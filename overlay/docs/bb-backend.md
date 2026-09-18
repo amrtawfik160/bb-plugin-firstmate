@@ -26,13 +26,13 @@ Plugin entry: `bb firstmate fm spawn -- --mode direct-PR -- ship '<task>'` runs 
 
 ```text
 backend=bb
-window=<thread-id>
+window=bb:<thread-id>
 bb_thread_id=<thread-id>
 worktree=<absolute managed-worktree path>
 harness=bb
 ```
 
-`window=` is the BB thread id. Peek/send/teardown resolve it through `fm_backend_resolve_selector`.
+`window=` is `bb:<thread-id>` (the watcher groups every BB window under session `bb`). `bb_thread_id=` is the bare thread id. Peek/send/teardown resolve `window=` through `fm_backend_resolve_selector`; the adapter strips a leading `bb:`.
 
 `fm-spawn.sh` does not call Treehouse. Isolation and unlanded-work refusals still apply.
 
@@ -48,11 +48,13 @@ harness=bb
 | remove_worktree | `bb thread stop` + `bb thread archive` (no Treehouse) |
 | busy_state | thread status → idle/busy |
 | agent_state | missing/alive/dead from `bb thread show` |
+| event wait | `bb thread wait --status idle` (first window to finish) |
 
 Composer submit/retry is a no-op: BB has no TUI composer. Delivery is the tell JSON succeeding.
 
 ## Limits
 
+- Event push is supported. `backend=bb` is push-capable: the toolbelt watcher blocks in `bb thread wait --status idle` instead of sleeping the poll interval. A pending interaction is the blocked edge (immediate escalation, deduped). Reaching idle ends the wait so the poll loop runs; it is not a stale wake.
 - No `--secondmate` yet (same class as Orca/cmux).
 - No Escape key.
 - Relay/mail/voice stay firstmate scripts if those planes are enabled; they are not rewritten in the BB plugin.

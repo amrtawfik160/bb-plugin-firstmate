@@ -391,7 +391,7 @@ index cb6ead4c..c600344d 100644
  A herdr task additionally records `herdr_session=`, `herdr_workspace_id=`, `herdr_tab_id=`, and `herdr_pane_id=`.
  A zellij task additionally records `zellij_session=`, `zellij_tab_id=`, and `zellij_pane_id=`.
  An Orca task additionally records `orca_worktree_id=` and `terminal=`, with `window=fm-<id>` kept as the shared firstmate alias.
-+A BB task additionally records `bb_thread_id=`, with `window=` equal to the BB thread id.
++A BB task additionally records `bb_thread_id=`, with `window=bb:<thread-id>` so every BB window shares one push session.
  A cmux task additionally records `cmux_workspace_id=` and `cmux_surface_id=`.
  Task selectors for `fm-peek.sh`, `fm-send.sh`, and `fm-crew-state.sh` resolve centrally through `fm_backend_resolve_selector`.
  A selector containing `:` is passed through as an explicit backend endpoint escape hatch.
@@ -408,3 +408,66 @@ index cb6ead4c..c600344d 100644
  A herdr, zellij, or cmux home is therefore never told `tmux` is missing, and the `treehouse` durable-lease upgrade check runs only for the backends that actually use treehouse.
  When `config/crew-dispatch.json` exists, bootstrap also requires `jq` for dispatch profile validation.
  When Relay is opted in, bootstrap also requires `curl` and `jq` before arming the relay poll shim.
+--- a/bin/fm-backend.sh
++++ b/bin/fm-backend.sh
+@@ -932,15 +932,15 @@
+ # and for those backends replaces its blind `sleep POLL` with a bounded wait on
+ # fm_backend_wait_transition. Every push-capable backend reuses the shared
+ # normalized-transition shape and policy table (bin/fm-transition-lib.sh); today
+-# only herdr implements the surface (docs/herdr-backend.md "Native
+-# pane.agent_status_changed push escalation"). A backend with no native push
++# herdr and bb implement the surface (docs/herdr-backend.md "Native
++# pane.agent_status_changed push escalation"; docs/bb-backend.md). A backend with no native push
+ # reports has-push false and returns 2 from the dispatchers below, so the
+ # watcher falls back to its poll loop - the permanent fail-closed backstop.
+ 
+ # fm_backend_has_push: 0 if <backend> exposes a native transition push stream.
+ fm_backend_has_push() {  # <backend>
+   case "$1" in
+-    herdr) return 0 ;;
++    herdr|bb) return 0 ;;
+     *) return 1 ;;
+   esac
+ }
+@@ -956,6 +956,7 @@
+   fm_backend_source "$backend" || return 1
+   case "$backend" in
+     herdr) fm_backend_herdr_events_capable "$@" ;;
++    bb) fm_backend_bb_events_capable "$@" ;;
+     *) return 1 ;;
+   esac
+ }
+@@ -973,6 +974,7 @@
+   fm_backend_source "$backend" || return 2
+   case "$backend" in
+     herdr) fm_backend_herdr_wait_transition "$@" ;;
++    bb) fm_backend_bb_wait_transition "$@" ;;
+     *) return 2 ;;
+   esac
+ }
+@@ -984,6 +986,7 @@
+   fm_backend_source "$backend" || return 1
+   case "$backend" in
+     herdr) fm_backend_herdr_commit_transition "$@" ;;
++    bb) fm_backend_bb_commit_transition "$@" ;;
+     *) return 1 ;;
+   esac
+ }
+@@ -995,6 +998,7 @@
+   fm_backend_source "$backend" || return 1
+   case "$backend" in
+     herdr) fm_backend_herdr_clear_transition "$@" ;;
++    bb) fm_backend_bb_clear_transition "$@" ;;
+     *) return 0 ;;
+   esac
+ }
+--- a/bin/fm-spawn.sh
++++ b/bin/fm-spawn.sh
+@@ -4046,6 +4046,7 @@
+ 
+ META_WINDOW=$T
+ [ "$BACKEND" = orca ] && META_WINDOW=$W
++[ "$BACKEND" = bb ] && META_WINDOW=bb:$T
+ SPAWN_GEN="s$(date +%s).${BASHPID:-$$}.$RANDOM"
+ SPAWN_META_PATH="$STATE/$ID.meta"
+ if [ "$SPAWN_META_LOCK_HELD" != 1 ]; then
