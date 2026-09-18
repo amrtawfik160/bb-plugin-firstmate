@@ -436,9 +436,11 @@ test("stopping or a manual interrupt is not nudged", async () => {
   try {
     stubIdleSdk(host);
     await seedCrew(host);
-    host.harness.sdk.stub("threads.events.list", async () => [
-      { data: { reason: "manual-stop" } },
-    ]);
+    host.harness.sdk.stub("threads.events.list", async (args: { types?: string[] }) => {
+      const types = args.types ?? [];
+      if (types.includes("turn/started")) return [{ createdAt: 1_000 }];
+      return [{ createdAt: 2_000, data: { reason: "manual-stop" } }];
+    });
     const stopped = await emitIdle(host, "still working", { status: "stopping" });
     assert.deepEqual(stopped.errors, []);
     assert.equal(sendCalls(host).length, 0);
@@ -519,16 +521,22 @@ function stubBusyCrew(host: Awaited<ReturnType<typeof load>>, output = "same") {
   host.harness.sdk.stub("threads.output", async () => ({ output }));
 }
 
-async function runStuckOnce(host: Awaited<ReturnType<typeof load>>) {
-  await host.bb.storage.kv.set("watch-meta", { lastPassAt: 0, checked: -1, notified: -1 });
+async function runStuckOnce(
+  host: Awaited<ReturnType<typeof load>>,
+  opts?: { lastPassAt?: number | null },
+) {
+  const metaInit: Record<string, unknown> = { checked: -1, notified: -1 };
+  if (opts?.lastPassAt === undefined) metaInit["lastPassAt"] = Date.now();
+  else if (opts.lastPassAt !== null) metaInit["lastPassAt"] = opts.lastPassAt;
+  await host.bb.storage.kv.set("watch-meta", metaInit);
   const run = host.harness.behavior.runService("crew-watch");
   const deadline = Date.now() + 4000;
   let meta: { lastPassAt: number; checked: number; notified: number } | null = null;
   while (Date.now() < deadline) {
     const raw = await host.bb.storage.kv.get("watch-meta");
-    if (typeof raw === "object" && raw !== null && "lastPassAt" in raw) {
+    if (typeof raw === "object" && raw !== null && "checked" in raw) {
       const row = raw as { lastPassAt: number; checked: number; notified: number };
-      if (row.lastPassAt !== 0) {
+      if (row.checked !== -1) {
         meta = row;
         break;
       }
@@ -584,6 +592,7 @@ test("stale output and stale tool activity pages both signals", async () => {
     assert.equal(sends.length, 1);
     assert.equal(sends[0]?.threadId, "thr_cap");
     assert.match(sends[0]?.text ?? "", /stuck \(31m no output change, no tool\/file activity 40m\)/);
+    assert.match(sends[0]?.text ?? "", /same/);
     const again = await runStuckOnce(host);
     assert.equal(again.notified, 0);
     assert.equal(sendCalls(host).length, 1);
@@ -614,6 +623,365 @@ test("stuck pass checks every parented crew past the old cap of 20", async () =>
     assert.equal(pass.notified, 21);
     assert.equal(sendCalls(host).length, 21);
     assert.equal(host.harness.sdk.callsTo("threads.output").length, 21);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("an interrupt older than this idle turn does not block the nudge", async () => {
+  const host = await load();
+  try {
+    stubIdleSdk(host);
+    await seedCrew(host);
+    host.harness.sdk.stub("threads.events.list", async (args: { types?: string[] }) => {
+      const types = args.types ?? [];
+      if (types.includes("turn/started")) return [{ createdAt: 5_000 }];
+      return [{ createdAt: 1_000, data: { reason: "manual-stop" } }];
+    });
+    const emitted = await emitIdle(host, "still working");
+    assert.deepEqual(emitted.errors, []);
+    assert.equal(sendCalls(host).filter((send) => send.threadId === "thr_crew").length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a thrown nudge does not count and does not report nudged", async () => {
+  const host = await load();
+  try {
+    stubIdleSdk(host);
+    await seedCrew(host);
+    let fail = true;
+    host.harness.sdk.stub("threads.send", async () => {
+      if (fail) throw new Error("send down");
+    });
+    const failed = await emitIdle(host, "still working");
+    assert.deepEqual(failed.errors, []);
+    const mid = (await host.bb.storage.kv.get("protocol-nudges")) as { c1?: { count?: number } } | null;
+    assert.equal(mid?.c1?.count ?? 0, 0);
+    assert.equal(sendCalls(host).filter((send) => send.threadId === "thr_cap").length, 0);
+    fail = false;
+    await emitIdle(host, "still working");
+    const nag = sendCalls(host).filter((send) => send.threadId === "thr_crew").at(-1);
+    assert.match(nag?.text ?? "", /nag 1 of 3/);
+    const after = (await host.bb.storage.kv.get("protocol-nudges")) as { c1?: { count?: number } };
+    assert.equal(after.c1?.count, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("cooldown persists dueAt and a reload re-arms the deferred nudge", async () => {
+  const host = await load();
+  try {
+    stubIdleSdk(host);
+    await seedCrew(host);
+    await emitIdle(host, "still working");
+    await emitIdle(host, "still working");
+    const cooled = (await host.bb.storage.kv.get("protocol-nudges")) as {
+      c1?: { count?: number; lastAt?: number; dueAt?: number };
+    };
+    assert.equal(cooled.c1?.count, 1);
+    assert.equal(typeof cooled.c1?.dueAt, "number");
+    assert.ok((cooled.c1?.dueAt ?? 0) > (cooled.c1?.lastAt ?? 0));
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+
+  const restarted = await load();
+  try {
+    stubIdleSdk(restarted);
+    await seedCrew(restarted);
+    const dueAt = Date.now() - 500;
+    await restarted.bb.storage.kv.set("protocol-nudges", {
+      c1: {
+        generation: "2026-09-18T00:00:00.000Z",
+        count: 1,
+        lastAt: Date.now() - 120_000,
+        exhausted: false,
+        dueAt,
+      },
+    });
+    const run = restarted.harness.behavior.runService("crew-watch");
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline && sendCalls(restarted).length === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    run.controller.abort();
+    await run.done;
+    const nag = sendCalls(restarted).find((send) => send.threadId === "thr_crew");
+    assert.match(nag?.text ?? "", /nag 2 of 3/);
+    const row = (await restarted.bb.storage.kv.get("protocol-nudges")) as { c1?: { count?: number; dueAt?: number } };
+    assert.equal(row.c1?.count, 2);
+    assert.equal(row.c1?.dueAt, undefined);
+  } finally {
+    await restarted.harness.lifecycle.dispose();
+  }
+});
+
+test("a nudge refreshes watch so the old hash cannot instant-stall", async () => {
+  const host = await load();
+  try {
+    stubIdleSdk(host);
+    await seedCrew(host);
+    const staleAt = Date.now() - 31 * 60_000;
+    await host.bb.storage.kv.set("watch", {
+      c1: { status: "active", hash: "same", at: staleAt, stuck: true },
+    });
+    await emitIdle(host, "still working");
+    const watch = (await host.bb.storage.kv.get("watch")) as Record<string, { at: number; stuck: boolean }>;
+    assert.equal(watch["c1"]?.stuck, false);
+    assert.ok((watch["c1"]?.at ?? 0) > staleAt);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("secondmate routes are not nudged, stuck-paged, fail-pinged, or interaction-paged", async () => {
+  const host = await load();
+  try {
+    stubIdleSdk(host);
+    stubBusyCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    const second = { ...crewRow("sm", "thr_sm", "thr_cap"), posture: "secondmate:proj_1" };
+    await host.bb.storage.kv.set("crews", [second, crewRow("c1", "thr_crew", "thr_cap")]);
+    const idle = await host.harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: "thr_sm", status: "idle", projectId: "proj_1" }),
+      lastAssistantText: "still working",
+    });
+    assert.deepEqual(idle.errors, []);
+    const failed = await host.harness.behavior.emitThreadEvent("thread.failed", {
+      thread: makeThreadResponse({ id: "thr_sm", status: "error", projectId: "proj_1" }),
+      error: "provider down",
+    });
+    assert.deepEqual(failed.errors, []);
+    const turn = await host.harness.behavior.emitThreadEvent("turn.failed", {
+      threadId: "thr_sm",
+      requestId: "req_sm",
+      turnId: null,
+      errorInfo: null,
+      inputAccepted: false,
+      rateLimits: null,
+      attemptNumber: 1,
+    });
+    assert.deepEqual(turn.errors, []);
+    const pending = await host.harness.behavior.emitThreadEvent("interaction.pending", {
+      thread: makeThreadResponse({ id: "thr_sm", status: "idle", projectId: "proj_1" }),
+      interaction: { id: "int_1" },
+    });
+    assert.deepEqual(pending.errors, []);
+    const staleAt = Date.now() - 31 * 60_000;
+    await host.bb.storage.kv.set("watch", {
+      sm: { status: "active", hash: "same", at: staleAt, stuck: false },
+      c1: { status: "active", hash: "same", at: staleAt, stuck: false },
+    });
+    host.harness.sdk.stub("threads.events.list", async () => [{ createdAt: staleAt }]);
+    const pass = await runStuckOnce(host);
+    assert.equal(pass.checked, 1);
+    assert.equal(pass.notified, 1);
+    const sends = sendCalls(host);
+    assert.equal(sends.length, 1);
+    assert.match(sends[0]?.text ?? "", /crew c1/);
+    assert.doesNotMatch(sends[0]?.text ?? "", /crew sm/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("thread.failed pages once; turn.failed does not double-page", async () => {
+  const host = await load();
+  try {
+    stubIdleSdk(host);
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    const failed = await host.harness.behavior.emitThreadEvent("thread.failed", {
+      thread: makeThreadResponse({ id: "thr_crew", status: "error", projectId: "proj_1" }),
+      error: "provider down",
+    });
+    assert.deepEqual(failed.errors, []);
+    const turn = await host.harness.behavior.emitThreadEvent("turn.failed", {
+      threadId: "thr_crew",
+      requestId: "req_1",
+      turnId: null,
+      errorInfo: null,
+      inputAccepted: false,
+      rateLimits: null,
+      attemptNumber: 1,
+    });
+    assert.deepEqual(turn.errors, []);
+    const sends = sendCalls(host);
+    assert.equal(sends.length, 1);
+    assert.equal(sends[0]?.threadId, "thr_cap");
+    assert.match(sends[0]?.text ?? "", /failed/);
+    assert.match(sends[0]?.text ?? "", /provider down/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("quiet holds without an AFK record and flushes on quiet off", async () => {
+  const host = await load();
+  try {
+    stubIdleSdk(host);
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await host.bb.storage.kv.set("quiet", true);
+    await host.bb.storage.kv.set("afk", {
+      on: false,
+      words: "",
+      since: "2026-09-18T00:00:00.000Z",
+      held: ["stale-afk"],
+    });
+    const emitted = await emitIdle(host, "DONE: batched");
+    assert.deepEqual(emitted.errors, []);
+    assert.equal(sendCalls(host).filter((send) => send.threadId === "thr_cap").length, 0);
+    const quiet = (await host.bb.storage.kv.get("quiet")) as { on?: boolean; held?: string[] };
+    assert.equal(quiet.on, true);
+    assert.match(quiet.held?.join("\n") ?? "", /DONE: batched/);
+    const afk = (await host.bb.storage.kv.get("afk")) as { held?: string[] };
+    assert.deepEqual(afk.held, ["stale-afk"]);
+    const off = await host.harness.behavior.runCli(["quiet", "off"]);
+    assert.equal(off.exitCode, 0, off.stderr);
+    assert.match(off.stdout, /Quiet off/);
+    assert.match(off.stdout, /DONE: batched/);
+    const cleared = (await host.bb.storage.kv.get("quiet")) as { on?: boolean; held?: string[] };
+    assert.equal(cleared.on, false);
+    assert.deepEqual(cleared.held, []);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("afk hold keeps the newest 20 and flushes the oldest", async () => {
+  const host = await load();
+  try {
+    stubIdleSdk(host);
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await host.bb.storage.kv.set("afk", {
+      on: true,
+      words: "",
+      since: "2026-09-18T00:00:00.000Z",
+      held: [],
+    });
+    for (let i = 0; i < 21; i++) {
+      const emitted = await emitIdle(host, `DONE: item ${i}`);
+      assert.deepEqual(emitted.errors, []);
+    }
+    const afk = (await host.bb.storage.kv.get("afk")) as { held?: string[] };
+    assert.equal(afk.held?.length, 20);
+    assert.match(afk.held?.[0] ?? "", /DONE: item 1/);
+    assert.match(afk.held?.[19] ?? "", /DONE: item 20/);
+    const flushed = sendCalls(host).filter((send) => send.threadId === "thr_cap");
+    assert.equal(flushed.length, 1);
+    assert.match(flushed[0]?.text ?? "", /DONE: item 0/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("stuck pass pages error and unknown once, and a read failure is not a stable hash", async () => {
+  const host = await load();
+  try {
+    stubBusyCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew", "thr_cap")]);
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ status: "error", environmentId: null }));
+    const first = await runStuckOnce(host);
+    assert.equal(first.notified, 1);
+    assert.match(sendCalls(host)[0]?.text ?? "", /failed/);
+    const second = await runStuckOnce(host);
+    assert.equal(second.notified, 0);
+    assert.equal(sendCalls(host).length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+
+  const unread = await load();
+  try {
+    stubBusyCrew(unread);
+    await unread.harness.behavior.setSettings({ supervisionEnabled: true });
+    await unread.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew", "thr_cap")]);
+    const staleAt = Date.now() - 31 * 60_000;
+    await unread.bb.storage.kv.set("watch", {
+      c1: { status: "active", hash: "same", at: staleAt, stuck: false },
+    });
+    unread.harness.sdk.stub("threads.output", async () => {
+      throw new Error("output down");
+    });
+    unread.harness.sdk.stub("threads.events.list", async () => [{ createdAt: staleAt }]);
+    const pass = await runStuckOnce(unread);
+    assert.equal(pass.notified, 1);
+    const sends = sendCalls(unread);
+    assert.equal(sends.length, 1);
+    assert.match(sends[0]?.text ?? "", /gone/);
+    assert.doesNotMatch(sends[0]?.text ?? "", /stuck \(/);
+    const again = await runStuckOnce(unread);
+    assert.equal(again.notified, 0);
+    assert.equal(sendCalls(unread).length, 1);
+    const watch = (await unread.bb.storage.kv.get("watch")) as Record<string, { hash?: string; alerted?: string }>;
+    assert.equal(watch["c1"]?.hash, "same");
+    assert.equal(watch["c1"]?.alerted, "unknown");
+  } finally {
+    await unread.harness.lifecycle.dispose();
+  }
+});
+
+test("a startup gap rebases stale watch rows instead of paging", async () => {
+  const host = await load();
+  try {
+    stubBusyCrew(host);
+    const staleAt = Date.now() - 31 * 60_000;
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew", "thr_cap")]);
+    await host.bb.storage.kv.set("watch", {
+      c1: { status: "active", hash: "same", at: staleAt, stuck: false },
+    });
+    host.harness.sdk.stub("threads.events.list", async () => [{ createdAt: staleAt }]);
+    const pass = await runStuckOnce(host, { lastPassAt: Date.now() - 60 * 60_000 });
+    assert.equal(pass.notified, 0);
+    assert.equal(sendCalls(host).length, 0);
+    const watch = (await host.bb.storage.kv.get("watch")) as Record<string, { at: number; stuck: boolean }>;
+    assert.equal(watch["c1"]?.stuck, false);
+    assert.ok((watch["c1"]?.at ?? 0) > staleAt);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+
+  const missing = await load();
+  try {
+    stubBusyCrew(missing);
+    const staleAt = Date.now() - 31 * 60_000;
+    await missing.harness.behavior.setSettings({ supervisionEnabled: true });
+    await missing.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew", "thr_cap")]);
+    await missing.bb.storage.kv.set("watch", {
+      c1: { status: "active", hash: "same", at: staleAt, stuck: false },
+    });
+    missing.harness.sdk.stub("threads.events.list", async () => [{ createdAt: staleAt }]);
+    const pass = await runStuckOnce(missing, { lastPassAt: null });
+    assert.equal(pass.notified, 0);
+    assert.equal(sendCalls(missing).length, 0);
+    const watch = (await missing.bb.storage.kv.get("watch")) as Record<string, { at: number }>;
+    assert.ok((watch["c1"]?.at ?? 0) > staleAt);
+  } finally {
+    await missing.harness.lifecycle.dispose();
+  }
+});
+
+test("forget drops the crew protocol-nudges row", async () => {
+  const host = await load();
+  try {
+    stubIdleSdk(host);
+    await seedCrew(host);
+    await host.bb.storage.kv.set("protocol-nudges", {
+      c1: { generation: "2026-09-18T00:00:00.000Z", count: 2, lastAt: 1, exhausted: false, dueAt: 9 },
+      other: { generation: "g", count: 1, lastAt: 1, exhausted: false },
+    });
+    const result = await host.harness.behavior.runCli(["forget", "c1"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    const nudges = (await host.bb.storage.kv.get("protocol-nudges")) as Record<string, unknown>;
+    assert.equal(nudges["c1"], undefined);
+    assert.ok(nudges["other"]);
   } finally {
     await host.harness.lifecycle.dispose();
   }
