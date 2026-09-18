@@ -1,0 +1,35 @@
+{
+  "name": "bb-plugin-firstmate",
+    "version": "0.3.4",
+  "type": "module",
+  "scripts": {
+    "test": "node --test --experimental-strip-types lib/policy.test.ts server.test.ts"
+  },
+  "engines": {
+    "bb": ">=0.43",
+    "bbPluginSdk": ">=0.4.87"
+  },
+  "bb": {
+    "name": "Firstmate",
+    "description": "Run firstmate-style agent crews inside BB: one captain thread dispatches crewmate child threads and brings back finished work.",
+    "branding": {
+      "icon": "Ship"
+    },
+    "server": "./server.ts",
+    "app": "./app.tsx",
+    "skills": [
+      "skills"
+    ]
+  },
+  "dependencies": {
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.4.87",
+    "@types/node": "^22.0.0",
+    "better-sqlite3": "^13.0.3",
+    "cron-parser": "^5.10.1",
+    "hono": "^4.13.8",
+    "typescript": "^5.7.0"
+  }
+}
