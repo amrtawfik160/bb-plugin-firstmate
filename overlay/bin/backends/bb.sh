@@ -89,6 +89,8 @@ elif field == "path":
             value = p
     if not value:
         value = pick(data, "path")
+elif field == "env_id":
+    value = pick(data, "environment", "id") or pick(data, "thread", "environmentId") or pick(data, "environmentId")
 elif field == "output":
     value = pick(data, "output") or pick(data, "text") or pick(data, "result", "output")
 if not value:
@@ -323,14 +325,118 @@ fm_backend_bb_kill() {  # <thread-id>
   bb thread stop "$id" >/dev/null 2>&1 || true
 }
 
+# Paths only. Drops the same untracked harness noise fm-teardown.sh ignores
+# (validate_worktree_teardown_safety) so a turn-end marker is not crew work.
+fm_backend_bb_porcelain_paths() {
+  python3 -c '
+import sys
+noise = ("?? .fm-grok-turnend", "?? .fm-kimi-turnend")
+for raw in sys.stdin:
+    line = raw.rstrip("\n")
+    if len(line) < 4:
+        continue
+    if line.startswith("?? .claude/") or line in noise:
+        continue
+    path = line[3:]
+    if " -> " in path:
+        path = path.split(" -> ", 1)[1]
+    if len(path) >= 2 and path[0] == "\"" and path[-1] == "\"":
+        path = path[1:-1]
+    if path:
+        sys.stdout.write(path + "\n")
+'
+}
+
+fm_backend_bb_diff_file_paths() {  # stdin: bb environment diff-files --json
+  python3 -c '
+import json, sys
+raw = sys.stdin.read()
+try:
+    data = json.loads(raw)
+except Exception as exc:
+    sys.stderr.write("error: invalid BB diff-files JSON: %s\n" % exc)
+    sys.exit(2)
+files = data.get("files") if isinstance(data, dict) else data
+if isinstance(data, dict) and not isinstance(files, list):
+    files = data.get("paths")
+if not isinstance(files, list):
+    sys.stderr.write("error: BB diff-files JSON has no file list\n")
+    sys.exit(2)
+for item in files:
+    path = ""
+    if isinstance(item, str):
+        path = item
+    elif isinstance(item, dict):
+        for key in ("path", "file", "filename"):
+            val = item.get(key)
+            if isinstance(val, str) and val:
+                path = val
+                break
+    if path:
+        sys.stdout.write(path + "\n")
+'
+}
+
+# 0 when stdin has no paths. 1 after printing the list; caller must not archive.
+fm_backend_bb_refuse_if_dirty() {  # <thread-id> <where>
+  local id=$1 where=$2 paths
+  paths=$(cat)
+  [ -n "$paths" ] || return 0
+  echo "error: refusing to remove BB worktree for $id; uncommitted changes ($where):" >&2
+  printf '%s\n' "$paths" >&2
+  return 1
+}
+
+# 0 only when the crew copy is proven clean. Any inspect failure is a refusal:
+# fm-teardown.sh treats remove_worktree failure as abort-and-retain.
+fm_backend_bb_worktree_is_clean() {  # <target> <thread-id>
+  local target=$1 id=$2 show wt env_id dirty
+  show=$(fm_backend_bb_show "$id" 2>/dev/null || true)
+  wt=$(printf '%s' "$show" | fm_backend_bb_json_field path 2>/dev/null || true)
+  if [ -z "$wt" ] && [ -d "$target" ]; then
+    wt=$target
+  fi
+  if [ -n "$wt" ] && [ -d "$wt" ]; then
+    if ! dirty=$(git -C "$wt" status --porcelain 2>/dev/null); then
+      echo "error: refusing to remove BB worktree for $id; cannot inspect uncommitted changes at $wt" >&2
+      return 1
+    fi
+    if ! dirty=$(printf '%s\n' "$dirty" | fm_backend_bb_porcelain_paths); then
+      echo "error: refusing to remove BB worktree for $id; cannot inspect uncommitted changes at $wt" >&2
+      return 1
+    fi
+    fm_backend_bb_refuse_if_dirty "$id" "$wt" <<<"$dirty" || return 1
+    return 0
+  fi
+  env_id=$(printf '%s' "$show" | fm_backend_bb_json_field env_id 2>/dev/null || true)
+  if [ -z "$env_id" ]; then
+    echo "error: refusing to remove BB worktree for $id; cannot inspect uncommitted changes" >&2
+    return 1
+  fi
+  fm_backend_bb_tool_check || return 1
+  if ! dirty=$(bb environment diff-files --json --target uncommitted "$env_id"); then
+    echo "error: refusing to remove BB worktree for $id; cannot inspect uncommitted changes (environment $env_id)" >&2
+    return 1
+  fi
+  if ! dirty=$(printf '%s' "$dirty" | fm_backend_bb_diff_file_paths); then
+    echo "error: refusing to remove BB worktree for $id; cannot inspect uncommitted changes (environment $env_id)" >&2
+    return 1
+  fi
+  fm_backend_bb_refuse_if_dirty "$id" "environment $env_id" <<<"$dirty" || return 1
+  return 0
+}
+
 fm_backend_bb_remove_worktree() {  # <thread-id-or-worktree-id>
-  # BB owns worktree lifecycle. Stop + archive so the managed-worktree can
-  # retire. Do not rm -rf the checkout from firstmate.
+  # BB owns worktree lifecycle. Archive is what retires the managed-worktree;
+  # a dirty tree must fail here so fm-teardown.sh aborts and keeps its records.
+  # Do not rm -rf the checkout from firstmate. Discard is forget --force.
   local id
   id=$(fm_backend_bb_thread_id "$1")
+  [ -n "$id" ] || { echo "error: refusing empty BB remove_worktree target" >&2; return 1; }
+  fm_backend_bb_worktree_is_clean "$1" "$id" || return 1
   fm_backend_bb_kill "$id"
   fm_backend_bb_tool_check || return 1
-  bb thread archive "$id" >/dev/null 2>&1 || true
+  bb thread archive "$id" || return 1
 }
 
 fm_backend_bb_worktree_path() {  # <thread-id>

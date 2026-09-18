@@ -45,7 +45,7 @@ harness=bb
 | send_text_submit | `bb thread tell --mode queue` |
 | send_key C-c | `bb thread tell --mode steer` interrupt |
 | kill | `bb thread stop` |
-| remove_worktree | `bb thread stop` + `bb thread archive` (no Treehouse) |
+| remove_worktree | Dirty tree: print the file list, exit 1, do not stop or archive. Clean: `bb thread stop` + `bb thread archive` (archive failure exits 1; no Treehouse) |
 | busy_state | thread status → idle/busy |
 | agent_state | missing/alive/dead from `bb thread show` |
 | event wait | `bb thread wait --status idle` (first window to finish) |
@@ -54,6 +54,7 @@ Composer submit/retry is a no-op: BB has no TUI composer. Delivery is the tell J
 
 ## Limits
 
+- `remove_worktree` refuses a dirty crew worktree (uncommitted or untracked files on stderr, exit 1) before stop/archive. That failure is what makes `fm-teardown.sh` abort and keep the task record. This op never discards. `--force` / discard is the captain's `forget --force`.
 - Event push is supported. `backend=bb` is push-capable: the toolbelt watcher blocks in `bb thread wait --status idle` instead of sleeping the poll interval. A pending interaction is the blocked edge (immediate escalation, deduped). Reaching idle ends the wait so the poll loop runs; it is not a stale wake.
 - No `--secondmate` yet (same class as Orca/cmux).
 - No Escape key.
