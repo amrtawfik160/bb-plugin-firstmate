@@ -118,6 +118,18 @@ const AFK_KEY = "afk";
 const QUIET_KEY = "quiet";
 const NUDGE_KEY = "protocol-nudges";
 const MAX_CREWS = 50;
+// Newest of these is "tool/file activity". Output text alone false-alarms while a crew is editing.
+const TOOL_ACTIVITY_TYPES = [
+  "item/toolCall/progress",
+  "item/mcpToolCall/progress",
+  "item/commandExecution/outputDelta",
+  "item/fileChange/outputDelta",
+  "item/backgroundTask/progress",
+  "item/backgroundTask/completed",
+  "item/delegation/progress",
+  "item/delegation/completed",
+  "turn/diff/updated",
+] as const;
 const MAX_QUEUE = 100;
 const MAX_DECISIONS = 100;
 const MAX_DONE = 10;
@@ -615,8 +627,15 @@ export default async function plugin(bb: BbPluginApi) {
 
   const watchStateSchema = z.record(
     z.string(),
-    z.object({ status: z.string(), hash: z.string(), at: z.number(), stuck: z.boolean() }),
+    z.object({
+      status: z.string(),
+      hash: z.string(),
+      at: z.number(),
+      stuck: z.boolean(),
+      activityAt: z.number().optional(),
+    }),
   );
+  type WatchState = z.infer<typeof watchStateSchema>;
 
   async function publishFleet(): Promise<void> {
     try {
@@ -1710,13 +1729,35 @@ export default async function plugin(bb: BbPluginApi) {
     return { ...result, scriptPath };
   }
 
+  async function readToolActivity(threadId: string): Promise<{ ok: true; at: number | null } | { ok: false }> {
+    try {
+      const rows = await bb.sdk.threads.events.list({
+        threadId,
+        order: "desc",
+        limit: "1",
+        types: TOOL_ACTIVITY_TYPES,
+      });
+      if (!Array.isArray(rows)) return { ok: false };
+      const row = rows[0];
+      if (row === undefined) return { ok: true, at: null };
+      const createdAt = asRecord(row)["createdAt"];
+      return typeof createdAt === "number" && Number.isFinite(createdAt)
+        ? { ok: true, at: createdAt }
+        : { ok: false };
+    } catch (error) {
+      bb.log.warn(
+        `stuck activity read failed for ${threadId}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return { ok: false };
+    }
+  }
+
   async function stuckPass(): Promise<{ checked: number; notified: number }> {
     const current = await settings.get();
     const stuckMs = Math.min(480, Math.max(5, Number(current.supervisionStuckMin) || 30)) * 60000;
-    const crews = (await listCrews()).filter((c) => c.parentThreadId !== null).slice(0, 20);
+    const crews = (await listCrews()).filter((c) => c.parentThreadId !== null).slice(0, MAX_CREWS);
     const parsed = watchStateSchema.safeParse(await bb.storage.kv.get<unknown>("watch"));
-    const state: Record<string, { status: string; hash: string; at: number; stuck: boolean }> =
-      parsed.success ? parsed.data : {};
+    const state: WatchState = parsed.success ? parsed.data : {};
     const now = Date.now();
     const seen = new Set<string>();
     let notified = 0;
@@ -1737,11 +1778,42 @@ export default async function plugin(bb: BbPluginApi) {
         state[crew.id] = { status, hash: excerpt, at: now, stuck: false };
         continue;
       }
-      if (!prev.stuck && now - prev.at >= stuckMs) {
-        await notifyCaptain(crew, `stuck (${Math.round((now - prev.at) / 60000)}m no output change)`, null);
-        notified++;
-        state[crew.id] = { ...prev, stuck: true };
+      const activity = await readToolActivity(crew.threadId);
+      if (!activity.ok) {
+        state[crew.id] = { ...prev, status, hash: excerpt };
+        continue;
       }
+      const activityAt = activity.at ?? undefined;
+      const activityStale = activityAt === undefined || now - activityAt >= stuckMs;
+      if (!activityStale) {
+        state[crew.id] = {
+          status,
+          hash: excerpt,
+          at: prev.at,
+          stuck: false,
+          ...(activityAt !== undefined ? { activityAt } : {}),
+        };
+        continue;
+      }
+      const outMin = Math.max(0, Math.round((now - prev.at) / 60000));
+      const actMin = activityAt === undefined ? outMin : Math.max(0, Math.round((now - activityAt) / 60000));
+      const row = {
+        status,
+        hash: excerpt,
+        at: prev.at,
+        stuck: prev.stuck,
+        ...(activityAt !== undefined ? { activityAt } : {}),
+      };
+      if (!prev.stuck && now - prev.at >= stuckMs) {
+        await notifyCaptain(
+          crew,
+          `stuck (${outMin}m no output change, no tool/file activity ${actMin}m)`,
+          null,
+        );
+        notified++;
+        row.stuck = true;
+      }
+      state[crew.id] = row;
     }
     for (const id of Object.keys(state)) {
       if (!seen.has(id)) delete state[id];

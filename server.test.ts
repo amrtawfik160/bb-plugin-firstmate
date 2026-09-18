@@ -496,3 +496,125 @@ test("nudgeEnabled false leaves the idle ping to supervision", async () => {
     await host.harness.lifecycle.dispose();
   }
 });
+
+function crewRow(id: string, threadId: string, parentThreadId: string | null) {
+  return {
+    id,
+    task: "fix login",
+    projectId: "proj_1",
+    threadId,
+    parentThreadId,
+    providerId: null,
+    worktree: true,
+    shape: "ship" as const,
+    posture: "local-only",
+    createdAt: "2026-09-18T00:00:00.000Z",
+  };
+}
+
+function stubBusyCrew(host: Awaited<ReturnType<typeof load>>, output = "same") {
+  host.harness.sdk.stub("threads.list", async () => []);
+  host.harness.sdk.stub("threads.send", async () => ({}));
+  host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ status: "active", environmentId: null }));
+  host.harness.sdk.stub("threads.output", async () => ({ output }));
+}
+
+async function runStuckOnce(host: Awaited<ReturnType<typeof load>>) {
+  await host.bb.storage.kv.set("watch-meta", { lastPassAt: 0, checked: -1, notified: -1 });
+  const run = host.harness.behavior.runService("crew-watch");
+  const deadline = Date.now() + 4000;
+  let meta: { lastPassAt: number; checked: number; notified: number } | null = null;
+  while (Date.now() < deadline) {
+    const raw = await host.bb.storage.kv.get("watch-meta");
+    if (typeof raw === "object" && raw !== null && "lastPassAt" in raw) {
+      const row = raw as { lastPassAt: number; checked: number; notified: number };
+      if (row.lastPassAt !== 0) {
+        meta = row;
+        break;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  run.controller.abort();
+  await run.done;
+  assert.ok(meta, "stuck pass did not finish");
+  return meta;
+}
+
+test("stale output with fresh tool activity does not page", async () => {
+  const host = await load();
+  try {
+    stubBusyCrew(host);
+    const staleAt = Date.now() - 31 * 60_000;
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew", "thr_cap")]);
+    await host.bb.storage.kv.set("watch", {
+      c1: { status: "active", hash: "same", at: staleAt, stuck: false, legacy: true },
+    });
+    host.harness.sdk.stub("threads.events.list", async () => [{ createdAt: Date.now() - 1000 }]);
+    const first = await runStuckOnce(host);
+    assert.equal(first.notified, 0);
+    assert.equal(sendCalls(host).length, 0);
+    const mid = (await host.bb.storage.kv.get("watch")) as Record<string, { at: number; stuck: boolean; activityAt?: number }>;
+    assert.equal(mid["c1"]?.stuck, false);
+    assert.equal(mid["c1"]?.at, staleAt);
+    assert.equal(typeof mid["c1"]?.activityAt, "number");
+    const second = await runStuckOnce(host);
+    assert.equal(second.notified, 0);
+    assert.equal(sendCalls(host).length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("stale output and stale tool activity pages both signals", async () => {
+  const host = await load();
+  try {
+    stubBusyCrew(host);
+    const now = Date.now();
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew", "thr_cap")]);
+    await host.bb.storage.kv.set("watch", {
+      c1: { status: "active", hash: "same", at: now - 31 * 60_000, stuck: false },
+    });
+    host.harness.sdk.stub("threads.events.list", async () => [{ createdAt: now - 40 * 60_000 }]);
+    const pass = await runStuckOnce(host);
+    assert.equal(pass.notified, 1);
+    const sends = sendCalls(host);
+    assert.equal(sends.length, 1);
+    assert.equal(sends[0]?.threadId, "thr_cap");
+    assert.match(sends[0]?.text ?? "", /stuck \(31m no output change, no tool\/file activity 40m\)/);
+    const again = await runStuckOnce(host);
+    assert.equal(again.notified, 0);
+    assert.equal(sendCalls(host).length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("stuck pass checks every parented crew past the old cap of 20", async () => {
+  const host = await load();
+  try {
+    stubBusyCrew(host);
+    const staleAt = Date.now() - 31 * 60_000;
+    const crews = [];
+    const watch: Record<string, { status: string; hash: string; at: number; stuck: boolean }> = {};
+    for (let i = 0; i < 21; i++) {
+      const id = `c${i}`;
+      crews.push(crewRow(id, `thr_${i}`, "thr_cap"));
+      watch[id] = { status: "active", hash: "same", at: staleAt, stuck: false };
+    }
+    crews.push(crewRow("orphan", "thr_orphan", null));
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await host.bb.storage.kv.set("crews", crews);
+    await host.bb.storage.kv.set("watch", watch);
+    host.harness.sdk.stub("threads.events.list", async () => [{ createdAt: staleAt }]);
+    const pass = await runStuckOnce(host);
+    assert.equal(pass.checked, 21);
+    assert.equal(pass.notified, 21);
+    assert.equal(sendCalls(host).length, 21);
+    assert.equal(host.harness.sdk.callsTo("threads.output").length, 21);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
