@@ -5,6 +5,7 @@ import {
   capPermission,
   crewPrompt,
   decisionDue,
+  hasStatusProtocol,
   looksReadOnly,
   parseOutcome,
   queueGate,
@@ -38,6 +39,17 @@ test("parseOutcome reads DONE/BLOCKED/FAILED", () => {
   assert.equal(parseOutcome("DONE: shipped https://example/pr/1"), "DONE: shipped https://example/pr/1");
   assert.equal(parseOutcome("noise\nFAILED: tests red\nmore"), "FAILED: tests red");
   assert.equal(parseOutcome("still working"), null);
+});
+
+test("hasStatusProtocol matches a leading verdict or a standalone line only", () => {
+  assert.equal(hasStatusProtocol("DONE: shipped"), true);
+  assert.equal(hasStatusProtocol("  blocked: need a token"), true);
+  assert.equal(hasStatusProtocol("ACK: on it\n\nFAILED: tests red"), true);
+  assert.equal(hasStatusProtocol("done corr=0123456789abcdef: note"), true);
+  assert.equal(hasStatusProtocol("still working"), false);
+  assert.equal(hasStatusProtocol("I am DONE: almost"), false);
+  assert.equal(hasStatusProtocol("needs-decision: pick one"), false);
+  assert.equal(hasStatusProtocol(null), false);
 });
 
 test("queueGate waits on deps and dates", () => {

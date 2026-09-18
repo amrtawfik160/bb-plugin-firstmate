@@ -11,8 +11,10 @@ import {
   capPermission,
   crewPrompt,
   decisionDue,
+  hasStatusProtocol,
   looksReadOnly,
   parseOutcome,
+  protocolNudgeText,
   queueGate,
   quietShouldSend,
   resolveWorktree,
@@ -114,6 +116,7 @@ const MEM_LEARNINGS_KEY = "memory-learnings";
 const SECONDMATES_KEY = "secondmates";
 const AFK_KEY = "afk";
 const QUIET_KEY = "quiet";
+const NUDGE_KEY = "protocol-nudges";
 const MAX_CREWS = 50;
 const MAX_QUEUE = 100;
 const MAX_DECISIONS = 100;
@@ -516,6 +519,21 @@ export default async function plugin(bb: BbPluginApi) {
       label: "Stuck alert after N min with no output change",
       default: 30,
     },
+    nudgeEnabled: {
+      type: "boolean",
+      label: "Doorbell a crew that idles without DONE:/BLOCKED:/FAILED:",
+      default: true,
+    },
+    nudgeMaxPerCrew: {
+      type: "number",
+      label: "Protocol nudges per crew task before NEEDS DECISION",
+      default: 3,
+    },
+    nudgeCooldownSeconds: {
+      type: "number",
+      label: "Minimum seconds between protocol nudges for one crew",
+      default: 60,
+    },
   });
 
   async function readList<T>(key: string, schema: z.ZodType<T>, cap: number): Promise<T[]> {
@@ -621,19 +639,22 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const afk = await readAfk();
     const quiet = await isQuiet();
-    const hold = (afk?.on === true && !afkShouldSend(kind)) || (quiet && !quietShouldSend(kind));
+    const postureEvent = kind === "needs-decision" ? "idle" : kind;
+    const hold = (afk?.on === true && !afkShouldSend(postureEvent)) || (quiet && !quietShouldSend(postureEvent));
     const head =
       kind === "idle"
         ? `✅ crew ${crew.id} done`
         : kind === "review"
           ? `🔎 crew ${crew.id} ready for review`
-          : kind === "error"
-            ? `❌ crew ${crew.id} failed`
-            : kind === "unknown"
-              ? `❓ crew ${crew.id} gone`
-              : kind === "interaction"
-                ? `✋ crew ${crew.id} needs input`
-                : `⏳ crew ${crew.id} ${kind}`;
+          : kind === "needs-decision"
+            ? `⚖️ crew ${crew.id} NEEDS DECISION`
+            : kind === "error"
+              ? `❌ crew ${crew.id} failed`
+              : kind === "unknown"
+                ? `❓ crew ${crew.id} gone`
+                : kind === "interaction"
+                  ? `✋ crew ${crew.id} needs input`
+                  : `⏳ crew ${crew.id} ${kind}`;
     const lines = [`${head} [${crew.shape}] :: ${truncate(crew.task, 100)}`];
     if (prUrl !== "") lines.push(prUrl);
     const outcome = parseOutcome(output);
@@ -642,9 +663,11 @@ export default async function plugin(bb: BbPluginApi) {
     lines.push(
       kind === "error"
         ? `next: bb firstmate retry|tell|forget ${crew.id}`
-        : kind === "idle" || kind === "review"
-          ? `next: bb firstmate deliver ${crew.id}`
-          : `next: bb firstmate crew ${crew.id}`,
+        : kind === "needs-decision"
+          ? `next: bb firstmate tell|stop|forget ${crew.id}`
+          : kind === "idle" || kind === "review"
+            ? `next: bb firstmate deliver ${crew.id}`
+            : `next: bb firstmate crew ${crew.id}`,
     );
     const text = lines.join("\n").slice(0, 1500);
     if (hold && afk !== null) {
@@ -743,10 +766,9 @@ export default async function plugin(bb: BbPluginApi) {
       try {
         hostId = await resolveHostForProject(input.crew.projectId, input.crew.parentThreadId ?? undefined);
       } catch (error) {
-        bb.log.warn("fm meta skipped: no host", {
-          crewId: input.crew.id,
-          error: error instanceof Error ? error.message : String(error),
-        });
+        bb.log.warn(
+          `fm meta skipped: no host crew=${input.crew.id} ${error instanceof Error ? error.message : String(error)}`,
+        );
         return false;
       }
     }
@@ -777,20 +799,17 @@ export default async function plugin(bb: BbPluginApi) {
     try {
       const result = await runOnHost(hostId, script, 20_000);
       if (result.exitCode !== 0) {
-        bb.log.warn("fm meta write failed", {
-          crewId: input.crew.id,
-          exitCode: result.exitCode,
-          output: result.output.slice(0, 500),
-        });
+        bb.log.warn(
+          `fm meta write failed crew=${input.crew.id} exit=${result.exitCode} ${result.output.slice(0, 500)}`,
+        );
         return false;
       }
-      bb.log.info("fm meta written", { crewId: input.crew.id, path: dest });
+      bb.log.info(`fm meta written crew=${input.crew.id} path=${dest}`);
       return true;
     } catch (error) {
-      bb.log.warn("fm meta write failed", {
-        crewId: input.crew.id,
-        error: error instanceof Error ? error.message : String(error),
-      });
+      bb.log.warn(
+        `fm meta write failed crew=${input.crew.id} ${error instanceof Error ? error.message : String(error)}`,
+      );
       return false;
     }
   }
@@ -808,13 +827,12 @@ export default async function plugin(bb: BbPluginApi) {
     try {
       const result = await runOnHost(hostId, `rm -f ${shQuote(dest)}`, 15_000);
       if (result.exitCode !== 0) {
-        bb.log.warn("fm meta drop failed", { crewId: crew.id, exitCode: result.exitCode });
+        bb.log.warn(`fm meta drop failed crew=${crew.id} exit=${result.exitCode}`);
       }
     } catch (error) {
-      bb.log.warn("fm meta drop failed", {
-        crewId: crew.id,
-        error: error instanceof Error ? error.message : String(error),
-      });
+      bb.log.warn(
+        `fm meta drop failed crew=${crew.id} ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
 
@@ -1327,10 +1345,9 @@ export default async function plugin(bb: BbPluginApi) {
         await bb.sdk.threads.pin({ threadId });
       }
     } catch (error) {
-      bb.log.warn("deck settle failed", {
-        threadId,
-        error: error instanceof Error ? error.message : String(error),
-      });
+      bb.log.warn(
+        `deck settle failed thread=${threadId} ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
 
@@ -1573,11 +1590,9 @@ export default async function plugin(bb: BbPluginApi) {
           if (typeof rec["nextSeq"] === "number") nextSeq = rec["nextSeq"];
           output += decodeChunks(chunk);
         } catch (error) {
-          bb.log.debug("host terminal output", {
-            terminalId,
-            status,
-            error: error instanceof Error ? error.message : String(error),
-          });
+          bb.log.debug(
+            `host terminal output terminal=${terminalId} status=${status} ${error instanceof Error ? error.message : String(error)}`,
+          );
         }
         if (
           !stdinSent &&
@@ -2457,6 +2472,130 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
+  const nudgeRowSchema = z.object({
+    generation: z.string(),
+    count: z.number(),
+    lastAt: z.number(),
+    exhausted: z.boolean(),
+  });
+  const nudgeStateSchema = z.record(z.string(), nudgeRowSchema);
+  type NudgeRow = z.infer<typeof nudgeRowSchema>;
+  const nudgeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  function clearNudgeTimer(crewId: string): void {
+    const timer = nudgeTimers.get(crewId);
+    if (timer === undefined) return;
+    clearTimeout(timer);
+    nudgeTimers.delete(crewId);
+  }
+
+  function nudgeLimits(current: Awaited<ReturnType<typeof settings.get>>): {
+    enabled: boolean;
+    max: number;
+    cooldownMs: number;
+  } {
+    const maxRaw = current.nudgeMaxPerCrew;
+    const coolRaw = current.nudgeCooldownSeconds;
+    const max = Number.isFinite(maxRaw) ? Math.max(0, Math.trunc(maxRaw)) : 3;
+    const seconds = Number.isFinite(coolRaw) ? Math.max(0, Math.trunc(coolRaw)) : 60;
+    return { enabled: current.nudgeEnabled === true, max, cooldownMs: seconds * 1000 };
+  }
+
+  async function readNudgeState(): Promise<Record<string, NudgeRow>> {
+    const parsed = nudgeStateSchema.safeParse(await bb.storage.kv.get<unknown>(NUDGE_KEY));
+    return parsed.success ? parsed.data : {};
+  }
+
+  function taskGeneration(crew: Crew): string {
+    return crew.createdAt !== "" ? crew.createdAt : crew.threadId;
+  }
+
+  async function turnWasStopped(thread: {
+    id: string;
+    status: string;
+    runtime?: { displayStatus?: string };
+  }): Promise<boolean> {
+    if (thread.status === "stopping" || thread.runtime?.displayStatus === "stopping") return true;
+    try {
+      const rows = await bb.sdk.threads.events.list({
+        threadId: thread.id,
+        order: "desc",
+        limit: "1",
+        types: ["system/thread/interrupted"],
+      });
+      const reason = asRecord(asRecord(rows[0])["data"])["reason"];
+      return reason === "manual-stop" || reason === "host-daemon-restarted";
+    } catch {
+      return false;
+    }
+  }
+
+  async function applyProtocolNudge(crew: Crew): Promise<"off" | "nudged" | "cooling" | "exhausted" | "spent"> {
+    const current = await settings.get();
+    const limits = nudgeLimits(current);
+    if (!limits.enabled) return "off";
+    const generation = taskGeneration(crew);
+    const state = await readNudgeState();
+    const prev = state[crew.id];
+    const row: NudgeRow =
+      prev === undefined || prev.generation !== generation
+        ? { generation, count: 0, lastAt: 0, exhausted: false }
+        : { ...prev };
+    if (row.exhausted) return "spent";
+    if (row.count >= limits.max) {
+      row.exhausted = true;
+      state[crew.id] = row;
+      await bb.storage.kv.set(NUDGE_KEY, state);
+      await notifyCaptain(
+        crew,
+        "needs-decision",
+        `NEEDS DECISION: crew ${crew.id} idled without DONE:/BLOCKED:/FAILED: after ${limits.max} protocol nudges`,
+      );
+      return "exhausted";
+    }
+    const now = Date.now();
+    if (row.lastAt > 0 && now - row.lastAt < limits.cooldownMs) {
+      const wait = limits.cooldownMs - (now - row.lastAt);
+      const existing = nudgeTimers.get(crew.id);
+      if (existing !== undefined) clearTimeout(existing);
+      const timer = setTimeout(() => {
+        nudgeTimers.delete(crew.id);
+        void runDeferredNudge(crew.id);
+      }, wait);
+      (timer as unknown as { unref?: () => void }).unref?.();
+      nudgeTimers.set(crew.id, timer);
+      return "cooling";
+    }
+    row.count += 1;
+    row.lastAt = now;
+    state[crew.id] = row;
+    await bb.storage.kv.set(NUDGE_KEY, state);
+    clearNudgeTimer(crew.id);
+    try {
+      await tellCrew(crew, protocolNudgeText(row.count, limits.max), false);
+    } catch (error) {
+      bb.log.warn(
+        `protocol nudge failed for crew ${crew.id}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    return "nudged";
+  }
+
+  async function runDeferredNudge(crewId: string): Promise<void> {
+    const crew = await findCrew(crewId);
+    if (crew === undefined) return;
+    try {
+      const thread = await bb.sdk.threads.get({ threadId: crew.threadId });
+      if (await turnWasStopped(thread)) return;
+      if (thread.status === "active" || thread.status === "starting") return;
+    } catch {
+      return;
+    }
+    const output = await crewOutput(crew);
+    if (hasStatusProtocol(output)) return;
+    await applyProtocolNudge(crew);
+  }
+
   bb.events.on("thread.created", async ({ thread }) => {
     if (!isCaptainSpawn(thread)) return;
     await settleDeck(thread.id);
@@ -2466,10 +2605,15 @@ export default async function plugin(bb: BbPluginApi) {
     await settleDeck(thread.id);
   });
   bb.events.on("thread.idle", async ({ thread, lastAssistantText }) => {
-    const current = await settings.get();
-    if (current.supervisionEnabled !== true) return;
     const crew = await findCrewByThread(thread.id);
     if (crew === undefined) return;
+    const stopped = await turnWasStopped(thread);
+    if (!stopped && !hasStatusProtocol(lastAssistantText)) {
+      const outcome = await applyProtocolNudge(crew);
+      if (outcome !== "off") return;
+    }
+    const current = await settings.get();
+    if (current.supervisionEnabled !== true) return;
     await notifyCaptain(crew, "idle", lastAssistantText);
   });
   bb.events.on("thread.failed", async ({ thread, error }) => {
@@ -3202,6 +3346,8 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.onDispose(() => {
+    for (const timer of nudgeTimers.values()) clearTimeout(timer);
+    nudgeTimers.clear();
     bb.log.info("disposed");
   });
 }

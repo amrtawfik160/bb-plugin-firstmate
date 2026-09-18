@@ -63,6 +63,53 @@ export function parseOutcome(output: string | null): string | null {
   return `${tag}: ${m[3].trim().replace(/\s+/g, " ").slice(0, 200)}`;
 }
 
+const CORR_TOKEN = /^corr=[0-9A-Fa-f]{16}$/;
+const PROTOCOL_VERBS = new Set(["done", "blocked", "failed"]);
+
+/** Leading verb, same cut as fm-classify-lib `status_line_verb` (before `:` / `[`, corr tokens dropped). */
+export function statusLineVerb(line: string): string {
+  let verb = line.split(":")[0] ?? "";
+  const bracket = verb.indexOf("[");
+  if (bracket >= 0) verb = verb.slice(0, bracket);
+  verb = verb.trim();
+  if (!verb.includes("corr=")) return verb;
+  const words = verb.split(/[ \t]+/).filter((word) => word !== "");
+  const first = words[0] ?? "";
+  const rest = words.slice(1).filter((word) => !CORR_TOKEN.test(word));
+  return [first, ...rest].filter((word) => word !== "").join(" ");
+}
+
+/**
+ * True when a reply already carries a status-protocol verdict.
+ * Marker at the start of the reply, or a standalone line: the line's leading
+ * verb is DONE / BLOCKED / FAILED. Prose that merely mentions the token does not count.
+ */
+export function hasStatusProtocol(text: string | null | undefined): boolean {
+  if (text == null || text === "") return false;
+  for (const line of text.split(/\r?\n/)) {
+    if (!/[^ \t]/.test(line)) continue;
+    if (PROTOCOL_VERBS.has(statusLineVerb(line).toLowerCase())) return true;
+  }
+  return false;
+}
+
+const TURNEND_RULE = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
+
+/** Doorbell copy in the upstream turn-end guard banner shape. */
+export function protocolNudgeText(nag: number, max: number): string {
+  return [
+    `●${TURNEND_RULE}`,
+    `●  TURN ENDED WITHOUT A STATUS VERDICT (nag ${nag} of ${max})`,
+    "●  Last reply has no DONE:, BLOCKED:, or FAILED: verdict.",
+    "●  A verdict is the marker at the start of the reply, or a standalone line.",
+    "●  Re-state the outcome in that protocol. Do not redo the task.",
+    "●    DONE: <one-line outcome>",
+    "●    BLOCKED: <what you need, exactly>",
+    "●    FAILED: <what failed + evidence>",
+    `●${TURNEND_RULE}`,
+  ].join("\n");
+}
+
 export function queueGate(
   item: { status: string; blockedBy: string[]; waitUntil: string | null; id: string },
   all: Array<{ id: string; status: string }>,

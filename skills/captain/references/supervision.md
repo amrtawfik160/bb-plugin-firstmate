@@ -79,3 +79,13 @@ Before reset/compaction or on `/stow`:
 
 Omit trivia and anything already owned elsewhere. Rewrite and prune rather
 than appending forever.
+
+## Protocol nudge
+
+`thread.idle` on a registered crew whose last reply has no `DONE:` / `BLOCKED:` /
+`FAILED:` line (start of the reply, or a standalone line) doorbells that crew
+to re-state the verdict. Non-crew threads are left alone. A stopping thread or
+a manual/host interrupt is not nudged. Defaults, no config required:
+`nudgeEnabled` on, `nudgeMaxPerCrew` 3, `nudgeCooldownSeconds` 60. Past the
+cap the captain gets one `NEEDS DECISION`. Afk/quiet still nudges the crew and
+holds that captain ping the same way a done-ping is held.

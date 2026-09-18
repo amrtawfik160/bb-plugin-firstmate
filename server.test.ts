@@ -304,3 +304,195 @@ test("ordinary new threads are not titled as captain", async () => {
     await host.harness.lifecycle.dispose();
   }
 });
+
+function sendCalls(host: Awaited<ReturnType<typeof load>>) {
+  return host.harness.sdk.callsTo("threads.send").map((call) => {
+    const args = call[0] as {
+      threadId?: string;
+      mode?: string;
+      input?: Array<{ text?: string }>;
+    };
+    return { threadId: args.threadId, mode: args.mode, text: args.input?.[0]?.text ?? "" };
+  });
+}
+
+async function seedCrew(host: Awaited<ReturnType<typeof load>>) {
+  await host.bb.storage.kv.set("crews", [
+    {
+      id: "c1",
+      task: "fix login",
+      projectId: "proj_1",
+      threadId: "thr_crew",
+      parentThreadId: "thr_cap",
+      providerId: null,
+      worktree: true,
+      shape: "ship",
+      posture: "local-only",
+      createdAt: "2026-09-18T00:00:00.000Z",
+    },
+  ]);
+}
+
+function stubIdleSdk(host: Awaited<ReturnType<typeof load>>) {
+  host.harness.sdk.stub("threads.send", async () => ({}));
+  host.harness.sdk.stub("threads.list", async () => []);
+  host.harness.sdk.stub("threads.get", async () =>
+    makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: null }),
+  );
+}
+
+async function emitIdle(
+  host: Awaited<ReturnType<typeof load>>,
+  lastAssistantText: string | null,
+  thread: Parameters<typeof makeThreadResponse>[0] = {},
+) {
+  return host.harness.behavior.emitThreadEvent("thread.idle", {
+    thread: makeThreadResponse({ id: "thr_crew", status: "idle", projectId: "proj_1", ...thread }),
+    lastAssistantText,
+  });
+}
+
+test("idle on a non-crew thread is ignored", async () => {
+  const host = await load();
+  try {
+    stubIdleSdk(host);
+    const emitted = await emitIdle(host, "still working", { id: "thr_other" });
+    assert.deepEqual(emitted.errors, []);
+    assert.equal(sendCalls(host).length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a protocol verdict does not nudge; supervision still pings the captain", async () => {
+  const host = await load();
+  try {
+    stubIdleSdk(host);
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    const emitted = await emitIdle(host, "ACK: on it\n\nDONE: shipped branch bb/nudge");
+    assert.deepEqual(emitted.errors, []);
+    const sends = sendCalls(host);
+    assert.equal(sends.length, 1);
+    assert.equal(sends[0]?.threadId, "thr_cap");
+    assert.match(sends[0]?.text ?? "", /DONE: shipped branch bb\/nudge/);
+    assert.doesNotMatch(sends[0]?.text ?? "", /TURN ENDED WITHOUT A STATUS VERDICT/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("missing protocol doorbells the crew and does not ping done", async () => {
+  const host = await load();
+  try {
+    stubIdleSdk(host);
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    const emitted = await emitIdle(host, "I am DONE: almost, but this is prose");
+    assert.deepEqual(emitted.errors, []);
+    const sends = sendCalls(host);
+    assert.equal(sends.length, 1);
+    assert.equal(sends[0]?.threadId, "thr_crew");
+    assert.equal(sends[0]?.mode, "queue-if-active");
+    assert.match(sends[0]?.text ?? "", /TURN ENDED WITHOUT A STATUS VERDICT \(nag 1 of 3\)/);
+    assert.match(sends[0]?.text ?? "", /DONE: <one-line outcome>/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("cooldown blocks a second nudge; the cap then surfaces NEEDS DECISION", async () => {
+  const host = await load();
+  try {
+    stubIdleSdk(host);
+    await seedCrew(host);
+    const first = await emitIdle(host, "still working");
+    assert.deepEqual(first.errors, []);
+    const second = await emitIdle(host, "still working");
+    assert.deepEqual(second.errors, []);
+    assert.equal(sendCalls(host).filter((send) => send.threadId === "thr_crew").length, 1);
+
+    await host.harness.behavior.setSettings({ nudgeMaxPerCrew: 2, nudgeCooldownSeconds: 0 });
+    await host.bb.storage.kv.set("protocol-nudges", {
+      c1: { generation: "2026-09-18T00:00:00.000Z", count: 1, lastAt: 0, exhausted: false },
+    });
+    await emitIdle(host, "still working");
+    await emitIdle(host, "still working");
+    const sends = sendCalls(host);
+    const crewNags = sends.filter((send) => send.threadId === "thr_crew");
+    const captain = sends.filter((send) => send.threadId === "thr_cap");
+    assert.equal(crewNags.length, 2);
+    assert.equal(captain.length, 1);
+    assert.match(captain[0]?.text ?? "", /NEEDS DECISION/);
+    await emitIdle(host, "still working");
+    assert.equal(sendCalls(host).length, sends.length);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("stopping or a manual interrupt is not nudged", async () => {
+  const host = await load();
+  try {
+    stubIdleSdk(host);
+    await seedCrew(host);
+    host.harness.sdk.stub("threads.events.list", async () => [
+      { data: { reason: "manual-stop" } },
+    ]);
+    const stopped = await emitIdle(host, "still working", { status: "stopping" });
+    assert.deepEqual(stopped.errors, []);
+    assert.equal(sendCalls(host).length, 0);
+    const interrupted = await emitIdle(host, "still working", { status: "idle" });
+    assert.deepEqual(interrupted.errors, []);
+    assert.equal(sendCalls(host).length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("provider-turn-idle still nudges; afk nudges the crew and holds the captain ping", async () => {
+  const host = await load();
+  try {
+    stubIdleSdk(host);
+    await seedCrew(host);
+    host.harness.sdk.stub("threads.events.list", async () => [
+      { data: { reason: "provider-turn-idle" } },
+    ]);
+    await host.bb.storage.kv.set("afk", {
+      on: true,
+      words: "out",
+      since: "2026-09-18T00:00:00.000Z",
+      held: [],
+    });
+    await host.harness.behavior.setSettings({ nudgeMaxPerCrew: 1, nudgeCooldownSeconds: 0, supervisionEnabled: true });
+    const nudged = await emitIdle(host, "no verdict");
+    assert.deepEqual(nudged.errors, []);
+    assert.equal(sendCalls(host).length, 1);
+    assert.equal(sendCalls(host)[0]?.threadId, "thr_crew");
+
+    const exhausted = await emitIdle(host, "no verdict");
+    assert.deepEqual(exhausted.errors, []);
+    assert.equal(sendCalls(host).filter((send) => send.threadId === "thr_cap").length, 0);
+    const afk = (await host.bb.storage.kv.get("afk")) as { held?: string[] };
+    assert.match(afk.held?.join("\n") ?? "", /NEEDS DECISION/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("nudgeEnabled false leaves the idle ping to supervision", async () => {
+  const host = await load();
+  try {
+    stubIdleSdk(host);
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ nudgeEnabled: false, supervisionEnabled: true });
+    const emitted = await emitIdle(host, "still working");
+    assert.deepEqual(emitted.errors, []);
+    const sends = sendCalls(host);
+    assert.equal(sends.length, 1);
+    assert.equal(sends[0]?.threadId, "thr_cap");
+    assert.match(sends[0]?.text ?? "", /crew c1 done/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
