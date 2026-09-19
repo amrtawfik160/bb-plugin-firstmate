@@ -263,6 +263,43 @@ test("deck titles and pins an untitled /captain thread", async () => {
   }
 });
 
+test("deck reports real firstmate active and does not re-init when fmHome is set", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home" },
+  });
+  await plugin(host.bb);
+  try {
+    stubCaptainDeck(host);
+    const result = await host.harness.behavior.runCli(["deck"], { threadId: "thr_cap", projectId: "proj_1" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /Real firstmate: active \(fmHome \/tmp\/fm-home\)/);
+    assert.match(result.stdout, /bb firstmate fm spawn/);
+    // Already initialized: deck must not clone or create a project again.
+    assert.equal(host.harness.sdk.callsTo("projects.create").length, 0);
+    assert.equal(host.harness.sdk.callsTo("terminals.create").length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("deck surfaces the one-time init command when real firstmate is not activatable", async () => {
+  const host = await load();
+  try {
+    stubCaptainDeck(host);
+    // No thread environment → host cannot be resolved → auto-init is skipped gracefully.
+    const result = await host.harness.behavior.runCli(["deck"], { threadId: "thr_cap", projectId: "proj_1" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /Real firstmate: not active yet/);
+    assert.match(result.stdout, /bb firstmate init --real/);
+    // Native BB deck still succeeded (thread titled + pinned).
+    assert.equal(host.harness.sdk.callsTo("threads.pin").length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("new /captain thread is titled and pinned on create, before deck runs", async () => {
   const host = await load();
   try {

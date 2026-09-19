@@ -1758,6 +1758,103 @@ export default async function plugin(bb: BbPluginApi) {
     return result.output;
   }
 
+  // Clone + overlay the real firstmate toolbelt on the host and persist fmHome.
+  // Idempotent: an existing clone is reused (FM_EXISTS) and the overlay re-applies
+  // safely. Shared by `init --real` and the auto-init on first captain deck.
+  async function initRealMode(
+    ctx: unknown,
+    signal: AbortSignal | undefined,
+    opts: { machine?: string; path?: string; name?: string; timeoutMs?: number },
+  ): Promise<{
+    hostId: string;
+    path: string;
+    existed: boolean;
+    projectId: string;
+    overlay: string;
+    tools: string;
+    summary: string;
+  }> {
+    const current = await settings.get();
+    const repo = current.firstmateRepo !== "" ? current.firstmateRepo : "https://github.com/kunchenguid/firstmate";
+    const name = opts.name ?? "firstmate";
+    const timeoutMs = opts.timeoutMs ?? 180000;
+    const hostId = await resolveHostId(opts.machine, ctx);
+    const home = (await runOnHost(hostId, `printf '%s' "$HOME"`, 30000, signal)).output.trim();
+    if (home === "") throw new Error("Could not resolve $HOME on host.");
+    const path = opts.path ?? `${home}/firstmate`;
+    const tools = await runOnHost(
+      hostId,
+      "command -v git; command -v gh; command -v bb; command -v python3; gh auth status 2>&1 | head -n 3",
+      30000,
+      signal,
+    );
+    if (!tools.output.includes("git")) throw new Error(`git missing on host. Tools:\n${tools.output}`);
+    const clone = await runOnHost(
+      hostId,
+      `[ -d ${shQuote(`${path}/.git`)} ] && echo FM_EXISTS || git clone ${shQuote(repo)} ${shQuote(path)}`,
+      timeoutMs,
+      signal,
+    );
+    if (clone.exitCode !== 0) throw new Error(`Clone failed:\n${truncate(clone.output, 1000)}`);
+    const existed = clone.output.includes("FM_EXISTS");
+    let projectId: string;
+    try {
+      const created = await bb.sdk.projects.create({ name, source: { type: "local_path", hostId, path } });
+      projectId = asRecord(created)["id"] as string;
+    } catch {
+      const projects = await bb.sdk.projects.list();
+      const rows: unknown[] = Array.isArray(projects) ? projects : [];
+      const match = rows.find((p) => asRecord(p)["name"] === name);
+      const id = match === undefined ? undefined : asRecord(match)["id"];
+      if (typeof id !== "string") throw new Error(`Project create failed and no project named ${name} found.`);
+      projectId = id;
+    }
+    const overlayOut = await installBbBackend(hostId, path, projectId, timeoutMs, signal);
+    try {
+      await settings.experimental_set({ fmHome: path });
+    } catch {
+      // persist best-effort
+    }
+    const summary = [
+      `host: ${hostId}`,
+      `path: ${path} (${existed ? "existed" : "cloned"})`,
+      `project: ${projectId}`,
+      `backend: bb (overlay installed; config/backend=bb)`,
+      `fm: bb firstmate fm spawn -- --mode direct-PR -- ship "<task>"`,
+      `overlay:\n${truncate(overlayOut, 800)}`,
+      `tools:\n${truncate(tools.output, 500)}`,
+    ].join("\n");
+    return { hostId, path, existed, projectId, overlay: overlayOut, tools: tools.output, summary };
+  }
+
+  // Real firstmate is the default. On deck, if it is not already initialized,
+  // clone + overlay it now (best-effort); on any failure, surface the single
+  // one-time command the captain must run. Returns a line for the deck digest.
+  async function ensureRealModeForDeck(ctx: unknown, signal: AbortSignal | undefined): Promise<string> {
+    const current = await settings.get();
+    if (current.fmHome.trim() !== "") {
+      return [
+        `Real firstmate: active (fmHome ${current.fmHome}).`,
+        `Dispatch through the full toolbelt: bb firstmate fm spawn -- --mode direct-PR -- ship "<task>".`,
+      ].join("\n");
+    }
+    try {
+      const res = await initRealMode(ctx, signal, {});
+      return [
+        `Real firstmate: initialized now (${res.existed ? "reused clone" : "cloned"}).`,
+        res.summary,
+      ].join("\n");
+    } catch (error) {
+      return [
+        "Real firstmate: not active yet. Run this once to unlock the full toolbelt",
+        "(194 bin/fm-*.sh scripts, 21 skills, harness adapters):",
+        "  bb firstmate init --real",
+        `(auto-init skipped: ${error instanceof Error ? error.message : String(error)})`,
+        "Native BB dispatch/deliver/merge still works in the meantime.",
+      ].join("\n");
+    }
+  }
+
   async function runFmScript(input: {
     script: string;
     args: string[];
@@ -1943,16 +2040,18 @@ export default async function plugin(bb: BbPluginApi) {
 
   function guideText(repo: string): string {
     return [
-      "firstmate inside BB — two planes, one runtime:",
-      "1. Native deck (plugin SDK / Fleet UI): bb firstmate deck, then dispatch/tell/watch/merge.",
-      "2. Real firstmate bin/ scripts: bb firstmate init --real, then bb firstmate fm <script> …",
-      "   Scripts keep policy (brief, gate, inbox, watch, merge, afk, bearings, backlog).",
+      "firstmate inside BB — real mode is the default, two planes over one runtime:",
+      "1. Real firstmate bin/ scripts (the full toolbelt): bb firstmate fm <script> …",
+      "   194 bin/fm-*.sh scripts + the original skills/harness adapters keep policy",
+      "   (brief, gate, inbox, watch, merge, afk, bearings, backlog). `/captain` (deck)",
+      "   auto-clones + overlays this on first run; no manual step if the host has git/gh.",
+      "2. Native deck (plugin SDK / Fleet UI): bb firstmate deck, then dispatch/tell/watch/merge.",
       "   BB is the session backend (threads + managed-worktree), like tmux/orca — not a rewrite of bin/.",
-      "Native dispatch (writes state/<id>.meta when fmHome is set, so peek/send/teardown see Fleet crews):",
-      "  bb firstmate dispatch --project <proj> -- \"fix flaky login test\"",
-      "Script spawn (after init --real):",
+      "Primary dispatch (real toolbelt, after deck/init --real):",
       "  bb firstmate fm spawn -- --mode direct-PR -- ship \"fix flaky login test\"",
-      `Optional clone: bb firstmate init --real  (repo ${repo}; overlays backends/bb.sh, sets config/backend=bb)`,
+      "Native dispatch (BB transport; writes state/<id>.meta when fmHome is set, so the scripts see Fleet crews):",
+      "  bb firstmate dispatch --project <proj> -- \"fix flaky login test\"",
+      `One-time activation if auto-init was skipped: bb firstmate init --real  (repo ${repo}; overlays backends/bb.sh, sets config/backend=bb, persists fmHome)`,
     ].join("\n");
   }
 
@@ -2043,10 +2142,13 @@ export default async function plugin(bb: BbPluginApi) {
     presentation: { label: { pending: "Taking the deck", completed: "On deck" } },
     parameters: z.object({}),
     async execute(_args, ctx) {
-      const threadId = asRecord(ctx)["threadId"];
+      const record = asRecord(ctx);
+      const threadId = record["threadId"];
       if (typeof threadId !== "string") return toolError("No thread to mark as captain.");
       await markDeck(threadId);
-      return `Captain, on deck.\n${await sessionDigest()}`;
+      const signal = record["signal"] as AbortSignal | undefined;
+      const real = await ensureRealModeForDeck(ctx, signal);
+      return `Captain, on deck.\n${real}\n${await sessionDigest()}`;
     },
   });
 
@@ -2979,8 +3081,13 @@ export default async function plugin(bb: BbPluginApi) {
           case "deck": {
             if (ctxThread === undefined) return fail("No thread: run this from a BB thread.");
             await markDeck(ctxThread);
+            const real = await ensureRealModeForDeck(ctx, signal);
+            const realMode = (await settings.get()).fmHome.trim() !== "";
             const digest = await sessionDigest();
-            return reply({ captain: true, threadId: ctxThread, digest }, `Captain, on deck.\n${digest}`);
+            return reply(
+              { captain: true, threadId: ctxThread, realMode, digest },
+              `Captain, on deck.\n${real}\n${digest}`,
+            );
           }
           case "session": {
             const digest = await sessionDigest();
@@ -2997,56 +3104,16 @@ export default async function plugin(bb: BbPluginApi) {
               ].join("\n");
               return reply({ native: true, threadId: ctxThread ?? null }, text);
             }
-            const repo = current.firstmateRepo !== "" ? current.firstmateRepo : "https://github.com/kunchenguid/firstmate";
-            const name = flagStr(flags, "name") ?? "firstmate";
-            const timeoutMs = Math.min(600, Math.max(30, Number(flagStr(flags, "timeout") ?? "180"))) * 1000;
-            const hostId = await resolveHostId(flagStr(flags, "machine"), ctx);
-            const home = (await runOnHost(hostId, `printf '%s' "$HOME"`, 30000, signal)).output.trim();
-            if (home === "") throw new Error("Could not resolve $HOME on host.");
-            const path = flagStr(flags, "path") ?? `${home}/firstmate`;
-            const tools = await runOnHost(
-              hostId,
-              "command -v git; command -v gh; command -v bb; command -v python3; gh auth status 2>&1 | head -n 3",
-              30000,
-              signal,
+            const res = await initRealMode(ctx, signal, {
+              machine: flagStr(flags, "machine"),
+              path: flagStr(flags, "path"),
+              name: flagStr(flags, "name"),
+              timeoutMs: Math.min(600, Math.max(30, Number(flagStr(flags, "timeout") ?? "180"))) * 1000,
+            });
+            return reply(
+              { hostId: res.hostId, path: res.path, existed: res.existed, projectId: res.projectId, backend: "bb", tools: res.tools, overlay: res.overlay },
+              res.summary,
             );
-            if (!tools.output.includes("git")) throw new Error(`git missing on host. Tools:\n${tools.output}`);
-            const clone = await runOnHost(
-              hostId,
-              `[ -d ${shQuote(`${path}/.git`)} ] && echo FM_EXISTS || git clone ${shQuote(repo)} ${shQuote(path)}`,
-              timeoutMs,
-              signal,
-            );
-            if (clone.exitCode !== 0) throw new Error(`Clone failed:\n${truncate(clone.output, 1000)}`);
-            const existed = clone.output.includes("FM_EXISTS");
-            let projectId: string;
-            try {
-              const created = await bb.sdk.projects.create({ name, source: { type: "local_path", hostId, path } });
-              projectId = asRecord(created)["id"] as string;
-            } catch {
-              const projects = await bb.sdk.projects.list();
-              const rows: unknown[] = Array.isArray(projects) ? projects : [];
-              const match = rows.find((p) => asRecord(p)["name"] === name);
-              const id = match === undefined ? undefined : asRecord(match)["id"];
-              if (typeof id !== "string") throw new Error(`Project create failed and no project named ${name} found.`);
-              projectId = id;
-            }
-            const overlayOut = await installBbBackend(hostId, path, projectId, timeoutMs, signal);
-            try {
-              await settings.experimental_set({ fmHome: path });
-            } catch {
-              // persist best-effort
-            }
-            const summary = [
-              `host: ${hostId}`,
-              `path: ${path} (${existed ? "existed" : "cloned"})`,
-              `project: ${projectId}`,
-              `backend: bb (overlay installed; config/backend=bb)`,
-              `fm: bb firstmate fm spawn -- --mode direct-PR -- ship "<task>"`,
-              `overlay:\n${truncate(overlayOut, 800)}`,
-              `tools:\n${truncate(tools.output, 500)}`,
-            ].join("\n");
-            return reply({ hostId, path, existed, projectId, backend: "bb", tools: tools.output, overlay: overlayOut }, summary);
           }
           case "dispatch": {
             const tasks =

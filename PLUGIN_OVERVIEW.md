@@ -12,9 +12,12 @@ Install, then run `/captain` in any thread — that calls `deck` and is the setu
 - Event supervision: `thread.idle` / `thread.failed` / `turn.failed` /
   `interaction.pending`. Stuck checker still samples output. Crews get no
   dispatch tools.
-- Real firstmate `bin/` via `bb firstmate fm` after `init --real`. BB is the
-  runtime backend (`FM_BACKEND=bb`); scripts are not rewritten in TypeScript.
-  Native `dispatch` writes `state/<id>.meta` so those scripts see Fleet crews.
+- Real firstmate `bin/` is the default: `/captain` (deck) auto-clones + overlays
+  the full toolbelt on first run (or prints one command, `bb firstmate init
+  --real`, if the host can't). Then `bb firstmate fm <script>` runs the real
+  policy scripts. BB is the runtime backend (`FM_BACKEND=bb`); scripts are not
+  rewritten in TypeScript. Native `dispatch` writes `state/<id>.meta` so those
+  scripts see Fleet crews.
 - Fleet sidebar board + thread-header chip + `@crew` mentions.
 
 Parent permission is a ceiling. Ship crews default to an isolated worktree.
