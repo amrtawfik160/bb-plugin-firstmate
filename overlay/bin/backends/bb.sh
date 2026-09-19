@@ -140,13 +140,10 @@ Do not dispatch nested crews. Work only this task. End with DONE:, BLOCKED:, or 
 
 $prompt"
   parent=${FM_BB_PARENT_THREAD_ID:-${BB_THREAD_ID:-}}
-  perm=${FM_BB_PERMISSION_MODE:-}
-  if [ -z "$perm" ]; then
-    case "${YOLO:-off}" in
-      on|true|1) perm=full ;;
-      *) perm=auto ;;
-    esac
-  fi
+  # Permission is a BB concern, not the firstmate yolo axis: yolo governs merge
+  # authority, not the crew's sandbox. Only an explicit FM_BB_PERMISSION_MODE
+  # raises it; default auto. (Previously yolo=on forced BB full permission.)
+  perm=${FM_BB_PERMISSION_MODE:-auto}
   vis=visible
   [ "${FM_BB_HIDDEN:-0}" = 1 ] && vis=hidden
   [ "${FM_BB_VISIBLE:-1}" = 0 ] && vis=hidden
@@ -172,6 +169,18 @@ for row in rows:
 sys.exit(1)
 ' 2>/dev/null || true)
   fi
+  # Provider/model/reasoning come from FM_BB_* env, else fm-spawn's resolved
+  # dispatch-profile globals (MODEL/EFFORT are in scope here). Propagating them
+  # is what lets `fm spawn --effort xhigh` actually reach the BB thread instead
+  # of only landing in state/<id>.meta.
+  local provider model reasoning
+  provider=${FM_BB_PROVIDER:-}
+  model=${FM_BB_MODEL:-${MODEL:-}}
+  reasoning=${FM_BB_REASONING:-${FM_BB_EFFORT:-${EFFORT:-}}}
+  case "$reasoning" in
+    low|medium|high|xhigh|max|ultra|ultracode|none) ;;
+    *) reasoning= ;;
+  esac
   set -- thread spawn --json --project "$project_id" --title "$name" \
     --prompt "$prompt" --visibility "$vis" --permission-mode "$perm"
   if [ "${FM_BB_SHARED_ENV:-0}" = 1 ]; then
@@ -180,14 +189,18 @@ sys.exit(1)
     set -- "$@" --new-environment worktree
   fi
   [ -z "$parent" ] || set -- "$@" --parent-thread "$parent"
-  [ -z "${FM_BB_PROVIDER:-}" ] || set -- "$@" --provider "$FM_BB_PROVIDER"
-  [ -z "${FM_BB_MODEL:-}" ] || set -- "$@" --model "$FM_BB_MODEL"
+  [ -z "$provider" ] || set -- "$@" --provider "$provider"
+  [ -z "$model" ] || set -- "$@" --model "$model"
+  [ -z "$reasoning" ] || set -- "$@" --reasoning-level "$reasoning"
   [ -z "$machine" ] || set -- "$@" --machine "$machine"
   out=$(bb "$@") || return 1
   thread_id=$(printf '%s' "$out" | fm_backend_bb_json_field id) || {
     echo "error: bb thread spawn did not return a thread id for $name" >&2
     return 1
   }
+  # Tag the thread as a firstmate crew so the plugin's agent config gives it the
+  # crewmate contract (no captain tools/skills), not the unmarked captain fallback.
+  bb firstmate mark-crew "$thread_id" --shape "${kind:-ship}" >/dev/null 2>&1 || true
   wt_path=$(printf '%s' "$out" | fm_backend_bb_json_field path 2>/dev/null || true)
   tries=0
   while [ -z "$wt_path" ] && [ "$tries" -lt 45 ]; do
@@ -433,7 +446,19 @@ fm_backend_bb_remove_worktree() {  # <thread-id-or-worktree-id>
   local id
   id=$(fm_backend_bb_thread_id "$1")
   [ -n "$id" ] || { echo "error: refusing empty BB remove_worktree target" >&2; return 1; }
-  fm_backend_bb_worktree_is_clean "$1" "$id" || return 1
+  # Upstream scout carve-out: a completed scout's worktree is disposable scratch
+  # (its durable deliverable is the report, already gated by teardown), so it is
+  # discarded without the dirty-tree refusal. --force is the captain's explicit
+  # discard. Ship work still gets the full clean-or-refuse protection. KIND/FORCE
+  # are fm-teardown.sh globals in scope here.
+  case "${KIND:-}" in
+    scout) ;;
+    *)
+      if [ "${FORCE:-}" != "--force" ]; then
+        fm_backend_bb_worktree_is_clean "$1" "$id" || return 1
+      fi
+      ;;
+  esac
   fm_backend_bb_kill "$id"
   fm_backend_bb_tool_check || return 1
   bb thread archive "$id" || return 1

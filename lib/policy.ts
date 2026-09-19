@@ -1,6 +1,14 @@
 export type Shape = "ship" | "scout";
 export type DeliveryMode = "direct-PR" | "no-mistakes" | "local-only";
 export type PermissionMode = "accept-edits" | "auto" | "full";
+export type ReasoningLevel = "low" | "medium" | "high" | "xhigh" | "max";
+
+const REASONING_LEVELS: ReadonlySet<string> = new Set(["low", "medium", "high", "xhigh", "max"]);
+
+/** Dispatch-profile reasoning effort, same scale as fm-spawn --effort (minus ultra). */
+export function toReasoningLevel(value: unknown): ReasoningLevel | undefined {
+  return typeof value === "string" && REASONING_LEVELS.has(value) ? (value as ReasoningLevel) : undefined;
+}
 
 const PERM_RANK: Record<PermissionMode, number> = {
   "accept-edits": 0,
@@ -255,4 +263,77 @@ export function bearingsText(input: {
 
 export function truncate(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+export interface MergeGateInput {
+  /** Live PR state: open | merged | closed | draft | ... */
+  prState: string;
+  /** Live check rollup state: passing | failing | pending | no_checks | unknown. */
+  checksState: string;
+  /** Forge mergeability: MERGEABLE | CONFLICTING | UNKNOWN. */
+  mergeable: string;
+  failed: number;
+  pending: number;
+  /** Exact check name the captain waives (mirrors fm-pr-merge --allow-red). */
+  allowRedCheck?: string;
+  /** Names of the non-green checks, when they can be read. null when unknown. */
+  redChecks?: string[] | null;
+}
+
+export type MergeGate = { ok: true; waived: string[] } | { ok: false; reason: string };
+
+/**
+ * The check/mergeability half of the merge decision, mirroring fm-pr-merge.sh.
+ * Captain authority (`yes`/yolo) is enforced by the caller and is deliberately
+ * NOT part of this gate: an allowRedCheck waiver never grants authority, and
+ * authority never waives a red check. Zero checks (no_checks) is treated as no
+ * failing checks. A red check lands only when the captain names it exactly and
+ * every other check is green — never silently.
+ */
+export function mergeGate(input: MergeGateInput): MergeGate {
+  if (input.prState !== "open") {
+    return { ok: false, reason: `PR is ${input.prState === "" ? "unknown" : input.prState}, not open.` };
+  }
+  const waive = (input.allowRedCheck ?? "").trim();
+  const cs = input.checksState;
+  if (cs === "failing") {
+    if (waive === "") {
+      return {
+        ok: false,
+        reason: `checks failing (failed ${input.failed}, pending ${input.pending}). To land anyway, name the exact red check to waive: allowRedCheck=<check-name>.`,
+      };
+    }
+    if (!Array.isArray(input.redChecks)) {
+      return {
+        ok: false,
+        reason: `cannot read individual check names to honor allowRedCheck=${waive}; refusing (a failed read is never an empty red set).`,
+      };
+    }
+    if (!input.redChecks.includes(waive)) {
+      return {
+        ok: false,
+        reason: `allowRedCheck=${waive} names no failing check (red: ${input.redChecks.join(", ") || "none"}).`,
+      };
+    }
+    const remaining = input.redChecks.filter((name) => name !== waive);
+    if (remaining.length > 0) {
+      return {
+        ok: false,
+        reason: `other checks still red (${remaining.join(", ")}); allowRedCheck waives one exact name and every other check must be green.`,
+      };
+    }
+    if (input.pending > 0) {
+      return { ok: false, reason: `checks still pending (${input.pending}); wait before waiving a red check.` };
+    }
+    return mergeableGate(input, [waive]);
+  }
+  if (cs === "pending") return { ok: false, reason: `checks pending (${input.pending}).` };
+  if (cs === "unknown") return { ok: false, reason: "checks unknown; cannot confirm green." };
+  // passing | no_checks — no failing checks. An allowRedCheck with nothing red waives nothing.
+  return mergeableGate(input, []);
+}
+
+function mergeableGate(input: MergeGateInput, waived: string[]): MergeGate {
+  if (input.mergeable !== "MERGEABLE") return { ok: false, reason: `PR not mergeable (${input.mergeable}).` };
+  return { ok: true, waived };
 }

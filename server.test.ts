@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import {
   createFakePluginHost,
   makePluginAgentConfigurationContext,
   makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
-import plugin, { formatFmMeta } from "./server.ts";
+import plugin, { formatFmMeta, toolbeltPhrase } from "./server.ts";
 
 const SKILLS = ["captain", "firstmate", "afk", "ahoy", "bearings", "quiet", "stow"] as const;
 
@@ -274,7 +277,7 @@ test("deck reports real firstmate active and does not re-init when fmHome is set
     stubCaptainDeck(host);
     const result = await host.harness.behavior.runCli(["deck"], { threadId: "thr_cap", projectId: "proj_1" });
     assert.equal(result.exitCode, 0, result.stderr);
-    assert.match(result.stdout, /Real firstmate: active \(fmHome \/tmp\/fm-home\)/);
+    assert.match(result.stdout, /Real firstmate: active \(fmHome \/tmp\/fm-home;/);
     assert.match(result.stdout, /bb firstmate fm spawn/);
     // Already initialized: deck must not clone or create a project again.
     assert.equal(host.harness.sdk.callsTo("projects.create").length, 0);
@@ -1022,4 +1025,307 @@ test("forget drops the crew protocol-nudges row", async () => {
   } finally {
     await host.harness.lifecycle.dispose();
   }
+});
+
+// --- Phase 1: adapter, gates, reconciliation, version-skew, real bearings -----
+
+function shipRow(id: string, threadId: string, parentThreadId: string | null, posture = "direct-PR") {
+  return {
+    id,
+    task: "fix login",
+    projectId: "proj_1",
+    threadId,
+    parentThreadId,
+    providerId: null,
+    model: null,
+    reasoningLevel: null,
+    worktree: true,
+    shape: "ship" as const,
+    posture,
+    createdAt: "2026-09-18T00:00:00.000Z",
+  };
+}
+
+function hostOutput(text: string, code = 0) {
+  const body = `\n${text}\n__FM_HOST_RC:${code}\n`;
+  return { nextSeq: 1, chunks: [{ dataBase64: Buffer.from(body).toString("base64") }] };
+}
+
+test("toolbeltPhrase uses computed counts when known, neutral text otherwise", () => {
+  assert.match(toolbeltPhrase("175", "21"), /175 bin\/fm-\*\.sh scripts \+ 21 skills/);
+  assert.match(toolbeltPhrase("", ""), /full bin\/fm-\*\.sh toolbelt/);
+  assert.match(toolbeltPhrase("0", "0"), /full bin\/fm-\*\.sh toolbelt/);
+});
+
+test("dispatch forwards reasoningLevel to the spawned thread", async () => {
+  const host = await load();
+  try {
+    host.harness.sdk.stub("environments.list", async () => [
+      { hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" },
+    ]);
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew" }));
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "starting" }));
+    const result = await host.harness.behavior.runCli(
+      ["dispatch", "--project", "proj_1", "--reasoning-level", "xhigh", "--", "fix flaky login"],
+      { projectId: "proj_1" },
+    );
+    assert.equal(result.exitCode, 0, result.stderr);
+    const args = host.harness.sdk.callsTo("threads.spawn")[0]![0] as { reasoningLevel?: string };
+    assert.equal(args.reasoningLevel, "xhigh");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("merge lands a PR with zero checks (no_checks) on the captain's word", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () =>
+      makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }),
+    );
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+    host.harness.sdk.stub("threads.output", async () => ({ output: "DONE: shipped" }));
+    host.harness.sdk.stub("threads.archive", async () => ({}));
+    host.harness.sdk.stub("threads.stop", async () => ({}));
+    host.harness.sdk.stub("environments.pullRequest", async () => ({
+      outcome: "available",
+      pullRequest: {
+        url: "https://gh/pr/1", number: 1, title: "t", state: "open",
+        checks: { state: "no_checks", failedCount: 0, pendingCount: 0, passedCount: 0 },
+        mergeability: { mergeable: "MERGEABLE" },
+      },
+    }));
+    let merged = 0;
+    host.harness.sdk.stub("environments.mergePullRequest", async () => { merged++; return {}; });
+    const result = await host.harness.behavior.runCli(["merge", "c1", "--yes"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(merged, 1);
+    assert.match(result.stdout, /Merged https:\/\/gh\/pr\/1/);
+    assert.deepEqual((await host.bb.storage.kv.get("crews")) as unknown[], []);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("allowRedCheck is separate from authority: no --yes still refuses", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () =>
+      makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }),
+    );
+    const result = await host.harness.behavior.runCli(["merge", "c1", "--allow-red", "flaky-e2e"]);
+    assert.equal(result.exitCode, 1);
+    assert.match(result.stderr, /captain's word/i);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("merge drops the real state meta after landing", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home" },
+  });
+  await plugin(host.bb);
+  try {
+    const hostCommands: string[] = [];
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () =>
+      makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }),
+    );
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+    host.harness.sdk.stub("threads.output", async () => ({ output: "DONE: shipped" }));
+    host.harness.sdk.stub("threads.archive", async () => ({}));
+    host.harness.sdk.stub("threads.stop", async () => ({}));
+    host.harness.sdk.stub("environments.list", async () => [
+      { hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" },
+    ]);
+    host.harness.sdk.stub("environments.pullRequest", async () => ({
+      outcome: "available",
+      pullRequest: {
+        url: "https://gh/pr/1", number: 1, title: "t", state: "open",
+        checks: { state: "passing", failedCount: 0, pendingCount: 0, passedCount: 3 },
+        mergeability: { mergeable: "MERGEABLE" },
+      },
+    }));
+    host.harness.sdk.stub("environments.mergePullRequest", async () => ({}));
+    host.harness.sdk.stub("terminals.create", async (args: { start?: { command?: string } }) => {
+      if (typeof args.start?.command === "string") hostCommands.push(args.start.command);
+      return { id: "term_1" };
+    });
+    host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+    host.harness.sdk.stub("terminals.output", async () => hostOutput(""));
+    host.harness.sdk.stub("terminals.close", async () => ({}));
+    const result = await host.harness.behavior.runCli(["merge", "c1", "--yes"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.ok(
+      hostCommands.some((cmd) => cmd.includes("rm -f") && cmd.includes("c1.meta")),
+      `no meta drop in ${hostCommands.join("\n---\n")}`,
+    );
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("bearings reconciles a crew whose PR merged externally", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () =>
+      makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }),
+    );
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+    host.harness.sdk.stub("threads.output", async () => ({ output: "DONE: shipped" }));
+    host.harness.sdk.stub("threads.archive", async () => ({}));
+    host.harness.sdk.stub("threads.stop", async () => ({}));
+    host.harness.sdk.stub("environments.pullRequest", async () => ({
+      outcome: "available",
+      pullRequest: {
+        url: "https://gh/pr/1", number: 1, title: "t", state: "merged",
+        checks: { state: "passing", failedCount: 0, pendingCount: 0, passedCount: 1 },
+        mergeability: { mergeable: "MERGEABLE" },
+      },
+    }));
+    const result = await host.harness.behavior.runCli(["bearings"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.deepEqual((await host.bb.storage.kv.get("crews")) as unknown[], []);
+    assert.equal(host.harness.sdk.callsTo("threads.archive").length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("mark-crew tags a thread so the crewmate contract applies", async () => {
+  const host = await load();
+  try {
+    host.harness.sdk.stub("threads.updatePluginMetadata", async (args: unknown) => args);
+    const result = await host.harness.behavior.runCli(["mark-crew", "thr_x", "--shape", "scout"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    const call = host.harness.sdk.callsTo("threads.updatePluginMetadata")[0]![0] as {
+      threadId?: string; set?: Record<string, unknown>;
+    };
+    assert.equal(call.threadId, "thr_x");
+    assert.equal(call.set?.crew, "true");
+    assert.equal(call.set?.shape, "scout");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("retry with a new reasoning relaunches in the same worktree", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () =>
+      makeThreadResponse({ id: "thr_crew", status: "error", environmentId: "env_wt" }),
+    );
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+    host.harness.sdk.stub("threads.stop", async () => ({}));
+    host.harness.sdk.stub("threads.archive", async () => ({}));
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew2" }));
+    const result = await host.harness.behavior.runCli(["retry", "c1", "--reasoning-level", "max"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    const args = host.harness.sdk.callsTo("threads.spawn")[0]![0] as {
+      environment?: { type?: string; environmentId?: string }; reasoningLevel?: string;
+    };
+    assert.equal(args.environment?.type, "reuse");
+    assert.equal(args.environment?.environmentId, "env_wt");
+    assert.equal(args.reasoningLevel, "max");
+    assert.equal(host.harness.sdk.callsTo("threads.retry").length, 0);
+    const crews = (await host.bb.storage.kv.get("crews")) as Array<{ threadId: string; reasoningLevel: string | null }>;
+    assert.equal(crews[0]?.threadId, "thr_crew2");
+    assert.equal(crews[0]?.reasoningLevel, "max");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("retry with no override still resubmits the failed turn on the same thread", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () =>
+      makeThreadResponse({ id: "thr_crew", status: "error", environmentId: "env_wt" }),
+    );
+    host.harness.sdk.stub("threads.retry", async () => ({}));
+    const result = await host.harness.behavior.runCli(["retry", "c1"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(host.harness.sdk.callsTo("threads.retry").length, 1);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("guide reports computed toolbelt counts when known", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmScriptCount: "175", fmSkillCount: "21" },
+  });
+  await plugin(host.bb);
+  try {
+    const result = await host.harness.behavior.runCli(["guide"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /175 bin\/fm-\*\.sh scripts \+ 21 skills/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("deck renders real fm-bearings-snapshot labelled, native digest as cache", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home" },
+  });
+  await plugin(host.bb);
+  try {
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () =>
+      makeThreadResponse({ id: "thr_cap", title: null, titleFallback: "/captain", projectId: "proj_1", environmentId: "env_cap" }),
+    );
+    host.harness.sdk.stub("threads.update", async (args: unknown) => args);
+    host.harness.sdk.stub("threads.pin", async (args: unknown) => args);
+    host.harness.sdk.stub("threads.updatePluginMetadata", async () => ({}));
+    host.harness.sdk.stub("projects.get", async () => ({
+      id: "proj_1", name: "Proj", kind: "standard" as const, gitRemoteUrl: null, sources: [], createdAt: 0, updatedAt: 0,
+    }));
+    host.harness.sdk.stub("environments.get", async () => ({ id: "env_cap", hostId: "host_1", path: "/repo", isWorktree: false, status: "ready" }));
+    host.harness.sdk.stub("terminals.create", async () => ({ id: "term_1" }));
+    host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+    host.harness.sdk.stub("terminals.output", async () => hostOutput("FLEET SNAPSHOT: 0 crews"));
+    host.harness.sdk.stub("terminals.close", async () => ({}));
+    const result = await host.harness.behavior.runCli(["deck"], { threadId: "thr_cap", projectId: "proj_1" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /real bearings \(fm-bearings-snapshot; authoritative\)/);
+    assert.match(result.stdout, /FLEET SNAPSHOT: 0 crews/);
+    assert.match(result.stdout, /native digest \(BB KV cache \/ fallback\)/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("bb overlay adapter propagates reasoning, tags crews, drops yolo->full, carves out scouts", () => {
+  const src = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), "overlay", "bin", "backends", "bb.sh"),
+    "utf8",
+  );
+  assert.match(src, /--reasoning-level/);
+  assert.match(src, /FM_BB_REASONING/);
+  assert.match(src, /firstmate mark-crew/);
+  // yolo no longer forces BB full permission
+  assert.doesNotMatch(src, /perm=full/);
+  // scout scratch carve-out in remove_worktree
+  assert.match(src, /KIND:-/);
+  assert.match(src, /scout\)/);
 });
