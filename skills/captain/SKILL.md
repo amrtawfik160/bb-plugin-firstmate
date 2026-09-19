@@ -15,7 +15,9 @@ This thread is now the first mate. The user is the captain.
   That marks the thread, names it `Captain · <project>` if untitled, pins it,
   turns supervision on, prints memory + bearings, and **auto-activates the full
   real firstmate toolbelt** (clones + overlays it on the host on first run;
-  reused idempotently after). Then acknowledge in one line ("Captain, on deck.
+  reused and fast-forwarded — ff-only, clean tree — after). The deck digest
+  shows the real `fm-bearings-snapshot` (authoritative) next to the native BB KV
+  digest (labelled cache/fallback). Then acknowledge in one line ("Captain, on deck.
   Give me orders.") unless the digest already needs a decision.
 - If deck reports "Real firstmate: not active yet" (host missing git/gh, or the
   thread has no environment), run the one printed command **once**:
@@ -34,8 +36,9 @@ Prefer the `firstmate_*` tools over shelling out. CLI remains valid.
 ## Real firstmate is the default
 
 Deck activates the full firstmate toolbelt on the host: the real `bin/fm-*.sh`
-scripts (~177), the original skills (~22 under `.agents/skills`), and the
-harness adapters (`bin/backends/`: bb, tmux, orca, cmux, zellij, herdr). BB is
+scripts, the original skills (under `.agents/skills`), and the harness adapters
+(`bin/backends/`: bb, tmux, orca, cmux, zellij, herdr) — the deck digest reports
+the actual counts from the clone, not a hardcoded number. BB is
 the runtime backend (`FM_BACKEND=bb`) — threads + managed-worktree — not a
 rewrite. Two planes, one runtime:
 
@@ -89,9 +92,14 @@ within its exact scope. Never infer, broaden, or carry it elsewhere.
   checker). Stuck ladder: `crew` peek → one-line `tell` → `interrupt` or
   `stop`+rebrief relaunch → second failure means report failed, preserve work.
 - **Deliver**: `deliver` per crew (committed + uncommitted diff + PR). Merge
-  via `merge` with `yes` (green + mergeable; yolo skips yes). Local-only lands
-  with ff-only onto the project checkout. Scout lands via report; promote with
-  `firstmate_promote` / `bb firstmate promote <id>` — never expand the scout.
+  via `merge` with `yes` (green + mergeable; a PR with zero checks / `no_checks`
+  counts as no failing checks; yolo skips yes). Authority (`yes`) is separate
+  from `--allow-red <check-name>`, which waives one exact failing check while
+  every other check must stay green — never silent, and never grants authority.
+  Local-only lands with ff-only onto the project checkout. Scout lands via
+  report; promote with `firstmate_promote` / `bb firstmate promote <id>` — never
+  expand the scout. `deck`/`bearings` retire any crew whose PR was merged or
+  closed outside BB.
 - **Close out**: `bearings` digest, `forget --stop` retired crews. File
   follow-ups with `queue add`, open questions with `decide ask` (collect the
   captain's choice with AskUserQuestion, then `decide answer`), durable facts
@@ -110,16 +118,18 @@ within its exact scope. Never infer, broaden, or carry it elsewhere.
 | queue | `firstmate_queue` / `queue add --project <id> [--after <qid>] [--wait-until <iso>] -- "<title>"` |
 | decisions | `firstmate_decide` / `decide ask\|answer` + AskUserQuestion |
 | track | `firstmate_crew`, `firstmate_crews`, `watch`, `tell` (doorbell), `interrupt`, `stop`, `retry` |
-| delivery | `firstmate_deliver`, `firstmate_merge`, `promote` |
+| recovery relaunch | `retry <id> --model m` / `--provider p` / `--reasoning-level l` (fresh thread, same worktree) |
+| delivery | `firstmate_deliver`, `firstmate_merge` (`--yes`, `--allow-red <check>`), `promote` |
 | secondmate | `firstmate_secondmate` / `bb firstmate secondmate register --project <id> --thread <id>` |
 | memory | `firstmate_memory` / `memory [show\|set-captain\|add-learning\|drop-learning\|clear]` |
 | watcher | `firstmate_supervision` / `supervision [on\|off\|status]` |
 | retire | `firstmate_forget` / `forget <id> [--stop] [--force]` |
 | afk / quiet | `firstmate_afk` / `firstmate_quiet` |
 
-Flags: `--title`, `--provider`, `--model`, `--permission-mode` (omit = resolve;
-parent permission is a ceiling), `--hidden` (default visible in the sidebar). `--json` when
-output drives code.
+Flags: `--title`, `--provider`, `--model`, `--reasoning-level low|medium|high|xhigh|max`
+(applied from turn 1), `--permission-mode` (omit = resolve; parent permission is
+a ceiling), `--hidden` (default visible in the sidebar). `--json` when output
+drives code.
 
 ## Modes
 

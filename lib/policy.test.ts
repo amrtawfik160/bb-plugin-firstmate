@@ -7,11 +7,97 @@ import {
   decisionDue,
   hasStatusProtocol,
   looksReadOnly,
+  mergeGate,
   parseOutcome,
   queueGate,
   quietShouldSend,
   resolveWorktree,
+  toReasoningLevel,
 } from "./policy.ts";
+
+test("toReasoningLevel accepts the dispatch-profile scale only", () => {
+  for (const level of ["low", "medium", "high", "xhigh", "max"]) {
+    assert.equal(toReasoningLevel(level), level);
+  }
+  assert.equal(toReasoningLevel("ultra"), undefined);
+  assert.equal(toReasoningLevel("none"), undefined);
+  assert.equal(toReasoningLevel(""), undefined);
+  assert.equal(toReasoningLevel(undefined), undefined);
+});
+
+const GREEN = { prState: "open", mergeable: "MERGEABLE", failed: 0, pending: 0 } as const;
+
+test("mergeGate treats zero checks (no_checks) as no failing checks", () => {
+  const gate = mergeGate({ ...GREEN, checksState: "no_checks" });
+  assert.deepEqual(gate, { ok: true, waived: [] });
+});
+
+test("mergeGate lands a green passing PR", () => {
+  assert.deepEqual(mergeGate({ ...GREEN, checksState: "passing" }), { ok: true, waived: [] });
+});
+
+test("mergeGate refuses pending and unknown checks", () => {
+  assert.equal(mergeGate({ ...GREEN, checksState: "pending", pending: 2 }).ok, false);
+  assert.equal(mergeGate({ ...GREEN, checksState: "unknown" }).ok, false);
+});
+
+test("mergeGate refuses a non-open PR and an unmergeable one", () => {
+  assert.equal(mergeGate({ ...GREEN, checksState: "passing", prState: "closed" }).ok, false);
+  assert.equal(mergeGate({ ...GREEN, checksState: "passing", mergeable: "CONFLICTING" }).ok, false);
+});
+
+test("mergeGate refuses failing checks without a waiver", () => {
+  const gate = mergeGate({ ...GREEN, checksState: "failing", failed: 1 });
+  assert.equal(gate.ok, false);
+  if (!gate.ok) assert.match(gate.reason, /allowRedCheck/);
+});
+
+test("mergeGate waives one exact red check when every other check is green", () => {
+  const gate = mergeGate({
+    ...GREEN,
+    checksState: "failing",
+    failed: 1,
+    allowRedCheck: "flaky-e2e",
+    redChecks: ["flaky-e2e"],
+  });
+  assert.deepEqual(gate, { ok: true, waived: ["flaky-e2e"] });
+});
+
+test("mergeGate refuses when the waiver leaves another red check", () => {
+  const gate = mergeGate({
+    ...GREEN,
+    checksState: "failing",
+    failed: 2,
+    allowRedCheck: "flaky-e2e",
+    redChecks: ["flaky-e2e", "typecheck"],
+  });
+  assert.equal(gate.ok, false);
+  if (!gate.ok) assert.match(gate.reason, /typecheck/);
+});
+
+test("mergeGate refuses a waiver that names no failing check", () => {
+  const gate = mergeGate({
+    ...GREEN,
+    checksState: "failing",
+    failed: 1,
+    allowRedCheck: "wrong-name",
+    redChecks: ["flaky-e2e"],
+  });
+  assert.equal(gate.ok, false);
+  if (!gate.ok) assert.match(gate.reason, /names no failing check/);
+});
+
+test("mergeGate never waives silently: an unreadable red set refuses", () => {
+  const gate = mergeGate({
+    ...GREEN,
+    checksState: "failing",
+    failed: 1,
+    allowRedCheck: "flaky-e2e",
+    redChecks: null,
+  });
+  assert.equal(gate.ok, false);
+  if (!gate.ok) assert.match(gate.reason, /cannot read/);
+});
 
 test("capPermission never exceeds parent", () => {
   assert.equal(capPermission("full", "auto"), "auto");
