@@ -98,6 +98,8 @@ const secondmateSchema = z.object({
 });
 type Secondmate = z.infer<typeof secondmateSchema>;
 
+const MAX_HELD = 20;
+
 const afkSchema = z.object({
   on: z.boolean(),
   words: z.string().default(""),
@@ -105,6 +107,19 @@ const afkSchema = z.object({
   held: z.array(z.string()).default([]),
 });
 type AfkState = z.infer<typeof afkSchema>;
+
+const quietSchema = z.object({
+  on: z.boolean(),
+  held: z.array(z.string()).default([]),
+});
+type QuietState = z.infer<typeof quietSchema>;
+
+/** Keep the newest holds. Overflow is returned so the caller can flush it instead of dropping the new line. */
+function pushHeld(held: string[], text: string): { held: string[]; evicted: string[] } {
+  const next = [...held, text];
+  if (next.length <= MAX_HELD) return { held: next, evicted: [] };
+  return { held: next.slice(next.length - MAX_HELD), evicted: next.slice(0, next.length - MAX_HELD) };
+}
 
 const CREWS_KEY = "crews";
 const QUEUE_KEY = "queue";
@@ -118,6 +133,18 @@ const AFK_KEY = "afk";
 const QUIET_KEY = "quiet";
 const NUDGE_KEY = "protocol-nudges";
 const MAX_CREWS = 50;
+// Newest of these is "tool/file activity". Output text alone false-alarms while a crew is editing.
+const TOOL_ACTIVITY_TYPES = [
+  "item/toolCall/progress",
+  "item/mcpToolCall/progress",
+  "item/commandExecution/outputDelta",
+  "item/fileChange/outputDelta",
+  "item/backgroundTask/progress",
+  "item/backgroundTask/completed",
+  "item/delegation/progress",
+  "item/delegation/completed",
+  "turn/diff/updated",
+] as const;
 const MAX_QUEUE = 100;
 const MAX_DECISIONS = 100;
 const MAX_DONE = 10;
@@ -598,8 +625,27 @@ export default async function plugin(bb: BbPluginApi) {
   async function writeAfk(state: AfkState | null): Promise<void> {
     await bb.storage.kv.set(AFK_KEY, state);
   }
+  async function readQuiet(): Promise<QuietState> {
+    const raw = await bb.storage.kv.get<unknown>(QUIET_KEY);
+    if (raw === true) return { on: true, held: [] };
+    const parsed = quietSchema.safeParse(raw);
+    return parsed.success ? parsed.data : { on: false, held: [] };
+  }
+  async function writeQuiet(state: QuietState): Promise<void> {
+    await bb.storage.kv.set(QUIET_KEY, state);
+  }
   async function isQuiet(): Promise<boolean> {
-    return (await bb.storage.kv.get<unknown>(QUIET_KEY)) === true;
+    return (await readQuiet()).on;
+  }
+  async function setQuiet(action: "on" | "off"): Promise<string> {
+    const prev = await readQuiet();
+    if (action === "on") {
+      await writeQuiet({ on: true, held: prev.held });
+      return "Quiet on";
+    }
+    await writeQuiet({ on: false, held: [] });
+    if (prev.held.length === 0) return "Quiet off";
+    return `Quiet off\nHeld while quiet:\n${prev.held.join("\n---\n")}`;
   }
   async function markQueueForCrew(crewId: string, status: "done"): Promise<void> {
     const items = await readQueue();
@@ -615,8 +661,16 @@ export default async function plugin(bb: BbPluginApi) {
 
   const watchStateSchema = z.record(
     z.string(),
-    z.object({ status: z.string(), hash: z.string(), at: z.number(), stuck: z.boolean() }),
+    z.object({
+      status: z.string(),
+      hash: z.string(),
+      at: z.number(),
+      stuck: z.boolean(),
+      activityAt: z.number().optional(),
+      alerted: z.string().optional(),
+    }),
   );
+  type WatchState = z.infer<typeof watchStateSchema>;
 
   async function publishFleet(): Promise<void> {
     try {
@@ -626,8 +680,21 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  async function deliverToCaptain(parentThreadId: string, text: string, crewId: string): Promise<void> {
+    try {
+      await bb.sdk.threads.send({
+        threadId: parentThreadId,
+        mode: "auto",
+        input: [{ type: "text", text, mentions: [] }],
+      });
+    } catch {
+      bb.log.warn(`notify failed for crew ${crewId}`);
+    }
+  }
+
   async function notifyCaptain(crew: Crew, event: string, output: string | null): Promise<void> {
     if (crew.parentThreadId === null) return;
+    const parentThreadId = crew.parentThreadId;
     let kind = event;
     let prUrl = "";
     if (event === "idle") {
@@ -638,9 +705,10 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
     const afk = await readAfk();
-    const quiet = await isQuiet();
+    const quietState = await readQuiet();
     const postureEvent = kind === "needs-decision" ? "idle" : kind;
-    const hold = (afk?.on === true && !afkShouldSend(postureEvent)) || (quiet && !quietShouldSend(postureEvent));
+    const quietHold = quietState.on && !quietShouldSend(postureEvent);
+    const afkHold = afk?.on === true && !afkShouldSend(postureEvent);
     const head =
       kind === "idle"
         ? `✅ crew ${crew.id} done`
@@ -670,20 +738,27 @@ export default async function plugin(bb: BbPluginApi) {
             : `next: bb firstmate crew ${crew.id}`,
     );
     const text = lines.join("\n").slice(0, 1500);
-    if (hold && afk !== null) {
-      afk.held = [...afk.held, text].slice(-20);
-      await writeAfk(afk);
+    if (quietHold || afkHold) {
+      const evicted: string[] = [];
+      if (quietHold) {
+        const pushed = pushHeld(quietState.held, text);
+        quietState.held = pushed.held;
+        evicted.push(...pushed.evicted);
+        await writeQuiet(quietState);
+      }
+      if (afkHold && afk !== null) {
+        const pushed = pushHeld(afk.held, text);
+        afk.held = pushed.held;
+        for (const line of pushed.evicted) {
+          if (!evicted.includes(line)) evicted.push(line);
+        }
+        await writeAfk(afk);
+      }
+      for (const line of evicted) await deliverToCaptain(parentThreadId, line, crew.id);
+      if (evicted.length > 0) await publishFleet();
       return;
     }
-    try {
-      await bb.sdk.threads.send({
-        threadId: crew.parentThreadId,
-        mode: "auto",
-        input: [{ type: "text", text, mentions: [] }],
-      });
-    } catch {
-      bb.log.warn(`notify failed for crew ${crew.id}`);
-    }
+    await deliverToCaptain(parentThreadId, text, crew.id);
     await publishFleet();
   }
 
@@ -1457,6 +1532,7 @@ export default async function plugin(bb: BbPluginApi) {
         try { await bb.sdk.threads.stop({ threadId: recovered.threadId }); } catch { /* */ }
       }
       await dropFmMeta(recovered);
+      await dropNudge(id);
       return `Forgot crew ${id} (was metadata-only)`;
     }
     await writeCrews(crews.filter((entry) => entry.id !== id));
@@ -1507,6 +1583,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     await publishFleet();
     await dropFmMeta(crew);
+    await dropNudge(id);
     return `Forgot crew ${id}`;
   }
 
@@ -1681,6 +1758,103 @@ export default async function plugin(bb: BbPluginApi) {
     return result.output;
   }
 
+  // Clone + overlay the real firstmate toolbelt on the host and persist fmHome.
+  // Idempotent: an existing clone is reused (FM_EXISTS) and the overlay re-applies
+  // safely. Shared by `init --real` and the auto-init on first captain deck.
+  async function initRealMode(
+    ctx: unknown,
+    signal: AbortSignal | undefined,
+    opts: { machine?: string; path?: string; name?: string; timeoutMs?: number },
+  ): Promise<{
+    hostId: string;
+    path: string;
+    existed: boolean;
+    projectId: string;
+    overlay: string;
+    tools: string;
+    summary: string;
+  }> {
+    const current = await settings.get();
+    const repo = current.firstmateRepo !== "" ? current.firstmateRepo : "https://github.com/kunchenguid/firstmate";
+    const name = opts.name ?? "firstmate";
+    const timeoutMs = opts.timeoutMs ?? 180000;
+    const hostId = await resolveHostId(opts.machine, ctx);
+    const home = (await runOnHost(hostId, `printf '%s' "$HOME"`, 30000, signal)).output.trim();
+    if (home === "") throw new Error("Could not resolve $HOME on host.");
+    const path = opts.path ?? `${home}/firstmate`;
+    const tools = await runOnHost(
+      hostId,
+      "command -v git; command -v gh; command -v bb; command -v python3; gh auth status 2>&1 | head -n 3",
+      30000,
+      signal,
+    );
+    if (!tools.output.includes("git")) throw new Error(`git missing on host. Tools:\n${tools.output}`);
+    const clone = await runOnHost(
+      hostId,
+      `[ -d ${shQuote(`${path}/.git`)} ] && echo FM_EXISTS || git clone ${shQuote(repo)} ${shQuote(path)}`,
+      timeoutMs,
+      signal,
+    );
+    if (clone.exitCode !== 0) throw new Error(`Clone failed:\n${truncate(clone.output, 1000)}`);
+    const existed = clone.output.includes("FM_EXISTS");
+    let projectId: string;
+    try {
+      const created = await bb.sdk.projects.create({ name, source: { type: "local_path", hostId, path } });
+      projectId = asRecord(created)["id"] as string;
+    } catch {
+      const projects = await bb.sdk.projects.list();
+      const rows: unknown[] = Array.isArray(projects) ? projects : [];
+      const match = rows.find((p) => asRecord(p)["name"] === name);
+      const id = match === undefined ? undefined : asRecord(match)["id"];
+      if (typeof id !== "string") throw new Error(`Project create failed and no project named ${name} found.`);
+      projectId = id;
+    }
+    const overlayOut = await installBbBackend(hostId, path, projectId, timeoutMs, signal);
+    try {
+      await settings.experimental_set({ fmHome: path });
+    } catch {
+      // persist best-effort
+    }
+    const summary = [
+      `host: ${hostId}`,
+      `path: ${path} (${existed ? "existed" : "cloned"})`,
+      `project: ${projectId}`,
+      `backend: bb (overlay installed; config/backend=bb)`,
+      `fm: bb firstmate fm spawn -- --mode direct-PR -- ship "<task>"`,
+      `overlay:\n${truncate(overlayOut, 800)}`,
+      `tools:\n${truncate(tools.output, 500)}`,
+    ].join("\n");
+    return { hostId, path, existed, projectId, overlay: overlayOut, tools: tools.output, summary };
+  }
+
+  // Real firstmate is the default. On deck, if it is not already initialized,
+  // clone + overlay it now (best-effort); on any failure, surface the single
+  // one-time command the captain must run. Returns a line for the deck digest.
+  async function ensureRealModeForDeck(ctx: unknown, signal: AbortSignal | undefined): Promise<string> {
+    const current = await settings.get();
+    if (current.fmHome.trim() !== "") {
+      return [
+        `Real firstmate: active (fmHome ${current.fmHome}).`,
+        `Dispatch through the full toolbelt: bb firstmate fm spawn -- --mode direct-PR -- ship "<task>".`,
+      ].join("\n");
+    }
+    try {
+      const res = await initRealMode(ctx, signal, {});
+      return [
+        `Real firstmate: initialized now (${res.existed ? "reused clone" : "cloned"}).`,
+        res.summary,
+      ].join("\n");
+    } catch (error) {
+      return [
+        "Real firstmate: not active yet. Run this once to unlock the full toolbelt",
+        "(194 bin/fm-*.sh scripts, 21 skills, harness adapters):",
+        "  bb firstmate init --real",
+        `(auto-init skipped: ${error instanceof Error ? error.message : String(error)})`,
+        "Native BB dispatch/deliver/merge still works in the meantime.",
+      ].join("\n");
+    }
+  }
+
   async function runFmScript(input: {
     script: string;
     args: string[];
@@ -1710,14 +1884,55 @@ export default async function plugin(bb: BbPluginApi) {
     return { ...result, scriptPath };
   }
 
+  async function readToolActivity(threadId: string): Promise<{ ok: true; at: number | null } | { ok: false }> {
+    try {
+      const rows = await bb.sdk.threads.events.list({
+        threadId,
+        order: "desc",
+        limit: "1",
+        types: TOOL_ACTIVITY_TYPES,
+      });
+      if (!Array.isArray(rows)) return { ok: false };
+      const row = rows[0];
+      if (row === undefined) return { ok: true, at: null };
+      const createdAt = asRecord(row)["createdAt"];
+      return typeof createdAt === "number" && Number.isFinite(createdAt)
+        ? { ok: true, at: createdAt }
+        : { ok: false };
+    } catch (error) {
+      bb.log.warn(
+        `stuck activity read failed for ${threadId}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return { ok: false };
+    }
+  }
+
+  let stuckRebased = false;
+
+  async function crewExcerpt(crew: Crew): Promise<{ ok: true; text: string } | { ok: false }> {
+    try {
+      const result = await bb.sdk.threads.output({ threadId: crew.threadId });
+      const text = asRecord(result)["output"];
+      return { ok: true, text: typeof text === "string" ? truncate(text, 300) : "" };
+    } catch {
+      return { ok: false };
+    }
+  }
+
   async function stuckPass(): Promise<{ checked: number; notified: number }> {
     const current = await settings.get();
     const stuckMs = Math.min(480, Math.max(5, Number(current.supervisionStuckMin) || 30)) * 60000;
-    const crews = (await listCrews()).filter((c) => c.parentThreadId !== null).slice(0, 20);
-    const parsed = watchStateSchema.safeParse(await bb.storage.kv.get<unknown>("watch"));
-    const state: Record<string, { status: string; hash: string; at: number; stuck: boolean }> =
-      parsed.success ? parsed.data : {};
+    const intervalMs = Math.min(60, Math.max(1, Number(current.supervisionIntervalMin) || 5)) * 60000;
+    const meta = asRecord(await bb.storage.kv.get<unknown>("watch-meta"));
+    const lastPassAt = meta["lastPassAt"];
     const now = Date.now();
+    const rebase = !stuckRebased && (typeof lastPassAt !== "number" || now - lastPassAt > intervalMs);
+    stuckRebased = true;
+    const crews = (await listCrews())
+      .filter((c) => c.parentThreadId !== null && !isSecondmateRoute(c))
+      .slice(0, MAX_CREWS);
+    const parsed = watchStateSchema.safeParse(await bb.storage.kv.get<unknown>("watch"));
+    const state: WatchState = parsed.success ? parsed.data : {};
     const seen = new Set<string>();
     let notified = 0;
     for (const crew of crews) {
@@ -1725,23 +1940,95 @@ export default async function plugin(bb: BbPluginApi) {
       const status = await crewStatus(crew);
       const prev = state[crew.id];
       if (prev === undefined) {
+        if (status === "error" || status === "unknown") {
+          const detail = status === "error" ? await crewOutput(crew, 300) : null;
+          await notifyCaptain(crew, status, detail);
+          notified++;
+          state[crew.id] = { status, hash: "", at: now, stuck: false, alerted: status };
+          continue;
+        }
         state[crew.id] = { status, hash: "", at: now, stuck: false };
         continue;
       }
-      if (status === "idle" || status === "error" || status === "unknown") {
+      if (status === "idle") {
         state[crew.id] = { status, hash: "", at: now, stuck: false };
         continue;
       }
-      const excerpt = (await crewOutput(crew, 300)) ?? "";
-      if (excerpt !== prev.hash) {
-        state[crew.id] = { status, hash: excerpt, at: now, stuck: false };
+      if (status === "error" || status === "unknown") {
+        if (prev.alerted !== status) {
+          const detail = status === "error" ? await crewOutput(crew, 300) : null;
+          await notifyCaptain(crew, status, detail);
+          notified++;
+        }
+        state[crew.id] = { status, hash: "", at: now, stuck: false, alerted: status };
         continue;
       }
+      if (rebase) {
+        state[crew.id] = {
+          status,
+          hash: prev.hash,
+          at: now,
+          stuck: false,
+          ...(prev.activityAt !== undefined ? { activityAt: prev.activityAt } : {}),
+        };
+        continue;
+      }
+      const excerpt = await crewExcerpt(crew);
+      if (!excerpt.ok) {
+        if (prev.alerted !== "unknown") {
+          await notifyCaptain(crew, "unknown", null);
+          notified++;
+        }
+        state[crew.id] = {
+          status,
+          hash: prev.hash,
+          at: prev.at,
+          stuck: prev.stuck,
+          alerted: "unknown",
+          ...(prev.activityAt !== undefined ? { activityAt: prev.activityAt } : {}),
+        };
+        continue;
+      }
+      if (excerpt.text !== prev.hash) {
+        state[crew.id] = { status, hash: excerpt.text, at: now, stuck: false };
+        continue;
+      }
+      const activity = await readToolActivity(crew.threadId);
+      if (!activity.ok) {
+        state[crew.id] = { ...prev, status, hash: excerpt.text };
+        continue;
+      }
+      const activityAt = activity.at ?? undefined;
+      const activityStale = activityAt === undefined || now - activityAt >= stuckMs;
+      if (!activityStale) {
+        state[crew.id] = {
+          status,
+          hash: excerpt.text,
+          at: prev.at,
+          stuck: false,
+          ...(activityAt !== undefined ? { activityAt } : {}),
+        };
+        continue;
+      }
+      const outMin = Math.max(0, Math.round((now - prev.at) / 60000));
+      const actMin = activityAt === undefined ? outMin : Math.max(0, Math.round((now - activityAt) / 60000));
+      const row = {
+        status,
+        hash: excerpt.text,
+        at: prev.at,
+        stuck: prev.stuck,
+        ...(activityAt !== undefined ? { activityAt } : {}),
+      };
       if (!prev.stuck && now - prev.at >= stuckMs) {
-        await notifyCaptain(crew, `stuck (${Math.round((now - prev.at) / 60000)}m no output change)`, null);
+        await notifyCaptain(
+          crew,
+          `stuck (${outMin}m no output change, no tool/file activity ${actMin}m)`,
+          excerpt.text === "" ? null : excerpt.text,
+        );
         notified++;
-        state[crew.id] = { ...prev, stuck: true };
+        row.stuck = true;
       }
+      state[crew.id] = row;
     }
     for (const id of Object.keys(state)) {
       if (!seen.has(id)) delete state[id];
@@ -1753,16 +2040,18 @@ export default async function plugin(bb: BbPluginApi) {
 
   function guideText(repo: string): string {
     return [
-      "firstmate inside BB — two planes, one runtime:",
-      "1. Native deck (plugin SDK / Fleet UI): bb firstmate deck, then dispatch/tell/watch/merge.",
-      "2. Real firstmate bin/ scripts: bb firstmate init --real, then bb firstmate fm <script> …",
-      "   Scripts keep policy (brief, gate, inbox, watch, merge, afk, bearings, backlog).",
+      "firstmate inside BB — real mode is the default, two planes over one runtime:",
+      "1. Real firstmate bin/ scripts (the full toolbelt): bb firstmate fm <script> …",
+      "   194 bin/fm-*.sh scripts + the original skills/harness adapters keep policy",
+      "   (brief, gate, inbox, watch, merge, afk, bearings, backlog). `/captain` (deck)",
+      "   auto-clones + overlays this on first run; no manual step if the host has git/gh.",
+      "2. Native deck (plugin SDK / Fleet UI): bb firstmate deck, then dispatch/tell/watch/merge.",
       "   BB is the session backend (threads + managed-worktree), like tmux/orca — not a rewrite of bin/.",
-      "Native dispatch (writes state/<id>.meta when fmHome is set, so peek/send/teardown see Fleet crews):",
-      "  bb firstmate dispatch --project <proj> -- \"fix flaky login test\"",
-      "Script spawn (after init --real):",
+      "Primary dispatch (real toolbelt, after deck/init --real):",
       "  bb firstmate fm spawn -- --mode direct-PR -- ship \"fix flaky login test\"",
-      `Optional clone: bb firstmate init --real  (repo ${repo}; overlays backends/bb.sh, sets config/backend=bb)`,
+      "Native dispatch (BB transport; writes state/<id>.meta when fmHome is set, so the scripts see Fleet crews):",
+      "  bb firstmate dispatch --project <proj> -- \"fix flaky login test\"",
+      `One-time activation if auto-init was skipped: bb firstmate init --real  (repo ${repo}; overlays backends/bb.sh, sets config/backend=bb, persists fmHome)`,
     ].join("\n");
   }
 
@@ -1853,10 +2142,13 @@ export default async function plugin(bb: BbPluginApi) {
     presentation: { label: { pending: "Taking the deck", completed: "On deck" } },
     parameters: z.object({}),
     async execute(_args, ctx) {
-      const threadId = asRecord(ctx)["threadId"];
+      const record = asRecord(ctx);
+      const threadId = record["threadId"];
       if (typeof threadId !== "string") return toolError("No thread to mark as captain.");
       await markDeck(threadId);
-      return `Captain, on deck.\n${await sessionDigest()}`;
+      const signal = record["signal"] as AbortSignal | undefined;
+      const real = await ensureRealModeForDeck(ctx, signal);
+      return `Captain, on deck.\n${real}\n${await sessionDigest()}`;
     },
   });
 
@@ -2157,8 +2449,7 @@ export default async function plugin(bb: BbPluginApi) {
     parameters: z.object({ action: z.enum(["on", "off", "status"]) }),
     async execute({ action }) {
       if (action === "on" || action === "off") {
-        await bb.storage.kv.set(QUIET_KEY, action === "on");
-        return `Quiet ${action}`;
+        return await setQuiet(action);
       }
       return `quiet: ${(await isQuiet()) ? "on" : "off"}`;
     },
@@ -2477,6 +2768,7 @@ export default async function plugin(bb: BbPluginApi) {
     count: z.number(),
     lastAt: z.number(),
     exhausted: z.boolean(),
+    dueAt: z.number().optional(),
   });
   const nudgeStateSchema = z.record(z.string(), nudgeRowSchema);
   type NudgeRow = z.infer<typeof nudgeRowSchema>;
@@ -2510,6 +2802,54 @@ export default async function plugin(bb: BbPluginApi) {
     return crew.createdAt !== "" ? crew.createdAt : crew.threadId;
   }
 
+  async function dropNudge(crewId: string): Promise<void> {
+    clearNudgeTimer(crewId);
+    const state = await readNudgeState();
+    if (state[crewId] === undefined) return;
+    delete state[crewId];
+    await bb.storage.kv.set(NUDGE_KEY, state);
+  }
+
+  function armNudgeTimer(crewId: string, waitMs: number): void {
+    clearNudgeTimer(crewId);
+    const timer = setTimeout(() => {
+      nudgeTimers.delete(crewId);
+      void runDeferredNudge(crewId);
+    }, Math.max(0, waitMs));
+    (timer as unknown as { unref?: () => void }).unref?.();
+    nudgeTimers.set(crewId, timer);
+  }
+
+  let nudgesRearmed = false;
+  async function rearmDeferredNudges(): Promise<void> {
+    if (nudgesRearmed) return;
+    nudgesRearmed = true;
+    const limits = nudgeLimits(await settings.get());
+    if (!limits.enabled) return;
+    const state = await readNudgeState();
+    const now = Date.now();
+    for (const [crewId, row] of Object.entries(state)) {
+      if (row.exhausted || row.dueAt === undefined || !(row.dueAt > 0)) continue;
+      armNudgeTimer(crewId, row.dueAt - now);
+    }
+  }
+
+  async function refreshWatchAfterNudge(crewId: string): Promise<void> {
+    const raw = await bb.storage.kv.get<unknown>("watch");
+    const parsed = watchStateSchema.safeParse(raw);
+    if (!parsed.success && raw != null) return;
+    const state: WatchState = parsed.success ? { ...parsed.data } : {};
+    const prev = state[crewId];
+    state[crewId] = {
+      status: prev?.status ?? "active",
+      hash: prev?.hash ?? "",
+      at: Date.now(),
+      stuck: false,
+      ...(prev?.activityAt !== undefined ? { activityAt: prev.activityAt } : {}),
+    };
+    await bb.storage.kv.set("watch", state);
+  }
+
   async function turnWasStopped(thread: {
     id: string;
     status: string;
@@ -2517,20 +2857,37 @@ export default async function plugin(bb: BbPluginApi) {
   }): Promise<boolean> {
     if (thread.status === "stopping" || thread.runtime?.displayStatus === "stopping") return true;
     try {
-      const rows = await bb.sdk.threads.events.list({
+      const interrupts = await bb.sdk.threads.events.list({
+        threadId: thread.id,
+        order: "desc",
+        limit: "8",
+        types: ["system/thread/interrupted"],
+      });
+      let interruptAt: number | null = null;
+      for (const row of interrupts) {
+        const reason = asRecord(row.data)["reason"];
+        if (reason !== "manual-stop" && reason !== "host-daemon-restarted") continue;
+        if (typeof row.createdAt === "number") {
+          interruptAt = row.createdAt;
+          break;
+        }
+      }
+      if (interruptAt === null) return false;
+      const turns = await bb.sdk.threads.events.list({
         threadId: thread.id,
         order: "desc",
         limit: "1",
-        types: ["system/thread/interrupted"],
+        types: ["turn/started"],
       });
-      const reason = asRecord(asRecord(rows[0])["data"])["reason"];
-      return reason === "manual-stop" || reason === "host-daemon-restarted";
+      const started = turns[0]?.createdAt;
+      return typeof started === "number" && interruptAt > started;
     } catch {
       return false;
     }
   }
 
   async function applyProtocolNudge(crew: Crew): Promise<"off" | "nudged" | "cooling" | "exhausted" | "spent"> {
+    if (isSecondmateRoute(crew)) return "spent";
     const current = await settings.get();
     const limits = nudgeLimits(current);
     if (!limits.enabled) return "off";
@@ -2555,35 +2912,34 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const now = Date.now();
     if (row.lastAt > 0 && now - row.lastAt < limits.cooldownMs) {
-      const wait = limits.cooldownMs - (now - row.lastAt);
-      const existing = nudgeTimers.get(crew.id);
-      if (existing !== undefined) clearTimeout(existing);
-      const timer = setTimeout(() => {
-        nudgeTimers.delete(crew.id);
-        void runDeferredNudge(crew.id);
-      }, wait);
-      (timer as unknown as { unref?: () => void }).unref?.();
-      nudgeTimers.set(crew.id, timer);
+      const dueAt = row.lastAt + limits.cooldownMs;
+      state[crew.id] = { ...row, dueAt };
+      await bb.storage.kv.set(NUDGE_KEY, state);
+      armNudgeTimer(crew.id, dueAt - now);
       return "cooling";
     }
-    row.count += 1;
-    row.lastAt = now;
-    state[crew.id] = row;
-    await bb.storage.kv.set(NUDGE_KEY, state);
     clearNudgeTimer(crew.id);
     try {
-      await tellCrew(crew, protocolNudgeText(row.count, limits.max), false);
+      await tellCrew(crew, protocolNudgeText(row.count + 1, limits.max), false);
     } catch (error) {
       bb.log.warn(
         `protocol nudge failed for crew ${crew.id}: ${error instanceof Error ? error.message : String(error)}`,
       );
+      return "cooling";
+    }
+    state[crew.id] = { generation: row.generation, count: row.count + 1, lastAt: now, exhausted: false };
+    await bb.storage.kv.set(NUDGE_KEY, state);
+    try {
+      await refreshWatchAfterNudge(crew.id);
+    } catch {
+      // nudge already landed; a stale watch row must not undo the send
     }
     return "nudged";
   }
 
   async function runDeferredNudge(crewId: string): Promise<void> {
     const crew = await findCrew(crewId);
-    if (crew === undefined) return;
+    if (crew === undefined || isSecondmateRoute(crew)) return;
     try {
       const thread = await bb.sdk.threads.get({ threadId: crew.threadId });
       if (await turnWasStopped(thread)) return;
@@ -2606,7 +2962,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
   bb.events.on("thread.idle", async ({ thread, lastAssistantText }) => {
     const crew = await findCrewByThread(thread.id);
-    if (crew === undefined) return;
+    if (crew === undefined || isSecondmateRoute(crew)) return;
     const stopped = await turnWasStopped(thread);
     if (!stopped && !hasStatusProtocol(lastAssistantText)) {
       const outcome = await applyProtocolNudge(crew);
@@ -2620,23 +2976,20 @@ export default async function plugin(bb: BbPluginApi) {
     const current = await settings.get();
     if (current.supervisionEnabled !== true) return;
     const crew = await findCrewByThread(thread.id);
-    if (crew === undefined) return;
+    if (crew === undefined || isSecondmateRoute(crew)) return;
     await notifyCaptain(crew, "error", error);
   });
   bb.events.on("interaction.pending", async ({ thread }) => {
     const current = await settings.get();
     if (current.supervisionEnabled !== true) return;
     const crew = await findCrewByThread(thread.id);
-    if (crew === undefined) return;
+    if (crew === undefined || isSecondmateRoute(crew)) return;
     await notifyCaptain(crew, "interaction", "crew is waiting on an approval or credential");
   });
-  bb.events.on("turn.failed", async ({ threadId, requestId, errorInfo }) => {
-    const current = await settings.get();
-    if (current.supervisionEnabled !== true) return;
+  bb.events.on("turn.failed", async ({ threadId }) => {
     const crew = await findCrewByThread(threadId);
-    if (crew === undefined) return;
-    const detail = errorInfo === null ? `turn ${requestId} failed` : `turn ${requestId} failed: ${JSON.stringify(errorInfo).slice(0, 300)}`;
-    await notifyCaptain(crew, "error", detail);
+    if (crew === undefined || isSecondmateRoute(crew)) return;
+    // thread.failed already paged the lifecycle error; this fires after the thread is in error.
   });
 
   bb.cli.register({
@@ -2728,8 +3081,13 @@ export default async function plugin(bb: BbPluginApi) {
           case "deck": {
             if (ctxThread === undefined) return fail("No thread: run this from a BB thread.");
             await markDeck(ctxThread);
+            const real = await ensureRealModeForDeck(ctx, signal);
+            const realMode = (await settings.get()).fmHome.trim() !== "";
             const digest = await sessionDigest();
-            return reply({ captain: true, threadId: ctxThread, digest }, `Captain, on deck.\n${digest}`);
+            return reply(
+              { captain: true, threadId: ctxThread, realMode, digest },
+              `Captain, on deck.\n${real}\n${digest}`,
+            );
           }
           case "session": {
             const digest = await sessionDigest();
@@ -2746,56 +3104,16 @@ export default async function plugin(bb: BbPluginApi) {
               ].join("\n");
               return reply({ native: true, threadId: ctxThread ?? null }, text);
             }
-            const repo = current.firstmateRepo !== "" ? current.firstmateRepo : "https://github.com/kunchenguid/firstmate";
-            const name = flagStr(flags, "name") ?? "firstmate";
-            const timeoutMs = Math.min(600, Math.max(30, Number(flagStr(flags, "timeout") ?? "180"))) * 1000;
-            const hostId = await resolveHostId(flagStr(flags, "machine"), ctx);
-            const home = (await runOnHost(hostId, `printf '%s' "$HOME"`, 30000, signal)).output.trim();
-            if (home === "") throw new Error("Could not resolve $HOME on host.");
-            const path = flagStr(flags, "path") ?? `${home}/firstmate`;
-            const tools = await runOnHost(
-              hostId,
-              "command -v git; command -v gh; command -v bb; command -v python3; gh auth status 2>&1 | head -n 3",
-              30000,
-              signal,
+            const res = await initRealMode(ctx, signal, {
+              machine: flagStr(flags, "machine"),
+              path: flagStr(flags, "path"),
+              name: flagStr(flags, "name"),
+              timeoutMs: Math.min(600, Math.max(30, Number(flagStr(flags, "timeout") ?? "180"))) * 1000,
+            });
+            return reply(
+              { hostId: res.hostId, path: res.path, existed: res.existed, projectId: res.projectId, backend: "bb", tools: res.tools, overlay: res.overlay },
+              res.summary,
             );
-            if (!tools.output.includes("git")) throw new Error(`git missing on host. Tools:\n${tools.output}`);
-            const clone = await runOnHost(
-              hostId,
-              `[ -d ${shQuote(`${path}/.git`)} ] && echo FM_EXISTS || git clone ${shQuote(repo)} ${shQuote(path)}`,
-              timeoutMs,
-              signal,
-            );
-            if (clone.exitCode !== 0) throw new Error(`Clone failed:\n${truncate(clone.output, 1000)}`);
-            const existed = clone.output.includes("FM_EXISTS");
-            let projectId: string;
-            try {
-              const created = await bb.sdk.projects.create({ name, source: { type: "local_path", hostId, path } });
-              projectId = asRecord(created)["id"] as string;
-            } catch {
-              const projects = await bb.sdk.projects.list();
-              const rows: unknown[] = Array.isArray(projects) ? projects : [];
-              const match = rows.find((p) => asRecord(p)["name"] === name);
-              const id = match === undefined ? undefined : asRecord(match)["id"];
-              if (typeof id !== "string") throw new Error(`Project create failed and no project named ${name} found.`);
-              projectId = id;
-            }
-            const overlayOut = await installBbBackend(hostId, path, projectId, timeoutMs, signal);
-            try {
-              await settings.experimental_set({ fmHome: path });
-            } catch {
-              // persist best-effort
-            }
-            const summary = [
-              `host: ${hostId}`,
-              `path: ${path} (${existed ? "existed" : "cloned"})`,
-              `project: ${projectId}`,
-              `backend: bb (overlay installed; config/backend=bb)`,
-              `fm: bb firstmate fm spawn -- --mode direct-PR -- ship "<task>"`,
-              `overlay:\n${truncate(overlayOut, 800)}`,
-              `tools:\n${truncate(tools.output, 500)}`,
-            ].join("\n");
-            return reply({ hostId, path, existed, projectId, backend: "bb", tools: tools.output, overlay: overlayOut }, summary);
           }
           case "dispatch": {
             const tasks =
@@ -3052,8 +3370,8 @@ export default async function plugin(bb: BbPluginApi) {
           case "quiet": {
             const sub = rest[0] ?? "status";
             if (sub === "on" || sub === "off") {
-              await bb.storage.kv.set(QUIET_KEY, sub === "on");
-              return reply({ quiet: sub === "on" }, `Quiet ${sub}`);
+              const text = await setQuiet(sub);
+              return reply({ quiet: sub === "on" }, text);
             }
             const q = await isQuiet();
             return reply({ quiet: q }, `quiet: ${q ? "on" : "off"}`);
@@ -3321,6 +3639,11 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.background.service("crew-watch", {
     async start(signal) {
+      try {
+        await rearmDeferredNudges();
+      } catch (error) {
+        bb.log.warn(error instanceof Error ? `nudge rearm: ${error.message}` : "nudge rearm failed");
+      }
       while (!signal.aborted) {
         try {
           const s = await settings.get();
