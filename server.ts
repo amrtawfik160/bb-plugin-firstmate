@@ -316,6 +316,15 @@ export function fmBackendEnv(input: {
 // fm-watch keeper paths + cadence (host-relative to fmHome).
 export const FM_WATCH_KEEPER_PID = "state/.bb-watch-keeper.pid";
 export const FM_WATCH_KEEPER_SH = "state/.bb-watch-keeper.sh";
+// D7: the plugin (the keeper's OWNER) refreshes this beat every supervisor tick while
+// watchOwner=fm-watch. The keeper self-exits when the beat goes stale, so a keeper
+// whose owner is gone (plugin disposed/disabled/crashed, or the flag flipped and the
+// plugin never reached the host) terminates on its own — teardown no longer depends on
+// the plugin removing the pidfile. TTL is derived from the re-arm interval below.
+export const FM_WATCH_OWNER_BEAT = "state/.bb-watch-owner.beat";
+export function fmWatchOwnerBeatTtl(interval: number): number {
+  return Math.max(120, interval * 6);
+}
 // How often the on-host keeper re-arms fm-watch. fm-watch exits on every actionable wake and
 // must be re-armed; the keeper (not the plugin's slow cycle) owns that, so the gap after a wake
 // is bounded by this, not by the supervision interval + grace.
@@ -333,6 +342,8 @@ export function fmWatchKeeperScript(hostId: string, fmHome: string, interval: nu
   const pid = `${fmHome}/${FM_WATCH_KEEPER_PID}`;
   const arm = `${fmHome}/bin/fm-watch-arm.sh`;
   const log = `${fmHome}/state/.bb-watch-arm.log`;
+  const ownerBeat = `${fmHome}/${FM_WATCH_OWNER_BEAT}`;
+  const ttl = fmWatchOwnerBeatTtl(interval);
   return [
     "#!/bin/bash",
     "# BB firstmate fm-watch keeper (managed; do not edit).",
@@ -357,9 +368,17 @@ export function fmWatchKeeperScript(hostId: string, fmHome: string, interval: nu
     `PID=${shQuote(pid)}`,
     `ARM=${shQuote(arm)}`,
     `LOG=${shQuote(log)}`,
+    `OWNER_BEAT=${shQuote(ownerBeat)}`,
+    `OWNER_TTL=${ttl}`,
     'echo $$ > "$PID"',
     `trap 'rm -f "$PID"' EXIT`,
+    // Loop while BOTH hold: (a) the pidfile still names this process (fast teardown
+    // removes/overwrites it), and (b) the owner beat is fresh (D7 self-exit — the owner
+    // stopped refreshing it, so the plugin is gone even if it never reached this host).
     'while [ "$(cat "$PID" 2>/dev/null)" = "$$" ]; do',
+    '  OB=$(cat "$OWNER_BEAT" 2>/dev/null || echo 0); case "$OB" in ""|*[!0-9]*) OB=0 ;; esac',
+    '  NOW=$(date +%s)',
+    '  if [ "$OB" -eq 0 ] || [ $(( NOW - OB )) -gt "$OWNER_TTL" ]; then break; fi',
     '  "$ARM" >> "$LOG" 2>&1 || true',
     `  sleep ${interval}`,
     "done",
@@ -4319,9 +4338,14 @@ export default async function plugin(bb: BbPluginApi) {
     const arm = `${fmHome}/bin/fm-watch-arm.sh`;
     const pid = `${fmHome}/${FM_WATCH_KEEPER_PID}`;
     const keeperScript = `${fmHome}/${FM_WATCH_KEEPER_SH}`;
+    const ownerBeat = `${fmHome}/${FM_WATCH_OWNER_BEAT}`;
     const interval = fmWatchKeeperInterval(graceSec);
-    // Phase 1: read beacon age + keeper liveness + a log tail (no side effects).
+    // Phase 1: refresh the owner beat (D7 self-exit heartbeat — written BEFORE any
+    // keeper launch so a freshly launched keeper always sees a fresh beat), then read
+    // beacon age + keeper liveness + a log tail (no other side effects).
     const readScript = [
+      `mkdir -p ${shQuote(`${fmHome}/state`)}`,
+      `date +%s > ${shQuote(ownerBeat)} 2>/dev/null || true`,
       "AGE=-1",
       `if [ -f ${shQuote(beat)} ]; then AGE=$(( $(date +%s) - $(stat -c %Y ${shQuote(beat)} 2>/dev/null || echo 0) )); fi`,
       "KEEPER=dead",
@@ -4367,12 +4391,34 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  // D7: the set of hosts where we launched a keeper, persisted to KV so a plugin
+  // RELOAD (which resets the supervisor's in-memory state to empty) still knows which
+  // hosts to tear down when it comes back up with watchOwner already flipped to native.
+  // Without this the teardown branch was gated on in-memory state the reload had lost,
+  // so a keeper started before the reload kept re-arming fm-watch forever.
+  const FM_WATCH_KEEPER_HOSTS_KEY = "fm-watch-keeper-hosts";
+  async function loadKeeperHosts(): Promise<string[]> {
+    const raw = await bb.storage.kv.get<unknown>(FM_WATCH_KEEPER_HOSTS_KEY);
+    return Array.isArray(raw) ? raw.filter((h): h is string => typeof h === "string" && h !== "") : [];
+  }
+  async function saveKeeperHosts(hosts: Set<string>): Promise<void> {
+    try {
+      await bb.storage.kv.set(FM_WATCH_KEEPER_HOSTS_KEY, [...hosts]);
+    } catch {
+      // best-effort; in-memory set still drives teardown this process
+    }
+  }
+
   // Stop the on-host keeper when watchOwner is turned off: remove its pidfile so the
   // loop self-exits on its next iteration, and best-effort kill the recorded pid.
   async function stopFmWatchKeeper(hostId: string, fmHome: string, signal?: AbortSignal): Promise<void> {
     const pid = `${fmHome}/${FM_WATCH_KEEPER_PID}`;
+    const ownerBeat = `${fmHome}/${FM_WATCH_OWNER_BEAT}`;
+    // Remove the pidfile (loop self-exits next iteration) AND the owner beat (a
+    // relaunch cannot be kept alive by a stale-fresh beat), then best-effort kill the
+    // recorded pid for an immediate stop rather than waiting one re-arm interval.
     const script =
-      `KP=$(cat ${shQuote(pid)} 2>/dev/null || echo); rm -f ${shQuote(pid)}; ` +
+      `KP=$(cat ${shQuote(pid)} 2>/dev/null || echo); rm -f ${shQuote(pid)} ${shQuote(ownerBeat)}; ` +
       `[ -n "$KP" ] && kill "$KP" 2>/dev/null || true`;
     try {
       await runOnHost(hostId, script, 15_000, signal);
@@ -4399,15 +4445,29 @@ export default async function plugin(bb: BbPluginApi) {
     return line.replace(/\d+/g, "#").replace(/\s+/g, " ").trim();
   }
 
-  // R2/D6: deliver each actionable fm-watch page to the OWNING captain ONLY — the
-  // parent thread of the crew whose id appears in the line. The plugin's settings and
-  // fmHome are host-global, so one supervisor cycle sees crews of MANY captains; the
-  // old fallback fanned a line with no resolvable crew id to EVERY captain on the
-  // host, leaking one captain's crew activity into another captain's chat. Now an
-  // unattributable line is delivered only when the host has exactly ONE owning captain
-  // (unambiguous, no cross-captain leak); with two or more captains it is dropped
-  // rather than broadcast. `seen` carries dedup keys across cycles. fm-watch owns
-  // wedge policy; BB is its per-captain-scoped delivery transport.
+  // Redact from a page line every whitespace token that names a crew NOT owned by the
+  // target captain (D8). One fm-watch signal line can reference SEVERAL crews (e.g.
+  // "signal: …/1f4c7c2a.status …/79da4929.status"); delivering it whole leaks other
+  // captains' crew ids. Each status/path token carries at most one crew id, so dropping
+  // the tokens that contain a foreign id yields a line mentioning only this captain's
+  // crews while keeping the label and any generic tokens. Returns "" if nothing but the
+  // label survives (no own-crew reference left).
+  function filterLineForOwner(line: string, foreignIds: string[]): string {
+    if (foreignIds.length === 0) return line;
+    return line
+      .split(/\s+/)
+      .filter((tok) => tok !== "" && !foreignIds.some((id) => tok.includes(id)))
+      .join(" ");
+  }
+
+  // R2/D6/D8: deliver each actionable fm-watch page ONLY to the captain(s) that own the
+  // crews it names, and to each such captain a copy FILTERED to only their own crew ids.
+  // The plugin's settings and fmHome are host-global, so one supervisor cycle sees crews
+  // of MANY captains: a multi-crew line must be split/filtered per owner, never fanned
+  // whole (that leak was D8), and a line naming no crew is delivered only when the host
+  // has exactly ONE owning captain (unambiguous), else dropped (not broadcast). `seen`
+  // carries dedup keys across cycles. fm-watch owns wedge policy; BB is its
+  // per-captain-scoped delivery transport.
   async function relayWatchReasons(lines: string[], hostId: string, seen: Set<string>): Promise<void> {
     if (lines.length === 0) return;
     const crews = await readCrews();
@@ -4424,21 +4484,36 @@ export default async function plugin(bb: BbPluginApi) {
     // Only fall back to a host captain when it is unambiguous (a single captain owns
     // crews on this host). Otherwise an unattributable line is dropped, never fanned.
     const soleHostParent = hostParents.size === 1 ? [...hostParents][0]! : undefined;
-    // Group lines by target parent so each captain gets one message.
+    const ownedCrews = crews.filter((c) => c.parentThreadId !== null && c.parentThreadId !== "");
+    // Group per target parent so each captain gets one message.
     const byParent = new Map<string, string[]>();
     for (const line of lines) {
       const key = `${hostId}|${relayDedupKey(line)}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      const owner = crews.find((c) => c.parentThreadId !== null && c.parentThreadId !== "" && line.includes(c.id));
-      const target = owner?.parentThreadId ?? soleHostParent;
-      if (target === undefined) {
-        bb.log.info(`fm-watch relay: dropping unattributable line on host ${hostId} (${hostParents.size} captains; no owner in line)`);
+      // Every known crew whose id appears in this line, grouped by owning captain.
+      const mentioned = ownedCrews.filter((c) => line.includes(c.id));
+      if (mentioned.length === 0) {
+        // No crew named: deliver only to a lone host captain, else drop (never fan).
+        if (soleHostParent === undefined) {
+          bb.log.info(`fm-watch relay: dropping unattributable line on host ${hostId} (${hostParents.size} captains; no crew in line)`);
+          continue;
+        }
+        const arr = byParent.get(soleHostParent) ?? [];
+        arr.push(line);
+        byParent.set(soleHostParent, arr);
         continue;
       }
-      const arr = byParent.get(target) ?? [];
-      arr.push(line);
-      byParent.set(target, arr);
+      const owners = new Set(mentioned.map((c) => c.parentThreadId!));
+      for (const parent of owners) {
+        // Redact tokens naming OTHER captains' crews before delivering to this captain.
+        const foreignIds = mentioned.filter((c) => c.parentThreadId !== parent).map((c) => c.id);
+        const filtered = filterLineForOwner(line, foreignIds);
+        if (filtered === "") continue;
+        const arr = byParent.get(parent) ?? [];
+        arr.push(filtered);
+        byParent.set(parent, arr);
+      }
     }
     for (const [parent, ls] of byParent) {
       await deliverToCaptain(parent, `🛰️ fm-watch:\n${ls.join("\n")}`, "fm-watch");
@@ -6457,13 +6532,20 @@ export default async function plugin(bb: BbPluginApi) {
       const RELAUNCH_BASE_MS = 60_000;
       const RELAUNCH_CAP_MS = 1_800_000; // 30 min
       // Hosts where a keeper was launched, so it can be torn down when the owner flips.
-      let keeperHosts = new Set<string>();
+      // D7: seed from KV so a reload (which lost the in-memory set) still tears down a
+      // keeper it started before the reload.
+      let keeperHosts = new Set<string>(await loadKeeperHosts());
+      // D7: teardown-when-off runs at most once per off-stretch (reset when the flag is
+      // on), so a flag flip / reload-with-flag-off sweeps within one tick, but we don't
+      // hammer the host every tick while it stays off.
+      let sweptWhileOff = false;
       while (!signal.aborted) {
         let gate = 90;
         try {
           const s = await settings.get();
           gate = Number.isFinite(s.watchHeartbeatSec) ? Math.max(30, Math.trunc(s.watchHeartbeatSec)) : 90;
           if (s.watchOwner === "fm-watch" && s.fmHome.trim() !== "") {
+            sweptWhileOff = false;
             const hosts = await resolveFmWatchHosts();
             if (hosts.length === 0) {
               bb.log.warn("fm-watch-supervisor: no host to reach fmHome (set fmHostId or dispatch a crew).");
@@ -6477,7 +6559,7 @@ export default async function plugin(bb: BbPluginApi) {
               const inBackoff = now < backoffUntil;
               const res = await superviseFmWatch(hostId, s.fmHome.trim(), gate, !inBackoff, signal);
               if (res === null) continue;
-              keeperHosts.add(hostId);
+              if (!keeperHosts.has(hostId)) { keeperHosts.add(hostId); await saveKeeperHosts(keeperHosts); }
               let streak = priorStreak;
               let nextBackoff = backoffUntil;
               if (res.keeperAlive) {
@@ -6507,11 +6589,20 @@ export default async function plugin(bb: BbPluginApi) {
               const mirror = await bb.storage.kv.get(fmWatchBeatKey(hosts[0]));
               if (mirror !== null && mirror !== undefined) await bb.storage.kv.set(FM_WATCH_BEAT_KEY, mirror);
             }
-          } else if (keeperHosts.size > 0) {
-            // watchOwner was turned off — stop the keepers we started so they do not
-            // keep re-arming fm-watch on the host forever.
-            for (const hostId of keeperHosts) await stopFmWatchKeeper(hostId, s.fmHome.trim(), signal);
+          } else if (!sweptWhileOff && s.fmHome.trim() !== "") {
+            // watchOwner is off (or was flipped, possibly across a reload) — stop every
+            // keeper we know about. D7: sweep the union of the KV-persisted set AND the
+            // configured host, so a keeper started before a reload (whose in-memory
+            // record the reload lost) is still torn down deterministically. Runs once
+            // per off-stretch. The keeper's owner-beat self-exit is the second layer for
+            // hosts we can no longer reach here.
+            const toStop = new Set<string>(keeperHosts);
+            const configured = await resolveFmWatchHostId();
+            if (configured !== null) toStop.add(configured);
+            for (const hostId of toStop) await stopFmWatchKeeper(hostId, s.fmHome.trim(), signal);
             keeperHosts = new Set<string>();
+            await saveKeeperHosts(keeperHosts);
+            sweptWhileOff = true;
           }
         } catch (error) {
           bb.log.warn(error instanceof Error ? `fm-watch-supervisor: ${error.message}` : "fm-watch-supervisor failed");
@@ -6525,9 +6616,25 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  bb.onDispose(() => {
+  bb.onDispose(async () => {
     for (const timer of nudgeTimers.values()) clearTimeout(timer);
     nudgeTimers.clear();
+    // D7: on plugin dispose/disable, stop any keeper we launched so it does not keep
+    // re-arming fm-watch headless. Best-effort (the host may be unreachable during
+    // teardown); the keeper's owner-beat self-exit guarantees termination regardless.
+    try {
+      const s = await settings.get();
+      const fmHome = s.fmHome.trim();
+      if (fmHome !== "") {
+        const hosts = new Set<string>(await loadKeeperHosts());
+        const configured = await resolveFmWatchHostId();
+        if (configured !== null) hosts.add(configured);
+        for (const hostId of hosts) await stopFmWatchKeeper(hostId, fmHome);
+        await saveKeeperHosts(new Set<string>());
+      }
+    } catch {
+      // best-effort; self-exit covers it
+    }
     bb.log.info("disposed");
   });
 }

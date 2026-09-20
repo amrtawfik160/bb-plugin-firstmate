@@ -13,6 +13,7 @@ import {
 import plugin, {
   captainWakeDoorbell,
   fmBackendEnv,
+  fmWatchKeeperInterval,
   fmWatchKeeperScript,
   formatFmMeta,
   formatSecondmate,
@@ -2893,6 +2894,116 @@ test("D6 relay: an fm-watch page reaches ONLY the owning captain; unattributable
   } finally {
     await host.harness.lifecycle.dispose();
   }
+});
+
+test("D8 relay: a MULTI-crew signal line is split/filtered per owner (no cross-captain crew-id leak)", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", watchOwner: "fm-watch", fmHostId: "host_1" },
+  });
+  await plugin(host.bb);
+  try {
+    host.harness.sdk.stub("terminals.create", async () => ({ id: "term_1" }));
+    host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+    host.harness.sdk.stub("terminals.close", async () => ({}));
+    host.harness.sdk.stub("threads.send", async () => ({}));
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ status: "active", environmentId: null }));
+    host.harness.sdk.stub("environments.list", async () => [
+      { hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" },
+    ]);
+    // Two captains on one host; a single fm-watch signal line names BOTH crews.
+    await host.bb.storage.kv.set("crews", [crewRow("1f4c7c2a", "thr_crew1", "thr_capA"), crewRow("79da4929", "thr_crew2", "thr_capB")]);
+    host.harness.sdk.stub("terminals.output", async () =>
+      hostRcPayload("FM_BEAT_AGE=5\nFM_RELAUNCHED=0\n---FM_LOGTAIL---\nsignal: state/1f4c7c2a.status state/79da4929.status wedged", 0),
+    );
+    const run = host.harness.behavior.runService("fm-watch-supervisor");
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline) {
+      if (sendCalls(host).length > 0) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    run.controller.abort();
+    await run.done;
+    const sends = sendCalls(host);
+    const toA = sends.filter((s) => s.threadId === "thr_capA").map((s) => s.text ?? "").join("\n");
+    const toB = sends.filter((s) => s.threadId === "thr_capB").map((s) => s.text ?? "").join("\n");
+    assert.match(toA, /1f4c7c2a/, "captain A must receive its own crew's page");
+    assert.doesNotMatch(toA, /79da4929/, "captain A must NOT see captain B's crew id in a multi-crew line");
+    assert.match(toB, /79da4929/, "captain B must receive its own crew's page");
+    assert.doesNotMatch(toB, /1f4c7c2a/, "captain B must NOT see captain A's crew id in a multi-crew line");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("D7: the keeper script self-exits when the owner beat goes stale (owner gone)", () => {
+  const script = fmWatchKeeperScript("host_1", "/fm", fmWatchKeeperInterval(90));
+  assert.match(script, /OWNER_BEAT=/, "keeper must reference the owner beat");
+  assert.match(script, /OWNER_TTL=\d+/, "keeper must carry an owner TTL");
+  // Loop breaks when the beat is missing (0) or older than the TTL.
+  assert.match(script, /"\$OB" -eq 0 \]\s*\|\|\s*\[ \$\(\( NOW - OB \)\) -gt "\$OWNER_TTL" \]/, "keeper must break on a stale/absent owner beat");
+});
+
+test("D7: watchOwner=native tears the keeper down on the first tick even after a reload (empty in-memory state)", async () => {
+  // Reproduces the live bug: the plugin came back up (reload → in-memory keeperHosts
+  // empty) with watchOwner already flipped to native; teardown must still fire, seeded
+  // from the configured fmHostId (and the KV-persisted set).
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", watchOwner: "native", fmHostId: "host_1" },
+  });
+  await plugin(host.bb);
+  try {
+    const cmds: string[] = [];
+    let n = 0;
+    host.harness.sdk.stub("threads.send", async () => ({}));
+    host.harness.sdk.stub("terminals.create", async (a: { start?: { command?: string } }) => {
+      cmds.push(a.start?.command ?? "");
+      return { id: `t_${++n}` };
+    });
+    host.harness.sdk.stub("terminals.get", async () => ({ status: "exited" }));
+    host.harness.sdk.stub("terminals.close", async () => ({}));
+    host.harness.sdk.stub("terminals.output", async () => hostRcPayload("", 0));
+    const teardownSeen = () => cmds.some((c) => unwrapHostCommand(c).includes(".bb-watch-keeper.pid") && unwrapHostCommand(c).includes("rm -f"));
+    const run = host.harness.behavior.runService("fm-watch-supervisor");
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline) {
+      if (teardownSeen()) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    run.controller.abort();
+    await run.done;
+    assert.ok(teardownSeen(), `watchOwner=native must remove the keeper pidfile on the host:\n${cmds.map(unwrapHostCommand).join("\n---\n")}`);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("D7: plugin dispose tears the keeper down", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", watchOwner: "fm-watch", fmHostId: "host_1" },
+  });
+  await plugin(host.bb);
+  const cmds: string[] = [];
+  let n = 0;
+  host.harness.sdk.stub("threads.send", async () => ({}));
+  host.harness.sdk.stub("terminals.create", async (a: { start?: { command?: string } }) => {
+    cmds.push(a.start?.command ?? "");
+    return { id: `t_${++n}` };
+  });
+  host.harness.sdk.stub("terminals.get", async () => ({ status: "exited" }));
+  host.harness.sdk.stub("terminals.close", async () => ({}));
+  host.harness.sdk.stub("terminals.output", async () => hostRcPayload("", 0));
+  // dispose() invokes bb.onDispose — which must stop the keeper on the configured host.
+  await host.harness.lifecycle.dispose();
+  assert.ok(
+    cmds.some((c) => unwrapHostCommand(c).includes(".bb-watch-keeper.pid") && unwrapHostCommand(c).includes("rm -f")),
+    `dispose must remove the keeper pidfile on the host:\n${cmds.map(unwrapHostCommand).join("\n---\n")}`,
+  );
 });
 
 test("R3 relaunch backoff: a persistently stale watcher is not relaunched every cycle", async () => {
