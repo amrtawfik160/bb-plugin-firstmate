@@ -2451,6 +2451,182 @@ test("A5 memory kv default is unchanged (no host calls)", async () => {
   }
 });
 
+// ---- D1: migrate-owners is direction-safe (never clobbers non-empty real files) ----
+
+test("D1 migrate-owners: never overwrites non-empty real memory with the KV cache; mirrors file→KV", async () => {
+  const host = ownerHost({ memoryOwner: "real" });
+  await plugin(host.bb);
+  try {
+    const fullLearn = "- 2026-01-01: FIRST authoritative learning (the head) <!--a:2026-01-01-->\n- 2026-01-02: second";
+    // KV holds only a TRUNCATED tail (a D2 decapitation) — the old migrate wrote this back over the real file.
+    await host.bb.storage.kv.set("memory-learnings", "tative learning (the head) <!--a:2026-01-01-->\n- 2026-01-02: second");
+    await host.bb.storage.kv.set("memory-captain", "STALE-KV-CAP");
+    const { writes } = stubRoutedHost(host, (cmd) => {
+      if (cmd.includes("cat") && cmd.includes("data/learnings.md") && !cmd.includes("archive")) return { payload: fullLearn, code: 0 };
+      if (cmd.includes("cat") && cmd.includes("data/captain.md")) return { payload: "REAL captain prefs", code: 0 };
+      return { payload: "", code: 0 };
+    });
+    const res = await host.harness.behavior.runCli(["migrate-owners"], { projectId: "proj_1" });
+    assert.equal(res.exitCode, 0, res.stderr);
+    // The authoritative files must NOT be overwritten by the (lossy) KV cache.
+    const learnWrite = decodeHostWrite(writes, "data/learnings.md");
+    assert.ok(learnWrite === null || learnWrite === fullLearn, `migrate must never write the KV cache over non-empty real learnings (wrote: ${JSON.stringify(learnWrite)})`);
+    const capWrite = decodeHostWrite(writes, "data/captain.md");
+    assert.ok(capWrite === null || capWrite === "REAL captain prefs", `migrate must never clobber real captain.md with KV (wrote: ${JSON.stringify(capWrite)})`);
+    // Direction is file→KV: the cache is refreshed from the authoritative file.
+    assert.equal(await host.bb.storage.kv.get("memory-learnings"), fullLearn, "KV must mirror the full real learnings file");
+    assert.equal(await host.bb.storage.kv.get("memory-captain"), "REAL captain prefs", "KV must mirror the full real captain file");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("D1 migrate-owners: refuses to touch memory when the real file is unreadable", async () => {
+  const host = ownerHost({ memoryOwner: "real" });
+  await plugin(host.bb);
+  try {
+    await host.bb.storage.kv.set("memory-learnings", "KV would-be-clobber");
+    const { writes } = stubRoutedHost(host, (cmd) => {
+      // learnings read FAILS (unreadable) → migrate must refuse, never seed from KV.
+      if (cmd.includes("cat") && cmd.includes("data/learnings.md") && !cmd.includes("archive")) return { code: 1 };
+      return { payload: "", code: 0 };
+    });
+    const res = await host.harness.behavior.runCli(["migrate-owners", "--json"], { projectId: "proj_1" });
+    assert.equal(res.exitCode, 0, res.stderr);
+    assert.equal(decodeHostWrite(writes, "data/learnings.md"), null, "unreadable real file must never be written from KV");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// ---- D2: the KV mirror is the FULL file, never a mid-line -4000 slice ----
+
+test("D2 add-learning: KV mirrors the FULL learnings file — no mid-line -4000 slice decapitation", async () => {
+  const host = ownerHost({ memoryOwner: "real" });
+  await plugin(host.bb);
+  try {
+    const head = "- 2026-01-01: HEADLEARNING captain still owns the runtime rollout <!--a:2026-01-01-->";
+    const filler = Array.from({ length: 60 }, (_, i) => `- 2026-01-02: filler learning ${i} ${"y".repeat(50)} <!--a:2026-01-02-->`).join("\n");
+    const existing = `${head}\n${filler}`;
+    assert.ok(Buffer.byteLength(existing, "utf8") > 4000, "fixture must exceed 4000 bytes so a -4000 slice would decapitate the head");
+    const { writes } = stubRoutedHost(host, (cmd) => {
+      if (cmd.includes("cat") && cmd.includes("data/learnings.md") && !cmd.includes("archive")) return { payload: existing, code: 0 };
+      return { payload: "", code: 0 };
+    });
+    const add = await host.harness.behavior.runCli(["memory", "add-learning", "newest", "one"], { projectId: "proj_1" });
+    assert.equal(add.exitCode, 0, add.stderr);
+    const live = decodeHostWrite(writes, "data/learnings.md");
+    const kv = await host.bb.storage.kv.get("memory-learnings");
+    assert.ok(live !== null, "live learnings must be written");
+    assert.equal(kv, live, "KV mirror must equal the full live file exactly");
+    assert.ok(typeof kv === "string" && kv.includes("HEADLEARNING"), "the head learning must survive in KV (not decapitated by a byte slice)");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// ---- D3: recall (session digest) reads the real files, not the stale KV cache ----
+
+test("D3 session digest: recall reads the real files, not a stale KV cache (native /stow edits show)", async () => {
+  const host = ownerHost({ memoryOwner: "real" });
+  await plugin(host.bb);
+  try {
+    // KV is STALE (as after a native /stow file edit that never touched KV).
+    await host.bb.storage.kv.set("memory-captain", "STALE_KV_CAPTAIN");
+    await host.bb.storage.kv.set("memory-learnings", "STALE_KV_LEARN");
+    stubRoutedHost(host, (cmd) => {
+      if (cmd.includes("cat") && cmd.includes("data/captain.md")) return { payload: "FRESH_REAL_CAPTAIN", code: 0 };
+      if (cmd.includes("cat") && cmd.includes("data/learnings.md") && !cmd.includes("archive")) return { payload: "FRESH_REAL_LEARN", code: 0 };
+      return { payload: "", code: 0 };
+    });
+    const res = await host.harness.behavior.runCli(["session"], { projectId: "proj_1" });
+    assert.equal(res.exitCode, 0, res.stderr);
+    assert.match(res.stdout, /FRESH_REAL_CAPTAIN/, "recall must show the real captain file");
+    assert.match(res.stdout, /FRESH_REAL_LEARN/, "recall must show the real learnings file");
+    assert.doesNotMatch(res.stdout, /STALE_KV_CAPTAIN/, "recall must not serve the stale KV cache");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// ---- D4: a fresh captain session receives stored memory, within a deliberate budget ----
+
+test("D4 captain instructions: inject stored memory (prefs + learnings); crews get none; budget bounded", async () => {
+  const bigContract = "C".repeat(3000);
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: {
+      captainMemory: "== Captain memory (recall; fmHome/data) ==\n-- prefs (captain.md) --\nMEMPREF ships terse\n-- recent learnings (learnings.md; newest 1) --\n- 2026-01-01: MEMLEARN flaky tests",
+      captainContract: bigContract,
+      fmSkillsManifest: JSON.stringify({ head: "abc1234567890", skills: [{ name: "stow", desc: "tiered memory" }] }),
+    },
+  });
+  await plugin(host.bb);
+  try {
+    const cfg = await host.harness.behavior.resolveAgentConfiguration(
+      makePluginAgentConfigurationContext({ pluginMetadata: { captain: "true" } }),
+    );
+    const instr = cfg.instructions ?? "";
+    assert.match(instr, /MEMPREF ships terse/, "captain prefs must be injected into a fresh captain session");
+    assert.match(instr, /MEMLEARN flaky tests/, "recent learnings must be injected");
+    // Budget: even with an oversized contract, memory AND skills survive (not first-come-scissored).
+    assert.match(instr, /- stow: tiered memory/, "skills manifest must survive the budget alongside memory");
+    assert.ok(instr.length <= 4096, `captain instructions must stay within the 4096 budget (was ${instr.length})`);
+    const crew = await host.harness.behavior.resolveAgentConfiguration(
+      makePluginAgentConfigurationContext({ pluginMetadata: { crew: "true" } }),
+    );
+    assert.doesNotMatch(crew.instructions ?? "", /MEMPREF/, "crews must never receive captain memory");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// ---- D5: clear archives before wiping, and refuses to wipe if it cannot archive ----
+
+test("D5 memory clear: archives current contents before wiping the real file", async () => {
+  const host = ownerHost({ memoryOwner: "real" });
+  await plugin(host.bb);
+  try {
+    const existing = "- 2026-01-01: important learning to preserve <!--a:2026-01-01-->";
+    await host.bb.storage.kv.set("memory-learnings", existing);
+    const { writes } = stubRoutedHost(host, (cmd) => {
+      if (cmd.includes("cat") && cmd.includes("data/learnings.md") && !cmd.includes("archive")) return { payload: existing, code: 0 };
+      return { payload: "", code: 0 };
+    });
+    const res = await host.harness.behavior.runCli(["memory", "clear", "learnings"], { projectId: "proj_1" });
+    assert.equal(res.exitCode, 0, res.stderr);
+    const archive = decodeHostWrite(writes, "data/learnings.archive.md");
+    assert.ok(archive !== null && archive.includes("important learning to preserve"), "clear must archive current learnings before wiping");
+    assert.ok(archive!.includes("<!--cleared:"), "archive must carry a cleared marker");
+    assert.equal(decodeHostWrite(writes, "data/learnings.md"), "", "live learnings wiped only AFTER the archive");
+    assert.equal(await host.bb.storage.kv.get("memory-learnings"), "", "KV cleared");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("D5 memory clear: refuses to wipe (no loss) when the archive write fails", async () => {
+  const host = ownerHost({ memoryOwner: "real" });
+  await plugin(host.bb);
+  try {
+    const existing = "- 2026-01-01: must not be lost <!--a:2026-01-01-->";
+    await host.bb.storage.kv.set("memory-learnings", existing);
+    const { writes } = stubRoutedHost(host, (cmd) => {
+      if (cmd.includes("cat") && cmd.includes("data/learnings.md") && !cmd.includes("archive")) return { payload: existing, code: 0 };
+      // The archive write FAILS → clear must be refused and nothing wiped.
+      if (cmd.includes("base64 -d") && cmd.includes("archive")) return { code: 1 };
+      return { payload: "", code: 0 };
+    });
+    const res = await host.harness.behavior.runCli(["memory", "clear", "learnings"], { projectId: "proj_1" });
+    assert.equal(res.exitCode, 1, "clear must fail when it cannot archive first");
+    assert.equal(decodeHostWrite(writes, "data/learnings.md"), null, "the live learnings file must be untouched when archive fails");
+    assert.equal(await host.bb.storage.kv.get("memory-learnings"), existing, "KV must not be cleared when archive fails");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("A3 afk real: on proposes+confirms the durable contract and sets the flag", async () => {
   const host = ownerHost({ afkOwner: "real" });
   await plugin(host.bb);
@@ -2647,6 +2823,46 @@ test("R2 relay: only signal:/stale: lines are relayed; check:/heartbeat are drop
     assert.match(relayed, /signal: c1 wedged/);
     assert.doesNotMatch(relayed, /check: routine/);
     assert.doesNotMatch(relayed, /heartbeat 12/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("D6 relay: an fm-watch page reaches ONLY the owning captain; unattributable lines are not fanned across captains", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", watchOwner: "fm-watch", fmHostId: "host_1" },
+  });
+  await plugin(host.bb);
+  try {
+    host.harness.sdk.stub("terminals.create", async () => ({ id: "term_1" }));
+    host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+    host.harness.sdk.stub("terminals.close", async () => ({}));
+    host.harness.sdk.stub("threads.send", async () => ({}));
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ status: "active", environmentId: null }));
+    host.harness.sdk.stub("environments.list", async () => [
+      { hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" },
+    ]);
+    // Two captains, each owning a crew on the SAME host.
+    await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew1", "thr_capA"), crewRow("c2", "thr_crew2", "thr_capB")]);
+    host.harness.sdk.stub("terminals.output", async () =>
+      hostRcPayload("FM_BEAT_AGE=5\nFM_RELAUNCHED=0\n---FM_LOGTAIL---\nsignal: c2 wedged on rebase\nsignal: mystery wedge no crew id", 0),
+    );
+    const run = host.harness.behavior.runService("fm-watch-supervisor");
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline) {
+      if (sendCalls(host).length > 0) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    run.controller.abort();
+    await run.done;
+    const sends = sendCalls(host);
+    // c2's page goes to its OWNER (capB) only.
+    assert.ok(sends.some((s) => s.threadId === "thr_capB" && (s.text ?? "").includes("c2 wedged on rebase")), "owning captain B must receive c2's page");
+    assert.ok(!sends.some((s) => s.threadId === "thr_capA" && (s.text ?? "").includes("c2 wedged")), "captain A must NOT receive captain B's crew page");
+    // The unattributable line must NOT be fanned to any captain (2 captains on host = ambiguous).
+    assert.ok(!sends.some((s) => (s.text ?? "").includes("mystery wedge")), "an unattributable line must not be broadcast across captains");
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -3124,17 +3340,82 @@ test("IT F1: notifyOwner=real — two DISTINCT crew reports both survive wake pr
     await host.harness.behavior.setSettings({ supervisionEnabled: true });
     await emitIdle(host, "DONE: REPORTONE milestone reached");
     await emitIdle(host, "BLOCKED: REPORTTWO missing credentials");
-    const present = await host.harness.behavior.runCli(["wake"], { projectId: "proj_1" });
+    // D6: the captain (crew.parentThreadId=thr_cap) drains its OWN scoped plane.
+    const present = await host.harness.behavior.runCli(["wake"], { threadId: "thr_cap", projectId: "proj_1" });
     assert.equal(present.exitCode, 0, present.stderr);
     assert.match(present.stdout, /REPORTONE/, present.stdout);
     assert.match(present.stdout, /REPORTTWO/, present.stdout);
     const m = /--ack-through (\d+) --recovery-generation (\S+)/.exec(present.stdout);
     assert.ok(m, `no WAKE_ACK line in:\n${present.stdout}`);
-    const acked = await host.harness.behavior.runCli(["wake", "--ack-through", m[1]!, "--recovery-generation", m[2]!], { projectId: "proj_1" });
+    const acked = await host.harness.behavior.runCli(["wake", "--ack-through", m[1]!, "--recovery-generation", m[2]!], { threadId: "thr_cap", projectId: "proj_1" });
     assert.equal(acked.exitCode, 0, acked.stderr);
-    const after = await host.harness.behavior.runCli(["wake"], { projectId: "proj_1" });
+    const after = await host.harness.behavior.runCli(["wake"], { threadId: "thr_cap", projectId: "proj_1" });
     assert.doesNotMatch(after.stdout, /REPORTONE/);
     assert.doesNotMatch(after.stdout, /REPORTTWO/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// ---- D6: per-captain isolation — two captains never see/consume each other's wakes ----
+
+test("IT D6: two captains — neither sees nor consumes the other's wakes (per-captain state plane)", { skip: !FM_INTEGRATION }, async () => {
+  const home = scratchFmHome();
+  const host = itHost(home, { notifyOwner: "real" });
+  await plugin(host.bb);
+  try {
+    stubRealExecHost(host);
+    await host.bb.storage.kv.set("crews", [
+      { id: "cA", task: "task A", projectId: "proj_1", threadId: "thr_crewA", parentThreadId: "thr_capA", providerId: null, worktree: true, shape: "ship", posture: "local-only", createdAt: "2026-09-18T00:00:00.000Z" },
+      { id: "cB", task: "task B", projectId: "proj_1", threadId: "thr_crewB", parentThreadId: "thr_capB", providerId: null, worktree: true, shape: "ship", posture: "local-only", createdAt: "2026-09-18T00:00:00.000Z" },
+    ]);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await emitIdle(host, "DONE: AONLY captain-A report", { id: "thr_crewA" });
+    await emitIdle(host, "DONE: BONLY captain-B report", { id: "thr_crewB" });
+    // Captain A drains its OWN plane: sees A, never B.
+    const a = await host.harness.behavior.runCli(["wake"], { threadId: "thr_capA", projectId: "proj_1" });
+    assert.equal(a.exitCode, 0, a.stderr);
+    assert.match(a.stdout, /AONLY/, a.stdout);
+    assert.doesNotMatch(a.stdout, /BONLY/, `captain A must NOT see captain B's report:\n${a.stdout}`);
+    // Captain A acks through its own max seq.
+    const m = /--ack-through (\d+) --recovery-generation (\S+)/.exec(a.stdout);
+    assert.ok(m, `no WAKE_ACK line for A:\n${a.stdout}`);
+    await host.harness.behavior.runCli(["wake", "--ack-through", m[1]!, "--recovery-generation", m[2]!], { threadId: "thr_capA", projectId: "proj_1" });
+    // Captain B still sees BONLY — A's ack could not consume B's rows.
+    const b = await host.harness.behavior.runCli(["wake"], { threadId: "thr_capB", projectId: "proj_1" });
+    assert.equal(b.exitCode, 0, b.stderr);
+    assert.match(b.stdout, /BONLY/, `captain B must still see its own report after A acked:\n${b.stdout}`);
+    assert.doesNotMatch(b.stdout, /AONLY/, "captain B must never see captain A's report");
+  } finally {
+    await host.harness.lifecycle.dispose();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// ---- D1/D2 LIVE: real host file I/O (base64 + atomic mv), not the virtual-FS stub ----
+
+test("IT D1/D2: migrate + add-learning preserve the real file head and mirror it to KV (real file I/O)", { skip: !FM_INTEGRATION }, async () => {
+  const home = scratchFmHome();
+  const host = itHost(home, { memoryOwner: "real" });
+  await plugin(host.bb);
+  try {
+    stubRealExecHost(host);
+    // Seed a real data/learnings.md head line through the plugin's own writer (real cat/base64/mv).
+    const add = await host.harness.behavior.runCli(["memory", "add-learning", "HEADLEARN authoritative head"], { projectId: "proj_1" });
+    assert.equal(add.exitCode, 0, add.stderr);
+    const seeded = readFileSync(join(home, "data", "learnings.md"), "utf8");
+    assert.match(seeded, /HEADLEARN authoritative head/, "seed write must land in the real file");
+    // D2: the KV mirror equals the full real file (no mid-line -4000 decapitation).
+    assert.equal(await host.bb.storage.kv.get("memory-learnings"), seeded.replace(/\n$/, ""), "KV must mirror the full real file after add-learning");
+    // Simulate a decapitated KV cache (the D2 bug) — shorter than the authoritative file.
+    await host.bb.storage.kv.set("memory-learnings", "EARN authoritative head");
+    // D1: migrate must NOT clobber the real file with the truncated KV; direction is file→KV.
+    const mig = await host.harness.behavior.runCli(["migrate-owners"], { projectId: "proj_1" });
+    assert.equal(mig.exitCode, 0, mig.stderr);
+    const afterFile = readFileSync(join(home, "data", "learnings.md"), "utf8");
+    assert.match(afterFile, /HEADLEARN authoritative head/, "real learnings head must survive migrate (never clobbered by the KV cache)");
+    assert.equal(await host.bb.storage.kv.get("memory-learnings"), afterFile.replace(/\n$/, ""), "KV must mirror the full real file after migrate");
   } finally {
     await host.harness.lifecycle.dispose();
     rmSync(home, { recursive: true, force: true });
@@ -3151,9 +3432,11 @@ test("IT F2: quiet hold + notifyOwner=real surfaces the held report at quiet-off
     stubRealExecHost(host);
     await seedCrew(host);
     await host.harness.behavior.setSettings({ supervisionEnabled: true });
-    await host.harness.behavior.runCli(["quiet", "on"], { projectId: "proj_1" });
+    // D6: the captain (crew.parentThreadId=thr_cap) drains its OWN scoped queue —
+    // pass the captain thread id exactly as production does (ctx.threadId).
+    await host.harness.behavior.runCli(["quiet", "on"], { threadId: "thr_cap", projectId: "proj_1" });
     await emitIdle(host, "DONE: HELDREPORT while quiet");
-    const off = await host.harness.behavior.runCli(["quiet", "off"], { projectId: "proj_1" });
+    const off = await host.harness.behavior.runCli(["quiet", "off"], { threadId: "thr_cap", projectId: "proj_1" });
     assert.equal(off.exitCode, 0, off.stderr);
     assert.match(off.stdout, /HELDREPORT/, `quiet-off must surface the held durable report:\n${off.stdout}`);
   } finally {
@@ -3220,9 +3503,11 @@ test("IT F5: turnEndGuard keeps re-ringing at a slow floor after the budget (nev
   try {
     stubRealExecHost(host);
     host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
-    // a real undrained signal wake so the REAL countUndrainedWakes awk sees pending>0
+    // a real undrained signal wake so the REAL countUndrainedWakes awk sees pending>0.
+    // D6: the count is read from the captain-SCOPED state plane (state/cap-thr_cap).
     const epoch = Math.floor(Date.now() / 1000);
-    writeFileSync(join(home, "state", ".wake-queue"), `${epoch}\t1\tsignal\tc1.status\tpending\n`);
+    mkdirSync(join(home, "state", "cap-thr_cap"), { recursive: true });
+    writeFileSync(join(home, "state", "cap-thr_cap", ".wake-queue"), `${epoch}\t1\tsignal\tc1.status\tpending\n`);
     const emitCaptainIdle = () =>
       host.harness.behavior.emitThreadEvent("thread.idle", {
         thread: makeThreadResponse({ id: "thr_cap", status: "idle", projectId: "proj_1" }),
@@ -3238,7 +3523,7 @@ test("IT F5: turnEndGuard keeps re-ringing at a slow floor after the budget (nev
     await emitCaptainIdle();
     assert.equal(sendCalls(host).length, before, "throttled within the slow floor");
     // queue drained → budget resets to zero
-    writeFileSync(join(home, "state", ".wake-queue"), "");
+    writeFileSync(join(home, "state", "cap-thr_cap", ".wake-queue"), "");
     await emitCaptainIdle();
     const st = (await host.bb.storage.kv.get("turnend-budget:thr_cap")) as { count?: number };
     assert.equal(st?.count, 0, "budget resets when the queue drains");
