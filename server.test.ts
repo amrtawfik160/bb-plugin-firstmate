@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -9,6 +11,7 @@ import {
   makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
 import plugin, { formatFmMeta, formatSecondmate, pickSecondmate, toolbeltPhrase, versionAtLeast } from "./server.ts";
+import { latestStatus, statusProtocolSummary } from "./lib/policy.ts";
 
 const SKILLS = ["captain", "firstmate", "afk", "ahoy", "bearings", "quiet", "stow"] as const;
 
@@ -2922,5 +2925,272 @@ test("queue real: tasks-axi add exit!=0 leaves the row KV-only (no backlog id)",
     assert.equal(q[0]?.backlogId, undefined, "a failed add must not record a backlog id");
   } finally {
     await host.harness.lifecycle.dispose();
+  }
+});
+
+
+// --- Phase 6: durable messaging planes — real-script integration + flag gating ---
+//
+// F6: these run the REAL firstmate bin/ scripts (fm-wake-lib, fm-wake-drain,
+// fm-task-inbox-lib) against a scratch FM_HOME by making the fake host terminal
+// actually execute each command. They assert the captain-facing RESULT (what drain
+// presents, what the crew's durable record contains), not just the emitted command
+// string. Skipped when the real scripts are absent (e.g. CI without them).
+
+const FM_TEST_BIN = process.env.FM_TEST_BIN ?? "/root/firstmate/bin";
+const FM_INTEGRATION =
+  existsSync(join(FM_TEST_BIN, "fm-wake-lib.sh")) &&
+  existsSync(join(FM_TEST_BIN, "fm-wake-drain.sh")) &&
+  existsSync(join(FM_TEST_BIN, "fm-task-inbox-lib.sh"));
+
+function scratchFmHome(): string {
+  const home = mkdtempSync(join(tmpdir(), "fm-it-"));
+  mkdirSync(join(home, "state"), { recursive: true });
+  symlinkSync(FM_TEST_BIN, join(home, "bin"));
+  return home;
+}
+
+// Make the fake host terminal EXECUTE each command for real (recovering the inner
+// command from the RC wrapper and running it in a fresh shell), so the plugin drives
+// the actual scripts. threads.send stays a recording no-op.
+function stubRealExecHost(host: Awaited<ReturnType<typeof load>>) {
+  const cmds = new Map<string, string>();
+  let n = 0;
+  host.harness.sdk.stub("threadSections.list", async () => []);
+  host.harness.sdk.stub("threadSections.create", async () => ({ id: "sec" }));
+  host.harness.sdk.stub("environments.list", async () => [
+    { hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" },
+  ]);
+  host.harness.sdk.stub("threads.send", async () => ({}));
+  host.harness.sdk.stub("threads.events.list", async () => []);
+  host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+  host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: null }));
+  host.harness.sdk.stub("terminals.create", async (args: { start?: { command?: string } }) => {
+    const id = `t_${++n}`;
+    cmds.set(id, args.start?.command ?? "");
+    return { id };
+  });
+  host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+  host.harness.sdk.stub("terminals.close", async () => ({}));
+  host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
+    const inner = unwrapHostCommand(cmds.get(args.terminalId) ?? "");
+    const r = spawnSync("bash", ["-c", inner], { encoding: "utf8", timeout: 30_000 });
+    return hostRcPayload((r.stdout ?? "") + (r.stderr ?? ""), typeof r.status === "number" ? r.status : 1);
+  });
+}
+
+function itHost(home: string, extra: Record<string, unknown>) {
+  return createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: home, fmHostId: "host_1", ...extra },
+  });
+}
+
+// ---- flag gating (cheap, defaults inert) ----
+
+test("notifyOwner=kv (default) sends the full report and enqueues no wake", async () => {
+  const host = ownerHost();
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRoutedHost(host, () => ({ code: 0 }));
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await emitIdle(host, "DONE: shipped the branch");
+    assert.ok(!seen.some((c) => c.includes("fm_wake_append")), "kv default must not enqueue a wake");
+    const sends = sendCalls(host);
+    assert.equal(sends.length, 1);
+    assert.match(sends[0]?.text ?? "", /DONE: shipped the branch/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("tellOwner=kv (default) uses a bare doorbell, no durable record", async () => {
+  const host = ownerHost();
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRoutedHost(host, () => ({ code: 0 }));
+    await seedCrew(host);
+    const res = await host.harness.behavior.runCli(["tell", "c1", "--message=please rebase"], { projectId: "proj_1" });
+    assert.equal(res.exitCode, 0, res.stderr);
+    assert.ok(!seen.some((c) => c.includes("fm_task_inbox_write")), "kv default writes no durable record");
+    assert.equal(sendCalls(host).length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// ---- F1: two distinct reports both survive present + ack ----
+
+test("IT F1: notifyOwner=real — two DISTINCT crew reports both survive wake present+ack", { skip: !FM_INTEGRATION }, async () => {
+  const home = scratchFmHome();
+  const host = itHost(home, { notifyOwner: "real" });
+  await plugin(host.bb);
+  try {
+    stubRealExecHost(host);
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await emitIdle(host, "DONE: REPORTONE milestone reached");
+    await emitIdle(host, "BLOCKED: REPORTTWO missing credentials");
+    const present = await host.harness.behavior.runCli(["wake"], { projectId: "proj_1" });
+    assert.equal(present.exitCode, 0, present.stderr);
+    assert.match(present.stdout, /REPORTONE/, present.stdout);
+    assert.match(present.stdout, /REPORTTWO/, present.stdout);
+    const m = /--ack-through (\d+) --recovery-generation (\S+)/.exec(present.stdout);
+    assert.ok(m, `no WAKE_ACK line in:\n${present.stdout}`);
+    const acked = await host.harness.behavior.runCli(["wake", "--ack-through", m[1]!, "--recovery-generation", m[2]!], { projectId: "proj_1" });
+    assert.equal(acked.exitCode, 0, acked.stderr);
+    const after = await host.harness.behavior.runCli(["wake"], { projectId: "proj_1" });
+    assert.doesNotMatch(after.stdout, /REPORTONE/);
+    assert.doesNotMatch(after.stdout, /REPORTTWO/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// ---- F2: quiet hold surfaces the held report at quiet-off ----
+
+test("IT F2: quiet hold + notifyOwner=real surfaces the held report at quiet-off", { skip: !FM_INTEGRATION }, async () => {
+  const home = scratchFmHome();
+  const host = itHost(home, { notifyOwner: "real" });
+  await plugin(host.bb);
+  try {
+    stubRealExecHost(host);
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await host.harness.behavior.runCli(["quiet", "on"], { projectId: "proj_1" });
+    await emitIdle(host, "DONE: HELDREPORT while quiet");
+    const off = await host.harness.behavior.runCli(["quiet", "off"], { projectId: "proj_1" });
+    assert.equal(off.exitCode, 0, off.stderr);
+    assert.match(off.stdout, /HELDREPORT/, `quiet-off must surface the held durable report:\n${off.stdout}`);
+  } finally {
+    await host.harness.lifecycle.dispose();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// ---- F3: no-meta crew stays steerable ----
+
+test("IT F3: tellOwner=real steers a crew with NO state/<id>.meta (durable record + delivery)", { skip: !FM_INTEGRATION }, async () => {
+  const home = scratchFmHome();
+  const host = itHost(home, { tellOwner: "real" });
+  await plugin(host.bb);
+  try {
+    stubRealExecHost(host);
+    await seedCrew(host);
+    // deliberately no state/c1.meta written
+    const res = await host.harness.behavior.runCli(["tell", "c1", "--message=please rebase on main"], { projectId: "proj_1" });
+    assert.equal(res.exitCode, 0, res.stderr);
+    assert.equal(sendCalls(host).length, 1, "literal doorbell still delivered");
+    const rec = readFileSync(join(home, "state", "c1.inbox", "001.msg"), "utf8");
+    assert.match(rec, /please rebase on main/, "durable record written despite no meta");
+    assert.ok(!existsSync(join(home, "state", "c1.meta")), "no meta was needed");
+  } finally {
+    await host.harness.lifecycle.dispose();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// ---- F4: steer text stored verbatim for every hazardous prefix + multiline ----
+
+test("IT F4: tellOwner=real stores steer text VERBATIM for --key / --resolve-key / slash / $ / multiline", { skip: !FM_INTEGRATION }, async () => {
+  const home = scratchFmHome();
+  const host = itHost(home, { tellOwner: "real" });
+  await plugin(host.bb);
+  try {
+    stubRealExecHost(host);
+    await seedCrew(host);
+    const bodies = ["--resolve-key foo bar", "--key Enter then act", "/deploy to prod now", "$env special skill", "line one\nline two\nline three"];
+    let seq = 0;
+    for (const body of bodies) {
+      const res = await host.harness.behavior.runCli(["tell", "c1", `--message=${body}`], { projectId: "proj_1" });
+      assert.equal(res.exitCode, 0, res.stderr);
+      seq += 1;
+      const rec = readFileSync(join(home, "state", "c1.inbox", `${String(seq).padStart(3, "0")}.msg`), "utf8");
+      const bodyOnDisk = rec.slice(rec.indexOf("\n--\n") + 4);
+      assert.equal(bodyOnDisk, body, `verbatim record mismatch for [${body}]`);
+    }
+    const texts = sendCalls(host).map((s) => s.text);
+    for (const body of bodies) assert.ok(texts.includes(body), `literal doorbell missing for [${body}]`);
+  } finally {
+    await host.harness.lifecycle.dispose();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// ---- F5: turn-end guard never abandons — slow floor after budget ----
+
+test("IT F5: turnEndGuard keeps re-ringing at a slow floor after the budget (never abandons)", { skip: !FM_INTEGRATION }, async () => {
+  const home = scratchFmHome();
+  const host = itHost(home, { turnEndGuard: "re-ring", turnEndGuardBudget: 2 });
+  await plugin(host.bb);
+  try {
+    stubRealExecHost(host);
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
+    // a real undrained signal wake so the REAL countUndrainedWakes awk sees pending>0
+    const epoch = Math.floor(Date.now() / 1000);
+    writeFileSync(join(home, "state", ".wake-queue"), `${epoch}\t1\tsignal\tc1.status\tpending\n`);
+    const emitCaptainIdle = () =>
+      host.harness.behavior.emitThreadEvent("thread.idle", {
+        thread: makeThreadResponse({ id: "thr_cap", status: "idle", projectId: "proj_1" }),
+        lastAssistantText: "done",
+      });
+    // budget already spent; lastRingAt old → must STILL re-ring (floor), not abandon
+    await host.bb.storage.kv.set("turnend-budget:thr_cap", { count: 5, lastRingAt: 0 });
+    let before = sendCalls(host).length;
+    await emitCaptainIdle();
+    assert.equal(sendCalls(host).length, before + 1, "must re-ring at the slow floor, not abandon");
+    // immediately again → within the floor cooldown → NO new ring
+    before = sendCalls(host).length;
+    await emitCaptainIdle();
+    assert.equal(sendCalls(host).length, before, "throttled within the slow floor");
+    // queue drained → budget resets to zero
+    writeFileSync(join(home, "state", ".wake-queue"), "");
+    await emitCaptainIdle();
+    const st = (await host.bb.storage.kv.get("turnend-budget:thr_cap")) as { count?: number };
+    assert.equal(st?.count, 0, "budget resets when the queue drains");
+  } finally {
+    await host.harness.lifecycle.dispose();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// ---- re-review: tellOwner steer must not be weaponized by fm-watch ----
+
+test("note: report lines never override the crew's real terminal verb (latestStatus/summary)", () => {
+  // A crew's real verb followed by our appended report note: latestStatus must still
+  // report `done`, and the summary must not show the note as the crew's state.
+  const lines = ["working: building", "done: shipped PR #9", "note: crew c1 update REPORTX"];
+  assert.deepEqual(latestStatus(lines), { verb: "done", note: "shipped PR #9" });
+  const summary = statusProtocolSummary(lines);
+  assert.match(summary ?? "", /state: done/);
+  assert.doesNotMatch(summary ?? "", /REPORTX/);
+});
+
+test("IT F3b: tellOwner=real writes a fire-and-forget record → fm_task_inbox_due_action stays quiet (no false stuck-recovery)", { skip: !FM_INTEGRATION }, async () => {
+  const home = scratchFmHome();
+  const host = itHost(home, { tellOwner: "real" });
+  await plugin(host.bb);
+  try {
+    stubRealExecHost(host);
+    await seedCrew(host);
+    const res = await host.harness.behavior.runCli(["tell", "c1", "--message=please rebase"], { projectId: "proj_1" });
+    assert.equal(res.exitCode, 0, res.stderr);
+    // the record must carry delivery=fire-and-forget
+    const rec = readFileSync(join(home, "state", "c1.inbox", "001.msg"), "utf8");
+    assert.match(rec, /delivery=fire-and-forget/, "steer record must be fire-and-forget");
+    // and the REAL ladder must report quiet even past grace — this is exactly what
+    // fm-watch's inbox_steer_check gates on, so it never escalates a healthy crew.
+    const due = spawnSync(
+      "bash",
+      ["-c", `export FM_HOME=${home} FM_ROOT=${home} FM_TASK_INBOX_GRACE_SECS=0; . ${home}/bin/fm-task-inbox-lib.sh; fm_task_inbox_due_action ${home}/state c1`],
+      { encoding: "utf8", timeout: 20_000 },
+    );
+    assert.equal((due.stdout ?? "").trim(), "quiet", `due_action must be quiet, got: ${due.stdout} / ${due.stderr}`);
+  } finally {
+    await host.harness.lifecycle.dispose();
+    rmSync(home, { recursive: true, force: true });
   }
 });

@@ -678,6 +678,32 @@ export default async function plugin(bb: BbPluginApi) {
       options: ["kv", "real"],
       default: "kv",
     },
+    notifyOwner: {
+      type: "select",
+      label:
+        "Crew→captain notification owner: kv (one fire-and-forget threads.send; a failed send is LOST) or real (enqueue a durable wake into the real fm-wake queue keyed <id>.status, then ring one cheap constant doorbell; the captain drains with `bb firstmate wake`, so a dropped doorbell never loses the report and repeats dedupe). Real degrades to the KV send with a log if the host/queue is unreachable.",
+      options: ["kv", "real"],
+      default: "kv",
+    },
+    tellOwner: {
+      type: "select",
+      label:
+        "Captain→crew steering owner: kv (a bare threads.send doorbell, no durable record, no ack) or real (route through the real fm-send.sh steering inbox: durable sequenced state/<id>.inbox/NNN.msg, one constant doorbell, ack = crew mv to handled/, fm-watch re-ring ladder; refuses unresolved targets). interrupt/stop stay hard-stops, never the inbox. Real degrades to the KV doorbell with a log on infra failure.",
+      options: ["kv", "real"],
+      default: "kv",
+    },
+    turnEndGuard: {
+      type: "select",
+      label:
+        "Captain turn-end backstop: off, or re-ring — on captain idle with undrained durable wakes, inject ONE bounded steering re-ring to drain them first. NOTE: BB exposes no blocking stop hook (unlike native firstmate's exit-2 Stop guard), so this is a post-idle backstop, NOT a guarantee — the blind window between idle and the re-ring remains.",
+      options: ["off", "re-ring"],
+      default: "off",
+    },
+    turnEndGuardBudget: {
+      type: "number",
+      label: "Back-to-back turn-end re-rings per captain thread before throttling to a slow floor (~15m) — it never abandons the captain with undrained wakes; resets when the queue drains.",
+      default: 3,
+    },
     defaultProvider: {
       type: "string",
       label: "Default crew provider id (blank = BB resolves)",
@@ -941,8 +967,9 @@ export default async function plugin(bb: BbPluginApi) {
     }
     await writeQuiet({ on: false, held: [] });
     await projectQuiet(false);
-    if (prev.held.length === 0) return "Quiet off";
-    return `Quiet off\nHeld while quiet:\n${prev.held.join("\n---\n")}`;
+    const wake = await wakeResumeBrief();
+    if (prev.held.length === 0) return `Quiet off${wake}`;
+    return `Quiet off\nHeld while quiet:\n${prev.held.join("\n---\n")}${wake}`;
   }
   async function markQueueForCrew(crewId: string, status: "done"): Promise<void> {
     const items = await readQueue();
@@ -986,6 +1013,70 @@ export default async function plugin(bb: BbPluginApi) {
       });
     } catch {
       bb.log.warn(`notify failed for crew ${crewId}`);
+    }
+  }
+
+  // One short constant doorbell that replaces the full-text notify when the
+  // durable wake was enqueued: the payload lives in the real wake queue, the
+  // captain's chat only carries this one line, and a duplicate is harmless (the
+  // queue dedupes on (kind,key)). This is what makes a lost delivery impossible —
+  // the report survives in state/.wake-queue even if this send never lands.
+  const CAPTAIN_WAKE_DOORBELL =
+    "🔔 Firstmate: crew wake(s) pending — run `bb firstmate wake` to drain (durable; open decisions + unread statuses surface there).";
+
+  // F5: after the turn-end re-ring budget, keep re-ringing at this slow floor rather
+  // than abandoning the captain idle-with-undrained-wakes.
+  const TURN_END_FLOOR_MS = 15 * 60_000;
+
+  // Enqueue a durable crew→captain report. F1: the wake row is only a POINTER —
+  // `fm-wake-drain` collapses rows per (kind,key) and acks the older unseen ones
+  // away, so distinct reports for one crew would be LOST if the text lived in the
+  // payload. Native firstmate keeps the content in the crew's append-only
+  // `state/<id>.status` file (a `note:` line — the fm-classify unread-surface
+  // grammar) which drain reads cursor-backed and presents in full (never deduped);
+  // the `signal <id>.status` wake is the pointer that tells drain the file has news.
+  // So we append the report as a note line, THEN enqueue the pointer. Both distinct
+  // reports then survive presentation + ack (proven live). Best-effort: returns
+  // false so the caller keeps the KV fire-and-forget send on any failure. The note
+  // is base64'd and decoded on the host into a shell var, never interpolated.
+  async function enqueueCaptainWake(crew: Crew, display: string): Promise<boolean> {
+    const fmHome = (await settings.get()).fmHome.trim();
+    if (fmHome === "" || isSecondmateRoute(crew)) return false;
+    let hostId: string;
+    try {
+      hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
+    } catch {
+      return false;
+    }
+    const lib = `${fmHome}/bin/fm-wake-lib.sh`;
+    const stateDir = `${fmHome}/state`;
+    const statusPath = `${stateDir}/${crew.id}.status`;
+    const key = `${crew.id}.status`;
+    // Single-line note in fm-classify grammar (strip any leading "note:" so we don't
+    // double it, collapse whitespace). `note:` is the informational unread surface.
+    const note = display.replace(/[\r\n\t]+/g, " ").replace(/^\s*note:\s*/i, "").trim().slice(0, 800);
+    const noteB64 = Buffer.from(note, "utf8").toString("base64");
+    const script = [
+      `export FM_HOME=${shQuote(fmHome)}`,
+      `export FM_ROOT=${shQuote(fmHome)}`,
+      `[ -f ${shQuote(lib)} ] || { echo "error: missing ${lib}" >&2; exit 127; }`,
+      `. ${shQuote(lib)}`,
+      `mkdir -p ${shQuote(stateDir)}`,
+      `note=$(printf '%s' ${shQuote(noteB64)} | base64 -d)`,
+      `printf 'note: %s\\n' "$note" >> ${shQuote(statusPath)}`,
+      `fm_wake_append signal ${shQuote(key)} ${shQuote(`crew ${crew.id} update`)}`,
+    ].join("\n");
+    try {
+      const res = await runOnHost(hostId, script, 15_000);
+      if (res.exitCode !== 0) {
+        bb.log.warn(`fm wake enqueue failed crew=${crew.id} exit=${res.exitCode}`);
+        return false;
+      }
+      bb.log.info(`fm wake enqueued crew=${crew.id} key=${key} (note→status + pointer)`);
+      return true;
+    } catch (error) {
+      bb.log.warn(`fm wake enqueue failed crew=${crew.id} ${error instanceof Error ? error.message : String(error)}`);
+      return false;
     }
   }
 
@@ -1035,7 +1126,17 @@ export default async function plugin(bb: BbPluginApi) {
             : `next: bb firstmate crew ${crew.id}`,
     );
     const text = lines.join("\n").slice(0, 1500);
+    // notifyOwner=real: persist the report into the durable wake queue first, then
+    // the chat send becomes only the cheap constant doorbell. A dropped doorbell can
+    // no longer lose the report — the captain drains the queue with `bb firstmate
+    // wake` (open decisions/unread statuses surface there, repeats dedupe). Default
+    // kv is byte-for-byte the previous fire-and-forget behavior.
+    const durable = (await settings.get()).notifyOwner === "real" ? await enqueueCaptainWake(crew, text) : false;
+    const doorbell = durable ? CAPTAIN_WAKE_DOORBELL : text;
     if (quietHold || afkHold) {
+      // The durable wake already persisted the report; do not also hold a redundant
+      // doorbell (the captain drains the queue on return). KV path unchanged.
+      if (durable) return;
       const evicted: string[] = [];
       if (quietHold) {
         const pushed = pushHeld(quietState.held, text);
@@ -1055,7 +1156,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (evicted.length > 0) await publishFleet();
       return;
     }
-    await deliverToCaptain(parentThreadId, text, crew.id);
+    await deliverToCaptain(parentThreadId, doorbell, crew.id);
     await publishFleet();
   }
 
@@ -2083,9 +2184,99 @@ export default async function plugin(bb: BbPluginApi) {
     return next;
   }
 
+  // Write a captain→crew steer as a durable, sequenced steering-inbox record via the
+  // real fm-task-inbox-lib primitive. F4: `fm-send.sh` has NO literal-body form
+  // (MESSAGE=$*), so a body starting with `--resolve-key`/`--fire-and-forget`/`--key`
+  // is eaten by its option loop and a leading `/` or `$` is diverted to the crew
+  // harness's own parser — none of which the captain intends for a chat steer.
+  // `fm_task_inbox_write <state> <id> <body> fire-and-forget` takes the body as ONE
+  // positional arg, so every prefix is stored verbatim (proven). F3: it needs no
+  // state/<id>.meta, so a crew created before real transport is never rendered
+  // unsteerable. Base64 keeps the body out of the command text entirely.
+  //
+  // The record is written `fire-and-forget` DELIBERATELY (re-review HIGH): a BB thread
+  // crew is steered over the BB send and never reads its inbox, so it never `mv`s the
+  // record into handled/ to ack it. A normal record would leave fm-watch's
+  // inbox_steer_check seeing a permanently-unhandled steer and escalate it into a
+  // FALSE stuck-crewmate-recovery (immediately for an idle crew, since the bb backend
+  // maps idle→dead). fire-and-forget records are excluded from the re-ring ladder
+  // (fm_task_inbox_oldest_unhandled skips them → due_action stays `quiet`), so the
+  // record stays a durable audit trail without ever being weaponized by the watcher.
+  // Best-effort: false ⇒ no durable record (caller still delivers the doorbell).
+  async function writeInboxRecord(hostId: string, fmHome: string, crewId: string, body: string): Promise<boolean> {
+    const lib = `${fmHome}/bin/fm-task-inbox-lib.sh`;
+    const stateDir = `${fmHome}/state`;
+    const b64 = Buffer.from(body.slice(0, MAX_TASK), "utf8").toString("base64");
+    const script = [
+      `export FM_HOME=${shQuote(fmHome)}`,
+      `export FM_ROOT=${shQuote(fmHome)}`,
+      `[ -f ${shQuote(lib)} ] || { echo "error: missing ${lib}" >&2; exit 127; }`,
+      `. ${shQuote(lib)}`,
+      `mkdir -p ${shQuote(stateDir)}`,
+      `body=$(printf '%s' ${shQuote(b64)} | base64 -d)`,
+      `fm_task_inbox_write ${shQuote(stateDir)} ${shQuote(crewId)} "$body" fire-and-forget >/dev/null`,
+    ].join("\n");
+    try {
+      const res = await runOnHost(hostId, script, 20_000);
+      if (res.exitCode !== 0) {
+        bb.log.warn(`fm inbox record crew=${crewId} exit=${res.exitCode}`);
+        return false;
+      }
+      return true;
+    } catch (error) {
+      bb.log.warn(`fm inbox record crew=${crewId} ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  }
+
+  // tellOwner=real: a captain→crew steer gets a durable fire-and-forget steering-inbox
+  // record (verbatim audit trail; NOT re-rung — the crew is steered over BB, not by
+  // reading its inbox) AND is delivered as the literal doorbell over BB — identical to
+  // the KV path, so no crew regresses. Delivery never depends on fm-send target
+  // resolution or state/<id>.meta (F3), and the body is stored/delivered verbatim
+  // regardless of prefix (F4). interrupt/stop stay hard steers, never this path.
+  // Returns a status string once the literal doorbell is delivered; null when
+  // tellOwner=kv, fmHome unset, or the BB send itself fails (so tellCrew's own send is
+  // the last-resort fallback).
+  async function sendViaInbox(crew: Crew, message: string): Promise<string | null> {
+    const current = await settings.get();
+    if (current.tellOwner !== "real") return null;
+    const fmHome = current.fmHome.trim();
+    if (fmHome === "" || isSecondmateRoute(crew)) return null;
+    let hostId: string | null = null;
+    try {
+      hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
+    } catch {
+      hostId = null;
+    }
+    const durable = hostId === null ? false : await writeInboxRecord(hostId, fmHome, crew.id, message);
+    try {
+      await bb.sdk.threads.send({
+        threadId: crew.threadId,
+        mode: "queue-if-active",
+        input: [{ type: "text", text: message.slice(0, MAX_TASK), mentions: [] }],
+      });
+    } catch (error) {
+      // Couldn't even deliver the literal doorbell — let tellCrew's own send try.
+      bb.log.warn(`fm inbox doorbell crew=${crew.id} ${error instanceof Error ? error.message : String(error)}; falling back`);
+      return null;
+    }
+    bb.log.info(`fm inbox steer crew=${crew.id} ${durable ? "durable record + literal doorbell" : "literal doorbell (no durable record)"}`);
+    return durable
+      ? `Told crew ${crew.id} (delivered over BB + durable fire-and-forget inbox record for audit; not re-rung)`
+      : `Told crew ${crew.id} (delivered over BB; durable record unavailable — logged)`;
+  }
+
   async function tellCrew(crew: Crew, message: string, interrupt: boolean): Promise<string> {
     if (isSecondmateRoute(crew) && interrupt) {
       throw new Error(`Crew ${crew.id} is a secondmate route — do not interrupt the domain captain thread.`);
+    }
+    // Steer (not interrupt) routes through the durable inbox when tellOwner=real.
+    // interrupt/stop always stay a hard bb steer — never the inbox — so an interrupt
+    // is never misread as a queued instruction.
+    if (!interrupt) {
+      const routed = await sendViaInbox(crew, message);
+      if (routed !== null) return routed;
     }
     await bb.sdk.threads.send({
       threadId: crew.threadId,
@@ -3088,6 +3279,140 @@ export default async function plugin(bb: BbPluginApi) {
       if (h !== "") return h;
     }
     return fleetHost();
+  }
+
+  // Present or acknowledge the real fm-wake queue (the durable crew→captain plane).
+  // Present (no ack args) prints the pending wake rows + UNREAD STATUS / OPEN
+  // DECISIONS sections and the `WAKE_ACK_REQUIRED: ... --ack-through <SEQ>
+  // --recovery-generation <GEN>` line; it does NOT consume. Ack mode consumes rows
+  // at/below the sequence. Returns null when fmHome/host is unset (caller reports
+  // plainly). Drives the real fm-wake-drain.sh — no policy is reimplemented here.
+  async function drainWakes(ackThrough?: number, recoveryGeneration?: string): Promise<string | null> {
+    const fmHome = (await settings.get()).fmHome.trim();
+    if (fmHome === "") return null;
+    const hostId = await fleetHost();
+    if (hostId === null || hostId === "") return null;
+    const args: string[] = [];
+    if (
+      ackThrough !== undefined &&
+      recoveryGeneration !== undefined &&
+      /^[A-Za-z0-9._-]+$/.test(recoveryGeneration)
+    ) {
+      args.push("--ack-through", String(Math.max(0, Math.trunc(ackThrough))), "--recovery-generation", recoveryGeneration);
+    }
+    try {
+      const res = await runFmScript({ script: "wake-drain", args, hostId, fmHome, timeoutMs: 30_000 });
+      const out = res.output.trim();
+      if (res.exitCode !== 0 && out === "") return `wake drain exit ${res.exitCode}`;
+      return out === "" ? "Wake queue empty." : out;
+    } catch (error) {
+      bb.log.warn(`fm wake drain failed ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    }
+  }
+
+  // Count actionable (signal/stale) undrained wakes, deduped on (kind,key) to match
+  // fm-wake-drain's presentation. 0 when the queue is absent/unreadable.
+  async function countUndrainedWakes(hostId: string, fmHome: string): Promise<number> {
+    const q = `${fmHome}/state/.wake-queue`;
+    const cmd =
+      `[ -f ${shQuote(q)} ] && awk -F '\\t' 'NF>=5 && $2 ~ /^[0-9]+$/ && ($3=="signal"||$3=="stale"){seen[$3"\\t"$4]=1} END{printf "FMWAKES=%d\\n", length(seen)}' ${shQuote(q)} || printf 'FMWAKES=0\\n'`;
+    try {
+      const res = await runOnHost(hostId, cmd, 15_000);
+      const m = /FMWAKES=(\d+)/.exec(res.output);
+      return m ? parseInt(m[1]!, 10) : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  // F2: surface durable wakes that arrived while quiet/afk was on. notifyOwner=real
+  // deliberately does not add to the KV `held` list (the report lives in the wake
+  // queue), so quiet-off / afk-off — which only print the KV held list — would never
+  // resurface a report enqueued while held. Present (not ack) the queue at resume so
+  // the captain sees them; the rows stay until acked via `bb firstmate wake`.
+  async function wakeResumeBrief(): Promise<string> {
+    const s = await settings.get();
+    if (s.notifyOwner !== "real") return "";
+    const fmHome = s.fmHome.trim();
+    if (fmHome === "") return "";
+    const hostId = await fleetHost();
+    if (hostId === null || hostId === "") return "";
+    const pending = await countUndrainedWakes(hostId, fmHome);
+    if (pending <= 0) return "";
+    const out = await drainWakes();
+    if (out === null) return "";
+    return `\n== ${pending} durable wake(s) held while away/quiet — run \`bb firstmate wake\` to drain/ack ==\n${out}`;
+  }
+
+  // Non-blocking turn-end backstop (item 4). BB exposes NO blocking stop hook — the
+  // PluginEvents.on("thread.idle") handler fires AFTER the thread is already idle and
+  // returns void, so it cannot veto the turn the way native firstmate's Stop hook
+  // does with exit 2. The strongest honest equivalent: when the captain idles with
+  // undrained durable wakes, inject ONE bounded steer re-ring so the captain drains
+  // them instead of going blind. The blind window between idle and the re-ring
+  // remains — this is a backstop, not a guarantee (see the feature request in the PR).
+  async function captainTurnEndGuard(threadId: string): Promise<void> {
+    const s = await settings.get();
+    if (s.turnEndGuard !== "re-ring") return;
+    const fmHome = s.fmHome.trim();
+    if (fmHome === "") return;
+    if (!(await isCaptainThread(threadId))) return;
+    const hostId = await fleetHost();
+    if (hostId === null || hostId === "") return;
+    const pending = await countUndrainedWakes(hostId, fmHome);
+    const budgetKey = `turnend-budget:${threadId}`;
+    if (pending === 0) {
+      await bb.storage.kv.set(budgetKey, { count: 0, lastRingAt: 0 });
+      return;
+    }
+    const max = Number.isFinite(s.turnEndGuardBudget) ? Math.max(1, Math.trunc(s.turnEndGuardBudget)) : 3;
+    // F5: never silently abandon. The first `max` idles re-ring back-to-back; after
+    // that we keep re-ringing but throttled to a slow floor, so the captain is never
+    // left idle-forever with undrained wakes (it just nags less often). Reset on drain.
+    const raw = await bb.storage.kv.get(budgetKey);
+    const state =
+      raw !== null && typeof raw === "object"
+        ? (raw as { count?: number; lastRingAt?: number })
+        : { count: typeof raw === "number" ? raw : 0, lastRingAt: 0 };
+    const count = typeof state.count === "number" ? state.count : 0;
+    const lastRingAt = typeof state.lastRingAt === "number" ? state.lastRingAt : 0;
+    const now = Date.now();
+    let floor = false;
+    let nextCount = count;
+    if (count < max) {
+      nextCount = count + 1;
+    } else if (now - lastRingAt >= TURN_END_FLOOR_MS) {
+      floor = true; // keep re-ringing, throttled — do NOT abandon
+    } else {
+      bb.log.info(`turn-end guard: ${pending} undrained for captain ${threadId}; slow-floor cooldown (next in ${Math.ceil((TURN_END_FLOOR_MS - (now - lastRingAt)) / 60000)}m)`);
+      return;
+    }
+    await bb.storage.kv.set(budgetKey, { count: nextCount, lastRingAt: now });
+    const tag = floor ? `slow-floor reminder` : `${nextCount}/${max}`;
+    try {
+      await bb.sdk.threads.send({
+        // Evidence (b), proven live: `mode: steer` to an IDLE thread STARTS a fresh
+        // turn (status idle→active); `queue-if-active` only queues without starting
+        // one. The captain is idle here (this fires on thread.idle), and the whole
+        // point is to make it take another turn to drain — so steer is required.
+        threadId,
+        mode: "steer",
+        input: [
+          {
+            type: "text",
+            text:
+              `🔔 Firstmate turn-end backstop (${tag}): ${pending} undrained crew wake(s)/decision(s). ` +
+              "Run `bb firstmate wake` and handle them before ending your turn.\n" +
+              "(Best-effort re-ring — BB has no blocking stop hook, so this is not a guaranteed block.)",
+            mentions: [],
+          },
+        ],
+      });
+      bb.log.info(`turn-end guard re-rang captain ${threadId} (${pending} pending, ${tag})`);
+    } catch (error) {
+      bb.log.warn(`turn-end guard re-ring failed ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   // Run bin/fm-tasks-axi.sh <args> at fmHome. Returns null when fmHome/host is
@@ -4196,6 +4521,21 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.agents.registerTool({
+    name: "firstmate_wake",
+    description:
+      "Drain the real firstmate wake queue: durable crew→captain notifications, unread crew statuses, and open decisions that a dropped doorbell would otherwise lose. Run this when doorbelled (notifyOwner=real) or on deck. After handling, pass ackThrough + recoveryGeneration (from the WAKE_ACK_REQUIRED line) to consume the rows.",
+    parameters: z.object({
+      ackThrough: z.number().int().min(0).optional().describe("Consume wakes at/below this sequence (from WAKE_ACK_REQUIRED)"),
+      recoveryGeneration: z.string().optional().describe("Recovery generation token (from WAKE_ACK_REQUIRED)"),
+    }),
+    async execute({ ackThrough, recoveryGeneration }) {
+      const out = await drainWakes(ackThrough, recoveryGeneration);
+      if (out === null) return toolError("No real fm-wake queue reachable (need real mode initialized + a host for fmHome).");
+      return out;
+    },
+  });
+
+  bb.agents.registerTool({
     name: "firstmate_deliver",
     description: "Crew delivery: outcome + committed/uncommitted diff + PR state.",
     parameters: z.object({ crewId: z.string() }),
@@ -4433,6 +4773,7 @@ export default async function plugin(bb: BbPluginApi) {
           "== return brief ==",
           snap.text,
           held.length === 0 ? "Nothing held." : `Held while away:\n${held.join("\n---\n")}`,
+          await wakeResumeBrief(),
         ].join("\n");
       }
       const afk = await readAfk();
@@ -5028,6 +5369,9 @@ export default async function plugin(bb: BbPluginApi) {
     await settleDeck(thread.id);
   });
   bb.events.on("thread.idle", async ({ thread, lastAssistantText }) => {
+    // Turn-end backstop for the captain (no-op unless turnEndGuard=re-ring and this
+    // is the captain thread). Runs before the crew path; captains are not crews.
+    await captainTurnEndGuard(thread.id).catch(() => {});
     const crew = await findCrewByThread(thread.id);
     if (crew === undefined || isSecondmateRoute(crew)) return;
     const stopped = await turnWasStopped(thread);
@@ -5077,6 +5421,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "stop", summary: "Stop a crew thread", usage: "bb firstmate stop <crew-id>" },
       { name: "retry", summary: "Re-submit a failed turn, or relaunch with a new model/provider/reasoning", usage: "bb firstmate retry <crew-id> [--model m] [--provider p] [--reasoning-level l]" },
       { name: "bearings", summary: "Fleet digest", usage: "bb firstmate bearings [--json]" },
+      { name: "wake", summary: "Drain the durable crew→captain wake queue (present, or --ack-through <seq> --recovery-generation <gen>)", usage: "bb firstmate wake [--ack-through <seq> --recovery-generation <gen>]" },
       { name: "deliver", summary: "Outcome + committed/uncommitted diff + PR", usage: "bb firstmate deliver <crew-id>" },
       { name: "merge", summary: "Merge PR or local-only ff-only land", usage: "bb firstmate merge <crew-id> [--yes]" },
       { name: "promote", summary: "Scout → new ship carrying the report", usage: "bb firstmate promote <crew-id>" },
@@ -5376,6 +5721,14 @@ export default async function plugin(bb: BbPluginApi) {
             const snap = await bearingsSnapshot();
             return reply(snap.json, snap.text);
           }
+          case "wake": {
+            const ackRaw = flagStr(flags, "ack-through");
+            const gen = flagStr(flags, "recovery-generation");
+            const ackThrough = ackRaw !== undefined && /^\d+$/.test(ackRaw) ? Number(ackRaw) : undefined;
+            const out = await drainWakes(ackThrough, gen);
+            if (out === null) return fail("No real fm-wake queue reachable (need real mode initialized + a host for fmHome).");
+            return reply({ drained: true, acked: ackThrough ?? null }, out);
+          }
           case "deliver": {
             const id = rest[0];
             if (id === undefined) return fail(usage);
@@ -5474,6 +5827,7 @@ export default async function plugin(bb: BbPluginApi) {
                 "== return brief ==",
                 snap.text,
                 held.length === 0 ? "Nothing held." : `Held while away:\n${held.join("\n---\n")}`,
+                await wakeResumeBrief(),
               ].join("\n");
               return reply({ afk: false, held, bearings: snap.json }, text);
             }
