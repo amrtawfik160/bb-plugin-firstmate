@@ -24,6 +24,27 @@ Install, then run `/captain` in any thread — that calls `deck` and is the setu
   crews. The overlay `bb` backend propagates provider/model/reasoning into the
   spawn, tags children as crews, and lets a completed scout's scratch worktree be
   discarded.
+- Real transport (opt-in, `transport=real`): `dispatch` routes end-to-end through
+  the real `fm-brief.sh` + `fm-spawn.sh` (backend=bb) so the real scripts create
+  the brief, worktree, thread, `state/<id>.meta` and profile
+  (harness/provider/model/effort). If the real spawn fails **before** a thread
+  exists, dispatch falls back to native BB spawn automatically; it never
+  double-spawns (an already-recorded `bb_thread_id` is adopted, not re-spawned).
+  Default `transport=native` keeps the current behavior — flip the setting to opt
+  in, flip it back to turn it off without a redeploy.
+- Watch ownership (opt-in, `watchOwner=fm-watch`): the real `fm-watch` owns
+  supervision policy (wedge evidence, steering re-rings, heartbeat); BB idle/
+  error/done events still flow as delivery/acceleration but BB no longer pages the
+  captain about a stuck crew, so there is no double-paging. Default
+  `watchOwner=native` keeps BB's stuck-pass. Falls back to native when real mode
+  is off.
+- Version-pinned real skills inventory: on init/deck (and when `fmHome` HEAD
+  moves) the plugin reads `fmHome/.agents/skills` and stores a version-pinned
+  manifest, then injects that inventory into captain sessions so the captain knows
+  the real policy skills and reads/runs them through the toolbelt. (BB plugins
+  cannot register a dynamic skill root from `configure()`, so the real skill
+  *content* is surfaced through the toolbelt rather than falsely re-registered;
+  crews still get none.)
 - Authoritative real state, rebuildable KV cache: `bb firstmate migrate-state`
   imports the KV crew cache into real `state/<id>.meta` + briefs, idempotently,
   without overwriting active work, and skipping terminal (done/failed) crews so

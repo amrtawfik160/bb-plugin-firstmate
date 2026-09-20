@@ -55,6 +55,29 @@ rewrite. Two planes, one runtime:
   use `fm` when you need the full script policy (relay/mail/voice, backlog
   handoff, afk/bearings contracts, adapters). Never fork or reimplement the scripts.
 
+### Feature flags: real transport + watch ownership
+
+Two behaviors are switchable in plugin settings (default off; flip back without a
+redeploy). They degrade to the current native behavior with a log line.
+
+- **`transport`** (`native` | `real`, default `native`): with `real` and real
+  mode active, `firstmate_dispatch` runs end-to-end through the real
+  `fm-brief.sh` + `fm-spawn.sh` (backend=bb) — the real scripts create the brief,
+  worktree, thread, `state/<id>.meta` and profile. If the real spawn fails
+  **before** a thread exists, dispatch falls back to native BB spawn; it never
+  double-spawns. Future-scheduled sends always use native.
+- **`watchOwner`** (`native` | `fm-watch`, default `native`): with `fm-watch`,
+  the real `fm-watch` owns supervision policy (wedge/steering/heartbeat) and BB
+  stops paging the captain about stuck crews (no double-paging); BB idle/error/
+  done events still flow. Keep `native` to use BB's stuck-pass.
+
+### Real skills inventory
+
+On deck (and when `fmHome` HEAD moves) the plugin refreshes a version-pinned
+inventory of `fmHome/.agents/skills` and injects it into this captain session, so
+you know which real policy skills exist. Read and run them through the toolbelt
+(`bb firstmate fm <script>` / the skill's own entrypoints). Crews get none.
+
 ### Authoritative state + status protocol
 
 - **Real state is authoritative; KV is a rebuildable cache.** After an upgrade,
