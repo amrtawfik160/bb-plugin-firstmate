@@ -133,32 +133,38 @@ Install, then run `/captain` in any thread — that calls `deck` and is the setu
   fire-and-forget behavior). BB messaging is otherwise fire-and-forget both ways —
   a failed `threads.send` is logged and lost, and a bare doorbell to a finished crew
   can re-run its turn. These route through the real firstmate transport instead:
-  - `notifyOwner=real` — a crew→captain notification enqueues a durable wake into the
-    real `state/.wake-queue` (`fm_wake_append signal <id>.status <text>`), then rings
-    ONE cheap constant doorbell; the captain drains with `bb firstmate wake` /
-    `firstmate_wake` (real `fm-wake-drain.sh`: pending wakes + UNREAD STATUS + OPEN
-    DECISIONS, with a `WAKE_ACK_REQUIRED --ack-through <seq> --recovery-generation
-    <gen>` line to consume). A dropped doorbell can no longer lose the report, and
-    repeated doorbells for the same `(signal,<id>.status)` dedupe to one line — the
-    live re-announce bug. Degrades to the KV fire-and-forget send with a log.
-  - `tellOwner=real` — a captain→crew steer routes through the real `fm-send.sh`
-    steering inbox: durable sequenced `state/<id>.inbox/NNN.msg`, one doorbell, ack =
-    the crew's `mv` into `handled/`, fm-watch's re-ring ladder for an active endpoint.
-    fm-send refuses an unresolved/dead target (exit 1) and that refusal is surfaced,
-    never a silent bare doorbell. `interrupt`/`stop` stay hard steers, never the
-    inbox, so an interrupt is never misread as a queued instruction. A BB thread idle
-    between turns has no running agent, so fm-send won't type into it; the plugin then
-    guarantees the doorbell with `bb thread tell` (identical delivery to today) while
-    the durable record + ack remain. Degrades to the KV doorbell with a log on infra
-    failure.
+  - `notifyOwner=real` — a crew→captain report is appended as a `note:` line into the
+    crew's append-only `state/<id>.status` file (the fm-classify unread-surface
+    grammar) and a `signal <id>.status` wake is enqueued as a POINTER. Content lives in
+    the status file, NOT the wake payload: `fm-wake-drain` collapses wake rows per key
+    and acks the older ones away, so a payload would lose distinct reports — the file
+    is read cursor-backed and every unread line is presented in full. The captain
+    drains with `bb firstmate wake` / `firstmate_wake` (real `fm-wake-drain.sh`:
+    UNREAD STATUS + OPEN DECISIONS + `WAKE_ACK_REQUIRED --ack-through <seq>
+    --recovery-generation <gen>`). Two distinct reports both survive present + ack
+    (proven). A cheap constant doorbell still rings; a dropped doorbell no longer loses
+    the report. Degrades to the KV fire-and-forget send with a log.
+  - `tellOwner=real` — a captain→crew steer is written as a durable sequenced record
+    `state/<id>.inbox/NNN.msg` via the real `fm_task_inbox_write` primitive (body is a
+    single positional arg → stored VERBATIM; `fm-send.sh` has no literal-body form, so
+    a body starting with `--resolve-key`/`--key`/`/`/`$` would be eaten by its option
+    loop or diverted to the harness parser), then delivered as the LITERAL doorbell
+    over BB — identical to the KV path. Delivery needs no `state/<id>.meta`, so a crew
+    created before real transport is never rendered unsteerable; if the BB send itself
+    fails, `tellCrew`'s own send is the fallback. `interrupt`/`stop` stay hard steers,
+    never the inbox. ack = the crew's `mv` into `handled/`, fm-watch's re-ring ladder
+    for a crew that reads its inbox. Degrades to the KV doorbell with a log.
   - `turnEndGuard=re-ring` — a non-blocking captain turn-end backstop. BB exposes NO
     blocking stop hook (its `PluginEvents.on("thread.idle")` fires AFTER idle and
     returns void — it cannot veto the turn the way native firstmate's exit-2 Stop
-    guard does), so on captain idle with undrained durable wakes the plugin injects
-    ONE bounded (`turnEndGuardBudget`, default 3, resets when the queue drains) steer
-    re-ring to drain them first. The blind window between idle and the re-ring
-    remains — this is a backstop, NOT a guarantee. A blocking `before-idle` plugin
-    hook is filed as a BB feature request.
+    guard does), so on captain idle with undrained durable wakes the plugin injects a
+    `steer` re-ring (proven live to start a fresh turn on an idle thread; `queue-if-
+    active` only queues). The first `turnEndGuardBudget` (default 3) idles re-ring
+    back-to-back; after that it keeps re-ringing at a slow floor (~15m) — it NEVER
+    abandons the captain idle-with-undrained-wakes; the budget resets when the queue
+    drains. Still a post-idle backstop, NOT a guarantee (the blind window between idle
+    and the re-ring remains). A blocking `before-idle` plugin hook is filed as a BB
+    feature request.
 - Full status protocol: the fold (`working` / `needs-decision` / `blocked` /
   `paused` / `done` / `failed`, with keyed `resolved`/`captain-held` closes) is a
   faithful port of `fm-classify-lib.sh`'s algorithm. `crew` folds the real
