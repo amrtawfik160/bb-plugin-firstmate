@@ -15,10 +15,13 @@ import plugin, {
   fmBackendEnv,
   fmWatchKeeperInterval,
   fmWatchKeeperScript,
+  fmWatchOwnerBeatTtl,
   formatFmMeta,
   formatSecondmate,
   inboxReapScript,
+  normalizeCaptainIntent,
   pickSecondmate,
+  rewriteWakeAckLine,
   toolbeltPhrase,
   versionAtLeast,
 } from "./server.ts";
@@ -3034,11 +3037,13 @@ test("D7: watchOwner=native tears the keeper down on the first tick even after a
   }
 });
 
-test("D7: plugin dispose tears the keeper down", async () => {
+test("B3(c): dispose with the feature OFF tears the keeper down", async () => {
+  // watchOwner=native means the fm-watch keeper should not be running; dispose sweeps
+  // the configured host so a keeper left over from a prior on-stretch is torn down.
   const host = createFakePluginHost({
     pluginId: "firstmate",
     agentSkillIds: SKILLS,
-    settings: { fmHome: "/tmp/fm-home", watchOwner: "fm-watch", fmHostId: "host_1" },
+    settings: { fmHome: "/tmp/fm-home", watchOwner: "native", fmHostId: "host_1" },
   });
   await plugin(host.bb);
   const cmds: string[] = [];
@@ -3057,6 +3062,221 @@ test("D7: plugin dispose tears the keeper down", async () => {
     cmds.some((c) => unwrapHostCommand(c).includes(".bb-watch-keeper.pid") && unwrapHostCommand(c).includes("rm -f")),
     `dispose must remove the keeper pidfile on the host:\n${cmds.map(unwrapHostCommand).join("\n---\n")}`,
   );
+});
+
+test("B3(c): dispose during a hot reload (watchOwner still fm-watch) LEAVES the keeper", async () => {
+  // A hot reload is dispose+re-init with the SAME config. Stopping the keeper here made
+  // it flap on every reload (killed, then re-launched next tick, leaving a gap). With
+  // the feature still on, dispose must NOT remove the keeper pidfile — the reloaded
+  // plugin re-adopts it, and the owner-beat self-exit is the backstop.
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", watchOwner: "fm-watch", fmHostId: "host_1" },
+  });
+  await plugin(host.bb);
+  const cmds: string[] = [];
+  let n = 0;
+  host.harness.sdk.stub("threads.send", async () => ({}));
+  host.harness.sdk.stub("terminals.create", async (a: { start?: { command?: string } }) => {
+    cmds.push(a.start?.command ?? "");
+    return { id: `t_${++n}` };
+  });
+  host.harness.sdk.stub("terminals.get", async () => ({ status: "exited" }));
+  host.harness.sdk.stub("terminals.close", async () => ({}));
+  host.harness.sdk.stub("terminals.output", async () => hostRcPayload("", 0));
+  await host.harness.lifecycle.dispose();
+  assert.ok(
+    !cmds.some((c) => unwrapHostCommand(c).includes(".bb-watch-keeper.pid") && unwrapHostCommand(c).includes("rm -f")),
+    `dispose during a hot reload must NOT remove the keeper pidfile:\n${cmds.map(unwrapHostCommand).join("\n---\n")}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// B1: brief-intent normalisation (why real transport never spawned)
+// ---------------------------------------------------------------------------
+
+// The EXACT operator-address rule native fm-spawn.sh refuses on, ported verbatim
+// from fm-dod-lib.sh's fm_brief_intent_address_line awk. The scratch-FM_HOME live
+// proof (scripts/live-brief-intent-check.mjs) binds to the real file; this unit
+// keeps the same rule so a drift is caught in `npm test` too.
+const NATIVE_INTENT_ADDRESS = /^[ \t]*(Captain('s (words|ask|intent))?:|Captain,)/;
+
+test("B1: normalizeCaptainIntent strips a leading Captain-label and keeps the words verbatim", () => {
+  const cases: Array<[string, string]> = [
+    ["Captain's intent: live check the transport", "live check the transport"],
+    ["Captain's intent (verbatim): live check the transport", "live check the transport"],
+    ["Captain: do the thing", "do the thing"],
+    ["Captain, please do X", "please do X"],
+    ["Captain's words: hi there", "hi there"],
+    ["Captain's ask: fix it", "fix it"],
+  ];
+  for (const [input, firstLine] of cases) {
+    const out = normalizeCaptainIntent(input);
+    assert.equal(out.split("\n")[0], firstLine, `strip label from: ${input}`);
+    for (const line of out.split("\n")) {
+      assert.ok(!NATIVE_INTENT_ADDRESS.test(line), `result still trips native refusal: ${JSON.stringify(line)}`);
+    }
+  }
+  // Multi-line captain task: ONLY the leading label is stripped; the rest is verbatim.
+  assert.equal(
+    normalizeCaptainIntent("Captain's intent: do items 1 and 2\nAcceptance: both land\n\nnotes: keep small"),
+    "do items 1 and 2\nAcceptance: both land\n\nnotes: keep small",
+  );
+  // A standalone label line is dropped entirely.
+  assert.equal(normalizeCaptainIntent("Captain's intent:\nDo the thing"), "Do the thing");
+  // Non-label text is left completely untouched (never rewrite the captain's words).
+  assert.equal(normalizeCaptainIntent("implement the scout's path"), "implement the scout's path");
+});
+
+test("B1: dispatch normalises the leading Captain-label out of the brief intent body", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home" },
+  });
+  await plugin(host.bb);
+  try {
+    const hostCommands: string[] = [];
+    host.harness.sdk.stub("threadSections.list", async () => []);
+    host.harness.sdk.stub("threadSections.create", async () => ({ id: "sec_crews" }));
+    host.harness.sdk.stub("environments.list", async () => [
+      { hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" },
+    ]);
+    host.harness.sdk.stub("environments.get", async () => ({
+      id: "env_wt", hostId: "host_1", path: "/wt", isWorktree: true, status: "ready",
+    }));
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew" }));
+    host.harness.sdk.stub("threads.get", async () =>
+      makeThreadResponse({ id: "thr_crew", status: "starting", environmentId: "env_wt" }),
+    );
+    host.harness.sdk.stub("terminals.create", async (args: { start?: { command?: string } }) => {
+      if (typeof args.start?.command === "string") hostCommands.push(args.start.command);
+      return { id: "term_1" };
+    });
+    host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+    host.harness.sdk.stub("terminals.output", async () => hostOutput(""));
+    host.harness.sdk.stub("terminals.close", async () => ({}));
+    const result = await host.harness.behavior.runCli(
+      ["dispatch", "--project", "proj_1", "--", "Captain's intent (verbatim): fix flaky login"],
+      { projectId: "proj_1" },
+    );
+    assert.equal(result.exitCode, 0, result.stderr);
+    const scaffold = hostCommands.find((c) => c.includes("FM_INTENT="));
+    assert.ok(scaffold, `no brief fill command in ${hostCommands.join("\n---\n")}`);
+    const m = /FM_INTENT=([A-Za-z0-9+/=]+)/.exec(scaffold!);
+    assert.ok(m, "no FM_INTENT b64 in the scaffold command");
+    const decoded = Buffer.from(m![1]!, "base64").toString("utf8");
+    assert.equal(decoded, "fix flaky login", `brief intent body must be normalised, got ${JSON.stringify(decoded)}`);
+    assert.ok(!NATIVE_INTENT_ADDRESS.test(decoded), "brief intent body still trips native refusal");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// B2 (D9): the surfaced ack instruction must name the partition-safe bb command
+// ---------------------------------------------------------------------------
+
+test("B2: rewriteWakeAckLine rewrites the raw script into the partition-safe bb command", () => {
+  const raw = [
+    "pending wake rows...",
+    "WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through 7 --recovery-generation gen.123",
+    "trailing",
+  ].join("\n");
+  const out = rewriteWakeAckLine(raw);
+  assert.match(out, /^WAKE_ACK_REQUIRED: after handling completes run bb firstmate wake --ack-through 7 --recovery-generation gen\.123$/m);
+  assert.ok(!/WAKE_ACK_REQUIRED:.*bin\/fm-wake-drain\.sh/.test(out), "raw script must not survive on the ACK line");
+  // Non-ACK lines are untouched (a re-run hint that mentions the raw script stays).
+  assert.match(out, /pending wake rows\.\.\./);
+  assert.match(out, /^trailing$/m);
+});
+
+test("B2: `bb firstmate wake` presents the ack instruction as the bb command, not the raw script", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", notifyOwner: "real", fmHostId: "host_1" },
+  });
+  await plugin(host.bb);
+  try {
+    host.harness.sdk.stub("terminals.create", async () => ({ id: "term_1" }));
+    host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+    host.harness.sdk.stub("terminals.close", async () => ({}));
+    host.harness.sdk.stub("terminals.output", async () =>
+      hostOutput(
+        "WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through 4 --recovery-generation g99",
+      ),
+    );
+    const result = await host.harness.behavior.runCli(["wake"], { projectId: "proj_1", threadId: "thr_cap" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /bb firstmate wake --ack-through 4 --recovery-generation g99/);
+    assert.ok(
+      !/WAKE_ACK_REQUIRED:.*bin\/fm-wake-drain\.sh/.test(result.stdout),
+      `the raw script must not appear on the surfaced ACK line:\n${result.stdout}`,
+    );
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// B3: keeper robustness (self-exit tolerance, beat-write SPOF)
+// ---------------------------------------------------------------------------
+
+test("B3(a): the owner-beat self-exit TTL tolerates transient host slowness", () => {
+  // The supervisor refreshes the beat ~every 15–30s; the self-exit must survive many
+  // missed refreshes so transient slowness cannot kill a healthy keeper. Old formula
+  // (max(120, interval*6)) gave a flat 120s (~4 refreshes) for every interval 10–20.
+  for (const interval of [10, 15, 20]) {
+    assert.ok(
+      fmWatchOwnerBeatTtl(interval) >= 600,
+      `TTL for interval ${interval} must give generous tolerance, got ${fmWatchOwnerBeatTtl(interval)}`,
+    );
+  }
+});
+
+test("B3(b): a failed owner-beat write is surfaced loudly, not swallowed", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", watchOwner: "fm-watch", fmHostId: "host_1", watchHeartbeatSec: 30 },
+  });
+  await plugin(host.bb);
+  try {
+    const cmds = new Map<string, string>();
+    let n = 0;
+    host.harness.sdk.stub("threads.send", async () => ({}));
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ status: "active", environmentId: null }));
+    host.harness.sdk.stub("terminals.create", async (args: { start?: { command?: string } }) => {
+      const id = `t_${++n}`;
+      cmds.set(id, args.start?.command ?? "");
+      return { id };
+    });
+    host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+    host.harness.sdk.stub("terminals.close", async () => ({}));
+    host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
+      const cmd = cmds.get(args.terminalId) ?? "";
+      // The owner-beat write fails on this host (full / read-only state dir).
+      if (cmd.includes("FM_BEAT_AGE")) {
+        return hostRcPayload("FM_OWNER_BEAT=fail\nFM_BEAT_AGE=5\nFM_KEEPER=alive\n---FM_LOGTAIL---\n", 0);
+      }
+      return hostRcPayload("", 0);
+    });
+    const run = host.harness.behavior.runService("fm-watch-supervisor");
+    const deadline = Date.now() + 2000;
+    const hit = () =>
+      host.harness.logEntries.some((e) => e.level === "error" && /owner-beat write FAILED/.test(e.message));
+    while (Date.now() < deadline && !hit()) await new Promise((r) => setTimeout(r, 10));
+    run.controller.abort();
+    await run.done;
+    assert.ok(
+      hit(),
+      `a failed owner-beat write must be logged at error:\n${host.harness.logEntries.map((e) => `${e.level}: ${e.message}`).join("\n")}`,
+    );
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
 });
 
 test("R3 relaunch backoff: a persistently stale watcher is not relaunched every cycle", async () => {
