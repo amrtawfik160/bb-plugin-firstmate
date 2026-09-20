@@ -74,6 +74,9 @@ const queueItemSchema = z.object({
   // The real data/backlog.md row id (fm-tasks-axi.sh) when queueOwner=real, so
   // dispatch/done/drop can drive the paired backlog transition. undefined = KV-only.
   backlogId: z.string().optional(),
+  // F3: a real add ran but no row id could be parsed — quarantined so migrate-owners
+  // never re-adds it and transitions never fire against a guessed id.
+  backlogUnparsed: z.boolean().optional(),
   createdAt: z.string(),
 });
 type QueueItem = z.infer<typeof queueItemSchema>;
@@ -1568,10 +1571,16 @@ export default async function plugin(bb: BbPluginApi) {
       let dirty = false;
       for (const item of items) {
         if (item.status === "done" || item.status === "dropped") { out.queue.skipped++; continue; }
-        if (item.backlogId !== undefined && item.backlogId !== "") { out.queue.skipped++; continue; }
-        const backlogId = await projectQueueAdd(item.title, item.projectId);
-        if (backlogId === undefined) { out.queue.skipped++; continue; }
-        item.backlogId = backlogId;
+        // Already projected (has a row id) or quarantined (add ran, no id parsed):
+        // never re-add — keeps migrate-owners idempotent.
+        if ((item.backlogId !== undefined && item.backlogId !== "") || item.backlogUnparsed === true) { out.queue.skipped++; continue; }
+        const proj = await projectQueueAdd(item.title, item.projectId);
+        if (proj.backlogId === undefined) {
+          if (proj.unparsed) { item.backlogUnparsed = true; dirty = true; }
+          out.queue.skipped++;
+          continue;
+        }
+        item.backlogId = proj.backlogId;
         if (item.status === "dispatched") await projectQueueTransition(item, "start");
         out.queue.projected++;
         dirty = true;
@@ -3055,29 +3064,49 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  // Write arbitrary content to a host file WITHOUT ever placing that content in the
+  // shell command text (F1): the payload is base64 (charset [A-Za-z0-9+/=], so it
+  // can carry no quotes, newlines, or heredoc delimiters) and decoded on the host.
+  // A line that happened to equal a heredoc delimiter can no longer truncate the
+  // file or run as a command. Mirrors the FM_INTENT brief-scaffold pattern.
+  async function writeHostFile(hostId: string, path: string, content: string): Promise<boolean> {
+    const dir = path.replace(/\/[^/]*$/, "");
+    const b64 = Buffer.from(content, "utf8").toString("base64");
+    const script = content === ""
+      ? `mkdir -p ${shQuote(dir)} && : > ${shQuote(path)}`
+      : `mkdir -p ${shQuote(dir)} && printf '%s' ${shQuote(b64)} | base64 -d > ${shQuote(path)}`;
+    try {
+      const res = await runOnHost(hostId, script, 15_000);
+      return res.exitCode === 0;
+    } catch (error) {
+      bb.log.warn(`host file write ${path} failed: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  }
+
   async function writeMemoryFile(rel: string, content: string): Promise<boolean> {
     const fmHome = (await settings.get()).fmHome.trim();
     if (fmHome === "") return false;
     const hostId = await fleetHost();
     if (hostId === null || hostId === "") return false;
-    const path = `${fmHome}/${rel}`;
-    const script = [
-      `mkdir -p ${shQuote(`${fmHome}/data`)}`,
-      content === ""
-        ? `: > ${shQuote(path)}`
-        : `cat > ${shQuote(path)} <<'FM_MEM_EOF'\n${content}\nFM_MEM_EOF`,
-    ].join("\n");
-    try {
-      const res = await runOnHost(hostId, script, 15_000);
-      return res.exitCode === 0;
-    } catch (error) {
-      bb.log.warn(`real memory: write ${rel} failed: ${error instanceof Error ? error.message : String(error)}`);
-      return false;
-    }
+    const ok = await writeHostFile(hostId, `${fmHome}/${rel}`, content);
+    if (!ok) bb.log.warn(`real memory: write ${rel} failed`);
+    return ok;
   }
 
   async function memoryIsReal(): Promise<boolean> {
     return (await settings.get()).memoryOwner === "real" && (await settings.get()).fmHome.trim() !== "";
+  }
+
+  // The learnings/captain real path is a read-modify-write across two host round
+  // trips; serialize all memory mutations in-process so the plugin's own concurrent
+  // tool/CLI calls can't interleave and lose an update. (Cross-process contention
+  // is out of scope — one plugin process owns the KV + the projection.)
+  let memoryChain: Promise<unknown> = Promise.resolve();
+  function withMemoryLock<T>(fn: () => Promise<T>): Promise<T> {
+    const run = memoryChain.then(fn, fn);
+    memoryChain = run.then(() => undefined, () => undefined);
+    return run;
   }
 
   // Shared memory ops behind firstmate_memory (tool + CLI). Owner=real routes the
@@ -3096,16 +3125,19 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function memorySetCaptain(text: string): Promise<void> {
-    const capped = text.slice(0, 4000);
-    if (await memoryIsReal()) {
-      if (!(await writeMemoryFile(MEM_CAPTAIN_FILE, capped))) {
-        bb.log.warn("real memory: captain write failed; KV cache only");
+    return withMemoryLock(async () => {
+      const capped = text.slice(0, 4000);
+      if (await memoryIsReal()) {
+        if (!(await writeMemoryFile(MEM_CAPTAIN_FILE, capped))) {
+          bb.log.warn("real memory: captain write failed; KV cache only");
+        }
       }
-    }
-    await bb.storage.kv.set(MEM_CAPTAIN_KEY, capped);
+      await bb.storage.kv.set(MEM_CAPTAIN_KEY, capped);
+    });
   }
 
   async function memoryAddLearning(text: string): Promise<void> {
+    return withMemoryLock(async () => {
     const date = new Date().toISOString().slice(0, 10);
     if (await memoryIsReal()) {
       const cur = await readMemoryFile(MEM_LEARNINGS_FILE);
@@ -3127,10 +3159,12 @@ export default async function plugin(bb: BbPluginApi) {
     const line = `- ${date}: ${text}`;
     const next = `${typeof prev === "string" && prev !== "" ? `${prev}\n` : ""}${line}`.slice(-4000);
     await bb.storage.kv.set(MEM_LEARNINGS_KEY, next);
+    });
   }
 
   // Returns the resulting line count, or -1 when n is out of range.
   async function memoryDropLearning(n: number): Promise<number> {
+    return withMemoryLock(async () => {
     if (await memoryIsReal()) {
       const cur = await readMemoryFile(MEM_LEARNINGS_FILE);
       if (cur !== null) {
@@ -3152,14 +3186,17 @@ export default async function plugin(bb: BbPluginApi) {
     lines.splice(n - 1, 1);
     await bb.storage.kv.set(MEM_LEARNINGS_KEY, lines.join("\n"));
     return lines.length;
+    });
   }
 
   async function memoryClear(which: "captain" | "learnings"): Promise<void> {
-    const rel = which === "captain" ? MEM_CAPTAIN_FILE : MEM_LEARNINGS_FILE;
-    if (await memoryIsReal()) {
-      if (!(await writeMemoryFile(rel, ""))) bb.log.warn(`real memory: clear ${which} failed; KV cache only`);
-    }
-    await bb.storage.kv.set(which === "captain" ? MEM_CAPTAIN_KEY : MEM_LEARNINGS_KEY, "");
+    return withMemoryLock(async () => {
+      const rel = which === "captain" ? MEM_CAPTAIN_FILE : MEM_LEARNINGS_FILE;
+      if (await memoryIsReal()) {
+        if (!(await writeMemoryFile(rel, ""))) bb.log.warn(`real memory: clear ${which} failed; KV cache only`);
+      }
+      await bb.storage.kv.set(which === "captain" ? MEM_CAPTAIN_KEY : MEM_LEARNINGS_KEY, "");
+    });
   }
 
   async function afkIsReal(): Promise<boolean> {
@@ -3171,10 +3208,28 @@ export default async function plugin(bb: BbPluginApi) {
     return s.quietOwner === "real" && s.fmHome.trim() !== "";
   }
 
+  // F2: away and quiet share the ONE native flag file state/.afk (quiet is a mode
+  // of away in native firstmate). BB models them as two independent KV states, so
+  // the flag is always recomputed from BOTH — never blindly overwritten or deleted
+  // by one owner. away outranks quiet (the durable, stronger posture); each owner
+  // only contributes when its own flag is "real". This keeps toggles of one from
+  // clobbering the other, and matches what the real fm scripts read (a single
+  // first-line mode).
+  async function syncAfkFlag(): Promise<boolean> {
+    const afkReal = await afkIsReal();
+    const quietReal = await quietIsReal();
+    if (!afkReal && !quietReal) return true; // neither projects to .afk
+    const away = afkReal && (await readAfk())?.on === true;
+    const quiet = quietReal && (await readQuiet()).on;
+    const mode = away ? "away" : quiet ? "quiet" : null;
+    return writeAfkFlag(mode);
+  }
+
   // Project AFK on/off into the real durable contract (state/.afk-contract) so
   // fm-merge-authority-lib and fm-watch see the same away authority, plus the
-  // state/.afk flag mode=away. KV still owns held-ping delivery. Grants list =
+  // shared state/.afk flag. KV still owns held-ping delivery. Grants list =
   // task ids the captain pre-authorized for away merges. Best-effort + logged.
+  // (Callers update KV afk state BEFORE calling, so syncAfkFlag reads the new value.)
   async function projectAfkOn(words: string, grants: string[]): Promise<{ contract: boolean }> {
     if (!(await afkIsReal())) return { contract: false };
     const args = ["propose"];
@@ -3183,11 +3238,11 @@ export default async function plugin(bb: BbPluginApi) {
     const proposed = await runAfkContract(args);
     if (proposed === null || proposed.exitCode !== 0) {
       bb.log.warn(`real afk: contract propose ${proposed === null ? "unreachable" : `exit=${proposed.exitCode}`}; KV flag only`);
-      await writeAfkFlag("away");
+      await syncAfkFlag();
       return { contract: false };
     }
     const confirmed = await runAfkContract(["confirm"]);
-    await writeAfkFlag("away");
+    await syncAfkFlag();
     if (confirmed === null || confirmed.exitCode !== 0) {
       bb.log.warn(`real afk: contract confirm ${confirmed === null ? "unreachable" : `exit=${confirmed.exitCode}`}`);
       return { contract: false };
@@ -3201,7 +3256,8 @@ export default async function plugin(bb: BbPluginApi) {
     if (archived === null || archived.exitCode !== 0) {
       bb.log.warn(`real afk: contract archive ${archived === null ? "unreachable" : `exit=${archived.exitCode}`}`);
     }
-    await writeAfkFlag(null);
+    // Recompute the shared flag: if quiet is still on it stays "quiet", not deleted.
+    await syncAfkFlag();
   }
 
   // Real contract away authority (validate exits 0 iff readable + confirmed) and
@@ -3216,10 +3272,12 @@ export default async function plugin(bb: BbPluginApi) {
     return { confirmed: true, grants };
   }
 
-  // Project quiet on/off into the native state/.afk flag (first line = quiet).
+  // Project quiet on/off into the shared native state/.afk flag. Recomputed from
+  // both owners (F2), so turning quiet off never deletes an active away flag, and
+  // turning quiet on never overwrites away. (Caller updates KV quiet state first.)
   async function projectQuiet(on: boolean): Promise<void> {
     if (!(await quietIsReal())) return;
-    const ok = await writeAfkFlag(on ? "quiet" : null);
+    const ok = await syncAfkFlag();
     if (!ok) bb.log.warn(`real quiet: state/.afk ${on ? "quiet write" : "clear"} failed; KV flag only`);
   }
 
@@ -3228,30 +3286,45 @@ export default async function plugin(bb: BbPluginApi) {
     return s.queueOwner === "real" && s.fmHome.trim() !== "";
   }
 
-  // Best-effort id parse from `tasks-axi add` output (adapters differ). Accepts a
-  // leading id token or an id-looking token; null when none is recognizable.
+  // F3: strict id parse from `tasks-axi add` output. Only an UNAMBIGUOUS,
+  // machine-parseable id is accepted — an explicit `id: <x>` / `id=<x>` / `#<x>`
+  // line, or a last line that is a SINGLE bare id-shaped token. Prose (any
+  // multi-word last line) yields null → the caller quarantines the row instead of
+  // grabbing a word like "your" out of "Added your task…" and mis-targeting a row.
   function parseBacklogId(output: string): string | null {
-    const line = output.split(/\r?\n/).map((l) => l.trim()).filter((l) => l !== "" && !l.startsWith("__FM_HOST_RC")).pop() ?? "";
-    const m = /\b([A-Za-z0-9][A-Za-z0-9._-]{1,63})\b/.exec(line);
-    return m ? m[1]! : null;
+    const lines = output
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter((l) => l !== "" && !l.startsWith("__FM_HOST_RC") && !l.startsWith(HOST_RC_MARKER));
+    const last = lines[lines.length - 1] ?? "";
+    const idChars = "[A-Za-z0-9][A-Za-z0-9._/-]{0,63}";
+    const explicit = new RegExp(`(?:^id[:=]\\s*|^#)(${idChars})\\b`, "i").exec(last);
+    if (explicit) return explicit[1]!;
+    if (new RegExp(`^${idChars}$`).test(last)) return last;
+    return null;
   }
 
-  // Project a backlog add into the real data/backlog.md, returning the row id (or
-  // undefined to leave backlogId unset). Only issues a command when queueOwner=real.
-  async function projectQueueAdd(title: string, projectId: string): Promise<string | undefined> {
-    if (!(await queueIsReal())) return undefined;
+  // Project a backlog add into the real data/backlog.md. Returns the parsed row id,
+  // or `unparsed:true` when the add ran but no id could be positively parsed (the
+  // KV item is then quarantined: never re-added and never transitioned). Only
+  // issues a command when queueOwner=real.
+  async function projectQueueAdd(title: string, projectId: string): Promise<{ backlogId?: string; unparsed: boolean }> {
+    if (!(await queueIsReal())) return { unparsed: false };
     const res = await runTasksAxi(["add", title.slice(0, 500)], { projectId });
     if (res === null) {
       bb.log.warn("real backlog: add unreachable (tasks-axi/host); KV cache only");
-      return undefined;
+      return { unparsed: false };
     }
     if (res.exitCode !== 0) {
       bb.log.warn(`real backlog: add exit=${res.exitCode} (tasks-axi missing?); KV cache only`);
-      return undefined;
+      return { unparsed: false };
     }
     const id = parseBacklogId(res.output);
-    if (id === null) bb.log.warn("real backlog: add ok but no row id parsed; KV cache only");
-    return id ?? undefined;
+    if (id === null) {
+      bb.log.warn("real backlog: add ran but no row id parsed; quarantined (won't re-add or transition)");
+      return { unparsed: true };
+    }
+    return { backlogId: id, unparsed: false };
   }
 
   // Drive the paired backlog transition for a KV queue item. verb: start|done|rm.
@@ -3297,13 +3370,8 @@ export default async function plugin(bb: BbPluginApi) {
       return;
     }
     const tmp = `${fmHome}/state/.bb-decision-${d.id}.answer`;
-    const write = [
-      `mkdir -p ${shQuote(`${fmHome}/state`)}`,
-      `cat > ${shQuote(tmp)} <<'FM_DEC_EOF'\n${answer.slice(0, 2000)}\nFM_DEC_EOF`,
-    ].join("\n");
-    try {
-      await runOnHost(hostId, write, 15_000);
-    } catch {
+    // F1: base64 payload, never in the command text (no heredoc-delimiter injection).
+    if (!(await writeHostFile(hostId, tmp, answer.slice(0, 2000)))) {
       bb.log.warn(`real decisions: answer ${d.id} tmp write failed; KV cache only`);
       return;
     }
@@ -4241,7 +4309,7 @@ export default async function plugin(bb: BbPluginApi) {
         if (title === undefined || title.trim() === "") return toolError("Need title.");
         const pid = projectId ?? ctxProject;
         if (pid === undefined) return toolError("Need projectId.");
-        const backlogId = await projectQueueAdd(title, pid);
+        const proj = await projectQueueAdd(title, pid);
         const item: QueueItem = {
           id: randomUUID().slice(0, 8),
           title: title.slice(0, 500),
@@ -4253,7 +4321,8 @@ export default async function plugin(bb: BbPluginApi) {
           waitUntil: waitUntil ?? null,
           status: "queued",
           crewId: null,
-          ...(backlogId !== undefined ? { backlogId } : {}),
+          ...(proj.backlogId !== undefined ? { backlogId: proj.backlogId } : {}),
+          ...(proj.unparsed ? { backlogUnparsed: true } : {}),
           createdAt: new Date().toISOString(),
         };
         await writeQueue([item, ...items]);
@@ -5236,7 +5305,7 @@ export default async function plugin(bb: BbPluginApi) {
               if (title === "") return fail(usage);
               const projectId = flagStr(flags, "project") ?? ctxProject;
               if (projectId === undefined) return fail("No project: pass --project <id>.");
-              const backlogId = await projectQueueAdd(title, projectId);
+              const proj = await projectQueueAdd(title, projectId);
               const item: QueueItem = {
                 id: randomUUID().slice(0, 8),
                 title: title.slice(0, 500),
@@ -5248,7 +5317,8 @@ export default async function plugin(bb: BbPluginApi) {
                 waitUntil: flagStr(flags, "wait-until") ?? null,
                 status: "queued",
                 crewId: null,
-                ...(backlogId !== undefined ? { backlogId } : {}),
+                ...(proj.backlogId !== undefined ? { backlogId: proj.backlogId } : {}),
+                ...(proj.unparsed ? { backlogUnparsed: true } : {}),
                 createdAt: new Date().toISOString(),
               };
               await writeQueue([item, ...items]);

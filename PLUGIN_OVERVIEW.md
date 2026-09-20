@@ -79,9 +79,12 @@ Install, then run `/captain` in any thread — that calls `deck` and is the setu
   routes through the native owner and is written through to the KV cache. Any
   host/read failure degrades to the KV path with a clear log:
   - `queueOwner=real` — the backlog routes through `fm-tasks-axi.sh` /
-    `data/backlog.md`. `add` records the real row id; `dispatch`/`done`/`drop`
-    drive the paired `start`/`done`/`rm` transition. Needs `tasks-axi` on the
-    host; if it is missing (exit 2) the KV backlog still works, without a row id.
+    `data/backlog.md`. `add` records the real row id (parsed only from an
+    unambiguous `id:`/`#`/bare-token form; ambiguous output quarantines the row so
+    it is never re-added or transitioned against a guessed id); `dispatch`/`done`/
+    `drop` drive the paired `start`/`done`/`rm` transition only when an id was
+    positively parsed. Needs `tasks-axi` on the host; if it is missing (exit 2) the
+    KV backlog still works, without a row id.
   - `decisionsOwner=real` — a decision is an ordinary **captain-held backlog task**
     (`fm-captain-hold.sh hold`); `answer` closes the held row
     (`fm-captain-hold.sh answer --decision-file`) and writes the `resolved [key=…]`
@@ -93,11 +96,17 @@ Install, then run `/captain` in any thread — that calls `deck` and is the setu
     grants (CLI `--grant <task-id>`). `off` archives the contract; `status` reads
     `validate`/`grants`. KV still owns held-ping delivery for the return brief.
   - `quietOwner=real` — quiet writes the native `state/.afk` flag with first line
-    `quiet` (the afk-skill quiet mode); `off` clears it. (If both `afkOwner` and
-    `quietOwner` are `real` they share the one native flag, as in native firstmate.)
+    `quiet` (the afk-skill quiet mode). When both `afkOwner` and `quietOwner` are
+    `real` they share the one native flag (as in native firstmate); the flag is
+    always recomputed from both KV states (away outranks quiet) so toggling one
+    never clobbers the other.
   - `memoryOwner=real` — captain prefs and learnings live in the tiered stow files
     `data/captain.md` (pinned) and `data/learnings.md` (aging; each line carries a
     `<!--a:YYYY-MM-DD-->` reinforced-date marker). `show` reads the real files.
+  Free text is written to host files as a base64 payload decoded on the host (never
+  interpolated into the shell command), so no line of user/agent text can inject a
+  command or truncate a file; the read-modify-write of the learnings file is
+  serialized in-process against concurrent tool calls.
   `bb firstmate migrate-owners` idempotently projects existing KV queue/decisions/
   afk/quiet/memory into the real files for the owners set to `real` (re-runnable:
   rows already projected are skipped, file writes are overwrites).

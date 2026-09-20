@@ -2105,6 +2105,18 @@ function stubRoutedHost(
   return { seen };
 }
 
+// Decode the base64 payload of a safe host-file write (F1) for a given path.
+// runOnHost wraps the command and escapes single quotes; strip all quoting first
+// so the inner `printf %s <b64> | base64 -d > <path>` is matchable.
+function decodeHostWrite(seen: string[], pathSubstr: string): string | null {
+  for (const cmd of seen) {
+    const unq = cmd.replace(/'\\''/g, "").replace(/'/g, "");
+    const m = new RegExp(`printf %s ([A-Za-z0-9+/=]+) \\| base64 -d > (\\S*${pathSubstr}\\S*)`).exec(unq);
+    if (m) return Buffer.from(m[1]!, "base64").toString("utf8");
+  }
+  return null;
+}
+
 function ownerHost(extra: Record<string, unknown> = {}) {
   return createFakePluginHost({
     pluginId: "firstmate",
@@ -2120,12 +2132,15 @@ test("A5 memory real: set-captain and add-learning write the tiered files + KV m
     const { seen } = stubRoutedHost(host, () => ({ payload: "", code: 0 }));
     const set = await host.harness.behavior.runCli(["memory", "set-captain", "prefers", "terse"], { projectId: "proj_1" });
     assert.equal(set.exitCode, 0, set.stderr);
-    assert.ok(seen.some((c) => c.includes("/tmp/fm-home/data/captain.md") && c.includes("prefers terse")), "captain.md not written");
+    // F1: content is base64 in the command, not literal; decode to verify.
+    assert.equal(decodeHostWrite(seen, "data/captain.md"), "prefers terse", "captain.md not written");
     assert.equal(await host.bb.storage.kv.get("memory-captain"), "prefers terse");
 
     const add = await host.harness.behavior.runCli(["memory", "add-learning", "flaky", "test", "note"], { projectId: "proj_1" });
     assert.equal(add.exitCode, 0, add.stderr);
-    assert.ok(seen.some((c) => c.includes("/tmp/fm-home/data/learnings.md") && /<!--a:\d{4}-\d{2}-\d{2}-->/.test(c)), "learnings.md not written with stow marker");
+    const learn = decodeHostWrite(seen, "data/learnings.md");
+    assert.ok(learn !== null && /<!--a:\d{4}-\d{2}-\d{2}-->/.test(learn), "learnings.md not written with stow marker");
+    assert.ok(learn!.includes("flaky test note"), "learning text missing");
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -2296,7 +2311,7 @@ test("migrate-owners projects KV into the real files and is idempotent", async (
     const first = await host.harness.behavior.runCli(["migrate-owners"], { projectId: "proj_1" });
     assert.equal(first.exitCode, 0, first.stderr);
     assert.equal(addCalls, 1, "queue row should be projected once");
-    assert.ok(seen.some((c) => c.includes("data/captain.md") && c.includes("MC")), "captain memory not projected");
+    assert.equal(decodeHostWrite(seen, "data/captain.md"), "MC", "captain memory not projected");
     const q1 = (await host.bb.storage.kv.get("queue")) as Array<{ backlogId?: string }>;
     assert.equal(q1[0]?.backlogId, "row-1");
     // Re-run: the queue row already has a backlogId → not projected again.
@@ -2489,6 +2504,122 @@ test("R5 read-through does not reap a crew whose meta write is known-failed", as
     assert.equal(list.exitCode, 0, list.stderr);
     const kept = (await host.bb.storage.kv.get("crews")) as Array<{ id: string }>;
     assert.ok(kept.some((c) => c.id === "c1"), "a known-failed-meta crew must not be reaped");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// --- Review follow-ups F1/F2/F3 ---------------------------------------------
+
+test("F1: memory content equal to the heredoc delimiter round-trips and never injects", async () => {
+  const host = ownerHost({ memoryOwner: "real" });
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRoutedHost(host, () => ({ code: 0 }));
+    // Exact PoC: lines equal to the OLD heredoc delimiters + a shell payload.
+    const poc = "FM_MEM_EOF\nFM_DEC_EOF\n'; touch /tmp/fm_pwned #";
+    const set = await host.harness.behavior.runCli(["memory", "set-captain", poc], { projectId: "proj_1" });
+    assert.equal(set.exitCode, 0, set.stderr);
+    // Content round-trips byte-for-byte (base64 decode of the write command).
+    assert.equal(decodeHostWrite(seen, "data/captain.md"), poc, "captain.md content did not round-trip");
+    // The dangerous text never appears as executable shell text (only base64).
+    const all = seen.join("\n");
+    assert.ok(!all.includes("touch /tmp/fm_pwned"), "payload leaked into the shell command text");
+    assert.ok(!/\bFM_MEM_EOF\b(?!.*base64)/.test(all.replace(/[A-Za-z0-9+/=]{16,}/g, "B64")), "delimiter leaked outside base64");
+    assert.equal(await host.bb.storage.kv.get("memory-captain"), poc);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("F1: decision answer equal to the delimiter round-trips via base64 (no injection)", async () => {
+  const host = ownerHost({ decisionsOwner: "real" });
+  await plugin(host.bb);
+  try {
+    await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew", "thr_cap")]);
+    const { seen } = stubRoutedHost(host, () => ({ code: 0 }));
+    const ask = await host.harness.behavior.runCli(["decide", "ask", "pick?", "--json"], { projectId: "proj_1" });
+    assert.equal(ask.exitCode, 0, ask.stderr);
+    const did = ((await host.bb.storage.kv.get("decisions")) as Array<{ id: string }>)[0]!.id;
+    const poc = "FM_DEC_EOF\n$(touch /tmp/fm_pwned2)";
+    const ans = await host.harness.behavior.runCli(["decide", "answer", did, "--message", poc], { projectId: "proj_1" });
+    assert.equal(ans.exitCode, 0, ans.stderr);
+    assert.equal(decodeHostWrite(seen, ".answer"), poc, "decision answer file did not round-trip");
+    assert.ok(!seen.join("\n").includes("touch /tmp/fm_pwned2"), "decision payload leaked into shell text");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// Extract the state/.afk flag mutation (write mode or removal) from a command slice.
+function afkFlagOp(cmds: string[]): "away" | "quiet" | "removed" | null {
+  for (const c of cmds) {
+    if (!c.includes("state/.afk") || c.includes(".afk-contract") || c.includes("fm-afk-contract.sh")) continue;
+    if (c.includes("rm -f")) return "removed";
+    if (/printf[^|]*quiet/.test(c)) return "quiet";
+    if (/printf[^|]*away/.test(c)) return "away";
+  }
+  return null;
+}
+
+test("F2: afk + quiet both real never clobber the shared state/.afk flag", async () => {
+  const host = ownerHost({ afkOwner: "real", quietOwner: "real" });
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRoutedHost(host, () => ({ code: 0 }));
+    let mark = seen.length;
+    const step = async (args: string[]) => {
+      mark = seen.length;
+      const r = await host.harness.behavior.runCli(args, { projectId: "proj_1" });
+      assert.equal(r.exitCode, 0, r.stderr);
+      return afkFlagOp(seen.slice(mark));
+    };
+    assert.equal(await step(["afk", "on", "--words", "bbl"]), "away", "afk on should set away");
+    assert.equal(await step(["quiet", "on"]), "away", "quiet on must NOT overwrite away");
+    assert.equal(await step(["afk", "off"]), "quiet", "afk off must leave quiet, not delete the flag");
+    assert.equal(await step(["quiet", "off"]), "removed", "quiet off with no away removes the flag");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("F3: unparseable tasks-axi add output quarantines the row (no re-add, no transition)", async () => {
+  const host = ownerHost({ queueOwner: "real" });
+  await plugin(host.bb);
+  try {
+    let addCalls = 0;
+    let transitions = 0;
+    const { seen: _seen } = stubRoutedHost(host, (cmd) => {
+      if (cmd.includes("fm-tasks-axi.sh") && cmd.includes("'add'")) { addCalls++; return { payload: "Added your task to the backlog successfully" }; }
+      if (cmd.includes("fm-tasks-axi.sh") && (cmd.includes("'done'") || cmd.includes("'start'") || cmd.includes("'rm'"))) transitions++;
+      return { code: 0 };
+    });
+    const add = await host.harness.behavior.runCli(["queue", "add", "ship it", "--project", "proj_1"], { projectId: "proj_1" });
+    assert.equal(add.exitCode, 0, add.stderr);
+    const q = (await host.bb.storage.kv.get("queue")) as Array<{ id: string; backlogId?: string; backlogUnparsed?: boolean }>;
+    assert.equal(q[0]?.backlogId, undefined, "prose output must not be taken as a row id");
+    assert.equal(q[0]?.backlogUnparsed, true, "row should be quarantined");
+    assert.equal(addCalls, 1);
+    // done must NOT drive a transition against a guessed id.
+    const done = await host.harness.behavior.runCli(["queue", "done", q[0]!.id], { projectId: "proj_1" });
+    assert.equal(done.exitCode, 0, done.stderr);
+    assert.equal(transitions, 0, "no transition without a parsed id");
+    // migrate-owners must not re-add the quarantined row.
+    await host.harness.behavior.runCli(["migrate-owners"], { projectId: "proj_1" });
+    assert.equal(addCalls, 1, "quarantined row must not be re-added on migrate");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("F3: an explicit id form is parsed; a bare id token is parsed", async () => {
+  const host = ownerHost({ queueOwner: "real" });
+  await plugin(host.bb);
+  try {
+    stubRoutedHost(host, (cmd) => (cmd.includes("'add'") ? { payload: "id: T-7" } : { code: 0 }));
+    await host.harness.behavior.runCli(["queue", "add", "explicit", "--project", "proj_1"], { projectId: "proj_1" });
+    const q = (await host.bb.storage.kv.get("queue")) as Array<{ backlogId?: string }>;
+    assert.equal(q[0]?.backlogId, "T-7", "explicit 'id: <id>' form should parse");
   } finally {
     await host.harness.lifecycle.dispose();
   }
