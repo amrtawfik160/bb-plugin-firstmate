@@ -3766,6 +3766,15 @@ export default async function plugin(bb: BbPluginApi) {
     return { kept: kept.join("\n"), overflow: "" };
   }
 
+  // Absence is signalled OUT-OF-BAND via a dedicated exit code, never a sentinel
+  // string inside stdout. The old `|| echo FM_MEM_ABSENT` + `out.includes(...)` meant
+  // a real memory line merely CONTAINING that literal made the whole file read as
+  // empty — a genuine data-loss path (an empty read makes migrateMemoryTier take the
+  // seed-KV→file branch and overwrite a real file that has MORE content than KV). The
+  // command now exits 0 with the file's exact bytes when present, exits FM_MEM_ABSENT_RC
+  // when the file does not exist, and exits anything else on a real host/read failure.
+  // File CONTENT is therefore never scanned for a control token.
+  const FM_MEM_ABSENT_RC = 42;
   async function readMemoryFile(rel: string): Promise<string | null> {
     const fmHome = (await settings.get()).fmHome.trim();
     if (fmHome === "") return null;
@@ -3773,11 +3782,11 @@ export default async function plugin(bb: BbPluginApi) {
     if (hostId === null || hostId === "") return null;
     const path = `${fmHome}/${rel}`;
     try {
-      const res = await runOnHost(hostId, `[ -f ${shQuote(path)} ] && cat ${shQuote(path)} || echo FM_MEM_ABSENT`, 15_000);
-      if (res.exitCode !== 0) return null; // host command failed → unreadable
-      const out = res.output;
-      if (out.includes("FM_MEM_ABSENT")) return "";
-      return out.replace(/\n$/, "");
+      const q = shQuote(path);
+      const res = await runOnHost(hostId, `if [ -f ${q} ]; then cat ${q}; else exit ${FM_MEM_ABSENT_RC}; fi`, 15_000);
+      if (res.exitCode === FM_MEM_ABSENT_RC) return ""; // file absent → empty (unambiguous)
+      if (res.exitCode !== 0) return null; // host command / cat failed → unreadable
+      return res.output.replace(/\n$/, "");
     } catch {
       return null;
     }

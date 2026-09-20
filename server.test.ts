@@ -2499,6 +2499,33 @@ test("D1 migrate-owners: refuses to touch memory when the real file is unreadabl
   }
 });
 
+test("D1 sentinel: a real memory line CONTAINING the literal FM_MEM_ABSENT is not read as empty and is never overwritten", async () => {
+  const host = ownerHost({ memoryOwner: "real" });
+  await plugin(host.bb);
+  try {
+    // A legitimate learning whose PROSE contains the absence sentinel literal.
+    const tricky = "- 2026-01-01: the readMemoryFile FM_MEM_ABSENT sentinel is out-of-band now <!--a:2026-01-01-->";
+    await host.bb.storage.kv.set("memory-learnings", "SHORT-KV-CACHE"); // KV shorter than the real file
+    const { writes } = stubRoutedHost(host, (cmd) => {
+      // File EXISTS (exit 0) and its content contains "FM_MEM_ABSENT". Absence would be
+      // a distinct non-zero exit, which this present-file read never returns.
+      if (cmd.includes("cat") && cmd.includes("data/learnings.md") && !cmd.includes("archive")) return { payload: tricky, code: 0 };
+      return { payload: "", code: 0 };
+    });
+    // migrate must treat the file as NON-empty → mirror file→KV, never seed KV→file.
+    const mig = await host.harness.behavior.runCli(["migrate-owners"], { projectId: "proj_1" });
+    assert.equal(mig.exitCode, 0, mig.stderr);
+    assert.equal(decodeHostWrite(writes, "data/learnings.md"), null, "a file containing the sentinel literal must NOT be overwritten (not treated as empty)");
+    assert.equal(await host.bb.storage.kv.get("memory-learnings"), tricky, "KV must mirror the real file even though it contains the sentinel literal");
+    // And recall (D3) must show the real content, not the stale short KV.
+    const show = await host.harness.behavior.runCli(["memory", "show", "--json"], { projectId: "proj_1" });
+    assert.equal(show.exitCode, 0, show.stderr);
+    assert.match(show.stdout, /out-of-band now/, "recall must surface the real line containing the sentinel literal");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 // ---- D2: the KV mirror is the FULL file, never a mid-line -4000 slice ----
 
 test("D2 add-learning: KV mirrors the FULL learnings file — no mid-line -4000 slice decapitation", async () => {
