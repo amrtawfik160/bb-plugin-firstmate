@@ -10,7 +10,17 @@ import {
   makePluginAgentConfigurationContext,
   makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
-import plugin, { formatFmMeta, formatSecondmate, pickSecondmate, toolbeltPhrase, versionAtLeast } from "./server.ts";
+import plugin, {
+  captainWakeDoorbell,
+  fmBackendEnv,
+  fmWatchKeeperScript,
+  formatFmMeta,
+  formatSecondmate,
+  inboxReapScript,
+  pickSecondmate,
+  toolbeltPhrase,
+  versionAtLeast,
+} from "./server.ts";
 import { latestStatus, statusProtocolSummary } from "./lib/policy.ts";
 
 const SKILLS = ["captain", "firstmate", "afk", "ahoy", "bearings", "quiet", "stow"] as const;
@@ -3019,6 +3029,87 @@ test("tellOwner=kv (default) uses a bare doorbell, no durable record", async () 
   } finally {
     await host.harness.lifecycle.dispose();
   }
+});
+
+// ---- supervision-model + ack-loop + doorbell + reaper characterization ----
+
+test("fmBackendEnv declares FM_SUPERVISION_MODEL=autoarm on every bb firstmate invocation", () => {
+  const env = fmBackendEnv({ fmHome: "/h", hostId: "host_1" });
+  assert.ok(env.includes("export FM_SUPERVISION_MODEL=autoarm"), env.join("\n"));
+  assert.ok(env.includes("export FM_BACKEND=bb"));
+  // no accidental successor flag on the generic invocation path (keeper-only concern)
+  assert.ok(!env.some((l) => l.includes("FM_WATCH_HANDLING_SUCCESSOR")));
+});
+
+test("bb firstmate fm routes with FM_SUPERVISION_MODEL=autoarm in the real command", async () => {
+  const host = ownerHost();
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRoutedHost(host, () => ({ code: 0 }));
+    host.harness.sdk.stub("hosts.list", async () => [{ id: "host_1", name: "host_1" }]);
+    const res = await host.harness.behavior.runCli(["fm", "--machine=host_1", "true"], { projectId: "proj_1" });
+    assert.equal(res.exitCode, 0, res.stderr);
+    assert.ok(
+      seen.some((c) => c.includes("export FM_SUPERVISION_MODEL=autoarm")),
+      `no autoarm export in routed fm command:\n${seen.join("\n---\n")}`,
+    );
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("fmWatchKeeperScript declares autoarm AND arms fm-watch as a handling successor", () => {
+  const s = fmWatchKeeperScript("host_1", "/h", 15);
+  assert.ok(s.includes("export FM_SUPERVISION_MODEL=autoarm"), s);
+  assert.ok(s.includes("export FM_WATCH_HANDLING_SUCCESSOR=1"), s);
+  assert.ok(s.includes("fm-watch-arm.sh"));
+});
+
+test("notifyOwner=real doorbell carries crew id + one-line outcome (not a generic pointer); durable enqueued", async () => {
+  const host = ownerHost({ notifyOwner: "real" });
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRoutedHost(host, () => ({ code: 0 }));
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await emitIdle(host, "DONE: shipped the branch");
+    assert.ok(seen.some((c) => c.includes("fm_wake_append")), "real must enqueue a durable wake (the store)");
+    const sends = sendCalls(host);
+    assert.equal(sends.length, 1);
+    const text = sends[0]?.text ?? "";
+    assert.match(text, /^🔔 /, text);
+    assert.match(text, /crew c1/, text);
+    assert.match(text, /shipped the branch/, text);
+    assert.match(text, /bb firstmate wake/, text);
+    assert.ok(!text.includes("crew wake(s) pending"), `must not be the old generic pointer: ${text}`);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("inboxReapScript reaps ONLY fire-and-forget beyond the cap; keeps a normal record, handled/, and non-.msg", () => {
+  const dir = mkdtempSync(join(tmpdir(), "fm-reap-"));
+  mkdirSync(join(dir, "handled"), { recursive: true });
+  const writeRec = (seq: number, ff: boolean, body: string) => {
+    const header = ["schema=fm-task-inbox.v1", "at=2026-01-01T00:00:00Z", ...(ff ? ["delivery=fire-and-forget"] : []), "--"];
+    writeFileSync(join(dir, `${String(seq).padStart(3, "0")}.msg`), `${header.join("\n")}\n${body}`);
+  };
+  writeRec(1, false, "OLD NORMAL unhandled steer — must survive"); // oldest overall, NOT ff
+  for (let seq = 2; seq <= 6; seq += 1) writeRec(seq, true, `ff steer ${seq}`); // 5 ff records
+  writeFileSync(join(dir, "handled", "003.msg"), "handled marker"); // handled/ subdir untouched
+  writeFileSync(join(dir, "readme.txt"), "not a msg"); // non-.msg untouched
+  const r = spawnSync("bash", ["-c", inboxReapScript(dir, 3)], { encoding: "utf8", timeout: 30_000 });
+  assert.equal(r.status, 0, r.stderr);
+  const alive = (p: string) => existsSync(join(dir, p));
+  // ff-vs-normal distinction: the oldest record is a NORMAL steer and MUST survive
+  assert.ok(alive("001.msg"), "normal (non-ff) record must never be reaped");
+  // 200-cap (here 3): only the newest 3 ff survive; older ff are pruned
+  assert.ok(!alive("002.msg") && !alive("003.msg"), "oldest ff beyond cap must be reaped");
+  assert.ok(alive("004.msg") && alive("005.msg") && alive("006.msg"), "newest ff within cap must survive");
+  // handled/ and non-.msg left alone
+  assert.ok(alive("handled/003.msg"), "handled/ subdir must be untouched");
+  assert.ok(alive("readme.txt"), "non-.msg files must be untouched");
+  rmSync(dir, { recursive: true, force: true });
 });
 
 // ---- F1: two distinct reports both survive present + ack ----
