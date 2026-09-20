@@ -72,10 +72,12 @@ They degrade to the current native behavior with a log line.
   refuses a task with no `data/backlog.md` row), so real transport adds that row
   (id = crew id, `--kind ship|scout`) via `fm-tasks-axi.sh` **before** spawning,
   lets fm-spawn move it to In-flight, and closes it on land (`done`) / forget
-  (`rm`). With `queueOwner=kv` it can't own that row, so it logs and falls back to
-  native. A ship whose delivery mode sits below the project's native standing
-  posture records a stated **intake judgement** on its brief so fm-spawn's
-  deviation notice is answered, not silenced.
+  (`rm`). The row is ownership: a crew records that it owns one at dispatch, so its
+  close survives a later flip of the feature flags mid-flight. With `queueOwner=kv`
+  it can't own the row, so it logs a clear message and falls back to native. Mode
+  reconciliation is left to native: the brief records the `Delivery contract: mode=`
+  line, fm-spawn refuses a mismatch, and its advisory below-standing-posture notice
+  is left intact — the plugin never synthesizes a posture "judgement" of its own.
 - **`watchOwner`** (`native` | `fm-watch`, default `native`): with `fm-watch`,
   the plugin's `fm-watch-supervisor` service runs and keeps the **real fm-watch**
   alive against `fmHome`, relays its wake reasons to you, and reads its heartbeat.
