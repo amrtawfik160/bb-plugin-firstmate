@@ -242,7 +242,12 @@ export function statusLinesFrom(text: string | null | undefined): string[] {
  */
 export function statusProtocolSummary(lines: string[]): string | null {
   const latest = latestStatus(lines);
-  const open = foldOpenDecisions(lines);
+  // Once a crew's latest status is terminal (done/failed) the task is over, so
+  // any earlier keyed decision is moot — do not report it as still open. This
+  // also protects the chat-output source, which never carries the resolved/
+  // captain-held closing lines the real state/<id>.status stream would.
+  const terminal = latest !== null && (latest.verb === "done" || latest.verb === "failed");
+  const open = terminal ? [] : foldOpenDecisions(lines);
   if (latest === null && open.length === 0) return null;
   const parts: string[] = [];
   if (latest !== null) {

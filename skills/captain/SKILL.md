@@ -61,12 +61,17 @@ rewrite. Two planes, one runtime:
   or if the sidebar and the real scripts disagree, run `bb firstmate migrate-state`
   once — it imports the KV crew cache into real `state/<id>.meta` + briefs,
   idempotently, and never overwrites active work. KV only accelerates the UI.
-- **Read crews by the full status protocol.** `bb firstmate crew <id>` and
-  `bearings` fold the firstmate status stream — `working` / `needs-decision` /
-  `blocked` / `paused` / `done` / `failed`, with keyed `resolved`/`captain-held`
-  closes — exactly as `fm-classify-lib.sh` does. An idle crew with an open
-  `needs-decision` is a **Captain's Call**, not a review-ready ship: steer it
-  (`firstmate_tell`) rather than merging.
+- **Read crews by the full status protocol.** The fold — `working` /
+  `needs-decision` / `blocked` / `paused` / `done` / `failed`, with keyed
+  `resolved`/`captain-held` closes — is a faithful port of `fm-classify-lib.sh`.
+  `crew <id>` folds the real `state/<id>.status` (which carries the closes);
+  `bearings` folds chat output (no host read, so no closes) and drops open
+  decisions once the crew's latest status is terminal. An idle crew with an open
+  `needs-decision` is a **Captain's Call**, not a review-ready ship.
+- **Answer a crew's decision with `tell --resolve-key <key>`** (or
+  `firstmate_tell resolveKey`). That both steers the crew and writes the closing
+  `resolved [key=<key>]` line into the real `state/<id>.status`, so the decision
+  stops showing as open. A plain `tell` only sends the message.
 - **Fallback safety.** Every real-mode write (meta, brief, contract, status read)
   is best-effort: if the host or scripts are unavailable it degrades to the
   native path with a logged note and never breaks dispatch.
@@ -135,7 +140,7 @@ within its exact scope. Never infer, broaden, or carry it elsewhere.
 | native dispatch (BB transport + Fleet UI) | `firstmate_dispatch` / `bb firstmate dispatch --project <id> -- "<brief>"` |
 | queue | `firstmate_queue` / `queue add --project <id> [--after <qid>] [--wait-until <iso>] -- "<title>"` |
 | decisions | `firstmate_decide` / `decide ask\|answer` + AskUserQuestion |
-| track | `firstmate_crew`, `firstmate_crews`, `watch`, `tell` (doorbell), `interrupt`, `stop`, `retry` |
+| track | `firstmate_crew`, `firstmate_crews`, `watch`, `tell` (doorbell; `--resolve-key <key>` to answer + close a decision), `interrupt`, `stop`, `retry` |
 | recovery relaunch | `retry <id> --model m` / `--provider p` / `--reasoning-level l` (fresh thread, same worktree) |
 | delivery | `firstmate_deliver`, `firstmate_merge` (`--yes`, `--allow-red <check>`), `promote` |
 | secondmate | `firstmate_secondmate` / `bb firstmate secondmate register --project <id> --thread <id>` |

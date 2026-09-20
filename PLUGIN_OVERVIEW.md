@@ -25,12 +25,17 @@ Install, then run `/captain` in any thread — that calls `deck` and is the setu
   spawn, tags children as crews, and lets a completed scout's scratch worktree be
   discarded.
 - Authoritative real state, rebuildable KV cache: `bb firstmate migrate-state`
-  imports the KV crew cache into real `state/<id>.meta` + briefs, idempotently
-  and without overwriting active work. KV stays a cache that only accelerates.
-- Full status protocol: `crew` and `bearings` fold the firstmate status stream
-  (`working` / `needs-decision` / `blocked` / `paused` / `done` / `failed`, with
-  keyed `resolved`/`captain-held` closes) exactly as `fm-classify-lib.sh` does —
-  an idle crew with an open `needs-decision` is a Captain's Call, not review-ready.
+  imports the KV crew cache into real `state/<id>.meta` + briefs, idempotently,
+  without overwriting active work, and skipping terminal (done/failed) crews so
+  the watcher can't resurrect dead work. KV stays a cache that only accelerates.
+- Full status protocol: the fold (`working` / `needs-decision` / `blocked` /
+  `paused` / `done` / `failed`, with keyed `resolved`/`captain-held` closes) is a
+  faithful port of `fm-classify-lib.sh`'s algorithm. `crew` folds the real
+  `state/<id>.status` when available (which carries the closes); `bearings` folds
+  the crew's chat output (no host read, so no closes) and therefore also drops
+  open decisions once the crew's latest status is terminal. An idle crew with an
+  open `needs-decision` is a Captain's Call, not review-ready. Answering via
+  `tell --resolve-key <key>` writes the closing `resolved` line into real state.
 - Captain sessions load the real `fmHome/AGENTS.md` captain contract as dynamic
   instructions (crews still get no captain tools/skills).
 - On deck the digest shows real `fm-bearings-snapshot` output (authoritative)

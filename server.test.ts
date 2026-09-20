@@ -1502,3 +1502,154 @@ test("bearings surfaces an idle crew's open decision as a Captain's Call", async
     await host.harness.lifecycle.dispose();
   }
 });
+
+// ── Phase 2 review fixes ─────────────────────────────────────────────────────
+
+test("bearings does not re-nag a crew that answered its decision then finished DONE", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () =>
+      makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }),
+    );
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+    // Chat output carries the needs-decision but NOT the resolved close (that only
+    // lands in the on-host .status). The crew then finished DONE with a PR.
+    host.harness.sdk.stub("threads.output", async () => ({
+      output: "needs-decision [key=api]: rename or keep?\nworking: applied captain answer\nDONE: shipped",
+    }));
+    host.harness.sdk.stub("environments.pullRequest", async () => ({
+      outcome: "available",
+      pullRequest: {
+        url: "https://gh/pr/42", number: 42, title: "t", state: "open",
+        checks: { state: "passing", failedCount: 0, pendingCount: 0, passedCount: 1 },
+        mergeability: { mergeable: "MERGEABLE" },
+      },
+    }));
+    const result = await host.harness.behavior.runCli(["bearings"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.doesNotMatch(result.stdout, /NEEDS-DECISION \[api\]/);
+    assert.match(result.stdout, /PR ready c1/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("migrate-state reports failed when the host/state is unreachable (exists === null)", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home" },
+  });
+  await plugin(host.bb);
+  try {
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () =>
+      makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }),
+    );
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+    host.harness.sdk.stub("environments.list", async () => [
+      { hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" },
+    ]);
+    // Exists-check yields neither EXISTS nor ABSENT -> unreadable -> null -> failed.
+    host.harness.sdk.stub("terminals.create", async () => ({ id: "term_1" }));
+    host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+    host.harness.sdk.stub("terminals.output", async () => hostOutput("garbage-no-marker"));
+    host.harness.sdk.stub("terminals.close", async () => ({}));
+    const r = JSON.parse((await host.harness.behavior.runCli(["migrate-state", "--json"])).stdout) as {
+      imported: string[]; failed: string[];
+    };
+    assert.deepEqual(r.imported, []);
+    assert.deepEqual(r.failed, ["c1"]);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("migrate-state imports even when the brief scaffold fails; skips terminal crews", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home" },
+  });
+  await plugin(host.bb);
+  try {
+    // c1 active (import, brief fails); c2 finished DONE (terminal, skip).
+    await host.bb.storage.kv.set("crews", [
+      shipRow("c1", "thr_c1", "thr_cap"),
+      shipRow("c2", "thr_c2", "thr_cap"),
+    ]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async (args: { threadId: string }) =>
+      makeThreadResponse({ id: args.threadId, status: "idle", environmentId: "env_wt" }),
+    );
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+    host.harness.sdk.stub("threads.output", async (args: { threadId: string }) =>
+      args.threadId === "thr_c2" ? { output: "DONE: already shipped" } : { output: "working: in progress" },
+    );
+    host.harness.sdk.stub("environments.list", async () => [
+      { hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" },
+    ]);
+    const terminalCmd = new Map<string, string>();
+    let seq = 0;
+    host.harness.sdk.stub("terminals.create", async (args: { start?: { command?: string } }) => {
+      const id = `term_${seq++}`;
+      terminalCmd.set(id, typeof args.start?.command === "string" ? args.start.command : "");
+      return { id };
+    });
+    host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+    host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
+      const cmd = terminalCmd.get(args.terminalId) ?? "";
+      if (cmd.includes("FM_META_EXISTS")) return hostOutput("FM_META_ABSENT");
+      if (cmd.includes("fm-brief.sh")) return hostOutput("brief boom", 1); // brief scaffold fails
+      return hostOutput("");
+    });
+    host.harness.sdk.stub("terminals.close", async () => ({}));
+    const r = JSON.parse((await host.harness.behavior.runCli(["migrate-state", "--json"])).stdout) as {
+      imported: string[]; skippedTerminal: string[];
+    };
+    assert.deepEqual(r.imported, ["c1"]); // brief failure did not block the import
+    assert.deepEqual(r.skippedTerminal, ["c2"]);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("tell --resolve-key writes the fm-classify resolved line into real state", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home" },
+  });
+  await plugin(host.bb);
+  try {
+    const hostCommands: string[] = [];
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () =>
+      makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }),
+    );
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+    host.harness.sdk.stub("threads.send", async () => ({}));
+    host.harness.sdk.stub("environments.list", async () => [
+      { hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" },
+    ]);
+    host.harness.sdk.stub("terminals.create", async (args: { start?: { command?: string } }) => {
+      if (typeof args.start?.command === "string") hostCommands.push(args.start.command);
+      return { id: "term_1" };
+    });
+    host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+    host.harness.sdk.stub("terminals.output", async () => hostOutput(""));
+    host.harness.sdk.stub("terminals.close", async () => ({}));
+    const result = await host.harness.behavior.runCli(
+      ["tell", "c1", "--resolve-key", "api", "--", "use postgres"],
+    );
+    assert.equal(result.exitCode, 0, result.stderr);
+    const close = hostCommands.find((c) => c.includes("c1.status") && c.includes("resolved [key=api]"));
+    assert.ok(close, `no resolved append in ${hostCommands.join("\n---\n")}`);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
