@@ -322,8 +322,18 @@ export const FM_WATCH_KEEPER_SH = "state/.bb-watch-keeper.sh";
 // plugin never reached the host) terminates on its own — teardown no longer depends on
 // the plugin removing the pidfile. TTL is derived from the re-arm interval below.
 export const FM_WATCH_OWNER_BEAT = "state/.bb-watch-owner.beat";
+// B3(a): the owner beat is refreshed by the supervisor TICK (every ~checkMs, 15–30s),
+// not by the keeper's own re-arm interval, and only when the host read/refresh call
+// SUCCEEDS. A transiently slow or briefly-unreachable host makes several ticks fail in
+// a row; with the old `max(120, interval*6)` (interval 10–20 ⇒ a flat 120s) a healthy
+// keeper self-exited after only ~4 missed refreshes, degrading real transport until the
+// next cycle re-launched it. Give the self-exit generous tolerance (a 10-minute floor,
+// ~20 missed 30s refreshes) so transient slowness can never kill a healthy keeper, while
+// a genuinely dead plugin — which never refreshes the beat again — still self-exits. This
+// is only the backstop: the primary teardowns (pidfile removal on flag-off/dispose) are
+// immediate, so a longer TTL costs nothing there.
 export function fmWatchOwnerBeatTtl(interval: number): number {
-  return Math.max(120, interval * 6);
+  return Math.max(600, interval * 30);
 }
 // How often the on-host keeper re-arms fm-watch. fm-watch exits on every actionable wake and
 // must be re-armed; the keeper (not the plugin's slow cycle) owns that, so the gap after a wake
@@ -408,6 +418,61 @@ export function inboxReapScript(dir: string, max: number): string {
     `done | grep -E '^[0-9]+\\.msg$' | sort -t. -k1,1nr | tail -n +${max + 1} \\`,
     `  | while IFS= read -r r; do rm -f -- "$dir/$r"; done`,
   ].join("\n");
+}
+
+// B1: native fm-spawn.sh REFUSES a ship/scout brief whose `## Captain's intent`
+// body has an operator-address line, via fm_brief_intent_address_line in
+// fm-dod-lib.sh (line 219). The EXACT rule native refuses on is a body line that,
+// after leading whitespace, opens with one of:
+//   Captain: | Captain's words: | Captain's ask: | Captain's intent: | Captain,
+// i.e. /^[[:space:]]*(Captain('s (words|ask|intent))?:|Captain,)/ — and native scans
+// EVERY line, refusing on the first match. The `## Captain's intent` heading already
+// records provenance, so captains (and the plugin's own scout-followup dispatch,
+// server.ts ~5155/6203, and the captain skill SKILL.md:166) phrase task text as
+// "Captain's intent: <words>" / "Captain, <words>". Written verbatim into {TASK}, that
+// tripped the gate 100% of the time and every real spawn silently fell back to native.
+//
+// Normalise the intent body to match native's gate EXACTLY and nothing more: strip the
+// operator-address label from EVERY line native would refuse (native scans them all),
+// and leave every form native ACCEPTS untouched — the captain's verbatim words are the
+// provenance record. Forms native accepts and this must NOT touch include the
+// parenthetical spellings "Captain's intent (verbatim):" and "Captain's ask (per the
+// spec):" (the parenthetical breaks native's `<label>:` match), so those keep their
+// words. This never weakens native's validator; it only feeds it a compliant body.
+export function normalizeCaptainIntent(task: string): string {
+  // Ported verbatim from fm_brief_intent_address_line — no parenthetical, no more
+  // spellings than native. Capture leading indentation so an inline label keeps it.
+  const address = /^([ \t]*)(?:Captain(?:'s (?:words|ask|intent))?:|Captain,)[ \t]*/;
+  const out: string[] = [];
+  for (const line of task.split("\n")) {
+    const m = address.exec(line);
+    if (m === null) {
+      out.push(line);
+      continue;
+    }
+    const rest = line.slice(m[0].length);
+    if (rest.trim() === "") continue; // a label on its own line is dropped entirely
+    out.push(m[1] + rest); // inline label: keep the words (and original indentation)
+  }
+  return out.join("\n");
+}
+
+// B2 (D9): native wake-drain instructs the captain to run the drain at SIX printf
+// sites across five code paths (fm-wake-drain.sh:715/748/752/757/782/860), each naming
+// the raw `bin/fm-wake-drain.sh` — in both the CONSUMING form
+// (`bin/fm-wake-drain.sh --ack-through <N> --recovery-generation <G>`, :748/:782/:860)
+// and the PRESENT/re-run form (`re-run bin/fm-wake-drain.sh and use …`, :715/:752/:757).
+// Pasted by hand, that raw script carries NO per-captain FM_STATE_OVERRIDE, so it
+// presents/acks the UNPARTITIONED root queue and can consume ANOTHER captain's rows
+// (observed live: an advisory named `--ack-through 16 --recovery-generation …` against
+// the root queue). PTY merges stderr into output, so every one of these reaches the
+// captain. Rewrite EVERY occurrence of the raw script to the partition-safe
+// `bb firstmate wake` (drainWakes scopes it to the caller's own plane), so no surfaced
+// line can ever name the raw script — the consuming form becomes
+// `bb firstmate wake --ack-through <N> --recovery-generation <G>` and the present form
+// becomes `re-run bb firstmate wake …`.
+export function rewriteWakeAckLine(out: string): string {
+  return out.replace(/bin\/fm-wake-drain\.sh/g, "bb firstmate wake");
 }
 
 function overlayBytes(rel: string): string {
@@ -1585,7 +1650,9 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const brief = `${fmHome}/data/${crew.id}/brief.md`;
     const briefScript = `${fmHome}/bin/fm-brief.sh`;
-    const intentB64 = Buffer.from(task.trim().slice(0, 3000), "utf8").toString("base64");
+    // Strip a leading Captain-label/address line so native fm-spawn.sh's
+    // fm_brief_intent_address_line does not refuse the brief (B1).
+    const intentB64 = Buffer.from(normalizeCaptainIntent(task.trim()).slice(0, 3000), "utf8").toString("base64");
     // fm-brief refuses --mode on scouts and requires it on ships; a ship's posture
     // is exactly the delivery mode the brief records.
     const scaffold =
@@ -1821,7 +1888,9 @@ export default async function plugin(bb: BbPluginApi) {
       });
       if (res.exitCode !== 0) {
         spawnFailed = true;
-        bb.log.warn(`real transport spawn crew=${crew.id} exit=${res.exitCode} ${res.output.slice(0, 600)}`);
+        // LOUD (B1): a non-zero fm-spawn exit (e.g. the brief-refusal that made every
+        // real spawn fail) must be an error, not a muffled warn.
+        bb.log.error(`real transport spawn crew=${crew.id} exit=${res.exitCode} ${res.output.slice(0, 600)}`);
       } else {
         bb.log.info(`real transport spawn crew=${crew.id} ok`);
       }
@@ -2273,7 +2342,12 @@ export default async function plugin(bb: BbPluginApi) {
           // native publishFmMeta/publishFmBrief backfills would only duplicate.
           return crew;
         }
-        bb.log.info(`real transport unavailable for crew=${crew.id}; using native dispatch`);
+        // LOUD (B1): a real-transport dispatch that produced no thread is a
+        // degradation, not routine info — a permanent silent fallback must never be
+        // able to masquerade as a working real transport again.
+        bb.log.error(
+          `real transport FAILED for crew=${crew.id} (fm-spawn produced no bb_thread_id); falling back to native dispatch — real transport is NOT working`,
+        );
       } catch (error) {
         bb.log.warn(
           `real transport error crew=${crew.id}; using native dispatch: ${error instanceof Error ? error.message : String(error)}`,
@@ -3545,7 +3619,11 @@ export default async function plugin(bb: BbPluginApi) {
     try {
       // D6: drain/ack only the CALLER captain's own scoped state plane.
       const res = await runFmScript({ script: "wake-drain", args, hostId, fmHome, env: wakeStateEnv(fmHome, captainThreadId), timeoutMs: 30_000 });
-      const out = res.output.trim();
+      // B2: the native WAKE_ACK_REQUIRED line names the raw `bin/fm-wake-drain.sh
+      // --ack-through`, which pasted verbatim acks the UNPARTITIONED root queue and can
+      // consume another captain's rows. Rewrite it to the partition-safe bb command so
+      // the emitted instruction can only ever touch the caller's own plane.
+      const out = rewriteWakeAckLine(res.output).trim();
       if (res.exitCode !== 0 && out === "") return `wake drain exit ${res.exitCode}`;
       return out === "" ? "Wake queue empty." : out;
     } catch (error) {
@@ -4345,7 +4423,11 @@ export default async function plugin(bb: BbPluginApi) {
     // beacon age + keeper liveness + a log tail (no other side effects).
     const readScript = [
       `mkdir -p ${shQuote(`${fmHome}/state`)}`,
-      `date +%s > ${shQuote(ownerBeat)} 2>/dev/null || true`,
+      // B3(b): the owner-beat write is a silent SPOF — a non-writable or full state dir
+      // makes it fail, the keeper then sees a stale/absent beat and self-exits while the
+      // plugin still believes supervision is healthy. Detect the write outcome and emit a
+      // marker so the plugin can surface it instead of going quietly blind.
+      `if date +%s > ${shQuote(ownerBeat)} 2>/dev/null; then echo FM_OWNER_BEAT=ok; else echo FM_OWNER_BEAT=fail; fi`,
       "AGE=-1",
       `if [ -f ${shQuote(beat)} ]; then AGE=$(( $(date +%s) - $(stat -c %Y ${shQuote(beat)} 2>/dev/null || echo 0) )); fi`,
       "KEEPER=dead",
@@ -4361,6 +4443,18 @@ export default async function plugin(bb: BbPluginApi) {
       const beatAge = ageMatch ? Number(ageMatch[1]) : -1;
       const keeperAlive = /FM_KEEPER=alive/.test(res.output);
       const noArm = res.output.includes("FM_WATCH_NO_ARM");
+      // B3(b): surface a failed owner-beat write loudly — the keeper is about to
+      // self-exit even though the plugin thinks it is healthy. Treat an explicit
+      // FM_OWNER_BEAT=fail as unwritable; absence of the marker (a truncated read) is
+      // not asserted as a failure.
+      // Log-only surfacing (accepted by the captain): a failed beat write means the
+      // keeper is about to self-exit while the plugin thinks it is healthy. Absence of
+      // the marker (a truncated read) is not asserted as a failure.
+      if (res.output.includes("FM_OWNER_BEAT=fail")) {
+        bb.log.error(
+          `fm-watch-supervisor: owner-beat write FAILED on host ${hostId} (${ownerBeat} not writable — full/read-only state dir?); the keeper will self-exit and real supervision will stop. Fix the state dir.`,
+        );
+      }
       const tailIdx = res.output.indexOf("---FM_LOGTAIL---");
       const logTail = tailIdx < 0 ? "" : res.output.slice(tailIdx + "---FM_LOGTAIL---".length).trim();
       if (noArm) {
@@ -6619,13 +6713,19 @@ export default async function plugin(bb: BbPluginApi) {
   bb.onDispose(async () => {
     for (const timer of nudgeTimers.values()) clearTimeout(timer);
     nudgeTimers.clear();
-    // D7: on plugin dispose/disable, stop any keeper we launched so it does not keep
-    // re-arming fm-watch headless. Best-effort (the host may be unreachable during
-    // teardown); the keeper's owner-beat self-exit guarantees termination regardless.
+    // B3(c): only stop the keeper when it SHOULD stop — i.e. when the feature is off
+    // (watchOwner !== "fm-watch"). onDispose fires on a hot reload too (dispose +
+    // re-init with the SAME config); stopping unconditionally there killed a healthy
+    // keeper on every reload, which the next supervisor tick then re-launched — a flap
+    // that left a supervision gap each reload. When watchOwner is still fm-watch we
+    // leave the keeper running: the reloaded plugin re-adopts it (superviseFmWatch
+    // no-ops while it is alive, keeperHosts is re-seeded from KV), and the owner-beat
+    // self-exit is the backstop if the plugin never comes back. Best-effort (the host
+    // may be unreachable during teardown).
     try {
       const s = await settings.get();
       const fmHome = s.fmHome.trim();
-      if (fmHome !== "") {
+      if (fmHome !== "" && s.watchOwner !== "fm-watch") {
         const hosts = new Set<string>(await loadKeeperHosts());
         const configured = await resolveFmWatchHostId();
         if (configured !== null) hosts.add(configured);
