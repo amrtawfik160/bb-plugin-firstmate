@@ -101,6 +101,159 @@ export function hasStatusProtocol(text: string | null | undefined): boolean {
   return false;
 }
 
+// ── Full status protocol ─────────────────────────────────────────────────────
+// The complete firstmate status vocabulary and the keyed open-decision fold,
+// ported line-for-line from bin/fm-classify-lib.sh so BB reads the same state
+// the real watcher/bearings do. `working`/`paused`/`done`/`failed`/`resolved`/
+// `captain-held` never leave a decision open; `needs-decision`/`blocked` open one
+// keyed by [key=<slug>], and only a `resolved`/`captain-held` line carrying that
+// exact key closes it — a later unrelated line never masks a still-open decision.
+
+/** The whole firstmate status verb roster (fm-classify-lib vocabulary). */
+export const STATUS_VERBS: ReadonlySet<string> = new Set([
+  "working",
+  "needs-decision",
+  "blocked",
+  "paused",
+  "done",
+  "failed",
+  "resolved",
+  "captain-held",
+]);
+
+/** Terminal, always-captain-relevant verbs (fm-classify-lib `status_is_terminal_verb`). */
+export const TERMINAL_VERBS: ReadonlySet<string> = new Set(["done", "needs-decision", "blocked", "failed"]);
+
+const SLUG_OK = /^[A-Za-z0-9._-]+$/;
+const RESERVED_KEY_PREFIXES = ["pending-reply-"] as const;
+const RESOLVE_VERB = "resolved";
+const HELD_VERB = "captain-held";
+
+export interface OpenDecision {
+  key: string;
+  verb: "needs-decision" | "blocked";
+  note: string;
+}
+
+/** fm-classify-lib `_fm_key_before_colon` + key extraction: the `[key=<slug>]` before the first colon. */
+function keyBeforeColon(line: string): string | null {
+  const before = line.split(":", 1)[0] ?? line;
+  const m = /\[key=([^\]]*)\]/.exec(before);
+  return m ? (m[1] ?? "") : null;
+}
+
+/** fm-classify-lib `_fm_key_at_note_head`: a `[key=<slug>]` token at the head of the note. */
+function keyAtNoteHead(line: string): string | null {
+  const idx = line.indexOf(":");
+  if (idx < 0) return null;
+  const rest = line.slice(idx + 1).replace(/^\s+/, "");
+  const m = /^\[key=([^\]]*)\]/.exec(rest);
+  return m ? (m[1] ?? "") : null;
+}
+
+/** fm-classify-lib `_fm_decision_key`: key slug, "default" when no token, null when the stated slug is malformed. */
+function decisionKey(line: string): string | null {
+  const before = keyBeforeColon(line);
+  let k: string;
+  if (before !== null) {
+    k = before;
+  } else {
+    const head = keyAtNoteHead(line);
+    if (head === null) return "default";
+    k = head;
+  }
+  return SLUG_OK.test(k) ? k : null;
+}
+
+/** fm-classify-lib `status_line_note`: text after the first colon, with a note-head key token stripped. */
+export function statusLineNote(line: string): string {
+  const idx = line.indexOf(":");
+  if (idx < 0) return line;
+  let n = line.slice(idx + 1).replace(/^\s+/, "");
+  if (keyBeforeColon(line) === null) {
+    const k = keyAtNoteHead(line);
+    if (k !== null && SLUG_OK.test(k)) {
+      const tok = `[key=${k}]`;
+      if (n.startsWith(tok)) n = n.slice(tok.length).replace(/^\s+/, "");
+    }
+  }
+  return n;
+}
+
+/** fm-classify-lib `_fm_decision_key_transition_allowed`: reserved keys only transition on their own vocabulary. */
+function keyTransitionAllowed(key: string, note: string): boolean {
+  for (const prefix of RESERVED_KEY_PREFIXES) {
+    if (key.startsWith(prefix)) {
+      return note.startsWith(prefix) && note.slice(prefix.length).includes(":");
+    }
+  }
+  return true;
+}
+
+/**
+ * Fold an append-only status stream into the decisions still open, mirroring
+ * fm-classify-lib `status_open_decisions` (via `_fm_decision_fold_line`).
+ * Most-recently-opened last, exactly as the reference prints them.
+ */
+export function foldOpenDecisions(lines: string[]): OpenDecision[] {
+  let open: OpenDecision[] = [];
+  for (const raw of lines) {
+    const line = raw.replace(/\r$/, "");
+    if (!/\S/.test(line)) continue; // blank-line no-op
+    // Real state/<id>.status is lowercase (fm-classify-lib); a BB crew's chat
+    // output emits uppercase DONE/BLOCKED/FAILED. Compare case-insensitively so
+    // both streams fold the same; the on-host stream is already lowercase, so
+    // this never changes the reference behavior.
+    const verb = statusLineVerb(line).toLowerCase();
+    const key = decisionKey(line);
+    if (key === null) continue; // malformed slug: fold as ordinary status
+    if (!keyTransitionAllowed(key, statusLineNote(line))) continue;
+    if (verb === "needs-decision" || verb === "blocked") {
+      const note = statusLineNote(line);
+      open = open.filter((r) => r.key !== key);
+      open.push({ key, verb, note });
+    } else if (verb === RESOLVE_VERB || verb === HELD_VERB) {
+      open = open.filter((r) => r.key !== key);
+    }
+  }
+  return open;
+}
+
+/** The most recent recognized status verb + note (fm-classify-lib `last_status_line`, verb-filtered). */
+export function latestStatus(lines: string[]): { verb: string; note: string } | null {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = (lines[i] ?? "").replace(/\r$/, "");
+    if (!/\S/.test(line)) continue;
+    const verb = statusLineVerb(line).toLowerCase();
+    if (STATUS_VERBS.has(verb)) return { verb, note: statusLineNote(line) };
+  }
+  return null;
+}
+
+/** Pull the status-protocol lines out of arbitrary text (a BB crew's chat output has no .status file). */
+export function statusLinesFrom(text: string | null | undefined): string[] {
+  if (text == null || text === "") return [];
+  return text.split(/\r?\n/).filter((line) => /\S/.test(line) && STATUS_VERBS.has(statusLineVerb(line).toLowerCase()));
+}
+
+/**
+ * A one-block human summary of a crew's folded status: the latest state, and any
+ * still-open keyed decisions. `null` when the stream carries no status protocol.
+ */
+export function statusProtocolSummary(lines: string[]): string | null {
+  const latest = latestStatus(lines);
+  const open = foldOpenDecisions(lines);
+  if (latest === null && open.length === 0) return null;
+  const parts: string[] = [];
+  if (latest !== null) {
+    parts.push(`state: ${latest.verb}${latest.note !== "" ? ` — ${truncate(latest.note, 160)}` : ""}`);
+  }
+  for (const d of open) {
+    parts.push(`open ${d.verb} [${d.key}]: ${truncate(d.note, 160)}`);
+  }
+  return parts.join("\n");
+}
+
 const TURNEND_RULE = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
 
 /** Doorbell copy in the upstream turn-end guard banner shape. */

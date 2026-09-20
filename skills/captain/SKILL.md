@@ -48,10 +48,28 @@ rewrite. Two planes, one runtime:
   "<task>"`, `bb firstmate fm bearings-snapshot`, `bb firstmate fm inbox`.
 - **Native BB loop (transport / Fleet UI):** `firstmate_dispatch` and the other
   `firstmate_*` tools still drive the same BB runtime and, when real mode is
-  active, write `state/<id>.meta` so the real scripts see the Fleet crews. Use
-  these for quick dispatch/track/deliver/merge with the sidebar board; use `fm`
-  when you need the full script policy (relay/mail/voice, backlog handoff,
-  afk/bearings contracts, adapters). Never fork or reimplement the scripts.
+  active, write a complete `state/<id>.meta` (harness/provider/model/effort) and
+  scaffold the structured brief `data/<id>/brief.md` (Captain's intent /
+  Firstmate spec) via the real `fm-brief.sh`, so the real scripts see the Fleet
+  crews. Use these for quick dispatch/track/deliver/merge with the sidebar board;
+  use `fm` when you need the full script policy (relay/mail/voice, backlog
+  handoff, afk/bearings contracts, adapters). Never fork or reimplement the scripts.
+
+### Authoritative state + status protocol
+
+- **Real state is authoritative; KV is a rebuildable cache.** After an upgrade,
+  or if the sidebar and the real scripts disagree, run `bb firstmate migrate-state`
+  once — it imports the KV crew cache into real `state/<id>.meta` + briefs,
+  idempotently, and never overwrites active work. KV only accelerates the UI.
+- **Read crews by the full status protocol.** `bb firstmate crew <id>` and
+  `bearings` fold the firstmate status stream — `working` / `needs-decision` /
+  `blocked` / `paused` / `done` / `failed`, with keyed `resolved`/`captain-held`
+  closes — exactly as `fm-classify-lib.sh` does. An idle crew with an open
+  `needs-decision` is a **Captain's Call**, not a review-ready ship: steer it
+  (`firstmate_tell`) rather than merging.
+- **Fallback safety.** Every real-mode write (meta, brief, contract, status read)
+  is best-effort: if the host or scripts are unavailable it degrades to the
+  native path with a logged note and never breaks dispatch.
 
 Harness adapters other than `bb` (tmux/orca/cmux/zellij/herdr) target non-BB
 session hosts; inside BB the `bb` adapter is the live one. The others ship with
@@ -123,6 +141,7 @@ within its exact scope. Never infer, broaden, or carry it elsewhere.
 | secondmate | `firstmate_secondmate` / `bb firstmate secondmate register --project <id> --thread <id>` |
 | memory | `firstmate_memory` / `memory [show\|set-captain\|add-learning\|drop-learning\|clear]` |
 | watcher | `firstmate_supervision` / `supervision [on\|off\|status]` |
+| rebuild real state from cache | `firstmate_migrate_state` / `bb firstmate migrate-state` (idempotent) |
 | retire | `firstmate_forget` / `forget <id> [--stop] [--force]` |
 | afk / quiet | `firstmate_afk` / `firstmate_quiet` |
 

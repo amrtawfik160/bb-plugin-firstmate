@@ -1329,3 +1329,176 @@ test("bb overlay adapter propagates reasoning, tags crews, drops yolo->full, car
   assert.match(src, /KIND:-/);
   assert.match(src, /scout\)/);
 });
+
+// ── Phase 2 additions ────────────────────────────────────────────────────────
+
+test("formatFmMeta records provider when set, omits it otherwise", () => {
+  const withProvider = formatFmMeta({
+    id: "p1", threadId: "thr_p", worktree: "/wt", project: "/repo", kind: "ship",
+    mode: "direct-PR", yolo: "off", model: "opus", provider: "claude-code", effort: "xhigh", spawnGen: "s1",
+  });
+  assert.match(withProvider, /^provider=claude-code$/m);
+  assert.match(withProvider, /^effort=xhigh$/m);
+  const without = formatFmMeta({
+    id: "p2", threadId: "thr_p2", worktree: "/wt", project: "/repo", kind: "scout", spawnGen: "s2",
+  });
+  assert.doesNotMatch(without, /^provider=/m);
+});
+
+test("captain sessions load the real AGENTS.md contract; crews never do", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", captainContract: "AHOY-CONTRACT-MARKER: supervise before ending a turn." },
+  });
+  await plugin(host.bb);
+  try {
+    const cap = await host.harness.behavior.resolveAgentConfiguration(
+      makePluginAgentConfigurationContext({ pluginMetadata: { captain: "true" } }),
+    );
+    assert.match(cap.instructions ?? "", /AHOY-CONTRACT-MARKER/);
+    const crew = await host.harness.behavior.resolveAgentConfiguration(
+      makePluginAgentConfigurationContext({ pluginMetadata: { crew: "true" } }),
+    );
+    assert.doesNotMatch(crew.instructions ?? "", /AHOY-CONTRACT-MARKER/);
+    assert.deepEqual(crew.tools.map((t) => t.name), []);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("dispatch scaffolds the real structured brief via fm-brief when real mode is on", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home" },
+  });
+  await plugin(host.bb);
+  try {
+    const hostCommands: string[] = [];
+    host.harness.sdk.stub("threadSections.list", async () => []);
+    host.harness.sdk.stub("threadSections.create", async () => ({ id: "sec_crews" }));
+    host.harness.sdk.stub("environments.list", async () => [
+      { hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" },
+    ]);
+    host.harness.sdk.stub("environments.get", async () => ({
+      id: "env_wt", hostId: "host_1", path: "/wt", isWorktree: true, status: "ready",
+    }));
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew" }));
+    host.harness.sdk.stub("threads.get", async () =>
+      makeThreadResponse({ id: "thr_crew", status: "starting", environmentId: "env_wt" }),
+    );
+    host.harness.sdk.stub("terminals.create", async (args: { start?: { command?: string } }) => {
+      if (typeof args.start?.command === "string") hostCommands.push(args.start.command);
+      return { id: "term_1" };
+    });
+    host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+    host.harness.sdk.stub("terminals.output", async () => hostOutput(""));
+    host.harness.sdk.stub("terminals.close", async () => ({}));
+    const result = await host.harness.behavior.runCli(
+      ["dispatch", "--project", "proj_1", "--", "fix flaky login"],
+      { projectId: "proj_1" },
+    );
+    assert.equal(result.exitCode, 0, result.stderr);
+    const brief = hostCommands.find((c) => c.includes("bin/fm-brief.sh"));
+    assert.ok(brief, `no fm-brief scaffold in ${hostCommands.join("\n---\n")}`);
+    assert.match(brief, /--mode/);
+    assert.match(brief, /direct-PR/);
+    assert.match(brief, /\{TASK\}/); // the python fill targets the placeholder
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("migrate-state imports absent crews into real state and is idempotent", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home" },
+  });
+  await plugin(host.bb);
+  try {
+    let metaPresent = false;
+    const commands: string[] = [];
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () =>
+      makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }),
+    );
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+    host.harness.sdk.stub("environments.list", async () => [
+      { hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" },
+    ]);
+    const terminalCmd = new Map<string, string>();
+    let seq = 0;
+    host.harness.sdk.stub("terminals.create", async (args: { start?: { command?: string } }) => {
+      const id = `term_${seq++}`;
+      const cmd = typeof args.start?.command === "string" ? args.start.command : "";
+      terminalCmd.set(id, cmd);
+      commands.push(cmd);
+      return { id };
+    });
+    host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+    host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
+      const cmd = terminalCmd.get(args.terminalId) ?? "";
+      if (cmd.includes("FM_META_EXISTS")) return hostOutput(metaPresent ? "FM_META_EXISTS" : "FM_META_ABSENT");
+      return hostOutput("");
+    });
+    host.harness.sdk.stub("terminals.close", async () => ({}));
+
+    const first = await host.harness.behavior.runCli(["migrate-state", "--json"]);
+    assert.equal(first.exitCode, 0, first.stderr);
+    const r1 = JSON.parse(first.stdout) as { imported: string[]; skippedExisting: string[]; failed: string[] };
+    assert.deepEqual(r1.imported, ["c1"]);
+    assert.ok(commands.some((c) => c.includes("c1.meta") && c.includes("window=thr_crew")), "no meta write");
+
+    metaPresent = true;
+    const second = await host.harness.behavior.runCli(["migrate-state", "--json"]);
+    const r2 = JSON.parse(second.stdout) as { imported: string[]; skippedExisting: string[] };
+    assert.deepEqual(r2.imported, []);
+    assert.deepEqual(r2.skippedExisting, ["c1"]);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("firstmate_crew folds the full status protocol from crew output", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () =>
+      makeThreadResponse({ id: "thr_crew", status: "idle" }),
+    );
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+    host.harness.sdk.stub("threads.output", async () => ({
+      output: "working: setting up\nneeds-decision [key=api]: rename or keep?\nworking: meanwhile",
+    }));
+    const result = await host.harness.behavior.runCli(["crew", "c1"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /state: working/);
+    assert.match(result.stdout, /open needs-decision \[api\]: rename or keep\?/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("bearings surfaces an idle crew's open decision as a Captain's Call", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () =>
+      makeThreadResponse({ id: "thr_crew", status: "idle" }),
+    );
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+    host.harness.sdk.stub("threads.output", async () => ({
+      output: "needs-decision [key=schema]: postgres or sqlite?",
+    }));
+    const result = await host.harness.behavior.runCli(["bearings"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /NEEDS-DECISION \[schema\]/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
