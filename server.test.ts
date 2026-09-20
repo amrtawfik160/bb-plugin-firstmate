@@ -3102,31 +3102,43 @@ test("B3(c): dispose during a hot reload (watchOwner still fm-watch) LEAVES the 
 // keeps the same rule so a drift is caught in `npm test` too.
 const NATIVE_INTENT_ADDRESS = /^[ \t]*(Captain('s (words|ask|intent))?:|Captain,)/;
 
-test("B1: normalizeCaptainIntent strips a leading Captain-label and keeps the words verbatim", () => {
-  const cases: Array<[string, string]> = [
+test("B1: normalizeCaptainIntent strips EXACTLY the labels native refuses, nothing native accepts", () => {
+  // Every form native REFUSES → the label is stripped, words kept verbatim.
+  const refused: Array<[string, string]> = [
     ["Captain's intent: live check the transport", "live check the transport"],
-    ["Captain's intent (verbatim): live check the transport", "live check the transport"],
     ["Captain: do the thing", "do the thing"],
     ["Captain, please do X", "please do X"],
     ["Captain's words: hi there", "hi there"],
     ["Captain's ask: fix it", "fix it"],
   ];
-  for (const [input, firstLine] of cases) {
+  for (const [input, firstLine] of refused) {
+    assert.ok(NATIVE_INTENT_ADDRESS.test(input), `sanity: native must refuse ${JSON.stringify(input)}`);
     const out = normalizeCaptainIntent(input);
     assert.equal(out.split("\n")[0], firstLine, `strip label from: ${input}`);
     for (const line of out.split("\n")) {
       assert.ok(!NATIVE_INTENT_ADDRESS.test(line), `result still trips native refusal: ${JSON.stringify(line)}`);
     }
   }
-  // Multi-line captain task: ONLY the leading label is stripped; the rest is verbatim.
+  // Every form native ACCEPTS → left COMPLETELY untouched (the words are the captain's
+  // provenance record; editing them when native would accept is a defect).
+  const accepted = [
+    "Captain's intent (verbatim): live check the transport",
+    "Captain's ask (per the spec): fix it",
+    "Captains: a plural noun, not an address",
+    "implement the scout's path",
+    "Note from Captain: this is mid-sentence, not a leading label",
+  ];
+  for (const input of accepted) {
+    assert.ok(!NATIVE_INTENT_ADDRESS.test(input), `sanity: native must ACCEPT ${JSON.stringify(input)}`);
+    assert.equal(normalizeCaptainIntent(input), input, `must not touch a form native accepts: ${input}`);
+  }
+  // Native scans EVERY line, so EVERY refused line is stripped — not just the first.
   assert.equal(
-    normalizeCaptainIntent("Captain's intent: do items 1 and 2\nAcceptance: both land\n\nnotes: keep small"),
-    "do items 1 and 2\nAcceptance: both land\n\nnotes: keep small",
+    normalizeCaptainIntent("Captain's intent: do items 1 and 2\nCaptain: and item 3\nAcceptance: both land"),
+    "do items 1 and 2\nand item 3\nAcceptance: both land",
   );
   // A standalone label line is dropped entirely.
   assert.equal(normalizeCaptainIntent("Captain's intent:\nDo the thing"), "Do the thing");
-  // Non-label text is left completely untouched (never rewrite the captain's words).
-  assert.equal(normalizeCaptainIntent("implement the scout's path"), "implement the scout's path");
 });
 
 test("B1: dispatch normalises the leading Captain-label out of the brief intent body", async () => {
@@ -3157,8 +3169,10 @@ test("B1: dispatch normalises the leading Captain-label out of the brief intent 
     host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
     host.harness.sdk.stub("terminals.output", async () => hostOutput(""));
     host.harness.sdk.stub("terminals.close", async () => ({}));
+    // The bare "Captain's intent:" label is the exact form native REFUSES (and the form
+    // the captain skill + auto-dispatches emit); it must be stripped before the brief.
     const result = await host.harness.behavior.runCli(
-      ["dispatch", "--project", "proj_1", "--", "Captain's intent (verbatim): fix flaky login"],
+      ["dispatch", "--project", "proj_1", "--", "Captain's intent: fix flaky login"],
       { projectId: "proj_1" },
     );
     assert.equal(result.exitCode, 0, result.stderr);
@@ -3178,18 +3192,32 @@ test("B1: dispatch normalises the leading Captain-label out of the brief intent 
 // B2 (D9): the surfaced ack instruction must name the partition-safe bb command
 // ---------------------------------------------------------------------------
 
-test("B2: rewriteWakeAckLine rewrites the raw script into the partition-safe bb command", () => {
-  const raw = [
-    "pending wake rows...",
-    "WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through 7 --recovery-generation gen.123",
-    "trailing",
-  ].join("\n");
-  const out = rewriteWakeAckLine(raw);
-  assert.match(out, /^WAKE_ACK_REQUIRED: after handling completes run bb firstmate wake --ack-through 7 --recovery-generation gen\.123$/m);
-  assert.ok(!/WAKE_ACK_REQUIRED:.*bin\/fm-wake-drain\.sh/.test(out), "raw script must not survive on the ACK line");
-  // Non-ACK lines are untouched (a re-run hint that mentions the raw script stays).
-  assert.match(out, /pending wake rows\.\.\./);
-  assert.match(out, /^trailing$/m);
+test("B2: rewriteWakeAckLine strips the raw script from ALL FIVE native emission sites", () => {
+  // Verbatim native strings (fm-wake-drain.sh) with %s rendered — the consuming forms
+  // AND the present/re-run forms. After rewrite NONE may still name the raw script.
+  const NATIVE_SITES = [
+    // :860 — main consuming ACK line
+    "WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through 16 --recovery-generation 3986370",
+    // :782 — recovery-only consuming ACK line
+    "WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through 0 --recovery-generation 3986370",
+    // :748 — stale-ack advisory, the CONSUMING form with NO WAKE_ACK_REQUIRED prefix
+    "wake drain: nothing was acknowledged through 12 (none of your presented wake rows is at or below it); the current wake is row 16: run bin/fm-wake-drain.sh --ack-through 16 --recovery-generation 3986370 after handling it",
+    // :752 — present/re-run form
+    "wake drain: nothing was acknowledged through 12 (none of your presented wake rows is at or below it); the current wake is row 16: re-run bin/fm-wake-drain.sh and use the WAKE_ACK_REQUIRED command it prints",
+    // :757 — present/re-run form
+    "wake drain: acknowledged wakes through 12 (3 row(s) consumed), but a newer recovery episode is pending; re-run bin/fm-wake-drain.sh and use the new WAKE_ACK_REQUIRED command",
+    // :715 — present/re-run form
+    "wake drain: recovery episode could not be retired safely; re-run bin/fm-wake-drain.sh and use the new WAKE_ACK_REQUIRED command",
+  ];
+  const out = rewriteWakeAckLine(NATIVE_SITES.join("\n"));
+  // Not a single surfaced line may name the raw script.
+  assert.ok(!/bin\/fm-wake-drain\.sh/.test(out), `raw script survived somewhere:\n${out}`);
+  // The consuming forms now name the partition-safe bb command with the same args.
+  assert.match(out, /run bb firstmate wake --ack-through 16 --recovery-generation 3986370/);
+  assert.match(out, /run bb firstmate wake --ack-through 0 --recovery-generation 3986370/);
+  assert.match(out, /run bb firstmate wake --ack-through 16 --recovery-generation 3986370 after handling it/);
+  // The present/re-run forms now name the bb command too.
+  assert.match(out, /re-run bb firstmate wake and use the WAKE_ACK_REQUIRED command it prints/);
 });
 
 test("B2: `bb firstmate wake` presents the ack instruction as the bb command, not the raw script", async () => {
@@ -3203,17 +3231,22 @@ test("B2: `bb firstmate wake` presents the ack instruction as the bb command, no
     host.harness.sdk.stub("terminals.create", async () => ({ id: "term_1" }));
     host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
     host.harness.sdk.stub("terminals.close", async () => ({}));
+    // Both the WAKE_ACK_REQUIRED consuming line AND the stale-ack advisory (the
+    // consuming form the captain hit live, no WAKE_ACK_REQUIRED prefix) come through.
     host.harness.sdk.stub("terminals.output", async () =>
       hostOutput(
-        "WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through 4 --recovery-generation g99",
+        [
+          "wake drain: nothing was acknowledged through 2 (none of your presented wake rows is at or below it); the current wake is row 4: run bin/fm-wake-drain.sh --ack-through 4 --recovery-generation g99 after handling it",
+          "WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through 4 --recovery-generation g99",
+        ].join("\n"),
       ),
     );
     const result = await host.harness.behavior.runCli(["wake"], { projectId: "proj_1", threadId: "thr_cap" });
     assert.equal(result.exitCode, 0, result.stderr);
     assert.match(result.stdout, /bb firstmate wake --ack-through 4 --recovery-generation g99/);
     assert.ok(
-      !/WAKE_ACK_REQUIRED:.*bin\/fm-wake-drain\.sh/.test(result.stdout),
-      `the raw script must not appear on the surfaced ACK line:\n${result.stdout}`,
+      !/bin\/fm-wake-drain\.sh/.test(result.stdout),
+      `no surfaced line may name the raw script:\n${result.stdout}`,
     );
   } finally {
     await host.harness.lifecycle.dispose();

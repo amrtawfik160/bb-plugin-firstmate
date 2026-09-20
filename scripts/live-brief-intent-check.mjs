@@ -90,27 +90,25 @@ try {
     return sh(join(fmh, "bin", "fm-spawn.sh"), args, { env, timeout: 90_000 });
   }
 
-  // Captain-authored task text, exactly as this captain writes briefs.
-  const CAPTAIN_TASK = "Captain's intent (verbatim): live-check the real transport end to end";
+  // The bare "Captain's intent:" label is the exact form native REFUSES and the form
+  // the captain skill (SKILL.md:166) and the plugin's own auto-dispatches emit.
+  const BARE = "Captain's intent: live-check the real transport end to end";
 
   for (const kind of ["ship", "scout"]) {
-    // (A) RAW label form that reproduces the bug. The `(verbatim)` spelling slips past
-    // native's regex, so to reproduce the actual 100%-refusal we use the bare label the
-    // captain's real dispatch also uses ("Captain's intent: ..."); the normalizer strips
-    // both. This is the exact failure from the live evidence.
+    // (A) RAW bare-label brief reproduces the 100%-refusal from the live evidence.
     const rawId = `b1-${kind}-raw`;
     scaffold(rawId, kind);
-    fill(rawId, "Captain's intent: live-check the real transport end to end");
+    fill(rawId, BARE);
     const raw = spawn(rawId, kind);
     const refused = REFUSAL.test(raw.out) && !SPAWNED.test(raw.out);
     record(`${kind}: RAW captain-label brief is REFUSED by real fm-spawn (bug reproduced)`, refused,
       refused ? "no thread created — this is what made real transport fall back" : `unexpected: ${raw.out.slice(-300)}`);
 
-    // (B) Normalized via the ACTUAL normalizeCaptainIntent, from the captain's own
-    // "Captain's intent (verbatim): ..." text. Must pass the gate and REAL-spawn.
+    // (B) The SAME text through the ACTUAL normalizeCaptainIntent must pass the gate and
+    // REAL-spawn a bb thread — proving the fix repairs the exact failing case.
     const okId = `b1-${kind}-fixed`;
     scaffold(okId, kind);
-    const normalized = normalizeCaptainIntent(CAPTAIN_TASK);
+    const normalized = normalizeCaptainIntent(BARE);
     fill(okId, normalized);
     const good = spawn(okId, kind);
     const m = SPAWNED.exec(good.out);
@@ -118,6 +116,30 @@ try {
     const spawnedOk = m !== null && !REFUSAL.test(good.out);
     record(`${kind}: normalized brief SPAWNS via real transport (no operator-address refusal)`, spawnedOk,
       spawnedOk ? `real bb thread=${m[1]} (normalized body=${JSON.stringify(normalized)})` : `no spawn: ${good.out.slice(-400)}`);
+  }
+
+  // (C) Do-not-over-strip, checked against the REAL native gate (no spawn needed): a
+  // provenance-bearing "(verbatim)" / "(per the spec)" form is one native ACCEPTS, so
+  // normalizeCaptainIntent must leave it byte-for-byte untouched, and the real
+  // fm_brief_intent_address_line (sourced from the actual fm-dod-lib.sh) must NOT flag
+  // the scaffolded brief. Editing words native would have accepted is a defect.
+  for (const provenance of [
+    "Captain's intent (verbatim): live-check the real transport end to end",
+    "Captain's ask (per the spec): keep the diff small",
+  ]) {
+    const unchanged = normalizeCaptainIntent(provenance) === provenance;
+    const pid = `b1-accept-${provenance.length}`;
+    scaffold(pid, "ship");
+    fill(pid, provenance);
+    // Run native's EXACT refusal predicate against the real brief.
+    const gate = sh("bash", [
+      "-c",
+      `. "${join(fmh, "bin", "fm-dod-lib.sh")}"; if fm_brief_intent_address_line "${brief(pid)}" >/dev/null; then echo NATIVE_REFUSES; else echo NATIVE_ACCEPTS; fi`,
+    ], { env });
+    const nativeAccepts = /NATIVE_ACCEPTS/.test(gate.out);
+    record(`don't-over-strip: native ACCEPTS + normalizer preserves ${JSON.stringify(provenance)}`,
+      unchanged && nativeAccepts,
+      `normalizerUnchanged=${unchanged} nativeGate=${gate.out.trim()}`);
   }
 } finally {
   for (const tid of createdThreads) teardownThread(tid);

@@ -421,57 +421,58 @@ export function inboxReapScript(dir: string, max: number): string {
 }
 
 // B1: native fm-spawn.sh REFUSES a ship/scout brief whose `## Captain's intent`
-// body opens with an operator-address line, via fm_brief_intent_address_line in
-// fm-dod-lib.sh — the exact rule is a body line matching
-//   /^[[:space:]]*(Captain('s (words|ask|intent))?:|Captain,)/
-// because the `## Captain's intent` heading already records provenance. Captains
-// (and the plugin's own scout-followup dispatch) routinely phrase task text as
-// "Captain's intent: <words>", "Captain's intent (verbatim): <words>", or
-// "Captain, <words>". Writing that verbatim into {TASK} made the real transport's
-// brief rejected 100% of the time, so every real spawn fell back to native and the
-// "real transport unavailable" line was only logged at info — a permanent silent
-// fallback. Normalise the intent body before it is written: strip a LEADING
-// operator-address label, preserving the captain's actual words verbatim. Only the
-// first non-empty line is touched (the captain's real words are never rewritten),
-// and the parenthetical "(verbatim)" spelling is stripped too — native's regex
-// misses it, but keeping the label out of the words is the point. This never
-// weakens native's validator; it only feeds it a compliant body.
+// body has an operator-address line, via fm_brief_intent_address_line in
+// fm-dod-lib.sh (line 219). The EXACT rule native refuses on is a body line that,
+// after leading whitespace, opens with one of:
+//   Captain: | Captain's words: | Captain's ask: | Captain's intent: | Captain,
+// i.e. /^[[:space:]]*(Captain('s (words|ask|intent))?:|Captain,)/ — and native scans
+// EVERY line, refusing on the first match. The `## Captain's intent` heading already
+// records provenance, so captains (and the plugin's own scout-followup dispatch,
+// server.ts ~5155/6203, and the captain skill SKILL.md:166) phrase task text as
+// "Captain's intent: <words>" / "Captain, <words>". Written verbatim into {TASK}, that
+// tripped the gate 100% of the time and every real spawn silently fell back to native.
+//
+// Normalise the intent body to match native's gate EXACTLY and nothing more: strip the
+// operator-address label from EVERY line native would refuse (native scans them all),
+// and leave every form native ACCEPTS untouched — the captain's verbatim words are the
+// provenance record. Forms native accepts and this must NOT touch include the
+// parenthetical spellings "Captain's intent (verbatim):" and "Captain's ask (per the
+// spec):" (the parenthetical breaks native's `<label>:` match), so those keep their
+// words. This never weakens native's validator; it only feeds it a compliant body.
 export function normalizeCaptainIntent(task: string): string {
-  const lines = task.split("\n");
-  let i = 0;
-  while (i < lines.length && lines[i]!.trim() === "") i++;
-  if (i >= lines.length) return task;
-  // Mirror native's address spellings (Captain / Captain's words|ask|intent) plus an
-  // optional parenthetical like " (verbatim)", then a colon; or a bare "Captain,".
-  const address = /^[ \t]*(?:Captain(?:'s (?:words|ask|intent))?(?: \([^)]*\))?:|Captain,)[ \t]*/;
-  const m = address.exec(lines[i]!);
-  if (m === null) return task;
-  const rest = lines[i]!.slice(m[0].length);
-  if (rest.trim() === "") {
-    lines.splice(i, 1); // label was on its own line — drop it entirely
-  } else {
-    lines[i] = rest;
+  // Ported verbatim from fm_brief_intent_address_line — no parenthetical, no more
+  // spellings than native. Capture leading indentation so an inline label keeps it.
+  const address = /^([ \t]*)(?:Captain(?:'s (?:words|ask|intent))?:|Captain,)[ \t]*/;
+  const out: string[] = [];
+  for (const line of task.split("\n")) {
+    const m = address.exec(line);
+    if (m === null) {
+      out.push(line);
+      continue;
+    }
+    const rest = line.slice(m[0].length);
+    if (rest.trim() === "") continue; // a label on its own line is dropped entirely
+    out.push(m[1] + rest); // inline label: keep the words (and original indentation)
   }
-  return lines.join("\n");
+  return out.join("\n");
 }
 
-// B2: the native wake-drain prints its acknowledgement instruction as a
-// `WAKE_ACK_REQUIRED: ... run bin/fm-wake-drain.sh --ack-through <N> --recovery-generation <G>`
-// line. That raw script, pasted verbatim by a captain, runs WITHOUT the per-captain
-// FM_STATE_OVERRIDE the plugin sets — so it acks the UNPARTITIONED root queue and can
-// consume another captain's rows. The partition-safe path is `bb firstmate wake
-// --ack-through <N> --recovery-generation <G>` (drainWakes scopes it to the caller's
-// own plane). Rewrite the surfaced instruction to name the bb command so pasting it can
-// only ever touch the caller's own rows. Leaves everything else untouched.
+// B2 (D9): native wake-drain instructs the captain to run the drain at SIX printf
+// sites across five code paths (fm-wake-drain.sh:715/748/752/757/782/860), each naming
+// the raw `bin/fm-wake-drain.sh` — in both the CONSUMING form
+// (`bin/fm-wake-drain.sh --ack-through <N> --recovery-generation <G>`, :748/:782/:860)
+// and the PRESENT/re-run form (`re-run bin/fm-wake-drain.sh and use …`, :715/:752/:757).
+// Pasted by hand, that raw script carries NO per-captain FM_STATE_OVERRIDE, so it
+// presents/acks the UNPARTITIONED root queue and can consume ANOTHER captain's rows
+// (observed live: an advisory named `--ack-through 16 --recovery-generation …` against
+// the root queue). PTY merges stderr into output, so every one of these reaches the
+// captain. Rewrite EVERY occurrence of the raw script to the partition-safe
+// `bb firstmate wake` (drainWakes scopes it to the caller's own plane), so no surfaced
+// line can ever name the raw script — the consuming form becomes
+// `bb firstmate wake --ack-through <N> --recovery-generation <G>` and the present form
+// becomes `re-run bb firstmate wake …`.
 export function rewriteWakeAckLine(out: string): string {
-  return out
-    .split("\n")
-    .map((line) =>
-      /^WAKE_ACK_REQUIRED:/.test(line)
-        ? line.replace(/bin\/fm-wake-drain\.sh(?= --ack-through )/g, "bb firstmate wake")
-        : line,
-    )
-    .join("\n");
+  return out.replace(/bin\/fm-wake-drain\.sh/g, "bb firstmate wake");
 }
 
 function overlayBytes(rel: string): string {
@@ -4409,7 +4410,7 @@ export default async function plugin(bb: BbPluginApi) {
     graceSec: number,
     allowRelaunch: boolean,
     signal?: AbortSignal,
-  ): Promise<{ beatAge: number; relaunched: boolean; keeperAlive: boolean; logTail: string; ownerBeatWritable: boolean } | null> {
+  ): Promise<{ beatAge: number; relaunched: boolean; keeperAlive: boolean; logTail: string } | null> {
     const beat = `${fmHome}/state/.last-watcher-beat`;
     const log = `${fmHome}/state/.bb-watch-arm.log`;
     const arm = `${fmHome}/bin/fm-watch-arm.sh`;
@@ -4446,8 +4447,10 @@ export default async function plugin(bb: BbPluginApi) {
       // self-exit even though the plugin thinks it is healthy. Treat an explicit
       // FM_OWNER_BEAT=fail as unwritable; absence of the marker (a truncated read) is
       // not asserted as a failure.
-      const ownerBeatWritable = !res.output.includes("FM_OWNER_BEAT=fail");
-      if (!ownerBeatWritable) {
+      // Log-only surfacing (accepted by the captain): a failed beat write means the
+      // keeper is about to self-exit while the plugin thinks it is healthy. Absence of
+      // the marker (a truncated read) is not asserted as a failure.
+      if (res.output.includes("FM_OWNER_BEAT=fail")) {
         bb.log.error(
           `fm-watch-supervisor: owner-beat write FAILED on host ${hostId} (${ownerBeat} not writable — full/read-only state dir?); the keeper will self-exit and real supervision will stop. Fix the state dir.`,
         );
@@ -4475,7 +4478,7 @@ export default async function plugin(bb: BbPluginApi) {
           bb.log.warn("fm-watch-supervisor: could not write the keeper script; will retry next cycle.");
         }
       }
-      return { beatAge, relaunched, keeperAlive, logTail, ownerBeatWritable };
+      return { beatAge, relaunched, keeperAlive, logTail };
     } catch (error) {
       bb.log.warn(`fm-watch-supervisor cycle failed: ${error instanceof Error ? error.message : String(error)}`);
       return null;
