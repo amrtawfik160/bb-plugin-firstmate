@@ -68,7 +68,14 @@ They degrade to the current native behavior with a log line.
   double-spawns (fm-spawn's `BB_ABORT_CLEANUP` cleans up graceful failures, and
   for the hard-kill window the plugin adopts the orphan thread by `fm-<id>` title
   / recorded `crewId` before falling back). Future-scheduled sends always use
-  native.
+  native. **Requires `queueOwner=real`:** native fm-spawn is backlog-first (it
+  refuses a task with no `data/backlog.md` row), so real transport adds that row
+  (id = crew id, `--kind ship|scout`) via `fm-tasks-axi.sh` **before** spawning,
+  lets fm-spawn move it to In-flight, and closes it on land (`done`) / forget
+  (`rm`). With `queueOwner=kv` it can't own that row, so it logs and falls back to
+  native. A ship whose delivery mode sits below the project's native standing
+  posture records a stated **intake judgement** on its brief so fm-spawn's
+  deviation notice is answered, not silenced.
 - **`watchOwner`** (`native` | `fm-watch`, default `native`): with `fm-watch`,
   the plugin's `fm-watch-supervisor` service runs and keeps the **real fm-watch**
   alive against `fmHome`, relays its wake reasons to you, and reads its heartbeat.

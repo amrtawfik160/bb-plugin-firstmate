@@ -11,8 +11,10 @@ import {
   makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
 import plugin, {
+  backlogTitleOf,
   captainWakeDoorbell,
   fmBackendEnv,
+  postureIntakeJudgement,
   fmWatchKeeperInterval,
   fmWatchKeeperScript,
   fmWatchOwnerBeatTtl,
@@ -205,6 +207,27 @@ test("formatFmMeta matches fm-spawn bb keys", () => {
   assert.match(ship, /^mode=direct-PR$/m);
   assert.match(ship, /^yolo=off$/m);
   assert.match(ship, /^model=composer$/m);
+});
+
+test("backlogTitleOf strips the Captain label and uses the first line, capped", () => {
+  assert.equal(backlogTitleOf("Captain's intent: fix flaky login\n\ndetails"), "fix flaky login");
+  assert.equal(backlogTitleOf("Captain's intent:\nsurvey the auth flow"), "survey the auth flow");
+  assert.equal(backlogTitleOf("   \n\nplain task"), "plain task");
+  assert.equal(backlogTitleOf(""), "crew task");
+  assert.equal(backlogTitleOf("x".repeat(500)).length, 200);
+});
+
+test("postureIntakeJudgement records only when the mode is below the standing posture", () => {
+  // Below standing → a stated judgement.
+  const j = postureIntakeJudgement("direct-PR", "no-mistakes");
+  assert.ok(j !== null && /Intake judgement:/.test(j) && /standing posture is no-mistakes/.test(j));
+  assert.ok(postureIntakeJudgement("local-only", "direct-PR") !== null);
+  // At/above standing, or unregistered/conditional/unknown standing → nothing.
+  assert.equal(postureIntakeJudgement("direct-PR", "direct-PR"), null);
+  assert.equal(postureIntakeJudgement("no-mistakes", "direct-PR"), null);
+  assert.equal(postureIntakeJudgement("direct-PR", ""), null);
+  assert.equal(postureIntakeJudgement("direct-PR", "no-mistakes-prod-only"), null);
+  assert.equal(postureIntakeJudgement("direct-PR", "garbage"), null);
 });
 
 function hostRcOutput(code = 0) {
@@ -1763,10 +1786,13 @@ async function crewsKv(host: Awaited<ReturnType<typeof load>>) {
 }
 
 function realHost() {
+  // Real transport is backlog-first: it requires queueOwner=real so the plugin can
+  // create+own the native backlog row before fm-spawn.sh (which refuses a task with
+  // no record). The real-transport tests therefore run with both flags set.
   return createFakePluginHost({
     pluginId: "firstmate",
     agentSkillIds: SKILLS,
-    settings: { fmHome: "/tmp/fm-home", transport: "real" },
+    settings: { fmHome: "/tmp/fm-home", transport: "real", queueOwner: "real" },
   });
 }
 
@@ -1859,6 +1885,230 @@ test("real transport never double-spawns when the meta already has a thread", as
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
     const crews = await crewsKv(host);
     assert.equal(crews[0]?.threadId, "thr_pre");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// C1: a real-transport dispatch that lets us tune the tasks-axi add exit code, the
+// native standing posture fm-project-mode.sh reports, the fm-spawn exit, the
+// bb_thread_id the meta carries afterwards, and the orphan-list contents. Records
+// every host command in `seen` so ordering (add BEFORE spawn) can be asserted.
+function stubRealTransportBacklog(
+  host: Awaited<ReturnType<typeof load>>,
+  opts: {
+    addExit?: number;
+    standing?: string; // raw fm-project-mode word, "" = unregistered/unreachable
+    spawnExit?: number;
+    threadIdAfterSpawn?: string;
+    orphan?: boolean;
+  },
+) {
+  host.harness.sdk.stub("threadSections.list", async () => []);
+  host.harness.sdk.stub("threadSections.create", async () => ({ id: "sec_crews" }));
+  host.harness.sdk.stub("environments.list", async () => [
+    { hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" },
+  ]);
+  host.harness.sdk.stub("environments.get", async () => ({
+    id: "env_wt", hostId: "host_1", path: "/wt", isWorktree: true, status: "ready",
+  }));
+  host.harness.sdk.stub("threads.get", async () =>
+    makeThreadResponse({ id: "thr_crew", status: "starting", environmentId: "env_wt" }),
+  );
+  host.harness.sdk.stub("threads.list", async () =>
+    opts.orphan ? [{ id: "thr_orphan", projectId: "proj_1", parentThreadId: "thr_cap", title: "renamed" }] : [],
+  );
+  host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+  const cmds = new Map<string, string>();
+  const seen: string[] = [];
+  let n = 0;
+  let spawned = false;
+  host.harness.sdk.stub("terminals.create", async (args: { start?: { command?: string } }) => {
+    const id = `term_${++n}`;
+    const cmd = args.start?.command ?? "";
+    cmds.set(id, cmd);
+    seen.push(cmd);
+    return { id };
+  });
+  host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+  host.harness.sdk.stub("terminals.close", async () => ({}));
+  host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
+    const cmd = cmds.get(args.terminalId) ?? "";
+    if (cmd.includes("bin/fm-project-mode.sh")) return hostRcPayload(opts.standing ?? "", 0);
+    if (cmd.includes("bin/fm-tasks-axi.sh") && cmd.includes("'add'")) return hostRcPayload("", opts.addExit ?? 0);
+    if (cmd.includes("bin/fm-spawn.sh")) {
+      spawned = true;
+      return hostRcPayload("", opts.spawnExit ?? 0);
+    }
+    if (cmd.includes("bb_thread_id")) {
+      const tid = spawned ? (opts.threadIdAfterSpawn ?? "") : "";
+      return hostRcPayload(tid === "" ? "FM_META_ABSENT" : tid, 0);
+    }
+    return hostRcPayload("", 0);
+  });
+  return { seen };
+}
+
+function crewIdFromStdout(stdout: string): string {
+  const m = /Dispatched (?:ship|scout) crew (\S+)/.exec(stdout);
+  assert.ok(m, `no crew id in: ${stdout}`);
+  return m![1]!;
+}
+
+test("C1: real transport adds the backlog row (id=crew id, --kind ship) BEFORE fm-spawn", async () => {
+  const host = realHost();
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRealTransportBacklog(host, { threadIdAfterSpawn: "thr_real" });
+    const result = await host.harness.behavior.runCli(
+      ["dispatch", "--project", "proj_1", "--", "Captain's intent: fix flaky login"],
+      { projectId: "proj_1" },
+    );
+    assert.equal(result.exitCode, 0, result.stderr);
+    const crewId = crewIdFromStdout(result.stdout);
+    const addIdx = seen.findIndex(
+      (c) => c.includes("bin/fm-tasks-axi.sh") && c.includes("'add'") && c.includes(`'${crewId}'`) && c.includes("'--kind'") && c.includes("'ship'"),
+    );
+    const spawnIdx = seen.findIndex((c) => c.includes("bin/fm-spawn.sh"));
+    assert.ok(addIdx >= 0, `no backlog add for ${crewId}: ${seen.join(" | ")}`);
+    assert.ok(spawnIdx >= 0, "fm-spawn.sh never ran");
+    assert.ok(addIdx < spawnIdx, "backlog add must run BEFORE fm-spawn (backlog-first)");
+    // fm-spawn owns the queued→In-flight start; the plugin must not double-start.
+    assert.ok(!seen.some((c) => c.includes("bin/fm-tasks-axi.sh") && c.includes("'start'")), "plugin double-started the row");
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0, "must not native-spawn");
+    assert.equal((await crewsKv(host))[0]?.threadId, "thr_real");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("C1: real transport adds the backlog row with --kind scout for a scout", async () => {
+  const host = realHost();
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRealTransportBacklog(host, { threadIdAfterSpawn: "thr_scout" });
+    const result = await host.harness.behavior.runCli(
+      ["dispatch", "--project", "proj_1", "--shape", "scout", "--", "Captain's intent: survey the auth flow"],
+      { projectId: "proj_1" },
+    );
+    assert.equal(result.exitCode, 0, result.stderr);
+    const crewId = crewIdFromStdout(result.stdout);
+    const addIdx = seen.findIndex(
+      (c) => c.includes("bin/fm-tasks-axi.sh") && c.includes("'add'") && c.includes(`'${crewId}'`) && c.includes("'--kind'") && c.includes("'scout'"),
+    );
+    const spawnIdx = seen.findIndex((c) => c.includes("bin/fm-spawn.sh"));
+    assert.ok(addIdx >= 0, `no scout backlog add for ${crewId}`);
+    assert.ok(addIdx < spawnIdx, "scout backlog add must run BEFORE fm-spawn");
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("C1: real transport requires queueOwner=real — falls back to native when kv", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", transport: "real" }, // queueOwner defaults kv
+  });
+  await plugin(host.bb);
+  try {
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_native" }));
+    const { seen } = stubRealTransportBacklog(host, { threadIdAfterSpawn: "thr_real" });
+    const result = await host.harness.behavior.runCli(
+      ["dispatch", "--project", "proj_1", "--", "Captain's intent: fix flaky login"],
+      { projectId: "proj_1" },
+    );
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.ok(!seen.some((c) => c.includes("bin/fm-spawn.sh")), "must not run fm-spawn without queueOwner=real");
+    assert.ok(!seen.some((c) => c.includes("bin/fm-tasks-axi.sh") && c.includes("'add'")), "must not add a backlog row without queueOwner=real");
+    // The guard returns BEFORE any real-transport work: fm-project-mode.sh (run only
+    // inside the real path) must never fire — it uniquely proves the early refusal.
+    assert.ok(!seen.some((c) => c.includes("bin/fm-project-mode.sh")), "must not begin real-transport work without queueOwner=real");
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 1, "must fall back to native spawn");
+    assert.equal((await crewsKv(host))[0]?.threadId, "thr_native");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("C1: a failed backlog add never spawns a worker — falls back to native", async () => {
+  const host = realHost();
+  await plugin(host.bb);
+  try {
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_native" }));
+    const { seen } = stubRealTransportBacklog(host, { addExit: 2, threadIdAfterSpawn: "thr_real" });
+    const result = await host.harness.behavior.runCli(
+      ["dispatch", "--project", "proj_1", "--", "Captain's intent: fix flaky login"],
+      { projectId: "proj_1" },
+    );
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.ok(seen.some((c) => c.includes("bin/fm-tasks-axi.sh") && c.includes("'add'")), "add was attempted");
+    assert.ok(!seen.some((c) => c.includes("bin/fm-spawn.sh")), "must NOT spawn a worker the backlog does not own");
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 1, "falls back to native dispatch");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("C1: a spawn that leaves no thread/orphan removes the seeded backlog row", async () => {
+  const host = realHost();
+  await plugin(host.bb);
+  try {
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_native" }));
+    const { seen } = stubRealTransportBacklog(host, { spawnExit: 1, threadIdAfterSpawn: "", orphan: false });
+    const result = await host.harness.behavior.runCli(
+      ["dispatch", "--project", "proj_1", "--", "Captain's intent: fix flaky login"],
+      { projectId: "proj_1" },
+    );
+    assert.equal(result.exitCode, 0, result.stderr);
+    const crewId = crewIdFromStdout(result.stdout);
+    const addIdx = seen.findIndex((c) => c.includes("bin/fm-tasks-axi.sh") && c.includes("'add'") && c.includes(`'${crewId}'`));
+    const rmIdx = seen.findIndex((c) => c.includes("bin/fm-tasks-axi.sh") && c.includes("'rm'") && c.includes(`'${crewId}'`));
+    assert.ok(addIdx >= 0, "row was added");
+    assert.ok(rmIdx > addIdx, "orphan row must be removed when no worker exists");
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 1, "falls back to native dispatch");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("C2: a ship below the standing posture records a stated intake judgement in the brief", async () => {
+  const host = realHost();
+  await plugin(host.bb);
+  try {
+    // Native standing posture reports no-mistakes; the plugin ships direct-PR.
+    const { seen } = stubRealTransportBacklog(host, { standing: "no-mistakes off", threadIdAfterSpawn: "thr_real" });
+    const result = await host.harness.behavior.runCli(
+      ["dispatch", "--project", "proj_1", "--", "Captain's intent: fix flaky login"],
+      { projectId: "proj_1" },
+    );
+    assert.equal(result.exitCode, 0, result.stderr);
+    const briefCmd = seen.find((c) => c.includes("FM_SPEC="));
+    assert.ok(briefCmd, "brief fill command not seen");
+    const b64 = /FM_SPEC=([A-Za-z0-9+/=]+)/.exec(briefCmd!)?.[1] ?? "";
+    const spec = Buffer.from(b64, "base64").toString("utf8");
+    assert.match(spec, /Intake judgement:/, "the brief spec must carry the stated intake judgement");
+    assert.match(spec, /standing posture is no-mistakes/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("C2: a ship at/above the standing posture records NO intake judgement", async () => {
+  const host = realHost();
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRealTransportBacklog(host, { standing: "direct-PR off", threadIdAfterSpawn: "thr_real" });
+    const result = await host.harness.behavior.runCli(
+      ["dispatch", "--project", "proj_1", "--", "Captain's intent: fix flaky login"],
+      { projectId: "proj_1" },
+    );
+    assert.equal(result.exitCode, 0, result.stderr);
+    const briefCmd = seen.find((c) => c.includes("FM_SPEC="));
+    const b64 = /FM_SPEC=([A-Za-z0-9+/=]+)/.exec(briefCmd ?? "")?.[1] ?? "";
+    const spec = Buffer.from(b64, "base64").toString("utf8");
+    assert.doesNotMatch(spec, /Intake judgement:/, "no judgement when the mode is not below standing");
   } finally {
     await host.harness.lifecycle.dispose();
   }
