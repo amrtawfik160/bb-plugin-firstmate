@@ -2924,3 +2924,166 @@ test("queue real: tasks-axi add exit!=0 leaves the row KV-only (no backlog id)",
     await host.harness.lifecycle.dispose();
   }
 });
+
+// --- Phase 6: durable messaging planes (wake queue / steering inbox / turn-end) ---
+
+test("notifyOwner=real enqueues a durable wake and rings only the constant doorbell", async () => {
+  const host = ownerHost({ notifyOwner: "real" });
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRoutedHost(host, () => ({ code: 0 }));
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    const emitted = await emitIdle(host, "DONE: shipped the branch");
+    assert.deepEqual(emitted.errors, []);
+    const wakeCmd = seen.find((c) => c.includes("fm_wake_append signal") && c.includes("c1.status"));
+    assert.ok(wakeCmd, `no durable wake enqueue in:\n${seen.join("\n---\n")}`);
+    const sends = sendCalls(host);
+    assert.equal(sends.length, 1);
+    assert.equal(sends[0]?.threadId, "thr_cap");
+    assert.match(sends[0]?.text ?? "", /bb firstmate wake/);
+    // The full report is NOT sent to chat when durable — only the constant doorbell.
+    assert.doesNotMatch(sends[0]?.text ?? "", /DONE: shipped the branch/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("notifyOwner=kv (default) sends the full report and enqueues no wake", async () => {
+  const host = ownerHost();
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRoutedHost(host, () => ({ code: 0 }));
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await emitIdle(host, "DONE: shipped the branch");
+    assert.ok(!seen.some((c) => c.includes("fm_wake_append")), "kv default must not enqueue a wake");
+    const sends = sendCalls(host);
+    assert.equal(sends.length, 1);
+    assert.match(sends[0]?.text ?? "", /DONE: shipped the branch/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("tellOwner=real routes a steer through the durable fm-send inbox, not a bare doorbell", async () => {
+  const host = ownerHost({ tellOwner: "real" });
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRoutedHost(host, () => ({ code: 0 }));
+    await seedCrew(host);
+    const res = await host.harness.behavior.runCli(["tell", "c1", "--", "please rebase on main"], { projectId: "proj_1" });
+    assert.equal(res.exitCode, 0, res.stderr);
+    const sendCmd = seen.find((c) => c.includes("bin/fm-send.sh") && c.includes("fm-c1"));
+    assert.ok(sendCmd, `no fm-send inbox route in:\n${seen.join("\n---\n")}`);
+    assert.match(res.stdout, /durable steering inbox/);
+    // No bare threads.send doorbell when the durable inbox owns delivery.
+    assert.equal(sendCalls(host).length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("tellOwner=real surfaces an fm-send unresolved-target refusal (no silent fallback)", async () => {
+  const host = ownerHost({ tellOwner: "real" });
+  await plugin(host.bb);
+  try {
+    stubRoutedHost(host, (cmd) =>
+      cmd.includes("bin/fm-send.sh")
+        ? { code: 1, payload: "error: target 'fm-c1' is not resolvable" }
+        : { code: 0 },
+    );
+    await seedCrew(host);
+    const res = await host.harness.behavior.runCli(["tell", "c1", "--", "please rebase"], { projectId: "proj_1" });
+    assert.notEqual(res.exitCode, 0);
+    assert.match(res.stderr + res.stdout, /fm-send refused/);
+    // Refusal must NOT fall back to a bare doorbell.
+    assert.equal(sendCalls(host).length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("turnEndGuard=re-ring re-rings the captain once when wakes are undrained; budget increments", async () => {
+  const host = ownerHost({ turnEndGuard: "re-ring" });
+  await plugin(host.bb);
+  try {
+    stubRoutedHost(host, (cmd) => (cmd.includes(".wake-queue") ? { code: 0, payload: "FMWAKES=2" } : { code: 0 }));
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
+    const emitted = await host.harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: "thr_cap", status: "idle", projectId: "proj_1" }),
+      lastAssistantText: "all done for now",
+    });
+    assert.deepEqual(emitted.errors, []);
+    const sends = sendCalls(host);
+    const ring = sends.find((s) => s.threadId === "thr_cap" && /turn-end backstop/.test(s.text));
+    assert.ok(ring, `no turn-end re-ring in ${JSON.stringify(sends)}`);
+    assert.equal(ring?.mode, "steer");
+    assert.equal(await host.bb.storage.kv.get("turnend-budget:thr_cap"), 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("turnEndGuard=re-ring stays quiet and resets budget when the wake queue is empty", async () => {
+  const host = ownerHost({ turnEndGuard: "re-ring" });
+  await plugin(host.bb);
+  try {
+    stubRoutedHost(host, (cmd) => (cmd.includes(".wake-queue") ? { code: 0, payload: "FMWAKES=0" } : { code: 0 }));
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
+    await host.bb.storage.kv.set("turnend-budget:thr_cap", 2);
+    const emitted = await host.harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: "thr_cap", status: "idle", projectId: "proj_1" }),
+      lastAssistantText: "all done",
+    });
+    assert.deepEqual(emitted.errors, []);
+    assert.ok(!sendCalls(host).some((s) => /turn-end backstop/.test(s.text)), "no re-ring when queue empty");
+    assert.equal(await host.bb.storage.kv.get("turnend-budget:thr_cap"), 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("firstmate_wake CLI drains the real wake queue and passes ack args through", async () => {
+  const host = ownerHost({ notifyOwner: "real" });
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRoutedHost(host, (cmd) =>
+      cmd.includes("fm-wake-drain.sh") ? { code: 0, payload: "UNREAD STATUS\nc1: ready for review" } : { code: 0 },
+    );
+    const present = await host.harness.behavior.runCli(["wake"], { projectId: "proj_1" });
+    assert.equal(present.exitCode, 0, present.stderr);
+    assert.match(present.stdout, /UNREAD STATUS/);
+    const acked = await host.harness.behavior.runCli(
+      ["wake", "--ack-through", "7", "--recovery-generation", "gen-1"],
+      { projectId: "proj_1" },
+    );
+    assert.equal(acked.exitCode, 0, acked.stderr);
+    const ackCmd = seen.find((c) => c.includes("fm-wake-drain.sh") && c.includes("--ack-through") && c.includes("gen-1"));
+    assert.ok(ackCmd, `no ack drain command in:\n${seen.join("\n---\n")}`);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("tellOwner=real doorbells an idle BB crew directly while still writing the durable record", async () => {
+  const host = ownerHost({ tellOwner: "real" });
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRoutedHost(host, () => ({ code: 0 }));
+    // fm-send won't type into an idle (non-running) BB agent, so server.ts must
+    // guarantee the doorbell — identical delivery to the KV path, plus a durable record.
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: null }));
+    await seedCrew(host);
+    const res = await host.harness.behavior.runCli(["tell", "c1", "--", "please rebase now"], { projectId: "proj_1" });
+    assert.equal(res.exitCode, 0, res.stderr);
+    assert.ok(seen.some((c) => c.includes("bin/fm-send.sh") && c.includes("fm-c1")), "durable fm-send record still written");
+    const sends = sendCalls(host);
+    assert.equal(sends.length, 1, "exactly one doorbell for an idle crew");
+    assert.equal(sends[0]?.threadId, "thr_crew");
+    assert.equal(sends[0]?.mode, "queue-if-active");
+    assert.match(sends[0]?.text ?? "", /please rebase now/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
