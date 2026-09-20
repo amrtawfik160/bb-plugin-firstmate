@@ -56,6 +56,12 @@ const crewSchema = z.object({
   // not reap it; undefined = legacy/native-recovered crew (real plane owns its
   // meta), reapable as before.
   metaWritten: z.boolean().optional(),
+  // F2: true = this crew was dispatched through the real transport and owns a
+  // native backlog row keyed on its crew id (created backlog-first, started by
+  // fm-spawn). The row is ownership, so its terminal close (done on land, rm on
+  // forget) is gated on THIS recorded fact — not on live settings, which may flip
+  // to native/kv mid-flight and would otherwise strand the row in_flight forever.
+  backlogRow: z.boolean().optional(),
   createdAt: z.string(),
 });
 type Crew = z.infer<typeof crewSchema>;
@@ -455,6 +461,18 @@ export function normalizeCaptainIntent(task: string): string {
     out.push(m[1] + rest); // inline label: keep the words (and original indentation)
   }
   return out.join("\n");
+}
+
+// Derive the backlog row title for a crew from its task text. Native fm-spawn is
+// backlog-first (every dispatched task must own a `data/backlog.md` row before a
+// worker exists), so real-transport dispatch adds the row with `add <id> <title>
+// --kind <shape>` before spawning. The title is the task's first non-empty line
+// with any leading Captain-label stripped (normalizeCaptainIntent), capped so a
+// long brief never bloats the one-line backlog entry.
+export function backlogTitleOf(task: string): string {
+  const intent = normalizeCaptainIntent(task.trim());
+  const firstLine = (intent.split(/\r?\n/).find((l) => l.trim() !== "") ?? "").trim();
+  return (firstLine === "" ? "crew task" : firstLine).slice(0, 200);
 }
 
 // B2 (D9): native wake-drain instructs the captain to run the drain at SIX printf
@@ -1847,15 +1865,54 @@ export default async function plugin(bb: BbPluginApi) {
     // A crew may already carry a real thread (idempotent re-dispatch). Never spawn twice.
     const existing = await readFmMetaField(hostId, crew.id, "bb_thread_id");
     if (existing !== null && existing !== "") return existing;
+    // C1: native fm-spawn.sh is BACKLOG-FIRST — it refuses a task with no
+    // `data/backlog.md` row ("task <id> has no backlog item in this home, so
+    // dispatching it would leave a worker no record owns"), because the row is what
+    // owns the worker. Creating and owning that row is the queue plane's job, so
+    // real transport REQUIRES queueOwner=real: only then can the plugin add the row
+    // before spawning and drive its done/rm on land/forget. Without it the two
+    // planes disagree and every real spawn would refuse. Fall back to native (which
+    // needs no backlog row) with a clear, actionable log rather than failing
+    // obscurely at the fm-spawn gate.
+    if (!(await queueIsReal())) {
+      bb.log.error(
+        `real transport requires queueOwner=real: native fm-spawn.sh refuses to dispatch a task with no backlog record, and only queueOwner=real lets the plugin create+own that row (add <id> --kind <shape>, then done/rm on land/forget). queueOwner is currently kv — set queueOwner=real in the Firstmate plugin settings. Falling back to native dispatch for crew=${crew.id}.`,
+      );
+      return null;
+    }
     const projectDir = await projectCheckoutPath(input.projectId);
     if (projectDir === null || projectDir === "") {
       bb.log.warn(`real transport: no project checkout for crew=${crew.id}; falling back to native`);
       return null;
     }
+    // C2: a ship whose delivery mode carries less rigor than the project's native
+    // standing posture makes fm-spawn print an advisory deviation notice. We do NOT
+    // write a plugin-side "intake judgement" onto the brief: any fixed text the
+    // plugin can synthesize is boilerplate that merely attests an instruction
+    // exists (and would be untrue for a mode like local-only, which has no PR). The
+    // honest record is native's own stderr notice, which we leave intact — the
+    // plugin never suppresses it. The mode itself already reconciles with native:
+    // fm-brief records the "Delivery contract: mode=" line and fm-spawn refuses a
+    // mismatch, so brief/spawn/backlog agree on the mode the captain dispatched.
     // Scaffold the authoritative brief first — a ship spawn reads its recorded
     // "Delivery contract: mode=" line and refuses a mismatch, so the brief must
     // exist (with the right mode) before fm-spawn.sh runs.
     await publishFmBrief(crew, hostId, input.task);
+    // C1: create the backlog row (id = crew id, so meta/brief/backlog/thread all
+    // agree) BEFORE spawning. tasks-axi add is idempotent (repeat returns
+    // ok/already), so a retry or a queue-dispatched crew whose row already exists
+    // is a no-op. fm-spawn.sh performs the queued→In-flight start itself once its
+    // endpoint exists; the plugin only seeds the queued row and later closes it.
+    const backlogAdd = await projectQueueAdd(crew.id, backlogTitleOf(input.task), crew.shape, input.projectId);
+    if (!backlogAdd.ok) {
+      // (c) The backlog write failed or tasks-axi is unavailable. Never spawn a
+      // worker no record owns; fall back to native dispatch with a loud, actionable
+      // error. No orphan row: a failed add left nothing to clean up.
+      bb.log.error(
+        `real transport: backlog-first add FAILED for crew=${crew.id} (fm-tasks-axi.sh/tasks-axi unreachable or errored). fm-spawn.sh would refuse a task with no backlog record, so NOT spawning a worker no record owns — falling back to native dispatch. Fix tasks-axi on the fleet host, then re-dispatch.`,
+      );
+      return null;
+    }
     const posture = await postureOf(input.projectId);
     // Pin the harness to the bb backend explicitly. fm-spawn.sh resolves the crew
     // harness from config/crew-harness → fm-harness.sh's own-runtime detection, which
@@ -1909,6 +1966,16 @@ export default async function plugin(bb: BbPluginApi) {
     if (orphan !== null) {
       bb.log.info(`real transport adopted orphan thread ${orphan} for crew=${crew.id} (fm-spawn left no bb_thread_id; spawnFailed=${spawnFailed})`);
       return orphan;
+    }
+    // (c) Genuinely no worker exists. Remove the backlog row we seeded so the
+    // backlog never carries a row no worker owns (the mirror of fm-spawn's own
+    // refusal) before falling back to native. A queue-dispatched crew's row is
+    // owned by the queue plane (its id is a live QueueItem) — that lifecycle drives
+    // its own start/done/rm, so leave it be. rm of an absent row is a harmless warn.
+    const ownedByQueue = (await readQueue()).some((q) => q.id === crew.id);
+    if (!ownedByQueue) {
+      await runTasksAxi(["rm", crew.id], { projectId: input.projectId });
+      bb.log.warn(`real transport: removed orphan backlog row ${crew.id} (spawn produced no thread; falling back to native)`);
     }
     return null;
   }
@@ -2248,6 +2315,10 @@ export default async function plugin(bb: BbPluginApi) {
     projectId: string;
     parentThreadId?: string;
     title?: string;
+    // Optional caller-owned crew id. The queue passes its item id so the crew,
+    // its native backlog row, brief, meta and thread all share ONE id (C1) — no
+    // second backlog row for one piece of work. Omitted → a fresh random id.
+    crewId?: string;
     providerId?: string;
     model?: string;
     reasoningLevel?: ReasoningLevel;
@@ -2301,7 +2372,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
     const crew: Crew = {
-      id: randomUUID().slice(0, 8),
+      id: input.crewId !== undefined && input.crewId !== "" ? input.crewId : randomUUID().slice(0, 8),
       task,
       projectId: input.projectId,
       threadId: "",
@@ -2336,6 +2407,10 @@ export default async function plugin(bb: BbPluginApi) {
         );
         if (realThreadId !== null && realThreadId !== "") {
           crew.threadId = realThreadId;
+          // F2: a returned thread id means the backlog-first add succeeded and
+          // fm-spawn started the row — record that this crew owns a real row so its
+          // close survives a later settings flip.
+          crew.backlogRow = true;
           await writeCrews([crew, ...(await readCrews())]);
           await publishFleet();
           // The real fm-spawn.sh already wrote state/<id>.meta + the brief; the
@@ -2984,6 +3059,8 @@ export default async function plugin(bb: BbPluginApi) {
   async function retireLanded(crew: Crew, outcome: string, pr: string): Promise<void> {
     await recordDone({ task: crew.task.slice(0, 200), shape: crew.shape, crewId: crew.id, outcome, pr });
     await markQueueForCrew(crew.id, "done");
+    // Close the crew's own backlog row (real transport seeds one keyed on crew.id).
+    await realBacklogTransitionForCrew(crew, "done");
     await writeCrews((await readCrews()).filter((c) => c.id !== crew.id));
     if (!(await isCaptainThread(crew.threadId))) {
       try { await bb.sdk.threads.archive({ threadId: crew.threadId }); } catch { /* best effort */ }
@@ -3044,6 +3121,7 @@ export default async function plugin(bb: BbPluginApi) {
         try { await bb.sdk.threads.stop({ threadId: recovered.threadId }); } catch { /* */ }
       }
       await dropFmMeta(recovered);
+      await realBacklogTransitionForCrew(recovered, "rm");
       await dropNudge(id);
       return `Forgot crew ${id} (was metadata-only)`;
     }
@@ -3095,6 +3173,8 @@ export default async function plugin(bb: BbPluginApi) {
     }
     await publishFleet();
     await dropFmMeta(crew);
+    // forget/drop removes the crew's own backlog row (dropped on forget, C1).
+    await realBacklogTransitionForCrew(crew, "rm");
     await dropNudge(id);
     return `Forgot crew ${id}`;
   }
@@ -4210,6 +4290,25 @@ export default async function plugin(bb: BbPluginApi) {
     const res = await runTasksAxi([verb, item.backlogId], { projectId: item.projectId });
     if (res === null || res.exitCode !== 0) {
       bb.log.warn(`real backlog: ${verb} ${item.backlogId} ${res === null ? "unreachable" : `exit=${res.exitCode}`}`);
+    }
+  }
+
+  // C1: close the crew's OWN backlog row (id = crew id) on the terminal events a
+  // crew reaches directly (land → done, forget/drop → rm), mirroring the queue
+  // item lifecycle. F2: gate on whether the crew was DISPATCHED with a real backlog
+  // row (crew.backlogRow, recorded at dispatch) — NOT on live settings. The row is
+  // ownership: a crew dispatched under real transport whose settings later flip to
+  // native/kv must still close its row, or it strands in_flight forever. A crew
+  // that never owned a row (native transport, legacy) is a no-op. Secondmate routes
+  // are not backlog items. Best-effort: an already-terminal or absent row just logs
+  // (rm of a missing row is harmless). runTasksAxi still needs fmHome+host; if
+  // unreachable it logs and the row is closed on the next reconcile.
+  async function realBacklogTransitionForCrew(crew: Crew, verb: "done" | "rm"): Promise<void> {
+    if (isSecondmateRoute(crew)) return;
+    if (crew.backlogRow !== true) return;
+    const res = await runTasksAxi([verb, crew.id], { projectId: crew.projectId });
+    if (res === null || res.exitCode !== 0) {
+      bb.log.warn(`real backlog: crew ${verb} ${crew.id} ${res === null ? "unreachable" : `exit=${res.exitCode}`}`);
     }
   }
 
@@ -5345,6 +5444,7 @@ export default async function plugin(bb: BbPluginApi) {
         projectId: item.projectId,
         parentThreadId: ctxString(ctx, "threadId"),
         title: `Crew: ${truncate(item.title, 60)}`,
+        crewId: item.id,
         worktree: resolveWorktree({ shape: item.shape }).worktree,
         visible: true,
         shape: item.shape,
@@ -5352,7 +5452,11 @@ export default async function plugin(bb: BbPluginApi) {
       });
       item.status = "dispatched";
       item.crewId = crew.id;
-      await projectQueueTransition(item, "start");
+      // Real transport spawns through fm-spawn.sh, which performs the queued→In-flight
+      // start itself (it owns the crew.id row once its endpoint exists). Starting again
+      // here would double-transition, so only start when the plugin owns the transition
+      // (native transport, or real fell back to native).
+      if ((await settings.get()).transport !== "real") await projectQueueTransition(item, "start");
       await writeQueue(items);
       await publishFleet();
       return `Dispatched queue ${queueId} as ${crew.shape} crew ${crew.id}`;
@@ -6384,6 +6488,7 @@ export default async function plugin(bb: BbPluginApi) {
                 projectId: item.projectId,
                 parentThreadId: ctxThread,
                 title: `Crew: ${truncate(item.title, 60)}`,
+                crewId: item.id,
                 providerId: flagStr(flags, "provider") ?? (current.defaultProvider !== "" ? current.defaultProvider : undefined),
                 model: flagStr(flags, "model"),
                 reasoningLevel: toReasoningLevel(flagStr(flags, "reasoning-level")),
@@ -6395,7 +6500,9 @@ export default async function plugin(bb: BbPluginApi) {
               });
               item.status = "dispatched";
               item.crewId = crew.id;
-              await projectQueueTransition(item, "start");
+              // fm-spawn.sh performs the queued→In-flight start itself for real-transport
+              // dispatches; only start here when the plugin owns the transition.
+              if (current.transport !== "real") await projectQueueTransition(item, "start");
               await writeQueue(items);
               return reply({ ...crew, status: await crewStatus(crew), queueId: qid }, `Dispatched queue ${qid} as ${crew.shape} crew ${crew.id}`);
             }
