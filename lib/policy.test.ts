@@ -5,13 +5,17 @@ import {
   capPermission,
   crewPrompt,
   decisionDue,
+  foldOpenDecisions,
   hasStatusProtocol,
+  latestStatus,
   looksReadOnly,
   mergeGate,
   parseOutcome,
   queueGate,
   quietShouldSend,
   resolveWorktree,
+  statusLinesFrom,
+  statusProtocolSummary,
   toReasoningLevel,
 } from "./policy.ts";
 
@@ -192,4 +196,63 @@ test("crew prompt asserts isolation and forbids nested dispatch", () => {
 test("looksReadOnly hints scout", () => {
   assert.equal(looksReadOnly("audit checkout latency"), true);
   assert.equal(looksReadOnly("fix flaky login test"), false);
+});
+
+// ── Full status protocol fold (mirrors fm-classify-lib.sh) ────────────────────
+
+test("foldOpenDecisions matches fm-classify-lib: keyed open/close, corr, reserved keys", () => {
+  const stream = [
+    "working: starting",
+    "needs-decision [key=api-shape]: rename or keep?",
+    "working: still going",
+    "needs-decision: [key=db] pick postgres or sqlite",
+    "blocked corr=0123456789abcdef [key=creds]: need token",
+    "done: finished",
+    "resolved [key=db] we chose sqlite", // note-head/no-colon closer for db
+    "needs-decision: bare default question",
+    "paused: waiting",
+    "needs-decision [key=bad slug]: malformed slug is skipped",
+    "blocked [key=pending-reply-7]: hijack attempt", // reserved key, wrong vocab -> ignored
+    "blocked [key=pending-reply-8]: pending-reply-8: real owner note", // reserved, own vocab -> opens
+  ];
+  const open = foldOpenDecisions(stream);
+  assert.deepEqual(open, [
+    { key: "api-shape", verb: "needs-decision", note: "rename or keep?" },
+    { key: "creds", verb: "blocked", note: "need token" },
+    { key: "default", verb: "needs-decision", note: "bare default question" },
+    { key: "pending-reply-8", verb: "blocked", note: "pending-reply-8: real owner note" },
+  ]);
+});
+
+test("a later done/working never masks a still-open needs-decision", () => {
+  const open = foldOpenDecisions([
+    "needs-decision [key=x]: pick one",
+    "working: kept going",
+    "done: shipped part",
+  ]);
+  assert.deepEqual(open, [{ key: "x", verb: "needs-decision", note: "pick one" }]);
+});
+
+test("a bare resolved closes a bare needs-decision (default key)", () => {
+  assert.deepEqual(foldOpenDecisions(["needs-decision: hmm", "resolved: done"]), []);
+});
+
+test("latestStatus returns the last recognized verb, ignoring prose", () => {
+  assert.deepEqual(latestStatus(["working: a", "just chatting here", "paused: waiting on CI"]), {
+    verb: "paused",
+    note: "waiting on CI",
+  });
+  assert.equal(latestStatus(["no status at all", "still prose"]), null);
+});
+
+test("statusLinesFrom pulls only protocol lines out of chat output", () => {
+  const lines = statusLinesFrom("Some narration.\nworking: building\nmore prose\nDONE: shipped");
+  assert.deepEqual(lines, ["working: building", "DONE: shipped"]);
+});
+
+test("statusProtocolSummary reports state and open decisions, null when absent", () => {
+  const summary = statusProtocolSummary(["needs-decision [key=k]: choose", "working: meanwhile"]);
+  assert.match(summary!, /state: working/);
+  assert.match(summary!, /open needs-decision \[k\]: choose/);
+  assert.equal(statusProtocolSummary(["nothing to see"]), null);
 });

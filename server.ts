@@ -13,12 +13,16 @@ import {
   decisionDue,
   hasStatusProtocol,
   looksReadOnly,
+  foldOpenDecisions,
+  latestStatus,
   mergeGate,
   parseOutcome,
   protocolNudgeText,
   queueGate,
   quietShouldSend,
   resolveWorktree,
+  statusLinesFrom,
+  statusProtocolSummary,
   toMode,
   toPermissionMode,
   toReasoningLevel,
@@ -440,6 +444,7 @@ const CAPTAIN_TOOLS = [
   "firstmate_secondmate",
   "firstmate_posture",
   "firstmate_supervision",
+  "firstmate_migrate_state",
   "firstmate_fm",
 ] as const;
 
@@ -470,6 +475,7 @@ export function formatFmMeta(input: {
   mode?: string;
   yolo?: "on" | "off";
   model?: string;
+  provider?: string;
   effort?: string;
   spawnGen?: string;
 }): string {
@@ -491,6 +497,7 @@ export function formatFmMeta(input: {
   }
   lines.push(`tasktmp=/tmp/fm-${input.id}`);
   lines.push(`model=${input.model ?? "default"}`);
+  if (input.provider !== undefined && input.provider !== "") lines.push(`provider=${input.provider}`);
   lines.push(`effort=${input.effort !== undefined && input.effort !== "" ? input.effort : "default"}`);
   lines.push(`spawn_gen=${spawnGen}`);
   lines.push("backend=bb");
@@ -543,6 +550,11 @@ export default async function plugin(bb: BbPluginApi) {
       label: "Computed count of .agents/skills dirs at fmHome (set by init --real).",
       default: "",
     },
+    captainContract: {
+      type: "string",
+      label: "Captain-contract excerpt from fmHome/AGENTS.md, injected into captain sessions (set by init --real).",
+      default: "",
+    },
     defaultProvider: {
       type: "string",
       label: "Default crew provider id (blank = BB resolves)",
@@ -585,6 +597,37 @@ export default async function plugin(bb: BbPluginApi) {
       default: 60,
     },
   });
+
+  // The real captain contract (fmHome/AGENTS.md excerpt), cached so the sync
+  // agents.configure() callback can inject it. Loaded from the persisted setting
+  // at start and refreshed by initRealMode. Empty until real mode is initialized.
+  let captainContractCache = "";
+  try {
+    captainContractCache = (await settings.get()).captainContract;
+  } catch {
+    // default empty
+  }
+  const CAPTAIN_CONTRACT_MAX = 3400;
+
+  // Read fmHome/AGENTS.md on the host, keep a bounded excerpt, and cache+persist
+  // it so captain sessions load the real contract. Best-effort.
+  async function refreshCaptainContract(hostId: string, fmHome: string, signal?: AbortSignal): Promise<void> {
+    try {
+      const path = `${fmHome}/AGENTS.md`;
+      const res = await runOnHost(hostId, `[ -f ${shQuote(path)} ] && head -c 20000 ${shQuote(path)} || true`, 20_000, signal);
+      const raw = res.output.trim();
+      if (raw === "") return;
+      const excerpt = raw.length > CAPTAIN_CONTRACT_MAX ? `${raw.slice(0, CAPTAIN_CONTRACT_MAX)}…` : raw;
+      captainContractCache = excerpt;
+      try {
+        await settings.experimental_set({ captainContract: excerpt });
+      } catch {
+        // cache still holds it for this process
+      }
+    } catch {
+      // best-effort; captain keeps the built-in instruction
+    }
+  }
 
   async function readList<T>(key: string, schema: z.ZodType<T>, cap: number): Promise<T[]> {
     const raw = await bb.storage.kv.get<unknown>(key);
@@ -814,6 +857,63 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  // A crew's append-only status stream, folded by the full protocol. When real
+  // mode is active the authoritative source is the on-host state/<id>.status file
+  // the worker appends to; otherwise (native path, or an unreachable host) fall
+  // back to the status-protocol lines the crew emitted in its BB chat output.
+  async function crewStatusLines(crew: Crew, output?: string | null): Promise<string[]> {
+    const fmHome = (await settings.get()).fmHome.trim();
+    if (fmHome !== "" && !isSecondmateRoute(crew)) {
+      try {
+        const hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
+        const path = `${fmHome}/state/${crew.id}.status`;
+        const res = await runOnHost(hostId, `[ -f ${shQuote(path)} ] && cat -- ${shQuote(path)} || true`, 15_000);
+        if (res.exitCode === 0 && res.output.trim() !== "") return res.output.split(/\r?\n/);
+      } catch {
+        // fall through to chat output
+      }
+    }
+    return statusLinesFrom(output === undefined ? await crewOutput(crew) : output);
+  }
+
+  // Close a crew's open keyed decision when the captain answers it. Native
+  // firstmate writes the closing `resolved [key=...]` line via `fm send
+  // --resolve-key`; the BB plugin's steer is a plain thread message, so without
+  // this the on-host state/<id>.status keeps the decision open forever (and
+  // `crew <id>` reads it as stale). Best-effort, real-mode only; a bad key or an
+  // unreachable host is a silent no-op — the steer message itself still lands.
+  async function appendResolvedStatus(crew: Crew, key: string, note: string): Promise<boolean> {
+    const fmHome = (await settings.get()).fmHome.trim();
+    if (fmHome === "") return false;
+    if (isSecondmateRoute(crew)) return false;
+    if (!/^[A-Za-z0-9._-]+$/.test(key)) return false; // fm-classify-lib slug charset
+    let hostId: string;
+    try {
+      hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
+    } catch {
+      return false;
+    }
+    const path = `${fmHome}/state/${crew.id}.status`;
+    // Matches fm-classify-lib grammar: `resolved [key=<slug>]: <note>`.
+    const line = `resolved [key=${key}]: ${note.replace(/[\r\n]+/g, " ").trim().slice(0, 200)}`;
+    const script = [
+      `mkdir -p ${shQuote(`${fmHome}/state`)}`,
+      `printf '%s\\n' ${shQuote(line)} >> ${shQuote(path)}`,
+    ].join("\n");
+    try {
+      const res = await runOnHost(hostId, script, 15_000);
+      if (res.exitCode !== 0) {
+        bb.log.warn(`fm resolve append failed crew=${crew.id} key=${key} exit=${res.exitCode}`);
+        return false;
+      }
+      bb.log.info(`fm decision resolved crew=${crew.id} key=${key}`);
+      return true;
+    } catch (error) {
+      bb.log.warn(`fm resolve append failed crew=${crew.id} key=${key} ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  }
+
   async function waitThreadPath(threadId: string, timeoutMs: number): Promise<string | null> {
     if (timeoutMs <= 0) return null;
     const deadline = Date.now() + timeoutMs;
@@ -856,6 +956,7 @@ export default async function plugin(bb: BbPluginApi) {
     hostId?: string;
     scheduled: boolean;
     model?: string;
+    provider?: string;
   }): Promise<boolean> {
     const fmHome = (await settings.get()).fmHome.trim();
     if (fmHome === "") return false;
@@ -884,6 +985,7 @@ export default async function plugin(bb: BbPluginApi) {
       mode: input.crew.shape === "ship" ? input.crew.posture : undefined,
       yolo: input.crew.shape === "ship" ? (posture.yolo ? "on" : "off") : undefined,
       model: input.model ?? input.crew.model ?? undefined,
+      provider: input.provider ?? input.crew.providerId ?? undefined,
       effort: input.crew.reasoningLevel ?? undefined,
     });
     const stateDir = `${fmHome}/state`;
@@ -913,6 +1015,60 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  // Scaffold the authoritative structured brief (data/<id>/brief.md) via the real
+  // fm-brief.sh, then fill its {TASK}/{FIRSTMATE_SPEC} placeholders so real tools
+  // (fm-bearings-snapshot, teardown, a manual `fm` relaunch) see a Captain-intent /
+  // Firstmate-spec brief for a BB-dispatched crew, not just a synthetic prompt.
+  // Best-effort and idempotent (never overwrites an existing brief); a missing
+  // script or host failure is silent — the crew already has the structured prompt.
+  async function publishFmBrief(crew: Crew, hostId: string | undefined, task: string): Promise<boolean> {
+    const fmHome = (await settings.get()).fmHome.trim();
+    if (fmHome === "") return false;
+    if (isSecondmateRoute(crew)) return false;
+    let host = hostId;
+    if (host === undefined || host === "") {
+      try {
+        host = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
+      } catch {
+        return false;
+      }
+    }
+    const brief = `${fmHome}/data/${crew.id}/brief.md`;
+    const briefScript = `${fmHome}/bin/fm-brief.sh`;
+    const intentB64 = Buffer.from(task.trim().slice(0, 3000), "utf8").toString("base64");
+    // fm-brief refuses --mode on scouts and requires it on ships; a ship's posture
+    // is exactly the delivery mode the brief records.
+    const scaffold =
+      crew.shape === "scout"
+        ? `${shQuote(briefScript)} ${shQuote(crew.id)} crew --scout`
+        : `${shQuote(briefScript)} ${shQuote(crew.id)} crew --mode ${shQuote(crew.posture)}`;
+    const py =
+      "import base64,os,sys;p=sys.argv[1];" +
+      'intent=base64.b64decode(os.environ["FM_INTENT"]).decode();' +
+      'spec="Implement the captain\'s intent above exactly; do not widen scope. Small diff, own branch, deliver per the mode contract, then report DONE/BLOCKED/FAILED.";' +
+      "s=open(p).read();s=s.replace('{TASK}',intent).replace('{FIRSTMATE_SPEC}',spec);open(p,'w').write(s)";
+    const script = [
+      `export FM_HOME=${shQuote(fmHome)}`,
+      `export FM_ROOT=${shQuote(fmHome)}`,
+      `[ -f ${shQuote(briefScript)} ] || exit 0`,
+      `[ -f ${shQuote(brief)} ] && exit 0`,
+      `${scaffold} >/dev/null 2>&1 || exit 0`,
+      `FM_INTENT=${intentB64} python3 -c ${shQuote(py)} ${shQuote(brief)} || exit 0`,
+    ].join("\n");
+    try {
+      const res = await runOnHost(host, script, 30_000);
+      if (res.exitCode !== 0) {
+        bb.log.warn(`fm brief scaffold failed crew=${crew.id} exit=${res.exitCode}`);
+        return false;
+      }
+      bb.log.info(`fm brief scaffolded crew=${crew.id} path=${brief}`);
+      return true;
+    } catch (error) {
+      bb.log.warn(`fm brief scaffold failed crew=${crew.id} ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  }
+
   async function dropFmMeta(crew: Crew): Promise<void> {
     const fmHome = (await settings.get()).fmHome.trim();
     if (fmHome === "") return;
@@ -933,6 +1089,97 @@ export default async function plugin(bb: BbPluginApi) {
         `fm meta drop failed crew=${crew.id} ${error instanceof Error ? error.message : String(error)}`,
       );
     }
+  }
+
+  // True when a crew already has an authoritative state/<id>.meta on its host.
+  // Used by the migration so it never overwrites the real state of active work.
+  async function fmMetaExists(crew: Crew): Promise<boolean | null> {
+    const fmHome = (await settings.get()).fmHome.trim();
+    if (fmHome === "") return null;
+    let hostId: string;
+    try {
+      hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
+    } catch {
+      return null;
+    }
+    const dest = `${fmHome}/state/${crew.id}.meta`;
+    try {
+      const res = await runOnHost(hostId, `[ -f ${shQuote(dest)} ] && echo FM_META_EXISTS || echo FM_META_ABSENT`, 15_000);
+      if (res.output.includes("FM_META_EXISTS")) return true;
+      if (res.output.includes("FM_META_ABSENT")) return false;
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  // A crew is terminal — its task is over — when its turn failed, its thread is
+  // gone/archived, or its last words / status carry a DONE/FAILED verdict.
+  // migrate-state skips these so backfilling a meta cannot make the real watcher
+  // (which iterates state/*.meta and supervises each) try to resurrect dead work.
+  async function crewIsTerminal(crew: Crew): Promise<boolean> {
+    const status = await crewStatus(crew);
+    if (status === "unknown" || status === "error") return true; // thread gone/failed
+    const output = await crewOutput(crew);
+    const outcome = parseOutcome(output);
+    if (outcome !== null && (outcome.startsWith("DONE") || outcome.startsWith("FAILED"))) return true;
+    const latest = latestStatus(statusLinesFrom(output));
+    return latest !== null && (latest.verb === "done" || latest.verb === "failed");
+  }
+
+  // Idempotently import the KV crew cache into the authoritative real state:
+  // write state/<id>.meta + a structured brief for every tracked, still-active
+  // crew that does not already have one. Existing real state is never overwritten
+  // (active work is left intact) and terminal/dead crews are skipped, so a re-run
+  // is a no-op and the watcher cannot resurrect finished work. KV is left
+  // untouched — it stays the rebuildable cache this only backfills.
+  async function migrateState(): Promise<{
+    total: number;
+    imported: string[];
+    skippedExisting: string[];
+    skippedSecondmate: string[];
+    skippedTerminal: string[];
+    failed: string[];
+  }> {
+    const fmHome = (await settings.get()).fmHome.trim();
+    if (fmHome === "") {
+      throw new Error("Real mode is off (no fmHome). Run: bb firstmate init --real");
+    }
+    const crews = await readCrews();
+    const imported: string[] = [];
+    const skippedExisting: string[] = [];
+    const skippedSecondmate: string[] = [];
+    const skippedTerminal: string[] = [];
+    const failed: string[] = [];
+    for (const crew of crews) {
+      if (isSecondmateRoute(crew)) {
+        skippedSecondmate.push(crew.id);
+        continue;
+      }
+      const exists = await fmMetaExists(crew);
+      if (exists === true) {
+        skippedExisting.push(crew.id);
+        continue;
+      }
+      if (exists === null) {
+        failed.push(crew.id);
+        continue;
+      }
+      if (await crewIsTerminal(crew)) {
+        skippedTerminal.push(crew.id);
+        continue;
+      }
+      // scheduled:true keeps the meta write from blocking on a (possibly gone)
+      // worktree path — a historical crew's meta records identity, not live path.
+      const okMeta = await publishFmMeta({ crew, scheduled: true, model: crew.model ?? undefined, provider: crew.providerId ?? undefined });
+      if (!okMeta) {
+        failed.push(crew.id);
+        continue;
+      }
+      await publishFmBrief(crew, undefined, crew.task);
+      imported.push(crew.id);
+    }
+    return { total: crews.length, imported, skippedExisting, skippedSecondmate, skippedTerminal, failed };
   }
 
   async function parentPermission(parentThreadId: string | undefined): Promise<PermissionMode | undefined> {
@@ -1194,7 +1441,8 @@ export default async function plugin(bb: BbPluginApi) {
     await writeCrews([crew, ...(await readCrews())]);
     await publishFleet();
     const scheduled = input.sendAt !== undefined && input.sendAt > Date.now();
-    await publishFmMeta({ crew, hostId, scheduled, model: input.model });
+    await publishFmMeta({ crew, hostId, scheduled, model: input.model, provider: input.providerId });
+    await publishFmBrief(crew, hostId, input.task);
     return crew;
   }
 
@@ -1399,7 +1647,19 @@ export default async function plugin(bb: BbPluginApi) {
       crews.map(async (crew) => {
         const status = await crewStatus(crew);
         const pr = status === "idle" || status === "error" ? await prForCrew(crew) : prFacts(null);
-        return { ...crew, status, prUrl: pr.url, prSummary: summarizePR({ pullRequest: { url: pr.url, number: pr.number, title: pr.title, state: pr.state, checks: { state: pr.checksState } } }) };
+        // Fold the crew's own status protocol for idle crews: an idle crew that
+        // emitted needs-decision/blocked is a captain call, not a review-ready
+        // ship. Chat output only (no host read) keeps the deck render cheap —
+        // but chat transcripts never carry the resolved/captain-held closes (those
+        // land in the on-host state/<id>.status), so a crew that raised a decision,
+        // got answered, and then finished DONE would fold to a stale-open decision.
+        // Guard on the latest verb not being terminal: once a crew's last status is
+        // done/failed the task is over, so any earlier decision is moot here.
+        const lines = status === "idle" && !isSecondmateRoute(crew) ? statusLinesFrom(await crewOutput(crew)) : [];
+        const latest = latestStatus(lines);
+        const openDecisions =
+          latest !== null && latest.verb !== "done" && latest.verb !== "failed" ? foldOpenDecisions(lines) : [];
+        return { ...crew, status, prUrl: pr.url, openDecisions, prSummary: summarizePR({ pullRequest: { url: pr.url, number: pr.number, title: pr.title, state: pr.state, checks: { state: pr.checksState } } }) };
       }),
     );
     const now = Date.now();
@@ -1421,7 +1681,13 @@ export default async function plugin(bb: BbPluginApi) {
         .filter((row) => row.status === "error")
         .map((row) => `! ${formatCrew(row, row.status)} — NEEDS DECISION: turn failed (retry? tell? forget?)`),
       ...rows
-        .filter((row) => row.status === "idle" && row.prUrl !== "")
+        .filter((row) => row.status === "idle" && row.openDecisions.length > 0)
+        .map((row) => {
+          const d = row.openDecisions[row.openDecisions.length - 1]!;
+          return `? ${row.id} — ${d.verb.toUpperCase()} [${d.key}]: ${truncate(d.note, 80)} — steer: bb firstmate tell ${row.id} -- "<answer>"`;
+        }),
+      ...rows
+        .filter((row) => row.status === "idle" && row.openDecisions.length === 0 && row.prUrl !== "")
         .map(
           (row) =>
             `PR ready ${row.id}: ${row.prUrl} — merge: bb firstmate merge ${row.id} --yes`,
@@ -1434,7 +1700,7 @@ export default async function plugin(bb: BbPluginApi) {
       (d) =>
         `✓ ${truncate(d.task.split("\n")[0] ?? d.task, 80)}${d.pr !== "" ? ` — ${d.pr}` : ""}${d.outcome !== "" ? ` (${truncate(d.outcome, 60)})` : ""}`,
     );
-    const readyRows = rows.filter((row) => row.status === "idle");
+    const readyRows = rows.filter((row) => row.status === "idle" && row.openDecisions.length === 0);
     const ready = readyRows.map((row) => {
       const pr = row.prUrl !== "" ? ` ${row.prUrl}` : "";
       return `• ${formatCrew(row, row.status)}${pr} — ready to review (crew/deliver)`;
@@ -2026,6 +2292,8 @@ export default async function plugin(bb: BbPluginApi) {
     } catch {
       // persist best-effort
     }
+    // Load the real captain contract (AGENTS.md) so captain sessions run it.
+    await refreshCaptainContract(hostId, path, signal);
     const summary = [
       `host: ${hostId}`,
       `path: ${path} (${existed ? "existed" : "cloned"}; ${ffNote})`,
@@ -2407,13 +2675,23 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.agents.registerTool({
     name: "firstmate_tell",
-    description: "Doorbell a crew: queues if the turn is active, starts a turn if idle. Use firstmate_interrupt to hard-stop.",
-    parameters: z.object({ crewId: z.string(), message: z.string().min(1).max(MAX_TASK) }),
-    async execute({ crewId, message }) {
+    description:
+      "Doorbell a crew: queues if the turn is active, starts a turn if idle. Use firstmate_interrupt to hard-stop. Pass resolveKey to also close that crew's open needs-decision/blocked (writes the resolved line to the real state/<id>.status, matching fm-classify-lib) when this steer is your answer to it.",
+    parameters: z.object({
+      crewId: z.string(),
+      message: z.string().min(1).max(MAX_TASK),
+      resolveKey: z.string().optional().describe("Key of the crew's open decision this steer answers (from crew/bearings); closes it in real state"),
+    }),
+    async execute({ crewId, message, resolveKey }) {
       const crew = await findCrew(crewId);
       if (crew === undefined) return toolError(`No crew ${crewId}.`);
       try {
-        return await tellCrew(crew, message, false);
+        const sent = await tellCrew(crew, message, false);
+        if (resolveKey !== undefined && resolveKey.trim() !== "") {
+          const closed = await appendResolvedStatus(crew, resolveKey.trim(), message);
+          return `${sent}${closed ? ` (resolved [key=${resolveKey.trim()}] in real state)` : ""}`;
+        }
+        return sent;
       } catch (error) {
         return toolError(error instanceof Error ? error.message : "Tell failed.");
       }
@@ -2553,7 +2831,8 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.agents.registerTool({
     name: "firstmate_crew",
-    description: "Show one crew: status, parsed DONE/BLOCKED/FAILED, last output.",
+    description:
+      "Show one crew: thread status, folded status protocol (state + open needs-decision/blocked), parsed DONE/BLOCKED/FAILED, last output.",
     parameters: z.object({ crewId: z.string() }),
     async execute({ crewId }) {
       const crew = await findCrew(crewId);
@@ -2561,7 +2840,13 @@ export default async function plugin(bb: BbPluginApi) {
       const status = await crewStatus(crew);
       const output = await crewOutput(crew);
       const outcome = parseOutcome(output);
-      return [formatCrew(crew, status), outcome === null ? "" : `outcome: ${outcome}`, output ?? "(no output yet)"]
+      const protocol = statusProtocolSummary(await crewStatusLines(crew, output));
+      return [
+        formatCrew(crew, status),
+        protocol ?? "",
+        outcome === null ? "" : `outcome: ${outcome}`,
+        output ?? "(no output yet)",
+      ]
         .filter((l) => l !== "")
         .join("\n");
     },
@@ -2968,6 +3253,27 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.agents.registerTool({
+    name: "firstmate_migrate_state",
+    description:
+      "Import the KV crew cache into the authoritative real firstmate state (state/<id>.meta + structured brief). Idempotent; never overwrites existing real state, never touches KV. Requires init --real.",
+    parameters: z.object({}),
+    async execute() {
+      try {
+        const r = await migrateState();
+        return [
+          `Migration complete: ${r.imported.length} imported, ${r.skippedExisting.length} already present, ${r.skippedSecondmate.length} secondmate routes skipped, ${r.skippedTerminal.length} terminal skipped, ${r.failed.length} failed (of ${r.total} crews).`,
+          r.imported.length > 0 ? `imported: ${r.imported.join(", ")}` : "",
+          r.failed.length > 0 ? `failed (host/state unreachable): ${r.failed.join(", ")}` : "",
+        ]
+          .filter((l) => l !== "")
+          .join("\n");
+      } catch (error) {
+        return toolError(error instanceof Error ? error.message : "Migration failed.");
+      }
+    },
+  });
+
+  bb.agents.registerTool({
     name: "firstmate_fm",
     description:
       "Run a real firstmate bin/fm-<script>.sh with FM_BACKEND=bb (policy scripts, not a TypeScript port). Requires init --real.",
@@ -3009,12 +3315,19 @@ export default async function plugin(bb: BbPluginApi) {
       };
     }
     const marked = metaFlag(meta, "captain");
+    const base = marked
+      ? "You are the first mate. The user is the captain. Never do crew work in this thread — dispatch with firstmate_dispatch. Parent permission is a ceiling."
+      : "Firstmate crews are available. Run /captain or firstmate_deck to take the deck.";
+    // Load the real firstmate captain contract (AGENTS.md) into marked captain
+    // sessions when real mode is active. Truncated to the SDK's 4096-char ceiling.
+    const instructions =
+      marked && captainContractCache !== ""
+        ? truncate(`${base}\n\n== Real firstmate captain contract (fmHome/AGENTS.md) ==\n${captainContractCache}`, 4096)
+        : base;
     return {
       tools: [...CAPTAIN_TOOLS],
       skills: marked ? [...CAPTAIN_SKILLS] : ["firstmate"],
-      instructions: marked
-        ? "You are the first mate. The user is the captain. Never do crew work in this thread — dispatch with firstmate_dispatch. Parent permission is a ceiling."
-        : "Firstmate crews are available. Run /captain or firstmate_deck to take the deck.",
+      instructions,
     };
   });
 
@@ -3286,7 +3599,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "crews", summary: "List recorded crews with live status", usage: "bb firstmate crews [--json]" },
       { name: "crew", summary: "Show one crew with last output", usage: "bb firstmate crew <crew-id> [--json]" },
       { name: "watch", summary: "Wait for crews via bb thread wait", usage: "bb firstmate watch [crew-id ...] [--timeout <sec>] [--json]" },
-      { name: "tell", summary: "Steer a running crew", usage: 'bb firstmate tell <crew-id> -- "<message>"' },
+      { name: "tell", summary: "Steer a running crew", usage: 'bb firstmate tell <crew-id> [--resolve-key <key>] -- "<message>"' },
       { name: "interrupt", summary: "Steer a hard stop without teardown", usage: "bb firstmate interrupt <crew-id>" },
       { name: "stop", summary: "Stop a crew thread", usage: "bb firstmate stop <crew-id>" },
       { name: "retry", summary: "Re-submit a failed turn, or relaunch with a new model/provider/reasoning", usage: "bb firstmate retry <crew-id> [--model m] [--provider p] [--reasoning-level l]" },
@@ -3304,6 +3617,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "supervision", summary: "Event pings + stuck checker", usage: "bb firstmate supervision on|off|status" },
       { name: "forget", summary: "Drop a crew record", usage: "bb firstmate forget <crew-id> [--stop] [--force]" },
       { name: "mark-crew", summary: "Tag a thread as a firstmate crew (used by the real-mode bb backend)", usage: "bb firstmate mark-crew <thread-id> [--shape ship|scout]" },
+      { name: "migrate-state", summary: "Import the KV crew cache into authoritative real state (idempotent)", usage: "bb firstmate migrate-state [--json]" },
     ],
     async run(argv, ctx) {
       if (argv[0] === "fm") {
@@ -3474,9 +3788,20 @@ export default async function plugin(bb: BbPluginApi) {
             const status = await crewStatus(crew);
             const output = await crewOutput(crew);
             const outcome = parseOutcome(output);
+            const lines = await crewStatusLines(crew, output);
+            const protocol = statusProtocolSummary(lines);
+            const latest = latestStatus(lines);
+            const openDecisions =
+              latest !== null && latest.verb !== "done" && latest.verb !== "failed" ? foldOpenDecisions(lines) : [];
             return reply(
-              { ...crew, status, outcome, output },
-              [formatCrew(crew, status), outcome === null ? "" : `outcome: ${outcome}`, output === null ? "(no output yet)" : "", output ?? ""]
+              { ...crew, status, outcome, protocol, openDecisions, output },
+              [
+                formatCrew(crew, status),
+                protocol ?? "",
+                outcome === null ? "" : `outcome: ${outcome}`,
+                output === null ? "(no output yet)" : "",
+                output ?? "",
+              ]
                 .filter((line) => line !== "")
                 .join("\n"),
             );
@@ -3522,7 +3847,12 @@ export default async function plugin(bb: BbPluginApi) {
             const crew = await findCrew(id);
             if (crew === undefined) return fail(`No crew ${id}. Run "bb firstmate crews".`);
             const text = await tellCrew(crew, message, command === "interrupt");
-            return reply({ told: true, id, interrupt: command === "interrupt" }, text);
+            const resolveKey = command === "tell" ? (flagStr(flags, "resolve-key") ?? "").trim() : "";
+            const resolved = resolveKey !== "" ? await appendResolvedStatus(crew, resolveKey, message) : false;
+            return reply(
+              { told: true, id, interrupt: command === "interrupt", resolved: resolved ? resolveKey : null },
+              resolved ? `${text} (resolved [key=${resolveKey}] in real state)` : text,
+            );
           }
           case "stop": {
             const id = rest[0];
@@ -3933,6 +4263,17 @@ export default async function plugin(bb: BbPluginApi) {
             if (id === undefined) return fail(usage);
             const text = await forgetCrew(id, flags.has("stop"), flags.has("force"));
             return reply({ forgotten: true, id }, text);
+          }
+          case "migrate-state": {
+            const r = await migrateState();
+            const text = [
+              `Migration complete: ${r.imported.length} imported, ${r.skippedExisting.length} already present, ${r.skippedSecondmate.length} secondmate routes skipped, ${r.skippedTerminal.length} terminal skipped, ${r.failed.length} failed (of ${r.total} crews).`,
+              r.imported.length > 0 ? `imported: ${r.imported.join(", ")}` : "",
+              r.failed.length > 0 ? `failed (host/state unreachable): ${r.failed.join(", ")}` : "",
+            ]
+              .filter((l) => l !== "")
+              .join("\n");
+            return reply({ ...r }, text);
           }
           default:
             return fail(usage);
