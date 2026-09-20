@@ -501,6 +501,22 @@ function threadIdOf(value: unknown): string {
   throw new Error("spawn returned no thread id");
 }
 
+// Minimum tasks-axi the native backlog lib pins (fm-tasks-axi-lib.sh FM_TASKS_AXI_MIN).
+const TASKS_AXI_MIN = "0.2.4";
+
+/** True when semver `have` >= `min` (numeric x.y.z compare; missing parts = 0). */
+export function versionAtLeast(have: string, min: string): boolean {
+  const parse = (v: string): number[] => v.split(".").map((n) => Number.parseInt(n, 10) || 0);
+  const a = parse(have);
+  const b = parse(min);
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const x = a[i] ?? 0;
+    const y = b[i] ?? 0;
+    if (x !== y) return x > y;
+  }
+  return true;
+}
+
 /** Human phrase for the real toolbelt size — computed counts when known, else neutral. */
 export function toolbeltPhrase(scriptCount: string, skillCount: string): string {
   const scripts = /^\d+$/.test(scriptCount) && scriptCount !== "0" ? `${scriptCount} bin/fm-*.sh scripts` : "the full bin/fm-*.sh toolbelt";
@@ -1845,33 +1861,42 @@ export default async function plugin(bb: BbPluginApi) {
     const mates = await readSecondmates();
     const mate = pickSecondmate(mates, input.projectId, task);
     if (mate !== undefined && mate.threadId !== input.parentThreadId) {
-      await bb.sdk.threads.send({
-        threadId: mate.threadId,
-        mode: "auto",
-        input: [
-          {
-            type: "text",
-            text: `Routed work from main captain.\nShape: ${input.shape}\nMode: ${input.mode}\n\n${task}\n\nDispatch a crew for this. Reply with the crew id when underway.`,
-            mentions: [],
-          },
-        ],
-      });
-      const routed: Crew = {
-        id: `sm-${randomUUID().slice(0, 6)}`,
-        task: `[secondmate ${mate.threadId}] ${task}`,
-        projectId: input.projectId,
-        threadId: mate.threadId,
-        parentThreadId: input.parentThreadId ?? null,
-        providerId: null,
-        model: null,
-        reasoningLevel: null,
-        worktree: false,
-        shape: input.shape,
-        posture: `secondmate:${input.mode}`,
-        createdAt: new Date().toISOString(),
-      };
-      await writeCrews([routed, ...(await readCrews())]);
-      return routed;
+      // The mate thread may be dead/archived — if the routing send throws, do NOT
+      // fail the dispatch: log and fall through to a normal native spawn so the
+      // task is never lost. (The captain can re-register a live secondmate later.)
+      try {
+        await bb.sdk.threads.send({
+          threadId: mate.threadId,
+          mode: "auto",
+          input: [
+            {
+              type: "text",
+              text: `Routed work from main captain.\nShape: ${input.shape}\nMode: ${input.mode}\n\n${task}\n\nDispatch a crew for this. Reply with the crew id when underway.`,
+              mentions: [],
+            },
+          ],
+        });
+        const routed: Crew = {
+          id: `sm-${randomUUID().slice(0, 6)}`,
+          task: `[secondmate ${mate.threadId}] ${task}`,
+          projectId: input.projectId,
+          threadId: mate.threadId,
+          parentThreadId: input.parentThreadId ?? null,
+          providerId: null,
+          model: null,
+          reasoningLevel: null,
+          worktree: false,
+          shape: input.shape,
+          posture: `secondmate:${input.mode}`,
+          createdAt: new Date().toISOString(),
+        };
+        await writeCrews([routed, ...(await readCrews())]);
+        return routed;
+      } catch (error) {
+        bb.log.warn(
+          `secondmate route to ${mate.threadId} failed (${error instanceof Error ? error.message : String(error)}); spawning a normal crew instead.`,
+        );
+      }
     }
     const crew: Crew = {
       id: randomUUID().slice(0, 8),
@@ -2769,9 +2794,11 @@ export default async function plugin(bb: BbPluginApi) {
     // degrading — queue-real still degrades safely to the KV cache until it's there.
     const axiPresent = /FM_AXI=\S/.test(tools.output);
     const axiVer = /FM_AXI_VER=v?(\d+\.\d+\.\d+)/.exec(tools.output)?.[1] ?? "";
-    const queueNote = axiPresent
-      ? `tasks-axi present${axiVer !== "" ? ` (v${axiVer}; needs >=0.2.4)` : ""}`
-      : "tasks-axi MISSING — install with 'npm install -g tasks-axi' on this host; queueOwner=real degrades to the KV cache until then";
+    const queueNote = !axiPresent
+      ? "tasks-axi MISSING — install with 'npm install -g tasks-axi' on this host; queueOwner=real degrades to the KV cache until then"
+      : axiVer !== "" && !versionAtLeast(axiVer, TASKS_AXI_MIN)
+        ? `tasks-axi v${axiVer} is BELOW the required ${TASKS_AXI_MIN} — upgrade with 'npm install -g tasks-axi'; queueOwner=real degrades to the KV cache until then`
+        : `tasks-axi present${axiVer !== "" ? ` (v${axiVer}; needs >=${TASKS_AXI_MIN})` : ` (version unknown; needs >=${TASKS_AXI_MIN})`}`;
     const clone = await runOnHost(
       hostId,
       `[ -d ${shQuote(`${path}/.git`)} ] && echo FM_EXISTS || git clone ${shQuote(repo)} ${shQuote(path)}`,
@@ -3215,16 +3242,20 @@ export default async function plugin(bb: BbPluginApi) {
         const line = `- ${date}: ${text.replace(/[\r\n]+/g, " ").trim()} <!--a:${date}-->`;
         const raw = `${cur !== "" ? `${cur}\n` : ""}${line}`;
         const { kept, overflow } = capLearnings(raw);
+        // Only trim the live file to `kept` once the overflow is safely archived.
+        // If the archive write fails we keep the FULL `raw` in the live file so
+        // overflowed (oldest) learnings are never dropped from both files — the
+        // cap re-applies on the next successful add. (No overflow → write raw.)
+        let next = raw;
         if (overflow !== "") {
-          // Rotate oldest lines out to the append-only archive (best-effort; the
-          // live file cap is what matters for the hot working set).
           const arch = await readMemoryFile(MEM_LEARNINGS_ARCHIVE_FILE);
           const archNext = `${arch !== null && arch !== "" ? `${arch}\n` : ""}${overflow}`;
-          if (!(await writeMemoryFile(MEM_LEARNINGS_ARCHIVE_FILE, archNext))) {
-            bb.log.warn("real memory: learnings archive rotate failed; overflow kept in live file");
+          if (await writeMemoryFile(MEM_LEARNINGS_ARCHIVE_FILE, archNext)) {
+            next = kept; // archived → safe to trim the live file
+          } else {
+            bb.log.warn("real memory: learnings archive rotate failed; keeping overflow in the live file (not trimmed)");
           }
         }
-        const next = overflow !== "" ? kept : raw;
         if (await writeMemoryFile(MEM_LEARNINGS_FILE, next)) {
           // KV mirrors the real file (cache/projection), so indexes stay aligned.
           await bb.storage.kv.set(MEM_LEARNINGS_KEY, next.slice(-4000));

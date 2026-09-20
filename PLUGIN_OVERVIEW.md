@@ -161,20 +161,25 @@ and why.
 - **Memory (item 9):** host file writes stream the payload via `runOnHost` stdin
   (`writeHostFile`), removing the `HOST_COMMAND_MAX` ceiling that silently froze
   `learnings.md` past ~7.4 KB. `learnings.md` is capped at ~64 KB with the oldest
-  lines rotated to `data/learnings.archive.md`. Tested with a >10 KB existing file
-  and a >64 KB rotation.
+  lines rotated to `data/learnings.archive.md`. If the archive write fails, the
+  live file is left untrimmed (keeps the full body) so overflow learnings are
+  never dropped — the cap re-applies on the next successful add. Tested with a
+  >10 KB write, a >64 KB rotation, and an archive-write-failure (no loss).
 - **Queue (item 9):** the plugin supplies its own backlog row id
   (`add <id> <title> --kind <shape>`, native convention) and never parses
   `tasks-axi` output — so real backlog rows work regardless of the external tool's
-  output format. `init --real` verifies `tasks-axi` (min 0.2.4) and prints the
-  install command (`npm install -g tasks-axi`) when absent; queue degrades to the
-  KV cache until it is present. (`tasks-axi` is not bundled and was absent on the
-  reference host.)
+  output format. `init --real` verifies `tasks-axi` presence **and** version
+  (>=0.2.4, compared numerically); absent or below-min prints the install/upgrade
+  command (`npm install -g tasks-axi`) and queue degrades to the KV cache until
+  it is satisfied. (`tasks-axi` is not bundled and was absent on the reference
+  host.)
 - **Watch (item 5):** the fm-watch supervisor was proven deterministically in a
   scratch home — a stale/absent beacon triggers relaunch, a fresh beacon suppresses
   it (watcher live), and relaunch backoff (60 s → 30 min cap) with an in-backoff
   no-spawn guard prevents flooding; BB resumes paging whenever the beat goes stale
   (no supervision gap). A full live-thread e2e was intentionally not run to avoid
   touching live fleet state; run it in a dedicated sandbox before enabling live.
-- **Secondmate (item 10):** feasible subset only (scope + clone-list routing);
-  full native home/handoff/inheritance/child-supervision remains OPEN as above.
+- **Secondmate (item 10):** feasible subset only (scope + clone-list routing). A
+  dead/archived mate thread never loses the task — if the routing send throws,
+  dispatch logs and falls back to a normal native spawn. Full native
+  home/handoff/inheritance/child-supervision remains OPEN as above.

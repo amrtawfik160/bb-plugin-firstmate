@@ -89,8 +89,9 @@ They degrade to the current native behavior with a log line.
   `add <id> <title> --kind <shape>`) and never parses `tasks-axi` output, so a row
   can't be mis-targeted or frozen by an unexpected add-output format; start/done/rm
   target the same id. Needs `tasks-axi` on the host (`npm install -g tasks-axi`,
-  min 0.2.4) — `init --real` verifies it and prints the install command if absent
-  (queue then degrades to the KV cache until installed). `decisionsOwner` →
+  min 0.2.4) — `init --real` verifies presence and version and prints the
+  install/upgrade command if absent or below min (queue then degrades to the KV
+  cache until satisfied). `decisionsOwner` →
   captain-held backlog tasks (`fm-captain-hold.sh`), answering also writes the
   `resolved` close to the crew's `state/<id>.status`. `afkOwner` → durable
   `state/.afk-contract` (`fm-afk-contract.sh`) so real merge/watch see the same

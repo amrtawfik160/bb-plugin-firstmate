@@ -8,7 +8,7 @@ import {
   makePluginAgentConfigurationContext,
   makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
-import plugin, { formatFmMeta, formatSecondmate, pickSecondmate, toolbeltPhrase } from "./server.ts";
+import plugin, { formatFmMeta, formatSecondmate, pickSecondmate, toolbeltPhrase, versionAtLeast } from "./server.ts";
 
 const SKILLS = ["captain", "firstmate", "afk", "ahoy", "bearings", "quiet", "stow"] as const;
 
@@ -115,6 +115,35 @@ test("dispatch spawns an isolated ship worktree", async () => {
     assert.equal(args.environment?.hostId, "host_1");
     assert.equal(args.environment?.workspace?.type, "managed-worktree");
     assert.equal(args.visibility, "visible");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("dispatch falls back to a normal spawn when the secondmate thread is dead", async () => {
+  const host = await load();
+  try {
+    host.harness.sdk.stub("threadSections.list", async () => []);
+    host.harness.sdk.stub("threadSections.create", async () => ({ id: "sec_crews" }));
+    host.harness.sdk.stub("environments.list", async () => [
+      { hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" },
+    ]);
+    // A registered secondmate whose thread is dead: the routing send throws.
+    await host.bb.storage.kv.set("secondmates", [
+      { projectId: "proj_1", threadId: "thr_dead", scope: "", projects: [], createdAt: "2026-01-01T00:00:00.000Z" },
+    ]);
+    host.harness.sdk.stub("threads.send", async () => { throw new Error("thread archived"); });
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew" }));
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "starting" }));
+    const result = await host.harness.behavior.runCli(
+      ["dispatch", "--project", "proj_1", "--", "fix flaky login"],
+      { projectId: "proj_1" },
+    );
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /Dispatched ship crew/, "must fall back to a real spawn, not fail");
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 1, "task must be spawned, never lost");
+    const crews = (await host.bb.storage.kv.get("crews")) as Array<{ id: string; posture: string }>;
+    assert.ok(!crews.some((c) => c.id.startsWith("sm-")), "no routed secondmate crew when the send failed");
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -2211,6 +2240,33 @@ test("R-a memory real: learnings cap rotates overflow to the archive, keeps the 
   }
 });
 
+test("R-a memory real: a failed archive write keeps EVERY learning in the live file (no loss)", async () => {
+  // F-rotate: if the overflow can't be archived, the live file must NOT be trimmed
+  // to `kept` — it must retain the full body so oldest learnings are never dropped.
+  const host = ownerHost({ memoryOwner: "real" });
+  await plugin(host.bb);
+  try {
+    const huge = Array.from({ length: 900 }, (_, i) => `- 2026-01-01: learning ${i} ${"x".repeat(80)} <!--a:2026-01-01-->`).join("\n");
+    assert.ok(Buffer.byteLength(huge, "utf8") > 64000, "fixture must exceed the cap so rotation triggers");
+    const { writes } = stubRoutedHost(host, (cmd) => {
+      if (cmd.includes("cat") && cmd.includes("data/learnings.md") && !cmd.includes("archive")) return { payload: huge, code: 0 };
+      // The archive write FAILS.
+      if (cmd.includes("base64 -d") && cmd.includes("archive")) return { code: 1 };
+      return { payload: "", code: 0 };
+    });
+    const add = await host.harness.behavior.runCli(["memory", "add-learning", "newest", "line"], { projectId: "proj_1" });
+    assert.equal(add.exitCode, 0, add.stderr);
+    const live = decodeHostWrite(writes, "data/learnings.md");
+    assert.ok(live !== null, "live learnings must still be written");
+    assert.ok(live!.includes("learning 0"), "oldest learning must be RETAINED when archive write fails");
+    assert.ok(live!.includes("newest line"), "newest learning must be present");
+    // Not trimmed: the full raw body (over the cap) is kept rather than dropping overflow.
+    assert.ok(Buffer.byteLength(live!, "utf8") > 64000, "live file must keep the full body (untrimmed) on archive failure");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("A5 memory real: show reads the real files (source=real)", async () => {
   const host = ownerHost({ memoryOwner: "real" });
   await plugin(host.bb);
@@ -2605,6 +2661,24 @@ test("pickSecondmate: scope word overlap disambiguates multiple eligible mates",
   assert.equal(pickSecondmate(mates, "shared", "fix the invoices billing bug")?.threadId, "thr_pay", "scope match wins over recency");
   // No scope overlap → most recently registered wins the tie.
   assert.equal(pickSecondmate(mates, "shared", "unrelated words here")?.threadId, "thr_auth", "recency breaks a scoreless tie");
+});
+
+test("pickSecondmate: equal scope scores break the tie to the most recent registration", () => {
+  const mates = [
+    smRow({ threadId: "thr_old", scope: "payments", projects: ["shared"], createdAt: "2026-01-01T00:00:00.000Z" }),
+    smRow({ threadId: "thr_new", scope: "payments", projects: ["shared"], createdAt: "2026-03-01T00:00:00.000Z" }),
+  ];
+  // Task hits both scopes equally → newest createdAt wins deterministically.
+  assert.equal(pickSecondmate(mates, "shared", "payments work")?.threadId, "thr_new");
+});
+
+test("versionAtLeast compares semver numerically", () => {
+  assert.equal(versionAtLeast("0.2.5", "0.2.4"), true);
+  assert.equal(versionAtLeast("0.2.4", "0.2.4"), true);
+  assert.equal(versionAtLeast("0.2.3", "0.2.4"), false);
+  assert.equal(versionAtLeast("0.10.0", "0.2.4"), true, "numeric, not lexical");
+  assert.equal(versionAtLeast("1.0.0", "0.2.4"), true);
+  assert.equal(versionAtLeast("0.2", "0.2.4"), false, "missing patch = 0");
 });
 
 test("formatSecondmate renders scope and clone list", () => {
