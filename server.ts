@@ -269,6 +269,128 @@ function shQuote(text: string): string {
   return `'${text.replace(/'/g, `'\\''`)}'`;
 }
 
+// The drain hint appended to every real-mode doorbell. The durable wake queue stays the
+// authoritative store; the chat doorbell is only a pointer to it, so a dropped doorbell can
+// never lose the report (it survives in state/.wake-queue).
+export const CAPTAIN_WAKE_DRAIN_HINT =
+  "run `bb firstmate wake` to drain (durable; full report + open decisions surface there).";
+
+// Build the real-mode (notifyOwner=real) doorbell: a compact summary carrying the crew id +
+// a one-line outcome so the captain sees WHAT happened without a second `bb firstmate wake`,
+// while the full report stays in the durable queue. `head` already names the crew and status
+// (e.g. "✅ crew c1 done"); `summary` is the parsed outcome or a trimmed first line, or "".
+export function captainWakeDoorbell(head: string, summary: string): string {
+  return `🔔 ${head}${summary !== "" ? ` — ${summary}` : ""}\n${CAPTAIN_WAKE_DRAIN_HINT}`;
+}
+
+// Base FM_BACKEND=bb environment exports shared by every bb firstmate invocation
+// (runFmScript). FM_SUPERVISION_MODEL=autoarm declares this home's supervision model —
+// see the block in runFmScript / docs/bb-backend.md.
+export function fmBackendEnv(input: {
+  fmHome: string;
+  hostId: string;
+  projectId?: string;
+  parentThreadId?: string;
+}): string[] {
+  return [
+    `export FM_HOME=${shQuote(input.fmHome)}`,
+    `export FM_ROOT=${shQuote(input.fmHome)}`,
+    "export FM_BACKEND=bb",
+    input.projectId !== undefined ? `export FM_BB_PROJECT_ID=${shQuote(input.projectId)}` : "",
+    input.parentThreadId !== undefined ? `export FM_BB_PARENT_THREAD_ID=${shQuote(input.parentThreadId)}` : "",
+    `export FM_BB_MACHINE=${shQuote(input.hostId)}`,
+    "export FM_BB_VISIBLE=1",
+    // A bb-backed home has no live watcher holding the lock between wakes (the keeper re-arms
+    // fm-watch, which exits on every actionable wake), so fm-harness detection — run by the bb
+    // daemon detached from any agent — resolves to `unknown` → the `persistent` model, which
+    // demands a live lock-holder and permanently declares downtime while the beacon is fresh.
+    // That is exactly the Claude Stop auto-arm shape (watcher only runs between turns), so the
+    // model is `autoarm`: a fresh beacon within grace is healthy with no live watcher, a stale
+    // beacon still alarms (no autoarm ledger explains the gap for a bb home). This is native
+    // firstmate's own override (fm-wake-lib.sh fm_supervision_model), for "callers that
+    // already know the harness" — the bb backend is exactly such a caller.
+    "export FM_SUPERVISION_MODEL=autoarm",
+  ].filter((line) => line !== "");
+}
+
+// fm-watch keeper paths + cadence (host-relative to fmHome).
+export const FM_WATCH_KEEPER_PID = "state/.bb-watch-keeper.pid";
+export const FM_WATCH_KEEPER_SH = "state/.bb-watch-keeper.sh";
+// How often the on-host keeper re-arms fm-watch. fm-watch exits on every actionable wake and
+// must be re-armed; the keeper (not the plugin's slow cycle) owns that, so the gap after a wake
+// is bounded by this, not by the supervision interval + grace.
+export function fmWatchKeeperInterval(graceSec: number): number {
+  const grace = Math.max(30, Math.trunc(graceSec));
+  return Math.max(10, Math.min(20, Math.floor(grace / 3)));
+}
+
+// The durable keeper: a standalone bash script (written to the host as a FILE via writeHostFile
+// so there is no shell-quoting hazard). It records its own pid, self-exits when the pidfile no
+// longer names it (teardown removes it), and re-arms fm-watch every `interval`s. fm-watch-arm.sh
+// is idempotent (attaches to a live watcher), so the loop is cheap while a watcher blocks and only
+// forks a new one after one exits.
+export function fmWatchKeeperScript(hostId: string, fmHome: string, interval: number): string {
+  const pid = `${fmHome}/${FM_WATCH_KEEPER_PID}`;
+  const arm = `${fmHome}/bin/fm-watch-arm.sh`;
+  const log = `${fmHome}/state/.bb-watch-arm.log`;
+  return [
+    "#!/bin/bash",
+    "# BB firstmate fm-watch keeper (managed; do not edit).",
+    `export FM_HOME=${shQuote(fmHome)}`,
+    `export FM_ROOT=${shQuote(fmHome)}`,
+    "export FM_BACKEND=bb",
+    `export FM_BB_MACHINE=${shQuote(hostId)}`,
+    "export FM_BB_VISIBLE=1",
+    // The bb-backed home is the auto-arm supervision model (see fmBackendEnv): the keeper re-arms
+    // fm-watch, which runs only between wakes. Declare it so the watcher it launches judges a
+    // fresh beacon with no live lock-holder as healthy.
+    "export FM_SUPERVISION_MODEL=autoarm",
+    // Arm each re-arm as a HANDLING SUCCESSOR. fm-watch treats every non-successor start after an
+    // announced-but-unacked wake episode as a NEW down stretch and re-mints the recovery
+    // generation (fm_recovery_marker_reopen_announced); the keeper re-arms every ~20s, so that
+    // generation churned continuously and no `fm-wake-drain --ack-through … --recovery-generation
+    // …` could ever match it — the ack loop. A re-arm is not a down stretch for this model, which
+    // is exactly what the successor flag encodes (fm-watch's own resurface_after_downtime comment:
+    // a non-successor re-announce is "an unbounded recovery loop"). The initial announced episode
+    // is still published by arm_check when a wake is pending, so buried rows are still presented.
+    "export FM_WATCH_HANDLING_SUCCESSOR=1",
+    `PID=${shQuote(pid)}`,
+    `ARM=${shQuote(arm)}`,
+    `LOG=${shQuote(log)}`,
+    'echo $$ > "$PID"',
+    `trap 'rm -f "$PID"' EXIT`,
+    'while [ "$(cat "$PID" 2>/dev/null)" = "$$" ]; do',
+    '  "$ARM" >> "$LOG" 2>&1 || true',
+    `  sleep ${interval}`,
+    "done",
+  ].join("\n");
+}
+
+// Host-side reaper for fire-and-forget steering-inbox records (state/<id>.inbox/NNN.msg). These
+// ff records are write-only (never mv'd to handled/, excluded from the re-ring ladder), so
+// without a bound they accumulate one-per-steer forever. Keep only the newest `max` FF records
+// (by numeric sequence), delete the oldest beyond the cap. Reaps ONLY records carrying a
+// `delivery=fire-and-forget` header line before the `--` separator — the exact predicate native
+// fm_task_inbox_is_fire_and_forget uses — so a NORMAL (re-rung, consumed) steer is NEVER deleted,
+// even if it is older. Only flat NNN.msg files in .inbox/ are considered; the handled/ subdir and
+// any non-.msg file are left alone (a non-recursive glob).
+export function inboxReapScript(dir: string, max: number): string {
+  const q = shQuote(dir);
+  return [
+    `dir=${q}`,
+    `[ -d "$dir" ] || exit 0`,
+    // Emit basenames of FF NNN.msg records only, then keep the newest `max` and delete the rest.
+    `for f in "$dir"/*.msg; do`,
+    `  [ -e "$f" ] || continue`,
+    `  b=\${f##*/}`,
+    // exact fire-and-forget predicate: a `delivery=fire-and-forget` line in the header (before --).
+    `  awk '$0=="--"{exit} $0=="delivery=fire-and-forget"{ff=1} END{exit(ff?0:1)}' "$f" || continue`,
+    `  printf '%s\\n' "$b"`,
+    `done | grep -E '^[0-9]+\\.msg$' | sort -t. -k1,1nr | tail -n +${max + 1} \\`,
+    `  | while IFS= read -r r; do rm -f -- "$dir/$r"; done`,
+  ].join("\n");
+}
+
 function overlayBytes(rel: string): string {
   return readFileSync(join(OVERLAY_DIR, rel)).toString("base64");
 }
@@ -1018,20 +1140,6 @@ export default async function plugin(bb: BbPluginApi) {
     } catch {
       bb.log.warn(`notify failed for crew ${crewId}`);
     }
-  }
-
-  // The drain hint appended to every real-mode doorbell. The durable wake queue stays
-  // the authoritative store; the chat doorbell is only a pointer to it, so a dropped
-  // doorbell can never lose the report (it survives in state/.wake-queue).
-  const CAPTAIN_WAKE_DRAIN_HINT =
-    "run `bb firstmate wake` to drain (durable; full report + open decisions surface there).";
-
-  // Build the real-mode doorbell: a compact summary carrying the crew id + a one-line
-  // outcome so the captain sees WHAT happened without a second `bb firstmate wake`, while
-  // the full report stays in the durable queue. `head` already names the crew and status
-  // (e.g. "✅ crew c1 done"); `summary` is the parsed outcome or a trimmed first line.
-  function captainWakeDoorbell(head: string, summary: string): string {
-    return `🔔 ${head}${summary !== "" ? ` — ${summary}` : ""}\n${CAPTAIN_WAKE_DRAIN_HINT}`;
   }
 
   // F5: after the turn-end re-ring budget, keep re-ringing at this slow floor rather
@@ -2241,25 +2349,14 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  // Bounded reaper for the fire-and-forget steering-inbox records. These NNN.msg files
-  // are write-only (never mv'd to handled/, excluded from the re-ring ladder), so without
-  // a bound they accumulate one-per-steer forever. Keep only the newest MAX_INBOX_RECORDS,
-  // by numeric sequence, deleting the oldest beyond the cap. Best-effort and bounded: a
-  // failure just leaves the records in place (the doorbell already delivered). Only the
-  // flat NNN.msg files in the crew's .inbox/ are touched — the handled/ subdir and any
-  // other state is left alone (find -maxdepth 1 -type f).
+  // Bounded reaper for the FIRE-AND-FORGET steering-inbox records. Best-effort and bounded: a
+  // failure just leaves the records in place (the doorbell already delivered). The pure script
+  // builder (inboxReapScript) reaps ONLY records carrying delivery=fire-and-forget and leaves
+  // handled/ and non-.msg files alone; see its comment.
   async function reapInboxRecords(hostId: string, fmHome: string, crewId: string): Promise<void> {
     const dir = `${fmHome}/state/${crewId}.inbox`;
-    const script = [
-      `dir=${shQuote(dir)}`,
-      `[ -d "$dir" ] || exit 0`,
-      // newest-first by numeric filename prefix; drop the first MAX (keep), delete the rest.
-      `find "$dir" -maxdepth 1 -type f -name '*.msg' -printf '%f\\n' 2>/dev/null \\`,
-      `  | grep -E '^[0-9]+\\.msg$' | sort -t. -k1,1nr | tail -n +${MAX_INBOX_RECORDS + 1} \\`,
-      `  | while IFS= read -r f; do rm -f -- "$dir/$f"; done`,
-    ].join("\n");
     try {
-      await runOnHost(hostId, script, 15_000);
+      await runOnHost(hostId, inboxReapScript(dir, MAX_INBOX_RECORDS), 15_000);
     } catch (error) {
       bb.log.warn(`fm inbox reap crew=${crewId} ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -3277,24 +3374,12 @@ export default async function plugin(bb: BbPluginApi) {
       .filter(([, v]) => v !== "")
       .map(([k, v]) => `export ${k}=${shQuote(v)}`);
     const prelude = [
-      `export FM_HOME=${shQuote(input.fmHome)}`,
-      `export FM_ROOT=${shQuote(input.fmHome)}`,
-      "export FM_BACKEND=bb",
-      input.projectId !== undefined ? `export FM_BB_PROJECT_ID=${shQuote(input.projectId)}` : "",
-      input.parentThreadId !== undefined ? `export FM_BB_PARENT_THREAD_ID=${shQuote(input.parentThreadId)}` : "",
-      `export FM_BB_MACHINE=${shQuote(input.hostId)}`,
-      "export FM_BB_VISIBLE=1",
-      // Declare the bb-backed home's supervision model. A bb home has no live watcher
-      // process holding the lock between wakes (the keeper re-arms fm-watch, which exits
-      // on every actionable wake), so fm-harness detection — run detached from any agent
-      // by the bb daemon — resolves to `unknown` → the `persistent` model, which demands a
-      // live lock-holder and permanently declares downtime while the beacon is fresh. That
-      // is exactly the Claude Stop auto-arm shape (watcher only runs between turns), so the
-      // model is `autoarm`: a fresh beacon within grace is healthy with no live watcher, a
-      // stale beacon still alarms (no autoarm ledger explains the gap for a bb home). This
-      // is native firstmate's own override (fm-wake-lib.sh fm_supervision_model), used by
-      // "callers that already know the harness" — the bb backend is exactly such a caller.
-      "export FM_SUPERVISION_MODEL=autoarm",
+      ...fmBackendEnv({
+        fmHome: input.fmHome,
+        hostId: input.hostId,
+        projectId: input.projectId,
+        parentThreadId: input.parentThreadId,
+      }),
       ...extraEnv,
       `if [ ! -f ${shQuote(scriptPath)} ]; then echo "error: missing ${scriptPath}" >&2; exit 127; fi`,
       `${shQuote(scriptPath)} ${input.args.map(shQuote).join(" ")}`,
@@ -4051,60 +4136,8 @@ export default async function plugin(bb: BbPluginApi) {
     return [...hosts];
   }
 
-  const FM_WATCH_KEEPER_PID = "state/.bb-watch-keeper.pid";
-  const FM_WATCH_KEEPER_SH = "state/.bb-watch-keeper.sh";
-  // How often the on-host keeper re-arms fm-watch. fm-watch exits on every actionable
-  // wake and must be re-armed; the keeper (not the plugin's slow cycle) owns that, so
-  // the gap after a wake is bounded by this, not by the supervision interval + grace.
-  function fmWatchKeeperInterval(graceSec: number): number {
-    const grace = Math.max(30, Math.trunc(graceSec));
-    return Math.max(10, Math.min(20, Math.floor(grace / 3)));
-  }
-
-  // The durable keeper: a standalone bash script (written to the host as a FILE via
-  // writeHostFile so there is no shell-quoting hazard — an inline `bash -c` body was
-  // fragile: escaped quotes inside `$(cat ...)` made it read a mis-quoted path and
-  // exit instantly). It records its own pid, self-exits when the pidfile no longer
-  // names it (the plugin's teardown removes it), and re-arms fm-watch every
-  // `interval`s. fm-watch-arm.sh is idempotent (attaches to a live watcher), so the
-  // loop is cheap while a watcher blocks and only forks a new one after one exits.
-  function fmWatchKeeperScript(hostId: string, fmHome: string, interval: number): string {
-    const pid = `${fmHome}/${FM_WATCH_KEEPER_PID}`;
-    const arm = `${fmHome}/bin/fm-watch-arm.sh`;
-    const log = `${fmHome}/state/.bb-watch-arm.log`;
-    return [
-      "#!/bin/bash",
-      "# BB firstmate fm-watch keeper (managed; do not edit).",
-      `export FM_HOME=${shQuote(fmHome)}`,
-      `export FM_ROOT=${shQuote(fmHome)}`,
-      "export FM_BACKEND=bb",
-      `export FM_BB_MACHINE=${shQuote(hostId)}`,
-      "export FM_BB_VISIBLE=1",
-      // The bb-backed home is the auto-arm supervision model (see runFmScript): the
-      // keeper re-arms fm-watch, which runs only between wakes. Declare it so the watcher
-      // it launches judges a fresh beacon with no live lock-holder as healthy.
-      "export FM_SUPERVISION_MODEL=autoarm",
-      // Arm each re-arm as a HANDLING SUCCESSOR. fm-watch treats every non-successor start
-      // after an announced-but-unacked wake episode as a NEW down stretch and re-mints the
-      // recovery generation (fm_recovery_marker_reopen_announced); the keeper re-arms every
-      // ~20s, so that generation churned continuously and no `fm-wake-drain --ack-through …
-      // --recovery-generation …` could ever match it — the ack loop. A re-arm is not a down
-      // stretch for this model, which is exactly what the successor flag encodes (fm-watch's
-      // own resurface_after_downtime comment: a non-successor re-announce is "an unbounded
-      // recovery loop"). The initial announced episode is still published by arm_check when a
-      // wake is pending, so buried rows are still presented; only the churn is stopped.
-      "export FM_WATCH_HANDLING_SUCCESSOR=1",
-      `PID=${shQuote(pid)}`,
-      `ARM=${shQuote(arm)}`,
-      `LOG=${shQuote(log)}`,
-      'echo $$ > "$PID"',
-      `trap 'rm -f "$PID"' EXIT`,
-      'while [ "$(cat "$PID" 2>/dev/null)" = "$$" ]; do',
-      '  "$ARM" >> "$LOG" 2>&1 || true',
-      `  sleep ${interval}`,
-      "done",
-    ].join("\n");
-  }
+  // fm-watch keeper paths/cadence/script are module-level pure builders (see above):
+  // FM_WATCH_KEEPER_PID, FM_WATCH_KEEPER_SH, fmWatchKeeperInterval, fmWatchKeeperScript.
 
   // One supervision cycle on the host. fm-watch is a one-shot that BLOCKS until an
   // actionable wake then EXITS (by design, to be re-armed) — so re-arming only when
