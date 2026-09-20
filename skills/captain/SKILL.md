@@ -79,6 +79,20 @@ They degrade to the current native behavior with a log line.
 - **`readThrough`** (default off): real `state/<id>.meta` becomes the source of
   truth for crew existence — one batched host read per crews/bearings/deliver
   reconciles the KV cache and drops crews the real plane tore down. Off = KV only.
+  A crew whose dispatch-time meta write failed is never reaped (recover with
+  `migrate-state`).
+- **Real-plane owners** (`queueOwner` / `decisionsOwner` / `afkOwner` /
+  `quietOwner` / `memoryOwner`, each `kv` | `real`, default `kv`): with `real`,
+  that tool routes through the native owner and writes through to the KV cache;
+  a host/read failure degrades to KV with a log. `queueOwner` → `fm-tasks-axi.sh`
+  `data/backlog.md` (needs `tasks-axi` on the host). `decisionsOwner` →
+  captain-held backlog tasks (`fm-captain-hold.sh`), answering also writes the
+  `resolved` close to the crew's `state/<id>.status`. `afkOwner` → durable
+  `state/.afk-contract` (`fm-afk-contract.sh`) so real merge/watch see the same
+  away authority + merge grants (`afk on --grant <task-id>`). `quietOwner` →
+  native `state/.afk` `quiet` flag. `memoryOwner` → tiered stow files
+  `data/captain.md` + `data/learnings.md`. Project existing KV state into the real
+  files once with `bb firstmate migrate-owners` (idempotent).
 
 ### Real skills inventory
 
@@ -181,6 +195,7 @@ within its exact scope. Never infer, broaden, or carry it elsewhere.
 | memory | `firstmate_memory` / `memory [show\|set-captain\|add-learning\|drop-learning\|clear]` |
 | watcher | `firstmate_supervision` / `supervision [on\|off\|status]` |
 | rebuild real state from cache | `firstmate_migrate_state` / `bb firstmate migrate-state` (idempotent) |
+| project KV owners → real files | `bb firstmate migrate-owners` (idempotent; real owners only) |
 | retire | `firstmate_forget` / `forget <id> [--stop] [--force]` |
 | afk / quiet | `firstmate_afk` / `firstmate_quiet` |
 
