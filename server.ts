@@ -203,6 +203,10 @@ const MAX_TASK = 4000;
 const MAX_OUTPUT = 4000;
 const MAX_FANOUT = 10;
 const MAX_WATCH_CREWS = 10;
+// Cap on fire-and-forget steering-inbox records kept per crew (state/<id>.inbox/NNN.msg).
+// These are write-only audit records with no consumer (never mv'd to handled/), so
+// without a bound they grow one-per-steer forever; the reaper keeps the newest this many.
+const MAX_INBOX_RECORDS = 200;
 const PLUGIN_ROOT = dirname(fileURLToPath(import.meta.url));
 const OVERLAY_DIR = join(PLUGIN_ROOT, "overlay");
 const FM_SCRIPT = /^[a-z0-9][a-z0-9-]*$/;
@@ -1016,13 +1020,19 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  // One short constant doorbell that replaces the full-text notify when the
-  // durable wake was enqueued: the payload lives in the real wake queue, the
-  // captain's chat only carries this one line, and a duplicate is harmless (the
-  // queue dedupes on (kind,key)). This is what makes a lost delivery impossible —
-  // the report survives in state/.wake-queue even if this send never lands.
-  const CAPTAIN_WAKE_DOORBELL =
-    "🔔 Firstmate: crew wake(s) pending — run `bb firstmate wake` to drain (durable; open decisions + unread statuses surface there).";
+  // The drain hint appended to every real-mode doorbell. The durable wake queue stays
+  // the authoritative store; the chat doorbell is only a pointer to it, so a dropped
+  // doorbell can never lose the report (it survives in state/.wake-queue).
+  const CAPTAIN_WAKE_DRAIN_HINT =
+    "run `bb firstmate wake` to drain (durable; full report + open decisions surface there).";
+
+  // Build the real-mode doorbell: a compact summary carrying the crew id + a one-line
+  // outcome so the captain sees WHAT happened without a second `bb firstmate wake`, while
+  // the full report stays in the durable queue. `head` already names the crew and status
+  // (e.g. "✅ crew c1 done"); `summary` is the parsed outcome or a trimmed first line.
+  function captainWakeDoorbell(head: string, summary: string): string {
+    return `🔔 ${head}${summary !== "" ? ` — ${summary}` : ""}\n${CAPTAIN_WAKE_DRAIN_HINT}`;
+  }
 
   // F5: after the turn-end re-ring budget, keep re-ringing at this slow floor rather
   // than abandoning the captain idle-with-undrained-wakes.
@@ -1126,13 +1136,15 @@ export default async function plugin(bb: BbPluginApi) {
             : `next: bb firstmate crew ${crew.id}`,
     );
     const text = lines.join("\n").slice(0, 1500);
-    // notifyOwner=real: persist the report into the durable wake queue first, then
-    // the chat send becomes only the cheap constant doorbell. A dropped doorbell can
-    // no longer lose the report — the captain drains the queue with `bb firstmate
-    // wake` (open decisions/unread statuses surface there, repeats dedupe). Default
-    // kv is byte-for-byte the previous fire-and-forget behavior.
+    // notifyOwner=real: persist the report into the durable wake queue first, then the
+    // chat send becomes a compact doorbell carrying the crew id + a one-line outcome
+    // (not just a generic pointer), so the captain sees WHAT happened without a second
+    // `bb firstmate wake`. A dropped doorbell can no longer lose the report — the full
+    // report and open decisions survive in the durable queue and surface on drain.
+    // Default kv is byte-for-byte the previous fire-and-forget behavior.
     const durable = (await settings.get()).notifyOwner === "real" ? await enqueueCaptainWake(crew, text) : false;
-    const doorbell = durable ? CAPTAIN_WAKE_DOORBELL : text;
+    const summary = outcome ?? (output !== null && output !== "" ? truncate(output.replace(/\n/g, " "), 160) : "");
+    const doorbell = durable ? captainWakeDoorbell(head, summary) : text;
     if (quietHold || afkHold) {
       // The durable wake already persisted the report; do not also hold a redundant
       // doorbell (the captain drains the queue on return). KV path unchanged.
@@ -2229,6 +2241,30 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  // Bounded reaper for the fire-and-forget steering-inbox records. These NNN.msg files
+  // are write-only (never mv'd to handled/, excluded from the re-ring ladder), so without
+  // a bound they accumulate one-per-steer forever. Keep only the newest MAX_INBOX_RECORDS,
+  // by numeric sequence, deleting the oldest beyond the cap. Best-effort and bounded: a
+  // failure just leaves the records in place (the doorbell already delivered). Only the
+  // flat NNN.msg files in the crew's .inbox/ are touched — the handled/ subdir and any
+  // other state is left alone (find -maxdepth 1 -type f).
+  async function reapInboxRecords(hostId: string, fmHome: string, crewId: string): Promise<void> {
+    const dir = `${fmHome}/state/${crewId}.inbox`;
+    const script = [
+      `dir=${shQuote(dir)}`,
+      `[ -d "$dir" ] || exit 0`,
+      // newest-first by numeric filename prefix; drop the first MAX (keep), delete the rest.
+      `find "$dir" -maxdepth 1 -type f -name '*.msg' -printf '%f\\n' 2>/dev/null \\`,
+      `  | grep -E '^[0-9]+\\.msg$' | sort -t. -k1,1nr | tail -n +${MAX_INBOX_RECORDS + 1} \\`,
+      `  | while IFS= read -r f; do rm -f -- "$dir/$f"; done`,
+    ].join("\n");
+    try {
+      await runOnHost(hostId, script, 15_000);
+    } catch (error) {
+      bb.log.warn(`fm inbox reap crew=${crewId} ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   // tellOwner=real: a captain→crew steer gets a durable fire-and-forget steering-inbox
   // record (verbatim audit trail; NOT re-rung — the crew is steered over BB, not by
   // reading its inbox) AND is delivered as the literal doorbell over BB — identical to
@@ -2250,6 +2286,7 @@ export default async function plugin(bb: BbPluginApi) {
       hostId = null;
     }
     const durable = hostId === null ? false : await writeInboxRecord(hostId, fmHome, crew.id, message);
+    if (durable && hostId !== null) await reapInboxRecords(hostId, fmHome, crew.id);
     try {
       await bb.sdk.threads.send({
         threadId: crew.threadId,
@@ -3247,6 +3284,17 @@ export default async function plugin(bb: BbPluginApi) {
       input.parentThreadId !== undefined ? `export FM_BB_PARENT_THREAD_ID=${shQuote(input.parentThreadId)}` : "",
       `export FM_BB_MACHINE=${shQuote(input.hostId)}`,
       "export FM_BB_VISIBLE=1",
+      // Declare the bb-backed home's supervision model. A bb home has no live watcher
+      // process holding the lock between wakes (the keeper re-arms fm-watch, which exits
+      // on every actionable wake), so fm-harness detection — run detached from any agent
+      // by the bb daemon — resolves to `unknown` → the `persistent` model, which demands a
+      // live lock-holder and permanently declares downtime while the beacon is fresh. That
+      // is exactly the Claude Stop auto-arm shape (watcher only runs between turns), so the
+      // model is `autoarm`: a fresh beacon within grace is healthy with no live watcher, a
+      // stale beacon still alarms (no autoarm ledger explains the gap for a bb home). This
+      // is native firstmate's own override (fm-wake-lib.sh fm_supervision_model), used by
+      // "callers that already know the harness" — the bb backend is exactly such a caller.
+      "export FM_SUPERVISION_MODEL=autoarm",
       ...extraEnv,
       `if [ ! -f ${shQuote(scriptPath)} ]; then echo "error: missing ${scriptPath}" >&2; exit 127; fi`,
       `${shQuote(scriptPath)} ${input.args.map(shQuote).join(" ")}`,
@@ -4032,6 +4080,20 @@ export default async function plugin(bb: BbPluginApi) {
       "export FM_BACKEND=bb",
       `export FM_BB_MACHINE=${shQuote(hostId)}`,
       "export FM_BB_VISIBLE=1",
+      // The bb-backed home is the auto-arm supervision model (see runFmScript): the
+      // keeper re-arms fm-watch, which runs only between wakes. Declare it so the watcher
+      // it launches judges a fresh beacon with no live lock-holder as healthy.
+      "export FM_SUPERVISION_MODEL=autoarm",
+      // Arm each re-arm as a HANDLING SUCCESSOR. fm-watch treats every non-successor start
+      // after an announced-but-unacked wake episode as a NEW down stretch and re-mints the
+      // recovery generation (fm_recovery_marker_reopen_announced); the keeper re-arms every
+      // ~20s, so that generation churned continuously and no `fm-wake-drain --ack-through …
+      // --recovery-generation …` could ever match it — the ack loop. A re-arm is not a down
+      // stretch for this model, which is exactly what the successor flag encodes (fm-watch's
+      // own resurface_after_downtime comment: a non-successor re-announce is "an unbounded
+      // recovery loop"). The initial announced episode is still published by arm_check when a
+      // wake is pending, so buried rows are still presented; only the churn is stopped.
+      "export FM_WATCH_HANDLING_SUCCESSOR=1",
       `PID=${shQuote(pid)}`,
       `ARM=${shQuote(arm)}`,
       `LOG=${shQuote(log)}`,

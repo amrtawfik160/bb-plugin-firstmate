@@ -52,6 +52,14 @@ harness=bb
 
 Composer submit/retry is a no-op: BB has no TUI composer. Delivery is the tell JSON succeeding.
 
+## Supervision model (auto-arm)
+
+A bb-backed home is the **auto-arm** supervision model. There is no live watcher process holding the singleton lock between wakes: the plugin's keeper re-arms `bin/fm-watch.sh`, which exits on every actionable wake and is re-armed ~20s later. Harness detection (`bin/fm-harness.sh`), run by the bb daemon detached from any agent process, therefore resolves to `unknown` → the `persistent` model, which demands a live lock-holder and would permanently declare downtime even while the beacon is fresh.
+
+The plugin declares the correct model with native firstmate's own override, `FM_SUPERVISION_MODEL=autoarm`, on every bb firstmate invocation (`runFmScript`) and in the keeper. Under `autoarm` a fresh beacon within grace is healthy with no live watcher, and a stale beacon still alarms (a bb home has no auto-arm ledger to explain the gap), so a real watcher outage — e.g. the keeper dying, which stops the beacon — is never muffled.
+
+The keeper additionally exports `FM_WATCH_HANDLING_SUCCESSOR=1`: every re-arm is a continuation of one unbroken supervision run, not a new down stretch, so `fm-watch` does not re-mint the recovery generation of an open wake episode on each re-arm (`fm_recovery_marker_reopen_announced`). Without it that generation churned every ~20s and no `fm-wake-drain --ack-through … --recovery-generation …` could match it — a permanent ack loop. The initial episode is still published by `arm_check` when a wake is pending, so buried rows are still presented; only the churn is stopped.
+
 ## Limits
 
 - `remove_worktree` refuses a dirty crew worktree (uncommitted or untracked files on stderr, exit 1) before stop/archive. That failure is what makes `fm-teardown.sh` abort and keep the task record. This op never discards. `--force` / discard is the captain's `forget --force`.
