@@ -555,6 +555,38 @@ export default async function plugin(bb: BbPluginApi) {
       label: "Captain-contract excerpt from fmHome/AGENTS.md, injected into captain sessions (set by init --real).",
       default: "",
     },
+    fmSkillsManifest: {
+      type: "string",
+      label: "Version-pinned inventory of fmHome/.agents/skills (JSON {head,skills[]}); set by init/deck, injected into captain sessions.",
+      default: "",
+    },
+    transport: {
+      type: "select",
+      label: "Crew dispatch transport: native BB spawn, or the real fm-brief.sh + fm-spawn.sh scripts (backend=bb). Falls back to native if real spawn fails before a thread exists.",
+      options: ["native", "real"],
+      default: "native",
+    },
+    watchOwner: {
+      type: "select",
+      label: "Crew supervision owner: native BB stuck-pass, or the real fm-watch (the plugin runs+supervises fm-watch; BB suppresses its own stuck-page only while fm-watch's heartbeat is live, else it pages as before). Falls back to native when real mode is off.",
+      options: ["native", "fm-watch"],
+      default: "native",
+    },
+    fmHostId: {
+      type: "string",
+      label: "Host id where fmHome lives (set by init --real; used by the fm-watch supervisor when no crew is around to resolve one).",
+      default: "",
+    },
+    watchHeartbeatSec: {
+      type: "number",
+      label: "fm-watch is considered live when its state/.last-watcher-beat is fresher than this many seconds; BB only suppresses its own stuck-page while live.",
+      default: 90,
+    },
+    readThrough: {
+      type: "boolean",
+      label: "Treat real state/<id>.meta as the source of truth for crew existence: on each crews/bearings/deliver read, one batched host read reconciles the KV cache and drops crews the real plane no longer tracks. Off = KV cache only.",
+      default: false,
+    },
     defaultProvider: {
       type: "string",
       label: "Default crew provider id (blank = BB resolves)",
@@ -626,6 +658,112 @@ export default async function plugin(bb: BbPluginApi) {
       }
     } catch {
       // best-effort; captain keeps the built-in instruction
+    }
+  }
+
+  // The real firstmate skills inventory (fmHome/.agents/skills), version-pinned to
+  // fmHome HEAD. BB plugins cannot register a dynamic skill root from the sync
+  // configure() callback (skill ids there must resolve to statically-declared
+  // manifest dirs), so instead of falsely registering unmovable host content we
+  // generate a version-pinned manifest and inject its inventory into captain
+  // sessions — the captain learns the real skills exist and reads/runs them
+  // through the toolbelt (bb firstmate fm ...). Crews still get none. Refreshed on
+  // init/deck and whenever fmHome HEAD changes. Cached for the sync callback.
+  const SKILLS_MANIFEST_MAX = 2400;
+  let skillsManifestCache = "";
+  try {
+    skillsManifestCache = renderSkillsManifest((await settings.get()).fmSkillsManifest);
+  } catch {
+    // default empty
+  }
+
+  function renderSkillsManifest(raw: string): string {
+    const trimmed = (raw ?? "").trim();
+    if (trimmed === "") return "";
+    try {
+      const parsed = JSON.parse(trimmed) as { head?: unknown; skills?: unknown };
+      const head = typeof parsed.head === "string" && parsed.head !== "" ? parsed.head.slice(0, 12) : "unknown";
+      const skills = Array.isArray(parsed.skills) ? parsed.skills : [];
+      if (skills.length === 0) return "";
+      const lines = skills
+        .map((s) => {
+          const rec = asRecord(s);
+          const name = typeof rec["name"] === "string" ? rec["name"] : "";
+          const desc = typeof rec["desc"] === "string" ? rec["desc"] : "";
+          return name === "" ? "" : `- ${name}${desc === "" ? "" : `: ${desc}`}`;
+        })
+        .filter((l) => l !== "");
+      if (lines.length === 0) return "";
+      const body = [
+        `== Real firstmate skills (fmHome/.agents/skills @ ${head}; ${lines.length} available) ==`,
+        "Read and run these through the toolbelt (e.g. bb firstmate fm <script>); they are the real policy skills.",
+        ...lines,
+      ].join("\n");
+      return truncate(body, SKILLS_MANIFEST_MAX);
+    } catch {
+      return "";
+    }
+  }
+
+  // Read fmHome HEAD + the .agents/skills inventory on the host, store a
+  // version-pinned JSON manifest, and refresh the injected cache. Skips the host
+  // read when HEAD is unchanged. Best-effort.
+  async function refreshSkillsManifest(hostId: string, fmHome: string, signal?: AbortSignal): Promise<void> {
+    try {
+      const skillsDir = `${fmHome}/.agents/skills`;
+      const py =
+        "import json,os,sys;d=sys.argv[1];out=[];\n" +
+        "dirs=sorted([n for n in os.listdir(d) if os.path.isdir(os.path.join(d,n))]) if os.path.isdir(d) else []\n" +
+        "for n in dirs:\n" +
+        "  desc=''\n" +
+        "  p=os.path.join(d,n,'SKILL.md')\n" +
+        "  try:\n" +
+        "    txt=open(p,encoding='utf-8',errors='replace').read()\n" +
+        "    for line in txt.splitlines():\n" +
+        "      s=line.strip()\n" +
+        "      if s.lower().startswith('description:'):\n" +
+        "        desc=s.split(':',1)[1].strip().strip('\\'\"');break\n" +
+        "  except Exception:\n" +
+        "    pass\n" +
+        "  out.append({'name':n,'desc':desc[:160]})\n" +
+        "sys.stdout.write(json.dumps(out))";
+      const cmd = [
+        `HEAD=$(git -C ${shQuote(fmHome)} rev-parse HEAD 2>/dev/null || echo unknown)`,
+        `printf 'FM_HEAD=%s\\n' "$HEAD"`,
+        `python3 -c ${shQuote(py)} ${shQuote(skillsDir)} 2>/dev/null || echo '[]'`,
+      ].join("\n");
+      const res = await runOnHost(hostId, cmd, 20_000, signal);
+      const headMatch = /FM_HEAD=(\S+)/.exec(res.output);
+      const head = headMatch?.[1] ?? "unknown";
+      const jsonStart = res.output.indexOf("[");
+      if (jsonStart < 0) return;
+      const skillsJson = res.output.slice(jsonStart).trim();
+      let skills: unknown;
+      try {
+        skills = JSON.parse(skillsJson);
+      } catch {
+        return;
+      }
+      if (!Array.isArray(skills)) return;
+      // Skip the persist when HEAD is unchanged and we already have a manifest.
+      try {
+        const prevRaw = (await settings.get()).fmSkillsManifest.trim();
+        if (prevRaw !== "") {
+          const prev = JSON.parse(prevRaw) as { head?: unknown };
+          if (typeof prev.head === "string" && prev.head === head && skillsManifestCache !== "") return;
+        }
+      } catch {
+        // fall through and persist
+      }
+      const manifest = JSON.stringify({ head, skills });
+      skillsManifestCache = renderSkillsManifest(manifest);
+      try {
+        await settings.experimental_set({ fmSkillsManifest: manifest });
+      } catch {
+        // cache still holds it for this process
+      }
+    } catch {
+      // best-effort; captain keeps the contract without the skill inventory
     }
   }
 
@@ -1113,6 +1251,166 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  // Read a single key from a real state/<id>.meta on the host. Returns the value,
+  // "" when the key is absent, or null when the host/state is unreadable. Used by
+  // the real transport to learn the thread id the real fm-spawn.sh created.
+  async function readFmMetaField(hostId: string, crewId: string, key: string): Promise<string | null> {
+    const fmHome = (await settings.get()).fmHome.trim();
+    if (fmHome === "") return null;
+    const dest = `${fmHome}/state/${crewId}.meta`;
+    try {
+      const res = await runOnHost(
+        hostId,
+        `[ -f ${shQuote(dest)} ] && grep ${shQuote(`^${key}=`)} ${shQuote(dest)} | tail -1 | cut -d= -f2- || echo FM_META_ABSENT`,
+        15_000,
+      );
+      const out = res.output.trim();
+      if (out === "" || out.includes("FM_META_ABSENT")) return "";
+      return out;
+    } catch {
+      return null;
+    }
+  }
+
+  // One batched host read of the real ledger: the set of task ids that currently
+  // have a state/<id>.meta. Used to reconcile the KV crew cache against the real
+  // plane's authoritative existence (item 3). null on any host/read failure, so a
+  // read failure never drops a crew. One `ls`-style read per call, never per-crew.
+  async function existingFmMetaIds(hostId: string, fmHome: string, signal?: AbortSignal): Promise<Set<string> | null> {
+    const dir = `${fmHome}/state`;
+    try {
+      const res = await runOnHost(
+        hostId,
+        `for f in ${shQuote(dir)}/*.meta; do [ -e "$f" ] || continue; b=$(basename "$f" .meta); printf '%s\\n' "$b"; done`,
+        15_000,
+        signal,
+      );
+      const ids = res.output
+        .split(/\r?\n/)
+        .map((s) => s.trim())
+        .filter((s) => s !== "" && !s.startsWith(".") && !s.includes("*"));
+      return new Set(ids);
+    } catch {
+      return null;
+    }
+  }
+
+  // Find a BB thread the real fm-spawn.sh created for this task but did not record
+  // in state/<id>.meta — the narrow hard-kill window between `bb thread spawn` and
+  // the meta write (fm-spawn's own BB_ABORT_CLEANUP trap handles graceful failures,
+  // so this only fires on a SIGKILL / host death). Matched by the deterministic
+  // thread title `fm-<taskId>` or the crewId recorded by `mark-crew --task`. Only
+  // threads not already tracked as crews are considered, so this never steals a
+  // live crew's thread. Returns the thread id to adopt, or null.
+  async function findOrphanThreadForTask(taskId: string): Promise<string | null> {
+    const known = new Set((await readCrews()).map((c) => c.threadId).filter((t) => t !== ""));
+    const wantTitle = `fm-${taskId}`;
+    try {
+      const found = await bb.sdk.threads.list({ originPluginId: "firstmate", includeHidden: true, limit: 50 });
+      const rows: unknown[] = Array.isArray(found)
+        ? found
+        : Array.isArray(asRecord(found)["threads"])
+          ? (asRecord(found)["threads"] as unknown[])
+          : [];
+      for (const row of rows) {
+        const rec = asRecord(row);
+        const tid = rec["id"];
+        if (typeof tid !== "string" || known.has(tid)) continue;
+        if (typeof rec["title"] === "string" && rec["title"] === wantTitle) return tid;
+        try {
+          const meta = asRecord(await bb.sdk.threads.getPluginMetadata({ threadId: tid, pluginId: "firstmate" }));
+          if (meta["crewId"] === taskId) return tid;
+        } catch {
+          // metadata unreadable; title match already tried
+        }
+      }
+    } catch {
+      // list unavailable → caller native-spawns
+    }
+    return null;
+  }
+
+  // The real transport swap: dispatch a crew end-to-end through the real
+  // fm-brief.sh + fm-spawn.sh (backend=bb) so the real scripts create the brief,
+  // the worktree, the thread and state/<id>.meta — with harness/provider/model/
+  // effort all threaded into the BB thread. Returns the thread id the real spawn
+  // created, or null when the spawn failed BEFORE any thread existed (the caller
+  // then falls back to native dispatch). Never double-spawns: if a bb_thread_id
+  // is already recorded (even on a later partial failure) that id is returned.
+  async function dispatchViaRealTransport(
+    crew: Crew,
+    input: {
+      task: string;
+      projectId: string;
+      parentThreadId?: string;
+      permissionMode?: PermissionMode;
+    },
+    hostId: string,
+    signal?: AbortSignal,
+  ): Promise<string | null> {
+    const fmHome = (await settings.get()).fmHome.trim();
+    if (fmHome === "") return null;
+    // A crew may already carry a real thread (idempotent re-dispatch). Never spawn twice.
+    const existing = await readFmMetaField(hostId, crew.id, "bb_thread_id");
+    if (existing !== null && existing !== "") return existing;
+    const projectDir = await projectCheckoutPath(input.projectId);
+    if (projectDir === null || projectDir === "") {
+      bb.log.warn(`real transport: no project checkout for crew=${crew.id}; falling back to native`);
+      return null;
+    }
+    // Scaffold the authoritative brief first — a ship spawn reads its recorded
+    // "Delivery contract: mode=" line and refuses a mismatch, so the brief must
+    // exist (with the right mode) before fm-spawn.sh runs.
+    await publishFmBrief(crew, hostId, input.task);
+    const posture = await postureOf(input.projectId);
+    const args =
+      crew.shape === "scout"
+        ? [crew.id, projectDir, "--scout", "--backend", "bb"]
+        : [crew.id, projectDir, "--mode", crew.posture, "--yolo", posture.yolo ? "on" : "off", "--backend", "bb"];
+    if (crew.model !== null && crew.model !== "") args.push("--model", crew.model);
+    if (crew.reasoningLevel !== null) args.push("--effort", crew.reasoningLevel);
+    const capped = capPermission(input.permissionMode, await parentPermission(input.parentThreadId));
+    const env: Record<string, string> = {};
+    if (crew.providerId !== null && crew.providerId !== "") env.FM_BB_PROVIDER = crew.providerId;
+    if (capped !== undefined) env.FM_BB_PERMISSION_MODE = capped;
+    let spawnFailed = false;
+    try {
+      const res = await runFmScript({
+        script: "spawn",
+        args,
+        hostId,
+        fmHome,
+        projectId: input.projectId,
+        parentThreadId: input.parentThreadId,
+        env,
+        timeoutMs: fmTimeoutMs("spawn", undefined),
+        signal,
+      });
+      if (res.exitCode !== 0) {
+        spawnFailed = true;
+        bb.log.warn(`real transport spawn crew=${crew.id} exit=${res.exitCode} ${res.output.slice(0, 600)}`);
+      } else {
+        bb.log.info(`real transport spawn crew=${crew.id} ok`);
+      }
+    } catch (error) {
+      spawnFailed = true;
+      bb.log.warn(`real transport spawn crew=${crew.id} ${error instanceof Error ? error.message : String(error)}`);
+    }
+    // Even on a non-zero exit, a thread may already exist — read the meta and
+    // honour it rather than native-spawning a duplicate.
+    const threadId = await readFmMetaField(hostId, crew.id, "bb_thread_id");
+    if (threadId !== null && threadId !== "") return threadId;
+    // No recorded thread. fm-spawn may still have created one and been hard-killed
+    // before writing bb_thread_id. Adopt that orphan instead of native-spawning a
+    // duplicate; only when none exists do we fall back to native (return null).
+    const orphan = await findOrphanThreadForTask(crew.id);
+    if (orphan !== null) {
+      bb.log.info(`real transport adopted orphan thread ${orphan} for crew=${crew.id} (fm-spawn left no bb_thread_id; spawnFailed=${spawnFailed})`);
+      return orphan;
+    }
+    return null;
+  }
+
   // A crew is terminal — its task is over — when its turn failed, its thread is
   // gone/archived, or its last words / status carry a DONE/FAILED verdict.
   // migrate-state skips these so backfilling a meta cannot make the real watcher
@@ -1297,6 +1595,34 @@ export default async function plugin(bb: BbPluginApi) {
     } catch {
       // kv alone still works
     }
+    // Read-through reconciliation (item 3, opt-in): real state/<id>.meta is the
+    // source of truth for crew existence. One batched host read; drop KV crews the
+    // real plane no longer tracks (torn down). Secondmate routes have no meta and
+    // are exempt; a failed read (null) never drops anything.
+    try {
+      const s = await settings.get();
+      if (s.readThrough === true && s.fmHome.trim() !== "") {
+        const hostId = await resolveFmWatchHostId();
+        if (hostId !== null) {
+          const ids = await existingFmMetaIds(hostId, s.fmHome.trim());
+          if (ids !== null) {
+            const kept = crews.filter((c) => isSecondmateRoute(c) || ids.has(c.id));
+            if (kept.length !== crews.length) {
+              for (const gone of crews) {
+                if (!kept.includes(gone)) {
+                  bb.log.info(`read-through: crew ${gone.id} dropped (no real state/<id>.meta)`);
+                  await markQueueForCrew(gone.id, "done").catch(() => {});
+                }
+              }
+              await writeCrews(kept);
+              return kept;
+            }
+          }
+        }
+      }
+    } catch {
+      // reconciliation is best-effort; the KV cache still serves
+    }
     return crews;
   }
 
@@ -1397,6 +1723,41 @@ export default async function plugin(bb: BbPluginApi) {
       posture: input.shape === "scout" ? "scout" : input.mode,
       createdAt: new Date().toISOString(),
     };
+    // Transport swap: when the real transport is selected and real mode is active,
+    // dispatch through the real fm-brief.sh + fm-spawn.sh (backend=bb) so the real
+    // scripts own the brief/worktree/thread/meta/profile. Native BB dispatch is the
+    // automatic fallback if the real spawn fails before a thread exists — and a
+    // future-scheduled send always uses native (fm-spawn has no sendAt).
+    const cur = await settings.get();
+    const scheduledFuture = input.sendAt !== undefined && input.sendAt > Date.now();
+    if (cur.transport === "real" && cur.fmHome.trim() !== "" && !scheduledFuture) {
+      try {
+        const rtHost = await resolveHostForProject(input.projectId, input.parentThreadId);
+        const realThreadId = await dispatchViaRealTransport(
+          crew,
+          {
+            task: input.task,
+            projectId: input.projectId,
+            parentThreadId: input.parentThreadId,
+            permissionMode: input.permissionMode,
+          },
+          rtHost,
+        );
+        if (realThreadId !== null && realThreadId !== "") {
+          crew.threadId = realThreadId;
+          await writeCrews([crew, ...(await readCrews())]);
+          await publishFleet();
+          // The real fm-spawn.sh already wrote state/<id>.meta + the brief; the
+          // native publishFmMeta/publishFmBrief backfills would only duplicate.
+          return crew;
+        }
+        bb.log.info(`real transport unavailable for crew=${crew.id}; using native dispatch`);
+      } catch (error) {
+        bb.log.warn(
+          `real transport error crew=${crew.id}; using native dispatch: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
     const capped = capPermission(input.permissionMode, await parentPermission(input.parentThreadId));
     let hostId: string | undefined;
     let environment: Parameters<typeof bb.sdk.threads.spawn>[0]["environment"];
@@ -2288,12 +2649,14 @@ export default async function plugin(bb: BbPluginApi) {
     const scriptCount = /FM_SCRIPTS=(\d+)/.exec(counts.output)?.[1] ?? "";
     const skillCount = /FM_SKILLS=(\d+)/.exec(counts.output)?.[1] ?? "";
     try {
-      await settings.experimental_set({ fmHome: path, fmScriptCount: scriptCount, fmSkillCount: skillCount });
+      await settings.experimental_set({ fmHome: path, fmScriptCount: scriptCount, fmSkillCount: skillCount, fmHostId: hostId });
     } catch {
       // persist best-effort
     }
-    // Load the real captain contract (AGENTS.md) so captain sessions run it.
+    // Load the real captain contract (AGENTS.md) so captain sessions run it, and
+    // the version-pinned skills inventory (fmHome/.agents/skills @ HEAD).
     await refreshCaptainContract(hostId, path, signal);
+    await refreshSkillsManifest(hostId, path, signal);
     const summary = [
       `host: ${hostId}`,
       `path: ${path} (${existed ? "existed" : "cloned"}; ${ffNote})`,
@@ -2313,6 +2676,13 @@ export default async function plugin(bb: BbPluginApi) {
   async function ensureRealModeForDeck(ctx: unknown, signal: AbortSignal | undefined): Promise<string> {
     const current = await settings.get();
     if (current.fmHome.trim() !== "") {
+      // Refresh the version-pinned skills inventory when HEAD moved (best-effort).
+      try {
+        const hostId = await resolveHostId(undefined, ctx);
+        await refreshSkillsManifest(hostId, current.fmHome, signal);
+      } catch {
+        // deck still renders; captain keeps the cached inventory
+      }
       return [
         `Real firstmate: active (fmHome ${current.fmHome}; ${toolbeltPhrase(current.fmScriptCount, current.fmSkillCount)}).`,
         `Dispatch through the full toolbelt: bb firstmate fm spawn -- --mode direct-PR -- ship "<task>".`,
@@ -2379,11 +2749,15 @@ export default async function plugin(bb: BbPluginApi) {
     fmHome: string;
     projectId?: string;
     parentThreadId?: string;
+    env?: Record<string, string>;
     timeoutMs: number;
     signal?: AbortSignal;
   }): Promise<{ exitCode: number | null; output: string; scriptPath: string }> {
     const script = normalizeFmScript(input.script);
     const scriptPath = `${input.fmHome}/bin/fm-${script}.sh`;
+    const extraEnv = Object.entries(input.env ?? {})
+      .filter(([, v]) => v !== "")
+      .map(([k, v]) => `export ${k}=${shQuote(v)}`);
     const prelude = [
       `export FM_HOME=${shQuote(input.fmHome)}`,
       `export FM_ROOT=${shQuote(input.fmHome)}`,
@@ -2392,6 +2766,7 @@ export default async function plugin(bb: BbPluginApi) {
       input.parentThreadId !== undefined ? `export FM_BB_PARENT_THREAD_ID=${shQuote(input.parentThreadId)}` : "",
       `export FM_BB_MACHINE=${shQuote(input.hostId)}`,
       "export FM_BB_VISIBLE=1",
+      ...extraEnv,
       `if [ ! -f ${shQuote(scriptPath)} ]; then echo "error: missing ${scriptPath}" >&2; exit 127; fi`,
       `${shQuote(scriptPath)} ${input.args.map(shQuote).join(" ")}`,
     ]
@@ -2436,10 +2811,145 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  // --- fm-watch supervisor (F1) ------------------------------------------------
+  // When watchOwner=fm-watch, the plugin runs and keeps alive the REAL fm-watch
+  // (via bin/fm-watch-arm.sh, backend=bb) against fmHome, and reads its liveness
+  // beacon (state/.last-watcher-beat). BB only suppresses its own stuck-page while
+  // that beat is live; a dead/stale watcher makes BB page as before. This closes
+  // the "flag on, nothing supervises" gap.
+  const FM_WATCH_BEAT_KEY = "fm-watch-beat";
+  const fmWatchBeatSchema = z.object({
+    beatAge: z.number(),
+    checkedAt: z.number(),
+    grace: z.number(),
+    relaunched: z.boolean(),
+  });
+
+  // The on-host beacon is fresh within `freshSec` AND the supervisor itself
+  // checked recently (so a dead supervisor cannot leave suppression latched on).
+  async function fmWatchLive(freshSec: number): Promise<boolean> {
+    const gate = Number.isFinite(freshSec) ? Math.max(30, Math.trunc(freshSec)) : 90;
+    const parsed = fmWatchBeatSchema.safeParse(await bb.storage.kv.get(FM_WATCH_BEAT_KEY));
+    if (!parsed.success) return false;
+    const beat = parsed.data;
+    if (Date.now() - beat.checkedAt > (gate + 60) * 1000) return false;
+    if (beat.beatAge < 0) return false;
+    return beat.beatAge <= gate;
+  }
+
+  async function resolveFmWatchHostId(): Promise<string | null> {
+    const s = await settings.get();
+    if (s.fmHostId.trim() !== "") return s.fmHostId.trim();
+    try {
+      for (const crew of await readCrews()) {
+        if (isSecondmateRoute(crew)) continue;
+        try {
+          const hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
+          if (hostId !== "") return hostId;
+        } catch {
+          // try next crew
+        }
+      }
+    } catch {
+      // none
+    }
+    return null;
+  }
+
+  // One supervision cycle on the host: read the beacon age, (re)launch a detached
+  // fm-watch-arm.sh when the watcher is stale/absent (arm attaches to a live one,
+  // so this is idempotent), and return the pre-relaunch age + a log tail for relay.
+  async function superviseFmWatch(
+    hostId: string,
+    fmHome: string,
+    graceSec: number,
+    signal?: AbortSignal,
+  ): Promise<{ beatAge: number; relaunched: boolean; logTail: string } | null> {
+    const grace = Math.max(30, Math.trunc(graceSec));
+    const beat = `${fmHome}/state/.last-watcher-beat`;
+    const log = `${fmHome}/state/.bb-watch-arm.log`;
+    const arm = `${fmHome}/bin/fm-watch-arm.sh`;
+    const script = [
+      `export FM_HOME=${shQuote(fmHome)}`,
+      `export FM_ROOT=${shQuote(fmHome)}`,
+      "export FM_BACKEND=bb",
+      `export FM_BB_MACHINE=${shQuote(hostId)}`,
+      "export FM_BB_VISIBLE=1",
+      "AGE=-1",
+      `if [ -f ${shQuote(beat)} ]; then AGE=$(( $(date +%s) - $(stat -c %Y ${shQuote(beat)} 2>/dev/null || echo 0) )); fi`,
+      "RELAUNCHED=0",
+      `if [ ! -x ${shQuote(arm)} ]; then echo FM_WATCH_NO_ARM;`,
+      `elif [ "$AGE" -lt 0 ] || [ "$AGE" -ge ${grace} ]; then`,
+      `  mkdir -p ${shQuote(`${fmHome}/state`)};`,
+      `  setsid nohup ${shQuote(arm)} >> ${shQuote(log)} 2>&1 </dev/null & RELAUNCHED=1;`,
+      "fi",
+      `printf 'FM_BEAT_AGE=%s\\nFM_RELAUNCHED=%s\\n' "$AGE" "$RELAUNCHED"`,
+      "echo '---FM_LOGTAIL---'",
+      `[ -f ${shQuote(log)} ] && tail -c 4000 ${shQuote(log)} || true`,
+    ].join("\n");
+    try {
+      const res = await runOnHost(hostId, script, 30_000, signal);
+      const ageMatch = /FM_BEAT_AGE=(-?\d+)/.exec(res.output);
+      const relMatch = /FM_RELAUNCHED=(\d)/.exec(res.output);
+      const beatAge = ageMatch ? Number(ageMatch[1]) : -1;
+      const relaunched = relMatch?.[1] === "1";
+      const tailIdx = res.output.indexOf("---FM_LOGTAIL---");
+      const logTail = tailIdx < 0 ? "" : res.output.slice(tailIdx + "---FM_LOGTAIL---".length).trim();
+      if (res.output.includes("FM_WATCH_NO_ARM")) {
+        bb.log.warn("fm-watch-supervisor: no fm-watch-arm.sh at fmHome; cannot run the real watcher.");
+      }
+      return { beatAge, relaunched, logTail };
+    } catch (error) {
+      bb.log.warn(`fm-watch-supervisor cycle failed: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    }
+  }
+
+  // fm-watch's actionable wake reason lines (its pages), for relay to the BB captain.
+  function extractWatchReasons(logTail: string): string {
+    const lines = logTail
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter((l) => /^(signal:|stale:|check:|heartbeat|watcher:)/.test(l));
+    return lines.slice(-8).join("\n");
+  }
+
+  function shortHash(text: string): string {
+    let h = 5381;
+    for (let i = 0; i < text.length; i++) h = ((h << 5) + h + text.charCodeAt(i)) | 0;
+    return String(h >>> 0);
+  }
+
+  // Deliver fm-watch's page to the BB captain(s): the distinct parent threads of
+  // the current crews. fm-watch owns the wedge policy; BB is its delivery transport.
+  async function relayWatchReasons(reasons: string): Promise<void> {
+    const parents = new Set<string>();
+    for (const crew of await readCrews()) {
+      if (crew.parentThreadId !== null && crew.parentThreadId !== "") parents.add(crew.parentThreadId);
+    }
+    const text = `🛰️ fm-watch:\n${reasons}`;
+    for (const parent of parents) {
+      await deliverToCaptain(parent, text, "fm-watch");
+    }
+  }
+
   async function stuckPass(): Promise<{ checked: number; notified: number }> {
     const current = await settings.get();
     const stuckMs = Math.min(480, Math.max(5, Number(current.supervisionStuckMin) || 30)) * 60000;
     const intervalMs = Math.min(60, Math.max(1, Number(current.supervisionIntervalMin) || 5)) * 60000;
+    // Watch ownership: when the real fm-watch owns policy AND its heartbeat is
+    // live, it owns wedge evidence and steering re-rings — BB must not also page
+    // the captain about a stuck crew (double-paging). But suppression is gated on a
+    // FRESH fm-watch beat: if the watcher is stale/absent, BB pages as before so a
+    // dead watcher never opens a silent supervision gap. BB idle/error/done events
+    // always flow (delivery, not policy).
+    const fmWatchOwns = current.watchOwner === "fm-watch" && current.fmHome.trim() !== "";
+    const suppressStuck = fmWatchOwns && (await fmWatchLive(current.watchHeartbeatSec));
+    if (fmWatchOwns && !suppressStuck) {
+      bb.log.warn(
+        "watchOwner=fm-watch but fm-watch heartbeat is stale/absent; BB stuck-pass is paging as fallback (no supervision gap).",
+      );
+    }
     const meta = asRecord(await bb.storage.kv.get<unknown>("watch-meta"));
     const lastPassAt = meta["lastPassAt"];
     const now = Date.now();
@@ -2536,7 +3046,7 @@ export default async function plugin(bb: BbPluginApi) {
         stuck: prev.stuck,
         ...(activityAt !== undefined ? { activityAt } : {}),
       };
-      if (!prev.stuck && now - prev.at >= stuckMs) {
+      if (!suppressStuck && !prev.stuck && now - prev.at >= stuckMs) {
         await notifyCaptain(
           crew,
           `stuck (${outMin}m no output change, no tool/file activity ${actMin}m)`,
@@ -3320,10 +3830,13 @@ export default async function plugin(bb: BbPluginApi) {
       : "Firstmate crews are available. Run /captain or firstmate_deck to take the deck.";
     // Load the real firstmate captain contract (AGENTS.md) into marked captain
     // sessions when real mode is active. Truncated to the SDK's 4096-char ceiling.
-    const instructions =
+    const contractBlock =
       marked && captainContractCache !== ""
-        ? truncate(`${base}\n\n== Real firstmate captain contract (fmHome/AGENTS.md) ==\n${captainContractCache}`, 4096)
-        : base;
+        ? `\n\n== Real firstmate captain contract (fmHome/AGENTS.md) ==\n${captainContractCache}`
+        : "";
+    const skillsBlock = marked && skillsManifestCache !== "" ? `\n\n${skillsManifestCache}` : "";
+    const instructions =
+      contractBlock === "" && skillsBlock === "" ? base : truncate(`${base}${contractBlock}${skillsBlock}`, 4096);
     return {
       tools: [...CAPTAIN_TOOLS],
       skills: marked ? [...CAPTAIN_SKILLS] : ["firstmate"],
@@ -3888,13 +4401,15 @@ export default async function plugin(bb: BbPluginApi) {
           }
           case "mark-crew": {
             const id = rest[0];
-            if (id === undefined) return fail("Usage: bb firstmate mark-crew <thread-id> [--shape ship|scout]");
+            if (id === undefined) return fail("Usage: bb firstmate mark-crew <thread-id> [--shape ship|scout] [--task <id>]");
             const shape = toShape(flagStr(flags, "shape"));
-            await bb.sdk.threads.updatePluginMetadata({
-              threadId: id,
-              set: { crew: "true", shape },
-            });
-            return reply({ marked: true, threadId: id, shape }, `Marked thread ${id} as ${shape} crew.`);
+            const taskId = (flagStr(flags, "task") ?? "").trim();
+            // Record the fm task id as crewId so a plugin-side fallback can find and
+            // adopt an orphan thread (created by fm-spawn but not yet recorded) by id.
+            const set: Record<string, string> = { crew: "true", shape };
+            if (taskId !== "") set["crewId"] = taskId;
+            await bb.sdk.threads.updatePluginMetadata({ threadId: id, set });
+            return reply({ marked: true, threadId: id, shape, task: taskId || null }, `Marked thread ${id} as ${shape} crew.`);
           }
           case "bearings": {
             const snap = await bearingsSnapshot();
@@ -4310,6 +4825,53 @@ export default async function plugin(bb: BbPluginApi) {
             },
             { once: true },
           );
+        });
+      }
+    },
+  });
+
+  // Runs and keeps alive the real fm-watch when watchOwner=fm-watch (else idle).
+  // It re-arms fm-watch (which self-terminates on an actionable wake) and reads
+  // its heartbeat so stuckPass can gate suppression on a live watcher — no gap.
+  bb.background.service("fm-watch-supervisor", {
+    async start(signal) {
+      let lastRelayHash = "";
+      while (!signal.aborted) {
+        let gate = 90;
+        try {
+          const s = await settings.get();
+          gate = Number.isFinite(s.watchHeartbeatSec) ? Math.max(30, Math.trunc(s.watchHeartbeatSec)) : 90;
+          if (s.watchOwner === "fm-watch" && s.fmHome.trim() !== "") {
+            const hostId = await resolveFmWatchHostId();
+            if (hostId === null) {
+              bb.log.warn("fm-watch-supervisor: no host to reach fmHome (set fmHostId or dispatch a crew).");
+            } else {
+              const res = await superviseFmWatch(hostId, s.fmHome.trim(), gate, signal);
+              if (res !== null) {
+                await bb.storage.kv.set(FM_WATCH_BEAT_KEY, {
+                  beatAge: res.beatAge,
+                  checkedAt: Date.now(),
+                  grace: gate,
+                  relaunched: res.relaunched,
+                });
+                const reasons = extractWatchReasons(res.logTail);
+                if (reasons !== "") {
+                  const h = shortHash(reasons);
+                  if (h !== lastRelayHash) {
+                    lastRelayHash = h;
+                    await relayWatchReasons(reasons);
+                  }
+                }
+              }
+            }
+          }
+        } catch (error) {
+          bb.log.warn(error instanceof Error ? `fm-watch-supervisor: ${error.message}` : "fm-watch-supervisor failed");
+        }
+        const checkMs = Math.max(15, Math.min(30, Math.floor(gate / 2))) * 1000;
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, checkMs);
+          signal.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
         });
       }
     },

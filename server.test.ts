@@ -1653,3 +1653,408 @@ test("tell --resolve-key writes the fm-classify resolved line into real state", 
     await host.harness.lifecycle.dispose();
   }
 });
+
+// --- Phase 3: real transport swap, watch ownership, skills manifest ----------
+
+function hostRcPayload(payload: string, code = 0) {
+  const text = `${payload}\n__FM_HOST_RC:${code}\n`;
+  return { nextSeq: 1, chunks: [{ dataBase64: Buffer.from(text).toString("base64") }] };
+}
+
+// Wire a fake host whose terminal output is routed by the command text, so a
+// dispatch through the real transport can be driven deterministically. `spawnExit`
+// is the exit code fm-spawn.sh reports; `threadId` is what state/<id>.meta carries
+// for bb_thread_id after a successful spawn ("" means the spawn left no thread).
+function stubRealTransportHost(
+  host: Awaited<ReturnType<typeof load>>,
+  opts: { spawnExit: number; threadIdAfterSpawn: string; threadIdBeforeSpawn?: string },
+) {
+  host.harness.sdk.stub("threadSections.list", async () => []);
+  host.harness.sdk.stub("threadSections.create", async () => ({ id: "sec_crews" }));
+  host.harness.sdk.stub("environments.list", async () => [
+    { hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" },
+  ]);
+  host.harness.sdk.stub("environments.get", async () => ({
+    id: "env_wt",
+    hostId: "host_1",
+    path: "/wt",
+    isWorktree: true,
+    status: "ready",
+  }));
+  host.harness.sdk.stub("threads.get", async () =>
+    makeThreadResponse({ id: "thr_crew", status: "starting", environmentId: "env_wt" }),
+  );
+  const cmds = new Map<string, string>();
+  const seen: string[] = [];
+  let n = 0;
+  let spawned = false;
+  host.harness.sdk.stub("terminals.create", async (args: { start?: { command?: string } }) => {
+    const id = `term_${++n}`;
+    const cmd = args.start?.command ?? "";
+    cmds.set(id, cmd);
+    seen.push(cmd);
+    return { id };
+  });
+  host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+  host.harness.sdk.stub("terminals.close", async () => ({}));
+  host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
+    const cmd = cmds.get(args.terminalId) ?? "";
+    if (cmd.includes("bin/fm-spawn.sh")) {
+      spawned = true;
+      return hostRcPayload("", opts.spawnExit);
+    }
+    if (cmd.includes("bb_thread_id")) {
+      const tid = spawned ? opts.threadIdAfterSpawn : (opts.threadIdBeforeSpawn ?? "");
+      return hostRcPayload(tid === "" ? "FM_META_ABSENT" : tid, 0);
+    }
+    return hostRcPayload("", 0);
+  });
+  return { seen };
+}
+
+async function crewsKv(host: Awaited<ReturnType<typeof load>>) {
+  return (await host.bb.storage.kv.get("crews")) as Array<{ id: string; threadId: string }>;
+}
+
+function realHost() {
+  return createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", transport: "real" },
+  });
+}
+
+test("real transport dispatches through fm-spawn.sh and adopts its thread id", async () => {
+  const host = realHost();
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRealTransportHost(host, { spawnExit: 0, threadIdAfterSpawn: "thr_real" });
+    const result = await host.harness.behavior.runCli(
+      ["dispatch", "--project", "proj_1", "--", "fix flaky login"],
+      { projectId: "proj_1" },
+    );
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /Dispatched ship crew/);
+    assert.ok(seen.some((c) => c.includes("bin/fm-spawn.sh")), "fm-spawn.sh was not invoked");
+    assert.ok(seen.some((c) => c.includes("--backend") && c.includes("bb")), "backend=bb not passed");
+    // No native BB spawn happened.
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
+    const crews = await crewsKv(host);
+    assert.equal(crews[0]?.threadId, "thr_real");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("real transport falls back to native BB spawn when the spawn leaves no thread", async () => {
+  const host = realHost();
+  await plugin(host.bb);
+  try {
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew" }));
+    const { seen } = stubRealTransportHost(host, { spawnExit: 1, threadIdAfterSpawn: "" });
+    const result = await host.harness.behavior.runCli(
+      ["dispatch", "--project", "proj_1", "--", "fix flaky login"],
+      { projectId: "proj_1" },
+    );
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.ok(seen.some((c) => c.includes("bin/fm-spawn.sh")), "fm-spawn.sh was not attempted");
+    // Real spawn produced no thread → native BB spawn is the fallback.
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 1);
+    const crews = await crewsKv(host);
+    assert.equal(crews[0]?.threadId, "thr_crew");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("real transport never double-spawns when the meta already has a thread", async () => {
+  const host = realHost();
+  await plugin(host.bb);
+  try {
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew" }));
+    const { seen } = stubRealTransportHost(host, {
+      spawnExit: 0,
+      threadIdAfterSpawn: "thr_real",
+      threadIdBeforeSpawn: "thr_pre",
+    });
+    const result = await host.harness.behavior.runCli(
+      ["dispatch", "--project", "proj_1", "--", "fix flaky login"],
+      { projectId: "proj_1" },
+    );
+    assert.equal(result.exitCode, 0, result.stderr);
+    // A recorded thread id short-circuits: no fm-spawn, no native spawn.
+    assert.ok(!seen.some((c) => c.includes("bin/fm-spawn.sh")), "fm-spawn ran despite an existing thread");
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
+    const crews = await crewsKv(host);
+    assert.equal(crews[0]?.threadId, "thr_pre");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+async function stuckHostWithWatchOwner(beat: { beatAge: number; ageOfCheck: number } | null) {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", watchOwner: "fm-watch" },
+  });
+  await plugin(host.bb);
+  stubBusyCrew(host);
+  const now = Date.now();
+  await host.harness.behavior.setSettings({ supervisionEnabled: true });
+  await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew", "thr_cap")]);
+  await host.bb.storage.kv.set("watch", {
+    c1: { status: "active", hash: "same", at: now - 31 * 60_000, stuck: false },
+  });
+  host.harness.sdk.stub("threads.events.list", async () => [{ createdAt: now - 40 * 60_000 }]);
+  if (beat !== null) {
+    await host.bb.storage.kv.set("fm-watch-beat", {
+      beatAge: beat.beatAge,
+      checkedAt: now - beat.ageOfCheck,
+      grace: 90,
+      relaunched: false,
+    });
+  }
+  return host;
+}
+
+test("fm-watch owner with a LIVE heartbeat suppresses BB's stuck page (no double-paging)", async () => {
+  const host = await stuckHostWithWatchOwner({ beatAge: 10, ageOfCheck: 5_000 });
+  try {
+    const pass = await runStuckOnce(host);
+    assert.equal(pass.notified, 0, "a live fm-watch owns the wedge; BB must not double-page");
+    assert.equal(sendCalls(host).length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("fm-watch owner with a STALE heartbeat still lets BB page (no supervision gap)", async () => {
+  const host = await stuckHostWithWatchOwner({ beatAge: 600, ageOfCheck: 5_000 });
+  try {
+    const pass = await runStuckOnce(host);
+    assert.equal(pass.notified, 1, "a stale fm-watch is not supervising; BB must page the wedge");
+    const sends = sendCalls(host);
+    assert.equal(sends.length, 1);
+    assert.equal(sends[0]?.threadId, "thr_cap");
+    assert.match(sends[0]?.text ?? "", /stuck \(/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("fm-watch owner with NO heartbeat record still lets BB page (never a silent gap)", async () => {
+  const host = await stuckHostWithWatchOwner(null);
+  try {
+    const pass = await runStuckOnce(host);
+    assert.equal(pass.notified, 1, "no fm-watch beat = no supervisor; BB must page");
+    assert.equal(sendCalls(host).length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("the fm-watch supervisor relaunches the real watcher when the beacon is stale", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", watchOwner: "fm-watch", fmHostId: "host_1" },
+  });
+  await plugin(host.bb);
+  try {
+    const cmds: string[] = [];
+    const ids = new Map<string, string>();
+    let n = 0;
+    host.harness.sdk.stub("terminals.create", async (args: { start?: { command?: string } }) => {
+      const id = `term_${++n}`;
+      const cmd = args.start?.command ?? "";
+      ids.set(id, cmd);
+      cmds.push(cmd);
+      return { id };
+    });
+    host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+    host.harness.sdk.stub("terminals.close", async () => ({}));
+    host.harness.sdk.stub("threads.send", async () => ({}));
+    await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew", "thr_cap")]);
+    // Beacon absent → the supervisor must (re)launch fm-watch-arm.sh and report age -1.
+    host.harness.sdk.stub("terminals.output", async () =>
+      hostRcPayload("FM_BEAT_AGE=-1\nFM_RELAUNCHED=1\n---FM_LOGTAIL---\nstale: fm-abc (escalation 1)", 0),
+    );
+    const run = host.harness.behavior.runService("fm-watch-supervisor");
+    const deadline = Date.now() + 4000;
+    let beat: { beatAge: number; relaunched: boolean } | null = null;
+    while (Date.now() < deadline) {
+      const raw = await host.bb.storage.kv.get("fm-watch-beat");
+      if (raw && typeof raw === "object" && "relaunched" in raw) {
+        beat = raw as { beatAge: number; relaunched: boolean };
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    run.controller.abort();
+    await run.done;
+    assert.ok(beat, "supervisor never wrote a heartbeat record");
+    assert.equal(beat.relaunched, true);
+    assert.ok(
+      cmds.some((c) => c.includes("bin/fm-watch-arm.sh") && c.includes("setsid")),
+      "supervisor did not detach-launch fm-watch-arm.sh",
+    );
+    // The watcher's page reason was relayed to the captain.
+    const relayed = sendCalls(host).some((s) => (s.text ?? "").includes("fm-watch") && (s.text ?? "").includes("stale: fm-abc"));
+    assert.ok(relayed, "supervisor did not relay the fm-watch wake reason to the captain");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("captain sessions get the version-pinned real skills inventory", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: {
+      fmSkillsManifest: JSON.stringify({
+        head: "abc1234567890",
+        skills: [
+          { name: "stow", desc: "tiered memory" },
+          { name: "afk", desc: "away mandate" },
+        ],
+      }),
+    },
+  });
+  await plugin(host.bb);
+  try {
+    const cfg = await host.harness.behavior.resolveAgentConfiguration(
+      makePluginAgentConfigurationContext({ pluginMetadata: { captain: "true" } }),
+    );
+    assert.match(cfg.instructions ?? "", /Real firstmate skills \(fmHome\/\.agents\/skills @ abc123456789/);
+    assert.match(cfg.instructions ?? "", /- stow: tiered memory/);
+    assert.match(cfg.instructions ?? "", /- afk: away mandate/);
+    // Crews still get nothing.
+    const crew = await host.harness.behavior.resolveAgentConfiguration(
+      makePluginAgentConfigurationContext({ pluginMetadata: { crew: "true" } }),
+    );
+    assert.doesNotMatch(crew.instructions ?? "", /Real firstmate skills/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// --- F2: fallback adopts an orphan thread instead of double-spawning ----------
+
+// Route the real-transport host calls and capture the generated task id from the
+// fm-spawn command so the orphan-thread stub can present a matching title.
+function stubOrphanTransportHost(
+  host: Awaited<ReturnType<typeof load>>,
+  opts: { byTitle: boolean },
+) {
+  const captured = { taskId: "" };
+  host.harness.sdk.stub("threadSections.list", async () => []);
+  host.harness.sdk.stub("threadSections.create", async () => ({ id: "sec_crews" }));
+  host.harness.sdk.stub("environments.list", async () => [
+    { hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" },
+  ]);
+  host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_x", status: "starting" }));
+  const cmds = new Map<string, string>();
+  let n = 0;
+  host.harness.sdk.stub("terminals.create", async (args: { start?: { command?: string } }) => {
+    const id = `term_${++n}`;
+    const cmd = args.start?.command ?? "";
+    cmds.set(id, cmd);
+    const m = /\/state\/([A-Za-z0-9]+)\.meta/.exec(cmd);
+    if (m) captured.taskId = m[1]!;
+    return { id };
+  });
+  host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+  host.harness.sdk.stub("terminals.close", async () => ({}));
+  // fm-spawn exits 0, but the meta never records bb_thread_id (hard-kill window).
+  host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
+    const cmd = cmds.get(args.terminalId) ?? "";
+    if (cmd.includes("bb_thread_id")) return hostRcPayload("FM_META_ABSENT", 0);
+    return hostRcPayload("", 0);
+  });
+  // The orphan thread fm-spawn created but did not record.
+  host.harness.sdk.stub("threads.list", async () => [
+    {
+      id: "thr_orphan",
+      projectId: "proj_1",
+      parentThreadId: "thr_cap",
+      title: opts.byTitle ? `fm-${captured.taskId}` : "renamed-window",
+    },
+  ]);
+  host.harness.sdk.stub("threads.getPluginMetadata", async () =>
+    opts.byTitle ? {} : { crew: "true", crewId: captured.taskId },
+  );
+  return captured;
+}
+
+test("real transport adopts an orphan thread by title (mark-crew failed) instead of double-spawning", async () => {
+  const host = realHost();
+  await plugin(host.bb);
+  try {
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_native" }));
+    stubOrphanTransportHost(host, { byTitle: true });
+    const result = await host.harness.behavior.runCli(
+      ["dispatch", "--project", "proj_1", "--", "fix flaky login"],
+      { projectId: "proj_1" },
+    );
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0, "must not native-spawn a duplicate");
+    const crews = await crewsKv(host);
+    assert.equal(crews[0]?.threadId, "thr_orphan");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("real transport adopts an orphan thread by recorded task id when the title differs", async () => {
+  const host = realHost();
+  await plugin(host.bb);
+  try {
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_native" }));
+    stubOrphanTransportHost(host, { byTitle: false });
+    const result = await host.harness.behavior.runCli(
+      ["dispatch", "--project", "proj_1", "--", "fix flaky login"],
+      { projectId: "proj_1" },
+    );
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
+    const crews = await crewsKv(host);
+    assert.equal(crews[0]?.threadId, "thr_orphan");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// --- item 3: read-through reconciliation against real state/<id>.meta ---------
+
+test("read-through drops a KV crew whose real state/<id>.meta is gone (one batched read)", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", readThrough: true, fmHostId: "host_1" },
+  });
+  await plugin(host.bb);
+  try {
+    host.harness.sdk.stub("threads.list", async () => []);
+    // Only c1 still has a meta; c2 was torn down in the real plane.
+    let metaReads = 0;
+    host.harness.sdk.stub("terminals.create", async () => ({ id: "term_1" }));
+    host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+    host.harness.sdk.stub("terminals.close", async () => ({}));
+    host.harness.sdk.stub("terminals.output", async () => {
+      metaReads++;
+      return hostRcPayload("c1", 0);
+    });
+    await host.bb.storage.kv.set("crews", [
+      crewRow("c1", "thr_c1", "thr_cap"),
+      crewRow("c2", "thr_c2", "thr_cap"),
+    ]);
+    const result = await host.harness.behavior.runCli(["crews"], { projectId: "proj_1" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    const crews = (await host.bb.storage.kv.get("crews")) as Array<{ id: string }>;
+    assert.deepEqual(crews.map((c) => c.id), ["c1"], "c2 (no real meta) must be reconciled out");
+    assert.equal(metaReads >= 1, true, "reconciliation should do at least the one batched meta read");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});

@@ -55,6 +55,40 @@ rewrite. Two planes, one runtime:
   use `fm` when you need the full script policy (relay/mail/voice, backlog
   handoff, afk/bearings contracts, adapters). Never fork or reimplement the scripts.
 
+### Feature flags: real transport + watch ownership + read-through
+
+All switchable in plugin settings (default off; flip back without a redeploy).
+They degrade to the current native behavior with a log line.
+
+- **`transport`** (`native` | `real`, default `native`): with `real` and real
+  mode active, `firstmate_dispatch` runs end-to-end through the real
+  `fm-brief.sh` + `fm-spawn.sh` (backend=bb) — the real scripts create the brief,
+  worktree, thread, `state/<id>.meta` and profile. If the real spawn fails
+  **before** a thread exists, dispatch falls back to native BB spawn; it never
+  double-spawns (fm-spawn's `BB_ABORT_CLEANUP` cleans up graceful failures, and
+  for the hard-kill window the plugin adopts the orphan thread by `fm-<id>` title
+  / recorded `crewId` before falling back). Future-scheduled sends always use
+  native.
+- **`watchOwner`** (`native` | `fm-watch`, default `native`): with `fm-watch`,
+  the plugin's `fm-watch-supervisor` service runs and keeps the **real fm-watch**
+  alive against `fmHome`, relays its wake reasons to you, and reads its heartbeat.
+  BB suppresses its own stuck-page **only while that heartbeat is live** — a dead
+  watcher makes BB page as before, so there is never a supervision gap. Safe to
+  enable; keep `native` to use BB's stuck-pass. (Tune the freshness gate with
+  `watchHeartbeatSec`, default 90s; the host is `fmHostId`, set at init.)
+- **`readThrough`** (default off): real `state/<id>.meta` becomes the source of
+  truth for crew existence — one batched host read per crews/bearings/deliver
+  reconciles the KV cache and drops crews the real plane tore down. Off = KV only.
+
+### Real skills inventory
+
+On deck (and when `fmHome` HEAD moves) the plugin refreshes a version-pinned
+inventory of `fmHome/.agents/skills` and injects it into this captain session, so
+you know which real policy skills exist. Read and run them through the toolbelt
+(`bb firstmate fm <script>` / the skill's own entrypoints). Crews get none.
+Caveat: the list only refreshes on deck, so after an fmHome upgrade re-run
+`/captain` (deck) to pick up new skills.
+
 ### Authoritative state + status protocol
 
 - **Real state is authoritative; KV is a rebuildable cache.** After an upgrade,
