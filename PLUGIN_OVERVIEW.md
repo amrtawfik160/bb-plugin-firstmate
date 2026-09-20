@@ -144,16 +144,23 @@ Install, then run `/captain` in any thread — that calls `deck` and is the setu
     --recovery-generation <gen>`). Two distinct reports both survive present + ack
     (proven). A cheap constant doorbell still rings; a dropped doorbell no longer loses
     the report. Degrades to the KV fire-and-forget send with a log.
-  - `tellOwner=real` — a captain→crew steer is written as a durable sequenced record
-    `state/<id>.inbox/NNN.msg` via the real `fm_task_inbox_write` primitive (body is a
-    single positional arg → stored VERBATIM; `fm-send.sh` has no literal-body form, so
-    a body starting with `--resolve-key`/`--key`/`/`/`$` would be eaten by its option
-    loop or diverted to the harness parser), then delivered as the LITERAL doorbell
-    over BB — identical to the KV path. Delivery needs no `state/<id>.meta`, so a crew
-    created before real transport is never rendered unsteerable; if the BB send itself
-    fails, `tellCrew`'s own send is the fallback. `interrupt`/`stop` stay hard steers,
-    never the inbox. ack = the crew's `mv` into `handled/`, fm-watch's re-ring ladder
-    for a crew that reads its inbox. Degrades to the KV doorbell with a log.
+  - `tellOwner=real` — a captain→crew steer is written as a durable `fire-and-forget`
+    record `state/<id>.inbox/NNN.msg` via the real `fm_task_inbox_write` primitive
+    (body is a single positional arg → stored VERBATIM; `fm-send.sh` has no
+    literal-body form, so a body starting with `--resolve-key`/`--key`/`/`/`$` would be
+    eaten by its option loop or diverted to the harness parser), then delivered as the
+    LITERAL doorbell over BB — identical to the KV path. The record is written
+    `fire-and-forget` on purpose: a BB thread crew is steered over the BB send and
+    never reads/acks its inbox, so a NORMAL record would leave fm-watch's
+    `inbox_steer_check` seeing a permanently-unhandled steer and escalate it into a
+    FALSE stuck-crewmate-recovery (immediate for an idle crew, since the bb backend
+    maps idle→dead). fire-and-forget records are skipped by the re-ring ladder
+    (`fm_task_inbox_oldest_unhandled` → `due_action` stays `quiet`), so the record is a
+    durable audit trail the watcher never weaponizes. Delivery needs no
+    `state/<id>.meta`, so a crew created before real transport is never rendered
+    unsteerable; if the BB send itself fails, `tellCrew`'s own send is the fallback.
+    `interrupt`/`stop` stay hard steers, never the inbox. Degrades to the KV doorbell
+    with a log.
   - `turnEndGuard=re-ring` — a non-blocking captain turn-end backstop. BB exposes NO
     blocking stop hook (its `PluginEvents.on("thread.idle")` fires AFTER idle and
     returns void — it cannot veto the turn the way native firstmate's exit-2 Stop

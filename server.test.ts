@@ -11,6 +11,7 @@ import {
   makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
 import plugin, { formatFmMeta, formatSecondmate, pickSecondmate, toolbeltPhrase, versionAtLeast } from "./server.ts";
+import { latestStatus, statusProtocolSummary } from "./lib/policy.ts";
 
 const SKILLS = ["captain", "firstmate", "afk", "ahoy", "bearings", "quiet", "stow"] as const;
 
@@ -3150,6 +3151,44 @@ test("IT F5: turnEndGuard keeps re-ringing at a slow floor after the budget (nev
     await emitCaptainIdle();
     const st = (await host.bb.storage.kv.get("turnend-budget:thr_cap")) as { count?: number };
     assert.equal(st?.count, 0, "budget resets when the queue drains");
+  } finally {
+    await host.harness.lifecycle.dispose();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// ---- re-review: tellOwner steer must not be weaponized by fm-watch ----
+
+test("note: report lines never override the crew's real terminal verb (latestStatus/summary)", () => {
+  // A crew's real verb followed by our appended report note: latestStatus must still
+  // report `done`, and the summary must not show the note as the crew's state.
+  const lines = ["working: building", "done: shipped PR #9", "note: crew c1 update REPORTX"];
+  assert.deepEqual(latestStatus(lines), { verb: "done", note: "shipped PR #9" });
+  const summary = statusProtocolSummary(lines);
+  assert.match(summary ?? "", /state: done/);
+  assert.doesNotMatch(summary ?? "", /REPORTX/);
+});
+
+test("IT F3b: tellOwner=real writes a fire-and-forget record → fm_task_inbox_due_action stays quiet (no false stuck-recovery)", { skip: !FM_INTEGRATION }, async () => {
+  const home = scratchFmHome();
+  const host = itHost(home, { tellOwner: "real" });
+  await plugin(host.bb);
+  try {
+    stubRealExecHost(host);
+    await seedCrew(host);
+    const res = await host.harness.behavior.runCli(["tell", "c1", "--message=please rebase"], { projectId: "proj_1" });
+    assert.equal(res.exitCode, 0, res.stderr);
+    // the record must carry delivery=fire-and-forget
+    const rec = readFileSync(join(home, "state", "c1.inbox", "001.msg"), "utf8");
+    assert.match(rec, /delivery=fire-and-forget/, "steer record must be fire-and-forget");
+    // and the REAL ladder must report quiet even past grace — this is exactly what
+    // fm-watch's inbox_steer_check gates on, so it never escalates a healthy crew.
+    const due = spawnSync(
+      "bash",
+      ["-c", `export FM_HOME=${home} FM_ROOT=${home} FM_TASK_INBOX_GRACE_SECS=0; . ${home}/bin/fm-task-inbox-lib.sh; fm_task_inbox_due_action ${home}/state c1`],
+      { encoding: "utf8", timeout: 20_000 },
+    );
+    assert.equal((due.stdout ?? "").trim(), "quiet", `due_action must be quiet, got: ${due.stdout} / ${due.stderr}`);
   } finally {
     await host.harness.lifecycle.dispose();
     rmSync(home, { recursive: true, force: true });

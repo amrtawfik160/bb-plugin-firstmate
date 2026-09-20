@@ -2189,11 +2189,20 @@ export default async function plugin(bb: BbPluginApi) {
   // (MESSAGE=$*), so a body starting with `--resolve-key`/`--fire-and-forget`/`--key`
   // is eaten by its option loop and a leading `/` or `$` is diverted to the crew
   // harness's own parser — none of which the captain intends for a chat steer.
-  // `fm_task_inbox_write <state> <id> <body>` takes the body as ONE positional arg,
-  // so every prefix is stored verbatim (proven). F3: it needs no state/<id>.meta, so
-  // a crew created before real transport is never rendered unsteerable. Base64 keeps
-  // the body out of the command text entirely. Best-effort: false ⇒ no durable record
-  // (caller still delivers the doorbell).
+  // `fm_task_inbox_write <state> <id> <body> fire-and-forget` takes the body as ONE
+  // positional arg, so every prefix is stored verbatim (proven). F3: it needs no
+  // state/<id>.meta, so a crew created before real transport is never rendered
+  // unsteerable. Base64 keeps the body out of the command text entirely.
+  //
+  // The record is written `fire-and-forget` DELIBERATELY (re-review HIGH): a BB thread
+  // crew is steered over the BB send and never reads its inbox, so it never `mv`s the
+  // record into handled/ to ack it. A normal record would leave fm-watch's
+  // inbox_steer_check seeing a permanently-unhandled steer and escalate it into a
+  // FALSE stuck-crewmate-recovery (immediately for an idle crew, since the bb backend
+  // maps idle→dead). fire-and-forget records are excluded from the re-ring ladder
+  // (fm_task_inbox_oldest_unhandled skips them → due_action stays `quiet`), so the
+  // record stays a durable audit trail without ever being weaponized by the watcher.
+  // Best-effort: false ⇒ no durable record (caller still delivers the doorbell).
   async function writeInboxRecord(hostId: string, fmHome: string, crewId: string, body: string): Promise<boolean> {
     const lib = `${fmHome}/bin/fm-task-inbox-lib.sh`;
     const stateDir = `${fmHome}/state`;
@@ -2205,7 +2214,7 @@ export default async function plugin(bb: BbPluginApi) {
       `. ${shQuote(lib)}`,
       `mkdir -p ${shQuote(stateDir)}`,
       `body=$(printf '%s' ${shQuote(b64)} | base64 -d)`,
-      `fm_task_inbox_write ${shQuote(stateDir)} ${shQuote(crewId)} "$body" >/dev/null`,
+      `fm_task_inbox_write ${shQuote(stateDir)} ${shQuote(crewId)} "$body" fire-and-forget >/dev/null`,
     ].join("\n");
     try {
       const res = await runOnHost(hostId, script, 20_000);
@@ -2220,14 +2229,15 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  // tellOwner=real: a captain→crew steer gets a durable sequenced steering-inbox
-  // record (audit + fm-watch's re-ring ladder for a crew that reads its inbox) AND is
-  // delivered as the literal doorbell over BB — identical to the KV path, so no crew
-  // regresses. Delivery never depends on fm-send target resolution or state/<id>.meta
-  // (F3), and the body is stored/delivered verbatim regardless of prefix (F4).
-  // interrupt/stop stay hard steers, never this path. Returns a status string once
-  // the literal doorbell is delivered; null when tellOwner=kv, fmHome unset, or the
-  // BB send itself fails (so tellCrew's own send is the last-resort fallback).
+  // tellOwner=real: a captain→crew steer gets a durable fire-and-forget steering-inbox
+  // record (verbatim audit trail; NOT re-rung — the crew is steered over BB, not by
+  // reading its inbox) AND is delivered as the literal doorbell over BB — identical to
+  // the KV path, so no crew regresses. Delivery never depends on fm-send target
+  // resolution or state/<id>.meta (F3), and the body is stored/delivered verbatim
+  // regardless of prefix (F4). interrupt/stop stay hard steers, never this path.
+  // Returns a status string once the literal doorbell is delivered; null when
+  // tellOwner=kv, fmHome unset, or the BB send itself fails (so tellCrew's own send is
+  // the last-resort fallback).
   async function sendViaInbox(crew: Crew, message: string): Promise<string | null> {
     const current = await settings.get();
     if (current.tellOwner !== "real") return null;
@@ -2253,8 +2263,8 @@ export default async function plugin(bb: BbPluginApi) {
     }
     bb.log.info(`fm inbox steer crew=${crew.id} ${durable ? "durable record + literal doorbell" : "literal doorbell (no durable record)"}`);
     return durable
-      ? `Told crew ${crew.id} (durable steering-inbox record + literal doorbell; ack = crew mv to handled/)`
-      : `Told crew ${crew.id} (literal doorbell; durable record unavailable — logged)`;
+      ? `Told crew ${crew.id} (delivered over BB + durable fire-and-forget inbox record for audit; not re-rung)`
+      : `Told crew ${crew.id} (delivered over BB; durable record unavailable — logged)`;
   }
 
   async function tellCrew(crew: Crew, message: string, interrupt: boolean): Promise<string> {
