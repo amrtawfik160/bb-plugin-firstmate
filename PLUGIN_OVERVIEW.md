@@ -105,7 +105,9 @@ Install, then run `/captain` in any thread — that calls `deck` and is the setu
     `<!--a:YYYY-MM-DD-->` reinforced-date marker). `show` reads the real files.
   Free text is written to host files as a base64 payload decoded on the host (never
   interpolated into the shell command), so no line of user/agent text can inject a
-  command or truncate a file; the read-modify-write of the learnings file is
+  command or truncate a file. The write is atomic: the payload is decoded to a
+  sibling temp file and `mv -f`'d over the target, so a failed or interrupted write
+  never truncates the existing file. The read-modify-write of the learnings file is
   serialized in-process against concurrent tool calls.
   `bb firstmate migrate-owners` idempotently projects existing KV queue/decisions/
   afk/quiet/memory into the real files for the owners set to `real` (re-runnable:
@@ -151,20 +153,30 @@ and why.
 | 6 | Merge gating (zero-checks, waiver) | CLOSED | Zero checks = no failing checks; `--allow-red <check>` waives one exact check, separate from `--yes`. |
 | 7 | Scout delivery/retirement semantics | PARTIAL | Ships default to isolated worktrees; scout durable external `report.md` and completed-scout scratch discard remain native-owned via real teardown. |
 | 8 | Retry = resubmission, not recovery relaunch | CLOSED | `retry` with `--model`/`--provider`/`--reasoning-level` relaunches a fresh thread in the same worktree. |
-| 9 | Queue/decisions/memory/AFK/quiet lookalikes | CLOSED | Each routes through its native owner behind a flag (`queueOwner`/`decisionsOwner`/`afkOwner`/`quietOwner`/`memoryOwner`); Phase 5 hardened queue (caller-owns-id) and memory (stdin writes + cap/rotate). |
+| 9 | Queue/decisions/memory/AFK/quiet lookalikes | CLOSED | Each routes through its native owner behind a flag (`queueOwner`/`decisionsOwner`/`afkOwner`/`quietOwner`/`memoryOwner`); Phase 5 hardened queue (caller-owns-id) and memory (atomic chunked host writes + cap/rotate). |
 | 10 | Secondmate is a different feature | PARTIAL | Routing now honors natural-language `scope` + a non-exclusive project clone list (`pickSecondmate`); multiple mates supported. OPEN: seeded isolated `FM_HOME`, backlog handoff, config/memory inheritance, and an independently-supervising child firstmate — BB's backend `create_task` only spawns non-nesting leaf crews and native refuses `--secondmate` on backend=bb, so a real secondmate home cannot be stood up without a secondmate-capable bb backend. |
 | 11 | Deck never renders real bearings | CLOSED | Deck runs real `fm-bearings-snapshot` (authoritative) beside the KV digest (labelled cache). |
 | 12 | Real-mode version not the referenced checkout | CLOSED | Reused clones fast-forward (ff-only, clean tree) on init; script/skill counts read from the actual clone. |
 
 ### Phase 5 specifics
 
-- **Memory (item 9):** host file writes stream the payload via `runOnHost` stdin
-  (`writeHostFile`), removing the `HOST_COMMAND_MAX` ceiling that silently froze
-  `learnings.md` past ~7.4 KB. `learnings.md` is capped at ~64 KB with the oldest
-  lines rotated to `data/learnings.archive.md`. If the archive write fails, the
-  live file is left untrimmed (keeps the full body) so overflow learnings are
-  never dropped — the cap re-applies on the next successful add. Tested with a
-  >10 KB write, a >64 KB rotation, and an archive-write-failure (no loss).
+- **Memory (item 9):** host file writes (`writeHostFile` → `writeHostBytes`) append
+  the base64 payload to a temp file in bounded `printf` chunks (each under
+  `HOST_COMMAND_MAX`), then decode + atomically rename over the target. This removed
+  a live-host failure: the earlier design fed the payload through terminal stdin, but
+  the BB host terminal is a PTY in canonical mode, so un-newlined input is buffered +
+  echoed and never delivered to the reading process — every write (even 10 bytes)
+  hung until the 15 s timeout, and `base64 -d > path` had already truncated the
+  target to 0 bytes. The chunked path has no size ceiling and no stdin dependency.
+  All `runOnHost` stdin now stages through the same writer (a temp file redirected
+  with `< file`), so `installBbBackend` and `runAfkContract` are covered too.
+  `learnings.md` is capped at ~64 KB with the oldest lines rotated to
+  `data/learnings.archive.md`. If the archive write fails, the live file is left
+  untrimmed (keeps the full body) so overflow learnings are never dropped — the cap
+  re-applies on the next successful add. Tested with a >10 KB write, a >64 KB
+  rotation, an archive-write-failure (no loss), and a forced-failure that leaves the
+  previous file intact. Prove it against a live host with
+  `node scripts/live-host-transport-check.mjs --host <id>` (skipped in CI).
 - **Queue (item 9):** the plugin supplies its own backlog row id
   (`add <id> <title> --kind <shape>`, native convention) and never parses
   `tasks-axi` output — so real backlog rows work regardless of the external tool's

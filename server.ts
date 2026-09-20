@@ -232,7 +232,6 @@ function stripAnsi(text: string): string {
 }
 
 const HOST_RC_MARKER = "__FM_HOST_RC";
-const HOST_STDIN_READY = "__FM_HOST_STDIN_READY";
 const HOST_COMMAND_MAX = 10000;
 
 function parseHostRc(raw: string): { exitCode: number; output: string } | null {
@@ -245,15 +244,19 @@ function parseHostRc(raw: string): { exitCode: number; output: string } | null {
   };
 }
 
-function wrapHostCommand(command: string, stdinBytes: number | null): string {
+// Wrap a command so its exit code is recoverable from terminal scrollback. The BB
+// host terminal is a PTY; we run the command, print a parseable RC marker, then
+// `sleep` so the marker survives until we read it (the terminal is force-closed by
+// the caller). Bulky/arbitrary payloads never travel as terminal stdin — the PTY
+// line discipline (canonical mode) buffers+echoes input without delivering it to
+// the reading process, so writes hung until timeout; payloads are staged to a host
+// file via writeHostBytes and fed with `< file` instead.
+function wrapHostCommand(command: string): string {
   const assigned = `__fm_cmd=${shQuote(command)}`;
-  const run =
-    stdinBytes === null
-      ? '"${SHELL:-/bin/bash}" -lc "$__fm_cmd"'
-      : `printf '\\n${HOST_STDIN_READY}\\n'; head -c ${stdinBytes} | "\${SHELL:-/bin/bash}" -lc "$__fm_cmd"`;
+  const run = '"${SHELL:-/bin/bash}" -lc "$__fm_cmd"';
   const script = `${assigned}; set +e; ${run}; __fm_ec=$?; printf '\\n${HOST_RC_MARKER}:%s\\n' "$__fm_ec"; sleep 86400`;
   if (script.length > HOST_COMMAND_MAX) {
-    throw new Error(`Host command too long (${script.length} > ${HOST_COMMAND_MAX}). Pass bulky payloads as stdin.`);
+    throw new Error(`Host command too long (${script.length} > ${HOST_COMMAND_MAX}). Stage bulky payloads with writeHostBytes.`);
   }
   return script;
 }
@@ -2626,26 +2629,26 @@ export default async function plugin(bb: BbPluginApi) {
       .join("");
   }
 
-  async function runOnHost(
+  // Run one command in a fresh host terminal and return its exit code + output.
+  // No stdin: the payload path (`stdin`) is handled by runOnHost, which stages the
+  // bytes to a host file and redirects them in — never through the PTY, whose
+  // canonical-mode line discipline never delivers un-newlined input to the reader.
+  async function runHostCommand(
     hostId: string,
     command: string,
     timeoutMs: number,
     signal?: AbortSignal,
-    stdin?: string,
   ): Promise<{ exitCode: number | null; output: string }> {
-    const stdinBytes = stdin === undefined ? null : Buffer.byteLength(stdin, "utf8");
     const session = await bb.sdk.terminals.create({
       cols: 120,
       rows: 30,
       scope: { kind: "host_path", hostId, cwd: "/tmp" },
-      start: { mode: "command", command: wrapHostCommand(command, stdinBytes) },
+      start: { mode: "command", command: wrapHostCommand(command) },
       title: "firstmate-host",
     });
     const terminalId = asRecord(session)["id"] as string;
     let nextSeq = 0;
     let output = "";
-    let stdinSent = stdinBytes === null;
-    const started = Date.now();
     try {
       const deadline = Date.now() + timeoutMs;
       for (;;) {
@@ -2668,17 +2671,6 @@ export default async function plugin(bb: BbPluginApi) {
             `host terminal output terminal=${terminalId} status=${status} ${error instanceof Error ? error.message : String(error)}`,
           );
         }
-        if (
-          !stdinSent &&
-          stdinBytes !== null &&
-          (stripAnsi(output).includes(HOST_STDIN_READY) || Date.now() - started > 2000)
-        ) {
-          await bb.sdk.terminals.input({
-            terminalId,
-            dataBase64: Buffer.from(stdin ?? "", "utf8").toString("base64"),
-          });
-          stdinSent = true;
-        }
         const parsed = parseHostRc(output);
         if (parsed !== null) return parsed;
         if (status === "exited") {
@@ -2693,6 +2685,88 @@ export default async function plugin(bb: BbPluginApi) {
       } catch {
         // best effort
       }
+    }
+  }
+
+  // Run a command on the host, optionally feeding it `stdin`. Stdin is NOT sent
+  // through the terminal (the PTY line discipline buffers+echoes un-newlined input
+  // without ever delivering it to the reading process, so `head`/`cat < -` hangs
+  // until timeout — even for 10 bytes). Instead the bytes are staged to a host file
+  // with the injection-safe chunked writer and redirected into the command group.
+  async function runOnHost(
+    hostId: string,
+    command: string,
+    timeoutMs: number,
+    signal?: AbortSignal,
+    stdin?: string,
+  ): Promise<{ exitCode: number | null; output: string }> {
+    if (stdin === undefined) return runHostCommand(hostId, command, timeoutMs, signal);
+    const tmp = `/tmp/.fm-stdin-${randomUUID()}`;
+    if (!(await writeHostBytes(hostId, tmp, stdin, timeoutMs, signal))) {
+      throw new Error("Failed to stage host stdin.");
+    }
+    try {
+      // Group so the redirect feeds the whole (possibly multi-line) command its stdin.
+      return await runHostCommand(hostId, `{\n${command}\n} < ${shQuote(tmp)}`, timeoutMs, signal);
+    } finally {
+      await runHostCommand(hostId, `rm -f ${shQuote(tmp)}`, 10_000).catch(() => {});
+    }
+  }
+
+  // Write raw bytes to a host file WITHOUT ever placing the content in the shell
+  // command text as executable syntax (F1). The payload is base64 (charset
+  // [A-Za-z0-9+/=]: no quotes, newlines, spaces, or heredoc delimiters) and appended
+  // to a temp file in bounded chunks — each `printf '%s' '<chunk>' >> tmp` stays
+  // under HOST_COMMAND_MAX, so there is no size ceiling and no terminal-stdin path.
+  // The temp file is decoded to a sibling and atomically renamed over the target, so
+  // a failed or interrupted write never truncates an existing file (the old
+  // `base64 -d > path` truncated the target before reading a single byte).
+  async function writeHostBytes(
+    hostId: string,
+    path: string,
+    content: string,
+    timeoutMs = 15_000,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    const dir = path.replace(/\/[^/]*$/, "") || "/";
+    const nonce = randomUUID();
+    const tmpB64 = `${path}.fm-b64-${nonce}`;
+    const tmpOut = `${path}.fm-out-${nonce}`;
+    const qB64 = shQuote(tmpB64);
+    const qOut = shQuote(tmpOut);
+    const b64 = Buffer.from(content, "utf8").toString("base64");
+    const cleanup = async () => {
+      await runHostCommand(hostId, `rm -f ${qB64} ${qOut}`, 10_000, signal).catch(() => {});
+    };
+    try {
+      let res = await runHostCommand(hostId, `mkdir -p ${shQuote(dir)} && : > ${qB64}`, timeoutMs, signal);
+      if (res.exitCode !== 0) {
+        await cleanup();
+        return false;
+      }
+      // Each append command must fit under HOST_COMMAND_MAX after wrapping/quoting;
+      // size the chunk from the temp path length with generous headroom.
+      const chunkSize = Math.max(1000, HOST_COMMAND_MAX - Buffer.byteLength(tmpB64, "utf8") - 300);
+      for (let i = 0; i < b64.length; i += chunkSize) {
+        const chunk = b64.slice(i, i + chunkSize);
+        res = await runHostCommand(hostId, `printf '%s' ${shQuote(chunk)} >> ${qB64}`, timeoutMs, signal);
+        if (res.exitCode !== 0) {
+          await cleanup();
+          return false;
+        }
+      }
+      res = await runHostCommand(
+        hostId,
+        `base64 -d ${qB64} > ${qOut} && mv -f ${qOut} ${shQuote(path)}`,
+        timeoutMs,
+        signal,
+      );
+      await cleanup();
+      return res.exitCode === 0;
+    } catch (error) {
+      await cleanup();
+      bb.log.warn(`host file write ${path} failed: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
     }
   }
 
@@ -3153,31 +3227,13 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  // Write arbitrary content to a host file WITHOUT ever placing that content in the
-  // shell command text (F1): the payload is base64 (charset [A-Za-z0-9+/=], so it
-  // can carry no quotes, newlines, or heredoc delimiters) and decoded on the host.
-  // A line that happened to equal a heredoc delimiter can no longer truncate the
-  // file or run as a command. Mirrors the FM_INTENT brief-scaffold pattern.
+  // Write arbitrary content to a host file. Injection-safe (F1: base64, never in the
+  // shell command as executable syntax), size-unbounded (chunked appends, no
+  // HOST_COMMAND_MAX ceiling), and atomic (temp + rename, so a failed write never
+  // truncates the target). See writeHostBytes for the mechanism and why the old
+  // terminal-stdin path (`base64 -d > path` fed via PTY input) timed out.
   async function writeHostFile(hostId: string, path: string, content: string): Promise<boolean> {
-    const dir = path.replace(/\/[^/]*$/, "");
-    try {
-      if (content === "") {
-        const res = await runOnHost(hostId, `mkdir -p ${shQuote(dir)} && : > ${shQuote(path)}`, 15_000);
-        return res.exitCode === 0;
-      }
-      // R-a fix: stream the payload via stdin (runOnHost pipes it into the command),
-      // so the content NEVER enters the shell command text and there is no
-      // HOST_COMMAND_MAX ceiling — arbitrarily large files (learnings.md) write
-      // reliably. Still base64 on the wire (stdin is delivered as dataBase64), so
-      // binary/quote/newline safety is preserved; the host decodes it back.
-      const b64 = Buffer.from(content, "utf8").toString("base64");
-      const cmd = `mkdir -p ${shQuote(dir)} && base64 -d > ${shQuote(path)}`;
-      const res = await runOnHost(hostId, cmd, 15_000, undefined, b64);
-      return res.exitCode === 0;
-    } catch (error) {
-      bb.log.warn(`host file write ${path} failed: ${error instanceof Error ? error.message : String(error)}`);
-      return false;
-    }
+    return writeHostBytes(hostId, path, content);
   }
 
   async function writeMemoryFile(rel: string, content: string): Promise<boolean> {

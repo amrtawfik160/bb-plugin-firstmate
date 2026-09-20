@@ -1685,11 +1685,8 @@ test("tell --resolve-key writes the fm-classify resolved line into real state", 
 
 // --- Phase 3: real transport swap, watch ownership, skills manifest ----------
 
-function hostRcPayload(payload: string, code = 0, stdinReady = false) {
-  // For stdin writes, emit the READY marker so the plugin sends its payload
-  // (captured via terminals.input) before the RC parse returns.
-  const prefix = stdinReady ? `\n__FM_HOST_STDIN_READY\n` : "";
-  const text = `${prefix}${payload}\n__FM_HOST_RC:${code}\n`;
+function hostRcPayload(payload: string, code = 0) {
+  const text = `${payload}\n__FM_HOST_RC:${code}\n`;
   return { nextSeq: 1, chunks: [{ dataBase64: Buffer.from(text).toString("base64") }] };
 }
 
@@ -2112,9 +2109,14 @@ function stubRoutedHost(
 ) {
   const cmds = new Map<string, string>();
   const seen: string[] = [];
-  // R-a: file payloads now stream via stdin (terminals.input dataBase64), not the
-  // command text. Capture each write's stdin, keyed by the terminal's command.
-  const writes: Array<{ cmd: string; stdin: string }> = [];
+  // Host writes now use the injection-safe chunked-append + atomic-rename mechanism
+  // (writeHostBytes): base64 is appended to a temp file in bounded `printf` chunks,
+  // then decoded to a sibling and `mv -f`'d over the target. Model it with a virtual
+  // filesystem so a file's final bytes are recoverable via decodeHostWrite. The
+  // router still owns each command's exit code + read payload (existing-file fixtures
+  // and forced write failures).
+  const vfs = new Map<string, string>();
+  const writes: Array<{ path: string; content: string }> = [];
   let n = 0;
   host.harness.sdk.stub("threadSections.list", async () => []);
   host.harness.sdk.stub("threadSections.create", async () => ({ id: "sec_crews" }));
@@ -2132,33 +2134,51 @@ function stubRoutedHost(
   });
   host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
   host.harness.sdk.stub("terminals.close", async () => ({}));
-  host.harness.sdk.stub("terminals.input", async (args: { terminalId: string; dataBase64: string }) => {
-    const cmd = cmds.get(args.terminalId) ?? "";
-    // The plugin sends the (already base64) payload as utf8 stdin, delivered here
-    // as dataBase64. Decode one layer to recover the stdin bytes the host sees.
-    writes.push({ cmd, stdin: Buffer.from(args.dataBase64, "base64").toString("utf8") });
-    return {};
-  });
   host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
     const cmd = cmds.get(args.terminalId) ?? "";
     const r = router(cmd);
-    // Stdin writes (`base64 -d > path`) must first see the READY marker so the
-    // plugin sends the payload before the RC parse returns.
-    const isStdinWrite = cmd.includes("base64 -d > ");
-    return hostRcPayload(r.payload ?? "", r.code ?? 0, isStdinWrite);
+    const code = r.code ?? 0;
+    // Only successful commands mutate the virtual FS (a forced-failure decode never
+    // renames over the target — mirrors the atomic write's truncate-safety).
+    if (code === 0) simulateHostWrite(unwrapHostCommand(cmd), vfs, writes);
+    return hostRcPayload(r.payload ?? "", code);
   });
-  return { seen, writes };
+  return { seen, writes, vfs };
 }
 
-// Decode a safe host-file write (F1/R-a) for a given path. The content streams as
-// stdin base64 into `base64 -d > <path>`; recover it by matching the target path in
-// the (quoted) command and decoding the captured stdin.
-function decodeHostWrite(writes: Array<{ cmd: string; stdin: string }>, pathSubstr: string): string | null {
-  for (const w of writes) {
-    const unq = w.cmd.replace(/'\\''/g, "").replace(/'/g, "");
-    if (new RegExp(`base64 -d > \\S*${pathSubstr}`).test(unq)) {
-      return Buffer.from(w.stdin, "base64").toString("utf8");
-    }
+// Recover the inner command from wrapHostCommand's `__fm_cmd='<escaped>'; set +e; "…`
+// envelope (single quotes escaped as '\'' inside the assignment).
+function unwrapHostCommand(wrapped: string): string {
+  const m = /^__fm_cmd='([\s\S]*?)'; set \+e; "/.exec(wrapped);
+  return m ? m[1].replace(/'\\''/g, "'") : wrapped;
+}
+
+// Apply a writeHostBytes step to the virtual filesystem. Recognizes the three write
+// commands (temp init, base64 chunk append, decode + atomic rename); records the
+// final bytes per target path so decodeHostWrite can recover them. base64 carries no
+// single quote, so [^']* captures a chunk exactly.
+function simulateHostWrite(
+  inner: string,
+  vfs: Map<string, string>,
+  writes: Array<{ path: string; content: string }>,
+): void {
+  let m = /^mkdir -p '[^']*' && : > '([^']+)'$/.exec(inner);
+  if (m) { vfs.set(m[1], ""); return; }
+  m = /^printf '%s' '([^']*)' >> '([^']+)'$/.exec(inner);
+  if (m) { vfs.set(m[2], (vfs.get(m[2]) ?? "") + m[1]); return; }
+  m = /^base64 -d '([^']+)' > '([^']+)' && mv -f '[^']+' '([^']+)'$/.exec(inner);
+  if (m) {
+    const content = Buffer.from(vfs.get(m[1]) ?? "", "base64").toString("utf8");
+    vfs.set(m[3], content);
+    vfs.delete(m[1]);
+    writes.push({ path: m[3], content });
+  }
+}
+
+// Recover the bytes last written to a host file whose path contains pathSubstr.
+function decodeHostWrite(writes: Array<{ path: string; content: string }>, pathSubstr: string): string | null {
+  for (let i = writes.length - 1; i >= 0; i--) {
+    if (writes[i]!.path.includes(pathSubstr)) return writes[i]!.content;
   }
   return null;
 }
@@ -2262,6 +2282,39 @@ test("R-a memory real: a failed archive write keeps EVERY learning in the live f
     assert.ok(live!.includes("newest line"), "newest learning must be present");
     // Not trimmed: the full raw body (over the cap) is kept rather than dropping overflow.
     assert.ok(Buffer.byteLength(live!, "utf8") > 64000, "live file must keep the full body (untrimmed) on archive failure");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("atomic write: a failed decode/rename never truncates the existing file", async () => {
+  // The old `base64 -d > path` truncated the target to 0 bytes before reading a
+  // single byte, so a timeout/failure destroyed the prior contents. writeHostBytes
+  // decodes to a sibling temp and `mv -f`'s over the target only on success, so a
+  // failed write leaves the previous file byte-for-byte intact.
+  const host = ownerHost({ memoryOwner: "real" });
+  await plugin(host.bb);
+  try {
+    let failCaptainDecode = false;
+    const { writes, vfs } = stubRoutedHost(host, (cmd) => {
+      // Fail only the atomic decode/rename of captain.md (never the chunk appends).
+      if (failCaptainDecode && cmd.includes("base64 -d") && cmd.includes("data/captain.md")) return { code: 1 };
+      return { payload: "", code: 0 };
+    });
+    const first = await host.harness.behavior.runCli(["memory", "set-captain", "ORIGINAL"], { projectId: "proj_1" });
+    assert.equal(first.exitCode, 0, first.stderr);
+    assert.equal(decodeHostWrite(writes, "data/captain.md"), "ORIGINAL", "first write must land");
+    const captainPath = [...vfs.keys()].find((k) => k.endsWith("data/captain.md"));
+    assert.ok(captainPath !== undefined, "captain.md must exist on the host FS after the first write");
+    assert.equal(vfs.get(captainPath!), "ORIGINAL");
+
+    // Second write's atomic step fails: the target must NOT be truncated or replaced.
+    failCaptainDecode = true;
+    const before = writes.length;
+    const second = await host.harness.behavior.runCli(["memory", "set-captain", "REPLACEMENT"], { projectId: "proj_1" });
+    assert.equal(second.exitCode, 0, second.stderr); // CLI still succeeds (KV mirror)
+    assert.equal(writes.length, before, "a failed atomic write records no new file bytes");
+    assert.equal(vfs.get(captainPath!), "ORIGINAL", "the previous file must survive a failed write (no truncation)");
   } finally {
     await host.harness.lifecycle.dispose();
   }
