@@ -45,12 +45,22 @@ Install, then run `/captain` in any thread — that calls `deck` and is the setu
   `watchHeartbeatSec`, default 90s); if the watcher is stale/absent BB pages as
   before, so there is never a silent supervision gap — and no double-paging while
   both are live. Default `watchOwner=native` keeps BB's stuck-pass; falls back to
-  native when real mode is off.
+  native when real mode is off. Hardened for multi-host fleets: the supervisor
+  runs and beats **one fm-watch per crew host** (per-host beacon keys), and BB's
+  stuck-suppression is decided **per crew's own host** — a live watcher on host A
+  never silences a stuck crew on host B. Relaunch uses exponential backoff (60s →
+  30m cap) so a crash-looping watcher is not re-spawned every cycle. Wake-reason
+  relay is scoped: only actionable `signal:`/`stale:` lines go to the **owning
+  captain** (the crew named in the line), deduped with volatile counters/times
+  normalized out; routine `check:`/`heartbeat:` trace is never relayed.
 - Read-through (opt-in, `readThrough=true`): real `state/<id>.meta` is the source
   of truth for crew existence. On each crews/bearings/deliver read, one batched
   host read reconciles the KV cache and drops crews the real plane no longer
   tracks (torn down). One `ls`-style read per call, never per-crew round trips; a
-  failed read never drops a crew. Default off = KV cache only.
+  failed read never drops a crew, and a crew whose **dispatch-time meta write is
+  known to have failed** (`metaWritten=false`, e.g. the host was briefly down) is
+  never reaped — its current absence is not proof of teardown; `migrate-state`
+  backfills the meta and clears the flag. Default off = KV cache only.
 - Version-pinned real skills inventory: on init/deck (and when `fmHome` HEAD
   moves) the plugin reads `fmHome/.agents/skills` and stores a version-pinned
   manifest, then injects that inventory into captain sessions so the captain knows
@@ -64,6 +74,33 @@ Install, then run `/captain` in any thread — that calls `deck` and is the setu
   imports the KV crew cache into real `state/<id>.meta` + briefs, idempotently,
   without overwriting active work, and skipping terminal (done/failed) crews so
   the watcher can't resurrect dead work. KV stays a cache that only accelerates.
+- Real-plane owners (opt-in, one flag each; default `kv` = today's behavior).
+  Each `firstmate_*` tool/CLI keeps its signature; when its owner is `real` the op
+  routes through the native owner and is written through to the KV cache. Any
+  host/read failure degrades to the KV path with a clear log:
+  - `queueOwner=real` — the backlog routes through `fm-tasks-axi.sh` /
+    `data/backlog.md`. `add` records the real row id; `dispatch`/`done`/`drop`
+    drive the paired `start`/`done`/`rm` transition. Needs `tasks-axi` on the
+    host; if it is missing (exit 2) the KV backlog still works, without a row id.
+  - `decisionsOwner=real` — a decision is an ordinary **captain-held backlog task**
+    (`fm-captain-hold.sh hold`); `answer` closes the held row
+    (`fm-captain-hold.sh answer --decision-file`) and writes the `resolved [key=…]`
+    close onto the linked crew's real `state/<id>.status` via the existing
+    `appendResolvedStatus`. `defer` uses `hold --until`; `drop` uses `tasks-axi rm`.
+  - `afkOwner=real` — AFK on proposes+confirms the durable `state/.afk-contract`
+    (`fm-afk-contract.sh`) and sets the `state/.afk` flag, so real `fm-merge`/
+    `fm-watch` (via `fm-merge-authority-lib`) see the same away authority and merge
+    grants (CLI `--grant <task-id>`). `off` archives the contract; `status` reads
+    `validate`/`grants`. KV still owns held-ping delivery for the return brief.
+  - `quietOwner=real` — quiet writes the native `state/.afk` flag with first line
+    `quiet` (the afk-skill quiet mode); `off` clears it. (If both `afkOwner` and
+    `quietOwner` are `real` they share the one native flag, as in native firstmate.)
+  - `memoryOwner=real` — captain prefs and learnings live in the tiered stow files
+    `data/captain.md` (pinned) and `data/learnings.md` (aging; each line carries a
+    `<!--a:YYYY-MM-DD-->` reinforced-date marker). `show` reads the real files.
+  `bb firstmate migrate-owners` idempotently projects existing KV queue/decisions/
+  afk/quiet/memory into the real files for the owners set to `real` (re-runnable:
+  rows already projected are skipped, file writes are overwrites).
 - Full status protocol: the fold (`working` / `needs-decision` / `blocked` /
   `paused` / `done` / `failed`, with keyed `resolved`/`captain-held` closes) is a
   faithful port of `fm-classify-lib.sh`'s algorithm. `crew` folds the real

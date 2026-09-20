@@ -181,7 +181,14 @@ sys.exit(1)
     low|medium|high|xhigh|max|ultra|ultracode|none) ;;
     *) reasoning= ;;
   esac
-  set -- thread spawn --json --project "$project_id" --title "$name" \
+  # Deterministic title anchor `fm-<id>` (R4): the plugin's orphan-adoption
+  # fallback matches on this exact title, so a thread created by this CLI spawn is
+  # adoptable even in the SIGKILL window before `mark-crew` tags it — no dependence
+  # on BB attributing originPluginId=firstmate to a CLI-spawned thread.
+  local title
+  title="fm-$id"
+  [ -n "$name" ] && title="fm-$id $name"
+  set -- thread spawn --json --project "$project_id" --title "$title" \
     --prompt "$prompt" --visibility "$vis" --permission-mode "$perm"
   if [ "${FM_BB_SHARED_ENV:-0}" = 1 ]; then
     set -- "$@" --environment "$project"
