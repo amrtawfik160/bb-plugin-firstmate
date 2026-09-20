@@ -60,6 +60,12 @@ The plugin declares the correct model with native firstmate's own override, `FM_
 
 The keeper additionally exports `FM_WATCH_HANDLING_SUCCESSOR=1`: every re-arm is a continuation of one unbroken supervision run, not a new down stretch, so `fm-watch` does not re-mint the recovery generation of an open wake episode on each re-arm (`fm_recovery_marker_reopen_announced`). Without it that generation churned every ~20s and no `fm-wake-drain --ack-through … --recovery-generation …` could match it — a permanent ack loop. The initial episode is still published by `arm_check` when a wake is pending, so buried rows are still presented; only the churn is stopped.
 
+## Per-captain wake plane (notifyOwner=real)
+
+Under `notifyOwner=real` the durable crew→captain wake plane is partitioned **per owning captain** via native `FM_STATE_OVERRIDE`: each captain thread gets its own state subdir `state/cap-<captain-thread-id>/` holding its queue, lock, seq, unread-status files, open-decisions fold and recovery marker. A captain's `bb firstmate wake` (and its `--ack-through`) can therefore only ever present/consume its own rows.
+
+**Cutover note (expected, not a bug):** the pre-partition global `state/.wake-queue` is no longer read once a captain drains its `state/cap-<id>/` plane. Any rows already sitting in that legacy global queue at the moment `notifyOwner` is switched to `real` are abandoned — they are stale *pending* wakes, so nothing durable is lost (the reports also live in each crew's `state/<id>.status` note log), only the "please drain" pointers are dropped. This is correct: some of those legacy rows belonged to other captains (the pre-partition global queue is exactly the cross-captain leak this partitioning fixes), so a captain must not inherit them. If you want a clean slate, the legacy `state/.wake-queue` / `.wake-queue.seq` / `.wake-queue.lock` can be deleted at cutover; leaving them is harmless (they are simply never read again).
+
 ## Limits
 
 - `remove_worktree` refuses a dirty crew worktree (uncommitted or untracked files on stderr, exit 1) before stop/archive. That failure is what makes `fm-teardown.sh` abort and keep the task record. This op never discards. `--force` / discard is the captain's `forget --force`.

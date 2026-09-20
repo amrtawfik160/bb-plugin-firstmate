@@ -742,6 +742,11 @@ export default async function plugin(bb: BbPluginApi) {
       label: "Captain-contract excerpt from fmHome/AGENTS.md, injected into captain sessions (set by init --real).",
       default: "",
     },
+    captainMemory: {
+      type: "string",
+      label: "Captain memory block (data/captain.md prefs + recent data/learnings.md) injected into captain sessions so a fresh captain thread recalls stored memory (set by init/deck and refreshed on memory writes).",
+      default: "",
+    },
     fmSkillsManifest: {
       type: "string",
       label: "Version-pinned inventory of fmHome/.agents/skills (JSON {head,skills[]}); set by init/deck, injected into captain sessions.",
@@ -1010,6 +1015,54 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  // D4: the captain's STORED memory (data/captain.md prefs + the most recent
+  // data/learnings.md lines), rendered into a bounded block and cached so the sync
+  // agents.configure() callback can inject it into a FRESH captain session. Without
+  // this a new captain thread received zero memory. Loaded from the persisted
+  // setting at start, refreshed on init/deck and after every memory write.
+  const CAPTAIN_MEMORY_MAX = 1400;
+  const CAPTAIN_MEMORY_RECENT_LINES = 12;
+  let captainMemoryCache = "";
+  try {
+    captainMemoryCache = (await settings.get()).captainMemory;
+  } catch {
+    // default empty
+  }
+
+  async function refreshCaptainMemory(): Promise<void> {
+    try {
+      const mem = await memoryShow();
+      const prefs = mem.captain.trim();
+      const learnLines = mem.learnings
+        .split("\n")
+        .map((l) => l.trim())
+        .filter((l) => l !== "");
+      const recent = learnLines.slice(-CAPTAIN_MEMORY_RECENT_LINES);
+      let next = "";
+      if (prefs !== "" || recent.length > 0) {
+        next = truncate(
+          [
+            "== Captain memory (recall; fmHome/data) ==",
+            "-- prefs (captain.md) --",
+            prefs === "" ? "(none)" : prefs,
+            `-- recent learnings (learnings.md; newest ${recent.length}) --`,
+            recent.length === 0 ? "(none)" : recent.join("\n"),
+          ].join("\n"),
+          CAPTAIN_MEMORY_MAX,
+        );
+      }
+      if (next === captainMemoryCache) return;
+      captainMemoryCache = next;
+      try {
+        await settings.experimental_set({ captainMemory: next });
+      } catch {
+        // cache still holds it for this process
+      }
+    } catch {
+      // best-effort; keep the last cached memory block
+    }
+  }
+
   async function readList<T>(key: string, schema: z.ZodType<T>, cap: number): Promise<T[]> {
     const raw = await bb.storage.kv.get<unknown>(key);
     if (!Array.isArray(raw)) return [];
@@ -1084,7 +1137,7 @@ export default async function plugin(bb: BbPluginApi) {
   async function isQuiet(): Promise<boolean> {
     return (await readQuiet()).on;
   }
-  async function setQuiet(action: "on" | "off"): Promise<string> {
+  async function setQuiet(action: "on" | "off", captainThreadId?: string): Promise<string> {
     const prev = await readQuiet();
     if (action === "on") {
       await writeQuiet({ on: true, held: prev.held });
@@ -1093,7 +1146,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     await writeQuiet({ on: false, held: [] });
     await projectQuiet(false);
-    const wake = await wakeResumeBrief();
+    const wake = await wakeResumeBrief(captainThreadId);
     if (prev.held.length === 0) return `Quiet off${wake}`;
     return `Quiet off\nHeld while quiet:\n${prev.held.join("\n---\n")}${wake}`;
   }
@@ -1157,6 +1210,27 @@ export default async function plugin(bb: BbPluginApi) {
   // reports then survive presentation + ack (proven live). Best-effort: returns
   // false so the caller keeps the KV fire-and-forget send on any failure. The note
   // is base64'd and decoded on the host into a shell var, never interpolated.
+  // D6: partition the durable wake plane PER OWNING CAPTAIN. The native fm-wake-lib
+  // honors FM_STATE_OVERRIDE (default $FM_HOME/state), which scopes the ENTIRE wake
+  // subsystem for one invocation — the queue file + lock + seq, the unread-status
+  // surface scan ($STATE/*.status), the open-decisions fold, AND the recovery marker.
+  // Without this every captain shared ONE global state dir, so captain A's `bb
+  // firstmate wake` (and its --ack-through) drained/consumed captain B's queue rows
+  // AND surfaced captain B's crew note lines. Giving each captain its own state
+  // subdir (verified live: A never sees/consumes B's rows or notes, and vice-versa)
+  // makes a drain/ack only ever touch that captain's own plane. A missing/empty
+  // captain id falls back to the legacy global state dir (single-captain case), so
+  // existing behavior is preserved when there is no owning captain.
+  function wakeStateDir(fmHome: string, captainThreadId: string | undefined): string {
+    const base = `${fmHome}/state`;
+    if (captainThreadId === undefined || captainThreadId === "") return base;
+    return `${base}/cap-${captainThreadId.replace(/[^A-Za-z0-9._-]/g, "_")}`;
+  }
+  function wakeStateEnv(fmHome: string, captainThreadId: string | undefined): Record<string, string> {
+    if (captainThreadId === undefined || captainThreadId === "") return {};
+    return { FM_STATE_OVERRIDE: wakeStateDir(fmHome, captainThreadId) };
+  }
+
   async function enqueueCaptainWake(crew: Crew, display: string): Promise<boolean> {
     const fmHome = (await settings.get()).fmHome.trim();
     if (fmHome === "" || isSecondmateRoute(crew)) return false;
@@ -1167,7 +1241,11 @@ export default async function plugin(bb: BbPluginApi) {
       return false;
     }
     const lib = `${fmHome}/bin/fm-wake-lib.sh`;
-    const stateDir = `${fmHome}/state`;
+    // D6: enqueue into the OWNING captain's scoped state dir, never the shared global
+    // one, so the note + queue row + seq + recovery marker all live in that captain's
+    // plane (see wakeStateDir). FM_STATE_OVERRIDE must be exported BEFORE the lib is
+    // sourced (the lib resolves $STATE and the queue path at source time).
+    const stateDir = wakeStateDir(fmHome, crew.parentThreadId ?? undefined);
     const statusPath = `${stateDir}/${crew.id}.status`;
     const key = `${crew.id}.status`;
     // Single-line note in fm-classify grammar (strip any leading "note:" so we don't
@@ -1177,9 +1255,10 @@ export default async function plugin(bb: BbPluginApi) {
     const script = [
       `export FM_HOME=${shQuote(fmHome)}`,
       `export FM_ROOT=${shQuote(fmHome)}`,
+      `export FM_STATE_OVERRIDE=${shQuote(stateDir)}`,
       `[ -f ${shQuote(lib)} ] || { echo "error: missing ${lib}" >&2; exit 127; }`,
-      `. ${shQuote(lib)}`,
       `mkdir -p ${shQuote(stateDir)}`,
+      `. ${shQuote(lib)}`,
       `note=$(printf '%s' ${shQuote(noteB64)} | base64 -d)`,
       `printf 'note: %s\\n' "$note" >> ${shQuote(statusPath)}`,
       `fm_wake_append signal ${shQuote(key)} ${shQuote(`crew ${crew.id} update`)}`,
@@ -1878,10 +1957,15 @@ export default async function plugin(bb: BbPluginApi) {
       if ((await readQuiet()).on) { await projectQuiet(true); out.quiet = true; }
     }
     if (await memoryIsReal()) {
-      const cap = await bb.storage.kv.get<unknown>(MEM_CAPTAIN_KEY);
-      const learn = await bb.storage.kv.get<unknown>(MEM_LEARNINGS_KEY);
-      const okCap = typeof cap === "string" && cap !== "" ? await writeMemoryFile(MEM_CAPTAIN_FILE, cap) : true;
-      const okLearn = typeof learn === "string" && learn !== "" ? await writeMemoryFile(MEM_LEARNINGS_FILE, learn) : true;
+      // D1: under memoryOwner=real the tiered FILES are authoritative — the KV blobs
+      // are only a lossy cache. Projecting KV→file unconditionally (the old bug) let
+      // a re-run of the documented-"safe" migrate clobber the head of learnings.md
+      // with the truncated cache, unrecoverably. migrateMemoryTier reverses the
+      // direction: it mirrors file→KV when the real file has content, and only ever
+      // seeds KV→file when the real file is empty/absent (which can never shrink real
+      // data). A shrinking overwrite of non-empty real content is refused outright.
+      const okCap = await migrateMemoryTier(MEM_CAPTAIN_FILE, MEM_CAPTAIN_KEY);
+      const okLearn = await migrateMemoryTier(MEM_LEARNINGS_FILE, MEM_LEARNINGS_KEY);
       out.memory = okCap && okLearn;
     }
     return out;
@@ -2649,10 +2733,14 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function sessionDigest(): Promise<string> {
-    const cap = await bb.storage.kv.get<unknown>(MEM_CAPTAIN_KEY);
-    const learn = await bb.storage.kv.get<unknown>(MEM_LEARNINGS_KEY);
-    const capText = typeof cap === "string" && cap !== "" ? cap : "(empty)";
-    const learnText = typeof learn === "string" && learn !== "" ? learn : "(empty)";
+    // D3: recall must reflect the authoritative files, not the KV cache. When
+    // memoryOwner=real, memoryShow reads data/captain.md + data/learnings.md
+    // directly (and degrades to KV only if the host read fails), so /captain,
+    // deck and session never serve a truncated/stale view — including after a
+    // native `/stow` edit that never touches KV. In kv mode this is the KV read.
+    const mem = await memoryShow();
+    const capText = mem.captain !== "" ? mem.captain : "(empty)";
+    const learnText = mem.learnings !== "" ? mem.learnings : "(empty)";
     const afk = await readAfk();
     const snap = await bearingsSnapshot();
     return [
@@ -3271,6 +3359,7 @@ export default async function plugin(bb: BbPluginApi) {
     // the version-pinned skills inventory (fmHome/.agents/skills @ HEAD).
     await refreshCaptainContract(hostId, path, signal);
     await refreshSkillsManifest(hostId, path, signal);
+    await refreshCaptainMemory();
     const summary = [
       `host: ${hostId}`,
       `path: ${path} (${existed ? "existed" : "cloned"}; ${ffNote})`,
@@ -3295,6 +3384,7 @@ export default async function plugin(bb: BbPluginApi) {
       try {
         const hostId = await resolveHostId(undefined, ctx);
         await refreshSkillsManifest(hostId, current.fmHome, signal);
+        await refreshCaptainMemory();
       } catch {
         // deck still renders; captain keeps the cached inventory
       }
@@ -3420,7 +3510,7 @@ export default async function plugin(bb: BbPluginApi) {
   // --recovery-generation <GEN>` line; it does NOT consume. Ack mode consumes rows
   // at/below the sequence. Returns null when fmHome/host is unset (caller reports
   // plainly). Drives the real fm-wake-drain.sh — no policy is reimplemented here.
-  async function drainWakes(ackThrough?: number, recoveryGeneration?: string): Promise<string | null> {
+  async function drainWakes(captainThreadId: string | undefined, ackThrough?: number, recoveryGeneration?: string): Promise<string | null> {
     const fmHome = (await settings.get()).fmHome.trim();
     if (fmHome === "") return null;
     const hostId = await fleetHost();
@@ -3434,7 +3524,8 @@ export default async function plugin(bb: BbPluginApi) {
       args.push("--ack-through", String(Math.max(0, Math.trunc(ackThrough))), "--recovery-generation", recoveryGeneration);
     }
     try {
-      const res = await runFmScript({ script: "wake-drain", args, hostId, fmHome, timeoutMs: 30_000 });
+      // D6: drain/ack only the CALLER captain's own scoped state plane.
+      const res = await runFmScript({ script: "wake-drain", args, hostId, fmHome, env: wakeStateEnv(fmHome, captainThreadId), timeoutMs: 30_000 });
       const out = res.output.trim();
       if (res.exitCode !== 0 && out === "") return `wake drain exit ${res.exitCode}`;
       return out === "" ? "Wake queue empty." : out;
@@ -3446,8 +3537,8 @@ export default async function plugin(bb: BbPluginApi) {
 
   // Count actionable (signal/stale) undrained wakes, deduped on (kind,key) to match
   // fm-wake-drain's presentation. 0 when the queue is absent/unreadable.
-  async function countUndrainedWakes(hostId: string, fmHome: string): Promise<number> {
-    const q = `${fmHome}/state/.wake-queue`;
+  async function countUndrainedWakes(hostId: string, fmHome: string, captainThreadId: string | undefined): Promise<number> {
+    const q = `${wakeStateDir(fmHome, captainThreadId)}/.wake-queue`;
     const cmd =
       `[ -f ${shQuote(q)} ] && awk -F '\\t' 'NF>=5 && $2 ~ /^[0-9]+$/ && ($3=="signal"||$3=="stale"){seen[$3"\\t"$4]=1} END{printf "FMWAKES=%d\\n", length(seen)}' ${shQuote(q)} || printf 'FMWAKES=0\\n'`;
     try {
@@ -3464,16 +3555,16 @@ export default async function plugin(bb: BbPluginApi) {
   // queue), so quiet-off / afk-off — which only print the KV held list — would never
   // resurface a report enqueued while held. Present (not ack) the queue at resume so
   // the captain sees them; the rows stay until acked via `bb firstmate wake`.
-  async function wakeResumeBrief(): Promise<string> {
+  async function wakeResumeBrief(captainThreadId: string | undefined): Promise<string> {
     const s = await settings.get();
     if (s.notifyOwner !== "real") return "";
     const fmHome = s.fmHome.trim();
     if (fmHome === "") return "";
     const hostId = await fleetHost();
     if (hostId === null || hostId === "") return "";
-    const pending = await countUndrainedWakes(hostId, fmHome);
+    const pending = await countUndrainedWakes(hostId, fmHome, captainThreadId);
     if (pending <= 0) return "";
-    const out = await drainWakes();
+    const out = await drainWakes(captainThreadId);
     if (out === null) return "";
     return `\n== ${pending} durable wake(s) held while away/quiet — run \`bb firstmate wake\` to drain/ack ==\n${out}`;
   }
@@ -3493,7 +3584,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (!(await isCaptainThread(threadId))) return;
     const hostId = await fleetHost();
     if (hostId === null || hostId === "") return;
-    const pending = await countUndrainedWakes(hostId, fmHome);
+    const pending = await countUndrainedWakes(hostId, fmHome, threadId);
     const budgetKey = `turnend-budget:${threadId}`;
     if (pending === 0) {
       await bb.storage.kv.set(budgetKey, { count: 0, lastRingAt: 0 });
@@ -3651,6 +3742,7 @@ export default async function plugin(bb: BbPluginApi) {
   const MEM_CAPTAIN_FILE = "data/captain.md";
   const MEM_LEARNINGS_FILE = "data/learnings.md";
   const MEM_LEARNINGS_ARCHIVE_FILE = "data/learnings.archive.md";
+  const MEM_CAPTAIN_ARCHIVE_FILE = "data/captain.archive.md";
   // Cap the live learnings tier so it stays a working set (mirrors stow's decay:
   // the freshest reinforced lines stay hot). Overflow is not lost — it rotates to
   // an append-only archive file. ~64 KB keeps hundreds of lines; well under any
@@ -3674,6 +3766,15 @@ export default async function plugin(bb: BbPluginApi) {
     return { kept: kept.join("\n"), overflow: "" };
   }
 
+  // Absence is signalled OUT-OF-BAND via a dedicated exit code, never a sentinel
+  // string inside stdout. The old `|| echo FM_MEM_ABSENT` + `out.includes(...)` meant
+  // a real memory line merely CONTAINING that literal made the whole file read as
+  // empty — a genuine data-loss path (an empty read makes migrateMemoryTier take the
+  // seed-KV→file branch and overwrite a real file that has MORE content than KV). The
+  // command now exits 0 with the file's exact bytes when present, exits FM_MEM_ABSENT_RC
+  // when the file does not exist, and exits anything else on a real host/read failure.
+  // File CONTENT is therefore never scanned for a control token.
+  const FM_MEM_ABSENT_RC = 42;
   async function readMemoryFile(rel: string): Promise<string | null> {
     const fmHome = (await settings.get()).fmHome.trim();
     if (fmHome === "") return null;
@@ -3681,11 +3782,11 @@ export default async function plugin(bb: BbPluginApi) {
     if (hostId === null || hostId === "") return null;
     const path = `${fmHome}/${rel}`;
     try {
-      const res = await runOnHost(hostId, `[ -f ${shQuote(path)} ] && cat ${shQuote(path)} || echo FM_MEM_ABSENT`, 15_000);
-      if (res.exitCode !== 0) return null; // host command failed → unreadable
-      const out = res.output;
-      if (out.includes("FM_MEM_ABSENT")) return "";
-      return out.replace(/\n$/, "");
+      const q = shQuote(path);
+      const res = await runOnHost(hostId, `if [ -f ${q} ]; then cat ${q}; else exit ${FM_MEM_ABSENT_RC}; fi`, 15_000);
+      if (res.exitCode === FM_MEM_ABSENT_RC) return ""; // file absent → empty (unambiguous)
+      if (res.exitCode !== 0) return null; // host command / cat failed → unreadable
+      return res.output.replace(/\n$/, "");
     } catch {
       return null;
     }
@@ -3712,6 +3813,30 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function memoryIsReal(): Promise<boolean> {
     return (await settings.get()).memoryOwner === "real" && (await settings.get()).fmHome.trim() !== "";
+  }
+
+  // D1: idempotent, direction-safe migration of one memory tier under
+  // memoryOwner=real. The real file is authoritative; the KV blob is a cache.
+  //  - real file unreadable  → refuse (touch nothing; never risk a clobber)
+  //  - real file non-empty   → mirror file→KV (source of truth into the cache)
+  //  - real file empty/absent + KV non-empty → seed KV→file (cannot shrink real data)
+  //  - both empty            → no-op
+  // It NEVER writes KV→file over a non-empty real file, so a re-run cannot destroy
+  // authoritative memory the way the old unconditional writeMemoryFile(<KV>) did.
+  async function migrateMemoryTier(fileRel: string, kvKey: string): Promise<boolean> {
+    const file = await readMemoryFile(fileRel);
+    if (file === null) {
+      bb.log.warn(`real memory migrate: ${fileRel} unreadable; skipped (KV + file left intact)`);
+      return false;
+    }
+    if (file.trim() !== "") {
+      await bb.storage.kv.set(kvKey, file);
+      return true;
+    }
+    const kvRaw = await bb.storage.kv.get<unknown>(kvKey);
+    const kv = typeof kvRaw === "string" ? kvRaw : "";
+    if (kv !== "") return writeMemoryFile(fileRel, kv);
+    return true;
   }
 
   // The learnings/captain real path is a read-modify-write across two host round
@@ -3742,13 +3867,17 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function memorySetCaptain(text: string): Promise<void> {
     return withMemoryLock(async () => {
-      const capped = text.slice(0, 4000);
       if (await memoryIsReal()) {
-        if (!(await writeMemoryFile(MEM_CAPTAIN_FILE, capped))) {
-          bb.log.warn("real memory: captain write failed; KV cache only");
+        if (await writeMemoryFile(MEM_CAPTAIN_FILE, text)) {
+          // D2: KV mirrors the real file EXACTLY (cache/projection) — never a raw
+          // byte-slice that could desync the mirror from the authoritative file.
+          await bb.storage.kv.set(MEM_CAPTAIN_KEY, text);
+          await refreshCaptainMemory();
+          return;
         }
+        bb.log.warn("real memory: captain write failed; KV cache only");
       }
-      await bb.storage.kv.set(MEM_CAPTAIN_KEY, capped);
+      await bb.storage.kv.set(MEM_CAPTAIN_KEY, text);
     });
   }
 
@@ -3777,8 +3906,11 @@ export default async function plugin(bb: BbPluginApi) {
           }
         }
         if (await writeMemoryFile(MEM_LEARNINGS_FILE, next)) {
-          // KV mirrors the real file (cache/projection), so indexes stay aligned.
-          await bb.storage.kv.set(MEM_LEARNINGS_KEY, next.slice(-4000));
+          // D2: KV mirrors the FULL live file (cache/projection). The live file is
+          // already line-capped + archived (capLearnings), so this is bounded and
+          // never a raw byte-slice that would decapitate the first learning.
+          await bb.storage.kv.set(MEM_LEARNINGS_KEY, next);
+          await refreshCaptainMemory();
           return;
         }
         bb.log.warn("real memory: learning write failed; KV cache only");
@@ -3788,8 +3920,11 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const prev = await bb.storage.kv.get<unknown>(MEM_LEARNINGS_KEY);
     const line = `- ${date}: ${text}`;
-    const next = `${typeof prev === "string" && prev !== "" ? `${prev}\n` : ""}${line}`.slice(-4000);
-    await bb.storage.kv.set(MEM_LEARNINGS_KEY, next);
+    const raw = `${typeof prev === "string" && prev !== "" ? `${prev}\n` : ""}${line}`;
+    // D2: kv-only mode has no archive, so overflow (oldest WHOLE lines) is dropped,
+    // but the boundary is always a full line — never a mid-line byte-slice.
+    const { kept } = capLearnings(raw);
+    await bb.storage.kv.set(MEM_LEARNINGS_KEY, kept);
     });
   }
 
@@ -3803,7 +3938,9 @@ export default async function plugin(bb: BbPluginApi) {
         if (!Number.isInteger(n) || n < 1 || n > lines.length) return -1;
         lines.splice(n - 1, 1);
         if (await writeMemoryFile(MEM_LEARNINGS_FILE, lines.join("\n"))) {
-          await bb.storage.kv.set(MEM_LEARNINGS_KEY, lines.join("\n").slice(-4000));
+          // D2: mirror the full file exactly (no raw byte-slice).
+          await bb.storage.kv.set(MEM_LEARNINGS_KEY, lines.join("\n"));
+          await refreshCaptainMemory();
           return lines.length;
         }
         bb.log.warn("real memory: learning drop write failed; KV cache only");
@@ -3820,13 +3957,36 @@ export default async function plugin(bb: BbPluginApi) {
     });
   }
 
-  async function memoryClear(which: "captain" | "learnings"): Promise<void> {
+  // D5: clear must never destroy non-empty real memory without an archive. In real
+  // mode we append the current contents to the tier's archive file FIRST and only
+  // truncate the live file if that archive write succeeds; a failed archive aborts
+  // the clear (nothing lost) and leaves the KV cache untouched. Returns false when
+  // the clear was refused because the archive could not be written.
+  async function memoryClear(which: "captain" | "learnings"): Promise<boolean> {
     return withMemoryLock(async () => {
       const rel = which === "captain" ? MEM_CAPTAIN_FILE : MEM_LEARNINGS_FILE;
+      const archiveRel = which === "captain" ? MEM_CAPTAIN_ARCHIVE_FILE : MEM_LEARNINGS_ARCHIVE_FILE;
       if (await memoryIsReal()) {
-        if (!(await writeMemoryFile(rel, ""))) bb.log.warn(`real memory: clear ${which} failed; KV cache only`);
+        const cur = await readMemoryFile(rel);
+        if (cur !== null && cur.trim() !== "") {
+          const stamp = new Date().toISOString();
+          const prevArch = await readMemoryFile(archiveRel);
+          const archNext = `${prevArch !== null && prevArch !== "" ? `${prevArch}\n` : ""}<!--cleared:${stamp}-->\n${cur}`;
+          if (!(await writeMemoryFile(archiveRel, archNext))) {
+            bb.log.warn(`real memory: clear ${which} refused — archive write failed (nothing cleared)`);
+            return false;
+          }
+        } else if (cur === null) {
+          bb.log.warn(`real memory: clear ${which} refused — current contents unreadable (nothing cleared)`);
+          return false;
+        }
+        if (!(await writeMemoryFile(rel, ""))) {
+          bb.log.warn(`real memory: clear ${which} failed after archive; KV cache only`);
+        }
       }
       await bb.storage.kv.set(which === "captain" ? MEM_CAPTAIN_KEY : MEM_LEARNINGS_KEY, "");
+      await refreshCaptainMemory();
+      return true;
     });
   }
 
@@ -4239,11 +4399,15 @@ export default async function plugin(bb: BbPluginApi) {
     return line.replace(/\d+/g, "#").replace(/\s+/g, " ").trim();
   }
 
-  // R2: deliver each actionable fm-watch page to the OWNING captain only — the
-  // parent thread of the crew whose id appears in the line. Lines with no
-  // resolvable crew id fall back to the parents of crews on `hostId` (not the
-  // whole fleet). `seen` carries dedup keys across cycles. fm-watch owns wedge
-  // policy; BB is its scoped delivery transport.
+  // R2/D6: deliver each actionable fm-watch page to the OWNING captain ONLY — the
+  // parent thread of the crew whose id appears in the line. The plugin's settings and
+  // fmHome are host-global, so one supervisor cycle sees crews of MANY captains; the
+  // old fallback fanned a line with no resolvable crew id to EVERY captain on the
+  // host, leaking one captain's crew activity into another captain's chat. Now an
+  // unattributable line is delivered only when the host has exactly ONE owning captain
+  // (unambiguous, no cross-captain leak); with two or more captains it is dropped
+  // rather than broadcast. `seen` carries dedup keys across cycles. fm-watch owns
+  // wedge policy; BB is its per-captain-scoped delivery transport.
   async function relayWatchReasons(lines: string[], hostId: string, seen: Set<string>): Promise<void> {
     if (lines.length === 0) return;
     const crews = await readCrews();
@@ -4257,19 +4421,24 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
     const hostParents = new Set(crewsOnHost.map((c) => c.parentThreadId).filter((p): p is string => p !== null && p !== ""));
-    // Group lines by target parent set so each captain gets one message.
+    // Only fall back to a host captain when it is unambiguous (a single captain owns
+    // crews on this host). Otherwise an unattributable line is dropped, never fanned.
+    const soleHostParent = hostParents.size === 1 ? [...hostParents][0]! : undefined;
+    // Group lines by target parent so each captain gets one message.
     const byParent = new Map<string, string[]>();
     for (const line of lines) {
       const key = `${hostId}|${relayDedupKey(line)}`;
       if (seen.has(key)) continue;
       seen.add(key);
       const owner = crews.find((c) => c.parentThreadId !== null && c.parentThreadId !== "" && line.includes(c.id));
-      const targets = owner?.parentThreadId ? [owner.parentThreadId] : [...hostParents];
-      for (const parent of targets) {
-        const arr = byParent.get(parent) ?? [];
-        arr.push(line);
-        byParent.set(parent, arr);
+      const target = owner?.parentThreadId ?? soleHostParent;
+      if (target === undefined) {
+        bb.log.info(`fm-watch relay: dropping unattributable line on host ${hostId} (${hostParents.size} captains; no owner in line)`);
+        continue;
       }
+      const arr = byParent.get(target) ?? [];
+      arr.push(line);
+      byParent.set(target, arr);
     }
     for (const [parent, ls] of byParent) {
       await deliverToCaptain(parent, `🛰️ fm-watch:\n${ls.join("\n")}`, "fm-watch");
@@ -4623,8 +4792,9 @@ export default async function plugin(bb: BbPluginApi) {
       ackThrough: z.number().int().min(0).optional().describe("Consume wakes at/below this sequence (from WAKE_ACK_REQUIRED)"),
       recoveryGeneration: z.string().optional().describe("Recovery generation token (from WAKE_ACK_REQUIRED)"),
     }),
-    async execute({ ackThrough, recoveryGeneration }) {
-      const out = await drainWakes(ackThrough, recoveryGeneration);
+    async execute({ ackThrough, recoveryGeneration }, ctx) {
+      // D6: the caller thread IS the captain — scope the drain/ack to its own queue.
+      const out = await drainWakes(ctxString(ctx, "threadId"), ackThrough, recoveryGeneration);
       if (out === null) return toolError("No real fm-wake queue reachable (need real mode initialized + a host for fmHome).");
       return out;
     },
@@ -4845,7 +5015,7 @@ export default async function plugin(bb: BbPluginApi) {
       action: z.enum(["on", "off", "status"]),
       words: z.string().optional(),
     }),
-    async execute({ action, words }) {
+    async execute({ action, words }, ctx) {
       if (action === "on") {
         await writeAfk({
           on: true,
@@ -4868,7 +5038,7 @@ export default async function plugin(bb: BbPluginApi) {
           "== return brief ==",
           snap.text,
           held.length === 0 ? "Nothing held." : `Held while away:\n${held.join("\n---\n")}`,
-          await wakeResumeBrief(),
+          await wakeResumeBrief(ctxString(ctx, "threadId")),
         ].join("\n");
       }
       const afk = await readAfk();
@@ -4922,9 +5092,9 @@ export default async function plugin(bb: BbPluginApi) {
     name: "firstmate_quiet",
     description: "Batch routine done-pings while the captain is present. Failures and review-ready PRs still surface.",
     parameters: z.object({ action: z.enum(["on", "off", "status"]) }),
-    async execute({ action }) {
+    async execute({ action }, ctx) {
       if (action === "on" || action === "off") {
-        return await setQuiet(action);
+        return await setQuiet(action, ctxString(ctx, "threadId"));
       }
       return `quiet: ${(await isQuiet()) ? "on" : "off"}`;
     },
@@ -5067,8 +5237,8 @@ export default async function plugin(bb: BbPluginApi) {
         return `Dropped learning #${n}.`;
       }
       if (which !== "captain" && which !== "learnings") return toolError("Need which=captain|learnings.");
-      await memoryClear(which);
-      return `Cleared ${which}.`;
+      if (!(await memoryClear(which))) return toolError(`Refused to clear ${which}: could not archive current contents first (nothing changed).`);
+      return `Cleared ${which} (previous contents archived).`;
     },
   });
 
@@ -5224,15 +5394,30 @@ export default async function plugin(bb: BbPluginApi) {
     const base = marked
       ? "You are the first mate. The user is the captain. Never do crew work in this thread — dispatch with firstmate_dispatch. Parent permission is a ceiling."
       : "Firstmate crews are available. Run /captain or firstmate_deck to take the deck.";
-    // Load the real firstmate captain contract (AGENTS.md) into marked captain
-    // sessions when real mode is active. Truncated to the SDK's 4096-char ceiling.
+    // D4: budget the 4096-char captain instruction window DELIBERATELY across the
+    // injected blocks instead of first-come truncation (which used to starve memory
+    // entirely and scissor the skills list down to ~500 chars). Per-block char
+    // allotments, ordered by recall value (memory first so a fresh captain always
+    // recalls stored prefs/learnings):
+    //   captain memory (prefs + recent learnings): 1400
+    //   captain contract (AGENTS.md excerpt):       1600
+    //   skills manifest:                             900
+    // base(~180) + blocks + headers stay under 4096; the final truncate is a backstop.
+    const CAP_MEMORY_BUDGET = 1400;
+    const CAP_CONTRACT_BUDGET = 1600;
+    const CAP_SKILLS_BUDGET = 900;
+    const memoryBlock =
+      marked && captainMemoryCache !== "" ? `\n\n${truncate(captainMemoryCache, CAP_MEMORY_BUDGET)}` : "";
     const contractBlock =
       marked && captainContractCache !== ""
-        ? `\n\n== Real firstmate captain contract (fmHome/AGENTS.md) ==\n${captainContractCache}`
+        ? `\n\n== Real firstmate captain contract (fmHome/AGENTS.md) ==\n${truncate(captainContractCache, CAP_CONTRACT_BUDGET)}`
         : "";
-    const skillsBlock = marked && skillsManifestCache !== "" ? `\n\n${skillsManifestCache}` : "";
+    const skillsBlock =
+      marked && skillsManifestCache !== "" ? `\n\n${truncate(skillsManifestCache, CAP_SKILLS_BUDGET)}` : "";
     const instructions =
-      contractBlock === "" && skillsBlock === "" ? base : truncate(`${base}${contractBlock}${skillsBlock}`, 4096);
+      memoryBlock === "" && contractBlock === "" && skillsBlock === ""
+        ? base
+        : truncate(`${base}${memoryBlock}${contractBlock}${skillsBlock}`, 4096);
     return {
       tools: [...CAPTAIN_TOOLS],
       skills: marked ? [...CAPTAIN_SKILLS] : ["firstmate"],
@@ -5820,7 +6005,7 @@ export default async function plugin(bb: BbPluginApi) {
             const ackRaw = flagStr(flags, "ack-through");
             const gen = flagStr(flags, "recovery-generation");
             const ackThrough = ackRaw !== undefined && /^\d+$/.test(ackRaw) ? Number(ackRaw) : undefined;
-            const out = await drainWakes(ackThrough, gen);
+            const out = await drainWakes(ctxString(ctx, "threadId"), ackThrough, gen);
             if (out === null) return fail("No real fm-wake queue reachable (need real mode initialized + a host for fmHome).");
             return reply({ drained: true, acked: ackThrough ?? null }, out);
           }
@@ -5922,7 +6107,7 @@ export default async function plugin(bb: BbPluginApi) {
                 "== return brief ==",
                 snap.text,
                 held.length === 0 ? "Nothing held." : `Held while away:\n${held.join("\n---\n")}`,
-                await wakeResumeBrief(),
+                await wakeResumeBrief(ctxString(ctx, "threadId")),
               ].join("\n");
               return reply({ afk: false, held, bearings: snap.json }, text);
             }
@@ -5934,7 +6119,7 @@ export default async function plugin(bb: BbPluginApi) {
           case "quiet": {
             const sub = rest[0] ?? "status";
             if (sub === "on" || sub === "off") {
-              const text = await setQuiet(sub);
+              const text = await setQuiet(sub, ctxString(ctx, "threadId"));
               return reply({ quiet: sub === "on" }, text);
             }
             const q = await isQuiet();
@@ -6184,8 +6369,8 @@ export default async function plugin(bb: BbPluginApi) {
             if (sub === "clear") {
               const which = rest[1];
               if (which !== "captain" && which !== "learnings") return fail(usage);
-              await memoryClear(which);
-              return reply({ cleared: true }, `Cleared ${which}.`);
+              if (!(await memoryClear(which))) return fail(`Refused to clear ${which}: could not archive current contents first (nothing changed).`);
+              return reply({ cleared: true }, `Cleared ${which} (previous contents archived).`);
             }
             return fail(usage);
           }
