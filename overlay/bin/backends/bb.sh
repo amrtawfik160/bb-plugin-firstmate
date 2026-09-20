@@ -200,7 +200,9 @@ sys.exit(1)
   }
   # Tag the thread as a firstmate crew so the plugin's agent config gives it the
   # crewmate contract (no captain tools/skills), not the unmarked captain fallback.
-  bb firstmate mark-crew "$thread_id" --shape "${kind:-ship}" >/dev/null 2>&1 || true
+  # Pass the task id so the plugin can adopt this thread by id if fm-spawn is
+  # hard-killed before it records bb_thread_id in the meta (no double-spawn).
+  bb firstmate mark-crew "$thread_id" --shape "${kind:-ship}" --task "$id" >/dev/null 2>&1 || true
   wt_path=$(printf '%s' "$out" | fm_backend_bb_json_field path 2>/dev/null || true)
   tries=0
   while [ -z "$wt_path" ] && [ "$tries" -lt 45 ]; do

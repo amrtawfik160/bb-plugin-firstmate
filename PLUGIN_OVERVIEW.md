@@ -29,22 +29,37 @@ Install, then run `/captain` in any thread — that calls `deck` and is the setu
   the brief, worktree, thread, `state/<id>.meta` and profile
   (harness/provider/model/effort). If the real spawn fails **before** a thread
   exists, dispatch falls back to native BB spawn automatically; it never
-  double-spawns (an already-recorded `bb_thread_id` is adopted, not re-spawned).
-  Default `transport=native` keeps the current behavior — flip the setting to opt
-  in, flip it back to turn it off without a redeploy.
-- Watch ownership (opt-in, `watchOwner=fm-watch`): the real `fm-watch` owns
-  supervision policy (wedge evidence, steering re-rings, heartbeat); BB idle/
-  error/done events still flow as delivery/acceleration but BB no longer pages the
-  captain about a stuck crew, so there is no double-paging. Default
-  `watchOwner=native` keeps BB's stuck-pass. Falls back to native when real mode
-  is off.
+  double-spawns. Ordering contract: `fm-spawn.sh` sets `BB_ABORT_CLEANUP` for the
+  whole window between `bb thread spawn` and the `state/<id>.meta` write, so a
+  graceful failure cleans up its own thread; only a hard-kill (SIGKILL / host
+  death) can orphan one. For that window the plugin reconciles before falling
+  back: it adopts an already-created thread (matched by the `fm-<id>` title or the
+  `crewId` recorded by `mark-crew --task`) instead of spawning a second. Default
+  `transport=native` keeps the current behavior — flip the setting to opt in, flip
+  it back to turn it off without a redeploy.
+- Watch ownership (opt-in, `watchOwner=fm-watch`): a plugin-managed background
+  service (`fm-watch-supervisor`) launches and keeps the **real `fm-watch`** alive
+  against `fmHome` (via `fm-watch-arm.sh`, backend=bb), relays its wake reasons to
+  the captain, and reads its liveness beacon (`state/.last-watcher-beat`). BB only
+  suppresses its own stuck-page **while that beat is live** (fresher than
+  `watchHeartbeatSec`, default 90s); if the watcher is stale/absent BB pages as
+  before, so there is never a silent supervision gap — and no double-paging while
+  both are live. Default `watchOwner=native` keeps BB's stuck-pass; falls back to
+  native when real mode is off.
+- Read-through (opt-in, `readThrough=true`): real `state/<id>.meta` is the source
+  of truth for crew existence. On each crews/bearings/deliver read, one batched
+  host read reconciles the KV cache and drops crews the real plane no longer
+  tracks (torn down). One `ls`-style read per call, never per-crew round trips; a
+  failed read never drops a crew. Default off = KV cache only.
 - Version-pinned real skills inventory: on init/deck (and when `fmHome` HEAD
   moves) the plugin reads `fmHome/.agents/skills` and stores a version-pinned
   manifest, then injects that inventory into captain sessions so the captain knows
   the real policy skills and reads/runs them through the toolbelt. (BB plugins
   cannot register a dynamic skill root from `configure()`, so the real skill
   *content* is surfaced through the toolbelt rather than falsely re-registered;
-  crews still get none.)
+  crews still get none.) Caveat: the inventory refreshes on init/deck (and only
+  re-persists when `fmHome` HEAD moved) — if HEAD moves without a re-deck, the
+  injected list is stale until the next deck.
 - Authoritative real state, rebuildable KV cache: `bb firstmate migrate-state`
   imports the KV crew cache into real `state/<id>.meta` + briefs, idempotently,
   without overwriting active work, and skipping terminal (done/failed) crews so
