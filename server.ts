@@ -1471,10 +1471,16 @@ export default async function plugin(bb: BbPluginApi) {
     // exist (with the right mode) before fm-spawn.sh runs.
     await publishFmBrief(crew, hostId, input.task);
     const posture = await postureOf(input.projectId);
+    // Pin the harness to the bb backend explicitly. fm-spawn.sh resolves the crew
+    // harness from config/crew-harness → fm-harness.sh's own-runtime detection, which
+    // returns `unknown` inside a BB host terminal (no harness env markers) — so a
+    // ship/scout with no --harness aborts with "no launch template for harness
+    // 'unknown'" and BB silently falls back to native. backend=bb has a launch
+    // template, so `--harness bb` makes the real transport actually spawn.
     const args =
       crew.shape === "scout"
-        ? [crew.id, projectDir, "--scout", "--backend", "bb"]
-        : [crew.id, projectDir, "--mode", crew.posture, "--yolo", posture.yolo ? "on" : "off", "--backend", "bb"];
+        ? [crew.id, projectDir, "--scout", "--backend", "bb", "--harness", "bb"]
+        : [crew.id, projectDir, "--mode", crew.posture, "--yolo", posture.yolo ? "on" : "off", "--backend", "bb", "--harness", "bb"];
     if (crew.model !== null && crew.model !== "") args.push("--model", crew.model);
     if (crew.reasoningLevel !== null) args.push("--effort", crew.reasoningLevel);
     const capped = capPermission(input.permissionMode, await parentPermission(input.parentThreadId));
@@ -3672,61 +3678,126 @@ export default async function plugin(bb: BbPluginApi) {
     return [...hosts];
   }
 
-  // One supervision cycle on the host: read the beacon age, (re)launch a detached
-  // fm-watch-arm.sh when the watcher is stale/absent (arm attaches to a live one,
-  // so this is idempotent), and return the pre-relaunch age + a log tail for relay.
+  const FM_WATCH_KEEPER_PID = "state/.bb-watch-keeper.pid";
+  const FM_WATCH_KEEPER_SH = "state/.bb-watch-keeper.sh";
+  // How often the on-host keeper re-arms fm-watch. fm-watch exits on every actionable
+  // wake and must be re-armed; the keeper (not the plugin's slow cycle) owns that, so
+  // the gap after a wake is bounded by this, not by the supervision interval + grace.
+  function fmWatchKeeperInterval(graceSec: number): number {
+    const grace = Math.max(30, Math.trunc(graceSec));
+    return Math.max(10, Math.min(20, Math.floor(grace / 3)));
+  }
+
+  // The durable keeper: a standalone bash script (written to the host as a FILE via
+  // writeHostFile so there is no shell-quoting hazard — an inline `bash -c` body was
+  // fragile: escaped quotes inside `$(cat ...)` made it read a mis-quoted path and
+  // exit instantly). It records its own pid, self-exits when the pidfile no longer
+  // names it (the plugin's teardown removes it), and re-arms fm-watch every
+  // `interval`s. fm-watch-arm.sh is idempotent (attaches to a live watcher), so the
+  // loop is cheap while a watcher blocks and only forks a new one after one exits.
+  function fmWatchKeeperScript(hostId: string, fmHome: string, interval: number): string {
+    const pid = `${fmHome}/${FM_WATCH_KEEPER_PID}`;
+    const arm = `${fmHome}/bin/fm-watch-arm.sh`;
+    const log = `${fmHome}/state/.bb-watch-arm.log`;
+    return [
+      "#!/bin/bash",
+      "# BB firstmate fm-watch keeper (managed; do not edit).",
+      `export FM_HOME=${shQuote(fmHome)}`,
+      `export FM_ROOT=${shQuote(fmHome)}`,
+      "export FM_BACKEND=bb",
+      `export FM_BB_MACHINE=${shQuote(hostId)}`,
+      "export FM_BB_VISIBLE=1",
+      `PID=${shQuote(pid)}`,
+      `ARM=${shQuote(arm)}`,
+      `LOG=${shQuote(log)}`,
+      'echo $$ > "$PID"',
+      `trap 'rm -f "$PID"' EXIT`,
+      'while [ "$(cat "$PID" 2>/dev/null)" = "$$" ]; do',
+      '  "$ARM" >> "$LOG" 2>&1 || true',
+      `  sleep ${interval}`,
+      "done",
+    ].join("\n");
+  }
+
+  // One supervision cycle on the host. fm-watch is a one-shot that BLOCKS until an
+  // actionable wake then EXITS (by design, to be re-armed) — so re-arming only when
+  // the beacon goes stale, then backing off, starved the watcher: after every wake
+  // it stayed down for the (growing) backoff window. Instead a durable KEEPER script
+  // owns continuous re-arming, launched detached (setsid+nohup survives the terminal
+  // force-close, verified on the live host) and tracked by a pidfile. This cycle only
+  // (re)launches the keeper when it is not alive; the beacon age is still read +
+  // reported so BB pages during any gap while the watcher is down.
   async function superviseFmWatch(
     hostId: string,
     fmHome: string,
     graceSec: number,
     allowRelaunch: boolean,
     signal?: AbortSignal,
-  ): Promise<{ beatAge: number; relaunched: boolean; logTail: string } | null> {
-    const grace = Math.max(30, Math.trunc(graceSec));
+  ): Promise<{ beatAge: number; relaunched: boolean; keeperAlive: boolean; logTail: string } | null> {
     const beat = `${fmHome}/state/.last-watcher-beat`;
     const log = `${fmHome}/state/.bb-watch-arm.log`;
     const arm = `${fmHome}/bin/fm-watch-arm.sh`;
-    // R3: when in relaunch backoff, only read the beacon age — never spawn another
-    // detached fm-watch-arm.sh this cycle (a crash-looping arm otherwise forks
-    // every ~30s). The backoff schedule lives in the per-host beat record.
-    const relaunchClause = allowRelaunch
-      ? [
-          `if [ ! -x ${shQuote(arm)} ]; then echo FM_WATCH_NO_ARM;`,
-          `elif [ "$AGE" -lt 0 ] || [ "$AGE" -ge ${grace} ]; then`,
-          `  mkdir -p ${shQuote(`${fmHome}/state`)};`,
-          `  setsid nohup ${shQuote(arm)} >> ${shQuote(log)} 2>&1 </dev/null & RELAUNCHED=1;`,
-          "fi",
-        ]
-      : [`if [ ! -x ${shQuote(arm)} ]; then echo FM_WATCH_NO_ARM; fi`];
-    const script = [
-      `export FM_HOME=${shQuote(fmHome)}`,
-      `export FM_ROOT=${shQuote(fmHome)}`,
-      "export FM_BACKEND=bb",
-      `export FM_BB_MACHINE=${shQuote(hostId)}`,
-      "export FM_BB_VISIBLE=1",
+    const pid = `${fmHome}/${FM_WATCH_KEEPER_PID}`;
+    const keeperScript = `${fmHome}/${FM_WATCH_KEEPER_SH}`;
+    const interval = fmWatchKeeperInterval(graceSec);
+    // Phase 1: read beacon age + keeper liveness + a log tail (no side effects).
+    const readScript = [
       "AGE=-1",
       `if [ -f ${shQuote(beat)} ]; then AGE=$(( $(date +%s) - $(stat -c %Y ${shQuote(beat)} 2>/dev/null || echo 0) )); fi`,
-      "RELAUNCHED=0",
-      ...relaunchClause,
-      `printf 'FM_BEAT_AGE=%s\\nFM_RELAUNCHED=%s\\n' "$AGE" "$RELAUNCHED"`,
+      "KEEPER=dead",
+      `if [ -f ${shQuote(pid)} ]; then KP=$(cat ${shQuote(pid)} 2>/dev/null || echo); if [ -n "$KP" ] && kill -0 "$KP" 2>/dev/null; then KEEPER=alive; fi; fi`,
+      `[ -x ${shQuote(arm)} ] || echo FM_WATCH_NO_ARM`,
+      `printf 'FM_BEAT_AGE=%s\\nFM_KEEPER=%s\\n' "$AGE" "$KEEPER"`,
       "echo '---FM_LOGTAIL---'",
       `[ -f ${shQuote(log)} ] && tail -c 4000 ${shQuote(log)} || true`,
     ].join("\n");
     try {
-      const res = await runOnHost(hostId, script, 30_000, signal);
+      const res = await runOnHost(hostId, readScript, 30_000, signal);
       const ageMatch = /FM_BEAT_AGE=(-?\d+)/.exec(res.output);
-      const relMatch = /FM_RELAUNCHED=(\d)/.exec(res.output);
       const beatAge = ageMatch ? Number(ageMatch[1]) : -1;
-      const relaunched = relMatch?.[1] === "1";
+      const keeperAlive = /FM_KEEPER=alive/.test(res.output);
+      const noArm = res.output.includes("FM_WATCH_NO_ARM");
       const tailIdx = res.output.indexOf("---FM_LOGTAIL---");
       const logTail = tailIdx < 0 ? "" : res.output.slice(tailIdx + "---FM_LOGTAIL---".length).trim();
-      if (res.output.includes("FM_WATCH_NO_ARM")) {
+      if (noArm) {
         bb.log.warn("fm-watch-supervisor: no fm-watch-arm.sh at fmHome; cannot run the real watcher.");
       }
-      return { beatAge, relaunched, logTail };
+      let relaunched = false;
+      // Phase 2: (re)launch the keeper only when it is down (and arm exists, and we
+      // are not in crash-loop backoff). Write the keeper script as a file, then
+      // detach-launch it.
+      if (!keeperAlive && allowRelaunch && !noArm) {
+        const wrote = await writeHostFile(hostId, keeperScript, fmWatchKeeperScript(hostId, fmHome, interval));
+        if (wrote) {
+          const launch = [
+            `mkdir -p ${shQuote(`${fmHome}/state`)}`,
+            `setsid nohup bash ${shQuote(keeperScript)} >> ${shQuote(log)} 2>&1 </dev/null &`,
+            "echo FM_KEEPER_LAUNCHED",
+          ].join("\n");
+          const launchRes = await runOnHost(hostId, launch, 20_000, signal);
+          relaunched = launchRes.exitCode === 0;
+        } else {
+          bb.log.warn("fm-watch-supervisor: could not write the keeper script; will retry next cycle.");
+        }
+      }
+      return { beatAge, relaunched, keeperAlive, logTail };
     } catch (error) {
       bb.log.warn(`fm-watch-supervisor cycle failed: ${error instanceof Error ? error.message : String(error)}`);
       return null;
+    }
+  }
+
+  // Stop the on-host keeper when watchOwner is turned off: remove its pidfile so the
+  // loop self-exits on its next iteration, and best-effort kill the recorded pid.
+  async function stopFmWatchKeeper(hostId: string, fmHome: string, signal?: AbortSignal): Promise<void> {
+    const pid = `${fmHome}/${FM_WATCH_KEEPER_PID}`;
+    const script =
+      `KP=$(cat ${shQuote(pid)} 2>/dev/null || echo); rm -f ${shQuote(pid)}; ` +
+      `[ -n "$KP" ] && kill "$KP" 2>/dev/null || true`;
+    try {
+      await runOnHost(hostId, script, 15_000, signal);
+    } catch (error) {
+      bb.log.warn(`fm-watch-supervisor: keeper teardown failed on ${hostId}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -5739,15 +5810,20 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   // Runs and keeps alive the real fm-watch when watchOwner=fm-watch (else idle).
-  // It re-arms fm-watch (which self-terminates on an actionable wake) and reads
-  // its heartbeat so stuckPass can gate suppression on a live watcher — no gap.
+  // A durable on-host keeper re-arms fm-watch (which self-terminates on an actionable
+  // wake); this service ensures the keeper is alive and reads the heartbeat so
+  // stuckPass can gate suppression on a live watcher — no gap.
   bb.background.service("fm-watch-supervisor", {
     async start(signal) {
       // R2 dedup memory across cycles (digit-normalized keys).
       const relaySeen = new Set<string>();
-      // R3 exponential relaunch backoff schedule.
+      // R3 exponential backoff for a keeper that will not STAY up (a genuine crash
+      // loop) — NOT for the normal case of fm-watch exiting on a wake (the keeper
+      // re-arms that on its own, so it must never trigger backoff).
       const RELAUNCH_BASE_MS = 60_000;
       const RELAUNCH_CAP_MS = 1_800_000; // 30 min
+      // Hosts where a keeper was launched, so it can be torn down when the owner flips.
+      let keeperHosts = new Set<string>();
       while (!signal.aborted) {
         let gate = 90;
         try {
@@ -5767,14 +5843,17 @@ export default async function plugin(bb: BbPluginApi) {
               const inBackoff = now < backoffUntil;
               const res = await superviseFmWatch(hostId, s.fmHome.trim(), gate, !inBackoff, signal);
               if (res === null) continue;
-              const live = res.beatAge >= 0 && res.beatAge <= gate;
+              keeperHosts.add(hostId);
               let streak = priorStreak;
               let nextBackoff = backoffUntil;
-              if (live) {
-                // Sustained beat — reset the backoff ladder.
+              if (res.keeperAlive) {
+                // The keeper is up and owns re-arming — reset the backoff ladder even
+                // if the beat is momentarily stale (between a wake and the next re-arm).
                 streak = 0;
                 nextBackoff = 0;
               } else if (res.relaunched) {
+                // Launched but not yet confirmed alive; if it keeps failing to stay
+                // up across cycles the ladder climbs and BB pages through the gap.
                 streak = priorStreak + 1;
                 nextBackoff = now + Math.min(RELAUNCH_CAP_MS, RELAUNCH_BASE_MS * 2 ** (streak - 1));
               }
@@ -5794,6 +5873,11 @@ export default async function plugin(bb: BbPluginApi) {
               const mirror = await bb.storage.kv.get(fmWatchBeatKey(hosts[0]));
               if (mirror !== null && mirror !== undefined) await bb.storage.kv.set(FM_WATCH_BEAT_KEY, mirror);
             }
+          } else if (keeperHosts.size > 0) {
+            // watchOwner was turned off — stop the keepers we started so they do not
+            // keep re-arming fm-watch on the host forever.
+            for (const hostId of keeperHosts) await stopFmWatchKeeper(hostId, s.fmHome.trim(), signal);
+            keeperHosts = new Set<string>();
           }
         } catch (error) {
           bb.log.warn(error instanceof Error ? `fm-watch-supervisor: ${error.message}` : "fm-watch-supervisor failed");
