@@ -72,10 +72,12 @@ const queueItemSchema = z.object({
   status: z.enum(["queued", "dispatched", "done", "dropped"]).default("queued"),
   crewId: z.string().nullable().default(null),
   // The real data/backlog.md row id (fm-tasks-axi.sh) when queueOwner=real, so
-  // dispatch/done/drop can drive the paired backlog transition. undefined = KV-only.
+  // dispatch/done/drop can drive the paired backlog transition. We now supply this
+  // id ourselves (native caller-owns-the-id convention) = the KV item id on a
+  // successful add. undefined = KV-only (real mode off, or the add failed).
   backlogId: z.string().optional(),
-  // F3: a real add ran but no row id could be parsed — quarantined so migrate-owners
-  // never re-adds it and transitions never fire against a guessed id.
+  // Legacy (kept for back-compat with rows persisted before the id-ownership
+  // switch, when an unparseable `add` output was quarantined). No longer written.
   backlogUnparsed: z.boolean().optional(),
   createdAt: z.string(),
 });
@@ -115,9 +117,37 @@ const secondmateSchema = z.object({
   projectId: z.string(),
   threadId: z.string(),
   scope: z.string().default(""),
+  // Native "non-exclusive clone list": the extra projects this secondmate also
+  // handles beyond its home projectId. Routing considers all of them (scope-first).
+  projects: z.array(z.string()).default([]),
   createdAt: z.string(),
 });
 type Secondmate = z.infer<typeof secondmateSchema>;
+
+// Route dispatch to a registered secondmate by SCOPE + project clone list, not a
+// bare projectId key. A secondmate is eligible when the dispatch project is its
+// home project OR appears in its non-exclusive `projects` clone list. Among
+// eligible mates, the one whose natural-language `scope` shares the most word
+// tokens with the task wins — a deterministic, best-effort proxy for the captain's
+// judgement (true NL routing stays the captain's call: register the fitting mate
+// or dispatch from its thread). Ties break to the most recently registered.
+// Returns undefined = no registered fit → dispatch stays with the main home.
+export function formatSecondmate(m: Secondmate): string {
+  const scope = m.scope !== "" ? ` (${m.scope})` : "";
+  const projects = m.projects.length > 0 ? ` [projects: ${m.projects.join(", ")}]` : "";
+  return `${m.projectId} → ${m.threadId}${scope}${projects}`;
+}
+
+export function pickSecondmate(mates: Secondmate[], projectId: string, task: string): Secondmate | undefined {
+  const eligible = mates.filter((m) => m.projectId === projectId || m.projects.includes(projectId));
+  if (eligible.length <= 1) return eligible[0];
+  const words = new Set((task.toLowerCase().match(/[a-z0-9]+/g) ?? []).filter((t) => t.length > 2));
+  const score = (m: Secondmate): number => {
+    const toks = (m.scope.toLowerCase().match(/[a-z0-9]+/g) ?? []).filter((t) => t.length > 2);
+    return toks.reduce((n, t) => n + (words.has(t) ? 1 : 0), 0);
+  };
+  return [...eligible].sort((a, b) => score(b) - score(a) || b.createdAt.localeCompare(a.createdAt))[0];
+}
 
 const MAX_HELD = 20;
 
@@ -1571,16 +1601,13 @@ export default async function plugin(bb: BbPluginApi) {
       let dirty = false;
       for (const item of items) {
         if (item.status === "done" || item.status === "dropped") { out.queue.skipped++; continue; }
-        // Already projected (has a row id) or quarantined (add ran, no id parsed):
-        // never re-add — keeps migrate-owners idempotent.
-        if ((item.backlogId !== undefined && item.backlogId !== "") || item.backlogUnparsed === true) { out.queue.skipped++; continue; }
-        const proj = await projectQueueAdd(item.title, item.projectId);
-        if (proj.backlogId === undefined) {
-          if (proj.unparsed) { item.backlogUnparsed = true; dirty = true; }
-          out.queue.skipped++;
-          continue;
-        }
-        item.backlogId = proj.backlogId;
+        // Already projected (has a row id): never re-add — keeps migrate-owners
+        // idempotent. We reuse the KV item id as the backlog row id (native
+        // caller-owns-the-id convention), so the row is deterministic.
+        if (item.backlogId !== undefined && item.backlogId !== "") { out.queue.skipped++; continue; }
+        const proj = await projectQueueAdd(item.id, item.title, item.shape, item.projectId);
+        if (!proj.ok) { out.queue.skipped++; continue; }
+        item.backlogId = item.id;
         if (item.status === "dispatched") await projectQueueTransition(item, "start");
         out.queue.projected++;
         dirty = true;
@@ -1816,7 +1843,7 @@ export default async function plugin(bb: BbPluginApi) {
     const task = input.task.trim().slice(0, MAX_TASK);
     if (task === "") throw new Error("Empty task.");
     const mates = await readSecondmates();
-    const mate = mates.find((m) => m.projectId === input.projectId);
+    const mate = pickSecondmate(mates, input.projectId, task);
     if (mate !== undefined && mate.threadId !== input.parentThreadId) {
       await bb.sdk.threads.send({
         threadId: mate.threadId,
@@ -2729,11 +2756,22 @@ export default async function plugin(bb: BbPluginApi) {
     const path = opts.path ?? `${home}/firstmate`;
     const tools = await runOnHost(
       hostId,
-      "command -v git; command -v gh; command -v bb; command -v python3; gh auth status 2>&1 | head -n 3",
+      "command -v git; command -v gh; command -v bb; command -v python3; " +
+        "printf 'FM_AXI='; command -v tasks-axi || true; printf 'FM_AXI_VER='; tasks-axi --version 2>/dev/null || true; " +
+        "gh auth status 2>&1 | head -n 3",
       30000,
       signal,
     );
     if (!tools.output.includes("git")) throw new Error(`git missing on host. Tools:\n${tools.output}`);
+    // queueOwner=real drives the home's tasks-axi backlog. It is resolved purely
+    // from PATH (npm package `tasks-axi`, min 0.2.4) and is NOT bundled. Verify it
+    // and, if absent, surface the exact install command rather than silently
+    // degrading — queue-real still degrades safely to the KV cache until it's there.
+    const axiPresent = /FM_AXI=\S/.test(tools.output);
+    const axiVer = /FM_AXI_VER=v?(\d+\.\d+\.\d+)/.exec(tools.output)?.[1] ?? "";
+    const queueNote = axiPresent
+      ? `tasks-axi present${axiVer !== "" ? ` (v${axiVer}; needs >=0.2.4)` : ""}`
+      : "tasks-axi MISSING — install with 'npm install -g tasks-axi' on this host; queueOwner=real degrades to the KV cache until then";
     const clone = await runOnHost(
       hostId,
       `[ -d ${shQuote(`${path}/.git`)} ] && echo FM_EXISTS || git clone ${shQuote(repo)} ${shQuote(path)}`,
@@ -2806,6 +2844,7 @@ export default async function plugin(bb: BbPluginApi) {
       `path: ${path} (${existed ? "existed" : "cloned"}; ${ffNote})`,
       `project: ${projectId}`,
       `backend: bb (overlay installed; config/backend=bb)`,
+      `queue: ${queueNote}`,
       `toolbelt: ${toolbeltPhrase(scriptCount, skillCount)}`,
       `fm: bb firstmate fm spawn -- --mode direct-PR -- ship "<task>"`,
       `overlay:\n${truncate(overlayOut, 800)}`,
@@ -3046,6 +3085,29 @@ export default async function plugin(bb: BbPluginApi) {
   // ops via the host (there is no fm-stow.sh; stow is agent file edits).
   const MEM_CAPTAIN_FILE = "data/captain.md";
   const MEM_LEARNINGS_FILE = "data/learnings.md";
+  const MEM_LEARNINGS_ARCHIVE_FILE = "data/learnings.archive.md";
+  // Cap the live learnings tier so it stays a working set (mirrors stow's decay:
+  // the freshest reinforced lines stay hot). Overflow is not lost — it rotates to
+  // an append-only archive file. ~64 KB keeps hundreds of lines; well under any
+  // practical limit now that writes stream via stdin.
+  const MEM_LEARNINGS_MAX_BYTES = 64_000;
+  // Split a learnings body into {kept, overflow}: kept = the most recent lines that
+  // fit under MEM_LEARNINGS_MAX_BYTES, overflow = the oldest lines pushed out.
+  function capLearnings(body: string): { kept: string; overflow: string } {
+    if (Buffer.byteLength(body, "utf8") <= MEM_LEARNINGS_MAX_BYTES) return { kept: body, overflow: "" };
+    const lines = body.split("\n");
+    const kept: string[] = [];
+    let bytes = 0;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const add = Buffer.byteLength(lines[i], "utf8") + 1;
+      if (bytes + add > MEM_LEARNINGS_MAX_BYTES && kept.length > 0) {
+        return { kept: kept.join("\n"), overflow: lines.slice(0, i + 1).join("\n") };
+      }
+      bytes += add;
+      kept.unshift(lines[i]);
+    }
+    return { kept: kept.join("\n"), overflow: "" };
+  }
 
   async function readMemoryFile(rel: string): Promise<string | null> {
     const fmHome = (await settings.get()).fmHome.trim();
@@ -3071,12 +3133,19 @@ export default async function plugin(bb: BbPluginApi) {
   // file or run as a command. Mirrors the FM_INTENT brief-scaffold pattern.
   async function writeHostFile(hostId: string, path: string, content: string): Promise<boolean> {
     const dir = path.replace(/\/[^/]*$/, "");
-    const b64 = Buffer.from(content, "utf8").toString("base64");
-    const script = content === ""
-      ? `mkdir -p ${shQuote(dir)} && : > ${shQuote(path)}`
-      : `mkdir -p ${shQuote(dir)} && printf '%s' ${shQuote(b64)} | base64 -d > ${shQuote(path)}`;
     try {
-      const res = await runOnHost(hostId, script, 15_000);
+      if (content === "") {
+        const res = await runOnHost(hostId, `mkdir -p ${shQuote(dir)} && : > ${shQuote(path)}`, 15_000);
+        return res.exitCode === 0;
+      }
+      // R-a fix: stream the payload via stdin (runOnHost pipes it into the command),
+      // so the content NEVER enters the shell command text and there is no
+      // HOST_COMMAND_MAX ceiling — arbitrarily large files (learnings.md) write
+      // reliably. Still base64 on the wire (stdin is delivered as dataBase64), so
+      // binary/quote/newline safety is preserved; the host decodes it back.
+      const b64 = Buffer.from(content, "utf8").toString("base64");
+      const cmd = `mkdir -p ${shQuote(dir)} && base64 -d > ${shQuote(path)}`;
+      const res = await runOnHost(hostId, cmd, 15_000, undefined, b64);
       return res.exitCode === 0;
     } catch (error) {
       bb.log.warn(`host file write ${path} failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -3144,7 +3213,18 @@ export default async function plugin(bb: BbPluginApi) {
       if (cur !== null) {
         // stow "aging" tier: date marker = last reinforced.
         const line = `- ${date}: ${text.replace(/[\r\n]+/g, " ").trim()} <!--a:${date}-->`;
-        const next = `${cur !== "" ? `${cur}\n` : ""}${line}`;
+        const raw = `${cur !== "" ? `${cur}\n` : ""}${line}`;
+        const { kept, overflow } = capLearnings(raw);
+        if (overflow !== "") {
+          // Rotate oldest lines out to the append-only archive (best-effort; the
+          // live file cap is what matters for the hot working set).
+          const arch = await readMemoryFile(MEM_LEARNINGS_ARCHIVE_FILE);
+          const archNext = `${arch !== null && arch !== "" ? `${arch}\n` : ""}${overflow}`;
+          if (!(await writeMemoryFile(MEM_LEARNINGS_ARCHIVE_FILE, archNext))) {
+            bb.log.warn("real memory: learnings archive rotate failed; overflow kept in live file");
+          }
+        }
+        const next = overflow !== "" ? kept : raw;
         if (await writeMemoryFile(MEM_LEARNINGS_FILE, next)) {
           // KV mirrors the real file (cache/projection), so indexes stay aligned.
           await bb.storage.kv.set(MEM_LEARNINGS_KEY, next.slice(-4000));
@@ -3286,45 +3366,30 @@ export default async function plugin(bb: BbPluginApi) {
     return s.queueOwner === "real" && s.fmHome.trim() !== "";
   }
 
-  // F3: strict id parse from `tasks-axi add` output. Only an UNAMBIGUOUS,
-  // machine-parseable id is accepted — an explicit `id: <x>` / `id=<x>` / `#<x>`
-  // line, or a last line that is a SINGLE bare id-shaped token. Prose (any
-  // multi-word last line) yields null → the caller quarantines the row instead of
-  // grabbing a word like "your" out of "Added your task…" and mis-targeting a row.
-  function parseBacklogId(output: string): string | null {
-    const lines = output
-      .split(/\r?\n/)
-      .map((l) => l.trim())
-      .filter((l) => l !== "" && !l.startsWith("__FM_HOST_RC") && !l.startsWith(HOST_RC_MARKER));
-    const last = lines[lines.length - 1] ?? "";
-    const idChars = "[A-Za-z0-9][A-Za-z0-9._/-]{0,63}";
-    const explicit = new RegExp(`(?:^id[:=]\\s*|^#)(${idChars})\\b`, "i").exec(last);
-    if (explicit) return explicit[1]!;
-    if (new RegExp(`^${idChars}$`).test(last)) return last;
-    return null;
-  }
-
-  // Project a backlog add into the real data/backlog.md. Returns the parsed row id,
-  // or `unparsed:true` when the add ran but no id could be positively parsed (the
-  // KV item is then quarantined: never re-added and never transitioned). Only
-  // issues a command when queueOwner=real.
-  async function projectQueueAdd(title: string, projectId: string): Promise<{ backlogId?: string; unparsed: boolean }> {
-    if (!(await queueIsReal())) return { unparsed: false };
-    const res = await runTasksAxi(["add", title.slice(0, 500)], { projectId });
+  // Project a backlog add into the real data/backlog.md. We follow native
+  // firstmate's convention: the CALLER owns the row id and passes it in
+  // (`tasks-axi add <id> <title> --kind <kind>`), then never reads an id back.
+  // Native code does exactly this (fm-spawn.sh: `add $ID '<title>' --kind $KIND`)
+  // and discards add stdout — the add-output format belongs to the external
+  // `tasks-axi` binary and is undocumented, so parsing it was a bet on a format we
+  // don't control. Owning the id makes real backlog rows work regardless of that
+  // output, and the paired start/done/rm transitions target the same id we chose.
+  // Returns ok=false (KV-cache only) when queueOwner!=real, the host/tool is
+  // unreachable, or tasks-axi is missing/failed. Only issues a command when real.
+  async function projectQueueAdd(id: string, title: string, shape: Shape, projectId: string): Promise<{ ok: boolean }> {
+    if (!(await queueIsReal())) return { ok: false };
+    const res = await runTasksAxi(["add", id, title.slice(0, 500), "--kind", shape], { projectId });
     if (res === null) {
       bb.log.warn("real backlog: add unreachable (tasks-axi/host); KV cache only");
-      return { unparsed: false };
+      return { ok: false };
     }
     if (res.exitCode !== 0) {
-      bb.log.warn(`real backlog: add exit=${res.exitCode} (tasks-axi missing?); KV cache only`);
-      return { unparsed: false };
+      bb.log.warn(
+        `real backlog: add exit=${res.exitCode} (tasks-axi missing? install with 'npm install -g tasks-axi' on the fleet host); KV cache only`,
+      );
+      return { ok: false };
     }
-    const id = parseBacklogId(res.output);
-    if (id === null) {
-      bb.log.warn("real backlog: add ran but no row id parsed; quarantined (won't re-add or transition)");
-      return { unparsed: true };
-    }
-    return { backlogId: id, unparsed: false };
+    return { ok: true };
   }
 
   // Drive the paired backlog transition for a KV queue item. verb: start|done|rm.
@@ -3831,7 +3896,7 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb firstmate memory [show|set-captain|add-learning|drop-learning <n>|clear <captain|learnings>]",
     "  bb firstmate afk [on|off|status] [-- \"words\"]",
     "  bb firstmate quiet [on|off|status]",
-    "  bb firstmate secondmate [list|register --project <id> --thread <id>|drop <project>]",
+    "  bb firstmate secondmate [list|register --project <id> --thread <id> [--scope <text>] [--projects a,b]|drop <project>]",
     "  bb firstmate supervision [on|off|status]",
     "  bb firstmate forget <id> [--stop] [--force]",
     "  bb firstmate mark-crew <thread-id> [--shape ship|scout]",
@@ -4309,9 +4374,10 @@ export default async function plugin(bb: BbPluginApi) {
         if (title === undefined || title.trim() === "") return toolError("Need title.");
         const pid = projectId ?? ctxProject;
         if (pid === undefined) return toolError("Need projectId.");
-        const proj = await projectQueueAdd(title, pid);
+        const newId = randomUUID().slice(0, 8);
+        const proj = await projectQueueAdd(newId, title, shape ?? "ship", pid);
         const item: QueueItem = {
-          id: randomUUID().slice(0, 8),
+          id: newId,
           title: title.slice(0, 500),
           detail: (detail ?? "").slice(0, MAX_TASK),
           projectId: pid,
@@ -4321,8 +4387,7 @@ export default async function plugin(bb: BbPluginApi) {
           waitUntil: waitUntil ?? null,
           status: "queued",
           crewId: null,
-          ...(proj.backlogId !== undefined ? { backlogId: proj.backlogId } : {}),
-          ...(proj.unparsed ? { backlogUnparsed: true } : {}),
+          ...(proj.ok ? { backlogId: newId } : {}),
           createdAt: new Date().toISOString(),
         };
         await writeQueue([item, ...items]);
@@ -4415,19 +4480,21 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.agents.registerTool({
     name: "firstmate_secondmate",
-    description: "Register a domain-captain thread. Dispatch to that project routes there instead of spawning.",
+    description: "Register a domain-captain thread. Dispatch routes there by scope + project clone list instead of spawning.",
     parameters: z.object({
       action: z.enum(["list", "register", "drop"]),
       projectId: z.string().optional(),
       threadId: z.string().optional(),
       scope: z.string().optional(),
+      // Non-exclusive clone list: extra project ids this secondmate also handles.
+      projects: z.array(z.string()).optional(),
     }),
-    async execute({ action, projectId, threadId, scope }, ctx) {
+    async execute({ action, projectId, threadId, scope, projects }, ctx) {
       const items = await readSecondmates();
       const ctxRecord = asRecord(ctx);
       if (action === "list") {
         if (items.length === 0) return "No secondmates.";
-        return items.map((m) => `${m.projectId} → ${m.threadId}${m.scope !== "" ? ` (${m.scope})` : ""}`).join("\n");
+        return items.map(formatSecondmate).join("\n");
       }
       if (action === "register") {
         const pid = projectId ?? (typeof ctxRecord["projectId"] === "string" ? ctxRecord["projectId"] : undefined);
@@ -4438,11 +4505,12 @@ export default async function plugin(bb: BbPluginApi) {
           projectId: pid,
           threadId: tid,
           scope: scope ?? "",
+          projects: (projects ?? []).map((p) => p.trim()).filter((p) => p !== ""),
           createdAt: new Date().toISOString(),
         };
         next.push(row);
         await writeSecondmates(next);
-        return `Secondmate ${pid} → ${tid}`;
+        return `Secondmate ${pid} → ${tid}${row.scope !== "" ? ` (${row.scope})` : ""}`;
       }
       const pid = projectId;
       if (pid === undefined) return toolError("Need projectId.");
@@ -5270,7 +5338,7 @@ export default async function plugin(bb: BbPluginApi) {
             const items = await readSecondmates();
             if (sub === "list") {
               if (items.length === 0) return reply([], "No secondmates.");
-              return reply(items, items.map((m) => `${m.projectId} → ${m.threadId}${m.scope !== "" ? ` (${m.scope})` : ""}`).join("\n"));
+              return reply(items, items.map(formatSecondmate).join("\n"));
             }
             if (sub === "register") {
               const projectId = flagStr(flags, "project") ?? ctxProject;
@@ -5283,6 +5351,7 @@ export default async function plugin(bb: BbPluginApi) {
                 projectId,
                 threadId,
                 scope: flagStr(flags, "scope") ?? "",
+                projects: (flagStr(flags, "projects") ?? "").split(",").map((p) => p.trim()).filter((p) => p !== ""),
                 createdAt: new Date().toISOString(),
               };
               next.push(row);
@@ -5305,20 +5374,21 @@ export default async function plugin(bb: BbPluginApi) {
               if (title === "") return fail(usage);
               const projectId = flagStr(flags, "project") ?? ctxProject;
               if (projectId === undefined) return fail("No project: pass --project <id>.");
-              const proj = await projectQueueAdd(title, projectId);
+              const newId = randomUUID().slice(0, 8);
+              const shapeVal = toShape(flagStr(flags, "shape"));
+              const proj = await projectQueueAdd(newId, title, shapeVal, projectId);
               const item: QueueItem = {
-                id: randomUUID().slice(0, 8),
+                id: newId,
                 title: title.slice(0, 500),
                 detail: (flagStr(flags, "detail") ?? "").slice(0, MAX_TASK),
                 projectId,
-                shape: toShape(flagStr(flags, "shape")),
+                shape: shapeVal,
                 mode: flagStr(flags, "mode") ?? "",
                 blockedBy: flagAll(flags, "after"),
                 waitUntil: flagStr(flags, "wait-until") ?? null,
                 status: "queued",
                 crewId: null,
-                ...(proj.backlogId !== undefined ? { backlogId: proj.backlogId } : {}),
-                ...(proj.unparsed ? { backlogUnparsed: true } : {}),
+                ...(proj.ok ? { backlogId: newId } : {}),
                 createdAt: new Date().toISOString(),
               };
               await writeQueue([item, ...items]);

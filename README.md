@@ -75,7 +75,7 @@ BB-specific behavior in this fork:
 
 - **Event-push watcher.** `backend=bb` reports push-capable. `fm-watch` blocks on `bb thread wait --status idle` instead of sleeping through its poll budget. A pending interaction surfaces as the blocked edge; the first window to finish wins the multi-window wait.
 - **Refusal-safe teardown.** `remove_worktree` inspects the crew worktree first and refuses dirty trees with the changed-file list, so `fm-teardown` aborts and keeps records instead of letting a later force-removal eat uncommitted work. Discarding is an explicit `forget --force`.
-- **No secondmate endpoint yet.** Domain captains use the native `secondmate register` instead.
+- **Secondmate = scope router, not a seeded home.** `secondmate register --scope "<what it owns>" --projects a,b` registers a domain-captain thread; dispatch routes there by scope + a non-exclusive project clone list. A fully seeded independent firstmate home (backlog handoff, config/memory inheritance, its own child supervision) is not built on BB — the backend only spawns non-nesting leaf crews. See the parity table in `PLUGIN_OVERVIEW.md`.
 
 ## Configuration
 
