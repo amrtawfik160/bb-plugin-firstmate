@@ -27,7 +27,13 @@ Install, then run `/captain` in any thread — that calls `deck` and is the setu
 - Real transport (opt-in, `transport=real`): `dispatch` routes end-to-end through
   the real `fm-brief.sh` + `fm-spawn.sh` (backend=bb) so the real scripts create
   the brief, worktree, thread, `state/<id>.meta` and profile
-  (harness/provider/model/effort). If the real spawn fails **before** a thread
+  (harness/provider/model/effort). The dispatch pins `--harness bb` for both ships
+  and scouts: `fm-spawn.sh` otherwise resolves the crew harness via
+  `fm-harness.sh`'s own-runtime detection, which returns `unknown` inside a BB host
+  terminal (no harness env markers and no ancestor harness process), so the spawn
+  aborted with "no launch template for harness 'unknown'" and silently fell back to
+  native. `backend=bb` has a launch template, so the explicit `--harness bb` makes
+  the real transport actually spawn. If the real spawn fails **before** a thread
   exists, dispatch falls back to native BB spawn automatically; it never
   double-spawns. Ordering contract: `fm-spawn.sh` sets `BB_ABORT_CLEANUP` for the
   whole window between `bb thread spawn` and the `state/<id>.meta` write, so a
@@ -38,21 +44,32 @@ Install, then run `/captain` in any thread — that calls `deck` and is the setu
   `transport=native` keeps the current behavior — flip the setting to opt in, flip
   it back to turn it off without a redeploy.
 - Watch ownership (opt-in, `watchOwner=fm-watch`): a plugin-managed background
-  service (`fm-watch-supervisor`) launches and keeps the **real `fm-watch`** alive
-  against `fmHome` (via `fm-watch-arm.sh`, backend=bb), relays its wake reasons to
-  the captain, and reads its liveness beacon (`state/.last-watcher-beat`). BB only
+  service (`fm-watch-supervisor`) keeps the **real `fm-watch`** alive against
+  `fmHome`, relays its wake reasons to the captain, and reads its liveness beacon
+  (`state/.last-watcher-beat`). `fm-watch` is a one-shot that **blocks until an
+  actionable wake then exits** (by design, to be re-armed), so keeping it alive is
+  owned by a durable on-host **keeper**: a small script (written to
+  `state/.bb-watch-keeper.sh` via the atomic host-file writer, launched detached
+  with `setsid nohup` — proven on the live host to survive the BB terminal
+  force-close) that re-arms `fm-watch-arm.sh` every ~`grace/3`s and self-exits when
+  its pidfile no longer names it. The supervisor cycle only **(re)launches the
+  keeper when its pid is dead**; a watcher exiting on a wake is normal and no longer
+  triggers relaunch/backoff (the old design re-armed on beacon staleness then backed
+  off, so after every wake the watcher stayed down for a growing window). BB only
   suppresses its own stuck-page **while that beat is live** (fresher than
   `watchHeartbeatSec`, default 90s); if the watcher is stale/absent BB pages as
   before, so there is never a silent supervision gap — and no double-paging while
-  both are live. Default `watchOwner=native` keeps BB's stuck-pass; falls back to
-  native when real mode is off. Hardened for multi-host fleets: the supervisor
-  runs and beats **one fm-watch per crew host** (per-host beacon keys), and BB's
+  both are live. Turning `watchOwner` off tears the keeper down (removes its
+  pidfile). Default `watchOwner=native` keeps BB's stuck-pass; falls back to native
+  when real mode is off. Hardened for multi-host fleets: the supervisor runs and
+  beats **one keeper per crew host** (per-host beacon keys), and BB's
   stuck-suppression is decided **per crew's own host** — a live watcher on host A
-  never silences a stuck crew on host B. Relaunch uses exponential backoff (60s →
-  30m cap) so a crash-looping watcher is not re-spawned every cycle. Wake-reason
-  relay is scoped: only actionable `signal:`/`stale:` lines go to the **owning
-  captain** (the crew named in the line), deduped with volatile counters/times
-  normalized out; routine `check:`/`heartbeat:` trace is never relayed.
+  never silences a stuck crew on host B. A keeper that will not stay up (a genuine
+  crash loop) is relaunched with exponential backoff (60s → 30m cap) and BB pages
+  through the gap. Wake-reason relay is scoped: only actionable `signal:`/`stale:`
+  lines go to the **owning captain** (the crew named in the line), deduped with
+  volatile counters/times normalized out; routine `check:`/`heartbeat:` trace is
+  never relayed.
 - Read-through (opt-in, `readThrough=true`): real `state/<id>.meta` is the source
   of truth for crew existence. On each crews/bearings/deliver read, one batched
   host read reconciles the KV cache and drops crews the real plane no longer
@@ -105,7 +122,9 @@ Install, then run `/captain` in any thread — that calls `deck` and is the setu
     `<!--a:YYYY-MM-DD-->` reinforced-date marker). `show` reads the real files.
   Free text is written to host files as a base64 payload decoded on the host (never
   interpolated into the shell command), so no line of user/agent text can inject a
-  command or truncate a file; the read-modify-write of the learnings file is
+  command or truncate a file. The write is atomic: the payload is decoded to a
+  sibling temp file and `mv -f`'d over the target, so a failed or interrupted write
+  never truncates the existing file. The read-modify-write of the learnings file is
   serialized in-process against concurrent tool calls.
   `bb firstmate migrate-owners` idempotently projects existing KV queue/decisions/
   afk/quiet/memory into the real files for the owners set to `real` (re-runnable:
@@ -151,20 +170,47 @@ and why.
 | 6 | Merge gating (zero-checks, waiver) | CLOSED | Zero checks = no failing checks; `--allow-red <check>` waives one exact check, separate from `--yes`. |
 | 7 | Scout delivery/retirement semantics | PARTIAL | Ships default to isolated worktrees; scout durable external `report.md` and completed-scout scratch discard remain native-owned via real teardown. |
 | 8 | Retry = resubmission, not recovery relaunch | CLOSED | `retry` with `--model`/`--provider`/`--reasoning-level` relaunches a fresh thread in the same worktree. |
-| 9 | Queue/decisions/memory/AFK/quiet lookalikes | CLOSED | Each routes through its native owner behind a flag (`queueOwner`/`decisionsOwner`/`afkOwner`/`quietOwner`/`memoryOwner`); Phase 5 hardened queue (caller-owns-id) and memory (stdin writes + cap/rotate). |
+| 9 | Queue/decisions/memory/AFK/quiet lookalikes | CLOSED | Each routes through its native owner behind a flag (`queueOwner`/`decisionsOwner`/`afkOwner`/`quietOwner`/`memoryOwner`); Phase 5 hardened queue (caller-owns-id) and memory (atomic chunked host writes + cap/rotate). |
 | 10 | Secondmate is a different feature | PARTIAL | Routing now honors natural-language `scope` + a non-exclusive project clone list (`pickSecondmate`); multiple mates supported. OPEN: seeded isolated `FM_HOME`, backlog handoff, config/memory inheritance, and an independently-supervising child firstmate — BB's backend `create_task` only spawns non-nesting leaf crews and native refuses `--secondmate` on backend=bb, so a real secondmate home cannot be stood up without a secondmate-capable bb backend. |
 | 11 | Deck never renders real bearings | CLOSED | Deck runs real `fm-bearings-snapshot` (authoritative) beside the KV digest (labelled cache). |
 | 12 | Real-mode version not the referenced checkout | CLOSED | Reused clones fast-forward (ff-only, clean tree) on init; script/skill counts read from the actual clone. |
 
 ### Phase 5 specifics
 
-- **Memory (item 9):** host file writes stream the payload via `runOnHost` stdin
-  (`writeHostFile`), removing the `HOST_COMMAND_MAX` ceiling that silently froze
-  `learnings.md` past ~7.4 KB. `learnings.md` is capped at ~64 KB with the oldest
-  lines rotated to `data/learnings.archive.md`. If the archive write fails, the
-  live file is left untrimmed (keeps the full body) so overflow learnings are
-  never dropped — the cap re-applies on the next successful add. Tested with a
-  >10 KB write, a >64 KB rotation, and an archive-write-failure (no loss).
+- **Memory (item 9):** host file writes (`writeHostFile` → `writeHostBytes`) append
+  the base64 payload to a temp file in bounded `printf` chunks (each under
+  `HOST_COMMAND_MAX`), then decode + atomically rename over the target. This removed
+  a live-host failure: the earlier design fed the payload through terminal stdin, but
+  the BB host terminal is a PTY in canonical mode, so un-newlined input is buffered +
+  echoed and never delivered to the reading process — every write (even 10 bytes)
+  hung until the 15 s timeout, and `base64 -d > path` had already truncated the
+  target to 0 bytes. The chunked path has no size ceiling and no stdin dependency.
+  All `runOnHost` stdin now stages through the same writer (a temp file redirected
+  with `< file`), so `installBbBackend` and `runAfkContract` are covered too.
+  `learnings.md` is capped at ~64 KB with the oldest lines rotated to
+  `data/learnings.archive.md`. If the archive write fails, the live file is left
+  untrimmed (keeps the full body) so overflow learnings are never dropped — the cap
+  re-applies on the next successful add. Tested with a >10 KB write, a >64 KB
+  rotation, an archive-write-failure (no loss), and a forced-failure that leaves the
+  previous file intact. Prove it against a live host with
+  `node scripts/live-host-transport-check.mjs --host <id>` (skipped in CI).
+- **Real transport harness (live-host fix):** ships and scouts pin `--harness bb`.
+  Without it, `fm-spawn.sh` resolved the crew harness via `fm-harness.sh`'s
+  own-runtime detection, which returns `unknown` in a BB host terminal (no harness
+  env markers, no ancestor harness process), aborting with "no launch template for
+  harness 'unknown'" and silently falling back to native. Reproduced on the live
+  host (under `setsid`, to escape the interactive Claude ancestry that masks the
+  bug) and proven end-to-end: a throwaway-project ship spawns `harness=bb` with a
+  real `bb_thread_id`, and both ship and scout hit the `unknown` error without the
+  flag.
+- **fm-watch keeper (live-host fix):** `fm-watch` exits on every actionable wake, so
+  a durable on-host keeper re-arms it continuously (written as a file and launched
+  `setsid nohup`; the old inline `bash -c` body was quoting-fragile and the old
+  design re-armed only on beacon staleness then backed off, starving the watcher
+  after each wake). Proven on the live host with a scratch state dir: killing the
+  watcher, the keeper re-armed a fresh one within the interval and kept the beat
+  live; a live keeper triggers no relaunch/backoff; teardown (pidfile removed) stops
+  it; and with the watcher down the beat ages past the gate so BB pages the gap.
 - **Queue (item 9):** the plugin supplies its own backlog row id
   (`add <id> <title> --kind <shape>`, native convention) and never parses
   `tasks-axi` output — so real backlog rows work regardless of the external tool's

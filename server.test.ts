@@ -1685,11 +1685,8 @@ test("tell --resolve-key writes the fm-classify resolved line into real state", 
 
 // --- Phase 3: real transport swap, watch ownership, skills manifest ----------
 
-function hostRcPayload(payload: string, code = 0, stdinReady = false) {
-  // For stdin writes, emit the READY marker so the plugin sends its payload
-  // (captured via terminals.input) before the RC parse returns.
-  const prefix = stdinReady ? `\n__FM_HOST_STDIN_READY\n` : "";
-  const text = `${prefix}${payload}\n__FM_HOST_RC:${code}\n`;
+function hostRcPayload(payload: string, code = 0) {
+  const text = `${payload}\n__FM_HOST_RC:${code}\n`;
   return { nextSeq: 1, chunks: [{ dataBase64: Buffer.from(text).toString("base64") }] };
 }
 
@@ -1769,10 +1766,36 @@ test("real transport dispatches through fm-spawn.sh and adopts its thread id", a
     assert.match(result.stdout, /Dispatched ship crew/);
     assert.ok(seen.some((c) => c.includes("bin/fm-spawn.sh")), "fm-spawn.sh was not invoked");
     assert.ok(seen.some((c) => c.includes("--backend") && c.includes("bb")), "backend=bb not passed");
+    // Harness pinned to bb: without it fm-harness.sh's own-runtime detection returns
+    // 'unknown' in a BB host terminal and fm-spawn aborts with "no launch template".
+    assert.ok(
+      seen.some((c) => c.includes("bin/fm-spawn.sh") && c.includes("--harness") && c.includes("bb")),
+      "ship spawn did not pin --harness bb",
+    );
     // No native BB spawn happened.
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
     const crews = await crewsKv(host);
     assert.equal(crews[0]?.threadId, "thr_real");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("real transport pins --harness bb for a scout too (else fm-spawn aborts on 'unknown')", async () => {
+  const host = realHost();
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRealTransportHost(host, { spawnExit: 0, threadIdAfterSpawn: "thr_scout" });
+    const result = await host.harness.behavior.runCli(
+      ["dispatch", "--project", "proj_1", "--shape", "scout", "--", "survey the auth flow"],
+      { projectId: "proj_1" },
+    );
+    assert.equal(result.exitCode, 0, result.stderr);
+    const spawn = seen.find((c) => c.includes("bin/fm-spawn.sh"));
+    assert.ok(spawn, "fm-spawn.sh was not invoked for the scout");
+    assert.ok(spawn!.includes("--scout"), "scout flag not passed");
+    assert.ok(spawn!.includes("--harness") && spawn!.includes("bb"), "scout spawn did not pin --harness bb");
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -1899,28 +1922,16 @@ test("the fm-watch supervisor relaunches the real watcher when the beacon is sta
   });
   await plugin(host.bb);
   try {
-    const cmds: string[] = [];
-    const ids = new Map<string, string>();
-    let n = 0;
-    host.harness.sdk.stub("terminals.create", async (args: { start?: { command?: string } }) => {
-      const id = `term_${++n}`;
-      const cmd = args.start?.command ?? "";
-      ids.set(id, cmd);
-      cmds.push(cmd);
-      return { id };
-    });
-    host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
-    host.harness.sdk.stub("terminals.close", async () => ({}));
-    host.harness.sdk.stub("threads.send", async () => ({}));
-    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ status: "active", environmentId: null }));
-    host.harness.sdk.stub("environments.list", async () => [
-      { hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" },
-    ]);
     await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew", "thr_cap")]);
-    // Beacon absent → the supervisor must (re)launch fm-watch-arm.sh and report age -1.
-    host.harness.sdk.stub("terminals.output", async () =>
-      hostRcPayload("FM_BEAT_AGE=-1\nFM_RELAUNCHED=1\n---FM_LOGTAIL---\nstale: fm-abc (escalation 1)", 0),
-    );
+    // Beacon absent + keeper dead → the supervisor must write the keeper script and
+    // detach-launch it, and report age -1. Writes are simulated so the keeper script
+    // content (written via writeHostFile) is recoverable with decodeHostWrite.
+    const { seen, writes } = stubRoutedHost(host, (cmd) => {
+      if (cmd.includes("FM_BEAT_AGE")) {
+        return { payload: "FM_BEAT_AGE=-1\nFM_KEEPER=dead\n---FM_LOGTAIL---\nstale: fm-abc (escalation 1)", code: 0 };
+      }
+      return { code: 0 };
+    });
     const run = host.harness.behavior.runService("fm-watch-supervisor");
     const deadline = Date.now() + 4000;
     let beat: { beatAge: number; relaunched: boolean } | null = null;
@@ -1935,14 +1946,70 @@ test("the fm-watch supervisor relaunches the real watcher when the beacon is sta
     run.controller.abort();
     await run.done;
     assert.ok(beat, "supervisor never wrote a heartbeat record");
-    assert.equal(beat.relaunched, true);
-    assert.ok(
-      cmds.some((c) => c.includes("bin/fm-watch-arm.sh") && c.includes("setsid")),
-      "supervisor did not detach-launch fm-watch-arm.sh",
-    );
+    assert.equal(beat.relaunched, true, "a dead keeper must be relaunched");
+    // It detach-launches the keeper SCRIPT (setsid + bash <keeper.sh>).
+    const launch = seen.find((c) => c.includes("setsid") && c.includes(".bb-watch-keeper.sh"));
+    assert.ok(launch, "supervisor did not detach-launch the keeper script");
+    // The keeper is a DURABLE self-re-arming loop (not a one-shot arm): its script
+    // carries the pidfile, the re-arm loop, and a sleep. fm-watch exits on every
+    // wake, so a one-shot arm would leave a growing unwatched gap.
+    const keeper = decodeHostWrite(writes, ".bb-watch-keeper.sh");
+    assert.ok(keeper, "keeper script was not written");
+    assert.ok(keeper!.includes("fm-watch-arm.sh"), "keeper does not re-arm fm-watch");
+    assert.ok(keeper!.includes(".bb-watch-keeper.pid"), "keeper does not track a pidfile");
+    assert.ok(/while \[/.test(keeper!) && /sleep /.test(keeper!), "keeper is not a re-arming loop");
     // The watcher's page reason was relayed to the captain.
     const relayed = sendCalls(host).some((s) => (s.text ?? "").includes("fm-watch") && (s.text ?? "").includes("stale: fm-abc"));
     assert.ok(relayed, "supervisor did not relay the fm-watch wake reason to the captain");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("fm-watch supervisor does NOT back off while the keeper is alive (watcher exiting on a wake is normal)", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", watchOwner: "fm-watch", fmHostId: "host_1" },
+  });
+  await plugin(host.bb);
+  try {
+    host.harness.sdk.stub("terminals.create", async () => ({ id: "term_k" }));
+    host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+    host.harness.sdk.stub("terminals.close", async () => ({}));
+    host.harness.sdk.stub("threads.send", async () => ({}));
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ status: "active", environmentId: null }));
+    host.harness.sdk.stub("environments.list", async () => [
+      { hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" },
+    ]);
+    await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew", "thr_cap")]);
+    // Keeper alive, but the beat is momentarily stale (fm-watch just exited on a wake,
+    // keeper about to re-arm). The old code (relaunch-on-stale + backoff) would climb
+    // the ladder here; the keeper-aware code must keep the ladder at zero.
+    host.harness.sdk.stub("terminals.output", async () =>
+      hostRcPayload("FM_BEAT_AGE=600\nFM_RELAUNCHED=0\nFM_KEEPER=alive\n---FM_LOGTAIL---\n", 0),
+    );
+    // Seed a prior backoff streak to prove it RESETS when the keeper is alive.
+    await host.bb.storage.kv.set("fm-watch-beat:host_1", {
+      beatAge: 600, checkedAt: Date.now() - 1000, grace: 90, relaunched: true,
+      backoffUntil: Date.now() + 300_000, consecutiveRelaunch: 3,
+    });
+    const run = host.harness.behavior.runService("fm-watch-supervisor");
+    const deadline = Date.now() + 4000;
+    let beat: { backoffUntil?: number; consecutiveRelaunch?: number } | null = null;
+    while (Date.now() < deadline) {
+      const raw = await host.bb.storage.kv.get("fm-watch-beat:host_1");
+      if (raw && typeof raw === "object" && "consecutiveRelaunch" in raw) {
+        const r = raw as { consecutiveRelaunch?: number; backoffUntil?: number };
+        if (r.consecutiveRelaunch === 0) { beat = r; break; }
+      }
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    run.controller.abort();
+    await run.done;
+    assert.ok(beat, "supervisor never reset the backoff ladder for a live keeper");
+    assert.equal(beat!.consecutiveRelaunch, 0, "a live keeper must reset the backoff streak");
+    assert.equal(beat!.backoffUntil, 0, "a live keeper must clear the backoff window");
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -2112,9 +2179,14 @@ function stubRoutedHost(
 ) {
   const cmds = new Map<string, string>();
   const seen: string[] = [];
-  // R-a: file payloads now stream via stdin (terminals.input dataBase64), not the
-  // command text. Capture each write's stdin, keyed by the terminal's command.
-  const writes: Array<{ cmd: string; stdin: string }> = [];
+  // Host writes now use the injection-safe chunked-append + atomic-rename mechanism
+  // (writeHostBytes): base64 is appended to a temp file in bounded `printf` chunks,
+  // then decoded to a sibling and `mv -f`'d over the target. Model it with a virtual
+  // filesystem so a file's final bytes are recoverable via decodeHostWrite. The
+  // router still owns each command's exit code + read payload (existing-file fixtures
+  // and forced write failures).
+  const vfs = new Map<string, string>();
+  const writes: Array<{ path: string; content: string }> = [];
   let n = 0;
   host.harness.sdk.stub("threadSections.list", async () => []);
   host.harness.sdk.stub("threadSections.create", async () => ({ id: "sec_crews" }));
@@ -2132,33 +2204,51 @@ function stubRoutedHost(
   });
   host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
   host.harness.sdk.stub("terminals.close", async () => ({}));
-  host.harness.sdk.stub("terminals.input", async (args: { terminalId: string; dataBase64: string }) => {
-    const cmd = cmds.get(args.terminalId) ?? "";
-    // The plugin sends the (already base64) payload as utf8 stdin, delivered here
-    // as dataBase64. Decode one layer to recover the stdin bytes the host sees.
-    writes.push({ cmd, stdin: Buffer.from(args.dataBase64, "base64").toString("utf8") });
-    return {};
-  });
   host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
     const cmd = cmds.get(args.terminalId) ?? "";
     const r = router(cmd);
-    // Stdin writes (`base64 -d > path`) must first see the READY marker so the
-    // plugin sends the payload before the RC parse returns.
-    const isStdinWrite = cmd.includes("base64 -d > ");
-    return hostRcPayload(r.payload ?? "", r.code ?? 0, isStdinWrite);
+    const code = r.code ?? 0;
+    // Only successful commands mutate the virtual FS (a forced-failure decode never
+    // renames over the target — mirrors the atomic write's truncate-safety).
+    if (code === 0) simulateHostWrite(unwrapHostCommand(cmd), vfs, writes);
+    return hostRcPayload(r.payload ?? "", code);
   });
-  return { seen, writes };
+  return { seen, writes, vfs };
 }
 
-// Decode a safe host-file write (F1/R-a) for a given path. The content streams as
-// stdin base64 into `base64 -d > <path>`; recover it by matching the target path in
-// the (quoted) command and decoding the captured stdin.
-function decodeHostWrite(writes: Array<{ cmd: string; stdin: string }>, pathSubstr: string): string | null {
-  for (const w of writes) {
-    const unq = w.cmd.replace(/'\\''/g, "").replace(/'/g, "");
-    if (new RegExp(`base64 -d > \\S*${pathSubstr}`).test(unq)) {
-      return Buffer.from(w.stdin, "base64").toString("utf8");
-    }
+// Recover the inner command from wrapHostCommand's `__fm_cmd='<escaped>'; set +e; "…`
+// envelope (single quotes escaped as '\'' inside the assignment).
+function unwrapHostCommand(wrapped: string): string {
+  const m = /^__fm_cmd='([\s\S]*?)'; set \+e; "/.exec(wrapped);
+  return m ? m[1].replace(/'\\''/g, "'") : wrapped;
+}
+
+// Apply a writeHostBytes step to the virtual filesystem. Recognizes the three write
+// commands (temp init, base64 chunk append, decode + atomic rename); records the
+// final bytes per target path so decodeHostWrite can recover them. base64 carries no
+// single quote, so [^']* captures a chunk exactly.
+function simulateHostWrite(
+  inner: string,
+  vfs: Map<string, string>,
+  writes: Array<{ path: string; content: string }>,
+): void {
+  let m = /^mkdir -p '[^']*' && : > '([^']+)'$/.exec(inner);
+  if (m) { vfs.set(m[1], ""); return; }
+  m = /^printf '%s' '([^']*)' >> '([^']+)'$/.exec(inner);
+  if (m) { vfs.set(m[2], (vfs.get(m[2]) ?? "") + m[1]); return; }
+  m = /^base64 -d '([^']+)' > '([^']+)' && mv -f '[^']+' '([^']+)'$/.exec(inner);
+  if (m) {
+    const content = Buffer.from(vfs.get(m[1]) ?? "", "base64").toString("utf8");
+    vfs.set(m[3], content);
+    vfs.delete(m[1]);
+    writes.push({ path: m[3], content });
+  }
+}
+
+// Recover the bytes last written to a host file whose path contains pathSubstr.
+function decodeHostWrite(writes: Array<{ path: string; content: string }>, pathSubstr: string): string | null {
+  for (let i = writes.length - 1; i >= 0; i--) {
+    if (writes[i]!.path.includes(pathSubstr)) return writes[i]!.content;
   }
   return null;
 }
@@ -2262,6 +2352,39 @@ test("R-a memory real: a failed archive write keeps EVERY learning in the live f
     assert.ok(live!.includes("newest line"), "newest learning must be present");
     // Not trimmed: the full raw body (over the cap) is kept rather than dropping overflow.
     assert.ok(Buffer.byteLength(live!, "utf8") > 64000, "live file must keep the full body (untrimmed) on archive failure");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("atomic write: a failed decode/rename never truncates the existing file", async () => {
+  // The old `base64 -d > path` truncated the target to 0 bytes before reading a
+  // single byte, so a timeout/failure destroyed the prior contents. writeHostBytes
+  // decodes to a sibling temp and `mv -f`'s over the target only on success, so a
+  // failed write leaves the previous file byte-for-byte intact.
+  const host = ownerHost({ memoryOwner: "real" });
+  await plugin(host.bb);
+  try {
+    let failCaptainDecode = false;
+    const { writes, vfs } = stubRoutedHost(host, (cmd) => {
+      // Fail only the atomic decode/rename of captain.md (never the chunk appends).
+      if (failCaptainDecode && cmd.includes("base64 -d") && cmd.includes("data/captain.md")) return { code: 1 };
+      return { payload: "", code: 0 };
+    });
+    const first = await host.harness.behavior.runCli(["memory", "set-captain", "ORIGINAL"], { projectId: "proj_1" });
+    assert.equal(first.exitCode, 0, first.stderr);
+    assert.equal(decodeHostWrite(writes, "data/captain.md"), "ORIGINAL", "first write must land");
+    const captainPath = [...vfs.keys()].find((k) => k.endsWith("data/captain.md"));
+    assert.ok(captainPath !== undefined, "captain.md must exist on the host FS after the first write");
+    assert.equal(vfs.get(captainPath!), "ORIGINAL");
+
+    // Second write's atomic step fails: the target must NOT be truncated or replaced.
+    failCaptainDecode = true;
+    const before = writes.length;
+    const second = await host.harness.behavior.runCli(["memory", "set-captain", "REPLACEMENT"], { projectId: "proj_1" });
+    assert.equal(second.exitCode, 0, second.stderr); // CLI still succeeds (KV mirror)
+    assert.equal(writes.length, before, "a failed atomic write records no new file bytes");
+    assert.equal(vfs.get(captainPath!), "ORIGINAL", "the previous file must survive a failed write (no truncation)");
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -2533,17 +2656,17 @@ test("R3 relaunch backoff: a persistently stale watcher is not relaunched every 
       const id = `t_${++n}`;
       const cmd = args.start?.command ?? "";
       cmds.set(id, cmd);
-      // A cycle that is allowed to relaunch includes the setsid arm launch clause.
-      if (cmd.includes("setsid") && cmd.includes("fm-watch-arm.sh")) relaunchAttempts++;
+      // A cycle that is allowed to relaunch detach-launches the keeper script.
+      if (cmd.includes("setsid") && cmd.includes(".bb-watch-keeper.sh")) relaunchAttempts++;
       return { id };
     });
     host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
     host.harness.sdk.stub("terminals.close", async () => ({}));
-    // Always stale: beat age huge, RELAUNCHED reported when the clause ran.
+    // Keeper always dead → each allowed cycle relaunches it, then backoff must gate.
     host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
       const cmd = cmds.get(args.terminalId) ?? "";
-      const rel = cmd.includes("setsid") ? 1 : 0;
-      return hostRcPayload(`FM_BEAT_AGE=9999\nFM_RELAUNCHED=${rel}\n---FM_LOGTAIL---\n`, 0);
+      if (cmd.includes("FM_BEAT_AGE")) return hostRcPayload("FM_BEAT_AGE=9999\nFM_KEEPER=dead\n---FM_LOGTAIL---\n", 0);
+      return hostRcPayload("", 0);
     });
     const run = host.harness.behavior.runService("fm-watch-supervisor");
     // Let several supervisor cycles elapse (checkMs ~15s min, but service loops fast on abort). Poll the beat backoff.
