@@ -133,3 +133,53 @@ checks (`no_checks`) counts as no failing checks, and `--allow-red <check-name>`
 waives one exact failing check while every other check must stay green — never
 silently, and separate from `--yes`. `deck`/`bearings` retire crews whose PR was
 merged or closed outside BB.
+
+## Native-firstmate parity (divergence table)
+
+Status of each divergence from the root-cause audit, re-run item by item.
+CLOSED = behaves like native firstmate (or routes through it); PARTIAL = the
+feasible subset is implemented and gaps are named; OPEN = not implemented on BB
+and why.
+
+| # | Divergence | Status | Evidence / note |
+|---|------------|--------|-----------------|
+| 1 | Two independent policy/state planes | PARTIAL | Real `state/`/backlog/contract/memory own policy behind the owner flags; KV is the projection/cache. Full single-ledger migration of pre-existing KV is `migrate-owners` (opt-in), not automatic. |
+| 2 | Dispatch loses brief/profile + reasoning effort | CLOSED | `transport=real` runs real `fm-brief.sh`+`fm-spawn.sh`; `dispatch --reasoning-level` applies from turn 1. |
+| 3 | Duplicated PR/merge state → stale reports | CLOSED | `deck`/`bearings` reconcile live thread/PR and retire crews merged/closed outside BB; merge retires both planes. |
+| 4 | Real skills/hooks/contract not loaded; crew isolation | CLOSED | Captain loads real `AGENTS.md` + version-pinned skills inventory; real-script crews tagged crew (no captain tools). |
+| 5 | Reduced status/supervision protocol | PARTIAL | `watchOwner=fm-watch` hands supervision to the real watcher (heartbeat-gated); full durable keyed status folding is projected, native watcher owns the ladder. |
+| 6 | Merge gating (zero-checks, waiver) | CLOSED | Zero checks = no failing checks; `--allow-red <check>` waives one exact check, separate from `--yes`. |
+| 7 | Scout delivery/retirement semantics | PARTIAL | Ships default to isolated worktrees; scout durable external `report.md` and completed-scout scratch discard remain native-owned via real teardown. |
+| 8 | Retry = resubmission, not recovery relaunch | CLOSED | `retry` with `--model`/`--provider`/`--reasoning-level` relaunches a fresh thread in the same worktree. |
+| 9 | Queue/decisions/memory/AFK/quiet lookalikes | CLOSED | Each routes through its native owner behind a flag (`queueOwner`/`decisionsOwner`/`afkOwner`/`quietOwner`/`memoryOwner`); Phase 5 hardened queue (caller-owns-id) and memory (stdin writes + cap/rotate). |
+| 10 | Secondmate is a different feature | PARTIAL | Routing now honors natural-language `scope` + a non-exclusive project clone list (`pickSecondmate`); multiple mates supported. OPEN: seeded isolated `FM_HOME`, backlog handoff, config/memory inheritance, and an independently-supervising child firstmate — BB's backend `create_task` only spawns non-nesting leaf crews and native refuses `--secondmate` on backend=bb, so a real secondmate home cannot be stood up without a secondmate-capable bb backend. |
+| 11 | Deck never renders real bearings | CLOSED | Deck runs real `fm-bearings-snapshot` (authoritative) beside the KV digest (labelled cache). |
+| 12 | Real-mode version not the referenced checkout | CLOSED | Reused clones fast-forward (ff-only, clean tree) on init; script/skill counts read from the actual clone. |
+
+### Phase 5 specifics
+
+- **Memory (item 9):** host file writes stream the payload via `runOnHost` stdin
+  (`writeHostFile`), removing the `HOST_COMMAND_MAX` ceiling that silently froze
+  `learnings.md` past ~7.4 KB. `learnings.md` is capped at ~64 KB with the oldest
+  lines rotated to `data/learnings.archive.md`. If the archive write fails, the
+  live file is left untrimmed (keeps the full body) so overflow learnings are
+  never dropped — the cap re-applies on the next successful add. Tested with a
+  >10 KB write, a >64 KB rotation, and an archive-write-failure (no loss).
+- **Queue (item 9):** the plugin supplies its own backlog row id
+  (`add <id> <title> --kind <shape>`, native convention) and never parses
+  `tasks-axi` output — so real backlog rows work regardless of the external tool's
+  output format. `init --real` verifies `tasks-axi` presence **and** version
+  (>=0.2.4, compared numerically); absent or below-min prints the install/upgrade
+  command (`npm install -g tasks-axi`) and queue degrades to the KV cache until
+  it is satisfied. (`tasks-axi` is not bundled and was absent on the reference
+  host.)
+- **Watch (item 5):** the fm-watch supervisor was proven deterministically in a
+  scratch home — a stale/absent beacon triggers relaunch, a fresh beacon suppresses
+  it (watcher live), and relaunch backoff (60 s → 30 min cap) with an in-backoff
+  no-spawn guard prevents flooding; BB resumes paging whenever the beat goes stale
+  (no supervision gap). A full live-thread e2e was intentionally not run to avoid
+  touching live fleet state; run it in a dedicated sandbox before enabling live.
+- **Secondmate (item 10):** feasible subset only (scope + clone-list routing). A
+  dead/archived mate thread never loses the task — if the routing send throws,
+  dispatch logs and falls back to a normal native spawn. Full native
+  home/handoff/inheritance/child-supervision remains OPEN as above.

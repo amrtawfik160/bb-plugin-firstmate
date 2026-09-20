@@ -85,14 +85,23 @@ They degrade to the current native behavior with a log line.
   `quietOwner` / `memoryOwner`, each `kv` | `real`, default `kv`): with `real`,
   that tool routes through the native owner and writes through to the KV cache;
   a host/read failure degrades to KV with a log. `queueOwner` → `fm-tasks-axi.sh`
-  `data/backlog.md` (needs `tasks-axi` on the host). `decisionsOwner` →
+  `data/backlog.md`. The plugin **supplies its own row id** (native convention:
+  `add <id> <title> --kind <shape>`) and never parses `tasks-axi` output, so a row
+  can't be mis-targeted or frozen by an unexpected add-output format; start/done/rm
+  target the same id. Needs `tasks-axi` on the host (`npm install -g tasks-axi`,
+  min 0.2.4) — `init --real` verifies presence and version and prints the
+  install/upgrade command if absent or below min (queue then degrades to the KV
+  cache until satisfied). `decisionsOwner` →
   captain-held backlog tasks (`fm-captain-hold.sh`), answering also writes the
   `resolved` close to the crew's `state/<id>.status`. `afkOwner` → durable
   `state/.afk-contract` (`fm-afk-contract.sh`) so real merge/watch see the same
   away authority + merge grants (`afk on --grant <task-id>`). `quietOwner` →
   native `state/.afk` `quiet` flag. `memoryOwner` → tiered stow files
-  `data/captain.md` + `data/learnings.md`. Project existing KV state into the real
-  files once with `bb firstmate migrate-owners` (idempotent).
+  `data/captain.md` + `data/learnings.md` (written via stdin, so there is no
+  command-size ceiling; `learnings.md` is capped at ~64 KB with the oldest lines
+  rotated to `data/learnings.archive.md` — no silent freeze at any size). Project
+  existing KV state into the real files once with `bb firstmate migrate-owners`
+  (idempotent).
 
 ### Real skills inventory
 
@@ -211,8 +220,17 @@ Load the matching skill: `/afk` → `afk`, `/quiet` → `quiet`, `ahoy` → `aho
 
 Secondmates = persistent domain captains (open a thread in that project, run
 `/captain` / `deck` there, then `secondmate register` from here). Idle by
-default; dispatch to their project routes the ask to that thread. Never
-supervise their child tree from here.
+default; dispatch routes there by **scope + a non-exclusive project clone list**,
+not just an exact project-id match: `secondmate register --project <id> --thread
+<id> --scope "<what it owns>" --projects a,b`. When several registered mates are
+eligible for a project, the one whose `scope` best matches the task wins; if none
+fits, dispatch stays with the main home. True scope judgement is still yours —
+register the fitting mate or dispatch from its own thread. Never supervise their
+child tree from here. **BB parity limit:** a BB secondmate is a routing target
+(thread + scope + clone list), not a fully seeded independent firstmate home —
+BB's backend can only spawn non-nesting leaf crews, so a seeded `FM_HOME`, backlog
+handoff, and config/memory inheritance are not implemented here (see
+PLUGIN_OVERVIEW parity table).
 
 Full contract: [intake + briefs](references/intake-briefs.md),
 [supervision + modes](references/supervision.md),
