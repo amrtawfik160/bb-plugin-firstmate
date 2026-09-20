@@ -13,6 +13,7 @@ import {
 import plugin, {
   captainWakeDoorbell,
   fmBackendEnv,
+  fmWatchKeeperInterval,
   fmWatchKeeperScript,
   formatFmMeta,
   formatSecondmate,
@@ -2499,28 +2500,81 @@ test("D1 migrate-owners: refuses to touch memory when the real file is unreadabl
   }
 });
 
-test("D1 sentinel: a real memory line CONTAINING the literal FM_MEM_ABSENT is not read as empty and is never overwritten", async () => {
+// D1 sentinel family: absence is out-of-band (exit code), never a substring of file
+// CONTENT, and a read FAILURE is never conflated with an empty/absent file. All
+// callers (migrate, D3 recall/memoryShow, D5 clear/archive, add/drop) go through the
+// one hardened readMemoryFile, so fixing it there covers every caller.
+const SENTINEL_LINE = "- 2026-01-01: reproduce the FM_MEM_ABSENT bug end-to-end <!--a:2026-01-01-->";
+
+test("D1 sentinel (a): file content containing the literal FM_MEM_ABSENT round-trips byte-exact and is not empty", async () => {
   const host = ownerHost({ memoryOwner: "real" });
   await plugin(host.bb);
   try {
-    // A legitimate learning whose PROSE contains the absence sentinel literal.
-    const tricky = "- 2026-01-01: the readMemoryFile FM_MEM_ABSENT sentinel is out-of-band now <!--a:2026-01-01-->";
-    await host.bb.storage.kv.set("memory-learnings", "SHORT-KV-CACHE"); // KV shorter than the real file
-    const { writes } = stubRoutedHost(host, (cmd) => {
-      // File EXISTS (exit 0) and its content contains "FM_MEM_ABSENT". Absence would be
-      // a distinct non-zero exit, which this present-file read never returns.
-      if (cmd.includes("cat") && cmd.includes("data/learnings.md") && !cmd.includes("archive")) return { payload: tricky, code: 0 };
+    stubRoutedHost(host, (cmd) => {
+      if (cmd.includes("data/captain.md")) return { payload: "CAP-REAL", code: 0 };
+      if (cmd.includes("data/learnings.md") && !cmd.includes("archive")) return { payload: SENTINEL_LINE, code: 0 };
       return { payload: "", code: 0 };
     });
-    // migrate must treat the file as NON-empty → mirror file→KV, never seed KV→file.
+    const show = await host.harness.behavior.runCli(["memory", "show", "--json"], { projectId: "proj_1" });
+    assert.equal(show.exitCode, 0, show.stderr);
+    const json = JSON.parse(show.stdout) as { learnings?: string; source?: string };
+    assert.equal(json.source, "real", "must read the real files");
+    assert.equal(json.learnings, SENTINEL_LINE, "content containing the sentinel literal must round-trip byte-exact");
+    assert.notEqual(json.learnings, "", "a file with content must never read as empty");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("D1 sentinel (b): migrate never overwrites a real file whose content contains the sentinel literal", async () => {
+  const host = ownerHost({ memoryOwner: "real" });
+  await plugin(host.bb);
+  try {
+    await host.bb.storage.kv.set("memory-learnings", "SHORT-KV-CACHE"); // KV shorter than the real file
+    const { writes } = stubRoutedHost(host, (cmd) => {
+      if (cmd.includes("cat") && cmd.includes("data/learnings.md") && !cmd.includes("archive")) return { payload: SENTINEL_LINE, code: 0 };
+      return { payload: "", code: 0 };
+    });
     const mig = await host.harness.behavior.runCli(["migrate-owners"], { projectId: "proj_1" });
     assert.equal(mig.exitCode, 0, mig.stderr);
     assert.equal(decodeHostWrite(writes, "data/learnings.md"), null, "a file containing the sentinel literal must NOT be overwritten (not treated as empty)");
-    assert.equal(await host.bb.storage.kv.get("memory-learnings"), tricky, "KV must mirror the real file even though it contains the sentinel literal");
-    // And recall (D3) must show the real content, not the stale short KV.
-    const show = await host.harness.behavior.runCli(["memory", "show", "--json"], { projectId: "proj_1" });
-    assert.equal(show.exitCode, 0, show.stderr);
-    assert.match(show.stdout, /out-of-band now/, "recall must surface the real line containing the sentinel literal");
+    assert.equal(await host.bb.storage.kv.get("memory-learnings"), SENTINEL_LINE, "KV must mirror the real file (file→KV), not the stale short cache");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("D1 sentinel (c): a genuinely-absent real file reads as absent and is seeded from KV", async () => {
+  const host = ownerHost({ memoryOwner: "real" });
+  await plugin(host.bb);
+  try {
+    await host.bb.storage.kv.set("memory-learnings", "SEEDME-FROM-KV");
+    const { writes } = stubRoutedHost(host, (cmd) => {
+      // Absent file → the read exits with the dedicated absence code (42), never 0.
+      if (cmd.includes("cat") && cmd.includes("data/learnings.md") && !cmd.includes("archive")) return { code: 42 };
+      return { payload: "", code: 0 };
+    });
+    const mig = await host.harness.behavior.runCli(["migrate-owners"], { projectId: "proj_1" });
+    assert.equal(mig.exitCode, 0, mig.stderr);
+    assert.equal(decodeHostWrite(writes, "data/learnings.md"), "SEEDME-FROM-KV", "a genuinely-absent real file must be seeded from KV (KV→file is safe when the file is truly absent)");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("D1 sentinel (d): a read FAILURE is distinct from empty — migrate refuses, never seeds/overwrites", async () => {
+  const host = ownerHost({ memoryOwner: "real" });
+  await plugin(host.bb);
+  try {
+    await host.bb.storage.kv.set("memory-learnings", "WOULD-CLOBBER");
+    const { writes } = stubRoutedHost(host, (cmd) => {
+      // A host/read FAILURE (exit 1) — must NOT look like an empty or absent file.
+      if (cmd.includes("cat") && cmd.includes("data/learnings.md") && !cmd.includes("archive")) return { code: 1 };
+      return { payload: "", code: 0 };
+    });
+    const mig = await host.harness.behavior.runCli(["migrate-owners"], { projectId: "proj_1" });
+    assert.equal(mig.exitCode, 0, mig.stderr);
+    assert.equal(decodeHostWrite(writes, "data/learnings.md"), null, "a read failure must never be treated as empty/absent → migrate must refuse to write");
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -2893,6 +2947,116 @@ test("D6 relay: an fm-watch page reaches ONLY the owning captain; unattributable
   } finally {
     await host.harness.lifecycle.dispose();
   }
+});
+
+test("D8 relay: a MULTI-crew signal line is split/filtered per owner (no cross-captain crew-id leak)", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", watchOwner: "fm-watch", fmHostId: "host_1" },
+  });
+  await plugin(host.bb);
+  try {
+    host.harness.sdk.stub("terminals.create", async () => ({ id: "term_1" }));
+    host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+    host.harness.sdk.stub("terminals.close", async () => ({}));
+    host.harness.sdk.stub("threads.send", async () => ({}));
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ status: "active", environmentId: null }));
+    host.harness.sdk.stub("environments.list", async () => [
+      { hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" },
+    ]);
+    // Two captains on one host; a single fm-watch signal line names BOTH crews.
+    await host.bb.storage.kv.set("crews", [crewRow("1f4c7c2a", "thr_crew1", "thr_capA"), crewRow("79da4929", "thr_crew2", "thr_capB")]);
+    host.harness.sdk.stub("terminals.output", async () =>
+      hostRcPayload("FM_BEAT_AGE=5\nFM_RELAUNCHED=0\n---FM_LOGTAIL---\nsignal: state/1f4c7c2a.status state/79da4929.status wedged", 0),
+    );
+    const run = host.harness.behavior.runService("fm-watch-supervisor");
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline) {
+      if (sendCalls(host).length > 0) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    run.controller.abort();
+    await run.done;
+    const sends = sendCalls(host);
+    const toA = sends.filter((s) => s.threadId === "thr_capA").map((s) => s.text ?? "").join("\n");
+    const toB = sends.filter((s) => s.threadId === "thr_capB").map((s) => s.text ?? "").join("\n");
+    assert.match(toA, /1f4c7c2a/, "captain A must receive its own crew's page");
+    assert.doesNotMatch(toA, /79da4929/, "captain A must NOT see captain B's crew id in a multi-crew line");
+    assert.match(toB, /79da4929/, "captain B must receive its own crew's page");
+    assert.doesNotMatch(toB, /1f4c7c2a/, "captain B must NOT see captain A's crew id in a multi-crew line");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("D7: the keeper script self-exits when the owner beat goes stale (owner gone)", () => {
+  const script = fmWatchKeeperScript("host_1", "/fm", fmWatchKeeperInterval(90));
+  assert.match(script, /OWNER_BEAT=/, "keeper must reference the owner beat");
+  assert.match(script, /OWNER_TTL=\d+/, "keeper must carry an owner TTL");
+  // Loop breaks when the beat is missing (0) or older than the TTL.
+  assert.match(script, /"\$OB" -eq 0 \]\s*\|\|\s*\[ \$\(\( NOW - OB \)\) -gt "\$OWNER_TTL" \]/, "keeper must break on a stale/absent owner beat");
+});
+
+test("D7: watchOwner=native tears the keeper down on the first tick even after a reload (empty in-memory state)", async () => {
+  // Reproduces the live bug: the plugin came back up (reload → in-memory keeperHosts
+  // empty) with watchOwner already flipped to native; teardown must still fire, seeded
+  // from the configured fmHostId (and the KV-persisted set).
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", watchOwner: "native", fmHostId: "host_1" },
+  });
+  await plugin(host.bb);
+  try {
+    const cmds: string[] = [];
+    let n = 0;
+    host.harness.sdk.stub("threads.send", async () => ({}));
+    host.harness.sdk.stub("terminals.create", async (a: { start?: { command?: string } }) => {
+      cmds.push(a.start?.command ?? "");
+      return { id: `t_${++n}` };
+    });
+    host.harness.sdk.stub("terminals.get", async () => ({ status: "exited" }));
+    host.harness.sdk.stub("terminals.close", async () => ({}));
+    host.harness.sdk.stub("terminals.output", async () => hostRcPayload("", 0));
+    const teardownSeen = () => cmds.some((c) => unwrapHostCommand(c).includes(".bb-watch-keeper.pid") && unwrapHostCommand(c).includes("rm -f"));
+    const run = host.harness.behavior.runService("fm-watch-supervisor");
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline) {
+      if (teardownSeen()) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    run.controller.abort();
+    await run.done;
+    assert.ok(teardownSeen(), `watchOwner=native must remove the keeper pidfile on the host:\n${cmds.map(unwrapHostCommand).join("\n---\n")}`);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("D7: plugin dispose tears the keeper down", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", watchOwner: "fm-watch", fmHostId: "host_1" },
+  });
+  await plugin(host.bb);
+  const cmds: string[] = [];
+  let n = 0;
+  host.harness.sdk.stub("threads.send", async () => ({}));
+  host.harness.sdk.stub("terminals.create", async (a: { start?: { command?: string } }) => {
+    cmds.push(a.start?.command ?? "");
+    return { id: `t_${++n}` };
+  });
+  host.harness.sdk.stub("terminals.get", async () => ({ status: "exited" }));
+  host.harness.sdk.stub("terminals.close", async () => ({}));
+  host.harness.sdk.stub("terminals.output", async () => hostRcPayload("", 0));
+  // dispose() invokes bb.onDispose — which must stop the keeper on the configured host.
+  await host.harness.lifecycle.dispose();
+  assert.ok(
+    cmds.some((c) => unwrapHostCommand(c).includes(".bb-watch-keeper.pid") && unwrapHostCommand(c).includes("rm -f")),
+    `dispose must remove the keeper pidfile on the host:\n${cmds.map(unwrapHostCommand).join("\n---\n")}`,
+  );
 });
 
 test("R3 relaunch backoff: a persistently stale watcher is not relaunched every cycle", async () => {
