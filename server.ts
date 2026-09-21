@@ -965,7 +965,7 @@ export default async function plugin(bb: BbPluginApi) {
     tellOwner: {
       type: "select",
       label:
-        "Captain→crew steering owner: kv (a bare threads.send doorbell, no durable record, no ack) or real (route through the real fm-send.sh steering inbox: durable sequenced state/<id>.inbox/NNN.msg, one constant doorbell, ack = crew mv to handled/, fm-watch re-ring ladder; refuses unresolved targets). interrupt/stop stay hard-stops, never the inbox. Real degrades to the KV doorbell with a log on infra failure.",
+        "Captain→crew steering owner: kv (a bare threads.send, no durable record, no ack) or real (also write a durable fire-and-forget audit record under state/<id>.inbox/NNN.msg; refuses unresolved targets). Either owner, a plain tell defaults to a STEER that lands in the crew's running turn (a non-urgent tell can opt into queue-if-active); interrupt/stop stay hard-stops. Real degrades to the KV path with a log on infra failure.",
       options: ["kv", "real"],
       default: "kv",
     },
@@ -2679,7 +2679,7 @@ export default async function plugin(bb: BbPluginApi) {
   // Returns a status string once the literal doorbell is delivered; null when
   // tellOwner=kv, fmHome unset, or the BB send itself fails (so tellCrew's own send is
   // the last-resort fallback).
-  async function sendViaInbox(crew: Crew, message: string): Promise<string | null> {
+  async function sendViaInbox(crew: Crew, message: string, queue: boolean): Promise<string | null> {
     const current = await settings.get();
     if (current.tellOwner !== "real") return null;
     const fmHome = current.fmHome.trim();
@@ -2692,44 +2692,82 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const durable = hostId === null ? false : await writeInboxRecord(hostId, fmHome, crew.id, message);
     if (durable && hostId !== null) await reapInboxRecords(hostId, fmHome, crew.id);
+    // Capture the running-turn status BEFORE we send, so the returned line honestly
+    // reports whether a steer LANDED in a live turn or merely started an idle one.
+    const wasActive = queue ? false : await crewInTurn(crew);
     try {
       await bb.sdk.threads.send({
         threadId: crew.threadId,
-        mode: "queue-if-active",
+        // Default tell is a STEER: mode:"steer" lands inside the crew's running turn
+        // (course correction reaches it mid-work) and starts a turn when idle.
+        // queue:true opts out to the old non-disturbing doorbell — queue-if-active
+        // only queues, so the crew reads it when it next drains its queue.
+        mode: queue ? "queue-if-active" : "steer",
         input: [{ type: "text", text: message.slice(0, MAX_TASK), mentions: [] }],
       });
     } catch (error) {
-      // Couldn't even deliver the literal doorbell — let tellCrew's own send try.
-      bb.log.warn(`fm inbox doorbell crew=${crew.id} ${error instanceof Error ? error.message : String(error)}; falling back`);
+      // Couldn't even deliver over BB — let tellCrew's own send try.
+      bb.log.warn(`fm inbox ${queue ? "doorbell" : "steer"} crew=${crew.id} ${error instanceof Error ? error.message : String(error)}; falling back`);
       return null;
     }
-    bb.log.info(`fm inbox steer crew=${crew.id} ${durable ? "durable record + literal doorbell" : "literal doorbell (no durable record)"}`);
-    return durable
-      ? `Told crew ${crew.id} (delivered over BB + durable fire-and-forget inbox record for audit; not re-rung)`
-      : `Told crew ${crew.id} (delivered over BB; durable record unavailable — logged)`;
+    bb.log.info(`fm inbox ${queue ? "queue" : "steer"} crew=${crew.id} ${durable ? "durable record + BB delivery" : "BB delivery (no durable record)"}`);
+    const audit = durable ? "durable fire-and-forget inbox record for audit" : "durable record unavailable — logged";
+    if (queue) return `Queued for crew ${crew.id} (${audit}; read when its current turn ends)`;
+    return wasActive
+      ? `Steered into crew ${crew.id}'s running turn (${audit})`
+      : `Told crew ${crew.id} (started a turn; ${audit})`;
   }
 
-  async function tellCrew(crew: Crew, message: string, interrupt: boolean): Promise<string> {
+  async function crewInTurn(crew: Crew): Promise<boolean> {
+    const status = await crewStatus(crew);
+    return status === "active" || status === "starting" || status === "pending";
+  }
+
+  // Standard framing on a plain (non-interrupt) tell so a crew reads it as a course
+  // correction to fold into its CURRENT task — not as a stop. interrupt keeps the
+  // opposite framing ("INTERRUPT: stop the current action"). The distinction is the
+  // whole point: a steer lands in the running turn and must not read as teardown —
+  // a crew that treats a correction as "ACK: Stopped" abandons live work.
+  const STEER_PREFIX =
+    "STEER from captain — this is a course correction, NOT a stop. Keep working on your current task and fold this in without tearing down or discarding work: ";
+
+  async function tellCrew(crew: Crew, message: string, interrupt: boolean, queue = false): Promise<string> {
     if (isSecondmateRoute(crew) && interrupt) {
       throw new Error(`Crew ${crew.id} is a secondmate route — do not interrupt the domain captain thread.`);
     }
-    // Steer (not interrupt) routes through the durable inbox when tellOwner=real.
-    // interrupt/stop always stay a hard bb steer — never the inbox — so an interrupt
-    // is never misread as a queued instruction.
+    // A plain tell is a STEER by default: mode:"steer" LANDS inside the crew's
+    // running turn (so a captain's correction reaches it mid-work instead of sitting
+    // in a queue the crew only reads after it finishes) and STARTS a turn when the
+    // crew is idle — strictly better than queue-if-active for a correction.
+    // `queue: true` is the deliberate opt-out for a genuinely non-urgent note that
+    // must not disturb an active turn (queue-if-active; read when the crew next
+    // drains its queue). interrupt/stop keep their own hard-stop framing and are
+    // never routed through the inbox or queued.
     if (!interrupt) {
-      const routed = await sendViaInbox(crew, message);
+      const body = queue ? message : `${STEER_PREFIX}${message}`;
+      const routed = await sendViaInbox(crew, body, queue);
       if (routed !== null) return routed;
+      const wasActive = queue ? false : await crewInTurn(crew);
+      await bb.sdk.threads.send({
+        threadId: crew.threadId,
+        mode: queue ? "queue-if-active" : "steer",
+        input: [{ type: "text", text: body.slice(0, MAX_TASK), mentions: [] }],
+      });
+      if (queue) {
+        return (await crewInTurn(crew))
+          ? `Queued for crew ${crew.id} (read when its current turn ends)`
+          : `Told crew ${crew.id}`;
+      }
+      return wasActive
+        ? `Steered into crew ${crew.id}'s running turn`
+        : `Told crew ${crew.id} (started a turn)`;
     }
     await bb.sdk.threads.send({
       threadId: crew.threadId,
-      mode: interrupt ? "steer" : "queue-if-active",
+      mode: "steer",
       input: [{ type: "text", text: message.slice(0, MAX_TASK), mentions: [] }],
     });
-    if (interrupt) return `Interrupted crew ${crew.id}`;
-    const status = await crewStatus(crew);
-    return status === "active" || status === "starting" || status === "pending"
-      ? `Queued for crew ${crew.id} (doorbell; not interrupting)`
-      : `Told crew ${crew.id}`;
+    return `Interrupted crew ${crew.id}`;
   }
 
   async function waitOne(crew: Crew, timeoutMs: number, signal?: AbortSignal): Promise<string> {
@@ -4980,7 +5018,7 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb firstmate deck | session [--json]",
     '  bb firstmate dispatch --project <id> [--task t ...] [--shape ship|scout] [--mode m] [--title t] [--provider p] [--model m] [--reasoning-level low|medium|high|xhigh|max] [--permission-mode m] [--shared-env] [--worktree] [--hidden] [--send-at ms] -- "<task>"',
     "  bb firstmate crews | crew <id> | watch [id ...] [--timeout s] [--json]",
-    '  bb firstmate tell <id> -- "<message>" | interrupt <id> | stop <id> | retry <id> [--model m] [--provider p] [--reasoning-level l] [--reason r]',
+    '  bb firstmate tell <id> [--queue] -- "<message>" | interrupt <id> | stop <id> | retry <id> [--model m] [--provider p] [--reasoning-level l] [--reason r]',
     "  bb firstmate bearings | deliver <id> | merge <id> [--yes] [--allow-red <check-name>] | promote <id>",
     '  bb firstmate queue add --project <id> [--shape s] [--mode m] [--after <qid>] [--wait-until <iso>] -- "<title>"',
     "  bb firstmate queue [list|next|dispatch <qid>|done <qid>|drop <qid>]",
@@ -5076,17 +5114,18 @@ export default async function plugin(bb: BbPluginApi) {
   bb.agents.registerTool({
     name: "firstmate_tell",
     description:
-      "Doorbell a crew: queues if the turn is active, starts a turn if idle. Use firstmate_interrupt to hard-stop. Pass resolveKey to also close that crew's open needs-decision/blocked (writes the resolved line to the real state/<id>.status, matching fm-classify-lib) when this steer is your answer to it.",
+      "Steer a crew: by default the message LANDS inside the crew's running turn (a course correction it acts on mid-work, not a stop) and starts a turn if the crew is idle. The returned line says honestly what happened (\"Steered into crew <id>'s running turn\" vs \"Told crew <id> (started a turn)\"). Pass queue=true for a genuinely non-urgent note that must NOT disturb an active turn — it queues and the crew reads it when its current turn ends. Use firstmate_interrupt to hard-stop. Pass resolveKey to also close that crew's open needs-decision/blocked (writes the resolved line to the real state/<id>.status, matching fm-classify-lib) when this steer is your answer to it.",
     parameters: z.object({
       crewId: z.string(),
       message: z.string().min(1).max(MAX_TASK),
+      queue: z.boolean().optional().describe("Non-urgent note: queue it instead of steering into the crew's running turn (read when the turn ends). Default false = steer now."),
       resolveKey: z.string().optional().describe("Key of the crew's open decision this steer answers (from crew/bearings); closes it in real state"),
     }),
-    async execute({ crewId, message, resolveKey }) {
+    async execute({ crewId, message, queue, resolveKey }) {
       const crew = await findCrew(crewId);
       if (crew === undefined) return toolError(`No crew ${crewId}.`);
       try {
-        const sent = await tellCrew(crew, message, false);
+        const sent = await tellCrew(crew, message, false, queue === true);
         if (resolveKey !== undefined && resolveKey.trim() !== "") {
           const closed = await appendResolvedStatus(crew, resolveKey.trim(), message);
           return `${sent}${closed ? ` (resolved [key=${resolveKey.trim()}] in real state)` : ""}`;
@@ -5960,7 +5999,10 @@ export default async function plugin(bb: BbPluginApi) {
     }
     clearNudgeTimer(crew.id);
     try {
-      await tellCrew(crew, protocolNudgeText(row.count + 1, limits.max), false);
+      // The protocol nudge is an automated doorbell for a crew that just ended a
+      // turn without a valid status verdict — queue it (do not steer/interrupt) so
+      // it is read on the crew's next turn without hijacking a fresh one.
+      await tellCrew(crew, protocolNudgeText(row.count + 1, limits.max), false, true);
     } catch (error) {
       bb.log.warn(
         `protocol nudge failed for crew ${crew.id}: ${error instanceof Error ? error.message : String(error)}`,
@@ -6048,7 +6090,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "crews", summary: "List recorded crews with live status", usage: "bb firstmate crews [--json]" },
       { name: "crew", summary: "Show one crew with last output", usage: "bb firstmate crew <crew-id> [--json]" },
       { name: "watch", summary: "Wait for crews via bb thread wait", usage: "bb firstmate watch [crew-id ...] [--timeout <sec>] [--json]" },
-      { name: "tell", summary: "Steer a running crew", usage: 'bb firstmate tell <crew-id> [--resolve-key <key>] -- "<message>"' },
+      { name: "tell", summary: "Steer a running crew mid-turn (course correction); --queue for a non-urgent note", usage: 'bb firstmate tell <crew-id> [--queue] [--resolve-key <key>] -- "<message>"' },
       { name: "interrupt", summary: "Steer a hard stop without teardown", usage: "bb firstmate interrupt <crew-id>" },
       { name: "stop", summary: "Stop a crew thread", usage: "bb firstmate stop <crew-id>" },
       { name: "retry", summary: "Re-submit a failed turn, or relaunch with a new model/provider/reasoning", usage: "bb firstmate retry <crew-id> [--model m] [--provider p] [--reasoning-level l]" },
@@ -6297,7 +6339,8 @@ export default async function plugin(bb: BbPluginApi) {
             if (id === undefined || message === "") return fail(usage);
             const crew = await findCrew(id);
             if (crew === undefined) return fail(`No crew ${id}. Run "bb firstmate crews".`);
-            const text = await tellCrew(crew, message, command === "interrupt");
+            const wantQueue = command === "tell" && flags.get("queue") === true;
+            const text = await tellCrew(crew, message, command === "interrupt", wantQueue);
             const resolveKey = command === "tell" ? (flagStr(flags, "resolve-key") ?? "").trim() : "";
             const resolved = resolveKey !== "" ? await appendResolvedStatus(crew, resolveKey, message) : false;
             return reply(

@@ -61,11 +61,16 @@ dropped without losing content, because the content lives elsewhere.
 _Avoid_: notification, ping.
 
 **Steer**:
-A captain→crew instruction. By default a steer is a plain BB doorbell send with no
-durable record. The durable path — writing an **inbox record** the crew reads and
-acknowledges — is the `tellOwner=real` option, which is off by default and slated
-for deletion (see **Owner flag**); do not assume steers are durable.
-`interrupt`/`stop` are hard steers, never the inbox.
+A captain→crew course correction. By default a plain `tell` delivers with BB
+`mode:"steer"`, which LANDS inside the crew's running turn (and starts a turn when
+the crew is idle) — so a captain can correct a crew mid-work instead of waiting for
+it to finish. It is framed "not a stop; keep working and fold this in", so the crew
+continues its task. `tell` with `queue:true` opts out to a **doorbell**
+(`queue-if-active`) for a non-urgent note read only when the crew next drains its
+queue. `interrupt`/`stop` are hard steers (`mode:"steer"` + stop framing), never the
+inbox. Under `tellOwner=real` a plain tell also writes a durable fire-and-forget
+**inbox record** as an audit trail; that owner is off by default and slated for
+deletion (see **Owner flag**), so do not assume steers are durably recorded.
 
 **Inbox record**:
 A durable message file in a crew's inbox. The crew acknowledges by moving the file

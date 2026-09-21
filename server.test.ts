@@ -497,6 +497,63 @@ test("missing protocol doorbells the crew and does not ping done", async () => {
   }
 });
 
+// ---- tell defaults to STEER (course correction lands in the running turn) ----
+
+const STEER_PREFIX_TEST =
+  "STEER from captain — this is a course correction, NOT a stop. Keep working on your current task and fold this in without tearing down or discarding work: ";
+
+function stubActiveSdk(host: Awaited<ReturnType<typeof load>>) {
+  host.harness.sdk.stub("threads.send", async () => ({}));
+  host.harness.sdk.stub("threads.list", async () => []);
+  host.harness.sdk.stub("threads.get", async () =>
+    makeThreadResponse({ id: "thr_crew", status: "active", environmentId: null }),
+  );
+}
+
+test("tell steers a running crew mid-turn by default (mode:steer + course-correction framing)", async () => {
+  const host = await load();
+  try {
+    stubActiveSdk(host);
+    await seedCrew(host);
+    const res = await host.harness.behavior.runCli(
+      ["tell", "c1", "--message=Correction from captain: the company is Straightline, not Streetline"],
+      { projectId: "proj_1" },
+    );
+    assert.equal(res.exitCode, 0, res.stderr);
+    const sends = sendCalls(host).filter((s) => s.threadId === "thr_crew");
+    assert.equal(sends.length, 1);
+    // The whole bug: a correction to an ACTIVE crew must land in its running turn.
+    // Reverting to mode:"queue-if-active" makes this assertion die.
+    assert.equal(sends[0]?.mode, "steer");
+    assert.ok(sends[0]?.text.startsWith(STEER_PREFIX_TEST), "steer must carry the not-a-stop framing");
+    assert.match(sends[0]?.text ?? "", /Straightline, not Streetline/);
+    // Honest status: the captain is told it steered, not that it "told" (queued).
+    assert.match(res.stdout, /Steered into crew c1's running turn/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("tell --queue opts out to a non-disturbing queued note (mode:queue-if-active, no steer prefix)", async () => {
+  const host = await load();
+  try {
+    stubActiveSdk(host);
+    await seedCrew(host);
+    const res = await host.harness.behavior.runCli(
+      ["tell", "c1", "--queue", "--message=non-urgent FYI for later"],
+      { projectId: "proj_1" },
+    );
+    assert.equal(res.exitCode, 0, res.stderr);
+    const sends = sendCalls(host).filter((s) => s.threadId === "thr_crew");
+    assert.equal(sends.length, 1);
+    assert.equal(sends[0]?.mode, "queue-if-active");
+    assert.equal(sends[0]?.text, "non-urgent FYI for later");
+    assert.match(res.stdout, /Queued for crew c1/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("cooldown blocks a second nudge; the cap then surfaces NEEDS DECISION", async () => {
   const host = await load();
   try {
@@ -4505,6 +4562,10 @@ test("IT F4: tellOwner=real stores steer text VERBATIM for --key / --resolve-key
   try {
     stubRealExecHost(host);
     await seedCrew(host);
+    // A default tell now steers with a standard course-correction prefix; the
+    // user's hazardous content must still be stored/delivered VERBATIM after it.
+    const STEER_PREFIX =
+      "STEER from captain — this is a course correction, NOT a stop. Keep working on your current task and fold this in without tearing down or discarding work: ";
     const bodies = ["--resolve-key foo bar", "--key Enter then act", "/deploy to prod now", "$env special skill", "line one\nline two\nline three"];
     let seq = 0;
     for (const body of bodies) {
@@ -4513,10 +4574,11 @@ test("IT F4: tellOwner=real stores steer text VERBATIM for --key / --resolve-key
       seq += 1;
       const rec = readFileSync(join(home, "state", "c1.inbox", `${String(seq).padStart(3, "0")}.msg`), "utf8");
       const bodyOnDisk = rec.slice(rec.indexOf("\n--\n") + 4);
-      assert.equal(bodyOnDisk, body, `verbatim record mismatch for [${body}]`);
+      assert.equal(bodyOnDisk, STEER_PREFIX + body, `verbatim record mismatch for [${body}]`);
+      assert.equal(bodyOnDisk.slice(STEER_PREFIX.length), body, `content mangled after prefix for [${body}]`);
     }
     const texts = sendCalls(host).map((s) => s.text);
-    for (const body of bodies) assert.ok(texts.includes(body), `literal doorbell missing for [${body}]`);
+    for (const body of bodies) assert.ok(texts.includes(STEER_PREFIX + body), `steer doorbell missing for [${body}]`);
   } finally {
     await host.harness.lifecycle.dispose();
     rmSync(home, { recursive: true, force: true });

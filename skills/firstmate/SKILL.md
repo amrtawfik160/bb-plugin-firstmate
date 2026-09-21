@@ -47,7 +47,7 @@ Run `bb firstmate --help` for flags. `--json` when output drives code.
    implements in its own worktree. Audit/review/diagnose → scout.
 3. Ship isolation is default. Never two ship crews on one checkout.
 4. Fan out with repeat `--task` (max 10). Brief = Captain's intent + spec.
-5. Supervise with `watch` or `bearings`. Steer with `tell` (doorbell / `queue-if-active`) or `interrupt` (hard stop).
+5. Supervise with `watch` or `bearings`. Course-correct a running crew with `tell` (steers into its live turn by default; `--queue` for a non-urgent note); `interrupt` is the hard stop.
 6. `deliver` (committed + uncommitted + PR URL), then `merge --yes` when green.
    Local-only uses ff-only onto the project checkout.
 7. Promote scouts with `promote` (new ship, report attached).
