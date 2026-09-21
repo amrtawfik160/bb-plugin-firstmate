@@ -166,50 +166,86 @@ of truth for policy wording. Paraphrasing native for its own sake is how these
 skills drifted to ~0% of native's text before this convention existed; copy the
 wording instead.
 
-Two rules make every difference from native visible and auditable. **An unmarked
-difference from native is by definition a bug.**
+The convention is **mechanically checkable**, not a matter of reviewer diligence:
+`npm test` runs `scripts/skill-fidelity.ts`, which fails when a skill's rendered
+prose differs from its pinned native source without a marker, and flags a marker
+whose native anchor no longer resolves. **An unmarked difference from native is a
+bug, and the check will catch it.**
 
-### Pin the native source per skill
+### The vendored native snapshot
 
-Every skill re-derived from native carries, right after its frontmatter, a
-`BB-SOURCE` header naming the native file it copies and the native commit it was
-taken from:
+The pinned native source is vendored, read-only, under `native-snapshot/<sha>/…`,
+mirroring native's own paths (`.agents/skills/<name>/SKILL.md`, or a named slice
+such as `AGENTS.section-9.md`). This is what the check diffs against, so it runs
+fully offline. It is a copy of native at the pin — never edit it by hand; re-vendor
+from the native clone when you bump a pin. Native is currently at `804394e8`.
 
-    <!-- BB-SOURCE: firstmate .agents/skills/afk/SKILL.md @ 804394e8
-         Copied from native firstmate; edited only where BB forces it. Every
-         divergence below is marked BB-DIVERGE. Re-sync and bump this SHA when
-         native moves. See CONTRIBUTING.md "Skill fidelity". -->
+### Pin the native source per skill (`BB-SOURCE`)
 
-The pinned SHA is what a future re-sync (or a drift check) diffs against. When you
-update a skill against a newer native revision, bump the SHA in the same pass.
-Native is currently at `804394e8`.
+Every re-derived skill carries, right after its frontmatter, a machine-parseable
+`BB-SOURCE` header:
 
-### Mark every divergence inline
+    <!-- BB-SOURCE
+         native: .agents/skills/afk/SKILL.md
+         sha: 804394e8
+         snapshot: native-snapshot/804394e8/.agents/skills/afk/SKILL.md
+         fidelity: adapted        # verbatim | adapted
+         note: … -->
 
-Wherever the copy departs from native — a reworded line, a dropped mechanic, an
-added BB-only rule — leave an inline `BB-DIVERGE` marker at that spot stating three
-things: what native says, what BB does instead, and the environmental reason it
-cannot be otherwise:
+`fidelity: verbatim` means the rendered prose is native's own, byte-for-byte modulo
+whitespace/markdown (e.g. `ask-user-authority`, `diagnostic-reasoning`).
+`fidelity: adapted` means it is copied but restructured for BB, so BB-specific text
+is fenced (below). Either way, **every rendered sentence outside a fence must appear
+verbatim in the pinned snapshot**, or the check fails.
 
-    <!-- BB-DIVERGE: native runs `fm-afk-launch.sh propose` then `confirm` as two
-         script calls; BB's `firstmate_afk on` commits the durable contract in one
-         call, so the read-back happens in chat before that call. Reason: the BB
-         tool has no separate propose step. -->
+### Two ways to mark a divergence
+
+**`BB-DIVERGE`** — a comment with a machine-parseable anchor to the native text it
+diverges from. `native-quote` must be a contiguous phrase that resolves verbatim in
+the snapshot; the check fails a quote that no longer resolves (native drift):
+
+    <!-- BB-DIVERGE
+         native: .agents/skills/afk/SKILL.md § Entering
+         native-quote: Run `bin/fm-afk-launch.sh confirm`
+         bb: BB's `firstmate_afk on` commits the durable contract in one call; the read-back happens in chat before that call.
+         reason: the BB tool has no separate propose step. -->
+
+**`BB-ONLY`** — a fence around BB-specific *rendered* text that has no native source
+(a tool call, a BB-only section). The fence carries a reason and the checker skips
+its contents:
+
+    <!-- BB-ONLY: BB commits the durable contract in one tool call. -->
+    Call `firstmate_afk` with `action: "on"` …
+    <!-- /BB-ONLY -->
 
 The reason must be a real environmental constraint (no tmux pane, no composer to
 read, BB threads not windows, no blocking stop hook, a tool that folds two native
 steps into one, the KV cache plane, etc.). "Shorter" or "reads better" is not a
 reason — copy native's wording instead.
 
-Do **not** import native instructions that would mislead a BB crew (tmux/herdr
-pane mechanics, keystroke injection, the away daemon) just to raise a fidelity
-number. Mark that whole block `BB-DIVERGE / NECESSARY-OMITTED` with the reason it
-does not apply here, rather than copying dead mechanics.
+Do **not** import native instructions that would mislead a BB crew (tmux/herdr pane
+mechanics, keystroke injection, the away daemon) just to raise a fidelity number.
+Mark that whole block `BB-DIVERGE` with `bb: NECESSARY-OMITTED …` and an anchor to a
+representative native phrase, rather than copying dead mechanics.
 
 Out of scope stays listed, not silently dropped: when a native section is deferred
 to a later pass (e.g. stow's tiered-memory/decay/budget contract, or the captain
 skill's hard-rules and intake wording), say so in the skill or PR so the remaining
 gap is tracked, not forgotten.
+
+### Running the check
+
+- `npm test` runs the offline structural + snapshot-membership check (no native
+  clone needed — it reads the vendored snapshot).
+- `npm run fidelity` runs the same check standalone.
+- `npm run fidelity -- --native /path/to/firstmate` additionally proves the vendored
+  snapshot still matches a live native clone at the pinned SHA, so a stale snapshot
+  (and every anchor resting on it) fails after a native bump.
+
+When native moves and you re-sync a skill: re-vendor its snapshot from the clone,
+bump the `sha` in `BB-SOURCE`, re-anchor any `native-quote` that native reworded,
+and restore/re-mark any prose that native changed — the check tells you exactly
+which sentences and anchors need attention.
 
 ## Docs and ADRs
 

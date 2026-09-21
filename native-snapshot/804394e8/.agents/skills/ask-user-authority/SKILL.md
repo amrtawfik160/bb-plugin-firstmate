@@ -1,19 +1,16 @@
-<!-- BB-SOURCE
-     native: .agents/skills/ask-user-authority/SKILL.md
-     sha: 804394e8
-     snapshot: native-snapshot/804394e8/.agents/skills/ask-user-authority/SKILL.md
-     fidelity: verbatim
-     note: Adopted as-is from native firstmate (pure decision policy, zero harness
-     dependency). Rendered prose is native's own; BB-only framing is fenced
-     BB-ONLY and structural edits are marked BB-DIVERGE. See CONTRIBUTING.md
-     "Skill fidelity". -->
+---
+name: ask-user-authority
+description: >-
+  Agent-only decision procedure for ask-user findings.
+  Use before deciding any ask-user finding.
+  This skill is the single owner of finding-decision policy: firstmate always applies judgment, decides findings that are unambiguous toward accepted intent, and escalates only genuinely ambiguous, expanding, or destructive ones.
+  Finding authority is this skill's criteria, not the project's yolo posture.
+user-invocable: false
+metadata:
+  internal: true
+---
 
 # ask-user-authority
-
-<!-- BB-ONLY: load-trigger line for a BB captain reference; native declares the
-     trigger in its skill frontmatter, which a plugin reference file does not carry. -->
-Read before deciding any no-mistakes ask-user finding.
-<!-- /BB-ONLY -->
 
 This skill is the single owner of the decision policy for no-mistakes ask-user findings.
 `AGENTS.md` section 7 points here and does not restate this procedure.
@@ -58,9 +55,3 @@ Do not relay reviewer labels or gate output as if they settled the decision.
 - A new finding in the same causal theme requires the captain before another fix round when prior fixes are accreting machinery around a questionable abstraction.
 - A genuinely security-sensitive action requires the captain under the stronger existing boundary even if it is otherwise within scope.
 - Complex architecture explicitly requested by the captain stays within scope and does not escalate merely because it is complex.
-
-<!-- BB-DIVERGE
-     native: .agents/skills/ask-user-authority/SKILL.md (frontmatter)
-     native-quote: user-invocable: false
-     bb: adopted as a captain reference loaded on demand from the captain skill; the escalation surface is BB plain chat / the AskUserQuestion tool. The decision policy itself is unchanged.
-     reason: BB has no agent-only skill loader or native pane; captain policy is carried as references. -->
