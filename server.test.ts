@@ -1454,6 +1454,23 @@ test("plugin emits a loud stale-mirror guard on use and surfaces FM_MIRROR_STALE
   assert.match(src, /fm-brief scaffold failed: \$__fm_err/);
 });
 
+test("stale-mirror guard is wired into the SUPERVISION paths (keeper + checkWatcher), loud (F2 re-review)", () => {
+  // Keeper: the pure builder embeds the guard, so a stale re-arm is recorded to the
+  // watch log (which checkWatcher tails and surfaces). fm-watch is re-armed FROM the
+  // mirror, so an unguarded keeper would degrade supervision silently.
+  const keeper = fmWatchKeeperScript("host_1", "/h", 15);
+  assert.match(keeper, /FM_MIRROR_STALE/, "keeper does not check the mirror on re-arm");
+  assert.match(keeper, /\.mirror-manifest/);
+  assert.match(keeper, /rev-parse HEAD/);
+  assert.match(keeper, /\} >> "\$LOG" 2>&1/, "keeper guard output must land in the watch log");
+
+  // checkWatcher: the supervision poll runs the guard and logs a loud, supervision-specific
+  // error when the mirror is stale.
+  const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "server.ts"), "utf8");
+  assert.match(src, /Check on every supervision poll/);
+  assert.match(src, /fm-watch-supervisor: bb mirror is STALE/);
+});
+
 // Behavioral guard: when a real firstmate checkout is reachable, actually run the
 // installer against a fresh clone and assert the tracked tree stays clean. Skips
 // (rather than fails) where no checkout is available so it never blocks CI, while

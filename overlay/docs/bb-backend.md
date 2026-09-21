@@ -117,6 +117,8 @@ A home installed by the **old** overlay has the three tracked files patched in p
 
 **Order matters: fast-forward BEFORE installing the mirror.** If you install first and fast-forward second, the mirror is built at the *old* HEAD and then HEAD advances underneath it — leaving new `bin/` scripts unmirrored and the three frozen copies behind upstream (the stale-mirror failure above), self-healing only at the next plugin `initRealMode`. Restore → fast-forward → *then* install against the new HEAD.
 
+**Quiesce the captain during the migration.** Between step 1 (native restored → `bin/` no longer carries bb) and step 4 (mirror installed), `config/backend=bb` is still set but the `config/bb-overlay` marker + `bin-bb/` are absent, so `$FM_BINDIR` resolves to native `bin/` and any dispatch in that window fails `unknown backend 'bb'`. Run the migration with no dispatch in flight (the whole sequence is seconds). This procedure also never references the memory backup at `/root/.bb-server/secrets/fm-memory-backup` — leave it untouched.
+
 ```bash
 FMH=/root/firstmate   # the live home
 

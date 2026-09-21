@@ -294,8 +294,11 @@ function fmBinDirAssign(fmHome: string): string {
 // the tree still reads clean. This emits FM_MIRROR_STALE on stderr when the mirror's
 // recorded HEAD no longer matches the clone's HEAD; the caller logs it loudly. A truly
 // missing SCRIPT_DIR sibling surfaces on its own (the script errors, non-zero) since
-// callers no longer swallow that. Runs only when FM_BINDIR is the mirror. Must be
-// emitted AFTER fmBinDirAssign.
+// callers no longer swallow that. Wired into BOTH the dispatch paths (runFmScript,
+// fm-brief scaffold) and the SUPERVISION paths (the watch keeper's per-re-arm check and
+// checkWatcher's per-poll check), so a stale watcher-arm is loud too. Runs only when
+// FM_BINDIR is the mirror. Cheap (~6ms: sed + git rev-parse). Must be emitted AFTER
+// fmBinDirAssign.
 function fmMirrorStaleGuard(fmHome: string): string {
   const q = shQuote(fmHome);
   return (
@@ -430,6 +433,12 @@ export function fmWatchKeeperScript(hostId: string, fmHome: string, interval: nu
     '  OB=$(cat "$OWNER_BEAT" 2>/dev/null || echo 0); case "$OB" in ""|*[!0-9]*) OB=0 ;; esac',
     '  NOW=$(date +%s)',
     '  if [ "$OB" -eq 0 ] || [ $(( NOW - OB )) -gt "$OWNER_TTL" ]; then break; fi',
+    // F2 (re-review): the keeper re-arms fm-watch FROM the mirror, so a stale mirror here
+    // (missing sibling / drifted copy after an out-of-band ff) would silently degrade
+    // supervision — exactly the failure this effort removed. Check on every re-arm and
+    // record FM_MIRROR_STALE into the watch log; checkWatcher reads that log tail and
+    // surfaces it loudly. Cheap (~6ms: sed + git rev-parse).
+    `  { ${fmMirrorStaleGuard(fmHome)} ; } >> "$LOG" 2>&1`,
     '  "$ARM" >> "$LOG" 2>&1 || true',
     `  sleep ${interval}`,
     "done",
@@ -4588,6 +4597,10 @@ export default async function plugin(bb: BbPluginApi) {
       "KEEPER=dead",
       `if [ -f ${shQuote(pid)} ]; then KP=$(cat ${shQuote(pid)} 2>/dev/null || echo); if [ -n "$KP" ] && kill -0 "$KP" 2>/dev/null; then KEEPER=alive; fi; fi`,
       `[ -x "$FM_BINDIR/fm-watch-arm.sh" ] || echo FM_WATCH_NO_ARM`,
+      // F2 (re-review): supervision runs fm-watch-arm FROM the mirror, so a stale mirror
+      // here degrades supervision silently. Check on every supervision poll; the emitted
+      // FM_MIRROR_STALE line is surfaced loudly by the caller below.
+      fmMirrorStaleGuard(fmHome),
       `printf 'FM_BEAT_AGE=%s\\nFM_KEEPER=%s\\n' "$AGE" "$KEEPER"`,
       "echo '---FM_LOGTAIL---'",
       `[ -f ${shQuote(log)} ] && tail -c 4000 ${shQuote(log)} || true`,
@@ -4608,6 +4621,16 @@ export default async function plugin(bb: BbPluginApi) {
       if (res.output.includes("FM_OWNER_BEAT=fail")) {
         bb.log.error(
           `fm-watch-supervisor: owner-beat write FAILED on host ${hostId} (${ownerBeat} not writable — full/read-only state dir?); the keeper will self-exit and real supervision will stop. Fix the state dir.`,
+        );
+      }
+      // F2 (re-review): a stale mirror on the SUPERVISION path (this poll's own guard, or
+      // the keeper's re-arm guard captured in the log tail) means the watcher fm-watch is
+      // armed from unmirrored/drifted scripts — supervision degrading silently. Surface it
+      // loudly on the supervision channel too, not just on dispatch.
+      if (res.output.includes("FM_MIRROR_STALE")) {
+        const line = res.output.split("\n").find((l) => l.includes("FM_MIRROR_STALE"))?.trim() ?? "FM_MIRROR_STALE";
+        bb.log.error(
+          `fm-watch-supervisor: bb mirror is STALE on host ${hostId}: ${line}. The keeper re-arms fm-watch from this mirror, so supervision is degrading — re-run the overlay installer against ${fmHome}.`,
         );
       }
       const tailIdx = res.output.indexOf("---FM_LOGTAIL---");
