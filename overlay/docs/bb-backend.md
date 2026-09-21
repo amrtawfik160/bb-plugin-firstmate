@@ -113,44 +113,47 @@ With (1)–(3), the entire bb overlay becomes `config/backends.d/bb.sh` + `bin/b
 
 ## Migrating a home off the in-place patch (safe; run by an operator, not the plugin)
 
-A home installed by the **old** overlay has the three tracked files patched in place — its tree is permanently dirty, so ff-update skips. `install-bb-backend.py` never reverts a tracked file (it only warns); restore the home by hand with this procedure. It touches **only** the three tracked files and the `.orig` leftovers; it never goes near `state/` or `data/` (crew state and the captain's live memory), and it leaves the new `bin-bb/` mirror in place.
+A home installed by the **old** overlay has the three tracked files patched in place — its tree is permanently dirty, so ff-update skips. `install-bb-backend.py` never reverts a tracked file (it only warns); restore the home by hand with this procedure. It touches **only** the three tracked files and the `.orig` leftovers; it never goes near `state/` or `data/` (crew state and the captain's live memory), and it never references the memory backup at `/root/.bb-server/secrets/fm-memory-backup`.
 
-**Order matters: fast-forward BEFORE installing the mirror.** If you install first and fast-forward second, the mirror is built at the *old* HEAD and then HEAD advances underneath it — leaving new `bin/` scripts unmirrored and the three frozen copies behind upstream (the stale-mirror failure above), self-healing only at the next plugin `initRealMode`. Restore → fast-forward → *then* install against the new HEAD.
+**`fmHome` is shared host-global across captains — the procedure must have NO bb-less window.** Every captain thread on a host shares this one `fmHome`, and a single captain **cannot** quiesce the others; another captain's crew can dispatch at any instant. So the migration cannot rely on "no dispatch in flight." It is ordered so that **a bb-capable path exists at every step**: install the mirror **FIRST** (while native is still patched in place — both paths dispatch bb), and only *then* restore native, fast-forward, and re-install. From the moment `bin-bb/` + the `config/bb-overlay` marker exist, `$FM_BINDIR` routes to the mirror, which serves bb dispatch through the rest of the sequence; native is never the only path, so no dispatch ever hits `unknown backend 'bb'`. (Proven end-to-end, with a dispatch probe at every step, by `scripts/live-migration-zero-window-check.mjs`; its `--old-order` mode shows the previous "restore-first" ordering *did* open a window.)
 
-**Quiesce the captain during the migration.** Between step 1 (native restored → `bin/` no longer carries bb) and step 4 (mirror installed), `config/backend=bb` is still set but the `config/bb-overlay` marker + `bin-bb/` are absent, so `$FM_BINDIR` resolves to native `bin/` and any dispatch in that window fails `unknown backend 'bb'`. Run the migration with no dispatch in flight (the whole sequence is seconds). This procedure also never references the memory backup at `/root/.bb-server/secrets/fm-memory-backup` — leave it untouched.
+Between the fast-forward (step 4) and the re-install (step 5) the mirror is momentarily **stale** (HEAD advanced past the mirror's manifest) — but it is not bb-*less*: the frozen copies still carry the bb arms and keep dispatching. `--verify` flags that staleness and the re-install repairs it; the plugin keeps routing to `bin-bb` throughout. This is a staleness window, not a correctness window.
 
 ```bash
-FMH=/root/firstmate   # the live home
+FMH=/root/firstmate   # the live home; OVL=<path to overlay/>
 
-# 0. Confirm what is dirty (expect: bin/fm-backend.sh, bin/fm-spawn.sh,
+# 0. Confirm the legacy state (expect: bin/fm-backend.sh, bin/fm-spawn.sh,
 #    bin/fm-teardown.sh, docs/configuration.md modified; *.orig untracked).
 git -C "$FMH" status --porcelain
 
-# 1. Restore the tracked files the old overlay patched in place. `git checkout`
+# 1. Install the mirror FIRST, while native is still patched. Now BOTH paths
+#    dispatch bb: native (still patched) and bin-bb (patched copies). Once the
+#    marker + bin-bb exist, the plugin routes to bin-bb. No bb-less moment.
+python3 "$OVL"/install-bb-backend.py --home "$FMH" --project-id <bb-project-id>
+python3 "$OVL"/install-bb-backend.py --home "$FMH" --verify   # healthy
+
+# 2. Restore the tracked files the old overlay patched in place. `git checkout`
 #    only rewrites these exact paths; nothing under state/ or data/ is touched.
+#    bb keeps working — the plugin is already routing to bin-bb.
 git -C "$FMH" checkout -- bin/fm-backend.sh bin/fm-spawn.sh bin/fm-teardown.sh docs/configuration.md
 
-# 2. Remove the patch's .orig backups (untracked; safe to delete).
-rm -f "$FMH"/bin/fm-backend.sh.orig "$FMH"/bin/fm-spawn.sh.orig \
-      "$FMH"/bin/fm-teardown.sh.orig "$FMH"/docs/configuration.md.orig
+# 3. Remove the patch's .orig backups (untracked; safe to delete).
+rm -f "$FMH"/bin/fm-*.sh.orig "$FMH"/docs/*.md.orig
 
-# 3. Tree is now clean (no legacy mirror yet). Fast-forward to upstream FIRST —
-#    this is the update that was frozen. Advances tracked files only.
+# 4. Fast-forward the now-clean clone to upstream (the update that was frozen).
+#    The mirror goes momentarily STALE here but still dispatches bb.
 git -C "$FMH" fetch --quiet origin
 up=$(git -C "$FMH" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)
 [ -n "$up" ] && git -C "$FMH" merge --ff-only "$up"
 
-# 4. THEN install the mirror overlay against the new HEAD, so bin-bb mirrors the
-#    updated bin/ and the three copies are patched from current sources. Writes
-#    the marker + .git/info/exclude. Preserves state/ and data/ untouched.
-python3 <overlay>/install-bb-backend.py --home "$FMH" --project-id <bb-project-id>
-
-# 5. Verify the mirror is healthy and the tree is clean.
-python3 <overlay>/install-bb-backend.py --home "$FMH" --verify
-git -C "$FMH" status --porcelain      # expect empty
+# 5. Re-install against the new HEAD so bin-bb mirrors the updated bin/ and the
+#    three copies are patched from current sources. Then verify + confirm clean.
+python3 "$OVL"/install-bb-backend.py --home "$FMH" --project-id <bb-project-id>
+python3 "$OVL"/install-bb-backend.py --home "$FMH" --verify   # healthy
+git -C "$FMH" status --porcelain                              # expect empty
 ```
 
-Do **not** run step 1 as `git checkout .` or `git reset --hard` — those would reach beyond the three files. `state/` and `data/` are never tracked in this clone (they are gitignored), so a scoped `git checkout -- <the four paths>` cannot lose crew state or memory; still, restrict the command to those paths. After any later out-of-band fast-forward (a manual `git pull`, an external updater), re-run steps 4–5; `--verify` fails loud (`FM_MIRROR_STALE`) whenever the mirror is behind HEAD or a sibling is missing, and the plugin logs the same on use.
+Do **not** run step 2 as `git checkout .` or `git reset --hard` — those would reach beyond the three files. `state/` and `data/` are never tracked in this clone (they are gitignored), so a scoped `git checkout -- <the four paths>` cannot lose crew state or memory; still, restrict the command to those paths. After any later out-of-band fast-forward (a manual `git pull`, an external updater), re-run step 5; `--verify` fails loud (`FM_MIRROR_STALE`) whenever the mirror is behind HEAD or a sibling is missing, and the plugin logs the same on the dispatch and supervision paths.
 
 ## Paths that do NOT reach bb through the mirror (F4/F5)
 

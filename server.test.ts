@@ -1562,6 +1562,35 @@ test("installer --verify fails LOUD after an out-of-band fast-forward leaves the
   }
 });
 
+// fmHome is shared host-global across captains, so the migration off the in-place patch
+// must never have a moment when no bb-capable path exists (another captain could dispatch
+// and hit `unknown backend 'bb'`). scripts/live-migration-zero-window-check.mjs reproduces
+// the live dirty state and probes a dispatch at every migration step. This test runs it
+// both ways: NEW order must expose ZERO windows; --old-order (the mutation) must expose a
+// window — proving the probe is load-bearing, not vacuous.
+test("migration off the in-place patch has zero bb-less window (mutation-proven)", (t) => {
+  const checkout = discoverFirstmateCheckout();
+  if (checkout === null) {
+    t.skip("no firstmate checkout discoverable (set FM_TEST_HOME to enable)");
+    return;
+  }
+  const scriptPath = join(dirname(fileURLToPath(import.meta.url)), "scripts", "live-migration-zero-window-check.mjs");
+  const runCheck = (extraArgs: string[]) =>
+    spawnSync("node", ["--experimental-strip-types", scriptPath, ...extraArgs], { encoding: "utf8", timeout: 240_000 });
+
+  const neu = runCheck([]);
+  assert.equal(neu.status, 0, `NEW-order migration must have zero windows:\n${neu.stdout}\n${neu.stderr}`);
+  assert.match(neu.stdout, /ZERO-WINDOW CONFIRMED/);
+  assert.match(neu.stdout, /windows \(unknown backend 'bb'\): 0/);
+
+  // Mutation: the OLD ("restore first") order MUST expose a window; the script exits 0
+  // only when it detects one, so this asserts the probe actually catches the gap.
+  const old = runCheck(["--old-order"]);
+  assert.equal(old.status, 0, `old-order mutation should detect a window:\n${old.stdout}\n${old.stderr}`);
+  assert.match(old.stdout, /OLD-ORDER MUTATION CONFIRMED/);
+  assert.doesNotMatch(old.stdout, /windows \(unknown backend 'bb'\): 0\b/);
+});
+
 // ── Phase 2 additions ────────────────────────────────────────────────────────
 
 test("formatFmMeta records provider when set, omits it otherwise", () => {
