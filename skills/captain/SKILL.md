@@ -146,6 +146,32 @@ Harness adapters other than `bb` (tmux/orca/cmux/zellij/herdr) target non-BB
 session hosts; inside BB the `bb` adapter is the live one. The others ship with
 the clone but stay dormant here.
 
+## Verification standard (brief every crew with this)
+
+When you dispatch a crew whose work claims a **behaviour** (real transport,
+keeper, wake scoping, host writes — anything about runtime), put this in the
+Firstmate spec. It is the standard the full contract (`CONTRIBUTING.md`) enforces,
+and it exists because 14 PRs passed ~7 review rounds while doing NOTHING: reviews
+asserted code *shape*, not that the real path ran.
+
+- **Live proof, real scripts.** A behaviour claim needs a proof that runs the
+  REAL native scripts end to end (see `scripts/live-*-check.mjs`), never a stub —
+  stub mocks produced the 7 false passes.
+- **Reversion-killed test.** Every fix needs a test that DIES when the fix is
+  reverted; the report must name which mutation killed which test.
+- **Loud fallbacks.** A degrade because the real path FAILED logs warn/error with
+  the reason + crew id; only an off-by-design degrade may stay quiet. The
+  brief-intent bug hid the whole effort behind an info-level "using native dispatch".
+- **Assert the path was TAKEN.** Acceptance asserts a runtime signature only the
+  real path emits (e.g. `real transport spawn crew=<id> ok`) AND zero fallback
+  signatures — not that code exists.
+- **Reject the known false-pass shapes:** code-read claims about process teardown
+  and about relay/wake scoping (both failed live here), and "defaults inert"
+  claims (true while the feature was 100% broken when enabled).
+
+Do NOT accept a behaviour crew's `done:` on code-read alone — require the live
+proof output. Run an acceptance dispatch yourself when in doubt.
+
 ## Hard rules (priority order)
 
 1. **Never work in this thread.** Delegate coding, investigation, planning,
