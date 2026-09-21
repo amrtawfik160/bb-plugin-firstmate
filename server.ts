@@ -1487,14 +1487,22 @@ export default async function plugin(bb: BbPluginApi) {
     // doorbell does not already carry — an open decision the captain must answer. For a plain
     // done/review/error the head+summary+next: line is self-sufficient.
     const doorbell = durable ? captainWakeDoorbell(head, summary, { drainHint: kind === "needs-decision" }) : text;
-    // Part B: one crew completion must yield ONE captain message. In real mode a plain done
-    // (kind "idle": finished, no PR, no decision, no failure) is already surfaced twice more —
-    // BB's own child-output delivery to this parent thread AND the durable wake queue that the
-    // captain drains — so the plugin's own doorbell is pure duplication and is suppressed. The
-    // report is never lost: it provably survives in the durable queue (enqueued just above) and
-    // in BB's delivery. Only the redundant chat line is dropped. kv mode (no durable backstop)
+    // Part B: one crew completion must yield ONE captain message — but ONLY for a genuine
+    // plain DONE. `kind === "idle"` alone is NOT "plain done": a crew that ends its turn
+    // reporting `BLOCKED:`/`FAILED:` in-band fires thread.idle, passes hasStatusProtocol (so no
+    // nudge), and reaches here still labelled "idle" — those verdicts are alerts and must ALWAYS
+    // doorbell. So gate on the parsed verdict: suppress only when the outcome is a DONE (success).
+    // Any non-done verdict, or a verdict-less idle (outcome null — ambiguous, err toward telling
+    // the captain), still doorbells.
+    //
+    // Safety basis is the DURABLE WAKE QUEUE, not BB's delivery: the enqueue above runs
+    // unconditionally in real mode BEFORE this gate, and the real fm-wake scripts are live-proven
+    // to hold + drain the report (see the IT "plain DONE survives the durable queue" test). So a
+    // suppressed plain-DONE report is never lost — the captain recovers it on `bb firstmate wake`,
+    // and BB additionally delivers its own copy to the parent thread. kv mode (no durable backstop)
     // and every non-plain event (review/needs-decision/error/interaction/unknown) still doorbell.
-    const suppressRedundantDoorbell = durable && kind === "idle";
+    const isPlainDone = outcome !== null && outcome.startsWith("DONE:");
+    const suppressRedundantDoorbell = durable && kind === "idle" && isPlainDone;
     if (quietHold || afkHold) {
       // The durable wake already persisted the report; do not also hold a redundant
       // doorbell (the captain drains the queue on return). KV path unchanged.
@@ -2367,6 +2375,23 @@ export default async function plugin(bb: BbPluginApi) {
     const owner = opts?.owner;
     if (owner === undefined || owner === "") return crews;
     return crews.filter((c) => c.parentThreadId === owner);
+  }
+
+  // An owner-scoped crew view that comes back empty must never read as "the fleet is empty":
+  // a captain running `crews` from a DIFFERENT thread than the one that dispatched would
+  // otherwise see a bare "No crews." and mistake a scoping artifact for an empty fleet. When
+  // the scoped view is empty but the host has crews under other threads/captains, say so and
+  // name the opt-in. `owner` undefined / `all` true means the view was already host-wide, so a
+  // plain "No crews." is the truth.
+  async function noCrewsMessage(owner: string | undefined, all: boolean): Promise<string> {
+    if (all || owner === undefined || owner === "") return "No crews.";
+    const hostCount = (await listCrews({ all: true })).length;
+    if (hostCount === 0) return "No crews.";
+    return (
+      `No crews dispatched from this thread. This view is scoped to your own crews; ` +
+      `${hostCount} crew(s) on this host belong to other threads/captains — pass --all ` +
+      `(all=true from a tool) to see the whole host.`
+    );
   }
 
   async function findCrew(id: string): Promise<Crew | undefined> {
@@ -3743,10 +3768,11 @@ export default async function plugin(bb: BbPluginApi) {
 
   // The deck digest: real bearings first (authoritative when active), then the
   // native KV digest explicitly labelled as a cache/fallback view.
-  async function deckDigest(ctx: unknown, signal: AbortSignal | undefined): Promise<string> {
+  async function deckDigest(ctx: unknown, signal: AbortSignal | undefined, all = false): Promise<string> {
     const realBearings = await realBearingsForDeck(ctx, signal);
-    // The calling thread IS the captain — scope the native/KV digest to its own crews.
-    const native = await sessionDigest(ctxString(ctx, "threadId"));
+    // The calling thread IS the captain — scope the native/KV digest to its own crews, unless
+    // `all` opts into the whole host.
+    const native = await sessionDigest(all ? undefined : ctxString(ctx, "threadId"));
     const nativeBlock = realBearings === ""
       ? native
       : ["== native digest (BB KV cache / fallback) ==", native].join("\n");
@@ -5145,17 +5171,17 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.agents.registerTool({
     name: "firstmate_deck",
-    description: "Mark this thread as the firstmate captain and return the session digest (memory, bearings, afk).",
+    description: "Mark this thread as the firstmate captain and return the session digest (memory, bearings, afk). Your own crews by default; pass all=true to see every captain's crews on the host.",
     presentation: { label: { pending: "Taking the deck", completed: "On deck" } },
-    parameters: z.object({}),
-    async execute(_args, ctx) {
+    parameters: z.object({ all: z.boolean().optional().describe("Show every captain's crews host-wide, not just your own") }),
+    async execute({ all }, ctx) {
       const record = asRecord(ctx);
       const threadId = record["threadId"];
       if (typeof threadId !== "string") return toolError("No thread to mark as captain.");
       await markDeck(threadId);
       const signal = record["signal"] as AbortSignal | undefined;
       const real = await ensureRealModeForDeck(ctx, signal);
-      return `Captain, on deck.\n${real}\n${await deckDigest(ctx, signal)}`;
+      return `Captain, on deck.\n${real}\n${await deckDigest(ctx, signal, all === true)}`;
     },
   });
 
@@ -5506,8 +5532,9 @@ export default async function plugin(bb: BbPluginApi) {
     description: "List recorded crews with live thread status. Your own crews by default; pass all=true to see every captain's crews on the host.",
     parameters: z.object({ all: z.boolean().optional().describe("Show every captain's crews host-wide, not just your own") }),
     async execute({ all }, ctx) {
-      const crews = (await listCrews({ owner: ctxString(ctx, "threadId"), all: all === true })).slice(0, 20);
-      if (crews.length === 0) return "No crews.";
+      const owner = ctxString(ctx, "threadId");
+      const crews = (await listCrews({ owner, all: all === true })).slice(0, 20);
+      if (crews.length === 0) return noCrewsMessage(owner, all === true);
       const rows = await Promise.all(crews.map(async (crew) => formatCrew(crew, await crewStatus(crew))));
       return rows.join("\n");
     },
@@ -6227,7 +6254,7 @@ export default async function plugin(bb: BbPluginApi) {
             await markDeck(ctxThread);
             const real = await ensureRealModeForDeck(ctx, signal);
             const realMode = (await settings.get()).fmHome.trim() !== "";
-            const digest = await deckDigest(ctx, signal);
+            const digest = await deckDigest(ctx, signal, flags.has("all"));
             return reply(
               { captain: true, threadId: ctxThread, realMode, digest },
               `Captain, on deck.\n${real}\n${digest}`,
@@ -6326,7 +6353,8 @@ export default async function plugin(bb: BbPluginApi) {
             // Your own crews by default (calling captain = ctxThread); --all opts into host-wide.
             const crews = (await listCrews({ owner: ctxThread, all: flags.has("all") })).slice(0, 20);
             const rows = await Promise.all(crews.map(async (crew) => ({ ...crew, status: await crewStatus(crew) })));
-            return reply(rows, rows.length === 0 ? "No crews." : rows.map((row) => formatCrew(row, row.status)).join("\n"));
+            const empty = await noCrewsMessage(ctxThread, flags.has("all"));
+            return reply(rows, rows.length === 0 ? empty : rows.map((row) => formatCrew(row, row.status)).join("\n"));
           }
           case "crew": {
             const id = rest[0];
