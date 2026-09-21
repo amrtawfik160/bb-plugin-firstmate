@@ -137,7 +137,14 @@ Caveat: the list only refreshes on deck, so after an fmHome upgrade re-run
 - **Answer a crew's decision with `tell --resolve-key <key>`** (or
   `firstmate_tell resolveKey`). That both steers the crew and writes the closing
   `resolved [key=<key>]` line into the real `state/<id>.status`, so the decision
-  stops showing as open. A plain `tell` only sends the message.
+  stops showing as open. A plain `tell` only sends the message (as a steer).
+- **`tell` steers into the running turn by default.** A plain `tell` lands the
+  message inside the crew's current turn as a course correction (and starts a turn
+  if the crew is idle) — so a captain can correct a crew mid-work instead of
+  waiting for it to finish reading a queued note on the wrong premise. It is framed
+  "not a stop; keep working and fold this in", so the crew continues its task. Use
+  `tell --queue` (`firstmate_tell queue=true`) only for a genuinely non-urgent note
+  that must not disturb an active turn. To hard-stop, use `interrupt`, not `tell`.
 - **Fallback safety.** Every real-mode write (meta, brief, contract, status read)
   is best-effort: if the host or scripts are unavailable it degrades to the
   native path with a logged note and never breaks dispatch.
@@ -232,7 +239,7 @@ within its exact scope. Never infer, broaden, or carry it elsewhere.
 | native dispatch (BB transport + Fleet UI) | `firstmate_dispatch` / `bb firstmate dispatch --project <id> -- "<brief>"` |
 | queue | `firstmate_queue` / `queue add --project <id> [--after <qid>] [--wait-until <iso>] -- "<title>"` |
 | decisions | `firstmate_decide` / `decide ask\|answer` + AskUserQuestion |
-| track | `firstmate_crew`, `firstmate_crews`, `watch`, `tell` (doorbell; `--resolve-key <key>` to answer + close a decision), `interrupt`, `stop`, `retry` |
+| track | `firstmate_crew`, `firstmate_crews`, `watch`, `tell` (steers into the running turn by default; `--queue` for a non-urgent note; `--resolve-key <key>` to answer + close a decision), `interrupt`, `stop`, `retry` |
 | recovery relaunch | `retry <id> --model m` / `--provider p` / `--reasoning-level l` (fresh thread, same worktree) |
 | delivery | `firstmate_deliver`, `firstmate_merge` (`--yes`, `--allow-red <check>`), `promote` |
 | secondmate | `firstmate_secondmate` / `bb firstmate secondmate register --project <id> --thread <id>` |
