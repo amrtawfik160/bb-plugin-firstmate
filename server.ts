@@ -273,6 +273,70 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// A stuck-pass MUST stop when the service is aborting (a plugin reload) — otherwise
+// `bb plugin reload` fails with "service crew-watch did not stop" (the live incident,
+// backlog 4c1b0ea5): stuckPass walks a host-global crew register (~50-67 crews) doing
+// per-crew host round-trips, and a single pass was observed at 302.5s — far past the
+// shutdown grace. The crew-watch loop already had an abortable sleep + a per-cycle
+// `signal.aborted` check, but `await stuckPass()` had NO abort awareness inside, so a
+// pass in flight when the reload arrived pinned the service open. These helpers make the
+// awaited work abort-aware: `raceAbort` lets a call that has no native signal/timeout
+// (the `bb.sdk.threads.*` reads) still return promptly on abort or a per-call timebox, so
+// one slow/unreachable host cannot pin the whole pass.
+const STUCK_PASS_BUDGET_MS = 120_000; // hard wall-clock ceiling for one stuckPass
+// Per-crew host/SDK read timebox (matches runOnHost). NOTE: a healthy-but-slow read that
+// exceeds this returns the degraded default, so crewStatus can yield "unknown" and page the
+// captain "crew gone" for a crew that is actually fine — a NEW false-"gone" trigger. It is the
+// safe direction (over-tell, never under-tell: a real wedge is never silently missed) and only
+// fires when a read is pathologically slow, but it is recorded here so nobody debugs it cold.
+const STUCK_HOST_CALL_MS = 15_000;
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && (error.name === "AbortError" || error.message === "Aborted.");
+}
+
+function abortError(): Error {
+  const error = new Error("Aborted.");
+  error.name = "AbortError";
+  return error;
+}
+
+// Await `promise`, but reject as soon as `signal` aborts (name "AbortError") or, if
+// `timeoutMs` is given, after that timebox (a plain "Timed out." error). The underlying
+// call may keep running in the background — the point is to stop AWAITING it so a service
+// loop can return within the shutdown grace. A call with neither a signal nor a timeout is
+// returned unchanged.
+async function raceAbort<T>(promise: Promise<T>, signal?: AbortSignal, timeoutMs?: number): Promise<T> {
+  if (signal === undefined && timeoutMs === undefined) return promise;
+  return await new Promise<T>((resolve, reject) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = () => {
+      if (timer !== undefined) clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fn();
+    };
+    const onAbort = () => finish(() => reject(abortError()));
+    if (signal?.aborted) {
+      finish(() => reject(abortError()));
+      return;
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (timeoutMs !== undefined) {
+      timer = setTimeout(() => finish(() => reject(new Error("Timed out."))), timeoutMs);
+    }
+    promise.then(
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(error)),
+    );
+  });
+}
+
 function stripAnsi(text: string): string {
   return text.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "").replace(/\r/g, "");
 }
@@ -1371,14 +1435,22 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  async function deliverToCaptain(parentThreadId: string, text: string, crewId: string): Promise<void> {
+  async function deliverToCaptain(parentThreadId: string, text: string, crewId: string, signal?: AbortSignal): Promise<void> {
     try {
-      await bb.sdk.threads.send({
-        threadId: parentThreadId,
-        mode: "auto",
-        input: [{ type: "text", text, mentions: [] }],
-      });
-    } catch {
+      // Abort-RESPONSIVE (no artificial timeout): a healthy send completes as before; only a
+      // reload (signal abort) abandons the await so the supervisor can stop within its grace.
+      // An abandoned send re-throws AbortError so the caller can DEFER (not commit the crew's
+      // alerted/stuck state) and re-page next pass — the alert is never dropped.
+      await raceAbort(
+        bb.sdk.threads.send({
+          threadId: parentThreadId,
+          mode: "auto",
+          input: [{ type: "text", text, mentions: [] }],
+        }),
+        signal,
+      );
+    } catch (error) {
+      if (isAbortError(error)) throw error;
       bb.log.warn(`notify failed for crew ${crewId}`);
     }
   }
@@ -1419,13 +1491,14 @@ export default async function plugin(bb: BbPluginApi) {
     return { FM_STATE_OVERRIDE: wakeStateDir(fmHome, captainThreadId) };
   }
 
-  async function enqueueCaptainWake(crew: Crew, display: string): Promise<boolean> {
+  async function enqueueCaptainWake(crew: Crew, display: string, signal?: AbortSignal): Promise<boolean> {
     const fmHome = (await settings.get()).fmHome.trim();
     if (fmHome === "" || isSecondmateRoute(crew)) return false;
     let hostId: string;
     try {
-      hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
-    } catch {
+      hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined, signal);
+    } catch (error) {
+      if (isAbortError(error)) throw error;
       return false;
     }
     const lib = `${fmHome}/bin/fm-wake-lib.sh`;
@@ -1452,7 +1525,7 @@ export default async function plugin(bb: BbPluginApi) {
       `fm_wake_append signal ${shQuote(key)} ${shQuote(`crew ${crew.id} update`)}`,
     ].join("\n");
     try {
-      const res = await runOnHost(hostId, script, 15_000);
+      const res = await runOnHost(hostId, script, 15_000, signal);
       if (res.exitCode !== 0) {
         bb.log.warn(`fm wake enqueue failed crew=${crew.id} exit=${res.exitCode}`);
         return false;
@@ -1460,12 +1533,13 @@ export default async function plugin(bb: BbPluginApi) {
       bb.log.info(`fm wake enqueued crew=${crew.id} key=${key} (note→status + pointer)`);
       return true;
     } catch (error) {
+      if (isAbortError(error)) throw error;
       bb.log.warn(`fm wake enqueue failed crew=${crew.id} ${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
   }
 
-  async function notifyCaptain(crew: Crew, event: string, output: string | null): Promise<void> {
+  async function notifyCaptain(crew: Crew, event: string, output: string | null, signal?: AbortSignal): Promise<void> {
     if (crew.parentThreadId === null) return;
     const parentThreadId = crew.parentThreadId;
     let kind = event;
@@ -1525,7 +1599,7 @@ export default async function plugin(bb: BbPluginApi) {
     // `bb firstmate wake`. A dropped doorbell can no longer lose the report — the full
     // report and open decisions survive in the durable queue and surface on drain.
     // Default kv is byte-for-byte the previous fire-and-forget behavior.
-    const durable = (await settings.get()).notifyOwner === "real" ? await enqueueCaptainWake(crew, text) : false;
+    const durable = (await settings.get()).notifyOwner === "real" ? await enqueueCaptainWake(crew, text, signal) : false;
     const summary = outcome ?? (output !== null && output !== "" ? truncate(output.replace(/\n/g, " "), 160) : "");
     // Part C: the drain hint adds something only when the durable queue holds context this
     // doorbell does not already carry — an open decision the captain must answer. For a plain
@@ -1566,26 +1640,26 @@ export default async function plugin(bb: BbPluginApi) {
         }
         await writeAfk(afk, parentThreadId);
       }
-      for (const line of evicted) await deliverToCaptain(parentThreadId, line, crew.id);
+      for (const line of evicted) await deliverToCaptain(parentThreadId, line, crew.id, signal);
       if (evicted.length > 0) await publishFleet();
       return;
     }
-    if (!suppressRedundantDoorbell) await deliverToCaptain(parentThreadId, doorbell, crew.id);
+    if (!suppressRedundantDoorbell) await deliverToCaptain(parentThreadId, doorbell, crew.id, signal);
     await publishFleet();
   }
 
-  async function crewStatus(crew: Crew): Promise<string> {
+  async function crewStatus(crew: Crew, signal?: AbortSignal): Promise<string> {
     try {
-      const thread = await bb.sdk.threads.get({ threadId: crew.threadId });
+      const thread = await raceAbort(bb.sdk.threads.get({ threadId: crew.threadId }), signal, STUCK_HOST_CALL_MS);
       return threadField(thread, "status");
     } catch {
       return "unknown";
     }
   }
 
-  async function crewOutput(crew: Crew, max = MAX_OUTPUT): Promise<string | null> {
+  async function crewOutput(crew: Crew, max = MAX_OUTPUT, signal?: AbortSignal): Promise<string | null> {
     try {
-      const result = await bb.sdk.threads.output({ threadId: crew.threadId });
+      const result = await raceAbort(bb.sdk.threads.output({ threadId: crew.threadId }), signal, STUCK_HOST_CALL_MS);
       const text = asRecord(result)["output"];
       return typeof text === "string" ? truncate(text, max) : null;
     } catch {
@@ -1593,9 +1667,9 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  async function threadEnv(threadId: string): Promise<string | null> {
+  async function threadEnv(threadId: string, signal?: AbortSignal): Promise<string | null> {
     try {
-      const thread = await bb.sdk.threads.get({ threadId });
+      const thread = await raceAbort(bb.sdk.threads.get({ threadId }), signal, STUCK_HOST_CALL_MS);
       const envId = asRecord(thread)["environmentId"];
       return typeof envId === "string" ? envId : null;
     } catch {
@@ -2380,15 +2454,23 @@ export default async function plugin(bb: BbPluginApi) {
   // Captain-facing VIEWS never call this directly; they call listCrews({ owner }) so one
   // captain never sees another's crews by default (D8). Write/eviction is unchanged: the
   // owner filter is a pure view over the returned array, applied after all KV writes.
-  async function listCrewsAll(): Promise<Crew[]> {
+  async function listCrewsAll(signal?: AbortSignal): Promise<Crew[]> {
     const crews = await readCrews();
     const known = new Set(crews.map((c) => c.threadId));
     try {
-      const found = await bb.sdk.threads.list({
-        originPluginId: "firstmate",
-        includeHidden: true,
-        limit: 50,
-      });
+      // Abort-aware + timeboxed prologue: the supervisor calls this BEFORE its per-crew
+      // abort loop, so an un-guarded threads.list / getPluginMetadata sweep here (host
+      // round-trips, worse under a degraded BB API) would pin crew-watch past the shutdown
+      // grace on a reload — the same "service did not stop" class we are fixing.
+      const found = await raceAbort(
+        bb.sdk.threads.list({
+          originPluginId: "firstmate",
+          includeHidden: true,
+          limit: 50,
+        }),
+        signal,
+        STUCK_HOST_CALL_MS,
+      );
       const rows: unknown[] = Array.isArray(found)
         ? found
         : Array.isArray(asRecord(found)["threads"])
@@ -2409,7 +2491,11 @@ export default async function plugin(bb: BbPluginApi) {
         missing.map(async (row): Promise<Crew | null> => {
           try {
             const meta = asRecord(
-              await bb.sdk.threads.getPluginMetadata({ threadId: row.threadId, pluginId: "firstmate" }),
+              await raceAbort(
+                bb.sdk.threads.getPluginMetadata({ threadId: row.threadId, pluginId: "firstmate" }),
+                signal,
+                STUCK_HOST_CALL_MS,
+              ),
             );
             if (!metaFlag(meta, "crew")) return null;
             const id = typeof meta["crewId"] === "string" ? meta["crewId"] : row.threadId.slice(0, 8);
@@ -2450,9 +2536,9 @@ export default async function plugin(bb: BbPluginApi) {
     try {
       const s = await settings.get();
       if (s.readThrough === true && s.fmHome.trim() !== "") {
-        const hostId = await resolveFmWatchHostId();
+        const hostId = await resolveFmWatchHostId(signal);
         if (hostId !== null) {
-          const ids = await existingFmMetaIds(hostId, s.fmHome.trim());
+          const ids = await existingFmMetaIds(hostId, s.fmHome.trim(), signal);
           if (ids !== null) {
             // R5: never reap a crew whose dispatch-time meta write is known to have
             // failed (metaWritten===false) — its current absence is not proof of
@@ -2524,12 +2610,12 @@ export default async function plugin(bb: BbPluginApi) {
     return `${crew.id} [${status}]${mark} ${crew.shape} ${crew.threadId} ${crew.worktree ? "worktree" : "shared-env"} :: ${truncate(crew.task, 80)}`;
   }
 
-  async function resolveHostForProject(projectId: string, parentThreadId?: string): Promise<string> {
+  async function resolveHostForProject(projectId: string, parentThreadId?: string, signal?: AbortSignal): Promise<string> {
     if (parentThreadId !== undefined) {
-      const envId = await threadEnv(parentThreadId);
+      const envId = await threadEnv(parentThreadId, signal);
       if (envId !== null) {
         try {
-          const env = await bb.sdk.environments.get({ environmentId: envId });
+          const env = await raceAbort(bb.sdk.environments.get({ environmentId: envId }), signal, STUCK_HOST_CALL_MS);
           const hostId = asRecord(env)["hostId"];
           if (typeof hostId === "string" && hostId !== "") return hostId;
         } catch {
@@ -2537,7 +2623,7 @@ export default async function plugin(bb: BbPluginApi) {
         }
       }
     }
-    const listed = await bb.sdk.environments.list({ projectId });
+    const listed = await raceAbort(bb.sdk.environments.list({ projectId }), signal, STUCK_HOST_CALL_MS);
     const preferred = listed.find((e) => e.isWorktree === false && e.status === "ready" && e.hostId !== "");
     const any = listed.find((e) => e.status === "ready" && e.hostId !== "");
     const pick = preferred ?? any;
@@ -4361,8 +4447,8 @@ export default async function plugin(bb: BbPluginApi) {
   // HOST_COMMAND_MAX ceiling), and atomic (temp + rename, so a failed write never
   // truncates the target). See writeHostBytes for the mechanism and why the old
   // terminal-stdin path (`base64 -d > path` fed via PTY input) timed out.
-  async function writeHostFile(hostId: string, path: string, content: string): Promise<boolean> {
-    return writeHostBytes(hostId, path, content);
+  async function writeHostFile(hostId: string, path: string, content: string, signal?: AbortSignal): Promise<boolean> {
+    return writeHostBytes(hostId, path, content, 15_000, signal);
   }
 
   async function writeMemoryFile(rel: string, content: string): Promise<boolean> {
@@ -4773,14 +4859,18 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  async function readToolActivity(threadId: string): Promise<{ ok: true; at: number | null } | { ok: false }> {
+  async function readToolActivity(threadId: string, signal?: AbortSignal): Promise<{ ok: true; at: number | null } | { ok: false }> {
     try {
-      const rows = await bb.sdk.threads.events.list({
-        threadId,
-        order: "desc",
-        limit: "1",
-        types: TOOL_ACTIVITY_TYPES,
-      });
+      const rows = await raceAbort(
+        bb.sdk.threads.events.list({
+          threadId,
+          order: "desc",
+          limit: "1",
+          types: TOOL_ACTIVITY_TYPES,
+        }),
+        signal,
+        STUCK_HOST_CALL_MS,
+      );
       if (!Array.isArray(rows)) return { ok: false };
       const row = rows[0];
       if (row === undefined) return { ok: true, at: null };
@@ -4789,18 +4879,22 @@ export default async function plugin(bb: BbPluginApi) {
         ? { ok: true, at: createdAt }
         : { ok: false };
     } catch (error) {
-      bb.log.warn(
-        `stuck activity read failed for ${threadId}: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      // An abort during a reload is not a read failure — stay quiet so a shutdown does
+      // not masquerade as a broken activity read.
+      if (!isAbortError(error)) {
+        bb.log.warn(
+          `stuck activity read failed for ${threadId}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
       return { ok: false };
     }
   }
 
   let stuckRebased = false;
 
-  async function crewExcerpt(crew: Crew): Promise<{ ok: true; text: string } | { ok: false }> {
+  async function crewExcerpt(crew: Crew, signal?: AbortSignal): Promise<{ ok: true; text: string } | { ok: false }> {
     try {
-      const result = await bb.sdk.threads.output({ threadId: crew.threadId });
+      const result = await raceAbort(bb.sdk.threads.output({ threadId: crew.threadId }), signal, STUCK_HOST_CALL_MS);
       const text = asRecord(result)["output"];
       return { ok: true, text: typeof text === "string" ? truncate(text, 300) : "" };
     } catch {
@@ -4844,14 +4938,15 @@ export default async function plugin(bb: BbPluginApi) {
     return beat.beatAge <= gate;
   }
 
-  async function resolveFmWatchHostId(): Promise<string | null> {
+  async function resolveFmWatchHostId(signal?: AbortSignal): Promise<string | null> {
     const s = await settings.get();
     if (s.fmHostId.trim() !== "") return s.fmHostId.trim();
     try {
       for (const crew of await readCrews()) {
+        if (signal?.aborted) break;
         if (isSecondmateRoute(crew)) continue;
         try {
-          const hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
+          const hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined, signal);
           if (hostId !== "") return hostId;
         } catch {
           // try next crew
@@ -4866,15 +4961,16 @@ export default async function plugin(bb: BbPluginApi) {
   // R1: every distinct host that hosts a crew, plus the configured fmHostId. The
   // supervisor runs (and beats) fm-watch on each, so multi-host fleets get
   // per-host liveness instead of one global suppression switch.
-  async function resolveFmWatchHosts(): Promise<string[]> {
+  async function resolveFmWatchHosts(signal?: AbortSignal): Promise<string[]> {
     const hosts = new Set<string>();
     const s = await settings.get();
     if (s.fmHostId.trim() !== "") hosts.add(s.fmHostId.trim());
     try {
       for (const crew of await readCrews()) {
+        if (signal?.aborted) break;
         if (isSecondmateRoute(crew)) continue;
         try {
-          const hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
+          const hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined, signal);
           if (hostId !== "") hosts.add(hostId);
         } catch {
           // skip this crew
@@ -4972,7 +5068,7 @@ export default async function plugin(bb: BbPluginApi) {
       // are not in crash-loop backoff). Write the keeper script as a file, then
       // detach-launch it.
       if (!keeperAlive && allowRelaunch && !noArm) {
-        const wrote = await writeHostFile(hostId, keeperScript, fmWatchKeeperScript(hostId, fmHome, interval));
+        const wrote = await writeHostFile(hostId, keeperScript, fmWatchKeeperScript(hostId, fmHome, interval), signal);
         if (wrote) {
           const launch = [
             `mkdir -p ${shQuote(`${fmHome}/state`)}`,
@@ -5078,14 +5174,15 @@ export default async function plugin(bb: BbPluginApi) {
   // has exactly ONE owning captain (unambiguous), else dropped (not broadcast). `seen`
   // carries dedup keys across cycles. fm-watch owns wedge policy; BB is its
   // per-captain-scoped delivery transport.
-  async function relayWatchReasons(lines: string[], hostId: string, seen: Set<string>): Promise<void> {
+  async function relayWatchReasons(lines: string[], hostId: string, seen: Set<string>, signal?: AbortSignal): Promise<void> {
     if (lines.length === 0) return;
     const crews = await readCrews();
     const crewsOnHost: Crew[] = [];
     for (const crew of crews) {
+      if (signal?.aborted) return;
       if (isSecondmateRoute(crew)) continue;
       try {
-        if ((await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined)) === hostId) crewsOnHost.push(crew);
+        if ((await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined, signal)) === hostId) crewsOnHost.push(crew);
       } catch {
         // unresolved host → not attributed to this host's fallback set
       }
@@ -5136,7 +5233,16 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  async function stuckPass(): Promise<{ checked: number; notified: number }> {
+  async function stuckPass(signal?: AbortSignal): Promise<{ checked: number; notified: number }> {
+    // The pass is abort-aware end to end: `passSignal` fires when the service is stopping
+    // (the reload escape hatch) OR when this single pass exceeds its wall-clock budget, so
+    // one slow/unreachable host cannot pin the pass even absent a reload. A partial pass is
+    // fine — the next cycle re-runs, and the rotation cursor (below) resumes where we left
+    // off so nothing is starved.
+    const passSignal = AbortSignal.any([
+      ...(signal !== undefined ? [signal] : []),
+      AbortSignal.timeout(STUCK_PASS_BUDGET_MS),
+    ]);
     const current = await settings.get();
     const stuckMs = Math.min(480, Math.max(5, Number(current.supervisionStuckMin) || 30)) * 60000;
     const intervalMs = Math.min(60, Math.max(1, Number(current.supervisionIntervalMin) || 5)) * 60000;
@@ -5158,7 +5264,7 @@ export default async function plugin(bb: BbPluginApi) {
       let host = hostForCrew.get(crew.id);
       if (host === undefined) {
         try {
-          host = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
+          host = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined, passSignal);
         } catch {
           host = null;
         }
@@ -5183,21 +5289,59 @@ export default async function plugin(bb: BbPluginApi) {
     const now = Date.now();
     const rebase = !stuckRebased && (typeof lastPassAt !== "number" || now - lastPassAt > intervalMs);
     stuckRebased = true;
-    const crews = (await listCrewsAll())
-      .filter((c) => c.parentThreadId !== null && !isSecondmateRoute(c))
-      .slice(0, MAX_CREWS);
+    // The register is HOST-GLOBAL and keeps growing (~50-67 crews live). Inspect at most
+    // MAX_CREWS per pass, starting from a persisted rotation cursor, so a register larger
+    // than the cap never starves its tail: successive passes sweep the whole list. (When
+    // the eligible list fits under the cap the cursor is inert and every crew is inspected
+    // every pass, exactly as before.) The cap + the per-pass wall budget together bound how
+    // long one pass can run regardless of how big the register gets.
+    const eligibleAll = (await listCrewsAll(passSignal)).filter((c) => c.parentThreadId !== null && !isSecondmateRoute(c));
+    const eligibleIds = new Set(eligibleAll.map((c) => c.id));
+    const cursorRaw = meta["cursor"];
+    const total = eligibleAll.length;
+    const start = total === 0 ? 0 : ((((typeof cursorRaw === "number" && Number.isFinite(cursorRaw) ? cursorRaw : 0) % total) + total) % total);
+    const rotated = total === 0 ? [] : [...eligibleAll.slice(start), ...eligibleAll.slice(0, start)];
+    const crews = rotated.slice(0, MAX_CREWS);
     const parsed = watchStateSchema.safeParse(await bb.storage.kv.get<unknown>("watch"));
     const state: WatchState = parsed.success ? parsed.data : {};
-    const seen = new Set<string>();
     let notified = 0;
+    let inspected = 0;
+    // Page the captain, but DEFER (not drop) if a reload aborts the send mid-flight: the
+    // send is abort-responsive (no artificial timeout — a healthy send completes), and on
+    // abort we return false so the caller leaves the crew's alerted/stuck state untouched
+    // and the NEXT pass re-pages. This closes the last unguarded await inside the loop — a
+    // captain send under a degraded BB API — so a reload cannot wedge on it either.
+    async function pageOrDefer(crew: Crew, event: string, output: string | null): Promise<boolean> {
+      try {
+        await notifyCaptain(crew, event, output, passSignal);
+        return true;
+      } catch (error) {
+        if (isAbortError(error)) return false;
+        throw error;
+      }
+    }
     for (const crew of crews) {
-      seen.add(crew.id);
-      const status = await crewStatus(crew);
+      // Between crews: stop promptly when the service is aborting (reload) or the pass
+      // budget is spent. Partial progress is persisted below; the cursor advances by the
+      // number actually inspected so the next pass resumes at the first un-inspected crew.
+      if (passSignal.aborted) break;
+      inspected++;
+      const status = await crewStatus(crew, passSignal);
+      // A host read that raced an abort returns a degraded default ("unknown"); do NOT act
+      // on it (that would spuriously page on shutdown). Un-count this crew (so the cursor
+      // resumes here) and let the next cycle redo it.
+      if (passSignal.aborted) {
+        inspected--;
+        break;
+      }
       const prev = state[crew.id];
       if (prev === undefined) {
         if (status === "error" || status === "unknown") {
-          const detail = status === "error" ? await crewOutput(crew, 300) : null;
-          await notifyCaptain(crew, status, detail);
+          const detail = status === "error" ? await crewOutput(crew, 300, passSignal) : null;
+          if (!(await pageOrDefer(crew, status, detail))) {
+            inspected--;
+            break;
+          }
           notified++;
           state[crew.id] = { status, hash: "", at: now, stuck: false, alerted: status };
           continue;
@@ -5211,8 +5355,11 @@ export default async function plugin(bb: BbPluginApi) {
       }
       if (status === "error" || status === "unknown") {
         if (prev.alerted !== status) {
-          const detail = status === "error" ? await crewOutput(crew, 300) : null;
-          await notifyCaptain(crew, status, detail);
+          const detail = status === "error" ? await crewOutput(crew, 300, passSignal) : null;
+          if (!(await pageOrDefer(crew, status, detail))) {
+            inspected--;
+            break;
+          }
           notified++;
         }
         state[crew.id] = { status, hash: "", at: now, stuck: false, alerted: status };
@@ -5228,10 +5375,17 @@ export default async function plugin(bb: BbPluginApi) {
         };
         continue;
       }
-      const excerpt = await crewExcerpt(crew);
+      const excerpt = await crewExcerpt(crew, passSignal);
+      if (passSignal.aborted) {
+        inspected--;
+        break;
+      }
       if (!excerpt.ok) {
         if (prev.alerted !== "unknown") {
-          await notifyCaptain(crew, "unknown", null);
+          if (!(await pageOrDefer(crew, "unknown", null))) {
+            inspected--;
+            break;
+          }
           notified++;
         }
         state[crew.id] = {
@@ -5248,7 +5402,11 @@ export default async function plugin(bb: BbPluginApi) {
         state[crew.id] = { status, hash: excerpt.text, at: now, stuck: false };
         continue;
       }
-      const activity = await readToolActivity(crew.threadId);
+      const activity = await readToolActivity(crew.threadId, passSignal);
+      if (passSignal.aborted) {
+        inspected--;
+        break;
+      }
       if (!activity.ok) {
         state[crew.id] = { ...prev, status, hash: excerpt.text };
         continue;
@@ -5274,23 +5432,42 @@ export default async function plugin(bb: BbPluginApi) {
         stuck: prev.stuck,
         ...(activityAt !== undefined ? { activityAt } : {}),
       };
-      if (!(await suppressForCrew(crew)) && !prev.stuck && now - prev.at >= stuckMs) {
-        await notifyCaptain(
-          crew,
-          `stuck (${outMin}m no output change, no tool/file activity ${actMin}m)`,
-          excerpt.text === "" ? null : excerpt.text,
-        );
+      const suppressed = await suppressForCrew(crew);
+      // suppressForCrew swallows an aborted host resolve into `false` (do not suppress);
+      // do NOT let that spurious-page on shutdown — break before deciding to notify.
+      if (passSignal.aborted) {
+        inspected--;
+        break;
+      }
+      if (!suppressed && !prev.stuck && now - prev.at >= stuckMs) {
+        if (
+          !(await pageOrDefer(
+            crew,
+            `stuck (${outMin}m no output change, no tool/file activity ${actMin}m)`,
+            excerpt.text === "" ? null : excerpt.text,
+          ))
+        ) {
+          inspected--;
+          break;
+        }
         notified++;
         row.stuck = true;
       }
       state[crew.id] = row;
     }
+    // Prune against the FULL eligible set (not just the crews inspected this pass): a crew
+    // no longer eligible is gone and its row can drop, but a crew merely not reached this
+    // rotation must keep its row so its stuck timer is not reset.
     for (const id of Object.keys(state)) {
-      if (!seen.has(id)) delete state[id];
+      if (!eligibleIds.has(id)) delete state[id];
     }
+    // Advance the rotation cursor by the crews actually inspected, so the next pass resumes
+    // at the first un-inspected crew (fair rotation, no starvation) even after a partial/
+    // aborted pass.
+    const nextCursor = total === 0 ? 0 : (start + inspected) % total;
     await bb.storage.kv.set("watch", state);
-    await bb.storage.kv.set("watch-meta", { lastPassAt: now, checked: crews.length, notified });
-    return { checked: crews.length, notified };
+    await bb.storage.kv.set("watch-meta", { lastPassAt: now, checked: inspected, notified, cursor: nextCursor });
+    return { checked: inspected, notified };
   }
 
   function guideText(repo: string, scriptCount = "", skillCount = ""): string {
@@ -7206,13 +7383,21 @@ export default async function plugin(bb: BbPluginApi) {
       while (!signal.aborted) {
         try {
           const s = await settings.get();
-          if (s.supervisionEnabled === true) await stuckPass();
+          if (s.supervisionEnabled === true) await stuckPass(signal);
         } catch (error) {
           bb.log.warn(error instanceof Error ? `supervise: ${error.message}` : "supervise failed");
         }
         const s = await settings.get().catch(() => null);
         const mins = s === null ? 5 : Math.min(60, Math.max(1, Number(s.supervisionIntervalMin) || 5));
         await new Promise<void>((resolve) => {
+          // stuckPass now returns early on abort, so the signal can ALREADY be aborted here.
+          // A sleep entered post-abort can never be woken by the abort listener (the event
+          // already fired), so without this immediate resolve it would pin the service open
+          // for the whole interval — the exact "service crew-watch did not stop" wedge.
+          if (signal.aborted) {
+            resolve();
+            return;
+          }
           const timer = setTimeout(resolve, mins * 60000);
           signal.addEventListener(
             "abort",
@@ -7255,11 +7440,15 @@ export default async function plugin(bb: BbPluginApi) {
           gate = Number.isFinite(s.watchHeartbeatSec) ? Math.max(30, Math.trunc(s.watchHeartbeatSec)) : 90;
           if (s.watchOwner === "fm-watch" && s.fmHome.trim() !== "") {
             sweptWhileOff = false;
-            const hosts = await resolveFmWatchHosts();
+            const hosts = await resolveFmWatchHosts(signal);
             if (hosts.length === 0) {
               bb.log.warn("fm-watch-supervisor: no host to reach fmHome (set fmHostId or dispatch a crew).");
             }
             for (const hostId of hosts) {
+              // Between hosts: bail out promptly on a reload. superviseFmWatch/relayWatchReasons
+              // already honor the signal inside, but without this check a multi-host fleet would
+              // still walk every remaining host before the loop noticed the abort.
+              if (signal.aborted) break;
               const key = fmWatchBeatKey(hostId);
               const prior = fmWatchBeatSchema.safeParse(await bb.storage.kv.get(key));
               const now = Date.now();
@@ -7290,7 +7479,7 @@ export default async function plugin(bb: BbPluginApi) {
                 backoffUntil: nextBackoff,
                 consecutiveRelaunch: streak,
               });
-              await relayWatchReasons(extractWatchReasons(res.logTail), hostId, relaySeen);
+              await relayWatchReasons(extractWatchReasons(res.logTail), hostId, relaySeen, signal);
             }
             // Legacy single-key mirror (one release): the first host's liveness, so
             // an older UI reading "fm-watch-beat" still sees a beat.
@@ -7306,9 +7495,12 @@ export default async function plugin(bb: BbPluginApi) {
             // per off-stretch. The keeper's owner-beat self-exit is the second layer for
             // hosts we can no longer reach here.
             const toStop = new Set<string>(keeperHosts);
-            const configured = await resolveFmWatchHostId();
+            const configured = await resolveFmWatchHostId(signal);
             if (configured !== null) toStop.add(configured);
-            for (const hostId of toStop) await stopFmWatchKeeper(hostId, s.fmHome.trim(), signal);
+            for (const hostId of toStop) {
+              if (signal.aborted) break;
+              await stopFmWatchKeeper(hostId, s.fmHome.trim(), signal);
+            }
             keeperHosts = new Set<string>();
             await saveKeeperHosts(keeperHosts);
             sweptWhileOff = true;
@@ -7318,6 +7510,13 @@ export default async function plugin(bb: BbPluginApi) {
         }
         const checkMs = Math.max(15, Math.min(30, Math.floor(gate / 2))) * 1000;
         await new Promise<void>((resolve) => {
+          // Same post-abort guard as crew-watch: the per-host work above now bails on abort,
+          // so the signal can already be aborted here; a sleep entered post-abort would never
+          // wake (the abort event already fired) and pin the service for the whole interval.
+          if (signal.aborted) {
+            resolve();
+            return;
+          }
           const timer = setTimeout(resolve, checkMs);
           signal.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
         });
