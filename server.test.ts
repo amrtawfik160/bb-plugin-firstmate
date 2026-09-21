@@ -5479,3 +5479,170 @@ test("IT F3b: tellOwner=real writes a fire-and-forget record → fm_task_inbox_d
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+// --- crew-watch abort-awareness (backlog 4c1b0ea5) ------------------------------
+// The live incident: `bb plugin reload firstmate` failed repeatedly with "service
+// crew-watch did not stop" while a stuckPass was in flight over a host-global crew
+// register (~50-67 crews), pinning the plugin DEGRADED and `bb firstmate` UNAVAILABLE to
+// every captain on the host. Root cause: the crew-watch loop checked signal.aborted between
+// cycles and its sleep was abortable, but `await stuckPass()` had NO abort awareness inside.
+// These tests prove the pass now stops within the shutdown grace on the FIRST attempt, and
+// mutation-prove each load-bearing abort check.
+
+// Each test below uses an inline hand-resolved barrier (two bare promises: one tripped when
+// the stub is entered, one the test resolves to release it) so a reload can be triggered
+// deterministically while a specific host read is in flight — no timers, so nothing dangles
+// at process exit.
+
+test("ACCEPTANCE: a reload mid slow stuckPass stops crew-watch within the grace, on the first attempt, repeatedly", async () => {
+  const host = await load();
+  try {
+    const N = 40;
+    const crews = [];
+    for (let i = 0; i < N; i++) crews.push(crewRow(`c${i}`, `thr_${i}`, "thr_cap"));
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await host.bb.storage.kv.set("crews", crews);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.send", async () => ({}));
+    host.harness.sdk.stub("threads.output", async () => ({ output: "same" }));
+    host.harness.sdk.stub("threads.events.list", async () => [{ createdAt: Date.now() }]);
+    let slow = true;
+    // A deliberately slow per-crew host read: one uninterrupted pass is 40 * 150ms = ~6s,
+    // far past the grace we assert. crewStatus (threads.get) is the read exercised on every
+    // crew, including the rebase path, so this makes the WHOLE pass slow.
+    host.harness.sdk.stub("threads.get", async () => {
+      if (slow) await new Promise((r) => setTimeout(r, 150));
+      return makeThreadResponse({ status: "active", environmentId: null });
+    });
+    const GRACE_MS = 1500;
+    for (let round = 0; round < 5; round++) {
+      await host.bb.storage.kv.set("watch-meta", { lastPassAt: Date.now(), checked: -1, notified: -1, cursor: 0 });
+      const base = host.harness.sdk.callsTo("threads.get").length;
+      const run = host.harness.behavior.runService("crew-watch");
+      const waitUntil = Date.now() + 5000;
+      // Wait until the pass is genuinely mid-flight (several crews inspected) before reloading.
+      while (host.harness.sdk.callsTo("threads.get").length < base + 4 && Date.now() < waitUntil) {
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      assert.ok(
+        host.harness.sdk.callsTo("threads.get").length >= base + 3,
+        `round ${round}: slow pass never got mid-flight`,
+      );
+      const t0 = Date.now();
+      run.controller.abort();
+      await run.done;
+      const stopMs = Date.now() - t0;
+      assert.ok(stopMs < GRACE_MS, `round ${round}: crew-watch took ${stopMs}ms to stop (grace ${GRACE_MS}ms)`);
+    }
+    // The plugin is not wedged after the aborted reloads: a clean pass completes normally.
+    slow = false;
+    const meta = await runStuckOnce(host);
+    assert.equal(meta.checked, N, "a clean pass after the reloads still inspects every crew");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("ABORT WIRING (post-crewStatus): a reload while reading a crew's status fires no spurious captain page", async () => {
+  const host = await load();
+  try {
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_1", "thr_cap")]);
+    // prev present and NOT alerted-unknown: a degraded "unknown" status WOULD page the captain.
+    await host.bb.storage.kv.set("watch", { c1: { status: "active", hash: "h", at: Date.now(), stuck: false } });
+    await host.bb.storage.kv.set("watch-meta", { lastPassAt: Date.now(), checked: -1, notified: -1, cursor: 0 });
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.send", async () => ({}));
+    host.harness.sdk.stub("threads.output", async () => ({ output: "h" }));
+    host.harness.sdk.stub("threads.events.list", async () => [{ createdAt: Date.now() }]);
+    let enter!: () => void;
+    let unblock!: () => void;
+    const entered = new Promise<void>((r) => (enter = r));
+    const blocked = new Promise<void>((r) => (unblock = r));
+    host.harness.sdk.stub("threads.get", async () => {
+      enter();
+      await blocked; // hold crewStatus in flight; abort (via the passed signal) interrupts the await
+      return makeThreadResponse({ status: "error", environmentId: null });
+    });
+    const run = host.harness.behavior.runService("crew-watch");
+    await entered; // deterministic: abort exactly while crewStatus is in flight
+    run.controller.abort();
+    await run.done;
+    assert.equal(sendCalls(host).length, 0, "a reload mid status-read must not page the captain");
+    unblock();
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("ABORT WIRING (post-crewExcerpt): a reload while reading a crew's output fires no spurious captain page", async () => {
+  const host = await load();
+  try {
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_1", "thr_cap")]);
+    // lastPassAt recent → no rebase, so the pass reaches the excerpt read; prev not
+    // alerted-unknown so a degraded excerpt (ok:false) WOULD page "unknown".
+    await host.bb.storage.kv.set("watch", { c1: { status: "active", hash: "h", at: Date.now(), stuck: false } });
+    await host.bb.storage.kv.set("watch-meta", { lastPassAt: Date.now(), checked: -1, notified: -1, cursor: 0 });
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.send", async () => ({}));
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ status: "active", environmentId: null }));
+    host.harness.sdk.stub("threads.events.list", async () => [{ createdAt: Date.now() }]);
+    let enter!: () => void;
+    let unblock!: () => void;
+    const entered = new Promise<void>((r) => (enter = r));
+    const blocked = new Promise<void>((r) => (unblock = r));
+    host.harness.sdk.stub("threads.output", async () => {
+      enter();
+      await blocked;
+      return { output: "different-so-would-not-page-normally" };
+    });
+    const run = host.harness.behavior.runService("crew-watch");
+    await entered;
+    run.controller.abort();
+    await run.done;
+    assert.equal(sendCalls(host).length, 0, "a reload mid output-read must not page the captain");
+    unblock();
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("ABORT WIRING (post-suppress): a reload while resolving a crew's host fires no spurious stuck page", async () => {
+  const host = await load();
+  try {
+    // watchOwner=fm-watch makes the stuck path consult suppressForCrew → resolveHostForProject.
+    await host.harness.behavior.setSettings({
+      supervisionEnabled: true,
+      watchOwner: "fm-watch",
+      fmHome: "/tmp/fm-home-abort",
+    });
+    await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_1", "thr_cap")]);
+    const staleAt = Date.now() - 40 * 60_000; // older than the 30m stuck window
+    await host.bb.storage.kv.set("watch", { c1: { status: "active", hash: "h", at: staleAt, stuck: false } });
+    await host.bb.storage.kv.set("watch-meta", { lastPassAt: Date.now(), checked: -1, notified: -1, cursor: 0 });
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.send", async () => ({}));
+    // environmentId null → resolveHostForProject skips environments.get and blocks on list.
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ status: "active", environmentId: null }));
+    host.harness.sdk.stub("threads.output", async () => ({ output: "h" })); // === prev.hash → stalled
+    host.harness.sdk.stub("threads.events.list", async () => [{ createdAt: staleAt }]); // stale activity
+    let enter!: () => void;
+    let unblock!: () => void;
+    const entered = new Promise<void>((r) => (enter = r));
+    const blocked = new Promise<void>((r) => (unblock = r));
+    host.harness.sdk.stub("environments.list", async () => {
+      enter();
+      await blocked;
+      return [];
+    });
+    const run = host.harness.behavior.runService("crew-watch");
+    await entered;
+    run.controller.abort();
+    await run.done;
+    assert.equal(sendCalls(host).length, 0, "a reload mid host-resolve must not fire a stuck page");
+    unblock();
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
