@@ -287,6 +287,27 @@ function fmBinDirAssign(fmHome: string): string {
   return `FM_BINDIR=${q}/bin; if [ -f ${q}/config/bb-overlay ] && [ -d ${q}/bin-bb ]; then FM_BINDIR=${q}/bin-bb; fi`;
 }
 
+// Loud staleness guard (F2). The plugin's own fast-forward (initRealMode) always
+// re-mirrors, but an OUT-OF-BAND ff (a manual `git pull`, an external updater, the
+// migration steps) advances HEAD without rebuilding bin-bb, leaving new sibling
+// scripts unmirrored and the three frozen copies behind upstream — silently, because
+// the tree still reads clean. This emits FM_MIRROR_STALE on stderr when the mirror's
+// recorded HEAD no longer matches the clone's HEAD; the caller logs it loudly. A truly
+// missing SCRIPT_DIR sibling surfaces on its own (the script errors, non-zero) since
+// callers no longer swallow that. Runs only when FM_BINDIR is the mirror. Must be
+// emitted AFTER fmBinDirAssign.
+function fmMirrorStaleGuard(fmHome: string): string {
+  const q = shQuote(fmHome);
+  return (
+    `if [ "$FM_BINDIR" = ${q}/bin-bb ]; then ` +
+    `__fm_mh=$(sed -n 's/^head=//p' ${q}/bin-bb/.mirror-manifest 2>/dev/null); ` +
+    `__fm_ch=$(git -C ${q} rev-parse HEAD 2>/dev/null || true); ` +
+    `if [ -n "$__fm_mh" ] && [ -n "$__fm_ch" ] && [ "$__fm_mh" != "$__fm_ch" ]; then ` +
+    `echo "FM_MIRROR_STALE: bb mirror built at $__fm_mh but HEAD is $__fm_ch; re-run install-bb-backend.py --home ${fmHome}" >&2; ` +
+    `fi; fi`
+  );
+}
+
 // The drain hint appended to every real-mode doorbell. The durable wake queue stays the
 // authoritative store; the chat doorbell is only a pointer to it, so a dropped doorbell can
 // never lose the report (it survives in state/.wake-queue).
@@ -1702,15 +1723,24 @@ export default async function plugin(bb: BbPluginApi) {
       `export FM_HOME=${shQuote(fmHome)}`,
       `export FM_ROOT=${shQuote(fmHome)}`,
       fmBinDirAssign(fmHome),
+      fmMirrorStaleGuard(fmHome),
       `[ -f ${briefRef} ] || exit 0`,
       `[ -f ${shQuote(brief)} ] && exit 0`,
-      `${scaffold} >/dev/null 2>&1 || exit 0`,
-      `FM_INTENT=${intentB64} python3 -c ${shQuote(py)} ${shQuote(brief)} || exit 0`,
+      // F2: do NOT `>/dev/null 2>&1 || exit 0` here — that swallowed a stale-mirror
+      // failure (e.g. a missing SCRIPT_DIR sibling in bin-bb) whole. Capture the
+      // scaffold's stderr and surface it so publishFmBrief logs it (best-effort still:
+      // the crew already has the structured prompt, so a failure only logs, not throws).
+      `if ! __fm_err=$(${scaffold} 2>&1); then echo "fm-brief scaffold failed: $__fm_err" >&2; exit 1; fi`,
+      `FM_INTENT=${intentB64} python3 -c ${shQuote(py)} ${shQuote(brief)} || { echo "fm-brief fill failed" >&2; exit 1; }`,
     ].join("\n");
     try {
       const res = await runOnHost(host, script, 30_000);
+      if (res.output.includes("FM_MIRROR_STALE")) {
+        const line = res.output.split("\n").find((l) => l.includes("FM_MIRROR_STALE"))?.trim() ?? "FM_MIRROR_STALE";
+        bb.log.error(`bb mirror is STALE while scaffolding brief crew=${crew.id}: ${line}. Re-run the overlay installer against ${fmHome}.`);
+      }
       if (res.exitCode !== 0) {
-        bb.log.warn(`fm brief scaffold failed crew=${crew.id} exit=${res.exitCode}`);
+        bb.log.warn(`fm brief scaffold failed crew=${crew.id} exit=${res.exitCode}: ${res.output.trim().slice(-400)}`);
         return false;
       }
       bb.log.info(`fm brief scaffolded crew=${crew.id} path=${brief}`);
@@ -3665,12 +3695,17 @@ export default async function plugin(bb: BbPluginApi) {
       }),
       ...extraEnv,
       fmBinDirAssign(input.fmHome),
+      fmMirrorStaleGuard(input.fmHome),
       `if [ ! -f "$FM_BINDIR/${scriptLeaf}" ]; then echo "error: missing $FM_BINDIR/${scriptLeaf}" >&2; exit 127; fi`,
       `"$FM_BINDIR/${scriptLeaf}" ${input.args.map(shQuote).join(" ")}`,
     ]
       .filter((line) => line !== "")
       .join("\n");
     const result = await runOnHost(input.hostId, prelude, input.timeoutMs, input.signal);
+    if (result.output.includes("FM_MIRROR_STALE")) {
+      const line = result.output.split("\n").find((l) => l.includes("FM_MIRROR_STALE"))?.trim() ?? "FM_MIRROR_STALE";
+      bb.log.error(`bb mirror is STALE on host ${input.hostId} running fm-${script}: ${line}. Re-run the overlay installer against ${input.fmHome}; new native scripts are unmirrored and the three patched copies are frozen behind upstream.`);
+    }
     return { ...result, scriptPath };
   }
 

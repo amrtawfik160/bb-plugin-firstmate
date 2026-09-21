@@ -1404,8 +1404,15 @@ test("installer applies patches to a scratch tree only — never against the hom
   // Patches are applied inside a throwaway temp tree.
   assert.match(INSTALLER_SRC, /tempfile\.TemporaryDirectory/);
   assert.match(INSTALLER_SRC, /cwd=tmproot/);
-  // The three patched files are copied into the MIRROR (dest_dir), not home/bin.
-  assert.match(INSTALLER_SRC, /shutil\.copy2\(src,\s*dest_dir/);
+  // The three patched files are written into the MIRROR (dest_dir), not home/bin.
+  assert.match(INSTALLER_SRC, /\(dest_dir \/ f\)\.write_text\(rewritten\)/);
+  // F4: internal dispatch self-references are rewritten to $SCRIPT_DIR in the copies.
+  assert.match(INSTALLER_SRC, /SELF_REF_RE/);
+  assert.match(INSTALLER_SRC, /\$SCRIPT_DIR/);
+  // F2: a manifest is written so staleness can be detected, and a --verify mode exists.
+  assert.match(INSTALLER_SRC, /def write_manifest/);
+  assert.match(INSTALLER_SRC, /def verify_mirror/);
+  assert.match(INSTALLER_SRC, /--verify/);
 });
 
 test("installer builds a mirror bin and keeps the tree clean via .git/info/exclude", () => {
@@ -1429,6 +1436,22 @@ test("plugin routes fm scripts through the bb mirror bin (FM_BINDIR), not hardco
   // runFmScript invokes via the resolved FM_BINDIR, and the watch keeper arms through it.
   assert.match(src, /"\$FM_BINDIR\/\$\{scriptLeaf\}"/);
   assert.match(src, /ARM="\$FM_BINDIR\/fm-watch-arm\.sh"/);
+});
+
+test("plugin emits a loud stale-mirror guard on use and surfaces FM_MIRROR_STALE (F2)", () => {
+  const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "server.ts"), "utf8");
+  // The guard compares the mirror manifest HEAD to the clone HEAD and prints FM_MIRROR_STALE.
+  assert.match(src, /function fmMirrorStaleGuard/);
+  assert.match(src, /FM_MIRROR_STALE/);
+  assert.match(src, /\.mirror-manifest/);
+  assert.match(src, /rev-parse HEAD/);
+  // runFmScript and the brief scaffold both wire the guard and log it loudly.
+  assert.match(src, /fmMirrorStaleGuard\(input\.fmHome\)/);
+  assert.match(src, /fmMirrorStaleGuard\(fmHome\)/);
+  assert.match(src, /bb mirror is STALE/);
+  // F2: the fm-brief scaffold must NOT swallow stderr with `>/dev/null 2>&1 || exit 0`.
+  assert.doesNotMatch(src, /\$\{scaffold\} >\/dev\/null 2>&1 \|\| exit 0/);
+  assert.match(src, /fm-brief scaffold failed: \$__fm_err/);
 });
 
 // Behavioral guard: when a real firstmate checkout is reachable, actually run the
@@ -1473,6 +1496,50 @@ test("installer leaves a real firstmate clone's tracked tree clean", (t) => {
     assert.ok(existsSync(join(home, "bin-bb", "fm-spawn.sh")), "mirror bin missing");
     const patched = readFileSync(join(home, "bin-bb", "fm-backend.sh"), "utf8");
     assert.match(patched, /FM_BACKEND_KNOWN="[^"]*\bbb\b/, "mirror fm-backend.sh lacks bb registration");
+    // F4: internal dispatch self-references in the mirror copy stay in the mirror
+    // ($SCRIPT_DIR), so batch/array dispatch does not re-invoke pristine native bin.
+    const mirrorSpawn = readFileSync(join(home, "bin-bb", "fm-spawn.sh"), "utf8");
+    assert.doesNotMatch(mirrorSpawn, /\$FM_ROOT\/bin\/fm-spawn\.sh/, "mirror fm-spawn still re-invokes native bin");
+    assert.match(mirrorSpawn, /\$SCRIPT_DIR\/fm-spawn\.sh/, "mirror fm-spawn self-ref not redirected to $SCRIPT_DIR");
+    // F2: the manifest exists and `--verify` reports the fresh mirror healthy.
+    assert.ok(existsSync(join(home, "bin-bb", ".mirror-manifest")), "mirror manifest missing");
+    const okVerify = spawnSync("python3", [join(OVERLAY_ROOT, "install-bb-backend.py"), "--home", home, "--verify"], { encoding: "utf8" });
+    assert.equal(okVerify.status, 0, `fresh mirror should verify clean:\n${okVerify.stdout}\n${okVerify.stderr}`);
+  } finally {
+    rmSync(work, { recursive: true, force: true });
+  }
+});
+
+test("installer --verify fails LOUD after an out-of-band fast-forward leaves the mirror stale (F2)", (t) => {
+  const checkout = discoverFirstmateCheckout();
+  if (checkout === null) {
+    t.skip("no firstmate checkout discoverable (set FM_TEST_HOME to enable)");
+    return;
+  }
+  const work = mkdtempSync(join(tmpdir(), "fm-bb-stale-"));
+  try {
+    const home = join(work, "home");
+    // Full clone (not --depth 1) so we can add a commit to simulate an out-of-band ff.
+    if (spawnSync("git", ["clone", "--quiet", "--no-local", `file://${checkout}`, home]).status !== 0) {
+      t.skip("clone failed");
+      return;
+    }
+    assert.equal(spawnSync("python3", [join(OVERLAY_ROOT, "install-bb-backend.py"), "--home", home, "--overlay", OVERLAY_ROOT]).status, 0);
+    // Verify healthy first (control).
+    assert.equal(spawnSync("python3", [join(OVERLAY_ROOT, "install-bb-backend.py"), "--home", home, "--verify"]).status, 0);
+    // Simulate an out-of-band upstream fast-forward: a new tracked bin/ file + an edit
+    // to one of the frozen sources, committed so HEAD advances underneath the mirror.
+    writeFileSync(join(home, "bin", "fm-newmod.sh"), "#!/usr/bin/env bash\n");
+    writeFileSync(join(home, "bin", "fm-spawn.sh"), readFileSync(join(home, "bin", "fm-spawn.sh"), "utf8") + "\n# DRIFT_MARKER\n");
+    spawnSync("git", ["-C", home, "add", "bin/fm-newmod.sh", "bin/fm-spawn.sh"]);
+    spawnSync("git", ["-C", home, "-c", "user.email=x@x", "-c", "user.name=x", "commit", "-q", "-m", "oob ff"]);
+    const stale = spawnSync("python3", [join(OVERLAY_ROOT, "install-bb-backend.py"), "--home", home, "--verify"], { encoding: "utf8" });
+    assert.notEqual(stale.status, 0, "stale mirror must make --verify fail");
+    assert.match(stale.stderr, /FM_MIRROR_STALE/, `--verify must be loud:\n${stale.stderr}`);
+    assert.match(stale.stderr, /missing sibling 'fm-newmod\.sh'|HEAD moved|frozen copy 'fm-spawn\.sh' is stale/);
+    // Re-install re-mirrors → verify healthy again (self-heal).
+    assert.equal(spawnSync("python3", [join(OVERLAY_ROOT, "install-bb-backend.py"), "--home", home, "--overlay", OVERLAY_ROOT]).status, 0);
+    assert.equal(spawnSync("python3", [join(OVERLAY_ROOT, "install-bb-backend.py"), "--home", home, "--verify"]).status, 0);
   } finally {
     rmSync(work, { recursive: true, force: true });
   }
