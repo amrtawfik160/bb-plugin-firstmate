@@ -3517,7 +3517,7 @@ test("R1 multi-host: a live watcher on host A does not suppress a stuck crew on 
   }
 });
 
-test("R2 relay: only signal:/stale: lines are relayed; check:/heartbeat are dropped", async () => {
+test("R2 relay: only stale: lines are relayed; routine signal:/check:/heartbeat are dropped", async () => {
   const host = createFakePluginHost({
     pluginId: "firstmate",
     agentSkillIds: SKILLS,
@@ -3535,7 +3535,7 @@ test("R2 relay: only signal:/stale: lines are relayed; check:/heartbeat are drop
     ]);
     await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew", "thr_cap")]);
     host.harness.sdk.stub("terminals.output", async () =>
-      hostRcPayload("FM_BEAT_AGE=5\nFM_RELAUNCHED=0\n---FM_LOGTAIL---\ncheck: routine\nheartbeat 12\nsignal: c1 wedged", 0),
+      hostRcPayload("FM_BEAT_AGE=5\nFM_RELAUNCHED=0\n---FM_LOGTAIL---\ncheck: routine\nheartbeat 12\nsignal: state/c1.status\nstale: c1 wedged", 0),
     );
     const run = host.harness.behavior.runService("fm-watch-supervisor");
     const deadline = Date.now() + 4000;
@@ -3546,7 +3546,12 @@ test("R2 relay: only signal:/stale: lines are relayed; check:/heartbeat are drop
     run.controller.abort();
     await run.done;
     const relayed = sendCalls(host).map((s) => s.text ?? "").join("\n");
-    assert.match(relayed, /signal: c1 wedged/);
+    // The stale: wedge line is the actionable backstop and IS relayed.
+    assert.match(relayed, /stale: c1 wedged/);
+    // A routine signal: line is only a status-file-changed pointer whose content is already
+    // delivered by notifyCaptain — it must NOT be relayed (reverting the extractWatchReasons
+    // stale-only filter re-relays it and fails this assertion).
+    assert.doesNotMatch(relayed, /signal:/);
     assert.doesNotMatch(relayed, /check: routine/);
     assert.doesNotMatch(relayed, /heartbeat 12/);
   } finally {
@@ -3573,7 +3578,7 @@ test("D6 relay: an fm-watch page reaches ONLY the owning captain; unattributable
     // Two captains, each owning a crew on the SAME host.
     await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew1", "thr_capA"), crewRow("c2", "thr_crew2", "thr_capB")]);
     host.harness.sdk.stub("terminals.output", async () =>
-      hostRcPayload("FM_BEAT_AGE=5\nFM_RELAUNCHED=0\n---FM_LOGTAIL---\nsignal: c2 wedged on rebase\nsignal: mystery wedge no crew id", 0),
+      hostRcPayload("FM_BEAT_AGE=5\nFM_RELAUNCHED=0\n---FM_LOGTAIL---\nstale: c2 wedged on rebase\nstale: mystery wedge no crew id", 0),
     );
     const run = host.harness.behavior.runService("fm-watch-supervisor");
     const deadline = Date.now() + 4000;
@@ -3594,7 +3599,7 @@ test("D6 relay: an fm-watch page reaches ONLY the owning captain; unattributable
   }
 });
 
-test("D8 relay: a MULTI-crew signal line is split/filtered per owner (no cross-captain crew-id leak)", async () => {
+test("D8 relay: a MULTI-crew stale line is split/filtered per owner (no cross-captain crew-id leak)", async () => {
   const host = createFakePluginHost({
     pluginId: "firstmate",
     agentSkillIds: SKILLS,
@@ -3613,7 +3618,7 @@ test("D8 relay: a MULTI-crew signal line is split/filtered per owner (no cross-c
     // Two captains on one host; a single fm-watch signal line names BOTH crews.
     await host.bb.storage.kv.set("crews", [crewRow("1f4c7c2a", "thr_crew1", "thr_capA"), crewRow("79da4929", "thr_crew2", "thr_capB")]);
     host.harness.sdk.stub("terminals.output", async () =>
-      hostRcPayload("FM_BEAT_AGE=5\nFM_RELAUNCHED=0\n---FM_LOGTAIL---\nsignal: state/1f4c7c2a.status state/79da4929.status wedged", 0),
+      hostRcPayload("FM_BEAT_AGE=5\nFM_RELAUNCHED=0\n---FM_LOGTAIL---\nstale: state/1f4c7c2a.status state/79da4929.status wedged", 0),
     );
     const run = host.harness.behavior.runService("fm-watch-supervisor");
     const deadline = Date.now() + 4000;
@@ -4367,7 +4372,22 @@ test("fmWatchKeeperScript declares autoarm AND arms fm-watch as a handling succe
   assert.ok(s.includes("fm-watch-arm.sh"));
 });
 
-test("notifyOwner=real doorbell carries crew id + one-line outcome (not a generic pointer); durable enqueued", async () => {
+// Part C: the drain hint is appended only when draining surfaces something the doorbell
+// line does not already carry (drainHint=true), never as a fixed footer.
+test("Part C: captainWakeDoorbell appends the drain hint only when drainHint=true", () => {
+  const plain = captainWakeDoorbell("✅ crew c1 done", "shipped the branch");
+  assert.match(plain, /^🔔 ✅ crew c1 done — shipped the branch$/, plain);
+  assert.ok(!plain.includes("bb firstmate wake"), `a plain doorbell must carry no drain footer: ${plain}`);
+  const withHint = captainWakeDoorbell("⚖️ crew c1 NEEDS DECISION", "pick a base branch", { drainHint: true });
+  assert.match(withHint, /bb firstmate wake/, withHint);
+  // Reverting the conditional (always append CAPTAIN_WAKE_DRAIN_HINT) makes the plain case
+  // carry the footer and fails the assertion above.
+});
+
+// Part B: one crew completion = one captain message. In real mode a plain done is already
+// surfaced by BB's own child-output delivery + the durable wake queue, so the plugin's own
+// doorbell is suppressed — but the durable enqueue (the store) still runs, so nothing is lost.
+test("Part B: notifyOwner=real — a plain done is NOT re-doorbelled (BB delivers), durable wake still enqueued", async () => {
   const host = ownerHost({ notifyOwner: "real" });
   await plugin(host.bb);
   try {
@@ -4375,15 +4395,200 @@ test("notifyOwner=real doorbell carries crew id + one-line outcome (not a generi
     await seedCrew(host);
     await host.harness.behavior.setSettings({ supervisionEnabled: true });
     await emitIdle(host, "DONE: shipped the branch");
-    assert.ok(seen.some((c) => c.includes("fm_wake_append")), "real must enqueue a durable wake (the store)");
-    const sends = sendCalls(host);
-    assert.equal(sends.length, 1);
+    // The report still lands in the durable queue (drain recovers it).
+    assert.ok(seen.some((c) => c.includes("fm_wake_append")), "real must still enqueue the durable wake (the store)");
+    // But the redundant chat doorbell is gone — reverting the suppression re-sends it and
+    // fails this assertion.
+    const sends = sendCalls(host).filter((s) => s.threadId === "thr_cap");
+    assert.equal(sends.length, 0, `a plain done must not re-doorbell the captain: ${sends.map((s) => s.text).join(" | ")}`);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// Part B: a NON-plain event (a failure) is NOT covered by "the crew just delivered its report",
+// so the plugin doorbell must still fire — the suppression must not silence real alerts.
+test("Part B: notifyOwner=real — a failure still doorbells the captain (non-plain is never suppressed), no drain footer", async () => {
+  const host = ownerHost({ notifyOwner: "real" });
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRoutedHost(host, () => ({ code: 0 }));
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await host.harness.behavior.emitThreadEvent("thread.failed", {
+      thread: makeThreadResponse({ id: "thr_crew", status: "error", projectId: "proj_1" }),
+      error: "boom: the build blew up",
+    });
+    assert.ok(seen.some((c) => c.includes("fm_wake_append")), "a failure must enqueue the durable wake");
+    const sends = sendCalls(host).filter((s) => s.threadId === "thr_cap");
+    assert.equal(sends.length, 1, "a failure must still reach the captain");
     const text = sends[0]?.text ?? "";
     assert.match(text, /^🔔 /, text);
-    assert.match(text, /crew c1/, text);
-    assert.match(text, /shipped the branch/, text);
+    assert.match(text, /crew c1 failed/, text);
+    // A failure is self-sufficient (head + summary + next: retry|tell|forget) — no drain footer.
+    assert.ok(!text.includes("bb firstmate wake"), `a failure doorbell needs no drain footer: ${text}`);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// Part B BLOCKER regression: a crew that reports BLOCKED/FAILED *in-band* (the normal firstmate
+// way) fires thread.idle and stays kind="idle" — it must NOT be swept up by the plain-done
+// suppression. Only a genuine DONE verdict is suppressed. These emit the verdict via thread.idle
+// (not thread.failed) — the exact path that regressed — and die if the gate widens back to
+// `kind === "idle"` alone.
+test("Part B: notifyOwner=real — an in-band BLOCKED (via thread.idle) still doorbells the captain", async () => {
+  const host = ownerHost({ notifyOwner: "real" });
+  await plugin(host.bb);
+  try {
+    stubRoutedHost(host, () => ({ code: 0 }));
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: null }));
+    host.harness.sdk.stub("threads.list", async () => []);
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await emitIdle(host, "BLOCKED: waiting on prod credentials, cannot proceed");
+    const sends = sendCalls(host).filter((s) => s.threadId === "thr_cap");
+    assert.equal(sends.length, 1, "a BLOCKED crew must still proactively reach the captain");
+    assert.match(sends[0]?.text ?? "", /BLOCKED: waiting on prod credentials/, sends[0]?.text);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("Part B: notifyOwner=real — an in-band FAILED (via thread.idle) still doorbells the captain", async () => {
+  const host = ownerHost({ notifyOwner: "real" });
+  await plugin(host.bb);
+  try {
+    stubRoutedHost(host, () => ({ code: 0 }));
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: null }));
+    host.harness.sdk.stub("threads.list", async () => []);
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await emitIdle(host, "FAILED: the migration is irrecoverable, aborting");
+    const sends = sendCalls(host).filter((s) => s.threadId === "thr_cap");
+    assert.equal(sends.length, 1, "a FAILED crew must still proactively reach the captain");
+    assert.match(sends[0]?.text ?? "", /FAILED: the migration is irrecoverable/, sends[0]?.text);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// Part C end-to-end: a needs-decision IS the one event whose full context (the decision to
+// answer) lives in the durable queue, so its real-mode doorbell keeps the drain hint.
+test("Part C: notifyOwner=real — a NEEDS DECISION doorbell keeps the drain hint (open decision lives in the queue)", async () => {
+  const host = ownerHost({ notifyOwner: "real", nudgeMaxPerCrew: 1, nudgeCooldownSeconds: 0 });
+  await plugin(host.bb);
+  try {
+    stubRoutedHost(host, () => ({ code: 0 }));
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: null }));
+    host.harness.sdk.stub("threads.list", async () => []);
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    // Prime the nudge ladder at the cap so the next verdict-less idle exhausts → NEEDS DECISION.
+    await host.bb.storage.kv.set("protocol-nudges", {
+      c1: { generation: "2026-09-18T00:00:00.000Z", count: 1, lastAt: 0, exhausted: false },
+    });
+    await emitIdle(host, "still working");
+    const captain = sendCalls(host).filter((s) => s.threadId === "thr_cap");
+    assert.equal(captain.length, 1, "the cap must surface NEEDS DECISION");
+    const text = captain[0]?.text ?? "";
+    assert.match(text, /NEEDS DECISION/, text);
     assert.match(text, /bb firstmate wake/, text);
-    assert.ok(!text.includes("crew wake(s) pending"), `must not be the old generic pointer: ${text}`);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// Part D: captain-facing views default to the CALLING captain's own crews. A shared register
+// with crews of many captains must not show captain A the crews owned by captain B; --all is the
+// explicit opt-in for the whole host.
+test("Part D: `crews` defaults to the calling captain's own crews; --all opts into host-wide", async () => {
+  const host = await load();
+  try {
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ status: "idle", environmentId: null }));
+    await host.bb.storage.kv.set("crews", [
+      crewRow("crewalpha", "thr_crewA", "thr_capA"),
+      crewRow("crewbravo", "thr_crewB", "thr_capB"),
+    ]);
+    // Captain A sees ONLY its own crew — reverting the listCrews owner filter shows crewbravo too.
+    const own = await host.harness.behavior.runCli(["crews"], { threadId: "thr_capA", projectId: "proj_1" });
+    assert.equal(own.exitCode, 0, own.stderr);
+    assert.match(own.stdout, /crewalpha/, own.stdout);
+    assert.doesNotMatch(own.stdout, /crewbravo/, `captain A must not see captain B's crew: ${own.stdout}`);
+    // --all is the explicit host-wide opt-in.
+    const all = await host.harness.behavior.runCli(["crews", "--all"], { threadId: "thr_capA", projectId: "proj_1" });
+    assert.equal(all.exitCode, 0, all.stderr);
+    assert.match(all.stdout, /crewalpha/, all.stdout);
+    assert.match(all.stdout, /crewbravo/, all.stdout);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// Part D empty-state: a captain running `crews` from a thread that dispatched nothing, while the
+// host DOES have crews under other threads, must not see a bare "No crews." that reads as an empty
+// fleet — it must say the view is scoped and name the --all opt-in.
+test("Part D: a cross-thread empty `crews` view is self-explaining (scoped + names --all), not a bare No crews.", async () => {
+  const host = await load();
+  try {
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ status: "idle", environmentId: null }));
+    // The only crews on the host belong to OTHER threads.
+    await host.bb.storage.kv.set("crews", [
+      crewRow("crewbravo", "thr_crewB", "thr_capB"),
+      crewRow("crewcharlie", "thr_crewC", "thr_capC"),
+    ]);
+    const own = await host.harness.behavior.runCli(["crews"], { threadId: "thr_capA", projectId: "proj_1" });
+    assert.equal(own.exitCode, 0, own.stderr);
+    // Not a bare "No crews." — it explains the scoping and names the opt-in (dies if the empty
+    // hint is dropped back to a bare "No crews.").
+    assert.match(own.stdout, /scoped to your own crews/, own.stdout);
+    assert.match(own.stdout, /--all/, own.stdout);
+    assert.doesNotMatch(own.stdout, /crewbravo/, "still must not leak other captains' crew ids");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// Item 2: `deck --all` genuinely opts into the whole host (the PR claimed deck supports --all).
+test("Part D: `deck --all` shows every captain's crews; default deck is scoped to this thread", async () => {
+  const host = await load();
+  try {
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ status: "idle", environmentId: null }));
+    host.harness.sdk.stub("threads.update", async () => ({}));
+    host.harness.sdk.stub("threads.updatePluginMetadata", async () => ({}));
+    await host.bb.storage.kv.set("crews", [
+      crewRow("crewalpha", "thr_crewA", "thr_capA"),
+      crewRow("crewbravo", "thr_crewB", "thr_capB"),
+    ]);
+    const scoped = await host.harness.behavior.runCli(["deck"], { threadId: "thr_capA", projectId: "proj_1" });
+    assert.equal(scoped.exitCode, 0, scoped.stderr);
+    assert.doesNotMatch(scoped.stdout, /crewbravo/, `default deck must be scoped to this thread: ${scoped.stdout}`);
+    const all = await host.harness.behavior.runCli(["deck", "--all"], { threadId: "thr_capA", projectId: "proj_1" });
+    assert.equal(all.exitCode, 0, all.stderr);
+    assert.match(all.stdout, /crewbravo/, `deck --all must show host-wide crews: ${all.stdout}`);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("Part D: the @crew mention menu is scoped to the composing captain's own crews", async () => {
+  const host = await load();
+  try {
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ status: "idle", environmentId: null }));
+    await host.bb.storage.kv.set("crews", [
+      crewRow("crewalpha", "thr_crewA", "thr_capA"),
+      crewRow("crewbravo", "thr_crewB", "thr_capB"),
+    ]);
+    const crewProvider = host.harness.registrations.mentionProviders.find((p) => p.id === "crew");
+    assert.ok(crewProvider, "the @crew mention provider must be registered");
+    const rows = await crewProvider!.search({ trigger: "@", query: "", projectId: "proj_1", threadId: "thr_capA" });
+    const ids = rows.map((r) => r.id);
+    assert.ok(ids.includes("crewalpha"), `captain A must see its own crew: ${ids.join(",")}`);
+    assert.ok(!ids.includes("crewbravo"), `captain A must not see captain B's crew in the mention menu: ${ids.join(",")}`);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -4438,6 +4643,41 @@ test("IT F1: notifyOwner=real — two DISTINCT crew reports both survive wake pr
     const after = await host.harness.behavior.runCli(["wake"], { threadId: "thr_cap", projectId: "proj_1" });
     assert.doesNotMatch(after.stdout, /REPORTONE/);
     assert.doesNotMatch(after.stdout, /REPORTTWO/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// IT Part B (live): the load-bearing safety property is the DURABLE QUEUE, not BB's delivery.
+// This drives the REAL fm-wake scripts (scratch FM_HOME): a suppressed plain DONE must still be
+// recoverable — the report survives in the durable queue and drains via `bb firstmate wake`, and
+// the queue entry names the crew even when the crew's own output is empty (so an empty/truncated
+// BB delivery can never open a silent hole). Proves suppression + no-loss together on real scripts.
+test("IT Part B: notifyOwner=real — a suppressed plain DONE is still recoverable from the durable queue (incl. empty output)", { skip: !FM_INTEGRATION }, async () => {
+  const home = scratchFmHome();
+  const host = itHost(home, { notifyOwner: "real" });
+  await plugin(host.bb);
+  try {
+    stubRealExecHost(host);
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+
+    // A plain DONE with an outcome: the chat doorbell is suppressed…
+    await emitIdle(host, "DONE: shipped clean REPORTDONE");
+    const capSends = sendCalls(host).filter((s) => s.threadId === "thr_cap");
+    assert.equal(capSends.length, 0, `a plain DONE must suppress the chat doorbell: ${capSends.map((s) => s.text).join(" | ")}`);
+
+    // …but the report provably survives in the durable queue and drains.
+    const present = await host.harness.behavior.runCli(["wake"], { threadId: "thr_cap", projectId: "proj_1" });
+    assert.equal(present.exitCode, 0, present.stderr);
+    assert.match(present.stdout, /REPORTDONE/, `suppressed report must survive the durable queue:\n${present.stdout}`);
+    // The entry names the crew, so an empty/truncated child output cannot make it anonymous.
+    assert.match(present.stdout, /c1/, present.stdout);
+    const m = /--ack-through (\d+) --recovery-generation (\S+)/.exec(present.stdout);
+    assert.ok(m, `no WAKE_ACK line in:\n${present.stdout}`);
+    const acked = await host.harness.behavior.runCli(["wake", "--ack-through", m[1]!, "--recovery-generation", m[2]!], { threadId: "thr_cap", projectId: "proj_1" });
+    assert.equal(acked.exitCode, 0, acked.stderr);
   } finally {
     await host.harness.lifecycle.dispose();
     rmSync(home, { recursive: true, force: true });
