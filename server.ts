@@ -321,8 +321,14 @@ export const CAPTAIN_WAKE_DRAIN_HINT =
 // a one-line outcome so the captain sees WHAT happened without a second `bb firstmate wake`,
 // while the full report stays in the durable queue. `head` already names the crew and status
 // (e.g. "✅ crew c1 done"); `summary` is the parsed outcome or a trimmed first line, or "".
-export function captainWakeDoorbell(head: string, summary: string): string {
-  return `🔔 ${head}${summary !== "" ? ` — ${summary}` : ""}\n${CAPTAIN_WAKE_DRAIN_HINT}`;
+// The drain hint is appended ONLY when draining surfaces something this line does not already
+// carry (drainHint=true) — never as a fixed footer. For a plain done/review the head+summary
+// plus the crew's own `next:` command is the complete actionable unit, so the "run bb firstmate
+// wake" footer was pure repetition; it is kept for an open decision, where the decision context
+// the captain must answer with genuinely lives in the durable queue, not in this one line.
+export function captainWakeDoorbell(head: string, summary: string, opts?: { drainHint?: boolean }): string {
+  const body = `🔔 ${head}${summary !== "" ? ` — ${summary}` : ""}`;
+  return opts?.drainHint === true ? `${body}\n${CAPTAIN_WAKE_DRAIN_HINT}` : body;
 }
 
 // Base FM_BACKEND=bb environment exports shared by every bb firstmate invocation
@@ -1477,7 +1483,18 @@ export default async function plugin(bb: BbPluginApi) {
     // Default kv is byte-for-byte the previous fire-and-forget behavior.
     const durable = (await settings.get()).notifyOwner === "real" ? await enqueueCaptainWake(crew, text) : false;
     const summary = outcome ?? (output !== null && output !== "" ? truncate(output.replace(/\n/g, " "), 160) : "");
-    const doorbell = durable ? captainWakeDoorbell(head, summary) : text;
+    // Part C: the drain hint adds something only when the durable queue holds context this
+    // doorbell does not already carry — an open decision the captain must answer. For a plain
+    // done/review/error the head+summary+next: line is self-sufficient.
+    const doorbell = durable ? captainWakeDoorbell(head, summary, { drainHint: kind === "needs-decision" }) : text;
+    // Part B: one crew completion must yield ONE captain message. In real mode a plain done
+    // (kind "idle": finished, no PR, no decision, no failure) is already surfaced twice more —
+    // BB's own child-output delivery to this parent thread AND the durable wake queue that the
+    // captain drains — so the plugin's own doorbell is pure duplication and is suppressed. The
+    // report is never lost: it provably survives in the durable queue (enqueued just above) and
+    // in BB's delivery. Only the redundant chat line is dropped. kv mode (no durable backstop)
+    // and every non-plain event (review/needs-decision/error/interaction/unknown) still doorbell.
+    const suppressRedundantDoorbell = durable && kind === "idle";
     if (quietHold || afkHold) {
       // The durable wake already persisted the report; do not also hold a redundant
       // doorbell (the captain drains the queue on return). KV path unchanged.
@@ -1501,7 +1518,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (evicted.length > 0) await publishFleet();
       return;
     }
-    await deliverToCaptain(parentThreadId, doorbell, crew.id);
+    if (!suppressRedundantDoorbell) await deliverToCaptain(parentThreadId, doorbell, crew.id);
     await publishFleet();
   }
 
@@ -2234,7 +2251,14 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  async function listCrews(): Promise<Crew[]> {
+  // Host-wide crew list: the shared KV register PLUS a sweep of every firstmate-origin
+  // thread on the host, and (opt-in) real state/<id>.meta read-through reconciliation.
+  // This is the register + eviction machinery and MUST stay host-wide — the supervisor's
+  // stuck-pass, read-through teardown and every by-id lookup depend on seeing all crews.
+  // Captain-facing VIEWS never call this directly; they call listCrews({ owner }) so one
+  // captain never sees another's crews by default (D8). Write/eviction is unchanged: the
+  // owner filter is a pure view over the returned array, applied after all KV writes.
+  async function listCrewsAll(): Promise<Crew[]> {
     const crews = await readCrews();
     const known = new Set(crews.map((c) => c.threadId));
     try {
@@ -2331,12 +2355,26 @@ export default async function plugin(bb: BbPluginApi) {
     return crews;
   }
 
+  // Captain-facing view over listCrewsAll. By default (an `owner` captain thread id is
+  // supplied) it returns ONLY that captain's crews (parentThreadId === owner), so `crews`,
+  // bearings, deck, session and the @crew mention menu never show another captain's work.
+  // `all: true` is the explicit opt-in that returns the whole host (e.g. `crews --all`).
+  // Omitting `owner` (no calling captain, e.g. an internal by-id lookup) also returns the
+  // whole host — this is a read-only view; the shared register and its eviction are untouched.
+  async function listCrews(opts?: { owner?: string; all?: boolean }): Promise<Crew[]> {
+    const crews = await listCrewsAll();
+    if (opts?.all === true) return crews;
+    const owner = opts?.owner;
+    if (owner === undefined || owner === "") return crews;
+    return crews.filter((c) => c.parentThreadId === owner);
+  }
+
   async function findCrew(id: string): Promise<Crew | undefined> {
-    return (await listCrews()).find((entry) => entry.id === id);
+    return (await listCrewsAll()).find((entry) => entry.id === id);
   }
 
   async function findCrewByThread(threadId: string): Promise<Crew | undefined> {
-    return (await listCrews()).find((entry) => entry.threadId === threadId);
+    return (await listCrewsAll()).find((entry) => entry.threadId === threadId);
   }
 
   function formatCrew(crew: Crew, status: string): string {
@@ -2856,7 +2894,7 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
 
-  async function bearingsSnapshot(): Promise<{
+  async function bearingsSnapshot(owner?: string): Promise<{
     text: string;
     json: Record<string, unknown>;
     rpc: {
@@ -2877,7 +2915,7 @@ export default async function plugin(bb: BbPluginApi) {
       supervision: boolean;
     };
   }> {
-    const tracked = (await listCrews()).slice(0, 20);
+    const tracked = (await listCrews({ owner })).slice(0, 20);
     const retired = await reconcileExternallyLanded(tracked);
     const crews = retired.size === 0 ? tracked : tracked.filter((c) => !retired.has(c.id));
     const rows = await Promise.all(
@@ -2994,7 +3032,7 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
 
-  async function sessionDigest(): Promise<string> {
+  async function sessionDigest(owner?: string): Promise<string> {
     // D3: recall must reflect the authoritative files, not the KV cache. When
     // memoryOwner=real, memoryShow reads data/captain.md + data/learnings.md
     // directly (and degrades to KV only if the host read fails), so /captain,
@@ -3004,7 +3042,7 @@ export default async function plugin(bb: BbPluginApi) {
     const capText = mem.captain !== "" ? mem.captain : "(empty)";
     const learnText = mem.learnings !== "" ? mem.learnings : "(empty)";
     const afk = await readAfk();
-    const snap = await bearingsSnapshot();
+    const snap = await bearingsSnapshot(owner);
     return [
       "== session ==",
       `afk: ${afk?.on === true ? `on since ${afk.since}` : "off"} · quiet: ${(await isQuiet()) ? "on" : "off"}`,
@@ -3707,7 +3745,8 @@ export default async function plugin(bb: BbPluginApi) {
   // native KV digest explicitly labelled as a cache/fallback view.
   async function deckDigest(ctx: unknown, signal: AbortSignal | undefined): Promise<string> {
     const realBearings = await realBearingsForDeck(ctx, signal);
-    const native = await sessionDigest();
+    // The calling thread IS the captain — scope the native/KV digest to its own crews.
+    const native = await sessionDigest(ctxString(ctx, "threadId"));
     const nativeBlock = realBearings === ""
       ? native
       : ["== native digest (BB KV cache / fallback) ==", native].join("\n");
@@ -4737,14 +4776,23 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  // R2: only fm-watch's ACTIONABLE page lines (signal: a wedge/steering re-ring,
-  // stale: a heartbeat backstop). check:/heartbeat/watcher: are routine high-rate
-  // trace and must never be relayed to the captain. Newest few only.
+  // R2/D-noise: relay ONLY fm-watch's stale: page lines. A stale: line is the
+  // wedge/outage backstop — a genuinely stuck crew, an unread steering instruction,
+  // or an unwritable-bookkeeping outage — and every wedge/escalation variant fm-watch
+  // prints (see bin/fm-watch.sh header) begins with "stale:", so this keeps every
+  // actionable condition. A signal: line is the OTHER thing: it is only a list of
+  // state/<id>.status file PATHS meaning "a status file changed" — a routine turn-end
+  // pointer whose captain-relevant content (done/blocked/needs-decision) is ALREADY
+  // delivered as a human line by notifyCaptain (thread.idle/failed → doorbell) and
+  // persisted in the durable wake queue. Relaying the raw path list on top of that is
+  // pure duplication that tells the captain nothing, so it is dropped. check:/heartbeat/
+  // watcher: are routine high-rate trace and are likewise never chat-relayed (they drive
+  // the durable queue). Newest few only.
   function extractWatchReasons(logTail: string): string[] {
     return logTail
       .split(/\r?\n/)
       .map((l) => l.trim())
-      .filter((l) => /^(signal:|stale:)/.test(l))
+      .filter((l) => /^stale:/.test(l))
       .slice(-8);
   }
 
@@ -4883,7 +4931,7 @@ export default async function plugin(bb: BbPluginApi) {
     const now = Date.now();
     const rebase = !stuckRebased && (typeof lastPassAt !== "number" || now - lastPassAt > intervalMs);
     stuckRebased = true;
-    const crews = (await listCrews())
+    const crews = (await listCrewsAll())
       .filter((c) => c.parentThreadId !== null && !isSecondmateRoute(c))
       .slice(0, MAX_CREWS);
     const parsed = watchStateSchema.safeParse(await bb.storage.kv.get<unknown>("watch"));
@@ -5163,10 +5211,10 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.agents.registerTool({
     name: "firstmate_bearings",
-    description: "Fleet digest: Captain's Call, Recently Landed, Ready, Underway, Charted Next.",
-    parameters: z.object({}),
-    async execute() {
-      return (await bearingsSnapshot()).text;
+    description: "Fleet digest: Captain's Call, Recently Landed, Ready, Underway, Charted Next. Your own crews by default; pass all=true to see every captain's crews on the host.",
+    parameters: z.object({ all: z.boolean().optional().describe("Show every captain's crews host-wide, not just your own") }),
+    async execute({ all }, ctx) {
+      return (await bearingsSnapshot(all === true ? undefined : ctxString(ctx, "threadId"))).text;
     },
   });
 
@@ -5419,7 +5467,7 @@ export default async function plugin(bb: BbPluginApi) {
         await writeAfk({ on: false, words: "", since: new Date().toISOString(), held: [] });
         await projectAfkOff();
         const held = prev?.held ?? [];
-        const snap = await bearingsSnapshot();
+        const snap = await bearingsSnapshot(ctxString(ctx, "threadId"));
         return [
           "== return brief ==",
           snap.text,
@@ -5455,10 +5503,10 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.agents.registerTool({
     name: "firstmate_crews",
-    description: "List recorded crews with live thread status.",
-    parameters: z.object({}),
-    async execute() {
-      const crews = (await listCrews()).slice(0, 20);
+    description: "List recorded crews with live thread status. Your own crews by default; pass all=true to see every captain's crews on the host.",
+    parameters: z.object({ all: z.boolean().optional().describe("Show every captain's crews host-wide, not just your own") }),
+    async execute({ all }, ctx) {
+      const crews = (await listCrews({ owner: ctxString(ctx, "threadId"), all: all === true })).slice(0, 20);
       if (crews.length === 0) return "No crews.";
       const rows = await Promise.all(crews.map(async (crew) => formatCrew(crew, await crewStatus(crew))));
       return rows.join("\n");
@@ -5467,10 +5515,10 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.agents.registerTool({
     name: "firstmate_session",
-    description: "Session digest: memory, bearings, afk/quiet.",
-    parameters: z.object({}),
-    async execute() {
-      return sessionDigest();
+    description: "Session digest: memory, bearings, afk/quiet. Your own crews by default; pass all=true to see every captain's crews on the host.",
+    parameters: z.object({ all: z.boolean().optional().describe("Show every captain's crews host-wide, not just your own") }),
+    async execute({ all }, ctx) {
+      return sessionDigest(all === true ? undefined : ctxString(ctx, "threadId"));
     },
   });
 
@@ -5818,6 +5866,10 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.rpc.register(rpcContract, {
     async fleet() {
+      // Host-wide: the fleet RPC input carries no caller thread id (rpc.ts fleet.input is
+      // z.null()), so this panel cannot be owner-scoped without a contract change. The
+      // agent/CLI surfaces the captain reads (crews, bearings, deck, session, @crew) are
+      // owner-scoped; scoping this panel is a follow-up that needs a threadId on the RPC.
       return (await bearingsSnapshot()).rpc;
     },
   });
@@ -5826,8 +5878,10 @@ export default async function plugin(bb: BbPluginApi) {
     id: "crew",
     label: "Crews",
     triggers: ["@"],
-    async search({ query }) {
-      const crews = (await listCrews()).slice(0, 20);
+    async search({ query, threadId }) {
+      // Scope the menu to the composing captain's own crews (threadId is the composer's
+      // thread); null before the composer commits one → host-wide fallback.
+      const crews = (await listCrews({ owner: threadId ?? undefined })).slice(0, 20);
       const q = query.toLowerCase();
       return crews
         .filter((c) => q === "" || c.id.includes(q) || c.task.toLowerCase().includes(q))
@@ -6180,7 +6234,7 @@ export default async function plugin(bb: BbPluginApi) {
             );
           }
           case "session": {
-            const digest = await sessionDigest();
+            const digest = await sessionDigest(flags.has("all") ? undefined : ctxThread);
             return reply({ digest }, digest);
           }
           case "init": {
@@ -6269,7 +6323,8 @@ export default async function plugin(bb: BbPluginApi) {
             );
           }
           case "crews": {
-            const crews = (await listCrews()).slice(0, 20);
+            // Your own crews by default (calling captain = ctxThread); --all opts into host-wide.
+            const crews = (await listCrews({ owner: ctxThread, all: flags.has("all") })).slice(0, 20);
             const rows = await Promise.all(crews.map(async (crew) => ({ ...crew, status: await crewStatus(crew) })));
             return reply(rows, rows.length === 0 ? "No crews." : rows.map((row) => formatCrew(row, row.status)).join("\n"));
           }
@@ -6393,7 +6448,7 @@ export default async function plugin(bb: BbPluginApi) {
             return reply({ marked: true, threadId: id, shape, task: taskId || null }, `Marked thread ${id} as ${shape} crew.`);
           }
           case "bearings": {
-            const snap = await bearingsSnapshot();
+            const snap = await bearingsSnapshot(flags.has("all") ? undefined : ctxThread);
             return reply(snap.json, snap.text);
           }
           case "wake": {
@@ -6496,7 +6551,7 @@ export default async function plugin(bb: BbPluginApi) {
               const prev = await readAfk();
               await writeAfk({ on: false, words: "", since: new Date().toISOString(), held: [] });
               await projectAfkOff();
-              const snap = await bearingsSnapshot();
+              const snap = await bearingsSnapshot(ctxThread);
               const held = prev?.held ?? [];
               const text = [
                 "== return brief ==",
