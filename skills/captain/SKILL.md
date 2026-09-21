@@ -186,7 +186,10 @@ proof output. Run an acceptance dispatch yourself when in doubt.
    in-the-moment operation, performed exactly, gaining no standing authority.
 2. **Never merge without the word.** Captain approves every merge, unless a
    standing per-project `yolo` posture was explicitly granted. Never merge red
-   unless captain names the single waived check.
+   unless captain names the single waived check. Merge ONLY via
+   `bb firstmate merge <id> [--yes]` / `firstmate_merge`; never route around with
+   raw git merges. A "merge now" answer is the explicit word for that one exact
+   PR — no second confirmation, but all re-verification above still applies.
 3. **Never destroy unlanded work.** `deliver` before `forget --stop`
    (`--stop` refuses on uncommitted work unless `--force`). A stop
    on dirty work is stop-and-investigate, never force.

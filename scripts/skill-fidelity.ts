@@ -37,6 +37,11 @@ import { join, dirname } from "node:path";
 import { execFileSync } from "node:child_process";
 
 const MAX_FENCE_SENTENCES = 6;
+// Total fenced sentences allowed per skill. Bounds the "mint many small fences"
+// bypass of the per-fence cap (break 7C): a skill cannot carry an unbounded
+// amount of fenced BB text however it is split. Limit: a legitimately BB-heavy
+// skill is capped here; raise deliberately if a real one needs it.
+const MAX_FENCED_SENTENCES_PER_SKILL = 10;
 
 // BB-specific tokens. A BB-ONLY fenced sentence must contain at least one, so it
 // is provably about BB mechanics rather than free prose. Matched on normalized
@@ -51,7 +56,17 @@ const BB_TOKENS: RegExp[] = [
   /\bdeliver\b/,
 ];
 
-export type Diverge = { native: string; nativeQuote: string; bb: string; reason: string; line: number };
+export type Diverge = { native: string; nativeQuote: string; bb: string; reason: string; line: number; endLine: number };
+
+// The actual BB tokens a string carries (matched strings, e.g. "firstmate_afk"
+// vs "firstmate_bearings" are distinct), so a marker and its fence can be checked
+// for a shared, specific BB vocabulary rather than a shared regex.
+function bbTokenSet(s: string): Set<string> {
+  const n = normalize(s);
+  const out = new Set<string>();
+  for (const re of BB_TOKENS) for (const m of n.matchAll(new RegExp(re.source, "g"))) out.add(m[0]);
+  return out;
+}
 export type Fence = { reason: string; inner: string; openLine: number; closeLine: number };
 
 export type Skill = {
@@ -134,6 +149,7 @@ export function scanSkill(repoRoot: string, rel: string): Skill {
         bb: field(body, "bb") ?? "",
         reason: field(body, "reason") ?? "",
         line: startLine,
+        endLine,
       });
       for (let l = startLine; l <= endLine; l++) divergeLines.add(l);
     }
@@ -208,16 +224,34 @@ function nearestNonBlankBelow(line: number, blank: Set<number>, max: number): nu
 // Constrain BB-ONLY fences: reason, size, BB-anchoring, and adjacency to a
 // load-bearing BB-DIVERGE. (native-content-in-fence is checked in
 // validateAgainstSnapshot, which has the snapshot.)
+function divergeCoveringLine(s: Skill, line: number): Diverge | null {
+  if (line <= 0) return null;
+  for (const d of s.diverges) if (line >= d.line && line <= d.endLine) return d;
+  return null;
+}
+
 export function validateFences(skills: Skill[]): Problem[] {
   const problems: Problem[] = [];
   for (const s of skills) {
-    const totalLines = s.rendered ? Math.max(...[...s.blankLines, 0]) : 0;
-    void totalLines;
     const maxLine = Math.max(0, ...s.fences.map((f) => f.closeLine), ...[...s.divergeLines], ...[...s.blankLines]);
+
+    // Distinct anchors: a native-quote may not be reused across BB-DIVERGE
+    // markers in one skill, so a valid anchor cannot be cloned to mint fences.
+    const seenQuotes = new Map<string, number>();
+    for (const d of s.diverges) {
+      if (!d.nativeQuote) continue;
+      const key = normalize(d.nativeQuote);
+      if (seenQuotes.has(key))
+        problems.push({ skill: s.path, line: d.line, msg: `BB-DIVERGE native-quote reused (also line ${seenQuotes.get(key)}); each anchor must be distinct so a valid quote cannot mint extra fences` });
+      else seenQuotes.set(key, d.line);
+    }
+
+    let fencedTotal = 0;
     for (const f of s.fences) {
       if (f.reason.replace(/[^a-z]/gi, "").length < 8)
         problems.push({ skill: s.path, line: f.openLine, msg: "BB-ONLY reason is empty or too short (must be a structured, non-empty reason)" });
       const inner = sentences(f.inner);
+      fencedTotal += inner.length;
       if (inner.length === 0)
         problems.push({ skill: s.path, line: f.openLine, msg: "BB-ONLY fence has no substantive sentence (fence something real, or drop it)" });
       if (inner.length > MAX_FENCE_SENTENCES)
@@ -225,13 +259,24 @@ export function validateFences(skills: Skill[]): Problem[] {
       for (const sent of inner)
         if (!BB_TOKENS.some((re) => re.test(sent)))
           problems.push({ skill: s.path, line: f.openLine, msg: `BB-ONLY sentence is not BB-anchored (no BB tool/command token) — free prose cannot hide in a fence: ${JSON.stringify(sent.slice(0, 80))}` });
+
       // Load-bearing: an adjacent BB-DIVERGE must authorise the fence.
       const above = nearestNonBlankAbove(f.openLine, s.blankLines);
       const below = nearestNonBlankBelow(f.closeLine, s.blankLines, maxLine);
-      const authorised = (above > 0 && s.divergeLines.has(above)) || (below > 0 && s.divergeLines.has(below));
-      if (!authorised)
+      const marker = divergeCoveringLine(s, above) ?? divergeCoveringLine(s, below);
+      if (!marker) {
         problems.push({ skill: s.path, line: f.openLine, msg: "BB-ONLY fence is not authorised by an adjacent BB-DIVERGE (delete the marker and the fence must fail)" });
+      } else {
+        // The authorising marker's bb: must describe THIS fence — they must share
+        // a BB vocabulary token, so a marker cannot rubber-stamp an unrelated fence.
+        const shared = [...bbTokenSet(marker.bb)].some((t) => bbTokenSet(f.inner).has(t));
+        if (!shared)
+          problems.push({ skill: s.path, line: f.openLine, msg: `authorising BB-DIVERGE (line ${marker.line}) 'bb:' shares no BB token with the fence it authorises — the marker must describe its fence` });
+      }
     }
+
+    if (fencedTotal > MAX_FENCED_SENTENCES_PER_SKILL)
+      problems.push({ skill: s.path, msg: `too much fenced BB-ONLY content (${fencedTotal} sentences > ${MAX_FENCED_SENTENCES_PER_SKILL} per skill); splitting into more fences does not raise the bound` });
   }
   return problems;
 }

@@ -225,9 +225,11 @@ checker constrains it so a rewrite cannot hide inside one:
 
 Every fence must satisfy all of:
 
-- **Adjacent `BB-DIVERGE`.** A fence must sit next to a `BB-DIVERGE` that names the
-  native it replaces. This makes the marker *load-bearing*: delete it and the fence
-  fails. (Fixes the hole where a `BB-DIVERGE` was decorative.)
+- **Adjacent `BB-DIVERGE` that describes the fence.** A fence must sit next to a
+  `BB-DIVERGE` that names the native it replaces, and that marker's `bb:` field must
+  share a BB token with the fence it authorises — so a marker cannot rubber-stamp a
+  fence it does not describe. This makes the marker *load-bearing*: delete it and the
+  fence fails. (Fixes the hole where a `BB-DIVERGE` was decorative.)
 - **BB-anchored per sentence.** Every sentence inside the fence must carry a token
   from the BB allow-list (`firstmate_*`, `bb firstmate`, `supervision on`,
   `Ready to review`, `--grant`/`--resolve-key`/`--yes`/`--allow-red`, `/afk` … ,
@@ -235,8 +237,11 @@ Every fence must satisfy all of:
   closes the "wrap a rewrite in a fence" hole.
 - **No native-derived content.** A sentence that resolves verbatim in native may not
   be fenced; un-fence it so it is actually checked.
-- **Bounded + structured reason.** At most six sentences per fence, and a non-empty
-  reason of real length. A fence cannot grow into a parallel skill.
+- **Bounded per fence AND per skill.** At most six sentences per fence, and at most
+  ten fenced sentences per skill total — so the per-fence cap cannot be dodged by
+  minting many small fences. Each authorising marker's `native-quote` must also be
+  distinct, so a valid anchor cannot be cloned to mint fences. The reason must be
+  non-empty and of real length. A fence cannot grow into a parallel skill.
 
 The reason must be a real environmental constraint (no tmux pane, no composer to
 read, BB threads not windows, no blocking stop hook, a tool that folds two native
@@ -245,12 +250,17 @@ reason — copy native's wording instead.
 
 **What the check can and cannot catch (be honest).** It catches every *unmarked*
 divergence, every *unfenced* non-native sentence, an anchor that stops resolving,
-native content smuggled into a fence, and any fenced sentence with no BB token — so
-the reviewer's "wrap the rewrite in a fence" escape and "delete the marker" escape
-both now fail. It does **not** semantically judge prose: a lie welded into a single
-sentence that also references a real BB tool would carry a token and pass the token
-gate. That residue is a human-review responsibility; the check makes casual and
-fenced drift fail loudly, not every conceivable adversarial sentence.
+native content smuggled into a fence, any fenced sentence with no BB token, a fence
+whose marker does not describe it, and fence-count/size inflation (per fence, per
+skill, and anchor reuse) — so the "wrap the rewrite in a fence", "delete the
+marker", and "mint many small fences" escapes all fail. It does **not** semantically
+judge prose: a fabricated claim welded into a single sentence that also references a
+real BB tool (or the same lie split across token-bearing clauses) carries a token
+and passes the vocabulary gate. That residue is a human-review responsibility —
+widening the token rules to chase it would only produce false failures. The check
+makes casual and fenced drift fail loudly and shrinks the reviewer's job to reading
+a few labelled, bounded fences and judging whether each reason is true; it does not
+catch every conceivable adversarial sentence.
 
 Do **not** import native instructions that would mislead a BB crew (tmux/herdr pane
 mechanics, keystroke injection, the away daemon) just to raise a fidelity number.
