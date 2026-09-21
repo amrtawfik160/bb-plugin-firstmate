@@ -2262,6 +2262,178 @@ test("real transport never double-spawns when the meta already has a thread", as
   }
 });
 
+// Record-after-spawn race: the real transport learns the thread id only after
+// fm-spawn.sh returns (~30s), and a fast crew can end its first turn — firing
+// thread.idle/thread.failed — before writeCrews persists that id. At that instant
+// findCrewByThread returns undefined and the live event is dropped for good, so the
+// captain gets no doorbell and no durable wake. `status`/`output` are what the
+// worker thread reports by the time dispatch finishes recording the crew.
+function stubRaceHost(
+  host: Awaited<ReturnType<typeof load>>,
+  opts: { status: string; output: string; threadIdAfterSpawn?: string },
+) {
+  host.harness.sdk.stub("threadSections.list", async () => []);
+  host.harness.sdk.stub("threadSections.create", async () => ({ id: "sec_crews" }));
+  host.harness.sdk.stub("environments.list", async () => [
+    { hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" },
+  ]);
+  host.harness.sdk.stub("environments.get", async () => ({
+    id: "env_wt", hostId: "host_1", path: "/wt", isWorktree: true, status: "ready",
+  }));
+  host.harness.sdk.stub("threads.list", async () => []);
+  host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+  host.harness.sdk.stub("threads.send", async () => ({}));
+  host.harness.sdk.stub("threads.events.list", async () => []);
+  host.harness.sdk.stub("threads.get", async () =>
+    makeThreadResponse({ id: opts.threadIdAfterSpawn ?? "thr_real", status: opts.status, environmentId: "env_wt" }),
+  );
+  host.harness.sdk.stub("threads.output", async () => ({ output: opts.output }));
+  const cmds = new Map<string, string>();
+  const seen: string[] = [];
+  let n = 0;
+  let spawned = false;
+  host.harness.sdk.stub("terminals.create", async (args: { start?: { command?: string } }) => {
+    const id = `term_${++n}`;
+    const cmd = args.start?.command ?? "";
+    cmds.set(id, cmd);
+    seen.push(cmd);
+    return { id };
+  });
+  host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+  host.harness.sdk.stub("terminals.close", async () => ({}));
+  host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
+    const cmd = cmds.get(args.terminalId) ?? "";
+    if (cmd.includes("fm-spawn.sh")) {
+      spawned = true;
+      return hostRcPayload("", 0);
+    }
+    if (cmd.includes("bb_thread_id")) {
+      const tid = spawned ? (opts.threadIdAfterSpawn ?? "thr_real") : "";
+      return hostRcPayload(tid === "" ? "FM_META_ABSENT" : tid, 0);
+    }
+    return hostRcPayload("", 0);
+  });
+  return { seen };
+}
+
+test("reconcile: a BLOCKED crew idle before its record existed still doorbells the captain", async () => {
+  const host = realHost();
+  await plugin(host.bb);
+  try {
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    const blocked = "BLOCKED: cannot proceed — the captain expects this";
+    stubRaceHost(host, { status: "idle", output: blocked });
+    // The live thread.idle the fast crew fired lands BEFORE the record exists: no
+    // crew owns thr_real yet, so it is dropped (this must NOT prime any dedup guard).
+    const dropped = await host.harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: "thr_real", status: "idle", projectId: "proj_1" }),
+      lastAssistantText: blocked,
+    });
+    assert.deepEqual(dropped.errors, []);
+    assert.equal(sendCalls(host).filter((s) => s.threadId === "thr_cap").length, 0, "dropped live event must not reach the captain");
+    const result = await host.harness.behavior.runCli(
+      ["dispatch", "--project", "proj_1", "--shape", "scout", "--", "Captain's intent: verify blocked alert"],
+      { projectId: "proj_1", threadId: "thr_cap" },
+    );
+    assert.equal(result.exitCode, 0, result.stderr);
+    const captain = sendCalls(host).filter((s) => s.threadId === "thr_cap");
+    assert.equal(captain.length, 1, "reconcile must deliver exactly one captain alert");
+    assert.match(captain[0]?.text ?? "", /BLOCKED: cannot proceed/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("reconcile: an in-band FAILED verdict on a fast crew also reaches the captain", async () => {
+  const host = realHost();
+  await plugin(host.bb);
+  try {
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    stubRaceHost(host, { status: "idle", output: "FAILED: build broke — see log" });
+    const result = await host.harness.behavior.runCli(
+      ["dispatch", "--project", "proj_1", "--shape", "scout", "--", "Captain's intent: verify failed alert"],
+      { projectId: "proj_1", threadId: "thr_cap" },
+    );
+    assert.equal(result.exitCode, 0, result.stderr);
+    const captain = sendCalls(host).filter((s) => s.threadId === "thr_cap");
+    assert.equal(captain.length, 1);
+    assert.match(captain[0]?.text ?? "", /FAILED: build broke/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("reconcile: notifyOwner=real enqueues the durable wake for a raced BLOCKED crew", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", transport: "real", queueOwner: "real", notifyOwner: "real", supervisionEnabled: true },
+  });
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRaceHost(host, { status: "idle", output: "BLOCKED: needs a secret" });
+    const result = await host.harness.behavior.runCli(
+      ["dispatch", "--project", "proj_1", "--shape", "scout", "--", "Captain's intent: verify durable wake"],
+      { projectId: "proj_1", threadId: "thr_cap" },
+    );
+    assert.equal(result.exitCode, 0, result.stderr);
+    const crewId = crewIdFromStdout(result.stdout);
+    assert.ok(
+      seen.some((c) => c.includes("fm_wake_append") && c.includes(`${crewId}.status`)),
+      `no durable wake enqueued for ${crewId}: ${seen.join(" | ")}`,
+    );
+    // The BLOCKED alert is not a plain DONE, so it also rings the doorbell.
+    assert.equal(sendCalls(host).filter((s) => s.threadId === "thr_cap").length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("reconcile: a still-active crew at dispatch is not prematurely reported", async () => {
+  const host = realHost();
+  await plugin(host.bb);
+  try {
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    stubRaceHost(host, { status: "active", output: "still working" });
+    const result = await host.harness.behavior.runCli(
+      ["dispatch", "--project", "proj_1", "--shape", "scout", "--", "Captain's intent: long job"],
+      { projectId: "proj_1", threadId: "thr_cap" },
+    );
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(sendCalls(host).filter((s) => s.threadId === "thr_cap").length, 0, "an active crew must not trigger a terminal alert");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("reconcile: does not wedge the live path — a later thread.idle still reaches the captain", async () => {
+  const host = realHost();
+  await plugin(host.bb);
+  try {
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    const blocked = "BLOCKED: waiting on approval";
+    stubRaceHost(host, { status: "idle", output: blocked });
+    const result = await host.harness.behavior.runCli(
+      ["dispatch", "--project", "proj_1", "--shape", "scout", "--", "Captain's intent: verify no double"],
+      { projectId: "proj_1", threadId: "thr_cap" },
+    );
+    assert.equal(result.exitCode, 0, result.stderr);
+    // Reconcile already delivered once during dispatch.
+    assert.equal(sendCalls(host).filter((s) => s.threadId === "thr_cap").length, 1);
+    // A live thread.idle now arriving for the SAME crew/thread must still be handled
+    // by the live path (the record exists) — proving the reconcile did not wedge the
+    // live path — but it is a distinct turn-end, so this asserts the paths coexist.
+    const live = await host.harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: "thr_real", status: "idle", projectId: "proj_1" }),
+      lastAssistantText: blocked,
+    });
+    assert.deepEqual(live.errors, []);
+    assert.equal(sendCalls(host).filter((s) => s.threadId === "thr_cap").length, 2, "the live path stays live once the record exists");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 // C1: a real-transport dispatch that lets us tune the tasks-axi add exit code, the
 // fm-spawn exit, the bb_thread_id the meta carries afterwards, and the orphan-list
 // contents. Records every host command in `seen` so ordering (add BEFORE spawn)

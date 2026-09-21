@@ -2532,6 +2532,10 @@ export default async function plugin(bb: BbPluginApi) {
           crew.backlogRow = true;
           await writeCrews([crew, ...(await readCrews())]);
           await publishFleet();
+          // fm-spawn ran ~30s while this crew may already have ended its first turn;
+          // its thread.idle/failed fired before this record carried the threadId and
+          // was dropped. Now that the record exists, catch that missed terminal.
+          await reconcileCrewTerminal(crew).catch(() => {});
           // The real fm-spawn.sh already wrote state/<id>.meta + the brief; the
           // native publishFmMeta/publishFmBrief backfills would only duplicate.
           return crew;
@@ -2601,6 +2605,10 @@ export default async function plugin(bb: BbPluginApi) {
       await writeCrews((await readCrews()).map((c) => (c.id === crew.id ? crew : c)));
     }
     await publishFmBrief(crew, hostId, input.task);
+    // Same record-after-spawn race as the real transport, though the native window
+    // is far smaller. Skip a future-scheduled send: its thread sits idle until sendAt
+    // and has not run yet, so its "idle" is not a turn-end to report.
+    if (!scheduled) await reconcileCrewTerminal(crew).catch(() => {});
     return crew;
   }
 
@@ -6115,6 +6123,65 @@ export default async function plugin(bb: BbPluginApi) {
     await applyProtocolNudge(crew);
   }
 
+  // A crew's worker thread can reach idle/error BEFORE its record carries its
+  // threadId: the real transport spawns through fm-spawn.sh (~30s) and only learns
+  // the thread id — the moment writeCrews can persist it — after that returns, while
+  // a fast crew has long since ended its first turn. The live thread.idle/
+  // thread.failed handlers fire at that earlier instant, findCrewByThread returns
+  // undefined, and the event is dropped; BB never replays it, so notifyCaptain is
+  // never reached — no captain doorbell and no durable wake. reconcileCrewTerminal
+  // (run once at the end of dispatch, after the record lands) catches that missed
+  // terminal. This set lets it skip a thread whose terminal a live event DID handle,
+  // so the two paths never double-notify in the narrow window where the idle instead
+  // lands just after the record. (Live handlers only ADD to it; they never dedup on
+  // it — repeated same-turn idles must each still nudge/ping as before.)
+  const liveTerminalHandled = new Set<string>();
+
+  async function handleCrewIdle(
+    crew: Crew,
+    thread: { id: string; status: string; runtime?: { displayStatus?: string } },
+    lastAssistantText: string | null,
+  ): Promise<void> {
+    if (isSecondmateRoute(crew)) return;
+    const stopped = await turnWasStopped(thread);
+    if (!stopped && !hasStatusProtocol(lastAssistantText)) {
+      const outcome = await applyProtocolNudge(crew);
+      if (outcome !== "off") return;
+    }
+    const current = await settings.get();
+    if (current.supervisionEnabled !== true) return;
+    await notifyCaptain(crew, "idle", lastAssistantText);
+  }
+
+  async function handleCrewFailed(crew: Crew, error: string | null): Promise<void> {
+    if (isSecondmateRoute(crew)) return;
+    const current = await settings.get();
+    if (current.supervisionEnabled !== true) return;
+    await notifyCaptain(crew, "error", error);
+  }
+
+  // Backstop for the record-after-spawn race described on liveTerminalHandled: once
+  // dispatch has recorded the crew (threadId set), re-check the thread's live state
+  // and drive the same handler a dropped live event would have. A no-op unless the
+  // thread is already terminal right now and no live event beat us to it.
+  async function reconcileCrewTerminal(crew: Crew): Promise<void> {
+    if (crew.parentThreadId === null || isSecondmateRoute(crew) || crew.threadId === "") return;
+    if (liveTerminalHandled.has(crew.threadId)) return;
+    let thread: { id: string; status: string; runtime?: { displayStatus?: string } };
+    try {
+      thread = await bb.sdk.threads.get({ threadId: crew.threadId });
+    } catch {
+      return;
+    }
+    // A live event may have landed while we were fetching — re-check before firing.
+    if (liveTerminalHandled.has(crew.threadId)) return;
+    if (thread.status === "idle") {
+      await handleCrewIdle(crew, thread, await crewOutput(crew));
+    } else if (thread.status === "error") {
+      await handleCrewFailed(crew, (await crewOutput(crew)) ?? "crew thread ended in error");
+    }
+  }
+
   bb.events.on("thread.created", async ({ thread }) => {
     if (!isCaptainSpawn(thread)) return;
     await settleDeck(thread.id);
@@ -6129,21 +6196,14 @@ export default async function plugin(bb: BbPluginApi) {
     await captainTurnEndGuard(thread.id).catch(() => {});
     const crew = await findCrewByThread(thread.id);
     if (crew === undefined || isSecondmateRoute(crew)) return;
-    const stopped = await turnWasStopped(thread);
-    if (!stopped && !hasStatusProtocol(lastAssistantText)) {
-      const outcome = await applyProtocolNudge(crew);
-      if (outcome !== "off") return;
-    }
-    const current = await settings.get();
-    if (current.supervisionEnabled !== true) return;
-    await notifyCaptain(crew, "idle", lastAssistantText);
+    liveTerminalHandled.add(thread.id);
+    await handleCrewIdle(crew, thread, lastAssistantText);
   });
   bb.events.on("thread.failed", async ({ thread, error }) => {
-    const current = await settings.get();
-    if (current.supervisionEnabled !== true) return;
     const crew = await findCrewByThread(thread.id);
     if (crew === undefined || isSecondmateRoute(crew)) return;
-    await notifyCaptain(crew, "error", error);
+    liveTerminalHandled.add(thread.id);
+    await handleCrewFailed(crew, error);
   });
   bb.events.on("interaction.pending", async ({ thread }) => {
     const current = await settings.get();
