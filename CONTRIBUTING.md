@@ -114,6 +114,31 @@ Reject these on sight — each one passed review here and then failed live:
   harmless while disabled says nothing about whether it works when turned on.
   "Off by default" is never a substitute for "proven on".
 
+## Differential drift guard (ports of native shell logic)
+
+`lib/policy.ts` hand-ports pieces of `fm-classify-lib.sh` (notably
+`foldOpenDecisions` ← `status_open_decisions`). A hand port drifts **silently**:
+the TS keeps compiling and the unit tests keep passing while the plugin quietly
+disagrees with the real watcher/bearings. Once already shipped: the fold omitted
+native's ship/scout terminal-collapse, so a retired crew surfaced a *phantom*
+open decision (false NEEDS-DECISION, hidden ready crew) — and a unit test pinned
+the wrong answer.
+
+The defence is a **differential test**, not more unit tests:
+`lib/policy.differential.test.ts` runs our fold and the **real** shell
+`status_open_decisions` over one crafted `.status` corpus and fails on any
+divergence, across every task kind (ship/scout collapse, secondmate/unknown do
+not). Extend the corpus whenever you touch the fold or find a new native edge.
+
+- It drives the script at `FM_CLASSIFY_LIB` (default
+  `/root/firstmate/bin/fm-classify-lib.sh`). On a host **with** native it runs and
+  proves equivalence; **without** native it **skips** (never a false green).
+- It is part of `npm test`. To force it against a specific native copy:
+  `FM_CLASSIFY_LIB=/path/to/fm-classify-lib.sh npm test`.
+- New port helper, or a behaviour you "improved" over native? The contract is
+  **equivalence**, not improvement — add the case to the corpus and make both
+  folds agree.
+
 ## Docs and ADRs
 
 - [`CONTEXT.md`](CONTEXT.md) is the glossary — terms only, no implementation

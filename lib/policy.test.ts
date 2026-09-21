@@ -203,37 +203,55 @@ test("looksReadOnly hints scout", () => {
 
 // ── Full status protocol fold (mirrors fm-classify-lib.sh) ────────────────────
 
-test("foldOpenDecisions matches fm-classify-lib: keyed open/close, corr, reserved keys", () => {
+test("foldOpenDecisions matches fm-classify-lib: keyed open/close, corr, reserved keys, terminal collapse", () => {
   const stream = [
     "working: starting",
     "needs-decision [key=api-shape]: rename or keep?",
     "working: still going",
     "needs-decision: [key=db] pick postgres or sqlite",
     "blocked corr=0123456789abcdef [key=creds]: need token",
-    "done: finished",
-    "resolved [key=db] we chose sqlite", // note-head/no-colon closer for db
+    "done: finished", // ship/scout terminal → collapses api-shape, db, creds
+    "resolved [key=db] we chose sqlite", // note-head/no-colon closer for db (already gone)
     "needs-decision: bare default question",
     "paused: waiting",
     "needs-decision [key=bad slug]: malformed slug is skipped",
     "blocked [key=pending-reply-7]: hijack attempt", // reserved key, wrong vocab -> ignored
     "blocked [key=pending-reply-8]: pending-reply-8: real owner note", // reserved, own vocab -> opens
   ];
+  // Default kind is ship, so the mid-stream `done: finished` retires every
+  // decision opened before it; only the two raised afterward remain open.
   const open = foldOpenDecisions(stream);
   assert.deepEqual(open, [
-    { key: "api-shape", verb: "needs-decision", note: "rename or keep?" },
-    { key: "creds", verb: "blocked", note: "need token" },
     { key: "default", verb: "needs-decision", note: "bare default question" },
     { key: "pending-reply-8", verb: "blocked", note: "pending-reply-8: real owner note" },
   ]);
 });
 
-test("a later done/working never masks a still-open needs-decision", () => {
-  const open = foldOpenDecisions([
-    "needs-decision [key=x]: pick one",
-    "working: kept going",
-    "done: shipped part",
-  ]);
-  assert.deepEqual(open, [{ key: "x", verb: "needs-decision", note: "pick one" }]);
+test("a ship/scout terminal done|failed collapses every open decision (fm-classify-lib :700-702)", () => {
+  // `working` is unrelated and never masks a still-open decision…
+  assert.deepEqual(
+    foldOpenDecisions(["needs-decision [key=x]: pick one", "working: kept going"]),
+    [{ key: "x", verb: "needs-decision", note: "pick one" }],
+  );
+  // …but a terminal `done` retires the whole task, so the decision is moot.
+  assert.deepEqual(
+    foldOpenDecisions(["needs-decision [key=x]: pick one", "working: kept going", "done: shipped part"]),
+    [],
+  );
+  // A decision raised AFTER the terminal survives (retry cycle).
+  assert.deepEqual(
+    foldOpenDecisions([
+      "needs-decision [key=x]: pick one",
+      "failed: gave up",
+      "needs-decision [key=y]: second question",
+    ]),
+    [{ key: "y", verb: "needs-decision", note: "second question" }],
+  );
+  // A non-collapsing kind (secondmate/unknown) keeps the earlier decision open.
+  assert.deepEqual(
+    foldOpenDecisions(["needs-decision [key=x]: pick one", "done: shipped part"], "secondmate"),
+    [{ key: "x", verb: "needs-decision", note: "pick one" }],
+  );
 });
 
 test("a bare resolved closes a bare needs-decision (default key)", () => {

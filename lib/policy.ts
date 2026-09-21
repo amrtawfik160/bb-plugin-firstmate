@@ -191,30 +191,56 @@ export interface OpenDecision {
   note: string;
 }
 
+/**
+ * fm-classify-lib `_fm_status_unstamped`: strip the worker-written `[at=…]` time
+ * tag(s) that sit before the line's first colon. Both the key and note readers,
+ * and the terminal-collapse colon test, locate the head/note separator on this
+ * unstamped copy so a readable stamp like `[at=10:30]` can never move it — its
+ * colons would otherwise end the head mid-tag or make a keyless line look like a
+ * transition. Tags at or after the first real colon (i.e. inside the note) are
+ * left untouched, exactly as the reference stops on the first colon it sees.
+ */
+function stripTimeTag(line: string): string {
+  let rest = line;
+  let keep = "";
+  for (;;) {
+    const at = rest.indexOf("[at=");
+    if (at < 0) break;
+    const close = rest.indexOf("]", at + 4);
+    if (close < 0) break; // no complete tag left (bash *\[at=*\]* requires a `]`)
+    const before = rest.slice(0, at);
+    if (before.includes(":")) break; // colon before the tag → the tag is in the note
+    keep += before.replace(/ $/, ""); // bash `${before% }`: drop one trailing space
+    rest = rest.slice(close + 1);
+  }
+  return keep + rest;
+}
+
 /** fm-classify-lib `_fm_key_before_colon` + key extraction: the `[key=<slug>]` before the first colon. */
-function keyBeforeColon(line: string): string | null {
-  const before = line.split(":", 1)[0] ?? line;
+function keyBeforeColon(unstamped: string): string | null {
+  const before = unstamped.split(":", 1)[0] ?? unstamped;
   const m = /\[key=([^\]]*)\]/.exec(before);
   return m ? (m[1] ?? "") : null;
 }
 
 /** fm-classify-lib `_fm_key_at_note_head`: a `[key=<slug>]` token at the head of the note. */
-function keyAtNoteHead(line: string): string | null {
-  const idx = line.indexOf(":");
+function keyAtNoteHead(unstamped: string): string | null {
+  const idx = unstamped.indexOf(":");
   if (idx < 0) return null;
-  const rest = line.slice(idx + 1).replace(/^\s+/, "");
+  const rest = unstamped.slice(idx + 1).replace(/^\s+/, "");
   const m = /^\[key=([^\]]*)\]/.exec(rest);
   return m ? (m[1] ?? "") : null;
 }
 
 /** fm-classify-lib `_fm_decision_key`: key slug, "default" when no token, null when the stated slug is malformed. */
 function decisionKey(line: string): string | null {
-  const before = keyBeforeColon(line);
+  const unstamped = stripTimeTag(line);
+  const before = keyBeforeColon(unstamped);
   let k: string;
   if (before !== null) {
     k = before;
   } else {
-    const head = keyAtNoteHead(line);
+    const head = keyAtNoteHead(unstamped);
     if (head === null) return "default";
     k = head;
   }
@@ -223,11 +249,12 @@ function decisionKey(line: string): string | null {
 
 /** fm-classify-lib `status_line_note`: text after the first colon, with a note-head key token stripped. */
 export function statusLineNote(line: string): string {
-  const idx = line.indexOf(":");
-  if (idx < 0) return line;
-  let n = line.slice(idx + 1).replace(/^\s+/, "");
-  if (keyBeforeColon(line) === null) {
-    const k = keyAtNoteHead(line);
+  const unstamped = stripTimeTag(line);
+  const idx = unstamped.indexOf(":");
+  if (idx < 0) return unstamped;
+  let n = unstamped.slice(idx + 1).replace(/^\s+/, "");
+  if (keyBeforeColon(unstamped) === null) {
+    const k = keyAtNoteHead(unstamped);
     if (k !== null && SLUG_OK.test(k)) {
       const tok = `[key=${k}]`;
       if (n.startsWith(tok)) n = n.slice(tok.length).replace(/^\s+/, "");
@@ -250,26 +277,63 @@ function keyTransitionAllowed(key: string, note: string): boolean {
  * Fold an append-only status stream into the decisions still open, mirroring
  * fm-classify-lib `status_open_decisions` (via `_fm_decision_fold_line`).
  * Most-recently-opened last, exactly as the reference prints them.
+ *
+ * `kind` selects the terminal-collapse rule that native reads from the task's
+ * sibling `.meta`: a ship/scout `done`/`failed` line closes EVERY open decision
+ * (fm-classify-lib.sh:700-702), because the terminal verdict retires the whole
+ * task — an earlier keyed decision it never explicitly resolved is moot, not a
+ * phantom the captain still owes an answer. A secondmate/unknown kind does not
+ * collapse. BB crews are only ever ship or scout (both collapse), so the default
+ * matches every real caller; the parameter exists so a differential harness can
+ * exercise the non-collapsing kinds against native.
  */
-export function foldOpenDecisions(lines: string[]): OpenDecision[] {
+export function foldOpenDecisions(lines: string[], kind: string = "ship"): OpenDecision[] {
+  const collapses = kind === "ship" || kind === "scout";
   let open: OpenDecision[] = [];
   for (const raw of lines) {
     const line = raw.replace(/\r$/, "");
-    if (!/\S/.test(line)) continue; // blank-line no-op
     // Real state/<id>.status is lowercase (fm-classify-lib); a BB crew's chat
     // output emits uppercase DONE/BLOCKED/FAILED. Compare case-insensitively so
     // both streams fold the same; the on-host stream is already lowercase, so
     // this never changes the reference behavior.
     const verb = statusLineVerb(line).toLowerCase();
+    // Only the six fold verbs can move the set; prose, blank lines, working, and
+    // paused are no-ops — mirrors the `while … case "$verb"` filter in native.
+    if (
+      verb !== "needs-decision" &&
+      verb !== "blocked" &&
+      verb !== "done" &&
+      verb !== "failed" &&
+      verb !== RESOLVE_VERB &&
+      verb !== HELD_VERB
+    ) {
+      continue;
+    }
+    const unstamped = stripTimeTag(line);
+    // Declaration guard (native `_fm_decision_fold_line`): a fold verb whose
+    // unstamped body carries neither a colon nor a complete `[key=…]` token is
+    // continuation prose and can never move the set.
+    if (!unstamped.includes(":") && !/\[key=[^\]]*\]/.test(unstamped)) continue;
+    // Terminal collapse (native :700-702): a ship/scout done|failed line whose
+    // unstamped body carries a colon retires every open decision. This runs
+    // BEFORE the key parse, so a malformed or absent key on the terminal line
+    // still collapses — exactly as native returns the empty set there.
+    if (collapses && (verb === "done" || verb === "failed") && unstamped.includes(":")) {
+      open = [];
+      continue;
+    }
+    // A done|failed that did not collapse (non-collapsing kind, or no colon) is a
+    // no-op: native's later `case "$verb"` lists only the four decision verbs.
+    if (verb === "done" || verb === "failed") continue;
     const key = decisionKey(line);
-    if (key === null) continue; // malformed slug: fold as ordinary status
+    if (key === null) continue; // malformed slug: no-op
     if (!keyTransitionAllowed(key, statusLineNote(line))) continue;
     if (verb === "needs-decision" || verb === "blocked") {
       const note = statusLineNote(line);
       open = open.filter((r) => r.key !== key);
       open.push({ key, verb, note });
-    } else if (verb === RESOLVE_VERB || verb === HELD_VERB) {
-      open = open.filter((r) => r.key !== key);
+    } else {
+      open = open.filter((r) => r.key !== key); // resolved | captain-held closer
     }
   }
   return open;

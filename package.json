@@ -3,7 +3,7 @@
   "version": "0.4.0",
   "type": "module",
   "scripts": {
-    "test": "node --test --experimental-strip-types lib/policy.test.ts server.test.ts"
+    "test": "node --test --experimental-strip-types lib/policy.test.ts lib/policy.differential.test.ts server.test.ts"
   },
   "engines": {
     "bb": ">=0.43",
