@@ -156,6 +156,61 @@ the open/close/collapse decision — and real host status files are LF, so on-ho
 impact is nil. A CRLF case is deliberately kept OUT of the differential corpus (it
 would correctly fail the guard); revisit only if CRLF status files ever appear.
 
+## Skill fidelity: copy native, mark every divergence
+
+The skills under [`skills/`](skills/) are not independent BB rewrites of firstmate
+policy — they are **native firstmate's own instructions, copied**, with edits only
+where BB's environment forces them. Native
+([kunchenguid/firstmate](https://github.com/kunchenguid/firstmate)) is the source
+of truth for policy wording. Paraphrasing native for its own sake is how these
+skills drifted to ~0% of native's text before this convention existed; copy the
+wording instead.
+
+Two rules make every difference from native visible and auditable. **An unmarked
+difference from native is by definition a bug.**
+
+### Pin the native source per skill
+
+Every skill re-derived from native carries, right after its frontmatter, a
+`BB-SOURCE` header naming the native file it copies and the native commit it was
+taken from:
+
+    <!-- BB-SOURCE: firstmate .agents/skills/afk/SKILL.md @ 804394e8
+         Copied from native firstmate; edited only where BB forces it. Every
+         divergence below is marked BB-DIVERGE. Re-sync and bump this SHA when
+         native moves. See CONTRIBUTING.md "Skill fidelity". -->
+
+The pinned SHA is what a future re-sync (or a drift check) diffs against. When you
+update a skill against a newer native revision, bump the SHA in the same pass.
+Native is currently at `804394e8`.
+
+### Mark every divergence inline
+
+Wherever the copy departs from native — a reworded line, a dropped mechanic, an
+added BB-only rule — leave an inline `BB-DIVERGE` marker at that spot stating three
+things: what native says, what BB does instead, and the environmental reason it
+cannot be otherwise:
+
+    <!-- BB-DIVERGE: native runs `fm-afk-launch.sh propose` then `confirm` as two
+         script calls; BB's `firstmate_afk on` commits the durable contract in one
+         call, so the read-back happens in chat before that call. Reason: the BB
+         tool has no separate propose step. -->
+
+The reason must be a real environmental constraint (no tmux pane, no composer to
+read, BB threads not windows, no blocking stop hook, a tool that folds two native
+steps into one, the KV cache plane, etc.). "Shorter" or "reads better" is not a
+reason — copy native's wording instead.
+
+Do **not** import native instructions that would mislead a BB crew (tmux/herdr
+pane mechanics, keystroke injection, the away daemon) just to raise a fidelity
+number. Mark that whole block `BB-DIVERGE / NECESSARY-OMITTED` with the reason it
+does not apply here, rather than copying dead mechanics.
+
+Out of scope stays listed, not silently dropped: when a native section is deferred
+to a later pass (e.g. stow's tiered-memory/decay/budget contract, or the captain
+skill's hard-rules and intake wording), say so in the skill or PR so the remaining
+gap is tracked, not forgotten.
+
 ## Docs and ADRs
 
 - [`CONTEXT.md`](CONTEXT.md) is the glossary — terms only, no implementation

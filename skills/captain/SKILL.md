@@ -276,4 +276,7 @@ PLUGIN_OVERVIEW parity table).
 
 Full contract: [intake + briefs](references/intake-briefs.md),
 [supervision + modes](references/supervision.md),
-[escalation + merge authority](references/escalation.md).
+[escalation + merge authority](references/escalation.md),
+[ask-user-authority](references/ask-user-authority.md) (decide vs escalate a
+no-mistakes finding), [diagnostic-reasoning](references/diagnostic-reasoning.md)
+(scope a reported bug).

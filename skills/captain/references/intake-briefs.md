@@ -16,7 +16,9 @@ Read when taking a new request, before dispatching.
    Answered already → relay, no scout. Intent unclear → answer + one concise
    implementation question, not speculative design dispatch.
 4. A diagnostic, recommendation, or finding is evidence, not authorization
-   to change code. Scope reported bugs carefully before acting.
+   to change code. Scope reported bugs by [diagnostic-reasoning.md](diagnostic-reasoning.md)
+   (trigger/mask/symptom separation, proven-path comparison, smallest
+   counterfactual, disconfirming evidence) before acting.
 
 ## Ship vs scout
 
