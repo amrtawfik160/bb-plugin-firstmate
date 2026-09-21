@@ -55,8 +55,12 @@ loop:
 - **Sibling service.** `fm-watch-supervisor` gets the same treatment: `superviseFmWatch`
   / `stopFmWatchKeeper` already honoured the signal internally; the per-host loops check
   it between hosts, and `resolveFmWatchHosts` / `resolveFmWatchHostId` /
-  `relayWatchReasons` thread it through their per-crew host resolves. A wedged sibling
-  would defeat the fix as surely as a wedged `crew-watch`.
+  `relayWatchReasons` thread it through their per-crew host resolves. The keeper-RELAUNCH
+  path also writes the keeper script via `writeHostFile` → `writeHostBytes`; that write is
+  now given the signal too (`writeHostFile(…, signal)`), so a reload landing while a dead
+  keeper is being relaunched aborts the write promptly instead of waiting out
+  `runHostCommand`'s 15s deadline. A wedged sibling would defeat the fix as surely as a
+  wedged `crew-watch`.
 
 ### A known, accepted over-tell
 
@@ -110,6 +114,20 @@ separately so operators have a hard escape even against a future plugin that wed
     grace and DEFERS the page`.
   - the post-`crewStatus` / post-`crewExcerpt` / post-`suppress` checks ⇒ the matching
     `ABORT WIRING (…)` test pages the captain on a reload.
+  - the keeper-relaunch `writeHostFile(…, signal)` AND the `fm-watch-supervisor` sleep
+    guard ⇒ `ACCEPTANCE (fm-watch-supervisor): a reload during a keeper relaunch-write …`
+    (either revert makes the sibling take ~15s / ~30s to stop). This is the test that now
+    defends the `fm-watch-supervisor` sleep guard, which previously had none.
   - The post-activity and between-crews checks are defence-in-depth (masked by
     `crewStatus` being the first read) and kept deliberately — not claimed as
     independently tested.
+
+### Residual, un-signalled path (bounded, recorded)
+
+`onDispose`'s best-effort keeper teardown (`stopFmWatchKeeper`, only when
+`watchOwner !== "fm-watch"`) runs WITHOUT a signal — the `bb.onDispose` callback provides
+none (it *is* the disposal, and runs only AFTER the services have stopped, so it cannot
+reproduce the "service did not stop" outage). Each `stopFmWatchKeeper` is per-host
+15s-bounded. Giving it an abort signal would mean inventing a module-level disposal
+controller — more than a few lines for a path that cannot wedge the reload — so it is left
+as-is and recorded here rather than half-done.

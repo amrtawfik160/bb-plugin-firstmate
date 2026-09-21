@@ -4447,8 +4447,8 @@ export default async function plugin(bb: BbPluginApi) {
   // HOST_COMMAND_MAX ceiling), and atomic (temp + rename, so a failed write never
   // truncates the target). See writeHostBytes for the mechanism and why the old
   // terminal-stdin path (`base64 -d > path` fed via PTY input) timed out.
-  async function writeHostFile(hostId: string, path: string, content: string): Promise<boolean> {
-    return writeHostBytes(hostId, path, content);
+  async function writeHostFile(hostId: string, path: string, content: string, signal?: AbortSignal): Promise<boolean> {
+    return writeHostBytes(hostId, path, content, 15_000, signal);
   }
 
   async function writeMemoryFile(rel: string, content: string): Promise<boolean> {
@@ -5068,7 +5068,7 @@ export default async function plugin(bb: BbPluginApi) {
       // are not in crash-loop backoff). Write the keeper script as a file, then
       // detach-launch it.
       if (!keeperAlive && allowRelaunch && !noArm) {
-        const wrote = await writeHostFile(hostId, keeperScript, fmWatchKeeperScript(hostId, fmHome, interval));
+        const wrote = await writeHostFile(hostId, keeperScript, fmWatchKeeperScript(hostId, fmHome, interval), signal);
         if (wrote) {
           const launch = [
             `mkdir -p ${shQuote(`${fmHome}/state`)}`,

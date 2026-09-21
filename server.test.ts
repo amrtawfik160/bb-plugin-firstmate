@@ -5739,3 +5739,50 @@ test("ABORT WIRING (notify): a reload during a stuck-page send stops within grac
     await host.harness.lifecycle.dispose();
   }
 });
+
+test("ACCEPTANCE (fm-watch-supervisor): a reload during a keeper relaunch-write stops the sibling service within the grace", async () => {
+  // Covers BOTH the fourth wedge (superviseFmWatch's keeper WRITE ran without the signal, so a
+  // reload waited out runHostCommand's 15s deadline) AND the fm-watch-supervisor sleep guard
+  // (a sleep entered post-abort would wait out its ~30s interval). Either revert makes this red.
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { watchOwner: "fm-watch", fmHome: "/tmp/fm-home", fmHostId: "host_1" },
+  });
+  await plugin(host.bb);
+  try {
+    let writeStarted = false;
+    let seq = 0;
+    const cmds = new Map<string, string>();
+    host.harness.sdk.stub("terminals.create", async (args: { start?: { command?: string } }) => {
+      const cmd = args.start?.command ?? "";
+      const id = `term_${seq++}`;
+      cmds.set(id, cmd);
+      if (cmd.includes(".fm-b64-")) writeStarted = true; // a keeper-script WRITE chunk is in flight
+      return { id };
+    });
+    host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+    host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
+      const cmd = cmds.get(args.terminalId) ?? "";
+      // The keeper-liveness READ completes reporting a DEAD keeper with the arm present, so the
+      // supervisor proceeds to relaunch (write the keeper script).
+      if (cmd.includes("FM_BEAT_AGE")) {
+        return hostOutput("FM_OWNER_BEAT=ok\nFM_BEAT_AGE=999\nFM_KEEPER=dead\n---FM_LOGTAIL---\n");
+      }
+      // Every other command (the keeper-script write chunks) never returns an RC — it blocks,
+      // so only an abort can end it.
+      return { nextSeq: 1, chunks: [{ dataBase64: Buffer.from("\nrunning\n").toString("base64") }] };
+    });
+    host.harness.sdk.stub("terminals.close", async () => ({}));
+    const run = host.harness.behavior.runService("fm-watch-supervisor");
+    const waitUntil = Date.now() + 5000;
+    while (!writeStarted && Date.now() < waitUntil) await new Promise((r) => setTimeout(r, 5));
+    assert.ok(writeStarted, "the supervisor never reached the keeper relaunch-write");
+    const t0 = Date.now();
+    run.controller.abort();
+    await awaitWithin(run.done, 2000, "a reload during the keeper relaunch-write did not stop fm-watch-supervisor within 2000ms");
+    assert.ok(Date.now() - t0 < 2000, "fm-watch-supervisor must stop within the grace on a reload");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
