@@ -478,6 +478,48 @@ test("a protocol verdict does not nudge; supervision still pings the captain", a
   }
 });
 
+test("D1: an in-band FAILED doorbell renders ❌ failed, never ✅ done, and never offers deliver", async () => {
+  const host = await load();
+  try {
+    stubIdleSdk(host);
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    const emitted = await emitIdle(host, "FAILED: contradictory requirements, cannot proceed");
+    assert.deepEqual(emitted.errors, []);
+    const sends = sendCalls(host);
+    assert.equal(sends.length, 1);
+    assert.equal(sends[0]?.threadId, "thr_cap");
+    const text = sends[0]?.text ?? "";
+    assert.match(text, /❌ crew c1 failed/);
+    assert.doesNotMatch(text, /✅ crew c1 done/);
+    assert.doesNotMatch(text, /next: bb firstmate deliver/);
+    assert.match(text, /next: bb firstmate retry\|tell\|forget c1/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("D1: an in-band BLOCKED doorbell renders 🚧 blocked, never ✅ done, and never offers deliver", async () => {
+  const host = await load();
+  try {
+    stubIdleSdk(host);
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    const emitted = await emitIdle(host, "BLOCKED: no git remote; gh-axi unavailable");
+    assert.deepEqual(emitted.errors, []);
+    const sends = sendCalls(host);
+    assert.equal(sends.length, 1);
+    assert.equal(sends[0]?.threadId, "thr_cap");
+    const text = sends[0]?.text ?? "";
+    assert.match(text, /🚧 crew c1 blocked/);
+    assert.doesNotMatch(text, /✅ crew c1 done/);
+    assert.doesNotMatch(text, /next: bb firstmate deliver/);
+    assert.match(text, /next: bb firstmate tell\|retry\|forget c1/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("missing protocol doorbells the crew and does not ping done", async () => {
   const host = await load();
   try {
@@ -613,7 +655,8 @@ test("provider-turn-idle still nudges; afk nudges the crew and holds the captain
     host.harness.sdk.stub("threads.events.list", async () => [
       { data: { reason: "provider-turn-idle" } },
     ]);
-    await host.bb.storage.kv.set("afk", {
+    // D3: afk posture is scoped to the crew's captain (thr_cap).
+    await host.bb.storage.kv.set("afk:cap-thr_cap", {
       on: true,
       words: "out",
       since: "2026-09-18T00:00:00.000Z",
@@ -628,7 +671,7 @@ test("provider-turn-idle still nudges; afk nudges the crew and holds the captain
     const exhausted = await emitIdle(host, "no verdict");
     assert.deepEqual(exhausted.errors, []);
     assert.equal(sendCalls(host).filter((send) => send.threadId === "thr_cap").length, 0);
-    const afk = (await host.bb.storage.kv.get("afk")) as { held?: string[] };
+    const afk = (await host.bb.storage.kv.get("afk:cap-thr_cap")) as { held?: string[] };
     assert.match(afk.held?.join("\n") ?? "", /NEEDS DECISION/);
   } finally {
     await host.harness.lifecycle.dispose();
@@ -972,14 +1015,84 @@ test("thread.failed pages once; turn.failed does not double-page", async () => {
   }
 });
 
+test("F2: the real afk contract + .afk flag write to the HOST-LEVEL path native reads (never cap-scoped)", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", fmHostId: "host_1", afkOwner: "real" },
+  });
+  await plugin(host.bb);
+  try {
+    const hostCommands: string[] = [];
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("terminals.create", async (args: { start?: { command?: string } }) => {
+      if (typeof args.start?.command === "string") hostCommands.push(args.start.command);
+      return { id: "term_1" };
+    });
+    host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+    host.harness.sdk.stub("terminals.output", async () => hostRcOutput(0));
+    host.harness.sdk.stub("terminals.close", async () => ({}));
+    const result = await host.harness.behavior.runCli(["afk", "on", "--words", "out"], { threadId: "thr_capA", projectId: "proj_1" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    // The .afk flag + the fm-afk-contract.sh invocation must target the host-level
+    // state dir the native fm-watch keeper reads — NEVER a cap-<captain> subdir.
+    const afkWrite = hostCommands.find((c) => c.includes("/state/.afk"));
+    assert.ok(afkWrite, `no .afk flag write in:\n${hostCommands.join("\n---\n")}`);
+    assert.match(afkWrite, /\/tmp\/fm-home\/state\/\.afk/);
+    for (const cmd of hostCommands) {
+      assert.doesNotMatch(cmd, /state\/cap-/, `real afk path must not be cap-scoped: ${cmd}`);
+      assert.doesNotMatch(cmd, /FM_STATE_OVERRIDE=.*cap-/, `contract must not scope FM_STATE_OVERRIDE per captain: ${cmd}`);
+    }
+    // The KV posture, by contrast, IS per-captain.
+    assert.ok(await host.bb.storage.kv.get("afk:cap-thr_capA"), "KV posture must be captain-scoped");
+    assert.equal(await host.bb.storage.kv.get("afk"), undefined, "no global KV posture key");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("D3: afk is per-captain — captain A going away never holds captain B's doorbell", async () => {
+  const host = await load();
+  try {
+    host.harness.sdk.stub("threads.send", async () => ({}));
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () =>
+      makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: null }),
+    );
+    await host.bb.storage.kv.set("crews", [
+      { ...crewRow("cA", "thr_crewA", "thr_capA") },
+      { ...crewRow("cB", "thr_crewB", "thr_capB") },
+    ]);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    // Only captain A is away.
+    await host.bb.storage.kv.set("afk:cap-thr_capA", {
+      on: true, words: "out", since: "2026-09-18T00:00:00.000Z", held: [],
+    });
+    // A's crew finishes: held for A (routine done ping), no doorbell to A.
+    await emitIdle(host, "DONE: A shipped", { id: "thr_crewA" });
+    assert.equal(sendCalls(host).filter((s) => s.threadId === "thr_capA").length, 0, "A is away → held");
+    const afkA = (await host.bb.storage.kv.get("afk:cap-thr_capA")) as { held?: string[] };
+    assert.match(afkA.held?.join("\n") ?? "", /DONE: A shipped/);
+    // B's crew finishes: B is NOT away, so B is doorbelled normally.
+    await emitIdle(host, "DONE: B shipped", { id: "thr_crewB" });
+    const toB = sendCalls(host).filter((s) => s.threadId === "thr_capB");
+    assert.equal(toB.length, 1, "B is present → doorbelled despite A being away");
+    assert.match(toB[0]?.text ?? "", /DONE: B shipped/);
+    // B's posture record must be untouched by A's afk.
+    assert.equal(await host.bb.storage.kv.get("afk:cap-thr_capB"), undefined);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("quiet holds without an AFK record and flushes on quiet off", async () => {
   const host = await load();
   try {
     stubIdleSdk(host);
     await seedCrew(host);
     await host.harness.behavior.setSettings({ supervisionEnabled: true });
-    await host.bb.storage.kv.set("quiet", true);
-    await host.bb.storage.kv.set("afk", {
+    await host.bb.storage.kv.set("quiet:cap-thr_cap", true);
+    await host.bb.storage.kv.set("afk:cap-thr_cap", {
       on: false,
       words: "",
       since: "2026-09-18T00:00:00.000Z",
@@ -988,16 +1101,16 @@ test("quiet holds without an AFK record and flushes on quiet off", async () => {
     const emitted = await emitIdle(host, "DONE: batched");
     assert.deepEqual(emitted.errors, []);
     assert.equal(sendCalls(host).filter((send) => send.threadId === "thr_cap").length, 0);
-    const quiet = (await host.bb.storage.kv.get("quiet")) as { on?: boolean; held?: string[] };
+    const quiet = (await host.bb.storage.kv.get("quiet:cap-thr_cap")) as { on?: boolean; held?: string[] };
     assert.equal(quiet.on, true);
     assert.match(quiet.held?.join("\n") ?? "", /DONE: batched/);
-    const afk = (await host.bb.storage.kv.get("afk")) as { held?: string[] };
+    const afk = (await host.bb.storage.kv.get("afk:cap-thr_cap")) as { held?: string[] };
     assert.deepEqual(afk.held, ["stale-afk"]);
-    const off = await host.harness.behavior.runCli(["quiet", "off"]);
+    const off = await host.harness.behavior.runCli(["quiet", "off"], { threadId: "thr_cap" });
     assert.equal(off.exitCode, 0, off.stderr);
     assert.match(off.stdout, /Quiet off/);
     assert.match(off.stdout, /DONE: batched/);
-    const cleared = (await host.bb.storage.kv.get("quiet")) as { on?: boolean; held?: string[] };
+    const cleared = (await host.bb.storage.kv.get("quiet:cap-thr_cap")) as { on?: boolean; held?: string[] };
     assert.equal(cleared.on, false);
     assert.deepEqual(cleared.held, []);
   } finally {
@@ -1011,7 +1124,7 @@ test("afk hold keeps the newest 20 and flushes the oldest", async () => {
     stubIdleSdk(host);
     await seedCrew(host);
     await host.harness.behavior.setSettings({ supervisionEnabled: true });
-    await host.bb.storage.kv.set("afk", {
+    await host.bb.storage.kv.set("afk:cap-thr_cap", {
       on: true,
       words: "",
       since: "2026-09-18T00:00:00.000Z",
@@ -1021,7 +1134,7 @@ test("afk hold keeps the newest 20 and flushes the oldest", async () => {
       const emitted = await emitIdle(host, `DONE: item ${i}`);
       assert.deepEqual(emitted.errors, []);
     }
-    const afk = (await host.bb.storage.kv.get("afk")) as { held?: string[] };
+    const afk = (await host.bb.storage.kv.get("afk:cap-thr_cap")) as { held?: string[] };
     assert.equal(afk.held?.length, 20);
     assert.match(afk.held?.[0] ?? "", /DONE: item 1/);
     assert.match(afk.held?.[19] ?? "", /DONE: item 20/);
@@ -1118,6 +1231,148 @@ test("a startup gap rebases stale watch rows instead of paging", async () => {
     assert.ok((watch["c1"]?.at ?? 0) > staleAt);
   } finally {
     await missing.harness.lifecycle.dispose();
+  }
+});
+
+function stubForgetSdk(
+  host: Awaited<ReturnType<typeof load>>,
+  opts: { dirty: string[]; committed?: string[]; prUrl?: string; isWorktree?: boolean },
+) {
+  host.harness.sdk.stub("threads.list", async () => []);
+  host.harness.sdk.stub("threads.get", async () =>
+    makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }),
+  );
+  host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+  host.harness.sdk.stub("threads.updatePluginMetadata", async () => ({}));
+  host.harness.sdk.stub("threads.archive", async () => ({}));
+  host.harness.sdk.stub("threads.stop", async () => ({}));
+  host.harness.sdk.stub("threads.output", async () => ({ output: "DONE: shipped" }));
+  host.harness.sdk.stub("environments.get", async () => ({
+    id: "env_wt",
+    hostId: "host_1",
+    path: "/wt",
+    isWorktree: opts.isWorktree ?? true,
+    status: "ready",
+    mergeBaseBranch: "main",
+  }));
+  // diffFiles is asked for two targets: uncommitted (dirty guard) and
+  // branch_committed (F1 committed-unpushed guard). Answer each independently.
+  host.harness.sdk.stub("environments.diffFiles", async (args: { target?: string }) => {
+    const paths = args.target === "branch_committed" ? (opts.committed ?? []) : opts.dirty;
+    return { files: paths.map((path) => ({ path })) };
+  });
+  host.harness.sdk.stub("environments.pullRequest", async () => ({
+    pullRequest: opts.prUrl !== undefined ? { url: opts.prUrl, state: "open" } : null,
+  }));
+  host.harness.sdk.stub("environments.delete", async () => ({ ok: true as const }));
+}
+
+test("D2: forget --stop on a clean crew removes the managed worktree", async () => {
+  const host = await load();
+  try {
+    await seedCrew(host); // worktree: true
+    stubForgetSdk(host, { dirty: [] });
+    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop"], { projectId: "proj_1" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /worktree removed/);
+    const del = host.harness.sdk.callsTo("environments.delete");
+    assert.equal(del.length, 1, "worktree env must be deleted exactly once");
+    assert.equal((del[0]?.[0] as { environmentId?: string }).environmentId, "env_wt");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("D2: forget --stop on a DIRTY crew refuses and leaves the worktree intact", async () => {
+  const host = await load();
+  try {
+    await seedCrew(host);
+    stubForgetSdk(host, { dirty: ["src/a.ts", "src/b.ts"] });
+    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop"], { projectId: "proj_1" });
+    assert.notEqual(result.exitCode, 0, "must refuse a dirty tree");
+    assert.match(result.stderr + result.stdout, /uncommitted file/);
+    // The worktree must NOT be deleted (no discarding uncommitted work), and the
+    // crew record must survive the refusal.
+    assert.equal(host.harness.sdk.callsTo("environments.delete").length, 0);
+    const crews = (await host.bb.storage.kv.get("crews")) as Array<{ id: string }>;
+    assert.ok(crews.some((c) => c.id === "c1"), "crew record must survive a refusal");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("D2: forget --stop --force on a dirty crew still removes the worktree", async () => {
+  const host = await load();
+  try {
+    await seedCrew(host);
+    stubForgetSdk(host, { dirty: ["src/a.ts"] });
+    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop", "--force"], { projectId: "proj_1" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(host.harness.sdk.callsTo("environments.delete").length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("D2: forget --stop on a SHARED-ENV crew never deletes the shared project environment", async () => {
+  const host = await load();
+  try {
+    // shared-env crew: worktree false → runs in project-default, must not be deleted.
+    await host.bb.storage.kv.set("crews", [
+      { ...shipRow("c1", "thr_crew", "thr_cap"), worktree: false, posture: "local-only" },
+    ]);
+    stubForgetSdk(host, { dirty: [], isWorktree: false });
+    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop"], { projectId: "proj_1" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(host.harness.sdk.callsTo("environments.delete").length, 0, "shared env must never be deleted");
+    assert.doesNotMatch(result.stdout, /worktree removed/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("F1: forget --stop refuses a crew with committed-but-UNPUSHED work (worktree intact)", async () => {
+  const host = await load();
+  try {
+    await seedCrew(host);
+    // Clean tree, but the branch has commits vs base and NO PR → unpushed, unlanded.
+    stubForgetSdk(host, { dirty: [], committed: ["src/feature.ts", "src/feature.test.ts"] });
+    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop"], { projectId: "proj_1" });
+    assert.notEqual(result.exitCode, 0, "must refuse committed-unpushed work");
+    assert.match(result.stderr + result.stdout, /committed but UNPUSHED/);
+    assert.equal(host.harness.sdk.callsTo("environments.delete").length, 0, "worktree must survive the refusal");
+    const crews = (await host.bb.storage.kv.get("crews")) as Array<{ id: string }>;
+    assert.ok(crews.some((c) => c.id === "c1"), "crew record must survive the refusal");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("F1: forget --stop ALLOWS a crew whose committed work is pushed to a PR (recoverable)", async () => {
+  const host = await load();
+  try {
+    await seedCrew(host);
+    // Committed vs base, but a PR exists → the commits are on the forge, recoverable.
+    stubForgetSdk(host, { dirty: [], committed: ["src/feature.ts"], prUrl: "https://github.com/x/y/pull/9" });
+    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop"], { projectId: "proj_1" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /worktree removed/);
+    assert.equal(host.harness.sdk.callsTo("environments.delete").length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("F1: forget --stop --force removes the worktree despite committed-unpushed work", async () => {
+  const host = await load();
+  try {
+    await seedCrew(host);
+    stubForgetSdk(host, { dirty: [], committed: ["src/feature.ts"] });
+    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop", "--force"], { projectId: "proj_1" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(host.harness.sdk.callsTo("environments.delete").length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
   }
 });
 
@@ -1420,7 +1675,7 @@ test("deck renders real fm-bearings-snapshot labelled, native digest as cache", 
     host.harness.sdk.stub("terminals.close", async () => ({}));
     const result = await host.harness.behavior.runCli(["deck"], { threadId: "thr_cap", projectId: "proj_1" });
     assert.equal(result.exitCode, 0, result.stderr);
-    assert.match(result.stdout, /real bearings \(fm-bearings-snapshot; authoritative\)/);
+    assert.match(result.stdout, /real bearings \(fm-bearings-snapshot; authoritative, host-wide\)/);
     assert.match(result.stdout, /FLEET SNAPSHOT: 0 crews/);
     assert.match(result.stdout, /native digest \(BB KV cache \/ fallback\)/);
   } finally {
@@ -1939,6 +2194,79 @@ test("bearings surfaces an idle crew's open decision as a Captain's Call", async
     const result = await host.harness.behavior.runCli(["bearings"]);
     assert.equal(result.exitCode, 0, result.stderr);
     assert.match(result.stdout, /NEEDS-DECISION \[schema\]/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("D4: bearings scopes backlog + landed to the calling captain, --all shows every captain's", async () => {
+  const host = await load();
+  try {
+    host.harness.sdk.stub("threads.list", async () => []);
+    await host.bb.storage.kv.set("queue", [
+      { id: "qA", title: "MINE-queued", projectId: "proj_1", status: "queued", parentThreadId: "thr_cap", createdAt: "2026-09-18T00:00:00.000Z" },
+      { id: "qB", title: "THEIRS-queued", projectId: "proj_2", status: "queued", parentThreadId: "thr_other", createdAt: "2026-09-18T00:00:00.000Z" },
+    ]);
+    await host.bb.storage.kv.set("done", [
+      { id: "dA", task: "MINE-landed", crewId: "cA", parentThreadId: "thr_cap", at: "2026-09-18T00:00:00.000Z" },
+      { id: "dB", task: "THEIRS-landed", crewId: "cB", parentThreadId: "thr_other", at: "2026-09-18T00:00:00.000Z" },
+    ]);
+    const mine = await host.harness.behavior.runCli(["bearings"], { threadId: "thr_cap", projectId: "proj_1" });
+    assert.equal(mine.exitCode, 0, mine.stderr);
+    assert.match(mine.stdout, /MINE-queued/);
+    assert.match(mine.stdout, /MINE-landed/);
+    assert.doesNotMatch(mine.stdout, /THEIRS-queued/);
+    assert.doesNotMatch(mine.stdout, /THEIRS-landed/);
+    const all = await host.harness.behavior.runCli(["bearings", "--all"], { threadId: "thr_cap", projectId: "proj_1" });
+    assert.equal(all.exitCode, 0, all.stderr);
+    assert.match(all.stdout, /MINE-queued/);
+    assert.match(all.stdout, /THEIRS-queued/);
+    assert.match(all.stdout, /THEIRS-landed/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("D1: bearings lists an idle FAILED crew as a Captain's Call, not ready to review", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () =>
+      makeThreadResponse({ id: "thr_crew", status: "idle" }),
+    );
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+    host.harness.sdk.stub("threads.output", async () => ({
+      output: "working: tried\nFAILED: contradictory requirements",
+    }));
+    const result = await host.harness.behavior.runCli(["bearings"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /FAILED: retry\/investigate/);
+    // A FAILED crew must never be offered as ready to review/deliver.
+    assert.doesNotMatch(result.stdout, /c1.*ready to review/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("D1: firstmate crew/crews render a distinct verdict marker for an idle FAILED crew", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () =>
+      makeThreadResponse({ id: "thr_crew", status: "idle" }),
+    );
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+    host.harness.sdk.stub("threads.output", async () => ({
+      output: "FAILED: contradictory requirements",
+    }));
+    const crew = await host.harness.behavior.runCli(["crew", "c1"]);
+    assert.equal(crew.exitCode, 0, crew.stderr);
+    assert.match(crew.stdout, /❌ FAILED/);
+    const crews = await host.harness.behavior.runCli(["crews"], { threadId: "thr_cap", projectId: "proj_1" });
+    assert.equal(crews.exitCode, 0, crews.stderr);
+    assert.match(crews.stdout, /❌ FAILED/);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -2519,6 +2847,17 @@ test("C1: real transport adds the backlog row (id=crew id, --kind ship) BEFORE f
     assert.ok(!seen.some((c) => c.includes("fm-tasks-axi.sh") && c.includes("'start'")), "plugin double-started the row");
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0, "must not native-spawn");
     assert.equal((await crewsKv(host))[0]?.threadId, "thr_real");
+    // D5: the backlog-first step emits a positive signature, BEFORE the spawn-ok
+    // line — so a captain can see the ordering directly in the log, not infer it.
+    const addLogIdx = host.harness.logEntries.findIndex(
+      (e) => e.level === "info" && e.message === `real transport backlog add crew=${crewId} ok`,
+    );
+    const spawnLogIdx = host.harness.logEntries.findIndex(
+      (e) => e.level === "info" && e.message === `real transport spawn crew=${crewId} ok`,
+    );
+    assert.ok(addLogIdx >= 0, `missing backlog-add log:\n${host.harness.logEntries.map((e) => `${e.level}: ${e.message}`).join("\n")}`);
+    assert.ok(spawnLogIdx >= 0, "missing spawn-ok log");
+    assert.ok(addLogIdx < spawnLogIdx, "backlog-add log must precede the spawn-ok log");
   } finally {
     await host.harness.lifecycle.dispose();
   }
