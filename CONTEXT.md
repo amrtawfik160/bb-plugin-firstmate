@@ -61,8 +61,11 @@ dropped without losing content, because the content lives elsewhere.
 _Avoid_: notification, ping.
 
 **Steer**:
-A captain→crew instruction. A durable steer is written as an **inbox record** the
-crew reads and acknowledges; `interrupt`/`stop` are hard steers, never the inbox.
+A captain→crew instruction. By default a steer is a plain BB doorbell send with no
+durable record. The durable path — writing an **inbox record** the crew reads and
+acknowledges — is the `tellOwner=real` option, which is off by default and slated
+for deletion (see **Owner flag**); do not assume steers are durable.
+`interrupt`/`stop` are hard steers, never the inbox.
 
 **Inbox record**:
 A durable message file in a crew's inbox. The crew acknowledges by moving the file
@@ -91,10 +94,14 @@ beacon is fresh. A bb home declares `autoarm` so a between-wakes gap is not a fa
 alarm.
 
 **Partition** / **cap-\<captain\>**:
-The per-captain scoping of the durable wake plane. Each captain gets its own state
-subdir (`state/cap-<captain-thread-id>/`) so one captain's drain/ack never touches
-another's queue rows or notes. A missing captain id falls back to the shared
-global state dir.
+The per-captain scoping of the durable **wake plane only**. Each captain gets its
+own state subdir (`state/cap-<captain-thread-id>/`) so one captain's drain/ack
+never touches another's wake queue rows or notes. A missing captain id falls back
+to the shared global state dir. This does **not** cover the crew register: that is
+a single shared KV list with no owner filtering on the read plane — `listCrews`
+sweeps every firstmate-origin thread host-wide, and it is capped at 50 (`MAX_CREWS`),
+so one captain's dispatches can EVICT another captain's records. Partitioning is a
+wake-plane property, not a crew-register property.
 
 ### Planes
 
@@ -105,9 +112,13 @@ fallback/cache). Real state is authoritative; KV is a rebuildable cache.
 
 **Owner flag**:
 A per-concern setting (`queueOwner`, `decisionsOwner`, `afkOwner`, `quietOwner`,
-`memoryOwner`, plus `transport`, `watchOwner`, `readThrough`) choosing `real` or
-`kv`/`native` for that concern. A real owner writes through to the KV cache and
-degrades to KV on host failure.
+`memoryOwner`, `notifyOwner`, plus `transport`, `watchOwner`) choosing `real` or
+`kv`/`native` for that concern. Every owner flag defaults to the `kv`/`native`
+side; a real owner writes through to the KV cache and degrades to KV on host
+failure. Note: `readThrough` and `tellOwner` are off by default and, per the
+captain's decision, are slated to be **deleted** rather than finished — do not
+treat them as supported owners; `turnEndGuard` is likewise off by default (see
+ADR 0002).
 
 **fmHome**:
 The firstmate home on the host — a reused, overlaid clone of the upstream repo,
