@@ -1,20 +1,6 @@
-<!-- BB-SOURCE
-     native: AGENTS.md § 9 (Escalation and captain etiquette)
-     sha: 804394e8
-     snapshot: native-snapshot/804394e8/AGENTS.section-9.md
-     fidelity: adapted
-     note: Escalation etiquette copied verbatim from native AGENTS.md section 9;
-     BB-specific framing and the BB merge-authority model are fenced BB-ONLY, and
-     every departure is marked BB-DIVERGE. Native's own merge-authority contract
-     (section 7) is not yet re-derived — deferred to a later PR. See
-     CONTRIBUTING.md "Skill fidelity". -->
+## 9. Escalation and captain etiquette
 
-# Escalation etiquette
-
-<!-- Read before pinging the captain. -->
-
-## Talk in outcomes, not mechanics
-
+**Talk in outcomes, not mechanics.**
 Every captain-facing message must translate internal state into the project outcome, consequence, and next decision.
 On every harness, whenever a turn calls for a captain-facing reply, its **final response message** must stand alone with all key information from the whole turn: outcomes, consequences, any decision or approval needed, and relevant URLs or identifiers, even if already stated in a mid-turn or pre-tool message.
 The captain may see only the final message; repeat the essentials there, not the full transcript or anchor.
@@ -45,8 +31,6 @@ Every escalation must stand alone and remain concise.
 Lead directly with concrete evidence, then the consequence, options when applicable, and a recommendation.
 Use the same evidence-first form for objections or clarifying challenges rather than unsupported deference.
 
-## Reach the captain immediately for
-
 Reach the captain immediately for:
 
 - Work ready for their review, with the PR's recorded URL.
@@ -56,20 +40,13 @@ Reach the captain immediately for:
 - Anything destructive, irreversible, or security-sensitive.
 - A needed credential or login.
 
-<!-- The decide-vs-escalate boundary behind those gate findings lives in
-     ask-user-authority.md. -->
-
+In a secondmate home, reaching the captain means appending the outcome to the parent channel your charter names; a captain-facing sentence in that home's chat has not been sent, and [`docs/secondmate-parent-channel.md`](docs/secondmate-parent-channel.md) owns which outcomes the home's own scripts deliver there without you.
 Do not surface automatic fixes, retries, routine progress, or internal supervision mechanics.
 Reply exactly `Captain, shipshape.` only for a true no-op that still needs an answer - an idle re-read, an empty heartbeat, or a pure acknowledgement with no consequence for the captain - without characterizing the visible session's unrelated decisions.
 For a captain-requested completion, or any wake that needs the captain's review, approval, merge, or design pick, give a captain-facing outcome that states what finished and never reply `Captain, shipshape.`; a finished requested deliverable is an outcome rather than progress or a no-op, and a transcript entry or durable record already showing the substance does not discharge the reply.
 Ask for the captain's word only when the next step requires a review, approval, merge, or design pick.
 Batch non-urgent updates into the next natural reply.
+Use plain chat for a yes-or-no decision and `lavish-axi` only when several options or a structured report benefit from a visual surface.
 Whenever a PR is mentioned, and for any review or merge ask, include the PR's full `https://...` URL in MAIN's final captain-facing response, copied verbatim from the task's ready status or `pr=` metadata and never assembled from memory or left to a transcript entry that already shows it; when neither source has one, report only the identifier you actually have.
 Mention cost as a courtesy when unusually much work is running, but never block on it.
 
-<!-- Merge authority is native AGENTS.md section 7, not section 9, and is not yet
-     re-derived from native text — deferred to the section-7 re-derivation PR. BB's
-     current merge rules live in the captain skill (Hard rules 2 + the Deliver
-     section + `firstmate_merge` / `--yes` / `--allow-red` in the command map).
-     Precedence (a current explicit captain instruction beats a standing rule in
-     its exact scope) is likewise carried by the captain skill's hard-rules coda. -->

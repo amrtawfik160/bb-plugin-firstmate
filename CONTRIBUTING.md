@@ -156,6 +156,136 @@ the open/close/collapse decision — and real host status files are LF, so on-ho
 impact is nil. A CRLF case is deliberately kept OUT of the differential corpus (it
 would correctly fail the guard); revisit only if CRLF status files ever appear.
 
+## Skill fidelity: copy native, mark every divergence
+
+The skills under [`skills/`](skills/) are not independent BB rewrites of firstmate
+policy — they are **native firstmate's own instructions, copied**, with edits only
+where BB's environment forces them. Native
+([kunchenguid/firstmate](https://github.com/kunchenguid/firstmate)) is the source
+of truth for policy wording. Paraphrasing native for its own sake is how these
+skills drifted to ~0% of native's text before this convention existed; copy the
+wording instead.
+
+The convention is **mechanically checkable**, not a matter of reviewer diligence:
+`npm test` runs `scripts/skill-fidelity.ts`, which fails when a skill's rendered
+prose differs from its pinned native source without a marker, and flags a marker
+whose native anchor no longer resolves. **An unmarked difference from native is a
+bug, and the check will catch it.**
+
+### The vendored native snapshot
+
+The pinned native source is vendored, read-only, under `native-snapshot/<sha>/…`,
+mirroring native's own paths (`.agents/skills/<name>/SKILL.md`, or a named slice
+such as `AGENTS.section-9.md`). This is what the check diffs against, so it runs
+fully offline. It is a copy of native at the pin — never edit it by hand; re-vendor
+from the native clone when you bump a pin. Native is currently at `804394e8`.
+
+### Pin the native source per skill (`BB-SOURCE`)
+
+Every re-derived skill carries, right after its frontmatter, a machine-parseable
+`BB-SOURCE` header:
+
+    <!-- BB-SOURCE
+         native: .agents/skills/afk/SKILL.md
+         sha: 804394e8
+         snapshot: native-snapshot/804394e8/.agents/skills/afk/SKILL.md
+         fidelity: adapted        # verbatim | adapted
+         note: … -->
+
+`fidelity: verbatim` means the rendered prose is native's own, byte-for-byte modulo
+whitespace/markdown (e.g. `ask-user-authority`, `diagnostic-reasoning`).
+`fidelity: adapted` means it is copied but restructured for BB, so BB-specific text
+is fenced (below). Either way, **every rendered sentence outside a fence must appear
+verbatim in the pinned snapshot**, or the check fails.
+
+### Two ways to mark a divergence
+
+**`BB-DIVERGE`** — a comment with a machine-parseable anchor to the native text it
+diverges from. `native-quote` must be a contiguous phrase that resolves verbatim in
+the snapshot; the check fails a quote that no longer resolves (native drift):
+
+    <!-- BB-DIVERGE
+         native: .agents/skills/afk/SKILL.md § Entering
+         native-quote: Run `bin/fm-afk-launch.sh confirm`
+         bb: BB's `firstmate_afk on` commits the durable contract in one call; the read-back happens in chat before that call.
+         reason: the BB tool has no separate propose step. -->
+
+**`BB-ONLY`** — a fence around BB-specific *rendered* text that has no native source
+(a tool call, a BB-only section). A fence is **not** a blind trust boundary; the
+checker constrains it so a rewrite cannot hide inside one:
+
+    <!-- BB-DIVERGE
+         native: .agents/skills/afk/SKILL.md § Entering
+         native-quote: Run `bin/fm-afk-launch.sh confirm`
+         bb: BB commits the durable contract in one tool call.
+         reason: the BB tool has no separate propose step. -->
+    <!-- BB-ONLY: BB commits the durable contract in one tool call. -->
+    Call `firstmate_afk` with `action: "on"` …
+    <!-- /BB-ONLY -->
+
+Every fence must satisfy all of:
+
+- **Adjacent `BB-DIVERGE` that describes the fence.** A fence must sit next to a
+  `BB-DIVERGE` that names the native it replaces, and that marker's `bb:` field must
+  share a BB token with the fence it authorises — so a marker cannot rubber-stamp a
+  fence it does not describe. This makes the marker *load-bearing*: delete it and the
+  fence fails. (Fixes the hole where a `BB-DIVERGE` was decorative.)
+- **BB-anchored per sentence.** Every sentence inside the fence must carry a token
+  from the BB allow-list (`firstmate_*`, `bb firstmate`, `supervision on`,
+  `Ready to review`, `--grant`/`--resolve-key`/`--yes`/`--allow-red`, `/afk` … ,
+  `deliver`). Free prose with no BB token cannot live in a fence — that is what
+  closes the "wrap a rewrite in a fence" hole.
+- **No native-derived content.** A sentence that resolves verbatim in native may not
+  be fenced; un-fence it so it is actually checked.
+- **Bounded per fence AND per skill.** At most six sentences per fence, and at most
+  ten fenced sentences per skill total — so the per-fence cap cannot be dodged by
+  minting many small fences. Each authorising marker's `native-quote` must also be
+  distinct, so a valid anchor cannot be cloned to mint fences. The reason must be
+  non-empty and of real length. A fence cannot grow into a parallel skill.
+
+The reason must be a real environmental constraint (no tmux pane, no composer to
+read, BB threads not windows, no blocking stop hook, a tool that folds two native
+steps into one, the KV cache plane, etc.). "Shorter" or "reads better" is not a
+reason — copy native's wording instead.
+
+**What the check can and cannot catch (be honest).** It catches every *unmarked*
+divergence, every *unfenced* non-native sentence, an anchor that stops resolving,
+native content smuggled into a fence, any fenced sentence with no BB token, a fence
+whose marker does not describe it, and fence-count/size inflation (per fence, per
+skill, and anchor reuse) — so the "wrap the rewrite in a fence", "delete the
+marker", and "mint many small fences" escapes all fail. It does **not** semantically
+judge prose: a fabricated claim welded into a single sentence that also references a
+real BB tool (or the same lie split across token-bearing clauses) carries a token
+and passes the vocabulary gate. That residue is a human-review responsibility —
+widening the token rules to chase it would only produce false failures. The check
+makes casual and fenced drift fail loudly and shrinks the reviewer's job to reading
+a few labelled, bounded fences and judging whether each reason is true; it does not
+catch every conceivable adversarial sentence.
+
+Do **not** import native instructions that would mislead a BB crew (tmux/herdr pane
+mechanics, keystroke injection, the away daemon) just to raise a fidelity number.
+Mark that whole block `BB-DIVERGE` with `bb: NECESSARY-OMITTED …` and an anchor to a
+representative native phrase, rather than copying dead mechanics.
+
+Out of scope stays listed, not silently dropped: when a native section is deferred
+to a later pass (e.g. stow's tiered-memory/decay/budget contract, or the captain
+skill's hard-rules and intake wording), say so in the skill or PR so the remaining
+gap is tracked, not forgotten.
+
+### Running the check
+
+- `npm test` runs the offline structural + snapshot-membership check (no native
+  clone needed — it reads the vendored snapshot).
+- `npm run fidelity` runs the same check standalone.
+- `npm run fidelity -- --native /path/to/firstmate` additionally proves the vendored
+  snapshot still matches a live native clone at the pinned SHA, so a stale snapshot
+  (and every anchor resting on it) fails after a native bump.
+
+When native moves and you re-sync a skill: re-vendor its snapshot from the clone,
+bump the `sha` in `BB-SOURCE`, re-anchor any `native-quote` that native reworded,
+and restore/re-mark any prose that native changed — the check tells you exactly
+which sentences and anchors need attention.
+
 ## Docs and ADRs
 
 - [`CONTEXT.md`](CONTEXT.md) is the glossary — terms only, no implementation
