@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -1393,6 +1394,27 @@ test("bb overlay adapter propagates reasoning, tags crews, drops yolo->full, car
 
 const OVERLAY_ROOT = join(dirname(fileURLToPath(import.meta.url)), "overlay");
 const INSTALLER_SRC = readFileSync(join(OVERLAY_ROOT, "install-bb-backend.py"), "utf8");
+const PATCH_BASE = readFileSync(join(OVERLAY_ROOT, "patch-base.txt"), "utf8").trim();
+const UPSTREAM_URL = "https://github.com/kunchenguid/firstmate";
+
+// Clone `checkout` into `home` and detach at the PINNED patch base (overlay/patch-base.txt).
+// The overlay patches are refreshed against that exact upstream commit, so the installer
+// only applies there — not against whatever the local checkout's HEAD happens to be. A
+// --local clone carries every object (including the base commit even when it is
+// unreachable from the checkout HEAD); if the base is still missing, fetch it from origin.
+// Returns null on success or a skip reason string.
+function cloneAtPatchBase(checkout: string, home: string): string | null {
+  if (spawnSync("git", ["clone", "--quiet", "--local", checkout, home]).status !== 0) return "clone failed";
+  if (spawnSync("git", ["-C", home, "cat-file", "-e", PATCH_BASE]).status !== 0) {
+    if (spawnSync("git", ["-C", home, "fetch", "--quiet", UPSTREAM_URL, PATCH_BASE]).status !== 0) {
+      return `patch base ${PATCH_BASE.slice(0, 12)} unavailable (no local object, fetch failed)`;
+    }
+  }
+  if (spawnSync("git", ["-C", home, "checkout", "--quiet", "--detach", PATCH_BASE]).status !== 0) {
+    return `could not checkout patch base ${PATCH_BASE.slice(0, 12)}`;
+  }
+  return null;
+}
 
 test("installer applies patches to a scratch tree only — never against the home's tracked bin/", () => {
   // The old installer ran `patch ... cwd=home`; that is the exact regression to block.
@@ -1491,9 +1513,9 @@ test("installer leaves a real firstmate clone's tracked tree clean", (t) => {
   const work = mkdtempSync(join(tmpdir(), "fm-bb-clean-"));
   try {
     const home = join(work, "home");
-    const clone = spawnSync("git", ["clone", "--quiet", "--no-local", "--depth", "1", `file://${checkout}`, home]);
-    if (clone.status !== 0) {
-      t.skip(`could not clone firstmate checkout: ${clone.stderr?.toString() ?? ""}`);
+    const skip = cloneAtPatchBase(checkout, home);
+    if (skip) {
+      t.skip(skip);
       return;
     }
     const run = spawnSync("python3", [
@@ -1536,9 +1558,10 @@ test("installer --verify fails LOUD after an out-of-band fast-forward leaves the
   const work = mkdtempSync(join(tmpdir(), "fm-bb-stale-"));
   try {
     const home = join(work, "home");
-    // Full clone (not --depth 1) so we can add a commit to simulate an out-of-band ff.
-    if (spawnSync("git", ["clone", "--quiet", "--no-local", `file://${checkout}`, home]).status !== 0) {
-      t.skip("clone failed");
+    // Clone at the patch base (a full clone we can advance to simulate an out-of-band ff).
+    const skip = cloneAtPatchBase(checkout, home);
+    if (skip) {
+      t.skip(skip);
       return;
     }
     assert.equal(spawnSync("python3", [join(OVERLAY_ROOT, "install-bb-backend.py"), "--home", home, "--overlay", OVERLAY_ROOT]).status, 0);
@@ -1562,6 +1585,98 @@ test("installer --verify fails LOUD after an out-of-band fast-forward leaves the
   }
 });
 
+// B1 source guards: the installer builds the mirror in a STAGING dir and atomically
+// swaps it in only on full success, and treats any patch-hunk failure as a loud,
+// non-zero abort (not just a trusted `patch` exit code). Reverting either behaviour
+// trips one of these.
+test("installer source builds atomically in staging and swaps on success (B1)", () => {
+  assert.match(INSTALLER_SRC, /\.staging/, "installer must build into a staging dir");
+  assert.match(INSTALLER_SRC, /def _atomic_swap/, "installer must have an atomic swap step");
+  assert.match(INSTALLER_SRC, /os\.rename\(staging, mirror\)/, "installer must rename staging into place");
+  // The old in-place rebuild (rmtree the live mirror, then rebuild) is the exact
+  // regression that caused the outage; it must be gone.
+  assert.doesNotMatch(INSTALLER_SRC, /shutil\.rmtree\(mirror\)/, "installer must not rmtree the live mirror before rebuilding");
+  // Loud, belt-and-suspenders failure detection: not just the patch exit code.
+  assert.match(INSTALLER_SRC, /def die_loud/);
+  assert.match(INSTALLER_SRC, /rglob\("\*\.rej"\)/, "installer must scan for reject files, not trust patch's exit code alone");
+  assert.match(INSTALLER_SRC, /INSTALL FAILED/);
+});
+
+// Fingerprint a directory's bytes + symlink targets, so an atomic install failure can
+// be proven not to have mutated a single byte of the working mirror.
+function fingerprintDir(root: string): string {
+  const h = createHash("sha256");
+  const walk = (dir: string, rel: string) => {
+    for (const name of readdirSync(dir).sort()) {
+      const abs = join(dir, name);
+      const st = lstatSync(abs);
+      const key = `${rel}/${name}`;
+      if (st.isSymbolicLink()) h.update(`L ${key} -> ${readlinkSync(abs)}\n`);
+      else if (st.isDirectory()) { h.update(`D ${key}\n`); walk(abs, key); }
+      else h.update(`F ${key} ${createHash("sha256").update(readFileSync(abs)).digest("hex")}\n`);
+    }
+  };
+  walk(root, "");
+  return h.digest("hex");
+}
+
+// B1 behavioural + mutation proof: a re-install whose patch no longer applies must abort
+// ATOMICALLY — exit non-zero and loud, print no "ready", leave no staging/backup litter,
+// and leave the previously-working mirror byte-for-byte intact and still dispatching bb.
+// Reverting the staging-and-swap (rebuilding in place) makes the "mirror untouched"
+// assertion fail: an in-place rebuild rmtrees/repopulates the live mirror before the
+// patch fails, so the fingerprint changes.
+test("failed re-install is atomic: working mirror is preserved byte-for-byte (B1, mutation-proven)", (t) => {
+  const checkout = discoverFirstmateCheckout();
+  if (checkout === null) {
+    t.skip("no firstmate checkout discoverable (set FM_TEST_HOME to enable)");
+    return;
+  }
+  const work = mkdtempSync(join(tmpdir(), "fm-bb-atomic-"));
+  try {
+    const home = join(work, "home");
+    const skip = cloneAtPatchBase(checkout, home);
+    if (skip) {
+      t.skip(skip);
+      return;
+    }
+    // A first, good install → a healthy working mirror.
+    assert.equal(
+      spawnSync("python3", [join(OVERLAY_ROOT, "install-bb-backend.py"), "--home", home, "--overlay", OVERLAY_ROOT, "--project-id", "proj_test"]).status,
+      0,
+      "initial install should succeed at the patch base",
+    );
+    const before = fingerprintDir(join(home, "bin-bb"));
+
+    // A broken overlay whose backend patch can no longer apply (a corrupted REMOVED
+    // line — a fuzz-tolerated context change would still apply and would not fail).
+    const broken = join(work, "broken-overlay");
+    cpSync(OVERLAY_ROOT, broken, { recursive: true });
+    const bp = join(broken, "firstmate-bb-backend.patch");
+    const patchText = readFileSync(bp, "utf8");
+    const needle = '-FM_BACKEND_KNOWN="tmux herdr zellij orca cmux"';
+    assert.ok(patchText.includes(needle), "anchor to corrupt must exist in the backend patch");
+    writeFileSync(bp, patchText.replace(needle, '-FM_BACKEND_KNOWN="THIS_LINE_DOES_NOT_EXIST_UPSTREAM"'));
+
+    const failed = spawnSync("python3", [join(OVERLAY_ROOT, "install-bb-backend.py"), "--home", home, "--overlay", broken, "--project-id", "proj_test"], { encoding: "utf8" });
+
+    // (a) loud + non-zero, never "ready".
+    assert.notEqual(failed.status, 0, "a patch-apply failure must exit non-zero");
+    assert.match(failed.stderr, /INSTALL FAILED/, `failure must be loud:\n${failed.stderr}`);
+    assert.match(failed.stderr, /did not apply/);
+    assert.doesNotMatch(`${failed.stdout}${failed.stderr}`, /BB backend ready/, "must not print 'ready' over a failure");
+    // (b) atomic: no litter, working mirror byte-identical.
+    assert.ok(!existsSync(join(home, "bin-bb.staging")), "no staging dir may be left behind");
+    assert.ok(!existsSync(join(home, "bin-bb.old")), "no backup dir may be left behind");
+    assert.equal(fingerprintDir(join(home, "bin-bb")), before, "the working mirror must be untouched by a failed install");
+    // (c) the mirror still dispatches bb.
+    const validate = spawnSync("bash", ["-c", `. "${join(home, "bin-bb", "fm-backend.sh")}"; fm_backend_validate bb`], { encoding: "utf8" });
+    assert.equal(validate.status, 0, "the preserved mirror must still validate bb");
+  } finally {
+    rmSync(work, { recursive: true, force: true });
+  }
+});
+
 // fmHome is shared host-global across captains, so the migration off the in-place patch
 // must never have a moment when no bb-capable path exists (another captain could dispatch
 // and hit `unknown backend 'bb'`). scripts/live-migration-zero-window-check.mjs reproduces
@@ -1579,9 +1694,17 @@ test("migration off the in-place patch has zero bb-less window (mutation-proven)
     spawnSync("node", ["--experimental-strip-types", scriptPath, ...extraArgs], { encoding: "utf8", timeout: 240_000 });
 
   const neu = runCheck([]);
+  if (/^SKIP:/m.test(neu.stdout)) {
+    t.skip(neu.stdout.trim());
+    return;
+  }
   assert.equal(neu.status, 0, `NEW-order migration must have zero windows:\n${neu.stdout}\n${neu.stderr}`);
   assert.match(neu.stdout, /ZERO-WINDOW CONFIRMED/);
   assert.match(neu.stdout, /windows \(unknown backend 'bb'\): 0/);
+  // The NEW order now also exercises a FAILED atomic re-install: it must abort loud and
+  // non-zero, leave the working mirror untouched, and keep dispatching bb (no window).
+  assert.match(neu.stdout, /FAILED re-install: exit=1 loud=true notReady=true noLeftover=true mirrorUntouched=true/);
+  assert.match(neu.stdout, /probe\[ok\] G: after a FAILED atomic re-install/);
 
   // Mutation: the OLD ("restore first") order MUST expose a window; the script exits 0
   // only when it detects one, so this asserts the probe actually catches the gap.

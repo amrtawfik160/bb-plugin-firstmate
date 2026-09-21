@@ -1,11 +1,11 @@
 #!/usr/bin/env node
-// F1 live proof: the bb backend actually runs THROUGH THE MIRROR (bin-bb), not
-// through native bin/. This is the proof PR #16's review found missing:
-// scripts/live-brief-intent-check.mjs drives native `bin/fm-spawn.sh` against a copy
-// of /root/firstmate that is STILL patched in place, so it passes whether or not the
-// mirror works. This script builds a PRISTINE clone (native bin/ has no bb), installs
-// the overlay, and proves the mirror is load-bearing — including a mutation check that
-// the native path REJECTS bb in the same run.
+// F1 / B2 live proof: the bb backend actually runs THROUGH THE MIRROR (bin-bb), not
+// through native bin/, and it does so from the REFRESHED patches applied against the
+// PINNED upstream base (overlay/patch-base.txt) — i.e. the fast-forward a live home
+// needs can actually complete and still spawn bb. This is the proof PR #16's review
+// found missing plus the B2 acceptance: on a scratch clone AT THE PATCH BASE,
+// install → verify healthy → all three copies present → native rejects bb →
+// mirror accepts bb → a real fm-spawn reaches bb thread spawn.
 //
 // NOT part of `npm test` (needs the `bb` CLI, a connected host, and the real native
 // firstmate scripts). Everything mutating happens under scratch clones and a throwaway
@@ -14,24 +14,17 @@
 //   node scripts/live-mirror-check.mjs
 //
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, existsSync, lstatSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { normalizeCaptainIntent } from "../server.ts";
+import { OVERLAY, INSTALLER, sh, discoverCheckout, cloneAtBase, patchBase } from "./fm-fixture.mjs";
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const OVERLAY = join(HERE, "..", "overlay");
-const INSTALLER = join(OVERLAY, "install-bb-backend.py");
-const NATIVE_FM = "/root/firstmate";
 const results = [];
 function record(name, ok, detail) {
   results.push({ name, ok });
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}${detail ? `  — ${detail}` : ""}`);
-}
-function sh(cmd, args, opts = {}) {
-  const r = spawnSync(cmd, args, { encoding: "utf8", maxBuffer: 1 << 26, ...opts });
-  return { code: r.status, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
 }
 
 const SPAWNED = /^spawned .* window=bb:(thr_[a-z0-9]+)/m;
@@ -46,10 +39,16 @@ function teardownThread(tid) {
   if (existsSync(wt)) rmSync(wt, { recursive: true, force: true });
 }
 
+const checkout = discoverCheckout();
+if (!checkout) {
+  console.log("SKIP: no firstmate checkout discoverable (set FM_TEST_HOME).");
+  process.exit(0);
+}
+
 const scratch = mkdtempSync(join(tmpdir(), "fm-mirror-"));
 const fmh = join(scratch, "fmhome");
 const proj = join(scratch, "proj");
-console.log(`# live-mirror-check scratch=${scratch}\n`);
+console.log(`# live-mirror-check scratch=${scratch}  patch base=${patchBase().slice(0, 12)}\n`);
 
 // Resolve FM_BINDIR exactly as the plugin's fmBinDirAssign does.
 function binDir() {
@@ -59,9 +58,11 @@ function binDir() {
 }
 
 try {
-  // (1) PRISTINE clone — native bin/ must NOT carry bb (unlike the live in-place home).
-  const clone = sh("git", ["clone", "--quiet", "--no-local", `file://${NATIVE_FM}`, fmh]);
-  if (clone.code !== 0) throw new Error(`clone pristine firstmate failed: ${clone.out}`);
+  // (1) PRISTINE clone AT THE PATCH BASE — native bin/ must NOT carry bb (unlike the
+  //     live in-place home), and the base is the exact upstream commit the refreshed
+  //     patches target, so this proves the fast-forward destination actually installs.
+  const cloned = cloneAtBase(checkout, fmh);
+  if (!cloned.ok) { console.log(`SKIP: ${cloned.reason}`); rmSync(scratch, { recursive: true, force: true }); process.exit(0); }
   mkdirSync(join(fmh, "data"), { recursive: true });
   mkdirSync(join(fmh, "state"), { recursive: true });
 
@@ -89,10 +90,23 @@ try {
   const instArgs = [INSTALLER, "--home", fmh, "--overlay", OVERLAY];
   if (realProjectId) instArgs.push("--project-id", realProjectId);
   const inst = sh("python3", instArgs);
+  record("installer applied the refreshed patches at the base and left the tree clean",
+    inst.code === 0 && existsSync(join(fmh, "bin-bb", "fm-spawn.sh")) &&
+      sh("git", ["-C", fmh, "status", "--porcelain"]).out.trim() === "",
+    inst.code === 0 ? `bin-bb=${binDir()}` : `installer failed:\n${inst.out.slice(-400)}`);
   if (inst.code !== 0) throw new Error(`installer failed: ${inst.out}`);
-  record("installer built the mirror and left the tree clean", existsSync(join(fmh, "bin-bb", "fm-spawn.sh")) &&
-    sh("git", ["-C", fmh, "status", "--porcelain"]).out.trim() === "",
-    `bin-bb=${binDir()}`);
+
+  // (2b) --verify reports the fresh mirror healthy.
+  const okVerify = sh("python3", [INSTALLER, "--home", fmh, "--verify"]);
+  record("installer --verify reports the fresh mirror healthy", okVerify.code === 0, okVerify.out.trim());
+
+  // (2c) all three no-seam files are carried as REAL copies (not symlinks) in the mirror.
+  const copiesOk = ["fm-backend.sh", "fm-spawn.sh", "fm-teardown.sh"].every((f) => {
+    const p = join(fmh, "bin-bb", f);
+    return existsSync(p) && !lstatSync(p).isSymbolicLink();
+  });
+  record("all three no-seam files are real patched copies in the mirror", copiesOk,
+    copiesOk ? "fm-backend.sh, fm-spawn.sh, fm-teardown.sh present as copies" : "a copy is missing or is a symlink");
 
   // (3) MUTATION PROOF: same call, native REJECTS bb, mirror ACCEPTS it. The mirror
   //     is what makes bb dispatch work; nothing else changed.

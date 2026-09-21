@@ -36,7 +36,11 @@ Native scripts derive `SCRIPT_DIR`/`FM_BACKEND_LIB_DIR` from their own `BASH_SOU
 
 `bin-bb/` is registered in `<home>/.git/info/exclude` (a per-clone, untracked git exclude that is **not** part of the repository), and `config/` is already gitignored upstream. So `git -C <home> status --porcelain` stays **empty** — which is exactly what the plugin's `fetch` + `git merge --ff-only` auto-update requires: with the old in-place patch the tree was permanently dirty and the update **always skipped**; the mirror keeps it clean so the clone actually fast-forwards.
 
-Re-run the installer after an ff-update: it re-mirrors (picking up new native `bin/` files) and regenerates the three patched copies against the new native source. If upstream changed one of the three files so a patch no longer applies, the install **fails loudly** instead of silently shipping a stale copy.
+Re-run the installer after an ff-update: it re-mirrors (picking up new native `bin/` files) and regenerates the three patched copies against the new native source.
+
+The install is **atomic and loud** (see `install-bb-backend.py`, `build_mirror` / `_atomic_swap`): the new mirror is built in full inside a `bin-bb.staging` directory and swapped into place with `os.rename` **only on complete success**, so a failed install can never replace a working mirror with a broken/partial one — on any failure the staging tree is discarded and the existing `bin-bb` is left **exactly as it was**. If upstream changed one of the three files so a hunk no longer applies, the install **aborts non-zero with a loud `INSTALL FAILED` banner** (detected via `patch`'s exit code **and** any reject file — not the exit code alone), never printing `BB backend ready` over a failure. (The earlier installer rebuilt in place: it `rmtree`d the live mirror first, so a patch failure mid-rebuild left `bin-bb` missing the three dispatch copies — a host-wide `unknown backend 'bb'` outage on a shared home.)
+
+The overlay patches are refreshed against a **pinned upstream base** recorded in [`overlay/patch-base.txt`](patch-base.txt) (currently the current `kunchenguid/firstmate` HEAD). Because the patches edit upstream prose/comments they are version-specific — they apply at that base and drift as upstream evolves. [`scripts/patch-drift-check.mjs`](../scripts/patch-drift-check.mjs) fetches the live upstream HEAD and dry-run-applies the patches exactly as the installer does, so drift is caught **ahead of a migration** rather than during one; when it flags drift, refresh the patches against HEAD, re-run the live proofs, and bump `patch-base.txt`.
 
 ## Task shape and metadata
 
@@ -119,6 +123,16 @@ A home installed by the **old** overlay has the three tracked files patched in p
 
 Between the fast-forward (step 4) and the re-install (step 5) the mirror is momentarily **stale** (HEAD advanced past the mirror's manifest) — but it is not bb-*less*: the frozen copies still carry the bb arms and keep dispatching. `--verify` flags that staleness and the re-install repairs it; the plugin keeps routing to `bin-bb` throughout. This is a staleness window, not a correctness window.
 
+> **The install only succeeds at the patch base.** The overlay patches are pinned to
+> [`overlay/patch-base.txt`](patch-base.txt) (the upstream commit they were refreshed
+> against). Step 1's install-first works only if `$FMH`'s HEAD is at that base. A home
+> that is **behind** the base (the current live case, at `2bcb88c3` while the base is
+> `804394e8`) cannot install-first at its old HEAD — the patches target the new source.
+> Such a home is handled by the sequence in **"Migrating a home that is behind the patch
+> base"** below, which relies on the mirror it already carries. Because the install is now
+> atomic, a re-install whose patch no longer applies aborts without touching the working
+> mirror, so a mistimed re-install can never open a window either.
+
 ```bash
 FMH=/root/firstmate   # the live home; OVL=<path to overlay/>
 
@@ -154,6 +168,35 @@ git -C "$FMH" status --porcelain                              # expect empty
 ```
 
 Do **not** run step 2 as `git checkout .` or `git reset --hard` — those would reach beyond the three files. `state/` and `data/` are never tracked in this clone (they are gitignored), so a scoped `git checkout -- <the four paths>` cannot lose crew state or memory; still, restrict the command to those paths. After any later out-of-band fast-forward (a manual `git pull`, an external updater), re-run step 5; `--verify` fails loud (`FM_MIRROR_STALE`) whenever the mirror is behind HEAD or a sibling is missing, and the plugin logs the same on the dispatch and supervision paths.
+
+## Migrating a home that is behind the patch base (the current live case)
+
+The live `/root/firstmate` is at `2bcb88c3` with a **working mirror already installed** (rebuilt at that HEAD, tree clean, serving bb) and needs to reach current upstream `804394e8` — which is the patch base. Because the refreshed patches target `804394e8` (not `2bcb88c3`), you must **not** rebuild the mirror at the old HEAD; the mirror it already has is what carries bb through the whole sequence, and the only install is the final one at the new HEAD. Zero-window and atomic-failure survival are proven by `scripts/live-migration-zero-window-check.mjs` (step G is a deliberately-failed re-install).
+
+```bash
+FMH=/root/firstmate   # the live home; OVL=<path to overlay/>
+
+# 1. Confirm the existing mirror is healthy and serving bb. Do NOT re-install at the
+#    old HEAD: the refreshed patches target the base (804394e8), not 2bcb88c3.
+python3 "$OVL"/install-bb-backend.py --home "$FMH" --verify   # healthy (at old HEAD)
+git -C "$FMH" status --porcelain                              # expect empty (no in-place patch)
+
+# 2. Fast-forward the clean clone to the base. The mirror goes momentarily STALE
+#    (HEAD past its manifest) but keeps dispatching bb — never bb-less.
+git -C "$FMH" fetch --quiet origin
+up=$(git -C "$FMH" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)
+[ -n "$up" ] && git -C "$FMH" merge --ff-only "$up"          # advances to 804394e8
+
+# 3. Re-install against the new HEAD. The refreshed patches apply; the installer builds
+#    the mirror in bin-bb.staging and atomically swaps it in ONLY on full success. If it
+#    failed (further drift), it aborts loud + non-zero and leaves the stale-but-serving
+#    mirror exactly in place — still no window; fix the patches and retry.
+python3 "$OVL"/install-bb-backend.py --home "$FMH" --project-id <bb-project-id>
+python3 "$OVL"/install-bb-backend.py --home "$FMH" --verify   # healthy
+git -C "$FMH" status --porcelain                              # expect empty
+```
+
+`bin-bb` contains a complete bb-capable mirror at every step (the old one until the instant the new one swaps in at step 3), so native `bin` — which rejects bb once fast-forwarded — is never the only path. Run `node scripts/patch-drift-check.mjs` before starting: if it reports drift, the patches need refreshing (and `patch-base.txt` bumping) before step 3 can succeed.
 
 ## Paths that do NOT reach bb through the mirror (F4/F5)
 

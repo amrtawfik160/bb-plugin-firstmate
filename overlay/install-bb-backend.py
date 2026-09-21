@@ -74,6 +74,31 @@ def die(msg: str) -> None:
     raise SystemExit(1)
 
 
+def die_loud(title: str, detail: str) -> None:
+    """A failure that must be impossible to miss. Used for patch-apply failures,
+    which turned a routine migration into a live outage precisely because an earlier
+    installer printed 'ready' over one. Never print a success line after this."""
+    bar = "!" * 72
+    print(bar, file=sys.stderr)
+    print(f"INSTALL FAILED: {title}", file=sys.stderr)
+    for line in detail.splitlines():
+        print(f"  {line}", file=sys.stderr)
+    print("  The mirror was NOT changed; any previously-working bin-bb is intact.", file=sys.stderr)
+    print(bar, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def _rm_path(path: Path) -> None:
+    """Remove a file, symlink, or directory tree; ignore if already gone."""
+    try:
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path)
+    except FileNotFoundError:
+        pass
+
+
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
 
@@ -140,11 +165,24 @@ def generate_patched_copies(home: Path, overlay: Path, dest_dir: Path) -> dict[s
             )
             sys.stdout.write(result.stdout)
             sys.stderr.write(result.stderr)
-            if result.returncode != 0:
-                die(
-                    f"could not apply {patch.name} to pristine native source; "
-                    "upstream likely changed one of the backend files. Refusing to "
-                    "ship a stale copy. Rebase the overlay patches on the new source."
+            # Loud-failure gate. `patch`'s exit code alone is not trusted: with
+            # --forward it can exit 0 while silently skipping an already/partly
+            # applied hunk, and a silent skip on migration day is exactly what
+            # produced the outage. So a failure is ANY of: non-zero exit, a .rej
+            # file written anywhere under the scratch tree, or a "hunk FAILED"
+            # line in the output. Any one of these aborts the whole install.
+            combined = f"{result.stdout}\n{result.stderr}"
+            rejects = sorted(str(p.relative_to(tmproot)) for p in tmproot.rglob("*.rej"))
+            failed_hunks = "FAILED" in combined or "hunks ignored" in combined
+            if result.returncode != 0 or rejects or failed_hunks:
+                die_loud(
+                    f"a hunk of {patch.name} did not apply to the pristine native source",
+                    "Upstream almost certainly changed one of the backend files.\n"
+                    "Refusing to ship a stale/partial copy over a working mirror.\n"
+                    f"patch exit={result.returncode}"
+                    + (f"; rejects: {', '.join(rejects)}" if rejects else "")
+                    + "\nRebase the overlay patches on the new source "
+                    "(scripts/patch-drift-check.mjs shows which hunks drifted).",
                 )
         for f in PATCHED_FILES:
             src = tmproot / "bin" / f
@@ -163,31 +201,67 @@ def generate_patched_copies(home: Path, overlay: Path, dest_dir: Path) -> dict[s
 
 
 def build_mirror(home: Path, overlay: Path) -> Path:
-    """(Re)build <home>/bin-bb: symlink every native bin entry, generate the three
-    patched copies, and install the bb.sh adapter."""
+    """ATOMICALLY (re)build <home>/bin-bb. The mirror is built in full inside a
+    STAGING directory and swapped into place only on complete success, so a failed
+    install (a patch that no longer applies, a missing adapter) can never replace a
+    working mirror with a broken/partial one: on any failure the staging tree is
+    discarded and the existing bin-bb is left EXACTLY as it was.
+
+    (The previous version rmtree'd the live mirror first and rebuilt in place, so a
+    patch failure mid-rebuild left bin-bb missing the three dispatch copies — a
+    host-wide `unknown backend 'bb'` outage on a shared home. Never again.)"""
     bin_dir = home / "bin"
     mirror = home / MIRROR_DIRNAME
-    if mirror.exists() or mirror.is_symlink():
-        if not mirror.is_dir() or mirror.is_symlink():
-            die(f"{mirror} exists and is not a plain directory; refusing to touch it")
-        shutil.rmtree(mirror)
-    mirror.mkdir(mode=0o755)
+    if (mirror.exists() or mirror.is_symlink()) and (not mirror.is_dir() or mirror.is_symlink()):
+        die(f"{mirror} exists and is not a plain directory; refusing to touch it")
 
-    patched = set(PATCHED_FILES)
-    native_entries = sorted(os.listdir(bin_dir))
-    for entry in native_entries:
-        src = bin_dir / entry
-        if entry == "backends" and src.is_dir():
-            _mirror_backends(src, mirror / "backends", overlay)
-            continue
-        if entry in patched:
-            continue  # generated below as a real copy
-        # Relative symlink so the mirror survives a home move.
-        os.symlink(os.path.join("..", "bin", entry), mirror / entry)
+    staging = home / f"{MIRROR_DIRNAME}.staging"
+    _rm_path(staging)  # clear any leftover from a previously-crashed install
+    try:
+        staging.mkdir(mode=0o755)
+        patched = set(PATCHED_FILES)
+        native_entries = sorted(os.listdir(bin_dir))
+        for entry in native_entries:
+            src = bin_dir / entry
+            if entry == "backends" and src.is_dir():
+                _mirror_backends(src, staging / "backends", overlay)
+                continue
+            if entry in patched:
+                continue  # generated below as a real copy
+            # Relative symlink so the mirror survives a home move. The depth of
+            # staging matches the final mirror, so ../bin resolves either way.
+            os.symlink(os.path.join("..", "bin", entry), staging / entry)
 
-    source_shas = generate_patched_copies(home, overlay, mirror)
-    write_manifest(home, mirror, native_entries, source_shas)
+        source_shas = generate_patched_copies(home, overlay, staging)
+        write_manifest(home, staging, native_entries, source_shas)
+    except BaseException:
+        # Includes die_loud()/die()'s SystemExit: discard the half-built staging and
+        # leave the previously-working mirror untouched.
+        _rm_path(staging)
+        raise
+
+    _atomic_swap(mirror, staging)
     return mirror
+
+
+def _atomic_swap(mirror: Path, staging: Path) -> None:
+    """Swap the fully-built `staging` tree into place at `mirror`. `os.rename` is
+    atomic within a filesystem (staging is a sibling of mirror, so always same fs).
+    On the first install there is no prior mirror. On a rebuild the old mirror is
+    renamed aside, the new one swapped in, and the old one discarded; if the swap-in
+    somehow fails the old mirror is rolled back so a working mirror is never lost."""
+    if not (mirror.exists() or mirror.is_symlink()):
+        os.rename(staging, mirror)
+        return
+    backup = mirror.with_name(mirror.name + ".old")
+    _rm_path(backup)
+    os.rename(mirror, backup)
+    try:
+        os.rename(staging, mirror)
+    except BaseException:
+        os.rename(backup, mirror)  # roll back to the working mirror
+        raise
+    _rm_path(backup)
 
 
 def write_manifest(home: Path, mirror: Path, native_entries: list[str], source_shas: dict[str, str]) -> None:
@@ -292,13 +366,25 @@ def write_exclude(home: Path) -> None:
     info.mkdir(parents=True, exist_ok=True)
     exclude = info / "exclude"
     existing = exclude.read_text() if exclude.exists() else ""
-    if EXCLUDE_MARKER in existing:
+    existing_lines = set(existing.splitlines())
+    # The transient staging/backup dirs of the atomic install must be excluded too,
+    # so a rebuild never flashes the tree dirty and a leftover after a crash stays
+    # untracked. Add any missing pattern even on a home whose marker already exists
+    # (installed by an older overlay that only listed /bin-bb/).
+    patterns = [
+        EXCLUDE_MARKER,
+        f"/{MIRROR_DIRNAME}/",
+        f"/{MIRROR_DIRNAME}.staging/",
+        f"/{MIRROR_DIRNAME}.old/",
+        "/docs/bb-backend.md",
+    ]
+    missing = [p for p in patterns if p not in existing_lines]
+    if not missing:
         return
-    patterns = [EXCLUDE_MARKER, f"/{MIRROR_DIRNAME}/", "/docs/bb-backend.md", ""]
     with exclude.open("a") as fh:
         if existing and not existing.endswith("\n"):
             fh.write("\n")
-        fh.write("\n".join(patterns) + "\n")
+        fh.write("\n".join(missing) + "\n")
     print(f"registered overlay paths in {exclude}")
 
 

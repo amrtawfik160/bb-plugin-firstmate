@@ -18,25 +18,33 @@
 // showing the probe is load-bearing. Deterministic: the probe is the validate gate, so
 // NO bb thread is created and no real project is needed. /root/firstmate is never touched.
 //
-import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, existsSync } from "node:fs";
+// The clone chain is pinned to the patch base (overlay/patch-base.txt) so the overlay
+// patches — which the migration installs — actually apply; the synthetic "upstream"
+// commits deliberately do NOT touch the patched files, so the fast-forward and the
+// re-install against the advanced HEAD both keep applying.
+//
+// The NEW order additionally exercises a FAILED re-install (step G): a re-install whose
+// patch no longer applies must abort ATOMICALLY — exit non-zero and loud, leave the
+// working mirror byte-for-byte intact, and keep dispatching bb. This is the exact
+// failure that turned a routine migration into a host-wide outage; the probe proves the
+// atomic installer now survives it with no bb-less window.
+//
+import { mkdtempSync, mkdirSync, rmSync, existsSync, cpSync, readFileSync, writeFileSync, readdirSync, lstatSync, readlinkSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import { spawnSync } from "node:child_process";
+import { OVERLAY, INSTALLER, sh, git, discoverCheckout, cloneAtBase, patchBase } from "./fm-fixture.mjs";
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const OVERLAY = join(HERE, "..", "overlay");
-const INSTALLER = join(OVERLAY, "install-bb-backend.py");
-const NATIVE_FM = "/root/firstmate";
 const OLD_ORDER = process.argv.includes("--old-order");
-
-function sh(cmd, args, opts = {}) {
-  const r = spawnSync(cmd, args, { encoding: "utf8", maxBuffer: 1 << 26, ...opts });
-  return { code: r.status, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
-}
-function git(home, ...args) { return sh("git", ["-C", home, ...args]); }
-
 const REJECTS_BB = /unknown backend 'bb'/;
+
+const checkout = discoverCheckout();
+if (!checkout) {
+  console.log("SKIP: no firstmate checkout discoverable (set FM_TEST_HOME).");
+  process.exit(0);
+}
+
 const scratch = mkdtempSync(join(tmpdir(), "fm-zerowin-"));
 const upstream = join(scratch, "upstream");
 const home = join(scratch, "home");
@@ -58,12 +66,38 @@ function probe(label) {
   console.log(`  probe[${hitWindow ? "WINDOW" : "ok"}] ${label}  (FM_BINDIR=${bindir.endsWith("bin-bb") ? "bin-bb" : "bin"})`);
 }
 
-console.log(`# zero-window migration check (${OLD_ORDER ? "OLD order — expect a window" : "NEW order — expect none"})  scratch=${scratch}\n`);
+// Content fingerprint of the mirror (file bytes + symlink targets) so an atomic
+// install failure can be proven not to have touched a single byte of it.
+function mirrorFingerprint() {
+  const root = join(home, "bin-bb");
+  const h = createHash("sha256");
+  const walk = (dir, rel) => {
+    for (const name of readdirSync(dir).sort()) {
+      const abs = join(dir, name);
+      const st = lstatSync(abs);
+      const key = `${rel}/${name}`;
+      if (st.isSymbolicLink()) h.update(`L ${key} -> ${readlinkSync(abs)}\n`);
+      else if (st.isDirectory()) { h.update(`D ${key}\n`); walk(abs, key); }
+      else h.update(`F ${key} ${createHash("sha256").update(readFileSync(abs)).digest("hex")}\n`);
+    }
+  };
+  walk(root, "");
+  return h.digest("hex");
+}
+
+console.log(`# zero-window migration check (${OLD_ORDER ? "OLD order — expect a window" : "NEW order — expect none"})  scratch=${scratch}`);
+console.log(`# patch base = ${patchBase().slice(0, 12)}\n`);
 try {
   // --- Reproduce the live dirty state ---------------------------------------
-  // upstream = clone of native firstmate, advanced by 2 commits (a new sourced bin/
-  // sibling + a doc edit) so `home` can be BEHIND it, exactly like the live home.
-  if (sh("git", ["clone", "--quiet", "--no-local", `file://${NATIVE_FM}`, upstream]).code !== 0) throw new Error("clone upstream failed");
+  // upstream = clone pinned at the patch base, then advanced by 2 commits (a new
+  // sourced bin/ sibling + a doc edit that do NOT touch the patched files) so `home`
+  // can be BEHIND it, exactly like the live home. Keeping the patched files untouched
+  // is what lets the re-install against the advanced HEAD keep applying.
+  const cloned = cloneAtBase(checkout, upstream);
+  if (!cloned.ok) { console.log(`SKIP: ${cloned.reason}`); rmSync(scratch, { recursive: true, force: true }); process.exit(0); }
+  // cloneAtBase leaves upstream DETACHED at the base; put it on a branch so the two
+  // synthetic commits advance a ref that `home` can track and fast-forward to.
+  git(upstream, "checkout", "-B", "main");
   sh("bash", ["-c", `printf '#!/usr/bin/env bash\\n' > "${join(upstream, "bin", "fm-extra-sibling.sh")}"; chmod +x "${join(upstream, "bin", "fm-extra-sibling.sh")}"`]);
   git(upstream, "add", "bin/fm-extra-sibling.sh");
   git(upstream, "-c", "user.email=x@x", "-c", "user.name=x", "commit", "-q", "-m", "upstream: new sibling");
@@ -71,7 +105,8 @@ try {
   git(upstream, "add", "README.md");
   git(upstream, "-c", "user.email=x@x", "-c", "user.name=x", "commit", "-q", "-m", "upstream: doc edit");
 
-  // home = clone of upstream, reset BACK 2 so it is behind (its @{u} is ahead).
+  // home = clone of upstream, reset BACK 2 so it is behind (its @{u} is ahead) and
+  // sits exactly at the patch base.
   if (sh("git", ["clone", "--quiet", "--no-local", `file://${upstream}`, home]).code !== 0) throw new Error("clone home failed");
   mkdirSync(join(home, "data"), { recursive: true });
   mkdirSync(join(home, "state"), { recursive: true });
@@ -111,6 +146,35 @@ try {
     if (install().code !== 0) throw new Error("re-install failed");
     probe("F: after re-install against new HEAD");
     console.log(`  --verify after re-install (expected healthy): ${verify().code === 0 ? "healthy" : "STALE"}`);
+
+    // ---- Step G: a FAILED re-install must not open a window ---------------
+    // Simulate upstream drifting a patched file so a hunk no longer applies, then
+    // re-install with the REAL overlay pointed at a broken copy of the patches. The
+    // atomic installer must exit non-zero and loud, leave the healthy mirror exactly
+    // as it was, and keep dispatching bb.
+    const before = mirrorFingerprint();
+    const brokenOverlay = join(scratch, "broken-overlay");
+    cpSync(OVERLAY, brokenOverlay, { recursive: true });
+    // Corrupt a REMOVED (-) line so patch cannot locate it -> the hunk FAILS hard
+    // (a fuzz-tolerated context change would still apply and would not be a failure).
+    const bp = join(brokenOverlay, "firstmate-bb-backend.patch");
+    const patchText = readFileSync(bp, "utf8");
+    const needle = '-FM_BACKEND_KNOWN="tmux herdr zellij orca cmux"';
+    if (!patchText.includes(needle)) throw new Error("could not find anchor to corrupt in backend patch");
+    writeFileSync(bp, patchText.replace(needle, '-FM_BACKEND_KNOWN="THIS_LINE_DOES_NOT_EXIST_UPSTREAM"'));
+    const failed = spawnSync("python3", [INSTALLER, "--home", home, "--overlay", brokenOverlay, "--project-id", "proj_test"], { encoding: "utf8" });
+    const loud = /INSTALL FAILED/.test(failed.stderr ?? "") && /did not apply/.test(failed.stderr ?? "");
+    const notReady = !/BB backend ready/.test(`${failed.stdout ?? ""}${failed.stderr ?? ""}`);
+    const noLeftover = !existsSync(join(home, "bin-bb.staging")) && !existsSync(join(home, "bin-bb.old"));
+    const untouched = mirrorFingerprint() === before;
+    console.log(`  FAILED re-install: exit=${failed.status} loud=${loud} notReady=${notReady} noLeftover=${noLeftover} mirrorUntouched=${untouched}`);
+    probe("G: after a FAILED atomic re-install (working mirror must still serve bb)");
+    if (failed.status === 0) throw new Error("failed re-install must exit non-zero");
+    if (!loud) throw new Error(`failed re-install must be LOUD:\n${failed.stderr}`);
+    if (!notReady) throw new Error("failed re-install must not print 'BB backend ready'");
+    if (!noLeftover) throw new Error("failed re-install left a staging/backup dir behind");
+    if (!untouched) throw new Error("failed re-install mutated the working mirror (not atomic)");
+    console.log(`  --verify after FAILED re-install (mirror intact, expected healthy): ${verify().code === 0 ? "healthy" : "STALE"}`);
   } else {
     // ---- OLD order (mutation): restore BEFORE install → a bb-less window --
     restoreNative();
