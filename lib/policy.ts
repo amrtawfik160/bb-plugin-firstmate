@@ -71,6 +71,62 @@ export function parseOutcome(output: string | null): string | null {
   return `${tag}: ${m[3].trim().replace(/\s+/g, " ").slice(0, 200)}`;
 }
 
+/** The self-reported terminal verdict a crew ends its turn with. */
+export type Verdict = "DONE" | "BLOCKED" | "FAILED";
+
+/** The verdict tag carried by a parsed outcome (parseOutcome output), or null. */
+export function verdictOf(outcome: string | null): Verdict | null {
+  if (outcome === null) return null;
+  if (outcome.startsWith("DONE")) return "DONE";
+  if (outcome.startsWith("BLOCKED")) return "BLOCKED";
+  if (outcome.startsWith("FAILED")) return "FAILED";
+  return null;
+}
+
+/** Compact inline verdict marker (glyph + word) for list/row surfaces. */
+export function verdictMarker(verdict: Verdict): string {
+  switch (verdict) {
+    case "BLOCKED":
+      return "🚧 BLOCKED";
+    case "FAILED":
+      return "❌ FAILED";
+    default:
+      return "✅ DONE";
+  }
+}
+
+/** How a crew's idle turn is presented once its self-reported verdict is known. */
+export interface VerdictPresentation {
+  /** Doorbell / wake-drain head, e.g. "✅ crew c1 done". */
+  head: string;
+  /** The `next:` action line appropriate to the verdict. */
+  next: string;
+}
+
+/**
+ * Present a crew that ended its turn idle (thread.idle → kind "idle") by its
+ * PARSED VERDICT, not by the raw event kind. A crew that self-reports BLOCKED or
+ * FAILED in-band still fires thread.idle, so deriving the head from kind alone
+ * renders a failure as "✅ … done" and offers `deliver` on a FAILED crew. Each
+ * verdict gets a distinct glyph and an appropriate next action:
+ *   DONE    → ✅ done,    deliver
+ *   BLOCKED → 🚧 blocked, tell|retry|forget (unblock/steer, never deliver)
+ *   FAILED  → ❌ failed,  retry|tell|forget (retry/investigate, never deliver)
+ * A verdict-less idle (verdict null — ambiguous) keeps the done/deliver shape,
+ * matching the prior default; the doorbell-suppression gate independently errs
+ * toward telling the captain for any non-DONE outcome.
+ */
+export function idleVerdictPresentation(crewId: string, verdict: Verdict | null): VerdictPresentation {
+  switch (verdict) {
+    case "BLOCKED":
+      return { head: `🚧 crew ${crewId} blocked`, next: `next: bb firstmate tell|retry|forget ${crewId}` };
+    case "FAILED":
+      return { head: `❌ crew ${crewId} failed`, next: `next: bb firstmate retry|tell|forget ${crewId}` };
+    default:
+      return { head: `✅ crew ${crewId} done`, next: `next: bb firstmate deliver ${crewId}` };
+  }
+}
+
 const CORR_TOKEN = /^corr=[0-9A-Fa-f]{16}$/;
 const PROTOCOL_VERBS = new Set(["done", "blocked", "failed"]);
 

@@ -17,6 +17,9 @@ import {
   statusLinesFrom,
   statusProtocolSummary,
   toReasoningLevel,
+  verdictOf,
+  verdictMarker,
+  idleVerdictPresentation,
 } from "./policy.ts";
 
 test("toReasoningLevel accepts the dispatch-profile scale only", () => {
@@ -255,4 +258,41 @@ test("statusProtocolSummary reports state and open decisions, null when absent",
   assert.match(summary!, /state: working/);
   assert.match(summary!, /open needs-decision \[k\]: choose/);
   assert.equal(statusProtocolSummary(["nothing to see"]), null);
+});
+
+test("verdictOf reads the terminal tag from a parsed outcome", () => {
+  assert.equal(verdictOf(parseOutcome("DONE: shipped")), "DONE");
+  assert.equal(verdictOf(parseOutcome("BLOCKED: need a remote")), "BLOCKED");
+  assert.equal(verdictOf(parseOutcome("FAILED: contradictory reqs")), "FAILED");
+  assert.equal(verdictOf(null), null);
+  assert.equal(verdictOf(parseOutcome("just prose, no verdict")), null);
+});
+
+test("idleVerdictPresentation: BLOCKED/FAILED never render as done and never offer deliver", () => {
+  const done = idleVerdictPresentation("c1", "DONE");
+  assert.equal(done.head, "✅ crew c1 done");
+  assert.match(done.next, /deliver c1/);
+
+  const blocked = idleVerdictPresentation("c1", "BLOCKED");
+  assert.equal(blocked.head, "🚧 crew c1 blocked");
+  assert.doesNotMatch(blocked.head, /done/);
+  assert.doesNotMatch(blocked.next, /deliver/);
+  assert.match(blocked.next, /tell\|retry\|forget c1/);
+
+  const failed = idleVerdictPresentation("c1", "FAILED");
+  assert.equal(failed.head, "❌ crew c1 failed");
+  assert.doesNotMatch(failed.head, /done/);
+  assert.doesNotMatch(failed.next, /deliver/);
+  assert.match(failed.next, /retry\|tell\|forget c1/);
+
+  // A verdict-less idle keeps the prior done/deliver shape.
+  const unknown = idleVerdictPresentation("c1", null);
+  assert.equal(unknown.head, "✅ crew c1 done");
+  assert.match(unknown.next, /deliver c1/);
+});
+
+test("verdictMarker gives a distinct glyph per verdict", () => {
+  assert.equal(verdictMarker("DONE"), "✅ DONE");
+  assert.equal(verdictMarker("BLOCKED"), "🚧 BLOCKED");
+  assert.equal(verdictMarker("FAILED"), "❌ FAILED");
 });
