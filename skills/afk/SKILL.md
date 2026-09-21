@@ -45,7 +45,7 @@ Say plainly which sentence, if any, you could not act on while away (a red merge
 ### On the captain's go, commit the posture
 
 <!-- BB-ONLY: BB commits the durable contract in one tool call. -->
-Call `firstmate_afk` with `action: "on"` and `words` set to the captain's words verbatim (or `bb firstmate afk on -- "words"`; pre-authorize a specific away merge with `--grant <task-id>`). With no words, commit directly.
+Call `firstmate_afk` with `action: "on"` and `words` set to the captain's words verbatim (or `bb firstmate afk on -- "words"`, pre-authorizing a specific away merge with `--grant <task-id>`), or commit directly when there are no words.
 <!-- /BB-ONLY -->
 <!-- BB-DIVERGE
      native: .agents/skills/afk/SKILL.md § Entering
@@ -56,8 +56,13 @@ Call `firstmate_afk` with `action: "on"` and `words` set to the captain's words 
 Relay that announcement verbatim in spirit: hold-for-return only, no phone channel, your instructions are recorded and the away session will carry them out where it can, anything it is unsure of, or that needs you, waits for your return, and destructive, irreversible, and security-sensitive actions are never pre-authorizable whatever the words say.
 Re-invoking `/afk` while already away with no new words is a refresh and leaves the standing record untouched; new words replace the mandate after the same read-back, preserve the original session entry, and archive the superseded words for the return brief.
 
+<!-- BB-DIVERGE
+     native: .agents/skills/afk/SKILL.md
+     native-quote: keeps the one supervision session running
+     bb: BB keeps `supervision on` and holds routine done-pings for the return brief; failures, stuck crews, credentials, and review-ready PRs still surface.
+     reason: BB has one supervision session and holds pings in its own transport. -->
 <!-- BB-ONLY: BB holds routine pings while supervision stays on. -->
-Keep `supervision on`. Routine done-pings are held for the return brief; failures, stuck crews, credentials, and review-ready PRs still surface.
+Keep `supervision on` so routine done-pings hold for the return brief, while failures, stuck crews, credentials, and review-ready PRs still surface.
 <!-- /BB-ONLY -->
 
 ## While away
@@ -69,6 +74,11 @@ Destructive, irreversible, and security-sensitive actions are never pre-authoriz
 
 No `/back` is needed. The first genuine message is the return signal:
 
+<!-- BB-DIVERGE
+     native: .agents/skills/afk/SKILL.md § How to exit: the return
+     native-quote: before acting on the message that brought the captain back
+     bb: BB runs `firstmate_afk off` (which prints the return brief) instead of native's `fm-afk-return.sh`.
+     reason: BB owns the return transition in its tool. -->
 <!-- BB-ONLY: BB prints the return brief through the tool; act on the message after. -->
 Call `firstmate_afk` `action: "off"` (or `bb firstmate afk off`) before acting on the message that brought the captain back.
 <!-- /BB-ONLY -->

@@ -211,17 +211,46 @@ the snapshot; the check fails a quote that no longer resolves (native drift):
          reason: the BB tool has no separate propose step. -->
 
 **`BB-ONLY`** — a fence around BB-specific *rendered* text that has no native source
-(a tool call, a BB-only section). The fence carries a reason and the checker skips
-its contents:
+(a tool call, a BB-only section). A fence is **not** a blind trust boundary; the
+checker constrains it so a rewrite cannot hide inside one:
 
+    <!-- BB-DIVERGE
+         native: .agents/skills/afk/SKILL.md § Entering
+         native-quote: Run `bin/fm-afk-launch.sh confirm`
+         bb: BB commits the durable contract in one tool call.
+         reason: the BB tool has no separate propose step. -->
     <!-- BB-ONLY: BB commits the durable contract in one tool call. -->
     Call `firstmate_afk` with `action: "on"` …
     <!-- /BB-ONLY -->
+
+Every fence must satisfy all of:
+
+- **Adjacent `BB-DIVERGE`.** A fence must sit next to a `BB-DIVERGE` that names the
+  native it replaces. This makes the marker *load-bearing*: delete it and the fence
+  fails. (Fixes the hole where a `BB-DIVERGE` was decorative.)
+- **BB-anchored per sentence.** Every sentence inside the fence must carry a token
+  from the BB allow-list (`firstmate_*`, `bb firstmate`, `supervision on`,
+  `Ready to review`, `--grant`/`--resolve-key`/`--yes`/`--allow-red`, `/afk` … ,
+  `deliver`). Free prose with no BB token cannot live in a fence — that is what
+  closes the "wrap a rewrite in a fence" hole.
+- **No native-derived content.** A sentence that resolves verbatim in native may not
+  be fenced; un-fence it so it is actually checked.
+- **Bounded + structured reason.** At most six sentences per fence, and a non-empty
+  reason of real length. A fence cannot grow into a parallel skill.
 
 The reason must be a real environmental constraint (no tmux pane, no composer to
 read, BB threads not windows, no blocking stop hook, a tool that folds two native
 steps into one, the KV cache plane, etc.). "Shorter" or "reads better" is not a
 reason — copy native's wording instead.
+
+**What the check can and cannot catch (be honest).** It catches every *unmarked*
+divergence, every *unfenced* non-native sentence, an anchor that stops resolving,
+native content smuggled into a fence, and any fenced sentence with no BB token — so
+the reviewer's "wrap the rewrite in a fence" escape and "delete the marker" escape
+both now fail. It does **not** semantically judge prose: a lie welded into a single
+sentence that also references a real BB tool would carry a token and pass the token
+gate. That residue is a human-review responsibility; the check makes casual and
+fenced drift fail loudly, not every conceivable adversarial sentence.
 
 Do **not** import native instructions that would mislead a BB crew (tmux/herdr pane
 mechanics, keystroke injection, the away daemon) just to raise a fidelity number.

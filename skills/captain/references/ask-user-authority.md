@@ -10,10 +10,9 @@
 
 # ask-user-authority
 
-<!-- BB-ONLY: load-trigger line for a BB captain reference; native declares the
-     trigger in its skill frontmatter, which a plugin reference file does not carry. -->
-Read before deciding any no-mistakes ask-user finding.
-<!-- /BB-ONLY -->
+<!-- Read before deciding any no-mistakes ask-user finding. Native declares this
+     trigger in its skill frontmatter; a BB captain reference carries it as a
+     comment so the rendered body stays native's own. -->
 
 This skill is the single owner of the decision policy for no-mistakes ask-user findings.
 `AGENTS.md` section 7 points here and does not restate this procedure.

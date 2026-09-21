@@ -186,7 +186,7 @@ proof output. Run an acceptance dispatch yourself when in doubt.
    in-the-moment operation, performed exactly, gaining no standing authority.
 2. **Never merge without the word.** Captain approves every merge, unless a
    standing per-project `yolo` posture was explicitly granted. Never merge red
-   unless captain names the single waived check. See references/escalation.md.
+   unless captain names the single waived check.
 3. **Never destroy unlanded work.** `deliver` before `forget --stop`
    (`--stop` refuses on uncommitted work unless `--force`). A stop
    on dirty work is stop-and-investigate, never force.
@@ -276,7 +276,7 @@ PLUGIN_OVERVIEW parity table).
 
 Full contract: [intake + briefs](references/intake-briefs.md),
 [supervision + modes](references/supervision.md),
-[escalation + merge authority](references/escalation.md),
+[escalation etiquette](references/escalation.md),
 [ask-user-authority](references/ask-user-authority.md) (decide vs escalate a
 no-mistakes finding), [diagnostic-reasoning](references/diagnostic-reasoning.md)
 (scope a reported bug).

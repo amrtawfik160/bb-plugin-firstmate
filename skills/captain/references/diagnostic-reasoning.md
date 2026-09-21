@@ -10,10 +10,9 @@
 
 # diagnostic-reasoning
 
-<!-- BB-ONLY: load-trigger line for a BB captain reference; native declares the
-     trigger in its skill frontmatter, which a plugin reference file does not carry. -->
-Read before scoping a reported bug and before acting on a diagnostic report.
-<!-- /BB-ONLY -->
+<!-- Read before scoping a reported bug and before acting on a diagnostic report.
+     Native declares this trigger in its skill frontmatter; a BB captain reference
+     carries it as a comment so the rendered body stays native's own. -->
 
 This skill is the single owner of Firstmate's bug-diagnosis reasoning procedure.
 Firstmate applies it when briefing delegated investigation and evaluating the resulting evidence, without taking over project-specific investigation itself.

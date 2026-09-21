@@ -9,11 +9,9 @@
      (section 7) is not yet re-derived — deferred to a later PR. See
      CONTRIBUTING.md "Skill fidelity". -->
 
-# Escalation + merge authority
+# Escalation etiquette
 
-<!-- BB-ONLY: BB framing line for when to read this reference. -->
-Read before pinging the captain or merging anything.
-<!-- /BB-ONLY -->
+<!-- Read before pinging the captain. -->
 
 ## Talk in outcomes, not mechanics
 
@@ -58,10 +56,8 @@ Reach the captain immediately for:
 - Anything destructive, irreversible, or security-sensitive.
 - A needed credential or login.
 
-<!-- BB-ONLY: pointer to the adopted decision policy for the third bullet. -->
-For the decide-vs-escalate boundary behind those gate findings, see
-[ask-user-authority.md](ask-user-authority.md).
-<!-- /BB-ONLY -->
+<!-- The decide-vs-escalate boundary behind those gate findings lives in
+     ask-user-authority.md. -->
 
 Do not surface automatic fixes, retries, routine progress, or internal supervision mechanics.
 Reply exactly `Captain, shipshape.` only for a true no-op that still needs an answer - an idle re-read, an empty heartbeat, or a pure acknowledgement with no consequence for the captain - without characterizing the visible session's unrelated decisions.
@@ -71,27 +67,9 @@ Batch non-urgent updates into the next natural reply.
 Whenever a PR is mentioned, and for any review or merge ask, include the PR's full `https://...` URL in MAIN's final captain-facing response, copied verbatim from the task's ready status or `pr=` metadata and never assembled from memory or left to a transcript entry that already shows it; when neither source has one, report only the identifier you actually have.
 Mention cost as a courtesy when unusually much work is running, but never block on it.
 
-<!-- BB-ONLY: BB's merge-authority model and merge tooling. Native's own merge
-     authority is AGENTS.md section 7 (not section 9) and is not yet re-derived
-     from native text — deferred to a later PR; until then this stays BB-only. -->
-## Merge authority
-
-- Default: captain approves every PR merge and local landing, per exact PR.
-- Standing `yolo` per project (explicit grant only): mate merges green,
-  in-scope work itself, then one-line outcome with full PR URL.
-- Never merge red under either setting unless a current explicit captain
-  instruction names the single waived check — and everything else is green.
-- Merge ONLY via `bb firstmate merge <id> [--yes]` / `firstmate_merge`:
-  PR path re-verifies open + CI green + mergeable; local-only path is
-  ff-only onto the project checkout. `--yes` is the captain's word for that
-  one exact land. Never route around with raw git merges.
-- A "merge now" answer is the explicit word for that one exact PR — no
-  second confirmation, but all re-verification above still applies.
-
-## Precedence
-
-Current explicit concrete captain instruction beats any standing rule in
-its exact scope. Must identify the concrete action/object. Never infer an
-override, broaden scope, apply by analogy, or convert one request into
-standing authority. Ambiguous scope → one concise clarification first.
-<!-- /BB-ONLY -->
+<!-- Merge authority is native AGENTS.md section 7, not section 9, and is not yet
+     re-derived from native text — deferred to the section-7 re-derivation PR. BB's
+     current merge rules live in the captain skill (Hard rules 2 + the Deliver
+     section + `firstmate_merge` / `--yes` / `--allow-red` in the command map).
+     Precedence (a current explicit captain instruction beats a standing rule in
+     its exact scope) is likewise carried by the captain skill's hard-rules coda. -->
