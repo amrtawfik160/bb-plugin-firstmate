@@ -11,6 +11,7 @@ import {
   capPermission,
   crewPrompt,
   decisionDue,
+  classifyMetaKind,
   hasStatusProtocol,
   idleVerdictPresentation,
   looksReadOnly,
@@ -1602,23 +1603,60 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  // A crew's append-only status stream, folded by the full protocol. When real
+  // The crew kind the fold must terminal-collapse under, resolved the way native
+  // `_fm_status_kind` does — NOT hardcoded. Native reads the crew's sibling
+  // state/<id>.meta and classifies a metaless/unreadable/symlink meta as
+  // `unknown` (which does NOT collapse); hardcoding `ship` would collapse
+  // decisions native keeps open on the 58% of live crews that have no `.meta`,
+  // SUPPRESSING a real captain call. A secondmate route never collapses. Without
+  // an fmHome there is no native plane to mirror, so trust the crew's own shape.
+  async function foldKind(crew: Crew, hostId?: string): Promise<string> {
+    if (isSecondmateRoute(crew)) return "secondmate";
+    const fmHome = (await settings.get()).fmHome.trim();
+    if (fmHome === "") return crew.shape;
+    try {
+      const hid = hostId ?? (await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined));
+      const meta = shQuote(`${fmHome}/state/${crew.id}.meta`);
+      // Native requires a regular, readable, non-symlink meta; anything else is
+      // `unknown`. exit 3 = that absent/rejected case; a clean cat = the content.
+      const res = await runOnHost(
+        hid,
+        `if [ -f ${meta} ] && [ -r ${meta} ] && [ ! -L ${meta} ]; then cat -- ${meta}; else exit 3; fi`,
+        15_000,
+      );
+      if (res.exitCode === 3) return classifyMetaKind(null);
+      if (res.exitCode !== 0) return "unknown"; // unreadable → native `unknown`
+      return classifyMetaKind(res.output);
+    } catch {
+      return "unknown";
+    }
+  }
+
+  // A crew's append-only status stream + the kind to fold it under. When real
   // mode is active the authoritative source is the on-host state/<id>.status file
-  // the worker appends to; otherwise (native path, or an unreachable host) fall
-  // back to the status-protocol lines the crew emitted in its BB chat output.
-  async function crewStatusLines(crew: Crew, output?: string | null): Promise<string[]> {
+  // the worker appends to (folded under the kind native reads from the sibling
+  // .meta); otherwise (native path, or an unreachable host) fall back to the
+  // status-protocol lines the crew emitted in its BB chat output (its own shape,
+  // or `secondmate` for a secondmate route).
+  async function crewStatusLines(
+    crew: Crew,
+    output?: string | null,
+  ): Promise<{ lines: string[]; kind: string }> {
     const fmHome = (await settings.get()).fmHome.trim();
     if (fmHome !== "" && !isSecondmateRoute(crew)) {
       try {
         const hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
         const path = `${fmHome}/state/${crew.id}.status`;
         const res = await runOnHost(hostId, `[ -f ${shQuote(path)} ] && cat -- ${shQuote(path)} || true`, 15_000);
-        if (res.exitCode === 0 && res.output.trim() !== "") return res.output.split(/\r?\n/);
+        if (res.exitCode === 0 && res.output.trim() !== "") {
+          return { lines: res.output.split(/\r?\n/), kind: await foldKind(crew, hostId) };
+        }
       } catch {
         // fall through to chat output
       }
     }
-    return statusLinesFrom(output === undefined ? await crewOutput(crew) : output);
+    const kind = isSecondmateRoute(crew) ? "secondmate" : crew.shape;
+    return { lines: statusLinesFrom(output === undefined ? await crewOutput(crew) : output), kind };
   }
 
   // Close a crew's open keyed decision when the captain answers it. Native
@@ -3045,8 +3083,13 @@ export default async function plugin(bb: BbPluginApi) {
         // done/failed the task is over, so any earlier decision is moot here.
         const lines = status === "idle" && !isSecondmateRoute(crew) ? statusLinesFrom(await crewOutput(crew)) : [];
         const latest = latestStatus(lines);
+        // Resolve the crew's real kind (native's `.meta` rule) only when a fold
+        // would actually run, so the deck stays cheap. A metaless crew folds as
+        // `unknown` → its open decision is NOT collapsed away.
         const openDecisions =
-          latest !== null && latest.verb !== "done" && latest.verb !== "failed" ? foldOpenDecisions(lines) : [];
+          latest !== null && latest.verb !== "done" && latest.verb !== "failed"
+            ? foldOpenDecisions(lines, await foldKind(crew))
+            : [];
         // A crew that ended idle self-reporting FAILED is a captain call (retry/
         // investigate), NOT a review-ready ship — its idle thread status must not
         // let it fall through to "ready to review (crew/deliver)".
@@ -5556,7 +5599,8 @@ export default async function plugin(bb: BbPluginApi) {
       const status = await crewStatus(crew);
       const output = await crewOutput(crew);
       const outcome = parseOutcome(output);
-      const protocol = statusProtocolSummary(await crewStatusLines(crew, output));
+      const { lines: statusLines, kind: foldKindResolved } = await crewStatusLines(crew, output);
+      const protocol = statusProtocolSummary(statusLines, foldKindResolved);
       return [
         formatCrew(crew, status, verdictOf(outcome)),
         protocol ?? "",
@@ -6619,11 +6663,13 @@ export default async function plugin(bb: BbPluginApi) {
             const status = await crewStatus(crew);
             const output = await crewOutput(crew);
             const outcome = parseOutcome(output);
-            const lines = await crewStatusLines(crew, output);
-            const protocol = statusProtocolSummary(lines);
+            const { lines, kind: foldKindResolved } = await crewStatusLines(crew, output);
+            const protocol = statusProtocolSummary(lines, foldKindResolved);
             const latest = latestStatus(lines);
             const openDecisions =
-              latest !== null && latest.verb !== "done" && latest.verb !== "failed" ? foldOpenDecisions(lines) : [];
+              latest !== null && latest.verb !== "done" && latest.verb !== "failed"
+                ? foldOpenDecisions(lines, foldKindResolved)
+                : [];
             return reply(
               { ...crew, status, outcome, protocol, openDecisions, output },
               [

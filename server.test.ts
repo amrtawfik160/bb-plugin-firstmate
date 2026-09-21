@@ -2179,6 +2179,73 @@ test("firstmate_crew folds the full status protocol from crew output", async () 
   }
 });
 
+// Wiring regression: the fold's kind must be resolved from the crew's on-host
+// state/<id>.meta the way native `_fm_status_kind` does — NOT hardcoded "ship".
+// These drive the real host-status path (fmHome set) with a stream that ends
+// `needs-decision → done → working`: latest is non-terminal so the fold runs, and
+// the mid-stream `done` collapses ONLY under a collapsing kind.
+function crewFoldHost(host: ReturnType<typeof createFakePluginHost>, statusStream: string, metaExitOrBody: { absent: true } | { body: string }) {
+  const cmdById = new Map<string, string>();
+  let n = 0;
+  host.harness.sdk.stub("threads.list", async () => []);
+  host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle" }));
+  host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+  host.harness.sdk.stub("threads.output", async () => ({ output: "" }));
+  host.harness.sdk.stub("environments.list", async () => [
+    { hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" },
+  ]);
+  host.harness.sdk.stub("terminals.create", async (args: { start?: { command?: string } }) => {
+    const id = `term_${++n}`;
+    cmdById.set(id, args.start?.command ?? "");
+    return { id };
+  });
+  host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+  host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
+    const cmd = cmdById.get(args.terminalId) ?? "";
+    if (cmd.includes("/state/c1.status")) return hostOutput(statusStream, 0);
+    if (cmd.includes("/state/c1.meta")) {
+      return "absent" in metaExitOrBody ? hostOutput("", 3) : hostOutput(metaExitOrBody.body, 0);
+    }
+    return hostRcOutput(0);
+  });
+  host.harness.sdk.stub("terminals.close", async () => ({}));
+}
+
+const HOLD_STREAM = [
+  "needs-decision [key=deploy-freeze]: HOLD all merges to main",
+  "done [at=1790000000]: apply complete",
+  "working [at=1790000100]: retry after redeploy",
+].join("\n");
+
+test("crew fold: a metaless crew folds as native `unknown` — mid-stream terminal does NOT suppress the open decision", async () => {
+  const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { fmHome: "/tmp/fm-home" } });
+  await plugin(host.bb);
+  try {
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    crewFoldHost(host, HOLD_STREAM, { absent: true }); // no .meta → native `unknown` → no collapse
+    const result = await host.harness.behavior.runCli(["crew", "c1"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    // The real captain call survives — hardcoding kind="ship" here would collapse it.
+    assert.match(result.stdout, /open needs-decision \[deploy-freeze\]: HOLD all merges to main/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("crew fold: a ship-meta crew collapses the mid-stream terminal, matching native ship", async () => {
+  const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { fmHome: "/tmp/fm-home" } });
+  await plugin(host.bb);
+  try {
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    crewFoldHost(host, HOLD_STREAM, { body: "id=c1\nkind=ship\n" }); // ship meta → collapse
+    const result = await host.harness.behavior.runCli(["crew", "c1"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.doesNotMatch(result.stdout, /open needs-decision \[deploy-freeze\]/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("bearings surfaces an idle crew's open decision as a Captain's Call", async () => {
   const host = await load();
   try {

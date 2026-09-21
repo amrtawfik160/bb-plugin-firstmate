@@ -132,12 +132,29 @@ not). Extend the corpus whenever you touch the fold or find a new native edge.
 
 - It drives the script at `FM_CLASSIFY_LIB` (default
   `/root/firstmate/bin/fm-classify-lib.sh`). On a host **with** native it runs and
-  proves equivalence; **without** native it **skips** (never a false green).
-- It is part of `npm test`. To force it against a specific native copy:
+  proves equivalence.
+- **Equivalence is conditional on passing the crew's real kind.** The fold only
+  matches native when the caller supplies the kind native derives from the crew's
+  `state/<id>.meta` — a metaless crew is `unknown` (which does NOT terminal-collapse),
+  NOT `ship`. `classifyMetaKind` (policy.ts) is that pure derivation and is itself
+  differential-tested against native `_fm_status_kind`; `server.ts` `foldKind` reads
+  the on-host `.meta` and feeds it to every fold call site. Do **not** hardcode a
+  kind — it silently suppresses real captain decisions on metaless crews.
+- **Never-inert:** without native the differential/kind cases skip, but a dedicated
+  gate test **fails loudly** so a green run on a native-less CI can't masquerade as a
+  verified port. Point CI at a native host, or set `FM_ALLOW_NO_NATIVE=1` to
+  knowingly accept an unverified run. Force a specific copy with
   `FM_CLASSIFY_LIB=/path/to/fm-classify-lib.sh npm test`.
 - New port helper, or a behaviour you "improved" over native? The contract is
   **equivalence**, not improvement — add the case to the corpus and make both
   folds agree.
+
+**Known divergence (recorded, not fixed):** `foldOpenDecisions` strips a trailing
+`\r` from each line (`policy.ts`, pre-existing), so a CRLF-terminated decision line
+yields note `"q"` vs native's `read -r` `"q\r"`. It affects note *text* only — never
+the open/close/collapse decision — and real host status files are LF, so on-host
+impact is nil. A CRLF case is deliberately kept OUT of the differential corpus (it
+would correctly fail the guard); revisit only if CRLF status files ever appear.
 
 ## Docs and ADRs
 

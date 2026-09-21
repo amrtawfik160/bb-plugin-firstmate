@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { foldOpenDecisions, type OpenDecision } from "./policy.ts";
+import { classifyMetaKind, foldOpenDecisions, type OpenDecision } from "./policy.ts";
 
 // ── Differential drift guard ─────────────────────────────────────────────────
 // foldOpenDecisions is a hand port of fm-classify-lib.sh `status_open_decisions`.
@@ -146,6 +146,26 @@ const CORPUS: Array<{ name: string; lines: string[] }> = [
       "resolved [at=1790000100] [key=a]: stamped answer",
     ],
   },
+  // ── MUT-E shape: a done|failed line whose key MATCHES an open decision. Under a
+  // collapsing kind the collapse wins; under a NON-collapsing kind the terminal is
+  // a plain no-op and MUST NOT drop the matching decision via the closer branch.
+  // (Removing the `verb === done|failed → continue` no-op reddens these.)
+  {
+    name: "MUT-E: keyed done matching an open decision (no-op under non-collapsing kind)",
+    lines: ["needs-decision [key=a]: q", "done [key=a]: x"],
+  },
+  {
+    name: "MUT-E: bare done matching a default decision",
+    lines: ["needs-decision: q", "done: x"],
+  },
+  {
+    name: "MUT-E: keyed failed matching an open blocked",
+    lines: ["blocked [key=a]: q", "failed [key=a]: x"],
+  },
+  {
+    name: "MUT-E: keyed done matching one of several open decisions",
+    lines: ["needs-decision [key=a]: first", "blocked [key=b]: second", "failed [key=a]: bail"],
+  },
 ];
 
 const KINDS = ["ship", "scout", "secondmate", "unknown"];
@@ -163,3 +183,72 @@ for (const { name, lines } of CORPUS) {
     }
   });
 }
+
+// ── kind resolution: classifyMetaKind vs native `_fm_status_kind` ─────────────
+// The fold is only faithful if the caller passes the kind native would derive
+// from the crew's `.meta`. classifyMetaKind is that pure derivation; prove it
+// equals native's `_fm_status_kind` (its meta-derived branch) over crafted metas,
+// including the metaless case that must classify `unknown` (non-collapsing).
+
+/** Drive the real shell `_fm_status_kind` for a status file + a crafted (or absent) `.meta`. */
+function nativeKind(meta: string | null): string {
+  const dir = mkdtempSync(join(tmpdir(), "fmkind-"));
+  try {
+    const status = join(dir, "crew.status");
+    writeFileSync(status, "working: x\n");
+    if (meta !== null) writeFileSync(join(dir, "crew.meta"), meta);
+    // No explicit kind arg → native reads the sibling .meta and falls back.
+    return execFileSync("bash", ["-c", '. "$1"; _fm_status_kind "$2"', "_", LIB, status], {
+      encoding: "utf8",
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const META_CORPUS: Array<{ name: string; meta: string | null }> = [
+  { name: "absent meta → unknown", meta: null },
+  { name: "empty meta → ship (no kind=)", meta: "" },
+  { name: "no kind= line → ship", meta: "id=c1\nthreadId=thr_x\n" },
+  { name: "kind=ship", meta: "id=c1\nkind=ship\n" },
+  { name: "kind=scout", meta: "kind=scout\n" },
+  { name: "kind=secondmate", meta: "kind=secondmate\n" },
+  { name: "unrecognized kind → unknown", meta: "kind=weird\n" },
+  { name: "empty kind value → ship", meta: "kind=\n" },
+  { name: "last kind= wins", meta: "kind=ship\nkind=scout\n" },
+  { name: "no trailing newline", meta: "kind=scout" },
+  { name: "CRLF keeps \\r → unknown (native read -r keeps it)", meta: "kind=ship\r\n" },
+];
+
+for (const { name, meta } of META_CORPUS) {
+  test(`kind resolution: ${name}`, { skip: !HAVE_NATIVE ? "native fm-classify-lib not present" : false }, () => {
+    assert.equal(
+      classifyMetaKind(meta),
+      nativeKind(meta),
+      `classifyMetaKind diverged from native _fm_status_kind\n  meta: ${JSON.stringify(meta)}`,
+    );
+  });
+}
+
+// ── Loud-CI gate (do not let a native-less run look "verified") ───────────────
+// The differential + kind cases SKIP without native, so a green run on a
+// native-less CI proves nothing about the port. Fail loudly unless the operator
+// knowingly opts out (FM_ALLOW_NO_NATIVE=1), so a plain green always means the
+// port was actually checked against native.
+test("drift guard must run against native (set FM_ALLOW_NO_NATIVE=1 to knowingly skip)", () => {
+  if (!HAVE_NATIVE && process.env["FM_ALLOW_NO_NATIVE"] !== "1") {
+    assert.fail(
+      `Differential drift guard is INERT: native fm-classify-lib not found at ${LIB}. ` +
+        `Run on a host with native firstmate, point FM_CLASSIFY_LIB at it, or set ` +
+        `FM_ALLOW_NO_NATIVE=1 to accept an unverified port for this run.`,
+    );
+  }
+});
+
+// KNOWN DIVERGENCE (deliberately NOT in the corpus, so the guard stays green):
+// foldOpenDecisions strips a trailing \r from each line (policy.ts, pre-existing),
+// so a CRLF-terminated decision line yields note "q" (ours) vs "q\r" (native's
+// `read -r`). It affects note TEXT only — never the open/close/collapse decision —
+// and real host status files are LF, so impact is nil on-host. Documented in
+// CONTRIBUTING.md ("known divergences"). Adding a CRLF line here would (correctly)
+// fail the guard; it is recorded rather than fixed in this change.

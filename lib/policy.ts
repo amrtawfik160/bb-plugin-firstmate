@@ -278,14 +278,21 @@ function keyTransitionAllowed(key: string, note: string): boolean {
  * fm-classify-lib `status_open_decisions` (via `_fm_decision_fold_line`).
  * Most-recently-opened last, exactly as the reference prints them.
  *
- * `kind` selects the terminal-collapse rule that native reads from the task's
- * sibling `.meta`: a ship/scout `done`/`failed` line closes EVERY open decision
+ * `kind` selects the terminal-collapse rule native reads from the task's sibling
+ * `.meta`: a ship/scout `done`/`failed` line closes EVERY open decision
  * (fm-classify-lib.sh:700-702), because the terminal verdict retires the whole
  * task — an earlier keyed decision it never explicitly resolved is moot, not a
- * phantom the captain still owes an answer. A secondmate/unknown kind does not
- * collapse. BB crews are only ever ship or scout (both collapse), so the default
- * matches every real caller; the parameter exists so a differential harness can
- * exercise the non-collapsing kinds against native.
+ * phantom the captain still owes an answer. `secondmate` and `unknown` do NOT
+ * collapse.
+ *
+ * `kind` is NOT optional-with-a-safe-guess: native derives it per crew from the
+ * `.meta` and classifies a metaless crew as `unknown` (non-collapsing), so a
+ * caller that hardcodes `ship` would collapse decisions native keeps open —
+ * a SUPPRESSING divergence that hides a real captain call. Callers MUST resolve
+ * the crew's real kind (see server.ts `foldKind` → `classifyMetaKind`). The
+ * `"ship"` default exists only so the pure differential harness and the
+ * hand-written unit tests can name a kind inline; it is not a stand-in for
+ * resolving the real one.
  */
 export function foldOpenDecisions(lines: string[], kind: string = "ship"): OpenDecision[] {
   const collapses = kind === "ship" || kind === "scout";
@@ -339,6 +346,30 @@ export function foldOpenDecisions(lines: string[], kind: string = "ship"): OpenD
   return open;
 }
 
+/**
+ * fm-classify-lib `_fm_status_kind` (its `.meta`-derived branch): the crew kind
+ * native folds a status file under, resolved from the sibling `.meta`.
+ *   - `null` (meta absent / unreadable / a symlink) → `"unknown"` — native's
+ *     fallback, which does NOT terminal-collapse.
+ *   - present but no `kind=` line → `"ship"` (native's `${kind:-ship}`).
+ *   - the LAST `kind=` line wins (native overwrites in its read loop); an
+ *     unrecognized value → `"unknown"`.
+ * The caller performs the file stat/read (native requires a regular, readable,
+ * non-symlink file); this is the pure classify so it can be proven equal to
+ * native's `_fm_status_kind` in the differential guard.
+ */
+export function classifyMetaKind(metaContent: string | null): string {
+  if (metaContent === null) return "unknown";
+  let kind = "";
+  // Match native's `while IFS= read -r line; case kind=*`: split on \n only and
+  // keep any \r, so a CRLF meta classifies exactly as native's `read -r` would.
+  for (const line of metaContent.split("\n")) {
+    if (line.startsWith("kind=")) kind = line.slice("kind=".length);
+  }
+  if (kind === "") kind = "ship";
+  return kind === "ship" || kind === "scout" || kind === "secondmate" ? kind : "unknown";
+}
+
 /** The most recent recognized status verb + note (fm-classify-lib `last_status_line`, verb-filtered). */
 export function latestStatus(lines: string[]): { verb: string; note: string } | null {
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -360,14 +391,14 @@ export function statusLinesFrom(text: string | null | undefined): string[] {
  * A one-block human summary of a crew's folded status: the latest state, and any
  * still-open keyed decisions. `null` when the stream carries no status protocol.
  */
-export function statusProtocolSummary(lines: string[]): string | null {
+export function statusProtocolSummary(lines: string[], kind: string = "ship"): string | null {
   const latest = latestStatus(lines);
   // Once a crew's latest status is terminal (done/failed) the task is over, so
   // any earlier keyed decision is moot — do not report it as still open. This
   // also protects the chat-output source, which never carries the resolved/
   // captain-held closing lines the real state/<id>.status stream would.
   const terminal = latest !== null && (latest.verb === "done" || latest.verb === "failed");
-  const open = terminal ? [] : foldOpenDecisions(lines);
+  const open = terminal ? [] : foldOpenDecisions(lines, kind);
   if (latest === null && open.length === 0) return null;
   const parts: string[] = [];
   if (latest !== null) {
