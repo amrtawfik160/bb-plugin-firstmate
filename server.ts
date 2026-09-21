@@ -200,12 +200,18 @@ const MEM_LEARNINGS_KEY = "memory-learnings";
 const SECONDMATES_KEY = "secondmates";
 const AFK_KEY = "afk";
 const QUIET_KEY = "quiet";
-// D3: afk/quiet posture is scoped PER CAPTAIN, the same partition the durable wake
-// plane uses (cap-<captain>). On a shared fmHome many captains coexist, so a global
-// posture let one captain's afk/quiet change every other captain's doorbell/hold
-// behaviour. The KV key and the real .afk-contract/.afk state dir both carry the
-// captain suffix; a missing captain id falls back to the legacy global key/dir
-// (single-captain case), preserving prior behaviour.
+// D3: the KV afk/quiet NOTIFICATION posture is scoped PER CAPTAIN. This is the
+// layer that drives notifyCaptain's doorbell/hold decision; on a shared fmHome a
+// global key let one captain's afk/quiet change every other captain's doorbell
+// behaviour. The suffix mirrors the durable wake plane (cap-<captain>); a missing
+// captain id falls back to the legacy global key (single-captain case).
+//
+// F2 scope boundary: ONLY the KV posture is per-captain. The real durable away
+// record (state/.afk-contract) and flag (state/.afk) stay HOST-LEVEL, because the
+// native fm-watch keeper is one process per fmHome and reads those unscoped paths —
+// scoping them would leave the keeper blind to every captain's posture and split
+// the plugin's writes from native's reads. That is native firstmate's own one-home
+// posture model; see runAfkContract/writeAfkFlag.
 function captainScopeSuffix(captainThreadId: string | undefined): string {
   return captainThreadId === undefined || captainThreadId === ""
     ? ""
@@ -2269,6 +2275,34 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  // Committed-but-UNPUSHED work in a crew's worktree: commits on the branch vs its
+  // merge base that are NOT on a remote (no open/merged PR). This is unlanded work
+  // exactly like uncommitted changes — our hard rule is never to destroy it. If a
+  // PR exists the commits are on the forge (recoverable), so those do not count.
+  // Returns the changed file paths (empty when there is no unpushed committed work,
+  // or when the base/diff cannot be read — the branch is never deleted by teardown,
+  // see the note at the environments.delete call, so an undetectable case still does
+  // not lose the commits; the guard just cannot cite them).
+  async function committedUnpushedFiles(envId: string, prUrl: string): Promise<string[]> {
+    if (prUrl !== "") return []; // pushed to a PR → on the remote, recoverable
+    let base: string | null = null;
+    try {
+      const env = asRecord(await bb.sdk.environments.get({ environmentId: envId }));
+      base =
+        (typeof env["mergeBaseBranch"] === "string" && env["mergeBaseBranch"]) ||
+        (typeof env["defaultBranch"] === "string" && env["defaultBranch"]) ||
+        (typeof env["baseBranch"] === "string" && env["baseBranch"]) ||
+        null;
+    } catch {
+      return [];
+    }
+    if (base === null) return [];
+    const res = await bb.sdk.environments
+      .diffFiles({ environmentId: envId, target: "branch_committed", mergeBaseBranch: base })
+      .catch(() => null);
+    return res === null ? [] : extractPaths(res);
+  }
+
   // The exact names of a PR's non-green checks, via gh (mirrors fm-pr-merge's
   // statusCheckRollup read). null when they cannot be read — a failed read is
   // never an empty red set, so the caller must refuse rather than merge.
@@ -3378,24 +3412,46 @@ export default async function plugin(bb: BbPluginApi) {
         }
       }
       if (!force && envId !== null) {
+        // Unlanded-work protection. "Unlanded" is BOTH uncommitted changes AND
+        // committed-but-unpushed commits (F1) — either is work that only exists in
+        // this worktree, and our hard rule is never to destroy it. We refuse on
+        // either, loudly, leaving the thread AND the worktree intact. This makes
+        // the safety DELIBERATE, not a side effect of the teardown primitive
+        // happening to preserve the branch (see the note at environments.delete).
         const diff = await bb.sdk.environments
           .diffFiles({ environmentId: envId, target: "uncommitted" })
           .catch(() => null);
         const dirty = diff === null ? [] : extractPaths(diff);
         if (dirty.length > 0) {
-          // Dirty-tree protection: never discard uncommitted work. Refuse loudly
-          // and leave BOTH the thread and the worktree intact.
           await writeCrews([crew, ...(await readCrews())]);
           throw new Error(
             `Refusing: crew ${id} has ${dirty.length} uncommitted file(s) (${dirty.slice(0, 5).join(", ")}${dirty.length > 5 ? "…" : ""}). Deliver first, or re-run with --force to discard.`,
+          );
+        }
+        const unpushed = await committedUnpushedFiles(envId, (await prForCrew(crew)).url);
+        if (unpushed.length > 0) {
+          await writeCrews([crew, ...(await readCrews())]);
+          throw new Error(
+            `Refusing: crew ${id} has committed but UNPUSHED work on its branch (${unpushed.length} file(s): ${unpushed.slice(0, 5).join(", ")}${unpushed.length > 5 ? "…" : ""}). Those commits exist only in this worktree's branch. Open a PR / push first, or re-run with --force to discard.`,
           );
         }
       }
       try { await bb.sdk.threads.archive({ threadId: crew.threadId }); } catch { /* */ }
       try { await bb.sdk.threads.stop({ threadId: crew.threadId }); } catch { /* */ }
       // D2: native fm-teardown removes the git worktree; do the same so worktrees
-      // do not accumulate on disk after forget. Only reached once the tree is
-      // clean (or --force), so no uncommitted work is discarded here.
+      // do not accumulate on disk after forget. Only reached once the tree is clean
+      // and has no committed-unpushed work (or --force), so no unlanded work is
+      // discarded here.
+      //
+      // What this primitive deletes, precisely (F1): BB's `environments.delete` for
+      // a managed worktree runs `git worktree remove` on the shared parent repo. It
+      // removes the WORKING TREE only — it does NOT delete the crew's branch and
+      // does NOT drop git stash entries; both live in the shared parent repo and
+      // survive removal. We do NOT rely on that for safety: the guard above already
+      // refuses committed-unpushed work, so removal here is of a worktree whose work
+      // is either landed/pushed or explicitly force-discarded. This comment is the
+      // contract — if a future BB version prunes branches or drops stashes on delete,
+      // the guard (not this primitive) is still what prevents data loss.
       if (worktreeEnvId !== null) {
         try {
           await bb.sdk.environments.delete({ environmentId: worktreeEnvId });
@@ -4128,9 +4184,19 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   // Run bin/fm-afk-contract.sh <args> at fmHome. Reads/writes state/.afk-contract.
+  // F2: the real away-record (state/.afk-contract) and flag (state/.afk) are
+  // HOST-LEVEL, not per-captain. The native `fm-watch` keeper is one process per
+  // fmHome and reads the UNSCOPED $FM_HOME/state paths; scoping the record to
+  // cap-<captain>/ (an earlier D3 attempt) meant the keeper saw NO captain's away
+  // posture and silently disabled native away-automation host-wide, while the
+  // plugin wrote somewhere the keeper never reads — a write/read split-brain. So
+  // the real contract stays where native reads it (one per-home posture, exactly
+  // native firstmate's own model), and only the KV notification posture is scoped
+  // per captain (that is the layer that drove the cross-captain doorbell holds the
+  // D3 defect was about). No split-brain: plugin write and native read are the same
+  // path. See the D3 note on readAfk/writeAfk for the KV side.
   async function runAfkContract(
     args: string[],
-    captainThreadId: string | undefined,
     stdin?: string,
   ): Promise<{ exitCode: number | null; output: string } | null> {
     const fmHome = (await settings.get()).fmHome.trim();
@@ -4138,16 +4204,9 @@ export default async function plugin(bb: BbPluginApi) {
     const hostId = await fleetHost();
     if (hostId === null || hostId === "") return null;
     const scriptPath = `${fmHome}/bin/fm-afk-contract.sh`;
-    const stateDir = wakeStateDir(fmHome, captainThreadId);
     const prelude = [
       `export FM_HOME=${shQuote(fmHome)}`,
       `export FM_ROOT=${shQuote(fmHome)}`,
-      // D3: scope the real away-record per captain, the same plane the wake queue
-      // uses. fm-afk-contract.sh honours FM_STATE_OVERRIDE (state root), so the
-      // .afk-contract lands in cap-<captain>/ and never collides with another
-      // captain's posture on a shared fmHome.
-      `export FM_STATE_OVERRIDE=${shQuote(stateDir)}`,
-      `mkdir -p ${shQuote(stateDir)}`,
       `if [ ! -f ${shQuote(scriptPath)} ]; then echo "error: missing ${scriptPath}" >&2; exit 127; fi`,
       `${shQuote(scriptPath)} ${args.map(shQuote).join(" ")}`,
     ].join("\n");
@@ -4161,17 +4220,17 @@ export default async function plugin(bb: BbPluginApi) {
 
   // Write/read the native away/quiet flag state/.afk (first line away|quiet). The
   // afk skill treats the flag file's first line as the mode; quiet is that mode.
-  async function writeAfkFlag(mode: "away" | "quiet" | null, captainThreadId: string | undefined): Promise<boolean> {
+  async function writeAfkFlag(mode: "away" | "quiet" | null): Promise<boolean> {
     const fmHome = (await settings.get()).fmHome.trim();
     if (fmHome === "") return false;
     const hostId = await fleetHost();
     if (hostId === null || hostId === "") return false;
-    // D3: the .afk flag file lives in the same per-captain state plane as the contract.
-    const stateDir = wakeStateDir(fmHome, captainThreadId);
-    const flag = `${stateDir}/.afk`;
+    // F2: host-level flag (see runAfkContract) — the native keeper reads this exact
+    // unscoped path.
+    const flag = `${fmHome}/state/.afk`;
     const script = mode === null
       ? `rm -f ${shQuote(flag)}`
-      : [`mkdir -p ${shQuote(stateDir)}`, `printf '%s\\n' ${shQuote(mode)} > ${shQuote(flag)}`].join("\n");
+      : [`mkdir -p ${shQuote(`${fmHome}/state`)}`, `printf '%s\\n' ${shQuote(mode)} > ${shQuote(flag)}`].join("\n");
     try {
       const res = await runOnHost(hostId, script, 15_000);
       return res.exitCode === 0;
@@ -4181,12 +4240,12 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  async function readAfkFlagMode(captainThreadId?: string): Promise<"away" | "quiet" | null> {
+  async function readAfkFlagMode(): Promise<"away" | "quiet" | null> {
     const fmHome = (await settings.get()).fmHome.trim();
     if (fmHome === "") return null;
     const hostId = await fleetHost();
     if (hostId === null || hostId === "") return null;
-    const flag = `${wakeStateDir(fmHome, captainThreadId)}/.afk`;
+    const flag = `${fmHome}/state/.afk`; // F2: host-level, as native reads it
     try {
       const res = await runOnHost(hostId, `[ -f ${shQuote(flag)} ] && head -1 ${shQuote(flag)} || echo FM_AFK_ABSENT`, 15_000);
       const line = res.output.trim().split(/\r?\n/)[0]?.trim();
@@ -4468,6 +4527,11 @@ export default async function plugin(bb: BbPluginApi) {
   // only contributes when its own flag is "real". This keeps toggles of one from
   // clobbering the other, and matches what the real fm scripts read (a single
   // first-line mode).
+  // syncAfkFlag recomputes the HOST-LEVEL .afk flag (F2) from the CALLING captain's
+  // per-captain KV posture. The flag is native's single per-home posture, so the
+  // most recent captain toggle owns it (last-write-wins) — exactly how native's
+  // one-home model behaves. captainThreadId selects whose KV is read; the write
+  // target is always the host-level flag.
   async function syncAfkFlag(captainThreadId: string | undefined): Promise<boolean> {
     const afkReal = await afkIsReal();
     const quietReal = await quietIsReal();
@@ -4475,7 +4539,7 @@ export default async function plugin(bb: BbPluginApi) {
     const away = afkReal && (await readAfk(captainThreadId))?.on === true;
     const quiet = quietReal && (await readQuiet(captainThreadId)).on;
     const mode = away ? "away" : quiet ? "quiet" : null;
-    return writeAfkFlag(mode, captainThreadId);
+    return writeAfkFlag(mode);
   }
 
   // Project AFK on/off into the real durable contract (state/.afk-contract) so
@@ -4488,13 +4552,13 @@ export default async function plugin(bb: BbPluginApi) {
     const args = ["propose"];
     if (words.trim() !== "") args.push("--words", words.slice(0, 2000));
     for (const g of grants) if (/^[A-Za-z0-9._-]+$/.test(g)) args.push("--grant", g);
-    const proposed = await runAfkContract(args, captainThreadId);
+    const proposed = await runAfkContract(args);
     if (proposed === null || proposed.exitCode !== 0) {
       bb.log.warn(`real afk: contract propose ${proposed === null ? "unreachable" : `exit=${proposed.exitCode}`}; KV flag only`);
       await syncAfkFlag(captainThreadId);
       return { contract: false };
     }
-    const confirmed = await runAfkContract(["confirm"], captainThreadId);
+    const confirmed = await runAfkContract(["confirm"]);
     await syncAfkFlag(captainThreadId);
     if (confirmed === null || confirmed.exitCode !== 0) {
       bb.log.warn(`real afk: contract confirm ${confirmed === null ? "unreachable" : `exit=${confirmed.exitCode}`}`);
@@ -4505,7 +4569,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function projectAfkOff(captainThreadId: string | undefined): Promise<void> {
     if (!(await afkIsReal())) return;
-    const archived = await runAfkContract(["archive"], captainThreadId);
+    const archived = await runAfkContract(["archive"]);
     if (archived === null || archived.exitCode !== 0) {
       bb.log.warn(`real afk: contract archive ${archived === null ? "unreachable" : `exit=${archived.exitCode}`}`);
     }
@@ -4515,12 +4579,14 @@ export default async function plugin(bb: BbPluginApi) {
 
   // Real contract away authority (validate exits 0 iff readable + confirmed) and
   // its granted task ids, for status/bearings. null when unreadable.
-  async function realAfkAuthority(captainThreadId?: string): Promise<{ confirmed: boolean; grants: string[] } | null> {
+  // Host-level away authority (F2): the native keeper and merge-authority read this
+  // same host-level contract, so status/bearings reflect the real per-home posture.
+  async function realAfkAuthority(): Promise<{ confirmed: boolean; grants: string[] } | null> {
     if (!(await afkIsReal())) return null;
-    const valid = await runAfkContract(["validate"], captainThreadId);
+    const valid = await runAfkContract(["validate"]);
     if (valid === null) return null;
     if (valid.exitCode !== 0) return { confirmed: false, grants: [] };
-    const g = await runAfkContract(["grants"], captainThreadId);
+    const g = await runAfkContract(["grants"]);
     const grants = g === null ? [] : g.output.split(/\r?\n/).map((l) => l.trim()).filter((l) => l !== "" && /^[A-Za-z0-9._-]+$/.test(l));
     return { confirmed: true, grants };
   }
@@ -5621,7 +5687,7 @@ export default async function plugin(bb: BbPluginApi) {
         ].join("\n");
       }
       const afk = await readAfk(cap);
-      const auth = await realAfkAuthority(cap);
+      const auth = await realAfkAuthority();
       const authNote = auth === null ? "" : ` contract:${auth.confirmed ? "confirmed" : "off"} grants=${auth.grants.length}`;
       return `afk: ${afk?.on === true ? "on" : "off"}${afk?.words ? ` words: ${afk.words}` : ""} held=${afk?.held.length ?? 0}${authNote}`;
     },
@@ -6780,7 +6846,7 @@ export default async function plugin(bb: BbPluginApi) {
               return reply({ afk: false, held, bearings: snap.json }, text);
             }
             const afk = await readAfk(ctxThread);
-            const auth = await realAfkAuthority(ctxThread);
+            const auth = await realAfkAuthority();
             const authNote = auth === null ? "" : ` contract:${auth.confirmed ? "confirmed" : "off"} grants=${auth.grants.length}`;
             return reply({ ...afk, contract: auth }, `afk: ${afk?.on === true ? "on" : "off"} held=${afk?.held.length ?? 0}${authNote}`);
           }

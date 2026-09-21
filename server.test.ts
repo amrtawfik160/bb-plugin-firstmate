@@ -1015,6 +1015,42 @@ test("thread.failed pages once; turn.failed does not double-page", async () => {
   }
 });
 
+test("F2: the real afk contract + .afk flag write to the HOST-LEVEL path native reads (never cap-scoped)", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", fmHostId: "host_1", afkOwner: "real" },
+  });
+  await plugin(host.bb);
+  try {
+    const hostCommands: string[] = [];
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("terminals.create", async (args: { start?: { command?: string } }) => {
+      if (typeof args.start?.command === "string") hostCommands.push(args.start.command);
+      return { id: "term_1" };
+    });
+    host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+    host.harness.sdk.stub("terminals.output", async () => hostRcOutput(0));
+    host.harness.sdk.stub("terminals.close", async () => ({}));
+    const result = await host.harness.behavior.runCli(["afk", "on", "--words", "out"], { threadId: "thr_capA", projectId: "proj_1" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    // The .afk flag + the fm-afk-contract.sh invocation must target the host-level
+    // state dir the native fm-watch keeper reads — NEVER a cap-<captain> subdir.
+    const afkWrite = hostCommands.find((c) => c.includes("/state/.afk"));
+    assert.ok(afkWrite, `no .afk flag write in:\n${hostCommands.join("\n---\n")}`);
+    assert.match(afkWrite, /\/tmp\/fm-home\/state\/\.afk/);
+    for (const cmd of hostCommands) {
+      assert.doesNotMatch(cmd, /state\/cap-/, `real afk path must not be cap-scoped: ${cmd}`);
+      assert.doesNotMatch(cmd, /FM_STATE_OVERRIDE=.*cap-/, `contract must not scope FM_STATE_OVERRIDE per captain: ${cmd}`);
+    }
+    // The KV posture, by contrast, IS per-captain.
+    assert.ok(await host.bb.storage.kv.get("afk:cap-thr_capA"), "KV posture must be captain-scoped");
+    assert.equal(await host.bb.storage.kv.get("afk"), undefined, "no global KV posture key");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("D3: afk is per-captain — captain A going away never holds captain B's doorbell", async () => {
   const host = await load();
   try {
@@ -1200,7 +1236,7 @@ test("a startup gap rebases stale watch rows instead of paging", async () => {
 
 function stubForgetSdk(
   host: Awaited<ReturnType<typeof load>>,
-  opts: { dirty: string[]; isWorktree?: boolean },
+  opts: { dirty: string[]; committed?: string[]; prUrl?: string; isWorktree?: boolean },
 ) {
   host.harness.sdk.stub("threads.list", async () => []);
   host.harness.sdk.stub("threads.get", async () =>
@@ -1217,9 +1253,16 @@ function stubForgetSdk(
     path: "/wt",
     isWorktree: opts.isWorktree ?? true,
     status: "ready",
+    mergeBaseBranch: "main",
   }));
-  host.harness.sdk.stub("environments.diffFiles", async () => ({
-    files: opts.dirty.map((path) => ({ path })),
+  // diffFiles is asked for two targets: uncommitted (dirty guard) and
+  // branch_committed (F1 committed-unpushed guard). Answer each independently.
+  host.harness.sdk.stub("environments.diffFiles", async (args: { target?: string }) => {
+    const paths = args.target === "branch_committed" ? (opts.committed ?? []) : opts.dirty;
+    return { files: paths.map((path) => ({ path })) };
+  });
+  host.harness.sdk.stub("environments.pullRequest", async () => ({
+    pullRequest: opts.prUrl !== undefined ? { url: opts.prUrl, state: "open" } : null,
   }));
   host.harness.sdk.stub("environments.delete", async () => ({ ok: true as const }));
 }
@@ -1283,6 +1326,51 @@ test("D2: forget --stop on a SHARED-ENV crew never deletes the shared project en
     assert.equal(result.exitCode, 0, result.stderr);
     assert.equal(host.harness.sdk.callsTo("environments.delete").length, 0, "shared env must never be deleted");
     assert.doesNotMatch(result.stdout, /worktree removed/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("F1: forget --stop refuses a crew with committed-but-UNPUSHED work (worktree intact)", async () => {
+  const host = await load();
+  try {
+    await seedCrew(host);
+    // Clean tree, but the branch has commits vs base and NO PR → unpushed, unlanded.
+    stubForgetSdk(host, { dirty: [], committed: ["src/feature.ts", "src/feature.test.ts"] });
+    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop"], { projectId: "proj_1" });
+    assert.notEqual(result.exitCode, 0, "must refuse committed-unpushed work");
+    assert.match(result.stderr + result.stdout, /committed but UNPUSHED/);
+    assert.equal(host.harness.sdk.callsTo("environments.delete").length, 0, "worktree must survive the refusal");
+    const crews = (await host.bb.storage.kv.get("crews")) as Array<{ id: string }>;
+    assert.ok(crews.some((c) => c.id === "c1"), "crew record must survive the refusal");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("F1: forget --stop ALLOWS a crew whose committed work is pushed to a PR (recoverable)", async () => {
+  const host = await load();
+  try {
+    await seedCrew(host);
+    // Committed vs base, but a PR exists → the commits are on the forge, recoverable.
+    stubForgetSdk(host, { dirty: [], committed: ["src/feature.ts"], prUrl: "https://github.com/x/y/pull/9" });
+    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop"], { projectId: "proj_1" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /worktree removed/);
+    assert.equal(host.harness.sdk.callsTo("environments.delete").length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("F1: forget --stop --force removes the worktree despite committed-unpushed work", async () => {
+  const host = await load();
+  try {
+    await seedCrew(host);
+    stubForgetSdk(host, { dirty: [], committed: ["src/feature.ts"] });
+    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop", "--force"], { projectId: "proj_1" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(host.harness.sdk.callsTo("environments.delete").length, 1);
   } finally {
     await host.harness.lifecycle.dispose();
   }
