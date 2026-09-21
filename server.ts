@@ -275,6 +275,18 @@ function shQuote(text: string): string {
   return `'${text.replace(/'/g, `'\\''`)}'`;
 }
 
+// The bb overlay never edits tracked firstmate files. Instead it installs a parallel
+// "mirror bin" at <home>/bin-bb (config/bb-overlay marks it): the three dispatch scripts
+// (fm-backend/fm-spawn/fm-teardown) are patched copies carrying the bb arms, and every
+// other bin entry is a symlink to native, so scripts run bb-aware while the tracked tree
+// stays clean and keeps fast-forwarding. This emits a shell statement that resolves
+// FM_BINDIR to bin-bb when the overlay is present, else native bin — evaluated on the host
+// so a home that is not bb-installed (or a pre-migration home) transparently uses bin.
+function fmBinDirAssign(fmHome: string): string {
+  const q = shQuote(fmHome);
+  return `FM_BINDIR=${q}/bin; if [ -f ${q}/config/bb-overlay ] && [ -d ${q}/bin-bb ]; then FM_BINDIR=${q}/bin-bb; fi`;
+}
+
 // The drain hint appended to every real-mode doorbell. The durable wake queue stays the
 // authoritative store; the chat doorbell is only a pointer to it, so a dropped doorbell can
 // never lose the report (it survives in state/.wake-queue).
@@ -356,7 +368,6 @@ export function fmWatchKeeperInterval(graceSec: number): number {
 // forks a new one after one exits.
 export function fmWatchKeeperScript(hostId: string, fmHome: string, interval: number): string {
   const pid = `${fmHome}/${FM_WATCH_KEEPER_PID}`;
-  const arm = `${fmHome}/bin/fm-watch-arm.sh`;
   const log = `${fmHome}/state/.bb-watch-arm.log`;
   const ownerBeat = `${fmHome}/${FM_WATCH_OWNER_BEAT}`;
   const ttl = fmWatchOwnerBeatTtl(interval);
@@ -382,7 +393,10 @@ export function fmWatchKeeperScript(hostId: string, fmHome: string, interval: nu
     // is still published by arm_check when a wake is pending, so buried rows are still presented.
     "export FM_WATCH_HANDLING_SUCCESSOR=1",
     `PID=${shQuote(pid)}`,
-    `ARM=${shQuote(arm)}`,
+    // Route to the bb mirror bin so the watcher this keeper arms is bb-dispatch-aware
+    // (native fm-watch has no bb arm); falls back to native bin when not bb-installed.
+    fmBinDirAssign(fmHome),
+    `ARM="$FM_BINDIR/fm-watch-arm.sh"`,
     `LOG=${shQuote(log)}`,
     `OWNER_BEAT=${shQuote(ownerBeat)}`,
     `OWNER_TTL=${ttl}`,
@@ -1667,7 +1681,9 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
     const brief = `${fmHome}/data/${crew.id}/brief.md`;
-    const briefScript = `${fmHome}/bin/fm-brief.sh`;
+    // fm-brief.sh is resolved to "$FM_BINDIR/fm-brief.sh" (the bb mirror bin when the
+    // overlay is installed) inside the host script below.
+    const briefRef = `"$FM_BINDIR/fm-brief.sh"`;
     // Strip a leading Captain-label/address line so native fm-spawn.sh's
     // fm_brief_intent_address_line does not refuse the brief (B1).
     const intentB64 = Buffer.from(normalizeCaptainIntent(task.trim()).slice(0, 3000), "utf8").toString("base64");
@@ -1675,8 +1691,8 @@ export default async function plugin(bb: BbPluginApi) {
     // is exactly the delivery mode the brief records.
     const scaffold =
       crew.shape === "scout"
-        ? `${shQuote(briefScript)} ${shQuote(crew.id)} crew --scout`
-        : `${shQuote(briefScript)} ${shQuote(crew.id)} crew --mode ${shQuote(crew.posture)}`;
+        ? `${briefRef} ${shQuote(crew.id)} crew --scout`
+        : `${briefRef} ${shQuote(crew.id)} crew --mode ${shQuote(crew.posture)}`;
     const py =
       "import base64,os,sys;p=sys.argv[1];" +
       'intent=base64.b64decode(os.environ["FM_INTENT"]).decode();' +
@@ -1685,7 +1701,8 @@ export default async function plugin(bb: BbPluginApi) {
     const script = [
       `export FM_HOME=${shQuote(fmHome)}`,
       `export FM_ROOT=${shQuote(fmHome)}`,
-      `[ -f ${shQuote(briefScript)} ] || exit 0`,
+      fmBinDirAssign(fmHome),
+      `[ -f ${briefRef} ] || exit 0`,
       `[ -f ${shQuote(brief)} ] && exit 0`,
       `${scaffold} >/dev/null 2>&1 || exit 0`,
       `FM_INTENT=${intentB64} python3 -c ${shQuote(py)} ${shQuote(brief)} || exit 0`,
@@ -3632,7 +3649,10 @@ export default async function plugin(bb: BbPluginApi) {
     signal?: AbortSignal;
   }): Promise<{ exitCode: number | null; output: string; scriptPath: string }> {
     const script = normalizeFmScript(input.script);
+    // Native path for the RETURN value / diagnostics; the invocation below resolves
+    // FM_BINDIR (bin-bb when the bb overlay is installed) on the host.
     const scriptPath = `${input.fmHome}/bin/fm-${script}.sh`;
+    const scriptLeaf = `fm-${script}.sh`;
     const extraEnv = Object.entries(input.env ?? {})
       .filter(([, v]) => v !== "")
       .map(([k, v]) => `export ${k}=${shQuote(v)}`);
@@ -3644,8 +3664,9 @@ export default async function plugin(bb: BbPluginApi) {
         parentThreadId: input.parentThreadId,
       }),
       ...extraEnv,
-      `if [ ! -f ${shQuote(scriptPath)} ]; then echo "error: missing ${scriptPath}" >&2; exit 127; fi`,
-      `${shQuote(scriptPath)} ${input.args.map(shQuote).join(" ")}`,
+      fmBinDirAssign(input.fmHome),
+      `if [ ! -f "$FM_BINDIR/${scriptLeaf}" ]; then echo "error: missing $FM_BINDIR/${scriptLeaf}" >&2; exit 127; fi`,
+      `"$FM_BINDIR/${scriptLeaf}" ${input.args.map(shQuote).join(" ")}`,
     ]
       .filter((line) => line !== "")
       .join("\n");
@@ -4512,7 +4533,6 @@ export default async function plugin(bb: BbPluginApi) {
   ): Promise<{ beatAge: number; relaunched: boolean; keeperAlive: boolean; logTail: string } | null> {
     const beat = `${fmHome}/state/.last-watcher-beat`;
     const log = `${fmHome}/state/.bb-watch-arm.log`;
-    const arm = `${fmHome}/bin/fm-watch-arm.sh`;
     const pid = `${fmHome}/${FM_WATCH_KEEPER_PID}`;
     const keeperScript = `${fmHome}/${FM_WATCH_KEEPER_SH}`;
     const ownerBeat = `${fmHome}/${FM_WATCH_OWNER_BEAT}`;
@@ -4521,6 +4541,7 @@ export default async function plugin(bb: BbPluginApi) {
     // keeper launch so a freshly launched keeper always sees a fresh beat), then read
     // beacon age + keeper liveness + a log tail (no other side effects).
     const readScript = [
+      fmBinDirAssign(fmHome),
       `mkdir -p ${shQuote(`${fmHome}/state`)}`,
       // B3(b): the owner-beat write is a silent SPOF — a non-writable or full state dir
       // makes it fail, the keeper then sees a stale/absent beat and self-exits while the
@@ -4531,7 +4552,7 @@ export default async function plugin(bb: BbPluginApi) {
       `if [ -f ${shQuote(beat)} ]; then AGE=$(( $(date +%s) - $(stat -c %Y ${shQuote(beat)} 2>/dev/null || echo 0) )); fi`,
       "KEEPER=dead",
       `if [ -f ${shQuote(pid)} ]; then KP=$(cat ${shQuote(pid)} 2>/dev/null || echo); if [ -n "$KP" ] && kill -0 "$KP" 2>/dev/null; then KEEPER=alive; fi; fi`,
-      `[ -x ${shQuote(arm)} ] || echo FM_WATCH_NO_ARM`,
+      `[ -x "$FM_BINDIR/fm-watch-arm.sh" ] || echo FM_WATCH_NO_ARM`,
       `printf 'FM_BEAT_AGE=%s\\nFM_KEEPER=%s\\n' "$AGE" "$KEEPER"`,
       "echo '---FM_LOGTAIL---'",
       `[ -f ${shQuote(log)} ] && tail -c 4000 ${shQuote(log)} || true`,

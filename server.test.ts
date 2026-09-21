@@ -1385,6 +1385,99 @@ test("bb overlay adapter propagates reasoning, tags crews, drops yolo->full, car
   assert.match(src, /scout\)/);
 });
 
+// ── Overlay must NEVER edit tracked native files (mirror-bin invariant) ───────
+// The overlay registers backend=bb through a parallel "mirror bin" (bin-bb), never
+// by patching the tracked bin/fm-backend.sh / fm-spawn.sh / fm-teardown.sh in place.
+// An in-place patch permanently dirties the firstmate clone and freezes the
+// fetch + ff-only auto-update. These guards fail loudly if that regresses.
+
+const OVERLAY_ROOT = join(dirname(fileURLToPath(import.meta.url)), "overlay");
+const INSTALLER_SRC = readFileSync(join(OVERLAY_ROOT, "install-bb-backend.py"), "utf8");
+
+test("installer applies patches to a scratch tree only — never against the home's tracked bin/", () => {
+  // The old installer ran `patch ... cwd=home`; that is the exact regression to block.
+  assert.doesNotMatch(
+    INSTALLER_SRC,
+    /cwd\s*=\s*home\b/,
+    "installer must not run patch (or anything) with cwd=home — that edits tracked files",
+  );
+  // Patches are applied inside a throwaway temp tree.
+  assert.match(INSTALLER_SRC, /tempfile\.TemporaryDirectory/);
+  assert.match(INSTALLER_SRC, /cwd=tmproot/);
+  // The three patched files are copied into the MIRROR (dest_dir), not home/bin.
+  assert.match(INSTALLER_SRC, /shutil\.copy2\(src,\s*dest_dir/);
+});
+
+test("installer builds a mirror bin and keeps the tree clean via .git/info/exclude", () => {
+  assert.match(INSTALLER_SRC, /MIRROR_DIRNAME\s*=\s*"bin-bb"/);
+  // Every non-patched bin entry is symlinked (inherits upstream on ff-update).
+  assert.match(INSTALLER_SRC, /os\.symlink\(/);
+  // The overlay's untracked paths are registered in the per-clone git exclude so
+  // `git status --porcelain` stays empty and ff-only stops skipping.
+  assert.match(INSTALLER_SRC, /info.*exclude/s);
+  assert.match(INSTALLER_SRC, /\/\{MIRROR_DIRNAME\}\//);
+  // config/ is already gitignored upstream, so the marker is safe.
+  assert.match(INSTALLER_SRC, /"bb-overlay"/);
+});
+
+test("plugin routes fm scripts through the bb mirror bin (FM_BINDIR), not hardcoded bin/", () => {
+  const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "server.ts"), "utf8");
+  // The routing helper resolves bin-bb when the overlay marker is present.
+  assert.match(src, /function fmBinDirAssign/);
+  assert.match(src, /config\/bb-overlay/);
+  assert.match(src, /\/bin-bb/);
+  // runFmScript invokes via the resolved FM_BINDIR, and the watch keeper arms through it.
+  assert.match(src, /"\$FM_BINDIR\/\$\{scriptLeaf\}"/);
+  assert.match(src, /ARM="\$FM_BINDIR\/fm-watch-arm\.sh"/);
+});
+
+// Behavioral guard: when a real firstmate checkout is reachable, actually run the
+// installer against a fresh clone and assert the tracked tree stays clean. Skips
+// (rather than fails) where no checkout is available so it never blocks CI, while
+// still catching a real in-place-patch regression on any dev/host that has one.
+function discoverFirstmateCheckout(): string | null {
+  for (const p of [process.env.FM_TEST_HOME, process.env.FM_HOME, "/root/firstmate"]) {
+    if (p && existsSync(join(p, "bin", "fm-backend.sh")) && existsSync(join(p, ".git"))) return p;
+  }
+  return null;
+}
+
+test("installer leaves a real firstmate clone's tracked tree clean", (t) => {
+  const checkout = discoverFirstmateCheckout();
+  if (checkout === null) {
+    t.skip("no firstmate checkout discoverable (set FM_TEST_HOME to enable)");
+    return;
+  }
+  const work = mkdtempSync(join(tmpdir(), "fm-bb-clean-"));
+  try {
+    const home = join(work, "home");
+    const clone = spawnSync("git", ["clone", "--quiet", "--no-local", "--depth", "1", `file://${checkout}`, home]);
+    if (clone.status !== 0) {
+      t.skip(`could not clone firstmate checkout: ${clone.stderr?.toString() ?? ""}`);
+      return;
+    }
+    const run = spawnSync("python3", [
+      join(OVERLAY_ROOT, "install-bb-backend.py"),
+      "--home", home,
+      "--overlay", OVERLAY_ROOT,
+      "--project-id", "proj_test",
+    ], { encoding: "utf8" });
+    assert.equal(run.status, 0, `installer failed:\n${run.stdout}\n${run.stderr}`);
+    const status = spawnSync("git", ["-C", home, "status", "--porcelain"], { encoding: "utf8" });
+    assert.equal(status.stdout.trim(), "", `overlay dirtied the tracked tree:\n${status.stdout}`);
+    // The three dispatch files must be byte-identical to HEAD.
+    const diff = spawnSync("git", ["-C", home, "diff", "--stat", "--",
+      "bin/fm-backend.sh", "bin/fm-spawn.sh", "bin/fm-teardown.sh"], { encoding: "utf8" });
+    assert.equal(diff.stdout.trim(), "", `tracked backend files were modified:\n${diff.stdout}`);
+    // The mirror bin exists and carries the bb dispatch registration.
+    assert.ok(existsSync(join(home, "bin-bb", "fm-spawn.sh")), "mirror bin missing");
+    const patched = readFileSync(join(home, "bin-bb", "fm-backend.sh"), "utf8");
+    assert.match(patched, /FM_BACKEND_KNOWN="[^"]*\bbb\b/, "mirror fm-backend.sh lacks bb registration");
+  } finally {
+    rmSync(work, { recursive: true, force: true });
+  }
+});
+
 // ── Phase 2 additions ────────────────────────────────────────────────────────
 
 test("formatFmMeta records provider when set, omits it otherwise", () => {
@@ -1455,7 +1548,7 @@ test("dispatch scaffolds the real structured brief via fm-brief when real mode i
       { projectId: "proj_1" },
     );
     assert.equal(result.exitCode, 0, result.stderr);
-    const brief = hostCommands.find((c) => c.includes("bin/fm-brief.sh"));
+    const brief = hostCommands.find((c) => c.includes("fm-brief.sh"));
     assert.ok(brief, `no fm-brief scaffold in ${hostCommands.join("\n---\n")}`);
     assert.match(brief, /--mode/);
     assert.match(brief, /direct-PR/);
@@ -1754,7 +1847,7 @@ function stubRealTransportHost(
   host.harness.sdk.stub("terminals.close", async () => ({}));
   host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
     const cmd = cmds.get(args.terminalId) ?? "";
-    if (cmd.includes("bin/fm-spawn.sh")) {
+    if (cmd.includes("fm-spawn.sh")) {
       spawned = true;
       return hostRcPayload("", opts.spawnExit);
     }
@@ -1793,12 +1886,12 @@ test("real transport dispatches through fm-spawn.sh and adopts its thread id", a
     );
     assert.equal(result.exitCode, 0, result.stderr);
     assert.match(result.stdout, /Dispatched ship crew/);
-    assert.ok(seen.some((c) => c.includes("bin/fm-spawn.sh")), "fm-spawn.sh was not invoked");
+    assert.ok(seen.some((c) => c.includes("fm-spawn.sh")), "fm-spawn.sh was not invoked");
     assert.ok(seen.some((c) => c.includes("--backend") && c.includes("bb")), "backend=bb not passed");
     // Harness pinned to bb: without it fm-harness.sh's own-runtime detection returns
     // 'unknown' in a BB host terminal and fm-spawn aborts with "no launch template".
     assert.ok(
-      seen.some((c) => c.includes("bin/fm-spawn.sh") && c.includes("--harness") && c.includes("bb")),
+      seen.some((c) => c.includes("fm-spawn.sh") && c.includes("--harness") && c.includes("bb")),
       "ship spawn did not pin --harness bb",
     );
     // No native BB spawn happened.
@@ -1820,7 +1913,7 @@ test("real transport pins --harness bb for a scout too (else fm-spawn aborts on 
       { projectId: "proj_1" },
     );
     assert.equal(result.exitCode, 0, result.stderr);
-    const spawn = seen.find((c) => c.includes("bin/fm-spawn.sh"));
+    const spawn = seen.find((c) => c.includes("fm-spawn.sh"));
     assert.ok(spawn, "fm-spawn.sh was not invoked for the scout");
     assert.ok(spawn!.includes("--scout"), "scout flag not passed");
     assert.ok(spawn!.includes("--harness") && spawn!.includes("bb"), "scout spawn did not pin --harness bb");
@@ -1841,7 +1934,7 @@ test("real transport falls back to native BB spawn when the spawn leaves no thre
       { projectId: "proj_1" },
     );
     assert.equal(result.exitCode, 0, result.stderr);
-    assert.ok(seen.some((c) => c.includes("bin/fm-spawn.sh")), "fm-spawn.sh was not attempted");
+    assert.ok(seen.some((c) => c.includes("fm-spawn.sh")), "fm-spawn.sh was not attempted");
     // Real spawn produced no thread → native BB spawn is the fallback.
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 1);
     const crews = await crewsKv(host);
@@ -1867,7 +1960,7 @@ test("real transport never double-spawns when the meta already has a thread", as
     );
     assert.equal(result.exitCode, 0, result.stderr);
     // A recorded thread id short-circuits: no fm-spawn, no native spawn.
-    assert.ok(!seen.some((c) => c.includes("bin/fm-spawn.sh")), "fm-spawn ran despite an existing thread");
+    assert.ok(!seen.some((c) => c.includes("fm-spawn.sh")), "fm-spawn ran despite an existing thread");
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
     const crews = await crewsKv(host);
     assert.equal(crews[0]?.threadId, "thr_pre");
@@ -1919,8 +2012,8 @@ function stubRealTransportBacklog(
   host.harness.sdk.stub("terminals.close", async () => ({}));
   host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
     const cmd = cmds.get(args.terminalId) ?? "";
-    if (cmd.includes("bin/fm-tasks-axi.sh") && cmd.includes("'add'")) return hostRcPayload("", opts.addExit ?? 0);
-    if (cmd.includes("bin/fm-spawn.sh")) {
+    if (cmd.includes("fm-tasks-axi.sh") && cmd.includes("'add'")) return hostRcPayload("", opts.addExit ?? 0);
+    if (cmd.includes("fm-spawn.sh")) {
       spawned = true;
       return hostRcPayload("", opts.spawnExit ?? 0);
     }
@@ -1951,14 +2044,14 @@ test("C1: real transport adds the backlog row (id=crew id, --kind ship) BEFORE f
     assert.equal(result.exitCode, 0, result.stderr);
     const crewId = crewIdFromStdout(result.stdout);
     const addIdx = seen.findIndex(
-      (c) => c.includes("bin/fm-tasks-axi.sh") && c.includes("'add'") && c.includes(`'${crewId}'`) && c.includes("'--kind'") && c.includes("'ship'"),
+      (c) => c.includes("fm-tasks-axi.sh") && c.includes("'add'") && c.includes(`'${crewId}'`) && c.includes("'--kind'") && c.includes("'ship'"),
     );
-    const spawnIdx = seen.findIndex((c) => c.includes("bin/fm-spawn.sh"));
+    const spawnIdx = seen.findIndex((c) => c.includes("fm-spawn.sh"));
     assert.ok(addIdx >= 0, `no backlog add for ${crewId}: ${seen.join(" | ")}`);
     assert.ok(spawnIdx >= 0, "fm-spawn.sh never ran");
     assert.ok(addIdx < spawnIdx, "backlog add must run BEFORE fm-spawn (backlog-first)");
     // fm-spawn owns the queued→In-flight start; the plugin must not double-start.
-    assert.ok(!seen.some((c) => c.includes("bin/fm-tasks-axi.sh") && c.includes("'start'")), "plugin double-started the row");
+    assert.ok(!seen.some((c) => c.includes("fm-tasks-axi.sh") && c.includes("'start'")), "plugin double-started the row");
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0, "must not native-spawn");
     assert.equal((await crewsKv(host))[0]?.threadId, "thr_real");
   } finally {
@@ -1978,9 +2071,9 @@ test("C1: real transport adds the backlog row with --kind scout for a scout", as
     assert.equal(result.exitCode, 0, result.stderr);
     const crewId = crewIdFromStdout(result.stdout);
     const addIdx = seen.findIndex(
-      (c) => c.includes("bin/fm-tasks-axi.sh") && c.includes("'add'") && c.includes(`'${crewId}'`) && c.includes("'--kind'") && c.includes("'scout'"),
+      (c) => c.includes("fm-tasks-axi.sh") && c.includes("'add'") && c.includes(`'${crewId}'`) && c.includes("'--kind'") && c.includes("'scout'"),
     );
-    const spawnIdx = seen.findIndex((c) => c.includes("bin/fm-spawn.sh"));
+    const spawnIdx = seen.findIndex((c) => c.includes("fm-spawn.sh"));
     assert.ok(addIdx >= 0, `no scout backlog add for ${crewId}`);
     assert.ok(addIdx < spawnIdx, "scout backlog add must run BEFORE fm-spawn");
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
@@ -2004,8 +2097,8 @@ test("C1: real transport requires queueOwner=real — falls back to native when 
       { projectId: "proj_1" },
     );
     assert.equal(result.exitCode, 0, result.stderr);
-    assert.ok(!seen.some((c) => c.includes("bin/fm-spawn.sh")), "must not run fm-spawn without queueOwner=real");
-    assert.ok(!seen.some((c) => c.includes("bin/fm-tasks-axi.sh") && c.includes("'add'")), "must not add a backlog row without queueOwner=real");
+    assert.ok(!seen.some((c) => c.includes("fm-spawn.sh")), "must not run fm-spawn without queueOwner=real");
+    assert.ok(!seen.some((c) => c.includes("fm-tasks-axi.sh") && c.includes("'add'")), "must not add a backlog row without queueOwner=real");
     // The early guard logs the exact actionable refusal — this uniquely proves the
     // guard fired (rather than the generic failed-add fallback catching it later).
     assert.ok(
@@ -2030,8 +2123,8 @@ test("C1: a failed backlog add never spawns a worker — falls back to native", 
       { projectId: "proj_1" },
     );
     assert.equal(result.exitCode, 0, result.stderr);
-    assert.ok(seen.some((c) => c.includes("bin/fm-tasks-axi.sh") && c.includes("'add'")), "add was attempted");
-    assert.ok(!seen.some((c) => c.includes("bin/fm-spawn.sh")), "must NOT spawn a worker the backlog does not own");
+    assert.ok(seen.some((c) => c.includes("fm-tasks-axi.sh") && c.includes("'add'")), "add was attempted");
+    assert.ok(!seen.some((c) => c.includes("fm-spawn.sh")), "must NOT spawn a worker the backlog does not own");
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 1, "falls back to native dispatch");
   } finally {
     await host.harness.lifecycle.dispose();
@@ -2050,8 +2143,8 @@ test("C1: a spawn that leaves no thread/orphan removes the seeded backlog row", 
     );
     assert.equal(result.exitCode, 0, result.stderr);
     const crewId = crewIdFromStdout(result.stdout);
-    const addIdx = seen.findIndex((c) => c.includes("bin/fm-tasks-axi.sh") && c.includes("'add'") && c.includes(`'${crewId}'`));
-    const rmIdx = seen.findIndex((c) => c.includes("bin/fm-tasks-axi.sh") && c.includes("'rm'") && c.includes(`'${crewId}'`));
+    const addIdx = seen.findIndex((c) => c.includes("fm-tasks-axi.sh") && c.includes("'add'") && c.includes(`'${crewId}'`));
+    const rmIdx = seen.findIndex((c) => c.includes("fm-tasks-axi.sh") && c.includes("'rm'") && c.includes(`'${crewId}'`));
     assert.ok(addIdx >= 0, "row was added");
     assert.ok(rmIdx > addIdx, "orphan row must be removed when no worker exists");
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 1, "falls back to native dispatch");
@@ -2082,7 +2175,7 @@ test("C2: the plugin writes NO canned intake-judgement essay to the brief (nativ
     assert.ok(!/[Ii]ntake judgement/.test(briefCmd!), "no canned intake-judgement essay");
     // The plugin also runs no fm-project-mode.sh probe — posture reconciliation is
     // left entirely to native (mode is carried on the brief's Delivery contract).
-    assert.ok(!seen.some((c) => c.includes("bin/fm-project-mode.sh")), "plugin must not synthesize a posture judgement");
+    assert.ok(!seen.some((c) => c.includes("fm-project-mode.sh")), "plugin must not synthesize a posture judgement");
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -2112,7 +2205,7 @@ test("F2: a crew's backlog row is closed on land even after settings flip to nat
     assert.equal(forgotten.exitCode, 0, forgotten.stderr);
     // The row is ownership: it must still be closed (rm) despite the flip to kv.
     assert.ok(
-      seen.some((c) => c.includes("bin/fm-tasks-axi.sh") && c.includes("'rm'") && c.includes(`'${crewId}'`)),
+      seen.some((c) => c.includes("fm-tasks-axi.sh") && c.includes("'rm'") && c.includes(`'${crewId}'`)),
       `the owned row must be closed after the flip:\n${seen.join(" | ")}`,
     );
   } finally {

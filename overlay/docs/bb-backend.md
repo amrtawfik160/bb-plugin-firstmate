@@ -20,7 +20,23 @@ Optional:
 - `FM_BB_VISIBLE=0` / `FM_BB_HIDDEN=1` — hide child threads from the sidebar (default visible)
 - `FM_BB_SHARED_ENV=1` — skip managed-worktree (ships should not)
 
-Plugin entry: `bb firstmate fm spawn -- --mode direct-PR -- ship '<task>'` runs `bin/fm-spawn.sh` on the host with `FM_BACKEND=bb`.
+Plugin entry: `bb firstmate fm spawn -- --mode direct-PR -- ship '<task>'` runs `fm-spawn.sh` on the host with `FM_BACKEND=bb`.
+
+## Installation architecture: the mirror bin (never patch tracked files)
+
+`/root/firstmate` is a clone of a third-party repo (`kunchenguid/firstmate`). Native firstmate exposes **no runtime seam** to register a new spawn-capable backend: `FM_BACKEND_KNOWN`/`FM_BACKEND_SPAWN` and every `fm_backend_*` dispatch `case` are hardcoded in the **tracked** files `bin/fm-backend.sh`, `bin/fm-spawn.sh`, and `bin/fm-teardown.sh`, and the only extension host (`bin/fm-extension.mjs`) binds **process-event adapters** only (`poll`/`classify`/`terminal`/`silent`) — it cannot register a spawn/worktree backend.
+
+The overlay therefore does **not** edit those tracked files. `install-bb-backend.py` builds a parallel **mirror bin** at `<home>/bin-bb`:
+
+- every native `bin/` entry is **symlinked** into `bin-bb/` (so it keeps inheriting upstream on every ff-update),
+- **except** the three no-seam files, which are generated as **patched copies** (native source + the overlay patches), and
+- `bin-bb/backends/` mirrors the native adapters plus the real `bb.sh`.
+
+Native scripts derive `SCRIPT_DIR`/`FM_BACKEND_LIB_DIR` from their own `BASH_SOURCE`, so invoking `bin-bb/fm-*.sh` makes every `. "$SCRIPT_DIR/fm-*.sh"` resolve **inside `bin-bb`**: the patched `fm-backend.sh` (with the bb dispatch arms) and the `bb.sh` adapter are picked up for **all** scripts, with zero edits to tracked files. The plugin routes `bin` → `bin-bb` at runtime (`fmBinDirAssign` / `$FM_BINDIR`) whenever the marker `config/bb-overlay` and `bin-bb/` are present, and falls back to native `bin` otherwise.
+
+`bin-bb/` is registered in `<home>/.git/info/exclude` (a per-clone, untracked git exclude that is **not** part of the repository), and `config/` is already gitignored upstream. So `git -C <home> status --porcelain` stays **empty** — which is exactly what the plugin's `fetch` + `git merge --ff-only` auto-update requires: with the old in-place patch the tree was permanently dirty and the update **always skipped**; the mirror keeps it clean so the clone actually fast-forwards.
+
+Re-run the installer after an ff-update: it re-mirrors (picking up new native `bin/` files) and regenerates the three patched copies against the new native source. If upstream changed one of the three files so a patch no longer applies, the install **fails loudly** instead of silently shipping a stale copy.
 
 ## Task shape and metadata
 
@@ -76,3 +92,58 @@ Under `notifyOwner=real` the durable crew→captain wake plane is partitioned **
 - No Escape key.
 - Relay/mail/voice stay firstmate scripts if those planes are enabled; they are not rewritten in the BB plugin.
 - Native `bb firstmate dispatch` uses the plugin SDK (pluginMetadata, Fleet UI) and, when `fmHome` is set, writes the same `state/<id>.meta` ledger `fm-spawn` does. `bb firstmate fm` is how the bash toolbelt drives the same BB runtime.
+
+## The three files still carried as patched copies (and the upstream seam we want)
+
+The mirror keeps the tracked tree clean, but `fm-backend.sh`, `fm-spawn.sh`, and `fm-teardown.sh` are still carried as **patched copies** in `bin-bb`, because their edits cannot be expressed through any native seam:
+
+- **`fm-backend.sh` — registration + dispatch.** `FM_BACKEND_KNOWN`/`FM_BACKEND_SPAWN` are literal strings and each `fm_backend_*` function is a literal `case` with a `*)` reject/`unknown` arm. There is no drop-in dir, no `FM_BACKEND_KNOWN_EXTRA`, no config-driven registration, and no post-source hook, so a new backend name and its dispatch arms cannot be added at runtime.
+- **`fm-spawn.sh` — spawn flow.** The worktree-creation `case "$BACKEND"` block, the two `[ "$BACKEND" != orca ]` Treehouse-skip conditionals, and the relaunch/meta handling are **inline in the main body**, not overridable functions.
+- **`fm-teardown.sh` — worktree ownership.** The `fm_backend_owns_worktrees` branch selection and the bb teardown arm are likewise inline.
+
+Because these are `case`/`if` blocks in tracked bodies (not functions with a `*)` that dispatches to `fm_backend_<name>_*`), no function override or env hook can inject them; a real copy is the only faithful option. The mirror confines the drift to exactly these three files while every other script inherits upstream.
+
+**Minimal upstream-friendly seams we would contribute to `kunchenguid/firstmate`** so these copies could shrink to a pure drop-in (no copied bodies):
+
+1. **Sourced backend drop-in + registration.** After computing `FM_BACKEND_KNOWN`, source `config/backends.d/*.sh` (gitignored, like `config/backend`) and append their declared names to `FM_BACKEND_KNOWN`/`FM_BACKEND_SPAWN` and to `fm_backend_owns_worktrees`. A drop-in declares `name`, `spawn=1`, `owns_worktrees=0|1`, and its adapter path.
+2. **Generic dispatch fallthrough.** Give every `fm_backend_*` dispatcher a `*)` arm that, for a registered non-native backend, calls `fm_backend_<name>_<op>` (the convention the adapters already follow) instead of printing `unknown`. That alone removes every per-op `case` edit in `fm-backend.sh`.
+3. **Spawn/teardown backend hooks.** Replace the inline `case`/`if` in `fm-spawn.sh`/`fm-teardown.sh` with calls the adapter can implement — e.g. `fm_backend_<name>_create_task`, and a queryable `fm_backend_owns_worktrees "$BACKEND"` gate around the Treehouse-skip conditionals (the teardown patch already introduces exactly this predicate).
+
+With (1)–(3), the entire bb overlay becomes `config/backends.d/bb.sh` + `bin/backends/bb.sh` with **zero** copied native bodies. Until then, the three patched copies are the honest, documented cost, isolated in `bin-bb`.
+
+## Migrating a home off the in-place patch (safe; run by an operator, not the plugin)
+
+A home installed by the **old** overlay has the three tracked files patched in place — its tree is permanently dirty, so ff-update skips. `install-bb-backend.py` never reverts a tracked file (it only warns); restore the home by hand with this procedure. It touches **only** the three tracked files and the `.orig` leftovers; it never goes near `state/` or `data/` (crew state and the captain's live memory), and it leaves the new `bin-bb/` mirror in place.
+
+```bash
+FMH=/root/firstmate   # the live home
+
+# 0. Confirm what is dirty (expect: bin/fm-backend.sh, bin/fm-spawn.sh,
+#    bin/fm-teardown.sh, docs/configuration.md modified; *.orig untracked).
+git -C "$FMH" status --porcelain
+
+# 1. Restore the tracked files the old overlay patched in place. `git checkout`
+#    only rewrites these exact paths; nothing under state/ or data/ is touched.
+git -C "$FMH" checkout -- bin/fm-backend.sh bin/fm-spawn.sh bin/fm-teardown.sh docs/configuration.md
+
+# 2. Remove the patch's .orig backups (untracked; safe to delete).
+rm -f "$FMH"/bin/fm-backend.sh.orig "$FMH"/bin/fm-spawn.sh.orig \
+      "$FMH"/bin/fm-teardown.sh.orig "$FMH"/docs/configuration.md.orig
+
+# 3. Tree should now be clean except for overlay-owned untracked paths. Register
+#    them in the per-clone exclude (the new installer does this for you) so the
+#    tree reads fully clean:
+git -C "$FMH" status --porcelain      # expect empty, or only bb.sh / bin-bb / docs/bb-backend.md
+
+# 4. (Re)install the mirror overlay so bin-bb exists and the marker + exclude are
+#    written. Preserves state/ and data/ untouched.
+python3 <overlay>/install-bb-backend.py --home "$FMH" --project-id <bb-project-id>
+
+# 5. Fast-forward the now-clean clone to upstream (this is what was frozen). It
+#    advances tracked files only; bin-bb/ (excluded, untracked) is left as-is.
+git -C "$FMH" fetch --quiet origin
+up=$(git -C "$FMH" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)
+[ -n "$up" ] && git -C "$FMH" merge --ff-only "$up"
+```
+
+Do **not** run step 1 as `git checkout .` or `git reset --hard` — those would reach beyond the three files. `state/` and `data/` are never tracked in this clone (they are gitignored), so a scoped `git checkout -- <the four paths>` cannot lose crew state or memory; still, restrict the command to those paths.
