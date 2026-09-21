@@ -20,7 +20,23 @@ Optional:
 - `FM_BB_VISIBLE=0` / `FM_BB_HIDDEN=1` — hide child threads from the sidebar (default visible)
 - `FM_BB_SHARED_ENV=1` — skip managed-worktree (ships should not)
 
-Plugin entry: `bb firstmate fm spawn -- --mode direct-PR -- ship '<task>'` runs `bin/fm-spawn.sh` on the host with `FM_BACKEND=bb`.
+Plugin entry: `bb firstmate fm spawn -- --mode direct-PR -- ship '<task>'` runs `fm-spawn.sh` on the host with `FM_BACKEND=bb`.
+
+## Installation architecture: the mirror bin (never patch tracked files)
+
+`/root/firstmate` is a clone of a third-party repo (`kunchenguid/firstmate`). Native firstmate exposes **no runtime seam** to register a new spawn-capable backend: `FM_BACKEND_KNOWN`/`FM_BACKEND_SPAWN` and every `fm_backend_*` dispatch `case` are hardcoded in the **tracked** files `bin/fm-backend.sh`, `bin/fm-spawn.sh`, and `bin/fm-teardown.sh`, and the only extension host (`bin/fm-extension.mjs`) binds **process-event adapters** only (`poll`/`classify`/`terminal`/`silent`) — it cannot register a spawn/worktree backend.
+
+The overlay therefore does **not** edit those tracked files. `install-bb-backend.py` builds a parallel **mirror bin** at `<home>/bin-bb`:
+
+- every native `bin/` entry is **symlinked** into `bin-bb/` (so it keeps inheriting upstream on every ff-update),
+- **except** the three no-seam files, which are generated as **patched copies** (native source + the overlay patches), and
+- `bin-bb/backends/` mirrors the native adapters plus the real `bb.sh`.
+
+Native scripts derive `SCRIPT_DIR`/`FM_BACKEND_LIB_DIR` from their own `BASH_SOURCE`, so invoking `bin-bb/fm-*.sh` makes every `. "$SCRIPT_DIR/fm-*.sh"` resolve **inside `bin-bb`**: the patched `fm-backend.sh` (with the bb dispatch arms) and the `bb.sh` adapter are picked up for **all** scripts, with zero edits to tracked files. The plugin routes `bin` → `bin-bb` at runtime (`fmBinDirAssign` / `$FM_BINDIR`) whenever the marker `config/bb-overlay` and `bin-bb/` are present, and falls back to native `bin` otherwise.
+
+`bin-bb/` is registered in `<home>/.git/info/exclude` (a per-clone, untracked git exclude that is **not** part of the repository), and `config/` is already gitignored upstream. So `git -C <home> status --porcelain` stays **empty** — which is exactly what the plugin's `fetch` + `git merge --ff-only` auto-update requires: with the old in-place patch the tree was permanently dirty and the update **always skipped**; the mirror keeps it clean so the clone actually fast-forwards.
+
+Re-run the installer after an ff-update: it re-mirrors (picking up new native `bin/` files) and regenerates the three patched copies against the new native source. If upstream changed one of the three files so a patch no longer applies, the install **fails loudly** instead of silently shipping a stale copy.
 
 ## Task shape and metadata
 
@@ -76,3 +92,74 @@ Under `notifyOwner=real` the durable crew→captain wake plane is partitioned **
 - No Escape key.
 - Relay/mail/voice stay firstmate scripts if those planes are enabled; they are not rewritten in the BB plugin.
 - Native `bb firstmate dispatch` uses the plugin SDK (pluginMetadata, Fleet UI) and, when `fmHome` is set, writes the same `state/<id>.meta` ledger `fm-spawn` does. `bb firstmate fm` is how the bash toolbelt drives the same BB runtime.
+
+## The three files still carried as patched copies (and the upstream seam we want)
+
+The mirror keeps the tracked tree clean, but `fm-backend.sh`, `fm-spawn.sh`, and `fm-teardown.sh` are still carried as **patched copies** in `bin-bb`, because their edits cannot be expressed through any native seam:
+
+- **`fm-backend.sh` — registration + dispatch.** `FM_BACKEND_KNOWN`/`FM_BACKEND_SPAWN` are literal strings and each `fm_backend_*` function is a literal `case` with a `*)` reject/`unknown` arm. There is no drop-in dir, no `FM_BACKEND_KNOWN_EXTRA`, no config-driven registration, and no post-source hook, so a new backend name and its dispatch arms cannot be added at runtime.
+- **`fm-spawn.sh` — spawn flow.** The worktree-creation `case "$BACKEND"` block, the two `[ "$BACKEND" != orca ]` Treehouse-skip conditionals, and the relaunch/meta handling are **inline in the main body**, not overridable functions.
+- **`fm-teardown.sh` — worktree ownership.** The `fm_backend_owns_worktrees` branch selection and the bb teardown arm are likewise inline.
+
+Because these are `case`/`if` blocks in tracked bodies (not functions with a `*)` that dispatches to `fm_backend_<name>_*`), no function override or env hook can inject them; a real copy is the only faithful option. The mirror confines the drift to exactly these three files while every other script inherits upstream.
+
+**Minimal upstream-friendly seams we would contribute to `kunchenguid/firstmate`** so these copies could shrink to a pure drop-in (no copied bodies):
+
+1. **Sourced backend drop-in + registration.** After computing `FM_BACKEND_KNOWN`, source `config/backends.d/*.sh` (gitignored, like `config/backend`) and append their declared names to `FM_BACKEND_KNOWN`/`FM_BACKEND_SPAWN` and to `fm_backend_owns_worktrees`. A drop-in declares `name`, `spawn=1`, `owns_worktrees=0|1`, and its adapter path.
+2. **Generic dispatch fallthrough.** Give every `fm_backend_*` dispatcher a `*)` arm that, for a registered non-native backend, calls `fm_backend_<name>_<op>` (the convention the adapters already follow) instead of printing `unknown`. That alone removes every per-op `case` edit in `fm-backend.sh`.
+3. **Spawn/teardown backend hooks.** Replace the inline `case`/`if` in `fm-spawn.sh`/`fm-teardown.sh` with calls the adapter can implement — e.g. `fm_backend_<name>_create_task`, and a queryable `fm_backend_owns_worktrees "$BACKEND"` gate around the Treehouse-skip conditionals (the teardown patch already introduces exactly this predicate).
+
+With (1)–(3), the entire bb overlay becomes `config/backends.d/bb.sh` + `bin/backends/bb.sh` with **zero** copied native bodies. Until then, the three patched copies are the honest, documented cost, isolated in `bin-bb`.
+
+## Migrating a home off the in-place patch (safe; run by an operator, not the plugin)
+
+A home installed by the **old** overlay has the three tracked files patched in place — its tree is permanently dirty, so ff-update skips. `install-bb-backend.py` never reverts a tracked file (it only warns); restore the home by hand with this procedure. It touches **only** the three tracked files and the `.orig` leftovers; it never goes near `state/` or `data/` (crew state and the captain's live memory), and it never references the memory backup at `/root/.bb-server/secrets/fm-memory-backup`.
+
+**`fmHome` is shared host-global across captains — the procedure must have NO bb-less window.** Every captain thread on a host shares this one `fmHome`, and a single captain **cannot** quiesce the others; another captain's crew can dispatch at any instant. So the migration cannot rely on "no dispatch in flight." It is ordered so that **a bb-capable path exists at every step**: install the mirror **FIRST** (while native is still patched in place — both paths dispatch bb), and only *then* restore native, fast-forward, and re-install. From the moment `bin-bb/` + the `config/bb-overlay` marker exist, `$FM_BINDIR` routes to the mirror, which serves bb dispatch through the rest of the sequence; native is never the only path, so no dispatch ever hits `unknown backend 'bb'`. (Proven end-to-end, with a dispatch probe at every step, by `scripts/live-migration-zero-window-check.mjs`; its `--old-order` mode shows the previous "restore-first" ordering *did* open a window.)
+
+Between the fast-forward (step 4) and the re-install (step 5) the mirror is momentarily **stale** (HEAD advanced past the mirror's manifest) — but it is not bb-*less*: the frozen copies still carry the bb arms and keep dispatching. `--verify` flags that staleness and the re-install repairs it; the plugin keeps routing to `bin-bb` throughout. This is a staleness window, not a correctness window.
+
+```bash
+FMH=/root/firstmate   # the live home; OVL=<path to overlay/>
+
+# 0. Confirm the legacy state (expect: bin/fm-backend.sh, bin/fm-spawn.sh,
+#    bin/fm-teardown.sh, docs/configuration.md modified; *.orig untracked).
+git -C "$FMH" status --porcelain
+
+# 1. Install the mirror FIRST, while native is still patched. Now BOTH paths
+#    dispatch bb: native (still patched) and bin-bb (patched copies). Once the
+#    marker + bin-bb exist, the plugin routes to bin-bb. No bb-less moment.
+python3 "$OVL"/install-bb-backend.py --home "$FMH" --project-id <bb-project-id>
+python3 "$OVL"/install-bb-backend.py --home "$FMH" --verify   # healthy
+
+# 2. Restore the tracked files the old overlay patched in place. `git checkout`
+#    only rewrites these exact paths; nothing under state/ or data/ is touched.
+#    bb keeps working — the plugin is already routing to bin-bb.
+git -C "$FMH" checkout -- bin/fm-backend.sh bin/fm-spawn.sh bin/fm-teardown.sh docs/configuration.md
+
+# 3. Remove the patch's .orig backups (untracked; safe to delete).
+rm -f "$FMH"/bin/fm-*.sh.orig "$FMH"/docs/*.md.orig
+
+# 4. Fast-forward the now-clean clone to upstream (the update that was frozen).
+#    The mirror goes momentarily STALE here but still dispatches bb.
+git -C "$FMH" fetch --quiet origin
+up=$(git -C "$FMH" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)
+[ -n "$up" ] && git -C "$FMH" merge --ff-only "$up"
+
+# 5. Re-install against the new HEAD so bin-bb mirrors the updated bin/ and the
+#    three copies are patched from current sources. Then verify + confirm clean.
+python3 "$OVL"/install-bb-backend.py --home "$FMH" --project-id <bb-project-id>
+python3 "$OVL"/install-bb-backend.py --home "$FMH" --verify   # healthy
+git -C "$FMH" status --porcelain                              # expect empty
+```
+
+Do **not** run step 2 as `git checkout .` or `git reset --hard` — those would reach beyond the three files. `state/` and `data/` are never tracked in this clone (they are gitignored), so a scoped `git checkout -- <the four paths>` cannot lose crew state or memory; still, restrict the command to those paths. After any later out-of-band fast-forward (a manual `git pull`, an external updater), re-run step 5; `--verify` fails loud (`FM_MIRROR_STALE`) whenever the mirror is behind HEAD or a sibling is missing, and the plugin logs the same on the dispatch and supervision paths.
+
+## Paths that do NOT reach bb through the mirror (F4/F5)
+
+The mirror redirects the plugin's entry points via `$FM_BINDIR`, and each patched copy's own internal dispatch self-calls are rewritten to `$SCRIPT_DIR` at install time (so `fm-spawn.sh` batch/array dispatch, which re-invokes itself per pair with `--backend bb`, stays inside the mirror). Two native references still resolve to pristine `bin/` and would report `unknown backend 'bb'` if reached with `backend=bb`:
+
+- **`bin/fm-bootstrap.sh` secondmate spawn** (`FM_SPAWN_NO_GUARD=1 "$FM_ROOT/bin/fm-spawn.sh" … --secondmate`). This is a symlinked (not patched) mirror entry, so its absolute `$FM_ROOT/bin/` call reaches native. **Not a functional regression:** `backend=bb` refuses `--secondmate` outright (`fm-spawn.sh`: "backend=bb does not support --secondmate spawns yet"), so a bb captain never completes a secondmate spawn under either scheme — the mirror only changes the error text (`unknown backend` vs the explicit refusal). If bb ever gains secondmate support, this call must be rewritten to `$FM_BINDIR`/`$SCRIPT_DIR`, or better, fixed by the upstream seam below.
+- **`bin/fm-remote-entrypoint.sh`** resolves `realpath "${BASH_SOURCE[0]}"`, so a symlinked `bin-bb` entry resolves back to native `bin` and bypasses the mirror. This is the remote-job entrypoint, outside the bb dispatch path; noted for completeness.
+
+The clean fix for both is the **upstream seam** proposed above (a generic `*)` dispatch fallthrough in native `bin/fm-backend.sh`): once native itself dispatches a registered backend to `fm_backend_<name>_*`, every `$FM_ROOT/bin/` reference reaches a bb-aware script with no mirror rewrite at all.

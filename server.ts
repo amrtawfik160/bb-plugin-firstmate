@@ -275,6 +275,42 @@ function shQuote(text: string): string {
   return `'${text.replace(/'/g, `'\\''`)}'`;
 }
 
+// The bb overlay never edits tracked firstmate files. Instead it installs a parallel
+// "mirror bin" at <home>/bin-bb (config/bb-overlay marks it): the three dispatch scripts
+// (fm-backend/fm-spawn/fm-teardown) are patched copies carrying the bb arms, and every
+// other bin entry is a symlink to native, so scripts run bb-aware while the tracked tree
+// stays clean and keeps fast-forwarding. This emits a shell statement that resolves
+// FM_BINDIR to bin-bb when the overlay is present, else native bin — evaluated on the host
+// so a home that is not bb-installed (or a pre-migration home) transparently uses bin.
+function fmBinDirAssign(fmHome: string): string {
+  const q = shQuote(fmHome);
+  return `FM_BINDIR=${q}/bin; if [ -f ${q}/config/bb-overlay ] && [ -d ${q}/bin-bb ]; then FM_BINDIR=${q}/bin-bb; fi`;
+}
+
+// Loud staleness guard (F2). The plugin's own fast-forward (initRealMode) always
+// re-mirrors, but an OUT-OF-BAND ff (a manual `git pull`, an external updater, the
+// migration steps) advances HEAD without rebuilding bin-bb, leaving new sibling
+// scripts unmirrored and the three frozen copies behind upstream — silently, because
+// the tree still reads clean. This emits FM_MIRROR_STALE on stderr when the mirror's
+// recorded HEAD no longer matches the clone's HEAD; the caller logs it loudly. A truly
+// missing SCRIPT_DIR sibling surfaces on its own (the script errors, non-zero) since
+// callers no longer swallow that. Wired into BOTH the dispatch paths (runFmScript,
+// fm-brief scaffold) and the SUPERVISION paths (the watch keeper's per-re-arm check and
+// checkWatcher's per-poll check), so a stale watcher-arm is loud too. Runs only when
+// FM_BINDIR is the mirror. Cheap (~6ms: sed + git rev-parse). Must be emitted AFTER
+// fmBinDirAssign.
+function fmMirrorStaleGuard(fmHome: string): string {
+  const q = shQuote(fmHome);
+  return (
+    `if [ "$FM_BINDIR" = ${q}/bin-bb ]; then ` +
+    `__fm_mh=$(sed -n 's/^head=//p' ${q}/bin-bb/.mirror-manifest 2>/dev/null); ` +
+    `__fm_ch=$(git -C ${q} rev-parse HEAD 2>/dev/null || true); ` +
+    `if [ -n "$__fm_mh" ] && [ -n "$__fm_ch" ] && [ "$__fm_mh" != "$__fm_ch" ]; then ` +
+    `echo "FM_MIRROR_STALE: bb mirror built at $__fm_mh but HEAD is $__fm_ch; re-run install-bb-backend.py --home ${fmHome}" >&2; ` +
+    `fi; fi`
+  );
+}
+
 // The drain hint appended to every real-mode doorbell. The durable wake queue stays the
 // authoritative store; the chat doorbell is only a pointer to it, so a dropped doorbell can
 // never lose the report (it survives in state/.wake-queue).
@@ -356,7 +392,6 @@ export function fmWatchKeeperInterval(graceSec: number): number {
 // forks a new one after one exits.
 export function fmWatchKeeperScript(hostId: string, fmHome: string, interval: number): string {
   const pid = `${fmHome}/${FM_WATCH_KEEPER_PID}`;
-  const arm = `${fmHome}/bin/fm-watch-arm.sh`;
   const log = `${fmHome}/state/.bb-watch-arm.log`;
   const ownerBeat = `${fmHome}/${FM_WATCH_OWNER_BEAT}`;
   const ttl = fmWatchOwnerBeatTtl(interval);
@@ -382,7 +417,10 @@ export function fmWatchKeeperScript(hostId: string, fmHome: string, interval: nu
     // is still published by arm_check when a wake is pending, so buried rows are still presented.
     "export FM_WATCH_HANDLING_SUCCESSOR=1",
     `PID=${shQuote(pid)}`,
-    `ARM=${shQuote(arm)}`,
+    // Route to the bb mirror bin so the watcher this keeper arms is bb-dispatch-aware
+    // (native fm-watch has no bb arm); falls back to native bin when not bb-installed.
+    fmBinDirAssign(fmHome),
+    `ARM="$FM_BINDIR/fm-watch-arm.sh"`,
     `LOG=${shQuote(log)}`,
     `OWNER_BEAT=${shQuote(ownerBeat)}`,
     `OWNER_TTL=${ttl}`,
@@ -395,6 +433,12 @@ export function fmWatchKeeperScript(hostId: string, fmHome: string, interval: nu
     '  OB=$(cat "$OWNER_BEAT" 2>/dev/null || echo 0); case "$OB" in ""|*[!0-9]*) OB=0 ;; esac',
     '  NOW=$(date +%s)',
     '  if [ "$OB" -eq 0 ] || [ $(( NOW - OB )) -gt "$OWNER_TTL" ]; then break; fi',
+    // F2 (re-review): the keeper re-arms fm-watch FROM the mirror, so a stale mirror here
+    // (missing sibling / drifted copy after an out-of-band ff) would silently degrade
+    // supervision — exactly the failure this effort removed. Check on every re-arm and
+    // record FM_MIRROR_STALE into the watch log; checkWatcher reads that log tail and
+    // surfaces it loudly. Cheap (~6ms: sed + git rev-parse).
+    `  { ${fmMirrorStaleGuard(fmHome)} ; } >> "$LOG" 2>&1`,
     '  "$ARM" >> "$LOG" 2>&1 || true',
     `  sleep ${interval}`,
     "done",
@@ -1667,7 +1711,9 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
     const brief = `${fmHome}/data/${crew.id}/brief.md`;
-    const briefScript = `${fmHome}/bin/fm-brief.sh`;
+    // fm-brief.sh is resolved to "$FM_BINDIR/fm-brief.sh" (the bb mirror bin when the
+    // overlay is installed) inside the host script below.
+    const briefRef = `"$FM_BINDIR/fm-brief.sh"`;
     // Strip a leading Captain-label/address line so native fm-spawn.sh's
     // fm_brief_intent_address_line does not refuse the brief (B1).
     const intentB64 = Buffer.from(normalizeCaptainIntent(task.trim()).slice(0, 3000), "utf8").toString("base64");
@@ -1675,8 +1721,8 @@ export default async function plugin(bb: BbPluginApi) {
     // is exactly the delivery mode the brief records.
     const scaffold =
       crew.shape === "scout"
-        ? `${shQuote(briefScript)} ${shQuote(crew.id)} crew --scout`
-        : `${shQuote(briefScript)} ${shQuote(crew.id)} crew --mode ${shQuote(crew.posture)}`;
+        ? `${briefRef} ${shQuote(crew.id)} crew --scout`
+        : `${briefRef} ${shQuote(crew.id)} crew --mode ${shQuote(crew.posture)}`;
     const py =
       "import base64,os,sys;p=sys.argv[1];" +
       'intent=base64.b64decode(os.environ["FM_INTENT"]).decode();' +
@@ -1685,15 +1731,25 @@ export default async function plugin(bb: BbPluginApi) {
     const script = [
       `export FM_HOME=${shQuote(fmHome)}`,
       `export FM_ROOT=${shQuote(fmHome)}`,
-      `[ -f ${shQuote(briefScript)} ] || exit 0`,
+      fmBinDirAssign(fmHome),
+      fmMirrorStaleGuard(fmHome),
+      `[ -f ${briefRef} ] || exit 0`,
       `[ -f ${shQuote(brief)} ] && exit 0`,
-      `${scaffold} >/dev/null 2>&1 || exit 0`,
-      `FM_INTENT=${intentB64} python3 -c ${shQuote(py)} ${shQuote(brief)} || exit 0`,
+      // F2: do NOT `>/dev/null 2>&1 || exit 0` here — that swallowed a stale-mirror
+      // failure (e.g. a missing SCRIPT_DIR sibling in bin-bb) whole. Capture the
+      // scaffold's stderr and surface it so publishFmBrief logs it (best-effort still:
+      // the crew already has the structured prompt, so a failure only logs, not throws).
+      `if ! __fm_err=$(${scaffold} 2>&1); then echo "fm-brief scaffold failed: $__fm_err" >&2; exit 1; fi`,
+      `FM_INTENT=${intentB64} python3 -c ${shQuote(py)} ${shQuote(brief)} || { echo "fm-brief fill failed" >&2; exit 1; }`,
     ].join("\n");
     try {
       const res = await runOnHost(host, script, 30_000);
+      if (res.output.includes("FM_MIRROR_STALE")) {
+        const line = res.output.split("\n").find((l) => l.includes("FM_MIRROR_STALE"))?.trim() ?? "FM_MIRROR_STALE";
+        bb.log.error(`bb mirror is STALE while scaffolding brief crew=${crew.id}: ${line}. Re-run the overlay installer against ${fmHome}.`);
+      }
       if (res.exitCode !== 0) {
-        bb.log.warn(`fm brief scaffold failed crew=${crew.id} exit=${res.exitCode}`);
+        bb.log.warn(`fm brief scaffold failed crew=${crew.id} exit=${res.exitCode}: ${res.output.trim().slice(-400)}`);
         return false;
       }
       bb.log.info(`fm brief scaffolded crew=${crew.id} path=${brief}`);
@@ -3632,7 +3688,10 @@ export default async function plugin(bb: BbPluginApi) {
     signal?: AbortSignal;
   }): Promise<{ exitCode: number | null; output: string; scriptPath: string }> {
     const script = normalizeFmScript(input.script);
+    // Native path for the RETURN value / diagnostics; the invocation below resolves
+    // FM_BINDIR (bin-bb when the bb overlay is installed) on the host.
     const scriptPath = `${input.fmHome}/bin/fm-${script}.sh`;
+    const scriptLeaf = `fm-${script}.sh`;
     const extraEnv = Object.entries(input.env ?? {})
       .filter(([, v]) => v !== "")
       .map(([k, v]) => `export ${k}=${shQuote(v)}`);
@@ -3644,12 +3703,18 @@ export default async function plugin(bb: BbPluginApi) {
         parentThreadId: input.parentThreadId,
       }),
       ...extraEnv,
-      `if [ ! -f ${shQuote(scriptPath)} ]; then echo "error: missing ${scriptPath}" >&2; exit 127; fi`,
-      `${shQuote(scriptPath)} ${input.args.map(shQuote).join(" ")}`,
+      fmBinDirAssign(input.fmHome),
+      fmMirrorStaleGuard(input.fmHome),
+      `if [ ! -f "$FM_BINDIR/${scriptLeaf}" ]; then echo "error: missing $FM_BINDIR/${scriptLeaf}" >&2; exit 127; fi`,
+      `"$FM_BINDIR/${scriptLeaf}" ${input.args.map(shQuote).join(" ")}`,
     ]
       .filter((line) => line !== "")
       .join("\n");
     const result = await runOnHost(input.hostId, prelude, input.timeoutMs, input.signal);
+    if (result.output.includes("FM_MIRROR_STALE")) {
+      const line = result.output.split("\n").find((l) => l.includes("FM_MIRROR_STALE"))?.trim() ?? "FM_MIRROR_STALE";
+      bb.log.error(`bb mirror is STALE on host ${input.hostId} running fm-${script}: ${line}. Re-run the overlay installer against ${input.fmHome}; new native scripts are unmirrored and the three patched copies are frozen behind upstream.`);
+    }
     return { ...result, scriptPath };
   }
 
@@ -4512,7 +4577,6 @@ export default async function plugin(bb: BbPluginApi) {
   ): Promise<{ beatAge: number; relaunched: boolean; keeperAlive: boolean; logTail: string } | null> {
     const beat = `${fmHome}/state/.last-watcher-beat`;
     const log = `${fmHome}/state/.bb-watch-arm.log`;
-    const arm = `${fmHome}/bin/fm-watch-arm.sh`;
     const pid = `${fmHome}/${FM_WATCH_KEEPER_PID}`;
     const keeperScript = `${fmHome}/${FM_WATCH_KEEPER_SH}`;
     const ownerBeat = `${fmHome}/${FM_WATCH_OWNER_BEAT}`;
@@ -4521,6 +4585,7 @@ export default async function plugin(bb: BbPluginApi) {
     // keeper launch so a freshly launched keeper always sees a fresh beat), then read
     // beacon age + keeper liveness + a log tail (no other side effects).
     const readScript = [
+      fmBinDirAssign(fmHome),
       `mkdir -p ${shQuote(`${fmHome}/state`)}`,
       // B3(b): the owner-beat write is a silent SPOF — a non-writable or full state dir
       // makes it fail, the keeper then sees a stale/absent beat and self-exits while the
@@ -4531,7 +4596,11 @@ export default async function plugin(bb: BbPluginApi) {
       `if [ -f ${shQuote(beat)} ]; then AGE=$(( $(date +%s) - $(stat -c %Y ${shQuote(beat)} 2>/dev/null || echo 0) )); fi`,
       "KEEPER=dead",
       `if [ -f ${shQuote(pid)} ]; then KP=$(cat ${shQuote(pid)} 2>/dev/null || echo); if [ -n "$KP" ] && kill -0 "$KP" 2>/dev/null; then KEEPER=alive; fi; fi`,
-      `[ -x ${shQuote(arm)} ] || echo FM_WATCH_NO_ARM`,
+      `[ -x "$FM_BINDIR/fm-watch-arm.sh" ] || echo FM_WATCH_NO_ARM`,
+      // F2 (re-review): supervision runs fm-watch-arm FROM the mirror, so a stale mirror
+      // here degrades supervision silently. Check on every supervision poll; the emitted
+      // FM_MIRROR_STALE line is surfaced loudly by the caller below.
+      fmMirrorStaleGuard(fmHome),
       `printf 'FM_BEAT_AGE=%s\\nFM_KEEPER=%s\\n' "$AGE" "$KEEPER"`,
       "echo '---FM_LOGTAIL---'",
       `[ -f ${shQuote(log)} ] && tail -c 4000 ${shQuote(log)} || true`,
@@ -4552,6 +4621,16 @@ export default async function plugin(bb: BbPluginApi) {
       if (res.output.includes("FM_OWNER_BEAT=fail")) {
         bb.log.error(
           `fm-watch-supervisor: owner-beat write FAILED on host ${hostId} (${ownerBeat} not writable — full/read-only state dir?); the keeper will self-exit and real supervision will stop. Fix the state dir.`,
+        );
+      }
+      // F2 (re-review): a stale mirror on the SUPERVISION path (this poll's own guard, or
+      // the keeper's re-arm guard captured in the log tail) means the watcher fm-watch is
+      // armed from unmirrored/drifted scripts — supervision degrading silently. Surface it
+      // loudly on the supervision channel too, not just on dispatch.
+      if (res.output.includes("FM_MIRROR_STALE")) {
+        const line = res.output.split("\n").find((l) => l.includes("FM_MIRROR_STALE"))?.trim() ?? "FM_MIRROR_STALE";
+        bb.log.error(
+          `fm-watch-supervisor: bb mirror is STALE on host ${hostId}: ${line}. The keeper re-arms fm-watch from this mirror, so supervision is degrading — re-run the overlay installer against ${fmHome}.`,
         );
       }
       const tailIdx = res.output.indexOf("---FM_LOGTAIL---");

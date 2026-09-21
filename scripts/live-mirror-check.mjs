@@ -1,0 +1,177 @@
+#!/usr/bin/env node
+// F1 live proof: the bb backend actually runs THROUGH THE MIRROR (bin-bb), not
+// through native bin/. This is the proof PR #16's review found missing:
+// scripts/live-brief-intent-check.mjs drives native `bin/fm-spawn.sh` against a copy
+// of /root/firstmate that is STILL patched in place, so it passes whether or not the
+// mirror works. This script builds a PRISTINE clone (native bin/ has no bb), installs
+// the overlay, and proves the mirror is load-bearing — including a mutation check that
+// the native path REJECTS bb in the same run.
+//
+// NOT part of `npm test` (needs the `bb` CLI, a connected host, and the real native
+// firstmate scripts). Everything mutating happens under scratch clones and a throwaway
+// project; /root/firstmate is never touched. Every real bb thread spawned is torn down.
+//
+//   node scripts/live-mirror-check.mjs
+//
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { normalizeCaptainIntent } from "../server.ts";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const OVERLAY = join(HERE, "..", "overlay");
+const INSTALLER = join(OVERLAY, "install-bb-backend.py");
+const NATIVE_FM = "/root/firstmate";
+const results = [];
+function record(name, ok, detail) {
+  results.push({ name, ok });
+  console.log(`${ok ? "PASS" : "FAIL"}  ${name}${detail ? `  — ${detail}` : ""}`);
+}
+function sh(cmd, args, opts = {}) {
+  const r = spawnSync(cmd, args, { encoding: "utf8", maxBuffer: 1 << 26, ...opts });
+  return { code: r.status, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
+}
+
+const SPAWNED = /^spawned .* window=bb:(thr_[a-z0-9]+)/m;
+const REJECTS_BB = /unknown backend 'bb'/;
+
+const createdThreads = [];
+function teardownThread(tid) {
+  sh("bb", ["thread", "stop", tid]);
+  sh("bb", ["thread", "archive", tid]);
+  sh("bb", ["thread", "delete", tid, "--yes"]);
+  const wt = `/root/.bb-server/plugins/environment-git-worktree/host-data/worktrees/${tid}-1`;
+  if (existsSync(wt)) rmSync(wt, { recursive: true, force: true });
+}
+
+const scratch = mkdtempSync(join(tmpdir(), "fm-mirror-"));
+const fmh = join(scratch, "fmhome");
+const proj = join(scratch, "proj");
+console.log(`# live-mirror-check scratch=${scratch}\n`);
+
+// Resolve FM_BINDIR exactly as the plugin's fmBinDirAssign does.
+function binDir() {
+  return existsSync(join(fmh, "config", "bb-overlay")) && existsSync(join(fmh, "bin-bb"))
+    ? join(fmh, "bin-bb")
+    : join(fmh, "bin");
+}
+
+try {
+  // (1) PRISTINE clone — native bin/ must NOT carry bb (unlike the live in-place home).
+  const clone = sh("git", ["clone", "--quiet", "--no-local", `file://${NATIVE_FM}`, fmh]);
+  if (clone.code !== 0) throw new Error(`clone pristine firstmate failed: ${clone.out}`);
+  mkdirSync(join(fmh, "data"), { recursive: true });
+  mkdirSync(join(fmh, "state"), { recursive: true });
+
+  const nativePreInstall = sh("bash", ["-c", `. "${join(fmh, "bin", "fm-backend.sh")}"; fm_backend_validate bb`]);
+  record("pristine native bin/ REJECTS bb before install (proves clone is not pre-patched)",
+    REJECTS_BB.test(nativePreInstall.out) && nativePreInstall.code !== 0,
+    nativePreInstall.out.trim() || "(no output)");
+
+  // Discover a real registered bb project so a real thread can actually spawn; when
+  // none is reachable the dispatch proof below still holds (see spawn loop).
+  // Set FM_MIRROR_CHECK_NO_REAL_PROJECT=1 to prove dispatch WITHOUT spawning into a
+  // real project (the mirror still reaches the bb thread-spawn layer and 404s on the
+  // throwaway dir — enough for the dispatch proof, and it creates nothing real).
+  let realProjectId = "";
+  let realProjectPath = "";
+  if (process.env.FM_MIRROR_CHECK_NO_REAL_PROJECT !== "1") {
+    const plist = sh("bb", ["project", "list"]);
+    const prow = plist.out.split("\n").map((l) => l.match(/^(proj_[a-z0-9]+)\s+.+?\s+(\/\S.*)$/)).find(Boolean);
+    if (prow) { realProjectId = prow[1]; realProjectPath = prow[2].trim(); }
+  }
+
+  // (2) Install the overlay → mirror bin. No fake --project-id: without a real project
+  //     the adapter resolves by path (like live-brief-intent-check), and the dispatch
+  //     proof does not depend on real thread creation.
+  const instArgs = [INSTALLER, "--home", fmh, "--overlay", OVERLAY];
+  if (realProjectId) instArgs.push("--project-id", realProjectId);
+  const inst = sh("python3", instArgs);
+  if (inst.code !== 0) throw new Error(`installer failed: ${inst.out}`);
+  record("installer built the mirror and left the tree clean", existsSync(join(fmh, "bin-bb", "fm-spawn.sh")) &&
+    sh("git", ["-C", fmh, "status", "--porcelain"]).out.trim() === "",
+    `bin-bb=${binDir()}`);
+
+  // (3) MUTATION PROOF: same call, native REJECTS bb, mirror ACCEPTS it. The mirror
+  //     is what makes bb dispatch work; nothing else changed.
+  const nativeReject = sh("bash", ["-c", `. "${join(fmh, "bin", "fm-backend.sh")}"; fm_backend_validate bb`]);
+  const mirrorAccept = sh("bash", ["-c", `. "${join(fmh, "bin-bb", "fm-backend.sh")}"; fm_backend_validate bb`]);
+  record("MUTATION: native bin REJECTS bb, mirror bin ACCEPTS bb",
+    REJECTS_BB.test(nativeReject.out) && nativeReject.code !== 0 && mirrorAccept.code === 0 && !REJECTS_BB.test(mirrorAccept.out),
+    `native=${nativeReject.code} mirror=${mirrorAccept.code}`);
+
+  // Throwaway project.
+  mkdirSync(proj, { recursive: true });
+  sh("git", ["init", "-q"], { cwd: proj });
+  sh("git", ["config", "user.email", "x@x"], { cwd: proj });
+  sh("git", ["config", "user.name", "x"], { cwd: proj });
+  sh("git", ["commit", "-q", "--allow-empty", "-m", "init"], { cwd: proj });
+
+  const env = { ...process.env, FM_HOME: fmh, FM_ROOT: fmh };
+  const brief = (id) => join(fmh, "data", id, "brief.md");
+  function scaffold(id, kind) {
+    const args = kind === "scout" ? [id, "crew", "--scout"] : [id, "crew", "--mode", "direct-PR"];
+    const r = sh(join(binDir(), "fm-brief.sh"), args, { env });
+    if (!existsSync(brief(id))) throw new Error(`fm-brief.sh did not scaffold ${id}: ${r.out}`);
+  }
+  function fill(id, task) {
+    const spec = "Implement the captain's intent above exactly; small diff; report DONE/BLOCKED/FAILED.";
+    const s = readFileSync(brief(id), "utf8").replace("{TASK}", task).replace("{FIRSTMATE_SPEC}", spec);
+    writeFileSync(brief(id), s);
+  }
+  const projDir = realProjectPath || proj;
+  const spawnEnv = realProjectId ? { ...env, FM_BB_PROJECT_ID: realProjectId } : env;
+  function spawnInProject(bindir, id, kind) {
+    const args =
+      kind === "scout"
+        ? [id, projDir, "--scout", "--backend", "bb", "--harness", "bb"]
+        : [id, projDir, "--mode", "direct-PR", "--yolo", "off", "--backend", "bb", "--harness", "bb"];
+    return sh(join(bindir, "fm-spawn.sh"), args, { env: spawnEnv, timeout: 120_000 });
+  }
+  // "The mirror dispatched bb to the real bb layer": it did NOT reject bb and reached
+  // `bb thread spawn` (a real thread id, or the bb thread-creation call itself). This is
+  // deterministic and independent of whether a registered project is reachable.
+  // Messages that ONLY the bb adapter (bin-bb) emits — proof dispatch resolved bb and
+  // ran fm_backend_bb_*: the adapter's own project-resolution error, the real bb
+  // thread-spawn call, or a spawned bb window. Native bin never reaches any of these
+  // (it stops at "unknown backend 'bb'").
+  const REACHED_BB = /backend=bb spawn needs|Failed to create thread|thread spawn|window=bb:|bb thread/i;
+
+  for (const kind of ["ship", "scout"]) {
+    const intent = normalizeCaptainIntent(`Captain's intent: live-mirror ${kind} end to end`);
+
+    // (4a) MIRROR path: dispatches bb (no "unknown backend") through to the real bb
+    //      thread-spawn layer. Records the real bb_thread_id when one is produced.
+    const okId = `mir-${kind}`;
+    scaffold(okId, kind);
+    fill(okId, intent);
+    const good = spawnInProject(binDir(), okId, kind);
+    const m = SPAWNED.exec(good.out);
+    if (m) createdThreads.push(m[1]);
+    const dispatched = !REJECTS_BB.test(good.out) && (m !== null || REACHED_BB.test(good.out));
+    record(`${kind}: "$FM_BINDIR/fm-spawn.sh" (MIRROR) dispatches bb to the real bb layer`, dispatched,
+      m ? `real bb thread=${m[1]}` : dispatched ? "reached bb thread spawn (no 'unknown backend')" : `unexpected: ${good.out.slice(-400)}`);
+    if (m) record(`${kind}: MIRROR produced a real bb_thread_id`, true, m[1]);
+
+    // (4b) NATIVE-bin path, same brief, REJECTS bb — proving the mirror (not native
+    //      bin) is what carried the dispatch. Fresh id so no brief/meta clash.
+    const natId = `nat-${kind}`;
+    scaffold(natId, kind);
+    fill(natId, intent);
+    const nat = spawnInProject(join(fmh, "bin"), natId, kind);
+    record(`${kind}: native bin/fm-spawn.sh REJECTS bb (mirror was load-bearing)`,
+      REJECTS_BB.test(nat.out) && !SPAWNED.test(nat.out),
+      REJECTS_BB.test(nat.out) ? "native rejected bb as expected" : `unexpected: ${nat.out.slice(-300)}`);
+  }
+} finally {
+  for (const tid of createdThreads) teardownThread(tid);
+  sh("bb", ["thread", "prune"]); // best-effort
+  try { rmSync(scratch, { recursive: true, force: true }); } catch {}
+  if (createdThreads.length) console.log(`\n(cleaned up real threads: ${createdThreads.join(", ")})`);
+}
+
+const failed = results.filter((r) => !r.ok);
+console.log(`\n${results.length - failed.length}/${results.length} passed`);
+process.exit(failed.length === 0 ? 0 : 1);
