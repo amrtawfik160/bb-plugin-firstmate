@@ -284,7 +284,12 @@ function sleep(ms: number): Promise<void> {
 // (the `bb.sdk.threads.*` reads) still return promptly on abort or a per-call timebox, so
 // one slow/unreachable host cannot pin the whole pass.
 const STUCK_PASS_BUDGET_MS = 120_000; // hard wall-clock ceiling for one stuckPass
-const STUCK_HOST_CALL_MS = 15_000; // per-crew host/SDK read timebox (matches runOnHost)
+// Per-crew host/SDK read timebox (matches runOnHost). NOTE: a healthy-but-slow read that
+// exceeds this returns the degraded default, so crewStatus can yield "unknown" and page the
+// captain "crew gone" for a crew that is actually fine — a NEW false-"gone" trigger. It is the
+// safe direction (over-tell, never under-tell: a real wedge is never silently missed) and only
+// fires when a read is pathologically slow, but it is recorded here so nobody debugs it cold.
+const STUCK_HOST_CALL_MS = 15_000;
 
 function isAbortError(error: unknown): boolean {
   return error instanceof Error && (error.name === "AbortError" || error.message === "Aborted.");
@@ -1430,14 +1435,22 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  async function deliverToCaptain(parentThreadId: string, text: string, crewId: string): Promise<void> {
+  async function deliverToCaptain(parentThreadId: string, text: string, crewId: string, signal?: AbortSignal): Promise<void> {
     try {
-      await bb.sdk.threads.send({
-        threadId: parentThreadId,
-        mode: "auto",
-        input: [{ type: "text", text, mentions: [] }],
-      });
-    } catch {
+      // Abort-RESPONSIVE (no artificial timeout): a healthy send completes as before; only a
+      // reload (signal abort) abandons the await so the supervisor can stop within its grace.
+      // An abandoned send re-throws AbortError so the caller can DEFER (not commit the crew's
+      // alerted/stuck state) and re-page next pass — the alert is never dropped.
+      await raceAbort(
+        bb.sdk.threads.send({
+          threadId: parentThreadId,
+          mode: "auto",
+          input: [{ type: "text", text, mentions: [] }],
+        }),
+        signal,
+      );
+    } catch (error) {
+      if (isAbortError(error)) throw error;
       bb.log.warn(`notify failed for crew ${crewId}`);
     }
   }
@@ -1478,13 +1491,14 @@ export default async function plugin(bb: BbPluginApi) {
     return { FM_STATE_OVERRIDE: wakeStateDir(fmHome, captainThreadId) };
   }
 
-  async function enqueueCaptainWake(crew: Crew, display: string): Promise<boolean> {
+  async function enqueueCaptainWake(crew: Crew, display: string, signal?: AbortSignal): Promise<boolean> {
     const fmHome = (await settings.get()).fmHome.trim();
     if (fmHome === "" || isSecondmateRoute(crew)) return false;
     let hostId: string;
     try {
-      hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
-    } catch {
+      hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined, signal);
+    } catch (error) {
+      if (isAbortError(error)) throw error;
       return false;
     }
     const lib = `${fmHome}/bin/fm-wake-lib.sh`;
@@ -1511,7 +1525,7 @@ export default async function plugin(bb: BbPluginApi) {
       `fm_wake_append signal ${shQuote(key)} ${shQuote(`crew ${crew.id} update`)}`,
     ].join("\n");
     try {
-      const res = await runOnHost(hostId, script, 15_000);
+      const res = await runOnHost(hostId, script, 15_000, signal);
       if (res.exitCode !== 0) {
         bb.log.warn(`fm wake enqueue failed crew=${crew.id} exit=${res.exitCode}`);
         return false;
@@ -1519,12 +1533,13 @@ export default async function plugin(bb: BbPluginApi) {
       bb.log.info(`fm wake enqueued crew=${crew.id} key=${key} (note→status + pointer)`);
       return true;
     } catch (error) {
+      if (isAbortError(error)) throw error;
       bb.log.warn(`fm wake enqueue failed crew=${crew.id} ${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
   }
 
-  async function notifyCaptain(crew: Crew, event: string, output: string | null): Promise<void> {
+  async function notifyCaptain(crew: Crew, event: string, output: string | null, signal?: AbortSignal): Promise<void> {
     if (crew.parentThreadId === null) return;
     const parentThreadId = crew.parentThreadId;
     let kind = event;
@@ -1584,7 +1599,7 @@ export default async function plugin(bb: BbPluginApi) {
     // `bb firstmate wake`. A dropped doorbell can no longer lose the report — the full
     // report and open decisions survive in the durable queue and surface on drain.
     // Default kv is byte-for-byte the previous fire-and-forget behavior.
-    const durable = (await settings.get()).notifyOwner === "real" ? await enqueueCaptainWake(crew, text) : false;
+    const durable = (await settings.get()).notifyOwner === "real" ? await enqueueCaptainWake(crew, text, signal) : false;
     const summary = outcome ?? (output !== null && output !== "" ? truncate(output.replace(/\n/g, " "), 160) : "");
     // Part C: the drain hint adds something only when the durable queue holds context this
     // doorbell does not already carry — an open decision the captain must answer. For a plain
@@ -1625,11 +1640,11 @@ export default async function plugin(bb: BbPluginApi) {
         }
         await writeAfk(afk, parentThreadId);
       }
-      for (const line of evicted) await deliverToCaptain(parentThreadId, line, crew.id);
+      for (const line of evicted) await deliverToCaptain(parentThreadId, line, crew.id, signal);
       if (evicted.length > 0) await publishFleet();
       return;
     }
-    if (!suppressRedundantDoorbell) await deliverToCaptain(parentThreadId, doorbell, crew.id);
+    if (!suppressRedundantDoorbell) await deliverToCaptain(parentThreadId, doorbell, crew.id, signal);
     await publishFleet();
   }
 
@@ -2439,15 +2454,23 @@ export default async function plugin(bb: BbPluginApi) {
   // Captain-facing VIEWS never call this directly; they call listCrews({ owner }) so one
   // captain never sees another's crews by default (D8). Write/eviction is unchanged: the
   // owner filter is a pure view over the returned array, applied after all KV writes.
-  async function listCrewsAll(): Promise<Crew[]> {
+  async function listCrewsAll(signal?: AbortSignal): Promise<Crew[]> {
     const crews = await readCrews();
     const known = new Set(crews.map((c) => c.threadId));
     try {
-      const found = await bb.sdk.threads.list({
-        originPluginId: "firstmate",
-        includeHidden: true,
-        limit: 50,
-      });
+      // Abort-aware + timeboxed prologue: the supervisor calls this BEFORE its per-crew
+      // abort loop, so an un-guarded threads.list / getPluginMetadata sweep here (host
+      // round-trips, worse under a degraded BB API) would pin crew-watch past the shutdown
+      // grace on a reload — the same "service did not stop" class we are fixing.
+      const found = await raceAbort(
+        bb.sdk.threads.list({
+          originPluginId: "firstmate",
+          includeHidden: true,
+          limit: 50,
+        }),
+        signal,
+        STUCK_HOST_CALL_MS,
+      );
       const rows: unknown[] = Array.isArray(found)
         ? found
         : Array.isArray(asRecord(found)["threads"])
@@ -2468,7 +2491,11 @@ export default async function plugin(bb: BbPluginApi) {
         missing.map(async (row): Promise<Crew | null> => {
           try {
             const meta = asRecord(
-              await bb.sdk.threads.getPluginMetadata({ threadId: row.threadId, pluginId: "firstmate" }),
+              await raceAbort(
+                bb.sdk.threads.getPluginMetadata({ threadId: row.threadId, pluginId: "firstmate" }),
+                signal,
+                STUCK_HOST_CALL_MS,
+              ),
             );
             if (!metaFlag(meta, "crew")) return null;
             const id = typeof meta["crewId"] === "string" ? meta["crewId"] : row.threadId.slice(0, 8);
@@ -2509,9 +2536,9 @@ export default async function plugin(bb: BbPluginApi) {
     try {
       const s = await settings.get();
       if (s.readThrough === true && s.fmHome.trim() !== "") {
-        const hostId = await resolveFmWatchHostId();
+        const hostId = await resolveFmWatchHostId(signal);
         if (hostId !== null) {
-          const ids = await existingFmMetaIds(hostId, s.fmHome.trim());
+          const ids = await existingFmMetaIds(hostId, s.fmHome.trim(), signal);
           if (ids !== null) {
             // R5: never reap a crew whose dispatch-time meta write is known to have
             // failed (metaWritten===false) — its current absence is not proof of
@@ -5268,7 +5295,7 @@ export default async function plugin(bb: BbPluginApi) {
     // the eligible list fits under the cap the cursor is inert and every crew is inspected
     // every pass, exactly as before.) The cap + the per-pass wall budget together bound how
     // long one pass can run regardless of how big the register gets.
-    const eligibleAll = (await listCrewsAll()).filter((c) => c.parentThreadId !== null && !isSecondmateRoute(c));
+    const eligibleAll = (await listCrewsAll(passSignal)).filter((c) => c.parentThreadId !== null && !isSecondmateRoute(c));
     const eligibleIds = new Set(eligibleAll.map((c) => c.id));
     const cursorRaw = meta["cursor"];
     const total = eligibleAll.length;
@@ -5279,6 +5306,20 @@ export default async function plugin(bb: BbPluginApi) {
     const state: WatchState = parsed.success ? parsed.data : {};
     let notified = 0;
     let inspected = 0;
+    // Page the captain, but DEFER (not drop) if a reload aborts the send mid-flight: the
+    // send is abort-responsive (no artificial timeout — a healthy send completes), and on
+    // abort we return false so the caller leaves the crew's alerted/stuck state untouched
+    // and the NEXT pass re-pages. This closes the last unguarded await inside the loop — a
+    // captain send under a degraded BB API — so a reload cannot wedge on it either.
+    async function pageOrDefer(crew: Crew, event: string, output: string | null): Promise<boolean> {
+      try {
+        await notifyCaptain(crew, event, output, passSignal);
+        return true;
+      } catch (error) {
+        if (isAbortError(error)) return false;
+        throw error;
+      }
+    }
     for (const crew of crews) {
       // Between crews: stop promptly when the service is aborting (reload) or the pass
       // budget is spent. Partial progress is persisted below; the cursor advances by the
@@ -5297,7 +5338,10 @@ export default async function plugin(bb: BbPluginApi) {
       if (prev === undefined) {
         if (status === "error" || status === "unknown") {
           const detail = status === "error" ? await crewOutput(crew, 300, passSignal) : null;
-          await notifyCaptain(crew, status, detail);
+          if (!(await pageOrDefer(crew, status, detail))) {
+            inspected--;
+            break;
+          }
           notified++;
           state[crew.id] = { status, hash: "", at: now, stuck: false, alerted: status };
           continue;
@@ -5312,7 +5356,10 @@ export default async function plugin(bb: BbPluginApi) {
       if (status === "error" || status === "unknown") {
         if (prev.alerted !== status) {
           const detail = status === "error" ? await crewOutput(crew, 300, passSignal) : null;
-          await notifyCaptain(crew, status, detail);
+          if (!(await pageOrDefer(crew, status, detail))) {
+            inspected--;
+            break;
+          }
           notified++;
         }
         state[crew.id] = { status, hash: "", at: now, stuck: false, alerted: status };
@@ -5335,7 +5382,10 @@ export default async function plugin(bb: BbPluginApi) {
       }
       if (!excerpt.ok) {
         if (prev.alerted !== "unknown") {
-          await notifyCaptain(crew, "unknown", null);
+          if (!(await pageOrDefer(crew, "unknown", null))) {
+            inspected--;
+            break;
+          }
           notified++;
         }
         state[crew.id] = {
@@ -5390,11 +5440,16 @@ export default async function plugin(bb: BbPluginApi) {
         break;
       }
       if (!suppressed && !prev.stuck && now - prev.at >= stuckMs) {
-        await notifyCaptain(
-          crew,
-          `stuck (${outMin}m no output change, no tool/file activity ${actMin}m)`,
-          excerpt.text === "" ? null : excerpt.text,
-        );
+        if (
+          !(await pageOrDefer(
+            crew,
+            `stuck (${outMin}m no output change, no tool/file activity ${actMin}m)`,
+            excerpt.text === "" ? null : excerpt.text,
+          ))
+        ) {
+          inspected--;
+          break;
+        }
         notified++;
         row.stuck = true;
       }
@@ -7332,14 +7387,13 @@ export default async function plugin(bb: BbPluginApi) {
         } catch (error) {
           bb.log.warn(error instanceof Error ? `supervise: ${error.message}` : "supervise failed");
         }
-        // stuckPass now returns early on abort, so the signal can ALREADY be aborted here.
-        // Break before the interval sleep: a sleep entered post-abort can never be woken by
-        // the abort listener (the event already fired), so it would pin the service open for
-        // the whole interval — the very "service crew-watch did not stop" wedge we are fixing.
-        if (signal.aborted) break;
         const s = await settings.get().catch(() => null);
         const mins = s === null ? 5 : Math.min(60, Math.max(1, Number(s.supervisionIntervalMin) || 5));
         await new Promise<void>((resolve) => {
+          // stuckPass now returns early on abort, so the signal can ALREADY be aborted here.
+          // A sleep entered post-abort can never be woken by the abort listener (the event
+          // already fired), so without this immediate resolve it would pin the service open
+          // for the whole interval — the exact "service crew-watch did not stop" wedge.
           if (signal.aborted) {
             resolve();
             return;
@@ -7454,12 +7508,11 @@ export default async function plugin(bb: BbPluginApi) {
         } catch (error) {
           bb.log.warn(error instanceof Error ? `fm-watch-supervisor: ${error.message}` : "fm-watch-supervisor failed");
         }
-        // Same post-abort guard as crew-watch: the per-host work above now bails on abort,
-        // so the signal can already be aborted here; a sleep entered post-abort would never
-        // wake (the abort event already fired) and pin the service for the whole interval.
-        if (signal.aborted) break;
         const checkMs = Math.max(15, Math.min(30, Math.floor(gate / 2))) * 1000;
         await new Promise<void>((resolve) => {
+          // Same post-abort guard as crew-watch: the per-host work above now bails on abort,
+          // so the signal can already be aborted here; a sleep entered post-abort would never
+          // wake (the abort event already fired) and pin the service for the whole interval.
           if (signal.aborted) {
             resolve();
             return;
