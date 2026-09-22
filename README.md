@@ -67,7 +67,13 @@ Three layers:
 
 1. **Thread events.** `thread.idle`, `thread.failed`, `turn.failed`, and `interaction.pending` ping the captain the moment a crew finishes, fails, or blocks on input.
 2. **Protocol nudge.** When a crew goes idle without a `DONE:` / `BLOCKED:` / `FAILED:` verdict, the plugin doorbells it with the upstream turnend-guard banner and asks for a restated outcome. Bounded: `nudgeMaxPerCrew` (default 3) nudges per task, `nudgeCooldownSeconds` (default 60) apart. Exhausted nudges surface one `NEEDS DECISION`. Manual stops and interrupts are never nudged.
-3. **Blocking watcher.** Under `/captain`, real `fm-watch` blocks on BB thread transitions and wakes only for crew activity. BB performs one startup reconciliation after reload, then stops interval crew scans. Native mode retains the configurable stuck checker.
+3. **Event-driven watch handoff.** Under `/captain`, `firstmate_watch` returns immediately after handing supervision to private agent-only crew events backed by the durable wake queue.
+   The manager calls it once per crew batch, ends the turn, and resumes only when a crew event arrives.
+   The `bb firstmate watch` CLI remains blocking for operator use.
+
+BB core's ACP dynamic-tool bridge can reject a long-lived tool call at its timeout boundary before the plugin can observe or catch the transport failure.
+The agent tool therefore never opens that blocking path.
+If the bridge still reports `dynamic tool request failed` around the short handoff, the manager does not retry; private crew events and the durable queue continue independently.
 
 Confirmed live crew reports stay durable during the captain turn and are acknowledged through Firstmate's native wake drain when that turn completes. The optional turn-end re-ring remains available, but `/captain` leaves it off so the manager starts only for a new crew event.
 
