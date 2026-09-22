@@ -351,20 +351,24 @@ def _mirror_backends(native_backends: Path, dest: Path, overlay: Path) -> None:
 def write_exclude(home: Path) -> None:
     """Register the overlay's untracked paths in .git/info/exclude so the tree
     reads clean and the plugin's ff-only auto-update stops skipping."""
-    git_dir = home / ".git"
-    if git_dir.is_file():
-        # Worktree/submodule: .git is a file pointing at the real gitdir.
-        text = git_dir.read_text().strip()
-        if text.startswith("gitdir:"):
-            git_dir = Path(text.split(":", 1)[1].strip())
-            if not git_dir.is_absolute():
-                git_dir = (home / git_dir).resolve()
-    if not git_dir.is_dir():
+    # Resolve Git's shared exclude file. A linked worktree's `.git` pointer
+    # names its private administrative directory, whose `info/exclude` is not
+    # consulted by Git.
+    try:
+        resolved = subprocess.run(
+            ["git", "-C", str(home), "rev-parse", "--git-path", "info/exclude"],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        resolved = None
+    if resolved is None or resolved.returncode != 0 or not resolved.stdout.strip():
         print(f"note: {home} has no .git; skipping info/exclude (config/ ignore still applies)")
         return
-    info = git_dir / "info"
-    info.mkdir(parents=True, exist_ok=True)
-    exclude = info / "exclude"
+    exclude = Path(resolved.stdout.strip())
+    if not exclude.is_absolute():
+        exclude = (home / exclude).resolve()
+    exclude.parent.mkdir(parents=True, exist_ok=True)
     existing = exclude.read_text() if exclude.exists() else ""
     existing_lines = set(existing.splitlines())
     # The transient staging/backup dirs of the atomic install must be excluded too,

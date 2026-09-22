@@ -16,4 +16,4 @@ instructions (see [CONTRIBUTING.md](../CONTRIBUTING.md) "Skill fidelity").
   `npm run fidelity -- --native /path/to/firstmate` to prove the snapshot matches
   the live clone.
 
-Vendored at `804394e8` (native HEAD at the time of the fidelity-convention PR).
+Vendored at `6f0f1399` (native HEAD at the time of the fidelity-convention PR).

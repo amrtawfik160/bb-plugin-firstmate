@@ -54,6 +54,7 @@ const BB_TOKENS: RegExp[] = [
   /--grant|--resolve-key|--yes|--allow-red/,
   /\/(afk|quiet|bearings|captain|stow)\b/,
   /\bdeliver\b/,
+  /references\/harness\/bb\.md/,
 ];
 
 export type Diverge = { native: string; nativeQuote: string; bb: string; reason: string; line: number; endLine: number };
@@ -83,6 +84,22 @@ export type Skill = {
 const SKILL_GLOBS = [
   "skills/afk/SKILL.md",
   "skills/bearings/SKILL.md",
+  "skills/ask-user-authority/SKILL.md",
+  "skills/bootstrap-diagnostics/SKILL.md",
+  "skills/captain-hold-lifecycle/SKILL.md",
+  "skills/decision-hold-lifecycle/SKILL.md",
+  "skills/diagnostic-reasoning/SKILL.md",
+  "skills/firstmate-codexapp/SKILL.md",
+  "skills/firstmate-coding-guidelines/SKILL.md",
+  "skills/firstmate-orca/SKILL.md",
+  "skills/fmx-respond/SKILL.md",
+  "skills/harness-adapters/SKILL.md",
+  "skills/process-event-sources/SKILL.md",
+  "skills/project-management/SKILL.md",
+  "skills/quota-array-dispatch/SKILL.md",
+  "skills/secondmate-provisioning/SKILL.md",
+  "skills/stuck-crewmate-recovery/SKILL.md",
+  "skills/updatefirstmate/SKILL.md",
   "skills/captain/references/escalation.md",
   "skills/captain/references/ask-user-authority.md",
   "skills/captain/references/diagnostic-reasoning.md",
@@ -174,15 +191,19 @@ export function scanSkill(repoRoot: string, rel: string): Skill {
 
   // Rendered prose = content minus frontmatter, minus fenced regions, minus every
   // HTML comment, minus headings and list scaffolding.
+  const rendered = renderedProse(content);
+
+  return { path: rel, hasFrontmatter, bbSource, diverges, fences, divergeLines, blankLines, rendered };
+}
+
+function renderedProse(content: string): string {
   let rendered = content.replace(/^---\n[\s\S]*?\n---\n/, "");
   rendered = rendered.replace(/<!--\s*BB-ONLY:[\s\S]*?<!--\s*\/BB-ONLY\s*-->/g, " ");
   rendered = rendered.replace(/<!--[\s\S]*?-->/g, " ");
-  rendered = rendered
+  return rendered
     .split("\n")
-    .filter((l) => !/^\s*#/.test(l))
+    .filter((line) => !/^\s*#/.test(line))
     .join(" ");
-
-  return { path: rel, hasFrontmatter, bbSource, diverges, fences, divergeLines, blankLines, rendered };
 }
 
 export function scanAll(repoRoot: string): Skill[] {
@@ -290,7 +311,9 @@ export function validateAgainstSnapshot(repoRoot: string, skills: Skill[]): Prob
       problems.push({ skill: s.path, msg: `snapshot not found: ${s.bbSource.snapshot}` });
       continue;
     }
-    const nativeBlob = normalize(readFileSync(snapPath, "utf8"));
+    const nativeContent = readFileSync(snapPath, "utf8");
+    const nativeBlob = normalize(nativeContent);
+    const nativeRendered = normalize(renderedProse(nativeContent));
 
     for (const d of s.diverges) {
       const q = normalize(d.nativeQuote);
@@ -300,13 +323,13 @@ export function validateAgainstSnapshot(repoRoot: string, skills: Skill[]): Prob
 
     // Rendered prose outside fences must be native.
     for (const sent of sentences(s.rendered))
-      if (!nativeBlob.includes(sent))
+      if (!nativeRendered.includes(sent))
         problems.push({ skill: s.path, msg: `unmarked divergence — rendered prose not in native, and not inside a BB-ONLY fence or BB-DIVERGE: ${JSON.stringify(sent.slice(0, 90))}` });
 
     // A fence may not shelter native-derived content (that is over-fencing).
     for (const f of s.fences)
       for (const sent of sentences(f.inner))
-        if (nativeBlob.includes(sent))
+        if (nativeRendered.includes(sent))
           problems.push({ skill: s.path, line: f.openLine, msg: `native-derived sentence is fenced BB-ONLY — un-fence it so it is checked: ${JSON.stringify(sent.slice(0, 80))}` });
   }
   return problems;

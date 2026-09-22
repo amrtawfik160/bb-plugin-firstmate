@@ -2,7 +2,7 @@
 
 Run firstmate-style agent crews inside [BB](https://github.com/get-bb/bb): one captain thread dispatches crewmate child threads, supervises them, and brings back finished work.
 
-The plugin implements the [firstmate](https://github.com/kunchenguid/firstmate) captain/crew protocol on BB primitives. A BB thread is the captain. Crews are child BB threads with their own managed worktrees. Status reports use the upstream protocol (`DONE:` / `BLOCKED:` / `FAILED:`), supervision rides on thread events instead of a tmux watcher, and merges are BB PR merges or ff-only local lands.
+The plugin implements the [firstmate](https://github.com/kunchenguid/firstmate) captain/crew protocol on BB primitives. A BB thread is the captain. Crews are child BB threads with their own managed worktrees. Status reports use the upstream protocol (`DONE:` / `BLOCKED:` / `FAILED:`), the real watcher runs through the BB backend, and merges are BB PR merges or ff-only local lands.
 
 ## Install
 
@@ -31,13 +31,15 @@ bb firstmate merge <crew-id> --yes      # merge green PR, or ff-only local land
 
 Crews end every task with a status verdict. `deliver` shows what they committed. You decide what lands.
 
+`/captain` initializes or reuses the real Firstmate checkout and activates its full BB profile: real dispatch, watcher, backlog, decisions, AFK/quiet, tiered memory, durable bidirectional messaging, state read-through, and event-driven crew wakes. Existing plugin state is migrated once without overwriting non-empty real files.
+
 ## What you get
 
 | Command | What it does |
 | --- | --- |
 | `deck` / `session` | Mark the thread as captain, print the fleet digest |
 | `dispatch` | Spawn a ship (isolated worktree) or scout (read-only) crew |
-| `tell` / `interrupt` / `stop` / `retry` | Steer crews: doorbell, hard stop, re-run |
+| `tell` / `interrupt` / `stop` / `retry` | Live steer, hard stop, or re-run a crew |
 | `watch` / `bearings` | Wait on crews, or print the 5-section fleet digest |
 | `deliver` / `merge` / `promote` | Collect diffs, land work, promote a scout to a ship |
 | `queue` | Backlog with dependencies (`--after`) and time gates (`--wait-until`) |
@@ -46,19 +48,26 @@ Crews end every task with a status verdict. `deliver` shows what they committed.
 | `memory` | Captain preferences and dated fleet learnings, reprinted on deck |
 | `afk` / `quiet` | Away mode (holds routine pings, keeps failures) and ping batching |
 | `secondmate` | Register domain-captain threads; dispatches to that project route there |
+| `scripts` / `fm` | Discover, verify, and run every installed upstream `fm-*` script through the BB backend |
 | `forget` | Drop a crew record, optionally archiving its thread |
 
 Ships get their own managed worktree by default, so two ships never share a checkout. Scouts are read-only. Crew threads cannot dispatch nested crews. Parent permission is the ceiling for everything a crew can do.
 
-The Fleet panel (sidebar navigation) lists every crew with live status; a thread-header chip and `@crew` mentions tie threads back to their crew.
+Crew thread names lead with the work and keep the command id at the end: `Ship · Fix flaky login · abc12def` or `Scout · Audit auth flow · abc12def`.
+
+The Fleet panel (sidebar navigation) lists every crew with live status. In a captain thread, its header chip and `@crew` mentions show that captain's fleet only.
+
+Captain threads follow upstream firstmate's section 9 visibility contract. Crew doorbells are agent-only triggers, so raw `🔔 crew …` status lines never render in captain chat. The manager re-reads current crew state, handles recoverable issues, batches simultaneous wakes, and reports only material outcomes or decisions. A frontend timeline filter also removes routine tool, command, waiting, reasoning, and legacy visible wake rows. Native Firstmate tools are mandatory when available.
 
 ## Supervision that cannot miss a report
 
-Three layers, all event-driven:
+Three layers:
 
 1. **Thread events.** `thread.idle`, `thread.failed`, `turn.failed`, and `interaction.pending` ping the captain the moment a crew finishes, fails, or blocks on input.
 2. **Protocol nudge.** When a crew goes idle without a `DONE:` / `BLOCKED:` / `FAILED:` verdict, the plugin doorbells it with the upstream turnend-guard banner and asks for a restated outcome. Bounded: `nudgeMaxPerCrew` (default 3) nudges per task, `nudgeCooldownSeconds` (default 60) apart. Exhausted nudges surface one `NEEDS DECISION`. Manual stops and interrupts are never nudged.
-3. **Stuck checker.** A background service alerts when a busy crew's output has not changed for `supervisionStuckMin` minutes (default 30).
+3. **Blocking watcher.** Under `/captain`, real `fm-watch` blocks on BB thread transitions and wakes only for crew activity. BB performs one startup reconciliation after reload, then stops interval crew scans. Native mode retains the configurable stuck checker.
+
+Confirmed live crew reports stay durable during the captain turn and are acknowledged through Firstmate's native wake drain when that turn completes. The optional turn-end re-ring remains available, but `/captain` leaves it off so the manager starts only for a new crew event.
 
 ## The real firstmate toolbelt
 
@@ -66,6 +75,7 @@ The native tools cover the liaison loop. For the full bash policy engine (brief,
 
 ```sh
 bb firstmate init --real        # clone upstream firstmate, overlay backends/bb.sh, set config/backend=bb
+bb firstmate scripts [query]    # verify 177 callable scripts + 20 helpers/adapters, then search entrypoints
 bb firstmate fm <script> ...    # run any bin/fm-<script>.sh with FM_BACKEND=bb
 ```
 
@@ -83,6 +93,7 @@ BB-specific behavior in this fork:
 
 | Key | Default | Purpose |
 | --- | --- | --- |
+| `fullParityOnDeck` | on | `/captain` activates every real Firstmate owner and safely migrates prior plugin state |
 | `firstmateRepo` | upstream repo URL | Repo cloned by `init --real` |
 | `fmHome` | empty | Firstmate home on the host; set by `init --real` |
 | `defaultProvider` | blank | Crew provider id (blank = BB resolves) |
@@ -96,7 +107,7 @@ BB-specific behavior in this fork:
 
 ## Skills
 
-The plugin ships catalog skills: `/captain` (take the deck, full contract), `/firstmate` (crew mechanics), `/bearings` (fleet digest), `/afk`, `/quiet`, `/ahoy` (catch-up), `/stow` (close-out knowledge capture).
+The plugin registers all 21 upstream `.agents/skills` as real BB skills, plus `/captain` and `/firstmate`. Their policy text is pinned to upstream commit `6f0f1399`; one shared runtime contract translates script paths, workers, approvals, and alternate harness mechanics to `firstmate_fm` and BB threads. Crew threads still receive no captain skills.
 
 ## Development
 

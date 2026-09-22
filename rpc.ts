@@ -14,7 +14,14 @@ const crewRow = z.object({
 
 export const rpcContract = defineRpcContract({
   fleet: {
-    input: z.null(),
+    // null is the pre-0.4.0 app contract. Keep it during live reloads because
+    // already-open BB tabs can run the previous bundle until they refresh.
+    input: z.union([
+      z.null(),
+      z.object({
+        threadId: z.string().nullable().optional(),
+      }),
+    ]),
     output: z.object({
       head: z.string(),
       calls: z.array(z.string()),
@@ -25,6 +32,7 @@ export const rpcContract = defineRpcContract({
       afk: z.boolean(),
       quiet: z.boolean(),
       supervision: z.boolean(),
+      captain: z.boolean(),
     }),
   },
 });
