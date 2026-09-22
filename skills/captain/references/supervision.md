@@ -4,12 +4,10 @@ Read when crews are running, stepping away, catching up, or closing out.
 
 ## Live supervision
 
-- Never end a turn blind with crews running: `firstmate_watch` / `bb firstmate
-  watch` blocks via BB `threads.wait` (do not poll status in a loop), or keep
-  `supervision on` (thread idle/fail events + stuck checker). Silent waiting
-  is not progress; never report unchanged fleets as news.
-- `bearings` = instant status. `watch` = blocking finish digest. Prefer events
-  and `watch` over polling loops.
+- With crews running, call `firstmate_watch` once per crew batch to hand supervision to private event-driven durable wakes, then end the turn and never retry or poll.
+- The `bb firstmate watch` CLI remains blocking via BB `threads.wait` for operator use; `supervision on` keeps thread idle/fail events + stuck checker active.
+- `bearings` = instant status.
+  Prefer events and the `firstmate_watch` handoff over polling loops; never report unchanged fleets as news.
 - Status lines are events, not truth: `crew`/`deliver` for current state
   before re-escalating anything old.
 

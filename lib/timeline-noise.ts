@@ -17,8 +17,8 @@ export function isRoutineReasoningRow(text: string): boolean {
 }
 
 export function firstmateTimelineNoiseDecision(text: string): TimelineNoiseDecision {
-  if (ROUTINE_WATCH_TRANSPORT_FAILURE.test(text)) return "hide";
   if (text.includes(FIRSTMATE_ATTENTION_MARKER)) return "show";
+  if (ROUTINE_WATCH_TRANSPORT_FAILURE.test(text)) return "hide";
   if (text.includes(FIRSTMATE_ROUTINE_MARKER)) return "hide";
   if (!FIRSTMATE_TOOL.test(text)) return "unrelated";
   return MATERIAL_TOOL_STATE.test(text) ? "show" : "hide";

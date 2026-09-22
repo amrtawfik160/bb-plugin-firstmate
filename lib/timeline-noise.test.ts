@@ -31,6 +31,13 @@ test("captain timeline hides only the firstmate_watch transport failure", () => 
   );
   assert.equal(firstmateTimelineNoiseDecision("firstmate_watch: crew c1 failed"), "show");
   assert.equal(firstmateTimelineNoiseDecision("firstmate_decide needs attention"), "show");
+  assert.equal(
+    firstmateTimelineNoiseDecision(
+      `Ran firstmate_watch (error) — dynamic tool request failed${FIRSTMATE_ATTENTION_MARKER}`,
+    ),
+    "show",
+    "an explicit attention marker must override transport-noise hiding",
+  );
 });
 
 test("captain panes hide generic expandable work but keep material states", () => {

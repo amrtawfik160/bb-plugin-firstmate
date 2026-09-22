@@ -192,6 +192,89 @@ test("firstmate_watch hands off to private wakes without opening a blocking tran
   }
 });
 
+test("firstmate_watch returns settled idle, error, and unknown crews without a handoff", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("crews", [
+      crewRow("c_idle", "thr_idle", "thr_cap"),
+      crewRow("c_error", "thr_error", "thr_cap"),
+      crewRow("c_unknown", "thr_unknown", "thr_cap"),
+    ]);
+    host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => {
+      if (threadId === "thr_unknown") throw new Error("transient status failure");
+      return makeThreadResponse({
+        id: threadId,
+        status: threadId === "thr_idle" ? "idle" : "error",
+        projectId: "proj_1",
+      });
+    });
+    host.harness.sdk.stub("threads.output", async ({ threadId }: { threadId: string }) => ({
+      output: threadId === "thr_idle" ? "DONE: shipped" : "FAILED: build broke",
+    }));
+    const watch = host.harness.inspection.registrations.agentTools.find(
+      (tool) => tool.name === "firstmate_watch",
+    );
+    assert.ok(watch);
+
+    const result = await watch.execute(
+      { crewIds: ["c_idle", "c_error", "c_unknown"] },
+      { threadId: "thr_cap", projectId: "proj_1" } as never,
+    );
+    const text = typeof result === "string"
+      ? result
+      : result.content.map((item) => item.type === "text" ? item.text : "").join("\n");
+
+    assert.match(text, /c_idle \[idle\].*DONE/);
+    assert.match(text, /c_error \[error\].*FAILED/);
+    assert.match(text, /c_unknown \[unknown\]/);
+    assert.doesNotMatch(text, /private event-driven supervision/i);
+    assert.equal(host.harness.sdk.callsTo("threads.wait").length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("firstmate_watch reports settled crews before handing off only active crews", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("crews", [
+      crewRow("c_done", "thr_done", "thr_cap"),
+      crewRow("c_live", "thr_live", "thr_cap"),
+      crewRow("c_unknown", "thr_unknown", "thr_cap"),
+    ]);
+    host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => {
+      if (threadId === "thr_unknown") throw new Error("transient status failure");
+      return makeThreadResponse({
+        id: threadId,
+        status: threadId === "thr_done" ? "idle" : "active",
+        projectId: "proj_1",
+      });
+    });
+    host.harness.sdk.stub("threads.output", async () => ({ output: "DONE: shipped" }));
+    const watch = host.harness.inspection.registrations.agentTools.find(
+      (tool) => tool.name === "firstmate_watch",
+    );
+    assert.ok(watch);
+
+    const result = await watch.execute(
+      { crewIds: ["c_done", "c_live", "c_unknown"] },
+      { threadId: "thr_cap", projectId: "proj_1" } as never,
+    );
+    const text = typeof result === "string"
+      ? result
+      : result.content.map((item) => item.type === "text" ? item.text : "").join("\n");
+
+    assert.match(
+      text,
+      /c_done \[idle\][\s\S]*c_unknown \[unknown\][\s\S]*Private event-driven supervision active for c_live/,
+    );
+    assert.doesNotMatch(text, /active for [^\n]*c_unknown/);
+    assert.equal(host.harness.sdk.callsTo("threads.wait").length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("fleet RPC identifies and scopes the current captain thread", async () => {
   const host = await load();
   try {

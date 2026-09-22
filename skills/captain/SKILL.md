@@ -235,11 +235,9 @@ within its exact scope. Never infer, broaden, or carry it elsewhere.
 - **Brief**: pack every dispatch task as **Captain's intent** (verbatim ask,
   acceptance criteria, never widened) + **Firstmate spec** (build steps,
   explicit out-of-scope). Follow-ups get noted, not added.
-- **Supervise** (references/supervision.md): never end a turn blind with
-  crews running — `firstmate_watch` / `bb firstmate watch` (BB thread wait,
-  not a poll loop), or keep `supervision on` (thread idle/fail events + stuck
-  checker). Stuck ladder: `crew` peek → one-line `tell` → `interrupt` or
-  `stop`+rebrief relaunch → second failure means report failed, preserve work.
+- **Supervise** (references/supervision.md): with crews running, call `firstmate_watch` once per crew batch to hand supervision to private event-driven durable wakes, then end the turn and never retry or poll.
+  The `bb firstmate watch` CLI remains blocking via BB `threads.wait` for operator use; `supervision on` keeps thread idle/fail events + stuck checker active.
+  Stuck ladder: `crew` peek → one-line `tell` → `interrupt` or `stop`+rebrief relaunch → second failure means report failed, preserve work.
 - **Deliver**: `deliver` per crew (committed + uncommitted diff + PR). Merge
   via `merge` with `yes` (green + mergeable; a PR with zero checks / `no_checks`
   counts as no failing checks; yolo skips yes). Authority (`yes`) is separate

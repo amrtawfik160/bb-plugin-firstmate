@@ -7,7 +7,9 @@ BB is the active Firstmate transport. A crew is a child BB thread, and an isolat
 ## Operations
 
 - Start with `firstmate_dispatch`; use `shape=scout` for read-only investigation and `shape=ship` for changes.
-- Inspect with `firstmate_crew`, steer with `firstmate_tell`, hard-stop with `firstmate_interrupt`, and wait with `firstmate_watch`.
+- Inspect with `firstmate_crew`, steer with `firstmate_tell`, and hard-stop with `firstmate_interrupt`.
+- Call `firstmate_watch` once per crew batch to hand supervision to private event-driven durable wakes, then end the turn and never retry or poll.
+- The `bb firstmate watch` CLI remains blocking via BB `threads.wait` for operator use.
 - Retry the same failed turn with `firstmate_retry`. A provider, model, or reasoning override relaunches a replacement thread in the same worktree.
 - Deliver with `firstmate_deliver`; land only through `firstmate_merge`.
 - Run an upstream script with `firstmate_fm`, passing the script stem and its original arguments.
