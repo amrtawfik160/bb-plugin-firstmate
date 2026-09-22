@@ -105,6 +105,13 @@ const SKILL_GLOBS = [
   "skills/captain/references/diagnostic-reasoning.md",
 ];
 
+const CAPTAIN_WATCH_GUIDANCE = [
+  "skills/captain/SKILL.md",
+  "skills/captain/references/supervision.md",
+  "skills/firstmate/SKILL.md",
+  "skills/harness-adapters/references/harness/bb.md",
+];
+
 export function normalize(s: string): string {
   return s
     .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
@@ -358,9 +365,32 @@ export function validateSnapshotFreshness(repoRoot: string, skills: Skill[], nat
   return problems;
 }
 
+export function validateCaptainWatchGuidance(repoRoot: string): Problem[] {
+  const problems: Problem[] = [];
+  for (const path of CAPTAIN_WATCH_GUIDANCE) {
+    const prose = normalize(readFileSync(join(repoRoot, path), "utf8"));
+    if (!prose.includes("call firstmate_watch once per crew batch"))
+      problems.push({ skill: path, msg: "firstmate_watch guidance must say to call it once per crew batch" });
+    if (!prose.includes("private event-driven durable wakes"))
+      problems.push({ skill: path, msg: "firstmate_watch guidance must name the private event-driven durable-wake handoff" });
+    if (!prose.includes("end the turn and never retry or poll"))
+      problems.push({ skill: path, msg: "firstmate_watch guidance must say to end the turn and never retry or poll" });
+    if (!prose.includes("bb firstmate watch cli remains blocking via bb threads.wait for operator use"))
+      problems.push({ skill: path, msg: "guidance must preserve the blocking bb firstmate watch CLI distinction" });
+    if (/firstmate_watch[^.]{0,160}\b(?:blocks?|blocking|threads\.wait)\b/.test(prose))
+      problems.push({ skill: path, msg: "firstmate_watch agent tool must not be described as blocking or using threads.wait" });
+  }
+  return problems;
+}
+
 export function runOffline(repoRoot: string): Problem[] {
   const skills = scanAll(repoRoot);
-  return [...validateStructure(skills), ...validateFences(skills), ...validateAgainstSnapshot(repoRoot, skills)];
+  return [
+    ...validateStructure(skills),
+    ...validateFences(skills),
+    ...validateAgainstSnapshot(repoRoot, skills),
+    ...validateCaptainWatchGuidance(repoRoot),
+  ];
 }
 
 function repoRootFromHere(): string {

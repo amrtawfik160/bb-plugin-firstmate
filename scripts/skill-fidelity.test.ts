@@ -8,6 +8,7 @@ import {
   runOffline,
   validateStructure,
   validateFences,
+  validateCaptainWatchGuidance,
   normalize,
   sentences,
   type Problem,
@@ -18,6 +19,7 @@ const ROOT = process.cwd();
 const AFK = "skills/afk/SKILL.md";
 const ESC = "skills/captain/references/escalation.md";
 const BEAR = "skills/bearings/SKILL.md";
+const BB_HARNESS = "skills/harness-adapters/references/harness/bb.md";
 
 // End-to-end: copy skills/ + native-snapshot/ into a temp root, mutate, run the
 // real offline check. This is exactly what `npm test` / `npm run fidelity` do.
@@ -38,6 +40,34 @@ const flagged = (ps: Problem[], re: RegExp) => ps.some((p) => re.test(p.msg));
 
 test("clean tree PASSES (not always-red)", () => {
   assert.deepEqual(runOffline(ROOT), [], JSON.stringify(runOffline(ROOT)));
+});
+
+test("captain watch guidance rejects the old blocking agent-tool contract", () => {
+  const ps = withTemp((root) =>
+    edit(root, BB_HARNESS, (s) =>
+      s.replace(
+        "Call `firstmate_watch` once per crew batch to hand supervision to private event-driven durable wakes, then end the turn and never retry or poll.",
+        "Call `firstmate_watch` to block via BB `threads.wait` until the crews finish.",
+      ),
+    ),
+  );
+  assert.ok(flagged(ps, /call it once per crew batch/), JSON.stringify(ps));
+  assert.ok(flagged(ps, /must not be described as blocking/), JSON.stringify(ps));
+});
+
+test("captain watch guidance preserves the blocking CLI distinction", () => {
+  const root = mkdtempSync(join(tmpdir(), "watch-guidance-"));
+  try {
+    cpSync(join(ROOT, "skills"), join(root, "skills"), { recursive: true });
+    edit(root, BB_HARNESS, (s) =>
+      s.replace("The `bb firstmate watch` CLI remains blocking via BB `threads.wait` for operator use.\n", ""),
+    );
+    assert.ok(
+      flagged(validateCaptainWatchGuidance(root), /blocking bb firstmate watch CLI distinction/),
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("break 1 — paraphrase a native line outside any fence FAILS", () => {
