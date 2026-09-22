@@ -3,12 +3,18 @@ Install, then run `/captain` in any thread — that calls `deck` and is the setu
 `deck` titles an untitled thread `Captain · <project>` and pins it so a new
 `/captain` row does not vanish from the sidebar.
 
+The captain timeline is outcome-only: routine tool, command, waiting, and
+reasoning rows are removed by a cleanup-safe frontend content script. Error,
+interruption, decision, and approval rows remain. The captain contract also
+forbids routine progress narration and shelling out when a native Firstmate
+tool exists.
+
 ## What you get
 
-- `/captain` plus `/afk` `/ahoy` `/bearings` `/quiet` `/stow` skills.
+- All 21 upstream `.agents/skills` registered as BB skills, plus `/captain` and `/firstmate`; the BB runtime adapter translates script paths, workers, approvals, and harness operations.
 - `bb firstmate` + `firstmate_*` tools (full CLI surface, including queue,
-  memory, secondmate, quiet, forget). `tell` is a doorbell (`queue-if-active`);
-  `interrupt` hard-stops. `watch` uses `threads.wait`.
+  memory, secondmate, quiet, forget). `tell` is a live steer; `tell --queue` is
+  the explicit non-urgent path; `interrupt` hard-stops. `watch` uses `threads.wait`.
 - Event supervision: `thread.idle` / `thread.failed` / `turn.failed` /
   `interaction.pending`. Stuck checker still samples output. Crews get no
   dispatch tools.
@@ -24,7 +30,7 @@ Install, then run `/captain` in any thread — that calls `deck` and is the setu
   crews. The overlay `bb` backend propagates provider/model/reasoning into the
   spawn, tags children as crews, and lets a completed scout's scratch worktree be
   discarded.
-- Real transport (opt-in, `transport=real`): `dispatch` routes end-to-end through
+- Real transport (`transport=real`, activated by `/captain`): `dispatch` routes end-to-end through
   the real `fm-brief.sh` + `fm-spawn.sh` (backend=bb) so the real scripts create
   the brief, worktree, thread, `state/<id>.meta` and profile
   (harness/provider/model/effort). The dispatch pins `--harness bb` for both ships
@@ -39,11 +45,11 @@ Install, then run `/captain` in any thread — that calls `deck` and is the setu
   whole window between `bb thread spawn` and the `state/<id>.meta` write, so a
   graceful failure cleans up its own thread; only a hard-kill (SIGKILL / host
   death) can orphan one. For that window the plugin reconciles before falling
-  back: it adopts an already-created thread (matched by the `fm-<id>` title or the
+  back: it adopts an already-created thread (matched by the stable ` · <id>` title suffix or the
   `crewId` recorded by `mark-crew --task`) instead of spawning a second. Default
   `transport=native` keeps the current behavior — flip the setting to opt in, flip
   it back to turn it off without a redeploy.
-- Watch ownership (opt-in, `watchOwner=fm-watch`): a plugin-managed background
+- Watch ownership (`watchOwner=fm-watch`, activated by `/captain`): a plugin-managed background
   service (`fm-watch-supervisor`) keeps the **real `fm-watch`** alive against
   `fmHome`, relays its wake reasons to the captain, and reads its liveness beacon
   (`state/.last-watcher-beat`). `fm-watch` is a one-shot that **blocks until an
@@ -56,21 +62,19 @@ Install, then run `/captain` in any thread — that calls `deck` and is the setu
   keeper when its pid is dead**; a watcher exiting on a wake is normal and no longer
   triggers relaunch/backoff (the old design re-armed on beacon staleness then backed
   off, so after every wake the watcher stayed down for a growing window). BB only
-  suppresses its own stuck-page **while that beat is live** (fresher than
-  `watchHeartbeatSec`, default 90s); if the watcher is stale/absent BB pages as
-  before, so there is never a silent supervision gap — and no double-paging while
-  both are live. Turning `watchOwner` off tears the keeper down (removes its
+  performs one BB stuck-state reconciliation when the plugin starts, then leaves
+  continuous wedge detection to the blocking real watcher instead of rescanning
+  every crew on a timer. Turning `watchOwner` off tears the keeper down (removes its
   pidfile). Default `watchOwner=native` keeps BB's stuck-pass; falls back to native
   when real mode is off. Hardened for multi-host fleets: the supervisor runs and
   beats **one keeper per crew host** (per-host beacon keys), and BB's
   stuck-suppression is decided **per crew's own host** — a live watcher on host A
   never silences a stuck crew on host B. A keeper that will not stay up (a genuine
-  crash loop) is relaunched with exponential backoff (60s → 30m cap) and BB pages
-  through the gap. Wake-reason relay is scoped: only actionable `signal:`/`stale:`
+  crash loop) is relaunched with exponential backoff (60s → 30m cap). Wake-reason relay is scoped: only actionable `stale:`
   lines go to the **owning captain** (the crew named in the line), deduped with
   volatile counters/times normalized out; routine `check:`/`heartbeat:` trace is
   never relayed.
-- Read-through (opt-in, `readThrough=true`): real `state/<id>.meta` is the source
+- Read-through (`readThrough=true`, activated by `/captain`): real `state/<id>.meta` is the source
   of truth for crew existence. On each crews/bearings/deliver read, one batched
   host read reconciles the KV cache and drops crews the real plane no longer
   tracks (torn down). One `ls`-style read per call, never per-crew round trips; a
@@ -78,20 +82,15 @@ Install, then run `/captain` in any thread — that calls `deck` and is the setu
   known to have failed** (`metaWritten=false`, e.g. the host was briefly down) is
   never reaped — its current absence is not proof of teardown; `migrate-state`
   backfills the meta and clears the flag. Default off = KV cache only.
-- Version-pinned real skills inventory: on init/deck (and when `fmHome` HEAD
-  moves) the plugin reads `fmHome/.agents/skills` and stores a version-pinned
-  manifest, then injects that inventory into captain sessions so the captain knows
-  the real policy skills and reads/runs them through the toolbelt. (BB plugins
-  cannot register a dynamic skill root from `configure()`, so the real skill
-  *content* is surfaced through the toolbelt rather than falsely re-registered;
-  crews still get none.) Caveat: the inventory refreshes on init/deck (and only
-  re-persists when `fmHome` HEAD moved) — if HEAD moves without a re-deck, the
-  injected list is stale until the next deck.
+- Version-pinned real skills: all 21 upstream skills are bundled and registered
+  from the plugin's static skill root. On init/deck the plugin also reads the live
+  `fmHome/.agents/skills` manifest so upstream additions or removals are visible as
+  drift. Captains get the complete set; crews get none.
 - Authoritative real state, rebuildable KV cache: `bb firstmate migrate-state`
   imports the KV crew cache into real `state/<id>.meta` + briefs, idempotently,
   without overwriting active work, and skipping terminal (done/failed) crews so
   the watcher can't resurrect dead work. KV stays a cache that only accelerates.
-- Real-plane owners (opt-in, one flag each; default `kv` = today's behavior).
+- Real-plane owners (activated together by `/captain`; individually configurable).
   Each `firstmate_*` tool/CLI keeps its signature; when its owner is `real` the op
   routes through the native owner and is written through to the KV cache. Any
   host/read failure degrades to the KV path with a clear log:
@@ -129,10 +128,8 @@ Install, then run `/captain` in any thread — that calls `deck` and is the setu
   `bb firstmate migrate-owners` idempotently projects existing KV queue/decisions/
   afk/quiet/memory into the real files for the owners set to `real` (re-runnable:
   rows already projected are skipped, file writes are overwrites).
-- Durable messaging planes (opt-in, one flag each; default keeps today's
-  fire-and-forget behavior). BB messaging is otherwise fire-and-forget both ways —
-  a failed `threads.send` is logged and lost, and a bare doorbell to a finished crew
-  can re-run its turn. These route through the real firstmate transport instead:
+- Durable messaging planes (automatically active under the default `/captain`
+  full-parity profile). These route through the real firstmate transport:
   - `notifyOwner=real` — a crew→captain report is appended as a `note:` line into the
     crew's append-only `state/<id>.status` file (the fm-classify unread-surface
     grammar) and a `signal <id>.status` wake is enqueued as a POINTER. Content lives in
@@ -142,26 +139,31 @@ Install, then run `/captain` in any thread — that calls `deck` and is the setu
     drains with `bb firstmate wake` / `firstmate_wake` (real `fm-wake-drain.sh`:
     UNREAD STATUS + OPEN DECISIONS + `WAKE_ACK_REQUIRED --ack-through <seq>
     --recovery-generation <gen>`). Two distinct reports both survive present + ack
-    (proven). A cheap constant doorbell still rings; a dropped doorbell no longer loses
-    the report. Degrades to the KV fire-and-forget send with a log.
-  - `tellOwner=real` — a captain→crew steer is written as a durable `fire-and-forget`
+    (proven). Each outcome is also delivered with BB `steer` as an agent-only input,
+    so it enters the active captain turn or starts one when idle without rendering a
+    raw status line to the captain. The plugin records the exact queue sequence only after BB confirms the
+    live steer. When that captain turn reaches idle, it runs native present+ack for
+    the contiguous confirmed sequence prefix before the turn-end guard. Reports the
+    captain already handled therefore do not return as duplicate “undrained wake”
+    turns; failed, held, and externally-created wakes have no receipt and remain
+    durable. Degrades to the KV send with a log.
+  - `tellOwner=real` — a captain→crew steer is written as a durable normal
     record `state/<id>.inbox/NNN.msg` via the real `fm_task_inbox_write` primitive
     (body is a single positional arg → stored VERBATIM; `fm-send.sh` has no
     literal-body form, so a body starting with `--resolve-key`/`--key`/`/`/`$` would be
-    eaten by its option loop or diverted to the harness parser), then delivered as the
-    LITERAL doorbell over BB — identical to the KV path. The record is written
-    `fire-and-forget` on purpose: a BB thread crew is steered over the BB send and
-    never reads/acks its inbox, so a NORMAL record would leave fm-watch's
-    `inbox_steer_check` seeing a permanently-unhandled steer and escalate it into a
-    FALSE stuck-crewmate-recovery (immediate for an idle crew, since the bb backend
-    maps idle→dead). fire-and-forget records are skipped by the re-ring ladder
-    (`fm_task_inbox_oldest_unhandled` → `due_action` stays `quiet`), so the record is a
-    durable audit trail the watcher never weaponizes. Delivery needs no
+    eaten by its option loop or diverted to the harness parser), then steered
+    literally into the active BB turn or used to start an idle crew. A confirmed
+    SDK delivery moves the normal record into `handled/`, which is the native
+    acknowledgement; a failed delivery leaves it for fm-watch's re-ring/recovery
+    ladder. Explicit non-urgent `tell --queue` records remain fire-and-forget so
+    they cannot re-ring into the current turn. Delivery needs no
     `state/<id>.meta`, so a crew created before real transport is never rendered
-    unsteerable; if the BB send itself fails, `tellCrew`'s own send is the fallback.
+    unsteerable; if the BB send itself fails, the unacknowledged normal record stays
+    pending for fm-watch to re-ring rather than creating a duplicate delivery.
     `interrupt`/`stop` stay hard steers, never the inbox. Degrades to the KV doorbell
     with a log.
-  - `turnEndGuard=re-ring` — a non-blocking captain turn-end backstop. BB exposes NO
+  - `turnEndGuard=re-ring` — an optional non-blocking captain turn-end backstop; the
+    `/captain` profile leaves it off so only new crew events start manager turns. BB exposes NO
     blocking stop hook (its `PluginEvents.on("thread.idle")` fires AFTER idle and
     returns void — it cannot veto the turn the way native firstmate's exit-2 Stop
     guard does), so on captain idle with undrained durable wakes the plugin injects a
@@ -205,11 +207,11 @@ and why.
 
 | # | Divergence | Status | Evidence / note |
 |---|------------|--------|-----------------|
-| 1 | Two independent policy/state planes | PARTIAL | Real `state/`/backlog/contract/memory own policy behind the owner flags; KV is the projection/cache. Full single-ledger migration of pre-existing KV is `migrate-owners` (opt-in), not automatic. |
+| 1 | Two independent policy/state planes | CLOSED | `/captain` activates real ownership and runs the idempotent migrations once. Real `state/`/backlog/contract/memory own policy; KV is a projection/cache. Non-empty real memory is never overwritten. |
 | 2 | Dispatch loses brief/profile + reasoning effort | CLOSED | `transport=real` runs real `fm-brief.sh`+`fm-spawn.sh`; `dispatch --reasoning-level` applies from turn 1. |
 | 3 | Duplicated PR/merge state → stale reports | CLOSED | `deck`/`bearings` reconcile live thread/PR and retire crews merged/closed outside BB; merge retires both planes. |
 | 4 | Real skills/hooks/contract not loaded; crew isolation | CLOSED | Captain loads real `AGENTS.md` + version-pinned skills inventory; real-script crews tagged crew (no captain tools). |
-| 5 | Reduced status/supervision protocol | PARTIAL | `watchOwner=fm-watch` hands supervision to the real watcher (heartbeat-gated); full durable keyed status folding is projected, native watcher owns the ladder. |
+| 5 | Reduced status/supervision protocol | CLOSED | `watchOwner=fm-watch` hands supervision to the real watcher; keyed status folding, heartbeat gating, re-arm, escalation, and BB event recovery are active. |
 | 6 | Merge gating (zero-checks, waiver) | CLOSED | Zero checks = no failing checks; `--allow-red <check>` waives one exact check, separate from `--yes`. |
 | 7 | Scout delivery/retirement semantics | PARTIAL | Ships default to isolated worktrees; scout durable external `report.md` and completed-scout scratch discard remain native-owned via real teardown. |
 | 8 | Retry = resubmission, not recovery relaunch | CLOSED | `retry` with `--model`/`--provider`/`--reasoning-level` relaunches a fresh thread in the same worktree. |

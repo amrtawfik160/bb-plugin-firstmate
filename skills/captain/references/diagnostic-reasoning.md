@@ -1,7 +1,7 @@
 <!-- BB-SOURCE
      native: .agents/skills/diagnostic-reasoning/SKILL.md
-     sha: 804394e8
-     snapshot: native-snapshot/804394e8/.agents/skills/diagnostic-reasoning/SKILL.md
+     sha: 6f0f1399
+     snapshot: native-snapshot/6f0f1399/.agents/skills/diagnostic-reasoning/SKILL.md
      fidelity: verbatim
      note: Adopted as-is from native firstmate (pure procedure, zero harness
      dependency). Rendered prose is native's own; BB-only framing is fenced

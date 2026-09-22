@@ -27,13 +27,14 @@ Prefer `firstmate_*` tools on a captain thread. CLI works everywhere.
 
 ## Commands
 
-`guide`, `init` (`--real` clones firstmate and overlays `backends/bb.sh`), `fm`
+`guide`, `init` (`--real` clones firstmate and overlays `backends/bb.sh`), `scripts`, `fm`
 (any `bin/fm-*.sh` with `FM_BACKEND=bb`), `deck`, `session`, `dispatch`, `crews`,
 `crew`, `watch`, `tell`, `interrupt`, `stop`, `retry`, `bearings`, `deliver`,
 `merge`, `promote`, `queue`, `decide`, `posture`, `memory`, `afk`, `quiet`,
 `secondmate`, `supervision`, `forget`.
 
-Native `dispatch`/`tell`/`watch` use the plugin SDK (Fleet UI, pluginMetadata).
+`scripts` verifies and searches the complete installed `fm-*` surface; `fm` runs any result through `FM_BACKEND=bb`.
+All 21 upstream policy skills are registered for captain threads through the shared BB runtime adapter. Native `dispatch`/`tell`/`watch` use the plugin SDK (Fleet UI, pluginMetadata).
 Crews spawn visible so they nest under the captain in the BB sidebar (`--hidden` to hide).
 When `fmHome` is set, `dispatch` also writes `state/<id>.meta` so peek/send/teardown
 see Fleet crews. `fm` is the real toolbelt. Both talk to BB threads.

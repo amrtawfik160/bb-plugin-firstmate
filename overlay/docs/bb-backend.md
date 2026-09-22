@@ -62,7 +62,7 @@ harness=bb
 | --- | --- |
 | create_task | `bb thread spawn --new-environment worktree --prompt <brief>` |
 | capture | `bb thread output` |
-| send_text_submit | `bb thread tell --mode queue` |
+| send_text_submit | `bb thread tell --mode steer` (inject active turn, otherwise start one) |
 | send_key C-c | `bb thread tell --mode steer` interrupt |
 | kill | `bb thread stop` |
 | remove_worktree | Dirty tree: print the file list, exit 1, do not stop or archive. Clean: `bb thread stop` + `bb thread archive` (archive failure exits 1; no Treehouse) |
@@ -126,8 +126,8 @@ Between the fast-forward (step 4) and the re-install (step 5) the mirror is mome
 > **The install only succeeds at the patch base.** The overlay patches are pinned to
 > [`overlay/patch-base.txt`](patch-base.txt) (the upstream commit they were refreshed
 > against). Step 1's install-first works only if `$FMH`'s HEAD is at that base. A home
-> that is **behind** the base (the current live case, at `2bcb88c3` while the base is
-> `804394e8`) cannot install-first at its old HEAD — the patches target the new source.
+> that is **behind** the base cannot install-first at its old HEAD — the patches
+> target the new source.
 > Such a home is handled by the sequence in **"Migrating a home that is behind the patch
 > base"** below, which relies on the mirror it already carries. Because the install is now
 > atomic, a re-install whose patch no longer applies aborts without touching the working
@@ -169,23 +169,23 @@ git -C "$FMH" status --porcelain                              # expect empty
 
 Do **not** run step 2 as `git checkout .` or `git reset --hard` — those would reach beyond the three files. `state/` and `data/` are never tracked in this clone (they are gitignored), so a scoped `git checkout -- <the four paths>` cannot lose crew state or memory; still, restrict the command to those paths. After any later out-of-band fast-forward (a manual `git pull`, an external updater), re-run step 5; `--verify` fails loud (`FM_MIRROR_STALE`) whenever the mirror is behind HEAD or a sibling is missing, and the plugin logs the same on the dispatch and supervision paths.
 
-## Migrating a home that is behind the patch base (the current live case)
+## Migrating a home that is behind the patch base
 
-The live `/root/firstmate` is at `2bcb88c3` with a **working mirror already installed** (rebuilt at that HEAD, tree clean, serving bb) and needs to reach current upstream `804394e8` — which is the patch base. Because the refreshed patches target `804394e8` (not `2bcb88c3`), you must **not** rebuild the mirror at the old HEAD; the mirror it already has is what carries bb through the whole sequence, and the only install is the final one at the new HEAD. Zero-window and atomic-failure survival are proven by `scripts/live-migration-zero-window-check.mjs` (step G is a deliberately-failed re-install).
+A home with a **working mirror already installed** may be behind the patch base. Do **not** rebuild the mirror at that old HEAD; the existing mirror carries bb through the update, and the only install is the final one at the pinned base. Zero-window and atomic-failure survival are proven by `scripts/live-migration-zero-window-check.mjs` (step G is a deliberately-failed re-install).
 
 ```bash
 FMH=/root/firstmate   # the live home; OVL=<path to overlay/>
+PATCH_BASE=$(cat "$OVL/patch-base.txt")
 
 # 1. Confirm the existing mirror is healthy and serving bb. Do NOT re-install at the
-#    old HEAD: the refreshed patches target the base (804394e8), not 2bcb88c3.
+#    old HEAD: the refreshed patches target PATCH_BASE.
 python3 "$OVL"/install-bb-backend.py --home "$FMH" --verify   # healthy (at old HEAD)
 git -C "$FMH" status --porcelain                              # expect empty (no in-place patch)
 
 # 2. Fast-forward the clean clone to the base. The mirror goes momentarily STALE
 #    (HEAD past its manifest) but keeps dispatching bb — never bb-less.
 git -C "$FMH" fetch --quiet origin
-up=$(git -C "$FMH" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)
-[ -n "$up" ] && git -C "$FMH" merge --ff-only "$up"          # advances to 804394e8
+git -C "$FMH" merge --ff-only "$PATCH_BASE"
 
 # 3. Re-install against the new HEAD. The refreshed patches apply; the installer builds
 #    the mirror in bin-bb.staging and atomically swaps it in ONLY on full success. If it

@@ -14,6 +14,8 @@ import {
 import plugin, {
   backlogTitleOf,
   captainWakeDoorbell,
+  compareUpstreamScriptSurface,
+  crewThreadTitle,
   fmBackendEnv,
   fmWatchKeeperInterval,
   fmWatchKeeperScript,
@@ -28,8 +30,9 @@ import plugin, {
   versionAtLeast,
 } from "./server.ts";
 import { latestStatus, statusProtocolSummary } from "./lib/policy.ts";
+import { UPSTREAM_SCRIPT_NAMES, PINNED_SCRIPT_SUPPORT_FILES, UPSTREAM_SKILL_NAMES } from "./lib/upstream-surface.ts";
 
-const SKILLS = ["captain", "firstmate", "afk", "ahoy", "bearings", "quiet", "stow"] as const;
+const SKILLS = ["captain", "firstmate", ...UPSTREAM_SKILL_NAMES] as const;
 
 async function load() {
   const host = createFakePluginHost({
@@ -48,6 +51,7 @@ test("cli help lists dispatch and deck", async () => {
     assert.match(result.stdout, /bb firstmate dispatch/);
     assert.match(result.stdout, /bb firstmate deck/);
     assert.match(result.stdout, /bb firstmate fm/);
+    assert.match(result.stdout, /bb firstmate scripts/);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -92,6 +96,79 @@ test("captain metadata loads the full skill set", async () => {
     );
     assert.ok(cfg.skills.includes("captain"));
     assert.ok(cfg.skills.includes("afk"));
+    assert.deepEqual([...cfg.skills].sort(), [...SKILLS].sort(), "captain must receive every bundled upstream skill");
+    assert.ok(cfg.tools.some((tool) => tool.name === "firstmate_wake"));
+    assert.deepEqual(
+      cfg.tools.map((tool) => tool.name).sort(),
+      host.harness.inspection.registrations.agentTools.map((tool) => tool.name).sort(),
+      "captain sessions must expose every registered firstmate tool",
+    );
+    assert.match(cfg.instructions ?? "", /talk in outcomes, not mechanics/i);
+    assert.match(cfg.instructions ?? "", /Do not narrate tool calls/);
+    assert.match(cfg.instructions ?? "", /automatic fixes, retries, routine progress/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("complete upstream script surface is pinned and drift is reported", () => {
+  const complete = compareUpstreamScriptSurface(UPSTREAM_SCRIPT_NAMES, "", PINNED_SCRIPT_SUPPORT_FILES);
+  assert.equal(complete.expected, 177);
+  assert.equal(complete.installed, 177);
+  assert.deepEqual(complete.missing, []);
+  assert.deepEqual(complete.extra, []);
+  assert.equal(complete.expectedSupport, 20);
+  assert.equal(complete.installedSupport, 20);
+  assert.deepEqual(complete.missingSupport, []);
+  assert.deepEqual(complete.extraSupport, []);
+  assert.deepEqual(complete.matches, [...UPSTREAM_SCRIPT_NAMES]);
+
+  const drift = compareUpstreamScriptSurface(
+    [...UPSTREAM_SCRIPT_NAMES.slice(1), "future-script"],
+    "afk",
+    [...PINNED_SCRIPT_SUPPORT_FILES.slice(1), "future-helper.py"],
+  );
+  assert.deepEqual(drift.missing, ["afk-contract"]);
+  assert.deepEqual(drift.extra, ["future-script"]);
+  assert.deepEqual(drift.missingSupport, ["backends/bb.sh"]);
+  assert.deepEqual(drift.extraSupport, ["future-helper.py"]);
+  assert.ok(drift.matches.every((name) => name.includes("afk")));
+});
+
+test("every pinned upstream skill is bundled under its registered name", () => {
+  const root = dirname(fileURLToPath(import.meta.url));
+  for (const name of UPSTREAM_SKILL_NAMES) {
+    const path = join(root, "skills", name, "SKILL.md");
+    assert.ok(existsSync(path), `missing bundled skill ${name}`);
+    assert.match(readFileSync(path, "utf8"), new RegExp(`^---\\nname: ${name}\\n`));
+  }
+});
+
+test("captain tool activity is folded by default", async () => {
+  const host = await load();
+  try {
+    const tools = host.harness.inspection.registrations.agentTools;
+    assert.ok(tools.length > 0);
+    for (const tool of tools) {
+      assert.equal(tool.presentation?.suppress, true, `${tool.name} should be low-noise`);
+    }
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("fleet RPC identifies and scopes the current captain thread", async () => {
+  const host = await load();
+  try {
+    host.harness.sdk.stub("threads.getPluginMetadata", async ({ threadId }: { threadId: string }) => (
+      threadId === "thr_captain" ? { captain: "true" } : {}
+    ));
+    const fleet = await host.harness.behavior.callRpc("fleet", { threadId: "thr_captain" }) as {
+      captain: boolean;
+    };
+    assert.equal(fleet.captain, true);
+    const legacy = await host.harness.behavior.callRpc("fleet", null) as { captain: boolean };
+    assert.equal(legacy.captain, false, "already-open tabs may keep the old null input until refresh");
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -128,11 +205,13 @@ test("dispatch spawns an isolated ship worktree", async () => {
     assert.equal(spawnCalls.length, 1);
     const args = spawnCalls[0]![0] as {
       environment?: { type?: string; hostId?: string; workspace?: { type?: string } };
+      title?: string;
       visibility?: string;
     };
     assert.equal(args.environment?.type, "host");
     assert.equal(args.environment?.hostId, "host_1");
     assert.equal(args.environment?.workspace?.type, "managed-worktree");
+    assert.match(args.title ?? "", /^Ship · Fix flaky login · [a-f0-9]{8}$/);
     assert.equal(args.visibility, "visible");
   } finally {
     await host.harness.lifecycle.dispose();
@@ -215,6 +294,18 @@ test("backlogTitleOf strips the Captain label and uses the first line, capped", 
   assert.equal(backlogTitleOf("   \n\nplain task"), "plain task");
   assert.equal(backlogTitleOf(""), "crew task");
   assert.equal(backlogTitleOf("x".repeat(500)).length, 200);
+});
+
+test("crewThreadTitle makes concise work-first ship and scout names", () => {
+  assert.equal(
+    crewThreadTitle("Captain's intent: fix flaky login\n\nmore detail", "ship", "abc12def"),
+    "Ship · Fix flaky login · abc12def",
+  );
+  assert.equal(
+    crewThreadTitle("ignored", "scout", "de45f678", "# audit the auth flow"),
+    "Scout · Audit the auth flow · de45f678",
+  );
+  assert.ok(crewThreadTitle("x".repeat(300), "ship", "abc12def").length <= 100);
 });
 
 function hostRcOutput(code = 0) {
@@ -406,9 +497,14 @@ function sendCalls(host: Awaited<ReturnType<typeof load>>) {
     const args = call[0] as {
       threadId?: string;
       mode?: string;
-      input?: Array<{ text?: string }>;
+      input?: Array<{ text?: string; visibility?: string }>;
     };
-    return { threadId: args.threadId, mode: args.mode, text: args.input?.[0]?.text ?? "" };
+    return {
+      threadId: args.threadId,
+      mode: args.mode,
+      text: args.input?.[0]?.text ?? "",
+      visibility: args.input?.[0]?.visibility,
+    };
   });
 }
 
@@ -1683,13 +1779,15 @@ test("deck renders real fm-bearings-snapshot labelled, native digest as cache", 
   }
 });
 
-test("bb overlay adapter propagates reasoning, tags crews, drops yolo->full, carves out scouts", () => {
+test("bb overlay adapter propagates reasoning, names and tags crews, drops yolo->full, carves out scouts", () => {
   const src = readFileSync(
     join(dirname(fileURLToPath(import.meta.url)), "overlay", "bin", "backends", "bb.sh"),
     "utf8",
   );
   assert.match(src, /--reasoning-level/);
   assert.match(src, /FM_BB_REASONING/);
+  assert.match(src, /FM_BB_THREAD_TITLE/);
+  assert.match(src, /\$role · \$subject · \$id/);
   assert.match(src, /firstmate mark-crew/);
   // yolo no longer forces BB full permission
   assert.doesNotMatch(src, /perm=full/);
@@ -2910,6 +3008,11 @@ test("C1: real transport adds the backlog row (id=crew id, --kind ship) BEFORE f
     assert.ok(addIdx >= 0, `no backlog add for ${crewId}: ${seen.join(" | ")}`);
     assert.ok(spawnIdx >= 0, "fm-spawn.sh never ran");
     assert.ok(addIdx < spawnIdx, "backlog add must run BEFORE fm-spawn (backlog-first)");
+    assert.ok(seen[spawnIdx]!.includes("FM_BB_THREAD_TITLE="), "real transport must pass an explicit title");
+    assert.ok(
+      seen[spawnIdx]!.includes("Ship · Fix flaky login ·") && seen[spawnIdx]!.includes(crewId),
+      "real transport must pass the same work-first title to its BB backend",
+    );
     // fm-spawn owns the queued→In-flight start; the plugin must not double-start.
     assert.ok(!seen.some((c) => c.includes("fm-tasks-axi.sh") && c.includes("'start'")), "plugin double-started the row");
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0, "must not native-spawn");
@@ -3323,7 +3426,7 @@ function stubOrphanTransportHost(
       id: "thr_orphan",
       projectId: "proj_1",
       parentThreadId: "thr_cap",
-      title: opts.byTitle ? `fm-${captured.taskId}` : "renamed-window",
+      title: opts.byTitle ? `Ship · Fix flaky login · ${captured.taskId}` : "renamed-window",
     },
   ]);
   host.harness.sdk.stub("threads.getPluginMetadata", async () =>
@@ -4095,7 +4198,7 @@ test("R1 multi-host: a live watcher on host A does not suppress a stuck crew on 
   }
 });
 
-test("R2 relay: only stale: lines are relayed; routine signal:/check:/heartbeat are dropped", async () => {
+test("R2 relay: actionable stale:/check: lines wake the manager; signal:/heartbeat stay dropped", async () => {
   const host = createFakePluginHost({
     pluginId: "firstmate",
     agentSkillIds: SKILLS,
@@ -4130,8 +4233,46 @@ test("R2 relay: only stale: lines are relayed; routine signal:/check:/heartbeat 
     // delivered by notifyCaptain — it must NOT be relayed (reverting the extractWatchReasons
     // stale-only filter re-relays it and fails this assertion).
     assert.doesNotMatch(relayed, /signal:/);
-    assert.doesNotMatch(relayed, /check: routine/);
+    assert.match(relayed, /check: routine/);
     assert.doesNotMatch(relayed, /heartbeat 12/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("inbox check wakes the deck manager even when no crews exist", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", watchOwner: "fm-watch", fmHostId: "host_1" },
+  });
+  await plugin(host.bb);
+  try {
+    host.harness.sdk.stub("terminals.create", async () => ({ id: "term_1" }));
+    host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+    host.harness.sdk.stub("terminals.close", async () => ({}));
+    host.harness.sdk.stub("threads.send", async () => ({}));
+    host.harness.sdk.stub("environments.list", async () => []);
+    await host.bb.storage.kv.set("crews", []);
+    await host.bb.storage.kv.set("fm-watch-captain:host_1", "thr_cap");
+    host.harness.sdk.stub("terminals.output", async () =>
+      hostRcPayload("FM_BEAT_AGE=5\nFM_RELAUNCHED=0\n---FM_LOGTAIL---\ncheck: captain inbox note 17\ncheck: captain inbox note 18", 0),
+    );
+    const run = host.harness.behavior.runService("fm-watch-supervisor");
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline) {
+      if (sendCalls(host).length > 0) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    run.controller.abort();
+    await run.done;
+    assert.ok(
+      sendCalls(host).some((s) => {
+        const text = s.text ?? "";
+        return s.threadId === "thr_cap" && text.includes("check: captain inbox note 17") && text.includes("check: captain inbox note 18");
+      }),
+      "the remembered /captain thread must receive every distinct home-wide inbox wake with an empty fleet",
+    );
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -4895,6 +5036,9 @@ test("notifyOwner=kv (default) sends the full report and enqueues no wake", asyn
     assert.ok(!seen.some((c) => c.includes("fm_wake_append")), "kv default must not enqueue a wake");
     const sends = sendCalls(host);
     assert.equal(sends.length, 1);
+    assert.equal(sends[0]?.mode, "steer", "crew outcome must enter the active captain turn, never queue");
+    assert.equal(sends[0]?.visibility, "agent-only", "internal crew wakes must never render in captain chat");
+    assert.match(sends[0]?.text ?? "", /Check the crew's current state because this event may already be resolved/);
     assert.match(sends[0]?.text ?? "", /DONE: shipped the branch/);
   } finally {
     await host.harness.lifecycle.dispose();
@@ -4955,17 +5099,16 @@ test("fmWatchKeeperScript declares autoarm AND arms fm-watch as a handling succe
 test("Part C: captainWakeDoorbell appends the drain hint only when drainHint=true", () => {
   const plain = captainWakeDoorbell("✅ crew c1 done", "shipped the branch");
   assert.match(plain, /^🔔 ✅ crew c1 done — shipped the branch$/, plain);
-  assert.ok(!plain.includes("bb firstmate wake"), `a plain doorbell must carry no drain footer: ${plain}`);
+  assert.ok(!plain.includes("firstmate_wake"), `a plain doorbell must carry no drain footer: ${plain}`);
   const withHint = captainWakeDoorbell("⚖️ crew c1 NEEDS DECISION", "pick a base branch", { drainHint: true });
-  assert.match(withHint, /bb firstmate wake/, withHint);
+  assert.match(withHint, /firstmate_wake/, withHint);
   // Reverting the conditional (always append CAPTAIN_WAKE_DRAIN_HINT) makes the plain case
   // carry the footer and fails the assertion above.
 });
 
-// Part B: one crew completion = one captain message. In real mode a plain done is already
-// surfaced by BB's own child-output delivery + the durable wake queue, so the plugin's own
-// doorbell is suppressed — but the durable enqueue (the store) still runs, so nothing is lost.
-test("Part B: notifyOwner=real — a plain done is NOT re-doorbelled (BB delivers), durable wake still enqueued", async () => {
+// Part B: one crew completion = one plugin-owned live wake. The durable queue is
+// recovery; the steer is immediate delivery even while the captain is busy.
+test("Part B: notifyOwner=real — a plain done is durably stored and steered into the captain turn", async () => {
   const host = ownerHost({ notifyOwner: "real" });
   await plugin(host.bb);
   try {
@@ -4975,10 +5118,10 @@ test("Part B: notifyOwner=real — a plain done is NOT re-doorbelled (BB deliver
     await emitIdle(host, "DONE: shipped the branch");
     // The report still lands in the durable queue (drain recovers it).
     assert.ok(seen.some((c) => c.includes("fm_wake_append")), "real must still enqueue the durable wake (the store)");
-    // But the redundant chat doorbell is gone — reverting the suppression re-sends it and
-    // fails this assertion.
     const sends = sendCalls(host).filter((s) => s.threadId === "thr_cap");
-    assert.equal(sends.length, 0, `a plain done must not re-doorbell the captain: ${sends.map((s) => s.text).join(" | ")}`);
+    assert.equal(sends.length, 1, `a plain done must proactively reach the captain: ${sends.map((s) => s.text).join(" | ")}`);
+    assert.equal(sends[0]?.mode, "steer", "a busy captain must receive the outcome in its current turn");
+    assert.match(sends[0]?.text ?? "", /shipped the branch/);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -5004,7 +5147,7 @@ test("Part B: notifyOwner=real — a failure still doorbells the captain (non-pl
     assert.match(text, /^🔔 /, text);
     assert.match(text, /crew c1 failed/, text);
     // A failure is self-sufficient (head + summary + next: retry|tell|forget) — no drain footer.
-    assert.ok(!text.includes("bb firstmate wake"), `a failure doorbell needs no drain footer: ${text}`);
+    assert.ok(!text.includes("firstmate_wake"), `a failure doorbell needs no drain footer: ${text}`);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -5071,7 +5214,7 @@ test("Part C: notifyOwner=real — a NEEDS DECISION doorbell keeps the drain hin
     assert.equal(captain.length, 1, "the cap must surface NEEDS DECISION");
     const text = captain[0]?.text ?? "";
     assert.match(text, /NEEDS DECISION/, text);
-    assert.match(text, /bb firstmate wake/, text);
+    assert.match(text, /firstmate_wake/, text);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -5209,6 +5352,11 @@ test("IT F1: notifyOwner=real — two DISTINCT crew reports both survive wake pr
     await host.harness.behavior.setSettings({ supervisionEnabled: true });
     await emitIdle(host, "DONE: REPORTONE milestone reached");
     await emitIdle(host, "BLOCKED: REPORTTWO missing credentials");
+    const live = sendCalls(host).filter((s) => s.threadId === "thr_cap");
+    assert.equal(live.length, 2, "each crew update must reach the manager even while it is already active");
+    assert.ok(live.every((s) => s.mode === "steer"), "no manager update may queue behind the active turn");
+    assert.match(live[0]?.text ?? "", /REPORTONE/);
+    assert.match(live[1]?.text ?? "", /REPORTTWO/);
     // D6: the captain (crew.parentThreadId=thr_cap) drains its OWN scoped plane.
     const present = await host.harness.behavior.runCli(["wake"], { threadId: "thr_cap", projectId: "proj_1" });
     assert.equal(present.exitCode, 0, present.stderr);
@@ -5227,12 +5375,42 @@ test("IT F1: notifyOwner=real — two DISTINCT crew reports both survive wake pr
   }
 });
 
-// IT Part B (live): the load-bearing safety property is the DURABLE QUEUE, not BB's delivery.
-// This drives the REAL fm-wake scripts (scratch FM_HOME): a suppressed plain DONE must still be
+test("IT live delivery settlement: a completed captain turn acknowledges steered wakes without a duplicate backstop", { skip: !FM_INTEGRATION }, async () => {
+  const home = scratchFmHome();
+  const host = itHost(home, { notifyOwner: "real", turnEndGuard: "re-ring" });
+  await plugin(host.bb);
+  try {
+    stubRealExecHost(host);
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await emitIdle(host, "DONE: FIRSTLIVE handled in captain turn");
+    await emitIdle(host, "BLOCKED: SECONDLIVE handled in captain turn");
+    assert.equal(sendCalls(host).filter((s) => s.threadId === "thr_cap").length, 2);
+
+    // The captain has incorporated both live steers and completed the turn. The
+    // plugin should perform native present+ack internally before the turn-end guard.
+    await host.harness.behavior.emitThreadEvent("thread.idle", {
+      thread: { id: "thr_cap", status: "idle", runtime: { displayStatus: "idle" } },
+      lastAssistantText: "Handled both crew outcomes.",
+    });
+
+    const capSends = sendCalls(host).filter((s) => s.threadId === "thr_cap");
+    assert.equal(capSends.length, 2, `no duplicate turn-end backstop expected: ${capSends.map((s) => s.text).join(" | ")}`);
+    const after = await host.harness.behavior.runCli(["wake"], { threadId: "thr_cap", projectId: "proj_1" });
+    assert.equal(after.exitCode, 0, after.stderr);
+    assert.doesNotMatch(after.stdout, /FIRSTLIVE|SECONDLIVE|WAKE_ACK_REQUIRED/, after.stdout);
+  } finally {
+    await host.harness.lifecycle.dispose();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// IT Part B (live): the durable queue remains recovery behind the live steer.
+// This drives the REAL fm-wake scripts (scratch FM_HOME): a plain DONE must be
 // recoverable — the report survives in the durable queue and drains via `bb firstmate wake`, and
 // the queue entry names the crew even when the crew's own output is empty (so an empty/truncated
-// BB delivery can never open a silent hole). Proves suppression + no-loss together on real scripts.
-test("IT Part B: notifyOwner=real — a suppressed plain DONE is still recoverable from the durable queue (incl. empty output)", { skip: !FM_INTEGRATION }, async () => {
+// BB delivery can never open a silent hole). Proves live delivery + recovery together.
+test("IT Part B: notifyOwner=real — a live-steered plain DONE is recoverable from the durable queue (incl. empty output)", { skip: !FM_INTEGRATION }, async () => {
   const home = scratchFmHome();
   const host = itHost(home, { notifyOwner: "real" });
   await plugin(host.bb);
@@ -5241,15 +5419,16 @@ test("IT Part B: notifyOwner=real — a suppressed plain DONE is still recoverab
     await seedCrew(host);
     await host.harness.behavior.setSettings({ supervisionEnabled: true });
 
-    // A plain DONE with an outcome: the chat doorbell is suppressed…
+    // A plain DONE with an outcome is steered live…
     await emitIdle(host, "DONE: shipped clean REPORTDONE");
     const capSends = sendCalls(host).filter((s) => s.threadId === "thr_cap");
-    assert.equal(capSends.length, 0, `a plain DONE must suppress the chat doorbell: ${capSends.map((s) => s.text).join(" | ")}`);
+    assert.equal(capSends.length, 1, `a plain DONE must reach the captain live: ${capSends.map((s) => s.text).join(" | ")}`);
+    assert.equal(capSends[0]?.mode, "steer");
 
     // …but the report provably survives in the durable queue and drains.
     const present = await host.harness.behavior.runCli(["wake"], { threadId: "thr_cap", projectId: "proj_1" });
     assert.equal(present.exitCode, 0, present.stderr);
-    assert.match(present.stdout, /REPORTDONE/, `suppressed report must survive the durable queue:\n${present.stdout}`);
+    assert.match(present.stdout, /REPORTDONE/, `live report must survive the durable queue:\n${present.stdout}`);
     // The entry names the crew, so an empty/truncated child output cannot make it anonymous.
     assert.match(present.stdout, /c1/, present.stdout);
     const m = /--ack-through (\d+) --recovery-generation (\S+)/.exec(present.stdout);
@@ -5362,7 +5541,7 @@ test("IT F3: tellOwner=real steers a crew with NO state/<id>.meta (durable recor
     const res = await host.harness.behavior.runCli(["tell", "c1", "--message=please rebase on main"], { projectId: "proj_1" });
     assert.equal(res.exitCode, 0, res.stderr);
     assert.equal(sendCalls(host).length, 1, "literal doorbell still delivered");
-    const rec = readFileSync(join(home, "state", "c1.inbox", "001.msg"), "utf8");
+    const rec = readFileSync(join(home, "state", "c1.inbox", "handled", "001.msg"), "utf8");
     assert.match(rec, /please rebase on main/, "durable record written despite no meta");
     assert.ok(!existsSync(join(home, "state", "c1.meta")), "no meta was needed");
   } finally {
@@ -5390,7 +5569,7 @@ test("IT F4: tellOwner=real stores steer text VERBATIM for --key / --resolve-key
       const res = await host.harness.behavior.runCli(["tell", "c1", `--message=${body}`], { projectId: "proj_1" });
       assert.equal(res.exitCode, 0, res.stderr);
       seq += 1;
-      const rec = readFileSync(join(home, "state", "c1.inbox", `${String(seq).padStart(3, "0")}.msg`), "utf8");
+      const rec = readFileSync(join(home, "state", "c1.inbox", "handled", `${String(seq).padStart(3, "0")}.msg`), "utf8");
       const bodyOnDisk = rec.slice(rec.indexOf("\n--\n") + 4);
       assert.equal(bodyOnDisk, STEER_PREFIX + body, `verbatim record mismatch for [${body}]`);
       assert.equal(bodyOnDisk.slice(STEER_PREFIX.length), body, `content mangled after prefix for [${body}]`);
@@ -5454,7 +5633,7 @@ test("note: report lines never override the crew's real terminal verb (latestSta
   assert.doesNotMatch(summary ?? "", /REPORTX/);
 });
 
-test("IT F3b: tellOwner=real writes a fire-and-forget record → fm_task_inbox_due_action stays quiet (no false stuck-recovery)", { skip: !FM_INTEGRATION }, async () => {
+test("IT F3b: tellOwner=real acknowledges a normal record after BB confirms delivery", { skip: !FM_INTEGRATION }, async () => {
   const home = scratchFmHome();
   const host = itHost(home, { tellOwner: "real" });
   await plugin(host.bb);
@@ -5463,11 +5642,11 @@ test("IT F3b: tellOwner=real writes a fire-and-forget record → fm_task_inbox_d
     await seedCrew(host);
     const res = await host.harness.behavior.runCli(["tell", "c1", "--message=please rebase"], { projectId: "proj_1" });
     assert.equal(res.exitCode, 0, res.stderr);
-    // the record must carry delivery=fire-and-forget
-    const rec = readFileSync(join(home, "state", "c1.inbox", "001.msg"), "utf8");
-    assert.match(rec, /delivery=fire-and-forget/, "steer record must be fire-and-forget");
-    // and the REAL ladder must report quiet even past grace — this is exactly what
-    // fm-watch's inbox_steer_check gates on, so it never escalates a healthy crew.
+    const handled = join(home, "state", "c1.inbox", "handled", "001.msg");
+    const rec = readFileSync(handled, "utf8");
+    assert.doesNotMatch(rec, /delivery=fire-and-forget/, "ordinary steer must use upstream's normal record");
+    assert.ok(!existsSync(join(home, "state", "c1.inbox", "001.msg")), "delivery acknowledgement must move the record to handled/");
+    // The REAL ladder sees no unhandled record, so it stays quiet.
     const due = spawnSync(
       "bash",
       ["-c", `export FM_HOME=${home} FM_ROOT=${home} FM_TASK_INBOX_GRACE_SECS=0; . ${home}/bin/fm-task-inbox-lib.sh; fm_task_inbox_due_action ${home}/state c1`],

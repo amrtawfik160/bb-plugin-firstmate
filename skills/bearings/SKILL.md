@@ -5,8 +5,8 @@ description: Fleet digest from live BB crew state. Use when the user runs /beari
 
 <!-- BB-SOURCE
      native: .agents/skills/bearings/SKILL.md
-     sha: 804394e8
-     snapshot: native-snapshot/804394e8/.agents/skills/bearings/SKILL.md
+     sha: 6f0f1399
+     snapshot: native-snapshot/6f0f1399/.agents/skills/bearings/SKILL.md
      fidelity: adapted
      note: Chat-response contract, the four section descriptions and the
      single-source rule are copied verbatim from native and are checked; the data

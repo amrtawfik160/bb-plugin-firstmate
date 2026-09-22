@@ -426,7 +426,7 @@ index 518e905f..7ddb7f82 100755
    if ! kimi_wait_for_ready; then
      kimi_spawn_fail "$KIMI_READY_FAILURE_DETAIL"
 diff --git a/docs/configuration.md b/docs/configuration.md
-index 8c5c25b7..9b61a439 100644
+index 4803123e..892f1664 100644
 --- a/docs/configuration.md
 +++ b/docs/configuration.md
 @@ -132,15 +132,15 @@ Every routine firstmate backlog command therefore runs through [`bin/fm-tasks-ax
@@ -458,7 +458,7 @@ index 8c5c25b7..9b61a439 100644
  A cmux task additionally records `cmux_workspace_id=` and `cmux_surface_id=`.
  Task selectors for `fm-peek.sh`, `fm-send.sh`, and `fm-crew-state.sh` resolve centrally through `fm_backend_resolve_selector`.
  A selector containing `:` is passed through as an explicit backend endpoint escape hatch.
-@@ -546,10 +547,11 @@ This section is the single owner of that universal toolchain list; backend guide
+@@ -558,10 +559,11 @@ This section is the single owner of that universal toolchain list; backend guide
  In that list, no-mistakes runs the validation pipeline, gh-axi and chrome-devtools-axi cover GitHub and browser operations, and tasks-axi plus quota-axi back backlog mutations and quota-aware array dispatch.
  Lavish is a presentation-only dependency for visual decisions and reports; nonvisual work can proceed with plain text when it is unavailable.
  The per-backend delta is required only for the backend resolved from `FM_BACKEND`, then `config/backend`, then runtime auto-detection, then default `tmux`, so a home is never told to install a tool an inactive backend or feature would need.

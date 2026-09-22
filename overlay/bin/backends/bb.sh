@@ -181,13 +181,19 @@ sys.exit(1)
     low|medium|high|xhigh|max|ultra|ultracode|none) ;;
     *) reasoning= ;;
   esac
-  # Deterministic title anchor `fm-<id>` (R4): the plugin's orphan-adoption
-  # fallback matches on this exact title, so a thread created by this CLI spawn is
-  # adoptable even in the SIGKILL window before `mark-crew` tags it — no dependence
-  # on BB attributing originPluginId=firstmate to a CLI-spawned thread.
-  local title
-  title="fm-$id"
-  [ -n "$name" ] && title="fm-$id $name"
+  # Put the work first so sidebar names are useful. Keep the task id as a stable
+  # suffix: the plugin can adopt the thread in the SIGKILL window before the
+  # separate `mark-crew` call tags it. Plugin dispatch supplies the normalized
+  # title; direct fm-spawn users get the same shape from the backlog name.
+  local title role subject
+  role=Ship
+  [ "$kind" = scout ] && role=Scout
+  subject=${name:-Crew task}
+  subject=${subject//$'\r'/ }
+  subject=${subject//$'\n'/ }
+  subject=${subject//$'\t'/ }
+  subject=${subject:0:76}
+  title="${FM_BB_THREAD_TITLE:-$role · $subject · $id}"
   set -- thread spawn --json --project "$project_id" --title "$title" \
     --prompt "$prompt" --visibility "$vis" --permission-mode "$perm"
   if [ "${FM_BB_SHARED_ENV:-0}" = 1 ]; then
@@ -261,7 +267,10 @@ fm_backend_bb_send_literal() {  # <thread-id> <text>
   local id text=$2
   id=$(fm_backend_bb_thread_id "$1")
   fm_backend_bb_tool_check || return 1
-  bb thread tell --json --mode queue "$id" "$text" >/dev/null
+  # Firstmate doorbells are wakeups, not mail for a later turn. Steering injects
+  # into an active BB turn and starts one when idle, matching the native terminal
+  # wake. The durable inbox record remains the source of truth across failures.
+  bb thread tell --json --mode steer "$id" "$text" >/dev/null
 }
 
 fm_backend_bb_send_text_line() {  # <thread-id> <text>
@@ -768,7 +777,7 @@ fm_backend_bb_wait_transition() {  # <session> <timeout_secs> <state_dir> <windo
         seen_ok=1
         ;;
       1) seen_ok=1 ;;
-      *) seen_fail=1 ;;
+      *) : ;;
     esac
   done
   if [ "${#to_wait[@]}" -eq 0 ]; then
