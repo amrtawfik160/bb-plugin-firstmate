@@ -950,7 +950,7 @@ const BB_SKILL_RUNTIME_CONTRACT = [
   "keep its policy and decision rules, but execute through BB.",
   "Translate bin/fm-<name>.sh calls to firstmate_fm with script=<name> and the same arguments; use bb firstmate fm <name> only when a shell command is required.",
   "In imported skills, ../../../AGENTS.md means the injected real captain contract, and ../../../bin, data, state, config, and docs refer to fmHome rather than this plugin directory.",
-  "Translate workers, panes, tabs, and Codex Desktop companion threads to firstmate crew child threads; use firstmate_dispatch/tell/interrupt/retry/stop/watch for their lifecycle.",
+  "Map workers, panes, and tabs to BB crew threads via firstmate_dispatch/tell/interrupt/retry/stop. Call firstmate_watch once per batch; it hands off to private durable wakes. End the turn; never retry or poll.",
   "Use BB interactions for captain questions and approvals.",
   "Treat tmux, herdr, zellij, cmux, orca, and harness-specific hook setup as reference material unless the active backend explicitly names that runtime.",
 ].join(" ");
@@ -6087,25 +6087,31 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_watch",
-    description: "Wait until the given crews finish (idle or error) using BB thread wait — do not poll.",
+    description: "Hand supervision of the given crews to private event-driven wakes backed by the durable queue. Returns immediately; call once per crew batch, end the turn, and do not retry or poll.",
     parameters: z.object({
       crewIds: z.array(z.string()).max(MAX_WATCH_CREWS).optional(),
-      timeoutSec: z.number().int().min(10).max(1800).optional(),
+      timeoutSec: z.number().int().min(10).max(1800).optional().describe("Accepted for compatibility; event-driven handoff returns immediately"),
     }),
-    async execute({ crewIds, timeoutSec }, ctx) {
+    async execute({ crewIds }) {
       const all = await listCrews();
       const targets = (crewIds === undefined ? all : all.filter((c) => crewIds.includes(c.id))).slice(0, MAX_WATCH_CREWS);
       if (targets.length === 0) return toolError("No matching crews.");
-      const timeoutMs = (timeoutSec ?? 600) * 1000;
-      const signal = asRecord(ctx)["signal"] as AbortSignal | undefined;
       const rows = await Promise.all(
         targets.map(async (crew) => {
-          const status = await waitOne(crew, timeoutMs, signal);
+          const status = await crewStatus(crew);
           const output = status === "idle" || status === "error" ? await crewOutput(crew, 800) : null;
           return { ...crew, status, outcome: parseOutcome(output), output };
         }),
       );
-      return rows.map((r) => `${formatCrew(r, r.status, verdictOf(r.outcome))}${r.outcome !== null ? `\n  ${r.outcome}` : ""}`).join("\n");
+      const settled = rows
+        .filter((row) => row.status === "idle" || row.status === "error" || row.status === "unknown")
+        .map((row) => `${formatCrew(row, row.status, verdictOf(row.outcome))}${row.outcome !== null ? `\n  ${row.outcome}` : ""}`);
+      const active = rows.filter((row) => row.status !== "idle" && row.status !== "error" && row.status !== "unknown");
+      if (active.length === 0) return settled.join("\n");
+      return [
+        ...settled,
+        `Private event-driven supervision active for ${active.map((row) => row.id).join(", ")}; outcomes arrive through agent-only durable wakes. End this turn and do not call firstmate_watch again for this crew batch.`,
+      ].join("\n");
     },
   });
 

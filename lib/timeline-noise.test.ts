@@ -22,6 +22,17 @@ test("captain timeline keeps failures and unrelated rows", () => {
   assert.equal(firstmateTimelineNoiseDecision("Asked the captain for approval"), "unrelated");
 });
 
+test("captain timeline hides only the firstmate_watch transport failure", () => {
+  assert.equal(
+    firstmateTimelineNoiseDecision(
+      "Ran firstmate_watch (error) — dynamic tool request failed",
+    ),
+    "hide",
+  );
+  assert.equal(firstmateTimelineNoiseDecision("firstmate_watch: crew c1 failed"), "show");
+  assert.equal(firstmateTimelineNoiseDecision("firstmate_decide needs attention"), "show");
+});
+
 test("captain panes hide generic expandable work but keep material states", () => {
   assert.equal(captainTimelineNoiseDecision("Ran shell command", true), "hide");
   assert.equal(captainTimelineNoiseDecision("Thought for 4s", true), "hide");

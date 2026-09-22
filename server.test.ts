@@ -31,6 +31,7 @@ import plugin, {
 } from "./server.ts";
 import { latestStatus, statusProtocolSummary } from "./lib/policy.ts";
 import { UPSTREAM_SCRIPT_NAMES, PINNED_SCRIPT_SUPPORT_FILES, UPSTREAM_SKILL_NAMES } from "./lib/upstream-surface.ts";
+import { FIRSTMATE_ROUTINE_MARKER } from "./lib/timeline-noise.ts";
 
 const SKILLS = ["captain", "firstmate", ...UPSTREAM_SKILL_NAMES] as const;
 
@@ -106,6 +107,8 @@ test("captain metadata loads the full skill set", async () => {
     assert.match(cfg.instructions ?? "", /talk in outcomes, not mechanics/i);
     assert.match(cfg.instructions ?? "", /Do not narrate tool calls/);
     assert.match(cfg.instructions ?? "", /automatic fixes, retries, routine progress/);
+    assert.match(cfg.instructions ?? "", /call firstmate_watch once per batch/i);
+    assert.match(cfg.instructions ?? "", /private durable wakes/i);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -152,6 +155,38 @@ test("captain tool activity is folded by default", async () => {
     for (const tool of tools) {
       assert.equal(tool.presentation?.suppress, true, `${tool.name} should be low-noise`);
     }
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("firstmate_watch hands off to private wakes without opening a blocking transport wait", async () => {
+  const host = await load();
+  try {
+    await seedCrew(host);
+    host.harness.sdk.stub("threads.get", async () =>
+      makeThreadResponse({ id: "thr_crew", status: "active", projectId: "proj_1" }),
+    );
+    host.harness.sdk.stub("threads.wait", async () => {
+      throw new Error("blocking watch transport must not be opened");
+    });
+    const watch = host.harness.inspection.registrations.agentTools.find(
+      (tool) => tool.name === "firstmate_watch",
+    );
+    assert.ok(watch);
+
+    const result = await watch.execute(
+      { crewIds: ["c1"], timeoutSec: 300 },
+      { threadId: "thr_cap", projectId: "proj_1" } as never,
+    );
+    const text = typeof result === "string"
+      ? result
+      : result.content.map((item) => item.type === "text" ? item.text : "").join("\n");
+
+    assert.equal(host.harness.sdk.callsTo("threads.wait").length, 0);
+    assert.match(text, /private event-driven supervision/i);
+    assert.match(text, /do not call firstmate_watch again/i);
+    assert.ok(text.includes(FIRSTMATE_ROUTINE_MARKER), "handoff row must stay hidden");
   } finally {
     await host.harness.lifecycle.dispose();
   }
