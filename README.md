@@ -18,6 +18,8 @@ bb plugin install path:/path/to/bb-plugin-firstmate --yes
 
 Requires `bb >= 0.43` and `bbPluginSdk >= 0.4.87` (see `package.json` engines).
 
+Update the plugin itself with `bb plugin update firstmate`. The pinned upstream Firstmate checkout updates separately: re-running `/captain` (or `bb firstmate init --real`) fast-forwards an existing `fmHome` clone in place (ff-only, requires a clean tree).
+
 ## Quick start
 
 Run `/captain` in any thread to take the deck, then work in plain language or with the CLI:
@@ -97,8 +99,8 @@ BB-specific behavior in this fork:
 | `firstmateRepo` | upstream repo URL | Repo cloned by `init --real` |
 | `fmHome` | empty | Firstmate home on the host; set by `init --real` |
 | `defaultProvider` | blank | Crew provider id (blank = BB resolves) |
-| `defaultPermissionMode` | blank | Crew permission mode (blank = inherit) |
-| `supervisionEnabled` | on | Captain pings on done/fail/stuck |
+| `defaultPermissionMode` | `resolve` | Crew permission mode (`resolve` = inherit from the captain) |
+| `supervisionEnabled` | off | Captain pings on done/fail/stuck; `deck`/`dispatch` turn it on automatically |
 | `supervisionIntervalMin` | 5 | Stuck-check sweep interval |
 | `supervisionStuckMin` | 30 | Minutes without output change before a stuck alert |
 | `nudgeEnabled` | on | Doorbell idle crews that missed the status protocol |
