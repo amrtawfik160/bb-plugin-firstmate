@@ -5,8 +5,8 @@ description: Enter away-mode supervision. Use when the user runs /afk, says they
 
 <!-- BB-SOURCE
      native: .agents/skills/afk/SKILL.md
-     sha: 6f0f1399
-     snapshot: native-snapshot/6f0f1399/.agents/skills/afk/SKILL.md
+     sha: 8c47279f
+     snapshot: native-snapshot/8c47279f/.agents/skills/afk/SKILL.md
      fidelity: adapted
      note: Away-posture policy copied verbatim from native firstmate. BB tool
      calls that replace native's scripts are fenced BB-ONLY, and every departure
@@ -29,32 +29,21 @@ Hold-for-return is the default and the only reach profile this release records: 
 
 ## Entering: `/afk [words]`
 
-Plain `/afk` with no words is a valid entry with no mandate.
-
-### Read the words back, then wait for the captain's go
-
-Then relay your own plain-sentence restatement of the words to the captain in `AGENTS.md` section 9 language - what you read them as asking for, sentence by sentence, never a numbered field list - beside the expected return, the spend cap, and the one-sentence reach announcement, so the captain can catch a misreading before saying go.
-Say plainly which sentence, if any, you could not act on while away (a red merge, a discard, anything on the never-set, local-only landing), so the captain can restate it or accept that it waits for their return.
+Typing `/afk` is itself the go: the captain may not look at the screen again, so entry never waits for a further human response, and no read-back gates it or asks for a go.
 
 <!-- BB-DIVERGE
      native: .agents/skills/afk/SKILL.md § Entering
-     native-quote: beside the expected return, the spend cap, and the one-sentence reach announcement
-     bb: relay the spend cap in the read-back, but BB's `firstmate_afk` tool takes only `words`; per-task merge grants are available via `bb firstmate afk on --grant <id>` and no spend cap is enforced by the tool.
-     reason: the BB tool surface exposes action + words only. -->
-
-### On the captain's go, commit the posture
-
-<!-- BB-ONLY: BB commits the durable contract in one tool call. -->
-Call `firstmate_afk` with `action: "on"` and `words` set to the captain's words verbatim (or `bb firstmate afk on -- "words"`, pre-authorizing a specific away merge with `--grant <task-id>`), or commit directly when there are no words.
+     native-quote: Write the record first, in this same turn.
+     bb: firstmate_afk invokes the native contract enter command before committing the BB posture; the tool exposes words, while native supplies the default spend cap.
+     reason: BB owns the background supervision service instead of the harness daemon. -->
+<!-- BB-ONLY: BB enters before the announcement. -->
+Before other work, call `firstmate_afk` with `action: "on"` and `words` set to the captain's words verbatim (or `bb firstmate afk on --words "words"`).
+Relay the entry announcement returned by `firstmate_afk`, then read the words back in plain sentences after `firstmate_afk` completes entry.
 <!-- /BB-ONLY -->
-<!-- BB-DIVERGE
-     native: .agents/skills/afk/SKILL.md § Entering
-     native-quote: Run `bin/fm-afk-launch.sh confirm`
-     bb: native runs `fm-afk-launch.sh propose` (writes the proposal + read-back) then `confirm` on the go as two script calls; BB's `firstmate_afk on` commits the durable contract in one call, so the read-back-and-wait happens in chat before that single call.
-     reason: the BB tool has no separate propose step. -->
 
-Relay that announcement verbatim in spirit: hold-for-return only, no phone channel, your instructions are recorded and the away session will carry them out where it can, anything it is unsure of, or that needs you, waits for your return, and destructive, irreversible, and security-sensitive actions are never pre-authorizable whatever the words say.
-Re-invoking `/afk` while already away with no new words is a refresh and leaves the standing record untouched; new words replace the mandate after the same read-back, preserve the original session entry, and archive the superseded words for the return brief.
+Plain `/afk` with no words is a valid entry with no mandate; the announcement says no instructions were recorded.
+The words are the whole mandate: `bin/fm-afk-contract.sh` records them exactly as given, with no clause fields, verbs, ids, or merge-grant list, and by the captain's mandate no parser, tokenizer, classifier, or grammar reads them anywhere.
+Re-invoking `/afk` while already away with no new words is a refresh and leaves the standing record untouched; new words replace the mandate at once, preserve the original session entry, and archive the superseded words for the return brief.
 
 <!-- BB-DIVERGE
      native: .agents/skills/afk/SKILL.md
@@ -83,11 +72,12 @@ No `/back` is needed. The first genuine message is the return signal:
 Call `firstmate_afk` `action: "off"` (or `bb firstmate afk off`) before acting on the message that brought the captain back.
 <!-- /BB-ONLY -->
 
-Relay the return brief in section 9 language and in its own order: supervisor health across the away window first (any gap leads), then the captain's instructions verbatim with the away session's account of every action it took under them, then what is waiting on the captain, then what was tried and failed or could not be fixed, then what was handled, then cost.
+Relay every section of the return brief in its emitted order and in section 9 language; `bin/fm-afk-return.sh` owns that order.
 The gate keeps every open `blocked:` event until that blocker's own resolution is proven: remediate each immediately through the normal lifecycle, or explicitly reclassify it with a durable reason and close its decision key with `resolved [key=...]`, then run `bin/fm-afk-return.sh check`.
 Captain-verdict outcomes are listed under "waiting on you", but do not exempt open blockers: per-blocker provenance is deferred with no owner, and the gate fails safe by keeping every open blocker.
 A Bearings request may be answered while the gate is open, and the digest surfaces the catch-up state as a Charted Next `(return-catchup)` warning row naming what still holds it.
 Acting on the fleet - dispatching, steering, merging, or any other ordinary captain work - still waits until the check exits successfully.
+Once it does, close every task the brief lists under "Landed, cleanup due" through ordinary teardown (`bin/fm-teardown.sh <task>`, never forced; a refusal is a stop-and-investigate result) and tell the captain those workers are closed in outcome language.
 
 <!-- BB-DIVERGE
      native: .agents/skills/afk/SKILL.md § How to exit: the return

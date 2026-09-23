@@ -10,13 +10,6 @@ metadata:
   internal: true
 ---
 
-<!-- BB-SOURCE
-     native: .agents/skills/stuck-crewmate-recovery/SKILL.md
-     sha: 8c47279f54e379e8ffa86a8d3a5b568f23ccf281
-     snapshot: native-snapshot/8c47279f/.agents/skills/stuck-crewmate-recovery/SKILL.md
-     fidelity: verbatim
--->
-
 # stuck-crewmate-recovery
 
 Use this playbook when the session-start digest reports an ordinary direct report's endpoint dead or its metadata has no window, or when a direct report is stale, looping, repeatedly confused, asking a question its brief already answers, unresponsive, or when a steer failed to land.

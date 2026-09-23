@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Patch drift alarm. The three overlay patches (fm-backend.sh, fm-spawn.sh,
-// fm-teardown.sh) plus docs/configuration.md edit upstream prose/comments, so they are
+// Patch drift alarm. The overlay patches (fm-backend.sh, fm-spawn.sh,
+// fm-teardown.sh, fm-merge-local.sh) plus docs/configuration.md edit upstream prose/comments, so they are
 // version-specific: they apply cleanly at the pinned base (overlay/patch-base.txt) and
 // drift as upstream evolves. A migration re-installs the mirror against the NEW upstream
 // HEAD, and if a hunk no longer applies the install now aborts atomically (loud, mirror
@@ -65,9 +65,9 @@ try {
   // but with --dry-run so nothing is written. A failure is ANY of: non-zero exit, a
   // "FAILED" line, or an "ignored" (already/partly-applied) line.
   let drifted = false;
-  for (const p of ["firstmate-bb-backend.patch", "firstmate-bb-teardown.patch"]) {
+  for (const p of ["firstmate-bb-backend.patch", "firstmate-bb-teardown.patch", "firstmate-bb-local-merge.patch", "firstmate-bb-browser.patch"]) {
     const r = sh("patch", ["-p1", "--forward", "--batch", "--dry-run", "-i", join(OVERLAY, p)], { cwd: clone });
-    const bad = r.code !== 0 || /FAILED/.test(r.out) || /hunks ignored/.test(r.out);
+    const bad = r.code !== 0 || /FAILED/.test(r.out) || /hunks ignored|fuzz/.test(r.out);
     console.log(`\n== ${p}: ${bad ? "DRIFTED" : "applies clean"} (patch exit=${r.code}) ==`);
     if (bad) {
       drifted = true;

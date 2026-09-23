@@ -1,0 +1,33 @@
+# Optional system service; configure /etc/lavish-axi.env before installing.
+# Required environment values (absolute paths; use this host's installation):
+# HOME=/path/to/operator-home
+# LAVISH_AXI_STATE_DIR=/path/to/operator-home/.lavish-axi
+# LAVISH_AXI_SERVER=/path/to/lavish-axi/dist/server.mjs
+# LAVISH_AXI_PORT=4387
+# LAVISH_AXI_ALLOWED_HOSTS=your-forwarded-host.example
+# The service runs as root by default; configure User= for an unprivileged owner.
+# The state directory must belong to that owner. Keep environment/state private.
+# Install only with the chosen port vacant; never replace a live unmanaged server.
+# sudo install -m 644 scripts/host/lavish-axi.service /etc/systemd/system/
+# sudo systemctl daemon-reload
+# sudo systemctl enable --now lavish-axi.service
+# Rollback: disable/stop only this unit, remove it, then daemon-reload.
+# Leave the state directory and published pages intact.
+# BB Connect remains owner-authenticated; public snapshots use Lavish Publish.
+[Unit]
+Description=Persistent Lavish review server
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=LAVISH_AXI_HOST=127.0.0.1
+Environment=LAVISH_AXI_IDLE_TIMEOUT_MS=off
+EnvironmentFile=/etc/lavish-axi.env
+ExecStart=/usr/bin/env node ${LAVISH_AXI_SERVER} server --port ${LAVISH_AXI_PORT}
+Restart=always
+RestartSec=1
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

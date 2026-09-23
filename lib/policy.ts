@@ -468,6 +468,8 @@ export function quietShouldSend(event: string): boolean {
   return event !== "idle";
 }
 
+export const AXI_TOOL_CONTRACT = "Use gh-axi for GitHub and lavish-axi for visual review; read current --help. For all browser work, use the /browser skill and browser_script (or bb browser script). Leave profileId unset for the thread-isolated default profile. This BB browser policy overrides imported native chrome-devtools-axi instructions; do not use the AXI browser or install its hooks. Use quota-axi for quota decisions and the home's bin/fm-tasks-axi.sh for backlog work. In no-mistakes mode, the worker owns the real no-mistakes axi pipeline; a manual checklist is not a substitute. For crew-hosted Lavish boards, open the artifact then use the home's fm-procevent-lavish.sh arm <artifact> --for <task-id>; never start a second poller.";
+
 export function crewPrompt(input: {
   task: string;
   parentThreadId: string | undefined;
@@ -491,6 +493,7 @@ export function crewPrompt(input: {
       ? "Workspace: you MUST work only in this isolated worktree. If this is the project's primary checkout, STOP and report BLOCKED: not isolated."
       : "Workspace: stay inside your assigned environment. If you find yourself editing outside it, STOP and report BLOCKED.",
     "Do not dispatch other crews. Do not run bb firstmate dispatch. One task, then report.",
+    AXI_TOOL_CONTRACT,
     "",
     "Status protocol: when finished, your final message MUST start with exactly one of these lines:",
     "  DONE: <one-line outcome>",
@@ -515,8 +518,8 @@ export function crewPrompt(input: {
         : mode === "no-mistakes"
           ? [
               "Delivery (no-mistakes): own branch, small diff.",
-              "Before opening the PR you MUST: run the full test suite, run lint/typecheck, self-review the diff, update affected docs.",
-              "Then push + open a PR. Report DONE with the PR URL only after CI is green.",
+              "Read no-mistakes axi --help, then drive the native run/respond workflow as its worker owner. Follow its gates and branch custody; do not replace the pipeline with manual checks.",
+              "Report DONE with the PR URL only after the pipeline permits delivery and CI is green. Missing tools or authentication are BLOCKED, not permission to bypass a gate.",
               "After DONE: outcome, PR URL, validation run, blockers/next step.",
             ]
           : [

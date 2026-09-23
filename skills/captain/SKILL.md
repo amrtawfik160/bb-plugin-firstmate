@@ -17,7 +17,9 @@ This thread is now the first mate. The user is the captain.
   real firstmate toolbelt** (clones + overlays it on the host on first run;
   reused and fast-forwarded — ff-only, clean tree — after). The deck digest
   shows the real `fm-bearings-snapshot` (authoritative) next to the native BB KV
-  digest (labelled cache/fallback). Then acknowledge in one line ("Captain, on deck.
+  digest (labelled cache/fallback). Read `firstmate_contract` in full before
+  orchestrating; it supplies the current native contract beyond the SDK instruction
+  limit. Then acknowledge in one line ("Captain, on deck.
   Give me orders.") unless the digest already needs a decision.
 - If deck reports "Real firstmate: not active yet" (host missing git/gh, or the
   thread has no environment), run the one printed command **once**:
@@ -50,6 +52,17 @@ captain.
 
 ## Real firstmate is the default
 
+Run `firstmate_toolchain` once per session. It runs native bootstrap in local,
+detect-only mode, so native owns AXI version floors without fleet mutations.
+Use `/browser` and `browser_script` (or `bb browser script`) for all browser
+work. Leave `profileId` unset for this thread's isolated default profile. This
+overrides native AXI browser instructions; do not use `chrome-devtools-axi` or
+install its hooks. Use `gh-axi` for GitHub, `quota-axi` for quota decisions, and
+`lavish-axi` for visual review. Use the home's
+`bin/fm-tasks-axi.sh` for backlog operations. No-mistakes crews own the real
+`no-mistakes axi` pipeline. Read each tool's current help; missing essential
+tools block their workflows. Lavish is optional for nonvisual work.
+
 Deck activates the full firstmate toolbelt on the host: the real `bin/fm-*.sh`
 scripts, the original skills (under `.agents/skills`), and the harness adapters
 (`bin/backends/`: bb, tmux, orca, cmux, zellij, herdr) — the deck digest reports
@@ -73,7 +86,7 @@ rewrite. Two planes, one runtime:
 ### Feature flags: real transport + watch ownership + read-through
 
 All switchable in plugin settings (default off; flip back without a redeploy).
-They degrade to the current native behavior with a log line.
+Real dispatch and AFK transitions preserve native refusals and report failures.
 
 Deck also activates every real owner automatically: dispatch, watcher, backlog,
 decisions, AFK/quiet, tiered memory, durable crew messaging, state read-through,
@@ -83,18 +96,15 @@ files authoritative and non-empty memory never overwritten.
 - **`transport`** (`native` | `real`, default `native`): with `real` and real
   mode active, `firstmate_dispatch` runs end-to-end through the real
   `fm-brief.sh` + `fm-spawn.sh` (backend=bb) — the real scripts create the brief,
-  worktree, thread, `state/<id>.meta` and profile. If the real spawn fails
-  **before** a thread exists, dispatch falls back to native BB spawn; it never
-  double-spawns (fm-spawn's `BB_ABORT_CLEANUP` cleans up graceful failures, and
-  for the hard-kill window the plugin adopts the orphan thread by its ` · <id>` title suffix
-  / recorded `crewId` before falling back). Future-scheduled sends always use
-  native. **Requires `queueOwner=real`:** native fm-spawn is backlog-first (it
+  worktree, thread, `state/<id>.meta` and profile. A native refusal stops
+  dispatch and preserves its queued row. A recorded worker or identifiable orphan
+  is adopted after a partial failure. Future dispatch uses `queue --wait-until`. **Requires `queueOwner=real`:** native fm-spawn is backlog-first (it
   refuses a task with no `data/backlog.md` row), so real transport adds that row
   (id = crew id, `--kind ship|scout`) via `fm-tasks-axi.sh` **before** spawning,
   lets fm-spawn move it to In-flight, and closes it on land (`done`) / forget
   (`rm`). The row is ownership: a crew records that it owns one at dispatch, so its
   close survives a later flip of the feature flags mid-flight. With `queueOwner=kv`
-  it can't own the row, so it logs a clear message and falls back to native. Mode
+  it cannot own the row, so dispatch refuses. Mode
   reconciliation is left to native: the brief records the `Delivery contract: mode=`
   line, fm-spawn refuses a mismatch, and its advisory below-standing-posture notice
   is left intact — the plugin never synthesizes a posture "judgement" of its own.
@@ -113,18 +123,20 @@ files authoritative and non-empty memory never overwritten.
 - **Real-plane owners** (`queueOwner` / `decisionsOwner` / `afkOwner` /
   `quietOwner` / `memoryOwner`, each `kv` | `real`, default `kv`): with `real`,
   that tool routes through the native owner and writes through to the KV cache;
-  a host/read failure degrades to KV with a log. `queueOwner` → `fm-tasks-axi.sh`
+  some host/read failures still degrade to KV with a log; AFK transitions
+  require native success before committing KV. `queueOwner` → `fm-tasks-axi.sh`
   `data/backlog.md`. The plugin **supplies its own row id** (native convention:
   `add <id> <title> --kind <shape>`) and never parses `tasks-axi` output, so a row
   can't be mis-targeted or frozen by an unexpected add-output format; start/done/rm
   target the same id. Needs `tasks-axi` on the host (`npm install -g tasks-axi`,
-  min 0.2.4) — `init --real` verifies presence and version and prints the
+  min 0.2.6) — `init --real` verifies presence and version and prints the
   install/upgrade command if absent or below min (queue then degrades to the KV
   cache until satisfied). `decisionsOwner` →
   captain-held backlog tasks (`fm-captain-hold.sh`), answering also writes the
   `resolved` close to the crew's `state/<id>.status`. `afkOwner` → durable
   `state/.afk-contract` (`fm-afk-contract.sh`) so real merge/watch see the same
-  away authority + merge grants (`afk on --grant <task-id>`). `quietOwner` →
+  away mandate verbatim through `enter`; entry failure preserves the previous BB
+  posture. Native has retired merge-grant lists. `quietOwner` →
   native `state/.afk` `quiet` flag. `memoryOwner` → tiered stow files
   `data/captain.md` + `data/learnings.md` (written via stdin, so there is no
   command-size ceiling; `learnings.md` is capped at ~64 KB with the oldest lines
@@ -293,11 +305,14 @@ not just an exact project-id match: `secondmate register --project <id> --thread
 eligible for a project, the one whose `scope` best matches the task wins; if none
 fits, dispatch stays with the main home. True scope judgement is still yours —
 register the fitting mate or dispatch from its own thread. Never supervise their
-child tree from here. **BB parity limit:** a BB secondmate is a routing target
-(thread + scope + clone list), not a fully seeded independent firstmate home —
-BB's backend can only spawn non-nesting leaf crews, so a seeded `FM_HOME`, backlog
-handoff, and config/memory inheritance are not implemented here (see
-PLUGIN_OVERVIEW parity table).
+child tree from here. `secondmate register` routes to an existing thread. For
+native seeding, inheritance and lifecycle, use `fm-home-seed.sh` and then
+`fm-spawn.sh <id> <home> --secondmate --backend bb --harness bb`. The BB adapter
+launches that home as a captain with crew tools, not as a leaf worker. A failed
+handoff refuses without spawning replacement work. Run `deck` in existing
+captains to bind independent native homes; running legacy crews retain their
+original paths. See [native parity](../../docs/native-parity.md) for runtime
+limits.
 
 Full contract: [intake + briefs](references/intake-briefs.md),
 [supervision + modes](references/supervision.md),

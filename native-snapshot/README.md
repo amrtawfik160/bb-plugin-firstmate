@@ -17,3 +17,6 @@ instructions (see [CONTRIBUTING.md](../CONTRIBUTING.md) "Skill fidelity").
   the live clone.
 
 Vendored at `6f0f1399` (native HEAD at the time of the fidelity-convention PR).
+
+AFK, fmx-respond, harness-adapters, process-event-sources, and
+stuck-crewmate-recovery updated to `8c47279f`; other skills retain their declared pins.

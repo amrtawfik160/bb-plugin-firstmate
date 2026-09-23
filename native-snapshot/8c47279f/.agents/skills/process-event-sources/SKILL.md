@@ -17,13 +17,6 @@ metadata:
   internal: true
 ---
 
-<!-- BB-SOURCE
-     native: .agents/skills/process-event-sources/SKILL.md
-     sha: 8c47279f54e379e8ffa86a8d3a5b568f23ccf281
-     snapshot: native-snapshot/8c47279f/.agents/skills/process-event-sources/SKILL.md
-     fidelity: verbatim
--->
-
 # process-event-sources
 
 Load this before arming a long-polling source, before registering a deterministic condition->action watch, whenever a `check:` wake carries `procevent <adapter> <source-id> <sequence>`, and whenever the watcher headlines a `process-event source stranded` or `process-event source failed to start` wake.
