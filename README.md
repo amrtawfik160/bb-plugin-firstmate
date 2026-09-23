@@ -40,6 +40,7 @@ Crews end every task with a status verdict. `deliver` shows what they committed.
 | Command | What it does |
 | --- | --- |
 | `deck` / `session` | Mark the thread as captain, print the fleet digest |
+| `contract` | Read the complete current native supervisor contract and BB adaptations |
 | `dispatch` | Spawn a ship (isolated worktree) or scout (read-only) crew |
 | `tell` / `interrupt` / `stop` / `retry` | Live steer, hard stop, or re-run a crew |
 | `watch` / `bearings` | Wait on crews, or print the 5-section fleet digest |
@@ -54,6 +55,12 @@ Crews end every task with a status verdict. `deliver` shows what they committed.
 | `forget` | Drop a crew record, optionally archiving its thread |
 
 Ships get their own managed worktree by default, so two ships never share a checkout. Scouts are read-only. Crew threads cannot dispatch nested crews. Parent permission is the ceiling for everything a crew can do.
+
+Crew records are retained until retirement; supervision rotates through bounded batches.
+For ships, `forget --stop` refuses unreadable Git state, uncommitted changes, or commits absent from the base and local remote-tracking refs.
+An existing PR does not bypass that check.
+Native scouts use teardown's durable report and inventory gates, including when BB records `worktree: false`.
+Failed cleanup keeps the crew available for retry; `--force` explicitly permits discarding local work.
 
 Crew thread names lead with the work and keep the command id at the end: `Ship · Fix flaky login · abc12def` or `Scout · Audit auth flow · abc12def`.
 
@@ -78,6 +85,12 @@ If the bridge still reports `dynamic tool request failed` around the short hando
 Confirmed live crew reports stay durable during the captain turn and are acknowledged through Firstmate's native wake drain when that turn completes. The optional turn-end re-ring remains available, but `/captain` leaves it off so the manager starts only for a new crew event.
 
 ## The real firstmate toolbelt
+
+Run `bb firstmate toolchain` (or `firstmate_toolchain`) to check the native AXI
+dependencies and Lavish compatibility without changing fleet state. Captain
+and crew instructions use `/browser` (`browser_script`) for browser work, with
+thread-isolated profiles. Other AXI tools, including Lavish, retain their roles. See the
+[toolchain requirements and verification](docs/axi-toolchain.md).
 
 The native tools cover the liaison loop. For the full bash policy engine (brief, gate, inbox, watch, merge, teardown, afk, bearings, backlog), the plugin drives upstream firstmate's `bin/` scripts with BB as the session backend:
 
@@ -131,6 +144,8 @@ The overlay **never edits tracked firstmate files**. `overlay/install-bb-backend
 ## Credits
 
 The captain/crew protocol, status grammar, and `bin/` toolbelt come from [kunchenguid/firstmate](https://github.com/kunchenguid/firstmate). This plugin maps that surface onto BB threads, worktrees, events, and diffs rather than porting the scripts.
+
+Native policy ownership, isolated homes and remaining BB runtime limits: [native parity](docs/native-parity.md).
 
 ## License
 

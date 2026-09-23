@@ -87,7 +87,7 @@ test("break 2 — delete a BB-DIVERGE while keeping the divergent text FAILS", (
   // call stays. Marker is now load-bearing, so this must fail.
   const ps = withTemp((root) =>
     edit(root, AFK, (s) =>
-      s.replace(/<!-- BB-DIVERGE\s+native: \.agents\/skills\/afk\/SKILL\.md § Entering\s+native-quote: Run `bin\/fm-afk-launch\.sh confirm`[\s\S]*?-->\n/, ""),
+      s.replace(/<!-- BB-DIVERGE\s+native: \.agents\/skills\/afk\/SKILL\.md § Entering\s+native-quote: Write the record first, in this same turn\.[\s\S]*?-->\n/, ""),
     ),
   );
   assert.ok(flagged(ps, /not authorised by an adjacent BB-DIVERGE/), JSON.stringify(ps));
@@ -104,7 +104,7 @@ test("break 4 — move a divergence outside its fence (keep text) FAILS", () => 
   const ps = withTemp((root) =>
     edit(root, AFK, (s) =>
       s
-        .replace("<!-- BB-ONLY: BB commits the durable contract in one tool call. -->\n", "")
+        .replace("<!-- BB-ONLY: BB enters before the announcement. -->\n", "")
         .replace("\n<!-- /BB-ONLY -->\nCall `firstmate_afk` `action: \"off\"`", "\nCall `firstmate_afk` `action: \"off\"`"),
     ),
   );
@@ -143,7 +143,7 @@ test("break 7C — minting a fence by REUSING a valid native-quote FAILS", () =>
     "## Entering: `/afk [words]`\n\n" +
     "<!-- BB-DIVERGE\n" +
     "     native: .agents/skills/afk/SKILL.md § Entering\n" +
-    "     native-quote: Run `bin/fm-afk-launch.sh confirm`\n" + // reuse of the commit fence's anchor
+    "     native-quote: Write the record first, in this same turn.\n" + // reuse of the commit fence's anchor
     "     bb: an extra `firstmate_afk` call minted to dodge the size bound.\n" +
     "     reason: bogus -->\n" +
     "<!-- BB-ONLY: a plausible reason long enough -->\n" +

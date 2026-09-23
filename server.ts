@@ -1,5 +1,6 @@
 // bb-plugin-firstmate — firstmate-style crews native to BB.
-import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,6 +8,7 @@ import { type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
   afkShouldSend,
+  AXI_TOOL_CONTRACT,
   bearingsText,
   capPermission,
   crewPrompt,
@@ -71,6 +73,7 @@ const crewSchema = z.object({
   // not reap it; undefined = legacy/native-recovered crew (real plane owns its
   // meta), reapable as before.
   metaWritten: z.boolean().optional(),
+  nativeHome: z.string().optional(),
   // F2: true = this crew was dispatched through the real transport and owns a
   // native backlog row keyed on its crew id (created backlog-first, started by
   // fm-spawn). The row is ownership, so its terminal close (done on land, rm on
@@ -82,6 +85,7 @@ const crewSchema = z.object({
 type Crew = z.infer<typeof crewSchema>;
 
 const queueItemSchema = z.object({
+  nativeHome: z.string().optional(),
   id: z.string(),
   title: z.string(),
   detail: z.string().default(""),
@@ -110,6 +114,9 @@ const queueItemSchema = z.object({
 type QueueItem = z.infer<typeof queueItemSchema>;
 
 const decisionSchema = z.object({
+  nativeTaskId: z.string().optional(),
+  parentThreadId: z.string().nullish(),
+  nativeHome: z.string().optional(),
   id: z.string(),
   question: z.string(),
   options: z.array(z.string()).default([]),
@@ -184,6 +191,7 @@ const afkSchema = z.object({
   on: z.boolean(),
   words: z.string().default(""),
   since: z.string(),
+  lastEntryAt: z.string().optional(),
   held: z.array(z.string()).default([]),
 });
 type AfkState = z.infer<typeof afkSchema>;
@@ -453,8 +461,8 @@ export function captainWakeDoorbell(head: string, summary: string, opts?: { drai
 const INTERNAL_WAKE_GUIDANCE = [
   "FIRSTMATE INTERNAL WAKE — hidden from the captain.",
   "Do not quote, paraphrase, or announce this wake.",
-  "Check the crew's current state because this event may already be resolved.",
-  "Handle recoverable issues autonomously and drain every pending wake in this turn.",
+  "First call firstmate_wake to read durable reports. Reconcile current crew state where action depends on it.",
+  "Handle each actionable report, then acknowledge using the exact ackThrough and recoveryGeneration returned by firstmate_wake. Delivery alone is not acknowledgment.",
   "Reply to the captain only with a concise material outcome, review item, needed decision, credential/login request, or blocker that still remains after recovery.",
 ].join(" ");
 
@@ -715,8 +723,11 @@ function normalizeFmScript(raw: string): string {
 }
 
 function fmTimeoutMs(script: string, overrideSec: number | undefined): number {
+  // A native drain can spend over 30 seconds folding a busy fleet's status logs.
+  // Short agent-selected budgets kill useful work and invite repeated drains.
+  const minimumSec = script === "wake-drain" ? 180 : 15;
   if (overrideSec !== undefined && Number.isFinite(overrideSec)) {
-    return Math.min(1800, Math.max(15, overrideSec)) * 1000;
+    return Math.min(1800, Math.max(minimumSec, overrideSec)) * 1000;
   }
   return ["spawn", "watch", "supervise-daemon", "session-start", "pr-merge"].includes(script) ? 600000 : 180000;
 }
@@ -847,6 +858,14 @@ function extractPaths(value: unknown): string[] {
   return out;
 }
 
+function checkedDiffPaths(value: unknown): string[] {
+  const files = Array.isArray(value) ? value : asRecord(value)["files"];
+  if (!Array.isArray(files) || files.some(file => extractPaths([file]).length !== 1)) {
+    throw new Error("Cannot verify worktree contents: invalid diff response. Crew retained.");
+  }
+  return extractPaths(files);
+}
+
 interface PrFacts {
   available: boolean;
   url: string;
@@ -908,6 +927,7 @@ const CAPTAIN_TOOLS = [
   "firstmate_tell",
   "firstmate_interrupt",
   "firstmate_watch",
+  "firstmate_contract",
   "firstmate_bearings",
   "firstmate_wake",
   "firstmate_deliver",
@@ -929,11 +949,13 @@ const CAPTAIN_TOOLS = [
   "firstmate_supervision",
   "firstmate_migrate_state",
   "firstmate_scripts",
+  "firstmate_toolchain",
   "firstmate_fm",
 ] as const;
 
 const CAPTAIN_VISIBILITY_CONTRACT = [
   "You are the first mate. The user is the captain.",
+  "Before orchestrating, read firstmate_contract and run firstmate_toolchain once per session. Missing essential dependencies block their workflows; Lavish is required only for visual work.",
   "Never do crew work in this thread; dispatch it. Parent permission is a ceiling.",
   "Captain-facing visibility follows real firstmate section 9: talk in outcomes, not mechanics.",
   "Do not narrate tool calls or surface successful bookkeeping, automatic fixes, retries, routine progress, waiting, or internal supervision mechanics.",
@@ -949,9 +971,10 @@ const BB_SKILL_RUNTIME_CONTRACT = [
   "BB adapter for every upstream firstmate skill:",
   "keep its policy and decision rules, but execute through BB.",
   "Translate bin/fm-<name>.sh calls to firstmate_fm with script=<name> and the same arguments; use bb firstmate fm <name> only when a shell command is required.",
-  "In imported skills, ../../../AGENTS.md means the injected real captain contract, and ../../../bin, data, state, config, and docs refer to fmHome rather than this plugin directory.",
+  "In imported skills, ../../../AGENTS.md means the complete contract returned by firstmate_contract, and ../../../bin, data, state, config, and docs refer to fmHome rather than this plugin directory.",
   "Map workers, panes, and tabs to BB crew threads via firstmate_dispatch/tell/interrupt/retry/stop. Call firstmate_watch once per batch; it hands off to private durable wakes. End the turn; never retry or poll.",
   "Use BB interactions for captain questions and approvals.",
+  AXI_TOOL_CONTRACT,
   "Treat tmux, herdr, zellij, cmux, orca, and harness-specific hook setup as reference material unless the active backend explicitly names that runtime.",
 ].join(" ");
 
@@ -999,7 +1022,7 @@ function threadIdOf(value: unknown): string {
 }
 
 // Minimum tasks-axi the native backlog lib pins (fm-tasks-axi-lib.sh FM_TASKS_AXI_MIN).
-const TASKS_AXI_MIN = "0.2.4";
+const TASKS_AXI_MIN = "0.2.6";
 
 /** True when semver `have` >= `min` (numeric x.y.z compare; missing parts = 0). */
 export function versionAtLeast(have: string, min: string): boolean {
@@ -1084,7 +1107,7 @@ function isBlankTitle(title: unknown): boolean {
 export default async function plugin(bb: BbPluginApi) {
   bb.log.info("loaded");
 
-  const settings = bb.settings.define({
+  const baseSettings = bb.settings.define({
     firstmateRepo: {
       type: "string",
       label: "Firstmate repo URL (used by init --real)",
@@ -1107,7 +1130,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
     captainContract: {
       type: "string",
-      label: "Captain-contract excerpt from fmHome/AGENTS.md, injected into captain sessions (set by init --real).",
+      label: "Legacy contract excerpt (unused). Captains read the current full contract through firstmate_contract.",
       default: "",
     },
     captainMemory: {
@@ -1160,25 +1183,25 @@ export default async function plugin(bb: BbPluginApi) {
     },
     decisionsOwner: {
       type: "select",
-      label: "Decisions owner: kv (BB KV list) or real (captain-held backlog tasks via fm-captain-hold.sh; answering also writes the resolved close to state/<id>.status). Real writes through to KV; falls back to KV with a log.",
+      label: "Decisions owner: kv (BB KV list) or real (captain-held backlog tasks via fm-captain-hold.sh; answering also writes the resolved close to state/<id>.status). Native mutations must succeed before BB acknowledges them.",
       options: ["kv", "real"],
       default: "kv",
     },
     afkOwner: {
       type: "select",
-      label: "AFK owner: kv (BB KV flag) or real (fm-afk-contract.sh + state/.afk-contract, so real merge/watch see the same away authority). Real writes through to KV; falls back to KV with a log.",
+      label: "AFK owner: kv (BB KV flag) or real (fm-afk-contract.sh + state/.afk-contract, so real merge/watch see the same away authority). Native mutations must succeed before BB acknowledges them.",
       options: ["kv", "real"],
       default: "kv",
     },
     quietOwner: {
       type: "select",
-      label: "Quiet owner: kv (BB KV flag) or real (state/.afk flag first line = quiet, the native afk-skill quiet mode). Real writes through to KV; falls back to KV with a log.",
+      label: "Quiet owner: kv (BB KV flag) or real (state/.afk flag first line = quiet, the native afk-skill quiet mode). Native mutations must succeed before BB acknowledges them.",
       options: ["kv", "real"],
       default: "kv",
     },
     memoryOwner: {
       type: "select",
-      label: "Memory owner: kv (two KV blobs) or real (tiered files data/captain.md + data/learnings.md with stow markers). Real writes through to KV; falls back to KV with a log.",
+      label: "Memory owner: kv (two KV blobs) or real (tiered files data/captain.md + data/learnings.md with stow markers). Native mutations must succeed before BB acknowledges them.",
       options: ["kv", "real"],
       default: "kv",
     },
@@ -1205,7 +1228,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
     turnEndGuardBudget: {
       type: "number",
-      label: "Back-to-back turn-end re-rings per captain thread before throttling to a slow floor (~15m) — it never abandons the captain with undrained wakes; resets when the queue drains.",
+      label: "Maximum automatic turn-end re-rings for unchanged wake contents; new contents reset the budget.",
       default: 3,
     },
     defaultProvider: {
@@ -1251,35 +1274,83 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  // The real captain contract (fmHome/AGENTS.md excerpt), cached so the sync
-  // agents.configure() callback can inject it. Loaded from the persisted setting
-  // at start and refreshed by initRealMode. Empty until real mode is initialized.
-  let captainContractCache = "";
-  try {
-    captainContractCache = (await settings.get()).captainContract;
-  } catch {
-    // default empty
+  type HomeScope = { captain?: string; home?: string; host?: string };
+  const homeScope = new AsyncLocalStorage<HomeScope>();
+  const captainHomes = new Map<string, string>();
+  for (const key of await bb.storage.kv.list("native-home:")) {
+    const home = await bb.storage.kv.get<string>(key);
+    if (typeof home === "string") captainHomes.set(key.slice("native-home:".length), home);
   }
-  const CAPTAIN_CONTRACT_MAX = 3400;
-
-  // Read fmHome/AGENTS.md on the host, keep a bounded excerpt, and cache+persist
-  // it so captain sessions load the real contract. Best-effort.
-  async function refreshCaptainContract(hostId: string, fmHome: string, signal?: AbortSignal): Promise<void> {
-    try {
-      const path = `${fmHome}/AGENTS.md`;
-      const res = await runOnHost(hostId, `[ -f ${shQuote(path)} ] && head -c 20000 ${shQuote(path)} || true`, 20_000, signal);
-      const raw = res.output.trim();
-      if (raw === "") return;
-      const excerpt = raw.length > CAPTAIN_CONTRACT_MAX ? `${raw.slice(0, CAPTAIN_CONTRACT_MAX)}…` : raw;
-      captainContractCache = excerpt;
-      try {
-        await settings.experimental_set({ captainContract: excerpt });
-      } catch {
-        // cache still holds it for this process
-      }
-    } catch {
-      // best-effort; captain keeps the built-in instruction
+  const settings = {
+    ...baseSettings,
+    async get() {
+      const value = await baseSettings.get();
+      const scope = homeScope.getStore();
+      return scope?.home ? { ...value, fmHome: scope.home, ...(scope.host ? { fmHostId: scope.host } : {}) } : value;
+    },
+  };
+  async function inCaptainHome<T>(captain: string | undefined, fn: () => Promise<T>): Promise<T> {
+    const home = captain ? await bb.storage.kv.get<string>(`native-home:${captain}`) : null;
+    const host = captain ? await bb.storage.kv.get<string>(`native-home-host:${captain}`) : null;
+    if (captain && typeof home === "string") captainHomes.set(captain, home);
+    return homeScope.run({ captain, home: typeof home === "string" ? home : undefined, host: typeof host === "string" ? host : undefined }, fn);
+  }
+  const homeProvisioners = new Map<string, Promise<string | null>>();
+  async function ensureCaptainHome(ctx: unknown, signal?: AbortSignal): Promise<string | null> {
+    const captain = ctxString(ctx, "threadId") ?? "";
+    let provision = homeProvisioners.get(captain);
+    if (!provision) {
+      provision = provisionCaptainHome(ctx, signal).finally(() => homeProvisioners.delete(captain));
+      homeProvisioners.set(captain, provision);
     }
+    const home = await provision;
+    const scope = homeScope.getStore();
+    if (scope && scope.captain === captain && home) {
+      scope.home = home;
+      scope.host = await bb.storage.kv.get<string>(`native-home-host:${captain}`) ?? undefined;
+    }
+    return home;
+  }
+  async function provisionCaptainHome(ctx: unknown, signal?: AbortSignal): Promise<string | null> {
+    const captain = ctxString(ctx, "threadId");
+    const base = (await baseSettings.get()).fmHome.trim();
+    if (!captain || !base) return null;
+    if (!/^[A-Za-z0-9_-]+$/.test(captain)) throw new Error("Invalid captain identity.");
+    const existing = await bb.storage.kv.get<string>(`native-home:${captain}`);
+    if (typeof existing === "string" && existing) {
+      const scope = homeScope.getStore();
+      if (scope) scope.home = existing;
+      return existing;
+    }
+    // Never detach an active away mandate from its native authority record.
+    if ((await readAfk(captain))?.on) throw new Error("Return from away mode before isolating this captain's home.");
+    const hostId = await resolveHostId(undefined, ctx);
+    const home = `${base}-bb-homes/${captain}`;
+    const clone = await runOnHost(hostId, [
+      "set -eu",
+      `mkdir -p ${shQuote(`${base}-bb-homes`)}`,
+      `if [ ! -d ${shQuote(`${home}/.git`)} ]; then git clone --shared --no-hardlinks ${shQuote(base)} ${shQuote(home)}; fi`,
+      `mkdir -p ${shQuote(`${home}/config`)} ${shQuote(`${home}/state`)} ${shQuote(`${home}/data`)}`,
+      // Copy configuration once; runtime records and backlog are never inherited.
+      `if [ ! -f ${shQuote(`${home}/config/bb-captain`)} ]; then`,
+      `  if [ -d ${shQuote(`${base}/config`)} ]; then cp -a ${shQuote(`${base}/config/.`)} ${shQuote(`${home}/config/`)}; fi`,
+      `  printf '%s\\n' ${shQuote(captain)} > ${shQuote(`${home}/config/bb-captain`)}`,
+      `fi`,
+    ].join("\n"), 180_000, signal);
+    requireNativeSuccess(clone, "captain home initialization");
+    await installBbBackend(hostId, home, ctxString(ctx, "projectId"), 180_000, signal);
+    // Old worker prompts still name the old home; pin them there before activating
+    // this home. Never move records underneath a running worker.
+    await mutateCrews(crews => crews.map(crew => ({ ...crew, nativeHome: crew.nativeHome ?? base })));
+    await writeQueue((await readQueue()).map(row => ({ ...row, nativeHome: row.nativeHome ?? base })));
+    await writeDecisions((await readDecisions()).map(row => ({ ...row, nativeHome: row.nativeHome ?? base })));
+    await bb.storage.kv.set(`native-home:${captain}`, home);
+    captainHomes.set(captain, home);
+    await bb.storage.kv.set(`native-home-host:${captain}`, hostId);
+    await bb.sdk.threads.updatePluginMetadata({ threadId: captain, set: { nativeHome: home, captain: "true" } });
+    const scope = homeScope.getStore();
+    if (scope) scope.home = home;
+    return home;
   }
 
   // The real firstmate skills inventory (fmHome/.agents/skills), version-pinned to
@@ -1423,6 +1494,10 @@ export default async function plugin(bb: BbPluginApi) {
           CAPTAIN_MEMORY_MAX,
         );
       }
+      if (homeScope.getStore()?.home) {
+        await bb.storage.kv.set(memoryCacheKey("captain-recall"), next);
+        return;
+      }
       if (next === captainMemoryCache) return;
       captainMemoryCache = next;
       try {
@@ -1446,23 +1521,79 @@ export default async function plugin(bb: BbPluginApi) {
     return out.slice(0, cap);
   }
 
-  async function writeCrews(crews: Crew[]): Promise<void> {
-    await bb.storage.kv.set(CREWS_KEY, crews.slice(0, MAX_CREWS));
+  let crewMutation = Promise.resolve();
+  async function mutateCrews(update: (crews: Crew[]) => Crew[] | Promise<Crew[]>): Promise<Crew[]> {
+    const previous = crewMutation;
+    let release!: () => void;
+    crewMutation = new Promise<void>(resolve => { release = resolve; });
+    await previous;
+    try {
+      const crews = await update(await readCrews());
+      await bb.storage.kv.set(CREWS_KEY, crews);
+      return crews;
+    } finally { release(); }
   }
   async function readCrews(): Promise<Crew[]> {
-    return readList(CREWS_KEY, crewSchema, MAX_CREWS);
+    // MAX_CREWS bounds one supervision pass, never the durable register.
+    return readList(CREWS_KEY, crewSchema, Number.POSITIVE_INFINITY);
+  }
+  async function removeCrew(crew: Crew): Promise<void> {
+    await mutateCrews(async crews => {
+      // A sweep may already have read the old thread metadata. Keep a durable
+      // tombstone so that result cannot resurrect an explicitly retired thread.
+      await bb.storage.kv.set(`crew-retired:${crew.threadId}`, true);
+      return crews.filter(c => c.id !== crew.id || c.threadId !== crew.threadId);
+    });
+    if (!isSecondmateRoute(crew)) {
+      try {
+        await bb.sdk.threads.updatePluginMetadata({ threadId: crew.threadId, set: { crew: "false" }, remove: ["crewId"] });
+      } catch (error) {
+        bb.log.warn(`retired crew ${crew.id}: thread metadata cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
   }
   async function readQueue(): Promise<QueueItem[]> {
-    return readList(QUEUE_KEY, queueItemSchema, MAX_QUEUE);
+    return readList(QUEUE_KEY, queueItemSchema, Number.POSITIVE_INFINITY);
+  }
+  const ledgerMutations = new Map<string, Promise<void>>();
+  async function serializeLedger<T>(key: string, operation: () => Promise<T>): Promise<T> {
+    const previous = ledgerMutations.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    ledgerMutations.set(key, pending);
+    await previous;
+    try { return await operation(); } finally {
+      release();
+      if (ledgerMutations.get(key) === pending) ledgerMutations.delete(key);
+    }
+  }
+  function withLedgerOperation<T>(name: string, captain: string | undefined, operation: () => Promise<T>): Promise<T> {
+    return ["queue", "decide", "firstmate_queue", "firstmate_decide"].includes(name)
+      ? serializeLedger(`operation:${captain ?? "legacy"}`, operation)
+      : operation();
   }
   async function writeQueue(items: QueueItem[]): Promise<void> {
-    await bb.storage.kv.set(QUEUE_KEY, items.slice(0, MAX_QUEUE));
+    await serializeLedger(QUEUE_KEY, async () => {
+      const owner = homeScope.getStore();
+      if (owner?.home && owner.captain) {
+        const foreign = (await readQueue()).filter(row => row.parentThreadId !== owner.captain);
+        items = [...items.filter(row => row.parentThreadId === owner.captain), ...foreign];
+      }
+      await bb.storage.kv.set(QUEUE_KEY, items);
+    });
   }
   async function readDecisions(): Promise<Decision[]> {
-    return readList(DECISIONS_KEY, decisionSchema, MAX_DECISIONS);
+    return readList(DECISIONS_KEY, decisionSchema, Number.POSITIVE_INFINITY);
   }
   async function writeDecisions(items: Decision[]): Promise<void> {
-    await bb.storage.kv.set(DECISIONS_KEY, items.slice(0, MAX_DECISIONS));
+    await serializeLedger(DECISIONS_KEY, async () => {
+      const owner = homeScope.getStore();
+      if (owner?.home && owner.captain) {
+        const foreign = (await readDecisions()).filter(row => row.parentThreadId !== owner.captain);
+        items = [...items.filter(row => row.parentThreadId === owner.captain), ...foreign];
+      }
+      await bb.storage.kv.set(DECISIONS_KEY, items);
+    });
   }
   async function readDone(): Promise<DoneEntry[]> {
     return readList(DONE_KEY, doneSchema, MAX_DONE);
@@ -1509,15 +1640,18 @@ export default async function plugin(bb: BbPluginApi) {
   async function isQuiet(captainThreadId?: string): Promise<boolean> {
     return (await readQuiet(captainThreadId)).on;
   }
-  async function setQuiet(action: "on" | "off", captainThreadId?: string): Promise<string> {
+  function setQuiet(action: "on" | "off", captainThreadId?: string): Promise<string> {
+    return withAfkTransition(() => setQuietLocked(action, captainThreadId));
+  }
+  async function setQuietLocked(action: "on" | "off", captainThreadId?: string): Promise<string> {
     const prev = await readQuiet(captainThreadId);
     if (action === "on") {
-      await writeQuiet({ on: true, held: prev.held }, captainThreadId);
       await projectQuiet(true, captainThreadId);
+      await writeQuiet({ on: true, held: prev.held }, captainThreadId);
       return "Quiet on";
     }
-    await writeQuiet({ on: false, held: [] }, captainThreadId);
     await projectQuiet(false, captainThreadId);
+    await writeQuiet({ on: false, held: [] }, captainThreadId);
     const wake = await wakeResumeBrief(captainThreadId);
     if (prev.held.length === 0) return `Quiet off${wake}`;
     return `Quiet off\nHeld while quiet:\n${prev.held.join("\n---\n")}${wake}`;
@@ -1586,10 +1720,6 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  // F5: after the turn-end re-ring budget, keep re-ringing at this slow floor rather
-  // than abandoning the captain idle-with-undrained-wakes.
-  const TURN_END_FLOOR_MS = 15 * 60_000;
-
   // Enqueue a durable crew→captain report. F1: the wake row is only a POINTER —
   // `fm-wake-drain` collapses rows per (kind,key) and acks the older unseen ones
   // away, so distinct reports for one crew would be LOST if the text lived in the
@@ -1614,6 +1744,7 @@ export default async function plugin(bb: BbPluginApi) {
   // existing behavior is preserved when there is no owning captain.
   function wakeStateDir(fmHome: string, captainThreadId: string | undefined): string {
     const base = `${fmHome}/state`;
+    if (captainThreadId && (captainHomes.get(captainThreadId) === fmHome || fmHome.endsWith(`-bb-homes/${captainThreadId}`))) return base;
     if (captainThreadId === undefined || captainThreadId === "") return base;
     return `${base}/cap-${captainThreadId.replace(/[^A-Za-z0-9._-]/g, "_")}`;
   }
@@ -1622,76 +1753,19 @@ export default async function plugin(bb: BbPluginApi) {
     return { FM_STATE_OVERRIDE: wakeStateDir(fmHome, captainThreadId) };
   }
 
-  type CaptainWakeReceipt = {
-    seq: number;
-    crewId: string;
-    hostId: string;
-    fmHome: string;
-  };
-
-  const LIVE_WAKE_RECEIPTS_PREFIX = "live-wake-receipts:";
-  const liveWakeReceiptLocks = new Map<string, Promise<void>>();
-
-  function liveWakeReceiptsKey(captainThreadId: string): string {
-    return `${LIVE_WAKE_RECEIPTS_PREFIX}${captainThreadId}`;
-  }
-
-  function parseLiveWakeReceipts(value: unknown): CaptainWakeReceipt[] {
-    if (!Array.isArray(value)) return [];
-    const out: CaptainWakeReceipt[] = [];
-    for (const item of value) {
-      const row = asRecord(item);
-      const seq = row["seq"];
-      const crewId = row["crewId"];
-      const hostId = row["hostId"];
-      const fmHome = row["fmHome"];
-      if (
-        typeof seq === "number" && Number.isSafeInteger(seq) && seq > 0 &&
-        typeof crewId === "string" && crewId !== "" &&
-        typeof hostId === "string" && hostId !== "" &&
-        typeof fmHome === "string" && fmHome !== ""
-      ) out.push({ seq, crewId, hostId, fmHome });
-    }
-    return out;
-  }
-
-  async function withLiveWakeReceiptLock<T>(captainThreadId: string, fn: () => Promise<T>): Promise<T> {
-    const previous = liveWakeReceiptLocks.get(captainThreadId) ?? Promise.resolve();
-    let release!: () => void;
-    const current = new Promise<void>((resolve) => { release = resolve; });
-    const tail = previous.then(() => current);
-    liveWakeReceiptLocks.set(captainThreadId, tail);
-    await previous;
-    try {
-      return await fn();
-    } finally {
-      release();
-      if (liveWakeReceiptLocks.get(captainThreadId) === tail) liveWakeReceiptLocks.delete(captainThreadId);
-    }
-  }
-
-  async function recordLiveWakeReceipt(captainThreadId: string, receipt: CaptainWakeReceipt): Promise<void> {
-    await withLiveWakeReceiptLock(captainThreadId, async () => {
-      const key = liveWakeReceiptsKey(captainThreadId);
-      const rows = parseLiveWakeReceipts(await bb.storage.kv.get<unknown>(key));
-      const next = [...rows.filter((row) => !(row.hostId === receipt.hostId && row.seq === receipt.seq)), receipt];
-      await bb.storage.kv.set(key, next);
-    });
-  }
-
   async function enqueueCaptainWake(
     crew: Crew,
     display: string,
     signal?: AbortSignal,
-  ): Promise<{ durable: boolean; receipt: CaptainWakeReceipt | null }> {
-    const fmHome = (await settings.get()).fmHome.trim();
-    if (fmHome === "" || isSecondmateRoute(crew)) return { durable: false, receipt: null };
+  ): Promise<{ durable: boolean }> {
+    const fmHome = (crew.parentThreadId ? await bb.storage.kv.get<string>(`native-home:${crew.parentThreadId}`) : null) || await crewNativeHome(crew);
+    if (fmHome === "" || isSecondmateRoute(crew)) return { durable: false };
     let hostId: string;
     try {
       hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined, signal);
     } catch (error) {
       if (isAbortError(error)) throw error;
-      return { durable: false, receipt: null };
+      return { durable: false };
     }
     const lib = `${fmHome}/bin/fm-wake-lib.sh`;
     // D6: enqueue into the OWNING captain's scoped state dir, never the shared global
@@ -1724,28 +1798,35 @@ export default async function plugin(bb: BbPluginApi) {
       const res = await runOnHost(hostId, script, 15_000, signal);
       if (res.exitCode !== 0) {
         bb.log.warn(`fm wake enqueue failed crew=${crew.id} exit=${res.exitCode}`);
-        return { durable: false, receipt: null };
+        return { durable: false };
       }
       bb.log.info(`fm wake enqueued crew=${crew.id} key=${key} (note→status + pointer)`);
-      const rawSeq = /(?:^|\n)FM_BB_WAKE_SEQ=(\d+)(?:\n|$)/.exec(res.output)?.[1];
-      const seq = rawSeq === undefined ? NaN : Number(rawSeq);
-      return {
-        durable: true,
-        receipt: Number.isSafeInteger(seq) && seq > 0 ? { seq, crewId: crew.id, hostId, fmHome } : null,
-      };
+      return { durable: true };
     } catch (error) {
       if (isAbortError(error)) throw error;
       bb.log.warn(`fm wake enqueue failed crew=${crew.id} ${error instanceof Error ? error.message : String(error)}`);
-      return { durable: false, receipt: null };
+      return { durable: false };
     }
   }
 
+  const notificationChains = new Map<string, Promise<void>>();
   async function notifyCaptain(crew: Crew, event: string, output: string | null, signal?: AbortSignal): Promise<void> {
+    const previous = notificationChains.get(crew.threadId) ?? Promise.resolve();
+    const run = previous.catch(() => {}).then(() => notifyCaptainOnce(crew, event, output, signal));
+    notificationChains.set(crew.threadId, run);
+    try { await run; } finally { if (notificationChains.get(crew.threadId) === run) notificationChains.delete(crew.threadId); }
+  }
+  async function notifyCaptainOnce(crew: Crew, event: string, output: string | null, signal?: AbortSignal): Promise<void> {
     if (crew.parentThreadId === null) return;
     const parentThreadId = crew.parentThreadId;
+    const deliveryKey = `captain-delivery:${crew.threadId}`;
+    const signature = createHash("sha256").update(`${event}\n${output ?? ""}`).digest("hex");
+    if (await bb.storage.kv.get(deliveryKey) === signature) return;
     let kind = event;
     let prUrl = "";
-    if (event === "idle") {
+    const outcome = parseOutcome(output);
+    // A PR can exist while the crew is blocked, failed, or still working.
+    if (event === "idle" && verdictOf(outcome) === "DONE") {
       const pr = await prForCrew(crew);
       if (pr.url !== "") {
         kind = "review";
@@ -1754,10 +1835,12 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const afk = await readAfk(parentThreadId);
     const quietState = await readQuiet(parentThreadId);
-    const postureEvent = kind === "needs-decision" ? "idle" : kind;
+    const verdict = verdictOf(outcome);
+    const postureEvent = kind === "idle" && (verdict === "BLOCKED" || verdict === "FAILED")
+      ? "error"
+      : kind === "needs-decision" ? "idle" : kind;
     const quietHold = quietState.on && !quietShouldSend(postureEvent);
     const afkHold = afk?.on === true && !afkShouldSend(postureEvent);
-    const outcome = parseOutcome(output);
     // An in-band BLOCKED/FAILED ends the turn as thread.idle → kind "idle", so the
     // head/glyph/next MUST come from the PARSED VERDICT, not the raw kind — else a
     // failure renders as "✅ … done" and a FAILED crew is offered `deliver`. Only
@@ -1802,8 +1885,9 @@ export default async function plugin(bb: BbPluginApi) {
     // Default kv is byte-for-byte the previous fire-and-forget behavior.
     const wake = (await settings.get()).notifyOwner === "real"
       ? await enqueueCaptainWake(crew, text, signal)
-      : { durable: false, receipt: null };
+      : { durable: false };
     const durable = wake.durable;
+    if (durable) await bb.storage.kv.set(deliveryKey, signature);
     const summary = outcome ?? (output !== null && output !== "" ? truncate(output.replace(/\n/g, " "), 160) : "");
     // Part C: the drain hint adds something only when the durable queue holds context this
     // doorbell does not already carry — an open decision the captain must answer. For a plain
@@ -1816,7 +1900,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (quietHold || afkHold) {
       // The durable wake already persisted the report; do not also hold a redundant
       // doorbell (the captain drains the queue on return). KV path unchanged.
-      if (durable) return;
+      if (durable) { await bb.storage.kv.set(deliveryKey, signature); return; }
       const evicted: string[] = [];
       if (quietHold) {
         const pushed = pushHeld(quietState.held, text);
@@ -1836,15 +1920,14 @@ export default async function plugin(bb: BbPluginApi) {
       if (evicted.length > 0) await publishFleet();
       return;
     }
-    const delivered = await deliverToCaptain(parentThreadId, doorbell, crew.id, signal);
-    // The native supervisor acknowledges after the captain's handling turn. Keep
-    // the wake durable while that turn is running, then let the captain idle event
-    // consume only the contiguous wakes whose live steer was confirmed. Failed or
-    // held deliveries have no receipt and therefore remain recoverable.
-    if (delivered && wake.receipt !== null) {
-      await recordLiveWakeReceipt(parentThreadId, wake.receipt);
+    if (await deliverToCaptain(parentThreadId, doorbell, crew.id, signal)) {
+      await bb.storage.kv.set(deliveryKey, signature);
     }
     await publishFleet();
+  }
+
+  async function crewNativeHome(crew: Crew): Promise<string> {
+    return crew.nativeHome ?? (await baseSettings.get()).fmHome.trim();
   }
 
   async function crewStatus(crew: Crew, signal?: AbortSignal): Promise<string> {
@@ -1885,7 +1968,7 @@ export default async function plugin(bb: BbPluginApi) {
   // an fmHome there is no native plane to mirror, so trust the crew's own shape.
   async function foldKind(crew: Crew, hostId?: string): Promise<string> {
     if (isSecondmateRoute(crew)) return "secondmate";
-    const fmHome = (await settings.get()).fmHome.trim();
+    const fmHome = await crewNativeHome(crew);
     if (fmHome === "") return crew.shape;
     try {
       const hid = hostId ?? (await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined));
@@ -1915,7 +1998,7 @@ export default async function plugin(bb: BbPluginApi) {
     crew: Crew,
     output?: string | null,
   ): Promise<{ lines: string[]; kind: string }> {
-    const fmHome = (await settings.get()).fmHome.trim();
+    const fmHome = await crewNativeHome(crew);
     if (fmHome !== "" && !isSecondmateRoute(crew)) {
       try {
         const hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
@@ -1939,7 +2022,7 @@ export default async function plugin(bb: BbPluginApi) {
   // `crew <id>` reads it as stale). Best-effort, real-mode only; a bad key or an
   // unreachable host is a silent no-op — the steer message itself still lands.
   async function appendResolvedStatus(crew: Crew, key: string, note: string): Promise<boolean> {
-    const fmHome = (await settings.get()).fmHome.trim();
+    const fmHome = await crewNativeHome(crew);
     if (fmHome === "") return false;
     if (isSecondmateRoute(crew)) return false;
     if (!/^[A-Za-z0-9._-]+$/.test(key)) return false; // fm-classify-lib slug charset
@@ -2014,7 +2097,7 @@ export default async function plugin(bb: BbPluginApi) {
     model?: string;
     provider?: string;
   }): Promise<boolean> {
-    const fmHome = (await settings.get()).fmHome.trim();
+    const fmHome = await crewNativeHome(input.crew);
     if (fmHome === "") return false;
     let hostId = input.hostId;
     if (hostId === undefined || hostId === "") {
@@ -2078,7 +2161,7 @@ export default async function plugin(bb: BbPluginApi) {
   // Best-effort and idempotent (never overwrites an existing brief); a missing
   // script or host failure is silent — the crew already has the structured prompt.
   async function publishFmBrief(crew: Crew, hostId: string | undefined, task: string): Promise<boolean> {
-    const fmHome = (await settings.get()).fmHome.trim();
+    const fmHome = await crewNativeHome(crew);
     if (fmHome === "") return false;
     if (isSecondmateRoute(crew)) return false;
     let host = hostId;
@@ -2140,31 +2223,29 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function dropFmMeta(crew: Crew): Promise<void> {
-    const fmHome = (await settings.get()).fmHome.trim();
+    const fmHome = await crewNativeHome(crew);
     if (fmHome === "") return;
     let hostId: string;
     try {
       hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
-    } catch {
-      return;
+    } catch (error) {
+      throw new Error(`Cannot remove native metadata for ${crew.id}: ${error instanceof Error ? error.message : String(error)}`);
     }
     const dest = `${fmHome}/state/${crew.id}.meta`;
     try {
       const result = await runOnHost(hostId, `rm -f ${shQuote(dest)}`, 15_000);
       if (result.exitCode !== 0) {
-        bb.log.warn(`fm meta drop failed crew=${crew.id} exit=${result.exitCode}`);
+        throw new Error(`exit ${result.exitCode}`);
       }
     } catch (error) {
-      bb.log.warn(
-        `fm meta drop failed crew=${crew.id} ${error instanceof Error ? error.message : String(error)}`,
-      );
+      throw new Error(`Native metadata cleanup failed for ${crew.id}; crew retained for retry: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
   // True when a crew already has an authoritative state/<id>.meta on its host.
   // Used by the migration so it never overwrites the real state of active work.
   async function fmMetaExists(crew: Crew): Promise<boolean | null> {
-    const fmHome = (await settings.get()).fmHome.trim();
+    const fmHome = await crewNativeHome(crew);
     if (fmHome === "") return null;
     let hostId: string;
     try {
@@ -2186,8 +2267,8 @@ export default async function plugin(bb: BbPluginApi) {
   // Read a single key from a real state/<id>.meta on the host. Returns the value,
   // "" when the key is absent, or null when the host/state is unreadable. Used by
   // the real transport to learn the thread id the real fm-spawn.sh created.
-  async function readFmMetaField(hostId: string, crewId: string, key: string): Promise<string | null> {
-    const fmHome = (await settings.get()).fmHome.trim();
+  async function readFmMetaField(hostId: string, crewId: string, key: string, home?: string): Promise<string | null> {
+    const fmHome = home ?? (await settings.get()).fmHome.trim();
     if (fmHome === "") return null;
     const dest = `${fmHome}/state/${crewId}.meta`;
     try {
@@ -2278,7 +2359,7 @@ export default async function plugin(bb: BbPluginApi) {
       // Broad fallback: no origin filter (catches a not-yet-tagged CLI spawn).
       return await match(rowsOf(await bb.sdk.threads.list({ includeHidden: true, limit: 50 })));
     } catch {
-      // list unavailable → caller native-spawns
+      // Leave dispatch refused when orphan discovery is unavailable.
     }
     return null;
   }
@@ -2287,8 +2368,7 @@ export default async function plugin(bb: BbPluginApi) {
   // fm-brief.sh + fm-spawn.sh (backend=bb) so the real scripts create the brief,
   // the worktree, the thread and state/<id>.meta — with harness/provider/model/
   // effort all threaded into the BB thread. Returns the thread id the real spawn
-  // created, or null when the spawn failed BEFORE any thread existed (the caller
-  // then falls back to native dispatch). Never double-spawns: if a bb_thread_id
+  // created; failures remain refusals. Never double-spawns: if a bb_thread_id
   // is already recorded (even on a later partial failure) that id is returned.
   async function dispatchViaRealTransport(
     crew: Crew,
@@ -2302,10 +2382,10 @@ export default async function plugin(bb: BbPluginApi) {
     hostId: string,
     signal?: AbortSignal,
   ): Promise<string | null> {
-    const fmHome = (await settings.get()).fmHome.trim();
+    const fmHome = await crewNativeHome(crew);
     if (fmHome === "") return null;
     // A crew may already carry a real thread (idempotent re-dispatch). Never spawn twice.
-    const existing = await readFmMetaField(hostId, crew.id, "bb_thread_id");
+    const existing = await readFmMetaField(hostId, crew.id, "bb_thread_id", await crewNativeHome(crew));
     if (existing !== null && existing !== "") return existing;
     // C1: native fm-spawn.sh is BACKLOG-FIRST — it refuses a task with no
     // `data/backlog.md` row ("task <id> has no backlog item in this home, so
@@ -2313,19 +2393,16 @@ export default async function plugin(bb: BbPluginApi) {
     // owns the worker. Creating and owning that row is the queue plane's job, so
     // real transport REQUIRES queueOwner=real: only then can the plugin add the row
     // before spawning and drive its done/rm on land/forget. Without it the two
-    // planes disagree and every real spawn would refuse. Fall back to native (which
-    // needs no backlog row) with a clear, actionable log rather than failing
-    // obscurely at the fm-spawn gate.
+    // planes disagree and dispatch must stop at the ownership boundary.
     if (!(await queueIsReal())) {
       bb.log.error(
-        `real transport requires queueOwner=real: native fm-spawn.sh refuses to dispatch a task with no backlog record, and only queueOwner=real lets the plugin create+own that row (add <id> --kind <shape>, then done/rm on land/forget). queueOwner is currently kv — set queueOwner=real in the Firstmate plugin settings. Falling back to native dispatch for crew=${crew.id}.`,
+        `real transport requires queueOwner=real: native fm-spawn.sh refuses to dispatch a task with no backlog record, and only queueOwner=real lets the plugin create+own that row (add <id> --kind <shape>, then done/rm on land/forget). queueOwner is currently kv — set queueOwner=real in the Firstmate plugin settings. Dispatch refused for crew=${crew.id}.`,
       );
-      return null;
+      throw new Error("Real transport requires queueOwner=real.");
     }
     const projectDir = await projectCheckoutPath(input.projectId);
     if (projectDir === null || projectDir === "") {
-      bb.log.warn(`real transport: no project checkout for crew=${crew.id}; falling back to native`);
-      return null;
+      throw new Error(`No project checkout for real dispatch ${crew.id}.`);
     }
     // C2: a ship whose delivery mode carries less rigor than the project's native
     // standing posture makes fm-spawn print an advisory deviation notice. We do NOT
@@ -2347,13 +2424,7 @@ export default async function plugin(bb: BbPluginApi) {
     // endpoint exists; the plugin only seeds the queued row and later closes it.
     const backlogAdd = await projectQueueAdd(crew.id, backlogTitleOf(input.task), crew.shape, input.projectId);
     if (!backlogAdd.ok) {
-      // (c) The backlog write failed or tasks-axi is unavailable. Never spawn a
-      // worker no record owns; fall back to native dispatch with a loud, actionable
-      // error. No orphan row: a failed add left nothing to clean up.
-      bb.log.error(
-        `real transport: backlog-first add FAILED for crew=${crew.id} (fm-tasks-axi.sh/tasks-axi unreachable or errored). fm-spawn.sh would refuse a task with no backlog record, so NOT spawning a worker no record owns — falling back to native dispatch. Fix tasks-axi on the fleet host, then re-dispatch.`,
-      );
-      return null;
+      throw new Error(`Backlog add failed for ${crew.id}; repair tasks-axi before dispatching a worker.`);
     }
     // D5: emit a positive signature for the backlog-FIRST step, paired with the
     // `real transport spawn crew=<id> ok` line the spawn emits below. Together they
@@ -2380,6 +2451,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (crew.providerId !== null && crew.providerId !== "") env.FM_BB_PROVIDER = crew.providerId;
     if (capped !== undefined) env.FM_BB_PERMISSION_MODE = capped;
     let spawnFailed = false;
+    let spawnFailure = "Native spawn returned without a recorded worker.";
     try {
       const res = await runFmScript({
         script: "spawn",
@@ -2394,6 +2466,7 @@ export default async function plugin(bb: BbPluginApi) {
       });
       if (res.exitCode !== 0) {
         spawnFailed = true;
+        spawnFailure = `fm-spawn exit ${res.exitCode}: ${res.output.slice(-2000)}`;
         // LOUD (B1): a non-zero fm-spawn exit (e.g. the brief-refusal that made every
         // real spawn fail) must be an error, not a muffled warn.
         bb.log.error(`real transport spawn crew=${crew.id} exit=${res.exitCode} ${res.output.slice(0, 600)}`);
@@ -2402,11 +2475,12 @@ export default async function plugin(bb: BbPluginApi) {
       }
     } catch (error) {
       spawnFailed = true;
+      spawnFailure = error instanceof Error ? error.message : String(error);
       bb.log.warn(`real transport spawn crew=${crew.id} ${error instanceof Error ? error.message : String(error)}`);
     }
     // Even on a non-zero exit, a thread may already exist — read the meta and
     // honour it rather than native-spawning a duplicate.
-    const threadId = await readFmMetaField(hostId, crew.id, "bb_thread_id");
+    const threadId = await readFmMetaField(hostId, crew.id, "bb_thread_id", await crewNativeHome(crew));
     if (threadId !== null && threadId !== "") return threadId;
     // No recorded thread. fm-spawn may still have created one and been hard-killed
     // before writing bb_thread_id. Adopt that orphan instead of native-spawning a
@@ -2416,17 +2490,9 @@ export default async function plugin(bb: BbPluginApi) {
       bb.log.info(`real transport adopted orphan thread ${orphan} for crew=${crew.id} (fm-spawn left no bb_thread_id; spawnFailed=${spawnFailed})`);
       return orphan;
     }
-    // (c) Genuinely no worker exists. Remove the backlog row we seeded so the
-    // backlog never carries a row no worker owns (the mirror of fm-spawn's own
-    // refusal) before falling back to native. A queue-dispatched crew's row is
-    // owned by the queue plane (its id is a live QueueItem) — that lifecycle drives
-    // its own start/done/rm, so leave it be. rm of an absent row is a harmless warn.
-    const ownedByQueue = (await readQueue()).some((q) => q.id === crew.id);
-    if (!ownedByQueue) {
-      await runTasksAxi(["rm", crew.id], { projectId: input.projectId });
-      bb.log.warn(`real transport: removed orphan backlog row ${crew.id} (spawn produced no thread; falling back to native)`);
-    }
-    return null;
+    // Native retains queued work when policy refuses a spawn (for example an AFK cap).
+    // Keep that row available for reconciliation instead of deleting it and bypassing the gate.
+    throw new Error(`${spawnFailure} Task ${crew.id} remains in the native backlog.`);
   }
 
   // A crew is terminal — its task is over — when its turn failed, its thread is
@@ -2461,7 +2527,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (fmHome === "") {
       throw new Error("Real mode is off (no fmHome). Run: bb firstmate init --real");
     }
-    const crews = await readCrews();
+    const crews = (await readCrews()).filter(crew => !homeScope.getStore()?.captain || crew.parentThreadId === homeScope.getStore()?.captain);
     const imported: string[] = [];
     const skippedExisting: string[] = [];
     const skippedSecondmate: string[] = [];
@@ -2495,7 +2561,7 @@ export default async function plugin(bb: BbPluginApi) {
       // The meta now exists — clear any known-failed flag so read-through can reap
       // it normally once the real plane tears it down.
       if (crew.metaWritten === false) {
-        await writeCrews((await readCrews()).map((c) => (c.id === crew.id ? { ...c, metaWritten: undefined } : c)));
+        await mutateCrews(crews => crews.map((c) => (c.id === crew.id ? { ...c, metaWritten: undefined } : c)));
       }
       await publishFmBrief(crew, undefined, crew.task);
       imported.push(crew.id);
@@ -2529,6 +2595,7 @@ export default async function plugin(bb: BbPluginApi) {
       const items = await readQueue();
       let dirty = false;
       for (const item of items) {
+        if (homeScope.getStore()?.home && (item.parentThreadId !== captainThreadId || (item.nativeHome && item.nativeHome !== fmHome))) continue;
         if (item.status === "done" || item.status === "dropped") { out.queue.skipped++; continue; }
         // Already projected (has a row id): never re-add — keeps migrate-owners
         // idempotent. We reuse the KV item id as the backlog row id (native
@@ -2546,6 +2613,7 @@ export default async function plugin(bb: BbPluginApi) {
 
     if (await decisionsIsReal()) {
       for (const d of await readDecisions()) {
+        if (homeScope.getStore()?.home && (d.parentThreadId !== captainThreadId || (d.nativeHome && d.nativeHome !== fmHome))) continue;
         if (d.status === "answered") { out.decisions.skipped++; continue; }
         if (d.status === "deferred") await projectDecisionDefer(d, d.deferredUntil);
         else await projectDecisionAsk(d);
@@ -2595,32 +2663,29 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  // Committed-but-UNPUSHED work in a crew's worktree: commits on the branch vs its
-  // merge base that are NOT on a remote (no open/merged PR). This is unlanded work
-  // exactly like uncommitted changes — our hard rule is never to destroy it. If a
-  // PR exists the commits are on the forge (recoverable), so those do not count.
-  // Returns the changed file paths (empty when there is no unpushed committed work,
-  // or when the base/diff cannot be read — the branch is never deleted by teardown,
-  // see the note at the environments.delete call, so an undetectable case still does
-  // not lose the commits; the guard just cannot cite them).
-  async function committedUnpushedFiles(envId: string, prUrl: string): Promise<string[]> {
-    if (prUrl !== "") return []; // pushed to a PR → on the remote, recoverable
-    let base: string | null = null;
-    try {
-      const env = asRecord(await bb.sdk.environments.get({ environmentId: envId }));
-      base =
-        (typeof env["mergeBaseBranch"] === "string" && env["mergeBaseBranch"]) ||
-        (typeof env["defaultBranch"] === "string" && env["defaultBranch"]) ||
-        (typeof env["baseBranch"] === "string" && env["baseBranch"]) ||
-        null;
-    } catch {
-      return [];
+  // Compare commit reachability, not changed files or the existence of a PR.
+  // A crew can commit again after opening a PR, including an empty commit.
+  async function committedUnpushedCommits(envId: string): Promise<string[]> {
+    const env = asRecord(await bb.sdk.environments.get({ environmentId: envId }));
+    const base =
+      (typeof env["mergeBaseBranch"] === "string" && env["mergeBaseBranch"]) ||
+      (typeof env["defaultBranch"] === "string" && env["defaultBranch"]) ||
+      (typeof env["baseBranch"] === "string" && env["baseBranch"]) || null;
+    const host = env["hostId"];
+    const path = env["path"];
+    if (!base || typeof host !== "string" || !host || typeof path !== "string" || !path) {
+      throw new Error("Cannot verify committed work: environment has no host, path, or base branch.");
     }
-    if (base === null) return [];
-    const res = await bb.sdk.environments
-      .diffFiles({ environmentId: envId, target: "branch_committed", mergeBaseBranch: base })
-      .catch(() => null);
-    return res === null ? [] : extractPaths(res);
+    // The base permits clean local-only worktrees without a remote. Use local
+    // remote-tracking refs; teardown does not fetch or require network access.
+    const result = await runOnHost(host,
+      `git -C ${shQuote(path)} rev-list --max-count=20 HEAD --not --remotes ${shQuote(base)} --`, 15_000);
+    if (result.exitCode !== 0) throw new Error("Cannot verify committed work: Git reachability check failed. Crew retained.");
+    const commits = result.output.trim().split(/\r?\n/).filter(Boolean);
+    if (commits.some(sha => !/^[a-f0-9]{40,64}$/.test(sha))) {
+      throw new Error("Cannot verify committed work: invalid Git response. Crew retained.");
+    }
+    return commits;
   }
 
   // The exact names of a PR's non-green checks, via gh (mirrors fm-pr-merge's
@@ -2663,9 +2728,11 @@ export default async function plugin(bb: BbPluginApi) {
   // captain never sees another's crews by default (D8). Write/eviction is unchanged: the
   // owner filter is a pure view over the returned array, applied after all KV writes.
   async function listCrewsAll(signal?: AbortSignal): Promise<Crew[]> {
-    const crews = await readCrews();
+    let crews = await readCrews();
     const known = new Set(crews.map((c) => c.threadId));
     try {
+      const savedOffset = await bb.storage.kv.get<unknown>("crew-recovery-offset");
+      const offset = typeof savedOffset === "number" && Number.isSafeInteger(savedOffset) && savedOffset >= 0 ? savedOffset : 0;
       // Abort-aware + timeboxed prologue: the supervisor calls this BEFORE its per-crew
       // abort loop, so an un-guarded threads.list / getPluginMetadata sweep here (host
       // round-trips, worse under a degraded BB API) would pin crew-watch past the shutdown
@@ -2675,6 +2742,7 @@ export default async function plugin(bb: BbPluginApi) {
           originPluginId: "firstmate",
           includeHidden: true,
           limit: 50,
+          offset,
         }),
         signal,
         STUCK_HOST_CALL_MS,
@@ -2693,8 +2761,7 @@ export default async function plugin(bb: BbPluginApi) {
         .filter(
           (r): r is { threadId: string; projectId: string; parentThreadId: unknown } =>
             typeof r.threadId === "string" && typeof r.projectId === "string" && !known.has(r.threadId),
-        )
-        .slice(0, 20);
+        );
       const recovered = await Promise.all(
         missing.map(async (row): Promise<Crew | null> => {
           try {
@@ -2709,6 +2776,7 @@ export default async function plugin(bb: BbPluginApi) {
             const id = typeof meta["crewId"] === "string" ? meta["crewId"] : row.threadId.slice(0, 8);
             return {
               id,
+              nativeHome: typeof meta["nativeHome"] === "string" ? meta["nativeHome"] : (await baseSettings.get()).fmHome.trim(),
               task: typeof meta["task"] === "string" ? meta["task"] : "(recovered crew)",
               projectId: row.projectId,
               threadId: row.threadId,
@@ -2726,14 +2794,18 @@ export default async function plugin(bb: BbPluginApi) {
           }
         }),
       );
-      let dirty = false;
-      for (const crew of recovered) {
-        if (crew !== null && !crews.some((c) => c.id === crew.id)) {
-          crews.push(crew);
-          dirty = true;
-        }
-      }
-      if (dirty) await writeCrews(crews);
+      if (recovered.some(c => c !== null)) {
+        crews = await mutateCrews(async current => {
+          for (const crew of recovered) {
+            if (crew !== null && !current.some(c => c.id === crew.id) &&
+                await bb.storage.kv.get(`crew-retired:${crew.threadId}`) !== true) current.push(crew);
+          }
+          return current;
+        });
+      } else crews = await readCrews();
+      // One bounded page per pass; new threads reset the order, so wrap after
+      // the last page instead of permanently stranding older metadata.
+      if (!signal?.aborted) await bb.storage.kv.set("crew-recovery-offset", rows.length === 50 ? offset + 50 : 0);
     } catch {
       // kv alone still works
     }
@@ -2751,7 +2823,7 @@ export default async function plugin(bb: BbPluginApi) {
             // R5: never reap a crew whose dispatch-time meta write is known to have
             // failed (metaWritten===false) — its current absence is not proof of
             // teardown. Secondmate routes have no meta and are always exempt.
-            const kept = crews.filter((c) => isSecondmateRoute(c) || ids.has(c.id) || c.metaWritten === false);
+            const kept = crews.filter((c) => isSecondmateRoute(c) || (c.nativeHome ?? (s.fmHome.trim())) !== s.fmHome.trim() || ids.has(c.id) || c.metaWritten === false);
             if (kept.length !== crews.length) {
               for (const gone of crews) {
                 if (!kept.includes(gone)) {
@@ -2759,8 +2831,9 @@ export default async function plugin(bb: BbPluginApi) {
                   await markQueueForCrew(gone.id, "done").catch(() => {});
                 }
               }
-              await writeCrews(kept);
-              return kept;
+              const removed = crews.filter(c => !kept.includes(c));
+              return mutateCrews(current => current.filter(c => !removed.some(gone =>
+                gone.id === c.id && gone.threadId === c.threadId && c.metaWritten !== false)));
             }
           }
         }
@@ -2894,15 +2967,14 @@ export default async function plugin(bb: BbPluginApi) {
           posture: `secondmate:${input.mode}`,
           createdAt: new Date().toISOString(),
         };
-        await writeCrews([routed, ...(await readCrews())]);
+        await mutateCrews(crews => [routed, ...crews]);
         return routed;
       } catch (error) {
-        bb.log.warn(
-          `secondmate route to ${mate.threadId} failed (${error instanceof Error ? error.message : String(error)}); spawning a normal crew instead.`,
-        );
+        throw new Error(`Secondmate route to ${mate.threadId} failed; delivery may be uncertain. Reconcile that handoff before retrying: ${String(error)}`);
       }
     }
     const crew: Crew = {
+      nativeHome: (await settings.get()).fmHome.trim(),
       id: input.crewId !== undefined && input.crewId !== "" ? input.crewId : randomUUID().slice(0, 8),
       task,
       projectId: input.projectId,
@@ -2916,25 +2988,18 @@ export default async function plugin(bb: BbPluginApi) {
       posture: input.shape === "scout" ? "scout" : input.mode,
       createdAt: new Date().toISOString(),
     };
-    // Transport swap: when the real transport is selected and real mode is active,
-    // dispatch through the real fm-brief.sh + fm-spawn.sh (backend=bb) so the real
-    // scripts own the brief/worktree/thread/meta/profile. Native BB dispatch is the
-    // automatic fallback if the real spawn fails before a thread exists — and a
-    // future-scheduled send always uses native (fm-spawn has no sendAt).
+    // Real mode delegates policy to native; a refusal cannot select a less strict transport.
     const cur = await settings.get();
     const scheduledFuture = input.sendAt !== undefined && input.sendAt > Date.now();
-    if (cur.transport === "real" && cur.fmHome.trim() !== "" && !scheduledFuture) {
+    if (cur.transport === "real") {
+      if (cur.fmHome.trim() === "") throw new Error("Real transport needs fmHome. Run init --real before dispatch.");
+      if (scheduledFuture) throw new Error("Real transport does not support sendAt. Queue the task with waitUntil instead.");
       try {
         const rtHost = await resolveHostForProject(input.projectId, input.parentThreadId);
         const realThreadId = await dispatchViaRealTransport(
           crew,
-          {
-            task: input.task,
-            projectId: input.projectId,
-            parentThreadId: input.parentThreadId,
-            title: input.title,
-            permissionMode: input.permissionMode,
-          },
+          { task: input.task, projectId: input.projectId, parentThreadId: input.parentThreadId,
+            title: input.title, permissionMode: input.permissionMode },
           rtHost,
         );
         if (realThreadId !== null && realThreadId !== "") {
@@ -2943,7 +3008,7 @@ export default async function plugin(bb: BbPluginApi) {
           // fm-spawn started the row — record that this crew owns a real row so its
           // close survives a later settings flip.
           crew.backlogRow = true;
-          await writeCrews([crew, ...(await readCrews())]);
+          await mutateCrews(crews => [crew, ...crews.filter(c => c.id !== crew.id)]);
           await publishFleet();
           // fm-spawn ran ~30s while this crew may already have ended its first turn;
           // its thread.idle/failed fired before this record carried the threadId and
@@ -2953,16 +3018,11 @@ export default async function plugin(bb: BbPluginApi) {
           // native publishFmMeta/publishFmBrief backfills would only duplicate.
           return crew;
         }
-        // LOUD (B1): a real-transport dispatch that produced no thread is a
-        // degradation, not routine info — a permanent silent fallback must never be
-        // able to masquerade as a working real transport again.
-        bb.log.error(
-          `real transport FAILED for crew=${crew.id} (fm-spawn produced no bb_thread_id); falling back to native dispatch — real transport is NOT working`,
-        );
+        throw new Error(`Native dispatch produced no recorded worker for ${crew.id}; reconcile that task before retrying.`);
       } catch (error) {
-        bb.log.warn(
-          `real transport error crew=${crew.id}; using native dispatch: ${error instanceof Error ? error.message : String(error)}`,
-        );
+        const reason = error instanceof Error ? error.message : String(error);
+        bb.log.error(`real transport refused crew=${crew.id}: ${reason}`);
+        throw new Error(`Real dispatch ${crew.id} stopped: ${reason}`);
       }
     }
     const capped = capPermission(input.permissionMode, await parentPermission(input.parentThreadId));
@@ -2999,6 +3059,7 @@ export default async function plugin(bb: BbPluginApi) {
       pluginMetadata: {
         crew: "true",
         crewId: crew.id,
+        nativeHome: crew.nativeHome ?? "",
         task: task.slice(0, 500),
         shape: input.shape,
         posture: crew.posture,
@@ -3006,7 +3067,7 @@ export default async function plugin(bb: BbPluginApi) {
       },
     });
     crew.threadId = threadIdOf(spawned);
-    await writeCrews([crew, ...(await readCrews())]);
+    await mutateCrews(crews => [crew, ...crews.filter(c => c.id !== crew.id)]);
     await publishFleet();
     const scheduled = input.sendAt !== undefined && input.sendAt > Date.now();
     const okMeta = await publishFmMeta({ crew, hostId, scheduled, model: input.model, provider: input.providerId });
@@ -3015,7 +3076,7 @@ export default async function plugin(bb: BbPluginApi) {
     // absence" so read-through can't reap a live crew whose meta never landed.
     if ((await settings.get()).fmHome.trim() !== "" && !okMeta) {
       crew.metaWritten = false;
-      await writeCrews((await readCrews()).map((c) => (c.id === crew.id ? crew : c)));
+      await mutateCrews(crews => crews.map((c) => (c.id === crew.id ? crew : c)));
     }
     await publishFmBrief(crew, hostId, input.task);
     // Same record-after-spawn race as the real transport, though the native window
@@ -3073,6 +3134,7 @@ export default async function plugin(bb: BbPluginApi) {
       pluginMetadata: {
         crew: "true",
         crewId: crew.id,
+        nativeHome: crew.nativeHome ?? "",
         task: crew.task.slice(0, 500),
         shape: crew.shape,
         posture: crew.posture,
@@ -3087,7 +3149,7 @@ export default async function plugin(bb: BbPluginApi) {
       model: model ?? null,
       reasoningLevel: reasoningLevel ?? null,
     };
-    await writeCrews((await readCrews()).map((c) => (c.id === crew.id ? next : c)));
+    await mutateCrews(crews => crews.map((c) => (c.id === crew.id ? next : c)));
     if (oldThreadId !== next.threadId) {
       try { await bb.sdk.threads.archive({ threadId: oldThreadId }); } catch { /* best effort */ }
     }
@@ -3188,7 +3250,7 @@ export default async function plugin(bb: BbPluginApi) {
   async function sendViaInbox(crew: Crew, message: string, queue: boolean): Promise<string | null> {
     const current = await settings.get();
     if (current.tellOwner !== "real") return null;
-    const fmHome = current.fmHome.trim();
+    const fmHome = await crewNativeHome(crew);
     if (fmHome === "" || isSecondmateRoute(crew)) return null;
     let hostId: string | null = null;
     try {
@@ -3640,10 +3702,32 @@ export default async function plugin(bb: BbPluginApi) {
       throw new Error(`Crew ${crew.id} is a secondmate route, not a ship to merge.`);
     }
     const local = crew.posture === "local-only" || (crew.shape === "ship" && posture.mode === "local-only");
+    const nativeHome = await crewNativeHome(crew);
+    if (nativeHome !== "") {
+      const hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
+      if (local) {
+        const result = await runFmScript({ script: "merge-local", args: [crew.id], fmHome: nativeHome, hostId, timeoutMs: 180_000 });
+        requireNativeSuccess(result, `local merge ${crew.id}`);
+        await retireLanded(crew, "local ff-only", "");
+        return `${result.output.trim()}\nCrew ${crew.id} retired.`;
+      }
+      const pr = prFacts(await bb.sdk.environments.pullRequest({ environmentId: envId }));
+      if (!pr.available || !pr.url) throw new Error(`No PR for crew ${crew.id}.`);
+      if (pr.state !== "merged") {
+        const args = [crew.id, pr.url];
+        if (allowRedCheck?.trim()) args.push("--allow-red", allowRedCheck.trim());
+        const result = await runFmScript({ script: "pr-merge", args, fmHome: nativeHome, hostId, timeoutMs: 180_000 });
+        requireNativeSuccess(result, `PR merge ${crew.id}`);
+        const landed = prFacts(await bb.sdk.environments.pullRequest({ environmentId: envId }));
+        if (landed.state !== "merged") return `${result.output.trim()}\nLanding not yet confirmed; crew ${crew.id} retained. Check the merge queue before teardown.`;
+      }
+      await retireLanded(crew, "merged through native gate", pr.url);
+      return `Merged ${pr.url}\nCrew ${crew.id} retired.`;
+    }
     if (local) return mergeLocal(crew, envId);
     if (crew.posture === "no-mistakes" || posture.mode === "no-mistakes") {
       const dirty = extractPaths(
-        await bb.sdk.environments.diffFiles({ environmentId: envId, target: "uncommitted" }).catch(() => null),
+        await bb.sdk.environments.diffFiles({ environmentId: envId, target: "uncommitted" }),
       );
       if (dirty.length > 0) {
         throw new Error(`no-mistakes: ${dirty.length} uncommitted file(s) remain (${dirty.slice(0, 5).join(", ")}).`);
@@ -3698,18 +3782,18 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function retireLanded(crew: Crew, outcome: string, pr: string): Promise<void> {
-    await recordDone({ task: crew.task.slice(0, 200), shape: crew.shape, crewId: crew.id, outcome, pr, parentThreadId: crew.parentThreadId });
-    await markQueueForCrew(crew.id, "done");
-    // Close the crew's own backlog row (real transport seeds one keyed on crew.id).
-    await realBacklogTransitionForCrew(crew, "done");
-    await writeCrews((await readCrews()).filter((c) => c.id !== crew.id));
-    if (!(await isCaptainThread(crew.threadId))) {
-      try { await bb.sdk.threads.archive({ threadId: crew.threadId }); } catch { /* best effort */ }
-      try { await bb.sdk.threads.stop({ threadId: crew.threadId }); } catch { /* best effort */ }
+    const nativeHome = await crewNativeHome(crew);
+    if (nativeHome !== "" && !isSecondmateRoute(crew)) {
+      const hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
+      const result = await runFmScript({ script: "teardown", args: [crew.id], fmHome: nativeHome, hostId, timeoutMs: 180_000 });
+      requireNativeSuccess(result, `teardown ${crew.id} (work landed; cleanup pending)`);
+    } else if (!(await isCaptainThread(crew.threadId))) {
+      await bb.sdk.threads.stop({ threadId: crew.threadId });
+      await bb.sdk.threads.archive({ threadId: crew.threadId });
     }
-    // Retire both representations atomically: without this the real state/<id>.meta
-    // ledger keeps a landed crew that GitHub and the KV cache have both dropped.
-    await dropFmMeta(crew);
+    await markQueueForCrew(crew.id, "done");
+    await recordDone({ task: crew.task.slice(0, 200), shape: crew.shape, crewId: crew.id, outcome, pr, parentThreadId: crew.parentThreadId });
+    await removeCrew(crew);
     await publishFleet();
   }
 
@@ -3738,48 +3822,36 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function forgetCrew(id: string, stop: boolean, force: boolean): Promise<string> {
-    const crews = await readCrews();
-    let crew = crews.find((entry) => entry.id === id);
-    if (crew === undefined) {
-      const recovered = await findCrew(id);
-      if (recovered === undefined) throw new Error(`No crew ${id}. Run "bb firstmate crews".`);
-      if (stop && (await isCaptainThread(recovered.threadId))) {
-        throw new Error(
-          "Refusing to archive the captain thread. Forget the crew without --stop.",
-        );
-      }
-      try {
-        await bb.sdk.threads.updatePluginMetadata({
-          threadId: recovered.threadId,
-          set: { crew: "false" },
-          remove: ["crewId"],
-        });
-      } catch {
-        // metadata-only
-      }
-      if (stop) {
-        try { await bb.sdk.threads.archive({ threadId: recovered.threadId }); } catch { /* */ }
-        try { await bb.sdk.threads.stop({ threadId: recovered.threadId }); } catch { /* */ }
-      }
-      await dropFmMeta(recovered);
-      await realBacklogTransitionForCrew(recovered, "rm");
-      await dropNudge(id);
-      return `Forgot crew ${id} (was metadata-only)`;
-    }
-    await writeCrews(crews.filter((entry) => entry.id !== id));
+    const crew = (await readCrews()).find(entry => entry.id === id) ?? await findCrew(id);
+    if (crew === undefined) throw new Error(`No crew ${id}. Run "bb firstmate crews".`);
     if (stop && isSecondmateRoute(crew) && !force) {
-      await writeCrews([crew, ...(await readCrews())]);
       throw new Error(`Refusing: ${id} is a secondmate route. Drop with forget (no --stop), or --force to also stop that thread.`);
     }
     let worktreeRemoved = false;
+    let nativeTeardown = false;
     if (stop) {
       if (await isCaptainThread(crew.threadId)) {
-        await writeCrews([crew, ...(await readCrews())]);
         throw new Error(
           "Refusing to archive the captain thread. Forget the crew without --stop.",
         );
       }
-      const envId = await threadEnv(crew.threadId);
+      const nativeHome = await crewNativeHome(crew);
+      if (crew.shape === "scout" && !isSecondmateRoute(crew) && nativeHome !== "") {
+        // Native owns scout report/hold gates and the resulting backlog transition.
+        // KV worktree=false does not rule out a native-managed BB worktree.
+        const hostId = await resolveHostForProject(crew.projectId, crew.threadId);
+        const result = await runFmScript({
+          script: "teardown", args: [crew.id, ...(force ? ["--force"] : [])],
+          fmHome: nativeHome, hostId, timeoutMs: 180_000,
+        });
+        requireNativeSuccess(result, `teardown ${crew.id} (crew retained for retry)`);
+        nativeTeardown = true;
+      }
+    }
+    if (stop && !nativeTeardown) {
+      const thread = await bb.sdk.threads.get({ threadId: crew.threadId });
+      const envId = thread.environmentId;
+      if (!force && crew.worktree && !envId) throw new Error(`Cannot verify worktree for crew ${id}: environment unavailable.`);
       // A crew's dedicated managed worktree is the environment to tear down. A
       // shared-env crew (crew.worktree === false) runs in the project-default
       // environment — never delete that; deleting it would take out the shared
@@ -3790,8 +3862,8 @@ export default async function plugin(bb: BbPluginApi) {
         try {
           const env = await bb.sdk.environments.get({ environmentId: envId });
           if (asRecord(env)["isWorktree"] === true) worktreeEnvId = envId;
-        } catch {
-          // env unreadable — skip worktree removal (do not guess)
+        } catch (error) {
+          if (!force) throw new Error(`Cannot verify environment for crew ${id}: ${error instanceof Error ? error.message : String(error)}`);
         }
       }
       if (!force && envId !== null) {
@@ -3801,26 +3873,22 @@ export default async function plugin(bb: BbPluginApi) {
         // either, loudly, leaving the thread AND the worktree intact. This makes
         // the safety DELIBERATE, not a side effect of the teardown primitive
         // happening to preserve the branch (see the note at environments.delete).
-        const diff = await bb.sdk.environments
-          .diffFiles({ environmentId: envId, target: "uncommitted" })
-          .catch(() => null);
-        const dirty = diff === null ? [] : extractPaths(diff);
+        const diff = await bb.sdk.environments.diffFiles({ environmentId: envId, target: "uncommitted" });
+        const dirty = checkedDiffPaths(diff);
         if (dirty.length > 0) {
-          await writeCrews([crew, ...(await readCrews())]);
           throw new Error(
             `Refusing: crew ${id} has ${dirty.length} uncommitted file(s) (${dirty.slice(0, 5).join(", ")}${dirty.length > 5 ? "…" : ""}). Deliver first, or re-run with --force to discard.`,
           );
         }
-        const unpushed = await committedUnpushedFiles(envId, (await prForCrew(crew)).url);
+        const unpushed = await committedUnpushedCommits(envId);
         if (unpushed.length > 0) {
-          await writeCrews([crew, ...(await readCrews())]);
           throw new Error(
-            `Refusing: crew ${id} has committed but UNPUSHED work on its branch (${unpushed.length} file(s): ${unpushed.slice(0, 5).join(", ")}${unpushed.length > 5 ? "…" : ""}). Those commits exist only in this worktree's branch. Open a PR / push first, or re-run with --force to discard.`,
+            `Refusing: crew ${id} has committed but UNPUSHED work on its branch (${unpushed.length >= 20 ? "at least " : ""}${unpushed.length} commit(s): ${unpushed.slice(0, 5).map(sha => sha.slice(0, 12)).join(", ")}${unpushed.length > 5 ? "…" : ""}). Those commits exist only in this worktree's branch. Open a PR / push first, or re-run with --force to discard.`,
           );
         }
       }
-      try { await bb.sdk.threads.archive({ threadId: crew.threadId }); } catch { /* */ }
-      try { await bb.sdk.threads.stop({ threadId: crew.threadId }); } catch { /* */ }
+      await bb.sdk.threads.stop({ threadId: crew.threadId });
+      await bb.sdk.threads.archive({ threadId: crew.threadId });
       // D2: native fm-teardown removes the git worktree; do the same so worktrees
       // do not accumulate on disk after forget. Only reached once the tree is clean
       // and has no committed-unpushed work (or --force), so no unlanded work is
@@ -3840,9 +3908,7 @@ export default async function plugin(bb: BbPluginApi) {
           await bb.sdk.environments.delete({ environmentId: worktreeEnvId });
           worktreeRemoved = true;
         } catch (error) {
-          bb.log.warn(
-            `forget ${id}: worktree env ${worktreeEnvId} not removed: ${error instanceof Error ? error.message : String(error)}`,
-          );
+          throw new Error(`forget ${id}: worktree ${worktreeEnvId} not removed; crew retained for retry: ${error instanceof Error ? error.message : String(error)}`);
         }
       }
     }
@@ -3863,10 +3929,13 @@ export default async function plugin(bb: BbPluginApi) {
     } catch {
       // best effort
     }
+    if (!nativeTeardown) {
+      await dropFmMeta(crew);
+      // forget/drop removes the crew's own backlog row (dropped on forget, C1).
+      await realBacklogTransitionForCrew(crew, "rm");
+    }
+    await removeCrew(crew);
     await publishFleet();
-    await dropFmMeta(crew);
-    // forget/drop removes the crew's own backlog row (dropped on forget, C1).
-    await realBacklogTransitionForCrew(crew, "rm");
     await dropNudge(id);
     return `Forgot crew ${id}${worktreeRemoved ? " (worktree removed)" : ""}`;
   }
@@ -3887,6 +3956,8 @@ export default async function plugin(bb: BbPluginApi) {
       if (typeof id !== "string") throw new Error(`No machine ${machineFlag}. See bb machine list.`);
       return id;
     }
+    const scopedHost = homeScope.getStore()?.host;
+    if (scopedHost) return scopedHost;
     const threadId = asRecord(ctx)["threadId"];
     if (typeof threadId !== "string") throw new Error("No machine: pass --machine <id-or-name> (see bb machine list).");
     const envId = await threadEnv(threadId);
@@ -3933,14 +4004,16 @@ export default async function plugin(bb: BbPluginApi) {
     const terminalId = asRecord(session)["id"] as string;
     let nextSeq = 0;
     let output = "";
+    let lastOutputError = "";
     try {
       const deadline = Date.now() + timeoutMs;
       for (;;) {
         if (signal?.aborted) throw new Error("Aborted.");
-        if (Date.now() >= deadline) throw new Error("Timed out waiting for host command.");
+        if (Date.now() >= deadline) throw new Error(`Timed out waiting for host command (host ${hostId}, terminal ${terminalId}, budget ${timeoutMs / 1000}s).${lastOutputError ? ` Last output read: ${lastOutputError}` : ""}`);
         const cur = await bb.sdk.terminals.get({ terminalId });
         const status = asRecord(cur)["status"];
         if (status === "disconnected") throw new Error("Terminal disconnected.");
+        let outputRead = false;
         try {
           const chunk = await bb.sdk.terminals.output({
             terminalId,
@@ -3950,14 +4023,17 @@ export default async function plugin(bb: BbPluginApi) {
           const rec = asRecord(chunk);
           if (typeof rec["nextSeq"] === "number") nextSeq = rec["nextSeq"];
           output += decodeChunks(chunk);
+          outputRead = true;
+          lastOutputError = "";
         } catch (error) {
+          lastOutputError = error instanceof Error ? error.message : String(error);
           bb.log.debug(
             `host terminal output terminal=${terminalId} status=${status} ${error instanceof Error ? error.message : String(error)}`,
           );
         }
         const parsed = parseHostRc(output);
         if (parsed !== null) return parsed;
-        if (status === "exited") {
+        if (status === "exited" && outputRead) {
           const exitCode = asRecord(cur)["exitCode"];
           return { exitCode: typeof exitCode === "number" ? exitCode : 1, output: stripAnsi(output) };
         }
@@ -4086,6 +4162,8 @@ export default async function plugin(bb: BbPluginApi) {
       "docs/bb-backend.md": overlayBytes("docs/bb-backend.md"),
       "firstmate-bb-backend.patch": overlayBytes("firstmate-bb-backend.patch"),
       "firstmate-bb-teardown.patch": overlayBytes("firstmate-bb-teardown.patch"),
+      "firstmate-bb-local-merge.patch": overlayBytes("firstmate-bb-local-merge.patch"),
+      "firstmate-bb-browser.patch": overlayBytes("firstmate-bb-browser.patch"),
       "install-bb-backend.py": overlayBytes("install-bb-backend.py"),
     };
     const py = [
@@ -4147,15 +4225,15 @@ export default async function plugin(bb: BbPluginApi) {
     );
     if (!tools.output.includes("git")) throw new Error(`git missing on host. Tools:\n${tools.output}`);
     // queueOwner=real drives the home's tasks-axi backlog. It is resolved purely
-    // from PATH (npm package `tasks-axi`, min 0.2.4) and is NOT bundled. Verify it
+    // from PATH and is NOT bundled. Verify it
     // and, if absent, surface the exact install command rather than silently
     // degrading — queue-real still degrades safely to the KV cache until it's there.
     const axiPresent = /FM_AXI=\S/.test(tools.output);
     const axiVer = /FM_AXI_VER=v?(\d+\.\d+\.\d+)/.exec(tools.output)?.[1] ?? "";
     const queueNote = !axiPresent
-      ? "tasks-axi MISSING — install with 'npm install -g tasks-axi' on this host; queueOwner=real degrades to the KV cache until then"
+      ? "tasks-axi MISSING — install with 'npm install -g tasks-axi' on this host; queueOwner=real refuses writes until repaired"
       : axiVer !== "" && !versionAtLeast(axiVer, TASKS_AXI_MIN)
-        ? `tasks-axi v${axiVer} is BELOW the required ${TASKS_AXI_MIN} — upgrade with 'npm install -g tasks-axi'; queueOwner=real degrades to the KV cache until then`
+        ? `tasks-axi v${axiVer} is BELOW the required ${TASKS_AXI_MIN} — upgrade with 'npm install -g tasks-axi'; queueOwner=real refuses writes until repaired`
         : `tasks-axi present${axiVer !== "" ? ` (v${axiVer}; needs >=${TASKS_AXI_MIN})` : ` (version unknown; needs >=${TASKS_AXI_MIN})`}`;
     const clone = await runOnHost(
       hostId,
@@ -4205,6 +4283,7 @@ export default async function plugin(bb: BbPluginApi) {
       projectId = id;
     }
     const overlayOut = await installBbBackend(hostId, path, projectId, timeoutMs, signal);
+    const toolchain = await checkToolchain(hostId, path, signal);
     // Replace the stale hardcoded 194/21 with the counts of the actual clone.
     const q = shQuote(path);
     const counts = await runOnHost(
@@ -4220,9 +4299,8 @@ export default async function plugin(bb: BbPluginApi) {
     } catch {
       // persist best-effort
     }
-    // Load the real captain contract (AGENTS.md) so captain sessions run it, and
-    // the version-pinned skills inventory (fmHome/.agents/skills @ HEAD).
-    await refreshCaptainContract(hostId, path, signal);
+    // Refresh the version-pinned skills inventory and captain memory.
+    // The complete native contract is read on demand through firstmate_contract.
     await refreshSkillsManifest(hostId, path, signal);
     await refreshCaptainMemory();
     const summary = [
@@ -4231,6 +4309,7 @@ export default async function plugin(bb: BbPluginApi) {
       `project: ${projectId}`,
       `backend: bb (overlay installed; config/backend=bb)`,
       `queue: ${queueNote}`,
+      `native toolchain:\n${toolchain.output}`,
       `toolbelt: ${toolbeltPhrase(scriptCount, skillCount)}`,
       `fm: bb firstmate fm spawn -- --mode direct-PR -- ship "<task>"`,
       `overlay:\n${truncate(overlayOut, 800)}`,
@@ -4266,13 +4345,13 @@ export default async function plugin(bb: BbPluginApi) {
 
     // Existing plugin state may predate the real owners. Import it once per home;
     // every migration is itself idempotent and refuses destructive overwrites.
-    const migratedHome = await bb.storage.kv.get<unknown>(FULL_PARITY_MIGRATION_KEY);
+    const migratedHome = await bb.storage.kv.get<unknown>(`${FULL_PARITY_MIGRATION_KEY}:${fmHome}`);
     if (migratedHome !== fmHome) {
       try {
         const state = await migrateState();
         const owners = await migrateOwners(captainThreadId);
         if (state.failed.length === 0 && owners.memory) {
-          await bb.storage.kv.set(FULL_PARITY_MIGRATION_KEY, fmHome);
+          await bb.storage.kv.set(`${FULL_PARITY_MIGRATION_KEY}:${fmHome}`, fmHome);
         } else {
           bb.log.warn(
             `full parity migration incomplete home=${fmHome} stateFailed=${state.failed.length} memory=${owners.memory}`,
@@ -4290,6 +4369,7 @@ export default async function plugin(bb: BbPluginApi) {
   // clone + overlay it now (best-effort); on any failure, surface the single
   // one-time command the captain must run. Returns a line for the deck digest.
   async function ensureRealModeForDeck(ctx: unknown, signal: AbortSignal | undefined): Promise<string> {
+    if ((await baseSettings.get()).fullParityOnDeck) await ensureCaptainHome(ctx, signal);
     const current = await settings.get();
     if (current.fmHome.trim() !== "") {
       // Refresh the version-pinned skills inventory when HEAD moved (best-effort).
@@ -4307,8 +4387,9 @@ export default async function plugin(bb: BbPluginApi) {
         );
         await refreshSkillsManifest(hostId, current.fmHome, signal);
         await refreshCaptainMemory();
-      } catch {
-        // deck still renders; captain keeps the cached inventory
+      } catch (error) {
+        if (current.fullParityOnDeck) throw new Error(`Native setup failed; captain is not ready: ${error instanceof Error ? error.message : String(error)}`);
+        bb.log.warn(`Native adapter refresh failed in compatibility mode: ${String(error)}`);
       }
       const profile = await activateFullParityForDeck(ctxString(ctx, "threadId"));
       return [
@@ -4319,6 +4400,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     try {
       const res = await initRealMode(ctx, signal, {});
+      if ((await baseSettings.get()).fullParityOnDeck) await ensureCaptainHome(ctx, signal);
       const profile = await activateFullParityForDeck(ctxString(ctx, "threadId"));
       return [
         `Real firstmate: initialized now (${res.existed ? "reused clone" : "cloned"}).`,
@@ -4341,16 +4423,8 @@ export default async function plugin(bb: BbPluginApi) {
   // labelled block, or "" when real mode is off / the script is unavailable, so
   // the caller falls back to the native KV digest (which is labelled cache).
   //
-  // D4: this block is intentionally HOST-WIDE and NOT per-captain-scoped. It is
-  // the verbatim output of the native `fm-bearings-snapshot` script, which reads
-  // the whole fmHome ledger. Native firstmate runs one captain per fmHome, so its
-  // snapshot IS that captain's world; under BB a single fmHome is shared across
-  // captains, so the snapshot necessarily aggregates all of them. The plugin
-  // cannot per-captain-filter another tool's authoritative rendering without
-  // reimplementing it (and then it would no longer be authoritative). The plugin's
-  // OWN per-captain view is the native KV digest below (sessionDigest), which IS
-  // scoped; this block is explicitly labelled authoritative/host-wide so the two
-  // are not confused.
+  // Native renders the whole selected home. Registered captains have dedicated
+  // homes; callers using the legacy shared home still see its combined ledger.
   async function realBearingsForDeck(ctx: unknown, signal: AbortSignal | undefined): Promise<string> {
     const current = await settings.get();
     if (current.fmHome.trim() === "") return "";
@@ -4367,7 +4441,8 @@ export default async function plugin(bb: BbPluginApi) {
         signal,
       });
       if (result.exitCode !== 0 || result.output.trim() === "") return "";
-      return ["== real bearings (fm-bearings-snapshot; authoritative, host-wide) ==", result.output.trim()].join("\n");
+      const scope = homeScope.getStore()?.home ? "captain home" : "host-wide";
+      return [`== real bearings (fm-bearings-snapshot; authoritative, ${scope}) ==`, result.output.trim()].join("\n");
     } catch {
       return "";
     }
@@ -4398,11 +4473,16 @@ export default async function plugin(bb: BbPluginApi) {
     signal?: AbortSignal;
   }): Promise<{ exitCode: number | null; output: string; scriptPath: string }> {
     const script = normalizeFmScript(input.script);
+    if (script === "spawn") await reconcileReturnedAfk(input.parentThreadId);
+    if (["spawn", "pr-merge", "merge-local"].includes(script)) await guardReturnCatchup(input.hostId, input.fmHome);
     // Native path for the RETURN value / diagnostics; the invocation below resolves
     // FM_BINDIR (bin-bb when the bb overlay is installed) on the host.
     const scriptPath = `${input.fmHome}/bin/fm-${script}.sh`;
     const scriptLeaf = `fm-${script}.sh`;
-    const extraEnv = Object.entries(input.env ?? {})
+    const extraEnv = Object.entries({
+      ...(script === "wake-drain" ? wakeStateEnv(input.fmHome, input.parentThreadId) : {}),
+      ...input.env,
+    })
       .filter(([, v]) => v !== "")
       .map(([k, v]) => `export ${k}=${shQuote(v)}`);
     const prelude = [
@@ -4425,7 +4505,11 @@ export default async function plugin(bb: BbPluginApi) {
       const line = result.output.split("\n").find((l) => l.includes("FM_MIRROR_STALE"))?.trim() ?? "FM_MIRROR_STALE";
       bb.log.error(`bb mirror is STALE on host ${input.hostId} running fm-${script}: ${line}. Re-run the overlay installer against ${input.fmHome}; new native scripts are unmirrored and the three patched copies are frozen behind upstream.`);
     }
-    return { ...result, scriptPath };
+    return {
+      ...result,
+      output: script === "wake-drain" ? rewriteWakeAckLine(result.output) : result.output,
+      scriptPath,
+    };
   }
 
   async function installedScriptSurface(ctx: unknown, query = "") {
@@ -4496,18 +4580,25 @@ export default async function plugin(bb: BbPluginApi) {
   // Present (no ack args) prints the pending wake rows + UNREAD STATUS / OPEN
   // DECISIONS sections and the `WAKE_ACK_REQUIRED: ... --ack-through <SEQ>
   // --recovery-generation <GEN>` line; it does NOT consume. Ack mode consumes rows
-  // at/below the sequence. Returns null when fmHome/host is unset (caller reports
-  // plainly). Drives the real fm-wake-drain.sh — no policy is reimplemented here.
+  // at/below the sequence. Configuration, transport, and native-script failures
+  // remain errors with their cause; none implies an empty or acknowledged queue.
   async function drainWakes(
     captainThreadId: string | undefined,
     ackThrough?: number,
     recoveryGeneration?: string,
     hostOverride?: string,
-  ): Promise<string | null> {
-    const fmHome = (await settings.get()).fmHome.trim();
-    if (fmHome === "") return null;
-    const hostId = hostOverride ?? await fleetHost();
-    if (hostId === null || hostId === "") return null;
+    signal?: AbortSignal,
+  ): Promise<string> {
+    const current = await settings.get();
+    const fmHome = current.fmHome.trim();
+    if (fmHome === "") throw new Error("Firstmate home is not configured. Run firstmate_deck before reading wakes.");
+    let hostId = hostOverride || current.fmHostId.trim();
+    if (!hostId && captainThreadId) {
+      try { hostId = await resolveHostId(undefined, { threadId: captainThreadId }); }
+      catch (error) { throw new Error(`Cannot resolve wake host for captain ${captainThreadId}, home ${fmHome}: ${error instanceof Error ? error.message : String(error)}`); }
+    }
+    if (!hostId) hostId = await fleetHost() ?? "";
+    if (!hostId) throw new Error(`No host configured for Firstmate home ${fmHome}. Run firstmate_deck from its captain thread or set fmHostId.`);
     const args: string[] = [];
     if (
       ackThrough !== undefined &&
@@ -4518,90 +4609,19 @@ export default async function plugin(bb: BbPluginApi) {
     }
     try {
       // D6: drain/ack only the CALLER captain's own scoped state plane.
-      const res = await runFmScript({ script: "wake-drain", args, hostId, fmHome, env: wakeStateEnv(fmHome, captainThreadId), timeoutMs: 30_000 });
+      const res = await runFmScript({ script: "wake-drain", args, hostId, fmHome, env: wakeStateEnv(fmHome, captainThreadId), timeoutMs: fmTimeoutMs("wake-drain", undefined), signal });
       // B2: the native WAKE_ACK_REQUIRED line names the raw `bin/fm-wake-drain.sh
       // --ack-through`, which pasted verbatim acks the UNPARTITIONED root queue and can
       // consume another captain's rows. Rewrite it to the partition-safe bb command so
       // the emitted instruction can only ever touch the caller's own plane.
       const out = rewriteWakeAckLine(res.output).trim();
-      if (res.exitCode !== 0 && out === "") return `wake drain exit ${res.exitCode}`;
+      if (res.exitCode !== 0) throw new Error(`native exit ${res.exitCode}: ${out || "no diagnostic output"}`);
       return out === "" ? "Wake queue empty." : out;
     } catch (error) {
-      bb.log.warn(`fm wake drain failed ${error instanceof Error ? error.message : String(error)}`);
-      return null;
+      const message = `Wake drain failed (home ${fmHome}, host ${hostId}): ${error instanceof Error ? error.message : String(error)}`;
+      bb.log.warn(message);
+      throw new Error(message);
     }
-  }
-
-  // A successful BB steer is delivery into the captain's current turn (or the
-  // turn it starts). Once that turn reaches idle, native Firstmate considers the
-  // handled wake acknowledged. Mirror that lifecycle without asking the captain
-  // to drain the same report a second time: consume only the contiguous queue
-  // prefix for which we have confirmed live-delivery receipts. Any failed, held,
-  // or externally-created wake breaks the prefix and remains fully durable.
-  async function settleLiveDeliveredWakes(captainThreadId: string): Promise<void> {
-    await withLiveWakeReceiptLock(captainThreadId, async () => {
-      const key = liveWakeReceiptsKey(captainThreadId);
-      const receipts = parseLiveWakeReceipts(await bb.storage.kv.get<unknown>(key));
-      if (receipts.length === 0) return;
-      const current = await settings.get();
-      const fmHome = current.fmHome.trim();
-      if (fmHome === "") return;
-
-      // Each host owns its own copy of this captain's state plane. Settle every
-      // host represented in the receipt set during the same captain idle event.
-      let remaining = receipts;
-      let changed = false;
-      const hosts = [...new Set(receipts.filter((row) => row.fmHome === fmHome).map((row) => row.hostId))];
-      for (const hostId of hosts) {
-        const matching = remaining.filter((row) => row.hostId === hostId && row.fmHome === fmHome);
-        if (matching.length === 0) continue;
-        const queue = `${wakeStateDir(fmHome, captainThreadId)}/.wake-queue`;
-        const res = await runOnHost(
-          hostId,
-          `[ -f ${shQuote(queue)} ] && awk -F '\\t' 'NF>=5 && $2 ~ /^[0-9]+$/ && ($3=="signal"||$3=="stale"){print $2}' ${shQuote(queue)} | sort -n -u || true`,
-          15_000,
-        ).catch(() => null);
-        if (res === null || res.exitCode !== 0) continue;
-        const pending = res.output
-          .split(/\r?\n/)
-          .map((line) => Number(line.trim()))
-          .filter((seq) => Number.isSafeInteger(seq) && seq > 0)
-          .sort((a, b) => a - b);
-        if (pending.length === 0) {
-          remaining = remaining.filter((row) => row.hostId !== hostId);
-          changed = true;
-          continue;
-        }
-        const delivered = new Set(matching.map((row) => row.seq));
-        let ackThrough = 0;
-        for (const seq of pending) {
-          if (!delivered.has(seq)) break;
-          ackThrough = seq;
-        }
-        if (ackThrough === 0) continue;
-
-        const presented = await drainWakes(captainThreadId, undefined, undefined, hostId);
-        const generation = presented === null
-          ? undefined
-          : /--recovery-generation\s+([A-Za-z0-9._-]+)/.exec(presented)?.[1];
-        if (generation === undefined) continue;
-        await drainWakes(captainThreadId, ackThrough, generation, hostId);
-
-        // Verify exact consumption before dropping receipts. A failed native ack
-        // leaves them in KV so the next idle retries instead of losing recovery.
-        const verify = await runOnHost(
-          hostId,
-          `[ -f ${shQuote(queue)} ] && awk -F '\\t' -v cut=${ackThrough} 'NF>=5 && $2 ~ /^[0-9]+$/ && $2<=cut && ($3=="signal"||$3=="stale"){n++} END{printf "FM_LEFT=%d\\n",n+0}' ${shQuote(queue)} || printf 'FM_LEFT=0\\n'`,
-          15_000,
-        ).catch(() => null);
-        if (verify === null || !/FM_LEFT=0(?:\n|$)/.test(verify.output)) continue;
-        const settled = matching.filter((row) => row.seq <= ackThrough).length;
-        remaining = remaining.filter((row) => !(row.hostId === hostId && row.seq <= ackThrough));
-        changed = true;
-        bb.log.info(`settled ${settled} live-delivered wake(s) for captain ${captainThreadId} on ${hostId}`);
-      }
-      if (changed) await bb.storage.kv.set(key, remaining);
-    });
   }
 
   // Count actionable (signal/stale) undrained wakes, deduped on (kind,key) to match
@@ -4634,7 +4654,6 @@ export default async function plugin(bb: BbPluginApi) {
     const pending = await countUndrainedWakes(hostId, fmHome, captainThreadId);
     if (pending <= 0) return "";
     const out = await drainWakes(captainThreadId);
-    if (out === null) return "";
     return `\n== ${pending} durable wake(s) held while away/quiet — run \`bb firstmate wake\` to drain/ack ==\n${out}`;
   }
 
@@ -4659,30 +4678,33 @@ export default async function plugin(bb: BbPluginApi) {
       await bb.storage.kv.set(budgetKey, { count: 0, lastRingAt: 0 });
       return;
     }
+    const queuePath = `${wakeStateDir(fmHome, threadId)}/.wake-queue`;
+    const fingerprint = await runOnHost(hostId, `sha256sum ${shQuote(queuePath)}`, 15_000);
+    if (fingerprint.exitCode !== 0) return;
+    const generation = fingerprint.output.split(/\s+/)[0];
+    const generationKey = `${budgetKey}:generation`;
+    if (await bb.storage.kv.get(generationKey) !== generation) {
+      await bb.storage.kv.set(budgetKey, { count: 0, lastRingAt: 0 });
+      await bb.storage.kv.set(generationKey, generation);
+    }
     const max = Number.isFinite(s.turnEndGuardBudget) ? Math.max(1, Math.trunc(s.turnEndGuardBudget)) : 3;
-    // F5: never silently abandon. The first `max` idles re-ring back-to-back; after
-    // that we keep re-ringing but throttled to a slow floor, so the captain is never
-    // left idle-forever with undrained wakes (it just nags less often). Reset on drain.
+    // Retain unresolved wakes without starting an unlimited sequence of turns.
     const raw = await bb.storage.kv.get(budgetKey);
     const state =
       raw !== null && typeof raw === "object"
         ? (raw as { count?: number; lastRingAt?: number })
         : { count: typeof raw === "number" ? raw : 0, lastRingAt: 0 };
     const count = typeof state.count === "number" ? state.count : 0;
-    const lastRingAt = typeof state.lastRingAt === "number" ? state.lastRingAt : 0;
     const now = Date.now();
-    let floor = false;
     let nextCount = count;
     if (count < max) {
       nextCount = count + 1;
-    } else if (now - lastRingAt >= TURN_END_FLOOR_MS) {
-      floor = true; // keep re-ringing, throttled — do NOT abandon
     } else {
-      bb.log.info(`turn-end guard: ${pending} undrained for captain ${threadId}; slow-floor cooldown (next in ${Math.ceil((TURN_END_FLOOR_MS - (now - lastRingAt)) / 60000)}m)`);
+      bb.log.warn(`turn-end guard: ${pending} wakes remain for ${threadId}; automatic re-ring budget exhausted. Queue retained for captain action.`);
       return;
     }
     await bb.storage.kv.set(budgetKey, { count: nextCount, lastRingAt: now });
-    const tag = floor ? "slow-floor reminder" : `${nextCount}/${max}`;
+    const tag = `${nextCount}/${max}`;
     try {
       await bb.sdk.threads.send({
         // Evidence (b), proven live: `mode: steer` to an IDLE thread STARTS a fresh
@@ -4707,9 +4729,9 @@ export default async function plugin(bb: BbPluginApi) {
   // tasks-axi missing → exit 2) is returned so the caller can log + fall back.
   async function runTasksAxi(
     args: string[],
-    opts: { hostId?: string; projectId?: string } = {},
+    opts: { hostId?: string; projectId?: string; home?: string } = {},
   ): Promise<{ exitCode: number | null; output: string } | null> {
-    const fmHome = (await settings.get()).fmHome.trim();
+    const fmHome = opts.home ?? (await settings.get()).fmHome.trim();
     if (fmHome === "") return null;
     const hostId = await resolveOwnerHost(opts.hostId, opts.projectId);
     if (hostId === null) return null;
@@ -4724,9 +4746,9 @@ export default async function plugin(bb: BbPluginApi) {
   // Run bin/fm-captain-hold.sh <args> at fmHome (decisions as captain-held rows).
   async function runCaptainHold(
     args: string[],
-    opts: { hostId?: string; projectId?: string } = {},
+    opts: { hostId?: string; projectId?: string; home?: string } = {},
   ): Promise<{ exitCode: number | null; output: string } | null> {
-    const fmHome = (await settings.get()).fmHome.trim();
+    const fmHome = opts.home ?? (await settings.get()).fmHome.trim();
     if (fmHome === "") return null;
     const hostId = await resolveOwnerHost(opts.hostId, opts.projectId);
     if (hostId === null) return null;
@@ -4887,6 +4909,11 @@ export default async function plugin(bb: BbPluginApi) {
     return ok;
   }
 
+  function memoryCacheKey(key: string): string {
+    const scope = homeScope.getStore();
+    return scope?.home && scope.captain ? `${key}:${scope.captain}` : key;
+  }
+
   async function memoryIsReal(): Promise<boolean> {
     return (await settings.get()).memoryOwner === "real" && (await settings.get()).fmHome.trim() !== "";
   }
@@ -4900,6 +4927,7 @@ export default async function plugin(bb: BbPluginApi) {
   // It NEVER writes KV→file over a non-empty real file, so a re-run cannot destroy
   // authoritative memory the way the old unconditional writeMemoryFile(<KV>) did.
   async function migrateMemoryTier(fileRel: string, kvKey: string): Promise<boolean> {
+    kvKey = memoryCacheKey(kvKey);
     const file = await readMemoryFile(fileRel);
     if (file === null) {
       bb.log.warn(`real memory migrate: ${fileRel} unreadable; skipped (KV + file left intact)`);
@@ -4936,8 +4964,8 @@ export default async function plugin(bb: BbPluginApi) {
       if (cap !== null && learn !== null) return { captain: cap, learnings: learn, source: "real" };
       bb.log.warn("real memory: read unavailable; showing KV cache");
     }
-    const cap = await bb.storage.kv.get<unknown>(MEM_CAPTAIN_KEY);
-    const learn = await bb.storage.kv.get<unknown>(MEM_LEARNINGS_KEY);
+    const cap = await bb.storage.kv.get<unknown>(memoryCacheKey(MEM_CAPTAIN_KEY));
+    const learn = await bb.storage.kv.get<unknown>(memoryCacheKey(MEM_LEARNINGS_KEY));
     return { captain: typeof cap === "string" ? cap : "", learnings: typeof learn === "string" ? learn : "", source: "kv" };
   }
 
@@ -4947,13 +4975,13 @@ export default async function plugin(bb: BbPluginApi) {
         if (await writeMemoryFile(MEM_CAPTAIN_FILE, text)) {
           // D2: KV mirrors the real file EXACTLY (cache/projection) — never a raw
           // byte-slice that could desync the mirror from the authoritative file.
-          await bb.storage.kv.set(MEM_CAPTAIN_KEY, text);
+          await bb.storage.kv.set(memoryCacheKey(MEM_CAPTAIN_KEY), text);
           await refreshCaptainMemory();
           return;
         }
-        bb.log.warn("real memory: captain write failed; KV cache only");
+        throw new Error("Native captain memory write failed; cache unchanged.");
       }
-      await bb.storage.kv.set(MEM_CAPTAIN_KEY, text);
+      await bb.storage.kv.set(memoryCacheKey(MEM_CAPTAIN_KEY), text);
     });
   }
 
@@ -4974,7 +5002,8 @@ export default async function plugin(bb: BbPluginApi) {
         let next = raw;
         if (overflow !== "") {
           const arch = await readMemoryFile(MEM_LEARNINGS_ARCHIVE_FILE);
-          const archNext = `${arch !== null && arch !== "" ? `${arch}\n` : ""}${overflow}`;
+          if (arch === null) throw new Error("Native learnings archive unreadable; nothing changed.");
+          const archNext = `${arch !== "" ? `${arch}\n` : ""}${overflow}`;
           if (await writeMemoryFile(MEM_LEARNINGS_ARCHIVE_FILE, archNext)) {
             next = kept; // archived → safe to trim the live file
           } else {
@@ -4985,22 +5014,22 @@ export default async function plugin(bb: BbPluginApi) {
           // D2: KV mirrors the FULL live file (cache/projection). The live file is
           // already line-capped + archived (capLearnings), so this is bounded and
           // never a raw byte-slice that would decapitate the first learning.
-          await bb.storage.kv.set(MEM_LEARNINGS_KEY, next);
+          await bb.storage.kv.set(memoryCacheKey(MEM_LEARNINGS_KEY), next);
           await refreshCaptainMemory();
           return;
         }
-        bb.log.warn("real memory: learning write failed; KV cache only");
+        throw new Error("Native learning write failed; cache unchanged.");
       } else {
-        bb.log.warn("real memory: learnings read unavailable; KV cache only");
+        throw new Error("Native learnings unreadable; cache unchanged.");
       }
     }
-    const prev = await bb.storage.kv.get<unknown>(MEM_LEARNINGS_KEY);
+    const prev = await bb.storage.kv.get<unknown>(memoryCacheKey(MEM_LEARNINGS_KEY));
     const line = `- ${date}: ${text}`;
     const raw = `${typeof prev === "string" && prev !== "" ? `${prev}\n` : ""}${line}`;
     // D2: kv-only mode has no archive, so overflow (oldest WHOLE lines) is dropped,
     // but the boundary is always a full line — never a mid-line byte-slice.
     const { kept } = capLearnings(raw);
-    await bb.storage.kv.set(MEM_LEARNINGS_KEY, kept);
+    await bb.storage.kv.set(memoryCacheKey(MEM_LEARNINGS_KEY), kept);
     });
   }
 
@@ -5015,20 +5044,20 @@ export default async function plugin(bb: BbPluginApi) {
         lines.splice(n - 1, 1);
         if (await writeMemoryFile(MEM_LEARNINGS_FILE, lines.join("\n"))) {
           // D2: mirror the full file exactly (no raw byte-slice).
-          await bb.storage.kv.set(MEM_LEARNINGS_KEY, lines.join("\n"));
+          await bb.storage.kv.set(memoryCacheKey(MEM_LEARNINGS_KEY), lines.join("\n"));
           await refreshCaptainMemory();
           return lines.length;
         }
-        bb.log.warn("real memory: learning drop write failed; KV cache only");
+        throw new Error("Native learning drop failed; cache unchanged.");
       } else {
-        bb.log.warn("real memory: learnings read unavailable; KV cache only");
+        throw new Error("Native learnings unreadable; cache unchanged.");
       }
     }
-    const prev = await bb.storage.kv.get<unknown>(MEM_LEARNINGS_KEY);
+    const prev = await bb.storage.kv.get<unknown>(memoryCacheKey(MEM_LEARNINGS_KEY));
     const lines = typeof prev === "string" ? prev.split("\n").filter((l) => l !== "") : [];
     if (!Number.isInteger(n) || n < 1 || n > lines.length) return -1;
     lines.splice(n - 1, 1);
-    await bb.storage.kv.set(MEM_LEARNINGS_KEY, lines.join("\n"));
+    await bb.storage.kv.set(memoryCacheKey(MEM_LEARNINGS_KEY), lines.join("\n"));
     return lines.length;
     });
   }
@@ -5047,7 +5076,8 @@ export default async function plugin(bb: BbPluginApi) {
         if (cur !== null && cur.trim() !== "") {
           const stamp = new Date().toISOString();
           const prevArch = await readMemoryFile(archiveRel);
-          const archNext = `${prevArch !== null && prevArch !== "" ? `${prevArch}\n` : ""}<!--cleared:${stamp}-->\n${cur}`;
+          if (prevArch === null) throw new Error("Native memory archive unreadable; nothing cleared.");
+          const archNext = `${prevArch !== "" ? `${prevArch}\n` : ""}<!--cleared:${stamp}-->\n${cur}`;
           if (!(await writeMemoryFile(archiveRel, archNext))) {
             bb.log.warn(`real memory: clear ${which} refused — archive write failed (nothing cleared)`);
             return false;
@@ -5057,10 +5087,10 @@ export default async function plugin(bb: BbPluginApi) {
           return false;
         }
         if (!(await writeMemoryFile(rel, ""))) {
-          bb.log.warn(`real memory: clear ${which} failed after archive; KV cache only`);
+          throw new Error(`Native memory clear ${which} failed after archive; cache unchanged.`);
         }
       }
-      await bb.storage.kv.set(which === "captain" ? MEM_CAPTAIN_KEY : MEM_LEARNINGS_KEY, "");
+      await bb.storage.kv.set(memoryCacheKey(which === "captain" ? MEM_CAPTAIN_KEY : MEM_LEARNINGS_KEY), "");
       await refreshCaptainMemory();
       return true;
     });
@@ -5087,53 +5117,213 @@ export default async function plugin(bb: BbPluginApi) {
   // most recent captain toggle owns it (last-write-wins) — exactly how native's
   // one-home model behaves. captainThreadId selects whose KV is read; the write
   // target is always the host-level flag.
-  async function syncAfkFlag(captainThreadId: string | undefined): Promise<boolean> {
+  async function syncAfkFlag(captainThreadId: string | undefined, quietOverride?: boolean): Promise<boolean> {
     const afkReal = await afkIsReal();
     const quietReal = await quietIsReal();
     if (!afkReal && !quietReal) return true; // neither projects to .afk
     const away = afkReal && (await readAfk(captainThreadId))?.on === true;
-    const quiet = quietReal && (await readQuiet(captainThreadId)).on;
+    const quiet = quietReal && (quietOverride ?? (await readQuiet(captainThreadId)).on);
     const mode = away ? "away" : quiet ? "quiet" : null;
     return writeAfkFlag(mode);
   }
 
+  let afkTransition = Promise.resolve();
+  async function withAfkTransition<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = afkTransition;
+    let release!: () => void;
+    afkTransition = new Promise<void>(resolve => { release = resolve; });
+    await previous;
+    try { return await operation(); } finally { release(); }
+  }
+
   // Project AFK on/off into the real durable contract (state/.afk-contract) so
   // fm-merge-authority-lib and fm-watch see the same away authority, plus the
-  // shared state/.afk flag. KV still owns held-ping delivery. Grants list =
-  // task ids the captain pre-authorized for away merges. Best-effort + logged.
-  // (Callers update KV afk state BEFORE calling, so syncAfkFlag reads the new value.)
-  async function projectAfkOn(words: string, grants: string[], captainThreadId: string | undefined): Promise<{ contract: boolean }> {
-    if (!(await afkIsReal())) return { contract: false };
-    const args = ["propose"];
-    if (words.trim() !== "") args.push("--words", words.slice(0, 2000));
-    for (const g of grants) if (/^[A-Za-z0-9._-]+$/.test(g)) args.push("--grant", g);
-    const proposed = await runAfkContract(args);
-    if (proposed === null || proposed.exitCode !== 0) {
-      bb.log.warn(`real afk: contract propose ${proposed === null ? "unreachable" : `exit=${proposed.exitCode}`}; KV flag only`);
-      await syncAfkFlag(captainThreadId);
-      return { contract: false };
+  // shared state/.afk flag. KV still owns held-ping delivery. Grant lists are
+  // retired in native; commit KV only after the native transition succeeds.
+  function projectAfkOn(words: string, grants: string[], captainThreadId: string | undefined) {
+    return withAfkTransition(() => enterAfk(words, grants, captainThreadId));
+  }
+  async function enterAfk(words: string, grants: string[], captainThreadId: string | undefined): Promise<{ contract: boolean; text: string }> {
+    if (grants.length > 0) throw new Error("Native Firstmate retired --grant. Put the captain's mandate in the away words.");
+    const previous = await readAfk(captainThreadId);
+    let contract = false;
+    let text = "";
+    if (await afkIsReal()) {
+      const entered = await runAfkContract(["enter", "--words", words]);
+      if (entered === null || entered.exitCode !== 0) {
+        throw new Error(`Native AFK entry failed: ${entered?.output.slice(-800) || "host unavailable"}`);
+      }
+      contract = true;
+      text = entered.output.trim();
     }
-    const confirmed = await runAfkContract(["confirm"]);
+    await writeAfk({
+      on: true,
+      words: words.trim() !== "" ? words : previous?.on ? previous.words : "",
+      since: previous?.on ? previous.since : new Date().toISOString(),
+      lastEntryAt: new Date().toISOString(),
+      held: previous?.held ?? [],
+    }, captainThreadId);
     await syncAfkFlag(captainThreadId);
-    if (confirmed === null || confirmed.exitCode !== 0) {
-      bb.log.warn(`real afk: contract confirm ${confirmed === null ? "unreachable" : `exit=${confirmed.exitCode}`}`);
-      return { contract: false };
-    }
-    return { contract: true };
+    return { contract, text };
   }
 
-  async function projectAfkOff(captainThreadId: string | undefined): Promise<void> {
-    if (!(await afkIsReal())) return;
-    const archived = await runAfkContract(["archive"]);
-    if (archived === null || archived.exitCode !== 0) {
-      bb.log.warn(`real afk: contract archive ${archived === null ? "unreachable" : `exit=${archived.exitCode}`}`);
-    }
-    // Recompute the shared flag: if quiet is still on it stays "quiet", not deleted.
+  function projectAfkOff(captainThreadId: string | undefined) {
+    return withAfkTransition(() => exitAfk(captainThreadId));
+  }
+  async function nativeReturn(captainThreadId: string | undefined): Promise<void> {
+    const current = await settings.get();
+    const hostId = await fleetHost();
+    if (!hostId) throw new Error("Native AFK return host unavailable.");
+    const result = await runFmScript({ script: "afk-return", args: ["begin"], fmHome: current.fmHome, hostId, timeoutMs: 180_000 });
+    await bb.storage.kv.set(`native-return:${captainThreadId ?? "legacy"}`, result.output);
+    // Exit 3 retains the blocker gate; away mode has ended.
+    if (result.exitCode !== 0 && result.exitCode !== 3) requireNativeSuccess(result, "AFK return");
+  }
+
+  async function exitAfk(captainThreadId: string | undefined): Promise<void> {
+    if (await afkIsReal()) await nativeReturn(captainThreadId);
+    await writeAfk({ on: false, words: "", since: new Date().toISOString(), held: [] }, captainThreadId);
     await syncAfkFlag(captainThreadId);
   }
 
-  // Real contract away authority (validate exits 0 iff readable + confirmed) and
-  // its granted task ids, for status/bearings. null when unreadable.
+  async function guardReturnCatchup(hostId: string, fmHome: string): Promise<void> {
+    // Active away mode is allowed to dispatch under native's away authority.
+    // The catch-up marker is separate: ordinary work waits for its native check.
+    const result = await runOnHost(hostId, [
+      ...fmBackendEnv({ hostId, fmHome }), fmBinDirAssign(fmHome),
+      `if [ -f ${shQuote(`${fmHome}/state/.afk-return-catchup`)} ]; then "$FM_BINDIR/fm-afk-return.sh" check; fi`,
+    ].join("\n"), 180_000);
+    requireNativeSuccess(result, "AFK catch-up");
+  }
+
+  // Match native authority to one BB captain before treating chat as a return.
+  // Old plugin wakes were labeled "user", so initiator alone is insufficient.
+  function reconcileReturnedAfk(captainThreadId: string | undefined) {
+    return withAfkTransition(() => reconcileReturnedAfkLocked(captainThreadId));
+  }
+  async function reconcileReturnedAfkLocked(captainThreadId: string | undefined): Promise<boolean> {
+    if (!captainThreadId || !(await afkIsReal())) return false;
+    const previous = await readAfk(captainThreadId);
+    if (!previous?.on) return false;
+    const current = await settings.get();
+    const hostId = await fleetHost();
+    if (!hostId) return false;
+    const home = current.fmHome.trim();
+    const contract = `${home}/state/.afk-contract`;
+    const library = `${home}/bin/fm-afk-contract.sh`;
+    const prelude = [
+      `export FM_HOME=${shQuote(home)}`,
+      `export FM_STATE_OVERRIDE=${shQuote(`${home}/state`)}`,
+      `. ${shQuote(library)}`,
+    ];
+    const cachedEpoch = Math.floor(Date.parse(previous.since) / 1000);
+    if (!Number.isSafeInteger(cachedEpoch)) return false;
+    const snapshot = await runOnHost(hostId, [
+      ...prelude,
+      `__fm_source=live`,
+      `fm_bb_afk_identity() {`,
+      `  local __fm_record=$1`,
+      `  fm_afk_contract_validate "$__fm_record" >/dev/null 2>&1 || return 0`,
+      `  printf 'FM_AFK_ID\\t%s\\t%s\\t%s\\t%s\\t%s\\n' "$(sha256sum "$__fm_record" | cut -d' ' -f1)" "$(fm_afk_contract_read_field "$__fm_record" entered_epoch)" "$(fm_afk_contract_read_field "$__fm_record" confirmed_epoch)" "$(fm_afk_contract_read_words "$__fm_record" | base64 | tr -d '\\n')" "$__fm_source"`,
+      `}`,
+      `if [ -f ${shQuote(contract)} ]; then fm_bb_afk_identity ${shQuote(contract)}; else`,
+      `  __fm_source=archive`,
+      // Legacy KV was timestamped around, rather than by, native entry.
+      `  for __fm_epoch in $(seq ${cachedEpoch - 4} ${cachedEpoch + 4}); do`,
+      `    __fm_record=$(${shQuote(library)} archived "$__fm_epoch" 2>/dev/null) || continue`,
+      `    fm_bb_afk_identity "$__fm_record"`,
+      `  done`,
+      `fi`,
+    ].join("\n"), 15_000);
+    if (snapshot.exitCode !== 0) return false;
+    const identities = [...snapshot.output.matchAll(/^FM_AFK_ID\t([a-f0-9]{64})\t(\d+)\t(\d+)\t([A-Za-z0-9+/=]*)\t(live|archive)$/gm)];
+    const matches = identities.filter(match =>
+      Buffer.from(match[4]!, "base64").toString("utf8") === previous.words
+      && Math.abs(Date.parse(previous.since) - Number(match[2]) * 1000) < 5000);
+    if (matches.length !== 1) return false;
+    const [, digest, entered, confirmed, encodedWords, source] = matches[0]!;
+    const words = Buffer.from(encodedWords!, "base64").toString("utf8");
+    const owns = (state: AfkState | null) => state?.on === true
+      && state.words === words
+      && Math.abs(Date.parse(state.since) - Number(entered) * 1000) < 5000;
+    for (const key of await bb.storage.kv.list(`${AFK_KEY}:cap-`)) {
+      if (key === afkKvKey(captainThreadId)) continue;
+      const parsed = afkSchema.safeParse(await bb.storage.kv.get(key));
+      if (parsed.success && owns(parsed.data)) return false; // ambiguous legacy owner
+    }
+
+    const accepted = new Set<string>();
+    let beforeSeq: string | undefined;
+    let returnRequest: { seq: number; requestId: string; at: number } | undefined;
+    const boundary = Math.max(Number(confirmed) * 1000 + 1000, Date.parse(previous.lastEntryAt ?? "") || 0);
+    // Bound recovery reads; keep authority unchanged if the return is beyond them.
+    for (let page = 0; page < 8 && !returnRequest; page++) {
+      const rows = await bb.sdk.threads.events.list({
+        threadId: captainThreadId, order: "desc", limit: "100", beforeSeq,
+        types: ["client/turn/requested", "turn/input/accepted"],
+      });
+      if (!rows.length) break;
+      for (const row of rows) {
+        if (row.createdAt <= boundary) continue;
+        const data = asRecord(row.data);
+        if (row.type === "turn/input/accepted" && typeof data["clientRequestId"] === "string") {
+          accepted.add(data["clientRequestId"]);
+          continue;
+        }
+        if (row.type !== "client/turn/requested" || data["initiator"] !== "user"
+          || data["senderThreadId"] != null || data["originPluginId"] != null
+          || (data["systemMessageKind"] != null && data["systemMessageKind"] !== "unlabeled")) continue;
+        const id = data["requestId"];
+        if (typeof id !== "string" || !accepted.has(id)) continue;
+        const blocks = Array.isArray(data["input"]) ? data["input"].map(asRecord) : [];
+        if (blocks.some(block => block["visibility"] === "agent-only")) continue;
+        const text = blocks.filter(block => block["type"] === "text").map(block => block["text"]).filter(value => typeof value === "string").join("\n").trim();
+        if (/^\/(?:firstmate:)?afk\b/i.test(text)) return false;
+        if (!text || text.includes("FIRSTMATE INTERNAL WAKE") || text.includes("FIRSTMATE_OP:")
+          || /^(?:🔔|🛰️\s*fm-watch:)/u.test(text)) continue;
+        returnRequest = { seq: row.seq, requestId: id, at: row.createdAt };
+        break;
+      }
+      const oldest = rows.at(-1)!;
+      if (oldest.createdAt <= boundary || beforeSeq === String(oldest.seq)) break;
+      beforeSeq = String(oldest.seq);
+    }
+    if (!returnRequest) return false;
+    if (captainThreadId && captainHomes.get(captainThreadId) === home) {
+      await nativeReturn(captainThreadId);
+      await writeAfk({ ...previous, on: false }, captainThreadId);
+      await bb.storage.kv.set(`afk-return-evidence${captainScopeSuffix(captainThreadId)}`, returnRequest);
+      return true;
+    }
+    const quiet = (await quietIsReal()) && (await readQuiet(captainThreadId)).on;
+    const archived = await runOnHost(hostId, [
+      ...prelude,
+      "fm_afk_contract_lock_hold || exit 1",
+      "trap 'fm_afk_contract_lock_release || true' EXIT",
+      ...(source === "archive" ? [
+        `[ ! -f ${shQuote(contract)} ] || { echo 'AFK record changed during return reconciliation; retry.' >&2; exit 1; }`,
+        `__fm_archived=$(${shQuote(library)} archived ${entered}) || exit 1`,
+        `[ "$(sha256sum "$__fm_archived" | cut -d' ' -f1)" = ${shQuote(digest!)} ] || exit 1`,
+        `printf '%s\\n' "$__fm_archived"`,
+      ] : [
+        `[ -f ${shQuote(contract)} ] || exit 3`,
+        `[ "$(sha256sum ${shQuote(contract)} 2>/dev/null | cut -d' ' -f1)" = ${shQuote(digest!)} ] || { echo 'AFK record changed during return reconciliation; retry.' >&2; exit 1; }`,
+        "fm_afk_contract_cmd_archive || exit 1",
+      ]),
+      quiet ? `printf 'quiet\\n' > ${shQuote(`${home}/state/.afk`)}` : `rm -f ${shQuote(`${home}/state/.afk`)}`,
+    ].join("\n"), 150_000);
+    if (archived.exitCode === 3) return false; // Another return already archived it.
+    if (archived.exitCode !== 0) throw new Error(`AFK return reconciliation failed: ${archived.output.slice(-500)}`);
+    await bb.storage.kv.set(`afk-return-evidence${captainScopeSuffix(captainThreadId)}`, {
+      ...returnRequest, digest, archivedPath: archived.output.trim(),
+    });
+    // Keep held reports and the mandate for the normal afk off return brief.
+    await writeAfk({ ...previous, on: false }, captainThreadId);
+    bb.log.info(`archived stale AFK after accepted human return captain=${captainThreadId} seq=${returnRequest.seq}`);
+    return true;
+  }
+
+  // Native validates the durable mandate; the legacy grants field stays empty.
   // Host-level away authority (F2): the native keeper and merge-authority read this
   // same host-level contract, so status/bearings reflect the real per-home posture.
   async function realAfkAuthority(): Promise<{ confirmed: boolean; grants: string[] } | null> {
@@ -5141,18 +5331,16 @@ export default async function plugin(bb: BbPluginApi) {
     const valid = await runAfkContract(["validate"]);
     if (valid === null) return null;
     if (valid.exitCode !== 0) return { confirmed: false, grants: [] };
-    const g = await runAfkContract(["grants"]);
-    const grants = g === null ? [] : g.output.split(/\r?\n/).map((l) => l.trim()).filter((l) => l !== "" && /^[A-Za-z0-9._-]+$/.test(l));
-    return { confirmed: true, grants };
+    return { confirmed: true, grants: [] };
   }
 
   // Project quiet on/off into the shared native state/.afk flag. Recomputed from
   // both owners (F2), so turning quiet off never deletes an active away flag, and
-  // turning quiet on never overwrites away. (Caller updates KV quiet state first.)
+  // turning quiet on never overwrites away. Native write succeeds before KV changes.
   async function projectQuiet(on: boolean, captainThreadId: string | undefined): Promise<void> {
     if (!(await quietIsReal())) return;
-    const ok = await syncAfkFlag(captainThreadId);
-    if (!ok) bb.log.warn(`real quiet: state/.afk ${on ? "quiet write" : "clear"} failed; KV flag only`);
+    const ok = await syncAfkFlag(captainThreadId, on);
+    if (!ok) throw new Error("Native quiet transition failed; BB posture unchanged.");
   }
 
   async function queueIsReal(): Promise<boolean> {
@@ -5170,19 +5358,17 @@ export default async function plugin(bb: BbPluginApi) {
   // output, and the paired start/done/rm transitions target the same id we chose.
   // Returns ok=false (KV-cache only) when queueOwner!=real, the host/tool is
   // unreachable, or tasks-axi is missing/failed. Only issues a command when real.
+  function requireNativeSuccess(result: { exitCode: number | null; output: string } | null, operation: string): void {
+    if (result !== null && result.exitCode === 0) return;
+    const reason = result === null ? "host unavailable" : `exit ${result.exitCode}: ${truncate(result.output, 1600)}`;
+    bb.log.error(`Native ${operation} failed: ${reason}`);
+    throw new Error(`Native ${operation} failed: ${reason}. BB state was not advanced; reconcile native state before retrying.`);
+  }
+
   async function projectQueueAdd(id: string, title: string, shape: Shape, projectId: string): Promise<{ ok: boolean }> {
     if (!(await queueIsReal())) return { ok: false };
     const res = await runTasksAxi(["add", id, title.slice(0, 500), "--kind", shape], { projectId });
-    if (res === null) {
-      bb.log.warn("real backlog: add unreachable (tasks-axi/host); KV cache only");
-      return { ok: false };
-    }
-    if (res.exitCode !== 0) {
-      bb.log.warn(
-        `real backlog: add exit=${res.exitCode} (tasks-axi missing? install with 'npm install -g tasks-axi' on the fleet host); KV cache only`,
-      );
-      return { ok: false };
-    }
+    requireNativeSuccess(res, `backlog add ${id}`);
     return { ok: true };
   }
 
@@ -5190,13 +5376,10 @@ export default async function plugin(bb: BbPluginApi) {
   async function projectQueueTransition(item: QueueItem, verb: "start" | "done" | "rm"): Promise<void> {
     if (!(await queueIsReal())) return;
     if (item.backlogId === undefined || item.backlogId === "") {
-      bb.log.warn(`real backlog: ${verb} skipped for queue ${item.id} (no backlog row id)`);
-      return;
+      throw new Error(`Native backlog ${verb} refused: queue ${item.id} has no native row. Reconcile it before continuing.`);
     }
-    const res = await runTasksAxi([verb, item.backlogId], { projectId: item.projectId });
-    if (res === null || res.exitCode !== 0) {
-      bb.log.warn(`real backlog: ${verb} ${item.backlogId} ${res === null ? "unreachable" : `exit=${res.exitCode}`}`);
-    }
+    const res = await runTasksAxi([verb, item.backlogId], { projectId: item.projectId, home: item.nativeHome });
+    requireNativeSuccess(res, `backlog ${verb}`);
   }
 
   // C1: close the crew's OWN backlog row (id = crew id) on the terminal events a
@@ -5212,10 +5395,8 @@ export default async function plugin(bb: BbPluginApi) {
   async function realBacklogTransitionForCrew(crew: Crew, verb: "done" | "rm"): Promise<void> {
     if (isSecondmateRoute(crew)) return;
     if (crew.backlogRow !== true) return;
-    const res = await runTasksAxi([verb, crew.id], { projectId: crew.projectId });
-    if (res === null || res.exitCode !== 0) {
-      bb.log.warn(`real backlog: crew ${verb} ${crew.id} ${res === null ? "unreachable" : `exit=${res.exitCode}`}`);
-    }
+    const res = await runTasksAxi([verb, crew.id], { projectId: crew.projectId, home: await crewNativeHome(crew) });
+    requireNativeSuccess(res, `backlog ${verb}`);
   }
 
   async function decisionsIsReal(): Promise<boolean> {
@@ -5224,16 +5405,21 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   // A decision is an ordinary captain-held backlog task (captain-hold-lifecycle):
-  // its identity is the decision id, reused as the backlog task id. Best-effort.
+  // Linked calls hold the existing crew task; standalone calls use the decision id.
   async function projectDecisionAsk(d: Decision): Promise<void> {
     if (!(await decisionsIsReal())) return;
     if (!/^[A-Za-z0-9._-]+$/.test(d.id)) return;
-    const res = await runCaptainHold(
-      ["hold", d.id, "--title", d.question.slice(0, 200), "--reason", "captain decision (BB firstmate_decide)"],
-    );
-    if (res === null || res.exitCode !== 0) {
-      bb.log.warn(`real decisions: hold ${d.id} ${res === null ? "unreachable" : `exit=${res.exitCode}`}; KV cache only`);
+    if (d.crewId) {
+      const crew = await findCrew(d.crewId);
+      if (!crew) throw new Error(`No crew ${d.crewId} for this captain call.`);
+      d.nativeHome = await crewNativeHome(crew);
+      d.nativeTaskId = crew.id;
     }
+    const res = await runCaptainHold(
+      ["hold", d.nativeTaskId ?? d.id, "--title", d.question.slice(0, 200), "--reason", "captain decision via BB firstmate_decide"],
+      { home: d.nativeHome },
+    );
+    requireNativeSuccess(res, "decision update");
   }
 
   // Answer closes the captain-held row and writes the resolved close to the linked
@@ -5241,48 +5427,42 @@ export default async function plugin(bb: BbPluginApi) {
   async function projectDecisionAnswer(d: Decision, answer: string): Promise<void> {
     if (!(await decisionsIsReal())) return;
     if (!/^[A-Za-z0-9._-]+$/.test(d.id)) return;
-    const fmHome = (await settings.get()).fmHome.trim();
+    const fmHome = d.nativeHome ?? (await settings.get()).fmHome.trim();
     const hostId = await fleetHost();
     if (fmHome === "" || hostId === null) {
-      bb.log.warn(`real decisions: answer ${d.id} no host; KV cache only`);
-      return;
+      throw new Error(`Native decision ${d.id}: host unavailable.`);
     }
     const tmp = `${fmHome}/state/.bb-decision-${d.id}.answer`;
     // F1: base64 payload, never in the command text (no heredoc-delimiter injection).
     if (!(await writeHostFile(hostId, tmp, answer.slice(0, 2000)))) {
-      bb.log.warn(`real decisions: answer ${d.id} tmp write failed; KV cache only`);
-      return;
+      throw new Error(`Native decision ${d.id}: could not persist answer.`);
     }
-    const res = await runCaptainHold(["answer", d.id, "--decision-file", tmp]);
+    const res = await runCaptainHold(["answer", d.nativeTaskId ?? d.id, "--decision-file", tmp, ...(d.nativeTaskId ? ["--release"] : [])], { home: d.nativeHome });
     await runOnHost(hostId, `rm -f ${shQuote(tmp)}`, 10_000).catch(() => {});
-    if (res === null || res.exitCode !== 0) {
-      bb.log.warn(`real decisions: answer ${d.id} ${res === null ? "unreachable" : `exit=${res.exitCode}`}`);
-    }
+    requireNativeSuccess(res, "decision update");
     // Also write the resolved close on the linked crew's own status log.
     if (d.crewId !== null) {
       const crew = await findCrew(d.crewId);
-      if (crew !== undefined) await appendResolvedStatus(crew, d.id, answer);
+      if (crew !== undefined && !(await appendResolvedStatus(crew, d.id, answer))) throw new Error("Native decision recorded, but crew status could not be resolved. Repair the status before resuming the worker.");
     }
   }
 
   async function projectDecisionDefer(d: Decision, until: string | null): Promise<void> {
     if (!(await decisionsIsReal())) return;
     if (!/^[A-Za-z0-9._-]+$/.test(d.id)) return;
-    const args = ["hold", d.id, "--reason", "deferred (BB firstmate_decide)"];
+    const args = ["hold", d.nativeTaskId ?? d.id, "--reason", "deferred via BB firstmate_decide"];
     if (until !== null && /^\d{4}-\d{2}-\d{2}$/.test(until)) args.push("--until", until);
-    const res = await runCaptainHold(args);
-    if (res === null || res.exitCode !== 0) {
-      bb.log.warn(`real decisions: defer ${d.id} ${res === null ? "unreachable" : `exit=${res.exitCode}`}`);
-    }
+    const res = await runCaptainHold(args, { home: d.nativeHome });
+    requireNativeSuccess(res, "decision update");
   }
 
   async function projectDecisionDrop(id: string): Promise<void> {
     if (!(await decisionsIsReal())) return;
     if (!/^[A-Za-z0-9._-]+$/.test(id)) return;
-    const res = await runTasksAxi(["rm", id]);
-    if (res === null || res.exitCode !== 0) {
-      bb.log.warn(`real decisions: drop ${id} ${res === null ? "unreachable" : `exit=${res.exitCode}`}`);
-    }
+    const row = (await readDecisions()).find(d => d.id === id);
+    if (row?.nativeTaskId) return projectDecisionAnswer(row, "Captain dropped this decision.");
+    const res = await runTasksAxi(["rm", id], { home: row?.nativeHome });
+    requireNativeSuccess(res, "decision update");
   }
 
   async function readToolActivity(threadId: string, signal?: AbortSignal): Promise<{ ok: true; at: number | null } | { ok: false }> {
@@ -5339,7 +5519,7 @@ export default async function plugin(bb: BbPluginApi) {
   // single global key is still written for one release so an old UI keeps reading.
   const FM_WATCH_BEAT_KEY = "fm-watch-beat";
   function fmWatchBeatKey(hostId: string): string {
-    return `fm-watch-beat:${hostId}`;
+    return `fm-watch-beat:${hostId}${homeScope.getStore()?.home ? `:${homeScope.getStore()!.home}` : ""}`;
   }
   const fmWatchBeatSchema = z.object({
     beatAge: z.number(),
@@ -5623,9 +5803,9 @@ export default async function plugin(bb: BbPluginApi) {
     // is empty. Before any deck is recorded, fall back only when one captain owns crews
     // on this host; never fan an unattributable line across managers.
     const remembered = await bb.storage.kv.get<unknown>(`${FM_WATCH_CAPTAIN_PREFIX}${hostId}`);
-    const rememberedCaptain = typeof remembered === "string" && remembered !== "" ? remembered : undefined;
+    const rememberedCaptain = homeScope.getStore()?.captain ?? (typeof remembered === "string" && remembered !== "" ? remembered : undefined);
     const soleHostParent = rememberedCaptain ?? (hostParents.size === 1 ? [...hostParents][0]! : undefined);
-    const ownedCrews = crews.filter((c) => c.parentThreadId !== null && c.parentThreadId !== "");
+    const ownedCrews = crews.filter((c) => c.parentThreadId !== null && c.parentThreadId !== "" && (!homeScope.getStore()?.home || c.nativeHome === homeScope.getStore()?.home));
     // Group per target parent so each captain gets one message.
     const byParent = new Map<string, string[]>();
     for (const line of lines) {
@@ -5924,6 +6104,7 @@ export default async function plugin(bb: BbPluginApi) {
   const usage = [
     "Usage:",
     "  bb firstmate guide [--json]",
+    "  bb firstmate toolchain [--json]   # native AXI + Lavish compatibility, read-only",
     "  bb firstmate init [--real] [--machine m] [--path p] [--name n] [--json]",
     "  bb firstmate scripts [query] [--json]   # list + verify every installed fm-* script",
     "  bb firstmate fm [--timeout s] <script> [args...]   # real bin/fm-<script>.sh with FM_BACKEND=bb",
@@ -5993,7 +6174,7 @@ export default async function plugin(bb: BbPluginApi) {
       presentation: { ...tool.presentation, suppress: true },
       async execute(params, ctx) {
         try {
-          return markCaptainToolResult(await execute(params, ctx));
+          return await withLedgerOperation(tool.name, ctxString(ctx, "threadId"), () => inCaptainHome(ctxString(ctx, "threadId"), async () => markCaptainToolResult(await execute(params, ctx))));
         } catch (error) {
           const message = error instanceof Error ? error.message : "Firstmate tool failed.";
           return markCaptainToolResult(toolError(message));
@@ -6001,6 +6182,60 @@ export default async function plugin(bb: BbPluginApi) {
       },
     });
   }) as BbPluginApi["agents"]["registerTool"];
+
+  async function readCaptainContract(ctx: unknown) {
+    const current = await settings.get();
+    if (current.fmHome.trim() === "") return toolError("Initialize real Firstmate with firstmate_deck first.");
+    const hostId = current.fmHostId.trim() || await resolveHostId(undefined, ctx);
+    const path = `${current.fmHome}/AGENTS.md`;
+    const result = await bb.sdk.files.read({ hostId, path });
+    if (!("content" in result)) return toolError("Native contract read returned no content.");
+    if (result.sizeBytes > 200_000) return toolError("Native contract exceeds 200KB; read it directly in the Firstmate home.");
+    const content = result.contentEncoding === "base64"
+      ? Buffer.from(result.content, "base64").toString("utf8") : result.content;
+    return `${content}\n\n## BB runtime adaptations\n${BB_SKILL_RUNTIME_CONTRACT}\n${CAPTAIN_VISIBILITY_CONTRACT}\nThe firstmate_contract read is now complete. Treat native policy refusals as refusals. Handle durable reports before calling firstmate_wake with its returned acknowledgment values.\n`;
+  }
+
+  async function checkToolchain(hostId: string, fmHome: string, signal?: AbortSignal) {
+    const result = await runFmScript({
+      script: "bootstrap", args: [], hostId, fmHome,
+      env: { FM_BOOTSTRAP_DETECT_ONLY: "1", FM_BOOTSTRAP_NETWORK: "skip" },
+      timeoutMs: 60_000, signal,
+    });
+    if (result.exitCode !== 0) throw new Error(`Native toolchain check failed: ${truncate(result.output, 2000)}`);
+    const output = [result.output.trim() || "Native bootstrap: all required tools and Lavish are compatible.", "Browser: use /browser with browser_script or bb browser script; leave profileId unset."].join("\n");
+    return {
+      ready: !/^(MISSING:|BACKEND_INVALID:)/m.test(output),
+      presentationReady: !/^PRESENTATION_UNAVAILABLE:/m.test(output),
+      output,
+    };
+  }
+
+  async function toolchainForContext(ctx: unknown, signal?: AbortSignal) {
+    const current = await settings.get();
+    if (!current.fmHome.trim()) throw new Error("Initialize native Firstmate before checking its toolchain.");
+    const hostId = current.fmHostId.trim() || await resolveHostId(undefined, ctx);
+    return checkToolchain(hostId, current.fmHome.trim(), signal);
+  }
+
+  registerCaptainTool({
+    name: "firstmate_toolchain",
+    description: "Read-only native bootstrap check for required AXI tools, no-mistakes, and Lavish compatibility. Does not install tools or run fleet repairs.",
+    parameters: z.object({}),
+    async execute(_, ctx) {
+      try { return (await toolchainForContext(ctx)).output; }
+      catch (error) { return toolError(error instanceof Error ? error.message : String(error)); }
+    },
+  });
+
+  registerCaptainTool({
+    name: "firstmate_contract",
+    description: "Read the complete current native Firstmate supervisor contract and the BB runtime adaptations. Read before orchestrating and after an upstream update.",
+    parameters: z.object({}),
+    async execute(_, ctx) {
+      return readCaptainContract(ctx);
+    },
+  });
 
   registerCaptainTool({
     name: "firstmate_dispatch",
@@ -6134,8 +6369,7 @@ export default async function plugin(bb: BbPluginApi) {
     }),
     async execute({ ackThrough, recoveryGeneration }, ctx) {
       // D6: the caller thread IS the captain — scope the drain/ack to its own queue.
-      const out = await drainWakes(ctxString(ctx, "threadId"), ackThrough, recoveryGeneration);
-      if (out === null) return toolError("No real fm-wake queue reachable (need real mode initialized + a host for fmHome).");
+      const out = await drainWakes(ctxString(ctx, "threadId"), ackThrough, recoveryGeneration, undefined, asRecord(ctx)["signal"] as AbortSignal | undefined);
       return wakeOutputForCaptainTool(out);
     },
   });
@@ -6184,7 +6418,7 @@ export default async function plugin(bb: BbPluginApi) {
       crewId: z.string().optional(),
     }),
     async execute({ action, question, decisionId, answer, options, crewId }) {
-      const all = await readDecisions();
+      const all = (await readDecisions()).filter(row => !homeScope.getStore()?.home || row.parentThreadId === homeScope.getStore()?.captain);
       if (action === "list") {
         if (all.length === 0) return "No decisions.";
         return all.map((d) => `${d.id} [${d.status}] :: ${truncate(d.question, 80)}`).join("\n");
@@ -6192,6 +6426,8 @@ export default async function plugin(bb: BbPluginApi) {
       if (action === "ask") {
         if (question === undefined || question.trim() === "") return toolError("Need question.");
         const d: Decision = {
+          parentThreadId: homeScope.getStore()?.captain ?? null,
+          nativeHome: (await settings.get()).fmHome,
           id: randomUUID().slice(0, 8),
           question: question.slice(0, 500),
           options: (options ?? []).slice(0, 10),
@@ -6202,13 +6438,14 @@ export default async function plugin(bb: BbPluginApi) {
           answer: "",
           createdAt: new Date().toISOString(),
         };
-        await writeDecisions([d, ...all]);
         await projectDecisionAsk(d);
+        await writeDecisions([d, ...all]);
         return `Decision ${d.id}: ${truncate(question, 100)}. Prefer AskUserQuestion to collect the captain's choice, then firstmate_decide action=answer.`;
       }
       if (action === "answer") {
         const d = all.find((x) => x.id === decisionId);
         if (d === undefined || answer === undefined) return toolError("Need decisionId + answer.");
+        await projectDecisionAnswer(d, answer);
         d.status = "answered";
         d.answer = answer.slice(0, 500);
         await writeDecisions(all);
@@ -6222,20 +6459,19 @@ export default async function plugin(bb: BbPluginApi) {
             });
           }
         }
-        await projectDecisionAnswer(d, answer);
         return `Answered ${d.id}`;
       }
       if (action === "defer") {
         const d = all.find((x) => x.id === decisionId);
         if (d === undefined) return toolError("Need decisionId.");
         d.status = "deferred";
-        await writeDecisions(all);
         await projectDecisionDefer(d, d.deferredUntil);
+        await writeDecisions(all);
         return `Deferred ${d.id}`;
       }
       if (action === "drop") {
-        await writeDecisions(all.filter((x) => x.id !== decisionId));
         if (decisionId !== undefined) await projectDecisionDrop(decisionId);
+        await writeDecisions(all.filter((x) => x.id !== decisionId));
         return `Dropped ${decisionId ?? ""}`;
       }
       return toolError("Unknown action.");
@@ -6360,25 +6596,19 @@ export default async function plugin(bb: BbPluginApi) {
     async execute({ action, words }, ctx) {
       const cap = ctxString(ctx, "threadId");
       if (action === "on") {
-        await writeAfk({
-          on: true,
-          words: words ?? "",
-          since: new Date().toISOString(),
-          held: (await readAfk(cap))?.held ?? [],
-        }, cap);
         try { await settings.experimental_set({ supervisionEnabled: true }); } catch { /* */ }
         const proj = await projectAfkOn(words ?? "", [], cap);
         const contractNote = (await afkIsReal()) ? ` Durable contract ${proj.contract ? "confirmed" : "not confirmed (KV flag only)"}.` : "";
-        return `AFK on. Words recorded, not executed as authority. Failures/credentials still surface.${contractNote}`;
+        return proj.text || `AFK on. Words recorded, not executed as authority. Failures/credentials still surface.${contractNote}`;
       }
       if (action === "off") {
         const prev = await readAfk(cap);
-        await writeAfk({ on: false, words: "", since: new Date().toISOString(), held: [] }, cap);
         await projectAfkOff(cap);
         const held = prev?.held ?? [];
         const snap = await bearingsSnapshot(cap);
         return [
           "== return brief ==",
+          String(await bb.storage.kv.get(`native-return:${cap ?? "legacy"}`) ?? ""),
           snap.text,
           held.length === 0 ? "Nothing held." : `Held while away:\n${held.join("\n---\n")}`,
           await wakeResumeBrief(cap),
@@ -6416,7 +6646,7 @@ export default async function plugin(bb: BbPluginApi) {
     parameters: z.object({ all: z.boolean().optional().describe("Show every captain's crews host-wide, not just your own") }),
     async execute({ all }, ctx) {
       const owner = ctxString(ctx, "threadId");
-      const crews = (await listCrews({ owner, all: all === true })).slice(0, 20);
+      const crews = await listCrews({ owner, all: all === true });
       if (crews.length === 0) return noCrewsMessage(owner, all === true);
       const rows = await Promise.all(
         crews.map(async (crew) => {
@@ -6467,7 +6697,7 @@ export default async function plugin(bb: BbPluginApi) {
       detail: z.string().optional(),
     }),
     async execute({ action, title, projectId, queueId, shape, mode, after, waitUntil, detail }, ctx) {
-      const items = await readQueue();
+      const items = (await readQueue()).filter(row => !homeScope.getStore()?.home || row.parentThreadId === homeScope.getStore()?.captain);
       const ctxProject = ctxString(ctx, "projectId");
       if (action === "list") {
         if (items.length === 0) return "Queue empty.";
@@ -6493,6 +6723,7 @@ export default async function plugin(bb: BbPluginApi) {
         const newId = randomUUID().slice(0, 8);
         const proj = await projectQueueAdd(newId, title, shape ?? "ship", pid);
         const item: QueueItem = {
+          nativeHome: (await settings.get()).fmHome,
           id: newId,
           title: title.slice(0, 500),
           detail: (detail ?? "").slice(0, MAX_TASK),
@@ -6728,7 +6959,8 @@ export default async function plugin(bb: BbPluginApi) {
     parameters: z.object({
       script: z.string().min(1).max(80).describe("Stem of bin/fm-<script>.sh, e.g. spawn, peek, send, watch, bearings-snapshot"),
       args: z.array(z.string()).max(40).optional(),
-      timeoutSec: z.number().int().min(15).max(1800).optional(),
+      timeoutSec: z.number().int().min(15).max(1800).optional()
+        .describe("Host command budget in seconds. Wake-drain uses at least 180 seconds, including when a shorter value is supplied; prefer firstmate_wake for drain/ack."),
     }),
     async execute({ script, args, timeoutSec }, ctx) {
       const current = await settings.get();
@@ -6759,38 +6991,23 @@ export default async function plugin(bb: BbPluginApi) {
         tools: [],
         skills: [],
         instructions:
-          "You are a firstmate crewmate. Do not dispatch other crews. Finish this one task, then report DONE, BLOCKED, or FAILED.",
+          `You are a firstmate crewmate. Do not dispatch other crews. Finish this one task, then report DONE, BLOCKED, or FAILED. ${AXI_TOOL_CONTRACT}`,
       };
     }
     const marked = metaFlag(meta, "captain");
     const base = marked
       ? `${CAPTAIN_VISIBILITY_CONTRACT} ${BB_SKILL_RUNTIME_CONTRACT}`
       : "Firstmate crews are available. Run /captain or firstmate_deck to take the deck.";
-    // D4: budget the 4096-char captain instruction window DELIBERATELY across the
-    // injected blocks instead of first-come truncation (which used to starve memory
-    // entirely and scissor the skills list down to ~500 chars). Per-block char
-    // allotments, ordered by recall value (memory first so a fresh captain always
-    // recalls stored prefs/learnings):
-    //   section-9 visibility contract (base):       ~900
-    //   captain memory (prefs + recent learnings):  1100
-    //   captain contract (AGENTS.md excerpt):       1100
-    //   skills manifest:                             700
-    // Blocks + headers stay under 4096; the final truncate is a backstop.
-    const CAP_MEMORY_BUDGET = 1100;
-    const CAP_CONTRACT_BUDGET = 1100;
-    const CAP_SKILLS_BUDGET = 700;
-    const memoryBlock =
-      marked && captainMemoryCache !== "" ? `\n\n${truncate(captainMemoryCache, CAP_MEMORY_BUDGET)}` : "";
-    const contractBlock =
-      marked && captainContractCache !== ""
-        ? `\n\n== Real firstmate captain contract (fmHome/AGENTS.md) ==\n${truncate(captainContractCache, CAP_CONTRACT_BUDGET)}`
-        : "";
-    const skillsBlock =
-      marked && skillsManifestCache !== "" ? `\n\n${truncate(skillsManifestCache, CAP_SKILLS_BUDGET)}` : "";
-    const instructions =
-      memoryBlock === "" && contractBlock === "" && skillsBlock === ""
-        ? base
-        : truncate(`${base}${memoryBlock}${contractBlock}${skillsBlock}`, 4096);
+    // The complete contract is a tool read; reserve the SDK window for pointers
+    // and recall. Divide the remaining space so neither memory nor skills vanish.
+    const remaining = Math.max(0, 4096 - base.length - 4);
+    const memoryBudget = Math.floor(remaining * 0.6);
+    const skillsBudget = remaining - memoryBudget;
+    const memoryBlock = marked && !meta["nativeHome"] && captainMemoryCache !== ""
+      ? `\n\n${truncate(captainMemoryCache, memoryBudget)}` : "";
+    const skillsBlock = marked && skillsManifestCache !== ""
+      ? `\n\n${truncate(skillsManifestCache, skillsBudget)}` : "";
+    const instructions = truncate(`${base}${memoryBlock}${skillsBlock}`, 4096);
     return {
       tools: [...CAPTAIN_TOOLS],
       skills: marked ? [...CAPTAIN_SKILLS] : ["firstmate"],
@@ -7025,7 +7242,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   // A crew's worker thread can reach idle/error BEFORE its record carries its
   // threadId: the real transport spawns through fm-spawn.sh (~30s) and only learns
-  // the thread id — the moment writeCrews can persist it — after that returns, while
+  // the thread id — the moment the crew register can persist it — after that returns, while
   // a fast crew has long since ended its first turn. The live thread.idle/
   // thread.failed handlers fire at that earlier instant, findCrewByThread returns
   // undefined, and the event is dropped; BB never replays it, so notifyCaptain is
@@ -7044,7 +7261,10 @@ export default async function plugin(bb: BbPluginApi) {
   ): Promise<void> {
     if (isSecondmateRoute(crew)) return;
     const stopped = await turnWasStopped(thread);
-    if (!stopped && !hasStatusProtocol(lastAssistantText)) {
+    // BB already reports interruptions to the parent. A completion wake here can
+    // cause the manager to resume work the user just stopped.
+    if (stopped) return;
+    if (!hasStatusProtocol(lastAssistantText)) {
       const outcome = await applyProtocolNudge(crew);
       if (outcome !== "off") return;
     }
@@ -7087,18 +7307,16 @@ export default async function plugin(bb: BbPluginApi) {
     await settleDeck(thread.id);
   });
   bb.events.on("thread.active", async ({ thread }) => {
+    await bb.storage.kv.delete(`captain-delivery:${thread.id}`);
+    await inCaptainHome(thread.id, () => reconcileReturnedAfk(thread.id)).catch(error => bb.log.warn(`AFK return: ${String(error)}`));
     if (!isCaptainSpawn(thread)) return;
     await settleDeck(thread.id);
   });
   bb.events.on("thread.idle", async ({ thread, lastAssistantText }) => {
-    // Confirmed live crew steers were part of the turn that just completed. Settle
-    // those first, so the guard only re-rings genuinely undelivered/held work.
-    await settleLiveDeliveredWakes(thread.id).catch((error) => {
-      bb.log.warn(`live wake settlement failed for ${thread.id}: ${error instanceof Error ? error.message : String(error)}`);
-    });
+    await inCaptainHome(thread.id, () => reconcileReturnedAfk(thread.id)).catch(error => bb.log.warn(`AFK return: ${String(error)}`));
     // Turn-end backstop for the captain (no-op unless turnEndGuard=re-ring and this
     // is the captain thread). Captains are not crews.
-    await captainTurnEndGuard(thread.id).catch(() => {});
+    await inCaptainHome(thread.id, () => captainTurnEndGuard(thread.id)).catch(() => {});
     const crew = await findCrewByThread(thread.id);
     if (crew === undefined || isSecondmateRoute(crew)) return;
     liveTerminalHandled.add(thread.id);
@@ -7129,6 +7347,8 @@ export default async function plugin(bb: BbPluginApi) {
     commands: [
       { name: "guide", summary: "Setup guide for firstmate inside BB", usage: "bb firstmate guide [--json]" },
       { name: "init", summary: "Native deck setup (add --real to clone firstmate and overlay the BB backend)", usage: "bb firstmate init [--real] [--json]" },
+      { name: "contract", summary: "Read the full native supervisor contract", usage: "bb firstmate contract" },
+      { name: "toolchain", summary: "Check native AXI and Lavish dependencies without mutations", usage: "bb firstmate toolchain [--json]" },
       { name: "scripts", summary: "List + verify every installed fm-* script", usage: "bb firstmate scripts [query] [--json]" },
       { name: "fm", summary: "Run a real firstmate bin/ script with FM_BACKEND=bb", usage: "bb firstmate fm [--timeout s] <script> [args...]" },
       { name: "deck", summary: "Mark this thread captain + session digest", usage: "bb firstmate deck [--json]" },
@@ -7150,7 +7370,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "decide", summary: "Durable decisions", usage: 'bb firstmate decide ask -- "<question>"' },
       { name: "posture", summary: "Per-project delivery mode + yolo", usage: "bb firstmate posture set --project <id> [--mode m]" },
       { name: "memory", summary: "Captain prefs + learnings", usage: "bb firstmate memory show" },
-      { name: "afk", summary: "Away posture", usage: "bb firstmate afk on|off|status" },
+      { name: "afk", summary: "Away posture", usage: "bb firstmate afk on|off|status|reconcile-return [--captain <thread-id>]" },
       { name: "quiet", summary: "Batch routine pings while present", usage: "bb firstmate quiet on|off|status" },
       { name: "secondmate", summary: "Register a domain captain thread", usage: "bb firstmate secondmate list|register|drop" },
       { name: "supervision", summary: "Event pings + stuck checker", usage: "bb firstmate supervision on|off|status" },
@@ -7160,6 +7380,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "migrate-owners", summary: "Project KV queue/decisions/afk/quiet/memory into the real files for owners set to real (idempotent)", usage: "bb firstmate migrate-owners [--json]" },
     ],
     async run(argv, ctx) {
+      return withLedgerOperation(argv[0] ?? "", ctxString(ctx, "threadId"), () => inCaptainHome(ctxString(ctx, "threadId"), async () => {
       if (argv[0] === "fm") {
         const json = argv.includes("--json");
         const fail = (message: string) => ({ exitCode: 1, stderr: message });
@@ -7214,6 +7435,15 @@ export default async function plugin(bb: BbPluginApi) {
             const repo = current.firstmateRepo !== "" ? current.firstmateRepo : "https://github.com/kunchenguid/firstmate";
             const text = guideText(repo, current.fmScriptCount, current.fmSkillCount);
             return reply({ guide: text }, text);
+          }
+          case "contract": {
+            const text = await readCaptainContract(ctx);
+            if (typeof text !== "string") return fail("Native contract could not be read.");
+            return reply({ contract: text }, text);
+          }
+          case "toolchain": {
+            const result = await toolchainForContext(ctx, signal);
+            return reply(result, result.output);
           }
           case "scripts": {
             const surface = await installedScriptSurface(ctx, rest.join(" "));
@@ -7322,7 +7552,7 @@ export default async function plugin(bb: BbPluginApi) {
           }
           case "crews": {
             // Your own crews by default (calling captain = ctxThread); --all opts into host-wide.
-            const crews = (await listCrews({ owner: ctxThread, all: flags.has("all") })).slice(0, 20);
+            const crews = await listCrews({ owner: ctxThread, all: flags.has("all") });
             const rows = await Promise.all(
               crews.map(async (crew) => {
                 const status = await crewStatus(crew);
@@ -7445,6 +7675,31 @@ export default async function plugin(bb: BbPluginApi) {
               `Relaunched crew ${id} as thread ${next.threadId} (${next.providerId ?? "default provider"}/${next.model ?? "default model"}/${next.reasoningLevel ?? "default reasoning"}), same worktree.`,
             );
           }
+          case "mark-captain": {
+            const threadId = rest[0];
+            const home = flagStr(flags, "home");
+            const parentHome = flagStr(flags, "parent-home");
+            const taskId = flagStr(flags, "task");
+            if (!threadId || !home?.startsWith("/") || !parentHome?.startsWith("/") || !taskId || !/^[A-Za-z0-9._-]+$/.test(taskId)) return fail("Need thread id, --home, --parent-home and --task.");
+            const hostId = await resolveHostId(undefined, ctx);
+            const proof = await runOnHost(hostId, [
+              "set -eu",
+              `[ "$(cat ${shQuote(`${home}/.fm-secondmate-home`)})" = ${shQuote(taskId)} ]`,
+              `. ${shQuote(`${parentHome}/bin/fm-secondmate-parent-lib.sh`)}`,
+              `fm_secondmate_parent_record_parse ${shQuote(`${home}/.fm-secondmate-parent`)}`,
+              `[ "$FM_SECONDMATE_PARENT_ROUTE" = local ]`,
+              `[ "$(realpath "$FM_SECONDMATE_PARENT_HOME")" = "$(realpath ${shQuote(parentHome)})" ]`,
+              `test -f ${shQuote(`${home}/AGENTS.md`)}`,
+              `test -d ${shQuote(`${home}/.git`)} -o -f ${shQuote(`${home}/.git`)}`,
+            ].join("\n"), 15_000, signal);
+            requireNativeSuccess(proof, "secondmate home identity");
+            await installBbBackend(hostId, home, ctxProject, 180_000, signal);
+            await bb.storage.kv.set(`native-home:${threadId}`, home);
+            captainHomes.set(threadId, home);
+            await bb.storage.kv.set(`native-home-host:${threadId}`, hostId);
+            await bb.sdk.threads.updatePluginMetadata({ threadId, set: { captain: "true", nativeHome: home, nativeTaskId: taskId, nativeParentHome: parentHome }, remove: ["crew", "crewId"] });
+            return reply({ threadId, home }, `Bound secondmate captain ${threadId} to ${home}`);
+          }
           case "mark-crew": {
             const id = rest[0];
             if (id === undefined) return fail("Usage: bb firstmate mark-crew <thread-id> [--shape ship|scout] [--task <id>]");
@@ -7454,6 +7709,8 @@ export default async function plugin(bb: BbPluginApi) {
             // adopt an orphan thread (created by fm-spawn but not yet recorded) by id.
             const set: Record<string, string> = { crew: "true", shape };
             if (taskId !== "") set["crewId"] = taskId;
+            const home = flagStr(flags, "home");
+            if (home) set["nativeHome"] = home;
             await bb.sdk.threads.updatePluginMetadata({ threadId: id, set });
             return reply({ marked: true, threadId: id, shape, task: taskId || null }, `Marked thread ${id} as ${shape} crew.`);
           }
@@ -7465,8 +7722,7 @@ export default async function plugin(bb: BbPluginApi) {
             const ackRaw = flagStr(flags, "ack-through");
             const gen = flagStr(flags, "recovery-generation");
             const ackThrough = ackRaw !== undefined && /^\d+$/.test(ackRaw) ? Number(ackRaw) : undefined;
-            const out = await drainWakes(ctxString(ctx, "threadId"), ackThrough, gen);
-            if (out === null) return fail("No real fm-wake queue reachable (need real mode initialized + a host for fmHome).");
+            const out = await drainWakes(ctxString(ctx, "threadId"), ackThrough, gen, undefined, signal);
             return reply({ drained: true, acked: ackThrough ?? null }, out);
           }
           case "deliver": {
@@ -7546,26 +7802,26 @@ export default async function plugin(bb: BbPluginApi) {
           }
           case "afk": {
             const sub = rest[0] ?? "status";
+            if (sub === "reconcile-return") {
+              const captain = flagStr(flags, "captain") ?? ctxThread;
+              if (!captain) return fail("Need --captain <thread-id>.");
+              const changed = await reconcileReturnedAfk(captain);
+              return reply({ changed }, changed ? "Archived stale away posture after verified human return; held reports retained for afk off." : "No verified return for this native away record; posture unchanged.");
+            }
             if (sub === "on") {
               const words = flagStr(flags, "words") ?? rest.slice(1).join(" ").trim();
-              await writeAfk({
-                on: true,
-                words,
-                since: new Date().toISOString(),
-                held: (await readAfk(ctxThread))?.held ?? [],
-              }, ctxThread);
               await settings.experimental_set({ supervisionEnabled: true });
               const proj = await projectAfkOn(words, flagAll(flags, "grant"), ctxThread);
-              return reply({ afk: true, words, contract: proj.contract }, `AFK on. Words recorded, not executed as authority.${(await afkIsReal()) ? ` Durable contract ${proj.contract ? "confirmed" : "not confirmed (KV flag only)"}.` : ""}`);
+              return reply({ afk: true, words, contract: proj.contract }, proj.text || `AFK on. Words recorded, not executed as authority.${(await afkIsReal()) ? ` Durable contract ${proj.contract ? "confirmed" : "not confirmed (KV flag only)"}.` : ""}`);
             }
             if (sub === "off") {
               const prev = await readAfk(ctxThread);
-              await writeAfk({ on: false, words: "", since: new Date().toISOString(), held: [] }, ctxThread);
               await projectAfkOff(ctxThread);
               const snap = await bearingsSnapshot(ctxThread);
               const held = prev?.held ?? [];
               const text = [
                 "== return brief ==",
+                String(await bb.storage.kv.get(`native-return:${ctxThread ?? "legacy"}`) ?? ""),
                 snap.text,
                 held.length === 0 ? "Nothing held." : `Held while away:\n${held.join("\n---\n")}`,
                 await wakeResumeBrief(ctxThread),
@@ -7621,7 +7877,7 @@ export default async function plugin(bb: BbPluginApi) {
           }
           case "queue": {
             const sub = rest[0] ?? "list";
-            const items = await readQueue();
+            const items = (await readQueue()).filter(row => !homeScope.getStore()?.home || row.parentThreadId === homeScope.getStore()?.captain);
             if (sub === "add") {
               const title = rest.slice(1).join(" ").trim();
               if (title === "") return fail(usage);
@@ -7631,6 +7887,7 @@ export default async function plugin(bb: BbPluginApi) {
               const shapeVal = toShape(flagStr(flags, "shape"));
               const proj = await projectQueueAdd(newId, title, shapeVal, projectId);
               const item: QueueItem = {
+          nativeHome: (await settings.get()).fmHome,
                 id: newId,
                 title: title.slice(0, 500),
                 detail: (flagStr(flags, "detail") ?? "").slice(0, MAX_TASK),
@@ -7708,11 +7965,13 @@ export default async function plugin(bb: BbPluginApi) {
           }
           case "decide": {
             const sub = rest[0] ?? "list";
-            const all = await readDecisions();
+            const all = (await readDecisions()).filter(row => !homeScope.getStore()?.home || row.parentThreadId === homeScope.getStore()?.captain);
             if (sub === "ask") {
               const question = rest.slice(1).join(" ").trim();
               if (question === "") return fail(usage);
               const d: Decision = {
+          parentThreadId: homeScope.getStore()?.captain ?? null,
+          nativeHome: (await settings.get()).fmHome,
                 id: randomUUID().slice(0, 8),
                 question: question.slice(0, 500),
                 options: flagAll(flags, "option").slice(0, 10),
@@ -7723,8 +7982,8 @@ export default async function plugin(bb: BbPluginApi) {
                 answer: "",
                 createdAt: new Date().toISOString(),
               };
-              await writeDecisions([d, ...all]);
               await projectDecisionAsk(d);
+              await writeDecisions([d, ...all]);
               return reply(
                 d,
                 `Decision ${d.id}: ${truncate(question, 100)}${d.options.length > 0 ? `\nOptions: ${d.options.join(" / ")}` : ""}\nAsk the captain with AskUserQuestion, then: bb firstmate decide answer ${d.id} -- "<answer>"`,
@@ -7743,7 +8002,8 @@ export default async function plugin(bb: BbPluginApi) {
               const d = all.find((x) => x.id === did);
               if (did === undefined || d === undefined) return fail(`No decision ${did ?? ""}.`);
               if (answer === "") return fail(usage);
-              d.status = "answered";
+              await projectDecisionAnswer(d, answer);
+        d.status = "answered";
               d.answer = answer.slice(0, 500);
               await writeDecisions(all);
               let told = "";
@@ -7758,7 +8018,6 @@ export default async function plugin(bb: BbPluginApi) {
                   told = ` (told crew ${d.crewId})`;
                 }
               }
-              await projectDecisionAnswer(d, answer);
               return reply({ answered: true, id: did }, `Answered ${did}${told}`);
             }
             if (sub === "defer") {
@@ -7767,15 +8026,15 @@ export default async function plugin(bb: BbPluginApi) {
               if (did === undefined || d === undefined) return fail(`No decision ${did ?? ""}.`);
               d.status = "deferred";
               d.deferredUntil = flagStr(flags, "until") ?? null;
-              await writeDecisions(all);
               await projectDecisionDefer(d, d.deferredUntil);
+              await writeDecisions(all);
               return reply({ deferred: true, id: did }, `Deferred ${did}`);
             }
             if (sub === "drop") {
               const did = rest[1];
               if (did === undefined) return fail(usage);
-              await writeDecisions(all.filter((x) => x.id !== did));
               await projectDecisionDrop(did);
+              await writeDecisions(all.filter((x) => x.id !== did));
               return reply({ dropped: true, id: did }, `Dropped decision ${did}`);
             }
             return fail(usage);
@@ -7874,6 +8133,7 @@ export default async function plugin(bb: BbPluginApi) {
       } catch (error) {
         return fail(error instanceof Error ? error.message : "failed");
       }
+      }));
     },
   });
 
@@ -8033,6 +8293,52 @@ export default async function plugin(bb: BbPluginApi) {
           }
           const timer = setTimeout(resolve, checkMs);
           signal.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
+        });
+      }
+    },
+  });
+
+  bb.background.service("captain-home-watch", {
+    async start(signal) {
+      const seen = new Map<string, Set<string>>();
+      while (!signal.aborted) {
+        for (const key of await bb.storage.kv.list("native-home:")) {
+          if (signal.aborted) break;
+          const captain = key.slice("native-home:".length);
+          try {
+            await inCaptainHome(captain, async () => {
+              const s = await settings.get();
+              const host = await bb.storage.kv.get<string>(`native-home-host:${captain}`);
+              if (!host) return;
+              if (s.watchOwner !== "fm-watch") {
+                await stopFmWatchKeeper(host, s.fmHome, signal);
+                return;
+              }
+              const grace = Math.max(30, Number(s.watchHeartbeatSec) || 90);
+              const prior = fmWatchBeatSchema.safeParse(await bb.storage.kv.get(fmWatchBeatKey(host)));
+              const now = Date.now();
+              const backoff = prior.success ? prior.data.backoffUntil ?? 0 : 0;
+              const result = await superviseFmWatch(host, s.fmHome, grace, now >= backoff, signal);
+              if (!result) return;
+              const streak = result.keeperAlive ? 0 : result.relaunched ? (prior.success ? prior.data.consecutiveRelaunch ?? 0 : 0) + 1 : 0;
+              await bb.storage.kv.set(fmWatchBeatKey(host), {
+                beatAge: result.beatAge, checkedAt: now, grace, relaunched: result.relaunched,
+                consecutiveRelaunch: streak,
+                backoffUntil: streak ? now + Math.min(1_800_000, 60_000 * 2 ** (streak - 1)) : backoff,
+              });
+              const delivered = seen.get(captain) ?? new Set<string>();
+              seen.set(captain, delivered);
+              await relayWatchReasons(extractWatchReasons(result.logTail), host, delivered, signal);
+            });
+          } catch (error) {
+            if (!signal.aborted) bb.log.warn(`captain home ${captain}: ${String(error)}`);
+          }
+        }
+        await new Promise<void>(resolve => {
+          if (signal.aborted) return resolve();
+          const onAbort = () => { clearTimeout(timer); resolve(); };
+          const timer = setTimeout(() => { signal.removeEventListener("abort", onAbort); resolve(); }, 30_000);
+          signal.addEventListener("abort", onAbort, { once: true });
         });
       }
     },

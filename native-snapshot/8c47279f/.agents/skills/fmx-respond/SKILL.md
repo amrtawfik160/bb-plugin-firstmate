@@ -12,13 +12,6 @@ metadata:
   internal: true
 ---
 
-<!-- BB-SOURCE
-     native: .agents/skills/fmx-respond/SKILL.md
-     sha: 8c47279f54e379e8ffa86a8d3a5b568f23ccf281
-     snapshot: native-snapshot/8c47279f/.agents/skills/fmx-respond/SKILL.md
-     fidelity: verbatim
--->
-
 # fmx-respond
 
 Relay lets a firstmate instance answer and act on public mentions routed through the shared `@myfirstmate` relay.

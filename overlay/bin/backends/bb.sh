@@ -135,10 +135,20 @@ fm_backend_bb_create_task() {  # <window-name> <project-path> <task-id> <kind> <
   else
     prompt="Firstmate $kind task $id. Follow the brief at the recorded data path."
   fi
-  prompt="You are a firstmate ${kind:-ship} crewmate running inside BB.
-Do not dispatch nested crews. Work only this task. End with DONE:, BLOCKED:, or FAILED:.
+  if [ "$kind" = secondmate ]; then
+    prompt="You are a persistent Firstmate secondmate captain inside BB.
+Your native home is $project. Read $project/AGENTS.md and data/charter.md. Take the deck using firstmate_deck; your home binding is installed by the launcher. Dispatch and supervise crews within your charter using native Firstmate policy and AXI tools. Persist open work in your home before stopping.
+For browser work use the /browser skill and browser_script (or bb browser script), leaving profileId unset for this thread's isolated default profile. This overrides native chrome-devtools-axi instructions; do not use the AXI browser or install its hooks.
 
 $prompt"
+  else
+  prompt="You are a firstmate ${kind:-ship} crewmate running inside BB.
+Do not dispatch nested crews. Work only this task. End with DONE:, BLOCKED:, or FAILED:.
+Use gh-axi for GitHub and lavish-axi for visual review. For browser work use the /browser skill and browser_script (or bb browser script), leaving profileId unset for this thread's isolated default profile. This overrides native chrome-devtools-axi instructions; do not use the AXI browser or install its hooks. Read current --help. In no-mistakes mode, drive the real no-mistakes axi pipeline as its worker owner.
+Firstmate home: ${FM_HOME:-}. Use its bin/fm-tasks-axi.sh for backlog work. For a Lavish board, read its config/lavish-axi-host if present and set LAVISH_AXI_HOST on the open command; BB does not inherit the launcher's shell exports. Open the artifact, then arm its fm-procevent-lavish.sh with --for $id. Do not start a second poller.
+
+$prompt"
+  fi
   parent=${FM_BB_PARENT_THREAD_ID:-${BB_THREAD_ID:-}}
   # Permission is a BB concern, not the firstmate yolo axis: yolo governs merge
   # authority, not the crew's sandbox. Only an explicit FM_BB_PERMISSION_MODE
@@ -188,6 +198,7 @@ sys.exit(1)
   local title role subject
   role=Ship
   [ "$kind" = scout ] && role=Scout
+  [ "$kind" = secondmate ] && role=Captain
   subject=${name:-Crew task}
   subject=${subject//$'\r'/ }
   subject=${subject//$'\n'/ }
@@ -196,7 +207,7 @@ sys.exit(1)
   title="${FM_BB_THREAD_TITLE:-$role · $subject · $id}"
   set -- thread spawn --json --project "$project_id" --title "$title" \
     --prompt "$prompt" --visibility "$vis" --permission-mode "$perm"
-  if [ "${FM_BB_SHARED_ENV:-0}" = 1 ]; then
+  if [ "$kind" = secondmate ] || [ "${FM_BB_SHARED_ENV:-0}" = 1 ]; then
     set -- "$@" --environment "$project"
   else
     set -- "$@" --new-environment worktree
@@ -215,7 +226,14 @@ sys.exit(1)
   # crewmate contract (no captain tools/skills), not the unmarked captain fallback.
   # Pass the task id so the plugin can adopt this thread by id if fm-spawn is
   # hard-killed before it records bb_thread_id in the meta (no double-spawn).
-  bb firstmate mark-crew "$thread_id" --shape "${kind:-ship}" --task "$id" >/dev/null 2>&1 || true
+  if [ "$kind" = secondmate ]; then
+    if ! bb firstmate mark-captain "$thread_id" --home "$project" --parent-home "$FM_HOME" --task "$id" >/dev/null; then
+      echo "error: secondmate $id launched as $thread_id but captain binding failed; endpoint retained for recovery" >&2
+      return 1
+    fi
+  else
+    bb firstmate mark-crew "$thread_id" --home "$FM_HOME" --shape "${kind:-ship}" --task "$id" >/dev/null 2>&1 || true
+  fi
   wt_path=$(printf '%s' "$out" | fm_backend_bb_json_field path 2>/dev/null || true)
   tries=0
   while [ -z "$wt_path" ] && [ "$tries" -lt 45 ]; do
@@ -286,8 +304,7 @@ fm_backend_bb_send_key() {  # <thread-id> <key> [expected-label]
   fm_backend_bb_tool_check || return 1
   case "$key" in
     C-c|ctrl+c|Ctrl-c|Ctrl-C)
-      bb thread tell --json --mode steer "$id" \
-        "INTERRUPT: stop the current action. Await new orders. Do not teardown." >/dev/null
+      bb thread stop --json "$id" >/dev/null
       ;;
     Enter|enter) return 0 ;;
     Escape|esc|Esc)
@@ -328,16 +345,14 @@ fm_backend_bb_busy_state() {  # <thread-id>
 }
 
 fm_backend_bb_agent_state() {  # <thread-id>
-  local id status
+  local id out status
   id=$(fm_backend_bb_thread_id "$1")
-  if ! fm_backend_bb_show "$id" >/dev/null 2>&1; then
-    printf 'missing'
-    return 0
-  fi
-  status=$(fm_backend_bb_show "$id" | fm_backend_bb_json_field status 2>/dev/null || true)
+  out=$(fm_backend_bb_show "$id" 2>/dev/null) || { printf 'unreadable'; return 0; }
+  status=$(printf '%s' "$out" | fm_backend_bb_json_field status 2>/dev/null || true)
+  # Idle is a resumable BB session, not a dead native endpoint.
   case "$status" in
-    active|running|starting|working|pending|queued) printf 'alive' ;;
-    idle|stopped|error|failed) printf 'dead' ;;
+    idle|active|running|starting|working|pending|queued) printf 'alive' ;;
+    stopped|error|failed) printf 'dead' ;;
     *) printf 'unreadable' ;;
   esac
 }
@@ -353,7 +368,7 @@ fm_backend_bb_kill() {  # <thread-id>
   id=$(fm_backend_bb_thread_id "$1")
   [ -n "$id" ] || { echo "error: refusing empty BB kill target" >&2; return 1; }
   fm_backend_bb_tool_check || return 1
-  bb thread stop "$id" >/dev/null 2>&1 || true
+  bb thread stop "$id" >/dev/null || return 1
 }
 
 # Paths only. Drops the same untracked harness noise fm-teardown.sh ignores
@@ -477,7 +492,7 @@ fm_backend_bb_remove_worktree() {  # <thread-id-or-worktree-id>
       fi
       ;;
   esac
-  fm_backend_bb_kill "$id"
+  fm_backend_bb_kill "$id" || return 1
   fm_backend_bb_tool_check || return 1
   bb thread archive "$id" || return 1
 }
@@ -704,6 +719,7 @@ fm_backend_bb_race_idle() {  # <timeout_secs> <thread_id...>
   [ "${#tids[@]}" -gt 0 ] || return 1
   dir=$(mktemp -d "${TMPDIR:-/tmp}/fm-bb-eventwait.XXXXXX") || return 2
   for tid in "${tids[@]}"; do
+    # shellcheck disable=SC2016 # Positional parameters belong to the child shell.
     setsid bash -c 'bb thread wait --status idle --timeout "$1" --json "$2" >"$3" 2>"$4"; printf "%s" "$?" > "$5"' \
       _ "$timeout" "$tid" "$dir/$tid.out" "$dir/$tid.err" "$dir/$tid.rc" </dev/null &
     pids+=("$!")
@@ -717,7 +733,7 @@ fm_backend_bb_race_idle() {  # <timeout_secs> <thread_id...>
       rcfile="$dir/$tid.rc"
       [ -f "$rcfile" ] || continue
       rc=$(tr -d '[:space:]' < "$rcfile" 2>/dev/null || true)
-      tids[$i]=
+      tids[i]=
       left=$((left - 1))
       case "$rc" in
         0|4)

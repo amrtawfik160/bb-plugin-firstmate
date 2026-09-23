@@ -28,7 +28,7 @@ Prefer `firstmate_*` tools on a captain thread. CLI works everywhere.
 
 ## Commands
 
-`guide`, `init` (`--real` clones firstmate and overlays `backends/bb.sh`), `scripts`, `fm`
+`guide`, `toolchain` (read-only native dependency check), `init` (`--real` clones firstmate and overlays `backends/bb.sh`), `scripts`, `fm`
 (any `bin/fm-*.sh` with `FM_BACKEND=bb`), `deck`, `session`, `dispatch`, `crews`,
 `crew`, `watch`, `tell`, `interrupt`, `stop`, `retry`, `bearings`, `deliver`,
 `merge`, `promote`, `queue`, `decide`, `posture`, `memory`, `afk`, `quiet`,
@@ -62,8 +62,35 @@ Run `bb firstmate --help` for flags. `--json` when output drives code.
 
 ## Rules
 
+- Run `firstmate_toolchain` once per captain session. Native bootstrap owns AXI
+  compatibility floors; missing essential tools block the affected workflow.
+- Use `gh-axi`, `quota-axi`, and `lavish-axi` for their native
+  roles; read current `--help`. Backlog calls go through the home's
+  `bin/fm-tasks-axi.sh`. No-mistakes workers own the actual `no-mistakes axi` run.
+- Use `/browser` with `browser_script` (or `bb browser script`) for browser work.
+  Leave `profileId` unset for the thread-isolated default. This overrides native
+  `chrome-devtools-axi` instructions; do not use the AXI browser or its hooks.
+  Lavish artifacts use the native process-event listener after opening, with one
+  poller per board.
+  BB crews must explicitly read the home's `config/lavish-axi-host` for the open
+  command; launcher shell exports do not propagate into BB threads. For a board
+  the remote captain should see, use `bb connect expose <port>` and append the
+  session path to its returned URL. Do not use Lavish's public sharing command
+  unless publishing was requested.
+
 - Never run crew work in captain thread; dispatch it.
 - Parent permission is ceiling: request `full` only when parent runs full.
 - Never poll crew status or guess thread ids; use crew ids from `crews` for targeted actions.
 - firstmate home (`init --real`) is a checkout env, never a nested worktree.
 - Prefer `firstmate_fm` / `bb firstmate fm` for policy scripts (brief, gate, PR merge, teardown) once a home exists.
+- Use `firstmate_wake` for wake presentation and acknowledgment. Generic `firstmate_fm` / `bb firstmate fm wake-drain` also scopes to this captain and uses at least 180 seconds, even when `timeoutSec` / `--timeout` is shorter; allow the existing call to finish.
+
+## Returning from away mode
+
+BB reconciles accepted human returns on captain activity/idle and before native
+spawn. It archives only the matching native away record, under its own lock;
+internal wakes and worker messages keep away mode active. Held reports remain
+available through `firstmate_afk` with `action: "off"` for the return brief.
+For an older stuck session, run `bb firstmate afk reconcile-return --captain
+<thread-id>`; it requires the same recorded return evidence and never raises the
+worker cap or deletes task records.

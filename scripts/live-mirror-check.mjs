@@ -4,7 +4,7 @@
 // PINNED upstream base (overlay/patch-base.txt) — i.e. the fast-forward a live home
 // needs can actually complete and still spawn bb. This is the proof PR #16's review
 // found missing plus the B2 acceptance: on a scratch clone AT THE PATCH BASE,
-// install → verify healthy → all three copies present → native rejects bb →
+// install → verify healthy → all five copies present → native rejects bb →
 // mirror accepts bb → a real fm-spawn reaches bb thread spawn.
 //
 // NOT part of `npm test` (needs the `bb` CLI, a connected host, and the real native
@@ -31,12 +31,12 @@ const SPAWNED = /^spawned .* window=bb:(thr_[a-z0-9]+)/m;
 const REJECTS_BB = /unknown backend 'bb'/;
 
 const createdThreads = [];
+let createdProject = "";
 function teardownThread(tid) {
   sh("bb", ["thread", "stop", tid]);
   sh("bb", ["thread", "archive", tid]);
   sh("bb", ["thread", "delete", tid, "--yes"]);
-  const wt = `/root/.bb-server/plugins/environment-git-worktree/host-data/worktrees/${tid}-1`;
-  if (existsSync(wt)) rmSync(wt, { recursive: true, force: true });
+
 }
 
 const checkout = discoverCheckout();
@@ -71,17 +71,21 @@ try {
     REJECTS_BB.test(nativePreInstall.out) && nativePreInstall.code !== 0,
     nativePreInstall.out.trim() || "(no output)");
 
-  // Discover a real registered bb project so a real thread can actually spawn; when
-  // none is reachable the dispatch proof below still holds (see spawn loop).
-  // Set FM_MIRROR_CHECK_NO_REAL_PROJECT=1 to prove dispatch WITHOUT spawning into a
-  // real project (the mirror still reaches the bb thread-spawn layer and 404s on the
-  // throwaway dir — enough for the dispatch proof, and it creates nothing real).
+  // Own the project as well as the home; never select a customer checkout.
+  mkdirSync(proj, { recursive: true });
+  for (const args of [["init", "-q"], ["config", "user.email", "fixture@example.invalid"],
+    ["config", "user.name", "Fixture"], ["commit", "-q", "--allow-empty", "-m", "init"]]) {
+    const result = sh("git", args, { cwd: proj });
+    if (result.code !== 0) throw new Error(result.out);
+  }
   let realProjectId = "";
-  let realProjectPath = "";
   if (process.env.FM_MIRROR_CHECK_NO_REAL_PROJECT !== "1") {
-    const plist = sh("bb", ["project", "list"]);
-    const prow = plist.out.split("\n").map((l) => l.match(/^(proj_[a-z0-9]+)\s+.+?\s+(\/\S.*)$/)).find(Boolean);
-    if (prow) { realProjectId = prow[1]; realProjectPath = prow[2].trim(); }
+    const created = sh("bb", ["project", "create", "--name", `mirror-acceptance-${process.pid}`, "--root", proj, "--json"]);
+    if (created.code !== 0) throw new Error(`scratch project creation failed: ${created.out}`);
+    const data = JSON.parse(created.stdout);
+    realProjectId = data.id || data.project?.id;
+    if (!realProjectId) throw new Error("scratch project creation returned no ID");
+    createdProject = realProjectId;
   }
 
   // (2) Install the overlay → mirror bin. No fake --project-id: without a real project
@@ -100,13 +104,13 @@ try {
   const okVerify = sh("python3", [INSTALLER, "--home", fmh, "--verify"]);
   record("installer --verify reports the fresh mirror healthy", okVerify.code === 0, okVerify.out.trim());
 
-  // (2c) all three no-seam files are carried as REAL copies (not symlinks) in the mirror.
-  const copiesOk = ["fm-backend.sh", "fm-spawn.sh", "fm-teardown.sh"].every((f) => {
+  // (2c) all five no-seam files are carried as REAL copies (not symlinks) in the mirror.
+  const copiesOk = ["fm-backend.sh", "fm-spawn.sh", "fm-teardown.sh", "fm-merge-local.sh", "fm-bootstrap.sh"].every((f) => {
     const p = join(fmh, "bin-bb", f);
     return existsSync(p) && !lstatSync(p).isSymbolicLink();
   });
-  record("all three no-seam files are real patched copies in the mirror", copiesOk,
-    copiesOk ? "fm-backend.sh, fm-spawn.sh, fm-teardown.sh present as copies" : "a copy is missing or is a symlink");
+  record("all five no-seam files are real patched copies in the mirror", copiesOk,
+    copiesOk ? "five backend/landing/bootstrap files present as copies" : "a copy is missing or is a symlink");
 
   // (3) MUTATION PROOF: same call, native REJECTS bb, mirror ACCEPTS it. The mirror
   //     is what makes bb dispatch work; nothing else changed.
@@ -116,14 +120,7 @@ try {
     REJECTS_BB.test(nativeReject.out) && nativeReject.code !== 0 && mirrorAccept.code === 0 && !REJECTS_BB.test(mirrorAccept.out),
     `native=${nativeReject.code} mirror=${mirrorAccept.code}`);
 
-  // Throwaway project.
-  mkdirSync(proj, { recursive: true });
-  sh("git", ["init", "-q"], { cwd: proj });
-  sh("git", ["config", "user.email", "x@x"], { cwd: proj });
-  sh("git", ["config", "user.name", "x"], { cwd: proj });
-  sh("git", ["commit", "-q", "--allow-empty", "-m", "init"], { cwd: proj });
-
-  const env = { ...process.env, FM_HOME: fmh, FM_ROOT: fmh };
+  const env = { ...process.env, FM_HOME: fmh, FM_ROOT: fmh, FM_BB_HIDDEN: "1", FM_BB_PARENT_THREAD_ID: "", BB_THREAD_ID: "" };
   const brief = (id) => join(fmh, "data", id, "brief.md");
   function scaffold(id, kind) {
     const args = kind === "scout" ? [id, "crew", "--scout"] : [id, "crew", "--mode", "direct-PR"];
@@ -135,7 +132,7 @@ try {
     const s = readFileSync(brief(id), "utf8").replace("{TASK}", task).replace("{FIRSTMATE_SPEC}", spec);
     writeFileSync(brief(id), s);
   }
-  const projDir = realProjectPath || proj;
+  const projDir = proj;
   const spawnEnv = realProjectId ? { ...env, FM_BB_PROJECT_ID: realProjectId } : env;
   function spawnInProject(bindir, id, kind) {
     const args =
@@ -154,7 +151,7 @@ try {
   const REACHED_BB = /backend=bb spawn needs|Failed to create thread|thread spawn|window=bb:|bb thread/i;
 
   for (const kind of ["ship", "scout"]) {
-    const intent = normalizeCaptainIntent(`Captain's intent: live-mirror ${kind} end to end`);
+    const intent = normalizeCaptainIntent(`Captain's intent: Disposable transport acceptance for ${kind}. Do not edit files, call tools, dispatch workers, or perform Git operations. Reply DONE: transport accepted.`);
 
     // (4a) MIRROR path: dispatches bb (no "unknown backend") through to the real bb
     //      thread-spawn layer. Records the real bb_thread_id when one is produced.
@@ -164,7 +161,7 @@ try {
     const good = spawnInProject(binDir(), okId, kind);
     const m = SPAWNED.exec(good.out);
     if (m) createdThreads.push(m[1]);
-    const dispatched = !REJECTS_BB.test(good.out) && (m !== null || REACHED_BB.test(good.out));
+    const dispatched = !REJECTS_BB.test(good.out) && (realProjectId ? good.code === 0 && m !== null : REACHED_BB.test(good.out));
     record(`${kind}: "$FM_BINDIR/fm-spawn.sh" (MIRROR) dispatches bb to the real bb layer`, dispatched,
       m ? `real bb thread=${m[1]}` : dispatched ? "reached bb thread spawn (no 'unknown backend')" : `unexpected: ${good.out.slice(-400)}`);
     if (m) record(`${kind}: MIRROR produced a real bb_thread_id`, true, m[1]);
@@ -181,7 +178,10 @@ try {
   }
 } finally {
   for (const tid of createdThreads) teardownThread(tid);
-  sh("bb", ["thread", "prune"]); // best-effort
+  if (createdProject) {
+    const removed = sh("bb", ["project", "delete", createdProject, "--yes"]);
+    record("disposable project cleanup succeeded", removed.code === 0, removed.code ? removed.out : undefined);
+  }
   try { rmSync(scratch, { recursive: true, force: true }); } catch {}
   if (createdThreads.length) console.log(`\n(cleaned up real threads: ${createdThreads.join(", ")})`);
 }

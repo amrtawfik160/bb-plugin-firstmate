@@ -3,18 +3,11 @@ name: harness-adapters
 description: >-
   Agent-only reference for firstmate harness operations.
   Use before spawning or recovering a crewmate or secondmate, handling a trust dialog, sending a harness-specific skill invocation, interrupting or exiting an agent, resuming an exited agent, or verifying a new harness adapter.
-  Contains verified facts for bb, claude, codex, opencode, pi, pi-signed, grok, kimi, cursor, gemini, muse, rovo, omp, agy, and devin.
+  Contains verified facts for claude, codex, opencode, pi, pi-signed, grok, kimi, cursor, gemini, muse, rovo, omp, agy, and devin.
 user-invocable: false
 metadata:
   internal: true
 ---
-
-<!-- BB-SOURCE
-     native: .agents/skills/harness-adapters/SKILL.md
-     sha: 8c47279f54e379e8ffa86a8d3a5b568f23ccf281
-     snapshot: native-snapshot/8c47279f/.agents/skills/harness-adapters/SKILL.md
-     fidelity: adapted
--->
 
 # harness-adapters
 
@@ -63,16 +56,6 @@ The `harness-adapter-routing-v1` object is the machine-readable and human-visibl
 `default` is the normal scenario when no narrower scenario applies.
 Kimi establishes its unsupported primary boundary in its selected harness reference; Muse and Gemini follow Non-negotiable safety above.
 A new tool remains undispatchable until the `verify` plan, its harness entry, every named owner, and the live checks land.
-
-<!-- BB-DIVERGE
-     native: .agents/skills/harness-adapters/SKILL.md § Operation-to-reference matrix
-     native-quote: Every emitted plan appends the selected or recorded harness reference after the named common references.
-     bb: BB loads references/harness/bb.md for firstmate_dispatch thread transport before applying this matrix.
-     reason: Upstream has no BB plugin backend entry.
--->
-<!-- BB-ONLY: BB harness routing entry -->
-For the BB runtime, read `references/harness/bb.md`; `firstmate_dispatch` and `firstmate_retry` own its thread lifecycle.
-<!-- /BB-ONLY -->
 
 ```json harness-adapter-routing-v1
 {

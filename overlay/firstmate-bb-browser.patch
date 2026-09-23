@@ -1,0 +1,14 @@
+diff --git a/bin/fm-bootstrap.sh b/bin/fm-bootstrap.sh
+--- a/bin/fm-bootstrap.sh
++++ b/bin/fm-bootstrap.sh
+@@ -908,6 +908,10 @@
+ # no verified dependency set is reported before the universal checks continue.
+ COMMON_TOOLS="node git gh no-mistakes gh-axi chrome-devtools-axi tasks-axi quota-axi"
+ BACKEND=$(fm_backend_name)
++# BB browser work uses the /browser plugin, not the AXI browser dependency.
++if [ "$BACKEND" = bb ]; then
++  COMMON_TOOLS=${COMMON_TOOLS//chrome-devtools-axi/}
++fi
+ BACKEND_VALID=1
+ if ! BACKEND_TOOLS=$(fm_backend_required_tools "$BACKEND"); then
+   BACKEND_VALID=0

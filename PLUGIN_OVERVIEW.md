@@ -198,7 +198,10 @@ waives one exact failing check while every other check must stay green — never
 silently, and separate from `--yes`. `deck`/`bearings` retire crews whose PR was
 merged or closed outside BB.
 
-## Native-firstmate parity (divergence table)
+## Historical parity tracking
+
+See [current parity and runtime limits](docs/native-parity.md) before interpreting
+the historical closure labels below. They do not establish runtime equivalence.
 
 Status of each divergence from the root-cause audit, re-run item by item.
 CLOSED = behaves like native firstmate (or routes through it); PARTIAL = the
@@ -216,7 +219,7 @@ and why.
 | 7 | Scout delivery/retirement semantics | PARTIAL | Ships default to isolated worktrees; scout durable external `report.md` and completed-scout scratch discard remain native-owned via real teardown. |
 | 8 | Retry = resubmission, not recovery relaunch | CLOSED | `retry` with `--model`/`--provider`/`--reasoning-level` relaunches a fresh thread in the same worktree. |
 | 9 | Queue/decisions/memory/AFK/quiet lookalikes | CLOSED | Each routes through its native owner behind a flag (`queueOwner`/`decisionsOwner`/`afkOwner`/`quietOwner`/`memoryOwner`); Phase 5 hardened queue (caller-owns-id) and memory (atomic chunked host writes + cap/rotate). |
-| 10 | Secondmate is a different feature | PARTIAL | Routing now honors natural-language `scope` + a non-exclusive project clone list (`pickSecondmate`); multiple mates supported. OPEN: seeded isolated `FM_HOME`, backlog handoff, config/memory inheritance, and an independently-supervising child firstmate — BB's backend `create_task` only spawns non-nesting leaf crews and native refuses `--secondmate` on backend=bb, so a real secondmate home cannot be stood up without a secondmate-capable bb backend. |
+| 10 | Secondmate lifecycle | WIRED | Native seeding/spawn now launches a captain in the seeded home. Existing-thread routing remains separate and refuses uncertain delivery. See [current parity details](docs/native-parity.md). |
 | 11 | Deck never renders real bearings | CLOSED | Deck runs real `fm-bearings-snapshot` (authoritative) beside the KV digest (labelled cache). |
 | 12 | Real-mode version not the referenced checkout | CLOSED | Reused clones fast-forward (ff-only, clean tree) on init; script/skill counts read from the actual clone. |
 
@@ -270,7 +273,6 @@ and why.
   no-spawn guard prevents flooding; BB resumes paging whenever the beat goes stale
   (no supervision gap). A full live-thread e2e was intentionally not run to avoid
   touching live fleet state; run it in a dedicated sandbox before enabling live.
-- **Secondmate (item 10):** feasible subset only (scope + clone-list routing). A
-  dead/archived mate thread never loses the task — if the routing send throws,
-  dispatch logs and falls back to a normal native spawn. Full native
-  home/handoff/inheritance/child-supervision remains OPEN as above.
+- **Secondmate (item 10):** native seed/spawn uses the BB captain adapter.
+  Failed routing no longer falls back to a potentially duplicate worker.
+  See [current parity details](docs/native-parity.md) for migration and verification.
