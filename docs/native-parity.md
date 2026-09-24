@@ -41,14 +41,18 @@ explicit acknowledgement. If the optional turn-end backstop is enabled, unchange
 queue contents get at most its configured number of re-rings. New queue contents
 reset that budget. The normal native profile leaves this backstop off.
 
-## Runtime limits
+## Runtime limits and how the plugin closes them
 
 BB SDK 0.4.104 has no blocking turn-end hook, no silent suppression for only
 core child-completion messages, and no native harness-process identity for a
-host-terminal invocation of `fm-session-start`. A plugin cannot honestly claim
-those guarantees. Native session startup remains callable, but a refused process
-lock is not treated as verified session ownership. Dedicated homes and native
-watchers isolate supervision without forging a harness PID.
+host-terminal command. The plugin closes each as far as the SDK allows:
+
+| Native guarantee | BB mechanism | Remaining gap |
+| --- | --- | --- |
+| Turn-end wake guard (`fm-turnend-guard.sh`) | `deck` installs user-level Claude/Codex `Stop` hooks (`overlay/bin/bb-captain-hook.sh`), gated on `~/.bb-firstmate/captains/<thread>`. A captain with unacknowledged wakes is blocked once per turn (exit 2; `stop_hook_active` allows the next stop). Other threads exit 0. | Queued-wake predicate only; watcher health stays with the plugin's supervisor. Codex asks to trust new hook entries once before it runs them. |
+| Session lock owned by the harness | The same hooks run `fm-sessionstart-run.sh` from `SessionStart`, inside the harness process tree, for a captain with its own home. | Legacy captains on the shared base home do not take its lock; run `deck` to move them to their own home. |
+| Wakes delivered at turn boundaries | A `message.dispatch` hook holds BB's crew-completion pings while the captain's turn is running and releases them as one batch at idle (`recheck`). | Held pings show as queued rows, not silence; BB offers no silent drop. |
+| Root wake queue drained by its session | Captains drain their own partition. The fm-watch supervisor acknowledges shared base-home root rows older than 10 minutes, after the relay forwarded them. | Skipped when a captain is bound to the base home itself. |
 
 Native `no-mistakes` use remains worker-owned, as upstream specifies. Native's PR
 merge script verifies forge state; it does not independently attest a successful

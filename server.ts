@@ -718,6 +718,84 @@ export function rewriteWakeAckLine(out: string): string {
   return out.replace(/bin\/fm-wake-drain\.sh/g, "bb firstmate wake");
 }
 
+// BB's own crew-completion pings ("@thread:<id> completed: …") are system
+// messages. Joining a captain's running turn they interrupt it and duplicate the
+// durable wake queue; native firstmate delivers wakes at turn boundaries. Hold
+// them while the captain is mid-turn and release them as one batch at idle.
+const CREW_PING_RE = /^\s*(?:\[bb system\]\s*)?@thread:[A-Za-z0-9_-]+ (?:completed|failed|was interrupted|interrupted|needs attention)\b/i;
+export function crewPingHoldDecision(input: {
+  attempt: string;
+  initiator: string;
+  text: string;
+  targetIsCaptain: boolean;
+  senderIsCrew: boolean;
+}): "hold" | "proceed" {
+  if (input.attempt !== "join-turn" || input.initiator !== "system" || !input.targetIsCaptain) return "proceed";
+  return input.senderIsCrew || CREW_PING_RE.test(input.text) ? "hold" : "proceed";
+}
+
+// The base home's root wake queue is fed by the native watcher, whose output the
+// plugin relays to each owning captain; captains drain only their own partition
+// (state/cap-<thread>), so nothing ever acknowledged the root rows. They piled up
+// (1,824 rows in two days) and native guards then refused teardown. This acks
+// root rows older than a grace window, after the relay has had them.
+export function rootWakePruneScript(fmHome: string, graceSec: number): string {
+  const home = `'${fmHome.replace(/'/g, `'\\''`)}'`;
+  return [
+    "set -u",
+    `cd ${home} || exit 0`,
+    "q=state/.wake-queue",
+    '[ -s "$q" ] || { echo "root-wake-prune rows=0"; exit 0; }',
+    `cutoff=$(( $(date +%s) - ${Math.max(60, Math.trunc(graceSec))} ))`,
+    "through=$(awk -F'\\t' -v c=\"$cutoff\" '$1 < c && $2 > m { m = $2 } END { print m + 0 }' \"$q\")",
+    '[ "$through" -gt 0 ] || { echo "root-wake-prune nothing-old"; exit 0; }',
+    // Native drain prints the ack line promptly, then may linger; cap it.
+    'out=$(FM_BACKEND=bb timeout 90 bin/fm-wake-drain.sh 2>&1 </dev/null || true)',
+    "gen=$(printf '%s\\n' \"$out\" | sed -n 's/.*--recovery-generation \\([A-Za-z0-9._-]*\\).*/\\1/p' | tail -n 1)",
+    '[ -n "$gen" ] || { echo "root-wake-prune no-generation"; exit 0; }',
+    'FM_BACKEND=bb timeout 240 bin/fm-wake-drain.sh --ack-through "$through" --recovery-generation "$gen" >/dev/null 2>&1 </dev/null || { echo "root-wake-prune ack-failed through=$through"; exit 0; }',
+    'echo "root-wake-prune through=$through left=$(awk \'END { print NR }\' "$q")"',
+  ].join("\n");
+}
+
+// User-level harness hooks for captain threads (overlay/bin/bb-captain-hook.sh).
+// BB captains run inside product repos, so upstream's project-level Stop and
+// SessionStart hooks never load; these entries restore them, gated on a
+// per-captain marker so every other thread is a silent no-op.
+export const CAPTAIN_HOOK_MARK = "bb-firstmate/bin/bb-captain-hook.sh";
+export function captainHookCommand(mode: "stop" | "session-start"): string {
+  return `h="$HOME/.${CAPTAIN_HOOK_MARK}"; [ -n "\${BB_THREAD_ID:-}" ] && [ -x "$h" ] && exec "$h" ${mode}; exit 0`;
+}
+export function captainHookInstallScript(input: {
+  threadId: string;
+  home: string;
+  state: string;
+  ownHome: boolean;
+  scriptB64: string;
+}): string {
+  const q = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
+  const merge = (file: string, event: "Stop" | "SessionStart", mode: "stop" | "session-start", timeout: number) =>
+    `f=${file}; [ -f "$f" ] || printf '{}\n' > "$f"; ` +
+    `if ! jq -e --arg c ${q(captainHookCommand(mode))} 'any(.hooks.${event}[]?.hooks[]?; .command == $c)' "$f" >/dev/null 2>&1; then ` +
+    `[ -f "$f.bak-bb-firstmate" ] || cp "$f" "$f.bak-bb-firstmate"; ` +
+    `t=$(mktemp) && jq --arg c ${q(captainHookCommand(mode))} ` +
+    `'.hooks.${event} = ((.hooks.${event} // []) + [{"hooks":[{"type":"command","command":$c,"timeout":${timeout}}]}])' "$f" > "$t" ` +
+    `&& cat "$t" > "$f"; rm -f "$t"; fi`;
+  return [
+    "set -e",
+    "command -v jq >/dev/null",
+    'd="$HOME/.bb-firstmate"; mkdir -p "$d/bin" "$d/captains"',
+    `printf %s ${q(input.scriptB64)} | base64 -d > "$d/bin/bb-captain-hook.sh.tmp" && chmod 0755 "$d/bin/bb-captain-hook.sh.tmp" && mv "$d/bin/bb-captain-hook.sh.tmp" "$d/bin/bb-captain-hook.sh"`,
+    `printf 'home=%s\nstate=%s\nown_home=%s\n' ${q(input.home)} ${q(input.state)} ${input.ownHome ? "1" : "0"} > "$d/captains/${input.threadId}"`,
+    'mkdir -p "$HOME/.claude" "$HOME/.codex"',
+    merge('"$HOME/.claude/settings.json"', "Stop", "stop", 30),
+    merge('"$HOME/.claude/settings.json"', "SessionStart", "session-start", 180),
+    merge('"$HOME/.codex/hooks.json"', "Stop", "stop", 30),
+    merge('"$HOME/.codex/hooks.json"', "SessionStart", "session-start", 180),
+    "echo captain-hooks-ok",
+  ].join("\n");
+}
+
 function overlayBytes(rel: string): string {
   return readFileSync(join(OVERLAY_DIR, rel)).toString("base64");
 }
@@ -1287,6 +1365,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
+  const knownCaptainsRef = new Set<string>();
   type HomeScope = { captain?: string; home?: string; host?: string };
   const homeScope = new AsyncLocalStorage<HomeScope>();
   const captainHomes = new Map<string, string>();
@@ -3700,6 +3779,7 @@ export default async function plugin(bb: BbPluginApi) {
       const thread = asRecord(await bb.sdk.threads.get({ threadId }));
       if (typeof thread["projectId"] === "string") {
         await bb.storage.kv.set(`${CAPTAIN_PROJECT_PREFIX}${threadId}`, thread["projectId"]);
+        knownCaptainsRef.add(threadId);
       }
       const patch: { threadId: string; title?: string; visibility?: "visible" } = { threadId };
       if (isBlankTitle(thread["title"])) {
@@ -4454,6 +4534,30 @@ export default async function plugin(bb: BbPluginApi) {
   // Real firstmate is the default. On deck, if it is not already initialized,
   // clone + overlay it now (best-effort); on any failure, surface the single
   // one-time command the captain must run. Returns a line for the deck digest.
+  async function installCaptainHooks(
+    hostId: string,
+    threadId: string | undefined,
+    fallbackHome: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (threadId === undefined || !/^[A-Za-z0-9_-]+$/.test(threadId)) return;
+    const stored = await bb.storage.kv.get<string>(`native-home:${threadId}`);
+    const home = typeof stored === "string" && stored !== "" ? stored : fallbackHome;
+    const script = captainHookInstallScript({
+      threadId,
+      home,
+      state: wakeStateDir(home, threadId),
+      ownHome: home.endsWith(`-bb-homes/${threadId}`),
+      scriptB64: overlayBytes("bin/bb-captain-hook.sh"),
+    });
+    const res = await runOnHost(hostId, `bash -c ${shQuote(script)}`, 60_000, signal);
+    if (res.exitCode !== 0 || !res.output.includes("captain-hooks-ok")) {
+      bb.log.warn(`captain hook install failed captain=${threadId} host=${hostId}: ${truncate(res.output, 400)}`);
+    } else {
+      bb.log.info(`captain hooks installed captain=${threadId} home=${home}`);
+    }
+  }
+
   async function ensureRealModeForDeck(ctx: unknown, signal: AbortSignal | undefined): Promise<string> {
     if ((await baseSettings.get()).fullParityOnDeck) await ensureCaptainHome(ctx, signal);
     const current = await settings.get();
@@ -4473,6 +4577,7 @@ export default async function plugin(bb: BbPluginApi) {
         );
         await refreshSkillsManifest(hostId, current.fmHome, signal);
         await refreshCaptainMemory();
+        await installCaptainHooks(hostId, ctxString(ctx, "threadId"), current.fmHome, signal);
       } catch (error) {
         if (current.fullParityOnDeck) throw new Error(`Native setup failed; captain is not ready: ${error instanceof Error ? error.message : String(error)}`);
         bb.log.warn(`Native adapter refresh failed in compatibility mode: ${String(error)}`);
@@ -7404,7 +7509,39 @@ export default async function plugin(bb: BbPluginApi) {
     if (!isCaptainSpawn(thread)) return;
     await settleDeck(thread.id);
   });
+  // Captain ids for the fast dispatch hook (KV-backed; settleDeck adds new ones).
+  const knownCaptains = knownCaptainsRef;
+  for (const key of await bb.storage.kv.list(CAPTAIN_PROJECT_PREFIX)) knownCaptains.add(key.slice(CAPTAIN_PROJECT_PREFIX.length));
+  const heldPingCaptains = new Set<string>();
+  try {
+    bb.experimental_hooks.on("message.dispatch", async (context) => {
+      try {
+        const threadId = context.thread.id;
+        if (!knownCaptains.has(threadId)) return { action: "proceed" };
+        const sender = typeof context.senderThreadId === "string" && context.senderThreadId !== "mixed" ? context.senderThreadId : null;
+        const senderIsCrew = sender !== null && (await readCrews()).some((c) => c.threadId === sender);
+        const decision = crewPingHoldDecision({
+          attempt: context.attempt,
+          initiator: String(context.initiator),
+          text: context.input.text,
+          targetIsCaptain: true,
+          senderIsCrew,
+        });
+        if (decision === "proceed") return { action: "proceed" };
+        heldPingCaptains.add(threadId);
+        return { action: "wait", reason: "Crew update held until the captain's current turn ends (firstmate batches crew pings)." };
+      } catch {
+        return { action: "proceed" };
+      }
+    });
+  } catch (error) {
+    bb.log.warn(`message.dispatch hook unavailable; crew pings join running turns: ${String(error)}`);
+  }
+
   bb.events.on("thread.idle", async ({ thread, lastAssistantText }) => {
+    if (heldPingCaptains.delete(thread.id)) {
+      await bb.experimental_hooks.recheck("message.dispatch").catch((error) => bb.log.warn(`crew ping release failed captain=${thread.id}: ${String(error)}`));
+    }
     await inCaptainHome(thread.id, () => reconcileReturnedAfk(thread.id)).catch(error => bb.log.warn(`AFK return: ${String(error)}`));
     // Turn-end backstop for the captain (no-op unless turnEndGuard=re-ring and this
     // is the captain thread). Captains are not crews.
@@ -8284,6 +8421,27 @@ export default async function plugin(bb: BbPluginApi) {
   // A durable on-host keeper re-arms fm-watch (which self-terminates on an actionable
   // wake); this service ensures the keeper is alive and reads the heartbeat so
   // stuckPass can gate suppression on a live watcher — no gap.
+  const ROOT_WAKE_PRUNE_INTERVAL_MS = 10 * 60_000;
+  const ROOT_WAKE_GRACE_SEC = 600;
+  const rootWakePruneNext = new Map<string, number>();
+  const rootWakePruneRunning = new Set<string>();
+  function pruneRelayedRootWakes(hostId: string, fmHome: string, signal?: AbortSignal): void {
+    const key = `${hostId}|${fmHome}`;
+    // A captain bound to this exact home drains the root queue itself; never ack for it.
+    if ([...captainHomes.values()].includes(fmHome)) return;
+    if (rootWakePruneRunning.has(key) || (rootWakePruneNext.get(key) ?? 0) > Date.now()) return;
+    rootWakePruneRunning.add(key);
+    rootWakePruneNext.set(key, Date.now() + ROOT_WAKE_PRUNE_INTERVAL_MS);
+    void runOnHost(hostId, `bash -c ${shQuote(rootWakePruneScript(fmHome, ROOT_WAKE_GRACE_SEC))}`, 600_000, signal)
+      .then((res) => {
+        const line = res.output.split("\n").find((l) => l.startsWith("root-wake-prune")) ?? truncate(res.output, 200);
+        if (line.includes("through=") && !line.includes("ack-failed")) bb.log.info(`fm-watch: ${line} home=${fmHome}`);
+        else if (!line.includes("rows=0") && !line.includes("nothing-old")) bb.log.warn(`fm-watch: ${line} home=${fmHome}`);
+      })
+      .catch((error) => bb.log.warn(`fm-watch: root wake prune failed home=${fmHome}: ${String(error)}`))
+      .finally(() => rootWakePruneRunning.delete(key));
+  }
+
   bb.background.service("fm-watch-supervisor", {
     async start(signal) {
       // R2 dedup memory across cycles (digit-normalized keys).
@@ -8348,6 +8506,7 @@ export default async function plugin(bb: BbPluginApi) {
                 consecutiveRelaunch: streak,
               });
               await relayWatchReasons(extractWatchReasons(res.logTail), hostId, relaySeen, signal);
+              pruneRelayedRootWakes(hostId, s.fmHome.trim(), signal);
             }
             // Legacy single-key mirror (one release): the first host's liveness, so
             // an older UI reading "fm-watch-beat" still sees a beat.
