@@ -8927,3 +8927,39 @@ test("the background landed sweep never retires a crew whose PR was closed unmer
     await host.harness.lifecycle.dispose();
   }
 });
+
+test("the landed sweep never wakes an archived (retired) owning captain", async () => {
+  const host = await load();
+  try {
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_capB")]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async (input: { threadId: string }) => ({
+      ...makeThreadResponse({ id: input.threadId, status: "idle", environmentId: input.threadId === "thr_crew" ? "env_wt" : null }),
+      ...(input.threadId === "thr_capB" ? { archivedAt: "2026-09-01T00:00:00.000Z" } : {}),
+    }));
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+    host.harness.sdk.stub("threads.updatePluginMetadata", async () => ({}));
+    host.harness.sdk.stub("threads.output", async () => ({ output: "DONE: shipped" }));
+    host.harness.sdk.stub("threads.stop", async () => ({}));
+    host.harness.sdk.stub("threads.archive", async () => ({}));
+    host.harness.sdk.stub("threads.send", async () => ({}));
+    host.harness.sdk.stub("environments.pullRequest", async () => ({
+      outcome: "available",
+      pullRequest: { url: "https://github.com/o/r/pull/9", number: 9, title: "t", state: "merged", checks: { state: "passing" }, mergeability: { mergeable: "MERGEABLE" } },
+    }));
+    await host.bb.storage.kv.set("watch-meta", { lastPassAt: Date.now(), checked: -1, notified: -1 });
+    const run = host.harness.behavior.runService("crew-watch");
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline && ((await host.bb.storage.kv.get("crews")) as unknown[]).length > 0) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    run.controller.abort();
+    await run.done;
+    assert.deepEqual(await host.bb.storage.kv.get("crews"), [], "the landed crew is still retired");
+    assert.equal(sendCalls(host).filter((s) => s.threadId === "thr_capB").length, 0, "a retired captain is not woken");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});

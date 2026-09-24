@@ -2122,10 +2122,13 @@ export default async function plugin(bb: BbPluginApi) {
     void run.finally(() => { if (heldWakeLocks.get(captain) === run) heldWakeLocks.delete(captain); }).catch(() => {});
     return run;
   }
-  async function captainHoldState(parentThreadId: string, signal?: AbortSignal): Promise<{ hold: boolean; reason: string; status: string | null }> {
+  async function captainHoldState(parentThreadId: string, signal?: AbortSignal): Promise<{ hold: boolean; reason: string; status: string | null; archived: boolean }> {
     let status: string | null = null;
+    let archived = false;
     try {
-      status = (await raceAbort(bb.sdk.threads.get({ threadId: parentThreadId }), signal, STUCK_HOST_CALL_MS)).status;
+      const thread = await raceAbort(bb.sdk.threads.get({ threadId: parentThreadId }), signal, STUCK_HOST_CALL_MS);
+      status = thread.status;
+      archived = asRecord(thread)["archivedAt"] != null;
     } catch (error) {
       if (isAbortError(error)) throw error;
     }
@@ -2141,7 +2144,7 @@ export default async function plugin(bb: BbPluginApi) {
     } catch (error) {
       if (isAbortError(error)) throw error;
     }
-    return { ...captainWakeHold({ status, rateLimit, now: Date.now() }), status };
+    return { ...captainWakeHold({ status, rateLimit, now: Date.now() }), status, archived };
   }
   async function holdCaptainWake(parentThreadId: string, text: string, reason: string): Promise<void> {
     await withHeldWakeLock(parentThreadId, async () => {
@@ -2163,6 +2166,8 @@ export default async function plugin(bb: BbPluginApi) {
       }
       if (held.data.lines.length === 0) { await bb.storage.kv.delete(key); return false; }
       const state = await captainHoldState(parentThreadId, signal);
+      // An archived captain is retired: its held wakes are dropped, never re-sent every 30s.
+      if (state.archived) { await bb.storage.kv.delete(key); return false; }
       if (state.hold) return false;
       if (!(await sendCaptainWake(parentThreadId, heldWakesMessage(held.data), "held-wakes", signal))) return false;
       await bb.storage.kv.delete(key);
@@ -2175,6 +2180,12 @@ export default async function plugin(bb: BbPluginApi) {
   // wake counts as delivered: it is persisted and released as one consolidated wake.
   async function deliverToCaptain(parentThreadId: string, text: string, crewId: string, signal?: AbortSignal): Promise<boolean> {
     const state = await captainHoldState(parentThreadId, signal);
+    // Host-wide sweeps (landed PRs, fm-watch relay) reach crews of captains the user
+    // archived; a wake would revive a retired captain. The durable queue keeps the report.
+    if (state.archived) {
+      bb.log.info(`captain ${parentThreadId} is archived; wake for crew ${crewId} not sent`);
+      return true;
+    }
     if (state.hold) {
       await holdCaptainWake(parentThreadId, text, state.reason);
       bb.log.info(`captain ${parentThreadId} wake held for crew ${crewId}: ${state.reason}`);
