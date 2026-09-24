@@ -16,6 +16,8 @@ import {
   decisionDue,
   classifyMetaKind,
   hasStatusProtocol,
+  isWaitingYield,
+  WAITING_PROTOCOL,
   idleVerdictPresentation,
   looksReadOnly,
   foldOpenDecisions,
@@ -473,7 +475,7 @@ export function captainWakeDoorbell(head: string, summary: string, opts?: { drai
 const INTERNAL_WAKE_GUIDANCE = [
   "FIRSTMATE INTERNAL WAKE — hidden from the captain. Do not quote, paraphrase, or announce it.",
   "Call firstmate_wake once with ack=true; it presents and acknowledges the durable reports in one call.",
-  "Act only where a report needs action (review, merge, retry, decision). A stale line for a crew that already finished needs nothing.",
+  "Act only where a report needs action (review, merge, retry, decision). A stale line for a crew that already finished, or a crew WAITING: on an external run, needs nothing.",
   "If nothing needs the captain, end the turn with no reply text at all — never send 'nothing new', 'still in progress', or a status recap.",
   "Otherwise reply once with the concise material outcome, review item, needed decision, credential/login request, or blocker that remains after recovery.",
 ].join(" ");
@@ -761,6 +763,138 @@ export function doorbellSupersededByBbPing(input: {
   if (input.kind !== "idle" && input.kind !== "review" && input.kind !== "error") return false;
   if (input.captainStatus !== "idle") return false;
   return input.captainTurnStartedAt !== null && input.captainTurnStartedAt >= input.crewFinishedAt;
+}
+
+// BB core posts "[bb system] @thread:<crew> completed|failed" to the parent for EVERY turn
+// end of a parent-notifiable child (parentThreadId set, originKind null), carrying the
+// crew's final output (or the failure), and no plugin hook can hold or drop it. So for a
+// turn-end outcome the plugin doorbell is always a SECOND captain wake for the same news.
+// When the durable row holds the full report (the captain's stop hook will not let the turn
+// end until it is drained), BB's ping is the one wake and the doorbell is skipped.
+// Decisions and interactions keep their doorbell: the ping lacks that context.
+export function bbPingCarriesOutcome(input: {
+  kind: string;
+  durable: boolean;
+  captainThreadId: string;
+  crewParentThreadId: string | null | undefined;
+  crewOriginKind: string | null | undefined;
+}): boolean {
+  if (!input.durable) return false;
+  if (input.kind !== "idle" && input.kind !== "review" && input.kind !== "error") return false;
+  return input.crewParentThreadId === input.captainThreadId && input.crewOriginKind == null;
+}
+
+// The captain's provider limit, read from its recent thread events (newest first). A
+// successful turn after the limit clears it; a `provider/rateLimits/updated` row carries
+// the blocked window's reset time; a bare rate-limit `provider/error` has none.
+export interface CaptainRateLimit { resetsAt: number | null; at: number }
+export function captainRateLimitFromEvents(rows: ReadonlyArray<{ type: string; createdAt?: number; data?: unknown }>): CaptainRateLimit | null {
+  let errAt: number | null = null;
+  for (const row of rows) {
+    const data = asRecordLoose(row.data);
+    const at = typeof row.createdAt === "number" ? row.createdAt : 0;
+    if (row.type === "turn/completed" && data["status"] === "completed") break;
+    if (row.type === "provider/error" && asRecordLoose(data["errorInfo"])["category"] === "rate-limit") {
+      errAt ??= at;
+      continue;
+    }
+    if (row.type === "provider/rateLimits/updated") {
+      const limits = asRecordLoose(data["rateLimits"]);
+      if (limits["status"] === "blocked") {
+        const windows = Array.isArray(limits["windows"]) ? limits["windows"] : [];
+        const resets = windows
+          .map(asRecordLoose)
+          .filter((w) => w["status"] === "blocked" && typeof w["resetsAtMs"] === "number")
+          .map((w) => w["resetsAtMs"] as number);
+        return { resetsAt: resets.length > 0 ? Math.max(...resets) : null, at };
+      }
+      if (errAt === null) return null;
+      break;
+    }
+  }
+  return errAt === null ? null : { resetsAt: null, at: errAt };
+}
+
+// A limit with no known reset holds for this long after its last error.
+export const CAPTAIN_LIMIT_HOLD_MS = 30 * 60_000;
+
+// Every wake started for a captain whose provider is out of quota fails at once (observed:
+// 11 failed turns in one session-limit window), and a steer into an errored captain is
+// refused (HTTP 409). Hold wakes while either is true; the durable queue already keeps
+// the reports, and the held lines go out as one consolidated wake once the captain is back.
+export function captainWakeHold(input: { status: string | null; rateLimit: CaptainRateLimit | null; now: number }): { hold: boolean; reason: string } {
+  const rl = input.rateLimit;
+  if (rl !== null) {
+    const until = rl.resetsAt ?? rl.at + CAPTAIN_LIMIT_HOLD_MS;
+    if (until > input.now) return { hold: true, reason: `provider limit until ${new Date(until).toISOString().slice(11, 16)} UTC` };
+  }
+  if (input.status === "error") return { hold: true, reason: "captain thread is in error" };
+  return { hold: false, reason: "" };
+}
+
+// One wake for everything held while the captain was unavailable.
+export function heldWakesMessage(held: { since: number; reason: string; lines: string[] }, max = 3000): string {
+  const head = `🔔 ${held.lines.length} crew update(s) held while you were unavailable (${held.reason}) since ${new Date(held.since).toISOString().slice(11, 16)} UTC:`;
+  const out: string[] = [head];
+  let used = head.length;
+  let shown = 0;
+  for (const line of held.lines) {
+    const item = `- ${line.replace(/\s*\n\s*/g, " | ")}`;
+    if (used + item.length + 1 > max) break;
+    out.push(item);
+    used += item.length + 1;
+    shown++;
+  }
+  if (shown < held.lines.length) out.push(`- …${held.lines.length - shown} more; the durable queue has every report.`);
+  out.push(CAPTAIN_WAKE_DRAIN_HINT);
+  return out.join("\n");
+}
+
+function asRecordLoose(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+// Captain-facing tool outputs are re-read on every later model call of the session, so a
+// 30k-character script dump costs far more than its one read. Longer outputs keep their
+// head and tail inline and point at the full copy.
+export const CAPTAIN_TOOL_OUTPUT_MAX = 12_000;
+export function capToolOutput(text: string, fullPath: string | null, max = CAPTAIN_TOOL_OUTPUT_MAX): string {
+  if (text.length <= max) return text;
+  const headLen = Math.floor(max * 0.6);
+  const tailLen = max - headLen;
+  const where = fullPath !== null ? `full output (${text.length} chars) saved at ${fullPath}; read only the part you need` : `full output was ${text.length} chars and could not be saved; re-run with narrower arguments`;
+  return `${text.slice(0, headLen)}\n\n[… ${text.length - headLen - tailLen} chars omitted — ${where} …]\n\n${text.slice(text.length - tailLen)}`;
+}
+
+// firstmate_contract by section. The full native AGENTS.md is ~90k characters; returned
+// whole on every session start it dominated the captain's context. By default return the
+// table of contents plus the always-on sections (identity, captain precedence); any other
+// section, or "all", is one more call away, so nothing the captain needs is dropped.
+export interface ContractSection { key: string; title: string; body: string }
+export function contractSections(content: string): { preamble: string; sections: ContractSection[] } {
+  const parts = content.split(/^(?=## )/m);
+  const preamble = parts[0]!.startsWith("## ") ? "" : parts.shift()!;
+  const sections = parts.map((body) => {
+    const title = (body.split("\n", 1)[0] ?? "").replace(/^##\s+/, "").trim();
+    const num = /^(\d+)\./.exec(title)?.[1];
+    return { key: num ?? title.toLowerCase(), title, body };
+  });
+  return { preamble, sections };
+}
+export const CONTRACT_DEFAULT_SECTIONS = ["1", "captain instruction precedence"];
+export function selectContract(content: string, section: string | undefined, threshold = 24_000): { text: string; complete: boolean } {
+  const { preamble, sections } = contractSections(content);
+  const want = (section ?? "").trim().toLowerCase();
+  if (want === "all" || sections.length === 0 || (want === "" && content.length <= threshold)) return { text: content, complete: true };
+  const toc = [
+    "## Contract sections (call firstmate_contract with section=<number or title>; section=\"all\" returns everything)",
+    ...sections.map((s) => `- ${s.title} (${s.body.length} chars)`),
+    "Read the section for an area before acting in it: 7 before dispatch/validate/merge, 8 while supervising, 9 before messaging the captain.",
+  ].join("\n");
+  const keys = want === "" ? CONTRACT_DEFAULT_SECTIONS : want.split(",").map((k) => k.trim().replace(/^§\s*/, "").replace(/\.$/, "")).filter((k) => k !== "");
+  const picked = sections.filter((s) => keys.some((k) => s.key === k || (!/^\d+$/.test(k) && s.title.toLowerCase().includes(k))));
+  if (picked.length === 0) return { text: `No contract section matches "${section}".\n\n${toc}\n`, complete: false };
+  return { text: `${want === "" ? preamble : ""}${toc}\n\n${picked.map((s) => s.body).join("")}`, complete: false };
 }
 
 // BB thread ids named in an fm-watch line ("stale: bb:thr_abc (idle 257s, …)").
@@ -1890,7 +2024,81 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  // Wakes held while a captain cannot take a turn (provider limit, errored thread).
+  // KV-backed so a reload keeps them; released as ONE wake when the captain is back.
+  const CAPTAIN_WAKE_HOLD_PREFIX = "captain-wake-hold:";
+  const MAX_HELD_WAKES = 40;
+  const heldWakeSchema = z.object({ since: z.number(), reason: z.string(), lines: z.array(z.string()) });
+  const heldWakeLocks = new Map<string, Promise<unknown>>();
+  function withHeldWakeLock<T>(captain: string, fn: () => Promise<T>): Promise<T> {
+    const prev = heldWakeLocks.get(captain) ?? Promise.resolve();
+    const run = prev.catch(() => {}).then(fn);
+    heldWakeLocks.set(captain, run);
+    void run.finally(() => { if (heldWakeLocks.get(captain) === run) heldWakeLocks.delete(captain); }).catch(() => {});
+    return run;
+  }
+  async function captainHoldState(parentThreadId: string, signal?: AbortSignal): Promise<{ hold: boolean; reason: string; status: string | null }> {
+    let status: string | null = null;
+    try {
+      status = (await raceAbort(bb.sdk.threads.get({ threadId: parentThreadId }), signal, STUCK_HOST_CALL_MS)).status;
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+    }
+    let rateLimit: CaptainRateLimit | null = null;
+    try {
+      const rows = await raceAbort(bb.sdk.threads.events.list({
+        threadId: parentThreadId,
+        order: "desc",
+        limit: "20",
+        types: ["provider/rateLimits/updated", "provider/error", "turn/completed"],
+      }), signal, STUCK_HOST_CALL_MS);
+      rateLimit = captainRateLimitFromEvents(Array.isArray(rows) ? rows : []);
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+    }
+    return { ...captainWakeHold({ status, rateLimit, now: Date.now() }), status };
+  }
+  async function holdCaptainWake(parentThreadId: string, text: string, reason: string): Promise<void> {
+    await withHeldWakeLock(parentThreadId, async () => {
+      const key = `${CAPTAIN_WAKE_HOLD_PREFIX}${parentThreadId}`;
+      const prev = heldWakeSchema.safeParse(await bb.storage.kv.get<unknown>(key));
+      const lines = [...(prev.success ? prev.data.lines : []), truncate(text, 600)].slice(-MAX_HELD_WAKES);
+      await bb.storage.kv.set(key, { since: prev.success ? prev.data.since : Date.now(), reason, lines });
+    });
+  }
+  // Release a captain's held wakes as one message once nothing holds it. Returns true when
+  // a consolidated wake went out.
+  async function releaseHeldCaptainWakes(parentThreadId: string, signal?: AbortSignal): Promise<boolean> {
+    return withHeldWakeLock(parentThreadId, async () => {
+      const key = `${CAPTAIN_WAKE_HOLD_PREFIX}${parentThreadId}`;
+      const held = heldWakeSchema.safeParse(await bb.storage.kv.get<unknown>(key));
+      if (!held.success) {
+        if ((await bb.storage.kv.get<unknown>(key)) != null) await bb.storage.kv.delete(key);
+        return false;
+      }
+      if (held.data.lines.length === 0) { await bb.storage.kv.delete(key); return false; }
+      const state = await captainHoldState(parentThreadId, signal);
+      if (state.hold) return false;
+      if (!(await sendCaptainWake(parentThreadId, heldWakesMessage(held.data), "held-wakes", signal))) return false;
+      await bb.storage.kv.delete(key);
+      bb.log.info(`captain ${parentThreadId}: released ${held.data.lines.length} held wake(s) as one`);
+      return true;
+    });
+  }
+
+  // Deliver a wake to a captain, or hold it while the captain cannot take a turn. A held
+  // wake counts as delivered: it is persisted and released as one consolidated wake.
   async function deliverToCaptain(parentThreadId: string, text: string, crewId: string, signal?: AbortSignal): Promise<boolean> {
+    const state = await captainHoldState(parentThreadId, signal);
+    if (state.hold) {
+      await holdCaptainWake(parentThreadId, text, state.reason);
+      bb.log.info(`captain ${parentThreadId} wake held for crew ${crewId}: ${state.reason}`);
+      return true;
+    }
+    return sendCaptainWake(parentThreadId, text, crewId, signal);
+  }
+
+  async function sendCaptainWake(parentThreadId: string, text: string, crewId: string, signal?: AbortSignal): Promise<boolean> {
     try {
       // Abort-RESPONSIVE (no artificial timeout): a healthy send completes as before; only a
       // reload (signal abort) abandons the await so the supervisor can stop within its grace.
@@ -1910,8 +2118,11 @@ export default async function plugin(bb: BbPluginApi) {
         }),
         signal,
       );
+      // BB queues a steer it cannot inject yet (a turn still starting, a context
+      // mutation) and dispatches it as soon as the captain is ready: the wake is
+      // delivered, just later, so this is not a failure.
       if (asRecord(result)["delivery"] === "queued") {
-        throw new Error("captain wake unexpectedly queued instead of steering");
+        bb.log.info(`captain ${parentThreadId} wake for crew ${crewId} queued by BB until the captain is ready`);
       }
       return true;
     } catch (error) {
@@ -2123,6 +2334,21 @@ export default async function plugin(bb: BbPluginApi) {
       for (const line of evicted) await deliverToCaptain(parentThreadId, line, crew.id, signal);
       if (evicted.length > 0) await publishFleet();
       return;
+    }
+    if (durable && (kind === "idle" || kind === "review" || kind === "error")) {
+      let crewThread: Record<string, unknown> | null = null;
+      try { crewThread = asRecord(await bb.sdk.threads.get({ threadId: crew.threadId })); } catch { /* unknown: ring */ }
+      if (crewThread !== null && bbPingCarriesOutcome({
+        kind,
+        durable,
+        captainThreadId: parentThreadId,
+        crewParentThreadId: typeof crewThread["parentThreadId"] === "string" ? crewThread["parentThreadId"] : null,
+        crewOriginKind: typeof crewThread["originKind"] === "string" ? crewThread["originKind"] : null,
+      })) {
+        bb.log.info(`doorbell skipped crew=${crew.id} captain=${parentThreadId}: BB's own child ${kind === "error" ? "failed" : "completed"} message is the wake; durable wake kept`);
+        await publishFleet();
+        return;
+      }
     }
     let captainStatus: string | null = null;
     try { captainStatus = (await bb.sdk.threads.get({ threadId: parentThreadId })).status; } catch { /* unknown: ring */ }
@@ -3938,6 +4164,9 @@ export default async function plugin(bb: BbPluginApi) {
         if (typeof own !== "string" || !(await isCaptainThread(threadId))) return "";
         projectId = own;
         await bb.storage.kv.set(`${CAPTAIN_PROJECT_PREFIX}${threadId}`, own);
+        // Register live too: compaction and crew-ping batching key off this set, which
+        // is otherwise only reloaded from KV at startup.
+        knownCaptainsRef.add(threadId);
       }
       const others: string[] = [];
       for (const key of await bb.storage.kv.list(CAPTAIN_PROJECT_PREFIX)) {
@@ -6112,6 +6341,8 @@ export default async function plugin(bb: BbPluginApi) {
   // has exactly ONE owning captain (unambiguous), else dropped (not broadcast). `seen`
   // carries dedup keys across cycles. fm-watch owns wedge policy; BB is its
   // per-captain-scoped delivery transport.
+  const RELAY_MAX_ATTEMPTS = 20;
+  const relayAttempts = new Map<string, number>();
   async function relayWatchReasons(lines: string[], hostId: string, seen: Set<string>, signal?: AbortSignal): Promise<void> {
     if (lines.length === 0) return;
     const crews = await readCrews();
@@ -6162,14 +6393,23 @@ export default async function plugin(bb: BbPluginApi) {
         runningCrewThreads.add(threadId); // unknown state: keep the wedge backstop
       }
     }
-    // Group per target parent so each captain gets one message.
-    const byParent = new Map<string, string[]>();
+    // Group per target parent so each captain gets one message. A dropped line is marked
+    // seen at once; a delivered line only per captain AFTER that captain's delivery
+    // succeeded (a held wake counts), so a failed send (e.g. HTTP 409 for an errored
+    // captain) is retried on the next cycle instead of being lost. A line that keeps
+    // failing is given up after RELAY_MAX_ATTEMPTS so it cannot retry forever.
+    const byParent = new Map<string, Array<{ text: string; key: string }>>();
+    const pushFor = (parent: string, text: string, key: string) => {
+      const arr = byParent.get(parent) ?? [];
+      arr.push({ text, key: `${key}>${parent}` });
+      byParent.set(parent, arr);
+    };
     for (const line of lines) {
       const key = `${hostId}|${relayDedupKey(line)}`;
       if (seen.has(key)) continue;
-      seen.add(key);
       const stale = staleLineRelayDecision({ line, knownCrewThreads, runningCrewThreads });
       if (stale === "drop-finished" || stale === "drop-foreign") {
+        seen.add(key);
         bb.log.info(`fm-watch relay: dropping ${stale === "drop-finished" ? "stale line for a finished crew" : "stale line for a crew outside this scope"}: ${truncate(line, 160)}`);
         continue;
       }
@@ -6178,12 +6418,11 @@ export default async function plugin(bb: BbPluginApi) {
       if (mentioned.length === 0) {
         // No crew named: deliver only to a lone host captain, else drop (never fan).
         if (soleHostParent === undefined) {
+          seen.add(key);
           bb.log.info(`fm-watch relay: dropping unattributable line on host ${hostId} (${hostParents.size} captains; no crew in line)`);
           continue;
         }
-        const arr = byParent.get(soleHostParent) ?? [];
-        arr.push(line);
-        byParent.set(soleHostParent, arr);
+        if (!seen.has(`${key}>${soleHostParent}`)) pushFor(soleHostParent, line, key);
         continue;
       }
       const owners = new Set(mentioned.map((c) => c.parentThreadId!));
@@ -6191,14 +6430,23 @@ export default async function plugin(bb: BbPluginApi) {
         // Redact tokens naming OTHER captains' crews before delivering to this captain.
         const foreignIds = mentioned.filter((c) => c.parentThreadId !== parent).flatMap((c) => (c.threadId !== "" ? [c.id, c.threadId] : [c.id]));
         const filtered = filterLineForOwner(line, foreignIds);
-        if (filtered === "") continue;
-        const arr = byParent.get(parent) ?? [];
-        arr.push(filtered);
-        byParent.set(parent, arr);
+        if (filtered === "" || seen.has(`${key}>${parent}`)) continue;
+        pushFor(parent, filtered, key);
       }
     }
-    for (const [parent, ls] of byParent) {
-      await deliverToCaptain(parent, `🛰️ fm-watch:\n${ls.join("\n")}`, "fm-watch");
+    for (const [parent, items] of byParent) {
+      if (signal?.aborted) return;
+      if (await deliverToCaptain(parent, `🛰️ fm-watch:\n${items.map((i) => i.text).join("\n")}`, "fm-watch", signal)) {
+        for (const i of items) { seen.add(i.key); relayAttempts.delete(i.key); }
+        continue;
+      }
+      for (const i of items) {
+        const n = (relayAttempts.get(i.key) ?? 0) + 1;
+        if (n < RELAY_MAX_ATTEMPTS) { relayAttempts.set(i.key, n); continue; }
+        relayAttempts.delete(i.key);
+        seen.add(i.key);
+        bb.log.warn(`fm-watch relay: giving up on a page for captain ${parent} after ${n} failed deliveries: ${truncate(i.text, 160)}`);
+      }
     }
     // Bound the dedup memory.
     if (seen.size > 200) {
@@ -6544,7 +6792,7 @@ export default async function plugin(bb: BbPluginApi) {
     });
   }) as BbPluginApi["agents"]["registerTool"];
 
-  async function readCaptainContract(ctx: unknown) {
+  async function readCaptainContract(ctx: unknown, section?: string) {
     const current = await settings.get();
     if (current.fmHome.trim() === "") return toolError("Initialize real Firstmate with firstmate_deck first.");
     const hostId = current.fmHostId.trim() || await resolveHostId(undefined, ctx);
@@ -6554,7 +6802,11 @@ export default async function plugin(bb: BbPluginApi) {
     if (result.sizeBytes > 200_000) return toolError("Native contract exceeds 200KB; read it directly in the Firstmate home.");
     const content = result.contentEncoding === "base64"
       ? Buffer.from(result.content, "base64").toString("utf8") : result.content;
-    return `${content}\n\n## BB runtime adaptations\n${BB_SKILL_RUNTIME_CONTRACT}\n${CAPTAIN_VISIBILITY_CONTRACT}\nThe firstmate_contract read is now complete. Treat native policy refusals as refusals. Read and acknowledge durable reports with one firstmate_wake ack=true call.\n`;
+    const picked = selectContract(content, section);
+    const done = picked.complete
+      ? "The firstmate_contract read is now complete."
+      : "This firstmate_contract read covers the listed sections; read any other section by name before acting in its area.";
+    return `${picked.text}\n\n## BB runtime adaptations\n${BB_SKILL_RUNTIME_CONTRACT}\n${CAPTAIN_VISIBILITY_CONTRACT}\n${done} Treat native policy refusals as refusals. Read and acknowledge durable reports with one firstmate_wake ack=true call.\n`;
   }
 
   async function checkToolchain(hostId: string, fmHome: string, signal?: AbortSignal) {
@@ -6591,10 +6843,12 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_contract",
-    description: "Read the complete current native Firstmate supervisor contract and the BB runtime adaptations. Read before orchestrating and after an upstream update.",
-    parameters: z.object({}),
-    async execute(_, ctx) {
-      return readCaptainContract(ctx);
+    description: "Read the current native Firstmate supervisor contract and the BB runtime adaptations. Without section: the table of contents plus the always-on sections. section=<number or title, comma-separated> reads those sections; section=\"all\" reads everything. Read before orchestrating and after an upstream update.",
+    parameters: z.object({
+      section: z.string().max(200).optional().describe('Contract section(s) by number or title, comma-separated (e.g. "7,8"), or "all".'),
+    }),
+    async execute({ section }, ctx) {
+      return readCaptainContract(ctx, section);
     },
   });
 
@@ -7357,7 +7611,15 @@ export default async function plugin(bb: BbPluginApi) {
           timeoutMs: fmTimeoutMs(normalizeFmScript(script), timeoutSec),
           signal: asRecord(ctx)["signal"] as AbortSignal | undefined,
         });
-        const text = result.output === "" ? `(exit ${result.exitCode ?? "?"})` : result.output;
+        let text = result.output === "" ? `(exit ${result.exitCode ?? "?"})` : result.output;
+        if (text.length > CAPTAIN_TOOL_OUTPUT_MAX) {
+          const stem = normalizeFmScript(script).replace(/[^A-Za-z0-9._-]/g, "_");
+          const path = `${current.fmHome}/state/.bb-tool-output/fm-${stem}-${Date.now()}.txt`;
+          const saved = await writeHostFile(hostId, path, text).catch(() => false);
+          text = capToolOutput(text, saved ? path : null);
+          // Keep a day of saved outputs.
+          void runOnHost(hostId, `find ${shQuote(`${current.fmHome}/state/.bb-tool-output`)} -type f -mmin +1440 -delete 2>/dev/null || true`, 15_000).catch(() => {});
+        }
         return result.exitCode === 0 ? text : toolError(text);
       } catch (error) {
         return toolError(error instanceof Error ? error.message : "fm failed");
@@ -7372,7 +7634,7 @@ export default async function plugin(bb: BbPluginApi) {
         tools: [],
         skills: [],
         instructions:
-          `You are a firstmate crewmate. Do not dispatch other crews. Finish this one task, then report DONE, BLOCKED, or FAILED. ${AXI_TOOL_CONTRACT} ${CI_POLL_CONTRACT}`,
+          `You are a firstmate crewmate. Do not dispatch other crews. Finish this one task, then report DONE, BLOCKED, or FAILED. ${WAITING_PROTOCOL} ${AXI_TOOL_CONTRACT} ${CI_POLL_CONTRACT}`,
       };
     }
     const marked = metaFlag(meta, "captain");
@@ -7617,8 +7879,57 @@ export default async function plugin(bb: BbPluginApi) {
       return;
     }
     const output = await crewOutput(crew);
-    if (hasStatusProtocol(output)) return;
+    if (hasStatusProtocol(output) || isWaitingYield(output)) return;
     await applyProtocolNudge(crew);
+  }
+
+  // A crew that yields WAITING: is parked on an external run. It is not an outcome, so it
+  // is neither nagged nor rung to the captain; BB resumes it after a delay through a
+  // time-scheduled queued message (durable in BB, survives a plugin reload). Past the cap
+  // the captain gets one decision instead of an endless silent loop.
+  const WAITING_KEY = "crew-waiting";
+  const WAIT_RESUME_MS = 5 * 60_000;
+  const WAIT_RESUME_MAX = 24;
+  const waitingRowSchema = z.record(z.string(), z.object({ generation: z.string(), count: z.number() }));
+  async function clearWaiting(crewId: string): Promise<void> {
+    const parsed = waitingRowSchema.safeParse(await bb.storage.kv.get<unknown>(WAITING_KEY));
+    if (!parsed.success || parsed.data[crewId] === undefined) return;
+    const next = { ...parsed.data };
+    delete next[crewId];
+    await bb.storage.kv.set(WAITING_KEY, next);
+  }
+  async function handleWaitingYield(crew: Crew, text: string | null): Promise<void> {
+    await dropNudge(crew.id);
+    const parsed = waitingRowSchema.safeParse(await bb.storage.kv.get<unknown>(WAITING_KEY));
+    const state = parsed.success ? { ...parsed.data } : {};
+    const generation = taskGeneration(crew);
+    const prev = state[crew.id];
+    const count = (prev !== undefined && prev.generation === generation ? prev.count : 0) + 1;
+    state[crew.id] = { generation, count };
+    await bb.storage.kv.set(WAITING_KEY, state);
+    const what = truncate((text ?? "").replace(/\s+/g, " ").trim(), 200);
+    if (count > WAIT_RESUME_MAX) {
+      if (count === WAIT_RESUME_MAX + 1 && (await settings.get()).supervisionEnabled === true) {
+        await notifyCaptain(crew, "needs-decision", `NEEDS DECISION: crew ${crew.id} has been waiting through ${WAIT_RESUME_MAX} automatic re-checks: ${what}`);
+      }
+      return;
+    }
+    try {
+      await bb.sdk.threads.send({
+        threadId: crew.threadId,
+        mode: "queue-if-active",
+        sendAt: Date.now() + WAIT_RESUME_MS,
+        input: [{
+          type: "text",
+          text: "Firstmate resume: re-check the external run you reported WAITING on. Keep waiting inside this turn with bounded re-checks; when it resolves, finish and end with DONE:, BLOCKED:, or FAILED:. If it is still running when you must yield, end with WAITING: again.",
+          mentions: [],
+        }],
+      });
+      bb.log.info(`crew ${crew.id} waiting (${count}/${WAIT_RESUME_MAX}); resume scheduled, captain not woken`);
+    } catch (error) {
+      bb.log.warn(`crew ${crew.id} waiting: resume schedule failed, telling the captain: ${error instanceof Error ? error.message : String(error)}`);
+      await notifyCaptain(crew, "needs-decision", `NEEDS DECISION: crew ${crew.id} is waiting and could not be scheduled to resume: ${what}`);
+    }
   }
 
   // A crew's worker thread can reach idle/error BEFORE its record carries its
@@ -7645,6 +7956,11 @@ export default async function plugin(bb: BbPluginApi) {
     // BB already reports interruptions to the parent. A completion wake here can
     // cause the manager to resume work the user just stopped.
     if (stopped) return;
+    if (isWaitingYield(lastAssistantText)) {
+      await handleWaitingYield(crew, lastAssistantText);
+      return;
+    }
+    await clearWaiting(crew.id);
     if (!hasStatusProtocol(lastAssistantText)) {
       const outcome = await applyProtocolNudge(crew);
       if (outcome !== "off") return;
@@ -7748,12 +8064,28 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  // The thread.idle trigger alone never reaches a captain that is already idle past the
+  // budget (it crossed it before this build, or its last turn ended while compaction was
+  // cooling down); the release service sweeps those.
+  async function compactIdleCaptain(threadId: string, signal?: AbortSignal): Promise<void> {
+    try {
+      const thread = asRecord(await raceAbort(bb.sdk.threads.get({ threadId }), signal, STUCK_HOST_CALL_MS));
+      if (thread["status"] !== "idle" || thread["archivedAt"] != null) return;
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      return;
+    }
+    await maybeCompactCaptain(threadId).catch((error) => bb.log.warn(`captain compaction check failed ${threadId}: ${String(error)}`));
+  }
+
   bb.events.on("thread.idle", async ({ thread, lastAssistantText }) => {
     // Compact before releasing held pings so they land on the smaller context.
     await maybeCompactCaptain(thread.id).catch((error) => bb.log.warn(`captain compaction check failed ${thread.id}: ${String(error)}`));
     if (heldPingCaptains.delete(thread.id)) {
       await bb.experimental_hooks.recheck("message.dispatch").catch((error) => bb.log.warn(`crew ping release failed captain=${thread.id}: ${String(error)}`));
     }
+    // A captain that completed a turn can take the wakes held while it was unavailable.
+    await releaseHeldCaptainWakes(thread.id).catch((error) => bb.log.warn(`held wake release failed captain=${thread.id}: ${String(error)}`));
     await inCaptainHome(thread.id, () => reconcileReturnedAfk(thread.id)).catch(error => bb.log.warn(`AFK return: ${String(error)}`));
     // Turn-end backstop for the captain (no-op unless turnEndGuard=re-ring and this
     // is the captain thread). Captains are not crews.
@@ -7788,7 +8120,7 @@ export default async function plugin(bb: BbPluginApi) {
     commands: [
       { name: "guide", summary: "Setup guide for firstmate inside BB", usage: "bb firstmate guide [--json]" },
       { name: "init", summary: "Native deck setup (add --real to clone firstmate and overlay the BB backend)", usage: "bb firstmate init [--real] [--json]" },
-      { name: "contract", summary: "Read the full native supervisor contract", usage: "bb firstmate contract" },
+      { name: "contract", summary: "Read the full native supervisor contract (or named sections)", usage: "bb firstmate contract [section,...]" },
       { name: "toolchain", summary: "Check native AXI and Lavish dependencies without mutations", usage: "bb firstmate toolchain [--json]" },
       { name: "scripts", summary: "List + verify every installed fm-* script", usage: "bb firstmate scripts [query] [--json]" },
       { name: "fm", summary: "Run a real firstmate bin/ script with FM_BACKEND=bb", usage: "bb firstmate fm [--timeout s] <script> [args...]" },
@@ -7878,7 +8210,8 @@ export default async function plugin(bb: BbPluginApi) {
             return reply({ guide: text }, text);
           }
           case "contract": {
-            const text = await readCaptainContract(ctx);
+            // The operator CLI reads the whole contract unless a section is named.
+            const text = await readCaptainContract(ctx, rest.join(" ").trim() || "all");
             if (typeof text !== "string") return fail("Native contract could not be read.");
             return reply({ contract: text }, text);
           }
@@ -8758,6 +9091,40 @@ export default async function plugin(bb: BbPluginApi) {
           }
           const timer = setTimeout(resolve, checkMs);
           signal.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
+        });
+      }
+    },
+  });
+
+  // Releases wakes held for an unavailable captain once its limit resets or it leaves
+  // the error state without a turn of its own, and compacts idle captains whose context
+  // crossed the budget while no turn ended (e.g. before an upgrade), so the next wake
+  // does not re-read the oversized context first.
+  const CAPTAIN_COMPACT_SWEEP_MS = 30 * 60_000;
+  bb.background.service("captain-wake-release", {
+    async start(signal) {
+      let nextCompactSweep = 0;
+      while (!signal.aborted) {
+        try {
+          for (const key of await bb.storage.kv.list(CAPTAIN_WAKE_HOLD_PREFIX)) {
+            if (signal.aborted) break;
+            await releaseHeldCaptainWakes(key.slice(CAPTAIN_WAKE_HOLD_PREFIX.length), signal);
+          }
+          if (Date.now() >= nextCompactSweep) {
+            nextCompactSweep = Date.now() + CAPTAIN_COMPACT_SWEEP_MS;
+            for (const captain of [...knownCaptainsRef]) {
+              if (signal.aborted) break;
+              await compactIdleCaptain(captain, signal);
+            }
+          }
+        } catch (error) {
+          if (!signal.aborted) bb.log.warn(`captain-wake-release: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) return resolve();
+          const onAbort = () => { clearTimeout(timer); resolve(); };
+          const timer = setTimeout(() => { signal.removeEventListener("abort", onAbort); resolve(); }, 30_000);
+          signal.addEventListener("abort", onAbort, { once: true });
         });
       }
     },
