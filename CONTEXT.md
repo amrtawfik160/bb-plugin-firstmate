@@ -106,7 +106,10 @@ to the shared global state dir. This does **not** cover the crew register: that 
 a single shared KV list with no owner filtering on the read plane — `listCrews`
 sweeps every firstmate-origin thread host-wide, and it is capped at 50 (`MAX_CREWS`),
 so one captain's dispatches can EVICT another captain's records. Partitioning is a
-wake-plane property, not a crew-register property.
+wake-plane property, not a crew-register property. Captain-facing crew views show
+the captain's own crews plus, read-only, the crews of other live captains on the
+same project (never other projects); another captain's crew or PR is refused on
+merge/forget/dispatch without an explicit owner override.
 
 ### Planes
 

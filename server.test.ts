@@ -13,6 +13,8 @@ import {
 } from "@get-bb/plugin-sdk/testing";
 import plugin, {
   backlogTitleOf,
+  briefSections,
+  sanitizeFmArgs,
   captainHookInstallScript,
   crewPingHoldDecision,
   doorbellSupersededByBbPing,
@@ -3593,6 +3595,7 @@ function stubRealTransportBacklog(
   opts: {
     addExit?: number;
     spawnExit?: number;
+    spawnOutput?: string;
     threadIdAfterSpawn?: string;
     orphan?: boolean;
   },
@@ -3630,7 +3633,7 @@ function stubRealTransportBacklog(
     if (cmd.includes("fm-tasks-axi.sh") && cmd.includes("'add'")) return hostRcPayload("", opts.addExit ?? 0);
     if (cmd.includes("fm-spawn.sh")) {
       spawned = true;
-      return hostRcPayload("", opts.spawnExit ?? 0);
+      return hostRcPayload(opts.spawnOutput ?? "", opts.spawnExit ?? 0);
     }
     if (cmd.includes("bb_thread_id")) {
       const tid = spawned ? (opts.threadIdAfterSpawn ?? "") : "";
@@ -7760,4 +7763,648 @@ test("non-hooked captain providers get explicit guard rules on deck", () => {
   assert.match(note, /acp-grok/);
   assert.match(note, /Never read bb\.db/);
   assert.match(note, /ack=true/);
+});
+
+// ---------------------------------------------------------------------------
+// Captain audit gaps: multi-captain coordination, dispatch/merge/forget/queue.
+// ---------------------------------------------------------------------------
+
+function toolText(result: unknown): string {
+  if (typeof result === "string") return result;
+  const r = result as { content: Array<{ type: string; text?: string }> };
+  return r.content.map((c) => (c.type === "text" ? c.text ?? "" : "")).join("\n");
+}
+
+function isToolError(result: unknown): boolean {
+  return typeof result === "object" && result !== null && (result as { isError?: boolean }).isError === true;
+}
+
+function agentTool(host: Awaited<ReturnType<typeof load>>, name: string) {
+  const found = host.harness.inspection.registrations.agentTools.find((t) => t.name === name);
+  assert.ok(found, `tool ${name} not registered`);
+  return found!;
+}
+
+// Captains A and B share proj_1; captain C runs proj_2. Every thr_cap* is a live captain.
+async function twoCaptainsFixture(host: Awaited<ReturnType<typeof load>>) {
+  await host.bb.storage.kv.set("captain-project:thr_capA", "proj_1");
+  await host.bb.storage.kv.set("captain-project:thr_capB", "proj_1");
+  await host.bb.storage.kv.set("captain-project:thr_capC", "proj_2");
+  host.harness.sdk.stub("threads.list", async () => []);
+  host.harness.sdk.stub("threads.get", async (input: { threadId: string }) =>
+    makeThreadResponse({ id: input.threadId, status: "idle", projectId: "proj_1", environmentId: null }));
+  host.harness.sdk.stub("threads.getPluginMetadata", async (input: { threadId: string }) =>
+    (input.threadId.startsWith("thr_cap") ? { captain: "true" } : {}));
+  host.harness.sdk.stub("threads.output", async () => ({ output: "DONE: shipped" }));
+}
+
+test("coordination: crews lists other captains' crews on this project, labelled read-only; never another project's", async () => {
+  const host = await load();
+  try {
+    await twoCaptainsFixture(host);
+    await host.bb.storage.kv.set("crews", [
+      crewRow("alpha", "thr_crewA", "thr_capA"),
+      crewRow("bravo", "thr_crewB", "thr_capB"),
+      { ...crewRow("charlie", "thr_crewC", "thr_capC"), projectId: "proj_2" },
+    ]);
+    const own = await host.harness.behavior.runCli(["crews"], { threadId: "thr_capA", projectId: "proj_1" });
+    assert.equal(own.exitCode, 0, own.stderr);
+    assert.match(own.stdout, /^alpha /m);
+    assert.match(own.stdout, /bravo .*owned by captain @thread:thr_capB \(read-only\)/, own.stdout);
+    assert.doesNotMatch(own.stdout, /charlie/, "another project's crew must never show");
+    const bearings = await agentTool(host, "firstmate_bearings").execute({}, { threadId: "thr_capA", projectId: "proj_1" } as never);
+    assert.match(toolText(bearings), /bravo .*owned by captain @thread:thr_capB/, toolText(bearings));
+    assert.doesNotMatch(toolText(bearings), /charlie/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("crews all=true stays on this project and caps its text rows", async () => {
+  const host = await load();
+  try {
+    await twoCaptainsFixture(host);
+    await host.bb.storage.kv.set("crews", [
+      { ...crewRow("charlie", "thr_crewC", "thr_capC"), projectId: "proj_2" },
+      ...Array.from({ length: 45 }, (_, i) => crewRow(`p${i}`, `thr_p${i}`, "thr_capB")),
+    ]);
+    const result = await agentTool(host, "firstmate_crews").execute({ all: true }, { threadId: "thr_capA", projectId: "proj_1" } as never);
+    const text = toolText(result);
+    assert.doesNotMatch(text, /charlie/, "all=true must not reach other projects");
+    assert.match(text, /p0 .*owned by @thread:thr_capB/);
+    assert.match(text, /5 more crew\(s\) not shown/, text);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("merge refuses another captain's crew, or a PR another captain's crew owns, unless overrideOwner", async () => {
+  const host = await load();
+  try {
+    const pr = "https://github.com/o/r/pull/7";
+    await host.bb.storage.kv.set("crews", [
+      { ...shipRow("c1", "thr_c1", "thr_capA"), prUrl: pr },
+      { ...shipRow("c2", "thr_c2", "thr_capB"), prUrl: pr },
+    ]);
+    await host.bb.storage.kv.set("captain-project:thr_capA", "proj_1");
+    await host.bb.storage.kv.set("captain-project:thr_capB", "proj_1");
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async (input: { threadId: string }) =>
+      makeThreadResponse({ id: input.threadId, status: "idle", environmentId: "env_wt" }));
+    host.harness.sdk.stub("threads.getPluginMetadata", async (input: { threadId: string }) =>
+      (input.threadId.startsWith("thr_cap") ? { captain: "true" } : {}));
+    host.harness.sdk.stub("threads.updatePluginMetadata", async () => ({}));
+    host.harness.sdk.stub("threads.output", async () => ({ output: "DONE: shipped" }));
+    host.harness.sdk.stub("threads.stop", async () => ({}));
+    host.harness.sdk.stub("threads.archive", async () => ({}));
+    host.harness.sdk.stub("environments.pullRequest", async () => ({
+      outcome: "available",
+      pullRequest: { url: pr, number: 7, title: "t", state: "merged", checks: { state: "passing" }, mergeability: { mergeable: "MERGEABLE" } },
+    }));
+    const theirs = await host.harness.behavior.runCli(["merge", "c2", "--yes"], { threadId: "thr_capA" });
+    assert.equal(theirs.exitCode, 1);
+    assert.match(theirs.stderr, /belongs to captain @thread:thr_capB/);
+    const shared = await host.harness.behavior.runCli(["merge", "c1", "--yes"], { threadId: "thr_capA" });
+    assert.equal(shared.exitCode, 1);
+    assert.match(shared.stderr, /PR of crew c2, owned by captain @thread:thr_capB/);
+    assert.equal(((await host.bb.storage.kv.get("crews")) as unknown[]).length, 2, "refusals retire nothing");
+    const forced = await host.harness.behavior.runCli(["merge", "c1", "--yes", "--override-owner"], { threadId: "thr_capA" });
+    assert.equal(forced.exitCode, 0, forced.stderr);
+    assert.match(forced.stdout, /Already merged/);
+    // A crew left by a thread that is no live captain (e.g. this captain's own old
+    // thread) is not "another captain's": no refusal.
+    await host.bb.storage.kv.set("crews", [shipRow("c3", "thr_c3", "thr_old")]);
+    const orphaned = await host.harness.behavior.runCli(["merge", "c3", "--yes"], { threadId: "thr_capA" });
+    assert.equal(orphaned.exitCode, 0, orphaned.stderr);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("dispatch refuses a task aimed at another captain's crew PR unless overrideOwner", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("crews", [{ ...shipRow("c2", "thr_c2", "thr_capB"), prUrl: "https://github.com/o/r/pull/7" }]);
+    await host.bb.storage.kv.set("captain-project:thr_capA", "proj_1");
+    await host.bb.storage.kv.set("captain-project:thr_capB", "proj_1");
+    host.harness.sdk.stub("threads.getPluginMetadata", async (input: { threadId: string }) =>
+      (input.threadId.startsWith("thr_cap") ? { captain: "true" } : {}));
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("environments.list", async () => [{ hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" }]);
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_new" }));
+    host.harness.sdk.stub("threads.get", async (input: { threadId: string }) =>
+      makeThreadResponse({ id: input.threadId, status: input.threadId === "thr_new" ? "starting" : "idle", environmentId: null }));
+    const task = "address the review comments on https://github.com/o/r/pull/7";
+    const refused = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--", task], { threadId: "thr_capA", projectId: "proj_1" });
+    assert.equal(refused.exitCode, 1);
+    assert.match(refused.stderr, /PR of crew c2 owned by captain @thread:thr_capB/);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
+    const forced = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--override-owner", "--", task], { threadId: "thr_capA", projectId: "proj_1" });
+    assert.equal(forced.exitCode, 0, forced.stderr);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a PR merged outside its captain retires the crew and tells the OWNING captain", async () => {
+  const host = await load();
+  try {
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_capB")]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async (input: { threadId: string }) =>
+      makeThreadResponse({ id: input.threadId, status: "idle", environmentId: input.threadId === "thr_crew" ? "env_wt" : null }));
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+    host.harness.sdk.stub("threads.updatePluginMetadata", async () => ({}));
+    host.harness.sdk.stub("threads.output", async () => ({ output: "DONE: shipped" }));
+    host.harness.sdk.stub("threads.stop", async () => ({}));
+    host.harness.sdk.stub("threads.archive", async () => ({}));
+    host.harness.sdk.stub("threads.send", async () => ({}));
+    host.harness.sdk.stub("environments.pullRequest", async () => ({
+      outcome: "available",
+      pullRequest: { url: "https://github.com/o/r/pull/9", number: 9, title: "t", state: "merged", checks: { state: "passing" }, mergeability: { mergeable: "MERGEABLE" } },
+    }));
+    await host.bb.storage.kv.set("watch-meta", { lastPassAt: Date.now(), checked: -1, notified: -1 });
+    const run = host.harness.behavior.runService("crew-watch");
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline && !sendCalls(host).some((s) => s.threadId === "thr_capB")) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    run.controller.abort();
+    await run.done;
+    const told = sendCalls(host).filter((s) => s.threadId === "thr_capB");
+    assert.equal(told.length, 1, "the owning captain must hear its PR landed");
+    assert.match(told[0]!.text, /crew c1 landed: https:\/\/github\.com\/o\/r\/pull\/9/);
+    assert.deepEqual(await host.bb.storage.kv.get("crews"), []);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("tell/retry refuse to wake an idle crew past the running-crew cap unless overCap", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("crews", [
+      ...[1, 2, 3, 4, 5].map((n) => shipRow(`c${n}`, `thr_c${n}`, "thr_cap")),
+      shipRow("c6", "thr_c6", "thr_cap"),
+    ]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async (input: { threadId: string }) =>
+      makeThreadResponse({ id: input.threadId, status: input.threadId === "thr_c6" ? "idle" : "active" }));
+    host.harness.sdk.stub("threads.send", async () => ({}));
+    host.harness.sdk.stub("threads.retry", async () => ({}));
+    const told = await host.harness.behavior.runCli(["tell", "c6", "--", "pick it back up"], { threadId: "thr_cap" });
+    assert.equal(told.exitCode, 1);
+    assert.match(told.stderr, /Crew cap reached: 5 crews running \(cap 5\)\. Waking idle crew c6/);
+    assert.equal(host.harness.sdk.callsTo("threads.send").length, 0);
+    const retried = await agentTool(host, "firstmate_retry").execute({ crewId: "c6" }, { threadId: "thr_cap" } as never);
+    assert.ok(isToolError(retried), toolText(retried));
+    assert.equal(host.harness.sdk.callsTo("threads.retry").length, 0);
+    const over = await host.harness.behavior.runCli(["tell", "c6", "--over-cap", "--", "pick it back up"], { threadId: "thr_cap" });
+    assert.equal(over.exitCode, 0, over.stderr);
+    assert.equal(host.harness.sdk.callsTo("threads.send").length, 1);
+    // Steering a crew that is already running adds no turn, so the cap does not apply.
+    const running = await host.harness.behavior.runCli(["tell", "c1", "--", "also check the tests"], { threadId: "thr_cap" });
+    assert.equal(running.exitCode, 0, running.stderr);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("read-through keeps a dispatched crew whose thread still waits for a host slot (no meta yet)", async () => {
+  const host = ownerHost({ readThrough: true });
+  await plugin(host.bb);
+  try {
+    host.harness.sdk.stub("threads.list", async () => []);
+    stubRoutedHost(host, () => ({ payload: "", code: 0 }));
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "pending", environmentId: null }));
+    host.harness.sdk.stub("threads.output", async () => ({ output: "" }));
+    await host.bb.storage.kv.set("crews", [{ ...crewRow("c1", "thr_crew", "thr_cap"), createdAt: new Date(Date.now() - 3_600_000).toISOString() }]);
+    const shown = await host.harness.behavior.runCli(["crew", "c1"], { threadId: "thr_cap" });
+    assert.equal(shown.exitCode, 0, shown.stderr);
+    assert.match(shown.stdout, /c1 \[pending\]/);
+    const watch = await agentTool(host, "firstmate_watch").execute({ crewIds: ["c1"] }, { threadId: "thr_cap" } as never);
+    assert.ok(!isToolError(watch), toolText(watch));
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("dispatch refuses an unknown providerId/model before spawning and names the catalog id", async () => {
+  const host = await load();
+  try {
+    host.harness.sdk.stub("environments.list", async () => [{ hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" }]);
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew" }));
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "starting" }));
+    host.harness.sdk.stub("providers.list", async () => [
+      { id: "acp-grok", available: true }, { id: "claude-code", available: true },
+    ]);
+    host.harness.sdk.stub("providers.models", async () => ({ modelLoadError: null, models: [{ id: "grok-4", model: "grok-4" }] }));
+    const bad = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--provider", "grok", "--", "fix login"], { projectId: "proj_1" });
+    assert.equal(bad.exitCode, 1);
+    assert.match(bad.stderr, /Unknown providerId "grok" — did you mean "acp-grok"\?/);
+    const badModel = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--provider", "acp-grok", "--model", "grok-9", "--", "fix login"], { projectId: "proj_1" });
+    assert.equal(badModel.exitCode, 1);
+    assert.match(badModel.stderr, /Unknown model "grok-9"/);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0, "nothing is spawned for a bad provider/model");
+    const good = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--provider", "acp-grok", "--model", "grok-4", "--", "fix login"], { projectId: "proj_1" });
+    assert.equal(good.exitCode, 0, good.stderr);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a crew thread born in error is reported as a FAILED dispatch, not a success", async () => {
+  const host = await load();
+  try {
+    host.harness.sdk.stub("environments.list", async () => [{ hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" }]);
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew" }));
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "error" }));
+    host.harness.sdk.stub("threads.output", async () => ({ output: "" }));
+    const cli = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--", "fix login"], { projectId: "proj_1" });
+    assert.equal(cli.exitCode, 1);
+    assert.match(cli.stderr, /FAILED: the thread is already in error/);
+    const viaTool = await agentTool(host, "firstmate_dispatch").execute({ task: "fix login", projectId: "proj_1" }, { projectId: "proj_1" } as never);
+    assert.ok(isToolError(viaTool));
+    assert.match(toolText(viaTool), /FAILED/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("dispatch records its title; relaunch and listings reuse it instead of the raw task quote", async () => {
+  const host = await load();
+  try {
+    host.harness.sdk.stub("environments.list", async () => [{ hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" }]);
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew" }));
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async (input: { threadId: string }) =>
+      makeThreadResponse({ id: input.threadId, status: "error", environmentId: "env_wt" }));
+    host.harness.sdk.stub("threads.output", async () => ({ output: "" }));
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+    host.harness.sdk.stub("threads.stop", async () => ({}));
+    host.harness.sdk.stub("threads.archive", async () => ({}));
+    const dispatched = await host.harness.behavior.runCli(
+      ["dispatch", "--project", "proj_1", "--title", "Fix login redirect", "--", "\"can you please look at why login bounces\" — the user"],
+      { projectId: "proj_1", threadId: "thr_cap" },
+    );
+    // Born in error (stub) → reported as failed, but the record exists for retry.
+    assert.equal(dispatched.exitCode, 1);
+    const crews = (await host.bb.storage.kv.get("crews")) as Array<{ id: string; title?: string }>;
+    assert.equal(crews[0]?.title, "Fix login redirect");
+    const id = crews[0]!.id;
+    const retried = await host.harness.behavior.runCli(["retry", id, "--reasoning-level", "max"], { threadId: "thr_cap" });
+    assert.equal(retried.exitCode, 0, retried.stderr);
+    const relaunch = host.harness.sdk.callsTo("threads.spawn")[1]![0] as { title?: string };
+    assert.equal(relaunch.title, `Ship · Fix login redirect · ${id}`);
+    const listed = await host.harness.behavior.runCli(["crews"], { threadId: "thr_cap" });
+    assert.match(listed.stdout, /:: Fix login redirect/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+function nativeMergeHost() {
+  return createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { fmHome: "/tmp/fm-home" } });
+}
+
+function stubNativeMerge(host: Awaited<ReturnType<typeof load>>, router: (cmd: string) => { payload?: string; code?: number }, pr: unknown) {
+  const routed = stubRoutedHost(host, (cmd) => router(unwrapHostCommand(cmd)));
+  host.harness.sdk.stub("threads.list", async () => []);
+  host.harness.sdk.stub("threads.get", async (input: { threadId: string }) =>
+    makeThreadResponse({ id: input.threadId, status: "idle", environmentId: "env_wt" }));
+  host.harness.sdk.stub("environments.get", async () => ({ id: "env_wt", hostId: "host_1", path: "/wt", isWorktree: true, status: "ready" }));
+  host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+  host.harness.sdk.stub("threads.updatePluginMetadata", async () => ({}));
+  host.harness.sdk.stub("threads.output", async () => ({ output: "DONE: shipped" }));
+  host.harness.sdk.stub("environments.pullRequest", async () => pr);
+  return routed;
+}
+
+test("merge trusts fm-pr-merge's verified MERGED readback over BB's stale PR cache", async () => {
+  const host = nativeMergeHost();
+  await plugin(host.bb);
+  try {
+    const url = "https://github.com/o/r/pull/1";
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    stubNativeMerge(host, (cmd) => (cmd.includes("fm-pr-merge.sh")
+      ? { payload: `verified: ${url} is merged (state=MERGED, merged=true, isInMergeQueue=false)` }
+      : {}), {
+      outcome: "available",
+      pullRequest: { url, number: 1, title: "t", state: "open", checks: { state: "passing" }, mergeability: { mergeable: "MERGEABLE" } },
+    });
+    const result = await host.harness.behavior.runCli(["merge", "c1", "--yes"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.doesNotMatch(result.stdout, /Landing not yet confirmed/);
+    assert.match(result.stdout, /Merged https:\/\/github\.com\/o\/r\/pull\/1\nCrew c1 retired/);
+    assert.deepEqual(await host.bb.storage.kv.get("crews"), []);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("merge resolves a crew PR the environment cache misses (crew pushed to an existing PR)", async () => {
+  const host = nativeMergeHost();
+  await plugin(host.bb);
+  try {
+    const url = "https://github.com/o/r/pull/5";
+    await host.bb.storage.kv.set("crews", [{ ...shipRow("c1", "thr_crew", "thr_cap"), prUrl: url }]);
+    const routed = stubNativeMerge(host, (cmd) => {
+      if (cmd.includes("fm-pr-merge.sh")) return { payload: `verified: ${url} is merged (state=MERGED, merged=true, isInMergeQueue=false)` };
+      if (cmd.includes("gh pr view")) return { payload: '{"state":"OPEN","mergeable":"MERGEABLE"}' };
+      return {};
+    }, { outcome: "absent" });
+    const result = await host.harness.behavior.runCli(["merge", "c1", "--yes"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    const merge = routed.seen.map(unwrapHostCommand).find((c) => c.includes("fm-pr-merge.sh"));
+    assert.ok(merge?.includes(`'${url}'`), `fm-pr-merge must get the resolved PR: ${merge}`);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("merge polls a lazily computed UNKNOWN mergeability instead of refusing at once", async () => {
+  const host = await load();
+  const prev = process.env.FM_MERGEABLE_POLL_MS;
+  process.env.FM_MERGEABLE_POLL_MS = "0";
+  try {
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }));
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+    host.harness.sdk.stub("threads.updatePluginMetadata", async () => ({}));
+    host.harness.sdk.stub("threads.output", async () => ({ output: "DONE: shipped" }));
+    host.harness.sdk.stub("threads.stop", async () => ({}));
+    host.harness.sdk.stub("threads.archive", async () => ({}));
+    let reads = 0;
+    host.harness.sdk.stub("environments.pullRequest", async () => ({
+      outcome: "available",
+      pullRequest: {
+        url: "https://github.com/o/r/pull/2", number: 2, title: "t", state: "open",
+        checks: { state: "passing", failedCount: 0, pendingCount: 0, passedCount: 2 },
+        mergeability: { mergeable: ++reads < 3 ? "UNKNOWN" : "MERGEABLE" },
+      },
+    }));
+    host.harness.sdk.stub("environments.mergePullRequest", async () => ({}));
+    const result = await host.harness.behavior.runCli(["merge", "c1", "--yes"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(host.harness.sdk.callsTo("environments.mergePullRequest").length, 1);
+  } finally {
+    if (prev === undefined) delete process.env.FM_MERGEABLE_POLL_MS; else process.env.FM_MERGEABLE_POLL_MS = prev;
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("forget --stop ignores harness scratch files as unlanded work", async () => {
+  const host = await load();
+  try {
+    stubForgetSdk(host, { dirty: [".lavish/review.html", "docs/.tmp-plan.md"] });
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(host.harness.sdk.callsTo("threads.archive").length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("forget --stop accepts squash-merged work whose remote branch is gone", async () => {
+  const host = await load();
+  try {
+    stubForgetSdk(host, { dirty: [], unpushed: 2 });
+    const url = "https://github.com/o/r/pull/3";
+    stubRoutedHost(host, (wrapped) => {
+      const cmd = unwrapHostCommand(wrapped);
+      if (cmd.includes("rev-list")) return { payload: ["1".padStart(40, "0"), "2".padStart(40, "0")].join("\n") };
+      if (cmd.includes("headRefOid")) return { payload: "FM_PR_COVERS_HEAD" };
+      if (cmd.includes("gh pr view")) return { payload: '{"state":"MERGED","mergeable":"UNKNOWN"}' };
+      return {};
+    });
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }));
+    await host.bb.storage.kv.set("crews", [{ ...shipRow("c1", "thr_crew", "thr_cap"), prUrl: url }]);
+    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /landed via merged https:\/\/github\.com\/o\/r\/pull\/3/);
+    assert.equal(host.harness.sdk.callsTo("threads.archive").length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("forgetting a ship retires its armed native check and state sidecars", async () => {
+  const host = nativeMergeHost();
+  await plugin(host.bb);
+  try {
+    stubForgetSdk(host, { dirty: [] });
+    const routed = stubRoutedHost(host, () => ({}));
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }));
+    await host.bb.storage.kv.set("crews", [{ ...shipRow("c1", "thr_crew", "thr_cap"), nativeHome: "/tmp/fm-home" }]);
+    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    const cmds = routed.seen.map(unwrapHostCommand);
+    assert.ok(cmds.some((c) => c.includes(`"$FM_BINDIR/fm-check-unregister.sh" 'c1'`)), cmds.join("\n---\n"));
+    assert.ok(cmds.some((c) => c.includes("'/tmp/fm-home/state/c1.pr-poll'") && c.includes("'/tmp/fm-home/state/c1.merge-authority'")
+      && c.includes("'/tmp/fm-home/state/c1.status'") && c.includes("rm -rf -- '/tmp/fm-home/state/c1.inbox'")));
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("scout forget attests an empty captain-call gate natively, then tears down", async () => {
+  const { host } = await nativeScoutForgetFixture();
+  try {
+    let teardowns = 0;
+    const routed = stubRoutedHost(host, (wrapped) => {
+      const cmd = unwrapHostCommand(wrapped);
+      if (cmd.includes('"$FM_BINDIR/fm-teardown.sh"')) {
+        teardowns++;
+        return teardowns === 1
+          ? { payload: "REFUSED: scout task c1 has not passed the captain-call completion gate.", code: 1 }
+          : { payload: "teardown c1 complete" };
+      }
+      return {};
+    });
+    host.harness.sdk.stub("threads.get", async (args: { threadId: string }) => makeThreadResponse({
+      id: args.threadId, status: "idle", environmentId: args.threadId === "thr_crew" ? "env_crew" : "env_cap",
+    }));
+    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(teardowns, 2);
+    const cmds = routed.seen.map(unwrapHostCommand);
+    assert.ok(cmds.some((c) => c.includes(`"$FM_BINDIR/fm-captain-hold.sh" 'complete' 'c1' '--none'`)));
+    assert.match(result.stdout, /captain-call gate attested --none/);
+    assert.deepEqual(await crewsKv(host), []);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("scout forget keeps the crew when native refuses the --none attestation (open decision)", async () => {
+  const { host } = await nativeScoutForgetFixture();
+  try {
+    stubRoutedHost(host, (wrapped) => {
+      const cmd = unwrapHostCommand(wrapped);
+      if (cmd.includes('"$FM_BINDIR/fm-teardown.sh"')) return { payload: "REFUSED: scout task c1 has not passed the captain-call completion gate.", code: 1 };
+      if (cmd.includes("fm-captain-hold.sh")) return { payload: "fm-captain-hold: origin c1 still has open captain decisions", code: 1 };
+      return {};
+    });
+    host.harness.sdk.stub("threads.get", async (args: { threadId: string }) => makeThreadResponse({
+      id: args.threadId, status: "idle", environmentId: args.threadId === "thr_crew" ? "env_crew" : "env_cap",
+    }));
+    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop"]);
+    assert.notEqual(result.exitCode, 0);
+    assert.match(result.stderr, /complete --none refused: .*open captain decisions/);
+    assert.equal((await crewsKv(host))[0]?.id, "c1");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("sanitizeFmArgs rewrites a captain-hold --reason native would refuse", () => {
+  assert.deepEqual(
+    sanitizeFmArgs("captain-hold", ["hold", "t1", "--reason", "needs sign-off (legal)\nsoon", "--title", "x (y)"]),
+    ["hold", "t1", "--reason", "needs sign-off [legal] soon", "--title", "x (y)"],
+  );
+  assert.deepEqual(sanitizeFmArgs("spawn", ["--reason", "a (b)"]), ["--reason", "a (b)"]);
+});
+
+test("briefSections splits headed task text so no section is nested or empty", () => {
+  const headed = "## Captain's intent\nfix the login redirect\n\n## Firstmate spec\nTouch only auth.ts.\n## Notes\nextra";
+  assert.deepEqual(briefSections(headed), { intent: "fix the login redirect", spec: "Touch only auth.ts.\n### Notes\nextra" });
+  assert.deepEqual(briefSections("plain words\n# Big heading"), { intent: "plain words\n### Big heading", spec: null });
+  assert.equal(backlogTitleOf(headed), "fix the login redirect");
+  assert.equal(backlogTitleOf("# Task\n## Captain's intent\n\n# Ship the export"), "Ship the export");
+});
+
+test("real dispatch of headed task text fills intent and spec from the task's own sections", async () => {
+  const host = realHost();
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRealTransportBacklog(host, { threadIdAfterSpawn: "thr_real" });
+    const task = "## Captain's intent\nfix the login redirect\n\n## Firstmate spec\nTouch only auth.ts.";
+    const result = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--", task], { projectId: "proj_1" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    const fill = seen.find((c) => c.includes("FM_INTENT="))!;
+    const b64 = (name: string) => Buffer.from(new RegExp(`${name}=([A-Za-z0-9+/=]+)`).exec(fill)![1]!, "base64").toString("utf8");
+    assert.equal(b64("FM_INTENT"), "fix the login redirect");
+    assert.equal(b64("FM_TASK_OWN_SPEC"), "Touch only auth.ts.");
+    const add = seen.find((c) => c.includes("fm-tasks-axi.sh") && c.includes("'add'"))!;
+    assert.ok(add.includes("fix the login redirect"), add);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a refused brief removes the backlog row its own dispatch created", async () => {
+  const host = realHost();
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRealTransportBacklog(host, {
+      spawnExit: 1,
+      spawnOutput: "error: /tmp/fm-home/data/x/brief.md must contain nonempty ## Captain's intent and ## Firstmate spec subsections (or a nonempty legacy # Task body) before spawn",
+      threadIdAfterSpawn: "",
+    });
+    const result = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--", "fix flaky login"], { projectId: "proj_1" });
+    assert.equal(result.exitCode, 1);
+    const crewId = /Real dispatch ([A-Za-z0-9]+) stopped/.exec(result.stderr)?.[1];
+    assert.ok(crewId, result.stderr);
+    assert.ok(seen.some((c) => c.includes("fm-tasks-axi.sh") && c.includes("'rm'") && c.includes(`'${crewId}'`)), "refused-brief row must be removed");
+    assert.match(result.stderr, /backlog row .* was removed/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("queue add carries providerId/model/reasoningLevel through to the dispatched crew", async () => {
+  const host = await load();
+  try {
+    host.harness.sdk.stub("environments.list", async () => [{ hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" }]);
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew" }));
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "starting" }));
+    const queue = agentTool(host, "firstmate_queue");
+    const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
+    const added = toolText(await queue.execute({ action: "add", title: "fix login", providerId: "acp-grok", model: "grok-4", reasoningLevel: "high" }, ctx));
+    const id = /Queued (\S+)/.exec(added)![1]!;
+    const dispatched = await queue.execute({ action: "dispatch", queueId: id }, ctx);
+    assert.ok(!isToolError(dispatched), toolText(dispatched));
+    const spawn = host.harness.sdk.callsTo("threads.spawn")[0]![0] as { providerId?: string; model?: string; reasoningLevel?: string };
+    assert.equal(spawn.providerId, "acp-grok");
+    assert.equal(spawn.model, "grok-4");
+    assert.equal(spawn.reasoningLevel, "high");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("bearings counts the real backlog, and queue dispatch adopts a hand-filed native row", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate", agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", queueOwner: "real", fmHostId: "host_1" },
+  });
+  await plugin(host.bb);
+  try {
+    const routed = stubRoutedHost(host, (wrapped) => {
+      const cmd = unwrapHostCommand(wrapped);
+      if (cmd.includes("fm-tasks-axi.sh") && cmd.includes("'list'")) {
+        return { payload: 'count: 2\ntasks[2]{id,state,kind,repo,title}:\n  oq-a,queued,ship,"-",Build the export\n  oq-b,queued,docs,"-","Docs: policy, draft"\n' };
+      }
+      if (cmd.includes("fm-tasks-axi.sh") && cmd.includes("'show'")) {
+        return { payload: "task:\n  id: oq-a\n  title: Build the export\n  state: queued\n  kind: ship\n" };
+      }
+      return {};
+    });
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew" }));
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "starting", environmentId: "env_wt" }));
+    host.harness.sdk.stub("environments.get", async () => ({ id: "env_wt", hostId: "host_1", path: "/wt", isWorktree: true, status: "ready" }));
+    const bearings = await host.harness.behavior.runCli(["bearings"], { threadId: "thr_cap", projectId: "proj_1" });
+    assert.equal(bearings.exitCode, 0, bearings.stderr);
+    assert.match(bearings.stdout, /· 2 queued/);
+    assert.match(bearings.stdout, /oq-b \[docs\] :: Docs: policy, draft/);
+    const dispatched = await agentTool(host, "firstmate_queue").execute({ action: "dispatch", queueId: "oq-a" }, { threadId: "thr_cap", projectId: "proj_1" } as never);
+    assert.ok(!isToolError(dispatched), toolText(dispatched));
+    assert.match(toolText(dispatched), /Dispatched native backlog row oq-a/);
+    const spawn = host.harness.sdk.callsTo("threads.spawn")[0]![0] as { title?: string };
+    assert.equal(spawn.title, "Ship · Build the export · oq-a");
+    assert.ok(routed.seen.map(unwrapHostCommand).some((c) => c.includes("fm-tasks-axi.sh") && c.includes("'start'") && c.includes("'oq-a'")));
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("the crew cap counts crews that are still starting", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("crews", [1, 2, 3, 4, 5].map((n) => shipRow(`c${n}`, `thr_c${n}`, "thr_cap")));
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async (input: { threadId: string }) =>
+      makeThreadResponse({ id: input.threadId, status: "starting" }));
+    const result = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--", "fix flaky login"], { projectId: "proj_1", threadId: "thr_cap" });
+    assert.equal(result.exitCode, 1);
+    assert.match(result.stderr, /Crew cap reached: 5 crews running/);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("queue dispatch obeys the running-crew cap", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("crews", [1, 2, 3, 4, 5].map((n) => shipRow(`c${n}`, `thr_c${n}`, "thr_cap")));
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async (input: { threadId: string }) =>
+      makeThreadResponse({ id: input.threadId, status: "active" }));
+    const queue = agentTool(host, "firstmate_queue");
+    const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
+    const id = /Queued (\S+)/.exec(toolText(await queue.execute({ action: "add", title: "fix login" }, ctx)))![1]!;
+    const dispatched = await queue.execute({ action: "dispatch", queueId: id }, ctx);
+    assert.ok(isToolError(dispatched), toolText(dispatched));
+    assert.match(toolText(dispatched), /Crew cap reached/);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
 });
