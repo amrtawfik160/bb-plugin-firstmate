@@ -20,8 +20,8 @@ This installer never edits a tracked file. It builds a parallel "mirror bin" at
 
   - every native bin/ entry is SYMLINKED into bin-bb/ (so it keeps inheriting
     upstream on every ff-update),
-  - EXCEPT five files with no native seam -- fm-backend.sh, fm-spawn.sh,
-    fm-teardown.sh, fm-merge-local.sh, fm-bootstrap.sh -- which are generated as patched COPIES, and
+  - EXCEPT six files with no native seam -- fm-backend.sh, fm-spawn.sh,
+    fm-teardown.sh, fm-merge-local.sh, fm-bootstrap.sh, fm-busy-lib.sh -- which are generated as patched COPIES, and
   - bin-bb/backends/ mirrors the native adapters plus the real bb.sh adapter.
 
 Native scripts derive SCRIPT_DIR and FM_BACKEND_LIB_DIR from their own
@@ -37,8 +37,8 @@ empty and the fetch + ff-only path actually fast-forwards. config/ is already
 gitignored upstream, so config/backend and config/bb-project stay invisible too.
 
 Re-run this installer after an ff-update: it re-mirrors (picking up any new native
-bin files) and regenerates the five patched copies against the new native
-source. If a patch no longer applies because upstream changed one of the five
+bin files) and regenerates the six patched copies against the new native
+source. If a patch no longer applies because upstream changed one of the six
 files, the install fails LOUDLY here instead of silently shipping a stale copy.
 """
 from __future__ import annotations
@@ -55,7 +55,7 @@ from pathlib import Path
 
 # Native backend dispatch and managed-branch landing have no extension seam. Carried as
 # patched copies in the mirror; everything else in bin/ is symlinked.
-PATCHED_FILES = ("fm-backend.sh", "fm-spawn.sh", "fm-teardown.sh", "fm-merge-local.sh", "fm-bootstrap.sh")
+PATCHED_FILES = ("fm-backend.sh", "fm-spawn.sh", "fm-teardown.sh", "fm-merge-local.sh", "fm-bootstrap.sh", "fm-busy-lib.sh")
 # Extra files the backend patch also touches but which we do NOT ship (docs only);
 # staged in the temp tree so their hunks apply, then discarded.
 PATCH_STAGE_EXTRA = ("docs/configuration.md",)

@@ -9,6 +9,7 @@ import { z } from "zod";
 import {
   afkShouldSend,
   AXI_TOOL_CONTRACT,
+  CI_POLL_CONTRACT,
   bearingsText,
   capPermission,
   crewPrompt,
@@ -1248,7 +1249,8 @@ export function formatFmMeta(input: {
   const spawnGen =
     input.spawnGen ?? `s${Math.floor(Date.now() / 1000)}.${process.pid}.${Math.floor(Math.random() * 10000)}`;
   const lines = [
-    `window=${input.threadId}`,
+    // Same `bb:<thread>` window fm-spawn records; a bare id makes fm-watch see a new window after retry.
+    `window=${input.threadId.startsWith("bb:") ? input.threadId : `bb:${input.threadId}`}`,
     `endpoint_task_id=${input.id}`,
     `worktree=${input.worktree}`,
     `project=${input.project}`,
@@ -7370,7 +7372,7 @@ export default async function plugin(bb: BbPluginApi) {
         tools: [],
         skills: [],
         instructions:
-          `You are a firstmate crewmate. Do not dispatch other crews. Finish this one task, then report DONE, BLOCKED, or FAILED. ${AXI_TOOL_CONTRACT}`,
+          `You are a firstmate crewmate. Do not dispatch other crews. Finish this one task, then report DONE, BLOCKED, or FAILED. ${AXI_TOOL_CONTRACT} ${CI_POLL_CONTRACT}`,
       };
     }
     const marked = metaFlag(meta, "captain");

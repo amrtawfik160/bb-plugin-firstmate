@@ -38,7 +38,7 @@ import plugin, {
   toolbeltPhrase,
   versionAtLeast,
 } from "./server.ts";
-import { latestStatus, statusProtocolSummary } from "./lib/policy.ts";
+import { CI_POLL_CONTRACT, latestStatus, statusProtocolSummary } from "./lib/policy.ts";
 import { UPSTREAM_SCRIPT_NAMES, PINNED_SCRIPT_SUPPORT_FILES, UPSTREAM_SKILL_NAMES } from "./lib/upstream-surface.ts";
 import { FIRSTMATE_ROUTINE_MARKER } from "./lib/timeline-noise.ts";
 
@@ -81,6 +81,13 @@ test("crews get no dispatch tools", async () => {
     assert.doesNotMatch(cfg.instructions ?? "", /chrome-devtools-axi for browser|CHROME_DEVTOOLS_AXI_SESSION/);
     assert.match(cfg.instructions ?? "", /lavish-axi/);
     assert.match(cfg.instructions ?? "", /no-mistakes axi/);
+    // Crews ran `gh-axi run watch` / `pr checks` loops and drained the shared GitHub token.
+    assert.match(cfg.instructions ?? "", /Never poll CI in a loop/);
+    assert.match(cfg.instructions ?? "", /at most every 5 minutes/);
+    assert.match(cfg.instructions ?? "", /\.resources\.graphql/);
+    // Crews must run the BB-capable mirror, not native bin/ (no bb backend there).
+    assert.match(cfg.instructions ?? "", /bin-bb\/fm-procevent-lavish\.sh arm/);
+    assert.doesNotMatch(cfg.instructions ?? "", /home's bin\/fm-tasks-axi\.sh/);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -392,7 +399,11 @@ test("formatFmMeta matches fm-spawn bb keys", () => {
     kind: "scout",
     spawnGen: "s1",
   });
-  assert.match(scout, /^window=thr_x$/m);
+  // Same window shape fm-spawn writes (META_WINDOW=bb:$T); a bare id after retry
+  // made fm-watch treat the relaunched crew as a new window and re-escalate stale.
+  assert.match(scout, /^window=bb:thr_x$/m);
+  assert.doesNotMatch(scout, /^window=thr_x$/m);
+  assert.match(formatFmMeta({ id: "p1", threadId: "bb:thr_y", worktree: "", project: "/r", kind: "scout" }), /^window=bb:thr_y$/m);
   assert.match(scout, /^endpoint_task_id=abc12def$/m);
   assert.match(scout, /^worktree=\/wt$/m);
   assert.match(scout, /^project=\/repo$/m);
@@ -493,9 +504,9 @@ test("dispatch with fmHome writes state meta and forget drops it", async () => {
     const idMatch = /Dispatched ship crew (\S+)/.exec(result.stdout);
     assert.ok(idMatch);
     const crewId = idMatch[1]!;
-    const writeCmd = hostCommands.find((cmd) => cmd.includes("window=thr_crew"));
+    const writeCmd = hostCommands.find((cmd) => cmd.includes("window=bb:thr_crew"));
     assert.ok(writeCmd, `no meta write command in ${hostCommands.join("\n---\n")}`);
-    assert.match(writeCmd, /window=thr_crew/);
+    assert.match(writeCmd, /window=bb:thr_crew/);
     assert.match(writeCmd, new RegExp(`endpoint_task_id=${crewId}`));
     assert.match(writeCmd, /worktree=\/wt/);
     assert.match(writeCmd, /project=\/repo/);
@@ -2744,6 +2755,139 @@ test("failed re-install is atomic: working mirror is preserved byte-for-byte (B1
 // the live dirty state and probes a dispatch at every migration step. This test runs it
 // both ways: NEW order must expose ZERO windows; --old-order (the mutation) must expose a
 // window — proving the probe is load-bearing, not vacuous.
+// Install the overlay into a scratch clone at the patch base and run `body` with the
+// home. Skips where no firstmate checkout is available.
+function withInstalledMirror(t: { skip: (msg: string) => void }, prefix: string, body: (home: string, work: string) => void): void {
+  const checkout = discoverFirstmateCheckout();
+  if (checkout === null) {
+    t.skip("no firstmate checkout discoverable (set FM_TEST_HOME to enable)");
+    return;
+  }
+  const work = mkdtempSync(join(tmpdir(), prefix));
+  try {
+    const home = join(work, "home");
+    const skip = cloneAtPatchBase(checkout, home);
+    if (skip) {
+      t.skip(skip);
+      return;
+    }
+    const inst = spawnSync("python3", [join(OVERLAY_ROOT, "install-bb-backend.py"), "--home", home, "--overlay", OVERLAY_ROOT, "--project-id", "proj_test"], { encoding: "utf8" });
+    assert.equal(inst.status, 0, `installer failed:\n${inst.stdout}\n${inst.stderr}`);
+    body(home, work);
+  } finally {
+    rmSync(work, { recursive: true, force: true });
+  }
+}
+
+// A fake `bb` whose `thread show --json` returns the real CLI shape ({thread:{status}}).
+function fakeBbShowing(dir: string, status: string): string {
+  const fakebin = join(dir, "fakebin");
+  mkdirSync(fakebin, { recursive: true });
+  writeFileSync(join(fakebin, "bb"), `#!/bin/sh\ncase "$1 $2" in\n 'thread show') printf '%s\\n' '${JSON.stringify({ thread: { id: "thr_busy1", status } })}' ;;\n *) exit 0 ;;\nesac\n`, { mode: 0o755 });
+  return fakebin;
+}
+
+const BB_SHARED_ENV_META = [
+  "window=bb:thr_busy1", "endpoint_task_id=c1", "worktree=", "project=/tmp",
+  "harness=bb", "kind=scout", "backend=bb", "bb_thread_id=thr_busy1",
+].join("\n") + "\n";
+
+// Audit A: fm-busy-lib trusted a native busy verdict only for herdr, so an active BB
+// crew in a long tool call classified `unknown missing`, and fm-watch paged a false
+// `stale:` after two unchanged polls. Reverting the fm-busy-lib hunk of
+// firstmate-bb-backend.patch (or dropping fm-busy-lib.sh from PATCHED_FILES) makes the
+// mirror read `unknown missing` and this test fail.
+test("an active BB crew classifies busy through the mirror (native herdr-only verdict reads unknown)", (t) => {
+  withInstalledMirror(t, "fm-bb-busy-", (home, work) => {
+    const state = join(work, "state");
+    mkdirSync(state);
+    writeFileSync(join(state, "c1.meta"), BB_SHARED_ENV_META);
+    const classify = (bin: string, status: string) => spawnSync("bash", ["-c",
+      `. "$B/fm-backend.sh" && . "$B/fm-busy-lib.sh" && fm_busy_classify_meta "$S/c1.meta" c1 "$S"`,
+    ], { encoding: "utf8", env: { ...process.env, B: bin, S: state, FM_HOME: home, PATH: `${fakeBbShowing(join(work, status), status)}:${process.env.PATH}` } });
+    assert.ok(lstatSync(join(home, "bin-bb", "fm-busy-lib.sh")).isFile() && !lstatSync(join(home, "bin-bb", "fm-busy-lib.sh")).isSymbolicLink(), "fm-busy-lib.sh must be a patched copy in the mirror");
+    const busy = classify(join(home, "bin-bb"), "active");
+    assert.equal(busy.status, 0, busy.stderr);
+    assert.equal(busy.stdout.trim(), "busy bb-native");
+    // An idle thread is still not proof of idle turn state: unknown, never busy.
+    assert.equal(classify(join(home, "bin-bb"), "idle").stdout.trim(), "unknown missing");
+    // Control: the pristine native lib (herdr-only) cannot see the busy BB crew.
+    assert.equal(classify(join(home, "bin"), "active").stdout.trim(), "unknown missing");
+  });
+});
+
+// Audit B (teardown half): a shared-env scout's meta records `worktree=` empty (BB owns
+// the environment), and native endpoint validation refused it ("missing, empty, or
+// ambiguous worktree identity"), so forget failed. Reverting the validate hunk in
+// firstmate-bb-backend.patch makes the first assertion fail.
+test("shared-env BB crew with no worktree passes endpoint validation; ambiguity and non-bb still refuse", (t) => {
+  withInstalledMirror(t, "fm-bb-sharedenv-", (home, work) => {
+    const validate = (meta: string) => {
+      writeFileSync(join(work, "c1.meta"), meta);
+      return spawnSync("bash", ["-c",
+        `. "$B/fm-backend.sh" && fm_backend_validate_task_endpoint "$M" c1 && printf '%s %s' "$FM_BACKEND_VALIDATED_BACKEND" "$FM_BACKEND_VALIDATED_TARGET"`,
+      ], { encoding: "utf8", env: { ...process.env, B: join(home, "bin-bb"), M: join(work, "c1.meta"), FM_HOME: home } });
+    };
+    const ok = validate(BB_SHARED_ENV_META);
+    assert.equal(ok.status, 0, ok.stderr);
+    assert.equal(ok.stdout, "bb bb:thr_busy1");
+    // No worktree= line at all is also a shared-env record.
+    assert.equal(validate(BB_SHARED_ENV_META.replace("worktree=\n", "")).status, 0);
+    // A repeated worktree= stays ambiguous and refuses.
+    const dup = validate(BB_SHARED_ENV_META.replace("worktree=\n", "worktree=\nworktree=/a\n"));
+    assert.notEqual(dup.status, 0);
+    assert.match(dup.stderr, /ambiguous worktree identity/);
+    // Only bb is exempt: an empty worktree for another backend still refuses.
+    const tmux = validate(BB_SHARED_ENV_META.replace("backend=bb", "backend=tmux"));
+    assert.notEqual(tmux.status, 0);
+    assert.match(tmux.stderr, /worktree identity/);
+  });
+});
+
+// Audit B (crew half): the crew preamble and the native brief pointed crews at the
+// home's native bin/ (no bb backend), so `fm-procevent-lavish.sh arm` refused with
+// "backend identity missing". Audit D: crews polled CI in tight loops and drained the
+// shared GitHub token. Reverting the path rewrite or the CI rule in bb.sh
+// fm_backend_bb_create_task fails this test.
+test("bb crew launch prompt routes scripts to bin-bb and forbids CI poll loops", () => {
+  const home = mkdtempSync(join(tmpdir(), "fm-bb-prompt-"));
+  try {
+    mkdirSync(join(home, "bin-bb"));
+    const fakebin = join(home, "fakebin");
+    const log = join(home, "transport.jsonl");
+    mkdirSync(fakebin);
+    writeFileSync(join(fakebin, "bb"), `#!/usr/bin/env python3\nimport json,sys\nwith open(${JSON.stringify(log)}, 'a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')\nargs=sys.argv[1:]\nif args[:2] == ['thread','spawn']: print(json.dumps({'id':'thr_crew1','path':'/wt'}))\nelif args[:2] == ['thread','show']: print(json.dumps({'thread':{'id':'thr_crew1','status':'active'},'environment':{'path':'/wt'}}))\n`, { mode: 0o755 });
+    const brief = join(home, "brief.md");
+    writeFileSync(brief, [
+      "arm your board with bin/fm-procevent-lavish.sh arm <artifact.html> --for <task-id>;",
+      `acknowledge with \`bin/fm-procevent.sh handled <source-id> <sequence>\``,
+      `run \`${home}/bin/fm-ensure-agents-md.sh .\` in the worktree.`,
+      "bin/fm-crew-state.sh at line start",
+    ].join("\n"));
+    const env = { ...process.env, PATH: `${fakebin}:${process.env.PATH}`, FM_HOME: home, FM_ROOT: home, FM_BB_PROJECT_ID: "project_1", FM_BB_MACHINE: "host_1" };
+    const run = spawnSync("bash", ["-c", `. ${JSON.stringify(join(OVERLAY_ROOT, "bin/backends/bb.sh"))} 2>/dev/null; fm_backend_bb_create_task "Scout" /repo c1 scout "$BRIEF"`], { env: { ...env, BRIEF: brief }, encoding: "utf8" });
+    assert.equal(run.status, 0, run.stderr);
+    const calls = readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line) as string[]);
+    const launch = calls.find(args => args[0] === "thread" && args[1] === "spawn")!;
+    const prompt = launch[launch.indexOf("--prompt") + 1]!;
+    const bindir = `${home}/bin-bb`;
+    assert.ok(prompt.includes(`${bindir}/fm-procevent-lavish.sh arm <artifact.html>`), prompt);
+    assert.ok(prompt.includes(`\`${bindir}/fm-procevent.sh handled`), prompt);
+    assert.ok(prompt.includes(`\`${bindir}/fm-ensure-agents-md.sh .\``), prompt);
+    assert.ok(prompt.includes(`\n${bindir}/fm-crew-state.sh at line start`), prompt);
+    assert.ok(prompt.includes(`Use ${bindir}/fm-tasks-axi.sh for backlog work`), prompt);
+    assert.ok(prompt.includes(`arm ${bindir}/fm-procevent-lavish.sh with --for c1`), prompt);
+    const briefPart = prompt.slice(prompt.indexOf("\n\n") + 2);
+    assert.match(briefPart, /^arm your board/);
+    assert.doesNotMatch(briefPart, /[ `(]bin\/fm-/, "no relative native bin/ reference may survive in the brief");
+    assert.ok(!prompt.includes(`${home}/bin/`), "no absolute native bin/ reference may survive");
+    assert.match(prompt, /Never poll CI in a loop/);
+    assert.match(prompt, /\.resources\.graphql/);
+    // The shell rule and the TS crew contract must say the same thing.
+    assert.ok(prompt.includes(CI_POLL_CONTRACT), "bb.sh CI rule drifted from lib/policy.ts CI_POLL_CONTRACT");
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
 test("migration off the in-place patch has zero bb-less window (mutation-proven)", (t) => {
   const checkout = discoverFirstmateCheckout();
   if (checkout === null) {
@@ -2896,7 +3040,7 @@ test("migrate-state imports absent crews into real state and is idempotent", asy
     assert.equal(first.exitCode, 0, first.stderr);
     const r1 = JSON.parse(first.stdout) as { imported: string[]; skippedExisting: string[]; failed: string[] };
     assert.deepEqual(r1.imported, ["c1"]);
-    assert.ok(commands.some((c) => c.includes("c1.meta") && c.includes("window=thr_crew")), "no meta write");
+    assert.ok(commands.some((c) => c.includes("c1.meta") && c.includes("window=bb:thr_crew")), "no meta write");
 
     metaPresent = true;
     const second = await host.harness.behavior.runCli(["migrate-state", "--json"]);
