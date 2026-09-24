@@ -8891,3 +8891,39 @@ test("BB's child ping does not replace the doorbell while the captain is rate-li
     await host.harness.lifecycle.dispose();
   }
 });
+
+test("the background landed sweep never retires a crew whose PR was closed unmerged", async () => {
+  const host = await load();
+  try {
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_capB")]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async (input: { threadId: string }) =>
+      makeThreadResponse({ id: input.threadId, status: "idle", environmentId: input.threadId === "thr_crew" ? "env_wt" : null }));
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+    host.harness.sdk.stub("threads.output", async () => ({ output: "DONE: shipped" }));
+    host.harness.sdk.stub("threads.stop", async () => ({}));
+    host.harness.sdk.stub("threads.archive", async () => ({}));
+    host.harness.sdk.stub("threads.send", async () => ({}));
+    let prReads = 0;
+    host.harness.sdk.stub("environments.pullRequest", async () => {
+      prReads++;
+      return {
+        outcome: "available",
+        pullRequest: { url: "https://github.com/o/r/pull/9", number: 9, title: "t", state: "closed", checks: { state: "passing" }, mergeability: { mergeable: "MERGEABLE" } },
+      };
+    });
+    await host.bb.storage.kv.set("watch-meta", { lastPassAt: Date.now(), checked: -1, notified: -1 });
+    const run = host.harness.behavior.runService("crew-watch");
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline && prReads === 0) await new Promise((resolve) => setTimeout(resolve, 10));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    run.controller.abort();
+    await run.done;
+    assert.ok(prReads > 0, "the sweep ran");
+    assert.equal(((await host.bb.storage.kv.get("crews")) as unknown[]).length, 1, "a closed-unmerged crew is kept");
+    assert.equal(host.harness.sdk.callsTo("threads.archive").length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});

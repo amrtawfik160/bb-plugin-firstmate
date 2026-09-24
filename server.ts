@@ -4929,6 +4929,9 @@ export default async function plugin(bb: BbPluginApi) {
       }
       if (!pr.available) continue;
       if (state !== "merged" && state !== "closed") continue;
+      // The background sweep only retires LANDED work. A PR closed unmerged may be
+      // one the captain closed to redo, so only a captain's own bearings retires it.
+      if (opts.notify === true && state !== "merged") continue;
       const tell = state === "merged" && (opts.notify === true || (opts.notifyUnless !== undefined && crew.parentThreadId !== opts.notifyUnless));
       try {
         await retireLanded(crew, state === "merged" ? "merged externally" : "PR closed externally", url);
