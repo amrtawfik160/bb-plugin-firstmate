@@ -2191,6 +2191,38 @@ test("bearings reconciles a crew whose PR merged externally", async () => {
   }
 });
 
+test("a refused landed-crew cleanup keeps the crew without failing bearings", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () =>
+      makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }),
+    );
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+    host.harness.sdk.stub("threads.output", async () => ({ output: "DONE: shipped" }));
+    host.harness.sdk.stub("threads.stop", async () => {
+      throw new Error("REFUSED: worktree has uncommitted changes");
+    });
+    host.harness.sdk.stub("environments.pullRequest", async () => ({
+      outcome: "available",
+      pullRequest: {
+        url: "https://gh/pr/1", number: 1, title: "t", state: "merged",
+        checks: { state: "passing", failedCount: 0, pendingCount: 0, passedCount: 1 },
+        mergeability: { mergeable: "MERGEABLE" },
+      },
+    }));
+    const first = await host.harness.behavior.runCli(["bearings"]);
+    assert.equal(first.exitCode, 0, first.stderr);
+    assert.equal(((await host.bb.storage.kv.get("crews")) as unknown[]).length, 1, "refused crew is kept");
+    const second = await host.harness.behavior.runCli(["bearings"]);
+    assert.equal(second.exitCode, 0, second.stderr);
+    assert.equal(host.harness.sdk.callsTo("threads.stop").length, 1, "refused cleanup backs off instead of re-running");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("mark-crew tags a thread so the crewmate contract applies", async () => {
   const host = await load();
   try {
