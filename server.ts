@@ -440,7 +440,7 @@ function fmMirrorStaleGuard(fmHome: string): string {
 // authoritative store; the chat doorbell is only a pointer to it, so a dropped doorbell can
 // never lose the report (it survives in state/.wake-queue).
 export const CAPTAIN_WAKE_DRAIN_HINT =
-  "Use `firstmate_wake` now; handle and acknowledge the durable report silently.";
+  "Use `firstmate_wake` with ack=true now; handle the durable report silently.";
 
 function wakeOutputForCaptainTool(out: string): string {
   return out
@@ -465,12 +465,16 @@ export function captainWakeDoorbell(head: string, summary: string, opts?: { drai
   return opts?.drainHint === true ? `${body}\n${CAPTAIN_WAKE_DRAIN_HINT}` : body;
 }
 
+// Every wake re-reads the captain's whole context once per model call, so the
+// guidance aims for ONE call: firstmate_wake ack=true presents and acknowledges
+// together. A wake that needs nothing from the captain must end with no text —
+// the captain never saw the wake, so a "nothing new" reply is pure noise.
 const INTERNAL_WAKE_GUIDANCE = [
-  "FIRSTMATE INTERNAL WAKE — hidden from the captain.",
-  "Do not quote, paraphrase, or announce this wake.",
-  "First call firstmate_wake to read durable reports. Reconcile current crew state where action depends on it.",
-  "Handle each actionable report, then acknowledge using the exact ackThrough and recoveryGeneration returned by firstmate_wake. Delivery alone is not acknowledgment.",
-  "Reply to the captain only with a concise material outcome, review item, needed decision, credential/login request, or blocker that still remains after recovery.",
+  "FIRSTMATE INTERNAL WAKE — hidden from the captain. Do not quote, paraphrase, or announce it.",
+  "Call firstmate_wake once with ack=true; it presents and acknowledges the durable reports in one call.",
+  "Act only where a report needs action (review, merge, retry, decision). A stale line for a crew that already finished needs nothing.",
+  "If nothing needs the captain, end the turn with no reply text at all — never send 'nothing new', 'still in progress', or a status recap.",
+  "Otherwise reply once with the concise material outcome, review item, needed decision, credential/login request, or blocker that remains after recovery.",
 ].join(" ");
 
 function captainWakeInput(text: string) {
@@ -718,10 +722,12 @@ export function rewriteWakeAckLine(out: string): string {
   return out.replace(/bin\/fm-wake-drain\.sh/g, "bb firstmate wake");
 }
 
-// BB's own crew-completion pings ("@thread:<id> completed: …") are system
-// messages. Joining a captain's running turn they interrupt it and duplicate the
+// Crew messages that join a captain's running turn interrupt it and duplicate the
 // durable wake queue; native firstmate delivers wakes at turn boundaries. Hold
 // them while the captain is mid-turn and release them as one batch at idle.
+// BB's own child-status pings ("[bb system] @thread:<id> completed: …") never
+// reach this hook: core delivers them through its parent-system-message path,
+// which skips message.dispatch. notifyCaptainOnce handles that overlap instead.
 const CREW_PING_RE = /^\s*(?:\[bb system\]\s*)?@thread:[A-Za-z0-9_-]+ (?:completed|failed|was interrupted|interrupted|needs attention)\b/i;
 export function crewPingHoldDecision(input: {
   attempt: string;
@@ -732,6 +738,101 @@ export function crewPingHoldDecision(input: {
 }): "hold" | "proceed" {
   if (input.attempt !== "join-turn" || input.initiator !== "system" || !input.targetIsCaptain) return "proceed";
   return input.senderIsCrew || CREW_PING_RE.test(input.text) ? "hold" : "proceed";
+}
+
+// BB posts its own "[bb system] @thread:<crew> completed/failed" ping to the parent
+// captain ~2s after a crew's turn ends, through a core path no plugin hook can hold
+// or drop. The plugin's doorbell for the same event is slower (it first persists the
+// durable wake and looks up the PR). When BB's ping has already started a captain
+// turn and that turn has ENDED, the doorbell would start a second full turn for news
+// the captain just absorbed — so it is skipped; the durable wake row stays queued for
+// the next drain. A running captain turn still takes the steer (it joins, no new
+// turn), and needs-decision/interaction keep their doorbell (BB's ping lacks the
+// open-decision context). Observed: ~37 duplicate captain turns across two captains.
+export function doorbellSupersededByBbPing(input: {
+  kind: string;
+  durable: boolean;
+  captainStatus: string | null;
+  captainTurnStartedAt: number | null;
+  crewFinishedAt: number;
+}): boolean {
+  if (!input.durable) return false;
+  if (input.kind !== "idle" && input.kind !== "review" && input.kind !== "error") return false;
+  if (input.captainStatus !== "idle") return false;
+  return input.captainTurnStartedAt !== null && input.captainTurnStartedAt >= input.crewFinishedAt;
+}
+
+// BB thread ids named in an fm-watch line ("stale: bb:thr_abc (idle 257s, …)").
+export function watchLineThreadIds(line: string): string[] {
+  return [...new Set([...line.matchAll(/\bthr_[A-Za-z0-9]+/g)].map((m) => m[0]))];
+}
+
+// fm-watch's wedge ladder treats an idle BB thread as alive, so a crew that simply
+// FINISHED re-pages "possible wedge" every ~4 minutes, and a crew from another home
+// (named only by thread id) was routed to whichever captain last took the deck.
+// A stale line is relayed only when it names at least one known crew that is still
+// running; a line naming only unknown threads is foreign and dropped. Lines that
+// name no thread at all are left to the caller's fallback rules.
+export function staleLineRelayDecision(input: {
+  line: string;
+  knownCrewThreads: ReadonlySet<string>;
+  runningCrewThreads: ReadonlySet<string>;
+}): "relay" | "drop-finished" | "drop-foreign" | "no-thread" {
+  if (!/^stale:/.test(input.line)) return "relay";
+  const ids = watchLineThreadIds(input.line);
+  if (ids.length === 0) return "no-thread";
+  const known = ids.filter((id) => input.knownCrewThreads.has(id));
+  if (known.length === 0) return "drop-foreign";
+  return known.some((id) => input.runningCrewThreads.has(id)) ? "relay" : "drop-finished";
+}
+
+// R2 dedup key. A check: line's numbers can be request ids or receipt sequences,
+// so it is kept byte-for-byte. A stale: line normalizes digits only inside its
+// parenthetical ("idle 257s, escalation 2"), so one wedge pages once per reason
+// rather than once per rung, while crew ids outside it (which may differ only in
+// digits) stay distinct. The demand-deep-inspection rung has its own wording and key.
+export function watchRelayDedupKey(line: string): string {
+  const flat = line.replace(/\s+/g, " ").trim();
+  if (/^check:/.test(flat)) return flat;
+  return flat.replace(/\(([^)]*)\)/g, (_m, inner: string) => `(${inner.replace(/\d+/g, "#")})`);
+}
+
+// Pull the ack pair out of a presented wake drain (native or rewritten form).
+export function wakeAckFromOutput(out: string): { ackThrough: number; recoveryGeneration: string } | null {
+  const m =
+    /ackThrough=(\d+) and recoveryGeneration="([A-Za-z0-9._-]+)"/.exec(out) ??
+    /--ack-through (\d+) --recovery-generation ([A-Za-z0-9._-]+)/.exec(out);
+  return m ? { ackThrough: Number(m[1]), recoveryGeneration: m[2]! } : null;
+}
+
+// A long-lived captain's context only grows, and every wake re-reads all of it, so
+// a 500k-token captain paid ~500k tokens per model call just to absorb a doorbell.
+// Compact an idle captain once it passes the budget, at most once per cooldown.
+export function captainCompactDue(input: {
+  usedTokens: number | null;
+  budget: number;
+  lastCompactAt: number | null;
+  now: number;
+  cooldownMs: number;
+}): boolean {
+  if (!(input.budget > 0) || input.usedTokens === null || input.usedTokens < input.budget) return false;
+  return input.lastCompactAt === null || input.now - input.lastCompactAt >= input.cooldownMs;
+}
+
+// Captain providers that run the user-level Stop/SessionStart hooks this plugin installs.
+export const HOOKED_CAPTAIN_PROVIDERS: ReadonlySet<string> = new Set(["claude-code", "codex"]);
+
+// Extra deck guidance for a captain whose harness skips those hooks (ACP providers
+// such as Grok): nothing enforces the wake guard or runs session start there, so the
+// rules the hooks would have enforced are stated explicitly.
+export function unhookedCaptainNote(providerId: string): string {
+  if (providerId === "" || HOOKED_CAPTAIN_PROVIDERS.has(providerId)) return "";
+  return [
+    `Captain harness note: this captain runs on ${providerId}, which does not load firstmate's turn-end and session-start hooks. Claude Code or Codex captains are recommended; ${providerId} works best as a crew provider.`,
+    "Your only state is the firstmate_* tools. Never read bb.db, BB server logs, other captains' homes, or another project's files to reconstruct state.",
+    "Report crew status only from a firstmate_crews/bearings/crew result from this turn; never from memory.",
+    "On a hidden wake, call firstmate_wake with ack=true; if nothing needs the captain, end the turn with no reply text.",
+  ].join("\n");
 }
 
 // The base home's root wake queue is fed by the native watcher, whose output the
@@ -1049,8 +1150,9 @@ const CAPTAIN_VISIBILITY_CONTRACT = [
   "Use the native firstmate_* tool whenever it exists. Never shell out to bb firstmate or call generic command tools for routine orchestration; those rows bypass the clean captain timeline. Use firstmate_fm for real scripts that have no native tool.",
   "Never paste tool output, worker reports, status lines, or internal records. Translate them into the project outcome, consequence, and next decision.",
   "Speak when requested work finishes; work is ready for review; findings are ready; a decision, approval, credential, or login is needed; or a real blocker or failure remains after recovery.",
-  "A crew wake delivered during your turn is live input: absorb it before continuing, drain firstmate_wake when it points to durable state, and keep draining until no unread wakes remain. Treat several crew wakes as one batch and leave none queued for a later turn.",
+  "A crew wake delivered during your turn is live input: absorb it before continuing, call firstmate_wake with ack=true when it points to durable state, and repeat only if it reports more unread wakes. Treat several crew wakes as one batch and leave none queued for a later turn.",
   "Keep each captain-facing message concise. The final response must stand alone with every material outcome, consequence, needed decision, and full recorded PR URL.",
+  "Your state is the firstmate_* tools and your own fmHome. Never read bb.db, BB server logs, other captains' homes, or another project's records.",
 ].join(" ");
 
 const BB_SKILL_RUNTIME_CONTRACT = [
@@ -1316,6 +1418,11 @@ export default async function plugin(bb: BbPluginApi) {
       type: "number",
       label: "Maximum automatic turn-end re-rings for unchanged wake contents; new contents reset the budget.",
       default: 3,
+    },
+    captainCompactAtTokens: {
+      type: "number",
+      label: "Compact an idle captain thread once its context passes this many tokens (at most every 20 minutes). Every crew wake re-reads the captain's whole context, so a small captain context is the main token saving. 0 = off.",
+      default: 200000,
     },
     defaultProvider: {
       type: "string",
@@ -1902,13 +2009,16 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   const notificationChains = new Map<string, Promise<void>>();
+  // When each captain last went active (a turn started), fed by thread.active.
+  const captainTurnStartedAt = new Map<string, number>();
   async function notifyCaptain(crew: Crew, event: string, output: string | null, signal?: AbortSignal): Promise<void> {
+    const crewFinishedAt = Date.now();
     const previous = notificationChains.get(crew.threadId) ?? Promise.resolve();
-    const run = previous.catch(() => {}).then(() => notifyCaptainOnce(crew, event, output, signal));
+    const run = previous.catch(() => {}).then(() => notifyCaptainOnce(crew, event, output, signal, crewFinishedAt));
     notificationChains.set(crew.threadId, run);
     try { await run; } finally { if (notificationChains.get(crew.threadId) === run) notificationChains.delete(crew.threadId); }
   }
-  async function notifyCaptainOnce(crew: Crew, event: string, output: string | null, signal?: AbortSignal): Promise<void> {
+  async function notifyCaptainOnce(crew: Crew, event: string, output: string | null, signal?: AbortSignal, crewFinishedAt = Date.now()): Promise<void> {
     if (crew.parentThreadId === null) return;
     const parentThreadId = crew.parentThreadId;
     const deliveryKey = `captain-delivery:${crew.threadId}`;
@@ -2010,6 +2120,19 @@ export default async function plugin(bb: BbPluginApi) {
       }
       for (const line of evicted) await deliverToCaptain(parentThreadId, line, crew.id, signal);
       if (evicted.length > 0) await publishFleet();
+      return;
+    }
+    let captainStatus: string | null = null;
+    try { captainStatus = (await bb.sdk.threads.get({ threadId: parentThreadId })).status; } catch { /* unknown: ring */ }
+    if (doorbellSupersededByBbPing({
+      kind,
+      durable,
+      captainStatus,
+      captainTurnStartedAt: captainTurnStartedAt.get(parentThreadId) ?? null,
+      crewFinishedAt,
+    })) {
+      bb.log.info(`doorbell skipped crew=${crew.id} captain=${parentThreadId}: BB's completion ping already woke the captain; durable wake kept`);
+      await publishFleet();
       return;
     }
     if (await deliverToCaptain(parentThreadId, doorbell, crew.id, signal)) {
@@ -3607,13 +3730,15 @@ export default async function plugin(bb: BbPluginApi) {
       }),
     );
     const now = Date.now();
-    const decisions = await readDecisions();
-    // D4: scope the backlog + landed to the calling captain, own-by-default with
-    // `--all` (owner === undefined) — the same partition crews/session already use.
-    // Rows queued/landed before this attribution existed carry no owner, so they
-    // surface only under --all (never mis-attributed to the wrong captain).
+    // D4: scope the backlog, landed work, AND decisions to the calling captain,
+    // own-by-default with `--all` (owner === undefined) — the same partition
+    // crews/session already use. Rows created before this attribution existed carry
+    // no owner, so they surface only under --all (never mis-attributed to the wrong
+    // captain). Decisions were once unscoped, so every captain's deck greeted it
+    // with other projects' open calls.
     const ownedByCaptain = (parentThreadId: string | null | undefined): boolean =>
       owner === undefined || owner === "" ? true : parentThreadId === owner;
+    const decisions = (await readDecisions()).filter((d) => ownedByCaptain(d.parentThreadId));
     const queue = (await readQueue()).filter((q) => ownedByCaptain(q.parentThreadId));
     const done = (await readDone()).filter((d) => ownedByCaptain(d.parentThreadId));
     const count = (s: string) => rows.filter((r) => r.status === s).length;
@@ -4774,6 +4899,16 @@ export default async function plugin(bb: BbPluginApi) {
   // --recovery-generation <GEN>` line; it does NOT consume. Ack mode consumes rows
   // at/below the sequence. Configuration, transport, and native-script failures
   // remain errors with their cause; none implies an empty or acknowledged queue.
+  // A captain sees its own queue and decision rows. With its own home it sees only
+  // those; on the shared legacy home it also keeps the unattributed rows written
+  // before rows carried an owner — but never another captain's.
+  function ownedByScopedCaptain(parentThreadId: string | null | undefined): boolean {
+    const scope = homeScope.getStore();
+    if (!scope?.captain) return true;
+    if (parentThreadId === scope.captain) return true;
+    return !scope.home && (parentThreadId === null || parentThreadId === undefined || parentThreadId === "");
+  }
+
   async function drainWakes(
     captainThreadId: string | undefined,
     ackThrough?: number,
@@ -4907,7 +5042,7 @@ export default async function plugin(bb: BbPluginApi) {
         mode: "steer",
         input: captainWakeInput(
           `${pending} crew update(s) still need attention. ` +
-          "Use `firstmate_wake`, handle and acknowledge them, then continue.",
+          "Use `firstmate_wake` with ack=true, handle them, then continue.",
         ),
       });
       bb.log.info(`turn-end guard re-rang captain ${threadId} (${pending} pending, ${tag})`);
@@ -5949,8 +6084,7 @@ export default async function plugin(bb: BbPluginApi) {
   // numbers can be request ids or receipt sequences, so preserve it byte-for-byte;
   // otherwise two queued captain requests can collapse into one notification.
   function relayDedupKey(line: string): string {
-    if (/^check:/.test(line)) return line.replace(/\s+/g, " ").trim();
-    return line.replace(/\d+/g, "#").replace(/\s+/g, " ").trim();
+    return watchRelayDedupKey(line);
   }
 
   // Redact from a page line every whitespace token that names a crew NOT owned by the
@@ -5994,18 +6128,51 @@ export default async function plugin(bb: BbPluginApi) {
     // records the manager for this host, so those events still wake it when the fleet
     // is empty. Before any deck is recorded, fall back only when one captain owns crews
     // on this host; never fan an unattributable line across managers.
+    const scope = homeScope.getStore();
     const remembered = await bb.storage.kv.get<unknown>(`${FM_WATCH_CAPTAIN_PREFIX}${hostId}`);
-    const rememberedCaptain = homeScope.getStore()?.captain ?? (typeof remembered === "string" && remembered !== "" ? remembered : undefined);
-    const soleHostParent = rememberedCaptain ?? (hostParents.size === 1 ? [...hostParents][0]! : undefined);
-    const ownedCrews = crews.filter((c) => c.parentThreadId !== null && c.parentThreadId !== "" && (!homeScope.getStore()?.home || c.nativeHome === homeScope.getStore()?.home));
+    let rememberedCaptain = scope?.captain ?? (typeof remembered === "string" && remembered !== "" ? remembered : undefined);
+    let hostFallback = hostParents.size === 1 ? [...hostParents][0]! : undefined;
+    if (!scope?.home) {
+      // The base home's unattributed lines belong to a captain on the base home, never to
+      // a captain that owns its own home (that captain's home has its own watcher). The
+      // host key only remembers who last took the deck, whatever project that was.
+      const baseHome = (await settings.get()).fmHome.trim();
+      const ownsOtherHome = async (captain: string | undefined): Promise<boolean> => {
+        if (captain === undefined) return false;
+        const home = await bb.storage.kv.get<unknown>(`native-home:${captain}`);
+        return typeof home === "string" && home !== "" && home !== baseHome;
+      };
+      if (await ownsOtherHome(rememberedCaptain)) rememberedCaptain = undefined;
+      if (await ownsOtherHome(hostFallback)) hostFallback = undefined;
+    }
+    const soleHostParent = rememberedCaptain ?? hostFallback;
+    const ownedCrews = crews.filter((c) => c.parentThreadId !== null && c.parentThreadId !== "" && (!scope?.home || c.nativeHome === scope.home || (!c.nativeHome && c.parentThreadId === scope.captain)));
+    // Stale lines name crews by BB thread id; only a crew whose thread is still
+    // running can be wedged. An idle/failed thread already rang its doorbell.
+    const knownCrewThreads = new Set(ownedCrews.map((c) => c.threadId).filter((t) => t !== ""));
+    const runningCrewThreads = new Set<string>();
+    for (const threadId of new Set(lines.filter((l) => /^stale:/.test(l)).flatMap(watchLineThreadIds))) {
+      if (!knownCrewThreads.has(threadId)) continue;
+      try {
+        const status = (await bb.sdk.threads.get({ threadId })).status;
+        if (status !== "idle" && status !== "error") runningCrewThreads.add(threadId);
+      } catch {
+        runningCrewThreads.add(threadId); // unknown state: keep the wedge backstop
+      }
+    }
     // Group per target parent so each captain gets one message.
     const byParent = new Map<string, string[]>();
     for (const line of lines) {
       const key = `${hostId}|${relayDedupKey(line)}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      // Every known crew whose id appears in this line, grouped by owning captain.
-      const mentioned = ownedCrews.filter((c) => line.includes(c.id));
+      const stale = staleLineRelayDecision({ line, knownCrewThreads, runningCrewThreads });
+      if (stale === "drop-finished" || stale === "drop-foreign") {
+        bb.log.info(`fm-watch relay: dropping ${stale === "drop-finished" ? "stale line for a finished crew" : "stale line for a crew outside this scope"}: ${truncate(line, 160)}`);
+        continue;
+      }
+      // Every known crew whose id or thread id appears in this line, grouped by owning captain.
+      const mentioned = ownedCrews.filter((c) => line.includes(c.id) || (c.threadId !== "" && line.includes(c.threadId)));
       if (mentioned.length === 0) {
         // No crew named: deliver only to a lone host captain, else drop (never fan).
         if (soleHostParent === undefined) {
@@ -6020,7 +6187,7 @@ export default async function plugin(bb: BbPluginApi) {
       const owners = new Set(mentioned.map((c) => c.parentThreadId!));
       for (const parent of owners) {
         // Redact tokens naming OTHER captains' crews before delivering to this captain.
-        const foreignIds = mentioned.filter((c) => c.parentThreadId !== parent).map((c) => c.id);
+        const foreignIds = mentioned.filter((c) => c.parentThreadId !== parent).flatMap((c) => (c.threadId !== "" ? [c.id, c.threadId] : [c.id]));
         const filtered = filterLineForOwner(line, foreignIds);
         if (filtered === "") continue;
         const arr = byParent.get(parent) ?? [];
@@ -6385,7 +6552,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (result.sizeBytes > 200_000) return toolError("Native contract exceeds 200KB; read it directly in the Firstmate home.");
     const content = result.contentEncoding === "base64"
       ? Buffer.from(result.content, "base64").toString("utf8") : result.content;
-    return `${content}\n\n## BB runtime adaptations\n${BB_SKILL_RUNTIME_CONTRACT}\n${CAPTAIN_VISIBILITY_CONTRACT}\nThe firstmate_contract read is now complete. Treat native policy refusals as refusals. Handle durable reports before calling firstmate_wake with its returned acknowledgment values.\n`;
+    return `${content}\n\n## BB runtime adaptations\n${BB_SKILL_RUNTIME_CONTRACT}\n${CAPTAIN_VISIBILITY_CONTRACT}\nThe firstmate_contract read is now complete. Treat native policy refusals as refusals. Read and acknowledge durable reports with one firstmate_wake ack=true call.\n`;
   }
 
   async function checkToolchain(hostId: string, fmHome: string, signal?: AbortSignal) {
@@ -6485,7 +6652,10 @@ export default async function plugin(bb: BbPluginApi) {
       await rememberWatchCaptain(ctx, threadId);
       const signal = record["signal"] as AbortSignal | undefined;
       const real = await ensureRealModeForDeck(ctx, signal);
-      return `Captain, on deck.\n${real}\n${await deckDigest(ctx, signal, all === true)}`;
+      let providerId = "";
+      try { providerId = (await bb.sdk.threads.get({ threadId })).providerId ?? ""; } catch { /* note is best-effort */ }
+      const note = unhookedCaptainNote(providerId);
+      return `Captain, on deck.\n${real}\n${await deckDigest(ctx, signal, all === true)}${note === "" ? "" : `\n\n${note}`}`;
     },
   });
 
@@ -6559,15 +6729,27 @@ export default async function plugin(bb: BbPluginApi) {
   registerCaptainTool({
     name: "firstmate_wake",
     description:
-      "Drain the real firstmate wake queue: durable crew→captain notifications, unread crew statuses, and open decisions that a dropped doorbell would otherwise lose. Run this when doorbelled (notifyOwner=real) or on deck. After handling, pass ackThrough + recoveryGeneration (from the WAKE_ACK_REQUIRED line) to consume the rows.",
+      "Drain the real firstmate wake queue: durable crew→captain notifications, unread crew statuses, and open decisions that a dropped doorbell would otherwise lose. Run this when doorbelled (notifyOwner=real) or on deck. Pass ack=true to present and acknowledge in ONE call (preferred: each extra call re-reads the whole captain context). Open decisions stay open after acknowledgment. Or pass ackThrough + recoveryGeneration (from the WAKE_ACK_REQUIRED line) to consume rows after a separate present.",
     parameters: z.object({
+      ack: z.boolean().optional().describe("Present and acknowledge in one call"),
       ackThrough: z.number().int().min(0).optional().describe("Consume wakes at/below this sequence (from WAKE_ACK_REQUIRED)"),
       recoveryGeneration: z.string().optional().describe("Recovery generation token (from WAKE_ACK_REQUIRED)"),
     }),
-    async execute({ ackThrough, recoveryGeneration }, ctx) {
+    async execute({ ack, ackThrough, recoveryGeneration }, ctx) {
       // D6: the caller thread IS the captain — scope the drain/ack to its own queue.
-      const out = await drainWakes(ctxString(ctx, "threadId"), ackThrough, recoveryGeneration, undefined, asRecord(ctx)["signal"] as AbortSignal | undefined);
-      return wakeOutputForCaptainTool(out);
+      const captain = ctxString(ctx, "threadId");
+      const signal = asRecord(ctx)["signal"] as AbortSignal | undefined;
+      const out = await drainWakes(captain, ackThrough, recoveryGeneration, undefined, signal);
+      if (ack !== true || ackThrough !== undefined) return wakeOutputForCaptainTool(out);
+      const pair = wakeAckFromOutput(out);
+      if (pair === null) return wakeOutputForCaptainTool(out);
+      await drainWakes(captain, pair.ackThrough, pair.recoveryGeneration, undefined, signal);
+      const presented = out
+        .split("\n")
+        .filter((line) => !/WAKE_ACK_REQUIRED|queued wakes pending/.test(line))
+        .join("\n")
+        .trim();
+      return `${presented === "" ? "No unread reports." : presented}\nAcknowledged through ${pair.ackThrough}.`;
     },
   });
 
@@ -6615,7 +6797,7 @@ export default async function plugin(bb: BbPluginApi) {
       crewId: z.string().optional(),
     }),
     async execute({ action, question, decisionId, answer, options, crewId }) {
-      const all = (await readDecisions()).filter(row => !homeScope.getStore()?.home || row.parentThreadId === homeScope.getStore()?.captain);
+      const all = (await readDecisions()).filter(row => ownedByScopedCaptain(row.parentThreadId));
       if (action === "list") {
         if (all.length === 0) return "No decisions.";
         return all.map((d) => `${d.id} [${d.status}] :: ${truncate(d.question, 80)}`).join("\n");
@@ -6894,7 +7076,7 @@ export default async function plugin(bb: BbPluginApi) {
       detail: z.string().optional(),
     }),
     async execute({ action, title, projectId, queueId, shape, mode, after, waitUntil, detail }, ctx) {
-      const items = (await readQueue()).filter(row => !homeScope.getStore()?.home || row.parentThreadId === homeScope.getStore()?.captain);
+      const items = (await readQueue()).filter(row => ownedByScopedCaptain(row.parentThreadId));
       const ctxProject = ctxString(ctx, "projectId");
       if (action === "list") {
         if (items.length === 0) return "Queue empty.";
@@ -7504,6 +7686,7 @@ export default async function plugin(bb: BbPluginApi) {
     await settleDeck(thread.id);
   });
   bb.events.on("thread.active", async ({ thread }) => {
+    captainTurnStartedAt.set(thread.id, Date.now());
     await bb.storage.kv.delete(`captain-delivery:${thread.id}`);
     await inCaptainHome(thread.id, () => reconcileReturnedAfk(thread.id)).catch(error => bb.log.warn(`AFK return: ${String(error)}`));
     if (!isCaptainSpawn(thread)) return;
@@ -7538,7 +7721,34 @@ export default async function plugin(bb: BbPluginApi) {
     bb.log.warn(`message.dispatch hook unavailable; crew pings join running turns: ${String(error)}`);
   }
 
+  const CAPTAIN_COMPACT_COOLDOWN_MS = 20 * 60_000;
+  async function maybeCompactCaptain(threadId: string): Promise<void> {
+    if (!knownCaptains.has(threadId)) return;
+    const budget = Number((await settings.get()).captainCompactAtTokens);
+    if (!(budget > 0)) return;
+    const key = `captain-compacted-at:${threadId}`;
+    const last = await bb.storage.kv.get<unknown>(key);
+    let usedTokens: number | null = null;
+    try {
+      usedTokens = (await bb.sdk.threads.context({ threadId })).usage?.usedTokens ?? null;
+    } catch {
+      return;
+    }
+    const now = Date.now();
+    if (!captainCompactDue({ usedTokens, budget, lastCompactAt: typeof last === "number" ? last : null, now, cooldownMs: CAPTAIN_COMPACT_COOLDOWN_MS })) return;
+    // Stamp first: a provider that cannot compact must not be retried on every idle.
+    await bb.storage.kv.set(key, now);
+    try {
+      await bb.sdk.threads.compact({ threadId });
+      bb.log.info(`captain ${threadId} compacted at ${usedTokens} tokens (budget ${budget})`);
+    } catch (error) {
+      bb.log.warn(`captain ${threadId} compaction failed at ${usedTokens} tokens: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   bb.events.on("thread.idle", async ({ thread, lastAssistantText }) => {
+    // Compact before releasing held pings so they land on the smaller context.
+    await maybeCompactCaptain(thread.id).catch((error) => bb.log.warn(`captain compaction check failed ${thread.id}: ${String(error)}`));
     if (heldPingCaptains.delete(thread.id)) {
       await bb.experimental_hooks.recheck("message.dispatch").catch((error) => bb.log.warn(`crew ping release failed captain=${thread.id}: ${String(error)}`));
     }
@@ -8108,7 +8318,7 @@ export default async function plugin(bb: BbPluginApi) {
           }
           case "queue": {
             const sub = rest[0] ?? "list";
-            const items = (await readQueue()).filter(row => !homeScope.getStore()?.home || row.parentThreadId === homeScope.getStore()?.captain);
+            const items = (await readQueue()).filter(row => ownedByScopedCaptain(row.parentThreadId));
             if (sub === "add") {
               const title = rest.slice(1).join(" ").trim();
               if (title === "") return fail(usage);
@@ -8196,7 +8406,7 @@ export default async function plugin(bb: BbPluginApi) {
           }
           case "decide": {
             const sub = rest[0] ?? "list";
-            const all = (await readDecisions()).filter(row => !homeScope.getStore()?.home || row.parentThreadId === homeScope.getStore()?.captain);
+            const all = (await readDecisions()).filter(row => ownedByScopedCaptain(row.parentThreadId));
             if (sub === "ask") {
               const question = rest.slice(1).join(" ").trim();
               if (question === "") return fail(usage);

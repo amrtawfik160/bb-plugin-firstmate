@@ -41,7 +41,7 @@ case "$mode" in
     [ -s "$queue" ] || exit 0
     rows=$(awk 'END { print NR }' "$queue" 2>/dev/null || echo 0)
     [ "${rows:-0}" -gt 0 ] 2>/dev/null || exit 0
-    printf 'firstmate: %s unhandled crew wake(s) for this captain. Call firstmate_wake, handle each report, then acknowledge with the returned ackThrough and recoveryGeneration before ending the turn.\n' "$rows" >&2
+    printf 'firstmate: %s unhandled crew wake(s) for this captain. Call firstmate_wake with ack=true (reads and acknowledges in one call), handle anything actionable, then end the turn.\n' "$rows" >&2
     exit 2
     ;;
   session-start)
