@@ -15,6 +15,12 @@ import plugin, {
   backlogTitleOf,
   captainHookInstallScript,
   crewPingHoldDecision,
+  doorbellSupersededByBbPing,
+  staleLineRelayDecision,
+  watchRelayDedupKey,
+  wakeAckFromOutput,
+  captainCompactDue,
+  unhookedCaptainNote,
   rootWakePruneScript,
   captainWakeDoorbell,
   compareUpstreamScriptSurface,
@@ -5756,7 +5762,7 @@ test("notifyOwner=kv (default) sends the full report and enqueues no wake", asyn
     assert.equal(sends.length, 1);
     assert.equal(sends[0]?.mode, "steer", "crew outcome must enter the active captain turn, never queue");
     assert.equal(sends[0]?.visibility, "agent-only", "internal crew wakes must never render in captain chat");
-    assert.match(sends[0]?.text ?? "", /Reconcile current crew state where action depends on it/);
+    assert.match(sends[0]?.text ?? "", /FIRSTMATE INTERNAL WAKE/);
     assert.match(sends[0]?.text ?? "", /DONE: shipped the branch/);
   } finally {
     await host.harness.lifecycle.dispose();
@@ -5864,9 +5870,9 @@ test("Part B: notifyOwner=real — a failure still doorbells the captain and req
     const text = sends[0]?.text ?? "";
     assert.match(text, /^🔔 /, text);
     assert.match(text, /crew c1 failed/, text);
-    // Failure delivery must not silently consume the durable report.
-    assert.match(text, /firstmate_wake/);
-    assert.match(text, /Delivery alone is not acknowledgment/);
+    // Failure delivery must not silently consume the durable report: the captain
+    // acknowledges it explicitly, in one firstmate_wake ack=true call.
+    assert.match(text, /firstmate_wake once with ack=true/);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -7535,4 +7541,223 @@ test("root wake prune acks only rows older than the grace window", () => {
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+test("doorbell is skipped only when BB's ping already ran a captain turn that ended", () => {
+  const base = { kind: "idle", durable: true, captainStatus: "idle", captainTurnStartedAt: 2_000, crewFinishedAt: 1_000 };
+  assert.equal(doorbellSupersededByBbPing(base), true);
+  assert.equal(doorbellSupersededByBbPing({ ...base, kind: "review" }), true);
+  assert.equal(doorbellSupersededByBbPing({ ...base, kind: "error" }), true);
+  assert.equal(doorbellSupersededByBbPing({ ...base, captainStatus: "active" }), false, "a running turn takes the steer (joins, no new turn)");
+  assert.equal(doorbellSupersededByBbPing({ ...base, captainTurnStartedAt: 500 }), false, "no captain turn since the crew finished");
+  assert.equal(doorbellSupersededByBbPing({ ...base, captainTurnStartedAt: null }), false);
+  assert.equal(doorbellSupersededByBbPing({ ...base, durable: false }), false, "without the durable row the doorbell is the only copy");
+  assert.equal(doorbellSupersededByBbPing({ ...base, kind: "needs-decision" }), false);
+  assert.equal(doorbellSupersededByBbPing({ ...base, kind: "interaction" }), false);
+  assert.equal(doorbellSupersededByBbPing({ ...base, captainStatus: null }), false);
+});
+
+async function crewDoneWithCaptainWoken(woken: boolean) {
+  const host = ownerHost({ notifyOwner: "real" });
+  await plugin(host.bb);
+  const { seen } = stubRoutedHost(host, (cmd) => {
+    // BB's own completion ping starts (and finishes) a captain turn while the
+    // plugin is still persisting the durable wake.
+    if (woken && cmd.includes("fm_wake_append")) {
+      void host.harness.behavior.emitThreadEvent("thread.active", { thread: makeThreadResponse({ id: "thr_cap", status: "active" }) } as never);
+    }
+    return { code: 0 };
+  });
+  host.harness.sdk.stub("threads.get", async (input: unknown) => {
+    const id = String((input as { threadId?: string }).threadId);
+    return makeThreadResponse({ id, status: id === "thr_cap" ? "idle" : "active", environmentId: null });
+  });
+  await seedCrew(host);
+  await host.harness.behavior.setSettings({ supervisionEnabled: true });
+  await host.harness.behavior.emitThreadEvent("thread.failed", {
+    thread: makeThreadResponse({ id: "thr_crew", status: "error", projectId: "proj_1" }),
+    error: "boom: the build blew up",
+  });
+  return { host, seen };
+}
+
+test("a crew report BB's ping already delivered does not start a second captain turn", async () => {
+  const { host, seen } = await crewDoneWithCaptainWoken(true);
+  try {
+    assert.ok(seen.some((c) => c.includes("fm_wake_append")), "the durable wake is still persisted");
+    assert.equal(sendCalls(host).filter((s) => s.threadId === "thr_cap").length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a crew report still rings the doorbell when the captain has not woken since", async () => {
+  const { host } = await crewDoneWithCaptainWoken(false);
+  try {
+    assert.equal(sendCalls(host).filter((s) => s.threadId === "thr_cap").length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("stale relay decision: finished and foreign crews are dropped, running crews relayed", () => {
+  const knownCrewThreads = new Set(["thr_run", "thr_done"]);
+  const runningCrewThreads = new Set(["thr_run"]);
+  const d = (line: string) => staleLineRelayDecision({ line, knownCrewThreads, runningCrewThreads });
+  assert.equal(d("stale: bb:thr_run (idle 257s, possible wedge, escalation 1)"), "relay");
+  assert.equal(d("stale: bb:thr_done (idle 311s, possible wedge, escalation 3, demand-deep-inspection: x)"), "drop-finished");
+  assert.equal(d("stale: thr_xenb5e6jcx (idle 291201s, possible wedge, escalation 1)"), "drop-foreign");
+  assert.equal(d("stale: c1 wedged"), "no-thread");
+  assert.equal(d("check: captain inbox note thr_zzz"), "relay", "check lines are never dropped here");
+});
+
+test("stale dedup pages one wedge once per reason, keeps crews distinct", () => {
+  assert.equal(
+    watchRelayDedupKey("stale: bb:thr_a1 (idle 257s, possible wedge, escalation 1)"),
+    watchRelayDedupKey("stale: bb:thr_a1 (idle 363s, possible wedge, escalation 2)"),
+  );
+  assert.notEqual(
+    watchRelayDedupKey("stale: bb:thr_a1 (idle 257s, possible wedge, escalation 1)"),
+    watchRelayDedupKey("stale: bb:thr_a2 (idle 257s, possible wedge, escalation 1)"),
+    "ids differing only in digits are different crews",
+  );
+  assert.notEqual(
+    watchRelayDedupKey("stale: bb:thr_a1 (idle 257s, possible wedge, escalation 2)"),
+    watchRelayDedupKey("stale: bb:thr_a1 (idle 311s, possible wedge, escalation 3, demand-deep-inspection: same pane)"),
+  );
+  assert.equal(watchRelayDedupKey("check: request 17"), "check: request 17");
+});
+
+async function runWatchRelay(host: Awaited<ReturnType<typeof load>>, logTail: string, until: () => boolean) {
+  host.harness.sdk.stub("terminals.create", async () => ({ id: "term_1" }));
+  host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+  host.harness.sdk.stub("terminals.close", async () => ({}));
+  host.harness.sdk.stub("threads.send", async () => ({}));
+  host.harness.sdk.stub("environments.list", async () => [{ hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" }]);
+  host.harness.sdk.stub("terminals.output", async () => hostRcPayload(`FM_BEAT_AGE=5\nFM_RELAUNCHED=0\n---FM_LOGTAIL---\n${logTail}`, 0));
+  const run = host.harness.behavior.runService("fm-watch-supervisor");
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline && !until()) await new Promise((r) => setTimeout(r, 10));
+  run.controller.abort();
+  await run.done;
+}
+
+test("fm-watch relay: a finished crew's stale page and a foreign thread's page never wake a captain", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", watchOwner: "fm-watch", fmHostId: "host_1" },
+  });
+  await plugin(host.bb);
+  try {
+    await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_run", "thr_cap"), crewRow("c2", "thr_done", "thr_cap")]);
+    await host.bb.storage.kv.set("fm-watch-captain:host_1", "thr_cap");
+    host.harness.sdk.stub("threads.get", async (input: unknown) => {
+      const id = String((input as { threadId?: string }).threadId);
+      return makeThreadResponse({ id, status: id === "thr_done" ? "idle" : "active", environmentId: null });
+    });
+    await runWatchRelay(host, [
+      "stale: bb:thr_done (idle 257s, possible wedge, escalation 1)",
+      "stale: thr_foreign9 (idle 291201s, possible wedge, escalation 1)",
+      "stale: bb:thr_run (idle 300s, possible wedge, escalation 1)",
+    ].join("\n"), () => sendCalls(host).length > 0);
+    const relayed = sendCalls(host).map((s) => `${s.threadId}:${s.text ?? ""}`).join("\n");
+    assert.match(relayed, /thr_cap:.*stale: bb:thr_run/s, "a running crew's wedge still pages its owner");
+    assert.doesNotMatch(relayed, /thr_done/, "finished crew already rang its doorbell");
+    assert.doesNotMatch(relayed, /thr_foreign9/, "a thread no captain owns is not routed to the last deck'd captain");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("fm-watch relay: the base home never falls back to a captain that owns its own home", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", watchOwner: "fm-watch", fmHostId: "host_1" },
+  });
+  await plugin(host.bb);
+  try {
+    await host.bb.storage.kv.set("crews", []);
+    await host.bb.storage.kv.set("fm-watch-captain:host_1", "thr_safi");
+    await host.bb.storage.kv.set("native-home:thr_safi", "/tmp/fm-home-bb-homes/thr_safi");
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ status: "active", environmentId: null }));
+    await runWatchRelay(host, "check: captain inbox note 17", () => sendCalls(host).length > 0);
+    assert.equal(sendCalls(host).filter((s) => s.threadId === "thr_safi").length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("bearings shows only the calling captain's decisions", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("decisions", [
+      { id: "d-mine", parentThreadId: "thr_cap", question: "Pick the Safi glass fallback", createdAt: "2026-09-24T00:00:00.000Z" },
+      { id: "d-theirs", parentThreadId: "thr_other", question: "Confirm the Five9 Worker has no Git hook", createdAt: "2026-09-24T00:00:00.000Z" },
+    ]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async (input: unknown) =>
+      makeThreadResponse({ id: String((input as { threadId?: string }).threadId), status: "idle", projectId: "proj_1" }),
+    );
+    const bearings = host.harness.inspection.registrations.agentTools.find((tool) => tool.name === "firstmate_bearings");
+    assert.ok(bearings);
+    const own = await bearings.execute({}, { threadId: "thr_cap", projectId: "proj_1" } as never);
+    const text = typeof own === "string" ? own : own.content.map((item) => item.type === "text" ? item.text : "").join("\n");
+    assert.match(text, /Safi glass fallback/);
+    assert.doesNotMatch(text, /Five9/, "another project's decision must not reach this captain");
+    const all = await bearings.execute({ all: true }, { threadId: "thr_cap", projectId: "proj_1" } as never);
+    const allText = typeof all === "string" ? all : all.content.map((item) => item.type === "text" ? item.text : "").join("\n");
+    assert.match(allText, /Five9/, "all=true still shows every captain's calls");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("wake ack pair parses from both the native and the rewritten form", () => {
+  assert.deepEqual(
+    wakeAckFromOutput('WAKE_ACK_REQUIRED: after handling completes call `firstmate_wake` with ackThrough=34 and recoveryGeneration="786811.1790246856.i5b960"'),
+    { ackThrough: 34, recoveryGeneration: "786811.1790246856.i5b960" },
+  );
+  assert.deepEqual(wakeAckFromOutput("run bb firstmate wake --ack-through 12 --recovery-generation gen.1"), { ackThrough: 12, recoveryGeneration: "gen.1" });
+  assert.equal(wakeAckFromOutput("Wake queue empty."), null);
+});
+
+test("captain compaction is due only past the budget and outside the cooldown", () => {
+  const base = { budget: 200_000, now: 10_000_000, cooldownMs: 1_200_000 };
+  assert.equal(captainCompactDue({ ...base, usedTokens: 510_000, lastCompactAt: null }), true);
+  assert.equal(captainCompactDue({ ...base, usedTokens: 150_000, lastCompactAt: null }), false);
+  assert.equal(captainCompactDue({ ...base, usedTokens: 510_000, lastCompactAt: base.now - 60_000 }), false);
+  assert.equal(captainCompactDue({ ...base, usedTokens: 510_000, lastCompactAt: base.now - 1_300_000 }), true);
+  assert.equal(captainCompactDue({ ...base, budget: 0, usedTokens: 900_000, lastCompactAt: null }), false, "0 turns it off");
+  assert.equal(captainCompactDue({ ...base, usedTokens: null, lastCompactAt: null }), false);
+});
+
+test("an idle captain past its context budget is compacted once; crews are never compacted", async () => {
+  const fresh = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { captainCompactAtTokens: 200000 } });
+  await fresh.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
+  await plugin(fresh.bb);
+  try {
+    fresh.harness.sdk.stub("threads.list", async () => []);
+    fresh.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 510_862, estimated: false, modelContextWindow: 1_000_000 } }));
+    fresh.harness.sdk.stub("threads.compact", async () => ({ ok: true }));
+    const idle = (id: string) => fresh.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id, status: "idle" }), lastAssistantText: "" } as never);
+    await idle("thr_cap");
+    await idle("thr_cap");
+    await idle("thr_not_a_captain");
+    const compacted = fresh.harness.sdk.callsTo("threads.compact").map((call) => (call[0] as { threadId: string }).threadId);
+    assert.deepEqual(compacted, ["thr_cap"], "one compaction per cooldown, captains only");
+  } finally {
+    await fresh.harness.lifecycle.dispose();
+  }
+});
+
+test("non-hooked captain providers get explicit guard rules on deck", () => {
+  assert.equal(unhookedCaptainNote("claude-code"), "");
+  assert.equal(unhookedCaptainNote("codex"), "");
+  assert.equal(unhookedCaptainNote(""), "");
+  const note = unhookedCaptainNote("acp-grok");
+  assert.match(note, /acp-grok/);
+  assert.match(note, /Never read bb\.db/);
+  assert.match(note, /ack=true/);
 });
