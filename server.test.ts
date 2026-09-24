@@ -13,6 +13,9 @@ import {
 } from "@get-bb/plugin-sdk/testing";
 import plugin, {
   backlogTitleOf,
+  captainHookInstallScript,
+  crewPingHoldDecision,
+  rootWakePruneScript,
   captainWakeDoorbell,
   compareUpstreamScriptSurface,
   crewThreadTitle,
@@ -7389,4 +7392,147 @@ test("IT wake script failure remains an error and preserves the queue", { skip: 
     assert.match(result.stderr, /exit 127.*missing/s);
     assert.equal(readFileSync(queue, "utf8"), "retained fixture wake\n");
   } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
+});
+
+
+// ---- BB gap closers: captain harness hooks, crew-ping batching, root wake prune ----
+
+const CAPTAIN_HOOK = join(dirname(fileURLToPath(import.meta.url)), "overlay/bin/bb-captain-hook.sh");
+
+function runCaptainHook(home: string, mode: string, payload: string, thread?: string) {
+  return spawnSync("bash", [CAPTAIN_HOOK, mode], {
+    input: payload,
+    encoding: "utf8",
+    env: { PATH: process.env.PATH ?? "", HOME: home, ...(thread ? { BB_THREAD_ID: thread } : {}) },
+  });
+}
+
+test("captain stop hook blocks once on unhandled wakes and is a no-op elsewhere", () => {
+  const home = mkdtempSync(join(tmpdir(), "fm-hook-"));
+  try {
+    const state = join(home, "state");
+    mkdirSync(join(home, ".bb-firstmate/captains"), { recursive: true });
+    mkdirSync(state);
+    writeFileSync(join(home, ".bb-firstmate/captains/thr_cap"), `home=${home}\nstate=${state}\nown_home=0\n`);
+    assert.equal(runCaptainHook(home, "stop", "{}", "thr_cap").status, 0, "empty queue allows the stop");
+    writeFileSync(join(state, ".wake-queue"), "1\t1\tsignal\ta.status\tx\n1\t2\tsignal\tb.status\ty\n");
+    const blocked = runCaptainHook(home, "stop", "{}", "thr_cap");
+    assert.equal(blocked.status, 2);
+    assert.match(blocked.stderr, /2 unhandled crew wake\(s\).*firstmate_wake/);
+    assert.equal(runCaptainHook(home, "stop", '{"stop_hook_active":true}', "thr_cap").status, 0, "never blocks twice");
+    assert.equal(runCaptainHook(home, "stop", '{"stopHookActive":true}', "thr_cap").status, 0);
+    assert.equal(runCaptainHook(home, "stop", "{}", "thr_other").status, 0, "non-captain thread is untouched");
+    assert.equal(runCaptainHook(home, "stop", "{}").status, 0, "no BB thread is untouched");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("captain session-start hook runs native session start only in the captain's own home", () => {
+  const home = mkdtempSync(join(tmpdir(), "fm-hook-"));
+  try {
+    const fm = join(home, "fm");
+    mkdirSync(join(fm, "bin"), { recursive: true });
+    mkdirSync(join(home, ".bb-firstmate/captains"), { recursive: true });
+    writeFileSync(join(fm, "bin/fm-sessionstart-run.sh"), '#!/bin/bash\necho "ran $(pwd) $FM_BACKEND $(cat)"\n', { mode: 0o755 });
+    const marker = join(home, ".bb-firstmate/captains/thr_cap");
+    writeFileSync(marker, `home=${fm}\nstate=${fm}/state\nown_home=0\n`);
+    assert.equal(runCaptainHook(home, "session-start", '{"source":"startup"}', "thr_cap").stdout, "", "shared legacy home never takes the lock");
+    writeFileSync(marker, `home=${fm}\nstate=${fm}/state\nown_home=1\n`);
+    const own = runCaptainHook(home, "session-start", '{"source":"startup"}', "thr_cap");
+    assert.equal(own.status, 0);
+    assert.equal(own.stdout.trim(), `ran ${fm} bb {"source":"startup"}`);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("captain hook install merges user-level Claude and Codex hooks idempotently", () => {
+  const home = mkdtempSync(join(tmpdir(), "fm-hook-"));
+  try {
+    mkdirSync(join(home, ".claude"));
+    writeFileSync(join(home, ".claude/settings.json"), JSON.stringify({ permissions: { allow: ["x"] }, hooks: { Stop: [{ hooks: [{ type: "command", command: "echo existing" }] }] } }));
+    const script = captainHookInstallScript({
+      threadId: "thr_cap", home: "/fm", state: "/fm/state/cap-thr_cap", ownHome: false,
+      scriptB64: readFileSync(CAPTAIN_HOOK).toString("base64"),
+    });
+    for (let i = 0; i < 3; i++) {
+      const res = spawnSync("bash", ["-c", script], { encoding: "utf8", env: { PATH: process.env.PATH ?? "", HOME: home } });
+      assert.equal(res.status, 0, res.stderr);
+      assert.match(res.stdout, /captain-hooks-ok/);
+    }
+    const claude = JSON.parse(readFileSync(join(home, ".claude/settings.json"), "utf8"));
+    assert.deepEqual(claude.permissions, { allow: ["x"] }, "unrelated settings preserved");
+    assert.equal(claude.hooks.Stop.length, 2, "existing Stop hook kept, ours added once");
+    assert.equal(claude.hooks.SessionStart.length, 1);
+    const codex = JSON.parse(readFileSync(join(home, ".codex/hooks.json"), "utf8"));
+    assert.equal(codex.hooks.Stop.length, 1);
+    assert.ok(existsSync(join(home, ".claude/settings.json.bak-bb-firstmate")));
+    assert.equal(readFileSync(join(home, ".bb-firstmate/captains/thr_cap"), "utf8"), "home=/fm\nstate=/fm/state/cap-thr_cap\nown_home=0\n");
+    assert.ok(lstatSync(join(home, ".bb-firstmate/bin/bb-captain-hook.sh")).mode & 0o100, "hook script is executable");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("crew pings are held only while a captain's turn is running", () => {
+  const base = { attempt: "join-turn", initiator: "system", text: "@thread:thr_x completed:\n\nDONE: ok", targetIsCaptain: true, senderIsCrew: false };
+  assert.equal(crewPingHoldDecision(base), "hold");
+  assert.equal(crewPingHoldDecision({ ...base, text: "[bb system]\n\n@thread:thr_x failed: boom" }), "hold");
+  assert.equal(crewPingHoldDecision({ ...base, text: "unrelated", senderIsCrew: true }), "hold");
+  assert.equal(crewPingHoldDecision({ ...base, attempt: "start-turn" }), "proceed", "an idle captain is woken");
+  assert.equal(crewPingHoldDecision({ ...base, initiator: "user" }), "proceed", "the captain's own messages always land");
+  assert.equal(crewPingHoldDecision({ ...base, initiator: "agent" }), "proceed", "agent tells land");
+  assert.equal(crewPingHoldDecision({ ...base, targetIsCaptain: false }), "proceed");
+  assert.equal(crewPingHoldDecision({ ...base, text: "please review" }), "proceed");
+});
+
+test("dispatch hook holds a crew ping mid-turn and rechecks when the captain idles", async () => {
+  // Captains are seeded before load: the hook reads its captain set at startup.
+  const fresh = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS });
+  await fresh.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
+  await fresh.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+  await plugin(fresh.bb);
+  try {
+    const hook = fresh.harness.inspection.registrations.hooks["message.dispatch"];
+    assert.ok(hook, "message.dispatch hook registered");
+    const ctx = (over: Record<string, unknown>) => ({
+      thread: makeThreadResponse({ id: "thr_cap", status: "active" }),
+      attempt: "join-turn", initiator: "system", senderThreadId: "thr_crew",
+      input: { blocks: [], text: "@thread:thr_crew completed:\n\nDONE: ok" }, ...over,
+    }) as never;
+    assert.equal((await hook(ctx({}))).action, "wait");
+    assert.equal((await hook(ctx({ attempt: "start-turn" }))).action, "proceed");
+    assert.equal((await hook(ctx({ thread: makeThreadResponse({ id: "thr_crewless", status: "active" }) }))).action, "proceed");
+    fresh.harness.sdk.stub("threads.list", async () => []);
+    await fresh.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_cap", status: "idle" }), lastAssistantText: "" } as never);
+    assert.equal(fresh.harness.inspection.recheckCount, 1, "held pings released at idle");
+  } finally {
+    await fresh.harness.lifecycle.dispose();
+  }
+});
+
+test("root wake prune acks only rows older than the grace window", () => {
+  const home = mkdtempSync(join(tmpdir(), "fm-prune-"));
+  try {
+    mkdirSync(join(home, "state"), { recursive: true });
+    mkdirSync(join(home, "bin"));
+    const now = Math.floor(Date.now() / 1000);
+    writeFileSync(join(home, "state/.wake-queue"), `${now - 7200}\t10\tsignal\ta\tx\n${now - 3600}\t11\tsignal\tb\ty\n${now - 5}\t12\tsignal\tc\tz\n`);
+    // Fake native drain: presents the generation, and on ack drops rows <= cutoff.
+    writeFileSync(join(home, "bin/fm-wake-drain.sh"), [
+      "#!/bin/bash",
+      'if [ "${1:-}" = "--ack-through" ]; then',
+      '  [ "$4" = "gen.1" ] || exit 3',
+      "  awk -F'\\t' -v t=\"$2\" '$2 > t' state/.wake-queue > state/q.tmp && mv state/q.tmp state/.wake-queue; exit 0",
+      "fi",
+      'echo "WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through 12 --recovery-generation gen.1"',
+    ].join("\n"), { mode: 0o755 });
+    const res = spawnSync("bash", ["-c", rootWakePruneScript(home, 600)], { encoding: "utf8" });
+    assert.equal(res.status, 0, res.stderr);
+    assert.match(res.stdout, /root-wake-prune through=11 left=1/);
+    assert.match(readFileSync(join(home, "state/.wake-queue"), "utf8"), /\t12\t/, "the fresh row stays for the relay");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
