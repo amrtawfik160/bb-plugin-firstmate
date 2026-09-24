@@ -20,6 +20,12 @@ import plugin, {
   watchRelayDedupKey,
   wakeAckFromOutput,
   captainCompactDue,
+  bbPingCarriesOutcome,
+  captainRateLimitFromEvents,
+  captainWakeHold,
+  heldWakesMessage,
+  capToolOutput,
+  selectContract,
   unhookedCaptainNote,
   rootWakePruneScript,
   captainWakeDoorbell,
@@ -1404,7 +1410,9 @@ test("stuck pass pages error and unknown once, and a read failure is not a stabl
     stubBusyCrew(host);
     await host.harness.behavior.setSettings({ supervisionEnabled: true });
     await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew", "thr_cap")]);
-    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ status: "error", environmentId: null }));
+    // Only the crew is in error; an errored CAPTAIN holds its wakes (see the hold tests).
+    host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) =>
+      makeThreadResponse({ id: threadId, status: threadId === "thr_cap" ? "idle" : "error", environmentId: null }));
     const first = await runStuckOnce(host);
     assert.equal(first.notified, 1);
     assert.match(sendCalls(host)[0]?.text ?? "", /failed/);
@@ -7760,4 +7768,252 @@ test("non-hooked captain providers get explicit guard rules on deck", () => {
   assert.match(note, /acp-grok/);
   assert.match(note, /Never read bb\.db/);
   assert.match(note, /ack=true/);
+});
+
+// ---- captain audit gaps: wake/notify/relay ----
+
+function captainAndCrewThreads(host: Awaited<ReturnType<typeof load>>, captain: Partial<Parameters<typeof makeThreadResponse>[0]> = {}, crew: Partial<Parameters<typeof makeThreadResponse>[0]> = {}) {
+  host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) =>
+    threadId === "thr_cap"
+      ? makeThreadResponse({ id: "thr_cap", status: "idle", environmentId: null, ...captain })
+      : makeThreadResponse({ id: threadId, status: "idle", environmentId: null, ...crew }));
+}
+
+test("no-op wakes end silently: the escalation skill no longer asks for 'Captain, shipshape.'", () => {
+  const rendered = (path: string) => readFileSync(join(dirname(fileURLToPath(import.meta.url)), path), "utf8").replace(/<!--[\s\S]*?-->/g, "");
+  const escalation = rendered("skills/captain/references/escalation.md");
+  assert.doesNotMatch(escalation, /Reply exactly `Captain, shipshape\.`/, "the skill must not tell captains to answer a no-op wake");
+  assert.match(escalation, /ends the turn with no reply text/);
+  const captain = rendered("skills/captain/SKILL.md");
+  assert.match(captain, /ends the turn with no\s+reply text at all/);
+});
+
+test("a crew WAITING: yield is not nagged, never wakes the captain, and is resumed later", async () => {
+  const host = ownerHost({ notifyOwner: "real" });
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRoutedHost(host, () => ({ code: 0 }));
+    captainAndCrewThreads(host);
+    host.harness.sdk.stub("threads.list", async () => []);
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    const before = Date.now();
+    await emitIdle(host, "WAITING: no-mistakes pipeline still running (step 4 of 7)");
+    assert.equal(sendCalls(host).filter((s) => s.threadId === "thr_cap").length, 0, "a yield is not an outcome for the captain");
+    assert.ok(!seen.some((c) => c.includes("fm_wake_append")), "a yield leaves no durable wake to drain");
+    const toCrew = host.harness.sdk.callsTo("threads.send").map((c) => c[0] as { threadId: string; sendAt?: number; input: Array<{ text: string }> }).filter((a) => a.threadId === "thr_crew");
+    assert.equal(toCrew.length, 1, "exactly one resume");
+    assert.doesNotMatch(toCrew[0]!.input[0]!.text, /TURN ENDED WITHOUT A STATUS VERDICT/, "a yield is never nagged");
+    assert.ok((toCrew[0]!.sendAt ?? 0) >= before + 4 * 60_000, "the resume is scheduled minutes out, not a busy loop");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("one wake per crew outcome: BB's own child ping replaces the plugin doorbell when the report is durable", async () => {
+  const host = ownerHost({ notifyOwner: "real" });
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRoutedHost(host, () => ({ code: 0 }));
+    captainAndCrewThreads(host, {}, { parentThreadId: "thr_cap", originKind: null });
+    host.harness.sdk.stub("threads.list", async () => []);
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await emitIdle(host, "DONE: shipped the branch");
+    assert.ok(seen.some((c) => c.includes("fm_wake_append")), "the durable report is still written");
+    assert.equal(sendCalls(host).filter((s) => s.threadId === "thr_cap").length, 0, "BB already pings the captain for this turn end");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("bbPingCarriesOutcome: only durable turn-end outcomes of BB child threads", () => {
+  const base = { kind: "idle", durable: true, captainThreadId: "thr_cap", crewParentThreadId: "thr_cap", crewOriginKind: null };
+  assert.equal(bbPingCarriesOutcome(base), true);
+  assert.equal(bbPingCarriesOutcome({ ...base, kind: "review" }), true);
+  assert.equal(bbPingCarriesOutcome({ ...base, kind: "error" }), true);
+  assert.equal(bbPingCarriesOutcome({ ...base, durable: false }), false, "without the durable row the doorbell is the only report");
+  assert.equal(bbPingCarriesOutcome({ ...base, kind: "needs-decision" }), false);
+  assert.equal(bbPingCarriesOutcome({ ...base, kind: "interaction" }), false);
+  assert.equal(bbPingCarriesOutcome({ ...base, crewParentThreadId: "thr_other" }), false, "BB pings the BB parent, not the recorded captain");
+  assert.equal(bbPingCarriesOutcome({ ...base, crewParentThreadId: null }), false);
+  assert.equal(bbPingCarriesOutcome({ ...base, crewOriginKind: "fork" }), false, "forks are not parent-notified");
+});
+
+test("captain rate limit: read from provider events; a later successful turn clears it", () => {
+  const blocked = { type: "provider/rateLimits/updated", createdAt: 1_000, data: { rateLimits: { status: "blocked", windows: [{ status: "blocked", resetsAtMs: 9_000 }, { status: "warning", resetsAtMs: 99_000 }] } } };
+  const err = { type: "provider/error", createdAt: 1_001, data: { detail: "You've hit your session limit · resets 8:40pm (UTC)", errorInfo: { category: "rate-limit" } } };
+  const ok = { type: "turn/completed", createdAt: 2_000, data: { status: "completed" } };
+  const failed = { type: "turn/completed", createdAt: 1_002, data: { status: "failed" } };
+  assert.deepEqual(captainRateLimitFromEvents([failed, err, blocked]), { resetsAt: 9_000, at: 1_000 });
+  assert.equal(captainRateLimitFromEvents([ok, failed, err, blocked]), null);
+  assert.deepEqual(captainRateLimitFromEvents([err]), { resetsAt: null, at: 1_001 });
+  assert.equal(captainRateLimitFromEvents([{ type: "provider/rateLimits/updated", createdAt: 5, data: { rateLimits: { status: "warning", windows: [] } } }]), null);
+  assert.equal(captainWakeHold({ status: "idle", rateLimit: { resetsAt: 9_000, at: 1_000 }, now: 5_000 }).hold, true);
+  assert.equal(captainWakeHold({ status: "idle", rateLimit: { resetsAt: 9_000, at: 1_000 }, now: 9_001 }).hold, false);
+  assert.equal(captainWakeHold({ status: "error", rateLimit: null, now: 0 }).hold, true);
+  assert.equal(captainWakeHold({ status: "active", rateLimit: null, now: 0 }).hold, false);
+  const msg = heldWakesMessage({ since: 0, reason: "provider limit", lines: ["🔔 ✅ crew c1 done", "🛰️ fm-watch:\nstale: bb:thr_x"] });
+  assert.match(msg, /2 crew update\(s\) held/);
+  assert.match(msg, /stale: bb:thr_x/);
+  assert.match(msg, /firstmate_wake/);
+});
+
+test("a rate-limited captain gets no wake turns; held wakes go out as one when it is back", async () => {
+  const host = await load();
+  try {
+    stubIdleSdk(host);
+    captainAndCrewThreads(host);
+    let limited = true;
+    host.harness.sdk.stub("threads.events.list", async ({ threadId }: { threadId: string }) =>
+      threadId === "thr_cap" && limited
+        ? [
+          { type: "turn/completed", createdAt: Date.now() - 1_000, data: { status: "failed" } },
+          { type: "provider/error", createdAt: Date.now() - 1_000, data: { errorInfo: { category: "rate-limit" } } },
+          { type: "provider/rateLimits/updated", createdAt: Date.now() - 2_000, data: { rateLimits: { status: "blocked", windows: [{ status: "blocked", resetsAtMs: Date.now() + 3_600_000 }] } } },
+        ]
+        : [{ type: "turn/completed", createdAt: Date.now(), data: { status: "completed" } }]);
+    await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_c1", "thr_cap"), crewRow("c2", "thr_c2", "thr_cap")]);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await emitIdle(host, "DONE: shipped one", { id: "thr_c1" });
+    await emitIdle(host, "BLOCKED: need the prod key", { id: "thr_c2" });
+    assert.equal(sendCalls(host).filter((s) => s.threadId === "thr_cap").length, 0, "no wake may start a turn that fails at once");
+    const held = await host.bb.storage.kv.get<{ lines: string[] }>("captain-wake-hold:thr_cap");
+    assert.equal(held?.lines.length, 2, "both reports are kept for the release");
+    limited = false;
+    await host.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_cap", status: "idle" }), lastAssistantText: "" } as never);
+    const sends = sendCalls(host).filter((s) => s.threadId === "thr_cap");
+    assert.equal(sends.length, 1, "one consolidated wake");
+    assert.match(sends[0]!.text, /crew c1 done/);
+    assert.match(sends[0]!.text, /need the prod key/);
+    assert.ok((await host.bb.storage.kv.get("captain-wake-hold:thr_cap")) == null, "released wakes are cleared");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a steer BB queues for a busy captain is a delivery, not a failure", async () => {
+  const host = await load();
+  try {
+    stubIdleSdk(host);
+    captainAndCrewThreads(host, { status: "active" });
+    host.harness.sdk.stub("threads.send", async () => ({ ok: true, delivery: "queued", queuedMessage: {} }));
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await emitIdle(host, "DONE: shipped the branch");
+    assert.equal(typeof (await host.bb.storage.kv.get("captain-delivery:thr_crew")), "string", "a queued wake is recorded as delivered");
+    assert.ok(!host.harness.inspection.logEntries.some((e) => /notify failed/.test(e.message)), "no failure warning for a queued wake");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("fm-watch relay: a page whose delivery failed is retried next cycle, not dropped", async (t) => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", watchOwner: "fm-watch", fmHostId: "host_1" },
+  });
+  await plugin(host.bb);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_run", "thr_cap")]);
+    await host.bb.storage.kv.set("fm-watch-captain:host_1", "thr_cap");
+    host.harness.sdk.stub("threads.get", async (input: unknown) => {
+      const id = String((input as { threadId?: string }).threadId);
+      return makeThreadResponse({ id, status: "active", environmentId: null });
+    });
+    host.harness.sdk.stub("terminals.create", async () => ({ id: "term_1" }));
+    host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+    host.harness.sdk.stub("terminals.close", async () => ({}));
+    host.harness.sdk.stub("environments.list", async () => [{ hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" }]);
+    host.harness.sdk.stub("terminals.output", async () => hostRcPayload("FM_BEAT_AGE=5\nFM_RELAUNCHED=0\n---FM_LOGTAIL---\nstale: bb:thr_run (idle 300s, possible wedge, escalation 1)", 0));
+    let attempts = 0;
+    host.harness.sdk.stub("threads.send", async () => {
+      attempts++;
+      if (attempts === 1) throw new Error("HTTP 409: Thread is not active");
+      return {};
+    });
+    const settle = async (cond: () => boolean) => {
+      for (let i = 0; i < 2000 && !cond(); i++) await new Promise((r) => setImmediate(r));
+    };
+    const run = host.harness.behavior.runService("fm-watch-supervisor");
+    await settle(() => attempts >= 1);
+    for (let i = 0; i < 50 && attempts < 2; i++) {
+      t.mock.timers.tick(31_000);
+      await settle(() => attempts >= 2);
+    }
+    assert.equal(attempts, 2, "the failed page is delivered on the next cycle");
+    for (let i = 0; i < 3; i++) { t.mock.timers.tick(31_000); await settle(() => false); }
+    assert.equal(attempts, 2, "once delivered it is not re-paged");
+    run.controller.abort();
+    t.mock.timers.tick(31_000);
+    await run.done;
+  } finally {
+    t.mock.timers.reset();
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("firstmate_contract: table of contents + always-on sections by default, any section on demand", () => {
+  const body = (n: number, title: string) => `## ${n}. ${title}\n${`${title} rule.\n`.repeat(900)}`;
+  const content = `# Firstmate\nPreamble.\n\n${body(1, "Identity")}${body(7, "Task lifecycle")}${body(9, "Escalation")}${body(10, "Backlog")}## Captain instruction precedence\nCurrent explicit instruction wins.\n`;
+  const def = selectContract(content, undefined);
+  assert.equal(def.complete, false);
+  assert.ok(def.text.length < content.length / 2, "default read is a fraction of the contract");
+  assert.match(def.text, /- 7\. Task lifecycle \(\d+ chars\)/, "the TOC names every section");
+  assert.match(def.text, /Identity rule\./);
+  assert.match(def.text, /Current explicit instruction wins/);
+  assert.doesNotMatch(def.text, /Task lifecycle rule\./);
+  const seven = selectContract(content, "7");
+  assert.match(seven.text, /Task lifecycle rule\./);
+  assert.doesNotMatch(seven.text, /Backlog rule\./, "section 1 must not match 10");
+  assert.doesNotMatch(selectContract(content, "1").text, /Backlog rule\./);
+  assert.match(selectContract(content, "escalation").text, /Escalation rule\./);
+  assert.equal(selectContract(content, "all").text, content);
+  assert.equal(selectContract("# short\nno sections", undefined).complete, true);
+});
+
+test("oversized firstmate_fm output is capped inline and saved whole on the host", async () => {
+  const host = ownerHost();
+  await plugin(host.bb);
+  try {
+    const big = `HEAD-MARK\n${"session start line\n".repeat(3000)}TAIL-MARK`;
+    const { writes } = stubRoutedHost(host, (cmd) => (cmd.includes("fm-session-start") ? { payload: big, code: 0 } : { code: 0 }));
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_cap", status: "active", environmentId: "env_1" }));
+    host.harness.sdk.stub("environments.get", async () => ({ id: "env_1", hostId: "host_1" }));
+    const tool = host.harness.inspection.registrations.agentTools.find((t) => t.name === "firstmate_fm");
+    assert.ok(tool);
+    const result = await tool.execute({ script: "session-start" }, { threadId: "thr_cap", projectId: "proj_1" } as never);
+    assert.equal(typeof result, "string", JSON.stringify(result).slice(0, 600));
+    const out = result as string;
+    assert.ok(out.length <= 12_500, `capped: ${out.length}`);
+    assert.match(out, /HEAD-MARK/);
+    assert.match(out, /TAIL-MARK/);
+    assert.match(out, /full output \(\d+ chars\) saved at \/tmp\/fm-home\/state\/\.bb-tool-output\/fm-session-start-/);
+    const saved = writes.find((w) => w.path.includes(".bb-tool-output/"));
+    assert.ok(saved?.content.includes("HEAD-MARK") && saved.content.includes("TAIL-MARK"), "the full output is kept");
+    assert.equal(capToolOutput("short", null), "short");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("an already-idle captain past the budget is compacted by the sweep, without waiting for a turn", async () => {
+  const fresh = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { captainCompactAtTokens: 200000 } });
+  await fresh.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
+  await plugin(fresh.bb);
+  try {
+    fresh.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_cap", status: "idle" }));
+    fresh.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 358_171, estimated: false, modelContextWindow: 1_000_000 } }));
+    fresh.harness.sdk.stub("threads.compact", async () => ({ ok: true }));
+    const run = fresh.harness.behavior.runService("captain-wake-release");
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline && fresh.harness.sdk.callsTo("threads.compact").length === 0) await new Promise((r) => setTimeout(r, 10));
+    run.controller.abort();
+    await run.done;
+    assert.deepEqual(fresh.harness.sdk.callsTo("threads.compact").map((c) => (c[0] as { threadId: string }).threadId), ["thr_cap"]);
+  } finally {
+    await fresh.harness.lifecycle.dispose();
+  }
 });

@@ -92,3 +92,8 @@ a manual/host interrupt is not nudged. Defaults, no config required:
 `nudgeEnabled` on, `nudgeMaxPerCrew` 3, `nudgeCooldownSeconds` 60. Past the
 cap the captain gets one `NEEDS DECISION`. Afk/quiet still nudges the crew and
 holds that captain ping the same way a done-ping is held.
+
+A reply that starts `WAITING: <what>` is not a verdict and is never nudged: the
+crew is parked on an external run (no-mistakes pipeline, CI, deploy). Firstmate
+does not ring the captain for it and resumes the crew itself after a few
+minutes; after 24 automatic re-checks the captain gets one `NEEDS DECISION`.

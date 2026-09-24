@@ -157,6 +157,24 @@ export function hasStatusProtocol(text: string | null | undefined): boolean {
   return false;
 }
 
+/**
+ * True when a crew ended its turn with a `WAITING:` yield rather than a verdict: it is
+ * parked on an external run (no-mistakes pipeline, CI, deploy) whose result has not
+ * landed. The first protocol line decides, so `WAITING:` above a later `DONE:` is still
+ * a yield and a `DONE:` above a `WAITING:` is a verdict. A yield is not an outcome: it
+ * is neither nagged nor rung to the captain.
+ */
+export function isWaitingYield(text: string | null | undefined): boolean {
+  if (text == null || text === "") return false;
+  for (const line of text.split(/\r?\n/)) {
+    if (!/[^ \t]/.test(line)) continue;
+    const verb = statusLineVerb(line).toLowerCase();
+    if (PROTOCOL_VERBS.has(verb)) return false;
+    if (verb === "waiting") return true;
+  }
+  return false;
+}
+
 // ── Full status protocol ─────────────────────────────────────────────────────
 // The complete firstmate status vocabulary and the keyed open-decision fold,
 // ported line-for-line from bin/fm-classify-lib.sh so BB reads the same state
@@ -423,6 +441,7 @@ export function protocolNudgeText(nag: number, max: number): string {
     "●    DONE: <one-line outcome>",
     "●    BLOCKED: <what you need, exactly>",
     "●    FAILED: <what failed + evidence>",
+    "●  Still waiting on a long external run (pipeline, CI)? Reply WAITING: <what> instead.",
     `●${TURNEND_RULE}`,
   ].join("\n");
 }
@@ -469,6 +488,11 @@ export function quietShouldSend(event: string): boolean {
 }
 
 export const AXI_TOOL_CONTRACT = "Use gh-axi for GitHub and lavish-axi for visual review; read current --help. For all browser work, use the /browser skill and browser_script (or bb browser script). Leave profileId unset for the thread-isolated default profile. This BB browser policy overrides imported native chrome-devtools-axi instructions; do not use the AXI browser or install its hooks. Use quota-axi for quota decisions and the home's bin/fm-tasks-axi.sh for backlog work. In no-mistakes mode, the worker owns the real no-mistakes axi pipeline; a manual checklist is not a substitute. For crew-hosted Lavish boards, open the artifact then use the home's fm-procevent-lavish.sh arm <artifact> --for <task-id>; never start a second poller.";
+
+// Every crew turn end pings the captain (BB's own child-completed message), so a crew that
+// yields every few minutes while a pipeline runs burns a captain wake each time. Keep the
+// wait inside the turn; a yield that cannot be avoided is WAITING:, never a false DONE:.
+export const WAITING_PROTOCOL = "Waiting on a long external run (no-mistakes pipeline, CI, deploy) is not a finish: keep waiting inside this turn with bounded re-checks. Only if you must end the turn before its result, start the reply with WAITING: <what you are waiting on> instead of a verdict; firstmate resumes you later to re-check it. Never write DONE: for work that is not done.";
 
 export const SECRET_HYGIENE_CONTRACT = "Never print production secrets: do not run env list/get against production (e.g. convex env list --prod), printenv, or credential dumps, and never echo credential values. Reference variable names only.";
 
@@ -518,6 +542,7 @@ export function crewPrompt(input: {
     "  BLOCKED: <what you need, exactly>",
     "  FAILED: <what failed + evidence>",
     "Then the detail. Keep it sparse: outcomes and blockers only, no progress narration.",
+    WAITING_PROTOCOL,
     "",
   ];
   const tail =

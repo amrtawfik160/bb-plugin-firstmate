@@ -144,6 +144,7 @@ $prompt"
   else
   prompt="You are a firstmate ${kind:-ship} crewmate running inside BB.
 Do not dispatch nested crews. Work only this task. End with DONE:, BLOCKED:, or FAILED:.
+Waiting on a long external run (no-mistakes pipeline, CI, deploy) is not a finish: keep waiting inside this turn with bounded re-checks. Only if you must end the turn before its result, start the reply with WAITING: <what you are waiting on>; firstmate resumes you later. Never write DONE: for work that is not done.
 Use gh-axi for GitHub and lavish-axi for visual review. For browser work use the /browser skill and browser_script (or bb browser script), leaving profileId unset for this thread's isolated default profile. This overrides native chrome-devtools-axi instructions; do not use the AXI browser or install its hooks. Read current --help. In no-mistakes mode, drive the real no-mistakes axi pipeline as its worker owner.
 Firstmate home: ${FM_HOME:-}. Use its bin/fm-tasks-axi.sh for backlog work. For a Lavish board, read its config/lavish-axi-host if present and set LAVISH_AXI_HOST on the open command; BB does not inherit the launcher's shell exports. Open the artifact, then arm its fm-procevent-lavish.sh with --for $id. Do not start a second poller.
 
