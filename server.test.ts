@@ -8278,6 +8278,14 @@ test("merge refuses another captain's crew, or a PR another captain's crew owns,
     await host.bb.storage.kv.set("crews", [shipRow("c3", "thr_c3", "thr_old")]);
     const orphaned = await host.harness.behavior.runCli(["merge", "c3", "--yes"], { threadId: "thr_capA" });
     assert.equal(orphaned.exitCode, 0, orphaned.stderr);
+    // A registered captain thread abandoned for days (never archived) is no live owner.
+    host.harness.sdk.stub("threads.get", async (input: { threadId: string }) => ({
+      ...makeThreadResponse({ id: input.threadId, status: "idle", environmentId: "env_wt" }),
+      updatedAt: input.threadId === "thr_capB" ? Date.now() - 3 * 24 * 3_600_000 : Date.now(),
+    }));
+    await host.bb.storage.kv.set("crews", [shipRow("c4", "thr_c4", "thr_capB")]);
+    const abandoned = await host.harness.behavior.runCli(["merge", "c4", "--yes"], { threadId: "thr_capA" });
+    assert.equal(abandoned.exitCode, 0, abandoned.stderr);
   } finally {
     await host.harness.lifecycle.dispose();
   }

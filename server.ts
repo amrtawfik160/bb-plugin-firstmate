@@ -276,6 +276,9 @@ const WAIT_RESUME_MAX = 24;
 const WAIT_RESUME_PREFIX = "Firstmate resume: re-check the external run";
 const waitingRowSchema = z.record(z.string(), z.object({ generation: z.string(), count: z.number() }));
 const MAX_CREWS = 50;
+// A same-project captain with no thread activity for this long no longer counts as a
+// live owner (ownership guards, "another captain is active" warnings).
+const CAPTAIN_LIVE_WINDOW_MS = 24 * 60 * 60_000;
 // Read-through never reaps a crew younger than this: fm-spawn writes state/<id>.meta
 // only after its thread runs, and a pending thread can wait for a host slot.
 const READ_THROUGH_GRACE_MS = 15 * 60_000;
@@ -4526,7 +4529,11 @@ export default async function plugin(bb: BbPluginApi) {
         if (other === threadId || (await bb.storage.kv.get<string>(key)) !== projectId) continue;
         try {
           const row = asRecord(await raceAbort(bb.sdk.threads.get({ threadId: other }), signal, STUCK_HOST_CALL_MS));
-          if (row["archivedAt"] != null) continue;
+          if (row["archivedAt"] != null || row["deletedAt"] != null) continue;
+          // A captain thread abandoned without archiving (the user moved to a new
+          // captain) is not live: its crews must stay manageable without an override.
+          const updatedAt = row["updatedAt"];
+          if (typeof updatedAt === "number" && updatedAt > 0 && Date.now() - updatedAt > CAPTAIN_LIVE_WINDOW_MS) continue;
         } catch {
           continue;
         }
