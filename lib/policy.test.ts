@@ -194,6 +194,10 @@ test("crew prompt asserts isolation and forbids nested dispatch", () => {
   assert.match(text, /Do not dispatch other crews/);
   assert.match(text, /DONE:/);
   assert.match(text, /Captain's intent/);
+  // Tight CI polling exhausted the shared GitHub token; the crew prompt forbids it.
+  assert.match(text, /Never poll CI in a loop/);
+  assert.match(text, /gh-axi run watch/);
+  assert.match(text, /end your turn and let firstmate's PR check wake you/);
 });
 
 test("looksReadOnly hints scout", () => {

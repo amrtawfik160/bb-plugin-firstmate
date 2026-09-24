@@ -125,9 +125,45 @@ fm_backend_bb_show() {  # <thread-id>
   bb thread show --json "$id"
 }
 
+# The home's BB-capable script dir. Native bin/ has no bb backend (FM_BACKEND_KNOWN
+# lacks it and there is no bin/backends/bb.sh), so a crew that runs
+# bin/fm-procevent-lavish.sh or bin/fm-teardown.sh against its own bb task is
+# refused ("backend identity missing"). bin-bb is the installer's mirror.
+fm_backend_bb_crew_bindir() {
+  local home=${FM_HOME:-}
+  if [ -n "$home" ] && [ -d "$home/bin-bb" ]; then
+    printf '%s' "$home/bin-bb"
+  else
+    printf '%s' "${home:+$home/}bin"
+  fi
+}
+
+# Rewrite the native brief's script paths (fm-brief.sh is a symlinked native
+# entry, so it renders $FM_ROOT/bin/... and relative bin/fm-*.sh) to the
+# BB-capable dir. No-op when the mirror is absent.
+fm_backend_bb_crew_brief_paths() {  # <bindir> <text>
+  local bindir=$1 text=$2 root
+  case "$bindir" in */bin-bb) ;; *) printf '%s' "$text"; return 0 ;; esac
+  for root in "${FM_HOME:-}" "${FM_ROOT:-}"; do
+    [ -n "$root" ] || continue
+    text=${text//"$root/bin/"/"$bindir/"}
+  done
+  text=${text//" bin/fm-"/" $bindir/fm-"}
+  text=${text//"\`bin/fm-"/"\`$bindir/fm-"}
+  text=${text//"(bin/fm-"/"($bindir/fm-"}
+  text=${text//$'\n'"bin/fm-"/$'\n'"$bindir/fm-"}
+  printf '%s' "$text"
+}
+
+# Crews exhausted the shared GitHub token (GraphQL bucket) with `run watch`
+# (3s interval) and `pr checks` loops. firstmate's own PR check wakes the crew.
+fm_backend_bb_ci_poll_rule() {
+  printf '%s' "Never poll CI in a loop: do not run gh run watch, gh-axi run watch, or repeated gh pr checks / gh-axi pr checks loops; they burn the GitHub token every crew shares. When waiting on CI, run gh pr checks <url> once at most every 5 minutes, or end your turn and let firstmate's PR check wake you. When rate-limited, read gh api rate_limit including .resources.graphql, not only core."
+}
+
 fm_backend_bb_create_task() {  # <window-name> <project-path> <task-id> <kind> <brief-path>
   local name=$1 project=$2 id=$3 kind=$4 brief=$5
-  local project_id prompt out thread_id wt_path parent perm vis machine tries
+  local project_id prompt out thread_id wt_path parent perm vis machine tries fm_bin
   fm_backend_bb_runtime_check || return 1
   project_id=$(fm_backend_bb_project_id) || return 1
   if [ -n "$brief" ] && [ -f "$brief" ]; then
@@ -142,10 +178,13 @@ For browser work use the /browser skill and browser_script (or bb browser script
 
 $prompt"
   else
+  fm_bin=$(fm_backend_bb_crew_bindir)
+  prompt=$(fm_backend_bb_crew_brief_paths "$fm_bin" "$prompt")
   prompt="You are a firstmate ${kind:-ship} crewmate running inside BB.
 Do not dispatch nested crews. Work only this task. End with DONE:, BLOCKED:, or FAILED:.
 Use gh-axi for GitHub and lavish-axi for visual review. For browser work use the /browser skill and browser_script (or bb browser script), leaving profileId unset for this thread's isolated default profile. This overrides native chrome-devtools-axi instructions; do not use the AXI browser or install its hooks. Read current --help. In no-mistakes mode, drive the real no-mistakes axi pipeline as its worker owner.
-Firstmate home: ${FM_HOME:-}. Use its bin/fm-tasks-axi.sh for backlog work. For a Lavish board, read its config/lavish-axi-host if present and set LAVISH_AXI_HOST on the open command; BB does not inherit the launcher's shell exports. Open the artifact, then arm its fm-procevent-lavish.sh with --for $id. Do not start a second poller.
+Firstmate home: ${FM_HOME:-}. Run every firstmate script from $fm_bin/ (the BB-capable scripts); where anything names bin/fm-*.sh, use $fm_bin/fm-*.sh instead, because the native bin/ copies do not know the bb backend and refuse BB tasks. Use $fm_bin/fm-tasks-axi.sh for backlog work. For a Lavish board, read its config/lavish-axi-host if present and set LAVISH_AXI_HOST on the open command; BB does not inherit the launcher's shell exports. Open the artifact, then arm $fm_bin/fm-procevent-lavish.sh with --for $id. Do not start a second poller.
+$(fm_backend_bb_ci_poll_rule)
 
 $prompt"
   fi

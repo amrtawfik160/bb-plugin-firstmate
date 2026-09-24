@@ -468,7 +468,11 @@ export function quietShouldSend(event: string): boolean {
   return event !== "idle";
 }
 
-export const AXI_TOOL_CONTRACT = "Use gh-axi for GitHub and lavish-axi for visual review; read current --help. For all browser work, use the /browser skill and browser_script (or bb browser script). Leave profileId unset for the thread-isolated default profile. This BB browser policy overrides imported native chrome-devtools-axi instructions; do not use the AXI browser or install its hooks. Use quota-axi for quota decisions and the home's bin/fm-tasks-axi.sh for backlog work. In no-mistakes mode, the worker owns the real no-mistakes axi pipeline; a manual checklist is not a substitute. For crew-hosted Lavish boards, open the artifact then use the home's fm-procevent-lavish.sh arm <artifact> --for <task-id>; never start a second poller.";
+export const AXI_TOOL_CONTRACT = "Use gh-axi for GitHub and lavish-axi for visual review; read current --help. For all browser work, use the /browser skill and browser_script (or bb browser script). Leave profileId unset for the thread-isolated default profile. This BB browser policy overrides imported native chrome-devtools-axi instructions; do not use the AXI browser or install its hooks. Use quota-axi for quota decisions and the home's bin-bb/fm-tasks-axi.sh for backlog work. In no-mistakes mode, the worker owns the real no-mistakes axi pipeline; a manual checklist is not a substitute. For crew-hosted Lavish boards, open the artifact then use the home's bin-bb/fm-procevent-lavish.sh arm <artifact> --for <task-id>; never start a second poller.";
+
+// Crews ran `gh-axi run watch` (3s interval) and `pr checks` loops thousands of
+// times and exhausted the GitHub token every crew and captain shares.
+export const CI_POLL_CONTRACT = "Never poll CI in a loop: do not run gh run watch, gh-axi run watch, or repeated gh pr checks / gh-axi pr checks loops; they burn the GitHub token every crew shares. When waiting on CI, run gh pr checks <url> once at most every 5 minutes, or end your turn and let firstmate's PR check wake you. When rate-limited, read gh api rate_limit including .resources.graphql, not only core.";
 
 export const SECRET_HYGIENE_CONTRACT = "Never print production secrets: do not run env list/get against production (e.g. convex env list --prod), printenv, or credential dumps, and never echo credential values. Reference variable names only.";
 
@@ -511,6 +515,7 @@ export function crewPrompt(input: {
       : "Workspace: stay inside your assigned environment. If you find yourself editing outside it, STOP and report BLOCKED.",
     "Do not dispatch other crews. Do not run bb firstmate dispatch. One task, then report.",
     AXI_TOOL_CONTRACT,
+    CI_POLL_CONTRACT,
     SECRET_HYGIENE_CONTRACT,
     "",
     "Status protocol: when finished, your final message MUST start with exactly one of these lines:",
