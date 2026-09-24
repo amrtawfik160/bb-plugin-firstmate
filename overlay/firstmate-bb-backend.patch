@@ -37,6 +37,27 @@ diff --git a/bin/fm-backend.sh b/bin/fm-backend.sh
      *) return 1 ;;
    esac
  }
+@@ -422,8 +432,18 @@
+     return 1
+   }
+   worktree=$(fm_backend_meta_exact_value "$meta" worktree) || {
+-    echo "REFUSED: task $id has a missing, empty, or ambiguous worktree identity; preserving task state." >&2
+-    return 1
++    # bb: a shared-env crew (a scout on the project checkout, or a scheduled
++    # crew recorded before its worktree existed) has no firstmate-owned
++    # worktree. BB owns the environment and teardown archives the thread by id,
++    # never a path, so an empty or absent worktree= is valid for backend=bb.
++    # An ambiguous (repeated) worktree= still refuses.
++    if [ "$(fm_backend_meta_exact_value "$meta" backend 2>/dev/null)" = bb ] \
++      && [ "$(grep -c '^worktree=' "$meta" 2>/dev/null || true)" -le 1 ]; then
++      worktree=
++    else
++      echo "REFUSED: task $id has a missing, empty, or ambiguous worktree identity; preserving task state." >&2
++      return 1
++    fi
+   }
+   project=$(fm_backend_meta_exact_value "$meta" project) || {
+     echo "REFUSED: task $id has a missing, empty, or ambiguous project identity; preserving task state." >&2
 @@ -543,6 +553,19 @@
          echo "REFUSED: cmux endpoint metadata for task $id is malformed or inconsistent; preserving task state." >&2
          return 1
@@ -477,3 +498,33 @@ index 4803123e..892f1664 100644
  A herdr, zellij, or cmux home is therefore never told `tmux` is missing, and the `treehouse` durable-lease upgrade check runs only for the backends that actually use treehouse.
  When `config/crew-dispatch.json` exists, bootstrap also requires `jq` for dispatch profile validation.
  When Relay is opted in, bootstrap also requires `curl` and `jq` before arming the relay poll shim.
+diff --git a/bin/fm-busy-lib.sh b/bin/fm-busy-lib.sh
+--- a/bin/fm-busy-lib.sh
++++ b/bin/fm-busy-lib.sh
+@@ -45,7 +45,7 @@
+ #                    unknown invalidation fm-control writes after a Devin interrupt
+ #   fm-recovery      a documented recovery reset after relaunch
+ # Classifier-only sources (never written into a record):
+-#   endpoint-gone, herdr-native, grok-regex, rovo-regex, agy-regex, muse-session-log,
++#   endpoint-gone, herdr-native, bb-native, grok-regex, rovo-regex, agy-regex, muse-session-log,
+ #   cursor-transcript, missing, malformed, gen-mismatch, source-mismatch,
+ #   kimi-unverified, codex-unverified, capture-failed, no-target, launch-prompt
+ #
+@@ -1078,11 +1078,14 @@
+   # No record at all. A native herdr busy verdict is semantic enough to trust
+   # for BUSY (streaming means a turn is running); native idle is narrower
+   # than turn state (a long foreground tool call reads idle) and stays
+-  # unknown here.
+-  if [ "$backend" = herdr ] && command -v fm_backend_busy_state >/dev/null 2>&1; then
++  # unknown here. A BB thread status is the same kind of semantic verdict: an
++  # active thread is a turn in flight, including a long tool call, so bb is
++  # trusted for BUSY too. Without it a busy BB crew read unknown and fm-watch
++  # paged a false stale: after two unchanged polls.
++  if { [ "$backend" = herdr ] || [ "$backend" = bb ]; } && command -v fm_backend_busy_state >/dev/null 2>&1; then
+     native=$(fm_backend_busy_state "$backend" "$target" 2>/dev/null || true)
+     if [ "$native" = busy ]; then
+-      printf 'busy herdr-native'
++      printf 'busy %s-native' "$backend"
+       return 0
+     fi
+   fi

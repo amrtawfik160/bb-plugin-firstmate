@@ -16,7 +16,7 @@ Talk to one agent, ship with a crew. BB mapping:
 | watcher | `thread.idle` / `thread.failed` events + stuck checker |
 | agent handoff | `firstmate_watch` → private event-driven durable wakes. |
 | CLI wait | `bb firstmate watch` → blocking `threads.wait` for operator use. |
-| status protocol | `DONE:` / `BLOCKED:` / `FAILED:` |
+| status protocol | `DONE:` / `BLOCKED:` / `FAILED:` (`WAITING:` = yield on an external run, not a verdict) |
 | PR / local merge | `deliver`, `merge` (PR or ff-only local-only) |
 
 No captain thread to open: run `/captain` in any thread. Never spawn a thread

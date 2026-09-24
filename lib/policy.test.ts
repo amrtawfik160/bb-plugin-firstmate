@@ -20,6 +20,8 @@ import {
   verdictOf,
   verdictMarker,
   idleVerdictPresentation,
+  isWaitingYield,
+  protocolNudgeText,
 } from "./policy.ts";
 
 test("toReasoningLevel accepts the dispatch-profile scale only", () => {
@@ -194,6 +196,10 @@ test("crew prompt asserts isolation and forbids nested dispatch", () => {
   assert.match(text, /Do not dispatch other crews/);
   assert.match(text, /DONE:/);
   assert.match(text, /Captain's intent/);
+  // Tight CI polling exhausted the shared GitHub token; the crew prompt forbids it.
+  assert.match(text, /Never poll CI in a loop/);
+  assert.match(text, /gh-axi run watch/);
+  assert.match(text, /end your turn and let firstmate's PR check wake you/);
 });
 
 test("looksReadOnly hints scout", () => {
@@ -313,4 +319,23 @@ test("verdictMarker gives a distinct glyph per verdict", () => {
   assert.equal(verdictMarker("DONE"), "✅ DONE");
   assert.equal(verdictMarker("BLOCKED"), "🚧 BLOCKED");
   assert.equal(verdictMarker("FAILED"), "❌ FAILED");
+});
+
+test("WAITING: is a yield, not a verdict; the first protocol line decides", () => {
+  assert.equal(isWaitingYield("WAITING: no-mistakes pipeline still running (step 4/7)"), true);
+  assert.equal(isWaitingYield("ACK: on it\n\nwaiting: CI for PR #12"), true);
+  assert.equal(isWaitingYield("WAITING: CI\nDONE: shipped"), true, "a yield above a later verdict is still a yield");
+  assert.equal(isWaitingYield("DONE: shipped\nWAITING: nothing"), false, "a verdict first is a verdict");
+  assert.equal(isWaitingYield("DONE: not done yet, pipeline still running"), false);
+  assert.equal(isWaitingYield("Waiting on CI to finish before I report."), false, "prose is not the marker");
+  assert.equal(isWaitingYield(null), false);
+  assert.equal(hasStatusProtocol("WAITING: CI"), false, "WAITING never counts as a finished verdict");
+});
+
+test("crews are taught to wait in-turn and yield WAITING:, never a false DONE:", () => {
+  const text = crewPrompt({ task: "fix login", parentThreadId: "thr_cap", shape: "ship", mode: "no-mistakes", isolated: true });
+  assert.match(text, /keep waiting inside this turn/);
+  assert.match(text, /WAITING: <what you are waiting on>/);
+  assert.match(text, /Never write DONE: for work that is not done/);
+  assert.match(protocolNudgeText(1, 3), /WAITING: <what>/);
 });

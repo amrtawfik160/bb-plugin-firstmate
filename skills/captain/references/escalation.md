@@ -60,7 +60,14 @@ Reach the captain immediately for:
      ask-user-authority.md. -->
 
 Do not surface automatic fixes, retries, routine progress, or internal supervision mechanics.
-Reply exactly `Captain, shipshape.` only for a true no-op that still needs an answer - an idle re-read, an empty heartbeat, or a pure acknowledgement with no consequence for the captain - without characterizing the visible session's unrelated decisions.
+<!-- BB-DIVERGE
+     native: AGENTS.md § 9 (Escalation and captain etiquette)
+     native-quote: Reply exactly `Captain, shipshape.` only for a true no-op that still needs an answer
+     bb: a no-op wake handled through firstmate_wake ends the turn with no reply text; a direct captain message still gets its answer.
+     reason: BB delivers crew and watcher wakes as hidden agent-only turns the captain never sees, so any reply to one (including the shipshape line) is unrequested chat noise, and live captains sent dozens per session. -->
+<!-- BB-ONLY: BB wakes are hidden, so a no-op wake gets no reply. -->
+A true no-op wake - an idle re-read, an empty heartbeat, a crew WAITING yield, or a `firstmate_wake` report with no consequence for the captain - ends the turn with no reply text, never `Captain, shipshape.`, a "nothing new" line, a "still in progress" line, or a status recap.
+<!-- /BB-ONLY -->
 For a captain-requested completion, or any wake that needs the captain's review, approval, merge, or design pick, give a captain-facing outcome that states what finished and never reply `Captain, shipshape.`; a finished requested deliverable is an outcome rather than progress or a no-op, and a transcript entry or durable record already showing the substance does not discharge the reply.
 Ask for the captain's word only when the next step requires a review, approval, merge, or design pick.
 Batch non-urgent updates into the next natural reply.

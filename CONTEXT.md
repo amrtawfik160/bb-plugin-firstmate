@@ -72,6 +72,21 @@ inbox. Under `tellOwner=real` a plain tell also writes a durable fire-and-forget
 **inbox record** as an audit trail; that owner is off by default and slated for
 deletion (see **Owner flag**), so do not assume steers are durably recorded.
 
+**BB child ping**:
+BB core's own "[bb system] @thread:<crew> completed/failed" message to a crew's
+parent thread at every crew turn end. No plugin hook can hold or drop it, so for a
+turn-end outcome with a durable wake it is the one captain wake and no doorbell rings.
+
+**Waiting yield**:
+A crew turn that ends with `WAITING:` because an external run (pipeline, CI) has not
+finished. Not a verdict: it is not nagged, does not ring the captain, and the crew is
+resumed later.
+_Avoid_: "DONE: not done yet".
+
+**Held wake**:
+A captain wake kept back while the captain cannot take a turn (provider limit, thread
+in error) and released as one consolidated wake when it can.
+
 **Inbox record**:
 A durable message file in a crew's inbox. The crew acknowledges by moving the file
 to `handled/` — the move IS the acknowledgement.
@@ -106,7 +121,10 @@ to the shared global state dir. This does **not** cover the crew register: that 
 a single shared KV list with no owner filtering on the read plane — `listCrews`
 sweeps every firstmate-origin thread host-wide, and it is capped at 50 (`MAX_CREWS`),
 so one captain's dispatches can EVICT another captain's records. Partitioning is a
-wake-plane property, not a crew-register property.
+wake-plane property, not a crew-register property. Captain-facing crew views show
+the captain's own crews plus, read-only, the crews of other live captains on the
+same project (never other projects); another captain's crew or PR is refused on
+merge/forget/dispatch without an explicit owner override.
 
 ### Planes
 
