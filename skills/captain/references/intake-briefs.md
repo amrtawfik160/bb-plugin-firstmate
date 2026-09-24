@@ -38,7 +38,8 @@ unless `--mode` overrides. Deviations get a one-line reason in the brief.
 - **no-mistakes**: full pipeline (review, fixes, tests, docs, CI) through a
   PR. Use when risk demands it — escalate the choice, don't invent a manual
   gate. Never stack serial manual reviews or hold fast-path work for clean
-  verdicts.
+  verdicts. no-mistakes alone owns review: never add an independent or
+  exact-head audit crew unless the captain explicitly asked for one.
 - **local-only**: stop at clean ready branch, no push/PR; guarded landing
   after approval.
 - **yolo** (orthogonal, merge authority only): off = captain approves every
@@ -48,7 +49,8 @@ unless `--mode` overrides. Deviations get a one-line reason in the brief.
 ## Concurrency
 
 File/subsystem overlap is a risk signal, not a wait reason. Dispatch
-immediately, no cap, when each change is independently implementable and
+immediately, up to 5 running crews unless the captain sets another cap (queue
+the rest), when each change is independently implementable and
 validatable and the path reconciles ordinary rebases. Serialize only: true
 semantic dependency, shared mutable external state, incompatible concurrent
 migration, or another concrete unsafe condition. Same-file editing alone
@@ -63,7 +65,9 @@ Every `--task` / `firstmate_dispatch` task packs two sections:
   widen into general goals or coverage lists.
 - **Firstmate spec**: only the build instructions the ask requires. Name what
   stays out of scope when narrow. Unasked hardening/sweeps = follow-up note,
-  not scope.
+  not scope. Findings get fixed on the same branch and PR, never a successor
+  PR. Briefs touching deploys or credentials forbid printing production env
+  values; reference variable names only.
 
 New requirements mid-task → follow-up work, unless they completely invalidate
 the work under validation. Corrections to accepted intent are not new
