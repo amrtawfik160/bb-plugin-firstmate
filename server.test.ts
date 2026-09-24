@@ -8836,3 +8836,36 @@ test("read-through: a dropped crew is not re-recovered and re-dropped on every c
     await host.harness.lifecycle.dispose();
   }
 });
+
+test("a scheduled WAITING resume is dropped once the crew stopped waiting (stopped/forgotten), and a waiting crew holds a cap slot", async () => {
+  const host = ownerHost({ notifyOwner: "real", maxActiveCrews: 1 });
+  await plugin(host.bb);
+  try {
+    stubRoutedHost(host, () => ({ code: 0 }));
+    captainAndCrewThreads(host);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.stop", async () => ({ ok: true }));
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await emitIdle(host, "WAITING: CI still running");
+    const resume = host.harness.sdk.callsTo("threads.send")
+      .map((c) => c[0] as { threadId: string; input: Array<{ text: string }> })
+      .find((a) => a.threadId === "thr_crew")!;
+    const hook = host.harness.inspection.registrations.hooks["message.dispatch"]!;
+    const due = () => hook({
+      thread: makeThreadResponse({ id: "thr_crew", status: "idle" }),
+      attempt: "start-turn", initiator: "system", senderThreadId: null, queuedMessages: [{}],
+      input: { blocks: [], text: resume.input[0]!.text },
+    } as never);
+    assert.equal((await due()).action, "proceed", "a crew still waiting takes its resume");
+    // The idle waiting crew holds the only slot: another dispatch is refused.
+    const capped = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--", "another task"], { threadId: "thr_cap", projectId: "proj_1" });
+    assert.equal(capped.exitCode, 1);
+    assert.match(capped.stderr, /Crew cap reached: 1 crews running/);
+    const stopped = await host.harness.behavior.runCli(["stop", "c1"], { threadId: "thr_cap" });
+    assert.equal(stopped.exitCode, 0, stopped.stderr);
+    assert.equal((await due()).action, "reject", "a stopped crew is not revived by its old resume");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});

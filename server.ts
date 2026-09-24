@@ -269,6 +269,12 @@ function quietKvKey(captainThreadId: string | undefined): string {
   return `${QUIET_KEY}${captainScopeSuffix(captainThreadId)}`;
 }
 const NUDGE_KEY = "protocol-nudges";
+// Crews parked on a WAITING: yield, and the scheduled resume that re-checks them.
+const WAITING_KEY = "crew-waiting";
+const WAIT_RESUME_MS = 5 * 60_000;
+const WAIT_RESUME_MAX = 24;
+const WAIT_RESUME_PREFIX = "Firstmate resume: re-check the external run";
+const waitingRowSchema = z.record(z.string(), z.object({ generation: z.string(), count: z.number() }));
 const MAX_CREWS = 50;
 // Read-through never reaps a crew younger than this: fm-spawn writes state/<id>.meta
 // only after its thread runs, and a pending thread can wait for a host slot.
@@ -1957,6 +1963,7 @@ export default async function plugin(bb: BbPluginApi) {
       await bb.storage.kv.set(`crew-retired:${crew.threadId}`, true);
       return crews.filter(c => c.id !== crew.id || c.threadId !== crew.threadId);
     });
+    await clearWaiting(crew.id).catch(() => {});
     if (!isSecondmateRoute(crew)) {
       try {
         await bb.sdk.threads.updatePluginMetadata({ threadId: crew.threadId, set: { crew: "false" }, remove: ["crewId"] });
@@ -3439,8 +3446,11 @@ export default async function plugin(bb: BbPluginApi) {
     const mine = (await listCrews({ owner: parentThreadId })).filter((c) => !isSecondmateRoute(c));
     const statuses = await Promise.all(mine.map((c) => crewStatus(c)));
     // A crew still starting already holds a slot; not counting it let a quick
-    // fan-out of dispatches overshoot the cap.
-    const running = statuses.filter((st) => st === "active" || st === "pending" || st === "starting").length;
+    // fan-out of dispatches overshoot the cap. A crew parked on WAITING: is idle
+    // between turns but its scheduled resume starts one, so it holds a slot too.
+    const waiting = await readWaiting();
+    const parked = await Promise.all(mine.map((c, i) => statuses[i] === "idle" ? isCrewWaiting(c, waiting) : Promise.resolve(false)));
+    const running = statuses.filter((st, i) => st === "active" || st === "pending" || st === "starting" || parked[i]).length;
     if (running + adding <= cap) return null;
     return `Crew cap reached: ${running} crews running (cap ${cap}). Queue this with firstmate_queue and dispatch when a crew finishes, or ask the captain to raise the cap.`;
   }
@@ -3450,6 +3460,8 @@ export default async function plugin(bb: BbPluginApi) {
   async function capRefusalToWake(crew: Crew, overCap: boolean): Promise<string | null> {
     if (overCap || isSecondmateRoute(crew) || crew.parentThreadId === null) return null;
     if (await crewInTurn(crew)) return null;
+    // A crew parked on WAITING: already holds its slot in the count.
+    if (await isCrewWaiting(crew)) return null;
     const refusal = await crewCapRefusal(crew.parentThreadId, 1);
     if (refusal === null) return null;
     const head = refusal.split(". ")[0] ?? refusal;
@@ -7872,6 +7884,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (isSecondmateRoute(crew)) return toolError(`Crew ${crewId} is a secondmate route — do not stop the domain captain.`);
       if (await isCaptainThread(crew.threadId)) return toolError("Refusing to stop the captain thread.");
       await bb.sdk.threads.stop({ threadId: crew.threadId });
+      await clearWaiting(crew.id);
       return `Stopped crew ${crewId}`;
     },
   });
@@ -8641,10 +8654,15 @@ export default async function plugin(bb: BbPluginApi) {
   // is neither nagged nor rung to the captain; BB resumes it after a delay through a
   // time-scheduled queued message (durable in BB, survives a plugin reload). Past the cap
   // the captain gets one decision instead of an endless silent loop.
-  const WAITING_KEY = "crew-waiting";
-  const WAIT_RESUME_MS = 5 * 60_000;
-  const WAIT_RESUME_MAX = 24;
-  const waitingRowSchema = z.record(z.string(), z.object({ generation: z.string(), count: z.number() }));
+  async function readWaiting(): Promise<Record<string, { generation: string; count: number }>> {
+    const parsed = waitingRowSchema.safeParse(await bb.storage.kv.get<unknown>(WAITING_KEY));
+    return parsed.success ? parsed.data : {};
+  }
+  // A crew parked on WAITING: for its current task generation, within the resume budget.
+  async function isCrewWaiting(crew: Crew, state?: Record<string, { generation: string; count: number }>): Promise<boolean> {
+    const row = (state ?? await readWaiting())[crew.id];
+    return row !== undefined && row.generation === taskGeneration(crew) && row.count <= WAIT_RESUME_MAX;
+  }
   async function clearWaiting(crewId: string): Promise<void> {
     const parsed = waitingRowSchema.safeParse(await bb.storage.kv.get<unknown>(WAITING_KEY));
     if (!parsed.success || parsed.data[crewId] === undefined) return;
@@ -8675,7 +8693,7 @@ export default async function plugin(bb: BbPluginApi) {
         sendAt: Date.now() + WAIT_RESUME_MS,
         input: [{
           type: "text",
-          text: "Firstmate resume: re-check the external run you reported WAITING on. Keep waiting inside this turn with bounded re-checks; when it resolves, finish and end with DONE:, BLOCKED:, or FAILED:. If it is still running when you must yield, end with WAITING: again.",
+          text: `${WAIT_RESUME_PREFIX} you reported WAITING on. Keep waiting inside this turn with bounded re-checks; when it resolves, finish and end with DONE:, BLOCKED:, or FAILED:. If it is still running when you must yield, end with WAITING: again.`,
           mentions: [],
         }],
       });
@@ -8772,7 +8790,19 @@ export default async function plugin(bb: BbPluginApi) {
     bb.experimental_hooks.on("message.dispatch", async (context) => {
       try {
         const threadId = context.thread.id;
-        if (!knownCaptains.has(threadId)) return { action: "proceed" };
+        if (!knownCaptains.has(threadId)) {
+          // A scheduled WAITING resume outlives the wait: BB fires it even after the
+          // crew was forgotten, retired as landed, stopped, relaunched, or finished.
+          // Only a crew still parked on WAITING takes it.
+          if ((context.queuedMessages ?? []).length <= 1 && context.input.text.trimStart().startsWith(WAIT_RESUME_PREFIX)) {
+            const crew = (await readCrews()).find((c) => c.threadId === threadId);
+            if (crew === undefined || !(await isCrewWaiting(crew))) {
+              bb.log.info(`dropped a stale WAITING resume for thread ${threadId}: the crew is no longer waiting`);
+              return { action: "reject", message: "Firstmate: this crew is no longer waiting on an external run; the scheduled re-check was dropped." };
+            }
+          }
+          return { action: "proceed" };
+        }
         const sender = typeof context.senderThreadId === "string" && context.senderThreadId !== "mixed" ? context.senderThreadId : null;
         const senderIsCrew = sender !== null && (await readCrews()).some((c) => c.threadId === sender);
         const decision = crewPingHoldDecision({
@@ -9183,6 +9213,7 @@ export default async function plugin(bb: BbPluginApi) {
             if (isSecondmateRoute(crew)) return fail(`Crew ${id} is a secondmate route — do not stop the domain captain.`);
             if (await isCaptainThread(crew.threadId)) return fail("Refusing to stop the captain thread.");
             await bb.sdk.threads.stop({ threadId: crew.threadId });
+            await clearWaiting(crew.id);
             return reply({ stopped: true, id }, `Stopped crew ${id}`);
           }
           case "retry": {
