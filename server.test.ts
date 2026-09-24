@@ -8401,7 +8401,7 @@ test("read-through keeps a dispatched crew whose thread still waits for a host s
   }
 });
 
-test("dispatch refuses an unknown providerId/model before spawning and names the catalog id", async () => {
+test("dispatch refuses an unknown providerId before spawning, names the catalog id, and lets unlisted models through", async () => {
   const host = await load();
   try {
     host.harness.sdk.stub("environments.list", async () => [{ hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" }]);
@@ -8414,10 +8414,11 @@ test("dispatch refuses an unknown providerId/model before spawning and names the
     const bad = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--provider", "grok", "--", "fix login"], { projectId: "proj_1" });
     assert.equal(bad.exitCode, 1);
     assert.match(bad.stderr, /Unknown providerId "grok" — did you mean "acp-grok"\?/);
-    const badModel = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--provider", "acp-grok", "--model", "grok-9", "--", "fix login"], { projectId: "proj_1" });
-    assert.equal(badModel.exitCode, 1);
-    assert.match(badModel.stderr, /Unknown model "grok-9"/);
-    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0, "nothing is spawned for a bad provider/model");
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0, "nothing is spawned for a bad provider");
+    // An unlisted model (alias or selected model) is not refused; a real rejection surfaces as a thread in error.
+    const aliasModel = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--provider", "acp-grok", "--model", "grok-latest", "--", "fix login"], { projectId: "proj_1" });
+    assert.equal(aliasModel.exitCode, 0, aliasModel.stderr);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 1, "an unlisted model still dispatches");
     const good = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--provider", "acp-grok", "--model", "grok-4", "--", "fix login"], { projectId: "proj_1" });
     assert.equal(good.exitCode, 0, good.stderr);
   } finally {

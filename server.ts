@@ -3634,10 +3634,11 @@ export default async function plugin(bb: BbPluginApi) {
     const models = Array.isArray(catalog["models"]) ? (catalog["models"] as unknown[]).map(asRecord) : [];
     if (catalog["modelLoadError"] != null || models.length === 0) return;
     if (models.some((m) => m["id"] === mid || m["model"] === mid)) return;
-    const known = models.map((m) => m["id"]).filter((id): id is string => typeof id === "string");
-    throw new Error(
-      `Unknown model "${mid}" for ${pid !== "" ? `provider "${pid}"` : "the default provider"}. Known models: ${known.slice(0, 20).join(", ")}${known.length > 20 ? ", …" : ""}. Nothing was spawned.`,
-    );
+    // The catalog lists canonical ids only; providers also accept aliases and
+    // selected models outside it, so an unlisted model is not a refusal. A model
+    // the provider really rejects shows up as a thread born in error, which
+    // dispatchStatusNote reports as FAILED.
+    bb.log.warn(`model "${mid}" is not in the ${pid !== "" ? `"${pid}"` : "default"} provider catalog (project=${projectId}); dispatching anyway`);
   }
 
   // A spawned crew whose thread is already in error never started; say so instead
