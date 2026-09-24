@@ -470,6 +470,23 @@ export function quietShouldSend(event: string): boolean {
 
 export const AXI_TOOL_CONTRACT = "Use gh-axi for GitHub and lavish-axi for visual review; read current --help. For all browser work, use the /browser skill and browser_script (or bb browser script). Leave profileId unset for the thread-isolated default profile. This BB browser policy overrides imported native chrome-devtools-axi instructions; do not use the AXI browser or install its hooks. Use quota-axi for quota decisions and the home's bin/fm-tasks-axi.sh for backlog work. In no-mistakes mode, the worker owns the real no-mistakes axi pipeline; a manual checklist is not a substitute. For crew-hosted Lavish boards, open the artifact then use the home's fm-procevent-lavish.sh arm <artifact> --for <task-id>; never start a second poller.";
 
+export const SECRET_HYGIENE_CONTRACT = "Never print production secrets: do not run env list/get against production (e.g. convex env list --prod), printenv, or credential dumps, and never echo credential values. Reference variable names only.";
+
+// Stuck ladder: a relaunch is the replacement step; the second failure is reported,
+// not relaunched again.
+export const MAX_CREW_RELAUNCHES = 1;
+
+// Default ceiling on concurrently running crews per captain (0 = no cap).
+export const DEFAULT_MAX_ACTIVE_CREWS = 5;
+
+// BB rejects retry reasons over 200 characters; a long captain note must not
+// turn a retry into an error.
+export function retryReason(reason: string | undefined, crewId: string): string {
+  const text = (reason ?? "").replace(/\s+/g, " ").trim();
+  if (text === "") return `firstmate retry crew ${crewId}`;
+  return text.length <= 200 ? text : `${text.slice(0, 199)}…`;
+}
+
 export function crewPrompt(input: {
   task: string;
   parentThreadId: string | undefined;
@@ -494,6 +511,7 @@ export function crewPrompt(input: {
       : "Workspace: stay inside your assigned environment. If you find yourself editing outside it, STOP and report BLOCKED.",
     "Do not dispatch other crews. Do not run bb firstmate dispatch. One task, then report.",
     AXI_TOOL_CONTRACT,
+    SECRET_HYGIENE_CONTRACT,
     "",
     "Status protocol: when finished, your final message MUST start with exactly one of these lines:",
     "  DONE: <one-line outcome>",

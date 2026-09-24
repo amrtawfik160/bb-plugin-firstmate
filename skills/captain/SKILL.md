@@ -189,9 +189,31 @@ Harness adapters other than `bb` (tmux/orca/cmux/zellij/herdr) target non-BB
 session hosts; inside BB the `bb` adapter is the live one. The others ship with
 the clone but stay dormant here.
 
-## Verification standard (brief every crew with this)
+## Delivery path owns rigor (every project)
 
-When you dispatch a crew whose work claims a **behaviour** (real transport,
+The selected delivery path owns its own rigor. With no-mistakes, no-mistakes
+alone owns review, fixes, tests, docs, push, PR, and CI; with direct-PR, follow
+the faster path without adding an independent reviewer.
+
+- Never dispatch an "independent", "fresh", "final", or "exact-head" audit of a
+  ship crew's PR unless the captain explicitly asked for that review. Risk,
+  security, or architecture alone never authorizes one; escalate whether to use
+  no-mistakes instead of inventing a manual gate.
+- Fix findings on the same branch and PR. Never rebuild a successor PR per fix
+  round; close a superseded PR in the same step that replaces it.
+- A second blocking finding on the same theme is a captain decision
+  ([ask-user-authority](references/ask-user-authority.md)), not another
+  fix-and-review round.
+- A captain word to ship, merge, or deploy authorizes merging work that passed
+  its delivery path. Canary, Dev, and live checks run after merge unless the
+  captain made them a merge gate.
+
+## Verification standard (firstmate plugin work only)
+
+Applies only to crews changing this firstmate plugin/toolbelt itself. Never
+apply it to product projects.
+
+When you dispatch such a crew whose work claims a **behaviour** (real transport,
 keeper, wake scoping, host writes — anything about runtime), put this in the
 Firstmate spec. It is the standard the full contract (`CONTRIBUTING.md`) enforces,
 and it exists because 14 PRs passed ~7 review rounds while doing NOTHING: reviews
@@ -232,6 +254,9 @@ proof output. Run an acceptance dispatch yourself when in doubt.
 4. **Crews never address the captain.** All crew communication flows through
    you. Hidden child threads already report to this parent; relay, don't paste.
 5. **Report outcomes faithfully.** Failed means failed, with evidence.
+6. **Never expose production secrets.** Every brief touching deploys or
+   credentials says: never print production env values (`env list/get --prod`,
+   `printenv`, dumps); reference variable names only.
 
 A current, explicit, concrete captain instruction overrides any standing rule
 within its exact scope. Never infer, broaden, or carry it elsewhere.
@@ -242,14 +267,20 @@ within its exact scope. Never infer, broaden, or carry it elsewhere.
   Ship (default) = change via PR/branch. Scout = knowledge report, never a
   PR, when uncertainty could change whether/what to build or captain wants a
   standalone deliverable. Consult existing reports first. Dispatch isolated
-  work immediately, no cap; serialize only true semantic dependency, shared
-  mutable state, or conflicting migration. Overlap alone never blocks.
+  work immediately, up to 5 running crews unless the captain sets another cap;
+  queue the rest. Serialize only true semantic dependency, shared mutable
+  state, or conflicting migration. Overlap alone never blocks. Deck and
+  bearings name any other captain on the same project; coordinate before
+  production deploys, key rotations, or deploy holds.
 - **Brief**: pack every dispatch task as **Captain's intent** (verbatim ask,
   acceptance criteria, never widened) + **Firstmate spec** (build steps,
   explicit out-of-scope). Follow-ups get noted, not added.
 - **Supervise** (references/supervision.md): with crews running, call `firstmate_watch` once per crew batch to hand supervision to private event-driven durable wakes, then end the turn and never retry or poll.
   The `bb firstmate watch` CLI remains blocking via BB `threads.wait` for operator use; `supervision on` keeps thread idle/fail events + stuck checker active.
   Stuck ladder: `crew` peek → one-line `tell` → `interrupt` or `stop`+rebrief relaunch → second failure means report failed, preserve work.
+  Relaunch keeps the crew's provider and model unless the captain names another.
+  Waiting is silent: no-change updates, elapsed time, and pending reviews are not captain-facing progress.
+  A credential or production-access blocker is one batched captain ask, never a relaunch.
 - **Deliver**: `deliver` per crew (committed + uncommitted diff + PR). Merge
   via `merge` with `yes` (green + mergeable; a PR with zero checks / `no_checks`
   counts as no failing checks; yolo skips yes). Authority (`yes`) is separate

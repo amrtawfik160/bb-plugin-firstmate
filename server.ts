@@ -34,6 +34,9 @@ import {
   toReasoningLevel,
   toShape,
   truncate,
+  MAX_CREW_RELAUNCHES,
+  DEFAULT_MAX_ACTIVE_CREWS,
+  retryReason,
   type DeliveryMode,
   type PermissionMode,
   type ReasoningLevel,
@@ -80,6 +83,10 @@ const crewSchema = z.object({
   // forget) is gated on THIS recorded fact — not on live settings, which may flip
   // to native/kv mid-flight and would otherwise strand the row in_flight forever.
   backlogRow: z.boolean().optional(),
+  // Recovery relaunches so far and the threads they replaced, so the stuck ladder
+  // stops at its second failure and a replaced thread id still resolves.
+  relaunches: z.number().optional(),
+  priorThreadIds: z.array(z.string()).optional(),
   createdAt: z.string(),
 });
 type Crew = z.infer<typeof crewSchema>;
@@ -515,6 +522,7 @@ export const FM_WATCH_KEEPER_SH = "state/.bb-watch-keeper.sh";
 // the plugin removing the pidfile. TTL is derived from the re-arm interval below.
 export const FM_WATCH_OWNER_BEAT = "state/.bb-watch-owner.beat";
 const FM_WATCH_CAPTAIN_PREFIX = "fm-watch-captain:";
+const CAPTAIN_PROJECT_PREFIX = "captain-project:";
 // B3(a): the owner beat is refreshed by the supervisor TICK (every ~checkMs, 15–30s),
 // not by the keeper's own re-arm interval, and only when the host read/refresh call
 // SUCCEEDS. A transiently slow or briefly-unreachable host makes several ticks fail in
@@ -1271,6 +1279,11 @@ export default async function plugin(bb: BbPluginApi) {
       type: "number",
       label: "Minimum seconds between protocol nudges for one crew",
       default: 60,
+    },
+    maxActiveCrews: {
+      type: "number",
+      label: "Max running crews per captain before dispatch refuses (0 = no cap)",
+      default: DEFAULT_MAX_ACTIVE_CREWS,
     },
   });
 
@@ -2858,6 +2871,20 @@ export default async function plugin(bb: BbPluginApi) {
     return crews.filter((c) => c.parentThreadId === owner);
   }
 
+  // Dispatch ceiling per captain: past it, the captain queues instead of fanning
+  // out. Returns the refusal text, or null when there is room for `adding` more.
+  async function crewCapRefusal(parentThreadId: string | undefined, adding: number): Promise<string | null> {
+    if (parentThreadId === undefined) return null;
+    const raw = (await settings.get()).maxActiveCrews;
+    const cap = Number.isFinite(raw) ? Math.max(0, Math.trunc(raw)) : DEFAULT_MAX_ACTIVE_CREWS;
+    if (cap === 0) return null;
+    const mine = (await listCrews({ owner: parentThreadId })).filter((c) => !isSecondmateRoute(c));
+    const statuses = await Promise.all(mine.map((c) => crewStatus(c)));
+    const running = statuses.filter((st) => st === "active" || st === "pending").length;
+    if (running + adding <= cap) return null;
+    return `Crew cap reached: ${running} crews running (cap ${cap}). Queue this with firstmate_queue and dispatch when a crew finishes, or ask the captain to raise the cap.`;
+  }
+
   // An owner-scoped crew view that comes back empty must never read as "the fleet is empty":
   // a captain running `crews` from a DIFFERENT thread than the one that dispatched would
   // otherwise see a bare "No crews." and mistake a scoping artifact for an empty fleet. When
@@ -2875,8 +2902,12 @@ export default async function plugin(bb: BbPluginApi) {
     );
   }
 
+  // Accept a crew id, or any thread id the crew has run on: captains often only
+  // hold the thread id from a completion ping.
   async function findCrew(id: string): Promise<Crew | undefined> {
-    return (await listCrewsAll()).find((entry) => entry.id === id);
+    const all = await listCrewsAll();
+    return all.find((entry) => entry.id === id)
+      ?? all.find((entry) => entry.threadId === id || (entry.priorThreadIds ?? []).includes(id));
   }
 
   async function findCrewByThread(threadId: string): Promise<Crew | undefined> {
@@ -3100,6 +3131,11 @@ export default async function plugin(bb: BbPluginApi) {
     if (await isCaptainThread(crew.threadId)) {
       throw new Error("Refusing to relaunch the captain thread.");
     }
+    if ((crew.relaunches ?? 0) >= MAX_CREW_RELAUNCHES) {
+      throw new Error(
+        `Crew ${crew.id} was already relaunched ${crew.relaunches} time(s). Stuck ladder: second failure means report it failed with preserved work; do not relaunch again.`,
+      );
+    }
     const envId = await threadEnv(crew.threadId);
     if (envId === null) throw new Error(`Crew ${crew.id} has no environment to reuse.`);
     const providerId = opts.providerId ?? crew.providerId ?? undefined;
@@ -3148,6 +3184,8 @@ export default async function plugin(bb: BbPluginApi) {
       providerId: providerId ?? null,
       model: model ?? null,
       reasoningLevel: reasoningLevel ?? null,
+      relaunches: (crew.relaunches ?? 0) + 1,
+      priorThreadIds: [...(crew.priorThreadIds ?? []), crew.threadId],
     };
     await mutateCrews(crews => crews.map((c) => (c.id === crew.id ? next : c)));
     if (oldThreadId !== next.threadId) {
@@ -3660,6 +3698,9 @@ export default async function plugin(bb: BbPluginApi) {
     }
     try {
       const thread = asRecord(await bb.sdk.threads.get({ threadId }));
+      if (typeof thread["projectId"] === "string") {
+        await bb.storage.kv.set(`${CAPTAIN_PROJECT_PREFIX}${threadId}`, thread["projectId"]);
+      }
       const patch: { threadId: string; title?: string; visibility?: "visible" } = { threadId };
       if (isBlankTitle(thread["title"])) {
         patch.title = await captainLabel(thread["projectId"]);
@@ -3675,6 +3716,40 @@ export default async function plugin(bb: BbPluginApi) {
       bb.log.warn(
         `deck settle failed thread=${threadId} ${error instanceof Error ? error.message : String(error)}`,
       );
+    }
+  }
+
+  // Two captains on one project collide on deploys, key rotations, and deploy
+  // holds. Name the other live captains so this one coordinates first.
+  async function otherCaptainsNote(threadId: string | undefined, signal?: AbortSignal): Promise<string> {
+    if (threadId === undefined) return "";
+    try {
+      let projectId = await bb.storage.kv.get<string>(`${CAPTAIN_PROJECT_PREFIX}${threadId}`);
+      if (typeof projectId !== "string") {
+        // A captain decked before this registry existed registers on its next digest.
+        const own = asRecord(await raceAbort(bb.sdk.threads.get({ threadId }), signal, STUCK_HOST_CALL_MS))["projectId"];
+        if (typeof own !== "string" || !(await isCaptainThread(threadId))) return "";
+        projectId = own;
+        await bb.storage.kv.set(`${CAPTAIN_PROJECT_PREFIX}${threadId}`, own);
+      }
+      const others: string[] = [];
+      for (const key of await bb.storage.kv.list(CAPTAIN_PROJECT_PREFIX)) {
+        const other = key.slice(CAPTAIN_PROJECT_PREFIX.length);
+        if (other === threadId || (await bb.storage.kv.get<string>(key)) !== projectId) continue;
+        try {
+          const row = asRecord(await raceAbort(bb.sdk.threads.get({ threadId: other }), signal, STUCK_HOST_CALL_MS));
+          if (row["archivedAt"] != null) continue;
+        } catch {
+          continue;
+        }
+        if (await isCaptainThread(other)) others.push(other);
+      }
+      if (others.length === 0) return "";
+      return others
+        .map((id) => `WARN: Another captain is active on this project: @thread:${id} — coordinate before production deploys, key rotations, or deploy holds.`)
+        .join("\n");
+    } catch {
+      return "";
     }
   }
 
@@ -4458,7 +4533,8 @@ export default async function plugin(bb: BbPluginApi) {
     const nativeBlock = realBearings === ""
       ? native
       : ["== native digest (BB KV cache / fallback) ==", native].join("\n");
-    return [realBearings, nativeBlock].filter((s) => s !== "").join("\n");
+    const others = await otherCaptainsNote(ctxString(ctx, "threadId"), signal);
+    return [others, realBearings, nativeBlock].filter((s) => s !== "").join("\n");
   }
 
   async function runFmScript(input: {
@@ -6248,6 +6324,9 @@ export default async function plugin(bb: BbPluginApi) {
       const resolvedProject =
         projectId ?? (typeof ctxRecord["projectId"] === "string" ? ctxRecord["projectId"] : undefined);
       if (resolvedProject === undefined) return toolError("No project: pass projectId.");
+      const parentThreadId = typeof ctxRecord["threadId"] === "string" ? ctxRecord["threadId"] : undefined;
+      const capped = await crewCapRefusal(parentThreadId, 1);
+      if (capped !== null) return toolError(capped);
       const current = await settings.get();
       const resolvedShape = shape ?? "ship";
       const posture = await postureOf(resolvedProject);
@@ -6355,7 +6434,9 @@ export default async function plugin(bb: BbPluginApi) {
     description: "Fleet digest: Captain's Call, Recently Landed, Ready, Underway, Charted Next. Your own crews by default; pass all=true to see every captain's crews on the host.",
     parameters: z.object({ all: z.boolean().optional().describe("Show every captain's crews host-wide, not just your own") }),
     async execute({ all }, ctx) {
-      return (await bearingsSnapshot(all === true ? undefined : ctxString(ctx, "threadId"))).text;
+      const text = (await bearingsSnapshot(all === true ? undefined : ctxString(ctx, "threadId"))).text;
+      const others = await otherCaptainsNote(ctxString(ctx, "threadId"));
+      return others === "" ? text : `${others}\n${text}`;
     },
   });
 
@@ -6534,7 +6615,7 @@ export default async function plugin(bb: BbPluginApi) {
       const replace = model !== undefined || providerId !== undefined || reasoningLevel !== undefined;
       try {
         if (!replace) {
-          await bb.sdk.threads.retry({ threadId: crew.threadId, reason: reason ?? `firstmate retry crew ${crewId}` });
+          await bb.sdk.threads.retry({ threadId: crew.threadId, reason: retryReason(reason, crew.id) });
           return `Retried crew ${crewId}`;
         }
         const next = await relaunchCrew(crew, {
@@ -6959,7 +7040,7 @@ export default async function plugin(bb: BbPluginApi) {
     parameters: z.object({
       script: z.string().min(1).max(80).describe("Stem of bin/fm-<script>.sh, e.g. spawn, peek, send, watch, bearings-snapshot"),
       args: z.array(z.string()).max(40).optional(),
-      timeoutSec: z.number().int().min(15).max(1800).optional()
+      timeoutSec: z.number().int().min(1).max(1800).optional()
         .describe("Host command budget in seconds. Wake-drain uses at least 180 seconds, including when a shorter value is supplied; prefer firstmate_wake for drain/ack."),
     }),
     async execute({ script, args, timeoutSec }, ctx) {
@@ -7508,6 +7589,8 @@ export default async function plugin(bb: BbPluginApi) {
             const sendAtRaw = flagStr(flags, "send-at");
             const sendAt = sendAtRaw === undefined ? undefined : Number(sendAtRaw);
             if (sendAt !== undefined && !Number.isFinite(sendAt)) return fail("Bad --send-at (epoch ms).");
+            const capped = await crewCapRefusal(ctxThread, tasks.length);
+            if (capped !== null) return fail(capped);
             const dispatched = [];
             for (let i = 0; i < tasks.length; i++) {
               const crew = await dispatchCrew({
@@ -7665,7 +7748,7 @@ export default async function plugin(bb: BbPluginApi) {
             if (model === undefined && providerId === undefined && reasoningLevel === undefined) {
               await bb.sdk.threads.retry({
                 threadId: crew.threadId,
-                reason: reason ?? `firstmate retry crew ${id}`,
+                reason: retryReason(reason, crew.id),
               });
               return reply({ retried: true, id }, `Retried crew ${id}`);
             }

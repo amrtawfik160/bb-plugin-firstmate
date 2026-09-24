@@ -2255,6 +2255,91 @@ test("retry with no override still resubmits the failed turn on the same thread"
   }
 });
 
+test("relaunch stops at the stuck-ladder cap and resolves a replaced thread id", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () =>
+      makeThreadResponse({ id: "thr_crew", status: "error", environmentId: "env_wt" }),
+    );
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+    host.harness.sdk.stub("threads.stop", async () => ({}));
+    host.harness.sdk.stub("threads.archive", async () => ({}));
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew2" }));
+    const first = await host.harness.behavior.runCli(["retry", "c1", "--model", "m1"]);
+    assert.equal(first.exitCode, 0, first.stderr);
+    // The captain only holds the old thread id from a completion ping.
+    const second = await host.harness.behavior.runCli(["retry", "thr_crew", "--model", "m2"]);
+    assert.notEqual(second.exitCode, 0, second.stdout);
+    assert.match(second.stderr, /second failure means report it failed/);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("retry shortens a long reason instead of failing on BB's 200-char limit", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () =>
+      makeThreadResponse({ id: "thr_crew", status: "error", environmentId: "env_wt" }),
+    );
+    host.harness.sdk.stub("threads.retry", async () => ({}));
+    const result = await host.harness.behavior.runCli(["retry", "c1", "--reason", "x".repeat(500)]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    const args = host.harness.sdk.callsTo("threads.retry")[0]![0] as { reason?: string };
+    assert.ok((args.reason ?? "").length <= 200, `reason length ${args.reason?.length}`);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("dispatch refuses past the running-crew cap", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("crews", [1, 2, 3, 4, 5].map((n) => shipRow(`c${n}`, `thr_c${n}`, "thr_cap")));
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async (input: unknown) =>
+      makeThreadResponse({ id: String((input as { threadId?: string }).threadId), status: "active" }),
+    );
+    const result = await host.harness.behavior.runCli(
+      ["dispatch", "--project", "proj_1", "--", "fix flaky login"],
+      { projectId: "proj_1", threadId: "thr_cap" },
+    );
+    assert.notEqual(result.exitCode, 0, result.stdout);
+    assert.match(result.stderr, /Crew cap reached: 5 crews running \(cap 5\)/);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("bearings names another live captain on the same project", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("captain-project:thr_other", "proj_1");
+    await host.bb.storage.kv.set("captain-project:thr_elsewhere", "proj_2");
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async (input: unknown) =>
+      makeThreadResponse({ id: String((input as { threadId?: string }).threadId), status: "idle", projectId: "proj_1" }),
+    );
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
+    const bearings = host.harness.inspection.registrations.agentTools.find((tool) => tool.name === "firstmate_bearings");
+    assert.ok(bearings);
+    const result = await bearings.execute({}, { threadId: "thr_cap", projectId: "proj_1" } as never);
+    const text = typeof result === "string"
+      ? result
+      : result.content.map((item) => item.type === "text" ? item.text : "").join("\n");
+    assert.match(text, /Another captain is active on this project: @thread:thr_other/);
+    assert.doesNotMatch(text, /thr_elsewhere/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("guide reports computed toolbelt counts when known", async () => {
   const host = createFakePluginHost({
     pluginId: "firstmate",

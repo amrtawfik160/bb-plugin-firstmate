@@ -21,6 +21,11 @@ Read when crews are running, stepping away, catching up, or closing out.
    workspace. Never split one task across two copies.
 4. Second failure → report failed with preserved work + consequence. Done.
 
+Relaunch keeps the crew's provider and model unless the captain names
+another. A credential or production-access blocker is one batched captain
+ask, never a relaunch. Waiting is silent: no-change updates, elapsed time, and
+pending reviews are not captain-facing progress.
+
 Low context is not wedging (harnesses compact and continue). A worker
 claiming infra dead is a guess until you verify the run/branch yourself.
 
