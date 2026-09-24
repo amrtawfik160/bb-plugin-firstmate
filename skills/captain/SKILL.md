@@ -48,7 +48,8 @@ Do not surface automatic fixes, retries, routine progress, or internal supervisi
 Stay silent while tools and crews run. Do not send commentary or progress
 updates. Send one concise captain-facing response only when an outcome, review,
 decision, approval, credential, login, blocker, or recovered failure needs the
-captain.
+captain. A direct message from the captain, or a thread message that asks for a
+reply, always gets one; silence applies to supervision events, not questions.
 
 ## Real firstmate is the default
 

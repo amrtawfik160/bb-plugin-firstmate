@@ -3877,20 +3877,31 @@ export default async function plugin(bb: BbPluginApi) {
   // this, an external merge leaves the crew stale in both the KV cache and the
   // real state/<id>.meta ledger. Only idle/error crews are checked — an active
   // crew's PR is not landed yet — so this adds no PR reads beyond bearings.
+  // A refused native teardown (e.g. uncommitted work in the crew worktree) keeps
+  // the crew. One refusal must not fail the whole digest/fleet view, and the
+  // slow teardown is not re-run on every poll.
+  const landedRetireBackoff = new Map<string, number>();
+  const LANDED_RETIRE_BACKOFF_MS = 10 * 60_000;
+
   async function reconcileExternallyLanded(crews: Crew[]): Promise<Set<string>> {
     const retired = new Set<string>();
     for (const crew of crews) {
       if (isSecondmateRoute(crew)) continue;
+      if ((landedRetireBackoff.get(crew.id) ?? 0) > Date.now()) continue;
       const status = await crewStatus(crew);
       if (status !== "idle" && status !== "error") continue;
       const pr = await prForCrew(crew);
       if (!pr.available) continue;
-      if (pr.state === "merged") {
-        await retireLanded(crew, "merged externally", pr.url);
+      if (pr.state !== "merged" && pr.state !== "closed") continue;
+      try {
+        await retireLanded(crew, pr.state === "merged" ? "merged externally" : "PR closed externally", pr.url);
         retired.add(crew.id);
-      } else if (pr.state === "closed") {
-        await retireLanded(crew, "PR closed externally", pr.url);
-        retired.add(crew.id);
+        landedRetireBackoff.delete(crew.id);
+      } catch (error) {
+        landedRetireBackoff.set(crew.id, Date.now() + LANDED_RETIRE_BACKOFF_MS);
+        bb.log.warn(
+          `landed crew retire refused crew=${crew.id} pr=${pr.url} (crew kept): ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
     }
     return retired;
