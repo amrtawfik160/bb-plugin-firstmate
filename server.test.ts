@@ -8869,3 +8869,25 @@ test("a scheduled WAITING resume is dropped once the crew stopped waiting (stopp
     await host.harness.lifecycle.dispose();
   }
 });
+
+test("BB's child ping does not replace the doorbell while the captain is rate-limited: the wake is held", async () => {
+  const host = ownerHost({ notifyOwner: "real" });
+  await plugin(host.bb);
+  try {
+    stubRoutedHost(host, () => ({ code: 0 }));
+    captainAndCrewThreads(host, {}, { parentThreadId: "thr_cap", originKind: null });
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.events.list", async ({ threadId }: { threadId: string }) =>
+      threadId === "thr_cap"
+        ? [{ type: "provider/rateLimits/updated", createdAt: Date.now() - 1_000, data: { rateLimits: { status: "blocked", windows: [{ status: "blocked", resetsAtMs: Date.now() + 3_600_000 }] } } }]
+        : []);
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await emitIdle(host, "DONE: shipped the branch");
+    assert.equal(sendCalls(host).filter((s) => s.threadId === "thr_cap").length, 0, "no wake into a limited captain");
+    const held = await host.bb.storage.kv.get<{ lines: string[] }>("captain-wake-hold:thr_cap");
+    assert.equal(held?.lines.length, 1, "the report is held for release when the limit resets");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});

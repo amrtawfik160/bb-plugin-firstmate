@@ -2429,7 +2429,9 @@ export default async function plugin(bb: BbPluginApi) {
         captainThreadId: parentThreadId,
         crewParentThreadId: typeof crewThread["parentThreadId"] === "string" ? crewThread["parentThreadId"] : null,
         crewOriginKind: typeof crewThread["originKind"] === "string" ? crewThread["originKind"] : null,
-      })) {
+      // BB's ping into a rate-limited or errored captain fails and is gone; only a held
+      // wake brings the report back once the captain is available again.
+      }) && !(await captainHoldState(parentThreadId, signal)).hold) {
         bb.log.info(`doorbell skipped crew=${crew.id} captain=${parentThreadId}: BB's own child ${kind === "error" ? "failed" : "completed"} message is the wake; durable wake kept`);
         await publishFleet();
         return;
