@@ -3306,8 +3306,12 @@ export default async function plugin(bb: BbPluginApi) {
           (r): r is { threadId: string; projectId: string; parentThreadId: unknown } =>
             typeof r.threadId === "string" && typeof r.projectId === "string" && !known.has(r.threadId),
         );
+      // A retired thread (removeCrew, or read-through below) is never recovered: without
+      // this check read-through dropped and recovery re-added the same page every call.
+      const retiredFlags = await Promise.all(missing.map((r) => bb.storage.kv.get(`crew-retired:${r.threadId}`)));
+      const candidates = missing.filter((_, i) => retiredFlags[i] !== true);
       const recovered = await Promise.all(
-        missing.map(async (row): Promise<Crew | null> => {
+        candidates.map(async (row): Promise<Crew | null> => {
           try {
             const meta = asRecord(
               await raceAbort(
@@ -3392,8 +3396,15 @@ export default async function plugin(bb: BbPluginApi) {
                 }
               }
               const removed = crews.filter(c => !kept.includes(c));
-              return mutateCrews(current => current.filter(c => !removed.some(gone =>
-                gone.id === c.id && gone.threadId === c.threadId && c.metaWritten !== false)));
+              return mutateCrews(async current => {
+                const next = current.filter(c => !removed.some(gone =>
+                  gone.id === c.id && gone.threadId === c.threadId && c.metaWritten !== false));
+                // Tombstone like removeCrew so the recovery sweep does not re-add it.
+                for (const gone of current) {
+                  if (!next.includes(gone) && gone.threadId !== "") await bb.storage.kv.set(`crew-retired:${gone.threadId}`, true);
+                }
+                return next;
+              });
             }
           }
         }

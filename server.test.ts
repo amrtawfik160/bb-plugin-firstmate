@@ -8810,3 +8810,29 @@ test("queue dispatch obeys the running-crew cap", async () => {
     await host.harness.lifecycle.dispose();
   }
 });
+
+test("read-through: a dropped crew is not re-recovered and re-dropped on every call", async () => {
+  const host = ownerHost({ readThrough: true });
+  await plugin(host.bb);
+  try {
+    // The thread still carries crew metadata (the recovery sweep sees it), but
+    // native state has no meta for it: it is torn down.
+    host.harness.sdk.stub("threads.list", async () => [{ id: "thr_old", projectId: "proj_1", parentThreadId: "thr_cap" }]);
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ crew: "true", crewId: "old1" }));
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_old", status: "idle", environmentId: null }));
+    host.harness.sdk.stub("threads.output", async () => ({ output: "" }));
+    host.harness.sdk.stub("terminals.create", async () => ({ id: "term_1" }));
+    host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+    host.harness.sdk.stub("terminals.close", async () => ({}));
+    host.harness.sdk.stub("terminals.output", async () => hostRcPayload("", 0));
+    for (let i = 0; i < 3; i++) {
+      const list = await host.harness.behavior.runCli(["crews"], { projectId: "proj_1" });
+      assert.equal(list.exitCode, 0, list.stderr);
+    }
+    assert.deepEqual(await host.bb.storage.kv.get("crews"), []);
+    const drops = host.harness.inspection.logEntries.filter((l) => /read-through: crew old1 dropped/.test(l.message));
+    assert.equal(drops.length, 1, "dropped once, not once per call");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
