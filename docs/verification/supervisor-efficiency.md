@@ -53,3 +53,34 @@ BB core completion messages bypass the plugin dispatch hook. This change batches
 plugin-owned durable wakes only. Full notification ownership, event identity and
 provider-independent lifecycle gating require BB SDK support; see
 [native parity](../native-parity.md). The opt-in native supervision host stays off.
+
+## Executed proofs and regression mutations
+
+- `scripts/live-bb-activity-check.mjs`: actual BB worker/tool stream, native
+  watcher `.hash` and `.progress` evidence, healthy work past both accelerated
+  eight-second bounds, then genuine silence producing a wedge alarm; native
+  steering receipt and accepted queue-row reuse. Disposable worker archived.
+- `scripts/live-mirror-check.mjs`: real ship/scout spawn and cleanup; native
+  local landing and bounded/unbounded secondmate relaunch routing/refusal.
+- `scripts/wake-receipt.test.ts`: actual native wake read/ack in a disposable
+  home, plus fault scenarios for status-only delivery, partial output, restart,
+  acknowledgement races and crashes. An external action is marked `acting`
+  before execution; interrupted action results require reconciliation.
+- `scripts/supervisor-mutation-check.mjs`: disabling batching, scope checking,
+  typed urgency, cancellation, callback isolation or pre-action journaling
+  independently fails its named regression test.
+- `scripts/bb-activity-mutation-check.mjs`: restoring stale text-only capture,
+  pending-composer mapping, unchecked send receipts, status-only busy mapping or
+  removing event-time progress publication independently fails its regression.
+- Snapshot-pin validation, old local-merge assignment order and pristine
+  secondmate relaunch routing are independently rejected by upstream proofs.
+
+The independent Standards and Spec reviews found callback deadlock, uncancellable
+batch delivery, an uncertain-action crash window, incorrectly batched input
+requests and missing pending-interaction wait evidence. Each finding received a
+focused regression. Review fixes are checked again before publishing the branch.
+
+The installed plugin and live captain homes are separate from this branch.
+Roll out the audited native commit and rebuilt mirror together, preserve state,
+and refresh the supervisor contract at a safe turn boundary. Do not advertise
+whole-fleet savings before comparing post-rollout workload and usage coverage.

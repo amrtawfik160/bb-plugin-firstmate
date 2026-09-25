@@ -7574,7 +7574,7 @@ export default async function plugin(bb: BbPluginApi) {
     bb.agents.registerTool({
       ...tool,
       parameters: tool.name === "firstmate_fm" ? (tool.parameters as unknown as z.ZodObject) : (tool.parameters as unknown as z.ZodObject).extend({
-        handledWake: z.string().min(1).optional().describe("Receipt id, only on your final successful action after handling the whole wake batch. Never repeat an action to retry acknowledgement."),
+        handledWake: z.string().min(1).optional().describe("Receipt ID; final successful action only."),
       }),
       presentation: { ...tool.presentation, suppress: true },
       async execute(params, ctx) {

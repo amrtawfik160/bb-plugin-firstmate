@@ -49,6 +49,8 @@ wedge_timer_check bb:thr_waitproof "$STATE/.stale-since-bb_thr_waitproof" 'non-t
   console.log("PASS pending interaction follows native bounded wait deferral");
   assert.match(run({ ...base, interactionCount: 0 }), /possible wedge/);
   console.log("PASS cleared interaction resumes native wedge alarm at next threshold");
+  assert.match(run({ ...base, status: "error" }), /possible wedge/);
+  console.log("PASS pending input on a failed thread never hides a stall");
   const watcher = join(home, "bin-bb/fm-watch.sh");
   const fixed = readFileSync(watcher, "utf8");
   writeFileSync(watcher, readFileSync(join(home, "bin/fm-watch.sh"), "utf8"));

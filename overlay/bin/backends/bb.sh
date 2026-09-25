@@ -491,7 +491,10 @@ try:
     count = data.get("interactionCount")
     if type(count) is not int or count < 0:
         raise ValueError("invalid interaction count")
-    sys.exit(0 if count > 0 else 1)
+    status = data.get("status")
+    if status not in ("active", "running", "working", "idle", "error", "failed", "stopped", "pending", "queued", "starting", "stopping"):
+        raise ValueError("invalid execution status")
+    sys.exit(0 if count > 0 and status in ("active", "running", "working", "idle") else 1)
 except Exception as exc:
     sys.stderr.write("error: invalid BB pending-input snapshot: %s; native wedge checks continue\n" % exc)
     sys.exit(1)
