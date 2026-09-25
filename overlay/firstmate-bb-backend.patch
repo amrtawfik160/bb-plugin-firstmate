@@ -1,7 +1,8 @@
 diff --git a/bin/fm-backend.sh b/bin/fm-backend.sh
+index ac7f73aa..23faa319 100644
 --- a/bin/fm-backend.sh
 +++ b/bin/fm-backend.sh
-@@ -66,9 +66,11 @@
+@@ -66,9 +66,11 @@ FM_BACKEND_CONFIG_DIR="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
  # spawn-capable; unlike tmux/herdr/zellij it is also the worktree provider.
  # cmux is EXPERIMENTAL and spawn-capable, session-provider-only like
  # herdr/zellij - verified against the real 0.64.17 binary (docs/cmux-backend.md).
@@ -12,24 +13,24 @@ diff --git a/bin/fm-backend.sh b/bin/fm-backend.sh
 -FM_BACKEND_SPAWN="tmux herdr zellij orca cmux"
 +FM_BACKEND_KNOWN="tmux herdr zellij orca cmux bb"
 +FM_BACKEND_SPAWN="tmux herdr zellij orca cmux bb"
- 
+
  # fm_backend_list_contains: whitespace-delimited membership without relying on
  # shell word splitting. fm-backend.sh is normally sourced by bash scripts, but
-@@ -86,6 +88,13 @@
- 
- fm_backend_is_known() {  # <name>
+@@ -88,6 +90,13 @@ fm_backend_is_known() {  # <name>
    fm_backend_list_contains "$FM_BACKEND_KNOWN" "$1"
-+}
-+
+ }
+
 +fm_backend_owns_worktrees() {  # <backend>
 +  case "$1" in
 +    orca|bb) return 0 ;;
 +    *) return 1 ;;
 +  esac
- }
-
++}
++
  # fm_backend_detect: detect the runtime firstmate itself is CURRENTLY executing
-@@ -312,6 +321,7 @@
+ # inside, from verified environment markers (mirrors bin/fm-harness.sh's
+ # env-marker detection layer for harnesses). Prints the detected backend name
+@@ -312,6 +321,7 @@ fm_backend_required_tools() {  # <backend>
      zellij) printf '%s' 'zellij jq treehouse' ;;
      cmux)   printf '%s' 'cmux jq treehouse' ;;
      orca)   printf '%s' 'orca' ;;
@@ -37,7 +38,7 @@ diff --git a/bin/fm-backend.sh b/bin/fm-backend.sh
      *) return 1 ;;
    esac
  }
-@@ -422,8 +432,18 @@
+@@ -422,8 +432,18 @@ fm_backend_validate_task_endpoint() {  # <meta-file> <task-id>
      return 1
    }
    worktree=$(fm_backend_meta_exact_value "$meta" worktree) || {
@@ -58,11 +59,10 @@ diff --git a/bin/fm-backend.sh b/bin/fm-backend.sh
    }
    project=$(fm_backend_meta_exact_value "$meta" project) || {
      echo "REFUSED: task $id has a missing, empty, or ambiguous project identity; preserving task state." >&2
-@@ -543,6 +553,19 @@
-         echo "REFUSED: cmux endpoint metadata for task $id is malformed or inconsistent; preserving task state." >&2
+@@ -544,6 +564,19 @@ fm_backend_validate_task_endpoint() {  # <meta-file> <task-id>
          return 1
        fi
-+      ;;
+       ;;
 +    bb)
 +      [ "$binding" = "$id" ] || {
 +        echo "REFUSED: BB endpoint metadata for task $id lacks an exact task binding; preserving task state." >&2
@@ -75,24 +75,25 @@ diff --git a/bin/fm-backend.sh b/bin/fm-backend.sh
 +          return 1
 +          ;;
 +      esac
-       ;;
++      ;;
    esac
    # shellcheck disable=SC2034 # Output globals are consumed by sourcing callers.
-@@ -656,6 +679,13 @@
-         # shellcheck source=/dev/null
-         . "$adapter" || return 1
+   FM_BACKEND_VALIDATED_BACKEND=$backend
+@@ -658,6 +691,13 @@ fm_backend_source() {  # <name>
          _FM_BACKEND_CMUX_SOURCED=1
-+      fi
-+      ;;
+       fi
+       ;;
 +    bb)
 +      if [ -z "${_FM_BACKEND_BB_SOURCED:-}" ]; then
 +        # shellcheck source=/dev/null
 +        . "$FM_BACKEND_LIB_DIR/backends/bb.sh" || return 1
 +        _FM_BACKEND_BB_SOURCED=1
-       fi
-       ;;
++      fi
++      ;;
    esac
-@@ -729,6 +759,7 @@
+ }
+
+@@ -729,6 +769,7 @@ fm_backend_capture() {  # <backend> <target> <lines> [expected-label]
      zellij) fm_backend_zellij_capture "$@" ;;
      orca) fm_backend_orca_capture "$@" ;;
      cmux) fm_backend_cmux_capture "$@" ;;
@@ -100,7 +101,7 @@ diff --git a/bin/fm-backend.sh b/bin/fm-backend.sh
      *) echo "error: no capture implementation for backend '$backend'" >&2; return 1 ;;
    esac
  }
-@@ -774,6 +805,7 @@
+@@ -774,6 +815,7 @@ fm_backend_send_key() {  # <backend> <target> <key> [expected-label]
      zellij) fm_backend_zellij_send_key "$@" ;;
      orca) fm_backend_orca_send_key "$@" ;;
      cmux) fm_backend_cmux_send_key "$@" ;;
@@ -108,7 +109,7 @@ diff --git a/bin/fm-backend.sh b/bin/fm-backend.sh
      *) echo "error: no send-key implementation for backend '$backend'" >&2; return 1 ;;
    esac
  }
-@@ -791,6 +823,7 @@
+@@ -791,6 +833,7 @@ fm_backend_send_text_submit() {  # <backend> <target> <text> <retries> <enter-sl
      zellij) fm_backend_zellij_send_text_submit "$@" ;;
      orca) fm_backend_orca_send_text_submit "$@" ;;
      cmux) fm_backend_cmux_send_text_submit "$@" ;;
@@ -116,7 +117,7 @@ diff --git a/bin/fm-backend.sh b/bin/fm-backend.sh
      *) echo "error: no send-text implementation for backend '$backend'" >&2; return 1 ;;
    esac
  }
-@@ -818,6 +851,7 @@
+@@ -818,6 +861,7 @@ fm_backend_kill() {  # <backend> <target>
      zellij) fm_backend_zellij_kill "$@" ;;
      orca) fm_backend_orca_kill "$@" ;;
      cmux) fm_backend_cmux_kill "$@" ;;
@@ -124,7 +125,7 @@ diff --git a/bin/fm-backend.sh b/bin/fm-backend.sh
      *) echo "error: no kill implementation for backend '$backend'" >&2; return 1 ;;
    esac
  }
-@@ -828,6 +862,7 @@
+@@ -828,6 +872,7 @@ fm_backend_remove_worktree() {  # <backend> <worktree-id>
    fm_backend_source "$backend" || return 1
    case "$backend" in
      orca) fm_backend_orca_remove_worktree "$@" ;;
@@ -132,7 +133,7 @@ diff --git a/bin/fm-backend.sh b/bin/fm-backend.sh
      *) echo "error: backend '$backend' does not own task worktrees" >&2; return 1 ;;
    esac
  }
-@@ -838,6 +873,7 @@
+@@ -838,6 +883,7 @@ fm_backend_worktree_path() {  # <backend> <worktree-id>
    fm_backend_source "$backend" || return 1
    case "$backend" in
      orca) fm_backend_orca_worktree_path "$@" ;;
@@ -140,7 +141,7 @@ diff --git a/bin/fm-backend.sh b/bin/fm-backend.sh
      *) echo "error: backend '$backend' does not own task worktrees" >&2; return 1 ;;
    esac
  }
-@@ -855,6 +891,7 @@
+@@ -855,6 +901,7 @@ fm_backend_busy_state() {  # <backend> <target>
    fm_backend_source "$backend" || { printf 'unknown'; return 0; }
    case "$backend" in
      herdr) fm_backend_herdr_busy_state "$@" ;;
@@ -148,7 +149,7 @@ diff --git a/bin/fm-backend.sh b/bin/fm-backend.sh
      *) printf 'unknown' ;;
    esac
  }
-@@ -881,6 +918,7 @@
+@@ -881,6 +928,7 @@ fm_backend_composer_state() {  # <backend> <target> [expected-label] -> empty|pe
      orca) fm_backend_orca_composer_state "$@" ;;
      cmux) fm_backend_cmux_composer_state "$@" ;;
      zellij) fm_backend_zellij_composer_state "$@" ;;
@@ -156,18 +157,18 @@ diff --git a/bin/fm-backend.sh b/bin/fm-backend.sh
      *) printf 'unknown' ;;
    esac
  }
-@@ -929,6 +967,10 @@
-     cmux)
+@@ -930,6 +978,10 @@ fm_backend_target_exists() {  # <backend> <target> [expected-label]
        fm_backend_source cmux || return 1
        fm_backend_cmux_target_ready "$target" "$expected_label"
-+      ;;
+       ;;
 +    bb)
 +      fm_backend_source bb || return 1
 +      fm_backend_bb_target_exists "$target"
-       ;;
++      ;;
      *)
        return 1
-@@ -962,6 +1004,7 @@
+       ;;
+@@ -962,6 +1014,7 @@ fm_backend_agent_state() {  # <backend> <target>
    case "$backend" in
      tmux) fm_backend_tmux_agent_state "$target" ;;
      herdr) fm_backend_herdr_agent_state "$target" ;;
@@ -175,7 +176,7 @@ diff --git a/bin/fm-backend.sh b/bin/fm-backend.sh
      *) printf 'unverified' ;;
    esac
  }
-@@ -984,15 +1027,15 @@
+@@ -984,15 +1037,15 @@ fm_backend_agent_alive() {  # <backend> <target>
  # and for those backends replaces its blind `sleep POLL` with a bounded wait on
  # fm_backend_wait_transition. Every push-capable backend reuses the shared
  # normalized-transition shape and policy table (bin/fm-transition-lib.sh); today
@@ -185,7 +186,7 @@ diff --git a/bin/fm-backend.sh b/bin/fm-backend.sh
 +# pane.agent_status_changed push escalation"; docs/bb-backend.md). A backend with no native push
  # reports has-push false and returns 2 from the dispatchers below, so the
  # watcher falls back to its poll loop - the permanent fail-closed backstop.
- 
+
  # fm_backend_has_push: 0 if <backend> exposes a native transition push stream.
  fm_backend_has_push() {  # <backend>
    case "$1" in
@@ -194,7 +195,7 @@ diff --git a/bin/fm-backend.sh b/bin/fm-backend.sh
      *) return 1 ;;
    esac
  }
-@@ -1008,6 +1051,7 @@
+@@ -1008,6 +1061,7 @@ fm_backend_events_capable() {  # <backend> <session>
    fm_backend_source "$backend" || return 1
    case "$backend" in
      herdr) fm_backend_herdr_events_capable "$@" ;;
@@ -202,7 +203,7 @@ diff --git a/bin/fm-backend.sh b/bin/fm-backend.sh
      *) return 1 ;;
    esac
  }
-@@ -1025,6 +1069,7 @@
+@@ -1025,6 +1079,7 @@ fm_backend_wait_transition() {  # <backend> <session> <timeout_secs> <state_dir>
    fm_backend_source "$backend" || return 2
    case "$backend" in
      herdr) fm_backend_herdr_wait_transition "$@" ;;
@@ -210,7 +211,7 @@ diff --git a/bin/fm-backend.sh b/bin/fm-backend.sh
      *) return 2 ;;
    esac
  }
-@@ -1036,6 +1081,7 @@
+@@ -1036,6 +1091,7 @@ fm_backend_commit_transition() {  # <backend> <state_dir> <session> <record>
    fm_backend_source "$backend" || return 1
    case "$backend" in
      herdr) fm_backend_herdr_commit_transition "$@" ;;
@@ -218,7 +219,7 @@ diff --git a/bin/fm-backend.sh b/bin/fm-backend.sh
      *) return 1 ;;
    esac
  }
-@@ -1047,6 +1093,7 @@
+@@ -1047,6 +1103,7 @@ fm_backend_clear_transition() {  # <backend> <state_dir> <window>
    fm_backend_source "$backend" || return 1
    case "$backend" in
      herdr) fm_backend_herdr_clear_transition "$@" ;;
@@ -226,10 +227,42 @@ diff --git a/bin/fm-backend.sh b/bin/fm-backend.sh
      *) return 0 ;;
    esac
  }
+diff --git a/bin/fm-busy-lib.sh b/bin/fm-busy-lib.sh
+index 6507376d..dad809e3 100755
+--- a/bin/fm-busy-lib.sh
++++ b/bin/fm-busy-lib.sh
+@@ -45,7 +45,7 @@
+ #                    unknown invalidation fm-control writes after a Devin interrupt
+ #   fm-recovery      a documented recovery reset after relaunch
+ # Classifier-only sources (never written into a record):
+-#   endpoint-gone, herdr-native, grok-regex, rovo-regex, agy-regex, muse-session-log,
++#   endpoint-gone, herdr-native, bb-native, grok-regex, rovo-regex, agy-regex, muse-session-log,
+ #   cursor-transcript, missing, malformed, gen-mismatch, source-mismatch,
+ #   kimi-unverified, codex-unverified, capture-failed, no-target, launch-prompt
+ #
+@@ -1078,11 +1078,14 @@ fm_busy_classify() {  # <backend> <target> <harness> <id> <state-dir> [tail40]
+   # No record at all. A native herdr busy verdict is semantic enough to trust
+   # for BUSY (streaming means a turn is running); native idle is narrower
+   # than turn state (a long foreground tool call reads idle) and stays
+-  # unknown here.
+-  if [ "$backend" = herdr ] && command -v fm_backend_busy_state >/dev/null 2>&1; then
++  # unknown here. A BB thread status is the same kind of semantic verdict: an
++  # active thread is a turn in flight, including a long tool call, so bb is
++  # trusted for BUSY too. Without it a busy BB crew read unknown and fm-watch
++  # paged a false stale: after two unchanged polls.
++  if { [ "$backend" = herdr ] || [ "$backend" = bb ]; } && command -v fm_backend_busy_state >/dev/null 2>&1; then
+     native=$(fm_backend_busy_state "$backend" "$target" 2>/dev/null || true)
+     if [ "$native" = busy ]; then
+-      printf 'busy herdr-native'
++      printf 'busy %s-native' "$backend"
+       return 0
+     fi
+   fi
 diff --git a/bin/fm-spawn.sh b/bin/fm-spawn.sh
+index 2147e022..3e0baae9 100755
 --- a/bin/fm-spawn.sh
 +++ b/bin/fm-spawn.sh
-@@ -76,11 +76,11 @@
+@@ -90,11 +90,11 @@
  #   docs/cmux-backend.md),
  #   then tmux.
  #   Spawn-capable backends are the reference tmux adapter, verified herdr
@@ -244,7 +277,7 @@ diff --git a/bin/fm-spawn.sh b/bin/fm-spawn.sh
  #   codex-app is not a known backend yet; docs/codex-app-backend.md owns that
  #   blocked backend contract. Default tmux spawns do not write backend= to meta;
  #   absent backend= means tmux. cmux does not support --secondmate spawns yet.
-@@ -1091,6 +1091,8 @@
+@@ -1141,6 +1141,8 @@ BACKEND=
  ORCA_ABORT_CLEANUP=0
  ORCA_WORKTREE_ID=
  ORCA_TERMINAL=
@@ -253,20 +286,20 @@ diff --git a/bin/fm-spawn.sh b/bin/fm-spawn.sh
  HERDR_PROJECTION_ABORT_CLEANUP=0
  HERDR_PROJECTION_ABORT_SESSION=
  HERDR_PROJECTION_ABORT_TASK_PANE=
-@@ -1190,6 +1192,12 @@
-   if [ "$HERDR_PRESENTATION_ORDER_LOCK_HELD" = 1 ]; then
+@@ -1241,6 +1243,12 @@ spawn_abort_cleanup() {
      HERDR_PRESENTATION_ORDER_LOCK_HELD=0
      fm_lock_release "$HERDR_PRESENTATION_ORDER_LOCK" || true
-+  fi
+   fi
 +  if [ "$BB_ABORT_CLEANUP" = 1 ]; then
 +    BB_ABORT_CLEANUP=0
 +    if [ -n "${BB_THREAD_ID:-}" ]; then
 +      fm_backend_kill bb "$BB_THREAD_ID" 2>/dev/null || true
 +    fi
-   fi
++  fi
    if [ "$ORCA_ABORT_CLEANUP" = 1 ]; then
      ORCA_ABORT_CLEANUP=0
-@@ -1376,12 +1384,12 @@
+     if [ -n "${ORCA_TERMINAL:-}" ]; then
+@@ -1428,12 +1436,12 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
        rc=2
        continue
      elif [ "$KIND" = scout ]; then
@@ -281,17 +314,17 @@ diff --git a/bin/fm-spawn.sh b/bin/fm-spawn.sh
          echo "batch: FAILED to spawn ${pair%%=*} (${pair#*=})" >&2
          rc=1
        fi
-@@ -1550,6 +1558,9 @@
-   fi
+@@ -1610,6 +1618,9 @@ if [ "$RELAUNCH" -eq 0 ]; then
    if [ "$BACKEND" = orca ]; then
      fm_backend_orca_runtime_check || exit 1
-+  fi
+   fi
 +  if [ "$BACKEND" = bb ]; then
 +    fm_backend_bb_runtime_check || exit 1
-   fi
++  fi
  fi
  SPAWN_TASK_LOCK="$STATE/.spawn-$ID.lock"
-@@ -2069,6 +2080,7 @@
+ if ! fm_lock_try_acquire "$SPAWN_TASK_LOCK"; then
+@@ -2136,6 +2147,7 @@ launch_template() {
    # when a supported effort is requested, since a second --config-override
    # would silently discard the first (confirmed live).
    rovo) printf '%s' 'env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT -u FM_PI_HARNESS __ROVOBIN__ run --yolo __MODELFLAG____ROVOCONFIGOVERRIDE__' ;;
@@ -299,18 +332,18 @@ diff --git a/bin/fm-spawn.sh b/bin/fm-spawn.sh
    *) return 1 ;;
    esac
  }
-@@ -2222,6 +2234,10 @@
-       esac
+@@ -2290,6 +2302,10 @@ if [ "$KIND" = secondmate ] && [ -z "$ARG3" ]; then
      fi
    fi
-+fi
+ fi
 +if [ "$BACKEND" = bb ]; then
 +  HARNESS=bb
 +  LAUNCH=:
- fi
++fi
  # Ultra is an explicit native capability, never a Pi thinking-level alias.
  # Validate the fully resolved profile before worktree or endpoint provisioning.
-@@ -2727,7 +2743,7 @@
+ if [ "$EFFORT" = ultra ]; then
+@@ -2812,7 +2828,7 @@ else
    WT=""
    BRIEF="$DATA/$ID/brief.md"
  fi
@@ -319,7 +352,7 @@ diff --git a/bin/fm-spawn.sh b/bin/fm-spawn.sh
    SPAWN_TREEHOUSE_PROJECT_LOCK=$(fm_treehouse_project_lock_path "$PROJ_ABS") || {
      echo "error: could not resolve the shared Treehouse project lock for $PROJ_ABS" >&2
      exit 1
-@@ -3485,6 +3501,24 @@
+@@ -3633,6 +3649,24 @@ EOF
      fi
      T="$ORCA_TERMINAL"
      ;;
@@ -344,7 +377,7 @@ diff --git a/bin/fm-spawn.sh b/bin/fm-spawn.sh
    esac
  fi
  if [ "$KIND" = secondmate ]; then
-@@ -3505,6 +3539,7 @@
+@@ -3653,6 +3687,7 @@ spawn_send_text_line() { # <target> <text>
    zellij) fm_backend_zellij_send_text_line "$1" "$2" "$W" ;;
    orca) fm_backend_orca_send_text_line "$1" "$2" ;;
    cmux) fm_backend_cmux_send_text_line "$1" "$2" "$W" ;;
@@ -352,7 +385,7 @@ diff --git a/bin/fm-spawn.sh b/bin/fm-spawn.sh
    esac
  }
  spawn_current_path() { # <target>
-@@ -3513,6 +3548,7 @@
+@@ -3661,6 +3696,7 @@ spawn_current_path() { # <target>
    herdr) fm_backend_herdr_current_path "$1" ;;
    zellij) fm_backend_zellij_current_path "$1" "$W" ;;
    cmux) fm_backend_cmux_current_path "$1" "$W" ;;
@@ -360,7 +393,7 @@ diff --git a/bin/fm-spawn.sh b/bin/fm-spawn.sh
    esac
  }
  spawn_send_literal() { # <target> <text>
-@@ -3522,6 +3558,7 @@
+@@ -3670,6 +3706,7 @@ spawn_send_literal() { # <target> <text>
    zellij) fm_backend_zellij_send_literal "$1" "$2" "$W" ;;
    orca) fm_backend_orca_send_literal "$1" "$2" ;;
    cmux) fm_backend_cmux_send_literal "$1" "$2" "$W" ;;
@@ -368,15 +401,15 @@ diff --git a/bin/fm-spawn.sh b/bin/fm-spawn.sh
    esac
  }
  spawn_send_key() { # <target> <key>
-@@ -3531,6 +3568,7 @@
+@@ -3679,6 +3716,7 @@ spawn_send_key() { # <target> <key>
    zellij) fm_backend_zellij_send_key "$1" "$2" "$W" ;;
    orca) fm_backend_orca_send_key "$1" "$2" ;;
    cmux) fm_backend_cmux_send_key "$1" "$2" "$W" ;;
 +  bb) fm_backend_bb_send_key "$1" "$2" ;;
    esac
  }
- 
-@@ -3767,6 +3805,10 @@
+
+@@ -3915,6 +3953,10 @@ rovo_endpoint_cleanup() {
      fm_backend_kill orca "$T" 2>/dev/null || true
      return 0
    fi
@@ -387,33 +420,33 @@ diff --git a/bin/fm-spawn.sh b/bin/fm-spawn.sh
    local tab_id=
    [ "$BACKEND" = zellij ] && tab_id=$ZELLIJ_TAB_ID
    fm_backend_kill "$BACKEND" "$T" "$tab_id" "fm-$ID" 2>/dev/null || true
-@@ -3861,7 +3903,7 @@
+@@ -4009,7 +4051,7 @@ if [ "$RELAUNCH" -eq 1 ]; then
      fi
    fi
    [ "$KIND" = secondmate ] || validate_spawn_worktree "relaunch" "$T"
 -elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
 +elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$BACKEND" != bb ]; then
    spawn_send_text_line "$WT_TARGET" 'treehouse get'
- 
+
    # Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.
-@@ -4462,6 +4504,7 @@
- 
+@@ -4610,6 +4652,7 @@ fi
+
  META_WINDOW=$T
  [ "$BACKEND" = orca ] && META_WINDOW=$W
 +[ "$BACKEND" = bb ] && META_WINDOW=bb:$T
  SPAWN_GEN="s$(date +%s).${BASHPID:-$$}.$RANDOM"
  SPAWN_META_PATH="$STATE/$ID.meta"
  if [ "$SPAWN_META_LOCK_HELD" != 1 ]; then
-@@ -4479,7 +4522,7 @@
+@@ -4627,7 +4670,7 @@ SPAWN_META_PATH=$SPAWN_META_TMP
  preserve_relaunch_meta() {
    awk -F= '
      BEGIN {
--      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
-+      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id bb_thread_id home projects control_relaunch_tx", keys, " ")
+-      split("window endpoint_task_id worktree project harness kind mode yolo branch tasktmp model effort account account_provider busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
++      split("window endpoint_task_id worktree project harness kind mode yolo branch tasktmp model effort account account_provider busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id bb_thread_id home projects control_relaunch_tx", keys, " ")
        for (i in keys) owned[keys[i]] = 1
      }
      !($1 in owned)
-@@ -4519,6 +4562,9 @@
+@@ -4672,6 +4715,9 @@ preserve_relaunch_meta() {
      echo "orca_worktree_id=$ORCA_WORKTREE_ID"
      echo "terminal=$ORCA_TERMINAL"
    fi
@@ -423,15 +456,15 @@ diff --git a/bin/fm-spawn.sh b/bin/fm-spawn.sh
    if [ "$BACKEND" = cmux ]; then
      echo "cmux_workspace_id=$CMUX_WORKSPACE_ID"
      echo "cmux_surface_id=$CMUX_SURFACE_ID"
-@@ -4622,6 +4668,7 @@
+@@ -4775,6 +4821,7 @@ if [ "$SPAWN_TASK_SET_LOCK_HELD" = 1 ]; then
  fi
  "$SCRIPT_DIR/fm-home-summary-refresh.sh" --best-effort || true
  [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
 +[ "$BACKEND" = bb ] && BB_ABORT_CLEANUP=0
- 
+
  sq_brief=$(shell_quote "$BRIEF")
  sq_turnend=$(shell_quote "$TURNEND")
-@@ -4751,6 +4798,12 @@
+@@ -4922,6 +4969,12 @@ spawn_record_traceparent() {
  # Export GOTMPDIR into the crewmate's pane shell so the agent and every child
  # process (go build, go test, ...) inherit it. Sent before the launch command so
  # the env is set when the agent starts; the brief sleep lets the export land.
@@ -444,7 +477,7 @@ diff --git a/bin/fm-spawn.sh b/bin/fm-spawn.sh
  spawn_send_text_line "$T" "export GOTMPDIR=$TASK_TMP/gotmp"
  # Export the compact-adviser kill switch into the pane shell through the same
  # pre-launch channel, so later commands in that shell inherit it too. The launch
-@@ -4872,6 +4925,7 @@
+@@ -5043,6 +5096,7 @@ if [ "${HERDR_PROJECTED:-0}" -eq 1 ]; then
    spawn_herdr_presentation_order_lock_release
  fi
  spawn_send_key "$T" Enter
@@ -453,12 +486,12 @@ diff --git a/bin/fm-spawn.sh b/bin/fm-spawn.sh
    if ! kimi_wait_for_ready; then
      kimi_spawn_fail "$KIMI_READY_FAILURE_DETAIL"
 diff --git a/docs/configuration.md b/docs/configuration.md
-index 4803123e..892f1664 100644
+index 30f91710..36bb5401 100644
 --- a/docs/configuration.md
 +++ b/docs/configuration.md
-@@ -132,15 +132,15 @@ Every routine firstmate backlog command therefore runs through [`bin/fm-tasks-ax
+@@ -151,15 +151,15 @@ Every routine firstmate backlog command therefore runs through [`bin/fm-tasks-ax
  ## Runtime backend (config/backend / FM_BACKEND)
- 
+
  For spawn-capable adapters, the runtime session-provider backend controls where task windows/endpoints are created, captured, sent to, watched, and killed.
 -`tmux` is the verified reference backend (see [`docs/tmux-backend.md`](tmux-backend.md)); `herdr` has its own required CI lane (see [`docs/herdr-backend.md`](herdr-backend.md)); `zellij`, `orca`, and `cmux` remain experimental spawn backends with no dedicated real-backend CI lane (see [`docs/zellij-backend.md`](zellij-backend.md), [`docs/orca-backend.md`](orca-backend.md), and [`docs/cmux-backend.md`](cmux-backend.md)).
 -Treehouse remains the worktree provider for tmux, herdr, zellij, and cmux, since herdr, zellij, and cmux are session providers only; Orca provides both the task worktree and terminal endpoint.
@@ -475,9 +508,9 @@ index 4803123e..892f1664 100644
 +Any value other than `tmux`, `herdr`, `zellij`, `orca`, `cmux`, or `bb` is rejected until another adapter is implemented and verified.
 +`fm-spawn.sh` accepts `tmux`, `herdr`, `zellij`, `orca`, `cmux`, and `bb` for ship and scout tasks; `backend=orca`, `backend=cmux`, and `backend=bb` still refuse `--secondmate` until secondmate launch semantics are designed for each.
  `codex-app` is not an accepted runtime backend yet; [`docs/codex-app-backend.md`](codex-app-backend.md) owns the Codex App boundary.
- The session-start secondmate liveness sweep uses the recovery-grade `fm_backend_agent_state` classifier where verified.
+ The session-start secondmate liveness sweep and the watcher's secondmate liveness tick use the recovery-grade `fm_backend_agent_state` classifier where verified.
  The comment above that function in `bin/fm-backend.sh` is the single owner of its detailed state contract and recovery authorization.
-@@ -154,6 +154,7 @@ Every new task records `endpoint_task_id=` as the cleanup binding between the me
+@@ -173,6 +173,7 @@ Every new task records `endpoint_task_id=` as the cleanup binding between the me
  A herdr task additionally records `herdr_session=`, `herdr_workspace_id=`, `herdr_tab_id=`, and `herdr_pane_id=`.
  A zellij task additionally records `zellij_session=`, `zellij_tab_id=`, and `zellij_pane_id=`.
  An Orca task additionally records `orca_worktree_id=` and `terminal=`, with `window=fm-<id>` kept as the shared firstmate alias.
@@ -485,7 +518,7 @@ index 4803123e..892f1664 100644
  A cmux task additionally records `cmux_workspace_id=` and `cmux_surface_id=`.
  Task selectors for `fm-peek.sh`, `fm-send.sh`, and `fm-crew-state.sh` resolve centrally through `fm_backend_resolve_selector`.
  A selector containing `:` is passed through as an explicit backend endpoint escape hatch.
-@@ -558,10 +559,11 @@ This section is the single owner of that universal toolchain list; backend guide
+@@ -626,10 +627,11 @@ This section is the single owner of that universal toolchain list; backend guide
  In that list, no-mistakes runs the validation pipeline, gh-axi and chrome-devtools-axi cover GitHub and browser operations, and tasks-axi plus quota-axi back backlog mutations and quota-aware array dispatch.
  Lavish is a presentation-only dependency for visual decisions and reports; nonvisual work can proceed with plain text when it is unavailable.
  The per-backend delta is required only for the backend resolved from `FM_BACKEND`, then `config/backend`, then runtime auto-detection, then default `tmux`, so a home is never told to install a tool an inactive backend or feature would need.
@@ -498,33 +531,33 @@ index 4803123e..892f1664 100644
  A herdr, zellij, or cmux home is therefore never told `tmux` is missing, and the `treehouse` durable-lease upgrade check runs only for the backends that actually use treehouse.
  When `config/crew-dispatch.json` exists, bootstrap also requires `jq` for dispatch profile validation.
  When Relay is opted in, bootstrap also requires `curl` and `jq` before arming the relay poll shim.
-diff --git a/bin/fm-busy-lib.sh b/bin/fm-busy-lib.sh
---- a/bin/fm-busy-lib.sh
-+++ b/bin/fm-busy-lib.sh
-@@ -45,7 +45,7 @@
- #                    unknown invalidation fm-control writes after a Devin interrupt
- #   fm-recovery      a documented recovery reset after relaunch
- # Classifier-only sources (never written into a record):
--#   endpoint-gone, herdr-native, grok-regex, rovo-regex, agy-regex, muse-session-log,
-+#   endpoint-gone, herdr-native, bb-native, grok-regex, rovo-regex, agy-regex, muse-session-log,
- #   cursor-transcript, missing, malformed, gen-mismatch, source-mismatch,
- #   kimi-unverified, codex-unverified, capture-failed, no-target, launch-prompt
- #
-@@ -1078,11 +1078,14 @@
-   # No record at all. A native herdr busy verdict is semantic enough to trust
-   # for BUSY (streaming means a turn is running); native idle is narrower
-   # than turn state (a long foreground tool call reads idle) and stays
--  # unknown here.
--  if [ "$backend" = herdr ] && command -v fm_backend_busy_state >/dev/null 2>&1; then
-+  # unknown here. A BB thread status is the same kind of semantic verdict: an
-+  # active thread is a turn in flight, including a long tool call, so bb is
-+  # trusted for BUSY too. Without it a busy BB crew read unknown and fm-watch
-+  # paged a false stale: after two unchanged polls.
-+  if { [ "$backend" = herdr ] || [ "$backend" = bb ]; } && command -v fm_backend_busy_state >/dev/null 2>&1; then
-     native=$(fm_backend_busy_state "$backend" "$target" 2>/dev/null || true)
-     if [ "$native" = busy ]; then
--      printf 'busy herdr-native'
-+      printf 'busy %s-native' "$backend"
-       return 0
-     fi
+diff --git a/bin/fm-secondmate-liveness-lib.sh b/bin/fm-secondmate-liveness-lib.sh
+index 9aaeb2e8..13e21c70 100644
+--- a/bin/fm-secondmate-liveness-lib.sh
++++ b/bin/fm-secondmate-liveness-lib.sh
+@@ -216,7 +216,7 @@ fm_secondmate_liveness_probe() {  # <meta> <id> <full|poll>
+   [ -n "$target" ] || target="$window"
+   agent_state=$(fm_backend_agent_state "$backend" "$target" 2>/dev/null) || agent_state=unreadable
+   case "$harness" in
+-    claude|codex|opencode|pi|pi-signed|grok|kimi|omp) ;;
++    claude|codex|opencode|pi|pi-signed|grok|kimi|omp|bb) ;;
+     *)
+       case "$agent_state" in dead|missing) agent_state=unverified-harness ;; esac
+       ;;
+@@ -290,10 +290,14 @@ fm_secondmate_liveness_relaunch() {  # <meta> <id> [timeout-secs]
+     [ -z "$target" ] || fm_backend_kill "$backend" "$target" 2>/dev/null || true
    fi
+   local rc=0
++  local -a bb_launch_args=()
++  if [ "$(fm_backend_of_meta "$meta")" = bb ]; then
++    bb_launch_args=(--backend bb --harness bb)
++  fi
+   if [ -n "$timeout" ]; then
+-    FM_SM_LIVE_OUT=$(FM_SPAWN_NO_GUARD=1 fm_run_timed "$timeout" "$FM_ROOT/bin/fm-spawn.sh" "$id" --secondmate 2>&1) || rc=$?
++    FM_SM_LIVE_OUT=$(FM_SPAWN_NO_GUARD=1 fm_run_timed "$timeout" "$FM_SM_LIVE_LIB_DIR/fm-spawn.sh" "$id" --secondmate "${bb_launch_args[@]}" 2>&1) || rc=$?
+   else
+-    FM_SM_LIVE_OUT=$(FM_SPAWN_NO_GUARD=1 "$FM_ROOT/bin/fm-spawn.sh" "$id" --secondmate 2>&1) || rc=$?
++    FM_SM_LIVE_OUT=$(FM_SPAWN_NO_GUARD=1 "$FM_SM_LIVE_LIB_DIR/fm-spawn.sh" "$id" --secondmate "${bb_launch_args[@]}" 2>&1) || rc=$?
+   fi
+   FM_SM_LIVE_RC=$rc
+   if [ "$rc" -eq 0 ]; then

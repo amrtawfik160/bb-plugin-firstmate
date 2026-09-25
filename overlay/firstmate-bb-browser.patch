@@ -1,7 +1,8 @@
 diff --git a/bin/fm-bootstrap.sh b/bin/fm-bootstrap.sh
+index 1f43c779..80c92135 100755
 --- a/bin/fm-bootstrap.sh
 +++ b/bin/fm-bootstrap.sh
-@@ -908,6 +908,10 @@
+@@ -827,6 +827,10 @@ missing_tool_diagnostic() {
  # no verified dependency set is reported before the universal checks continue.
  COMMON_TOOLS="node git gh no-mistakes gh-axi chrome-devtools-axi tasks-axi quota-axi"
  BACKEND=$(fm_backend_name)

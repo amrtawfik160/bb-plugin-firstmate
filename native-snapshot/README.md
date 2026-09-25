@@ -16,7 +16,10 @@ instructions (see [CONTRIBUTING.md](../CONTRIBUTING.md) "Skill fidelity").
   `npm run fidelity -- --native /path/to/firstmate` to prove the snapshot matches
   the live clone.
 
-Vendored at `6f0f1399` (native HEAD at the time of the fidelity-convention PR).
+Current snapshot: `b42d4fa8a752fad9a5f0235783b02534bce29219`, the audited
+runtime/overlay pin. Every `BB-SOURCE` must use that full SHA; the offline fidelity
+check rejects a skill or overlay pin that differs from `lib/upstream-surface.ts`.
+Older snapshots remain historical fixtures and are never loaded at runtime.
 
-AFK, fmx-respond, harness-adapters, process-event-sources, and
-stuck-crewmate-recovery updated to `8c47279f`; other skills retain their declared pins.
+The BB captain, firstmate, ahoy, quiet and stow adapters remain BB-specific
+instructions; their policy coverage is not certified as verbatim by this check.

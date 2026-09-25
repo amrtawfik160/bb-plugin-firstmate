@@ -358,3 +358,5 @@ Full contract: [intake + briefs](references/intake-briefs.md),
 [ask-user-authority](references/ask-user-authority.md) (decide vs escalate a
 no-mistakes finding), [diagnostic-reasoning](references/diagnostic-reasoning.md)
 (scope a reported bug).
+
+Wake receipt handling follows [supervision](references/supervision.md#durable-wake-handling); `ack: true` is read-only, and `handledWake` completes the batch after handling.

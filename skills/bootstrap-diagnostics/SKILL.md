@@ -11,8 +11,8 @@ metadata:
 
 <!-- BB-SOURCE
      native: .agents/skills/bootstrap-diagnostics/SKILL.md
-     sha: 6f0f139962eadaea29487cafead418a0eb2ec6e4
-     snapshot: native-snapshot/6f0f1399/.agents/skills/bootstrap-diagnostics/SKILL.md
+     sha: b42d4fa8a752fad9a5f0235783b02534bce29219
+     snapshot: native-snapshot/b42d4fa8/.agents/skills/bootstrap-diagnostics/SKILL.md
      fidelity: verbatim
 -->
 
@@ -47,6 +47,7 @@ When any diagnostic needs captain attention, report the plain consequence and re
 - `CREW_DISPATCH: invalid config/crew-dispatch.json - <reason>` - the optional dispatch profile file exists but failed low-cost bootstrap validation; stop profile-based dispatch, report the actionable error, and require correction of the malformed schema, unverified harness name, or invalid harness/effort pair rather than falling back around it or selecting a bad profile.
 - `FLEET_SYNC: <repo>: skipped: <reason>` - a benign one-off skip (offline, no origin, local-only); bootstrap continued, investigate only if it blocks work.
   A skip can also report the bounded fleet-refresh timeout (`FM_FLEET_SYNC_BOOTSTRAP_TIMEOUT`, or a fleet-size-aware default with a 20 second floor); a timeout never blocks startup.
+  `skipped: registry entry does not resolve to a delivery posture` is the one skip that is not one-off: the clone is left alone on every bootstrap until `data/projects.md` is corrected, so run the printed `bin/fm-project-mode.sh <repo>` to read the refusal and fix the entry.
 - `FLEET_SYNC: <repo>: recovered: <detail>` - the clone had drifted onto a clean detached HEAD holding no unique commits and the sync self-healed it (re-attached the default branch and fast-forwarded); no action needed, it is reported only so the self-heal is visible.
 - `FLEET_SYNC: <repo>: STUCK: on <state>, N commits behind <base> - needs attention` - the clone is dirty, on a non-default branch, detached with unique commits, or diverged, so the sync left it untouched (never forcing or discarding); it will keep falling behind until you look.
   A loud STUCK, especially a growing N across bootstraps, means that clone needs hands-on attention; dispatch a crewmate or resolve it before it strands work.

@@ -9,7 +9,7 @@
 // the patches exactly as install-bb-backend.py does, failing when any hunk no longer
 // applies.
 //
-//   node scripts/patch-drift-check.mjs
+//   node scripts/patch-drift-check.mjs [--ref <audited-sha>]
 //
 // Exit 0  = patches still apply cleanly to current upstream HEAD (fuzz counts as drift).
 // Exit 1  = a hunk no longer applies — refresh the patches (regenerate against HEAD) and
@@ -35,16 +35,23 @@ try {
     console.log("SKIP: could not clone the local checkout.");
     process.exit(2);
   }
-  const ls = sh("git", ["ls-remote", UPSTREAM_URL, "HEAD"]);
-  if (ls.code !== 0) {
-    console.log(`SKIP: could not reach upstream (${UPSTREAM_URL}) — no network?`);
-    process.exit(2);
+  const refIndex = process.argv.indexOf("--ref");
+  let head;
+  if (refIndex !== -1) {
+    head = process.argv[refIndex + 1];
+    if (!head || !/^[0-9a-f]{40}$/.test(head)) throw new Error("--ref requires a full audited commit SHA");
+  } else {
+    const ls = sh("git", ["ls-remote", UPSTREAM_URL, "HEAD"]);
+    if (ls.code !== 0) {
+      console.log(`SKIP: could not reach upstream (${UPSTREAM_URL}) — no network?`);
+      process.exit(2);
+    }
+    head = ls.stdout.trim().split(/\s+/)[0];
   }
-  const head = ls.stdout.trim().split(/\s+/)[0];
   const base = patchBase();
   console.log(`# patch-drift-check`);
   console.log(`# pinned base   = ${base}`);
-  console.log(`# upstream HEAD = ${head}`);
+  console.log(`# checked commit = ${head}`);
   if (git(clone, "cat-file", "-e", head).code !== 0) {
     if (git(clone, "fetch", "--quiet", UPSTREAM_URL, head).code !== 0) {
       console.log(`SKIP: could not fetch upstream HEAD ${head.slice(0, 12)}.`);
@@ -56,9 +63,9 @@ try {
     process.exit(2);
   }
   if (head === base) {
-    console.log("note: upstream HEAD == pinned base (expected clean).");
+    console.log("note: checked commit == pinned base (expected clean).");
   } else {
-    console.log("note: upstream HEAD has moved past the pinned base; verifying the patches still apply.");
+    console.log("note: checked commit differs from the pinned base; verifying the patches still apply.");
   }
 
   // Dry-run apply exactly as install-bb-backend.py does (patch -p1 --forward --batch),
@@ -75,11 +82,11 @@ try {
     }
   }
   if (drifted) {
-    console.log("\nDRIFT: at least one hunk no longer applies to upstream HEAD.");
+    console.log("\nDRIFT: at least one hunk no longer applies to the checked commit.");
     console.log("Refresh the overlay patches against HEAD, re-run the live proofs, and bump overlay/patch-base.txt.");
     exitCode = 1;
   } else {
-    console.log("\nOK: all overlay patches still apply cleanly to current upstream HEAD.");
+    console.log("\nOK: all overlay patches still apply cleanly to checked upstream commit.");
     exitCode = 0;
   }
 } finally {

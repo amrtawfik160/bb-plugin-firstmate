@@ -1,7 +1,7 @@
 // Shared fixture helpers for the live proof scripts.
 //
 // The overlay patches are refreshed against a PINNED upstream commit recorded in
-// overlay/patch-base.txt (currently the current kunchenguid/firstmate HEAD). Live
+// overlay/patch-base.txt (an audited kunchenguid/firstmate commit). Live
 // proofs and the migration check must run against that exact base, because a patch
 // that edits upstream prose is version-specific: it applies at the base it was cut
 // against, and scripts/patch-drift-check.mjs is what alarms when upstream moves past

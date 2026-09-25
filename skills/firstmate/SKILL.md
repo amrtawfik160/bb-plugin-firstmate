@@ -94,3 +94,5 @@ available through `firstmate_afk` with `action: "off"` for the return brief.
 For an older stuck session, run `bb firstmate afk reconcile-return --captain
 <thread-id>`; it requires the same recorded return evidence and never raises the
 worker cap or deletes task records.
+
+Wake receipt handling follows [supervision](../captain/references/supervision.md#durable-wake-handling); complete `handledWake` only after handling the whole batch.

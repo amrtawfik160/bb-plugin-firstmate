@@ -1,7 +1,11 @@
+diff --git a/bin/fm-merge-local.sh b/bin/fm-merge-local.sh
+index 44580de5..694e1758 100755
 --- a/bin/fm-merge-local.sh
 +++ b/bin/fm-merge-local.sh
-@@ -96,2 +96,12 @@
- BRANCH="fm/$ID"
+@@ -96,6 +96,16 @@ default_branch() {
+
+ BRANCH=$(grep '^branch=' "$META" | cut -d= -f2- || true)
+ [ -n "$BRANCH" ] || BRANCH="fm/$ID"
 +# BB names managed worktree branches. Resolve that transport-owned name while
 +# retaining native's control lock, captain hold, clean-tree and ff-only gates.
 +if [ "$(grep '^backend=' "$META" | cut -d= -f2-)" = bb ]; then
@@ -12,4 +16,6 @@
 +  [ "$BB_COMMON" = "$PROJ_COMMON" ] || { echo "error: BB worktree belongs to another repository" >&2; exit 1; }
 +  BRANCH=$(git -C "$BB_WT" symbolic-ref --quiet --short HEAD) || { echo "error: BB worktree has no branch" >&2; exit 1; }
 +fi
- git -C "$PROJ" rev-parse --verify --quiet "refs/heads/$BRANCH" >/dev/null || { echo "error: branch $BRANCH does not exist in $PROJ" >&2; exit 1; }
+ if ! git check-ref-format --branch "$BRANCH" >/dev/null 2>&1; then
+   echo "error: task $ID has an invalid recorded ship branch '$BRANCH'" >&2
+   exit 1

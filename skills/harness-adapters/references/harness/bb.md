@@ -19,3 +19,5 @@ The plugin applies the crew marker and task id as thread metadata. Crew threads 
 ## Recovery
 
 Use the recorded `threadId` and `crewId`. The real transport writes both into `state/<id>.meta`; if a hard kill lands between thread creation and that write, the plugin adopts the thread by its stable title suffix or plugin metadata before spawning a replacement.
+
+Wake receipt handling follows [supervision](../../../captain/references/supervision.md#durable-wake-handling); complete `handledWake` only after handling the whole batch.

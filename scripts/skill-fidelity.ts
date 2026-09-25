@@ -35,6 +35,7 @@
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { execFileSync } from "node:child_process";
+import { UPSTREAM_FIRSTMATE_SHA } from "../lib/upstream-surface.ts";
 
 const MAX_FENCE_SENTENCES = 6;
 // Total fenced sentences allowed per skill. Bounds the "mint many small fences"
@@ -219,6 +220,17 @@ export function scanAll(repoRoot: string): Skill[] {
 
 export type Problem = { skill: string; line?: number; msg: string };
 
+export function validateVersionAlignment(skills: Skill[], patchBase: string): Problem[] {
+  const problems: Problem[] = [];
+  if (patchBase.trim() !== UPSTREAM_FIRSTMATE_SHA)
+    problems.push({ skill: "overlay/patch-base.txt", msg: "overlay patch base must match UPSTREAM_FIRSTMATE_SHA" });
+  for (const skill of skills) {
+    if (skill.bbSource && skill.bbSource.sha !== UPSTREAM_FIRSTMATE_SHA)
+      problems.push({ skill: skill.path, msg: "BB-SOURCE sha must match the audited runtime pin UPSTREAM_FIRSTMATE_SHA" });
+  }
+  return problems;
+}
+
 export function validateStructure(skills: Skill[]): Problem[] {
   const problems: Problem[] = [];
   for (const s of skills) {
@@ -386,6 +398,7 @@ export function validateCaptainWatchGuidance(repoRoot: string): Problem[] {
 export function runOffline(repoRoot: string): Problem[] {
   const skills = scanAll(repoRoot);
   return [
+    ...validateVersionAlignment(skills, readFileSync(join(repoRoot, "overlay/patch-base.txt"), "utf8")),
     ...validateStructure(skills),
     ...validateFences(skills),
     ...validateAgainstSnapshot(repoRoot, skills),
