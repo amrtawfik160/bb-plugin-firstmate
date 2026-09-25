@@ -4,7 +4,7 @@
 // PINNED upstream base (overlay/patch-base.txt) — i.e. the fast-forward a live home
 // needs can actually complete and still spawn bb. This is the proof PR #16's review
 // found missing plus the B2 acceptance: on a scratch clone AT THE PATCH BASE,
-// install → verify healthy → all seven copies present → native rejects bb →
+// install → verify healthy → all eight copies present → native rejects bb →
 // mirror accepts bb → a real fm-spawn reaches bb thread spawn.
 //
 // NOT part of `npm test` (needs the `bb` CLI, a connected host, and the real native
@@ -104,13 +104,13 @@ try {
   const okVerify = sh("python3", [INSTALLER, "--home", fmh, "--verify"]);
   record("installer --verify reports the fresh mirror healthy", okVerify.code === 0, okVerify.out.trim());
 
-  // (2c) all seven no-seam files are carried as REAL copies (not symlinks) in the mirror.
-  const copiesOk = ["fm-backend.sh", "fm-spawn.sh", "fm-teardown.sh", "fm-merge-local.sh", "fm-bootstrap.sh", "fm-busy-lib.sh", "fm-secondmate-liveness-lib.sh"].every((f) => {
+  // (2c) all eight no-seam files are carried as REAL copies (not symlinks) in the mirror.
+  const copiesOk = ["fm-backend.sh", "fm-spawn.sh", "fm-teardown.sh", "fm-merge-local.sh", "fm-bootstrap.sh", "fm-busy-lib.sh", "fm-secondmate-liveness-lib.sh", "fm-watch.sh"].every((f) => {
     const p = join(fmh, "bin-bb", f);
     return existsSync(p) && !lstatSync(p).isSymbolicLink();
   });
-  record("all seven no-seam files are real patched copies in the mirror", copiesOk,
-    copiesOk ? "seven backend/landing/bootstrap/busy files present as copies" : "a copy is missing or is a symlink");
+  record("all eight no-seam files are real patched copies in the mirror", copiesOk,
+    copiesOk ? "eight backend/landing/bootstrap/busy files present as copies" : "a copy is missing or is a symlink");
 
   // (3) MUTATION PROOF: same call, native REJECTS bb, mirror ACCEPTS it. The mirror
   //     is what makes bb dispatch work; nothing else changed.
