@@ -9114,5 +9114,5 @@ test("native host operations can call back into activity without self-deadlock",
     });
     await awaitWithin(host.harness.behavior.runCli(["fm", "--machine", "host_1", "peek", "task"]), 1000, "native callback deadlocked");
     assert.equal(callback, true);
-  } finally { await host.harness.lifecycle.dispose(); }
+  } finally { await host.harness.behavior.setSettings({ fmHome: "" }); await host.harness.lifecycle.dispose(); }
 });
