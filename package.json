@@ -3,7 +3,7 @@
   "version": "0.4.0",
   "type": "module",
   "scripts": {
-    "test": "node --test --experimental-strip-types lib/policy.test.ts lib/policy.differential.test.ts lib/timeline-noise.test.ts server.test.ts scripts/skill-fidelity.test.ts",
+    "test": "node --test --experimental-strip-types lib/policy.test.ts lib/policy.differential.test.ts lib/timeline-noise.test.ts server.test.ts scripts/skill-fidelity.test.ts lib/bb-activity.test.ts lib/wake-receipt.test.ts scripts/wake-receipt.test.ts scripts/supervisor-benchmark.test.mjs",
     "fidelity": "node --experimental-strip-types scripts/skill-fidelity.ts"
   },
   "engines": {
