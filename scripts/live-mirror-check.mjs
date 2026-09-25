@@ -4,7 +4,7 @@
 // PINNED upstream base (overlay/patch-base.txt) — i.e. the fast-forward a live home
 // needs can actually complete and still spawn bb. This is the proof PR #16's review
 // found missing plus the B2 acceptance: on a scratch clone AT THE PATCH BASE,
-// install → verify healthy → all six copies present → native rejects bb →
+// install → verify healthy → all seven copies present → native rejects bb →
 // mirror accepts bb → a real fm-spawn reaches bb thread spawn.
 //
 // NOT part of `npm test` (needs the `bb` CLI, a connected host, and the real native
@@ -104,13 +104,13 @@ try {
   const okVerify = sh("python3", [INSTALLER, "--home", fmh, "--verify"]);
   record("installer --verify reports the fresh mirror healthy", okVerify.code === 0, okVerify.out.trim());
 
-  // (2c) all six no-seam files are carried as REAL copies (not symlinks) in the mirror.
-  const copiesOk = ["fm-backend.sh", "fm-spawn.sh", "fm-teardown.sh", "fm-merge-local.sh", "fm-bootstrap.sh", "fm-busy-lib.sh"].every((f) => {
+  // (2c) all seven no-seam files are carried as REAL copies (not symlinks) in the mirror.
+  const copiesOk = ["fm-backend.sh", "fm-spawn.sh", "fm-teardown.sh", "fm-merge-local.sh", "fm-bootstrap.sh", "fm-busy-lib.sh", "fm-secondmate-liveness-lib.sh"].every((f) => {
     const p = join(fmh, "bin-bb", f);
     return existsSync(p) && !lstatSync(p).isSymbolicLink();
   });
-  record("all six no-seam files are real patched copies in the mirror", copiesOk,
-    copiesOk ? "six backend/landing/bootstrap/busy files present as copies" : "a copy is missing or is a symlink");
+  record("all seven no-seam files are real patched copies in the mirror", copiesOk,
+    copiesOk ? "seven backend/landing/bootstrap/busy files present as copies" : "a copy is missing or is a symlink");
 
   // (3) MUTATION PROOF: same call, native REJECTS bb, mirror ACCEPTS it. The mirror
   //     is what makes bb dispatch work; nothing else changed.
@@ -132,6 +132,59 @@ try {
     const s = readFileSync(brief(id), "utf8").replace("{TASK}", task).replace("{FIRSTMATE_SPEC}", spec);
     writeFileSync(brief(id), s);
   }
+  // Execute the actual local-only merge with BB's managed branch. The old patch
+  // can still apply with fuzz, but native now overwrites a BB branch resolved too early.
+  const landing = join(scratch, "landing");
+  const landingWorktree = join(scratch, "landing-worktree");
+  mkdirSync(landing);
+  for (const args of [["init", "-q", "-b", "main"], ["config", "user.email", "fixture@example.invalid"],
+    ["config", "user.name", "Fixture"], ["commit", "-q", "--allow-empty", "-m", "base"],
+    ["worktree", "add", "-q", "-b", "bb/managed-landing", landingWorktree]]) {
+    const r = sh("git", args, { cwd: landing });
+    if (r.code !== 0) throw new Error(r.out);
+  }
+  const commit = sh("git", ["commit", "-q", "--allow-empty", "-m", "ship"], { cwd: landingWorktree });
+  if (commit.code !== 0) throw new Error(commit.out);
+  const landedHead = sh("git", ["rev-parse", "HEAD"], { cwd: landingWorktree }).stdout.trim();
+  writeFileSync(join(fmh, "state", "managed-landing.meta"),
+    `project=${landing}\nworktree=${landingWorktree}\nmode=local-only\nbackend=bb\nbranch=fm/managed-landing\n`);
+  const mergePath = join(binDir(), "fm-merge-local.sh");
+  const mergeSource = readFileSync(mergePath, "utf8");
+  const block = mergeSource.match(/# BB names managed[\s\S]*?\nfi\n/)?.[0];
+  if (!block) throw new Error("BB local-merge branch adaptation absent");
+  const earlyBranch = mergeSource.replace(block, "").replace('BRANCH=$(grep', block + 'BRANCH=$(grep');
+  writeFileSync(mergePath, earlyBranch);
+  const brokenMerge = sh("bash", [mergePath, "managed-landing"], { env });
+  record("MUTATION: old BB branch patch order refuses the actual managed branch", brokenMerge.code !== 0 && /branch fm\/managed-landing does not exist/.test(brokenMerge.out), brokenMerge.out.trim());
+  writeFileSync(mergePath, mergeSource);
+  const landed = sh("bash", [mergePath, "managed-landing"], { env });
+  record("real mirror local merge lands BB's branch after native branch resolution",
+    landed.code === 0 && /merged bb\/managed-landing into local main/.test(landed.out) &&
+      sh("git", ["rev-parse", "HEAD"], { cwd: landing }).stdout.trim() === landedHead,
+    landed.out.trim());
+
+  // Exercise the native relaunch function with an unregistered ID: it must reach
+  // the mirrored spawn and preserve native's refusal, without creating a manager.
+  writeFileSync(join(fmh, "state/routing.meta"), "backend=bb\nharness=bb\n");
+  const liveLib = join(binDir(), "fm-secondmate-liveness-lib.sh");
+  const liveSource = readFileSync(liveLib, "utf8");
+  function relaunchProbe(timeout) {
+    return sh("bash", ["-xc", `STATE="$FM_HOME/state"; . "$FM_HOME/bin-bb/fm-wake-lib.sh"; . "$FM_HOME/bin-bb/fm-secondmate-liveness-lib.sh"; FM_SM_LIVE_KILL=0; fm_secondmate_liveness_relaunch "$STATE/routing.meta" routing ${timeout}; rc=$?; printf '%s\\n' "$FM_SM_LIVE_OUT"; exit "$rc"`], { env: { ...env, FM_BACKEND: "bb" }, timeout: 20_000 });
+  }
+  const routedSpawn = (r) => r.out.includes(`${binDir()}/fm-spawn.sh routing --secondmate`) &&
+    !r.out.includes(`${fmh}/bin/fm-spawn.sh routing --secondmate`);
+  writeFileSync(liveLib, readFileSync(join(fmh, "bin/fm-secondmate-liveness-lib.sh"), "utf8"));
+  const nativeRelaunch = relaunchProbe("");
+  record("MUTATION: native liveness relaunch bypasses the BB mirror", !routedSpawn(nativeRelaunch) &&
+    nativeRelaunch.out.includes(`${fmh}/bin/fm-spawn.sh routing --secondmate`));
+  writeFileSync(liveLib, liveSource);
+  for (const timeout of ["", "10"]) {
+    const recovery = relaunchProbe(timeout);
+    record(`native liveness relaunch uses mirror and retains registration refusal (${timeout || "unbounded"})`,
+      routedSpawn(recovery) && recovery.code !== 0 && /no firstmate home supplied or registered for routing/.test(recovery.out),
+      /no firstmate home supplied or registered for routing/.test(recovery.out) ? `spawn routed through mirror; exit=${recovery.code}` : recovery.out.slice(-3000));
+  }
+
   const projDir = proj;
   const spawnEnv = realProjectId ? { ...env, FM_BB_PROJECT_ID: realProjectId } : env;
   function spawnInProject(bindir, id, kind) {

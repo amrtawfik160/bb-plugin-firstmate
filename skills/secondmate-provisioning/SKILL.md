@@ -11,8 +11,8 @@ metadata:
 
 <!-- BB-SOURCE
      native: .agents/skills/secondmate-provisioning/SKILL.md
-     sha: 6f0f139962eadaea29487cafead418a0eb2ec6e4
-     snapshot: native-snapshot/6f0f1399/.agents/skills/secondmate-provisioning/SKILL.md
+     sha: b42d4fa8a752fad9a5f0235783b02534bce29219
+     snapshot: native-snapshot/b42d4fa8/.agents/skills/secondmate-provisioning/SKILL.md
      fidelity: verbatim
 -->
 
@@ -123,6 +123,7 @@ Inherited `config/backend` becomes that secondmate home's local runtime-backend 
 A present primary value always converges byte-exact into validated secondmate homes, and primary absence removes the destination so those homes keep runtime auto-detection.
 Explicit per-spawn `--backend` and `FM_BACKEND` remain stronger than every home's local `config/backend`, including an inherited default.
 `config/secondmate-harness` is not inherited because it is only the primary's knob for launching secondmate agents.
+`config/claude-account` and `config/pi-account` are not inherited: a local secondmate agent launches on the launching home's worker account pin, and a secondmate home that should pin its own workers needs its own file ([`docs/configuration.md`](../../../docs/configuration.md) "Worker account pin").
 `data/captain-shared.md` is main-authoritative in the primary home and read-only in secondmate homes.
 Its primary file header must state that the file is main-authoritative, read-only in secondmate homes, must not be edited there, and that new captain-preference discoveries are routed to the main firstmate through marked status or a document pointer.
 Every propagation point converges the secondmate copy to the primary bytes; when the primary file is absent, any existing secondmate copy is quarantined and removed so absence converges too.

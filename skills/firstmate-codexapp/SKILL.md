@@ -10,8 +10,8 @@ metadata:
 
 <!-- BB-SOURCE
      native: .agents/skills/firstmate-codexapp/SKILL.md
-     sha: 6f0f139962eadaea29487cafead418a0eb2ec6e4
-     snapshot: native-snapshot/6f0f1399/.agents/skills/firstmate-codexapp/SKILL.md
+     sha: b42d4fa8a752fad9a5f0235783b02534bce29219
+     snapshot: native-snapshot/b42d4fa8/.agents/skills/firstmate-codexapp/SKILL.md
      fidelity: verbatim
 -->
 

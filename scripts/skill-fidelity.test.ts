@@ -7,6 +7,7 @@ import {
   scanAll,
   runOffline,
   validateStructure,
+  validateVersionAlignment,
   validateFences,
   validateCaptainWatchGuidance,
   normalize,
@@ -26,6 +27,7 @@ const BB_HARNESS = "skills/harness-adapters/references/harness/bb.md";
 function withTemp(mutate: (root: string) => void): Problem[] {
   const root = mkdtempSync(join(tmpdir(), "fidelity-"));
   try {
+    cpSync(join(ROOT, "overlay"), join(root, "overlay"), { recursive: true });
     cpSync(join(ROOT, "skills"), join(root, "skills"), { recursive: true });
     cpSync(join(ROOT, "native-snapshot"), join(root, "native-snapshot"), { recursive: true });
     mutate(root);
@@ -58,6 +60,7 @@ test("captain watch guidance rejects the old blocking agent-tool contract", () =
 test("captain watch guidance preserves the blocking CLI distinction", () => {
   const root = mkdtempSync(join(tmpdir(), "watch-guidance-"));
   try {
+    cpSync(join(ROOT, "overlay"), join(root, "overlay"), { recursive: true });
     cpSync(join(ROOT, "skills"), join(root, "skills"), { recursive: true });
     edit(root, BB_HARNESS, (s) =>
       s.replace("The `bb firstmate watch` CLI remains blocking via BB `threads.wait` for operator use.\n", ""),
@@ -279,4 +282,14 @@ test("normalizer keeps tool underscores but ignores wrapping/bullets/arrows", ()
 test("sentence splitter drops short structural fragments", () => {
   assert.deepEqual(sentences("Yes. No."), []);
   assert.equal(sentences("This is a sufficiently long policy sentence to be checked for membership.").length, 1);
+});
+
+// These mutations catch the historical independently-bumped runtime and skill pins.
+test("version alignment rejects stale skill and overlay pins", () => {
+  const skills = scanAll(ROOT);
+  const base = readFileSync(join(ROOT, "overlay/patch-base.txt"), "utf8");
+  assert.deepEqual(validateVersionAlignment(skills, base), []);
+  assert.ok(flagged(validateVersionAlignment(skills, "6f0f1399"), /patch base/));
+  skills[0].bbSource!.sha = "6f0f1399";
+  assert.ok(flagged(validateVersionAlignment(skills, base), /audited runtime pin/));
 });
