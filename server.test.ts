@@ -52,6 +52,10 @@ import { FIRSTMATE_ROUTINE_MARKER } from "./lib/timeline-noise.ts";
 
 const SKILLS = ["captain", "firstmate", ...UPSTREAM_SKILL_NAMES] as const;
 
+function wakeFrame(report: string): string {
+  return "FM_BB_RECEIPT=" + JSON.stringify({ id: "fixture", phase: "ready", report, path: "/tmp/report.txt", replayed: false, truncated: false });
+}
+
 async function load() {
   const host = createFakePluginHost({
     pluginId: "firstmate",
@@ -380,7 +384,7 @@ test("dispatch refuses an uncertain secondmate handoff instead of duplicating wo
     ]);
     // A registered secondmate whose thread is dead: the routing send throws.
     await host.bb.storage.kv.set("secondmates", [
-      { projectId: "proj_1", threadId: "thr_dead", scope: "", projects: [], createdAt: "2026-01-01T00:00:00.000Z" },
+      { projectId: "proj_1", threadId: "thr_dead", scope: "login", projects: [], createdAt: "2026-01-01T00:00:00.000Z" },
     ]);
     host.harness.sdk.stub("threads.send", async () => { throw new Error("thread archived"); });
     host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew" }));
@@ -5411,12 +5415,12 @@ test("B2: `bb firstmate wake` presents the ack instruction as the bb command, no
     // Both the WAKE_ACK_REQUIRED consuming line AND the stale-ack advisory (the
     // consuming form the captain hit live, no WAKE_ACK_REQUIRED prefix) come through.
     host.harness.sdk.stub("terminals.output", async () =>
-      hostOutput(
+      hostOutput(wakeFrame(
         [
           "wake drain: nothing was acknowledged through 2 (none of your presented wake rows is at or below it); the current wake is row 4: run bin/fm-wake-drain.sh --ack-through 4 --recovery-generation g99 after handling it",
           "WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through 4 --recovery-generation g99",
         ].join("\n"),
-      ),
+      )),
     );
     const result = await host.harness.behavior.runCli(["wake"], { projectId: "proj_1", threadId: "thr_cap" });
     assert.equal(result.exitCode, 0, result.stderr);
@@ -7017,7 +7021,7 @@ for (const entry of ["tool", "cli"] as const) {
           elapsed = scenario.elapsed;
           return { chunks: [], nextSeq: 0 };
         }
-        return hostRcPayload("DRAIN_FINISHED\nWAKE_ACK_REQUIRED: bin/fm-wake-drain.sh --ack-through 2 --recovery-generation g1", 0);
+        return hostRcPayload(wakeFrame("DRAIN_FINISHED\nWAKE_ACK_REQUIRED: bin/fm-wake-drain.sh --ack-through 2 --recovery-generation g1"), 0);
       });
       let output: string;
       if (entry === "tool") {
@@ -7509,7 +7513,7 @@ test("wake retries an exited terminal's failed output read without rerunning the
     host.harness.sdk.stub("terminals.get", async () => ({ status: "exited", exitCode: 0 }));
     host.harness.sdk.stub("terminals.output", async () => {
       if (++reads === 1) throw new Error("HTTP 504: Timed out reading terminal output");
-      return hostRcPayload("WAKE_PAYLOAD_RECOVERED", 0);
+      return hostRcPayload(wakeFrame("WAKE_PAYLOAD_RECOVERED"), 0);
     });
     host.harness.sdk.stub("terminals.close", async () => ({}));
     const result = await host.harness.behavior.runCli(["wake"], { threadId: "thr_cap" });
@@ -7531,7 +7535,7 @@ test("wake resolves an unconfigured host from the calling captain's environment"
       return { id: "term_cap" };
     });
     host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
-    host.harness.sdk.stub("terminals.output", async () => hostRcPayload("CAPTAIN_QUEUE", 0));
+    host.harness.sdk.stub("terminals.output", async () => hostRcPayload(wakeFrame("CAPTAIN_QUEUE"), 0));
     host.harness.sdk.stub("terminals.close", async () => ({}));
     const result = await host.harness.behavior.runCli(["wake"], { threadId: "thr_cap" });
     assert.equal(result.exitCode, 0, result.stderr);
@@ -9035,10 +9039,80 @@ test("IT receipts replay across reload, reject failed final actions and complete
     assert.match(String(replay), new RegExp(`WAKE_RECEIPT: ${id} \\(replayed\\)`));
     const failed = await tool("firstmate_deliver").execute({ crewId: "absent", handledWake: id }, ctx);
     assert.equal((failed as { isError: boolean }).isError, true);
-    assert.equal(JSON.parse(readFileSync(journal, "utf8")).phase, "ready", "failed action cannot finish receipt");
-    const success = await tool("firstmate_memory").execute({ action: "show", handledWake: id }, ctx);
+    assert.equal(JSON.parse(readFileSync(journal, "utf8")).phase, "acting", "failed action remains uncertain until reconciled");
+    assert.match(JSON.stringify(failed), /Reconcile external state/);
+    await tool("firstmate_wake").execute({ handledWake: id }, ctx);
+    await emitIdle(host, "BLOCKED: new receipt delivery must survive until handled");
+    const next = await tool("firstmate_wake").execute({}, ctx);
+    const nextId = /WAKE_RECEIPT: ([a-f0-9]+)/.exec(String(next))?.[1];
+    assert.ok(nextId);
+    const success = await tool("firstmate_memory").execute({ action: "show", handledWake: nextId }, ctx);
     assert.doesNotMatch(JSON.stringify(success), /ACTION SUCCEEDED; wake completion is unconfirmed/);
     const after = await tool("firstmate_wake").execute({}, ctx);
     assert.doesNotMatch(String(after), /receipt delivery must survive until handled/);
   } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test("batch timer send must not pin release service on abort", async () => {
+  const host = ownerHost({ notifyOwner: "real", captainWakeBatchMs: 10 });
+  await plugin(host.bb);
+  let unblock!: () => void;
+  let enter!: () => void;
+  const entered = new Promise<void>(r => enter = r);
+  try {
+    stubRoutedHost(host, () => ({ code: 0 }));
+    captainAndCrewThreads(host);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.send", async () => {
+      enter(); await new Promise<void>(r => unblock = r);
+      return { ok: true, delivery: "sent" };
+    });
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await emitIdle(host, "DONE: routine report");
+    await awaitWithin(entered, 1000, "batch timer never fired");
+    const run = host.harness.behavior.runService("captain-wake-release");
+    await new Promise(r => setTimeout(r, 30));
+    run.controller.abort();
+    try { await awaitWithin(run.done, 200, "release service blocked behind unsignalled timer lock"); }
+    finally { unblock(); await run.done; }
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("interaction urgency bypasses batching", async () => {
+  const host = ownerHost({ notifyOwner: "real", captainWakeBatchMs: 5000 });
+  await plugin(host.bb);
+  try {
+    stubRoutedHost(host, () => ({ code: 0 }));
+    captainAndCrewThreads(host);
+    host.harness.sdk.stub("threads.list", async () => []);
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await host.harness.behavior.emitThreadEvent("interaction.pending", { thread: makeThreadResponse({id:"thr_crew",status:"active"}) } as never);
+    assert.equal(sendCalls(host).filter(s => s.threadId === "thr_cap").length, 1, "interaction must be immediate");
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+
+test("native host operations can call back into activity without self-deadlock", async () => {
+  const host = ownerHost(); await plugin(host.bb);
+  try {
+    host.harness.sdk.stub("hosts.list", async () => [{ id: "host_1", name: "host_1" }]);
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_worker", status: "active" }));
+    host.harness.sdk.stub("threads.events.list", async () => []);
+    host.harness.sdk.stub("threads.output", async () => ({ output: "" }));
+    host.harness.sdk.stub("threads.interactions.list", async () => []);
+    host.harness.sdk.stub("terminals.create", async () => ({ id: "callback" }));
+    host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+    host.harness.sdk.stub("terminals.close", async () => ({}));
+    let callback = false;
+    host.harness.sdk.stub("terminals.output", async () => {
+      const result = await host.harness.behavior.runCli(["activity", "thr_worker", "--json"]);
+      assert.equal(result.exitCode, 0, result.stderr);
+      callback = true;
+      return hostRcPayload("native finished", 0);
+    });
+    await awaitWithin(host.harness.behavior.runCli(["fm", "--machine", "host_1", "peek", "task"]), 1000, "native callback deadlocked");
+    assert.equal(callback, true);
+  } finally { await host.harness.lifecycle.dispose(); }
 });

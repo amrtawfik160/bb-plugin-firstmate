@@ -21,7 +21,9 @@ export function renderWakeReceipt(receipt: WakeReceipt): string {
   if (receipt.truncated) lines.push(`REPORT TRUNCATED: read the full report at ${receipt.path} before completing this receipt.`);
   if (receipt.id) {
     lines.push(`WAKE_RECEIPT: ${receipt.id}${receipt.replayed ? " (replayed)" : ""}`);
-    lines.push(receipt.phase === "ready"
+    lines.push(receipt.phase === "acting"
+      ? "Action outcome is uncertain. Reconcile external state before acting again; do not blindly repeat the action. After reconciliation, complete with firstmate_wake handledWake."
+      : receipt.phase === "ready"
       ? "Handle the whole batch, then pass handledWake on your final successful Firstmate action. If no action remains, call firstmate_wake with handledWake."
       : "Handling was recorded. Retry firstmate_wake with handledWake only; do not repeat the successful action.");
   }

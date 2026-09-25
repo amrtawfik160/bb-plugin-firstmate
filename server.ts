@@ -1373,7 +1373,6 @@ const CAPTAIN_VISIBILITY_CONTRACT = [
   "Stay silent while tools and crews run: do not send commentary or progress updates. Send one concise captain-facing response only when an outcome, review, decision, approval, credential, login, blocker, or recovered failure needs the captain.",
   "Use the native firstmate_* tool whenever it exists. Never shell out to bb firstmate or call generic command tools for routine orchestration; those rows bypass the clean captain timeline. Use firstmate_fm for real scripts that have no native tool.",
   "Never paste tool output, worker reports, status lines, or internal records. Translate them into the project outcome, consequence, and next decision.",
-  "Speak when requested work finishes; work is ready for review; findings are ready; a decision, approval, credential, or login is needed; or a real blocker or failure remains after recovery.",
   "A crew wake delivered during your turn is live input: absorb it before continuing, call firstmate_wake when it points to durable state, handle the full batch, then pass its receipt as handledWake on your final successful action. Repeat only for new reports. Treat several crew wakes as one batch and leave none queued for a later turn.",
   "Keep each captain-facing message concise. The final response must stand alone with every material outcome, consequence, needed decision, and full recorded PR URL.",
   "Your state is the firstmate_* tools and your own fmHome. Never read bb.db, BB server logs, other captains' homes, or another project's records.",
@@ -1998,7 +1997,13 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
   function withLedgerOperation<T>(name: string, captain: string | undefined, operation: () => Promise<T>): Promise<T> {
-    return serializeLedger(`operation:${captain ?? "legacy"}`, operation);
+    return ["queue", "decide", "firstmate_queue", "firstmate_decide"].includes(name)
+      ? serializeLedger(`operation:${captain ?? "legacy"}`, operation)
+      : operation();
+  }
+  function withCliOperation<T>(argv: string[], captain: string | undefined, operation: () => Promise<T>): Promise<T> {
+    const wake = argv[0] === "wake" || (argv[0] === "fm" && argv.some(arg => ["wake-drain", "fm-wake-drain.sh"].includes(arg)));
+    return wake ? serializeLedger(`receipt:${captain ?? "legacy"}`, operation) : withLedgerOperation(argv[0] ?? "", captain, operation);
   }
   async function writeQueue(items: QueueItem[]): Promise<void> {
     await serializeLedger(QUEUE_KEY, async () => {
@@ -2123,22 +2128,23 @@ export default async function plugin(bb: BbPluginApi) {
   const MAX_HELD_WAKES = 40;
   const heldWakeSchema = z.object({ since: z.number(), reason: z.string(), lines: z.array(z.string()), dueAt: z.number().optional() });
   const wakeBatchTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const wakeBatchAbort = new AbortController();
   function scheduleWakeBatch(captain: string, delay: number): void {
     if (wakeBatchTimers.has(captain)) return;
     const timer = setTimeout(() => {
       wakeBatchTimers.delete(captain);
-      void releaseHeldCaptainWakes(captain).catch((error) => bb.log.warn(`wake batch retained for retry captain=${captain}: ${String(error)}`));
+      void releaseHeldCaptainWakes(captain, AbortSignal.any([wakeBatchAbort.signal, AbortSignal.timeout(STUCK_HOST_CALL_MS)])).catch((error) => bb.log.warn(`wake batch retained for retry captain=${captain}: ${String(error)}`));
     }, delay);
     timer.unref?.();
     wakeBatchTimers.set(captain, timer);
   }
   const heldWakeLocks = new Map<string, Promise<unknown>>();
-  function withHeldWakeLock<T>(captain: string, fn: () => Promise<T>): Promise<T> {
+  function withHeldWakeLock<T>(captain: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     const prev = heldWakeLocks.get(captain) ?? Promise.resolve();
-    const run = prev.catch(() => {}).then(fn);
+    const run = prev.catch(() => {}).then(() => { signal?.throwIfAborted(); return fn(); });
     heldWakeLocks.set(captain, run);
     void run.finally(() => { if (heldWakeLocks.get(captain) === run) heldWakeLocks.delete(captain); }).catch(() => {});
-    return run;
+    return raceAbort(run, signal, STUCK_HOST_CALL_MS);
   }
   async function captainHoldState(parentThreadId: string, signal?: AbortSignal): Promise<{ hold: boolean; reason: string; status: string | null; archived: boolean }> {
     let status: string | null = null;
@@ -2195,12 +2201,12 @@ export default async function plugin(bb: BbPluginApi) {
       await bb.storage.kv.delete(key);
       bb.log.info(`captain ${parentThreadId}: released ${held.data.lines.length} held wake(s) as one`);
       return true;
-    });
+    }, signal);
   }
 
   // Deliver a wake to a captain, or hold it while the captain cannot take a turn. A held
   // wake counts as delivered: it is persisted and released as one consolidated wake.
-  async function deliverToCaptain(parentThreadId: string, text: string, crewId: string, signal?: AbortSignal): Promise<boolean> {
+  async function deliverToCaptain(parentThreadId: string, text: string, crewId: string, signal?: AbortSignal, urgent = false): Promise<boolean> {
     const state = await captainHoldState(parentThreadId, signal);
     // Host-wide sweeps (landed PRs, fm-watch relay) reach crews of captains the user
     // archived; a wake would revive a retired captain. The durable queue keeps the report.
@@ -2215,7 +2221,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const current = await settings.get();
     const batchMs = Math.min(5000, Math.max(0, Number(current.captainWakeBatchMs) || 0));
-    if (current.notifyOwner === "real" && batchMs > 0 && !/needs-decision|blocked|failed|failure|error|interaction/i.test(text)) {
+    if (current.notifyOwner === "real" && !urgent && batchMs > 0 && !/needs-decision|blocked|failed|failure|error|interaction/i.test(text)) {
       await holdCaptainWake(parentThreadId, text, "routine event batch", Date.now() + batchMs);
       scheduleWakeBatch(parentThreadId, batchMs);
       return true;
@@ -2490,7 +2496,7 @@ export default async function plugin(bb: BbPluginApi) {
       await publishFleet();
       return;
     }
-    if (await deliverToCaptain(parentThreadId, doorbell, crew.id, signal)) {
+    if (await deliverToCaptain(parentThreadId, doorbell, crew.id, signal, ["error", "interaction", "needs-decision", "unknown"].includes(kind) || verdict === "BLOCKED" || verdict === "FAILED")) {
       await bb.storage.kv.set(deliveryKey, signature);
     }
     await publishFleet();
@@ -5785,7 +5791,7 @@ export default async function plugin(bb: BbPluginApi) {
     env?: Record<string, string>;
     timeoutMs: number;
     signal?: AbortSignal;
-    receipt?: { action: "receive" | "inspect" | "mark-success" | "complete" | "legacy-ack"; id?: string };
+    receipt?: { action: "receive" | "inspect" | "begin-action" | "mark-success" | "complete" | "legacy-ack"; id?: string };
   }): Promise<{ exitCode: number | null; output: string; scriptPath: string; receipt?: WakeReceipt }> {
     const script = normalizeFmScript(input.script);
     if (script === "spawn") await reconcileReturnedAfk(input.parentThreadId);
@@ -5809,7 +5815,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     // Compressed source stays under BB's 10KB command limit without staging a
     // helper on every wake. Journal/report files are still written on the host.
-    const receiptRunner = `import base64,zlib; exec(zlib.decompress(base64.b64decode("${deflateSync(Buffer.from(overlayBytes("bin/bb-wake-receipt.py"), "base64")).toString("base64")}")))`;
+    const receiptRunner = receipt ? `import base64,zlib; exec(zlib.decompress(base64.b64decode("${deflateSync(Buffer.from(overlayBytes("bin/bb-wake-receipt.py"), "base64")).toString("base64")}")))` : "";
     const invocation = receipt
       ? `python3 -c ${shQuote(receiptRunner)} ${shQuote(wakeStateDir(input.fmHome, input.parentThreadId))} ${shQuote(receipt.action)} ${shQuote(receipt.id ?? "")} "$FM_BINDIR/${scriptLeaf}"`
       : `"$FM_BINDIR/${scriptLeaf}" ${input.args.map(shQuote).join(" ")}`;
@@ -5928,7 +5934,7 @@ export default async function plugin(bb: BbPluginApi) {
     recoveryGeneration?: string,
     hostOverride?: string,
     signal?: AbortSignal,
-    receipt?: { action: "receive" | "inspect" | "mark-success" | "complete"; id?: string },
+    receipt?: { action: "receive" | "inspect" | "begin-action" | "mark-success" | "complete"; id?: string },
   ): Promise<string> {
     const current = await settings.get();
     const fmHome = current.fmHome.trim();
@@ -7221,7 +7227,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     for (const [parent, items] of byParent) {
       if (signal?.aborted) return;
-      if (await deliverToCaptain(parent, `🛰️ fm-watch:\n${items.map((i) => i.text).join("\n")}`, "fm-watch", signal)) {
+      if (await deliverToCaptain(parent, `🛰️ fm-watch:\n${items.map((i) => i.text).join("\n")}`, "fm-watch", signal, items.some(item => /^(signal|check):|demand-deep-inspection/.test(item.text)))) {
         for (const i of items) { seen.add(i.key); relayAttempts.delete(i.key); }
         continue;
       }
@@ -7567,22 +7573,30 @@ export default async function plugin(bb: BbPluginApi) {
     ) => ReturnType<Parameters<BbPluginApi["agents"]["registerTool"]>[0]["execute"]>;
     bb.agents.registerTool({
       ...tool,
-      parameters: (tool.parameters as unknown as z.ZodObject).extend({
+      parameters: tool.name === "firstmate_fm" ? (tool.parameters as unknown as z.ZodObject) : (tool.parameters as unknown as z.ZodObject).extend({
         handledWake: z.string().min(1).optional().describe("Receipt id, only on your final successful action after handling the whole wake batch. Never repeat an action to retry acknowledgement."),
       }),
       presentation: { ...tool.presentation, suppress: true },
       async execute(params, ctx) {
         try {
           const captain = ctxString(ctx, "threadId");
-          return await withLedgerOperation(tool.name, captain, () => inCaptainHome(captain, async () => {
+          const receiptCall = typeof asRecord(params)["handledWake"] === "string" || tool.name === "firstmate_wake" || (tool.name === "firstmate_fm" && normalizeFmScript(String(asRecord(params)["script"] ?? "")) === "wake-drain");
+          const run = () => withLedgerOperation(tool.name, captain, () => inCaptainHome(captain, async () => {
             const { handledWake, ...operation } = asRecord(params);
             const id = typeof handledWake === "string" ? handledWake : undefined;
+            if (id && tool.name === "firstmate_fm") return markCaptainToolResult(toolError("Complete handledWake on a direct Firstmate action or firstmate_wake; generic scripts may call back into the wake API."));
             const signal = asRecord(ctx)["signal"] as AbortSignal | undefined;
-            const journal = (action: "inspect" | "mark-success" | "complete") => drainWakes(captain, undefined, undefined, undefined, signal, { action, id });
+            const journal = (action: "inspect" | "begin-action" | "mark-success" | "complete") => drainWakes(captain, undefined, undefined, undefined, signal, { action, id });
             if (id && tool.name === "firstmate_wake") return markCaptainToolResult(await journal("complete"));
-            if (id) await journal("inspect");
-            const result = await execute(operation, ctx);
-            if (!id || (typeof result !== "string" && result.isError)) return markCaptainToolResult(result);
+            if (id) await journal("begin-action");
+            let result: Awaited<ReturnType<typeof execute>>;
+            const uncertain = `Wake ${id}: action outcome is uncertain. Reconcile external state before acting again, then complete with firstmate_wake handledWake. Do not blindly repeat ${tool.name}.`;
+            try { result = await execute(operation, ctx); }
+            catch (error) { throw new Error(`${String(error)}${id ? `\n${uncertain}` : ""}`); }
+            if (!id) return markCaptainToolResult(result);
+            if (typeof result !== "string" && result.isError) return markCaptainToolResult({
+              ...result, content: [...result.content, { type: "text", text: uncertain }],
+            });
             let suffix: string;
             try {
               await journal("mark-success");
@@ -7595,6 +7609,7 @@ export default async function plugin(bb: BbPluginApi) {
               ...result, content: [...result.content, { type: "text", text: suffix }],
             });
           }));
+          return receiptCall ? await serializeLedger(`receipt:${captain ?? "legacy"}`, run) : await run();
         } catch (error) {
           const message = error instanceof Error ? error.message : "Firstmate tool failed.";
           return markCaptainToolResult(toolError(message));
@@ -9017,7 +9032,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "migrate-owners", summary: "Project KV queue/decisions/afk/quiet/memory into the real files for owners set to real (idempotent)", usage: "bb firstmate migrate-owners [--json]" },
     ],
     async run(argv, ctx) {
-      return withLedgerOperation(argv[0] ?? "", ctxString(ctx, "threadId"), () => inCaptainHome(ctxString(ctx, "threadId"), async () => {
+      return withCliOperation(argv, ctxString(ctx, "threadId"), () => inCaptainHome(ctxString(ctx, "threadId"), async () => {
       if (argv[0] === "fm") {
         const json = argv.includes("--json");
         const fail = (message: string) => ({ exitCode: 1, stderr: message });
@@ -10069,6 +10084,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.onDispose(async () => {
+    wakeBatchAbort.abort();
     for (const timer of wakeBatchTimers.values()) clearTimeout(timer);
     wakeBatchTimers.clear();
     for (const timer of nudgeTimers.values()) clearTimeout(timer);
