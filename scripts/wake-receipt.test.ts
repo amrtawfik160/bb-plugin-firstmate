@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, readdirSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -213,6 +213,7 @@ test("large Unicode/control reports use a complete bounded JSON frame and full d
 
 test("unchanged persistent decisions do not create an endless completion loop", (t) => {
   const f = fixture(t, { persistent: "OPEN DECISIONS:\nwaiting for user's budget\n" });
+  writeFileSync(join(f.state, ".status-presentation-cursor"), "stable native cursor\n");
   const receipt = f.run();
   assert.ok(receipt.id);
   assert.equal(f.run("complete", receipt.id).id, null);
@@ -390,3 +391,105 @@ test("real native drain retains pairless status and new-generation queue rows", 
   f.run("complete", successor.id, native);
   assert.equal(readFileSync(join(f.state, ".wake-queue"), "utf8"), "");
 });
+
+
+test("empty reads and completed receipts do not accumulate report files", (t) => {
+  const f = fixture(t);
+  const reports = join(f.state, ".bb-wake-reports");
+  for (let n = 0; n < 10; n++) {
+    assert.equal(f.run().id, null);
+    assert.deepEqual(readdirSync(reports), []);
+    f.update({ unread: `status ${n}\n` });
+    const receipt = f.run();
+    assert.ok(receipt.id);
+    assert.deepEqual(readdirSync(reports), [receipt.id + ".txt"]);
+    assert.equal(f.run("complete", receipt.id).id, null);
+    assert.deepEqual(readdirSync(reports), []);
+  }
+});
+
+test("pruning keeps active recovery captures and leaves unrelated files alone", (t) => {
+  const f = fixture(t, { unread: "consumed before failure\n", failRead: true });
+  assert.notEqual(f.raw().status, 0);
+  const reports = join(f.state, ".bb-wake-reports");
+  const journal = JSON.parse(readFileSync(join(f.state, ".bb-wake-receipt.json"), "utf8"));
+  const capture = join(reports, journal.capture + ".native.txt");
+  const orphan = join(reports, "a".repeat(32) + ".txt");
+  writeFileSync(orphan, "completed orphan");
+  writeFileSync(join(reports, "notes.txt"), "unrelated");
+  assert.notEqual(f.raw("inspect", journal.id).status, 0);
+  assert.equal(existsSync(orphan), false);
+  assert.match(readFileSync(capture, "utf8"), /consumed before failure/);
+  assert.ok(existsSync(join(reports, journal.capture + ".result.json")));
+  const recovered = f.run();
+  assert.match(recovered.report, /consumed before failure/);
+  assert.deepEqual(readdirSync(reports).sort(), [recovered.id + ".txt", "notes.txt"].sort());
+  f.run("complete", recovered.id!);
+  assert.deepEqual(readdirSync(reports), ["notes.txt"]);
+});
+
+test("unknown legacy capture cursor cannot suppress equal fresh reports", (t) => {
+  const f = fixture(t, { unread: "same failure\n" });
+  const first = f.run();
+  f.update({ unread: "same failure\n" });
+  const second = f.run("complete", first.id!);
+  assert.ok(second.id);
+  assert.notEqual(second.id, first.id);
+  assert.equal(second.report, first.report);
+  assert.equal(existsSync(first.path), false);
+  assert.equal(readFileSync(second.path, "utf8"), second.report);
+});
+
+for (const line of ["failed: deployment rejected\n", "note: repeated status\n"]) {
+  test(`real native preserves a repeated new status: ${line.trim()}`, { skip: !existsSync(join(nativeFixture, "bin/fm-wake-drain.sh")) }, (t) => {
+    const f = fixture(t);
+    const native = join(nativeFixture, "bin/fm-wake-drain.sh");
+    const status = join(f.state, "worker.status");
+    const cursor = join(f.state, ".status-presentation-cursor");
+    writeFileSync(status, line);
+    const first = f.run("receive", "", native);
+    assert.ok(first.id);
+    const before = readFileSync(cursor, "utf8");
+    appendFileSync(status, line);
+    const second = f.run("complete", first.id, native);
+    assert.notEqual(readFileSync(cursor, "utf8"), before, "native consumed the new status event");
+    assert.ok(second.id, "new consumed status must remain a pending receipt");
+    assert.notEqual(second.id, first.id);
+    assert.match(second.report, /repeated|deployment rejected/);
+    assert.equal(f.run("receive", "", native).id, second.id);
+    assert.equal(f.run("complete", second.id, native).id, null, "unchanged persistent sections must not loop");
+    assert.deepEqual(readdirSync(join(f.state, ".bb-wake-reports")), []);
+  });
+}
+
+
+test("real native persistent open decisions complete without a receipt loop", { skip: !existsSync(join(nativeFixture, "bin/fm-wake-drain.sh")) }, (t) => {
+  const f = fixture(t);
+  const native = join(nativeFixture, "bin/fm-wake-drain.sh");
+  writeFileSync(join(f.state, "worker.status"), "blocked: waiting for approval\n");
+  const first = f.run("receive", "", native);
+  assert.ok(first.id);
+  assert.match(first.report, /OPEN DECISIONS/);
+  assert.equal(f.run("complete", first.id, native).id, null);
+  assert.deepEqual(readdirSync(join(f.state, ".bb-wake-reports")), []);
+});
+
+for (const phase of ["presenting", "acknowledging", "refreshing"]) {
+  test(`malformed ${phase} journal cannot prune unreferenced recovery evidence`, (t) => {
+    const f = fixture(t, { unread: "consumed failure evidence\n", failRead: true });
+    assert.notEqual(f.raw().status, 0);
+    const path = join(f.state, ".bb-wake-receipt.json");
+    const journal = JSON.parse(readFileSync(path, "utf8"));
+    const reports = join(f.state, ".bb-wake-reports");
+    journal.phase = phase;
+    delete journal.capture;
+    writeFileSync(join(reports, journal.id + ".txt"), "partial evidence\n");
+    writeFileSync(path, JSON.stringify(journal));
+    const before = readdirSync(reports).sort().map(name => [name, readFileSync(join(reports, name), "utf8")]);
+    const result = f.raw();
+    assert.notEqual(result.status, 0);
+    assert.deepEqual(readdirSync(reports).sort().map(name => [name, readFileSync(join(reports, name), "utf8")]), before);
+    assert.match(result.stderr, /Invalid native capture reference/);
+    assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), journal);
+  });
+}
