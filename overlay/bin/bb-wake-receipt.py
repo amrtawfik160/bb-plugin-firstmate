@@ -7,6 +7,7 @@ Actions: receive, inspect ID, begin-action ID, mark-success ID, complete ID,
 Returns one bounded FM_BB_RECEIPT=<JSON> line; full reports stay on disk.
 """
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -67,6 +68,13 @@ def meaningful(report):
     return "\n".join(lines).strip()
 
 
+def status_cursor(state):
+    try:
+        return hashlib.sha256((state / ".status-presentation-cursor").read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return None
+
+
 class Journal:
     def __init__(self, state, script):
         self.state = state
@@ -74,6 +82,7 @@ class Journal:
         self.path = state / ".bb-wake-receipt.json"
         self.reports = state / ".bb-wake-reports"
         self.reports.mkdir(mode=0o700, exist_ok=True)
+        self.status_unchanged = False
         self.current = json.loads(self.path.read_text()) if self.path.exists() else None
         if self.current is not None:
             value = self.current
@@ -87,6 +96,19 @@ class Journal:
                 raise RuntimeError("Invalid native acknowledgement in journal; retained")
             if value["phase"] != "presenting" and not self.report_path().is_file():
                 raise RuntimeError("Wake receipt report is missing; no acknowledgement authorized")
+
+    def prune_reports(self):
+        # The receipt flock also covers orphan recovery and the native guardian.
+        # Only a durably referenced report/capture can still be needed on replay.
+        keep = {self.report_path().name} if self.current else set()
+        if self.current and "capture" in self.current:
+            keep.update(path.name for path in self.capture_paths())
+        with os.scandir(self.reports) as entries:
+            for entry in entries:
+                if (entry.name not in keep and re.fullmatch(
+                        r"[a-f0-9]{32}\.(?:txt|native\.txt|result\.json)(?:\.tmp)?", entry.name)):
+                    os.unlink(entry.path)
+        sync_directory(self.reports)
 
     def report_path(self):
         return self.reports / (self.current["id"] + ".txt")
@@ -161,6 +183,7 @@ class Journal:
                 if null > 2:
                     os.close(null)
                 env = dict(os.environ, FM_STATE_OVERRIDE=str(self.state))
+                cursor_before = status_cursor(self.state)
                 with output.open("w") as stream:
                     try:
                         process = subprocess.Popen(
@@ -180,7 +203,8 @@ class Journal:
                         code = 1
                     stream.flush()
                     os.fsync(stream.fileno())
-                atomic_json(result_path, {"exitCode": code})
+                atomic_json(result_path, {"exitCode": code, "cursorBefore": cursor_before,
+                                          "cursorAfter": status_cursor(self.state)})
                 os._exit(0)
             except BaseException:
                 os._exit(1)
@@ -195,6 +219,10 @@ class Journal:
         report = output.read_text()
         if result.get("exitCode") != 0:
             raise RuntimeError(f"Native wake operation failed ({result.get('exitCode')}); report retained at {output}")
+        before = result.get("cursorBefore")
+        self.status_unchanged = (isinstance(before, str)
+                                 and re.fullmatch(r"[a-f0-9]{64}", before) is not None
+                                 and before == result.get("cursorAfter"))
         return report
 
     def start(self):
@@ -305,7 +333,10 @@ class Journal:
         acknowledgement = self.current.get("ackReport", "")
         old_report = self.report()
         pair = ack_pair(fresh)
-        if not pair and not meaningful(acknowledgement) and meaningful(fresh) in {"", meaningful(old_report)}:
+        # Equal text can describe a new failure. Only suppress a repeated native
+        # surface when its durable presentation cursor proves nothing advanced.
+        unchanged = self.status_unchanged and meaningful(fresh) == meaningful(old_report)
+        if not pair and not meaningful(acknowledgement) and (not meaningful(fresh) or unchanged):
             self.clear()
         else:
             report = ("NATIVE ACKNOWLEDGEMENT OUTPUT (previous handling completed):\n" + acknowledgement + "\n" if meaningful(acknowledgement) else "") + fresh
@@ -338,6 +369,7 @@ def main():
     with (state / ".bb-wake-receipt.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         journal = Journal(state, script)
+        journal.prune_reports()
         if action == "receive":
             journal.receive()
         elif action == "inspect":
@@ -353,6 +385,7 @@ def main():
             if not pair or expected != str(pair["through"]) + ":" + pair["generation"]:
                 raise RuntimeError("Legacy acknowledgement does not match the current receipt; nothing consumed")
             journal.complete(journal.current["id"])
+        journal.prune_reports()
 
 
 if __name__ == "__main__":
