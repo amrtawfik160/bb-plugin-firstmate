@@ -123,6 +123,42 @@ test("mark-success survives process restart and receive completes only acknowled
   assert.equal(f.read().acks, 1);
 });
 
+test("begin-action survives a crash and never authorizes blindly repeating the action", (t) => {
+  const f = fixture(t, { queue: [{ seq: 1, text: "merge once" }] });
+  const first = f.run();
+  assert.equal(f.run("begin-action", first.id!).phase, "acting");
+  // External action could have committed here before the caller process died.
+  const resumed = f.run();
+  assert.equal(resumed.id, first.id);
+  assert.equal(resumed.phase, "acting");
+  assert.equal(resumed.replayed, true);
+  assert.notEqual(f.raw("inspect", first.id!).status, 0);
+  assert.notEqual(f.raw("begin-action", first.id!).status, 0);
+  assert.equal(f.read().acks, undefined);
+  assert.deepEqual(f.read().queue, [{ seq: 1, text: "merge once" }]);
+});
+
+test("begin-action followed by mark-success permits acknowledgement-only recovery", (t) => {
+  const f = fixture(t, { queue: [{ seq: 1, text: "successful final action" }] });
+  const first = f.run();
+  f.run("begin-action", first.id!);
+  assert.equal(f.run("mark-success", first.id!).phase, "handled");
+  assert.equal(f.run().completed, first.id);
+  assert.equal(f.read().acks, 1);
+  assert.deepEqual(f.read().queue, []);
+});
+
+test("uncertain action may be explicitly completed after external-state reconciliation", (t) => {
+  const f = fixture(t, { queue: [{ seq: 1, text: "uncertain final action" }] });
+  const first = f.run();
+  f.run("begin-action", first.id!);
+  assert.equal(f.run().phase, "acting");
+  const reconciled = f.run("complete", first.id!);
+  assert.equal(reconciled.id, null);
+  assert.equal(reconciled.completed, first.id);
+  assert.equal(f.read().acks, 1);
+});
+
 test("wrong receipt and mismatched legacy acknowledgement never invoke native", (t) => {
   const f = fixture(t, { queue: [{ seq: 1, text: "keep me" }] });
   const first = f.run();
