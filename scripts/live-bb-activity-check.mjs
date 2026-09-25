@@ -60,7 +60,7 @@ exec ${JSON.stringify(realBb)} "$@"
   const bin = join(home, "bin-bb");
   const env = { ...process.env, FM_HOME: home, FM_ROOT_OVERRIDE: home, FM_STATE_OVERRIDE: join(home, "state"), FM_CONFIG_OVERRIDE: join(home, "config"), FM_BACKEND: "bb", FM_POLL: "1", FM_STALE_ESCALATE_SECS: "8", FM_BUSY_TURN_MAX_SECS: "8", FM_WATCH_HANDLING_SUCCESSOR: "1", FM_HEARTBEAT: "300", PROOF_BRIDGE: bridge, PROOF_BIN: bin };
   const shell = code => command("bash", ["-c", 'export PATH="$PROOF_BRIDGE:$PATH"; ' + code], { env });
-  writeFileSync(join(scratch, "prompt"), `This is an isolated transport acceptance test. Do not edit files or use firstmate tools. Immediately run one exec_command: python3 -u -c 'import time,pathlib; [(print("activity-proof", i, flush=True), time.sleep(2)) for i in range(18)]; pathlib.Path(${JSON.stringify(join(scratch, "silent"))}).touch(); time.sleep(40)' with yield_time_ms=1000. Continue waiting with write_stdin until it finishes. If a Firstmate instruction arrives, read and move its inbox record as requested; it only asks for acknowledgement. Finish DONE: activity proof complete. No planning or research.`);
+  writeFileSync(join(scratch, "prompt"), `This is an isolated transport acceptance test. Do not edit files or use firstmate tools. Immediately run one exec_command: python3 -u -c 'import time,pathlib; [(print("activity-proof", i, flush=True), time.sleep(2)) for i in range(18)]; pathlib.Path(${JSON.stringify(join(scratch, "silent"))}).touch(); time.sleep(70)' with yield_time_ms=1000. Continue waiting with write_stdin using yield_time_ms=30000 until it finishes. If a Firstmate instruction arrives, read and move its inbox record as requested; it only asks for acknowledgement. Finish DONE: activity proof complete. No planning or research.`);
   const spawned = json("thread", "spawn", "--project", project, "--environment", root, "--title", "Disposable Firstmate activity proof", "--prompt-file", join(scratch, "prompt"), "--visibility", "hidden", "--json");
   threadId = spawned.id ?? spawned.thread?.id;
   assert.ok(threadId);
@@ -89,6 +89,13 @@ exec ${JSON.stringify(realBb)} "$@"
   assert.equal(watcher.exitCode, null, `watcher exited early: ${watcherOut}`);
   assert.doesNotMatch(watcherOut, /possible wedge|demand-deep-inspection|activity capture failed/);
   report("real native watcher survives tool work beyond both accelerated bounds", "18s observation / 8s busy bound / 8s wedge threshold");
+  for (let i = 0; i < 45 && !existsSync(join(scratch, "silent")); i++) await delay(1000);
+  assert.ok(existsSync(join(scratch, "silent")), "owned command never entered its silent phase");
+  for (let i = 0; i < 50 && watcher.exitCode === null; i++) await delay(1000);
+  assert.equal(watcher.exitCode, 0, `native watcher did not detect the stalled tool: ${watcherOut}`);
+  assert.match(watcherOut, /possible wedge/);
+  report("real native watcher still escalates an active silent tool", "recorded progress stopped; true stall remained visible");
+  watcher = undefined;
   const inbox = join(home, "state", "proof.inbox"); mkdirSync(inbox); mkdirSync(join(inbox, "handled"));
   writeFileSync(join(inbox, "001.msg"), "Acknowledge this transport proof by moving this file to handled/. Continue the running command.\n");
   env.PROOF_RECORD = join(inbox, "001.msg");
@@ -97,13 +104,6 @@ exec ${JSON.stringify(realBb)} "$@"
   const events = json("thread", "log", threadId, "--json", "--all");
   assert.ok(events.some(row => JSON.stringify(row.data).includes(": Firstmate instruction waiting:")), "real steer was not accepted into thread events");
   report("real native inbox ring accepts a running-thread steer", "no composer skip; event-log delivery confirmed");
-  for (let i = 0; i < 45 && !existsSync(join(scratch, "silent")); i++) await delay(1000);
-  assert.ok(existsSync(join(scratch, "silent")), "owned command never entered its silent phase");
-  for (let i = 0; i < 35 && watcher.exitCode === null; i++) await delay(1000);
-  assert.equal(watcher.exitCode, 0, `native watcher did not detect the stalled tool: ${watcherOut}`);
-  assert.match(watcherOut, /possible wedge/);
-  report("real native watcher still escalates an active silent tool", "recorded progress stopped; true stall remained visible");
-  watcher = undefined;
   bb("thread", "wait", threadId, "--timeout", "90s", "--json");
   const stable = capture(); await delay(1200); assert.equal(capture(), stable);
   report("quiet captures do not invent activity between polls");
@@ -121,6 +121,9 @@ exec ${JSON.stringify(realBb)} "$@"
 } finally {
   if (watcher) { watcher.kill("SIGTERM"); await new Promise(resolve => watcher.once("exit", resolve)); }
   if (threadId) {
+    try {
+      for (const row of json("thread", "queue", "list", threadId, "--json")) bb("thread", "queue", "delete", threadId, row.id, "--json");
+    } catch (error) { console.error(`queue cleanup: ${error}`); }
     for (const args of [["thread", "stop", threadId], ["thread", "archive", threadId]]) {
       try { bb(...args); } catch (error) { console.error(`cleanup: ${error}`); }
     }
