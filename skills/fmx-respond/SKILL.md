@@ -14,8 +14,8 @@ metadata:
 
 <!-- BB-SOURCE
      native: .agents/skills/fmx-respond/SKILL.md
-     sha: 8c47279f54e379e8ffa86a8d3a5b568f23ccf281
-     snapshot: native-snapshot/8c47279f/.agents/skills/fmx-respond/SKILL.md
+     sha: b42d4fa8a752fad9a5f0235783b02534bce29219
+     snapshot: native-snapshot/b42d4fa8/.agents/skills/fmx-respond/SKILL.md
      fidelity: verbatim
 -->
 

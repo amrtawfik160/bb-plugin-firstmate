@@ -3,7 +3,7 @@
 #
 # BB owns the task worktree (managed-worktree) and the agent endpoint (a BB
 # thread). There is no TUI composer: send is `bb thread tell`, capture is
-# `bb thread output`, kill is `bb thread stop`. Treehouse is not used.
+# `bb firstmate activity`, kill is `bb thread stop`. Treehouse is not used.
 #
 # Target string: `bb:<thread-id>` (preferred; all BB windows share session `bb`
 # for one push wait) or a bare `thr_...`. Spawn writes window=bb:<thread-id>
@@ -307,12 +307,64 @@ fm_backend_bb_capture() {  # <thread-id> <lines> [expected-label]
   local id lines=${2:-40} out
   id=$(fm_backend_bb_thread_id "$1")
   fm_backend_bb_tool_check || return 1
-  out=$(bb thread output --json "$id" 2>/dev/null) || {
-    out=$(fm_backend_bb_show "$id" 2>/dev/null) || return 1
-    printf '%s\n' "$out"
-    return 0
+  out=$(bb firstmate activity "$id" --json) || {
+    echo "error: BB activity capture failed for $id; install matching firstmate server and adapter" >&2
+    return 1
   }
-  printf '%s' "$out" | fm_backend_bb_json_field output 2>/dev/null | tail -n "$lines"
+  # A recorded event identity changes for real model/tool progress; repeated reads
+  # of a quiet thread are byte-identical. Never hash updatedAt or the poll clock.
+  printf '%s' "$out" | python3 -c '
+import fcntl, json, os, sys, tempfile
+from pathlib import Path
+try:
+    data = json.load(sys.stdin)
+    if data.get("version") != 1 or data.get("threadId") != sys.argv[1]:
+        raise ValueError("unsupported or mismatched activity snapshot")
+    output = data.get("output")
+    if not isinstance(output, str):
+        raise ValueError("missing output")
+    activity = data.get("activity")
+    marker = "none"
+    if activity is not None:
+        if not isinstance(activity, dict) or not isinstance(activity.get("seq"), int) or not isinstance(activity.get("createdAt"), (int, float)) or not isinstance(activity.get("type"), str):
+            raise ValueError("invalid activity event")
+        marker = "%s %s %s" % (activity["seq"], activity["createdAt"], activity["type"])
+    # Native bounds long busy turns with <task>.progress, not pane churn alone.
+    # Publish the event timestamp exactly, including on the first read of an old
+    # event. A polling clock would hide real stalls indefinitely.
+    state = Path(sys.argv[3]) if sys.argv[3] else None
+    if state is not None and state.is_dir() and activity is not None:
+        matches = []
+        for meta in state.glob("*.meta"):
+            fields = dict(line.split("=", 1) for line in meta.read_text().splitlines() if "=" in line)
+            if fields.get("backend") == "bb" and fields.get("window") == "bb:" + sys.argv[1] and fields.get("bb_thread_id") == sys.argv[1]:
+                matches.append(meta)
+        if len(matches) > 1:
+            raise ValueError("ambiguous BB task metadata")
+        if matches:
+            progress = matches[0].with_suffix(".progress")
+            event_time = activity["createdAt"] / 1000
+            with (state / ".bb-progress.lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                if not progress.exists() or progress.stat().st_mtime < event_time:
+                    temp_name = None
+                    try:
+                        with tempfile.NamedTemporaryFile(mode="w", dir=state, prefix=".bb-progress-", delete=False) as temp:
+                            temp_name = temp.name
+                            temp.write(marker + "\n")
+                        os.utime(temp_name, (event_time, event_time))
+                        os.replace(temp_name, progress)
+                        temp_name = None
+                    finally:
+                        if temp_name is not None:
+                            os.unlink(temp_name)
+    lines = max(1, int(sys.argv[2]))
+    body = output.splitlines()[-max(0, lines - 1):] if lines > 1 else []
+    print("\n".join(body + ["[BB activity: " + marker + "]"]))
+except Exception as exc:
+    sys.stderr.write("error: invalid BB activity capture: %s\n" % exc)
+    sys.exit(1)
+' "$id" "$lines" "${FM_STATE_OVERRIDE:-${FM_HOME:+$FM_HOME/state}}"
 }
 
 fm_backend_bb_current_path() {  # <thread-id>
@@ -322,13 +374,54 @@ fm_backend_bb_current_path() {  # <thread-id>
 }
 
 fm_backend_bb_send_literal() {  # <thread-id> <text>
-  local id text=$2
+  local id text=$2 out queued
   id=$(fm_backend_bb_thread_id "$1")
   fm_backend_bb_tool_check || return 1
-  # Firstmate doorbells are wakeups, not mail for a later turn. Steering injects
-  # into an active BB turn and starts one when idle, matching the native terminal
-  # wake. The durable inbox record remains the source of truth across failures.
-  bb thread tell --json --mode steer "$id" "$text" >/dev/null
+  FM_BACKEND_BB_DELIVERY=
+  # The native watcher may ring an unhandled inbox again while BB is waiting on
+  # an interaction. Reuse that accepted queue row, not another identical steer.
+  case "$text" in
+    ': Firstmate instruction waiting: '*)
+      queued=$(bb thread queue list --json "$id") || return 1
+      out=$(printf '%s' "$queued" | python3 -c '
+import json, sys
+try:
+    rows = json.load(sys.stdin)
+    if not isinstance(rows, list):
+        raise ValueError("expected queue array")
+    for row in rows:
+        content = row.get("content", [])
+        if len(content) == 1 and content[0].get("type") == "text" and content[0].get("text") == sys.argv[1]:
+            print(json.dumps({"ok": True, "delivery": "queued", "queuedMessage": row}))
+            break
+except Exception as exc:
+    sys.stderr.write("error: invalid BB queue response: %s\n" % exc)
+    sys.exit(1)
+' "$text") || return 1
+      ;;
+    *) out= ;;
+  esac
+  if [ -z "$out" ]; then
+    out=$(bb thread tell --json --mode steer "$id" "$text") || return 1
+  fi
+  FM_BACKEND_BB_DELIVERY=$(printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    delivery = data.get("delivery")
+    if data.get("ok") is not True or delivery not in ("sent", "queued"):
+        raise ValueError("missing accepted delivery receipt")
+    if delivery == "queued":
+        row = data.get("queuedMessage", {})
+        if not isinstance(row, dict) or not row.get("id"):
+            raise ValueError("queued delivery has no queue id")
+        wait = row.get("waitingOn") or {}
+        sys.stderr.write("BB accepted queued steer %s (waiting on %s); do not resend.\n" % (row["id"], wait.get("kind", "dispatch")))
+    print(delivery)
+except Exception as exc:
+    sys.stderr.write("error: invalid BB send receipt: %s\n" % exc)
+    sys.exit(1)
+') || return 1
 }
 
 fm_backend_bb_send_text_line() {  # <thread-id> <text>
@@ -360,28 +453,78 @@ fm_backend_bb_send_key() {  # <thread-id> <key> [expected-label]
 
 fm_backend_bb_send_text_submit() {  # <thread-id> <text> <retries> <enter-sleep> <settle>
   fm_backend_bb_send_literal "$1" "$2" || { printf 'send-failed'; return 0; }
-  printf 'empty'
+  case "$FM_BACKEND_BB_DELIVERY" in
+    sent) printf 'empty' ;;
+    queued) printf 'pending' ;;  # accepted durably, not delivered into the turn yet
+  esac
 }
 
-fm_backend_bb_composer_state() {  # <thread-id> [expected-label] -> empty|pending|unknown
-  local state
-  state=$(fm_backend_bb_busy_state "$1")
-  case "$state" in
-    idle) printf 'empty' ;;
-    busy) printf 'pending' ;;
+fm_backend_bb_composer_state() {  # <thread-id> [expected-label] -> empty|unknown
+  # There is no terminal composer to overwrite. Execution, an accepted queue row,
+  # and an open interaction are separate BB states, never an unsent draft.
+  local status
+  status=$(fm_backend_bb_show "$1" 2>/dev/null | fm_backend_bb_json_field status 2>/dev/null) || {
+    printf 'unknown'; return 0;
+  }
+  case "$status" in
+    idle|stopped|error|failed|active|running|starting|working|pending|queued|stopping) printf 'empty' ;;
     *) printf 'unknown' ;;
   esac
+}
+
+# Positive wait evidence is read only at native's wedge threshold; stale or invalid
+# snapshots must never grant an indefinite exemption from inactivity checks.
+fm_backend_bb_pending_input() {  # <thread-id>
+  local id out
+  id=$(fm_backend_bb_thread_id "$1")
+  . "$(dirname -- "${BASH_SOURCE[0]}")/../fm-timeout-lib.sh"
+  out=$(fm_run_timed 5 bb firstmate activity "$id" --json) || {
+    echo "error: BB pending-input probe failed for $id; native wedge checks continue" >&2
+    return 1
+  }
+  printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] != 1 or data.get("threadId") != sys.argv[1]:
+        raise ValueError("unsupported or mismatched activity snapshot")
+    count = data.get("interactionCount")
+    if type(count) is not int or count < 0:
+        raise ValueError("invalid interaction count")
+    status = data.get("status")
+    if status not in ("active", "running", "working", "idle", "error", "failed", "stopped", "pending", "queued", "starting", "stopping"):
+        raise ValueError("invalid execution status")
+    sys.exit(0 if count > 0 and status in ("active", "running", "working", "idle") else 1)
+except Exception as exc:
+    sys.stderr.write("error: invalid BB pending-input snapshot: %s; native wedge checks continue\n" % exc)
+    sys.exit(1)
+' "$id"
 }
 
 fm_backend_bb_busy_state() {  # <thread-id>
-  local id status
+  local id out
   id=$(fm_backend_bb_thread_id "$1")
-  status=$(fm_backend_bb_show "$id" 2>/dev/null | fm_backend_bb_json_field status 2>/dev/null || true)
-  case "$status" in
-    idle|stopped|error|failed) printf 'idle' ;;
-    active|running|starting|working|pending|queued) printf 'busy' ;;
-    *) printf 'unknown' ;;
-  esac
+  out=$(bb firstmate activity "$id" --json) || { printf 'unknown'; return 0; }
+  printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    if data.get("version") != 1 or data.get("threadId") != sys.argv[1]:
+        raise ValueError("unsupported or mismatched activity snapshot")
+    if data.get("interactionCount", 0) > 0:
+        print("idle", end="")
+    elif data.get("runtimeStatus") in ("host-reconnecting", "waiting-for-host", "provisioning", "stopping"):
+        print("unknown", end="")
+    elif data.get("status") in ("active", "running", "working"):
+        print("busy", end="")
+    elif data.get("status") in ("idle", "stopped", "error", "failed"):
+        print("idle", end="")
+    else:
+        print("unknown", end="")
+except Exception as exc:
+    sys.stderr.write("error: invalid BB busy-state snapshot: %s\n" % exc)
+    print("unknown", end="")
+' "$id"
 }
 
 fm_backend_bb_agent_state() {  # <thread-id>

@@ -52,6 +52,10 @@ import { FIRSTMATE_ROUTINE_MARKER } from "./lib/timeline-noise.ts";
 
 const SKILLS = ["captain", "firstmate", ...UPSTREAM_SKILL_NAMES] as const;
 
+function wakeFrame(report: string): string {
+  return "FM_BB_RECEIPT=" + JSON.stringify({ id: "fixture", phase: "ready", report, path: "/tmp/report.txt", replayed: false, truncated: false });
+}
+
 async function load() {
   const host = createFakePluginHost({
     pluginId: "firstmate",
@@ -150,12 +154,12 @@ test("captain metadata loads the full skill set", async () => {
 
 test("complete upstream script surface is pinned and drift is reported", () => {
   const complete = compareUpstreamScriptSurface(UPSTREAM_SCRIPT_NAMES, "", PINNED_SCRIPT_SUPPORT_FILES);
-  assert.equal(complete.expected, 177);
-  assert.equal(complete.installed, 177);
+  assert.equal(complete.expected, UPSTREAM_SCRIPT_NAMES.length);
+  assert.equal(complete.installed, UPSTREAM_SCRIPT_NAMES.length);
   assert.deepEqual(complete.missing, []);
   assert.deepEqual(complete.extra, []);
-  assert.equal(complete.expectedSupport, 20);
-  assert.equal(complete.installedSupport, 20);
+  assert.equal(complete.expectedSupport, PINNED_SCRIPT_SUPPORT_FILES.length);
+  assert.equal(complete.installedSupport, PINNED_SCRIPT_SUPPORT_FILES.length);
   assert.deepEqual(complete.missingSupport, []);
   assert.deepEqual(complete.extraSupport, []);
   assert.deepEqual(complete.matches, [...UPSTREAM_SCRIPT_NAMES]);
@@ -380,7 +384,7 @@ test("dispatch refuses an uncertain secondmate handoff instead of duplicating wo
     ]);
     // A registered secondmate whose thread is dead: the routing send throws.
     await host.bb.storage.kv.set("secondmates", [
-      { projectId: "proj_1", threadId: "thr_dead", scope: "", projects: [], createdAt: "2026-01-01T00:00:00.000Z" },
+      { projectId: "proj_1", threadId: "thr_dead", scope: "login", projects: [], createdAt: "2026-01-01T00:00:00.000Z" },
     ]);
     host.harness.sdk.stub("threads.send", async () => { throw new Error("thread archived"); });
     host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew" }));
@@ -1641,7 +1645,7 @@ for (const kind of ["legacy scout", "native ship", "secondmate route"]) {
 // Opt-in acceptance: the actual native scripts run on this host, with all state
 // under dist/. Refusals happen before any endpoint cleanup; no live crew is used.
 for (const report of [false, true]) {
-  test(`scout forget native gates: ${report ? "missing inventory" : "missing report"}`,
+  test(`scout forget native gates: ${report ? "missing inventory with refused recovery" : "missing report"}`,
     { skip: !process.env.FM_SCOUT_NATIVE_BIN }, async () => {
       const nativeBin = process.env.FM_SCOUT_NATIVE_BIN!;
       assert.ok(existsSync(join(nativeBin, "fm-teardown.sh")), "native teardown required");
@@ -1686,7 +1690,11 @@ for (const report of [false, true]) {
         assert.notEqual(result.exitCode, 0);
         const refusal = report ? /has not passed the captain-call completion gate/ : /has no report at/;
         assert.match(result.stderr, refusal);
-        assert.equal(routed.seen.length, 1);
+        assert.equal(routed.seen.length, report ? 2 : 1);
+        if (report) {
+          assert.match(unwrapHostCommand(routed.seen[1]), /fm-captain-hold\.sh/);
+          assert.match(result.stderr, /acceptance refuses non-teardown command/);
+        }
         assert.equal(executions.length, 1);
         assert.match(executions[0], refusal);
         assert.doesNotMatch(result.stderr, /uncommitted file|UNPUSHED|using native dispatch/);
@@ -2793,7 +2801,7 @@ function withInstalledMirror(t: { skip: (msg: string) => void }, prefix: string,
 function fakeBbShowing(dir: string, status: string): string {
   const fakebin = join(dir, "fakebin");
   mkdirSync(fakebin, { recursive: true });
-  writeFileSync(join(fakebin, "bb"), `#!/bin/sh\ncase "$1 $2" in\n 'thread show') printf '%s\\n' '${JSON.stringify({ thread: { id: "thr_busy1", status } })}' ;;\n *) exit 0 ;;\nesac\n`, { mode: 0o755 });
+  writeFileSync(join(fakebin, "bb"), `#!/bin/sh\ncase "$1 $2" in\n 'firstmate activity') printf '%s\\n' '${JSON.stringify({ version: 1, threadId: "thr_busy1", status, runtimeStatus: status, interactionCount: 0, queuedMessageCount: 0, activity: null, output: "" })}' ;;\n 'thread show') printf '%s\\n' '${JSON.stringify({ thread: { id: "thr_busy1", status } })}' ;;\n *) exit 0 ;;\nesac\n`, { mode: 0o755 });
   return fakebin;
 }
 
@@ -2813,8 +2821,8 @@ test("an active BB crew classifies busy through the mirror (native herdr-only ve
     mkdirSync(state);
     writeFileSync(join(state, "c1.meta"), BB_SHARED_ENV_META);
     const classify = (bin: string, status: string) => spawnSync("bash", ["-c",
-      `. "$B/fm-backend.sh" && . "$B/fm-busy-lib.sh" && fm_busy_classify_meta "$S/c1.meta" c1 "$S"`,
-    ], { encoding: "utf8", env: { ...process.env, B: bin, S: state, FM_HOME: home, PATH: `${fakeBbShowing(join(work, status), status)}:${process.env.PATH}` } });
+      `export PATH="$FAKE_BIN:$PATH"; . "$B/fm-backend.sh" && . "$B/fm-busy-lib.sh" && fm_busy_classify_meta "$S/c1.meta" c1 "$S"`,
+    ], { encoding: "utf8", env: { ...process.env, B: bin, S: state, FM_HOME: home, FAKE_BIN: fakeBbShowing(join(work, status), status) } });
     assert.ok(lstatSync(join(home, "bin-bb", "fm-busy-lib.sh")).isFile() && !lstatSync(join(home, "bin-bb", "fm-busy-lib.sh")).isSymbolicLink(), "fm-busy-lib.sh must be a patched copy in the mirror");
     const busy = classify(join(home, "bin-bb"), "active");
     assert.equal(busy.status, 0, busy.stderr);
@@ -4410,7 +4418,7 @@ function ownerHost(extra: Record<string, unknown> = {}) {
   return createFakePluginHost({
     pluginId: "firstmate",
     agentSkillIds: SKILLS,
-    settings: { fmHome: "/tmp/fm-home", fmHostId: "host_1", ...extra },
+    settings: { fmHome: "/tmp/fm-home", fmHostId: "host_1", captainWakeBatchMs: 0, ...extra },
   });
 }
 
@@ -5411,12 +5419,12 @@ test("B2: `bb firstmate wake` presents the ack instruction as the bb command, no
     // Both the WAKE_ACK_REQUIRED consuming line AND the stale-ack advisory (the
     // consuming form the captain hit live, no WAKE_ACK_REQUIRED prefix) come through.
     host.harness.sdk.stub("terminals.output", async () =>
-      hostOutput(
+      hostOutput(wakeFrame(
         [
           "wake drain: nothing was acknowledged through 2 (none of your presented wake rows is at or below it); the current wake is row 4: run bin/fm-wake-drain.sh --ack-through 4 --recovery-generation g99 after handling it",
           "WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through 4 --recovery-generation g99",
         ].join("\n"),
-      ),
+      )),
     );
     const result = await host.harness.behavior.runCli(["wake"], { projectId: "proj_1", threadId: "thr_cap" });
     assert.equal(result.exitCode, 0, result.stderr);
@@ -5620,9 +5628,9 @@ const smRow = (over: Partial<{ projectId: string; threadId: string; scope: strin
 });
 
 test("pickSecondmate: home project and non-exclusive clone list are both eligible", () => {
-  const mates = [smRow({ projectId: "auth", threadId: "thr_auth", projects: ["billing"] })];
-  assert.equal(pickSecondmate(mates, "auth", "x")?.threadId, "thr_auth", "home project routes");
-  assert.equal(pickSecondmate(mates, "billing", "x")?.threadId, "thr_auth", "clone-list project routes");
+  const mates = [smRow({ projectId: "auth", threadId: "thr_auth", projects: ["billing"], scope: "authentication" })];
+  assert.equal(pickSecondmate(mates, "auth", "authentication issue")?.threadId, "thr_auth", "home project routes");
+  assert.equal(pickSecondmate(mates, "billing", "authentication issue")?.threadId, "thr_auth", "clone-list project routes");
   assert.equal(pickSecondmate(mates, "unrelated", "x"), undefined, "no fit → main home");
 });
 
@@ -5632,8 +5640,9 @@ test("pickSecondmate: scope word overlap disambiguates multiple eligible mates",
     smRow({ threadId: "thr_auth", scope: "authentication login sessions", projects: ["shared"], createdAt: "2026-01-02T00:00:00.000Z" }),
   ];
   assert.equal(pickSecondmate(mates, "shared", "fix the invoices billing bug")?.threadId, "thr_pay", "scope match wins over recency");
-  // No scope overlap → most recently registered wins the tie.
-  assert.equal(pickSecondmate(mates, "shared", "unrelated words here")?.threadId, "thr_auth", "recency breaks a scoreless tie");
+  // Project membership alone never transfers responsibility.
+  assert.equal(pickSecondmate(mates, "shared", "unrelated words here"), undefined);
+  assert.equal(pickSecondmate([mates[0]!], "shared", "and the unrelated bug"), undefined);
 });
 
 test("pickSecondmate: equal scope scores break the tie to the most recent registration", () => {
@@ -5784,7 +5793,7 @@ test("queue real: native add refusal preserves the cache", async () => {
 // presents, what the crew's durable record contains), not just the emitted command
 // string. Skipped when the real scripts are absent (e.g. CI without them).
 
-const FM_TEST_BIN = process.env.FM_TEST_BIN ?? "/root/firstmate/bin";
+const FM_TEST_BIN = process.env.FM_TEST_BIN ?? join(process.env.FM_TEST_HOME ?? "/root/firstmate", "bin");
 const FM_INTEGRATION =
   existsSync(join(FM_TEST_BIN, "fm-wake-lib.sh")) &&
   existsSync(join(FM_TEST_BIN, "fm-wake-drain.sh")) &&
@@ -5830,7 +5839,7 @@ function itHost(home: string, extra: Record<string, unknown>) {
   return createFakePluginHost({
     pluginId: "firstmate",
     agentSkillIds: SKILLS,
-    settings: { fmHome: home, fmHostId: "host_1", ...extra },
+    settings: { fmHome: home, fmHostId: "host_1", captainWakeBatchMs: 0, ...extra },
   });
 }
 
@@ -6027,7 +6036,7 @@ test("Part B: notifyOwner=real — a failure still doorbells the captain and req
     assert.match(text, /crew c1 failed/, text);
     // Failure delivery must not silently consume the durable report: the captain
     // acknowledges it explicitly, in one firstmate_wake ack=true call.
-    assert.match(text, /firstmate_wake once with ack=true/);
+    assert.match(text, /Call firstmate_wake once/);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -7016,7 +7025,7 @@ for (const entry of ["tool", "cli"] as const) {
           elapsed = scenario.elapsed;
           return { chunks: [], nextSeq: 0 };
         }
-        return hostRcPayload("DRAIN_FINISHED\nWAKE_ACK_REQUIRED: bin/fm-wake-drain.sh --ack-through 2 --recovery-generation g1", 0);
+        return hostRcPayload(wakeFrame("DRAIN_FINISHED\nWAKE_ACK_REQUIRED: bin/fm-wake-drain.sh --ack-through 2 --recovery-generation g1"), 0);
       });
       let output: string;
       if (entry === "tool") {
@@ -7301,7 +7310,7 @@ test("IT native secondmate seed and spawn use the BB captain adapter", { skip: !
   const home = join(dir, "main");
   const child = join(dir, "child");
   try {
-    assert.equal(spawnSync("git", ["clone", "--quiet", "--shared", "/root/firstmate", home]).status, 0);
+    assert.equal(spawnSync("git", ["clone", "--quiet", "--shared", discoverFirstmateCheckout()!, home]).status, 0);
     assert.equal(spawnSync("python3", [join(OVERLAY_ROOT, "install-bb-backend.py"), "--home", home]).status, 0);
     mkdirSync(join(home, "data"), { recursive: true });
     const fakebin = join(dir, "fakebin"); mkdirSync(fakebin);
@@ -7444,7 +7453,7 @@ test("IT BB bootstrap uses browser plugin without requiring AXI browser", { skip
   const host = itHost(home, {});
   await plugin(host.bb);
   try {
-    assert.equal(spawnSync("git", ["clone", "--quiet", "--shared", "/root/firstmate", home]).status, 0);
+    assert.equal(spawnSync("git", ["clone", "--quiet", "--shared", discoverFirstmateCheckout()!, home]).status, 0);
     const installed = spawnSync("python3", [join(OVERLAY_ROOT, "install-bb-backend.py"), "--home", home], { encoding: "utf8" });
     assert.equal(installed.status, 0, installed.stdout + installed.stderr);
     stubRealExecHost(host, { BASH_ENV: probe });
@@ -7508,7 +7517,7 @@ test("wake retries an exited terminal's failed output read without rerunning the
     host.harness.sdk.stub("terminals.get", async () => ({ status: "exited", exitCode: 0 }));
     host.harness.sdk.stub("terminals.output", async () => {
       if (++reads === 1) throw new Error("HTTP 504: Timed out reading terminal output");
-      return hostRcPayload("WAKE_PAYLOAD_RECOVERED", 0);
+      return hostRcPayload(wakeFrame("WAKE_PAYLOAD_RECOVERED"), 0);
     });
     host.harness.sdk.stub("terminals.close", async () => ({}));
     const result = await host.harness.behavior.runCli(["wake"], { threadId: "thr_cap" });
@@ -7530,7 +7539,7 @@ test("wake resolves an unconfigured host from the calling captain's environment"
       return { id: "term_cap" };
     });
     host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
-    host.harness.sdk.stub("terminals.output", async () => hostRcPayload("CAPTAIN_QUEUE", 0));
+    host.harness.sdk.stub("terminals.output", async () => hostRcPayload(wakeFrame("CAPTAIN_QUEUE"), 0));
     host.harness.sdk.stub("terminals.close", async () => ({}));
     const result = await host.harness.behavior.runCli(["wake"], { threadId: "thr_cap" });
     assert.equal(result.exitCode, 0, result.stderr);
@@ -7914,7 +7923,7 @@ test("non-hooked captain providers get explicit guard rules on deck", () => {
   const note = unhookedCaptainNote("acp-grok");
   assert.match(note, /acp-grok/);
   assert.match(note, /Never read bb\.db/);
-  assert.match(note, /ack=true/);
+  assert.match(note, /handledWake/);
 });
 
 
@@ -8002,7 +8011,7 @@ test("captain rate limit: read from provider events; a later successful turn cle
   assert.equal(captainWakeHold({ status: "error", rateLimit: null, now: 0 }).hold, true);
   assert.equal(captainWakeHold({ status: "active", rateLimit: null, now: 0 }).hold, false);
   const msg = heldWakesMessage({ since: 0, reason: "provider limit", lines: ["🔔 ✅ crew c1 done", "🛰️ fm-watch:\nstale: bb:thr_x"] });
-  assert.match(msg, /2 crew update\(s\) held/);
+  assert.match(msg, /2 crew update\(s\)/);
   assert.match(msg, /stale: bb:thr_x/);
   assert.match(msg, /firstmate_wake/);
 });
@@ -8971,4 +8980,143 @@ test("the landed sweep never wakes an archived (retired) owning captain", async 
   } finally {
     await host.harness.lifecycle.dispose();
   }
+});
+
+test("routine durable plugin wakes batch once; decisions bypass the delay", async () => {
+  const host = ownerHost({ notifyOwner: "real", captainWakeBatchMs: 30 });
+  await plugin(host.bb);
+  try {
+    stubRoutedHost(host, () => ({ code: 0 }));
+    captainAndCrewThreads(host);
+    host.harness.sdk.stub("threads.list", async () => []);
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await emitIdle(host, "DONE: first outcome");
+    await emitIdle(host, "DONE: second distinct outcome");
+    assert.equal(sendCalls(host).filter(s => s.threadId === "thr_cap").length, 0);
+    assert.ok(await host.bb.storage.kv.get("captain-wake-hold:thr_cap"), "persist batch before reporting delivery");
+    await new Promise(resolve => setTimeout(resolve, 70));
+    const sent = sendCalls(host).filter(s => s.threadId === "thr_cap");
+    assert.equal(sent.length, 1);
+    assert.match(sent[0]!.text, /first outcome/);
+    assert.match(sent[0]!.text, /second distinct outcome/);
+    assert.equal(await host.bb.storage.kv.get("captain-wake-hold:thr_cap"), undefined);
+    await emitIdle(host, "BLOCKED: credentials needed");
+    assert.equal(sendCalls(host).filter(s => s.threadId === "thr_cap").length, 2, "blocked input bypasses batching");
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("persisted routine batch survives restart and failed delivery", async () => {
+  const host = ownerHost({ notifyOwner: "real", captainWakeBatchMs: 30 });
+  await host.bb.storage.kv.set("captain-wake-hold:thr_cap", { since: Date.now() - 1000, dueAt: Date.now() - 500, reason: "routine event batch", lines: ["DONE: retained outcome"] });
+  await plugin(host.bb);
+  try {
+    captainAndCrewThreads(host);
+    host.harness.sdk.stub("threads.send", async () => { throw new Error("temporary transport failure"); });
+    await host.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_cap", status: "idle" }), lastAssistantText: "" } as never);
+    assert.ok(await host.bb.storage.kv.get("captain-wake-hold:thr_cap"), "failed delivery retains durable batch");
+    host.harness.sdk.stub("threads.send", async () => ({ ok: true, delivery: "sent" }));
+    await host.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_cap", status: "idle" }), lastAssistantText: "" } as never);
+    assert.equal(await host.bb.storage.kv.get("captain-wake-hold:thr_cap"), undefined);
+    assert.match(sendCalls(host).at(-1)!.text, /retained outcome/);
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("IT receipts replay across reload, reject failed final actions and complete on success", { skip: !FM_INTEGRATION }, async () => {
+  const home = scratchFmHome();
+  const host = itHost(home, { notifyOwner: "real" });
+  await plugin(host.bb);
+  try {
+    stubRealExecHost(host);
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await emitIdle(host, "BLOCKED: receipt delivery must survive until handled");
+    const tool = (name: string) => host.harness.inspection.registrations.agentTools.find(t => t.name === name)!;
+    const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
+    const presented = await tool("firstmate_wake").execute({ ack: true }, ctx);
+    assert.equal(typeof presented, "string");
+    const id = /WAKE_RECEIPT: ([a-f0-9]+)/.exec(presented as string)?.[1];
+    assert.ok(id, String(presented));
+    const journal = join(home, "state/cap-thr_cap/.bb-wake-receipt.json");
+    assert.ok(existsSync(journal), "ack=true never consumes an unseen report");
+    const replay = await tool("firstmate_wake").execute({}, ctx);
+    assert.match(String(replay), new RegExp(`WAKE_RECEIPT: ${id} \\(replayed\\)`));
+    const failed = await tool("firstmate_deliver").execute({ crewId: "absent", handledWake: id }, ctx);
+    assert.equal((failed as { isError: boolean }).isError, true);
+    assert.equal(JSON.parse(readFileSync(journal, "utf8")).phase, "acting", "failed action remains uncertain until reconciled");
+    assert.match(JSON.stringify(failed), /Reconcile external state/);
+    await tool("firstmate_wake").execute({ handledWake: id }, ctx);
+    await emitIdle(host, "BLOCKED: new receipt delivery must survive until handled");
+    const next = await tool("firstmate_wake").execute({}, ctx);
+    const nextId = /WAKE_RECEIPT: ([a-f0-9]+)/.exec(String(next))?.[1];
+    assert.ok(nextId);
+    const success = await tool("firstmate_memory").execute({ action: "show", handledWake: nextId }, ctx);
+    assert.doesNotMatch(JSON.stringify(success), /ACTION SUCCEEDED; wake completion is unconfirmed/);
+    const after = await tool("firstmate_wake").execute({}, ctx);
+    assert.doesNotMatch(String(after), /receipt delivery must survive until handled/);
+  } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test("batch timer send must not pin release service on abort", async () => {
+  const host = ownerHost({ notifyOwner: "real", captainWakeBatchMs: 10 });
+  await plugin(host.bb);
+  let unblock!: () => void;
+  let enter!: () => void;
+  const entered = new Promise<void>(r => enter = r);
+  try {
+    stubRoutedHost(host, () => ({ code: 0 }));
+    captainAndCrewThreads(host);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.send", async () => {
+      enter(); await new Promise<void>(r => unblock = r);
+      return { ok: true, delivery: "sent" };
+    });
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await emitIdle(host, "DONE: routine report");
+    await awaitWithin(entered, 1000, "batch timer never fired");
+    const run = host.harness.behavior.runService("captain-wake-release");
+    await new Promise(r => setTimeout(r, 30));
+    run.controller.abort();
+    try { await awaitWithin(run.done, 200, "release service blocked behind unsignalled timer lock"); }
+    finally { unblock(); await run.done; }
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("interaction urgency bypasses batching", async () => {
+  const host = ownerHost({ notifyOwner: "real", captainWakeBatchMs: 5000 });
+  await plugin(host.bb);
+  try {
+    stubRoutedHost(host, () => ({ code: 0 }));
+    captainAndCrewThreads(host);
+    host.harness.sdk.stub("threads.list", async () => []);
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await host.harness.behavior.emitThreadEvent("interaction.pending", { thread: makeThreadResponse({id:"thr_crew",status:"active"}) } as never);
+    assert.equal(sendCalls(host).filter(s => s.threadId === "thr_cap").length, 1, "interaction must be immediate");
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+
+test("native host operations can call back into activity without self-deadlock", async () => {
+  const host = ownerHost(); await plugin(host.bb);
+  try {
+    host.harness.sdk.stub("hosts.list", async () => [{ id: "host_1", name: "host_1" }]);
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_worker", status: "active" }));
+    host.harness.sdk.stub("threads.events.list", async () => []);
+    host.harness.sdk.stub("threads.output", async () => ({ output: "" }));
+    host.harness.sdk.stub("threads.interactions.list", async () => []);
+    host.harness.sdk.stub("terminals.create", async () => ({ id: "callback" }));
+    host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+    host.harness.sdk.stub("terminals.close", async () => ({}));
+    let callback = false;
+    host.harness.sdk.stub("terminals.output", async () => {
+      const result = await host.harness.behavior.runCli(["activity", "thr_worker", "--json"]);
+      assert.equal(result.exitCode, 0, result.stderr);
+      callback = true;
+      return hostRcPayload("native finished", 0);
+    });
+    await awaitWithin(host.harness.behavior.runCli(["fm", "--machine", "host_1", "peek", "task"]), 1000, "native callback deadlocked");
+    assert.equal(callback, true);
+  } finally { await host.harness.behavior.setSettings({ fmHome: "" }); await host.harness.lifecycle.dispose(); }
 });

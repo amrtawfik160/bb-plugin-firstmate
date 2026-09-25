@@ -1,4 +1,5 @@
 // bb-plugin-firstmate — firstmate-style crews native to BB.
+import { deflateSync } from "node:zlib";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -46,6 +47,8 @@ import {
   type Shape,
   type Verdict,
 } from "./lib/policy.ts";
+import { parseWakeReceipt, renderWakeReceipt, type WakeReceipt } from "./lib/wake-receipt.ts";
+import { readBbActivity } from "./lib/bb-activity.ts";
 import { rpcContract } from "./rpc.ts";
 import {
   UPSTREAM_FIRSTMATE_SHA,
@@ -202,13 +205,13 @@ export function formatSecondmate(m: Secondmate): string {
 
 export function pickSecondmate(mates: Secondmate[], projectId: string, task: string): Secondmate | undefined {
   const eligible = mates.filter((m) => m.projectId === projectId || m.projects.includes(projectId));
-  if (eligible.length <= 1) return eligible[0];
-  const words = new Set((task.toLowerCase().match(/[a-z0-9]+/g) ?? []).filter((t) => t.length > 2));
-  const score = (m: Secondmate): number => {
-    const toks = (m.scope.toLowerCase().match(/[a-z0-9]+/g) ?? []).filter((t) => t.length > 2);
-    return toks.reduce((n, t) => n + (words.has(t) ? 1 : 0), 0);
-  };
-  return [...eligible].sort((a, b) => score(b) - score(a) || b.createdAt.localeCompare(a.createdAt))[0];
+  const stop = new Set(["and", "the", "for", "with", "from", "this", "that", "all", "work", "tasks", "project", "fix", "handle"]);
+  const tokens = (text: string) => new Set((text.toLowerCase().match(/[a-z0-9]+/g) ?? []).filter((t) => t.length > 2 && !stop.has(t)));
+  const words = tokens(task);
+  const scored = eligible.map((mate) => ({ mate, score: [...tokens(mate.scope)].filter((t) => words.has(t)).length }))
+    .filter(({ score }) => score > 0)
+    .sort((a, b) => b.score - a.score || b.mate.createdAt.localeCompare(a.mate.createdAt));
+  return scored[0]?.mate;
 }
 
 const MAX_HELD = 20;
@@ -473,7 +476,7 @@ function fmMirrorStaleGuard(fmHome: string): string {
 // authoritative store; the chat doorbell is only a pointer to it, so a dropped doorbell can
 // never lose the report (it survives in state/.wake-queue).
 export const CAPTAIN_WAKE_DRAIN_HINT =
-  "Use `firstmate_wake` with ack=true now; handle the durable report silently.";
+  "Use `firstmate_wake` now; handle the durable report silently and complete its receipt on your final successful action.";
 
 function wakeOutputForCaptainTool(out: string): string {
   return out
@@ -499,12 +502,11 @@ export function captainWakeDoorbell(head: string, summary: string, opts?: { drai
 }
 
 // Every wake re-reads the captain's whole context once per model call, so the
-// guidance aims for ONE call: firstmate_wake ack=true presents and acknowledges
-// together. A wake that needs nothing from the captain must end with no text —
+// guidance piggybacks completion on the final action after the report is handled. A wake that needs nothing from the captain must end with no text —
 // the captain never saw the wake, so a "nothing new" reply is pure noise.
 const INTERNAL_WAKE_GUIDANCE = [
   "FIRSTMATE INTERNAL WAKE — hidden from the captain. Do not quote, paraphrase, or announce it.",
-  "Call firstmate_wake once with ack=true; it presents and acknowledges the durable reports in one call.",
+  "Call firstmate_wake once. Handle the full report, then pass its receipt id as handledWake on your final successful Firstmate action; use firstmate_wake handledWake only when no action remains. Never repeat a successful action to retry acknowledgement.",
   "Act only where a report needs action (review, merge, retry, decision). A stale line for a crew that already finished, or a crew WAITING: on an external run, needs nothing.",
   "If nothing needs the captain, end the turn with no reply text at all — never send 'nothing new', 'still in progress', or a status recap.",
   "Otherwise reply once with the concise material outcome, review item, needed decision, credential/login request, or blocker that remains after recovery.",
@@ -919,7 +921,7 @@ export function captainWakeHold(input: { status: string | null; rateLimit: Capta
 
 // One wake for everything held while the captain was unavailable.
 export function heldWakesMessage(held: { since: number; reason: string; lines: string[] }, max = 3000): string {
-  const head = `🔔 ${held.lines.length} crew update(s) held while you were unavailable (${held.reason}) since ${new Date(held.since).toISOString().slice(11, 16)} UTC:`;
+  const head = `🔔 ${held.lines.length} crew update(s) (${held.reason}) since ${new Date(held.since).toISOString().slice(11, 16)} UTC:`;
   const out: string[] = [head];
   let used = head.length;
   let shown = 0;
@@ -1051,7 +1053,7 @@ export function unhookedCaptainNote(providerId: string): string {
     `Captain harness note: this captain runs on ${providerId}, which does not load firstmate's turn-end and session-start hooks. Claude Code or Codex captains are recommended; ${providerId} works best as a crew provider.`,
     "Your only state is the firstmate_* tools. Never read bb.db, BB server logs, other captains' homes, or another project's files to reconstruct state.",
     "Report crew status only from a firstmate_crews/bearings/crew result from this turn; never from memory.",
-    "On a hidden wake, call firstmate_wake with ack=true; if nothing needs the captain, end the turn with no reply text.",
+    "On a hidden wake, read firstmate_wake, handle the batch and complete handledWake on your final action; if nothing needs the captain, end the turn with no reply text.",
   ].join("\n");
 }
 
@@ -1371,8 +1373,7 @@ const CAPTAIN_VISIBILITY_CONTRACT = [
   "Stay silent while tools and crews run: do not send commentary or progress updates. Send one concise captain-facing response only when an outcome, review, decision, approval, credential, login, blocker, or recovered failure needs the captain.",
   "Use the native firstmate_* tool whenever it exists. Never shell out to bb firstmate or call generic command tools for routine orchestration; those rows bypass the clean captain timeline. Use firstmate_fm for real scripts that have no native tool.",
   "Never paste tool output, worker reports, status lines, or internal records. Translate them into the project outcome, consequence, and next decision.",
-  "Speak when requested work finishes; work is ready for review; findings are ready; a decision, approval, credential, or login is needed; or a real blocker or failure remains after recovery.",
-  "A crew wake delivered during your turn is live input: absorb it before continuing, call firstmate_wake with ack=true when it points to durable state, and repeat only if it reports more unread wakes. Treat several crew wakes as one batch and leave none queued for a later turn.",
+  "A crew wake delivered during your turn is live input: absorb it before continuing, call firstmate_wake when it points to durable state, handle the full batch, then pass its receipt as handledWake on your final successful action. Repeat only for new reports. Treat several crew wakes as one batch and leave none queued for a later turn.",
   "Keep each captain-facing message concise. The final response must stand alone with every material outcome, consequence, needed decision, and full recorded PR URL.",
   "Your state is the firstmate_* tools and your own fmHome. Never read bb.db, BB server logs, other captains' homes, or another project's records.",
 ].join(" ");
@@ -1641,6 +1642,11 @@ export default async function plugin(bb: BbPluginApi) {
       type: "number",
       label: "Maximum automatic turn-end re-rings for unchanged wake contents; new contents reset the budget.",
       default: 3,
+    },
+    captainWakeBatchMs: {
+      type: "number",
+      label: "Coalesce plugin-owned durable routine wakes for this many milliseconds (0 = immediate, maximum 5000). Decisions and failures remain immediate. BB core child messages are outside this setting.",
+      default: 1500,
     },
     captainCompactAtTokens: {
       type: "number",
@@ -1995,6 +2001,10 @@ export default async function plugin(bb: BbPluginApi) {
       ? serializeLedger(`operation:${captain ?? "legacy"}`, operation)
       : operation();
   }
+  function withCliOperation<T>(argv: string[], captain: string | undefined, operation: () => Promise<T>): Promise<T> {
+    const wake = argv[0] === "wake" || (argv[0] === "fm" && argv.some(arg => ["wake-drain", "fm-wake-drain.sh"].includes(arg)));
+    return wake ? serializeLedger(`receipt:${captain ?? "legacy"}`, operation) : withLedgerOperation(argv[0] ?? "", captain, operation);
+  }
   async function writeQueue(items: QueueItem[]): Promise<void> {
     await serializeLedger(QUEUE_KEY, async () => {
       const owner = homeScope.getStore();
@@ -2116,14 +2126,25 @@ export default async function plugin(bb: BbPluginApi) {
   // KV-backed so a reload keeps them; released as ONE wake when the captain is back.
   const CAPTAIN_WAKE_HOLD_PREFIX = "captain-wake-hold:";
   const MAX_HELD_WAKES = 40;
-  const heldWakeSchema = z.object({ since: z.number(), reason: z.string(), lines: z.array(z.string()) });
+  const heldWakeSchema = z.object({ since: z.number(), reason: z.string(), lines: z.array(z.string()), dueAt: z.number().optional() });
+  const wakeBatchTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const wakeBatchAbort = new AbortController();
+  function scheduleWakeBatch(captain: string, delay: number): void {
+    if (wakeBatchTimers.has(captain)) return;
+    const timer = setTimeout(() => {
+      wakeBatchTimers.delete(captain);
+      void releaseHeldCaptainWakes(captain, AbortSignal.any([wakeBatchAbort.signal, AbortSignal.timeout(STUCK_HOST_CALL_MS)])).catch((error) => bb.log.warn(`wake batch retained for retry captain=${captain}: ${String(error)}`));
+    }, delay);
+    timer.unref?.();
+    wakeBatchTimers.set(captain, timer);
+  }
   const heldWakeLocks = new Map<string, Promise<unknown>>();
-  function withHeldWakeLock<T>(captain: string, fn: () => Promise<T>): Promise<T> {
+  function withHeldWakeLock<T>(captain: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     const prev = heldWakeLocks.get(captain) ?? Promise.resolve();
-    const run = prev.catch(() => {}).then(fn);
+    const run = prev.catch(() => {}).then(() => { signal?.throwIfAborted(); return fn(); });
     heldWakeLocks.set(captain, run);
     void run.finally(() => { if (heldWakeLocks.get(captain) === run) heldWakeLocks.delete(captain); }).catch(() => {});
-    return run;
+    return raceAbort(run, signal, STUCK_HOST_CALL_MS);
   }
   async function captainHoldState(parentThreadId: string, signal?: AbortSignal): Promise<{ hold: boolean; reason: string; status: string | null; archived: boolean }> {
     let status: string | null = null;
@@ -2149,12 +2170,12 @@ export default async function plugin(bb: BbPluginApi) {
     }
     return { ...captainWakeHold({ status, rateLimit, now: Date.now() }), status, archived };
   }
-  async function holdCaptainWake(parentThreadId: string, text: string, reason: string): Promise<void> {
+  async function holdCaptainWake(parentThreadId: string, text: string, reason: string, dueAt?: number): Promise<void> {
     await withHeldWakeLock(parentThreadId, async () => {
       const key = `${CAPTAIN_WAKE_HOLD_PREFIX}${parentThreadId}`;
       const prev = heldWakeSchema.safeParse(await bb.storage.kv.get<unknown>(key));
-      const lines = [...(prev.success ? prev.data.lines : []), truncate(text, 600)].slice(-MAX_HELD_WAKES);
-      await bb.storage.kv.set(key, { since: prev.success ? prev.data.since : Date.now(), reason, lines });
+      const lines = [...new Set([...(prev.success ? prev.data.lines : []), truncate(text, 600)])].slice(-MAX_HELD_WAKES);
+      await bb.storage.kv.set(key, { since: prev.success ? prev.data.since : Date.now(), reason, lines, dueAt: prev.success ? prev.data.dueAt : dueAt });
     });
   }
   // Release a captain's held wakes as one message once nothing holds it. Returns true when
@@ -2168,6 +2189,10 @@ export default async function plugin(bb: BbPluginApi) {
         return false;
       }
       if (held.data.lines.length === 0) { await bb.storage.kv.delete(key); return false; }
+      if ((held.data.dueAt ?? 0) > Date.now()) {
+        scheduleWakeBatch(parentThreadId, held.data.dueAt! - Date.now());
+        return false;
+      }
       const state = await captainHoldState(parentThreadId, signal);
       // An archived captain is retired: its held wakes are dropped, never re-sent every 30s.
       if (state.archived) { await bb.storage.kv.delete(key); return false; }
@@ -2176,12 +2201,12 @@ export default async function plugin(bb: BbPluginApi) {
       await bb.storage.kv.delete(key);
       bb.log.info(`captain ${parentThreadId}: released ${held.data.lines.length} held wake(s) as one`);
       return true;
-    });
+    }, signal);
   }
 
   // Deliver a wake to a captain, or hold it while the captain cannot take a turn. A held
   // wake counts as delivered: it is persisted and released as one consolidated wake.
-  async function deliverToCaptain(parentThreadId: string, text: string, crewId: string, signal?: AbortSignal): Promise<boolean> {
+  async function deliverToCaptain(parentThreadId: string, text: string, crewId: string, signal?: AbortSignal, urgent = false): Promise<boolean> {
     const state = await captainHoldState(parentThreadId, signal);
     // Host-wide sweeps (landed PRs, fm-watch relay) reach crews of captains the user
     // archived; a wake would revive a retired captain. The durable queue keeps the report.
@@ -2192,6 +2217,13 @@ export default async function plugin(bb: BbPluginApi) {
     if (state.hold) {
       await holdCaptainWake(parentThreadId, text, state.reason);
       bb.log.info(`captain ${parentThreadId} wake held for crew ${crewId}: ${state.reason}`);
+      return true;
+    }
+    const current = await settings.get();
+    const batchMs = Math.min(5000, Math.max(0, Number(current.captainWakeBatchMs) || 0));
+    if (current.notifyOwner === "real" && !urgent && batchMs > 0 && !/needs-decision|blocked|failed|failure|error|interaction/i.test(text)) {
+      await holdCaptainWake(parentThreadId, text, "routine event batch", Date.now() + batchMs);
+      scheduleWakeBatch(parentThreadId, batchMs);
       return true;
     }
     return sendCaptainWake(parentThreadId, text, crewId, signal);
@@ -2464,7 +2496,7 @@ export default async function plugin(bb: BbPluginApi) {
       await publishFleet();
       return;
     }
-    if (await deliverToCaptain(parentThreadId, doorbell, crew.id, signal)) {
+    if (await deliverToCaptain(parentThreadId, doorbell, crew.id, signal, ["error", "interaction", "needs-decision", "unknown"].includes(kind) || verdict === "BLOCKED" || verdict === "FAILED")) {
       await bb.storage.kv.set(deliveryKey, signature);
     }
     await publishFleet();
@@ -3671,7 +3703,7 @@ export default async function plugin(bb: BbPluginApi) {
     const task = input.task.trim().slice(0, MAX_TASK);
     if (task === "") throw new Error("Empty task.");
     const mates = await readSecondmates();
-    const mate = pickSecondmate(mates, input.projectId, task);
+    const mate = input.mode === "local-only" ? undefined : pickSecondmate(mates, input.projectId, task);
     if (mate !== undefined && mate.threadId !== input.parentThreadId) {
       // The mate thread may be dead/archived — if the routing send throws, do NOT
       // fail the dispatch: log and fall through to a normal native spawn so the
@@ -5500,7 +5532,7 @@ export default async function plugin(bb: BbPluginApi) {
         : `tasks-axi present${axiVer !== "" ? ` (v${axiVer}; needs >=${TASKS_AXI_MIN})` : ` (version unknown; needs >=${TASKS_AXI_MIN})`}`;
     const clone = await runOnHost(
       hostId,
-      `[ -d ${shQuote(`${path}/.git`)} ] && echo FM_EXISTS || git clone ${shQuote(repo)} ${shQuote(path)}`,
+      `if [ -d ${shQuote(`${path}/.git`)} ]; then echo FM_EXISTS; else git clone ${shQuote(repo)} ${shQuote(path)} && git -C ${shQuote(path)} checkout --detach ${shQuote(UPSTREAM_FIRSTMATE_SHA)}; fi`,
       timeoutMs,
       signal,
     );
@@ -5515,9 +5547,8 @@ export default async function plugin(bb: BbPluginApi) {
         hostId,
         [
           `if [ -n "$(git -C ${q} status --porcelain 2>/dev/null)" ]; then echo FM_FF_SKIP_DIRTY; else`,
-          `git -C ${q} fetch --quiet origin 2>&1 || echo FM_FF_FETCH_FAIL;`,
-          `up=$(git -C ${q} rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true);`,
-          `if [ -n "$up" ]; then git -C ${q} merge --ff-only "$up" 2>&1 && echo FM_FF_OK || echo FM_FF_NOFF; else echo FM_FF_NO_UPSTREAM; fi; fi`,
+          `git -C ${q} cat-file -e ${shQuote(`${UPSTREAM_FIRSTMATE_SHA}^{commit}`)} 2>/dev/null || git -C ${q} fetch --quiet origin ${shQuote(UPSTREAM_FIRSTMATE_SHA)} || exit 1;`,
+          `if git -C ${q} merge-base --is-ancestor HEAD ${shQuote(UPSTREAM_FIRSTMATE_SHA)}; then git -C ${q} merge --ff-only ${shQuote(UPSTREAM_FIRSTMATE_SHA)} 2>&1 && echo FM_FF_OK || echo FM_FF_NOFF; else echo FM_FF_NOFF; fi; fi`,
         ].join("\n"),
         timeoutMs,
         signal,
@@ -5526,7 +5557,7 @@ export default async function plugin(bb: BbPluginApi) {
       ffNote = out.includes("FM_FF_SKIP_DIRTY")
         ? "reused clone: fast-forward skipped (working tree dirty)"
         : out.includes("FM_FF_OK")
-          ? "reused clone: fast-forwarded to origin"
+          ? "reused clone: fast-forwarded to audited native pin"
           : out.includes("FM_FF_NOFF")
             ? "reused clone: not fast-forwardable (diverged); left as-is"
             : out.includes("FM_FF_NO_UPSTREAM")
@@ -5760,7 +5791,8 @@ export default async function plugin(bb: BbPluginApi) {
     env?: Record<string, string>;
     timeoutMs: number;
     signal?: AbortSignal;
-  }): Promise<{ exitCode: number | null; output: string; scriptPath: string }> {
+    receipt?: { action: "receive" | "inspect" | "begin-action" | "mark-success" | "complete" | "legacy-ack"; id?: string };
+  }): Promise<{ exitCode: number | null; output: string; scriptPath: string; receipt?: WakeReceipt }> {
     const script = normalizeFmScript(input.script);
     if (script === "spawn") await reconcileReturnedAfk(input.parentThreadId);
     if (["spawn", "pr-merge", "merge-local"].includes(script)) await guardReturnCatchup(input.hostId, input.fmHome);
@@ -5774,6 +5806,19 @@ export default async function plugin(bb: BbPluginApi) {
     })
       .filter(([, v]) => v !== "")
       .map(([k, v]) => `export ${k}=${shQuote(v)}`);
+    let receipt = input.receipt;
+    if (script === "wake-drain" && !receipt) {
+      if (input.args.length === 0) receipt = { action: "receive" };
+      else if (input.args.length === 4 && input.args[0] === "--ack-through" && input.args[2] === "--recovery-generation") {
+        receipt = { action: "legacy-ack", id: `${input.args[1]}:${input.args[3]}` };
+      } else throw new Error("Use firstmate_wake for wake presentation/completion; unsupported native wake arguments.");
+    }
+    // Compressed source stays under BB's 10KB command limit without staging a
+    // helper on every wake. Journal/report files are still written on the host.
+    const receiptRunner = receipt ? `import base64,zlib; exec(zlib.decompress(base64.b64decode("${deflateSync(Buffer.from(overlayBytes("bin/bb-wake-receipt.py"), "base64")).toString("base64")}")))` : "";
+    const invocation = receipt
+      ? `python3 -c ${shQuote(receiptRunner)} ${shQuote(wakeStateDir(input.fmHome, input.parentThreadId))} ${shQuote(receipt.action)} ${shQuote(receipt.id ?? "")} "$FM_BINDIR/${scriptLeaf}"`
+      : `"$FM_BINDIR/${scriptLeaf}" ${input.args.map(shQuote).join(" ")}`;
     const prelude = [
       ...fmBackendEnv({
         fmHome: input.fmHome,
@@ -5785,7 +5830,7 @@ export default async function plugin(bb: BbPluginApi) {
       fmBinDirAssign(input.fmHome),
       fmMirrorStaleGuard(input.fmHome),
       `if [ ! -f "$FM_BINDIR/${scriptLeaf}" ]; then echo "error: missing $FM_BINDIR/${scriptLeaf}" >&2; exit 127; fi`,
-      `"$FM_BINDIR/${scriptLeaf}" ${input.args.map(shQuote).join(" ")}`,
+      invocation,
     ]
       .filter((line) => line !== "")
       .join("\n");
@@ -5794,9 +5839,11 @@ export default async function plugin(bb: BbPluginApi) {
       const line = result.output.split("\n").find((l) => l.includes("FM_MIRROR_STALE"))?.trim() ?? "FM_MIRROR_STALE";
       bb.log.error(`bb mirror is STALE on host ${input.hostId} running fm-${script}: ${line}. Re-run the overlay installer against ${input.fmHome}; new native scripts are unmirrored and the three patched copies are frozen behind upstream.`);
     }
+    const parsed = receipt && result.exitCode === 0 ? parseWakeReceipt(result.output) : undefined;
     return {
       ...result,
-      output: script === "wake-drain" ? rewriteWakeAckLine(result.output) : result.output,
+      ...(parsed ? { receipt: parsed } : {}),
+      output: parsed ? rewriteWakeAckLine(renderWakeReceipt(parsed)) : result.output,
       scriptPath,
     };
   }
@@ -5887,6 +5934,7 @@ export default async function plugin(bb: BbPluginApi) {
     recoveryGeneration?: string,
     hostOverride?: string,
     signal?: AbortSignal,
+    receipt?: { action: "receive" | "inspect" | "begin-action" | "mark-success" | "complete"; id?: string },
   ): Promise<string> {
     const current = await settings.get();
     const fmHome = current.fmHome.trim();
@@ -5908,7 +5956,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     try {
       // D6: drain/ack only the CALLER captain's own scoped state plane.
-      const res = await runFmScript({ script: "wake-drain", args, hostId, fmHome, env: wakeStateEnv(fmHome, captainThreadId), timeoutMs: fmTimeoutMs("wake-drain", undefined), signal });
+      const res = await runFmScript({ script: "wake-drain", args, hostId, fmHome, parentThreadId: captainThreadId, receipt, env: wakeStateEnv(fmHome, captainThreadId), timeoutMs: fmTimeoutMs("wake-drain", undefined), signal });
       // B2: the native WAKE_ACK_REQUIRED line names the raw `bin/fm-wake-drain.sh
       // --ack-through`, which pasted verbatim acks the UNPARTITIONED root queue and can
       // consume another captain's rows. Rewrite it to the partition-safe bb command so
@@ -5927,12 +5975,14 @@ export default async function plugin(bb: BbPluginApi) {
   // fm-wake-drain's presentation. 0 when the queue is absent/unreadable.
   async function countUndrainedWakes(hostId: string, fmHome: string, captainThreadId: string | undefined): Promise<number> {
     const q = `${wakeStateDir(fmHome, captainThreadId)}/.wake-queue`;
+    const receipt = `${wakeStateDir(fmHome, captainThreadId)}/.bb-wake-receipt.json`;
     const cmd =
       `[ -f ${shQuote(q)} ] && awk -F '\\t' 'NF>=5 && $2 ~ /^[0-9]+$/ && ($3=="signal"||$3=="stale"){seen[$3"\\t"$4]=1} END{printf "FMWAKES=%d\\n", length(seen)}' ${shQuote(q)} || printf 'FMWAKES=0\\n'`;
     try {
       const res = await runOnHost(hostId, cmd, 15_000);
       const m = /FMWAKES=(\d+)/.exec(res.output);
-      return m ? parseInt(m[1]!, 10) : 0;
+      const receiptPending = await runOnHost(hostId, `[ ! -s ${shQuote(receipt)} ] || printf 'FMRECEIPT=1\\n'`, 15_000);
+      return (m ? parseInt(m[1]!, 10) : 0) + (receiptPending.output.includes("FMRECEIPT=1") ? 1 : 0);
     } catch {
       return 0;
     }
@@ -5978,7 +6028,7 @@ export default async function plugin(bb: BbPluginApi) {
       return;
     }
     const queuePath = `${wakeStateDir(fmHome, threadId)}/.wake-queue`;
-    const fingerprint = await runOnHost(hostId, `sha256sum ${shQuote(queuePath)}`, 15_000);
+    const fingerprint = await runOnHost(hostId, `(cat ${shQuote(queuePath)} ${shQuote(`${wakeStateDir(fmHome, threadId)}/.bb-wake-receipt.json`)} 2>/dev/null || true) | sha256sum`, 15_000);
     if (fingerprint.exitCode !== 0) return;
     const generation = fingerprint.output.split(/\s+/)[0];
     const generationKey = `${budgetKey}:generation`;
@@ -6014,7 +6064,7 @@ export default async function plugin(bb: BbPluginApi) {
         mode: "steer",
         input: captainWakeInput(
           `${pending} crew update(s) still need attention. ` +
-          "Use `firstmate_wake` with ack=true, handle them, then continue.",
+          "Use `firstmate_wake`, handle the batch, and complete its receipt on your final successful action.",
         ),
       });
       bb.log.info(`turn-end guard re-rang captain ${threadId} (${pending} pending, ${tag})`);
@@ -7177,7 +7227,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     for (const [parent, items] of byParent) {
       if (signal?.aborted) return;
-      if (await deliverToCaptain(parent, `🛰️ fm-watch:\n${items.map((i) => i.text).join("\n")}`, "fm-watch", signal)) {
+      if (await deliverToCaptain(parent, `🛰️ fm-watch:\n${items.map((i) => i.text).join("\n")}`, "fm-watch", signal, items.some(item => /^(signal|check):|demand-deep-inspection/.test(item.text)))) {
         for (const i of items) { seen.add(i.key); relayAttempts.delete(i.key); }
         continue;
       }
@@ -7523,10 +7573,43 @@ export default async function plugin(bb: BbPluginApi) {
     ) => ReturnType<Parameters<BbPluginApi["agents"]["registerTool"]>[0]["execute"]>;
     bb.agents.registerTool({
       ...tool,
+      parameters: tool.name === "firstmate_fm" ? (tool.parameters as unknown as z.ZodObject) : (tool.parameters as unknown as z.ZodObject).extend({
+        handledWake: z.string().min(1).optional().describe("Receipt ID; final successful action only."),
+      }),
       presentation: { ...tool.presentation, suppress: true },
       async execute(params, ctx) {
         try {
-          return await withLedgerOperation(tool.name, ctxString(ctx, "threadId"), () => inCaptainHome(ctxString(ctx, "threadId"), async () => markCaptainToolResult(await execute(params, ctx))));
+          const captain = ctxString(ctx, "threadId");
+          const receiptCall = typeof asRecord(params)["handledWake"] === "string" || tool.name === "firstmate_wake" || (tool.name === "firstmate_fm" && normalizeFmScript(String(asRecord(params)["script"] ?? "")) === "wake-drain");
+          const run = () => withLedgerOperation(tool.name, captain, () => inCaptainHome(captain, async () => {
+            const { handledWake, ...operation } = asRecord(params);
+            const id = typeof handledWake === "string" ? handledWake : undefined;
+            if (id && tool.name === "firstmate_fm") return markCaptainToolResult(toolError("Complete handledWake on a direct Firstmate action or firstmate_wake; generic scripts may call back into the wake API."));
+            const signal = asRecord(ctx)["signal"] as AbortSignal | undefined;
+            const journal = (action: "inspect" | "begin-action" | "mark-success" | "complete") => drainWakes(captain, undefined, undefined, undefined, signal, { action, id });
+            if (id && tool.name === "firstmate_wake") return markCaptainToolResult(await journal("complete"));
+            if (id) await journal("begin-action");
+            let result: Awaited<ReturnType<typeof execute>>;
+            const uncertain = `Wake ${id}: action outcome is uncertain. Reconcile external state before acting again, then complete with firstmate_wake handledWake. Do not blindly repeat ${tool.name}.`;
+            try { result = await execute(operation, ctx); }
+            catch (error) { throw new Error(`${String(error)}${id ? `\n${uncertain}` : ""}`); }
+            if (!id) return markCaptainToolResult(result);
+            if (typeof result !== "string" && result.isError) return markCaptainToolResult({
+              ...result, content: [...result.content, { type: "text", text: uncertain }],
+            });
+            let suffix: string;
+            try {
+              await journal("mark-success");
+              suffix = await journal("complete");
+            } catch (error) {
+              bb.log.error(`Action ${tool.name} succeeded but wake completion failed captain=${captain}: ${String(error)}`);
+              suffix = `ACTION SUCCEEDED; wake completion is unconfirmed. Do not repeat ${tool.name}. Retry firstmate_wake with handledWake=${id} only. ${String(error)}`;
+            }
+            return markCaptainToolResult(typeof result === "string" ? `${result}\n\n${suffix}` : {
+              ...result, content: [...result.content, { type: "text", text: suffix }],
+            });
+          }));
+          return receiptCall ? await serializeLedger(`receipt:${captain ?? "legacy"}`, run) : await run();
         } catch (error) {
           const message = error instanceof Error ? error.message : "Firstmate tool failed.";
           return markCaptainToolResult(toolError(message));
@@ -7549,7 +7632,7 @@ export default async function plugin(bb: BbPluginApi) {
     const done = picked.complete
       ? "The firstmate_contract read is now complete."
       : "This firstmate_contract read covers the listed sections; read any other section by name before acting in its area.";
-    return `${picked.text}\n\n## BB runtime adaptations\n${BB_SKILL_RUNTIME_CONTRACT}\n${CAPTAIN_VISIBILITY_CONTRACT}\n${done} Treat native policy refusals as refusals. Read and acknowledge durable reports with one firstmate_wake ack=true call.\n`;
+    return `${picked.text}\n\n## BB runtime adaptations\n${BB_SKILL_RUNTIME_CONTRACT}\n${CAPTAIN_VISIBILITY_CONTRACT}\n${done} Treat native policy refusals as refusals. Read durable reports with firstmate_wake; pass handledWake on the final successful action after handling the whole batch.\n`;
   }
 
   async function checkToolchain(hostId: string, fmHome: string, signal?: AbortSignal) {
@@ -7743,28 +7826,15 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_wake",
-    description:
-      "Drain the real firstmate wake queue: durable crew→captain notifications, unread crew statuses, and open decisions that a dropped doorbell would otherwise lose. Run this when doorbelled (notifyOwner=real) or on deck. Pass ack=true to present and acknowledge in ONE call (preferred: each extra call re-reads the whole captain context). Open decisions stay open after acknowledgment. Or pass ackThrough + recoveryGeneration (from the WAKE_ACK_REQUIRED line) to consume rows after a separate present.",
+    description: "Read durable reports into a recoverable receipt. Handle the whole batch, then pass handledWake on the final successful Firstmate action, or on this tool when no action remains. Open decisions remain open. ack=true is a read-only compatibility alias; it never acknowledges unseen work.",
     parameters: z.object({
-      ack: z.boolean().optional().describe("Present and acknowledge in one call"),
-      ackThrough: z.number().int().min(0).optional().describe("Consume wakes at/below this sequence (from WAKE_ACK_REQUIRED)"),
-      recoveryGeneration: z.string().optional().describe("Recovery generation token (from WAKE_ACK_REQUIRED)"),
+      ack: z.boolean().optional().describe("Compatibility alias: read into a durable receipt"),
+      ackThrough: z.number().int().min(0).optional().describe("Legacy acknowledgement; must match the outstanding receipt"),
+      recoveryGeneration: z.string().optional(),
     }),
-    async execute({ ack, ackThrough, recoveryGeneration }, ctx) {
-      // D6: the caller thread IS the captain — scope the drain/ack to its own queue.
-      const captain = ctxString(ctx, "threadId");
+    async execute({ ackThrough, recoveryGeneration }, ctx) {
       const signal = asRecord(ctx)["signal"] as AbortSignal | undefined;
-      const out = await drainWakes(captain, ackThrough, recoveryGeneration, undefined, signal);
-      if (ack !== true || ackThrough !== undefined) return wakeOutputForCaptainTool(out);
-      const pair = wakeAckFromOutput(out);
-      if (pair === null) return wakeOutputForCaptainTool(out);
-      await drainWakes(captain, pair.ackThrough, pair.recoveryGeneration, undefined, signal);
-      const presented = out
-        .split("\n")
-        .filter((line) => !/WAKE_ACK_REQUIRED|queued wakes pending/.test(line))
-        .join("\n")
-        .trim();
-      return `${presented === "" ? "No unread reports." : presented}\nAcknowledged through ${pair.ackThrough}.`;
+      return wakeOutputForCaptainTool(await drainWakes(ctxString(ctx, "threadId"), ackThrough, recoveryGeneration, undefined, signal));
     },
   });
 
@@ -8942,6 +9012,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "interrupt", summary: "Steer a hard stop without teardown", usage: "bb firstmate interrupt <crew-id>" },
       { name: "stop", summary: "Stop a crew thread", usage: "bb firstmate stop <crew-id>" },
       { name: "retry", summary: "Re-submit a failed turn, or relaunch with a new model/provider/reasoning", usage: "bb firstmate retry <crew-id> [--model m] [--provider p] [--reasoning-level l]" },
+      { name: "activity", summary: "Bounded real BB activity for the native watcher", usage: "bb firstmate activity <thread-id> --json" },
       { name: "bearings", summary: "Fleet digest", usage: "bb firstmate bearings [--json]" },
       { name: "wake", summary: "Drain the durable crew→captain wake queue (present, or --ack-through <seq> --recovery-generation <gen>)", usage: "bb firstmate wake [--ack-through <seq> --recovery-generation <gen>]" },
       { name: "deliver", summary: "Outcome + committed/uncommitted diff + PR", usage: "bb firstmate deliver <crew-id>" },
@@ -8961,7 +9032,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "migrate-owners", summary: "Project KV queue/decisions/afk/quiet/memory into the real files for owners set to real (idempotent)", usage: "bb firstmate migrate-owners [--json]" },
     ],
     async run(argv, ctx) {
-      return withLedgerOperation(argv[0] ?? "", ctxString(ctx, "threadId"), () => inCaptainHome(ctxString(ctx, "threadId"), async () => {
+      return withCliOperation(argv, ctxString(ctx, "threadId"), () => inCaptainHome(ctxString(ctx, "threadId"), async () => {
       if (argv[0] === "fm") {
         const json = argv.includes("--json");
         const fail = (message: string) => ({ exitCode: 1, stderr: message });
@@ -9303,6 +9374,12 @@ export default async function plugin(bb: BbPluginApi) {
             await bb.sdk.threads.updatePluginMetadata({ threadId: id, set });
             return reply({ marked: true, threadId: id, shape, task: taskId || null }, `Marked thread ${id} as ${shape} crew.`);
           }
+          case "activity": {
+            const threadId = rest[0];
+            if (!threadId) return fail("Usage: bb firstmate activity <thread-id> --json");
+            const activity = await readBbActivity(bb.sdk, threadId, signal);
+            return reply(activity, JSON.stringify(activity));
+          }
           case "bearings": {
             const snap = await bearingsSnapshot(flags.has("all") ? undefined : ctxThread, { realBacklog: true });
             return reply(snap.json, snap.text);
@@ -9311,7 +9388,8 @@ export default async function plugin(bb: BbPluginApi) {
             const ackRaw = flagStr(flags, "ack-through");
             const gen = flagStr(flags, "recovery-generation");
             const ackThrough = ackRaw !== undefined && /^\d+$/.test(ackRaw) ? Number(ackRaw) : undefined;
-            const out = await drainWakes(ctxString(ctx, "threadId"), ackThrough, gen, undefined, signal);
+            const handled = flagStr(flags, "handled-wake");
+            const out = await drainWakes(ctxString(ctx, "threadId"), ackThrough, gen, undefined, signal, handled ? { action: "complete", id: handled } : undefined);
             return reply({ drained: true, acked: ackThrough ?? null }, out);
           }
           case "deliver": {
@@ -10006,6 +10084,9 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.onDispose(async () => {
+    wakeBatchAbort.abort();
+    for (const timer of wakeBatchTimers.values()) clearTimeout(timer);
+    wakeBatchTimers.clear();
     for (const timer of nudgeTimers.values()) clearTimeout(timer);
     nudgeTimers.clear();
     // B3(c): only stop the keeper when it SHOULD stop — i.e. when the feature is off
