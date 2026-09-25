@@ -119,3 +119,10 @@ completed batches, pending recovery evidence and unrelated files.
 `node scripts/wake-receipt-mutation-check.mjs` confirms both regressions fail when
 reverting their respective fixes: text-only equality loses the new native event;
 disabling cleanup leaves files behind after empty/completed receipts.
+
+Follow-up validation: **500 passed, 0 failed, 0 skipped**, including the optional
+native scout gates. TypeScript and plugin build passed. All three receipt
+mutations failed their intended regression assertions. Independent behavior and
+safety re-reviews passed after fixing the malformed-journal finding; the latter
+verified byte-for-byte preservation of recovery evidence in all three capture
+phases. Gitleaks found no secrets in the two implementation commits.
