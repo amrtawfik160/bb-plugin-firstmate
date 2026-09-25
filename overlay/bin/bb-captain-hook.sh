@@ -7,8 +7,8 @@
 # load. These user-level entries restore the two harness-owned guarantees:
 #
 #   stop           Upstream fm-turnend-guard.sh's queued-wake predicate: a captain
-#                  may not end a turn while its wake queue holds unacknowledged
-#                  rows. Blocks with exit 2 (Claude and Codex both honor it) and
+#                  may not end a turn with unacknowledged queue rows or a pending
+#                  presentation receipt. Blocks with exit 2 and
 #                  never twice in one turn (stop_hook_active / stopHookActive).
 #   session-start  Runs the home's native fm-sessionstart-run.sh from inside the
 #                  harness process tree, so the session lock is owned by the real
@@ -38,10 +38,14 @@ case "$mode" in
     fi
     [ "$active" = "true" ] && exit 0
     queue="${state}/.wake-queue"
+    if [ -e "${state}/.bb-wake-receipt.json" ]; then
+      printf 'firstmate: a durable wake receipt still needs handling. Call firstmate_wake with ack=true to recover it; after handling all reports, pass handledWake on the final successful Firstmate action or firstmate_wake.\n' >&2
+      exit 2
+    fi
     [ -s "$queue" ] || exit 0
     rows=$(awk 'END { print NR }' "$queue" 2>/dev/null || echo 0)
     [ "${rows:-0}" -gt 0 ] 2>/dev/null || exit 0
-    printf 'firstmate: %s unhandled crew wake(s) for this captain. Call firstmate_wake with ack=true (reads and acknowledges in one call), handle anything actionable, then end the turn.\n' "$rows" >&2
+    printf 'firstmate: %s unhandled crew wake(s) for this captain. Call firstmate_wake with ack=true, handle all reports, then pass handledWake on the final successful Firstmate action or firstmate_wake.\n' "$rows" >&2
     exit 2
     ;;
   session-start)
