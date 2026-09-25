@@ -2,7 +2,7 @@
 """Keep native presentations until explicit handling completion.
 
 Usage: bb-wake-receipt.py STATE ACTION EXPECTED NATIVE_SCRIPT
-Actions: receive, inspect ID, mark-success ID, complete ID,
+Actions: receive, inspect ID, begin-action ID, mark-success ID, complete ID,
          legacy-ack THROUGH:GENERATION. receive uses an empty EXPECTED.
 Returns one bounded FM_BB_RECEIPT=<JSON> line; full reports stay on disk.
 """
@@ -18,7 +18,7 @@ import uuid
 
 
 FRAME_LIMIT = 6000
-PHASES = {"presenting", "ready", "handled", "acknowledging", "acknowledged", "refreshing"}
+PHASES = {"presenting", "ready", "acting", "handled", "acknowledging", "acknowledged", "refreshing"}
 ACK = re.compile(
     r"^WAKE_ACK_REQUIRED: [^\n]* --ack-through (\d+) --recovery-generation ([A-Za-z0-9._-]+)\s*$",
     re.MULTILINE,
@@ -235,13 +235,25 @@ class Journal:
 
     def inspect(self, expected):
         self.check_id(expected)
+        if self.current["phase"] == "acting":
+            raise RuntimeError("Wake action outcome is uncertain; reconcile external state before proceeding, do not repeat the action")
         if self.current["phase"] != "ready":
             raise RuntimeError("Wake handling already completed or is uncertain; retry firstmate_wake completion only, do not repeat the action")
         self.publish(True)
 
+    def begin_action(self, expected):
+        self.check_id(expected)
+        if self.current["phase"] != "ready":
+            raise RuntimeError("Wake action already started or completed; reconcile external state before proceeding, do not repeat the action")
+        # An interruption after this write has an uncertain external outcome.
+        # Receive must replay it for reconciliation, never reauthorize the action.
+        self.current["phase"] = "acting"
+        self.save()
+        self.publish(True)
+
     def mark_success(self, expected):
         self.check_id(expected)
-        if self.current["phase"] not in {"ready", "handled"}:
+        if self.current["phase"] not in {"ready", "acting", "handled"}:
             raise RuntimeError("Wake already completing; retry completion only, do not repeat the action")
         self.current.update(phase="handled", actionSucceeded=True)
         self.save()
@@ -250,7 +262,7 @@ class Journal:
     def complete(self, expected):
         self.check_id(expected)
         completed = self.current["id"]
-        if self.current["phase"] == "ready":
+        if self.current["phase"] in {"ready", "acting"}:
             self.current["phase"] = "handled"
             self.save()
         if self.current["phase"] == "presenting":
@@ -318,7 +330,7 @@ def main():
     if len(sys.argv) != 5:
         raise RuntimeError("Usage: bb-wake-receipt.py STATE ACTION EXPECTED NATIVE_SCRIPT")
     state, action, expected, script = sys.argv[1:]
-    if action not in {"receive", "inspect", "mark-success", "complete", "legacy-ack"}:
+    if action not in {"receive", "inspect", "begin-action", "mark-success", "complete", "legacy-ack"}:
         raise RuntimeError("Unknown wake receipt action")
     os.umask(0o077)
     state = Path(state).resolve()
@@ -330,6 +342,8 @@ def main():
             journal.receive()
         elif action == "inspect":
             journal.inspect(expected)
+        elif action == "begin-action":
+            journal.begin_action(expected)
         elif action == "mark-success":
             journal.mark_success(expected)
         elif action == "complete":
