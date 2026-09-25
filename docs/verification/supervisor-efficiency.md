@@ -90,3 +90,8 @@ audited native fixture. TypeScript, plugin build and 21-skill fidelity passed.
 All six supervisor mutations failed their intended regression assertions. The
 final independent Spec re-review confirmed all four of its findings resolved;
 the Standards shutdown finding is covered by the reproduced abort regression.
+
+The two optional native scout-gate cases also passed separately. Both execute
+real native teardown; the missing-inventory case deliberately refuses the
+subsequent completion repair in the host harness and verifies that crew state,
+files and BB endpoints remain intact.

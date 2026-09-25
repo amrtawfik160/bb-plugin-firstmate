@@ -1645,7 +1645,7 @@ for (const kind of ["legacy scout", "native ship", "secondmate route"]) {
 // Opt-in acceptance: the actual native scripts run on this host, with all state
 // under dist/. Refusals happen before any endpoint cleanup; no live crew is used.
 for (const report of [false, true]) {
-  test(`scout forget native gates: ${report ? "missing inventory" : "missing report"}`,
+  test(`scout forget native gates: ${report ? "missing inventory with refused recovery" : "missing report"}`,
     { skip: !process.env.FM_SCOUT_NATIVE_BIN }, async () => {
       const nativeBin = process.env.FM_SCOUT_NATIVE_BIN!;
       assert.ok(existsSync(join(nativeBin, "fm-teardown.sh")), "native teardown required");
@@ -1690,7 +1690,11 @@ for (const report of [false, true]) {
         assert.notEqual(result.exitCode, 0);
         const refusal = report ? /has not passed the captain-call completion gate/ : /has no report at/;
         assert.match(result.stderr, refusal);
-        assert.equal(routed.seen.length, 1);
+        assert.equal(routed.seen.length, report ? 2 : 1);
+        if (report) {
+          assert.match(unwrapHostCommand(routed.seen[1]), /fm-captain-hold\.sh/);
+          assert.match(result.stderr, /acceptance refuses non-teardown command/);
+        }
         assert.equal(executions.length, 1);
         assert.match(executions[0], refusal);
         assert.doesNotMatch(result.stderr, /uncommitted file|UNPUSHED|using native dispatch/);
