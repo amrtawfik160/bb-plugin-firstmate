@@ -561,3 +561,23 @@ index 9aaeb2e8..13e21c70 100644
    fi
    FM_SM_LIVE_RC=$rc
    if [ "$rc" -eq 0 ]; then
+diff --git a/bin/fm-watch.sh b/bin/fm-watch.sh
+index d31a0adf..980e8a69 100755
+--- a/bin/fm-watch.sh
++++ b/bin/fm-watch.sh
+@@ -1244,6 +1244,15 @@ wait_record() {  # <kind> <subject> <whom> <action> <age-record>
+ wedge_wait_evidence() {  # <task> -> one wait_record on stdout
+   local task=$1 last until statusf run
+   [ -n "$task" ] || return 1
++  local meta="$STATE/$task.meta" target
++  if [ -f "$meta" ] && [ "$(fm_backend_of_meta "$meta")" = bb ]; then
++    target=$(fm_backend_target_of_meta "$meta")
++    if [ -n "$target" ] && fm_backend_source bb && fm_backend_bb_pending_input "$target"; then
++      wait_record 'BB pending input' 'awaiting the captain - BB input requested' \
++        captain 'answer the pending BB interaction' ''
++      return 0
++    fi
++  fi
+   statusf="$STATE/$task.status"
+   last=$(last_status_line "$statusf")
+   if status_is_captain_held "$last"; then

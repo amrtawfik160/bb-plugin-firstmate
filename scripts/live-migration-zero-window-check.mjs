@@ -125,7 +125,7 @@ try {
 
   const install = (extra = []) => sh("python3", [INSTALLER, "--home", home, "--overlay", OVERLAY, ...extra]);
   const verify = () => sh("python3", [INSTALLER, "--home", home, "--verify"]);
-  const restoreNative = () => git(home, "checkout", "--", "bin/fm-backend.sh", "bin/fm-spawn.sh", "bin/fm-teardown.sh", "bin/fm-busy-lib.sh", "bin/fm-secondmate-liveness-lib.sh", "docs/configuration.md");
+  const restoreNative = () => git(home, "checkout", "--", "bin/fm-backend.sh", "bin/fm-spawn.sh", "bin/fm-teardown.sh", "bin/fm-busy-lib.sh", "bin/fm-secondmate-liveness-lib.sh", "bin/fm-watch.sh", "docs/configuration.md");
   const rmOrig = () => sh("bash", ["-c", `rm -f "${home}"/bin/fm-*.sh.orig "${home}"/docs/*.md.orig`]);
   const fastForward = () => { git(home, "fetch", "--quiet", "origin"); const up = git(home, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}").out.trim(); return git(home, "merge", "--ff-only", up); };
 

@@ -472,6 +472,32 @@ fm_backend_bb_composer_state() {  # <thread-id> [expected-label] -> empty|unknow
   esac
 }
 
+# Positive wait evidence is read only at native's wedge threshold; stale or invalid
+# snapshots must never grant an indefinite exemption from inactivity checks.
+fm_backend_bb_pending_input() {  # <thread-id>
+  local id out
+  id=$(fm_backend_bb_thread_id "$1")
+  . "$(dirname -- "${BASH_SOURCE[0]}")/../fm-timeout-lib.sh"
+  out=$(fm_run_timed 5 bb firstmate activity "$id" --json) || {
+    echo "error: BB pending-input probe failed for $id; native wedge checks continue" >&2
+    return 1
+  }
+  printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] != 1 or data.get("threadId") != sys.argv[1]:
+        raise ValueError("unsupported or mismatched activity snapshot")
+    count = data.get("interactionCount")
+    if type(count) is not int or count < 0:
+        raise ValueError("invalid interaction count")
+    sys.exit(0 if count > 0 else 1)
+except Exception as exc:
+    sys.stderr.write("error: invalid BB pending-input snapshot: %s; native wedge checks continue\n" % exc)
+    sys.exit(1)
+' "$id"
+}
+
 fm_backend_bb_busy_state() {  # <thread-id>
   local id out
   id=$(fm_backend_bb_thread_id "$1")
