@@ -95,3 +95,27 @@ The two optional native scout-gate cases also passed separately. Both execute
 real native teardown; the missing-inventory case deliberately refuses the
 subsequent completion repair in the host harness and verifies that crew state,
 files and BB endpoints remain intact.
+
+## Receipt correctness and retention follow-up
+
+The post-merge review reproduced two gaps: a newly appended failure could be
+consumed when its report text matched the prior presentation, and completed or
+empty reads retained every capture on disk. The guardian now records the native
+presentation cursor before and after execution. Equal report text is suppressed
+only when that durable cursor exists and did not advance; legacy captures without
+cursor evidence are retained conservatively.
+
+Report cleanup runs under the receipt lock, preserving the current report and
+recovery capture. It removes only helper-owned UUID report/capture files that are
+no longer referenced, including leftovers from the previous implementation.
+Invalid journals refuse cleanup. Unrelated files are untouched.
+
+Real native regressions append identical `failed:` and `note:` events during
+handling and require a successor receipt after the native cursor advances. A
+separate native open-decision case verifies that an unchanged persistent decision
+does not create an endless completion loop. Retention tests cover empty reads,
+completed batches, pending recovery evidence and unrelated files.
+
+`node scripts/wake-receipt-mutation-check.mjs` confirms both regressions fail when
+reverting their respective fixes: text-only equality loses the new native event;
+disabling cleanup leaves files behind after empty/completed receipts.

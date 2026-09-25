@@ -89,6 +89,10 @@ class Journal:
             if (value.get("version") != 1 or value.get("phase") not in PHASES
                     or not re.fullmatch(r"[a-f0-9]{32}", value.get("id", ""))):
                 raise RuntimeError("Invalid wake receipt journal; retained for recovery")
+            if value["phase"] in {"presenting", "acknowledging", "refreshing"} or "capture" in value:
+                capture = value.get("capture")
+                if not isinstance(capture, str) or not re.fullmatch(r"[a-f0-9]{32}", capture):
+                    raise RuntimeError("Invalid native capture reference; journal and evidence retained")
             pair = value.get("pair")
             if pair is not None and (not isinstance(pair.get("through"), int)
                     or pair["through"] < 0

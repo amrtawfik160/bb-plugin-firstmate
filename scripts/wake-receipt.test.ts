@@ -473,3 +473,23 @@ test("real native persistent open decisions complete without a receipt loop", { 
   assert.equal(f.run("complete", first.id, native).id, null);
   assert.deepEqual(readdirSync(join(f.state, ".bb-wake-reports")), []);
 });
+
+for (const phase of ["presenting", "acknowledging", "refreshing"]) {
+  test(`malformed ${phase} journal cannot prune unreferenced recovery evidence`, (t) => {
+    const f = fixture(t, { unread: "consumed failure evidence\n", failRead: true });
+    assert.notEqual(f.raw().status, 0);
+    const path = join(f.state, ".bb-wake-receipt.json");
+    const journal = JSON.parse(readFileSync(path, "utf8"));
+    const reports = join(f.state, ".bb-wake-reports");
+    journal.phase = phase;
+    delete journal.capture;
+    writeFileSync(join(reports, journal.id + ".txt"), "partial evidence\n");
+    writeFileSync(path, JSON.stringify(journal));
+    const before = readdirSync(reports).sort().map(name => [name, readFileSync(join(reports, name), "utf8")]);
+    const result = f.raw();
+    assert.notEqual(result.status, 0);
+    assert.deepEqual(readdirSync(reports).sort().map(name => [name, readFileSync(join(reports, name), "utf8")]), before);
+    assert.match(result.stderr, /Invalid native capture reference/);
+    assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), journal);
+  });
+}

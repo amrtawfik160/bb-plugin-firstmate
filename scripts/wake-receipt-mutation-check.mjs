@@ -11,6 +11,7 @@ const native = process.env.FIRSTMATE_TEST_NATIVE ?? "/tmp/firstmate-upstream-aud
 assert.ok(existsSync(join(native, "bin/fm-wake-drain.sh")), "real native fixture required");
 const scratch = mkdtempSync(join(tmpdir(), "fm-receipt-mutations-"));
 const cases = [
+  ["prune before validating recovery capture", 'if value["phase"] in {"presenting", "acknowledging", "refreshing"} or "capture" in value:', "if False:", "malformed .* journal"],
   ["discard equal text despite a new native status event", "unchanged = self.status_unchanged and", "unchanged =", "real native preserves a repeated new status"],
   ["retain completed and empty captures forever", "        journal.prune_reports()", "        # cleanup disabled by mutation", "empty reads and completed receipts do not accumulate"],
 ];
