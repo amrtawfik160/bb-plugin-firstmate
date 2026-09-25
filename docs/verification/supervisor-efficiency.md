@@ -84,3 +84,9 @@ The installed plugin and live captain homes are separate from this branch.
 Roll out the audited native commit and rebuilt mirror together, preserve state,
 and refresh the supervisor contract at a safe turn boundary. Do not advertise
 whole-fleet savings before comparing post-rollout workload and usage coverage.
+
+Final combined run: **489 passed, 0 failed, 2 skipped** (491 tests), using the
+audited native fixture. TypeScript, plugin build and 21-skill fidelity passed.
+All six supervisor mutations failed their intended regression assertions. The
+final independent Spec re-review confirmed all four of its findings resolved;
+the Standards shutdown finding is covered by the reproduced abort regression.
