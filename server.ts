@@ -306,10 +306,6 @@ const MAX_TASK = 4000;
 const MAX_OUTPUT = 4000;
 const MAX_FANOUT = 10;
 const MAX_WATCH_CREWS = 10;
-// Cap on fire-and-forget steering-inbox records kept per crew (state/<id>.inbox/NNN.msg).
-// These are write-only audit records with no consumer (never mv'd to handled/), so
-// without a bound they grow one-per-steer forever; the reaper keeps the newest this many.
-const MAX_INBOX_RECORDS = 200;
 const PLUGIN_ROOT = dirname(fileURLToPath(import.meta.url));
 const OVERLAY_DIR = join(PLUGIN_ROOT, "overlay");
 const FM_SCRIPT = /^[a-z0-9][a-z0-9-]*$/;
@@ -640,31 +636,6 @@ export function fmWatchKeeperScript(hostId: string, fmHome: string, interval: nu
     '  "$ARM" >> "$LOG" 2>&1 || true',
     `  sleep ${interval}`,
     "done",
-  ].join("\n");
-}
-
-// Host-side reaper for fire-and-forget steering-inbox records (state/<id>.inbox/NNN.msg). These
-// ff records are write-only (never mv'd to handled/, excluded from the re-ring ladder), so
-// without a bound they accumulate one-per-steer forever. Keep only the newest `max` FF records
-// (by numeric sequence), delete the oldest beyond the cap. Reaps ONLY records carrying a
-// `delivery=fire-and-forget` header line before the `--` separator — the exact predicate native
-// fm_task_inbox_is_fire_and_forget uses — so a NORMAL (re-rung, consumed) steer is NEVER deleted,
-// even if it is older. Only flat NNN.msg files in .inbox/ are considered; the handled/ subdir and
-// any non-.msg file are left alone (a non-recursive glob).
-export function inboxReapScript(dir: string, max: number): string {
-  const q = shQuote(dir);
-  return [
-    `dir=${q}`,
-    `[ -d "$dir" ] || exit 0`,
-    // Emit basenames of FF NNN.msg records only, then keep the newest `max` and delete the rest.
-    `for f in "$dir"/*.msg; do`,
-    `  [ -e "$f" ] || continue`,
-    `  b=\${f##*/}`,
-    // exact fire-and-forget predicate: a `delivery=fire-and-forget` line in the header (before --).
-    `  awk '$0=="--"{exit} $0=="delivery=fire-and-forget"{ff=1} END{exit(ff?0:1)}' "$f" || continue`,
-    `  printf '%s\\n' "$b"`,
-    `done | grep -E '^[0-9]+\\.msg$' | sort -t. -k1,1nr | tail -n +${max + 1} \\`,
-    `  | while IFS= read -r r; do rm -f -- "$dir/$r"; done`,
   ].join("\n");
 }
 
@@ -1627,7 +1598,7 @@ export default async function plugin(bb: BbPluginApi) {
     tellOwner: {
       type: "select",
       label:
-        "Captain→crew steering owner: kv (a bare threads.send) or real (write a normal durable state/<id>.inbox/NNN.msg record, steer it live, and move it to handled/ on confirmed delivery; failures remain for fm-watch recovery). A non-urgent tell may opt into queue-if-active; interrupt/stop stay hard-stops. /captain selects real under the full-parity profile.",
+        "Captain→crew steering owner: kv (a bare threads.send) or real (write a native inbox record and send its constant doorbell; only the worker acknowledges it by moving it to handled/). A non-urgent tell may opt into queue-if-active; interrupt/stop stay hard-stops. /captain selects real under the full-parity profile.",
       options: ["kv", "real"],
       default: "kv",
     },
@@ -3953,19 +3924,15 @@ export default async function plugin(bb: BbPluginApi) {
   // state/<id>.meta, so a crew created before real transport is never rendered
   // unsteerable. Base64 keeps the body out of the command text entirely.
   //
-  // Ordinary steers use a NORMAL record, matching upstream: until BB confirms the
-  // message was inserted into the crew's model input, fm-watch may re-ring it. Once
-  // BB confirms delivery we atomically move the record to handled/, which is the
-  // native acknowledgement. An explicit non-urgent `--queue` remains
-  // fire-and-forget because by definition it must not re-ring into an active turn.
-  // Best-effort: null ⇒ no durable record (caller still attempts BB delivery).
+  // Normal records retain native retry semantics. Non-urgent records opt out of
+  // native re-rings; BB owns their deferred notification. Neither is pruned unread.
   async function writeInboxRecord(
     hostId: string,
     fmHome: string,
     crewId: string,
     body: string,
     fireAndForget: boolean,
-  ): Promise<string | null> {
+  ): Promise<{ record: string; doorbell: string } | null> {
     const lib = `${fmHome}/bin/fm-task-inbox-lib.sh`;
     const stateDir = `${fmHome}/state`;
     const b64 = Buffer.from(body.slice(0, MAX_TASK), "utf8").toString("base64");
@@ -3976,7 +3943,9 @@ export default async function plugin(bb: BbPluginApi) {
       `. ${shQuote(lib)}`,
       `mkdir -p ${shQuote(stateDir)}`,
       `body=$(printf '%s' ${shQuote(b64)} | base64 -d)`,
-      `fm_task_inbox_write ${shQuote(stateDir)} ${shQuote(crewId)} "$body"${fireAndForget ? " fire-and-forget" : ""}`,
+      `record=$(fm_task_inbox_write ${shQuote(stateDir)} ${shQuote(crewId)} "$body"${fireAndForget ? " fire-and-forget" : ""}) || exit $?`,
+      `printf '%s\\n' "$record"`,
+      `fm_task_inbox_doorbell_line "$record"`,
     ].join("\n");
     try {
       const res = await runOnHost(hostId, script, 20_000);
@@ -3984,104 +3953,112 @@ export default async function plugin(bb: BbPluginApi) {
         bb.log.warn(`fm inbox record crew=${crewId} exit=${res.exitCode}`);
         return null;
       }
-      const record = res.output.trim().split(/\r?\n/).at(-1) ?? "";
+      const [record = "", doorbell = ""] = res.output.trim().split(/\r?\n/);
       const prefix = `${stateDir}/${crewId}.inbox/`;
       if (!record.startsWith(prefix) || !/^\d+\.msg$/.test(record.slice(prefix.length))) {
         bb.log.warn(`fm inbox record crew=${crewId} returned an invalid record path`);
         return null;
       }
-      return record;
+      if (!doorbell.startsWith(": Firstmate instruction waiting:")) return null;
+      return { record, doorbell };
     } catch (error) {
       bb.log.warn(`fm inbox record crew=${crewId} ${error instanceof Error ? error.message : String(error)}`);
       return null;
     }
   }
 
-  async function acknowledgeInboxRecord(hostId: string, fmHome: string, crewId: string, record: string): Promise<boolean> {
-    const inbox = `${fmHome}/state/${crewId}.inbox`;
-    const name = record.slice(`${inbox}/`.length);
-    if (!/^\d+\.msg$/.test(name)) return false;
-    const handled = `${inbox}/handled`;
-    const res = await runOnHost(
-      hostId,
-      `mkdir -p ${shQuote(handled)} && { [ ! -f ${shQuote(record)} ] || mv -- ${shQuote(record)} ${shQuote(`${handled}/${name}`)}; }`,
-      15_000,
-    ).catch(() => null);
-    return res !== null && res.exitCode === 0;
+  type InboxDelivery = {
+    threadId: string; hostId: string; home: string; crewId: string; senderThreadId?: string;
+    doorbell: string; queueIds: string[]; records: string[]; retry: boolean;
+  };
+  const INBOX_DELIVERY_PREFIX = "inbox-delivery:";
+
+  async function inboxQueueRows(delivery: InboxDelivery, signal?: AbortSignal) {
+    const rows = await raceAbort(bb.sdk.threads.queuedMessages.list({ threadId: delivery.threadId, signal }), signal, STUCK_HOST_CALL_MS);
+    return rows.filter(row => delivery.queueIds.includes(row.id)
+      && row.content.length === 1 && row.content[0]?.type === "text"
+      && row.content[0].text === delivery.doorbell);
   }
 
-  // Bounded reaper for the FIRE-AND-FORGET steering-inbox records. Best-effort and bounded: a
-  // failure just leaves the records in place (the doorbell already delivered). The pure script
-  // builder (inboxReapScript) reaps ONLY records carrying delivery=fire-and-forget and leaves
-  // handled/ and non-.msg files alone; see its comment.
-  async function reapInboxRecords(hostId: string, fmHome: string, crewId: string): Promise<void> {
-    const dir = `${fmHome}/state/${crewId}.inbox`;
-    try {
-      await runOnHost(hostId, inboxReapScript(dir, MAX_INBOX_RECORDS), 15_000);
-    } catch (error) {
-      bb.log.warn(`fm inbox reap crew=${crewId} ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
-
-  // tellOwner=real: a captain→crew steer gets the same durable normal inbox record
-  // upstream uses. BB then delivers the literal message as a live steer; confirmed
-  // model-input delivery moves the record to handled/, while a failed send leaves it
-  // unhandled for fm-watch's re-ring/recovery ladder. Delivery never depends on fm-send target
-  // resolution or state/<id>.meta (F3), and the body is stored/delivered verbatim
-  // regardless of prefix (F4). interrupt/stop stay hard steers, never this path.
-  // Returns a status string once the literal doorbell is delivered or durably
-  // recorded for recovery; null when tellOwner=kv, fmHome unset, or no normal
-  // durable record exists and the BB send itself fails.
-  async function sendViaInbox(crew: Crew, message: string, queue: boolean): Promise<string | null> {
-    const current = await settings.get();
-    if (current.tellOwner !== "real") return null;
-    const fmHome = await crewNativeHome(crew);
-    if (fmHome === "" || isSecondmateRoute(crew)) return null;
-    let hostId: string | null = null;
-    try {
-      hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
-    } catch {
-      hostId = null;
-    }
-    const record = hostId === null ? null : await writeInboxRecord(hostId, fmHome, crew.id, message, queue);
-    if (record !== null && queue && hostId !== null) await reapInboxRecords(hostId, fmHome, crew.id);
-    // Capture the running-turn status BEFORE we send, so the returned line honestly
-    // reports whether a steer LANDED in a live turn or merely started an idle one.
-    const wasActive = queue ? false : await crewInTurn(crew);
-    try {
-      const result = await bb.sdk.threads.send({
-        threadId: crew.threadId,
-        // Default tell is a STEER: mode:"steer" lands inside the crew's running turn
-        // (course correction reaches it mid-work) and starts a turn when idle.
-        // queue:true opts out to the old non-disturbing doorbell — queue-if-active
-        // only queues, so the crew reads it when it next drains its queue.
-        mode: queue ? "queue-if-active" : "steer",
-        input: [{ type: "text", text: message.slice(0, MAX_TASK), mentions: [] }],
-      });
-      if (!queue && record !== null && hostId !== null && asRecord(result)["delivery"] !== "queued") {
-        if (!(await acknowledgeInboxRecord(hostId, fmHome, crew.id, record))) {
-          bb.log.warn(`fm inbox ack crew=${crew.id} failed; watcher will recover the normal record`);
+  // The native worker's move into handled/ is the only acknowledgement. This
+  // reconciles notifications, never message bodies or unrelated queued input.
+  async function reconcileInboxDelivery(key: string, signal?: AbortSignal): Promise<void> {
+    await raceAbort(serializeLedger(key, async () => {
+      const delivery = await bb.storage.kv.get<InboxDelivery>(key);
+      if (!delivery || signal?.aborted) return;
+      const rows = await inboxQueueRows(delivery, signal);
+      const dir = `${delivery.home}/state/${delivery.crewId}.inbox`;
+      const probeScript = "import os,sys,json; d=sys.argv[1]; entries=list(os.scandir(d)); records=json.loads(sys.argv[2]); pending=any(e.name.endswith('.msg') for e in entries); acknowledged=bool(records) and all(os.path.isfile(os.path.join(d,'handled',r)) for r in records); print('pending' if pending else 'empty' if acknowledged else 'unconfirmed')";
+      const probe = await runOnHost(delivery.hostId,
+        `python3 -c ${shQuote(probeScript)} ${shQuote(dir)} ${shQuote(JSON.stringify(delivery.records ?? []))}`, STUCK_HOST_CALL_MS, signal);
+      if (probe.exitCode !== 0) return; // Unreadable is never acknowledged.
+      if (probe.output.trim() === "empty") {
+        for (const row of rows) {
+          if (signal?.aborted) return;
+          await raceAbort(bb.sdk.threads.queuedMessages.delete({ threadId: delivery.threadId, queuedMessageId: row.id }), signal, STUCK_HOST_CALL_MS);
         }
+        await bb.storage.kv.delete(key);
+      } else if (probe.output.trim() === "pending" && delivery.retry && rows.length === 0) {
+        const result = await raceAbort(bb.sdk.threads.send({
+          threadId: delivery.threadId, mode: "queue-if-active", senderThreadId: delivery.senderThreadId,
+          input: [{ type: "text", text: delivery.doorbell, mentions: [] }],
+        }), signal, STUCK_HOST_CALL_MS);
+        const row = asRecord(asRecord(result)["queuedMessage"]);
+        delivery.queueIds = typeof row["id"] === "string" ? [row["id"]] : [];
+        delivery.retry = false;
+        await bb.storage.kv.set(key, delivery);
       }
-    } catch (error) {
-      // A normal record is watcher-owned until acknowledged. Keep it pending for
-      // fm-watch rather than sending a second copy through tellCrew's fallback.
-      if (!queue && record !== null) {
-        bb.log.warn(`fm inbox steer crew=${crew.id} ${error instanceof Error ? error.message : String(error)}; durable record left for watcher re-ring`);
-        return `Recorded steer for crew ${crew.id}; fm-watch will re-ring it.`;
+    }), signal, STUCK_HOST_CALL_MS);
+  }
+
+  // Native parity: write once, ring a constant pointer, let the worker acknowledge.
+  // A queued notification can be coalesced because it reads every pending record.
+  async function sendViaInbox(crew: Crew, message: string, queue: boolean): Promise<string | null> {
+    if ((await settings.get()).tellOwner !== "real" || isSecondmateRoute(crew)) return null;
+    const home = await crewNativeHome(crew);
+    if (!home) return null;
+    let hostId: string;
+    try { hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined); }
+    catch { throw new Error("Firstmate inbox host unavailable; instruction was not sent."); }
+    const key = INBOX_DELIVERY_PREFIX + crew.threadId;
+    return serializeLedger(key, async () => {
+      const written = await writeInboxRecord(hostId, home, crew.id, message, queue);
+      if (!written) throw new Error("Firstmate inbox write failed; instruction delivery is unconfirmed. Inspect the inbox before retrying.");
+      const { record, doorbell } = written;
+      const previous = await bb.storage.kv.get<InboxDelivery>(key);
+      const delivery: InboxDelivery = previous && previous.home === home && previous.crewId === crew.id
+        ? previous : { threadId: crew.threadId, hostId, home, crewId: crew.id, senderThreadId: crew.parentThreadId ?? undefined, doorbell, queueIds: [], records: [], retry: false };
+      delivery.doorbell = doorbell;
+      delivery.records = [...(delivery.records ?? []), record.slice(record.lastIndexOf("/") + 1)];
+      // Persist before sending: reload or a failed send can retry the notification.
+      delivery.retry = true;
+      await bb.storage.kv.set(key, delivery);
+      const wasActive = queue ? false : await crewInTurn(crew);
+      try {
+        if (queue && (await inboxQueueRows(delivery)).length > 0) {
+          delivery.retry = false;
+          await bb.storage.kv.set(key, delivery);
+          return `Queued for crew ${crew.id} (native inbox; existing notification covers this record)`;
+        }
+        const result = await bb.sdk.threads.send({
+          threadId: crew.threadId, mode: queue ? "queue-if-active" : "steer", senderThreadId: crew.parentThreadId ?? undefined,
+          input: [{ type: "text", text: doorbell, mentions: [] }],
+        });
+        const row = asRecord(asRecord(result)["queuedMessage"]);
+        if (typeof row["id"] === "string") delivery.queueIds.push(row["id"]);
+        delivery.retry = false;
+        await bb.storage.kv.set(key, delivery);
+        if (asRecord(result)["delivery"] === "queued" || queue) {
+          return `Queued for crew ${crew.id} (native inbox; worker acknowledgement pending)`;
+        }
+        return wasActive
+          ? `Steered into crew ${crew.id}'s running turn (native inbox notification; worker acknowledgement pending)`
+          : `Told crew ${crew.id} (started a turn; native inbox acknowledgement pending)`;
+      } catch (error) {
+        bb.log.warn(`inbox notification crew=${crew.id}: ${String(error)}`);
+        return `Recorded instruction for crew ${crew.id} at ${record}; notification pending retry.`;
       }
-      bb.log.warn(`fm inbox doorbell crew=${crew.id} ${error instanceof Error ? error.message : String(error)}; falling back`);
-      return null;
-    }
-    const durable = record !== null;
-    bb.log.info(`fm inbox ${queue ? "queue" : "steer"} crew=${crew.id} ${durable ? "durable record + BB delivery" : "BB delivery (no durable record)"}`);
-    const audit = durable
-      ? queue ? "durable non-urgent record" : "durable inbox record acknowledged on delivery"
-      : "durable record unavailable — logged";
-    if (queue) return `Queued for crew ${crew.id} (${audit}; read when its current turn ends)`;
-    return wasActive
-      ? `Steered into crew ${crew.id}'s running turn (${audit})`
-      : `Told crew ${crew.id} (started a turn; ${audit})`;
+    });
   }
 
   async function crewInTurn(crew: Crew): Promise<boolean> {
@@ -4114,11 +4091,13 @@ export default async function plugin(bb: BbPluginApi) {
       const routed = await sendViaInbox(crew, body, queue);
       if (routed !== null) return routed;
       const wasActive = queue ? false : await crewInTurn(crew);
-      await bb.sdk.threads.send({
+      const result = await bb.sdk.threads.send({
         threadId: crew.threadId,
+        senderThreadId: crew.parentThreadId ?? undefined,
         mode: queue ? "queue-if-active" : "steer",
         input: [{ type: "text", text: body.slice(0, MAX_TASK), mentions: [] }],
       });
+      if (asRecord(result)["delivery"] === "queued") return `Queued for crew ${crew.id} (BB deferred delivery)`;
       if (queue) {
         return (await crewInTurn(crew))
           ? `Queued for crew ${crew.id} (read when its current turn ends)`
@@ -7075,10 +7054,13 @@ export default async function plugin(bb: BbPluginApi) {
     // relaunch cannot be kept alive by a stale-fresh beat), then best-effort kill the
     // recorded pid for an immediate stop rather than waiting one re-arm interval.
     const script =
+      `${fmBinDirAssign(fmHome)}\n` +
       `KP=$(cat ${shQuote(pid)} 2>/dev/null || echo); rm -f ${shQuote(pid)} ${shQuote(ownerBeat)}; ` +
-      `[ -n "$KP" ] && kill "$KP" 2>/dev/null || true`;
+      `[ -n "$KP" ] && kill "$KP" 2>/dev/null || true; ` +
+      `if [ -x "$FM_BINDIR/fm-watch-arm.sh" ]; then FM_HOME=${shQuote(fmHome)} FM_ROOT_OVERRIDE=${shQuote(fmHome)} FM_STATE_OVERRIDE=${shQuote(`${fmHome}/state`)} "$FM_BINDIR/fm-watch-arm.sh" --stop; fi`;
     try {
-      await runOnHost(hostId, script, 15_000, signal);
+      const result = await runOnHost(hostId, script, 15_000, signal);
+      if (result.exitCode !== 0) throw new Error(`native watcher stop exited ${result.exitCode}: ${truncate(result.output, 300)}`);
     } catch (error) {
       bb.log.warn(`fm-watch-supervisor: keeper teardown failed on ${hostId}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -7762,7 +7744,7 @@ export default async function plugin(bb: BbPluginApi) {
   registerCaptainTool({
     name: "firstmate_tell",
     description:
-      "Steer a crew: by default the message LANDS inside the crew's running turn (a course correction it acts on mid-work, not a stop) and starts a turn if the crew is idle. The returned line says honestly what happened (\"Steered into crew <id>'s running turn\" vs \"Told crew <id> (started a turn)\"). Pass queue=true for a genuinely non-urgent note that must NOT disturb an active turn — it queues and the crew reads it when its current turn ends. Use firstmate_interrupt to hard-stop. Pass resolveKey to also close that crew's open needs-decision/blocked (writes the resolved line to the real state/<id>.status, matching fm-classify-lib) when this steer is your answer to it.",
+      "Send a crew instruction. In real mode, store it once in the native inbox and notify the worker with the native doorbell; only the worker acknowledges it. Default notification steers the active turn or starts an idle one; BB may defer delivery, which the result reports. queue=true defers a non-urgent notification and coalesces queued doorbells. Use the default for policy changes and decision answers; use firstmate_interrupt to hard-stop. resolveKey closes the named open decision in native status after the instruction is recorded.",
     parameters: z.object({
       crewId: z.string(),
       message: z.string().min(1).max(MAX_TASK),
@@ -8925,7 +8907,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   const CAPTAIN_COMPACT_COOLDOWN_MS = 20 * 60_000;
-  async function maybeCompactCaptain(threadId: string): Promise<void> {
+  async function maybeCompactCaptain(threadId: string, signal?: AbortSignal): Promise<void> {
     if (!knownCaptains.has(threadId)) return;
     const budget = Number((await settings.get()).captainCompactAtTokens);
     if (!(budget > 0)) return;
@@ -8933,8 +8915,9 @@ export default async function plugin(bb: BbPluginApi) {
     const last = await bb.storage.kv.get<unknown>(key);
     let usedTokens: number | null = null;
     try {
-      usedTokens = (await bb.sdk.threads.context({ threadId })).usage?.usedTokens ?? null;
-    } catch {
+      usedTokens = (await raceAbort(bb.sdk.threads.context({ threadId }), signal, STUCK_HOST_CALL_MS)).usage?.usedTokens ?? null;
+    } catch (error) {
+      if (isAbortError(error)) throw error;
       return;
     }
     const now = Date.now();
@@ -8942,9 +8925,10 @@ export default async function plugin(bb: BbPluginApi) {
     // Stamp first: a provider that cannot compact must not be retried on every idle.
     await bb.storage.kv.set(key, now);
     try {
-      await bb.sdk.threads.compact({ threadId });
+      await raceAbort(bb.sdk.threads.compact({ threadId }), signal, STUCK_HOST_CALL_MS);
       bb.log.info(`captain ${threadId} compacted at ${usedTokens} tokens (budget ${budget})`);
     } catch (error) {
+      if (isAbortError(error)) throw error;
       bb.log.warn(`captain ${threadId} compaction failed at ${usedTokens} tokens: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
@@ -8960,7 +8944,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (isAbortError(error)) throw error;
       return;
     }
-    await maybeCompactCaptain(threadId).catch((error) => bb.log.warn(`captain compaction check failed ${threadId}: ${String(error)}`));
+    await maybeCompactCaptain(threadId, signal);
   }
 
   bb.events.on("thread.idle", async ({ thread, lastAssistantText }) => {
@@ -10020,6 +10004,11 @@ export default async function plugin(bb: BbPluginApi) {
       let nextCompactSweep = 0;
       while (!signal.aborted) {
         try {
+          for (const key of await bb.storage.kv.list(INBOX_DELIVERY_PREFIX)) {
+            if (signal.aborted) break;
+            try { await reconcileInboxDelivery(key, signal); }
+            catch (error) { if (!signal.aborted) bb.log.warn(`inbox reconciliation: ${String(error)}`); }
+          }
           for (const key of await bb.storage.kv.list(CAPTAIN_WAKE_HOLD_PREFIX)) {
             if (signal.aborted) break;
             await releaseHeldCaptainWakes(key.slice(CAPTAIN_WAKE_HOLD_PREFIX.length), signal);
@@ -10056,6 +10045,12 @@ export default async function plugin(bb: BbPluginApi) {
               const s = await settings.get();
               const host = await bb.storage.kv.get<string>(`native-home-host:${captain}`);
               if (!host) return;
+              const thread = await raceAbort(bb.sdk.threads.get({ threadId: captain }), signal, STUCK_HOST_CALL_MS);
+              if (thread.archivedAt != null) {
+                await stopFmWatchKeeper(host, s.fmHome, signal);
+                seen.delete(captain);
+                return;
+              }
               if (s.watchOwner !== "fm-watch") {
                 await stopFmWatchKeeper(host, s.fmHome, signal);
                 return;

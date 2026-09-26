@@ -1,7 +1,7 @@
 # Audited native version
 
 The script surface, overlay patches and all 21 fidelity-managed skill files use
-`4299683d5b656a70ced609d7d929499ddc0d675a`. This is an audited commit, not a claim
+`bb69be62e1f8df465d674a35f7e2ce707b900501`. This is an audited commit, not a claim
 that the plugin follows upstream HEAD. `npm run fidelity` rejects a different
 skill or overlay pin; `--native` also checks the snapshot against Git objects.
 BB-specific captain, firstmate, ahoy, quiet and stow instructions remain adapters,
@@ -15,7 +15,26 @@ contract at the next safe boundary. Keep queued wakes and unresolved decisions.
 
 ## Changes that affect the BB adapter
 
-At `4299683d5b656a70ced609d7d929499ddc0d675a`, the direct upstream delta adds three callable scripts: `fm-git-strip-ai-trailers.sh`, `fm-host-mirror.sh`, and `fm-lab-home.sh`. The script manifest includes all three, and the Cursor adapter documents the trailer handling. `fm-spawn.sh` installs its new per-task commit-message hook (`state/<id>.git-hooks`) for every spawn, BB crews included, but activates it only by exporting `core.hooksPath` through the pane launch command. The BB adapter launches the agent at thread creation, skips the pane-send block, and drops `export` lines, so `core.hooksPath` is never delivered to BB threads: the hook is installed and torn down but inert for BB crews, and AI trailers are not stripped at the commit object. Follow-up: deliver `core.hooksPath` to BB threads.
+The update from `4299683d` includes 19 upstream commits. The catalog now exposes
+190 native scripts, including the new `fm-remote-secondmate-relaunch.sh` wrapper.
+All four overlay patches apply cleanly, without changed hunks.
+
+- Watcher lock and recovery fixes address races and Bash 5.2 command-substitution
+  hangs. Branch acknowledgement now retires matching check receipts, reducing
+  repeated away-mode escalations while preserving newer reports.
+- Worker briefs require declared waits for background jobs, validation runs and
+  long commands. These waits retain the first alert and use the existing longer
+  recheck interval, reducing repeated possible-wedge alerts.
+- Cancelled validation runs no longer produce false failure reports.
+- Native secondmate provisioning and the Claude, OpenCode, Pi and shared recovery
+  references are refreshed. Remote relaunch republishes endpoint metadata. These
+  imported native capabilities do not establish support for each harness in BB.
+- The new attended native supervision-host support remains opt-in and is not
+  enabled by this plugin update.
+
+### Earlier adapter behavior retained
+
+The preceding `4299683d` update added three callable scripts: `fm-git-strip-ai-trailers.sh`, `fm-host-mirror.sh`, and `fm-lab-home.sh`. The script manifest includes all three, and the Cursor adapter documents the trailer handling. `fm-spawn.sh` installs its new per-task commit-message hook (`state/<id>.git-hooks`) for every spawn, BB crews included, but activates it only by exporting `core.hooksPath` through the pane launch command. The BB adapter launches the agent at thread creation, skips the pane-send block, and drops `export` lines, so `core.hooksPath` is never delivered to BB threads: the hook is installed and torn down but inert for BB crews, and AI trailers are not stripped at the commit object. Follow-up: deliver `core.hooksPath` to BB threads.
 
 - `fm-pr-merge.sh` adds the attended-only `--allow-missing <check>` waiver for one exact required context that has not reported. `firstmate_merge` forwards it only through the native verification path and refuses the option on the BB API path, which cannot verify required contexts; it remains separate from `yes` and `allowRedCheck`.
 - The plugin mirrors AGENTS section 9; that section is unchanged at this pin. Upstream's section 6 project-memory rule and section 7 merge wording are outside the plugin's mirrored AGENTS slice; the captain merge guidance now describes the native missing-check waiver.
@@ -50,7 +69,7 @@ At `4299683d5b656a70ced609d7d929499ddc0d675a`, the direct upstream delta adds th
 Use a disposable native clone containing the audited commit, never a live home:
 
 ```sh
-FM_TEST_HOME=/path/to/clone node scripts/patch-drift-check.mjs --ref 4299683d5b656a70ced609d7d929499ddc0d675a
+FM_TEST_HOME=/path/to/clone node scripts/patch-drift-check.mjs --ref bb69be62e1f8df465d674a35f7e2ce707b900501
 npm run fidelity -- --native /path/to/clone
 FM_TEST_HOME=/path/to/clone node --experimental-strip-types scripts/live-mirror-check.mjs
 ```

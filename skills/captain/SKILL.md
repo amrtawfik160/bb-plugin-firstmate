@@ -181,16 +181,17 @@ captain/thread context.
   `firstmate_tell resolveKey`). That both steers the crew and writes the closing
   `resolved [key=<key>]` line into the real `state/<id>.status`, so the decision
   stops showing as open. A plain `tell` only sends the message (as a steer).
-- **`tell` steers into the running turn by default.** A plain `tell` lands the
-  message inside the crew's current turn as a course correction (and starts a turn
-  if the crew is idle) — so a captain can correct a crew mid-work instead of
-  waiting for it to finish reading a queued note on the wrong premise. It is framed
-  "not a stop; keep working and fold this in", so the crew continues its task. Use
-  `tell --queue` (`firstmate_tell queue=true`) only for a genuinely non-urgent note
-  that must not disturb an active turn. To hard-stop, use `interrupt`, not `tell`.
-- **Fallback safety.** Every real-mode write (meta, brief, contract, status read)
-  is best-effort: if the host or scripts are unavailable it degrades to the
-  native path with a logged note and never breaks dispatch.
+- **`tell` notifies the running crew by default.** In real mode, instructions live
+  once in the native inbox; BB sends the native doorbell. The worker reads pending
+  records in order and moves them to `handled/` after acting. Accepting a BB
+  notification does not acknowledge an instruction. Repeated notifications never
+  repeat already handled bodies. Use `tell --queue` (`firstmate_tell queue=true`)
+  only for non-urgent notes; queued doorbells are coalesced and removed when the
+  inbox is consumed. Policy changes and decision answers use the default steer.
+  To hard-stop, use `interrupt`.
+- **Inbox failures stay visible.** A failed native write is reported without a
+  literal-message fallback. A stored instruction survives notification failure;
+  the notification is retried without rewriting the body.
 
 Harness adapters other than `bb` (tmux/orca/cmux/zellij/herdr) target non-BB
 session hosts; inside BB the `bb` adapter is the live one. The others ship with

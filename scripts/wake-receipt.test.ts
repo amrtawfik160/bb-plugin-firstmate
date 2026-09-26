@@ -220,6 +220,28 @@ test("unchanged persistent decisions do not create an endless completion loop", 
   assert.equal(f.read().reads, 2);
 });
 
+test("completing a wake with already presented open decisions needs no second receipt", (t) => {
+  const f = fixture(t, { queue: [{ seq: 1, text: "worker finished" }], persistent: "OPEN DECISIONS:\nwaiting for user's budget\n" });
+  writeFileSync(join(f.state, ".status-presentation-cursor"), "stable native cursor\n");
+  const first = f.run();
+  assert.match(first.report, /worker finished/);
+  assert.match(first.report, /waiting for user's budget/);
+  const done = f.run("complete", first.id!);
+  assert.equal(done.id, null, "unchanged decisions were already handled in the original batch");
+  assert.equal(f.read().acks, 1);
+  assert.equal(f.read().persistent, "OPEN DECISIONS:\nwaiting for user's budget\n", "completion must not resolve the decision");
+});
+
+test("a changed open decision survives completion of an earlier mixed wake", (t) => {
+  const f = fixture(t, { queue: [{ seq: 1, text: "worker finished" }], persistent: "OPEN DECISIONS:\nold decision\n" });
+  writeFileSync(join(f.state, ".status-presentation-cursor"), "stable native cursor\n");
+  const first = f.run();
+  f.update({ persistent: "OPEN DECISIONS:\nnew decision\n" });
+  const next = f.run("complete", first.id!);
+  assert.ok(next.id);
+  assert.match(next.report, /new decision/);
+});
+
 test("empty presentations do not create pending receipts", (t) => {
   const f = fixture(t);
   assert.equal(f.run().id, null);
@@ -472,6 +494,25 @@ test("real native persistent open decisions complete without a receipt loop", { 
   assert.match(first.report, /OPEN DECISIONS/);
   assert.equal(f.run("complete", first.id, native).id, null);
   assert.deepEqual(readdirSync(join(f.state, ".bb-wake-reports")), []);
+});
+
+test("real native mixed wake completes once while preserving its open decision", { skip: !existsSync(join(nativeFixture, "bin/fm-wake-drain.sh")) }, (t) => {
+  const f = fixture(t);
+  const native = join(nativeFixture, "bin/fm-wake-drain.sh");
+  const status = join(f.state, "worker.status");
+  writeFileSync(status, "blocked: waiting for approval\n");
+  const queued = spawnSync("bash", ["-c", '. "$1"; fm_wake_append signal worker.status "worker update"', "_", join(nativeFixture, "bin/fm-wake-lib.sh")], {
+    encoding: "utf8", env: { ...process.env, FM_STATE_OVERRIDE: f.state, FM_ROOT_OVERRIDE: f.dir, FM_HOME: f.dir },
+  });
+  assert.equal(queued.status, 0, queued.stderr);
+  const first = f.run("receive", "", native);
+  assert.ok(first.id);
+  assert.ok(first.pair);
+  assert.match(first.report, /OPEN DECISIONS/);
+  const done = f.run("complete", first.id, native);
+  assert.equal(done.id, null);
+  assert.equal(readFileSync(status, "utf8"), "blocked: waiting for approval\n");
+  assert.equal(readFileSync(join(f.state, ".wake-queue"), "utf8"), "");
 });
 
 for (const phase of ["presenting", "acknowledging", "refreshing"]) {

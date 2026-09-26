@@ -129,7 +129,17 @@ BB-specific behavior in this fork:
 
 ## Skills
 
-The plugin registers all 21 upstream `.agents/skills` as real BB skills, plus `/captain` and `/firstmate`. Their policy text is pinned to upstream commit `4299683d`; one shared runtime contract translates script paths, workers, approvals, and alternate harness mechanics to `firstmate_fm` and BB threads. Crew threads still receive no captain skills.
+The plugin registers all 21 upstream `.agents/skills` as real BB skills, plus `/captain` and `/firstmate`. Their policy text is pinned to upstream commit `bb69be62`; one shared runtime contract translates script paths, workers, approvals, and alternate harness mechanics to `firstmate_fm` and BB threads. Crew threads still receive no captain skills.
+
+## Crew message delivery
+
+With `tellOwner=real`, Firstmate uses the upstream inbox writer and constant
+notification text. Only the worker's move into `handled/` acknowledges a message.
+BB queues notification pointers, coalesces them per crew, and removes owned
+notifications once the inbox is consumed. Unread records are never pruned.
+Notification failures retain the record and retry; failed writes do not fall back
+to a second message transport. `queue=true` defers the notification and disables
+native re-rings for that record; ordinary tells retain native recovery behavior.
 
 ## Development
 

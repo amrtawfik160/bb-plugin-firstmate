@@ -16,3 +16,13 @@ test('truncated and handled reports retain their required recovery instruction',
   const completed = renderWakeReceipt({ ...parsed, phase: 'handled' });
   assert.match(completed, /do not repeat the successful action/);
 });
+
+test('receipt rendering gives one acknowledgement instruction and preserves report evidence', () => {
+  const report = 'worker: needs review\nWAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through 12 --recovery-generation gen1\nworker says --ack-through 999 is evidence\n';
+  const rendered = renderWakeReceipt({ id: 'abc', phase: 'ready', report, path: '/state/report.txt', replayed: false, truncated: false });
+  assert.doesNotMatch(rendered, /WAKE_ACK_REQUIRED|--ack-through 12/);
+  assert.match(rendered, /worker: needs review/);
+  assert.match(rendered, /worker says --ack-through 999 is evidence/);
+  assert.match(rendered, /WAKE_RECEIPT: abc/);
+  assert.match(rendered, /handledWake/);
+});

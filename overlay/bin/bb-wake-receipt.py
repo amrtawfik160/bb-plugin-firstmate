@@ -339,7 +339,13 @@ class Journal:
         pair = ack_pair(fresh)
         # Equal text can describe a new failure. Only suppress a repeated native
         # surface when its durable presentation cursor proves nothing advanced.
-        unchanged = self.status_unchanged and meaningful(fresh) == meaningful(old_report)
+        fresh_surface = meaningful(fresh)
+        old_surface = meaningful(old_report)
+        # A mixed batch loses its consumed queue/status prefix on refresh. Its
+        # unchanged open-decision suffix was already presented in that batch.
+        known_decisions = (fresh_surface.startswith("OPEN DECISIONS")
+                           and old_surface.endswith("\n" + fresh_surface))
+        unchanged = self.status_unchanged and (fresh_surface == old_surface or known_decisions)
         if not pair and not meaningful(acknowledgement) and (not meaningful(fresh) or unchanged):
             self.clear()
         else:
