@@ -27,7 +27,7 @@ import { fileURLToPath } from "node:url";
 import { normalizeCaptainIntent } from "../server.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const NATIVE_FM = "/root/firstmate";
+const NATIVE_FM = process.env.FM_TEST_HOME ?? "/root/firstmate";
 const results = [];
 function record(name, ok, detail) {
   results.push({ name, ok });

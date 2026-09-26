@@ -29,7 +29,7 @@ import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const BIN = process.env.FM_LIVE_BIN ?? "/root/github_projects/firstmate/bin";
+const BIN = process.env.FM_LIVE_BIN ?? `${process.env.FM_TEST_HOME ?? "/root/firstmate"}/bin`;
 const AFK = join(BIN, "fm-afk-contract.sh");
 const MERGE_LIB = join(BIN, "fm-merge-authority-lib.sh");
 
@@ -47,15 +47,13 @@ function bash(script, env = {}) {
   return { code: r.status, out: `${r.stdout ?? ""}${r.stderr ?? ""}`.trim() };
 }
 
-// Propose + confirm an away contract (granting task <id>) into <stateDir>, exactly
-// as the plugin's projectAfkOn does (fm-afk-contract.sh honours FM_STATE_OVERRIDE).
-function writeAwayContract(home, stateDir, grantId, words) {
+// Enter an away contract into <stateDir>, exactly as the plugin's projectAfkOn
+// does (fm-afk-contract.sh honours FM_STATE_OVERRIDE).
+function writeAwayContract(home, stateDir, words) {
   mkdirSync(stateDir, { recursive: true });
   const env = { FM_HOME: home, FM_ROOT: home, FM_STATE_OVERRIDE: stateDir };
-  const propose = bash(`'${AFK}' propose --words '${words}' --grant '${grantId}'`, env);
-  if (propose.code !== 0) return { ok: false, out: propose.out };
-  const confirm = bash(`'${AFK}' confirm`, env);
-  return { ok: confirm.code === 0, out: confirm.out };
+  const enter = bash(`'${AFK}' enter --words '${words}'`, env);
+  return { ok: enter.code === 0, out: enter.out };
 }
 
 // The REAL keeper/merge read path: resolve away-authority for <id> using the
@@ -83,20 +81,20 @@ try {
   }
 
   // ── A. host-level write → the real keeper RESOLVES the away grant ───────────
-  const wroteHost = writeAwayContract(home, hostState, "taskX", "stepping out; land taskX if green");
+  const wroteHost = writeAwayContract(home, hostState, "stepping out; land taskX if green");
   record("host-level away contract confirmed (fixed plugin write path)", wroteHost.ok, wroteHost.out.split("\n").pop());
   const validateHost = bash(`'${AFK}' validate`, { FM_HOME: home, FM_STATE_OVERRIDE: hostState });
   record("real fm-afk-contract.sh validate passes at host-level", validateHost.code === 0, validateHost.out || "exit 0");
   const authHost = keeperResolvesAuthority(home, hostState, metaPath, "taskX");
-  record("the REAL merge-authority keeper resolves AWAY-GRANT at host-level",
-    /AUTHORITY=away-grant/.test(authHost.out), authHost.out.split("\n").pop());
+  record("the REAL merge-authority keeper resolves away authority at host-level",
+    /AUTHORITY=away REASON=away/.test(authHost.out), authHost.out.split("\n").pop());
 
   // reset the home for the regression case
   bash(`'${AFK}' archive`, { FM_HOME: home, FM_STATE_OVERRIDE: hostState });
 
   // ── B. cap-scoped write → the host-level keeper is BLIND (the split-brain) ───
   const capState = join(hostState, "cap-thr_capA");
-  const wroteScoped = writeAwayContract(home, capState, "taskX", "stepping out (scoped)");
+  const wroteScoped = writeAwayContract(home, capState, "stepping out (scoped)");
   record("cap-scoped away contract confirmed (the rejected D3 approach)", wroteScoped.ok, wroteScoped.out.split("\n").pop());
   const validateScopedAtHost = bash(`'${AFK}' validate`, { FM_HOME: home, FM_STATE_OVERRIDE: hostState });
   record("host-level validate sees NOTHING when the contract is cap-scoped (regression)",

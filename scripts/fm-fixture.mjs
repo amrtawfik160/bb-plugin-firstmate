@@ -40,9 +40,10 @@ export function discoverCheckout() {
 }
 
 /**
- * Clone `checkout` into `dest` and detach at the pinned patch base. A --local clone
+ * Clone `checkout` into `dest` and detach at the pinned patch base. A local clone
  * copies every object (including the loose base commit even when it is unreachable
- * from the checkout's HEAD); if the base is still missing, fetch it from origin.
+ * from the checkout's HEAD); disable hardlinks so it also works across filesystems.
+ * If the base is still missing, fetch it from origin.
  * Returns { ok, reason }.
  */
 export function cloneAtBase(checkout, dest, base = patchBase()) {
@@ -50,7 +51,7 @@ export function cloneAtBase(checkout, dest, base = patchBase()) {
     // Base not in the local checkout at all — try to bring it in from origin below
     // after the clone (the clone still succeeds; we fetch the commit into dest).
   }
-  if (sh("git", ["clone", "--quiet", "--local", checkout, dest]).code !== 0) {
+  if (sh("git", ["clone", "--quiet", "--local", "--no-hardlinks", checkout, dest]).code !== 0) {
     return { ok: false, reason: "clone failed" };
   }
   if (git(dest, "cat-file", "-e", base).code !== 0) {

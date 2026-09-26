@@ -1,5 +1,23 @@
 # Plugin runtime verification
 
+## Upstream refresh verification — 2026-09-26
+
+Pinned native source: `4299683d5b656a70ced609d7d929499ddc0d675a` (34 commits past the prior `b42d4fa8` pin). The source was a fresh upstream clone; `/root/firstmate` was not used or modified.
+
+| Command | Result |
+| --- | --- |
+| `FM_TEST_HOME=.upstream-work npm run fidelity -- --native .upstream-work` | OK — 21 skills, 12 BB-DIVERGE anchors, 7 authorized BB-ONLY fences, snapshot fresh |
+| `FM_TEST_HOME=.upstream-work FM_TEST_BIN='' FM_CLASSIFY_LIB=.upstream-work/bin/fm-classify-lib.sh FIRSTMATE_TEST_NATIVE=.upstream-work npm test` | 501 tests, 450 passed, 0 failed, 51 skipped; `FM_TEST_BIN=''` skips live native integration cases that need the host fixture |
+| `npm exec -- tsc --noEmit` | Exit 0 |
+| `FM_TEST_HOME=.upstream-work node scripts/patch-drift-check.mjs --ref 4299683d5b656a70ced609d7d929499ddc0d675a` | All four overlay patches apply cleanly at the pinned SHA |
+| `FM_TEST_HOME=.upstream-work FM_LIVE_BIN=.upstream-work/bin node scripts/live-afk-hostlevel-check.mjs` | 7/7 pass using upstream `enter --words` and `AUTHORITY=away` |
+| `FM_TEST_HOME=.upstream-work node scripts/live-forget-worktree-check.mjs` | 9/9 pass; disposable `/tmp` Git worktrees |
+| `FM_TEST_HOME=.upstream-work node scripts/live-migration-zero-window-check.mjs` | 7 probes, 0 BB-less windows; atomic failed reinstall preserved the mirror |
+| `FM_TEST_HOME=.upstream-work FM_MIRROR_CHECK_NO_REAL_PROJECT=1 node scripts/live-mirror-check.mjs` | 14/14 pass through the BB spawn layer; real thread creation intentionally disabled |
+| `node scripts/live-host-transport-check.mjs --host host_m4jkvpkw67 --scratch /tmp/fm-host-transport-92347fc2` | 5/5 pass; exact hashes for 10B, 10KB, 200KB and Unicode payloads; forced failure preserved original |
+
+Four live checks (`live-bb-activity`, `live-blocked-alert`, `live-brief-intent`, `live-tell-steer`) were not run because they create BB threads; the activity proof also installs a temporary plugin. The real-thread mirror proof was run in its documented no-project mode, so it verifies native routing but not endpoint creation. This worker lane is barred from administering shared host worktree slots. No claims from the unrun checks are presented as verified. The passing checks above invoke real native scripts from the new clone and showed no fallback signatures.
+
 Verified 2026-09-23 with Node 24.18.0, BB 0.43.3, SDK 0.4.104, ShellCheck 0.11.0, and Lavish 0.1.78.
 Overlay base: `9296f9b9d2566797b9a9aecaa5956bb8e471d2cd`.
 This record separates native execution from substituted SDK boundaries.

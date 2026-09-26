@@ -43,7 +43,7 @@ import { join } from "node:path";
 import { parseOutcome, hasStatusProtocol } from "../lib/policy.ts";
 import { captainWakeDoorbell } from "../server.ts";
 
-const NATIVE_FM = "/root/firstmate";
+const NATIVE_FM = process.env.FM_TEST_HOME ?? "/root/firstmate";
 const PROJECT = process.env.FM_LIVE_PROJECT ?? "proj_f9qp5ifyiq";
 const HOST = process.env.FM_LIVE_HOST ?? "host_m4jkvpkw67";
 const REPO = process.env.FM_LIVE_REPO ?? "/root/github_projects/bb-plugin-firstmate";

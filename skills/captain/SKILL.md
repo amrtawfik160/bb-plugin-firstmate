@@ -252,7 +252,7 @@ proof output. Run an acceptance dispatch yourself when in doubt.
 2. **Never merge without the word.** Captain approves every merge, unless a
    standing per-project `yolo` posture was explicitly granted. Never merge red
    unless captain names the single waived check. Merge ONLY via
-   `bb firstmate merge <id> [--yes]` / `firstmate_merge`; never route around with
+   `bb firstmate merge <id> [--yes] [--allow-red <check>] [--allow-missing <check>]` / `firstmate_merge`; never route around with
    raw git merges. A "merge now" answer is the explicit word for that one exact
    PR — no second confirmation, but all re-verification above still applies.
 3. **Never destroy unlanded work.** `deliver` before `forget --stop`
@@ -292,7 +292,10 @@ within its exact scope. Never infer, broaden, or carry it elsewhere.
   via `merge` with `yes` (green + mergeable; a PR with zero checks / `no_checks`
   counts as no failing checks; yolo skips yes). Authority (`yes`) is separate
   from `--allow-red <check-name>`, which waives one exact failing check while
-  every other check must stay green — never silent, and never grants authority.
+  every other check must stay green, and `--allow-missing <check-name>`, which
+  waives one exact required check that has not reported while every other
+  required check reports and all checks stay green. Both waivers are attended
+  only, never silent, and never grant authority.
   Local-only lands with ff-only onto the project checkout. Scout lands via
   report; promote with `firstmate_promote` / `bb firstmate promote <id>` — never
   expand the scout. `deck`/`bearings` retire any crew whose PR was merged or
@@ -316,7 +319,7 @@ within its exact scope. Never infer, broaden, or carry it elsewhere.
 | decisions | `firstmate_decide` / `decide ask\|answer` + AskUserQuestion |
 | track | `firstmate_crew`, `firstmate_crews`, `watch`, `tell` (steers into the running turn by default; `--queue` for a non-urgent note; `--resolve-key <key>` to answer + close a decision), `interrupt`, `stop`, `retry` |
 | recovery relaunch | `retry <id> --model m` / `--provider p` / `--reasoning-level l` (fresh thread, same worktree) |
-| delivery | `firstmate_deliver`, `firstmate_merge` (`--yes`, `--allow-red <check>`), `promote` |
+| delivery | `firstmate_deliver`, `firstmate_merge` (`--yes`, `--allow-red <check>`, `--allow-missing <check>`), `promote` |
 | secondmate | `firstmate_secondmate` / `bb firstmate secondmate register --project <id> --thread <id>` |
 | memory | `firstmate_memory` / `memory [show\|set-captain\|add-learning\|drop-learning\|clear]` |
 | watcher | `firstmate_supervision` / `supervision [on\|off\|status]` |

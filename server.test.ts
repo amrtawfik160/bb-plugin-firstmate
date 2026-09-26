@@ -2149,6 +2149,32 @@ test("allowRedCheck is separate from authority: no --yes still refuses", async (
   }
 });
 
+test("allowMissingCheck refuses when the BB merge path cannot read required contexts", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () =>
+      makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }),
+    );
+    host.harness.sdk.stub("environments.pullRequest", async () => ({
+      outcome: "available",
+      pullRequest: {
+        url: "https://gh/pr/1", number: 1, title: "t", state: "open",
+        checks: { state: "passing", failedCount: 0, pendingCount: 0, passedCount: 1 },
+        mergeability: { mergeable: "MERGEABLE" },
+      },
+    }));
+    host.harness.sdk.stub("environments.mergePullRequest", async () => ({}));
+    const result = await host.harness.behavior.runCli(["merge", "c1", "--yes", "--allow-missing", "required-check"]);
+    assert.equal(result.exitCode, 1);
+    assert.match(result.stderr, /native PR merge gate/);
+    assert.equal(host.harness.sdk.callsTo("environments.mergePullRequest").length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("merge runs native merge and teardown before retiring the crew", async () => {
   const host = createFakePluginHost({
     pluginId: "firstmate",
@@ -2187,13 +2213,15 @@ test("merge runs native merge and teardown before retiring the crew", async () =
     host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
     host.harness.sdk.stub("terminals.output", async () => hostOutput(""));
     host.harness.sdk.stub("terminals.close", async () => ({}));
-    const result = await host.harness.behavior.runCli(["merge", "c1", "--yes"]);
+    const result = await host.harness.behavior.runCli(["merge", "c1", "--yes", "--allow-missing", "required-check"]);
     assert.equal(result.exitCode, 0, result.stderr);
     assert.ok(
       hostCommands.some((cmd) => cmd.includes("fm-teardown.sh") && cmd.includes("c1")),
       `no native teardown in ${hostCommands.join("\n---\n")}`,
     );
-    assert.ok(hostCommands.some(cmd => cmd.includes("fm-pr-merge.sh")));
+    const nativeMerge = hostCommands.find(cmd => cmd.includes("fm-pr-merge.sh"));
+    assert.ok(nativeMerge);
+    assert.ok(nativeMerge.includes("--allow-missing") && nativeMerge.includes("required-check"), nativeMerge);
     assert.equal(host.harness.sdk.callsTo("environments.mergePullRequest").length, 0);
   } finally {
     await host.harness.lifecycle.dispose();
@@ -2882,7 +2910,7 @@ test("bb crew launch prompt routes scripts to bin-bb and forbids CI poll loops",
       `run \`${home}/bin/fm-ensure-agents-md.sh .\` in the worktree.`,
       "bin/fm-crew-state.sh at line start",
     ].join("\n"));
-    const env = { ...process.env, PATH: `${fakebin}:${process.env.PATH}`, FM_HOME: home, FM_ROOT: home, FM_BB_PROJECT_ID: "project_1", FM_BB_MACHINE: "host_1" };
+    const env = { ...process.env, PATH: `${fakebin}:${process.env.PATH}`, BB_CLI: join(fakebin, "bb"), FM_HOME: home, FM_ROOT: home, FM_BACKEND_LIB_DIR: join(process.env.FM_TEST_HOME ?? "/root/firstmate", "bin-bb"), FM_BB_PROJECT_ID: "project_1", FM_BB_MACHINE: "host_1" };
     const run = spawnSync("bash", ["-c", `. ${JSON.stringify(join(OVERLAY_ROOT, "bin/backends/bb.sh"))} 2>/dev/null; fm_backend_bb_create_task "Scout" /repo c1 scout "$BRIEF"`], { env: { ...env, BRIEF: brief }, encoding: "utf8" });
     assert.equal(run.status, 0, run.stderr);
     const calls = readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line) as string[]);
@@ -7241,7 +7269,7 @@ test("IT native local merge respects captain hold and lands BB-named branch", { 
   };
   try {
     mkdirSync(project); mkdirSync(join(home, "config")); mkdirSync(join(home, "fakebin"));
-    symlinkSync("/root/firstmate/bin-bb", join(home, "bin-bb"));
+    symlinkSync(join(process.env.FM_TEST_HOME ?? "/root/firstmate", "bin-bb"), join(home, "bin-bb"));
     writeFileSync(join(home, "config/bb-overlay"), "bin-bb\n");
     git("init", "-b", "main", project);
     git("-C", project, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "base");
@@ -7286,7 +7314,7 @@ test("IT BB secondmate launch keeps captain role and seeded home; stop failures 
   try {
     mkdirSync(fakebin);
     writeFileSync(join(fakebin, "bb"), `#!/usr/bin/env python3\nimport json,sys\nwith open(${JSON.stringify(log)}, 'a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')\nargs=sys.argv[1:]\nif args[:2] == ['thread','spawn']: print(json.dumps({'id':'thr_secondmate','path':${JSON.stringify(home)}}))\nelif args[:2] == ['thread','show']: print(json.dumps({'id':'thr_secondmate','status':'idle','path':${JSON.stringify(home)}}))\nelif args[:2] == ['thread','stop']: sys.exit(19)\n`, { mode: 0o755 });
-    const env = { ...process.env, PATH: `${fakebin}:${process.env.PATH}`, FM_HOME: home, FM_BB_PROJECT_ID: "project_1", FM_BB_MACHINE: "host_1" };
+    const env = { ...process.env, PATH: `${fakebin}:${process.env.PATH}`, BB_CLI: join(fakebin, "bb"), FM_HOME: home, FM_BACKEND_LIB_DIR: join(process.env.FM_TEST_HOME ?? "/root/firstmate", "bin-bb"), FM_BB_PROJECT_ID: "project_1", FM_BB_MACHINE: "host_1" };
     const run = spawnSync("bash", ["-c", `. ${JSON.stringify(join(OVERLAY_ROOT, "bin/backends/bb.sh"))}; fm_backend_bb_create_task domain "$FM_HOME" sm1 secondmate ''`], { env, encoding: "utf8" });
     assert.equal(run.status, 0, run.stderr);
     const calls = readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line) as string[]);
@@ -7424,7 +7452,7 @@ test("IT secondmate registration rejects a mismatched native parent", { skip: !F
     stubRealExecHost(host);
     await host.bb.storage.kv.set("native-home:thr_cap", home);
     await host.bb.storage.kv.set("native-home-host:thr_cap", "host_1");
-    const result = await host.harness.behavior.runCli(["mark-captain", "thr_domain", "--home", home, "--parent-home", "/root/firstmate", "--task", "domain"], { threadId: "thr_cap" });
+    const result = await host.harness.behavior.runCli(["mark-captain", "thr_domain", "--home", home, "--parent-home", process.env.FM_TEST_HOME ?? "/root/firstmate", "--task", "domain"], { threadId: "thr_cap" });
     assert.equal(result.exitCode, 1);
     assert.match(result.stderr, /Native secondmate home identity failed/);
     assert.equal(await host.bb.storage.kv.get("native-home:thr_domain"), undefined);

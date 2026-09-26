@@ -4788,11 +4788,12 @@ export default async function plugin(bb: BbPluginApi) {
     crew: Crew,
     yes: boolean,
     allowRedCheck?: string,
+    allowMissingCheck?: string,
     opts: { caller?: string; overrideOwner?: boolean } = {},
   ): Promise<string> {
     const posture = await postureOf(crew.projectId);
-    // Captain authority (yes/yolo) and an allowRedCheck waiver are separate: the
-    // waiver never grants authority, so a --allow-red without --yes still refuses.
+    // Captain authority (yes/yolo) and check waivers are separate: neither waiver
+    // grants authority, so either waiver without --yes still refuses.
     if (!posture.yolo && !yes) {
       throw new Error(
         `Needs captain's word: re-run with --yes, or set yolo (bb firstmate posture set --project ${crew.projectId} --yolo on).`,
@@ -4824,6 +4825,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (pr.state !== "merged") {
         const args = [crew.id, pr.url];
         if (allowRedCheck?.trim()) args.push("--allow-red", allowRedCheck.trim());
+        if (allowMissingCheck?.trim()) args.push("--allow-missing", allowMissingCheck.trim());
         await awaitMergeableKnown(hostId, pr.url);
         let result = await runFmScript({ script: "pr-merge", args, fmHome: nativeHome, hostId, timeoutMs: 180_000 });
         if (result.exitCode !== 0 && /mergeable is "UNKNOWN"/.test(result.output)) {
@@ -4854,6 +4856,9 @@ export default async function plugin(bb: BbPluginApi) {
     }
     let f = prFacts(await bb.sdk.environments.pullRequest({ environmentId: envId }));
     if (!f.available) throw new Error(`No PR for crew ${crew.id}. For local-only: bb firstmate posture set --project ${crew.projectId} --mode local-only then merge.`);
+    if (allowMissingCheck?.trim()) {
+      throw new Error("Refusing: this BB merge path cannot verify required check contexts; --allow-missing is supported only through the native PR merge gate.");
+    }
     await rememberPrUrl(crew, f.url);
     await guardForeignPr(crew, f.url, override);
     if (f.state === "merged") {
@@ -7512,7 +7517,7 @@ export default async function plugin(bb: BbPluginApi) {
     '  bb firstmate dispatch --project <id> [--task t ...] [--shape ship|scout] [--mode m] [--title t] [--provider p] [--model m] [--reasoning-level low|medium|high|xhigh|max] [--permission-mode m] [--shared-env] [--worktree] [--hidden] [--send-at ms] -- "<task>"',
     "  bb firstmate crews | crew <id> | watch [id ...] [--timeout s] [--json]",
     '  bb firstmate tell <id> [--queue] -- "<message>" | interrupt <id> | stop <id> | retry <id> [--model m] [--provider p] [--reasoning-level l] [--reason r]',
-    "  bb firstmate bearings | deliver <id> | merge <id> [--yes] [--allow-red <check-name>] | promote <id>",
+    "  bb firstmate bearings | deliver <id> | merge <id> [--yes] [--allow-red <check-name>] [--allow-missing <check-name>] | promote <id>",
     '  bb firstmate queue add --project <id> [--shape s] [--mode m] [--after <qid>] [--wait-until <iso>] -- "<title>"',
     "  bb firstmate queue [list|next|dispatch <qid>|done <qid>|drop <qid>]",
     '  bb firstmate decide ask [--option o ...] [--crew <id>] -- "<question>"',
@@ -7852,20 +7857,22 @@ export default async function plugin(bb: BbPluginApi) {
   registerCaptainTool({
     name: "firstmate_merge",
     description:
-      "Merge a crew PR (green+mergeable, or zero checks) or ff-only local-only land. Needs yes=true or yolo posture. allowRedCheck names one exact failing check to land past — separate from yes, and never silent.",
+      "Merge a crew PR (green+mergeable, or zero checks) or ff-only local-only land. Needs yes=true or yolo posture. allowRedCheck waives one exact failing check; allowMissingCheck waives one exact required check that has not reported through native verification. Neither grants authority.",
     parameters: z.object({
       crewId: z.string(),
       yes: z.boolean().optional(),
       allowRedCheck: z.string().optional()
         .describe("Exact name of one failing check to waive; every other check must be green"),
+      allowMissingCheck: z.string().optional()
+        .describe("Exact name of one required check that has not reported; native verification is required, all other required checks must report and be green"),
       overrideOwner: z.boolean().optional()
         .describe("Land a crew/PR owned by another captain (only when the captain explicitly said so)"),
     }),
-    async execute({ crewId, yes, allowRedCheck, overrideOwner }, ctx) {
+    async execute({ crewId, yes, allowRedCheck, allowMissingCheck, overrideOwner }, ctx) {
       const crew = await findCrew(crewId);
       if (crew === undefined) return toolError(`No crew ${crewId}.`);
       try {
-        return await mergeCrew(crew, yes === true, allowRedCheck, { caller: ctxString(ctx, "threadId"), overrideOwner: overrideOwner === true });
+        return await mergeCrew(crew, yes === true, allowRedCheck, allowMissingCheck, { caller: ctxString(ctx, "threadId"), overrideOwner: overrideOwner === true });
       } catch (error) {
         return toolError(error instanceof Error ? error.message : "Merge failed.");
       }
@@ -9405,7 +9412,7 @@ export default async function plugin(bb: BbPluginApi) {
             if (id === undefined) return fail(usage);
             const crew = await findCrew(id);
             if (crew === undefined) return fail(`No crew ${id}.`);
-            const text = await mergeCrew(crew, flags.has("yes"), flagStr(flags, "allow-red"), {
+            const text = await mergeCrew(crew, flags.has("yes"), flagStr(flags, "allow-red"), flagStr(flags, "allow-missing"), {
               caller: ctxThread, overrideOwner: flags.has("override-owner"),
             });
             return reply({ merged: true, id }, text);

@@ -17,10 +17,10 @@
 #   FM_BB_MACHINE / BB_MACHINE
 
 # shellcheck source=bin/fm-composer-lib.sh
-. "$(dirname -- "${BASH_SOURCE[0]}")/../fm-composer-lib.sh"
+. "${FM_BACKEND_LIB_DIR:-$(cd "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}/fm-composer-lib.sh"
 # shellcheck source=bin/fm-transition-lib.sh
-if [ -f "$(dirname -- "${BASH_SOURCE[0]}")/../fm-transition-lib.sh" ]; then
-  . "$(dirname -- "${BASH_SOURCE[0]}")/../fm-transition-lib.sh"
+if [ -f "${FM_BACKEND_LIB_DIR:-$(cd "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}/fm-transition-lib.sh" ]; then
+  . "${FM_BACKEND_LIB_DIR:-$(cd "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}/fm-transition-lib.sh"
 fi
 
 # Per-window dedupe marker for a fresh blocked edge. Same key scheme as herdr

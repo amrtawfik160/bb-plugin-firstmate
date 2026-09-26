@@ -53,7 +53,7 @@ if [ "$1" = firstmate ] && [ "$2" = activity ]; then
 fi
 exec ${JSON.stringify(realBb)} "$@"
 `, { mode: 0o755 });
-  command("git", ["clone", "--quiet", "--local", native, home]);
+  command("git", ["clone", "--quiet", "--local", "--no-hardlinks", native, home]);
   command("git", ["-C", home, "checkout", "--quiet", "--detach", readFileSync(join(root, "overlay/patch-base.txt"), "utf8").trim()]);
   command("python3", [join(root, "overlay/install-bb-backend.py"), "--home", home, "--overlay", join(root, "overlay"), "--project-id", project]);
   mkdirSync(join(home, "state"), { recursive: true }); mkdirSync(join(home, "data"), { recursive: true });
