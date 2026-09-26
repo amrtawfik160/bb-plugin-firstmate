@@ -35,8 +35,9 @@ test author expected; it cannot tell you the real `fm-spawn.sh` refuses your
 brief. The live proofs in [`scripts/`](scripts/) are the model:
 
 - [`scripts/live-brief-intent-check.mjs`](scripts/live-brief-intent-check.mjs) —
-  runs the **real** `fm-brief.sh` + `fm-spawn.sh` (`--backend bb --harness bb`)
-  under a scratch `FM_HOME`, spawns and tears down real `bb` threads, and imports
+  installs the overlay mirror into a scratch `FM_HOME` cloned at the patch base,
+  runs the **real** `bin-bb/fm-brief.sh` + `fm-spawn.sh` (`--backend bb --harness bb`),
+  spawns and tears down real `bb` threads, and imports
   the **actual** `normalizeCaptainIntent` from `server.ts` (not a copy).
 - [`scripts/live-host-transport-check.mjs`](scripts/live-host-transport-check.mjs)
   — mirrors `writeHostBytes` against the actual BB terminal transport and proves

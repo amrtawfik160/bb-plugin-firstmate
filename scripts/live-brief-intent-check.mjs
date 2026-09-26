@@ -13,21 +13,22 @@
 //      strips the leading operator-address label. The same brief then passes the gate and
 //      the REAL fm-spawn.sh --backend bb --harness bb spawns a real bb thread.
 //
-// Everything mutating happens under a scratch FM_HOME (a copy of the native firstmate
-// with fresh empty data/ and state/) and a throwaway project; the live /root/firstmate
+// Everything mutating happens under a scratch FM_HOME (a clone of the local firstmate
+// checkout detached at the overlay patch base, with the BB overlay installed so the
+// bb backend dispatches through bin-bb/) and a throwaway project; the live firstmate
 // data and state are never touched. Every real bb thread it spawns is torn down.
 //
-//   node scripts/live-brief-intent-check.mjs
+//   FM_TEST_HOME=/path/to/clone node scripts/live-brief-intent-check.mjs
 //
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { normalizeCaptainIntent } from "../server.ts";
+import { OVERLAY, INSTALLER, discoverCheckout, cloneAtBase, patchBase } from "./fm-fixture.mjs";
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const NATIVE_FM = process.env.FM_TEST_HOME ?? "/root/firstmate";
+const PROJECT = process.env.FM_LIVE_PROJECT ?? "proj_f9qp5ifyiq";
+const HOST = process.env.FM_LIVE_HOST ?? "host_m4jkvpkw67";
 const results = [];
 function record(name, ok, detail) {
   results.push({ name, ok });
@@ -49,18 +50,28 @@ function teardownThread(tid) {
   sh("bb", ["thread", "archive", tid]);
   sh("bb", ["thread", "delete", tid, "--yes"]);
   const wt = `/root/.bb-server/plugins/environment-git-worktree/host-data/worktrees/${tid}-1`;
-  if (existsSync(wt)) rmSync(wt, { recursive: true, force: true });
+  try { rmSync(wt, { recursive: true, force: true }); } catch {}
+}
+
+const checkout = discoverCheckout();
+if (!checkout) {
+  console.log("SKIP: no firstmate checkout discoverable (set FM_TEST_HOME).");
+  process.exit(0);
 }
 
 const scratch = mkdtempSync(join(tmpdir(), "fm-b1-"));
 const fmh = join(scratch, "fmhome");
+const bin = join(fmh, "bin-bb");
 const proj = join(scratch, "proj");
-console.log(`# live-brief-intent-check scratch=${scratch}\n`);
+console.log(`# live-brief-intent-check scratch=${scratch}  patch base=${patchBase().slice(0, 12)}\n`);
 
 try {
-  // Scratch FM_HOME: copy native firstmate WITHOUT its live data/ and state/.
-  const rc = sh("rsync", ["-a", "--exclude", "data/", "--exclude", "state/", `${NATIVE_FM}/`, `${fmh}/`]);
-  if (rc.code !== 0) throw new Error(`rsync scratch FM_HOME failed: ${rc.out}`);
+  // Scratch FM_HOME: a clone at the patch base with the BB overlay installed, so
+  // fm-spawn.sh --backend bb resolves through the mirror (bin-bb/) as the plugin invokes it.
+  const cloned = cloneAtBase(checkout, fmh);
+  if (!cloned.ok) throw new Error(`clone scratch FM_HOME failed: ${cloned.reason}`);
+  const inst = sh("python3", [INSTALLER, "--home", fmh, "--overlay", OVERLAY, "--project-id", PROJECT]);
+  if (inst.code !== 0 || !existsSync(join(bin, "fm-spawn.sh"))) throw new Error(`install-bb-backend.py failed: ${inst.out}`);
   mkdirSync(join(fmh, "data"), { recursive: true });
   mkdirSync(join(fmh, "state"), { recursive: true });
   // Throwaway git project.
@@ -70,11 +81,11 @@ try {
   sh("git", ["config", "user.name", "x"], { cwd: proj });
   sh("git", ["commit", "-q", "--allow-empty", "-m", "init"], { cwd: proj });
 
-  const env = { ...process.env, FM_HOME: fmh, FM_ROOT: fmh };
+  const env = { ...process.env, FM_HOME: fmh, FM_ROOT: fmh, FM_BB_MACHINE: HOST };
   const brief = (id) => join(fmh, "data", id, "brief.md");
   function scaffold(id, kind) {
     const args = kind === "scout" ? [id, "crew", "--scout"] : [id, "crew", "--mode", "direct-PR"];
-    const r = sh(join(fmh, "bin", "fm-brief.sh"), args, { env });
+    const r = sh(join(bin, "fm-brief.sh"), args, { env });
     if (!existsSync(brief(id))) throw new Error(`fm-brief.sh did not scaffold ${id}: ${r.out}`);
   }
   function fill(id, task) {
@@ -87,7 +98,7 @@ try {
       kind === "scout"
         ? [id, proj, "--scout", "--backend", "bb", "--harness", "bb"]
         : [id, proj, "--mode", "direct-PR", "--yolo", "off", "--backend", "bb", "--harness", "bb"];
-    return sh(join(fmh, "bin", "fm-spawn.sh"), args, { env, timeout: 90_000 });
+    return sh(join(bin, "fm-spawn.sh"), args, { env, timeout: 90_000 });
   }
 
   // The bare "Captain's intent:" label is the exact form native REFUSES and the form
@@ -134,7 +145,7 @@ try {
     // Run native's EXACT refusal predicate against the real brief.
     const gate = sh("bash", [
       "-c",
-      `. "${join(fmh, "bin", "fm-dod-lib.sh")}"; if fm_brief_intent_address_line "${brief(pid)}" >/dev/null; then echo NATIVE_REFUSES; else echo NATIVE_ACCEPTS; fi`,
+      `. "${join(bin, "fm-dod-lib.sh")}"; if fm_brief_intent_address_line "${brief(pid)}" >/dev/null; then echo NATIVE_REFUSES; else echo NATIVE_ACCEPTS; fi`,
     ], { env });
     const nativeAccepts = /NATIVE_ACCEPTS/.test(gate.out);
     record(`don't-over-strip: native ACCEPTS + normalizer preserves ${JSON.stringify(provenance)}`,
