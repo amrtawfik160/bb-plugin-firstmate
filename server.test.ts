@@ -2918,7 +2918,7 @@ test("bb crew launch prompt routes scripts to bin-bb and forbids CI poll loops",
       `run \`${home}/bin/fm-ensure-agents-md.sh .\` in the worktree.`,
       "bin/fm-crew-state.sh at line start",
     ].join("\n"));
-    const env = { ...process.env, PATH: `${fakebin}:${process.env.PATH}`, BB_CLI: join(fakebin, "bb"), FM_HOME: home, FM_ROOT: home, FM_BB_PROJECT_ID: "project_1", FM_BB_MACHINE: "host_1" };
+    const env = { ...process.env, PATH: `${fakebin}:${process.env.PATH}`, FM_HOME: home, FM_ROOT: home, FM_BB_PROJECT_ID: "project_1", FM_BB_MACHINE: "host_1" };
     const run = spawnSync("bash", ["-c", `. ${JSON.stringify(join(OVERLAY_ROOT, "bin/backends/bb.sh"))} 2>/dev/null; fm_backend_bb_create_task "Scout" /repo c1 scout "$BRIEF"`], { env: { ...env, BRIEF: brief }, encoding: "utf8" });
     assert.equal(run.status, 0, run.stderr);
     const calls = readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line) as string[]);
@@ -7322,7 +7322,7 @@ test("IT BB secondmate launch keeps captain role and seeded home; stop failures 
   try {
     mkdirSync(fakebin);
     writeFileSync(join(fakebin, "bb"), `#!/usr/bin/env python3\nimport json,sys\nwith open(${JSON.stringify(log)}, 'a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')\nargs=sys.argv[1:]\nif args[:2] == ['thread','spawn']: print(json.dumps({'id':'thr_secondmate','path':${JSON.stringify(home)}}))\nelif args[:2] == ['thread','show']: print(json.dumps({'id':'thr_secondmate','status':'idle','path':${JSON.stringify(home)}}))\nelif args[:2] == ['thread','stop']: sys.exit(19)\n`, { mode: 0o755 });
-    const env = { ...process.env, PATH: `${fakebin}:${process.env.PATH}`, BB_CLI: join(fakebin, "bb"), FM_HOME: home, FM_BB_PROJECT_ID: "project_1", FM_BB_MACHINE: "host_1" };
+    const env = { ...process.env, PATH: `${fakebin}:${process.env.PATH}`, FM_HOME: home, FM_BB_PROJECT_ID: "project_1", FM_BB_MACHINE: "host_1" };
     const run = spawnSync("bash", ["-c", `. ${JSON.stringify(join(OVERLAY_ROOT, "bin/backends/bb.sh"))}; fm_backend_bb_create_task domain "$FM_HOME" sm1 secondmate ''`], { env, encoding: "utf8" });
     assert.equal(run.status, 0, run.stderr);
     const calls = readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line) as string[]);

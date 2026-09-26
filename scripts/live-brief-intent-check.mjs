@@ -28,7 +28,6 @@ import { normalizeCaptainIntent } from "../server.ts";
 import { OVERLAY, INSTALLER, discoverCheckout, cloneAtBase, patchBase } from "./fm-fixture.mjs";
 
 const PROJECT = process.env.FM_LIVE_PROJECT ?? "proj_f9qp5ifyiq";
-const HOST = process.env.FM_LIVE_HOST ?? "host_m4jkvpkw67";
 const results = [];
 function record(name, ok, detail) {
   results.push({ name, ok });
@@ -81,7 +80,7 @@ try {
   sh("git", ["config", "user.name", "x"], { cwd: proj });
   sh("git", ["commit", "-q", "--allow-empty", "-m", "init"], { cwd: proj });
 
-  const env = { ...process.env, FM_HOME: fmh, FM_ROOT: fmh, FM_BB_MACHINE: HOST };
+  const env = { ...process.env, FM_HOME: fmh, FM_ROOT: fmh };
   const brief = (id) => join(fmh, "data", id, "brief.md");
   function scaffold(id, kind) {
     const args = kind === "scout" ? [id, "crew", "--scout"] : [id, "crew", "--mode", "direct-PR"];
