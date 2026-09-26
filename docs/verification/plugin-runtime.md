@@ -1,5 +1,33 @@
 # Plugin runtime verification
 
+## Upstream refresh verification — 2026-09-26
+
+Pinned native source: `4299683d5b656a70ced609d7d929499ddc0d675a` (34 commits past the prior `b42d4fa8` pin). The source was a fresh upstream clone; `/root/firstmate` was not used or modified.
+
+| Command | Result |
+| --- | --- |
+| `FM_TEST_HOME=.upstream-work npm run fidelity -- --native .upstream-work` | OK — 21 skills, 12 BB-DIVERGE anchors, 7 authorized BB-ONLY fences, snapshot fresh |
+| `FM_TEST_HOME=.upstream-work FM_TEST_BIN='' FM_CLASSIFY_LIB=.upstream-work/bin/fm-classify-lib.sh FIRSTMATE_TEST_NATIVE=.upstream-work npm test` | 501 tests, 450 passed, 0 failed, 51 skipped; `FM_TEST_BIN=''` skips live native integration cases that need the host fixture |
+| `npm exec -- tsc --noEmit` | Exit 0 |
+| `FM_TEST_HOME=.upstream-work node scripts/patch-drift-check.mjs --ref 4299683d5b656a70ced609d7d929499ddc0d675a` | All four overlay patches apply cleanly at the pinned SHA |
+| `FM_TEST_HOME=.upstream-work FM_LIVE_BIN=.upstream-work/bin node scripts/live-afk-hostlevel-check.mjs` | 7/7 pass using upstream `enter --words` and `AUTHORITY=away` |
+| `FM_TEST_HOME=.upstream-work node scripts/live-forget-worktree-check.mjs` | 9/9 pass; disposable `/tmp` Git worktrees |
+| `FM_TEST_HOME=.upstream-work node scripts/live-migration-zero-window-check.mjs` | 7 probes, 0 BB-less windows; atomic failed reinstall preserved the mirror |
+| `FM_TEST_HOME=.upstream-work FM_MIRROR_CHECK_NO_REAL_PROJECT=1 node scripts/live-mirror-check.mjs` | 14/14 pass through the BB spawn layer; real thread creation intentionally disabled |
+| `node scripts/live-host-transport-check.mjs --host host_m4jkvpkw67 --scratch /tmp/fm-host-transport-92347fc2` | 5/5 pass; exact hashes for 10B, 10KB, 200KB and Unicode payloads; forced failure preserved original |
+
+## Baseline comparison for the remaining live checks
+
+| Check | Baseline at b42 / origin main | New pin `4299683d` | Verdict |
+| --- | --- | --- | --- |
+| `live-bb-activity` | Same `HTTP 409: This directory belongs to environment env_wyzbtysv6s; reuse that environment instead.` before native source is read | Same HTTP 409 before native source is read | Environmental: active-environment collision reproduced on baseline |
+| `live-blocked-alert` | `cannot open .../FETCH_HEAD: Read-only file system`; captain-thread cleanup hit the same read-only worktree restriction | Same FETCH_HEAD read-only failure; scout-thread cleanup hit the same restriction | Environmental: shared Git metadata and worktree mounts are read-only on both pins |
+| `live-brief-intent` | Original script: 2/6; ship/scout raw and normalized spawns all report `unknown backend 'bb'` because the script invoked pristine `bin/`. Reworked script (installs the overlay into a clone at the patch base and invokes `bin-bb/`) against the origin/main overlay at `b42d4fa8`: 2/6; no `unknown backend` output; all four spawn cases stop at `error: no-mistakes gate agent must not drive the fleet (NO_MISTAKES_GATE set)`; both native “don't over-strip” checks pass | Reworked script: same 2/6 and identical gate refusal; no `unknown backend` output; both native “don't over-strip” checks pass | Environmental: the rerun was made from inside the no-mistakes gate session, and upstream `fm-spawn.sh` sources `fm-gate-refuse-lib.sh` and refuses before backend validation at both pins. The pristine-`bin/` cause is removed from the script; a real spawn result needs a run outside a gate session. The `bin-bb/` loader regression is fixed and covered below |
+| `live-tell-steer` | 5/6; steer token not echoed, continuation and queue checks pass; cleanup hits read-only worktree | Same 5/6 behavior; cleanup hits read-only worktree | Environmental/provider response: reproduced on baseline; this script calls BB tell directly |
+| BB overlay source loader | Origin/main overlay sources `fm_backend_source bb` successfully on b42 | Refreshed overlay sources successfully; removing the new `bb` sibling case makes the same check exit 1 | Regression fixed: `server.test.ts` installs the real overlay and asserts the BB adapter function loads from `bin-bb/` |
+
+The scripts left these IDs after their own cleanup hit read-only paths: new pin `thr_na2h7eqxqu`, `thr_quakwy6b7m`, `thr_wkd6ue3py9`; baseline `thr_hq9duzfbxa`, `thr_pcfpasj37s`, `thr_u49d8v68ab`, `thr_vdpugar3et`. They were not touched. The activity and brief-intent checks created no threads. The reworked brief-intent check ran as `FM_TEST_HOME=<clone> node scripts/live-brief-intent-check.mjs` against a clone containing `4299683d`, and for the baseline as the same script copied into a `git archive` of origin/main with `FM_TEST_HOME=/root/firstmate`, so its fixture cloned at that tree's own patch base `b42d4fa8`. The no-real-project mirror proof passed 14/14 and showed no `unknown backend` fallback signature. The full suite passes 455 tests, with 0 failures and 46 host-fixture skips.
+
 Verified 2026-09-23 with Node 24.18.0, BB 0.43.3, SDK 0.4.104, ShellCheck 0.11.0, and Lavish 0.1.78.
 Overlay base: `9296f9b9d2566797b9a9aecaa5956bb8e471d2cd`.
 This record separates native execution from substituted SDK boundaries.

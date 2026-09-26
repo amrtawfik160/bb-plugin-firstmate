@@ -29,6 +29,7 @@ bb firstmate dispatch --project <project-id> -- "fix the flaky login test"
 bb firstmate watch                      # blocks until crews go idle (no polling)
 bb firstmate deliver <crew-id>          # committed + uncommitted diff, PR URL
 bb firstmate merge <crew-id> --yes      # merge green PR, or ff-only local land
+# Attended-only, exact-check waivers: --allow-red <check> / --allow-missing <check>
 ```
 
 Crews end every task with a status verdict. `deliver` shows what they committed. You decide what lands.
@@ -128,7 +129,7 @@ BB-specific behavior in this fork:
 
 ## Skills
 
-The plugin registers all 21 upstream `.agents/skills` as real BB skills, plus `/captain` and `/firstmate`. Their policy text is pinned to upstream commit `b42d4fa8`; one shared runtime contract translates script paths, workers, approvals, and alternate harness mechanics to `firstmate_fm` and BB threads. Crew threads still receive no captain skills.
+The plugin registers all 21 upstream `.agents/skills` as real BB skills, plus `/captain` and `/firstmate`. Their policy text is pinned to upstream commit `4299683d`; one shared runtime contract translates script paths, workers, approvals, and alternate harness mechanics to `firstmate_fm` and BB threads. Crew threads still receive no captain skills.
 
 ## Development
 
@@ -139,7 +140,7 @@ bb plugin build                # compile dist/
 bb plugin reload firstmate     # reload the running plugin
 ```
 
-The overlay **never edits tracked firstmate files**. `overlay/install-bb-backend.py` builds a parallel "mirror bin" at `<home>/bin-bb` (native entries symlinked; `fm-backend.sh`/`fm-spawn.sh`/`fm-teardown.sh` are patched copies via the two `overlay/*.patch` files; `bb.sh` added), registers it in `<home>/.git/info/exclude`, and the plugin routes `bin` → `bin-bb` (`$FM_BINDIR`) when the `config/bb-overlay` marker is present. This keeps `git status --porcelain` empty so the fetch + ff-only auto-update actually fast-forwards. See `overlay/docs/bb-backend.md` ("Installation architecture", the upstream-seam proposal, and the migration procedure). The two patches must keep applying to pristine upstream firstmate; when changing dispatchers, run the installer against a fresh clone before committing (the `installer leaves a real firstmate clone's tracked tree clean` test guards this).
+The overlay **never edits tracked firstmate files**. `overlay/install-bb-backend.py` builds a parallel "mirror bin" at `<home>/bin-bb` (native entries symlinked; the no-seam dispatch scripts are patched copies generated from the `overlay/*.patch` files; `bb.sh` added), registers it in `<home>/.git/info/exclude`, and the plugin routes `bin` → `bin-bb` (`$FM_BINDIR`) when the `config/bb-overlay` marker is present. This keeps `git status --porcelain` empty so the fetch + ff-only auto-update actually fast-forwards. See `overlay/docs/bb-backend.md` ("Installation architecture", the upstream-seam proposal, and the migration procedure). The patches must keep applying to pristine upstream firstmate; when changing dispatchers, run the installer against a fresh clone before committing (the `installer leaves a real firstmate clone's tracked tree clean` test guards this).
 
 ## Credits
 

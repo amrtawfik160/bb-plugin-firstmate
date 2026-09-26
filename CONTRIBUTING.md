@@ -35,8 +35,9 @@ test author expected; it cannot tell you the real `fm-spawn.sh` refuses your
 brief. The live proofs in [`scripts/`](scripts/) are the model:
 
 - [`scripts/live-brief-intent-check.mjs`](scripts/live-brief-intent-check.mjs) —
-  runs the **real** `fm-brief.sh` + `fm-spawn.sh` (`--backend bb --harness bb`)
-  under a scratch `FM_HOME`, spawns and tears down real `bb` threads, and imports
+  installs the overlay mirror into a scratch `FM_HOME` cloned at the patch base,
+  runs the **real** `bin-bb/fm-brief.sh` + `fm-spawn.sh` (`--backend bb --harness bb`),
+  spawns and tears down real `bb` threads, and imports
   the **actual** `normalizeCaptainIntent` from `server.ts` (not a copy).
 - [`scripts/live-host-transport-check.mjs`](scripts/live-host-transport-check.mjs)
   — mirrors `writeHostBytes` against the actual BB terminal transport and proves
@@ -178,7 +179,7 @@ The pinned native source is vendored, read-only, under `native-snapshot/<sha>/�
 mirroring native's own paths (`.agents/skills/<name>/SKILL.md`, or a named slice
 such as `AGENTS.section-9.md`). This is what the check diffs against, so it runs
 fully offline. It is a copy of native at the pin — never edit it by hand; re-vendor
-from the native clone when you bump a pin. Native is currently at `b42d4fa8`.
+from the native clone when you bump a pin. Native is currently at `4299683d`.
 
 ### Pin the native source per skill (`BB-SOURCE`)
 
@@ -187,8 +188,8 @@ Every re-derived skill carries, right after its frontmatter, a machine-parseable
 
     <!-- BB-SOURCE
          native: .agents/skills/afk/SKILL.md
-         sha: b42d4fa8a752fad9a5f0235783b02534bce29219
-         snapshot: native-snapshot/b42d4fa8/.agents/skills/afk/SKILL.md
+         sha: 4299683d5b656a70ced609d7d929499ddc0d675a
+         snapshot: native-snapshot/4299683d/.agents/skills/afk/SKILL.md
          fidelity: adapted        # verbatim | adapted
          note: … -->
 

@@ -193,9 +193,10 @@ tool exists.
 
 Parent permission is a ceiling. Ship crews default to an isolated worktree.
 Merge needs the captain's word (`--yes` / yolo). Checks: green passes, zero
-checks (`no_checks`) counts as no failing checks, and `--allow-red <check-name>`
-waives one exact failing check while every other check must stay green — never
-silently, and separate from `--yes`. `deck`/`bearings` retire crews whose PR was
+checks (`no_checks`) counts as no failing checks. The `--allow-red <check-name>`
+and `--allow-missing <check-name>` waivers each name one exact check, are
+attended-only, never silent, and never grant authority; the captain skill's
+Deliver section owns the exact rules. `deck`/`bearings` retire crews whose PR was
 merged or closed outside BB.
 
 ## Historical parity tracking

@@ -11,8 +11,8 @@ metadata:
 
 <!-- BB-SOURCE
      native: .agents/skills/secondmate-provisioning/SKILL.md
-     sha: b42d4fa8a752fad9a5f0235783b02534bce29219
-     snapshot: native-snapshot/b42d4fa8/.agents/skills/secondmate-provisioning/SKILL.md
+     sha: 4299683d5b656a70ced609d7d929499ddc0d675a
+     snapshot: native-snapshot/4299683d/.agents/skills/secondmate-provisioning/SKILL.md
      fidelity: verbatim
 -->
 

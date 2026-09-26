@@ -89,7 +89,7 @@ try {
   }
 
   // (2) Install the overlay → mirror bin. No fake --project-id: without a real project
-  //     the adapter resolves by path (like live-brief-intent-check), and the dispatch
+  //     the adapter resolves by path, and the dispatch
   //     proof does not depend on real thread creation.
   const instArgs = [INSTALLER, "--home", fmh, "--overlay", OVERLAY];
   if (realProjectId) instArgs.push("--project-id", realProjectId);

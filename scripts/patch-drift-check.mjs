@@ -31,7 +31,7 @@ const scratch = mkdtempSync(join(tmpdir(), "fm-drift-"));
 const clone = join(scratch, "up");
 let exitCode = 0;
 try {
-  if (sh("git", ["clone", "--quiet", "--local", checkout, clone]).code !== 0) {
+  if (sh("git", ["clone", "--quiet", "--local", "--no-hardlinks", checkout, clone]).code !== 0) {
     console.log("SKIP: could not clone the local checkout.");
     process.exit(2);
   }

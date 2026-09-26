@@ -2149,6 +2149,32 @@ test("allowRedCheck is separate from authority: no --yes still refuses", async (
   }
 });
 
+test("allowMissingCheck refuses when the BB merge path cannot read required contexts", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () =>
+      makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }),
+    );
+    host.harness.sdk.stub("environments.pullRequest", async () => ({
+      outcome: "available",
+      pullRequest: {
+        url: "https://gh/pr/1", number: 1, title: "t", state: "open",
+        checks: { state: "passing", failedCount: 0, pendingCount: 0, passedCount: 1 },
+        mergeability: { mergeable: "MERGEABLE" },
+      },
+    }));
+    host.harness.sdk.stub("environments.mergePullRequest", async () => ({}));
+    const result = await host.harness.behavior.runCli(["merge", "c1", "--yes", "--allow-missing", "required-check"]);
+    assert.equal(result.exitCode, 1);
+    assert.match(result.stderr, /native PR merge gate/);
+    assert.equal(host.harness.sdk.callsTo("environments.mergePullRequest").length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("merge runs native merge and teardown before retiring the crew", async () => {
   const host = createFakePluginHost({
     pluginId: "firstmate",
@@ -2187,13 +2213,15 @@ test("merge runs native merge and teardown before retiring the crew", async () =
     host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
     host.harness.sdk.stub("terminals.output", async () => hostOutput(""));
     host.harness.sdk.stub("terminals.close", async () => ({}));
-    const result = await host.harness.behavior.runCli(["merge", "c1", "--yes"]);
+    const result = await host.harness.behavior.runCli(["merge", "c1", "--yes", "--allow-missing", "required-check"]);
     assert.equal(result.exitCode, 0, result.stderr);
     assert.ok(
       hostCommands.some((cmd) => cmd.includes("fm-teardown.sh") && cmd.includes("c1")),
       `no native teardown in ${hostCommands.join("\n---\n")}`,
     );
-    assert.ok(hostCommands.some(cmd => cmd.includes("fm-pr-merge.sh")));
+    const nativeMerge = hostCommands.find(cmd => cmd.includes("fm-pr-merge.sh"));
+    assert.ok(nativeMerge);
+    assert.ok(nativeMerge.includes("--allow-missing") && nativeMerge.includes("required-check"), nativeMerge);
     assert.equal(host.harness.sdk.callsTo("environments.mergePullRequest").length, 0);
   } finally {
     await host.harness.lifecycle.dispose();
@@ -2494,7 +2522,7 @@ const UPSTREAM_URL = "https://github.com/kunchenguid/firstmate";
 // unreachable from the checkout HEAD); if the base is still missing, fetch it from origin.
 // Returns null on success or a skip reason string.
 function cloneAtPatchBase(checkout: string, home: string): string | null {
-  if (spawnSync("git", ["clone", "--quiet", "--local", checkout, home]).status !== 0) return "clone failed";
+  if (spawnSync("git", ["clone", "--quiet", "--local", "--no-hardlinks", checkout, home]).status !== 0) return "clone failed";
   if (spawnSync("git", ["-C", home, "cat-file", "-e", PATCH_BASE]).status !== 0) {
     if (spawnSync("git", ["-C", home, "fetch", "--quiet", UPSTREAM_URL, PATCH_BASE]).status !== 0) {
       return `patch base ${PATCH_BASE.slice(0, 12)} unavailable (no local object, fetch failed)`;
@@ -2625,6 +2653,14 @@ test("installer leaves a real firstmate clone's tracked tree clean", (t) => {
     assert.ok(existsSync(join(home, "bin-bb", "fm-spawn.sh")), "mirror bin missing");
     const patched = readFileSync(join(home, "bin-bb", "fm-backend.sh"), "utf8");
     assert.match(patched, /FM_BACKEND_KNOWN="[^"]*\bbb\b/, "mirror fm-backend.sh lacks bb registration");
+    const source = spawnSync("bash", ["-c", [
+      `. "${join(home, "bin-bb", "fm-backend.sh")}"`,
+      "fm_backend_source bb",
+      "declare -F fm_backend_bb_create_task >/dev/null",
+      "printf 'BB_BACKEND_SOURCE_LOADED\\n'",
+    ].join(" && ")], { encoding: "utf8", env: { ...process.env, FM_HOME: home, FM_ROOT: home } });
+    assert.equal(source.status, 0, `bb backend source must load from the mirror:\n${source.stderr}`);
+    assert.match(source.stdout, /BB_BACKEND_SOURCE_LOADED/);
     // F4: internal dispatch self-references in the mirror copy stay in the mirror
     // ($SCRIPT_DIR), so batch/array dispatch does not re-invoke pristine native bin.
     const mirrorSpawn = readFileSync(join(home, "bin-bb", "fm-spawn.sh"), "utf8");
@@ -7241,7 +7277,7 @@ test("IT native local merge respects captain hold and lands BB-named branch", { 
   };
   try {
     mkdirSync(project); mkdirSync(join(home, "config")); mkdirSync(join(home, "fakebin"));
-    symlinkSync("/root/firstmate/bin-bb", join(home, "bin-bb"));
+    symlinkSync(join(process.env.FM_TEST_HOME ?? "/root/firstmate", "bin-bb"), join(home, "bin-bb"));
     writeFileSync(join(home, "config/bb-overlay"), "bin-bb\n");
     git("init", "-b", "main", project);
     git("-C", project, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "base");
@@ -7424,7 +7460,7 @@ test("IT secondmate registration rejects a mismatched native parent", { skip: !F
     stubRealExecHost(host);
     await host.bb.storage.kv.set("native-home:thr_cap", home);
     await host.bb.storage.kv.set("native-home-host:thr_cap", "host_1");
-    const result = await host.harness.behavior.runCli(["mark-captain", "thr_domain", "--home", home, "--parent-home", "/root/firstmate", "--task", "domain"], { threadId: "thr_cap" });
+    const result = await host.harness.behavior.runCli(["mark-captain", "thr_domain", "--home", home, "--parent-home", process.env.FM_TEST_HOME ?? "/root/firstmate", "--task", "domain"], { threadId: "thr_cap" });
     assert.equal(result.exitCode, 1);
     assert.match(result.stderr, /Native secondmate home identity failed/);
     assert.equal(await host.bb.storage.kv.get("native-home:thr_domain"), undefined);
