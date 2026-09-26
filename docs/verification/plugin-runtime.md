@@ -16,7 +16,17 @@ Pinned native source: `4299683d5b656a70ced609d7d929499ddc0d675a` (34 commits pas
 | `FM_TEST_HOME=.upstream-work FM_MIRROR_CHECK_NO_REAL_PROJECT=1 node scripts/live-mirror-check.mjs` | 14/14 pass through the BB spawn layer; real thread creation intentionally disabled |
 | `node scripts/live-host-transport-check.mjs --host host_m4jkvpkw67 --scratch /tmp/fm-host-transport-92347fc2` | 5/5 pass; exact hashes for 10B, 10KB, 200KB and Unicode payloads; forced failure preserved original |
 
-Four live checks (`live-bb-activity`, `live-blocked-alert`, `live-brief-intent`, `live-tell-steer`) were not run because they create BB threads; the activity proof also installs a temporary plugin. The real-thread mirror proof was run in its documented no-project mode, so it verifies native routing but not endpoint creation. This worker lane is barred from administering shared host worktree slots. No claims from the unrun checks are presented as verified. The passing checks above invoke real native scripts from the new clone and showed no fallback signatures.
+## Baseline comparison for the remaining live checks
+
+| Check | Baseline at b42 / origin main | New pin `4299683d` | Verdict |
+| --- | --- | --- | --- |
+| `live-bb-activity` | Same `HTTP 409: This directory belongs to environment env_wyzbtysv6s; reuse that environment instead.` before native source is read | Same HTTP 409 before native source is read | Environmental: active-environment collision reproduced on baseline |
+| `live-blocked-alert` | `cannot open .../FETCH_HEAD: Read-only file system`; captain-thread cleanup hit the same read-only worktree restriction | Same FETCH_HEAD read-only failure; scout-thread cleanup hit the same restriction | Environmental: shared Git metadata and worktree mounts are read-only on both pins |
+| `live-brief-intent` | 2/6; ship/scout raw and normalized spawns all report `unknown backend 'bb'`; both native “don't over-strip” checks pass | Same 2/6 and same unknown-backend output; both native “don't over-strip” checks pass | Environmental: the live script invokes pristine `bin/` on both pins. Separately, the actual `bin-bb/` loader regression is fixed and covered below |
+| `live-tell-steer` | 5/6; steer token not echoed, continuation and queue checks pass; cleanup hits read-only worktree | Same 5/6 behavior; cleanup hits read-only worktree | Environmental/provider response: reproduced on baseline; this script calls BB tell directly |
+| BB overlay source loader | Origin/main overlay sources `fm_backend_source bb` successfully on b42 | Refreshed overlay sources successfully; removing the new `bb` sibling case makes the same check exit 1 | Regression fixed: `server.test.ts` installs the real overlay and asserts the BB adapter function loads from `bin-bb/` |
+
+The scripts left these IDs after their own cleanup hit read-only paths: new pin `thr_na2h7eqxqu`, `thr_quakwy6b7m`, `thr_wkd6ue3py9`; baseline `thr_hq9duzfbxa`, `thr_pcfpasj37s`, `thr_u49d8v68ab`, `thr_vdpugar3et`. They were not touched. The activity and brief-intent checks created no threads. The no-real-project mirror proof passed 14/14 and showed no `unknown backend` fallback signature. The full suite passes 455 tests, with 0 failures and 46 host-fixture skips.
 
 Verified 2026-09-23 with Node 24.18.0, BB 0.43.3, SDK 0.4.104, ShellCheck 0.11.0, and Lavish 0.1.78.
 Overlay base: `9296f9b9d2566797b9a9aecaa5956bb8e471d2cd`.

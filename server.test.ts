@@ -2522,7 +2522,7 @@ const UPSTREAM_URL = "https://github.com/kunchenguid/firstmate";
 // unreachable from the checkout HEAD); if the base is still missing, fetch it from origin.
 // Returns null on success or a skip reason string.
 function cloneAtPatchBase(checkout: string, home: string): string | null {
-  if (spawnSync("git", ["clone", "--quiet", "--local", checkout, home]).status !== 0) return "clone failed";
+  if (spawnSync("git", ["clone", "--quiet", "--local", "--no-hardlinks", checkout, home]).status !== 0) return "clone failed";
   if (spawnSync("git", ["-C", home, "cat-file", "-e", PATCH_BASE]).status !== 0) {
     if (spawnSync("git", ["-C", home, "fetch", "--quiet", UPSTREAM_URL, PATCH_BASE]).status !== 0) {
       return `patch base ${PATCH_BASE.slice(0, 12)} unavailable (no local object, fetch failed)`;
@@ -2653,6 +2653,14 @@ test("installer leaves a real firstmate clone's tracked tree clean", (t) => {
     assert.ok(existsSync(join(home, "bin-bb", "fm-spawn.sh")), "mirror bin missing");
     const patched = readFileSync(join(home, "bin-bb", "fm-backend.sh"), "utf8");
     assert.match(patched, /FM_BACKEND_KNOWN="[^"]*\bbb\b/, "mirror fm-backend.sh lacks bb registration");
+    const source = spawnSync("bash", ["-c", [
+      `. "${join(home, "bin-bb", "fm-backend.sh")}"`,
+      "fm_backend_source bb",
+      "declare -F fm_backend_bb_create_task >/dev/null",
+      "printf 'BB_BACKEND_SOURCE_LOADED\\n'",
+    ].join(" && ")], { encoding: "utf8", env: { ...process.env, FM_HOME: home, FM_ROOT: home } });
+    assert.equal(source.status, 0, `bb backend source must load from the mirror:\n${source.stderr}`);
+    assert.match(source.stdout, /BB_BACKEND_SOURCE_LOADED/);
     // F4: internal dispatch self-references in the mirror copy stay in the mirror
     // ($SCRIPT_DIR), so batch/array dispatch does not re-invoke pristine native bin.
     const mirrorSpawn = readFileSync(join(home, "bin-bb", "fm-spawn.sh"), "utf8");
