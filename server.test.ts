@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -39,7 +39,6 @@ import plugin, {
   fmWatchOwnerBeatTtl,
   formatFmMeta,
   formatSecondmate,
-  inboxReapScript,
   normalizeCaptainIntent,
   pickSecondmate,
   rewriteWakeAckLine,
@@ -6240,31 +6239,6 @@ test("Part D: the @crew mention menu is scoped to the composing captain's own cr
   }
 });
 
-test("inboxReapScript reaps ONLY fire-and-forget beyond the cap; keeps a normal record, handled/, and non-.msg", () => {
-  const dir = mkdtempSync(join(tmpdir(), "fm-reap-"));
-  mkdirSync(join(dir, "handled"), { recursive: true });
-  const writeRec = (seq: number, ff: boolean, body: string) => {
-    const header = ["schema=fm-task-inbox.v1", "at=2026-01-01T00:00:00Z", ...(ff ? ["delivery=fire-and-forget"] : []), "--"];
-    writeFileSync(join(dir, `${String(seq).padStart(3, "0")}.msg`), `${header.join("\n")}\n${body}`);
-  };
-  writeRec(1, false, "OLD NORMAL unhandled steer — must survive"); // oldest overall, NOT ff
-  for (let seq = 2; seq <= 6; seq += 1) writeRec(seq, true, `ff steer ${seq}`); // 5 ff records
-  writeFileSync(join(dir, "handled", "003.msg"), "handled marker"); // handled/ subdir untouched
-  writeFileSync(join(dir, "readme.txt"), "not a msg"); // non-.msg untouched
-  const r = spawnSync("bash", ["-c", inboxReapScript(dir, 3)], { encoding: "utf8", timeout: 30_000 });
-  assert.equal(r.status, 0, r.stderr);
-  const alive = (p: string) => existsSync(join(dir, p));
-  // ff-vs-normal distinction: the oldest record is a NORMAL steer and MUST survive
-  assert.ok(alive("001.msg"), "normal (non-ff) record must never be reaped");
-  // 200-cap (here 3): only the newest 3 ff survive; older ff are pruned
-  assert.ok(!alive("002.msg") && !alive("003.msg"), "oldest ff beyond cap must be reaped");
-  assert.ok(alive("004.msg") && alive("005.msg") && alive("006.msg"), "newest ff within cap must survive");
-  // handled/ and non-.msg left alone
-  assert.ok(alive("handled/003.msg"), "handled/ subdir must be untouched");
-  assert.ok(alive("readme.txt"), "non-.msg files must be untouched");
-  rmSync(dir, { recursive: true, force: true });
-});
-
 // ---- F1: two distinct reports both survive present + ack ----
 
 test("IT F1: notifyOwner=real — two DISTINCT crew reports both survive wake present+ack", { skip: !FM_INTEGRATION }, async () => {
@@ -6287,9 +6261,9 @@ test("IT F1: notifyOwner=real — two DISTINCT crew reports both survive wake pr
     assert.equal(present.exitCode, 0, present.stderr);
     assert.match(present.stdout, /REPORTONE/, present.stdout);
     assert.match(present.stdout, /REPORTTWO/, present.stdout);
-    const m = /--ack-through (\d+) --recovery-generation (\S+)/.exec(present.stdout);
-    assert.ok(m, `no WAKE_ACK line in:\n${present.stdout}`);
-    const acked = await host.harness.behavior.runCli(["wake", "--ack-through", m[1]!, "--recovery-generation", m[2]!], { threadId: "thr_cap", projectId: "proj_1" });
+    const m = /WAKE_RECEIPT: ([a-f0-9]+)/.exec(present.stdout);
+    assert.ok(m, `no receipt in:\n${present.stdout}`);
+    const acked = await host.harness.behavior.runCli(["wake", "--handled-wake", m[1]!], { threadId: "thr_cap", projectId: "proj_1" });
     assert.equal(acked.exitCode, 0, acked.stderr);
     const after = await host.harness.behavior.runCli(["wake"], { threadId: "thr_cap", projectId: "proj_1" });
     assert.doesNotMatch(after.stdout, /REPORTONE/);
@@ -6317,9 +6291,9 @@ test("IT captain idle preserves delivered wakes until explicit native acknowledg
     const present = await host.harness.behavior.runCli(["wake"], { threadId: "thr_cap", projectId: "proj_1" });
     assert.match(present.stdout, /FIRSTLIVE/);
     assert.match(present.stdout, /SECONDLIVE/);
-    const ack = /--ack-through (\d+) --recovery-generation ([A-Za-z0-9._-]+)/.exec(present.stdout);
+    const ack = /WAKE_RECEIPT: ([a-f0-9]+)/.exec(present.stdout);
     assert.ok(ack, present.stdout);
-    const consumed = await host.harness.behavior.runCli(["wake", "--ack-through", ack[1]!, "--recovery-generation", ack[2]!], { threadId: "thr_cap", projectId: "proj_1" });
+    const consumed = await host.harness.behavior.runCli(["wake", "--handled-wake", ack[1]!], { threadId: "thr_cap", projectId: "proj_1" });
     assert.equal(consumed.exitCode, 0, consumed.stderr);
     const after = await host.harness.behavior.runCli(["wake"], { threadId: "thr_cap", projectId: "proj_1" });
     assert.doesNotMatch(after.stdout, /FIRSTLIVE|SECONDLIVE|WAKE_ACK_REQUIRED/);
@@ -6355,9 +6329,9 @@ test("IT Part B: notifyOwner=real — a live-steered plain DONE is recoverable f
     assert.match(present.stdout, /REPORTDONE/, `live report must survive the durable queue:\n${present.stdout}`);
     // The entry names the crew, so an empty/truncated child output cannot make it anonymous.
     assert.match(present.stdout, /c1/, present.stdout);
-    const m = /--ack-through (\d+) --recovery-generation (\S+)/.exec(present.stdout);
-    assert.ok(m, `no WAKE_ACK line in:\n${present.stdout}`);
-    const acked = await host.harness.behavior.runCli(["wake", "--ack-through", m[1]!, "--recovery-generation", m[2]!], { threadId: "thr_cap", projectId: "proj_1" });
+    const m = /WAKE_RECEIPT: ([a-f0-9]+)/.exec(present.stdout);
+    assert.ok(m, `no receipt in:\n${present.stdout}`);
+    const acked = await host.harness.behavior.runCli(["wake", "--handled-wake", m[1]!], { threadId: "thr_cap", projectId: "proj_1" });
     assert.equal(acked.exitCode, 0, acked.stderr);
   } finally {
     await host.harness.lifecycle.dispose();
@@ -6386,9 +6360,9 @@ test("IT D6: two captains — neither sees nor consumes the other's wakes (per-c
     assert.match(a.stdout, /AONLY/, a.stdout);
     assert.doesNotMatch(a.stdout, /BONLY/, `captain A must NOT see captain B's report:\n${a.stdout}`);
     // Captain A acks through its own max seq.
-    const m = /--ack-through (\d+) --recovery-generation (\S+)/.exec(a.stdout);
-    assert.ok(m, `no WAKE_ACK line for A:\n${a.stdout}`);
-    await host.harness.behavior.runCli(["wake", "--ack-through", m[1]!, "--recovery-generation", m[2]!], { threadId: "thr_capA", projectId: "proj_1" });
+    const m = /WAKE_RECEIPT: ([a-f0-9]+)/.exec(a.stdout);
+    assert.ok(m, `no receipt for A:\n${a.stdout}`);
+    await host.harness.behavior.runCli(["wake", "--handled-wake", m[1]!], { threadId: "thr_capA", projectId: "proj_1" });
     // Captain B still sees BONLY — A's ack could not consume B's rows.
     const b = await host.harness.behavior.runCli(["wake"], { threadId: "thr_capB", projectId: "proj_1" });
     assert.equal(b.exitCode, 0, b.stderr);
@@ -6465,7 +6439,7 @@ test("IT F3: tellOwner=real steers a crew with NO state/<id>.meta (durable recor
     const res = await host.harness.behavior.runCli(["tell", "c1", "--message=please rebase on main"], { projectId: "proj_1" });
     assert.equal(res.exitCode, 0, res.stderr);
     assert.equal(sendCalls(host).length, 1, "literal doorbell still delivered");
-    const rec = readFileSync(join(home, "state", "c1.inbox", "handled", "001.msg"), "utf8");
+    const rec = readFileSync(join(home, "state", "c1.inbox", "001.msg"), "utf8");
     assert.match(rec, /please rebase on main/, "durable record written despite no meta");
     assert.ok(!existsSync(join(home, "state", "c1.meta")), "no meta was needed");
   } finally {
@@ -6493,13 +6467,14 @@ test("IT F4: tellOwner=real stores steer text VERBATIM for --key / --resolve-key
       const res = await host.harness.behavior.runCli(["tell", "c1", `--message=${body}`], { projectId: "proj_1" });
       assert.equal(res.exitCode, 0, res.stderr);
       seq += 1;
-      const rec = readFileSync(join(home, "state", "c1.inbox", "handled", `${String(seq).padStart(3, "0")}.msg`), "utf8");
+      const rec = readFileSync(join(home, "state", "c1.inbox", `${String(seq).padStart(3, "0")}.msg`), "utf8");
       const bodyOnDisk = rec.slice(rec.indexOf("\n--\n") + 4);
       assert.equal(bodyOnDisk, STEER_PREFIX + body, `verbatim record mismatch for [${body}]`);
       assert.equal(bodyOnDisk.slice(STEER_PREFIX.length), body, `content mangled after prefix for [${body}]`);
     }
     const texts = sendCalls(host).map((s) => s.text);
-    for (const body of bodies) assert.ok(texts.includes(STEER_PREFIX + body), `steer doorbell missing for [${body}]`);
+    assert.equal(texts.length, bodies.length);
+    for (const text of texts) assert.match(text, /Firstmate instruction waiting/);
   } finally {
     await host.harness.lifecycle.dispose();
     rmSync(home, { recursive: true, force: true });
@@ -6556,7 +6531,7 @@ test("note: report lines never override the crew's real terminal verb (latestSta
   assert.doesNotMatch(summary ?? "", /REPORTX/);
 });
 
-test("IT F3b: tellOwner=real acknowledges a normal record after BB confirms delivery", { skip: !FM_INTEGRATION }, async () => {
+test("IT F3b: tellOwner=real leaves acknowledgement to the native worker", { skip: !FM_INTEGRATION }, async () => {
   const home = scratchFmHome();
   const host = itHost(home, { tellOwner: "real" });
   await plugin(host.bb);
@@ -6565,10 +6540,12 @@ test("IT F3b: tellOwner=real acknowledges a normal record after BB confirms deli
     await seedCrew(host);
     const res = await host.harness.behavior.runCli(["tell", "c1", "--message=please rebase"], { projectId: "proj_1" });
     assert.equal(res.exitCode, 0, res.stderr);
-    const handled = join(home, "state", "c1.inbox", "handled", "001.msg");
+    const handled = join(home, "state", "c1.inbox", "001.msg");
     const rec = readFileSync(handled, "utf8");
     assert.doesNotMatch(rec, /delivery=fire-and-forget/, "ordinary steer must use upstream's normal record");
-    assert.ok(!existsSync(join(home, "state", "c1.inbox", "001.msg")), "delivery acknowledgement must move the record to handled/");
+    assert.ok(existsSync(handled), "notification acceptance must not acknowledge the record");
+    mkdirSync(join(home, "state/c1.inbox/handled"), { recursive: true });
+    assert.equal(spawnSync("mv", [handled, join(home, "state/c1.inbox/handled/001.msg")]).status, 0);
     // The REAL ladder sees no unhandled record, so it stays quiet.
     const due = spawnSync(
       "bash",
@@ -7088,7 +7065,8 @@ for (const entry of ["tool", "cli"] as const) {
       }
       assert.match(output, /DRAIN_FINISHED/);
       assert.match(command, /FM_STATE_OVERRIDE='\/tmp\/fm-home\/state\/cap-thr_cap'/);
-      assert.match(output, /bb firstmate wake --ack-through 2/);
+      assert.match(output, /WAKE_RECEIPT: fixture/);
+      assert.doesNotMatch(output, /--ack-through 2/);
       assert.equal(host.harness.sdk.callsTo("terminals.create").length, 1, "finish the same drain, never retry it");
       assert.equal(host.harness.sdk.callsTo("terminals.close").length, 1);
     } finally {
@@ -7951,6 +7929,111 @@ test("an idle captain past its context budget is compacted once; crews are never
     await fresh.harness.lifecycle.dispose();
   }
 });
+
+test("captain home watcher stops archived homes without refreshing their owner beat", async () => {
+  const host = await load();
+  try {
+    await host.harness.behavior.setSettings({ watchOwner: "fm-watch" });
+    await host.bb.storage.kv.set("native-home:thr_retired", "/tmp/retired-captain");
+    await host.bb.storage.kv.set("native-home-host:thr_retired", "host_1");
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_retired", archivedAt: 1 }));
+    let entered!: () => void;
+    const commandStarted = new Promise<void>(resolve => { entered = resolve; });
+    let command = "";
+    host.harness.sdk.stub("terminals.create", async (input: { start: { command: string } }) => {
+      command = unwrapHostCommand(input.start.command); entered(); return { id: "term_retired" };
+    });
+    host.harness.sdk.stub("terminals.output", async () => ({ nextSeq: 1, chunks: [] }));
+    host.harness.sdk.stub("terminals.get", async () => ({ status: "exited", exitCode: 0 }));
+    host.harness.sdk.stub("terminals.close", async () => ({}));
+    const run = host.harness.behavior.runService("captain-home-watch");
+    try {
+      await awaitWithin(commandStarted, 1500, "retired keeper was not inspected");
+      assert.match(command, /rm -f/);
+      assert.match(command, /fm-watch-arm\.sh" --stop/, "native stop must retire the watcher child too");
+      assert.doesNotMatch(command, /FM_OWNER_BEAT=ok/, "retired homes must not receive an owner heartbeat");
+      assert.equal(await host.bb.storage.kv.get("native-home:thr_retired"), "/tmp/retired-captain", "retain recovery state");
+    } finally { run.controller.abort(); await run.done; }
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("IT archived captain stops a real native watcher and preserves its status", { skip: !FM_INTEGRATION }, async () => {
+  const home = scratchFmHome();
+  const status = join(home, "state/worker.status");
+  writeFileSync(status, "");
+  const watcher = spawn("bash", [join(home, "bin/fm-watch.sh")], {
+    env: { ...process.env, FM_HOME: home, FM_ROOT_OVERRIDE: home, FM_STATE_OVERRIDE: join(home, "state"), FM_POLL: "1", FM_CHECK_INTERVAL: "999999", FM_HEARTBEAT: "999999", FM_WATCH_HANDLING_SUCCESSOR: "1" },
+    stdio: "ignore",
+  });
+  const exited = new Promise<void>(resolve => watcher.once("exit", () => resolve()));
+  const host = itHost(home, { watchOwner: "fm-watch" });
+  await plugin(host.bb);
+  try {
+    const deadline = Date.now() + 10000;
+    while (!existsSync(join(home, "state/.last-watcher-beat")) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
+    assert.ok(existsSync(join(home, "state/.last-watcher-beat")), "real native watcher must start");
+    assert.equal(watcher.exitCode, null);
+    await host.bb.storage.kv.set("native-home:thr_retired", home);
+    await host.bb.storage.kv.set("native-home-host:thr_retired", "host_1");
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_retired", archivedAt: 1 }));
+    let result!: Promise<ReturnType<typeof hostRcPayload>>;
+    host.harness.sdk.stub("terminals.create", async (input: { start: { command: string } }) => {
+      result = new Promise((resolve, reject) => {
+        const command = spawn("bash", ["-c", unwrapHostCommand(input.start.command)]);
+        let output = "";
+        command.stdout.on("data", data => { output += data; });
+        command.stderr.on("data", data => { output += data; });
+        command.once("error", reject);
+        command.once("exit", code => resolve(hostRcPayload(output, code ?? 1)));
+      });
+      return { id: "term_native_stop" };
+    });
+    host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+    host.harness.sdk.stub("terminals.output", async () => result);
+    let closed!: () => void;
+    const finished = new Promise<void>(resolve => { closed = resolve; });
+    host.harness.sdk.stub("terminals.close", async () => { closed(); return {}; });
+    const run = host.harness.behavior.runService("captain-home-watch");
+    try {
+      await awaitWithin(finished, 15000, "native stop command did not finish");
+      await awaitWithin(exited, 1000, "archived home's native watcher leaked");
+      assert.equal(readFileSync(status, "utf8"), "");
+      assert.ok(!existsSync(join(home, "state/.bb-watch-owner.beat")));
+    } finally { run.controller.abort(); await run.done; }
+  } finally {
+    watcher.kill("SIGKILL"); await exited;
+    await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true });
+  }
+});
+
+for (const operation of ["context", "compact"] as const) {
+  test(`captain wake release aborts during a hung ${operation} call`, async () => {
+    const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { captainCompactAtTokens: 200000 } });
+    await host.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
+    await plugin(host.bb);
+    let unblock!: () => void;
+    let entered!: () => void;
+    const blocked = new Promise<void>(resolve => { unblock = resolve; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    try {
+      host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_cap", status: "idle" }));
+      host.harness.sdk.stub("threads.context", async () => {
+        if (operation === "context") { entered(); await blocked; }
+        return { usage: { usedTokens: 510000 } };
+      });
+      host.harness.sdk.stub("threads.compact", async () => {
+        if (operation === "compact") { entered(); await blocked; }
+        return {};
+      });
+      const run = host.harness.behavior.runService("captain-wake-release");
+      try {
+        await awaitWithin(started, 1500, "compaction sweep did not reach the call");
+        run.controller.abort();
+        await awaitWithin(run.done, 500, "compaction pinned the service after abort");
+      } finally { unblock(); run.controller.abort(); await run.done; }
+    } finally { await host.harness.lifecycle.dispose(); }
+  });
+}
 
 test("non-hooked captain providers get explicit guard rules on deck", () => {
   assert.equal(unhookedCaptainNote("claude-code"), "");
@@ -9155,4 +9238,143 @@ test("native host operations can call back into activity without self-deadlock",
     await awaitWithin(host.harness.behavior.runCli(["fm", "--machine", "host_1", "peek", "task"]), 1000, "native callback deadlocked");
     assert.equal(callback, true);
   } finally { await host.harness.behavior.setSettings({ fmHome: "" }); await host.harness.lifecycle.dispose(); }
+});
+
+// Exercise the actual native record writer, worker acknowledgement, and BB queue.
+test("IT inbox parity: one queued doorbell, worker ack removes it across reload", { skip: !FM_INTEGRATION }, async () => {
+  const home = scratchFmHome();
+  let host = itHost(home, { tellOwner: "real" });
+  await plugin(host.bb);
+  try {
+    stubRealExecHost(host);
+    await seedCrew(host);
+    let rows: Array<{ id: string; content: Array<{ type: string; text: string }> }> = [];
+    host.harness.sdk.stub("threads.queuedMessages.list", async () => rows);
+    host.harness.sdk.stub("threads.send", async (args: { input: Array<{ type: string; text: string }> }) => {
+      const row = { id: `q${rows.length + 1}`, content: args.input };
+      rows.push(row);
+      return { delivery: "queued", queuedMessage: row };
+    });
+    host.harness.sdk.stub("threads.queuedMessages.delete", async (args: { queuedMessageId: string }) => {
+      rows = rows.filter(r => r.id !== args.queuedMessageId);
+      return {};
+    });
+    for (const message of ["first instruction", "replacement instruction"]) {
+      const result = await host.harness.behavior.runCli(["tell", "c1", "--queue", `--message=${message}`], { projectId: "proj_1" });
+      assert.equal(result.exitCode, 0, result.stderr);
+    }
+    assert.equal(rows.length, 1, "two inbox records need only one queued doorbell");
+    assert.match(rows[0]!.content[0]!.text, /Firstmate instruction waiting/);
+    assert.doesNotMatch(rows[0]!.content[0]!.text, /replacement instruction/);
+    const dir = join(home, "state/c1.inbox");
+    assert.match(readFileSync(join(dir, "001.msg"), "utf8"), /first instruction/);
+    assert.match(readFileSync(join(dir, "002.msg"), "utf8"), /replacement instruction/);
+    // Native worker consumes both records before BB ends its long turn.
+    mkdirSync(join(dir, "handled"), { recursive: true });
+    for (const name of ["001.msg", "002.msg"]) {
+      const result = spawnSync("mv", [join(dir, name), join(dir, "handled", name)]);
+      assert.equal(result.status, 0);
+    }
+    rows.push({ id: "human", content: [{ type: "text", text: "unrelated human instruction" }] });
+    host = await host.harness.lifecycle.reload(plugin);
+    stubRealExecHost(host);
+    host.harness.sdk.stub("threads.queuedMessages.list", async () => rows);
+    host.harness.sdk.stub("threads.queuedMessages.delete", async (args: { queuedMessageId: string }) => {
+      rows = rows.filter(r => r.id !== args.queuedMessageId);
+      return {};
+    });
+    const run = host.harness.behavior.runService("captain-wake-release");
+    try {
+      for (let n = 0; n < 100 && rows.length > 1; n++) await new Promise(r => setTimeout(r, 10));
+      assert.deepEqual(rows.map(r => r.id), ["human"], `only the consumed inbox doorbell is removed: ${JSON.stringify(host.harness.logEntries)}`);
+    } finally { run.controller.abort(); await run.done; }
+  } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test("IT inbox parity: BB accepting a steer is not worker acknowledgement", { skip: !FM_INTEGRATION }, async () => {
+  const home = scratchFmHome();
+  const host = itHost(home, { tellOwner: "real" });
+  await plugin(host.bb);
+  try {
+    stubRealExecHost(host);
+    await seedCrew(host);
+    const result = await host.harness.behavior.runCli(["tell", "c1", "--message=do this once"], { projectId: "proj_1" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.ok(existsSync(join(home, "state/c1.inbox/001.msg")), "native record remains until worker ack");
+    assert.ok(!existsSync(join(home, "state/c1.inbox/handled/001.msg")));
+    assert.match(sendCalls(host)[0]!.text, /Firstmate instruction waiting/);
+    assert.doesNotMatch(sendCalls(host)[0]!.text, /do this once/);
+  } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test("IT inbox parity: failed queue delivery retries without deleting unread records", { skip: !FM_INTEGRATION }, async () => {
+  const home = scratchFmHome();
+  const host = itHost(home, { tellOwner: "real" });
+  await plugin(host.bb);
+  try {
+    stubRealExecHost(host);
+    await seedCrew(host);
+    const dir = join(home, "state/c1.inbox");
+    mkdirSync(dir, { recursive: true });
+    for (let n = 1; n <= 205; n++) writeFileSync(join(dir, `${String(n).padStart(3, "0")}.msg`), "schema=fm-task-inbox.v1\ndelivery=fire-and-forget\n--\nunread");
+    host.harness.sdk.stub("threads.queuedMessages.list", async () => []);
+    host.harness.sdk.stub("threads.send", async () => { throw new Error("offline"); });
+    const result = await host.harness.behavior.runCli(["tell", "c1", "--queue", "--message=preserve me"], { projectId: "proj_1" });
+    assert.match(result.stdout, /notification pending retry/);
+    assert.equal(readdirSync(dir).filter(n => n.endsWith(".msg")).length, 206, "unread records are not a disposable cache");
+    let retried = false;
+    host.harness.sdk.stub("threads.send", async (args: { input: Array<{ text: string }>; senderThreadId?: string }) => {
+      assert.match(args.input[0]!.text, /Firstmate instruction waiting/);
+      assert.equal(args.senderThreadId, "thr_cap");
+      retried = true;
+      return { delivery: "queued", queuedMessage: { id: "retry" } };
+    });
+    const run = host.harness.behavior.runService("captain-wake-release");
+    try {
+      for (let n = 0; n < 100 && !retried; n++) await new Promise(r => setTimeout(r, 10));
+      assert.ok(retried);
+      assert.equal(readdirSync(dir).filter(n => n.endsWith(".msg")).length, 206);
+    } finally { run.controller.abort(); await run.done; }
+  } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test("IT inbox parity: deferred steer is reported queued, unreadable inbox never falls back to literal delivery", { skip: !FM_INTEGRATION }, async () => {
+  const home = scratchFmHome();
+  const host = itHost(home, { tellOwner: "real" });
+  await plugin(host.bb);
+  try {
+    stubRealExecHost(host);
+    await seedCrew(host);
+    host.harness.sdk.stub("threads.send", async () => ({ delivery: "queued", queuedMessage: { id: "q1" } }));
+    const result = await host.harness.behavior.runCli(["tell", "c1", "--message=decision"], { projectId: "proj_1" });
+    assert.match(result.stdout, /Queued for crew/);
+    assert.doesNotMatch(result.stdout, /Steered into/);
+    assert.ok(existsSync(join(home, "state/c1.inbox/001.msg")));
+    rmSync(join(home, "bin"));
+    const failed = await host.harness.behavior.runCli(["tell", "c1", "--message=must not bypass inbox"], { projectId: "proj_1" });
+    assert.notEqual(failed.exitCode, 0);
+    assert.equal(sendCalls(host).length, 1, "failed native writes cannot silently fall back to a second transport");
+  } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test("IT inbox parity: a missing record is not an acknowledgement", { skip: !FM_INTEGRATION }, async () => {
+  const home = scratchFmHome();
+  const host = itHost(home, { tellOwner: "real" });
+  await plugin(host.bb);
+  try {
+    stubRealExecHost(host); await seedCrew(host);
+    let row: unknown;
+    host.harness.sdk.stub("threads.queuedMessages.list", async () => row ? [row] : []);
+    host.harness.sdk.stub("threads.send", async (args: { input: unknown }) => {
+      row = { id: "q1", content: args.input };
+      return { delivery: "queued", queuedMessage: row };
+    });
+    let deleted = false;
+    host.harness.sdk.stub("threads.queuedMessages.delete", async () => { deleted = true; return {}; });
+    await host.harness.behavior.runCli(["tell", "c1", "--queue", "--message=must survive"], { projectId: "proj_1" });
+    rmSync(join(home, "state/c1.inbox/001.msg"));
+    const run = host.harness.behavior.runService("captain-wake-release");
+    try { await new Promise(r => setTimeout(r, 150)); assert.equal(deleted, false); }
+    finally { run.controller.abort(); await run.done; }
+  } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
 });

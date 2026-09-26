@@ -10,8 +10,8 @@ metadata:
 
 <!-- BB-SOURCE
      native: .agents/skills/firstmate-codexapp/SKILL.md
-     sha: 4299683d5b656a70ced609d7d929499ddc0d675a
-     snapshot: native-snapshot/4299683d/.agents/skills/firstmate-codexapp/SKILL.md
+     sha: bb69be62e1f8df465d674a35f7e2ce707b900501
+     snapshot: native-snapshot/bb69be62/.agents/skills/firstmate-codexapp/SKILL.md
      fidelity: verbatim
 -->
 
@@ -69,7 +69,7 @@ For a Firstmate-managed task, include an explicit status instruction:
 ```text
 Append supervisor-visible status lines to <absolute-firstmate-home>/state/<task-id>.status.
 Use only these prefixes for status changes: working:, needs-decision:, blocked:, paused:, done:, failed:.
-Use paused: only for a deliberate known external wait that should be rechecked later, never for a blocker that needs firstmate to act.
+Follow the task brief's status-reporting rule for declaring and resolving waits; bin/fm-brief.sh owns that rule.
 Before doing substantive work, append "working: Codex Desktop thread started".
 ```
 

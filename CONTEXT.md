@@ -61,16 +61,13 @@ dropped without losing content, because the content lives elsewhere.
 _Avoid_: notification, ping.
 
 **Steer**:
-A captain→crew course correction. By default a plain `tell` delivers with BB
-`mode:"steer"`, which LANDS inside the crew's running turn (and starts a turn when
-the crew is idle) — so a captain can correct a crew mid-work instead of waiting for
-it to finish. It is framed "not a stop; keep working and fold this in", so the crew
-continues its task. `tell` with `queue:true` opts out to a **doorbell**
-(`queue-if-active`) for a non-urgent note read only when the crew next drains its
-queue. `interrupt`/`stop` are hard steers (`mode:"steer"` + stop framing), never the
-inbox. Under `tellOwner=real` a plain tell also writes a durable fire-and-forget
-**inbox record** as an audit trail; that owner is off by default and slated for
-deletion (see **Owner flag**), so do not assume steers are durably recorded.
+A captain→crew course correction. In real mode the plugin writes one native inbox
+record and sends the native doorbell through BB `mode:"steer"`. The worker reads
+pending records and moves them to `handled/` after acting. BB accepting a
+notification is not acknowledgement. `queue:true` defers the notification with
+`queue-if-active`; the plugin coalesces owned queued doorbells and removes them
+only after the tracked records are acknowledged. Unread records are never pruned.
+Interrupt/stop use BB lifecycle controls, outside the inbox.
 
 **BB child ping**:
 BB core's own "[bb system] @thread:<crew> completed/failed" message to a crew's

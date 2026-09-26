@@ -11,8 +11,8 @@ metadata:
 
 <!-- BB-SOURCE
      native: .agents/skills/bootstrap-diagnostics/SKILL.md
-     sha: 4299683d5b656a70ced609d7d929499ddc0d675a
-     snapshot: native-snapshot/4299683d/.agents/skills/bootstrap-diagnostics/SKILL.md
+     sha: bb69be62e1f8df465d674a35f7e2ce707b900501
+     snapshot: native-snapshot/bb69be62/.agents/skills/bootstrap-diagnostics/SKILL.md
      fidelity: verbatim
 -->
 
