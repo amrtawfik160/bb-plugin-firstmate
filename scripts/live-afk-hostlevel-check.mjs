@@ -14,15 +14,16 @@
 // This drives the REAL native scripts (fm-afk-contract.sh + fm-merge-authority-lib.sh)
 // under a scratch FM_HOME (the live /root/firstmate data is untouched) and proves:
 //
-//   A. host-level write  → the real merge-authority keeper RESOLVES the away grant
-//      (fm_merge_authority_resolve → away-grant). This is what the fixed plugin does.
+//   A. host-level write  → the real merge-authority keeper RESOLVES away authority
+//      (fm_merge_authority_resolve → AUTHORITY=away). This is what the fixed plugin does.
 //   B. cap-scoped write  → the SAME host-level keeper read sees NOTHING (attended),
 //      i.e. the regression the fix avoids — proving the split-brain is real.
 //   C. two captains: the real contract is ONE per-home posture (host-level), exactly
 //      native firstmate's model; there is no per-captain real contract to diverge.
 //      (The per-captain split is the KV posture, proven by the F2/D3 unit tests.)
 //
-//   node scripts/live-afk-hostlevel-check.mjs
+//   FM_TEST_HOME=/path/to/clone node scripts/live-afk-hostlevel-check.mjs
+//   (FM_LIVE_BIN=/path/to/bin overrides the native bin/ it drives.)
 //
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
