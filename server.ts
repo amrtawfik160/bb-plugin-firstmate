@@ -1621,7 +1621,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
     captainCompactAtTokens: {
       type: "number",
-      label: "Compact an idle captain thread once its context passes this many tokens (at most every 20 minutes). Every crew wake re-reads the captain's whole context, so a small captain context is the main token saving. 0 = off.",
+      label: "Compact an idle captain or crew thread once its context passes this many tokens (at most every 20 minutes per thread). 0 = off.",
       default: 200000,
     },
     defaultProvider: {
@@ -2483,6 +2483,315 @@ export default async function plugin(bb: BbPluginApi) {
       return threadField(thread, "status");
     } catch {
       return "unknown";
+    }
+  }
+
+  // One list per parent for status. A thread the list omits still gets one get.
+  async function statusesFor(crews: Crew[], signal?: AbortSignal): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    const byParent = new Map<string, Crew[]>();
+    const loose: Crew[] = [];
+    for (const crew of crews) {
+      if (crew.threadId === "") continue;
+      const parent = crew.parentThreadId;
+      if (parent === null || parent === "") loose.push(crew);
+      else {
+        const group = byParent.get(parent) ?? [];
+        group.push(crew);
+        byParent.set(parent, group);
+      }
+    }
+    await Promise.all([...byParent.entries()].map(async ([parentThreadId, group]) => {
+      let listed: Array<{ id?: string; status?: string }> = [];
+      try {
+        listed = await raceAbort(
+          bb.sdk.threads.list({ parentThreadId, includeHidden: true, signal }),
+          signal,
+          STUCK_HOST_CALL_MS,
+        );
+      } catch (error) {
+        if (isAbortError(error)) throw error;
+        listed = [];
+      }
+      const seen = new Set<string>();
+      for (const row of listed) {
+        if (typeof row.id === "string" && typeof row.status === "string" && row.status !== "") {
+          out.set(row.id, row.status);
+          seen.add(row.id);
+        }
+      }
+      for (const crew of group) {
+        if (seen.has(crew.threadId)) continue;
+        out.set(crew.threadId, await crewStatus(crew, signal));
+      }
+    }));
+    for (const crew of loose) {
+      if (!out.has(crew.threadId)) out.set(crew.threadId, await crewStatus(crew, signal));
+    }
+    return out;
+  }
+
+  function bbFailure(error: unknown): { code: string; reason: string; message: string } {
+    const rec = asRecord(error);
+    const body = asRecord(rec["body"]);
+    const nested = asRecord(body["error"] ?? (typeof body["code"] === "string" ? body : {}));
+    const details = asRecord(rec["details"] ?? nested["details"] ?? body["details"]);
+    const code = [rec["code"], nested["code"], body["code"]].find((value) => typeof value === "string" && value !== "");
+    const reason = typeof details["reason"] === "string" ? details["reason"] : "";
+    const message = error instanceof Error
+      ? error.message
+      : typeof nested["message"] === "string"
+        ? nested["message"]
+        : typeof body["message"] === "string"
+          ? body["message"]
+          : String(error);
+    return { code: typeof code === "string" ? code : "", reason, message };
+  }
+
+  const SESSION_REPAIR_REASONS = new Set(["foreign", "ambiguous", "invalid"]);
+
+  async function withSessionRepair<T>(threadId: string, op: () => Promise<T>): Promise<T> {
+    try {
+      return await op();
+    } catch (error) {
+      const failure = bbFailure(error);
+      if (failure.code !== "provider_session_unavailable" || !SESSION_REPAIR_REASONS.has(failure.reason)) throw error;
+      let status = "unknown";
+      try {
+        status = threadField(await bb.sdk.threads.get({ threadId }), "status");
+      } catch (readError) {
+        if (isAbortError(readError)) throw readError;
+        throw error;
+      }
+      if (status !== "idle" && status !== "error") throw error;
+      await bb.sdk.threads.clearContext({ threadId });
+      return await op();
+    }
+  }
+
+  async function envIntentionallyDeleted(envId: string, crew?: Crew): Promise<boolean> {
+    if ((await bb.storage.kv.get(`deleted-env:${envId}`)) === true) return true;
+    if (crew === undefined) return false;
+    const home = await crewNativeHome(crew);
+    if (home === "") return false;
+    try {
+      const hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
+      const file = `${home}/state/.bb-deleted-envs`;
+      const res = await runOnHost(hostId, `grep -qx -- ${shQuote(envId)} ${shQuote(file)} && echo yes || true`, 15_000);
+      return res.output.trim() === "yes";
+    } catch {
+      return false;
+    }
+  }
+
+  async function markEnvDeleted(envId: string, crew?: Crew): Promise<void> {
+    await bb.storage.kv.set(`deleted-env:${envId}`, true);
+    if (crew === undefined) return;
+    const home = await crewNativeHome(crew);
+    if (home === "") return;
+    try {
+      const hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
+      const file = `${home}/state/.bb-deleted-envs`;
+      await runOnHost(hostId, `mkdir -p ${shQuote(`${home}/state`)} && printf '%s\\n' ${shQuote(envId)} >> ${shQuote(file)}`, 15_000);
+    } catch {
+      // KV is enough for later restores from this plugin.
+    }
+  }
+
+  function envPhase(env: unknown): string {
+    const life = asRecord(asRecord(env)["lifecycle"]);
+    return typeof life["phase"] === "string" ? life["phase"] : "";
+  }
+
+  // Workspace is gone only once lifecycle.phase is destroyed. active and retiring
+  // still have the checkout; teardown is the removal itself and is not restored.
+  async function ensureWorkspace(threadId: string, crew?: Crew, signal?: AbortSignal): Promise<void> {
+    if (threadId === "") return;
+    let envId: string | null;
+    let canRestore: boolean | undefined;
+    try {
+      const thread = await raceAbort(bb.sdk.threads.get({ threadId }), signal, STUCK_HOST_CALL_MS);
+      const rec = asRecord(thread);
+      envId = typeof rec["environmentId"] === "string" ? rec["environmentId"] : null;
+      if (typeof rec["canRestoreEnvironment"] === "boolean") canRestore = rec["canRestoreEnvironment"];
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      return;
+    }
+    if (envId === null) return;
+    if (await envIntentionallyDeleted(envId, crew)) {
+      throw new Error(`Workspace ${envId} was deleted and will not be restored.`);
+    }
+    let env: unknown;
+    try {
+      env = await raceAbort(bb.sdk.environments.get({ environmentId: envId }), signal, STUCK_HOST_CALL_MS);
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      return;
+    }
+    if (envPhase(env) !== "destroyed") return;
+    if (canRestore === false) {
+      throw new Error(`Workspace for ${threadId} is gone and its environment provider cannot restore it.`);
+    }
+    const threads = bb.sdk.threads as typeof bb.sdk.threads & {
+      restoreEnvironment?(args: { threadId: string }): Promise<unknown>;
+    };
+    if (typeof threads.restoreEnvironment !== "function") {
+      throw new Error(`Workspace for ${threadId} is gone and this BB host cannot restore it.`);
+    }
+    try {
+      await raceAbort(threads.restoreEnvironment({ threadId }), signal, STUCK_HOST_CALL_MS);
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      const failure = bbFailure(error);
+      throw new Error(`Workspace for ${threadId} is gone and could not be restored${failure.message !== "" ? `: ${failure.message}` : ""}.`);
+    }
+    const deadline = Date.now() + 30_000;
+    for (;;) {
+      if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("Aborted.");
+      const current = await raceAbort(bb.sdk.environments.get({ environmentId: envId }), signal, STUCK_HOST_CALL_MS);
+      const rec = asRecord(current);
+      if (envPhase(current) === "active" && rec["status"] === "ready") return;
+      if (Date.now() >= deadline) {
+        throw new Error(`Workspace for ${threadId} is not usable after restore.`);
+      }
+      await sleep(500);
+    }
+  }
+
+  async function resendFailedSameBody(threadId: string, body: string): Promise<boolean> {
+    let rows: Awaited<ReturnType<typeof bb.sdk.threads.queuedMessages.list>>;
+    try {
+      rows = await bb.sdk.threads.queuedMessages.list({ threadId });
+    } catch {
+      return false;
+    }
+    const hit = rows.find((row) => {
+      if (typeof row.failureReason !== "string" || row.failureReason === "") return false;
+      return row.content.length === 1 && row.content[0]?.type === "text" && row.content[0].text === body;
+    });
+    if (hit === undefined) return false;
+    await bb.sdk.threads.queuedMessages.send({ threadId, queuedMessageId: hit.id, mode: "steer" });
+    return true;
+  }
+
+  function interactionView(interaction: unknown): {
+    id: string;
+    kind: string;
+    verb: "approve" | "grant" | "answer" | "respond";
+    summary: string;
+    requestedMode: PermissionMode | undefined;
+    permissions: { fileSystem: { read: string[]; write: string[] } | null; network: { enabled: boolean | null } | null } | null;
+  } {
+    const rec = asRecord(interaction);
+    const payload = asRecord(rec["payload"]);
+    const subject = asRecord(payload["subject"]);
+    const id = typeof rec["id"] === "string" ? rec["id"] : "";
+    const payloadKind = typeof payload["kind"] === "string" ? payload["kind"] : "";
+    const subjectKind = typeof subject["kind"] === "string" ? subject["kind"] : "";
+    let kind = subjectKind !== "" ? subjectKind : payloadKind !== "" ? payloadKind : "interaction";
+    let verb: "approve" | "grant" | "answer" | "respond" = "approve";
+    let summary = "pending input";
+    if (payloadKind === "user_question" || kind === "user_question") {
+      kind = "question";
+      verb = "answer";
+      const questions = Array.isArray(payload["questions"]) ? payload["questions"] : [];
+      const prompt = asRecord(questions[0])["prompt"];
+      summary = typeof prompt === "string" && prompt.trim() !== "" ? truncate(prompt.trim(), 120) : "a question";
+    } else if (payloadKind === "plugin" || kind === "plugin" || payloadKind.includes("/")) {
+      kind = payloadKind === "plugin" || kind === "plugin" ? "plugin" : kind;
+      verb = "respond";
+      const title = payload["title"];
+      summary = typeof title === "string" && title.trim() !== "" ? truncate(title.trim(), 120) : "a form";
+    } else if (subjectKind === "permission_grant") {
+      kind = "permission";
+      verb = "grant";
+      const tool = typeof subject["toolName"] === "string" && subject["toolName"] !== "" ? subject["toolName"] : "permission";
+      summary = truncate(`grant ${tool}`, 120);
+    } else if (subjectKind === "command") {
+      kind = "command";
+      summary = truncate(typeof subject["command"] === "string" ? subject["command"] : "a command", 120);
+    } else if (subjectKind === "file_change") {
+      kind = "file-change";
+      summary = truncate(typeof subject["writeScope"] === "string" && subject["writeScope"] !== "" ? subject["writeScope"] : "a file change", 120);
+    } else if (subjectKind === "plan") {
+      kind = "plan";
+      summary = truncate(typeof subject["plan"] === "string" ? subject["plan"] : "a plan", 120);
+    } else if (subjectKind === "tool_use") {
+      kind = "tool-use";
+      summary = truncate(typeof subject["tool"] === "string" ? subject["tool"] : "a tool", 120);
+    }
+    const requestedMode = toPermissionMode(subject["permissionMode"] ?? subject["mode"] ?? payload["permissionMode"] ?? payload["mode"]);
+    const permissions = asRecord(subject["permissions"]);
+    const fs = asRecord(permissions["fileSystem"]);
+    const net = asRecord(permissions["network"]);
+    const hasPerms = subjectKind === "permission_grant";
+    return {
+      id,
+      kind,
+      verb,
+      summary,
+      requestedMode,
+      permissions: hasPerms ? {
+        fileSystem: Array.isArray(fs["read"]) || Array.isArray(fs["write"])
+          ? {
+            read: Array.isArray(fs["read"]) ? fs["read"].filter((item): item is string => typeof item === "string") : [],
+            write: Array.isArray(fs["write"]) ? fs["write"].filter((item): item is string => typeof item === "string") : [],
+          }
+          : null,
+        network: typeof net["enabled"] === "boolean" || net["enabled"] === null
+          ? { enabled: typeof net["enabled"] === "boolean" ? net["enabled"] : null }
+          : null,
+      } : null,
+    };
+  }
+
+  const dispatchPermissionLines = new Map<string, string>();
+
+  async function noteMachineCeiling(crewId: string, threadId: string, requested: PermissionMode | undefined): Promise<void> {
+    dispatchPermissionLines.delete(crewId);
+    if (requested === undefined || threadId === "") return;
+    try {
+      const actual = toPermissionMode(asRecord(await bb.sdk.threads.defaultExecutionOptions({ threadId }))["permissionMode"]);
+      if (actual === undefined || actual === requested) return;
+      const envId = await threadEnv(threadId);
+      if (envId === null) return;
+      const hostId = asRecord(await bb.sdk.environments.get({ environmentId: envId }))["hostId"];
+      if (typeof hostId !== "string" || hostId === "") return;
+      const max = toPermissionMode(asRecord(await bb.sdk.hosts.get({ hostId }))["maxPermissionMode"]);
+      if (max === undefined) return;
+      if (capPermission(requested, max) === actual) {
+        dispatchPermissionLines.set(crewId, `permission: ${actual} (machine ceiling ${max})`);
+      }
+    } catch {
+      // The dispatch result stays valid without the ceiling line.
+    }
+  }
+
+  function permissionLine(crewId: string): string {
+    const line = dispatchPermissionLines.get(crewId);
+    return line === undefined ? "" : `\n${line}`;
+  }
+
+  async function bbCliErrorTally(hostId: string, signal?: AbortSignal): Promise<string> {
+    try {
+      const res = await runOnHost(hostId, "bb diagnostics cli-errors --json", 15_000, signal);
+      if (res.exitCode !== 0) return "";
+      const parsed = asRecord(JSON.parse(res.output.trim() || "{}"));
+      const rows = parsed["rows"];
+      if (!Array.isArray(rows) || rows.length === 0) return "";
+      const lines: string[] = [];
+      for (const row of rows) {
+        const rec = asRecord(row);
+        const command = rec["command"];
+        const code = rec["code"];
+        if (typeof command !== "string" || command === "" || typeof code !== "string" || code === "") continue;
+        const count = typeof rec["count"] === "number" ? ` x${rec["count"]}` : "";
+        lines.push(`${command} ${code}${count}`);
+      }
+      return lines.length === 0 ? "" : `bb cli errors:\n${lines.join("\n")}`;
+    } catch {
+      return "";
     }
   }
 
@@ -3463,7 +3772,8 @@ export default async function plugin(bb: BbPluginApi) {
     const cap = Number.isFinite(raw) ? Math.max(0, Math.trunc(raw)) : DEFAULT_MAX_ACTIVE_CREWS;
     if (cap === 0) return null;
     const mine = (await listCrews({ owner: parentThreadId })).filter((c) => !isSecondmateRoute(c));
-    const statuses = await Promise.all(mine.map((c) => crewStatus(c)));
+    const statusByThread = await statusesFor(mine);
+    const statuses = mine.map((c) => statusByThread.get(c.threadId) ?? "unknown");
     // A crew still starting already holds a slot; not counting it let a quick
     // fan-out of dispatches overshoot the cap. A crew parked on WAITING: is idle
     // between turns but its scheduled resume starts one, so it holds a slot too.
@@ -3525,9 +3835,10 @@ export default async function plugin(bb: BbPluginApi) {
     } else {
       crews = await listCrews({ owner });
     }
+    const statusByThread = await statusesFor(crews);
     const rows = await Promise.all(
       crews.map(async (crew) => {
-        const status = await crewStatus(crew);
+        const status = statusByThread.get(crew.threadId) ?? await crewStatus(crew);
         // Idle/error threads may carry a terminal verdict — surface it so a
         // done ship is distinguishable from a blocked/failed crew at a glance.
         const verdict =
@@ -3753,6 +4064,7 @@ export default async function plugin(bb: BbPluginApi) {
           crew.backlogRow = true;
           await mutateCrews(crews => [crew, ...crews.filter(c => c.id !== crew.id)]);
           await publishFleet();
+          await noteMachineCeiling(crew.id, realThreadId, capPermission(input.permissionMode, await parentPermission(input.parentThreadId)));
           // fm-spawn ran ~30s while this crew may already have ended its first turn;
           // its thread.idle/failed fired before this record carried the threadId and
           // was dropped. Now that the record exists, catch that missed terminal.
@@ -3827,6 +4139,7 @@ export default async function plugin(bb: BbPluginApi) {
     // is far smaller. Skip a future-scheduled send: its thread sits idle until sendAt
     // and has not run yet, so its "idle" is not a turn-end to report.
     if (!scheduled) await reconcileCrewTerminal(crew).catch(() => {});
+    await noteMachineCeiling(crew.id, crew.threadId, capped);
     return crew;
   }
 
@@ -3859,6 +4172,7 @@ export default async function plugin(bb: BbPluginApi) {
       await validateProviderChoice(providerId, model, crew.projectId, crew.parentThreadId ?? undefined);
     }
     const capped = capPermission(undefined, await parentPermission(crew.parentThreadId ?? undefined));
+    await ensureWorkspace(crew.threadId, crew);
     // Release the old thread first so the environment is free to reuse.
     try { await bb.sdk.threads.stop({ threadId: crew.threadId }); } catch { /* best effort */ }
     const note = (opts.note ?? "").trim();
@@ -4022,6 +4336,9 @@ export default async function plugin(bb: BbPluginApi) {
     catch { throw new Error("Firstmate inbox host unavailable; instruction was not sent."); }
     const key = INBOX_DELIVERY_PREFIX + crew.threadId;
     return serializeLedger(key, async () => {
+      if (await resendFailedSameBody(crew.threadId, message.slice(0, MAX_TASK))) {
+        return `Resent the failed steer to crew ${crew.id}`;
+      }
       const written = await writeInboxRecord(hostId, home, crew.id, message, queue);
       if (!written) throw new Error("Firstmate inbox write failed; instruction delivery is unconfirmed. Inspect the inbox before retrying.");
       const { record, doorbell } = written;
@@ -4040,10 +4357,15 @@ export default async function plugin(bb: BbPluginApi) {
           await bb.storage.kv.set(key, delivery);
           return `Queued for crew ${crew.id} (native inbox; existing notification covers this record)`;
         }
-        const result = await bb.sdk.threads.send({
+        if (await resendFailedSameBody(crew.threadId, doorbell)) {
+          delivery.retry = false;
+          await bb.storage.kv.set(key, delivery);
+          return `Resent the failed steer to crew ${crew.id}`;
+        }
+        const result = await withSessionRepair(crew.threadId, () => bb.sdk.threads.send({
           threadId: crew.threadId, mode: queue ? "queue-if-active" : "steer", senderThreadId: crew.parentThreadId ?? undefined,
           input: [{ type: "text", text: doorbell, mentions: [] }],
-        });
+        }));
         const row = asRecord(asRecord(result)["queuedMessage"]);
         if (typeof row["id"] === "string") delivery.queueIds.push(row["id"]);
         delivery.retry = false;
@@ -4074,10 +4396,28 @@ export default async function plugin(bb: BbPluginApi) {
   const STEER_PREFIX =
     "STEER from captain — this is a course correction, NOT a stop. Keep working on your current task and fold this in without tearing down or discarding work: ";
 
+  async function retryCrewTurn(crew: Crew, reason: string | undefined): Promise<void> {
+    await ensureWorkspace(crew.threadId, crew);
+    try {
+      await withSessionRepair(crew.threadId, () => bb.sdk.threads.retry({
+        threadId: crew.threadId,
+        reason: retryReason(reason, crew.id),
+      }));
+    } catch (error) {
+      const failure = bbFailure(error);
+      if (failure.code === "no_failed_turn" || failure.code === "retry_already_queued") {
+        throw new Error(`${failure.code}: ${failure.message}`);
+      }
+      throw error;
+    }
+  }
+
   async function tellCrew(crew: Crew, message: string, interrupt: boolean, queue = false): Promise<string> {
     if (isSecondmateRoute(crew) && interrupt) {
       throw new Error(`Crew ${crew.id} is a secondmate route — do not interrupt the domain captain thread.`);
     }
+    // A steer does not resolve an open interaction. The captain wake names the command.
+    await ensureWorkspace(crew.threadId, crew);
     // A plain tell is a STEER by default: mode:"steer" LANDS inside the crew's
     // running turn (so a captain's correction reaches it mid-work instead of sitting
     // in a queue the crew only reads after it finishes) and STARTS a turn when the
@@ -4088,15 +4428,18 @@ export default async function plugin(bb: BbPluginApi) {
     // never routed through the inbox or queued.
     if (!interrupt) {
       const body = queue ? message : `${STEER_PREFIX}${message}`;
+      if (await resendFailedSameBody(crew.threadId, body.slice(0, MAX_TASK))) {
+        return `Resent the failed steer to crew ${crew.id}`;
+      }
       const routed = await sendViaInbox(crew, body, queue);
       if (routed !== null) return routed;
       const wasActive = queue ? false : await crewInTurn(crew);
-      const result = await bb.sdk.threads.send({
+      const result = await withSessionRepair(crew.threadId, () => bb.sdk.threads.send({
         threadId: crew.threadId,
         senderThreadId: crew.parentThreadId ?? undefined,
         mode: queue ? "queue-if-active" : "steer",
         input: [{ type: "text", text: body.slice(0, MAX_TASK), mentions: [] }],
-      });
+      }));
       if (asRecord(result)["delivery"] === "queued") return `Queued for crew ${crew.id} (BB deferred delivery)`;
       if (queue) {
         return (await crewInTurn(crew))
@@ -4107,11 +4450,11 @@ export default async function plugin(bb: BbPluginApi) {
         ? `Steered into crew ${crew.id}'s running turn`
         : `Told crew ${crew.id} (started a turn)`;
     }
-    await bb.sdk.threads.send({
+    await withSessionRepair(crew.threadId, () => bb.sdk.threads.send({
       threadId: crew.threadId,
       mode: "steer",
       input: [{ type: "text", text: message.slice(0, MAX_TASK), mentions: [] }],
-    });
+    }));
     return `Interrupted crew ${crew.id}`;
   }
 
@@ -4130,6 +4473,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function deliverLines(crew: Crew): Promise<{ text: string; json: Record<string, unknown> }> {
+    await ensureWorkspace(crew.threadId, crew);
     const status = await crewStatus(crew);
     const output = await crewOutput(crew, 500);
     const envId = await threadEnv(crew.threadId);
@@ -4285,9 +4629,10 @@ export default async function plugin(bb: BbPluginApi) {
     // A crew landed under another captain's view is announced to its own captain.
     const retired = await reconcileExternallyLanded(tracked, { notifyUnless: owner ?? "" });
     const crews = retired.size === 0 ? tracked : tracked.filter((c) => !retired.has(c.id));
+    const statusByThread = await statusesFor(crews);
     const rows = await Promise.all(
       crews.map(async (crew) => {
-        const status = await crewStatus(crew);
+        const status = statusByThread.get(crew.threadId) ?? "unknown";
         const pr = status === "idle" || status === "error" ? await prForCrew(crew) : prFacts(null);
         if (pr.url !== "") await rememberPrUrl(crew, pr.url).catch(() => {});
         // Fold the crew's own status protocol for idle crews: an idle crew that
@@ -4576,8 +4921,9 @@ export default async function plugin(bb: BbPluginApi) {
   async function foreignCrewLines(entries: Array<{ crew: Crew; owner: string }>, signal?: AbortSignal): Promise<string[]> {
     if (entries.length === 0) return [];
     const shown = entries.slice(0, MAX_FOREIGN_CREW_ROWS);
+    const statusByThread = await statusesFor(shown.map((entry) => entry.crew), signal);
     const lines = await Promise.all(shown.map(async ({ crew, owner }) => {
-      const status = await crewStatus(crew, signal);
+      const status = statusByThread.get(crew.threadId) ?? "unknown";
       const pr = crew.prUrl !== undefined && crew.prUrl !== "" ? ` ${crew.prUrl}` : "";
       return `  ${formatCrew(crew, status)}${pr} — owned by captain @thread:${owner} (read-only)`;
     }));
@@ -4733,6 +5079,25 @@ export default async function plugin(bb: BbPluginApi) {
     const raw = Number(process.env.FM_MERGEABLE_POLL_MS);
     return Number.isFinite(raw) && raw >= 0 ? raw : 5_000;
   }
+  async function refreshEnvironmentPr(envId: string): Promise<PrFacts> {
+    return prFacts(await bb.sdk.environments.pullRequest({ environmentId: envId }));
+  }
+
+  // Environment-owned PRs are marked ready and re-read through the SDK.
+  // gh stays for check-name buckets BB does not return. Merge itself is one path.
+  async function prepareEnvironmentPullRequest(envId: string): Promise<PrFacts> {
+    let facts = await refreshEnvironmentPr(envId);
+    if (facts.state === "draft" || facts.attention === "draft") {
+      await bb.sdk.environments.markPullRequestReady({ environmentId: envId });
+      facts = await refreshEnvironmentPr(envId);
+    }
+    for (let i = 0; i < MERGEABLE_POLL_TRIES && facts.mergeable === "UNKNOWN" && (facts.state === "open" || facts.state === "draft"); i++) {
+      if (i > 0) await sleep(mergeablePollMs());
+      facts = await refreshEnvironmentPr(envId);
+    }
+    return facts;
+  }
+
   async function awaitMergeableKnown(hostId: string, url: string): Promise<void> {
     for (let i = 0; i < MERGEABLE_POLL_TRIES; i++) {
       const view = await ghPrView(hostId, url);
@@ -4805,17 +5170,22 @@ export default async function plugin(bb: BbPluginApi) {
         const args = [crew.id, pr.url];
         if (allowRedCheck?.trim()) args.push("--allow-red", allowRedCheck.trim());
         if (allowMissingCheck?.trim()) args.push("--allow-missing", allowMissingCheck.trim());
-        await awaitMergeableKnown(hostId, pr.url);
+        if (pr.source === "environment") {
+          await prepareEnvironmentPullRequest(envId);
+        } else {
+          await awaitMergeableKnown(hostId, pr.url);
+        }
         let result = await runFmScript({ script: "pr-merge", args, fmHome: nativeHome, hostId, timeoutMs: 180_000 });
         if (result.exitCode !== 0 && /mergeable is "UNKNOWN"/.test(result.output)) {
-          await awaitMergeableKnown(hostId, pr.url);
+          if (pr.source === "environment") await prepareEnvironmentPullRequest(envId);
+          else await awaitMergeableKnown(hostId, pr.url);
           result = await runFmScript({ script: "pr-merge", args, fmHome: nativeHome, hostId, timeoutMs: 180_000 });
         }
         requireNativeSuccess(result, `PR merge ${crew.id}`);
         // fm-pr-merge reads the PR back from GitHub before it prints this line, so it
         // is the authoritative landing proof; BB's PR cache can lag behind it.
         let landed = /verified: \S+ is merged \(state=MERGED/.test(result.output);
-        if (!landed) landed = (await ghPrView(hostId, pr.url))?.state === "merged";
+        if (!landed && pr.source !== "environment") landed = (await ghPrView(hostId, pr.url))?.state === "merged";
         if (!landed) {
           try { landed = prFacts(await bb.sdk.environments.pullRequest({ environmentId: envId })).state === "merged"; } catch { /* unconfirmed */ }
         }
@@ -4844,10 +5214,7 @@ export default async function plugin(bb: BbPluginApi) {
       await retireLanded(crew, "merged (already landed)", f.url);
       return `Already merged: ${f.url}\nCrew ${crew.id} retired.`;
     }
-    for (let i = 0; i < MERGEABLE_POLL_TRIES && f.mergeable === "UNKNOWN" && f.state === "open"; i++) {
-      if (i > 0) await sleep(mergeablePollMs());
-      f = prFacts(await bb.sdk.environments.pullRequest({ environmentId: envId }));
-    }
+    f = await prepareEnvironmentPullRequest(envId);
     const waive = (allowRedCheck ?? "").trim();
     const redChecks = waive !== "" && f.checksState === "failing" ? await redCheckNames(crew, f.url) : null;
     const gate = mergeGate({
@@ -4944,11 +5311,12 @@ export default async function plugin(bb: BbPluginApi) {
     opts: { notifyUnless?: string; notify?: boolean; signal?: AbortSignal } = {},
   ): Promise<Set<string>> {
     const retired = new Set<string>();
+    const statusByThread = await statusesFor(crews, opts.signal);
     for (const crew of crews) {
       if (opts.signal?.aborted) break;
       if (isSecondmateRoute(crew)) continue;
       if ((landedRetireBackoff.get(crew.id) ?? 0) > Date.now()) continue;
-      const status = await crewStatus(crew, opts.signal);
+      const status = statusByThread.get(crew.threadId) ?? "unknown";
       if (status !== "idle" && status !== "error") continue;
       let pr = await prForCrew(crew);
       let state = pr.state;
@@ -5179,12 +5547,15 @@ export default async function plugin(bb: BbPluginApi) {
       // is either landed/pushed or explicitly force-discarded. This comment is the
       // contract — if a future BB version prunes branches or drops stashes on delete,
       // the guard (not this primitive) is still what prevents data loss.
-      if (worktreeEnvId !== null) {
+      // Ships stay archived through BB's retirement grace. A finished scout's
+      // scratch checkout is deleted now so it does not sit through that grace.
+      if (worktreeEnvId !== null && crew.shape === "scout") {
         try {
           await bb.sdk.environments.delete({ environmentId: worktreeEnvId });
+          await markEnvDeleted(worktreeEnvId, crew);
           worktreeRemoved = true;
         } catch (error) {
-          throw new Error(`forget ${id}: worktree ${worktreeEnvId} not removed; crew retained for retry: ${error instanceof Error ? error.message : String(error)}`);
+          notes.push(`environment ${worktreeEnvId} was not deleted: ${error instanceof Error ? error.message : String(error)}`);
         }
       }
     }
@@ -7303,6 +7674,7 @@ export default async function plugin(bb: BbPluginApi) {
     const start = total === 0 ? 0 : ((((typeof cursorRaw === "number" && Number.isFinite(cursorRaw) ? cursorRaw : 0) % total) + total) % total);
     const rotated = total === 0 ? [] : [...eligibleAll.slice(start), ...eligibleAll.slice(0, start)];
     const crews = rotated.slice(0, MAX_CREWS);
+    const statusByThread = await statusesFor(crews, passSignal);
     const parsed = watchStateSchema.safeParse(await bb.storage.kv.get<unknown>("watch"));
     const state: WatchState = parsed.success ? parsed.data : {};
     let notified = 0;
@@ -7327,7 +7699,7 @@ export default async function plugin(bb: BbPluginApi) {
       // number actually inspected so the next pass resumes at the first un-inspected crew.
       if (passSignal.aborted) break;
       inspected++;
-      const status = await crewStatus(crew, passSignal);
+      const status = statusByThread.get(crew.threadId) ?? await crewStatus(crew, passSignal);
       // A host read that raced an abort returns a degraded default ("unknown"); do NOT act
       // on it (that would spuriously page on shutdown). Un-count this crew (so the cursor
       // resumes here) and let the next cycle redo it.
@@ -7629,7 +8001,12 @@ export default async function plugin(bb: BbPluginApi) {
       timeoutMs: 60_000, signal,
     });
     if (result.exitCode !== 0) throw new Error(`Native toolchain check failed: ${truncate(result.output, 2000)}`);
-    const output = [result.output.trim() || "Native bootstrap: all required tools and Lavish are compatible.", "Browser: use /browser with browser_script or bb browser script; leave profileId unset."].join("\n");
+    let body = result.output.trim() || "Native bootstrap: all required tools and Lavish are compatible.";
+    if (/error: .*bb |'bb' CLI|bb status failed|BACKEND_INVALID/i.test(body) && !body.includes("bb cli errors:")) {
+      const tally = await bbCliErrorTally(hostId, signal);
+      if (tally !== "") body = `${body}\n${tally}`;
+    }
+    const output = [body, "Browser: use /browser with browser_script or bb browser script; leave profileId unset."].join("\n");
     return {
       ready: !/^(MISSING:|BACKEND_INVALID:)/m.test(output),
       presentationReady: !/^PRESENTATION_UNAVAILABLE:/m.test(output),
@@ -7717,7 +8094,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (status === "error") {
         return toolError(`Dispatch of ${crew.shape} crew ${crew.id} (thread ${crew.threadId}) FAILED:${dispatchStatusNote(status)}`);
       }
-      return `Dispatched ${crew.shape} crew ${crew.id} as thread ${crew.threadId} (${status}, ${crew.posture}).${warn}${dispatchStatusNote(status)} Track with: bb firstmate crew ${crew.id}`;
+      return `Dispatched ${crew.shape} crew ${crew.id} as thread ${crew.threadId} (${status}, ${crew.posture}).${warn}${dispatchStatusNote(status)}${permissionLine(crew.id)} Track with: bb firstmate crew ${crew.id}`;
     },
   });
 
@@ -7781,9 +8158,10 @@ export default async function plugin(bb: BbPluginApi) {
       const all = await listCrews();
       const targets = (crewIds === undefined ? all : all.filter((c) => crewIds.includes(c.id))).slice(0, MAX_WATCH_CREWS);
       if (targets.length === 0) return toolError("No matching crews.");
+      const statusByThread = await statusesFor(targets);
       const rows = await Promise.all(
         targets.map(async (crew) => {
-          const status = await crewStatus(crew);
+          const status = statusByThread.get(crew.threadId) ?? "unknown";
           const output = status === "idle" || status === "error" ? await crewOutput(crew, 800) : null;
           return { ...crew, status, outcome: parseOutcome(output), output };
         }),
@@ -7993,7 +8371,7 @@ export default async function plugin(bb: BbPluginApi) {
         const capped = await capRefusalToWake(crew, overCap === true);
         if (capped !== null) return toolError(capped);
         if (!replace) {
-          await bb.sdk.threads.retry({ threadId: crew.threadId, reason: retryReason(reason, crew.id) });
+          await retryCrewTurn(crew, reason);
           return `Retried crew ${crewId}`;
         }
         const next = await relaunchCrew(crew, {
@@ -8259,7 +8637,7 @@ export default async function plugin(bb: BbPluginApi) {
       await writeQueue(items);
       await publishFleet();
       const status = await crewStatus(crew);
-      return `Dispatched ${adopted ? "native backlog row" : "queue"} ${queueId} as ${crew.shape} crew ${crew.id} (${status}).${dispatchStatusNote(status)}`;
+      return `Dispatched ${adopted ? "native backlog row" : "queue"} ${queueId} as ${crew.shape} crew ${crew.id} (${status}).${dispatchStatusNote(status)}${permissionLine(crew.id)}`;
     },
   });
 
@@ -8907,11 +9285,10 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   const CAPTAIN_COMPACT_COOLDOWN_MS = 20 * 60_000;
-  async function maybeCompactCaptain(threadId: string, signal?: AbortSignal): Promise<void> {
-    if (!knownCaptains.has(threadId)) return;
+  async function maybeCompactThread(threadId: string, stampKey: string, signal?: AbortSignal): Promise<void> {
     const budget = Number((await settings.get()).captainCompactAtTokens);
     if (!(budget > 0)) return;
-    const key = `captain-compacted-at:${threadId}`;
+    const key = stampKey;
     const last = await bb.storage.kv.get<unknown>(key);
     let usedTokens: number | null = null;
     try {
@@ -8926,11 +9303,20 @@ export default async function plugin(bb: BbPluginApi) {
     await bb.storage.kv.set(key, now);
     try {
       await raceAbort(bb.sdk.threads.compact({ threadId }), signal, STUCK_HOST_CALL_MS);
-      bb.log.info(`captain ${threadId} compacted at ${usedTokens} tokens (budget ${budget})`);
+      bb.log.info(`thread ${threadId} compacted at ${usedTokens} tokens (budget ${budget})`);
     } catch (error) {
       if (isAbortError(error)) throw error;
-      bb.log.warn(`captain ${threadId} compaction failed at ${usedTokens} tokens: ${error instanceof Error ? error.message : String(error)}`);
+      bb.log.warn(`thread ${threadId} compaction failed at ${usedTokens} tokens: ${error instanceof Error ? error.message : String(error)}`);
     }
+  }
+
+  async function maybeCompactCaptain(threadId: string, signal?: AbortSignal): Promise<void> {
+    if (!knownCaptains.has(threadId)) return;
+    await maybeCompactThread(threadId, `captain-compacted-at:${threadId}`, signal);
+  }
+
+  async function maybeCompactCrew(threadId: string, signal?: AbortSignal): Promise<void> {
+    await maybeCompactThread(threadId, `crew-compacted-at:${threadId}`, signal);
   }
 
   // The thread.idle trigger alone never reaches a captain that is already idle past the
@@ -8961,6 +9347,7 @@ export default async function plugin(bb: BbPluginApi) {
     await inCaptainHome(thread.id, () => captainTurnEndGuard(thread.id)).catch(() => {});
     const crew = await findCrewByThread(thread.id);
     if (crew === undefined || isSecondmateRoute(crew)) return;
+    await maybeCompactCrew(thread.id).catch((error) => bb.log.warn(`crew compaction check failed ${thread.id}: ${String(error)}`));
     liveTerminalHandled.add(thread.id);
     await handleCrewIdle(crew, thread, lastAssistantText);
   });
@@ -8970,12 +9357,55 @@ export default async function plugin(bb: BbPluginApi) {
     liveTerminalHandled.add(thread.id);
     await handleCrewFailed(crew, error);
   });
-  bb.events.on("interaction.pending", async ({ thread }) => {
+  bb.events.on("interaction.pending", async ({ thread, interaction }) => {
     const current = await settings.get();
     if (current.supervisionEnabled !== true) return;
     const crew = await findCrewByThread(thread.id);
     if (crew === undefined || isSecondmateRoute(crew)) return;
-    await notifyCaptain(crew, "interaction", "crew is waiting on an approval or credential");
+    let loaded: unknown = interaction;
+    const hinted = typeof asRecord(interaction)["id"] === "string" ? asRecord(interaction)["id"] : "";
+    try {
+      if (typeof hinted === "string" && hinted !== "") {
+        loaded = await bb.sdk.threads.interactions.get({ threadId: thread.id, interactionId: hinted });
+      } else {
+        const rows = await bb.sdk.threads.interactions.list({ threadId: thread.id });
+        loaded = rows.find((row) => asRecord(row)["status"] === "pending") ?? interaction;
+      }
+    } catch {
+      loaded = interaction;
+    }
+    const view = interactionView(loaded);
+    const interactionId = view.id !== "" ? view.id : (typeof hinted === "string" ? hinted : "");
+    let requested = view.requestedMode;
+    if (requested === undefined && view.verb === "grant") {
+      try {
+        requested = toPermissionMode(asRecord(await bb.sdk.threads.defaultExecutionOptions({ threadId: thread.id }))["permissionMode"]);
+      } catch { /* ceiling stays unknown */ }
+    }
+    const parent = await parentPermission(crew.parentThreadId ?? undefined);
+    const afk = (await readAfk(crew.parentThreadId ?? undefined))?.on === true;
+    const yolo = (await postureOf(crew.projectId)).yolo;
+    const withinCeiling = requested !== undefined && parent !== undefined && capPermission(requested, parent) === requested;
+    if (view.verb === "grant" && interactionId !== "" && (afk || yolo) && withinCeiling) {
+      try {
+        await bb.sdk.threads.interactions.resolve({
+          threadId: thread.id,
+          interactionId,
+          resolution: {
+            decision: "allow_for_session",
+            grantedPermissions: view.permissions,
+          },
+        });
+        return;
+      } catch (error) {
+        bb.log.warn(`permission grant ${interactionId} was not auto-resolved: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    const command = interactionId === ""
+      ? `bb thread interactions ${view.verb} <interactionId> ${thread.id}`
+      : `bb thread interactions ${view.verb} ${interactionId} ${thread.id}`;
+    const summary = `${view.kind} ${interactionId || "(unknown id)"}: ${view.summary}`;
+    await notifyCaptain(crew, "interaction", `${summary}\n${command}`);
   });
   bb.events.on("turn.failed", async ({ threadId }) => {
     const crew = await findCrewByThread(threadId);
@@ -9194,7 +9624,7 @@ export default async function plugin(bb: BbPluginApi) {
             const text = [
               ...dispatched.map(
                 (c) =>
-                  `Dispatched ${c.shape} crew ${c.id} as thread ${c.threadId} [${c.status}] (${c.worktree ? "worktree" : "shared-env"}, ${c.posture})${dispatchStatusNote(c.status)}\nTrack: bb firstmate crew ${c.id}`,
+                  `Dispatched ${c.shape} crew ${c.id} as thread ${c.threadId} [${c.status}] (${c.worktree ? "worktree" : "shared-env"}, ${c.posture})${dispatchStatusNote(c.status)}${permissionLine(c.id)}\nTrack: bb firstmate crew ${c.id}`,
               ),
               ...hints,
             ].join("\n");
@@ -9314,10 +9744,7 @@ export default async function plugin(bb: BbPluginApi) {
             const overCap = await capRefusalToWake(crew, flags.has("over-cap"));
             if (overCap !== null) return fail(overCap);
             if (model === undefined && providerId === undefined && reasoningLevel === undefined) {
-              await bb.sdk.threads.retry({
-                threadId: crew.threadId,
-                reason: retryReason(reason, crew.id),
-              });
+              await retryCrewTurn(crew, reason);
               return reply({ retried: true, id }, `Retried crew ${id}`);
             }
             const next = await relaunchCrew(crew, { model, providerId, reasoningLevel, note: reason });
@@ -9619,7 +10046,7 @@ export default async function plugin(bb: BbPluginApi) {
               // dispatches; only start here when the plugin owns the transition.
               if (current.transport !== "real") await projectQueueTransition(item, "start");
               await writeQueue(items);
-              return reply({ ...crew, status: await crewStatus(crew), queueId: qid }, `Dispatched queue ${qid} as ${crew.shape} crew ${crew.id}`);
+              return reply({ ...crew, status: await crewStatus(crew), queueId: qid }, `Dispatched queue ${qid} as ${crew.shape} crew ${crew.id}${permissionLine(crew.id)}`);
             }
             if (sub === "drop" || sub === "done") {
               const qid = rest[1];
