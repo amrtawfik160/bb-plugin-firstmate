@@ -1776,7 +1776,7 @@ test("lifecycle: recovery reaches older threads beyond the first page", async ()
   } finally { await host.harness.lifecycle.dispose(); }
 });
 
-for (const failedStep of ["threads.stop", "threads.archive", "environments.delete"] as const) {
+for (const failedStep of ["threads.stop", "threads.archive"] as const) {
   test(`lifecycle: cleanup failure in ${failedStep} remains retryable`, async () => {
     const host = await load();
     try {
@@ -1786,7 +1786,7 @@ for (const failedStep of ["threads.stop", "threads.archive", "environments.delet
       const result = await host.harness.behavior.runCli(["forget", "c1", "--stop"]);
       assert.notEqual(result.exitCode, 0);
       assert.equal((await crewsKv(host))[0]?.id, "c1");
-      if (failedStep !== "environments.delete") assert.equal(host.harness.sdk.callsTo("environments.delete").length, 0);
+      assert.equal(host.harness.sdk.callsTo("environments.delete").length, 0);
     } finally { await host.harness.lifecycle.dispose(); }
   });
 }
@@ -1914,7 +1914,8 @@ test("IT lifecycle: real Git distinguishes a pushed PR from a later empty local 
     git("-C", repo, "push", "origin", "crew");
     const allowed = await host.harness.behavior.runCli(["forget", "c1", "--stop"]);
     assert.equal(allowed.exitCode, 0, allowed.stderr);
-    assert.equal(host.harness.sdk.callsTo("environments.delete").length, 1);
+    assert.equal(host.harness.sdk.callsTo("threads.archive").length, 1);
+    assert.equal(host.harness.sdk.callsTo("environments.delete").length, 0, "ship archive waits out the grace period");
     assert.deepEqual(await crewsKv(host), []);
   } finally {
     await host.harness.lifecycle.dispose();
@@ -1922,17 +1923,16 @@ test("IT lifecycle: real Git distinguishes a pushed PR from a later empty local 
   }
 });
 
-test("D2: forget --stop on a clean crew removes the managed worktree", async () => {
+test("D2: forget --stop on a clean ship archives and leaves the worktree to the grace period", async () => {
   const host = await load();
   try {
     await seedCrew(host); // worktree: true
     stubForgetSdk(host, { dirty: [] });
     const result = await host.harness.behavior.runCli(["forget", "c1", "--stop"], { projectId: "proj_1" });
     assert.equal(result.exitCode, 0, result.stderr);
-    assert.match(result.stdout, /worktree removed/);
-    const del = host.harness.sdk.callsTo("environments.delete");
-    assert.equal(del.length, 1, "worktree env must be deleted exactly once");
-    assert.equal((del[0]?.[0] as { environmentId?: string }).environmentId, "env_wt");
+    assert.doesNotMatch(result.stdout, /worktree removed/);
+    assert.equal(host.harness.sdk.callsTo("threads.archive").length, 1);
+    assert.equal(host.harness.sdk.callsTo("environments.delete").length, 0);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -1956,14 +1956,15 @@ test("D2: forget --stop on a DIRTY crew refuses and leaves the worktree intact",
   }
 });
 
-test("D2: forget --stop --force on a dirty crew still removes the worktree", async () => {
+test("D2: forget --stop --force on a dirty ship archives without deleting the worktree", async () => {
   const host = await load();
   try {
     await seedCrew(host);
     stubForgetSdk(host, { dirty: ["src/a.ts"] });
     const result = await host.harness.behavior.runCli(["forget", "c1", "--stop", "--force"], { projectId: "proj_1" });
     assert.equal(result.exitCode, 0, result.stderr);
-    assert.equal(host.harness.sdk.callsTo("environments.delete").length, 1);
+    assert.equal(host.harness.sdk.callsTo("threads.archive").length, 1);
+    assert.equal(host.harness.sdk.callsTo("environments.delete").length, 0);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -2011,21 +2012,22 @@ test("F1: forget --stop ALLOWS a crew whose committed work is pushed to a PR (re
     stubForgetSdk(host, { dirty: [], committed: ["src/feature.ts"], prUrl: "https://github.com/x/y/pull/9" });
     const result = await host.harness.behavior.runCli(["forget", "c1", "--stop"], { projectId: "proj_1" });
     assert.equal(result.exitCode, 0, result.stderr);
-    assert.match(result.stdout, /worktree removed/);
-    assert.equal(host.harness.sdk.callsTo("environments.delete").length, 1);
+    assert.equal(host.harness.sdk.callsTo("threads.archive").length, 1);
+    assert.equal(host.harness.sdk.callsTo("environments.delete").length, 0);
   } finally {
     await host.harness.lifecycle.dispose();
   }
 });
 
-test("F1: forget --stop --force removes the worktree despite committed-unpushed work", async () => {
+test("F1: forget --stop --force archives despite committed-unpushed work and does not delete the ship worktree", async () => {
   const host = await load();
   try {
     await seedCrew(host);
     stubForgetSdk(host, { dirty: [], committed: ["src/feature.ts"] });
     const result = await host.harness.behavior.runCli(["forget", "c1", "--stop", "--force"], { projectId: "proj_1" });
     assert.equal(result.exitCode, 0, result.stderr);
-    assert.equal(host.harness.sdk.callsTo("environments.delete").length, 1);
+    assert.equal(host.harness.sdk.callsTo("threads.archive").length, 1);
+    assert.equal(host.harness.sdk.callsTo("environments.delete").length, 0);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -2909,7 +2911,7 @@ test("bb crew launch prompt routes scripts to bin-bb and forbids CI poll loops",
     const fakebin = join(home, "fakebin");
     const log = join(home, "transport.jsonl");
     mkdirSync(fakebin);
-    writeFileSync(join(fakebin, "bb"), `#!/usr/bin/env python3\nimport json,sys\nwith open(${JSON.stringify(log)}, 'a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')\nargs=sys.argv[1:]\nif args[:2] == ['thread','spawn']: print(json.dumps({'id':'thr_crew1','path':'/wt'}))\nelif args[:2] == ['thread','show']: print(json.dumps({'thread':{'id':'thr_crew1','status':'active'},'environment':{'path':'/wt'}}))\n`, { mode: 0o755 });
+    writeFileSync(join(fakebin, "bb"), `#!/usr/bin/env python3\nimport json,sys\nwith open(${JSON.stringify(log)}, 'a') as f:\n    args=sys.argv[1:]\n    f.write(json.dumps(args)+'\\n')\n    if '--prompt-file' in args:\n        f.write(json.dumps(['prompt-body', open(args[args.index('--prompt-file')+1]).read()])+'\\n')\nif args[:2] == ['thread','spawn']: print(json.dumps({'id':'thr_crew1','path':'/wt'}))\nelif args[:2] == ['thread','show']: print(json.dumps({'thread':{'id':'thr_crew1','status':'active'},'environment':{'path':'/wt'}}))\n`, { mode: 0o755 });
     const brief = join(home, "brief.md");
     writeFileSync(brief, [
       "arm your board with bin/fm-procevent-lavish.sh arm <artifact.html> --for <task-id>;",
@@ -2922,7 +2924,9 @@ test("bb crew launch prompt routes scripts to bin-bb and forbids CI poll loops",
     assert.equal(run.status, 0, run.stderr);
     const calls = readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line) as string[]);
     const launch = calls.find(args => args[0] === "thread" && args[1] === "spawn")!;
-    const prompt = launch[launch.indexOf("--prompt") + 1]!;
+    const prompt = calls.find(args => args[0] === "prompt-body")?.[1] ?? "";
+    assert.ok(launch.includes("--prompt-file"));
+    assert.equal(launch.includes("--prompt"), false);
     const bindir = `${home}/bin-bb`;
     assert.ok(prompt.includes(`${bindir}/fm-procevent-lavish.sh arm <artifact.html>`), prompt);
     assert.ok(prompt.includes(`\`${bindir}/fm-procevent.sh handled`), prompt);
@@ -7299,7 +7303,7 @@ test("IT BB secondmate launch keeps captain role and seeded home; stop failures 
   const log = join(home, "transport.jsonl");
   try {
     mkdirSync(fakebin);
-    writeFileSync(join(fakebin, "bb"), `#!/usr/bin/env python3\nimport json,sys\nwith open(${JSON.stringify(log)}, 'a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')\nargs=sys.argv[1:]\nif args[:2] == ['thread','spawn']: print(json.dumps({'id':'thr_secondmate','path':${JSON.stringify(home)}}))\nelif args[:2] == ['thread','show']: print(json.dumps({'id':'thr_secondmate','status':'idle','path':${JSON.stringify(home)}}))\nelif args[:2] == ['thread','stop']: sys.exit(19)\n`, { mode: 0o755 });
+    writeFileSync(join(fakebin, "bb"), `#!/usr/bin/env python3\nimport json,sys\nwith open(${JSON.stringify(log)}, 'a') as f:\n    args=sys.argv[1:]\n    f.write(json.dumps(args)+'\\n')\n    if '--prompt-file' in args:\n        f.write(json.dumps(['prompt-body', open(args[args.index('--prompt-file')+1]).read()])+'\\n')\nif args[:2] == ['thread','spawn']: print(json.dumps({'id':'thr_secondmate','path':${JSON.stringify(home)}}))\nelif args[:2] == ['thread','show']: print(json.dumps({'id':'thr_secondmate','status':'idle','path':${JSON.stringify(home)}}))\nelif args[:2] == ['thread','stop']: sys.exit(19)\n`, { mode: 0o755 });
     const env = { ...process.env, PATH: `${fakebin}:${process.env.PATH}`, FM_HOME: home, FM_BB_PROJECT_ID: "project_1", FM_BB_MACHINE: "host_1" };
     const run = spawnSync("bash", ["-c", `. ${JSON.stringify(join(OVERLAY_ROOT, "bin/backends/bb.sh"))}; fm_backend_bb_create_task domain "$FM_HOME" sm1 secondmate ''`], { env, encoding: "utf8" });
     assert.equal(run.status, 0, run.stderr);
@@ -7307,7 +7311,8 @@ test("IT BB secondmate launch keeps captain role and seeded home; stop failures 
     const launch = calls.find(args => args[0] === "thread" && args[1] === "spawn")!;
     assert.equal(launch[launch.indexOf("--environment") + 1], home);
     assert.ok(!launch.includes("--new-environment"));
-    const prompt = launch[launch.indexOf("--prompt") + 1]!;
+    const prompt = calls.find(args => args[0] === "prompt-body")?.[1] ?? "";
+    assert.ok(launch.includes("--prompt-file"));
     assert.match(prompt, /persistent Firstmate secondmate captain/);
     assert.match(prompt, /\/browser skill and browser_script/);
     assert.match(prompt, /profileId unset/);
@@ -7911,7 +7916,7 @@ test("captain compaction is due only past the budget and outside the cooldown", 
   assert.equal(captainCompactDue({ ...base, usedTokens: null, lastCompactAt: null }), false);
 });
 
-test("an idle captain past its context budget is compacted once; crews are never compacted", async () => {
+test("an idle captain past its context budget is compacted once; a crew compacts on its own stamp", async () => {
   const fresh = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { captainCompactAtTokens: 200000 } });
   await fresh.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
   await plugin(fresh.bb);
@@ -7923,8 +7928,14 @@ test("an idle captain past its context budget is compacted once; crews are never
     await idle("thr_cap");
     await idle("thr_cap");
     await idle("thr_not_a_captain");
+    await fresh.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew", "thr_cap")]);
+    await idle("thr_crew");
+    await idle("thr_crew");
     const compacted = fresh.harness.sdk.callsTo("threads.compact").map((call) => (call[0] as { threadId: string }).threadId);
-    assert.deepEqual(compacted, ["thr_cap"], "one compaction per cooldown, captains only");
+    assert.deepEqual(compacted, ["thr_cap", "thr_crew"]);
+    assert.equal(await fresh.bb.storage.kv.get("captain-compacted-at:thr_cap") !== undefined, true);
+    assert.equal(await fresh.bb.storage.kv.get("crew-compacted-at:thr_crew") !== undefined, true);
+    assert.equal(await fresh.bb.storage.kv.get("captain-compacted-at:thr_crew"), undefined);
   } finally {
     await fresh.harness.lifecycle.dispose();
   }
@@ -9377,4 +9388,247 @@ test("IT inbox parity: a missing record is not an acknowledgement", { skip: !FM_
     try { await new Promise(r => setTimeout(r, 150)); assert.equal(deleted, false); }
     finally { run.controller.abort(); await run.done; }
   } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test("interaction wake names the id, kind, and the matching command", async () => {
+  const host = await load();
+  try {
+    stubIdleSdk(host);
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    host.harness.sdk.stub("threads.interactions.get", async () => ({
+      id: "int_cmd",
+      status: "pending",
+      payload: { kind: "approval", subject: { kind: "command", command: "rm -rf ./build", itemId: "i" }, reason: null, availableDecisions: ["allow_once", "deny"] },
+    }));
+    const pending = await host.harness.behavior.emitThreadEvent("interaction.pending", {
+      thread: makeThreadResponse({ id: "thr_crew", status: "active" }),
+      interaction: { id: "int_cmd" },
+    });
+    assert.deepEqual(pending.errors, []);
+    const text = sendCalls(host).map((call) => call.text).join("\n");
+    assert.match(text, /command int_cmd/);
+    assert.match(text, /rm -rf \.\/build/);
+    assert.match(text, /bb thread interactions approve int_cmd thr_crew/);
+    assert.equal(host.harness.sdk.callsTo("threads.interactions.resolve").length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("yolo auto-grants a permission at or below the parent and leaves a higher grant as a wake", async () => {
+  const host = await load();
+  try {
+    stubIdleSdk(host);
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await host.bb.storage.kv.set("postures", { proj_1: { mode: "direct-PR", yolo: true } });
+    host.harness.sdk.stub("threads.defaultExecutionOptions", async (args: { threadId: string }) => ({
+      permissionMode: args.threadId === "thr_cap" ? "auto" : "accept-edits",
+      model: "m", reasoningLevel: "medium", serviceTier: "default", source: "client/turn/start",
+    }));
+    const grant = {
+      id: "int_grant",
+      status: "pending",
+      payload: {
+        kind: "approval",
+        subject: { kind: "permission_grant", toolName: "Bash", itemId: "i", permissions: { fileSystem: null, network: { enabled: false } } },
+        reason: null,
+        availableDecisions: ["allow_for_session", "deny"],
+      },
+    };
+    host.harness.sdk.stub("threads.interactions.get", async () => grant);
+    host.harness.sdk.stub("threads.interactions.resolve", async () => ({ status: "resolved" }));
+    const granted = await host.harness.behavior.emitThreadEvent("interaction.pending", {
+      thread: makeThreadResponse({ id: "thr_crew", status: "active" }),
+      interaction: { id: "int_grant" },
+    });
+    assert.deepEqual(granted.errors, []);
+    assert.equal(host.harness.sdk.callsTo("threads.interactions.resolve").length, 1);
+    assert.equal(sendCalls(host).length, 0, "an in-ceiling grant is not a wake");
+    host.harness.sdk.stub("threads.defaultExecutionOptions", async (args: { threadId: string }) => ({
+      permissionMode: args.threadId === "thr_cap" ? "auto" : "full",
+      model: "m", reasoningLevel: "medium", serviceTier: "default", source: "client/turn/start",
+    }));
+    host.harness.sdk.stub("threads.interactions.get", async () => ({ ...grant, id: "int_high" }));
+    const high = await host.harness.behavior.emitThreadEvent("interaction.pending", {
+      thread: makeThreadResponse({ id: "thr_crew", status: "active" }),
+      interaction: { id: "int_high" },
+    });
+    assert.deepEqual(high.errors, []);
+    assert.equal(host.harness.sdk.callsTo("threads.interactions.resolve").length, 1, "a grant above the parent stays unresolved");
+    assert.match(sendCalls(host).map((call) => call.text).join("\n"), /bb thread interactions grant int_high thr_crew/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("retry surfaces no_failed_turn and does not relaunch", async () => {
+  const host = await load();
+  try {
+    await seedCrew(host);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: null }));
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_new" }));
+    host.harness.sdk.stub("threads.retry", async () => {
+      const error = new Error("Thread thr_crew has no failed turn to retry: it is idle.");
+      (error as Error & { code: string }).code = "no_failed_turn";
+      throw error;
+    });
+    const result = await host.harness.behavior.runCli(["retry", "c1"]);
+    assert.notEqual(result.exitCode, 0);
+    assert.match(result.stderr, /no_failed_turn/);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a foreign provider session is cleared and the same send is retried", async () => {
+  const host = await load();
+  try {
+    await seedCrew(host);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: null }));
+    host.harness.sdk.stub("threads.queuedMessages.list", async () => []);
+    host.harness.sdk.stub("threads.clearContext", async () => ({ ok: true }));
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_new" }));
+    let sends = 0;
+    host.harness.sdk.stub("threads.send", async () => {
+      sends += 1;
+      if (sends === 1) {
+        const error = new Error("provider session belongs to another thread");
+        (error as Error & { code: string; details: { reason: string } }).code = "provider_session_unavailable";
+        (error as Error & { details: { reason: string } }).details = { reason: "foreign" };
+        throw error;
+      }
+      return { delivery: "sent" };
+    });
+    const result = await host.harness.behavior.runCli(["tell", "c1", "--message=keep going"], { threadId: "thr_cap" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(sends, 2);
+    assert.equal(host.harness.sdk.callsTo("threads.clearContext").length, 1);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a destroyed workspace is restored before tell, and a deleted one is not", async () => {
+  const host = await load();
+  try {
+    await seedCrew(host);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.queuedMessages.list", async () => []);
+    host.harness.sdk.stub("threads.send", async () => ({ delivery: "sent" }));
+    let phase = "destroyed";
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({
+      id: "thr_crew", status: "idle", environmentId: "env_wt", canRestoreEnvironment: true,
+    }));
+    host.harness.sdk.stub("environments.get", async () => ({
+      id: "env_wt",
+      status: phase === "destroyed" ? "destroyed" : "ready",
+      lifecycle: { phase, retireAt: null, teardown: null },
+    }));
+    host.harness.sdk.stub("threads.restoreEnvironment", async () => {
+      phase = "active";
+      return { status: "idle" };
+    });
+    const restored = await host.harness.behavior.runCli(["tell", "c1", "--message=continue"], { threadId: "thr_cap" });
+    assert.equal(restored.exitCode, 0, restored.stderr);
+    assert.equal(host.harness.sdk.callsTo("threads.restoreEnvironment").length, 1);
+    await host.bb.storage.kv.set("deleted-env:env_wt", true);
+    phase = "destroyed";
+    const refused = await host.harness.behavior.runCli(["tell", "c1", "--message=again"], { threadId: "thr_cap" });
+    assert.notEqual(refused.exitCode, 0);
+    assert.match(refused.stderr, /will not be restored/);
+    assert.equal(host.harness.sdk.callsTo("threads.restoreEnvironment").length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("finished scout teardown deletes the scratch environment; the archive stands if delete fails", async () => {
+  const host = await load();
+  try {
+    stubForgetSdk(host, { dirty: [] });
+    await host.bb.storage.kv.set("crews", [{ ...shipRow("c1", "thr_crew", "thr_cap"), shape: "scout" }]);
+    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(host.harness.sdk.callsTo("threads.archive").length, 1);
+    const del = host.harness.sdk.callsTo("environments.delete");
+    assert.equal(del.length, 1);
+    assert.equal((del[0]?.[0] as { environmentId?: string }).environmentId, "env_wt");
+    assert.equal(await host.bb.storage.kv.get("deleted-env:env_wt"), true);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a failed scout environment delete keeps the archive and reports the error", async () => {
+  const host = await load();
+  try {
+    stubForgetSdk(host, { dirty: [] });
+    host.harness.sdk.stub("environments.delete", async () => { throw new Error("provider refused"); });
+    await host.bb.storage.kv.set("crews", [{ ...shipRow("c1", "thr_crew", "thr_cap"), shape: "scout" }]);
+    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /was not deleted/);
+    assert.equal(host.harness.sdk.callsTo("threads.archive").length, 1);
+    assert.equal((await host.bb.storage.kv.get("crews") as unknown[]).length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("dispatch reports when the machine ceiling lowers the requested permission", async () => {
+  const host = await load();
+  try {
+    host.harness.sdk.stub("environments.list", async () => [
+      { hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" },
+    ]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew" }));
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "starting", environmentId: "env_wt" }));
+    host.harness.sdk.stub("threads.defaultExecutionOptions", async () => ({
+      permissionMode: "auto", model: "m", reasoningLevel: "medium", serviceTier: "default", source: "client/thread/start",
+    }));
+    host.harness.sdk.stub("environments.get", async () => ({
+      id: "env_wt", hostId: "host_1", status: "ready", lifecycle: { phase: "active", retireAt: null, teardown: null },
+    }));
+    host.harness.sdk.stub("hosts.get", async () => ({ id: "host_1", maxPermissionMode: "auto" }));
+    const result = await host.harness.behavior.runCli(
+      ["dispatch", "--project", "proj_1", "--permission-mode", "full", "--", "ship the fix"],
+      { projectId: "proj_1" },
+    );
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /permission: auto \(machine ceiling auto\)/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a failed queued row with the same body is re-sent instead of appended", async () => {
+  const host = await load();
+  try {
+    await seedCrew(host);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: null }));
+    host.harness.sdk.stub("threads.queuedMessages.list", async () => [{
+      id: "q_failed",
+      failureReason: "provider_session_unavailable",
+      content: [{ type: "text", text: "STEER from captain — this is a course correction, NOT a stop. Keep working on your current task and fold this in without tearing down or discarding work: same words" }],
+    }]);
+    host.harness.sdk.stub("threads.queuedMessages.send", async () => ({ delivery: "sent" }));
+    host.harness.sdk.stub("threads.send", async () => ({ delivery: "sent" }));
+    const result = await host.harness.behavior.runCli(["tell", "c1", "--message=same words"], { threadId: "thr_cap" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    const resent = host.harness.sdk.callsTo("threads.queuedMessages.send");
+    assert.equal(resent.length, 1);
+    assert.equal((resent[0]?.[0] as { mode?: string; queuedMessageId?: string }).mode, "steer");
+    assert.equal((resent[0]?.[0] as { queuedMessageId?: string }).queuedMessageId, "q_failed");
+    assert.equal(host.harness.sdk.callsTo("threads.send").length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
 });

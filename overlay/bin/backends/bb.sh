@@ -38,10 +38,37 @@ fm_backend_bb_tool_check() {
   }
 }
 
+fm_backend_bb_cli_error_tally() {
+  bb diagnostics cli-errors --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+rows = data.get("rows") if isinstance(data, dict) else None
+if not isinstance(rows, list) or not rows:
+    sys.exit(0)
+lines = []
+for row in rows:
+    if not isinstance(row, dict):
+        continue
+    command = row.get("command")
+    code = row.get("code")
+    if not isinstance(command, str) or not command or not isinstance(code, str) or not code:
+        continue
+    count = row.get("count")
+    suffix = " x%s" % count if isinstance(count, int) else ""
+    lines.append("%s %s%s" % (command, code, suffix))
+if lines:
+    sys.stderr.write("bb cli errors:\n%s\n" % "\n".join(lines))
+' || true
+}
+
 fm_backend_bb_runtime_check() {
   fm_backend_bb_tool_check || return 1
   bb status >/dev/null 2>&1 || {
     echo "error: backend=bb selected but 'bb status' failed; enroll this host and retry" >&2
+    fm_backend_bb_cli_error_tally
     return 1
   }
 }
@@ -123,6 +150,151 @@ fm_backend_bb_show() {  # <thread-id>
   id=$(fm_backend_bb_thread_id "$1")
   fm_backend_bb_tool_check || return 1
   bb thread show --json "$id"
+}
+
+# stdout is the JSON body on success. On failure, stdout is left to bb and a
+# parsed {"ok":false,"error":{code,message,hint?}} is printed as
+# "error: <message> (<code>)" plus the hint. Stderr is never folded into stdout.
+# Sets FM_BACKEND_BB_ERROR_CODE and FM_BACKEND_BB_ERROR_REASON.
+fm_backend_bb_run_json() {
+  local out status parsed
+  FM_BACKEND_BB_ERROR_CODE=
+  FM_BACKEND_BB_ERROR_REASON=
+  out=$(bb "$@")
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf '%s' "$out"
+    return 0
+  fi
+  parsed=$(printf '%s' "$out" | python3 -c '
+import json, sys
+raw = sys.stdin.read()
+try:
+    data = json.loads(raw) if raw.strip() else None
+except Exception:
+    data = None
+err = data.get("error") if isinstance(data, dict) else None
+if not (isinstance(data, dict) and data.get("ok") is False and isinstance(err, dict)
+        and isinstance(err.get("code"), str) and err.get("code")
+        and isinstance(err.get("message"), str)):
+    sys.exit(2)
+details = err.get("details") if isinstance(err.get("details"), dict) else {}
+reason = details.get("reason") if isinstance(details.get("reason"), str) else ""
+if not reason and isinstance(err.get("reason"), str):
+    reason = err["reason"]
+hint = err.get("hint") if isinstance(err.get("hint"), str) else ""
+sys.stderr.write("error: %s (%s)\n" % (err["message"], err["code"]))
+if hint:
+    sys.stderr.write("%s\n" % hint)
+sys.stdout.write("%s\t%s" % (err["code"], reason))
+') || true
+  if [ -n "$parsed" ]; then
+    FM_BACKEND_BB_ERROR_CODE=${parsed%%$'\t'*}
+    FM_BACKEND_BB_ERROR_REASON=${parsed#*$'\t'}
+  fi
+  fm_backend_bb_cli_error_tally
+  return "$status"
+}
+
+fm_backend_bb_private_file() {  # <body> -> path
+  local path
+  path=$(mktemp "${TMPDIR:-/tmp}/fm-bb.XXXXXX")
+  chmod 600 "$path"
+  printf '%s' "$1" > "$path"
+  printf '%s' "$path"
+}
+
+fm_backend_bb_env_was_deleted() {  # <env-id>
+  local file=${FM_HOME:-}/state/.bb-deleted-envs
+  [ -n "$1" ] && [ -f "$file" ] && grep -qx -- "$1" "$file"
+}
+
+fm_backend_bb_mark_env_deleted() {  # <env-id>
+  local dir=${FM_HOME:-}/state
+  [ -n "$1" ] && [ -n "${FM_HOME:-}" ] || return 0
+  mkdir -p "$dir"
+  printf '%s\n' "$1" >> "$dir/.bb-deleted-envs"
+}
+
+# Restore only a destroyed workspace. retiring/teardown still have the checkout
+# (or are removing it); restore is refused while it is there.
+fm_backend_bb_ensure_workspace() {  # <thread-id>
+  local id show env_id envjson phase status can i
+  id=$(fm_backend_bb_thread_id "$1")
+  show=$(bb thread show --json "$id" 2>/dev/null) || return 0
+  env_id=$(printf '%s' "$show" | fm_backend_bb_json_field env_id 2>/dev/null || true)
+  [ -n "$env_id" ] || return 0
+  if fm_backend_bb_env_was_deleted "$env_id"; then
+    echo "error: environment $env_id was deleted and will not be restored" >&2
+    return 1
+  fi
+  envjson=$(bb environment show --json "$env_id" 2>/dev/null) || return 0
+  phase=$(printf '%s' "$envjson" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+life = data.get("lifecycle") if isinstance(data, dict) else None
+phase = life.get("phase") if isinstance(life, dict) else ""
+sys.stdout.write(phase if isinstance(phase, str) else "")
+') || true
+  [ "$phase" = destroyed ] || return 0
+  can=$(printf '%s' "$show" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if isinstance(data, dict) and isinstance(data.get("thread"), dict):
+    data = data["thread"]
+if isinstance(data, dict) and "canRestoreEnvironment" in data:
+    sys.stdout.write("true" if data.get("canRestoreEnvironment") is True else "false")
+') || true
+  if [ "$can" = false ]; then
+    echo "error: workspace for $id is gone and its environment provider cannot restore it" >&2
+    return 1
+  fi
+  if ! fm_backend_bb_run_json thread restore-environment --json "$id" >/dev/null; then
+    echo "error: workspace for $id is gone and could not be restored" >&2
+    return 1
+  fi
+  i=0
+  while [ "$i" -lt 30 ]; do
+    envjson=$(bb environment show --json "$env_id" 2>/dev/null || true)
+    phase=$(printf '%s' "$envjson" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+life = data.get("lifecycle") if isinstance(data, dict) else None
+phase = life.get("phase") if isinstance(life, dict) else ""
+status = data.get("status") if isinstance(data, dict) else ""
+sys.stdout.write("%s\t%s" % (phase if isinstance(phase, str) else "", status if isinstance(status, str) else ""))
+') || true
+    status=${phase#*$'\t'}
+    phase=${phase%%$'\t'*}
+    if [ "$phase" = active ] && [ "$status" = ready ]; then
+      return 0
+    fi
+    i=$((i + 1))
+    sleep 1
+  done
+  echo "error: workspace for $id is not usable after restore" >&2
+  return 1
+}
+
+fm_backend_bb_session_retryable() {
+  case "$FM_BACKEND_BB_ERROR_CODE" in
+    provider_session_unavailable) ;;
+    *) return 1 ;;
+  esac
+  case "$FM_BACKEND_BB_ERROR_REASON" in
+    foreign|ambiguous|invalid) ;;
+    *) return 1 ;;
+  esac
+  return 0
 }
 
 # The home's BB-capable script dir. Native bin/ has no bb backend (FM_BACKEND_KNOWN
@@ -245,8 +417,10 @@ sys.exit(1)
   subject=${subject//$'\t'/ }
   subject=${subject:0:76}
   title="${FM_BB_THREAD_TITLE:-$role · $subject · $id}"
+  local prompt_file
+  prompt_file=$(fm_backend_bb_private_file "$prompt") || return 1
   set -- thread spawn --json --project "$project_id" --title "$title" \
-    --prompt "$prompt" --visibility "$vis" --permission-mode "$perm"
+    --prompt-file "$prompt_file" --visibility "$vis" --permission-mode "$perm"
   if [ "$kind" = secondmate ] || [ "${FM_BB_SHARED_ENV:-0}" = 1 ]; then
     set -- "$@" --environment "$project"
   else
@@ -257,7 +431,10 @@ sys.exit(1)
   [ -z "$model" ] || set -- "$@" --model "$model"
   [ -z "$reasoning" ] || set -- "$@" --reasoning-level "$reasoning"
   [ -z "$machine" ] || set -- "$@" --machine "$machine"
-  out=$(bb "$@") || return 1
+  out=$(fm_backend_bb_run_json "$@")
+  local spawn_status=$?
+  rm -f "$prompt_file"
+  [ "$spawn_status" -eq 0 ] || return "$spawn_status"
   thread_id=$(printf '%s' "$out" | fm_backend_bb_json_field id) || {
     echo "error: bb thread spawn did not return a thread id for $name" >&2
     return 1
@@ -293,8 +470,26 @@ fm_backend_bb_relaunch() {  # <thread-id> [brief-path]
   local id brief=$2
   id=$(fm_backend_bb_thread_id "$1")
   fm_backend_bb_tool_check || return 1
-  if bb thread retry --json "$id" >/dev/null 2>&1; then
+  fm_backend_bb_ensure_workspace "$id" || return 1
+  if fm_backend_bb_run_json thread retry --json "$id" >/dev/null; then
     return 0
+  fi
+  case "$FM_BACKEND_BB_ERROR_CODE" in
+    no_failed_turn|retry_already_queued) return 1 ;;
+  esac
+  if fm_backend_bb_session_retryable; then
+    local status
+    status=$(fm_backend_bb_show "$id" 2>/dev/null | fm_backend_bb_json_field status 2>/dev/null || true)
+    case "$status" in
+      idle|error|failed)
+        if fm_backend_bb_run_json thread clear --json "$id" >/dev/null \
+          && fm_backend_bb_run_json thread retry --json "$id" >/dev/null; then
+          return 0
+        fi
+        return 1
+        ;;
+    esac
+    return 1
   fi
   if [ -n "$brief" ] && [ -f "$brief" ]; then
     fm_backend_bb_send_literal "$id" "RELAUNCH: continue from the brief at $brief. Follow it exactly."
@@ -373,16 +568,42 @@ fm_backend_bb_current_path() {  # <thread-id>
   fm_backend_bb_show "$id" | fm_backend_bb_json_field path
 }
 
+fm_backend_bb_tell_file() {  # <thread-id> <text>
+  local id=$1 text=$2 path out status
+  path=$(fm_backend_bb_private_file "$text") || return 1
+  out=$(fm_backend_bb_run_json thread tell --json --mode steer --message-file "$path" "$id")
+  status=$?
+  rm -f "$path"
+  if [ "$status" -ne 0 ] && fm_backend_bb_session_retryable; then
+    local thread_status
+    thread_status=$(fm_backend_bb_show "$id" 2>/dev/null | fm_backend_bb_json_field status 2>/dev/null || true)
+    case "$thread_status" in
+      idle|error|failed)
+        if fm_backend_bb_run_json thread clear --json "$id" >/dev/null; then
+          path=$(fm_backend_bb_private_file "$text") || return 1
+          out=$(fm_backend_bb_run_json thread tell --json --mode steer --message-file "$path" "$id")
+          status=$?
+          rm -f "$path"
+        fi
+        ;;
+    esac
+  fi
+  [ "$status" -eq 0 ] || return "$status"
+  printf '%s' "$out"
+}
+
 fm_backend_bb_send_literal() {  # <thread-id> <text>
   local id text=$2 out queued
   id=$(fm_backend_bb_thread_id "$1")
   fm_backend_bb_tool_check || return 1
+  fm_backend_bb_ensure_workspace "$id" || return 1
   FM_BACKEND_BB_DELIVERY=
   # The native watcher may ring an unhandled inbox again while BB is waiting on
   # an interaction. Reuse that accepted queue row, not another identical steer.
+  # A failed row for the same body is re-sent, not appended again.
   case "$text" in
     ': Firstmate instruction waiting: '*)
-      queued=$(bb thread queue list --json "$id") || return 1
+      queued=$(fm_backend_bb_run_json thread queue list --json "$id") || return 1
       out=$(printf '%s' "$queued" | python3 -c '
 import json, sys
 try:
@@ -392,7 +613,11 @@ try:
     for row in rows:
         content = row.get("content", [])
         if len(content) == 1 and content[0].get("type") == "text" and content[0].get("text") == sys.argv[1]:
-            print(json.dumps({"ok": True, "delivery": "queued", "queuedMessage": row}))
+            reason = row.get("failureReason")
+            if isinstance(reason, str) and reason:
+                sys.stdout.write("FAILED\t%s" % row.get("id", ""))
+            else:
+                print(json.dumps({"ok": True, "delivery": "queued", "queuedMessage": row}))
             break
 except Exception as exc:
     sys.stderr.write("error: invalid BB queue response: %s\n" % exc)
@@ -401,8 +626,15 @@ except Exception as exc:
       ;;
     *) out= ;;
   esac
+  case "$out" in
+    FAILED$'\t'*)
+      local qid=${out#FAILED$'\t'}
+      [ -n "$qid" ] || { echo "error: failed queue row has no id" >&2; return 1; }
+      out=$(fm_backend_bb_run_json thread queue send --json --mode steer "$id" "$qid") || return 1
+      ;;
+  esac
   if [ -z "$out" ]; then
-    out=$(bb thread tell --json --mode steer "$id" "$text") || return 1
+    out=$(fm_backend_bb_tell_file "$id" "$text") || return 1
   fi
   FM_BACKEND_BB_DELIVERY=$(printf '%s' "$out" | python3 -c '
 import json, sys
@@ -678,6 +910,20 @@ fm_backend_bb_remove_worktree() {  # <thread-id-or-worktree-id>
   fm_backend_bb_kill "$id" || return 1
   fm_backend_bb_tool_check || return 1
   bb thread archive "$id" || return 1
+  # A finished scout's scratch checkout should not sit through the retirement
+  # grace. Ship work is archived only. A failed delete leaves the archive.
+  if [ "${KIND:-}" = scout ]; then
+    local env_id show
+    show=$(fm_backend_bb_show "$id" 2>/dev/null || true)
+    env_id=$(printf '%s' "$show" | fm_backend_bb_json_field env_id 2>/dev/null || true)
+    if [ -n "$env_id" ]; then
+      if fm_backend_bb_run_json environment delete --json "$env_id" >/dev/null; then
+        fm_backend_bb_mark_env_deleted "$env_id"
+      else
+        echo "error: archived $id but environment $env_id was not deleted" >&2
+      fi
+    fi
+  fi
 }
 
 fm_backend_bb_worktree_path() {  # <thread-id>
