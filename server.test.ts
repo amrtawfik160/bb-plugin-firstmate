@@ -9604,7 +9604,7 @@ test("IT inbox parity: deferred steer is reported queued, unreadable inbox never
     await seedCrew(host);
     host.harness.sdk.stub("threads.send", async () => ({ delivery: "queued", queuedMessage: { id: "q1" } }));
     const result = await host.harness.behavior.runCli(["tell", "c1", "--message=decision"], { projectId: "proj_1" });
-    assert.match(result.stdout, /Queued for crew/);
+    assert.match(result.stdout, /NOT delivered/);
     assert.doesNotMatch(result.stdout, /Steered into/);
     assert.ok(existsSync(join(home, "state/c1.inbox/001.msg")));
     rmSync(join(home, "bin"));
