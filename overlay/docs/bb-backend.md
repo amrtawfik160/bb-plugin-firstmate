@@ -67,7 +67,7 @@ harness=bb
 | kill | `bb thread stop` |
 | remove_worktree | Dirty tree: print the file list, exit 1, do not stop or archive. Clean: `bb thread stop` + `bb thread archive` (archive failure exits 1; no Treehouse) |
 | busy_state | thread status → idle/busy |
-| agent_state | missing/alive/dead from `bb thread show` |
+| agent_state | missing/alive/dead from `bb thread show`; an archived or deleted thread is `missing`, so the watcher reports it once and stops escalating it as a wedge |
 | event wait | `bb thread wait --status idle` (first window to finish) |
 
 Composer submit/retry is a no-op: BB has no TUI composer. Delivery is the tell JSON succeeding.

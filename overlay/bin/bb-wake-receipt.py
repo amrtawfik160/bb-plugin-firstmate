@@ -68,6 +68,22 @@ def meaningful(report):
     return "\n".join(lines).strip()
 
 
+SECTION = re.compile(r"^[A-Z][A-Z ]{3,}[A-Z](?: \(|:)")
+
+
+def decisions_surface(report):
+    """Return (OPEN DECISIONS section text, whether it is the whole surface)."""
+    block, inside, only = [], False, True
+    for line in meaningful(report).splitlines():
+        if SECTION.match(line):
+            inside = line.startswith("OPEN DECISIONS")
+        if inside:
+            block.append(line)
+        else:
+            only = False
+    return "\n".join(block), only and bool(block)
+
+
 def status_cursor(state):
     try:
         return hashlib.sha256((state / ".status-presentation-cursor").read_bytes()).hexdigest()
@@ -100,6 +116,30 @@ class Journal:
                 raise RuntimeError("Invalid native acknowledgement in journal; retained")
             if value["phase"] != "presenting" and not self.report_path().is_file():
                 raise RuntimeError("Wake receipt report is missing; no acknowledgement authorized")
+
+    def decisions_path(self):
+        return self.state / ".bb-open-decisions-presented"
+
+    def decisions_repeat(self, report):
+        """True when report is only the OPEN DECISIONS already presented.
+
+        Open decisions stay open until answered, so re-presenting them is not a
+        new event. The digest follows the decision text, never the native status
+        cursor, which advances whenever any crew appends any status line.
+        """
+        block, only = decisions_surface(report)
+        path = self.decisions_path()
+        if not block:
+            path.unlink(missing_ok=True)
+            return False
+        digest = hashlib.sha256(block.encode()).hexdigest()
+        try:
+            seen = path.read_text().strip() == digest
+        except FileNotFoundError:
+            seen = False
+        if not seen:
+            atomic_text(path, digest)
+        return only and seen
 
     def prune_reports(self):
         # The receipt flock also covers orphan recovery and the native guardian.
@@ -244,7 +284,8 @@ class Journal:
         self.current["phase"] = "ready"
         self.current.pop("capture", None)
         self.save()
-        if not self.current["pair"] and not meaningful(report):
+        repeat = self.decisions_repeat(report)
+        if not self.current["pair"] and (not meaningful(report) or repeat):
             self.clear()
 
     def recover_presentation(self):
@@ -345,7 +386,8 @@ class Journal:
         # unchanged open-decision suffix was already presented in that batch.
         known_decisions = (fresh_surface.startswith("OPEN DECISIONS")
                            and old_surface.endswith("\n" + fresh_surface))
-        unchanged = self.status_unchanged and (fresh_surface == old_surface or known_decisions)
+        decisions_repeat = self.decisions_repeat(fresh)
+        unchanged = decisions_repeat or (self.status_unchanged and (fresh_surface == old_surface or known_decisions))
         if not pair and not meaningful(acknowledgement) and (not meaningful(fresh) or unchanged):
             self.clear()
         else:

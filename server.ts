@@ -19,6 +19,7 @@ import {
   hasStatusProtocol,
   isWaitingYield,
   WAITING_PROTOCOL,
+  LEFTOVER_TIMER_CONTRACT,
   idleVerdictPresentation,
   looksReadOnly,
   foldOpenDecisions,
@@ -40,6 +41,9 @@ import {
   truncate,
   MAX_CREW_RELAUNCHES,
   DEFAULT_MAX_ACTIVE_CREWS,
+  DEFAULT_MAX_FANOUT,
+  MAX_FANOUT_CEILING,
+  resolveFanoutCap,
   retryReason,
   type DeliveryMode,
   type PermissionMode,
@@ -49,6 +53,7 @@ import {
 } from "./lib/policy.ts";
 import { parseWakeReceipt, renderWakeReceipt, type WakeReceipt } from "./lib/wake-receipt.ts";
 import { readBbActivity } from "./lib/bb-activity.ts";
+import { ORPHAN_DECISION_QUIET_SEC, ORPHAN_SWEEP_BUDGET_MS, ORPHAN_SWEEP_INTERVAL_MS, orphanCandidateScript, orphanResolveLines, parseOrphanCandidates, parseStaleLavishSources, staleLavishSourceScript } from "./lib/orphan-decisions.ts";
 import { rpcContract } from "./rpc.ts";
 import {
   UPSTREAM_FIRSTMATE_SHA,
@@ -279,6 +284,11 @@ const WAIT_RESUME_MAX = 24;
 const WAIT_RESUME_PREFIX = "Firstmate resume: re-check the external run";
 const waitingRowSchema = z.record(z.string(), z.object({ generation: z.string(), count: z.number() }));
 const MAX_CREWS = 50;
+function isFinishedQueueItem(item: { status: string }): boolean {
+  return item.status === "done" || item.status === "dropped";
+}
+// A spawn that failed for a transport reason may still have created its thread.
+const TRANSIENT_SPAWN_FAILURE = /\b50[234]\b|gateway|timed? ?out|ETIMEDOUT|ECONNRESET|temporarily unavailable/i;
 // A same-project captain with no thread activity for this long no longer counts as a
 // live owner (ownership guards, "another captain is active" warnings).
 const CAPTAIN_LIVE_WINDOW_MS = 24 * 60 * 60_000;
@@ -304,8 +314,6 @@ const MAX_DECISIONS = 100;
 const MAX_DONE = 10;
 const MAX_TASK = 4000;
 const MAX_OUTPUT = 4000;
-const MAX_FANOUT = 10;
-const MAX_WATCH_CREWS = 10;
 const PLUGIN_ROOT = dirname(fileURLToPath(import.meta.url));
 const OVERLAY_DIR = join(PLUGIN_ROOT, "overlay");
 const FM_SCRIPT = /^[a-z0-9][a-z0-9-]*$/;
@@ -324,6 +332,20 @@ function ctxString(ctx: unknown, key: string): string | undefined {
 function threadField(thread: unknown, key: string): string {
   const value = asRecord(thread)[key];
   return typeof value === "string" ? value : "unknown";
+}
+
+// Errors a busy host or BB API throws while the work is still fine: worth one more try.
+const TRANSIENT_HOST_ERROR = /host unavailable|HTTP 409|could not be inspected|\b50[234]\b|gateway|timed? ?out|ETIMEDOUT|ECONNRESET/i;
+async function withTransientRetry<T>(operation: () => Promise<T>, delaysMs: readonly number[] = [1000, 2500]): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (attempt >= delaysMs.length || !TRANSIENT_HOST_ERROR.test(message)) throw error;
+      await sleep(delaysMs[attempt]!);
+    }
+  }
 }
 
 function sleep(ms: number): Promise<void> {
@@ -1670,6 +1692,11 @@ export default async function plugin(bb: BbPluginApi) {
       label: "Max running crews per captain before dispatch refuses (0 = no cap)",
       default: DEFAULT_MAX_ACTIVE_CREWS,
     },
+    maxFanout: {
+      type: "number",
+      label: `Max crews in one fan-out dispatch or watch batch (default ${DEFAULT_MAX_FANOUT}, at most ${MAX_FANOUT_CEILING})`,
+      default: DEFAULT_MAX_FANOUT,
+    },
   });
 
   const knownCaptainsRef = new Set<string>();
@@ -2659,6 +2686,35 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  // The dispatch hook rejects a scheduled WAITING resume once its crew is no longer
+  // waiting, but a rejected resume stays behind as a FAILED queued row. Rows ahead of a
+  // steer make BB defer it, so steering an idle crew "queued" and never started its
+  // turn. Drop the failed stale resumes before steering or retrying.
+  async function purgeStaleResumeRows(crew: Crew): Promise<number> {
+    if (await isCrewWaiting(crew)) return 0;
+    let rows: Awaited<ReturnType<typeof bb.sdk.threads.queuedMessages.list>>;
+    try {
+      rows = await bb.sdk.threads.queuedMessages.list({ threadId: crew.threadId });
+    } catch {
+      return 0;
+    }
+    let purged = 0;
+    for (const row of rows) {
+      const stale = typeof row.failureReason === "string" && row.failureReason !== ""
+        && row.content.length === 1 && row.content[0]?.type === "text"
+        && row.content[0].text.trimStart().startsWith(WAIT_RESUME_PREFIX);
+      if (!stale) continue;
+      try {
+        await bb.sdk.threads.queuedMessages.delete({ threadId: crew.threadId, queuedMessageId: row.id });
+        purged++;
+      } catch (error) {
+        bb.log.warn(`stale resume row ${row.id} not removed crew=${crew.id}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (purged > 0) bb.log.info(`removed ${purged} failed stale WAITING resume row(s) ahead of crew ${crew.id}`);
+    return purged;
+  }
+
   async function resendFailedSameBody(threadId: string, body: string): Promise<boolean> {
     let rows: Awaited<ReturnType<typeof bb.sdk.threads.queuedMessages.list>>;
     try {
@@ -3216,15 +3272,22 @@ export default async function plugin(bb: BbPluginApi) {
         : Array.isArray(asRecord(found)["threads"])
           ? (asRecord(found)["threads"] as unknown[])
           : [];
-    try {
-      const filtered = await match(rowsOf(await bb.sdk.threads.list({ originPluginId: "firstmate", includeHidden: true, limit: 50 })));
-      if (filtered !== null) return filtered;
-      // Broad fallback: no origin filter (catches a not-yet-tagged CLI spawn).
-      return await match(rowsOf(await bb.sdk.threads.list({ includeHidden: true, limit: 50 })));
-    } catch {
-      // Leave dispatch refused when orphan discovery is unavailable.
+    // A transient BB API failure (a 504 while the crew is being created) must not read
+    // as "no orphan": that refuses a dispatch whose crew already exists.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const filtered = await match(rowsOf(await bb.sdk.threads.list({ originPluginId: "firstmate", includeHidden: true, limit: 50 })));
+        if (filtered !== null) return filtered;
+        // Broad fallback: no origin filter (catches a not-yet-tagged CLI spawn).
+        return await match(rowsOf(await bb.sdk.threads.list({ includeHidden: true, limit: 50 })));
+      } catch (error) {
+        if (attempt >= 2) {
+          bb.log.warn(`orphan thread discovery failed for crew=${taskId}: ${error instanceof Error ? error.message : String(error)}`);
+          return null; // Leave dispatch refused when orphan discovery is unavailable.
+        }
+        await sleep(1000 * (attempt + 1));
+      }
     }
-    return null;
   }
 
   // The real transport swap: dispatch a crew end-to-end through the real
@@ -3355,7 +3418,16 @@ export default async function plugin(bb: BbPluginApi) {
     // No recorded thread. fm-spawn may still have created one and been hard-killed
     // before writing bb_thread_id. Adopt that orphan instead of native-spawning a
     // duplicate; only when none exists do we fall back to native (return null).
-    const orphan = await findOrphanThreadForTask(crew.id);
+    let orphan = await findOrphanThreadForTask(crew.id);
+    // A timed-out or gateway-failed spawn can still finish creating the thread a moment
+    // later; look again before reporting a failure for a crew that exists.
+    if (orphan === null && spawnFailed && TRANSIENT_SPAWN_FAILURE.test(spawnFailure)) {
+      for (const delayMs of [2000, 4000]) {
+        await sleep(delayMs);
+        orphan = await findOrphanThreadForTask(crew.id);
+        if (orphan !== null) break;
+      }
+    }
     if (orphan !== null) {
       bb.log.info(`real transport adopted orphan thread ${orphan} for crew=${crew.id} (fm-spawn left no bb_thread_id; spawnFailed=${spawnFailed})`);
       return orphan;
@@ -3762,6 +3834,10 @@ export default async function plugin(bb: BbPluginApi) {
     const owner = opts?.owner;
     if (owner === undefined || owner === "") return crews;
     return crews.filter((c) => c.parentThreadId === owner);
+  }
+
+  async function fanoutCap(): Promise<number> {
+    return resolveFanoutCap((await settings.get()).maxFanout);
   }
 
   // Dispatch ceiling per captain: past it, the captain queues instead of fanning
@@ -4370,6 +4446,9 @@ export default async function plugin(bb: BbPluginApi) {
         if (typeof row["id"] === "string") delivery.queueIds.push(row["id"]);
         delivery.retry = false;
         await bb.storage.kv.set(key, delivery);
+        if (asRecord(result)["delivery"] === "queued" && !queue) {
+          return `Recorded instruction for crew ${crew.id} (native inbox) but its notification is NOT delivered: BB deferred the steer behind earlier queued input, so no turn started. Inspect it: bb thread queue list ${crew.threadId}`;
+        }
         if (asRecord(result)["delivery"] === "queued" || queue) {
           return `Queued for crew ${crew.id} (native inbox; worker acknowledgement pending)`;
         }
@@ -4428,6 +4507,7 @@ export default async function plugin(bb: BbPluginApi) {
     // never routed through the inbox or queued.
     if (!interrupt) {
       const body = queue ? message : `${STEER_PREFIX}${message}`;
+      if (!queue) await purgeStaleResumeRows(crew);
       if (await resendFailedSameBody(crew.threadId, body.slice(0, MAX_TASK))) {
         return `Resent the failed steer to crew ${crew.id}`;
       }
@@ -4440,7 +4520,11 @@ export default async function plugin(bb: BbPluginApi) {
         mode: queue ? "queue-if-active" : "steer",
         input: [{ type: "text", text: body.slice(0, MAX_TASK), mentions: [] }],
       }));
-      if (asRecord(result)["delivery"] === "queued") return `Queued for crew ${crew.id} (BB deferred delivery)`;
+      if (asRecord(result)["delivery"] === "queued") {
+        return queue
+          ? `Queued for crew ${crew.id} (BB deferred delivery)`
+          : `Queued for crew ${crew.id} but NOT delivered: BB deferred the steer behind earlier queued input, so no turn started. Inspect it: bb thread queue list ${crew.threadId}`;
+      }
       if (queue) {
         return (await crewInTurn(crew))
           ? `Queued for crew ${crew.id} (read when its current turn ends)`
@@ -4579,18 +4663,23 @@ export default async function plugin(bb: BbPluginApi) {
   // Adopt a queued REAL backlog row the captain filed by hand (fm-tasks-axi) as a
   // queue item, so `queue dispatch <id>` works on it instead of pushing captains to
   // bypass the queue. The row keeps its id (it owns the crew).
-  async function adoptRealBacklogRow(id: string, projectId: string | undefined, owner: string | undefined): Promise<QueueItem | null> {
+  async function adoptRealBacklogRow(id: string, projectId: string | undefined, owner: string | undefined, strictText = true): Promise<QueueItem | null> {
     if (projectId === undefined || !/^[A-Za-z0-9._-]+$/.test(id) || !(await queueIsReal())) return null;
-    const res = await runTasksAxi(["show", id], { projectId });
+    // `show` cuts a long title at ~80 chars with a "(truncated …)" marker unless --full;
+    // the brief is built from this text, so a cut-off row would dispatch a cut-off task.
+    const res = await runTasksAxi(["show", id, "--full"], { projectId });
     if (res === null || res.exitCode !== 0) return null;
     if (tasksAxiField(res.output, "state") !== "queued") return null;
     const title = tasksAxiField(res.output, "title");
     if (title === "") return null;
+    if (strictText && /\(truncated, \d+ chars total/.test(title)) {
+      throw new Error(`Native backlog row ${id} came back truncated even with --full; refusing to dispatch a cut-off brief. Read it with fm-tasks-axi show ${id} --full and re-add it as a queue item.`);
+    }
     return {
       nativeHome: (await settings.get()).fmHome,
       id,
       title: title.slice(0, 500),
-      detail: "",
+      detail: [title.slice(500), tasksAxiField(res.output, "body")].filter((part) => part !== "").join("\n\n").slice(0, MAX_TASK),
       projectId,
       shape: tasksAxiField(res.output, "kind") === "scout" ? "scout" : "ship",
       mode: "",
@@ -5315,6 +5404,10 @@ export default async function plugin(bb: BbPluginApi) {
     for (const crew of crews) {
       if (opts.signal?.aborted) break;
       if (isSecondmateRoute(crew)) continue;
+      // Only a ship's own PR can land its work. A scout (an ops crew that merges or
+      // verifies other people's PRs) delivers a report, so a merged PR on its
+      // environment must never retire it while the captain still needs it.
+      if (crew.shape !== "ship") continue;
       if ((landedRetireBackoff.get(crew.id) ?? 0) > Date.now()) continue;
       const status = statusByThread.get(crew.threadId) ?? "unknown";
       if (status !== "idle" && status !== "error") continue;
@@ -5513,7 +5606,7 @@ export default async function plugin(bb: BbPluginApi) {
         // either, loudly, leaving the thread AND the worktree intact. This makes
         // the safety DELIBERATE, not a side effect of the teardown primitive
         // happening to preserve the branch (see the note at environments.delete).
-        const diff = await bb.sdk.environments.diffFiles({ environmentId: envId, target: "uncommitted" });
+        const diff = await withTransientRetry(() => bb.sdk.environments.diffFiles({ environmentId: envId, target: "uncommitted" }));
         const dirty = checkedDiffPaths(diff).filter((path) => !isScratchPath(path));
         if (dirty.length > 0) {
           throw new Error(
@@ -5577,12 +5670,35 @@ export default async function plugin(bb: BbPluginApi) {
       // best effort
     }
     if (!nativeTeardown) {
-      await dropFmMeta(crew);
-      // forget/drop removes the crew's own backlog row (dropped on forget, C1).
-      await realBacklogTransitionForCrew(crew, "rm");
-      // Native teardown retires checks/sidecars itself; this path must do it too.
-      const leftover = await retireNativeTaskState(crew);
-      if (leftover !== "") notes.push(`WARN: ${leftover}`);
+      try {
+        await withTransientRetry(() => dropFmMeta(crew));
+        // forget/drop removes the crew's own backlog row (dropped on forget, C1).
+        await withTransientRetry(() => realBacklogTransitionForCrew(crew, "rm"));
+        // Native teardown retires checks/sidecars itself; this path must do it too.
+        const leftover = await withTransientRetry(() => retireNativeTaskState(crew));
+        if (leftover !== "") notes.push(`WARN: ${leftover}`);
+      } catch (error) {
+        // Earlier steps are already applied (thread stopped/archived, native meta dropped);
+        // say so plainly and keep the crew record so re-running forget finishes the rest.
+        const applied = stop ? "the thread is already stopped and archived" : "nothing about the thread changed";
+        throw new Error(`Forget of ${id} is PARTIALLY applied (${applied}); native cleanup did not finish: ${error instanceof Error ? error.message : String(error)} The crew record is kept: run firstmate_forget again to finish.`);
+      }
+    }
+    // Forgetting without stop leaves the thread alive. A running turn is the captain's to
+    // stop, but an idle thread's leftover timers/monitors would wake it and keep it
+    // pushing to a branch a new crew may own, so release its runtime; say so when it runs.
+    if (!stop && !nativeTeardown && !isSecondmateRoute(crew) && !(await isCaptainThread(crew.threadId))) {
+      try {
+        const status = await crewStatus(crew);
+        if (status === "idle") {
+          await bb.sdk.threads.stop({ threadId: crew.threadId });
+          notes.push("idle thread stopped so leftover monitors cannot wake it (it can still be resumed by a message)");
+        } else if (status === "active" || status === "starting" || status === "pending") {
+          notes.push(`WARN: thread ${crew.threadId} is still running and keeps acting on its branch; use stop=true or firstmate_interrupt if it must not`);
+        }
+      } catch (error) {
+        notes.push(`WARN: thread ${crew.threadId} could not be stopped (${error instanceof Error ? error.message : String(error)}); its leftover monitors may still wake it`);
+      }
     }
     await removeCrew(crew);
     await publishFleet();
@@ -6283,6 +6399,49 @@ export default async function plugin(bb: BbPluginApi) {
     return !scope.home && (parentThreadId === null || parentThreadId === undefined || parentThreadId === "");
   }
 
+  // Close open decisions whose crew is gone: no register record, no native .meta, and
+  // a status log quiet for an hour. Native folds such a log as kind `unknown`, which
+  // never terminal-collapses, so its decision would be re-printed on every drain
+  // forever. The closing `resolved` line is appended, never a rewrite, so the audit
+  // trail stays. Throttled per home; a failure is logged and never blocks the drain.
+  const orphanSweepAt = new Map<string, number>();
+  async function sweepOrphanDecisions(hostId: string, fmHome: string, signal?: AbortSignal): Promise<void> {
+    const last = orphanSweepAt.get(fmHome) ?? 0;
+    if (Date.now() - last < ORPHAN_SWEEP_INTERVAL_MS) return;
+    orphanSweepAt.set(fmHome, Date.now());
+    try {
+      const stateDir = `${fmHome}/state`;
+      const listed = await runOnHost(hostId, orphanCandidateScript(stateDir, ORPHAN_DECISION_QUIET_SEC), 20_000, signal);
+      const registered = new Set((await readCrews()).map((c) => c.id));
+      for (const id of listed.exitCode === 0 ? parseOrphanCandidates(listed.output) : []) {
+        if (registered.has(id)) continue;
+        const path = `${stateDir}/${id}.status`;
+        const read = await runOnHost(hostId, `cat -- ${shQuote(path)}`, 15_000, signal);
+        if (read.exitCode !== 0) continue;
+        const closers = orphanResolveLines(read.output.split(/\r?\n/), "auto-closed: crew gone (no register record, no native meta, quiet for over an hour)");
+        if (closers.length === 0) continue;
+        const wrote = await runOnHost(hostId, `printf '%s\\n' ${closers.map(shQuote).join(" ")} >> ${shQuote(path)}`, 15_000, signal);
+        if (wrote.exitCode === 0) bb.log.info(`fm orphan decisions closed crew=${id} count=${closers.length}`);
+        else bb.log.warn(`fm orphan decision close failed crew=${id} exit=${wrote.exitCode}`);
+      }
+    } catch (error) {
+      bb.log.warn(`fm orphan decision sweep failed home=${fmHome}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    try {
+      // A Lavish source whose artifact is gone can never launch; retire it natively (native
+      // refuses while a captured round is unacknowledged, so nothing unread is lost).
+      const stale = await runOnHost(hostId, staleLavishSourceScript(`${fmHome}/state`), 20_000, signal);
+      if (stale.exitCode !== 0) return;
+      for (const id of parseStaleLavishSources(stale.output)) {
+        const res = await runFmScript({ script: "procevent", args: ["retire", id], hostId, fmHome, timeoutMs: 30_000, signal });
+        if (res.exitCode === 0) bb.log.info(`fm stale lavish source retired ${id}`);
+        else bb.log.warn(`fm stale lavish source ${id} not retired: ${truncate(res.output.trim(), 300)}`);
+      }
+    } catch (error) {
+      bb.log.warn(`fm stale lavish source sweep failed home=${fmHome}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   async function drainWakes(
     captainThreadId: string | undefined,
     ackThrough?: number,
@@ -6318,6 +6477,11 @@ export default async function plugin(bb: BbPluginApi) {
       // the emitted instruction can only ever touch the caller's own plane.
       const out = rewriteWakeAckLine(res.output).trim();
       if (res.exitCode !== 0) throw new Error(`native exit ${res.exitCode}: ${out || "no diagnostic output"}`);
+      // After a successful drain and under its own short budget, so a slow host can only
+      // delay housekeeping, never the drain itself. Its effect shows from the next drain.
+      if (args.length === 0 && (receipt === undefined || receipt.action === "receive")) {
+        await sweepOrphanDecisions(hostId, fmHome, AbortSignal.any([...(signal !== undefined ? [signal] : []), AbortSignal.timeout(ORPHAN_SWEEP_BUDGET_MS)]));
+      }
       return out === "" ? "Wake queue empty." : out;
     } catch (error) {
       const message = `Wake drain failed (home ${fmHome}, host ${hostId}): ${error instanceof Error ? error.message : String(error)}`;
@@ -7873,7 +8037,7 @@ export default async function plugin(bb: BbPluginApi) {
     '  bb firstmate tell <id> [--queue] -- "<message>" | interrupt <id> | stop <id> | retry <id> [--model m] [--provider p] [--reasoning-level l] [--reason r]',
     "  bb firstmate bearings | deliver <id> | merge <id> [--yes] [--allow-red <check-name>] [--allow-missing <check-name>] | promote <id>",
     '  bb firstmate queue add --project <id> [--shape s] [--mode m] [--after <qid>] [--wait-until <iso>] -- "<title>"',
-    "  bb firstmate queue [list|next|dispatch <qid>|done <qid>|drop <qid>]",
+    "  bb firstmate queue [list|next|dispatch <qid>|done <qid>|drop <qid>|prune]",
     '  bb firstmate decide ask [--option o ...] [--crew <id>] -- "<question>"',
     "  bb firstmate decide [list|answer <id>|defer <id>|drop <id>]",
     "  bb firstmate posture [set --project <id> [--mode m] [--yolo on|off]]",
@@ -8151,12 +8315,12 @@ export default async function plugin(bb: BbPluginApi) {
     name: "firstmate_watch",
     description: "Hand supervision of the given crews to private event-driven wakes backed by the durable queue. Returns immediately; call once per crew batch, end the turn, and do not retry or poll.",
     parameters: z.object({
-      crewIds: z.array(z.string()).max(MAX_WATCH_CREWS).optional(),
+      crewIds: z.array(z.string()).max(MAX_FANOUT_CEILING).optional(),
       timeoutSec: z.number().int().min(10).max(1800).optional().describe("Accepted for compatibility; event-driven handoff returns immediately"),
     }),
     async execute({ crewIds }) {
       const all = await listCrews();
-      const targets = (crewIds === undefined ? all : all.filter((c) => crewIds.includes(c.id))).slice(0, MAX_WATCH_CREWS);
+      const targets = (crewIds === undefined ? all : all.filter((c) => crewIds.includes(c.id))).slice(0, await fanoutCap());
       if (targets.length === 0) return toolError("No matching crews.");
       const statusByThread = await statusesFor(targets);
       const rows = await Promise.all(
@@ -8510,9 +8674,9 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_queue",
-    description: "Backlog with deps/time gates. add files work (with the crew's providerId/model/reasoningLevel); dispatch starts a crew when ungated — also for a queued row filed straight into the native backlog.",
+    description: "Backlog with deps/time gates. add files work (with the crew's providerId/model/reasoningLevel); dispatch starts a crew when ungated — also for a queued row filed straight into the native backlog. drop/done also close a native backlog row that has no queue item; prune forgets finished (done/dropped) queue items.",
     parameters: z.object({
-      action: z.enum(["add", "list", "next", "dispatch", "done", "drop"]),
+      action: z.enum(["add", "list", "next", "dispatch", "done", "drop", "prune"]),
       title: z.string().optional(),
       projectId: z.string().optional(),
       queueId: z.string().optional(),
@@ -8534,9 +8698,11 @@ export default async function plugin(bb: BbPluginApi) {
         const now = Date.now();
         const kvIds = new Set(items.flatMap((q) => [q.id, q.backlogId ?? ""]));
         const real = ((await realQueuedRows()) ?? []).filter((r) => !kvIds.has(r.id));
-        if (items.length === 0 && real.length === 0) return "Queue empty.";
+        // A finished (done/dropped) item is history, not work: it stays out of the list.
+        const live = items.filter((q) => !isFinishedQueueItem(q));
+        if (live.length === 0 && real.length === 0) return "Queue empty.";
         return [
-          ...items.map((q) => {
+          ...live.map((q) => {
             const gate = q.status === "queued" ? queueGate(q, items, now) : null;
             return `${q.id} [${q.status}] ${q.shape} :: ${truncate(q.title, 70)}${gate !== null ? ` — ${gate}` : ""}${q.crewId !== null ? ` (crew ${q.crewId})` : ""}`;
           }),
@@ -8584,20 +8750,27 @@ export default async function plugin(bb: BbPluginApi) {
         await publishFleet();
         return `Queued ${item.id} [${item.shape}] :: ${truncate(item.title, 80)}`;
       }
+      if (action === "prune") {
+        const kept = items.filter((q) => !isFinishedQueueItem(q));
+        await writeQueue(kept);
+        await publishFleet();
+        return `Pruned ${items.length - kept.length} finished queue item(s).`;
+      }
       let item = items.find((q) => q.id === queueId);
       let adopted = false;
-      if (item === undefined && queueId !== undefined && action === "dispatch") {
-        // A row filed straight into the native backlog: adopt it into the queue.
-        const row = await adoptRealBacklogRow(queueId, projectId ?? ctxProject, captain);
-        if (row !== null) { item = row; adopted = true; items.unshift(row); }
+      if (item === undefined && queueId !== undefined && (action === "dispatch" || action === "drop" || action === "done")) {
+        // A row filed straight into the native backlog: adopt it into the queue. Closing one
+        // needs no queue item afterwards, so drop/done never persist the adopted copy.
+        const row = await adoptRealBacklogRow(queueId, projectId ?? ctxProject, captain, action === "dispatch");
+        if (row !== null) { item = row; adopted = true; if (action === "dispatch") items.unshift(row); }
       }
       if (queueId === undefined || item === undefined) return toolError(`No queued item ${queueId ?? ""}.`);
       if (action === "drop" || action === "done") {
         item.status = action === "drop" ? "dropped" : "done";
         await projectQueueTransition(item, action === "drop" ? "rm" : "done");
-        await writeQueue(items);
+        if (!adopted) await writeQueue(items);
         await publishFleet();
-        return `Queue ${queueId} ${item.status}`;
+        return `Queue ${queueId} ${item.status}${adopted ? " (native backlog row)" : ""}`;
       }
       const gate = queueGate(item, items, Date.now());
       if (gate !== null) return toolError(`Item ${queueId} gated: ${gate}.`);
@@ -8862,7 +9035,7 @@ export default async function plugin(bb: BbPluginApi) {
         tools: [],
         skills: [],
         instructions:
-          `You are a firstmate crewmate. Do not dispatch other crews. Finish this one task, then report DONE, BLOCKED, or FAILED. ${WAITING_PROTOCOL} ${AXI_TOOL_CONTRACT} ${CI_POLL_CONTRACT}`,
+          `You are a firstmate crewmate. Do not dispatch other crews. Finish this one task, then report DONE, BLOCKED, or FAILED. ${WAITING_PROTOCOL} ${LEFTOVER_TIMER_CONTRACT} ${AXI_TOOL_CONTRACT} ${CI_POLL_CONTRACT}`,
       };
     }
     const marked = metaFlag(meta, "captain");
@@ -9439,7 +9612,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "deliver", summary: "Outcome + committed/uncommitted diff + PR", usage: "bb firstmate deliver <crew-id>" },
       { name: "merge", summary: "Merge PR or local-only ff-only land", usage: "bb firstmate merge <crew-id> [--yes]" },
       { name: "promote", summary: "Scout → new ship carrying the report", usage: "bb firstmate promote <crew-id>" },
-      { name: "queue", summary: "Backlog with deps/time gates", usage: 'bb firstmate queue add --project <id> -- "<title>"' },
+      { name: "queue", summary: "Backlog with deps/time gates; drop/done close a native row too, prune forgets finished items", usage: 'bb firstmate queue add --project <id> -- "<title>"' },
       { name: "decide", summary: "Durable decisions", usage: 'bb firstmate decide ask -- "<question>"' },
       { name: "posture", summary: "Per-project delivery mode + yolo", usage: "bb firstmate posture set --project <id> [--mode m]" },
       { name: "memory", summary: "Captain prefs + learnings", usage: "bb firstmate memory show" },
@@ -9567,7 +9740,8 @@ export default async function plugin(bb: BbPluginApi) {
                 ? flagAll(flags, "task")
                 : [rest.join(" ").trim()].filter((t) => t !== "");
             if (tasks.length === 0) return fail(`Empty task.\n${usage}`);
-            if (tasks.length > MAX_FANOUT) return fail(`Too many tasks (max ${MAX_FANOUT}).`);
+            const maxFanout = await fanoutCap();
+            if (tasks.length > maxFanout) return fail(`Too many tasks (max ${maxFanout}; raise the maxFanout setting).`);
             const projectId = flagStr(flags, "project") ?? ctxProject;
             if (projectId === undefined) return fail("No project: pass --project <id> (see bb project list).");
             const shape = toShape(flagStr(flags, "shape"));
@@ -9672,7 +9846,7 @@ export default async function plugin(bb: BbPluginApi) {
             const ids = rest.length > 0 ? rest : null;
             const timeoutMs = Math.min(1800, Math.max(10, Number(flagStr(flags, "timeout") ?? "600"))) * 1000;
             const all = await listCrews();
-            const targets = (ids === null ? all : all.filter((c) => ids.includes(c.id))).slice(0, MAX_WATCH_CREWS);
+            const targets = (ids === null ? all : all.filter((c) => ids.includes(c.id))).slice(0, await fanoutCap());
             if (targets.length === 0) return fail("No matching crews.");
             if (ids !== null) {
               const missing = ids.filter((id) => !targets.some((c) => c.id === id));
@@ -9996,9 +10170,10 @@ export default async function plugin(bb: BbPluginApi) {
               return reply(item, `Queued ${item.id} [${item.shape}] :: ${truncate(item.title, 80)}`);
             }
             if (sub === "list") {
-              if (items.length === 0) return reply([], "Queue empty.");
+              const live = items.filter((q) => !isFinishedQueueItem(q));
+              if (live.length === 0) return reply([], "Queue empty.");
               const now = Date.now();
-              const lines = items.map((q) => {
+              const lines = live.map((q) => {
                 const gate = q.status === "queued" ? queueGate(q, items, now) : null;
                 return `${q.id} [${q.status}] ${q.shape} :: ${truncate(q.title, 70)}${gate !== null ? ` — ${gate}` : ""}${q.crewId !== null ? ` (crew ${q.crewId})` : ""}`;
               });
@@ -10050,12 +10225,19 @@ export default async function plugin(bb: BbPluginApi) {
             }
             if (sub === "drop" || sub === "done") {
               const qid = rest[1];
-              const item = items.find((q) => q.id === qid);
+              let item = items.find((q) => q.id === qid);
+              const adopted = item === undefined && qid !== undefined;
+              if (item === undefined && qid !== undefined) item = await adoptRealBacklogRow(qid, flagStr(flags, "project") ?? ctxProject, ctxThread, false) ?? undefined;
               if (qid === undefined || item === undefined) return fail(`No queued item ${qid ?? ""}.`);
               item.status = sub === "drop" ? "dropped" : "done";
               await projectQueueTransition(item, sub === "drop" ? "rm" : "done");
-              await writeQueue(items);
-              return reply({ id: qid, status: item.status }, `Queue ${qid} ${item.status}`);
+              if (!adopted) await writeQueue(items);
+              return reply({ id: qid, status: item.status }, `Queue ${qid} ${item.status}${adopted ? " (native backlog row)" : ""}`);
+            }
+            if (sub === "prune") {
+              const kept = items.filter((q) => !isFinishedQueueItem(q));
+              await writeQueue(kept);
+              return reply({ pruned: items.length - kept.length }, `Pruned ${items.length - kept.length} finished queue item(s).`);
             }
             return fail(usage);
           }

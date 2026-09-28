@@ -220,6 +220,37 @@ test("unchanged persistent decisions do not create an endless completion loop", 
   assert.equal(f.read().reads, 2);
 });
 
+test("open decisions already presented never demand a second receipt, even when crews keep moving the status cursor", (t) => {
+  const f = fixture(t, { persistent: "OPEN DECISIONS (still open):\n96b4c16c blocked: PR merged long ago\n" });
+  const cursor = join(f.state, ".status-presentation-cursor");
+  writeFileSync(cursor, "cursor 1\n");
+  const first = f.run();
+  assert.ok(first.id, "decisions are presented once as a receipt");
+  writeFileSync(cursor, "cursor 2 after an unrelated crew appended a status line\n");
+  const done = f.run("complete", first.id!);
+  assert.equal(done.id, null, "the same open decision is not a new event");
+  assert.equal(existsSync(join(f.state, ".bb-wake-receipt.json")), false);
+  writeFileSync(cursor, "cursor 3\n");
+  const again = f.run();
+  assert.equal(again.id, null, "a later read with the same open decision needs no handling");
+  assert.equal(existsSync(join(f.state, ".bb-wake-receipt.json")), false);
+});
+
+test("an open decision that changed or reopened after resolution is presented again", (t) => {
+  const f = fixture(t, { persistent: "OPEN DECISIONS:\nold decision\n" });
+  const first = f.run();
+  f.run("complete", first.id!);
+  f.update({ persistent: "OPEN DECISIONS:\nnew decision\n" });
+  const changed = f.run();
+  assert.ok(changed.id);
+  assert.match(changed.report, /new decision/);
+  f.run("complete", changed.id!);
+  f.update({ persistent: "" });
+  assert.equal(f.run().id, null);
+  f.update({ persistent: "OPEN DECISIONS:\nnew decision\n" });
+  assert.ok(f.run().id, "a decision that closed and reopened is new again");
+});
+
 test("completing a wake with already presented open decisions needs no second receipt", (t) => {
   const f = fixture(t, { queue: [{ seq: 1, text: "worker finished" }], persistent: "OPEN DECISIONS:\nwaiting for user's budget\n" });
   writeFileSync(join(f.state, ".status-presentation-cursor"), "stable native cursor\n");
@@ -513,6 +544,23 @@ test("real native mixed wake completes once while preserving its open decision",
   assert.equal(done.id, null);
   assert.equal(readFileSync(status, "utf8"), "blocked: waiting for approval\n");
   assert.equal(readFileSync(join(f.state, ".wake-queue"), "utf8"), "");
+});
+
+test("real native drain: an orphan's open decision is presented once, then never demands another receipt while crews keep writing status", { skip: !existsSync(join(nativeFixture, "bin/fm-wake-drain.sh")) }, (t) => {
+  const f = fixture(t);
+  const native = join(nativeFixture, "bin/fm-wake-drain.sh");
+  writeFileSync(join(f.state, "96b4c16c.status"), "blocked [at=1]: CI billing blocks the merged PR\n");
+  const other = join(f.state, "livecrew.status");
+  const first = f.run("receive", "", native);
+  assert.ok(first.id, "a new open decision is presented once as a receipt");
+  assert.match(first.report, /96b4c16c/);
+  // An unrelated crew appends status: native's presentation cursor moves, the decision does not.
+  writeFileSync(other, "working: still going\n");
+  const done = f.run("complete", first.id, native);
+  assert.equal(done.id, null, "the same open decision is not a new event");
+  writeFileSync(other, "working: still going\nworking: more\n");
+  assert.equal(f.run("receive", "", native).id, null, "a later drain of the same decision needs no handling");
+  assert.equal(existsSync(join(f.state, ".bb-wake-receipt.json")), false, "no journal is left for the stop hook to demand");
 });
 
 for (const phase of ["presenting", "acknowledging", "refreshing"]) {
