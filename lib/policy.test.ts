@@ -4,6 +4,8 @@ import {
   afkShouldSend,
   capPermission,
   crewPrompt,
+  LEFTOVER_TIMER_CONTRACT,
+  resolveFanoutCap,
   decisionDue,
   foldOpenDecisions,
   hasStatusProtocol,
@@ -338,4 +340,20 @@ test("crews are taught to wait in-turn and yield WAITING:, never a false DONE:",
   assert.match(text, /WAITING: <what you are waiting on>/);
   assert.match(text, /Never write DONE: for work that is not done/);
   assert.match(protocolNudgeText(1, 3), /WAITING: <what>/);
+});
+
+test("crews are taught not to leave timers that ping the captain with empty completions", () => {
+  const text = crewPrompt({ task: "fix login", parentThreadId: "thr_cap", shape: "ship", mode: "direct-PR", isolated: true });
+  assert.ok(text.includes(LEFTOVER_TIMER_CONTRACT));
+  assert.match(LEFTOVER_TIMER_CONTRACT, /never start your own timer/);
+  assert.match(LEFTOVER_TIMER_CONTRACT, /stop every timer, monitor, and background shell you started/);
+});
+
+test("fan-out cap is configurable past the old hard 10 and stays bounded", () => {
+  assert.equal(resolveFanoutCap(undefined), 10);
+  assert.equal(resolveFanoutCap("nope"), 10);
+  assert.equal(resolveFanoutCap(0), 10);
+  assert.equal(resolveFanoutCap(12), 12);
+  assert.equal(resolveFanoutCap(12.9), 12);
+  assert.equal(resolveFanoutCap(500), 50);
 });

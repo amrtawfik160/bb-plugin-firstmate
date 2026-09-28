@@ -1,0 +1,24 @@
+# Captain-session fixes: verification
+
+Evidence source: a long captain session (read-only: its `state/`, `.watch-*.log`,
+`procevent/`, and thread queues). Every fix names the mutation that kills its test.
+
+| # | Defect | Fix | Test that dies when the fix is reverted |
+| - | --- | --- | --- |
+| 3 | Receipt with only the same OPEN DECISIONS re-demanded handling; native's status cursor moves whenever *any* crew appends a line, so the old "cursor unchanged" test never held. | `bb-wake-receipt.py` keys repeat suppression on a digest of the OPEN DECISIONS text (`.bb-open-decisions-presented`), never on the cursor. A changed or reopened decision is still presented. | `scripts/wake-receipt.test.ts` "open decisions already presented never demand a second receipt…", "an open decision that changed or reopened…", and the real-native "orphan's open decision is presented once…" (reverting `bb-wake-receipt.py` fails all three). |
+| 1 | Archived thread kept a live `.meta`; `fm_backend_bb_agent_state` read an idle-but-archived thread as `alive`, so fm-watch escalated "possible wedge" forever. | Archived/deleted thread → `missing`, which native reports once and absorbs. | `server.test.ts` "BB endpoint liveness…" (archived/deleted cases). |
+| 2 | Orphan decisions re-printed on every drain. | Post-drain sweep appends `resolved [key=…]` for metaless, registry-absent, quiet (>1h) status logs. | `server.test.ts` "wake drain closes open decisions of a crew that is gone…" (killed by removing the sweep call and by removing the register check); `lib/orphan-decisions.test.ts`. |
+| 8 | Leftover crew timers wake the crew; BB pings the captain "completed" and no plugin hook can drop that ping. | Crew contract (`LEFTOVER_TIMER_CONTRACT`, mirrored in `bb.sh`) forbids self-armed timers and requires stopping them before a verdict. | `lib/policy.test.ts`, `server.test.ts` "real spawn brief carries the same leftover-timer rule…". Behavioural effect depends on crews following the contract; the ping itself is unchanged. |
+| 9 | Fan-out / watch batch hard-capped at 10. | `maxFanout` setting (default 10, ceiling 50). | `lib/policy.test.ts` "fan-out cap is configurable…". |
+| 5 | Queue dispatch of a native row used `show` (title cut at ~80 chars). A 504 during creation read as "no orphan". | `show --full` plus body as detail; a still-truncated row refuses. Orphan discovery retries transient failures. | `server.test.ts` "queue dispatch of a native row reads the FULL task text…", "real transport adopts the created thread when BB answers 504…". |
+| 4 | `reconcileExternallyLanded` retired any idle crew whose environment showed a merged PR, including a DONE ops scout. | Only ships are retired by external landing. | `server.test.ts` "bearings never retires a DONE scout…". Root cause by code-read; the crew record was already gone when investigated. |
+| 6 | Native rows could not be dropped; finished KV items were listed forever. | `queue drop/done` close a native row; `queue prune`; finished items leave the list. | `server.test.ts` "queue drop closes a hand-filed native backlog row…". |
+| 7 | Lavish sources whose artifact worktree was removed re-reported `launch-failed` each cycle. | Post-drain sweep retires them with native `fm-procevent.sh retire` (native still refuses an unacknowledged round). | `server.test.ts` "wake drain retires a Lavish source…", `lib/orphan-decisions.test.ts`. Live: real `fm-procevent.sh retire` on a scratch state removed the source. |
+| 10 | Steer of an idle crew "queued" and never started a turn: our own dispatch hook rejects stale WAITING resumes, which stay as failed queued rows ahead of the steer. | Purge failed stale resumes before a steer; a deferred steer is reported as NOT delivered. | `server.test.ts` "steering an idle crew first removes…", "a steer BB defers is reported as not delivered…". Root cause from the crew thread's queue (six failed resume rows); not reproduced by steering the live crew. |
+| 11 | Plain forget left the thread alive; leftover monitors woke it. | Forget stops an idle thread's runtime and warns when a turn is running. | `server.test.ts` "forget without stop releases an idle thread…", "…warns clearly when the crew thread is still running". |
+| 12 | Forget/dispatch host failures partially applied without saying so. | Transient host/BB errors retry; a persisting failure names what applied and keeps the crew record so a retry finishes. | `server.test.ts` "forget retries a transient host failure…". |
+
+Not run: a live dispatch against a connected host (no deploy to the live host was done).
+`server.test.ts` has a pre-existing hang in "a startup gap rebases stale watch rows…" when the
+whole file runs in order (identical on the base commit); it passes alone and was excluded from
+full runs with `--test-name-pattern`.

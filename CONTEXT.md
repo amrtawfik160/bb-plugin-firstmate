@@ -84,6 +84,12 @@ _Avoid_: "DONE: not done yet".
 A captain wake kept back while the captain cannot take a turn (provider limit, thread
 in error) and released as one consolidated wake when it can.
 
+**Orphan decision**:
+An open `needs-decision`/`blocked` line in a status log whose crew is gone (no register
+record, no native `.meta`, quiet for over an hour). Native folds such a log as kind
+`unknown`, which never terminal-collapses, so the wake drain re-printed it forever; the
+plugin appends a closing `resolved` line instead of leaving it open.
+
 **Inbox record**:
 A durable message file in a crew's inbox. The crew acknowledges by moving the file
 to `handled/` — the move IS the acknowledgement.

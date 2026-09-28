@@ -333,6 +333,12 @@ fm_backend_bb_ci_poll_rule() {
   printf '%s' "Never poll CI in a loop: do not run gh run watch, gh-axi run watch, or repeated gh pr checks / gh-axi pr checks loops; they burn the GitHub token every crew shares. When waiting on CI, run gh pr checks <url> once at most every 5 minutes, or end your turn and let firstmate's PR check wake you. When rate-limited, read gh api rate_limit including .resources.graphql, not only core."
 }
 
+# A crew's own timer or monitor firing after its verdict wakes it for an empty turn,
+# and BB pings the captain "completed" for that turn (no hook can drop the ping).
+fm_backend_bb_leftover_timer_rule() {
+  printf '%s' "Firstmate's scheduled resume is the only wake after a WAITING: yield: never start your own timer, sleep loop, or monitor to wake yourself. Before you end a turn with a verdict or WAITING:, stop every timer, monitor, and background shell you started; a leftover one wakes you again and pings the captain with an empty completion. If an old timer still wakes you and nothing changed, end the turn with no reply text."
+}
+
 fm_backend_bb_create_task() {  # <window-name> <project-path> <task-id> <kind> <brief-path>
   local name=$1 project=$2 id=$3 kind=$4 brief=$5
   local project_id prompt out thread_id wt_path parent perm vis machine tries fm_bin
@@ -355,6 +361,7 @@ $prompt"
   prompt="You are a firstmate ${kind:-ship} crewmate running inside BB.
 Do not dispatch nested crews. Work only this task. End with DONE:, BLOCKED:, or FAILED:.
 Waiting on a long external run (no-mistakes pipeline, CI, deploy) is not a finish: keep waiting inside this turn with bounded re-checks. Only if you must end the turn before its result, start the reply with WAITING: <what you are waiting on>; firstmate resumes you later. Never write DONE: for work that is not done.
+$(fm_backend_bb_leftover_timer_rule)
 Use gh-axi for GitHub and lavish-axi for visual review. For browser work use the /browser skill and browser_script (or bb browser script), leaving profileId unset for this thread's isolated default profile. This overrides native chrome-devtools-axi instructions; do not use the AXI browser or install its hooks. Read current --help. In no-mistakes mode, drive the real no-mistakes axi pipeline as its worker owner.
 Firstmate home: ${FM_HOME:-}. Run every firstmate script from $fm_bin/ (the BB-capable scripts); where anything names bin/fm-*.sh, use $fm_bin/fm-*.sh instead, because the native bin/ copies do not know the bb backend and refuse BB tasks. Use $fm_bin/fm-tasks-axi.sh for backlog work. For a Lavish board, read its config/lavish-axi-host if present and set LAVISH_AXI_HOST on the open command; BB does not inherit the launcher's shell exports. Open the artifact, then arm $fm_bin/fm-procevent-lavish.sh with --for $id. Do not start a second poller.
 $(fm_backend_bb_ci_poll_rule)
@@ -763,6 +770,22 @@ fm_backend_bb_agent_state() {  # <thread-id>
   local id out status
   id=$(fm_backend_bb_thread_id "$1")
   out=$(fm_backend_bb_show "$id" 2>/dev/null) || { printf 'unreadable'; return 0; }
+  # An archived or deleted thread is retired for good: it never moves again, so
+  # the watcher must read it as an endpoint that is gone (reported once, then
+  # absorbed) instead of an idle session that keeps escalating as a wedge.
+  if printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+if isinstance(data, dict) and isinstance(data.get("thread"), dict):
+    data = data["thread"]
+sys.exit(0 if isinstance(data, dict) and (data.get("archivedAt") is not None or data.get("deletedAt") is not None) else 1)
+' 2>/dev/null; then
+    printf 'missing'
+    return 0
+  fi
   status=$(printf '%s' "$out" | fm_backend_bb_json_field status 2>/dev/null || true)
   # Idle is a resumable BB session, not a dead native endpoint.
   case "$status" in

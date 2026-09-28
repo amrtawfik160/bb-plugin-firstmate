@@ -498,6 +498,11 @@ export const CI_POLL_CONTRACT = "Never poll CI in a loop: do not run gh run watc
 // wait inside the turn; a yield that cannot be avoided is WAITING:, never a false DONE:.
 export const WAITING_PROTOCOL = "Waiting on a long external run (no-mistakes pipeline, CI, deploy) is not a finish: keep waiting inside this turn with bounded re-checks. Only if you must end the turn before its result, start the reply with WAITING: <what you are waiting on> instead of a verdict; firstmate resumes you later to re-check it. Never write DONE: for work that is not done.";
 
+// A crew's own timer, sleep loop or monitor fires after its verdict, wakes the crew for
+// an empty turn, and BB pings the captain "completed" for it: no plugin hook can drop
+// that ping, so the crew must not leave the timer running.
+export const LEFTOVER_TIMER_CONTRACT = "Firstmate's scheduled resume is the only wake after a WAITING: yield: never start your own timer, sleep loop, or monitor to wake yourself. Before you end a turn with a verdict or WAITING:, stop every timer, monitor, and background shell you started; a leftover one wakes you again and pings the captain with an empty completion. If an old timer still wakes you and nothing changed, end the turn with no reply text.";
+
 export const SECRET_HYGIENE_CONTRACT = "Never print production secrets: do not run env list/get against production (e.g. convex env list --prod), printenv, or credential dumps, and never echo credential values. Reference variable names only.";
 
 // Stuck ladder: a relaunch is the replacement step; the second failure is reported,
@@ -506,6 +511,16 @@ export const MAX_CREW_RELAUNCHES = 1;
 
 // Default ceiling on concurrently running crews per captain (0 = no cap).
 export const DEFAULT_MAX_ACTIVE_CREWS = 5;
+
+// Crews per fan-out dispatch and per watch batch. The default was a hard 10 while a
+// captain approved 12; a configured value is honored up to the register ceiling.
+export const DEFAULT_MAX_FANOUT = 10;
+export const MAX_FANOUT_CEILING = 50;
+export function resolveFanoutCap(raw: unknown): number {
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(n) || n < 1) return DEFAULT_MAX_FANOUT;
+  return Math.min(MAX_FANOUT_CEILING, Math.trunc(n));
+}
 
 // BB rejects retry reasons over 200 characters; a long captain note must not
 // turn a retry into an error.
@@ -548,6 +563,7 @@ export function crewPrompt(input: {
     "  FAILED: <what failed + evidence>",
     "Then the detail. Keep it sparse: outcomes and blockers only, no progress narration.",
     WAITING_PROTOCOL,
+    LEFTOVER_TIMER_CONTRACT,
     "",
   ];
   const tail =
