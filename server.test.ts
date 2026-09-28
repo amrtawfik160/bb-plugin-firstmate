@@ -95,6 +95,8 @@ test("crews get no dispatch tools", async () => {
     // Crews ran `gh-axi run watch` / `pr checks` loops and drained the shared GitHub token.
     assert.match(cfg.instructions ?? "", /Never poll CI in a loop/);
     assert.match(cfg.instructions ?? "", /at most every 5 minutes/);
+    // A leftover timer re-wakes a finished crew and pings the captain with an empty completion.
+    assert.ok((cfg.instructions ?? "").includes(LEFTOVER_TIMER_CONTRACT), "crew instructions carry the leftover-timer contract");
     assert.match(cfg.instructions ?? "", /\.resources\.graphql/);
     // Crews must run the BB-capable mirror, not native bin/ (no bb backend there).
     assert.match(cfg.instructions ?? "", /bin-bb\/fm-procevent-lavish\.sh arm/);
@@ -2108,6 +2110,37 @@ test("forget retries a transient host failure and names what is left when it sti
     assert.match(result.stderr, /PARTIALLY applied/);
     assert.match(result.stderr, /run firstmate_forget again to finish/);
     assert.equal(((await host.bb.storage.kv.get("crews")) as unknown[]).length, 1, "the crew record stays so a retry can finish");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("forget finishes when a transient error hid an rm that applied and the retry finds the row gone", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate", agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", queueOwner: "real", fmHostId: "host_1" },
+  });
+  await plugin(host.bb);
+  try {
+    let rmCalls = 0;
+    stubRoutedHost(host, (wrapped) => {
+      const cmd = unwrapHostCommand(wrapped);
+      if (cmd.includes("fm-tasks-axi.sh") && cmd.includes("'rm'")) {
+        return ++rmCalls === 1
+          ? { payload: "HTTP 504: Timed out reading terminal output", code: 1 }
+          : { payload: "error: NOT_FOUND: no task c1", code: 1 };
+      }
+      return {};
+    });
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: null }));
+    host.harness.sdk.stub("threads.stop", async () => ({}));
+    await host.bb.storage.kv.set("crews", [{ ...shipRow("c1", "thr_crew", "thr_cap"), nativeHome: "/tmp/fm-home", backlogRow: true }]);
+    const result = await host.harness.behavior.runCli(["forget", "c1"], { threadId: "thr_cap" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.ok(rmCalls >= 2, `the transient failure was retried (saw ${rmCalls} attempts)`);
+    assert.doesNotMatch(result.stderr, /PARTIALLY applied/);
+    assert.equal(((await host.bb.storage.kv.get("crews")) as unknown[]).length, 0, "the crew record is removed");
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -9083,6 +9116,111 @@ test("real transport adopts the created thread when BB answers 504 while the cre
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0, "no duplicate spawn");
     assert.ok(listCalls >= 3, "the transient listing failure was retried, not read as no orphan");
     assert.equal((await crewsKv(host))[0]?.threadId, "thr_orphan");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("queue dispatch of a native row splits a long title into a short title and detail, keeping the body", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate", agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", queueOwner: "real", fmHostId: "host_1" },
+  });
+  await plugin(host.bb);
+  const full = `${"Investigate the flaky export job. ".repeat(20)}TAILMARK-9Z`;
+  assert.ok(full.length > 500, "the title is over the 500 char title limit");
+  try {
+    stubRoutedHost(host, (wrapped) => {
+      const cmd = unwrapHostCommand(wrapped);
+      if (cmd.includes("fm-tasks-axi.sh") && cmd.includes("'show'")) {
+        return { payload: `task:\n  id: oq-a\n  title: ${JSON.stringify(full)}\n  state: queued\n  kind: ship\n  body: ${JSON.stringify("BODYMARK-7Q extra context")}\n` };
+      }
+      return {};
+    });
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew" }));
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "starting", environmentId: "env_wt" }));
+    host.harness.sdk.stub("environments.get", async () => ({ id: "env_wt", hostId: "host_1", path: "/wt", isWorktree: true, status: "ready" }));
+    const dispatched = await agentTool(host, "firstmate_queue").execute({ action: "dispatch", queueId: "oq-a" }, { threadId: "thr_cap", projectId: "proj_1" } as never);
+    assert.ok(!isToolError(dispatched), toolText(dispatched));
+    const spawn = host.harness.sdk.callsTo("threads.spawn")[0]![0] as { prompt?: string; title?: string };
+    assert.ok(spawn.prompt?.includes("TAILMARK-9Z"), "the title overflow past 500 chars reaches the brief as detail");
+    assert.ok(spawn.prompt?.includes("BODYMARK-7Q extra context"), "the row body reaches the brief");
+    assert.ok(!(spawn.title ?? "").includes("TAILMARK-9Z"), "the thread title stays short");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("real transport re-looks for the thread after a 504 spawn failure and adopts it once it appears", async () => {
+  const host = realHost();
+  await plugin(host.bb);
+  try {
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_native" }));
+    const captured = stubOrphanTransportHost(host, { byTitle: false });
+    const cmds = new Map<string, string>();
+    let terms = 0;
+    host.harness.sdk.stub("terminals.create", async (args: { start?: { command?: string } }) => {
+      const id = `term_${++terms}`;
+      const cmd = args.start?.command ?? "";
+      cmds.set(id, cmd);
+      const m = /\/state\/([A-Za-z0-9]+)\.meta/.exec(cmd);
+      if (m) captured.taskId = m[1]!;
+      return { id };
+    });
+    // fm-spawn fails with a gateway timeout; the recorded thread id is absent.
+    host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
+      const cmd = cmds.get(args.terminalId) ?? "";
+      if (cmd.includes("bb_thread_id")) return hostRcPayload("FM_META_ABSENT", 0);
+      if (cmd.includes("fm-spawn")) return hostRcPayload("HTTP 504 Gateway Timeout", 1);
+      return hostRcPayload("", 0);
+    });
+    // The thread only shows up after the first look (filtered + broad pass) came back empty.
+    let listCalls = 0;
+    host.harness.sdk.stub("threads.list", async () => {
+      listCalls++;
+      return listCalls <= 2 ? [] : [{ id: "thr_late", projectId: "proj_1", parentThreadId: "thr_cap", title: "renamed-window" }];
+    });
+    const result = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--", "fix flaky login"], { projectId: "proj_1" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0, "no duplicate spawn");
+    assert.ok(listCalls >= 3, `the thread was looked for again after the failed spawn (saw ${listCalls} list calls)`);
+    assert.equal((await crewsKv(host))[0]?.threadId, "thr_late");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("maxFanout caps a fan-out dispatch and a watch batch", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate", agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", maxFanout: 2 },
+  });
+  await plugin(host.bb);
+  try {
+    const refused = await host.harness.behavior.runCli(
+      ["dispatch", "--project", "proj_1", "--task", "one", "--task", "two", "--task", "three"],
+      { projectId: "proj_1", threadId: "thr_cap" },
+    );
+    assert.equal(refused.exitCode, 1);
+    assert.match(refused.stderr, /Too many tasks \(max 2;/);
+    await host.bb.storage.kv.set("crews", [
+      crewRow("c1", "thr_1", "thr_cap"),
+      crewRow("c2", "thr_2", "thr_cap"),
+      crewRow("c3", "thr_3", "thr_cap"),
+    ]);
+    host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) =>
+      makeThreadResponse({ id: threadId, status: "idle", projectId: "proj_1" }));
+    host.harness.sdk.stub("threads.output", async () => ({ output: "DONE: shipped" }));
+    const watch = await agentTool(host, "firstmate_watch").execute({}, { threadId: "thr_cap", projectId: "proj_1" } as never);
+    const text = toolText(watch);
+    assert.match(text, /c1 \[idle\]/);
+    assert.match(text, /c2 \[idle\]/);
+    assert.doesNotMatch(text, /c3 \[/, "a watch batch stops at maxFanout");
+    const cliWatch = await host.harness.behavior.runCli(["watch"], { threadId: "thr_cap", projectId: "proj_1" });
+    assert.equal(cliWatch.exitCode, 0, cliWatch.stderr);
+    assert.match(cliWatch.stdout, /c2 \[idle\]/);
+    assert.doesNotMatch(cliWatch.stdout, /c3 \[/, "the CLI watch batch stops at maxFanout");
   } finally {
     await host.harness.lifecycle.dispose();
   }

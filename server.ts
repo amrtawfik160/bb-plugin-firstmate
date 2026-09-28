@@ -5673,7 +5673,7 @@ export default async function plugin(bb: BbPluginApi) {
       try {
         await withTransientRetry(() => dropFmMeta(crew));
         // forget/drop removes the crew's own backlog row (dropped on forget, C1).
-        await withTransientRetry(() => realBacklogTransitionForCrew(crew, "rm"));
+        await withTransientRetry(() => realBacklogTransitionForCrew(crew, "rm", true));
         // Native teardown retires checks/sidecars itself; this path must do it too.
         const leftover = await withTransientRetry(() => retireNativeTaskState(crew));
         if (leftover !== "") notes.push(`WARN: ${leftover}`);
@@ -7260,10 +7260,13 @@ export default async function plugin(bb: BbPluginApi) {
   // are not backlog items. Best-effort: an already-terminal or absent row just logs
   // (rm of a missing row is harmless). runTasksAxi still needs fmHome+host; if
   // unreachable it logs and the row is closed on the next reconcile.
-  async function realBacklogTransitionForCrew(crew: Crew, verb: "done" | "rm"): Promise<void> {
+  // `missingIsDone`: a NOT_FOUND on rm means the row is already gone, e.g. a transient
+  // error hid an rm that applied and the retry finds nothing — the goal state, not a failure.
+  async function realBacklogTransitionForCrew(crew: Crew, verb: "done" | "rm", missingIsDone = false): Promise<void> {
     if (isSecondmateRoute(crew)) return;
     if (crew.backlogRow !== true) return;
     const res = await runTasksAxi([verb, crew.id], { projectId: crew.projectId, home: await crewNativeHome(crew) });
+    if (missingIsDone && verb === "rm" && res !== null && res.exitCode !== 0 && /NOT_FOUND/.test(res.output)) return;
     requireNativeSuccess(res, `backlog ${verb}`);
   }
 
