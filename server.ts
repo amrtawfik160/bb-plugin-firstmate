@@ -104,6 +104,8 @@ const crewSchema = z.object({
   // Last PR url seen for this crew (BB environment PR, gh by branch, or the crew's own
   // report). Lets merge/forget/ownership checks resolve a PR the environment cache misses.
   prUrl: z.string().optional(),
+  // true = `task` holds only a prefix; the full brief lives under crew-task:<id>.
+  taskSpilled: z.boolean().optional(),
   createdAt: z.string(),
 });
 type Crew = z.infer<typeof crewSchema>;
@@ -244,6 +246,10 @@ function pushHeld(held: string[], text: string): { held: string[]; evicted: stri
 }
 
 const CREWS_KEY = "crews";
+// BB caps one KV value at 256 KiB. Full briefs made the register overflow it at a few
+// hundred crews and every dispatch failed, so the register keeps a prefix only.
+const CREW_TASK_PREFIX = "crew-task:";
+const TASK_INLINE_MAX = 300;
 const QUEUE_KEY = "queue";
 const DECISIONS_KEY = "decisions";
 const DONE_KEY = "done";
@@ -1954,10 +1960,28 @@ export default async function plugin(bb: BbPluginApi) {
     crewMutation = new Promise<void>(resolve => { release = resolve; });
     await previous;
     try {
-      const crews = await update(await readCrews());
+      const crews = await spillTasks(await update(await readCrews()));
       await bb.storage.kv.set(CREWS_KEY, crews);
       return crews;
     } finally { release(); }
+  }
+  async function spillTasks(crews: Crew[]): Promise<Crew[]> {
+    const out: Crew[] = [];
+    for (const crew of crews) {
+      if (crew.task.length <= TASK_INLINE_MAX) {
+        out.push(crew);
+        continue;
+      }
+      await bb.storage.kv.set(`${CREW_TASK_PREFIX}${crew.id}`, crew.task);
+      out.push({ ...crew, task: crew.task.slice(0, TASK_INLINE_MAX), taskSpilled: true });
+    }
+    return out;
+  }
+  // The full brief, for the few paths that re-send it (relaunch, brief publish, context).
+  async function fullCrewTask(crew: Crew): Promise<string> {
+    if (crew.taskSpilled !== true) return crew.task;
+    const full = await bb.storage.kv.get<unknown>(`${CREW_TASK_PREFIX}${crew.id}`);
+    return typeof full === "string" && full.startsWith(crew.task) ? full : crew.task;
   }
   async function readCrews(): Promise<Crew[]> {
     // MAX_CREWS bounds one supervision pass, never the durable register.
@@ -1970,7 +1994,10 @@ export default async function plugin(bb: BbPluginApi) {
       await bb.storage.kv.set(`crew-retired:${crew.threadId}`, true);
       return crews.filter(c => c.id !== crew.id || c.threadId !== crew.threadId);
     });
-    await clearWaiting(crew.id).catch(() => {});
+    if (crew.taskSpilled === true && !(await readCrews()).some((c) => c.id === crew.id)) {
+      await bb.storage.kv.delete(`${CREW_TASK_PREFIX}${crew.id}`).catch(() => {});
+    }
+    if (await clearWaiting(crew.id).catch(() => false)) await dropResumeRows(crew, "all");
     if (!isSecondmateRoute(crew)) {
       try {
         await bb.sdk.threads.updatePluginMetadata({ threadId: crew.threadId, set: { crew: "false" }, remove: ["crewId"] });
@@ -2692,6 +2719,12 @@ export default async function plugin(bb: BbPluginApi) {
   // turn. Drop the failed stale resumes before steering or retrying.
   async function purgeStaleResumeRows(crew: Crew): Promise<number> {
     if (await isCrewWaiting(crew)) return 0;
+    return dropResumeRows(crew, "failed");
+  }
+
+  // "failed" drops only rejected resumes; "all" also cancels a still-scheduled one, so a
+  // crew never holds more than one pending resume and a finished crew holds none.
+  async function dropResumeRows(crew: Pick<Crew, "id" | "threadId">, which: "failed" | "all"): Promise<number> {
     let rows: Awaited<ReturnType<typeof bb.sdk.threads.queuedMessages.list>>;
     try {
       rows = await bb.sdk.threads.queuedMessages.list({ threadId: crew.threadId });
@@ -2700,7 +2733,8 @@ export default async function plugin(bb: BbPluginApi) {
     }
     let purged = 0;
     for (const row of rows) {
-      const stale = typeof row.failureReason === "string" && row.failureReason !== ""
+      const failed = typeof row.failureReason === "string" && row.failureReason !== "";
+      const stale = (which === "all" || failed)
         && row.content.length === 1 && row.content[0]?.type === "text"
         && row.content[0].text.trimStart().startsWith(WAIT_RESUME_PREFIX);
       if (!stale) continue;
@@ -2711,7 +2745,7 @@ export default async function plugin(bb: BbPluginApi) {
         bb.log.warn(`stale resume row ${row.id} not removed crew=${crew.id}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
-    if (purged > 0) bb.log.info(`removed ${purged} failed stale WAITING resume row(s) ahead of crew ${crew.id}`);
+    if (purged > 0) bb.log.info(`removed ${purged} ${which === "failed" ? "failed stale" : "pending"} WAITING resume row(s) for crew ${crew.id}`);
     return purged;
   }
 
@@ -3514,7 +3548,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (crew.metaWritten === false) {
         await mutateCrews(crews => crews.map((c) => (c.id === crew.id ? { ...c, metaWritten: undefined } : c)));
       }
-      await publishFmBrief(crew, undefined, crew.task);
+      await publishFmBrief(crew, undefined, await fullCrewTask(crew));
       imported.push(crew.id);
     }
     return { total: crews.length, imported, skippedExisting, skippedSecondmate, skippedTerminal, failed };
@@ -4033,9 +4067,28 @@ export default async function plugin(bb: BbPluginApi) {
 
   // A spawned crew whose thread is already in error never started; say so instead
   // of reporting the dispatch as a success.
-  function dispatchStatusNote(status: string): string {
+  function dispatchStatusNote(status: string, failure = ""): string {
+    if (status === "error" && failure !== "") return ` FAILED: BB reports "${failure}". Fix that cause, then firstmate_forget stop=true and dispatch again.`;
     if (status === "error") return " FAILED: the thread is already in error (bad provider/model, or BB refused the launch). Read it with firstmate_crew, then firstmate_forget stop=true and dispatch again.";
     if (status === "pending") return " PENDING: every BB host thread slot is busy; the crew starts on its own when a slot frees. It is tracked now (firstmate_crew / firstmate_watch work).";
+    return "";
+  }
+
+  // BB's own reason a thread is in error (provisioning, provider), e.g. "Provisioning
+  // thread failed: Host is not connected", so a failed dispatch names its real cause.
+  async function threadFailureDetail(threadId: string): Promise<string> {
+    try {
+      const rows = await raceAbort(bb.sdk.threads.events.list({
+        threadId, order: "desc", limit: "20", types: ["system/error", "provider/error"],
+      }), undefined, STUCK_HOST_CALL_MS);
+      for (const row of rows) {
+        const data = asRecord(row.data);
+        const parts = [data["message"], data["detail"]].filter((v): v is string => typeof v === "string" && v.trim() !== "");
+        if (parts.length > 0) return truncate(parts.join(": "), 300);
+      }
+    } catch {
+      // the generic note still applies
+    }
     return "";
   }
 
@@ -4252,9 +4305,10 @@ export default async function plugin(bb: BbPluginApi) {
     // Release the old thread first so the environment is free to reuse.
     try { await bb.sdk.threads.stop({ threadId: crew.threadId }); } catch { /* best effort */ }
     const note = (opts.note ?? "").trim();
+    const task = await fullCrewTask(crew);
     const prompt = [
       crewPrompt({
-        task: crew.task,
+        task,
         parentThreadId: crew.parentThreadId ?? undefined,
         shape: crew.shape,
         mode: toMode(crew.posture, "direct-PR"),
@@ -4267,7 +4321,7 @@ export default async function plugin(bb: BbPluginApi) {
       projectId: crew.projectId,
       environment: { type: "reuse", environmentId: envId },
       prompt,
-      title: crewThreadTitle(crew.task, crew.shape, crew.id, crew.title),
+      title: crewThreadTitle(task, crew.shape, crew.id, crew.title),
       parentThreadId: crew.parentThreadId ?? undefined,
       providerId,
       model,
@@ -4278,7 +4332,7 @@ export default async function plugin(bb: BbPluginApi) {
         crew: "true",
         crewId: crew.id,
         nativeHome: crew.nativeHome ?? "",
-        task: crew.task.slice(0, 500),
+        task: task.slice(0, 500),
         ...(crew.title !== undefined ? { title: crew.title } : {}),
         shape: crew.shape,
         posture: crew.posture,
@@ -4475,16 +4529,21 @@ export default async function plugin(bb: BbPluginApi) {
   const STEER_PREFIX =
     "STEER from captain — this is a course correction, NOT a stop. Keep working on your current task and fold this in without tearing down or discarding work: ";
 
-  async function retryCrewTurn(crew: Crew, reason: string | undefined): Promise<void> {
+  // BB retries a RetriableError turn on its own; the captain's retry usually lands
+  // after the crew is already running again, which is success, not an error.
+  async function retryCrewTurn(crew: Crew, reason: string | undefined): Promise<string> {
     await ensureWorkspace(crew.threadId, crew);
     try {
       await withSessionRepair(crew.threadId, () => bb.sdk.threads.retry({
         threadId: crew.threadId,
         reason: retryReason(reason, crew.id),
       }));
+      return `Retried crew ${crew.id}`;
     } catch (error) {
       const failure = bbFailure(error);
-      if (failure.code === "no_failed_turn" || failure.code === "retry_already_queued") {
+      if (failure.code === "retry_already_queued") return `Crew ${crew.id} already has a retry queued; nothing to do.`;
+      if (failure.code === "no_failed_turn") {
+        if (await crewInTurn(crew)) return `Crew ${crew.id} is already running again (BB resumed it); no retry needed.`;
         throw new Error(`${failure.code}: ${failure.message}`);
       }
       throw error;
@@ -5577,8 +5636,16 @@ export default async function plugin(bb: BbPluginApi) {
             result = { ...result, output: `${result.output.trim()}\ncaptain-hold complete --none refused: ${gate.output.trim()}` };
           }
         }
-        requireNativeSuccess(result, `teardown ${crew.id} (crew retained for retry)`);
-        nativeTeardown = true;
+        // No native task record (spawn never wrote it, or native already retired it):
+        // there is nothing native to tear down, so BB-side cleanup below takes over.
+        const noRecord = result.exitCode !== 0
+          && new RegExp(`task record is not a regular file at \\S*/state/${crew.id}\\.meta\\b`).test(result.output);
+        if (noRecord) {
+          notes.push("no native task record; cleaned up on the BB side");
+        } else {
+          requireNativeSuccess(result, `teardown ${crew.id} (crew retained for retry)`);
+          nativeTeardown = true;
+        }
       }
     }
     if (stop && !nativeTeardown) {
@@ -8259,7 +8326,7 @@ export default async function plugin(bb: BbPluginApi) {
       const warn = wt.sharedOverride ? " WARN: ship crew on shared env." : "";
       const status = await crewStatus(crew);
       if (status === "error") {
-        return toolError(`Dispatch of ${crew.shape} crew ${crew.id} (thread ${crew.threadId}) FAILED:${dispatchStatusNote(status)}`);
+        return toolError(`Dispatch of ${crew.shape} crew ${crew.id} (thread ${crew.threadId}) FAILED:${dispatchStatusNote(status, await threadFailureDetail(crew.threadId))}`);
       }
       return `Dispatched ${crew.shape} crew ${crew.id} as thread ${crew.threadId} (${status}, ${crew.posture}).${warn}${dispatchStatusNote(status)}${permissionLine(crew.id)} Track with: bb firstmate crew ${crew.id}`;
     },
@@ -8512,7 +8579,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (isSecondmateRoute(crew)) return toolError(`Crew ${crewId} is a secondmate route — do not stop the domain captain.`);
       if (await isCaptainThread(crew.threadId)) return toolError("Refusing to stop the captain thread.");
       await bb.sdk.threads.stop({ threadId: crew.threadId });
-      await clearWaiting(crew.id);
+      if (await clearWaiting(crew.id)) await dropResumeRows(crew, "all");
       return `Stopped crew ${crewId}`;
     },
   });
@@ -8538,8 +8605,7 @@ export default async function plugin(bb: BbPluginApi) {
         const capped = await capRefusalToWake(crew, overCap === true);
         if (capped !== null) return toolError(capped);
         if (!replace) {
-          await retryCrewTurn(crew, reason);
-          return `Retried crew ${crewId}`;
+          return await retryCrewTurn(crew, reason);
         }
         const next = await relaunchCrew(crew, {
           model,
@@ -8813,7 +8879,8 @@ export default async function plugin(bb: BbPluginApi) {
       await writeQueue(items);
       await publishFleet();
       const status = await crewStatus(crew);
-      return `Dispatched ${adopted ? "native backlog row" : "queue"} ${queueId} as ${crew.shape} crew ${crew.id} (${status}).${dispatchStatusNote(status)}${permissionLine(crew.id)}`;
+      const failure = status === "error" ? await threadFailureDetail(crew.threadId) : "";
+      return `Dispatched ${adopted ? "native backlog row" : "queue"} ${queueId} as ${crew.shape} crew ${crew.id} (${status}).${dispatchStatusNote(status, failure)}${permissionLine(crew.id)}`;
     },
   });
 
@@ -9091,7 +9158,7 @@ export default async function plugin(bb: BbPluginApi) {
       const crew = await findCrew(itemId);
       if (crew === undefined) throw new Error(`No crew ${itemId}`);
       const status = await crewStatus(crew);
-      return { context: `Crew ${crew.id} [${status}] ${crew.shape} thread ${crew.threadId}: ${crew.task}` };
+      return { context: `Crew ${crew.id} [${status}] ${crew.shape} thread ${crew.threadId}: ${await fullCrewTask(crew)}` };
     },
   });
 
@@ -9284,6 +9351,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const output = await crewOutput(crew);
     if (hasStatusProtocol(output) || isWaitingYield(output)) return;
+    if (await isCrewWaiting(crew) && await hasPendingResume(crew)) return;
     await applyProtocolNudge(crew);
   }
 
@@ -9300,20 +9368,36 @@ export default async function plugin(bb: BbPluginApi) {
     const row = (state ?? await readWaiting())[crew.id];
     return row !== undefined && row.generation === taskGeneration(crew) && row.count <= WAIT_RESUME_MAX;
   }
-  async function clearWaiting(crewId: string): Promise<void> {
+  async function clearWaiting(crewId: string): Promise<boolean> {
     const parsed = waitingRowSchema.safeParse(await bb.storage.kv.get<unknown>(WAITING_KEY));
-    if (!parsed.success || parsed.data[crewId] === undefined) return;
+    if (!parsed.success || parsed.data[crewId] === undefined) return false;
     const next = { ...parsed.data };
     delete next[crewId];
     await bb.storage.kv.set(WAITING_KEY, next);
+    return true;
+  }
+  async function hasPendingResume(crew: Crew): Promise<boolean> {
+    try {
+      const rows = await bb.sdk.threads.queuedMessages.list({ threadId: crew.threadId });
+      return rows.some((row) => !(typeof row.failureReason === "string" && row.failureReason !== "")
+        && row.content.length === 1 && row.content[0]?.type === "text"
+        && row.content[0].text.trimStart().startsWith(WAIT_RESUME_PREFIX));
+    } catch {
+      return false;
+    }
   }
   async function handleWaitingYield(crew: Crew, text: string | null): Promise<void> {
     await dropNudge(crew.id);
+    // Background commands, inbox doorbells and steers each start a turn that can yield
+    // WAITING: again before the scheduled resume fires. Replace the pending resume
+    // instead of stacking another, and only a consumed resume spends the budget.
+    const replaced = await dropResumeRows(crew, "all");
     const parsed = waitingRowSchema.safeParse(await bb.storage.kv.get<unknown>(WAITING_KEY));
     const state = parsed.success ? { ...parsed.data } : {};
     const generation = taskGeneration(crew);
     const prev = state[crew.id];
-    const count = (prev !== undefined && prev.generation === generation ? prev.count : 0) + 1;
+    const base = prev !== undefined && prev.generation === generation ? prev.count : 0;
+    const count = replaced > 0 && base > 0 ? base : base + 1;
     state[crew.id] = { generation, count };
     await bb.storage.kv.set(WAITING_KEY, state);
     const what = truncate((text ?? "").replace(/\s+/g, " ").trim(), 200);
@@ -9330,7 +9414,7 @@ export default async function plugin(bb: BbPluginApi) {
         sendAt: Date.now() + WAIT_RESUME_MS,
         input: [{
           type: "text",
-          text: `${WAIT_RESUME_PREFIX} you reported WAITING on. Keep waiting inside this turn with bounded re-checks; when it resolves, finish and end with DONE:, BLOCKED:, or FAILED:. If it is still running when you must yield, end with WAITING: again.`,
+          text: `${WAIT_RESUME_PREFIX} you reported WAITING on. Check it once now. If it resolved, finish and end with DONE:, BLOCKED:, or FAILED:. If it is still running, either wait with blocking foreground re-checks at most every 5 minutes, or end with WAITING: again right away; never start a background timer, sleep, or monitor, since firstmate already resumes you.`,
           mentions: [],
         }],
       });
@@ -9369,8 +9453,13 @@ export default async function plugin(bb: BbPluginApi) {
       await handleWaitingYield(crew, lastAssistantText);
       return;
     }
-    await clearWaiting(crew.id);
-    if (!hasStatusProtocol(lastAssistantText)) {
+    if (hasStatusProtocol(lastAssistantText)) {
+      if (await clearWaiting(crew.id)) await dropResumeRows(crew, "all");
+    } else {
+      // A leftover timer or background command woke a parked crew, which ended with no
+      // verdict as its contract says. It is still waiting and its resume still stands.
+      if (await isCrewWaiting(crew) && await hasPendingResume(crew)) return;
+      await clearWaiting(crew.id);
       const outcome = await applyProtocolNudge(crew);
       if (outcome !== "off") return;
     }
@@ -9435,6 +9524,11 @@ export default async function plugin(bb: BbPluginApi) {
             const crew = (await readCrews()).find((c) => c.threadId === threadId);
             if (crew === undefined || !(await isCrewWaiting(crew))) {
               bb.log.info(`dropped a stale WAITING resume for thread ${threadId}: the crew is no longer waiting`);
+              // BB keeps a rejected row as a FAILED queue entry; clear it once the
+              // rejection has landed so it neither clutters the queue nor defers a steer.
+              setTimeout(() => {
+                void dropResumeRows(crew ?? { id: threadId, threadId }, "failed").catch(() => {});
+              }, 5_000).unref?.();
               return { action: "reject", message: "Firstmate: this crew is no longer waiting on an external run; the scheduled re-check was dropped." };
             }
           }
@@ -9798,10 +9892,12 @@ export default async function plugin(bb: BbPluginApi) {
                 `fm: bb firstmate fm peek -- ${dispatched.map((c) => c.id).join(" ")}`,
               );
             }
+            const failures = new Map<string, string>();
+            for (const c of dispatched) if (c.status === "error") failures.set(c.id, await threadFailureDetail(c.threadId));
             const text = [
               ...dispatched.map(
                 (c) =>
-                  `Dispatched ${c.shape} crew ${c.id} as thread ${c.threadId} [${c.status}] (${c.worktree ? "worktree" : "shared-env"}, ${c.posture})${dispatchStatusNote(c.status)}${permissionLine(c.id)}\nTrack: bb firstmate crew ${c.id}`,
+                  `Dispatched ${c.shape} crew ${c.id} as thread ${c.threadId} [${c.status}] (${c.worktree ? "worktree" : "shared-env"}, ${c.posture})${dispatchStatusNote(c.status, failures.get(c.id))}${permissionLine(c.id)}\nTrack: bb firstmate crew ${c.id}`,
               ),
               ...hints,
             ].join("\n");
@@ -9906,7 +10002,7 @@ export default async function plugin(bb: BbPluginApi) {
             if (isSecondmateRoute(crew)) return fail(`Crew ${id} is a secondmate route — do not stop the domain captain.`);
             if (await isCaptainThread(crew.threadId)) return fail("Refusing to stop the captain thread.");
             await bb.sdk.threads.stop({ threadId: crew.threadId });
-            await clearWaiting(crew.id);
+            if (await clearWaiting(crew.id)) await dropResumeRows(crew, "all");
             return reply({ stopped: true, id }, `Stopped crew ${id}`);
           }
           case "retry": {
@@ -9921,8 +10017,8 @@ export default async function plugin(bb: BbPluginApi) {
             const overCap = await capRefusalToWake(crew, flags.has("over-cap"));
             if (overCap !== null) return fail(overCap);
             if (model === undefined && providerId === undefined && reasoningLevel === undefined) {
-              await retryCrewTurn(crew, reason);
-              return reply({ retried: true, id }, `Retried crew ${id}`);
+              const outcome = await retryCrewTurn(crew, reason);
+              return reply({ retried: outcome.startsWith("Retried"), id }, outcome);
             }
             const next = await relaunchCrew(crew, { model, providerId, reasoningLevel, note: reason });
             return reply(
@@ -10648,10 +10744,13 @@ export default async function plugin(bb: BbPluginApi) {
   bb.background.service("captain-home-watch", {
     async start(signal) {
       const seen = new Map<string, Set<string>>();
+      // A deleted captain 404s forever; without this every pass logged it again.
+      const deletedCaptains = new Set<string>();
       while (!signal.aborted) {
         for (const key of await bb.storage.kv.list("native-home:")) {
           if (signal.aborted) break;
           const captain = key.slice("native-home:".length);
+          if (deletedCaptains.has(captain)) continue;
           try {
             await inCaptainHome(captain, async () => {
               const s = await settings.get();
@@ -10684,7 +10783,14 @@ export default async function plugin(bb: BbPluginApi) {
               await relayWatchReasons(extractWatchReasons(result.logTail), host, delivered, signal);
             });
           } catch (error) {
-            if (!signal.aborted) bb.log.warn(`captain home ${captain}: ${String(error)}`);
+            if (signal.aborted) continue;
+            if (/\bHTTP 404\b.*Thread not found/i.test(String(error))) {
+              deletedCaptains.add(captain);
+              seen.delete(captain);
+              bb.log.info(`captain home ${captain}: thread deleted; skipping it until the next reload`);
+              continue;
+            }
+            bb.log.warn(`captain home ${captain}: ${String(error)}`);
           }
         }
         await new Promise<void>(resolve => {

@@ -496,7 +496,10 @@ export const CI_POLL_CONTRACT = "Never poll CI in a loop: do not run gh run watc
 // Every crew turn end pings the captain (BB's own child-completed message), so a crew that
 // yields every few minutes while a pipeline runs burns a captain wake each time. Keep the
 // wait inside the turn; a yield that cannot be avoided is WAITING:, never a false DONE:.
-export const WAITING_PROTOCOL = "Waiting on a long external run (no-mistakes pipeline, CI, deploy) is not a finish: keep waiting inside this turn with bounded re-checks. Only if you must end the turn before its result, start the reply with WAITING: <what you are waiting on> instead of a verdict; firstmate resumes you later to re-check it. Never write DONE: for work that is not done.";
+// A harness that cannot block in the foreground (Claude Code blocks foreground sleep)
+// must not fake it with a background timer: the timer's completion is a new turn end
+// (another captain ping) and a second wake beside firstmate's own resume.
+export const WAITING_PROTOCOL = "Waiting on a long external run (no-mistakes pipeline, CI, deploy) is not a finish: keep waiting inside this turn only with blocking foreground re-checks, at most one every 5 minutes. If you cannot block in the foreground, or must end the turn before the result, do not start a background wait: start the reply with WAITING: <what you are waiting on> instead of a verdict, and firstmate resumes you in about 5 minutes to re-check it. Never write DONE: for work that is not done.";
 
 // A crew's own timer, sleep loop or monitor fires after its verdict, wakes the crew for
 // an empty turn, and BB pings the captain "completed" for it: no plugin hook can drop
