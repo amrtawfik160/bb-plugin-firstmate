@@ -44,6 +44,7 @@ import plugin, {
   rewriteWakeAckLine,
   toolbeltPhrase,
   versionAtLeast,
+  overlayFingerprint,
 } from "./server.ts";
 import { CI_POLL_CONTRACT, LEFTOVER_TIMER_CONTRACT, WAITING_PROTOCOL, latestStatus, statusProtocolSummary } from "./lib/policy.ts";
 import { UPSTREAM_SCRIPT_NAMES, PINNED_SCRIPT_SUPPORT_FILES, UPSTREAM_SKILL_NAMES } from "./lib/upstream-surface.ts";
@@ -2888,6 +2889,46 @@ test("installer --verify fails LOUD after an out-of-band fast-forward leaves the
   }
 });
 
+test("installer and plugin hash the same overlay fingerprint", () => {
+  const py = spawnSync("python3", ["-c", [
+    "import importlib.util, sys, pathlib",
+    "spec = importlib.util.spec_from_file_location('inst', sys.argv[1])",
+    "mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)",
+    "print(mod.overlay_fingerprint(pathlib.Path(sys.argv[2])), end='')",
+  ].join("\n"), join(OVERLAY_ROOT, "install-bb-backend.py"), OVERLAY_ROOT], { encoding: "utf8" });
+  assert.equal(py.status, 0, py.stderr);
+  assert.equal(py.stdout, overlayFingerprint(OVERLAY_ROOT));
+});
+
+test("installer --verify flags a mirror built from an older overlay, and a re-install heals it", (t) => {
+  const checkout = discoverFirstmateCheckout();
+  if (checkout === null) {
+    t.skip("no firstmate checkout discoverable (set FM_TEST_HOME to enable)");
+    return;
+  }
+  const work = mkdtempSync(join(tmpdir(), "fm-bb-overlay-"));
+  try {
+    const home = join(work, "home");
+    const skip = cloneAtPatchBase(checkout, home);
+    if (skip) {
+      t.skip(skip);
+      return;
+    }
+    const older = join(work, "overlay-old");
+    cpSync(OVERLAY_ROOT, older, { recursive: true });
+    writeFileSync(join(older, "bin", "backends", "bb.sh"), readFileSync(join(older, "bin", "backends", "bb.sh"), "utf8") + "\n# older adapter\n");
+    const installer = join(OVERLAY_ROOT, "install-bb-backend.py");
+    assert.equal(spawnSync("python3", [installer, "--home", home, "--overlay", older]).status, 0);
+    const stale = spawnSync("python3", [installer, "--home", home, "--overlay", OVERLAY_ROOT, "--verify"], { encoding: "utf8" });
+    assert.notEqual(stale.status, 0, "a mirror from an older overlay must not verify as healthy");
+    assert.match(stale.stderr, /overlay changed since the mirror was built/);
+    assert.equal(spawnSync("python3", [installer, "--home", home, "--overlay", OVERLAY_ROOT]).status, 0);
+    assert.equal(spawnSync("python3", [installer, "--home", home, "--overlay", OVERLAY_ROOT, "--verify"]).status, 0);
+  } finally {
+    rmSync(work, { recursive: true, force: true });
+  }
+});
+
 // B1 source guards: the installer builds the mirror in a STAGING dir and atomically
 // swaps it in only on full success, and treats any patch-hunk failure as a loud,
 // non-zero abort (not just a trusted `patch` exit code). Reverting either behaviour
@@ -3713,6 +3754,57 @@ test("real transport dispatches through fm-spawn.sh and adopts its thread id", a
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
     const crews = await crewsKv(host);
     assert.equal(crews[0]?.threadId, "thr_real");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("real transport runs one fm-spawn at a time per home, so a slow spawn does not make the next dispatch fail on the task-set lock", async () => {
+  const host = realHost();
+  await plugin(host.bb);
+  try {
+    stubRealTransportHost(host, { spawnExit: 0, threadIdAfterSpawn: "thr_real" });
+    const cmds = new Map<string, string>();
+    const spawnDone = new Set<string>();
+    let n = 0;
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let releaseFirst = false;
+    let firstSpawn: string | null = null;
+    host.harness.sdk.stub("terminals.create", async (args: { start?: { command?: string } }) => {
+      const id = `term_${++n}`;
+      const cmd = args.start?.command ?? "";
+      cmds.set(id, cmd);
+      if (cmd.includes("fm-spawn.sh")) {
+        firstSpawn ??= id;
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+      }
+      return { id };
+    });
+    host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
+      const cmd = cmds.get(args.terminalId) ?? "";
+      if (cmd.includes("fm-spawn.sh")) {
+        if (args.terminalId === firstSpawn && !releaseFirst) return { chunks: [], nextSeq: 0 };
+        if (!spawnDone.has(args.terminalId)) { spawnDone.add(args.terminalId); inFlight--; }
+        return hostRcPayload("", 0);
+      }
+      if (cmd.includes("bb_thread_id")) {
+        const id = /([0-9a-f]{8})\.meta/.exec(cmd)?.[1] ?? String(n);
+        return hostRcPayload(spawnDone.size > 0 ? `thr_real_${id}` : "FM_META_ABSENT", 0);
+      }
+      return hostRcPayload("", 0);
+    });
+    const first = host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--", "fix flaky login"], { projectId: "proj_1" });
+    const second = host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--", "fix flaky signup"], { projectId: "proj_1" });
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    assert.equal(maxInFlight, 1, "the second spawn waits for the first instead of racing its lock");
+    releaseFirst = true;
+    const [a, b] = await Promise.all([first, second]);
+    assert.equal(a.exitCode, 0, a.stderr);
+    assert.equal(b.exitCode, 0, b.stderr);
+    assert.equal(maxInFlight, 1);
+    assert.equal(spawnDone.size, 2, "both spawns ran");
   } finally {
     await host.harness.lifecycle.dispose();
   }
