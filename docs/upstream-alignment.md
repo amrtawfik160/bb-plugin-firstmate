@@ -1,7 +1,7 @@
 # Audited native version
 
 The script surface, overlay patches and all 21 fidelity-managed skill files use
-`bb69be62e1f8df465d674a35f7e2ce707b900501`. This is an audited commit, not a claim
+`2d833ff147cd26a5c461e914e06854e0eb2707ce`. This is an audited commit, not a claim
 that the plugin follows upstream HEAD. `npm run fidelity` rejects a different
 skill or overlay pin; `--native` also checks the snapshot against Git objects.
 BB-specific captain, firstmate, ahoy, quiet and stow instructions remain adapters,
@@ -69,7 +69,7 @@ The preceding `4299683d` update added three callable scripts: `fm-git-strip-ai-t
 Use a disposable native clone containing the audited commit, never a live home:
 
 ```sh
-FM_TEST_HOME=/path/to/clone node scripts/patch-drift-check.mjs --ref bb69be62e1f8df465d674a35f7e2ce707b900501
+FM_TEST_HOME=/path/to/clone node scripts/patch-drift-check.mjs --ref 2d833ff147cd26a5c461e914e06854e0eb2707ce
 npm run fidelity -- --native /path/to/clone
 FM_TEST_HOME=/path/to/clone node --experimental-strip-types scripts/live-mirror-check.mjs
 ```

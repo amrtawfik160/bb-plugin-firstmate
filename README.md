@@ -129,7 +129,7 @@ BB-specific behavior in this fork:
 
 ## Skills
 
-The plugin registers all 21 upstream `.agents/skills` as real BB skills, plus `/captain` and `/firstmate`. Their policy text is pinned to upstream commit `bb69be62`; one shared runtime contract translates script paths, workers, approvals, and alternate harness mechanics to `firstmate_fm` and BB threads. Crew threads still receive no captain skills.
+The plugin registers 28 upstream `.agents/skills` (all except `firstmate-calm`, which it leaves out) as real BB skills, plus `/captain` and `/firstmate`. Their policy text is pinned to upstream commit `2d833ff1`; one shared runtime contract translates script paths, workers, approvals, and alternate harness mechanics to `firstmate_fm` and BB threads. Crew threads still receive no captain skills.
 
 ## Crew message delivery
 
