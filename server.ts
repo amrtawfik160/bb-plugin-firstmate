@@ -6021,15 +6021,18 @@ export default async function plugin(bb: BbPluginApi) {
   async function refreshStaleMirror(hostId: string, home: string, captain: string, signal?: AbortSignal): Promise<void> {
     const q = shQuote(home);
     const probe = await runOnHost(hostId,
-      `if [ -d ${q}/bin-bb ]; then printf 'FM_OVERLAY=%s\\n' "$(sed -n 's/^overlay=//p' ${q}/bin-bb/.mirror-manifest 2>/dev/null)"; else echo FM_NO_MIRROR; fi`,
+      `if [ -d ${q}/bin-bb ]; then printf 'FM_OVERLAY=%s FM_BUILT_HEAD=%s FM_HEAD=%s\\n' "$(sed -n 's/^overlay=//p' ${q}/bin-bb/.mirror-manifest 2>/dev/null)" "$(sed -n 's/^head=//p' ${q}/bin-bb/.mirror-manifest 2>/dev/null)" "$(git -C ${q} rev-parse HEAD 2>/dev/null)"; else echo FM_NO_MIRROR; fi`,
       STUCK_HOST_CALL_MS, signal);
-    const built = /FM_OVERLAY=([0-9a-f]*)/.exec(probe.output)?.[1];
-    if (probe.exitCode !== 0 || built === undefined) return;
-    if (built === overlayFingerprint()) return;
+    const fields = /FM_OVERLAY=([0-9a-f]*) FM_BUILT_HEAD=([0-9a-f]*) FM_HEAD=([0-9a-f]*)/.exec(probe.output);
+    if (probe.exitCode !== 0 || fields === null) return;
+    const [, built = "", builtHead = "", head = ""] = fields;
+    // An upstream update (/updatefirstmate, fm-update.sh) moves HEAD under the mirror.
+    const headMoved = builtHead !== "" && head !== "" && builtHead !== head;
+    if (built === overlayFingerprint() && !headMoved) return;
     const projectId = await bb.storage.kv.get<string>(`${CAPTAIN_PROJECT_PREFIX}${captain}`);
     try {
       await installBbBackend(hostId, home, typeof projectId === "string" && projectId !== "" ? projectId : undefined, 180_000, signal);
-      bb.log.info(`bb mirror refreshed for ${home}: it was built from ${built === "" ? "an unfingerprinted" : "an older"} overlay`);
+      bb.log.info(`bb mirror refreshed for ${home}: ${headMoved ? `firstmate moved ${builtHead.slice(0, 8)} -> ${head.slice(0, 8)}` : `it was built from ${built === "" ? "an unfingerprinted" : "an older"} overlay`}`);
     } catch (error) {
       if (isAbortError(error)) throw error;
       bb.log.warn(`bb mirror refresh failed for ${home}: ${error instanceof Error ? error.message : String(error)}`);
