@@ -83,6 +83,11 @@ export type Skill = {
 };
 
 const SKILL_GLOBS = [
+  "skills/captain/SKILL.md",
+  "skills/firstmate/SKILL.md",
+  "skills/ahoy/SKILL.md",
+  "skills/quiet/SKILL.md",
+  "skills/stow/SKILL.md",
   "skills/afk/SKILL.md",
   "skills/bearings/SKILL.md",
   "skills/ask-user-authority/SKILL.md",
@@ -114,9 +119,6 @@ const SKILL_GLOBS = [
 ];
 
 const CAPTAIN_WATCH_GUIDANCE = [
-  "skills/captain/SKILL.md",
-  "skills/captain/references/supervision.md",
-  "skills/firstmate/SKILL.md",
   "skills/harness-adapters/references/harness/bb.md",
 ];
 
@@ -338,6 +340,11 @@ export function validateAgainstSnapshot(repoRoot: string, skills: Skill[]): Prob
       continue;
     }
     const nativeContent = readFileSync(snapPath, "utf8");
+    if (s.bbSource.fidelity === "verbatim" && s.hasFrontmatter) {
+      const copied = readFileSync(join(repoRoot, s.path), "utf8").replace(/\n<!-- BB-SOURCE[\s\S]*?-->\n/, "");
+      if (copied !== nativeContent)
+        problems.push({ skill: s.path, msg: "verbatim skill must preserve every native byte, including frontmatter and omitted clauses" });
+    }
     const nativeBlob = normalize(nativeContent);
     const nativeRendered = normalize(renderedProse(nativeContent));
 

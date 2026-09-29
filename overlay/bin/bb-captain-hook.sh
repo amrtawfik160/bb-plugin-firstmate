@@ -6,17 +6,11 @@
 # files (.claude/settings.json, .codex/hooks.json in the firstmate home) never
 # load. These user-level entries restore the two harness-owned guarantees:
 #
-#   stop           Upstream fm-turnend-guard.sh's queued-wake predicate: a captain
-#                  may not end a turn with unacknowledged queue rows or a pending
-#                  presentation receipt. Blocks with exit 2 and
-#                  never twice in one turn (stop_hook_active / stopHookActive).
-#   session-start  Runs the home's native fm-sessionstart-run.sh from inside the
-#                  harness process tree, so the session lock is owned by the real
-#                  harness (native ancestry), not a host terminal.
+#   stop           Runs native fm-turnend-guard, then guards the BB presentation receipt.
+#   stop-autoarm   Native Claude asyncRewake cooperation; native owns its eligibility.
+#   session-start  Runs native startup inside the harness process tree.
 #
-# Scope: a thread is a captain only when the plugin wrote
-# ~/.bb-firstmate/captains/$BB_THREAD_ID. Every other thread, and every error,
-# is a silent exit 0.
+# Only registered captain threads use these home bindings.
 set -u
 
 mode=${1:-}
@@ -28,10 +22,28 @@ marker="${HOME}/.bb-firstmate/captains/${thread}"
 [ -f "$marker" ] || exit 0
 home=$(sed -n 's/^home=//p' "$marker" 2>/dev/null | head -n 1)
 state=$(sed -n 's/^state=//p' "$marker" 2>/dev/null | head -n 1)
-[ -n "$home" ] && [ -n "$state" ] || exit 0
+[ -n "$home" ] && [ -n "$state" ] || {
+  printf 'firstmate: invalid captain marker thread=%s path=%s\n' "$thread" "$marker" >&2; exit 1;
+}
+run_native() {
+  local leaf=$1; shift
+  local run="$home/bin-bb/$leaf"
+  [ -x "$run" ] || {
+    printf 'firstmate: captain=%s missing executable %s\n' "$thread" "$run" >&2; return 1;
+  }
+  cd "$home" 2>/dev/null || {
+    printf 'firstmate: captain=%s cannot enter home %s\n' "$thread" "$home" >&2; return 1;
+  }
+  printf '%s' "$payload" | FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_STATE_OVERRIDE="$state" FM_BACKEND=bb "$run" "$@"
+}
 
 case "$mode" in
   stop)
+    native_args=()
+    [ "${2:-}" != "--claude" ] || native_args+=(--claude)
+    run_native fm-turnend-guard.sh "${native_args[@]}"
+    rc=$?
+    [ "$rc" = 0 ] || exit "$rc"
     active=false
     if command -v jq >/dev/null 2>&1 && [ -n "$payload" ]; then
       active=$(printf '%s' "$payload" | jq -r 'if (.stopHookActive // .stop_hook_active // false) == true then "true" else "false" end' 2>/dev/null || echo false)
@@ -48,15 +60,17 @@ case "$mode" in
     printf 'firstmate: %s unhandled crew wake(s) for this captain. Call firstmate_wake with ack=true, handle all reports, then pass handledWake on the final successful Firstmate action or firstmate_wake.\n' "$rows" >&2
     exit 2
     ;;
+  stop-autoarm)
+    run_native fm-claude-stop-autoarm.sh
+    exit $?
+    ;;
   session-start)
     # Only a captain with its own native home owns that home's session lock; a
     # legacy captain on the shared base home would take it from the others.
     [ "$(sed -n 's/^own_home=//p' "$marker" 2>/dev/null | head -n 1)" = "1" ] || exit 0
-    run="${home}/bin/fm-sessionstart-run.sh"
-    [ -x "$run" ] || exit 0
-    cd "$home" 2>/dev/null || exit 0
-    printf '%s' "$payload" | FM_BACKEND=bb "$run" || true
-    exit 0
+    run_native fm-sessionstart-run.sh
+    exit $?
+
     ;;
 esac
 exit 0

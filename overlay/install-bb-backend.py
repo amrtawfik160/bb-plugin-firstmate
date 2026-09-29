@@ -204,6 +204,7 @@ def generate_patched_copies(home: Path, overlay: Path, dest_dir: Path) -> dict[s
 # host (server.ts OVERLAY_INSTALL_INPUTS), so both sides hash the same set.
 OVERLAY_INSTALL_INPUTS = (
     "bin/backends/bb.sh",
+    "bin/backends/bb-worker-transport.txt",
     "docs/bb-backend.md",
     "firstmate-bb-backend.patch",
     "firstmate-bb-teardown.patch",
@@ -377,6 +378,7 @@ def _mirror_backends(native_backends: Path, dest: Path, overlay: Path) -> None:
     if not adapter.is_file():
         die(f"missing adapter {adapter}")
     shutil.copy2(adapter, dest / "bb.sh")
+    shutil.copy2(overlay / "bin" / "backends" / "bb-worker-transport.txt", dest / "bb-worker-transport.txt")
     os.chmod(dest / "bb.sh", 0o755)
     print(f"installed {dest / 'bb.sh'}")
 

@@ -228,3 +228,12 @@ input defers, clearing resumes alarms, and replacing the patched watcher with
 pristine native reproduces the false wedge. It also checks invalid/failed/timeout
 reads preserve alarms and worker status/progress remain unchanged. This is a
 native shell regression proof; it does not create a real BB interaction.
+
+## Supervisor startup transport
+
+The native fleet lock uses verified harness ancestry.
+BB host-terminal RPCs run outside that ancestry, so supervisor startup uses the agent's shell or its SessionStart hook.
+`firstmate_fm` supplies the command for the three native session-start entry points; it does not attempt or override the lock.
+The command binds `FM_HOME`, `FM_ROOT_OVERRIDE`, and `FM_BACKEND=bb`, then executes the original native entry point through the `bin-bb` mirror.
+The BB SessionStart hook uses the same bindings and mirror.
+Actual native lock refusals preserve the upstream read-only contract.

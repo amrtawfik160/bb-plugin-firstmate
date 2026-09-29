@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   afkShouldSend,
+  bearingsText,
   capPermission,
   crewPrompt,
   LEFTOVER_TIMER_CONTRACT,
@@ -358,4 +359,16 @@ test("fan-out cap is configurable past the old hard 10 and stays bounded", () =>
   assert.equal(resolveFanoutCap(12), 12);
   assert.equal(resolveFanoutCap(12.9), 12);
   assert.equal(resolveFanoutCap(500), 50);
+});
+
+
+test("Bearings preserves native's four sections, including an empty fleet and pending mate review", () => {
+  const input = { rows: [], calls: [], landed: [], ready: [], running: [], next: [], idle: 0, active: 0, errors: 0, decisionsDue: 0, queued: 0 };
+  const expected = ["Captain's Call", "Recently Landed", "Underway", "Charted Next"];
+  const headings = (text: string) => [...text.matchAll(/^== (.+) ==$/gm)].map(m => m[1]);
+  assert.deepEqual(headings(bearingsText(input)), expected);
+  const text = bearingsText({ ...input, ready: ["Awaiting firstmate review"] });
+  assert.deepEqual(headings(text), expected);
+  assert.match(text, /== Underway ==\nAwaiting firstmate review/);
+  assert.doesNotMatch(text.slice(0, text.indexOf("== Recently Landed ==")), /Awaiting firstmate review/);
 });

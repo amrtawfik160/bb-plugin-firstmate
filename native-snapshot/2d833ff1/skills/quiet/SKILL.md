@@ -9,12 +9,6 @@ metadata:
   internal: true
 ---
 
-<!-- BB-SOURCE
-     native: .agents/skills/quiet/SKILL.md
-     sha: 2d833ff147cd26a5c461e914e06854e0eb2707ce
-     snapshot: native-snapshot/2d833ff1/skills/quiet/SKILL.md
-     fidelity: verbatim -->
-
 # quiet
 
 Quiet supervision mode (kunchenguid/firstmate#2356): the same token-saving

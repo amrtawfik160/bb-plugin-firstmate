@@ -487,6 +487,7 @@ export function quietShouldSend(event: string): boolean {
   return event !== "idle";
 }
 
+
 export const AXI_TOOL_CONTRACT = "Use gh-axi for GitHub and lavish-axi for visual review; read current --help. For all browser work, use the /browser skill and browser_script (or bb browser script). Leave profileId unset for the thread-isolated default profile. This BB browser policy overrides imported native chrome-devtools-axi instructions; do not use the AXI browser or install its hooks. Use quota-axi for quota decisions and the home's bin-bb/fm-tasks-axi.sh for backlog work. In no-mistakes mode, the worker owns the real no-mistakes axi pipeline; a manual checklist is not a substitute. For crew-hosted Lavish boards, open the artifact then use the home's bin-bb/fm-procevent-lavish.sh arm <artifact> --for <task-id>; never start a second poller.";
 
 // Crews ran `gh-axi run watch` (3s interval) and `pr checks` loops thousands of
@@ -622,20 +623,11 @@ export function bearingsText(input: {
   const section = (title: string, items: string[], empty: string) =>
     [`== ${title} ==`, ...(items.length > 0 ? items : [empty])].join("\n");
   const head = `Fleet: ${input.rows.length} crews (${input.idle} idle, ${input.active} active, ${input.errors} error) · ${input.decisionsDue} decisions due · ${input.queued} queued`;
-  if (
-    input.rows.length === 0 &&
-    input.calls.length === 0 &&
-    input.landed.length === 0 &&
-    input.next.length === 0
-  ) {
-    return "No crews, no queue, no decisions.";
-  }
   return [
     head,
     section("Captain's Call", input.calls, "Nothing needs your action right now."),
     section("Recently Landed", input.landed, "No recent completions."),
-    section("Ready to review", input.ready, "Nothing waiting for review."),
-    section("Underway", input.running, "Nothing underway."),
+    section("Underway", [...input.running, ...input.ready], "Nothing underway."),
     section("Charted Next", input.next, "Nothing queued."),
   ].join("\n");
 }
