@@ -45,7 +45,7 @@ import plugin, {
   toolbeltPhrase,
   versionAtLeast,
 } from "./server.ts";
-import { CI_POLL_CONTRACT, LEFTOVER_TIMER_CONTRACT, latestStatus, statusProtocolSummary } from "./lib/policy.ts";
+import { CI_POLL_CONTRACT, LEFTOVER_TIMER_CONTRACT, WAITING_PROTOCOL, latestStatus, statusProtocolSummary } from "./lib/policy.ts";
 import { UPSTREAM_SCRIPT_NAMES, PINNED_SCRIPT_SUPPORT_FILES, UPSTREAM_SKILL_NAMES } from "./lib/upstream-surface.ts";
 import { FIRSTMATE_ROUTINE_MARKER } from "./lib/timeline-noise.ts";
 
@@ -2454,6 +2454,36 @@ test("retry with a new reasoning relaunches in the same worktree", async () => {
     const crews = (await host.bb.storage.kv.get("crews")) as Array<{ threadId: string; reasoningLevel: string | null }>;
     assert.equal(crews[0]?.threadId, "thr_crew2");
     assert.equal(crews[0]?.reasoningLevel, "max");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("long briefs are spilled out of the crews register, and a relaunch still sends the full brief", async () => {
+  const host = await load();
+  try {
+    const brief = `Captain's intent: finish the partner-billing stack. ${"detail ".repeat(400)}END-OF-BRIEF`;
+    await host.bb.storage.kv.set("crews", [{ ...shipRow("c1", "thr_crew", "thr_cap"), task: brief }]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () =>
+      makeThreadResponse({ id: "thr_crew", status: "error", environmentId: "env_wt" }),
+    );
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+    host.harness.sdk.stub("threads.stop", async () => ({}));
+    host.harness.sdk.stub("threads.archive", async () => ({}));
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew2" }));
+    const result = await host.harness.behavior.runCli(["retry", "c1", "--reasoning-level", "max"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    const crews = (await host.bb.storage.kv.get("crews")) as Array<{ task: string; taskSpilled?: boolean }>;
+    assert.ok(crews[0]!.task.length <= 300, "the register keeps only a prefix");
+    assert.equal(crews[0]!.taskSpilled, true);
+    assert.equal(await host.bb.storage.kv.get("crew-task:c1"), brief, "the full brief is kept aside");
+    // A second relaunch reads the full brief back, not the prefix.
+    await host.bb.storage.kv.set("crews", [{ ...crews[0], relaunches: 0, threadId: "thr_crew" }]);
+    const again = await host.harness.behavior.runCli(["retry", "c1", "--reasoning-level", "high"]);
+    assert.equal(again.exitCode, 0, again.stderr);
+    const prompt = (host.harness.sdk.callsTo("threads.spawn")[1]![0] as { prompt: string }).prompt;
+    assert.match(prompt, /END-OF-BRIEF/);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -7581,6 +7611,14 @@ test("real spawn brief carries the same leftover-timer rule as the TS crew contr
   assert.match(readFileSync(join(OVERLAY_ROOT, "bin/backends/bb.sh"), "utf8"), /^\$\(fm_backend_bb_leftover_timer_rule\)$/m, "the rule is part of the crew prompt");
 });
 
+test("real spawn brief carries the same WAITING rule as the TS crew contract", () => {
+  const adapter = JSON.stringify(join(OVERLAY_ROOT, "bin/backends/bb.sh"));
+  const result = spawnSync("bash", ["-c", `. ${adapter}; fm_backend_bb_waiting_rule`], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, WAITING_PROTOCOL);
+  assert.match(readFileSync(join(OVERLAY_ROOT, "bin/backends/bb.sh"), "utf8"), /^\$\(fm_backend_bb_waiting_rule\)$/m, "the rule is part of the crew prompt");
+});
+
 test("BB endpoint liveness preserves idle sessions and distinguishes unreadable state", () => {
   const adapter = JSON.stringify(join(OVERLAY_ROOT, "bin/backends/bb.sh"));
   for (const [reply, expected] of [
@@ -8234,6 +8272,77 @@ test("a crew WAITING: yield is not nagged, never wakes the captain, and is resum
     assert.equal(toCrew.length, 1, "exactly one resume");
     assert.doesNotMatch(toCrew[0]!.input[0]!.text, /TURN ENDED WITHOUT A STATUS VERDICT/, "a yield is never nagged");
     assert.ok((toCrew[0]!.sendAt ?? 0) >= before + 4 * 60_000, "the resume is scheduled minutes out, not a busy loop");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// A live queue for thr_crew: scheduled sends land as rows, deletes remove them.
+function liveCrewQueue(host: Awaited<ReturnType<typeof load>>) {
+  const rows: Array<{ id: string; failureReason: string | null; content: Array<{ type: "text"; text: string }> }> = [];
+  const deleted: string[] = [];
+  let seq = 0;
+  host.harness.sdk.stub("threads.queuedMessages.list", async ({ threadId }: { threadId: string }) => threadId === "thr_crew" ? [...rows] : []);
+  host.harness.sdk.stub("threads.queuedMessages.delete", async ({ queuedMessageId }: { queuedMessageId: string }) => {
+    deleted.push(queuedMessageId);
+    rows.splice(rows.findIndex((r) => r.id === queuedMessageId), 1);
+    return {};
+  });
+  host.harness.sdk.stub("threads.send", async (args: { threadId: string; sendAt?: number; input: Array<{ text: string }> }) => {
+    if (args.threadId !== "thr_crew" || args.sendAt === undefined) return { delivery: "sent" };
+    const row = { id: `q${++seq}`, failureReason: null, content: [{ type: "text" as const, text: args.input[0]!.text }] };
+    rows.push(row);
+    return { delivery: "queued", queuedMessage: row };
+  });
+  return { rows, deleted };
+}
+
+test("repeated WAITING: yields keep exactly one scheduled resume and spend no extra budget", async () => {
+  const host = ownerHost({ notifyOwner: "real" });
+  await plugin(host.bb);
+  try {
+    stubRoutedHost(host, () => ({ code: 0 }));
+    captainAndCrewThreads(host);
+    host.harness.sdk.stub("threads.list", async () => []);
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    const queue = liveCrewQueue(host);
+    await emitIdle(host, "WAITING: CI on #1808");
+    await emitIdle(host, "WAITING: CI on #1808");
+    await emitIdle(host, "WAITING: CI on #1808");
+    assert.equal(queue.rows.length, 1, "one pending resume, not three");
+    assert.deepEqual(queue.deleted, ["q1", "q2"], "each new yield replaces the pending resume");
+    const waiting = await host.bb.storage.kv.get<Record<string, { count: number }>>("crew-waiting");
+    assert.equal(waiting?.["c1"]?.count, 1, "unconsumed resumes do not spend the budget");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a parked crew woken by a leftover timer stays parked: no nag, resume kept; a verdict cancels the resume", async () => {
+  const host = ownerHost({ notifyOwner: "real" });
+  await plugin(host.bb);
+  try {
+    stubRoutedHost(host, () => ({ code: 0 }));
+    captainAndCrewThreads(host);
+    host.harness.sdk.stub("threads.list", async () => []);
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    const queue = liveCrewQueue(host);
+    await emitIdle(host, "WAITING: CI on #1850");
+    const sendsBefore = host.harness.sdk.callsTo("threads.send").length;
+    await emitIdle(host, "");
+    assert.equal(host.harness.sdk.callsTo("threads.send").length, sendsBefore, "no protocol nag for an empty wake while parked");
+    assert.equal(queue.rows.length, 1, "the scheduled resume still stands");
+    const hook = host.harness.inspection.registrations.hooks["message.dispatch"]!;
+    const due = await hook({
+      thread: makeThreadResponse({ id: "thr_crew", status: "idle" }),
+      attempt: "start-turn", initiator: "system", senderThreadId: null, queuedMessages: [{}],
+      input: { blocks: [], text: queue.rows[0]!.content[0]!.text },
+    } as never);
+    assert.equal(due.action, "proceed", "the crew is still waiting, so its resume runs");
+    await emitIdle(host, "DONE: #1850 green and merged");
+    assert.equal(queue.rows.length, 0, "a verdict cancels the pending resume");
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -9863,6 +9972,25 @@ test("retry surfaces no_failed_turn and does not relaunch", async () => {
     assert.notEqual(result.exitCode, 0);
     assert.match(result.stderr, /no_failed_turn/);
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("retry of a crew BB already resumed reports success, not no_failed_turn", async () => {
+  const host = await load();
+  try {
+    await seedCrew(host);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "active", environmentId: null }));
+    host.harness.sdk.stub("threads.retry", async () => {
+      const error = new Error("Thread thr_crew has no failed turn to retry: it is active.");
+      (error as Error & { code: string }).code = "no_failed_turn";
+      throw error;
+    });
+    const result = await host.harness.behavior.runCli(["retry", "c1"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /already running again/);
   } finally {
     await host.harness.lifecycle.dispose();
   }

@@ -336,7 +336,9 @@ test("WAITING: is a yield, not a verdict; the first protocol line decides", () =
 
 test("crews are taught to wait in-turn and yield WAITING:, never a false DONE:", () => {
   const text = crewPrompt({ task: "fix login", parentThreadId: "thr_cap", shape: "ship", mode: "no-mistakes", isolated: true });
-  assert.match(text, /keep waiting inside this turn/);
+  assert.match(text, /keep waiting inside this turn only with blocking foreground re-checks, at most one every 5 minutes/);
+  assert.match(text, /do not start a background wait/, "a harness that cannot block must yield, not fake a wait with a timer");
+  assert.doesNotMatch(text, /bounded re-checks/, "the old wording contradicted the no-timer and no-polling rules");
   assert.match(text, /WAITING: <what you are waiting on>/);
   assert.match(text, /Never write DONE: for work that is not done/);
   assert.match(protocolNudgeText(1, 3), /WAITING: <what>/);

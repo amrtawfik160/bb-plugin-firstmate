@@ -335,6 +335,12 @@ fm_backend_bb_ci_poll_rule() {
 
 # A crew's own timer or monitor firing after its verdict wakes it for an empty turn,
 # and BB pings the captain "completed" for that turn (no hook can drop the ping).
+# Same text as WAITING_PROTOCOL in lib/policy.ts: block in the foreground or yield
+# WAITING:, never a background timer (a second wake beside the scheduled resume).
+fm_backend_bb_waiting_rule() {
+  printf '%s' "Waiting on a long external run (no-mistakes pipeline, CI, deploy) is not a finish: keep waiting inside this turn only with blocking foreground re-checks, at most one every 5 minutes. If you cannot block in the foreground, or must end the turn before the result, do not start a background wait: start the reply with WAITING: <what you are waiting on> instead of a verdict, and firstmate resumes you in about 5 minutes to re-check it. Never write DONE: for work that is not done."
+}
+
 fm_backend_bb_leftover_timer_rule() {
   printf '%s' "Firstmate's scheduled resume is the only wake after a WAITING: yield: never start your own timer, sleep loop, or monitor to wake yourself. Before you end a turn with a verdict or WAITING:, stop every timer, monitor, and background shell you started; a leftover one wakes you again and pings the captain with an empty completion. If an old timer still wakes you and nothing changed, end the turn with no reply text."
 }
@@ -360,7 +366,7 @@ $prompt"
   prompt=$(fm_backend_bb_crew_brief_paths "$fm_bin" "$prompt")
   prompt="You are a firstmate ${kind:-ship} crewmate running inside BB.
 Do not dispatch nested crews. Work only this task. End with DONE:, BLOCKED:, or FAILED:.
-Waiting on a long external run (no-mistakes pipeline, CI, deploy) is not a finish: keep waiting inside this turn with bounded re-checks. Only if you must end the turn before its result, start the reply with WAITING: <what you are waiting on>; firstmate resumes you later. Never write DONE: for work that is not done.
+$(fm_backend_bb_waiting_rule)
 $(fm_backend_bb_leftover_timer_rule)
 Use gh-axi for GitHub and lavish-axi for visual review. For browser work use the /browser skill and browser_script (or bb browser script), leaving profileId unset for this thread's isolated default profile. This overrides native chrome-devtools-axi instructions; do not use the AXI browser or install its hooks. Read current --help. In no-mistakes mode, drive the real no-mistakes axi pipeline as its worker owner.
 Firstmate home: ${FM_HOME:-}. Run every firstmate script from $fm_bin/ (the BB-capable scripts); where anything names bin/fm-*.sh, use $fm_bin/fm-*.sh instead, because the native bin/ copies do not know the bb backend and refuse BB tasks. Use $fm_bin/fm-tasks-axi.sh for backlog work. For a Lavish board, read its config/lavish-axi-host if present and set LAVISH_AXI_HOST on the open command; BB does not inherit the launcher's shell exports. Open the artifact, then arm $fm_bin/fm-procevent-lavish.sh with --for $id. Do not start a second poller.
