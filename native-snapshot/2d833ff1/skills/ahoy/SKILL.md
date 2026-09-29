@@ -6,12 +6,6 @@ metadata:
   internal: true
 ---
 
-<!-- BB-SOURCE
-     native: .agents/skills/ahoy/SKILL.md
-     sha: 2d833ff147cd26a5c461e914e06854e0eb2707ce
-     snapshot: native-snapshot/2d833ff1/skills/ahoy/SKILL.md
-     fidelity: verbatim -->
-
 # ahoy
 
 Give the captain a concise session-only recap without gathering fresh state.

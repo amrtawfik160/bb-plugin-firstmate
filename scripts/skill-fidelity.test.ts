@@ -19,7 +19,6 @@ import {
 const ROOT = process.cwd();
 const AFK = "skills/afk/SKILL.md";
 const ESC = "skills/captain/references/escalation.md";
-const BEAR = "skills/bearings/SKILL.md";
 const BB_HARNESS = "skills/harness-adapters/references/harness/bb.md";
 
 // End-to-end: copy skills/ + native-snapshot/ into a temp root, mutate, run the
@@ -98,7 +97,7 @@ test("break 2 — delete a BB-DIVERGE while keeping the divergent text FAILS", (
 
 test("break 3 — corrupt a native-quote so it no longer resolves FAILS", () => {
   const ps = withTemp((root) =>
-    edit(root, BEAR, (s) => s.replace("native-quote: EXACTLY these four sections, in THIS order", "native-quote: some sentence native never wrote at all")),
+    edit(root, AFK, (s) => s.replace("native-quote: Write the record first, in this same turn.", "native-quote: some sentence native never wrote at all")),
   );
   assert.ok(flagged(ps, /native-quote does not resolve/), JSON.stringify(ps));
 });
@@ -216,15 +215,10 @@ test("7B (disclosed residue) — the same lie split across token-bearing clauses
 });
 
 test("BB-ONLY fence cannot shelter native-derived content", () => {
-  // Fence a real native sentence: over-fencing must be flagged so it gets un-fenced.
-  const ps = withTemp((root) =>
-    edit(root, BEAR, (s) =>
-      s.replace(
-        "BB additionally renders a **Ready to review** section for crews that finished and sit idle awaiting `deliver`.",
-        "It is the single bounded, deterministic fleet-state source for Bearings.",
-      ),
-    ),
-  );
+  const ps = withTemp(root => edit(root, AFK, s => s.replace(
+    /(<\!-- BB-ONLY: BB enters before the announcement\. -->)\n[^\n]+/,
+    "$1\nAway mode is a POSTURE of the one supervision session, not a second architecture.",
+  )));
   assert.ok(flagged(ps, /native-derived sentence is fenced/), JSON.stringify(ps));
 });
 
@@ -293,3 +287,16 @@ test("version alignment rejects stale skill and overlay pins", () => {
   skills[0].bbSource!.sha = "6f0f1399";
   assert.ok(flagged(validateVersionAlignment(skills, base), /audited runtime pin/));
 });
+
+
+test("captain bootstrap rejects an independent policy sentence", () => {
+  const ps = withTemp(root => edit(root, "skills/captain/SKILL.md", s => s + "\nAlways run an extra security review before dispatching any ship.\n"));
+  assert.ok(flagged(ps, /unmarked divergence/), JSON.stringify(ps));
+});
+
+for (const name of ["ahoy", "quiet", "stow", "bearings"]) {
+  test(`verbatim ${name} rejects deleted native instructions`, () => {
+    const ps = withTemp(root => edit(root, `skills/${name}/SKILL.md`, s => s.slice(0, s.lastIndexOf("\n", s.length - 2)) + "\n"));
+    assert.ok(flagged(ps, /preserve every native byte/), JSON.stringify(ps));
+  });
+}

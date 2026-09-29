@@ -16,6 +16,9 @@ import plugin, {
   briefSections,
   sanitizeFmArgs,
   captainHookInstallScript,
+  captainHookCommand,
+  captainStartupCommand,
+  nativeWorkerTransport,
   crewPingHoldDecision,
   doorbellSupersededByBbPing,
   staleLineRelayDecision,
@@ -46,7 +49,7 @@ import plugin, {
   versionAtLeast,
   overlayFingerprint,
 } from "./server.ts";
-import { CI_POLL_CONTRACT, LEFTOVER_TIMER_CONTRACT, WAITING_PROTOCOL, latestStatus, statusProtocolSummary } from "./lib/policy.ts";
+import { LEFTOVER_TIMER_CONTRACT, WAITING_PROTOCOL, latestStatus, statusProtocolSummary } from "./lib/policy.ts";
 import { UPSTREAM_SCRIPT_NAMES, PINNED_SCRIPT_SUPPORT_FILES, UPSTREAM_SKILL_NAMES } from "./lib/upstream-surface.ts";
 import { FIRSTMATE_ROUTINE_MARKER } from "./lib/timeline-noise.ts";
 
@@ -87,20 +90,16 @@ test("crews get no dispatch tools", async () => {
     );
     assert.deepEqual(cfg.tools.map((t) => t.name), []);
     assert.deepEqual(cfg.skills, []);
-    assert.match(cfg.instructions ?? "", /gh-axi/);
+    assert.match(cfg.instructions ?? "", /native launch brief/);
     assert.match(cfg.instructions ?? "", /\/browser skill and browser_script/);
-    assert.match(cfg.instructions ?? "", /Leave profileId unset/);
+    assert.match(cfg.instructions ?? "", /profileId unset/);
     assert.doesNotMatch(cfg.instructions ?? "", /chrome-devtools-axi for browser|CHROME_DEVTOOLS_AXI_SESSION/);
     assert.match(cfg.instructions ?? "", /lavish-axi/);
-    assert.match(cfg.instructions ?? "", /no-mistakes axi/);
-    // Crews ran `gh-axi run watch` / `pr checks` loops and drained the shared GitHub token.
-    assert.match(cfg.instructions ?? "", /Never poll CI in a loop/);
-    assert.match(cfg.instructions ?? "", /at most every 5 minutes/);
-    // A leftover timer re-wakes a finished crew and pings the captain with an empty completion.
-    assert.ok((cfg.instructions ?? "").includes(LEFTOVER_TIMER_CONTRACT), "crew instructions carry the leftover-timer contract");
-    assert.match(cfg.instructions ?? "", /\.resources\.graphql/);
+    assert.doesNotMatch(cfg.instructions ?? "", /a manual checklist is not a substitute|Never poll CI/);
+    assert.doesNotMatch(cfg.instructions ?? "", /WAITING:|scheduled resume|stop every timer/);
+
     // Crews must run the BB-capable mirror, not native bin/ (no bb backend there).
-    assert.match(cfg.instructions ?? "", /bin-bb\/fm-procevent-lavish\.sh arm/);
+    assert.match(cfg.instructions ?? "", /bin-bb\/fm-procevent-lavish\.sh/);
     assert.doesNotMatch(cfg.instructions ?? "", /home's bin\/fm-tasks-axi\.sh/);
   } finally {
     await host.harness.lifecycle.dispose();
@@ -144,9 +143,8 @@ test("captain metadata loads the full skill set", async () => {
       host.harness.inspection.registrations.agentTools.map((tool) => tool.name).sort(),
       "captain sessions must expose every registered firstmate tool",
     );
-    assert.match(cfg.instructions ?? "", /talk in outcomes, not mechanics/i);
-    assert.match(cfg.instructions ?? "", /Do not narrate tool calls/);
-    assert.match(cfg.instructions ?? "", /automatic fixes, retries, routine progress/);
+    assert.match(cfg.instructions ?? "", /complete native supervisor contract/);
+    assert.doesNotMatch(cfg.instructions ?? "", /Do not narrate tool calls|Never do crew work|Never merge/);
     assert.match(cfg.instructions ?? "", /call firstmate_watch once per batch/i);
     assert.match(cfg.instructions ?? "", /private durable wakes/i);
   } finally {
@@ -337,7 +335,9 @@ test("bearings on an empty fleet", async () => {
   try {
     const result = await host.harness.behavior.runCli(["bearings"]);
     assert.equal(result.exitCode, 0);
-    assert.match(result.stdout, /No crews, no queue, no decisions/);
+    assert.match(result.stdout, /== Captain's Call ==/);
+    assert.match(result.stdout, /== Charted Next ==/);
+    assert.doesNotMatch(result.stdout, /== Ready to review ==/);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -583,13 +583,15 @@ test("deck reuses shared home when automatic native profile is explicitly disabl
   await plugin(host.bb);
   try {
     stubCaptainDeck(host);
+    await host.harness.behavior.setSettings({ fmHostId: "host_1" });
+    stubRoutedHost(host, () => ({}));
     const result = await host.harness.behavior.runCli(["deck"], { threadId: "thr_cap", projectId: "proj_1" });
     assert.equal(result.exitCode, 0, result.stderr);
     assert.match(result.stdout, /Real firstmate: active \(fmHome \/tmp\/fm-home;/);
     assert.match(result.stdout, /bb firstmate fm spawn/);
     // Already initialized: deck must not clone or create a project again.
     assert.equal(host.harness.sdk.callsTo("projects.create").length, 0);
-    assert.equal(host.harness.sdk.callsTo("terminals.create").length, 0);
+    assert.ok(host.harness.sdk.callsTo("terminals.create").length > 0, "native snapshot is read on the host");
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -2632,7 +2634,7 @@ test("guide reports computed toolbelt counts when known", async () => {
   }
 });
 
-test("deck renders real fm-bearings-snapshot labelled, native digest as cache", async () => {
+test("deck renders native Bearings without a competing chat-derived cache", async () => {
   const host = createFakePluginHost({
     pluginId: "firstmate",
     agentSkillIds: SKILLS,
@@ -2653,13 +2655,12 @@ test("deck renders real fm-bearings-snapshot labelled, native digest as cache", 
     host.harness.sdk.stub("environments.get", async () => ({ id: "env_cap", hostId: "host_1", path: "/repo", isWorktree: false, status: "ready" }));
     host.harness.sdk.stub("terminals.create", async () => ({ id: "term_1" }));
     host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
-    host.harness.sdk.stub("terminals.output", async () => hostOutput("FLEET SNAPSHOT: 0 crews"));
+    host.harness.sdk.stub("terminals.output", async () => hostOutput(nativeBearingsFixture()));
     host.harness.sdk.stub("terminals.close", async () => ({}));
     const result = await host.harness.behavior.runCli(["deck"], { threadId: "thr_cap", projectId: "proj_1" });
     assert.equal(result.exitCode, 0, result.stderr);
-    assert.match(result.stdout, /real bearings \(fm-bearings-snapshot; authoritative, host-wide\)/);
-    assert.match(result.stdout, /FLEET SNAPSHOT: 0 crews/);
-    assert.match(result.stdout, /native digest \(BB KV cache \/ fallback\)/);
+    assert.match(result.stdout, /Captain's Call/);
+    assert.doesNotMatch(result.stdout, /BB KV cache \/ fallback/);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -3121,10 +3122,11 @@ test("shared-env BB crew with no worktree passes endpoint validation; ambiguity 
 // "backend identity missing". Audit D: crews polled CI in tight loops and drained the
 // shared GitHub token. Reverting the path rewrite or the CI rule in bb.sh
 // fm_backend_bb_create_task fails this test.
-test("bb crew launch prompt routes scripts to bin-bb and forbids CI poll loops", () => {
+test("bb crew launch prompt preserves the brief with only BB transport adaptations", () => {
   const home = mkdtempSync(join(tmpdir(), "fm-bb-prompt-"));
   try {
-    mkdirSync(join(home, "bin-bb"));
+    mkdirSync(join(home, "bin-bb/backends"), { recursive: true });
+    cpSync(join(OVERLAY_ROOT, "bin/backends/bb-worker-transport.txt"), join(home, "bin-bb/backends/bb-worker-transport.txt"));
     const fakebin = join(home, "fakebin");
     const log = join(home, "transport.jsonl");
     mkdirSync(fakebin);
@@ -3155,10 +3157,8 @@ test("bb crew launch prompt routes scripts to bin-bb and forbids CI poll loops",
     assert.match(briefPart, /^arm your board/);
     assert.doesNotMatch(briefPart, /[ `(]bin\/fm-/, "no relative native bin/ reference may survive in the brief");
     assert.ok(!prompt.includes(`${home}/bin/`), "no absolute native bin/ reference may survive");
-    assert.match(prompt, /Never poll CI in a loop/);
-    assert.match(prompt, /\.resources\.graphql/);
-    // The shell rule and the TS crew contract must say the same thing.
-    assert.ok(prompt.includes(CI_POLL_CONTRACT), "bb.sh CI rule drifted from lib/policy.ts CI_POLL_CONTRACT");
+    assert.doesNotMatch(prompt, /Never poll CI|\.resources\.graphql/);
+    assert.doesNotMatch(prompt, /WAITING:|scheduled resume|stop every timer/);
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
@@ -3917,6 +3917,7 @@ function stubRaceHost(
   host.harness.sdk.stub("terminals.close", async () => ({}));
   host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
     const cmd = cmds.get(args.terminalId) ?? "";
+    if (cmd.includes(".status") && cmd.includes("cat --")) return hostRcPayload(opts.output.toLowerCase(), 0);
     if (cmd.includes("fm-spawn.sh")) {
       spawned = true;
       return hostRcPayload("", 0);
@@ -4026,7 +4027,8 @@ test("reconcile: duplicate idle event is coalesced while a changed verdict still
   try {
     await host.harness.behavior.setSettings({ supervisionEnabled: true });
     const blocked = "BLOCKED: waiting on approval";
-    stubRaceHost(host, { status: "idle", output: blocked });
+    const native = { status: "idle", output: blocked };
+    stubRaceHost(host, native);
     const result = await host.harness.behavior.runCli(
       ["dispatch", "--project", "proj_1", "--shape", "scout", "--", "Captain's intent: verify no double"],
       { projectId: "proj_1", threadId: "thr_cap" },
@@ -4043,6 +4045,7 @@ test("reconcile: duplicate idle event is coalesced while a changed verdict still
     });
     assert.deepEqual(live.errors, []);
     assert.equal(sendCalls(host).filter((s) => s.threadId === "thr_cap").length, 1, "same verdict is delivered once");
+    native.output = "resolved: approval received\ndone: approval received and shipped";
     await host.harness.behavior.emitThreadEvent("thread.idle", {
       thread: makeThreadResponse({ id: "thr_real", status: "idle", projectId: "proj_1" }),
       lastAssistantText: "DONE: approval received and shipped",
@@ -4641,6 +4644,10 @@ test("read-through drops a KV crew whose real state/<id>.meta is gone (one batch
 
 // A fake host whose terminal output is routed by the command text. `router`
 // returns { payload, code } for a command; default is empty payload, rc 0.
+function nativeBearingsFixture(extra: Record<string, unknown> = {}): string {
+  return JSON.stringify({ schema: "fm-bearings.v1", home: "/tmp/fm-home", in_flight: [], decisions_open: [], landed: [], gates: [], omitted: [], ...extra });
+}
+
 function stubRoutedHost(
   host: Awaited<ReturnType<typeof load>>,
   router: (cmd: string) => { payload?: string; code?: number },
@@ -4679,7 +4686,7 @@ function stubRoutedHost(
     // Only successful commands mutate the virtual FS (a forced-failure decode never
     // renames over the target — mirrors the atomic write's truncate-safety).
     if (code === 0) simulateHostWrite(unwrapHostCommand(cmd), vfs, writes);
-    return hostRcPayload(r.payload ?? "", code);
+    return hostRcPayload(r.payload ?? (cmd.includes("fm-bearings-snapshot.sh") ? nativeBearingsFixture() : ""), code);
   });
   return { seen, writes, vfs };
 }
@@ -5071,6 +5078,7 @@ test("D3 session digest: recall reads the real files, not a stale KV cache (nati
     await host.bb.storage.kv.set("memory-captain", "STALE_KV_CAPTAIN");
     await host.bb.storage.kv.set("memory-learnings", "STALE_KV_LEARN");
     stubRoutedHost(host, (cmd) => {
+      if (cmd.includes("fm-bearings-snapshot.sh")) return { payload: nativeBearingsFixture() };
       if (cmd.includes("cat") && cmd.includes("data/captain.md")) return { payload: "FRESH_REAL_CAPTAIN", code: 0 };
       if (cmd.includes("cat") && cmd.includes("data/learnings.md") && !cmd.includes("archive")) return { payload: "FRESH_REAL_LEARN", code: 0 };
       return { payload: "", code: 0 };
@@ -7718,20 +7726,22 @@ test("IT secondmate registration rejects a mismatched native parent", { skip: !F
   } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
 });
 
-test("real spawn brief carries the same leftover-timer rule as the TS crew contract", () => {
-  const adapter = JSON.stringify(join(OVERLAY_ROOT, "bin/backends/bb.sh"));
-  const result = spawnSync("bash", ["-c", `. ${adapter}; fm_backend_bb_leftover_timer_rule`], { encoding: "utf8" });
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, LEFTOVER_TIMER_CONTRACT);
-  assert.match(readFileSync(join(OVERLAY_ROOT, "bin/backends/bb.sh"), "utf8"), /^\$\(fm_backend_bb_leftover_timer_rule\)$/m, "the rule is part of the crew prompt");
-});
-
-test("real spawn brief carries the same WAITING rule as the TS crew contract", () => {
-  const adapter = JSON.stringify(join(OVERLAY_ROOT, "bin/backends/bb.sh"));
-  const result = spawnSync("bash", ["-c", `. ${adapter}; fm_backend_bb_waiting_rule`], { encoding: "utf8" });
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, WAITING_PROTOCOL);
-  assert.match(readFileSync(join(OVERLAY_ROOT, "bin/backends/bb.sh"), "utf8"), /^\$\(fm_backend_bb_waiting_rule\)$/m, "the rule is part of the crew prompt");
+test("native worker transport is shared with the adapter and adds no waiting policy", () => {
+  const home = mkdtempSync(join(tmpdir(), "fm-prompt-"));
+  try {
+    mkdirSync(join(home, "bin-bb/backends"), { recursive: true });
+    mkdirSync(join(home, "config"));
+    writeFileSync(join(home, "config/bb-overlay"), "bb\n");
+    cpSync(join(OVERLAY_ROOT, "bin/backends/bb-worker-transport.txt"), join(home, "bin-bb/backends/bb-worker-transport.txt"));
+    const brief = join(home, "brief.md");
+    writeFileSync(brief, "NATIVE_SENTINEL\npaused: native external wait\n");
+    const result = spawnSync("bash", ["-c", `. "$1"; fm_backend_bb_worker_prompt "$2" ship c1`, "audit", join(OVERLAY_ROOT, "bin/backends/bb.sh"), brief],
+      { env: { ...process.env, FM_HOME: home, FM_ROOT: home }, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(result.stdout.startsWith(nativeWorkerTransport(home, "c1") + "\n\n"));
+    assert.match(result.stdout, /NATIVE_SENTINEL\npaused: native external wait/);
+    assert.doesNotMatch(result.stdout, /WAITING:|Never poll CI|stop every timer|scheduled resume/);
+  } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
 test("BB endpoint liveness preserves idle sessions and distinguishes unreadable state", () => {
@@ -7897,6 +7907,8 @@ test("captain stop hook blocks once on unhandled wakes and is a no-op elsewhere"
     const state = join(home, "state");
     mkdirSync(join(home, ".bb-firstmate/captains"), { recursive: true });
     mkdirSync(state);
+    mkdirSync(join(home, "bin-bb"));
+    writeFileSync(join(home, "bin-bb/fm-turnend-guard.sh"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
     writeFileSync(join(home, ".bb-firstmate/captains/thr_cap"), `home=${home}\nstate=${state}\nown_home=0\n`);
     assert.equal(runCaptainHook(home, "stop", "{}", "thr_cap").status, 0, "empty queue allows the stop");
     writeFileSync(join(state, ".wake-queue"), "1\t1\tsignal\ta.status\tx\n1\t2\tsignal\tb.status\ty\n");
@@ -7916,16 +7928,16 @@ test("captain session-start hook runs native session start only in the captain's
   const home = mkdtempSync(join(tmpdir(), "fm-hook-"));
   try {
     const fm = join(home, "fm");
-    mkdirSync(join(fm, "bin"), { recursive: true });
+    mkdirSync(join(fm, "bin-bb"), { recursive: true });
     mkdirSync(join(home, ".bb-firstmate/captains"), { recursive: true });
-    writeFileSync(join(fm, "bin/fm-sessionstart-run.sh"), '#!/bin/bash\necho "ran $(pwd) $FM_BACKEND $(cat)"\n', { mode: 0o755 });
+    writeFileSync(join(fm, "bin-bb/fm-sessionstart-run.sh"), '#!/bin/bash\necho "ran $(pwd) $FM_BACKEND $FM_HOME $FM_ROOT_OVERRIDE $(cat)"\n', { mode: 0o755 });
     const marker = join(home, ".bb-firstmate/captains/thr_cap");
     writeFileSync(marker, `home=${fm}\nstate=${fm}/state\nown_home=0\n`);
     assert.equal(runCaptainHook(home, "session-start", '{"source":"startup"}', "thr_cap").stdout, "", "shared legacy home never takes the lock");
     writeFileSync(marker, `home=${fm}\nstate=${fm}/state\nown_home=1\n`);
     const own = runCaptainHook(home, "session-start", '{"source":"startup"}', "thr_cap");
     assert.equal(own.status, 0);
-    assert.equal(own.stdout.trim(), `ran ${fm} bb {"source":"startup"}`);
+    assert.equal(own.stdout.trim(), `ran ${fm} bb ${fm} ${fm} {"source":"startup"}`);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -8341,13 +8353,15 @@ for (const operation of ["context", "compact"] as const) {
   });
 }
 
-test("non-hooked captain providers get explicit guard rules on deck", () => {
+test("non-hooked captain providers get hook transport guidance without a second policy", () => {
   assert.equal(unhookedCaptainNote("claude-code"), "");
   assert.equal(unhookedCaptainNote("codex"), "");
   assert.equal(unhookedCaptainNote(""), "");
   const note = unhookedCaptainNote("acp-grok");
   assert.match(note, /acp-grok/);
-  assert.match(note, /Never read bb\.db/);
+  assert.match(note, /does not execute the installed SessionStart and Stop hooks/);
+  assert.match(note, /firstmate_fm script=session-start/);
+  assert.doesNotMatch(note, /Never read bb\.db|recommended/);
   assert.match(note, /handledWake/);
 });
 
@@ -8367,7 +8381,8 @@ test("no-op wakes end silently: the escalation skill no longer asks for 'Captain
   assert.doesNotMatch(escalation, /Reply exactly `Captain, shipshape\.`/, "the skill must not tell captains to answer a no-op wake");
   assert.match(escalation, /ends the turn with no reply text/);
   const captain = rendered("skills/captain/SKILL.md");
-  assert.match(captain, /ends the turn with no\s+reply text at all/);
+  assert.match(captain, /complete upstream supervisor contract, verbatim/);
+  assert.doesNotMatch(captain, /Reply exactly `Captain, shipshape\.`/);
 });
 
 test("a crew WAITING: yield is not nagged, never wakes the captain, and is resumed later", async () => {
@@ -8608,16 +8623,12 @@ test("fm-watch relay: a page whose delivery failed is retried next cycle, not dr
   }
 });
 
-test("firstmate_contract: table of contents + always-on sections by default, any section on demand", () => {
+test("firstmate_contract: complete native contract verbatim by default, sections for lookup", () => {
   const body = (n: number, title: string) => `## ${n}. ${title}\n${`${title} rule.\n`.repeat(900)}`;
   const content = `# Firstmate\nPreamble.\n\n${body(1, "Identity")}${body(7, "Task lifecycle")}${body(9, "Escalation")}${body(10, "Backlog")}## Captain instruction precedence\nCurrent explicit instruction wins.\n`;
   const def = selectContract(content, undefined);
-  assert.equal(def.complete, false);
-  assert.ok(def.text.length < content.length / 2, "default read is a fraction of the contract");
-  assert.match(def.text, /- 7\. Task lifecycle \(\d+ chars\)/, "the TOC names every section");
-  assert.match(def.text, /Identity rule\./);
-  assert.match(def.text, /Current explicit instruction wins/);
-  assert.doesNotMatch(def.text, /Task lifecycle rule\./);
+  assert.equal(def.complete, true);
+  assert.equal(def.text, content, "default must preserve every native byte, including startup and lock refusal policy");
   const seven = selectContract(content, "7");
   assert.match(seven.text, /Task lifecycle rule\./);
   assert.doesNotMatch(seven.text, /Backlog rule\./, "section 1 must not match 10");
@@ -8631,19 +8642,19 @@ test("oversized firstmate_fm output is capped inline and saved whole on the host
   const host = ownerHost();
   await plugin(host.bb);
   try {
-    const big = `HEAD-MARK\n${"session start line\n".repeat(3000)}TAIL-MARK`;
-    const { writes } = stubRoutedHost(host, (cmd) => (cmd.includes("fm-session-start") ? { payload: big, code: 0 } : { code: 0 }));
+    const big = `HEAD-MARK\n${"peek line\n".repeat(3000)}TAIL-MARK`;
+    const { writes } = stubRoutedHost(host, (cmd) => (cmd.includes("fm-peek") ? { payload: big, code: 0 } : { code: 0 }));
     host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_cap", status: "active", environmentId: "env_1" }));
     host.harness.sdk.stub("environments.get", async () => ({ id: "env_1", hostId: "host_1" }));
     const tool = host.harness.inspection.registrations.agentTools.find((t) => t.name === "firstmate_fm");
     assert.ok(tool);
-    const result = await tool.execute({ script: "session-start" }, { threadId: "thr_cap", projectId: "proj_1" } as never);
+    const result = await tool.execute({ script: "peek" }, { threadId: "thr_cap", projectId: "proj_1" } as never);
     assert.equal(typeof result, "string", JSON.stringify(result).slice(0, 600));
     const out = result as string;
     assert.ok(out.length <= 12_500, `capped: ${out.length}`);
     assert.match(out, /HEAD-MARK/);
     assert.match(out, /TAIL-MARK/);
-    assert.match(out, /full output \(\d+ chars\) saved at \/tmp\/fm-home\/state\/\.bb-tool-output\/fm-session-start-/);
+    assert.match(out, /full output \(\d+ chars\) saved at \/tmp\/fm-home\/state\/\.bb-tool-output\/fm-peek-/);
     const saved = writes.find((w) => w.path.includes(".bb-tool-output/"));
     assert.ok(saved?.content.includes("HEAD-MARK") && saved.content.includes("TAIL-MARK"), "the full output is kept");
     assert.equal(capToolOutput("short", null), "short");
@@ -9284,6 +9295,7 @@ test("bearings counts the real backlog, and queue dispatch adopts a hand-filed n
   try {
     const routed = stubRoutedHost(host, (wrapped) => {
       const cmd = unwrapHostCommand(wrapped);
+      if (cmd.includes("fm-bearings-snapshot.sh")) return { payload: nativeBearingsFixture({ gates: [{ id: "oq-a", title: "Build the export" }, { id: "oq-b", title: "Docs: policy, draft" }] }) };
       if (cmd.includes("fm-tasks-axi.sh") && cmd.includes("'list'")) {
         return { payload: 'count: 2\ntasks[2]{id,state,kind,repo,title}:\n  oq-a,queued,ship,"-",Build the export\n  oq-b,queued,docs,"-","Docs: policy, draft"\n' };
       }
@@ -9298,8 +9310,8 @@ test("bearings counts the real backlog, and queue dispatch adopts a hand-filed n
     host.harness.sdk.stub("environments.get", async () => ({ id: "env_wt", hostId: "host_1", path: "/wt", isWorktree: true, status: "ready" }));
     const bearings = await host.harness.behavior.runCli(["bearings"], { threadId: "thr_cap", projectId: "proj_1" });
     assert.equal(bearings.exitCode, 0, bearings.stderr);
-    assert.match(bearings.stdout, /· 2 queued/);
-    assert.match(bearings.stdout, /oq-b \[docs\] :: Docs: policy, draft/);
+    assert.match(bearings.stdout, /Charted Next/);
+    assert.match(bearings.stdout, /oq-b · Docs: policy, draft/);
     const dispatched = await agentTool(host, "firstmate_queue").execute({ action: "dispatch", queueId: "oq-a" }, { threadId: "thr_cap", projectId: "proj_1" } as never);
     assert.ok(!isToolError(dispatched), toolText(dispatched));
     assert.match(toolText(dispatched), /Dispatched native backlog row oq-a/);
@@ -9471,7 +9483,7 @@ test("maxFanout caps a fan-out dispatch and a watch batch", async () => {
   }
 });
 
-test("wake drain closes open decisions of a crew that is gone, and leaves a registered crew's decision alone", async () => {
+test("wake drain preserves open decisions even when the crew register and metadata are gone", async () => {
   const host = ownerHost({ notifyOwner: "real" });
   await plugin(host.bb);
   try {
@@ -9488,7 +9500,7 @@ test("wake drain closes open decisions of a crew that is gone, and leaves a regi
     assert.equal(result.exitCode, 0, result.stderr);
     const cmds = routed.seen.map(unwrapHostCommand);
     const closers = cmds.filter((c) => c.includes("resolved [key=default]") && c.includes("96b4c16c.status"));
-    assert.equal(closers.length, 1, "the orphan's decision is closed once");
+    assert.equal(closers.length, 0, "an absent crew does not answer its open decision");
     assert.ok(cmds.every((c) => !(c.includes("resolved [key=") && c.includes("live1234.status"))), "a registered crew's decision is never auto-closed");
   } finally {
     await host.harness.lifecycle.dispose();
@@ -10317,4 +10329,155 @@ test("a failed queued row with the same body is re-sent instead of appended", as
   } finally {
     await host.harness.lifecycle.dispose();
   }
+});
+
+
+test("native startup tool routes to the agent shell without attempting a host-terminal lock", async () => {
+  const host = ownerHost();
+  await plugin(host.bb);
+  try {
+    host.harness.sdk.stub("terminal.sessions.create", async () => { throw new Error("startup must not run outside the harness"); });
+    const tool = host.harness.inspection.registrations.agentTools.find(t => t.name === "firstmate_fm")!;
+    for (const script of ["session-start", "fm-sessionstart-run.sh", "sessionstart-nudge"]) {
+      const result = await tool.execute({ script, args: ["--source", "compact"] }, { threadId: "thr_cap", projectId: "proj_1" } as never);
+      assert.equal(typeof result, "string");
+      assert.match(result as string, /agent's shell tool/);
+      assert.match(result as string, /No native startup or lock acquisition has been attempted/);
+      assert.ok((result as string).includes(captainStartupCommand("/tmp/fm-home", script, ["--source", "compact"])!));
+    }
+    assert.equal(host.harness.sdk.callsTo("terminal.sessions.create").length, 0);
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("startup command preserves shell arguments without executing their contents", () => {
+  const home = "/tmp/fm home'quoted";
+  const arg = "$(touch /tmp/firstmate-should-never-exist); `id`\n--source";
+  const command = captainStartupCommand(home, "session-start", [arg])!;
+  const work = mkdtempSync(join(tmpdir(), "startup-quote-"));
+  try {
+    const actualHome = join(work, "fm home'quoted");
+    mkdirSync(join(actualHome, "bin-bb"), { recursive: true });
+    writeFileSync(join(actualHome, "bin-bb/fm-session-start.sh"), '#!/usr/bin/env python3\nimport json,os,sys\nprint(json.dumps([os.getcwd(), os.environ["FM_HOME"], os.environ["FM_ROOT_OVERRIDE"], os.environ["FM_BACKEND"], sys.argv[1:]]))\n', { mode: 0o755 });
+    const result = spawnSync("bash", ["-c", captainStartupCommand(actualHome, "session-start", [arg])!], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), [actualHome, actualHome, actualHome, "bb", [arg]]);
+    assert.ok(command.includes("bin-bb/fm-session-start.sh"));
+    assert.equal(captainStartupCommand(home, "peek"), null);
+  } finally { rmSync(work, { recursive: true, force: true }); }
+});
+
+
+test("CLI startup returns the same harness-shell command without host execution", async () => {
+  const host = ownerHost();
+  await plugin(host.bb);
+  try {
+    host.harness.sdk.stub("terminal.sessions.create", async () => { throw new Error("detached startup must not execute"); });
+    const result = await host.harness.behavior.runCli(["fm", "session-start", "--source", "compact", "--json"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    const body = JSON.parse(result.stdout);
+    assert.equal(body.requiresAgentShell, true);
+    assert.equal(body.command, captainStartupCommand("/tmp/fm-home", "session-start", ["--source", "compact"]));
+    assert.equal(host.harness.sdk.callsTo("terminal.sessions.create").length, 0);
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+
+for (const missing of [false, true]) {
+  test(`native replacement retry ${missing ? "preserves the prior thread when its brief is missing" : "uses the native brief through the shared transport wrapper"}`, async () => {
+    const home = scratchFmHome();
+    mkdirSync(join(home, "config"));
+    mkdirSync(join(home, "bin-bb/backends"), { recursive: true });
+    mkdirSync(join(home, "data/c1"), { recursive: true });
+    writeFileSync(join(home, "config/bb-overlay"), "bb\n");
+    cpSync(join(OVERLAY_ROOT, "bin/backends/bb.sh"), join(home, "bin-bb/backends/bb.sh"));
+    cpSync(join(OVERLAY_ROOT, "bin/backends/bb-worker-transport.txt"), join(home, "bin-bb/backends/bb-worker-transport.txt"));
+    symlinkSync(join(FM_TEST_BIN, "fm-composer-lib.sh"), join(home, "bin-bb/fm-composer-lib.sh"));
+    const brief = "FIRSTMATE_OP: v1 launch-brief\nNative role sentinel\npaused: native wait\n";
+    if (!missing) writeFileSync(join(home, "data/c1/brief.md"), brief);
+    const host = itHost(home, { transport: "real" });
+    await plugin(host.bb);
+    try {
+      stubRealExecHost(host);
+      host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: "error", environmentId: "env_wt" }));
+      host.harness.sdk.stub("environments.get", async () => ({ id: "env_wt", hostId: "host_1", status: "ready", path: "/repo/isolated", isWorktree: true }));
+      host.harness.sdk.stub("threads.stop", async () => ({}));
+      host.harness.sdk.stub("threads.archive", async () => ({}));
+      host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_new" }));
+      await host.bb.storage.kv.set("crews", [{ ...crewRow("c1", "thr_crew", "thr_cap"), nativeHome: home, backlogRow: true }]);
+      const result = await host.harness.behavior.runCli(["retry", "c1", "--reasoning-level", "xhigh"]);
+      assert.equal(result.exitCode, missing ? 1 : 0, result.stderr);
+      if (missing) {
+        assert.match(result.stderr, /Prior thread preserved/);
+        assert.equal(host.harness.sdk.callsTo("threads.stop").length, 0);
+        assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
+      } else {
+        const spawned = host.harness.sdk.callsTo("threads.spawn")[0]![0] as { prompt: string };
+        assert.ok(spawned.prompt.includes(brief));
+        assert.doesNotMatch(spawned.prompt, /Never poll CI|WAITING:|stop every timer|final message MUST/);
+      }
+    } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
+  });
+}
+
+test("native worker idle honors durable status without imposing chat verdicts or scheduled resumes", async () => {
+  const host = ownerHost({ transport: "real", watchOwner: "fm-watch", supervisionEnabled: true });
+  await plugin(host.bb);
+  try {
+    stubIdleSdk(host);
+    host.harness.sdk.stub("threads.queuedMessages.list", async () => []);
+    await host.bb.storage.kv.set("crews", [{ ...crewRow("c1", "thr_crew", "thr_cap"), nativeHome: "/tmp/fm-home", backlogRow: true }]);
+    for (const reply of ["Finished; report saved.", "WAITING: old injected vocabulary", null]) {
+      const event = await emitIdle(host, reply);
+      assert.deepEqual(event.errors, []);
+    }
+    assert.equal(sendCalls(host).length, 0, "native watcher owns completion and paused declarations");
+    assert.equal(await host.bb.storage.kv.get("crew-waiting"), undefined);
+    assert.equal(await host.bb.storage.kv.get("protocol-nudges"), undefined);
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("native Bearings uses canonical decisions and gates across CLI, tool, session and RPC", async () => {
+  const host = ownerHost({ transport: "real" });
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRoutedHost(host, cmd => cmd.includes("fm-bearings-snapshot.sh") ? { payload: nativeBearingsFixture({
+      home: "fixture/base-label",
+      in_flight: [{ id: "c1", kind: "ship", state: "working", name: "Native active task" }, {id:"mate/child",kind:"ship",state:"working",name:"Secondmate child"}],
+      decisions_open: [{ id: "c1", key: "choice", verb: "needs-decision", summary: "Native owner must choose" }],
+      gates: [{ id: "later", title: "Waiting for choice", blocked_by: "c1" }],
+    }) } : {});
+    await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew", "thr_cap")]);
+    host.harness.sdk.stub("threads.output", async () => ({ output: "DONE: false chat outcome" }));
+    for (const command of [["bearings"], ["session"]]) {
+      const result = await host.harness.behavior.runCli(command, { threadId: "thr_cap" });
+      assert.equal(result.exitCode, 0, result.stderr);
+      assert.match(result.stdout, /Native owner must choose/);
+      assert.match(result.stdout, /Charted Next[\s\S]*Waiting for choice/);
+      assert.doesNotMatch(result.stdout, /ready to review|false chat outcome/);
+    }
+    const tool = await agentTool(host, "firstmate_bearings").execute({}, { threadId: "thr_cap" } as never);
+    assert.match(toolText(tool), /Native owner must choose/);
+    const rpc = await host.harness.behavior.callRpc("fleet", { threadId: "thr_cap" }) as { calls: string[]; ready: unknown[]; running: {id:string;threadId:string}[] };
+    assert.match(rpc.calls.join("\n"), /Native owner must choose/);
+    assert.deepEqual(rpc.ready, []);
+    assert.equal(rpc.running.find(r => r.id === "c1")?.threadId,"thr_crew");
+    assert.equal(rpc.running.find(r => r.id === "mate/child")?.threadId,"");
+    assert.ok(seen.some(cmd => cmd.includes("fm-bearings-snapshot.sh") && cmd.includes("--json")));
+    assert.equal(host.harness.sdk.callsTo("threads.output").length, 0);
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("registered captain reports a missing installed hook while other threads stay inert", () => {
+  const root = mkdtempSync(join(tmpdir(), "fm-hook-command-"));
+  try {
+    mkdirSync(join(root,".bb-firstmate/captains"),{recursive:true});
+    writeFileSync(join(root,".bb-firstmate/captains/thr_registered"),"home=/fixture\n");
+    const command = captainHookCommand("session-start").replaceAll("$HOME",root);
+    const registered = spawnSync("bash",["-c",command],{encoding:"utf8",env:{...process.env,BB_THREAD_ID:"thr_registered"}});
+    assert.equal(registered.status,1);
+    assert.match(registered.stderr,/registered captain missing hook/);
+    const other = spawnSync("bash",["-c",command],{encoding:"utf8",env:{...process.env,BB_THREAD_ID:"thr_other"}});
+    assert.equal(other.status,0);
+    assert.equal(other.stderr,"");
+  } finally {rmSync(root,{recursive:true,force:true});}
 });

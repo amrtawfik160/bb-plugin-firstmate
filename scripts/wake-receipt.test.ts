@@ -404,6 +404,8 @@ test("zero-cutoff native recovery episodes require explicit handling acknowledge
 test("captain stop hook blocks pairless pending receipt and preserves recursion guard", (t) => {
   const f = fixture(t, { unread: "note with no native queue\n" });
   f.run();
+  mkdirSync(join(f.dir, "bin-bb"));
+  writeFileSync(join(f.dir, "bin-bb/fm-turnend-guard.sh"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
   const markers = join(f.dir, ".bb-firstmate/captains");
   mkdirSync(markers, { recursive: true });
   writeFileSync(join(markers, "thr_test"), `home=${f.dir}\nstate=${f.state}\n`);

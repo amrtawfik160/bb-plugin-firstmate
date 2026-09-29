@@ -52,8 +52,8 @@ host-terminal command. The plugin closes each as far as the SDK allows:
 
 | Native guarantee | BB mechanism | Remaining gap |
 | --- | --- | --- |
-| Turn-end wake guard (`fm-turnend-guard.sh`) | `deck` installs user-level Claude/Codex `Stop` hooks (`overlay/bin/bb-captain-hook.sh`), gated on `~/.bb-firstmate/captains/<thread>`. A captain with unacknowledged wakes is blocked once per turn (exit 2; `stop_hook_active` allows the next stop). Other threads exit 0. | Queued-wake or pending-receipt predicate; watcher health stays with the plugin's supervisor. Codex asks to trust new hook entries once before it runs them. |
-| Session lock owned by the harness | The same hooks run `fm-sessionstart-run.sh` from `SessionStart`, inside the harness process tree, for a captain with its own home. | Legacy captains on the shared base home do not take its lock; run `deck` to move them to their own home. |
+| Turn-end wake guard (`fm-turnend-guard.sh`) | `deck` installs user-level Claude/Codex `Stop` hooks (`overlay/bin/bb-captain-hook.sh`), gated on `~/.bb-firstmate/captains/<thread>`. The adapter runs native supervision predicates first, then the BB receipt/queue guard. Claude also receives native `stop --claude` and `stop-autoarm` with `asyncRewake`. Other threads exit 0. | Native script routing and synchronous guard are exercised under the agent harness. End-to-end Claude async hook ownership, successor survival and rewake delivery in BB remain unverified. Codex asks to trust new hook entries once before it runs them. |
+| Session lock owned by the harness | The same hooks run `bin-bb/fm-sessionstart-run.sh` from `SessionStart`, inside the harness process tree, for a captain with its own home. If the digest is absent, `firstmate_fm` supplies the equivalent agent-shell startup command rather than using a detached host terminal. | Legacy captains on the shared base home do not take its lock; run `deck` to move them to their own home. |
 | Wakes delivered at turn boundaries | Plugin-owned routine durable wakes are grouped for 1.5 seconds, persisted before delivery, and recovered after reload. Decisions/failures bypass that delay. Redundant plugin completion pings are skipped when BB core owns the outcome. | BB core child completion bypasses `message.dispatch`; the hook cannot batch or silently suppress that path. Hidden UI rows still cost model tokens. |
 | Root wake queue drained by its session | Captains drain their own partition. The fm-watch supervisor acknowledges shared base-home root rows older than 10 minutes, after the relay forwarded them. | Skipped when a captain is bound to the base home itself. |
 
@@ -82,3 +82,32 @@ of core child completions; (2) stable supervisor event/turn/generation and origi
 identifiers across every provider; (3) a supported blocking lifecycle gate or durable
 continuation equivalent; (4) consistent provider usage and activity telemetry.
 No installed BB core files are patched here.
+
+## Prompt ownership
+
+The complete current native supervisor contract is read verbatim by default.
+BB entry skills only bind the home and select transport; they contain no independent intake, delivery, authority, or supervision playbook.
+Every registered upstream skill is covered by the fidelity check; verbatim skill copies are compared byte for byte, including deletions and frontmatter.
+Bearings uses the native four-section contract.
+The BB runtime still has the limits documented above; prompt fidelity does not establish identical hook or event capabilities across all providers.
+
+Startup transport proof: `node --experimental-strip-types scripts/live-startup-harness-check.mjs` runs real native startup beneath the current harness and in an orphaned host process.
+The former must acquire the real harness lock; the latter must refuse read-only without changing that lock.
+`--mutate-host-transport` routes the positive case through the detached path and must fail the acquisition assertion.
+
+## Native worker and Bearings authority
+
+Native launch and replacement prompts retain `data/<id>/brief.md`. The shared
+`bb-worker-transport.txt` adds only browser and home/path transport instructions.
+Replacement refuses before stopping the prior thread if the native brief cannot
+be read. Native workers use upstream durable status and paused/process-event
+contracts; BB does not inject WAITING, scheduled resumes, mandatory timer shutdown
+or final-chat verdict nudges. The SDK-only compatibility transport retains its
+legacy lifecycle and is outside this native-policy claim.
+
+Bearings tool, CLI, session and RPC read `fm-bearings-snapshot.sh --json`, preserve
+its classification and publish the prescribed local secondmate reconcile request.
+The digest discloses contribution coverage, date/age gates, omitted surfaces and
+secondmate integrity warnings. Unregistered native tasks have no BB thread link.
+Wake reads preserve unanswered metaless decisions; absence and age never answer
+a captain decision. See [implementation verification](verification/native-policy-fixes-2026-09-29.md).

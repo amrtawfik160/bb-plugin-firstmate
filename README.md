@@ -18,7 +18,7 @@ bb plugin install path:/path/to/bb-plugin-firstmate --yes
 
 Requires `bb >= 0.43` and `bbPluginSdk >= 0.4.87` (see `package.json` engines).
 
-Update the plugin itself with `bb plugin update firstmate`. The pinned upstream Firstmate checkout updates separately: re-running `/captain` (or `bb firstmate init --real`) fast-forwards an existing `fmHome` clone in place (ff-only, requires a clean tree).
+Update the plugin itself with `bb plugin update firstmate`. Re-running `/captain` (or `bb firstmate init --real`) fast-forwards a clean `fmHome` clone to the plugin’s audited upstream commit, keeping scripts and skills on the same revision.
 
 ## Quick start
 
@@ -130,6 +130,11 @@ BB-specific behavior in this fork:
 ## Skills
 
 The plugin registers 28 upstream `.agents/skills` (all except `firstmate-calm`, which it leaves out) as real BB skills, plus `/captain` and `/firstmate`. Their policy text is pinned to upstream commit `2d833ff1`; one shared runtime contract translates script paths, workers, approvals, and alternate harness mechanics to `firstmate_fm` and BB threads. Crew threads still receive no captain skills.
+
+`/captain` is a BB bootstrap: it binds this thread's home and reads the complete upstream `AGENTS.md` verbatim through `firstmate_contract`. Section arguments remain available for later lookup. Upstream owns intake, authority, delivery, and supervision policy; BB instructions only map paths, threads, browser access, and durable wake receipts. The fidelity check covers both entry skills and every registered upstream skill, and requires byte-for-byte preservation for verbatim skill copies.
+
+Native startup must run beneath the agent harness to acquire its session lock. `firstmate_fm` returns an agent-shell command for `session-start`, `sessionstart-run`, and `sessionstart-nudge` instead of attempting startup through BB's detached host-terminal RPC. SessionStart hooks use the same `bin-bb` mirror and explicit native home. A genuine native lock refusal retains read-only behavior; startup transport is repaired without bypassing the refusal.
+
 
 ## Crew message delivery
 

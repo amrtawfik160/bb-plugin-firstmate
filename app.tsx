@@ -94,9 +94,9 @@ function FleetBoard() {
         <ul>
           {fleet.ready.map((crew) => (
             <li key={crew.id}>
-              <button type="button" className="fm-link" onClick={() => nav.toThread(crew.threadId)}>
+              {crew.threadId ? <button type="button" className="fm-link" onClick={() => nav.toThread(crew.threadId)}>
                 {crew.id}
-              </button>{" "}
+              </button> : <span>{crew.id}</span>}{" "}
               [{crew.shape}] {crew.task}
               {crew.prUrl !== "" ? (
                 <>
@@ -115,9 +115,9 @@ function FleetBoard() {
         <ul>
           {fleet.running.map((crew) => (
             <li key={crew.id}>
-              <button type="button" className="fm-link" onClick={() => nav.toThread(crew.threadId)}>
+              {crew.threadId ? <button type="button" className="fm-link" onClick={() => nav.toThread(crew.threadId)}>
                 {crew.id}
-              </button>{" "}
+              </button> : <span>{crew.id}</span>}{" "}
               [{crew.status}] {crew.task}
             </li>
           ))}
