@@ -200,6 +200,30 @@ def generate_patched_copies(home: Path, overlay: Path, dest_dir: Path) -> dict[s
     return source_shas
 
 
+# Every overlay file the install consumes; the plugin ships exactly these to a remote
+# host (server.ts OVERLAY_INSTALL_INPUTS), so both sides hash the same set.
+OVERLAY_INSTALL_INPUTS = (
+    "bin/backends/bb.sh",
+    "docs/bb-backend.md",
+    "firstmate-bb-backend.patch",
+    "firstmate-bb-teardown.patch",
+    "firstmate-bb-local-merge.patch",
+    "firstmate-bb-browser.patch",
+    "install-bb-backend.py",
+)
+
+
+def overlay_fingerprint(overlay: Path) -> str:
+    """Content hash of the overlay a mirror is built from. The plugin computes the
+    same hash (server.ts overlayFingerprint) to spot a home still running an older
+    adapter after a plugin update: path, NUL, bytes, NUL per input file, in order."""
+    digest = hashlib.sha256()
+    for rel in OVERLAY_INSTALL_INPUTS:
+        path = overlay / rel
+        digest.update(rel.encode() + b"\0" + (path.read_bytes() if path.is_file() else b"") + b"\0")
+    return digest.hexdigest()
+
+
 def build_mirror(home: Path, overlay: Path) -> Path:
     """ATOMICALLY (re)build <home>/bin-bb. The mirror is built in full inside a
     STAGING directory and swapped into place only on complete success, so a failed
@@ -233,7 +257,7 @@ def build_mirror(home: Path, overlay: Path) -> Path:
             os.symlink(os.path.join("..", "bin", entry), staging / entry)
 
         source_shas = generate_patched_copies(home, overlay, staging)
-        write_manifest(home, staging, native_entries, source_shas)
+        write_manifest(home, staging, native_entries, source_shas, overlay_fingerprint(overlay))
     except BaseException:
         # Includes die_loud()/die()'s SystemExit: discard the half-built staging and
         # leave the previously-working mirror untouched.
@@ -264,12 +288,14 @@ def _atomic_swap(mirror: Path, staging: Path) -> None:
     _rm_path(backup)
 
 
-def write_manifest(home: Path, mirror: Path, native_entries: list[str], source_shas: dict[str, str]) -> None:
+def write_manifest(home: Path, mirror: Path, native_entries: list[str], source_shas: dict[str, str], overlay_sha: str) -> None:
     """Record what the mirror was built from so a later out-of-band fast-forward can be
-    detected as stale (F2). Lines: head=<sha>, entries=<name,name,...>, src=<file>:<sha>."""
+    detected as stale (F2). Lines: head=<sha>, overlay=<sha>, entries=<name,name,...>,
+    src=<file>:<sha>."""
     lines = [
         "# firstmate bb mirror manifest (bb-plugin-firstmate) — do not edit",
         f"head={head_commit(home)}",
+        f"overlay={overlay_sha}",
         f"entries={','.join(native_entries)}",
     ]
     for f in PATCHED_FILES:
@@ -294,7 +320,7 @@ def read_manifest(mirror: Path) -> dict[str, str] | None:
     return data
 
 
-def verify_mirror(home: Path) -> list[str]:
+def verify_mirror(home: Path, overlay: Path | None = None) -> list[str]:
     """Return a list of staleness/breakage reasons (empty == healthy). Checks that
     every native bin entry still has a live mirror counterpart (missing SCRIPT_DIR
     sibling), that the manifest HEAD matches the current HEAD, and that the pristine
@@ -321,6 +347,13 @@ def verify_mirror(home: Path) -> list[str]:
     recorded = manifest.get("head", "")
     if current and recorded and current != recorded:
         reasons.append(f"HEAD moved since the mirror was built ({recorded[:12]} -> {current[:12]}); re-run the installer")
+    # Overlay drift: the plugin shipped a newer adapter or patch set since this build.
+    if overlay is not None and overlay.is_dir():
+        built = manifest.get("overlay", "")
+        if built == "":
+            reasons.append("mirror records no overlay fingerprint (built by an older overlay); re-run the installer")
+        elif built != overlay_fingerprint(overlay):
+            reasons.append("overlay changed since the mirror was built (newer bb.sh or patches); re-run the installer")
     # Frozen-copy drift: the pristine native source of a patched copy changed since the
     # copy was generated, so the copy no longer reflects upstream.
     for f in PATCHED_FILES:
@@ -463,14 +496,14 @@ def main() -> None:
         die(f"{home} is not a firstmate root")
 
     if args.verify:
-        reasons = verify_mirror(home)
+        reasons = verify_mirror(home, Path(args.overlay).resolve() if args.overlay else Path(__file__).resolve().parent)
         if reasons:
             print("FM_MIRROR_STALE: the bb mirror is stale or broken:", file=sys.stderr)
             for r in reasons:
                 print(f"  - {r}", file=sys.stderr)
             print("  Re-run install-bb-backend.py to rebuild the mirror.", file=sys.stderr)
             raise SystemExit(1)
-        print("mirror OK: siblings present, HEAD matches, frozen copies current.")
+        print("mirror OK: siblings present, HEAD matches, overlay current, frozen copies current.")
         return
 
     overlay = Path(args.overlay).resolve() if args.overlay else Path(__file__).resolve().parent

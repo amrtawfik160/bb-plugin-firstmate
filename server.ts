@@ -1122,6 +1122,28 @@ function overlayBytes(rel: string): string {
   return readFileSync(join(OVERLAY_DIR, rel)).toString("base64");
 }
 
+// The overlay files a mirror install consumes, in the order install-bb-backend.py
+// (OVERLAY_INSTALL_INPUTS) hashes them into the manifest's overlay= fingerprint.
+export const OVERLAY_INSTALL_INPUTS = [
+  "bin/backends/bb.sh",
+  "docs/bb-backend.md",
+  "firstmate-bb-backend.patch",
+  "firstmate-bb-teardown.patch",
+  "firstmate-bb-local-merge.patch",
+  "firstmate-bb-browser.patch",
+  "install-bb-backend.py",
+] as const;
+
+export function overlayFingerprint(dir = OVERLAY_DIR): string {
+  const digest = createHash("sha256");
+  for (const rel of OVERLAY_INSTALL_INPUTS) {
+    let bytes: Buffer;
+    try { bytes = readFileSync(join(dir, rel)); } catch { bytes = Buffer.alloc(0); }
+    digest.update(Buffer.concat([Buffer.from(rel), Buffer.from([0]), bytes, Buffer.from([0])]));
+  }
+  return digest.digest("hex");
+}
+
 function normalizeFmScript(raw: string): string {
   let name = raw.trim();
   if (name.startsWith("fm-")) name = name.slice(3);
@@ -2019,6 +2041,36 @@ export default async function plugin(bb: BbPluginApi) {
     try { return await operation(); } finally {
       release();
       if (ledgerMutations.get(key) === pending) ledgerMutations.delete(key);
+    }
+  }
+  // fm-spawn holds the home's task-set lock through BB thread creation and refuses,
+  // not waits, when another spawn holds it. Two dispatches into one home therefore
+  // failed whenever the first was slow (a host outage kept one spawning for 7 min).
+  // Run this plugin's spawns one at a time per home, with a bounded wait.
+  const SPAWN_GATE_WAIT_MS = 5 * 60_000;
+  const spawnGates = new Map<string, { done: Promise<void>; since: number }>();
+  async function withHomeSpawnGate<T>(home: string, operation: () => Promise<T>): Promise<T> {
+    for (;;) {
+      const current = spawnGates.get(home);
+      if (current === undefined) break;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const finished = await Promise.race([
+        current.done.then(() => true),
+        new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), SPAWN_GATE_WAIT_MS); }),
+      ]);
+      clearTimeout(timer);
+      if (!finished) {
+        throw new Error(`Another crew spawn in this home has been running for ${Math.round((Date.now() - current.since) / 1000)}s (BB host slow or disconnected?); this spawn was not started.`);
+      }
+    }
+    let release!: () => void;
+    const done = new Promise<void>((resolve) => { release = resolve; });
+    spawnGates.set(home, { done, since: Date.now() });
+    try {
+      return await operation();
+    } finally {
+      spawnGates.delete(home);
+      release();
     }
   }
   function withLedgerOperation<T>(name: string, captain: string | undefined, operation: () => Promise<T>): Promise<T> {
@@ -3420,7 +3472,7 @@ export default async function plugin(bb: BbPluginApi) {
     let spawnFailed = false;
     let spawnFailure = "Native spawn returned without a recorded worker.";
     try {
-      const res = await runFmScript({
+      const res = await withHomeSpawnGate(fmHome, () => runFmScript({
         script: "spawn",
         args,
         hostId,
@@ -3430,7 +3482,7 @@ export default async function plugin(bb: BbPluginApi) {
         env,
         timeoutMs: fmTimeoutMs("spawn", undefined),
         signal,
-      });
+      }));
       if (res.exitCode !== 0) {
         spawnFailed = true;
         spawnFailure = `fm-spawn exit ${res.exitCode}: ${res.output.slice(-2000)}`;
@@ -5963,6 +6015,27 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  // A long-lived captain only re-installs its mirror on /captain, so after a plugin
+  // update its crews kept the old bb.sh (old spawn brief, old liveness rules) until
+  // someone re-decked. Rebuild a home whose manifest names a different overlay.
+  async function refreshStaleMirror(hostId: string, home: string, captain: string, signal?: AbortSignal): Promise<void> {
+    const q = shQuote(home);
+    const probe = await runOnHost(hostId,
+      `if [ -d ${q}/bin-bb ]; then printf 'FM_OVERLAY=%s\\n' "$(sed -n 's/^overlay=//p' ${q}/bin-bb/.mirror-manifest 2>/dev/null)"; else echo FM_NO_MIRROR; fi`,
+      STUCK_HOST_CALL_MS, signal);
+    const built = /FM_OVERLAY=([0-9a-f]*)/.exec(probe.output)?.[1];
+    if (probe.exitCode !== 0 || built === undefined) return;
+    if (built === overlayFingerprint()) return;
+    const projectId = await bb.storage.kv.get<string>(`${CAPTAIN_PROJECT_PREFIX}${captain}`);
+    try {
+      await installBbBackend(hostId, home, typeof projectId === "string" && projectId !== "" ? projectId : undefined, 180_000, signal);
+      bb.log.info(`bb mirror refreshed for ${home}: it was built from ${built === "" ? "an unfingerprinted" : "an older"} overlay`);
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      bb.log.warn(`bb mirror refresh failed for ${home}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   async function installBbBackend(
     hostId: string,
     home: string,
@@ -5990,15 +6063,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
       return result.output;
     }
-    const files: Record<string, string> = {
-      "bin/backends/bb.sh": overlayBytes("bin/backends/bb.sh"),
-      "docs/bb-backend.md": overlayBytes("docs/bb-backend.md"),
-      "firstmate-bb-backend.patch": overlayBytes("firstmate-bb-backend.patch"),
-      "firstmate-bb-teardown.patch": overlayBytes("firstmate-bb-teardown.patch"),
-      "firstmate-bb-local-merge.patch": overlayBytes("firstmate-bb-local-merge.patch"),
-      "firstmate-bb-browser.patch": overlayBytes("firstmate-bb-browser.patch"),
-      "install-bb-backend.py": overlayBytes("install-bb-backend.py"),
-    };
+    const files: Record<string, string> = Object.fromEntries(OVERLAY_INSTALL_INPUTS.map((rel) => [rel, overlayBytes(rel)]));
     const py = [
       "import base64, json, os, pathlib, subprocess, sys, tempfile",
       "home = pathlib.Path(sys.argv[1])",
@@ -10746,6 +10811,8 @@ export default async function plugin(bb: BbPluginApi) {
       const seen = new Map<string, Set<string>>();
       // A deleted captain 404s forever; without this every pass logged it again.
       const deletedCaptains = new Set<string>();
+      // Homes whose bb mirror was checked against this load's overlay (once per load).
+      const overlayChecked = new Set<string>();
       while (!signal.aborted) {
         for (const key of await bb.storage.kv.list("native-home:")) {
           if (signal.aborted) break;
@@ -10761,6 +10828,11 @@ export default async function plugin(bb: BbPluginApi) {
                 await stopFmWatchKeeper(host, s.fmHome, signal);
                 seen.delete(captain);
                 return;
+              }
+              const checkKey = `${host}:${s.fmHome}`;
+              if (s.fmHome.trim() !== "" && !overlayChecked.has(checkKey)) {
+                overlayChecked.add(checkKey);
+                await refreshStaleMirror(host, s.fmHome, captain, signal);
               }
               if (s.watchOwner !== "fm-watch") {
                 await stopFmWatchKeeper(host, s.fmHome, signal);
