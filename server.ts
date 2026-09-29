@@ -2724,7 +2724,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   // "failed" drops only rejected resumes; "all" also cancels a still-scheduled one, so a
   // crew never holds more than one pending resume and a finished crew holds none.
-  async function dropResumeRows(crew: Crew, which: "failed" | "all"): Promise<number> {
+  async function dropResumeRows(crew: Pick<Crew, "id" | "threadId">, which: "failed" | "all"): Promise<number> {
     let rows: Awaited<ReturnType<typeof bb.sdk.threads.queuedMessages.list>>;
     try {
       rows = await bb.sdk.threads.queuedMessages.list({ threadId: crew.threadId });
@@ -4067,9 +4067,28 @@ export default async function plugin(bb: BbPluginApi) {
 
   // A spawned crew whose thread is already in error never started; say so instead
   // of reporting the dispatch as a success.
-  function dispatchStatusNote(status: string): string {
+  function dispatchStatusNote(status: string, failure = ""): string {
+    if (status === "error" && failure !== "") return ` FAILED: BB reports "${failure}". Fix that cause, then firstmate_forget stop=true and dispatch again.`;
     if (status === "error") return " FAILED: the thread is already in error (bad provider/model, or BB refused the launch). Read it with firstmate_crew, then firstmate_forget stop=true and dispatch again.";
     if (status === "pending") return " PENDING: every BB host thread slot is busy; the crew starts on its own when a slot frees. It is tracked now (firstmate_crew / firstmate_watch work).";
+    return "";
+  }
+
+  // BB's own reason a thread is in error (provisioning, provider), e.g. "Provisioning
+  // thread failed: Host is not connected", so a failed dispatch names its real cause.
+  async function threadFailureDetail(threadId: string): Promise<string> {
+    try {
+      const rows = await raceAbort(bb.sdk.threads.events.list({
+        threadId, order: "desc", limit: "20", types: ["system/error", "provider/error"],
+      }), undefined, STUCK_HOST_CALL_MS);
+      for (const row of rows) {
+        const data = asRecord(row.data);
+        const parts = [data["message"], data["detail"]].filter((v): v is string => typeof v === "string" && v.trim() !== "");
+        if (parts.length > 0) return truncate(parts.join(": "), 300);
+      }
+    } catch {
+      // the generic note still applies
+    }
     return "";
   }
 
@@ -5617,8 +5636,16 @@ export default async function plugin(bb: BbPluginApi) {
             result = { ...result, output: `${result.output.trim()}\ncaptain-hold complete --none refused: ${gate.output.trim()}` };
           }
         }
-        requireNativeSuccess(result, `teardown ${crew.id} (crew retained for retry)`);
-        nativeTeardown = true;
+        // No native task record (spawn never wrote it, or native already retired it):
+        // there is nothing native to tear down, so BB-side cleanup below takes over.
+        const noRecord = result.exitCode !== 0
+          && new RegExp(`task record is not a regular file at \\S*/state/${crew.id}\\.meta\\b`).test(result.output);
+        if (noRecord) {
+          notes.push("no native task record; cleaned up on the BB side");
+        } else {
+          requireNativeSuccess(result, `teardown ${crew.id} (crew retained for retry)`);
+          nativeTeardown = true;
+        }
       }
     }
     if (stop && !nativeTeardown) {
@@ -8299,7 +8326,7 @@ export default async function plugin(bb: BbPluginApi) {
       const warn = wt.sharedOverride ? " WARN: ship crew on shared env." : "";
       const status = await crewStatus(crew);
       if (status === "error") {
-        return toolError(`Dispatch of ${crew.shape} crew ${crew.id} (thread ${crew.threadId}) FAILED:${dispatchStatusNote(status)}`);
+        return toolError(`Dispatch of ${crew.shape} crew ${crew.id} (thread ${crew.threadId}) FAILED:${dispatchStatusNote(status, await threadFailureDetail(crew.threadId))}`);
       }
       return `Dispatched ${crew.shape} crew ${crew.id} as thread ${crew.threadId} (${status}, ${crew.posture}).${warn}${dispatchStatusNote(status)}${permissionLine(crew.id)} Track with: bb firstmate crew ${crew.id}`;
     },
@@ -8852,7 +8879,8 @@ export default async function plugin(bb: BbPluginApi) {
       await writeQueue(items);
       await publishFleet();
       const status = await crewStatus(crew);
-      return `Dispatched ${adopted ? "native backlog row" : "queue"} ${queueId} as ${crew.shape} crew ${crew.id} (${status}).${dispatchStatusNote(status)}${permissionLine(crew.id)}`;
+      const failure = status === "error" ? await threadFailureDetail(crew.threadId) : "";
+      return `Dispatched ${adopted ? "native backlog row" : "queue"} ${queueId} as ${crew.shape} crew ${crew.id} (${status}).${dispatchStatusNote(status, failure)}${permissionLine(crew.id)}`;
     },
   });
 
@@ -9496,6 +9524,11 @@ export default async function plugin(bb: BbPluginApi) {
             const crew = (await readCrews()).find((c) => c.threadId === threadId);
             if (crew === undefined || !(await isCrewWaiting(crew))) {
               bb.log.info(`dropped a stale WAITING resume for thread ${threadId}: the crew is no longer waiting`);
+              // BB keeps a rejected row as a FAILED queue entry; clear it once the
+              // rejection has landed so it neither clutters the queue nor defers a steer.
+              setTimeout(() => {
+                void dropResumeRows(crew ?? { id: threadId, threadId }, "failed").catch(() => {});
+              }, 5_000).unref?.();
               return { action: "reject", message: "Firstmate: this crew is no longer waiting on an external run; the scheduled re-check was dropped." };
             }
           }
@@ -9859,10 +9892,12 @@ export default async function plugin(bb: BbPluginApi) {
                 `fm: bb firstmate fm peek -- ${dispatched.map((c) => c.id).join(" ")}`,
               );
             }
+            const failures = new Map<string, string>();
+            for (const c of dispatched) if (c.status === "error") failures.set(c.id, await threadFailureDetail(c.threadId));
             const text = [
               ...dispatched.map(
                 (c) =>
-                  `Dispatched ${c.shape} crew ${c.id} as thread ${c.threadId} [${c.status}] (${c.worktree ? "worktree" : "shared-env"}, ${c.posture})${dispatchStatusNote(c.status)}${permissionLine(c.id)}\nTrack: bb firstmate crew ${c.id}`,
+                  `Dispatched ${c.shape} crew ${c.id} as thread ${c.threadId} [${c.status}] (${c.worktree ? "worktree" : "shared-env"}, ${c.posture})${dispatchStatusNote(c.status, failures.get(c.id))}${permissionLine(c.id)}\nTrack: bb firstmate crew ${c.id}`,
               ),
               ...hints,
             ].join("\n");

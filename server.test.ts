@@ -1612,6 +1612,29 @@ for (const refusal of [
   });
 }
 
+test("scout forget: a missing native task record falls back to BB-side cleanup instead of dead-ending", async () => {
+  const { host } = await nativeScoutForgetFixture({
+    refusal: "error: teardown refused: task record is not a regular file at /pinned-home/state/c1.meta . BB state was not advanced",
+  });
+  try {
+    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop", "--force"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(host.harness.sdk.callsTo("threads.stop").length + host.harness.sdk.callsTo("threads.archive").length > 0, true, "BB side retires the thread");
+    assert.deepEqual(await crewsKv(host), []);
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("scout forget: another task's missing record is still a refusal", async () => {
+  const { host } = await nativeScoutForgetFixture({
+    refusal: "error: teardown refused: task record is not a regular file at /pinned-home/state/other.meta .",
+  });
+  try {
+    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop", "--force"]);
+    assert.notEqual(result.exitCode, 0);
+    assert.equal((await crewsKv(host))[0]?.id, "c1");
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
 test("scout forget: captain guard precedes native teardown even with force", async () => {
   const { host, routed } = await nativeScoutForgetFixture();
   try {
@@ -8829,6 +8852,27 @@ test("a crew thread born in error is reported as a FAILED dispatch, not a succes
     const viaTool = await agentTool(host, "firstmate_dispatch").execute({ task: "fix login", projectId: "proj_1" }, { projectId: "proj_1" } as never);
     assert.ok(isToolError(viaTool));
     assert.match(toolText(viaTool), /FAILED/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a failed dispatch names BB's own error instead of guessing provider/model", async () => {
+  const host = await load();
+  try {
+    host.harness.sdk.stub("environments.list", async () => [{ hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" }]);
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew" }));
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "error" }));
+    host.harness.sdk.stub("threads.output", async () => ({ output: "" }));
+    host.harness.sdk.stub("threads.events.list", async () => [
+      { type: "system/error", createdAt: 1, data: { code: "thread_provisioning_failed", message: "Provisioning thread failed", detail: "Host is not connected" } },
+    ]);
+    const cli = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--", "fix login"], { projectId: "proj_1" });
+    assert.equal(cli.exitCode, 1);
+    assert.match(cli.stderr, /Provisioning thread failed: Host is not connected/);
+    const viaTool = await agentTool(host, "firstmate_dispatch").execute({ task: "fix login", projectId: "proj_1" }, { projectId: "proj_1" } as never);
+    assert.match(toolText(viaTool), /BB reports "Provisioning thread failed: Host is not connected"/);
+    assert.doesNotMatch(toolText(viaTool), /bad provider\/model/);
   } finally {
     await host.harness.lifecycle.dispose();
   }
