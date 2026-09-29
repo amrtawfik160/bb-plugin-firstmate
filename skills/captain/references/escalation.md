@@ -1,7 +1,7 @@
 <!-- BB-SOURCE
      native: AGENTS.md § 9 (Escalation and captain etiquette)
-     sha: bb69be62e1f8df465d674a35f7e2ce707b900501
-     snapshot: native-snapshot/bb69be62/AGENTS.section-9.md
+     sha: 2d833ff147cd26a5c461e914e06854e0eb2707ce
+     snapshot: native-snapshot/2d833ff1/AGENTS.section-9.md
      fidelity: adapted
      note: Escalation etiquette copied verbatim from native AGENTS.md section 9;
      BB-specific framing and the BB merge-authority model are fenced BB-ONLY, and
