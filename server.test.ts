@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -7939,6 +7939,63 @@ test("captain session-start hook runs native session start only in the captain's
     assert.equal(own.status, 0);
     assert.equal(own.stdout.trim(), `ran ${fm} bb ${fm} ${fm} {"source":"startup"}`);
   } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("captain autoarm defers to a healthy BB keeper and falls back during an outage", async () => {
+  const home = mkdtempSync(join(tmpdir(), "fm-hook-"));
+  const state = join(home, "state");
+  mkdirSync(state);
+  mkdirSync(join(home, "bin-bb"));
+  mkdirSync(join(home, ".bb-firstmate/captains"), { recursive: true });
+  writeFileSync(join(home, ".bb-firstmate/captains/thr_cap"), `home=${home}\nstate=${state}\nown_home=1\n`);
+  writeFileSync(join(home, "bin-bb/fm-claude-stop-autoarm.sh"), '#!/bin/bash\nprintf "fallback %s %s" "$FM_SUPERVISION_MODEL" "$(cat)"\nexit 2\n', { mode: 0o755 });
+  writeFileSync(join(home, "bin-bb/fm-turnend-guard.sh"), "#!/bin/bash\nexit 0\n", { mode: 0o755 });
+  const keeperPath = join(state, ".bb-watch-keeper.sh");
+  writeFileSync(keeperPath, "#!/bin/bash\nwhile :; do sleep 0.1; done\n");
+  const keeper = spawn("bash", [keeperPath], { stdio: "ignore" });
+  await new Promise<void>((resolve, reject) => { keeper.once("spawn", resolve); keeper.once("error", reject); });
+  const run = () => runCaptainHook(home, "stop-autoarm", '{"stop_hook_active":true}', "thr_cap");
+  const fallback = () => {
+    const result = run();
+    assert.equal(result.status, 2, result.stderr);
+    assert.equal(result.stdout, 'fallback autoarm {"stop_hook_active":true}');
+  };
+  const ownerBeat = join(state, ".bb-watch-owner.beat");
+  const watcherBeat = join(state, ".last-watcher-beat");
+  const now = Math.floor(Date.now() / 1000);
+  try {
+    fallback();
+    writeFileSync(join(state, ".bb-watch-keeper.pid"), String(keeper.pid));
+    writeFileSync(ownerBeat, String(now));
+    fallback(); // A live keeper without a watcher beacon does not own supervision.
+    writeFileSync(watcherBeat, "");
+    const quiet = run();
+    assert.equal(quiet.status, 0, quiet.stderr);
+    assert.equal(quiet.stdout + quiet.stderr, "");
+    writeFileSync(ownerBeat, String(now - 601));
+    fallback();
+    writeFileSync(ownerBeat, String(now));
+    utimesSync(watcherBeat, now - 301, now - 301);
+    fallback();
+    utimesSync(watcherBeat, now, now);
+    writeFileSync(ownerBeat, "invalid");
+    fallback();
+    writeFileSync(ownerBeat, String(now + 600));
+    fallback();
+    writeFileSync(ownerBeat, String(now));
+    writeFileSync(join(state, ".bb-watch-keeper.pid"), String(process.pid));
+    fallback(); // A reused pid belonging to another command is not the keeper.
+    writeFileSync(join(state, ".bb-watch-keeper.pid"), String(keeper.pid));
+    writeFileSync(join(state, ".wake-queue"), "1\t1\tsignal\ta.status\tnew work\n");
+    assert.equal(runCaptainHook(home, "stop", "{}", "thr_cap").status, 2, "delegation preserves the unread-work guard");
+    const exited = new Promise<void>(resolve => keeper.once("exit", () => resolve()));
+    keeper.kill("SIGTERM");
+    await exited;
+    fallback();
+  } finally {
+    keeper.kill("SIGTERM");
     rmSync(home, { recursive: true, force: true });
   }
 });

@@ -7,7 +7,7 @@
 # load. These user-level entries restore the two harness-owned guarantees:
 #
 #   stop           Runs native fm-turnend-guard, then guards the BB presentation receipt.
-#   stop-autoarm   Native Claude asyncRewake cooperation; native owns its eligibility.
+#   stop-autoarm   Defer to a healthy BB keeper; otherwise use native asyncRewake.
 #   session-start  Runs native startup inside the harness process tree.
 #
 # Only registered captain threads use these home bindings.
@@ -34,7 +34,27 @@ run_native() {
   cd "$home" 2>/dev/null || {
     printf 'firstmate: captain=%s cannot enter home %s\n' "$thread" "$home" >&2; return 1;
   }
-  printf '%s' "$payload" | FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_STATE_OVERRIDE="$state" FM_BACKEND=bb "$run" "$@"
+  printf '%s' "$payload" | FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_STATE_OVERRIDE="$state" FM_BACKEND=bb FM_SUPERVISION_MODEL=autoarm "$run" "$@"
+}
+
+bb_keeper_healthy() {
+  local keeper_pid keeper_command owner_beat watcher_beat now
+  keeper_pid=$(cat "$state/.bb-watch-keeper.pid" 2>/dev/null || true)
+  case "$keeper_pid" in ''|*[!0-9]*|0) return 1 ;; esac
+  keeper_command=$(ps -p "$keeper_pid" -o args= 2>/dev/null || true)
+  case "$keeper_command" in
+    "bash $state/.bb-watch-keeper.sh"|"/bin/bash $state/.bb-watch-keeper.sh") ;;
+    *) return 1 ;;
+  esac
+  owner_beat=$(cat "$state/.bb-watch-owner.beat" 2>/dev/null || true)
+  watcher_beat=$(stat -c %Y "$state/.last-watcher-beat" 2>/dev/null \
+    || stat -f %m "$state/.last-watcher-beat" 2>/dev/null || true)
+  case "$owner_beat" in ''|*[!0-9]*) return 1 ;; esac
+  case "$watcher_beat" in ''|*[!0-9]*) return 1 ;; esac
+  now=$(date +%s)
+  # Match the keeper's 600s owner TTL and native's default 300s watcher grace.
+  [ "$owner_beat" -le "$now" ] && [ $((now - owner_beat)) -le 600 ] \
+    && [ "$watcher_beat" -le "$now" ] && [ $((now - watcher_beat)) -le 300 ]
 }
 
 case "$mode" in
@@ -61,6 +81,9 @@ case "$mode" in
     exit 2
     ;;
   stop-autoarm)
+    # The keeper already arms and relays this home's watcher. A second owner
+    # can turn a closed cycle into repeated empty recovery turns.
+    bb_keeper_healthy && exit 0
     run_native fm-claude-stop-autoarm.sh
     exit $?
     ;;
