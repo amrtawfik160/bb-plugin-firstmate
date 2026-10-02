@@ -205,6 +205,7 @@ def generate_patched_copies(home: Path, overlay: Path, dest_dir: Path) -> dict[s
 OVERLAY_INSTALL_INPUTS = (
     "bin/backends/bb.sh",
     "bin/backends/bb-worker-transport.txt",
+    "bin/fm-inbox-take.sh",
     "docs/bb-backend.md",
     "firstmate-bb-backend.patch",
     "firstmate-bb-teardown.patch",
@@ -258,6 +259,14 @@ def build_mirror(home: Path, overlay: Path) -> Path:
             os.symlink(os.path.join("..", "bin", entry), staging / entry)
 
         source_shas = generate_patched_copies(home, overlay, staging)
+        helper = overlay / "bin" / "fm-inbox-take.sh"
+        if not helper.is_file():
+            die(f"missing {helper}")
+        dest_helper = staging / "fm-inbox-take.sh"
+        if dest_helper.exists() or dest_helper.is_symlink():
+            dest_helper.unlink()
+        shutil.copy2(helper, dest_helper)
+        os.chmod(dest_helper, 0o755)
         write_manifest(home, staging, native_entries, source_shas, overlay_fingerprint(overlay))
     except BaseException:
         # Includes die_loud()/die()'s SystemExit: discard the half-built staging and

@@ -388,6 +388,25 @@ export function classifyMetaKind(metaContent: string | null): string {
   return kind === "ship" || kind === "scout" || kind === "secondmate" ? kind : "unknown";
 }
 
+/**
+ * True when the latest recognized status line is a declared done or failed
+ * verdict. The verb must lead the line and the body must carry a colon, the
+ * same declaration guard fm-classify-lib uses before a terminal line can move
+ * state. Prose ("Step 2 is done."), a bare DONE, and a quoted line
+ * ("> done: …", "\"DONE: …\"") do not count. A later non-terminal verb wins.
+ */
+export function hasTerminalVerdict(lines: string[]): boolean {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = (lines[i] ?? "").replace(/\r$/, "");
+    if (!/\S/.test(line)) continue;
+    const verb = statusLineVerb(line).toLowerCase();
+    if (!STATUS_VERBS.has(verb)) continue;
+    if (verb !== "done" && verb !== "failed") return false;
+    return stripTimeTag(line).includes(":");
+  }
+  return false;
+}
+
 /** The most recent recognized status verb + note (fm-classify-lib `last_status_line`, verb-filtered). */
 export function latestStatus(lines: string[]): { verb: string; note: string } | null {
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -488,7 +507,21 @@ export function quietShouldSend(event: string): boolean {
 }
 
 
-export const AXI_TOOL_CONTRACT = "Use gh-axi for GitHub and lavish-axi for visual review; read current --help. For all browser work, use the /browser skill and browser_script (or bb browser script). Leave profileId unset for the thread-isolated default profile. This BB browser policy overrides imported native chrome-devtools-axi instructions; do not use the AXI browser or install its hooks. Use quota-axi for quota decisions and the home's bin-bb/fm-tasks-axi.sh for backlog work. In no-mistakes mode, the worker owns the real no-mistakes axi pipeline; a manual checklist is not a substitute. For crew-hosted Lavish boards, open the artifact then use the home's bin-bb/fm-procevent-lavish.sh arm <artifact> --for <task-id>; never start a second poller.";
+export const AXI_TOOL_CONTRACT = "Use gh-axi for GitHub and lavish-axi for visual review; read current --help. When gh-axi returns RATE_LIMITED, use gh api REST for that call. Read gh api rate_limit before waiting. Do not block the task on a GraphQL limit while REST quota remains. For all browser work, use the /browser skill and browser_script (or bb browser script). Leave profileId unset for the thread-isolated default profile. This BB browser policy overrides imported native chrome-devtools-axi instructions; do not use the AXI browser or install its hooks. Use quota-axi for quota decisions and the home's bin-bb/fm-tasks-axi.sh for backlog work. In no-mistakes mode, the worker owns the real no-mistakes axi pipeline; a manual checklist is not a substitute. For crew-hosted Lavish boards, open the artifact then use the home's bin-bb/fm-procevent-lavish.sh arm <artifact> --for <task-id>; never start a second poller.";
+
+// BB-DIVERGE: the idle provider reaper kills nohup and bare `&` orphans when a
+// crew thread goes idle. Native assumes that background work persists.
+// `systemd-run --unit=<name>` survives. This is the whole adaptation.
+export const BB_BACKGROUND_JOB_CONTRACT = "Long background work must survive this thread going idle. Start it with systemd-run --unit=<name>, not nohup and not a shell &. The unit name is the handle that stays after the turn ends.";
+
+// BB-DIVERGE: BB deletes a crew worktree tmp/ when the workspace is archived.
+// Native task artifacts live under data/<task>/.
+export const BB_ARTIFACT_CONTRACT = "Keep durable artifacts under the firstmate home data/<task-id>/, not this worktree tmp/. The worktree tmp/ is removed when the workspace is archived.";
+
+// BB-DIVERGE: native fm_task_inbox_doorbell_line tells the worker to list, read,
+// and mv state/<id>.inbox/*.msg by hand. There is no worker drain helper
+// (fm-inbox.sh drain is the captain note inbox). fm-inbox-take.sh is those steps.
+export const BB_INBOX_TAKE_CONTRACT = "A steering wake that begins with Firstmate instruction waiting is the native inbox doorbell. Run FM_HOME=<home> <home>/bin-bb/fm-inbox-take.sh <task-id>. That script lists state/<task-id>.inbox/*.msg in numeric order and prints each body. After you act, run it again with --ack so it moves each file to handled/. Do not hand-roll those steps.";
 
 // Crews ran `gh-axi run watch` (3s interval) and `pr checks` loops thousands of
 // times and exhausted the GitHub token every crew and captain shares.
@@ -560,6 +593,9 @@ export function crewPrompt(input: {
     AXI_TOOL_CONTRACT,
     CI_POLL_CONTRACT,
     SECRET_HYGIENE_CONTRACT,
+    BB_BACKGROUND_JOB_CONTRACT,
+    BB_ARTIFACT_CONTRACT,
+    BB_INBOX_TAKE_CONTRACT,
     "",
     "Status protocol: when finished, your final message MUST start with exactly one of these lines:",
     "  DONE: <one-line outcome>",

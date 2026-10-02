@@ -15,6 +15,7 @@ import {
   decisionDue,
   classifyMetaKind,
   hasStatusProtocol,
+  hasTerminalVerdict,
   isWaitingYield,
   idleVerdictPresentation,
   looksReadOnly,
@@ -1116,6 +1117,7 @@ function overlayBytes(rel: string): string {
 export const OVERLAY_INSTALL_INPUTS = [
   "bin/backends/bb.sh",
   "bin/backends/bb-worker-transport.txt",
+  "bin/fm-inbox-take.sh",
   "docs/bb-backend.md",
   "firstmate-bb-backend.patch",
   "firstmate-bb-teardown.patch",
@@ -1366,6 +1368,7 @@ const CAPTAIN_TOOLS = [
   "firstmate_stop",
   "firstmate_retry",
   "firstmate_promote",
+  "firstmate_handoff",
   "firstmate_afk",
   "firstmate_quiet",
   "firstmate_queue",
@@ -3172,7 +3175,9 @@ export default async function plugin(bb: BbPluginApi) {
       "import base64,os,sys;p=sys.argv[1];" +
       'intent=base64.b64decode(os.environ["FM_INTENT"]).decode();' +
       'spec=base64.b64decode(os.environ["FM_TASK_OWN_SPEC"]).decode() if "FM_TASK_OWN_SPEC" in os.environ else "Implement the captain\'s intent above exactly; do not widen scope. Small diff, own branch, deliver per the mode contract, then report DONE/BLOCKED/FAILED.";' +
-      "s=open(p).read();s=s.replace('{TASK}',intent).replace('{FIRSTMATE_SPEC}',spec);open(p,'w').write(s)";
+      "s=open(p).read();s=s.replace('{TASK}',intent).replace('{FIRSTMATE_SPEC}',spec);" +
+      "s+='\\n\\nBB-DIVERGE: Keep durable artifacts under data/<task-id>/ in this firstmate home, not the worktree tmp/. The worktree tmp/ is removed when the workspace is archived.\\n';" +
+      "open(p,'w').write(s)";
     const script = [
       `export FM_HOME=${shQuote(fmHome)}`,
       `export FM_ROOT=${shQuote(fmHome)}`,
@@ -3520,8 +3525,8 @@ export default async function plugin(bb: BbPluginApi) {
     const output = await crewOutput(crew);
     const outcome = parseOutcome(output);
     if (outcome !== null && (outcome.startsWith("DONE") || outcome.startsWith("FAILED"))) return true;
-    const latest = latestStatus(statusLinesFrom(output));
-    return latest !== null && (latest.verb === "done" || latest.verb === "failed");
+    // A bare "DONE" or a quoted status line is not a declared verdict.
+    return hasTerminalVerdict(statusLinesFrom(output));
   }
 
   // Idempotently import the KV crew cache into the authoritative real state:
@@ -3950,7 +3955,8 @@ export default async function plugin(bb: BbPluginApi) {
     return (
       `No crews dispatched from this thread. This view is scoped to your own crews; ` +
       `${hostCount} crew(s) on this host belong to other threads/captains — pass --all ` +
-      `(all=true from a tool) to see the whole host.`
+      `(all=true from a tool) to see the whole host. ` +
+      `To take a previous captain's crews onto this deck: bb firstmate handoff --from <previous-captain-thread>.`
     );
   }
 
@@ -4514,7 +4520,11 @@ export default async function plugin(bb: BbPluginApi) {
       }
       const written = await writeInboxRecord(hostId, home, crew.id, message, queue);
       if (!written) throw new Error("Firstmate inbox write failed; instruction delivery is unconfirmed. Inspect the inbox before retrying.");
-      const { record, doorbell } = written;
+      const { record } = written;
+      // BB-DIVERGE: the native doorbell tells the worker to hand-roll list/read/mv.
+      // Name the helper that performs those steps. The native prefix stays so a
+      // worker that only knows the old line can still follow it.
+      const doorbell = `${written.doorbell} On BB, run FM_HOME=${home} ${home}/bin-bb/fm-inbox-take.sh ${crew.id} and, after you act, run it again with --ack.`;
       const previous = await bb.storage.kv.get<InboxDelivery>(key);
       const delivery: InboxDelivery = previous && previous.home === home && previous.crewId === crew.id
         ? previous : { threadId: crew.threadId, hostId, home, crewId: crew.id, senderThreadId: crew.parentThreadId ?? undefined, doorbell, queueIds: [], records: [], retry: false };
@@ -5170,6 +5180,7 @@ export default async function plugin(bb: BbPluginApi) {
       "Other captains' crews on this project (read-only — do not merge, steer, or re-dispatch their PRs; coordinate with that captain):",
       ...lines,
       ...(entries.length > shown.length ? [`  … ${entries.length - shown.length} more`] : []),
+      "To take a previous captain's crews onto this deck: bb firstmate handoff --from <captain-thread>. That moves wakes, tell, and decide. It does not move native state files. firstmate_promote turns a scout into a ship. firstmate_migrate_state backfills KV into state files. Neither changes which captain owns a crew.",
     ];
   }
 
@@ -5350,7 +5361,76 @@ export default async function plugin(bb: BbPluginApi) {
   async function ownerRefusal(crew: Crew, caller: string | undefined, verb: string): Promise<string | null> {
     if (caller === undefined || caller === "" || crew.parentThreadId === null || crew.parentThreadId === caller) return null;
     if (!(await sameProjectCaptains(caller)).others.includes(crew.parentThreadId)) return null;
-    return `Refusing to ${verb} crew ${crew.id}: it belongs to captain @thread:${crew.parentThreadId}, not this captain. Coordinate with that captain first, or pass overrideOwner=true (--override-owner) when the captain told you to take it over.`;
+    return `Refusing to ${verb} crew ${crew.id}: it belongs to captain @thread:${crew.parentThreadId}, not this captain. Take that deck with: bb firstmate handoff --from ${crew.parentThreadId}. Or pass overrideOwner=true (--override-owner) for this one action only; that does not move wakes.`;
+  }
+
+  // BB-DIVERGE: native Firstmate has one operator per home. fm-backlog-handoff.sh
+  // moves backlog items to a secondmate. firstmate_promote turns a scout into a
+  // new ship. firstmate_migrate_state backfills KV into state files. None of
+  // those reparent a crew when the human opens a new captain thread. BB gives
+  // each /captain thread its own home and leaves crews parented to the thread
+  // that dispatched them, so the new captain cannot tell or decide and the old
+  // thread keeps receiving wakes. This is an explicit handoff only. It does not
+  // run by itself, and it does not move native state files out from under a
+  // running worker.
+  async function handoffFromCaptain(from: string, to: string, onlyCrewId?: string): Promise<string> {
+    if (from === "" || to === "") throw new Error("handoff must run on the captain thread that is taking the deck, with --from <previous-captain-thread>.");
+    if (from === to) throw new Error("handoff --from is this captain already.");
+    if (!/^[A-Za-z0-9_-]+$/.test(from)) throw new Error("Bad --from thread id.");
+    const caller = asRecord(await bb.sdk.threads.get({ threadId: to }));
+    const projectId = typeof caller["projectId"] === "string" ? caller["projectId"] : "";
+    if (projectId === "") throw new Error("This captain thread has no project, so handoff cannot tell which crews belong here.");
+    const all = await readCrews();
+    const owned = all.filter((crew) => crew.parentThreadId === from && crew.projectId === projectId);
+    const moving = onlyCrewId === undefined
+      ? owned
+      : owned.filter((crew) => crew.id === onlyCrewId || crew.threadId === onlyCrewId);
+    if (moving.length === 0) {
+      throw new Error(`No crews owned by captain @thread:${from} on this project. firstmate_promote turns a scout into a ship. firstmate_migrate_state backfills KV into state files. Neither moves a deck.`);
+    }
+    const updateParent = bb.sdk.threads.update as (input: { threadId: string; parentThreadId: string }) => Promise<unknown>;
+    const moved: string[] = [];
+    const failed: string[] = [];
+    for (const crew of moving) {
+      if (isSecondmateRoute(crew)) {
+        failed.push(`${crew.id}: a secondmate route stays with its home`);
+        continue;
+      }
+      try {
+        await updateParent({ threadId: crew.threadId, parentThreadId: to });
+        moved.push(crew.id);
+      } catch (error) {
+        failed.push(`${crew.id}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    const movedSet = new Set(moved);
+    if (movedSet.size === 0) throw new Error(`Handoff moved no crews. ${failed.join("; ")}`);
+    {
+      await mutateCrews((crews) => crews.map((crew) => (
+        movedSet.has(crew.id) && crew.parentThreadId === from ? { ...crew, parentThreadId: to } : crew
+      )));
+      const takes = (row: { parentThreadId?: string | null; projectId?: string; crewId?: string | null }): boolean => {
+        if (row.parentThreadId !== from) return false;
+        if (row.projectId !== undefined && row.projectId !== "" && row.projectId !== projectId) return false;
+        if (onlyCrewId !== undefined) return row.crewId != null && movedSet.has(row.crewId);
+        return row.crewId == null || movedSet.has(row.crewId);
+      };
+      await serializeLedger(QUEUE_KEY, async () => {
+        const items = await readQueue();
+        await bb.storage.kv.set(QUEUE_KEY, items.map((row) => (takes(row) ? { ...row, parentThreadId: to } : row)));
+      });
+      await serializeLedger(DECISIONS_KEY, async () => {
+        const items = await readDecisions();
+        await bb.storage.kv.set(DECISIONS_KEY, items.map((row) => (takes(row) ? { ...row, parentThreadId: to } : row)));
+      });
+    }
+    const lines = [
+      `Handed off ${moved.length} crew(s) from @thread:${from} to @thread:${to}: ${moved.join(", ") || "(none)"}.`,
+      "BB thread parent updated. Native state files stay in each crew's existing home.",
+      "Wakes, tell, and decide for these crews now use this captain.",
+    ];
+    if (failed.length > 0) lines.push(`Kept: ${failed.join("; ")}`);
+    return lines.join("\n");
   }
 
   async function guardForeignPr(crew: Crew, url: string, override: boolean): Promise<void> {
@@ -5578,6 +5658,23 @@ export default async function plugin(bb: BbPluginApi) {
       // The background sweep only retires LANDED work. A PR closed unmerged may be
       // one the captain closed to redo, so only a captain's own bearings retires it.
       if (opts.notify === true && state !== "merged") continue;
+      // BB-DIVERGE: native fm-pr-poll.sh does not tear a crew down when a PR
+      // merges, and fm-watch only retires the poll. This sweep exists so an
+      // external merge does not leave a finished ship in the register. It must
+      // not archive a ship that is idle between turns while work continues.
+      // Retirement requires a declared terminal status: done or failed, leading
+      // the line, with a colon. On a native home that is state/<id>.status.
+      // With no native home it is the same declaration in chat. Prose
+      // ("Step 2 is done."), a bare DONE, and a quoted status line do not count.
+      // A status read that fails leaves the crew in place.
+      let terminal = false;
+      try {
+        terminal = hasTerminalVerdict((await crewStatusLines(crew)).lines);
+      } catch (error) {
+        bb.log.warn(`landed crew left in place crew=${crew.id} pr=${url}: status unreadable (${error instanceof Error ? error.message : String(error)})`);
+        continue;
+      }
+      if (!terminal) continue;
       const tell = state === "merged" && (opts.notify === true || (opts.notifyUnless !== undefined && crew.parentThreadId !== opts.notifyUnless));
       try {
         await retireLanded(crew, state === "merged" ? "merged externally" : "PR closed externally", url);
@@ -8155,6 +8252,7 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb firstmate crews | crew <id> | watch [id ...] [--timeout s] [--json]",
     '  bb firstmate tell <id> [--queue] -- "<message>" | interrupt <id> | stop <id> | retry <id> [--model m] [--provider p] [--reasoning-level l] [--reason r]',
     "  bb firstmate bearings | deliver <id> | merge <id> [--yes] [--allow-red <check-name>] [--allow-missing <check-name>] | promote <id>",
+    "  bb firstmate handoff --from <previous-captain-thread> [--crew <id>]",
     '  bb firstmate queue add --project <id> [--shape s] [--mode m] [--after <qid>] [--wait-until <iso>] -- "<title>"',
     "  bb firstmate queue [list|next|dispatch <qid>|done <qid>|drop <qid>|prune]",
     '  bb firstmate decide ask [--option o ...] [--crew <id>] -- "<question>"',
@@ -8702,6 +8800,24 @@ export default async function plugin(bb: BbPluginApi) {
         parentThreadId: scout.parentThreadId,
       });
       return `Promoted scout ${scout.id} → ship ${ship.id} (${ship.threadId}). Scout record kept until forget.`;
+    },
+  });
+
+  registerCaptainTool({
+    name: "firstmate_handoff",
+    description: "Move crews from a previous captain thread onto this captain. Updates the BB parent, so wakes, tell, and decide follow this deck. Does not move native state files. Not firstmate_promote (scout to ship) and not firstmate_migrate_state (KV backfill). Explicit only: it never takes crews from a captain you did not name.",
+    parameters: z.object({
+      from: z.string().min(1).describe("Previous captain thread id"),
+      crewId: z.string().optional().describe("One crew id. Omit to move every crew that captain owns on this project."),
+    }),
+    async execute({ from, crewId }, ctx) {
+      const to = ctxString(ctx, "threadId");
+      if (to === undefined || to === "") return toolError("handoff must run on the captain thread that is taking the deck.");
+      try {
+        return await handoffFromCaptain(from, to, crewId);
+      } catch (error) {
+        return toolError(error instanceof Error ? error.message : "Handoff failed.");
+      }
     },
   });
 
@@ -10172,6 +10288,13 @@ export default async function plugin(bb: BbPluginApi) {
               caller: ctxThread, overrideOwner: flags.has("override-owner"),
             });
             return reply({ merged: true, id }, text);
+          }
+          case "handoff": {
+            const from = flagStr(flags, "from");
+            if (ctxThread === undefined || ctxThread === "") return fail("handoff must run on the captain thread that is taking the deck.");
+            if (from === undefined || from === "") return fail("Usage: bb firstmate handoff --from <previous-captain-thread> [--crew <id>]");
+            const text = await handoffFromCaptain(from, ctxThread, flagStr(flags, "crew"));
+            return reply({ from, to: ctxThread, crew: flagStr(flags, "crew") ?? null }, text);
           }
           case "promote": {
             const id = rest[0];
