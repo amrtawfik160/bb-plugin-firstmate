@@ -91,6 +91,10 @@ test("crews get no dispatch tools", async () => {
     assert.deepEqual(cfg.tools.map((t) => t.name), []);
     assert.deepEqual(cfg.skills, []);
     assert.match(cfg.instructions ?? "", /native launch brief/);
+    assert.match(cfg.instructions ?? "", /systemd-run --unit=/);
+    assert.match(cfg.instructions ?? "", /data\/<task-id>\//);
+    assert.match(cfg.instructions ?? "", /use gh api REST/);
+    assert.match(cfg.instructions ?? "", /fm-inbox-take\.sh/);
     assert.match(cfg.instructions ?? "", /\/browser skill and browser_script/);
     assert.match(cfg.instructions ?? "", /profileId unset/);
     assert.doesNotMatch(cfg.instructions ?? "", /chrome-devtools-axi for browser|CHROME_DEVTOOLS_AXI_SESSION/);
@@ -2436,6 +2440,92 @@ test("a refused landed-crew cleanup keeps the crew without failing bearings", as
     assert.equal(host.harness.sdk.callsTo("threads.stop").length, 1, "refused cleanup backs off instead of re-running");
   } finally {
     await host.harness.lifecycle.dispose();
+  }
+});
+
+test("handoff reparents a previous captain's crews and their decisions", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("crews", [
+      shipRow("c1", "thr_crew", "thr_old"),
+      shipRow("c2", "thr_other", "thr_else"),
+      { ...shipRow("c3", "thr_otherproj", "thr_old"), projectId: "proj_other" },
+    ]);
+    await host.bb.storage.kv.set("decisions", [{
+      id: "d1",
+      question: "ship it?",
+      options: [],
+      context: "",
+      crewId: "c1",
+      status: "open",
+      deferredUntil: null,
+      answer: "",
+      createdAt: "2026-09-18T00:00:00.000Z",
+      parentThreadId: "thr_old",
+    }]);
+    await host.bb.storage.kv.set("queue", [{
+      id: "q1",
+      title: "follow-up",
+      detail: "",
+      projectId: "proj_1",
+      shape: "ship",
+      mode: "",
+      blockedBy: [],
+      waitUntil: null,
+      status: "queued",
+      crewId: "c1",
+      parentThreadId: "thr_old",
+      createdAt: "2026-09-18T00:00:00.000Z",
+    }]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async (input: { threadId: string }) =>
+      makeThreadResponse({ id: input.threadId, status: "idle", projectId: "proj_1" }));
+    const updates: Array<{ threadId?: string; parentThreadId?: string }> = [];
+    host.harness.sdk.stub("threads.update", async (args: { threadId?: string; parentThreadId?: string }) => {
+      updates.push(args);
+      return {};
+    });
+    const result = await host.harness.behavior.runCli(["handoff", "--from", "thr_old"], { threadId: "thr_new" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    const crews = (await host.bb.storage.kv.get("crews")) as Array<{ id: string; parentThreadId: string }>;
+    assert.equal(crews.find((c) => c.id === "c1")?.parentThreadId, "thr_new");
+    assert.equal(crews.find((c) => c.id === "c2")?.parentThreadId, "thr_else");
+    assert.equal(crews.find((c) => c.id === "c3")?.parentThreadId, "thr_old", "another project stays");
+    assert.deepEqual(updates, [{ threadId: "thr_crew", parentThreadId: "thr_new" }]);
+    const decisions = (await host.bb.storage.kv.get("decisions")) as Array<{ parentThreadId: string }>;
+    assert.equal(decisions[0]?.parentThreadId, "thr_new");
+    const queue = (await host.bb.storage.kv.get("queue")) as Array<{ parentThreadId: string }>;
+    assert.equal(queue[0]?.parentThreadId, "thr_new");
+    const again = await host.harness.behavior.runCli(["handoff", "--from", "thr_else", "--crew", "missing"], { threadId: "thr_new" });
+    assert.equal(again.exitCode, 1);
+    assert.match(again.stderr, /No crews owned by captain/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("fm-inbox-take prints inbox bodies and moves them only on --ack", () => {
+  const home = mkdtempSync(join(tmpdir(), "fm-inbox-"));
+  try {
+    const inbox = join(home, "state", "c1.inbox");
+    mkdirSync(join(home, "bin"), { recursive: true });
+    mkdirSync(inbox, { recursive: true });
+    writeFileSync(join(home, "bin", "fm-task-inbox-lib.sh"), "fm_task_inbox_body() { echo BODY; }\n");
+    writeFileSync(join(inbox, "1.msg"), "seq: 1\n--\nSTEER one\n");
+    writeFileSync(join(inbox, "2.msg"), "seq: 2\n--\nSTEER two\n");
+    const bin = join(dirname(fileURLToPath(import.meta.url)), "overlay/bin/fm-inbox-take.sh");
+    const read = spawnSync(bin, ["c1"], { env: { ...process.env, FM_HOME: home }, encoding: "utf8" });
+    assert.equal(read.status, 0, read.stderr);
+    assert.match(read.stdout, /BODY/);
+    assert.doesNotMatch(read.stdout, /STEER one/);
+    assert.ok(existsSync(join(inbox, "1.msg")), "reading does not acknowledge");
+    const ack = spawnSync(bin, ["c1", "--ack"], { env: { ...process.env, FM_HOME: home }, encoding: "utf8" });
+    assert.equal(ack.status, 0, ack.stderr);
+    assert.ok(existsSync(join(inbox, "handled", "1.msg")));
+    assert.ok(existsSync(join(inbox, "handled", "2.msg")));
+    assert.equal(existsSync(join(inbox, "1.msg")), false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
   }
 });
 
@@ -8839,6 +8929,7 @@ test("merge refuses another captain's crew, or a PR another captain's crew owns,
     const theirs = await host.harness.behavior.runCli(["merge", "c2", "--yes"], { threadId: "thr_capA" });
     assert.equal(theirs.exitCode, 1);
     assert.match(theirs.stderr, /belongs to captain @thread:thr_capB/);
+    assert.match(theirs.stderr, /bb firstmate handoff --from thr_capB/);
     const shared = await host.harness.behavior.runCli(["merge", "c1", "--yes"], { threadId: "thr_capA" });
     assert.equal(shared.exitCode, 1);
     assert.match(shared.stderr, /PR of crew c2, owned by captain @thread:thr_capB/);
@@ -9733,6 +9824,50 @@ test("BB's child ping does not replace the doorbell while the captain is rate-li
     assert.equal(sendCalls(host).filter((s) => s.threadId === "thr_cap").length, 0, "no wake into a limited captain");
     const held = await host.bb.storage.kv.get<{ lines: string[] }>("captain-wake-hold:thr_cap");
     assert.equal(held?.lines.length, 1, "the report is held for release when the limit resets");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("the background landed sweep keeps an idle ship whose merged PR has no terminal verdict", async () => {
+  const host = await load();
+  try {
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_capB")]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async (input: { threadId: string }) =>
+      makeThreadResponse({ id: input.threadId, status: "idle", environmentId: input.threadId === "thr_crew" ? "env_wt" : null }));
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+    host.harness.sdk.stub("threads.output", async () => ({
+      output: [
+        "Step 2 is done.",
+        "> done: shipped",
+        "\"DONE: all green\"",
+        "paused: still applying, no DONE",
+      ].join("\n"),
+    }));
+    host.harness.sdk.stub("threads.stop", async () => ({}));
+    host.harness.sdk.stub("threads.archive", async () => ({}));
+    host.harness.sdk.stub("threads.send", async () => ({}));
+    let prReads = 0;
+    host.harness.sdk.stub("environments.pullRequest", async () => {
+      prReads++;
+      return {
+        outcome: "available",
+        pullRequest: { url: "https://github.com/o/r/pull/1925", number: 1925, title: "t", state: "merged", checks: { state: "passing" }, mergeability: { mergeable: "MERGEABLE" } },
+      };
+    });
+    await host.bb.storage.kv.set("watch-meta", { lastPassAt: Date.now(), checked: -1, notified: -1 });
+    const run = host.harness.behavior.runService("crew-watch");
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline && prReads === 0) await new Promise((resolve) => setTimeout(resolve, 10));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    run.controller.abort();
+    await run.done;
+    assert.ok(prReads > 0, "the sweep ran");
+    assert.equal(((await host.bb.storage.kv.get("crews")) as unknown[]).length, 1, "a merged PR without done/failed must not retire the ship");
+    assert.equal(host.harness.sdk.callsTo("threads.archive").length, 0);
+    assert.equal(host.harness.sdk.callsTo("threads.stop").length, 0);
   } finally {
     await host.harness.lifecycle.dispose();
   }

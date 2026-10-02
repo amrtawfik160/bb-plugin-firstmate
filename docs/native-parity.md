@@ -98,7 +98,7 @@ The former must acquire the real harness lock; the latter must refuse read-only 
 ## Native worker and Bearings authority
 
 Native launch and replacement prompts retain `data/<id>/brief.md`. The shared
-`bb-worker-transport.txt` adds only browser and home/path transport instructions.
+`bb-worker-transport.txt` adds browser and home/path transport, plus the BB-only notes for idle-reaper jobs (`systemd-run --unit`), durable `data/<task-id>/` artifacts, the `gh api` REST fallback when gh-axi is rate-limited, and `bin-bb/fm-inbox-take.sh` for the worker inbox.
 Replacement refuses before stopping the prior thread if the native brief cannot
 be read. Native workers use upstream durable status and paused/process-event
 contracts; BB does not inject WAITING, scheduled resumes, mandatory timer shutdown

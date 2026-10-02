@@ -13,6 +13,7 @@ import {
   latestStatus,
   looksReadOnly,
   mergeGate,
+  hasTerminalVerdict,
   parseOutcome,
   queueGate,
   quietShouldSend,
@@ -137,6 +138,10 @@ test("parseOutcome reads DONE/BLOCKED/FAILED", () => {
   assert.equal(parseOutcome("DONE: shipped https://example/pr/1"), "DONE: shipped https://example/pr/1");
   assert.equal(parseOutcome("noise\nFAILED: tests red\nmore"), "FAILED: tests red");
   assert.equal(parseOutcome("still working"), null);
+  assert.equal(parseOutcome("Step 2 is done."), null);
+  assert.equal(parseOutcome("The step is DONE"), null);
+  assert.equal(parseOutcome("> DONE: shipped"), null);
+  assert.equal(parseOutcome("\"DONE: all green\""), null);
 });
 
 test("hasStatusProtocol matches a leading verdict or a standalone line only", () => {
@@ -200,6 +205,10 @@ test("crew prompt asserts isolation and forbids nested dispatch", () => {
   assert.match(text, /DONE:/);
   assert.match(text, /Captain's intent/);
   // Tight CI polling exhausted the shared GitHub token; the crew prompt forbids it.
+  assert.match(text, /systemd-run --unit=/);
+  assert.match(text, /data\/<task-id>\//);
+  assert.match(text, /When gh-axi returns RATE_LIMITED, use gh api REST/);
+  assert.match(text, /fm-inbox-take\.sh/);
   assert.match(text, /Never poll CI in a loop/);
   assert.match(text, /gh-axi run watch/);
   assert.match(text, /end your turn and let firstmate's PR check wake you/);
@@ -265,6 +274,16 @@ test("a ship/scout terminal done|failed collapses every open decision (fm-classi
 
 test("a bare resolved closes a bare needs-decision (default key)", () => {
   assert.deepEqual(foldOpenDecisions(["needs-decision: hmm", "resolved: done"]), []);
+});
+
+test("hasTerminalVerdict requires a declared done or failed line", () => {
+  assert.equal(hasTerminalVerdict(["done: shipped"]), true);
+  assert.equal(hasTerminalVerdict(["failed [at=10:30]: tests red"]), true);
+  assert.equal(hasTerminalVerdict(["working: a", "paused: still applying, no DONE"]), false);
+  assert.equal(hasTerminalVerdict(["Step 2 is done."]), false);
+  assert.equal(hasTerminalVerdict(["DONE"]), false);
+  assert.equal(hasTerminalVerdict(["> done: shipped", "\"DONE: all green\""]), false);
+  assert.equal(hasTerminalVerdict(["done: shipped", "paused: resumed"]), false);
 });
 
 test("latestStatus returns the last recognized verb, ignoring prose", () => {
