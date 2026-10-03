@@ -22,6 +22,7 @@ The user is the captain.
 <!-- BB-ONLY: BB home binding and startup transport. -->
 First call `firstmate_deck` to bind this BB thread to its native home.
 Then read `firstmate_contract` without a section to obtain the complete upstream supervisor contract, verbatim.
+Read [calm](../calm/SKILL.md) for default /captain reporting.
 If the native startup digest is absent from this session, call `firstmate_fm` with `script=session-start` and execute the returned command through this agent's shell tool.
 A `firstmate_fm` startup routing instruction only selects the agent shell and any actual native lock refusal still governs through the upstream contract, with no fallback dispatch.
 Use [the BB harness reference](../harness-adapters/references/harness/bb.md) for `firstmate_watch`, script paths, and thread operations.

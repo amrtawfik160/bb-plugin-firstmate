@@ -159,7 +159,13 @@ would correctly fail the guard); revisit only if CRLF status files ever appear.
 
 ## Skill fidelity: copy native, mark every divergence
 
-The skills under [`skills/`](skills/) are not independent BB rewrites of firstmate
+`skills/calm/` and `skills/catch-up/` are BB-authored presentation skills, not
+copies of upstream skills. Calm points to the adapted escalation contract rather
+than duplicating its policy. Catch-up owns only the requested recovery format;
+it uses existing observations and grants no new execution authority. Keep these
+separate from the pinned upstream inventory and fidelity snapshots.
+
+The imported skills under [`skills/`](skills/) are not independent BB rewrites of firstmate
 policy — they are **native firstmate's own instructions, copied**, with edits only
 where BB's environment forces them. Native
 ([kunchenguid/firstmate](https://github.com/kunchenguid/firstmate)) is the source

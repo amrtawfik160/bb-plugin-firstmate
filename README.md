@@ -129,7 +129,13 @@ BB-specific behavior in this fork:
 
 ## Skills
 
-The plugin registers 28 upstream `.agents/skills` (all except `firstmate-calm`, which it leaves out) as real BB skills, plus `/captain` and `/firstmate`. Their policy text is pinned to upstream commit `2d833ff1`; one shared runtime contract translates script paths, workers, approvals, and alternate harness mechanics to `firstmate_fm` and BB threads. Crew threads still receive no captain skills.
+The plugin registers 28 upstream `.agents/skills`, plus `/captain`, `/firstmate`, `/calm`, and `/catch-up`. The upstream `firstmate-calm` entry is a terminal module rather than a portable skill; BB uses its existing timeline filter and the `/calm` reporting skill instead. Imported policy text is pinned to upstream commit `2d833ff1`; one shared runtime contract translates script paths, workers, approvals, and alternate harness mechanics to `firstmate_fm` and BB threads. Crew threads still receive no captain skills.
+
+Calm reporting is the default in captain threads. Routine supervision stays silent; requested outcomes, review-ready work, decisions, exhausted blockers, and needed logins still reach you. This changes reporting only and leaves supervision and AFK/quiet settings unchanged. Ask for detail whenever needed.
+
+After updating the plugin, existing captain sessions can run `/calm` to load the reporting rules immediately. New captain sessions receive the default through their startup instructions.
+
+Run `/catch-up` after a long conversation or switching tasks. It summarizes important results, decisions needing you, blockers, in-progress work, and next steps from current records and the available conversation. It keeps unresolved items visible, flags missing evidence, and does not approve or start work. Its default scope is this captain's work; request all captains explicitly for a wider view. `/bearings` remains the full fleet snapshot and board workflow.
 
 `/captain` is a BB bootstrap: it binds this thread's home and reads the complete upstream `AGENTS.md` verbatim through `firstmate_contract`. Section arguments remain available for later lookup. Upstream owns intake, authority, delivery, and supervision policy; BB instructions only map paths, threads, browser access, and durable wake receipts. The fidelity check covers both entry skills and every registered upstream skill, and requires byte-for-byte preservation for verbatim skill copies.
 
