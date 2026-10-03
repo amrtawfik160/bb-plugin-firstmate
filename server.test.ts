@@ -53,7 +53,7 @@ import { LEFTOVER_TIMER_CONTRACT, WAITING_PROTOCOL, latestStatus, statusProtocol
 import { UPSTREAM_SCRIPT_NAMES, PINNED_SCRIPT_SUPPORT_FILES, UPSTREAM_SKILL_NAMES } from "./lib/upstream-surface.ts";
 import { FIRSTMATE_ROUTINE_MARKER } from "./lib/timeline-noise.ts";
 
-const SKILLS = ["captain", "firstmate", ...UPSTREAM_SKILL_NAMES] as const;
+const SKILLS = ["captain", "firstmate", "calm", "catch-up", ...UPSTREAM_SKILL_NAMES] as const;
 
 function wakeFrame(report: string): string {
   return "FM_BB_RECEIPT=" + JSON.stringify({ id: "fixture", phase: "ready", report, path: "/tmp/report.txt", replayed: false, truncated: false });
@@ -151,6 +151,34 @@ test("captain metadata loads the full skill set", async () => {
     assert.doesNotMatch(cfg.instructions ?? "", /Do not narrate tool calls|Never do crew work|Never merge/);
     assert.match(cfg.instructions ?? "", /call firstmate_watch once per batch/i);
     assert.match(cfg.instructions ?? "", /private durable wakes/i);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("calm reporting survives captain resume and stays out of worker and ordinary threads", async () => {
+  const host = await load();
+  try {
+    for (const nativeHome of [undefined, "/tmp/resumed-captain"]) {
+      const cfg = await host.harness.behavior.resolveAgentConfiguration(
+        makePluginAgentConfigurationContext({ pluginMetadata: { captain: "true", ...(nativeHome ? { nativeHome } : {}) } }),
+      );
+      assert.ok(cfg.skills.includes("calm"));
+      assert.ok(cfg.skills.includes("catch-up"));
+      assert.match(cfg.instructions ?? "", /Calm reporting is the captain default/);
+      assert.match(cfg.instructions ?? "", /keep required outcomes and escalations visible/);
+      assert.ok((cfg.instructions ?? "").length <= 4096);
+    }
+    for (const pluginMetadata of [{}, { crew: "true", captain: "true" }]) {
+      const cfg = await host.harness.behavior.resolveAgentConfiguration(
+        makePluginAgentConfigurationContext({ pluginMetadata }),
+      );
+      assert.ok(!cfg.skills.includes("calm"));
+      assert.ok(!cfg.skills.includes("catch-up"));
+      assert.doesNotMatch(cfg.instructions ?? "", /Calm reporting is the captain default/);
+    }
+    assert.equal(host.harness.sdk.callsTo("threads.send").length, 0);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
   } finally {
     await host.harness.lifecycle.dispose();
   }

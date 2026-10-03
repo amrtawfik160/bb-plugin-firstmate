@@ -1349,7 +1349,7 @@ function summarizePR(value: unknown): string {
   return parts.length > 0 ? parts.join(" ") : "none";
 }
 
-const CAPTAIN_SKILLS = ["captain", "firstmate", ...UPSTREAM_SKILL_NAMES] as const;
+const CAPTAIN_SKILLS = ["captain", "firstmate", "calm", "catch-up", ...UPSTREAM_SKILL_NAMES] as const;
 const CAPTAIN_TOOLS = [
   "firstmate_dispatch",
   "firstmate_deck",
@@ -1388,6 +1388,7 @@ const CAPTAIN_CONTRACT_POINTER = "Before orchestrating, read firstmate_contract 
 const BB_SKILL_RUNTIME_CONTRACT = [
   "BB adapter for every upstream firstmate skill:",
   "The complete native supervisor contract and imported upstream skills own policy; the following mappings only adapt execution to BB.",
+  "Calm reporting is the captain default: read the calm skill before replying to supervision events. It owns BB presentation, including silent routine wakes; keep required outcomes and escalations visible. The captain can invoke /catch-up for a concise recovery brief.",
   "Translate bin/fm-<name>.sh calls to firstmate_fm with script=<name> and the same arguments; use bb firstmate fm <name> only when a shell command is required.",
   "In imported skills, ../../../AGENTS.md means the complete contract returned by firstmate_contract, and ../../../bin, data, state, config, and docs refer to fmHome rather than this plugin directory.",
   "Map workers, panes, and tabs to BB crew threads via firstmate_dispatch/tell/interrupt/retry/stop. Call firstmate_watch once per batch; it hands off to private durable wakes. End the turn; never retry or poll.",
