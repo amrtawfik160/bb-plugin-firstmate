@@ -52,6 +52,7 @@ import { parseWakeReceipt, renderWakeReceipt, type WakeReceipt } from "./lib/wak
 import { readBbActivity } from "./lib/bb-activity.ts";
 import { ORPHAN_SWEEP_BUDGET_MS, ORPHAN_SWEEP_INTERVAL_MS, parseStaleLavishSources, staleLavishSourceScript } from "./lib/orphan-decisions.ts";
 import { nativeBearingsProjection } from "./lib/native-bearings.ts";
+import { createSnapshotReads } from "./lib/snapshot-reads.ts";
 import { rpcContract } from "./rpc.ts";
 import {
   UPSTREAM_FIRSTMATE_SHA,
@@ -2179,6 +2180,7 @@ export default async function plugin(bb: BbPluginApi) {
   type WatchState = z.infer<typeof watchStateSchema>;
 
   async function publishFleet(): Promise<void> {
+    fleetSnapshots.invalidate();
     try {
       await bb.realtime.publish("fleet", { at: Date.now() });
     } catch {
@@ -4827,7 +4829,9 @@ export default async function plugin(bb: BbPluginApi) {
       supervision: boolean;
     };
   }> {
-    if ((await settings.get()).fmHome.trim() !== "") return nativeBearingsSnapshot(owner);
+    if ((await settings.get()).fmHome.trim() !== "") {
+      return fleetSnapshots.read(owner ?? "__all__", () => nativeBearingsSnapshot(owner, snapshotAbort.signal));
+    }
     const tracked = (await listCrews({ owner })).slice(0, 20);
     // A crew landed under another captain's view is announced to its own captain.
     const retired = await reconcileExternallyLanded(tracked, { notifyUnless: owner ?? "" });
@@ -4973,7 +4977,13 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
 
-  async function nativeBearingsSnapshot(owner?: string) {
+  const snapshotAbort = new AbortController();
+  const fleetSnapshots = createSnapshotReads<Awaited<ReturnType<typeof nativeBearingsSnapshot>>>({
+    concurrency: 2,
+    signal: snapshotAbort.signal,
+  });
+
+  async function nativeBearingsSnapshot(owner?: string, signal?: AbortSignal) {
     const current = await baseSettings.get();
     const targets = owner !== undefined
       ? [{ captain: owner, home: captainHomes.get(owner) ?? (await settings.get()).fmHome.trim() }]
@@ -4983,11 +4993,13 @@ export default async function plugin(bb: BbPluginApi) {
         ]).values()];
     const snapshots = [];
     for (const target of targets) {
+      signal?.throwIfAborted();
       const snapshot = await inCaptainHome(target.captain, async () => {
         const scoped = await settings.get();
         const hostId = scoped.fmHostId.trim() || await resolveHostId(undefined, { threadId: target.captain });
         const result = await runFmScript({ script: "bearings-snapshot", args: ["--json"],
           hostId, fmHome: target.home, parentThreadId: target.captain,
+          env: { FM_SNAPSHOT_LOCAL_READ_CONCURRENCY: "2" }, signal,
           timeoutMs: fmTimeoutMs("bearings-snapshot", undefined) });
         if (result.exitCode !== 0) throw new Error(`Native Bearings failed for ${target.home}: ${result.output}`);
         let projection;
@@ -4995,9 +5007,10 @@ export default async function plugin(bb: BbPluginApi) {
         catch (error) { throw new Error(`Invalid native Bearings for ${target.home}: ${String(error)}`); }
         try {
           const request = await runFmScript({ script: "secondmate-reconcile", args: ["request", "--snapshot", "-"],
-            hostId, fmHome: target.home, parentThreadId: target.captain, stdin: result.output, timeoutMs: 30_000 });
+            hostId, fmHome: target.home, parentThreadId: target.captain, stdin: result.output, timeoutMs: 30_000, signal });
           if (request.exitCode !== 0) throw new Error(request.output);
         } catch (error) {
+          if (signal?.aborted) throw error;
           projection = nativeBearingsProjection(projection.model, [`Secondmate reconcile request was not recorded: ${String(error)}`]);
         }
         return projection;
@@ -9301,9 +9314,16 @@ export default async function plugin(bb: BbPluginApi) {
     async fleet(input) {
       const threadId = input?.threadId;
       const owner = threadId ?? undefined;
+      const captain = owner !== undefined && await isCaptainThread(owner);
+      if (owner !== undefined && !captain) {
+        return { head: "", calls: [], landed: [], ready: [], running: [], next: [], afk: false, quiet: false, supervision: false, captain: false };
+      }
+      const snapshot = (await settings.get()).fmHome.trim() !== ""
+        ? await fleetSnapshots.read(owner ?? "__all__", () => nativeBearingsSnapshot(owner, snapshotAbort.signal), 15_000)
+        : await bearingsSnapshot(owner);
       return {
-        ...(await bearingsSnapshot(owner)).rpc,
-        captain: owner !== undefined && await isCaptainThread(owner),
+        ...snapshot.rpc,
+        captain,
       };
     },
   });
@@ -11007,6 +11027,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.onDispose(async () => {
+    snapshotAbort.abort();
     wakeBatchAbort.abort();
     for (const timer of wakeBatchTimers.values()) clearTimeout(timer);
     wakeBatchTimers.clear();
