@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   definePluginApp,
   useBbContext,
@@ -12,6 +12,7 @@ import {
   isRoutineReasoningRow,
 } from "./lib/timeline-noise.ts";
 import "./app.css";
+import { createFleetRefresh } from "./lib/fleet-refresh.ts";
 
 type Fleet = {
   head: string;
@@ -40,29 +41,36 @@ type Fleet = {
   captain: boolean;
 };
 
-function FleetBoard() {
+function useFleet(threadId: string | null) {
   const rpc = useRpc<typeof rpcContract>();
-  const nav = useBbNavigate();
-  const { threadId } = useBbContext();
   const [fleet, setFleet] = useState<Fleet | null>(null);
   const [error, setError] = useState<string | null>(null);
-
-  async function load() {
-    try {
-      setFleet(await rpc.call("fleet", { threadId }));
-      setError(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "fleet failed");
-    }
-  }
-
+  const queue = useRef<ReturnType<typeof createFleetRefresh> | null>(null);
   useEffect(() => {
-    void load();
-  }, [threadId]);
+    let disposed = false;
+    setFleet(null);
+    setError(null);
+    const refresh = createFleetRefresh(async () => {
+      try {
+        const value = await rpc.call("fleet", { threadId });
+        if (!disposed) { setFleet(value); setError(null); }
+      } catch (err) {
+        if (!disposed) setError(err instanceof Error ? err.message : "fleet failed");
+      }
+    });
+    queue.current = refresh;
+    refresh.refresh();
+    return () => { disposed = true; refresh.dispose(); queue.current = null; };
+  }, [rpc, threadId]);
+  const load = useCallback(() => queue.current?.refresh(), []);
+  useRealtime("fleet", load);
+  return { fleet, error, load };
+}
 
-  useRealtime("fleet", () => {
-    void load();
-  });
+function FleetBoard() {
+  const nav = useBbNavigate();
+  const { threadId } = useBbContext();
+  const { fleet, error, load } = useFleet(threadId);
 
   if (error !== null && fleet === null) {
     return <p className="fm-muted">{error}</p>;
@@ -146,25 +154,9 @@ function Section({ title, items, empty }: { title: string; items: string[]; empt
 }
 
 function HeaderChip({ threadId }: { threadId: string }) {
-  const rpc = useRpc<typeof rpcContract>();
-  const [label, setLabel] = useState("Fleet");
-  const [captain, setCaptain] = useState(false);
-
-  async function load() {
-    const fleet = await rpc.call("fleet", { threadId });
-    setCaptain(fleet.captain);
-    setLabel(`${fleet.running.length} underway · ${fleet.ready.length} ready`);
-  }
-
-  useEffect(() => {
-    void load();
-  }, [rpc, threadId]);
-
-  useRealtime("fleet", () => {
-    void load();
-  });
-
-  if (!captain) return null;
+  const { fleet } = useFleet(threadId);
+  if (!fleet?.captain) return null;
+  const label = `${fleet.running.length} underway · ${fleet.ready.length} ready`;
   return <span className="fm-chip">{label}</span>;
 }
 

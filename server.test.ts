@@ -362,6 +362,33 @@ test("fleet RPC identifies and scopes the current captain thread", async () => {
   }
 });
 
+test("fleet RPC skips native snapshots for ordinary threads", async () => {
+  const host = ownerHost({ transport: "real" });
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRoutedHost(host, () => ({}));
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+    const fleet = await host.harness.behavior.callRpc("fleet", { threadId: "thr_ordinary" }) as { captain: boolean; running: unknown[] };
+    assert.equal(fleet.captain, false);
+    assert.deepEqual(fleet.running, []);
+    assert.equal(seen.filter(cmd => cmd.includes("fm-bearings-snapshot.sh")).length, 0);
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("fleet RPC shares concurrent native snapshots and caches repeated reads", async () => {
+  const host = ownerHost({ transport: "real" });
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRoutedHost(host, () => ({}));
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
+    const responses = await Promise.all(Array.from({ length: 8 }, () => host.harness.behavior.callRpc("fleet", { threadId: "thr_cap" })));
+    assert.equal(responses.length, 8);
+    assert.equal(seen.filter(cmd => cmd.includes("fm-bearings-snapshot.sh")).length, 1);
+    await host.harness.behavior.callRpc("fleet", { threadId: "thr_cap" });
+    assert.equal(seen.filter(cmd => cmd.includes("fm-bearings-snapshot.sh")).length, 1);
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
 test("bearings on an empty fleet", async () => {
   const host = await load();
   try {
@@ -10677,6 +10704,7 @@ test("native Bearings uses canonical decisions and gates across CLI, tool, sessi
     }
     const tool = await agentTool(host, "firstmate_bearings").execute({}, { threadId: "thr_cap" } as never);
     assert.match(toolText(tool), /Native owner must choose/);
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
     const rpc = await host.harness.behavior.callRpc("fleet", { threadId: "thr_cap" }) as { calls: string[]; ready: unknown[]; running: {id:string;threadId:string}[] };
     assert.match(rpc.calls.join("\n"), /Native owner must choose/);
     assert.deepEqual(rpc.ready, []);
