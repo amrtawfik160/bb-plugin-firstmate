@@ -43,6 +43,10 @@ export function createLaunches(db: Database) {
     const rows=db.prepare("SELECT record FROM launches WHERE owner=? AND state IN ('reserved','creating','provisioning','uncertain')").all(owner) as {record:string}[];
     return rows.map(row=>{const r=JSON.parse(row.record) as LaunchRecord;return launchTaskKey(r.projectId,r.taskId);});
   }
+  function forTask(project:string,owner:string,task:string):LaunchRecord|undefined {
+    const row=db.prepare("SELECT record FROM launches WHERE project=? AND owner=? AND json_extract(record,'$.taskId')=? ORDER BY json_extract(record,'$.generation') DESC LIMIT 1").get(project,owner,task) as {record:string}|undefined;
+    return row ? JSON.parse(row.record) : undefined;
+  }
   function reassignWorker(threadId:string,from:string,to:string,projectId:string) {
     return db.prepare(`UPDATE launches SET owner=?,record=json_set(record,'$.owner',?) WHERE owner=? AND project=? AND json_extract(record,'$.threadId')=?`)
       .run(to,to,from,projectId,threadId).changes;
@@ -117,7 +121,7 @@ export function createLaunches(db: Database) {
       }
     });
   }
-  return { get, save, update, list, heldTaskIds, reassignWorker,reserve, once, create };
+  return { get, save, update, list, heldTaskIds, forTask,reassignWorker,reserve, once, create };
 }
 
 async function recoveryRead<T>(operation:Promise<T>,signal?:AbortSignal):Promise<T> {

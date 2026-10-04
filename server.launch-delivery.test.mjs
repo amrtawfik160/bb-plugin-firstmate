@@ -132,6 +132,7 @@ test('background PR follow-up survives reload, forgotten worker, stale lookup an
  const other=await host.harness.behavior.runCli(['deliveries','list','--json'],{threadId:'thr_other',projectId:'proj_1'});assert.equal(JSON.parse(other.stdout)[0].ownerNeeded,true,'lost manager obligation is visibly project scoped');
  host.harness.sdk.stub('threads.getPluginMetadata',async()=>({captain:'true'}));
  const rpc=await host.harness.behavior.callRpc('fleet',{threadId:'thr_cap'});assert.equal(rpc.deliveries[0].id,r.id);assert.equal(rpcContract.fleet.output.safeParse(rpc).success,true);
+ host.harness.sdk.stub('threads.update',async()=>({}));
  const handoff=await host.harness.behavior.runCli(['handoff','--from','thr_cap'],{threadId:'thr_new',projectId:'proj_1'});assert.equal(handoff.exitCode,0,handoff.stderr);assert.equal(store.get(r.id).owner,'thr_new');assert.equal(store.get(r.id).ownerNeeded,false);
  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'other-project',status:'idle'}));
  const outside=await host.harness.behavior.runCli(['deliveries','list','--all','--json'],{threadId:'outside',projectId:'other-project'});assert.deepEqual(JSON.parse(outside.stdout),[]);
@@ -206,7 +207,7 @@ test('native seeded secondmate role and child home exist at initial configuratio
 test('owned launch metadata recovers scoped orphan PR references without claiming scout or foreign URLs',async()=>{
  const host=await base();try {
  const launches=createLaunches(host.bb.storage.database());const key=JSON.stringify(['proj_1','thr_cap','','owned',1]);
- const record={key,taskId:'owned',projectId:'proj_1',owner:'thr_cap',home:'',generation:1,shape:'ship',state:'running',threadId:'thr_owned',updatedAt:1};launches.save(record);
+ const record={key,taskId:'owned',projectId:'proj_1',owner:'thr_cap',home:'',generation:1,shape:'ship',deliveryRequirement:'merged',state:'running',threadId:'thr_owned',updatedAt:1};launches.save(record);
  launches.save({...record,key:'foreign',taskId:'foreign',threadId:'thr_foreign'});launches.save({...record,key:'scout',shape:'scout',taskId:'scout',threadId:'thr_scout'});
  host.harness.sdk.stub('threads.getPluginMetadata',async({threadId})=>threadId==='thr_owned'?{launchKey:key,crewId:'owned',nativeHome:''}:{});
  host.harness.sdk.stub('environments.pullRequest',async()=>({outcome:'available',pullRequest:{url:'https://github.com/acme/own/pull/3',state:'open'}}));
@@ -229,5 +230,150 @@ test('missed manager deletion is surfaced after restart; inventory failures pres
  await host.harness.behavior.runSchedule('pr-delivery-follow-up');assert.equal(store.get(r.id).freshness,'stale');assert.equal(store.get(r.id).ownerNeeded,false);
  host.harness.sdk.stub('threads.list',async()=>[]);const again=store.get(r.id);again.nextCheckAt=0;store.save(again);
  await host.harness.behavior.runSchedule('pr-delivery-follow-up');assert.equal(store.get(r.id).ownerNeeded,true);assert.equal(store.get(r.id).owner,'thr_missing');
+ }finally{await host.harness.lifecycle.dispose();}
+});
+const tool=(host,name)=>host.harness.inspection.registrations.agentTools.find(t=>t.name===name);
+const turn=()=>new Promise(setImmediate);
+async function until(condition) { for(let i=0;i<300;i++){if(condition())return;await turn();}throw new Error('fixture did not reach boundary'); }
+const forge=(extra={})=>({headRefOid:'sha1',state:'OPEN',isDraft:false,statusCheckRollup:[],reviewDecision:null,reviews:[],mergeable:'MERGEABLE',...extra});
+
+test('factory metadata adoption and dispatch recovery preserve required verification through discovery and merge',async()=>{
+ for(const route of ['metadata','dispatch']) {
+  let host=await base();try {
+   let metadata;
+   host.harness.sdk.stub('threads.spawn',async args=>{metadata=args.pluginMetadata;throw new Error('core created worker but reply was lost');});
+   const launch=await host.harness.behavior.runCli(['dispatch','--project','proj_1','--task-id','contract','--delivery-requirement','merged-and-verified','--','fix login'],ctx);
+   assert.equal(launch.exitCode,1);assert.equal(metadata.deliveryRequirement,'merged-and-verified');
+   host=await host.harness.lifecycle.reload(plugin);commonStubs(host);
+   host.harness.sdk.stub('threads.list',async()=>[makeThreadResponse({id:'thr_recovered',projectId:'proj_1',parentThreadId:'thr_cap',status:'idle',environmentId:'env_wt'})]);
+   host.harness.sdk.stub('threads.getPluginMetadata',async({threadId})=>threadId==='thr_recovered'?metadata:{});
+   host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle',environmentId:'env_wt'}));
+   const adopted=await host.harness.behavior.runCli(route==='metadata'?['crews']:['dispatch','--project','proj_1','--task-id','contract','--','fix login'],ctx);
+   assert.equal(adopted.exitCode,0,adopted.stderr);
+   const crew=(await host.bb.storage.kv.get('crews'))[0];assert.equal(crew.deliveryRequirement,'merged-and-verified');assert.equal(crew.launchKey,metadata.launchKey);
+   host.harness.sdk.stub('environments.pullRequest',async()=>({outcome:'available',pullRequest:{url:'https://github.com/acme/recovery/pull/1',state:'merged'}}));
+   host.harness.sdk.stub('threads.send',async()=>({delivery:'queued'}));
+   hostCommands(host,()=>({payload:JSON.stringify(forge({state:'MERGED',mergeCommit:{oid:'merge1'}}))}));
+   await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+   const record=createDeliveries(host.bb.storage.database()).get('acme/recovery#1');assert.equal(record.requirement,'merged-and-verified');assert.equal(record.status,'merged-needs-verification');
+  } finally {await host.harness.lifecycle.dispose();}
+ }
+});
+test('CLI and tool registration inherit original contract; queue and promotion carry it to creation',async()=>{
+ const host=await base();try {
+  await host.bb.storage.kv.set('crews',[{...row(1),deliveryRequirement:'merged-and-verified'}]);
+  const cli=await host.harness.behavior.runCli(['deliveries','register','--crew','c1','--url','https://github.com/acme/contracts/pull/1'],ctx);assert.equal(cli.exitCode,0,cli.stderr);
+  await tool(host,'firstmate_deliveries').execute({action:'register',crewId:'c1',url:'https://github.com/acme/contracts/pull/2'},ctx);
+  const store=createDeliveries(host.bb.storage.database());assert.equal(store.get('acme/contracts#1').requirement,'merged-and-verified');assert.equal(store.get('acme/contracts#2').requirement,'merged-and-verified');
+  const changed=await host.harness.behavior.runCli(['deliveries','register','--crew','c1','--url','https://github.com/acme/contracts/pull/1','--requirement','merged','--authorized'],ctx);assert.equal(changed.exitCode,1);
+  host.harness.sdk.stub('threads.spawn',async()=>({id:'thr_new'}));
+  const add=await host.harness.behavior.runCli(['queue','add','--project','proj_1','--delivery-requirement','merged-and-verified','--json','--','fix login'],ctx);assert.equal(add.exitCode,0,add.stderr);
+  const dispatched=await host.harness.behavior.runCli(['queue','dispatch',JSON.parse(add.stdout).id],ctx);assert.equal(dispatched.exitCode,0,dispatched.stderr);
+  assert.equal(host.harness.sdk.callsTo('threads.spawn').at(-1)[0].pluginMetadata.deliveryRequirement,'merged-and-verified');
+  await host.bb.storage.kv.set('crews',[{...row(9,'scout'),deliveryRequirement:'merged-and-verified'}]);
+  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle',environmentId:'env_wt'}));
+  const promoted=await host.harness.behavior.runCli(['promote','c9'],ctx);assert.equal(promoted.exitCode,0,promoted.stderr);
+  assert.equal(host.harness.sdk.callsTo('threads.spawn').at(-1)[0].pluginMetadata.deliveryRequirement,'merged-and-verified');
+ }finally{await host.harness.lifecycle.dispose();}
+});
+test('hung discovery is bounded per item and does not starve other PRs or future registered scans',async t=>{
+ const host=await base();try {
+  await host.bb.storage.kv.set('crews',[row(1),{...row(2),prUrl:'https://github.com/acme/healthy/pull/2'}]);
+  let calls=0;host.harness.sdk.stub('environments.pullRequest',async()=>{calls++;return new Promise(()=>{});});
+  hostCommands(host,()=>({payload:JSON.stringify(forge({isDraft:true}))}));
+  t.mock.timers.enable({apis:['setTimeout']});
+  const scan=host.harness.behavior.runSchedule('pr-delivery-follow-up');await until(()=>calls===1);t.mock.timers.tick(15001);await scan;
+  assert.equal(createDeliveries(host.bb.storage.database()).get('acme/healthy#2').status,'draft');
+  const again=host.harness.behavior.runSchedule('pr-delivery-follow-up');await until(()=>calls===2);t.mock.timers.tick(15001);await again;
+  assert.equal(calls,2,'followingUp was released after timeout');
+ }finally{t.mock.timers.reset();await host.harness.lifecycle.dispose();}
+});
+test('registered follow-up disposal settles hung discovery and notification recovery reads',async()=>{
+ for(const boundary of ['discovery','notification']) {
+  const host=await base();let reached=false;try {
+   if(boundary==='discovery') {
+    await host.bb.storage.kv.set('crews',[row(1)]);
+    host.harness.sdk.stub('environments.pullRequest',async()=>{reached=true;return new Promise(()=>{});});
+   }else{
+    const store=createDeliveries(host.bb.storage.database());let r=store.register({url:'https://github.com/acme/hung/pull/1',taskId:'c1',projectId:'proj_1',owner:'thr_cap',home:'',worker:'thr_c1'});
+    r.nextCheckAt=Date.now()+100000;r.notification={desired:'signature',delivered:null,queued:null,retryAt:0,attempted:'signature'};store.save(r);
+    host.harness.sdk.stub('threads.queuedMessages.list',async()=>{reached=true;return new Promise(()=>{});});
+   }
+   const scan=host.harness.behavior.runSchedule('pr-delivery-follow-up').catch(error=>error);await until(()=>reached);
+   await Promise.race([host.harness.lifecycle.dispose(),new Promise((_,reject)=>setTimeout(()=>reject(new Error('disposal hung')),1000))]);await scan;
+  }finally{await host.harness.lifecycle.dispose();}
+ }
+});
+test('late terminal identity is closed once after disposal with no terminal reads or continuation',async()=>{
+ const host=await base();let release;try {
+  const store=createDeliveries(host.bb.storage.database());store.register({url:'https://github.com/acme/late/pull/1',taskId:'c1',projectId:'proj_1',owner:'thr_cap',home:'',worker:'thr_c1'});
+  host.harness.sdk.stub('terminals.create',async()=>new Promise(r=>{release=r;}));host.harness.sdk.stub('terminals.close',async()=>({}));
+  const scan=host.harness.behavior.runSchedule('pr-delivery-follow-up').catch(error=>error);await until(()=>release);
+  await host.harness.lifecycle.dispose();await scan;release({id:'term_late'});await until(()=>host.harness.sdk.callsTo('terminals.close').length===1).catch(()=>{});
+  assert.equal(host.harness.sdk.callsTo('terminals.close').length,1,'late creation is closed exactly once');
+  assert.equal(host.harness.sdk.callsTo('terminals.close')[0][0].terminalId,'term_late');assert.equal(host.harness.sdk.callsTo('terminals.get').length,0);assert.equal(host.harness.sdk.callsTo('terminals.output').length,0);assert.equal(host.harness.sdk.callsTo('threads.send').length,0);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+test('partial handoff preserves failed worker task, launch, decision and PR ownership while transferring orphan obligations',async()=>{
+ const host=await base();try {
+  await host.bb.storage.kv.set('crews',[row(1),row(2)]);
+  await host.bb.storage.kv.set('decisions',[{id:'decision',question:'approve?',options:[],crewId:'c2',parentThreadId:'thr_cap',createdAt:new Date().toISOString(),status:'open'}]);
+  const store=createDeliveries(host.bb.storage.database()),launches=createLaunches(host.bb.storage.database());
+  for(const n of [1,2,3]) {store.register({url:`https://github.com/acme/handoff/pull/${n}`,taskId:`c${n}`,projectId:'proj_1',owner:'thr_cap',home:'',worker:`thr_c${n}`});launches.save({key:`l${n}`,taskId:`c${n}`,projectId:'proj_1',owner:'thr_cap',home:'',generation:1,shape:'ship',state:'running',threadId:`thr_c${n}`,updatedAt:1});}
+  host.harness.sdk.stub('threads.update',async({threadId})=>{if(threadId==='thr_c2')throw new Error('reparent failed');return{};});
+  const result=await host.harness.behavior.runCli(['handoff','--from','thr_cap'],{threadId:'thr_new',projectId:'proj_1'});assert.equal(result.exitCode,0,result.stderr);assert.match(result.stdout,/Kept: c2/);
+  assert.equal(store.get('acme/handoff#1').owner,'thr_new');assert.equal(store.get('acme/handoff#2').owner,'thr_cap');assert.equal(store.get('acme/handoff#3').owner,'thr_new');assert.equal(launches.get('l2').owner,'thr_cap');
+  assert.equal((await host.bb.storage.kv.get('crews')).find(r=>r.id==='c2').parentThreadId,'thr_cap');assert.equal((await host.bb.storage.kv.get('decisions'))[0].parentThreadId,'thr_cap');
+ }finally{await host.harness.lifecycle.dispose();}
+});
+test('forgotten author retains native guarded merge continuation and refuses destructive retirement',async()=>{
+ let host=await base({fmHome:'/native',fmHostId:'host_1'});try {
+  await host.bb.storage.kv.set('crews',[{...row(1),nativeHome:'/native',prUrl:'https://github.com/acme/retained/pull/1',deliveryRequirement:'merged-and-verified'}]);
+  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle',environmentId:'env_wt'}));
+  host.harness.sdk.stub('threads.stop',async()=>({}));host.harness.sdk.stub('threads.archive',async()=>({}));
+  host.harness.sdk.stub('environments.pullRequest',async()=>({outcome:'unavailable'}));
+  const commands=hostCommands(host,command=>command.includes('gh pr view')?{payload:JSON.stringify(forge())}:{code:0});
+  const refusal=await host.harness.behavior.runCli(['forget','c1','--stop','--force'],ctx);assert.equal(refusal.exitCode,1);assert.match(refusal.stderr,/Outstanding PR delivery/);assert.equal(host.harness.sdk.callsTo('threads.archive').length,0);
+  const forgotten=await host.harness.behavior.runCli(['forget','c1'],ctx);assert.equal(forgotten.exitCode,0,forgotten.stderr);assert.equal((await host.bb.storage.kv.get('crews')).length,0);
+  assert.ok([...commands.values()].every(c=>!c.includes('fm-check-unregister')&&!c.includes('fm-teardown')),'native authority is retained');
+  host=await host.harness.lifecycle.reload(plugin);commonStubs(host);
+  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle',environmentId:'env_wt',archivedAt:threadId==='thr_c1'?1:null}));
+  host.harness.sdk.stub('environments.pullRequest',async()=>({outcome:'unavailable'}));
+  const resumed=hostCommands(host,command=>command.includes('gh pr view')?{payload:JSON.stringify(forge())}:command.includes('fm-pr-merge')?{code:1,payload:'native required check refuses merge'}:{code:0});
+  host.harness.sdk.stub('threads.updatePluginMetadata',async()=>({}));host.harness.sdk.stub('threads.unarchive',async()=>({}));host.harness.sdk.stub('threads.send',async()=>({delivery:'sent'}));
+  const fix=await host.harness.behavior.runCli(['tell','c1','--message','Fix the failing check on this PR'],ctx);assert.equal(fix.exitCode,0,fix.stderr);
+  assert.equal(host.harness.sdk.callsTo('threads.unarchive').length,1);
+  assert.equal(host.harness.sdk.callsTo('threads.updatePluginMetadata').at(-1)[0].set.crew,'true');assert.equal(host.harness.sdk.callsTo('threads.send').at(-1)[0].threadId,'thr_c1');
+  const merge=await host.harness.behavior.runCli(['merge','c1','--yes'],ctx);assert.equal(merge.exitCode,1);assert.match(merge.stderr,/native required check refuses merge/);assert.ok([...resumed.values()].some(c=>c.includes('fm-pr-merge')));assert.ok([...resumed.values()].every(c=>!c.includes('gh pr merge')));
+  host.harness.sdk.stub('threads.update',async()=>{throw new Error('archived author reparent failed');});
+  const blocked=await host.harness.behavior.runCli(['handoff','--from','thr_cap','--crew','c1'],{threadId:'thr_new',projectId:'proj_1'});assert.equal(blocked.exitCode,0,blocked.stderr);assert.match(blocked.stdout,/Kept: c1/);
+  assert.equal(createDeliveries(host.bb.storage.database()).get('acme/retained#1').owner,'thr_cap');
+  host.harness.sdk.stub('threads.update',async()=>({}));
+  const transferred=await host.harness.behavior.runCli(['handoff','--from','thr_cap','--crew','c1'],{threadId:'thr_new',projectId:'proj_1'});assert.equal(transferred.exitCode,0,transferred.stderr);assert.equal(createDeliveries(host.bb.storage.database()).get('acme/retained#1').owner,'thr_new');
+  const foreign=await host.harness.behavior.runCli(['merge','c1','--yes'],{threadId:'thr_other',projectId:'proj_1'});assert.equal(foreign.exitCode,1);assert.match(foreign.stderr,/No crew/);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+test('native guard failure after real bridge creation retains an unadmitted worker and its capacity',async()=>{
+ const host=await base({fmHome:'/native',fmHostId:'host_1',transport:'real',queueOwner:'real',maxActiveCrews:1});try {
+  let metadata;host.harness.sdk.stub('files.read',async()=>({content:'Validated native brief',contentEncoding:'utf8',sizeBytes:22}));
+  host.harness.sdk.stub('threads.spawn',async args=>{metadata=args.pluginMetadata;return{id:'thr_created'};});
+  host.harness.sdk.stub('threads.list',async()=>metadata?[makeThreadResponse({id:'thr_created',projectId:'proj_1',parentThreadId:'thr_cap'})]:[]);
+  host.harness.sdk.stub('threads.getPluginMetadata',async({threadId})=>threadId==='thr_created'?metadata??{}:{});
+  const commands=new Map();let n=0;
+  host.harness.sdk.stub('terminals.create',async args=>{const id=`native${++n}`;commands.set(id,args.start.command);return{id};});
+  host.harness.sdk.stub('terminals.get',async()=>({status:'running'}));host.harness.sdk.stub('terminals.close',async()=>({}));
+  host.harness.sdk.stub('terminals.output',async({terminalId})=>{
+   const command=commands.get(terminalId);let code=0,payload='';
+   if(command.includes('fm-spawn.sh')&&!command.includes('native_command=')) {
+    const creation=await host.harness.behavior.runCli(['create-worker','--task','guard','--shape','ship','--project','proj_1','--home','/native','--host','host_1','--path','/repo','--prompt-file','/tmp/brief','--parent','thr_cap','--native-pid','999'],ctx);
+    assert.equal(creation.exitCode,0,creation.stderr);code=1;payload='native isolation/publication guard refused after BB creation';
+   }else if(command.includes('bb_thread_id')) payload='FM_META_ABSENT';
+   return{nextSeq:1,chunks:[{dataBase64:Buffer.from(`${payload}\n__FM_HOST_RC:${code}\n`).toString('base64')}]};
+  });
+  const result=await host.harness.behavior.runCli(['dispatch','--project','proj_1','--task-id','guard','--','fix login'],ctx);
+  assert.equal(result.exitCode,1,result.stdout);assert.match(result.stderr,/Native admission\/publication remains unresolved/);
+  const launches=createLaunches(host.bb.storage.database());assert.equal(launches.list()[0].state,'provisioning');assert.equal(launches.list()[0].threadId,'thr_created');assert.equal(host.harness.sdk.callsTo('threads.spawn').length,1);
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');assert.equal(launches.list()[0].state,'provisioning');
+  const other=await host.harness.behavior.runCli(['dispatch','--project','proj_1','--task-id','second','--','other work'],ctx);assert.equal(other.exitCode,1);assert.match(other.stderr,/cap reached/);assert.equal(host.harness.sdk.callsTo('threads.stop').length,0);
  }finally{await host.harness.lifecycle.dispose();}
 });

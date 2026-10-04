@@ -2,10 +2,11 @@ import { createHash } from 'node:crypto';
 import type { BbPluginApi } from '@get-bb/plugin-sdk';
 type Database = ReturnType<BbPluginApi['storage']['database']>;
 export type DeliveryRequirement = 'pr' | 'merged' | 'merged-and-verified';
-export type DeliveryStatus = 'draft' | 'waiting-checks' | 'failing-checks' | 'waiting-review' | 'changes-requested' | 'waiting-approval' | 'ready-to-merge' | 'merged-needs-verification' | 'closed-needs-disposition' | 'complete' | 'explicitly-abandoned';
+export type DeliveryStatus = 'draft' | 'waiting-checks' | 'failing-checks' | 'waiting-review' | 'waiting-native-gates' | 'changes-requested' | 'waiting-approval' | 'ready-to-merge' | 'merged-needs-verification' | 'closed-needs-disposition' | 'complete' | 'explicitly-abandoned';
 export interface DeliveryRecord {
   id: string; repository: string; number: number; url: string; headSha: string; mergeCommitSha:string|null;
   taskId: string; projectId: string; owner: string | null; home: string;
+  continuation?:Record<string,unknown>;
   workers: string[]; requirement: DeliveryRequirement; status: DeliveryStatus;
   blocker: string; nextAction: string; nextCheckAt: number; observedAt: number | null;
   freshness: 'fresh' | 'stale'; error: string | null; errors: number;
@@ -34,7 +35,7 @@ function notificationKey(r: DeliveryRecord) {
   return createHash('sha256').update(JSON.stringify([r.headSha, r.status, r.owner, r.ownerNeeded, r.blocker])).digest('hex');
 }
 function actionable(r: DeliveryRecord) {
-  return r.ownerNeeded || ['failing-checks','changes-requested','waiting-review','waiting-approval','ready-to-merge','merged-needs-verification','closed-needs-disposition'].includes(r.status);
+  return r.ownerNeeded || ['failing-checks','changes-requested','waiting-review','waiting-native-gates','waiting-approval','ready-to-merge','merged-needs-verification','closed-needs-disposition'].includes(r.status);
 }
 export function createDeliveries(db: Database) {
   db.exec(`CREATE TABLE IF NOT EXISTS deliveries (id TEXT PRIMARY KEY, owner TEXT, project TEXT NOT NULL, status TEXT NOT NULL, due INTEGER NOT NULL, record TEXT NOT NULL);
@@ -73,16 +74,20 @@ export function createDeliveries(db: Database) {
     return !!db.prepare(`SELECT 1 FROM deliveries WHERE owner=? AND project=? AND status NOT IN ('complete','explicitly-abandoned')${filter} LIMIT 1`)
       .get(owner,projectId,...(taskId === undefined ? [] : [taskId]));
   }
-  function register(input: { url: string; taskId: string; projectId: string; owner: string | null; home: string; worker: string; requirement?: DeliveryRequirement }) {
+  function taskRecord(owner:string,projectId:string,id:string) {
+    const row=db.prepare("SELECT record FROM deliveries WHERE owner=? AND project=? AND status NOT IN ('complete','explicitly-abandoned') AND (json_extract(record,'$.taskId')=? OR EXISTS(SELECT 1 FROM json_each(json_extract(record,'$.workers')) WHERE value=?)) ORDER BY due,id LIMIT 1").get(owner,projectId,id,id) as {record:string}|undefined;
+    return row ? JSON.parse(row.record) as DeliveryRecord : undefined;
+  }
+  function register(input: { url: string; taskId: string; projectId: string; owner: string | null; home: string; worker: string; requirement?: DeliveryRequirement; continuation?:Record<string,unknown> }) {
     const identity = canonicalPr(input.url);
     const prior = get(identity.id);
     if (prior) {
       if (prior.projectId !== input.projectId || prior.owner !== input.owner || prior.taskId !== input.taskId) throw new Error(`PR ${identity.id} already belongs to another task or manager. Explicit assignment is required.`);
       if (input.requirement && prior.requirement !== input.requirement) throw new Error("Delivery contract is already agreed; registration cannot silently replace it.");
-      return save({ ...prior, workers: [...new Set([...prior.workers,input.worker])].slice(-100) });
+      return save({ ...prior, continuation:input.continuation ?? prior.continuation, workers: [...new Set([...prior.workers,input.worker])].slice(-100) });
     }
     return save({ ...identity, headSha:'', mergeCommitSha:null,taskId:input.taskId, projectId:input.projectId, owner:input.owner,
-      home:input.home, workers:[input.worker], requirement:input.requirement ?? 'merged', status:'waiting-checks',
+      home:input.home, continuation:input.continuation, workers:[input.worker], requirement:input.requirement ?? 'merged', status:'waiting-checks',
       blocker:'Forge observation pending', nextAction:'Observe PR checks and review', nextCheckAt:Date.now(), observedAt:null,
       freshness:'stale', error:null, errors:0, ownerNeeded:input.owner === null, verifiedCommitSha:null, disposition:null,
       notification:{ desired:null, delivered:null, queued:null, retryAt:0 }, actionDueAt:Date.now()+86_400_000, updatedAt:Date.now() });
@@ -102,16 +107,18 @@ export function createDeliveries(db: Database) {
     } else if (o.draft) {
       r.status='draft'; r.blocker='PR is a draft'; r.nextAction='Finish work and mark ready';
     } else if (o.review === 'changes-requested') {
-      r.status='changes-requested'; r.blocker='Reviewer requested changes'; r.nextAction='Reuse the author for fixes, then obtain independent review';
+      r.status='changes-requested'; r.blocker='Reviewer requested changes'; r.nextAction='Reuse the author for fixes, then repeat the agreed review and validation';
     } else if (o.checks === 'failing') {
       r.status='failing-checks'; r.blocker='A check failed'; r.nextAction='Reuse the author to investigate and fix the failing check';
     } else if (changedHead || o.checks !== 'passing' || o.mergeable !== 'mergeable') {
       r.status='waiting-checks'; r.blocker=changedHead ? 'New head invalidated prior readiness; confirm checks and review again' : 'Checks or mergeability are pending or unknown'; r.nextAction='Wait for current-head checks and mergeability';
-    } else if (o.review !== 'approved' || o.reviewHeadSha !== o.headSha) {
-      r.status='waiting-review'; r.blocker='Independent review is required or unknown'; r.nextAction='Obtain independent review for the current head';
+    } else if (o.review === 'required' || (o.review === 'approved' && o.reviewHeadSha !== o.headSha)) {
+      r.status='waiting-review'; r.blocker='Repository review requirement is unsatisfied for this head'; r.nextAction='Satisfy the repository’s required review policy for the current head';
+    } else if (o.review === 'unknown' && mergeAuthorized) {
+      r.status='waiting-native-gates'; r.blocker='Repository review evidence is unknown'; r.nextAction='Continue the agreed native review and validation path, then use native guarded merge to check repository rules and task authority';
     } else {
       r.status=mergeAuthorized ? 'ready-to-merge' : 'waiting-approval';
-      r.blocker=mergeAuthorized ? '' : 'Merge approval is required'; r.nextAction=mergeAuthorized ? 'Use native guarded merge; preserve independent review' : 'Request merge approval through the existing decision mechanism';
+      r.blocker=mergeAuthorized ? '' : 'Merge approval is required'; r.nextAction=mergeAuthorized ? 'Use native guarded merge; preserve the agreed review and validation path' : 'Request merge approval through the existing decision mechanism';
     }
     if (r.requirement === 'pr' && o.state === 'open' && !o.draft) {
       r.status='complete'; r.blocker=''; r.nextAction='Agreed PR-only delivery satisfied';
@@ -141,11 +148,11 @@ export function createDeliveries(db: Database) {
     db.prepare(`UPDATE deliveries SET due=?,record=json_set(record,'$.ownerNeeded',json('true'),'$.nextAction','Explicitly assign a new manager','$.nextCheckAt',?,'$.notification.desired','owner-needed:'||id||':'||owner)
       WHERE owner=? AND status NOT IN ('complete','explicitly-abandoned')`).run(now+3_600_000,now+3_600_000,owner);
   }
-  function transferOwner(from:string,to:string,projectId:string,taskId?:string) {
+  function transferOwner(from:string,to:string,projectId:string,taskId?:string,excludedTasks:string[] = []) {
     const now=Date.now();
-    const filter=taskId === undefined ? '' : " AND json_extract(record,'$.taskId')=?";
+    const filter=(taskId === undefined ? '' : " AND json_extract(record,'$.taskId')=?") + (excludedTasks.length ? ` AND json_extract(record,'$.taskId') NOT IN (${excludedTasks.map(()=>'?').join(',')})` : '');
     return db.prepare(`UPDATE deliveries SET owner=?,due=?,record=json_set(record,'$.owner',?,'$.ownerNeeded',json('false'),'$.nextCheckAt',?,'$.notification.queued',NULL,'$.notification.attempted',NULL,'$.notification.delivered',NULL,'$.notification.desired','handoff:'||id||':'||?) WHERE owner=? AND project=? AND status NOT IN ('complete','explicitly-abandoned')${filter}`)
-      .run(to,now,to,now,to,from,projectId,...(taskId === undefined ? [] : [taskId])).changes;
+      .run(to,now,to,now,to,from,projectId,...(taskId === undefined ? [] : [taskId]),...excludedTasks).changes;
   }
 
   function abandon(id:string, actor:string, reason:string) {
@@ -191,7 +198,7 @@ export function createDeliveries(db: Database) {
       const latest=get(id)!; if (latest.owner !== r.owner || latest.notification.desired !== signature || latest.ownerNeeded) return false; latest.notification.retryAt=now+60_000; save(latest); return false;
     }
   }
-  return { get,save,list,conflict,hasOwned,register,observe,stale,assign,ownerLost,transferOwner,abandon,verify,markQueued,notify,pendingNotifications };
+  return { get,save,list,conflict,hasOwned,taskRecord,register,observe,stale,assign,ownerLost,transferOwner,abandon,verify,markQueued,notify,pendingNotifications };
 }
 
 /** Parse forge data conservatively. A successful lookup with unknown fields

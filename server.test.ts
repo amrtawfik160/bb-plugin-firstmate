@@ -4750,7 +4750,8 @@ test("real transport adopts an orphan by exact launch metadata when the title di
       ["dispatch", "--project", "proj_1", "--", "fix flaky login"],
       { threadId:"thr_cap",projectId: "proj_1" },
     );
-    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(result.exitCode, 1, "adoption cannot attest missing native admission");
+    assert.match(result.stderr,/provisioning/);
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
     const crews = await crewsKv(host);
     assert.equal(crews[0]?.threadId, "thr_orphan");
@@ -6057,7 +6058,8 @@ test("R4 orphan adoption via broad list when the thread is not tagged firstmate-
       ["dispatch", "--project", "proj_1", "--", "adopt me"],
       { threadId:"thr_cap",projectId: "proj_1" },
     );
-    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(result.exitCode, 1, "adoption cannot attest missing native admission");
+    assert.match(result.stderr,/provisioning/);
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0, "must adopt the orphan, not native-spawn");
     const crews = await crewsKv(host);
     assert.equal(crews[0]?.threadId, "thr_orphan");
@@ -9690,7 +9692,8 @@ test("real transport adopts the created thread when BB answers 504 while the cre
       return [{ id: "thr_orphan", projectId: "proj_1", parentThreadId: "thr_cap", title: "renamed-window" }];
     });
     const result = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--", "fix flaky login"], { threadId:"thr_cap",projectId: "proj_1" });
-    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(result.exitCode, 1, "adoption cannot attest missing native admission");
+    assert.match(result.stderr,/provisioning/);
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0, "no duplicate spawn");
     assert.ok(listCalls >= 3, "the transient listing failure was retried, not read as no orphan");
     assert.equal((await crewsKv(host))[0]?.threadId, "thr_orphan");
@@ -9760,7 +9763,8 @@ test("real transport re-looks for the thread after a 504 spawn failure and adopt
       return listCalls <= 2 ? [] : [{ id: "thr_late", projectId: "proj_1", parentThreadId: "thr_cap", title: "renamed-window" }];
     });
     const result = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--", "fix flaky login"], { threadId:"thr_cap",projectId: "proj_1" });
-    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(result.exitCode, 1, "adoption cannot attest missing native admission");
+    assert.match(result.stderr,/provisioning/);
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0, "no duplicate spawn");
     assert.ok(listCalls >= 3, `the thread was looked for again after the failed spawn (saw ${listCalls} list calls)`);
     assert.equal((await crewsKv(host))[0]?.threadId, "thr_late");

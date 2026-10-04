@@ -11,7 +11,7 @@
 // firstmate scripts). Everything mutating happens under scratch clones and a throwaway
 // project; /root/firstmate is never touched. Every real bb thread spawned is torn down.
 //
-//   node scripts/live-mirror-check.mjs
+//   FM_BB_MACHINE=<isolated-host-id> node scripts/live-mirror-check.mjs
 //
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, existsSync, lstatSync, readFileSync, writeFileSync } from "node:fs";
@@ -20,6 +20,8 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { normalizeCaptainIntent } from "../server.ts";
 import { OVERLAY, INSTALLER, sh, discoverCheckout, cloneAtBase, patchBase } from "./fm-fixture.mjs";
+
+if (!process.env.FM_BB_MACHINE) throw new Error("FM_BB_MACHINE is required: select the connected host on the isolated BB server before running live acceptance.");
 
 const results = [];
 function record(name, ok, detail) {

@@ -134,6 +134,7 @@ const queueItemSchema = z.object({
   providerId: z.string().optional(),
   model: z.string().optional(),
   reasoningLevel: z.string().optional(),
+  deliveryRequirement: z.enum(["pr", "merged", "merged-and-verified"]).optional(),
   waitUntil: z.string().nullable().default(null),
   status: z.enum(["queued", "dispatched", "done", "dropped"]).default("queued"),
   crewId: z.string().nullable().default(null),
@@ -171,6 +172,7 @@ const decisionSchema = z.object({
 type Decision = z.infer<typeof decisionSchema>;
 
 const doneSchema = z.object({
+  deliveryRequirement:z.enum(["pr","merged","merged-and-verified"]).optional(),
   id: z.string(),
   task: z.string(),
   shape: shapeSchema.default("ship"),
@@ -1403,7 +1405,7 @@ const BB_SKILL_RUNTIME_CONTRACT = [
   "Translate bin/fm-<name>.sh calls to firstmate_fm with script=<name> and the same arguments; use bb firstmate fm <name> only when a shell command is required.",
   "In imported skills, ../../../AGENTS.md means the complete contract returned by firstmate_contract, and ../../../bin, data, state, config, and docs refer to fmHome rather than this plugin directory.",
   "Map workers, panes, and tabs to BB crew threads via firstmate_dispatch/tell/interrupt/retry/stop. Call firstmate_watch once per batch; it hands off to private durable wakes. End the turn; never retry or poll.",
-  "Use BB interactions for captain questions and approvals. firstmate_deliveries retains open PRs after worker retirement and wake acknowledgement. Continue authorized review/fix/merge work using the author for fixes and an independent reviewer; merge through firstmate_merge. Inspect unresolved delivery records after compaction or handoff.",
+  "Use BB interactions for captain questions and approvals. firstmate_deliveries retains open PRs after worker retirement and wake acknowledgement. Continue authorized review/fix/merge work using the author for fixes and preserving the agreed native review and validation path, including independent review when required; merge through firstmate_merge. Inspect unresolved delivery records after compaction or handoff.",
   "Run firstmate_toolchain for native dependency detection. For browser work use the /browser skill and browser_script (or bb browser script), with profileId unset for the thread-isolated default. This replaces native chrome-devtools-axi transport. Read config/lavish-axi-host for remote Lavish access and use bb connect expose for a board the captain should see.",
   "Treat tmux, herdr, zellij, cmux, orca, and harness-specific hook setup as reference material unless the active backend explicitly names that runtime.",
 ].join(" ");
@@ -1541,7 +1543,8 @@ export default async function plugin(bb: BbPluginApi) {
   const reports=scoutReports(bb.storage.database());
   const deliveries = createDeliveries(bb.storage.database());
   const launchAbort = new AbortController();
-  bb.onDispose(() => launchAbort.abort());
+  let followUpWork:Promise<void>|undefined;
+  bb.onDispose(async () => { launchAbort.abort();await followUpWork?.catch(()=>{}); });
 
   const baseSettings = bb.settings.define({
     firstmateRepo: {
@@ -3269,7 +3272,7 @@ export default async function plugin(bb: BbPluginApi) {
   // Read a single key from a real state/<id>.meta on the host. Returns the value,
   // "" when the key is absent, or null when the host/state is unreadable. Used by
   // the real transport to learn the thread id the real fm-spawn.sh created.
-  async function readFmMetaField(hostId: string, crewId: string, key: string, home?: string): Promise<string | null> {
+  async function readFmMetaField(hostId: string, crewId: string, key: string, home?: string,signal?:AbortSignal): Promise<string | null> {
     const fmHome = home ?? (await settings.get()).fmHome.trim();
     if (fmHome === "") return null;
     const dest = `${fmHome}/state/${crewId}.meta`;
@@ -3278,11 +3281,13 @@ export default async function plugin(bb: BbPluginApi) {
         hostId,
         `[ -f ${shQuote(dest)} ] && grep ${shQuote(`^${key}=`)} ${shQuote(dest)} | tail -1 | cut -d= -f2- || echo FM_META_ABSENT`,
         15_000,
+        signal,
       );
       const out = res.output.trim();
       if (out === "" || out.includes("FM_META_ABSENT")) return "";
       return out;
-    } catch {
+    } catch (error) {
+      if (signal?.aborted) throw error;
       return null;
     }
   }
@@ -3773,8 +3778,11 @@ export default async function plugin(bb: BbPluginApi) {
             );
             if (!metaFlag(meta, "crew")) return null;
             const id = typeof meta["crewId"] === "string" ? meta["crewId"] : row.threadId.slice(0, 8);
+            const launch = typeof meta["launchKey"] === "string" ? launches.get(meta["launchKey"]) : launches.forTask(row.projectId,typeof row.parentThreadId === "string" ? row.parentThreadId : "",id);
             return {
               id,
+              launchKey:typeof meta["launchKey"] === "string" ? meta["launchKey"] : launch?.key,
+              deliveryRequirement:recoveredContract(meta,launch),
               nativeHome: typeof meta["nativeHome"] === "string" ? meta["nativeHome"] : (await baseSettings.get()).fmHome.trim(),
               task: typeof meta["task"] === "string" ? meta["task"] : "(recovered crew)",
               ...(typeof meta["title"] === "string" && meta["title"] !== "" ? { title: meta["title"] } : {}),
@@ -3971,10 +3979,17 @@ export default async function plugin(bb: BbPluginApi) {
 
   // Accept a crew id, or any thread id the crew has run on: captains often only
   // hold the thread id from a completion ping.
-  async function findCrew(id: string): Promise<Crew | undefined> {
+  async function findCrew(id: string,caller?:string): Promise<Crew | undefined> {
     const all = await listCrewsAll();
-    return all.find((entry) => entry.id === id)
-      ?? all.find((entry) => entry.threadId === id || (entry.priorThreadIds ?? []).includes(id));
+    const found=all.find(entry=>entry.id === id) ?? all.find(entry=>entry.threadId === id || (entry.priorThreadIds ?? []).includes(id));
+    if (found) { const launch=found.launchKey ? launches.get(found.launchKey) : launches.forTask(found.projectId,found.parentThreadId ?? "",found.id);
+      return launch?.deliveryRequirement ? {...found,launchKey:launch.key,deliveryRequirement:recoveredContract({deliveryRequirement:found.deliveryRequirement},launch)} : found; }
+    if (!caller) return undefined;
+    const projectId=(await bb.sdk.threads.get({threadId:caller})).projectId;
+    const record=deliveries.taskRecord(caller,projectId,id);
+    if (!record?.continuation) return undefined;
+    const recovered=crewSchema.parse(record.continuation);
+    return {...recovered,parentThreadId:record.owner,deliveryRequirement:record.requirement,prUrl:record.url};
   }
 
   async function findCrewByThread(threadId: string): Promise<Crew | undefined> {
@@ -4139,8 +4154,10 @@ export default async function plugin(bb: BbPluginApi) {
     if (!("content" in read) || read.sizeBytes > 1_000_000) throw new Error("Native prompt is missing or exceeds 1MB.");
     const prompt = read.contentEncoding === "base64" ? Buffer.from(read.content,"base64").toString("utf8") : read.content;
     const key = launchKey(projectId, owner, home, taskId);
-    let record = await launches.reserve({ key, taskId, projectId, owner, home, generation:1,shape,nativeInvoked:true,deliveryMode:flagStr(flags,"delivery-mode"),deliveryRequirement:flagStr(flags,"delivery-requirement") as "pr" | "merged" | "merged-and-verified" | undefined,state:"reserved",threadId:null,hostId,updatedAt:Date.now() }, () => launchCapacity(owner || undefined));
+    let record = await launches.reserve({ key, taskId, projectId, owner, home, generation:1,shape,nativeInvoked:true,deliveryMode:flagStr(flags,"delivery-mode"),deliveryRequirement:z.enum(["pr","merged","merged-and-verified"]).parse(flagStr(flags,"delivery-requirement") ?? "merged"),state:"reserved",threadId:null,hostId,updatedAt:Date.now() }, () => launchCapacity(owner || undefined));
     record = await reconcileLaunch(record);
+    const suppliedContract=flagStr(flags,"delivery-requirement");
+    if (suppliedContract && suppliedContract !== recoveredContract({},record)) throw new Error("Creation retry cannot change the original delivery contract.");
     const created = await launches.create(key, () => bb.sdk.threads.spawn({ projectId, parentThreadId:owner || undefined,
       environment: shape === "secondmate" || flags.has("shared-env")
         ? { type:"host",hostId,workspace:{ type:"unmanaged",path } }
@@ -4149,7 +4166,7 @@ export default async function plugin(bb: BbPluginApi) {
       reasoningLevel: strictReasoning(flagStr(flags,"reasoning-level")), permissionMode,
       visibility:flags.has("hidden") ? "hidden" : "visible",
       pluginMetadata: { launchKey:key,generation:1,nativeHome:shape === "secondmate" ? path : home,
-        ...(shape === "secondmate" ? { captain:"true",nativeTaskId:taskId,nativeParentHome:home } : { crew:"true",crewId:taskId,shape,posture:flagStr(flags,"delivery-mode") ?? "direct-PR",worktree:!flags.has("shared-env"),deliveryRequirement:flagStr(flags,"delivery-requirement") ?? "merged" }) },
+        ...(shape === "secondmate" ? { captain:"true",nativeTaskId:taskId,nativeParentHome:home } : { crew:"true",crewId:taskId,shape,posture:flagStr(flags,"delivery-mode") ?? "direct-PR",worktree:!flags.has("shared-env"),deliveryRequirement:recoveredContract({},record) }) },
     }), launchAbort.signal);
     if (shape === "secondmate") {
       await bb.storage.kv.set(`native-home:${created.threadId}`,path);
@@ -4209,12 +4226,19 @@ export default async function plugin(bb: BbPluginApi) {
     return { cap, activeTaskIds };
   }
 
-  async function reconcileLaunch(record: LaunchRecord): Promise<LaunchRecord> {
+  async function reconcileLaunch(record: LaunchRecord,signal=launchAbort.signal): Promise<LaunchRecord> {
     if (record.threadId) return record;
     if (record.state !== "creating" && record.state !== "uncertain") return record;
-    const found = await discoverLaunch(bb, record, launchAbort.signal);
+    const found = await discoverLaunch(bb, record, signal);
+    signal.throwIfAborted();
     if (found) return launches.update(record.key, { threadId: found, state: "provisioning", error: undefined });
     throw new Error(`Launch ${record.taskId} remains uncertain after bounded reconciliation. Its slot is retained; no replacement was created.`);
+  }
+
+  async function launchEnvironmentReady(record:LaunchRecord,env:{hostId:string;status:string;path:string|null},signal?:AbortSignal) {
+    if (env.status !== "ready" || !env.path || (record.hostId && env.hostId !== record.hostId)) return false;
+    if (!record.nativeInvoked) return true;
+    return await readFmMetaField(env.hostId,record.taskId,"bb_thread_id",record.home,signal) === record.threadId;
   }
 
   async function dispatchCrew(input: Parameters<typeof dispatchCrewBody>[0]): Promise<Crew> {
@@ -4226,8 +4250,10 @@ export default async function plugin(bb: BbPluginApi) {
     const key = launchKey(input.projectId, input.parentThreadId ?? "", home, taskId);
     return launches.once(`dispatch:${key}`, async () => {
       const record = await launches.reserve({ key, taskId, projectId: input.projectId, owner: input.parentThreadId ?? "",
-        home, generation: 1, shape: input.shape, deliveryMode:input.mode, deliveryRequirement:input.deliveryRequirement, state: "reserved", threadId: null, updatedAt: Date.now() }, () => launchCapacity(input.parentThreadId));
+        home, generation: 1, shape: input.shape, deliveryMode:input.mode, deliveryRequirement:input.deliveryRequirement ?? "merged", state: "reserved", threadId: null, updatedAt: Date.now() }, () => launchCapacity(input.parentThreadId));
       const resolved = await reconcileLaunch(record);
+      if (input.deliveryRequirement && input.deliveryRequirement !== recoveredContract({},resolved)) throw new Error("Retry cannot change the original delivery contract.");
+      input={...input,deliveryRequirement:recoveredContract({},resolved)};
       if (resolved.threadId && ((await settings.get()).transport !== "real" || resolved.state === "running")) {
         const crew = (await readCrews()).find(c => c.id === taskId && c.projectId === input.projectId && c.parentThreadId === (input.parentThreadId ?? null));
         if (crew) return crew;
@@ -4235,6 +4261,7 @@ export default async function plugin(bb: BbPluginApi) {
           threadId: resolved.threadId, nativeHome: home, providerId: null, model: null, reasoningLevel: null,
           worktree: input.worktree, shape: input.shape, posture: input.shape === "scout" ? "scout" : input.mode,
           launchKey: key, metaWritten: false, createdAt: new Date().toISOString() };
+        recovered.deliveryRequirement=recoveredContract({},resolved);
         await mutateCrews(rows => [recovered, ...rows.filter(c => c.id !== taskId)]);
         return recovered;
       }
@@ -4247,12 +4274,13 @@ export default async function plugin(bb: BbPluginApi) {
         try { thread = await raceAbort(bb.sdk.threads.defaultExecutionOptions({ threadId:crew.threadId }),launchAbort.signal,STUCK_HOST_CALL_MS); } catch { /* project defaults unresolved; never claim parent inheritance */ }
         const envId=await threadEnv(crew.threadId);
         let ready=false;
-        if (envId) try { const env=await raceAbort(bb.sdk.environments.get({environmentId:envId}),launchAbort.signal,STUCK_HOST_CALL_MS); ready=env.status === "ready" && !!env.path; } catch { /* provisioning is unresolved */ }
+        if (envId) try { const env=await raceAbort(bb.sdk.environments.get({environmentId:envId}),launchAbort.signal,STUCK_HOST_CALL_MS); ready=await launchEnvironmentReady({...launches.get(key)!,threadId:crew.threadId},env,launchAbort.signal); } catch { /* provisioning is unresolved */ }
         launches.update(key, { threadId: crew.threadId, shape:isSecondmateRoute(crew) ? "secondmate-route" : crew.shape, state: ready || isSecondmateRoute(crew) ? "running" : "provisioning", execution: {
           providerId: actualProvider, model: thread?.model ?? crew.model,
           reasoningLevel: thread?.reasoningLevel ?? crew.reasoningLevel } });
         if (thread) { crew.providerId = actualProvider; crew.model = thread.model; crew.reasoningLevel = thread.reasoningLevel; }
         await mutateCrews(rows => rows.map(c => c.id === taskId ? crew : c));
+        if (!ready && launches.get(key)?.nativeInvoked && !isSecondmateRoute(crew)) throw new Error("Native admission/publication remains unresolved; worker and capacity are retained.");
         return crew;
       } catch (error) {
         const latest = launches.get(key)!;
@@ -4318,7 +4346,7 @@ export default async function plugin(bb: BbPluginApi) {
           worktree: false,
           shape: input.shape,
           posture: `secondmate:${input.mode}`,
-          deliveryRequirement:input.deliveryRequirement,
+          deliveryRequirement:input.deliveryRequirement ?? "merged",
           createdAt: new Date().toISOString(),
         };
         launches.update(routeKey,{threadId:mate.threadId,state:"running"});
@@ -4329,7 +4357,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
     const crew: Crew = {
-      deliveryRequirement: input.deliveryRequirement,
+      deliveryRequirement: input.deliveryRequirement ?? "merged",
       nativeHome: (await settings.get()).fmHome.trim(),
       id: input.crewId !== undefined && input.crewId !== "" ? input.crewId : randomUUID().slice(0, 8),
       task,
@@ -4484,6 +4512,7 @@ export default async function plugin(bb: BbPluginApi) {
     crew: Crew,
     opts: { providerId?: string; model?: string; reasoningLevel?: ReasoningLevel; note?: string; overCap?: boolean },
   ): Promise<Crew> {
+    crew={...crew,deliveryRequirement:await contractForCrew(crew)};
     if (isSecondmateRoute(crew)) {
       throw new Error(`Crew ${crew.id} is a secondmate route — relaunch the domain captain thread directly.`);
     }
@@ -4781,6 +4810,18 @@ export default async function plugin(bb: BbPluginApi) {
       }
       throw error;
     }
+  }
+
+  async function resumeRetainedAuthor(crew:Crew,caller?:string) {
+    if (!caller || crew.parentThreadId !== caller || (await readCrews()).some(c=>c.threadId === crew.threadId)) return;
+    const record=deliveries.taskRecord(caller,crew.projectId,crew.id);
+    if (!record?.continuation || !record.workers.includes(crew.threadId)) return;
+    const thread=await bb.sdk.threads.get({threadId:crew.threadId});
+    if (thread.projectId !== crew.projectId) throw new Error("Retained author project mismatch; explicit recovery is required.");
+    // Forget clears the role flag. Restore only this owned, durable worker before
+    // any requested fix turn can receive a fresh agent configuration.
+    await bb.sdk.threads.updatePluginMetadata({threadId:crew.threadId,set:{crew:"true",crewId:crew.id,shape:crew.shape,posture:crew.posture,nativeHome:record.home,deliveryRequirement:record.requirement,...(crew.launchKey ? {launchKey:crew.launchKey} : {})}});
+    if (thread.archivedAt != null) await bb.sdk.threads.unarchive({threadId:crew.threadId});
   }
 
   async function tellCrew(crew: Crew, message: string, interrupt: boolean, queue = false): Promise<string> {
@@ -5465,7 +5506,27 @@ export default async function plugin(bb: BbPluginApi) {
     }
     return deliveries.list({ owner, projectId, includeLost:!!projectId, limit: 50 });
   }
-  async function registerCrewPr(crew: Crew, url: string) {
+  function recoveredContract(meta:Record<string,unknown>,record?:LaunchRecord):NonNullable<Crew["deliveryRequirement"]> {
+    const value=meta["deliveryRequirement"];
+    if (value !== undefined && !["pr","merged","merged-and-verified"].includes(String(value))) throw new Error("Recovered task has an invalid delivery contract.");
+    if (record?.deliveryRequirement && value !== undefined && record.deliveryRequirement !== value) throw new Error("Recovered metadata disagrees with the durable delivery contract.");
+    if (record) {
+      if (!record.deliveryRequirement && value === undefined) throw new Error("Durable launch has no readable original delivery contract; explicit recovery is required.");
+      return record.deliveryRequirement ?? (value as NonNullable<Crew["deliveryRequirement"]>);
+    }
+    if (value !== undefined) return value as NonNullable<Crew["deliveryRequirement"]>;
+    if (meta["launchKey"]) throw new Error("Recovered launch has no readable delivery contract; explicit recovery is required.");
+    return "merged"; // Pre-register legacy tasks used the documented merged default.
+  }
+  async function contractForCrew(crew:Crew,signal?:AbortSignal) {
+    const record=crew.launchKey ? launches.get(crew.launchKey) : launches.forTask(crew.projectId,crew.parentThreadId ?? "",crew.id);
+    if (crew.deliveryRequirement || record?.deliveryRequirement) return recoveredContract({deliveryRequirement:crew.deliveryRequirement},record);
+    let metadata:Record<string,unknown>;
+    try { metadata=await raceAbort(bb.sdk.threads.getPluginMetadata({threadId:crew.threadId,signal}),signal,STUCK_HOST_CALL_MS); }
+    catch(error) { if (signal?.aborted || record || crew.launchKey) throw error; return "merged" as const; }
+    return recoveredContract(metadata,record);
+  }
+  async function registerCrewPr(crew: Crew, url: string,signal?:AbortSignal) {
     if (crew.shape !== "ship" || crew.posture === "local-only" || isSecondmateRoute(crew) || !url) return;
     const identity = canonicalPr(url);
     const prior=deliveries.get(identity.id);
@@ -5473,17 +5534,20 @@ export default async function plugin(bb: BbPluginApi) {
       bb.log.warn(`PR ${identity.id} already tracked by task ${prior.taskId}; preserving its owner.`);
       return;
     }
-    deliveries.register({ url,taskId:crew.id,projectId:crew.projectId,owner:crew.parentThreadId,
-      home:await crewNativeHome(crew),worker:crew.threadId,requirement:crew.deliveryRequirement });
+    const home=await raceAbort(crewNativeHome(crew),signal,STUCK_HOST_CALL_MS);
+    const requirement=await contractForCrew(crew,signal);
+    const task=await raceAbort(fullCrewTask(crew),signal,STUCK_HOST_CALL_MS);
+    signal?.throwIfAborted();
+    deliveries.register({url,taskId:crew.id,projectId:crew.projectId,owner:crew.parentThreadId,home,worker:crew.threadId,requirement,continuation:{...crew,task,taskSpilled:false}});
   }
-  async function discoverCrewDelivery(crew: Crew) {
+  async function discoverCrewDelivery(crew: Crew,signal?:AbortSignal) {
     if (crew.shape !== "ship" || crew.posture === "local-only" || isSecondmateRoute(crew)) return;
-    if (crew.prUrl) { await registerCrewPr(crew, crew.prUrl); return; }
-    const envId = await threadEnv(crew.threadId);
+    if (crew.prUrl) { await registerCrewPr(crew, crew.prUrl,signal); return; }
+    const envId = await threadEnv(crew.threadId,signal);
     if (!envId) return;
-    const hostId = await resolveHostForProject(crew.projectId,crew.parentThreadId ?? undefined);
+    const hostId = await resolveHostForProject(crew.projectId,crew.parentThreadId ?? undefined,signal);
     // Environment/branch identity proves provenance. Report URLs alone do not.
-    await resolveCrewPr(crew,envId,hostId);
+    await resolveCrewPr(crew,envId,hostId,signal);
   }
   async function reconcileDelivery(record:DeliveryRecord,signal?:AbortSignal) {
     return serializeLedger(`delivery:${record.id}`,async()=>{
@@ -5516,7 +5580,8 @@ export default async function plugin(bb: BbPluginApi) {
       const observation = parseForge(JSON.parse(result.output));
       // Standing yolo allows asking the manager to continue; only native merge
       // can establish task-level authority and required checks at execution.
-      const authorized = (await postureOf(record.projectId)).yolo;
+      const authorized = (await raceAbort(postureOf(record.projectId),signal,STUCK_HOST_CALL_MS)).yolo;
+      signal?.throwIfAborted();
       return deliveries.observe(record.id,observation,authorized);
     } catch (error) {
       if (signal?.aborted) throw error;
@@ -5533,7 +5598,7 @@ export default async function plugin(bb: BbPluginApi) {
       const crew: Crew = { id:r.taskId,task:`PR delivery ${r.id}`,projectId:r.projectId,threadId:r.workers.at(-1) ?? "",
         parentThreadId:r.owner,providerId:null,model:null,reasoningLevel:null,worktree:true,shape:"ship",posture:"direct-PR",
         nativeHome:r.home,createdAt:new Date(r.updatedAt).toISOString() };
-      const text = `FM_DELIVERY_NOTICE=${r.id}:${r.notification.desired} PR delivery needs follow-up. ${deliveryLine(r)}. Inspect firstmate_deliveries. Reuse the author for fixes and retain independent review. Continue only already-authorized work; merge through firstmate_merge. Wake acknowledgement does not complete this deliverable.`;
+      const text = `FM_DELIVERY_NOTICE=${r.id}:${r.notification.desired} PR delivery needs follow-up. ${deliveryLine(r)}. Inspect firstmate_deliveries. Reuse the author for fixes and preserve the task’s native review and validation contract. Continue only already-authorized work; merge through firstmate_merge. Wake acknowledgement does not complete this deliverable.`;
       if (r.notification.queued !== r.notification.desired) {
         const queued = await enqueueCaptainWake(crew,text,signal,`FM_DELIVERY_NOTICE=${r.id}:${r.notification.desired}`);
         if (queued.durable && !deliveries.markQueued(r.id,r.owner!,r.notification.desired!)) return false;
@@ -5546,11 +5611,11 @@ export default async function plugin(bb: BbPluginApi) {
     },Date.now(), async r => {
       const marker=`FM_DELIVERY_NOTICE=${r.id}:${r.notification.desired}`;
       try {
-        const held=await bb.storage.kv.get(`${CAPTAIN_WAKE_HOLD_PREFIX}${r.owner}`);
+        const held=await raceAbort(bb.storage.kv.get(`${CAPTAIN_WAKE_HOLD_PREFIX}${r.owner}`),signal,STUCK_HOST_CALL_MS);
         if (JSON.stringify(held)?.includes(marker)) return "accepted";
-        const queued=await bb.sdk.threads.queuedMessages.list({ threadId:r.owner! });
+        const queued=await raceAbort(bb.sdk.threads.queuedMessages.list({ threadId:r.owner!,signal }),signal,STUCK_HOST_CALL_MS);
         if (queued.some(q=>!q.failureReason && JSON.stringify(q.content).includes(marker))) return "accepted";
-        const events=await bb.sdk.threads.events.list({ threadId:r.owner!,order:"desc",limit:"100" });
+        const events=await raceAbort(bb.sdk.threads.events.list({ threadId:r.owner!,order:"desc",limit:"100",signal }),signal,STUCK_HOST_CALL_MS);
         if (events.some(e=>JSON.stringify(e.data).includes(marker))) return "accepted";
         if (events.length<100 || events.at(-1)!.createdAt < (r.notification.attemptedAt ?? 0)) return "absent";
         return "unknown";
@@ -5559,22 +5624,22 @@ export default async function plugin(bb: BbPluginApi) {
   }
   let deliveryDoneCursor=0;
   async function recoverDoneDeliveries(signal?:AbortSignal) {
-    const done=(await readDone()).filter(r=>r.shape === "ship" && r.pr && r.parentThreadId);
+    const done=(await raceAbort(readDone(),signal,STUCK_HOST_CALL_MS)).filter(r=>r.shape === "ship" && r.pr && r.parentThreadId);
     const batch=[...done.slice(deliveryDoneCursor),...done.slice(0,deliveryDoneCursor)].slice(0,10);
     deliveryDoneCursor=done.length ? (deliveryDoneCursor+batch.length)%done.length : 0;
     for (const row of batch) {
       signal?.throwIfAborted();
-      try {
+      await boundedFollowUp(async signal=>{
         const identity=canonicalPr(row.pr);
-        if (deliveries.get(identity.id)) continue;
+        if (deliveries.get(identity.id)) return;
         const owner=row.parentThreadId!;
-        const savedProject=await bb.storage.kv.get<string>(`${CAPTAIN_PROJECT_PREFIX}${owner}`);
+        const savedProject=await raceAbort(bb.storage.kv.get<string>(`${CAPTAIN_PROJECT_PREFIX}${owner}`),signal,STUCK_HOST_CALL_MS);
         let projectId=savedProject;
-        if (!projectId) projectId=(await bb.sdk.threads.get({threadId:owner})).projectId;
-        if (!projectId) continue;
-        const home=await bb.storage.kv.get<string>(`native-home:${owner}`) ?? "";
-        deliveries.register({url:row.pr,taskId:row.crewId,projectId,owner,home,worker:""});
-      } catch (error) { bb.log.warn(`PR inventory recovery ${row.crewId}: ${String(error)}`); }
+        if (!projectId) projectId=(await raceAbort(bb.sdk.threads.get({threadId:owner,signal}),signal,STUCK_HOST_CALL_MS)).projectId;
+        if (!projectId) return;
+        const home=await raceAbort(bb.storage.kv.get<string>(`native-home:${owner}`),signal,STUCK_HOST_CALL_MS) ?? "";
+        deliveries.register({url:row.pr,taskId:row.crewId,projectId,owner,home,worker:"",requirement:row.deliveryRequirement ?? recoveredContract({},launches.forTask(projectId,owner,row.crewId))});
+      },signal).catch(error=>bb.log.warn(`PR inventory recovery ${row.crewId}: ${String(error)}`));
     }
   }
   let deliveryDiscoveryCursor = 0;
@@ -5582,52 +5647,53 @@ export default async function plugin(bb: BbPluginApi) {
   async function launchRecoveryPass(signal?: AbortSignal) {
     const batch=launches.list(undefined,10,launchRecoveryCursor);
     launchRecoveryCursor=batch.length === 10 ? launchRecoveryCursor+10 : 0;
-    const retained=await readCrews();
+    const retained=await raceAbort(readCrews(),signal,STUCK_HOST_CALL_MS);
     for (const record of batch) {
-      if (signal?.aborted) break;
-      if (record.state === "creating" || record.state === "uncertain") {
-        await reconcileLaunch(record).catch(error => bb.log.warn(String(error)));
-      }
-      const recovered=launches.get(record.key)!;
-      if (recovered.state === "provisioning" && recovered.threadId) try {
-        const thread=await raceAbort(bb.sdk.threads.get({threadId:recovered.threadId,signal}),signal,STUCK_HOST_CALL_MS);
-        if (thread.environmentId) {
-          const env=await raceAbort(bb.sdk.environments.get({environmentId:thread.environmentId}),signal,STUCK_HOST_CALL_MS);
-          if (env.status === "ready" && env.path && (!recovered.hostId || env.hostId === recovered.hostId)) {
-            const admitted=!recovered.nativeInvoked || await readFmMetaField(env.hostId,recovered.taskId,"bb_thread_id",recovered.home) === recovered.threadId;
-            if (admitted) launches.update(recovered.key,{state:"running",path:env.path,hostId:env.hostId,error:undefined});
-          }
+      signal?.throwIfAborted();
+      await boundedFollowUp(async signal=>{
+        if (record.state === "creating" || record.state === "uncertain") {
+          await reconcileLaunch(record,signal).catch(error => bb.log.warn(String(error)));
         }
-      } catch(error) { if (signal?.aborted) throw error; bb.log.warn(`Provisioning remains unresolved ${record.taskId}: ${String(error)}`); }
-      if (recovered.shape !== "ship" || recovered.deliveryMode === "local-only" || !recovered.threadId || !recovered.owner || retained.some(c=>c.threadId === recovered.threadId)) continue;
-      try {
-        const metadata=await raceAbort(bb.sdk.threads.getPluginMetadata({threadId:recovered.threadId}),signal,STUCK_HOST_CALL_MS);
-        if (metadata.launchKey !== recovered.key || metadata.nativeHome !== recovered.home || metadata.crewId !== recovered.taskId) continue;
-        // Only exact, owned launch metadata can recover an orphan reference.
-        const crew:Crew={id:recovered.taskId,task:"Recovered owned launch",projectId:recovered.projectId,parentThreadId:recovered.owner,
-          threadId:recovered.threadId,nativeHome:recovered.home,providerId:null,model:null,reasoningLevel:null,worktree:true,shape:"ship",posture:"direct-PR",
-          deliveryRequirement:recovered.deliveryRequirement,createdAt:new Date(recovered.updatedAt).toISOString()};
-        await discoverCrewDelivery(crew);
-      } catch(error) { if (signal?.aborted) throw error; bb.log.warn(`Owned PR reference recovery ${record.taskId}: ${String(error)}`); }
+        const recovered=launches.get(record.key)!;
+        if (recovered.state === "provisioning" && recovered.threadId) try {
+          const thread=await raceAbort(bb.sdk.threads.get({threadId:recovered.threadId,signal}),signal,STUCK_HOST_CALL_MS);
+          if (thread.environmentId) {
+            const env=await raceAbort(bb.sdk.environments.get({environmentId:thread.environmentId}),signal,STUCK_HOST_CALL_MS);
+            if (await launchEnvironmentReady(recovered,env,signal)) {
+              signal?.throwIfAborted();
+              if (env.path) launches.update(recovered.key,{state:"running",path:env.path,hostId:env.hostId,error:undefined});
+            }
+          }
+        } catch(error) { if (signal?.aborted) throw error; bb.log.warn(`Provisioning remains unresolved ${record.taskId}: ${String(error)}`); }
+        if (recovered.shape !== "ship" || recovered.deliveryMode === "local-only" || !recovered.threadId || !recovered.owner || retained.some(c=>c.threadId === recovered.threadId)) return;
+        try {
+          const metadata=await raceAbort(bb.sdk.threads.getPluginMetadata({threadId:recovered.threadId}),signal,STUCK_HOST_CALL_MS);
+          if (metadata.launchKey !== recovered.key || metadata.nativeHome !== recovered.home || metadata.crewId !== recovered.taskId) return;
+          // Only exact, owned launch metadata can recover an orphan reference.
+          const crew:Crew={id:recovered.taskId,task:"Recovered owned launch",projectId:recovered.projectId,parentThreadId:recovered.owner,
+            threadId:recovered.threadId,nativeHome:recovered.home,providerId:null,model:null,reasoningLevel:null,worktree:true,shape:"ship",posture:"direct-PR",
+            launchKey:recovered.key,deliveryRequirement:recoveredContract(metadata,recovered),createdAt:new Date(recovered.updatedAt).toISOString()};
+          await discoverCrewDelivery(crew,signal);
+        } catch(error) { if (signal?.aborted) throw error; bb.log.warn(`Owned PR reference recovery ${record.taskId}: ${String(error)}`); }
+      },signal).catch(error=>bb.log.warn(`Launch recovery ${record.taskId}: ${String(error)}`));
     }
   }
   async function deliveryPass(signal?: AbortSignal) {
     await recoverDoneDeliveries(signal);
-    const crews = await readCrews();
+    const crews = await raceAbort(readCrews(),signal,STUCK_HOST_CALL_MS);
     const batch = [...crews.slice(deliveryDiscoveryCursor),...crews.slice(0,deliveryDiscoveryCursor)].slice(0,10);
     deliveryDiscoveryCursor = crews.length ? (deliveryDiscoveryCursor+batch.length)%crews.length : 0;
     for (const crew of batch) {
       signal?.throwIfAborted();
-      await discoverCrewDelivery(crew).catch(error => bb.log.warn(`PR discovery ${crew.id}: ${String(error)}`));
+      await boundedFollowUp(s=>discoverCrewDelivery(crew,s),signal).catch(error => bb.log.warn(`PR discovery ${crew.id}: ${String(error)}`));
     }
     for (const record of deliveries.list({ due:Date.now(),limit:10 })) {
       signal?.throwIfAborted();
-      await reconcileDelivery(record,signal);
-      await notifyDelivery(record,signal);
+      await boundedFollowUp(async s=>{await reconcileDelivery(record,s);await notifyDelivery(record,s);},signal).catch(error=>bb.log.warn(`PR follow-up ${record.id}: ${String(error)}`));
     }
     // Notification failure stays due independently of forge polling backoff.
     for (const record of deliveries.pendingNotifications()) {
-      if (record.notification.desired !== record.notification.delivered) await notifyDelivery(record,signal);
+      if (record.notification.desired !== record.notification.delivered) await boundedFollowUp(s=>notifyDelivery(record,s),signal).catch(error=>bb.log.warn(`PR notification ${record.id}: ${String(error)}`));
     }
   }
   const deliveryParams = z.object({
@@ -5648,7 +5714,9 @@ export default async function plugin(bb: BbPluginApi) {
       const crew=await findCrew(input.crewId ?? "");
       if (!crew || crew.parentThreadId !== owner || crew.projectId !== projectId || crew.shape !== "ship") throw new Error("Register requires an owned ship on this project.");
       if (input.requirement && !input.authorized) throw new Error("Setting an explicit delivery contract requires user authority; an existing contract cannot be replaced by registration.");
-      const record=deliveries.register({ url:input.url ?? crew.prUrl ?? "",taskId:crew.id,projectId,owner,home:await crewNativeHome(crew),worker:crew.threadId,requirement:input.requirement });
+      const original=await contractForCrew(crew);
+      if (input.requirement && input.requirement !== original) throw new Error("Registration cannot change the original delivery contract.");
+      const record=deliveries.register({ url:input.url ?? crew.prUrl ?? "",taskId:crew.id,projectId,owner,home:await crewNativeHome(crew),worker:crew.threadId,requirement:original,continuation:{...crew,task:await fullCrewTask(crew),taskSpilled:false} });
       return [record];
     }
     const r=deliveries.get(input.id ?? "");
@@ -5669,12 +5737,13 @@ export default async function plugin(bb: BbPluginApi) {
     return [deliveries.get(r.id)!];
   }
 
-  async function rememberPrUrl(crew: Crew, url: string): Promise<void> {
+  async function rememberPrUrl(crew: Crew, url: string,signal?:AbortSignal): Promise<void> {
     if (url === "") return;
-    await registerCrewPr(crew,url);
+    await registerCrewPr(crew,url,signal);
     if (crew.prUrl === url) return;
     crew.prUrl = url;
-    await mutateCrews((crews) => crews.map((c) => (c.id === crew.id && c.threadId === crew.threadId ? { ...c, prUrl: url } : c)));
+    signal?.throwIfAborted();
+    await raceAbort(mutateCrews((crews) => crews.map((c) => (c.id === crew.id && c.threadId === crew.threadId ? { ...c, prUrl: url } : c))),signal,STUCK_HOST_CALL_MS);
   }
 
   async function markDeck(threadId: string): Promise<void> {
@@ -5688,52 +5757,54 @@ export default async function plugin(bb: BbPluginApi) {
 
   // Live PR state + mergeability through gh on the crew's host. null when gh cannot
   // answer (the caller then relies on native/BB reads, never on a guess).
-  async function ghPrView(hostId: string, url: string): Promise<{ state: string; mergeable: string } | null> {
+  async function ghPrView(hostId: string, url: string,signal?:AbortSignal): Promise<{ state: string; mergeable: string } | null> {
     try {
-      const res = await runOnHost(hostId, `gh pr view ${shQuote(url)} --json state,mergeable 2>/dev/null || true`, 30_000);
+      const res = await runOnHost(hostId, `gh pr view ${shQuote(url)} --json state,mergeable 2>/dev/null || true`, 30_000,signal);
       const parsed = asRecord(JSON.parse(res.output.trim() || "null"));
       const state = parsed["state"];
       if (typeof state !== "string") return null;
       const mergeable = parsed["mergeable"];
       return { state: state.toLowerCase(), mergeable: typeof mergeable === "string" ? mergeable.toUpperCase() : "UNKNOWN" };
-    } catch {
+    } catch(error) {
+      if (signal?.aborted) throw error;
       return null;
     }
   }
 
   // A crew's PR even when BB's environment cache has none — e.g. the crew pushed to
   // an EXISTING PR. Order: environment PR, the recorded crew PR url, gh by the
-  // crew's branch, then the last PR url the crew itself reported.
+  // crew's branch. A report URL alone does not establish task provenance.
   async function resolveCrewPr(
     crew: Crew,
     envId: string,
     hostId: string | null,
+    signal?:AbortSignal,
   ): Promise<{ url: string; state: string; source: string } | null> {
     let env = prFacts(null);
-    try { env = prFacts(await bb.sdk.environments.pullRequest({ environmentId: envId })); } catch { /* fall through */ }
+    try { env = prFacts(await raceAbort(bb.sdk.environments.pullRequest({ environmentId: envId,signal }),signal,STUCK_HOST_CALL_MS)); } catch(error) { if (signal?.aborted) throw error; }
     if (env.available && env.url !== "") {
-      await rememberPrUrl(crew, env.url);
+      await rememberPrUrl(crew, env.url,signal);
       return { url: env.url, state: env.state, source: "environment" };
     }
     if (hostId === null) return null;
     const candidates: Array<{ url: string; source: string }> = [];
     if (crew.prUrl !== undefined && crew.prUrl !== "") candidates.push({ url: crew.prUrl, source: "recorded" });
     try {
-      const e = asRecord(await bb.sdk.environments.get({ environmentId: envId }));
+      const e = asRecord(await raceAbort(bb.sdk.environments.get({ environmentId: envId,signal }),signal,STUCK_HOST_CALL_MS));
       const branch = typeof e["branchName"] === "string" ? e["branchName"] : "";
       const path = typeof e["path"] === "string" ? e["path"] : "";
       if (branch !== "" && path !== "") {
         const res = await runOnHost(hostId,
-          `cd ${shQuote(path)} && gh pr list --head ${shQuote(branch)} --state all --json url --limit 1 2>/dev/null || true`, 30_000);
+          `cd ${shQuote(path)} && gh pr list --head ${shQuote(branch)} --state all --json url --limit 1 2>/dev/null || true`, 30_000,signal);
         const rows: unknown = JSON.parse(res.output.trim() || "[]");
         const url = Array.isArray(rows) ? asRecord(rows[0])["url"] : undefined;
         if (typeof url === "string" && url !== "") candidates.push({ url, source: `gh (branch ${branch})` });
       }
-    } catch { /* next source */ }
+    } catch(error) { if (signal?.aborted) throw error; }
     for (const c of candidates) {
-      const view = await ghPrView(hostId, c.url);
+      const view = await ghPrView(hostId, c.url,signal);
       if (view === null && c.source !== "recorded") continue;
-      await rememberPrUrl(crew, c.url);
+      await rememberPrUrl(crew, c.url,signal);
       return { url: c.url, state: view?.state ?? "", source: c.source };
     }
     return null;
@@ -5799,6 +5870,20 @@ export default async function plugin(bb: BbPluginApi) {
     if (projectId === "") throw new Error("This captain thread has no project, so handoff cannot tell which crews belong here.");
     const all = await readCrews();
     const owned = all.filter((crew) => crew.parentThreadId === from && crew.projectId === projectId);
+    // A forgotten worker can still be the authoritative author of an outstanding
+    // delivery. Its trusted continuation participates in the same reparent gates.
+    for (let offset=0; ; offset+=100) {
+      const selected=onlyCrewId ? deliveries.taskRecord(from,projectId,onlyCrewId) : undefined;
+      const records=onlyCrewId ? (selected ? [selected] : []) : deliveries.list({owner:from,projectId,limit:100,offset});
+      for (const record of records) {
+        if (!record.continuation || owned.some(c=>c.id === record.taskId)) continue;
+        if (onlyCrewId && record.taskId !== onlyCrewId && !record.workers.includes(onlyCrewId)) continue;
+        const continuation=crewSchema.parse(record.continuation);
+        owned.push({...continuation,parentThreadId:from,deliveryRequirement:record.requirement,prUrl:record.url});
+      }
+      if (records.length<100) break;
+      if (offset>=400) throw new Error("Handoff inventory exceeds 500 PR records; hand off one explicit task at a time.");
+    }
     const moving = onlyCrewId === undefined
       ? owned
       : owned.filter((crew) => crew.id === onlyCrewId || crew.threadId === onlyCrewId);
@@ -5824,7 +5909,9 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const movedSet = new Set(moved);
     if (movedSet.size === 0 && !hasDeliveries) throw new Error(`Handoff moved no crews. ${failed.join("; ")}`);
-    const deliveriesMoved=deliveries.transferOwner(from,to,projectId,onlyCrewId);
+    const failedTasks=moving.filter(c=>!movedSet.has(c.id)).map(c=>c.id);
+    const selectedTask=moving.find(c=>c.id === onlyCrewId || c.threadId === onlyCrewId)?.id ?? onlyCrewId;
+    const deliveriesMoved=deliveries.transferOwner(from,to,projectId,selectedTask,failedTasks);
     {
       await mutateCrews((crews) => crews.map((crew) => (
         movedSet.has(crew.id) && crew.parentThreadId === from ? { ...crew, parentThreadId: to } : crew
@@ -5847,10 +5934,11 @@ export default async function plugin(bb: BbPluginApi) {
     const lines = [
       `Handed off ${moved.length} crew(s) from @thread:${from} to @thread:${to}: ${moved.join(", ") || "(none)"}.`,
       `Transferred ${deliveriesMoved} unresolved PR deliveries.`,
-      "BB thread parent updated. Native state files stay in each crew's existing home.",
+      moved.length ? "BB thread parent updated. Native state files stay in each crew's existing home." : "Worker ownership kept. Any transferred orphan obligations are listed above.",
       "Wakes, tell, and decide for these crews now use this captain.",
     ];
-    if (failed.length > 0) lines.push(`Kept: ${failed.join("; ")}`);
+    if (moved.length === 0 && deliveriesMoved > 0) lines.push("Only orphan PR obligations transferred; worker ownership is unchanged.");
+    if (failed.length > 0) lines.push(`Kept: ${failed.join("; ")}. Their task-associated PR obligations remain with the previous captain.`);
     return lines.join("\n");
   }
 
@@ -6010,7 +6098,7 @@ export default async function plugin(bb: BbPluginApi) {
       await bb.sdk.threads.archive({ threadId: crew.threadId });
     }
     await markQueueForCrew(crew.id, "done");
-    await recordDone({ task: crewLabel(crew).slice(0, 200), shape: crew.shape, crewId: crew.id, outcome, pr, parentThreadId: crew.parentThreadId });
+    await recordDone({ task: crewLabel(crew).slice(0, 200), shape: crew.shape, crewId: crew.id, outcome, pr, parentThreadId: crew.parentThreadId,deliveryRequirement:await contractForCrew(crew) });
     await removeCrew(crew);
     await publishFleet();
   }
@@ -6217,6 +6305,22 @@ export default async function plugin(bb: BbPluginApi) {
       throw new Error(`Refusing: ${id} is a secondmate route. Drop with forget (no --stop), or --force to also stop that thread.`);
     }
     await discoverCrewDelivery(crew);
+    let preserveAuthority=deliveries.hasOwned(crew.parentThreadId ?? "",crew.projectId,crew.id);
+    if (stop && preserveAuthority) {
+      // A known merge can satisfy the merged contract even before the next scan.
+      // It cannot satisfy required verification or an unrelated PR obligation.
+      const record=deliveries.taskRecord(crew.parentThreadId ?? "",crew.projectId,crew.id);
+      const envId=await threadEnv(crew.threadId);
+      if (record && envId) {
+        const hostId=await resolveHostForProject(crew.projectId,crew.parentThreadId ?? undefined);
+        const pr=await resolveCrewPr(crew,envId,hostId);
+        if (pr?.state === "merged" && canonicalPr(pr.url).id === record.id) {
+          deliveries.observe(record.id,{headSha:record.headSha,state:"merged",draft:false,checks:"unknown",review:"unknown",mergeable:"unknown",reviewHeadSha:null,mergeCommitSha:null},false);
+        }
+      }
+      preserveAuthority=deliveries.hasOwned(crew.parentThreadId ?? "",crew.projectId,crew.id);
+    }
+    if (stop && preserveAuthority) throw new Error("Outstanding PR delivery requires this task's native authority and environment. Forget without --stop, or complete/explicitly abandon its delivery before teardown.");
     let worktreeRemoved = false;
     let nativeTeardown = false;
     const notes: string[] = [];
@@ -6344,6 +6448,7 @@ export default async function plugin(bb: BbPluginApi) {
           crewId: crew.id,
           outcome: parseOutcome(out) ?? "",
           pr: f.url,
+          deliveryRequirement:await contractForCrew(crew),
           parentThreadId: crew.parentThreadId,
         });
         await markQueueForCrew(crew.id, "done");
@@ -6351,7 +6456,8 @@ export default async function plugin(bb: BbPluginApi) {
     } catch {
       // best effort
     }
-    if (!nativeTeardown) {
+    if (preserveAuthority) notes.push("Outstanding PR continuation retained with native task authority and environment.");
+    if (!nativeTeardown && !preserveAuthority) {
       try {
         await withTransientRetry(() => dropFmMeta(crew));
         // forget/drop removes the crew's own backlog row (dropped on forget, C1).
@@ -6442,29 +6548,47 @@ export default async function plugin(bb: BbPluginApi) {
     timeoutMs: number,
     signal?: AbortSignal,
   ): Promise<{ exitCode: number | null; output: string }> {
-    const session = await raceAbort(bb.sdk.terminals.create({
-      cols: 120,
-      rows: 30,
-      scope: { kind: "host_path", hostId, cwd: "/tmp" },
-      start: { mode: "command", command: wrapHostCommand(command) },
-      title: "firstmate-host",
-    }),signal,Math.min(timeoutMs,STUCK_HOST_CALL_MS));
-    const terminalId = asRecord(session)["id"] as string;
+    signal?.throwIfAborted();
+    // Capture only the cleanup callback while the plugin context is live. A late
+    // create reply must still be closed after disposal invalidates bb.sdk access.
+    const terminalClose=bb.sdk.terminals.close;
+    let terminalId:string|undefined;
+    let creationLost=false,closing=false;
+    async function closeOnce() {
+      if (!terminalId || closing) return;
+      closing=true;
+      try {await raceAbort(terminalClose({terminalId,mode:"force"}),undefined,1000);} catch { /* bounded cleanup */ }
+    }
     let nextSeq = 0;
     let output = "";
     let lastOutputError = "";
     try {
+      const pending=bb.sdk.terminals.create({
+        cols: 120,
+        rows: 30,
+        scope: { kind: "host_path", hostId, cwd: "/tmp" },
+        start: { mode: "command", command: wrapHostCommand(command) },
+        title: "firstmate-host",
+      }).then(async session=>{
+        terminalId=asRecord(session)["id"] as string;
+        if (creationLost) await closeOnce();
+        return session;
+      });
+      const session=await raceAbort(pending,signal,Math.min(timeoutMs,STUCK_HOST_CALL_MS));
+      const activeTerminalId=asRecord(session)["id"];
+      if (typeof activeTerminalId !== "string") throw new Error("Terminal creation returned no identity.");
+      signal?.throwIfAborted();
       const deadline = Date.now() + timeoutMs;
       for (;;) {
         if (signal?.aborted) throw new Error("Aborted.");
         if (Date.now() >= deadline) throw new Error(`Timed out waiting for host command (host ${hostId}, terminal ${terminalId}, budget ${timeoutMs / 1000}s).${lastOutputError ? ` Last output read: ${lastOutputError}` : ""}`);
-        const cur = await raceAbort(bb.sdk.terminals.get({ terminalId }),signal,Math.min(STUCK_HOST_CALL_MS,Math.max(1,deadline-Date.now())));
+        const cur = await raceAbort(bb.sdk.terminals.get({ terminalId:activeTerminalId }),signal,Math.min(STUCK_HOST_CALL_MS,Math.max(1,deadline-Date.now())));
         const status = asRecord(cur)["status"];
         if (status === "disconnected") throw new Error("Terminal disconnected.");
         let outputRead = false;
         try {
           const chunk = await raceAbort(bb.sdk.terminals.output({
-            terminalId,
+            terminalId:activeTerminalId,
             sinceSeq: nextSeq,
             tailBytes: 65536,
           }),signal,Math.min(STUCK_HOST_CALL_MS,Math.max(1,deadline-Date.now())));
@@ -6488,11 +6612,8 @@ export default async function plugin(bb: BbPluginApi) {
         await sleep(250);
       }
     } finally {
-      try {
-        await raceAbort(bb.sdk.terminals.close({ terminalId, mode: "force" }),undefined,1000);
-      } catch {
-        // best effort
-      }
+      creationLost=true;
+      await closeOnce();
     }
   }
 
@@ -8942,12 +9063,13 @@ export default async function plugin(bb: BbPluginApi) {
       resolveKey: z.string().optional().describe("Key of the crew's open decision this steer answers (from crew/bearings); closes it in real state"),
       overCap: z.boolean().optional().describe("Wake an idle crew even past the running-crew cap (only on the captain's word)"),
     }),
-    async execute({ crewId, message, queue, resolveKey, overCap }) {
-      const crew = await findCrew(crewId);
+    async execute({ crewId, message, queue, resolveKey, overCap },ctx) {
+      const crew = await findCrew(crewId,ctxString(ctx,"threadId"));
       if (crew === undefined) return toolError(`No crew ${crewId}.`);
       try {
         const capped = await capRefusalToWake(crew, overCap === true);
         if (capped !== null) return toolError(capped);
+        await resumeRetainedAuthor(crew,ctxString(ctx,"threadId"));
         const sent = await tellCrew(crew, message, false, queue === true);
         if (resolveKey !== undefined && resolveKey.trim() !== "") {
           const closed = await appendResolvedStatus(crew, resolveKey.trim(), message);
@@ -9020,8 +9142,8 @@ export default async function plugin(bb: BbPluginApi) {
     name: "firstmate_deliver",
     description: "Crew delivery: outcome + committed/uncommitted diff + PR state.",
     parameters: z.object({ crewId: z.string() }),
-    async execute({ crewId }) {
-      const crew = await findCrew(crewId);
+    async execute({ crewId },ctx) {
+      const crew = await findCrew(crewId,ctxString(ctx,"threadId"));
       if (crew === undefined) return toolError(`No crew ${crewId}.`);
       return (await deliverLines(crew)).text;
     },
@@ -9042,7 +9164,7 @@ export default async function plugin(bb: BbPluginApi) {
         .describe("Land a crew/PR owned by another captain (only when the captain explicitly said so)"),
     }),
     async execute({ crewId, yes, allowRedCheck, allowMissingCheck, overrideOwner }, ctx) {
-      const crew = await findCrew(crewId);
+      const crew = await findCrew(crewId,ctxString(ctx,"threadId"));
       if (crew === undefined) return toolError(`No crew ${crewId}.`);
       try {
         return await mergeCrew(crew, yes === true, allowRedCheck, allowMissingCheck, { caller: ctxString(ctx, "threadId"), overrideOwner: overrideOwner === true });
@@ -9176,14 +9298,15 @@ export default async function plugin(bb: BbPluginApi) {
         .describe("Replacement reasoning effort — triggers a relaunch reusing the worktree"),
       overCap: z.boolean().optional().describe("Retry even past the running-crew cap (only on the captain's word)"),
     }),
-    async execute({ crewId, reason, model, providerId, reasoningLevel, overCap }) {
-      const crew = await findCrew(crewId);
+    async execute({ crewId, reason, model, providerId, reasoningLevel, overCap },ctx) {
+      const crew = await findCrew(crewId,ctxString(ctx,"threadId"));
       if (crew === undefined) return toolError(`No crew ${crewId}.`);
       const replace = model !== undefined || providerId !== undefined || reasoningLevel !== undefined;
       try {
         if (!replace) {
           const capped = await capRefusalToWake(crew, overCap === true);
           if (capped !== null) return toolError(capped);
+          await resumeRetainedAuthor(crew,ctxString(ctx,"threadId"));
           return await retryCrewTurn(crew, reason);
         }
         const next = await relaunchCrew(crew, {
@@ -9225,6 +9348,7 @@ export default async function plugin(bb: BbPluginApi) {
         visible: true,
         shape: "ship",
         mode: toMode(mode, posture.mode),
+        deliveryRequirement:await contractForCrew(scout),
       });
       await recordDone({
         task: scout.task.slice(0, 200),
@@ -9358,8 +9482,9 @@ export default async function plugin(bb: BbPluginApi) {
       model: z.string().optional().describe("Crew model (add: stored; dispatch: overrides)"),
       reasoningLevel: z.enum(["low", "medium", "high", "xhigh", "max", "ultra", "none", "ultracode"]).optional()
         .describe("Crew reasoning effort (add: stored; dispatch: overrides)"),
+      deliveryRequirement:z.enum(["pr","merged","merged-and-verified"]).optional(),
     }),
-    async execute({ action, title, projectId, queueId, shape, mode, after, waitUntil, detail, providerId, model, reasoningLevel }, ctx) {
+    async execute({ action, title, projectId, queueId, shape, mode, after, waitUntil, detail, providerId, model, reasoningLevel, deliveryRequirement }, ctx) {
       const items = (await readQueue()).filter(row => ownedByScopedCaptain(row.parentThreadId));
       const ctxProject = ctxString(ctx, "projectId");
       const captain = ctxString(ctx, "threadId");
@@ -9408,6 +9533,7 @@ export default async function plugin(bb: BbPluginApi) {
           ...(providerId !== undefined && providerId !== "" ? { providerId } : {}),
           ...(model !== undefined && model !== "" ? { model } : {}),
           ...(reasoningLevel !== undefined ? { reasoningLevel } : {}),
+          deliveryRequirement:deliveryRequirement ?? "merged",
           waitUntil: waitUntil ?? null,
           status: "queued",
           crewId: null,
@@ -9459,6 +9585,7 @@ export default async function plugin(bb: BbPluginApi) {
           providerId: providerId ?? item.providerId ?? (current.defaultProvider !== "" ? current.defaultProvider : undefined),
           model: model ?? item.model,
           reasoningLevel: toReasoningLevel(reasoningLevel ?? item.reasoningLevel),
+          deliveryRequirement:item.deliveryRequirement,
           permissionMode: toPermissionMode(current.defaultPermissionMode),
           worktree: resolveWorktree({ shape: item.shape }).worktree,
           visible: true,
@@ -10635,13 +10762,14 @@ export default async function plugin(bb: BbPluginApi) {
                 ? "INTERRUPT: stop the current action. Await new orders. Do not teardown or discard work."
                 : (flagStr(flags, "message") ?? rest.slice(1).join(" ").trim());
             if (id === undefined || message === "") return fail(usage);
-            const crew = await findCrew(id);
+            const crew = await findCrew(id,ctxThread);
             if (crew === undefined) return fail(`No crew ${id}. Run "bb firstmate crews".`);
             const wantQueue = command === "tell" && flags.get("queue") === true;
             if (command === "tell") {
               const overCap = await capRefusalToWake(crew, flags.has("over-cap"));
               if (overCap !== null) return fail(overCap);
             }
+            if (command === "tell") await resumeRetainedAuthor(crew,ctxThread);
             const text = await tellCrew(crew, message, command === "interrupt", wantQueue);
             const resolveKey = command === "tell" ? (flagStr(flags, "resolve-key") ?? "").trim() : "";
             const resolved = resolveKey !== "" ? await appendResolvedStatus(crew, resolveKey, message) : false;
@@ -10664,7 +10792,7 @@ export default async function plugin(bb: BbPluginApi) {
           case "retry": {
             const id = rest[0];
             if (id === undefined) return fail(usage);
-            const crew = await findCrew(id);
+            const crew = await findCrew(id,ctxThread);
             if (crew === undefined) return fail(`No crew ${id}.`);
             const model = flagStr(flags, "model");
             const providerId = flagStr(flags, "provider");
@@ -10673,6 +10801,7 @@ export default async function plugin(bb: BbPluginApi) {
             if (model === undefined && providerId === undefined && reasoningLevel === undefined) {
               const overCap = await capRefusalToWake(crew, flags.has("over-cap"));
               if (overCap !== null) return fail(overCap);
+              await resumeRetainedAuthor(crew,ctxThread);
               const outcome = await retryCrewTurn(crew, reason);
               return reply({ retried: outcome.startsWith("Retried"), id }, outcome);
             }
@@ -10765,7 +10894,7 @@ export default async function plugin(bb: BbPluginApi) {
           case "deliver": {
             const id = rest[0];
             if (id === undefined) return fail(usage);
-            const crew = await findCrew(id);
+            const crew = await findCrew(id,ctxThread);
             if (crew === undefined) return fail(`No crew ${id}.`);
             const d = await deliverLines(crew);
             return reply(d.json, d.text);
@@ -10773,7 +10902,7 @@ export default async function plugin(bb: BbPluginApi) {
           case "merge": {
             const id = rest[0];
             if (id === undefined) return fail(usage);
-            const crew = await findCrew(id);
+            const crew = await findCrew(id,ctxThread);
             if (crew === undefined) return fail(`No crew ${id}.`);
             const text = await mergeCrew(crew, flags.has("yes"), flagStr(flags, "allow-red"), flagStr(flags, "allow-missing"), {
               caller: ctxThread, overrideOwner: flags.has("override-owner"),
@@ -10806,6 +10935,7 @@ export default async function plugin(bb: BbPluginApi) {
               visible: !flags.has("hidden"),
               shape: "ship",
               mode: toMode(flagStr(flags, "mode"), registry.mode),
+              deliveryRequirement:await contractForCrew(scout),
             });
             await recordDone({
               task: scout.task.slice(0, 200),
@@ -10944,6 +11074,7 @@ export default async function plugin(bb: BbPluginApi) {
                 ...(flagStr(flags, "provider") !== undefined ? { providerId: flagStr(flags, "provider") } : {}),
                 ...(flagStr(flags, "model") !== undefined ? { model: flagStr(flags, "model") } : {}),
                 ...(toReasoningLevel(flagStr(flags, "reasoning-level")) !== undefined ? { reasoningLevel: strictReasoning(flagStr(flags, "reasoning-level")) } : {}),
+                deliveryRequirement:z.enum(["pr","merged","merged-and-verified"]).parse(flagStr(flags,"delivery-requirement") ?? "merged"),
                 waitUntil: flagStr(flags, "wait-until") ?? null,
                 status: "queued",
                 crewId: null,
@@ -10993,6 +11124,7 @@ export default async function plugin(bb: BbPluginApi) {
                 providerId: flagStr(flags, "provider") ?? item.providerId ?? (current.defaultProvider !== "" ? current.defaultProvider : undefined),
                 model: flagStr(flags, "model") ?? item.model,
                 reasoningLevel: strictReasoning(flagStr(flags, "reasoning-level") ?? item.reasoningLevel),
+                deliveryRequirement:item.deliveryRequirement,
                 permissionMode: toPermissionMode(flagStr(flags, "permission-mode") ?? current.defaultPermissionMode),
                 worktree: resolveWorktree({ shape: item.shape, sharedEnv: flags.has("shared-env"), worktreeFlag: flags.has("worktree") }).worktree,
                 visible: !flags.has("hidden"),
@@ -11201,12 +11333,17 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  let followingUp=false;
+  async function boundedFollowUp<T>(action:(signal:AbortSignal)=>Promise<T>,parent=launchAbort.signal):Promise<T> {
+    parent.throwIfAborted();
+    const budget=new AbortController();
+    const signal=AbortSignal.any([parent,budget.signal]);
+    const timer=setTimeout(()=>budget.abort(new Error("PR follow-up item deadline exceeded")),STUCK_HOST_CALL_MS);
+    try {return await raceAbort(action(signal),signal);} finally {clearTimeout(timer);}
+  }
   bb.background.schedule("pr-delivery-follow-up", "* * * * *", async () => {
-    if (followingUp) return;
-    followingUp=true;
-    try { await launchRecoveryPass(launchAbort.signal);await deliveryPass(launchAbort.signal);await publishFleet(); }
-    finally { followingUp=false; }
+    if (followUpWork || launchAbort.signal.aborted) return;
+    followUpWork=(async()=>{await launchRecoveryPass(launchAbort.signal);await deliveryPass(launchAbort.signal);await raceAbort(publishFleet(),launchAbort.signal,STUCK_HOST_CALL_MS);})();
+    try {await followUpWork;} finally {followUpWork=undefined;}
   });
   bb.events.on("thread.archived", ({ thread }) => { deliveries.ownerLost(thread.id); });
   bb.events.on("thread.deleted", ({ thread }) => { deliveries.ownerLost(thread.id); });

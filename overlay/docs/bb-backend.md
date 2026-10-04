@@ -242,3 +242,21 @@ BB host-terminal RPCs run outside that ancestry, so supervisor startup uses the 
 The command binds `FM_HOME`, `FM_ROOT_OVERRIDE`, and `FM_BACKEND=bb`, then executes the original native entry point through the `bin-bb` mirror.
 The BB SessionStart hook uses the same bindings and mirror.
 Actual native lock refusals preserve the upstream read-only contract.
+
+
+### Startup workspace and live acceptance
+
+BB binds the managed workspace during `sdk.threads.spawn`. Only native
+`spawn_enter_recorded_worktree` skips its shell `cd` for the BB backend. The
+following native cwd assertion still verifies the recorded path. A captain's
+explicit `cd` instruction remains ordinary worker input; the adapter does not
+filter it.
+
+Run live acceptance only on the authorized isolated BB server. Set
+`bb machine list --json` on that server and choose its connected host. Set
+`FM_BB_MACHINE` to that host ID before running
+`node scripts/live-mirror-check.mjs`. It is required because a thread's host
+cannot be assumed to match a separate test server. Select provider, model and
+reasoning explicitly for the test server when its project has no defaults.
+The implementation agent does not run this script under its no-real-worker
+constraint; the parent performs acceptance after review.

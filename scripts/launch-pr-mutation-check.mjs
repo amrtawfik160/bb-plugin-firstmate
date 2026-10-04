@@ -12,6 +12,15 @@ const cases=[
   {name:'Host and checkout selection',file:'lib/execution-selection.ts',from:"(!preferredHost || e.hostId===preferredHost)",to:'true',test:'lib/launch-delivery.test.mjs',pattern:'coherent checkout selection refuses'},
   {name:'PR retention after acknowledged notification',file:'lib/pr-delivery.ts',from:'latest.notification.delivered=signature; latest.notification.retryAt=0;',to:'latest.notification.delivered=signature; latest.notification.retryAt=0; latest.status="complete";',test:'lib/launch-delivery.test.mjs',pattern:'PR completion is separate from worker'},
   {name:'Current-head readiness invalidation',file:'lib/pr-delivery.ts',from:'const changedHead = prior.headSha !== o.headSha;',to:'const changedHead = false;',test:'lib/launch-delivery.test.mjs',pattern:'PR completion is separate from worker'},
+  {name:'Immutable recovery contract',file:'server.ts',from:'deliveryRequirement:recoveredContract(meta,launch),',to:'deliveryRequirement:"merged",',test:'server.launch-delivery.test.mjs',pattern:'factory metadata adoption and dispatch recovery'},
+  {name:'Registration contract inheritance',file:'server.ts',from:'worker:crew.threadId,requirement:original,continuation:',to:'worker:crew.threadId,requirement:"merged",continuation:',test:'server.launch-delivery.test.mjs',pattern:'CLI and tool registration inherit'},
+  {name:'End-to-end follow-up cancellation',file:'server.ts',from:'await raceAbort(bb.sdk.environments.pullRequest({ environmentId: envId,signal }),signal,STUCK_HOST_CALL_MS)',to:'await bb.sdk.environments.pullRequest({ environmentId: envId })',more:[['try {return await raceAbort(action(signal),signal);}', 'try {return await action(signal);}']],test:'server.launch-delivery.test.mjs',pattern:'registered follow-up disposal settles',failurePattern:'disposal hung'},
+  {name:'Late terminal cleanup',file:'server.ts',from:'if (creationLost) await closeOnce();',to:'if (false) await closeOnce();',test:'server.launch-delivery.test.mjs',pattern:'late terminal identity'},
+  {name:'Native publication admission',file:'server.ts',from:'return await readFmMetaField(env.hostId,record.taskId,"bb_thread_id",record.home,signal) === record.threadId;',to:'return true;',test:'server.launch-delivery.test.mjs',pattern:'native guard failure after real bridge'},
+  {name:'Partial handoff isolation',file:'server.ts',from:'selectedTask,failedTasks);',to:'selectedTask);',test:'server.launch-delivery.test.mjs',pattern:'partial handoff preserves'},
+  {name:'Retained native authority',file:'server.ts',from:'if (!nativeTeardown && !preserveAuthority)',to:'if (!nativeTeardown)',test:'server.launch-delivery.test.mjs',pattern:'forgotten author retains'},
+  {name:'Native review policy',file:'lib/pr-delivery.ts',from:"o.review === 'unknown' && mergeAuthorized",to:'false',test:'lib/launch-delivery.test.mjs',pattern:'native review path does not invent'},
+  {name:'Startup workspace seam',file:'overlay/firstmate-bb-backend.patch',from:'+  [ "$BACKEND" = bb ] && return 0',to:'+  [ "$BACKEND" = bb ] && :',test:'lib/launch-delivery.test.mjs',pattern:'native startup workspace handoff'},
 ];
 try {
   cpSync(root,scratch,{recursive:true,filter:path=>!['.git','node_modules','dist','__pycache__'].includes(basename(path))});
@@ -21,14 +30,15 @@ try {
     if (!original.includes(c.from)) throw new Error(`Mutation anchor disappeared: ${c.name}`);
     // For the role test, replace the explicit crew value rather than adding a
     // duplicate property, which would only prove a syntax check.
-    const modified=c.name==='Creation role metadata'
+    let modified=c.name==='Creation role metadata'
       ? original.replace('crew:"true",crewId:taskId,shape','crew:"false",crewId:taskId,shape')
       : original.replace(c.from,c.to);
+    for (const [from,to] of c.more ?? []) {if (!modified.includes(from)) throw new Error(`Additional mutation anchor disappeared: ${c.name}`);modified=modified.replace(from,to);}
     if (modified===original) throw new Error(`Mutation did not change ${c.name}`);
     writeFileSync(path,modified);
     const result=spawnSync(process.execPath,['--test','--experimental-strip-types',`--test-name-pattern=${c.pattern}`,c.test],{cwd:scratch,encoding:'utf8',timeout:30_000});
     writeFileSync(path,original);
-    if (result.status===0 || result.error || !/AssertionError|ERR_ASSERTION/.test(result.stdout+result.stderr)) throw new Error(`${c.name} did not kill its behavioral assertion:\n${result.stdout}\n${result.stderr}`);
+    if (result.status===0 || result.error || !new RegExp(c.failurePattern ?? "AssertionError|ERR_ASSERTION").test(result.stdout+result.stderr)) throw new Error(`${c.name} did not kill its behavioral assertion:\n${result.stdout}\n${result.stderr}`);
     console.log(`PASS: removing ${c.name} fails ${c.pattern}`);
   }
   const native=process.env.FM_TEST_HOME;
