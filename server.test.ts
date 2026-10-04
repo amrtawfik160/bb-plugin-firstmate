@@ -7439,24 +7439,67 @@ for (const entry of ["tool", "cli"] as const) {
     const started = Date.now();
     let elapsed = 0;
     t.mock.method(Date, "now", () => started + elapsed);
+    const timers = t.mock.method(globalThis, "setTimeout");
     try {
       host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_cap", environmentId: "env_1" }));
       host.harness.sdk.stub("environments.get", async () => ({ hostId: "host_1" }));
       let command = "";
+      const commands = new Map<string,string>();
+      const files = new Map<string,string>();
+      const writes: Array<{path:string;content:string}> = [];
+      const nativeTerminals = new Set<string>();
+      const closed: string[] = [];
+      const budget = scenario.script === "wake-drain" ? Math.max(180,scenario.timeout) : scenario.timeout;
+      let terminalSeq = 0;
       host.harness.sdk.stub("terminals.create", async (args: { start?: { command?: string } }) => {
-        command = unwrapHostCommand(args.start?.command ?? "");
-        return { id: "term_slow_drain" };
+        const inner = unwrapHostCommand(args.start?.command ?? "");
+        const id = `term_slow_${++terminalSeq}`;
+        commands.set(id,inner);
+        const staged = /^bash '(\/tmp\/\.fm-receipt-[^']+)'$/.exec(inner);
+        if (staged) {
+          command = files.get(staged[1]) ?? "";
+          assert.match(command,/python3 -c .*fm-wake-drain\.sh/s,"execute only an atomically staged receipt");
+          nativeTerminals.add(id);
+        } else if (scenario.script === "peek" && inner.includes('"$FM_BINDIR/fm-peek.sh"')) {
+          command = inner;
+          nativeTerminals.add(id);
+        }
+        return { id };
       });
       host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
-      host.harness.sdk.stub("terminals.close", async () => ({}));
+      host.harness.sdk.stub("terminals.close", async ({terminalId}:{terminalId:string}) => {closed.push(terminalId);return {};});
       let reads = 0;
-      host.harness.sdk.stub("terminals.output", async () => {
+      host.harness.sdk.stub("terminals.output", async ({terminalId}:{terminalId:string}) => {
+        if (!nativeTerminals.has(terminalId)) {
+          const inner=commands.get(terminalId)!;
+          simulateHostWrite(inner,files,writes);
+          if (inner.startsWith("rm -f ")) for (const path of files.keys()) {
+            if (inner.includes(`'${path}'`)) files.delete(path);
+          }
+          return hostRcPayload("",0);
+        }
         if (++reads === 1) {
           elapsed = scenario.elapsed;
           return { chunks: [], nextSeq: 0 };
         }
+        // Finish within one millisecond of the exact native execution budget.
+        // Observe the read deadline to distinguish 180/240s from a larger cap.
+        elapsed = budget*1000-1;
         return hostRcPayload(wakeFrame("DRAIN_FINISHED\nWAKE_ACK_REQUIRED: bin/fm-wake-drain.sh --ack-through 2 --recovery-generation g1"), 0);
       });
+      const assertCleanup = () => {
+        assert.equal(nativeTerminals.size,1,"finish or time out the same native invocation, never retry it");
+        // Receipt: init, two payload chunks, atomic decode/rename, writer
+        // cleanup, one native execution and receipt cleanup. Peek stays direct.
+        assert.equal(commands.size,scenario.script==="wake-drain" ? 7 : 1,"exact staging/execution/cleanup commands");
+        if (scenario.script==="wake-drain") {
+          assert.equal(writes.length,1,"publish exactly one complete guarded command");
+          assert.equal([...commands.values()].filter(cmd=>cmd.startsWith("printf '%s' ")).length,2,"exact payload chunk count");
+          assert.match(command,/ 'receive' '' "\$FM_BINDIR\/fm-wake-drain.sh"$/,"timeout never requests an acknowledgement");
+        }
+        assert.deepEqual([...closed].sort(),[...commands.keys()].sort(),"every created terminal closes exactly once");
+        assert.equal(files.size,0,"staged command and writer scratch files are removed");
+      };
       let output: string;
       if (entry === "tool") {
         const tool = host.harness.inspection.registrations.agentTools.find(tool => tool.name === "firstmate_fm")!;
@@ -7464,7 +7507,9 @@ for (const entry of ["tool", "cli"] as const) {
         if (!scenario.ok) {
           assert.equal(typeof result, "object");
           assert.match(JSON.stringify(result), /Timed out waiting for host command/);
-          assert.equal(host.harness.sdk.callsTo("terminals.close").length, 1);
+          assert.match(JSON.stringify(result),new RegExp(`budget ${budget}s`));
+          assert.equal(reads,1,"timeout does not continue or retry the native read");
+          assertCleanup();
           return;
         }
         assert.equal(typeof result, "string", JSON.stringify(result));
@@ -7474,7 +7519,9 @@ for (const entry of ["tool", "cli"] as const) {
         if (!scenario.ok) {
           assert.equal(result.exitCode, 1);
           assert.match(result.stderr, /Timed out waiting for host command/);
-          assert.equal(host.harness.sdk.callsTo("terminals.close").length, 1);
+          assert.match(result.stderr,new RegExp(`budget ${budget}s`));
+          assert.equal(reads,1,"timeout does not continue or retry the native read");
+          assertCleanup();
           return;
         }
         assert.equal(result.exitCode, 0, result.stderr);
@@ -7484,8 +7531,9 @@ for (const entry of ["tool", "cli"] as const) {
       assert.match(command, /FM_STATE_OVERRIDE='\/tmp\/fm-home\/state\/cap-thr_cap'/);
       assert.match(output, /WAKE_RECEIPT: fixture/);
       assert.doesNotMatch(output, /--ack-through 2/);
-      assert.equal(host.harness.sdk.callsTo("terminals.create").length, 1, "finish the same drain, never retry it");
-      assert.equal(host.harness.sdk.callsTo("terminals.close").length, 1);
+      assert.equal(reads,2,"finish the original native invocation after the slow first read");
+      assert.ok(timers.mock.calls.some(call=>call.arguments[1]===1),`read deadline honors the exact ${budget}s native budget`);
+      assertCleanup();
     } finally {
       t.mock.restoreAll();
       await host.harness.lifecycle.dispose();

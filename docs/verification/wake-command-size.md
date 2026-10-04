@@ -73,15 +73,32 @@ Native receipt journals and reports remain the recovery authority.
   exact full guarded script rendered by the actual factory, changing only the
   action and receipt ID. No test-only product API is added.
 
-The existing timeout/retry fixtures now identify the staged receipt invocation.
+The output-read timeout/retry fixtures identify the staged receipt invocation.
 They still prove one receipt execution, retained timeout diagnostics and an output
 read retry without rerunning or acknowledging the native command.
+
+Parent's full run at `8fdfbcb` found six failing host-timeout fixtures among 695
+tests (689 passed, zero skipped; `/tmp/fm-wake-parent-full.log`). The original
+targeted pattern omitted test names containing `host timeout`. Those fixtures
+still treated staging as the slow native command and expected one terminal.
+The correction changes tests and this document only; product code is unchanged.
+
+All eight tool/CLI host-timeout cases now model the staged files and identify the
+actual native execution. They preserve the original slow-read scenarios and
+observe the final read deadline one millisecond before the exact 180-second
+minimum or explicit 240-second budget. Peek still times out at 15 seconds.
+Success and timeout both assert one native invocation without retry or
+acknowledgement. The fixture's two payload chunks require seven receipt terminals
+(init, two appends, atomic publication, writer cleanup, execution, receipt cleanup).
+Peek requires one terminal. Every created terminal closes exactly once, and no
+staged file remains. Coverage now includes all eight cases plus the 40 previously
+selected wake/receipt/host tests.
 
 ## Validation
 
 ```sh
 FIRSTMATE_TEST_NATIVE=/tmp/fm-launch-pr-verified FM_SCOUT_NATIVE_BIN=/tmp/fm-launch-pr-verified/bin-bb node --test --experimental-strip-types server.wake-command-size.test.mjs scripts/wake-receipt.test.ts lib/wake-receipt.test.ts
-FIRSTMATE_TEST_NATIVE=/tmp/fm-launch-pr-verified FM_SCOUT_NATIVE_BIN=/tmp/fm-launch-pr-verified/bin-bb node --test --experimental-strip-types --test-name-pattern='wake|receipt|host (file|stdin)|host operations' server.test.ts
+FIRSTMATE_TEST_NATIVE=/tmp/fm-launch-pr-verified FM_SCOUT_NATIVE_BIN=/tmp/fm-launch-pr-verified/bin-bb node --test --experimental-strip-types --test-name-pattern='host timeout|wake|receipt|host (file|stdin)|host operations' server.test.ts
 node scripts/wake-command-size-mutation.mjs
 npx tsc --noEmit
 npm run fidelity -- --native /tmp/fm-launch-pr-verified
@@ -95,11 +112,11 @@ the receipt transport in `server.ts` and restores every source byte in `finally`
 | Check | Result / evidence |
 | --- | --- |
 | Receipt helper, framing and new transport regressions | 52 passed, zero failed/skipped. `/tmp/fm-wake-size-affected-final.log`; includes nine new transport tests. |
-| Selected server wake/receipt/host tests | 40 passed, zero failed/skipped. `/tmp/fm-wake-size-server-final.log`. |
+| Selected server host-timeout/wake/receipt/host tests | 48 passed, zero failed/skipped. Includes all eight host-timeout cases. `/tmp/fm-wake-timeout-correction-server.log`. |
 | Inline-transport causal mutation | Killed; exact reported overflow reproduced. `/tmp/fm-wake-size-mutation.log`. |
-| Typecheck | Passed. `/tmp/fm-wake-size-tsc.log`. |
-| Native skill fidelity | Passed: 33 skills, 12 adaptation anchors, seven BB-only fences; snapshot fresh. `/tmp/fm-wake-size-fidelity.log`. |
-| Plugin build | Passed. `/tmp/fm-wake-size-build.log`. SDK remains pinned at 0.4.104. |
+| Typecheck | Passed after fixture correction. `/tmp/fm-wake-timeout-correction-tsc.log`. |
+| Native skill fidelity | Passed: 33 skills, 12 adaptation anchors, seven BB-only fences; snapshot fresh. `/tmp/fm-wake-timeout-correction-fidelity.log`. |
+| Plugin build | Passed after fixture correction. `/tmp/fm-wake-timeout-correction-build.log`. SDK remains pinned at 0.4.104. |
 | Diff check | Passed. |
 
 No app/RPC schema or native receipt semantics changed. Staging adds host file
