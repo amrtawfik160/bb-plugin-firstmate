@@ -57,7 +57,8 @@ import { LEFTOVER_TIMER_CONTRACT, WAITING_PROTOCOL, latestStatus, statusProtocol
 import { UPSTREAM_SCRIPT_NAMES, PINNED_SCRIPT_SUPPORT_FILES, UPSTREAM_SKILL_NAMES } from "./lib/upstream-surface.ts";
 import { FIRSTMATE_ROUTINE_MARKER } from "./lib/timeline-noise.ts";
 
-const SKILLS = ["captain", "firstmate", "calm", "catch-up", ...UPSTREAM_SKILL_NAMES] as const;
+const CAPTAIN_TEST_SKILLS = ["captain", "firstmate", "calm", "catch-up", "captain-methods", ...UPSTREAM_SKILL_NAMES] as const;
+const SKILLS = [...CAPTAIN_TEST_SKILLS, "worker-methods"] as const;
 
 function wakeFrame(report: string): string {
   return "FM_BB_RECEIPT=" + JSON.stringify({ id: "fixture", phase: "ready", report, path: "/tmp/report.txt", replayed: false, truncated: false });
@@ -93,7 +94,7 @@ test("crews get no dispatch tools", async () => {
       makePluginAgentConfigurationContext({ pluginMetadata: { crew: "true" } }),
     );
     assert.deepEqual(cfg.tools.map((t) => t.name), []);
-    assert.deepEqual(cfg.skills, []);
+    assert.deepEqual(cfg.skills, ["worker-methods"]);
     assert.match(cfg.instructions ?? "", /native launch brief/);
     assert.match(cfg.instructions ?? "", /exact-ID steering inbox/);
     assert.doesNotMatch(cfg.instructions ?? "", /browser_script|systemd-run|data\/<task-id>\//, "rendered launch brief is the single policy owner");
@@ -128,7 +129,7 @@ test("captain metadata loads the full skill set", async () => {
     );
     assert.ok(cfg.skills.includes("captain"));
     assert.ok(cfg.skills.includes("afk"));
-    assert.deepEqual([...cfg.skills].sort(), [...SKILLS].sort(), "captain must receive every bundled upstream skill");
+    assert.deepEqual([...cfg.skills].sort(), [...CAPTAIN_TEST_SKILLS].sort(), "captain must receive every bundled upstream skill and its role methods");
     assert.ok(cfg.tools.some((tool) => tool.name === "firstmate_wake"));
     assert.ok(cfg.tools.some((tool) => tool.name === "firstmate_toolchain"));
     assert.match(cfg.instructions ?? "", /firstmate_toolchain/);
@@ -4642,7 +4643,7 @@ test("captain sessions get the version-pinned real skills inventory", async () =
     assert.match(cfg.instructions ?? "", /Real firstmate skills \(fmHome\/\.agents\/skills @ abc123456789/);
     assert.match(cfg.instructions ?? "", /- stow: tiered memory/);
     assert.match(cfg.instructions ?? "", /- afk: away mandate/);
-    // Crews still get nothing.
+    // Crews get neither native captain inventory nor captain memory.
     const crew = await host.harness.behavior.resolveAgentConfiguration(
       makePluginAgentConfigurationContext({ pluginMetadata: { crew: "true" } }),
     );

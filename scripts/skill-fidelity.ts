@@ -82,6 +82,9 @@ export type Skill = {
   rendered: string; // rendered prose: frontmatter, comments and fenced regions removed
 };
 
+// Native-derived inventory only. BB-owned calm, catch-up, captain-methods, and
+// worker-methods are explicit exceptions documented in CONTRIBUTING.md; their
+// package/reference/routing checks do not replace any native fidelity check.
 const SKILL_GLOBS = [
   "skills/captain/SKILL.md",
   "skills/firstmate/SKILL.md",

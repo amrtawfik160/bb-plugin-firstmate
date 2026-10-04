@@ -21,7 +21,7 @@ function hostCommands(host,answer) {
  return commands;
 }
 async function base(settings={}) {
- const host=createFakePluginHost({pluginId:'firstmate',agentSkillIds:['firstmate','captain','calm','catch-up',...UPSTREAM_SKILL_NAMES],settings});await plugin(host.bb);
+ const host=createFakePluginHost({pluginId:'firstmate',agentSkillIds:['firstmate','captain','calm','catch-up','captain-methods','worker-methods',...UPSTREAM_SKILL_NAMES],settings});await plugin(host.bb);
  commonStubs(host);return host;
 }
 function commonStubs(host) {
@@ -87,7 +87,7 @@ test('native bridge seeds role/home/generation before initial configuration and 
  let roleChecked=false;
  host.harness.sdk.stub('threads.spawn',async input=>{
   const configuration=await host.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({pluginMetadata:input.pluginMetadata}));
-  assert.equal(configuration.tools.length,0);assert.equal(configuration.skills.length,0);
+  assert.equal(configuration.tools.length,0);assert.deepEqual(configuration.skills,['worker-methods']);
   assert.equal(input.pluginMetadata.nativeHome,'/native');assert.equal(input.pluginMetadata.crewId,'task');assert.equal(input.pluginMetadata.generation,1);
   assert.equal(input.permissionMode,'accept-edits');assert.equal(input.visibility,'hidden');roleChecked=true;return{id:'thr_worker'};
  });

@@ -162,8 +162,17 @@ would correctly fail the guard); revisit only if CRLF status files ever appear.
 `skills/calm/` and `skills/catch-up/` are BB-authored presentation skills, not
 copies of upstream skills. Calm points to the adapted escalation contract rather
 than duplicating its policy. Catch-up owns only the requested recovery format;
-it uses existing observations and grants no new execution authority. Keep these
-separate from the pinned upstream inventory and fidelity snapshots.
+it uses existing observations and grants no new execution authority.
+`skills/captain-methods/` and `skills/worker-methods/` are also BB-owned exceptions:
+original, bounded method compositions with pinned pstack attribution. They add
+conditional coverage, reporting, proof, verification, evidence, and research
+procedures, not native lifecycle policy. Only the matching role receives each
+entry skill. Each skill carries its own method references; shared procedure text
+is checked for consistency by `server.methods.test.mjs`. These four BB-owned
+skills stay separate from the pinned upstream inventory and fidelity snapshots.
+The imported inventory and its full fidelity check remain unchanged. See
+[`docs/verification/bounded-methods.md`](docs/verification/bounded-methods.md) for
+the exact instruction delta, scope matrix, and acceptance limits.
 
 The imported skills under [`skills/`](skills/) are not independent BB rewrites of firstmate
 policy — they are **native firstmate's own instructions, copied**, with edits only

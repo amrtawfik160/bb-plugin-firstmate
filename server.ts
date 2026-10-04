@@ -1345,7 +1345,7 @@ function summarizePR(value: unknown): string {
   return parts.length > 0 ? parts.join(" ") : "none";
 }
 
-const CAPTAIN_SKILLS = ["captain", "firstmate", "calm", "catch-up", ...UPSTREAM_SKILL_NAMES] as const;
+const CAPTAIN_SKILLS = ["captain", "firstmate", "calm", "catch-up", "captain-methods", ...UPSTREAM_SKILL_NAMES] as const;
 const CAPTAIN_TOOLS = [
   "firstmate_dispatch",
   "firstmate_deck",
@@ -1386,6 +1386,7 @@ const BB_SKILL_RUNTIME_CONTRACT = [
   "BB adapter for every upstream firstmate skill:",
   "The complete native supervisor contract and imported upstream skills own policy; the following mappings only adapt execution to BB.",
   "Calm reporting is the captain default: read the calm skill before replying to supervision events. It owns BB presentation, including silent routine wakes; keep required outcomes and escalations visible. The captain can invoke /catch-up for a concise recovery brief.",
+  "Read captain-methods at assignment, completion, and required-report triggers; load only its matching reference. Its checks read existing records and grant no new authority.",
   "Translate bin/fm-<name>.sh calls to firstmate_fm with script=<name> and the same arguments; use bb firstmate fm <name> only when a shell command is required.",
   "In imported skills, ../../../AGENTS.md means the complete contract returned by firstmate_contract, and ../../../bin, data, state, config, and docs refer to fmHome rather than this plugin directory.",
   "Map workers, panes, and tabs to BB crew threads via firstmate_dispatch/tell/interrupt/retry/stop. Call firstmate_watch once per batch; it hands off to private durable wakes. End the turn; never retry or poll.",
@@ -10053,9 +10054,9 @@ export default async function plugin(bb: BbPluginApi) {
     if (metaFlag(meta, "crew")) {
       return {
         tools: [],
-        skills: [],
+        skills: ["worker-methods"],
         instructions:
-          "The native launch brief owns this worker role, BB transport and task policy. BB crew threads have no captain tools or skills. Follow that brief and its exact-ID steering inbox procedure.",
+          "The native launch brief owns this worker role, BB transport and task policy. BB crew threads have no captain tools or skills. Follow that brief and its exact-ID steering inbox procedure. Read worker-methods and only its matching reference for task proof, app verification, consequential decisions, or assigned research/design/review. Do not delegate or change the selected provider, model, or effort. Worker completion is a handoff, not captain merge or deployment completion.",
       };
     }
     const marked = metaFlag(meta, "captain");

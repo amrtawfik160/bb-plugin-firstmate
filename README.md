@@ -165,7 +165,7 @@ BB-specific behavior in this fork:
 
 ## Skills
 
-The plugin registers 28 upstream `.agents/skills`, plus `/captain`, `/firstmate`, `/calm`, and `/catch-up`. The upstream `firstmate-calm` entry is a terminal module rather than a portable skill; BB uses its existing timeline filter and the `/calm` reporting skill instead. Imported policy text is pinned to upstream commit `1f3e7696`; one shared runtime contract translates script paths, workers, approvals, and alternate harness mechanics to `firstmate_fm` and BB threads. Crew threads still receive no captain skills.
+The plugin registers 28 upstream `.agents/skills`, plus `/captain`, `/firstmate`, `/calm`, and `/catch-up`. Two internal BB-owned method skills load by role: `captain-methods` for bounded assignments, completion coverage and reporting; `worker-methods` for task proof, product verification and scoped investigation. Their references load only at the named trigger. The upstream `firstmate-calm` entry is a terminal module rather than a portable skill; BB uses its existing timeline filter and the `/calm` reporting skill instead. Imported policy text is pinned to upstream commit `1f3e7696`; one shared runtime contract translates script paths, workers, approvals, and alternate harness mechanics to `firstmate_fm` and BB threads. Crew threads still receive no captain skills or captain tools.
 
 Calm reporting is the default in captain threads. Routine supervision stays silent; requested outcomes, review-ready work, decisions, exhausted blockers, and needed logins still reach you. This changes reporting only and leaves supervision and AFK/quiet settings unchanged. Ask for detail whenever needed.
 
