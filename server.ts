@@ -54,6 +54,7 @@ import { ORPHAN_SWEEP_BUDGET_MS, ORPHAN_SWEEP_INTERVAL_MS, parseStaleLavishSourc
 import { nativeBearingsProjection } from "./lib/native-bearings.ts";
 import { createSnapshotReads } from "./lib/snapshot-reads.ts";
 import { scoutReports } from "./lib/scout-report.ts";
+import { createQueueStore, type QueueItem } from "./lib/queue-store.ts";
 import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRecord } from "./lib/launch.ts";
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
 import { createDeliveries, canonicalPr, deliveryLine, parseForge, type DeliveryRecord } from "./lib/pr-delivery.ts";
@@ -123,39 +124,6 @@ function crewLabel(crew: { task: string; title?: string }): string {
   return title !== "" ? title : crew.task;
 }
 
-const queueItemSchema = z.object({
-  nativeHome: z.string().optional(),
-  id: z.string(),
-  title: z.string(),
-  detail: z.string().default(""),
-  projectId: z.string(),
-  shape: shapeSchema.default("ship"),
-  mode: z.string().default(""),
-  blockedBy: z.array(z.string()).default([]),
-  // Crew launch choices carried from `queue add` to `queue dispatch`.
-  providerId: z.string().optional(),
-  model: z.string().optional(),
-  reasoningLevel: z.string().optional(),
-  deliveryRequirement: z.enum(["pr", "merged", "merged-and-verified"]).optional(),
-  waitUntil: z.string().nullable().default(null),
-  status: z.enum(["queued", "dispatched", "done", "dropped"]).default("queued"),
-  crewId: z.string().nullable().default(null),
-  // D4: the captain thread that queued this row. Scopes the backlog to its owner
-  // (own-by-default in deck/bearings/session, host-wide under --all), matching how
-  // crews/session already scope. Optional for back-compat: rows persisted before
-  // this field are unattributed and surface only under --all.
-  parentThreadId: z.string().nullish(),
-  // The real data/backlog.md row id (fm-tasks-axi.sh) when queueOwner=real, so
-  // dispatch/done/drop can drive the paired backlog transition. We now supply this
-  // id ourselves (native caller-owns-the-id convention) = the KV item id on a
-  // successful add. undefined = KV-only (real mode off, or the add failed).
-  backlogId: z.string().optional(),
-  // Legacy (kept for back-compat with rows persisted before the id-ownership
-  // switch, when an unparseable `add` output was quarantined). No longer written.
-  backlogUnparsed: z.boolean().optional(),
-  createdAt: z.string(),
-});
-type QueueItem = z.infer<typeof queueItemSchema>;
 
 const decisionSchema = z.object({
   nativeTaskId: z.string().optional(),
@@ -1551,6 +1519,7 @@ function isBlankTitle(title: unknown): boolean {
 
 export default async function plugin(bb: BbPluginApi) {
   bb.log.info("loaded");
+  const queueStore = createQueueStore(bb.storage.database(), () => bb.storage.kv.get(QUEUE_KEY));
   const launches = createLaunches(bb.storage.database());
   const reports=scoutReports(bb.storage.database());
   const deliveries = createDeliveries(bb.storage.database());
@@ -1628,7 +1597,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
     queueOwner: {
       type: "select",
-      label: "Backlog owner: kv (BB KV list) or real (fm-tasks-axi.sh + data/backlog.md; needs tasks-axi on the host). Real writes through to KV as a cache; falls back to KV with a log if the real backlog is unreachable.",
+      label: "Backlog owner: kv (BB SQLite queue) or real (native backlog + SQLite queue; needs tasks-axi on the host). Native failures retain a gated record for explicit reconcile.",
       options: ["kv", "real"],
       default: "kv",
     },
@@ -1814,7 +1783,8 @@ export default async function plugin(bb: BbPluginApi) {
     // Old worker prompts still name the old home; pin them there before activating
     // this home. Never move records underneath a running worker.
     await mutateCrews(crews => crews.map(crew => ({ ...crew, nativeHome: crew.nativeHome ?? base })));
-    await writeQueue((await readQueue()).map(row => ({ ...row, nativeHome: row.nativeHome ?? base })));
+    await queueStore.ready();
+    queueStore.transform(row => row.nativeHome === undefined, row => ({ ...row, nativeHome: base }));
     await writeDecisions((await readDecisions()).map(row => ({ ...row, nativeHome: row.nativeHome ?? base })));
     await bb.storage.kv.set(`native-home:${captain}`, home);
     captainHomes.set(captain, home);
@@ -2049,7 +2019,8 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
   async function readQueue(): Promise<QueueItem[]> {
-    return readList(QUEUE_KEY, queueItemSchema, Number.POSITIVE_INFINITY);
+    await queueStore.ready();
+    return queueStore.list();
   }
   const ledgerMutations = new Map<string, Promise<void>>();
   async function serializeLedger<T>(key: string, operation: () => Promise<T>): Promise<T> {
@@ -2101,16 +2072,6 @@ export default async function plugin(bb: BbPluginApi) {
   function withCliOperation<T>(argv: string[], captain: string | undefined, operation: () => Promise<T>): Promise<T> {
     const wake = argv[0] === "wake" || (argv[0] === "fm" && argv.some(arg => ["wake-drain", "fm-wake-drain.sh"].includes(arg)));
     return wake ? serializeLedger(`receipt:${captain ?? "legacy"}`, operation) : withLedgerOperation(argv[0] ?? "", captain, operation);
-  }
-  async function writeQueue(items: QueueItem[]): Promise<void> {
-    await serializeLedger(QUEUE_KEY, async () => {
-      const owner = homeScope.getStore();
-      if (owner?.home && owner.captain) {
-        const foreign = (await readQueue()).filter(row => row.parentThreadId !== owner.captain);
-        items = [...items.filter(row => row.parentThreadId === owner.captain), ...foreign];
-      }
-      await bb.storage.kv.set(QUEUE_KEY, items);
-    });
   }
   async function readDecisions(): Promise<Decision[]> {
     return readList(DECISIONS_KEY, decisionSchema, Number.POSITIVE_INFINITY);
@@ -2186,16 +2147,9 @@ export default async function plugin(bb: BbPluginApi) {
     if (prev.held.length === 0) return `Quiet off${wake}`;
     return `Quiet off\nHeld while quiet:\n${prev.held.join("\n---\n")}${wake}`;
   }
-  async function markQueueForCrew(crewId: string, status: "done"): Promise<void> {
-    const items = await readQueue();
-    let changed = false;
-    for (const item of items) {
-      if (item.crewId === crewId && item.status === "dispatched") {
-        item.status = status;
-        changed = true;
-      }
-    }
-    if (changed) await writeQueue(items);
+  async function markQueueForCrew(crew: Crew, status: "done"): Promise<void> {
+    await queueStore.ready();
+    queueStore.transform(row => row.crewId === crew.id && row.projectId === crew.projectId && (row.parentThreadId??null) === crew.parentThreadId && row.status === "dispatched", row => ({...row,status}));
   }
 
   const watchStateSchema = z.record(
@@ -3606,22 +3560,21 @@ export default async function plugin(bb: BbPluginApi) {
 
     if (await queueIsReal()) {
       const items = await readQueue();
-      let dirty = false;
       for (const item of items) {
-        if (homeScope.getStore()?.home && (item.parentThreadId !== captainThreadId || (item.nativeHome && item.nativeHome !== fmHome))) continue;
+        if (!ownedByScopedCaptain(item.parentThreadId) || item.nativeHome && item.nativeHome !== fmHome) continue;
         if (item.status === "done" || item.status === "dropped") { out.queue.skipped++; continue; }
         // Already projected (has a row id): never re-add — keeps migrate-owners
         // idempotent. We reuse the KV item id as the backlog row id (native
         // caller-owns-the-id convention), so the row is deterministic.
-        if (item.backlogId !== undefined && item.backlogId !== "") { out.queue.skipped++; continue; }
-        const proj = await projectQueueAdd(item.id, item.title, item.shape, item.projectId);
+        if (item.nativePending || item.backlogId !== undefined && item.backlogId !== "") { out.queue.skipped++; continue; }
+        queueStore.patch(item,{nativePending:true});
+        const proj = await projectQueueAdd(item.id, item.title, item.shape, item.projectId,item.nativeHome);
         if (!proj.ok) { out.queue.skipped++; continue; }
         item.backlogId = item.id;
         if (item.status === "dispatched") await projectQueueTransition(item, "start");
         out.queue.projected++;
-        dirty = true;
+        queueStore.patch(item, {backlogId:item.id,nativePending:false});
       }
-      if (dirty) await writeQueue(items);
     }
 
     if (await decisionsIsReal()) {
@@ -3864,7 +3817,7 @@ export default async function plugin(bb: BbPluginApi) {
               for (const gone of crews) {
                 if (!kept.includes(gone)) {
                   bb.log.info(`read-through: crew ${gone.id} dropped (no real state/<id>.meta)`);
-                  await markQueueForCrew(gone.id, "done").catch(() => {});
+                  await markQueueForCrew(gone, "done").catch(() => {});
                 }
               }
               const removed = crews.filter(c => !kept.includes(c));
@@ -5088,7 +5041,7 @@ export default async function plugin(bb: BbPluginApi) {
       nativeHome: (await settings.get()).fmHome,
       id,
       title: title.slice(0, 500),
-      detail: [title.slice(500), tasksAxiField(res.output, "body")].filter((part) => part !== "").join("\n\n").slice(0, MAX_TASK),
+      detail: [title.slice(500), tasksAxiField(res.output, "body")].filter((part) => part !== "").join("\n\n"),
       projectId,
       shape: tasksAxiField(res.output, "kind") === "scout" ? "scout" : "ship",
       mode: "",
@@ -5178,7 +5131,7 @@ export default async function plugin(bb: BbPluginApi) {
     const active = rows.filter((r) => r.status !== "idle" && r.status !== "error").length;
     const errors = count("error");
     const due = decisions.filter((d) => decisionDue(d, now));
-    const dispatchable = queue.filter((q) => q.status === "queued" && queueGate(q, queue, now) === null);
+    const dispatchable = queue.filter((q) => q.status === "queued" && storedQueueGate(q, queue, now) === null);
     const calls = [
       ...due.map(
         (d) =>
@@ -5226,7 +5179,7 @@ export default async function plugin(bb: BbPluginApi) {
       ...queue
         .filter((q) => q.status === "queued")
         .map((q) => {
-          const gate = queueGate(q, queue, now);
+          const gate = storedQueueGate(q, queue, now);
           return `○ ${q.id} [${q.shape}] :: ${truncate(q.title, 70)}${gate !== null ? ` — ${gate}` : " — dispatchable"}`;
         }),
       ...decisions
@@ -5999,10 +5952,8 @@ export default async function plugin(bb: BbPluginApi) {
         if (onlyCrewId !== undefined) return row.crewId != null && movedSet.has(row.crewId);
         return row.crewId == null || movedSet.has(row.crewId);
       };
-      await serializeLedger(QUEUE_KEY, async () => {
-        const items = await readQueue();
-        await bb.storage.kv.set(QUEUE_KEY, items.map((row) => (takes(row) ? { ...row, parentThreadId: to } : row)));
-      });
+      await queueStore.ready();
+      queueStore.transform(takes, row => ({...row,parentThreadId:to}));
       await serializeLedger(DECISIONS_KEY, async () => {
         const items = await readDecisions();
         await bb.storage.kv.set(DECISIONS_KEY, items.map((row) => (takes(row) ? { ...row, parentThreadId: to } : row)));
@@ -6174,7 +6125,7 @@ export default async function plugin(bb: BbPluginApi) {
       await bb.sdk.threads.stop({ threadId: crew.threadId });
       await bb.sdk.threads.archive({ threadId: crew.threadId });
     }
-    await markQueueForCrew(crew.id, "done");
+    await markQueueForCrew(crew, "done");
     await recordDone({ task: crewLabel(crew).slice(0, 200), shape: crew.shape, crewId: crew.id, outcome, pr, parentThreadId: crew.parentThreadId,deliveryRequirement:await contractForCrew(crew) });
     await removeCrew(crew);
     await publishFleet();
@@ -6528,7 +6479,7 @@ export default async function plugin(bb: BbPluginApi) {
           deliveryRequirement:await contractForCrew(crew),
           parentThreadId: crew.parentThreadId,
         });
-        await markQueueForCrew(crew.id, "done");
+        await markQueueForCrew(crew, "done");
       }
     } catch {
       // best effort
@@ -8094,9 +8045,80 @@ export default async function plugin(bb: BbPluginApi) {
     throw new Error(`Native ${operation} failed: ${reason}. BB state was not advanced; reconcile native state before retrying.`);
   }
 
-  async function projectQueueAdd(id: string, title: string, shape: Shape, projectId: string): Promise<{ ok: boolean }> {
+  function validateQueueText(title:string,detail:string) {
+    if (title.length > 500 || detail.length > MAX_TASK || (detail ? `${title}\n\n${detail}` : title).length > MAX_TASK) throw new Error(`Queue text exceeds limits (title 500, full task ${MAX_TASK} characters); nothing truncated or filed.`);
+  }
+  function storedQueueGate(item:QueueItem,all:QueueItem[],now:number) {
+    if (item.nativePending) return "native publication unresolved; run queue reconcile with the exact id";
+    return queueGate(item,all.filter(row=>row.projectId===item.projectId && (row.parentThreadId??null)===(item.parentThreadId??null)),now);
+  }
+  async function publishQueueAdd(item:QueueItem) {
+    // Intent is durable BEFORE the external add. A timeout retains the full spec;
+    // reconciliation reads the exact native id and never repeats an unknown add.
+    try {
+      const projected=await projectQueueAdd(item.id,item.title,item.shape,item.projectId,item.nativeHome);
+      if (projected.ok) { queueStore.patch(item,{backlogId:item.id,nativePending:false});item.backlogId=item.id;item.nativePending=false; }
+    } catch (error) {
+      throw new Error(`Queue ${item.id} saved; native add unresolved. Inspect native row, then queue reconcile ${item.id}. ${error instanceof Error?error.message:String(error)}`);
+    }
+  }
+  function findQueueItem(items:QueueItem[],id:string|undefined,project:string|undefined):QueueItem|undefined {
+    const matches=items.filter(row=>row.id===id && (project===undefined || row.projectId===project));
+    if (matches.length>1) throw new Error(`Queue id ${id} is ambiguous; pass its exact project.`);
+    return matches[0];
+  }
+  async function reconcileQueue(id:string,project:string|undefined,owner:string|undefined,input:Partial<QueueItem>={}) {
+    if (!owner || !project || !/^[A-Za-z0-9._-]+$/.test(id) || !(await queueIsReal())) throw new Error("Queue reconcile requires the owning captain, exact project/id and native backlog.");
+    await queueStore.ready();
+    const existing=queueStore.get({id,projectId:project,parentThreadId:owner});
+    const reservation=launches.forTask(project,owner,id);
+    // Handoff retains a task's original home. Only an owned durable record or
+    // exact owned launch supplies that home; never accept a caller override.
+    const home=existing?.nativeHome || reservation?.home || (await settings.get()).fmHome;
+    if (existing && reservation && existing.nativeHome && existing.nativeHome!==reservation.home) throw new Error("Queue reconcile refused: stored queue/launch homes conflict.");
+    if (existing) for (const key of ['title','detail','mode','deliveryRequirement','providerId','model','reasoningLevel'] as const) {
+      if (input[key]!==undefined && input[key]!==existing[key]) throw new Error(`Queue reconcile cannot change original ${key}.`);
+    }
+    const read=await runTasksAxi(["show",id,"--full"],{projectId:project,home});
+    requireNativeSuccess(read,`queue reconcile ${id}`);
+    const state=tasksAxiField(read!.output,"state"),title=tasksAxiField(read!.output,"title"),kind=tasksAxiField(read!.output,"kind");
+    if (tasksAxiField(read!.output,"id")!==id || !title || !['ship','scout'].includes(kind) || !['queued','in_flight','done'].includes(state) || /\(truncated, \d+ chars total/.test(title)) throw new Error("Native row is not a readable task in a recoverable state.");
+    if (existing && (existing.title!==title || existing.shape!==kind || existing.backlogId && existing.backlogId!==id)) throw new Error("Native row conflicts with the saved queue identity/title/kind.");
+    if (existing && ['done','dropped'].includes(existing.status)) return existing; // never reopen history
+    if (state==='queued') {
+      if (existing) return queueStore.patch(existing,{backlogId:id,nativePending:false});
+      // An old native-only row cannot prove the lost BB options/full task. The
+      // owner explicitly supplies that contract, after inspecting the exact row.
+      if (input.title!==title || input.detail===undefined || input.mode===undefined || input.deliveryRequirement===undefined) throw new Error("Native-only queued repair needs original --title, --detail, --mode and --delivery-requirement plus original execution/dependency/time options. Native title alone cannot recover a lost BB spec.");
+      if (await bb.storage.kv.get(`native-home:${owner}`)!==home) throw new Error("Native-only queued repair requires this captain's isolated native home; shared-home provenance is ambiguous.");
+      await validateProviderChoice(input.providerId,input.model,project,owner);
+      modeSchema.parse(input.mode);
+      validateQueueText(title,input.detail);
+      const record:QueueItem={...input,id,title,detail:input.detail,projectId:project,parentThreadId:owner,nativeHome:home,shape:kind as Shape,mode:input.mode,deliveryRequirement:input.deliveryRequirement,blockedBy:input.blockedBy??[],waitUntil:input.waitUntil??null,status:'queued',crewId:null,backlogId:id,createdAt:new Date().toISOString()};
+      return queueStore.add(record);
+    }
+    const candidates=(await readCrews()).filter(c=>c.id===id && c.projectId===project && c.parentThreadId===owner && c.nativeHome===home);
+    const launch=reservation;
+    if (candidates.length!==1 || !launch || launch.state!=='running' || launch.home!==home || launch.threadId!==candidates[0]!.threadId || launch.shape!==kind || launches.isDeletedWorker(launch.threadId)) throw new Error("Native in-flight/completed queue repair needs one exact registered, admitted launch and worker; no replacement created.");
+    const crew=candidates[0]!;
+    if (await bb.storage.kv.get(`crew-retired:${crew.threadId}`)===true) throw new Error("Queue repair refused: worker was explicitly retired.");
+    const thread=await raceAbort(bb.sdk.threads.get({threadId:crew.threadId}),launchAbort.signal,STUCK_HOST_CALL_MS);
+    const meta=await raceAbort(bb.sdk.threads.getPluginMetadata({threadId:crew.threadId}),launchAbort.signal,STUCK_HOST_CALL_MS);
+    if (thread.projectId!==project || thread.parentThreadId!==owner || meta.crewId!==id || meta.launchKey!==launch.key || meta.nativeHome!==home || await readFmMetaField(launch.hostId || await resolveHostId(undefined,{threadId:owner}),id,"bb_thread_id",home)!==crew.threadId) throw new Error("Exact BB/native worker identity does not match queue recovery.");
+    const task=await fullCrewTask(crew);
+    if (!task || task==='(recovered crew)' || crew.taskSpilled && task===crew.task || crew.shape!==kind || crew.deliveryRequirement!==launch.deliveryRequirement || crew.posture!==launch.deliveryMode) throw new Error("Original full task or immutable execution/delivery provenance is missing or conflicting.");
+    let record=existing;
+    if (!record) {
+      // Full task is retained verbatim, even if the native short title differs.
+      record={id,title,detail:task,projectId:project,parentThreadId:owner,nativeHome:home,shape:crew.shape,mode:crew.posture,blockedBy:[],waitUntil:null,status:'dispatched',crewId:id,backlogId:id,createdAt:crew.createdAt,deliveryRequirement:crew.deliveryRequirement,...(crew.providerId?{providerId:crew.providerId}:{}),...(crew.model?{model:crew.model}:{}),...(crew.reasoningLevel?{reasoningLevel:crew.reasoningLevel}:{})};
+      queueStore.add(record);
+    }
+    return queueStore.patch(record,{status:state==='done'?'done':'dispatched',crewId:id,backlogId:id,nativePending:false});
+  }
+
+  async function projectQueueAdd(id: string, title: string, shape: Shape, projectId: string, home?:string): Promise<{ ok: boolean }> {
     if (!(await queueIsReal())) return { ok: false };
-    const res = await runTasksAxi(["add", id, title.slice(0, 500), "--kind", shape], { projectId });
+    const res = await runTasksAxi(["add", id, title.slice(0, 500), "--kind", shape], { projectId,home });
     requireNativeSuccess(res, `backlog add ${id}`);
     return { ok: true };
   }
@@ -8906,6 +8928,7 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb firstmate scout-report <id> [--json]   # complete owned promotion artifact",
     "  bb firstmate bearings | deliver <id> | merge <id> [--yes] [--allow-red <check-name>] [--allow-missing <check-name>] | promote <id>",
     "  bb firstmate handoff --from <previous-captain-thread> [--crew <id>]",
+    '  bb firstmate queue reconcile <id> --project <id> [--title <original> --detail <full> --mode <mode> --delivery-requirement <contract> --provider <id> --model <id> --reasoning-level <level> --after <id> --wait-until <iso>]',
     '  bb firstmate queue add --project <id> [--shape s] [--mode m] [--after <qid>] [--wait-until <iso>] -- "<title>"',
     "  bb firstmate queue [list|next|dispatch <qid>|done <qid>|drop <qid>|prune]",
     '  bb firstmate decide ask [--option o ...] [--crew <id>] -- "<question>"',
@@ -9568,9 +9591,9 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_queue",
-    description: "Backlog with deps/time gates. add files work (with the crew's providerId/model/reasoningLevel); dispatch starts a crew when ungated — also for a queued row filed straight into the native backlog. drop/done also close a native backlog row that has no queue item; prune forgets finished (done/dropped) queue items.",
+    description: "Backlog with deps/time gates. add files work (with the crew's providerId/model/reasoningLevel); dispatch starts a crew when ungated — also for a queued row filed straight into the native backlog. drop/done also close a native backlog row that has no queue item; prune forgets finished (done/dropped) queue items. reconcile repairs exact native publication or existing admitted worker registration without launching; native-only queued repair requires the original full contract.",
     parameters: z.object({
-      action: z.enum(["add", "list", "next", "dispatch", "done", "drop", "prune"]),
+      action: z.enum(["add", "list", "next", "dispatch", "done", "drop", "prune", "reconcile"]),
       title: z.string().optional(),
       projectId: z.string().optional(),
       queueId: z.string().optional(),
@@ -9589,6 +9612,11 @@ export default async function plugin(bb: BbPluginApi) {
       const items = (await readQueue()).filter(row => ownedByScopedCaptain(row.parentThreadId));
       const ctxProject = ctxString(ctx, "projectId");
       const captain = ctxString(ctx, "threadId");
+      if (action === "reconcile") {
+        if (!queueId) return toolError("Need exact queueId.");
+        const row=await reconcileQueue(queueId,projectId??ctxProject,captain,{title,detail,mode,deliveryRequirement,providerId,model,reasoningLevel,blockedBy:after,waitUntil});
+        return `Reconciled queue ${row.id} [${row.status}]${row.crewId?` with existing crew ${row.crewId}; no turn started`:''}.`;
+      }
       if (action === "list") {
         const now = Date.now();
         const kvIds = new Set(items.flatMap((q) => [q.id, q.backlogId ?? ""]));
@@ -9598,7 +9626,7 @@ export default async function plugin(bb: BbPluginApi) {
         if (live.length === 0 && real.length === 0) return "Queue empty.";
         return [
           ...live.map((q) => {
-            const gate = q.status === "queued" ? queueGate(q, items, now) : null;
+            const gate = q.status === "queued" ? storedQueueGate(q, items, now) : null;
             return `${q.id} [${q.status}] ${q.shape} :: ${truncate(q.title, 70)}${gate !== null ? ` — ${gate}` : ""}${q.crewId !== null ? ` (crew ${q.crewId})` : ""}`;
           }),
           ...real.map((r) => `${r.id} [queued] ${r.kind || "task"} :: ${truncate(r.title, 70)} — native backlog row`),
@@ -9606,7 +9634,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
       if (action === "next") {
         const now = Date.now();
-        const open = items.filter((q) => q.status === "queued" && queueGate(q, items, now) === null);
+        const open = items.filter((q) => q.status === "queued" && storedQueueGate(q, items, now) === null);
         if (open.length === 0) return "Nothing dispatchable.";
         const first = [...open].reverse()[0] as QueueItem;
         return `${first.id} [${first.shape}] ${first.projectId} :: ${first.title}`;
@@ -9620,13 +9648,13 @@ export default async function plugin(bb: BbPluginApi) {
         } catch (error) {
           return toolError(error instanceof Error ? error.message : String(error));
         }
+        validateQueueText(title, detail ?? "");
         const newId = randomUUID().slice(0, 8);
-        const proj = await projectQueueAdd(newId, title, shape ?? "ship", pid);
         const item: QueueItem = {
           nativeHome: (await settings.get()).fmHome,
           id: newId,
-          title: title.slice(0, 500),
-          detail: (detail ?? "").slice(0, MAX_TASK),
+          title,
+          detail: detail ?? "",
           projectId: pid,
           shape: shape ?? "ship",
           mode: mode ?? "",
@@ -9639,42 +9667,44 @@ export default async function plugin(bb: BbPluginApi) {
           status: "queued",
           crewId: null,
           parentThreadId: captain ?? null,
-          ...(proj.ok ? { backlogId: newId } : {}),
+          ...(await queueIsReal() ? {nativePending:true} : {}),
           createdAt: new Date().toISOString(),
         };
-        await writeQueue([item, ...items]);
+        queueStore.add(item);
+        await publishQueueAdd(item);
         await publishFleet();
         return `Queued ${item.id} [${item.shape}] :: ${truncate(item.title, 80)}`;
       }
       if (action === "prune") {
         const kept = items.filter((q) => !isFinishedQueueItem(q));
-        await writeQueue(kept);
+        queueStore.transform(row => ownedByScopedCaptain(row.parentThreadId) && isFinishedQueueItem(row), () => null);
         await publishFleet();
         return `Pruned ${items.length - kept.length} finished queue item(s).`;
       }
-      let item = items.find((q) => q.id === queueId);
+      let item = findQueueItem(items,queueId,projectId??ctxProject);
       let adopted = false;
       if (item === undefined && queueId !== undefined && (action === "dispatch" || action === "drop" || action === "done")) {
         // A row filed straight into the native backlog: adopt it into the queue. Closing one
         // needs no queue item afterwards, so drop/done never persist the adopted copy.
         const row = await adoptRealBacklogRow(queueId, projectId ?? ctxProject, captain, action === "dispatch");
-        if (row !== null) { item = row; adopted = true; if (action === "dispatch") items.unshift(row); }
+        if (row !== null) { item = row; adopted = true; if (action === "dispatch") { queueStore.add(row); items.unshift(row); } }
       }
       if (queueId === undefined || item === undefined) return toolError(`No queued item ${queueId ?? ""}.`);
       if (action === "drop" || action === "done") {
         item.status = action === "drop" ? "dropped" : "done";
         await projectQueueTransition(item, action === "drop" ? "rm" : "done");
-        if (!adopted) await writeQueue(items);
+        if (!adopted) queueStore.patch(item, {status:item.status});
         await publishFleet();
         return `Queue ${queueId} ${item.status}${adopted ? " (native backlog row)" : ""}`;
       }
-      const gate = queueGate(item, items, Date.now());
+      const gate = storedQueueGate(item, items, Date.now());
       if (gate !== null) return toolError(`Item ${queueId} gated: ${gate}.`);
       // Queue dispatch starts a crew like any dispatch, so the same cap applies.
 
       const registry = await postureOf(item.projectId);
       const current = await settings.get();
       const brief = item.detail !== "" ? `${item.title}\n\n${item.detail}` : item.title;
+      if (brief.length > MAX_TASK) throw new Error(`Queue task ${item.id} exceeds ${MAX_TASK} characters; full record retained, dispatch refused.`);
       let crew: Crew;
       try {
         crew = await dispatchCrew({
@@ -9703,7 +9733,7 @@ export default async function plugin(bb: BbPluginApi) {
       // here would double-transition, so only start when the plugin owns the transition
       // (native transport, or real fell back to native).
       if (current.transport !== "real") await projectQueueTransition(item, "start");
-      await writeQueue(items);
+      queueStore.patch(item, {status:item.status,crewId:item.crewId});
       await publishFleet();
       const status = await crewStatus(crew);
       const failure = status === "error" ? await threadFailureDetail(crew.threadId) : "";
@@ -10588,7 +10618,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "merge", summary: "Merge PR or local-only ff-only land", usage: "bb firstmate merge <crew-id> [--yes]" },
       { name:"scout-report",summary:"Read the complete owned promotion artifact",usage:"bb firstmate scout-report <id> [--json]" },
       { name: "promote", summary: "Scout → new ship carrying the report", usage: "bb firstmate promote <crew-id>" },
-      { name: "queue", summary: "Backlog with deps/time gates; drop/done close a native row too, prune forgets finished items", usage: 'bb firstmate queue add --project <id> -- "<title>"' },
+      { name: "queue", summary: "Backlog with deps/time gates; reconcile restores exact native linkage without launching; prune forgets finished items", usage: 'bb firstmate queue add --project <id> -- "<title>"' },
       { name: "decide", summary: "Durable decisions", usage: 'bb firstmate decide ask -- "<question>"' },
       { name: "posture", summary: "Per-project delivery mode + yolo", usage: "bb firstmate posture set --project <id> [--mode m]" },
       { name: "memory", summary: "Captain prefs + learnings", usage: "bb firstmate memory show" },
@@ -11164,19 +11194,25 @@ export default async function plugin(bb: BbPluginApi) {
           case "queue": {
             const sub = rest[0] ?? "list";
             const items = (await readQueue()).filter(row => ownedByScopedCaptain(row.parentThreadId));
+            if (sub === "reconcile") {
+              const id=rest[1];if (!id) return fail("Need exact queue id.");
+              const row=await reconcileQueue(id,flagStr(flags,"project")??ctxProject,ctxThread,{title:flagStr(flags,"title"),detail:flagStr(flags,"detail"),mode:flagStr(flags,"mode"),deliveryRequirement:flagStr(flags,"delivery-requirement") as QueueItem['deliveryRequirement'],providerId:flagStr(flags,"provider"),model:flagStr(flags,"model"),reasoningLevel:strictReasoning(flagStr(flags,"reasoning-level")),blockedBy:flagAll(flags,"after"),waitUntil:flagStr(flags,"wait-until")});
+              return reply(row,`Reconciled queue ${id} [${row.status}]. Existing worker kept; no turn started.`);
+            }
             if (sub === "add") {
               const title = rest.slice(1).join(" ").trim();
               if (title === "") return fail(usage);
               const projectId = flagStr(flags, "project") ?? ctxProject;
               if (projectId === undefined) return fail("No project: pass --project <id>.");
+              validateQueueText(title, flagStr(flags,"detail") ?? "");
+              await validateProviderChoice(flagStr(flags,"provider"),flagStr(flags,"model"),projectId,ctxThread);
               const newId = randomUUID().slice(0, 8);
               const shapeVal = toShape(flagStr(flags, "shape"));
-              const proj = await projectQueueAdd(newId, title, shapeVal, projectId);
               const item: QueueItem = {
           nativeHome: (await settings.get()).fmHome,
                 id: newId,
-                title: title.slice(0, 500),
-                detail: (flagStr(flags, "detail") ?? "").slice(0, MAX_TASK),
+                title,
+                detail: flagStr(flags, "detail") ?? "",
                 projectId,
                 shape: shapeVal,
                 mode: flagStr(flags, "mode") ?? "",
@@ -11189,10 +11225,11 @@ export default async function plugin(bb: BbPluginApi) {
                 status: "queued",
                 crewId: null,
                 parentThreadId: ctxThread ?? null,
-                ...(proj.ok ? { backlogId: newId } : {}),
+                ...(await queueIsReal() ? {nativePending:true} : {}),
                 createdAt: new Date().toISOString(),
               };
-              await writeQueue([item, ...items]);
+              queueStore.add(item);
+              await publishQueueAdd(item);
               return reply(item, `Queued ${item.id} [${item.shape}] :: ${truncate(item.title, 80)}`);
             }
             if (sub === "list") {
@@ -11200,31 +11237,32 @@ export default async function plugin(bb: BbPluginApi) {
               if (live.length === 0) return reply([], "Queue empty.");
               const now = Date.now();
               const lines = live.map((q) => {
-                const gate = q.status === "queued" ? queueGate(q, items, now) : null;
+                const gate = q.status === "queued" ? storedQueueGate(q, items, now) : null;
                 return `${q.id} [${q.status}] ${q.shape} :: ${truncate(q.title, 70)}${gate !== null ? ` — ${gate}` : ""}${q.crewId !== null ? ` (crew ${q.crewId})` : ""}`;
               });
               return reply(items, lines.join("\n"));
             }
             if (sub === "next") {
               const now = Date.now();
-              const open = items.filter((q) => q.status === "queued" && queueGate(q, items, now) === null);
+              const open = items.filter((q) => q.status === "queued" && storedQueueGate(q, items, now) === null);
               if (open.length === 0) return reply([], "Nothing dispatchable.");
               const first = [...open].reverse()[0] as QueueItem;
               return reply(first, `${first.id} [${first.shape}] ${first.projectId} :: ${first.title}\nDispatch: bb firstmate queue dispatch ${first.id}`);
             }
             if (sub === "dispatch") {
               const qid = rest[1];
-              let item = items.find((q) => q.id === qid);
+              let item = findQueueItem(items,qid,flagStr(flags,"project")??ctxProject);
               if (item === undefined && qid !== undefined) {
                 const row = await adoptRealBacklogRow(qid, flagStr(flags, "project") ?? ctxProject, ctxThread);
-                if (row !== null) { item = row; items.unshift(row); }
+                if (row !== null) { item = row; queueStore.add(row); items.unshift(row); }
               }
               if (qid === undefined || item === undefined) return fail(`No queued item ${qid ?? ""}.`);
-              const gate = queueGate(item, items, Date.now());
+              const gate = storedQueueGate(item, items, Date.now());
               if (gate !== null) return fail(`Item ${qid} gated: ${gate}.`);
 
               const registry = await postureOf(item.projectId);
               const brief = item.detail !== "" ? `${item.title}\n\n${item.detail}` : item.title;
+              if (brief.length > MAX_TASK) throw new Error(`Queue task ${item.id} exceeds ${MAX_TASK} characters; full record retained, dispatch refused.`);
               const crew = await dispatchCrew({
                 task: brief,
                 projectId: item.projectId,
@@ -11246,23 +11284,23 @@ export default async function plugin(bb: BbPluginApi) {
               // fm-spawn.sh performs the queued→In-flight start itself for real-transport
               // dispatches; only start here when the plugin owns the transition.
               if (current.transport !== "real") await projectQueueTransition(item, "start");
-              await writeQueue(items);
+              queueStore.patch(item, {status:item.status,crewId:item.crewId});
               return reply({ ...crew, status: await crewStatus(crew), queueId: qid }, `Dispatched queue ${qid} as ${crew.shape} crew ${crew.id}${permissionLine(crew.id)}`);
             }
             if (sub === "drop" || sub === "done") {
               const qid = rest[1];
-              let item = items.find((q) => q.id === qid);
+              let item = findQueueItem(items,qid,flagStr(flags,"project")??ctxProject);
               const adopted = item === undefined && qid !== undefined;
               if (item === undefined && qid !== undefined) item = await adoptRealBacklogRow(qid, flagStr(flags, "project") ?? ctxProject, ctxThread, false) ?? undefined;
               if (qid === undefined || item === undefined) return fail(`No queued item ${qid ?? ""}.`);
               item.status = sub === "drop" ? "dropped" : "done";
               await projectQueueTransition(item, sub === "drop" ? "rm" : "done");
-              if (!adopted) await writeQueue(items);
+              if (!adopted) queueStore.patch(item, {status:item.status});
               return reply({ id: qid, status: item.status }, `Queue ${qid} ${item.status}${adopted ? " (native backlog row)" : ""}`);
             }
             if (sub === "prune") {
               const kept = items.filter((q) => !isFinishedQueueItem(q));
-              await writeQueue(kept);
+              queueStore.transform(row => ownedByScopedCaptain(row.parentThreadId) && isFinishedQueueItem(row), () => null);
               return reply({ pruned: items.length - kept.length }, `Pruned ${items.length - kept.length} finished queue item(s).`);
             }
             return fail(usage);

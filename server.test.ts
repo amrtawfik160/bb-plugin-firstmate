@@ -12,6 +12,8 @@ import {
   makePluginAgentConfigurationContext,
   makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
+import {createQueueStore} from "./lib/queue-store.ts";
+async function durableQueue(host: ReturnType<typeof createFakePluginHost>) { const queue=createQueueStore(host.bb.storage.database(),()=>host.bb.storage.kv.get("queue"));await queue.ready();return queue.list(); }
 import plugin, {
   OVERLAY_INSTALL_INPUTS,
   backlogTitleOf,
@@ -2539,7 +2541,7 @@ test("handoff reparents a previous captain's crews and their decisions", async (
     assert.deepEqual(updates, [{ threadId: "thr_crew", parentThreadId: "thr_new" }]);
     const decisions = (await host.bb.storage.kv.get("decisions")) as Array<{ parentThreadId: string }>;
     assert.equal(decisions[0]?.parentThreadId, "thr_new");
-    const queue = (await host.bb.storage.kv.get("queue")) as Array<{ parentThreadId: string }>;
+    const queue = (await durableQueue(host)) as Array<{ parentThreadId: string }>;
     assert.equal(queue[0]?.parentThreadId, "thr_new");
     const again = await host.harness.behavior.runCli(["handoff", "--from", "thr_else", "--crew", "missing"], { threadId: "thr_new" });
     assert.equal(again.exitCode, 1);
@@ -5361,7 +5363,7 @@ test("A1 queue real: add owns the row id (add <id> <title> --kind); done drives 
     const { seen } = stubRoutedHost(host, () => ({ payload: "Added your task successfully — enjoy!", code: 0 }));
     const add = await host.harness.behavior.runCli(["queue", "add", "ship it", "--project", "proj_1"], { projectId: "proj_1" });
     assert.equal(add.exitCode, 0, add.stderr);
-    const q = (await host.bb.storage.kv.get("queue")) as Array<{ id: string; backlogId?: string }>;
+    const q = (await durableQueue(host)) as Array<{ id: string; backlogId?: string }>;
     const qid = q[0]!.id;
     assert.equal(q[0]?.backlogId, qid, "backlog row id must equal the KV item id we supplied");
     // The add command carries our id and --kind, not just the title.
@@ -5377,14 +5379,15 @@ test("A1 queue real: add owns the row id (add <id> <title> --kind); done drives 
   }
 });
 
-test("A1 queue real: missing tasks-axi refuses without creating a phantom queue item", async () => {
+test("A1 queue real: missing tasks-axi retains unresolved full queue intent", async () => {
   const host = ownerHost({ queueOwner: "real" });
   await plugin(host.bb);
   try {
     stubRoutedHost(host, () => ({ code: 2 })); // tasks-axi not on PATH
     const add = await host.harness.behavior.runCli(["queue", "add", "ship it", "--project", "proj_1"], { projectId: "proj_1" });
     assert.equal(add.exitCode, 1);
-    assert.deepEqual(await host.bb.storage.kv.get("queue") ?? [], []);
+    assert.equal((await durableQueue(host)).length, 1);
+    assert.equal((await durableQueue(host))[0]?.nativePending,true);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -5428,7 +5431,7 @@ test("migrate-owners projects KV into the real files and is idempotent", async (
     assert.equal(first.exitCode, 0, first.stderr);
     assert.equal(addCalls, 1, "queue row should be projected once");
     assert.equal(decodeHostWrite(writes, "data/captain.md"), "MC", "captain memory not projected");
-    const q1 = (await host.bb.storage.kv.get("queue")) as Array<{ id: string; backlogId?: string }>;
+    const q1 = (await durableQueue(host)) as Array<{ id: string; backlogId?: string }>;
     assert.equal(q1[0]?.backlogId, q1[0]?.id, "migrate reuses the KV item id as the backlog row id");
     // Re-run: the queue row already has a backlogId → not projected again.
     const second = await host.harness.behavior.runCli(["migrate-owners"], { projectId: "proj_1" });
@@ -6207,7 +6210,7 @@ test("queue real: id-ownership is robust to arbitrary add output; transitions ta
     });
     const add = await host.harness.behavior.runCli(["queue", "add", "ship it", "--project", "proj_1"], { projectId: "proj_1" });
     assert.equal(add.exitCode, 0, add.stderr);
-    const q = (await host.bb.storage.kv.get("queue")) as Array<{ id: string; backlogId?: string }>;
+    const q = (await durableQueue(host)) as Array<{ id: string; backlogId?: string }>;
     const qid = q[0]!.id;
     assert.equal(q[0]?.backlogId, qid, "row id is our supplied id regardless of add stdout");
     const done = await host.harness.behavior.runCli(["queue", "done", qid], { projectId: "proj_1" });
@@ -6223,14 +6226,15 @@ test("queue real: id-ownership is robust to arbitrary add output; transitions ta
   }
 });
 
-test("queue real: native add refusal preserves the cache", async () => {
+test("queue real: native add refusal retains unresolved full queue intent", async () => {
   const host = ownerHost({ queueOwner: "real" });
   await plugin(host.bb);
   try {
     stubRoutedHost(host, (cmd) => (cmd.includes("'add'") ? { code: 1 } : { code: 0 }));
     const add = await host.harness.behavior.runCli(["queue", "add", "explicit", "--project", "proj_1"], { projectId: "proj_1" });
     assert.equal(add.exitCode, 1);
-    assert.deepEqual(await host.bb.storage.kv.get("queue") ?? [], []);
+    assert.equal((await durableQueue(host)).length, 1);
+    assert.equal((await durableQueue(host))[0]?.nativePending,true);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -7873,7 +7877,7 @@ test("concurrent captain queue and decision writes preserve every owner's rows",
       ];
     }));
     for (const result of writes) assert.equal(result.exitCode, 0, result.stderr);
-    assert.equal((await host.bb.storage.kv.get("queue") as unknown[]).length, 4);
+    assert.equal((await durableQueue(host) as unknown[]).length, 4);
     assert.equal((await host.bb.storage.kv.get("decisions") as unknown[]).length, 4);
   } finally { await host.harness.lifecycle.dispose(); }
 });
@@ -9895,7 +9899,7 @@ test("queue drop closes a hand-filed native backlog row, and prune forgets finis
     assert.ok(routed.seen.map(unwrapHostCommand).some((c) => c.includes("fm-tasks-axi.sh") && c.includes("'rm'") && c.includes("'old-pr'")), "native row removed");
     const pruned = toolText(await queue.execute({ action: "prune" }, ctx));
     assert.match(pruned, /Pruned 1 finished/);
-    assert.deepEqual(await host.bb.storage.kv.get("queue"), []);
+    assert.deepEqual(await durableQueue(host), []);
   } finally {
     await host.harness.lifecycle.dispose();
   }
