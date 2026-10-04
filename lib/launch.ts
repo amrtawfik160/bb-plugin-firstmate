@@ -7,6 +7,7 @@ export interface LaunchRecord {
   nativeInvoked?: boolean; deliveryMode?: string; deliveryRequirement?: 'pr' | 'merged' | 'merged-and-verified';
   hostId?: string; path?: string; error?: string; updatedAt: number;
   execution?: { providerId: string | null; model: string | null; reasoningLevel: string | null };
+  adoption?: { threadId:string; environmentId:string; worktree:string; proof:string; briefSha:string; promptSha:string; createdAt:number; originalUpdatedAt:number; originalError?:string; execution?:{model:string;reasoningLevel:string;permissionMode:string}; phase:'publishing'|'complete' };
 }
 type Database = ReturnType<BbPluginApi['storage']['database']>;
 export const launchTaskKey=(project:string,task:string)=>JSON.stringify([project,task]);
@@ -18,7 +19,8 @@ export function createLaunches(db: Database) {
   db.exec(`CREATE TABLE IF NOT EXISTS launches (key TEXT PRIMARY KEY, owner TEXT NOT NULL, project TEXT NOT NULL, state TEXT NOT NULL, record TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS launches_owner ON launches(owner, state);
     CREATE INDEX IF NOT EXISTS launches_thread ON launches(json_extract(record,'$.threadId'));
-    CREATE TABLE IF NOT EXISTS launch_deleted_workers (thread TEXT PRIMARY KEY)`);
+    CREATE TABLE IF NOT EXISTS launch_deleted_workers (thread TEXT PRIMARY KEY);
+    CREATE TABLE IF NOT EXISTS launch_adoption_tasks (key TEXT PRIMARY KEY, task TEXT NOT NULL)`);
   let tail: Promise<unknown> = Promise.resolve();
   const inFlight = new Map<string, Promise<unknown>>();
   function get(key: string): LaunchRecord | undefined {
@@ -70,6 +72,22 @@ export function createLaunches(db: Database) {
   function reassignWorker(threadId:string,from:string,to:string,projectId:string) {
     return db.prepare(`UPDATE launches SET owner=?,record=json_set(record,'$.owner',?) WHERE owner=? AND project=? AND json_extract(record,'$.threadId')=?`)
       .run(to,to,from,projectId,threadId).changes;
+  }
+  function adoptionTask(key:string):string|undefined {
+    return (db.prepare('SELECT task FROM launch_adoption_tasks WHERE key=?').get(key) as {task:string}|undefined)?.task;
+  }
+  function claimAdoption(expected:LaunchRecord,adoption:NonNullable<LaunchRecord['adoption']>,task:string) {
+    return db.transaction(()=>{
+      const current=get(expected.key);
+      if (!current || !['uncertain','provisioning'].includes(current.state) && !current.adoption || current.state==='deleted' || current.state==='failed' || isDeletedWorker(adoption.threadId) ||
+          current.owner!==expected.owner || current.home!==expected.home || current.projectId!==expected.projectId || current.deliveryRequirement!==expected.deliveryRequirement || current.deliveryMode!==expected.deliveryMode ||
+          current.hostId!==expected.hostId || current.path!==expected.path || current.generation!==expected.generation || current.shape!==expected.shape || JSON.stringify(current.execution)!==JSON.stringify(expected.execution) ||
+          current.threadId && current.threadId!==adoption.threadId || current.adoption && current.adoption.proof!==adoption.proof) throw new Error('Launch changed or another adoption owns its publication.');
+      const priorTask=adoptionTask(expected.key);
+      if (priorTask!==undefined && priorTask!==task) throw new Error('Original adoption task content changed.');
+      db.prepare('INSERT OR IGNORE INTO launch_adoption_tasks VALUES (?,?)').run(expected.key,task);
+      return update(expected.key,{state:'provisioning',threadId:adoption.threadId,adoption,error:'Explicit adoption publication incomplete; repeat with this exact thread.'});
+    })();
   }
   async function reserve(record: LaunchRecord, capacity: () => Promise<{ cap: number; activeTaskIds: string[] }>, overCap = false) {
     const run = tail.then(async () => {
@@ -144,7 +162,7 @@ export function createLaunches(db: Database) {
       }
     });
   }
-  return { get, save, update, list, heldTaskIds, forTask,reassignWorker,workerDeleted,isDeletedWorker,reserve, once, create };
+  return { get, save, update, list, heldTaskIds, forTask,reassignWorker,workerDeleted,isDeletedWorker,adoptionTask,claimAdoption,reserve, once, create };
 }
 
 async function recoveryRead<T>(operation:Promise<T>,signal?:AbortSignal):Promise<T> {

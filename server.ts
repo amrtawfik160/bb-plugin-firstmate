@@ -55,6 +55,7 @@ import { nativeBearingsProjection } from "./lib/native-bearings.ts";
 import { createSnapshotReads } from "./lib/snapshot-reads.ts";
 import { scoutReports } from "./lib/scout-report.ts";
 import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRecord } from "./lib/launch.ts";
+import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
 import { createDeliveries, canonicalPr, deliveryLine, parseForge, type DeliveryRecord } from "./lib/pr-delivery.ts";
 import { captureHostCommand, decodeHostCapture } from "./lib/host-capture.ts";
 import { selectExecution, validateLaunchCapabilities } from "./lib/execution-selection.ts";
@@ -1139,6 +1140,8 @@ export const OVERLAY_INSTALL_INPUTS = [
   "bin/backends/bb-worker-prompt.py",
   "bin/fm-inbox-take.sh",
   "bin/fm-inbox-take.py",
+  "bin/fm-launch-adopt.sh",
+  "bin/fm-launch-adopt.py",
   "docs/bb-backend.md",
   "firstmate-bb-backend.patch",
   "firstmate-bb-teardown.patch",
@@ -2017,6 +2020,8 @@ export default async function plugin(bb: BbPluginApi) {
   // The full brief, for the few paths that re-send it (relaunch, brief publish, context).
   async function fullCrewTask(crew: Crew): Promise<string> {
     if (crew.taskSpilled !== true) return crew.task;
+    const adopted=crew.launchKey ? launches.adoptionTask(crew.launchKey) : undefined;
+    if (adopted?.startsWith(crew.task)) return adopted;
     const full = await bb.storage.kv.get<unknown>(`${CREW_TASK_PREFIX}${crew.id}`);
     return typeof full === "string" && full.startsWith(crew.task) ? full : crew.task;
   }
@@ -4234,7 +4239,66 @@ export default async function plugin(bb: BbPluginApi) {
     return { cap, activeTaskIds };
   }
 
+  async function adoptLegacyLaunch(taskId:string, threadId:string, owner:string, projectId:string, check:boolean, callerSignal?:AbortSignal) {
+    if (!/^[A-Za-z0-9._-]{1,100}$/.test(taskId) || [".",".."].includes(taskId) || !/^thr_[A-Za-z0-9]+$/.test(threadId)) throw new Error("Exact task and BB thread identities are required.");
+    const signal=AbortSignal.any([launchAbort.signal,AbortSignal.timeout(60_000),...(callerSignal ? [callerSignal] : [])]);
+    const read=<T>(p:Promise<T>)=>adoptionRead(p,signal);
+    const home=await read(bb.storage.kv.get<string>(`native-home:${owner}`));
+    if (!home || home !== (await settings.get()).fmHome.trim()) throw new Error("Adoption requires the owning captain's explicitly bound native home.");
+    const captain=await read(bb.sdk.threads.get({threadId:owner,signal}));
+    const captainMeta=await read(bb.sdk.threads.getPluginMetadata({threadId:owner,signal}));
+    if (!metaFlag(captainMeta,"captain") || captain.projectId !== projectId || captain.archivedAt || captain.deletedAt) throw new Error("Adoption must run in the live owning captain and exact project context.");
+    const record=launches.forTask(projectId,owner,taskId);
+    assertAdoptableReservation(record,owner,projectId,home,threadId);
+    return launches.once(`adopt:${record.key}`,async()=>{
+      if (launches.isDeletedWorker(threadId) || await read(bb.storage.kv.get(`crew-retired:${threadId}`)) === true) throw new Error("Worker was explicitly deleted or retired; adoption refused.");
+      const identity=await inspectAdoptionIdentity(bb,record,threadId,signal);
+      const crews=await read(readCrews());
+      const conflict=(c:Crew)=>c.projectId===projectId && c.id===taskId && (c.threadId!==threadId || c.parentThreadId!==owner || c.nativeHome && c.nativeHome!==home || c.shape!==record.shape || c.posture!==record.deliveryMode || c.deliveryRequirement && c.deliveryRequirement!==record.deliveryRequirement);
+      if (crews.some(conflict) || crews.some(c=>c.threadId===threadId && (c.id!==taskId || c.projectId!==projectId))) throw new Error("Crew register identity or immutable delivery contract conflicts.");
+      const execution={model:identity.execution.model,reasoningLevel:identity.execution.reasoningLevel,permissionMode:identity.execution.permissionMode};
+      const plan={record,threadId,environmentId:identity.environment.id,worktree:identity.environment.path!,createdAt:identity.thread.createdAt,eventId:identity.eventId,prompt:identity.prompt,execution,proof:record.adoption?.proof};
+      const resultSchema=z.object({proof:z.string(),briefSha:z.string(),promptSha:z.string(),task:z.string(),outcome:z.string(),branch:z.string(),head:z.string(),existing:z.boolean()});
+      async function native(action:"--check"|"--publish") {
+        const command=[...fmBackendEnv({fmHome:home!,hostId:record!.hostId!,projectId,parentThreadId:owner}),fmBinDirAssign(home!),fmMirrorStaleGuard(home!),"export FM_BINDIR",`bash "$FM_BINDIR/fm-launch-adopt.sh" ${action}`].join("\n");
+        const raw=await runOnHost(record!.hostId!,captureHostCommand(command),20_000,signal,JSON.stringify(plan));
+        requireNativeSuccess(raw,"legacy adoption host transport");
+        const captured=decodeHostCapture(raw.output.trim());
+        if (captured.exitCode !== 0) throw new Error(captured.stderr.trim() || captured.output.trim() || "Native adoption guard refused.");
+        return resultSchema.parse(JSON.parse(captured.output));
+      }
+      const inspected=await native("--check");
+      const summary={taskId,threadId,worktree:plan.worktree,workerStatus:identity.thread.status,deliveryRequirement:record.deliveryRequirement,originalAdmission:"unconfirmed",merge:"separate native guarded operation",status:inspected.outcome};
+      if (check) return { ...summary,adopted:false,eligible:true };
+      signal.throwIfAborted();
+      if (launches.isDeletedWorker(threadId) || await read(bb.storage.kv.get(`crew-retired:${threadId}`)) === true) throw new Error("Worker was retired during preflight; adoption refused.");
+      const adoption={threadId,environmentId:plan.environmentId,worktree:plan.worktree,proof:inspected.proof,briefSha:inspected.briefSha,promptSha:inspected.promptSha,createdAt:plan.createdAt,originalUpdatedAt:record.adoption?.originalUpdatedAt ?? record.updatedAt,originalError:record.adoption?.originalError ?? record.error,execution,phase:"publishing" as const};
+      const pending=launches.claimAdoption(record,adoption,inspected.task);
+      if (pending.state === "deleted") throw new Error("Worker was deleted during adoption; registration refused.");
+      plan.proof=adoption.proof;
+      const published=await native("--publish");
+      // Re-read public identity immediately before BB publication. Do not bind a
+      // worker that moved/retired during host validation or an interrupted retry.
+      const latest=await inspectAdoptionIdentity(bb,record,threadId,signal);
+      if (latest.environment.id!==plan.environmentId || latest.environment.path!==plan.worktree || latest.eventId!==plan.eventId || latest.prompt!==plan.prompt || launches.isDeletedWorker(threadId) || await read(bb.storage.kv.get(`crew-retired:${threadId}`)) === true) throw new Error("Worker identity changed during adoption; registration remains unresolved.");
+      await read(bb.sdk.threads.updatePluginMetadata({threadId,signal,set:{crew:"true",crewId:taskId,shape:record.shape,nativeHome:home,launchKey:record.key,generation:record.generation,posture:record.deliveryMode!,deliveryRequirement:record.deliveryRequirement!,worktree:"true",adopted:"true"}}));
+      const task=inspected.task;
+      await read(mutateCrews(async current=>{
+        if (current.some(conflict) || await bb.storage.kv.get(`crew-retired:${threadId}`) === true || launches.isDeletedWorker(threadId)) throw new Error("Task was retired or changed during adoption cache publication.");
+        const prior=current.find(c=>c.threadId===threadId);
+        const crew:Crew={...prior,id:taskId,threadId,projectId,parentThreadId:owner,nativeHome:home,launchKey:record.key,deliveryRequirement:record.deliveryRequirement!,shape:toShape(record.shape),posture:record.deliveryMode!,task:task.slice(0,TASK_INLINE_MAX),taskSpilled:task.length>TASK_INLINE_MAX,worktree:true,metaWritten:true,createdAt:prior?.createdAt || new Date(plan.createdAt).toISOString(),providerId:prior?.providerId ?? record.execution?.providerId ?? identity.thread.providerId,model:prior?.model ?? execution.model,reasoningLevel:prior?.reasoningLevel ?? execution.reasoningLevel};
+        return [...current.filter(c=>c.threadId!==threadId),crew];
+      }));
+      signal.throwIfAborted();
+      const completed=launches.update(record.key,{state:"running",adoption:{...adoption,phase:"complete"},error:undefined});
+      if (completed.state === "deleted") throw new Error("Worker was deleted during publication; launch remains deleted.");
+      bb.log.info(`legacy launch adopted task=${taskId} thread=${threadId}; no turn started; original native admission unconfirmed`);
+      return {...summary,workerStatus:latest.thread.status,status:published.outcome,adopted:true,eligible:true};
+    });
+  }
+
   async function reconcileLaunch(record: LaunchRecord,signal=launchAbort.signal): Promise<LaunchRecord> {
+    if (record.adoption?.phase === "publishing") throw new Error(`Launch ${record.taskId} has an interrupted explicit adoption; repeat launches adopt with its exact worker identity.`);
     if (record.threadId) return record;
     if (record.state !== "creating" && record.state !== "uncertain") return record;
     const found = await discoverLaunch(bb, record, signal);
@@ -4244,6 +4308,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function launchEnvironmentReady(record:LaunchRecord,env:{hostId:string;status:string;path:string|null},signal?:AbortSignal) {
+    if (record.adoption?.phase === "publishing") return false;
     if (env.status !== "ready" || !env.path || (record.hostId && env.hostId !== record.hostId)) return false;
     if (!record.nativeInvoked) return true;
     return await readFmMetaField(env.hostId,record.taskId,"bb_thread_id",record.home,signal) === record.threadId;
@@ -8816,6 +8881,7 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb firstmate deck | session [--json]",
     '  bb firstmate dispatch --project <id> [--task t ...] [--shape ship|scout] [--mode m] [--title t] [--provider p] [--model m] [--reasoning-level low|medium|high|xhigh|max|ultra|none|ultracode] [--permission-mode m] [--shared-env] [--worktree] [--hidden] [--task-id id] [--delivery-requirement pr|merged|merged-and-verified] -- "<task>"',
     "  bb firstmate launches list [--limit n] [--offset n] [--json]   # uncertain slots require reconciliation",
+    "  bb firstmate launches adopt <task-id> --thread <thread-id> [--check] [--json]   # exact legacy registration repair; no turn or merge",
     "  bb firstmate deliveries list|inspect|register|reconcile|assign|abandon|verify [id] [--from manager] [--reason evidence] [--authorized]",
     "  sendAt is unsupported; backlog waitUntil requires later explicit dispatch.",
     "  bb firstmate crews | crew <id> | watch [id ...] [--timeout s] [--json]",
@@ -10500,6 +10566,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "bearings", summary: "Fleet digest", usage: "bb firstmate bearings [--json]" },
       { name: "wake", summary: "Drain the durable crew→captain wake queue (present, or --ack-through <seq> --recovery-generation <gen>)", usage: "bb firstmate wake [--ack-through <seq> --recovery-generation <gen>]" },
       { name: "deliveries", summary: "Durable PR follow-up", usage: "bb firstmate deliveries list|inspect|register|reconcile|assign|abandon|verify [id] [--from <manager>] [--reason <evidence>] [--authorized]" },
+      { name: "launches", summary: "Inspect reservations or explicitly adopt an existing legacy worker", usage: "bb firstmate launches list | adopt <task-id> --thread <thread-id> [--check] [--json]" },
       { name: "deliver", summary: "Outcome + committed/uncommitted diff + PR", usage: "bb firstmate deliver <crew-id>" },
       { name: "merge", summary: "Merge PR or local-only ff-only land", usage: "bb firstmate merge <crew-id> [--yes]" },
       { name:"scout-report",summary:"Read the complete owned promotion artifact",usage:"bb firstmate scout-report <id> [--json]" },
@@ -10849,6 +10916,14 @@ export default async function plugin(bb: BbPluginApi) {
             return reply({taskId:rest[0],report},report);
           }
           case "launches": {
+            if (rest[0] === "adopt") {
+              const threadId=flagStr(flags,"thread");
+              if (!ctxThread || !ctxProject || rest.length!==2 || !threadId) return fail("Usage in owning captain/project: bb firstmate launches adopt <task-id> --thread <id> [--check] [--json]");
+              if ([...flags.keys()].some(key=>!["thread","check","json"].includes(key))) return fail("Adoption cannot change launch options or authority.");
+              const result=await adoptLegacyLaunch(rest[1]!,threadId,ctxThread,ctxProject,flags.has("check"),signal);
+              return reply(result,`${result.adopted ? "Adopted" : "Eligible"} task ${result.taskId}, thread ${result.threadId}, worktree ${result.worktree}; worker ${result.workerStatus}. Original admission unconfirmed. Merge remains a separate native guarded operation.`);
+            }
+            if (rest.length>0 && (rest[0]!=="list" || rest.length>1)) return fail(usage);
             const rows = launches.list(ctxThread,Math.max(1,Number(flagStr(flags,"limit")) || 50),Math.max(0,Number(flagStr(flags,"offset")) || 0));
             return reply(rows, rows.map(r => `${r.taskId} ${r.state} ${r.threadId ?? "unknown worker"} ${r.error ?? ""}`).join("\n"));
           }

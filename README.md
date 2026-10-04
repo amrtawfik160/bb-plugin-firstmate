@@ -14,6 +14,13 @@ Project checkout and environment selection use the selected host together. Missi
 
 PR delivery lives in a SQLite register independent of worker records, wake receipts and conversation history. Discovery uses owned environment/branch identity or explicit ship registration, never arbitrary report URLs. GitHub records preserve head SHA, contract, owner, workers, blocker, next action, observation freshness and notification identity. A new head invalidates readiness; forge approval must name that head. Forge failures preserve stale last-known state. Closed unmerged PRs require explicit disposition.
 
+For an old worker whose environment became ready after native registration failed,
+the owning captain can run `bb firstmate launches adopt <task-id> --thread <id>
+--check --json`, then repeat without `--check`. This restores exact validated
+registration without starting a turn, changing work or granting merge authority.
+Missing provenance, conflicting identities and retired tasks refuse. See the
+[repair procedure and limits](docs/verification/legacy-launch-adoption.md).
+
 PR follow-up requires host `gh`, `bash` and `python3`. Structured forge reads capture stdout separately from stderr and terminal progress. Missing tools, failed commands and malformed JSON leave records stale for retry.
 
 The background follow-up schedule reads bounded batches each minute with error backoff. Unchanged waiting PRs do not start model turns. Actionable transitions and overdue actions notify the owning manager through existing wake delivery. Notification acceptance is persisted and ambiguous sends are reconciled before retry. Hidden notifications alone do not imply token savings.
