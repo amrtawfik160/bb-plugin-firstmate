@@ -7927,11 +7927,19 @@ for (const entry of ["tool", "cli"] as const) {
     await plugin(host.bb);
     const started = Date.now();
     let elapsed = 0;
+    const receipts = new Set<string>();
+    let terminalSeq=0;
     t.mock.method(Date, "now", () => started + elapsed);
     try {
-      host.harness.sdk.stub("terminals.create", async () => ({ id: "term_wake_timeout" }));
+      host.harness.sdk.stub("terminals.create", async (args:{start:{command:string}}) => {
+        if (unwrapHostCommand(args.start.command).startsWith("bash '/tmp/.fm-receipt-")) {
+          receipts.add("term_wake_timeout");return {id:"term_wake_timeout"};
+        }
+        return {id:`term_stage_${++terminalSeq}`};
+      });
       host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
-      host.harness.sdk.stub("terminals.output", async () => {
+      host.harness.sdk.stub("terminals.output", async ({terminalId}:{terminalId:string}) => {
+        if (!receipts.has(terminalId)) return hostRcPayload("",0);
         elapsed = 181_000;
         throw new Error("HTTP 504: Timed out reading terminal output");
       });
@@ -7952,7 +7960,8 @@ for (const entry of ["tool", "cli"] as const) {
       assert.match(error, /HTTP 504/);
       assert.match(error, /term_wake_timeout/);
       assert.doesNotMatch(error, /need real mode initialized/);
-      assert.equal(host.harness.sdk.callsTo("terminals.create").length, 1, "do not rerun or acknowledge a drain on timeout");
+      assert.equal(receipts.size, 1, "do not rerun or acknowledge a drain on timeout");
+      assert.equal(host.harness.sdk.callsTo("terminals.create").filter(call=>unwrapHostCommand((call[0] as {start:{command:string}}).start.command).startsWith("bash '/tmp/.fm-receipt-")).length,1);
     } finally { t.mock.restoreAll(); await host.harness.lifecycle.dispose(); }
   });
 }
@@ -7967,7 +7976,7 @@ test("wake retries an exited terminal's failed output read without rerunning the
     let n = 0;
     host.harness.sdk.stub("terminals.create", async (args: { start?: { command?: string } }) => {
       const id = `term_${++n}`;
-      if ((args.start?.command ?? "").includes("fm-wake-drain.sh")) drainTerminals.add(id);
+      if (unwrapHostCommand(args.start?.command ?? "").startsWith("bash '/tmp/.fm-receipt-")) drainTerminals.add(id);
       return { id };
     });
     host.harness.sdk.stub("terminals.get", async () => ({ status: "exited", exitCode: 0 }));
@@ -9793,7 +9802,7 @@ test("wake drain preserves open decisions even when the crew register and metada
       if (cmd.includes("FMORPHAN")) return { payload: "FMORPHAN 96b4c16c\nFMORPHAN live1234\n" };
       if (cmd.startsWith("cat -- ") && cmd.includes("96b4c16c.status")) return { payload: "blocked [at=1]: CI billing blocks PR 1805\ndone: PR merged\n" };
       if (cmd.startsWith("cat -- ") && cmd.includes("live1234.status")) return { payload: "blocked: waiting on the captain\n" };
-      if (cmd.includes("wake-receipt") || cmd.includes("fm-wake-drain")) return { payload: wakeFrame("No unread reports.") };
+      if (cmd.startsWith("bash '/tmp/.fm-receipt-") || cmd.includes("wake-receipt") || cmd.includes("fm-wake-drain")) return { payload: wakeFrame("No unread reports.") };
       return { payload: "" };
     });
     const result = await host.harness.behavior.runCli(["wake"], { projectId: "proj_1", threadId: "thr_cap" });
@@ -9851,7 +9860,7 @@ test("wake drain retires a Lavish source whose artifact is gone through the nati
     const routed = stubRoutedHost(host, (wrapped) => {
       const cmd = unwrapHostCommand(wrapped);
       if (cmd.includes("FMSTALESRC")) return { payload: "FMSTALESRC lavish-362f54fae363665b\n" };
-      if (cmd.includes("wake-receipt") || cmd.includes("fm-wake-drain")) return { payload: wakeFrame("No unread reports.") };
+      if (cmd.startsWith("bash '/tmp/.fm-receipt-") || cmd.includes("wake-receipt") || cmd.includes("fm-wake-drain")) return { payload: wakeFrame("No unread reports.") };
       return { payload: "" };
     });
     const result = await host.harness.behavior.runCli(["wake"], { projectId: "proj_1", threadId: "thr_cap" });

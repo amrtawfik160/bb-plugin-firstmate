@@ -6739,6 +6739,7 @@ export default async function plugin(bb: BbPluginApi) {
     content: string,
     timeoutMs = 15_000,
     signal?: AbortSignal,
+    propagateError = false,
   ): Promise<boolean> {
     const dir = path.replace(/\/[^/]*$/, "") || "/";
     const nonce = randomUUID();
@@ -6778,6 +6779,7 @@ export default async function plugin(bb: BbPluginApi) {
     } catch (error) {
       await cleanup();
       bb.log.warn(`host file write ${path} failed: ${error instanceof Error ? error.message : String(error)}`);
+      if (propagateError) throw error;
       return false;
     }
   }
@@ -7149,8 +7151,8 @@ export default async function plugin(bb: BbPluginApi) {
         receipt = { action: "legacy-ack", id: `${input.args[1]}:${input.args[3]}` };
       } else throw new Error("Use firstmate_wake for wake presentation/completion; unsupported native wake arguments.");
     }
-    // Compressed source stays under BB's 10KB command limit without staging a
-    // helper on every wake. Journal/report files are still written on the host.
+    // Compression reduces staged bytes; it does not bound the composed command
+    // after the environment, stale guard, scoped paths and shell quoting are added.
     const receiptRunner = receipt ? `import base64,zlib; exec(zlib.decompress(base64.b64decode("${deflateSync(Buffer.from(overlayBytes("bin/bb-wake-receipt.py"), "base64")).toString("base64")}")))` : "";
     const invocation = receipt
       ? `python3 -c ${shQuote(receiptRunner)} ${shQuote(wakeStateDir(input.fmHome, input.parentThreadId))} ${shQuote(receipt.action)} ${shQuote(receipt.id ?? "")} "$FM_BINDIR/${scriptLeaf}"`
@@ -7170,7 +7172,22 @@ export default async function plugin(bb: BbPluginApi) {
     ]
       .filter((line) => line !== "")
       .join("\n");
-    const result = await runOnHost(input.hostId, prelude, input.timeoutMs, input.signal, input.stdin);
+    const result = receipt ? await (async () => {
+      // The receipt helper is plugin-shipped, not installer-owned. Stage the whole
+      // guarded script, including helper/arguments, so only a fixed-length temp
+      // path travels in the host command. Optional stdin is separately staged by
+      // runOnHost; no receipt/native invocation starts until both writes succeed.
+      const staged = `/tmp/.fm-receipt-${randomUUID()}.sh`;
+      try {
+        if (!(await writeHostBytes(input.hostId, staged, prelude, input.timeoutMs, input.signal, true))) {
+          throw new Error("Failed to stage wake receipt command; no receipt action was executed.");
+        }
+        return await runOnHost(input.hostId, `bash ${shQuote(staged)}`, input.timeoutMs, input.signal, input.stdin);
+      } finally {
+        // Cancellation must not prevent cleanup of a fully staged command.
+        await runHostCommand(input.hostId, `rm -f ${shQuote(staged)} ${shQuote(staged)}.fm-b64-* ${shQuote(staged)}.fm-out-*`, 10_000).catch(() => {});
+      }
+    })() : await runOnHost(input.hostId, prelude, input.timeoutMs, input.signal, input.stdin);
     if (result.output.includes("FM_MIRROR_STALE")) {
       const line = result.output.split("\n").find((l) => l.includes("FM_MIRROR_STALE"))?.trim() ?? "FM_MIRROR_STALE";
       bb.log.error(`bb mirror is STALE on host ${input.hostId} running fm-${script}: ${line}. Re-run the overlay installer against ${input.fmHome}; new native scripts are unmirrored and the three patched copies are frozen behind upstream.`);
