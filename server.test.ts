@@ -146,7 +146,7 @@ test("captain metadata loads the full skill set", async () => {
   }
 });
 
-test("calm reporting survives captain resume and stays out of worker and ordinary threads", async () => {
+test("calm reporting survives captain resume, ships for cold startup, and stays out of workers", async () => {
   const host = await load();
   try {
     for (const nativeHome of [undefined, "/tmp/resumed-captain"]) {
@@ -163,8 +163,9 @@ test("calm reporting survives captain resume and stays out of worker and ordinar
       const cfg = await host.harness.behavior.resolveAgentConfiguration(
         makePluginAgentConfigurationContext({ pluginMetadata }),
       );
-      assert.ok(!cfg.skills.includes("calm"));
-      assert.ok(!cfg.skills.includes("catch-up"));
+      const isWorker = "crew" in pluginMetadata;
+      assert.equal(cfg.skills.includes("calm"), !isWorker);
+      assert.equal(cfg.skills.includes("catch-up"), !isWorker);
       assert.doesNotMatch(cfg.instructions ?? "", /Calm reporting is the captain default/);
     }
     assert.equal(host.harness.sdk.callsTo("threads.send").length, 0);
