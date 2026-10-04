@@ -220,3 +220,64 @@ inputs to reproduce verification.
    task state cannot acquire invented authority. They remain visible obligations
    requiring explicit recovery from actual native evidence. New forget paths
    preserve this linkage and refuse destructive retirement while it is needed.
+
+## Final isolated-host corrections: structured forge reads and deleted launches
+
+The parent's real PR lookup exposed PTY contamination: `gh pr view` emitted
+`Working...` before its JSON. Direct JSON parsing retained stale state forever.
+The parent separately proved clean stdout/stderr capture on the scratch host.
+No production plugin, native home or fleet changed during these corrections.
+
+| Requirement | Correction and code | Behavioral evidence |
+| --- | --- | --- |
+| D: reliable forge observations | [Host capture](../../lib/host-capture.ts) runs the command with stdout/stderr pipes and carries a strict JSON envelope across the supported terminal API. [Reconciliation and discovery](../../server.ts) parse complete stdout only on successful exit. | Actual local PTY tests reproduce the parent's progress prefix. The registered schedule discovers the branch PR, observes merge, and retains required verification. Nonzero exit with valid merged JSON and malformed stdout both remain stale; the next valid read recovers. |
+| A/B: exact deleted-worker admission | [Launch storage](../../lib/launch.ts) records terminal `deleted` attempts and exact deletion identities. The public `thread.deleted` event releases only matching reservations. Known deleted crew rows do not count toward capacity. | Internal native creation remains provisioning; unrelated deletion does not release its slot. Exact deletion admits the next task. Reload retains the original contract/history and refuses resuming the deleted attempt. A deletion preceding the spawn response retains unknown capacity until the exact identity arrives, then releases it. |
+| C/E: truthful transport/help | [Transport setting](../../server.ts) now describes refusal on real spawn failure. [README](../../README.md) lists deleted attempts and host dependencies for structured forge reads. | No fallback or new authority path was introduced. |
+
+The capture helper uses `python3`, already required by the native BB backend,
+plus host `bash` and `gh`. It does not parse a JSON-looking substring, discard
+command failures, use unsupported process APIs, or add independent polling.
+It delegates to the existing abort/deadline-aware host terminal transport;
+late terminal cleanup and disposal regressions continue to pass. Child output
+is JSON-escaped before it reaches the PTY, so stderr and embedded control text
+cannot masquerade as the transport exit marker.
+
+Deletion identities use per-record SQLite rows, including events arriving before
+an outstanding create response. A null/unknown launch identity is never released
+by absence from inventory or by an unrelated deletion. Slow provisioning writes
+cannot resurrect an already deleted attempt. Deletion events recorded before
+reload remain durable. A missed core deletion event without authoritative replay
+is not inferred from a transient get failure; such uncertain state remains held.
+
+Validation after the corrections:
+
+```bash
+node --test --experimental-strip-types lib/host-capture.test.mjs lib/launch-delivery.test.mjs server.launch-delivery.test.mjs
+
+FIRSTMATE_TEST_NATIVE=/tmp/fm-launch-pr-verified \
+FM_TEST_HOME=/tmp/fm-launch-pr-verified \
+FM_SCOUT_NATIVE_BIN=/tmp/fm-launch-pr-verified/bin-bb \
+FM_CLASSIFY_LIB=/tmp/fm-launch-pr-verified/bin/fm-classify-lib.sh \
+node --test --experimental-strip-types --test-name-pattern='merge uses|merge.*gh|orphan|retire|forget' server.test.ts
+
+FM_TEST_HOME=/tmp/fm-launch-pr-verified node scripts/launch-pr-mutation-check.mjs
+npx tsc --noEmit
+npm run fidelity -- --native /tmp/fm-launch-pr-verified
+bb plugin build .
+git diff --check
+```
+
+Results: **51** launch/delivery/capture tests passed; **48** affected native,
+merge and retirement tests passed; zero failures/skips in both runs. **17** causal
+mutation checks passed, including removal of structured capture and exact
+worker-deletion release. TypeScript, fidelity, build and whitespace checks exit
+zero. Scratch logs: `/tmp/fm-host-capture-target.log`,
+`/tmp/fm-host-capture-affected-native.log`, `/tmp/fm-host-capture-mutations.log`,
+`/tmp/fm-host-capture-fidelity.log`, `/tmp/fm-host-capture-build.log`.
+
+Parent independently verified the previous `3e9702e` full suite: **636 passed**,
+zero failures/skips. Per parent instruction, this small correction uses targeted
+validation; parent owns the new full suite and final live acceptance. Remaining
+live checks are the real read-only PR50 lookup/required verification lifecycle
+and deletion of a fresh native worker while its reservation is provisioning.
+The parent's separate acceptance document remains untracked and parent-owned.

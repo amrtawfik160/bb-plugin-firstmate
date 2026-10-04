@@ -6,6 +6,10 @@ import { createDeliveries } from './lib/pr-delivery.ts';
 import { createLaunches } from './lib/launch.ts';
 import { rpcContract } from './rpc.ts';
 import { UPSTREAM_SKILL_NAMES } from './lib/upstream-surface.ts';
+import { runPty,mergedJson } from './lib/host-capture.fixture.mjs';
+import { mkdtempSync,writeFileSync,rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 const row=(n,shape='ship')=>({id:`c${n}`,task:'fix login',projectId:'proj_1',threadId:`thr_c${n}`,parentThreadId:'thr_cap',providerId:null,model:null,reasoningLevel:null,worktree:true,shape,posture:shape==='scout'?'scout':'direct-PR',createdAt:'2026-09-18T00:00:00.000Z'});
 const ctx={threadId:'thr_cap',projectId:'proj_1'};
 function hostCommands(host,answer) {
@@ -13,7 +17,7 @@ function hostCommands(host,answer) {
  host.harness.sdk.stub('terminals.create',async args=>{const id=`term${++n}`;commands.set(id,args.start.command);return{id};});
  host.harness.sdk.stub('terminals.get',async()=>({status:'running'}));
  host.harness.sdk.stub('terminals.close',async()=>({}));
- host.harness.sdk.stub('terminals.output',async({terminalId})=>{const out=answer(commands.get(terminalId));return{nextSeq:1,chunks:[{dataBase64:Buffer.from(`${out.payload ?? ''}\n__FM_HOST_RC:${out.code ?? 0}\n`).toString('base64')}]};});
+ host.harness.sdk.stub('terminals.output',async({terminalId})=>{const command=commands.get(terminalId);const out=answer(command);const captured=command.includes('FM_HOST_CAPTURE_V1');const payload=captured?JSON.stringify({protocol:'FM_HOST_CAPTURE_V1',exitCode:out.code??0,stdout:out.payload??'',stderr:out.stderr??''}):out.payload??'';return{nextSeq:1,chunks:[{dataBase64:Buffer.from(`${payload}\n__FM_HOST_RC:${captured?0:out.code ?? 0}\n`).toString('base64')}]};});
  return commands;
 }
 async function base(settings={}) {
@@ -375,5 +379,62 @@ test('native guard failure after real bridge creation retains an unadmitted work
   const launches=createLaunches(host.bb.storage.database());assert.equal(launches.list()[0].state,'provisioning');assert.equal(launches.list()[0].threadId,'thr_created');assert.equal(host.harness.sdk.callsTo('threads.spawn').length,1);
   await host.harness.behavior.runSchedule('pr-delivery-follow-up');assert.equal(launches.list()[0].state,'provisioning');
   const other=await host.harness.behavior.runCli(['dispatch','--project','proj_1','--task-id','second','--','other work'],ctx);assert.equal(other.exitCode,1);assert.match(other.stderr,/cap reached/);assert.equal(host.harness.sdk.callsTo('threads.stop').length,0);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('registered PR schedule parses real PTY forge reads for discovery and merge verification; command failures stay stale',async()=>{
+ const host=await base();const dir=mkdtempSync(join(tmpdir(),'fm-forge-pty-'));
+ try {
+  writeFileSync(join(dir,'gh'),`#!/usr/bin/env python3
+import os,sys
+if sys.stdout.isatty(): print("Working...")
+print("forge stderr diagnostic",file=sys.stderr)
+if sys.argv[2] == "list": print('[{"url":"https://github.com/acme/pty/pull/50"}]')
+else: print(open(os.path.join(os.path.dirname(__file__),"observation")).read())
+sys.exit(int(open(os.path.join(os.path.dirname(__file__),"exit")).read()))
+`,{mode:0o700});
+  writeFileSync(join(dir,'observation'),mergedJson);writeFileSync(join(dir,'exit'),'0');
+  await host.bb.storage.kv.set('crews',[{...row(1),deliveryRequirement:'merged-and-verified'}]);
+  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle',environmentId:'env_wt'}));
+  host.harness.sdk.stub('environments.pullRequest',async()=>({outcome:'unavailable'}));
+  host.harness.sdk.stub('environments.get',async()=>({id:'env_wt',hostId:'host_1',status:'ready',path:dir,branchName:'owned-task'}));
+  host.harness.sdk.stub('threads.send',async()=>({delivery:'queued'}));host.harness.sdk.stub('threads.queuedMessages.list',async()=>[]);
+  let n=0;const commands=new Map(),outputs=new Map();
+  host.harness.sdk.stub('terminals.create',async args=>{const id=`pty${++n}`;commands.set(id,args.start.command);outputs.set(id,runPty(args.start.command.replaceAll('gh pr ',`${dir}/gh pr `).replace(/; sleep 86400$/, '')));return{id};});
+  host.harness.sdk.stub('terminals.get',async()=>({status:'exited'}));host.harness.sdk.stub('terminals.close',async()=>({}));
+  host.harness.sdk.stub('terminals.output',async({terminalId})=>({nextSeq:1,chunks:[{dataBase64:Buffer.from(outputs.get(terminalId)).toString('base64')}]}));
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  const store=createDeliveries(host.bb.storage.database());let record=store.get('acme/pty#50');
+  assert.ok(record,'PTY lookup must discover the owned PR');
+  assert.equal(record.freshness,'fresh');assert.equal(record.status,'merged-needs-verification');assert.equal(record.headSha,JSON.parse(mergedJson).headRefOid);
+  assert.ok([...commands.values()].some(cmd=>cmd.includes('gh pr list')));assert.ok([...commands.values()].filter(cmd=>cmd.includes('gh pr view')).length>=2);
+  // Valid merged JSON cannot hide a failed forge command. Keep the last observed
+  // contract/state and expose stderr. The next successful read remains retryable.
+  writeFileSync(join(dir,'exit'),'7');record.nextCheckAt=0;store.save(record);
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');record=store.get(record.id);
+  assert.equal(record.freshness,'stale');assert.equal(record.status,'merged-needs-verification');assert.match(record.error,/forge stderr diagnostic/);
+  writeFileSync(join(dir,'exit'),'0');writeFileSync(join(dir,'observation'),'Working...\n'+mergedJson);record.nextCheckAt=0;store.save(record);
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');assert.equal(store.get(record.id).freshness,'stale');
+  writeFileSync(join(dir,'observation'),mergedJson);record=store.get(record.id);record.nextCheckAt=0;store.save(record);
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');assert.equal(store.get(record.id).freshness,'fresh');
+ }finally{await host.harness.lifecycle.dispose();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('native creation provisioning releases capacity only on exact core deletion and retains contract across reload',async()=>{
+ let host=await base({fmHome:'/native',maxActiveCrews:1});try {
+  hostCommands(host,()=>({code:0}));host.harness.sdk.stub('files.read',async()=>({content:'native brief',contentEncoding:'utf8',sizeBytes:12}));
+  let n=0;host.harness.sdk.stub('threads.spawn',async()=>({id:`thr_native_${++n}`}));
+  const argv=task=>['create-worker','--task',task,'--shape','ship','--project','proj_1','--home','/native','--host','host_1','--path','/repo','--prompt-file','/tmp/brief','--parent','thr_cap','--native-pid','999','--delivery-requirement','merged-and-verified'];
+  const first=await host.harness.behavior.runCli(argv('deleted-worker'),ctx);assert.equal(first.exitCode,0,first.stderr);
+  let launches=createLaunches(host.bb.storage.database());const original=launches.list()[0];assert.equal(original.state,'provisioning');
+  await host.harness.behavior.emitThreadEvent('thread.deleted',{thread:makeThreadResponse({id:'thr_unrelated',projectId:'proj_1'})});
+  const refused=await host.harness.behavior.runCli(argv('next-worker'),ctx);assert.equal(refused.exitCode,1);assert.match(refused.stderr,/cap reached/);assert.equal(n,1);
+  await host.harness.behavior.emitThreadEvent('thread.deleted',{thread:makeThreadResponse({id:original.threadId,projectId:'proj_1'})});
+  assert.equal(launches.get(original.key).state,'deleted');assert.equal(launches.get(original.key).deliveryRequirement,'merged-and-verified');assert.equal(launches.get(original.key).threadId,original.threadId);
+  launches.update(original.key,{state:'running'});assert.equal(launches.get(original.key).state,'deleted','slow provisioning cannot undo deletion');
+  host=await host.harness.lifecycle.reload(plugin);commonStubs(host);hostCommands(host,()=>({code:0}));host.harness.sdk.stub('files.read',async()=>({content:'native brief',contentEncoding:'utf8',sizeBytes:12}));host.harness.sdk.stub('threads.spawn',async()=>({id:`thr_native_${++n}`}));
+  const retry=await host.harness.behavior.runCli(argv('deleted-worker'),ctx);assert.equal(retry.exitCode,1);assert.match(retry.stderr,/deleted by BB core/);assert.equal(n,1);
+  const next=await host.harness.behavior.runCli(argv('next-worker'),ctx);assert.equal(next.exitCode,0,next.stderr);assert.equal(n,2);
+  launches=createLaunches(host.bb.storage.database());assert.equal(launches.get(original.key).state,'deleted');
  }finally{await host.harness.lifecycle.dispose();}
 });

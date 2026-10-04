@@ -4842,7 +4842,9 @@ function stubRoutedHost(
     // Only successful commands mutate the virtual FS (a forced-failure decode never
     // renames over the target — mirrors the atomic write's truncate-safety).
     if (code === 0) simulateHostWrite(unwrapHostCommand(cmd), vfs, writes);
-    return hostRcPayload(r.payload ?? (cmd.includes("fm-bearings-snapshot.sh") ? nativeBearingsFixture() : ""), code);
+    const payload=r.payload ?? (cmd.includes("fm-bearings-snapshot.sh") ? nativeBearingsFixture() : "");
+    if (cmd.includes("FM_HOST_CAPTURE_V1")) return hostRcPayload(JSON.stringify({protocol:"FM_HOST_CAPTURE_V1",exitCode:code,stdout:payload,stderr:""}),0);
+    return hostRcPayload(payload, code);
   });
   return { seen, writes, vfs };
 }

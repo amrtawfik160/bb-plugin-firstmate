@@ -7,6 +7,8 @@ import { spawnSync } from 'node:child_process';
 const root=resolve('.');
 const scratch=mkdtempSync(join(tmpdir(),'fm-launch-pr-mutations-'));
 const cases=[
+  {name:'Structured forge stdout',file:'server.ts',from:'runOnHost(hostId,captureHostCommand(command),timeoutMs,signal)',to:'runOnHost(hostId,command,timeoutMs,signal)',test:'server.launch-delivery.test.mjs',pattern:'registered PR schedule parses real PTY'},
+  {name:'Exact deleted worker reservation release',file:'server.ts',from:'launches.workerDeleted(thread.id);',to:'',test:'server.launch-delivery.test.mjs',pattern:'native creation provisioning releases capacity'},
   {name:'Atomic launch admission',file:'lib/launch.ts',from:'active.size >= cap',to:'false',test:'server.launch-delivery.test.mjs',pattern:'dispatch admission fixes actual concurrent cap probe'},
   {name:'Creation role metadata',file:'server.ts',from:'pluginMetadata: { launchKey:key,generation:1,nativeHome:',to:'pluginMetadata: { launchKey:key,generation:1,crew:"false",nativeHome:',test:'server.launch-delivery.test.mjs',pattern:'native bridge seeds role/home/generation'},
   {name:'Host and checkout selection',file:'lib/execution-selection.ts',from:"(!preferredHost || e.hostId===preferredHost)",to:'true',test:'lib/launch-delivery.test.mjs',pattern:'coherent checkout selection refuses'},

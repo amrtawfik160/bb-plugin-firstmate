@@ -1,6 +1,6 @@
 import type { BbPluginApi } from '@get-bb/plugin-sdk';
 
-export type LaunchState = 'reserved' | 'creating' | 'provisioning' | 'running' | 'failed' | 'uncertain';
+export type LaunchState = 'reserved' | 'creating' | 'provisioning' | 'running' | 'failed' | 'uncertain' | 'deleted';
 export interface LaunchRecord {
   key: string; taskId: string; projectId: string; owner: string; home: string;
   generation: number; shape: string; state: LaunchState; threadId: string | null;
@@ -16,7 +16,9 @@ export const launchKey = (project: string, owner: string, home: string, task: st
  * bounded inventory is never proof that a timed-out create did not succeed. */
 export function createLaunches(db: Database) {
   db.exec(`CREATE TABLE IF NOT EXISTS launches (key TEXT PRIMARY KEY, owner TEXT NOT NULL, project TEXT NOT NULL, state TEXT NOT NULL, record TEXT NOT NULL);
-    CREATE INDEX IF NOT EXISTS launches_owner ON launches(owner, state)`);
+    CREATE INDEX IF NOT EXISTS launches_owner ON launches(owner, state);
+    CREATE INDEX IF NOT EXISTS launches_thread ON launches(json_extract(record,'$.threadId'));
+    CREATE TABLE IF NOT EXISTS launch_deleted_workers (thread TEXT PRIMARY KEY)`);
   let tail: Promise<unknown> = Promise.resolve();
   const inFlight = new Map<string, Promise<unknown>>();
   function get(key: string): LaunchRecord | undefined {
@@ -31,7 +33,25 @@ export function createLaunches(db: Database) {
   function update(key: string, patch: Partial<LaunchRecord>) {
     const current = get(key);
     if (!current) throw new Error('Launch reservation missing');
+    // Authoritative deletion is terminal for this attempt. A concurrent slow
+    // provisioning read or late spawn response cannot restore its held slot.
+    if (current.state === 'deleted') return current;
+    if (patch.threadId && db.prepare('SELECT 1 FROM launch_deleted_workers WHERE thread=?').get(patch.threadId)) {
+      patch={...patch,state:'deleted',error:'Worker was deleted by BB core; this attempt cannot be resumed'};
+    }
     return save({ ...current, ...patch, key, updatedAt: Date.now() });
+  }
+  function workerDeleted(threadId:string) {
+    return db.transaction(()=>{
+      // Keep the exact identity if deletion arrives before the spawn response.
+      // An unknown creation still holds capacity until that response reconciles.
+      db.prepare('INSERT OR IGNORE INTO launch_deleted_workers VALUES (?)').run(threadId);
+      return db.prepare(`UPDATE launches SET state='deleted',record=json_set(record,'$.state','deleted','$.error','Worker was deleted by BB core; this attempt cannot be resumed','$.updatedAt',?) WHERE json_extract(record,'$.threadId')=? AND state!='deleted'`)
+        .run(Date.now(),threadId).changes;
+    })();
+  }
+  function isDeletedWorker(threadId:string):boolean {
+    return !!db.prepare('SELECT 1 FROM launch_deleted_workers WHERE thread=?').get(threadId);
   }
   function list(owner?: string, limit = 100, offset = 0): LaunchRecord[] {
     const rows = owner === undefined
@@ -79,6 +99,7 @@ export function createLaunches(db: Database) {
     return once(key, async () => {
       const record = get(key);
       if (!record) throw new Error('Launch reservation missing');
+      if (record.state === 'deleted') throw new Error(`Worker for launch ${record.taskId} was deleted by BB core. This attempt cannot be resumed.`);
       if (record.threadId) return record;
       if (record.state === 'creating' || record.state === 'uncertain') throw new Error(`Launch ${record.taskId} has an uncertain creation outcome. Reconcile it before a new attempt.`);
       signal?.throwIfAborted();
@@ -114,14 +135,16 @@ export function createLaunches(db: Database) {
         // Core has no cancel/hold API for creation, so never stop that worker.
 
         // Write the identity even when disposal/cancellation happened during spawn.
-        return update(key, { state: 'provisioning', threadId: thread.id });
+        const resolved=update(key, { state: 'provisioning', threadId: thread.id });
+        if (resolved.state === 'deleted') throw new Error(`Worker for launch ${resolved.taskId} was deleted by BB core. This attempt cannot be resumed.`);
+        return resolved;
       } catch (error) {
         update(key, { state: 'uncertain', error: String(error) });
         throw error;
       }
     });
   }
-  return { get, save, update, list, heldTaskIds, forTask,reassignWorker,reserve, once, create };
+  return { get, save, update, list, heldTaskIds, forTask,reassignWorker,workerDeleted,isDeletedWorker,reserve, once, create };
 }
 
 async function recoveryRead<T>(operation:Promise<T>,signal?:AbortSignal):Promise<T> {

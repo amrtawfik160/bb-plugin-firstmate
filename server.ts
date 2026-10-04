@@ -56,6 +56,7 @@ import { createSnapshotReads } from "./lib/snapshot-reads.ts";
 import { scoutReports } from "./lib/scout-report.ts";
 import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRecord } from "./lib/launch.ts";
 import { createDeliveries, canonicalPr, deliveryLine, parseForge, type DeliveryRecord } from "./lib/pr-delivery.ts";
+import { captureHostCommand, decodeHostCapture } from "./lib/host-capture.ts";
 import { selectExecution, validateLaunchCapabilities } from "./lib/execution-selection.ts";
 import { rpcContract } from "./rpc.ts";
 import {
@@ -1589,7 +1590,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
     transport: {
       type: "select",
-      label: "Crew dispatch transport: native BB spawn, or the real fm-brief.sh + fm-spawn.sh scripts (backend=bb). Falls back to native if real spawn fails before a thread exists.",
+      label: "Crew dispatch transport: native BB spawn, or the real fm-brief.sh + fm-spawn.sh scripts (backend=bb). Real spawn failure refuses dispatch; no fallback worker is started.",
       options: ["native", "real"],
       default: "native",
     },
@@ -4203,7 +4204,7 @@ export default async function plugin(bb: BbPluginApi) {
   async function launchCapacity(owner: string | undefined) {
     const raw = (await settings.get()).maxActiveCrews;
     const cap = Number.isFinite(raw) ? Math.max(0, Math.trunc(raw)) : DEFAULT_MAX_ACTIVE_CREWS;
-    const mine = (await readCrews()).filter(c => c.parentThreadId === (owner ?? null) && !isSecondmateRoute(c));
+    const mine = (await readCrews()).filter(c => c.parentThreadId === (owner ?? null) && !isSecondmateRoute(c) && !launches.isDeletedWorker(c.threadId));
     const statuses = await statusesFor(mine);
     const activeTaskIds: string[] = [];
     for (const c of mine) {
@@ -4252,6 +4253,7 @@ export default async function plugin(bb: BbPluginApi) {
       const record = await launches.reserve({ key, taskId, projectId: input.projectId, owner: input.parentThreadId ?? "",
         home, generation: 1, shape: input.shape, deliveryMode:input.mode, deliveryRequirement:input.deliveryRequirement ?? "merged", state: "reserved", threadId: null, updatedAt: Date.now() }, () => launchCapacity(input.parentThreadId));
       const resolved = await reconcileLaunch(record);
+      if (resolved.state === "deleted") throw new Error(`Worker for launch ${taskId} was deleted by BB core. This attempt cannot be resumed.`);
       if (input.deliveryRequirement && input.deliveryRequirement !== recoveredContract({},resolved)) throw new Error("Retry cannot change the original delivery contract.");
       input={...input,deliveryRequirement:recoveredContract({},resolved)};
       if (resolved.threadId && ((await settings.get()).transport !== "real" || resolved.state === "running")) {
@@ -4285,7 +4287,7 @@ export default async function plugin(bb: BbPluginApi) {
       } catch (error) {
         const latest = launches.get(key)!;
         if (latest.state === "reserved" && !latest.nativeInvoked) launches.update(key, { state: "failed", error: String(error) });
-        else if (latest.state !== "failed") launches.update(key, { state: latest.threadId ? "provisioning" : "uncertain", error: String(error) });
+        else if (latest.state !== "failed" && latest.state !== "deleted") launches.update(key, { state: latest.threadId ? "provisioning" : "uncertain", error: String(error) });
         throw new Error(`Launch ${taskId} (${launches.get(key)?.state ?? "uncertain"}): ${String(error)}. Reuse taskId=${taskId} for reconciliation; do not create a fresh retry identity.`);
       }
     });
@@ -5575,8 +5577,8 @@ export default async function plugin(bb: BbPluginApi) {
       }
       if (owner.archivedAt != null || owner.projectId !== record.projectId) { deliveries.ownerLost(record.owner); return; }
       const hostId = await resolveHostForProject(record.projectId,record.owner,signal);
-      const result = await runOnHost(hostId, `gh pr view ${shQuote(record.url)} --json state,isDraft,headRefOid,statusCheckRollup,reviewDecision,reviews,mergeable,mergeCommit`,30_000,signal);
-      if (result.exitCode !== 0) throw new Error(result.output || `Forge lookup exit ${result.exitCode}`);
+      const result = await runStructuredOnHost(hostId, `gh pr view ${shQuote(record.url)} --json state,isDraft,headRefOid,statusCheckRollup,reviewDecision,reviews,mergeable,mergeCommit`,30_000,signal);
+      if (result.exitCode !== 0) throw new Error(result.stderr || result.output || `Forge lookup exit ${result.exitCode}`);
       const observation = parseForge(JSON.parse(result.output));
       // Standing yolo allows asking the manager to continue; only native merge
       // can establish task-level authority and required checks at execution.
@@ -5665,7 +5667,7 @@ export default async function plugin(bb: BbPluginApi) {
             }
           }
         } catch(error) { if (signal?.aborted) throw error; bb.log.warn(`Provisioning remains unresolved ${record.taskId}: ${String(error)}`); }
-        if (recovered.shape !== "ship" || recovered.deliveryMode === "local-only" || !recovered.threadId || !recovered.owner || retained.some(c=>c.threadId === recovered.threadId)) return;
+        if (recovered.state === "deleted" || recovered.shape !== "ship" || recovered.deliveryMode === "local-only" || !recovered.threadId || !recovered.owner || retained.some(c=>c.threadId === recovered.threadId)) return;
         try {
           const metadata=await raceAbort(bb.sdk.threads.getPluginMetadata({threadId:recovered.threadId}),signal,STUCK_HOST_CALL_MS);
           if (metadata.launchKey !== recovered.key || metadata.nativeHome !== recovered.home || metadata.crewId !== recovered.taskId) return;
@@ -5759,8 +5761,9 @@ export default async function plugin(bb: BbPluginApi) {
   // answer (the caller then relies on native/BB reads, never on a guess).
   async function ghPrView(hostId: string, url: string,signal?:AbortSignal): Promise<{ state: string; mergeable: string } | null> {
     try {
-      const res = await runOnHost(hostId, `gh pr view ${shQuote(url)} --json state,mergeable 2>/dev/null || true`, 30_000,signal);
-      const parsed = asRecord(JSON.parse(res.output.trim() || "null"));
+      const res = await runStructuredOnHost(hostId, `gh pr view ${shQuote(url)} --json state,mergeable`, 30_000,signal);
+      if (res.exitCode !== 0) throw new Error(res.stderr || res.output || `Forge lookup exit ${res.exitCode}`);
+      const parsed = asRecord(JSON.parse(res.output));
       const state = parsed["state"];
       if (typeof state !== "string") return null;
       const mergeable = parsed["mergeable"];
@@ -5794,9 +5797,10 @@ export default async function plugin(bb: BbPluginApi) {
       const branch = typeof e["branchName"] === "string" ? e["branchName"] : "";
       const path = typeof e["path"] === "string" ? e["path"] : "";
       if (branch !== "" && path !== "") {
-        const res = await runOnHost(hostId,
-          `cd ${shQuote(path)} && gh pr list --head ${shQuote(branch)} --state all --json url --limit 1 2>/dev/null || true`, 30_000,signal);
-        const rows: unknown = JSON.parse(res.output.trim() || "[]");
+        const res = await runStructuredOnHost(hostId,
+          `cd ${shQuote(path)} && gh pr list --head ${shQuote(branch)} --state all --json url --limit 1`, 30_000,signal);
+        if (res.exitCode !== 0) throw new Error(res.stderr || res.output || `Forge lookup exit ${res.exitCode}`);
+        const rows: unknown = JSON.parse(res.output);
         const url = Array.isArray(rows) ? asRecord(rows[0])["url"] : undefined;
         if (typeof url === "string" && url !== "") candidates.push({ url, source: `gh (branch ${branch})` });
       }
@@ -6615,6 +6619,12 @@ export default async function plugin(bb: BbPluginApi) {
       creationLost=true;
       await closeOnce();
     }
+  }
+
+  async function runStructuredOnHost(hostId:string,command:string,timeoutMs:number,signal?:AbortSignal) {
+    const result=await runOnHost(hostId,captureHostCommand(command),timeoutMs,signal);
+    if (result.exitCode !== 0) throw new Error(result.output || `Host capture exit ${result.exitCode}`);
+    return decodeHostCapture(result.output);
   }
 
   // Run a command on the host, optionally feeding it `stdin`. Stdin is NOT sent
@@ -11346,7 +11356,7 @@ export default async function plugin(bb: BbPluginApi) {
     try {await followUpWork;} finally {followUpWork=undefined;}
   });
   bb.events.on("thread.archived", ({ thread }) => { deliveries.ownerLost(thread.id); });
-  bb.events.on("thread.deleted", ({ thread }) => { deliveries.ownerLost(thread.id); });
+  bb.events.on("thread.deleted", ({ thread }) => { launches.workerDeleted(thread.id); deliveries.ownerLost(thread.id); });
 
   bb.background.service("crew-watch", {
     async start(signal) {
