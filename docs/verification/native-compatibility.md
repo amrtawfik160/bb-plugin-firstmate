@@ -1,6 +1,6 @@
 # Exact old/new native compatibility and FIFO inbox correction
 
-The existing installer now supports both audited native sources, without changing the native pin or introducing an updater. Production activation is pending parent review/integration. This implementation agent made no production changes and launched no models.
+The existing installer now supports both audited native sources, without changing the native pin or introducing an updater. Parent review, integration and activation are complete; see [parent acceptance](parent-prompt-acceptance.md). This implementation agent made no production changes and launched no models.
 
 Correction baseline: `56295c14f26381ed817e74a6cb6d8374b1fea162`. Parent independently verified the preceding prompt correction with 654 passing tests, eight mutation checks, real ship/scout acceptance (25 checks), and initial/replacement acceptance (eight checks).
 
@@ -61,4 +61,4 @@ All selected tests have zero failures and zero skips. All five compatibility/FIF
 
 Logs: `/tmp/fm-compat-target.log`, `/tmp/fm-compat-server.log`, `/tmp/fm-compat-remote.log`, `/tmp/fm-compat-native-lifecycle.log`, `/tmp/fm-compat-migration.log`, `/tmp/fm-compat-mutations.log`, `/tmp/fm-compat-drift-old.log`, `/tmp/fm-compat-drift-new.log`, `/tmp/fm-compat-adaptation-audit.log`, `/tmp/fm-compat-tsc.log`, `/tmp/fm-compat-fidelity.log`, `/tmp/fm-compat-build.log`.
 
-Parent reported independent real old-source ship/scout acceptance passing 25 checks out of 25. Parent’s final integration suite passed 662 tests, with zero failures and zero skips (`/tmp/fm-compat-parent-full-final.log`). Tested source hashes match `/tmp/fm-compat-candidate-hashes.json`; independent compatibility review was clear. Parent owns production activation, which remains pending. The full suite was not unnecessarily repeated by this agent after affected checks passed. Existing workers retain their supplied prompt. Future source SHAs require audit before registration.
+Parent reported independent real old-source ship/scout acceptance passing 25 checks out of 25. Parent’s final integration suite passed 662 tests, with zero failures and zero skips (`/tmp/fm-compat-parent-full-final.log`). Tested source hashes match `/tmp/fm-compat-candidate-hashes.json`; independent compatibility review was clear. Parent completed production activation; see [parent acceptance](parent-prompt-acceptance.md). The full suite was not unnecessarily repeated by this agent after affected checks passed. Existing workers retain their supplied prompt. Future source SHAs require audit before registration.

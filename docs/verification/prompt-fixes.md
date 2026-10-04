@@ -1,6 +1,6 @@
 # BB worker prompt and exact-message acknowledgement corrections
 
-The prompt and helper corrections are implemented in the isolated plugin checkout. The follow-up compatibility correction now supports exact full-installer refresh on both audited native versions. Production activation remains parent-owned and pending. No production plugin, native home, fleet, worker, or model was changed during this work.
+The prompt and helper corrections are implemented in the isolated plugin checkout. The follow-up compatibility correction now supports exact full-installer refresh on both audited native versions. Parent activation is complete; see [parent acceptance](parent-prompt-acceptance.md). No production plugin, native home, fleet, worker, or model was changed during this work.
 
 Review baseline: `33d5cb0e6ed2e8abcb45bf36d911e830abeb6b16`. This correction builds on the completed launch/PR work, rather than replacing it. Parent-owned [acceptance evidence](parent-launch-pr-acceptance.md) remains unchanged. The prompt findings originate in `/tmp/firstmate-prompt-review.JUSIMU/review.md` and its actual-helper `probe.py` reproduction.
 
@@ -71,4 +71,4 @@ The prior old-home failure recorded in `/tmp/fm-prompt-old-installer.log` is his
 
 1. Parent reviews the separate compatibility/FIFO commit and retains final integration and production activation ownership. Parent reported independent real old-version ship/scout acceptance passing 25 checks out of 25. No production changes were made by this implementation agent.
 2. Existing `refreshMirror` paths continue to use the full installer. They can refresh either supported source without upgrading native or partially copying helpers. Existing running workers retain their prior supplied prompts.
-3. Parent’s final compatibility integration passed 662 tests with zero failures/skips (`/tmp/fm-compat-parent-full-final.log`); tested source hashes match `/tmp/fm-compat-candidate-hashes.json`. Production activation remains pending. Unknown future native source versions require explicit audit and an exact registry entry; matching patch context alone grants no support.
+3. Parent’s final compatibility integration passed 662 tests with zero failures/skips (`/tmp/fm-compat-parent-full-final.log`); tested source hashes match `/tmp/fm-compat-candidate-hashes.json`. Parent activation is complete; see [parent acceptance](parent-prompt-acceptance.md). Unknown future native source versions require explicit audit and an exact registry entry; matching patch context alone grants no support.
