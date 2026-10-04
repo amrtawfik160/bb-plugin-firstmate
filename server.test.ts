@@ -8416,13 +8416,118 @@ test("wake ack pair parses from both the native and the rewritten form", () => {
 });
 
 test("captain compaction is due only past the budget and outside the cooldown", () => {
-  const base = { budget: 200_000, now: 10_000_000, cooldownMs: 1_200_000 };
-  assert.equal(captainCompactDue({ ...base, usedTokens: 510_000, lastCompactAt: null }), true);
+  const base = { budget: 200_000, modelContextWindow: 1_000_000, estimated: false, now: 10_000_000, cooldownMs: 1_200_000 };
+  assert.equal(captainCompactDue({ ...base, usedTokens: 910_000, lastCompactAt: null }), true);
   assert.equal(captainCompactDue({ ...base, usedTokens: 150_000, lastCompactAt: null }), false);
-  assert.equal(captainCompactDue({ ...base, usedTokens: 510_000, lastCompactAt: base.now - 60_000 }), false);
-  assert.equal(captainCompactDue({ ...base, usedTokens: 510_000, lastCompactAt: base.now - 1_300_000 }), true);
+  assert.equal(captainCompactDue({ ...base, usedTokens: 910_000, lastCompactAt: base.now - 60_000 }), false);
+  assert.equal(captainCompactDue({ ...base, usedTokens: 910_000, lastCompactAt: base.now - 1_300_000 }), true);
   assert.equal(captainCompactDue({ ...base, budget: 0, usedTokens: 900_000, lastCompactAt: null }), false, "0 turns it off");
   assert.equal(captainCompactDue({ ...base, usedTokens: null, lastCompactAt: null }), false);
+  for (const overrides of [
+    { usedTokens: 899_999 }, { usedTokens: 1_000_001 }, { usedTokens: NaN },
+    { usedTokens: Infinity }, { modelContextWindow: null }, { modelContextWindow: 0 },
+    { modelContextWindow: NaN }, { estimated: true }, { budget: Infinity },
+  ]) {
+    assert.equal(captainCompactDue({ ...base, usedTokens: 900_000, lastCompactAt: null, ...overrides }), false, JSON.stringify(overrides));
+  }
+  assert.equal(captainCompactDue({ ...base, usedTokens: 900_000, lastCompactAt: null }), true);
+});
+
+async function compactionHost() {
+  const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { captainCompactAtTokens: 200000 } });
+  await host.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
+  await plugin(host.bb);
+  return { host, idle: stubCompactionHost(host) };
+}
+
+function stubCompactionHost(host: Awaited<ReturnType<typeof load>>) {
+  host.harness.sdk.stub("threads.list", async () => []);
+  host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_cap", status: "idle" }));
+  host.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 910000, modelContextWindow: 1000000, estimated: false } }));
+  host.harness.sdk.stub("threads.compact", async () => ({ ok: true }));
+  return () => host.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_cap", status: "idle" }), lastAssistantText: "" } as never);
+}
+
+for (const [name, usage] of Object.entries({
+  estimated: { usedTokens: 910000, modelContextWindow: 1000000, estimated: true },
+  "over-window provider total": { usedTokens: 2103251, modelContextWindow: 256000, estimated: false },
+  "missing capacity": { usedTokens: 910000, estimated: false },
+  "provider-managed compaction": { usedTokens: 910000, modelContextWindow: 1000000, estimated: false, snapshot: { autoCompactAtTokens: 950000 } },
+})) {
+  test(`automatic compaction ignores ${name}`, async () => {
+    const { host, idle } = await compactionHost();
+    try {
+      host.harness.sdk.stub("threads.context", async () => ({ usage }));
+      await idle();
+      assert.equal(host.harness.sdk.callsTo("threads.compact").length, 0);
+      assert.equal(await host.bb.storage.kv.get("captain-compacted-at:thr_cap"), undefined);
+    } finally { await host.harness.lifecycle.dispose(); }
+  });
+}
+
+test("automatic compaction requires new evidence after cooldown and reload", async () => {
+  let { host, idle } = await compactionHost();
+  try {
+    await idle();
+    assert.equal(host.harness.sdk.callsTo("threads.compact").length, 1);
+    await host.bb.storage.kv.set("captain-compacted-at:thr_cap", Date.now() - 1_300_000);
+    host = await host.harness.lifecycle.reload(plugin);
+    idle = stubCompactionHost(host);
+    assert.equal(await host.bb.storage.kv.get("captain-project:thr_cap"), "proj_1");
+    await idle();
+    assert.equal(host.harness.sdk.callsTo("threads.compact").length, 0, "unchanged evidence survives reload and cooldown");
+    host.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 300000, modelContextWindow: 1000000, estimated: false } }));
+    await idle();
+    assert.equal(await host.bb.storage.kv.get("thread-compaction-evidence:thr_cap"), undefined, "lower usage clears the old measurement");
+    host.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 910000, modelContextWindow: 1000000, estimated: false } }));
+    await idle();
+    assert.equal(host.harness.sdk.callsTo("threads.compact").length, 1, "context that shrank and filled again is eligible");
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("automatic compaction coalesces simultaneous idle events", async () => {
+  const { host, idle } = await compactionHost();
+  let release!: () => void;
+  let entered!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  try {
+    host.harness.sdk.stub("threads.context", async () => {
+      entered(); await blocked;
+      return { usage: { usedTokens: 910000, modelContextWindow: 1000000, estimated: false } };
+    });
+    const first = idle();
+    await awaitWithin(started, 1000, "first check did not read context");
+    const second = idle();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    release();
+    await Promise.all([first, second]);
+    assert.equal(host.harness.sdk.callsTo("threads.context").length, 1);
+    assert.equal(host.harness.sdk.callsTo("threads.compact").length, 1);
+  } finally { release(); await host.harness.lifecycle.dispose(); }
+});
+
+test("automatic compaction rechecks current thread status after reading usage", async () => {
+  const { host, idle } = await compactionHost();
+  try {
+    for (const thread of [
+      makeThreadResponse({ id: "thr_cap", status: "active" }),
+      makeThreadResponse({ id: "thr_cap", status: "idle", archivedAt: Date.now() }),
+    ]) {
+      host.harness.sdk.stub("threads.get", async () => thread);
+      await idle();
+    }
+    assert.equal(host.harness.sdk.callsTo("threads.compact").length, 0);
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("automatic compaction preserves a captain with ample context remaining", async () => {
+  const { host, idle } = await compactionHost();
+  try {
+    host.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 510_862, estimated: false, modelContextWindow: 1_000_000 } }));
+    await idle();
+    assert.equal(host.harness.sdk.callsTo("threads.compact").length, 0, "a half-empty context does not need compaction");
+  } finally { await host.harness.lifecycle.dispose(); }
 });
 
 test("an idle captain past its context budget is compacted once; a crew compacts on its own stamp", async () => {
@@ -8431,7 +8536,8 @@ test("an idle captain past its context budget is compacted once; a crew compacts
   await plugin(fresh.bb);
   try {
     fresh.harness.sdk.stub("threads.list", async () => []);
-    fresh.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 510_862, estimated: false, modelContextWindow: 1_000_000 } }));
+    fresh.harness.sdk.stub("threads.get", async ({ threadId }) => makeThreadResponse({ id: threadId, status: "idle" }));
+    fresh.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 910_862, estimated: false, modelContextWindow: 1_000_000 } }));
     fresh.harness.sdk.stub("threads.compact", async () => ({ ok: true }));
     const idle = (id: string) => fresh.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id, status: "idle" }), lastAssistantText: "" } as never);
     await idle("thr_cap");
@@ -8539,7 +8645,7 @@ for (const operation of ["context", "compact"] as const) {
       host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_cap", status: "idle" }));
       host.harness.sdk.stub("threads.context", async () => {
         if (operation === "context") { entered(); await blocked; }
-        return { usage: { usedTokens: 510000 } };
+        return { usage: { usedTokens: 910000, estimated: false, modelContextWindow: 1000000 } };
       });
       host.harness.sdk.stub("threads.compact", async () => {
         if (operation === "compact") { entered(); await blocked; }
@@ -8871,7 +8977,7 @@ test("an already-idle captain past the budget is compacted by the sweep, without
   await plugin(fresh.bb);
   try {
     fresh.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_cap", status: "idle" }));
-    fresh.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 358_171, estimated: false, modelContextWindow: 1_000_000 } }));
+    fresh.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 958_171, estimated: false, modelContextWindow: 1_000_000 } }));
     fresh.harness.sdk.stub("threads.compact", async () => ({ ok: true }));
     const run = fresh.harness.behavior.runService("captain-wake-release");
     const deadline = Date.now() + 3000;

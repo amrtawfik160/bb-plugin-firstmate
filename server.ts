@@ -1025,17 +1025,20 @@ export function wakeAckFromOutput(out: string): { ackThrough: number; recoveryGe
   return m ? { ackThrough: Number(m[1]), recoveryGeneration: m[2]! } : null;
 }
 
-// A long-lived captain's context only grows, and every wake re-reads all of it, so
-// a 500k-token captain paid ~500k tokens per model call just to absorb a doorbell.
-// Compact an idle captain once it passes the budget, at most once per cooldown.
+// The token budget is a floor, not evidence of pressure on a larger model.
 export function captainCompactDue(input: {
   usedTokens: number | null;
+  modelContextWindow: number | null;
+  estimated: boolean;
   budget: number;
   lastCompactAt: number | null;
   now: number;
   cooldownMs: number;
 }): boolean {
-  if (!(input.budget > 0) || input.usedTokens === null || input.usedTokens < input.budget) return false;
+  if (!Number.isFinite(input.budget) || !(input.budget > 0) || input.estimated !== false) return false;
+  const { usedTokens, modelContextWindow } = input;
+  if (usedTokens === null || modelContextWindow === null || !Number.isFinite(usedTokens) || !Number.isFinite(modelContextWindow)) return false;
+  if (modelContextWindow <= 0 || usedTokens > modelContextWindow || usedTokens < Math.max(input.budget, modelContextWindow * 0.9)) return false;
   return input.lastCompactAt === null || input.now - input.lastCompactAt >= input.cooldownMs;
 }
 
@@ -1659,7 +1662,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
     captainCompactAtTokens: {
       type: "number",
-      label: "Compact an idle captain or crew thread once its context passes this many tokens (at most every 20 minutes per thread). 0 = off.",
+      label: "Minimum measured tokens for automatic compaction. Also requires 90% context usage, an idle thread, and no provider-managed compaction threshold. Unchanged readings are not retried; minimum interval is 20 minutes. 0 = off.",
       default: 200000,
     },
     defaultProvider: {
@@ -9760,21 +9763,43 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   const CAPTAIN_COMPACT_COOLDOWN_MS = 20 * 60_000;
+  const compactionChecks = new Set<string>();
   async function maybeCompactThread(threadId: string, stampKey: string, signal?: AbortSignal): Promise<void> {
+    if (compactionChecks.has(threadId)) return;
+    compactionChecks.add(threadId);
+    try { await checkThreadCompaction(threadId, stampKey, signal); }
+    finally { compactionChecks.delete(threadId); }
+  }
+
+  async function checkThreadCompaction(threadId: string, stampKey: string, signal?: AbortSignal): Promise<void> {
     const budget = Number((await settings.get()).captainCompactAtTokens);
     if (!(budget > 0)) return;
     const key = stampKey;
     const last = await bb.storage.kv.get<unknown>(key);
-    let usedTokens: number | null = null;
+    let usage: Awaited<ReturnType<typeof bb.sdk.threads.context>>["usage"];
     try {
-      usedTokens = (await raceAbort(bb.sdk.threads.context({ threadId }), signal, STUCK_HOST_CALL_MS)).usage?.usedTokens ?? null;
+      usage = (await raceAbort(bb.sdk.threads.context({ threadId }), signal, STUCK_HOST_CALL_MS)).usage;
     } catch (error) {
       if (isAbortError(error)) throw error;
       return;
     }
+    if (!usage) return;
+    const { usedTokens, modelContextWindow, estimated } = usage;
+    const nativeThreshold = usage.snapshot?.autoCompactAtTokens;
+    if (typeof nativeThreshold === "number" && Number.isFinite(nativeThreshold) && nativeThreshold > 0) return;
+    const evidenceKey = `thread-compaction-evidence:${threadId}`;
+    if (estimated === false && Number.isFinite(usedTokens) && usedTokens >= 0 && Number.isFinite(modelContextWindow) && modelContextWindow > 0 && usedTokens < modelContextWindow * 0.9) {
+      await bb.storage.kv.delete(evidenceKey);
+    }
     const now = Date.now();
-    if (!captainCompactDue({ usedTokens, budget, lastCompactAt: typeof last === "number" ? last : null, now, cooldownMs: CAPTAIN_COMPACT_COOLDOWN_MS })) return;
-    // Stamp first: a provider that cannot compact must not be retried on every idle.
+    if (!captainCompactDue({ usedTokens, modelContextWindow, estimated, budget, lastCompactAt: typeof last === "number" ? last : null, now, cooldownMs: CAPTAIN_COMPACT_COOLDOWN_MS })) return;
+    const evidence = JSON.stringify([usedTokens, modelContextWindow, usage.snapshot?.providerSessionId ?? null, usage.snapshot?.capturedAt ?? null]);
+    if (await bb.storage.kv.get(evidenceKey) === evidence) return;
+    const thread = await raceAbort(bb.sdk.threads.get({ threadId }), signal, STUCK_HOST_CALL_MS);
+    if (thread.status !== "idle" || thread.archivedAt != null) return;
+    // Persist the attempted reading before calling the provider so a reload or
+    // unchanged failed attempt cannot compact the same context again.
+    await bb.storage.kv.set(evidenceKey, evidence);
     await bb.storage.kv.set(key, now);
     try {
       await raceAbort(bb.sdk.threads.compact({ threadId }), signal, STUCK_HOST_CALL_MS);

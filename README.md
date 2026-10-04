@@ -152,6 +152,21 @@ Notification failures retain the record and retry; failed writes do not fall bac
 to a second message transport. `queue=true` defers the notification and disables
 native re-rings for that record; ordinary tells retain native recovery behavior.
 
+## Automatic compaction
+
+Firstmate compacts idle captain and crew threads only when measured usage reaches
+90% of the model's context window and the `captainCompactAtTokens` minimum.
+Estimated usage, unknown capacity, and totals larger than the context window do
+not trigger it. When the provider reports its own automatic compaction threshold,
+Firstmate leaves compaction to that provider.
+
+The minimum interval remains 20 minutes per thread. An unchanged reading cannot
+trigger another attempt after that interval or a plugin reload; usage that falls
+below 90% clears that reading so future growth can qualify again. Concurrent
+checks share one attempt, and thread status is checked again before compaction.
+Set `captainCompactAtTokens` to `0` to disable Firstmate's automatic compaction.
+Manual compaction and the provider's own compaction remain available.
+
 ## Development
 
 ```sh
