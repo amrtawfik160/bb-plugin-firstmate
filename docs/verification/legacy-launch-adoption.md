@@ -55,9 +55,17 @@ Authoritative SDK evidence must prove the exact parent/project, ready active man
 isolated environment on the original host, exclusive thread binding, and original
 project source. The first `client/turn/requested` event must be a thread start and
 contain the native task region verbatim plus exact status/inbox paths. The native
-brief must name the original project, mode, status and branch/report namespace.
-The source and worktree origin repository identities must agree. The source ship
-branch must exist; the current branch can differ and is never changed.
+brief must name the original checkout or the exact legacy scaffold project token
+`crew`, with the same Setup scaffold appearing once in the immutable first prompt.
+`crew` is not repository evidence. The original reservation checkout must still be
+an SDK project source on the original host; its origin and the worktree origin
+must agree. Any other scaffold project name refuses, even if repeated in the
+first prompt. Mode, status and branch/report namespace must still agree.
+The source ship branch must exist and is preserved as native metadata `branch=`.
+The current Git branch can differ and is never changed; it is observed separately
+as `bb_adopt_observed_branch=`. Retrying refuses a conflicting native `branch=`.
+The helper result's `branch` and `head` describe current Git observations, not a change
+to the original native delivery contract or ownership of every referenced PR.
 The initial event's resolved model, reasoning and permission settings remain
 evidence, not a request to change the worker. Known original execution selections
 must agree. Missing legacy model fields are populated in repaired native metadata
@@ -157,3 +165,44 @@ supplied task remain pending parent review/acceptance.
 | Immutable contract, creation history and retry-safe publication | `lib/launch.ts` transaction/journal/per-record task storage; four factory publication faults, actual reload, premature-readiness mutant. |
 | Crew read-through and separate outstanding PR obligations | `server.ts` CLI/cache/full-task read-through; actual `firstmate_crew`, two PR records unchanged, no forge call. |
 | Installer/remote refresh/stale helper detection without native upgrade | `OVERLAY_INSTALL_INPUTS`, installer owned payloads and shared prompt fixture; selected installer/mirror/remote/replacement tests. |
+
+## Parent review corrections: legacy project token and immutable branch
+
+The old adapter used the exact `crew` Setup token for the supplied task. The
+earlier checkout-only guard would refuse that valid legacy evidence. Both audited
+native versions now accept this token only with matching immutable prompt Setup
+and the original SDK project-source/host and Git origin checks described above.
+The refusal matrix runs with this legacy token and still rejects mismatched
+project source, arbitrary matching prompt/source project names, and a differing
+initial Setup. The actual plugin factory tests publish registration, read
+`firstmate_crew`, preserve two independent PR obligations and repeat after reload.
+
+Native metadata `branch=` now preserves `Ship branch:` from the source brief.
+The original implementation incorrectly wrote the current Git branch there.
+Both-pin regressions give the successor branch a distinct commit, publish the
+original branch contract, then run the real native `fm-review-diff.sh --stat`.
+Review resolves the original branch; HEAD, refs, dirty files, status and brief
+remain unchanged. Fetch in this test is redirected to a disposable local source.
+No remote forge is accessed. A retry with conflicting `branch=` refuses.
+
+Bounded correction validation:
+
+```sh
+FIRSTMATE_TEST_NATIVE=/tmp/fm-launch-pr-verified FM_SCOUT_NATIVE_BIN=/tmp/fm-launch-pr-verified/bin-bb node --test --experimental-strip-types scripts/launch-adoption.test.mjs
+FIRSTMATE_TEST_NATIVE=/tmp/fm-launch-pr-verified FM_SCOUT_NATIVE_BIN=/tmp/fm-launch-pr-verified/bin-bb node --test --experimental-strip-types --test-name-pattern='real native adoption|native immutable branch' scripts/launch-adoption.test.mjs
+FIRSTMATE_TEST_NATIVE=/tmp/fm-launch-pr-verified FM_SCOUT_NATIVE_BIN=/tmp/fm-launch-pr-verified/bin-bb node scripts/launch-adoption-mutations.mjs 'source project' 'legacy generic token' 'immutable setup correspondence' 'immutable native branch' 'existing branch collision'
+npx tsc --noEmit
+npm run fidelity
+bb plugin build .
+git diff --check
+```
+
+The adoption suite passed 24 tests with zero failures/skips
+(`/tmp/fm-adoption-correction-tests.log`). Final ship/scout mode and native review
+checks passed 10 selected tests with zero failures/skips
+(`/tmp/fm-adoption-correction-branch-final.log`). All five selected mutants were killed
+(`/tmp/fm-adoption-correction-mutations.log`). Typecheck, fidelity and build passed
+(`/tmp/fm-adoption-correction-{tsc,fidelity,build}.log`). Diff check passed.
+SDK pin remains unchanged.
+Parent owns final full-suite and real-host acceptance. These corrections do not
+change the procedure or its existing limits; production repair remains pending.

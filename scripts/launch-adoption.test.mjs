@@ -12,14 +12,14 @@ import {pins,fixture,scaffold,run,ok,overlay} from './prompt-fixture.mjs';
 
 const ctx={threadId:'thr_captain',projectId:'proj_repair'};
 const target='thr_legacy';
-function setup(pin=pins[1],shape='ship',mode='direct-PR') {
+function setup(pin=pins[1],shape='ship',mode='direct-PR',projectToken) {
  const home=fixture(pin);ok(run('python3',[join(overlay,'install-bb-backend.py'),'--home',home]));
  const root=mkdtempSync(join(tmpdir(),'fm-adopt-repo-')),repo=join(root,'repo'),wt=join(root,'wt');mkdirSync(repo);
- ok(run('git',['-C',repo,'init','--quiet']));ok(run('git',['-C',repo,'config','user.email','test@example.com']));ok(run('git',['-C',repo,'config','user.name','Fixture']));
+ ok(run('git',['-C',repo,'init','--quiet','--initial-branch=main']));ok(run('git',['-C',repo,'config','user.email','test@example.com']));ok(run('git',['-C',repo,'config','user.name','Fixture']));
  writeFileSync(join(repo,'file'),'original\n');ok(run('git',['-C',repo,'add','file']));ok(run('git',['-C',repo,'commit','--quiet','-m','fixture']));ok(run('git',['-C',repo,'remote','add','origin','https://github.com/acme/repo.git']));
  ok(run('git',['-C',repo,'worktree','add','--quiet','-b','fm/deadbeef',wt]));
  ok(run('git',['-C',wt,'checkout','--quiet','-b','fm/deadbeef-disclosures']));writeFileSync(join(wt,'dirty'),'keep existing dirty work\n');
- const source=scaffold(home,'deadbeef',shape,mode);writeFileSync(source.source,source.text.replace('worktree of /example/project,','worktree of '+repo+','));
+ const source=scaffold(home,'deadbeef',shape,mode);writeFileSync(source.source,source.text.replace('worktree of /example/project,','worktree of '+(projectToken??repo)+','));
  const brief=readFileSync(source.source,'utf8');
  const status='2026-10-04T00:00:00Z done: PRs https://github.com/acme/repo/pull/43 and https://github.com/acme/repo/pull/47\n';writeFileSync(join(home,'state/deadbeef.status'),status);
  writeFileSync(join(home,'config/bb-captain'),ctx.threadId+'\n');
@@ -38,16 +38,32 @@ for(const pin of pins) for(const [shape,mode] of [['ship','direct-PR'],['ship','
    const before=invariant(f);const inspected=JSON.parse(ok(f.native('--check')));assert.equal(inspected.existing,false);assert.equal(existsSync(join(f.home,'state/deadbeef.meta')),false);
    const adopted=JSON.parse(ok(f.native('--publish')));assert.equal(adopted.existing,true);assert.equal(adopted.proof,inspected.proof);
    const meta=readFileSync(join(f.home,'state/deadbeef.meta'),'utf8');assert.match(meta,/bb_original_admission=unconfirmed/);assert.match(meta,/bb_delivery_requirement=merged-and-verified/);assert.match(meta,/bb_thread_id=thr_legacy/);
+   if(shape==='ship') {assert.match(meta,/^branch=fm\/deadbeef$/m);assert.match(meta,/^bb_adopt_observed_branch=fm\/deadbeef-disclosures$/m);}
    const preflight=run('bash',['-c','. "$FM_BINDIR/fm-backend.sh"; fm_backend_validate_task_endpoint "$FM_HOME/state/deadbeef.meta" deadbeef; printf "%s" "$FM_BACKEND_VALIDATED_TARGET"'],{FM_HOME:f.home,FM_BINDIR:join(f.home,'bin-bb')});assert.equal(ok(preflight),`bb:${target}`);
    ok(f.native('--publish'));assert.equal(readFileSync(join(f.home,'state/deadbeef.meta'),'utf8'),meta);assert.deepEqual(invariant(f),before);
   }finally{f.clean();}
  });
 }
+for(const pin of pins) test(`native immutable branch ${pin.slice(0,8)}: adoption and real review keep source branch despite successor HEAD`,()=>{
+ const f=setup(pin,'ship','local-only','crew');try {
+  writeFileSync(join(f.wt,'file'),'successor-only content\n');ok(run('git',['-C',f.wt,'add','file']));ok(run('git',['-C',f.wt,'commit','--quiet','-m','successor work']));
+  const base=ok(run('git',['-C',f.repo,'rev-parse','main'])).trim();ok(run('git',['-C',f.repo,'update-ref','refs/remotes/origin/main',base]));
+  const before=invariant(f);ok(f.native('--publish'));
+  const metaPath=join(f.home,'state/deadbeef.meta'),meta=readFileSync(metaPath,'utf8');assert.match(meta,/^branch=fm\/deadbeef$/m);assert.match(meta,/^bb_adopt_observed_branch=fm\/deadbeef-disclosures$/m);
+  // Native review really resolves its recorded branch. Keep the HTTPS origin
+  // identity, but direct this test's fetch to the disposable local source only.
+  const review=run('bash',[join(f.home,'bin-bb/fm-review-diff.sh'),'deadbeef','--stat'],{FM_HOME:f.home,FM_ROOT_OVERRIDE:f.home,GIT_CONFIG_COUNT:'1',GIT_CONFIG_KEY_0:`url.${f.repo}.insteadOf`,GIT_CONFIG_VALUE_0:'https://github.com/acme/repo.git'});
+  assert.match(ok(review),/no changes vs origin\/main/);assert.deepEqual(invariant(f),before);
+  writeFileSync(metaPath,meta.replace('branch=fm/deadbeef\n','branch=fm/deadbeef-disclosures\n'));
+  const retry=f.native('--publish');assert.notEqual(retry.status,0);assert.match(retry.stderr,/metadata collision: branch/);assert.deepEqual(invariant(f),before);
+ }finally{f.clean();}
+});
 test('native repair refuses changed source, task, repo, primary checkout, metadata collision and retired namespace before registration',()=>{
  const changes=[
   ['source mode',f=>{const p=join(f.home,'data/deadbeef/brief.md');writeFileSync(p,f.brief.replace('Delivery contract: mode=direct-PR','Delivery contract: mode=local-only'));},/delivery contract/],
   ['wrong prompt',f=>{f.plan.prompt=f.plan.prompt.replace('Smooth canvas zoom','Different user task');},/prompt/],
   ['wrong source project',f=>{writeFileSync(join(f.home,'data/deadbeef/brief.md'),f.brief.replace('worktree of '+f.repo+',','worktree of /wrong/project,'));},/project provenance/],
+  ['different initial setup',f=>{f.plan.prompt=f.plan.prompt.replace('worktree of '+f.repo+',','worktree of crew,');},/prompt setup/],
   ['wrong home',f=>{f.plan.record={...f.record,home:f.root};},/namespace|native|ENOENT/],
   ['primary',f=>{f.plan.worktree=f.repo;},/isolation/],
   ['wrong repo',f=>{ok(run('git',['-C',f.repo,'remote','set-url','origin','https://github.com/acme/different.git']));const isolated=join(f.root,'other');ok(run('git',['clone','--quiet',f.repo,isolated]));ok(run('git',['-C',isolated,'branch','fm/deadbeef']));ok(run('git',['-C',isolated,'remote','set-url','origin','https://github.com/acme/repo.git']));f.plan.worktree=isolated;},/origin/],
@@ -86,8 +102,8 @@ async function factory(f,reuse) {
  return {host,metadata,environment,thread};
 }
 function noWorkerMutations(host) {for(const method of ['threads.spawn','threads.send','threads.retry','threads.stop','threads.update','threads.delete','threads.archive']) assert.equal(host.harness.sdk.callsTo(method).length,0,method);}
-test('actual factory legacy repair restores crew visibility, keeps multiple PR obligations and immutable contract after reload',async()=>{
- const f=setup(pins[0]);let {host,metadata}=await factory(f);try {
+for(const [pin,projectToken] of [[pins[0],undefined],[pins[0],'crew'],[pins[1],'crew']]) test(`actual factory legacy repair ${pin.slice(0,8)} ${projectToken??'exact path'} restores crew visibility, keeps multiple PR obligations and immutable contract after reload`,async()=>{
+ const f=setup(pin,'ship','direct-PR',projectToken);let {host,metadata}=await factory(f);try {
   const deliveries=createDeliveries(host.bb.storage.database());for(const number of [43,47]) deliveries.register({url:`https://github.com/acme/repo/pull/${number}`,taskId:f.record.taskId,projectId:ctx.projectId,owner:ctx.threadId,home:f.home,worker:target,requirement:f.record.deliveryRequirement});
   const records=[deliveries.get('acme/repo#43'),deliveries.get('acme/repo#47')];const before=invariant(f);
   const args=['launches','adopt','deadbeef','--thread',target,'--json'];
@@ -115,12 +131,15 @@ test('factory refuses wrong owner/project/host/environment/provenance/metadata/r
   ['metadata',async(_f,x)=>{x.metadata.set(target,{crewId:'different'});}],
   ['provenance',async(_f,x)=>{x.host.harness.sdk.stub('threads.events.list',async()=>[]);}],
   ['model',async(f)=>{f.plan.execution={...f.plan.execution,model:'different-model'};}],
+  ['original project source',async(f,x)=>{x.host.harness.sdk.stub('projects.get',async()=>({id:ctx.projectId,sources:[{hostId:'host_fixture',path:f.root}]}));}],
+  ['generic token prompt mismatch',async(f)=>{f.plan.prompt=f.plan.prompt.replace('worktree of crew,','worktree of '+f.repo+',');}],
+  ['arbitrary project token',async(f)=>{const changed=f.brief.replace('worktree of crew,','worktree of unrelated,');writeFileSync(join(f.home,'data/deadbeef/brief.md'),changed);f.plan.prompt=f.plan.prompt.replace(f.brief,changed);}],
   ['rival',async(_f,x)=>{x.host.harness.sdk.stub('threads.list',async args=>args.environmentId?[x.thread]:[x.thread,makeThreadResponse({id:'thr_rival',projectId:ctx.projectId,parentThreadId:ctx.threadId})]);x.metadata.set('thr_rival',{crewId:'deadbeef'});}],
   ['retired',async(_f,x)=>{await x.host.bb.storage.kv.set(`crew-retired:${target}`,true);}],
   ['contract',async(f,x)=>{createLaunches(x.host.bb.storage.database()).update(f.record.key,{deliveryRequirement:undefined});}],
   ['deleted',async(f,x)=>{createLaunches(x.host.bb.storage.database()).workerDeleted(target);}],
  ];
- for(const [name,mutate] of changes) {const f=setup();const x=await factory(f);try{const context=await mutate(f,x)??ctx;const result=await x.host.harness.behavior.runCli(['launches','adopt','deadbeef','--thread',target],context);assert.equal(result.exitCode,1,name);assert.equal(existsSync(join(f.home,'state/deadbeef.meta')),false,name);assert.equal(x.host.harness.sdk.callsTo('threads.updatePluginMetadata').length,0,name);noWorkerMutations(x.host);}finally{await x.host.harness.lifecycle.dispose();f.clean();}}
+ for(const [name,mutate] of changes) {const f=setup(pins[0],'ship','direct-PR','crew');const x=await factory(f);try{const context=await mutate(f,x)??ctx;const result=await x.host.harness.behavior.runCli(['launches','adopt','deadbeef','--thread',target],context);assert.equal(result.exitCode,1,name);assert.equal(existsSync(join(f.home,'state/deadbeef.meta')),false,name);assert.equal(x.host.harness.sdk.callsTo('threads.updatePluginMetadata').length,0,name);noWorkerMutations(x.host);}finally{await x.host.harness.lifecycle.dispose();f.clean();}}
 });
 for(const boundary of ['reservation','bb-metadata','crew-cache','completion']) test(`actual factory interrupted ${boundary} publication recovers durable exact adoption after reload`,async()=>{
  const f=setup();let {host,metadata}=await factory(f);try {

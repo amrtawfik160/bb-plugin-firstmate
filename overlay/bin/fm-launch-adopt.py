@@ -78,7 +78,14 @@ def inspect(plan):
     prompt = plan['prompt']
     require(prompt.count(task_body) == 1 and f'{home}/state/{task}.status' in prompt and f'{home}/state/{task}.inbox' in prompt, 'initial prompt does not correspond to native task/home evidence')
     require(f'{home}/state/{task}.status' in brief, 'source status identity conflicts')
-    require(f'\n# Setup\nYou are in a disposable git worktree of {r["path"]}, at a detached HEAD on a clean default branch.\n' in brief, 'source project provenance differs from original checkout')
+    setup = re.findall(r'\n# Setup\nYou are in a disposable git worktree of (.+), at a detached HEAD on a clean default branch.\n', brief)
+    # The legacy adapter rendered the literal project token "crew". It is not
+    # repository evidence: the plugin must still prove the original SDK source,
+    # and below we compare the actual origins. Require this exact scaffold in the
+    # immutable initial prompt too; no other project alias is accepted.
+    require(len(setup) == 1 and setup[0] in (r['path'], 'crew'), 'source project provenance differs from original checkout')
+    setup_anchor = f'\n# Setup\nYou are in a disposable git worktree of {setup[0]}, at a detached HEAD on a clean default branch.\n'
+    require(prompt.count(setup_anchor) == 1, 'initial prompt setup differs from native source provenance')
     mode = re.findall(r'^Delivery contract: mode=(\S+)', brief, re.M)
     require(r['shape'] in ('ship','scout'), 'only ordinary workers may be adopted')
     if r['shape'] == 'ship':
@@ -102,7 +109,7 @@ def inspect(plan):
                   spawn_gen=str(r['generation']), tasktmp='/tmp/fm-'+task, model=execution['model'], effort=execution['reasoningLevel'],
                   bb_adopt_key=digest(r['key']), bb_adopt_proof=proof, bb_admission='explicit-repair', bb_original_admission='unconfirmed', bb_created_at=str(plan['createdAt']), bb_delivery_requirement=r['deliveryRequirement'])
     if r['shape'] == 'ship':
-        fields.update(mode=r['deliveryMode'], yolo='off', branch=current_branch)
+        fields.update(mode=r['deliveryMode'], yolo='off', branch=branch[0], bb_adopt_observed_branch=current_branch)
     meta = home/'state'/f'{task}.meta'
     existing = meta.exists() or meta.is_symlink()
     if existing:
@@ -112,7 +119,7 @@ def inspect(plan):
             require(sep and name not in values, 'native metadata is malformed or ambiguous')
             values[name] = value
         for key,value in fields.items():
-            if key != 'branch':
+            if key != 'bb_adopt_observed_branch':
                 require(values.get(key) == value, 'native metadata collision: '+key)
     # Reject an endpoint already registered under any other native task.
     entries = list((home/'state').glob('*.meta'))
