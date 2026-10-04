@@ -310,37 +310,24 @@ fm_backend_bb_crew_bindir() {
   fi
 }
 
-# Rewrite the native brief's script paths (fm-brief.sh is a symlinked native
-# entry, so it renders $FM_ROOT/bin/... and relative bin/fm-*.sh) to the
-# BB-capable dir. No-op when the mirror is absent.
-fm_backend_bb_crew_brief_paths() {  # <bindir> <text>
-  local bindir=$1 text=$2 root
-  case "$bindir" in */bin-bb) ;; *) printf '%s' "$text"; return 0 ;; esac
-  for root in "${FM_HOME:-}" "${FM_ROOT:-}"; do
-    [ -n "$root" ] || continue
-    text=${text//"$root/bin/"/"$bindir/"}
-  done
-  text=${text//" bin/fm-"/" $bindir/fm-"}
-  text=${text//"\`bin/fm-"/"\`$bindir/fm-"}
-  text=${text//"(bin/fm-"/"($bindir/fm-"}
-  text=${text//$'\n'"bin/fm-"/$'\n'"$bindir/fm-"}
-  printf '%s' "$text"
-}
-
-# One transport-only wrapper, shared by initial launches and replacement retries.
-fm_backend_bb_worker_prompt() {  # <brief-path> <kind> <task-id>
-  local brief=$1 kind=$2 id=$3 prompt fm_bin transport
+# One marked rendering boundary for initial launches and replacement retries.
+# Native helpers revalidate source content and generate current worker identity;
+# task words are never included in scaffold substitutions.
+fm_backend_bb_worker_prompt() {  # <brief-path> <kind> <task-id> [delivery-mode]
+  local brief=$1 kind=$2 id=$3 mode=${4:-} fm_bin role
   [ -f "$brief" ] && [ -r "$brief" ] && [ ! -L "$brief" ] || {
     echo "error: native brief is missing or unreadable: $brief" >&2; return 1;
   }
-  prompt=$(cat -- "$brief") || return 1
   fm_bin=$(fm_backend_bb_crew_bindir)
-  prompt=$(fm_backend_bb_crew_brief_paths "$fm_bin" "$prompt")
-  transport=$(cat -- "$fm_bin/backends/bb-worker-transport.txt") || return 1
-  transport=${transport//\{FM_HOME\}/${FM_HOME:-}}
-  transport=${transport//\{FM_BINDIR\}/$fm_bin}
-  transport=${transport//\{TASK_ID\}/$id}
-  printf '%s\n\n%s\n' "$transport" "$prompt"
+  . "$fm_bin/fm-dod-lib.sh" || return 1
+  if fm_brief_task_placeholders_present "$brief" || ! fm_brief_task_content_valid "$brief"; then
+    echo "error: native worker task content is incomplete; preserve the prior thread" >&2; return 1;
+  fi
+  if fm_brief_intent_address_line "$brief" >/dev/null; then
+    echo "error: native worker intent has an operator-address line" >&2; return 1;
+  fi
+  role=$(fm_brief_worker_role "${FM_HOME:?}/state" "$id") || return 1
+  python3 "$fm_bin/backends/bb-worker-prompt.py" "$brief" "$kind" "$id" "$FM_HOME" "$fm_bin" "$role" "$mode"
 }
 
 fm_backend_bb_create_task() {  # <window-name> <project-path> <task-id> <kind> <brief-path>

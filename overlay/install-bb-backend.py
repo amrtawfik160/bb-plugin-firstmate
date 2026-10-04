@@ -205,13 +205,23 @@ def generate_patched_copies(home: Path, overlay: Path, dest_dir: Path) -> dict[s
 OVERLAY_INSTALL_INPUTS = (
     "bin/backends/bb.sh",
     "bin/backends/bb-worker-transport.txt",
+    "bin/backends/bb-worker-prompt.py",
     "bin/fm-inbox-take.sh",
+    "bin/fm-inbox-take.py",
     "docs/bb-backend.md",
     "firstmate-bb-backend.patch",
     "firstmate-bb-teardown.patch",
     "firstmate-bb-local-merge.patch",
     "firstmate-bb-browser.patch",
     "install-bb-backend.py",
+)
+
+
+# Owned transport payloads must be real current copies, not merely covered by
+# a claimed bundle fingerprint. Native siblings remain symlinks by design.
+TRANSPORT_PAYLOADS = (
+    "backends/bb.sh", "backends/bb-worker-transport.txt",
+    "backends/bb-worker-prompt.py", "fm-inbox-take.sh", "fm-inbox-take.py",
 )
 
 
@@ -259,14 +269,15 @@ def build_mirror(home: Path, overlay: Path) -> Path:
             os.symlink(os.path.join("..", "bin", entry), staging / entry)
 
         source_shas = generate_patched_copies(home, overlay, staging)
-        helper = overlay / "bin" / "fm-inbox-take.sh"
-        if not helper.is_file():
-            die(f"missing {helper}")
-        dest_helper = staging / "fm-inbox-take.sh"
-        if dest_helper.exists() or dest_helper.is_symlink():
-            dest_helper.unlink()
-        shutil.copy2(helper, dest_helper)
-        os.chmod(dest_helper, 0o755)
+        for helper_name in ("fm-inbox-take.sh", "fm-inbox-take.py"):
+            helper = overlay / "bin" / helper_name
+            if not helper.is_file():
+                die(f"missing {helper}")
+            dest_helper = staging / helper_name
+            if dest_helper.exists() or dest_helper.is_symlink():
+                dest_helper.unlink()
+            shutil.copy2(helper, dest_helper)
+            os.chmod(dest_helper, 0o755)
         write_manifest(home, staging, native_entries, source_shas, overlay_fingerprint(overlay))
     except BaseException:
         # Includes die_loud()/die()'s SystemExit: discard the half-built staging and
@@ -310,6 +321,8 @@ def write_manifest(home: Path, mirror: Path, native_entries: list[str], source_s
     ]
     for f in PATCHED_FILES:
         lines.append(f"src={f}:{source_shas.get(f, '')}")
+    for relative in TRANSPORT_PAYLOADS:
+        lines.append(f"payload={relative}:{hashlib.sha256((mirror / relative).read_bytes()).hexdigest()}")
     (mirror / MANIFEST_NAME).write_text("\n".join(lines) + "\n")
 
 
@@ -322,9 +335,9 @@ def read_manifest(mirror: Path) -> dict[str, str] | None:
         if line.startswith("#") or "=" not in line:
             continue
         key, _, val = line.partition("=")
-        if key == "src":
+        if key in ("src", "payload"):
             name, _, sha = val.partition(":")
-            data[f"src:{name}"] = sha
+            data[f"{key}:{name}"] = sha
         else:
             data[key] = val
     return data
@@ -342,6 +355,15 @@ def verify_mirror(home: Path, overlay: Path | None = None) -> list[str]:
     manifest = read_manifest(mirror)
     if manifest is None:
         return ["mirror manifest is missing (built by an older overlay); re-run the installer"]
+    for relative in TRANSPORT_PAYLOADS:
+        target = mirror / relative
+        want = manifest.get(f"payload:{relative}", "")
+        if target.is_symlink() or not target.is_file():
+            reasons.append(f"owned BB transport payload missing or symlinked: {relative}")
+        elif not want or hashlib.sha256(target.read_bytes()).hexdigest() != want:
+            reasons.append(f"owned BB transport payload stale/unrecorded: {relative}")
+        elif overlay is not None and target.read_bytes() != (overlay / "bin" / relative).read_bytes():
+            reasons.append(f"owned BB transport payload differs from current overlay: {relative}")
     # Missing siblings: any native bin entry without a mirror counterpart breaks a
     # SCRIPT_DIR source in whatever mirror script needs it.
     bin_dir = home / "bin"
@@ -388,6 +410,7 @@ def _mirror_backends(native_backends: Path, dest: Path, overlay: Path) -> None:
         die(f"missing adapter {adapter}")
     shutil.copy2(adapter, dest / "bb.sh")
     shutil.copy2(overlay / "bin" / "backends" / "bb-worker-transport.txt", dest / "bb-worker-transport.txt")
+    shutil.copy2(overlay / "bin" / "backends" / "bb-worker-prompt.py", dest / "bb-worker-prompt.py")
     os.chmod(dest / "bb.sh", 0o755)
     print(f"installed {dest / 'bb.sh'}")
 

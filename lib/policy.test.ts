@@ -206,7 +206,7 @@ test("crew prompt asserts isolation and forbids nested dispatch", () => {
   assert.match(text, /Captain's intent/);
   // Tight CI polling exhausted the shared GitHub token; the crew prompt forbids it.
   assert.match(text, /systemd-run --unit=/);
-  assert.match(text, /data\/<task-id>\//);
+  assert.match(text, /absolute task-owned artifact directory/);
   assert.match(text, /When gh-axi returns RATE_LIMITED, use gh api REST/);
   assert.match(text, /fm-inbox-take\.sh/);
   assert.match(text, /Never poll CI in a loop/);

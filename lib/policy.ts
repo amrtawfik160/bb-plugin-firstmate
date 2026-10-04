@@ -516,12 +516,12 @@ export const BB_BACKGROUND_JOB_CONTRACT = "Long background work must survive thi
 
 // BB-DIVERGE: BB deletes a crew worktree tmp/ when the workspace is archived.
 // Native task artifacts live under data/<task>/.
-export const BB_ARTIFACT_CONTRACT = "Keep durable artifacts under the firstmate home data/<task-id>/, not this worktree tmp/. The worktree tmp/ is removed when the workspace is archived.";
+export const BB_ARTIFACT_CONTRACT = "Use the absolute task-owned artifact directory supplied by firstmate for durable artifacts. If no path was supplied, ask firstmate before writing outside the assigned workspace. The worktree tmp/ is removed when the workspace is archived.";
 
 // BB-DIVERGE: native fm_task_inbox_doorbell_line tells the worker to list, read,
 // and mv state/<id>.inbox/*.msg by hand. There is no worker drain helper
 // (fm-inbox.sh drain is the captain note inbox). fm-inbox-take.sh is those steps.
-export const BB_INBOX_TAKE_CONTRACT = "A steering wake that begins with Firstmate instruction waiting is the native inbox doorbell. Run FM_HOME=<home> <home>/bin-bb/fm-inbox-take.sh <task-id>. That script lists state/<task-id>.inbox/*.msg in numeric order and prints each body. After you act, run it again with --ack so it moves each file to handled/. Do not hand-roll those steps.";
+export const BB_INBOX_TAKE_CONTRACT = "A steering wake that begins with Firstmate instruction waiting is the native inbox doorbell. Run FM_HOME=<home> <home>/bin-bb/fm-inbox-take.sh <task-id>. That script lists state/<task-id>.inbox/*.msg in numeric order and prints each body. After you act, acknowledge only the displayed immutable message IDs you handled using the printed command, for example --ack 001.msg 002.msg. Bare --ack refuses; new arrivals stay pending. Do not hand-roll those steps.";
 
 // Crews ran `gh-axi run watch` (3s interval) and `pr checks` loops thousands of
 // times and exhausted the GitHub token every crew and captain shares.

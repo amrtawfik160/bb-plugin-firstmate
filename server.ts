@@ -490,17 +490,23 @@ function fmBinDirAssign(fmHome: string): string {
 // callers no longer swallow that. Wired into BOTH the dispatch paths (runFmScript,
 // fm-brief scaffold) and the SUPERVISION paths (the watch keeper's per-re-arm check and
 // checkWatcher's per-poll check), so a stale watcher-arm is loud too. Runs only when
-// FM_BINDIR is the mirror. Cheap (~6ms: sed + git rev-parse). Must be emitted AFTER
+// FM_BINDIR is the mirror. Checks HEAD and hashes the small owned transport bundle. Must be emitted AFTER
 // fmBinDirAssign.
 function fmMirrorStaleGuard(fmHome: string): string {
   const q = shQuote(fmHome);
+  // Compare actual owned transport files, including newly shipped companions.
+  // A bundle marker alone cannot prove an interrupted/manual refresh copied them.
+  const payloads=Object.fromEntries(OVERLAY_INSTALL_INPUTS.filter(rel=>rel.startsWith("bin/")).map(rel=>[
+    rel.slice(4), createHash("sha256").update(readFileSync(join(OVERLAY_DIR,rel))).digest("hex"),
+  ]));
+  const verifyPayloads="import hashlib,json,pathlib,sys;root=pathlib.Path(sys.argv[1]);expected=json.loads(sys.argv[2]);bad=[name for name,digest in expected.items() if (root/name).is_symlink() or not (root/name).is_file() or hashlib.sha256((root/name).read_bytes()).hexdigest()!=digest];print('FM_MIRROR_STALE: BB transport payloads stale/missing: '+', '.join(bad),file=sys.stderr) if bad else None;sys.exit(1 if bad else 0)";
   return (
     `if [ "$FM_BINDIR" = ${q}/bin-bb ]; then ` +
     `__fm_mh=$(sed -n 's/^head=//p' ${q}/bin-bb/.mirror-manifest 2>/dev/null); ` +
     `__fm_ch=$(git -C ${q} rev-parse HEAD 2>/dev/null || true); ` +
     `if [ -n "$__fm_mh" ] && [ -n "$__fm_ch" ] && [ "$__fm_mh" != "$__fm_ch" ]; then ` +
     `echo "FM_MIRROR_STALE: bb mirror built at $__fm_mh but HEAD is $__fm_ch; re-run install-bb-backend.py --home ${fmHome}" >&2; ` +
-    `fi; fi`
+    `fi; python3 -c ${shQuote(verifyPayloads)} "$FM_BINDIR" ${shQuote(JSON.stringify(payloads))} || exit 1; fi`
   );
 }
 
@@ -1130,7 +1136,9 @@ function overlayBytes(rel: string): string {
 export const OVERLAY_INSTALL_INPUTS = [
   "bin/backends/bb.sh",
   "bin/backends/bb-worker-transport.txt",
+  "bin/backends/bb-worker-prompt.py",
   "bin/fm-inbox-take.sh",
+  "bin/fm-inbox-take.py",
   "docs/bb-backend.md",
   "firstmate-bb-backend.patch",
   "firstmate-bb-teardown.patch",
@@ -1147,11 +1155,6 @@ export function overlayFingerprint(dir = OVERLAY_DIR): string {
     digest.update(Buffer.concat([Buffer.from(rel), Buffer.from([0]), bytes, Buffer.from([0])]));
   }
   return digest.digest("hex");
-}
-
-export function nativeWorkerTransport(home: string, taskId: string): string {
-  return readFileSync(join(OVERLAY_DIR, "bin/backends/bb-worker-transport.txt"), "utf8").trim()
-    .replaceAll("{FM_HOME}", home).replaceAll("{FM_BINDIR}", `${home}/bin-bb`).replaceAll("{TASK_ID}", taskId);
 }
 
 function normalizeFmScript(raw: string): string {
@@ -3194,7 +3197,6 @@ export default async function plugin(bb: BbPluginApi) {
       'intent=base64.b64decode(os.environ["FM_INTENT"]).decode();' +
       'spec=base64.b64decode(os.environ["FM_TASK_OWN_SPEC"]).decode() if "FM_TASK_OWN_SPEC" in os.environ else "Implement the captain\'s intent above exactly; do not widen scope. Small diff, own branch, deliver per the mode contract, then report DONE/BLOCKED/FAILED.";' +
       "s=open(p).read();s=s.replace('{TASK}',intent).replace('{FIRSTMATE_SPEC}',spec);" +
-      "s+='\\n\\nBB-DIVERGE: Keep durable artifacts under data/<task-id>/ in this firstmate home, not the worktree tmp/. The worktree tmp/ is removed when the workspace is archived.\\n';" +
       "open(p,'w').write(s)";
     const script = [
       `export FM_HOME=${shQuote(fmHome)}`,
@@ -4542,13 +4544,14 @@ export default async function plugin(bb: BbPluginApi) {
     let workerPrompt: string;
     if (fmHome !== "") {
       const hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
-      const brief = `${fmHome}/data/${crew.id}/brief.md`;
+      const briefDir = `${fmHome}/data/${crew.id}`;
       const command = [
         `export FM_HOME=${shQuote(fmHome)} FM_ROOT=${shQuote(fmHome)}`,
         fmBinDirAssign(fmHome),
         fmMirrorStaleGuard(fmHome),
         `. "$FM_BINDIR/backends/bb.sh"`,
-        `fm_backend_bb_worker_prompt ${shQuote(brief)} ${shQuote(crew.shape)} ${shQuote(crew.id)}`,
+        `brief=${shQuote(`${briefDir}/launch-brief.md`)}; [ -e "$brief" ] || brief=${shQuote(`${briefDir}/brief.md`)}`,
+        `fm_backend_bb_worker_prompt "$brief" ${shQuote(crew.shape)} ${shQuote(crew.id)} ${shQuote(crew.posture)}`,
       ].join("\n");
       const result = await runOnHost(hostId, command, 30_000);
       if (result.exitCode !== 0 || result.output.trim() === "") {
@@ -4735,7 +4738,7 @@ export default async function plugin(bb: BbPluginApi) {
       // BB-DIVERGE: the native doorbell tells the worker to hand-roll list/read/mv.
       // Name the helper that performs those steps. The native prefix stays so a
       // worker that only knows the old line can still follow it.
-      const doorbell = `${written.doorbell} On BB, run FM_HOME=${home} ${home}/bin-bb/fm-inbox-take.sh ${crew.id} and, after you act, run it again with --ack.`;
+      const doorbell = `${written.doorbell} On BB, run FM_HOME=${home} ${home}/bin-bb/fm-inbox-take.sh ${crew.id} and, after you act, run the helper's printed acknowledgement command with only the displayed immutable message IDs you handled (--ack 001.msg [002.msg ...]). Bare --ack refuses; new arrivals remain pending.`;
       const previous = await bb.storage.kv.get<InboxDelivery>(key);
       const delivery: InboxDelivery = previous && previous.home === home && previous.crewId === crew.id
         ? previous : { threadId: crew.threadId, hostId, home, crewId: crew.id, senderThreadId: crew.parentThreadId ?? undefined, doorbell, queueIds: [], records: [], retry: false };
@@ -9843,7 +9846,7 @@ export default async function plugin(bb: BbPluginApi) {
         tools: [],
         skills: [],
         instructions:
-          `The native launch brief owns this worker role and policy. BB crew threads have no captain tools or skills. ${nativeWorkerTransport(typeof meta["nativeHome"] === "string" ? meta["nativeHome"] : "", typeof meta["crewId"] === "string" ? meta["crewId"] : "<task-id>")}`,
+          "The native launch brief owns this worker role, BB transport and task policy. BB crew threads have no captain tools or skills. Follow that brief and its exact-ID steering inbox procedure.",
       };
     }
     const marked = metaFlag(meta, "captain");

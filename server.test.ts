@@ -1,3 +1,4 @@
+import { fixture as nativePromptFixture,scaffold as nativePromptScaffold } from './scripts/prompt-fixture.mjs';
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
@@ -18,7 +19,6 @@ import plugin, {
   captainHookInstallScript,
   captainHookCommand,
   captainStartupCommand,
-  nativeWorkerTransport,
   crewPingHoldDecision,
   doorbellSupersededByBbPing,
   staleLineRelayDecision,
@@ -91,20 +91,8 @@ test("crews get no dispatch tools", async () => {
     assert.deepEqual(cfg.tools.map((t) => t.name), []);
     assert.deepEqual(cfg.skills, []);
     assert.match(cfg.instructions ?? "", /native launch brief/);
-    assert.match(cfg.instructions ?? "", /systemd-run --unit=/);
-    assert.match(cfg.instructions ?? "", /data\/<task-id>\//);
-    assert.match(cfg.instructions ?? "", /use gh api REST/);
-    assert.match(cfg.instructions ?? "", /fm-inbox-take\.sh/);
-    assert.match(cfg.instructions ?? "", /\/browser skill and browser_script/);
-    assert.match(cfg.instructions ?? "", /profileId unset/);
-    assert.doesNotMatch(cfg.instructions ?? "", /chrome-devtools-axi for browser|CHROME_DEVTOOLS_AXI_SESSION/);
-    assert.match(cfg.instructions ?? "", /lavish-axi/);
-    assert.doesNotMatch(cfg.instructions ?? "", /a manual checklist is not a substitute|Never poll CI/);
-    assert.doesNotMatch(cfg.instructions ?? "", /WAITING:|scheduled resume|stop every timer/);
-
-    // Crews must run the BB-capable mirror, not native bin/ (no bb backend there).
-    assert.match(cfg.instructions ?? "", /bin-bb\/fm-procevent-lavish\.sh/);
-    assert.doesNotMatch(cfg.instructions ?? "", /home's bin\/fm-tasks-axi\.sh/);
+    assert.match(cfg.instructions ?? "", /exact-ID steering inbox/);
+    assert.doesNotMatch(cfg.instructions ?? "", /browser_script|systemd-run|data\/<task-id>\//, "rendered launch brief is the single policy owner");
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -2560,26 +2548,26 @@ test("handoff reparents a previous captain's crews and their decisions", async (
   }
 });
 
-test("fm-inbox-take prints inbox bodies and moves them only on --ack", () => {
+test("fm-inbox-take prints inbox bodies and moves them only for explicit --ack IDs", () => {
   const home = mkdtempSync(join(tmpdir(), "fm-inbox-"));
   try {
     const inbox = join(home, "state", "c1.inbox");
     mkdirSync(join(home, "bin"), { recursive: true });
     mkdirSync(inbox, { recursive: true });
     writeFileSync(join(home, "bin", "fm-task-inbox-lib.sh"), "fm_task_inbox_body() { echo BODY; }\n");
-    writeFileSync(join(inbox, "1.msg"), "seq: 1\n--\nSTEER one\n");
-    writeFileSync(join(inbox, "2.msg"), "seq: 2\n--\nSTEER two\n");
+    writeFileSync(join(inbox, "001.msg"), "seq: 1\n--\nSTEER one\n");
+    writeFileSync(join(inbox, "002.msg"), "seq: 2\n--\nSTEER two\n");
     const bin = join(dirname(fileURLToPath(import.meta.url)), "overlay/bin/fm-inbox-take.sh");
     const read = spawnSync(bin, ["c1"], { env: { ...process.env, FM_HOME: home }, encoding: "utf8" });
     assert.equal(read.status, 0, read.stderr);
     assert.match(read.stdout, /BODY/);
     assert.doesNotMatch(read.stdout, /STEER one/);
-    assert.ok(existsSync(join(inbox, "1.msg")), "reading does not acknowledge");
-    const ack = spawnSync(bin, ["c1", "--ack"], { env: { ...process.env, FM_HOME: home }, encoding: "utf8" });
+    assert.ok(existsSync(join(inbox, "001.msg")), "reading does not acknowledge");
+    const ack = spawnSync(bin, ["c1", "--ack", "001.msg", "002.msg"], { env: { ...process.env, FM_HOME: home }, encoding: "utf8" });
     assert.equal(ack.status, 0, ack.stderr);
-    assert.ok(existsSync(join(inbox, "handled", "1.msg")));
-    assert.ok(existsSync(join(inbox, "handled", "2.msg")));
-    assert.equal(existsSync(join(inbox, "1.msg")), false);
+    assert.ok(existsSync(join(inbox, "handled", "001.msg")));
+    assert.ok(existsSync(join(inbox, "handled", "002.msg")));
+    assert.equal(existsSync(join(inbox, "001.msg")), false);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -3270,13 +3258,10 @@ test("shared-env BB crew with no worktree passes endpoint validation; ambiguity 
   });
 });
 
-// Audit B (crew half): the crew preamble and the native brief pointed crews at the
-// home's native bin/ (no bb backend), so `fm-procevent-lavish.sh arm` refused with
-// "backend identity missing". Audit D: crews polled CI in tight loops and drained the
-// shared GitHub token. Reverting the path rewrite or the CI rule in bb.sh
-// fm_backend_bb_create_task fails this test.
+// Actual BB adapter creation carries the native role and scoped script paths,
+// while quoted native-looking task text remains verbatim. No model is launched.
 test("bb crew launch prompt preserves the brief with only BB transport adaptations", () => {
-  const home = mkdtempSync(join(tmpdir(), "fm-bb-prompt-"));
+  const home = nativePromptFixture();
   try {
     mkdirSync(join(home, "bin-bb/backends"), { recursive: true });
     cpSync(join(OVERLAY_ROOT, "bin/backends/bb-worker-transport.txt"), join(home, "bin-bb/backends/bb-worker-transport.txt"));
@@ -3284,13 +3269,8 @@ test("bb crew launch prompt preserves the brief with only BB transport adaptatio
     const log = join(home, "transport.jsonl");
     mkdirSync(fakebin);
     writeFileSync(join(fakebin, "bb"), `#!/usr/bin/env python3\nimport json,sys\nwith open(${JSON.stringify(log)}, 'a') as f:\n    args=sys.argv[1:]\n    f.write(json.dumps(args)+'\\n')\n    if '--prompt-file' in args:\n        f.write(json.dumps(['prompt-body', open(args[args.index('--prompt-file')+1]).read()])+'\\n')\nif args[:2] == ['firstmate','create-worker']: print(json.dumps({'id':'thr_crew1','path':'/wt'}))\nelif args[:2] == ['thread','show']: print(json.dumps({'thread':{'id':'thr_crew1','status':'active'},'environment':{'path':'/wt'}}))\n`, { mode: 0o755 });
-    const brief = join(home, "brief.md");
-    writeFileSync(brief, [
-      "arm your board with bin/fm-procevent-lavish.sh arm <artifact.html> --for <task-id>;",
-      `acknowledge with \`bin/fm-procevent.sh handled <source-id> <sequence>\``,
-      `run \`${home}/bin/fm-ensure-agents-md.sh .\` in the worktree.`,
-      "bin/fm-crew-state.sh at line start",
-    ].join("\n"));
+    const f=nativePromptScaffold(home,"c1","scout");
+    const brief=f.source;
     const env = { ...process.env, PATH: `${fakebin}:${process.env.PATH}`, FM_HOME: home, FM_ROOT: home, FM_BB_PROJECT_ID: "project_1", FM_BB_MACHINE: "host_1" };
     const run = spawnSync("bash", ["-c", `. ${JSON.stringify(join(OVERLAY_ROOT, "bin/backends/bb.sh"))} 2>/dev/null; fm_backend_bb_create_task "Scout" /repo c1 scout "$BRIEF"`], { env: { ...env, BRIEF: brief }, encoding: "utf8" });
     assert.equal(run.status, 0, run.stderr);
@@ -3299,19 +3279,12 @@ test("bb crew launch prompt preserves the brief with only BB transport adaptatio
     const prompt = calls.find(args => args[0] === "prompt-body")?.[1] ?? "";
     assert.ok(launch.includes("--prompt-file"));
     assert.equal(launch.includes("--prompt"), false);
-    const bindir = `${home}/bin-bb`;
-    assert.ok(prompt.includes(`${bindir}/fm-procevent-lavish.sh arm <artifact.html>`), prompt);
-    assert.ok(prompt.includes(`\`${bindir}/fm-procevent.sh handled`), prompt);
-    assert.ok(prompt.includes(`\`${bindir}/fm-ensure-agents-md.sh .\``), prompt);
-    assert.ok(prompt.includes(`\n${bindir}/fm-crew-state.sh at line start`), prompt);
-    assert.ok(prompt.includes(`Use ${bindir}/fm-tasks-axi.sh for backlog work`), prompt);
-    assert.ok(prompt.includes(`arm ${bindir}/fm-procevent-lavish.sh with --for c1`), prompt);
-    const briefPart = prompt.slice(prompt.indexOf("\n\n") + 2);
-    assert.match(briefPart, /^arm your board/);
-    assert.doesNotMatch(briefPart, /[ `(]bin\/fm-/, "no relative native bin/ reference may survive in the brief");
-    assert.ok(!prompt.includes(`${home}/bin/`), "no absolute native bin/ reference may survive");
-    assert.doesNotMatch(prompt, /Never poll CI|\.resources\.graphql/);
-    assert.doesNotMatch(prompt, /WAITING:|scheduled resume|stop every timer/);
+    assert.ok(prompt.includes(f.task), "Task script paths and words stay verbatim");
+    assert.match(prompt,/# Current worker role contract/);
+    assert.ok(prompt.includes(`${home}/bin-bb/fm-fleet-ledger.sh`));
+    assert.ok(prompt.includes(`${home}/bin-bb/fm-procevent-lavish.sh`));
+    assert.ok(prompt.includes(`${home}/data/c1/`));
+    assert.equal(readFileSync(brief,"utf8"),f.text);
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
@@ -7887,21 +7860,16 @@ test("IT secondmate registration rejects a mismatched native parent", { skip: !F
 });
 
 test("native worker transport is shared with the adapter and adds no waiting policy", () => {
-  const home = mkdtempSync(join(tmpdir(), "fm-prompt-"));
+  const home=nativePromptFixture();
   try {
-    mkdirSync(join(home, "bin-bb/backends"), { recursive: true });
-    mkdirSync(join(home, "config"));
-    writeFileSync(join(home, "config/bb-overlay"), "bb\n");
-    cpSync(join(OVERLAY_ROOT, "bin/backends/bb-worker-transport.txt"), join(home, "bin-bb/backends/bb-worker-transport.txt"));
-    const brief = join(home, "brief.md");
-    writeFileSync(brief, "NATIVE_SENTINEL\npaused: native external wait\n");
-    const result = spawnSync("bash", ["-c", `. "$1"; fm_backend_bb_worker_prompt "$2" ship c1`, "audit", join(OVERLAY_ROOT, "bin/backends/bb.sh"), brief],
-      { env: { ...process.env, FM_HOME: home, FM_ROOT: home }, encoding: "utf8" });
-    assert.equal(result.status, 0, result.stderr);
-    assert.ok(result.stdout.startsWith(nativeWorkerTransport(home, "c1") + "\n\n"));
-    assert.match(result.stdout, /NATIVE_SENTINEL\npaused: native external wait/);
-    assert.doesNotMatch(result.stdout, /WAITING:|Never poll CI|stop every timer|scheduled resume/);
-  } finally { rmSync(home, { recursive: true, force: true }); }
+    const f=nativePromptScaffold(home,"c1");
+    const result=spawnSync("bash",["-c", '. "$1"; fm_backend_bb_worker_prompt "$2" ship c1',"audit",join(home,"bin-bb/backends/bb.sh"),f.source], {env:{...process.env,FM_HOME:home,FM_ROOT:home},encoding:"utf8"});
+    assert.equal(result.status,0,result.stderr);
+    assert.ok(result.stdout.includes(`Firstmate home: ${home}`));
+    assert.ok(result.stdout.includes(`${home}/data/c1/`));
+    assert.ok(result.stdout.includes(f.task));
+    assert.doesNotMatch(result.stdout,/WAITING:|Never poll CI|stop every timer|scheduled resume/);
+  } finally {rmSync(home,{recursive:true,force:true});}
 });
 
 test("BB endpoint liveness preserves idle sessions and distinguishes unreadable state", () => {
@@ -10755,16 +10723,14 @@ test("CLI startup returns the same harness-shell command without host execution"
 
 for (const missing of [false, true]) {
   test(`native replacement retry ${missing ? "preserves the prior thread when its brief is missing" : "uses the native brief through the shared transport wrapper"}`, async () => {
-    const home = scratchFmHome();
-    mkdirSync(join(home, "config"));
-    mkdirSync(join(home, "bin-bb/backends"), { recursive: true });
-    mkdirSync(join(home, "data/c1"), { recursive: true });
-    writeFileSync(join(home, "config/bb-overlay"), "bb\n");
-    cpSync(join(OVERLAY_ROOT, "bin/backends/bb.sh"), join(home, "bin-bb/backends/bb.sh"));
-    cpSync(join(OVERLAY_ROOT, "bin/backends/bb-worker-transport.txt"), join(home, "bin-bb/backends/bb-worker-transport.txt"));
-    symlinkSync(join(FM_TEST_BIN, "fm-composer-lib.sh"), join(home, "bin-bb/fm-composer-lib.sh"));
-    const brief = "FIRSTMATE_OP: v1 launch-brief\nNative role sentinel\npaused: native wait\n";
-    if (!missing) writeFileSync(join(home, "data/c1/brief.md"), brief);
+    const home = nativePromptFixture();
+    if (!missing) {
+      const f=nativePromptScaffold(home,"c1","ship","local-only");
+      const role=spawnSync("bash",["-c",'. "$1"; fm_brief_worker_role "$2" c1',"fixture",join(home,"bin/fm-dod-lib.sh"),join(home,"state")],{encoding:"utf8"});
+      assert.equal(role.status,0,role.stderr);
+      writeFileSync(join(home,"data/c1/launch-brief.md"),role.stdout+"\n"+f.text);
+      writeFileSync(join(home,"data/c1/brief.md"),"stale source must not replace the authoritative launch brief");
+    }
     const host = itHost(home, { transport: "real" });
     await plugin(host.bb);
     try {
@@ -10783,7 +10749,9 @@ for (const missing of [false, true]) {
         assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
       } else {
         const spawned = host.harness.sdk.callsTo("threads.spawn")[0]![0] as { prompt: string };
-        assert.ok(spawned.prompt.includes(brief));
+        assert.match(spawned.prompt,/Smooth canvas zoom/);
+        assert.match(spawned.prompt,/# Current worker role contract/);
+        assert.doesNotMatch(spawned.prompt,/stale source must not replace/);
         assert.doesNotMatch(spawned.prompt, /Never poll CI|WAITING:|stop every timer|final message MUST/);
       }
     } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
@@ -10852,4 +10820,20 @@ test("registered captain reports a missing installed hook while other threads st
     assert.equal(other.status,0);
     assert.equal(other.stderr,"");
   } finally {rmSync(root,{recursive:true,force:true});}
+});
+
+test("native replacement refuses a stale owned inbox helper before stopping or spawning a worker",async()=>{
+  const home=nativePromptFixture();
+  nativePromptScaffold(home,"c1","ship","local-only");
+  writeFileSync(join(home,"bin-bb/fm-inbox-take.py"),"obsolete helper ignoring immutable IDs\n");
+  const host=itHost(home,{transport:"real"});await plugin(host.bb);
+  try {
+    stubRealExecHost(host);
+    host.harness.sdk.stub("threads.get",async({threadId}:{threadId:string})=>makeThreadResponse({id:threadId,status:"error",environmentId:"env_wt"}));
+    host.harness.sdk.stub("environments.get",async()=>({id:"env_wt",hostId:"host_1",status:"ready",path:"/repo/isolated",isWorktree:true}));
+    await host.bb.storage.kv.set("crews",[{...crewRow("c1","thr_crew","thr_cap"),nativeHome:home,backlogRow:true}]);
+    const result=await host.harness.behavior.runCli(["retry","c1","--reasoning-level","xhigh"]);
+    assert.equal(result.exitCode,1);assert.match(result.stderr,/FM_MIRROR_STALE.*fm-inbox-take.py/);
+    assert.equal(host.harness.sdk.callsTo("threads.stop").length,0);assert.equal(host.harness.sdk.callsTo("threads.spawn").length,0);
+  }finally{await host.harness.lifecycle.dispose();rmSync(home,{recursive:true,force:true});}
 });
