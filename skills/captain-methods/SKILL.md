@@ -15,7 +15,7 @@ Read only the reference for the current trigger:
 | Trigger | Reference |
 |---|---|
 | Assign work or check a handoff; before reporting completion | [Assignment and coverage](references/coverage.md) |
-| Reporting policy requires a user-facing update | [Report editor](references/reporting.md) |
+| Reporting policy requires a user-facing update | [Report editor](../calm/references/reporting.md) |
 | A long task makes a consequential decision | [Decision trail](references/decision-trail.md) |
 | Choose an investigation, design, or independent review | [Scoped methods](references/research-design-review.md) |
 | Explicitly requested history, reflection, or preference review | [Requested review](references/requested-review.md) |

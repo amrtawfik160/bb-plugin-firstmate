@@ -24,7 +24,7 @@ timeline filtering and requires no terminal hooks or `config/calm` changes.
    A repeated notification alone does not justify another message.
 
 Calm leaves supervision, authorization, and AFK/quiet settings unchanged.
-For a required reply, apply the [report editor](../captain-methods/references/reporting.md)
+For a required reply, apply the [report editor](references/reporting.md)
 without changing those reporting triggers or dropping evidence and PR links.
 Use `/quiet` for notification batching and `/catch-up` for a requested recovery
 brief. Routine work continues while the captain discusses another topic.

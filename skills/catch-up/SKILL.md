@@ -50,7 +50,7 @@ groups:
   already authorized work from a proposed action that needs approval.
 
 Use one sentence per item and recorded links where the captain can act.
-Apply the [report editor](../captain-methods/references/reporting.md) to wording
+Apply the [report editor](../calm/references/reporting.md) to wording
 only. Preserve coverage warnings, every actionable decision, and the read-only
 boundary below.
 Give each decision its own numbered item. Aim for one screen; retain every

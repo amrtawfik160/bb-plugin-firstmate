@@ -111,11 +111,8 @@ test("unmarked threads still get firstmate_deck so /captain can take the deck", 
     );
     const names = cfg.tools.map((t) => t.name);
     assert.ok(names.includes("firstmate_deck"));
-    assert.ok(names.includes("firstmate_dispatch"));
-    assert.ok(names.includes("firstmate_interrupt"));
-    assert.ok(names.includes("firstmate_queue"));
-    assert.ok(names.includes("firstmate_fm"));
-    assert.deepEqual(cfg.skills, ["firstmate"]);
+    assert.deepEqual(names.sort(), ["firstmate_contract", "firstmate_deck"]);
+    assert.deepEqual(cfg.skills, ["firstmate", "captain", "calm", "catch-up", "harness-adapters"]);
   } finally {
     await host.harness.lifecycle.dispose();
   }

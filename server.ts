@@ -1347,6 +1347,10 @@ function summarizePR(value: unknown): string {
   return parts.length > 0 ? parts.join(" ") : "none";
 }
 
+// BB packages only selected skill directories. Keep the complete cold-entry
+// reference closure available before deck binding, without role methods.
+const CAPTAIN_BOOTSTRAP_SKILLS = ["firstmate", "captain", "calm", "catch-up", "harness-adapters"] as const;
+const CAPTAIN_BOOTSTRAP_TOOLS = ["firstmate_deck", "firstmate_contract"] as const;
 const CAPTAIN_SKILLS = ["captain", "firstmate", "calm", "catch-up", "captain-methods", ...UPSTREAM_SKILL_NAMES] as const;
 const CAPTAIN_TOOLS = [
   "firstmate_dispatch",
@@ -10108,8 +10112,8 @@ export default async function plugin(bb: BbPluginApi) {
       ? `\n\n${truncate(skillsManifestCache, skillsBudget)}` : "";
     const instructions = truncate(`${base}${memoryBlock}${skillsBlock}`, 4096);
     return {
-      tools: [...CAPTAIN_TOOLS],
-      skills: marked ? [...CAPTAIN_SKILLS] : ["firstmate"],
+      tools: marked ? [...CAPTAIN_TOOLS] : [...CAPTAIN_BOOTSTRAP_TOOLS],
+      skills: marked ? [...CAPTAIN_SKILLS] : [...CAPTAIN_BOOTSTRAP_SKILLS],
       instructions,
     };
   });

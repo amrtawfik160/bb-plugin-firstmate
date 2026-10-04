@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { readFileSync, readdirSync } from 'node:fs';
+import { readFileSync, readdirSync, cpSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createFakePluginHost, makePluginAgentConfigurationContext } from '@get-bb/plugin-sdk/testing';
 import plugin from './server.ts';
+import {followRuntimeReferences} from './scripts/captain-packaging-check.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const skillRoot = join(root, 'skills');
@@ -109,13 +111,55 @@ test('method references resolve within the manifest package without global skill
       }
       readFileSync(destination); // Throws if the package-local reference is absent.
       // Existing native references can use fmHome anchors. Check the new graph only.
-      if (/^(captain-methods|worker-methods)\//.test(local)) pending.push(destination);
+      if (/^(captain-methods|worker-methods|calm)\//.test(local)) pending.push(destination);
     }
   }
-  assert.equal([...seen].filter(path => path.includes('/captain-methods/') || path.includes('/worker-methods/')).length, 11);
+  assert.equal([...seen].filter(path => path.includes('/captain-methods/') || path.includes('/worker-methods/')).length, 10);
+  assert.ok(seen.has(join(skillRoot, 'calm/references/reporting.md')), 'shared reporting ships with its presentation owner');
   const read = (skill, name) => readFileSync(join(skillRoot, skill, 'references', name), 'utf8');
   assert.equal(read('captain-methods', 'decision-trail.md'), read('worker-methods', 'decision-trail.md'));
   const methodSteps = text => text.slice(text.indexOf('1. To explain current behavior'));
   assert.equal(methodSteps(read('captain-methods', 'research-design-review.md')),
     methodSteps(read('worker-methods', 'research-design-review.md')), 'shared procedure stays equal after role-specific boundary');
 });
+
+// Materialize only the directories selected by the actual SDK configure driver.
+// The full repository cannot satisfy a dangling runtime-package reference here.
+function runtimePackage(configuration, additionalSkills = []) {
+  const directory = mkdtempSync(join(tmpdir(), 'fm-cold-skills-'));
+  for (const id of new Set([...configuration.skills, ...additionalSkills])) {
+    cpSync(join(skillRoot, id), join(directory, id), { recursive: true });
+  }
+  return directory;
+}
+for (const [route, entry, explicit] of [
+  ['typed Firstmate request', 'firstmate/SKILL.md', []],
+  ['direct captain invocation', 'captain/SKILL.md', ['captain']],
+]) {
+  test(`cold runtime package resolves ${route} before binding or reload`, async () => {
+    let host = await configuredHost();
+    try {
+      for (const reload of [false, true]) {
+        if (reload) host = await host.harness.lifecycle.reload(plugin);
+        const cfg = await configure(host, {});
+        const directory = runtimePackage(cfg, explicit);
+        try {
+          const visited = followRuntimeReferences(directory, entry);
+          for (const required of ['captain/SKILL.md', 'calm/SKILL.md',
+            'calm/references/reporting.md', 'catch-up/SKILL.md',
+            'captain/references/escalation.md', 'captain/references/supervision.md',
+            'harness-adapters/references/harness/bb.md']) assert.ok(visited.includes(required), required);
+          assert.deepEqual(cfg.tools.map(tool => tool.name).sort(), ['firstmate_contract', 'firstmate_deck']);
+          assert.ok(!cfg.skills.some(id => id.endsWith('-methods')));
+          const bound = await configure(host, { captain: 'true', nativeHome: '/owned-captain' });
+          assert.ok(bound.tools.some(tool => tool.name === 'firstmate_dispatch'));
+          assert.ok(bound.skills.includes('captain-methods'));
+          const crew = await configure(host, { crew: 'true', captain: 'true' });
+          assert.deepEqual(crew.tools, []);
+          assert.deepEqual(crew.skills, ['worker-methods']);
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      }
+      assert.equal(host.harness.inspection.sdk.calls.length, 0);
+    } finally { await host.harness.lifecycle.dispose(); }
+  });
+}
