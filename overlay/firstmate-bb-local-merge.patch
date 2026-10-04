@@ -3,7 +3,7 @@ index 44580de5..694e1758 100755
 --- a/bin/fm-merge-local.sh
 +++ b/bin/fm-merge-local.sh
 @@ -96,6 +96,16 @@ default_branch() {
-
+ 
  BRANCH=$(grep '^branch=' "$META" | cut -d= -f2- || true)
  [ -n "$BRANCH" ] || BRANCH="fm/$ID"
 +# BB names managed worktree branches. Resolve that transport-owned name while

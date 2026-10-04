@@ -73,8 +73,8 @@ try {
   // "FAILED" line, or an "ignored" (already/partly-applied) line.
   let drifted = false;
   for (const p of ["firstmate-bb-backend.patch", "firstmate-bb-teardown.patch", "firstmate-bb-local-merge.patch", "firstmate-bb-browser.patch"]) {
-    const r = sh("patch", ["-p1", "--forward", "--batch", "--dry-run", "-i", join(OVERLAY, p)], { cwd: clone });
-    const bad = r.code !== 0 || /FAILED/.test(r.out) || /hunks ignored|fuzz/.test(r.out);
+    const r = sh("patch", ["-p1", "--fuzz=0", "--forward", "--batch", "--dry-run", "-i", join(OVERLAY, p)], { cwd: clone });
+    const bad = r.code !== 0 || /FAILED/.test(r.out) || /hunks ignored|fuzz|offset/.test(r.out);
     console.log(`\n== ${p}: ${bad ? "DRIFTED" : "applies clean"} (patch exit=${r.code}) ==`);
     if (bad) {
       drifted = true;

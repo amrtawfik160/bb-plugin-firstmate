@@ -15,6 +15,7 @@ import "./app.css";
 import { createFleetRefresh } from "./lib/fleet-refresh.ts";
 
 type Fleet = {
+  deliveries:Array<{ id:string;url:string;owner:string|null;status:string;blocker:string;nextAction:string;freshness:string;ownerNeeded:boolean }>;
   head: string;
   calls: string[];
   landed: string[];
@@ -95,6 +96,11 @@ function FleetBoard() {
       <p>{fleet.head}</p>
       <Section title="Captain's Call" items={fleet.calls} empty="Nothing needs you." />
       <Section title="Recently Landed" items={fleet.landed} empty="No recent completions." />
+      <h2>Unresolved PR deliveries</h2>
+      {fleet.deliveries.length === 0 ? <p className="fm-muted">No unresolved PR deliveries.</p> : <ul>{fleet.deliveries.map(r => <li key={r.id}>
+        <a href={r.url}>{r.id}</a> [{r.status}{r.freshness === "stale" ? ", stale" : ""}{r.ownerNeeded ? ", owner needed" : ""}] Owner: {r.owner ? <button type="button" className="fm-link" onClick={() => nav.toThread(r.owner!)}>{r.owner}</button> : "unassigned"}.
+        {" "}{r.blocker} Next: {r.nextAction}
+      </li>)}</ul>}
       <h2>Ready to review</h2>
       {fleet.ready.length === 0 ? (
         <p className="fm-muted">Nothing waiting.</p>

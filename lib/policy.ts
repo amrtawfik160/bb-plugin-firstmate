@@ -1,11 +1,11 @@
 export type Shape = "ship" | "scout";
 export type DeliveryMode = "direct-PR" | "no-mistakes" | "local-only";
 export type PermissionMode = "accept-edits" | "auto" | "full";
-export type ReasoningLevel = "low" | "medium" | "high" | "xhigh" | "max";
+export type ReasoningLevel = "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | "none" | "ultracode";
 
-const REASONING_LEVELS: ReadonlySet<string> = new Set(["low", "medium", "high", "xhigh", "max"]);
+const REASONING_LEVELS: ReadonlySet<string> = new Set(["low", "medium", "high", "xhigh", "max", "ultra", "none", "ultracode"]);
 
-/** Dispatch-profile reasoning effort, same scale as fm-spawn --effort (minus ultra). */
+/** Dispatch-profile reasoning effort, all reasoning values accepted by the pinned BB SDK. */
 export function toReasoningLevel(value: unknown): ReasoningLevel | undefined {
   return typeof value === "string" && REASONING_LEVELS.has(value) ? (value as ReasoningLevel) : undefined;
 }

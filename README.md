@@ -4,6 +4,24 @@ Run firstmate-style agent crews inside [BB](https://github.com/get-bb/bb): one c
 
 The plugin implements the [firstmate](https://github.com/kunchenguid/firstmate) captain/crew protocol on BB primitives. A BB thread is the captain. Crews are child BB threads with their own managed worktrees. Status reports use the upstream protocol (`DONE:` / `BLOCKED:` / `FAILED:`), the real watcher runs through the BB backend, and merges are BB PR merges or ff-only local lands.
 
+## Reliable launch and PR follow-up
+
+Launches reserve capacity before creation. Dispatch, backlog dispatch, promotion and replacement share admission. A stable `--task-id` identifies a retry; backlog requests reuse their item ID. `bb firstmate launches list --json` shows reserved, creating, provisioning, running, failed and uncertain attempts. Promotion requires a finished successful scout and a readable complete report. Compatibility reports live in a scoped SQLite artifact, read with `bb firstmate scout-report <id>`; native promotion references the original file. An uncertain attempt retains its slot and reconciles exact creation metadata before reuse. Bounded absence is never proof that creation failed.
+
+The native adapter calls the internal `bb firstmate create-worker` bridge after native admission guards. It seeds role, task, home and generation through SDK creation metadata. Parent permissions remain the ceiling. Provisioning timeout retains the worker; it does not stop a slow worker. SDK 0.4.104 has no pre-turn hold or creation cancellation API: native post-creation isolation cannot be claimed complete before its checks finish.
+
+Project checkout and environment selection use the selected host together. Missing matching source refuses launch. Native ships require managed isolation; `sharedEnv` is refused. Visibility is forwarded. Omitted execution choices use project defaults, and resolved settings are recorded when available. Advertised provider reasoning levels are validated, including `ultra`, `none` and `ultracode`. `sendAt` is unsupported and refused before reservation. Backlog `waitUntil` is an eligibility gate; the manager must explicitly dispatch due work.
+
+PR delivery lives in a SQLite register independent of worker records, wake receipts and conversation history. Discovery uses owned environment/branch identity or explicit ship registration, never arbitrary report URLs. GitHub records preserve head SHA, contract, owner, workers, blocker, next action, observation freshness and notification identity. A new head invalidates readiness; forge approval must name that head. Forge failures preserve stale last-known state. Closed unmerged PRs require explicit disposition.
+
+The background follow-up schedule reads bounded batches each minute with error backoff. Unchanged waiting PRs do not start model turns. Actionable transitions and overdue actions notify the owning manager through existing wake delivery. Notification acceptance is persisted and ambiguous sends are reconciled before retry. Hidden notifications alone do not imply token savings.
+
+`bb firstmate deliveries list --json` lists unresolved work; `inspect`, `register`, `reconcile`, `assign`, `abandon` and `verify` share the `firstmate_deliveries` tool. List accepts bounded `--limit` and `--offset`; `--all` is a read-only project view. Fleet, bearings and session show owner, blocker, next action and PR link. Worker teardown/forget preserves records. Explicit handoff transfers ownership, including records whose worker was forgotten. Lost managers leave visible owner-needed records; assignment requires naming the previous manager.
+
+The dispatch contract `--delivery-requirement pr|merged|merged-and-verified` defaults to `merged`. PR-only tasks finish when a non-draft PR exists. Required verification needs the freshly observed merged commit and recorded evidence (`verify <id> --commit <sha> --reason "<evidence>"`). Deployment is not implied. Abandonment requires explicit authority and a reason. Follow-up never grants merge authority or merges directly; managers retain independent review and use native guarded merge. Approval-required PRs remain visible.
+
+The native pin includes `wait-no-turns`, watcher continuity, bounded mergeability-unknown retry and completion inventory checks. Native `config/wait-no-turns` remains opt-in. BB does not copy home-local preferences or add a competing native-worker waiting loop. See [implementation evidence](docs/verification/launch-pr-lifecycle-progress.md) for limits and validation.
+
 ## Install
 
 ```sh
@@ -97,7 +115,7 @@ The native tools cover the liaison loop. For the full bash policy engine (brief,
 
 ```sh
 bb firstmate init --real        # clone upstream firstmate, overlay backends/bb.sh, set config/backend=bb
-bb firstmate scripts [query]    # verify 177 callable scripts + 20 helpers/adapters, then search entrypoints
+bb firstmate scripts [query]    # verify 194 callable scripts + 22 helpers/adapters, then search entrypoints
 bb firstmate fm <script> ...    # run any bin/fm-<script>.sh with FM_BACKEND=bb
 ```
 
@@ -107,7 +125,7 @@ BB-specific behavior in this fork:
 
 - **Event-push watcher.** `backend=bb` reports push-capable. `fm-watch` blocks on `bb thread wait --status idle` instead of sleeping through its poll budget. A pending interaction surfaces as the blocked edge; the first window to finish wins the multi-window wait.
 - **Refusal-safe teardown.** `remove_worktree` inspects the crew worktree first and refuses dirty trees with the changed-file list, so `fm-teardown` aborts and keeps records instead of letting a later force-removal eat uncommitted work. Discarding is an explicit `forget --force`.
-- **Secondmate = scope router, not a seeded home.** `secondmate register --scope "<what it owns>" --projects a,b` registers a domain-captain thread; dispatch routes there by scope + a non-exclusive project clone list. A fully seeded independent firstmate home (backlog handoff, config/memory inheritance, its own child supervision) is not built on BB — the backend only spawns non-nesting leaf crews. See the parity table in `PLUGIN_OVERVIEW.md`.
+- **Secondmates support both routing and native seeded homes.** `secondmate register --scope "<what it owns>" --projects a,b` registers an existing domain captain. Native `fm-secondmate-add.sh` creates an independent home through native identity, inheritance and isolation guards. Its BB captain role and home metadata are seeded before its first turn. The creation bridge installs the BB backend in that child home. Routing an existing captain does not create a new seeded home.
 
 ## Configuration
 
@@ -129,7 +147,7 @@ BB-specific behavior in this fork:
 
 ## Skills
 
-The plugin registers 28 upstream `.agents/skills`, plus `/captain`, `/firstmate`, `/calm`, and `/catch-up`. The upstream `firstmate-calm` entry is a terminal module rather than a portable skill; BB uses its existing timeline filter and the `/calm` reporting skill instead. Imported policy text is pinned to upstream commit `2d833ff1`; one shared runtime contract translates script paths, workers, approvals, and alternate harness mechanics to `firstmate_fm` and BB threads. Crew threads still receive no captain skills.
+The plugin registers 28 upstream `.agents/skills`, plus `/captain`, `/firstmate`, `/calm`, and `/catch-up`. The upstream `firstmate-calm` entry is a terminal module rather than a portable skill; BB uses its existing timeline filter and the `/calm` reporting skill instead. Imported policy text is pinned to upstream commit `1f3e7696`; one shared runtime contract translates script paths, workers, approvals, and alternate harness mechanics to `firstmate_fm` and BB threads. Crew threads still receive no captain skills.
 
 Calm reporting is the default in captain threads. Routine supervision stays silent; requested outcomes, review-ready work, decisions, exhausted blockers, and needed logins still reach you. This changes reporting only and leaves supervision and AFK/quiet settings unchanged. Ask for detail whenever needed.
 

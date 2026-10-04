@@ -158,7 +158,7 @@ def generate_patched_copies(home: Path, overlay: Path, dest_dir: Path) -> dict[s
             target.write_text(native)
         for patch in (backend_patch, teardown_patch, overlay / "firstmate-bb-local-merge.patch", overlay / "firstmate-bb-browser.patch"):
             result = subprocess.run(
-                ["patch", "-p1", "--forward", "--batch", "-i", str(patch)],
+                ["patch", "-p1", "--fuzz=0", "--forward", "--batch", "-i", str(patch)],
                 cwd=tmproot,
                 capture_output=True,
                 text=True,
@@ -173,7 +173,7 @@ def generate_patched_copies(home: Path, overlay: Path, dest_dir: Path) -> dict[s
             # line in the output. Any one of these aborts the whole install.
             combined = f"{result.stdout}\n{result.stderr}"
             rejects = sorted(str(p.relative_to(tmproot)) for p in tmproot.rglob("*.rej"))
-            failed_hunks = "FAILED" in combined or "hunks ignored" in combined
+            failed_hunks = "FAILED" in combined or "hunks ignored" in combined or "offset" in combined or "fuzz" in combined
             if result.returncode != 0 or rejects or failed_hunks:
                 die_loud(
                     f"a hunk of {patch.name} did not apply to the pristine native source",

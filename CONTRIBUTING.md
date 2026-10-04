@@ -185,7 +185,7 @@ The pinned native source is vendored, read-only, under `native-snapshot/<sha>/�
 mirroring native's own paths (`.agents/skills/<name>/SKILL.md`, or a named slice
 such as `AGENTS.section-9.md`). This is what the check diffs against, so it runs
 fully offline. It is a copy of native at the pin — never edit it by hand; re-vendor
-from the native clone when you bump a pin. Native is currently at `2d833ff1`.
+from the native clone when you bump a pin. Native is currently at `1f3e7696`.
 
 ### Pin the native source per skill (`BB-SOURCE`)
 
@@ -194,8 +194,8 @@ Every re-derived skill carries, right after its frontmatter, a machine-parseable
 
     <!-- BB-SOURCE
          native: .agents/skills/afk/SKILL.md
-         sha: 2d833ff147cd26a5c461e914e06854e0eb2707ce
-         snapshot: native-snapshot/2d833ff1/.agents/skills/afk/SKILL.md
+         sha: 1f3e769616fdf9f31f85f4c3e6a9f71606634238
+         snapshot: native-snapshot/1f3e7696/.agents/skills/afk/SKILL.md
          fidelity: adapted        # verbatim | adapted
          note: … -->
 

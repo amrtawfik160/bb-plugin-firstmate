@@ -28,12 +28,12 @@ import {
   protocolNudgeText,
 } from "./policy.ts";
 
-test("toReasoningLevel accepts the dispatch-profile scale only", () => {
+test("toReasoningLevel accepts every pinned SDK reasoning level", () => {
   for (const level of ["low", "medium", "high", "xhigh", "max"]) {
     assert.equal(toReasoningLevel(level), level);
   }
-  assert.equal(toReasoningLevel("ultra"), undefined);
-  assert.equal(toReasoningLevel("none"), undefined);
+  assert.equal(toReasoningLevel("ultra"), "ultra");
+  assert.equal(toReasoningLevel("none"), "none");
   assert.equal(toReasoningLevel(""), undefined);
   assert.equal(toReasoningLevel(undefined), undefined);
 });

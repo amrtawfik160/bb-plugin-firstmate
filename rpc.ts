@@ -23,6 +23,7 @@ export const rpcContract = defineRpcContract({
       }),
     ]),
     output: z.object({
+      deliveries:z.array(z.object({ id:z.string(),url:z.string(),owner:z.string().nullable(),status:z.string(),blocker:z.string(),nextAction:z.string(),freshness:z.string(),ownerNeeded:z.boolean() })).default([]),
       head: z.string(),
       calls: z.array(z.string()),
       landed: z.array(z.string()),

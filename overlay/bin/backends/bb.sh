@@ -371,26 +371,9 @@ $prompt"
   [ "${FM_BB_HIDDEN:-0}" = 1 ] && vis=hidden
   [ "${FM_BB_VISIBLE:-1}" = 0 ] && vis=hidden
   machine=${FM_BB_MACHINE:-${BB_MACHINE:-}}
-  if [ -z "$machine" ]; then
-    machine=$(bb machine list --json 2>/dev/null | python3 -c '
-import json,sys
-raw=sys.stdin.read()
-try:
-    data=json.loads(raw)
-except Exception:
-    sys.exit(1)
-rows=data if isinstance(data,list) else data.get("machines") or data.get("hosts") or []
-for row in rows:
-    if not isinstance(row, dict):
-        continue
-    status=str(row.get("status") or "")
-    if status in ("connected","ready","active") or row.get("connected") is True:
-        ident=row.get("id") or row.get("hostId")
-        if isinstance(ident, str) and ident:
-            sys.stdout.write(ident)
-            sys.exit(0)
-sys.exit(1)
-' 2>/dev/null || true)
+  [ -n "$machine" ] || { echo "error: native BB launch needs an explicit execution host" >&2; return 1; }
+  if [ "$kind" = ship ] && [ "${FM_BB_SHARED_ENV:-0}" = 1 ]; then
+    echo "error: native ship isolation is mandatory" >&2; return 1
   fi
   # Provider/model/reasoning come from FM_BB_* env, else fm-spawn's resolved
   # dispatch-profile globals (MODEL/EFFORT are in scope here). Propagating them
@@ -399,14 +382,17 @@ sys.exit(1)
   local provider model reasoning
   provider=${FM_BB_PROVIDER:-}
   model=${FM_BB_MODEL:-${MODEL:-}}
+  if [ "${FM_BB_PROJECT_DEFAULTS:-0}" = 1 ]; then model=${FM_BB_MODEL:-}; fi
   reasoning=${FM_BB_REASONING:-${FM_BB_EFFORT:-${EFFORT:-}}}
+  if [ "${FM_BB_PROJECT_DEFAULTS:-0}" = 1 ]; then reasoning=${FM_BB_REASONING:-}; fi
   case "$reasoning" in
     low|medium|high|xhigh|max|ultra|ultracode|none) ;;
-    *) reasoning= ;;
+    "") ;;
+    *) echo "error: unsupported BB reasoning level $reasoning" >&2; return 1 ;;
   esac
   # Put the work first so sidebar names are useful. Keep the task id as a stable
-  # suffix: the plugin can adopt the thread in the SIGKILL window before the
-  # separate `mark-crew` call tags it. Plugin dispatch supplies the normalized
+  # suffix for humans. The internal bridge seeds recovery metadata atomically
+  # in the creation request. Plugin dispatch supplies the normalized
   # title; direct fm-spawn users get the same shape from the backlog name.
   local title role subject
   role=Ship
@@ -420,50 +406,25 @@ sys.exit(1)
   title="${FM_BB_THREAD_TITLE:-$role · $subject · $id}"
   local prompt_file
   prompt_file=$(fm_backend_bb_private_file "$prompt") || return 1
-  set -- thread spawn --json --project "$project_id" --title "$title" \
-    --prompt-file "$prompt_file" --visibility "$vis" --permission-mode "$perm"
-  if [ "$kind" = secondmate ] || [ "${FM_BB_SHARED_ENV:-0}" = 1 ]; then
-    set -- "$@" --environment "$project"
-  else
-    set -- "$@" --new-environment worktree
-  fi
-  [ -z "$parent" ] || set -- "$@" --parent-thread "$parent"
+  set -- firstmate create-worker --json --project "$project_id" --title "$title" \
+    --prompt-file "$prompt_file" --permission-mode "$perm" --home "$FM_HOME" \
+    --task "$id" --shape "$kind" --host "$machine" --path "$project" \
+    --native-pid "$$" --delivery-mode "${MODE:-no-mistakes}" --delivery-requirement "${FM_BB_DELIVERY_REQUIREMENT:-merged}"
+  [ "$vis" != hidden ] || set -- "$@" --hidden
+  [ "${FM_BB_SHARED_ENV:-0}" != 1 ] || set -- "$@" --shared-env
+  [ -z "$parent" ] || set -- "$@" --parent "$parent"
   [ -z "$provider" ] || set -- "$@" --provider "$provider"
   [ -z "$model" ] || set -- "$@" --model "$model"
   [ -z "$reasoning" ] || set -- "$@" --reasoning-level "$reasoning"
-  [ -z "$machine" ] || set -- "$@" --machine "$machine"
   out=$(fm_backend_bb_run_json "$@")
   local spawn_status=$?
   rm -f "$prompt_file"
   [ "$spawn_status" -eq 0 ] || return "$spawn_status"
-  thread_id=$(printf '%s' "$out" | fm_backend_bb_json_field id) || {
-    echo "error: bb thread spawn did not return a thread id for $name" >&2
-    return 1
-  }
-  # Tag the thread as a firstmate crew so the plugin's agent config gives it the
-  # crewmate contract (no captain tools/skills), not the unmarked captain fallback.
-  # Pass the task id so the plugin can adopt this thread by id if fm-spawn is
-  # hard-killed before it records bb_thread_id in the meta (no double-spawn).
-  if [ "$kind" = secondmate ]; then
-    if ! bb firstmate mark-captain "$thread_id" --home "$project" --parent-home "$FM_HOME" --task "$id" >/dev/null; then
-      echo "error: secondmate $id launched as $thread_id but captain binding failed; endpoint retained for recovery" >&2
-      return 1
-    fi
-  else
-    bb firstmate mark-crew "$thread_id" --home "$FM_HOME" --shape "${kind:-ship}" --task "$id" >/dev/null 2>&1 || true
-  fi
-  wt_path=$(printf '%s' "$out" | fm_backend_bb_json_field path 2>/dev/null || true)
-  tries=0
-  while [ -z "$wt_path" ] && [ "$tries" -lt 45 ]; do
-    sleep 1
-    tries=$((tries + 1))
-    wt_path=$(fm_backend_bb_show "$thread_id" 2>/dev/null | fm_backend_bb_json_field path 2>/dev/null || true)
-  done
-  if [ -z "$wt_path" ]; then
-    echo "error: bb thread $thread_id has no environment path yet" >&2
-    fm_backend_bb_kill "$thread_id" >/dev/null 2>&1 || true
-    return 1
-  fi
+  thread_id=$(printf '%s' "$out" | fm_backend_bb_json_field id) || return 1
+  wt_path=$(printf '%s' "$out" | fm_backend_bb_json_field path) || return 1
+  # The plugin retained the worker if provisioning has not resolved. No timeout
+  # path kills a real worker or frees its durable launch reservation.
+  [ -n "$thread_id" ] && [ -n "$wt_path" ] || return 1
   printf '%s\t%s' "$thread_id" "$wt_path"
 }
 
