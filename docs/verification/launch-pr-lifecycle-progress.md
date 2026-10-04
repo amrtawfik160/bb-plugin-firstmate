@@ -5,7 +5,7 @@ Implementation/native compatibility commit: `87507587ebace16e1c3a619e8594e16427e
 Implementation checkout: `/root/github_projects/bb-plugin-firstmate-launch-pr-lifecycle`.
 The baseline's existing server, README, review and reproduction changes are preserved.
 
-This document is the recovery checkpoint and review matrix. Implementation and final validation are complete in this checkout. No live plugin was installed or reloaded, no real worker/model task was launched, and no PR was created or merged.
+This document is the recovery checkpoint and review matrix. Initial implementation validation and the parent-review corrections are recorded below. No live plugin was installed or reloaded, no real worker/model task was launched, and no PR was created or merged.
 
 ## API and native contract
 
@@ -34,7 +34,7 @@ This document is the recovery checkpoint and review matrix. Implementation and f
 | D: persistent follow-up | Supported minute schedule rotates discovery/recovery and bounded due records; error backoff; durable notification attempts/acceptance and markers | Worker ends while checks are pending; later green checks wake manager; receipt acknowledgement keeps open PR; unchanged waiting creates no model send; overdue action sends one durable reminder | Polling is bounded; larger cohorts have proportional latency. Hidden notices do not establish token savings |
 | D: crash/dedup/failure | PR notice marker persists through native wake queue, held input, SDK queued input and event reconciliation; fresh-record callbacks preserve handoff and verification | Failed send stays retryable; duplicate events/reload do not resend successful notice; write-after-acceptance fault reconciles before resend; in-flight callbacks cannot overwrite new owner or completed verification | SDK has no idempotent-send key. Ambiguous send with unreadable/incomplete evidence stays pending; see limits below |
 | D: scope/ownership | Fleet, session, bearings, RPC and consolidated `deliveries` tool/CLI show unresolved work; explicit handoff and previous-owner assignment are scoped | Lost/archived/deleted manager surfaces owner-needed; forgotten author handoff; cross-project refusal; conflicts beyond first page; explicit unassigned recovery | Read-only project visibility never transfers ownership. Other captains' PRs and scout report URLs are not automatically claimed |
-| D: authority/completion | Existing native guarded merge remains the merge route; follow-up requests independent review and authorized continuation; contract is immutable on re-register | Approval-required records stay pending; explicit owner/reason abandonment; merged commit evidence satisfies only agreed verification; PR-only task completes with non-draft PR | No automatic merge, new merge grant or implied deployment. Verification is manager-recorded evidence |
+| D: authority/completion | Existing native guarded merge remains the merge route; follow-up preserves agreed native review/validation and authorized continuation; contract is immutable on re-register | Approval-required records stay pending; explicit owner/reason abandonment; merged commit evidence satisfies only agreed verification; PR-only task completes with non-draft PR | No automatic merge, new merge grant or implied deployment. Verification is manager-recorded evidence |
 | E: native loader/update | [all four patches](../../overlay), [installer](../../overlay/install-bb-backend.py), [refresh tool](../../scripts/refresh-native-pin.mjs) and [manifest](../../lib/upstream-surface.ts) target the audited pin | Exact four-patch application; installer/verify; clean tracked native tree; actual BB backend source load; loader mutation reproduces failure | Positional `set --` clause changes with the native pin; offsets/fuzz are rejected |
 | E: native fidelity/options | [vendored snapshot](../../native-snapshot/1f3e7696), pinned skill headers and adapted anchors updated; [backend docs](../../overlay/docs/bb-backend.md), [README](../../README.md) corrected | Fidelity: 33 skills, 12 authorized divergence anchors, seven authorized BB-only fences; opt-in native tests | Wait-no-turns, watcher continuity, bounded mergeability retry and completion inventory preserved. No home-local preferences silently enabled |
 | F: structure/delivery | Launch, execution selection, scout report and PR reconciliation are cohesive modules; replaced orphan/title adoption, late marking, timeout kill and outer replacement-cap path removed | TypeScript, full tests, build/RPC schema, whitespace and mutation checks | Existing server integrations remain; no unrelated cosmetic rewrite or second policy owner |
@@ -57,7 +57,7 @@ bb plugin build .
 git diff --check
 ```
 
-Final full-suite result: **626 tests passed**, zero failed, zero skipped. Duration: **168882.645806 milliseconds**. The count increased from the baseline's 590 tests because 36 regression tests were added. All eight baseline opt-in skips ran successfully against scratch native state. TypeScript, build and whitespace checks exited zero.
+Initial implementation full-suite result: **626 tests passed**, zero failed, zero skipped. Duration: **168882.645806 milliseconds**. The count increased from the baseline's 590 tests because 36 regression tests were added. All eight baseline opt-in skips ran successfully against scratch native state. TypeScript, build and whitespace checks exited zero.
 
 Local captured output: `/tmp/fm-full-final.log`, `/tmp/fm-new-final.log`, `/tmp/fm-retry-final.log` and `/tmp/fm-mutation-final.log`. These are review aids; the commands above reproduce the results without relying on the temporary logs.
 
@@ -125,12 +125,12 @@ Six isolated mutations reproduce assertion failures: remove atomic admission, re
 
 ## Limits and bounded parent follow-up
 
-1. **Live acceptance remains with the parent.** User instruction prohibits plugin reload/install, deployed native upgrade and real worker tasks in this implementation turn. The repository's live-proof rule is therefore deferred explicitly, not passed by mocks. Parent review precedes live acceptance.
+1. **Final live acceptance remains with the parent.** The parent reports 17/17 live-mirror checks at candidate `3282ed6` on its isolated BB server/host. It created and removed one real ship and one real scout without production state changes. That proof predates these corrections; final acceptance must use the new commits. This implementation agent has not installed/reloaded a live plugin or launched real workers.
 2. **No pre-turn hold/cancel API exists in SDK 0.4.104.** Atomic role metadata fixes captain-tool exposure. A prepared environment is still needed for native isolation guards. Creation/provisioning stays recoverable; no native readiness is claimed before guard publication.
 3. **Unknown create outcomes hold capacity.** Discovery pages at most 500 scoped threads. Safe retries reuse task identity/generation. No force-release treats incomplete inventory as proof of absence. Permanently unreadable workers can need operator diagnosis through `launches` and BB inventory.
 4. **Notification exact-once is bounded by core evidence.** Accepted messages have durable identity and accepted-write-fault recovery. Definite failure can retry. Ambiguous failure reconciles held/queued/event markers first. Event inventory is bounded to 100 rows. Incomplete evidence leaves the obligation pending. SDK lacks an idempotent-send key, so a core RPC accepted arbitrarily late after a complete absence observation has no absolute exactly-once guarantee.
 5. **Monitoring requires a loaded plugin.** Supported schedules resume after reload and read durable records. Each pass reads ten due PRs, ten worker discoveries, ten launch records and ten historical done references, plus up to 20 notification retries. Forge backoff grows from one minute to one hour. Large cohorts increase latency; obligations remain visible and explicitly reconcilable.
-6. **Forge/review conservatism is deliberate.** Only GitHub PR URLs are canonicalized. Aggregate approval without current-commit proof stays waiting-review. Approval cannot replace native required checks or authority. Closed-unmerged needs explicit replacement/reopen/abandonment disposition.
+6. **Forge/review conservatism is deliberate.** Only GitHub PR URLs are canonicalized. A repository-required review remains pending until satisfied. Unknown review evidence stays unresolved and asks an authorized manager to continue through native gates; it does not invent external GitHub approval for direct-PR or no-mistakes work. Approval cannot replace native required checks or authority. Closed-unmerged needs explicit replacement/reopen/abandonment disposition.
 7. **Recovery is an explicit BB adaptation.** SDK replacement reuses the existing environment/full native brief and stops/archives the previous thread before creation. The native BB recovery classifier is not claimed verified or rewritten to manufacture approval. Existing brief, ownership, machine permission, isolation and merge gates remain in force.
 8. **Parent acceptance stays bounded.** After review, parent can authorize one ship and one scout in a throwaway BB project with a source matching its host. Check initial metadata/role, native guard publication and slow/reload recovery. Verify one owned PR through pending checks, later readiness, handoff and reload. Do not merge without existing authority. Existing live scripts that select an unrelated temporary checkout must first supply/register a matching project source for the new execution-selection contract.
 
@@ -141,3 +141,82 @@ Six isolated mutations reproduce assertion failures: remove atomic admission, re
 3. Use the exact commands above for independent review. Do not repeat live acceptance without parent authority.
 4. Review the implementation/native compatibility commit, then the verification evidence commit.
 5. Preserve the baseline..HEAD range and remaining live acceptance boundary when handing off.
+
+
+## Parent-review corrections, 2026-10-04
+
+Correction commit: `0396b2e` (all nine findings). The following documentation
+commit records final validation. Full implementation range starts at the baseline
+above; parent can review corrections with `git diff 3282ed6..HEAD`.
+
+Parent found blocking defects after the initial implementation. The changes below
+preserve both existing implementation commits and the baseline. Each regression
+uses the registered plugin factory or an actual patched native setup function.
+
+| Finding | Correction and code | Causal validation |
+| --- | --- | --- |
+| 1: recovery lost delivery contract | [server](../../server.ts) resolves original launch/metadata contract during adoption, retry, queue, routing, promotion and completion recovery; conflicting or unreadable launch contracts refuse | Factory reload exercises both metadata adoption and dispatch recovery, then discovers a merged PR that remains `merged-needs-verification` |
+| 2: hung schedule/disposal | Discovery, launch/history recovery and notification reconciliation propagate cancellation and bounded reads; each item has a 15-second total budget; schedule tracks its pending promise and releases it on every exit | Actual registered schedule handles hung SDK discovery, advances to another PR, runs again, and disposes promptly during discovery or notification recovery |
+| 3: late terminal leak | Terminal creation is inside cleanup scope; only its close callback is retained while API context is live; a late identity closes once after cancellation/disposal | Deferred creation + disposal + late reply makes one force-close and zero terminal reads or manager sends |
+| 4: invented external approval | [delivery reconciliation](../../lib/pr-delivery.ts) separates required repository review from unknown evidence; authorized unknown evidence requests the existing native review/validation path with `waiting-native-gates` | Unknown evidence never becomes ready-to-merge, required review/changes-requested remain blockers, and default native continuation does not require self-approval on GitHub |
+| 5: unadmitted worker reported running | One shared admission predicate requires ready environment, selected host and exact native `bb_thread_id` publication | Factory invokes the real creation bridge, then injects native post-creation guard failure; worker stays provisioning, one spawn occurs, and its cap slot stays held |
+| 6: partial handoff split ownership | Task-associated records exclude failed reparenting; explicit orphan-only transfer remains supported and reported separately | One successful worker, one failed worker and one orphan: failed task keeps worker, decision, launch and PR owner; retained authors participate in reparent gates even after forget |
+| 7: register ignored original contract | CLI/tool registration inherits original contract and refuses an explicit mismatch | Both actual entrypoints without requirement retain `merged-and-verified`; queue and promotion carry that requirement into creation metadata |
+| 8: forget destroyed continuation | Per-record SQLite stores complete trusted worker/task continuation; plain forget keeps native task authority and environment; destructive retirement refuses outstanding delivery. Scoped merge/tell/retry resolve retained records; requested fixes restore worker role and unarchive through public SDK APIs | Forgotten worker + plugin reload + archived author accepts an authorized fix instruction; guarded merge remains callable and reports a native required-check refusal. No raw GitHub merge occurs. Foreign managers cannot resolve this continuation |
+| 9: startup cd caused second turn | [backend patch](../../overlay/firstmate-bb-backend.patch) skips shell cd only inside native startup workspace handoff for BB. Subsequent cwd assertion still runs | Applies exact patch to audited source, executes native startup function with zero model input, and proves explicit captain cd instructions still reach adapter delivery |
+
+The four older orphan tests now require a truthful provisioning refusal when
+native admission metadata is absent. Adoption still retains the original worker
+without duplicating it. The existing squash-merge retirement regression still
+passes: confirmed merge satisfies a merged-only contract; required verification
+and unrelated PR obligations remain outstanding.
+
+### Validation of the corrections
+
+- Targeted launch/delivery tests: **46 passed**, zero failed/skipped.
+- Affected orphan/retirement tests: **7 passed**, zero failed/skipped.
+- Fifteen mutation checks pass. They remove each original reliability guard and
+  each parent-review fix in isolated copies. End-to-end cancellation mutation
+  reproduces hung disposal; startup mutation produces extra model input.
+- `npx tsc --noEmit`, `git diff --check`, `bb plugin build .`, strict scratch
+  overlay install/verify, actual BB backend source load, four-patch drift check,
+  and `npm run fidelity -- --native /tmp/fm-launch-pr-verified`: exit zero.
+- Build reports the host CLI's bundled SDK as 0.5.29. The project's public API
+  contract and installed declarations remain pinned to 0.4.104; no upgrade was
+  performed. Fleet RPC output still parses against its registered schema.
+- Final full-suite result for the corrections: **636 passed**, zero failed,
+  zero skipped. Duration: **162581.765579 milliseconds**. This is 10 additional
+  behavioral tests beyond the initial 626-test implementation; all eight native
+  opt-in tests ran against scratch state.
+
+Exact commands are the full-suite/native commands above plus:
+
+```bash
+node --test --experimental-strip-types lib/launch-delivery.test.mjs server.launch-delivery.test.mjs
+FM_TEST_HOME=/tmp/fm-launch-pr-verified node scripts/launch-pr-mutation-check.mjs
+```
+
+Local review logs: `/tmp/fm-review-target-verified.log`,
+`/tmp/fm-review-affected.log`, `/tmp/fm-review-mutation-complete.log`, and
+`/tmp/fm-review-final-acceptance.log`. These are scratch evidence, not required
+inputs to reproduce verification.
+
+### Remaining acceptance boundaries
+
+1. Point the CLI at the parent's isolated BB server. Run `bb machine list --json`
+   and choose that server's connected host ID. Set `FM_BB_MACHINE` explicitly;
+   the live script refuses a missing value before creating scratch records.
+2. Parent reruns `live-mirror-check` with explicit provider/model/reasoning and
+   the new candidate. Check startup events contain one task prompt and no setup
+   cd prompt. Preserve native cwd/isolation refusal evidence.
+3. Parent verifies persistent PR follow-up through pending checks, later native
+   continuation, worker forget, manager handoff and plugin reload. Merge remains
+   subject to already-existing authority and native checks.
+4. SDK 0.4.104 cannot cancel a host terminal creation before its identity returns.
+   A command might start during that RPC; cancellation prevents plugin polling or
+   continuation, and a late identity triggers force-close. If core never returns
+   an identity, plugin-only cleanup cannot prove that no terminal exists.
+5. Older forgotten records without a trusted continuation snapshot or native
+   task state cannot acquire invented authority. They remain visible obligations
+   requiring explicit recovery from actual native evidence. New forget paths
+   preserve this linkage and refuse destructive retirement while it is needed.
