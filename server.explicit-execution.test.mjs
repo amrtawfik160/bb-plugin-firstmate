@@ -106,6 +106,22 @@ test('native publication plus failed crew cache write recovers across reload wit
  const recovered=await host.harness.behavior.runCli(change(),ctx);assert.equal(recovered.exitCode,0,recovered.stderr);assert.equal(state.n,1);assert.equal(host.harness.sdk.callsTo('threads.stop').length,0);assert.equal(host.harness.sdk.callsTo('threads.archive').length,0);assert.equal(host.harness.sdk.callsTo('threads.spawn').length,0);assert.deepEqual(f.invariant(),before);assert.equal((await host.bb.storage.kv.get('crews'))[0].replacementGeneration,3);assert.equal(createLaunches(host.bb.storage.database()).forTask('proj_1','thr_cap','c1').replacement.published,true);
  }finally{await host.harness.lifecycle.dispose();f.clean();}
 });
+for(const pin of pins)for(const intent of ['execution-change','failure-recovery'])test(`final replacement journal write fault resumes exact ${intent} after cache publication/reload on ${pin.slice(0,8)}`,async()=>{
+ const f=replacementFixture(pin);let {host,state}=await factory(intent==='execution-change'?1:0,f);try {
+ const source={...crew(f.home,intent==='execution-change'?1:0),task:f.task};await host.bb.storage.kv.set('crews',[source]);commands(host,true);const before=f.invariant();
+ const args=change().map(v=>v==='execution-change'?intent:v);const db=host.bb.storage.database();
+ db.exec("CREATE TRIGGER reject_final BEFORE UPDATE ON launches WHEN json_extract(NEW.record,'$.replacement.published')=1 BEGIN SELECT RAISE(ABORT,'final publication fault'); END");
+ const failed=await host.harness.behavior.runCli(args,ctx);assert.equal(failed.exitCode,1);assert.match(failed.stderr,/final publication fault/);assert.equal(state.n,1);
+ const cached=(await host.bb.storage.kv.get('crews'))[0];assert.equal(cached.threadId,'thr_new1');assert.equal(cached.relaunches,1);
+ const pending=createLaunches(db).forTask('proj_1','thr_cap','c1');assert.equal(pending.state,'provisioning');assert.notEqual(pending.replacement.published,true);assert.equal(pending.replacement.sourceThreadId,'thr_old');assert.deepEqual(pending.replacement.sourceCrew,{...source,taskSpilled:false});assert.deepEqual(f.invariant(),before);assert.match(readFileSync(join(f.home,'state/c1.meta'),'utf8'),/^branch=fm\/c1$/m);
+ db.exec('DROP TRIGGER reject_final');host=await host.harness.lifecycle.reload(plugin);stubs(host,state,f);commands(host,true);
+ const changed=await host.harness.behavior.runCli(args.map(v=>v==='grok-4.6'?'next-model':v),ctx);assert.equal(changed.exitCode,1);assert.match(changed.stderr,/immutable request/);
+ const retry=host.harness.registrations.agentTools.find(t=>t.name==='firstmate_retry');const result=await retry.execute({crewId:'c1',intent,reason:'User explicitly requested this execution change',providerId:'acp-grok',model:'grok-4.6',reasoningLevel:'xhigh'},ctx);assert.equal(typeof result,'string',JSON.stringify(result));
+ const completed=createLaunches(host.bb.storage.database()).forTask('proj_1','thr_cap','c1');assert.equal(completed.state,'running');assert.equal(completed.replacement.published,true);assert.equal(completed.key,pending.key);assert.equal(completed.generation,pending.generation);assert.deepEqual(completed.replacement.sourceCrew,pending.replacement.sourceCrew);assert.equal(completed.replacement.sourceThreadId,'thr_old');
+ const saved=(await host.bb.storage.kv.get('crews'))[0];assert.equal(saved.threadId,'thr_new1');assert.equal(saved.createdAt,source.createdAt);assert.equal(saved.deliveryRequirement,'merged-and-verified');assert.equal(saved.relaunches,1);assert.deepEqual(saved.priorThreadIds,['thr_original','thr_old']);assert.deepEqual(f.invariant(),before);assert.match(readFileSync(join(f.home,'state/c1.meta'),'utf8'),/^branch=fm\/c1$/m);
+ assert.equal(state.n,1);for(const method of ['threads.spawn','threads.stop','threads.archive','threads.send','threads.retry','environments.remove'])assert.equal(host.harness.sdk.callsTo(method).length,0,method);
+ }finally{await host.harness.lifecycle.dispose();f.clean();}
+});
 test('native rebind refuses branch collision and a primary checkout before publication, leaving every source byte/work intact',()=>{
  const f=replacementFixture();try {
  const before=f.invariant();const plan={home:f.home,owner:'thr_cap',taskId:'c1',sourceThreadId:'thr_old',threadId:'thr_new',worktree:f.wt,project:f.repo,shape:'ship',mode:'direct-PR',generation:3,providerId:'acp-grok',model:'grok-4.6',reasoningLevel:'xhigh'};

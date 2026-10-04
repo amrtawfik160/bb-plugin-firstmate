@@ -10,6 +10,7 @@ function check(name,path,source,pattern,diagnostic) {
 }
 check('blanket stuck-ladder guard','server.ts',original.replace('if (!explicit && (crew.relaunches ?? 0) >= MAX_CREW_RELAUNCHES)','if ((crew.relaunches ?? 0) >= MAX_CREW_RELAUNCHES)'),'second user-directed',/second failure/);
 check('generation reused from recovery count','server.ts',original.replace('crew.id,plan.generation);','crew.id,(crew.relaunches??0)+2);'),'second user-directed',/conflicts with this exact request/);
+check('pending cache publication resumes from new worker instead of original source','server.ts',original.replace('return replaceCrew(source,opts);','return replaceCrew(current,opts);'),'final replacement journal',/unchanged execution|second failure/);
 const helper='overlay/bin/fm-worker-rebind.py',source=readFileSync(helper,'utf8');
 check('native branch-contract collision guard',helper,source.replace("    a.require(len(branches)==1 and fields.get('branch',branches[0])==branches[0],'immutable source branch conflict')","    a.require(len(branches)==1,'source branch missing')"),'native rebind refuses',/AssertionError/);
 assert.equal(readFileSync('server.ts','utf8'),original);console.log('Restored source bytes.');

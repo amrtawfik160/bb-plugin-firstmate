@@ -142,3 +142,43 @@ its native source pin was not upgraded (`/tmp/fm-model-scratch-install.log`). Al
 other native cases install current helpers into disposable audited clones.
 Parent must refresh each applicable BB mirror before activation of this commit;
 the existing audited old-pin installer suffices. No production operation occurred.
+
+## Correction: final journal publication fault
+
+Baseline `99017e7` had an additional crash boundary: the crew cache already held
+the replacement, but the final SQLite `replacement.published=true` write failed.
+Retry compared the target with that new worker and refused unchanged execution;
+ordinary recovery instead hit its newly consumed failure limit. A different
+target could not clear the unresolved launch. Parent reproduced this with the
+actual factory and a SQLite failure trigger at
+`/tmp/fm-std-replacement-final-publication.mjs`.
+
+Retry now recognizes only the exact returned worker, launch key, generation,
+owner/project/home, shape, mode and original delivery contract. It resumes from
+the durable original source snapshot. Deleted/retired identities and conflicting
+contracts refuse. Existing immutable request checks require the original intent,
+reason and target. The reservation retains its existing replacement identity;
+native preflight/publication remains guarded and idempotent. No second create,
+stop or archive occurs. The original branch and source snapshot are preserved.
+
+Four causal regressions inject the actual SQLite final-write failure after the
+crew cache/native endpoint succeeds, then reload and retry through CLI/tool
+entrypoints. They cover execution change and ordinary recovery at each audited
+native source pin. Changed targets refuse while publication is pending. Exact
+retry completes the same generation with one total worker, unchanged branch,
+HEAD/refs, saved skill, source brief/status, creation time and delivery contract.
+The mutation replacing original-source resumption with current-worker resumption
+kills these tests with unchanged-execution/second-failure refusals.
+
+Correction validation results are recorded below. Parent owns the final full
+suite and production retry. No production operation occurred.
+
+| Command | Result |
+| --- | --- |
+| `FIRSTMATE_TEST_NATIVE=/tmp/fm-launch-pr-verified FM_SCOUT_NATIVE_BIN=/tmp/fm-launch-pr-verified/bin-bb node --test --experimental-strip-types server.explicit-execution.test.mjs` | 29 passed, zero failures/skips; `/tmp/fm-model-publication-affected.log` |
+| `FIRSTMATE_TEST_NATIVE=/tmp/fm-launch-pr-verified FM_SCOUT_NATIVE_BIN=/tmp/fm-launch-pr-verified/bin-bb node --test --experimental-strip-types --test-name-pattern='retry\|replacement\|relaunch\|uncertain replacement' server.test.ts server.launch-delivery.test.mjs` | 22 passed, zero failures/skips; `/tmp/fm-model-publication-existing.log` |
+| `node --experimental-strip-types scripts/explicit-execution-mutation.mjs` | Four mutations killed, including final-publication resumption; bytes restored; `/tmp/fm-model-publication-mutation.log` |
+| `npx tsc --noEmit` | Passed |
+| `npm run fidelity -- --native /tmp/fm-launch-pr-verified` | Passed: 33 skills, 12 divergence anchors, seven BB-only fences |
+| `bb plugin build .` | Passed; no SDK pin change |
+| `git diff --check` | Passed |

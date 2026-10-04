@@ -4576,7 +4576,23 @@ export default async function plugin(bb: BbPluginApi) {
     return launches.once(`replacement-request:${request}`,()=>serializeLedger(`replacement-task:${crew.projectId}:${crew.parentThreadId}:${crew.id}`,async()=>{
       const current=(await readCrews()).find(c=>c.id===crew.id && c.projectId===crew.projectId && c.parentThreadId===crew.parentThreadId);
       if (!current || current.threadId!==crew.threadId) throw new Error("Worker changed or retired while replacement was queued; inspect before another request.");
-      return replaceCrew(current,opts);
+      // Cache publication precedes the durable completion marker. If that final
+      // write failed, resume using the immutable original source, not the new
+      // worker's execution or consumed recovery count. The existing reservation
+      // still enforces the exact request and retains its returned worker identity.
+      const pending=launches.forTask(current.projectId,current.parentThreadId??"",current.id);
+      let source=current;
+      if (pending?.replacement && !pending.replacement.published && pending.threadId===current.threadId) {
+        source=crewSchema.parse(pending.replacement.sourceCrew);
+        if (!['provisioning','uncertain'].includes(pending.state) || launches.isDeletedWorker(current.threadId) || await bb.storage.kv.get(`crew-retired:${current.threadId}`)===true ||
+            current.launchKey!==pending.key || current.replacementGeneration!==pending.generation ||
+            source.threadId!==pending.replacement.sourceThreadId || source.id!==current.id || source.projectId!==current.projectId ||
+            source.parentThreadId!==current.parentThreadId || source.nativeHome!==current.nativeHome || (source.nativeHome??"")!==pending.home ||
+            source.shape!==current.shape || source.posture!==current.posture || source.deliveryRequirement!==current.deliveryRequirement) {
+          throw new Error("Pending replacement publication conflicts with current worker identity or task contract; inspect before retry.");
+        }
+      }
+      return replaceCrew(source,opts);
     }));
   }
   async function replaceCrew(crew:Crew,opts:{providerId?:string;model?:string;reasoningLevel?:ReasoningLevel;note?:string;overCap?:boolean;intent?:ReplacementIntent;caller?:string}):Promise<Crew> {
