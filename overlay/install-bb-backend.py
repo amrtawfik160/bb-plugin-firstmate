@@ -239,6 +239,8 @@ OVERLAY_INSTALL_INPUTS = (
     "bin/fm-inbox-take.py",
     "bin/fm-launch-adopt.sh",
     "bin/fm-launch-adopt.py",
+    "bin/fm-worker-rebind.sh",
+    "bin/fm-worker-rebind.py",
     "docs/bb-backend.md",
     "firstmate-bb-backend.patch",
     "firstmate-bb-teardown.patch",
@@ -258,7 +260,7 @@ OVERLAY_INSTALL_INPUTS = (
 TRANSPORT_PAYLOADS = (
     "backends/bb.sh", "backends/bb-worker-transport.txt",
     "backends/bb-worker-prompt.py", "fm-inbox-take.sh", "fm-inbox-take.py",
-    "fm-launch-adopt.sh", "fm-launch-adopt.py",
+    "fm-launch-adopt.sh", "fm-launch-adopt.py", "fm-worker-rebind.sh", "fm-worker-rebind.py",
 )
 
 
@@ -310,7 +312,7 @@ def build_mirror(home: Path, overlay: Path) -> Path:
             os.symlink(os.path.join("..", "bin", entry), staging / entry)
 
         source_shas = generate_patched_copies(home, overlay, staging, selection)
-        for helper_name in ("fm-inbox-take.sh", "fm-inbox-take.py", "fm-launch-adopt.sh", "fm-launch-adopt.py"):
+        for helper_name in ("fm-inbox-take.sh", "fm-inbox-take.py", "fm-launch-adopt.sh", "fm-launch-adopt.py", "fm-worker-rebind.sh", "fm-worker-rebind.py"):
             helper = overlay / "bin" / helper_name
             if not helper.is_file():
                 die(f"missing {helper}")

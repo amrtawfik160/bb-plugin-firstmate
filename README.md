@@ -110,6 +110,13 @@ Three layers:
 
 BB core's ACP dynamic-tool bridge can reject a long-lived tool call at its timeout boundary before the plugin can observe or catch the transport failure.
 The agent tool therefore never opens that blocking path.
+An owning captain can make an explicitly user-directed execution change with
+`bb firstmate retry <crew-id> --intent execution-change --reason '<user request>' --provider <id> --model <id> --reasoning-level <level>`.
+The current public SDK catalog must confirm an actual change. It preserves the
+same environment and native task contract and does not consume failure recovery
+allowance. Missing intent retains the existing recovery limit. See
+[execution-change evidence and preconditions](docs/verification/explicit-model-change.md).
+
 If the bridge still reports `dynamic tool request failed` around the short handoff, the manager does not retry; private crew events and the durable queue continue independently.
 
 Confirmed live crew reports stay durable during the captain turn and are acknowledged through Firstmate's native wake drain when that turn completes. The optional turn-end re-ring remains available, but `/captain` leaves it off so the manager starts only for a new crew event.

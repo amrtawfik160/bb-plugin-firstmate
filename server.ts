@@ -54,6 +54,7 @@ import { ORPHAN_SWEEP_BUDGET_MS, ORPHAN_SWEEP_INTERVAL_MS, parseStaleLavishSourc
 import { nativeBearingsProjection } from "./lib/native-bearings.ts";
 import { createSnapshotReads } from "./lib/snapshot-reads.ts";
 import { scoutReports } from "./lib/scout-report.ts";
+import { replacementPlan, type ReplacementIntent } from "./lib/replacement.ts";
 import { createQueueStore, type QueueItem } from "./lib/queue-store.ts";
 import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRecord } from "./lib/launch.ts";
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
@@ -103,6 +104,7 @@ const crewSchema = z.object({
   // Recovery relaunches so far and the threads they replaced, so the stuck ladder
   // stops at its second failure and a replaced thread id still resolves.
   relaunches: z.number().optional(),
+  replacementGeneration:z.number().int().positive().optional(),
   priorThreadIds: z.array(z.string()).optional(),
   // The dispatch title the captain asked for. Relaunch reuses it and captain-facing
   // labels prefer it over the raw task quote.
@@ -1110,6 +1112,8 @@ export const OVERLAY_INSTALL_INPUTS = [
   "bin/fm-inbox-take.py",
   "bin/fm-launch-adopt.sh",
   "bin/fm-launch-adopt.py",
+  "bin/fm-worker-rebind.sh",
+  "bin/fm-worker-rebind.py",
   "docs/bb-backend.md",
   "firstmate-bb-backend.patch",
   "firstmate-bb-teardown.patch",
@@ -1990,6 +1994,8 @@ export default async function plugin(bb: BbPluginApi) {
   // The full brief, for the few paths that re-send it (relaunch, brief publish, context).
   async function fullCrewTask(crew: Crew): Promise<string> {
     if (crew.taskSpilled !== true) return crew.task;
+    const replacement=crew.launchKey ? launches.get(crew.launchKey)?.replacement?.task : undefined;
+    if (replacement?.startsWith(crew.task)) return replacement;
     const adopted=crew.launchKey ? launches.adoptionTask(crew.launchKey) : undefined;
     if (adopted?.startsWith(crew.task)) return adopted;
     const full = await bb.storage.kv.get<unknown>(`${CREW_TASK_PREFIX}${crew.id}`);
@@ -3745,7 +3751,16 @@ export default async function plugin(bb: BbPluginApi) {
             if (!metaFlag(meta, "crew")) return null;
             const id = typeof meta["crewId"] === "string" ? meta["crewId"] : row.threadId.slice(0, 8);
             const launch = typeof meta["launchKey"] === "string" ? launches.get(meta["launchKey"]) : launches.forTask(row.projectId,typeof row.parentThreadId === "string" ? row.parentThreadId : "",id);
+            const latestLaunch=launches.forTask(row.projectId,typeof row.parentThreadId === "string"?row.parentThreadId:"",id);
+            const original=launch?.replacement?crewSchema.parse(launch.replacement.sourceCrew):undefined;
+            if (launch?.replacement && !launch.replacement.published) {
+              if (launches.isDeletedWorker(launch.replacement.sourceThreadId) || await bb.storage.kv.get(`crew-retired:${launch.replacement.sourceThreadId}`)===true) return null;
+              return original!;
+            }
+            if (latestLaunch?.replacement && latestLaunch.replacement.sourceThreadId===row.threadId && latestLaunch.threadId!==row.threadId) return null;
+
             return {
+              ...original,
               id,
               launchKey:typeof meta["launchKey"] === "string" ? meta["launchKey"] : launch?.key,
               deliveryRequirement:recoveredContract(meta,launch),
@@ -3755,13 +3770,16 @@ export default async function plugin(bb: BbPluginApi) {
               projectId: row.projectId,
               threadId: row.threadId,
               parentThreadId: typeof row.parentThreadId === "string" ? row.parentThreadId : null,
-              providerId: null,
-              model: null,
-              reasoningLevel: null,
+              providerId:launch?.execution?.providerId ?? null,
+              model:launch?.execution?.model ?? null,
+              reasoningLevel:launch?.execution?.reasoningLevel ?? null,
+              relaunches:launch?.replacement?.recoveryCount ?? Math.max(typeof meta.relaunches==='number'?meta.relaunches:0,(launch?.generation ?? (typeof meta.generation==='number'?meta.generation:1))-1),
+              replacementGeneration:launch?.generation ?? (typeof meta.generation==='number'?meta.generation:1),
+              ...(launch?.replacement?{priorThreadIds:[...(original?.priorThreadIds??[]),launch.replacement.sourceThreadId],taskSpilled:true}:{}),
               worktree: metaFlag(meta, "worktree"),
               shape: toShape(meta["shape"]),
               posture: typeof meta["posture"] === "string" ? meta["posture"] : "direct-PR",
-              createdAt: "",
+              createdAt:original?.createdAt??"",
             };
           } catch {
             return null;
@@ -4004,6 +4022,7 @@ export default async function plugin(bb: BbPluginApi) {
     parentThreadId: string | undefined,
     reasoningLevel?: ReasoningLevel,
     selectedHost?:string,
+    strict=false,
   ): Promise<void> {
     let resolvedProvider=providerId;
     if (!resolvedProvider && (model || reasoningLevel)) try { resolvedProvider=(await bb.sdk.projects.defaultExecutionOptions({projectId}))?.providerId; } catch { /* default is unresolved */ }
@@ -4016,11 +4035,12 @@ export default async function plugin(bb: BbPluginApi) {
     try {
       providers = await raceAbort(bb.sdk.providers.list(routing), undefined, STUCK_HOST_CALL_MS);
     } catch (error) {
+      if (strict) throw new Error("Execution change refused: provider catalog unreadable.");
       bb.log.warn(`provider catalog unreadable (project=${projectId}); dispatch not pre-validated: ${error instanceof Error ? error.message : String(error)}`);
       return;
     }
     const rows = Array.isArray(providers) ? providers.map(asRecord) : [];
-    if (rows.length === 0) return;
+    if (rows.length === 0) {if (strict) throw new Error("Execution change refused: provider catalog is empty.");return;}
     if (pid !== "") {
       const ids = rows.map((p) => p["id"]).filter((id): id is string => typeof id === "string");
       const hit = rows.find((p) => p["id"] === pid);
@@ -4031,6 +4051,7 @@ export default async function plugin(bb: BbPluginApi) {
           `Unknown providerId "${pid}"${near.length > 0 ? ` — did you mean ${near.map((id) => `"${id}"`).join(" or ")}?` : "."} Known providers: ${ids.join(", ")}. Nothing was spawned.`,
         );
       }
+      if (strict && reasoningLevel && !Array.isArray(hit["reasoningLevels"])) throw new Error("Execution change refused: reasoning capability is unknown.");
       if (reasoningLevel && Array.isArray(hit["reasoningLevels"]) && !hit["reasoningLevels"].some((level:unknown) => asRecord(level)["id"] === reasoningLevel)) {
         throw new Error(`Provider "${pid}" does not advertise reasoning level "${reasoningLevel}". Nothing was spawned.`);
       }
@@ -4043,11 +4064,13 @@ export default async function plugin(bb: BbPluginApi) {
     try {
       catalog = asRecord(await raceAbort(bb.sdk.providers.models({ ...routing, ...(pid !== "" ? { providerId: pid } : {}) }), undefined, STUCK_HOST_CALL_MS));
     } catch {
+      if (strict) throw new Error("Execution change refused: model catalog unreadable.");
       return;
     }
     const models = Array.isArray(catalog["models"]) ? (catalog["models"] as unknown[]).map(asRecord) : [];
-    if (catalog["modelLoadError"] != null || models.length === 0) return;
+    if (catalog["modelLoadError"] != null || models.length === 0) {if (strict) throw new Error("Execution change refused: model catalog is unresolved.");return;}
     if (models.some((m) => m["id"] === mid || m["model"] === mid)) return;
+    if (strict) throw new Error(`Execution change refused: model ${mid} is not in the selected provider catalog.`);
     // The catalog lists canonical ids only; providers also accept aliases and
     // selected models outside it, so an unlisted model is not a refusal. A model
     // the provider really rejects shows up as a thread born in error, which
@@ -4261,7 +4284,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function launchEnvironmentReady(record:LaunchRecord,env:{hostId:string;status:string;path:string|null},signal?:AbortSignal) {
-    if (record.adoption?.phase === "publishing") return false;
+    if (record.adoption?.phase === "publishing" || record.replacement && !record.replacement.published) return false;
     if (env.status !== "ready" || !env.path || (record.hostId && env.hostId !== record.hostId)) return false;
     if (!record.nativeInvoked) return true;
     return await readFmMetaField(env.hostId,record.taskId,"bb_thread_id",record.home,signal) === record.threadId;
@@ -4535,10 +4558,33 @@ export default async function plugin(bb: BbPluginApi) {
     return `Read the complete durable scout report with: bb firstmate scout-report ${scout.id}. Keep its recommendations and acceptance criteria intact.`;
   }
 
+  async function rebindReplacement(source:Crew,next:Crew,hostId:string,worktree:string,generation:number,check=false,briefSha?:string) {
+    const home=await crewNativeHome(source);if (!home) return "";
+    const project=await projectCheckoutPath(source.projectId,hostId);
+    if (!project) throw new Error("Replacement native project checkout is unresolved.");
+    const result=await runFmScript({script:"worker-rebind",signal:launchAbort.signal,args:[check?"--check":"--publish"],hostId,fmHome:home,projectId:source.projectId,timeoutMs:30_000,
+      stdin:JSON.stringify({home,owner:source.parentThreadId??"",taskId:source.id,sourceThreadId:source.threadId,threadId:next.threadId,worktree,project,shape:source.shape,mode:source.posture,generation,check,briefSha,providerId:next.providerId,model:next.model,reasoningLevel:next.reasoningLevel})});
+    requireNativeSuccess(result,check?"worker replacement preflight":"worker replacement publication");
+    const sha=/^FM_BB_REBIND_SOURCE_SHA=([a-f0-9]{64})$/m.exec(result.output)?.[1];if (!sha) throw new Error("Replacement native source evidence missing.");return sha;
+  }
+
   async function relaunchCrew(
     crew: Crew,
-    opts: { providerId?: string; model?: string; reasoningLevel?: ReasoningLevel; note?: string; overCap?: boolean },
+    opts: { providerId?: string; model?: string; reasoningLevel?: ReasoningLevel; note?: string; overCap?: boolean;intent?:ReplacementIntent;caller?:string },
   ): Promise<Crew> {
+    const request=JSON.stringify([crew.projectId,crew.parentThreadId,crew.id,crew.threadId,opts]);
+    return launches.once(`replacement-request:${request}`,()=>serializeLedger(`replacement-task:${crew.projectId}:${crew.parentThreadId}:${crew.id}`,async()=>{
+      const current=(await readCrews()).find(c=>c.id===crew.id && c.projectId===crew.projectId && c.parentThreadId===crew.parentThreadId);
+      if (!current || current.threadId!==crew.threadId) throw new Error("Worker changed or retired while replacement was queued; inspect before another request.");
+      return replaceCrew(current,opts);
+    }));
+  }
+  async function replaceCrew(crew:Crew,opts:{providerId?:string;model?:string;reasoningLevel?:ReasoningLevel;note?:string;overCap?:boolean;intent?:ReplacementIntent;caller?:string}):Promise<Crew> {
+    const intent=opts.intent??'failure-recovery';
+    const explicit=intent==='execution-change';
+    if (explicit && opts.overCap) throw new Error("Execution change does not permit a capacity override.");
+    if (explicit && (!opts.caller || crew.parentThreadId!==opts.caller || !(opts.note??'').trim())) throw new Error("Execution change requires the owning captain and an explicit user-directed reason.");
+    if (launches.isDeletedWorker(crew.threadId) || await bb.storage.kv.get(`crew-retired:${crew.threadId}`)===true) throw new Error("Source worker was deleted or explicitly retired; replacement refused.");
     crew={...crew,deliveryRequirement:await contractForCrew(crew)};
     if (isSecondmateRoute(crew)) {
       throw new Error(`Crew ${crew.id} is a secondmate route — relaunch the domain captain thread directly.`);
@@ -4546,27 +4592,33 @@ export default async function plugin(bb: BbPluginApi) {
     if (await isCaptainThread(crew.threadId)) {
       throw new Error("Refusing to relaunch the captain thread.");
     }
-    if ((crew.relaunches ?? 0) >= MAX_CREW_RELAUNCHES) {
+    if (!explicit && (crew.relaunches ?? 0) >= MAX_CREW_RELAUNCHES) {
       throw new Error(
         `Crew ${crew.id} was already relaunched ${crew.relaunches} time(s). Stuck ladder: second failure means report it failed with preserved work; do not relaunch again.`,
       );
     }
     const envId = await threadEnv(crew.threadId);
     if (envId === null) throw new Error(`Crew ${crew.id} has no environment to reuse.`);
-    const providerId = opts.providerId ?? crew.providerId ?? undefined;
-    const model = opts.model ?? crew.model ?? undefined;
-    const reasoningLevel = opts.reasoningLevel ?? toReasoningLevel(crew.reasoningLevel);
+    const actual=explicit?await raceAbort(bb.sdk.threads.defaultExecutionOptions({threadId:crew.threadId}),launchAbort.signal,STUCK_HOST_CALL_MS):undefined;
+    const originalThread=explicit?await raceAbort(bb.sdk.threads.get({threadId:crew.threadId}),launchAbort.signal,STUCK_HOST_CALL_MS):undefined;
+    if (explicit && (!actual || !originalThread?.providerId || originalThread.projectId!==crew.projectId || originalThread.parentThreadId!==opts.caller)) throw new Error("Execution change refused: authoritative current execution/ownership is unresolved.");
+    if (explicit && opts.reasoningLevel===undefined && toReasoningLevel(actual!.reasoningLevel)===undefined) throw new Error("Current reasoning value is unsupported; supply an explicit supported target rather than omit it.");
+    const providerId = opts.providerId ?? originalThread?.providerId ?? crew.providerId ?? undefined;
+    const model = opts.model ?? actual?.model ?? crew.model ?? undefined;
+    const reasoningLevel = opts.reasoningLevel ?? toReasoningLevel(actual?.reasoningLevel??crew.reasoningLevel);
+    if (explicit && providerId===originalThread!.providerId && model===actual!.model && reasoningLevel===actual!.reasoningLevel) throw new Error("Execution change requires an actual provider/model/reasoning change; unchanged execution remains subject to failure recovery limits.");
     // Validate a replacement before the old thread is stopped, never after.
-    const reusedEnvironment=await bb.sdk.environments.get({environmentId:envId});
-    await validateProviderChoice(providerId, model, crew.projectId, crew.parentThreadId ?? undefined,reasoningLevel,reusedEnvironment.hostId);
-    const capped = capPermission(undefined, await parentPermission(crew.parentThreadId ?? undefined));
+    const reusedEnvironment=await raceAbort(bb.sdk.environments.get({environmentId:envId}),launchAbort.signal,STUCK_HOST_CALL_MS);
+    if (explicit && (reusedEnvironment.status!=="ready" || crew.worktree && !reusedEnvironment.isWorktree || !reusedEnvironment.path)) throw new Error("Execution change requires the ready original worktree.");
+    await validateProviderChoice(providerId, model, crew.projectId, crew.parentThreadId ?? undefined,reasoningLevel,reusedEnvironment.hostId,explicit);
+    const capped = capPermission(actual?toPermissionMode(actual.permissionMode):undefined, await parentPermission(crew.parentThreadId ?? undefined));
     await ensureWorkspace(crew.threadId, crew);
     const note = (opts.note ?? "").trim();
     const task = await fullCrewTask(crew);
     const fmHome = await crewNativeHome(crew);
     let workerPrompt: string;
     if (fmHome !== "") {
-      const hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
+      const hostId = reusedEnvironment.hostId;
       const briefDir = `${fmHome}/data/${crew.id}`;
       const command = [
         `export FM_HOME=${shQuote(fmHome)} FM_ROOT=${shQuote(fmHome)}`,
@@ -4576,7 +4628,7 @@ export default async function plugin(bb: BbPluginApi) {
         `brief=${shQuote(`${briefDir}/launch-brief.md`)}; [ -e "$brief" ] || brief=${shQuote(`${briefDir}/brief.md`)}`,
         `fm_backend_bb_worker_prompt "$brief" ${shQuote(crew.shape)} ${shQuote(crew.id)} ${shQuote(crew.posture)}`,
       ].join("\n");
-      const result = await runOnHost(hostId, command, 30_000);
+      const result = await runOnHost(hostId, command, 30_000,launchAbort.signal);
       if (result.exitCode !== 0 || result.output.trim() === "") {
         throw new Error(`Native relaunch brief unavailable for crew ${crew.id}: ${result.output.trim() || `exit ${result.exitCode}`}. Prior thread preserved.`);
       }
@@ -4588,20 +4640,36 @@ export default async function plugin(bb: BbPluginApi) {
     const prompt = [workerPrompt, "",
       `RELAUNCH: the prior thread was replaced. Continue the same task in this same worktree.${note !== "" ? ` Progress note: ${note}` : ""}`,
     ].join("\n");
-    const key = launchKey(crew.projectId,crew.parentThreadId ?? "",crew.nativeHome ?? "",crew.id,(crew.relaunches ?? 0)+2);
+    const plan=replacementPlan(crew,launches.forTask(crew.projectId,crew.parentThreadId??"",crew.id),{
+      sourceCrew:{...crew,task,taskSpilled:false},sourceThreadId:crew.threadId,environmentId:envId,intent,reason:note,recoveryCount:(crew.relaunches??0)+(explicit?0:1),task,prompt,
+      target:{providerId:providerId??null,model:model??null,reasoningLevel:reasoningLevel??null},
+    });
+    const key = launchKey(crew.projectId,crew.parentThreadId ?? "",crew.nativeHome ?? "",crew.id,plan.generation);
     let reservation = await launches.reserve({ key,taskId:crew.id,projectId:crew.projectId,owner:crew.parentThreadId ?? "",home:crew.nativeHome ?? "",
-      generation:(crew.relaunches ?? 0)+2,shape:crew.shape,deliveryMode:crew.posture,deliveryRequirement:crew.deliveryRequirement,state:"reserved",threadId:null,hostId:reusedEnvironment.hostId,path:reusedEnvironment.path ?? undefined,updatedAt:Date.now() }, () => launchCapacity(crew.parentThreadId ?? undefined),opts.overCap);
+      generation:plan.generation,replacement:plan.contract,shape:crew.shape,deliveryMode:crew.posture,deliveryRequirement:crew.deliveryRequirement,state:"reserved",threadId:null,hostId:reusedEnvironment.hostId,path:reusedEnvironment.path ?? undefined,updatedAt:Date.now() }, () => launchCapacity(crew.parentThreadId ?? undefined),opts.overCap);
+    if (JSON.stringify(reservation.replacement?.target)!==JSON.stringify(plan.contract.target) || reservation.replacement?.sourceThreadId!==crew.threadId || reservation.replacement.intent!==intent || reservation.replacement.reason!==note) throw new Error("Replacement reservation conflicts with this exact request.");
     reservation = await reconcileLaunch(reservation);
+    if (fmHome) {
+      const sha=await rebindReplacement(crew,{...crew,threadId:reservation.threadId??crew.threadId,providerId:providerId??null,model:model??null,reasoningLevel:reasoningLevel??null},reusedEnvironment.hostId,reusedEnvironment.path??"",plan.generation,true,reservation.replacement!.nativeBriefSha);
+      if (!reservation.replacement!.nativeBriefSha) reservation=launches.update(key,{replacement:{...reservation.replacement!,nativeBriefSha:sha}});
+    }
     // Release only after the replacement's native instructions are readable and a
     // durable slot exists. Unknown creation is reconciled before stopping again.
     if (!reservation.threadId) {
-      await bb.sdk.threads.stop({ threadId: crew.threadId });
-      await bb.sdk.threads.archive({threadId:crew.threadId});
+      if (!reservation.replacement!.stopped) {
+        await raceAbort(bb.sdk.threads.stop({ threadId: crew.threadId }),launchAbort.signal,STUCK_HOST_CALL_MS);
+        reservation=launches.update(key,{replacement:{...reservation.replacement!,stopped:true}});
+      }
+      if (!reservation.replacement!.archived) {
+        const source=await raceAbort(bb.sdk.threads.get({threadId:crew.threadId}),launchAbort.signal,STUCK_HOST_CALL_MS);
+        if (!source.archivedAt) await raceAbort(bb.sdk.threads.archive({threadId:crew.threadId}),launchAbort.signal,STUCK_HOST_CALL_MS);
+        reservation=launches.update(key,{replacement:{...reservation.replacement!,archived:true}});
+      }
     }
     const replacement = await launches.create(key, () => bb.sdk.threads.spawn({
       projectId: crew.projectId,
       environment: { type: "reuse", environmentId: envId },
-      prompt,
+      prompt:reservation.replacement!.prompt,
       title: crewThreadTitle(task, crew.shape, crew.id, crew.title),
       parentThreadId: crew.parentThreadId ?? undefined,
       providerId,
@@ -4611,7 +4679,7 @@ export default async function plugin(bb: BbPluginApi) {
       visibility: "visible",
       pluginMetadata: {
         crew: "true", launchKey:key,generation:reservation.generation,
-        crewId: crew.id,
+        crewId: crew.id, replacementIntent:intent,relaunches:plan.contract.recoveryCount,replacementGeneration:plan.generation,taskSpilled:task.length>500,
         nativeHome: crew.nativeHome ?? "",
         task: task.slice(0, 500),
         ...(crew.title !== undefined ? { title: crew.title } : {}),
@@ -4626,7 +4694,8 @@ export default async function plugin(bb: BbPluginApi) {
       providerId: providerId ?? null,
       model: model ?? null,
       reasoningLevel: reasoningLevel ?? null,
-      relaunches: (crew.relaunches ?? 0) + 1,
+      relaunches: plan.contract.recoveryCount,
+      replacementGeneration:plan.generation,launchKey:key,
       priorThreadIds: [...(crew.priorThreadIds ?? []), crew.threadId],
     };
     try {
@@ -4635,12 +4704,16 @@ export default async function plugin(bb: BbPluginApi) {
     } catch { /* Defaults remain explicitly unresolved. */ }
     try { next.providerId=(await raceAbort(bb.sdk.threads.get({threadId:next.threadId}),launchAbort.signal,STUCK_HOST_CALL_MS)).providerId; }
     catch { /* Keep the requested provider when core cannot report it. */ }
-    launches.update(key,{ state:reusedEnvironment.status === "ready" && reusedEnvironment.path ? "running" : "provisioning",execution:{providerId:next.providerId,model:next.model,reasoningLevel:next.reasoningLevel} });
-    await mutateCrews(crews => crews.map((c) => (c.id === crew.id ? next : c)));
+    launches.update(key,{ state:"provisioning",execution:{providerId:next.providerId,model:next.model,reasoningLevel:next.reasoningLevel} });
+
     // The old thread was archived before creation; unknown outcomes retain the
     // reserved replacement slot and recover by exact generation metadata.
+    if (launches.isDeletedWorker(next.threadId) || launches.get(key)?.state==='deleted') throw new Error("Replacement was deleted; native publication refused, preserved work requires inspection.");
+    if (fmHome && !await rebindReplacement(crew,next,reusedEnvironment.hostId,reusedEnvironment.path??"",plan.generation,false,reservation.replacement!.nativeBriefSha)) throw new Error("Replacement worker exists; native endpoint publication pending. Repeat this exact retry request; do not create another worker.");
+    if (launches.isDeletedWorker(next.threadId)) throw new Error("Replacement was deleted during publication; crew cache remains unresolved.");
+    await mutateCrews(crews => crews.map((c) => (c.id === crew.id && c.projectId===crew.projectId && c.parentThreadId===crew.parentThreadId ? next : c)));
     await publishFleet();
-    await publishFmMeta({ crew: next, scheduled: false });
+    launches.update(key,{state:reusedEnvironment.status === "ready" && reusedEnvironment.path ? "running" : "provisioning",replacement:{...launches.get(key)!.replacement!,published:true}});
     return next;
   }
 
@@ -8924,7 +8997,7 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb firstmate deliveries list|inspect|register|reconcile|assign|abandon|verify [id] [--from manager] [--reason evidence] [--authorized]",
     "  sendAt is unsupported; backlog waitUntil requires later explicit dispatch.",
     "  bb firstmate crews | crew <id> | watch [id ...] [--timeout s] [--json]",
-    '  bb firstmate tell <id> [--queue] -- "<message>" | interrupt <id> | stop <id> | retry <id> [--model m] [--provider p] [--reasoning-level l] [--reason r]',
+    '  bb firstmate tell <id> [--queue] -- "<message>" | interrupt <id> | stop <id> | retry <id> [--model m] [--provider p] [--reasoning-level l] [--intent failure-recovery|execution-change] [--reason r]',
     "  bb firstmate scout-report <id> [--json]   # complete owned promotion artifact",
     "  bb firstmate bearings | deliver <id> | merge <id> [--yes] [--allow-red <check-name>] [--allow-missing <check-name>] | promote <id>",
     "  bb firstmate handoff --from <previous-captain-thread> [--crew <id>]",
@@ -9412,7 +9485,7 @@ export default async function plugin(bb: BbPluginApi) {
   registerCaptainTool({
     name: "firstmate_retry",
     description:
-      "Re-run a crew. With no provider/model/reasoning override, re-submits the failed turn on the same thread. With any override, relaunches a fresh thread in the SAME worktree at the new provider/model/reasoning (recovery relaunch).",
+      "Re-run a crew. With no provider/model/reasoning override, re-submits the failed turn on the same thread. With any override, relaunches a fresh thread in the SAME worktree at the new provider/model/reasoning (recovery relaunch). Explicit intent=execution-change with user-directed reason validates a changed execution under its owner without consuming failure recovery allowance.",
     parameters: z.object({
       crewId: z.string(),
       reason: z.string().optional(),
@@ -9420,13 +9493,15 @@ export default async function plugin(bb: BbPluginApi) {
       providerId: z.string().optional().describe("Replacement provider — triggers a relaunch reusing the worktree"),
       reasoningLevel: z.enum(["low", "medium", "high", "xhigh", "max", "ultra", "none", "ultracode"]).optional()
         .describe("Replacement reasoning effort — triggers a relaunch reusing the worktree"),
+      intent:z.enum(["failure-recovery","execution-change"]).optional().describe("execution-change requires an explicit user-directed reason and an actual validated change, under the owning captain; does not consume failure recovery allowance"),
       overCap: z.boolean().optional().describe("Retry even past the running-crew cap (only on the captain's word)"),
     }),
-    async execute({ crewId, reason, model, providerId, reasoningLevel, overCap },ctx) {
+    async execute({ crewId, reason, model, providerId, reasoningLevel, overCap,intent },ctx) {
       const crew = await findCrew(crewId,ctxString(ctx,"threadId"));
       if (crew === undefined) return toolError(`No crew ${crewId}.`);
       const replace = model !== undefined || providerId !== undefined || reasoningLevel !== undefined;
       try {
+        if (intent==='execution-change' && !replace) throw new Error("Execution change requires an explicit provider/model/reasoning override.");
         if (!replace) {
           const capped = await capRefusalToWake(crew, overCap === true);
           if (capped !== null) return toolError(capped);
@@ -9437,7 +9512,7 @@ export default async function plugin(bb: BbPluginApi) {
           model,
           providerId,
           reasoningLevel: toReasoningLevel(reasoningLevel),
-          note: reason, overCap:overCap === true,
+          note: reason, overCap:overCap === true,intent,caller:ctxString(ctx,"threadId"),
         });
         return `Relaunched crew ${crewId} as thread ${next.threadId} (${next.providerId ?? "default provider"}/${next.model ?? "default model"}/${next.reasoningLevel ?? "default reasoning"}), same worktree.`;
       } catch (error) {
@@ -10608,7 +10683,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "tell", summary: "Steer a running crew mid-turn (course correction); --queue for a non-urgent note", usage: 'bb firstmate tell <crew-id> [--queue] [--resolve-key <key>] -- "<message>"' },
       { name: "interrupt", summary: "Steer a hard stop without teardown", usage: "bb firstmate interrupt <crew-id>" },
       { name: "stop", summary: "Stop a crew thread", usage: "bb firstmate stop <crew-id>" },
-      { name: "retry", summary: "Re-submit a failed turn, or relaunch with a new model/provider/reasoning", usage: "bb firstmate retry <crew-id> [--model m] [--provider p] [--reasoning-level l]" },
+      { name: "retry", summary: "Retry failure, or explicitly change execution under the owning captain with a user-directed reason", usage: "bb firstmate retry <crew-id> [--model m] [--provider p] [--reasoning-level l] [--intent execution-change --reason r]" },
       { name: "activity", summary: "Bounded real BB activity for the native watcher", usage: "bb firstmate activity <thread-id> --json" },
       { name: "bearings", summary: "Fleet digest", usage: "bb firstmate bearings [--json]" },
       { name: "wake", summary: "Drain the durable crew→captain wake queue (present, or --ack-through <seq> --recovery-generation <gen>)", usage: "bb firstmate wake [--ack-through <seq> --recovery-generation <gen>]" },
@@ -10930,6 +11005,8 @@ export default async function plugin(bb: BbPluginApi) {
             const providerId = flagStr(flags, "provider");
             const reasoningLevel = strictReasoning(flagStr(flags, "reasoning-level"));
             const reason = flagStr(flags, "reason");
+            const intent=z.enum(["failure-recovery","execution-change"]).parse(flagStr(flags,"intent")??"failure-recovery");
+            if (intent==='execution-change' && model===undefined && providerId===undefined && reasoningLevel===undefined) return fail("Execution change requires an explicit provider/model/reasoning override.");
             if (model === undefined && providerId === undefined && reasoningLevel === undefined) {
               const overCap = await capRefusalToWake(crew, flags.has("over-cap"));
               if (overCap !== null) return fail(overCap);
@@ -10937,7 +11014,7 @@ export default async function plugin(bb: BbPluginApi) {
               const outcome = await retryCrewTurn(crew, reason);
               return reply({ retried: outcome.startsWith("Retried"), id }, outcome);
             }
-            const next = await relaunchCrew(crew, { model, providerId, reasoningLevel, note: reason, overCap:flags.has("over-cap") });
+            const next = await relaunchCrew(crew, { model, providerId, reasoningLevel, note: reason, overCap:flags.has("over-cap"),intent,caller:ctxThread });
             return reply(
               { relaunched: true, id, threadId: next.threadId, model: next.model, providerId: next.providerId, reasoningLevel: next.reasoningLevel },
               `Relaunched crew ${id} as thread ${next.threadId} (${next.providerId ?? "default provider"}/${next.model ?? "default model"}/${next.reasoningLevel ?? "default reasoning"}), same worktree.`,

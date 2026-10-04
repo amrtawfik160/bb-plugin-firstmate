@@ -1,3 +1,4 @@
+import {replacementFixture} from './lib/replacement.fixture.mjs';
 import { fixture as nativePromptFixture,scaffold as nativePromptScaffold } from './scripts/prompt-fixture.mjs';
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
@@ -10789,24 +10790,24 @@ test("CLI startup returns the same harness-shell command without host execution"
 
 for (const missing of [false, true]) {
   test(`native replacement retry ${missing ? "preserves the prior thread when its brief is missing" : "uses the native brief through the shared transport wrapper"}`, async () => {
-    const home = nativePromptFixture();
+    const f=replacementFixture(undefined,"ship","local-only");
+    const home=f.home;
     if (!missing) {
-      const f=nativePromptScaffold(home,"c1","ship","local-only");
       const role=spawnSync("bash",["-c",'. "$1"; fm_brief_worker_role "$2" c1',"fixture",join(home,"bin/fm-dod-lib.sh"),join(home,"state")],{encoding:"utf8"});
       assert.equal(role.status,0,role.stderr);
-      writeFileSync(join(home,"data/c1/launch-brief.md"),role.stdout+"\n"+f.text);
-      writeFileSync(join(home,"data/c1/brief.md"),"stale source must not replace the authoritative launch brief");
-    }
+      writeFileSync(join(home,"data/c1/launch-brief.md"),role.stdout+"\n"+f.brief);
+    } else {rmSync(join(home,"data/c1/brief.md"));}
     const host = itHost(home, { transport: "real" });
     await plugin(host.bb);
     try {
       stubRealExecHost(host);
       host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: "error", environmentId: "env_wt" }));
-      host.harness.sdk.stub("environments.get", async () => ({ id: "env_wt", hostId: "host_1", status: "ready", path: "/repo/isolated", isWorktree: true }));
+      host.harness.sdk.stub("environments.get", async () => ({ id: "env_wt", hostId: "host_1", status: "ready", path: f.wt, isWorktree: true }));
       host.harness.sdk.stub("threads.stop", async () => ({}));
       host.harness.sdk.stub("threads.archive", async () => ({}));
       host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_new" }));
-      await host.bb.storage.kv.set("crews", [{ ...crewRow("c1", "thr_crew", "thr_cap"), nativeHome: home, backlogRow: true }]);
+      host.harness.sdk.stub("environments.list", async()=>[{id:"env_source",hostId:"host_1",status:"ready",path:f.repo,isWorktree:false}]);
+      await host.bb.storage.kv.set("crews", [{ ...crewRow("c1", "thr_old", "thr_cap"), posture:"local-only",nativeHome: home, backlogRow: true }]);
       const result = await host.harness.behavior.runCli(["retry", "c1", "--reasoning-level", "xhigh"]);
       assert.equal(result.exitCode, missing ? 1 : 0, result.stderr);
       if (missing) {
@@ -10820,7 +10821,7 @@ for (const missing of [false, true]) {
         assert.doesNotMatch(spawned.prompt,/stale source must not replace/);
         assert.doesNotMatch(spawned.prompt, /Never poll CI|WAITING:|stop every timer|final message MUST/);
       }
-    } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
+    } finally { await host.harness.lifecycle.dispose(); f.clean(); }
   });
 }
 
