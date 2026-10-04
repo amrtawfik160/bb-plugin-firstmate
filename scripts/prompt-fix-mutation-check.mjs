@@ -6,6 +6,7 @@ import {tmpdir} from 'node:os';
 import {spawnSync} from 'node:child_process';
 const root=resolve('.'),scratch=mkdtempSync(join(tmpdir(),'fm-prompt-mutations-'));
 const cases=[
+ {name:'FIFO nonblocking validation',file:'overlay/bin/fm-inbox-take.py',from:' | os.O_NONBLOCK',to:'',test:'scripts/prompt-inbox.test.mjs',pattern:'FIFO messages'},
  {name:'exact-ID inbox acknowledgement',file:'overlay/bin/fm-inbox-take.sh',old:true,test:'scripts/prompt-inbox.test.mjs',pattern:'read 001 then arrival 002'},
  {name:'one BB browser rule',file:'overlay/bin/backends/bb-worker-prompt.py',from:"rules = rules.replace(BROWSER, '<!-- BB-DIVERGE: native fm-brief.sh Rules / rule 3; BB browser transport. -->\\n' + browser, 1)",to:'rules = rules',test:'scripts/prompt-inbox.test.mjs',pattern:'worker renderer preserves task'},
  {name:'immutable Task rendering boundary',file:'overlay/bin/backends/bb-worker-prompt.py',from:'task = prefix[:herdr_start]',to:'task = paths(prefix[:herdr_start], home, bindir)',test:'scripts/prompt-inbox.test.mjs',pattern:'worker renderer preserves task'},

@@ -95,6 +95,22 @@ test('ack rejects traversal, malformed IDs, symlinks, conflicts and mixed unknow
  }finally{rmSync(home,{recursive:true,force:true});}
 });
 
+test('FIFO messages in pending and handled namespaces refuse promptly without moving a valid message',()=>{
+ const {home,dir}=inboxFixture();try {
+  writeFileSync(join(dir,'001.msg'),'valid pending message\n');mkdirSync(join(dir,'handled'));
+  for(const namespace of [dir,join(dir,'handled')]) {
+   const fifo=join(namespace,'002.msg');ok(run('mkfifo',[fifo]));
+   const calls=[['--ack','001.msg','002.msg']];if(namespace===dir)calls.push([]);
+   for(const args of calls) {
+    const result=spawnSync('bash',[join(overlay,'bin/fm-inbox-take.sh'),'task',...args],{env:{...process.env,FM_HOME:home},encoding:'utf8',timeout:2000});
+    assert.equal(result.status,2,result.error?.message??result.stderr);assert.match(result.stderr,/not a regular message/);
+    assert.equal(existsSync(join(dir,'001.msg')),true);assert.equal(existsSync(join(dir,'handled/001.msg')),false);
+   }
+   rmSync(fifo);
+  }
+ }finally{rmSync(home,{recursive:true,force:true});}
+});
+
 for(const pin of pins) test(`native ${pin.slice(0,8)} inbox envelopes decode through Bash without changing body bytes`,()=>{
  const home=fixture(pin);try {
   const dir=join(home,'state/task.inbox');mkdirSync(dir);const body='First line\n--\nLast line without final newline';writeFileSync(join(dir,'001.msg'),'schema=fm-task-inbox.v1\nat=2026-10-04T00:00:00Z\n--\n'+body);
@@ -115,15 +131,6 @@ test('full installer ships the renderer/helper and verification detects missing 
  }finally{rmSync(home,{recursive:true,force:true});}
 });
 
-test('full current installer refuses deployed old pin without damaging an existing mirror or native files',()=>{
- const home=fixture(pins[0]);try {
-  const marker=join(home,'bin-bb/previous-mirror-marker');writeFileSync(marker,'preserve working mirror\n');
-  const previous=readFileSync(join(home,'bin-bb/backends/bb.sh'));const result=run('python3',[join(overlay,'install-bb-backend.py'),'--home',home]);
-  assert.notEqual(result.status,0);assert.match(result.stderr,/firstmate-bb-backend.patch.*did not apply/);assert.match(result.stderr,/fm-backend.sh.rej/);
-  assert.equal(readFileSync(marker,'utf8'),'preserve working mirror\n');assert.deepEqual(readFileSync(join(home,'bin-bb/backends/bb.sh')),previous);
-  assert.equal(ok(run('git',['-C',home,'status','--porcelain','--untracked-files=no'])),'');
- }finally{rmSync(home,{recursive:true,force:true});}
-});
 
 test('home additions and copied intent remain verbatim; references follow native completion and guards stay inline',()=>{
  const home=fixture();try {

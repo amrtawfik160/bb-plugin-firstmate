@@ -1144,6 +1144,11 @@ export const OVERLAY_INSTALL_INPUTS = [
   "firstmate-bb-teardown.patch",
   "firstmate-bb-local-merge.patch",
   "firstmate-bb-browser.patch",
+  "patch-sets.json",
+  "compat/2d833ff147cd26a5c461e914e06854e0eb2707ce/firstmate-bb-backend.patch",
+  "compat/2d833ff147cd26a5c461e914e06854e0eb2707ce/firstmate-bb-teardown.patch",
+  "compat/2d833ff147cd26a5c461e914e06854e0eb2707ce/firstmate-bb-local-merge.patch",
+  "compat/2d833ff147cd26a5c461e914e06854e0eb2707ce/firstmate-bb-browser.patch",
   "install-bb-backend.py",
 ] as const;
 

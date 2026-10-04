@@ -13,6 +13,7 @@ import {
   makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
 import plugin, {
+  OVERLAY_INSTALL_INPUTS,
   backlogTitleOf,
   briefSections,
   sanitizeFmArgs,
@@ -3023,7 +3024,11 @@ test("installer --verify fails LOUD after an out-of-band fast-forward leaves the
     assert.notEqual(stale.status, 0, "stale mirror must make --verify fail");
     assert.match(stale.stderr, /FM_MIRROR_STALE/, `--verify must be loud:\n${stale.stderr}`);
     assert.match(stale.stderr, /missing sibling 'fm-newmod\.sh'|HEAD moved|frozen copy 'fm-spawn\.sh' is stale/);
-    // Re-install re-mirrors → verify healthy again (self-heal).
+    // Unknown source commits must not inherit an audited patch set just because
+    // patch context happens to match. Return to an audited source before refresh.
+    const denied = spawnSync("python3", [join(OVERLAY_ROOT, "install-bb-backend.py"), "--home", home, "--overlay", OVERLAY_ROOT], {encoding:"utf8"});
+    assert.notEqual(denied.status, 0);assert.match(denied.stderr, /unsupported native source SHA/);
+    assert.equal(spawnSync("git", ["-C", home, "checkout", "--quiet", "--detach", PATCH_BASE]).status, 0);
     assert.equal(spawnSync("python3", [join(OVERLAY_ROOT, "install-bb-backend.py"), "--home", home, "--overlay", OVERLAY_ROOT]).status, 0);
     assert.equal(spawnSync("python3", [join(OVERLAY_ROOT, "install-bb-backend.py"), "--home", home, "--verify"]).status, 0);
   } finally {
@@ -10837,3 +10842,36 @@ test("native replacement refuses a stale owned inbox helper before stopping or s
     assert.equal(host.harness.sdk.callsTo("threads.stop").length,0);assert.equal(host.harness.sdk.callsTo("threads.spawn").length,0);
   }finally{await host.harness.lifecycle.dispose();rmSync(home,{recursive:true,force:true});}
 });
+
+for (const pin of ["2d833ff147cd26a5c461e914e06854e0eb2707ce", "1f3e769616fdf9f31f85f4c3e6a9f71606634238"]) {
+  test(`registered remote overlay install ships exact patch set for native ${pin.slice(0,8)} without upgrading its seeded home`, async () => {
+    const parent=nativePromptFixture(pin),work=mkdtempSync(join(tmpdir(),"fm-remote-compat-")),child=join(work,"child");
+    const seeded=spawnSync("bash",[join(parent,"bin/fm-home-seed.sh"),"domain",child,"--no-projects"],{env:{...process.env,FM_HOME:parent,FM_BACKEND:"bb",FM_SECONDMATE_CHARTER:"Fixture audit",FM_SECONDMATE_SCOPE:"Fixture audit"},encoding:"utf8",timeout:30000});
+    assert.equal(seeded.status,0,seeded.stdout+seeded.stderr);
+    const host=itHost(parent,{});await plugin(host.bb);
+    try {
+      stubRealExecHost(host);
+      host.harness.sdk.stub("threads.get",async({threadId}:{threadId:string})=>makeThreadResponse({id:threadId,status:"idle",environmentId:"env_main"}));
+      host.harness.sdk.stub("environments.get",async()=>({id:"env_main",hostId:"host_1",status:"ready",path:parent,isWorktree:false}));
+      host.harness.sdk.stub("threads.updatePluginMetadata",async()=>({}));
+      const commands=new Map<string,string>();let sequence=0;
+      host.harness.sdk.stub("terminals.create",async(args:{start:{command:string}})=>{const id=`remote_${++sequence}`;commands.set(id,args.start.command);return{id};});
+      host.harness.sdk.stub("terminals.output",async({terminalId}:{terminalId:string})=>{
+        const inner=unwrapHostCommand(commands.get(terminalId)??"");
+        // Force only the remote-host discovery seam; execute every payload write
+        // and the actual remote installer command against this disposable home.
+        if(inner.includes("echo FM_OVERLAY_LOCAL"))return hostRcPayload("FM_OVERLAY_REMOTE\n",0);
+        const result=spawnSync("bash",["-c",inner],{env:{...process.env,TMPDIR:work},encoding:"utf8",timeout:30000});
+        return hostRcPayload((result.stdout??"")+(result.stderr??""),result.status??1);
+      });
+      const result=await host.harness.behavior.runCli(["mark-captain","thr_domain","--home",child,"--parent-home",parent,"--task","domain"],{threadId:"thr_cap",projectId:"proj_1"});
+      assert.equal(result.exitCode,0,result.stderr);
+      const manifest=readFileSync(join(child,"bin-bb/.mirror-manifest"),"utf8");assert.match(manifest,new RegExp(`^head=${pin}$`,"m"));assert.match(manifest,new RegExp(`^patch-set=${pin}$`,"m"));
+      assert.equal(spawnSync("git",["-C",child,"rev-parse","HEAD"],{encoding:"utf8"}).stdout.trim(),pin);
+      const bundle=readdirSync(work).find(name=>name.startsWith("fm-bb-overlay-"));assert.ok(bundle,"remote upload path must run");
+      for(const rel of OVERLAY_INSTALL_INPUTS)assert.deepEqual(readFileSync(join(work,bundle!,rel)),readFileSync(join(OVERLAY_ROOT,rel)));
+      const verified=spawnSync("python3",[join(OVERLAY_ROOT,"install-bb-backend.py"),"--home",child,"--verify"],{encoding:"utf8"});assert.equal(verified.status,0,verified.stderr);
+      assert.equal(await host.bb.storage.kv.get("native-home:thr_domain"),child);assert.equal(host.harness.sdk.callsTo("threads.spawn").length,0);
+    }finally{await host.harness.lifecycle.dispose();rmSync(parent,{recursive:true,force:true});rmSync(work,{recursive:true,force:true});}
+  });
+}

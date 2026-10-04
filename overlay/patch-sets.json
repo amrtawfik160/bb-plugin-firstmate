@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "sets": {
+    "1f3e769616fdf9f31f85f4c3e6a9f71606634238": [
+      "firstmate-bb-backend.patch",
+      "firstmate-bb-teardown.patch",
+      "firstmate-bb-local-merge.patch",
+      "firstmate-bb-browser.patch"
+    ],
+    "2d833ff147cd26a5c461e914e06854e0eb2707ce": [
+      "compat/2d833ff147cd26a5c461e914e06854e0eb2707ce/firstmate-bb-backend.patch",
+      "compat/2d833ff147cd26a5c461e914e06854e0eb2707ce/firstmate-bb-teardown.patch",
+      "compat/2d833ff147cd26a5c461e914e06854e0eb2707ce/firstmate-bb-local-merge.patch",
+      "compat/2d833ff147cd26a5c461e914e06854e0eb2707ce/firstmate-bb-browser.patch"
+    ]
+  }
+}
