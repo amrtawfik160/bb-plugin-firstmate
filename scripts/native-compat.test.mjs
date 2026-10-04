@@ -7,7 +7,7 @@ import {overlay,pins,fixture,run,ok} from './prompt-fixture.mjs';
 import {OVERLAY_INSTALL_INPUTS,overlayFingerprint} from '../server.ts';
 const installer=join(overlay,'install-bb-backend.py');
 const registry=JSON.parse(readFileSync(join(overlay,'patch-sets.json'),'utf8'));
-const patched=['fm-backend.sh','fm-spawn.sh','fm-teardown.sh','fm-merge-local.sh','fm-bootstrap.sh','fm-busy-lib.sh','fm-secondmate-liveness-lib.sh','fm-watch.sh'];
+const patched=['fm-backend.sh','fm-spawn.sh','fm-teardown.sh','fm-merge-local.sh','fm-bootstrap.sh','fm-tasks-axi-lib.sh','fm-quota-axi-lib.sh','fm-busy-lib.sh','fm-secondmate-liveness-lib.sh','fm-watch.sh'];
 const install=(home,bundle=overlay)=>run('python3',[installer,'--home',home,'--overlay',bundle]);
 const verify=(home,bundle=overlay)=>run('python3',[installer,'--home',home,'--overlay',bundle,'--verify']);
 function treeDigest(root) {return ok(run('python3',['-c',"import hashlib,pathlib,sys;p=pathlib.Path(sys.argv[1]);h=hashlib.sha256();[(h.update(str(f.relative_to(p)).encode()),h.update(('link:'+str(f.readlink())).encode() if f.is_symlink() else f.read_bytes())) for f in sorted(p.rglob('*')) if f.is_file() or f.is_symlink()];print(h.hexdigest())",root])).trim();}

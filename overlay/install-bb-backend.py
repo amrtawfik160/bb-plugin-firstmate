@@ -20,8 +20,9 @@ This installer never edits a tracked file. It builds a parallel "mirror bin" at
 
   - every native bin/ entry is SYMLINKED into bin-bb/ (so it keeps inheriting
     upstream on every ff-update),
-  - EXCEPT eight files with no native seam -- fm-backend.sh, fm-spawn.sh,
-    fm-teardown.sh, fm-merge-local.sh, fm-bootstrap.sh, fm-busy-lib.sh, fm-secondmate-liveness-lib.sh, fm-watch.sh -- which are generated as patched COPIES, and
+  - EXCEPT ten files with no native seam -- fm-backend.sh, fm-spawn.sh,
+    fm-teardown.sh, fm-merge-local.sh, fm-bootstrap.sh, fm-tasks-axi-lib.sh,
+    fm-quota-axi-lib.sh, fm-busy-lib.sh, fm-secondmate-liveness-lib.sh, fm-watch.sh -- which are generated as patched COPIES, and
   - bin-bb/backends/ mirrors the native adapters plus the real bb.sh adapter.
 
 Native scripts derive SCRIPT_DIR and FM_BACKEND_LIB_DIR from their own
@@ -37,8 +38,8 @@ empty and the fetch + ff-only path actually fast-forwards. config/ is already
 gitignored upstream, so config/backend and config/bb-project stay invisible too.
 
 Re-run this installer after an ff-update: it re-mirrors (picking up any new native
-bin files) and regenerates the eight patched copies against the new native
-source. If a patch no longer applies because upstream changed one of the eight
+bin files) and regenerates the ten patched copies against the new native
+source. If a patch no longer applies because upstream changed one of the ten
 files, the install fails LOUDLY here instead of silently shipping a stale copy.
 """
 from __future__ import annotations
@@ -56,7 +57,7 @@ from pathlib import Path
 
 # Native backend dispatch and managed-branch landing have no extension seam. Carried as
 # patched copies in the mirror; everything else in bin/ is symlinked.
-PATCHED_FILES = ("fm-backend.sh", "fm-spawn.sh", "fm-teardown.sh", "fm-merge-local.sh", "fm-bootstrap.sh", "fm-busy-lib.sh", "fm-secondmate-liveness-lib.sh", "fm-watch.sh")
+PATCHED_FILES = ("fm-backend.sh", "fm-spawn.sh", "fm-teardown.sh", "fm-merge-local.sh", "fm-bootstrap.sh", "fm-tasks-axi-lib.sh", "fm-quota-axi-lib.sh", "fm-busy-lib.sh", "fm-secondmate-liveness-lib.sh", "fm-watch.sh")
 # Extra files the backend patch also touches but which we do NOT ship (docs only);
 # staged in the temp tree so their hunks apply, then discarded.
 PATCH_STAGE_EXTRA = ("docs/configuration.md",)
@@ -241,6 +242,7 @@ OVERLAY_INSTALL_INPUTS = (
     "bin/fm-launch-adopt.py",
     "bin/fm-worker-rebind.sh",
     "bin/fm-worker-rebind.py",
+    "bin/fm-bb-probe-lib.sh",
     "docs/bb-backend.md",
     "firstmate-bb-backend.patch",
     "firstmate-bb-teardown.patch",
@@ -260,7 +262,7 @@ OVERLAY_INSTALL_INPUTS = (
 TRANSPORT_PAYLOADS = (
     "backends/bb.sh", "backends/bb-worker-transport.txt",
     "backends/bb-worker-prompt.py", "fm-inbox-take.sh", "fm-inbox-take.py",
-    "fm-launch-adopt.sh", "fm-launch-adopt.py", "fm-worker-rebind.sh", "fm-worker-rebind.py",
+    "fm-launch-adopt.sh", "fm-launch-adopt.py", "fm-worker-rebind.sh", "fm-worker-rebind.py", "fm-bb-probe-lib.sh",
 )
 
 
@@ -312,7 +314,7 @@ def build_mirror(home: Path, overlay: Path) -> Path:
             os.symlink(os.path.join("..", "bin", entry), staging / entry)
 
         source_shas = generate_patched_copies(home, overlay, staging, selection)
-        for helper_name in ("fm-inbox-take.sh", "fm-inbox-take.py", "fm-launch-adopt.sh", "fm-launch-adopt.py", "fm-worker-rebind.sh", "fm-worker-rebind.py"):
+        for helper_name in ("fm-inbox-take.sh", "fm-inbox-take.py", "fm-launch-adopt.sh", "fm-launch-adopt.py", "fm-worker-rebind.sh", "fm-worker-rebind.py", "fm-bb-probe-lib.sh"):
             helper = overlay / "bin" / helper_name
             if not helper.is_file():
                 die(f"missing {helper}")

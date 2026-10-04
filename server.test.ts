@@ -613,10 +613,13 @@ function stubCaptainDeck(host: Awaited<ReturnType<typeof load>>, thread = makeTh
 
 test("deck titles and pins an untitled /captain thread", async () => {
   const host = await load();
+  await host.harness.behavior.setSettings({ fullParityOnDeck: false });
   try {
     stubCaptainDeck(host);
     const result = await host.harness.behavior.runCli(["deck"], { threadId: "thr_cap", projectId: "proj_1" });
     assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /native home is unavailable/);
+    assert.doesNotMatch(result.stdout, /cd ''/);
     const updates = host.harness.sdk.callsTo("threads.update");
     assert.equal(updates.length, 1);
     assert.equal((updates[0]![0] as { title?: string }).title, "Captain · Cyndra SaaS");
@@ -649,17 +652,17 @@ test("deck reuses shared home when automatic native profile is explicitly disabl
   }
 });
 
-test("deck surfaces the one-time init command when real firstmate is not activatable", async () => {
+test("deck refuses missing environment before native setup or claimed readiness", async () => {
   const host = await load();
   try {
     stubCaptainDeck(host);
-    // No thread environment → host cannot be resolved → auto-init is skipped gracefully.
     const result = await host.harness.behavior.runCli(["deck"], { threadId: "thr_cap", projectId: "proj_1" });
-    assert.equal(result.exitCode, 0, result.stderr);
-    assert.match(result.stdout, /Real firstmate: not active yet/);
-    assert.match(result.stdout, /bb firstmate init --real/);
-    // Native BB deck still succeeded (thread titled + pinned).
-    assert.equal(host.harness.sdk.callsTo("threads.pin").length, 1);
+    assert.equal(result.exitCode, 1, result.stdout);
+    assert.match(result.stderr, /Captain is not ready.*host identity/);
+    assert.match(result.stderr, /actual BB thread environment/);
+    assert.equal(host.harness.sdk.callsTo("threads.pin").length, 0);
+    assert.equal(host.harness.sdk.callsTo("threads.updatePluginMetadata").length, 0);
+    assert.equal(host.harness.sdk.callsTo("terminals.create").length, 0);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -6622,6 +6625,7 @@ test("Part D: a cross-thread empty `crews` view is self-explaining (scoped + nam
 // Item 2: `deck --all` genuinely opts into the whole host (the PR claimed deck supports --all).
 test("Part D: `deck --all` shows every captain's crews; default deck is scoped to this thread", async () => {
   const host = await load();
+  await host.harness.behavior.setSettings({ fullParityOnDeck: false });
   try {
     host.harness.sdk.stub("threads.list", async () => []);
     host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ status: "idle", environmentId: null }));
@@ -7360,6 +7364,8 @@ test("IT current native AFK entry writes a valid durable record", { skip: !FM_IN
 test("native captain contract tool returns the entire source beyond the SDK instruction limit", async () => {
   const host = ownerHost();
   await plugin(host.bb);
+  await host.bb.storage.kv.set("native-home:thr_cap", "/tmp/fm-home");
+  await host.bb.storage.kv.set("native-home-host:thr_cap", "host_1");
   try {
     const content = "# Firstmate\n" + "supervision policy\n".repeat(5000) + "END_OF_NATIVE_CONTRACT";
     host.harness.sdk.stub("files.read", async () => ({
@@ -7890,7 +7896,8 @@ test("deck refuses readiness when a configured native adapter cannot refresh", a
   try {
     await host.bb.storage.kv.set("native-home:thr_cap", "/native/captain");
     await host.bb.storage.kv.set("native-home-host:thr_cap", "host_1");
-    stubCaptainDeck(host);
+    stubCaptainDeck(host, makeThreadResponse({ id: "thr_cap", projectId: "proj_1", environmentId: "env_cap" }));
+    host.harness.sdk.stub("environments.get", async () => ({ hostId: "host_1", status: "ready", path: "/project" }));
     host.harness.sdk.stub("terminals.create", async () => { throw new Error("fixture host unavailable"); });
     const result = await host.harness.behavior.runCli(["deck"], { threadId: "thr_cap", projectId: "proj_1" });
     assert.equal(result.exitCode, 1);
@@ -10742,6 +10749,8 @@ test("a failed queued row with the same body is re-sent instead of appended", as
 test("native startup tool routes to the agent shell without attempting a host-terminal lock", async () => {
   const host = ownerHost();
   await plugin(host.bb);
+  await host.bb.storage.kv.set("native-home:thr_cap", "/tmp/fm-home");
+  await host.bb.storage.kv.set("native-home-host:thr_cap", "host_1");
   try {
     host.harness.sdk.stub("terminal.sessions.create", async () => { throw new Error("startup must not run outside the harness"); });
     const tool = host.harness.inspection.registrations.agentTools.find(t => t.name === "firstmate_fm")!;
@@ -10777,9 +10786,11 @@ test("startup command preserves shell arguments without executing their contents
 test("CLI startup returns the same harness-shell command without host execution", async () => {
   const host = ownerHost();
   await plugin(host.bb);
+  await host.bb.storage.kv.set("native-home:thr_cap", "/tmp/fm-home");
+  await host.bb.storage.kv.set("native-home-host:thr_cap", "host_1");
   try {
     host.harness.sdk.stub("terminal.sessions.create", async () => { throw new Error("detached startup must not execute"); });
-    const result = await host.harness.behavior.runCli(["fm", "session-start", "--source", "compact", "--json"]);
+    const result = await host.harness.behavior.runCli(["fm", "session-start", "--source", "compact", "--json"], { threadId: "thr_cap", projectId: "proj_1" });
     assert.equal(result.exitCode, 0, result.stderr);
     const body = JSON.parse(result.stdout);
     assert.equal(body.requiresAgentShell, true);

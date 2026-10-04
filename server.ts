@@ -55,6 +55,7 @@ import { nativeBearingsProjection } from "./lib/native-bearings.ts";
 import { createSnapshotReads } from "./lib/snapshot-reads.ts";
 import { scoutReports } from "./lib/scout-report.ts";
 import { replacementPlan, type ReplacementIntent } from "./lib/replacement.ts";
+import { boundedCaptainStartup, captainBindingText } from "./lib/captain-startup.ts";
 import { createQueueStore, type QueueItem } from "./lib/queue-store.ts";
 import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRecord } from "./lib/launch.ts";
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
@@ -1031,9 +1032,9 @@ export function captainCompactDue(input: {
 // Captain providers that run the user-level Stop/SessionStart hooks this plugin installs.
 export const HOOKED_CAPTAIN_PROVIDERS: ReadonlySet<string> = new Set(["claude-code", "codex"]);
 
-// Extra deck guidance for a captain whose harness skips those hooks (ACP providers
-// such as Grok): nothing enforces the wake guard or runs session start there, so the
-// rules the hooks would have enforced are stated explicitly.
+// Compatibility presentation export for consumers of hook availability. Deck
+// now returns bound startup guidance for every provider through captain-startup;
+// it no longer performs an extra provider lookup for this optional note.
 export function unhookedCaptainNote(providerId: string): string {
   if (providerId === "" || HOOKED_CAPTAIN_PROVIDERS.has(providerId)) return "";
   return [
@@ -1114,6 +1115,7 @@ export const OVERLAY_INSTALL_INPUTS = [
   "bin/fm-launch-adopt.py",
   "bin/fm-worker-rebind.sh",
   "bin/fm-worker-rebind.py",
+  "bin/fm-bb-probe-lib.sh",
   "docs/bb-backend.md",
   "firstmate-bb-backend.patch",
   "firstmate-bb-teardown.patch",
@@ -1380,7 +1382,7 @@ const CAPTAIN_TOOLS = [
   "firstmate_fm",
 ] as const;
 
-const CAPTAIN_CONTRACT_POINTER = "Before orchestrating, read firstmate_contract without a section for the complete native supervisor contract. If its startup digest is absent, call firstmate_fm script=session-start and run the supplied command through your agent shell.";
+const CAPTAIN_CONTRACT_POINTER = "Before orchestrating, call firstmate_deck (ACP/CLI: bb firstmate deck --json) to bind this thread's native home, then read firstmate_contract without a section (bb firstmate contract) for the complete native supervisor contract. If the startup digest is absent, run deck's exact command through your agent shell; firstmate_fm script=session-start returns it again. Failed prerequisites, lock refusal or a truncated digest remain unresolved.";
 
 const BB_SKILL_RUNTIME_CONTRACT = [
   "BB adapter for every upstream firstmate skill:",
@@ -1749,7 +1751,7 @@ export default async function plugin(bb: BbPluginApi) {
       provision = provisionCaptainHome(ctx, signal).finally(() => homeProvisioners.delete(captain));
       homeProvisioners.set(captain, provision);
     }
-    const home = await provision;
+    const home = await raceAbort(provision,signal);
     const scope = homeScope.getStore();
     if (scope && scope.captain === captain && home) {
       scope.home = home;
@@ -1784,6 +1786,7 @@ export default async function plugin(bb: BbPluginApi) {
       `fi`,
     ].join("\n"), 180_000, signal);
     requireNativeSuccess(clone, "captain home initialization");
+    signal?.throwIfAborted();
     await installBbBackend(hostId, home, ctxString(ctx, "projectId"), 180_000, signal);
     // Old worker prompts still name the old home; pin them there before activating
     // this home. Never move records underneath a running worker.
@@ -1791,10 +1794,13 @@ export default async function plugin(bb: BbPluginApi) {
     await queueStore.ready();
     queueStore.transform(row => row.nativeHome === undefined, row => ({ ...row, nativeHome: base }));
     await writeDecisions((await readDecisions()).map(row => ({ ...row, nativeHome: row.nativeHome ?? base })));
+    signal?.throwIfAborted();
+    await bb.storage.kv.set(`native-home-host:${captain}`, hostId);
+    signal?.throwIfAborted();
     await bb.storage.kv.set(`native-home:${captain}`, home);
     captainHomes.set(captain, home);
-    await bb.storage.kv.set(`native-home-host:${captain}`, hostId);
-    await bb.sdk.threads.updatePluginMetadata({ threadId: captain, set: { nativeHome: home, captain: "true" } });
+    signal?.throwIfAborted();
+    await raceAbort(bb.sdk.threads.updatePluginMetadata({ threadId: captain, set: { nativeHome: home, captain: "true" } }),signal,STUCK_HOST_CALL_MS);
     const scope = homeScope.getStore();
     if (scope) scope.home = home;
     return home;
@@ -5432,32 +5438,35 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  async function settleDeck(threadId: string): Promise<void> {
-    await bb.sdk.threads.updatePluginMetadata({
+  async function settleDeck(threadId: string,signal?:AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    await raceAbort(bb.sdk.threads.updatePluginMetadata({
       threadId,
       set: { captain: "true" },
-    });
+    }),signal,STUCK_HOST_CALL_MS);
+    signal?.throwIfAborted();
     try {
       await settings.experimental_set({ supervisionEnabled: true });
     } catch {
       // settings may already be on
     }
     try {
-      const thread = asRecord(await bb.sdk.threads.get({ threadId }));
+      const thread = asRecord(await raceAbort(bb.sdk.threads.get({ threadId }),signal,STUCK_HOST_CALL_MS));
+      signal?.throwIfAborted();
       if (typeof thread["projectId"] === "string") {
         await bb.storage.kv.set(`${CAPTAIN_PROJECT_PREFIX}${threadId}`, thread["projectId"]);
         knownCaptainsRef.add(threadId);
       }
       const patch: { threadId: string; title?: string; visibility?: "visible" } = { threadId };
       if (isBlankTitle(thread["title"])) {
-        patch.title = await captainLabel(thread["projectId"]);
+        patch.title = await raceAbort(captainLabel(thread["projectId"]),signal,STUCK_HOST_CALL_MS);
       }
       if (thread["visibility"] !== "visible") patch.visibility = "visible";
       if (patch.title !== undefined || patch.visibility !== undefined) {
-        await bb.sdk.threads.update(patch);
+        signal?.throwIfAborted();await raceAbort(bb.sdk.threads.update(patch),signal,STUCK_HOST_CALL_MS);
       }
       if (thread["pinnedAt"] == null) {
-        await bb.sdk.threads.pin({ threadId });
+        signal?.throwIfAborted();await raceAbort(bb.sdk.threads.pin({ threadId }),signal,STUCK_HOST_CALL_MS);
       }
     } catch (error) {
       bb.log.warn(
@@ -5864,8 +5873,9 @@ export default async function plugin(bb: BbPluginApi) {
     await raceAbort(mutateCrews((crews) => crews.map((c) => (c.id === crew.id && c.threadId === crew.threadId ? { ...c, prUrl: url } : c))),signal,STUCK_HOST_CALL_MS);
   }
 
-  async function markDeck(threadId: string): Promise<void> {
-    await settleDeck(threadId);
+  async function markDeck(threadId: string,signal?:AbortSignal): Promise<void> {
+    await settleDeck(threadId,signal);
+    signal?.throwIfAborted();
     await publishFleet();
   }
 
@@ -6855,6 +6865,7 @@ export default async function plugin(bb: BbPluginApi) {
     projectId: string | undefined,
     timeoutMs: number,
     signal?: AbortSignal,
+    verifyFirst=false,
   ): Promise<string> {
     const overlayHome = OVERLAY_DIR;
     const installer = join(overlayHome, "install-bb-backend.py");
@@ -6865,6 +6876,10 @@ export default async function plugin(bb: BbPluginApi) {
       signal,
     );
     if (localProbe.output.includes("FM_OVERLAY_LOCAL")) {
+      if (verifyFirst) {
+        const verified=await runOnHost(hostId,`python3 ${shQuote(installer)} --home ${shQuote(home)} --overlay ${shQuote(overlayHome)} --verify`,Math.min(30_000,timeoutMs),signal);
+        if(verified.exitCode===0 && verified.output.includes("mirror OK:"))return verified.output;
+      }
       const result = await runOnHost(
         hostId,
         `python3 ${shQuote(installer)} --home ${shQuote(home)} --overlay ${shQuote(overlayHome)}${projectId === undefined ? "" : ` --project-id ${shQuote(projectId)}`}`,
@@ -7028,9 +7043,7 @@ export default async function plugin(bb: BbPluginApi) {
     return { hostId, path, existed, projectId, overlay: overlayOut, tools: tools.output, summary };
   }
 
-  const FULL_PARITY_MIGRATION_KEY = "full-parity-migrated-home";
-
-  async function activateFullParityForDeck(captainThreadId: string | undefined): Promise<string> {
+  async function activateFullParityForDeck(): Promise<string> {
     const before = await settings.get();
     const fmHome = before.fmHome.trim();
     if (!before.fullParityOnDeck || fmHome === "") return "";
@@ -7049,35 +7062,17 @@ export default async function plugin(bb: BbPluginApi) {
       // can start repeated manager turns with no new crew event; durable wakes
       // remain recoverable through firstmate_wake and deck/session catch-up.
       turnEndGuard: "off",
-      supervisionEnabled: true,
+      supervisionEnabled: before.supervisionEnabled,
       nudgeEnabled: false,
     });
 
-    // Existing plugin state may predate the real owners. Import it once per home;
-    // every migration is itself idempotent and refuses destructive overwrites.
-    const migratedHome = await bb.storage.kv.get<unknown>(`${FULL_PARITY_MIGRATION_KEY}:${fmHome}`);
-    if (migratedHome !== fmHome) {
-      try {
-        const state = await migrateState();
-        const owners = await migrateOwners(captainThreadId);
-        if (state.failed.length === 0 && owners.memory) {
-          await bb.storage.kv.set(`${FULL_PARITY_MIGRATION_KEY}:${fmHome}`, fmHome);
-        } else {
-          bb.log.warn(
-            `full parity migration incomplete home=${fmHome} stateFailed=${state.failed.length} memory=${owners.memory}`,
-          );
-        }
-      } catch (error) {
-        bb.log.warn(`full parity migration deferred: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    }
-    await refreshCaptainMemory();
-    return "Full Firstmate profile: active (real state, memory, watcher, backlog, decisions, durable messaging, and wake guard).";
+    // Binding does not scan or project the legacy fleet. The explicit migration
+    // commands retain native overwrite guards; native startup owns its own digest.
+    return "BB native owners configured; native lock, bootstrap and session digest still require the agent shell. Legacy import remains an explicit migrate-state/migrate-owners operation.";
   }
 
-  // Real firstmate is the default. On deck, if it is not already initialized,
-  // clone + overlay it now (best-effort); on any failure, surface the single
-  // one-time command the captain must run. Returns a line for the deck digest.
+  // Install hooks only after the exact captain home is bound. A failed write
+  // cannot stamp setup as verified. Native startup still runs in the agent shell.
   async function installCaptainHooks(
     hostId: string,
     threadId: string | undefined,
@@ -7096,7 +7091,7 @@ export default async function plugin(bb: BbPluginApi) {
     });
     const res = await runOnHost(hostId, `bash -c ${shQuote(script)}`, 60_000, signal);
     if (res.exitCode !== 0 || !res.output.includes("captain-hooks-ok")) {
-      bb.log.warn(`captain hook install failed captain=${threadId} host=${hostId}: ${truncate(res.output, 400)}`);
+      throw new Error(`Captain hook install failed captain=${threadId} host=${hostId}: ${truncate(res.output, 400)}`);
     } else {
       bb.log.info(`captain hooks installed captain=${threadId} home=${home}`);
     }
@@ -7112,23 +7107,30 @@ export default async function plugin(bb: BbPluginApi) {
         // Re-apply the plugin-owned BB adapter on every deck. Upstream scripts stay
         // untouched; this refreshes the mirror when the plugin's transport semantics
         // change (for example queue → live steer) without requiring a manual re-init.
-        await installBbBackend(
+        const adapter=await installBbBackend(
           hostId,
           current.fmHome,
           ctxString(ctx, "projectId"),
           180_000,
           signal,
+          true,
         );
-        await refreshSkillsManifest(hostId, current.fmHome, signal);
-        await refreshCaptainMemory();
-        await installCaptainHooks(hostId, ctxString(ctx, "threadId"), current.fmHome, signal);
+        const setupKey=`captain-adapter-setup:${ctxString(ctx,"threadId")??''}`;
+        const stamp=JSON.stringify([current.fmHome,hostId,overlayFingerprint()]);
+        const verifiedSetup=adapter.includes("mirror OK:") && await bb.storage.kv.get(setupKey)===stamp;
+        if (!verifiedSetup) await refreshSkillsManifest(hostId, current.fmHome, signal);
+        if (!current.fullParityOnDeck) await refreshCaptainMemory();
+        if (!verifiedSetup) {
+          await installCaptainHooks(hostId, ctxString(ctx, "threadId"), current.fmHome, signal);
+          signal?.throwIfAborted();await bb.storage.kv.set(setupKey,stamp);
+        }
       } catch (error) {
         if (current.fullParityOnDeck) throw new Error(`Native setup failed; captain is not ready: ${error instanceof Error ? error.message : String(error)}`);
         bb.log.warn(`Native adapter refresh failed in compatibility mode: ${String(error)}`);
       }
-      const profile = await activateFullParityForDeck(ctxString(ctx, "threadId"));
+      const profile = await activateFullParityForDeck();
       return [
-        `Real firstmate: active (fmHome ${current.fmHome}; ${toolbeltPhrase(current.fmScriptCount, current.fmSkillCount)}).`,
+        `Real firstmate: ${current.fullParityOnDeck?"bound":"active"} (fmHome ${current.fmHome}; ${toolbeltPhrase(current.fmScriptCount, current.fmSkillCount)}).`,
         profile,
         `Dispatch through the full toolbelt: bb firstmate fm spawn -- --mode direct-PR -- ship "<task>".`,
       ].filter((line) => line !== "").join("\n");
@@ -7136,13 +7138,14 @@ export default async function plugin(bb: BbPluginApi) {
     try {
       const res = await initRealMode(ctx, signal, {});
       if ((await baseSettings.get()).fullParityOnDeck) await ensureCaptainHome(ctx, signal);
-      const profile = await activateFullParityForDeck(ctxString(ctx, "threadId"));
+      const profile = await activateFullParityForDeck();
       return [
         `Real firstmate: initialized now (${res.existed ? "reused clone" : "cloned"}).`,
         profile,
         res.summary,
       ].filter((line) => line !== "").join("\n");
     } catch (error) {
+      if ((await baseSettings.get()).fullParityOnDeck) throw new Error(`Native initialization failed: ${error instanceof Error?error.message:String(error)}. Configure a valid native source with bb firstmate init --real --machine <host> before retry.`);
       return [
         "Real firstmate: not active yet. Run this once to unlock the full toolbelt",
         `(${toolbeltPhrase(current.fmScriptCount, current.fmSkillCount)}):`,
@@ -7157,6 +7160,35 @@ export default async function plugin(bb: BbPluginApi) {
     const digest = await sessionDigest(all ? undefined : ctxString(ctx, "threadId"));
     const others = await otherCaptainsNote(ctxString(ctx, "threadId"), signal);
     return [others, digest].filter(Boolean).join("\n");
+  }
+
+  async function takeDeck(ctx:unknown,signal?:AbortSignal,all=false,digest=false) {
+    const threadId=ctxString(ctx,"threadId");if(!threadId)throw new Error("No thread: run this from a BB thread.");
+    return boundedCaptainStartup([launchAbort.signal,...(signal?[signal]:[])],async(startSignal,stage)=>{
+      // Bind before registering a watcher or enabling a captain. New threads
+      // must never read the shared base home's fleet as their startup digest.
+      stage('host identity');
+      if((await baseSettings.get()).fullParityOnDeck) {
+        const envId=await threadEnv(threadId,startSignal);if(!envId)throw new Error("Captain environment/host unavailable; bind from its actual BB thread environment.");
+        const shellEnv=await raceAbort(bb.sdk.environments.get({environmentId:envId}),startSignal,STUCK_HOST_CALL_MS);
+        const expectedHost=homeScope.getStore()?.host||(await baseSettings.get()).fmHostId.trim();
+        if(expectedHost && expectedHost!==shellEnv.hostId)throw new Error("Native source/bound home is on another host; no path will be passed into this captain's host. Configure a matching native source explicitly.");
+      }
+      stage('native home binding');const setup=await ensureRealModeForDeck(ctx,startSignal);
+      startSignal.throwIfAborted();const current=await settings.get();
+      const home=current.fmHome.trim();const host=current.fmHostId.trim()||(home?await raceAbort(resolveHostId(undefined,ctx),startSignal,STUCK_HOST_CALL_MS):'');
+      if(current.fullParityOnDeck) {
+        if(!home || await bb.storage.kv.get(`native-home:${threadId}`)!==home)throw new Error("Captain home binding is missing; shared-home fallback refused.");
+        stage('native prerequisites');const tools=await checkToolchain(host,home,startSignal);
+        if(!tools.ready)throw new Error(`Native prerequisite check refused:\n${tools.output}`);
+      }
+      stage('captain registration');await markDeck(threadId,startSignal);startSignal.throwIfAborted();
+      await raceAbort(rememberWatchCaptain(ctx,threadId),startSignal,STUCK_HOST_CALL_MS);startSignal.throwIfAborted();
+      const renderedDigest=(!current.fullParityOnDeck||all||digest)?(stage('requested session digest'),await raceAbort(deckDigest(ctx,startSignal,all),startSignal)):undefined;
+      const command=home?(captainStartupCommand(home,'session-start')??''):'';
+      return {captain:true,threadId,realMode:!!home,nativeHome:home,hostId:host,ready:false,requiresAgentShell:!!home,startupCommand:command,digest:renderedDigest??null,
+        text:captainBindingText({home,host,command,setup,digest:renderedDigest})};
+    });
   }
 
   async function runFmScript(input: {
@@ -9007,7 +9039,8 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb firstmate init [--real] [--machine m] [--path p] [--name n] [--json]",
     "  bb firstmate scripts [query] [--json]   # list + verify every installed fm-* script",
     "  bb firstmate fm [--timeout s] <script> [args...]   # real bin/fm-<script>.sh with FM_BACKEND=bb",
-    "  bb firstmate deck | session [--json]",
+    "  bb firstmate deck [--digest|--all] [--json] | session [--json]",
+    "  bb firstmate contract [section,...] [--json] # complete native policy",
     '  bb firstmate dispatch --project <id> [--task t ...] [--shape ship|scout] [--mode m] [--title t] [--provider p] [--model m] [--reasoning-level low|medium|high|xhigh|max|ultra|none|ultracode] [--permission-mode m] [--shared-env] [--worktree] [--hidden] [--task-id id] [--delivery-requirement pr|merged|merged-and-verified] -- "<task>"',
     "  bb firstmate launches list [--limit n] [--offset n] [--json]   # uncertain slots require reconciliation",
     "  bb firstmate launches adopt <task-id> --thread <thread-id> [--check] [--json]   # exact legacy registration repair; no turn or merge",
@@ -9128,10 +9161,20 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function readCaptainContract(ctx: unknown, section?: string) {
     const current = await settings.get();
+    if (current.fullParityOnDeck && homeScope.getStore()?.captain && !homeScope.getStore()?.home) return toolError("No bound captain home. Call firstmate_deck or bb firstmate deck before reading the native contract; shared-home fallback refused.");
     if (current.fmHome.trim() === "") return toolError("Initialize real Firstmate with firstmate_deck first.");
-    const hostId = current.fmHostId.trim() || await resolveHostId(undefined, ctx);
+    const callerSignal = asRecord(ctx)["signal"] as AbortSignal | undefined;
+    const signal = AbortSignal.any([launchAbort.signal, ...(callerSignal ? [callerSignal] : [])]);
+    const hostId = current.fmHostId.trim() || await raceAbort(resolveHostId(undefined, ctx), signal, STUCK_HOST_CALL_MS);
     const path = `${current.fmHome}/AGENTS.md`;
-    const result = await bb.sdk.files.read({ hostId, path });
+    let result;
+    try {
+      result = await raceAbort(bb.sdk.files.read({ hostId, path }), signal, STUCK_HOST_CALL_MS);
+      signal.throwIfAborted();
+    } catch (error) {
+      if (signal.aborted) throw new Error(`Native contract read cancelled at ${path}: ${String(signal.reason ?? error)}. Contract remains incomplete; this read attempted no native startup.`);
+      throw new Error(`Native contract read failed at ${path}: ${String(error)}. Complete contract is unavailable; repair this host read before startup or orchestration.`);
+    }
     if (!("content" in result)) return toolError("Native contract read returned no content.");
     if (result.sizeBytes > 200_000) return toolError("Native contract exceeds 200KB; read it directly in the Firstmate home.");
     const content = result.contentEncoding === "base64"
@@ -9157,7 +9200,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const output = [body, "Browser: use /browser with browser_script or bb browser script; leave profileId unset."].join("\n");
     return {
-      ready: !/^(MISSING:|BACKEND_INVALID:)/m.test(output),
+      ready: !/^(MISSING:|MISSING_MANUAL:|BACKEND_INVALID:)/m.test(output),
       presentationReady: !/^PRESENTATION_UNAVAILABLE:/m.test(output),
       output,
     };
@@ -9248,21 +9291,11 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_deck",
-    description: "Mark this thread as the firstmate captain and return the session digest (memory, bearings, afk). Your own crews by default; pass all=true to see every captain's crews on the host.",
-    presentation: { label: { pending: "Taking the deck", completed: "On deck" } },
-    parameters: z.object({ all: z.boolean().optional().describe("Show every captain's crews host-wide, not just your own") }),
-    async execute({ all }, ctx) {
-      const record = asRecord(ctx);
-      const threadId = record["threadId"];
-      if (typeof threadId !== "string") return toolError("No thread to mark as captain.");
-      await markDeck(threadId);
-      await rememberWatchCaptain(ctx, threadId);
-      const signal = record["signal"] as AbortSignal | undefined;
-      const real = await ensureRealModeForDeck(ctx, signal);
-      let providerId = "";
-      try { providerId = (await bb.sdk.threads.get({ threadId })).providerId ?? ""; } catch { /* note is best-effort */ }
-      const note = unhookedCaptainNote(providerId);
-      return `Captain, on deck.\n${real}\n${await deckDigest(ctx, signal, all === true)}${note === "" ? "" : `\n\n${note}`}`;
+    description: "Bind this captain to its exact native home and return the required agent-shell startup command; readiness is unverified until the native digest succeeds. Optional digest/all explicitly requests a fleet digest.",
+    presentation: { label: { pending: "Binding captain home", completed: "Home bound; verify native startup" } },
+    parameters: z.object({ all: z.boolean().optional().describe("Explicitly scan every captain's crews"), digest:z.boolean().optional().describe("Explicitly request the session/fleet digest before native startup") }),
+    async execute({ all,digest }, ctx) {
+      return (await takeDeck(ctx,asRecord(ctx)["signal"] as AbortSignal|undefined,all===true,digest===true)).text;
     },
   });
 
@@ -10022,6 +10055,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (current.fmHome === "") return toolError("No firstmate home. Run bb firstmate init --real.");
       try {
         const startup = captainStartupCommand(current.fmHome, script, args ?? []);
+        if (startup!==null && current.fullParityOnDeck && !homeScope.getStore()?.home) return toolError("Native startup requires a bound captain home. Call firstmate_deck or bb firstmate deck; shared-home fallback refused.");
         if (startup !== null) return `BB startup transport: run this exact command through your agent's shell tool, which runs under the harness. The host-terminal RPC cannot provide that ancestry. No native startup or lock acquisition has been attempted by this tool.\n\n${startup}`;
         const hostId = await resolveHostId(undefined, ctx);
         const result = await runFmScript({
@@ -10691,7 +10725,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "toolchain", summary: "Check native AXI and Lavish dependencies without mutations", usage: "bb firstmate toolchain [--json]" },
       { name: "scripts", summary: "List + verify every installed fm-* script", usage: "bb firstmate scripts [query] [--json]" },
       { name: "fm", summary: "Run a real firstmate bin/ script with FM_BACKEND=bb", usage: "bb firstmate fm [--timeout s] <script> [args...]" },
-      { name: "deck", summary: "Mark this thread captain + session digest", usage: "bb firstmate deck [--json]" },
+      { name: "deck", summary: "Bind native home and return agent-shell startup (not ready until native digest)", usage: "bb firstmate deck [--digest|--all] [--json]" },
       { name: "session", summary: "Session digest: memory + bearings + afk", usage: "bb firstmate session [--json]" },
       { name: "dispatch", summary: "Dispatch crewmate child threads", usage: 'bb firstmate dispatch --project <id> -- "<task>"' },
       { name: "crews", summary: "List recorded crews with live status", usage: "bb firstmate crews [--json]" },
@@ -10738,6 +10772,7 @@ export default async function plugin(bb: BbPluginApi) {
           const parsed = parseFmArgv(argv.slice(1));
           if (parsed.script === undefined) return fail("Usage: bb firstmate fm [--timeout s] <script> [args...]\nExample: bb firstmate fm spawn -- --mode direct-PR -- ship \"fix login\"");
           const startup = captainStartupCommand(fmHome, parsed.script, parsed.args);
+          if (startup!==null && current.fullParityOnDeck && (!homeScope.getStore()?.home || homeScope.getStore()?.home!==fmHome)) return fail("Native startup requires this captain's exact bound home. Run bb firstmate deck; shared/explicit foreign-home fallback refused.");
           if (startup !== null) return { exitCode: 0, stdout: json
             ? JSON.stringify({ requiresAgentShell: true, command: startup })
             : `Run through the agent's shell (native lock requires harness ancestry):\n${startup}` };
@@ -10789,7 +10824,7 @@ export default async function plugin(bb: BbPluginApi) {
           case "contract": {
             // The operator CLI reads the whole contract unless a section is named.
             const text = await readCaptainContract(ctx, rest.join(" ").trim() || "all");
-            if (typeof text !== "string") return fail("Native contract could not be read.");
+            if (typeof text !== "string") return fail(text.content.filter(c=>c.type==='text').map(c=>c.text).join('\n')||"Native contract could not be read.");
             return reply({ contract: text }, text);
           }
           case "toolchain": {
@@ -10801,16 +10836,8 @@ export default async function plugin(bb: BbPluginApi) {
             return reply(surface, renderScriptSurface(surface));
           }
           case "deck": {
-            if (ctxThread === undefined) return fail("No thread: run this from a BB thread.");
-            await markDeck(ctxThread);
-            await rememberWatchCaptain(ctx, ctxThread);
-            const real = await ensureRealModeForDeck(ctx, signal);
-            const realMode = (await settings.get()).fmHome.trim() !== "";
-            const digest = await deckDigest(ctx, signal, flags.has("all"));
-            return reply(
-              { captain: true, threadId: ctxThread, realMode, digest },
-              `Captain, on deck.\n${real}\n${digest}`,
-            );
+            const result=await takeDeck(ctx,signal,flags.has("all"),flags.has("digest"));
+            const {text,...data}=result;return reply(data,text);
           }
           case "session": {
             const digest = await sessionDigest(flags.has("all") ? undefined : ctxThread);

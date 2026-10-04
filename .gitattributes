@@ -1,1 +1,2 @@
 overlay/*.patch whitespace=-blank-at-eol
+overlay/compat/*/*.patch whitespace=-blank-at-eol

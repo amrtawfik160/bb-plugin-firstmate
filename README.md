@@ -47,7 +47,7 @@ bb plugin install path:/path/to/bb-plugin-firstmate --yes
 
 Requires `bb >= 0.43` and `bbPluginSdk >= 0.4.87` (see `package.json` engines).
 
-Update the plugin itself with `bb plugin update firstmate`. Re-running `/captain` (or `bb firstmate init --real`) fast-forwards a clean `fmHome` clone to the plugin’s audited upstream commit, keeping scripts and skills on the same revision.
+Update the plugin itself with `bb plugin update firstmate`. Re-running `/captain` verifies or refreshes the BB adapter for the existing audited native version. Explicit `bb firstmate init --real` can fast-forward a clean `fmHome` clone to the plugin’s audited upstream commit.
 
 ## Quick start
 
@@ -63,13 +63,15 @@ bb firstmate merge <crew-id> --yes      # merge green PR, or ff-only local land
 
 Crews end every task with a status verdict. `deliver` shows what they committed. You decide what lands.
 
-`/captain` initializes or reuses the real Firstmate checkout and activates its full BB profile: real dispatch, watcher, backlog, decisions, AFK/quiet, tiered memory, durable bidirectional messaging, state read-through, and event-driven crew wakes. Existing plugin state is migrated once without overwriting non-empty real files.
+`/captain` first calls `firstmate_deck` (ACP/CLI: `bb firstmate deck --json`) to bind this thread's exact native home and return the agent-shell startup command. Binding has a 60-second deadline and reports `ready: false`: execute the returned command beneath the agent harness and require the complete native digest, successful lock and prerequisites before dispatch. Read the complete contract with `firstmate_contract` or `bb firstmate contract`; never guess a shared home or search plugin internals. Failed or truncated startup stays unresolved: inspect the named prerequisite before retry.
+
+Bare `deck` defers fleet inventory to native startup. Request `deck --digest`, `deck --all`, or `session` for a separate fleet view. A verified bound adapter reuses its skills inventory and hooks; changed or stale adapters refresh under the same setup deadline. Legacy plugin records remain durable and are imported explicitly with `migrate-state` / `migrate-owners`, without overwriting native files.
 
 ## What you get
 
 | Command | What it does |
 | --- | --- |
-| `deck` / `session` | Mark the thread as captain, print the fleet digest |
+| `deck` / `session` | Bind the exact home and return pending startup / print the fleet digest |
 | `contract` | Read the complete current native supervisor contract and BB adaptations |
 | `dispatch` | Spawn a ship (isolated worktree) or scout (read-only) crew |
 | `tell` / `interrupt` / `stop` / `retry` | Live steer, hard stop, or re-run a crew |
@@ -151,12 +153,12 @@ BB-specific behavior in this fork:
 
 | Key | Default | Purpose |
 | --- | --- | --- |
-| `fullParityOnDeck` | on | `/captain` activates every real Firstmate owner and safely migrates prior plugin state |
+| `fullParityOnDeck` | on | `/captain` binds a scoped native home and configures native owners; native startup and explicit legacy migration remain separate |
 | `firstmateRepo` | upstream repo URL | Repo cloned by `init --real` |
 | `fmHome` | empty | Firstmate home on the host; set by `init --real` |
 | `defaultProvider` | blank | Crew provider id (blank = BB resolves) |
 | `defaultPermissionMode` | `resolve` | Crew permission mode (`resolve` = inherit from the captain) |
-| `supervisionEnabled` | off | Captain pings on done/fail/stuck; `deck`/`dispatch` turn it on automatically |
+| `supervisionEnabled` | off | Captain pings on done/fail/stuck; successful deck binding or `dispatch` enables supervision |
 | `supervisionIntervalMin` | 5 | Stuck-check sweep interval |
 | `supervisionStuckMin` | 30 | Minutes without output change before a stuck alert |
 | `nudgeEnabled` | on | Doorbell idle crews that missed the status protocol |
@@ -173,7 +175,7 @@ After updating the plugin, existing captain sessions can run `/calm` to load the
 
 Run `/catch-up` after a long conversation or switching tasks. It summarizes important results, decisions needing you, blockers, in-progress work, and next steps from current records and the available conversation. It keeps unresolved items visible, flags missing evidence, and does not approve or start work. Its default scope is this captain's work; request all captains explicitly for a wider view. `/bearings` remains the full fleet snapshot and board workflow.
 
-`/captain` is a BB bootstrap: it binds this thread's home and reads the complete upstream `AGENTS.md` verbatim through `firstmate_contract`. Section arguments remain available for later lookup. Upstream owns intake, authority, delivery, and supervision policy; BB instructions only map paths, threads, browser access, and durable wake receipts. The fidelity check covers both entry skills and every registered upstream skill, and requires byte-for-byte preservation for verbatim skill copies.
+`/captain` is a BB bootstrap: it binds this thread's home, returns its exact agent-shell startup command, and reads the complete upstream `AGENTS.md` verbatim through `firstmate_contract`. Section arguments remain available for later lookup. Upstream owns intake, authority, delivery, and supervision policy; BB instructions only map paths, threads, browser access, and durable wake receipts. The fidelity check covers both entry skills and every registered upstream skill, and requires byte-for-byte preservation for verbatim skill copies.
 
 Native startup must run beneath the agent harness to acquire its session lock. `firstmate_fm` returns an agent-shell command for `session-start`, `sessionstart-run`, and `sessionstart-nudge` instead of attempting startup through BB's detached host-terminal RPC. SessionStart hooks use the same `bin-bb` mirror and explicit native home. A genuine native lock refusal retains read-only behavior; startup transport is repaired without bypassing the refusal.
 
