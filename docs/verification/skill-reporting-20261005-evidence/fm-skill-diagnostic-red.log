@@ -1,0 +1,28 @@
+✖ public diagnostic inventory preserves folded native descriptions and all trigger branches without becoming role policy (405.203445ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 0
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 674.668953
+
+✖ failing tests:
+
+test at server.native-policy.test.mjs:144:1
+✖ public diagnostic inventory preserves folded native descriptions and all trigger branches without becoming role policy (405.203445ms)
+  AssertionError [ERR_ASSERTION]: Use bb firstmate skill <native-name> [relative-reference] [--source <selected-root source-file>] [--paged], then skill --cursor <cursor>. Bind with bb firstmate deck first.
+
+  1 !== 0
+
+      at TestContext.<anonymous> (file:///root/github_projects/bb-plugin-firstmate-launch-pr-lifecycle/server.native-policy.test.mjs:147:93)
+      at async Test.run (node:internal/test_runner/test:1332:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: 1,
+    expected: 0,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }

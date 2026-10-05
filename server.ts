@@ -2,6 +2,7 @@
 import { deflateSync } from "node:zlib";
 import { CAPTAIN_ROLE_INSTRUCTIONS } from "./lib/captain-role.ts";
 import { contractPage, contractCursorSection } from "./lib/contract-transport.ts";
+import { skillPage, skillCursorRequest } from "./lib/skill-transport.ts";
 import { DISPATCH_TRANSPORT, FM_WRAPPER_HELP, taskDelivery, nativeDispatchIntake } from "./lib/dispatch-intake.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
@@ -65,7 +66,7 @@ import { createQueueStore, type QueueItem } from "./lib/queue-store.ts";
 import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRecord } from "./lib/launch.ts";
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
 import { optionHelp } from "./lib/cli-help.ts";
-import { AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython } from "./lib/native-policy.ts";
+import { AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython, nativeDescriptions } from "./lib/native-policy.ts";
 import { createDeliveries, canonicalPr, deliveryLine, parseForge, type DeliveryRecord } from "./lib/pr-delivery.ts";
 import { captureHostCommand, decodeHostCapture } from "./lib/host-capture.ts";
 import { selectExecution, validateLaunchCapabilities } from "./lib/execution-selection.ts";
@@ -1406,7 +1407,7 @@ const BB_SKILL_RUNTIME_CONTRACT = [
   "BB adapter for every upstream firstmate skill:",
   "The complete native supervisor contract and imported upstream skills own policy; the following mappings only adapt execution to BB.",
   "Translate bin/fm-<name>.sh calls to firstmate_fm with script=<name> and the same arguments; use bb firstmate fm <name> only when a shell command is required.",
-  "Load native policy skills and their references with firstmate_skill (bb firstmate skill <name> [reference] [--source <selected-root source-file>]); it reads this captain’s selected runtime. Native AGENTS.md means firstmate_contract; bin and docs mean the selected runtime, while data, state and config mean the exact bound captain home returned by deck.",
+  "Load native policy skills and their references with firstmate_skill (ACP/CLI: bb firstmate skill <name> [reference] [--source <selected-root source-file>] --paged), following every returned cursor to the end marker; it reads this captain’s selected runtime. Native AGENTS.md means firstmate_contract; bin and docs mean the selected runtime, while data, state and config mean the exact bound captain home returned by deck.",
   "Map workers, panes, and tabs to BB crew threads via firstmate_dispatch/tell/interrupt/retry/stop. Call firstmate_watch once per batch; it hands off to private durable wakes. End the turn; never retry or poll.",
   "Use BB interactions for captain questions and approvals. firstmate_deliveries retains open PRs after worker retirement and wake acknowledgement. Continue authorized review/fix/merge work using the author for fixes and preserving the agreed native review and validation path, including independent review when required; merge through firstmate_merge. Inspect unresolved delivery records after compaction or handoff.",
   "Run firstmate_toolchain for native dependency detection. For browser work use the /browser skill and browser_script (or bb browser script), with profileId unset for the thread-isolated default. This replaces native chrome-devtools-axi transport. Read config/lavish-axi-host for remote Lavish access and use bb connect expose for a board the captain should see.",
@@ -1871,104 +1872,17 @@ export default async function plugin(bb: BbPluginApi) {
   // Diagnostic inventory only. SDK configure accepts static skill names, so
   // captain policy reads use the exact selected native runtime instead of
   // injecting a globally copied inventory. Crews receive no captain skills.
-  const SKILLS_MANIFEST_MAX = 2400;
-  let skillsManifestCache = "";
-  try {
-    skillsManifestCache = renderSkillsManifest((await settings.get()).fmSkillsManifest);
-  } catch {
-    // default empty
-  }
-
-  function renderSkillsManifest(raw: string): string {
-    const trimmed = (raw ?? "").trim();
-    if (trimmed === "") return "";
-    try {
-      const parsed = JSON.parse(trimmed) as { head?: unknown; skills?: unknown };
-      const head = typeof parsed.head === "string" && parsed.head !== "" ? parsed.head.slice(0, 12) : "unknown";
-      const skills = Array.isArray(parsed.skills) ? parsed.skills : [];
-      if (skills.length === 0) return "";
-      const lines = skills
-        .map((s) => {
-          const rec = asRecord(s);
-          const name = typeof rec["name"] === "string" ? rec["name"] : "";
-          const desc = typeof rec["desc"] === "string" ? rec["desc"] : "";
-          return name === "" ? "" : `- ${name}${desc === "" ? "" : `: ${desc}`}`;
-        })
-        .filter((l) => l !== "");
-      if (lines.length === 0) return "";
-      const body = [
-        `== Real firstmate skills (fmHome/.agents/skills @ ${head}; ${lines.length} available) ==`,
-        "Read selected native skills via firstmate_skill; this inventory is diagnostic only.",
-        ...lines,
-      ].join("\n");
-      return truncate(body, SKILLS_MANIFEST_MAX);
-    } catch {
-      return "";
-    }
-  }
-
-  // Read fmHome HEAD + the .agents/skills inventory on the host, store a
-  // version-pinned JSON manifest, and refresh the diagnostic cache. Skips the host
-  // read when HEAD is unchanged. Best-effort.
+  // Diagnostic settings preserve complete descriptions from the same verified
+  // catalog as policy reads. This inventory is never injected into role context.
   async function refreshSkillsManifest(hostId: string, fmHome: string, signal?: AbortSignal): Promise<void> {
     try {
       const captain=homeScope.getStore()?.captain ?? await bb.storage.kv.get<string>(`captain-for-home:${fmHome}`);
       const selection=captain?await bb.storage.kv.get<{root:string}>(`native-runtime:${captain}`):null;
-      const inventoryRoot=selection?.root??fmHome;
-      const skillsDir = `${inventoryRoot}/.agents/skills`;
-      const py =
-        "import json,os,sys;d=sys.argv[1];out=[];\n" +
-        "dirs=sorted([n for n in os.listdir(d) if os.path.isdir(os.path.join(d,n))]) if os.path.isdir(d) else []\n" +
-        "for n in dirs:\n" +
-        "  desc=''\n" +
-        "  p=os.path.join(d,n,'SKILL.md')\n" +
-        "  try:\n" +
-        "    txt=open(p,encoding='utf-8',errors='replace').read()\n" +
-        "    for line in txt.splitlines():\n" +
-        "      s=line.strip()\n" +
-        "      if s.lower().startswith('description:'):\n" +
-        "        desc=s.split(':',1)[1].strip().strip('\\'\"');break\n" +
-        "  except Exception:\n" +
-        "    pass\n" +
-        "  out.append({'name':n,'desc':desc[:160]})\n" +
-        "sys.stdout.write(json.dumps(out))";
-      const cmd = [
-        `HEAD=$(git -C ${shQuote(inventoryRoot)} rev-parse HEAD 2>/dev/null || echo unknown)`,
-        `printf 'FM_HEAD=%s\\n' "$HEAD"`,
-        `python3 -c ${shQuote(py)} ${shQuote(skillsDir)} 2>/dev/null || echo '[]'`,
-      ].join("\n");
-      const res = await runOnHost(hostId, cmd, 20_000, signal);
-      const headMatch = /FM_HEAD=(\S+)/.exec(res.output);
-      const head = headMatch?.[1] ?? "unknown";
-      const jsonStart = res.output.indexOf("[");
-      if (jsonStart < 0) return;
-      const skillsJson = res.output.slice(jsonStart).trim();
-      let skills: unknown;
-      try {
-        skills = JSON.parse(skillsJson);
-      } catch {
-        return;
-      }
-      if (!Array.isArray(skills)) return;
-      // Skip the persist when HEAD is unchanged and we already have a manifest.
-      try {
-        const prevRaw = (await settings.get()).fmSkillsManifest.trim();
-        if (prevRaw !== "") {
-          const prev = JSON.parse(prevRaw) as { head?: unknown };
-          if (typeof prev.head === "string" && prev.head === head && skillsManifestCache !== "") return;
-        }
-      } catch {
-        // fall through and persist
-      }
-      const manifest = JSON.stringify({ head, skills });
-      skillsManifestCache = renderSkillsManifest(manifest);
-      try {
-        await settings.experimental_set({ fmSkillsManifest: manifest });
-      } catch {
-        // cache still holds it for this process
-      }
-    } catch {
-      // best-effort; captain keeps the contract without the skill inventory
+      const catalog=await nativePolicyLookup(hostId,selection?.root??fmHome,{operation:'catalog'},signal??AbortSignal.any([launchAbort.signal,AbortSignal.timeout(30_000)]));
+      const skills=nativeDescriptions(catalog.entries!).map(({name,description})=>({name,desc:description}));
+      await settings.experimental_set({fmSkillsManifest:JSON.stringify({schema:2,head:catalog.commit,skills})});
+    } catch (error) {
+      bb.log.warn(`Diagnostic native skill inventory remains stale: ${String(error)}`);
     }
   }
 
@@ -7265,7 +7179,10 @@ export default async function plugin(bb: BbPluginApi) {
       ownHome: captainHomes.get(threadId)===home || home.endsWith(`-bb-homes/${threadId}`),
       scriptB64: overlayBytes("bin/bb-captain-hook.sh"),
     });
-    const res = await runOnHost(hostId, `bash -c ${shQuote(script)}`, 60_000, signal);
+    // The hook bytes plus shell quoting can exceed BB's composed command cap.
+    // Stage the complete installer through the existing bounded stdin transport;
+    // nothing installs until staging succeeds, and runOnHost removes that file.
+    const res = await runOnHost(hostId, "bash", 60_000, signal, script);
     if (res.exitCode !== 0 || !res.output.includes("captain-hooks-ok")) {
       throw new Error(`Captain hook install failed captain=${threadId} host=${hostId}: ${truncate(res.output, 400)}`);
     } else {
@@ -7293,7 +7210,8 @@ export default async function plugin(bb: BbPluginApi) {
         );
         const setupKey=`captain-adapter-setup:${ctxString(ctx,"threadId")??''}`;
         const runtimeSelection=await bb.storage.kv.get(`native-runtime:${ctxString(ctx,"threadId")??''}`);
-        const stamp=JSON.stringify([current.fmHome,hostId,overlayFingerprint(),runtimeSelection]);
+        const hookRevision=createHash('sha256').update(Buffer.from(overlayBytes('bin/bb-captain-hook.sh'),'base64')).digest('hex');
+        const stamp=JSON.stringify([current.fmHome,hostId,overlayFingerprint(),runtimeSelection,hookRevision]);
         const verifiedSetup=adapter.includes("mirror OK:") && await bb.storage.kv.get(setupKey)===stamp;
         if (!verifiedSetup) await refreshSkillsManifest(hostId, current.fmHome, signal);
         if (!current.fullParityOnDeck) await refreshCaptainMemory();
@@ -9250,7 +9168,9 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb firstmate fm [--timeout s] <script> [args...]   # real bin/fm-<script>.sh with FM_BACKEND=bb",
     "  bb firstmate deck [--digest|--all] [--json] | session [--json]",
     "  bb firstmate contract [section,...] [--paged | --cursor <cursor>] [--json] # read every page; default CLI returns complete native policy",
-    "  bb firstmate skill <name> [relative-reference] [--source <selected-root source-file>] [--json] # complete selected native policy",
+    "  bb firstmate skill <name> [relative-reference] [--source <selected-root source-file>] [--paged] [--json] # operator full read; agent bounded pages",
+    "  bb firstmate skill --cursor <cursor> [--json] # continue the same verified skill/reference",
+    "  bb firstmate skill --list [--paged] [--json] # complete diagnostic descriptions; not an alternate policy catalog",
     "  bb firstmate runtime status|install|select|migrate|rollback [exact-release|external] [--check] [--json]",
     dispatchHelp,
     "  bb firstmate launches list [--limit n] [--offset n] [--json]   # uncertain slots require reconciliation",
@@ -9404,8 +9324,13 @@ export default async function plugin(bb: BbPluginApi) {
     } finally {await runHostCommand(host,`rm -f ${shQuote(helper)}`,1000).catch(()=>{});}
   }
 
-  async function readNativeSkill(ctx:unknown,name:string,reference?:string,source?:string) {
-    const resource=nativeSkillPath(name,reference,source);
+  async function readNativeSkill(ctx:unknown,name?:string,reference?:string,source?:string,paged=false,cursor?:string,list=false) {
+    const resumed=cursor?skillCursorRequest(cursor):undefined;
+    if (resumed && ((list && !resumed.list) || (name!==undefined && name!==resumed.name) || (reference!==undefined && reference!==resumed.reference) || (source!==undefined && source!==resumed.source))) throw new Error('Native skill cursor resource differs from request; restart without cursor.');
+    if (list && (name || reference!==undefined || source!==undefined)) throw new Error('Use --list without native resource arguments.');
+    const request=resumed??(list?{list:true as const}:{name:name??'',...(reference!==undefined?{reference}:{}),...(source!==undefined?{source}:{})});
+    ({name,reference,source}=request);
+    const resource=request.list?undefined:nativeSkillPath(name??'',reference,source);
     const signal=AbortSignal.any([launchAbort.signal,AbortSignal.timeout(30_000),...(asRecord(ctx)["signal"]?[asRecord(ctx)["signal"] as AbortSignal]:[])]);
     const current=await raceAbort(settings.get(),signal,STUCK_HOST_CALL_MS),captain=ctxString(ctx,"threadId");
     if (!captain || !homeScope.getStore()?.home) throw new Error("Bind this captain with firstmate_deck before native policy reads; no global policy fallback.");
@@ -9416,12 +9341,21 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const selection=await raceAbort(bb.storage.kv.get<{root:string}>(`native-runtime:${captain}`),signal,STUCK_HOST_CALL_MS);
     const root=selection?.root??current.fmHome;
+    if (!resource) {
+      const catalog=await nativePolicyLookup(host,root,{operation:'catalog'},signal);
+      const skills=nativeDescriptions(catalog.entries!);
+      const inventory={diagnostic:true,commit:catalog.commit,root:catalog.root,skills};
+      await raceAbort(settings.experimental_set({fmSkillsManifest:JSON.stringify({schema:2,head:catalog.commit,skills:skills.map(({name,description})=>({name,desc:description}))})}),signal,STUCK_HOST_CALL_MS);
+      const text=JSON.stringify(inventory,null,2);
+      return paged || cursor ? skillPage(text,JSON.stringify([captain,current.fmHome,host,catalog.root,catalog.commit]),request,cursor) : text;
+    }
     const record=await nativePolicyLookup(host,root,{operation:'read',...resource},signal);
     const file=await raceAbort(bb.sdk.files.read({hostId:host,path:`${root}/${resource.path}`}),signal,STUCK_HOST_CALL_MS);
     if (!('content' in file)) throw new Error('Complete native policy file content unavailable');
     const data=Buffer.from(file.content,file.contentEncoding==='base64'?'base64':'utf8');
     if (data.length!==record.sizeBytes || createHash('sha256').update(data).digest('hex')!==record.sha256) throw new Error('Native policy changed or was truncated during file transfer; read remains unresolved');
-    return `Native policy @ ${record.commit}: ${record.root}/${record.path}${record.fragment?'#'+record.fragment:''}\nSource file (--source): ${record.path}\n\n${data.toString('utf8')}`;
+    const text=`Native policy @ ${record.commit}: ${record.root}/${record.path}${record.fragment?'#'+record.fragment:''}\nSource file (--source): ${record.path}\n\n${data.toString('utf8')}`;
+    return paged || cursor ? skillPage(text,JSON.stringify([captain,current.fmHome,host,record.root,record.commit]),request,cursor) : text;
   }
 
   async function checkToolchain(hostId: string, fmHome: string, signal?: AbortSignal) {
@@ -9474,9 +9408,9 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   registerCaptainTool({
-    name:"firstmate_skill",description:"Read a complete native policy skill or reference from this captain’s selected runtime; both audited revisions supported, no global copied policy fallback.",
-    parameters:z.object({name:z.string(),reference:z.string().optional().describe("Native relative link, including .. and #fragment inside selected runtime; returns complete document"),source:z.string().optional().describe("Exact selected-root relative source file for nested links; default .agents/skills/<name>/SKILL.md")}),
-    async execute({name,reference,source},ctx){return readNativeSkill(ctx,name,reference,source);},
+    name:"firstmate_skill",description:"Read verified native policy from this captain's selected runtime in bounded pages. Follow every returned cursor until END OF NATIVE SKILL TRANSPORT before applying it; no global copied policy fallback.",
+    parameters:z.object({name:z.string().optional().describe("Exact native skill name for the first page"),list:z.boolean().optional().describe("Inspect full diagnostic descriptions from the verified selected catalog; omit resource arguments"),reference:z.string().max(1000).optional().describe("Native relative link, including .. and #fragment inside selected runtime"),source:z.string().max(1000).optional().describe("Exact selected-root relative source file for nested links; default .agents/skills/<name>/SKILL.md"),cursor:z.string().max(4096).optional().describe("Exact continuation cursor; omit other arguments to continue the same verified resource")}),
+    async execute({name,reference,source,cursor,list},ctx){return readNativeSkill(ctx,name,reference,source,true,cursor,list);},
   });
   registerCaptainTool({
     name: "firstmate_dispatch",
@@ -10999,7 +10933,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "fm", summary: "Run a real firstmate bin/ script with FM_BACKEND=bb", usage: FM_WRAPPER_HELP },
       { name: "deck", summary: "Bind native home and return agent-shell startup (not ready until native digest)", usage: "bb firstmate deck [--digest|--all] [--json]" },
       { name: "session", summary: "Session digest: memory + bearings + afk", usage: "bb firstmate session [--json]" },
-      { name:"skill", summary:"Read selected native policy without mixing runtime versions", usage:"bb firstmate skill <name> [relative-reference] [--source <selected-root source-file>] [--json]" },
+      { name:"skill", summary:"Read selected native policy or diagnostic descriptions without mixing runtime versions", usage:"bb firstmate skill <name> [relative-reference] [--source <selected-root source-file>] [--paged] [--json]; skill --cursor <cursor>; skill --list [--paged] [--json]" },
       { name: "dispatch", summary: "Dispatch crewmate child threads", usage: dispatchHelp },
       { name: "crews", summary: "List recorded crews with live status", usage: "bb firstmate crews [--json]" },
       { name: "crew", summary: "Show one crew with last output", usage: "bb firstmate crew <crew-id> [--json]" },
@@ -11104,8 +11038,9 @@ export default async function plugin(bb: BbPluginApi) {
             return reply({ guide: text }, text);
           }
           case "skill": {
-            if (!rest[0]) return fail("Use bb firstmate skill <native-name> [relative-reference] [--source <selected-root source-file>]. Bind with bb firstmate deck first.");
-            const text=await readNativeSkill(ctx,rest[0],rest[1],flagStr(flags,'source'));return reply({text},text);
+            if (!rest[0] && !flagStr(flags,'cursor') && !flags.has('list')) return fail("Use bb firstmate skill <native-name> [relative-reference] [--source <selected-root source-file>] [--paged], then skill --cursor <cursor>; skill --list inspects diagnostic descriptions. Bind with bb firstmate deck first.");
+            const list=flags.has('list'),text=await readNativeSkill(ctx,rest[0],rest[1],flagStr(flags,'source'),flags.has('paged'),flagStr(flags,'cursor'),list);
+            return list && flags.has('json') && !flags.has('paged') && !flagStr(flags,'cursor') ? reply(JSON.parse(text),text) : reply({text},text);
           }
           case "contract": {
             // The operator CLI reads the whole contract unless a section is named.

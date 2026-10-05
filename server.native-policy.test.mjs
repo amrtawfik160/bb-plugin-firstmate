@@ -39,6 +39,17 @@ async function hostFor(home,extraSettings={}) {
  host.harness.sdk.stub('terminals.output',async({terminalId})=>({nextSeq:1,chunks:[{dataBase64:Buffer.from(output.get(terminalId)).toString('base64')}]}));
  return{host,commands};
 }
+async function completeSkill(tool,request,context=ctx){
+ let text='',cursor;
+ do{
+  const page=await tool.execute(cursor?{cursor}:request,context);assert.equal(typeof page,'string',JSON.stringify(page));
+  assert.ok(Buffer.byteLength(page)<12000,'bounded native skill response');
+  const body=/\nBEGIN_PAGE\n([\s\S]*)\nEND_PAGE\n/.exec(page);assert.ok(body);text+=body[1];
+  cursor=/firstmate_skill \{"cursor":"([A-Za-z0-9_-]+)"\}/.exec(page)?.[1];
+  if(!cursor)assert.match(page,/END OF NATIVE SKILL TRANSPORT/);
+ }while(cursor);
+ return text;
+}
 test('cold-entry tool instructions retain exact native supervisor role across binding and later turns, excluding workers',async()=>{
  for(const pin of ['1f3e7696','2d833ff1']){
   const native=readFileSync(`native-snapshot/${pin}/AGENTS.md`,'utf8');
@@ -95,6 +106,67 @@ for(const pin of pins)test(`bounded registered contract pages ${pin.slice(0,8)} 
   assert.ok(full.stdout.includes(body),'complete native text/catalog/adaptations must equal operator full read');
   assert.match(body,/Selected native skill trigger catalog/);assert.match(body,/BB runtime adaptations/);
   assert.equal(f.host.harness.sdk.callsTo('threads.spawn').length,0);assert.equal(f.host.harness.sdk.callsTo('threads.send').length,0);
+ }finally{await f.host.harness.lifecycle.dispose();rmSync(home,{recursive:true,force:true});}
+});
+for(const pin of pins)test(`bounded native skill reads ${pin.slice(0,8)} preserve large bytes through tool and CLI continuation after reload`,async()=>{
+ const home=fixture(pin);let f=await hostFor(home);
+ try{
+  const full=await f.host.harness.behavior.runCli(['skill','afk'],ctx);assert.equal(full.exitCode,0,full.stderr);
+  assert.ok(Buffer.byteLength(full.stdout)>19500,'real native skill exceeds observed incident preview');
+  let body='',cursor,count=0;
+  do{
+   const tool=f.host.harness.registrations.agentTools.find(t=>t.name==='firstmate_skill');
+   const page=await tool.execute(cursor?{cursor}:{name:'afk'},ctx);
+   assert.equal(typeof page,'string',JSON.stringify(page));
+   assert.ok(Buffer.byteLength(page)<12000,'bounded public payload including instructions and marker');
+   const content=/\nBEGIN_PAGE\n([\s\S]*)\nEND_PAGE\n/.exec(page);assert.ok(content,'explicit native page envelope');body+=content[1];
+   cursor=/firstmate_skill \{"cursor":"([A-Za-z0-9_-]+)"\}/.exec(page)?.[1];
+   if(count++===0){
+    assert.ok(cursor);
+    const cli=await f.host.harness.behavior.runCli(['skill','afk','--paged'],ctx);assert.equal(cli.exitCode,0,cli.stderr);assert.ok(cli.stdout.includes(content[1]));
+    const other=await tool.execute({name:'stow',cursor},ctx);assert.equal(other.isError,true);assert.match(JSON.stringify(other),/resource differs/);
+    await f.host.bb.storage.kv.set('native-home:thr_other',home);await f.host.bb.storage.kv.set('native-home-host:thr_other','host_1');
+    const wrong=await tool.execute({cursor},{...ctx,threadId:'thr_other'});assert.equal(wrong.isError,true);assert.match(JSON.stringify(wrong),/another captain/);
+    await f.host.harness.lifecycle.dispose();f=await hostFor(home);
+    const resumed=await f.host.harness.behavior.runCli(['skill','--cursor',cursor],ctx);assert.equal(resumed.exitCode,0,resumed.stderr);assert.match(resumed.stdout,/FIRSTMATE_SKILL_PAGE 2\//);
+   }
+   if(!cursor)assert.match(page,/END OF NATIVE SKILL TRANSPORT/);
+   assert.ok(count<20);
+  }while(cursor);
+  assert.equal(body,full.stdout,'all native text and identity headers survive in exact order');
+  const tool=f.host.harness.registrations.agentTools.find(t=>t.name==='firstmate_skill');
+  const first=await tool.execute({name:'afk'},ctx),pending=/firstmate_skill \{"cursor":"([A-Za-z0-9_-]+)"\}/.exec(first)[1];
+  const path=join(home,'.agents/skills/afk/SKILL.md');writeFileSync(path,readFileSync(path,'utf8')+'\nChanged native file\n');
+  const changed=await tool.execute({cursor:pending},ctx);assert.equal(changed.isError,true);assert.match(JSON.stringify(changed),/differ from selected Git snapshot/);
+  assert.equal(f.host.harness.sdk.callsTo('threads.spawn').length,0);assert.equal(f.host.harness.sdk.callsTo('threads.send').length,0);
+ }finally{await f.host.harness.lifecycle.dispose();rmSync(home,{recursive:true,force:true});}
+});
+test('public diagnostic inventory preserves folded native descriptions and all trigger branches without becoming role policy',async()=>{
+ const home=fixture(),f=await hostFor(home);
+ try{
+  const result=await f.host.harness.behavior.runCli(['skill','--list','--json'],ctx);assert.equal(result.exitCode,0,result.stderr);
+  const inventory=JSON.parse(result.stdout);
+  assert.equal(inventory.diagnostic,true);assert.equal(inventory.commit,pins[1]);assert.equal(inventory.skills.length,28);
+  const afk=inventory.skills.find(s=>s.name==='afk');
+  assert.ok(afk.description.startsWith('Enter the away posture when the captain invokes /afk, says they are going afk,'));
+  assert.ok(afk.description.endsWith('on the first unmarked message renders the return brief from durable records before ordinary work resumes.'));
+  assert.ok(afk.description.length>160,'description preserves all branches beyond old 160-character cutoff');
+  assert.ok(afk.description.includes('on Pi the supervision branch acts on the words by its own judgment'));
+  const maintenance=inventory.skills.find(s=>s.name==='agent-skill-trigger-index');assert.equal(maintenance.description,'Load only when auditing or maintaining the complete agent-only skill trigger index.');
+  const tool=f.host.harness.registrations.agentTools.find(t=>t.name==='firstmate_skill');
+  const text=await completeSkill(tool,{list:true});assert.deepEqual(JSON.parse(text),inventory);
+  const cfg=await f.host.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({pluginMetadata:{captain:'true',nativeHome:home}}));
+  assert.ok(!cfg.instructions.includes(afk.description),'diagnostic inventory is not a competing role trigger policy');
+ }finally{await f.host.harness.lifecycle.dispose();rmSync(home,{recursive:true,force:true});}
+});
+test('oversized Unicode reference identity refuses an unusable cursor without shortening the operator document',async()=>{
+ const home=fixture(),f=await hostFor(home);try{
+  const reference='SKILL.md#'+'界'.repeat(990);
+  const tool=f.host.harness.registrations.agentTools.find(t=>t.name==='firstmate_skill');
+  const result=await tool.execute({name:'afk',reference},ctx);assert.equal(result.isError,true,'cannot publish a cursor larger than the continuation parser accepts');
+  assert.match(JSON.stringify(result),/identity.*bytes.*omit.*fragment/);
+  const full=await f.host.harness.behavior.runCli(['skill','afk',reference],ctx);assert.equal(full.exitCode,0,full.stderr);
+  assert.ok(full.stdout.endsWith(readFileSync(join(home,'.agents/skills/afk/SKILL.md'),'utf8')));
  }finally{await f.host.harness.lifecycle.dispose();rmSync(home,{recursive:true,force:true});}
 });
 for(const pin of pins)test(`native dispatch intake ${pin.slice(0,8)} writes branch brief then resolves then owns backlog before attempted guarded BB spawn`,async()=>{
@@ -208,12 +280,12 @@ for(const pin of pins)test(`native relative references ${pin.slice(0,8)} resolve
     const args=['skill',request.name,request.reference,...(request.source?['--source',request.source]:[])];
     const cli=await f.host.harness.behavior.runCli(args,ctx);assert.equal(cli.exitCode,0,cli.stderr);
     assert.ok(cli.stdout.endsWith(expected),'complete document through registered CLI, including tail');
-    const result=await tool.execute(request,ctx);assert.ok(result.endsWith(expected+FIRSTMATE_ROUTINE_MARKER),'complete document through registered tool, including tail');
+    const result=await completeSkill(tool,request);assert.ok(result.endsWith(expected),'complete document through registered tool, including tail');
     assert.ok(result.includes(pin));assert.ok(result.includes(path));
     if(path==='docs/configuration.md')assert.ok(Buffer.byteLength(expected)>200000,'real document exceeds replaced limit');
   }
-  const fragment=await tool.execute({name:'stuck-crewmate-recovery',source:'docs/configuration.md',reference:'#crew-hosted-lavish-review-boards'},ctx);
-  assert.ok(fragment.endsWith(readFileSync(join(home,'docs/configuration.md'),'utf8')+FIRSTMATE_ROUTINE_MARKER));
+  const fragment=await completeSkill(tool,{name:'stuck-crewmate-recovery',source:'docs/configuration.md',reference:'#crew-hosted-lavish-review-boards'});
+  assert.ok(fragment.endsWith(readFileSync(join(home,'docs/configuration.md'),'utf8')));
   assert.equal(f.host.harness.sdk.callsTo('threads.spawn').length,0);assert.equal(f.host.harness.sdk.callsTo('threads.send').length,0);
   assert.equal(f.host.harness.sdk.callsTo('terminals.create').length,f.host.harness.sdk.callsTo('terminals.close').length);
  }finally{await f.host.harness.lifecycle.dispose();rmSync(home,{recursive:true,force:true});}

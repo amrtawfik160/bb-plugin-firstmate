@@ -1,0 +1,30 @@
+✖ oversized Unicode reference identity refuses an unusable cursor without shortening the operator document (499.165294ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 0
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 787.653521
+
+✖ failing tests:
+
+test at server.native-policy.test.mjs:162:1
+✖ oversized Unicode reference identity refuses an unusable cursor without shortening the operator document (499.165294ms)
+  AssertionError [ERR_ASSERTION]: cannot publish a cursor larger than the continuation parser accepts
+  + actual - expected
+
+  + undefined
+  - true
+
+      at TestContext.<anonymous> (file:///root/github_projects/bb-plugin-firstmate-launch-pr-lifecycle/server.native-policy.test.mjs:166:70)
+      at async Test.run (node:internal/test_runner/test:1332:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: true,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }

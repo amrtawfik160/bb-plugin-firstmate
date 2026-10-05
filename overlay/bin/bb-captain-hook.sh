@@ -59,6 +59,13 @@ bb_keeper_healthy() {
     && [ "$watcher_beat" -le "$now" ] && [ $((now - watcher_beat)) -le 300 ]
 }
 
+# BB private Stop feedback continues a turn that may already contain a report.
+# Point that continuation back to native section 9, without consuming reports
+# or introducing a second reporting policy. The final-message sentence is native.
+resume_outcome_report() {
+  printf '%s\n' 'After handling, continue the captain-facing outcome under native AGENTS.md section 9. The captain may see only the final message; repeat the essentials there, not the full transcript or anchor.' >&2
+}
+
 case "$mode" in
   stop)
     native_args=()
@@ -74,12 +81,14 @@ case "$mode" in
     queue="${state}/.wake-queue"
     if [ -e "${state}/.bb-wake-receipt.json" ]; then
       printf 'firstmate: a durable wake receipt still needs handling. Call firstmate_wake with ack=true to recover it; after handling all reports, pass handledWake on the final successful Firstmate action or firstmate_wake.\n' >&2
+      resume_outcome_report
       exit 2
     fi
     [ -s "$queue" ] || exit 0
     rows=$(awk 'END { print NR }' "$queue" 2>/dev/null || echo 0)
     [ "${rows:-0}" -gt 0 ] 2>/dev/null || exit 0
     printf 'firstmate: %s unhandled crew wake(s) for this captain. Call firstmate_wake with ack=true, handle all reports, then pass handledWake on the final successful Firstmate action or firstmate_wake.\n' "$rows" >&2
+    resume_outcome_report
     exit 2
     ;;
   stop-autoarm)

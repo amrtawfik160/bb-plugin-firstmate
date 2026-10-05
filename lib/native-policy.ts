@@ -1,3 +1,15 @@
+import { parseDocument } from "yaml";
+
+export function nativeDescriptions(entries: Array<{path:string;sha256:string;frontmatter:string}>) {
+  return entries.map(entry=>{
+    const document=parseDocument(entry.frontmatter);
+    if (document.errors.length) throw new Error(`Invalid verified native frontmatter: ${entry.path}`);
+    const value=document.toJS() as Record<string,unknown>;
+    if (typeof value?.name!=='string' || typeof value?.description!=='string' || !value.description.trim()) throw new Error(`Incomplete native description: ${entry.path}`);
+    return {name:value.name,description:value.description,path:entry.path,sha256:entry.sha256};
+  });
+}
+
 /** Read policy from the exact selected runtime. SDK 0.4.104 only accepts static
  * skill ids; supplying global copied skills would mix two native revisions. */
 export const AUDITED_POLICY_COMMITS=['2d833ff147cd26a5c461e914e06854e0eb2707ce','1f3e769616fdf9f31f85f4c3e6a9f71606634238'] as const;

@@ -1,0 +1,40 @@
+✖ bounded native skill reads 2d833ff1 preserve large bytes through tool and CLI continuation after reload (862.312313ms)
+✖ bounded native skill reads 1f3e7696 preserve large bytes through tool and CLI continuation after reload (774.364318ms)
+ℹ tests 2
+ℹ suites 0
+ℹ pass 0
+ℹ fail 2
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1962.610215
+
+✖ failing tests:
+
+test at server.native-policy.test.mjs:111:23
+✖ bounded native skill reads 2d833ff1 preserve large bytes through tool and CLI continuation after reload (862.312313ms)
+  AssertionError [ERR_ASSERTION]: bounded public payload including instructions and marker
+      at TestContext.<anonymous> (file:///root/github_projects/bb-plugin-firstmate-launch-pr-lifecycle/server.native-policy.test.mjs:121:11)
+      at async Test.run (node:internal/test_runner/test:1332:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: false,
+    expected: true,
+    operator: '==',
+    diff: 'simple'
+  }
+
+test at server.native-policy.test.mjs:111:23
+✖ bounded native skill reads 1f3e7696 preserve large bytes through tool and CLI continuation after reload (774.364318ms)
+  AssertionError [ERR_ASSERTION]: bounded public payload including instructions and marker
+      at TestContext.<anonymous> (file:///root/github_projects/bb-plugin-firstmate-launch-pr-lifecycle/server.native-policy.test.mjs:121:11)
+      at async Test.run (node:internal/test_runner/test:1332:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:911:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: false,
+    expected: true,
+    operator: '==',
+    diff: 'simple'
+  }

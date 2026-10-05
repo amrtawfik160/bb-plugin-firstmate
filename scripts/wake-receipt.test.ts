@@ -417,6 +417,31 @@ test("captain stop hook blocks pairless pending receipt and preserves recursion 
   assert.equal(run('{"stop_hook_active":true}').status, 0);
 });
 
+test("late audit notification continuation preserves unread reports and resumes native final-outcome reporting", (t) => {
+  const f = fixture(t, { queue: [{ seq: 1, text: "audit completed: seven findings; no product changes" }] });
+  mkdirSync(join(f.dir, "bin-bb"));
+  writeFileSync(join(f.dir, "bin-bb/fm-turnend-guard.sh"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  const markers = join(f.dir, ".bb-firstmate/captains");mkdirSync(markers, { recursive: true });
+  writeFileSync(join(markers, "thr_test"), `home=${f.dir}\nstate=${f.state}\n`);
+  writeFileSync(join(f.state, ".wake-queue"), "1\t1\tsignal\tworker.status\taudit completed\n");
+  const hook = (payload: string) => spawnSync("bash", [join(root, "overlay/bin/bb-captain-hook.sh"), "stop"], {
+    input: payload, encoding: "utf8", env: { ...process.env, HOME: f.dir, BB_THREAD_ID: "thr_test" },
+  });
+  const blocked = hook("{}");assert.equal(blocked.status, 2);
+  assert.match(blocked.stderr, /AGENTS\.md section 9/);
+  const nativeRule = "The captain may see only the final message; repeat the essentials there, not the full transcript or anchor.";
+  assert.ok(readFileSync(join(root, "native-snapshot/1f3e7696/AGENTS.md"), "utf8").includes(nativeRule));
+  assert.ok(blocked.stderr.includes(nativeRule), "private operational continuation must return to the native outcome rule");
+  assert.equal(f.read().reads, undefined);assert.equal(f.read().acks, undefined, "a hook never handles unseen reports");
+  const receipt=f.run();assert.match(receipt.report,/seven findings/);
+  const pending=hook("{}");assert.equal(pending.status,2);assert.ok(pending.stderr.includes(nativeRule));
+  assert.equal(f.run("inspect", receipt.id!).id,receipt.id);
+  assert.equal(hook('{"stopHookActive":true}').status,0,"one continuation remains bounded without consuming its receipt");
+  assert.equal(f.run("complete", receipt.id!).completed,receipt.id);
+  assert.equal(f.read().acks,1);
+  assert.deepEqual(f.read().queue,[]);
+});
+
 test("real native drain retains pairless status and new-generation queue rows", { skip: !existsSync(join(nativeFixture, "bin/fm-wake-drain.sh")) }, (t) => {
   const f = fixture(t);
   const native = join(nativeFixture, "bin/fm-wake-drain.sh");
