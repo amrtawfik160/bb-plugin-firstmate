@@ -27,7 +27,9 @@ export function ciEnvironment(native,bin) {
  const env={...process.env};
  for(const key of Object.keys(env))if(key.startsWith('BB_') || key.startsWith('FM_') || key.startsWith('FIRSTMATE_'))delete env[key];
  // No external Firstmate fallback or inherited model/host routing in this profile.
- return {...env,PATH:`${bin}:${dirname(process.execPath)}:/usr/bin:/bin`,
+ // Native adoption uses the real backlog CLI from the CI lockfile, never a
+ // separately managed global install. The owned BB refusal stays first.
+ return {...env,PATH:`${bin}:${resolve('scripts/ci-tools/node_modules/.bin')}:${dirname(process.execPath)}:/usr/bin:/bin`,
   FIRSTMATE_TEST_NATIVE:native,FM_TEST_HOME:native,FM_SCOUT_NATIVE_BIN:join(native,'bin-bb'),FM_CLASSIFY_LIB:join(native,'bin/fm-classify-lib.sh')};
 }
 export function assertNoSkippedTests(output) {
