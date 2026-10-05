@@ -10,10 +10,10 @@ including after context compaction. A direct request for detail takes precedence
 Native Calm is a terminal presentation module; this skill uses BB's existing
 timeline filtering and requires no terminal hooks or `config/calm` changes.
 
-1. Read [escalation etiquette](../captain/references/escalation.md), the authority
+1. Read [escalation etiquette](../../entry-skills/captain/references/escalation.md), the authority
    for which outcomes require a reply and which routine events stay silent.
 2. Handle incoming work under the existing authority and
-   [durable receipt contract](../captain/references/supervision.md#durable-wake-handling).
+   [durable receipt contract](../../entry-skills/captain/references/supervision.md#durable-wake-handling).
    Silence changes presentation only: finish handling before acknowledging a report.
 3. For a required reply, lead with the outcome or the action the captain needs
    to take. Include its consequence and the next step, with the recorded link

@@ -1,3 +1,4 @@
+import {manifestSkillIds} from './scripts/plugin-skill-fixture.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync, readdirSync, cpSync, mkdtempSync, rmSync } from 'node:fs';
@@ -11,8 +12,7 @@ import {followRuntimeReferences} from './scripts/captain-packaging-check.mjs';
 const root = dirname(fileURLToPath(import.meta.url));
 const skillRoot = join(root, 'skills');
 // Declare skills from the actual manifest directory, not from the routing code.
-const skillIds = readdirSync(skillRoot).filter(name =>
-  readdirSync(join(skillRoot, name)).includes('SKILL.md'));
+const skillIds = manifestSkillIds(root);
 
 async function configuredHost(settings = {}) {
   const host = createFakePluginHost({ pluginId: 'firstmate', agentSkillIds: skillIds, settings });
@@ -87,7 +87,7 @@ test('saturated captain instruction budget preserves every runtime obligation an
   } finally { await host.harness.lifecycle.dispose(); }
 });
 
-test('method references resolve within the manifest package without global skill paths', () => {
+test('unregistered method source references resolve within the repository without global skill paths', () => {
   const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
   assert.ok(!manifest.bb.skills.includes('skills'));
   for(const name of ['calm','catch-up','captain-methods','worker-methods']) assert.ok(!manifest.bb.skills.includes('skills/'+name), 'optional source remains unregistered');
@@ -104,7 +104,7 @@ test('method references resolve within the manifest package without global skill
       if (/^https:\/\//.test(target)) continue;
       const destination = resolve(dirname(path), target.split('#')[0]);
       const local = relative(skillRoot, destination);
-      assert.ok(!local.startsWith('..'), `${target} must stay in packaged skills`);
+      assert.ok(!relative(root,destination).startsWith('..'), `${target} must stay in the repository sources`);
       const sourceSkill = relative(skillRoot, path).split('/')[0];
       if (sourceSkill.endsWith('-methods') && /^(captain-methods|worker-methods)\//.test(local)) {
         assert.equal(local.split('/')[0], sourceSkill, 'each selected method skill carries its own method references');
@@ -128,7 +128,7 @@ test('method references resolve within the manifest package without global skill
 function runtimePackage(configuration, additionalSkills = []) {
   const directory = mkdtempSync(join(tmpdir(), 'fm-cold-skills-'));
   for (const id of new Set([...configuration.skills, ...additionalSkills])) {
-    cpSync(join(skillRoot, id), join(directory, id), { recursive: true });
+    cpSync(join(root, 'entry-skills', id), join(directory, id), { recursive: true });
   }
   return directory;
 }

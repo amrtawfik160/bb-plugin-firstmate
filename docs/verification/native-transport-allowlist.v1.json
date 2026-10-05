@@ -27,23 +27,23 @@
     }
   },
   "captainTransport": {
-    "skills/captain/SKILL.md": {
+    "entry-skills/captain/SKILL.md": {
       "sha256": "65756be8ec73727143d21ff78e66b59ea3e6578b1a9351ad41d85d6b3c6374a3",
       "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner."
     },
-    "skills/firstmate/SKILL.md": {
+    "entry-skills/firstmate/SKILL.md": {
       "sha256": "4278efad7a37ce187b2082ba4eb40e4a77b8e3c112aaaf13fdc786f38edd50ff",
       "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner."
     },
-    "skills/captain/references/bb.md": {
+    "entry-skills/captain/references/bb.md": {
       "sha256": "7ad5512a7bf21494491a5271a8cf75d2e2a53146bee8b10e773a1f07330d6962",
       "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner."
     },
-    "skills/captain/references/intake-briefs.md": {
+    "entry-skills/captain/references/intake-briefs.md": {
       "sha256": "06d88ecf4bc68cccc6288428dc0b346509b928ae302e411a45d3b9f56566759a",
       "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner."
     },
-    "skills/captain/references/supervision.md": {
+    "entry-skills/captain/references/supervision.md": {
       "sha256": "f1e6152dffd6e075f5a8be86b8cf210b3517bf3b994bf9f1769849ae6b588f8d",
       "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner."
     }

@@ -5,7 +5,7 @@ import {join,resolve} from 'node:path';import {tmpdir} from 'node:os';import {sp
 const root=resolve('.'),copy=mkdtempSync(join(tmpdir(),'fm-trigger-mutations-')),env={...process.env};
 for(const key of ['BB_CLI','BB_INFERENCE','BB_INFERENCE_FALLBACK','BB_TRANSCRIPTION','BB_THREAD_ID','BB_PROJECT_ID','BB_ENVIRONMENT_ID','BB_HOST_ID','BB_SERVER_URL','BB_HOST_DAEMON_PORT','BB_DATA_DIR'])delete env[key];
 try{
- for(const path of ['package.json','server.ts','rpc.ts','server.native-policy.test.mjs','lib','overlay','skills','scripts','runtime-assets','docs'])cpSync(join(root,path),join(copy,path),{recursive:true,filter:p=>!p.includes('__pycache__')});
+ for(const path of ['package.json','server.ts','rpc.ts','server.native-policy.test.mjs','lib','overlay','skills','entry-skills','scripts','runtime-assets','docs'])cpSync(join(root,path),join(copy,path),{recursive:true,filter:p=>!p.includes('__pycache__')});
  symlinkSync(join(root,'node_modules'),join(copy,'node_modules'),'dir');
  function killed(name,file,from,to,pattern,diagnostic){
   const path=join(copy,file),original=readFileSync(path,'utf8');assert.ok(original.includes(from),'anchor: '+name);

@@ -1,3 +1,4 @@
+import {manifestSkillIds} from './scripts/plugin-skill-fixture.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {createHash} from 'node:crypto';
@@ -13,7 +14,7 @@ import {runtimeFixture} from './scripts/native-runtime-fixture.mjs';
 import {fixture,pins,scaffold,render,run,ok} from './scripts/prompt-fixture.mjs';
 const ctx={threadId:'thr_cap',projectId:'proj_1'};
 const manifest=JSON.parse(readFileSync('package.json','utf8'));
-const ids=manifest.bb.skills.map(path=>/^name:\s*(.+)$/m.exec(readFileSync(path+'/SKILL.md','utf8'))[1]);
+const ids=manifestSkillIds(process.cwd());
 const hash=text=>createHash('sha256').update(text).digest('hex');
 async function hostFor(home) {
  const host=createFakePluginHost({pluginId:'firstmate',agentSkillIds:ids,settings:{fmHome:home,fmHostId:'host_1',fullParityOnDeck:false}});await plugin(host.bb);

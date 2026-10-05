@@ -86,8 +86,8 @@ export type Skill = {
 // worker-methods are explicit exceptions documented in CONTRIBUTING.md; their
 // package/reference/routing checks do not replace any native fidelity check.
 const SKILL_GLOBS = [
-  "skills/captain/SKILL.md",
-  "skills/firstmate/SKILL.md",
+  "entry-skills/captain/SKILL.md",
+  "entry-skills/firstmate/SKILL.md",
   "skills/ahoy/SKILL.md",
   "skills/quiet/SKILL.md",
   "skills/stow/SKILL.md",
@@ -116,13 +116,13 @@ const SKILL_GLOBS = [
   "skills/session-start-recovery/SKILL.md",
   "skills/ship-landing/SKILL.md",
   "skills/validation-supervision/SKILL.md",
-  "skills/captain/references/escalation.md",
-  "skills/captain/references/ask-user-authority.md",
-  "skills/captain/references/diagnostic-reasoning.md",
+  "entry-skills/captain/references/escalation.md",
+  "entry-skills/captain/references/ask-user-authority.md",
+  "entry-skills/captain/references/diagnostic-reasoning.md",
 ];
 
 const CAPTAIN_WATCH_GUIDANCE = [
-  "skills/captain/references/bb.md",
+  "entry-skills/captain/references/bb.md",
 ];
 
 export function normalize(s: string): string {

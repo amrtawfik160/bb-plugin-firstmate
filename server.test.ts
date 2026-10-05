@@ -8768,10 +8768,10 @@ function captainAndCrewThreads(host: Awaited<ReturnType<typeof load>>, captain: 
 
 test("no-op wakes end silently: the escalation skill no longer asks for 'Captain, shipshape.'", () => {
   const rendered = (path: string) => readFileSync(join(dirname(fileURLToPath(import.meta.url)), path), "utf8").replace(/<!--[\s\S]*?-->/g, "");
-  const escalation = rendered("skills/captain/references/escalation.md");
+  const escalation = rendered("entry-skills/captain/references/escalation.md");
   assert.doesNotMatch(escalation, /Reply exactly `Captain, shipshape\.`/, "the skill must not tell captains to answer a no-op wake");
   assert.match(escalation, /ends the turn with no reply text/);
-  const captain = rendered("skills/captain/SKILL.md");
+  const captain = rendered("entry-skills/captain/SKILL.md");
   assert.match(captain, /complete upstream supervisor contract, verbatim/);
   assert.doesNotMatch(captain, /Reply exactly `Captain, shipshape\.`/);
 });

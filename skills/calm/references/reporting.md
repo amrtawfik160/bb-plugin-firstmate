@@ -2,7 +2,7 @@
 
 Apply only when existing reporting policy requires a reply or the user directly
 requests one. [Calm](../../calm/SKILL.md) and
-[escalation etiquette](../../captain/references/escalation.md) still decide when
+[escalation etiquette](../../../entry-skills/captain/references/escalation.md) still decide when
 to speak. [Catch-up](../../catch-up/SKILL.md) keeps its evidence and read-only
 contract. Editing cannot create a notification when policy calls for silence.
 

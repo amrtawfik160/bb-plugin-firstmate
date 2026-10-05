@@ -9,7 +9,7 @@ const root=resolve('.'),copy=mkdtempSync(join(tmpdir(),'fm-policy-mutations-'));
 const env={...process.env};
 for(const key of ['BB_CLI','BB_INFERENCE','BB_INFERENCE_FALLBACK','BB_TRANSCRIPTION','BB_THREAD_ID','BB_PROJECT_ID','BB_ENVIRONMENT_ID','BB_HOST_ID','BB_SERVER_URL','BB_HOST_DAEMON_PORT','BB_DATA_DIR'])delete env[key];
 try {
- for(const path of ['package.json','server.ts','rpc.ts','server.test.ts','server.native-policy.test.mjs','server.methods.test.mjs','server.launch-delivery.test.mjs','lib','overlay','skills','scripts','runtime-assets','docs'])cpSync(join(root,path),join(copy,path),{recursive:true,filter:path=>!path.includes('__pycache__')});
+ for(const path of ['package.json','server.ts','rpc.ts','server.test.ts','server.native-policy.test.mjs','server.methods.test.mjs','server.launch-delivery.test.mjs','lib','overlay','skills','entry-skills','scripts','runtime-assets','docs'])cpSync(join(root,path),join(copy,path),{recursive:true,filter:path=>!path.includes('__pycache__')});
  symlinkSync(join(root,'node_modules'),join(copy,'node_modules'),'dir');
  function killed(name,file,from,to,testFile,pattern,diagnostic) {
    const path=join(copy,file),original=readFileSync(path,'utf8');assert.ok(original.includes(from),'mutation anchor: '+name);
@@ -32,7 +32,7 @@ try {
  killed('current project mode replaces existing task mode','server.ts','crew.posture === "no-mistakes"','crew.posture === "no-mistakes" || posture.mode === "no-mistakes"','server.test.ts',"merge lands a PR with zero checks",/no-mistakes|1 !== 0/);
  killed('standing approval requires another per-PR request','server.ts','if (!posture.yolo && !yes)', 'if (!yes)','server.launch-delivery.test.mjs','recorded standing yolo',/Guarded native preflight|captain.s word/);
  killed('explicit task mode silently disables native standing yolo','server.ts','return {mode:explicitMode,yolo:context.plugin?.yolo ?? context.native?.yolo ?? false};','return {mode:explicitMode,yolo:false};','server.native-policy.test.mjs','native posture 2d833ff1',/FIXTURE_NO_WORKER|false !== true/);
- killed('method policy hides in a transitive captain reference','skills/captain/references/bb.md','## Operations','Read captain-methods before all assignments.\n\n## Operations','server.native-policy.test.mjs','selected 2d833ff1',/captain transport changes require explicit review/);
+ killed('method policy hides in a transitive captain reference','entry-skills/captain/references/bb.md','## Operations','Read captain-methods before all assignments.\n\n## Operations','server.native-policy.test.mjs','selected 2d833ff1',/captain transport changes require explicit review/);
  killed('orphan PR discovery changes recorded native mode','server.ts','posture:modeSchema.parse(recovered.deliveryMode)','posture:"direct-PR"','server.launch-delivery.test.mjs','durable launch orphan',/direct-PR.*no-mistakes|no-mistakes.*direct-PR/s);
  console.log('12/12 mutations killed; source checkout and external native homes untouched.');
 }finally{rmSync(copy,{recursive:true,force:true});}
