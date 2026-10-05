@@ -1,3 +1,4 @@
+import type { RoutedIntake } from './secondmate-intake.ts';
 import type { ReplacementContract } from './replacement.ts';
 import type { BbPluginApi } from '@get-bb/plugin-sdk';
 
@@ -6,6 +7,7 @@ export interface LaunchRecord {
   key: string; taskId: string; projectId: string; owner: string; home: string;
   generation: number; shape: string; state: LaunchState; threadId: string | null;
   replacement?:ReplacementContract;
+  routedIntake?:RoutedIntake;
   branchPrefix?:string;
   yolo?:boolean; nativeInvoked?: boolean; deliveryMode?: string; deliveryRequirement?: 'branch' | 'pr' | 'merged' | 'merged-and-verified';
   hostId?: string; path?: string; error?: string; updatedAt: number;
@@ -57,6 +59,13 @@ export function createLaunches(db: Database) {
   }
   function isDeletedWorker(threadId:string):boolean {
     return !!db.prepare('SELECT 1 FROM launch_deleted_workers WHERE thread=?').get(threadId);
+  }
+  function routeOnlyThread(threadId:string,projectId:string):boolean {
+    // Legacy route forgetting wrote a worker tombstone. Only exact durable
+    // route evidence with no worker/replacement/deletion history qualifies.
+    if (isDeletedWorker(threadId)) return false;
+    const worker=db.prepare("SELECT 1 FROM launches WHERE json_extract(record,'$.shape') != 'secondmate-route' AND (json_extract(record,'$.threadId')=? OR json_extract(record,'$.replacement.sourceThreadId')=?) LIMIT 1").get(threadId,threadId);
+    return !worker && !!db.prepare("SELECT 1 FROM launches WHERE project=? AND json_extract(record,'$.shape')='secondmate-route' AND json_extract(record,'$.threadId')=? LIMIT 1").get(projectId,threadId);
   }
   function list(owner?: string, limit = 100, offset = 0): LaunchRecord[] {
     const rows = owner === undefined
@@ -168,7 +177,7 @@ export function createLaunches(db: Database) {
       }
     });
   }
-  return { get, save, update, list, heldTaskIds,hasRuntimeConsumers, forTask,reassignWorker,workerDeleted,isDeletedWorker,adoptionTask,claimAdoption,reserve, once, create };
+  return { get, save, update, list,routeOnlyThread, heldTaskIds,hasRuntimeConsumers, forTask,reassignWorker,workerDeleted,isDeletedWorker,adoptionTask,claimAdoption,reserve, once, create };
 }
 
 async function recoveryRead<T>(operation:Promise<T>,signal?:AbortSignal):Promise<T> {

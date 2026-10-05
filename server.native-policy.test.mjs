@@ -416,3 +416,81 @@ test('bundled policy skill and references use the selected immutable runtime, no
   assert.equal(f.host.harness.sdk.callsTo('threads.spawn').length,0);assert.equal(f.host.harness.sdk.callsTo('threads.send').length,0);
  }finally{await f.host.harness.lifecycle.dispose();fixture.clean();}
 });
+
+for(const pin of pins)test(`accepted dispatch intent and specification ${pin.slice(0,8)} reach real native briefs and rendered workers without tail loss`,async()=>{
+ const home=fixture(pin),f=await hostFor(home,{transport:'real',queueOwner:'real'}),repo=join(home,'test-repository');
+ try{
+  ok(run('python3',['overlay/install-bb-backend.py','--home',home]));mkdirSync(repo);
+  ok(run('git',['init','--quiet',repo]));ok(run('git',['-C',repo,'config','user.name','Fixture']));ok(run('git',['-C',repo,'config','user.email','fixture@example.invalid']));
+  writeFileSync(join(repo,'proof.txt'),'owned baseline\n');ok(run('git',['-C',repo,'add','proof.txt']));ok(run('git',['-C',repo,'commit','--quiet','-m','owned baseline']));
+  f.host.harness.sdk.stub('providers.list',async()=>[{id:'fixture-provider',available:true}]);
+  const intent='Audit only. '+ 'x'.repeat(3030)+'\n```text\n## quoted heading\n```\nTAIL_NO_PRODUCT_EDITS';
+  const spec='Implement bounded verification. '+'x'.repeat(3020)+'\nTAIL_SPEC_CONDITION';
+  const tool=f.host.harness.registrations.agentTools.find(t=>t.name==='firstmate_dispatch');
+  for(const [id,task,expectedIntent,expectedSpec,kind] of [
+   ['full-intent',intent,intent,null,'cli'],
+   ['full-spec',"## Captain's intent\nAudit only.\n## Firstmate spec\n"+spec,'Audit only.',spec,'tool'],
+   ['unicode-intent','Audit only. '+'😀'.repeat(1500)+' TAIL_UNICODE','Audit only. '+'😀'.repeat(1500)+' TAIL_UNICODE',null,'cli'],
+  ]){
+   assert.ok(task.length<4000);
+   const result=kind==='cli'?await f.host.harness.behavior.runCli(['dispatch','--task-id',id,'--shape','scout','--provider','fixture-provider','--',task],ctx):await tool.execute({task,taskId:id,shape:'scout',providerId:'fixture-provider'},ctx);
+   const brief=readFileSync(join(home,`data/${id}/brief.md`),'utf8');
+   assert.ok(brief.includes(expectedIntent),'all accepted intent bytes reach the authoritative native brief');
+   if(expectedSpec)assert.ok(brief.includes(expectedSpec),'all accepted specification bytes reach the authoritative native brief');
+   const rendered=ok(render(home,join(home,`data/${id}/brief.md`),'scout',id));
+   assert.ok(rendered.includes(expectedIntent),'worker renderer retains the same intent');
+   if(expectedSpec)assert.ok(rendered.includes(expectedSpec),'worker renderer retains the same specification');
+   assert.ok(f.commands.some(c=>c.includes('fm-spawn.sh')&&c.includes(id)),JSON.stringify(result));
+  }
+  assert.equal(f.host.harness.sdk.callsTo('threads.spawn').length,0,'fake BB endpoint cannot launch a model');
+ }finally{await f.host.harness.lifecycle.dispose();rmSync(home,{recursive:true,force:true});}
+});
+
+for(const pin of pins)test(`worker CLI exact inbox and native status notification ${pin.slice(0,8)} remain callable while foreign task and supervisor bridge refuse`,async()=>{
+ const home=fixture(pin),f=await hostFor(home),worker={...ctx,threadId:'thr_worker'};
+ try{
+  ok(run('python3',['overlay/install-bb-backend.py','--home',home]));
+  f.host.harness.sdk.stub('threads.getPluginMetadata',async({threadId})=>threadId==='thr_worker'?{crew:'true',crewId:'owned-task',nativeHome:home}:{});
+  mkdirSync(join(home,'state/owned-task.inbox'));writeFileSync(join(home,'state/owned-task.inbox/001.msg'),'schema=fm-task-inbox.v1\nat=2026-10-05T00:00:00Z\n--\nExact pending steering body\n');writeFileSync(join(home,'state/owned-task.status'),'done: preserved handoff\n');
+  const inbox=await f.host.harness.behavior.runCli(['fm','--home',home,'inbox-take','--','owned-task'],worker);assert.equal(inbox.exitCode,0,inbox.stderr);assert.match(inbox.stdout,/001.msg/);assert.match(inbox.stdout,/Exact pending steering body/);
+  const ack=await f.host.harness.behavior.runCli(['fm','--home',home,'inbox-take','--','owned-task','--ack','001.msg'],worker);assert.equal(ack.exitCode,0,ack.stderr);assert.equal(readFileSync(join(home,'state/owned-task.inbox/handled/001.msg'),'utf8'),'schema=fm-task-inbox.v1\nat=2026-10-05T00:00:00Z\n--\nExact pending steering body\n');
+  const status=await f.host.harness.behavior.runCli(['fm','--home',home,'fleet-ledger','--','appended',join(home,'config'),join(home,'state/owned-task.status')],worker);assert.equal(status.exitCode,0,status.stderr);assert.equal(readFileSync(join(home,'state/owned-task.status'),'utf8'),'done: preserved handoff\n');
+  const count=f.commands.length;
+  for(const argv of [['fm','--home',home+'-foreign','inbox-take','--','owned-task'],['fm','--home',home,'inbox-take','--','owned-task','--ack'],['fm','--home',home,'inbox-take','--','another-task'],['fm','--home',home,'fleet-ledger','--','appended',join(home,'config'),join(home,'state/another.status')],['fm','--home',home,'spawn','--','owned-task','proj_1']]){
+   const denied=await f.host.harness.behavior.runCli(argv,worker);assert.equal(denied.exitCode,1);assert.match(denied.stderr,/worker caller/);
+  }
+  assert.equal(f.commands.length,count,'refusal occurs before host mutation');assert.equal(f.host.harness.sdk.callsTo('threads.spawn').length,0);
+ }finally{await f.host.harness.lifecycle.dispose();rmSync(home,{recursive:true,force:true});}
+});
+
+for(const pin of pins)test(`secondmate public dispatch ${pin.slice(0,8)} carries exact child intake independently of supervisor execution through native child brief`,async()=>{
+ const home=fixture(pin),f=await hostFor(home,{transport:'real',queueOwner:'real'}),repo=join(home,'test-repository');
+ try{
+  ok(run('python3',['overlay/install-bb-backend.py','--home',home]));mkdirSync(repo);
+  ok(run('git',['init','--quiet',repo]));ok(run('git',['-C',repo,'config','user.name','Fixture']));ok(run('git',['-C',repo,'config','user.email','fixture@example.invalid']));writeFileSync(join(repo,'proof.txt'),'baseline\n');ok(run('git',['-C',repo,'add','.']));ok(run('git',['-C',repo,'commit','--quiet','-m','baseline']));
+  f.host.harness.sdk.stub('providers.list',async()=>[{id:'requested-provider',available:true,reasoningLevels:[{id:'high'}],models:[{id:'requested-model'}]}]);
+  f.host.harness.sdk.stub('threads.defaultExecutionOptions',async()=>({model:'supervisor-model',reasoningLevel:'low',permissionMode:'accept-edits'}));
+  f.host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',providerId:'supervisor-provider',environmentId:'env_1'}));
+  await f.host.bb.storage.kv.set('native-home:thr_mate',home);await f.host.bb.storage.kv.set('native-home-host:thr_mate','host_1');
+  await f.host.bb.storage.kv.set('postures',{proj_1:{mode:'direct-PR',yolo:true,provenance:{source:'captain-instruction',actor:'thr_cap',at:'2026-10-05T00:00:00Z',reason:'Existing approved standing posture'}}});
+  await f.host.bb.storage.kv.set('secondmates',[{projectId:'proj_1',threadId:'thr_mate',scope:'subscription',projects:[],createdAt:'2026-10-05T00:00:00Z'}]);
+  let handed;
+  f.host.harness.sdk.stub('threads.send',async({threadId,input})=>{assert.equal(threadId,'thr_mate');handed=input[0].text;return{};});
+  const task='Audit subscription. Preserve user words and scope.';
+  const result=await f.host.harness.behavior.runCli(['dispatch','--task-id','routed-intake','--project','proj_1','--mode','direct-PR','--delivery-requirement','pr','--provider','requested-provider','--model','requested-model','--reasoning-level','high','--branch-prefix','audit/','--dispatch-profile-reason','Explicit native intake selection','--hidden','--',task],ctx);
+  assert.equal(result.exitCode,0,result.stderr);
+  const match=/BEGIN_FIRSTMATE_ROUTED_INTAKE\n([\s\S]*?)\nEND_FIRSTMATE_ROUTED_INTAKE/.exec(handed);assert.ok(match,'handoff must expose the exact structured child request');
+  const envelope=JSON.parse(match[1]);assert.equal(envelope.schema,1);assert.equal(envelope.origin.captainId,'thr_cap');assert.equal(envelope.origin.home,home);
+  const child=envelope.dispatch;
+  assert.equal(child.task,task);assert.equal(child.projectId,'proj_1');assert.equal(child.taskId,'routed-intake');assert.equal(child.providerId,'requested-provider');assert.equal(child.model,'requested-model');assert.equal(child.reasoningLevel,'high');assert.equal(child.branchPrefix,'audit/');assert.equal(child.dispatchProfileReason,'Explicit native intake selection');assert.equal(child.mode,'direct-PR');assert.equal(child.deliveryRequirement,'pr');assert.equal(child.visible,false);assert.equal(child.worktree,true);
+  assert.equal(envelope.posture.yolo,true);assert.equal(envelope.posture.provenance.actor,'thr_cap');
+  const rows=JSON.parse((await f.host.harness.behavior.runCli(['crews','--json'],ctx)).stdout);const routed=rows.find(c=>c.id==='routed-intake');
+  assert.equal(routed.providerId,'requested-provider');assert.equal(routed.model,'requested-model');assert.equal(routed.reasoningLevel,'high');assert.deepEqual(routed.routedIntake,envelope);
+  const launches=JSON.parse((await f.host.harness.behavior.runCli(['launches','--json'],ctx)).stdout);assert.deepEqual(launches.find(r=>r.taskId==='routed-intake').routedIntake,envelope);
+  const retry=await f.host.harness.behavior.runCli(['dispatch','--task-id','routed-intake','--project','proj_1','--mode','direct-PR','--delivery-requirement','pr','--provider','requested-provider','--model','requested-model','--reasoning-level','high','--branch-prefix','audit/','--dispatch-profile-reason','Explicit native intake selection','--hidden','--',task],ctx);assert.equal(retry.exitCode,0,retry.stderr);assert.equal(f.host.harness.sdk.callsTo('threads.send').length,1,'idempotent route preserves one handoff');
+  const native=await f.host.harness.registrations.agentTools.find(t=>t.name==='firstmate_dispatch').execute(child,{...ctx,threadId:'thr_mate'});
+  const brief=readFileSync(join(home,'data/routed-intake/brief.md'),'utf8');assert.ok(brief.includes(task),JSON.stringify(native));assert.match(brief,/Ship branch: `?audit\/routed-intake/);assert.match(brief,/Delivery contract: mode=direct-PR/);
+  const commands=f.commands.filter(c=>c.includes('fm-spawn.sh'));assert.equal(commands.length,1);assert.ok(commands[0].includes("FM_BB_PROVIDER='requested-provider'"));assert.ok(commands[0].includes("FM_BB_MODEL='requested-model'"));assert.ok(commands[0].includes("FM_BB_REASONING='high'"));assert.ok(commands[0].includes("FM_BB_DELIVERY_REQUIREMENT='pr'"));
+  assert.equal(f.host.harness.sdk.callsTo('threads.update').length,0,'routing changes no supervisor execution');assert.equal(f.host.harness.sdk.callsTo('threads.spawn').length,0,'real native endpoint refusal cannot fall back to SDK spawn');
+ }finally{await f.host.harness.lifecycle.dispose();rmSync(home,{recursive:true,force:true});}
+});

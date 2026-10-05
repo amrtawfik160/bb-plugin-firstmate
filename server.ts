@@ -2,6 +2,7 @@
 import { deflateSync } from "node:zlib";
 import { CAPTAIN_ROLE_INSTRUCTIONS } from "./lib/captain-role.ts";
 import { contractPage, contractCursorSection } from "./lib/contract-transport.ts";
+import { routedIntakeSchema, renderRoutedIntake } from "./lib/secondmate-intake.ts";
 import { skillPage, skillCursorRequest } from "./lib/skill-transport.ts";
 import { DISPATCH_TRANSPORT, FM_WRAPPER_HELP, taskDelivery, nativeDispatchIntake } from "./lib/dispatch-intake.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -126,6 +127,7 @@ const crewSchema = z.object({
   launchKey: z.string().optional(),
   deliveryRequirement: z.enum(["branch", "pr", "merged", "merged-and-verified"]).optional(),
   branchPrefix:z.string().max(120).optional(),
+  routedIntake:routedIntakeSchema.optional(),
   createdAt: z.string(),
 });
 type Crew = z.infer<typeof crewSchema>;
@@ -1761,6 +1763,33 @@ export default async function plugin(bb: BbPluginApi) {
     if (captain && typeof home === "string") captainHomes.set(captain, home);
     return homeScope.run({ captain, home: typeof home === "string" ? home : undefined, host: typeof host === "string" ? host : undefined }, fn);
   }
+  // Role exclusion is enforced at the public invocation boundary, before ledger
+  // receipts, home provisioning or supervisor mutations. Static tool selection
+  // alone cannot stop a worker from invoking the CLI.
+  async function requireSupervisorCaller(ctx: unknown, argv?: string[]): Promise<void> {
+    const threadId=ctxString(ctx,"threadId");
+    if (!threadId) return; // Internal/native harness calls still prove native admission.
+    const signal=AbortSignal.any([launchAbort.signal,AbortSignal.timeout(STUCK_HOST_CALL_MS),...(asRecord(ctx)["signal"]?[asRecord(ctx)["signal"] as AbortSignal]:[])]);
+    const meta=asRecord(await raceAbort(bb.sdk.threads.getPluginMetadata({threadId,pluginId:"firstmate",signal}),signal));
+    const known=(await raceAbort(readCrews(),signal)).some(c=>!isSecondmateRoute(c) && (c.threadId===threadId || c.priorThreadIds?.includes(threadId)));
+    const retired=await raceAbort(bb.storage.kv.get(`crew-retired:${threadId}`),signal)===true;
+    const project=ctxString(ctx,"projectId");
+    const routeOnly=retired && !known && !metaFlag(meta,"crew") && metaFlag(meta,"captain") && !!project && launches.routeOnlyThread(threadId,project) &&
+      (await raceAbort(readSecondmates(),signal)).some(m=>m.threadId===threadId && (m.projectId===project || m.projects.includes(project)));
+    const worker=metaFlag(meta,"crew") || known || launches.isDeletedWorker(threadId) || retired && !routeOnly;
+    if (!worker) return;
+    if (argv?.[0]==="help" || argv?.[0]==="guide" || argv?.[0]==="--help") return;
+    // The native status append itself is a worker shell command. Preserve its
+    // optional fleet-ledger notification and exact-task inbox bridge only.
+    if (argv?.[0]==="fm" && typeof meta["crewId"]==="string" && typeof meta["nativeHome"]==="string") {
+      const parsed=parseFmArgv(argv.slice(1)),home=flagFromArgv(argv,"home") ?? (await settings.get()).fmHome;
+      const id=meta["crewId"],ownedHome=meta["nativeHome"];
+      const inbox=parsed.script==="inbox-take" && parsed.args[0]===id && (parsed.args.length===1 || parsed.args[1]==="--ack" && parsed.args.length>2 && parsed.args.slice(2).every(value=>/^\d+\.msg$/.test(value)));
+      const status=parsed.script==="fleet-ledger" && parsed.args.length===3 && parsed.args[0]==="appended" && parsed.args[1]===`${ownedHome}/config` && parsed.args[2]===`${ownedHome}/state/${id}.status`;
+      if (home===ownedHome && (inbox || status)) return;
+    }
+    throw new Error("Worker threads: Firstmate worker caller cannot invoke supervisor operations. Use the native brief's exact-task inbox and status commands; captain identity takes no precedence over worker identity.");
+  }
   const homeProvisioners = new Map<string, Promise<string | null>>();
   async function ensureCaptainHome(ctx: unknown, signal?: AbortSignal): Promise<string | null> {
     const captain = ctxString(ctx, "threadId") ?? "";
@@ -1991,13 +2020,14 @@ export default async function plugin(bb: BbPluginApi) {
     await mutateCrews(async crews => {
       // A sweep may already have read the old thread metadata. Keep a durable
       // tombstone so that result cannot resurrect an explicitly retired thread.
-      await bb.storage.kv.set(`crew-retired:${crew.threadId}`, true);
-      return crews.filter(c => c.id !== crew.id || c.threadId !== crew.threadId);
+      if (isSecondmateRoute(crew)) await bb.storage.kv.set(`route-retired:${crew.launchKey ?? JSON.stringify([crew.parentThreadId,crew.projectId,crew.nativeHome,crew.id])}`,true);
+      else await bb.storage.kv.set(`crew-retired:${crew.threadId}`, true);
+      return crews.filter(c => !(c.id===crew.id && c.threadId===crew.threadId && c.projectId===crew.projectId && c.parentThreadId===crew.parentThreadId));
     });
     if (crew.taskSpilled === true && !(await readCrews()).some((c) => c.id === crew.id)) {
       await bb.storage.kv.delete(`${CREW_TASK_PREFIX}${crew.id}`).catch(() => {});
     }
-    if (await clearWaiting(crew.id).catch(() => false)) await dropResumeRows(crew, "all");
+    if (!isSecondmateRoute(crew) && await clearWaiting(crew.id).catch(() => false)) await dropResumeRows(crew, "all");
     if (!isSecondmateRoute(crew)) {
       try {
         await bb.sdk.threads.updatePluginMetadata({ threadId: crew.threadId, set: { crew: "false" }, remove: ["crewId"] });
@@ -3191,12 +3221,12 @@ export default async function plugin(bb: BbPluginApi) {
     // fm_brief_intent_address_line does not refuse the brief (B1).
     // Headed task text supplies its own spec section; never nest it under the template's.
     const sections = briefSections(task.trim());
-    const intentB64 = Buffer.from(normalizeCaptainIntent(sections.intent).slice(0, 3000), "utf8").toString("base64");
+    const intentB64 = Buffer.from(normalizeCaptainIntent(sections.intent), "utf8").toString("base64");
     // Only a spec the captain's own text supplied travels separately; otherwise the
     // fixed default below fills {FIRSTMATE_SPEC} (no plugin-synthesized judgement).
     const specEnv = sections.spec === null
       ? ""
-      : `FM_TASK_OWN_SPEC=${Buffer.from(sections.spec.slice(0, 3000), "utf8").toString("base64")} `;
+      : `FM_TASK_OWN_SPEC=${Buffer.from(sections.spec, "utf8").toString("base64")} `;
     // fm-brief refuses --mode on scouts and requires it on ships; a ship's posture
     // is exactly the delivery mode the brief records.
     const scaffold =
@@ -3224,7 +3254,13 @@ export default async function plugin(bb: BbPluginApi) {
       `FM_INTENT=${intentB64} ${specEnv}python3 -c ${shQuote(py)} ${shQuote(brief)} || { echo "fm-brief fill failed" >&2; exit 1; }`,
     ].join("\n");
     try {
-      const res = await runOnHost(host, script, 30_000,signal);
+      // Preserve the entire accepted intent/specification. Check the same full
+      // quoting envelope as execution; oversized scripts use bounded staging.
+      let inline = true;
+      try { wrapHostCommand(script); } catch { inline = false; }
+      const res = inline
+        ? await runOnHost(host, script, 30_000, signal)
+        : await runOnHost(host, "bash", 30_000, signal, script);
       if (res.output.includes("FM_MIRROR_STALE")) {
         const line = res.output.split("\n").find((l) => l.includes("FM_MIRROR_STALE"))?.trim() ?? "FM_MIRROR_STALE";
         bb.log.error(`bb mirror is STALE while scaffolding brief crew=${crew.id}: ${line}. Re-run the overlay installer against ${fmHome}.`);
@@ -4020,10 +4056,22 @@ export default async function plugin(bb: BbPluginApi) {
 
   // Accept a crew id, or any thread id the crew has run on: captains often only
   // hold the thread id from a completion ping.
-  async function findCrew(id: string,caller?:string): Promise<Crew | undefined> {
+  async function findCrew(id: string,caller?:string,allowForeign=false): Promise<Crew | undefined> {
     caller=caller??homeScope.getStore()?.captain;
     const all = await listCrewsAll();
-    const found=all.find(entry=>entry.id === id) ?? all.find(entry=>entry.threadId === id || (entry.priorThreadIds ?? []).includes(id));
+    const matches=all.filter(entry=>entry.id===id || entry.threadId===id || (entry.priorThreadIds ?? []).includes(id));
+    const home=homeScope.getStore()?.home;
+    const ownerMatches=caller ? matches.filter(entry=>entry.parentThreadId===caller) : matches;
+    const homeMatches=home ? ownerMatches.filter(entry=>entry.nativeHome===home) : [];
+    // Explicit handoff preserves the worker's original home. Prefer this home
+    // when it resolves a collision, but never move recorded paths on handoff.
+    const owned=homeMatches.length ? homeMatches : ownerMatches;
+    const candidates=owned.length ? owned : matches;
+    if (candidates.length>1) throw new Error(`Ambiguous crew ${id}; use its exact worker thread identity in its owning captain home.`);
+    const found=candidates[0];
+    if (found && caller && !owned.length && found.parentThreadId && !allowForeign) {
+      throw new Error(`Refusing to access crew ${id}: it belongs to captain @thread:${found.parentThreadId}, the owning captain. Take that deck with: bb firstmate handoff --from ${found.parentThreadId}. Or use explicit supported --override-owner for this action.`);
+    }
     if (found) { const launch=found.launchKey ? launches.get(found.launchKey) : launches.forTask(found.projectId,found.parentThreadId ?? "",found.id);
       return launch?.deliveryRequirement ? {...found,launchKey:launch.key,deliveryRequirement:recoveredContract({deliveryRequirement:found.deliveryRequirement},launch)} : found; }
     if (!caller) return undefined;
@@ -4361,6 +4409,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function dispatchCrew(input: Parameters<typeof dispatchCrewBody>[0]): Promise<Crew> {
+    if (input.task.length>MAX_TASK) throw new Error(`Task exceeds ${MAX_TASK} UTF-16 units; split the assignment before dispatch. No brief, reservation or worker was created.`);
     const requestedRequirement=input.deliveryRequirement;
     if (input.crewId && !/^[A-Za-z0-9._-]{1,100}$/.test(input.crewId)) throw new Error("Invalid task retry identity.");
     if (input.deliveryRequirement && !["branch","pr","merged","merged-and-verified"].includes(input.deliveryRequirement)) throw new Error("Unsupported delivery contract.");
@@ -4376,6 +4425,7 @@ export default async function plugin(bb: BbPluginApi) {
       const record = await launches.reserve({ key, taskId, projectId: input.projectId, owner: input.parentThreadId ?? "",
         home, generation: 1, shape: input.shape, deliveryMode:input.mode, yolo:input.yolo, branchPrefix:input.branchPrefix,deliveryRequirement:input.deliveryRequirement ?? "merged", state: "reserved", threadId: null, updatedAt: Date.now() }, () => launchCapacity(input.parentThreadId));
       const resolved = await reconcileLaunch(record);
+      if (resolved.routedIntake && await bb.storage.kv.get(`route-retired:${resolved.key}`)===true) throw new Error(`Routed request ${taskId} was explicitly forgotten; this handoff cannot be resent or recovered as active.`);
       if (resolved.state === "deleted") throw new Error(`Worker for launch ${taskId} was deleted by BB core. This attempt cannot be resumed.`);
       if (requestedRequirement && requestedRequirement !== recoveredContract({},resolved)) throw new Error("Retry cannot change the original delivery contract.");
       if (input.yolo!==undefined && resolved.yolo!==undefined && input.yolo!==resolved.yolo) throw new Error("Retry cannot change the original merge-authority selection.");
@@ -4390,12 +4440,21 @@ export default async function plugin(bb: BbPluginApi) {
           worktree: input.worktree, shape: input.shape, posture: input.shape === "scout" ? "scout" : input.mode,
           yolo:resolved.yolo,launchKey: key, metaWritten: false, createdAt: new Date().toISOString() };
         recovered.deliveryRequirement=recoveredContract({},resolved);
-        await mutateCrews(rows => [recovered, ...rows.filter(c => c.id !== taskId)]);
+        if (resolved.routedIntake) {
+          const child=resolved.routedIntake.dispatch;
+          Object.assign(recovered,{task:child.task,providerId:child.providerId??null,model:child.model??null,reasoningLevel:child.reasoningLevel??null,posture:`secondmate:${child.mode}`,worktree:false,routedIntake:resolved.routedIntake,branchPrefix:child.branchPrefix,yolo:resolved.routedIntake.posture.yolo});
+        }
+        await mutateCrews(rows => [recovered, ...rows.filter(c => !(c.id===taskId && c.projectId===input.projectId && c.parentThreadId===(input.parentThreadId??null)))]);
         return recovered;
       }
       try {
         const crew = await dispatchCrewBody({ ...input, crewId: taskId, ownsRow:input.crewId === undefined });
         crew.launchKey = key;
+        if (isSecondmateRoute(crew)) {
+          // The recipient thread's environment/model is supervisor context only.
+          await mutateCrews(rows=>rows.map(c=>c.id===taskId && c.projectId===input.projectId && c.parentThreadId===(input.parentThreadId??null)?crew:c));
+          return crew;
+        }
         let actualProvider = crew.providerId;
         let thread: Awaited<ReturnType<typeof bb.sdk.threads.defaultExecutionOptions>> | null = null;
         try { actualProvider = (await raceAbort(bb.sdk.threads.get({ threadId:crew.threadId }),launchAbort.signal,STUCK_HOST_CALL_MS)).providerId; } catch { /* unresolved */ }
@@ -4407,7 +4466,7 @@ export default async function plugin(bb: BbPluginApi) {
           providerId: actualProvider, model: thread?.model ?? crew.model,
           reasoningLevel: thread?.reasoningLevel ?? crew.reasoningLevel } });
         if (thread) { crew.providerId = actualProvider; crew.model = thread.model; crew.reasoningLevel = thread.reasoningLevel; }
-        await mutateCrews(rows => rows.map(c => c.id === taskId ? crew : c));
+        await mutateCrews(rows => rows.map(c => c.id===taskId && c.projectId===input.projectId && c.parentThreadId===(input.parentThreadId??null) ? crew : c));
         if (!ready && launches.get(key)?.nativeInvoked && !isSecondmateRoute(crew)) throw new Error("Native admission/publication remains unresolved; worker and capacity are retained.");
         return crew;
       } catch (error) {
@@ -4444,7 +4503,7 @@ export default async function plugin(bb: BbPluginApi) {
     dispatchProfileReason?:string;
     signal?:AbortSignal;
   }): Promise<Crew> {
-    const task = input.task.trim().slice(0, MAX_TASK);
+    const task = input.task.trim();
     if (task === "") throw new Error("Empty task.");
     const mates = await readSecondmates();
     const mate = input.mode === "local-only" ? undefined : pickSecondmate(mates, input.projectId, task);
@@ -4452,7 +4511,14 @@ export default async function plugin(bb: BbPluginApi) {
       // Persist the route before sending. An unknown send outcome is not proof
       // that the domain captain did not receive the task.
       const routeKey=launchKey(input.projectId,input.parentThreadId ?? "",(await settings.get()).fmHome.trim(),input.crewId!);
-      launches.update(routeKey,{state:"creating",nativeInvoked:true,shape:"secondmate-route"});
+      const prior=launches.get(routeKey)?.routedIntake;
+      const requestedIntake=routedIntakeSchema.parse({schema:1,origin:{captainId:input.parentThreadId??null,home:(await settings.get()).fmHome.trim()},
+        dispatch:{task,taskId:input.crewId!,projectId:input.projectId,title:input.title,providerId:input.providerId,model:input.model,reasoningLevel:input.reasoningLevel,permissionMode:capPermission(input.permissionMode,await parentPermission(input.parentThreadId)),
+          worktree:input.worktree,visible:input.visible,shape:input.shape,mode:input.mode,deliveryRequirement:input.deliveryRequirement??"merged",branchPrefix:input.branchPrefix,dispatchProfileReason:input.dispatchProfileReason},
+        posture:{mode:input.mode,yolo:input.yolo??false,provenance:(await postureOf(input.projectId)).provenance}});
+      if (prior && JSON.stringify(prior.dispatch)!==JSON.stringify(requestedIntake.dispatch)) throw new Error('Routed intake cannot change while its handoff is unresolved.');
+      const intake=prior ?? requestedIntake;
+      launches.update(routeKey,{state:"creating",nativeInvoked:true,shape:"secondmate-route",routedIntake:intake});
       try {
         await bb.sdk.threads.send({
           threadId: mate.threadId,
@@ -4460,20 +4526,21 @@ export default async function plugin(bb: BbPluginApi) {
           input: [
             {
               type: "text",
-              text: `Routed work from main captain.\nTask: ${input.crewId}\nShape: ${input.shape}\nMode: ${input.mode}\nDelivery requirement: ${input.deliveryRequirement ?? "merged"}\n\n${task}\n\nDispatch a crew for this. Reply with the crew id when underway.`,
+              text: renderRoutedIntake(intake),
               mentions: [],
             },
           ],
         });
         const routed: Crew = {
           id: input.crewId!,
-          task: `[secondmate ${mate.threadId}] ${task}`,
+          task, routedIntake:intake, nativeHome:intake.origin.home,
+          branchPrefix:intake.dispatch.branchPrefix,yolo:intake.posture.yolo,
           projectId: input.projectId,
           threadId: mate.threadId,
           parentThreadId: input.parentThreadId ?? null,
-          providerId: null,
-          model: null,
-          reasoningLevel: null,
+          providerId: intake.dispatch.providerId ?? null,
+          model: intake.dispatch.model ?? null,
+          reasoningLevel: intake.dispatch.reasoningLevel ?? null,
           worktree: false,
           shape: input.shape,
           posture: `secondmate:${input.mode}`,
@@ -4531,7 +4598,7 @@ export default async function plugin(bb: BbPluginApi) {
           // fm-spawn started the row — record that this crew owns a real row so its
           // close survives a later settings flip.
           crew.backlogRow = true;
-          await mutateCrews(crews => [crew, ...crews.filter(c => c.id !== crew.id)]);
+          await mutateCrews(crews => [crew, ...crews.filter(c => !(c.id===crew.id && c.projectId===crew.projectId && c.parentThreadId===crew.parentThreadId))]);
           await publishFleet();
           await noteMachineCeiling(crew.id, realThreadId, capPermission(input.permissionMode, await parentPermission(input.parentThreadId)));
           // fm-spawn ran ~30s while this crew may already have ended its first turn;
@@ -4595,7 +4662,7 @@ export default async function plugin(bb: BbPluginApi) {
       },
     }), input.signal ? AbortSignal.any([input.signal,launchAbort.signal]) : launchAbort.signal);
     crew.threadId = created.threadId!;
-    await mutateCrews(crews => [crew, ...crews.filter(c => c.id !== crew.id)]);
+    await mutateCrews(crews => [crew, ...crews.filter(c => !(c.id===crew.id && c.projectId===crew.projectId && c.parentThreadId===crew.parentThreadId))]);
     await publishFleet();
     const okMeta = await publishFmMeta({ crew, hostId, scheduled:false, model: input.model, provider: input.providerId });
     // R5: only record a known-failed write. undefined (write succeeded, or real
@@ -6513,12 +6580,19 @@ export default async function plugin(bb: BbPluginApi) {
     force: boolean,
     opts: { caller?: string; overrideOwner?: boolean } = {},
   ): Promise<string> {
-    const crew = (await readCrews()).find(entry => entry.id === id) ?? await findCrew(id);
+    const crew = await findCrew(id,opts.caller,opts.overrideOwner===true);
     if (crew === undefined) throw new Error(`No crew ${id}. Run "bb firstmate crews".`);
     const notMine = opts.overrideOwner === true ? null : await ownerRefusal(crew, opts.caller, "forget");
     if (notMine !== null) throw new Error(notMine);
     if (stop && isSecondmateRoute(crew) && !force) {
       throw new Error(`Refusing: ${id} is a secondmate route. Drop with forget (no --stop), or --force to also stop that thread.`);
+    }
+    if (isSecondmateRoute(crew) && !stop) {
+      // Retire only the request projection; the domain captain owns its child
+      // tree, native state, runtime, and same-ID worker protocol records.
+      await removeCrew(crew);
+      await publishFleet();
+      return `Forgot secondmate route ${id}; domain captain and child work are retained.`;
     }
     await discoverCrewDelivery(crew);
     let preserveAuthority=deliveries.hasOwned(crew.parentThreadId ?? "",crew.projectId,crew.id);
@@ -9231,6 +9305,7 @@ export default async function plugin(bb: BbPluginApi) {
       presentation: { ...tool.presentation, suppress: true },
       async execute(params, ctx) {
         try {
+          await requireSupervisorCaller(ctx);
           const captain = ctxString(ctx, "threadId");
           const receiptCall = typeof asRecord(params)["handledWake"] === "string" || tool.name === "firstmate_wake" || (tool.name === "firstmate_fm" && normalizeFmScript(String(asRecord(params)["script"] ?? "")) === "wake-drain");
           const run = () => withLedgerOperation(tool.name, captain, () => inCaptainHome(captain, async () => {
@@ -9458,6 +9533,7 @@ export default async function plugin(bb: BbPluginApi) {
       } catch (error) {
         return toolError(`Dispatch failed: ${error instanceof Error ? error.message : String(error)}`);
       }
+      if (isSecondmateRoute(crew)) return `Routed ${crew.shape} request ${crew.id} to secondmate thread ${crew.threadId}; child launch remains pending. Exact child intake is retained; this supervisor's execution is separate. Track with: bb firstmate crew ${crew.id}`;
       const warn = wt.sharedOverride ? " WARN: ship crew on shared env." : "";
       const status = await crewStatus(crew);
       if (status === "error") {
@@ -9590,7 +9666,7 @@ export default async function plugin(bb: BbPluginApi) {
         .describe("Land a crew/PR owned by another captain (only when the captain explicitly said so)"),
     }),
     async execute({ crewId, yes, allowRedCheck, allowMissingCheck, overrideOwner }, ctx) {
-      const crew = await findCrew(crewId,ctxString(ctx,"threadId"));
+      const crew = await findCrew(crewId,ctxString(ctx,"threadId"),overrideOwner===true);
       if (crew === undefined) return toolError(`No crew ${crewId}.`);
       try {
         return await mergeCrew(crew, yes === true, allowRedCheck, allowMissingCheck, { caller: ctxString(ctx, "threadId"), overrideOwner: overrideOwner === true });
@@ -10967,6 +11043,8 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "migrate-owners", summary: "Project KV queue/decisions/afk/quiet/memory into the real files for owners set to real (idempotent)", usage: "bb firstmate migrate-owners [--json]" },
     ],
     async run(argv, ctx) {
+      try { await requireSupervisorCaller(ctx,argv); }
+      catch(error) { return {exitCode:1,stderr:error instanceof Error?error.message:String(error)}; }
       return withCliOperation(argv, ctxString(ctx, "threadId"), () => inCaptainHome(ctxString(ctx, "threadId"), async () => {
       if (argv[0] === "fm") {
         const helpIndex=argv.findIndex(arg=>arg==='--help'||arg==='-h'),separator=argv.indexOf('--');
@@ -11155,7 +11233,7 @@ export default async function plugin(bb: BbPluginApi) {
             const text = [
               ...dispatched.map(
                 (c) =>
-                  `Dispatched ${c.shape} crew ${c.id} as thread ${c.threadId} [${c.status}] (${c.worktree ? "worktree" : "shared-env"}, ${c.posture})${dispatchStatusNote(c.status, failures.get(c.id))}${permissionLine(c.id)}\nTrack: bb firstmate crew ${c.id}`,
+                  isSecondmateRoute(c) ? `Routed ${c.shape} request ${c.id} to secondmate thread ${c.threadId}; child launch remains pending.\nTrack: bb firstmate crew ${c.id}` : `Dispatched ${c.shape} crew ${c.id} as thread ${c.threadId} [${c.status}] (${c.worktree ? "worktree" : "shared-env"}, ${c.posture})${dispatchStatusNote(c.status, failures.get(c.id))}${permissionLine(c.id)}\nTrack: bb firstmate crew ${c.id}`,
               ),
               ...hints,
             ].join("\n");
@@ -11390,7 +11468,7 @@ export default async function plugin(bb: BbPluginApi) {
           case "merge": {
             const id = rest[0];
             if (id === undefined) return fail(usage);
-            const crew = await findCrew(id,ctxThread);
+            const crew = await findCrew(id,ctxThread,flags.has("override-owner"));
             if (crew === undefined) return fail(`No crew ${id}.`);
             const text = await mergeCrew(crew, flags.has("yes"), flagStr(flags, "allow-red"), flagStr(flags, "allow-missing"), {
               caller: ctxThread, overrideOwner: flags.has("override-owner"),

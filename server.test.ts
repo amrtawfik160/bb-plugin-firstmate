@@ -9,11 +9,19 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
-  createFakePluginHost,
+  createFakePluginHost as sdkFakePluginHost,
   makePluginAgentConfigurationContext,
   makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
 import {createQueueStore} from "./lib/queue-store.ts";
+// Public invocation now reads authoritative caller role before any mutation.
+// Older cases exercised no role lookup; give them an explicit ordinary caller,
+// while role-specific fixtures override this stub with exact thread identities.
+function createFakePluginHost(...args: Parameters<typeof sdkFakePluginHost>) {
+  const host=sdkFakePluginHost(...args);
+  host.harness.sdk.stub("threads.getPluginMetadata",async()=>({}));
+  return host;
+}
 async function durableQueue(host: ReturnType<typeof createFakePluginHost>) { const queue=createQueueStore(host.bb.storage.database(),()=>host.bb.storage.kv.get("queue"));await queue.ready();return queue.list(); }
 import plugin, {
   OVERLAY_INSTALL_INPUTS,
@@ -4747,8 +4755,8 @@ function stubOrphanTransportHost(
       title: opts.byTitle ? `Ship · Fix flaky login · ${captured.taskId}` : "renamed-window",
     },
   ]);
-  host.harness.sdk.stub("threads.getPluginMetadata", async () =>
-    opts.byTitle ? {} : { crew: "true", crewId: captured.taskId, nativeHome:"/tmp/fm-home",
+  host.harness.sdk.stub("threads.getPluginMetadata", async ({threadId}: {threadId:string}) =>
+    opts.byTitle || !["thr_orphan","thr_late"].includes(threadId) ? {} : { crew: "true", crewId: captured.taskId, nativeHome:"/tmp/fm-home",
       launchKey:JSON.stringify(["proj_1","thr_cap","/tmp/fm-home",captured.taskId,1]),generation:1 },
   );
   return captured;
@@ -6091,7 +6099,7 @@ test("R4 orphan adoption via broad list when the thread is not tagged firstmate-
     host.harness.sdk.stub("threads.list", async (args: { originPluginId?: string }) =>
       args.originPluginId === "firstmate" ? [] : [{ id: "thr_orphan", projectId: "proj_1", parentThreadId: "thr_cap", title: "renamed" }],
     );
-    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ crew: "true", crewId: captured.taskId,nativeHome:"/tmp/fm-home",
+    host.harness.sdk.stub("threads.getPluginMetadata", async ({threadId}: {threadId:string}) => threadId!=="thr_orphan" ? {} : ({ crew: "true", crewId: captured.taskId,nativeHome:"/tmp/fm-home",
       launchKey:JSON.stringify(["proj_1","thr_cap","/tmp/fm-home",captured.taskId,1]),generation:1 }));
     const result = await host.harness.behavior.runCli(
       ["dispatch", "--project", "proj_1", "--", "adopt me"],
@@ -9230,11 +9238,14 @@ test("merge refuses another captain's crew, or a PR another captain's crew owns,
     const forced = await host.harness.behavior.runCli(["merge", "c1", "--yes", "--override-owner"], { threadId: "thr_capA" });
     assert.equal(forced.exitCode, 0, forced.stderr);
     assert.match(forced.stdout, /Already merged/);
-    // A crew left by a thread that is no live captain (e.g. this captain's own old
-    // thread) is not "another captain's": no refusal.
+    // Foreign records retain exact ownership even when their captain is inactive.
+    // Explicit one-action override remains supported; inactivity is not takeover.
     await host.bb.storage.kv.set("crews", [shipRow("c3", "thr_c3", "thr_old")]);
     const orphaned = await host.harness.behavior.runCli(["merge", "c3", "--yes"], { threadId: "thr_capA" });
-    assert.equal(orphaned.exitCode, 0, orphaned.stderr);
+    assert.equal(orphaned.exitCode, 1, orphaned.stderr);
+    assert.match(orphaned.stderr,/owning captain/);
+    const orphanOverride=await host.harness.behavior.runCli(["merge","c3","--yes","--override-owner"],{threadId:"thr_capA"});
+    assert.equal(orphanOverride.exitCode,0,orphanOverride.stderr);
     // A registered captain thread abandoned for days (never archived) is no live owner.
     host.harness.sdk.stub("threads.get", async (input: { threadId: string }) => ({
       ...makeThreadResponse({ id: input.threadId, status: "idle", environmentId: "env_wt" }),
@@ -9242,7 +9253,8 @@ test("merge refuses another captain's crew, or a PR another captain's crew owns,
     }));
     await host.bb.storage.kv.set("crews", [shipRow("c4", "thr_c4", "thr_capB")]);
     const abandoned = await host.harness.behavior.runCli(["merge", "c4", "--yes"], { threadId: "thr_capA" });
-    assert.equal(abandoned.exitCode, 0, abandoned.stderr);
+    assert.equal(abandoned.exitCode,1,abandoned.stderr);
+    assert.match(abandoned.stderr,/owning captain/);
   } finally {
     await host.harness.lifecycle.dispose();
   }

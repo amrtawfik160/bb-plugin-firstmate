@@ -1,0 +1,28 @@
+✖ registered supervisor tool and CLI mutations refuse worker identities before publication while captain dispatch remains available (165.290634ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 0
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 475.417906
+
+✖ failing tests:
+
+test at server.launch-delivery.test.mjs:554:1
+✖ registered supervisor tool and CLI mutations refuse worker identities before publication while captain dispatch remains available (165.290634ms)
+  AssertionError [ERR_ASSERTION]: {"exitCode":0,"stdout":"Dispatched ship crew 877aa933 as thread thr_positive [active] (worktree, no-mistakes)\nTrack: bb firstmate crew 877aa933","stderr":""}
+  
+  0 !== 1
+  
+      at TestContext.<anonymous> (file:///root/github_projects/bb-plugin-firstmate-launch-pr-lifecycle/server.launch-delivery.test.mjs:566:73)
+      at async Test.run (node:internal/test_runner/test:1332:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: 0,
+    expected: 1,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }

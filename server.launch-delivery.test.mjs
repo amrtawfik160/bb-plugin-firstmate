@@ -99,7 +99,7 @@ test('uncertain replacement reconciles its reserved slot at capacity before any 
  const first=await host.harness.behavior.runCli(['retry','c1','--reasoning-level','high'],ctx);assert.equal(first.exitCode,1);
  assert.equal(createLaunches(host.bb.storage.database()).list('thr_cap')[0].state,'uncertain');
  host.harness.sdk.stub('threads.list',async()=>[makeThreadResponse({id:'thr_replacement',projectId:'proj_1',parentThreadId:'thr_cap'})]);
- host.harness.sdk.stub('threads.getPluginMetadata',async()=>metadata);
+ host.harness.sdk.stub('threads.getPluginMetadata',async({threadId})=>threadId==='thr_replacement'?metadata:{});
  const recovered=await host.harness.behavior.runCli(['retry','c1','--reasoning-level','high'],ctx);assert.equal(recovered.exitCode,0,recovered.stderr);
  assert.equal(host.harness.sdk.callsTo('threads.spawn').length,1);assert.equal(host.harness.sdk.callsTo('threads.stop').length,1);
  assert.equal((await host.bb.storage.kv.get('crews'))[0].threadId,'thr_replacement');
@@ -201,7 +201,7 @@ test('reload during creation reconciles seeded worker identity before retry and 
  const old=host;host=await host.harness.lifecycle.reload(plugin);commonStubs(host);
  await pending;
  assert.equal(old.harness.sdk.callsTo('threads.stop').length,0);
- host.harness.sdk.stub('threads.list',async()=>[{id:'thr_created'}]);host.harness.sdk.stub('threads.getPluginMetadata',async()=>metadata);
+ host.harness.sdk.stub('threads.list',async()=>[{id:'thr_created'}]);host.harness.sdk.stub('threads.getPluginMetadata',async({threadId})=>threadId==='thr_created'?metadata:{});
  host.harness.sdk.stub('threads.spawn',async()=>{throw new Error('must not create replacement');});
  const retry=await host.harness.behavior.runCli(['dispatch','--project','proj_1','--task-id','stable','--','fix login'],ctx);
  assert.equal(retry.exitCode,0,retry.stderr);assert.equal(host.harness.sdk.callsTo('threads.spawn').length,0);
@@ -548,5 +548,122 @@ test('durable launch orphan discovery preserves native task mode before author c
   const delivery=createDeliveries(host.bb.storage.database()).get('acme/orphan#11');assert.ok(delivery,'scheduled orphan recovery must discover the exact owned PR');
   assert.equal(delivery.continuation.posture,'no-mistakes');assert.equal(delivery.requirement,'pr');assert.deepEqual(delivery.workers,['thr_orphan']);
   assert.equal(host.harness.sdk.callsTo('threads.spawn').length,0);assert.equal(host.harness.sdk.callsTo('environments.mergePullRequest').length,0);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('registered supervisor tool and CLI mutations refuse worker identities before publication while captain dispatch remains available',async()=>{
+ const host=await base();let meta={crew:'true',crewId:'parent-task',nativeHome:'/owned/home'};
+ host.harness.sdk.stub('threads.getPluginMetadata',async({threadId})=>threadId==='thr_worker'?meta:{});
+ host.harness.sdk.stub('threads.spawn',async()=>makeThreadResponse({id:'thr_positive',projectId:'proj_1',environmentId:'env_wt'}));
+ const worker={...ctx,threadId:'thr_worker'};
+ try{
+  const dispatch=host.harness.registrations.agentTools.find(t=>t.name==='firstmate_dispatch');
+  for(const identity of [meta,{...meta,captain:'true'},{...meta,generation:2},{crew:false}]){
+   meta=identity;
+   if(identity.crew===false)await host.bb.storage.kv.set('crew-retired:thr_worker',true);
+   const config=await host.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({pluginMetadata:{...identity,crew:'true'}}));assert.deepEqual(config.tools,[]);
+   for(const argv of [['dispatch','--override-owner','--','nested work'],['queue','add','nested work'],['deck'],['fm','spawn','--','nested-task','proj_1'],['create-worker','--task','nested-task']]){
+    const result=await host.harness.behavior.runCli(argv,worker);assert.equal(result.exitCode,1,JSON.stringify(result));assert.match(result.stderr,/worker.*supervisor/i);
+   }
+   const result=await dispatch.execute({task:'nested work',mode:'local-only',overrideOwner:true},worker);assert.equal(result.isError,true,JSON.stringify(result));assert.match(JSON.stringify(result),/worker.*supervisor/i);
+   assert.equal(host.harness.sdk.callsTo('threads.spawn').length,0);assert.equal(host.harness.sdk.callsTo('terminals.create').length,0);assert.equal(host.harness.sdk.callsTo('threads.send').length,0);
+   const launches=await host.harness.behavior.runCli(['launches','--json'],ctx);assert.deepEqual(JSON.parse(launches.stdout),[],'refusal publishes no launch reservation');
+  }
+  await host.bb.storage.kv.delete('crew-retired:thr_worker');
+  await host.bb.storage.kv.set('crews',[{...row(99),threadId:'thr_current',parentThreadId:'thr_other',nativeHome:'/other/captain/home',priorThreadIds:['thr_worker']}]);
+  await host.bb.storage.kv.set('native-home:thr_worker','/wrong/captain/home');
+  meta={captain:'true'};
+  const prior=await host.harness.behavior.runCli(['dispatch','--','replacement prior identity'],worker);assert.equal(prior.exitCode,1);assert.match(prior.stderr,/worker caller/);assert.equal(host.harness.sdk.callsTo('terminals.create').length,0);
+  const result=await host.harness.behavior.runCli(['dispatch','--task-id','positive','--mode','local-only','--','authorized captain task'],ctx);assert.equal(result.exitCode,0,result.stderr);assert.equal(host.harness.sdk.callsTo('threads.spawn').length,1);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('routed child intake survives reload and interrupted crew publication without resending or adopting supervisor defaults',async()=>{
+ let host=await base({transport:'real',queueOwner:'real',fmHome:'/fake/home'});
+ const request={task:'Audit subscription exactly.',taskId:'route-reload',projectId:'proj_1',shape:'ship',mode:'direct-PR',deliveryRequirement:'merged-and-verified',providerId:'selected-provider',model:'selected-model',reasoningLevel:'high',branchPrefix:'audit/',dispatchProfileReason:'Approved native intake choice',visible:false};
+ try{
+  await host.bb.storage.kv.set('postures',{proj_1:{mode:'direct-PR',yolo:false}});
+  await host.bb.storage.kv.set('secondmates',[{projectId:'proj_1',threadId:'thr_mate',scope:'subscription',projects:[],createdAt:'2026-10-05T00:00:00Z'}]);
+  let sent;host.harness.sdk.stub('threads.send',async({input})=>{sent=JSON.parse(/BEGIN_FIRSTMATE_ROUTED_INTAKE\n([\s\S]*?)\nEND_FIRSTMATE_ROUTED_INTAKE/.exec(input[0].text)[1]);return{};});
+  const result=await host.harness.registrations.agentTools.find(t=>t.name==='firstmate_dispatch').execute(request,ctx);assert.equal(typeof result,'string',JSON.stringify(result));assert.equal(host.harness.sdk.callsTo('threads.send').length,1);
+  // Crash boundary: the durable route and returned recipient are published, but
+  // the rebuildable crew projection is absent on the next plugin instance.
+  await host.bb.storage.kv.set('crews',[]);
+  host=await baseReload(host);
+  const replay=await host.harness.registrations.agentTools.find(t=>t.name==='firstmate_dispatch').execute(request,ctx);assert.equal(typeof replay,'string',JSON.stringify(replay));assert.equal(host.harness.sdk.callsTo('threads.send').length,0);
+  const rows=JSON.parse((await host.harness.behavior.runCli(['crews','--json'],ctx)).stdout);const recovered=rows.find(c=>c.id==='route-reload');assert.deepEqual(recovered.routedIntake,sent);assert.equal(recovered.providerId,'selected-provider');assert.equal(recovered.model,'selected-model');assert.equal(recovered.reasoningLevel,'high');assert.equal(recovered.deliveryRequirement,'merged-and-verified');assert.equal(recovered.posture,'secondmate:direct-PR');
+ }finally{await host.harness.lifecycle.dispose();}
+});
+async function baseReload(host){const next=await host.harness.lifecycle.reload(plugin);commonStubs(next);return next;}
+
+test('unknown secondmate send retains full child request and refuses duplicate handoff after reload',async()=>{
+ let host=await base({transport:'real',queueOwner:'real',fmHome:'/fake/home'});
+ try{
+  await host.bb.storage.kv.set('postures',{proj_1:{mode:'direct-PR',yolo:false}});
+  await host.bb.storage.kv.set('secondmates',[{projectId:'proj_1',threadId:'thr_mate',scope:'subscription',projects:[],createdAt:'2026-10-05T00:00:00Z'}]);
+  host.harness.sdk.stub('threads.send',async()=>{throw new Error('unknown external send outcome');});
+  const argv=['dispatch','--task-id','uncertain-route','--mode','direct-PR','--provider','selected-provider','--model','selected-model','--reasoning-level','high','--','Audit subscription with exact tail.'];
+  const first=await host.harness.behavior.runCli(argv,ctx);assert.equal(first.exitCode,1);assert.match(first.stderr,/uncertain/);
+  const before=JSON.parse((await host.harness.behavior.runCli(['launches','--json'],ctx)).stdout)[0];assert.equal(before.routedIntake.dispatch.task,'Audit subscription with exact tail.');assert.equal(before.routedIntake.dispatch.model,'selected-model');
+  host=await baseReload(host);
+  const retry=await host.harness.behavior.runCli(argv,ctx);assert.equal(retry.exitCode,1);assert.match(retry.stderr,/uncertain/);assert.equal(host.harness.sdk.callsTo('threads.send').length,0);assert.equal(host.harness.sdk.callsTo('threads.spawn').length,0);
+  const after=JSON.parse((await host.harness.behavior.runCli(['launches','--json'],ctx)).stdout)[0];assert.deepEqual(after.routedIntake,before.routedIntake);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('same-id secondmate child operations remain scoped after route and child publication',async()=>{
+ const host=await base(),mate={...ctx,threadId:'thr_mate'};
+ try{
+  await host.bb.storage.kv.set('secondmates',[{projectId:'proj_1',threadId:'thr_mate',scope:'subscription',projects:[],createdAt:'2026-10-05T00:00:00Z'}]);
+  host.harness.sdk.stub('threads.send',async()=>({}));
+  host.harness.sdk.stub('threads.spawn',async()=>makeThreadResponse({id:'thr_child',projectId:'proj_1',environmentId:'env_wt'}));
+  host.harness.sdk.stub('threads.stop',async()=>({}));
+  const args=['dispatch','--task-id','same-task','--mode','direct-PR','--delivery-requirement','pr','--','Audit subscription'];
+  assert.equal((await host.harness.behavior.runCli(args,ctx)).exitCode,0);
+  assert.equal((await host.harness.behavior.runCli(args,mate)).exitCode,0);
+  assert.equal((await host.bb.storage.kv.get('crews')).length,2);
+  for(const [caller,expected] of [[ctx,'thr_mate'],[mate,'thr_child']]){
+   const inspect=await host.harness.behavior.runCli(['crew','same-task','--json'],caller);assert.equal(inspect.exitCode,0,inspect.stderr);assert.equal(JSON.parse(inspect.stdout).threadId,expected);
+   const tool=await host.harness.registrations.agentTools.find(t=>t.name==='firstmate_crew').execute({crewId:'same-task'},caller);assert.match(JSON.stringify(tool),new RegExp(expected));
+  }
+  const stop=await host.harness.behavior.runCli(['stop','same-task'],ctx);assert.equal(stop.exitCode,1);assert.match(stop.stderr,/secondmate route/);assert.equal(host.harness.sdk.callsTo('threads.stop').length,0);
+  await host.bb.storage.kv.set('crew-waiting',{'same-task':{generation:'child-generation',count:1}});
+  await host.bb.storage.kv.set('protocol-nudges',{'same-task':{count:1}});
+  const forgot=await host.harness.behavior.runCli(['forget','same-task'],ctx);assert.equal(forgot.exitCode,0,forgot.stderr);
+  assert.deepEqual(await host.bb.storage.kv.get('crew-waiting'),{'same-task':{generation:'child-generation',count:1}});
+  assert.deepEqual(await host.bb.storage.kv.get('protocol-nudges'),{'same-task':{count:1}});
+  const remaining=await host.bb.storage.kv.get('crews');assert.equal(remaining.length,1);assert.equal(remaining[0].threadId,'thr_child');
+  const repeat=await host.harness.behavior.runCli(args,ctx);assert.equal(repeat.exitCode,1);assert.match(repeat.stderr,/explicitly forgotten/);assert.equal(host.harness.sdk.callsTo('threads.send').length,1);
+  const foreign=await host.harness.behavior.runCli(['stop','same-task'],ctx);assert.equal(foreign.exitCode,1);assert.equal(host.harness.sdk.callsTo('threads.stop').length,0);
+  const own=await host.harness.behavior.runCli(['stop','same-task'],mate);assert.equal(own.exitCode,0,own.stderr);assert.equal(host.harness.sdk.callsTo('threads.stop').at(-1)[0].threadId,'thr_child');
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('route-only retirement permits the verified secondmate supervisor while genuine retired workers remain excluded',async()=>{
+ const host=await base(),mate={...ctx,threadId:'thr_mate'};
+ try{
+  await host.bb.storage.kv.set('secondmates',[{projectId:'proj_1',threadId:'thr_mate',scope:'subscription',projects:[],createdAt:'2026-10-05T00:00:00Z'}]);
+  host.harness.sdk.stub('threads.getPluginMetadata',async({threadId})=>threadId==='thr_mate'?{captain:'true'}:{});
+  host.harness.sdk.stub('threads.send',async()=>({}));host.harness.sdk.stub('threads.spawn',async()=>({id:'thr_new_child'}));
+  assert.equal((await host.harness.behavior.runCli(['dispatch','--task-id','retire-route','--mode','direct-PR','--','Audit subscription'],ctx)).exitCode,0);
+  assert.equal((await host.harness.behavior.runCli(['forget','retire-route'],ctx)).exitCode,0);
+  assert.notEqual(await host.bb.storage.kv.get('crew-retired:thr_mate'),true,'route retirement is not worker retirement');
+  // Old releases wrote the boolean tombstone even for a route. Its durable
+  // exact route journal plus registered secondmate identity permits repair.
+  await host.bb.storage.kv.set('crew-retired:thr_mate',true);
+  const legacy=await host.harness.behavior.runCli(['dispatch','--task-id','mate-new','--mode','local-only','--','Independent assigned task'],mate);assert.equal(legacy.exitCode,0,legacy.stderr);
+  await host.bb.storage.kv.set('crew-retired:thr_new_child',true);
+  host.harness.sdk.stub('threads.getPluginMetadata',async()=>({captain:'true'}));
+  const worker=await host.harness.behavior.runCli(['dispatch','--','Nested task'],{...ctx,threadId:'thr_new_child'});assert.equal(worker.exitCode,1);assert.match(worker.stderr,/worker.*supervisor/i);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('unreadable caller role refuses dispatch before receipt, reservation or native publication',async()=>{
+ const host=await base();try{
+  host.harness.sdk.stub('threads.getPluginMetadata',async()=>{throw new Error('authoritative role unavailable');});
+  const cli=await host.harness.behavior.runCli(['dispatch','--','task'],ctx);assert.equal(cli.exitCode,1);assert.match(cli.stderr,/authoritative role unavailable/);
+  const tool=await host.harness.registrations.agentTools.find(t=>t.name==='firstmate_dispatch').execute({task:'task'},ctx);assert.equal(tool.isError,true);assert.match(JSON.stringify(tool),/authoritative role unavailable/);
+  for(const name of ['threads.spawn','threads.send','terminals.create'])assert.equal(host.harness.sdk.callsTo(name).length,0);
+  assert.deepEqual(createLaunches(host.bb.storage.database()).list(),[]);assert.equal(await host.bb.storage.kv.get('crews'),undefined);
  }finally{await host.harness.lifecycle.dispose();}
 });
