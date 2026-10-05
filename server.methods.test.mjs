@@ -5,6 +5,7 @@ import { readFileSync, readdirSync, cpSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 import { createFakePluginHost, makePluginAgentConfigurationContext } from '@get-bb/plugin-sdk/testing';
 import plugin from './server.ts';
 import {followRuntimeReferences} from './scripts/captain-packaging-check.mjs';
@@ -214,6 +215,63 @@ test('direct-PR body author reads the actual installed PR skill in bounded owner
   }
   mode='direct-PR';host.harness.sdk.stub('skills.list',async()=>({skills:[]}));
   const missing=await tool.execute({action:'read',name:'pr'},worker);assert.equal(missing.isError,true);assert.match(JSON.stringify(missing),/Missing.*\/pr/);
+  assert.equal(host.harness.sdk.callsTo('threads.spawn').length,0);assert.equal(host.harness.sdk.callsTo('threads.send').length,0);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('public paged PR reads expose exact SDK source provenance outside the unchanged full body',async()=>{
+ const host=await configuredHost({selectedMethods:'selected-v1'}),worker={threadId:'thr_author',projectId:'proj_1'};
+ const id='owned-'+['$&',"$'",'$`','"界\\\npr'].join('-'),revision='sdk-"版\\\nrev',content='Complete requested PR body 🧭 "quote"\n'.repeat(500);
+ const expected={id,revision,sha256:createHash('sha256').update(content).digest('hex')};
+ try{
+  host.harness.sdk.stub('threads.getPluginMetadata',async()=>({crew:'true',crewId:'task',shape:'ship',posture:'direct-PR',nativeHome:'/task-home'}));
+  host.harness.sdk.stub('threads.get',async()=>({projectId:'proj_1',environmentId:'env_writer'}));
+  host.harness.sdk.stub('skills.list',async()=>({skills:[{id,name:'pr',pluginId:null,scope:'bb-user'}]}));
+  host.harness.sdk.stub('skills.getContent',async()=>({content,revision}));
+  const tool=host.harness.registrations.agentTools.find(t=>t.name==='firstmate_methods');
+  for(const transport of ['tool','cli']){
+   let cursor,assembled='',pages=0;
+   do{
+    let page;
+    if(transport==='tool')page=await tool.execute(cursor?{action:'read',cursor}:{action:'read',name:'pr'},worker);
+    else{
+     const result=await host.harness.behavior.runCli(['methods','read',...(cursor?['--cursor',cursor]:['pr','--paged']),'--json'],worker);
+     assert.equal(result.exitCode,0,result.stderr);assert.ok(Buffer.byteLength(result.stdout)<12000,'complete serialized CLI response must fit transport budget');page=JSON.parse(result.stdout).text;
+    }
+    assert.equal(typeof page,'string',JSON.stringify(page));assert.ok(Buffer.byteLength(page)<12000,'complete tool response including its activity marker must fit transport budget');
+    const metadata=/^FIRSTMATE_PR_SOURCE ([^\n]+)$/m.exec(page);assert.ok(metadata,'the public page must expose resolved SDK provenance');
+    assert.deepEqual(JSON.parse(metadata[1]),expected);assert.ok(metadata.index<page.indexOf('\nBEGIN_PAGE\n'));
+    assert.match(page,/snapshot.*transport.*revision|revision.*snapshot.*transport/i);
+    assembled+=/\nBEGIN_PAGE\n([\s\S]*)\nEND_PAGE\n/.exec(page)[1];
+    cursor=/"cursor":"([A-Za-z0-9_-]+)"/.exec(page)?.[1];assert.ok(++pages<10);
+   }while(cursor);
+   assert.equal(assembled,content);assert.ok(pages>1);
+  }
+  const unpaged=await host.harness.behavior.runCli(['methods','read','pr','--json'],worker);assert.equal(unpaged.exitCode,0,unpaged.stderr);assert.equal(JSON.parse(unpaged.stdout).text,content);
+  assert.equal(host.harness.sdk.callsTo('threads.spawn').length,0);assert.equal(host.harness.sdk.callsTo('threads.send').length,0);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('public PR reads refuse oversized UTF-8 or escaped provenance and complete serialized pages without truncation',async()=>{
+ const host=await configuredHost({selectedMethods:'selected-v1'}),worker={threadId:'thr_author',projectId:'proj_1'};
+ let id='owned-pr',revision='sdk-revision',content='Full requested PR skill';
+ try{
+  host.harness.sdk.stub('threads.getPluginMetadata',async()=>({crew:'true',crewId:'task',shape:'ship',posture:'direct-PR',nativeHome:'/task-home'}));
+  host.harness.sdk.stub('threads.get',async()=>({projectId:'proj_1',environmentId:'env_writer'}));
+  host.harness.sdk.stub('skills.list',async()=>({skills:[{id,name:'pr',pluginId:null,scope:'bb-user'}]}));
+  host.harness.sdk.stub('skills.getContent',async()=>({content,revision}));
+  const tool=host.harness.registrations.agentTools.find(t=>t.name==='firstmate_methods');
+  for(const sample of [
+   {id:'界'.repeat(700),revision:'sdk-revision',content:'Full requested PR skill',reason:/PR source metadata.*2048/},
+   {id:'owned-pr',revision:'\u0000'.repeat(400),content:'Full requested PR skill',reason:/PR source metadata.*2048/},
+   {id:'owned-pr',revision:'sdk-revision',content:'\u0000'.repeat(8000)+'unchanged tail',reason:/PR paged response.*12000/},
+   {id:'owned-pr',revision:'\n'.repeat(950),content:'"\n'.repeat(4000)+'unchanged tail',reason:/PR paged response.*12000/},
+  ]){
+   ({id,revision,content}=sample);
+   const page=await tool.execute({action:'read',name:'pr'},worker);assert.equal(page.isError,true,'over-budget read must refuse, not shorten source evidence or body');assert.match(JSON.stringify(page),sample.reason);
+   const cli=await host.harness.behavior.runCli(['methods','read','pr','--paged','--json'],worker);assert.equal(cli.exitCode,1);assert.match(cli.stderr,sample.reason);assert.doesNotMatch(cli.stdout,/BEGIN_PAGE/);
+   const operator=await host.harness.behavior.runCli(['methods','read','pr','--json'],worker);assert.equal(operator.exitCode,0,operator.stderr);assert.equal(JSON.parse(operator.stdout).text,content,'unpaged operator output remains complete and unchanged');
+  }
   assert.equal(host.harness.sdk.callsTo('threads.spawn').length,0);assert.equal(host.harness.sdk.callsTo('threads.send').length,0);
  }finally{await host.harness.lifecycle.dispose();}
 });

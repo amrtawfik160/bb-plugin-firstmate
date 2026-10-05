@@ -1,4 +1,4 @@
-import {METHODS_PROFILE,METHODS_REVISION,methodPointer,methodResource,installedPrResource,selectedPrSource} from "./lib/selected-methods.ts";
+import {METHODS_PROFILE,METHODS_REVISION,methodPointer,methodResource,installedPrResource,selectedPrSource,prSourcePage,type PrSource} from "./lib/selected-methods.ts";
 // bb-plugin-firstmate — firstmate-style crews native to BB.
 import { deflateSync } from "node:zlib";
 import { CAPTAIN_ROLE_INSTRUCTIONS } from "./lib/captain-role.ts";
@@ -9520,7 +9520,7 @@ export default async function plugin(bb: BbPluginApi) {
     const resumed=input.cursor?skillCursorRequest(input.cursor):undefined;
     if(resumed && ((input.name!==undefined && input.name!==resumed.name) || (input.reference!==undefined && input.reference!==resumed.reference) || (input.source!==undefined && input.source!==resumed.source)))throw new Error("Method cursor resource differs from request.");
     const request=resumed??{name:input.name??`${role}-methods`,...(input.reference!==undefined?{reference:input.reference}:{}),...(input.source!==undefined?{source:input.source}:{})};
-    let resource:{text:string}, externalIdentity:unknown=null;
+    let resource:{text:string;source?:PrSource}, externalIdentity:unknown=null;
     if(request.name==="pr") {
       if(!identity.worker || identity.meta.shape!=="ship" || identity.meta.posture!=="direct-PR")throw new Error("/pr belongs to the direct-PR ship body author; native pipeline/local-only ownership stays unchanged.");
       if(request.reference!==undefined || request.source!==undefined)throw new Error("Read the resolved /pr entry body without method-relative references.");
@@ -9531,7 +9531,9 @@ export default async function plugin(bb: BbPluginApi) {
       resource=resolved;externalIdentity=resolved.identity;
     } else resource=methodResource(PLUGIN_ROOT,role,request.name!,request.reference,request.source);
     const scope=JSON.stringify(["BB-methods",identity.threadId,identity.meta.nativeHome??null,role,methodsProfile,METHODS_REVISION,externalIdentity]);
-    return paged || input.cursor?skillPage(resource.text,scope,request,input.cursor,"methods"):resource.text;
+    if(!paged && !input.cursor)return resource.text;
+    const page=skillPage(resource.text,scope,request,input.cursor,"methods");
+    return resource.source?prSourcePage(page,resource.source,FIRSTMATE_ROUTINE_MARKER):page;
   }
   bb.agents.registerTool({
     name:"firstmate_methods",description:"Read the explicitly selected installation's role-owned BB methods in bounded pages; native policy remains authoritative. Status is read-only. Enable/disable require a captain and an explicit user-directed selection reason.",

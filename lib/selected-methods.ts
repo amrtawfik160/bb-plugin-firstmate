@@ -8,6 +8,17 @@ export const METHODS_REVISION=createHash('sha256').update(JSON.stringify(METHOD_
 export const prSourceSchema=z.object({id:z.string().min(1),revision:z.string().min(1),sha256:z.string().regex(/^[a-f0-9]{64}$/)}).strict();
 export type PrSource=z.infer<typeof prSourceSchema>;
 export function selectedPrSource(value:string):PrSource|undefined{return value?prSourceSchema.parse(JSON.parse(value)):undefined;}
+/** Public source evidence describes the complete SDK body, not a page snapshot. */
+export function prSourcePage(page:string,source:PrSource,activityMarker:string):string {
+  const metadata=JSON.stringify(prSourceSchema.parse(source));
+  if(Buffer.byteLength(metadata)>2048)throw new Error('PR source metadata exceeds 2048 UTF-8 bytes after JSON escaping; no source evidence was truncated.');
+  const result=page.replace('\nBEGIN_PAGE\n',()=>`\nFIRSTMATE_PR_SOURCE ${metadata}\nSource revision identifies complete SKILL.md; snapshot identifies this transport read.\nBEGIN_PAGE\n`);
+  // The existing 8KB body pages leave room within the 12KB skill-response
+  // budget. Count escaped metadata, complete headers/cursor, activity marker
+  // and the CLI JSON envelope rather than estimating overhead from raw text.
+  if(Buffer.byteLength(JSON.stringify({text:result+activityMarker},null,2)+'\n')>=12000)throw new Error('PR paged response exceeds 12000 UTF-8 bytes including JSON escaping; no source or body was truncated. Use an unpaged operator read for this resource.');
+  return result;
+}
 export type MethodRole='captain'|'worker';
 export function methodPointer(role:MethodRole):string {
   return role==='captain'
