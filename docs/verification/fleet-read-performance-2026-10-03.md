@@ -10,7 +10,7 @@ Before the server fix, the ordinary-thread RPC test observed one native invocati
 
 The snapshot scheduler tests exercise owner sharing, concurrency limits, expiration, failed reads, invalidation during a pending read, and disposal. The frontend scheduler test exercises event bursts, an unresolved request, a later refresh, and disposal.
 
-The full project suite passed 582 tests, skipped eight tests, and failed zero tests. Server and frontend TypeScript checks and the plugin build passed. Existing automatic-compaction edits were preserved and excluded from the performance commit.
+The original working checkout passed 582 tests, skipped eight tests, and failed zero tests. A clean PR checkout then passed 574 tests, skipped eight tests, and failed zero tests; the eight additional passing tests belonged to pre-existing automatic-compaction edits. Those edits were preserved and excluded from the PR. Server and frontend TypeScript checks and the plugin build passed.
 
 ## Live evidence
 
