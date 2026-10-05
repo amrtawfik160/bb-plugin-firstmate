@@ -6,18 +6,25 @@ import {mkdtempSync,mkdirSync,readFileSync,writeFileSync,openSync,closeSync,real
 import {tmpdir} from 'node:os';import {dirname,join,resolve} from 'node:path';import {createServer} from 'node:net';
 import {createFakePluginHost,makePluginAgentConfigurationContext} from '@get-bb/plugin-sdk/testing';
 import plugin from '../server.ts';import {followRuntimeReferences} from './captain-packaging-check.mjs';
+import {resolveInstalledBbRuntime} from './bb-runtime-fixture.mjs';
 const exec=promisify(execFile),root=resolve('.');
 async function freePort(){const socket=createServer();await new Promise(r=>socket.listen(0,'127.0.0.1',r));const port=socket.address().port;await new Promise(r=>socket.close(r));return port;}
+const discoveryEnv={...process.env};for(const key of Object.keys(discoveryEnv))if(key.startsWith('BB_'))delete discoveryEnv[key];
+const pathBinary=realpathSync((await exec('sh',['-c','command -v bb'],{env:discoveryEnv})).stdout.trim());
 
-test('installed BB discovers only shipped entry skills and resolves actual role configuration', {timeout:90000},async()=>{
+test('installed BB runtime lookup accepts both official entrypoints from the same package',()=>{
+ const runtime=resolveInstalledBbRuntime(pathBinary);
+ for(const binary of [runtime.javascriptCli,runtime.nativeCli])assert.deepEqual(resolveInstalledBbRuntime(binary),runtime);
+ assert.throws(()=>resolveInstalledBbRuntime(runtime.serverPath),/Unsupported official BB entrypoint/);
+});
+
+for(const entrypoint of ['javascriptCli','nativeCli'])test('installed BB discovers only shipped entry skills and resolves actual role configuration via '+entrypoint, {timeout:90000},async()=>{
+ const located=resolveInstalledBbRuntime(pathBinary),runtime=resolveInstalledBbRuntime(located[entrypoint]),binary=runtime[entrypoint],serverPath=runtime.serverPath;
  const home=mkdtempSync(join(tmpdir(),'fm-package-discovery-')),data=join(home,'data');mkdirSync(data);
  const env={...process.env};for(const key of Object.keys(env))if(key.startsWith('BB_'))delete env[key];
  const port=await freePort();let daemonPort=await freePort();
  for(let n=0;daemonPort===port && n<8;n++)daemonPort=await freePort();assert.notEqual(daemonPort,port,'distinct owned ports required');
  Object.assign(env,{HOME:home,BB_DATA_DIR:data,BB_SERVER_LAUNCH_ID:home,BB_SERVER_URL:`http://127.0.0.1:${port}`,BB_SERVER_PORT:String(port),BB_SERVER_BIND_HOST:'127.0.0.1',BB_HOST_DAEMON_PORT:String(daemonPort)});
- const binary=realpathSync((await exec('sh',['-c','command -v bb'],{env})).stdout.trim());
- const packageRoot=resolve(dirname(binary),'../..'),serverPath=join(packageRoot,'server/dist/index.js');
- assert.ok(readFileSync(serverPath).length,'installed BB runtime required');
  const logPath=join(home,'server.log'),fd=openSync(logPath,'w'),server=spawn(process.execPath,[serverPath],{env,stdio:['ignore',fd,fd]});closeSync(fd);
  let daemon;
  const cli=async args=>JSON.parse((await exec(binary,args,{env,timeout:30000,maxBuffer:4*1024*1024})).stdout);
@@ -34,7 +41,7 @@ test('installed BB discovers only shipped entry skills and resolves actual role 
   const bootstrap=await fetch(env.BB_SERVER_URL+'/internal/hosts/enroll-key',{method:'POST',headers:{'content-type':'application/json'},body:'{}',signal:AbortSignal.timeout(5000)});
   assert.equal(bootstrap.status,201);const credential=await bootstrap.json();
   const daemonFd=openSync(join(home,'daemon.log'),'w');
-  daemon=spawn(process.execPath,[join(packageRoot,'host-daemon/dist/daemon-bundle.mjs')],{env:{...env,BB_CLI_DIR:dirname(binary),BB_HOST_ID:credential.hostId,BB_HOST_ENROLL_KEY:credential.enrollKey},stdio:['ignore',daemonFd,daemonFd]});closeSync(daemonFd);
+  daemon=spawn(process.execPath,[runtime.daemonPath],{env:{...env,BB_CLI_DIR:dirname(runtime.nativeCli),BB_HOST_ID:credential.hostId,BB_HOST_ENROLL_KEY:credential.enrollKey},stdio:['ignore',daemonFd,daemonFd]});closeSync(daemonFd);
   let connected=false;
   for(let n=0;n<100;n++){
    if(daemon.exitCode!==null)throw new Error('Owned daemon exited: '+readFileSync(join(home,'daemon.log'),'utf8'));
@@ -58,7 +65,7 @@ test('installed BB discovers only shipped entry skills and resolves actual role 
    }
   }finally{await host.harness.lifecycle.dispose();}
   const state=await cli(['plugin','list','--json']);
-  writeFileSync(join(home,'evidence.json'),JSON.stringify({entries,state},null,2));
+  writeFileSync(join(home,'evidence.json'),JSON.stringify({entrypoint,binary,runtime,entries,state},null,2));
  }catch(error){throw new Error(String(error)+'\nOwned server log: '+logPath+'\n'+readFileSync(logPath,'utf8').slice(-6000));}
  finally{
   for(const child of [daemon,server].filter(Boolean)){
