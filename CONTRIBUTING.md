@@ -9,6 +9,10 @@ Do the normal things: keep the diff small, run `tsc` and `npm test` before you
 open a PR, follow the surrounding code's idiom. The rest of this file is the one
 part that is not optional.
 
+For clean CI coverage and owned acceptance preflight, read
+[verification entry points](docs/verification/session-retro-20261005.md#verification-entry-points).
+CI checks the supported offline profile; full native and live model acceptance remain separate requirements below.
+
 ## The verification standard
 
 This standard exists because it had to. Fourteen PRs shipped native ownership of

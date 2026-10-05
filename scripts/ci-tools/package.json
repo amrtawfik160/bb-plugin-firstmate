@@ -1,0 +1,7 @@
+{
+  "name": "firstmate-ci-tools",
+  "private": true,
+  "dependencies": {
+    "bb-app": "0.44.0"
+  }
+}
