@@ -7378,13 +7378,13 @@ test("IT current native AFK entry writes a valid durable record", { skip: !FM_IN
 });
 
 
-test("native captain contract tool returns the entire source beyond the SDK instruction limit", async () => {
+test("native captain contract tool pages the entire source below ACP truncation", async () => {
   const host = ownerHost();
   await plugin(host.bb);
   await host.bb.storage.kv.set("native-home:thr_cap", "/tmp/fm-home");
   await host.bb.storage.kv.set("native-home-host:thr_cap", "host_1");
   try {
-    const content = "# Firstmate\n" + "supervision policy\n".repeat(5000) + "END_OF_NATIVE_CONTRACT";
+    const content = "# Firstmate\n" + "supervision policy 🧭\n".repeat(5000) + "END_OF_NATIVE_CONTRACT";
     // This unit isolates the complete SDK transport; real dual-pin tests verify
     // catalog production from tracked native bytes through the staged helper.
     stubRoutedHost(host, command => ({payload: command.includes('FM_HOST_CAPTURE_V1') ? JSON.stringify({
@@ -7399,11 +7399,25 @@ test("native captain contract tool returns the entire source beyond the SDK inst
     assert.match(cfg.instructions ?? "", /read firstmate_contract/);
     const tool = host.harness.inspection.registrations.agentTools.find(t => t.name === "firstmate_contract");
     assert.ok(tool);
-    const result = await tool.execute({}, { threadId: "thr_cap", projectId: "proj_1" } as never);
-    assert.equal(typeof result, "string");
-    assert.ok((result as string).startsWith(content), "full native text must survive transport and instruction budgets");
-    assert.match(result as string, /BB runtime adaptations/);
-    assert.match(result as string, /description: A fixture trigger/);
+    let cursor: string | undefined, assembled = "", count = 0;
+    do {
+      const result = await tool.execute(cursor ? { cursor } : {}, { threadId: "thr_cap", projectId: "proj_1" } as never);
+      assert.equal(typeof result, "string");
+      // The actual Grok preview cuts at 19.5KB. Every result, including BB's
+      // tool marker and continuation header, must fit before that boundary.
+      assert.ok(Buffer.byteLength(result as string) < 19_500);
+      const preview = Buffer.from(result as string).subarray(0, 19_500).toString("utf8");
+      const body = /\nBEGIN_PAGE\n([\s\S]*)\nEND_PAGE\n/.exec(preview);
+      assert.ok(body, "whole page must survive ACP preview");
+      assembled += body[1];
+      cursor = /firstmate_contract \{"cursor":"([A-Za-z0-9_-]+)"\}/.exec(preview)?.[1];
+      assert.ok(++count < 40);
+      if (!cursor) assert.match(preview, /END OF CONTRACT TRANSPORT/);
+    } while (cursor);
+    assert.ok(count > 1);
+    assert.ok(assembled.startsWith(content), "all native bytes must survive UTF-8 page boundaries");
+    assert.match(assembled, /BB runtime adaptations/);
+    assert.match(assembled, /description: A fixture trigger/);
   } finally { await host.harness.lifecycle.dispose(); }
 });
 

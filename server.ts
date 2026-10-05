@@ -1,5 +1,7 @@
 // bb-plugin-firstmate — firstmate-style crews native to BB.
 import { deflateSync } from "node:zlib";
+import { CAPTAIN_ROLE_INSTRUCTIONS } from "./lib/captain-role.ts";
+import { contractPage, contractCursorSection } from "./lib/contract-transport.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -1393,7 +1395,7 @@ const CAPTAIN_TOOLS = [
   "firstmate_fm",
 ] as const;
 
-const CAPTAIN_CONTRACT_POINTER = "Before orchestrating, call firstmate_deck (ACP/CLI: bb firstmate deck --json) to bind this thread's native home, then read firstmate_contract without a section (bb firstmate contract) for the complete native supervisor contract and its selected-runtime skill trigger catalog. If the startup digest is absent, run deck's exact command through your agent shell; firstmate_fm script=session-start returns it again. Failed prerequisites, lock refusal or a truncated digest remain unresolved.";
+const CAPTAIN_CONTRACT_POINTER = "Before orchestrating, call firstmate_deck (ACP/CLI: bb firstmate deck --json) to bind this thread's native home, then read firstmate_contract without a section and follow every cursor (ACP/CLI: bb firstmate contract --paged, then --cursor) for the complete native supervisor contract and its selected-runtime skill trigger catalog. If the startup digest is absent, run deck's exact command through your agent shell; firstmate_fm script=session-start returns it again. Failed prerequisites, lock refusal or a truncated digest remain unresolved.";
 
 const BB_SKILL_RUNTIME_CONTRACT = [
   "BB adapter for every upstream firstmate skill:",
@@ -9208,7 +9210,7 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb firstmate scripts [query] [--json]   # list + verify every installed fm-* script",
     "  bb firstmate fm [--timeout s] <script> [args...]   # real bin/fm-<script>.sh with FM_BACKEND=bb",
     "  bb firstmate deck [--digest|--all] [--json] | session [--json]",
-    "  bb firstmate contract [section,...] [--json] # complete native policy",
+    "  bb firstmate contract [section,...] [--paged | --cursor <cursor>] [--json] # read every page; default CLI returns complete native policy",
     "  bb firstmate skill <name> [relative-reference] [--source <selected-root source-file>] [--json] # complete selected native policy",
     "  bb firstmate runtime status|install|select|migrate|rollback [exact-release|external] [--check] [--json]",
     dispatchHelp,
@@ -9309,7 +9311,12 @@ export default async function plugin(bb: BbPluginApi) {
     });
   }) as BbPluginApi["agents"]["registerTool"];
 
-  async function readCaptainContract(ctx: unknown, section?: string) {
+  async function readCaptainContract(ctx: unknown, section?: string, paged = false, cursor?: string) {
+    if (cursor) {
+      const originalSection = contractCursorSection(cursor);
+      if (section !== undefined && section !== originalSection) throw new Error("Do not change contract section during a cursor read; restart without cursor.");
+      section = originalSection;
+    }
     const current = await settings.get();
     if (!homeScope.getStore()?.captain || !homeScope.getStore()?.home) return toolError("No bound captain home. Call firstmate_deck or bb firstmate deck before reading the native contract; shared-home fallback refused.");
     if (current.fmHome.trim() === "") return toolError("Initialize real Firstmate with firstmate_deck first.");
@@ -9338,12 +9345,13 @@ export default async function plugin(bb: BbPluginApi) {
       ? Buffer.from(result.content, "base64").toString("utf8") : result.content;
     const picked = selectContract(content, section);
     const done = picked.complete
-      ? "The firstmate_contract read is now complete."
+      ? "This transport contains the complete native contract; read all of it and its trigger catalog before orchestration."
       : "This firstmate_contract read covers the listed sections; read any other section by name before acting in its area.";
     const catalog=await nativePolicyLookup(hostId,path.slice(0,-'/AGENTS.md'.length),{operation:'catalog'},signal);
     if (catalog.contractSha256!==createHash('sha256').update(content).digest('hex')) throw new Error('Native contract changed during selected-runtime trigger read; complete contract/catalog read remains unresolved.');
     const triggers=`## Selected native skill trigger catalog @ ${catalog.commit}\n${catalog.root}\n\n${catalog.entries!.map(entry=>`### ${entry.path}\nNative file SHA-256: ${entry.sha256}\n\n\`\`\`yaml\n${entry.frontmatter}\n\`\`\``).join('\n\n')}`;
-    return `${picked.text}\n\n${triggers}\n\n## BB runtime adaptations\n${BB_SKILL_RUNTIME_CONTRACT}\n${done} Treat native policy refusals as refusals. Read durable reports with firstmate_wake; pass handledWake on the final successful action after handling the whole batch.\n`;
+    const text = `${picked.text}\n\n${triggers}\n\n## BB runtime adaptations\n${BB_SKILL_RUNTIME_CONTRACT}\n${done} Treat native policy refusals as refusals. Read durable reports with firstmate_wake; pass handledWake on the final successful action after handling the whole batch.\n`;
+    return paged || cursor ? contractPage(text, JSON.stringify([contractCaptain, current.fmHome, hostId, catalog.root, catalog.commit]), section, cursor) : text;
   }
 
   async function nativePolicyLookup(host:string,root:string,request:Record<string,unknown>,signal:AbortSignal) {
@@ -9416,12 +9424,13 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_contract",
-    description: "Read the current native Firstmate supervisor contract, complete selected-runtime skill trigger catalog and BB runtime adaptations. Without section: the complete upstream contract verbatim. section=<number or title, comma-separated> reads those sections; section=\"all\" reads everything. Read before orchestrating and after an upstream update.",
+    description: "Read the native supervisor contract, complete selected-runtime skill trigger catalog and BB adaptations in bounded pages. Start without cursor, then follow EVERY returned cursor before orchestrating. Native bytes remain verbatim across pages. section selects sections; all selects the entire contract. Cursor pins the captain/home and verified snapshot; changed bytes require restarting. Repeat after an upstream update or lost context.",
     parameters: z.object({
       section: z.string().max(200).optional().describe('Contract section(s) by number or title, comma-separated (e.g. "7,8"), or "all".'),
+      cursor: z.string().max(1200).optional().describe("Exact continuation from previous page; omit section on continuation. Read every page in order."),
     }),
-    async execute({ section }, ctx) {
-      return readCaptainContract(ctx, section);
+    async execute({ section, cursor }, ctx) {
+      return readCaptainContract(ctx, section, true, cursor);
     },
   });
 
@@ -9487,6 +9496,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_deck",
+    instructions: CAPTAIN_ROLE_INSTRUCTIONS,
     description: "Bind this captain to its exact native home and return the required agent-shell startup command; readiness is unverified until the native digest succeeds. Optional digest/all explicitly requests a fleet digest.",
     presentation: { label: { pending: "Binding captain home", completed: "Home bound; verify native startup" } },
     parameters: z.object({ all: z.boolean().optional().describe("Explicitly scan every captain's crews"), digest:z.boolean().optional().describe("Explicitly request the session/fleet digest before native startup") }),
@@ -10943,7 +10953,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "guide", summary: "Setup guide for firstmate inside BB", usage: "bb firstmate guide [--json]" },
       { name: "runtime", summary: "Pinned native runtime status, installation and explicit selection", usage: "bb firstmate runtime status|install|select|migrate|rollback [release-id] [--check] [--json]" },
       { name: "init", summary: "Native deck setup (add --real for the bundled runtime or an existing explicit external home)", usage: "bb firstmate init [--real] [--json]" },
-      { name: "contract", summary: "Read the full native supervisor contract (or named sections)", usage: "bb firstmate contract [section,...]" },
+      { name: "contract", summary: "Read the complete native contract and trigger catalog; follow every cursor in bounded mode", usage: "bb firstmate contract [section,...] [--paged | --cursor <cursor>] [--json]" },
       { name: "toolchain", summary: "Check native AXI and Lavish dependencies without mutations", usage: "bb firstmate toolchain [--json]" },
       { name: "scripts", summary: "List + verify every installed fm-* script", usage: "bb firstmate scripts [query] [--json]" },
       { name: "fm", summary: "Run a real firstmate bin/ script with FM_BACKEND=bb", usage: "bb firstmate fm [--timeout s] <script> [args...]" },
@@ -11057,7 +11067,7 @@ export default async function plugin(bb: BbPluginApi) {
           }
           case "contract": {
             // The operator CLI reads the whole contract unless a section is named.
-            const text = await readCaptainContract(ctx, rest.join(" ").trim() || "all");
+            const text = await readCaptainContract(ctx, rest.join(" ").trim() || undefined, flags.get("paged") === true, flagStr(flags, "cursor"));
             if (typeof text !== "string") return fail(text.content.filter(c=>c.type==='text').map(c=>c.text).join('\n')||"Native contract could not be read.");
             return reply({ contract: text }, text);
           }

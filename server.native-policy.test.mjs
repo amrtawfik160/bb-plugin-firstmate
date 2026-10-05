@@ -10,6 +10,7 @@ import plugin from './server.ts';
 import {createDeliveries,parseForge,deliveryLine} from './lib/pr-delivery.ts';
 import {createLaunches} from './lib/launch.ts';
 import {FIRSTMATE_ROUTINE_MARKER} from './lib/timeline-noise.ts';
+import {CAPTAIN_ROLE_INSTRUCTIONS,NATIVE_CAPTAIN_ROLE} from './lib/captain-role.ts';
 import {runtimeFixture} from './scripts/native-runtime-fixture.mjs';
 import {fixture,pins,scaffold,render,run,ok} from './scripts/prompt-fixture.mjs';
 const ctx={threadId:'thr_cap',projectId:'proj_1'};
@@ -24,7 +25,7 @@ async function hostFor(home) {
  host.harness.sdk.stub('environments.get',async()=>({id:'env_1',hostId:'host_1',path:home+'/test-repository',status:'ready'}));
  host.harness.sdk.stub('environments.list',async()=>[{id:'env_1',hostId:'host_1',path:home+'/test-repository',status:'ready',isWorktree:false}]);
  host.harness.sdk.stub('files.read',async({path})=>({content:readFileSync(path,'utf8'),sizeBytes:readFileSync(path).length}));
- const fakebin=join(home,'test-cli');mkdirSync(fakebin);writeFileSync(join(fakebin,'bb'),'#!/bin/sh\nexit 97\n',{mode:0o755});
+ const fakebin=join(home,'test-cli');mkdirSync(fakebin,{recursive:true});writeFileSync(join(fakebin,'bb'),'#!/bin/sh\nexit 97\n',{mode:0o755});
  const output=new Map();let n=0;const commands=[];
  host.harness.sdk.stub('terminals.create',async({start})=>{
    assert.ok(Buffer.byteLength(start.command)<=10000,'fully composed host command budget');
@@ -37,6 +38,64 @@ async function hostFor(home) {
  host.harness.sdk.stub('terminals.output',async({terminalId})=>({nextSeq:1,chunks:[{dataBase64:Buffer.from(output.get(terminalId)).toString('base64')}]}));
  return{host,commands};
 }
+test('cold-entry tool instructions retain exact native supervisor role across binding and later turns, excluding workers',async()=>{
+ for(const pin of ['1f3e7696','2d833ff1']){
+  const native=readFileSync(`native-snapshot/${pin}/AGENTS.md`,'utf8');
+  assert.equal(NATIVE_CAPTAIN_ROLE,native.slice(native.indexOf('## 1. Identity'),native.indexOf('You may maintain')).trimEnd(),'role excerpt must preserve every native exception and authority rule');
+ }
+ const host=createFakePluginHost({pluginId:'firstmate',agentSkillIds:ids});await plugin(host.bb);
+ try{
+  const deck=host.harness.registrations.agentTools.find(t=>t.name==='firstmate_deck');
+  assert.equal(deck.instructions,CAPTAIN_ROLE_INSTRUCTIONS);
+  const allow=JSON.parse(readFileSync('docs/verification/native-transport-allowlist.v1.json','utf8'));
+  assert.equal(hash(deck.instructions),allow.toolUsage.firstmate_deck.sha256,'persistent tool instructions require explicit transport review');
+  assert.ok(deck.instructions.length<=4096,'public SDK tool usage limit');
+  assert.match(deck.instructions,/Before binding, this conditional role does not apply/);
+  assert.match(deck.instructions,/project task belongs to worker intake/);
+  assert.match(deck.instructions,/concrete captain-approved project operation/);
+  for(const metadata of [{},{captain:'true'},{captain:'true'}]){
+   const cfg=await host.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({pluginMetadata:metadata}));
+   // BB appends this supported usage snippet when the tool is selected. The
+   // cold session already contains it before metadata changes (no hot update).
+   assert.equal(cfg.tools.find(t=>t.name===deck.name)?.instructions,CAPTAIN_ROLE_INSTRUCTIONS);
+   assert.ok(deck.instructions.includes(NATIVE_CAPTAIN_ROLE));
+  }
+  for(const metadata of [{crew:'true'},{crew:'true',captain:'true'}]){
+   const cfg=await host.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({pluginMetadata:metadata}));
+   assert.ok(!cfg.tools.some(t=>t.name===deck.name));assert.deepEqual(cfg.skills,[]);
+  }
+  assert.equal(host.harness.sdk.callsTo('threads.update').length,0,'role configuration changes no model or thread settings');
+  assert.equal(host.harness.sdk.callsTo('threads.spawn').length,0);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+for(const pin of pins)test(`bounded registered contract pages ${pin.slice(0,8)} survive ACP preview and restart with exact captain isolation`,async()=>{
+ const home=fixture(pin);let f=await hostFor(home);
+ try{
+  const full=await f.host.harness.behavior.runCli(['contract'],ctx);assert.equal(full.exitCode,0,full.stderr);
+  let body='',cursor,count=0;
+  do{
+   const tool=f.host.harness.registrations.agentTools.find(t=>t.name==='firstmate_contract');
+   const page=await tool.execute(cursor?{cursor}:{},ctx);assert.equal(typeof page,'string',JSON.stringify(page));
+   assert.ok(Buffer.byteLength(page)<19500,'all actual tool bytes fit observed Grok preview');
+   const preview=Buffer.from(page).subarray(0,19500).toString('utf8');
+   const match=/\nBEGIN_PAGE\n([\s\S]*)\nEND_PAGE\n/.exec(preview);assert.ok(match);body+=match[1];
+   cursor=/firstmate_contract \{"cursor":"([A-Za-z0-9_-]+)"\}/.exec(preview)?.[1];
+   if(count++===0){
+    assert.ok(cursor);
+    const cli=await f.host.harness.behavior.runCli(['contract','--paged'],ctx);assert.equal(cli.exitCode,0,cli.stderr);assert.ok(cli.stdout.includes(match[1]));
+    await f.host.bb.storage.kv.set('native-home:thr_other',home);await f.host.bb.storage.kv.set('native-home-host:thr_other','host_1');
+    const wrong=await tool.execute({cursor},{...ctx,threadId:'thr_other'});assert.equal(wrong.isError,true);assert.match(JSON.stringify(wrong),/another captain/);
+    await f.host.harness.lifecycle.dispose();f=await hostFor(home);
+    const resumed=await f.host.harness.behavior.runCli(['contract','--cursor',cursor],ctx);assert.equal(resumed.exitCode,0,resumed.stderr);assert.match(resumed.stdout,/FIRSTMATE_CONTRACT_PAGE 2\//);
+   }
+   assert.ok(count<30);
+  }while(cursor);
+  assert.ok(count>1);assert.ok(body.startsWith(readFileSync(join(home,'AGENTS.md'),'utf8')));
+  assert.ok(full.stdout.includes(body),'complete native text/catalog/adaptations must equal operator full read');
+  assert.match(body,/Selected native skill trigger catalog/);assert.match(body,/BB runtime adaptations/);
+  assert.equal(f.host.harness.sdk.callsTo('threads.spawn').length,0);assert.equal(f.host.harness.sdk.callsTo('threads.send').length,0);
+ }finally{await f.host.harness.lifecycle.dispose();rmSync(home,{recursive:true,force:true});}
+});
 for(const pin of pins)test(`selected ${pin.slice(0,8)} native policy and complete contract through registered CLI/tool, composed with transport only`,async()=>{
  const home=fixture(pin),f=await hostFor(home);try {
   const tool=f.host.harness.registrations.agentTools.find(t=>t.name==='firstmate_skill');
@@ -207,6 +266,7 @@ test('registered CLI help describes actual dispatch and queue execution/gates; p
     for(const flag of ['--project','--provider','--model','--reasoning-level','--mode','--delivery-requirement','--shape'])assert.ok(help.includes(flag),name+':'+flag);
     for(const value of ['ultra','none','ultracode','merged-and-verified','local-only'])assert.ok(help.includes(value));
   }
+  const contractHelp=await f.host.harness.behavior.runCli(['contract','--help'],ctx);assert.equal(contractHelp.exitCode,0,contractHelp.stderr);for(const flag of ['--paged','--cursor','--json'])assert.ok(contractHelp.stdout.includes(flag));
   const qHelp=subcommands.find(c=>c.name==='queue').usage;for(const flag of ['--after','--wait-until','--detail'])assert.ok(qHelp.includes(flag));
   const dHelp=subcommands.find(c=>c.name==='dispatch').usage;for(const flag of ['--task-id','--override-owner','--permission-mode'])assert.ok(dHelp.includes(flag));
   const general=await f.host.harness.behavior.runCli(['help'],ctx);assert.ok(general.stdout.includes(dHelp));assert.ok(general.stdout.includes(qHelp));
