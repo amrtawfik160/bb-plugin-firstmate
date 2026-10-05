@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {createHash} from 'node:crypto';
-import {readFileSync,writeFileSync,mkdirSync,rmSync,cpSync} from 'node:fs';
+import {readFileSync,writeFileSync,mkdirSync,rmSync,cpSync,symlinkSync,readdirSync} from 'node:fs';
 import {join} from 'node:path';
 import {spawnSync} from 'node:child_process';
 import {createFakePluginHost,makeThreadResponse,makePluginAgentConfigurationContext} from '@get-bb/plugin-sdk/testing';
 import plugin from './server.ts';
 import {createDeliveries,parseForge,deliveryLine} from './lib/pr-delivery.ts';
 import {createLaunches} from './lib/launch.ts';
+import {FIRSTMATE_ROUTINE_MARKER} from './lib/timeline-noise.ts';
 import {runtimeFixture} from './scripts/native-runtime-fixture.mjs';
 import {fixture,pins,scaffold,render,run,ok} from './scripts/prompt-fixture.mjs';
 const ctx={threadId:'thr_cap',projectId:'proj_1'};
@@ -25,6 +26,7 @@ async function hostFor(home) {
  const fakebin=join(home,'test-cli');mkdirSync(fakebin);writeFileSync(join(fakebin,'bb'),'#!/bin/sh\nexit 97\n',{mode:0o755});
  const output=new Map();let n=0;const commands=[];
  host.harness.sdk.stub('terminals.create',async({start})=>{
+   assert.ok(Buffer.byteLength(start.command)<=10000,'fully composed host command budget');
    const match=/^__fm_cmd='([\s\S]*?)'; set \+e; "/.exec(start.command);assert.ok(match,start.command);
    const command=match[1].replace(/'\\''/g,"'");commands.push(command);
    const result=spawnSync('bash',['--noprofile','--norc','-c',command],{stdio:['ignore','pipe','pipe'],encoding:'utf8',env:{...process.env,HOME:home,PATH:fakebin+':'+process.env.PATH},timeout:30000,maxBuffer:4*1024*1024});
@@ -47,6 +49,15 @@ for(const pin of pins)test(`selected ${pin.slice(0,8)} native policy and complet
   }
   const contract=await f.host.harness.behavior.runCli(['contract'],ctx);assert.equal(contract.exitCode,0,contract.stderr);
   const native=readFileSync(join(home,'AGENTS.md'),'utf8');assert.ok(contract.stdout.includes(native));assert.doesNotMatch(contract.stdout,/Calm reporting|captain-methods|worker-methods|report editor/);
+  const paths=ok(run('git',['-C',home,'ls-tree','-r','--name-only','HEAD','--','.agents/skills'])).trim().split('\n').filter(p=>p.endsWith('/SKILL.md'));
+  assert.equal((contract.stdout.match(/^### \.agents\/skills\//gm)??[]).length,paths.length,'complete selected native trigger inventory');
+  for(const path of paths){
+    const text=readFileSync(join(home,path),'utf8'),frontmatter=/^---\r?\n([\s\S]*?)\r?\n---/.exec(text)[1];
+    assert.ok(contract.stdout.includes(frontmatter),'complete verbatim trigger frontmatter: '+path);
+    assert.ok(contract.stdout.includes(hash(text)),'verified native trigger hash: '+path);
+  }
+  const maintenance=readFileSync(join(home,'.agents/skills/agent-skill-trigger-index/SKILL.md'),'utf8').split(/\n---\n/)[1];
+  assert.ok(!contract.stdout.includes(maintenance),'maintenance-only skill body must not load');
   assert.match(contract.stdout,/no-mistakes alone owns review/);assert.match(contract.stdout,/without adding an independent reviewer/);assert.match(contract.stdout,/captain-approved `yolo`/);assert.match(contract.stdout,/After an autonomous merge.*full-URL/);
   for(const meta of [{captain:'true',nativeHome:home},{crew:'true',captain:'true'}]) {
     const cfg=await f.host.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({pluginMetadata:meta}));
@@ -89,6 +100,98 @@ test('unknown policy, changed bytes, traversal and foreign references refuse wit
   ok(run('git',['-C',home,'-c','user.name=Fixture','-c','user.email=fixture@example.test','commit','-am','unsupported policy']));
   const unknown=await request(['ship-landing']);assert.equal(unknown.exitCode,1);assert.match(unknown.stderr,/Unknown native policy revision/);
   assert.equal(f.host.harness.sdk.callsTo('threads.spawn').length,0);
+ }finally{await f.host.harness.lifecycle.dispose();rmSync(home,{recursive:true,force:true});}
+});
+
+for(const pin of pins)test(`native relative references ${pin.slice(0,8)} resolve complete tracked documents and nested source links`,async()=>{
+ const home=fixture(pin),f=await hostFor(home);try{
+  const tool=f.host.harness.registrations.agentTools.find(t=>t.name==='firstmate_skill');
+  const cases=[
+    {name:'stuck-crewmate-recovery',reference:'../../../docs/configuration.md#crew-hosted-lavish-review-boards',path:'docs/configuration.md'},
+    {name:'stuck-crewmate-recovery',reference:'../../../docs/agent-control.md',path:'docs/agent-control.md'},
+    {name:'harness-adapters',source:'.agents/skills/harness-adapters/references/harness/codex.md',reference:'../../../../../docs/supervision-host.md',path:'docs/supervision-host.md'},
+  ];
+  for(const {path,...request} of cases){
+    const source=readFileSync(join(home,request.source??`.agents/skills/${request.name}/SKILL.md`),'utf8');
+    assert.ok(source.includes(request.reference),'actual pinned native reference link');
+    const expected=readFileSync(join(home,path),'utf8');
+    const args=['skill',request.name,request.reference,...(request.source?['--source',request.source]:[])];
+    const cli=await f.host.harness.behavior.runCli(args,ctx);assert.equal(cli.exitCode,0,cli.stderr);
+    assert.ok(cli.stdout.endsWith(expected),'complete document through registered CLI, including tail');
+    const result=await tool.execute(request,ctx);assert.ok(result.endsWith(expected+FIRSTMATE_ROUTINE_MARKER),'complete document through registered tool, including tail');
+    assert.ok(result.includes(pin));assert.ok(result.includes(path));
+    if(path==='docs/configuration.md')assert.ok(Buffer.byteLength(expected)>200000,'real document exceeds replaced limit');
+  }
+  const fragment=await tool.execute({name:'stuck-crewmate-recovery',source:'docs/configuration.md',reference:'#crew-hosted-lavish-review-boards'},ctx);
+  assert.ok(fragment.endsWith(readFileSync(join(home,'docs/configuration.md'),'utf8')+FIRSTMATE_ROUTINE_MARKER));
+  assert.equal(f.host.harness.sdk.callsTo('threads.spawn').length,0);assert.equal(f.host.harness.sdk.callsTo('threads.send').length,0);
+  assert.equal(f.host.harness.sdk.callsTo('terminals.create').length,f.host.harness.sdk.callsTo('terminals.close').length);
+ }finally{await f.host.harness.lifecycle.dispose();rmSync(home,{recursive:true,force:true});}
+});
+
+test('trigger catalog stays complete and isolated to each selected captain runtime; corruption refuses completion',async()=>{
+ const one=fixture(pins[0]),two=fixture(pins[1]),f=await hostFor(one);try{
+  await f.host.bb.storage.kv.set('native-home:thr_second',two);await f.host.bb.storage.kv.set('native-home-host:thr_second','host_1');
+  const expected=home=>ok(run('git',['-C',home,'ls-tree','-r','--name-only','HEAD','--','.agents/skills'])).trim().split('\n').filter(p=>p.endsWith('/SKILL.md'));
+  for(const [captain,home,pin] of [['thr_cap',one,pins[0]],['thr_second',two,pins[1]]]){
+    const result=await f.host.harness.behavior.runCli(['contract'],{...ctx,threadId:captain});assert.equal(result.exitCode,0,result.stderr);
+    assert.match(result.stdout,new RegExp('trigger catalog @ '+pin),'catalog must match selected home revision');
+    assert.ok(result.stdout.includes(home));assert.ok(!result.stdout.includes(home===one?two:one),'foreign selected home must never provide catalog');
+    for(const path of expected(home))assert.ok(result.stdout.includes(/^---\n([\s\S]*?)\n---/.exec(readFileSync(join(home,path),'utf8'))[1]));
+  }
+  const path=join(two,'.agents/skills/stuck-crewmate-recovery/SKILL.md');writeFileSync(path,readFileSync(path,'utf8')+'\nForeign policy\n');
+  const bad=await f.host.harness.behavior.runCli(['contract'],{...ctx,threadId:'thr_second'});
+  assert.equal(bad.exitCode,1);assert.match(bad.stderr,/differ from selected Git snapshot/);assert.ok(!bad.stdout.includes('read is now complete'));
+  const unaffected=await f.host.harness.behavior.runCli(['contract'],ctx);assert.equal(unaffected.exitCode,0,unaffected.stderr);
+ }finally{await f.host.harness.lifecycle.dispose();rmSync(one,{recursive:true,force:true});rmSync(two,{recursive:true,force:true});}
+});
+
+test('unbound captain cannot consume the global policy root even in compatibility mode',async()=>{
+ const home=fixture(),f=await hostFor(home);try{
+  const missing={...ctx,threadId:'thr_unbound'};
+  const result=await f.host.harness.behavior.runCli(['contract'],missing);
+  assert.equal(result.exitCode,1);assert.match(result.stderr,/No bound captain home/);
+  const tool=f.host.harness.registrations.agentTools.find(t=>t.name==='firstmate_contract');
+  const response=await tool.execute({},missing);assert.equal(response.isError,true);assert.match(JSON.stringify(response),/shared-home fallback refused/);
+  assert.equal(f.host.harness.sdk.callsTo('files.read').length,0);assert.equal(f.host.harness.sdk.callsTo('terminals.create').length,0);
+ }finally{await f.host.harness.lifecycle.dispose();rmSync(home,{recursive:true,force:true});}
+});
+
+test('reference escapes, symlinks, changed source/target and truncated SDK transfers cannot report a complete policy read',async()=>{
+ const home=fixture(),f=await hostFor(home);try{
+  const request=(reference,source)=>f.host.harness.behavior.runCli(['skill','stuck-crewmate-recovery',reference,...(source?['--source',source]:[])],ctx);
+  for(const [reference,source] of [['../../../../etc/passwd'],['/etc/passwd'],['https://example.com'],['..\\secret'],['../../../docs/configuration.md','../foreign/SKILL.md'],['../../etc/passwd','docs/configuration.md']]){
+    const calls=f.host.harness.sdk.callsTo('terminals.create').length;
+    const result=await request(reference,source);assert.equal(result.exitCode,1);
+    assert.equal(f.host.harness.sdk.callsTo('terminals.create').length,calls,'escaping/invalid paths refuse before host execution');
+  }
+  const target=join(home,'docs/agent-control.md'),original=readFileSync(target);
+  rmSync(target);symlinkSync(join(home,'docs/configuration.md'),target);
+  let result=await request('../../../docs/agent-control.md');assert.equal(result.exitCode,1);assert.match(result.stderr,/symlinked/);
+  rmSync(target);writeFileSync(target,Buffer.concat([original,Buffer.from('\nChanged target\n')]));
+  result=await request('../../../docs/agent-control.md');assert.equal(result.exitCode,1);assert.match(result.stderr,/differ from selected Git snapshot/);
+  writeFileSync(target,original);
+  const base=join(home,'.agents/skills/stuck-crewmate-recovery/SKILL.md'),source=readFileSync(base);
+  writeFileSync(base,Buffer.concat([source,Buffer.from('\nChanged source\n')]));
+  result=await request('../../../docs/agent-control.md');assert.equal(result.exitCode,1);assert.match(result.stderr,/differ from selected Git snapshot/);
+  rmSync(base);symlinkSync(join(home,'.agents/skills/ship-landing/SKILL.md'),base);
+  result=await request('../../../docs/agent-control.md');assert.equal(result.exitCode,1);assert.match(result.stderr,/symlinked/);
+  rmSync(base);writeFileSync(base,source);
+  f.host.harness.sdk.stub('files.read',async({path})=>({content:readFileSync(path,'utf8').slice(0,-1),sizeBytes:readFileSync(path).length}));
+  result=await request('../../../docs/agent-control.md');assert.equal(result.exitCode,1);assert.match(result.stderr,/truncated during file transfer/);
+  assert.equal(f.host.harness.sdk.callsTo('threads.spawn').length,0);assert.equal(f.host.harness.sdk.callsTo('threads.send').length,0);
+ }finally{await f.host.harness.lifecycle.dispose();rmSync(home,{recursive:true,force:true});}
+});
+
+test('policy staging failure never reads a target or claims completed trigger inventory',async()=>{
+ const home=fixture(),f=await hostFor(home);try{
+  f.host.harness.sdk.stub('terminals.create',async()=>{throw new Error('INJECTED_POLICY_STAGE_FAILURE');});
+  let result=await f.host.harness.behavior.runCli(['skill','ship-landing'],ctx);
+  assert.equal(result.exitCode,1);assert.match(result.stderr,/INJECTED_POLICY_STAGE_FAILURE/);
+  assert.equal(f.host.harness.sdk.callsTo('files.read').length,0,'target transfer requires successful verification');
+  result=await f.host.harness.behavior.runCli(['contract'],ctx);
+  assert.equal(result.exitCode,1);assert.match(result.stderr,/INJECTED_POLICY_STAGE_FAILURE/);assert.ok(!result.stdout.includes('read is now complete'));
+  assert.equal(f.host.harness.sdk.callsTo('threads.spawn').length,0);assert.equal(f.host.harness.sdk.callsTo('threads.send').length,0);
  }finally{await f.host.harness.lifecycle.dispose();rmSync(home,{recursive:true,force:true});}
 });
 

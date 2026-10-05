@@ -6,7 +6,9 @@ BB is the active Firstmate transport. A crew is a child BB thread, and an isolat
 
 ## Selected policy and intake
 
-Read native skills with `firstmate_skill` or `bb firstmate skill <name> [relative-reference]`; read their relative references through the same operation. These reads use the selected runtime, not globally copied policy skills. Unknown revisions or modified native bytes refuse without implicit upgrade. Native source owns delegation, reporting, review, completion and authority.
+The required complete `firstmate_contract` / `bb firstmate contract` read also loads the selected runtime's complete skill trigger catalog as verbatim native frontmatter; it loads no skill bodies and does not invoke the maintenance-only trigger-index skill. Repeat this complete read after compaction if the contract or trigger catalog is no longer in context.
+
+Read native skills with `firstmate_skill` or `bb firstmate skill <name> [relative-reference]`; read their relative references through the same operation. Links resolve from the skill entry file by default, including `..` and `#fragment` inside the runtime; for a nested file, pass `source=<exact selected-root relative source file>` or CLI `--source`, using the path printed by the previous read. The complete linked document is returned with its fragment identified, without heading-only truncation. These reads use the selected runtime, not globally copied policy skills. Unknown revisions or modified native bytes refuse without implicit upgrade. Native source owns delegation, reporting, review, completion and authority.
 
 Use `bb firstmate dispatch --help`, `bb firstmate queue --help` and `bb firstmate help` for the registered options. Read `firstmate_posture` / `bb firstmate posture --json` for native registry context, explicit BB posture and approval provenance before mode/authority intake. Native registry is context; apply the native precedence for current user/project instructions. Existing approved standing yolo needs no fresh merge request, actual user holds still apply, and unexplained legacy flags remain unverified until resolved from recorded approval.
 

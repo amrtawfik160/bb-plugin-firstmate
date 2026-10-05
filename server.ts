@@ -1393,13 +1393,13 @@ const CAPTAIN_TOOLS = [
   "firstmate_fm",
 ] as const;
 
-const CAPTAIN_CONTRACT_POINTER = "Before orchestrating, call firstmate_deck (ACP/CLI: bb firstmate deck --json) to bind this thread's native home, then read firstmate_contract without a section (bb firstmate contract) for the complete native supervisor contract. If the startup digest is absent, run deck's exact command through your agent shell; firstmate_fm script=session-start returns it again. Failed prerequisites, lock refusal or a truncated digest remain unresolved.";
+const CAPTAIN_CONTRACT_POINTER = "Before orchestrating, call firstmate_deck (ACP/CLI: bb firstmate deck --json) to bind this thread's native home, then read firstmate_contract without a section (bb firstmate contract) for the complete native supervisor contract and its selected-runtime skill trigger catalog. If the startup digest is absent, run deck's exact command through your agent shell; firstmate_fm script=session-start returns it again. Failed prerequisites, lock refusal or a truncated digest remain unresolved.";
 
 const BB_SKILL_RUNTIME_CONTRACT = [
   "BB adapter for every upstream firstmate skill:",
   "The complete native supervisor contract and imported upstream skills own policy; the following mappings only adapt execution to BB.",
   "Translate bin/fm-<name>.sh calls to firstmate_fm with script=<name> and the same arguments; use bb firstmate fm <name> only when a shell command is required.",
-  "Load native policy skills and their references with firstmate_skill (bb firstmate skill <name> [reference]); it reads this captain’s selected runtime. Native AGENTS.md means firstmate_contract; bin and docs mean the selected runtime, while data, state and config mean the exact bound captain home returned by deck.",
+  "Load native policy skills and their references with firstmate_skill (bb firstmate skill <name> [reference] [--source <selected-root source-file>]); it reads this captain’s selected runtime. Native AGENTS.md means firstmate_contract; bin and docs mean the selected runtime, while data, state and config mean the exact bound captain home returned by deck.",
   "Map workers, panes, and tabs to BB crew threads via firstmate_dispatch/tell/interrupt/retry/stop. Call firstmate_watch once per batch; it hands off to private durable wakes. End the turn; never retry or poll.",
   "Use BB interactions for captain questions and approvals. firstmate_deliveries retains open PRs after worker retirement and wake acknowledgement. Continue authorized review/fix/merge work using the author for fixes and preserving the agreed native review and validation path, including independent review when required; merge through firstmate_merge. Inspect unresolved delivery records after compaction or handoff.",
   "Run firstmate_toolchain for native dependency detection. For browser work use the /browser skill and browser_script (or bb browser script), with profileId unset for the thread-isolated default. This replaces native chrome-devtools-axi transport. Read config/lavish-axi-host for remote Lavish access and use bb connect expose for a board the captain should see.",
@@ -9209,7 +9209,7 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb firstmate fm [--timeout s] <script> [args...]   # real bin/fm-<script>.sh with FM_BACKEND=bb",
     "  bb firstmate deck [--digest|--all] [--json] | session [--json]",
     "  bb firstmate contract [section,...] [--json] # complete native policy",
-    "  bb firstmate skill <name> [relative-reference] [--json] # exact selected native policy",
+    "  bb firstmate skill <name> [relative-reference] [--source <selected-root source-file>] [--json] # complete selected native policy",
     "  bb firstmate runtime status|install|select|migrate|rollback [exact-release|external] [--check] [--json]",
     dispatchHelp,
     "  bb firstmate launches list [--limit n] [--offset n] [--json]   # uncertain slots require reconciliation",
@@ -9311,10 +9311,10 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function readCaptainContract(ctx: unknown, section?: string) {
     const current = await settings.get();
-    if (current.fullParityOnDeck && homeScope.getStore()?.captain && !homeScope.getStore()?.home) return toolError("No bound captain home. Call firstmate_deck or bb firstmate deck before reading the native contract; shared-home fallback refused.");
+    if (!homeScope.getStore()?.captain || !homeScope.getStore()?.home) return toolError("No bound captain home. Call firstmate_deck or bb firstmate deck before reading the native contract; shared-home fallback refused.");
     if (current.fmHome.trim() === "") return toolError("Initialize real Firstmate with firstmate_deck first.");
     const callerSignal = asRecord(ctx)["signal"] as AbortSignal | undefined;
-    const signal = AbortSignal.any([launchAbort.signal, ...(callerSignal ? [callerSignal] : [])]);
+    const signal = AbortSignal.any([launchAbort.signal, AbortSignal.timeout(30_000), ...(callerSignal ? [callerSignal] : [])]);
     const hostId = current.fmHostId.trim() || await raceAbort(resolveHostId(undefined, ctx), signal, STUCK_HOST_CALL_MS);
     const contractCaptain=ctxString(ctx,"threadId");
     if(contractCaptain && await bb.storage.kv.get(`runtime-selection-pending:${contractCaptain}`)) {
@@ -9340,11 +9340,26 @@ export default async function plugin(bb: BbPluginApi) {
     const done = picked.complete
       ? "The firstmate_contract read is now complete."
       : "This firstmate_contract read covers the listed sections; read any other section by name before acting in its area.";
-    return `${picked.text}\n\n## BB runtime adaptations\n${BB_SKILL_RUNTIME_CONTRACT}\n${done} Treat native policy refusals as refusals. Read durable reports with firstmate_wake; pass handledWake on the final successful action after handling the whole batch.\n`;
+    const catalog=await nativePolicyLookup(hostId,path.slice(0,-'/AGENTS.md'.length),{operation:'catalog'},signal);
+    if (catalog.contractSha256!==createHash('sha256').update(content).digest('hex')) throw new Error('Native contract changed during selected-runtime trigger read; complete contract/catalog read remains unresolved.');
+    const triggers=`## Selected native skill trigger catalog @ ${catalog.commit}\n${catalog.root}\n\n${catalog.entries!.map(entry=>`### ${entry.path}\nNative file SHA-256: ${entry.sha256}\n\n\`\`\`yaml\n${entry.frontmatter}\n\`\`\``).join('\n\n')}`;
+    return `${picked.text}\n\n${triggers}\n\n## BB runtime adaptations\n${BB_SKILL_RUNTIME_CONTRACT}\n${done} Treat native policy refusals as refusals. Read durable reports with firstmate_wake; pass handledWake on the final successful action after handling the whole batch.\n`;
   }
 
-  async function readNativeSkill(ctx:unknown,name:string,reference?:string) {
-    const signal=AbortSignal.any([launchAbort.signal,...(asRecord(ctx)["signal"]?[asRecord(ctx)["signal"] as AbortSignal]:[])]);
+  async function nativePolicyLookup(host:string,root:string,request:Record<string,unknown>,signal:AbortSignal) {
+    const helper=`/tmp/.fm-policy-${randomUUID()}.py`;
+    const distribution=JSON.parse(readFileSync(join(PLUGIN_ROOT,"runtime-assets/distribution.json"),"utf8"));
+    try {
+      if (!await writeHostBytes(host,helper,nativePolicyReadPython,STUCK_HOST_CALL_MS,signal,true)) throw new Error('Failed to stage selected native policy reader; no policy read executed.');
+      const result=await runStructuredOnHost(host,`python3 ${shQuote(helper)} ${shQuote(root)} ${shQuote(JSON.stringify(request))} ${shQuote(JSON.stringify(AUDITED_POLICY_COMMITS))} ${shQuote(distribution.snapshotCommit)}`,30_000,signal);
+      if (result.exitCode!==0) throw new Error(`Selected native policy read refused: ${result.stderr || result.output || `exit ${result.exitCode}`}`);
+      return JSON.parse(result.output) as {commit:string;root:string;path?:string;fragment?:string;sha256?:string;sizeBytes?:number;contractSha256?:string;entries?:Array<{path:string;sha256:string;frontmatter:string}>};
+    } finally {await runHostCommand(host,`rm -f ${shQuote(helper)}`,1000).catch(()=>{});}
+  }
+
+  async function readNativeSkill(ctx:unknown,name:string,reference?:string,source?:string) {
+    const resource=nativeSkillPath(name,reference,source);
+    const signal=AbortSignal.any([launchAbort.signal,AbortSignal.timeout(30_000),...(asRecord(ctx)["signal"]?[asRecord(ctx)["signal"] as AbortSignal]:[])]);
     const current=await raceAbort(settings.get(),signal,STUCK_HOST_CALL_MS),captain=ctxString(ctx,"threadId");
     if (!captain || !homeScope.getStore()?.home) throw new Error("Bind this captain with firstmate_deck before native policy reads; no global policy fallback.");
     const host=await raceAbort(resolveHostId(undefined,ctx),signal,STUCK_HOST_CALL_MS);
@@ -9354,12 +9369,12 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const selection=await raceAbort(bb.storage.kv.get<{root:string}>(`native-runtime:${captain}`),signal,STUCK_HOST_CALL_MS);
     const root=selection?.root??current.fmHome;
-    const distribution=JSON.parse(readFileSync(join(PLUGIN_ROOT,"runtime-assets/distribution.json"),"utf8"));
-    const relative=nativeSkillPath(name,reference);
-    const result=await runStructuredOnHost(host,`python3 -c ${shQuote(nativePolicyReadPython)} ${shQuote(root)} ${shQuote(relative)} ${shQuote(JSON.stringify(AUDITED_POLICY_COMMITS))} ${shQuote(distribution.snapshotCommit)}`,30_000,signal);
-    if (result.exitCode!==0) throw new Error(`Selected native policy read refused: ${result.stderr || result.output || `exit ${result.exitCode}`}`);
-    const record=JSON.parse(result.output) as {commit:string;root:string;path:string;text:string};
-    return `Native policy @ ${record.commit}: ${record.root}/${record.path}\n\n${record.text}`;
+    const record=await nativePolicyLookup(host,root,{operation:'read',...resource},signal);
+    const file=await raceAbort(bb.sdk.files.read({hostId:host,path:`${root}/${resource.path}`}),signal,STUCK_HOST_CALL_MS);
+    if (!('content' in file)) throw new Error('Complete native policy file content unavailable');
+    const data=Buffer.from(file.content,file.contentEncoding==='base64'?'base64':'utf8');
+    if (data.length!==record.sizeBytes || createHash('sha256').update(data).digest('hex')!==record.sha256) throw new Error('Native policy changed or was truncated during file transfer; read remains unresolved');
+    return `Native policy @ ${record.commit}: ${record.root}/${record.path}${record.fragment?'#'+record.fragment:''}\nSource file (--source): ${record.path}\n\n${data.toString('utf8')}`;
   }
 
   async function checkToolchain(hostId: string, fmHome: string, signal?: AbortSignal) {
@@ -9401,7 +9416,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_contract",
-    description: "Read the current native Firstmate supervisor contract and the BB runtime adaptations. Without section: the complete upstream contract verbatim. section=<number or title, comma-separated> reads those sections; section=\"all\" reads everything. Read before orchestrating and after an upstream update.",
+    description: "Read the current native Firstmate supervisor contract, complete selected-runtime skill trigger catalog and BB runtime adaptations. Without section: the complete upstream contract verbatim. section=<number or title, comma-separated> reads those sections; section=\"all\" reads everything. Read before orchestrating and after an upstream update.",
     parameters: z.object({
       section: z.string().max(200).optional().describe('Contract section(s) by number or title, comma-separated (e.g. "7,8"), or "all".'),
     }),
@@ -9412,8 +9427,8 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name:"firstmate_skill",description:"Read a complete native policy skill or reference from this captain’s selected runtime; both audited revisions supported, no global copied policy fallback.",
-    parameters:z.object({name:z.string(),reference:z.string().optional().describe("Relative resource within that native skill; default SKILL.md")}),
-    async execute({name,reference},ctx){return readNativeSkill(ctx,name,reference);},
+    parameters:z.object({name:z.string(),reference:z.string().optional().describe("Native relative link, including .. and #fragment inside selected runtime; returns complete document"),source:z.string().optional().describe("Exact selected-root relative source file for nested links; default .agents/skills/<name>/SKILL.md")}),
+    async execute({name,reference,source},ctx){return readNativeSkill(ctx,name,reference,source);},
   });
   registerCaptainTool({
     name: "firstmate_dispatch",
@@ -10934,7 +10949,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "fm", summary: "Run a real firstmate bin/ script with FM_BACKEND=bb", usage: "bb firstmate fm [--timeout s] <script> [args...]" },
       { name: "deck", summary: "Bind native home and return agent-shell startup (not ready until native digest)", usage: "bb firstmate deck [--digest|--all] [--json]" },
       { name: "session", summary: "Session digest: memory + bearings + afk", usage: "bb firstmate session [--json]" },
-      { name:"skill", summary:"Read selected native policy without mixing runtime versions", usage:"bb firstmate skill <name> [relative-reference] [--json]" },
+      { name:"skill", summary:"Read selected native policy without mixing runtime versions", usage:"bb firstmate skill <name> [relative-reference] [--source <selected-root source-file>] [--json]" },
       { name: "dispatch", summary: "Dispatch crewmate child threads", usage: dispatchHelp },
       { name: "crews", summary: "List recorded crews with live status", usage: "bb firstmate crews [--json]" },
       { name: "crew", summary: "Show one crew with last output", usage: "bb firstmate crew <crew-id> [--json]" },
@@ -11037,8 +11052,8 @@ export default async function plugin(bb: BbPluginApi) {
             return reply({ guide: text }, text);
           }
           case "skill": {
-            if (!rest[0]) return fail("Use bb firstmate skill <native-name> [relative-reference]. Bind with bb firstmate deck first.");
-            const text=await readNativeSkill(ctx,rest[0],rest[1]);return reply({text},text);
+            if (!rest[0]) return fail("Use bb firstmate skill <native-name> [relative-reference] [--source <selected-root source-file>]. Bind with bb firstmate deck first.");
+            const text=await readNativeSkill(ctx,rest[0],rest[1],flagStr(flags,'source'));return reply({text},text);
           }
           case "contract": {
             // The operator CLI reads the whole contract unless a section is named.

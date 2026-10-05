@@ -7384,6 +7384,13 @@ test("native captain contract tool returns the entire source beyond the SDK inst
   await host.bb.storage.kv.set("native-home-host:thr_cap", "host_1");
   try {
     const content = "# Firstmate\n" + "supervision policy\n".repeat(5000) + "END_OF_NATIVE_CONTRACT";
+    // This unit isolates the complete SDK transport; real dual-pin tests verify
+    // catalog production from tracked native bytes through the staged helper.
+    stubRoutedHost(host, command => ({payload: command.includes('FM_HOST_CAPTURE_V1') ? JSON.stringify({
+      commit:'1f3e769616fdf9f31f85f4c3e6a9f71606634238',root:'/tmp/fm-home',
+      contractSha256:createHash('sha256').update(content).digest('hex'),
+      entries:[{path:'.agents/skills/fixture/SKILL.md',sha256:'fixture',frontmatter:'name: fixture\ndescription: A fixture trigger'}],
+    }) : ''}));
     host.harness.sdk.stub("files.read", async () => ({
       content, contentEncoding: "utf8", sizeBytes: Buffer.byteLength(content), path: "/tmp/fm-home/AGENTS.md", sha256: "fixture",
     }));
@@ -7395,6 +7402,7 @@ test("native captain contract tool returns the entire source beyond the SDK inst
     assert.equal(typeof result, "string");
     assert.ok((result as string).startsWith(content), "full native text must survive transport and instruction budgets");
     assert.match(result as string, /BB runtime adaptations/);
+    assert.match(result as string, /description: A fixture trigger/);
   } finally { await host.harness.lifecycle.dispose(); }
 });
 
