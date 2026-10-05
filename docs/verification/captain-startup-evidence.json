@@ -1,0 +1,58 @@
+{
+  "date": "2026-10-04",
+  "scope": "Owned disposable native homes beneath the actual implementation agent harness; no production operation or model launch.",
+  "fixtures": [
+    {
+      "home": "/tmp/fm-prompt-fixture-pBDUod",
+      "pin": "2d833ff147cd26a5c461e914e06854e0eb2707ce",
+      "command": "cd '/tmp/fm-prompt-fixture-pBDUod' && FM_HOME='/tmp/fm-prompt-fixture-pBDUod' FM_ROOT_OVERRIDE='/tmp/fm-prompt-fixture-pBDUod' FM_BACKEND=bb '/tmp/fm-prompt-fixture-pBDUod/bin-bb/fm-session-start.sh'",
+      "exit": 0,
+      "elapsedMs": 5705,
+      "nativeLock": "lock acquired: harness pid 3053072",
+      "completeSections": [
+        "BOOTSTRAP",
+        "WAKE QUEUE",
+        "NEXT STEP"
+      ],
+      "workerCommands": [],
+      "outputSha256": "d6cd9040a9b8254655ba160df3c51ead3fed978e9623e887e43789042c396b22",
+      "fixtureRemoved": true
+    },
+    {
+      "home": "/tmp/fm-prompt-fixture-5gUPkQ",
+      "pin": "1f3e769616fdf9f31f85f4c3e6a9f71606634238",
+      "command": "cd '/tmp/fm-prompt-fixture-5gUPkQ' && FM_HOME='/tmp/fm-prompt-fixture-5gUPkQ' FM_ROOT_OVERRIDE='/tmp/fm-prompt-fixture-5gUPkQ' FM_BACKEND=bb '/tmp/fm-prompt-fixture-5gUPkQ/bin-bb/fm-session-start.sh'",
+      "exit": 0,
+      "elapsedMs": 6341,
+      "nativeLock": "lock acquired: harness pid 3053072",
+      "completeSections": [
+        "BOOTSTRAP",
+        "WAKE QUEUE",
+        "NEXT STEP"
+      ],
+      "workerCommands": [],
+      "outputSha256": "aa2081f3e74744f45be930c46a704e61aa0efcfea62fd7fed8c2a7154f066ebb",
+      "fixtureRemoved": true
+    }
+  ],
+  "fullSuite": {
+    "tests": 766,
+    "pass": 766,
+    "fail": 0,
+    "skipped": 0,
+    "elapsedMs": 160334.895188,
+    "testFileConcurrency": 1,
+    "log": "/tmp/fm-captain-full-final.log"
+  },
+  "causalMutations": [
+    "KILLED bare deck scans fleet before returning",
+    "KILLED watcher registration precedes home binding",
+    "KILLED bound startup falls back to shared source home",
+    "KILLED native read-only dependency probe is unbounded",
+    "KILLED native feature help loses stderr",
+    "KILLED bound adapter reinstalled on every deck",
+    "KILLED mandatory contract read awaits a hung SDK without cancellation",
+    "Source checkout untouched; all mutation copies restored."
+  ],
+  "rawProofDirectory": "/tmp/fm-captain-startup-proof"
+}

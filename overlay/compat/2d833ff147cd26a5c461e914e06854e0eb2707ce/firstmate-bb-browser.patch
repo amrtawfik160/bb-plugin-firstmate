@@ -1,0 +1,113 @@
+diff --git a/bin/fm-bootstrap.sh b/bin/fm-bootstrap.sh
+--- a/bin/fm-bootstrap.sh
++++ b/bin/fm-bootstrap.sh
+@@ -827,6 +827,11 @@
+ # no verified dependency set is reported before the universal checks continue.
+ COMMON_TOOLS="node git gh no-mistakes gh-axi chrome-devtools-axi tasks-axi quota-axi"
+ BACKEND=$(fm_backend_name)
++# BB-ONLY: browser transport and bounded dependency reads; native floors stay intact.
++if [ "$BACKEND" = bb ]; then
++  COMMON_TOOLS=${COMMON_TOOLS//chrome-devtools-axi/}
++  . "$SCRIPT_DIR/fm-bb-probe-lib.sh"
++fi
+ BACKEND_VALID=1
+ if ! BACKEND_TOOLS=$(fm_backend_required_tools "$BACKEND"); then
+   BACKEND_VALID=0
+@@ -856,7 +861,11 @@
+   local tool=$1 min=$2 output parts major minor patch extra
+   local min_major min_minor min_patch min_extra
+   command -v "$tool" >/dev/null 2>&1 || return 1
++  if [ "$BACKEND" = bb ]; then
++    output=$(fm_bb_read_probe "$tool" --version) || return 1
++  else
+   output=$("$tool" --version 2>/dev/null) || return 1
++  fi
+   parts=$(printf '%s\n' "$output" | sed -nE 's/.*[vV]?([0-9]+)\.([0-9]+)\.([0-9]+).*/\1 \2 \3/p' | head -n 1)
+   IFS=' ' read -r major minor patch extra <<< "$parts"
+   [ -n "$major" ] && [ -n "$minor" ] && [ -n "$patch" ] && [ -z "$extra" ] || return 1
+@@ -1436,7 +1445,7 @@
+   # verified owner rather than a bare `command -v`, so a home that merely has
+   # some unrelated executable named `agent` on PATH is still reported missing
+   # instead of failing at the first spawn.
+-  if [ "$crew" = cursor ] && ! fm_cursor_resolve_binary >/dev/null 2>&1; then
++  if [ "$BACKEND" != bb ] && [ "$crew" = cursor ] && ! fm_cursor_resolve_binary >/dev/null 2>&1; then
+     echo "MISSING_MANUAL: cursor-agent (instructions: $(manual_install_url cursor-agent))"
+   fi
+   crew_dispatch_validate
+diff --git a/bin/fm-tasks-axi-lib.sh b/bin/fm-tasks-axi-lib.sh
+--- a/bin/fm-tasks-axi-lib.sh
++++ b/bin/fm-tasks-axi-lib.sh
+@@ -51,10 +51,19 @@
+   *) FM_TASKS_AXI_COMPATIBLE_MEMO= ;;
+ esac
+ 
++# BB-ONLY: native read probes use the shared native timeout runner.
++if [ "${FM_BACKEND:-}" = bb ]; then
++  . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fm-bb-probe-lib.sh"
++fi
++
+ fm_tasks_axi_version_parts() {
+   local output
+   command -v tasks-axi >/dev/null 2>&1 || return 1
+-  output=$(tasks-axi --version 2>/dev/null) || return 1
++  if [ "${FM_BACKEND:-}" = bb ]; then
++    output=$(fm_bb_read_probe tasks-axi --version) || return 1
++  else
++    output=$(tasks-axi --version 2>/dev/null) || return 1
++  fi
+   printf '%s\n' "$output" |
+     sed -n 's/.*\([0-9][0-9]*\)\.\([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2 \3/p' |
+     head -1
+@@ -96,14 +105,22 @@
+ fm_tasks_axi_update_has_archive_body() {
+   local output
+   command -v tasks-axi >/dev/null 2>&1 || return 1
+-  output=$(tasks-axi update --help 2>&1) || return 1
++  if [ "${FM_BACKEND:-}" = bb ]; then
++    output=$(fm_bb_read_probe --include-stderr tasks-axi update --help) || return 1
++  else
++    output=$(tasks-axi update --help 2>&1) || return 1
++  fi
+   printf '%s\n' "$output" | grep -F -- '--archive-body' >/dev/null
+ }
+ 
+ fm_tasks_axi_mv_has_multi_id() {
+   local output
+   command -v tasks-axi >/dev/null 2>&1 || return 1
+-  output=$(tasks-axi mv --help 2>&1) || return 1
++  if [ "${FM_BACKEND:-}" = bb ]; then
++    output=$(fm_bb_read_probe --include-stderr tasks-axi mv --help) || return 1
++  else
++    output=$(tasks-axi mv --help 2>&1) || return 1
++  fi
+   printf '%s\n' "$output" | grep -F -- '[<id>...]' >/dev/null
+ }
+ 
+diff --git a/bin/fm-quota-axi-lib.sh b/bin/fm-quota-axi-lib.sh
+--- a/bin/fm-quota-axi-lib.sh
++++ b/bin/fm-quota-axi-lib.sh
+@@ -44,6 +44,11 @@
+     end;
+ '
+ 
++# BB-ONLY: native read probes use the shared native timeout runner.
++if [ "${FM_BACKEND:-}" = bb ]; then
++  . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fm-bb-probe-lib.sh"
++fi
++
+ fm_quota_axi_compatible() {
+   local timeout=${1:-} output parts major minor patch extra
+   local min_major min_minor min_patch min_extra
+@@ -55,7 +60,11 @@
+     [ "$(type -t fm_run_timed)" = function ] || return 1
+     output=$(fm_run_timed "$timeout" quota-axi --version 2>/dev/null </dev/null) || return 1
+   else
+-    output=$(quota-axi --version 2>/dev/null </dev/null) || return 1
++    if [ "${FM_BACKEND:-}" = bb ]; then
++      output=$(fm_bb_read_probe quota-axi --version) || return 1
++    else
++      output=$(quota-axi --version 2>/dev/null </dev/null) || return 1
++    fi
+   fi
+   parts=$(printf '%s\n' "$output" |
+     sed -n 's/.*\([0-9][0-9]*\)\.\([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2 \3/p' |

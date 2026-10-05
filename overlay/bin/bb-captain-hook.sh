@@ -21,20 +21,22 @@ case "$thread" in *[!A-Za-z0-9_-]*) exit 0 ;; esac
 marker="${HOME}/.bb-firstmate/captains/${thread}"
 [ -f "$marker" ] || exit 0
 home=$(sed -n 's/^home=//p' "$marker" 2>/dev/null | head -n 1)
+root=$(sed -n 's/^root=//p' "$marker" 2>/dev/null | head -n 1)
+root=${root:-$home}
 state=$(sed -n 's/^state=//p' "$marker" 2>/dev/null | head -n 1)
 [ -n "$home" ] && [ -n "$state" ] || {
   printf 'firstmate: invalid captain marker thread=%s path=%s\n' "$thread" "$marker" >&2; exit 1;
 }
 run_native() {
   local leaf=$1; shift
-  local run="$home/bin-bb/$leaf"
+  local run="$root/bin-bb/$leaf"
   [ -x "$run" ] || {
     printf 'firstmate: captain=%s missing executable %s\n' "$thread" "$run" >&2; return 1;
   }
   cd "$home" 2>/dev/null || {
     printf 'firstmate: captain=%s cannot enter home %s\n' "$thread" "$home" >&2; return 1;
   }
-  printf '%s' "$payload" | FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_STATE_OVERRIDE="$state" FM_BACKEND=bb FM_SUPERVISION_MODEL=autoarm "$run" "$@"
+  printf '%s' "$payload" | FM_HOME="$home" FM_ROOT_OVERRIDE="$root" FM_STATE_OVERRIDE="$state" FM_BACKEND=bb FM_SUPERVISION_MODEL=autoarm "$run" "$@"
 }
 
 bb_keeper_healthy() {

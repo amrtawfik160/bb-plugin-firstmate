@@ -1,0 +1,11 @@
+✔ bb crew launch prompt preserves the brief with only BB transport adaptations (855.6757ms)
+✔ IT native local merge respects captain hold and lands BB-named branch (10068.401615ms)
+✔ IT BB secondmate launch keeps captain role and seeded home; stop failures propagate (239.893761ms)
+ℹ tests 3
+ℹ suites 0
+ℹ pass 3
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 11507.662729

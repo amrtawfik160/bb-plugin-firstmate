@@ -1,5 +1,7 @@
+import {replacementFixture} from './lib/replacement.fixture.mjs';
+import { fixture as nativePromptFixture,scaffold as nativePromptScaffold } from './scripts/prompt-fixture.mjs';
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
 import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -11,14 +13,16 @@ import {
   makePluginAgentConfigurationContext,
   makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
+import {createQueueStore} from "./lib/queue-store.ts";
+async function durableQueue(host: ReturnType<typeof createFakePluginHost>) { const queue=createQueueStore(host.bb.storage.database(),()=>host.bb.storage.kv.get("queue"));await queue.ready();return queue.list(); }
 import plugin, {
+  OVERLAY_INSTALL_INPUTS,
   backlogTitleOf,
   briefSections,
   sanitizeFmArgs,
   captainHookInstallScript,
   captainHookCommand,
   captainStartupCommand,
-  nativeWorkerTransport,
   crewPingHoldDecision,
   doorbellSupersededByBbPing,
   staleLineRelayDecision,
@@ -53,7 +57,41 @@ import { LEFTOVER_TIMER_CONTRACT, WAITING_PROTOCOL, latestStatus, statusProtocol
 import { UPSTREAM_SCRIPT_NAMES, PINNED_SCRIPT_SUPPORT_FILES, UPSTREAM_SKILL_NAMES } from "./lib/upstream-surface.ts";
 import { FIRSTMATE_ROUTINE_MARKER } from "./lib/timeline-noise.ts";
 
-const SKILLS = ["captain", "firstmate", "calm", "catch-up", ...UPSTREAM_SKILL_NAMES] as const;
+const CAPTAIN_TEST_SKILLS = ["captain", "firstmate", "calm", "catch-up", "captain-methods", ...UPSTREAM_SKILL_NAMES] as const;
+const SKILLS = [...CAPTAIN_TEST_SKILLS, "worker-methods"] as const;
+
+// No fixture sends bytes on the host shell's stdin; native input is explicitly
+// staged/redirection-owned by the command. Node's default socket-backed stdin
+// makes a top-level `bash -c` source HOME/.bashrc (remote-shell detection), which
+// can replace our fake PATH with the real BB CLI in a shell-less service.
+function fixtureShell(command: string, options: SpawnSyncOptionsWithStringEncoding) {
+  return spawnSync("bash", ["-c", command], { ...options, stdio: ["ignore", "pipe", "pipe"] });
+}
+
+test("closed-stdin BB fixtures preserve fake PATH when a service has no shell level", () => {
+  const home = mkdtempSync(join(tmpdir(), "fm-fixture-shell-"));
+  try {
+    const fakebin = join(home, "fakebin"), startupbin = join(home, "startupbin");
+    mkdirSync(fakebin); mkdirSync(startupbin);
+    writeFileSync(join(fakebin, "bb"), "#!/bin/sh\nprintf 'FIXTURE_BB\\n'\n", { mode: 0o755 });
+    writeFileSync(join(startupbin, "bb"), "#!/bin/sh\nprintf 'STARTUP_PATH_BB\\n'\nexit 97\n", { mode: 0o755 });
+    writeFileSync(join(home, ".bashrc"), `export PATH='${startupbin}':"$PATH"\n`);
+    const env = { ...process.env, HOME: home, PATH: `${fakebin}:/usr/bin:/bin` };
+    for (const key of ["SHLVL", "BASH_ENV", "ENV", "BB_CLI", "SSH_CLIENT", "SSH_CONNECTION"]) delete env[key];
+    // Reproduce the old escape safely: both executables are disposable stubs.
+    const escaped = spawnSync("bash", ["-c", "bb fixture-status"], { env, encoding: "utf8" });
+    assert.equal(escaped.status, 97, escaped.stderr);
+    assert.equal(escaped.stdout, "STARTUP_PATH_BB\n");
+    const isolated = fixtureShell("bb fixture-status", { env, encoding: "utf8" });
+    assert.equal(isolated.status, 0, isolated.stderr);
+    assert.equal(isolated.stdout, "FIXTURE_BB\n");
+    // Explicit native stdin redirection remains available despite closed stdin.
+    writeFileSync(join(home, "input"), "staged input\n");
+    const input = fixtureShell('cat < "$HOME/input"', { env, encoding: "utf8" });
+    assert.equal(input.status, 0, input.stderr);
+    assert.equal(input.stdout, "staged input\n");
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
 
 function wakeFrame(report: string): string {
   return "FM_BB_RECEIPT=" + JSON.stringify({ id: "fixture", phase: "ready", report, path: "/tmp/report.txt", replayed: false, truncated: false });
@@ -89,22 +127,10 @@ test("crews get no dispatch tools", async () => {
       makePluginAgentConfigurationContext({ pluginMetadata: { crew: "true" } }),
     );
     assert.deepEqual(cfg.tools.map((t) => t.name), []);
-    assert.deepEqual(cfg.skills, []);
+    assert.deepEqual(cfg.skills, ["worker-methods"]);
     assert.match(cfg.instructions ?? "", /native launch brief/);
-    assert.match(cfg.instructions ?? "", /systemd-run --unit=/);
-    assert.match(cfg.instructions ?? "", /data\/<task-id>\//);
-    assert.match(cfg.instructions ?? "", /use gh api REST/);
-    assert.match(cfg.instructions ?? "", /fm-inbox-take\.sh/);
-    assert.match(cfg.instructions ?? "", /\/browser skill and browser_script/);
-    assert.match(cfg.instructions ?? "", /profileId unset/);
-    assert.doesNotMatch(cfg.instructions ?? "", /chrome-devtools-axi for browser|CHROME_DEVTOOLS_AXI_SESSION/);
-    assert.match(cfg.instructions ?? "", /lavish-axi/);
-    assert.doesNotMatch(cfg.instructions ?? "", /a manual checklist is not a substitute|Never poll CI/);
-    assert.doesNotMatch(cfg.instructions ?? "", /WAITING:|scheduled resume|stop every timer/);
-
-    // Crews must run the BB-capable mirror, not native bin/ (no bb backend there).
-    assert.match(cfg.instructions ?? "", /bin-bb\/fm-procevent-lavish\.sh/);
-    assert.doesNotMatch(cfg.instructions ?? "", /home's bin\/fm-tasks-axi\.sh/);
+    assert.match(cfg.instructions ?? "", /exact-ID steering inbox/);
+    assert.doesNotMatch(cfg.instructions ?? "", /browser_script|systemd-run|data\/<task-id>\//, "rendered launch brief is the single policy owner");
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -118,11 +144,8 @@ test("unmarked threads still get firstmate_deck so /captain can take the deck", 
     );
     const names = cfg.tools.map((t) => t.name);
     assert.ok(names.includes("firstmate_deck"));
-    assert.ok(names.includes("firstmate_dispatch"));
-    assert.ok(names.includes("firstmate_interrupt"));
-    assert.ok(names.includes("firstmate_queue"));
-    assert.ok(names.includes("firstmate_fm"));
-    assert.deepEqual(cfg.skills, ["firstmate"]);
+    assert.deepEqual(names.sort(), ["firstmate_contract", "firstmate_deck"]);
+    assert.deepEqual(cfg.skills, ["firstmate", "captain", "calm", "catch-up", "harness-adapters"]);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -136,7 +159,7 @@ test("captain metadata loads the full skill set", async () => {
     );
     assert.ok(cfg.skills.includes("captain"));
     assert.ok(cfg.skills.includes("afk"));
-    assert.deepEqual([...cfg.skills].sort(), [...SKILLS].sort(), "captain must receive every bundled upstream skill");
+    assert.deepEqual([...cfg.skills].sort(), [...CAPTAIN_TEST_SKILLS].sort(), "captain must receive every bundled upstream skill and its role methods");
     assert.ok(cfg.tools.some((tool) => tool.name === "firstmate_wake"));
     assert.ok(cfg.tools.some((tool) => tool.name === "firstmate_toolchain"));
     assert.match(cfg.instructions ?? "", /firstmate_toolchain/);
@@ -156,7 +179,7 @@ test("captain metadata loads the full skill set", async () => {
   }
 });
 
-test("calm reporting survives captain resume and stays out of worker and ordinary threads", async () => {
+test("calm reporting survives captain resume, ships for cold startup, and stays out of workers", async () => {
   const host = await load();
   try {
     for (const nativeHome of [undefined, "/tmp/resumed-captain"]) {
@@ -173,8 +196,9 @@ test("calm reporting survives captain resume and stays out of worker and ordinar
       const cfg = await host.harness.behavior.resolveAgentConfiguration(
         makePluginAgentConfigurationContext({ pluginMetadata }),
       );
-      assert.ok(!cfg.skills.includes("calm"));
-      assert.ok(!cfg.skills.includes("catch-up"));
+      const isWorker = "crew" in pluginMetadata;
+      assert.equal(cfg.skills.includes("calm"), !isWorker);
+      assert.equal(cfg.skills.includes("catch-up"), !isWorker);
       assert.doesNotMatch(cfg.instructions ?? "", /Calm reporting is the captain default/);
     }
     assert.equal(host.harness.sdk.callsTo("threads.send").length, 0);
@@ -620,10 +644,13 @@ function stubCaptainDeck(host: Awaited<ReturnType<typeof load>>, thread = makeTh
 
 test("deck titles and pins an untitled /captain thread", async () => {
   const host = await load();
+  await host.harness.behavior.setSettings({ fullParityOnDeck: false });
   try {
     stubCaptainDeck(host);
     const result = await host.harness.behavior.runCli(["deck"], { threadId: "thr_cap", projectId: "proj_1" });
     assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /native home is unavailable/);
+    assert.doesNotMatch(result.stdout, /cd ''/);
     const updates = host.harness.sdk.callsTo("threads.update");
     assert.equal(updates.length, 1);
     assert.equal((updates[0]![0] as { title?: string }).title, "Captain · Cyndra SaaS");
@@ -656,17 +683,17 @@ test("deck reuses shared home when automatic native profile is explicitly disabl
   }
 });
 
-test("deck surfaces the one-time init command when real firstmate is not activatable", async () => {
+test("deck refuses missing environment before native setup or claimed readiness", async () => {
   const host = await load();
   try {
     stubCaptainDeck(host);
-    // No thread environment → host cannot be resolved → auto-init is skipped gracefully.
     const result = await host.harness.behavior.runCli(["deck"], { threadId: "thr_cap", projectId: "proj_1" });
-    assert.equal(result.exitCode, 0, result.stderr);
-    assert.match(result.stdout, /Real firstmate: not active yet/);
-    assert.match(result.stdout, /bb firstmate init --real/);
-    // Native BB deck still succeeded (thread titled + pinned).
-    assert.equal(host.harness.sdk.callsTo("threads.pin").length, 1);
+    assert.equal(result.exitCode, 1, result.stdout);
+    assert.match(result.stderr, /Captain is not ready.*host identity/);
+    assert.match(result.stderr, /actual BB thread environment/);
+    assert.equal(host.harness.sdk.callsTo("threads.pin").length, 0);
+    assert.equal(host.harness.sdk.callsTo("threads.updatePluginMetadata").length, 0);
+    assert.equal(host.harness.sdk.callsTo("terminals.create").length, 0);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -1743,6 +1770,7 @@ for (const report of [false, true]) {
         for (const dir of ["state", "data/c1", "config", "tmp", "project", "wt"]) {
           mkdirSync(join(scratch, dir), { recursive: true });
         }
+        spawnSync("git",["init","--quiet","--initial-branch=main",scratch]);
         const meta = [
           "backend=bb", "window=thr_fixture_no_live_endpoint", "endpoint_task_id=c1",
           `worktree=${scratch}/wt`, `project=${scratch}/project`,
@@ -2296,7 +2324,7 @@ test("merge lands a PR with zero checks (no_checks) on the captain's word", asyn
     host.harness.sdk.stub("environments.pullRequest", async () => ({
       outcome: "available",
       pullRequest: {
-        url: "https://gh/pr/1", number: 1, title: "t", state: "open",
+        url: "https://github.com/o/r/pull/1", number: 1, title: "t", state: "open",
         checks: { state: "no_checks", failedCount: 0, pendingCount: 0, passedCount: 0 },
         mergeability: { mergeable: "MERGEABLE" },
       },
@@ -2306,7 +2334,7 @@ test("merge lands a PR with zero checks (no_checks) on the captain's word", asyn
     const result = await host.harness.behavior.runCli(["merge", "c1", "--yes"]);
     assert.equal(result.exitCode, 0, result.stderr);
     assert.equal(merged, 1);
-    assert.match(result.stdout, /Merged https:\/\/gh\/pr\/1/);
+    assert.match(result.stdout, /Merged https:\/\/github\.com\/o\/r\/pull\/1/);
     assert.deepEqual((await host.bb.storage.kv.get("crews")) as unknown[], []);
   } finally {
     await host.harness.lifecycle.dispose();
@@ -2340,7 +2368,7 @@ test("allowMissingCheck refuses when the BB merge path cannot read required cont
     host.harness.sdk.stub("environments.pullRequest", async () => ({
       outcome: "available",
       pullRequest: {
-        url: "https://gh/pr/1", number: 1, title: "t", state: "open",
+        url: "https://github.com/o/r/pull/1", number: 1, title: "t", state: "open",
         checks: { state: "passing", failedCount: 0, pendingCount: 0, passedCount: 1 },
         mergeability: { mergeable: "MERGEABLE" },
       },
@@ -2380,7 +2408,7 @@ test("merge runs native merge and teardown before retiring the crew", async () =
     host.harness.sdk.stub("environments.pullRequest", async () => ({
       outcome: "available",
       pullRequest: {
-        url: "https://gh/pr/1", number: 1, title: "t", state: ++prReads === 1 ? "open" : "merged",
+        url: "https://github.com/o/r/pull/1", number: 1, title: "t", state: ++prReads === 1 ? "open" : "merged",
         checks: { state: "passing", failedCount: 0, pendingCount: 0, passedCount: 3 },
         mergeability: { mergeable: "MERGEABLE" },
       },
@@ -2423,7 +2451,7 @@ test("bearings reconciles a crew whose PR merged externally", async () => {
     host.harness.sdk.stub("environments.pullRequest", async () => ({
       outcome: "available",
       pullRequest: {
-        url: "https://gh/pr/1", number: 1, title: "t", state: "merged",
+        url: "https://github.com/o/r/pull/1", number: 1, title: "t", state: "merged",
         checks: { state: "passing", failedCount: 0, pendingCount: 0, passedCount: 1 },
         mergeability: { mergeable: "MERGEABLE" },
       },
@@ -2452,7 +2480,7 @@ test("bearings never retires a DONE scout because a PR on its environment merged
     host.harness.sdk.stub("environments.pullRequest", async () => ({
       outcome: "available",
       pullRequest: {
-        url: "https://gh/pr/1852", number: 1852, title: "t", state: "merged",
+        url: "https://github.com/o/r/pull/1852", number: 1852, title: "t", state: "merged",
         checks: { state: "passing", failedCount: 0, pendingCount: 0, passedCount: 1 },
         mergeability: { mergeable: "MERGEABLE" },
       },
@@ -2482,7 +2510,7 @@ test("a refused landed-crew cleanup keeps the crew without failing bearings", as
     host.harness.sdk.stub("environments.pullRequest", async () => ({
       outcome: "available",
       pullRequest: {
-        url: "https://gh/pr/1", number: 1, title: "t", state: "merged",
+        url: "https://github.com/o/r/pull/1", number: 1, title: "t", state: "merged",
         checks: { state: "passing", failedCount: 0, pendingCount: 0, passedCount: 1 },
         mergeability: { mergeable: "MERGEABLE" },
       },
@@ -2549,7 +2577,7 @@ test("handoff reparents a previous captain's crews and their decisions", async (
     assert.deepEqual(updates, [{ threadId: "thr_crew", parentThreadId: "thr_new" }]);
     const decisions = (await host.bb.storage.kv.get("decisions")) as Array<{ parentThreadId: string }>;
     assert.equal(decisions[0]?.parentThreadId, "thr_new");
-    const queue = (await host.bb.storage.kv.get("queue")) as Array<{ parentThreadId: string }>;
+    const queue = (await durableQueue(host)) as Array<{ parentThreadId: string }>;
     assert.equal(queue[0]?.parentThreadId, "thr_new");
     const again = await host.harness.behavior.runCli(["handoff", "--from", "thr_else", "--crew", "missing"], { threadId: "thr_new" });
     assert.equal(again.exitCode, 1);
@@ -2559,26 +2587,26 @@ test("handoff reparents a previous captain's crews and their decisions", async (
   }
 });
 
-test("fm-inbox-take prints inbox bodies and moves them only on --ack", () => {
+test("fm-inbox-take prints inbox bodies and moves them only for explicit --ack IDs", () => {
   const home = mkdtempSync(join(tmpdir(), "fm-inbox-"));
   try {
     const inbox = join(home, "state", "c1.inbox");
     mkdirSync(join(home, "bin"), { recursive: true });
     mkdirSync(inbox, { recursive: true });
     writeFileSync(join(home, "bin", "fm-task-inbox-lib.sh"), "fm_task_inbox_body() { echo BODY; }\n");
-    writeFileSync(join(inbox, "1.msg"), "seq: 1\n--\nSTEER one\n");
-    writeFileSync(join(inbox, "2.msg"), "seq: 2\n--\nSTEER two\n");
+    writeFileSync(join(inbox, "001.msg"), "seq: 1\n--\nSTEER one\n");
+    writeFileSync(join(inbox, "002.msg"), "seq: 2\n--\nSTEER two\n");
     const bin = join(dirname(fileURLToPath(import.meta.url)), "overlay/bin/fm-inbox-take.sh");
     const read = spawnSync(bin, ["c1"], { env: { ...process.env, FM_HOME: home }, encoding: "utf8" });
     assert.equal(read.status, 0, read.stderr);
     assert.match(read.stdout, /BODY/);
     assert.doesNotMatch(read.stdout, /STEER one/);
-    assert.ok(existsSync(join(inbox, "1.msg")), "reading does not acknowledge");
-    const ack = spawnSync(bin, ["c1", "--ack"], { env: { ...process.env, FM_HOME: home }, encoding: "utf8" });
+    assert.ok(existsSync(join(inbox, "001.msg")), "reading does not acknowledge");
+    const ack = spawnSync(bin, ["c1", "--ack", "001.msg", "002.msg"], { env: { ...process.env, FM_HOME: home }, encoding: "utf8" });
     assert.equal(ack.status, 0, ack.stderr);
-    assert.ok(existsSync(join(inbox, "handled", "1.msg")));
-    assert.ok(existsSync(join(inbox, "handled", "2.msg")));
-    assert.equal(existsSync(join(inbox, "1.msg")), false);
+    assert.ok(existsSync(join(inbox, "handled", "001.msg")));
+    assert.ok(existsSync(join(inbox, "handled", "002.msg")));
+    assert.equal(existsSync(join(inbox, "001.msg")), false);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -2604,6 +2632,7 @@ test("mark-crew tags a thread so the crewmate contract applies", async () => {
 test("retry with a new reasoning relaunches in the same worktree", async () => {
   const host = await load();
   try {
+    host.harness.sdk.stub("environments.get", async () => ({ id:"env_wt",hostId:"host_1",status:"ready",path:"/repo/isolated",isWorktree:true }));
     await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
     host.harness.sdk.stub("threads.list", async () => []);
     host.harness.sdk.stub("threads.get", async () =>
@@ -2633,6 +2662,7 @@ test("retry with a new reasoning relaunches in the same worktree", async () => {
 test("long briefs are spilled out of the crews register, and a relaunch still sends the full brief", async () => {
   const host = await load();
   try {
+    host.harness.sdk.stub("environments.get", async () => ({ id:"env_wt",hostId:"host_1",status:"ready",path:"/repo/isolated",isWorktree:true }));
     const brief = `Captain's intent: finish the partner-billing stack. ${"detail ".repeat(400)}END-OF-BRIEF`;
     await host.bb.storage.kv.set("crews", [{ ...shipRow("c1", "thr_crew", "thr_cap"), task: brief }]);
     host.harness.sdk.stub("threads.list", async () => []);
@@ -2649,12 +2679,15 @@ test("long briefs are spilled out of the crews register, and a relaunch still se
     assert.ok(crews[0]!.task.length <= 300, "the register keeps only a prefix");
     assert.equal(crews[0]!.taskSpilled, true);
     assert.equal(await host.bb.storage.kv.get("crew-task:c1"), brief, "the full brief is kept aside");
-    // A second relaunch reads the full brief back, not the prefix.
-    await host.bb.storage.kv.set("crews", [{ ...crews[0], relaunches: 0, threadId: "thr_crew" }]);
-    const again = await host.harness.behavior.runCli(["retry", "c1", "--reasoning-level", "high"]);
-    assert.equal(again.exitCode, 0, again.stderr);
-    const prompt = (host.harness.sdk.callsTo("threads.spawn")[1]![0] as { prompt: string }).prompt;
+    const prompt = (host.harness.sdk.callsTo("threads.spawn")[0]![0] as { prompt: string }).prompt;
     assert.match(prompt, /END-OF-BRIEF/);
+    // Recovery is bounded by native policy. Do not rewind the generation to
+    // manufacture a second replacement of the same already-replaced task.
+    const again = await host.harness.behavior.runCli(["retry", "c1", "--reasoning-level", "high"]);
+    assert.equal(again.exitCode, 1);
+    assert.match(again.stderr, /already relaunched/);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 1);
+
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -2681,6 +2714,7 @@ test("retry with no override still resubmits the failed turn on the same thread"
 test("relaunch stops at the stuck-ladder cap and resolves a replaced thread id", async () => {
   const host = await load();
   try {
+    host.harness.sdk.stub("environments.get", async () => ({ id:"env_wt",hostId:"host_1",status:"ready",path:"/repo/isolated",isWorktree:true }));
     await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
     host.harness.sdk.stub("threads.list", async () => []);
     host.harness.sdk.stub("threads.get", async () =>
@@ -2733,7 +2767,7 @@ test("dispatch refuses past the running-crew cap", async () => {
       { projectId: "proj_1", threadId: "thr_cap" },
     );
     assert.notEqual(result.exitCode, 0, result.stdout);
-    assert.match(result.stderr, /Crew cap reached: 5 crews running \(cap 5\)/);
+    assert.match(result.stderr, /Crew cap reached: 5 crews running or reserved \(cap 5\)/);
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
   } finally {
     await host.harness.lifecycle.dispose();
@@ -2820,7 +2854,8 @@ test("bb overlay adapter propagates reasoning, names and tags crews, drops yolo-
   assert.match(src, /FM_BB_REASONING/);
   assert.match(src, /FM_BB_THREAD_TITLE/);
   assert.match(src, /\$role · \$subject · \$id/);
-  assert.match(src, /firstmate mark-crew/);
+  assert.match(src, /firstmate create-worker/);
+  assert.doesNotMatch(src, /firstmate mark-crew|thread spawn/);
   // yolo no longer forces BB full permission
   assert.doesNotMatch(src, /perm=full/);
   // scout scratch carve-out in remove_worktree
@@ -3027,7 +3062,11 @@ test("installer --verify fails LOUD after an out-of-band fast-forward leaves the
     assert.notEqual(stale.status, 0, "stale mirror must make --verify fail");
     assert.match(stale.stderr, /FM_MIRROR_STALE/, `--verify must be loud:\n${stale.stderr}`);
     assert.match(stale.stderr, /missing sibling 'fm-newmod\.sh'|HEAD moved|frozen copy 'fm-spawn\.sh' is stale/);
-    // Re-install re-mirrors → verify healthy again (self-heal).
+    // Unknown source commits must not inherit an audited patch set just because
+    // patch context happens to match. Return to an audited source before refresh.
+    const denied = spawnSync("python3", [join(OVERLAY_ROOT, "install-bb-backend.py"), "--home", home, "--overlay", OVERLAY_ROOT], {encoding:"utf8"});
+    assert.notEqual(denied.status, 0);assert.match(denied.stderr, /unsupported native source SHA/);
+    assert.equal(spawnSync("git", ["-C", home, "checkout", "--quiet", "--detach", PATCH_BASE]).status, 0);
     assert.equal(spawnSync("python3", [join(OVERLAY_ROOT, "install-bb-backend.py"), "--home", home, "--overlay", OVERLAY_ROOT]).status, 0);
     assert.equal(spawnSync("python3", [join(OVERLAY_ROOT, "install-bb-backend.py"), "--home", home, "--verify"]).status, 0);
   } finally {
@@ -3262,48 +3301,33 @@ test("shared-env BB crew with no worktree passes endpoint validation; ambiguity 
   });
 });
 
-// Audit B (crew half): the crew preamble and the native brief pointed crews at the
-// home's native bin/ (no bb backend), so `fm-procevent-lavish.sh arm` refused with
-// "backend identity missing". Audit D: crews polled CI in tight loops and drained the
-// shared GitHub token. Reverting the path rewrite or the CI rule in bb.sh
-// fm_backend_bb_create_task fails this test.
+// Actual BB adapter creation carries the native role and scoped script paths,
+// while quoted native-looking task text remains verbatim. No model is launched.
 test("bb crew launch prompt preserves the brief with only BB transport adaptations", () => {
-  const home = mkdtempSync(join(tmpdir(), "fm-bb-prompt-"));
+  const home = nativePromptFixture();
   try {
     mkdirSync(join(home, "bin-bb/backends"), { recursive: true });
     cpSync(join(OVERLAY_ROOT, "bin/backends/bb-worker-transport.txt"), join(home, "bin-bb/backends/bb-worker-transport.txt"));
     const fakebin = join(home, "fakebin");
     const log = join(home, "transport.jsonl");
     mkdirSync(fakebin);
-    writeFileSync(join(fakebin, "bb"), `#!/usr/bin/env python3\nimport json,sys\nwith open(${JSON.stringify(log)}, 'a') as f:\n    args=sys.argv[1:]\n    f.write(json.dumps(args)+'\\n')\n    if '--prompt-file' in args:\n        f.write(json.dumps(['prompt-body', open(args[args.index('--prompt-file')+1]).read()])+'\\n')\nif args[:2] == ['thread','spawn']: print(json.dumps({'id':'thr_crew1','path':'/wt'}))\nelif args[:2] == ['thread','show']: print(json.dumps({'thread':{'id':'thr_crew1','status':'active'},'environment':{'path':'/wt'}}))\n`, { mode: 0o755 });
-    const brief = join(home, "brief.md");
-    writeFileSync(brief, [
-      "arm your board with bin/fm-procevent-lavish.sh arm <artifact.html> --for <task-id>;",
-      `acknowledge with \`bin/fm-procevent.sh handled <source-id> <sequence>\``,
-      `run \`${home}/bin/fm-ensure-agents-md.sh .\` in the worktree.`,
-      "bin/fm-crew-state.sh at line start",
-    ].join("\n"));
+    writeFileSync(join(fakebin, "bb"), `#!/usr/bin/env python3\nimport json,sys\nwith open(${JSON.stringify(log)}, 'a') as f:\n    args=sys.argv[1:]\n    f.write(json.dumps(args)+'\\n')\n    if '--prompt-file' in args:\n        f.write(json.dumps(['prompt-body', open(args[args.index('--prompt-file')+1]).read()])+'\\n')\nif args[:2] == ['firstmate','create-worker']: print(json.dumps({'id':'thr_crew1','path':'/wt'}))\nelif args[:2] == ['thread','show']: print(json.dumps({'thread':{'id':'thr_crew1','status':'active'},'environment':{'path':'/wt'}}))\n`, { mode: 0o755 });
+    const f=nativePromptScaffold(home,"c1","scout");
+    const brief=f.source;
     const env = { ...process.env, PATH: `${fakebin}:${process.env.PATH}`, FM_HOME: home, FM_ROOT: home, FM_BB_PROJECT_ID: "project_1", FM_BB_MACHINE: "host_1" };
-    const run = spawnSync("bash", ["-c", `. ${JSON.stringify(join(OVERLAY_ROOT, "bin/backends/bb.sh"))} 2>/dev/null; fm_backend_bb_create_task "Scout" /repo c1 scout "$BRIEF"`], { env: { ...env, BRIEF: brief }, encoding: "utf8" });
+    const run = fixtureShell(`. ${JSON.stringify(join(home, "bin-bb/backends/bb.sh"))} && fm_backend_bb_create_task "Scout" /repo c1 scout "$BRIEF"`, { env: { ...env, BRIEF: brief }, encoding: "utf8" });
     assert.equal(run.status, 0, run.stderr);
     const calls = readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line) as string[]);
-    const launch = calls.find(args => args[0] === "thread" && args[1] === "spawn")!;
+    const launch = calls.find(args => args[0] === "firstmate" && args[1] === "create-worker")!;
     const prompt = calls.find(args => args[0] === "prompt-body")?.[1] ?? "";
     assert.ok(launch.includes("--prompt-file"));
     assert.equal(launch.includes("--prompt"), false);
-    const bindir = `${home}/bin-bb`;
-    assert.ok(prompt.includes(`${bindir}/fm-procevent-lavish.sh arm <artifact.html>`), prompt);
-    assert.ok(prompt.includes(`\`${bindir}/fm-procevent.sh handled`), prompt);
-    assert.ok(prompt.includes(`\`${bindir}/fm-ensure-agents-md.sh .\``), prompt);
-    assert.ok(prompt.includes(`\n${bindir}/fm-crew-state.sh at line start`), prompt);
-    assert.ok(prompt.includes(`Use ${bindir}/fm-tasks-axi.sh for backlog work`), prompt);
-    assert.ok(prompt.includes(`arm ${bindir}/fm-procevent-lavish.sh with --for c1`), prompt);
-    const briefPart = prompt.slice(prompt.indexOf("\n\n") + 2);
-    assert.match(briefPart, /^arm your board/);
-    assert.doesNotMatch(briefPart, /[ `(]bin\/fm-/, "no relative native bin/ reference may survive in the brief");
-    assert.ok(!prompt.includes(`${home}/bin/`), "no absolute native bin/ reference may survive");
-    assert.doesNotMatch(prompt, /Never poll CI|\.resources\.graphql/);
-    assert.doesNotMatch(prompt, /WAITING:|scheduled resume|stop every timer/);
+    assert.ok(prompt.includes(f.task), "Task script paths and words stay verbatim");
+    assert.match(prompt,/# Current worker role contract/);
+    assert.ok(prompt.includes(`${home}/bin-bb/fm-fleet-ledger.sh`));
+    assert.ok(prompt.includes(`${home}/bin-bb/fm-procevent-lavish.sh`));
+    assert.ok(prompt.includes(`${home}/data/c1/`));
+    assert.equal(readFileSync(brief,"utf8"),f.text);
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
@@ -3671,7 +3695,7 @@ test("bearings does not re-nag a crew that answered its decision then finished D
     host.harness.sdk.stub("environments.pullRequest", async () => ({
       outcome: "available",
       pullRequest: {
-        url: "https://gh/pr/42", number: 42, title: "t", state: "open",
+        url: "https://github.com/o/r/pull/42", number: 42, title: "t", state: "open",
         checks: { state: "passing", failedCount: 0, pendingCount: 0, passedCount: 1 },
         mergeability: { mergeable: "MERGEABLE" },
       },
@@ -3679,7 +3703,7 @@ test("bearings does not re-nag a crew that answered its decision then finished D
     const result = await host.harness.behavior.runCli(["bearings"]);
     assert.equal(result.exitCode, 0, result.stderr);
     assert.doesNotMatch(result.stdout, /NEEDS-DECISION \[api\]/);
-    assert.match(result.stdout, /PR ready c1/);
+    assert.match(result.stdout, /PR follow-up c1/);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -4653,7 +4677,7 @@ test("captain sessions get the version-pinned real skills inventory", async () =
     assert.match(cfg.instructions ?? "", /Real firstmate skills \(fmHome\/\.agents\/skills @ abc123456789/);
     assert.match(cfg.instructions ?? "", /- stow: tiered memory/);
     assert.match(cfg.instructions ?? "", /- afk: away mandate/);
-    // Crews still get nothing.
+    // Crews get neither native captain inventory nor captain memory.
     const crew = await host.harness.behavior.resolveAgentConfiguration(
       makePluginAgentConfigurationContext({ pluginMetadata: { crew: "true" } }),
     );
@@ -4706,12 +4730,13 @@ function stubOrphanTransportHost(
     },
   ]);
   host.harness.sdk.stub("threads.getPluginMetadata", async () =>
-    opts.byTitle ? {} : { crew: "true", crewId: captured.taskId },
+    opts.byTitle ? {} : { crew: "true", crewId: captured.taskId, nativeHome:"/tmp/fm-home",
+      launchKey:JSON.stringify(["proj_1","thr_cap","/tmp/fm-home",captured.taskId,1]),generation:1 },
   );
   return captured;
 }
 
-test("real transport adopts an orphan thread by title (mark-crew failed) instead of double-spawning", async () => {
+test("real transport retains uncertain creation when only an untrusted title matches", async () => {
   const host = realHost();
   await plugin(host.bb);
   try {
@@ -4719,18 +4744,19 @@ test("real transport adopts an orphan thread by title (mark-crew failed) instead
     stubOrphanTransportHost(host, { byTitle: true });
     const result = await host.harness.behavior.runCli(
       ["dispatch", "--project", "proj_1", "--", "fix flaky login"],
-      { projectId: "proj_1" },
+      { threadId:"thr_cap",projectId: "proj_1" },
     );
-    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(result.exitCode, 1);
+    assert.match(result.stderr,/uncertain/);
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0, "must not native-spawn a duplicate");
     const crews = await crewsKv(host);
-    assert.equal(crews[0]?.threadId, "thr_orphan");
+    assert.equal(crews?.length ?? 0, 0);
   } finally {
     await host.harness.lifecycle.dispose();
   }
 });
 
-test("real transport adopts an orphan thread by recorded task id when the title differs", async () => {
+test("real transport adopts an orphan by exact launch metadata when the title differs", async () => {
   const host = realHost();
   await plugin(host.bb);
   try {
@@ -4738,9 +4764,10 @@ test("real transport adopts an orphan thread by recorded task id when the title 
     stubOrphanTransportHost(host, { byTitle: false });
     const result = await host.harness.behavior.runCli(
       ["dispatch", "--project", "proj_1", "--", "fix flaky login"],
-      { projectId: "proj_1" },
+      { threadId:"thr_cap",projectId: "proj_1" },
     );
-    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(result.exitCode, 1, "adoption cannot attest missing native admission");
+    assert.match(result.stderr,/provisioning/);
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
     const crews = await crewsKv(host);
     assert.equal(crews[0]?.threadId, "thr_orphan");
@@ -4831,7 +4858,9 @@ function stubRoutedHost(
     // Only successful commands mutate the virtual FS (a forced-failure decode never
     // renames over the target — mirrors the atomic write's truncate-safety).
     if (code === 0) simulateHostWrite(unwrapHostCommand(cmd), vfs, writes);
-    return hostRcPayload(r.payload ?? (cmd.includes("fm-bearings-snapshot.sh") ? nativeBearingsFixture() : ""), code);
+    const payload=r.payload ?? (cmd.includes("fm-bearings-snapshot.sh") ? nativeBearingsFixture() : "");
+    if (cmd.includes("FM_HOST_CAPTURE_V1")) return hostRcPayload(JSON.stringify({protocol:"FM_HOST_CAPTURE_V1",exitCode:code,stdout:payload,stderr:""}),0);
+    return hostRcPayload(payload, code);
   });
   return { seen, writes, vfs };
 }
@@ -5370,7 +5399,7 @@ test("A1 queue real: add owns the row id (add <id> <title> --kind); done drives 
     const { seen } = stubRoutedHost(host, () => ({ payload: "Added your task successfully — enjoy!", code: 0 }));
     const add = await host.harness.behavior.runCli(["queue", "add", "ship it", "--project", "proj_1"], { projectId: "proj_1" });
     assert.equal(add.exitCode, 0, add.stderr);
-    const q = (await host.bb.storage.kv.get("queue")) as Array<{ id: string; backlogId?: string }>;
+    const q = (await durableQueue(host)) as Array<{ id: string; backlogId?: string }>;
     const qid = q[0]!.id;
     assert.equal(q[0]?.backlogId, qid, "backlog row id must equal the KV item id we supplied");
     // The add command carries our id and --kind, not just the title.
@@ -5386,14 +5415,15 @@ test("A1 queue real: add owns the row id (add <id> <title> --kind); done drives 
   }
 });
 
-test("A1 queue real: missing tasks-axi refuses without creating a phantom queue item", async () => {
+test("A1 queue real: missing tasks-axi retains unresolved full queue intent", async () => {
   const host = ownerHost({ queueOwner: "real" });
   await plugin(host.bb);
   try {
     stubRoutedHost(host, () => ({ code: 2 })); // tasks-axi not on PATH
     const add = await host.harness.behavior.runCli(["queue", "add", "ship it", "--project", "proj_1"], { projectId: "proj_1" });
     assert.equal(add.exitCode, 1);
-    assert.deepEqual(await host.bb.storage.kv.get("queue") ?? [], []);
+    assert.equal((await durableQueue(host)).length, 1);
+    assert.equal((await durableQueue(host))[0]?.nativePending,true);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -5437,7 +5467,7 @@ test("migrate-owners projects KV into the real files and is idempotent", async (
     assert.equal(first.exitCode, 0, first.stderr);
     assert.equal(addCalls, 1, "queue row should be projected once");
     assert.equal(decodeHostWrite(writes, "data/captain.md"), "MC", "captain memory not projected");
-    const q1 = (await host.bb.storage.kv.get("queue")) as Array<{ id: string; backlogId?: string }>;
+    const q1 = (await durableQueue(host)) as Array<{ id: string; backlogId?: string }>;
     assert.equal(q1[0]?.backlogId, q1[0]?.id, "migrate reuses the KV item id as the backlog row id");
     // Re-run: the queue row already has a backlogId → not projected again.
     const second = await host.harness.behavior.runCli(["migrate-owners"], { projectId: "proj_1" });
@@ -6036,18 +6066,19 @@ test("R4 orphan adoption via broad list when the thread is not tagged firstmate-
       if (cmd.includes("bb_thread_id")) return hostRcPayload("FM_META_ABSENT", 0);
       return hostRcPayload("", 0);
     });
-    // The origin-FILTERED list is empty (BB hasn't attributed firstmate origin to
-    // the CLI-spawned thread yet); only the BROAD list returns the orphan, matched
-    // by the crewId that mark-crew stamped.
+    // Origin attribution can be unavailable after a crash. Scoped recovery uses
+    // exact plugin creation metadata, independently of human-facing titles.
     host.harness.sdk.stub("threads.list", async (args: { originPluginId?: string }) =>
       args.originPluginId === "firstmate" ? [] : [{ id: "thr_orphan", projectId: "proj_1", parentThreadId: "thr_cap", title: "renamed" }],
     );
-    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ crew: "true", crewId: captured.taskId }));
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ crew: "true", crewId: captured.taskId,nativeHome:"/tmp/fm-home",
+      launchKey:JSON.stringify(["proj_1","thr_cap","/tmp/fm-home",captured.taskId,1]),generation:1 }));
     const result = await host.harness.behavior.runCli(
       ["dispatch", "--project", "proj_1", "--", "adopt me"],
-      { projectId: "proj_1" },
+      { threadId:"thr_cap",projectId: "proj_1" },
     );
-    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(result.exitCode, 1, "adoption cannot attest missing native admission");
+    assert.match(result.stderr,/provisioning/);
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0, "must adopt the orphan, not native-spawn");
     const crews = await crewsKv(host);
     assert.equal(crews[0]?.threadId, "thr_orphan");
@@ -6215,7 +6246,7 @@ test("queue real: id-ownership is robust to arbitrary add output; transitions ta
     });
     const add = await host.harness.behavior.runCli(["queue", "add", "ship it", "--project", "proj_1"], { projectId: "proj_1" });
     assert.equal(add.exitCode, 0, add.stderr);
-    const q = (await host.bb.storage.kv.get("queue")) as Array<{ id: string; backlogId?: string }>;
+    const q = (await durableQueue(host)) as Array<{ id: string; backlogId?: string }>;
     const qid = q[0]!.id;
     assert.equal(q[0]?.backlogId, qid, "row id is our supplied id regardless of add stdout");
     const done = await host.harness.behavior.runCli(["queue", "done", qid], { projectId: "proj_1" });
@@ -6231,14 +6262,15 @@ test("queue real: id-ownership is robust to arbitrary add output; transitions ta
   }
 });
 
-test("queue real: native add refusal preserves the cache", async () => {
+test("queue real: native add refusal retains unresolved full queue intent", async () => {
   const host = ownerHost({ queueOwner: "real" });
   await plugin(host.bb);
   try {
     stubRoutedHost(host, (cmd) => (cmd.includes("'add'") ? { code: 1 } : { code: 0 }));
     const add = await host.harness.behavior.runCli(["queue", "add", "explicit", "--project", "proj_1"], { projectId: "proj_1" });
     assert.equal(add.exitCode, 1);
-    assert.deepEqual(await host.bb.storage.kv.get("queue") ?? [], []);
+    assert.equal((await durableQueue(host)).length, 1);
+    assert.equal((await durableQueue(host))[0]?.nativePending,true);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -6290,7 +6322,7 @@ function stubRealExecHost(host: Awaited<ReturnType<typeof load>>, extraEnv: Reco
   host.harness.sdk.stub("terminals.close", async () => ({}));
   host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
     const inner = unwrapHostCommand(cmds.get(args.terminalId) ?? "");
-    const r = spawnSync("bash", ["-c", inner], { encoding: "utf8", timeout: 30_000, env: { ...process.env, ...extraEnv } });
+    const r = fixtureShell(inner, { encoding: "utf8", timeout: 30_000, env: { ...process.env, ...extraEnv } });
     return hostRcPayload((r.stdout ?? "") + (r.stderr ?? ""), typeof r.status === "number" ? r.status : 1);
   });
 }
@@ -6624,6 +6656,7 @@ test("Part D: a cross-thread empty `crews` view is self-explaining (scoped + nam
 // Item 2: `deck --all` genuinely opts into the whole host (the PR claimed deck supports --all).
 test("Part D: `deck --all` shows every captain's crews; default deck is scoped to this thread", async () => {
   const host = await load();
+  await host.harness.behavior.setSettings({ fullParityOnDeck: false });
   try {
     host.harness.sdk.stub("threads.list", async () => []);
     host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ status: "idle", environmentId: null }));
@@ -7362,6 +7395,8 @@ test("IT current native AFK entry writes a valid durable record", { skip: !FM_IN
 test("native captain contract tool returns the entire source beyond the SDK instruction limit", async () => {
   const host = ownerHost();
   await plugin(host.bb);
+  await host.bb.storage.kv.set("native-home:thr_cap", "/tmp/fm-home");
+  await host.bb.storage.kv.set("native-home-host:thr_cap", "host_1");
   try {
     const content = "# Firstmate\n" + "supervision policy\n".repeat(5000) + "END_OF_NATIVE_CONTRACT";
     host.harness.sdk.stub("files.read", async () => ({
@@ -7447,24 +7482,67 @@ for (const entry of ["tool", "cli"] as const) {
     const started = Date.now();
     let elapsed = 0;
     t.mock.method(Date, "now", () => started + elapsed);
+    const timers = t.mock.method(globalThis, "setTimeout");
     try {
       host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_cap", environmentId: "env_1" }));
       host.harness.sdk.stub("environments.get", async () => ({ hostId: "host_1" }));
       let command = "";
+      const commands = new Map<string,string>();
+      const files = new Map<string,string>();
+      const writes: Array<{path:string;content:string}> = [];
+      const nativeTerminals = new Set<string>();
+      const closed: string[] = [];
+      const budget = scenario.script === "wake-drain" ? Math.max(180,scenario.timeout) : scenario.timeout;
+      let terminalSeq = 0;
       host.harness.sdk.stub("terminals.create", async (args: { start?: { command?: string } }) => {
-        command = unwrapHostCommand(args.start?.command ?? "");
-        return { id: "term_slow_drain" };
+        const inner = unwrapHostCommand(args.start?.command ?? "");
+        const id = `term_slow_${++terminalSeq}`;
+        commands.set(id,inner);
+        const staged = /^bash '(\/tmp\/\.fm-receipt-[^']+)'$/.exec(inner);
+        if (staged) {
+          command = files.get(staged[1]) ?? "";
+          assert.match(command,/python3 -c .*fm-wake-drain\.sh/s,"execute only an atomically staged receipt");
+          nativeTerminals.add(id);
+        } else if (scenario.script === "peek" && inner.includes('"$FM_BINDIR/fm-peek.sh"')) {
+          command = inner;
+          nativeTerminals.add(id);
+        }
+        return { id };
       });
       host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
-      host.harness.sdk.stub("terminals.close", async () => ({}));
+      host.harness.sdk.stub("terminals.close", async ({terminalId}:{terminalId:string}) => {closed.push(terminalId);return {};});
       let reads = 0;
-      host.harness.sdk.stub("terminals.output", async () => {
+      host.harness.sdk.stub("terminals.output", async ({terminalId}:{terminalId:string}) => {
+        if (!nativeTerminals.has(terminalId)) {
+          const inner=commands.get(terminalId)!;
+          simulateHostWrite(inner,files,writes);
+          if (inner.startsWith("rm -f ")) for (const path of files.keys()) {
+            if (inner.includes(`'${path}'`)) files.delete(path);
+          }
+          return hostRcPayload("",0);
+        }
         if (++reads === 1) {
           elapsed = scenario.elapsed;
           return { chunks: [], nextSeq: 0 };
         }
+        // Finish within one millisecond of the exact native execution budget.
+        // Observe the read deadline to distinguish 180/240s from a larger cap.
+        elapsed = budget*1000-1;
         return hostRcPayload(wakeFrame("DRAIN_FINISHED\nWAKE_ACK_REQUIRED: bin/fm-wake-drain.sh --ack-through 2 --recovery-generation g1"), 0);
       });
+      const assertCleanup = () => {
+        assert.equal(nativeTerminals.size,1,"finish or time out the same native invocation, never retry it");
+        // Receipt: init, two payload chunks, atomic decode/rename, writer
+        // cleanup, one native execution and receipt cleanup. Peek stays direct.
+        assert.equal(commands.size,scenario.script==="wake-drain" ? 7 : 1,"exact staging/execution/cleanup commands");
+        if (scenario.script==="wake-drain") {
+          assert.equal(writes.length,1,"publish exactly one complete guarded command");
+          assert.equal([...commands.values()].filter(cmd=>cmd.startsWith("printf '%s' ")).length,2,"exact payload chunk count");
+          assert.match(command,/ 'receive' '' "\$FM_BINDIR\/fm-wake-drain.sh"$/,"timeout never requests an acknowledgement");
+        }
+        assert.deepEqual([...closed].sort(),[...commands.keys()].sort(),"every created terminal closes exactly once");
+        assert.equal(files.size,0,"staged command and writer scratch files are removed");
+      };
       let output: string;
       if (entry === "tool") {
         const tool = host.harness.inspection.registrations.agentTools.find(tool => tool.name === "firstmate_fm")!;
@@ -7472,7 +7550,9 @@ for (const entry of ["tool", "cli"] as const) {
         if (!scenario.ok) {
           assert.equal(typeof result, "object");
           assert.match(JSON.stringify(result), /Timed out waiting for host command/);
-          assert.equal(host.harness.sdk.callsTo("terminals.close").length, 1);
+          assert.match(JSON.stringify(result),new RegExp(`budget ${budget}s`));
+          assert.equal(reads,1,"timeout does not continue or retry the native read");
+          assertCleanup();
           return;
         }
         assert.equal(typeof result, "string", JSON.stringify(result));
@@ -7482,7 +7562,9 @@ for (const entry of ["tool", "cli"] as const) {
         if (!scenario.ok) {
           assert.equal(result.exitCode, 1);
           assert.match(result.stderr, /Timed out waiting for host command/);
-          assert.equal(host.harness.sdk.callsTo("terminals.close").length, 1);
+          assert.match(result.stderr,new RegExp(`budget ${budget}s`));
+          assert.equal(reads,1,"timeout does not continue or retry the native read");
+          assertCleanup();
           return;
         }
         assert.equal(result.exitCode, 0, result.stderr);
@@ -7492,8 +7574,9 @@ for (const entry of ["tool", "cli"] as const) {
       assert.match(command, /FM_STATE_OVERRIDE='\/tmp\/fm-home\/state\/cap-thr_cap'/);
       assert.match(output, /WAKE_RECEIPT: fixture/);
       assert.doesNotMatch(output, /--ack-through 2/);
-      assert.equal(host.harness.sdk.callsTo("terminals.create").length, 1, "finish the same drain, never retry it");
-      assert.equal(host.harness.sdk.callsTo("terminals.close").length, 1);
+      assert.equal(reads,2,"finish the original native invocation after the slow first read");
+      assert.ok(timers.mock.calls.some(call=>call.arguments[1]===1),`read deadline honors the exact ${budget}s native budget`);
+      assertCleanup();
     } finally {
       t.mock.restoreAll();
       await host.harness.lifecycle.dispose();
@@ -7718,19 +7801,20 @@ test("IT native local merge respects captain hold and lands BB-named branch", { 
 });
 
 test("IT BB secondmate launch keeps captain role and seeded home; stop failures propagate", { skip: !FM_INTEGRATION }, () => {
-  const home = scratchFmHome();
-  mkdirSync(join(home, "data"));
+  const home = nativePromptFixture();
+  mkdirSync(join(home, "data"), { recursive: true });
   const fakebin = join(home, "fakebin");
   const log = join(home, "transport.jsonl");
   try {
     mkdirSync(fakebin);
-    writeFileSync(join(fakebin, "bb"), `#!/usr/bin/env python3\nimport json,sys\nwith open(${JSON.stringify(log)}, 'a') as f:\n    args=sys.argv[1:]\n    f.write(json.dumps(args)+'\\n')\n    if '--prompt-file' in args:\n        f.write(json.dumps(['prompt-body', open(args[args.index('--prompt-file')+1]).read()])+'\\n')\nif args[:2] == ['thread','spawn']: print(json.dumps({'id':'thr_secondmate','path':${JSON.stringify(home)}}))\nelif args[:2] == ['thread','show']: print(json.dumps({'id':'thr_secondmate','status':'idle','path':${JSON.stringify(home)}}))\nelif args[:2] == ['thread','stop']: sys.exit(19)\n`, { mode: 0o755 });
+    writeFileSync(join(fakebin, "bb"), `#!/usr/bin/env python3\nimport json,sys\nwith open(${JSON.stringify(log)}, 'a') as f:\n    args=sys.argv[1:]\n    f.write(json.dumps(args)+'\\n')\n    if '--prompt-file' in args:\n        f.write(json.dumps(['prompt-body', open(args[args.index('--prompt-file')+1]).read()])+'\\n')\nif args[:2] == ['firstmate','create-worker']: print(json.dumps({'id':'thr_secondmate','path':${JSON.stringify(home)}}))\nelif args[:2] == ['thread','show']: print(json.dumps({'id':'thr_secondmate','status':'idle','path':${JSON.stringify(home)}}))\nelif args[:2] == ['thread','stop']: sys.exit(19)\n`, { mode: 0o755 });
     const env = { ...process.env, PATH: `${fakebin}:${process.env.PATH}`, FM_HOME: home, FM_BB_PROJECT_ID: "project_1", FM_BB_MACHINE: "host_1" };
-    const run = spawnSync("bash", ["-c", `. ${JSON.stringify(join(OVERLAY_ROOT, "bin/backends/bb.sh"))}; fm_backend_bb_create_task domain "$FM_HOME" sm1 secondmate ''`], { env, encoding: "utf8" });
+    const adapter = JSON.stringify(join(home, "bin-bb/backends/bb.sh"));
+    const run = fixtureShell(`. ${adapter} && fm_backend_bb_create_task domain "$FM_HOME" sm1 secondmate ''`, { env, encoding: "utf8" });
     assert.equal(run.status, 0, run.stderr);
     const calls = readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line) as string[]);
-    const launch = calls.find(args => args[0] === "thread" && args[1] === "spawn")!;
-    assert.equal(launch[launch.indexOf("--environment") + 1], home);
+    const launch = calls.find(args => args[0] === "firstmate" && args[1] === "create-worker")!;
+    assert.equal(launch[launch.indexOf("--path") + 1], home);
     assert.ok(!launch.includes("--new-environment"));
     const prompt = calls.find(args => args[0] === "prompt-body")?.[1] ?? "";
     assert.ok(launch.includes("--prompt-file"));
@@ -7738,9 +7822,10 @@ test("IT BB secondmate launch keeps captain role and seeded home; stop failures 
     assert.match(prompt, /\/browser skill and browser_script/);
     assert.match(prompt, /profileId unset/);
     assert.doesNotMatch(prompt, /Do not dispatch nested crews/);
-    assert.ok(calls.some(args => args[0] === "firstmate" && args[1] === "mark-captain"));
+    assert.ok(launch.includes("--shape") && launch.includes("secondmate"));
+    assert.ok(!calls.some(args => args[1] === "mark-captain"));
     assert.ok(!calls.some(args => args[1] === "mark-crew"));
-    const stop = spawnSync("bash", ["-c", `. ${JSON.stringify(join(OVERLAY_ROOT, "bin/backends/bb.sh"))}; fm_backend_bb_kill thr_secondmate`], { env, encoding: "utf8" });
+    const stop = fixtureShell(`. ${adapter} && fm_backend_bb_kill thr_secondmate`, { env, encoding: "utf8" });
     assert.notEqual(stop.status, 0, "a failed native endpoint close cannot report success");
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
@@ -7755,7 +7840,7 @@ test("IT native secondmate seed and spawn use the BB captain adapter", { skip: !
     mkdirSync(join(home, "data"), { recursive: true });
     const fakebin = join(dir, "fakebin"); mkdirSync(fakebin);
     const log = join(dir, "bb.jsonl");
-    writeFileSync(join(fakebin, "bb"), `#!/usr/bin/env python3\nimport json,sys\nwith open(${JSON.stringify(log)},'a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')\nargs=sys.argv[1:]\nif args[:2] in [['thread','spawn'],['thread','show']]: print(json.dumps({'id':'thr_domain','path':${JSON.stringify(child)},'status':'idle'}))\n`, { mode: 0o755 });
+    writeFileSync(join(fakebin, "bb"), `#!/usr/bin/env python3\nimport json,sys\nwith open(${JSON.stringify(log)},'a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')\nargs=sys.argv[1:]\nif args[:2] in [['firstmate','create-worker'],['thread','show']]: print(json.dumps({'id':'thr_domain','path':${JSON.stringify(child)},'status':'idle'}))\n`, { mode: 0o755 });
     const env = {
       ...process.env, PATH: `${fakebin}:${process.env.PATH}`, FM_HOME: home, FM_BACKEND: "bb",
       FM_BB_PROJECT_ID: "proj_fixture", FM_BB_MACHINE: "host_fixture", FM_STATE_OVERRIDE: join(home, "state"),
@@ -7772,9 +7857,9 @@ test("IT native secondmate seed and spawn use the BB captain adapter", { skip: !
     assert.ok(meta.includes(`home=${child}`));
     assert.ok(readFileSync(join(child, "data/charter.md"), "utf8").includes("Firstmate"));
     const calls = readFileSync(log, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line) as string[]);
-    assert.ok(calls.some(args => args[0] === "firstmate" && args[1] === "mark-captain"));
-    const launch = calls.find(args => args[0] === "thread" && args[1] === "spawn")!;
-    assert.ok(launch.includes("--environment") && launch.includes(child));
+    assert.ok(!calls.some(args => args[1] === "mark-captain"));
+    const launch = calls.find(args => args[0] === "firstmate" && args[1] === "create-worker")!;
+    assert.ok(launch.includes("--path") && launch.includes(child));
     assert.ok(!launch.includes("--new-environment"));
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -7832,7 +7917,7 @@ test("concurrent captain queue and decision writes preserve every owner's rows",
       ];
     }));
     for (const result of writes) assert.equal(result.exitCode, 0, result.stderr);
-    assert.equal((await host.bb.storage.kv.get("queue") as unknown[]).length, 4);
+    assert.equal((await durableQueue(host) as unknown[]).length, 4);
     assert.equal((await host.bb.storage.kv.get("decisions") as unknown[]).length, 4);
   } finally { await host.harness.lifecycle.dispose(); }
 });
@@ -7843,7 +7928,8 @@ test("deck refuses readiness when a configured native adapter cannot refresh", a
   try {
     await host.bb.storage.kv.set("native-home:thr_cap", "/native/captain");
     await host.bb.storage.kv.set("native-home-host:thr_cap", "host_1");
-    stubCaptainDeck(host);
+    stubCaptainDeck(host, makeThreadResponse({ id: "thr_cap", projectId: "proj_1", environmentId: "env_cap" }));
+    host.harness.sdk.stub("environments.get", async () => ({ hostId: "host_1", status: "ready", path: "/project" }));
     host.harness.sdk.stub("terminals.create", async () => { throw new Error("fixture host unavailable"); });
     const result = await host.harness.behavior.runCli(["deck"], { threadId: "thr_cap", projectId: "proj_1" });
     assert.equal(result.exitCode, 1);
@@ -7872,21 +7958,16 @@ test("IT secondmate registration rejects a mismatched native parent", { skip: !F
 });
 
 test("native worker transport is shared with the adapter and adds no waiting policy", () => {
-  const home = mkdtempSync(join(tmpdir(), "fm-prompt-"));
+  const home=nativePromptFixture();
   try {
-    mkdirSync(join(home, "bin-bb/backends"), { recursive: true });
-    mkdirSync(join(home, "config"));
-    writeFileSync(join(home, "config/bb-overlay"), "bb\n");
-    cpSync(join(OVERLAY_ROOT, "bin/backends/bb-worker-transport.txt"), join(home, "bin-bb/backends/bb-worker-transport.txt"));
-    const brief = join(home, "brief.md");
-    writeFileSync(brief, "NATIVE_SENTINEL\npaused: native external wait\n");
-    const result = spawnSync("bash", ["-c", `. "$1"; fm_backend_bb_worker_prompt "$2" ship c1`, "audit", join(OVERLAY_ROOT, "bin/backends/bb.sh"), brief],
-      { env: { ...process.env, FM_HOME: home, FM_ROOT: home }, encoding: "utf8" });
-    assert.equal(result.status, 0, result.stderr);
-    assert.ok(result.stdout.startsWith(nativeWorkerTransport(home, "c1") + "\n\n"));
-    assert.match(result.stdout, /NATIVE_SENTINEL\npaused: native external wait/);
-    assert.doesNotMatch(result.stdout, /WAITING:|Never poll CI|stop every timer|scheduled resume/);
-  } finally { rmSync(home, { recursive: true, force: true }); }
+    const f=nativePromptScaffold(home,"c1");
+    const result=spawnSync("bash",["-c", '. "$1"; fm_backend_bb_worker_prompt "$2" ship c1',"audit",join(home,"bin-bb/backends/bb.sh"),f.source], {env:{...process.env,FM_HOME:home,FM_ROOT:home},encoding:"utf8"});
+    assert.equal(result.status,0,result.stderr);
+    assert.ok(result.stdout.includes(`Firstmate home: ${home}`));
+    assert.ok(result.stdout.includes(`${home}/data/c1/`));
+    assert.ok(result.stdout.includes(f.task));
+    assert.doesNotMatch(result.stdout,/WAITING:|Never poll CI|stop every timer|scheduled resume/);
+  } finally {rmSync(home,{recursive:true,force:true});}
 });
 
 test("BB endpoint liveness preserves idle sessions and distinguishes unreadable state", () => {
@@ -7939,11 +8020,19 @@ for (const entry of ["tool", "cli"] as const) {
     await plugin(host.bb);
     const started = Date.now();
     let elapsed = 0;
+    const receipts = new Set<string>();
+    let terminalSeq=0;
     t.mock.method(Date, "now", () => started + elapsed);
     try {
-      host.harness.sdk.stub("terminals.create", async () => ({ id: "term_wake_timeout" }));
+      host.harness.sdk.stub("terminals.create", async (args:{start:{command:string}}) => {
+        if (unwrapHostCommand(args.start.command).startsWith("bash '/tmp/.fm-receipt-")) {
+          receipts.add("term_wake_timeout");return {id:"term_wake_timeout"};
+        }
+        return {id:`term_stage_${++terminalSeq}`};
+      });
       host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
-      host.harness.sdk.stub("terminals.output", async () => {
+      host.harness.sdk.stub("terminals.output", async ({terminalId}:{terminalId:string}) => {
+        if (!receipts.has(terminalId)) return hostRcPayload("",0);
         elapsed = 181_000;
         throw new Error("HTTP 504: Timed out reading terminal output");
       });
@@ -7964,7 +8053,8 @@ for (const entry of ["tool", "cli"] as const) {
       assert.match(error, /HTTP 504/);
       assert.match(error, /term_wake_timeout/);
       assert.doesNotMatch(error, /need real mode initialized/);
-      assert.equal(host.harness.sdk.callsTo("terminals.create").length, 1, "do not rerun or acknowledge a drain on timeout");
+      assert.equal(receipts.size, 1, "do not rerun or acknowledge a drain on timeout");
+      assert.equal(host.harness.sdk.callsTo("terminals.create").filter(call=>unwrapHostCommand((call[0] as {start:{command:string}}).start.command).startsWith("bash '/tmp/.fm-receipt-")).length,1);
     } finally { t.mock.restoreAll(); await host.harness.lifecycle.dispose(); }
   });
 }
@@ -7979,7 +8069,7 @@ test("wake retries an exited terminal's failed output read without rerunning the
     let n = 0;
     host.harness.sdk.stub("terminals.create", async (args: { start?: { command?: string } }) => {
       const id = `term_${++n}`;
-      if ((args.start?.command ?? "").includes("fm-wake-drain.sh")) drainTerminals.add(id);
+      if (unwrapHostCommand(args.start?.command ?? "").startsWith("bash '/tmp/.fm-receipt-")) drainTerminals.add(id);
       return { id };
     });
     host.harness.sdk.stub("terminals.get", async () => ({ status: "exited", exitCode: 0 }));
@@ -8166,7 +8256,7 @@ test("captain hook install merges user-level Claude and Codex hooks idempotently
     const codex = JSON.parse(readFileSync(join(home, ".codex/hooks.json"), "utf8"));
     assert.equal(codex.hooks.Stop.length, 1);
     assert.ok(existsSync(join(home, ".claude/settings.json.bak-bb-firstmate")));
-    assert.equal(readFileSync(join(home, ".bb-firstmate/captains/thr_cap"), "utf8"), "home=/fm\nstate=/fm/state/cap-thr_cap\nown_home=0\n");
+    assert.equal(readFileSync(join(home, ".bb-firstmate/captains/thr_cap"), "utf8"), "home=/fm\nstate=/fm/state/cap-thr_cap\nown_home=0\nroot=/fm\n");
     assert.ok(lstatSync(join(home, ".bb-firstmate/bin/bb-captain-hook.sh")).mode & 0o100, "hook script is executable");
   } finally {
     rmSync(home, { recursive: true, force: true });
@@ -8416,13 +8506,118 @@ test("wake ack pair parses from both the native and the rewritten form", () => {
 });
 
 test("captain compaction is due only past the budget and outside the cooldown", () => {
-  const base = { budget: 200_000, now: 10_000_000, cooldownMs: 1_200_000 };
-  assert.equal(captainCompactDue({ ...base, usedTokens: 510_000, lastCompactAt: null }), true);
+  const base = { budget: 200_000, modelContextWindow: 1_000_000, estimated: false, now: 10_000_000, cooldownMs: 1_200_000 };
+  assert.equal(captainCompactDue({ ...base, usedTokens: 910_000, lastCompactAt: null }), true);
   assert.equal(captainCompactDue({ ...base, usedTokens: 150_000, lastCompactAt: null }), false);
-  assert.equal(captainCompactDue({ ...base, usedTokens: 510_000, lastCompactAt: base.now - 60_000 }), false);
-  assert.equal(captainCompactDue({ ...base, usedTokens: 510_000, lastCompactAt: base.now - 1_300_000 }), true);
+  assert.equal(captainCompactDue({ ...base, usedTokens: 910_000, lastCompactAt: base.now - 60_000 }), false);
+  assert.equal(captainCompactDue({ ...base, usedTokens: 910_000, lastCompactAt: base.now - 1_300_000 }), true);
   assert.equal(captainCompactDue({ ...base, budget: 0, usedTokens: 900_000, lastCompactAt: null }), false, "0 turns it off");
   assert.equal(captainCompactDue({ ...base, usedTokens: null, lastCompactAt: null }), false);
+  for (const overrides of [
+    { usedTokens: 899_999 }, { usedTokens: 1_000_001 }, { usedTokens: NaN },
+    { usedTokens: Infinity }, { modelContextWindow: null }, { modelContextWindow: 0 },
+    { modelContextWindow: NaN }, { estimated: true }, { budget: Infinity },
+  ]) {
+    assert.equal(captainCompactDue({ ...base, usedTokens: 900_000, lastCompactAt: null, ...overrides }), false, JSON.stringify(overrides));
+  }
+  assert.equal(captainCompactDue({ ...base, usedTokens: 900_000, lastCompactAt: null }), true);
+});
+
+async function compactionHost() {
+  const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { captainCompactAtTokens: 200000 } });
+  await host.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
+  await plugin(host.bb);
+  return { host, idle: stubCompactionHost(host) };
+}
+
+function stubCompactionHost(host: Awaited<ReturnType<typeof load>>) {
+  host.harness.sdk.stub("threads.list", async () => []);
+  host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_cap", status: "idle" }));
+  host.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 910000, modelContextWindow: 1000000, estimated: false } }));
+  host.harness.sdk.stub("threads.compact", async () => ({ ok: true }));
+  return () => host.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_cap", status: "idle" }), lastAssistantText: "" } as never);
+}
+
+for (const [name, usage] of Object.entries({
+  estimated: { usedTokens: 910000, modelContextWindow: 1000000, estimated: true },
+  "over-window provider total": { usedTokens: 2103251, modelContextWindow: 256000, estimated: false },
+  "missing capacity": { usedTokens: 910000, estimated: false },
+  "provider-managed compaction": { usedTokens: 910000, modelContextWindow: 1000000, estimated: false, snapshot: { autoCompactAtTokens: 950000 } },
+})) {
+  test(`automatic compaction ignores ${name}`, async () => {
+    const { host, idle } = await compactionHost();
+    try {
+      host.harness.sdk.stub("threads.context", async () => ({ usage }));
+      await idle();
+      assert.equal(host.harness.sdk.callsTo("threads.compact").length, 0);
+      assert.equal(await host.bb.storage.kv.get("captain-compacted-at:thr_cap"), undefined);
+    } finally { await host.harness.lifecycle.dispose(); }
+  });
+}
+
+test("automatic compaction requires new evidence after cooldown and reload", async () => {
+  let { host, idle } = await compactionHost();
+  try {
+    await idle();
+    assert.equal(host.harness.sdk.callsTo("threads.compact").length, 1);
+    await host.bb.storage.kv.set("captain-compacted-at:thr_cap", Date.now() - 1_300_000);
+    host = await host.harness.lifecycle.reload(plugin);
+    idle = stubCompactionHost(host);
+    assert.equal(await host.bb.storage.kv.get("captain-project:thr_cap"), "proj_1");
+    await idle();
+    assert.equal(host.harness.sdk.callsTo("threads.compact").length, 0, "unchanged evidence survives reload and cooldown");
+    host.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 300000, modelContextWindow: 1000000, estimated: false } }));
+    await idle();
+    assert.equal(await host.bb.storage.kv.get("thread-compaction-evidence:thr_cap"), undefined, "lower usage clears the old measurement");
+    host.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 910000, modelContextWindow: 1000000, estimated: false } }));
+    await idle();
+    assert.equal(host.harness.sdk.callsTo("threads.compact").length, 1, "context that shrank and filled again is eligible");
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("automatic compaction coalesces simultaneous idle events", async () => {
+  const { host, idle } = await compactionHost();
+  let release!: () => void;
+  let entered!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  try {
+    host.harness.sdk.stub("threads.context", async () => {
+      entered(); await blocked;
+      return { usage: { usedTokens: 910000, modelContextWindow: 1000000, estimated: false } };
+    });
+    const first = idle();
+    await awaitWithin(started, 1000, "first check did not read context");
+    const second = idle();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    release();
+    await Promise.all([first, second]);
+    assert.equal(host.harness.sdk.callsTo("threads.context").length, 1);
+    assert.equal(host.harness.sdk.callsTo("threads.compact").length, 1);
+  } finally { release(); await host.harness.lifecycle.dispose(); }
+});
+
+test("automatic compaction rechecks current thread status after reading usage", async () => {
+  const { host, idle } = await compactionHost();
+  try {
+    for (const thread of [
+      makeThreadResponse({ id: "thr_cap", status: "active" }),
+      makeThreadResponse({ id: "thr_cap", status: "idle", archivedAt: Date.now() }),
+    ]) {
+      host.harness.sdk.stub("threads.get", async () => thread);
+      await idle();
+    }
+    assert.equal(host.harness.sdk.callsTo("threads.compact").length, 0);
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("automatic compaction preserves a captain with ample context remaining", async () => {
+  const { host, idle } = await compactionHost();
+  try {
+    host.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 510_862, estimated: false, modelContextWindow: 1_000_000 } }));
+    await idle();
+    assert.equal(host.harness.sdk.callsTo("threads.compact").length, 0, "a half-empty context does not need compaction");
+  } finally { await host.harness.lifecycle.dispose(); }
 });
 
 test("an idle captain past its context budget is compacted once; a crew compacts on its own stamp", async () => {
@@ -8431,7 +8626,8 @@ test("an idle captain past its context budget is compacted once; a crew compacts
   await plugin(fresh.bb);
   try {
     fresh.harness.sdk.stub("threads.list", async () => []);
-    fresh.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 510_862, estimated: false, modelContextWindow: 1_000_000 } }));
+    fresh.harness.sdk.stub("threads.get", async ({ threadId }) => makeThreadResponse({ id: threadId, status: "idle" }));
+    fresh.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 910_862, estimated: false, modelContextWindow: 1_000_000 } }));
     fresh.harness.sdk.stub("threads.compact", async () => ({ ok: true }));
     const idle = (id: string) => fresh.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id, status: "idle" }), lastAssistantText: "" } as never);
     await idle("thr_cap");
@@ -8539,7 +8735,7 @@ for (const operation of ["context", "compact"] as const) {
       host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_cap", status: "idle" }));
       host.harness.sdk.stub("threads.context", async () => {
         if (operation === "context") { entered(); await blocked; }
-        return { usage: { usedTokens: 510000 } };
+        return { usage: { usedTokens: 910000, estimated: false, modelContextWindow: 1000000 } };
       });
       host.harness.sdk.stub("threads.compact", async () => {
         if (operation === "compact") { entered(); await blocked; }
@@ -8871,7 +9067,7 @@ test("an already-idle captain past the budget is compacted by the sweep, without
   await plugin(fresh.bb);
   try {
     fresh.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_cap", status: "idle" }));
-    fresh.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 358_171, estimated: false, modelContextWindow: 1_000_000 } }));
+    fresh.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 958_171, estimated: false, modelContextWindow: 1_000_000 } }));
     fresh.harness.sdk.stub("threads.compact", async () => ({ ok: true }));
     const run = fresh.harness.behavior.runService("captain-wake-release");
     const deadline = Date.now() + 3000;
@@ -9187,6 +9383,7 @@ test("a failed dispatch names BB's own error instead of guessing provider/model"
 test("dispatch records its title; relaunch and listings reuse it instead of the raw task quote", async () => {
   const host = await load();
   try {
+    host.harness.sdk.stub("environments.get", async () => ({ id:"env_wt",hostId:"host_1",status:"ready",path:"/repo/isolated",isWorktree:true }));
     host.harness.sdk.stub("environments.list", async () => [{ hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" }]);
     host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew" }));
     host.harness.sdk.stub("threads.list", async () => []);
@@ -9571,8 +9768,9 @@ test("real transport adopts the created thread when BB answers 504 while the cre
       if (listCalls <= 2) throw new Error("HTTP 504 Gateway Timeout");
       return [{ id: "thr_orphan", projectId: "proj_1", parentThreadId: "thr_cap", title: "renamed-window" }];
     });
-    const result = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--", "fix flaky login"], { projectId: "proj_1" });
-    assert.equal(result.exitCode, 0, result.stderr);
+    const result = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--", "fix flaky login"], { threadId:"thr_cap",projectId: "proj_1" });
+    assert.equal(result.exitCode, 1, "adoption cannot attest missing native admission");
+    assert.match(result.stderr,/provisioning/);
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0, "no duplicate spawn");
     assert.ok(listCalls >= 3, "the transient listing failure was retried, not read as no orphan");
     assert.equal((await crewsKv(host))[0]?.threadId, "thr_orphan");
@@ -9641,8 +9839,9 @@ test("real transport re-looks for the thread after a 504 spawn failure and adopt
       listCalls++;
       return listCalls <= 2 ? [] : [{ id: "thr_late", projectId: "proj_1", parentThreadId: "thr_cap", title: "renamed-window" }];
     });
-    const result = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--", "fix flaky login"], { projectId: "proj_1" });
-    assert.equal(result.exitCode, 0, result.stderr);
+    const result = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--", "fix flaky login"], { threadId:"thr_cap",projectId: "proj_1" });
+    assert.equal(result.exitCode, 1, "adoption cannot attest missing native admission");
+    assert.match(result.stderr,/provisioning/);
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0, "no duplicate spawn");
     assert.ok(listCalls >= 3, `the thread was looked for again after the failed spawn (saw ${listCalls} list calls)`);
     assert.equal((await crewsKv(host))[0]?.threadId, "thr_late");
@@ -9696,7 +9895,7 @@ test("wake drain preserves open decisions even when the crew register and metada
       if (cmd.includes("FMORPHAN")) return { payload: "FMORPHAN 96b4c16c\nFMORPHAN live1234\n" };
       if (cmd.startsWith("cat -- ") && cmd.includes("96b4c16c.status")) return { payload: "blocked [at=1]: CI billing blocks PR 1805\ndone: PR merged\n" };
       if (cmd.startsWith("cat -- ") && cmd.includes("live1234.status")) return { payload: "blocked: waiting on the captain\n" };
-      if (cmd.includes("wake-receipt") || cmd.includes("fm-wake-drain")) return { payload: wakeFrame("No unread reports.") };
+      if (cmd.startsWith("bash '/tmp/.fm-receipt-") || cmd.includes("wake-receipt") || cmd.includes("fm-wake-drain")) return { payload: wakeFrame("No unread reports.") };
       return { payload: "" };
     });
     const result = await host.harness.behavior.runCli(["wake"], { projectId: "proj_1", threadId: "thr_cap" });
@@ -9741,7 +9940,7 @@ test("queue drop closes a hand-filed native backlog row, and prune forgets finis
     assert.ok(routed.seen.map(unwrapHostCommand).some((c) => c.includes("fm-tasks-axi.sh") && c.includes("'rm'") && c.includes("'old-pr'")), "native row removed");
     const pruned = toolText(await queue.execute({ action: "prune" }, ctx));
     assert.match(pruned, /Pruned 1 finished/);
-    assert.deepEqual(await host.bb.storage.kv.get("queue"), []);
+    assert.deepEqual(await durableQueue(host), []);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -9754,7 +9953,7 @@ test("wake drain retires a Lavish source whose artifact is gone through the nati
     const routed = stubRoutedHost(host, (wrapped) => {
       const cmd = unwrapHostCommand(wrapped);
       if (cmd.includes("FMSTALESRC")) return { payload: "FMSTALESRC lavish-362f54fae363665b\n" };
-      if (cmd.includes("wake-receipt") || cmd.includes("fm-wake-drain")) return { payload: wakeFrame("No unread reports.") };
+      if (cmd.startsWith("bash '/tmp/.fm-receipt-") || cmd.includes("wake-receipt") || cmd.includes("fm-wake-drain")) return { payload: wakeFrame("No unread reports.") };
       return { payload: "" };
     });
     const result = await host.harness.behavior.runCli(["wake"], { projectId: "proj_1", threadId: "thr_cap" });
@@ -10582,6 +10781,8 @@ test("a failed queued row with the same body is re-sent instead of appended", as
 test("native startup tool routes to the agent shell without attempting a host-terminal lock", async () => {
   const host = ownerHost();
   await plugin(host.bb);
+  await host.bb.storage.kv.set("native-home:thr_cap", "/tmp/fm-home");
+  await host.bb.storage.kv.set("native-home-host:thr_cap", "host_1");
   try {
     host.harness.sdk.stub("terminal.sessions.create", async () => { throw new Error("startup must not run outside the harness"); });
     const tool = host.harness.inspection.registrations.agentTools.find(t => t.name === "firstmate_fm")!;
@@ -10604,11 +10805,13 @@ test("startup command preserves shell arguments without executing their contents
   try {
     const actualHome = join(work, "fm home'quoted");
     mkdirSync(join(actualHome, "bin-bb"), { recursive: true });
+    mkdirSync(join(actualHome, "config"));
+    writeFileSync(join(actualHome, "config/bb-overlay"), "bin-bb\n");
     writeFileSync(join(actualHome, "bin-bb/fm-session-start.sh"), '#!/usr/bin/env python3\nimport json,os,sys\nprint(json.dumps([os.getcwd(), os.environ["FM_HOME"], os.environ["FM_ROOT_OVERRIDE"], os.environ["FM_BACKEND"], sys.argv[1:]]))\n', { mode: 0o755 });
     const result = spawnSync("bash", ["-c", captainStartupCommand(actualHome, "session-start", [arg])!], { encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(JSON.parse(result.stdout), [actualHome, actualHome, actualHome, "bb", [arg]]);
-    assert.ok(command.includes("bin-bb/fm-session-start.sh"));
+    assert.ok(command.includes("$FM_BINDIR/fm-session-start.sh"));
     assert.equal(captainStartupCommand(home, "peek"), null);
   } finally { rmSync(work, { recursive: true, force: true }); }
 });
@@ -10617,9 +10820,11 @@ test("startup command preserves shell arguments without executing their contents
 test("CLI startup returns the same harness-shell command without host execution", async () => {
   const host = ownerHost();
   await plugin(host.bb);
+  await host.bb.storage.kv.set("native-home:thr_cap", "/tmp/fm-home");
+  await host.bb.storage.kv.set("native-home-host:thr_cap", "host_1");
   try {
     host.harness.sdk.stub("terminal.sessions.create", async () => { throw new Error("detached startup must not execute"); });
-    const result = await host.harness.behavior.runCli(["fm", "session-start", "--source", "compact", "--json"]);
+    const result = await host.harness.behavior.runCli(["fm", "session-start", "--source", "compact", "--json"], { threadId: "thr_cap", projectId: "proj_1" });
     assert.equal(result.exitCode, 0, result.stderr);
     const body = JSON.parse(result.stdout);
     assert.equal(body.requiresAgentShell, true);
@@ -10631,26 +10836,24 @@ test("CLI startup returns the same harness-shell command without host execution"
 
 for (const missing of [false, true]) {
   test(`native replacement retry ${missing ? "preserves the prior thread when its brief is missing" : "uses the native brief through the shared transport wrapper"}`, async () => {
-    const home = scratchFmHome();
-    mkdirSync(join(home, "config"));
-    mkdirSync(join(home, "bin-bb/backends"), { recursive: true });
-    mkdirSync(join(home, "data/c1"), { recursive: true });
-    writeFileSync(join(home, "config/bb-overlay"), "bb\n");
-    cpSync(join(OVERLAY_ROOT, "bin/backends/bb.sh"), join(home, "bin-bb/backends/bb.sh"));
-    cpSync(join(OVERLAY_ROOT, "bin/backends/bb-worker-transport.txt"), join(home, "bin-bb/backends/bb-worker-transport.txt"));
-    symlinkSync(join(FM_TEST_BIN, "fm-composer-lib.sh"), join(home, "bin-bb/fm-composer-lib.sh"));
-    const brief = "FIRSTMATE_OP: v1 launch-brief\nNative role sentinel\npaused: native wait\n";
-    if (!missing) writeFileSync(join(home, "data/c1/brief.md"), brief);
+    const f=replacementFixture(undefined,"ship","local-only");
+    const home=f.home;
+    if (!missing) {
+      const role=spawnSync("bash",["-c",'. "$1"; fm_brief_worker_role "$2" c1',"fixture",join(home,"bin/fm-dod-lib.sh"),join(home,"state")],{encoding:"utf8"});
+      assert.equal(role.status,0,role.stderr);
+      writeFileSync(join(home,"data/c1/launch-brief.md"),role.stdout+"\n"+f.brief);
+    } else {rmSync(join(home,"data/c1/brief.md"));}
     const host = itHost(home, { transport: "real" });
     await plugin(host.bb);
     try {
       stubRealExecHost(host);
       host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: "error", environmentId: "env_wt" }));
-      host.harness.sdk.stub("environments.get", async () => ({ id: "env_wt", hostId: "host_1", status: "ready", path: "/repo/isolated", isWorktree: true }));
+      host.harness.sdk.stub("environments.get", async () => ({ id: "env_wt", hostId: "host_1", status: "ready", path: f.wt, isWorktree: true }));
       host.harness.sdk.stub("threads.stop", async () => ({}));
       host.harness.sdk.stub("threads.archive", async () => ({}));
       host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_new" }));
-      await host.bb.storage.kv.set("crews", [{ ...crewRow("c1", "thr_crew", "thr_cap"), nativeHome: home, backlogRow: true }]);
+      host.harness.sdk.stub("environments.list", async()=>[{id:"env_source",hostId:"host_1",status:"ready",path:f.repo,isWorktree:false}]);
+      await host.bb.storage.kv.set("crews", [{ ...crewRow("c1", "thr_old", "thr_cap"), posture:"local-only",nativeHome: home, backlogRow: true }]);
       const result = await host.harness.behavior.runCli(["retry", "c1", "--reasoning-level", "xhigh"]);
       assert.equal(result.exitCode, missing ? 1 : 0, result.stderr);
       if (missing) {
@@ -10659,10 +10862,12 @@ for (const missing of [false, true]) {
         assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
       } else {
         const spawned = host.harness.sdk.callsTo("threads.spawn")[0]![0] as { prompt: string };
-        assert.ok(spawned.prompt.includes(brief));
+        assert.match(spawned.prompt,/Smooth canvas zoom/);
+        assert.match(spawned.prompt,/# Current worker role contract/);
+        assert.doesNotMatch(spawned.prompt,/stale source must not replace/);
         assert.doesNotMatch(spawned.prompt, /Never poll CI|WAITING:|stop every timer|final message MUST/);
       }
-    } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
+    } finally { await host.harness.lifecycle.dispose(); f.clean(); }
   });
 }
 
@@ -10729,3 +10934,52 @@ test("registered captain reports a missing installed hook while other threads st
     assert.equal(other.stderr,"");
   } finally {rmSync(root,{recursive:true,force:true});}
 });
+
+test("native replacement refuses a stale owned inbox helper before stopping or spawning a worker",async()=>{
+  const home=nativePromptFixture();
+  nativePromptScaffold(home,"c1","ship","local-only");
+  writeFileSync(join(home,"bin-bb/fm-inbox-take.py"),"obsolete helper ignoring immutable IDs\n");
+  const host=itHost(home,{transport:"real"});await plugin(host.bb);
+  try {
+    stubRealExecHost(host);
+    host.harness.sdk.stub("threads.get",async({threadId}:{threadId:string})=>makeThreadResponse({id:threadId,status:"error",environmentId:"env_wt"}));
+    host.harness.sdk.stub("environments.get",async()=>({id:"env_wt",hostId:"host_1",status:"ready",path:"/repo/isolated",isWorktree:true}));
+    await host.bb.storage.kv.set("crews",[{...crewRow("c1","thr_crew","thr_cap"),nativeHome:home,backlogRow:true}]);
+    const result=await host.harness.behavior.runCli(["retry","c1","--reasoning-level","xhigh"]);
+    assert.equal(result.exitCode,1);assert.match(result.stderr,/FM_MIRROR_STALE.*fm-inbox-take.py/);
+    assert.equal(host.harness.sdk.callsTo("threads.stop").length,0);assert.equal(host.harness.sdk.callsTo("threads.spawn").length,0);
+  }finally{await host.harness.lifecycle.dispose();rmSync(home,{recursive:true,force:true});}
+});
+
+for (const pin of ["2d833ff147cd26a5c461e914e06854e0eb2707ce", "1f3e769616fdf9f31f85f4c3e6a9f71606634238"]) {
+  test(`registered remote overlay install ships exact patch set for native ${pin.slice(0,8)} without upgrading its seeded home`, async () => {
+    const parent=nativePromptFixture(pin),work=mkdtempSync(join(tmpdir(),"fm-remote-compat-")),child=join(work,"child");
+    const seeded=spawnSync("bash",[join(parent,"bin/fm-home-seed.sh"),"domain",child,"--no-projects"],{env:{...process.env,FM_HOME:parent,FM_BACKEND:"bb",FM_SECONDMATE_CHARTER:"Fixture audit",FM_SECONDMATE_SCOPE:"Fixture audit"},encoding:"utf8",timeout:30000});
+    assert.equal(seeded.status,0,seeded.stdout+seeded.stderr);
+    const host=itHost(parent,{});await plugin(host.bb);
+    try {
+      stubRealExecHost(host);
+      host.harness.sdk.stub("threads.get",async({threadId}:{threadId:string})=>makeThreadResponse({id:threadId,status:"idle",environmentId:"env_main"}));
+      host.harness.sdk.stub("environments.get",async()=>({id:"env_main",hostId:"host_1",status:"ready",path:parent,isWorktree:false}));
+      host.harness.sdk.stub("threads.updatePluginMetadata",async()=>({}));
+      const commands=new Map<string,string>();let sequence=0;
+      host.harness.sdk.stub("terminals.create",async(args:{start:{command:string}})=>{const id=`remote_${++sequence}`;commands.set(id,args.start.command);return{id};});
+      host.harness.sdk.stub("terminals.output",async({terminalId}:{terminalId:string})=>{
+        const inner=unwrapHostCommand(commands.get(terminalId)??"");
+        // Force only the remote-host discovery seam; execute every payload write
+        // and the actual remote installer command against this disposable home.
+        if(inner.includes("echo FM_OVERLAY_LOCAL"))return hostRcPayload("FM_OVERLAY_REMOTE\n",0);
+        const result=spawnSync("bash",["-c",inner],{env:{...process.env,TMPDIR:work},encoding:"utf8",timeout:30000});
+        return hostRcPayload((result.stdout??"")+(result.stderr??""),result.status??1);
+      });
+      const result=await host.harness.behavior.runCli(["mark-captain","thr_domain","--home",child,"--parent-home",parent,"--task","domain"],{threadId:"thr_cap",projectId:"proj_1"});
+      assert.equal(result.exitCode,0,result.stderr);
+      const manifest=readFileSync(join(child,"bin-bb/.mirror-manifest"),"utf8");assert.match(manifest,new RegExp(`^head=${pin}$`,"m"));assert.match(manifest,new RegExp(`^patch-set=${pin}$`,"m"));
+      assert.equal(spawnSync("git",["-C",child,"rev-parse","HEAD"],{encoding:"utf8"}).stdout.trim(),pin);
+      const bundle=readdirSync(work).find(name=>name.startsWith("fm-bb-overlay-"));assert.ok(bundle,"remote upload path must run");
+      for(const rel of OVERLAY_INSTALL_INPUTS)assert.deepEqual(readFileSync(join(work,bundle!,rel)),readFileSync(join(OVERLAY_ROOT,rel)));
+      const verified=spawnSync("python3",[join(OVERLAY_ROOT,"install-bb-backend.py"),"--home",child,"--verify"],{encoding:"utf8"});assert.equal(verified.status,0,verified.stderr);
+      assert.equal(await host.bb.storage.kv.get("native-home:thr_domain"),child);assert.equal(host.harness.sdk.callsTo("threads.spawn").length,0);
+    }finally{await host.harness.lifecycle.dispose();rmSync(parent,{recursive:true,force:true});rmSync(work,{recursive:true,force:true});}
+  });
+}
