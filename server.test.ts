@@ -1,7 +1,7 @@
 import {replacementFixture} from './lib/replacement.fixture.mjs';
 import { fixture as nativePromptFixture,scaffold as nativePromptScaffold } from './scripts/prompt-fixture.mjs';
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
 import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -59,6 +59,39 @@ import { FIRSTMATE_ROUTINE_MARKER } from "./lib/timeline-noise.ts";
 
 const CAPTAIN_TEST_SKILLS = ["captain", "firstmate", "calm", "catch-up", "captain-methods", ...UPSTREAM_SKILL_NAMES] as const;
 const SKILLS = [...CAPTAIN_TEST_SKILLS, "worker-methods"] as const;
+
+// No fixture sends bytes on the host shell's stdin; native input is explicitly
+// staged/redirection-owned by the command. Node's default socket-backed stdin
+// makes a top-level `bash -c` source HOME/.bashrc (remote-shell detection), which
+// can replace our fake PATH with the real BB CLI in a shell-less service.
+function fixtureShell(command: string, options: SpawnSyncOptionsWithStringEncoding) {
+  return spawnSync("bash", ["-c", command], { ...options, stdio: ["ignore", "pipe", "pipe"] });
+}
+
+test("closed-stdin BB fixtures preserve fake PATH when a service has no shell level", () => {
+  const home = mkdtempSync(join(tmpdir(), "fm-fixture-shell-"));
+  try {
+    const fakebin = join(home, "fakebin"), startupbin = join(home, "startupbin");
+    mkdirSync(fakebin); mkdirSync(startupbin);
+    writeFileSync(join(fakebin, "bb"), "#!/bin/sh\nprintf 'FIXTURE_BB\\n'\n", { mode: 0o755 });
+    writeFileSync(join(startupbin, "bb"), "#!/bin/sh\nprintf 'STARTUP_PATH_BB\\n'\nexit 97\n", { mode: 0o755 });
+    writeFileSync(join(home, ".bashrc"), `export PATH='${startupbin}':"$PATH"\n`);
+    const env = { ...process.env, HOME: home, PATH: `${fakebin}:/usr/bin:/bin` };
+    for (const key of ["SHLVL", "BASH_ENV", "ENV", "BB_CLI", "SSH_CLIENT", "SSH_CONNECTION"]) delete env[key];
+    // Reproduce the old escape safely: both executables are disposable stubs.
+    const escaped = spawnSync("bash", ["-c", "bb fixture-status"], { env, encoding: "utf8" });
+    assert.equal(escaped.status, 97, escaped.stderr);
+    assert.equal(escaped.stdout, "STARTUP_PATH_BB\n");
+    const isolated = fixtureShell("bb fixture-status", { env, encoding: "utf8" });
+    assert.equal(isolated.status, 0, isolated.stderr);
+    assert.equal(isolated.stdout, "FIXTURE_BB\n");
+    // Explicit native stdin redirection remains available despite closed stdin.
+    writeFileSync(join(home, "input"), "staged input\n");
+    const input = fixtureShell('cat < "$HOME/input"', { env, encoding: "utf8" });
+    assert.equal(input.status, 0, input.stderr);
+    assert.equal(input.stdout, "staged input\n");
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
 
 function wakeFrame(report: string): string {
   return "FM_BB_RECEIPT=" + JSON.stringify({ id: "fixture", phase: "ready", report, path: "/tmp/report.txt", replayed: false, truncated: false });
@@ -3282,7 +3315,7 @@ test("bb crew launch prompt preserves the brief with only BB transport adaptatio
     const f=nativePromptScaffold(home,"c1","scout");
     const brief=f.source;
     const env = { ...process.env, PATH: `${fakebin}:${process.env.PATH}`, FM_HOME: home, FM_ROOT: home, FM_BB_PROJECT_ID: "project_1", FM_BB_MACHINE: "host_1" };
-    const run = spawnSync("bash", ["-c", `. ${JSON.stringify(join(OVERLAY_ROOT, "bin/backends/bb.sh"))} 2>/dev/null; fm_backend_bb_create_task "Scout" /repo c1 scout "$BRIEF"`], { env: { ...env, BRIEF: brief }, encoding: "utf8" });
+    const run = fixtureShell(`. ${JSON.stringify(join(home, "bin-bb/backends/bb.sh"))} && fm_backend_bb_create_task "Scout" /repo c1 scout "$BRIEF"`, { env: { ...env, BRIEF: brief }, encoding: "utf8" });
     assert.equal(run.status, 0, run.stderr);
     const calls = readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line) as string[]);
     const launch = calls.find(args => args[0] === "firstmate" && args[1] === "create-worker")!;
@@ -6289,7 +6322,7 @@ function stubRealExecHost(host: Awaited<ReturnType<typeof load>>, extraEnv: Reco
   host.harness.sdk.stub("terminals.close", async () => ({}));
   host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
     const inner = unwrapHostCommand(cmds.get(args.terminalId) ?? "");
-    const r = spawnSync("bash", ["-c", inner], { encoding: "utf8", timeout: 30_000, env: { ...process.env, ...extraEnv } });
+    const r = fixtureShell(inner, { encoding: "utf8", timeout: 30_000, env: { ...process.env, ...extraEnv } });
     return hostRcPayload((r.stdout ?? "") + (r.stderr ?? ""), typeof r.status === "number" ? r.status : 1);
   });
 }
@@ -7768,15 +7801,16 @@ test("IT native local merge respects captain hold and lands BB-named branch", { 
 });
 
 test("IT BB secondmate launch keeps captain role and seeded home; stop failures propagate", { skip: !FM_INTEGRATION }, () => {
-  const home = scratchFmHome();
-  mkdirSync(join(home, "data"));
+  const home = nativePromptFixture();
+  mkdirSync(join(home, "data"), { recursive: true });
   const fakebin = join(home, "fakebin");
   const log = join(home, "transport.jsonl");
   try {
     mkdirSync(fakebin);
     writeFileSync(join(fakebin, "bb"), `#!/usr/bin/env python3\nimport json,sys\nwith open(${JSON.stringify(log)}, 'a') as f:\n    args=sys.argv[1:]\n    f.write(json.dumps(args)+'\\n')\n    if '--prompt-file' in args:\n        f.write(json.dumps(['prompt-body', open(args[args.index('--prompt-file')+1]).read()])+'\\n')\nif args[:2] == ['firstmate','create-worker']: print(json.dumps({'id':'thr_secondmate','path':${JSON.stringify(home)}}))\nelif args[:2] == ['thread','show']: print(json.dumps({'id':'thr_secondmate','status':'idle','path':${JSON.stringify(home)}}))\nelif args[:2] == ['thread','stop']: sys.exit(19)\n`, { mode: 0o755 });
     const env = { ...process.env, PATH: `${fakebin}:${process.env.PATH}`, FM_HOME: home, FM_BB_PROJECT_ID: "project_1", FM_BB_MACHINE: "host_1" };
-    const run = spawnSync("bash", ["-c", `. ${JSON.stringify(join(OVERLAY_ROOT, "bin/backends/bb.sh"))}; fm_backend_bb_create_task domain "$FM_HOME" sm1 secondmate ''`], { env, encoding: "utf8" });
+    const adapter = JSON.stringify(join(home, "bin-bb/backends/bb.sh"));
+    const run = fixtureShell(`. ${adapter} && fm_backend_bb_create_task domain "$FM_HOME" sm1 secondmate ''`, { env, encoding: "utf8" });
     assert.equal(run.status, 0, run.stderr);
     const calls = readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line) as string[]);
     const launch = calls.find(args => args[0] === "firstmate" && args[1] === "create-worker")!;
@@ -7791,7 +7825,7 @@ test("IT BB secondmate launch keeps captain role and seeded home; stop failures 
     assert.ok(launch.includes("--shape") && launch.includes("secondmate"));
     assert.ok(!calls.some(args => args[1] === "mark-captain"));
     assert.ok(!calls.some(args => args[1] === "mark-crew"));
-    const stop = spawnSync("bash", ["-c", `. ${JSON.stringify(join(OVERLAY_ROOT, "bin/backends/bb.sh"))}; fm_backend_bb_kill thr_secondmate`], { env, encoding: "utf8" });
+    const stop = fixtureShell(`. ${adapter} && fm_backend_bb_kill thr_secondmate`, { env, encoding: "utf8" });
     assert.notEqual(stop.status, 0, "a failed native endpoint close cannot report success");
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
