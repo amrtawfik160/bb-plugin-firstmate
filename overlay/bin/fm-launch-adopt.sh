@@ -8,12 +8,12 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 case "${1:-}" in --check|--publish) ACTION=$1 ;; *) echo 'Usage: fm-launch-adopt.sh --check|--publish (plugin evidence on stdin)' >&2; exit 2 ;; esac
 [ "$#" = 1 ] || exit 2
 : "${FM_HOME:?}" "${FM_BINDIR:?}"
-[ "$FM_BINDIR" = "$FM_HOME/bin-bb" ] || { echo 'REFUSED: adoption requires the current BB mirror' >&2; exit 2; }
+[ "$FM_BINDIR" = "${FM_ROOT_OVERRIDE:-$FM_HOME}/bin-bb" ] || { echo 'REFUSED: adoption requires the current BB mirror' >&2; exit 2; }
 STATE=$FM_HOME/state
 CONFIG=$FM_HOME/config
 DATA=$FM_HOME/data
 export FM_TASKS_AXI_TIMEOUT=5
-export FM_ROOT=$FM_HOME FM_ROOT_OVERRIDE=$FM_HOME FM_STATE_OVERRIDE=$STATE
+export FM_ROOT=${FM_ROOT_OVERRIDE:-$FM_HOME} FM_ROOT_OVERRIDE=${FM_ROOT_OVERRIDE:-$FM_HOME} FM_STATE_OVERRIDE=$STATE
 TMP=$(mktemp -d)
 TASK_LOCK= META_LOCK=
 cleanup() {

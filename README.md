@@ -45,9 +45,11 @@ Or from a local checkout:
 bb plugin install path:/path/to/bb-plugin-firstmate --yes
 ```
 
-Requires `bb >= 0.43` and `bbPluginSdk >= 0.4.87` (see `package.json` engines).
+Requires `bb >= 0.43` and `bbPluginSdk >= 0.4.104` (see `package.json` engines).
 
-Update the plugin itself with `bb plugin update firstmate`. Re-running `/captain` verifies or refreshes the BB adapter for the existing audited native version. Explicit `bb firstmate init --real` can fast-forward a clean `fmHome` clone to the plugin’s audited upstream commit.
+A clean installation bundles pinned native Firstmate plus its matching BB adapter. No separately installed Firstmate repository is required. Git, BB, Python, Bash, forge credentials and the native tool prerequisites remain host dependencies; see [runtime installation and upgrades](docs/self-contained-runtime.md).
+
+Update with `bb plugin update firstmate`. Updates never fetch native upstream during startup or automatically switch an existing captain's runtime. `bb firstmate runtime status --json` reports the plugin version, bundled upstream commit and adapter revision, installed releases, and the exact selected home runtime. Existing external homes keep their paths and version until an explicit guarded migration.
 
 ## Quick start
 
@@ -73,6 +75,7 @@ Bare `deck` defers fleet inventory to native startup. Request `deck --digest`, `
 | --- | --- |
 | `deck` / `session` | Bind the exact home and return pending startup / print the fleet digest |
 | `contract` | Read the complete current native supervisor contract and BB adaptations |
+| `runtime` | Inspect installed/selected code; explicitly install, check, select, migrate or roll back a quiescent home |
 | `dispatch` | Spawn a ship (isolated worktree) or scout (read-only) crew |
 | `tell` / `interrupt` / `stop` / `retry` | Live steer, hard stop, or re-run a crew |
 | `watch` / `bearings` | Wait on crews, or print the 5-section fleet digest |
@@ -134,12 +137,13 @@ thread-isolated profiles. Other AXI tools, including Lavish, retain their roles.
 The native tools cover the liaison loop. For the full bash policy engine (brief, gate, inbox, watch, merge, teardown, afk, bearings, backlog), the plugin drives upstream firstmate's `bin/` scripts with BB as the session backend:
 
 ```sh
-bb firstmate init --real        # clone upstream firstmate, overlay backends/bb.sh, set config/backend=bb
-bb firstmate scripts [query]    # verify 194 callable scripts + 22 helpers/adapters, then search entrypoints
-bb firstmate fm <script> ...    # run any bin/fm-<script>.sh with FM_BACKEND=bb
+bb firstmate init --real        # install/select the pinned bundle for this owning thread
+bb firstmate runtime status --json # installed releases versus selected per-home code
+bb firstmate scripts [query]    # inspect installed entries and explicit bundled exclusions
+bb firstmate fm <script> ...    # run supported bin/fm-<script>.sh with FM_BACKEND=bb
 ```
 
-`overlay/bin/backends/bb.sh` adapts firstmate's backend operations to BB: spawn becomes `bb thread spawn` into a managed worktree, capture becomes `bb thread output`, send becomes `bb thread tell`, kill becomes `bb thread stop`. Native dispatch writes the same `state/<id>.meta` ledger the scripts do, so `fm-peek`, `fm-send`, and the plugin's tools see one fleet.
+`overlay/bin/backends/bb.sh` adapts firstmate's backend operations to BB: spawn uses the internal creation bridge and public SDK to seed identity before the first turn in a managed worktree, capture becomes `bb thread output`, send becomes `bb thread tell`, kill becomes `bb thread stop`. Native dispatch writes the same `state/<id>.meta` ledger the scripts do, so `fm-peek`, `fm-send`, and the plugin's tools see one fleet.
 
 BB-specific behavior in this fork:
 
@@ -154,8 +158,8 @@ BB-specific behavior in this fork:
 | Key | Default | Purpose |
 | --- | --- | --- |
 | `fullParityOnDeck` | on | `/captain` binds a scoped native home and configures native owners; native startup and explicit legacy migration remain separate |
-| `firstmateRepo` | upstream repo URL | Repo cloned by `init --real` |
-| `fmHome` | empty | Firstmate home on the host; set by `init --real` |
+| `firstmateRepo` | upstream repo URL | Legacy attribution; bundled startup does not clone/fetch it |
+| `fmHome` | empty | Blank selects bundled runtime for new captains; a configured external source stays external |
 | `defaultProvider` | blank | Crew provider id (blank = BB resolves) |
 | `defaultPermissionMode` | `resolve` | Crew permission mode (`resolve` = inherit from the captain) |
 | `supervisionEnabled` | off | Captain pings on done/fail/stuck; successful deck binding or `dispatch` enables supervision |

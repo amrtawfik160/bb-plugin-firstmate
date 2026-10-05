@@ -63,6 +63,9 @@ export function createLaunches(db: Database) {
       : db.prepare('SELECT record FROM launches WHERE owner=? ORDER BY key LIMIT ? OFFSET ?').all(owner, Math.max(1,Math.min(limit, 100)), Math.max(0,offset));
     return (rows as { record: string }[]).map(r => JSON.parse(r.record));
   }
+  function hasRuntimeConsumers(owner:string) {
+    return !!db.prepare("SELECT 1 FROM launches WHERE owner=? AND state IN ('reserved','creating','provisioning','running','uncertain') LIMIT 1").get(owner);
+  }
   function heldTaskIds(owner:string) {
     const rows=db.prepare("SELECT record FROM launches WHERE owner=? AND state IN ('reserved','creating','provisioning','uncertain')").all(owner) as {record:string}[];
     return rows.map(row=>{const r=JSON.parse(row.record) as LaunchRecord;return launchTaskKey(r.projectId,r.taskId);});
@@ -164,7 +167,7 @@ export function createLaunches(db: Database) {
       }
     });
   }
-  return { get, save, update, list, heldTaskIds, forTask,reassignWorker,workerDeleted,isDeletedWorker,adoptionTask,claimAdoption,reserve, once, create };
+  return { get, save, update, list, heldTaskIds,hasRuntimeConsumers, forTask,reassignWorker,workerDeleted,isDeletedWorker,adoptionTask,claimAdoption,reserve, once, create };
 }
 
 async function recoveryRead<T>(operation:Promise<T>,signal?:AbortSignal):Promise<T> {

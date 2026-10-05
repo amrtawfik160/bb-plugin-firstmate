@@ -1,0 +1,16 @@
+{
+  "adapterRevision": "b435326123441eac4de8fc46c1f5694fc61183d4112c545abf897082affa4cdf",
+  "archiveBytes": 2666874,
+  "archiveSha256": "0399578caa2eab04274e13473fb71ade297386c89afea09142e9388a63431764",
+  "auditedSources": [
+    "1f3e769616fdf9f31f85f4c3e6a9f71606634238",
+    "2d833ff147cd26a5c461e914e06854e0eb2707ce"
+  ],
+  "helperSha256": "55f3858c73e8a7f205a2616530fc0de17a96f7b2de572436e0fd9da85f43d0f1",
+  "pluginVersion": "0.4.0",
+  "release": "597623fe465df0234bb58eee41b06fc0d4cc686e3949530e9654461ea7574ae9",
+  "schema": 1,
+  "snapshotCommit": "4cdbef4dbf44a721e55cf0ad01524ee27b377e05",
+  "stateContract": "native-flat-v1",
+  "upstreamCommit": "1f3e769616fdf9f31f85f4c3e6a9f71606634238"
+}

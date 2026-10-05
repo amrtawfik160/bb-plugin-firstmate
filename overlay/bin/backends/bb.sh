@@ -302,7 +302,7 @@ fm_backend_bb_session_retryable() {
 # bin/fm-procevent-lavish.sh or bin/fm-teardown.sh against its own bb task is
 # refused ("backend identity missing"). bin-bb is the installer's mirror.
 fm_backend_bb_crew_bindir() {
-  local home=${FM_HOME:-}
+  local home=${FM_ROOT_OVERRIDE:-${FM_HOME:-}}
   if [ -n "$home" ] && [ -d "$home/bin-bb" ]; then
     printf '%s' "$home/bin-bb"
   else

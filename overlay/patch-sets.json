@@ -1,4 +1,10 @@
 {
+  "bundledSnapshots": {
+    "4cdbef4dbf44a721e55cf0ad01524ee27b377e05": {
+      "sourceManifestSha256": "098f5aae7887df23ae1e696634a937b83fd08c02d32a3b34b06f65cef639b58f",
+      "upstreamCommit": "1f3e769616fdf9f31f85f4c3e6a9f71606634238"
+    }
+  },
   "schema": 1,
   "sets": {
     "1f3e769616fdf9f31f85f4c3e6a9f71606634238": [

@@ -19,8 +19,7 @@ try:
     a.require(re.fullmatch(r'[A-Za-z0-9._-]{1,100}',task) and task not in ('.','..'),'invalid task id')
     for p in (home/'state',home/'data',home/'data'/task):
         a.require(p.is_dir() and not p.is_symlink() and p.resolve()==p,'invalid task namespace')
-    a.require(a.git(home,'rev-parse','HEAD') in a.PINS,'unaudited native source')
-    source=a.regular(home/'bin/fm-spawn.sh')
+    source=a.regular(a.native_root(home)/'bin/fm-spawn.sh')
     function=re.search(r'^spawn_worktree_isolated\(\) \{[^\n]*\n.*?^\}',source,re.M|re.S)
     a.require(function and a.digest(function[0])==a.ISOLATION_SHA,'native isolation predicate changed')
     marker=home/'config/bb-captain'

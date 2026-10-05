@@ -7,10 +7,10 @@ case "${1:-}" in --check|--publish) ACTION=$1 ;; *) exit 2 ;; esac
 : "${FM_HOME:?}"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 FM_BINDIR=${FM_BINDIR:-$SCRIPT_DIR}
-[ "$FM_BINDIR" = "$FM_HOME/bin-bb" ] || exit 2
+[ "$FM_BINDIR" = "${FM_ROOT_OVERRIDE:-$FM_HOME}/bin-bb" ] || exit 2
 SCRIPT_DIR=$FM_BINDIR
 STATE=$FM_HOME/state CONFIG=$FM_HOME/config DATA=$FM_HOME/data
-export FM_ROOT=$FM_HOME FM_ROOT_OVERRIDE=$FM_HOME FM_STATE_OVERRIDE=$STATE
+export FM_ROOT=${FM_ROOT_OVERRIDE:-$FM_HOME} FM_ROOT_OVERRIDE=${FM_ROOT_OVERRIDE:-$FM_HOME} FM_STATE_OVERRIDE=$STATE
 TMP=$(mktemp -d)
 TASK_LOCK= META_LOCK=
 cleanup() {

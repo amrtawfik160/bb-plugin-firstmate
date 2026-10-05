@@ -3,12 +3,14 @@
   "version": "0.4.0",
   "type": "module",
   "scripts": {
-    "test": "node --test --experimental-strip-types lib/policy.test.ts lib/policy.differential.test.ts lib/timeline-noise.test.ts server.test.ts scripts/skill-fidelity.test.ts lib/bb-activity.test.ts lib/wake-receipt.test.ts lib/orphan-decisions.test.ts scripts/wake-receipt.test.ts scripts/supervisor-benchmark.test.mjs lib/native-bearings.test.ts lib/snapshot-reads.test.ts lib/fleet-refresh.test.ts lib/launch-delivery.test.mjs server.launch-delivery.test.mjs lib/host-capture.test.mjs scripts/prompt-inbox.test.mjs scripts/native-compat.test.mjs scripts/launch-adoption.test.mjs server.wake-command-size.test.mjs lib/queue-store.test.mjs server.queue-storage.test.mjs server.explicit-execution.test.mjs server.methods.test.mjs server.captain-startup.test.mjs scripts/captain-startup-native.test.mjs",
-    "fidelity": "node --experimental-strip-types scripts/skill-fidelity.ts"
+    "test": "node --test --experimental-strip-types lib/policy.test.ts lib/policy.differential.test.ts lib/timeline-noise.test.ts server.test.ts scripts/skill-fidelity.test.ts lib/bb-activity.test.ts lib/wake-receipt.test.ts lib/orphan-decisions.test.ts scripts/wake-receipt.test.ts scripts/supervisor-benchmark.test.mjs lib/native-bearings.test.ts lib/snapshot-reads.test.ts lib/fleet-refresh.test.ts lib/launch-delivery.test.mjs server.launch-delivery.test.mjs lib/host-capture.test.mjs scripts/prompt-inbox.test.mjs scripts/native-compat.test.mjs scripts/launch-adoption.test.mjs server.wake-command-size.test.mjs lib/queue-store.test.mjs server.queue-storage.test.mjs server.explicit-execution.test.mjs server.methods.test.mjs server.captain-startup.test.mjs scripts/captain-startup-native.test.mjs lib/native-runtime.test.mjs scripts/native-runtime.test.mjs server.native-runtime.test.mjs",
+    "fidelity": "node --experimental-strip-types scripts/skill-fidelity.ts",
+    "runtime:package": "python3 scripts/package-native-runtime.py",
+    "runtime:verify": "python3 scripts/package-native-runtime.py --check"
   },
   "engines": {
     "bb": ">=0.43",
-    "bbPluginSdk": ">=0.4.87"
+    "bbPluginSdk": ">=0.4.104"
   },
   "bb": {
     "name": "Firstmate",

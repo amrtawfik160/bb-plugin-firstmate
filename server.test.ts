@@ -8222,7 +8222,7 @@ test("captain hook install merges user-level Claude and Codex hooks idempotently
     const codex = JSON.parse(readFileSync(join(home, ".codex/hooks.json"), "utf8"));
     assert.equal(codex.hooks.Stop.length, 1);
     assert.ok(existsSync(join(home, ".claude/settings.json.bak-bb-firstmate")));
-    assert.equal(readFileSync(join(home, ".bb-firstmate/captains/thr_cap"), "utf8"), "home=/fm\nstate=/fm/state/cap-thr_cap\nown_home=0\n");
+    assert.equal(readFileSync(join(home, ".bb-firstmate/captains/thr_cap"), "utf8"), "home=/fm\nstate=/fm/state/cap-thr_cap\nown_home=0\nroot=/fm\n");
     assert.ok(lstatSync(join(home, ".bb-firstmate/bin/bb-captain-hook.sh")).mode & 0o100, "hook script is executable");
   } finally {
     rmSync(home, { recursive: true, force: true });
@@ -10771,11 +10771,13 @@ test("startup command preserves shell arguments without executing their contents
   try {
     const actualHome = join(work, "fm home'quoted");
     mkdirSync(join(actualHome, "bin-bb"), { recursive: true });
+    mkdirSync(join(actualHome, "config"));
+    writeFileSync(join(actualHome, "config/bb-overlay"), "bin-bb\n");
     writeFileSync(join(actualHome, "bin-bb/fm-session-start.sh"), '#!/usr/bin/env python3\nimport json,os,sys\nprint(json.dumps([os.getcwd(), os.environ["FM_HOME"], os.environ["FM_ROOT_OVERRIDE"], os.environ["FM_BACKEND"], sys.argv[1:]]))\n', { mode: 0o755 });
     const result = spawnSync("bash", ["-c", captainStartupCommand(actualHome, "session-start", [arg])!], { encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(JSON.parse(result.stdout), [actualHome, actualHome, actualHome, "bb", [arg]]);
-    assert.ok(command.includes("bin-bb/fm-session-start.sh"));
+    assert.ok(command.includes("$FM_BINDIR/fm-session-start.sh"));
     assert.equal(captainStartupCommand(home, "peek"), null);
   } finally { rmSync(work, { recursive: true, force: true }); }
 });

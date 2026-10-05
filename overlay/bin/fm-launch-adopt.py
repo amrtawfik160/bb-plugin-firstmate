@@ -50,6 +50,21 @@ def repository(path):
     return (match[1].lower(), match[2].removesuffix('.git').rstrip('/'))
 
 
+def native_root(home):
+    """BB transport selection only; the version's verified installer owns source identity."""
+    path=home/'config/bb-runtime-selected.json'
+    if not path.exists():
+        require(git(home,'rev-parse','HEAD') in PINS,'unsupported native source pin')
+        return home
+    value=json.loads(regular(path))
+    require(value['schema']==1 and value['stateContract']=='native-flat-v1' and re.fullmatch(r'[0-9a-f]{64}',value['release']),'invalid selected runtime')
+    store=Path(value['store']);require(store.is_absolute(),'invalid runtime store')
+    helper=store/'versions'/value['release']/'runtime-host.py'
+    require(digest(regular(helper))==value['helperSha256'],'runtime helper bytes changed')
+    root=subprocess.check_output([sys.executable,str(helper),'resolve','--store',str(store),'--home',str(home),'--captain',value['captain'],'--host',value['host']],text=True,timeout=15).strip()
+    require(root==value['root'],'selected runtime identity mismatch')
+    return Path(root)
+
 def inspect(plan):
     r = plan['record']
     home, task = Path(r['home']), r['taskId']
@@ -57,8 +72,7 @@ def inspect(plan):
     require(home.is_absolute() and home.resolve() == home, 'home must be an exact canonical path')
     for path in (home/'state', home/'data', home/'data'/task):
         require(path.is_dir() and not path.is_symlink() and path.resolve() == path, 'task namespace is not a real directory')
-    require(git(home, 'rev-parse', 'HEAD') in PINS, 'unsupported native source pin')
-    source = regular(home/'bin/fm-spawn.sh')
+    source = regular(native_root(home)/'bin/fm-spawn.sh')
     function = re.search(r'^spawn_worktree_isolated\(\) \{[^\n]*\n.*?^\}', source, re.M|re.S)
     require(function and digest(function[0]) == ISOLATION_SHA, 'native isolation predicate changed')
     marker = home/'config/bb-captain'

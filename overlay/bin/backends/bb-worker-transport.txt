@@ -1,4 +1,5 @@
 Firstmate home: {FM_HOME}. Run firstmate scripts from {FM_BINDIR}/, the BB-capable mirror, including {FM_BINDIR}/fm-tasks-axi.sh for backlog work. The native status command retains its fleet-ledger authority; it grants no permission to edit config or shared state.
+Native command environment: `{FM_COMMAND_ENV}`. Prefix native script invocations with this environment; BB worker shells do not inherit the captain launcher's exports. Keep the native status command and its arguments intact.
 Long background work must survive this thread going idle. Start it with systemd-run --unit=<name>, not nohup and not a shell &. The unit name is the handle that stays after the turn ends.
 Keep durable artifacts under {ARTIFACT_DIR}, not this worktree tmp/. The worktree tmp/ is removed when the workspace is archived.
 When gh-axi returns RATE_LIMITED, use gh api REST for that call. Read gh api rate_limit before waiting. Do not block the task on a GraphQL limit while REST quota remains.

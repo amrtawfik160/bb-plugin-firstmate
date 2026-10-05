@@ -55,6 +55,8 @@ import { nativeBearingsProjection } from "./lib/native-bearings.ts";
 import { createSnapshotReads } from "./lib/snapshot-reads.ts";
 import { scoutReports } from "./lib/scout-report.ts";
 import { replacementPlan, type ReplacementIntent } from "./lib/replacement.ts";
+import {pluginAssetRoot} from "./lib/plugin-assets.ts";
+import {createNativeRuntime, runtimeRootAssign} from "./lib/native-runtime.ts";
 import { boundedCaptainStartup, captainBindingText } from "./lib/captain-startup.ts";
 import { createQueueStore, type QueueItem } from "./lib/queue-store.ts";
 import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRecord } from "./lib/launch.ts";
@@ -300,7 +302,7 @@ const MAX_DECISIONS = 100;
 const MAX_DONE = 10;
 const MAX_TASK = 4000;
 const MAX_OUTPUT = 4000;
-const PLUGIN_ROOT = dirname(fileURLToPath(import.meta.url));
+const PLUGIN_ROOT = pluginAssetRoot(import.meta.url);
 const OVERLAY_DIR = join(PLUGIN_ROOT, "overlay");
 const FM_SCRIPT = /^[a-z0-9][a-z0-9-]*$/;
 
@@ -449,7 +451,7 @@ function shQuote(text: string): string {
 // so a home that is not bb-installed (or a pre-migration home) transparently uses bin.
 function fmBinDirAssign(fmHome: string): string {
   const q = shQuote(fmHome);
-  return `FM_BINDIR=${q}/bin; if [ -f ${q}/config/bb-overlay ] && [ -d ${q}/bin-bb ]; then FM_BINDIR=${q}/bin-bb; fi`;
+  return `${runtimeRootAssign(fmHome)}; FM_BINDIR="$FM_RUNTIME_ROOT/bin"; if [ -f "$FM_RUNTIME_ROOT/config/bb-overlay" ] && [ -d "$FM_RUNTIME_ROOT/bin-bb" ]; then FM_BINDIR="$FM_RUNTIME_ROOT/bin-bb"; fi`;
 }
 
 // Loud staleness guard (F2). The plugin's own fast-forward (initRealMode) always
@@ -473,7 +475,7 @@ function fmMirrorStaleGuard(fmHome: string): string {
   ]));
   const verifyPayloads="import hashlib,json,pathlib,sys;root=pathlib.Path(sys.argv[1]);expected=json.loads(sys.argv[2]);bad=[name for name,digest in expected.items() if (root/name).is_symlink() or not (root/name).is_file() or hashlib.sha256((root/name).read_bytes()).hexdigest()!=digest];print('FM_MIRROR_STALE: BB transport payloads stale/missing: '+', '.join(bad),file=sys.stderr) if bad else None;sys.exit(1 if bad else 0)";
   return (
-    `if [ "$FM_BINDIR" = ${q}/bin-bb ]; then ` +
+    `if [ "\${FM_BUNDLED_VERIFIED:-}" != 1 ] && [ "$FM_BINDIR" = ${q}/bin-bb ]; then ` +
     `__fm_mh=$(sed -n 's/^head=//p' ${q}/bin-bb/.mirror-manifest 2>/dev/null); ` +
     `__fm_ch=$(git -C ${q} rev-parse HEAD 2>/dev/null || true); ` +
     `if [ -n "$__fm_mh" ] && [ -n "$__fm_ch" ] && [ "$__fm_mh" != "$__fm_ch" ]; then ` +
@@ -966,7 +968,7 @@ export function selectContract(content: string, section: string | undefined): { 
 export function captainStartupCommand(home: string, script: string, args: readonly string[] = []): string | null {
   const stem = normalizeFmScript(script);
   if (!["session-start", "sessionstart-run", "sessionstart-nudge"].includes(stem)) return null;
-  return `cd ${shQuote(home)} && FM_HOME=${shQuote(home)} FM_ROOT_OVERRIDE=${shQuote(home)} FM_BACKEND=bb ${shQuote(`${home}/bin-bb/fm-${stem}.sh`)}${args.map(arg => ` ${shQuote(arg)}`).join("")}`;
+  return `cd ${shQuote(home)} && { ${fmBinDirAssign(home)}; FM_HOME=${shQuote(home)} FM_BACKEND=bb "$FM_BINDIR/fm-${stem}.sh"${args.map(arg => ` ${shQuote(arg)}`).join("")}; }`;
 }
 
 // BB thread ids named in an fm-watch line ("stale: bb:thr_abc (idle 257s, …)").
@@ -1076,7 +1078,7 @@ export function captainHookCommand(mode: "stop" | "stop-autoarm" | "session-star
   return `h="$HOME/.${CAPTAIN_HOOK_MARK}"; [ -n "\${BB_THREAD_ID:-}" ] || exit 0; [ -f "$HOME/.bb-firstmate/captains/$BB_THREAD_ID" ] || exit 0; [ -x "$h" ] || { echo "firstmate: registered captain missing hook $h" >&2; exit 1; }; exec "$h" ${mode}${claude ? " --claude" : ""}`;
 }
 export function captainHookInstallScript(input: {
-  threadId: string; home: string; state: string; ownHome: boolean; scriptB64: string;
+  threadId: string; home: string; state: string; ownHome: boolean; scriptB64: string; runtimeRoot?:string;
 }): string {
   const q = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
   const install = (file: string, claude: boolean) => {
@@ -1092,7 +1094,7 @@ export function captainHookInstallScript(input: {
   return ["set -e", "command -v jq >/dev/null",
     'd="$HOME/.bb-firstmate"; mkdir -p "$d/bin" "$d/captains"',
     `printf %s ${q(input.scriptB64)} | base64 -d > "$d/bin/bb-captain-hook.sh.tmp" && chmod 0755 "$d/bin/bb-captain-hook.sh.tmp" && mv "$d/bin/bb-captain-hook.sh.tmp" "$d/bin/bb-captain-hook.sh"`,
-    `printf 'home=%s\nstate=%s\nown_home=%s\n' ${q(input.home)} ${q(input.state)} ${input.ownHome ? "1" : "0"} > "$d/captains/${input.threadId}"`,
+    `printf 'home=%s\nstate=%s\nown_home=%s\nroot=%s\n' ${q(input.home)} ${q(input.state)} ${input.ownHome ? "1" : "0"} ${q(input.runtimeRoot??input.home)} > "$d/captains/${input.threadId}"`,
     'mkdir -p "$HOME/.claude" "$HOME/.codex"',
     install('"$HOME/.claude/settings.json"', true), install('"$HOME/.codex/hooks.json"', false),
     "echo captain-hooks-ok",
@@ -1354,6 +1356,7 @@ const CAPTAIN_BOOTSTRAP_TOOLS = ["firstmate_deck", "firstmate_contract"] as cons
 const CAPTAIN_SKILLS = ["captain", "firstmate", "calm", "catch-up", "captain-methods", ...UPSTREAM_SKILL_NAMES] as const;
 const CAPTAIN_TOOLS = [
   "firstmate_dispatch",
+  "firstmate_runtime",
   "firstmate_deck",
   "firstmate_tell",
   "firstmate_interrupt",
@@ -1535,18 +1538,19 @@ export default async function plugin(bb: BbPluginApi) {
   const reports=scoutReports(bb.storage.database());
   const deliveries = createDeliveries(bb.storage.database());
   const launchAbort = new AbortController();
+  const nativeRuntime=createNativeRuntime({assets:join(PLUGIN_ROOT,"runtime-assets"),files:()=>bb.sdk.files,disposal:launchAbort.signal,run:runStructuredOnHost});
   let followUpWork:Promise<void>|undefined;
   bb.onDispose(async () => { launchAbort.abort();await followUpWork?.catch(()=>{}); });
 
   const baseSettings = bb.settings.define({
     firstmateRepo: {
       type: "string",
-      label: "Firstmate repo URL (used by init --real)",
+      label: "Firstmate attribution URL; bundled startup never clones or updates it",
       default: "https://github.com/kunchenguid/firstmate",
     },
     fmHome: {
       type: "string",
-      label: "Firstmate home on the host (bin/ + config/). Set by init --real.",
+      label: "Legacy external Firstmate source/home; blank uses the bundled pinned runtime and durable per-thread homes.",
       default: "",
     },
     fmScriptCount: {
@@ -1766,7 +1770,7 @@ export default async function plugin(bb: BbPluginApi) {
   async function provisionCaptainHome(ctx: unknown, signal?: AbortSignal): Promise<string | null> {
     const captain = ctxString(ctx, "threadId");
     const base = (await baseSettings.get()).fmHome.trim();
-    if (!captain || !base) return null;
+    if (!captain) return null;
     if (!/^[A-Za-z0-9_-]+$/.test(captain)) throw new Error("Invalid captain identity.");
     const existing = await bb.storage.kv.get<string>(`native-home:${captain}`);
     if (typeof existing === "string" && existing) {
@@ -1774,6 +1778,9 @@ export default async function plugin(bb: BbPluginApi) {
       if (scope) scope.home = existing;
       return existing;
     }
+    const seeded=await recoverSeededRuntime(ctx,signal);
+    if (seeded) return seeded;
+    if (!base) return provisionBundledCaptain(ctx,signal);
     // Never detach an active away mandate from its native authority record.
     if ((await readAfk(captain))?.on) throw new Error("Return from away mode before isolating this captain's home.");
     const hostId = await resolveHostId(undefined, ctx);
@@ -1807,6 +1814,48 @@ export default async function plugin(bb: BbPluginApi) {
     await raceAbort(bb.sdk.threads.updatePluginMetadata({ threadId: captain, set: { nativeHome: home, captain: "true" } }),signal,STUCK_HOST_CALL_MS);
     const scope = homeScope.getStore();
     if (scope) scope.home = home;
+    return home;
+  }
+
+  async function recoverSeededRuntime(ctx:unknown,signal?:AbortSignal):Promise<string|null> {
+    const captain=ctxString(ctx,"threadId");
+    if(!captain)return null;
+    const metadata=asRecord(await raceAbort(bb.sdk.threads.getPluginMetadata({threadId:captain,signal}),signal,STUCK_HOST_CALL_MS));
+    if(!metaFlag(metadata,"captain") || typeof metadata["nativeRuntimeRelease"]!=="string")return null;
+    const home=metadata["nativeHome"],parentHome=metadata["nativeParentHome"],taskId=metadata["nativeTaskId"];
+    const thread=await raceAbort(bb.sdk.threads.get({threadId:captain,signal}),signal,STUCK_HOST_CALL_MS);
+    if(typeof home!=="string" || typeof parentHome!=="string" || typeof taskId!=="string" || !thread.parentThreadId || !thread.environmentId)throw new Error("Seeded bundled home lacks exact native parent/task/environment identity; no shared-home fallback.");
+    const environment=await raceAbort(bb.sdk.environments.get({environmentId:thread.environmentId,signal}),signal,STUCK_HOST_CALL_MS);
+    if(environment.path!==home || environment.status!=="ready")throw new Error("Seeded captain environment is not its ready native home.");
+    const bound=await nativeRuntime.operation(environment.hostId,"bind-seeded",{home,captain,release:metadata["nativeRuntimeRelease"],parentHome,parentCaptain:thread.parentThreadId,taskId},signal);
+    await bb.storage.kv.set(`native-home-host:${captain}`,environment.hostId);
+    await bb.storage.kv.set(`native-runtime:${captain}`,bound.selection);
+    await bb.storage.kv.set(`captain-for-home:${home}`,captain);
+    await bb.storage.kv.set(`native-home:${captain}`,home);
+    captainHomes.set(captain,home);
+    return home;
+  }
+
+  async function provisionBundledCaptain(ctx:unknown,signal?:AbortSignal,path?:string,explicitHost?:string):Promise<string> {
+    const captain=ctxString(ctx,"threadId");
+    if(!captain || !/^thr_[A-Za-z0-9_-]+$/.test(captain))throw new Error("Bundled captain binding requires this owning BB thread; use runtime install for host-only installation.");
+    const envId=await threadEnv(captain,signal);
+    if(!envId)throw new Error("Captain environment/host unavailable; no bundled bytes transferred.");
+    const environment=await raceAbort(bb.sdk.environments.get({environmentId:envId,signal}),signal,STUCK_HOST_CALL_MS);
+    const host=environment.hostId;
+    if(explicitHost && explicitHost!==host)throw new Error("Runtime host must match the owning captain environment; no cross-host path transfer.");
+    const installed=await nativeRuntime.operation(host,"install",{},signal);
+    const home=path??`${installed.store}/homes/${captain}`;
+    const bound=await nativeRuntime.operation(host,"bind",{home,captain,projectId:ctxString(ctx,"projectId")},signal);
+    signal?.throwIfAborted();
+    await bb.storage.kv.set(`native-home-host:${captain}`,host);
+    await bb.storage.kv.set(`native-runtime:${captain}`,bound.selection);
+    await bb.storage.kv.set(`native-home:${captain}`,home);
+    await bb.storage.kv.set(`captain-for-home:${home}`,captain);
+    captainHomes.set(captain,home);
+    const scope=homeScope.getStore();if(scope){scope.home=home;scope.host=host;}
+    await raceAbort(bb.sdk.threads.updatePluginMetadata({threadId:captain,set:{nativeHome:home,captain:"true"}}),signal,STUCK_HOST_CALL_MS);
+    bb.log.info(`bundled native captain bound captain=${captain} host=${host} home=${home} selected=${JSON.stringify(bound.selection)} installed=${installed.distribution.release}; no external source fallback`);
     return home;
   }
 
@@ -1858,7 +1907,10 @@ export default async function plugin(bb: BbPluginApi) {
   // read when HEAD is unchanged. Best-effort.
   async function refreshSkillsManifest(hostId: string, fmHome: string, signal?: AbortSignal): Promise<void> {
     try {
-      const skillsDir = `${fmHome}/.agents/skills`;
+      const captain=homeScope.getStore()?.captain ?? await bb.storage.kv.get<string>(`captain-for-home:${fmHome}`);
+      const selection=captain?await bb.storage.kv.get<{root:string}>(`native-runtime:${captain}`):null;
+      const inventoryRoot=selection?.root??fmHome;
+      const skillsDir = `${inventoryRoot}/.agents/skills`;
       const py =
         "import json,os,sys;d=sys.argv[1];out=[];\n" +
         "dirs=sorted([n for n in os.listdir(d) if os.path.isdir(os.path.join(d,n))]) if os.path.isdir(d) else []\n" +
@@ -1876,7 +1928,7 @@ export default async function plugin(bb: BbPluginApi) {
         "  out.append({'name':n,'desc':desc[:160]})\n" +
         "sys.stdout.write(json.dumps(out))";
       const cmd = [
-        `HEAD=$(git -C ${shQuote(fmHome)} rev-parse HEAD 2>/dev/null || echo unknown)`,
+        `HEAD=$(git -C ${shQuote(inventoryRoot)} rev-parse HEAD 2>/dev/null || echo unknown)`,
         `printf 'FM_HEAD=%s\\n' "$HEAD"`,
         `python3 -c ${shQuote(py)} ${shQuote(skillsDir)} 2>/dev/null || echo '[]'`,
       ].join("\n");
@@ -2395,11 +2447,12 @@ export default async function plugin(bb: BbPluginApi) {
     const dedupPath=dedupMarker ? `${stateDir}/.pr-notice-${createHash("sha256").update(dedupMarker).digest("hex")}` : undefined;
     const script = [
       `export FM_HOME=${shQuote(fmHome)}`,
-      `export FM_ROOT=${shQuote(fmHome)}`,
+      fmBinDirAssign(fmHome),
       `export FM_STATE_OVERRIDE=${shQuote(stateDir)}`,
-      `[ -f ${shQuote(lib)} ] || { echo "error: missing ${lib}" >&2; exit 127; }`,
+      `lib=${shQuote(lib)}; [ "\${FM_BUNDLED_VERIFIED:-}" != 1 ] || lib="$FM_BINDIR/fm-wake-lib.sh"`,
+      `[ -f "$lib" ] || { echo "error: missing $lib" >&2; exit 127; }`,
       `mkdir -p ${shQuote(stateDir)}`,
-      `. ${shQuote(lib)}`,
+      `. "$lib"`,
       `note=$(printf '%s' ${shQuote(noteB64)} | base64 -d)`,
       ...(dedupMarker ? [
         `fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK" || exit 1`,
@@ -4137,6 +4190,7 @@ export default async function plugin(bb: BbPluginApi) {
     const selection = await selectExecution(bb, projectId, hostId);
     if (shape !== "secondmate" && selection.checkout !== path) throw new Error("Native project path does not match selected host checkout.");
     const permissionMode = capPermission(toPermissionMode(flagStr(flags, "permission-mode")), await parentPermission(owner || undefined));
+    const parentRuntime=shape==="secondmate"?await bb.storage.kv.get<{release:string}>(`native-runtime:${owner}`):undefined;
     if (shape === "secondmate") {
       const proof = await runOnHost(hostId, ["set -eu",
         `[ "$(cat ${shQuote(`${path}/.fm-secondmate-home`)})" = ${shQuote(taskId)} ]`,
@@ -4147,7 +4201,12 @@ export default async function plugin(bb: BbPluginApi) {
         `test -f ${shQuote(`${path}/AGENTS.md`)}`,
       ].join("\n"), 15_000, launchAbort.signal);
       requireNativeSuccess(proof, "secondmate home identity");
-      await installBbBackend(hostId, path, projectId, 180_000, launchAbort.signal);
+      if(parentRuntime) {
+        // Seeded child source came from this exact selected version. Use that
+        // version's verified adapter, including after a plugin update.
+        const prepared=await runOnHost(hostId,[fmBinDirAssign(home),fmMirrorStaleGuard(home),`python3 "$FM_RUNTIME_ROOT/../overlay/install-bb-backend.py" --home ${shQuote(path)} --overlay "$FM_RUNTIME_ROOT/../overlay" --project-id ${shQuote(projectId)}`].join("\n"),60_000,launchAbort.signal);
+        requireNativeSuccess(prepared,"seeded selected runtime adapter");
+      } else await installBbBackend(hostId, path, projectId, 180_000, launchAbort.signal);
     }
     await validateProviderChoice(flagStr(flags,"provider"),flagStr(flags,"model"),projectId,owner || undefined,strictReasoning(flagStr(flags,"reasoning-level")),hostId);
     const read = await bb.sdk.files.read({ hostId, path: promptFile });
@@ -4166,9 +4225,14 @@ export default async function plugin(bb: BbPluginApi) {
       reasoningLevel: strictReasoning(flagStr(flags,"reasoning-level")), permissionMode,
       visibility:flags.has("hidden") ? "hidden" : "visible",
       pluginMetadata: { launchKey:key,generation:1,nativeHome:shape === "secondmate" ? path : home,
-        ...(shape === "secondmate" ? { captain:"true",nativeTaskId:taskId,nativeParentHome:home } : { crew:"true",crewId:taskId,shape,posture:flagStr(flags,"delivery-mode") ?? "direct-PR",worktree:!flags.has("shared-env"),deliveryRequirement:recoveredContract({},record) }) },
+        ...(shape === "secondmate" ? { captain:"true",nativeTaskId:taskId,nativeParentHome:home,...(parentRuntime?{nativeRuntimeRelease:parentRuntime.release}:{}) } : { crew:"true",crewId:taskId,shape,posture:flagStr(flags,"delivery-mode") ?? "direct-PR",worktree:!flags.has("shared-env"),deliveryRequirement:recoveredContract({},record) }) },
     }), launchAbort.signal);
     if (shape === "secondmate") {
+      if(parentRuntime) {
+        const bound=await nativeRuntime.operation(hostId,"bind-seeded",{home:path,captain:created.threadId!,release:parentRuntime.release,parentHome:home,parentCaptain:owner,taskId},launchAbort.signal);
+        await bb.storage.kv.set(`native-runtime:${created.threadId}`,bound.selection);
+        await bb.storage.kv.set(`captain-for-home:${path}`,created.threadId!);
+      }
       await bb.storage.kv.set(`native-home:${created.threadId}`,path);
       await bb.storage.kv.set(`native-home-host:${created.threadId}`,hostId);
       captainHomes.set(created.threadId!,path);
@@ -4768,9 +4832,10 @@ export default async function plugin(bb: BbPluginApi) {
     const b64 = Buffer.from(body.slice(0, MAX_TASK), "utf8").toString("base64");
     const script = [
       `export FM_HOME=${shQuote(fmHome)}`,
-      `export FM_ROOT=${shQuote(fmHome)}`,
-      `[ -f ${shQuote(lib)} ] || { echo "error: missing ${lib}" >&2; exit 127; }`,
-      `. ${shQuote(lib)}`,
+      fmBinDirAssign(fmHome),
+      `lib=${shQuote(lib)}; [ "\${FM_BUNDLED_VERIFIED:-}" != 1 ] || lib="$FM_BINDIR/fm-task-inbox-lib.sh"`,
+      `[ -f "$lib" ] || { echo "error: missing $lib" >&2; exit 127; }`,
+      `. "$lib"`,
       `mkdir -p ${shQuote(stateDir)}`,
       `body=$(printf '%s' ${shQuote(b64)} | base64 -d)`,
       `record=$(fm_task_inbox_write ${shQuote(stateDir)} ${shQuote(crewId)} "$body"${fireAndForget ? " fire-and-forget" : ""}) || exit $?`,
@@ -6843,6 +6908,10 @@ export default async function plugin(bb: BbPluginApi) {
   // update its crews kept the old bb.sh (old spawn brief, old liveness rules) until
   // someone re-decked. Rebuild a home whose manifest names a different overlay.
   async function refreshStaleMirror(hostId: string, home: string, captain: string, signal?: AbortSignal): Promise<void> {
+    if(await bb.storage.kv.get(`native-runtime:${captain}`)) {
+      await nativeRuntime.operation(hostId,"inspect",{home,captain},signal);
+      return;
+    }
     const q = shQuote(home);
     const probe = await runOnHost(hostId,
       `if [ -d ${q}/bin-bb ]; then printf 'FM_OVERLAY=%s FM_BUILT_HEAD=%s FM_HEAD=%s\\n' "$(sed -n 's/^overlay=//p' ${q}/bin-bb/.mirror-manifest 2>/dev/null)" "$(sed -n 's/^head=//p' ${q}/bin-bb/.mirror-manifest 2>/dev/null)" "$(git -C ${q} rev-parse HEAD 2>/dev/null)"; else echo FM_NO_MIRROR; fi`,
@@ -6871,6 +6940,16 @@ export default async function plugin(bb: BbPluginApi) {
     signal?: AbortSignal,
     verifyFirst=false,
   ): Promise<string> {
+    const selectedProbe=await runOnHost(hostId,`if [ -f ${shQuote(`${home}/config/bb-runtime-selected.json`)} ]; then echo FM_RUNTIME_BUNDLED; else echo FM_RUNTIME_EXTERNAL; fi`,Math.min(15_000,timeoutMs),signal);
+    if(selectedProbe.exitCode===0 && selectedProbe.output.includes("FM_RUNTIME_BUNDLED")) {
+      const captain=homeScope.getStore()?.captain ?? await bb.storage.kv.get<string>(`captain-for-home:${home}`);
+      if(!captain)throw new Error("Bundled runtime verification requires the owning captain context; no external installer fallback.");
+      const checked=await nativeRuntime.operation(hostId,"inspect",{home,captain},signal);
+      await bb.storage.kv.set(`native-runtime:${captain}`,checked.selected);
+      await bb.storage.kv.set(`captain-for-home:${home}`,captain);
+      bb.log.info(`bundled native runtime verified home=${home} host=${hostId}; no external source fallback`);
+      return `mirror OK: verified bundled runtime ${JSON.stringify(checked.selected)}`;
+    }
     const overlayHome = OVERLAY_DIR;
     const installer = join(overlayHome, "install-bb-backend.py");
     const localProbe = await runOnHost(
@@ -6938,6 +7017,17 @@ export default async function plugin(bb: BbPluginApi) {
     summary: string;
   }> {
     const current = await settings.get();
+    if(!opts.path && (!current.fmHome.trim() || await bb.storage.kv.get(`native-runtime:${ctxString(ctx,"threadId")??''}`))) {
+      const hostId=await resolveHostId(opts.machine,ctx);
+      const before=await bb.storage.kv.get<string>(`native-home:${ctxString(ctx,"threadId")??''}`);
+      const path=await provisionBundledCaptain(ctx,signal,undefined,hostId);
+      const projectId=ctxString(ctx,"projectId")??"";
+      const status=await nativeRuntime.operation(hostId,"inspect",{home:path,captain:ctxString(ctx,"threadId")},signal);
+      const toolchain=await checkToolchain(hostId,path,signal);
+      await refreshSkillsManifest(hostId,path,signal);
+      const summary=`Bundled Firstmate runtime selected on host ${hostId}.\nHome: ${path}\nInstalled release: ${status.distribution.release}\nSelected: ${JSON.stringify(status.selected)}\nUpstream: ${status.distribution.upstreamCommit}\nNative startup/lock readiness remains pending; no external repository or network clone used.\n${toolchain.output}`;
+      return {hostId,path,existed:!!before,projectId,overlay:"Verified bundled native plus adapter",tools:toolchain.output,summary};
+    }
     const repo = current.firstmateRepo !== "" ? current.firstmateRepo : "https://github.com/kunchenguid/firstmate";
     const name = opts.name ?? "firstmate";
     const timeoutMs = opts.timeoutMs ?? 180000;
@@ -6967,38 +7057,13 @@ export default async function plugin(bb: BbPluginApi) {
         : `tasks-axi present${axiVer !== "" ? ` (v${axiVer}; needs >=${TASKS_AXI_MIN})` : ` (version unknown; needs >=${TASKS_AXI_MIN})`}`;
     const clone = await runOnHost(
       hostId,
-      `if [ -d ${shQuote(`${path}/.git`)} ]; then echo FM_EXISTS; else git clone ${shQuote(repo)} ${shQuote(path)} && git -C ${shQuote(path)} checkout --detach ${shQuote(UPSTREAM_FIRSTMATE_SHA)}; fi`,
+      `if [ -d ${shQuote(`${path}/.git`)} ]; then echo FM_EXISTS; else echo "No existing external native home at the explicit path; run bb firstmate deck in the owning thread to bind the bundled runtime." >&2; exit 2; fi`,
       timeoutMs,
       signal,
     );
     if (clone.exitCode !== 0) throw new Error(`Clone failed:\n${truncate(clone.output, 1000)}`);
     const existed = clone.output.includes("FM_EXISTS");
-    // Version skew: a reused clone can lag the referenced source. Fast-forward it
-    // (ff-only, and only when the tree is clean so a dirty overlay is never lost).
-    let ffNote = existed ? "reused clone: no fast-forward attempted" : "fresh clone";
-    if (existed) {
-      const q = shQuote(path);
-      const ff = await runOnHost(
-        hostId,
-        [
-          `if [ -n "$(git -C ${q} status --porcelain 2>/dev/null)" ]; then echo FM_FF_SKIP_DIRTY; else`,
-          `git -C ${q} cat-file -e ${shQuote(`${UPSTREAM_FIRSTMATE_SHA}^{commit}`)} 2>/dev/null || git -C ${q} fetch --quiet origin ${shQuote(UPSTREAM_FIRSTMATE_SHA)} || exit 1;`,
-          `if git -C ${q} merge-base --is-ancestor HEAD ${shQuote(UPSTREAM_FIRSTMATE_SHA)}; then git -C ${q} merge --ff-only ${shQuote(UPSTREAM_FIRSTMATE_SHA)} 2>&1 && echo FM_FF_OK || echo FM_FF_NOFF; else echo FM_FF_NOFF; fi; fi`,
-        ].join("\n"),
-        timeoutMs,
-        signal,
-      );
-      const out = ff.output;
-      ffNote = out.includes("FM_FF_SKIP_DIRTY")
-        ? "reused clone: fast-forward skipped (working tree dirty)"
-        : out.includes("FM_FF_OK")
-          ? "reused clone: fast-forwarded to audited native pin"
-          : out.includes("FM_FF_NOFF")
-            ? "reused clone: not fast-forwardable (diverged); left as-is"
-            : out.includes("FM_FF_NO_UPSTREAM")
-              ? "reused clone: no upstream to fast-forward"
-              : "reused clone: fast-forward attempted";
-    }
+    const ffNote = "external home preserved; no fetch or native update attempted";
     let projectId: string;
     try {
       const created = await bb.sdk.projects.create({ name, source: { type: "local_path", hostId, path } });
@@ -7086,11 +7151,13 @@ export default async function plugin(bb: BbPluginApi) {
     if (threadId === undefined || !/^[A-Za-z0-9_-]+$/.test(threadId)) return;
     const stored = await bb.storage.kv.get<string>(`native-home:${threadId}`);
     const home = typeof stored === "string" && stored !== "" ? stored : fallbackHome;
+    const selection=await bb.storage.kv.get<Record<string,unknown>>(`native-runtime:${threadId}`);
     const script = captainHookInstallScript({
       threadId,
+      runtimeRoot:typeof selection?.["root"]==="string"?selection["root"]:home,
       home,
       state: wakeStateDir(home, threadId),
-      ownHome: home.endsWith(`-bb-homes/${threadId}`),
+      ownHome: captainHomes.get(threadId)===home || home.endsWith(`-bb-homes/${threadId}`),
       scriptB64: overlayBytes("bin/bb-captain-hook.sh"),
     });
     const res = await runOnHost(hostId, `bash -c ${shQuote(script)}`, 60_000, signal);
@@ -7120,7 +7187,8 @@ export default async function plugin(bb: BbPluginApi) {
           true,
         );
         const setupKey=`captain-adapter-setup:${ctxString(ctx,"threadId")??''}`;
-        const stamp=JSON.stringify([current.fmHome,hostId,overlayFingerprint()]);
+        const runtimeSelection=await bb.storage.kv.get(`native-runtime:${ctxString(ctx,"threadId")??''}`);
+        const stamp=JSON.stringify([current.fmHome,hostId,overlayFingerprint(),runtimeSelection]);
         const verifiedSetup=adapter.includes("mirror OK:") && await bb.storage.kv.get(setupKey)===stamp;
         if (!verifiedSetup) await refreshSkillsManifest(hostId, current.fmHome, signal);
         if (!current.fullParityOnDeck) await refreshCaptainMemory();
@@ -7144,7 +7212,7 @@ export default async function plugin(bb: BbPluginApi) {
       if ((await baseSettings.get()).fullParityOnDeck) await ensureCaptainHome(ctx, signal);
       const profile = await activateFullParityForDeck();
       return [
-        `Real firstmate: initialized now (${res.existed ? "reused clone" : "cloned"}).`,
+        `Real firstmate: initialized now (${res.existed ? "reused home" : "installed"}).`,
         profile,
         res.summary,
       ].filter((line) => line !== "").join("\n");
@@ -7245,6 +7313,7 @@ export default async function plugin(bb: BbPluginApi) {
       fmBinDirAssign(input.fmHome),
       fmMirrorStaleGuard(input.fmHome),
       `if [ ! -f "$FM_BINDIR/${scriptLeaf}" ]; then echo "error: missing $FM_BINDIR/${scriptLeaf}" >&2; exit 127; fi`,
+      ["update","test-run","test-isolation-proof","lint","lint-workflows"].includes(script) ? 'if [ "${FM_BUNDLED_VERIFIED:-}" = 1 ]; then echo "Bundled native development/update command refused; use a development source checkout for lint/tests or install a tested BB plugin release and use bb firstmate runtime select --check." >&2; exit 2; fi' : "",
       invocation,
     ]
       .filter((line) => line !== "")
@@ -7287,8 +7356,8 @@ export default async function plugin(bb: BbPluginApi) {
     const mirrorBb = `${fmHome}/bin-bb/backends/bb.sh`;
     const res = await runOnHost(
       hostId,
-      `{ find ${shQuote(bin)} -maxdepth 2 -type f -printf '%P\\n' 2>/dev/null; ` +
-        `[ -f ${shQuote(mirrorBb)} ] && printf 'backends/bb.sh\\n' || true; } | LC_ALL=C sort -u`,
+      `${fmBinDirAssign(fmHome)}; { find "$FM_RUNTIME_ROOT/bin" -maxdepth 2 -type f -printf '%P\\n' 2>/dev/null; ` +
+        `[ -f "$FM_RUNTIME_ROOT/bin-bb/backends/bb.sh" ] && printf 'backends/bb.sh\\n' || true; } | LC_ALL=C sort -u`,
       20_000,
       asRecord(ctx)["signal"] as AbortSignal | undefined,
     );
@@ -7301,17 +7370,20 @@ export default async function plugin(bb: BbPluginApi) {
       .map((name) => name.slice(3, -3));
     const entryFiles = new Set(names.map((name) => `fm-${name}.sh`));
     const support = files.filter((name) => !entryFiles.has(name));
-    return compareUpstreamScriptSurface(names, query, support);
+    const captain=homeScope.getStore()?.captain;
+    const bundled=captain?await bb.storage.kv.get(`native-runtime:${captain}`):null;
+    return {...compareUpstreamScriptSurface(names, query, support),...(bundled?{bundledUnavailable:["update","test-run","test-isolation-proof","lint","lint-workflows"]}:{})};
   }
 
-  function renderScriptSurface(surface: ReturnType<typeof compareUpstreamScriptSurface>): string {
+  function renderScriptSurface(surface: ReturnType<typeof compareUpstreamScriptSurface> & {bundledUnavailable?:string[]}): string {
     const drift = [
       surface.missing.length > 0 ? `missing: ${surface.missing.join(", ")}` : "",
       surface.extra.length > 0 ? `new upstream: ${surface.extra.join(", ")}` : "",
     ].filter((line) => line !== "");
     return [
-      `Firstmate scripts: ${surface.installed} callable + ${surface.installedSupport} support/adapters installed / ${surface.expected} + ${surface.expectedSupport} pinned @ ${surface.sha.slice(0, 12)}`,
+      `Firstmate scripts: ${surface.installed} ${surface.bundledUnavailable?"installed entries":"callable"} + ${surface.installedSupport} support/adapters installed / ${surface.expected} + ${surface.expectedSupport} pinned @ ${surface.sha.slice(0, 12)}`,
       ...drift,
+      ...(surface.bundledUnavailable?[`Bundled development/update entries unavailable through Firstmate tools: ${surface.bundledUnavailable.join(", ")}; use a development checkout or an explicit tested release selection.`]:[]),
       surface.missingSupport.length > 0 ? `missing support: ${surface.missingSupport.join(", ")}` : "",
       surface.extraSupport.length > 0 ? `new support: ${surface.extraSupport.join(", ")}` : "",
       surface.matches.length > 0 ? surface.matches.join("\n") : "No matching scripts.",
@@ -7589,9 +7661,10 @@ export default async function plugin(bb: BbPluginApi) {
     const scriptPath = `${fmHome}/bin/fm-afk-contract.sh`;
     const prelude = [
       `export FM_HOME=${shQuote(fmHome)}`,
-      `export FM_ROOT=${shQuote(fmHome)}`,
-      `if [ ! -f ${shQuote(scriptPath)} ]; then echo "error: missing ${scriptPath}" >&2; exit 127; fi`,
-      `${shQuote(scriptPath)} ${args.map(shQuote).join(" ")}`,
+      fmBinDirAssign(fmHome),
+      `script=${shQuote(scriptPath)}; [ "\${FM_BUNDLED_VERIFIED:-}" != 1 ] || script="$FM_BINDIR/fm-afk-contract.sh"`,
+      `[ -f "$script" ] || { echo "error: missing $script" >&2; exit 127; }`,
+      `"$script" ${args.map(shQuote).join(" ")}`,
     ].join("\n");
     try {
       return await runOnHost(hostId, prelude, 30_000, undefined, stdin);
@@ -8020,7 +8093,9 @@ export default async function plugin(bb: BbPluginApi) {
     const prelude = [
       `export FM_HOME=${shQuote(home)}`,
       `export FM_STATE_OVERRIDE=${shQuote(`${home}/state`)}`,
-      `. ${shQuote(library)}`,
+      fmBinDirAssign(home),
+      `library=${shQuote(library)}; [ "\${FM_BUNDLED_VERIFIED:-}" != 1 ] || library="$FM_BINDIR/fm-afk-contract.sh"`,
+      `. "$library"`,
     ];
     const cachedEpoch = Math.floor(Date.parse(previous.since) / 1000);
     if (!Number.isSafeInteger(cachedEpoch)) return false;
@@ -8036,7 +8111,7 @@ export default async function plugin(bb: BbPluginApi) {
       `  __fm_source=archive`,
       // Legacy KV was timestamped around, rather than by, native entry.
       `  for __fm_epoch in $(seq ${cachedEpoch - 4} ${cachedEpoch + 4}); do`,
-      `    __fm_record=$(${shQuote(library)} archived "$__fm_epoch" 2>/dev/null) || continue`,
+      `    __fm_record=$("$library" archived "$__fm_epoch" 2>/dev/null) || continue`,
       `    fm_bb_afk_identity "$__fm_record"`,
       `  done`,
       `fi`,
@@ -9025,14 +9100,14 @@ export default async function plugin(bb: BbPluginApi) {
       "1. Real firstmate bin/ scripts (the full toolbelt): bb firstmate fm <script> …",
       `   ${toolbeltPhrase(scriptCount, skillCount)} keep policy`,
       "   (brief, gate, inbox, watch, merge, afk, bearings, backlog). `/captain` (deck)",
-      "   auto-clones + overlays this on first run; no manual step if the host has git/gh.",
+      "   installs the pinned bundle on clean hosts; native prerequisites and harness startup remain required.",
       "2. Native deck (plugin SDK / Fleet UI): bb firstmate deck, then dispatch/tell/watch/merge.",
       "   BB is the session backend (threads + managed-worktree), like tmux/orca — not a rewrite of bin/.",
       "Primary dispatch (real toolbelt, after deck/init --real):",
       "  bb firstmate fm spawn -- --mode direct-PR -- ship \"fix flaky login test\"",
       "Native dispatch (BB transport; writes state/<id>.meta when fmHome is set, so the scripts see Fleet crews):",
       "  bb firstmate dispatch --project <proj> -- \"fix flaky login test\"",
-      `One-time activation if auto-init was skipped: bb firstmate init --real  (repo ${repo}; overlays backends/bb.sh, sets config/backend=bb, persists fmHome)`,
+      `Pinned bundle/native attribution: ${repo}. Inspect bb firstmate runtime status --json; no startup fetch or implicit runtime selection upgrade.`,
     ].join("\n");
   }
 
@@ -9045,6 +9120,7 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb firstmate fm [--timeout s] <script> [args...]   # real bin/fm-<script>.sh with FM_BACKEND=bb",
     "  bb firstmate deck [--digest|--all] [--json] | session [--json]",
     "  bb firstmate contract [section,...] [--json] # complete native policy",
+    "  bb firstmate runtime status|install|select|migrate|rollback [exact-release|external] [--check] [--json]",
     '  bb firstmate dispatch --project <id> [--task t ...] [--shape ship|scout] [--mode m] [--title t] [--provider p] [--model m] [--reasoning-level low|medium|high|xhigh|max|ultra|none|ultracode] [--permission-mode m] [--shared-env] [--worktree] [--hidden] [--task-id id] [--delivery-requirement pr|merged|merged-and-verified] -- "<task>"',
     "  bb firstmate launches list [--limit n] [--offset n] [--json]   # uncertain slots require reconciliation",
     "  bb firstmate launches adopt <task-id> --thread <thread-id> [--check] [--json]   # exact legacy registration repair; no turn or merge",
@@ -9170,7 +9246,14 @@ export default async function plugin(bb: BbPluginApi) {
     const callerSignal = asRecord(ctx)["signal"] as AbortSignal | undefined;
     const signal = AbortSignal.any([launchAbort.signal, ...(callerSignal ? [callerSignal] : [])]);
     const hostId = current.fmHostId.trim() || await raceAbort(resolveHostId(undefined, ctx), signal, STUCK_HOST_CALL_MS);
-    const path = `${current.fmHome}/AGENTS.md`;
+    const contractCaptain=ctxString(ctx,"threadId");
+    if(contractCaptain && await bb.storage.kv.get(`runtime-selection-pending:${contractCaptain}`)) {
+      const inspected=await nativeRuntime.operation(hostId,"inspect",{home:current.fmHome,captain:contractCaptain},signal);
+      await bb.storage.kv.set(`native-runtime:${contractCaptain}`,inspected.selected??null);
+      // Preserve the pending action until explicit status/retry reconciles it.
+    }
+    const runtimeSelection=await bb.storage.kv.get<Record<string,unknown>>(`native-runtime:${contractCaptain??''}`);
+    const path = `${typeof runtimeSelection?.["root"]==="string"?runtimeSelection["root"]:current.fmHome}/AGENTS.md`;
     let result;
     try {
       result = await raceAbort(bb.sdk.files.read({ hostId, path }), signal, STUCK_HOST_CALL_MS);
@@ -10087,6 +10170,53 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
+  async function runtimeForContext(ctx:unknown,action:"status"|"install"|"select"|"migrate"|"rollback",release?:string,check=false,machine?:string) {
+    const captain=ctxString(ctx,"threadId");
+    const signal=asRecord(ctx)["signal"] as AbortSignal|undefined;
+    if(captain) {
+      const metadata=await raceAbort(bb.sdk.threads.getPluginMetadata({threadId:captain,signal}),signal,STUCK_HOST_CALL_MS);
+      if(metaFlag(asRecord(metadata),"crew"))throw new Error("Worker threads cannot install, select or migrate captain runtimes.");
+    }
+    const home=captain?await bb.storage.kv.get<string>(`native-home:${captain}`):null;
+    const boundHost=captain?await bb.storage.kv.get<string>(`native-home-host:${captain}`):null;
+    const host=boundHost||await resolveHostId(machine,ctx);
+    if(machine && boundHost && machine!==boundHost)throw new Error("Runtime host selection differs from the owning captain home.");
+    if(captain) {
+      const environmentId=await threadEnv(captain,signal);
+      if(!environmentId)throw new Error("Runtime operation requires this thread's authoritative environment/host.");
+      const environment=await raceAbort(bb.sdk.environments.get({environmentId,signal}),signal,STUCK_HOST_CALL_MS);
+      if(environment.hostId!==host)throw new Error("Runtime operation host differs from the captain environment; no cross-host path use.");
+    }
+    if(action!=="status" && action!=="install") {
+      if(!captain || !home || !boundHost || !await isCaptainThread(captain))throw new Error("Runtime selection requires the owning bound captain; call deck first. No ownership transfer.");
+      if(!release || !( /^[0-9a-f]{64}$/.test(release) || action==="rollback" && release==="external"))throw new Error("Specify one exact installed release ID from runtime status; rollback external is allowed only for a recorded external migration.");
+      if(launches.hasRuntimeConsumers(captain))throw new Error("Runtime selection refused while this captain has running/reserved/uncertain launches; reconcile them first without respawning.");
+    }
+    if(check && (action==="status" || action==="install"))throw new Error("--check is supported only for runtime select/migrate/rollback.");
+    if(release && action==="install")throw new Error("runtime install stages this plugin release; it does not accept an alternative release ID.");
+    const pendingKey=`runtime-selection-pending:${captain??''}`;
+    const pending=await bb.storage.kv.get<Record<string,unknown>>(pendingKey);
+    const mutation=action!=="install" && action!=="status" && !check;
+    if(mutation && pending && (pending["release"]!==release || pending["action"]!==action))throw new Error("An earlier runtime selection remains unresolved; inspect runtime status before choosing another release.");
+    if(mutation && !pending)await bb.storage.kv.set(pendingKey,{action,release,previous:await bb.storage.kv.get(`native-runtime:${captain}`),startedAt:Date.now()});
+    const result=await nativeRuntime.operation(host,action,{home:home??undefined,captain:home?captain:undefined,release,check},signal);
+    if(action==="status" && pending && captain && result.selectionCompatible===true) {
+      // A status read is authoritative after publication/response/KV failures.
+      await bb.storage.kv.set(`native-runtime:${captain}`,result.selected??null);
+      await bb.storage.kv.delete(pendingKey);
+    }
+    if(action!=="install" && action!=="status" && !check && captain) {
+      await bb.storage.kv.set(`native-runtime:${captain}`,result.selection??null);
+      await bb.storage.kv.delete(`captain-adapter-setup:${captain}`);
+      await bb.storage.kv.delete(pendingKey);
+    }
+    return {host,...result,pendingSelection:await bb.storage.kv.get(pendingKey)??null};
+  }
+  registerCaptainTool({name:"firstmate_runtime",description:"Inspect installed versus selected native runtime. Install a pinned release or explicitly check/select/migrate/rollback this owning captain's quiescent home; no worker turns or task-state changes.",
+    parameters:z.object({action:z.enum(["status","install","select","migrate","rollback"]).default("status"),release:z.string().regex(/^(?:[0-9a-f]{64}|external)$/).optional(),check:z.boolean().optional()}),
+    async execute({action,release,check},ctx){try{return JSON.stringify(await runtimeForContext(ctx,action,release,check));}catch(error){return toolError(error instanceof Error?error.message:String(error));}}
+  });
+
   bb.agents.configure((context) => {
     const meta = asRecord(context.pluginMetadata);
     if (metaFlag(meta, "crew")) {
@@ -10724,7 +10854,8 @@ export default async function plugin(bb: BbPluginApi) {
     summary: "Run firstmate-style crews: dispatch crewmate threads, track them, bring back results",
     commands: [
       { name: "guide", summary: "Setup guide for firstmate inside BB", usage: "bb firstmate guide [--json]" },
-      { name: "init", summary: "Native deck setup (add --real to clone firstmate and overlay the BB backend)", usage: "bb firstmate init [--real] [--json]" },
+      { name: "runtime", summary: "Pinned native runtime status, installation and explicit selection", usage: "bb firstmate runtime status|install|select|migrate|rollback [release-id] [--check] [--json]" },
+      { name: "init", summary: "Native deck setup (add --real for the bundled runtime or an existing explicit external home)", usage: "bb firstmate init [--real] [--json]" },
       { name: "contract", summary: "Read the full native supervisor contract (or named sections)", usage: "bb firstmate contract [section,...]" },
       { name: "toolchain", summary: "Check native AXI and Lavish dependencies without mutations", usage: "bb firstmate toolchain [--json]" },
       { name: "scripts", summary: "List + verify every installed fm-* script", usage: "bb firstmate scripts [query] [--json]" },
@@ -10820,6 +10951,12 @@ export default async function plugin(bb: BbPluginApi) {
           case "help":
           case "--help":
             return { exitCode: 0, stdout: usage };
+          case "runtime": {
+            const action=rest[0]??"status";
+            if(!["status","install","select","migrate","rollback"].includes(action))return fail("Use runtime status|install|select|migrate|rollback, one exact release ID, and optional --check.");
+            const result=await runtimeForContext(ctx,action as "status"|"install"|"select"|"migrate"|"rollback",rest[1],flags.has("check"),flagStr(flags,"machine"));
+            return reply(result,JSON.stringify(result,null,2));
+          }
           case "guide": {
             const repo = current.firstmateRepo !== "" ? current.firstmateRepo : "https://github.com/kunchenguid/firstmate";
             const text = guideText(repo, current.fmScriptCount, current.fmSkillCount);

@@ -7,8 +7,10 @@ through substitutions. Unknown or ambiguous structure refuses before launch.
 """
 from pathlib import Path
 import re
+import importlib.util
 import shlex
 import sys
+sys.dont_write_bytecode=True
 
 IDENTITY = 'You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.\n\n'
 BROWSER = '3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.'
@@ -35,7 +37,13 @@ def paths(scaffold, home, bindir):
 def render(brief, kind, task_id, home, bindir, role, transport, mode=''):
     require(kind in WRITES, 'only ship/scout worker roles are supported')
     require(re.fullmatch(r'[A-Za-z0-9._-]{1,100}', task_id) and task_id not in ('.', '..'), 'invalid task identity')
-    require(home.startswith('/') and bindir == home + '/bin-bb', 'absolute supervising home and BB mirror required')
+    require(home.startswith('/') and bindir.startswith('/'), 'absolute supervising home and BB mirror required')
+    if bindir != home + '/bin-bb':
+        # Shared immutable runtime is selected by the home, never inferred from
+        # task text or a global install path. Reuse the transport verifier.
+        spec=importlib.util.spec_from_file_location('bb_runtime_source',Path(__file__).parent.parent/'fm-launch-adopt.py')
+        source=importlib.util.module_from_spec(spec);spec.loader.exec_module(source)
+        require(str(source.native_root(Path(home))/'bin-bb')==bindir,'BB mirror is not this home selected runtime')
     artifact = f'{home}/data/{task_id}/'
     status = f'{home}/state/{task_id}.status'
     inbox = f'{home}/state/{task_id}.inbox'
@@ -135,7 +143,8 @@ def render(brief, kind, task_id, home, bindir, role, transport, mode=''):
             references.append('# Native Lavish operational reference\n' + line)
             lines[index] = 'If the deliverable is a visual artifact for captain review, read and follow the Native Lavish operational reference below before reporting done.\n'
     completion = ''.join(lines)
-    transport = transport.replace('{FM_HOME}', home).replace('{FM_BINDIR}', bindir).replace('{TASK_ID}', task_id).replace('{ARTIFACT_DIR}', artifact)
+    command_env = f'FM_HOME={shlex.quote(home)} FM_ROOT_OVERRIDE={shlex.quote(str(Path(bindir).parent))} FM_BACKEND=bb'
+    transport = transport.replace('{FM_COMMAND_ENV}', command_env).replace('{FM_HOME}', home).replace('{FM_BINDIR}', bindir).replace('{TASK_ID}', task_id).replace('{ARTIFACT_DIR}', artifact)
     result = role.rstrip() + '\n\n' + task + '\nWork on your own; do not wait for a human.\n' + paths(herdr, home, bindir)
     result += '\n# BB execution transport\n<!-- BB-DIVERGE: native script invocation and BB archive/background transport only. -->\n' + transport.rstrip() + '\n'
     result += paths(setup + '\n# Rules\n' + rules + '\n# Definition of done\n' + completion, home, bindir)

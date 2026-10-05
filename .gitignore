@@ -1,2 +1,5 @@
 dist/
 node_modules
+
+# Reproducible native generation intermediate; runtime.tar.gz is shipped.
+runtime-assets/native.bundle

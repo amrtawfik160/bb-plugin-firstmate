@@ -118,6 +118,54 @@ def head_commit(home: Path) -> str:
     return ""
 
 
+def audited_source_identity(home: Path) -> str:
+    """BB package identity differs from native upstream identity; verify the export.
+
+    This is a packaging adaptation, not a new source/patch policy: only unchanged,
+    hash-verified native bytes may select the existing exact upstream patch set.
+    External Git homes without the tracked descriptor retain exact-HEAD behavior.
+    """
+    descriptor = home / ".bb-native-runtime.json"
+    if not descriptor.exists():
+        return head_commit(home)
+    if descriptor.is_symlink():
+        raise ValueError("native runtime descriptor must be a regular file")
+    raw = descriptor.read_bytes()
+    committed = subprocess.run(["git", "-C", str(home), "show", "HEAD:.bb-native-runtime.json"], capture_output=True)
+    if committed.returncode != 0 or committed.stdout != raw:
+        raise ValueError("native runtime descriptor differs from committed packaging identity")
+    try:
+        metadata = json.loads(raw)
+        if metadata["schema"] != 1 or metadata["format"] != "filtered-git-snapshot-v1" or metadata["stateContract"] != "native-flat-v1":
+            raise ValueError("unknown native runtime format/state contract")
+        source = metadata["upstreamCommit"]
+        if not re.fullmatch(r"[0-9a-f]{40}", source) or not isinstance(metadata["files"], dict) or not metadata["files"]:
+            raise ValueError("incomplete native runtime source descriptor")
+        for name, record in metadata["files"].items():
+            relative = Path(name)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError(f"invalid native runtime member {name}")
+            path = home / relative
+            mode = record["mode"]
+            if mode == "120000":
+                if not path.is_symlink() or not path.resolve().is_relative_to(home):
+                    raise ValueError(f"invalid native runtime symlink {name}")
+                data = os.readlink(path).encode()
+            elif mode in ("100644", "100755"):
+                if path.is_symlink() or not path.is_file():
+                    raise ValueError(f"missing native runtime file {name}")
+                data = path.read_bytes()
+                if bool(path.stat().st_mode & 0o111) != (mode == "100755"):
+                    raise ValueError(f"native runtime mode mismatch {name}")
+            else:
+                raise ValueError(f"unsupported native runtime mode {name}")
+            if hashlib.sha256(data).hexdigest() != record["sha256"]:
+                raise ValueError(f"native runtime bytes mismatch {name}")
+        return source
+    except (KeyError, TypeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid native runtime source descriptor: {error}") from error
+
+
 def pristine_source(home: Path, relpath: str, ref: str = "HEAD") -> str:
     """Return the committed (HEAD) bytes of a tracked file, so patching works even
     when the live working tree still carries the old in-place edits."""
@@ -143,9 +191,14 @@ def select_patch_set(home: Path, overlay: Path) -> tuple[str, list[Path], str]:
         data = json.loads(registry.read_text())
         if data.get("schema") != 1 or not isinstance(data.get("sets"), dict):
             raise ValueError("unsupported patch registry schema")
-        if not re.fullmatch(r"[0-9a-f]{40}", head) or head not in data["sets"]:
+        source = audited_source_identity(home)
+        if (home / ".bb-native-runtime.json").exists():
+            attestation = data.get("bundledSnapshots", {}).get(head)
+            if not isinstance(attestation, dict) or attestation.get("upstreamCommit") != source or attestation.get("sourceManifestSha256") != hashlib.sha256((home / ".bb-native-runtime.json").read_bytes()).hexdigest():
+                raise ValueError(f"unsupported bundled Git/source identity {head}; no audited snapshot attestation")
+        if not re.fullmatch(r"[0-9a-f]{40}", head) or source not in data["sets"]:
             raise ValueError(f"unsupported native source SHA {head or '<unknown>'}; no audited exact patch set")
-        names = data["sets"][head]
+        names = data["sets"][source]
         if not isinstance(names, list) or len(names) != 4 or len(set(names)) != 4:
             raise ValueError("audited patch set must contain four distinct files")
         patches = []
@@ -173,7 +226,7 @@ def generate_patched_copies(home: Path, overlay: Path, dest_dir: Path, selection
         native_sha, patches, _ = selection or select_patch_set(home, overlay)
     except ValueError as error:
         die_loud("native source/patch selection refused", str(error))
-    print(f"selected audited native patch set {native_sha}")
+    print(f"selected audited native patch set {audited_source_identity(home)} (Git identity {native_sha})")
 
     source_shas: dict[str, str] = {}
     with tempfile.TemporaryDirectory(prefix="fm-bb-patch-") as tmp:
@@ -363,7 +416,7 @@ def write_manifest(home: Path, mirror: Path, native_entries: list[str], source_s
     lines = [
         "# firstmate bb mirror manifest (bb-plugin-firstmate) — do not edit",
         f"head={selection[0]}",
-        f"patch-set={selection[0]}",
+        f"patch-set={audited_source_identity(home)}",
         f"patch-set-sha={selection[2]}",
         f"overlay={overlay_sha}",
         f"entries={','.join(native_entries)}",
@@ -431,7 +484,7 @@ def verify_mirror(home: Path, overlay: Path | None = None) -> list[str]:
     if overlay is not None:
         try:
             selected_sha, _, selected_digest = select_patch_set(home, overlay)
-            if manifest.get("patch-set") != selected_sha or manifest.get("patch-set-sha") != selected_digest:
+            if manifest.get("patch-set") != audited_source_identity(home) or manifest.get("patch-set-sha") != selected_digest:
                 reasons.append("audited native patch-set identity/digest differs from mirror manifest; re-run the installer")
         except ValueError as error:
             reasons.append(str(error))
