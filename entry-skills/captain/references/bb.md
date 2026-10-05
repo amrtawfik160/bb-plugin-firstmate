@@ -12,6 +12,16 @@ Read native skills with `firstmate_skill` or `bb firstmate skill <name> [relativ
 
 Use `bb firstmate dispatch --help`, `bb firstmate queue --help` and `bb firstmate help` for the registered options. Read `firstmate_posture` / `bb firstmate posture --json` for native registry context, explicit BB posture and approval provenance before mode/authority intake. Native registry is context; apply the native precedence for current user/project instructions. Existing approved standing yolo needs no fresh merge request, actual user holds still apply, and unexplained legacy flags remain unverified until resolved from recorded approval.
 
+The `firstmate_dispatch` description and required contract's BB dispatch appendix explain the native-to-BB mapping: this operation creates the native brief, immediately runs native dispatch resolution, seeds/reuses the exact backlog row, then calls guarded native spawn. Do not create a parallel matching brief to satisfy this ordering. Native script help uses `firstmate_fm` with `script="brief", args=["--help"]`, or `bb firstmate fm brief -- --help`; without `--`, CLI help describes the wrapper.
+
+For an intake-selected local-only change, use the worker selection requested by the user and its verbatim task, for example:
+
+```text
+bb firstmate dispatch --project <selected-project> --shape ship --mode local-only --delivery-requirement branch --provider <selected-provider> --model <selected-model> --reasoning-level <selected-level> -- "<verbatim-task>"
+```
+
+`branch` records ready-in-branch completion without requiring push, PR or merge. It does not change project merge authority. Native local-only completion and any separately authorized local merge retain their native guards. An enabled native resolver's refusal returns the task ID and retained result; read it, finish native intake, then reuse that ID with `--dispatch-profile-reason` and explicit validated BB worker execution. A reason records the selection; it grants no approval. Resolver configuration/usage errors remain refusals.
+
 A bound captain remains the supervisor on later turns. BB live provider sessions keep the instructions constructed at session start; the conditional native role is therefore included in the cold-entry deck tool usage instructions before binding. Worker tool exclusion keeps their launch identity authoritative. The excerpt is identical in both audited native versions; the complete selected-runtime read remains required. A project-task provider/model/effort request applies to worker intake, preserving supervisor execution unless the user explicitly requests a supervisor-thread change. Native delegation exceptions and merge authority still apply.
 
 ## Operations

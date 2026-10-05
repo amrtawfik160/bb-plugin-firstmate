@@ -4,6 +4,7 @@ import { createFakePluginHost,makeThreadResponse,makePluginAgentConfigurationCon
 import plugin from './server.ts';
 import { createDeliveries } from './lib/pr-delivery.ts';
 import { createLaunches } from './lib/launch.ts';
+import { createQueueStore } from './lib/queue-store.ts';
 import { rpcContract } from './rpc.ts';
 import { UPSTREAM_SKILL_NAMES } from './lib/upstream-surface.ts';
 import { runPty,mergedJson } from './lib/host-capture.fixture.mjs';
@@ -12,6 +13,41 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 const row=(n,shape='ship')=>({id:`c${n}`,task:'fix login',projectId:'proj_1',threadId:`thr_c${n}`,parentThreadId:'thr_cap',providerId:null,model:null,reasoningLevel:null,worktree:true,shape,posture:shape==='scout'?'scout':'direct-PR',createdAt:'2026-09-18T00:00:00.000Z'});
 const ctx={threadId:'thr_cap',projectId:'proj_1'};
+test('registered local-only tool/CLI preserve branch delivery, exclude PR obligations and refuse conflicting contracts before spawn',async()=>{
+ const host=await base();try{
+  host.harness.sdk.stub('threads.spawn',async input=>{
+   assert.equal(input.pluginMetadata.deliveryRequirement,'branch');assert.equal(input.pluginMetadata.posture,'local-only');
+   return makeThreadResponse({id:'thr_branch',projectId:'proj_1',environmentId:'env_wt'});
+  });
+  const tool=host.harness.registrations.agentTools.find(t=>t.name==='firstmate_dispatch');
+  const result=await tool.execute({task:'Implement a small local change; no push, PR or merge.',mode:'local-only',taskId:'local-branch',projectId:'proj_1'},ctx);
+  assert.equal(typeof result,'string',JSON.stringify(result));assert.match(result,/Dispatched/);
+  const crew=(await host.bb.storage.kv.get('crews')).find(c=>c.id==='local-branch');assert.equal(crew.deliveryRequirement,'branch');
+  const restored=await host.harness.behavior.runCli(['dispatch','--task-id','local-branch','--mode','local-only','--','same task'],ctx);assert.equal(restored.exitCode,0,restored.stderr);
+  assert.equal(host.harness.sdk.callsTo('threads.spawn').length,1,'idempotent task reuse');
+  const before=host.harness.sdk.callsTo('threads.spawn').length;
+  const conflict=await host.harness.behavior.runCli(['dispatch','--mode','local-only','--delivery-requirement','merged','--','conflict'],ctx);assert.equal(conflict.exitCode,1);assert.match(conflict.stderr,/conflicts/);
+  const wrongMode=await host.harness.behavior.runCli(['dispatch','--mode','direct-PR','--delivery-requirement','branch','--','conflict'],ctx);assert.equal(wrongMode.exitCode,1);assert.match(wrongMode.stderr,/requires mode/);
+  assert.equal(host.harness.sdk.callsTo('threads.spawn').length,before);
+  const unsupported=await host.harness.behavior.runCli(['dispatch','--mode','local-only','--branch-prefix','work/','--','task'],ctx);assert.equal(unsupported.exitCode,1);assert.match(unsupported.stderr,/needs transport=real/);assert.equal(host.harness.sdk.callsTo('threads.spawn').length,before);
+  const registered=await host.harness.behavior.runCli(['deliveries','register','--crew','local-branch','--url','https://github.com/fixture/repo/pull/7'],ctx);assert.equal(registered.exitCode,1);assert.match(registered.stderr,/cannot be registered/);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+test('queued local-only intake keeps branch and unresolved mode defers its default until dispatch',async()=>{
+ const host=await base();try{
+  const queue=host.harness.registrations.agentTools.find(t=>t.name==='firstmate_queue');
+  const added=await queue.execute({action:'add',title:'local branch work',detail:'Unchanged full task',mode:'local-only',branchPrefix:'work/',dispatchProfileReason:'intake selection'},ctx);
+  assert.match(added,/Queued/);
+  const store=createQueueStore(host.bb.storage.database(),async()=>undefined);await store.ready();
+  const local=store.list('thr_cap')[0];assert.equal(local.deliveryRequirement,'branch');assert.equal(local.branchPrefix,'work/');assert.equal(local.dispatchProfileReason,'intake selection');
+  const deferred=await host.harness.behavior.runCli(['queue','add','mode selected at dispatch','--json'],ctx);assert.equal(deferred.exitCode,0,deferred.stderr);
+  const item=JSON.parse(deferred.stdout);assert.equal(item.deliveryRequirement,undefined,'no premature merged contract before mode intake');
+  await host.bb.storage.kv.set('postures',{proj_1:{mode:'local-only',yolo:false}});
+  host.harness.sdk.stub('threads.spawn',async input=>{assert.equal(input.pluginMetadata.deliveryRequirement,'branch');return makeThreadResponse({id:'thr_queued_branch',projectId:'proj_1',environmentId:'env_wt'});});
+  const dispatched=await queue.execute({action:'dispatch',queueId:item.id},ctx);assert.match(dispatched,/Dispatched/);
+  assert.equal((await host.bb.storage.kv.get('crews'))[0].deliveryRequirement,'branch');
+ }finally{await host.harness.lifecycle.dispose();}
+});
 function hostCommands(host,answer) {
  const commands=new Map();let n=0;
  host.harness.sdk.stub('terminals.create',async args=>{const id=`term${++n}`;commands.set(id,args.start.command);return{id};});
@@ -368,7 +404,8 @@ test('native guard failure after real bridge creation retains an unadmitted work
   host.harness.sdk.stub('terminals.get',async()=>({status:'running'}));host.harness.sdk.stub('terminals.close',async()=>({}));
   host.harness.sdk.stub('terminals.output',async({terminalId})=>{
    const command=commands.get(terminalId);let code=0,payload='';
-   if(command.includes('fm-spawn.sh')&&!command.includes('native_command=')) {
+   if(command.includes('fm-dispatch-resolve.sh')) payload='dispatch-resolve: off (fixture)';
+   else if(command.includes('fm-spawn.sh')&&!command.includes('native_command=')) {
     const creation=await host.harness.behavior.runCli(['create-worker','--task','guard','--shape','ship','--project','proj_1','--home','/native','--host','host_1','--path','/repo','--prompt-file','/tmp/brief','--parent','thr_cap','--native-pid','999'],ctx);
     assert.equal(creation.exitCode,0,creation.stderr);code=1;payload='native isolation/publication guard refused after BB creation';
    }else if(command.includes('bb_thread_id')) payload='FM_META_ABSENT';

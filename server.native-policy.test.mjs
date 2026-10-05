@@ -1,5 +1,6 @@
 import {manifestSkillIds} from './scripts/plugin-skill-fixture.mjs';
 import assert from 'node:assert/strict';
+import { DISPATCH_TRANSPORT } from './lib/dispatch-intake.ts';
 import test from 'node:test';
 import {createHash} from 'node:crypto';
 import {readFileSync,writeFileSync,mkdirSync,rmSync,cpSync,symlinkSync,readdirSync} from 'node:fs';
@@ -17,8 +18,8 @@ const ctx={threadId:'thr_cap',projectId:'proj_1'};
 const manifest=JSON.parse(readFileSync('package.json','utf8'));
 const ids=manifestSkillIds(process.cwd());
 const hash=text=>createHash('sha256').update(text).digest('hex');
-async function hostFor(home) {
- const host=createFakePluginHost({pluginId:'firstmate',agentSkillIds:ids,settings:{fmHome:home,fmHostId:'host_1',fullParityOnDeck:false}});await plugin(host.bb);
+async function hostFor(home,extraSettings={}) {
+ const host=createFakePluginHost({pluginId:'firstmate',agentSkillIds:ids,settings:{fmHome:home,fmHostId:'host_1',fullParityOnDeck:false,...extraSettings}});await plugin(host.bb);
  await host.bb.storage.kv.set('native-home:thr_cap',home);await host.bb.storage.kv.set('native-home-host:thr_cap','host_1');
  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',parentThreadId:threadId==='thr_cap'?null:'thr_cap',environmentId:'env_1'}));
  host.harness.sdk.stub('threads.getPluginMetadata',async()=>({captain:'true'}));
@@ -31,7 +32,7 @@ async function hostFor(home) {
    assert.ok(Buffer.byteLength(start.command)<=10000,'fully composed host command budget');
    const match=/^__fm_cmd='([\s\S]*?)'; set \+e; "/.exec(start.command);assert.ok(match,start.command);
    const command=match[1].replace(/'\\''/g,"'");commands.push(command);
-   const result=spawnSync('bash',['--noprofile','--norc','-c',command],{stdio:['ignore','pipe','pipe'],encoding:'utf8',env:{...process.env,HOME:home,PATH:fakebin+':'+process.env.PATH},timeout:30000,maxBuffer:4*1024*1024});
+   const result=spawnSync('bash',['--noprofile','--norc','-c',command],{stdio:['ignore','pipe','pipe'],encoding:'utf8',env:{...Object.fromEntries(Object.entries(process.env).filter(([key])=>!key.startsWith('BB_'))),HOME:home,TYPESAFE_API_KEY:'',PATH:fakebin+':'+process.env.PATH},timeout:30000,maxBuffer:4*1024*1024});
    const id='term'+(++n);output.set(id,(result.stdout??'')+(result.stderr??'')+`\n__FM_HOST_RC:${result.status??2}\n`);return{id};
  });
  host.harness.sdk.stub('terminals.get',async()=>({status:'running'}));host.harness.sdk.stub('terminals.close',async()=>({}));
@@ -96,6 +97,33 @@ for(const pin of pins)test(`bounded registered contract pages ${pin.slice(0,8)} 
   assert.equal(f.host.harness.sdk.callsTo('threads.spawn').length,0);assert.equal(f.host.harness.sdk.callsTo('threads.send').length,0);
  }finally{await f.host.harness.lifecycle.dispose();rmSync(home,{recursive:true,force:true});}
 });
+for(const pin of pins)test(`native dispatch intake ${pin.slice(0,8)} writes branch brief then resolves then owns backlog before attempted guarded BB spawn`,async()=>{
+ const home=fixture(pin),f=await hostFor(home,{transport:'real',queueOwner:'real'}),repo=join(home,'test-repository');
+ try{
+  ok(run('python3',['overlay/install-bb-backend.py','--home',home]));mkdirSync(repo);
+  ok(run('git',['init','--quiet',repo]));ok(run('git',['-C',repo,'config','user.name','Fixture']));ok(run('git',['-C',repo,'config','user.email','fixture@example.invalid']));
+  writeFileSync(join(repo,'proof.txt'),'owned baseline\n');ok(run('git',['-C',repo,'add','proof.txt']));ok(run('git',['-C',repo,'commit','--quiet','-m','owned baseline']));
+  const head=ok(run('git',['-C',repo,'rev-parse','HEAD']));
+  f.host.harness.sdk.stub('providers.list',async()=>[{id:'fixture-provider',available:true}]);
+  const task='Create a tiny local module on the assigned branch. No push, PR or merge.';
+  const r=await f.host.harness.behavior.runCli(['dispatch','--task-id','owned-intake','--project','proj_1','--mode','local-only','--branch-prefix','work/','--provider','fixture-provider','--',''+task],ctx);
+  // Native may refuse at a dependency/BB endpoint guard. It must never fall back
+  // to an SDK/model spawn. Prior native brief/resolver/backlog stages are real.
+  assert.equal(r.exitCode,1,'the fake BB executable cannot launch a worker');
+  const brief=readFileSync(join(home,'data/owned-intake/brief.md'),'utf8');
+  assert.ok(brief.includes(task));assert.match(brief,/Ship branch: `?work\/owned-intake/);assert.match(brief,/local-only/);
+  const briefIndex=f.commands.findIndex(c=>c.includes('FM_INTENT=')),resolveIndex=f.commands.findIndex(c=>c.includes('fm-dispatch-resolve.sh')),backlogIndex=f.commands.findIndex(c=>c.includes('fm-tasks-axi.sh')&&c.includes("'add'")),spawnIndex=f.commands.findIndex(c=>c.includes('fm-spawn.sh'));
+  assert.ok(briefIndex>=0 && resolveIndex>briefIndex && backlogIndex>resolveIndex && spawnIndex>backlogIndex,JSON.stringify(f.commands));
+  assert.ok(f.commands[spawnIndex].includes("'--branch-prefix' 'work/'"));assert.ok(f.commands[spawnIndex].includes("FM_BB_DELIVERY_REQUIREMENT='branch'"));
+  const launch=JSON.parse((await f.host.harness.behavior.runCli(['launches','--json'],ctx)).stdout).find(r=>r.taskId==='owned-intake');
+  assert.equal(launch.deliveryRequirement,'branch');assert.equal(launch.branchPrefix,'work/');
+  const artifacts=readdirSync(join(home,'data/owned-intake')).filter(n=>n.startsWith('dispatch-resolution-'));assert.equal(artifacts.length,1);assert.match(readFileSync(join(home,'data/owned-intake',artifacts[0]),'utf8'),/dispatch-resolve: off/);
+  assert.equal(f.host.harness.sdk.callsTo('threads.spawn').length,0);assert.equal(ok(run('git',['-C',repo,'rev-parse','HEAD'])),head);
+  const wrapper=await f.host.harness.behavior.runCli(['fm','brief','--help'],ctx);assert.equal(wrapper.exitCode,0);assert.match(wrapper.stdout,/fm brief -- --help/);
+  const help=await f.host.harness.behavior.runCli(['fm','brief','--','--help'],ctx);assert.equal(help.exitCode,0,help.stderr);assert.match(help.stdout,/fm-brief.sh <task-id>/);assert.match(help.stdout,/local-only/);
+  const tool=f.host.harness.registrations.agentTools.find(t=>t.name==='firstmate_dispatch');assert.match(tool.description,/brief→dispatch-resolve→backlog/);assert.match(tool.description,/providerId\/model\/reasoningLevel choose the BB worker/);
+ }finally{await f.host.harness.lifecycle.dispose();rmSync(home,{recursive:true,force:true});}
+});
 for(const pin of pins)test(`selected ${pin.slice(0,8)} native policy and complete contract through registered CLI/tool, composed with transport only`,async()=>{
  const home=fixture(pin),f=await hostFor(home);try {
   const tool=f.host.harness.registrations.agentTools.find(t=>t.name==='firstmate_skill');
@@ -123,6 +151,7 @@ for(const pin of pins)test(`selected ${pin.slice(0,8)} native policy and complet
     const cfg=await f.host.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({pluginMetadata:meta}));
     assert.ok(!cfg.skills.some(name=>['captain-methods','worker-methods','calm','catch-up'].includes(name)));
     const allow=JSON.parse(readFileSync('docs/verification/native-transport-allowlist.v1.json','utf8'));
+    assert.equal(hash(DISPATCH_TRANSPORT),allow.dispatchTransport.sha256,'dispatch transport mapping requires explicit review');
     assert.equal(hash(cfg.instructions),allow.dynamic[meta.crew?'crew':'captain'].sha256,'any added default instruction requires explicit transport review');
     for(const [path,entry] of Object.entries(allow.renderer))assert.equal(hash(readFileSync(path)),entry.sha256,'rendered transport changes require explicit review: '+path);
     for(const [path,entry] of Object.entries(allow.captainTransport))assert.equal(hash(readFileSync(path)),entry.sha256,'captain transport changes require explicit review: '+path);
@@ -132,6 +161,7 @@ for(const pin of pins)test(`selected ${pin.slice(0,8)} native policy and complet
       const composed=[cfg.instructions,...Object.keys(allow.captainTransport).map(path=>readFileSync(path,'utf8')),contract.stdout].join('\n');
       assert.doesNotMatch(composed,/captain-methods|worker-methods|Calm reporting|report editor/);
       assert.ok(composed.includes(native),'complete selected native contract must survive composition');
+      assert.ok(contract.stdout.includes(DISPATCH_TRANSPORT),'complete managed-dispatch mapping in required native contract read');
       assert.match(composed,/standing `yolo`/);assert.match(composed,/must stand alone/);assert.match(composed,/firstmate_skill/);
     }
   }

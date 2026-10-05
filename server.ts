@@ -2,6 +2,7 @@
 import { deflateSync } from "node:zlib";
 import { CAPTAIN_ROLE_INSTRUCTIONS } from "./lib/captain-role.ts";
 import { contractPage, contractCursorSection } from "./lib/contract-transport.ts";
+import { DISPATCH_TRANSPORT, FM_WRAPPER_HELP, taskDelivery, nativeDispatchIntake } from "./lib/dispatch-intake.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -122,7 +123,8 @@ const crewSchema = z.object({
   // true = `task` holds only a prefix; the full brief lives under crew-task:<id>.
   taskSpilled: z.boolean().optional(),
   launchKey: z.string().optional(),
-  deliveryRequirement: z.enum(["pr", "merged", "merged-and-verified"]).optional(),
+  deliveryRequirement: z.enum(["branch", "pr", "merged", "merged-and-verified"]).optional(),
+  branchPrefix:z.string().max(120).optional(),
   createdAt: z.string(),
 });
 type Crew = z.infer<typeof crewSchema>;
@@ -151,7 +153,7 @@ const decisionSchema = z.object({
 type Decision = z.infer<typeof decisionSchema>;
 
 const doneSchema = z.object({
-  deliveryRequirement:z.enum(["pr","merged","merged-and-verified"]).optional(),
+  deliveryRequirement:z.enum(["branch","pr","merged","merged-and-verified"]).optional(),
   id: z.string(),
   task: z.string(),
   shape: shapeSchema.default("ship"),
@@ -1259,6 +1261,9 @@ function flagStr(flags: Map<string, FlagValue>, ...keys: string[]): string | und
   }
   return undefined;
 }
+function flagStrAllowEmpty(flags:Map<string,FlagValue>,key:string):string|undefined {
+  const value=flags.get(key);return typeof value==='string' ? value : Array.isArray(value) ? value[0] : undefined;
+}
 
 function flagAll(flags: Map<string, FlagValue>, ...keys: string[]): string[] {
   const out: string[] = [];
@@ -2179,7 +2184,7 @@ export default async function plugin(bb: BbPluginApi) {
     const signal=AbortSignal.any([launchAbort.signal,...(asRecord(ctx)["signal"] ? [asRecord(ctx)["signal"] as AbortSignal] : [])]);
     const cached=(await raceAbort(readPostures(),signal,STUCK_HOST_CALL_MS))[projectId];
     const home=(await raceAbort(settings.get(),signal,STUCK_HOST_CALL_MS)).fmHome;
-    let native:{mode:string;yolo:boolean;output:string;registered:boolean}|null=null;
+    let native:{mode:string;yolo:boolean;branchPrefix:string;output:string;registered:boolean}|null=null;
     if (home) {
       const host=await raceAbort(resolveHostForProject(projectId,ctxString(ctx,"threadId"),signal),signal,STUCK_HOST_CALL_MS);
       const path=await raceAbort(projectCheckoutPath(projectId,host),signal,STUCK_HOST_CALL_MS);
@@ -2190,7 +2195,12 @@ export default async function plugin(bb: BbPluginApi) {
       const rows=result.output.split('\n').filter(line=>/^(no-mistakes(?:-prod-only)?|direct-PR|local-only) (on|off)$/.test(line.trim()));
       if (rows.length!==1) throw new Error("Native posture read did not yield one complete mode/yolo record; inspect native project-mode output.");
       const [mode,yolo]=rows[0]!.trim().split(' ');
-      native={mode:mode!,yolo:yolo==='on',output:result.output,registered:!result.output.includes("defaulting")};
+      const prefix=await runFmScript({script:"project-mode",args:["--branch-prefix",name],hostId:host,fmHome:home,timeoutMs:30_000,signal});
+      requireNativeSuccess(prefix,"native registered branch prefix");
+      const prefixRows=prefix.output.replace(/\r?\n$/, '').split(/\r?\n/).filter(line=>!line.startsWith('warn:'));
+      const branchPrefix=prefixRows[0] ?? '';
+      if (prefixRows.length!==1 || /\s/.test(branchPrefix)) throw new Error("Native branch prefix read is malformed; inspect project-mode output.");
+      native={mode:mode!,yolo:yolo==='on',branchPrefix,output:result.output,registered:!result.output.includes("defaulting")};
     }
     return {projectId,native,plugin:cached??null,default:{mode:"no-mistakes",yolo:false},
       authority:cached?.provenance ? {status:"recorded-captain-instruction",...cached.provenance} : (cached?.yolo || native?.yolo) ? {status:"legacy-unverified",note:"Preserve prior standing posture. Resolve from existing captain approval; missing provenance is not proof of absent approval. A registry flag alone does not prove approval."} : {status:"off"},
@@ -3247,7 +3257,7 @@ export default async function plugin(bb: BbPluginApi) {
   // Firstmate-spec brief for a BB-dispatched crew, not just a synthetic prompt.
   // Best-effort and idempotent (never overwrites an existing brief); a missing
   // script or host failure is silent — the crew already has the structured prompt.
-  async function publishFmBrief(crew: Crew, hostId: string | undefined, task: string): Promise<boolean> {
+  async function publishFmBrief(crew: Crew, hostId: string | undefined, task: string, projectDir?:string,signal?:AbortSignal): Promise<boolean> {
     const fmHome = await crewNativeHome(crew);
     if (fmHome === "") return false;
     if (isSecondmateRoute(crew)) return false;
@@ -3277,8 +3287,8 @@ export default async function plugin(bb: BbPluginApi) {
     // is exactly the delivery mode the brief records.
     const scaffold =
       crew.shape === "scout"
-        ? `${briefRef} ${shQuote(crew.id)} crew --scout`
-        : `${briefRef} ${shQuote(crew.id)} crew --mode ${shQuote(crew.posture)}`;
+        ? `${briefRef} ${shQuote(crew.id)} ${shQuote(projectDir ?? 'crew')} --scout`
+        : `${briefRef} ${shQuote(crew.id)} ${shQuote(projectDir ?? 'crew')} --mode ${shQuote(crew.posture)}${crew.branchPrefix !== undefined ? ` --branch-prefix ${shQuote(crew.branchPrefix)}` : ''}`;
     const py =
       "import base64,os,sys;p=sys.argv[1];" +
       'intent=base64.b64decode(os.environ["FM_INTENT"]).decode();' +
@@ -3300,7 +3310,7 @@ export default async function plugin(bb: BbPluginApi) {
       `FM_INTENT=${intentB64} ${specEnv}python3 -c ${shQuote(py)} ${shQuote(brief)} || { echo "fm-brief fill failed" >&2; exit 1; }`,
     ].join("\n");
     try {
-      const res = await runOnHost(host, script, 30_000);
+      const res = await runOnHost(host, script, 30_000,signal);
       if (res.output.includes("FM_MIRROR_STALE")) {
         const line = res.output.split("\n").find((l) => l.includes("FM_MIRROR_STALE"))?.trim() ?? "FM_MIRROR_STALE";
         bb.log.error(`bb mirror is STALE while scaffolding brief crew=${crew.id}: ${line}. Re-run the overlay installer against ${fmHome}.`);
@@ -3438,6 +3448,7 @@ export default async function plugin(bb: BbPluginApi) {
       ownsRow?: boolean;
       visible?: boolean;
       checkout?:string;
+      dispatchProfileReason?:string;
     },
     hostId: string,
     signal?: AbortSignal,
@@ -3481,7 +3492,17 @@ export default async function plugin(bb: BbPluginApi) {
     // Scaffold the authoritative brief first — a ship spawn reads its recorded
     // "Delivery contract: mode=" line and refuses a mismatch, so the brief must
     // exist (with the right mode) before fm-spawn.sh runs.
-    await publishFmBrief(crew, hostId, input.task);
+    if (!await publishFmBrief(crew, hostId, input.task, projectDir,signal)) throw new Error('Native brief publication failed; no resolver/backlog/spawn executed.');
+    const resolved=await runFmScript({script:'dispatch-resolve',args:[`${fmHome}/data/${crew.id}/brief.md`],hostId,fmHome,timeoutMs:30_000,signal});
+    // Preserve every candidate/result without manufacturing an intake judgment.
+    const resolutionPath=`${fmHome}/data/${crew.id}/dispatch-resolution-${randomUUID()}.txt`;
+    if (!await writeHostBytes(hostId,resolutionPath,`${resolved.output}\nBB execution: ${crew.providerId ?? 'project default'} / ${crew.model ?? 'project default'} / ${crew.reasoningLevel ?? 'project default'}\nBB intake reason: ${input.dispatchProfileReason ?? '(not supplied)'}\n`,STUCK_HOST_CALL_MS,signal,true)) throw new Error('Could not retain native dispatch resolution; no backlog/spawn executed.');
+    let resolution:string;
+    try { resolution=nativeDispatchIntake(resolved.exitCode,resolved.output,input.dispatchProfileReason); }
+    catch(error) { throw new Error(`Task ${crew.id}: ${String(error)} (resolution evidence: ${resolutionPath})`); }
+    if (resolution!=='off' && (!crew.providerId || !crew.model)) throw new Error('Enabled native dispatch resolution needs an explicit validated BB provider/model selection; reuse taskId after native intake.');
+    if (resolution!=='off') await validateProviderChoice(crew.providerId!,crew.model!,crew.projectId,crew.parentThreadId??undefined,strictReasoning(crew.reasoningLevel??undefined),hostId,true);
+    bb.log.info(`real transport dispatch-resolve crew=${crew.id} status=${resolution} evidence=${resolutionPath}${input.dispatchProfileReason ? ` override=${input.dispatchProfileReason}` : ''}`);
     // C1: create the backlog row (id = crew id, so meta/brief/backlog/thread all
     // agree) BEFORE spawning. tasks-axi add is idempotent (repeat returns
     // ok/already), so a retry or a queue-dispatched crew whose row already exists
@@ -3507,6 +3528,7 @@ export default async function plugin(bb: BbPluginApi) {
       crew.shape === "scout"
         ? [crew.id, projectDir, "--scout", "--backend", "bb", "--harness", "bb"]
         : [crew.id, projectDir, "--mode", crew.posture, "--yolo", (crew.yolo ?? posture.yolo) ? "on" : "off", "--backend", "bb", "--harness", "bb"];
+    if (crew.shape==='ship' && crew.branchPrefix!==undefined) args.push('--branch-prefix',crew.branchPrefix);
     if (crew.model !== null && crew.model !== "") args.push("--model", crew.model);
     if (crew.reasoningLevel !== null) args.push("--effort", crew.reasoningLevel);
     const capped = capPermission(input.permissionMode, await parentPermission(input.parentThreadId));
@@ -3523,6 +3545,9 @@ export default async function plugin(bb: BbPluginApi) {
     let spawnFailed = false;
     let spawnFailure = "Native spawn returned without a recorded worker.";
     try {
+      // Earlier failures are known pre-spawn refusals. Only crossing native
+      // spawn can have an uncertain external worker outcome.
+      launches.update(launchKey(crew.projectId,crew.parentThreadId ?? '',crew.nativeHome ?? '',crew.id),{nativeInvoked:true});
       const res = await withHomeSpawnGate(fmHome, () => runFmScript({
         script: "spawn",
         args,
@@ -4268,7 +4293,8 @@ export default async function plugin(bb: BbPluginApi) {
     if (!("content" in read) || read.sizeBytes > 1_000_000) throw new Error("Native prompt is missing or exceeds 1MB.");
     const prompt = read.contentEncoding === "base64" ? Buffer.from(read.content,"base64").toString("utf8") : read.content;
     const key = launchKey(projectId, owner, home, taskId);
-    let record = await launches.reserve({ key, taskId, projectId, owner, home, generation:1,shape,nativeInvoked:true,deliveryMode:flagStr(flags,"delivery-mode"),deliveryRequirement:z.enum(["pr","merged","merged-and-verified"]).parse(flagStr(flags,"delivery-requirement") ?? "merged"),state:"reserved",threadId:null,hostId,updatedAt:Date.now() }, () => launchCapacity(owner || undefined));
+    const deliveryRequirement=taskDelivery(flagStr(flags,"delivery-mode") ?? "direct-PR",z.enum(["branch","pr","merged","merged-and-verified"]).optional().parse(flagStr(flags,"delivery-requirement")),shape);
+    let record = await launches.reserve({ key, taskId, projectId, owner, home, generation:1,shape,nativeInvoked:true,deliveryMode:flagStr(flags,"delivery-mode"),deliveryRequirement,state:"reserved",threadId:null,hostId,updatedAt:Date.now() }, () => launchCapacity(owner || undefined));
     record = await reconcileLaunch(record);
     const suppliedContract=flagStr(flags,"delivery-requirement");
     if (suppliedContract && suppliedContract !== recoveredContract({},record)) throw new Error("Creation retry cannot change the original delivery contract.");
@@ -4421,19 +4447,26 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function dispatchCrew(input: Parameters<typeof dispatchCrewBody>[0]): Promise<Crew> {
+    const requestedRequirement=input.deliveryRequirement;
     if (input.crewId && !/^[A-Za-z0-9._-]{1,100}$/.test(input.crewId)) throw new Error("Invalid task retry identity.");
-    if (input.deliveryRequirement && !["pr","merged","merged-and-verified"].includes(input.deliveryRequirement)) throw new Error("Unsupported delivery contract.");
-    validateLaunchCapabilities({ ...input, transport: (await settings.get()).transport });
+    if (input.deliveryRequirement && !["branch","pr","merged","merged-and-verified"].includes(input.deliveryRequirement)) throw new Error("Unsupported delivery contract.");
+    input={...input,deliveryRequirement:taskDelivery(input.mode,input.deliveryRequirement,input.shape)};
+    if (input.branchPrefix!==undefined && input.shape!=='ship') throw new Error('branchPrefix applies only to ship dispatch.');
+    const transport=(await settings.get()).transport;
+    if (transport!=='real' && (input.branchPrefix!==undefined || input.dispatchProfileReason!==undefined)) throw new Error('Native branch prefix/profile intake needs transport=real (deck/init --real); SDK compatibility dispatch cannot bind a native branch or run native resolution.');
+    validateLaunchCapabilities({ ...input, transport });
     const taskId = input.crewId || randomUUID().slice(0, 8);
     const home = (await settings.get()).fmHome.trim();
     const key = launchKey(input.projectId, input.parentThreadId ?? "", home, taskId);
     return launches.once(`dispatch:${key}`, async () => {
       const record = await launches.reserve({ key, taskId, projectId: input.projectId, owner: input.parentThreadId ?? "",
-        home, generation: 1, shape: input.shape, deliveryMode:input.mode, yolo:input.yolo, deliveryRequirement:input.deliveryRequirement ?? "merged", state: "reserved", threadId: null, updatedAt: Date.now() }, () => launchCapacity(input.parentThreadId));
+        home, generation: 1, shape: input.shape, deliveryMode:input.mode, yolo:input.yolo, branchPrefix:input.branchPrefix,deliveryRequirement:input.deliveryRequirement ?? "merged", state: "reserved", threadId: null, updatedAt: Date.now() }, () => launchCapacity(input.parentThreadId));
       const resolved = await reconcileLaunch(record);
       if (resolved.state === "deleted") throw new Error(`Worker for launch ${taskId} was deleted by BB core. This attempt cannot be resumed.`);
-      if (input.deliveryRequirement && input.deliveryRequirement !== recoveredContract({},resolved)) throw new Error("Retry cannot change the original delivery contract.");
+      if (requestedRequirement && requestedRequirement !== recoveredContract({},resolved)) throw new Error("Retry cannot change the original delivery contract.");
       if (input.yolo!==undefined && resolved.yolo!==undefined && input.yolo!==resolved.yolo) throw new Error("Retry cannot change the original merge-authority selection.");
+      if (input.branchPrefix!==undefined && input.branchPrefix!==(resolved.branchPrefix ?? 'fm/')) throw new Error('Retry cannot change the recorded ship branch prefix.');
+      input={...input,branchPrefix:resolved.branchPrefix};
       input={...input,yolo:resolved.yolo??input.yolo,deliveryRequirement:recoveredContract({},resolved)};
       if (resolved.threadId && ((await settings.get()).transport !== "real" || resolved.state === "running")) {
         const crew = (await readCrews()).find(c => c.id === taskId && c.projectId === input.projectId && c.parentThreadId === (input.parentThreadId ?? null));
@@ -4492,7 +4525,9 @@ export default async function plugin(bb: BbPluginApi) {
     mode: DeliveryMode;
     yolo?:boolean;
     sendAt?: number;
-    deliveryRequirement?: "pr" | "merged" | "merged-and-verified";
+    deliveryRequirement?: "branch" | "pr" | "merged" | "merged-and-verified";
+    branchPrefix?:string;
+    dispatchProfileReason?:string;
     signal?:AbortSignal;
   }): Promise<Crew> {
     const task = input.task.trim().slice(0, MAX_TASK);
@@ -4540,6 +4575,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const crew: Crew = {
       yolo:input.yolo,deliveryRequirement: input.deliveryRequirement ?? "merged",
+      ...(input.branchPrefix!==undefined ? {branchPrefix:input.branchPrefix} : {}),
       nativeHome: (await settings.get()).fmHome.trim(),
       id: input.crewId !== undefined && input.crewId !== "" ? input.crewId : randomUUID().slice(0, 8),
       task,
@@ -4568,13 +4604,11 @@ export default async function plugin(bb: BbPluginApi) {
       if (cur.fmHome.trim() === "") throw new Error("Real transport needs fmHome. Run init --real before dispatch.");
       try {
         const rtHost = selection.hostId;
-        const nativeKey = launchKey(input.projectId,input.parentThreadId ?? "",crew.nativeHome ?? "",crew.id);
-        launches.update(nativeKey,{ nativeInvoked:true });
         const realThreadId = await dispatchViaRealTransport(
           crew,
           { task: input.task, projectId: input.projectId, parentThreadId: input.parentThreadId,
             title: input.title, permissionMode: input.permissionMode,
-            ownsRow: input.ownsRow, visible: input.visible,checkout:selection.checkout },
+            ownsRow: input.ownsRow, visible: input.visible,checkout:selection.checkout,dispatchProfileReason:input.dispatchProfileReason },
           rtHost,input.signal,
         );
         if (realThreadId !== null && realThreadId !== "") {
@@ -5761,7 +5795,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
   function recoveredContract(meta:Record<string,unknown>,record?:LaunchRecord):NonNullable<Crew["deliveryRequirement"]> {
     const value=meta["deliveryRequirement"];
-    if (value !== undefined && !["pr","merged","merged-and-verified"].includes(String(value))) throw new Error("Recovered task has an invalid delivery contract.");
+    if (value !== undefined && !["branch","pr","merged","merged-and-verified"].includes(String(value))) throw new Error("Recovered task has an invalid delivery contract.");
     if (record?.deliveryRequirement && value !== undefined && record.deliveryRequirement !== value) throw new Error("Recovered metadata disagrees with the durable delivery contract.");
     if (record) {
       if (!record.deliveryRequirement && value === undefined) throw new Error("Durable launch has no readable original delivery contract; explicit recovery is required.");
@@ -5789,6 +5823,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const home=await raceAbort(crewNativeHome(crew),signal,STUCK_HOST_CALL_MS);
     const requirement=await contractForCrew(crew,signal);
+    if (requirement==='branch') throw new Error('A branch delivery contract cannot become a PR obligation.');
     const task=await raceAbort(fullCrewTask(crew),signal,STUCK_HOST_CALL_MS);
     signal?.throwIfAborted();
     deliveries.register({url,taskId:crew.id,projectId:crew.projectId,owner:crew.parentThreadId,home,worker:crew.threadId,requirement,continuation:{...crew,task,taskSpilled:false}});
@@ -5893,7 +5928,9 @@ export default async function plugin(bb: BbPluginApi) {
         if (!projectId) projectId=(await raceAbort(bb.sdk.threads.get({threadId:owner,signal}),signal,STUCK_HOST_CALL_MS)).projectId;
         if (!projectId) return;
         const home=await raceAbort(bb.storage.kv.get<string>(`native-home:${owner}`),signal,STUCK_HOST_CALL_MS) ?? "";
-        deliveries.register({url:row.pr,taskId:row.crewId,projectId,owner,home,worker:"",requirement:row.deliveryRequirement ?? recoveredContract({},launches.forTask(projectId,owner,row.crewId))});
+        const requirement=row.deliveryRequirement ?? recoveredContract({},launches.forTask(projectId,owner,row.crewId));
+        if (requirement==='branch') return;
+        deliveries.register({url:row.pr,taskId:row.crewId,projectId,owner,home,worker:"",requirement});
       },signal).catch(error=>bb.log.warn(`PR inventory recovery ${row.crewId}: ${String(error)}`));
     }
   }
@@ -5971,6 +6008,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (!crew || crew.parentThreadId !== owner || crew.projectId !== projectId || crew.shape !== "ship") throw new Error("Register requires an owned ship on this project.");
       if (input.requirement && !input.authorized) throw new Error("Setting an explicit delivery contract requires user authority; an existing contract cannot be replaced by registration.");
       const original=await contractForCrew(crew);
+      if (original==='branch') throw new Error('Branch delivery is satisfied by the native ready-in-branch artifact; it cannot be registered as a PR contract.');
       if (input.requirement && input.requirement !== original) throw new Error("Registration cannot change the original delivery contract.");
       const record=deliveries.register({ url:input.url ?? crew.prUrl ?? "",taskId:crew.id,projectId,owner,home:await crewNativeHome(crew),worker:crew.threadId,requirement:original,continuation:{...crew,task:await fullCrewTask(crew),taskSpilled:false} });
       return [record];
@@ -9170,10 +9208,9 @@ export default async function plugin(bb: BbPluginApi) {
       "   installs the pinned bundle on clean hosts; native prerequisites and harness startup remain required.",
       "2. Native deck (plugin SDK / Fleet UI): bb firstmate deck, then dispatch/tell/watch/merge.",
       "   BB is the session backend (threads + managed-worktree), like tmux/orca — not a rewrite of bin/.",
-      "Primary dispatch (real toolbelt, after deck/init --real):",
-      "  bb firstmate fm spawn -- --mode direct-PR -- ship \"fix flaky login test\"",
-      "Native dispatch (BB transport; writes state/<id>.meta when fmHome is set, so the scripts see Fleet crews):",
+      "Primary native dispatch (after deck/init --real; BB owns brief/resolver/backlog/spawn):",
       "  bb firstmate dispatch --project <proj> -- \"fix flaky login test\"",
+      DISPATCH_TRANSPORT,
       `Pinned bundle/native attribution: ${repo}. Inspect bb firstmate runtime status --json; no startup fetch or implicit runtime selection upgrade.`,
     ].join("\n");
   }
@@ -9191,17 +9228,19 @@ export default async function plugin(bb: BbPluginApi) {
     permissionMode: z.enum(["accept-edits", "auto", "full"]).optional(),
     shape: shapeSchema.optional(),
     mode: modeSchema.optional(),
+    branchPrefix:z.string().max(120).optional().describe("Native ship-branch prefix selected at intake; passed unchanged to brief and spawn, default fm/; empty gives a bare task-id branch"),
+    dispatchProfileReason:z.string().min(1).max(1000).optional().describe("Native enabled dispatch-resolve intake decision/override reason for explicit BB provider/model selection; does not grant approval"),
     worktree: z.boolean().optional(),
     sharedEnv: z.boolean().optional().describe("Unsupported for native ship transport; shared-worktree requests refuse before creation"),
     visible: z.boolean().optional().describe("Show in the BB sidebar as a nested subagent (default true)"),
-    deliveryRequirement:z.enum(["pr","merged","merged-and-verified"]).optional().describe("Agreed delivery contract; default is merge without deployment"),
+    deliveryRequirement:z.enum(["branch","pr","merged","merged-and-verified"]).optional().describe("local-only defaults to branch (ready in branch, no push/PR/merge); PR modes default to merged, which requires existing native merge authority, never grants it"),
     sendAt: z.never().optional().describe("Unsupported for Firstmate launch; use backlog waitUntil eligibility and explicit dispatch"),
     overrideOwner: z.boolean().optional()
       .describe("Proceed even though the task targets a PR another captain's crew owns (only on the captain's word)"),
   });
 
   const dispatchHelp='bb firstmate dispatch [options] -- "<task>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","sendAt"])+"\n  --task <text>  Repeat for bounded fan-out; --hidden hides the worker.\n  sendAt/--send-at is unsupported; native ship isolation is mandatory.";
-  const queueHelp='bb firstmate queue add [options] -- "<title>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider"},["task","taskId","overrideOwner","sendAt","title","permissionMode","sharedEnv","worktree","visible"])+"\n  --detail <full-task>\n  --after <queue-id>  Repeat for dependencies, which remain dispatch gates.\n  --wait-until <ISO-time>  Eligibility only; explicit dispatch required.\n  dispatch preserves the queued shape, mode, contract, dependencies and identity; only provider/model/reasoning/permission/visibility/worktree options override at dispatch.\n  list | next | done <queue-id> | drop <queue-id> | prune | reconcile <exact-id> --project <id> [original options]"+"\nDispatch: bb firstmate queue dispatch <queue-id> [options]\n"+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","taskId","overrideOwner","sendAt","title","shape","mode","deliveryRequirement"]);
+  const queueHelp='bb firstmate queue add [options] -- "<title>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider"},["task","taskId","overrideOwner","sendAt","title","permissionMode","sharedEnv","worktree","visible"])+"\n  --detail <full-task>\n  --after <queue-id>  Repeat for dependencies, which remain dispatch gates.\n  --wait-until <ISO-time>  Eligibility only; explicit dispatch required.\n  dispatch preserves the queued shape, mode, contract, dependencies and identity; only provider/model/reasoning/permission/visibility/worktree options override at dispatch; dispatch-profile-reason records completed native intake.\n  list | next | done <queue-id> | drop <queue-id> | prune | reconcile <exact-id> --project <id> [original options]"+"\nDispatch: bb firstmate queue dispatch <queue-id> [options]\n"+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","taskId","overrideOwner","sendAt","title","shape","mode","deliveryRequirement","branchPrefix"]);
   const usage = [
     "Usage:",
     "  bb firstmate guide [--json]",
@@ -9350,7 +9389,7 @@ export default async function plugin(bb: BbPluginApi) {
     const catalog=await nativePolicyLookup(hostId,path.slice(0,-'/AGENTS.md'.length),{operation:'catalog'},signal);
     if (catalog.contractSha256!==createHash('sha256').update(content).digest('hex')) throw new Error('Native contract changed during selected-runtime trigger read; complete contract/catalog read remains unresolved.');
     const triggers=`## Selected native skill trigger catalog @ ${catalog.commit}\n${catalog.root}\n\n${catalog.entries!.map(entry=>`### ${entry.path}\nNative file SHA-256: ${entry.sha256}\n\n\`\`\`yaml\n${entry.frontmatter}\n\`\`\``).join('\n\n')}`;
-    const text = `${picked.text}\n\n${triggers}\n\n## BB runtime adaptations\n${BB_SKILL_RUNTIME_CONTRACT}\n${done} Treat native policy refusals as refusals. Read durable reports with firstmate_wake; pass handledWake on the final successful action after handling the whole batch.\n`;
+    const text = `${picked.text}\n\n${triggers}\n\n## BB runtime adaptations\n${BB_SKILL_RUNTIME_CONTRACT}\n${DISPATCH_TRANSPORT}\n${done} Treat native policy refusals as refusals. Read durable reports with firstmate_wake; pass handledWake on the final successful action after handling the whole batch.\n`;
     return paged || cursor ? contractPage(text, JSON.stringify([contractCaptain, current.fmHome, hostId, catalog.root, catalog.commit]), section, cursor) : text;
   }
 
@@ -9442,10 +9481,10 @@ export default async function plugin(bb: BbPluginApi) {
   registerCaptainTool({
     name: "firstmate_dispatch",
     description:
-      "Dispatch a firstmate-style crewmate: spawns a child BB thread for one task (ship crews get an isolated worktree by default) and records it as a crew.",
+      `Dispatch one native crewmate after intake; BB owns the brief→dispatch-resolve→backlog→guarded spawn sequence. ${DISPATCH_TRANSPORT}`,
     presentation: { label: { pending: "Dispatching crewmate", completed: "Dispatched crewmate" } },
     parameters: dispatchParams,
-    async execute({ task, taskId, projectId, title, providerId, model, reasoningLevel, permissionMode, shape, mode, worktree, sharedEnv, visible, sendAt, deliveryRequirement, overrideOwner }, ctx) {
+    async execute({ task, taskId, projectId, title, providerId, model, reasoningLevel, permissionMode, shape, mode, branchPrefix,dispatchProfileReason,worktree, sharedEnv, visible, sendAt, deliveryRequirement, overrideOwner }, ctx) {
       const ctxRecord = asRecord(ctx);
       const resolvedProject =
         projectId ?? (typeof ctxRecord["projectId"] === "string" ? ctxRecord["projectId"] : undefined);
@@ -9480,7 +9519,7 @@ export default async function plugin(bb: BbPluginApi) {
           visible: visible !== false,
           shape: resolvedShape,
           mode: toMode(mode, posture.mode),yolo:posture.yolo,
-          sendAt,deliveryRequirement,signal:ctxRecord["signal"] as AbortSignal | undefined,
+          sendAt,deliveryRequirement,branchPrefix,dispatchProfileReason,signal:ctxRecord["signal"] as AbortSignal | undefined,
         });
       } catch (error) {
         return toolError(`Dispatch failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -9937,9 +9976,10 @@ export default async function plugin(bb: BbPluginApi) {
       model: z.string().optional().describe("Crew model (add: stored; dispatch: overrides)"),
       reasoningLevel: z.enum(["low", "medium", "high", "xhigh", "max", "ultra", "none", "ultracode"]).optional()
         .describe("Crew reasoning effort (add: stored; dispatch: overrides)"),
-      deliveryRequirement:z.enum(["pr","merged","merged-and-verified"]).optional(),
+      deliveryRequirement:z.enum(["branch","pr","merged","merged-and-verified"]).optional(),
+      branchPrefix:z.string().max(120).optional(),dispatchProfileReason:z.string().min(1).max(1000).optional(),
     }),
-    async execute({ action, title, projectId, queueId, shape, mode, after, waitUntil, detail, providerId, model, reasoningLevel, deliveryRequirement }, ctx) {
+    async execute({ action, title, projectId, queueId, shape, mode, after, waitUntil, detail, providerId, model, reasoningLevel, deliveryRequirement,branchPrefix,dispatchProfileReason }, ctx) {
       const items = (await readQueue()).filter(row => ownedByScopedCaptain(row.parentThreadId));
       const ctxProject = ctxString(ctx, "projectId");
       const captain = ctxString(ctx, "threadId");
@@ -9993,7 +10033,7 @@ export default async function plugin(bb: BbPluginApi) {
           ...(providerId !== undefined && providerId !== "" ? { providerId } : {}),
           ...(model !== undefined && model !== "" ? { model } : {}),
           ...(reasoningLevel !== undefined ? { reasoningLevel } : {}),
-          deliveryRequirement:deliveryRequirement ?? "merged",
+          deliveryRequirement:mode ? taskDelivery(mode,deliveryRequirement,shape??'ship') : deliveryRequirement,branchPrefix,dispatchProfileReason,
           waitUntil: waitUntil ?? null,
           status: "queued",
           crewId: null,
@@ -10047,7 +10087,7 @@ export default async function plugin(bb: BbPluginApi) {
           providerId: providerId ?? item.providerId ?? (current.defaultProvider !== "" ? current.defaultProvider : undefined),
           model: model ?? item.model,
           reasoningLevel: toReasoningLevel(reasoningLevel ?? item.reasoningLevel),
-          deliveryRequirement:item.deliveryRequirement,
+          deliveryRequirement:item.deliveryRequirement,branchPrefix:item.branchPrefix,dispatchProfileReason:dispatchProfileReason ?? item.dispatchProfileReason,
           permissionMode: toPermissionMode(current.defaultPermissionMode),
           worktree: resolveWorktree({ shape: item.shape }).worktree,
           visible: true,
@@ -10956,7 +10996,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "contract", summary: "Read the complete native contract and trigger catalog; follow every cursor in bounded mode", usage: "bb firstmate contract [section,...] [--paged | --cursor <cursor>] [--json]" },
       { name: "toolchain", summary: "Check native AXI and Lavish dependencies without mutations", usage: "bb firstmate toolchain [--json]" },
       { name: "scripts", summary: "List + verify every installed fm-* script", usage: "bb firstmate scripts [query] [--json]" },
-      { name: "fm", summary: "Run a real firstmate bin/ script with FM_BACKEND=bb", usage: "bb firstmate fm [--timeout s] <script> [args...]" },
+      { name: "fm", summary: "Run a real firstmate bin/ script with FM_BACKEND=bb", usage: FM_WRAPPER_HELP },
       { name: "deck", summary: "Bind native home and return agent-shell startup (not ready until native digest)", usage: "bb firstmate deck [--digest|--all] [--json]" },
       { name: "session", summary: "Session digest: memory + bearings + afk", usage: "bb firstmate session [--json]" },
       { name:"skill", summary:"Read selected native policy without mixing runtime versions", usage:"bb firstmate skill <name> [relative-reference] [--source <selected-root source-file>] [--json]" },
@@ -10995,6 +11035,8 @@ export default async function plugin(bb: BbPluginApi) {
     async run(argv, ctx) {
       return withCliOperation(argv, ctxString(ctx, "threadId"), () => inCaptainHome(ctxString(ctx, "threadId"), async () => {
       if (argv[0] === "fm") {
+        const helpIndex=argv.findIndex(arg=>arg==='--help'||arg==='-h'),separator=argv.indexOf('--');
+        if(helpIndex>=0 && (separator<0 || helpIndex<separator)) return {exitCode:0,stdout:FM_WRAPPER_HELP};
         const json = argv.includes("--json");
         const fail = (message: string) => ({ exitCode: 1, stderr: message });
         const signal = asRecord(ctx)["signal"] as AbortSignal | undefined;
@@ -11003,7 +11045,7 @@ export default async function plugin(bb: BbPluginApi) {
           const fmHome = flagFromArgv(argv, "home") ?? (current.fmHome !== "" ? current.fmHome : undefined);
           if (fmHome === undefined) return fail("No firstmate home. Run: bb firstmate init --real");
           const parsed = parseFmArgv(argv.slice(1));
-          if (parsed.script === undefined) return fail("Usage: bb firstmate fm [--timeout s] <script> [args...]\nExample: bb firstmate fm spawn -- --mode direct-PR -- ship \"fix login\"");
+          if (parsed.script === undefined) return fail(FM_WRAPPER_HELP);
           const startup = captainStartupCommand(fmHome, parsed.script, parsed.args);
           if (startup!==null && current.fullParityOnDeck && (!homeScope.getStore()?.home || homeScope.getStore()?.home!==fmHome)) return fail("Native startup requires this captain's exact bound home. Run bb firstmate deck; shared/explicit foreign-home fallback refused.");
           if (startup !== null) return { exitCode: 0, stdout: json
@@ -11121,7 +11163,7 @@ export default async function plugin(bb: BbPluginApi) {
             if (projectId === undefined) return fail("No project: pass --project <id> (see bb project list).");
             if(flagStr(flags,"mode")) modeSchema.parse(flagStr(flags,"mode"));
             if(flagStr(flags,"shape")) shapeSchema.parse(flagStr(flags,"shape"));
-            if(flagStr(flags,"delivery-requirement")) z.enum(["pr","merged","merged-and-verified"]).parse(flagStr(flags,"delivery-requirement"));
+            if(flagStr(flags,"delivery-requirement")) z.enum(["branch","pr","merged","merged-and-verified"]).parse(flagStr(flags,"delivery-requirement"));
             const shape = toShape(flagStr(flags, "shape"));
             const wt = resolveWorktree({
               shape,
@@ -11157,7 +11199,7 @@ export default async function plugin(bb: BbPluginApi) {
                 visible: !flags.has("hidden"),
                 shape,
                 mode,yolo:registry.yolo,
-                sendAt,signal,deliveryRequirement:flagStr(flags,"delivery-requirement") as "pr" | "merged" | "merged-and-verified" | undefined,
+                sendAt,signal,branchPrefix:flagStrAllowEmpty(flags,'branch-prefix'),dispatchProfileReason:flagStr(flags,'dispatch-profile-reason'),deliveryRequirement:flagStr(flags,"delivery-requirement") as "branch" | "pr" | "merged" | "merged-and-verified" | undefined,
               });
               dispatched.push({ ...crew, status: await crewStatus(crew) });
             }
@@ -11372,7 +11414,7 @@ export default async function plugin(bb: BbPluginApi) {
             if (id === undefined) return fail("Usage: bb firstmate mark-crew <thread-id> [--shape ship|scout] [--task <id>]");
             if(flagStr(flags,"mode")) modeSchema.parse(flagStr(flags,"mode"));
             if(flagStr(flags,"shape")) shapeSchema.parse(flagStr(flags,"shape"));
-            if(flagStr(flags,"delivery-requirement")) z.enum(["pr","merged","merged-and-verified"]).parse(flagStr(flags,"delivery-requirement"));
+            if(flagStr(flags,"delivery-requirement")) z.enum(["branch","pr","merged","merged-and-verified"]).parse(flagStr(flags,"delivery-requirement"));
             const shape = toShape(flagStr(flags, "shape"));
             const taskId = (flagStr(flags, "task") ?? "").trim();
             // Record the fm task id as crewId so a plugin-side fallback can find and
@@ -11593,7 +11635,8 @@ export default async function plugin(bb: BbPluginApi) {
                 ...(flagStr(flags, "provider") !== undefined ? { providerId: flagStr(flags, "provider") } : {}),
                 ...(flagStr(flags, "model") !== undefined ? { model: flagStr(flags, "model") } : {}),
                 ...(toReasoningLevel(flagStr(flags, "reasoning-level")) !== undefined ? { reasoningLevel: strictReasoning(flagStr(flags, "reasoning-level")) } : {}),
-                deliveryRequirement:z.enum(["pr","merged","merged-and-verified"]).parse(flagStr(flags,"delivery-requirement") ?? "merged"),
+                deliveryRequirement:flagStr(flags,'mode') ? taskDelivery(flagStr(flags,'mode')!,z.enum(["branch","pr","merged","merged-and-verified"]).optional().parse(flagStr(flags,"delivery-requirement")),shapeVal) : z.enum(["branch","pr","merged","merged-and-verified"]).optional().parse(flagStr(flags,"delivery-requirement")),
+                branchPrefix:flagStrAllowEmpty(flags,'branch-prefix'),dispatchProfileReason:flagStr(flags,'dispatch-profile-reason'),
                 waitUntil: flagStr(flags, "wait-until") ?? null,
                 status: "queued",
                 crewId: null,
@@ -11645,7 +11688,7 @@ export default async function plugin(bb: BbPluginApi) {
                 providerId: flagStr(flags, "provider") ?? item.providerId ?? (current.defaultProvider !== "" ? current.defaultProvider : undefined),
                 model: flagStr(flags, "model") ?? item.model,
                 reasoningLevel: strictReasoning(flagStr(flags, "reasoning-level") ?? item.reasoningLevel),
-                deliveryRequirement:item.deliveryRequirement,
+                deliveryRequirement:item.deliveryRequirement,branchPrefix:item.branchPrefix,dispatchProfileReason:flagStr(flags,'dispatch-profile-reason') ?? item.dispatchProfileReason,
                 permissionMode: toPermissionMode(flagStr(flags, "permission-mode") ?? current.defaultPermissionMode),
                 worktree: resolveWorktree({ shape: item.shape, sharedEnv: flags.has("shared-env"), worktreeFlag: flags.has("worktree") }).worktree,
                 visible: !flags.has("hidden"),

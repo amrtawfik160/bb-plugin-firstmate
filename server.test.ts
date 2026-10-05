@@ -3857,6 +3857,7 @@ function stubRealTransportHost(
   host.harness.sdk.stub("terminals.close", async () => ({}));
   host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
     const cmd = cmds.get(args.terminalId) ?? "";
+    if (cmd.includes("fm-dispatch-resolve.sh")) return hostRcPayload("dispatch-resolve: off (fixture)\n", 0);
     if (cmd.includes("fm-spawn.sh")) {
       spawned = true;
       return hostRcPayload("", opts.spawnExit);
@@ -3929,7 +3930,7 @@ test("real transport runs one fm-spawn at a time per home, so a slow spawn does 
       const id = `term_${++n}`;
       const cmd = args.start?.command ?? "";
       cmds.set(id, cmd);
-      if (cmd.includes("fm-spawn.sh")) {
+    if (cmd.includes("fm-spawn.sh")) {
         firstSpawn ??= id;
         inFlight++;
         maxInFlight = Math.max(maxInFlight, inFlight);
@@ -3938,7 +3939,8 @@ test("real transport runs one fm-spawn at a time per home, so a slow spawn does 
     });
     host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
       const cmd = cmds.get(args.terminalId) ?? "";
-      if (cmd.includes("fm-spawn.sh")) {
+      if (cmd.includes("fm-dispatch-resolve.sh")) return hostRcPayload("dispatch-resolve: off (fixture)\n", 0);
+    if (cmd.includes("fm-spawn.sh")) {
         if (args.terminalId === firstSpawn && !releaseFirst) return { chunks: [], nextSeq: 0 };
         if (!spawnDone.has(args.terminalId)) { spawnDone.add(args.terminalId); inFlight--; }
         return hostRcPayload("", 0);
@@ -4072,6 +4074,7 @@ function stubRaceHost(
   host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
     const cmd = cmds.get(args.terminalId) ?? "";
     if (cmd.includes(".status") && cmd.includes("cat --")) return hostRcPayload(opts.output.toLowerCase(), 0);
+    if (cmd.includes("fm-dispatch-resolve.sh")) return hostRcPayload("dispatch-resolve: off (fixture)\n", 0);
     if (cmd.includes("fm-spawn.sh")) {
       spawned = true;
       return hostRcPayload("", 0);
@@ -4222,6 +4225,8 @@ function stubRealTransportBacklog(
     spawnOutput?: string;
     threadIdAfterSpawn?: string;
     orphan?: boolean;
+    resolveOutput?:string;
+    resolveExit?:number;
   },
 ) {
   host.harness.sdk.stub("threadSections.list", async () => []);
@@ -4255,6 +4260,7 @@ function stubRealTransportBacklog(
   host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
     const cmd = cmds.get(args.terminalId) ?? "";
     if (cmd.includes("fm-tasks-axi.sh") && cmd.includes("'add'")) return hostRcPayload("", opts.addExit ?? 0);
+    if (cmd.includes("fm-dispatch-resolve.sh")) return hostRcPayload(opts.resolveOutput ?? "dispatch-resolve: off (fixture)\n", opts.resolveExit ?? 0);
     if (cmd.includes("fm-spawn.sh")) {
       spawned = true;
       return hostRcPayload(opts.spawnOutput ?? "", opts.spawnExit ?? 0);
@@ -4273,6 +4279,31 @@ function crewIdFromStdout(stdout: string): string {
   assert.ok(m, `no crew id in: ${stdout}`);
   return m![1]!;
 }
+
+test("native resolver decisions are retained before launch and explicit BB intake resumes the same task without hidden profile mapping", async()=>{
+  const host=realHost();await plugin(host.bb);
+  try {
+    host.harness.sdk.stub('providers.list',async()=>[{id:'fixture-provider',available:true,reasoningLevels:[{id:'high'}]}]);
+    host.harness.sdk.stub('providers.models',async()=>({modelLoadError:null,models:[{id:'fixture-model',model:'fixture-model'}]}));
+    const options={resolveOutput:'dispatch-resolve:\n  status: clear\n  profile: --harness codex --model native-profile --effort high\n',threadIdAfterSpawn:'thr_real'};
+    const {seen}=stubRealTransportBacklog(host,options);
+    const args=['dispatch','--task-id','resolver-choice','--project','proj_1','--provider','fixture-provider','--model','fixture-model','--reasoning-level','high'];
+    const first=await host.harness.behavior.runCli([...args,'--','bounded task'],{projectId:'proj_1'});
+    assert.equal(first.exitCode,1);assert.match(first.stderr,/dispatchProfileReason/);
+    assert.ok(seen.some(c=>c.includes('fm-dispatch-resolve.sh')));
+    assert.ok(!seen.some(c=>c.includes('fm-tasks-axi.sh')&&c.includes("'add'")));assert.ok(!seen.some(c=>c.includes('fm-spawn.sh')));
+    const records=JSON.parse((await host.harness.behavior.runCli(['launches','--json'])).stdout);assert.equal(records[0].state,'failed');assert.ok(!records[0].nativeInvoked,'known pre-spawn refusal holds no unknown worker');
+    const result=await host.harness.behavior.runCli([...args,'--dispatch-profile-reason','Current user chose the validated BB worker execution rather than the native CLI profile','--','bounded task'],{projectId:'proj_1'});
+    assert.equal(result.exitCode,0,result.stderr);
+    const spawn=seen.filter(c=>c.includes('fm-spawn.sh'));assert.equal(spawn.length,1);
+    const command=unwrapHostCommand(spawn[0]);
+    assert.ok(command.includes("FM_BB_PROVIDER='fixture-provider'"));assert.ok(command.includes("FM_BB_MODEL='fixture-model'"));assert.ok(command.includes("'--harness' 'bb'"));
+    assert.equal(host.harness.sdk.callsTo('threads.spawn').length,0,'no compatibility fallback');
+    const failed=stubRealTransportBacklog(host,{resolveOutput:'error: malformed rules',resolveExit:2});
+    const refused=await host.harness.behavior.runCli(['dispatch','--task-id','config-refusal','--dispatch-profile-reason','an override','--','task'],{projectId:'proj_1'});
+    assert.equal(refused.exitCode,1);assert.match(refused.stderr,/configuration\/usage refusal/);assert.equal(failed.seen.filter(c=>c.includes('fm-spawn.sh')).length,0);
+  }finally{await host.harness.lifecycle.dispose();}
+});
 
 test("C1: real transport adds the backlog row (id=crew id, --kind ship) BEFORE fm-spawn", async () => {
   const host = realHost();
@@ -4703,6 +4734,7 @@ function stubOrphanTransportHost(
   // fm-spawn exits 0, but the meta never records bb_thread_id (hard-kill window).
   host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
     const cmd = cmds.get(args.terminalId) ?? "";
+    if (cmd.includes("fm-dispatch-resolve.sh")) return hostRcPayload("dispatch-resolve: off (fixture)\n", 0);
     if (cmd.includes("bb_thread_id")) return hostRcPayload("FM_META_ABSENT", 0);
     return hostRcPayload("", 0);
   });
@@ -4840,6 +4872,7 @@ function stubRoutedHost(
   host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
     const cmd = cmds.get(args.terminalId) ?? "";
     const r = router(cmd);
+    if (cmd.includes("fm-dispatch-resolve.sh") && r.payload === undefined && r.code === undefined) r.payload = "dispatch-resolve: off (fixture)\n";
     const code = r.code ?? 0;
     // Only successful commands mutate the virtual FS (a forced-failure decode never
     // renames over the target — mirrors the atomic write's truncate-safety).
@@ -6049,6 +6082,7 @@ test("R4 orphan adoption via broad list when the thread is not tagged firstmate-
     // fm-spawn exits 0 but the meta never records bb_thread_id (SIGKILL window).
     host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
       const cmd = cmds.get(args.terminalId) ?? "";
+      if (cmd.includes("fm-dispatch-resolve.sh")) return hostRcPayload("dispatch-resolve: off (fixture)\n", 0);
       if (cmd.includes("bb_thread_id")) return hostRcPayload("FM_META_ABSENT", 0);
       return hostRcPayload("", 0);
     });
@@ -9837,6 +9871,7 @@ test("real transport re-looks for the thread after a 504 spawn failure and adopt
     // fm-spawn fails with a gateway timeout; the recorded thread id is absent.
     host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
       const cmd = cmds.get(args.terminalId) ?? "";
+      if (cmd.includes("fm-dispatch-resolve.sh")) return hostRcPayload("dispatch-resolve: off (fixture)\n", 0);
       if (cmd.includes("bb_thread_id")) return hostRcPayload("FM_META_ABSENT", 0);
       if (cmd.includes("fm-spawn")) return hostRcPayload("HTTP 504 Gateway Timeout", 1);
       return hostRcPayload("", 0);
