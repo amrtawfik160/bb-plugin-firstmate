@@ -1,0 +1,12 @@
+✔ captain stop hook blocks pairless pending receipt and preserves recursion guard (219.634606ms)
+✔ late audit notification continuation preserves unread reports and resumes native final-outcome reporting (435.342523ms)
+✔ real native drain retains pairless status and new-generation queue rows (12974.814288ms)
+✔ real native drain: an orphan's open decision is presented once, then never demands another receipt while crews keep writing status (7372.039005ms)
+ℹ tests 4
+ℹ suites 0
+ℹ pass 4
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 21133.746539

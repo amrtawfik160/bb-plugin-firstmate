@@ -429,8 +429,15 @@ test("late audit notification continuation preserves unread reports and resumes 
   });
   const blocked = hook("{}");assert.equal(blocked.status, 2);
   assert.match(blocked.stderr, /AGENTS\.md section 9/);
+  const everyMessage="Every captain-facing message must translate internal state into the project outcome, consequence, and next decision.";
+  assert.ok(blocked.stderr.indexOf(everyMessage)>=0 && blocked.stderr.indexOf(everyMessage)<blocked.stderr.indexOf("Call firstmate_wake"),"native every-message translation applies before private receipt handling, not only afterward");
+  assert.match(blocked.stderr,/Never relay worker reports, status lines, tool output, validation-state labels, or decision records verbatim into captain chat\./);
   const nativeRule = "The captain may see only the final message; repeat the essentials there, not the full transcript or anchor.";
-  assert.ok(readFileSync(join(root, "native-snapshot/1f3e7696/AGENTS.md"), "utf8").includes(nativeRule));
+  for(const pin of ["1f3e7696","2d833ff1"]){
+    const native=readFileSync(join(root,`native-snapshot/${pin}/AGENTS.md`),"utf8");
+    assert.ok(native.includes(nativeRule));assert.ok(native.includes(everyMessage));
+    assert.ok(native.includes("Never relay worker reports, status lines, tool output, validation-state labels, or decision records verbatim into captain chat."));
+  }
   assert.ok(blocked.stderr.includes(nativeRule), "private operational continuation must return to the native outcome rule");
   assert.equal(f.read().reads, undefined);assert.equal(f.read().acks, undefined, "a hook never handles unseen reports");
   const receipt=f.run();assert.match(receipt.report,/seven findings/);
