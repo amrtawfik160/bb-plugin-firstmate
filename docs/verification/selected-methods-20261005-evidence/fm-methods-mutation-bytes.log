@@ -1,0 +1,28 @@
+✖ public methods selection persists for new captains and exposes only role-owned verified references (112.845407ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 0
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 419.005591
+
+✖ failing tests:
+
+test at server.methods.test.mjs:166:1
+✖ public methods selection persists for new captains and exposes only role-owned verified references (112.845407ms)
+  AssertionError [ERR_ASSERTION]: {"content":[{"type":"text","text":"Selected method bytes differ from the installed version; rebuild and review the package."},{"type":"text","text":"⁢⁣⁢⁣⁢"}],"isError":true}
+  
+  'object' !== 'string'
+  
+      at TestContext.<anonymous> (file:///root/github_projects/bb-plugin-firstmate-launch-pr-lifecycle/server.methods.test.mjs:182:132)
+      at async Test.run (node:internal/test_runner/test:1332:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: 'object',
+    expected: 'string',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }

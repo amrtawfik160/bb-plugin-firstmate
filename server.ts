@@ -1,3 +1,4 @@
+import {METHODS_PROFILE,METHODS_REVISION,methodPointer,methodResource,installedPrResource,selectedPrSource} from "./lib/selected-methods.ts";
 // bb-plugin-firstmate — firstmate-style crews native to BB.
 import { deflateSync } from "node:zlib";
 import { CAPTAIN_ROLE_INSTRUCTIONS } from "./lib/captain-role.ts";
@@ -1555,6 +1556,9 @@ export default async function plugin(bb: BbPluginApi) {
   bb.onDispose(async () => { launchAbort.abort();await followUpWork?.catch(()=>{}); });
 
   const baseSettings = bb.settings.define({
+    selectedMethods: { type:"select",label:"Explicit installation-wide BB methods selection; native policy stays authoritative",options:["off","selected-v1"],default:"off" },
+    selectedPrSource:{type:"string",label:"Validated /pr ID/revision/hash; select through methods enable --pr-skill",default:""},
+    selectedMethodsReason: { type:"string",label:"Recorded explicit methods selection source/reason",default:"" },
     firstmateRepo: {
       type: "string",
       label: "Firstmate attribution URL; bundled startup never clones or updates it",
@@ -1741,6 +1745,8 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
+  let methodsProfile=(await baseSettings.get()).selectedMethods;
+  baseSettings.onChange(next=>{methodsProfile=next.selectedMethods;});
   const knownCaptainsRef = new Set<string>();
   type HomeScope = { captain?: string; home?: string; host?: string };
   const homeScope = new AsyncLocalStorage<HomeScope>();
@@ -1766,9 +1772,9 @@ export default async function plugin(bb: BbPluginApi) {
   // Role exclusion is enforced at the public invocation boundary, before ledger
   // receipts, home provisioning or supervisor mutations. Static tool selection
   // alone cannot stop a worker from invoking the CLI.
-  async function requireSupervisorCaller(ctx: unknown, argv?: string[]): Promise<void> {
+  async function supervisorCallerIdentity(ctx:unknown) {
     const threadId=ctxString(ctx,"threadId");
-    if (!threadId) return; // Internal/native harness calls still prove native admission.
+    if (!threadId) return undefined; // Internal/native harness calls still prove native admission.
     const signal=AbortSignal.any([launchAbort.signal,AbortSignal.timeout(STUCK_HOST_CALL_MS),...(asRecord(ctx)["signal"]?[asRecord(ctx)["signal"] as AbortSignal]:[])]);
     const meta=asRecord(await raceAbort(bb.sdk.threads.getPluginMetadata({threadId,pluginId:"firstmate",signal}),signal));
     const known=(await raceAbort(readCrews(),signal)).some(c=>!isSecondmateRoute(c) && (c.threadId===threadId || c.priorThreadIds?.includes(threadId)));
@@ -1777,7 +1783,13 @@ export default async function plugin(bb: BbPluginApi) {
     const routeOnly=retired && !known && !metaFlag(meta,"crew") && metaFlag(meta,"captain") && !!project && launches.routeOnlyThread(threadId,project) &&
       (await raceAbort(readSecondmates(),signal)).some(m=>m.threadId===threadId && (m.projectId===project || m.projects.includes(project)));
     const worker=metaFlag(meta,"crew") || known || launches.isDeletedWorker(threadId) || retired && !routeOnly;
-    if (!worker) return;
+    return {threadId,meta,worker};
+  }
+  async function requireSupervisorCaller(ctx:unknown,argv?:string[]):Promise<void> {
+    const identity=await supervisorCallerIdentity(ctx);
+    if(!identity?.worker)return;
+    const {meta}=identity;
+    if(argv?.[0]==="methods" && (argv[1]==="status" || argv[1]==="read"))return;
     if (argv?.[0]==="help" || argv?.[0]==="guide" || argv?.[0]==="--help") return;
     // The native status append itself is a worker shell command. Preserve its
     // optional fleet-ledger notification and exact-task inbox bridge only.
@@ -9482,6 +9494,51 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
+  async function selectedMethods(ctx:unknown,input:{action:string;profile?:string;reason?:string;prSkillId?:string;name?:string;reference?:string;source?:string;cursor?:string},paged=true) {
+    if(!["status","enable","disable","read"].includes(input.action))throw new Error("Unknown methods action; use bb firstmate help methods.");
+    const identity=await supervisorCallerIdentity(ctx);
+    const role=identity?.worker?"worker":"captain";
+    if(input.action==="status") return {profile:methodsProfile,role,revision:METHODS_REVISION,prSkillId:selectedPrSource((await baseSettings.get()).selectedPrSource)?.id??null,reason:(await baseSettings.get()).selectedMethodsReason};
+    if(input.action==="enable" || input.action==="disable") {
+      await requireSupervisorCaller(ctx);
+      if(!identity || !metaFlag(identity.meta,"captain")) throw new Error("Methods selection requires the bound captain context.");
+      if(!input.reason?.trim()) throw new Error("Explicit installation selection requires its user-directed reason.");
+      if(input.action==="enable" && input.profile!==undefined && input.profile!==METHODS_PROFILE)throw new Error("Unknown selected methods profile.");
+      const profile=input.action==="enable"?METHODS_PROFILE:"off";
+      let sourceSelection:string|undefined;
+      if(input.prSkillId!==undefined){
+        if(input.action!=="enable")throw new Error("Select /pr only through methods enable.");
+        const signal=AbortSignal.any([launchAbort.signal,AbortSignal.timeout(STUCK_HOST_CALL_MS),...(asRecord(ctx)["signal"]?[asRecord(ctx)["signal"] as AbortSignal]:[])]);
+        const resolved=await installedPrResource(bb.sdk,identity.threadId,ctxString(ctx,"projectId"),signal,raceAbort,input.prSkillId);
+        sourceSelection=JSON.stringify(resolved.source);
+      }
+      await baseSettings.experimental_set({selectedMethods:profile,...(sourceSelection!==undefined?{selectedPrSource:sourceSelection}:{}),selectedMethodsReason:JSON.stringify({actor:identity.threadId,at:new Date().toISOString(),reason:input.reason})});
+      return {profile,revision:METHODS_REVISION};
+    }
+    if(methodsProfile!==METHODS_PROFILE)throw new Error("BB methods are not selected for this installation. Native defaults remain active.");
+    if(!identity || !identity.worker && !metaFlag(identity.meta,"captain"))throw new Error("Read selected methods from a bound captain or native worker role.");
+    const resumed=input.cursor?skillCursorRequest(input.cursor):undefined;
+    if(resumed && ((input.name!==undefined && input.name!==resumed.name) || (input.reference!==undefined && input.reference!==resumed.reference) || (input.source!==undefined && input.source!==resumed.source)))throw new Error("Method cursor resource differs from request.");
+    const request=resumed??{name:input.name??`${role}-methods`,...(input.reference!==undefined?{reference:input.reference}:{}),...(input.source!==undefined?{source:input.source}:{})};
+    let resource:{text:string}, externalIdentity:unknown=null;
+    if(request.name==="pr") {
+      if(!identity.worker || identity.meta.shape!=="ship" || identity.meta.posture!=="direct-PR")throw new Error("/pr belongs to the direct-PR ship body author; native pipeline/local-only ownership stays unchanged.");
+      if(request.reference!==undefined || request.source!==undefined)throw new Error("Read the resolved /pr entry body without method-relative references.");
+      const signal=AbortSignal.any([launchAbort.signal,AbortSignal.timeout(STUCK_HOST_CALL_MS),...(asRecord(ctx)["signal"]?[asRecord(ctx)["signal"] as AbortSignal]:[])]);
+      const selected=selectedPrSource((await baseSettings.get()).selectedPrSource);
+      const resolved=await installedPrResource(bb.sdk,identity.threadId,ctxString(ctx,"projectId"),signal,raceAbort,selected?.id);
+      if(selected && (resolved.source.revision!==selected.revision || resolved.source.sha256!==selected.sha256))throw new Error("Selected /pr source changed; reselect its verified current ID with an explicit installation selection reason before body writing.");
+      resource=resolved;externalIdentity=resolved.identity;
+    } else resource=methodResource(PLUGIN_ROOT,role,request.name!,request.reference,request.source);
+    const scope=JSON.stringify(["BB-methods",identity.threadId,identity.meta.nativeHome??null,role,methodsProfile,METHODS_REVISION,externalIdentity]);
+    return paged || input.cursor?skillPage(resource.text,scope,request,input.cursor,"methods"):resource.text;
+  }
+  bb.agents.registerTool({
+    name:"firstmate_methods",description:"Read the explicitly selected installation's role-owned BB methods in bounded pages; native policy remains authoritative. Status is read-only. Enable/disable require a captain and an explicit user-directed selection reason.",
+    parameters:z.object({action:z.enum(["status","enable","disable","read"]).default("read"),profile:z.string().optional(),reason:z.string().max(1000).optional(),prSkillId:z.string().min(1).max(1000).optional(),name:z.string().optional(),reference:z.string().max(1000).optional(),source:z.string().max(1000).optional(),cursor:z.string().max(4096).optional()}),
+    presentation:{suppress:true},
+    async execute(input,ctx){try{const result=await selectedMethods(ctx,input);return markCaptainToolResult(typeof result==="string"?result:JSON.stringify(result));}catch(error){return markCaptainToolResult(toolError(error instanceof Error?error.message:String(error)));}}
+  });
   registerCaptainTool({
     name:"firstmate_skill",description:"Read verified native policy from this captain's selected runtime in bounded pages. Follow every returned cursor until END OF NATIVE SKILL TRANSPORT before applying it; no global copied policy fallback.",
     parameters:z.object({name:z.string().optional().describe("Exact native skill name for the first page"),list:z.boolean().optional().describe("Inspect full diagnostic descriptions from the verified selected catalog; omit resource arguments"),reference:z.string().max(1000).optional().describe("Native relative link, including .. and #fragment inside selected runtime"),source:z.string().max(1000).optional().describe("Exact selected-root relative source file for nested links; default .agents/skills/<name>/SKILL.md"),cursor:z.string().max(4096).optional().describe("Exact continuation cursor; omit other arguments to continue the same verified resource")}),
@@ -10370,15 +10427,15 @@ export default async function plugin(bb: BbPluginApi) {
     const meta = asRecord(context.pluginMetadata);
     if (metaFlag(meta, "crew")) {
       return {
-        tools: [],
+        tools: methodsProfile===METHODS_PROFILE?["firstmate_methods"]:[],
         skills: [],
         instructions:
-          "The native launch brief owns this worker role, BB transport and task policy. BB crew threads have no captain tools or skills. Follow that brief and its exact-ID steering inbox procedure. Do not delegate or change the selected provider, model, or effort. Worker completion is a handoff, not captain merge or deployment completion.",
+          "The native launch brief owns this worker role, BB transport and task policy. BB crew threads have no captain tools or skills. Follow that brief and its exact-ID steering inbox procedure. Do not delegate or change the selected provider, model, or effort. Worker completion is a handoff, not captain merge or deployment completion."+(methodsProfile===METHODS_PROFILE?" "+methodPointer("worker")+(meta.shape==="ship" && meta.posture==="direct-PR"?" Before creating or updating a PR body, read the actual workspace /pr skill using firstmate_methods action=read name=pr, following every cursor. Missing /pr leaves body writing pending; report that missing dependency.":""):""),
       };
     }
     const marked = metaFlag(meta, "captain");
     const base = marked
-      ? `${CAPTAIN_CONTRACT_POINTER} ${BB_SKILL_RUNTIME_CONTRACT}`
+      ? `${CAPTAIN_CONTRACT_POINTER} ${BB_SKILL_RUNTIME_CONTRACT}${methodsProfile===METHODS_PROFILE?" "+methodPointer("captain"):""}`
       : "Firstmate crews are available. Run /captain or firstmate_deck to take the deck.";
     // The complete contract and selected native skills are tool reads. Reserve
     // the SDK window for transport pointers and existing user memory.
@@ -10389,7 +10446,7 @@ export default async function plugin(bb: BbPluginApi) {
     const skillsBlock = ""; // Selected native policy is read through firstmate_skill, never the global manifest cache.
     const instructions = truncate(`${base}${memoryBlock}${skillsBlock}`, 4096);
     return {
-      tools: marked ? [...CAPTAIN_TOOLS] : [...CAPTAIN_BOOTSTRAP_TOOLS],
+      tools: marked ? [...CAPTAIN_TOOLS,...(methodsProfile===METHODS_PROFILE?["firstmate_methods"]:[])] : [...CAPTAIN_BOOTSTRAP_TOOLS],
       skills: marked ? [...CAPTAIN_SKILLS] : [...CAPTAIN_BOOTSTRAP_SKILLS],
       instructions,
     };
@@ -11009,6 +11066,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "fm", summary: "Run a real firstmate bin/ script with FM_BACKEND=bb", usage: FM_WRAPPER_HELP },
       { name: "deck", summary: "Bind native home and return agent-shell startup (not ready until native digest)", usage: "bb firstmate deck [--digest|--all] [--json]" },
       { name: "session", summary: "Session digest: memory + bearings + afk", usage: "bb firstmate session [--json]" },
+      { name:"methods",summary:"Status or explicit installation selection; bounded role-owned method reads",usage:"bb firstmate methods status | enable selected-v1 --reason <user-selection> [--pr-skill <exact-skill-id>] | disable --reason <reason> | read [captain-methods|worker-methods|pr] [relative-reference] [--source <source>] [--paged|--cursor <cursor>] [--json]" },
       { name:"skill", summary:"Read selected native policy or diagnostic descriptions without mixing runtime versions", usage:"bb firstmate skill <name> [relative-reference] [--source <selected-root source-file>] [--paged] [--json]; skill --cursor <cursor>; skill --list [--paged] [--json]" },
       { name: "dispatch", summary: "Dispatch crewmate child threads", usage: dispatchHelp },
       { name: "crews", summary: "List recorded crews with live status", usage: "bb firstmate crews [--json]" },
@@ -11114,6 +11172,12 @@ export default async function plugin(bb: BbPluginApi) {
             const repo = current.firstmateRepo !== "" ? current.firstmateRepo : "https://github.com/kunchenguid/firstmate";
             const text = guideText(repo, current.fmScriptCount, current.fmSkillCount);
             return reply({ guide: text }, text);
+          }
+          case "methods": {
+            const action=rest[0]??"status";
+            if(!["status","enable","disable","read"].includes(action))return fail("Use methods status|enable|disable|read.");
+            const value=await selectedMethods(ctx,{action,profile:action==="enable"?rest[1]:undefined,reason:flagStr(flags,"reason"),prSkillId:flagStr(flags,"pr-skill"),name:action==="read"?rest[1]:undefined,reference:action==="read"?rest[2]:undefined,source:flagStr(flags,"source"),cursor:flagStr(flags,"cursor")},flags.has("paged"));
+            return typeof value==="string"?reply({text:value},value):reply(value,JSON.stringify(value));
           }
           case "skill": {
             if (!rest[0] && !flagStr(flags,'cursor') && !flags.has('list')) return fail("Use bb firstmate skill <native-name> [relative-reference] [--source <selected-root source-file>] [--paged], then skill --cursor <cursor>; skill --list inspects diagnostic descriptions. Bind with bb firstmate deck first.");

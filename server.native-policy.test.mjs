@@ -248,6 +248,19 @@ for(const pin of pins)test(`selected ${pin.slice(0,8)} native policy and complet
     if(mode==='no-mistakes')assert.match(composed,/NEVER pass `--yes`/);
     assert.equal(readFileSync(source.source,'utf8'),source.text);
   }
+  const selected=await f.host.harness.behavior.runCli(['methods','enable','selected-v1','--reason','User selected bounded existing methods and PR composition'],ctx);assert.equal(selected.exitCode,0,selected.stderr);
+  const selectedCaptain=await f.host.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({pluginMetadata:{captain:'true',nativeHome:home}}));
+  assert.match(selectedCaptain.instructions,/captain-methods/);assert.doesNotMatch(selectedCaptain.instructions,/Calm|report editor/);assert.ok(contract.stdout.includes(native));
+  for(const [kind,mode] of [['ship','direct-PR'],['ship','no-mistakes'],['ship','local-only'],['scout','']]) {
+    const id='selected-'+kind+'-'+(mode||'read'),source=scaffold(home,id,kind,mode),prompt=ok(render(home,source.source,kind,id,mode));
+    const cfg=await f.host.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({pluginMetadata:{crew:'true',captain:'true',shape:kind,posture:mode,nativeHome:home}}));
+    const composed=prompt+'\n'+cfg.instructions;assert.match(composed,/worker-methods/);assert.doesNotMatch(composed,/captain-methods|Calm reporting/);assert.ok(composed.includes(source.task));assert.ok(composed.includes(source.spec));
+    assert.match(composed,/HARD SAFETY GATE/);assert.match(composed,/exact key/);assert.match(composed,/--ack 001\.msg/);
+    if(kind==='ship')assert.ok(composed.includes(`Delivery contract: mode=${mode}`));
+    if(kind==='ship' && mode==='direct-PR'){assert.match(cfg.instructions,/name=pr/);assert.match(composed,/not a draft/);}else assert.doesNotMatch(cfg.instructions,/name=pr/);
+    if(mode==='no-mistakes')assert.match(composed,/NEVER pass `--yes`/);
+    assert.equal(readFileSync(source.source,'utf8'),source.text);
+  }
   assert.equal(f.host.harness.sdk.callsTo('threads.spawn').length,0);assert.equal(f.host.harness.sdk.callsTo('threads.send').length,0);
   assert.equal(f.host.harness.sdk.callsTo('terminals.create').length,f.host.harness.sdk.callsTo('terminals.close').length);
  }finally{await f.host.harness.lifecycle.dispose();rmSync(home,{recursive:true,force:true});}

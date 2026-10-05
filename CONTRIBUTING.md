@@ -165,10 +165,17 @@ would correctly fail the guard); revisit only if CRLF status files ever appear.
 
 `skills/calm/`, `skills/catch-up/`, `skills/captain-methods/` and
 `skills/worker-methods/` are retained BB-authored source exceptions, separate from
-the native fidelity inventory. They are **unregistered** and must not load through
-role configuration, startup instructions, contract appendices or transitive
-pointers. The public SDK's static skill selection does not provide a verified
-user-only opt-in boundary. Native section 9 owns default reporting.
+the native fidelity inventory. They remain **unregistered**. Native section 9
+owns reporting. Calm/catch-up are never injected as policy or method pointers.
+Unconfigured installations expose no selected methods. Explicit installation
+selection (`bb firstmate methods enable selected-v1 --reason <user-selection>`)
+uses the existing settings API, a role-specific trigger pointer and the bounded
+`firstmate_methods` reader; it does not load static skill bodies or append them
+to native contracts. The reader verifies the versioned ten-file BB methods
+inventory. Any source change requires reviewed hashes and causal public-read
+proof. Direct-PR ships alone resolve their actual workspace `/pr` entry through
+public SDK skills APIs; external no-mistakes author loading remains a separate
+unverified boundary. See [selected methods evidence](docs/verification/selected-methods-20261005.md).
 
 Only the `/captain` and `/firstmate` transport entries are registered. Read native
 policy through `firstmate_skill` from the exact selected audited runtime, rather

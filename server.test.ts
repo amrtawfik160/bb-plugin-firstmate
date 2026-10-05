@@ -175,8 +175,8 @@ test("captain metadata loads the full skill set", async () => {
     assert.match(cfg.instructions ?? "", /lavish-axi/);
     assert.deepEqual(
       cfg.tools.map((tool) => tool.name).sort(),
-      host.harness.inspection.registrations.agentTools.map((tool) => tool.name).sort(),
-      "captain sessions must expose every registered firstmate tool",
+      host.harness.inspection.registrations.agentTools.filter((tool) => tool.name !== "firstmate_methods").map((tool) => tool.name).sort(),
+      "native-default captain sessions expose every native tool; installation-selected methods stay off",
     );
     assert.match(cfg.instructions ?? "", /complete native supervisor contract/);
     assert.doesNotMatch(cfg.instructions ?? "", /Do not narrate tool calls|Never do crew work|Never merge/);

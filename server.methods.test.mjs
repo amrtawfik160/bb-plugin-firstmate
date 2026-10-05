@@ -162,3 +162,105 @@ for (const [route, entry, explicit] of [
     } finally { await host.harness.lifecycle.dispose(); }
   });
 }
+
+test('public methods selection persists for new captains and exposes only role-owned verified references',async()=>{
+ let host=await configuredHost();const ctx={threadId:'thr_cap',projectId:'proj_1'},worker={threadId:'thr_worker',projectId:'proj_1'};
+ const stubs=()=>host.harness.sdk.stub('threads.getPluginMetadata',async({threadId})=>threadId==='thr_worker'?{crew:'true',crewId:'task',shape:'ship',posture:'direct-PR'}:{captain:'true'});
+ stubs();
+ try{
+  const status=await host.harness.behavior.runCli(['methods','status','--json'],ctx);assert.equal(status.exitCode,0,status.stderr);assert.equal(JSON.parse(status.stdout).profile,'off');
+  const unknown=await host.harness.behavior.runCli(['methods','unknown'],ctx);assert.equal(unknown.exitCode,1);assert.match(unknown.stderr,/Use methods status\|enable\|disable\|read/);
+  const absent=await host.harness.behavior.runCli(['methods','read','captain-methods'],ctx);assert.equal(absent.exitCode,1);assert.match(absent.stderr,/not selected/);
+  const enabled=await host.harness.behavior.runCli(['methods','enable','selected-v1','--reason','User selected existing Pstack methods and PR composition'],ctx);assert.equal(enabled.exitCode,0,enabled.stderr);
+  const cfg=await configure(host,{captain:'true',nativeHome:'/new-home'});assert.ok(cfg.tools.some(t=>t.name==='firstmate_methods'));assert.match(cfg.instructions,/coverage|Assignment/);assert.doesNotMatch(cfg.instructions,/Calm|worker-methods/);
+  const tool=host.harness.registrations.agentTools.find(t=>t.name==='firstmate_methods');assert.ok(tool);
+  const page=await tool.execute({action:'read',name:'captain-methods',reference:'references/coverage.md'},ctx);assert.equal(typeof page,'string',JSON.stringify(page));assert.match(page,/END OF BB METHODS TRANSPORT/);
+  assert.ok(page.includes(readFileSync(join(skillRoot,'captain-methods/references/coverage.md'),'utf8')));
+  const crew=await configure(host,{crew:'true',captain:'true',shape:'ship',posture:'direct-PR'});assert.deepEqual(crew.tools.map(t=>t.name),['firstmate_methods']);assert.deepEqual(crew.skills,[]);assert.match(crew.instructions,/worker-methods/);assert.doesNotMatch(crew.instructions,/captain-methods|Calm|Report scope gaps to the captain/);
+  const enableTool=await tool.execute({action:'enable',profile:'selected-v1',reason:'Worker request'},worker);assert.equal(enableTool.isError,true);
+  const wrong=await tool.execute({action:'read',name:'captain-methods'},worker);assert.equal(wrong.isError,true);assert.match(JSON.stringify(wrong),/role/);
+  const own=await tool.execute({action:'read',name:'worker-methods',reference:'references/product-verification.md'},worker);assert.equal(typeof own,'string',JSON.stringify(own));assert.match(own,/does not assign full skill maintenance/);assert.doesNotMatch(own,/ask the\s+captain/);
+  const escape=await tool.execute({action:'read',name:'worker-methods',reference:'../../calm/SKILL.md'},worker);assert.equal(escape.isError,true);
+  const denied=await host.harness.behavior.runCli(['methods','enable','selected-v1','--reason','Worker request'],worker);assert.equal(denied.exitCode,1);assert.match(denied.stderr,/worker.*supervisor/i);
+  host=await host.harness.lifecycle.reload(plugin);stubs();
+  const resumed=await configure(host,{captain:'true',nativeHome:'/another-home'});assert.match(resumed.instructions,/firstmate_methods/,'durable installation selection needs no repeated opt-in');
+  assert.equal((await host.harness.behavior.runCli(['methods','disable','--reason','Explicit operator change'],ctx)).exitCode,0);
+  const off=await configure(host,{crew:'true'});assert.deepEqual(off.tools,[]);assert.doesNotMatch(off.instructions,/worker-methods/);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('direct-PR body author reads the actual installed PR skill in bounded owner-pinned pages; pipeline and local-only ownership stay native',async()=>{
+ const host=await configuredHost({selectedMethods:'selected-v1'}),worker={threadId:'thr_worker',projectId:'proj_1'};
+ let mode='direct-PR',revision='revision-1';const content='---\nname: pr\ndescription: Write reviewer-facing PR bodies.\n---\n# PR body\nRead the repository diff, preserve evidence and risks.\n'+'\n'+'owned PR-reference evidence\n'.repeat(700);
+ try{
+  host.harness.sdk.stub('threads.getPluginMetadata',async()=>({crew:'true',crewId:'task',shape:'ship',posture:mode,nativeHome:'/task-home'}));
+  host.harness.sdk.stub('threads.get',async({threadId})=>({id:threadId,projectId:'proj_1',environmentId:'env_writer'}));
+  host.harness.sdk.stub('skills.list',async args=>{assert.equal(args.projectId,'proj_1');assert.equal(args.environmentId,'env_writer');return{skills:[{id:'owned-pr',name:'pr',pluginId:null,scope:'bb-user'}]};});
+  host.harness.sdk.stub('skills.getContent',async args=>{assert.equal(args.skillId,'owned-pr');assert.equal(args.path,'SKILL.md');return{content,revision};});
+  const tool=host.harness.registrations.agentTools.find(t=>t.name==='firstmate_methods');assert.ok(tool);
+  const cfg=await configure(host,{crew:'true',shape:'ship',posture:mode});assert.match(cfg.instructions,/before creating or updating a PR body/i);assert.match(cfg.instructions,/name=pr/);
+  let cursor,assembled='',pages=0;
+  do{
+   const page=await tool.execute(cursor?{action:'read',cursor}:{action:'read',name:'pr'},worker);assert.equal(typeof page,'string',JSON.stringify(page));assert.ok(Buffer.byteLength(page)<19500);
+   assembled+=/\nBEGIN_PAGE\n([\s\S]*)\nEND_PAGE\n/.exec(page)[1];
+   const next=/"cursor":"([A-Za-z0-9_-]+)"/.exec(page)?.[1];
+   if(next && !cursor){revision='revision-2';const changed=await tool.execute({action:'read',cursor:next},worker);assert.equal(changed.isError,true);revision='revision-1';const foreign=await tool.execute({action:'read',cursor:next},{...worker,threadId:'thr_other_worker'});assert.equal(foreign.isError,true);}
+   cursor=next;assert.ok(++pages<20);if(!cursor)assert.match(page,/END OF BB METHODS TRANSPORT/);
+  }while(cursor);
+  assert.equal(assembled,content);assert.ok(pages>1);
+  for(const posture of ['no-mistakes','local-only']){
+   mode=posture;const config=await configure(host,{crew:'true',shape:'ship',posture});assert.doesNotMatch(config.instructions,/name=pr|before creating or updating a PR body/);
+   const read=await tool.execute({action:'read',name:'pr'},worker);assert.equal(read.isError,true);assert.match(JSON.stringify(read),/body author/);
+  }
+  mode='direct-PR';host.harness.sdk.stub('skills.list',async()=>({skills:[]}));
+  const missing=await tool.execute({action:'read',name:'pr'},worker);assert.equal(missing.isError,true);assert.match(JSON.stringify(missing),/Missing.*\/pr/);
+  assert.equal(host.harness.sdk.callsTo('threads.spawn').length,0);assert.equal(host.harness.sdk.callsTo('threads.send').length,0);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('PR skill lookup cancellation settles disposal without writing a body or starting another task',async()=>{
+ const host=await configuredHost({selectedMethods:'selected-v1'});let entered;const started=new Promise(r=>{entered=r;});
+ host.harness.sdk.stub('threads.getPluginMetadata',async()=>({crew:'true',shape:'ship',posture:'direct-PR'}));
+ host.harness.sdk.stub('threads.get',async()=>({projectId:'proj_1',environmentId:'env_writer'}));
+ host.harness.sdk.stub('skills.list',async({signal})=>{assert.ok(signal instanceof AbortSignal);entered();return new Promise(()=>{});});
+ const tool=host.harness.registrations.agentTools.find(t=>t.name==='firstmate_methods');
+ const pending=tool.execute({action:'read',name:'pr'},{threadId:'thr_worker',projectId:'proj_1'});await started;
+ await host.harness.lifecycle.dispose();let timer;
+ try{const response=await Promise.race([pending,new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('PR reader did not settle disposal')),1000);})]);assert.equal(response.isError,true);assert.match(JSON.stringify(response),/abort/i);assert.equal(host.harness.sdk.callsTo('skills.getContent').length,0);assert.equal(host.harness.sdk.callsTo('threads.spawn').length,0);}finally{clearTimeout(timer);}
+});
+
+test('PR author resolves provider-specific skill copies and permits only byte-identical cross-provider copies for ACP',async()=>{
+ const host=await configuredHost({selectedMethods:'selected-v1'});let providerId='acp-grok',conflict=false;const reads=[];
+ host.harness.sdk.stub('threads.getPluginMetadata',async()=>({crew:'true',shape:'ship',posture:'direct-PR'}));
+ host.harness.sdk.stub('threads.get',async()=>({projectId:'proj_1',environmentId:'env_writer',providerId}));
+ host.harness.sdk.stub('skills.list',async()=>({skills:['claude-code','codex','pi'].map(provider=>({name:'pr',id:provider+'-pr',provider,scope:'provider-user'}))}));
+ host.harness.sdk.stub('skills.getContent',async({skillId})=>{reads.push(skillId);return{content:conflict && skillId==='pi-pr'?'Different body policy':'Exact selected PR body policy',revision:skillId+'-v1'};});
+ const tool=host.harness.registrations.agentTools.find(t=>t.name==='firstmate_methods');const context={threadId:'thr_author',projectId:'proj_1'};
+ try{
+  const compatible=await tool.execute({action:'read',name:'pr'},context);assert.equal(typeof compatible,'string',JSON.stringify(compatible));assert.match(compatible,/Exact selected PR body policy/);assert.deepEqual(reads.sort(),['claude-code-pr','codex-pr','pi-pr']);
+  conflict=true;const ambiguous=await tool.execute({action:'read',name:'pr'},context);assert.equal(ambiguous.isError,true);assert.match(JSON.stringify(ambiguous),/Ambiguous.*\/pr/);
+  providerId='codex';reads.length=0;const native=await tool.execute({action:'read',name:'pr'},context);assert.equal(typeof native,'string',JSON.stringify(native));assert.deepEqual(reads,['codex-pr'],'use the actual selected provider rather than foreign copies');
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('explicit installation PR source survives reload and unreadable foreign aliases without bypassing BB content guards',async()=>{
+ let host=await configuredHost(),changed=false,unavailable=false,renamed=false;const context={threadId:'thr_cap',projectId:'proj_1'},worker={threadId:'thr_author',projectId:'proj_1'};
+ const stubs=()=>{
+  host.harness.sdk.stub('threads.getPluginMetadata',async({threadId})=>threadId==='thr_cap'?{captain:'true'}:{crew:'true',shape:'ship',posture:'direct-PR'});
+  host.harness.sdk.stub('threads.get',async()=>({projectId:'proj_1',environmentId:'env_writer',providerId:'acp-grok'}));
+  host.harness.sdk.stub('skills.list',async()=>({skills:[{name:renamed?'different-skill':'pr',id:'physical-pr',provider:'codex',scope:'provider-user'},{name:'pr',id:'alias-pr',provider:'claude-code',scope:'provider-user'}]}));
+  host.harness.sdk.stub('skills.getContent',async({skillId})=>{if(skillId==='alias-pr')throw new Error('BB refuses symlink root');assert.equal(skillId,'physical-pr');if(unavailable)throw new Error('Selected resource unavailable');return{content:changed?'Changed PR skill':'Exact requested PR skill',revision:changed?'physical-v2':'physical-v1'};});
+ };
+ stubs();try{
+  const selected=await host.harness.behavior.runCli(['methods','enable','selected-v1','--pr-skill','physical-pr','--reason','User selected this existing PR skill'],context);assert.equal(selected.exitCode,0,selected.stderr);
+  const status=await host.harness.behavior.runCli(['methods','status','--json'],context);assert.equal(JSON.parse(status.stdout).prSkillId,'physical-pr');
+  host=await host.harness.lifecycle.reload(plugin);stubs();
+  const tool=host.harness.registrations.agentTools.find(t=>t.name==='firstmate_methods');const body=await tool.execute({action:'read',name:'pr'},worker);assert.equal(typeof body,'string',JSON.stringify(body));assert.match(body,/Exact requested PR skill/);assert.deepEqual(host.harness.sdk.callsTo('skills.getContent').map(([args])=>args.skillId),['physical-pr']);
+  const bad=await host.harness.behavior.runCli(['methods','enable','selected-v1','--pr-skill','alias-pr','--reason','Explicit source change'],context);assert.equal(bad.exitCode,1);assert.match(bad.stderr,/symlink/);
+  const retained=await host.harness.behavior.runCli(['methods','status','--json'],context);assert.equal(JSON.parse(retained.stdout).prSkillId,'physical-pr','invalid selection cannot replace valid prior source');
+  changed=true;const changedRead=await tool.execute({action:'read',name:'pr'},worker);assert.equal(changedRead.isError,true);assert.match(JSON.stringify(changedRead),/source changed/);changed=false;
+  unavailable=true;const lost=await tool.execute({action:'read',name:'pr'},worker);assert.equal(lost.isError,true);assert.match(JSON.stringify(lost),/unavailable/);unavailable=false;
+  renamed=true;const unrelated=await host.harness.behavior.runCli(['methods','enable','selected-v1','--pr-skill','physical-pr','--reason','Cannot select a differently named skill'],context);assert.equal(unrelated.exitCode,1);assert.match(unrelated.stderr,/unavailable|requested pr/);
+  assert.equal(host.harness.sdk.callsTo('threads.spawn').length,0);
+ }finally{await host.harness.lifecycle.dispose();}
+});

@@ -27,7 +27,7 @@ function decode(cursor: string) {
 export function skillCursorRequest(cursor: string): SkillRequest { return decode(cursor).request; }
 
 /** Reuses the byte-bounded native contract transport; never rewrites native text. */
-export function skillPage(text: string, scope: string, input: SkillRequest, cursor?: string): string {
+export function skillPage(text: string, scope: string, input: SkillRequest, cursor?: string, transport: "native" | "methods" = "native"): string {
   const request = requestSchema.parse(input);
   const snapshot = createHash("sha256").update(JSON.stringify([scope, request, text])).digest("hex");
   const pages = contractPages(text), requested = cursor ? decode(cursor) : undefined;
@@ -38,8 +38,9 @@ export function skillPage(text: string, scope: string, input: SkillRequest, curs
   if (index >= pages.length) throw new Error("Native skill cursor page is outside this snapshot; restart the complete read.");
   const next = index + 1 < pages.length
     ? Buffer.from(JSON.stringify({ snapshot, page: index + 1, request })).toString("base64url") : undefined;
+  const tool=transport==="methods"?"firstmate_methods":"firstmate_skill", cli=transport==="methods"?"methods read":"skill";
   const instruction = next
-    ? `Continue with firstmate_skill {"cursor":"${next}"} or bb firstmate skill --cursor ${next}.`
-    : "END OF NATIVE SKILL TRANSPORT: all pages must have been read in order. Delivery of this page alone does not establish a complete read.";
-  return `FIRSTMATE_SKILL_PAGE ${index + 1}/${pages.length} snapshot=${snapshot}\n${instruction}\nRead every page before applying this skill or reference; a preview or saved remainder is incomplete.\nBEGIN_PAGE\n${pages[index]}\nEND_PAGE\n`;
+    ? `Continue with ${tool} {${transport==="methods"?'"action":"read",':""}"cursor":"${next}"} or bb firstmate ${cli} --cursor ${next}.`
+    : `END OF ${transport==="methods"?"BB METHODS":"NATIVE SKILL"} TRANSPORT: all pages must have been read in order. Delivery of this page alone does not establish a complete read.`;
+  return `FIRSTMATE_${transport==="methods"?"METHODS":"SKILL"}_PAGE ${index + 1}/${pages.length} snapshot=${snapshot}\n${instruction}\nRead every page before applying this skill or reference; a preview or saved remainder is incomplete.\nBEGIN_PAGE\n${pages[index]}\nEND_PAGE\n`;
 }

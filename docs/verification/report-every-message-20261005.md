@@ -30,3 +30,14 @@ Parent owns repeating actual ACP reporting acceptance, independent review and ac
 
 Logs are retained under `report-every-message-20261005-evidence/`.
 Full integration checks follow the separately settled dispatch changes; no partial full-suite claim is made for this correction alone.
+
+## Subsequent actual acceptance: still failed
+
+Parent repeated valid actual ACP Grok 4.7/high Stop acceptance on frozen `e0d6247`.
+A record was injected at first reasoning event 1856 before response 1988.
+Intermediate response 1988 still narrated report/receipt handling.
+Actual wake 1990 and acknowledgement 1995 emptied the queue and removed the receipt; final 2098 retained both findings and limits.
+This is a final-outcome pass and **failed every-message model acceptance**.
+The earlier late-injection run is invalid and excluded.
+Evidence remains parent-owned at `acceptance-e0d6247/{acceptance.md,report-events.json,report-result.json,injection.json}`.
+No additional wording-only correction followed. See [supported trace limit](selected-methods-20261005.md#reporting-trace-and-unresolved-model-acceptance).

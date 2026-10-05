@@ -6,6 +6,7 @@ import {mkdtempSync,mkdirSync,readFileSync,writeFileSync,openSync,closeSync,real
 import {tmpdir} from 'node:os';import {dirname,join,resolve} from 'node:path';import {createServer} from 'node:net';
 import {createFakePluginHost,makePluginAgentConfigurationContext} from '@get-bb/plugin-sdk/testing';
 import plugin from '../server.ts';import {followRuntimeReferences} from './captain-packaging-check.mjs';
+import {METHOD_ASSET_HASHES} from '../lib/method-assets.ts';
 import {resolveInstalledBbRuntime} from './bb-runtime-fixture.mjs';
 import {acceptancePreflight} from './acceptance-preflight.mjs';import {createHash} from 'node:crypto';
 const exec=promisify(execFile),root=resolve('.');
@@ -67,6 +68,16 @@ for(const entrypoint of ['javascriptCli','nativeCli'])test('installed BB discove
   }finally{await host.harness.lifecycle.dispose();}
   const state=await cli(['plugin','list','--json']);
   const installed=state.plugins.find(p=>p.id==='firstmate');
+  for(const [asset,expectedHash] of Object.entries(METHOD_ASSET_HASHES))assert.equal(createHash('sha256').update(readFileSync(join(installed.rootDir,'skills',asset))).digest('hex'),expectedHash,'installed selected method asset '+asset);
+  const selected=createFakePluginHost({pluginId:'firstmate',agentSkillIds:ids,settings:{selectedMethods:'selected-v1'}});await plugin(selected.bb);
+  try{
+   for(const role of [{captain:'true'},{crew:'true',captain:'true',shape:'ship',posture:'direct-PR'}]){
+    const cfg=await selected.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({pluginMetadata:role}));
+    assert.ok(cfg.tools.some(t=>t.name==='firstmate_methods'));assert.ok(!cfg.skills.some(id=>id.includes('methods')));assert.doesNotMatch(cfg.instructions,/Calm/);
+    assert.match(cfg.instructions,role.crew?/worker-methods/:/captain-methods/);
+   }
+  }finally{await selected.harness.lifecycle.dispose();}
+
   const machines=await cli(['machine','list','--json']);const machine=machines.find(h=>h.status==='connected');assert.ok(machine,'exact owned host available: '+JSON.stringify(machines));
   const expected={serverUrl:env.BB_SERVER_URL,launchId:home,dataDir:data,pluginRoot:installed.rootDir,hostId:machine.id,
     buildSha256:createHash('sha256').update(readFileSync(join(installed.rootDir,'dist/server.js'))).digest('hex'),release:JSON.parse(readFileSync(join(installed.rootDir,'runtime-assets/distribution.json'))).release};

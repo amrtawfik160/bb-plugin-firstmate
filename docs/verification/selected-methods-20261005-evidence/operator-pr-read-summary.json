@@ -1,0 +1,20 @@
+{
+  "seam": "actual public bb skill list/show, CLI default personal workspace (no project/environment selectors); read-only; no candidate plugin or model invocation",
+  "readableRequestedPr": {
+    "id": "skill_31727271933b0c288fc1c87139bb3f6b6c838af88670efddceab3428fc018806",
+    "name": "pr",
+    "provider": "codex",
+    "scope": "provider-user",
+    "bytes": 4169,
+    "contentSha256": "ab63f1cf78647389edcd386c9427c5dfca27ed2836930c24773ffee834c19bcd",
+    "revision": "ab63f1cf78647389edcd386c9427c5dfca27ed2836930c24773ffee834c19bcd"
+  },
+  "refusedAlias": {
+    "id": "skill_e93b17c00c7dca79e2feca36e7af9d544d61726e14f0e0668fe019ae061e882d",
+    "provider": "claude-code",
+    "status": 502,
+    "code": "invalid_path",
+    "reason": "Root path must not be a symlink"
+  },
+  "withdrawnClaim": "Earlier progress message incorrectly called local hash equality successful public reads for all three provider copies and stated 2452 bytes. Correct size is 4169 bytes. Actual worker read remains parent acceptance."
+}

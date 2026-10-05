@@ -1,0 +1,28 @@
+✖ PR author resolves provider-specific skill copies and permits only byte-identical cross-provider copies for ACP (107.992197ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 0
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 438.540663
+
+✖ failing tests:
+
+test at server.methods.test.mjs:232:1
+✖ PR author resolves provider-specific skill copies and permits only byte-identical cross-provider copies for ACP (107.992197ms)
+  AssertionError [ERR_ASSERTION]: {"content":[{"type":"text","text":"Ambiguous /pr skills contain different body policies in the author's workspace; resolve that source conflict before body writing."},{"type":"text","text":"⁢⁣⁢⁣⁢"}],"isError":true}
+  
+  'object' !== 'string'
+  
+      at TestContext.<anonymous> (file:///root/github_projects/bb-plugin-firstmate-launch-pr-lifecycle/server.methods.test.mjs:242:111)
+      at async Test.run (node:internal/test_runner/test:1332:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: 'object',
+    expected: 'string',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }

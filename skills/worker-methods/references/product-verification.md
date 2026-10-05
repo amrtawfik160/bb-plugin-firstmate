@@ -9,7 +9,7 @@ assignment.
    exercise that journey. This does not assign full skill maintenance.
    Only when explicitly assigned maintenance, maintain its skill and feature
    map. Create a skill only when none exists and creation is assigned. If several targets are ambiguous, ask the
-   captain which one owns this surface. Do not assume a Cursor directory.
+   supervising manager through the native result channel which target owns this surface. Do not assume a Cursor directory.
 2. Inspect launch, readiness, authentication, driver, evidence, and cleanup
    procedures against source. Use the project's harness first. A maintenance
    assignment edits only the verification skill, map, and owned harness; report

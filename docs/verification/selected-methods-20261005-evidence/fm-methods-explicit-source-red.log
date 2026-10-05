@@ -1,0 +1,30 @@
+✖ explicit installation PR source survives reload and unreadable foreign aliases without bypassing BB content guards (111.221809ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 0
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 445.762501
+
+✖ failing tests:
+
+test at server.methods.test.mjs:246:1
+✖ explicit installation PR source survives reload and unreadable foreign aliases without bypassing BB content guards (111.221809ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + undefined
+  - 'physical-pr'
+  
+      at TestContext.<anonymous> (file:///root/github_projects/bb-plugin-firstmate-launch-pr-lifecycle/server.methods.test.mjs:256:97)
+      at async Test.run (node:internal/test_runner/test:1332:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: 'physical-pr',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
