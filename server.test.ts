@@ -3250,8 +3250,9 @@ test("an active BB crew classifies busy through the mirror (native herdr-only ve
     const busy = classify(join(home, "bin-bb"), "active");
     assert.equal(busy.status, 0, busy.stderr);
     assert.equal(busy.stdout.trim(), "busy bb-native");
-    // An idle thread is still not proof of idle turn state: unknown, never busy.
-    assert.equal(classify(join(home, "bin-bb"), "idle").stdout.trim(), "unknown missing");
+    // BB core status covers the entire turn, including tools. Idle permits the
+    // native status/DoD reader; it is not itself task completion.
+    assert.equal(classify(join(home, "bin-bb"), "idle").stdout.trim(), "idle bb-native");
     // Control: the pristine native lib (herdr-only) cannot see the busy BB crew.
     assert.equal(classify(join(home, "bin"), "active").stdout.trim(), "unknown missing");
   });
