@@ -63,7 +63,7 @@ bb firstmate merge <crew-id> --yes      # merge green PR, or ff-only local land
 # Attended-only, exact-check waivers: --allow-red <check> / --allow-missing <check>
 ```
 
-Crews end every task with a status verdict. `deliver` shows what they committed. You decide what lands.
+Crews end every task with a status verdict. `deliver` shows what they committed. Native task contracts and recorded captain authority govern landing.
 
 `/captain` first calls `firstmate_deck` (ACP/CLI: `bb firstmate deck --json`) to bind this thread's exact native home and return the agent-shell startup command. Binding has a 60-second deadline and reports `ready: false`: execute the returned command beneath the agent harness and require the complete native digest, successful lock and prerequisites before dispatch. Read the complete contract with `firstmate_contract` or `bb firstmate contract`; never guess a shared home or search plugin internals. Failed or truncated startup stays unresolved: inspect the named prerequisite before retry.
 
@@ -74,7 +74,7 @@ Bare `deck` defers fleet inventory to native startup. Request `deck --digest`, `
 | Command | What it does |
 | --- | --- |
 | `deck` / `session` | Bind the exact home and return pending startup / print the fleet digest |
-| `contract` | Read the complete current native supervisor contract and BB adaptations |
+| `contract` / `skill` | Read the complete supervisor contract / policy skill from the selected native runtime |
 | `runtime` | Inspect installed/selected code; explicitly install, check, select, migrate or roll back a quiescent home |
 | `dispatch` | Spawn a ship (isolated worktree) or scout (read-only) crew |
 | `tell` / `interrupt` / `stop` / `retry` | Live steer, hard stop, or re-run a crew |
@@ -82,7 +82,7 @@ Bare `deck` defers fleet inventory to native startup. Request `deck --digest`, `
 | `deliver` / `merge` / `promote` | Collect diffs, land work, promote a scout to a ship |
 | `queue` | Backlog with dependencies (`--after`) and time gates (`--wait-until`) |
 | `decide` | Durable captain decisions surfaced as NEEDS DECISION pings |
-| `posture` | Per-project delivery mode: `direct-PR`, `no-mistakes`, `local-only`, plus yolo merge authority |
+| `posture` | Inspect native registry, BB override and standing authority provenance; explicitly record current user-directed posture |
 | `memory` | Captain preferences and dated fleet learnings, reprinted on deck |
 | `afk` / `quiet` | Away mode (holds routine pings, keeps failures) and ping batching |
 | `secondmate` | Register domain-captain threads; dispatches to that project route there |
@@ -171,15 +171,13 @@ BB-specific behavior in this fork:
 
 ## Skills
 
-The plugin registers 28 upstream `.agents/skills`, plus `/captain`, `/firstmate`, `/calm`, and `/catch-up`. Two internal BB-owned method skills load by role: `captain-methods` for bounded assignments, completion coverage and reporting; `worker-methods` for task proof, product verification and scoped investigation. Their references load only at the named trigger. The upstream `firstmate-calm` entry is a terminal module rather than a portable skill; BB uses its existing timeline filter and the `/calm` reporting skill instead. Imported policy text is pinned to upstream commit `1f3e7696`; one shared runtime contract translates script paths, workers, approvals, and alternate harness mechanics to `firstmate_fm` and BB threads. Crew threads still receive no captain skills or captain tools.
+The plugin registers `/captain` and `/firstmate` as startup and transport instructions. Native `AGENTS.md` owns policy, including section 9 reporting. Captain and crew configuration no longer loads BB method or presentation skills. The source directories `captain-methods`, `worker-methods`, `calm` and `catch-up` remain unregistered: SDK 0.4.104 has no verified user-only opt-in selection surface, so these files are not automatic instructions.
 
-Calm reporting is the default in captain threads. Routine supervision stays silent; requested outcomes, review-ready work, decisions, exhausted blockers, and needed logins still reach you. This changes reporting only and leaves supervision and AFK/quiet settings unchanged. Ask for detail whenever needed.
+Read native policy skills and their relative references with `firstmate_skill` or `bb firstmate skill <name> [relative-reference]`. This reads the exact selected native runtime, checks its audited identity and original bytes, and refuses unknown versions, traversal, symlinks or changed policy. The two supported revisions are `2d833ff147cd26a5c461e914e06854e0eb2707ce` and `1f3e769616fdf9f31f85f4c3e6a9f71606634238`. Static copied skills cannot follow a per-home selection in this SDK; they remain fidelity-checked source material, not registered policy. The pinned runtime retains its complete native skill inventory.
 
-After updating the plugin, existing captain sessions can run `/calm` to load the reporting rules immediately. New captain sessions receive the default through their startup instructions.
+`/captain` binds this thread's home, returns the exact agent-shell startup command, and reads complete upstream `AGENTS.md` through `firstmate_contract`. Native policy reads are never shortened to fit an instruction field. Section arguments remain available for later lookup. BB adaptations map paths, threads, browser access and durable wake receipts; native intake, authority, review and completion gates remain authoritative.
 
-Run `/catch-up` after a long conversation or switching tasks. It summarizes important results, decisions needing you, blockers, in-progress work, and next steps from current records and the available conversation. It keeps unresolved items visible, flags missing evidence, and does not approve or start work. Its default scope is this captain's work; request all captains explicitly for a wider view. `/bearings` remains the full fleet snapshot and board workflow.
-
-`/captain` is a BB bootstrap: it binds this thread's home, returns its exact agent-shell startup command, and reads the complete upstream `AGENTS.md` verbatim through `firstmate_contract`. Section arguments remain available for later lookup. Upstream owns intake, authority, delivery, and supervision policy; BB instructions only map paths, threads, browser access, and durable wake receipts. The fidelity check covers both entry skills and every registered upstream skill, and requires byte-for-byte preservation for verbatim skill copies.
+After parent integration, refresh an existing captain's configuration and read the complete contract again. Do not migrate its runtime, rewrite task briefs, restart workers or remove old assets merely to refresh instructions. Existing conversation text cannot be erased by a configuration refresh; use the current complete native contract when recovering context. Text checks prove instruction composition, not identical model behavior.
 
 Native startup must run beneath the agent harness to acquire its session lock. `firstmate_fm` returns an agent-shell command for `session-start`, `sessionstart-run`, and `sessionstart-nudge` instead of attempting startup through BB's detached host-terminal RPC. SessionStart hooks use the same `bin-bb` mirror and explicit native home. A genuine native lock refusal retains read-only behavior; startup transport is repaired without bypassing the refusal.
 
@@ -229,3 +227,15 @@ Native policy ownership, isolated homes and remaining BB runtime limits: [native
 ## License
 
 [MIT](LICENSE)
+
+## Intake, authority and PR health
+
+Use registered help rather than reading plugin implementation: `bb firstmate dispatch --help`, `bb firstmate queue --help`, and `bb firstmate help`. Dispatch and queue help are rendered from the same supported option schema, including project, execution selection, shape, mode, delivery requirement and gates. Unsupported scheduling and native shared-worktree choices are stated explicitly.
+
+`bb firstmate posture --project <project> --json` reports actual native registry context and any BB override. Native's unregistered default is `no-mistakes` with yolo off. The registry is mechanical intake context; current user and project instructions choose the task mode. Explicit task modes do not rewrite the registry. A registered mode change needs the current user override/reason. Existing tasks keep their recorded delivery mode and requirement even if the project posture later changes.
+
+Captain-approved yolo is standing authority for green, in-scope work under native guards. A fresh per-PR request is unnecessary. Only an actual user hold changes that authority; supervisor-authored caution is not a user hold. Legacy yolo without provenance is preserved and shown as unverified. Missing provenance does not prove absent approval. Resolve it from recorded user approval; then record that existing standing instruction through `bb firstmate posture set --project <project> --yolo on --reason '<existing approval evidence>'`. This does not invent approval. New explicit posture changes record the captain, time and reason in the existing posture record. Native merge checks and explicit owner scope still apply.
+
+A PR-only contract is satisfied by its non-draft PR artifact. The durable record then stays `pr-delivered` and observes check health until the PR has a disposition. A later red check does not undo artifact delivery or create a merge requirement. Each failing check keeps its identity, link, author and follow-up accounting in CLI/tools and Fleet. A second independent failure remains visible while a baseline fix is active. Healthy observations do not create repeated model turns.
+
+Reuse the recorded author for branch-specific fixes. For a proved baseline failure, link an existing authorized follow-up task separately with `bb firstmate deliveries account <id> --failure <failure-id> --scope baseline --follow-up-task <task-id> --reason '<baseline evidence>' --authorized`. Use `--scope author` for the original branch author. Accounting does not mark a check passing, start a worker or grant merge authority. Worker retirement and wake acknowledgement keep the outstanding record and author continuation.

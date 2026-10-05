@@ -122,7 +122,7 @@ const SKILL_GLOBS = [
 ];
 
 const CAPTAIN_WATCH_GUIDANCE = [
-  "skills/harness-adapters/references/harness/bb.md",
+  "skills/captain/references/bb.md",
 ];
 
 export function normalize(s: string): string {

@@ -1,13 +1,14 @@
-# Maintain or create product verification
+# Verify a changed journey; maintain a verification skill only when assigned
 
 Use the project's existing verification skill and explicit visual references
 for a changed user journey. This method describes future project work; loading
 it does not authorize editing an app or generating a skill during an unrelated
 assignment.
 
-1. Locate the existing verification skill and feature map in the project's
-   configured skill locations. Maintain that target. Create one only when none
-   exists and creation is assigned. If several targets are ambiguous, ask the
+1. For a changed journey, read the relevant existing verification procedure and
+   exercise that journey. This does not assign full skill maintenance.
+   Only when explicitly assigned maintenance, maintain its skill and feature
+   map. Create a skill only when none exists and creation is assigned. If several targets are ambiguous, ask the
    captain which one owns this surface. Do not assume a Cursor directory.
 2. Inspect launch, readiness, authentication, driver, evidence, and cleanup
    procedures against source. Use the project's harness first. A maintenance

@@ -137,7 +137,7 @@ test('actual dispatch returns from native start before failed queue publication;
   sdk(host);host.harness.sdk.stub('threads.getPluginMetadata',async({threadId})=>threadId==='thr_worker'?metadata:{});
   return hostCommands(host,command=>{
    if(command.includes("'start'"))started=true;
-   return{output:command.includes("'show'")?`task:\n  id: ${id}\n  title: full launch spec\n  kind: ship\n  state: ${started?'in_flight':'queued'}\n`:command.includes('bb_thread_id')?'thr_worker':''};
+   return{output:command.includes("fm-project-mode.sh")?"no-mistakes off\n":command.includes("'show'")?`task:\n  id: ${id}\n  title: full launch spec\n  kind: ship\n  state: ${started?'in_flight':'queued'}\n`:command.includes('bb_thread_id')?'thr_worker':''};
   });
  };stubs();
  const add=await host.harness.behavior.runCli(['queue','add','full launch spec','--detail','saved unchanged body','--delivery-requirement','merged-and-verified','--json'],ctx);assert.equal(add.exitCode,0,add.stderr);const item=JSON.parse(add.stdout);id=item.id;

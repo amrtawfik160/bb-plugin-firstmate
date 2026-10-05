@@ -159,20 +159,22 @@ would correctly fail the guard); revisit only if CRLF status files ever appear.
 
 ## Skill fidelity: copy native, mark every divergence
 
-`skills/calm/` and `skills/catch-up/` are BB-authored presentation skills, not
-copies of upstream skills. Calm points to the adapted escalation contract rather
-than duplicating its policy. Catch-up owns only the requested recovery format;
-it uses existing observations and grants no new execution authority.
-`skills/captain-methods/` and `skills/worker-methods/` are also BB-owned exceptions:
-original, bounded method compositions with pinned pstack attribution. They add
-conditional coverage, reporting, proof, verification, evidence, and research
-procedures, not native lifecycle policy. Only the matching role receives each
-entry skill. Each skill carries its own method references; shared procedure text
-is checked for consistency by `server.methods.test.mjs`. These four BB-owned
-skills stay separate from the pinned upstream inventory and fidelity snapshots.
-The imported inventory and its full fidelity check remain unchanged. See
-[`docs/verification/bounded-methods.md`](docs/verification/bounded-methods.md) for
-the exact instruction delta, scope matrix, and acceptance limits.
+`skills/calm/`, `skills/catch-up/`, `skills/captain-methods/` and
+`skills/worker-methods/` are retained BB-authored source exceptions, separate from
+the native fidelity inventory. They are **unregistered** and must not load through
+role configuration, startup instructions, contract appendices or transitive
+pointers. The public SDK's static skill selection does not provide a verified
+user-only opt-in boundary. Native section 9 owns default reporting.
+
+Only the `/captain` and `/firstmate` transport entries are registered. Read native
+policy through `firstmate_skill` from the exact selected audited runtime, rather
+than expose globally pinned policy skills to captains on another revision.
+`server.native-policy.test.mjs` composes actual captain and worker configuration
+with both native sources and the worker renderer. The versioned
+`docs/verification/native-transport-allowlist.v1.json` records transport bytes;
+changing it requires an explicit boundary justification and causal proof. Native
+skill bytes, task text, task modes and native authority/completion gates remain
+independent invariants. Configuration equality is not a claim about model behavior.
 
 The imported skills under [`skills/`](skills/) are not independent BB rewrites of firstmate
 policy — they are **native firstmate's own instructions, copied**, with edits only

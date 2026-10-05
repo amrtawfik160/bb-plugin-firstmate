@@ -21,10 +21,10 @@ For repeated failed fixes, write the premise and enumerate relevant actors and
 writers before another patch. Test a counterfactual; an even actor count alone
 cannot disprove a premise. Separate independent facts when the domain permits,
 but serialize canonical shared objects structurally. Instructions are not
-concurrency control. Preserve Firstmate's canonical records and ownership.
+concurrency control. For work on Firstmate itself, preserve Firstmate's canonical records and ownership.
 
 Prefer types, durable identity, transactions, and runtime checks over repeated
-warnings for critical invariants. Do not delete native authority or trigger
+warnings for critical invariants. For work on Firstmate itself, preserve native authority and trigger
 instructions after adding enforcement. For measurements, report the unit,
 sample definition, run count, spread, and actual measured result.
 

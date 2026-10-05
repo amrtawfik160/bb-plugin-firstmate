@@ -19,7 +19,7 @@ import {
 const ROOT = process.cwd();
 const AFK = "skills/afk/SKILL.md";
 const ESC = "skills/captain/references/escalation.md";
-const BB_HARNESS = "skills/harness-adapters/references/harness/bb.md";
+const BB_HARNESS = "skills/captain/references/bb.md";
 
 // End-to-end: copy skills/ + native-snapshot/ into a temp root, mutate, run the
 // real offline check. This is exactly what `npm test` / `npm run fidelity` do.

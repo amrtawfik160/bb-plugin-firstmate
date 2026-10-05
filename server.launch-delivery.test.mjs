@@ -87,7 +87,7 @@ test('native bridge seeds role/home/generation before initial configuration and 
  let roleChecked=false;
  host.harness.sdk.stub('threads.spawn',async input=>{
   const configuration=await host.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({pluginMetadata:input.pluginMetadata}));
-  assert.equal(configuration.tools.length,0);assert.deepEqual(configuration.skills,['worker-methods']);
+  assert.equal(configuration.tools.length,0);assert.deepEqual(configuration.skills,[]);
   assert.equal(input.pluginMetadata.nativeHome,'/native');assert.equal(input.pluginMetadata.crewId,'task');assert.equal(input.pluginMetadata.generation,1);
   assert.equal(input.permissionMode,'accept-edits');assert.equal(input.visibility,'hidden');roleChecked=true;return{id:'thr_worker'};
  });
@@ -211,7 +211,7 @@ test('native seeded secondmate role and child home exist at initial configuratio
 test('owned launch metadata recovers scoped orphan PR references without claiming scout or foreign URLs',async()=>{
  const host=await base();try {
  const launches=createLaunches(host.bb.storage.database());const key=JSON.stringify(['proj_1','thr_cap','','owned',1]);
- const record={key,taskId:'owned',projectId:'proj_1',owner:'thr_cap',home:'',generation:1,shape:'ship',deliveryRequirement:'merged',state:'running',threadId:'thr_owned',updatedAt:1};launches.save(record);
+ const record={key,taskId:'owned',projectId:'proj_1',owner:'thr_cap',home:'',generation:1,shape:'ship',deliveryMode:'direct-PR',deliveryRequirement:'merged',state:'running',threadId:'thr_owned',updatedAt:1};launches.save(record);
  launches.save({...record,key:'foreign',taskId:'foreign',threadId:'thr_foreign'});launches.save({...record,key:'scout',shape:'scout',taskId:'scout',threadId:'thr_scout'});
  host.harness.sdk.stub('threads.getPluginMetadata',async({threadId})=>threadId==='thr_owned'?{launchKey:key,crewId:'owned',nativeHome:''}:{});
  host.harness.sdk.stub('environments.pullRequest',async()=>({outcome:'available',pullRequest:{url:'https://github.com/acme/own/pull/3',state:'open'}}));
@@ -436,5 +436,80 @@ test('native creation provisioning releases capacity only on exact core deletion
   const retry=await host.harness.behavior.runCli(argv('deleted-worker'),ctx);assert.equal(retry.exitCode,1);assert.match(retry.stderr,/deleted by BB core/);assert.equal(n,1);
   const next=await host.harness.behavior.runCli(argv('next-worker'),ctx);assert.equal(next.exitCode,0,next.stderr);assert.equal(n,2);
   launches=createLaunches(host.bb.storage.database());assert.equal(launches.get(original.key).state,'deleted');
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('PR-only delivered artifact remains monitored across reload; baseline follow-up never hides an independent CI failure',async()=>{
+ let host=await base();try {
+ const author={...row(1),prUrl:'https://github.com/acme/repo/pull/901',deliveryRequirement:'pr'};
+ const baseline={...row(2),task:'Fix authorized baseline failure',deliveryRequirement:'pr'};
+ await host.bb.storage.kv.set('crews',[author,baseline]);
+ const registered=await host.harness.behavior.runCli(['deliveries','register','--crew','c1','--url',author.prUrl,'--json'],ctx);assert.equal(registered.exitCode,0,registered.stderr);
+ let rollup=[{name:'branch-unit',conclusion:'SUCCESS',detailsUrl:'https://ci.example/branch/1'}];
+ const observation=()=>({headRefOid:'sha-ci',state:'OPEN',isDraft:false,mergeable:'MERGEABLE',reviewDecision:'',reviews:[],statusCheckRollup:rollup});
+ const install=()=>{
+   commonStubs(host);host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle',environmentId:'env_wt'}));
+   host.harness.sdk.stub('threads.send',async()=>({delivery:'queued'}));host.harness.sdk.stub('threads.queuedMessages.list',async()=>[]);
+   hostCommands(host,c=>c.includes('gh pr view')?{payload:JSON.stringify(observation())}:{code:0});
+ };
+ install();let store=createDeliveries(host.bb.storage.database());const id='acme/repo#901';
+ const pass=async()=>{const r=store.get(id);store.save({...r,nextCheckAt:0});await host.harness.behavior.runSchedule('pr-delivery-follow-up');};
+ await pass();let r=store.get(id);assert.equal(r.status,'pr-delivered');assert.ok(r.deliverySatisfiedAt);assert.equal(r.requirement,'pr');assert.deepEqual(r.workers,['thr_c1']);
+ const satisfiedAt=r.deliverySatisfiedAt;
+ // Worker completes and leaves the cache. The persistent author remains callable.
+ await host.bb.storage.kv.set('crews',[baseline]);host=await host.harness.lifecycle.reload(plugin);install();store=createDeliveries(host.bb.storage.database());
+ rollup=[{name:'convex-baseline',conclusion:'FAILURE',detailsUrl:'https://ci.example/baseline/1'}];await pass();r=store.get(id);
+ assert.equal(r.status,'failing-checks');assert.equal(r.deliverySatisfiedAt,satisfiedAt);assert.equal(r.requirement,'pr');assert.ok(r.continuation);assert.equal(r.failures[0].accounting,undefined);
+ const firstSignature=r.notification.delivered;assert.ok(firstSignature);
+ const authorRead=await host.harness.behavior.runCli(['crew','c1'],ctx);assert.equal(authorRead.exitCode,0,authorRead.stderr);
+ const accounted=await host.harness.behavior.runCli(['deliveries','account',id,'--failure',r.failures[0].id,'--scope','baseline','--follow-up-task','c2','--reason','Same named check fails on main at verified baseline commit; existing user-authorized c2 fix','--authorized','--json'],ctx);assert.equal(accounted.exitCode,0,accounted.stderr);
+ rollup.push({name:'proxy-parity',conclusion:'FAILURE',detailsUrl:'https://ci.example/parity/1'});await pass();r=store.get(id);
+ assert.equal(r.failures.length,2);assert.equal(r.failures[0].accounting.taskId,'c2');assert.equal(r.failures[1].accounting,undefined);assert.notEqual(r.notification.delivered,firstSignature);
+ host.harness.sdk.stub('threads.getPluginMetadata',async()=>({captain:'true'}));
+ const fleet=await host.harness.behavior.callRpc('fleet',{threadId:'thr_cap'});assert.equal(rpcContract.fleet.output.safeParse(fleet).success,true);
+ const visible=fleet.deliveries.find(d=>d.id===id);assert.equal(visible.deliverySatisfiedAt,satisfiedAt);assert.deepEqual(visible.failures,r.failures);assert.deepEqual(visible.workers,['thr_c1']);
+ const deliveryTool=host.harness.registrations.agentTools.find(t=>t.name==='firstmate_deliveries');
+ const branchAccount=await deliveryTool.execute({action:'account',id,failureId:r.failures[1].id,scope:'author',followUpTask:'c1',authorized:true,reason:'Reuse original chat author for this branch-specific check'},ctx);assert.equal(typeof branchAccount,'string',JSON.stringify(branchAccount));
+ r=store.get(id);assert.equal(r.failures[1].accounting.worker,'thr_c1');assert.equal(r.failures[0].accounting.worker,'thr_c2');
+ assert.equal(host.harness.sdk.callsTo('threads.spawn').length,0);assert.equal(host.harness.sdk.callsTo('threads.send').filter(c=>c[0].threadId!=='thr_cap').length,0,'accounting records identity; no worker turn or new authority');
+ const before=host.harness.sdk.callsTo('threads.send').length;await pass();const after=host.harness.sdk.callsTo('threads.send').length;await pass();assert.equal(host.harness.sdk.callsTo('threads.send').length,after,'unchanged observations do not wake another model turn');
+ const output=await host.harness.behavior.runCli(['deliveries','list'],ctx);assert.match(output.stdout,/Agreed delivery satisfied/);assert.match(output.stdout,/proxy-parity/);assert.match(output.stdout,/convex-baseline/);assert.ok(output.stdout.includes(author.prUrl));
+ const foreign=await host.harness.behavior.runCli(['deliveries','account',id,'--failure',r.failures[1].id,'--scope','author','--authorized','--reason','wrong owner'],{threadId:'foreign',projectId:'proj_1'});assert.equal(foreign.exitCode,1);
+ rollup=rollup.map(c=>({...c,conclusion:'SUCCESS'}));await pass();r=store.get(id);assert.equal(r.status,'pr-delivered');assert.ok(r.failures.every(f=>f.resolvedAt));assert.equal(r.requirement,'pr');assert.equal(r.deliverySatisfiedAt,satisfiedAt);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('recorded standing yolo reaches the native guard without a fresh merge ask; legacy provenance and actual user holds remain explicit',async()=>{
+ const host=await base({fmHome:'/scratch/native',fmHostId:'host_1'});try{
+ await host.bb.storage.kv.set('crews',[{...row(1),nativeHome:'/scratch/native',prUrl:'https://github.com/acme/repo/pull/10'}]);
+ await host.bb.storage.kv.set('postures',{proj_1:{mode:'direct-PR',yolo:true}});
+ const legacy=await host.harness.behavior.runCli(['merge','c1'],ctx);assert.equal(legacy.exitCode,1);assert.match(legacy.stderr,/provenance is unverified/);assert.match(legacy.stderr,/no fresh per-PR request/);
+ await host.bb.storage.kv.set('postures',{proj_1:{mode:'direct-PR',yolo:true,provenance:{source:'captain-instruction',actor:'thr_cap',at:'2026-10-05T00:00:00Z',reason:'User approved standing green in-scope merge; supervisor earlier wrote do-not-merge without user authority'}}});
+ host.harness.sdk.stub('environments.pullRequest',async()=>({outcome:'unavailable'}));
+ let guarded=0;hostCommands(host,c=>{
+ if(c.includes('/fm-pr-merge.sh')){guarded++;return{code:1,payload:'NATIVE_USER_HOLD_OR_CHECK_REFUSAL: retained task'};}
+ if(c.includes('gh pr view'))return{payload:JSON.stringify({state:'OPEN',mergeable:'MERGEABLE'})};
+ return{code:0};
+ });
+ const standing=await host.harness.behavior.runCli(['merge','c1'],ctx);assert.equal(standing.exitCode,1);assert.match(standing.stderr,/NATIVE_USER_HOLD_OR_CHECK_REFUSAL/);assert.equal(guarded,1,'standing authority must reach the guarded route without a fresh request');
+ assert.equal((await host.bb.storage.kv.get('crews')).length,1);assert.equal(host.harness.sdk.callsTo('environments.mergePullRequest').length,0);
+ await host.bb.storage.kv.set('postures',{proj_1:{mode:'direct-PR',yolo:false,provenance:{source:'captain-instruction',actor:'thr_cap',at:'2026-10-05T01:00:00Z',reason:'Actual user hold'}}});
+ const held=await host.harness.behavior.runCli(['merge','c1'],ctx);assert.equal(held.exitCode,1);assert.match(held.stderr,/Needs captain/);assert.equal(guarded,1,'actual hold must retain its gate');
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('durable launch orphan discovery preserves native task mode before author continuation publication',async()=>{
+ const host=await base();try {
+  const record={key:'proj_1:thr_cap:/native:orphan',taskId:'orphan',projectId:'proj_1',owner:'thr_cap',home:'/native',generation:1,shape:'ship',state:'running',threadId:'thr_orphan',deliveryMode:'no-mistakes',deliveryRequirement:'pr',updatedAt:Date.now()};
+  await createLaunches(host.bb.storage.database()).reserve(record,async()=>({cap:5,activeTaskIds:[]}));
+  host.harness.sdk.stub('threads.list',async()=>[]); // Cache/metadata adoption cannot satisfy this path.
+  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle',environmentId:'env_wt'}));
+  host.harness.sdk.stub('threads.getPluginMetadata',async({threadId})=>threadId==='thr_orphan'?{launchKey:record.key,nativeHome:record.home,crewId:record.taskId}:{});
+  host.harness.sdk.stub('environments.pullRequest',async()=>({outcome:'available',pullRequest:{url:'https://github.com/acme/orphan/pull/11',state:'open'}}));
+  host.harness.sdk.stub('threads.send',async()=>({delivery:'queued'}));hostCommands(host,()=>({payload:JSON.stringify(forge())}));
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  const delivery=createDeliveries(host.bb.storage.database()).get('acme/orphan#11');assert.ok(delivery,'scheduled orphan recovery must discover the exact owned PR');
+  assert.equal(delivery.continuation.posture,'no-mistakes');assert.equal(delivery.requirement,'pr');assert.deepEqual(delivery.workers,['thr_orphan']);
+  assert.equal(host.harness.sdk.callsTo('threads.spawn').length,0);assert.equal(host.harness.sdk.callsTo('environments.mergePullRequest').length,0);
  }finally{await host.harness.lifecycle.dispose();}
 });
