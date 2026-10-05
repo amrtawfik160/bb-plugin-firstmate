@@ -248,24 +248,25 @@ diff --git a/bin/fm-busy-lib.sh b/bin/fm-busy-lib.sh
  #   cursor-transcript, missing, malformed, gen-mismatch, source-mismatch,
  #   kimi-unverified, codex-unverified, capture-failed, no-target, launch-prompt
  #
-@@ -1078,11 +1078,14 @@
+@@ -1075,6 +1075,18 @@
+       return 0
+       ;;
+   esac
++  # BB-only transport: core thread lifecycle brackets the whole turn, including
++  # foreground tools. A verified idle verdict permits native status/DoD reads;
++  # it never declares task completion itself. Keep malformed records above and
++  # unavailable/queued execution unknown. Other harnesses retain native rules.
++  if [ "$backend:$harness" = bb:bb ] && command -v fm_backend_busy_state >/dev/null 2>&1; then
++    native=$(fm_backend_busy_state bb "$target" 2>/dev/null || true)
++    case "$native" in
++      busy|idle) printf '%s bb-native' "$native" ;;
++      *) printf 'unknown bb-native' ;;
++    esac
++    return 0
++  fi
    # No record at all. A native herdr busy verdict is semantic enough to trust
    # for BUSY (streaming means a turn is running); native idle is narrower
    # than turn state (a long foreground tool call reads idle) and stays
--  # unknown here.
--  if [ "$backend" = herdr ] && command -v fm_backend_busy_state >/dev/null 2>&1; then
-+  # unknown here. A BB thread status is the same kind of semantic verdict: an
-+  # active thread is a turn in flight, including a long tool call, so bb is
-+  # trusted for BUSY too. Without it a busy BB crew read unknown and fm-watch
-+  # paged a false stale: after two unchanged polls.
-+  if { [ "$backend" = herdr ] || [ "$backend" = bb ]; } && command -v fm_backend_busy_state >/dev/null 2>&1; then
-     native=$(fm_backend_busy_state "$backend" "$target" 2>/dev/null || true)
-     if [ "$native" = busy ]; then
--      printf 'busy herdr-native'
-+      printf 'busy %s-native' "$backend"
-       return 0
-     fi
-   fi
 diff --git a/bin/fm-secondmate-liveness-lib.sh b/bin/fm-secondmate-liveness-lib.sh
 --- a/bin/fm-secondmate-liveness-lib.sh
 +++ b/bin/fm-secondmate-liveness-lib.sh

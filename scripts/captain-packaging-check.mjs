@@ -15,7 +15,7 @@ export function followRuntimeReferences(directory, entry) {
       const destination = resolve(dirname(path), target.split('#')[0]);
       assert.ok(!relative(directory, destination).startsWith('..'),
         `cold startup must resolve inside the selected runtime package: ${target}`);
-      readFileSync(destination); // Includes report editor, calm, receipt and BB transport dependencies.
+      readFileSync(destination); // Every required local startup reference must exist; no global fallback.
       pending.push(destination);
     }
   }

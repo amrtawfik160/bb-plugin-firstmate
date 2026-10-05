@@ -1,0 +1,51 @@
+{
+  "schema": 1,
+  "nativeCommits": [
+    "2d833ff147cd26a5c461e914e06854e0eb2707ce",
+    "1f3e769616fdf9f31f85f4c3e6a9f71606634238"
+  ],
+  "dynamic": {
+    "captain": {
+      "sha256": "9751a7212370c28ea46930b089158df65094ec918bc8bbc44176974b921c7607",
+      "text": "Before orchestrating, call firstmate_deck (ACP/CLI: bb firstmate deck --json) to bind this thread's native home, then read firstmate_contract without a section (bb firstmate contract) for the complete native supervisor contract and its selected-runtime skill trigger catalog. If the startup digest is absent, run deck's exact command through your agent shell; firstmate_fm script=session-start returns it again. Failed prerequisites, lock refusal or a truncated digest remain unresolved. BB adapter for every upstream firstmate skill: The complete native supervisor contract and imported upstream skills own policy; the following mappings only adapt execution to BB. Translate bin/fm-<name>.sh calls to firstmate_fm with script=<name> and the same arguments; use bb firstmate fm <name> only when a shell command is required. Load native policy skills and their references with firstmate_skill (bb firstmate skill <name> [reference] [--source <selected-root source-file>]); it reads this captain’s selected runtime. Native AGENTS.md means firstmate_contract; bin and docs mean the selected runtime, while data, state and config mean the exact bound captain home returned by deck. Map workers, panes, and tabs to BB crew threads via firstmate_dispatch/tell/interrupt/retry/stop. Call firstmate_watch once per batch; it hands off to private durable wakes. End the turn; never retry or poll. Use BB interactions for captain questions and approvals. firstmate_deliveries retains open PRs after worker retirement and wake acknowledgement. Continue authorized review/fix/merge work using the author for fixes and preserving the agreed native review and validation path, including independent review when required; merge through firstmate_merge. Inspect unresolved delivery records after compaction or handoff. Run firstmate_toolchain for native dependency detection. For browser work use the /browser skill and browser_script (or bb browser script), with profileId unset for the thread-isolated default. This replaces native chrome-devtools-axi transport. Read config/lavish-axi-host for remote Lavish access and use bb connect expose for a board the captain should see. Treat tmux, herdr, zellij, cmux, orca, and harness-specific hook setup as reference material unless the active backend explicitly names that runtime.",
+      "reason": "Native policy reads and selected-runtime path mappings; BB threads, browser, durable receipts and PR transport. Required full selected-runtime trigger catalog and source-relative native reference transport."
+    },
+    "crew": {
+      "sha256": "2766c8a42bba21e40d5ae0405ca253dc1a2403190970931b6a945e45313e3da2",
+      "text": "The native launch brief owns this worker role, BB transport and task policy. BB crew threads have no captain tools or skills. Follow that brief and its exact-ID steering inbox procedure. Do not delegate or change the selected provider, model, or effort. Worker completion is a handoff, not captain merge or deployment completion.",
+      "reason": "Native launch brief pointer, exact-ID inbox and BB role exclusion; no additional method policy."
+    }
+  },
+  "renderer": {
+    "overlay/bin/backends/bb-worker-prompt.py": {
+      "sha256": "dfe4f1077eb6897c33d0762c7879de5848db693ec1efb1fb79fbeeb5df726ea0",
+      "reason": "Known native scaffold boundaries only: script/browser transport, exact task-owned paths and inbox IDs; retain operational references, task and native completion gates."
+    },
+    "overlay/bin/backends/bb-worker-transport.txt": {
+      "sha256": "6d450a1fe61c27823c5eff8e991f40dc43507721524be6a13f5e5cf8af2706df",
+      "reason": "Known native scaffold boundaries only: script/browser transport, exact task-owned paths and inbox IDs; retain operational references, task and native completion gates."
+    }
+  },
+  "captainTransport": {
+    "entry-skills/captain/SKILL.md": {
+      "sha256": "65756be8ec73727143d21ff78e66b59ea3e6578b1a9351ad41d85d6b3c6374a3",
+      "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner."
+    },
+    "entry-skills/firstmate/SKILL.md": {
+      "sha256": "4278efad7a37ce187b2082ba4eb40e4a77b8e3c112aaaf13fdc786f38edd50ff",
+      "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner."
+    },
+    "entry-skills/captain/references/bb.md": {
+      "sha256": "7ad5512a7bf21494491a5271a8cf75d2e2a53146bee8b10e773a1f07330d6962",
+      "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner."
+    },
+    "entry-skills/captain/references/intake-briefs.md": {
+      "sha256": "06d88ecf4bc68cccc6288428dc0b346509b928ae302e411a45d3b9f56566759a",
+      "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner."
+    },
+    "entry-skills/captain/references/supervision.md": {
+      "sha256": "f1e6152dffd6e075f5a8be86b8cf210b3517bf3b994bf9f1769849ae6b588f8d",
+      "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner."
+    }
+  }
+}

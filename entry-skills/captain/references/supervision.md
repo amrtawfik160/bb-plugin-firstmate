@@ -1,7 +1,7 @@
 # BB supervision transport
 
 Native `AGENTS.md` section 8 and its referenced upstream skills own supervision policy.
-Use [the BB harness reference](../../harness-adapters/references/harness/bb.md) for the event-driven watch handoff.
+Use [the BB harness reference](bb.md) for the event-driven watch handoff.
 
 ## Durable wake handling
 

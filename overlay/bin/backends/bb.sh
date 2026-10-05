@@ -690,12 +690,18 @@ fm_backend_bb_busy_state() {  # <thread-id>
 import json, sys
 try:
     data = json.load(sys.stdin)
-    if data.get("version") != 1 or data.get("threadId") != sys.argv[1]:
+    if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] != 1 or data.get("threadId") != sys.argv[1]:
         raise ValueError("unsupported or mismatched activity snapshot")
-    if data.get("interactionCount", 0) > 0:
-        print("idle", end="")
-    elif data.get("runtimeStatus") in ("host-reconnecting", "waiting-for-host", "provisioning", "stopping"):
+    if not isinstance(data.get("runtimeStatus"), str) or data["runtimeStatus"] not in ("active", "idle", "error", "pending", "starting", "stopping", "host-reconnecting", "waiting-for-host", "provisioning"):
+        raise ValueError("missing or unsupported runtime status")
+    if type(data.get("interactionCount")) is not int or data["interactionCount"] < 0:
+        raise ValueError("missing or invalid interaction count")
+    if not isinstance(data.get("status"), str) or data["status"] not in ("active", "running", "working", "idle", "stopped", "error", "failed", "pending", "queued", "starting", "stopping"):
+        raise ValueError("missing or unsupported execution status")
+    if data["runtimeStatus"] in ("host-reconnecting", "waiting-for-host", "provisioning", "stopping", "pending", "starting"):
         print("unknown", end="")
+    elif data["interactionCount"] > 0:
+        print("idle", end="")
     elif data.get("status") in ("active", "running", "working"):
         print("busy", end="")
     elif data.get("status") in ("idle", "stopped", "error", "failed"):

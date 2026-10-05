@@ -6,7 +6,7 @@ import {tmpdir} from 'node:os';
 import {spawnSync} from 'node:child_process';
 const root = resolve('.'), copy = mkdtempSync(join(tmpdir(), 'fm-cold-package-mutation-'));
 try {
-  for (const file of ['package.json', 'rpc.ts', 'server.ts', 'server.methods.test.mjs', 'lib', 'overlay', 'skills', 'scripts']) {
+  for (const file of ['package.json', 'rpc.ts', 'server.ts', 'server.methods.test.mjs', 'lib', 'overlay', 'skills', 'entry-skills', 'scripts']) {
     cpSync(join(root, file), join(copy, file), {recursive: true});
   }
   symlinkSync(join(root, 'node_modules'), join(copy, 'node_modules'), 'dir');

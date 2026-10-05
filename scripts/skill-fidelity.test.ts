@@ -18,8 +18,8 @@ import {
 
 const ROOT = process.cwd();
 const AFK = "skills/afk/SKILL.md";
-const ESC = "skills/captain/references/escalation.md";
-const BB_HARNESS = "skills/harness-adapters/references/harness/bb.md";
+const ESC = "entry-skills/captain/references/escalation.md";
+const BB_HARNESS = "entry-skills/captain/references/bb.md";
 
 // End-to-end: copy skills/ + native-snapshot/ into a temp root, mutate, run the
 // real offline check. This is exactly what `npm test` / `npm run fidelity` do.
@@ -28,6 +28,7 @@ function withTemp(mutate: (root: string) => void): Problem[] {
   try {
     cpSync(join(ROOT, "overlay"), join(root, "overlay"), { recursive: true });
     cpSync(join(ROOT, "skills"), join(root, "skills"), { recursive: true });
+    cpSync(join(ROOT, "entry-skills"), join(root, "entry-skills"), { recursive: true });
     cpSync(join(ROOT, "native-snapshot"), join(root, "native-snapshot"), { recursive: true });
     mutate(root);
     return runOffline(root);
@@ -61,6 +62,7 @@ test("captain watch guidance preserves the blocking CLI distinction", () => {
   try {
     cpSync(join(ROOT, "overlay"), join(root, "overlay"), { recursive: true });
     cpSync(join(ROOT, "skills"), join(root, "skills"), { recursive: true });
+    cpSync(join(ROOT, "entry-skills"), join(root, "entry-skills"), { recursive: true });
     edit(root, BB_HARNESS, (s) =>
       s.replace("The `bb firstmate watch` CLI remains blocking via BB `threads.wait` for operator use.\n", ""),
     );
@@ -290,7 +292,7 @@ test("version alignment rejects stale skill and overlay pins", () => {
 
 
 test("captain bootstrap rejects an independent policy sentence", () => {
-  const ps = withTemp(root => edit(root, "skills/captain/SKILL.md", s => s + "\nAlways run an extra security review before dispatching any ship.\n"));
+  const ps = withTemp(root => edit(root, "entry-skills/captain/SKILL.md", s => s + "\nAlways run an extra security review before dispatching any ship.\n"));
   assert.ok(flagged(ps, /unmarked divergence/), JSON.stringify(ps));
 });
 

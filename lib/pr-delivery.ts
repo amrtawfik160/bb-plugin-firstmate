@@ -2,11 +2,16 @@ import { createHash } from 'node:crypto';
 import type { BbPluginApi } from '@get-bb/plugin-sdk';
 type Database = ReturnType<BbPluginApi['storage']['database']>;
 export type DeliveryRequirement = 'pr' | 'merged' | 'merged-and-verified';
-export type DeliveryStatus = 'draft' | 'waiting-checks' | 'failing-checks' | 'waiting-review' | 'waiting-native-gates' | 'changes-requested' | 'waiting-approval' | 'ready-to-merge' | 'merged-needs-verification' | 'closed-needs-disposition' | 'complete' | 'explicitly-abandoned';
+export type DeliveryStatus = 'draft' | 'waiting-checks' | 'failing-checks' | 'waiting-review' | 'waiting-native-gates' | 'changes-requested' | 'waiting-approval' | 'ready-to-merge' | 'merged-needs-verification' | 'closed-needs-disposition' | 'pr-delivered' | 'complete' | 'explicitly-abandoned';
+export interface CheckFailure {
+  id:string; name:string; url:string; headSha:string; resolvedAt:number|null;
+  accounting?:{scope:'author'|'baseline'; taskId:string; worker:string; evidence:string; actor:string; at:number};
+}
 export interface DeliveryRecord {
   id: string; repository: string; number: number; url: string; headSha: string; mergeCommitSha:string|null;
   taskId: string; projectId: string; owner: string | null; home: string;
   continuation?:Record<string,unknown>;
+  deliverySatisfiedAt?:number|null; forgeState?:ForgeObservation['state']; failures?:CheckFailure[];
   workers: string[]; requirement: DeliveryRequirement; status: DeliveryStatus;
   blocker: string; nextAction: string; nextCheckAt: number; observedAt: number | null;
   freshness: 'fresh' | 'stale'; error: string | null; errors: number;
@@ -19,7 +24,7 @@ export interface ForgeObservation {
   headSha: string; state: 'open' | 'closed' | 'merged'; draft: boolean;
   checks: 'pending' | 'passing' | 'failing' | 'unknown'; review: 'approved' | 'changes-requested' | 'required' | 'unknown';
   mergeable: 'mergeable' | 'conflicting' | 'unknown';
-  reviewHeadSha:string|null; mergeCommitSha:string|null;
+  reviewHeadSha:string|null; mergeCommitSha:string|null; failedChecks?:{id:string;name:string;url:string}[];
 }
 export function canonicalPr(url: string) {
   const m = /^https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)(?:[/?#].*)?$/.exec(url.trim());
@@ -28,11 +33,11 @@ export function canonicalPr(url: string) {
   return { id: `${repository}#${number}`, repository, number, url: `https://github.com/${repository}/pull/${number}` };
 }
 export function deliveryLine(r: DeliveryRecord) {
-  return `${r.id} [${r.status}${r.freshness === 'stale' ? ', stale' : ''}${r.ownerNeeded ? ', owner needed' : ''}] owner=${r.owner ?? 'unassigned'} ${r.url}\n  ${r.blocker || 'No known blocker'}. Next: ${r.nextAction}`;
+  return `${r.id} [${r.status}${r.freshness === 'stale' ? ', stale' : ''}${r.ownerNeeded ? ', owner needed' : ''}] owner=${r.owner ?? 'unassigned'} ${r.url}\n  ${r.deliverySatisfiedAt ? 'Agreed delivery satisfied; ' : ''}${r.blocker || 'No known blocker'}. Next: ${r.nextAction}${(r.failures ?? []).filter(f=>f.resolvedAt===null).map(f=>`\n  ${f.id}: ${f.name} ${f.url} — ${f.accounting ? `${f.accounting.scope} follow-up task=${f.accounting.taskId} worker=${f.accounting.worker}` : `unaccounted; author=${r.workers.at(-1) ?? 'unknown'}`}`).join('')}`;
 }
 const terminal = (r: DeliveryRecord) => r.status === 'complete' || r.status === 'explicitly-abandoned';
 function notificationKey(r: DeliveryRecord) {
-  return createHash('sha256').update(JSON.stringify([r.headSha, r.status, r.owner, r.ownerNeeded, r.blocker])).digest('hex');
+  return createHash('sha256').update(JSON.stringify([r.headSha, r.status, r.owner, r.ownerNeeded, r.blocker, (r.failures??[]).filter(f=>f.resolvedAt===null).map(f=>[f.id,f.accounting??null])])).digest('hex');
 }
 function actionable(r: DeliveryRecord) {
   return r.ownerNeeded || ['failing-checks','changes-requested','waiting-review','waiting-native-gates','waiting-approval','ready-to-merge','merged-needs-verification','closed-needs-disposition'].includes(r.status);
@@ -42,6 +47,9 @@ export function createDeliveries(db: Database) {
     CREATE INDEX IF NOT EXISTS deliveries_due ON deliveries(status,due);
     CREATE INDEX IF NOT EXISTS deliveries_owner ON deliveries(owner,project);
     CREATE INDEX IF NOT EXISTS deliveries_project_number ON deliveries(project,json_extract(record,'$.number'))`);
+  // Old PR-only completion recorded artifact delivery, never forge completion.
+  // Reopen observation once, preserving original contracts and author linkage.
+  db.prepare("UPDATE deliveries SET status='pr-delivered',due=0,record=json_set(record,'$.status','pr-delivered','$.deliverySatisfiedAt',json_extract(record,'$.updatedAt'),'$.freshness','stale','$.nextCheckAt',0,'$.nextAction','Observe PR health; original PR-only contract stays satisfied') WHERE status='complete' AND json_extract(record,'$.requirement')='pr' AND json_extract(record,'$.forgeState') IS NULL AND json_extract(record,'$.mergeCommitSha') IS NULL").run();
   function get(id: string): DeliveryRecord | undefined {
     const row = db.prepare('SELECT record FROM deliveries WHERE id=?').get(id) as { record: string } | undefined;
     return row ? JSON.parse(row.record) : undefined;
@@ -92,14 +100,23 @@ export function createDeliveries(db: Database) {
       freshness:'stale', error:null, errors:0, ownerNeeded:input.owner === null, verifiedCommitSha:null, disposition:null,
       notification:{ desired:null, delivered:null, queued:null, retryAt:0 }, actionDueAt:Date.now()+86_400_000, updatedAt:Date.now() });
   }
-  function observe(id: string, o: ForgeObservation, mergeAuthorized: boolean, now = Date.now()) {
+  function observe(id: string, o: ForgeObservation, mergeAuthorized: boolean, now = Date.now(), unverifiedStanding=false) {
     const prior = get(id); if (!prior) throw new Error('Unknown deliverable');
     if (terminal(prior)) return prior;
     const changedHead = prior.headSha !== o.headSha;
     let r: DeliveryRecord = { ...prior, headSha:o.headSha, mergeCommitSha:o.mergeCommitSha,verifiedCommitSha:changedHead ? null : prior.verifiedCommitSha,
-      observedAt:now, freshness:'fresh', error:null, errors:0, updatedAt:now, nextCheckAt:now+60_000 };
+      forgeState:o.state, observedAt:now, freshness:'fresh', error:null, errors:0, updatedAt:now, nextCheckAt:now+60_000 };
+    const currentFailures=o.failedChecks ?? (o.checks==='failing' ? [{id:'unknown-check',name:'Unidentified failing check; inspect forge',url:r.url}] : []);
+    const failures=changedHead ? [] : (prior.failures ?? []);
+    r.failures=failures.map(f=>({...f,resolvedAt:o.checks==='passing' ? (f.resolvedAt ?? now) : f.resolvedAt}));
+    for (const failure of currentFailures) {
+      const old=r.failures.find(f=>f.id===failure.id);
+      if (old) old.resolvedAt=null;
+      else r.failures.push({...failure,headSha:o.headSha,resolvedAt:null});
+    }
     if (o.state === 'merged') {
       r.status = r.requirement === 'merged-and-verified' && (r.verifiedCommitSha !== o.mergeCommitSha || r.mergeCommitSha === null) ? 'merged-needs-verification' : 'complete';
+      if (r.status==='complete') r.deliverySatisfiedAt=prior.deliverySatisfiedAt ?? now;
       r.blocker = r.status === 'complete' ? '' : r.mergeCommitSha ? 'Required verification has not been recorded' : 'Merged commit is not yet readable';
       r.nextAction = r.status === 'complete' ? 'Delivery contract satisfied' : r.mergeCommitSha ? `Run agreed verification on merged commit ${r.mergeCommitSha} and record its evidence` : 'Observe the merged commit before recording verification';
     } else if (o.state === 'closed') {
@@ -120,15 +137,26 @@ export function createDeliveries(db: Database) {
       r.status=mergeAuthorized ? 'ready-to-merge' : 'waiting-approval';
       r.blocker=mergeAuthorized ? '' : 'Merge approval is required'; r.nextAction=mergeAuthorized ? 'Use native guarded merge; preserve the agreed review and validation path' : 'Request merge approval through the existing decision mechanism';
     }
+    if (unverifiedStanding && r.status==='waiting-approval') {
+      r.status='waiting-native-gates';r.blocker='Standing yolo recorded; captain approval provenance is unverified';
+      r.nextAction='Resolve recorded captain approval under native precedence. Already-approved green in-scope work needs no fresh merge request; an unexplained registry flag alone proves no approval. Preserve actual user holds, then use native guarded merge.';
+    }
     if (r.requirement === 'pr' && o.state === 'open' && !o.draft) {
-      r.status='complete'; r.blocker=''; r.nextAction='Agreed PR-only delivery satisfied';
+      r.deliverySatisfiedAt=prior.deliverySatisfiedAt ?? now;
+      // Artifact delivery is fulfilled independently of CI and review health.
+      if (o.checks==='failing' || o.review==='changes-requested') {
+        r.nextAction='Inspect every independent failure. Reuse the author for branch-specific fixes; record baseline evidence and an existing authorized follow-up task separately. No merge authority is added.';
+      } else {
+        r.status='pr-delivered'; r.blocker=o.checks==='passing' ? '' : 'PR delivered; checks pending or unknown';
+        r.nextAction='Observe PR health; PR-only delivery does not require merge';
+      }
     }
     if (r.status !== prior.status || changedHead) r.actionDueAt=now+86_400_000;
     r.notification={...prior.notification};
-    if (actionable(r) || (r.status === 'complete' && prior.status !== 'complete')) r.notification.desired=notificationKey(r);
+    if (actionable(r) || (r.deliverySatisfiedAt && !prior.deliverySatisfiedAt) || (r.status === 'complete' && prior.status !== 'complete')) r.notification.desired=notificationKey(r);
     if (!terminal(r)) {
-      if (now >= r.actionDueAt) r.notification.desired=`overdue:${notificationKey(r)}:${r.actionDueAt}`;
-      else if (!actionable(r)) r.notification.desired=null;
+      if (now >= r.actionDueAt && r.status!=='pr-delivered') r.notification.desired=`overdue:${notificationKey(r)}:${r.actionDueAt}`;
+      else if (!actionable(r) && !(r.deliverySatisfiedAt && !prior.deliverySatisfiedAt)) r.notification.desired=r.status==='pr-delivered' && prior.status==='pr-delivered' && !changedHead && prior.notification.desired!==prior.notification.delivered ? prior.notification.desired : null;
     }
     if (r.notification.desired !== prior.notification.desired) r.notification.attempted=null;
     return save(r);
@@ -155,6 +183,14 @@ export function createDeliveries(db: Database) {
       .run(to,now,to,now,to,from,projectId,...(taskId === undefined ? [] : [taskId]),...excludedTasks).changes;
   }
 
+  function accountFailure(id:string, actor:string, failureId:string, scope:'author'|'baseline', taskId:string, worker:string, evidence:string) {
+    const r=get(id);if (!r || r.owner!==actor || !evidence.trim() || !taskId || !worker) throw new Error('Failure accounting requires owner, exact follow-up identity and evidence');
+    const failure=r.failures?.find(f=>f.id===failureId && f.resolvedAt===null);
+    if (!failure) throw new Error('Unknown current failing check; reconcile first');
+    if (scope==='author' && (taskId!==r.taskId || !r.workers.includes(worker))) throw new Error('Branch-specific follow-up must reuse the recorded author');
+    failure.accounting={scope,taskId,worker,evidence,actor,at:Date.now()};
+    return save({...r,updatedAt:Date.now()});
+  }
   function abandon(id:string, actor:string, reason:string) {
     const r=get(id); if (!r || r.owner !== actor) throw new Error('Only the owning manager can record authorized abandonment');
     if (!reason.trim()) throw new Error('Abandonment requires a reason and explicit authority');
@@ -198,7 +234,7 @@ export function createDeliveries(db: Database) {
       const latest=get(id)!; if (latest.owner !== r.owner || latest.notification.desired !== signature || latest.ownerNeeded) return false; latest.notification.retryAt=now+60_000; save(latest); return false;
     }
   }
-  return { get,save,list,conflict,hasOwned,taskRecord,register,observe,stale,assign,ownerLost,transferOwner,abandon,verify,markQueued,notify,pendingNotifications };
+  return { get,save,list,conflict,hasOwned,taskRecord,register,observe,stale,assign,ownerLost,transferOwner,accountFailure,abandon,verify,markQueued,notify,pendingNotifications };
 }
 
 /** Parse forge data conservatively. A successful lookup with unknown fields
@@ -214,6 +250,10 @@ export function parseForge(value: unknown): ForgeObservation {
   const approvals=Array.isArray(r.reviews) ? (r.reviews as Record<string,unknown>[]).filter(review=>review.state === 'APPROVED' && (review.commit as Record<string,unknown>|undefined)?.oid === r.headRefOid) : [];
   const approved=r.reviewDecision === 'APPROVED' && approvals.length>0;
   return { mergeCommitSha:typeof (r.mergeCommit as Record<string,unknown>|undefined)?.oid === 'string' ? (r.mergeCommit as {oid:string}).oid : null,reviewHeadSha:approved ? r.headRefOid : null,headSha:r.headRefOid,state:String(r.state).toLowerCase() as ForgeObservation['state'], draft:r.isDraft === true,
+    failedChecks:(checks??[]).filter(c=>failing.includes(String(c.conclusion ?? c.state))).map(c=>{
+      const name=String(c.name ?? c.context ?? 'Unidentified check'),url=String(c.detailsUrl ?? c.targetUrl ?? '');
+      return {id:createHash('sha256').update(JSON.stringify([name,url])).digest('hex').slice(0,24),name,url};
+    }),
     checks:checkState, review:approved ? 'approved' : r.reviewDecision === 'CHANGES_REQUESTED' ? 'changes-requested' : r.reviewDecision === 'REVIEW_REQUIRED' ? 'required' : 'unknown',
     mergeable:r.mergeable === 'MERGEABLE' ? 'mergeable' : r.mergeable === 'CONFLICTING' ? 'conflicting' : 'unknown' };
 }

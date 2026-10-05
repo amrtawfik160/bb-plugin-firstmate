@@ -57,8 +57,8 @@ import { LEFTOVER_TIMER_CONTRACT, WAITING_PROTOCOL, latestStatus, statusProtocol
 import { UPSTREAM_SCRIPT_NAMES, PINNED_SCRIPT_SUPPORT_FILES, UPSTREAM_SKILL_NAMES } from "./lib/upstream-surface.ts";
 import { FIRSTMATE_ROUTINE_MARKER } from "./lib/timeline-noise.ts";
 
-const CAPTAIN_TEST_SKILLS = ["captain", "firstmate", "calm", "catch-up", "captain-methods", ...UPSTREAM_SKILL_NAMES] as const;
-const SKILLS = [...CAPTAIN_TEST_SKILLS, "worker-methods"] as const;
+const CAPTAIN_TEST_SKILLS = ["captain", "firstmate"] as const;
+const SKILLS = [...new Set([...CAPTAIN_TEST_SKILLS, ...UPSTREAM_SKILL_NAMES])] as const;
 
 // No fixture sends bytes on the host shell's stdin; native input is explicitly
 // staged/redirection-owned by the command. Node's default socket-backed stdin
@@ -127,7 +127,7 @@ test("crews get no dispatch tools", async () => {
       makePluginAgentConfigurationContext({ pluginMetadata: { crew: "true" } }),
     );
     assert.deepEqual(cfg.tools.map((t) => t.name), []);
-    assert.deepEqual(cfg.skills, ["worker-methods"]);
+    assert.deepEqual(cfg.skills, []);
     assert.match(cfg.instructions ?? "", /native launch brief/);
     assert.match(cfg.instructions ?? "", /exact-ID steering inbox/);
     assert.doesNotMatch(cfg.instructions ?? "", /browser_script|systemd-run|data\/<task-id>\//, "rendered launch brief is the single policy owner");
@@ -145,7 +145,7 @@ test("unmarked threads still get firstmate_deck so /captain can take the deck", 
     const names = cfg.tools.map((t) => t.name);
     assert.ok(names.includes("firstmate_deck"));
     assert.deepEqual(names.sort(), ["firstmate_contract", "firstmate_deck"]);
-    assert.deepEqual(cfg.skills, ["firstmate", "captain", "calm", "catch-up", "harness-adapters"]);
+    assert.deepEqual(cfg.skills, ["firstmate", "captain"]);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -158,8 +158,8 @@ test("captain metadata loads the full skill set", async () => {
       makePluginAgentConfigurationContext({ pluginMetadata: { captain: "true" } }),
     );
     assert.ok(cfg.skills.includes("captain"));
-    assert.ok(cfg.skills.includes("afk"));
-    assert.deepEqual([...cfg.skills].sort(), [...CAPTAIN_TEST_SKILLS].sort(), "captain must receive every bundled upstream skill and its role methods");
+    assert.ok(cfg.tools.some(t=>t.name==="firstmate_skill"));
+    assert.deepEqual([...cfg.skills].sort(), [...CAPTAIN_TEST_SKILLS].sort(), "captain must receive only bootstrap/transport skills; native policy reads are selected per home");
     assert.ok(cfg.tools.some((tool) => tool.name === "firstmate_wake"));
     assert.ok(cfg.tools.some((tool) => tool.name === "firstmate_toolchain"));
     assert.match(cfg.instructions ?? "", /firstmate_toolchain/);
@@ -179,33 +179,17 @@ test("captain metadata loads the full skill set", async () => {
   }
 });
 
-test("calm reporting survives captain resume, ships for cold startup, and stays out of workers", async () => {
-  const host = await load();
-  try {
-    for (const nativeHome of [undefined, "/tmp/resumed-captain"]) {
-      const cfg = await host.harness.behavior.resolveAgentConfiguration(
-        makePluginAgentConfigurationContext({ pluginMetadata: { captain: "true", ...(nativeHome ? { nativeHome } : {}) } }),
-      );
-      assert.ok(cfg.skills.includes("calm"));
-      assert.ok(cfg.skills.includes("catch-up"));
-      assert.match(cfg.instructions ?? "", /Calm reporting is the captain default/);
-      assert.match(cfg.instructions ?? "", /keep required outcomes and escalations visible/);
-      assert.ok((cfg.instructions ?? "").length <= 4096);
+test("default reporting has no BB method layer across cold startup, resume and crew roles", async () => {
+  const host=await load();try {
+    for (const pluginMetadata of [{},{captain:"true"},{captain:"true",nativeHome:"/owned"},{crew:"true",captain:"true"}]) {
+      const cfg=await host.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({pluginMetadata}));
+      assert.ok(!cfg.skills.some(name=>["calm","catch-up","captain-methods","worker-methods"].includes(name)));
+      assert.doesNotMatch(cfg.instructions??"",/Calm reporting|report editor|Read.*methods/);
+      assert.ok((cfg.instructions??"").length<=4096);
     }
-    for (const pluginMetadata of [{}, { crew: "true", captain: "true" }]) {
-      const cfg = await host.harness.behavior.resolveAgentConfiguration(
-        makePluginAgentConfigurationContext({ pluginMetadata }),
-      );
-      const isWorker = "crew" in pluginMetadata;
-      assert.equal(cfg.skills.includes("calm"), !isWorker);
-      assert.equal(cfg.skills.includes("catch-up"), !isWorker);
-      assert.doesNotMatch(cfg.instructions ?? "", /Calm reporting is the captain default/);
-    }
-    assert.equal(host.harness.sdk.callsTo("threads.send").length, 0);
-    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
-  } finally {
-    await host.harness.lifecycle.dispose();
-  }
+    assert.equal(host.harness.sdk.callsTo("threads.send").length,0);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length,0);
+  } finally {await host.harness.lifecycle.dispose();}
 });
 
 test("complete upstream script surface is pinned and drift is reported", () => {
@@ -609,7 +593,7 @@ test("dispatch with fmHome writes state meta and forget drops it", async () => {
     assert.match(writeCmd, /project=\/repo/);
     assert.match(writeCmd, /backend=bb/);
     assert.match(writeCmd, /kind=ship/);
-    assert.match(writeCmd, /mode=direct-PR/);
+    assert.match(writeCmd, /mode=no-mistakes/);
     assert.match(writeCmd, /yolo=off/);
     assert.ok(writeCmd.includes("/tmp/fm-home/state"));
 
@@ -3266,8 +3250,9 @@ test("an active BB crew classifies busy through the mirror (native herdr-only ve
     const busy = classify(join(home, "bin-bb"), "active");
     assert.equal(busy.status, 0, busy.stderr);
     assert.equal(busy.stdout.trim(), "busy bb-native");
-    // An idle thread is still not proof of idle turn state: unknown, never busy.
-    assert.equal(classify(join(home, "bin-bb"), "idle").stdout.trim(), "unknown missing");
+    // BB core status covers the entire turn, including tools. Idle permits the
+    // native status/DoD reader; it is not itself task completion.
+    assert.equal(classify(join(home, "bin-bb"), "idle").stdout.trim(), "idle bb-native");
     // Control: the pristine native lib (herdr-only) cannot see the busy BB crew.
     assert.equal(classify(join(home, "bin"), "active").stdout.trim(), "unknown missing");
   });
@@ -3436,7 +3421,7 @@ test("dispatch scaffolds the real structured brief via fm-brief when real mode i
     const brief = hostCommands.find((c) => c.includes("fm-brief.sh"));
     assert.ok(brief, `no fm-brief scaffold in ${hostCommands.join("\n---\n")}`);
     assert.match(brief, /--mode/);
-    assert.match(brief, /direct-PR/);
+    assert.match(brief, /no-mistakes/);
     assert.match(brief, /\{TASK\}/); // the python fill targets the placeholder
   } finally {
     await host.harness.lifecycle.dispose();
@@ -4674,9 +4659,10 @@ test("captain sessions get the version-pinned real skills inventory", async () =
     const cfg = await host.harness.behavior.resolveAgentConfiguration(
       makePluginAgentConfigurationContext({ pluginMetadata: { captain: "true" } }),
     );
-    assert.match(cfg.instructions ?? "", /Real firstmate skills \(fmHome\/\.agents\/skills @ abc123456789/);
-    assert.match(cfg.instructions ?? "", /- stow: tiered memory/);
-    assert.match(cfg.instructions ?? "", /- afk: away mandate/);
+    assert.doesNotMatch(cfg.instructions ?? "", /Real firstmate skills/);
+    assert.doesNotMatch(cfg.instructions ?? "", /- stow: tiered memory/);
+    assert.doesNotMatch(cfg.instructions ?? "", /- afk: away mandate/);
+    assert.match(cfg.instructions ?? "", /firstmate_skill/);
     // Crews get neither native captain inventory nor captain memory.
     const crew = await host.harness.behavior.resolveAgentConfiguration(
       makePluginAgentConfigurationContext({ pluginMetadata: { crew: "true" } }),
@@ -5289,7 +5275,7 @@ test("D4 captain instructions: inject stored memory (prefs + learnings); crews g
     assert.match(instr, /MEMPREF ships terse/, "captain prefs must be injected into a fresh captain session");
     assert.match(instr, /MEMLEARN flaky tests/, "recent learnings must be injected");
     // Budget: even with an oversized contract, memory AND skills survive (not first-come-scissored).
-    assert.match(instr, /- stow: tiered memory/, "skills manifest must survive the budget alongside memory");
+    assert.doesNotMatch(instr, /- stow: tiered memory/, "a global manifest must not inject another home’s policy");
     assert.ok(instr.length <= 4096, `captain instructions must stay within the 4096 budget (was ${instr.length})`);
     const crew = await host.harness.behavior.resolveAgentConfiguration(
       makePluginAgentConfigurationContext({ pluginMetadata: { crew: "true" } }),
@@ -7399,6 +7385,13 @@ test("native captain contract tool returns the entire source beyond the SDK inst
   await host.bb.storage.kv.set("native-home-host:thr_cap", "host_1");
   try {
     const content = "# Firstmate\n" + "supervision policy\n".repeat(5000) + "END_OF_NATIVE_CONTRACT";
+    // This unit isolates the complete SDK transport; real dual-pin tests verify
+    // catalog production from tracked native bytes through the staged helper.
+    stubRoutedHost(host, command => ({payload: command.includes('FM_HOST_CAPTURE_V1') ? JSON.stringify({
+      commit:'1f3e769616fdf9f31f85f4c3e6a9f71606634238',root:'/tmp/fm-home',
+      contractSha256:createHash('sha256').update(content).digest('hex'),
+      entries:[{path:'.agents/skills/fixture/SKILL.md',sha256:'fixture',frontmatter:'name: fixture\ndescription: A fixture trigger'}],
+    }) : ''}));
     host.harness.sdk.stub("files.read", async () => ({
       content, contentEncoding: "utf8", sizeBytes: Buffer.byteLength(content), path: "/tmp/fm-home/AGENTS.md", sha256: "fixture",
     }));
@@ -7410,6 +7403,7 @@ test("native captain contract tool returns the entire source beyond the SDK inst
     assert.equal(typeof result, "string");
     assert.ok((result as string).startsWith(content), "full native text must survive transport and instruction budgets");
     assert.match(result as string, /BB runtime adaptations/);
+    assert.match(result as string, /description: A fixture trigger/);
   } finally { await host.harness.lifecycle.dispose(); }
 });
 
@@ -8775,10 +8769,10 @@ function captainAndCrewThreads(host: Awaited<ReturnType<typeof load>>, captain: 
 
 test("no-op wakes end silently: the escalation skill no longer asks for 'Captain, shipshape.'", () => {
   const rendered = (path: string) => readFileSync(join(dirname(fileURLToPath(import.meta.url)), path), "utf8").replace(/<!--[\s\S]*?-->/g, "");
-  const escalation = rendered("skills/captain/references/escalation.md");
+  const escalation = rendered("entry-skills/captain/references/escalation.md");
   assert.doesNotMatch(escalation, /Reply exactly `Captain, shipshape\.`/, "the skill must not tell captains to answer a no-op wake");
   assert.match(escalation, /ends the turn with no reply text/);
-  const captain = rendered("skills/captain/SKILL.md");
+  const captain = rendered("entry-skills/captain/SKILL.md");
   assert.match(captain, /complete upstream supervisor contract, verbatim/);
   assert.doesNotMatch(captain, /Reply exactly `Captain, shipshape\.`/);
 });

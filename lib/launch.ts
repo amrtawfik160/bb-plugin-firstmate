@@ -6,7 +6,7 @@ export interface LaunchRecord {
   key: string; taskId: string; projectId: string; owner: string; home: string;
   generation: number; shape: string; state: LaunchState; threadId: string | null;
   replacement?:ReplacementContract;
-  nativeInvoked?: boolean; deliveryMode?: string; deliveryRequirement?: 'pr' | 'merged' | 'merged-and-verified';
+  yolo?:boolean; nativeInvoked?: boolean; deliveryMode?: string; deliveryRequirement?: 'pr' | 'merged' | 'merged-and-verified';
   hostId?: string; path?: string; error?: string; updatedAt: number;
   execution?: { providerId: string | null; model: string | null; reasoningLevel: string | null };
   adoption?: { threadId:string; environmentId:string; worktree:string; proof:string; briefSha:string; promptSha:string; createdAt:number; originalUpdatedAt:number; originalError?:string; execution?:{model:string;reasoningLevel:string;permissionMode:string}; phase:'publishing'|'complete' };
