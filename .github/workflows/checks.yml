@@ -23,6 +23,13 @@ jobs:
       - run: npx tsc --noEmit
       - name: probe
         run: |
+          native="$RUNNER_TEMP/firstmate-native"
+          git init -q "$native"
+          git -C "$native" remote add origin https://github.com/kunchenguid/firstmate.git
+          git -C "$native" fetch -q --depth=1 origin "$(cat overlay/patch-base.txt)"
+          git -C "$native" checkout -q --detach FETCH_HEAD
+          python3 overlay/install-bb-backend.py --home "$native"
+          export FM_TEST_HOME="$native" FM_CLASSIFY_LIB="$native/bin/fm-classify-lib.sh"
           for f in $(node -p "require('./package.json').scripts.test.split(/\s+/).filter(t=>/\.test\.(ts|mjs)$/.test(t)).join(' ')"); do
             if node --test --experimental-strip-types $f >/tmp/o.log 2>&1; then echo "PASS $f $(grep -E '^ℹ skipped' /tmp/o.log)"; else echo "FAIL $f"; fi
           done
