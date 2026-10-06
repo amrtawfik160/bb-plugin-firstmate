@@ -1,0 +1,14 @@
+PASS: removing completed provider activity fails completed worker tools prevent
+PASS: removing report-only specification fails report-only dispatch fills
+PASS: removing recorded startup instruction fails worker renderer preserves task
+PASS: removing installed checkpoint integrity fails full installer ships
+PASS: removing required project reads fails setup requires complete
+PASS: removing native delivery mode identity fails cannot substitute a lighter
+PASS: removing doctor setup fails setup executes doctor
+PASS: removing report before completion fails failed progress write
+PASS: removing paired progress report fails report writes native status
+PASS: removing paused before validation fails background validation records paused
+PASS: removing exact wait resolution fails background validation records paused
+PASS: removing native zero-turn validation fails native zero-turn waiting
+PASS: removing interrupted unit detection fails unit that ends without
+PASS: removing untracked revision identity fails stale result after untracked

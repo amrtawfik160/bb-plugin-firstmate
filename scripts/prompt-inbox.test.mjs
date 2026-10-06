@@ -19,6 +19,7 @@ for(const pin of pins) test(`native ${pin.slice(0,8)} worker renderer preserves 
    assert.doesNotMatch(output,/data\/<task-id>\/|The move IS the acknowledgement|then mv each|after you act, run it again with --ack/);
    assert.match(output,/--ack 001\.msg \[002\.msg \.\.\.\]/);assert.equal(output.includes('Do not poll or list the inbox while waiting'),f.text.includes('Do not poll or list the inbox while waiting'),'native opt-in/default remains unchanged');
    assert.match(output,/The only writes allowed outside it are/);assert.equal(output.split('Stay inside this worktree; modify nothing outside it.').length-1,1,'only the verbatim task quote remains');assert.ok(output.includes(`${home}/data/${id}/`));assert.ok(output.includes(`${home}/state/${id}.status`));assert.ok(output.includes(`${home}/state/${id}.inbox/handled/`));
+   assert.match(output,/fm-worker-checkpoint\.py.* setup /);assert.match(output,/report <phase>/);if(f.text.includes('Do not poll or list the inbox while waiting')){assert.match(output,/setup [^`]+ --foreground-checks/);assert.match(output,/check-foreground/);assert.doesNotMatch(output,/each call waits up to 30 seconds/);}else{assert.match(output,/each call waits up to 30 seconds/);assert.doesNotMatch(output,/check-foreground/);}assert.match(output,/Register further guides/);
    assert.match(output,/no-mistakes daemon|worktree pool/);assert.match(output,/exact key/);assert.match(output,/fm-fleet-ledger\.sh/);
    if(lab) {
     const contract=f.text.slice(f.text.lastIndexOf('# Herdr isolation - HARD SAFETY CONTRACT'),f.text.indexOf('\n# Setup\n')).trimEnd().replaceAll(`${home}/bin/`,`${home}/bin-bb/`).replace(/(^|[ \n`(])bin\/fm-/g,(_,before)=>`${before}${home}/bin-bb/fm-`);
@@ -123,7 +124,7 @@ test('full installer ships the renderer/helper and verification detects missing 
   ok(run('python3',[join(overlay,'install-bb-backend.py'),'--home',home]));
   const verify=()=>run('python3',[join(overlay,'install-bb-backend.py'),'--home',home,'--verify']);ok(verify());
   ok(run('bash',['-c','. "$1"; declare -F fm_backend_bb_worker_prompt >/dev/null','fixture',join(home,'bin-bb/backends/bb.sh')],{FM_HOME:home}));
-  for(const file of ['backends/bb-worker-prompt.py','fm-inbox-take.py']) {
+  for(const file of ['backends/bb-worker-prompt.py','fm-inbox-take.py','fm-worker-checkpoint.py']) {
    const path=join(home,'bin-bb',file),original=readFileSync(path);writeFileSync(path,'stale payload\n');assert.notEqual(verify().status,0);writeFileSync(path,original);
    rmSync(path);assert.notEqual(verify().status,0);writeFileSync(path,original);
   }

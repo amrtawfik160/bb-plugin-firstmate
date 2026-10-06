@@ -34,6 +34,10 @@ def paths(scaffold, home, bindir):
     return scaffold
 
 
+def command_env_placeholder(home, bindir):
+    return f'FM_HOME={shlex.quote(home)} FM_ROOT_OVERRIDE={shlex.quote(str(Path(bindir).parent))} FM_BACKEND=bb'
+
+
 def render(brief, kind, task_id, home, bindir, role, transport, mode=''):
     require(kind in WRITES, 'only ship/scout worker roles are supported')
     require(re.fullmatch(r'[A-Za-z0-9._-]{1,100}', task_id) and task_id not in ('.', '..'), 'invalid task identity')
@@ -134,6 +138,22 @@ def render(brief, kind, task_id, home, bindir, role, transport, mode=''):
         matches = re.findall(r'^Delivery contract: mode=(\S+)', completion, re.M)
         require(len(matches) == 1 and matches[0] in ('direct-PR', 'no-mistakes', 'local-only'), 'unknown native delivery mode')
         require(not mode or matches[0] == mode, 'replacement mode conflicts with native delivery contract')
+    checkpoint = f'{command_env_placeholder(home, bindir)} python3 {shlex.quote(bindir + "/fm-worker-checkpoint.py")} {shlex.quote(task_id)}'
+    # Startup owns setup verification once, after the native branch/isolation step.
+    doctor = '2. Run `no-mistakes doctor`; if it reports the repo is not initialized here, run `no-mistakes init`.'
+    if mode == 'no-mistakes' or kind == 'ship' and matches[0] == 'no-mistakes':
+        require(setup.count(doctor) == 1, 'native no-mistakes setup changed')
+        setup = setup.replace(doctor, '', 1)
+    task_mode = 'scout' if kind == 'scout' else matches[0]
+    setup_option = ' --foreground-checks' if tail[1].strip() else ''
+    setup += f'\n<!-- BB-DIVERGE: recorded task setup and project reads. -->\nAfter isolation and branch setup, run `{checkpoint} setup {task_mode}{setup_option}`. In no-mistakes mode this runs doctor and initializes only when doctor reports an uninitialized repository. Read each printed instruction page and follow every continuation. Register further guides required by project instructions with `{checkpoint} require-read <path> [<path> ...]`, then use its printed read commands. Read the project rules and task-specific skills before editing.\n'
+    rules += f'\n<!-- BB-DIVERGE: one task reporting and background-check transport. -->\nAt an actionable phase change or after handling steering, run `{checkpoint} report <phase> "<one-line summary>"`; optionally pipe current findings on stdin. This updates the native status and `{artifact}progress.md` together, preserves notes, and records current worktree/check evidence. The native states, exact-key resolution rules, fleet ledger, and completion gates above remain authoritative. Resolve any manually opened wait or blocker with the native exact-key command before resuming.'
+    if tail[1].strip():
+        rules += f'\nFor long source-stable local checks (tests, typecheck and build), run `{checkpoint} check-foreground "<label>" -- <command> [<argument> ...]` using the largest foreground timeout your harness supports, as the native zero-turn waiting instructions above require. It records the native pause and exact-key resolution, command output and revision receipt without a background unit or status-poll loop.\n'
+    else:
+        rules += f'\nFor a long source-stable local check (tests, typecheck and build), run `{checkpoint} check "<label>" -- <command> [<argument> ...]`. It records paused before launch, runs a durable systemd unit, records the result, and resolves that exact wait key. Run its printed wait command; each call waits up to 30 seconds. Use these bounded waits instead of repeated background-task status calls. A check only covers its recorded command and revision; changed work requires a new check. Use the native paused command above for other external waits.\n'
+    if task_mode == 'no-mistakes':
+        rules += '\nRun the no-mistakes pipeline through its native commands and outcome artifacts below; the checkpoint helper covers source-stable local checks.\n'
     # Preserve all native no-mistakes gate/pipeline instructions inline: they are
     # execution-critical in that mode. Optional visual instructions move as one
     # verbatim reference, reached by a strong conditional pointer before done.
@@ -143,7 +163,7 @@ def render(brief, kind, task_id, home, bindir, role, transport, mode=''):
             references.append('# Native Lavish operational reference\n' + line)
             lines[index] = 'If the deliverable is a visual artifact for captain review, read and follow the Native Lavish operational reference below before reporting done.\n'
     completion = ''.join(lines)
-    command_env = f'FM_HOME={shlex.quote(home)} FM_ROOT_OVERRIDE={shlex.quote(str(Path(bindir).parent))} FM_BACKEND=bb'
+    command_env = command_env_placeholder(home, bindir)
     transport = transport.replace('{FM_COMMAND_ENV}', command_env).replace('{FM_HOME}', home).replace('{FM_BINDIR}', bindir).replace('{TASK_ID}', task_id).replace('{ARTIFACT_DIR}', artifact)
     result = role.rstrip() + '\n\n' + task + '\nWork on your own; do not wait for a human.\n' + paths(herdr, home, bindir)
     result += '\n# BB execution transport\n<!-- BB-DIVERGE: native script invocation and BB archive/background transport only. -->\n' + transport.rstrip() + '\n'

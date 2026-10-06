@@ -1,0 +1,9 @@
+✔ actual guarded receipt transport 1f3e7696 preserves reports and captain isolation across reload (6504.420385ms)
+ℹ tests 838
+ℹ suites 0
+ℹ pass 838
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 174110.398282

@@ -18,12 +18,16 @@
   },
   "renderer": {
     "overlay/bin/backends/bb-worker-prompt.py": {
-      "sha256": "dfe4f1077eb6897c33d0762c7879de5848db693ec1efb1fb79fbeeb5df726ea0",
-      "reason": "Known native scaffold boundaries only: script/browser transport, exact task-owned paths and inbox IDs; retain operational references, task and native completion gates."
+      "sha256": "4deceae8dd856eda11b0610d4fdd00e28ad3e214c3d98142464fcb230d2a1f1b",
+      "reason": "Known native scaffold boundaries only: script/browser transport, exact task-owned paths and inbox IDs; retain operational references, task and native completion gates. Recorded task setup/project reads, paired native status/progress reports and durable unit-bound validation waits; native status/completion authority retained. Preserve selected native zero-turn waiting with foreground checks; no-mistakes pipeline outcomes retain their native owner."
     },
     "overlay/bin/backends/bb-worker-transport.txt": {
       "sha256": "6d450a1fe61c27823c5eff8e991f40dc43507721524be6a13f5e5cf8af2706df",
       "reason": "Known native scaffold boundaries only: script/browser transport, exact task-owned paths and inbox IDs; retain operational references, task and native completion gates."
+    },
+    "overlay/bin/fm-worker-checkpoint.py": {
+      "sha256": "2e65f80930538031c193bf0fd27330838ef6b65abf98b050194986aa4d7bd7f4",
+      "reason": "Exact native task/worktree-owned setup, project read receipts, status append including fleet-ledger notification, progress snapshots, and background-command receipts with revision identity. No merge, completion, or deployment authorization."
     }
   },
   "captainTransport": {
