@@ -1357,7 +1357,7 @@ function summarizePR(value: unknown): string {
 // reference closure available before deck binding, without role methods.
 const CAPTAIN_BOOTSTRAP_SKILLS = ["firstmate", "captain"] as const;
 const CAPTAIN_BOOTSTRAP_TOOLS = ["firstmate_deck", "firstmate_contract"] as const;
-const CAPTAIN_SKILLS = ["captain", "firstmate"] as const;
+const CAPTAIN_SKILLS = ["captain", "firstmate", "skill-routing"] as const;
 const CAPTAIN_TOOLS = [
   "firstmate_dispatch",
   "firstmate_reply",
@@ -1395,7 +1395,7 @@ const CAPTAIN_TOOLS = [
   "firstmate_fm",
 ] as const;
 
-const CAPTAIN_CONTRACT_POINTER = "Before orchestrating, call firstmate_deck (ACP/CLI: bb firstmate deck --json) to bind this thread's native home, then read firstmate_contract without a section (bb firstmate contract) for the complete native supervisor contract and its selected-runtime skill trigger catalog. If the startup digest is absent, run deck's exact command through your agent shell; firstmate_fm script=session-start returns it again. Failed prerequisites, lock refusal or a truncated digest remain unresolved.";
+const CAPTAIN_CONTRACT_POINTER = "Before orchestrating, call firstmate_deck (ACP/CLI: bb firstmate deck --json) to bind this thread's native home, then read firstmate_contract without a section (bb firstmate contract) for the complete native supervisor contract and its selected-runtime skill trigger catalog. If the startup digest is absent, run deck's exact command through your agent shell; firstmate_fm script=session-start returns it again. Failed prerequisites, lock refusal or a truncated digest remain unresolved. Before each dispatch, read the skill-routing skill and name its matched pstack and Matt Pocock skills in the brief.";
 
 const BB_SKILL_RUNTIME_CONTRACT = [
   "BB adapter for every upstream firstmate skill:",
@@ -10603,9 +10603,9 @@ export default async function plugin(bb: BbPluginApi) {
     if (metaFlag(meta, "crew")) {
       return {
         tools: [],
-        skills: [],
+        skills: ["skill-routing"],
         instructions:
-          "The native launch brief owns this worker role, BB transport and task policy. BB crew threads have no captain tools or skills. Follow that brief and its exact-ID steering inbox procedure. Do not delegate or change the selected provider, model, or effort. Worker completion is a handoff, not captain merge or deployment completion.",
+          "The native launch brief owns this worker role, BB transport and task policy. BB crew threads have no captain tools or captain skills. Follow that brief and its exact-ID steering inbox procedure. Read the skill-routing skill and follow the skills it matches to your task, under its Firstmate rules. Do not delegate or change the selected provider, model, or effort. Worker completion is a handoff, not captain merge or deployment completion.",
       };
     }
     const marked = metaFlag(meta, "captain");

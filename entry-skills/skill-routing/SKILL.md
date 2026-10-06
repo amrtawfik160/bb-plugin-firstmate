@@ -1,0 +1,50 @@
+---
+name: skill-routing
+description: "Task-to-skill table for Firstmate supervisors and crewmates. Use before dispatching or starting a bug fix, slowdown, feature, refactor, unclear spec, investigation, review, PR body, or user-facing prose."
+---
+
+# Skill routing
+
+Match the task to every row that fits and follow the named poteto pstack and
+Matt Pocock skills. Read each skill's `SKILL.md` from `~/.agents/skills/<name>/`,
+`~/.claude/skills/<name>/`, or `~/.codex/skills/<name>/`. Many are
+user-invoke-only, so read the file directly. A poteto-mode playbook is
+`poteto-mode/playbooks/<file>` in the same folders. When a named skill is not
+installed, continue without it and say so in your report.
+
+The supervisor names the matched skills in each dispatch brief. A crewmate
+follows the skills its brief names and any row that matches its own work.
+
+| Task | Skills |
+|---|---|
+| Bug, failure, crash, or flaky test | `diagnosing-bugs`; poteto-mode `bug-fix.md`; `tdd` for the regression test |
+| Slowness or perf regression | `diagnosing-bugs`; poteto-mode `perf-issue.md`; `benchmark-checklist` before reporting a number |
+| Feature or behavior change | poteto-mode `feature.md`; `tdd` |
+| Refactor or architecture | poteto-mode `refactoring.md`; `codebase-design`; `improve-codebase-architecture`; the `principle-*` skills the playbook names |
+| Unclear spec or contested design | Supervisor: `grill-with-docs` with the user, then `to-spec` and `to-tickets` for work that spans crews; `interrogate` under the review bound below. Crewmate: report the open question in your result |
+| Investigation of how or why | poteto-mode `investigation.md`; `how` or `why`, single-model |
+| Design question that needs running code | `prototype` |
+| Review or risk | `code-review`; `blast-radius` |
+| PR body | `pr` |
+| Prose for the user | `unslop`; `technical-writing` for docs |
+| Editing a skill or agent instructions | `writing-for-agents` |
+| Stuck or drifting | `zoom-out` |
+
+## Firstmate rules win
+
+Where a routed skill conflicts with Firstmate, follow Firstmate:
+
+- Do every step in your own session. Where a skill spawns a `Task`, a
+  `poteto-agent`, or parallel workers, do that work inline. The supervisor
+  delegates only to crewmates through `firstmate_dispatch`.
+- Run `how`, `why`, `swarm`, and `arena` single-model. Keep the provider, model,
+  and effort you were given; ignore `/setup-pstack` model lines.
+- `interrogate` and any extra reviewer are supervisor-only: scoped crewmate
+  review assignments under existing review authority, with an agreed count bound.
+- Firstmate owns concurrency, merge, delivery, and PR status. Follow the brief's
+  delivery contract in place of poteto-mode's Babysit, Shipping, Autopilot,
+  Orchestrate, Autonomous run, and Opening a PR merge or polling steps.
+- Skip Cursor-only steps: `deslop`, `control-ui`, `control-cli`, `create-skill`,
+  and `pstack-models.mdc`.
+- A crewmate's questions go to the supervisor through the brief's result channel.
+- Load only the skills a matched row names.

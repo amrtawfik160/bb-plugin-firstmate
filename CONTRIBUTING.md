@@ -166,7 +166,15 @@ role configuration, startup instructions, contract appendices or transitive
 pointers. The public SDK's static skill selection does not provide a verified
 user-only opt-in boundary. Native section 9 owns default reporting.
 
-Only the `/captain` and `/firstmate` transport entries are registered. Read native
+`entry-skills/skill-routing/` is the one registered BB-authored exception. It is
+selected for bound captains and crews. It maps a task to the poteto pstack and
+Matt Pocock skills installed on the host. Its "Firstmate rules win" block bounds
+them: no subagents, one model, and Firstmate keeps merge, delivery, and
+concurrency. Edit the table there, not in the methods skills. It is outside the
+native fidelity inventory, and the transport allowlist pins its bytes.
+
+Only the `/captain` and `/firstmate` transport entries and `skill-routing` are
+registered. Read native
 policy through `firstmate_skill` from the exact selected audited runtime, rather
 than expose globally pinned policy skills to captains on another revision.
 `server.native-policy.test.mjs` composes actual captain and worker configuration

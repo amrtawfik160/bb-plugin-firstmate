@@ -24,7 +24,8 @@ Read only the reference for the current task trigger:
 Return the assigned revision, result, observed verification, evidence pointers,
 and uncovered requirements. Missing evidence is a gap. Worker completion is a
 handoff, not captain merge or deployment completion. Use the brief's existing
-result channel. Do not execute raw pstack skills or load their whole corpus.
+result channel. Use pstack and Matt Pocock skills as the `skill-routing` table
+matches them, under its Firstmate rules.
 
 These original BB adaptations draw on
 [pstack at e43c7ee26e0038c6c1fa8380dd34ce86ff94cb2a](https://github.com/cursor/plugins/tree/e43c7ee26e0038c6c1fa8380dd34ce86ff94cb2a/pstack/skills).
