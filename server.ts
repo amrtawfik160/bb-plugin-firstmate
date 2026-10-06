@@ -607,7 +607,9 @@ export const FM_WATCH_LOG_KEEP = 262_144;
 // hours while it follows one, so the keeper runs it in the background and keeps checking its
 // own exit conditions: the pidfile still names it (teardown removes it, a successor
 // overwrites it) and the owner beat is fresh. On exit it stops its re-arm and removes the
-// pidfile only while the pidfile still names it.
+// pidfile only while the pidfile still names it. After its traps are set, every `$(...)`
+// runs inside a `( )` subshell: bash 5.2 drops a trap that fires while the shell itself
+// expands a command substitution, so a TERM to the keeper was sometimes lost.
 export function fmWatchKeeperScript(hostId: string, fmHome: string, interval: number): string {
   const pid = `${fmHome}/${FM_WATCH_KEEPER_PID}`;
   const log = `${fmHome}/state/.bb-watch-arm.log`;
@@ -651,24 +653,24 @@ export function fmWatchKeeperScript(hostId: string, fmHome: string, interval: nu
     "trap 'exit 143' TERM INT HUP",
     // (a) the pidfile still names this process, and (b) the owner beat is fresh (D7 self-exit:
     // the owner stopped refreshing it, so the plugin or its captain is gone).
-    "owned() {",
+    "owned() (",
     '  [ "$(cat "$PID" 2>/dev/null)" = "$$" ] || return 1',
     '  OB=$(cat "$OWNER_BEAT" 2>/dev/null || echo 0); case "$OB" in ""|*[!0-9]*) OB=0 ;; esac',
     '  NOW=$(date +%s)',
     '  if [ "$OB" -eq 0 ] || [ $(( NOW - OB )) -gt "$OWNER_TTL" ]; then return 1; fi',
-    "}",
-    "trim_log() {",
+    ")",
+    "trim_log() (",
     '  SIZE=$(stat -c %s "$LOG" 2>/dev/null || echo 0)',
     '  if [ "$SIZE" -gt "$LOG_MAX" ] && tail -c "$LOG_KEEP" "$LOG" > "$LOG.trim" 2>/dev/null; then cat "$LOG.trim" > "$LOG"; fi',
     '  rm -f "$LOG.trim"',
-    "}",
+    ")",
     "while owned; do",
     "  trim_log",
     // F2 (re-review): the keeper re-arms fm-watch FROM the mirror, so a stale mirror here
     // (missing sibling / drifted copy after an out-of-band ff) would silently degrade
     // supervision. Check on every re-arm and record FM_MIRROR_STALE into the watch log;
     // the supervision poll runs the same guard and reports it. Cheap (~6ms: sed + git rev-parse).
-    `  { ${fmMirrorStaleGuard(fmHome)} ; } >> "$LOG" 2>&1`,
+    `  ( ${fmMirrorStaleGuard(fmHome)} ) >> "$LOG" 2>&1 || exit 1`,
     '  "$ARM" >> "$LOG" 2>&1 &',
     "  ARM_PID=$!",
     '  while kill -0 "$ARM_PID" 2>/dev/null; do',
