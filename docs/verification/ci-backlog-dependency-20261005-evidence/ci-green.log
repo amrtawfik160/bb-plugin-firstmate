@@ -1,0 +1,2013 @@
+
+> bb-plugin-firstmate@0.4.0 test:ci
+> node --experimental-strip-types scripts/ci-check.mjs
+
+{"profile":"clean-ci","testFiles":["lib/policy.test.ts","lib/policy.differential.test.ts","lib/timeline-noise.test.ts","scripts/skill-fidelity.test.ts","lib/bb-activity.test.ts","lib/wake-receipt.test.ts","lib/orphan-decisions.test.ts","scripts/wake-receipt.test.ts","scripts/supervisor-benchmark.test.mjs","lib/native-bearings.test.ts","lib/snapshot-reads.test.ts","lib/fleet-refresh.test.ts","lib/launch-delivery.test.mjs","server.launch-delivery.test.mjs","lib/host-capture.test.mjs","scripts/prompt-inbox.test.mjs","scripts/launch-adoption.test.mjs","server.wake-command-size.test.mjs","lib/queue-store.test.mjs","server.explicit-execution.test.mjs","server.methods.test.mjs","lib/native-runtime.test.mjs","lib/contract-transport.test.mjs","lib/dispatch-intake.test.mjs","scripts/ci-check.test.mjs","scripts/acceptance-preflight.test.mjs"],"environmentOnly":{"server.test.ts":"Full native integration and installed tool CLIs; run npm test on the acceptance host.","scripts/plugin-package-discovery.test.mjs":"Installed official BB server/host package; owned actual loader acceptance.","scripts/captain-startup-native.test.mjs":"Installed no-mistakes/tasks-axi/quota-axi and browser/Lavish CLIs.","scripts/native-runtime.test.mjs":"Native worker/secondmate startup prerequisite CLIs.","scripts/native-compat.test.mjs":"Native secondmate startup prerequisite CLIs.","server.native-policy.test.mjs":"Real native registry/backlog intake uses tasks-axi.","server.native-crew-state.test.mjs":"Native completion gates use installed external CLIs.","server.queue-storage.test.mjs":"Real tasks-axi backlog integration.","server.captain-startup.test.mjs":"Actual native bootstrap prerequisites include no-mistakes.","server.native-runtime.test.mjs":"Actual deck/native bootstrap requires installed no-mistakes."},"liveModelAcceptance":"required separately, never replaced by this profile"}
+TAP version 13
+# Subtest: activity captures real tool progress and excludes watchdog/accounting churn
+ok 1 - activity captures real tool progress and excludes watchdog/accounting churn
+  ---
+  duration_ms: 20.871824
+  type: 'test'
+  ...
+# Subtest: native capture changes for tool work, stays identical on repeated polls, and fails loudly if unavailable
+ok 2 - native capture changes for tool work, stays identical on repeated polls, and fails loudly if unavailable
+  ---
+  duration_ms: 371.643465
+  type: 'test'
+  ...
+# Subtest: a running, queued, or interaction-blocked BB thread has no terminal draft
+ok 3 - a running, queued, or interaction-blocked BB thread has no terminal draft
+  ---
+  duration_ms: 278.940648
+  type: 'test'
+  ...
+# Subtest: native submit distinguishes accepted delivery from queued interaction and malformed receipts
+ok 4 - native submit distinguishes accepted delivery from queued interaction and malformed receipts
+  ---
+  duration_ms: 477.378035
+  type: 'test'
+  ...
+# Subtest: re-ringing a native inbox held by an interaction reuses the accepted queue row
+ok 5 - re-ringing a native inbox held by an interaction reuses the accepted queue row
+  ---
+  duration_ms: 194.92058
+  type: 'test'
+  ...
+# Subtest: open interaction, unavailable host, and a queued turn are not active execution
+ok 6 - open interaction, unavailable host, and a queued turn are not active execution
+  ---
+  duration_ms: 384.875604
+  type: 'test'
+  ...
+# Subtest: BB idle transport evidence rejects incomplete, malformed and foreign activity snapshots
+ok 7 - BB idle transport evidence rejects incomplete, malformed and foreign activity snapshots
+  ---
+  duration_ms: 780.424945
+  type: 'test'
+  ...
+# Subtest: native busy-turn progress uses recorded event time and never the read clock
+ok 8 - native busy-turn progress uses recorded event time and never the read clock
+  ---
+  duration_ms: 296.301034
+  type: 'test'
+  ...
+# Subtest: UTF-8 bounded contract transport is lossless, snapshot-scoped and resumable without mutable read state
+ok 9 - UTF-8 bounded contract transport is lossless, snapshot-scoped and resumable without mutable read state
+  ---
+  duration_ms: 26.948864
+  type: 'test'
+  ...
+# Subtest: local-only delivery is branch readiness, never a PR/merge requirement or authority
+ok 10 - local-only delivery is branch readiness, never a PR/merge requirement or authority
+  ---
+  duration_ms: 1.422353
+  type: 'test'
+  ...
+# Subtest: native resolver off is inert; enabled decisions and configuration errors are never silently mapped or ignored
+ok 11 - native resolver off is inert; enabled decisions and configuration errors are never silently mapped or ignored
+  ---
+  duration_ms: 0.614896
+  type: 'test'
+  ...
+# Subtest: fleet refresh coalesces event bursts and waits for the running read
+ok 12 - fleet refresh coalesces event bursts and waits for the running read
+  ---
+  duration_ms: 2.989124
+  type: 'test'
+  ...
+# Subtest: real PTY progress breaks direct JSON; capture gives complete stdout and separate stderr
+ok 13 - real PTY progress breaks direct JSON; capture gives complete stdout and separate stderr
+  ---
+  duration_ms: 134.901607
+  type: 'test'
+  ...
+# Subtest: capture preserves nonzero command exit and rejects contaminated or incomplete envelopes
+ok 14 - capture preserves nonzero command exit and rejects contaminated or incomplete envelopes
+  ---
+  duration_ms: 58.050781
+  type: 'test'
+  ...
+# Subtest: launch capacity atomically reserves one slot for two concurrent dispatches and same-task retries
+ok 15 - launch capacity atomically reserves one slot for two concurrent dispatches and same-task retries
+  ---
+  duration_ms: 45.234184
+  type: 'test'
+  ...
+# Subtest: creation persists before spawn; a lost response holds its slot across a process restart
+ok 16 - creation persists before spawn; a lost response holds its slot across a process restart
+  ---
+  duration_ms: 191.974402
+  type: 'test'
+  ...
+# Subtest: spawn identity write fault is recoverable and cancellation before create has no side effects
+ok 17 - spawn identity write fault is recoverable and cancellation before create has no side effects
+  ---
+  duration_ms: 70.506199
+  type: 'test'
+  ...
+# Subtest: bounded recovery matches exact metadata and project/manager scope beyond first page
+ok 18 - bounded recovery matches exact metadata and project/manager scope beyond first page
+  ---
+  duration_ms: 4.2487
+  type: 'test'
+  ...
+# Subtest: coherent checkout selection refuses a path on the wrong host and capabilities refuse before launch
+ok 19 - coherent checkout selection refuses a path on the wrong host and capabilities refuse before launch
+  ---
+  duration_ms: 0.421822
+  type: 'test'
+  ...
+# Subtest: PR completion is separate from worker and wake retention, with durable checks/review transitions
+ok 20 - PR completion is separate from worker and wake retention, with durable checks/review transitions
+  ---
+  duration_ms: 134.683676
+  type: 'test'
+  ...
+# Subtest: forge failure is stale last-known state, closed-unmerged requires disposition, abandonment requires owner/reason
+ok 21 - forge failure is stale last-known state, closed-unmerged requires disposition, abandonment requires owner/reason
+  ---
+  duration_ms: 92.548542
+  type: 'test'
+  ...
+# Subtest: handoff/lost manager preserves owner-needed obligation and refuses project/owner takeover
+ok 22 - handoff/lost manager preserves owner-needed obligation and refuses project/owner takeover
+  ---
+  duration_ms: 74.705554
+  type: 'test'
+  ...
+# Subtest: merged verification follows only the agreed contract and validates head plus evidence
+ok 23 - merged verification follows only the agreed contract and validates head plus evidence
+  ---
+  duration_ms: 92.214305
+  type: 'test'
+  ...
+# Subtest: duplicate events and failed notifications survive restart without losing retry or spamming successful delivery
+ok 24 - duplicate events and failed notifications survive restart without losing retry or spamming successful delivery
+  ---
+  duration_ms: 109.560428
+  type: 'test'
+  ...
+# Subtest: notification acceptance/write crash reconciles its identity before repeating an external send
+ok 25 - notification acceptance/write crash reconciles its identity before repeating an external send
+  ---
+  duration_ms: 105.00357
+  type: 'test'
+  ...
+# Subtest: record storage scales beyond one KV value and forge parser never guesses readiness
+ok 26 - record storage scales beyond one KV value and forge parser never guesses readiness
+  ---
+  duration_ms: 6735.036487
+  type: 'test'
+  ...
+# Subtest: cancellation during create retains capacity, captures a late identity and recovers after restart
+ok 27 - cancellation during create retains capacity, captures a late identity and recovers after restart
+  ---
+  duration_ms: 56.158625
+  type: 'test'
+  ...
+# Subtest: recovery detects duplicate launch identities across pages instead of adopting the first
+ok 28 - recovery detects duplicate launch identities across pages instead of adopting the first
+  ---
+  duration_ms: 2.653775
+  type: 'test'
+  ...
+# Subtest: creation deadline retains uncertainty and two overlapping stores cannot duplicate the external call
+ok 29 - creation deadline retains uncertainty and two overlapping stores cannot duplicate the external call
+  ---
+  duration_ms: 54.939961
+  type: 'test'
+  ...
+# Subtest: cancelling a blocked inventory lookup preserves recoverability without waiting for core
+ok 30 - cancelling a blocked inventory lookup preserves recoverability without waiting for core
+  ---
+  duration_ms: 0.436474
+  type: 'test'
+  ...
+# Subtest: current-head and completion notifications cancel obsolete actions and retain one completion notice
+ok 31 - current-head and completion notifications cancel obsolete actions and retain one completion notice
+  ---
+  duration_ms: 58.851319
+  type: 'test'
+  ...
+# Subtest: notification reconciliation and send callbacks cannot overwrite handoff or completed verification
+ok 32 - notification reconciliation and send callbacks cannot overwrite handoff or completed verification
+  ---
+  duration_ms: 87.922079
+  type: 'test'
+  ...
+# Subtest: ownership conflicts beyond the first page and explicit unassigned recovery stay project scoped
+ok 33 - ownership conflicts beyond the first page and explicit unassigned recovery stay project scoped
+  ---
+  duration_ms: 693.073175
+  type: 'test'
+  ...
+# Subtest: reservation write failure precedes all external creation and explicit task IDs are project scoped
+ok 34 - reservation write failure precedes all external creation and explicit task IDs are project scoped
+  ---
+  duration_ms: 23.509074
+  type: 'test'
+  ...
+# Subtest: overdue next action sends one durable reminder after an acknowledged actionable transition
+ok 35 - overdue next action sends one durable reminder after an acknowledged actionable transition
+  ---
+  duration_ms: 57.734431
+  type: 'test'
+  ...
+# Subtest: explicit worker handoff transfers admission accounting while preserving its creation identity
+ok 36 - explicit worker handoff transfers admission accounting while preserving its creation identity
+  ---
+  duration_ms: 33.534206
+  type: 'test'
+  ...
+# Subtest: native review path does not invent external GitHub approval; unknown evidence remains unresolved
+ok 37 - native review path does not invent external GitHub approval; unknown evidence remains unresolved
+  ---
+  duration_ms: 43.09359
+  type: 'test'
+  ...
+# Subtest: native startup workspace handoff creates no model prompt while explicit cd steering is delivered
+ok 38 - native startup workspace handoff creates no model prompt while explicit cd steering is delivered
+  ---
+  duration_ms: 60.050443
+  type: 'test'
+  ...
+# Subtest: deletion before a late spawn identity holds unknown capacity then releases only that exact attempt across restart
+ok 39 - deletion before a late spawn identity holds unknown capacity then releases only that exact attempt across restart
+  ---
+  duration_ms: 51.405898
+  type: 'test'
+  ...
+# Subtest: legacy PR-only completion reopens health observation once and failed completion notice survives unchanged waiting
+ok 40 - legacy PR-only completion reopens health observation once and failed completion notice survives unchanged waiting
+  ---
+  duration_ms: 91.498367
+  type: 'test'
+  ...
+# Subtest: native Bearings retains date reasons, coverage, home warnings and exclusive contribution calls
+ok 41 - native Bearings retains date reasons, coverage, home warnings and exclusive contribution calls
+  ---
+  duration_ms: 3.849211
+  type: 'test'
+  ...
+# Subtest: native Bearings does not claim clear action coverage without native proof
+ok 42 - native Bearings does not claim clear action coverage without native proof
+  ---
+  duration_ms: 0.544147
+  type: 'test'
+  ...
+# Subtest: runtime host transfer uses public host files with checked bytes, explicit host and bounded quoted commands
+ok 43 - runtime host transfer uses public host files with checked bytes, explicit host and bounded quoted commands
+  ---
+  duration_ms: 34.832741
+  type: 'test'
+  ...
+# Subtest: failed/conflicting file staging never invokes publication or selection
+ok 44 - failed/conflicting file staging never invokes publication or selection
+  ---
+  duration_ms: 12.282374
+  type: 'test'
+  ...
+# Subtest: interruption during SDK write settles promptly; late bytes get cleanup and never execute
+ok 45 - interruption during SDK write settles promptly; late bytes get cleanup and never execute
+  ---
+  duration_ms: 15.306842
+  type: 'test'
+  ...
+# Subtest: missing or changed asset bytes refuse before any host operation
+ok 46 - missing or changed asset bytes refuse before any host operation
+  ---
+  duration_ms: 30.095938
+  type: 'test'
+  ...
+# Subtest: runtime shell resolves exact selected release; selection descriptor never supplies executable code or guessed global root
+ok 47 - runtime shell resolves exact selected release; selection descriptor never supplies executable code or guessed global root
+  ---
+  duration_ms: 0.26339
+  type: 'test'
+  ...
+# Subtest: built and source entrypoints resolve only their own shipped package assets
+ok 48 - built and source entrypoints resolve only their own shipped package assets
+  ---
+  duration_ms: 0.187745
+  type: 'test'
+  ...
+# Subtest: stale Lavish sources are the ones whose artifact no longer exists
+ok 49 - stale Lavish sources are the ones whose artifact no longer exists
+  ---
+  duration_ms: 32.837386
+  type: 'test'
+  ...
+# Subtest: differential: empty
+ok 50 - differential: empty
+  ---
+  duration_ms: 151.902535
+  type: 'test'
+  ...
+# Subtest: differential: prose + blank only
+ok 51 - differential: prose + blank only
+  ---
+  duration_ms: 86.487398
+  type: 'test'
+  ...
+# Subtest: differential: single keyed needs-decision
+ok 52 - differential: single keyed needs-decision
+  ---
+  duration_ms: 142.595937
+  type: 'test'
+  ...
+# Subtest: differential: keyed resolved closes it
+ok 53 - differential: keyed resolved closes it
+  ---
+  duration_ms: 136.079278
+  type: 'test'
+  ...
+# Subtest: differential: captain-held closes it
+ok 54 - differential: captain-held closes it
+  ---
+  duration_ms: 124.696451
+  type: 'test'
+  ...
+# Subtest: differential: note-head key + no-colon closer
+ok 55 - differential: note-head key + no-colon closer
+  ---
+  duration_ms: 140.314057
+  type: 'test'
+  ...
+# Subtest: differential: corr token in the verb region
+ok 56 - differential: corr token in the verb region
+  ---
+  duration_ms: 158.761325
+  type: 'test'
+  ...
+# Subtest: differential: reserved key wrong vocab is ignored; own vocab opens
+ok 57 - differential: reserved key wrong vocab is ignored; own vocab opens
+  ---
+  duration_ms: 141.643318
+  type: 'test'
+  ...
+# Subtest: differential: malformed slug is a no-op
+ok 58 - differential: malformed slug is a no-op
+  ---
+  duration_ms: 133.454897
+  type: 'test'
+  ...
+# Subtest: differential: default (bare) key open + close
+ok 59 - differential: default (bare) key open + close
+  ---
+  duration_ms: 158.966025
+  type: 'test'
+  ...
+# Subtest: differential: multiple decisions, most-recently-opened last
+ok 60 - differential: multiple decisions, most-recently-opened last
+  ---
+  duration_ms: 159.723868
+  type: 'test'
+  ...
+# Subtest: differential: re-open same key updates verb/note in place
+ok 61 - differential: re-open same key updates verb/note in place
+  ---
+  duration_ms: 155.043291
+  type: 'test'
+  ...
+# Subtest: differential: terminal done collapses a still-open decision
+ok 62 - differential: terminal done collapses a still-open decision
+  ---
+  duration_ms: 105.268052
+  type: 'test'
+  ...
+# Subtest: differential: terminal failed collapses, then a later decision re-opens
+ok 63 - differential: terminal failed collapses, then a later decision re-opens
+  ---
+  duration_ms: 142.082105
+  type: 'test'
+  ...
+# Subtest: differential: mid-stream done collapses several open decisions
+ok 64 - differential: mid-stream done collapses several open decisions
+  ---
+  duration_ms: 182.273142
+  type: 'test'
+  ...
+# Subtest: differential: done with NO colon does not collapse (declaration guard)
+ok 65 - differential: done with NO colon does not collapse (declaration guard)
+  ---
+  duration_ms: 112.535321
+  type: 'test'
+  ...
+# Subtest: differential: readable time tag with inner colon, note present, collapses
+ok 66 - differential: readable time tag with inner colon, note present, collapses
+  ---
+  duration_ms: 108.386483
+  type: 'test'
+  ...
+# Subtest: differential: readable time tag, no note colon, does not collapse
+ok 67 - differential: readable time tag, no note colon, does not collapse
+  ---
+  duration_ms: 121.975224
+  type: 'test'
+  ...
+# Subtest: differential: readable time tag before a keyed blocked keeps key/note intact
+ok 68 - differential: readable time tag before a keyed blocked keeps key/note intact
+  ---
+  duration_ms: 87.98276
+  type: 'test'
+  ...
+# Subtest: differential: epoch-stamped keyed lines fold normally
+ok 69 - differential: epoch-stamped keyed lines fold normally
+  ---
+  duration_ms: 127.038733
+  type: 'test'
+  ...
+# Subtest: differential: MUT-E: keyed done matching an open decision (no-op under non-collapsing kind)
+ok 70 - differential: MUT-E: keyed done matching an open decision (no-op under non-collapsing kind)
+  ---
+  duration_ms: 106.602631
+  type: 'test'
+  ...
+# Subtest: differential: MUT-E: bare done matching a default decision
+ok 71 - differential: MUT-E: bare done matching a default decision
+  ---
+  duration_ms: 114.388329
+  type: 'test'
+  ...
+# Subtest: differential: MUT-E: keyed failed matching an open blocked
+ok 72 - differential: MUT-E: keyed failed matching an open blocked
+  ---
+  duration_ms: 111.139729
+  type: 'test'
+  ...
+# Subtest: differential: MUT-E: keyed done matching one of several open decisions
+ok 73 - differential: MUT-E: keyed done matching one of several open decisions
+  ---
+  duration_ms: 119.70409
+  type: 'test'
+  ...
+# Subtest: kind resolution: absent meta → unknown
+ok 74 - kind resolution: absent meta → unknown
+  ---
+  duration_ms: 14.29236
+  type: 'test'
+  ...
+# Subtest: kind resolution: empty meta → ship (no kind=)
+ok 75 - kind resolution: empty meta → ship (no kind=)
+  ---
+  duration_ms: 15.243888
+  type: 'test'
+  ...
+# Subtest: kind resolution: no kind= line → ship
+ok 76 - kind resolution: no kind= line → ship
+  ---
+  duration_ms: 13.028529
+  type: 'test'
+  ...
+# Subtest: kind resolution: kind=ship
+ok 77 - kind resolution: kind=ship
+  ---
+  duration_ms: 12.310017
+  type: 'test'
+  ...
+# Subtest: kind resolution: kind=scout
+ok 78 - kind resolution: kind=scout
+  ---
+  duration_ms: 17.065016
+  type: 'test'
+  ...
+# Subtest: kind resolution: kind=secondmate
+ok 79 - kind resolution: kind=secondmate
+  ---
+  duration_ms: 17.852694
+  type: 'test'
+  ...
+# Subtest: kind resolution: unrecognized kind → unknown
+ok 80 - kind resolution: unrecognized kind → unknown
+  ---
+  duration_ms: 15.642293
+  type: 'test'
+  ...
+# Subtest: kind resolution: empty kind value → ship
+ok 81 - kind resolution: empty kind value → ship
+  ---
+  duration_ms: 20.112369
+  type: 'test'
+  ...
+# Subtest: kind resolution: last kind= wins
+ok 82 - kind resolution: last kind= wins
+  ---
+  duration_ms: 28.461464
+  type: 'test'
+  ...
+# Subtest: kind resolution: no trailing newline
+ok 83 - kind resolution: no trailing newline
+  ---
+  duration_ms: 20.572209
+  type: 'test'
+  ...
+# Subtest: kind resolution: CRLF keeps \\r → unknown (native read -r keeps it)
+ok 84 - kind resolution: CRLF keeps \\r → unknown (native read -r keeps it)
+  ---
+  duration_ms: 22.333205
+  type: 'test'
+  ...
+# Subtest: drift guard must run against native (set FM_ALLOW_NO_NATIVE=1 to knowingly skip)
+ok 85 - drift guard must run against native (set FM_ALLOW_NO_NATIVE=1 to knowingly skip)
+  ---
+  duration_ms: 0.26996
+  type: 'test'
+  ...
+# Subtest: toReasoningLevel accepts every pinned SDK reasoning level
+ok 86 - toReasoningLevel accepts every pinned SDK reasoning level
+  ---
+  duration_ms: 2.207767
+  type: 'test'
+  ...
+# Subtest: mergeGate treats zero checks (no_checks) as no failing checks
+ok 87 - mergeGate treats zero checks (no_checks) as no failing checks
+  ---
+  duration_ms: 0.818725
+  type: 'test'
+  ...
+# Subtest: mergeGate lands a green passing PR
+ok 88 - mergeGate lands a green passing PR
+  ---
+  duration_ms: 0.113343
+  type: 'test'
+  ...
+# Subtest: mergeGate refuses pending and unknown checks
+ok 89 - mergeGate refuses pending and unknown checks
+  ---
+  duration_ms: 0.10497
+  type: 'test'
+  ...
+# Subtest: mergeGate refuses a non-open PR and an unmergeable one
+ok 90 - mergeGate refuses a non-open PR and an unmergeable one
+  ---
+  duration_ms: 0.199213
+  type: 'test'
+  ...
+# Subtest: mergeGate refuses failing checks without a waiver
+ok 91 - mergeGate refuses failing checks without a waiver
+  ---
+  duration_ms: 0.175958
+  type: 'test'
+  ...
+# Subtest: mergeGate waives one exact red check when every other check is green
+ok 92 - mergeGate waives one exact red check when every other check is green
+  ---
+  duration_ms: 0.75624
+  type: 'test'
+  ...
+# Subtest: mergeGate refuses when the waiver leaves another red check
+ok 93 - mergeGate refuses when the waiver leaves another red check
+  ---
+  duration_ms: 0.120834
+  type: 'test'
+  ...
+# Subtest: mergeGate refuses a waiver that names no failing check
+ok 94 - mergeGate refuses a waiver that names no failing check
+  ---
+  duration_ms: 0.415692
+  type: 'test'
+  ...
+# Subtest: mergeGate never waives silently: an unreadable red set refuses
+ok 95 - mergeGate never waives silently: an unreadable red set refuses
+  ---
+  duration_ms: 0.472028
+  type: 'test'
+  ...
+# Subtest: capPermission never exceeds parent
+ok 96 - capPermission never exceeds parent
+  ---
+  duration_ms: 0.222137
+  type: 'test'
+  ...
+# Subtest: ship defaults to isolated worktree; shared-env is an override
+ok 97 - ship defaults to isolated worktree; shared-env is an override
+  ---
+  duration_ms: 0.482443
+  type: 'test'
+  ...
+# Subtest: parseOutcome reads DONE/BLOCKED/FAILED
+ok 98 - parseOutcome reads DONE/BLOCKED/FAILED
+  ---
+  duration_ms: 0.300957
+  type: 'test'
+  ...
+# Subtest: hasStatusProtocol matches a leading verdict or a standalone line only
+ok 99 - hasStatusProtocol matches a leading verdict or a standalone line only
+  ---
+  duration_ms: 0.406068
+  type: 'test'
+  ...
+# Subtest: queueGate waits on deps and dates
+ok 100 - queueGate waits on deps and dates
+  ---
+  duration_ms: 0.304773
+  type: 'test'
+  ...
+# Subtest: decisionDue treats open as due and deferred as date-gated
+ok 101 - decisionDue treats open as due and deferred as date-gated
+  ---
+  duration_ms: 0.108384
+  type: 'test'
+  ...
+# Subtest: afk holds idle pings; quiet still surfaces failures
+ok 102 - afk holds idle pings; quiet still surfaces failures
+  ---
+  duration_ms: 0.108145
+  type: 'test'
+  ...
+# Subtest: crew prompt asserts isolation and forbids nested dispatch
+ok 103 - crew prompt asserts isolation and forbids nested dispatch
+  ---
+  duration_ms: 0.196929
+  type: 'test'
+  ...
+# Subtest: looksReadOnly hints scout
+ok 104 - looksReadOnly hints scout
+  ---
+  duration_ms: 0.206004
+  type: 'test'
+  ...
+# Subtest: foldOpenDecisions matches fm-classify-lib: keyed open/close, corr, reserved keys, terminal collapse
+ok 105 - foldOpenDecisions matches fm-classify-lib: keyed open/close, corr, reserved keys, terminal collapse
+  ---
+  duration_ms: 0.588775
+  type: 'test'
+  ...
+# Subtest: a ship/scout terminal done|failed collapses every open decision (fm-classify-lib :700-702)
+ok 106 - a ship/scout terminal done|failed collapses every open decision (fm-classify-lib :700-702)
+  ---
+  duration_ms: 0.211482
+  type: 'test'
+  ...
+# Subtest: a bare resolved closes a bare needs-decision (default key)
+ok 107 - a bare resolved closes a bare needs-decision (default key)
+  ---
+  duration_ms: 0.114804
+  type: 'test'
+  ...
+# Subtest: hasTerminalVerdict requires a declared done or failed line
+ok 108 - hasTerminalVerdict requires a declared done or failed line
+  ---
+  duration_ms: 0.18436
+  type: 'test'
+  ...
+# Subtest: latestStatus returns the last recognized verb, ignoring prose
+ok 109 - latestStatus returns the last recognized verb, ignoring prose
+  ---
+  duration_ms: 0.124539
+  type: 'test'
+  ...
+# Subtest: statusLinesFrom pulls only protocol lines out of chat output
+ok 110 - statusLinesFrom pulls only protocol lines out of chat output
+  ---
+  duration_ms: 0.115094
+  type: 'test'
+  ...
+# Subtest: statusProtocolSummary reports state and open decisions, null when absent
+ok 111 - statusProtocolSummary reports state and open decisions, null when absent
+  ---
+  duration_ms: 0.213686
+  type: 'test'
+  ...
+# Subtest: verdictOf reads the terminal tag from a parsed outcome
+ok 112 - verdictOf reads the terminal tag from a parsed outcome
+  ---
+  duration_ms: 0.097488
+  type: 'test'
+  ...
+# Subtest: idleVerdictPresentation: BLOCKED/FAILED never render as done and never offer deliver
+ok 113 - idleVerdictPresentation: BLOCKED/FAILED never render as done and never offer deliver
+  ---
+  duration_ms: 0.141825
+  type: 'test'
+  ...
+# Subtest: verdictMarker gives a distinct glyph per verdict
+ok 114 - verdictMarker gives a distinct glyph per verdict
+  ---
+  duration_ms: 0.077949
+  type: 'test'
+  ...
+# Subtest: WAITING: is a yield, not a verdict; the first protocol line decides
+ok 115 - WAITING: is a yield, not a verdict; the first protocol line decides
+  ---
+  duration_ms: 0.129407
+  type: 'test'
+  ...
+# Subtest: crews are taught to wait in-turn and yield WAITING:, never a false DONE:
+ok 116 - crews are taught to wait in-turn and yield WAITING:, never a false DONE:
+  ---
+  duration_ms: 0.133493
+  type: 'test'
+  ...
+# Subtest: crews are taught not to leave timers that ping the captain with empty completions
+ok 117 - crews are taught not to leave timers that ping the captain with empty completions
+  ---
+  duration_ms: 0.124378
+  type: 'test'
+  ...
+# Subtest: fan-out cap is configurable past the old hard 10 and stays bounded
+ok 118 - fan-out cap is configurable past the old hard 10 and stays bounded
+  ---
+  duration_ms: 0.117488
+  type: 'test'
+  ...
+# Subtest: Bearings preserves native's four sections, including an empty fleet and pending mate review
+ok 119 - Bearings preserves native's four sections, including an empty fleet and pending mate review
+  ---
+  duration_ms: 0.432627
+  type: 'test'
+  ...
+# Subtest: queue migration is complete, ordered, scoped and transactional; restart/prune cannot resurrect evidence
+ok 120 - queue migration is complete, ordered, scoped and transactional; restart/prune cannot resurrect evidence
+  ---
+  duration_ms: 125.542488
+  type: 'test'
+  ...
+# Subtest: queue refuses not-array legacy data without silent loss or marker
+ok 121 - queue refuses not-array legacy data without silent loss or marker
+  ---
+  duration_ms: 0.762789
+  type: 'test'
+  ...
+# Subtest: queue refuses malformed legacy data without silent loss or marker
+ok 122 - queue refuses malformed legacy data without silent loss or marker
+  ---
+  duration_ms: 1.161136
+  type: 'test'
+  ...
+# Subtest: queue refuses unknown legacy data without silent loss or marker
+ok 123 - queue refuses unknown legacy data without silent loss or marker
+  ---
+  duration_ms: 0.654905
+  type: 'test'
+  ...
+# Subtest: queue refuses duplicate legacy data without silent loss or marker
+ok 124 - queue refuses duplicate legacy data without silent loss or marker
+  ---
+  duration_ms: 0.845566
+  type: 'test'
+  ...
+# Subtest: queue read/write errors stay loud; row mutations and colliding handoff roll back without foreign loss
+ok 125 - queue read/write errors stay loud; row mutations and colliding handoff roll back without foreign loss
+  ---
+  duration_ms: 2.347229
+  type: 'test'
+  ...
+# Subtest: two stores racing migration share one complete snapshot; legacy read failure remains recoverable
+ok 126 - two stores racing migration share one complete snapshot; legacy read failure remains recoverable
+  ---
+  duration_ms: 2.243131
+  type: 'test'
+  ...
+# Subtest: snapshot reads bound concurrency across owners and share the same owner
+ok 127 - snapshot reads bound concurrency across owners and share the same owner
+  ---
+  duration_ms: 6.634217
+  type: 'test'
+  ...
+# Subtest: snapshot cache expires, invalidates and never caches a failed read
+ok 128 - snapshot cache expires, invalidates and never caches a failed read
+  ---
+  duration_ms: 1.063688
+  type: 'test'
+  ...
+# Subtest: invalidation during a snapshot prevents a stale response entering the cache
+ok 129 - invalidation during a snapshot prevents a stale response entering the cache
+  ---
+  duration_ms: 0.334179
+  type: 'test'
+  ...
+# Subtest: disposal rejects queued snapshots without starting their host work
+ok 130 - disposal rejects queued snapshots without starting their host work
+  ---
+  duration_ms: 7.486152
+  type: 'test'
+  ...
+# Subtest: captain timeline hides pending and successful Firstmate tools
+ok 131 - captain timeline hides pending and successful Firstmate tools
+  ---
+  duration_ms: 1.562636
+  type: 'test'
+  ...
+# Subtest: captain timeline keeps failures and unrelated rows
+ok 132 - captain timeline keeps failures and unrelated rows
+  ---
+  duration_ms: 0.384956
+  type: 'test'
+  ...
+# Subtest: captain timeline hides only the firstmate_watch transport failure
+ok 133 - captain timeline hides only the firstmate_watch transport failure
+  ---
+  duration_ms: 0.12421
+  type: 'test'
+  ...
+# Subtest: captain panes hide generic expandable work but keep material states
+ok 134 - captain panes hide generic expandable work but keep material states
+  ---
+  duration_ms: 0.291574
+  type: 'test'
+  ...
+# Subtest: captain timeline hides internal crew wakes, including old visible rows
+ok 135 - captain timeline hides internal crew wakes, including old visible rows
+  ---
+  duration_ms: 0.212013
+  type: 'test'
+  ...
+# Subtest: recognizes BB reasoning labels without matching normal messages
+ok 136 - recognizes BB reasoning labels without matching normal messages
+  ---
+  duration_ms: 0.311024
+  type: 'test'
+  ...
+# Subtest: receipt parsing fails closed on absent, truncated, duplicate or invalid frames
+ok 137 - receipt parsing fails closed on absent, truncated, duplicate or invalid frames
+  ---
+  duration_ms: 2.654495
+  type: 'test'
+  ...
+# Subtest: truncated and handled reports retain their required recovery instruction
+ok 138 - truncated and handled reports retain their required recovery instruction
+  ---
+  duration_ms: 0.403293
+  type: 'test'
+  ...
+# Subtest: receipt rendering gives one acknowledgement instruction and preserves report evidence
+ok 139 - receipt rendering gives one acknowledgement instruction and preserves report evidence
+  ---
+  duration_ms: 0.212935
+  type: 'test'
+  ...
+# Subtest: preflight refuses disabled/stale/wrong-server/wrong-host candidates while keeping runtime selection explicitly unverified
+ok 140 - preflight refuses disabled/stale/wrong-server/wrong-host candidates while keeping runtime selection explicitly unverified
+  ---
+  duration_ms: 23.09905
+  type: 'test'
+  ...
+# Subtest: wrong health identity refuses before any CLI invocation and remote/implicit origins refuse
+ok 141 - wrong health identity refuses before any CLI invocation and remote/implicit origins refuse
+  ---
+  duration_ms: 1.921332
+  type: 'test'
+  ...
+# Subtest: CI coverage accounts every package test file; environment exclusions are explicit and cannot go stale
+ok 142 - CI coverage accounts every package test file; environment exclusions are explicit and cannot go stale
+  ---
+  duration_ms: 3.254779
+  type: 'test'
+  ...
+# Subtest: clean CI resolves the locked native backlog CLI while refusing real BB transport
+ok 143 - clean CI resolves the locked native backlog CLI while refusing real BB transport
+  ---
+  duration_ms: 58.114018
+  type: 'test'
+  ...
+# Subtest: CI has no inherited BB routing, explicit native fixtures and no tolerated skipped assertions
+ok 144 - CI has no inherited BB routing, explicit native fixtures and no tolerated skipped assertions
+  ---
+  duration_ms: 3.129729
+  type: 'test'
+  ...
+# Subtest: real native adoption 2d833ff1 ship/direct-PR: guards publish exact existing endpoint without touching work
+ok 145 - real native adoption 2d833ff1 ship/direct-PR: guards publish exact existing endpoint without touching work
+  ---
+  duration_ms: 2880.1078
+  type: 'test'
+  ...
+# Subtest: real native adoption 2d833ff1 ship/no-mistakes: guards publish exact existing endpoint without touching work
+ok 146 - real native adoption 2d833ff1 ship/no-mistakes: guards publish exact existing endpoint without touching work
+  ---
+  duration_ms: 2475.110322
+  type: 'test'
+  ...
+# Subtest: real native adoption 2d833ff1 ship/local-only: guards publish exact existing endpoint without touching work
+ok 147 - real native adoption 2d833ff1 ship/local-only: guards publish exact existing endpoint without touching work
+  ---
+  duration_ms: 2226.929352
+  type: 'test'
+  ...
+# Subtest: real native adoption 2d833ff1 scout/direct-PR: guards publish exact existing endpoint without touching work
+ok 148 - real native adoption 2d833ff1 scout/direct-PR: guards publish exact existing endpoint without touching work
+  ---
+  duration_ms: 2596.363438
+  type: 'test'
+  ...
+# Subtest: real native adoption 1f3e7696 ship/direct-PR: guards publish exact existing endpoint without touching work
+ok 149 - real native adoption 1f3e7696 ship/direct-PR: guards publish exact existing endpoint without touching work
+  ---
+  duration_ms: 2796.588253
+  type: 'test'
+  ...
+# Subtest: real native adoption 1f3e7696 ship/no-mistakes: guards publish exact existing endpoint without touching work
+ok 150 - real native adoption 1f3e7696 ship/no-mistakes: guards publish exact existing endpoint without touching work
+  ---
+  duration_ms: 3063.990478
+  type: 'test'
+  ...
+# Subtest: real native adoption 1f3e7696 ship/local-only: guards publish exact existing endpoint without touching work
+ok 151 - real native adoption 1f3e7696 ship/local-only: guards publish exact existing endpoint without touching work
+  ---
+  duration_ms: 2290.106238
+  type: 'test'
+  ...
+# Subtest: real native adoption 1f3e7696 scout/direct-PR: guards publish exact existing endpoint without touching work
+ok 152 - real native adoption 1f3e7696 scout/direct-PR: guards publish exact existing endpoint without touching work
+  ---
+  duration_ms: 2245.059126
+  type: 'test'
+  ...
+# Subtest: native immutable branch 2d833ff1: adoption and real review keep source branch despite successor HEAD
+ok 153 - native immutable branch 2d833ff1: adoption and real review keep source branch despite successor HEAD
+  ---
+  duration_ms: 2560.60608
+  type: 'test'
+  ...
+# Subtest: native immutable branch 1f3e7696: adoption and real review keep source branch despite successor HEAD
+ok 154 - native immutable branch 1f3e7696: adoption and real review keep source branch despite successor HEAD
+  ---
+  duration_ms: 3120.542871
+  type: 'test'
+  ...
+# Subtest: native repair refuses changed source, task, repo, primary checkout, metadata collision and retired namespace before registration
+ok 155 - native repair refuses changed source, task, repo, primary checkout, metadata collision and retired namespace before registration
+  ---
+  duration_ms: 7859.790814
+  type: 'test'
+  ...
+# Subtest: actual factory legacy repair 2d833ff1 exact path restores crew visibility, keeps multiple PR obligations and immutable contract after reload
+ok 156 - actual factory legacy repair 2d833ff1 exact path restores crew visibility, keeps multiple PR obligations and immutable contract after reload
+  ---
+  duration_ms: 4765.789229
+  type: 'test'
+  ...
+# Subtest: actual factory legacy repair 2d833ff1 crew restores crew visibility, keeps multiple PR obligations and immutable contract after reload
+ok 157 - actual factory legacy repair 2d833ff1 crew restores crew visibility, keeps multiple PR obligations and immutable contract after reload
+  ---
+  duration_ms: 3795.241737
+  type: 'test'
+  ...
+# Subtest: actual factory legacy repair 1f3e7696 crew restores crew visibility, keeps multiple PR obligations and immutable contract after reload
+ok 158 - actual factory legacy repair 1f3e7696 crew restores crew visibility, keeps multiple PR obligations and immutable contract after reload
+  ---
+  duration_ms: 4849.178942
+  type: 'test'
+  ...
+# Subtest: factory refuses wrong owner/project/host/environment/provenance/metadata/rival/deleted identities without publication
+ok 159 - factory refuses wrong owner/project/host/environment/provenance/metadata/rival/deleted identities without publication
+  ---
+  duration_ms: 16295.576757
+  type: 'test'
+  ...
+# Subtest: actual factory interrupted reservation publication recovers durable exact adoption after reload
+ok 160 - actual factory interrupted reservation publication recovers durable exact adoption after reload
+  ---
+  duration_ms: 3609.930103
+  type: 'test'
+  ...
+# Subtest: actual factory interrupted bb-metadata publication recovers durable exact adoption after reload
+ok 161 - actual factory interrupted bb-metadata publication recovers durable exact adoption after reload
+  ---
+  duration_ms: 6602.861557
+  type: 'test'
+  ...
+# Subtest: actual factory interrupted crew-cache publication recovers durable exact adoption after reload
+ok 162 - actual factory interrupted crew-cache publication recovers durable exact adoption after reload
+  ---
+  duration_ms: 6279.042257
+  type: 'test'
+  ...
+# Subtest: actual factory interrupted completion publication recovers durable exact adoption after reload
+ok 163 - actual factory interrupted completion publication recovers durable exact adoption after reload
+  ---
+  duration_ms: 4245.831069
+  type: 'test'
+  ...
+# Subtest: hung adoption identity read cancels on plugin disposal before any native or worker mutation
+ok 164 - hung adoption identity read cancels on plugin disposal before any native or worker mutation
+  ---
+  duration_ms: 711.103386
+  type: 'test'
+  ...
+# Subtest: native 2d833ff1 backlog pairing and closed-task refusal are authoritative
+ok 165 - native 2d833ff1 backlog pairing and closed-task refusal are authoritative
+  ---
+  duration_ms: 4699.81772
+  type: 'test'
+  ...
+# Subtest: native 1f3e7696 backlog pairing and closed-task refusal are authoritative
+ok 166 - native 1f3e7696 backlog pairing and closed-task refusal are authoritative
+  ---
+  duration_ms: 5440.517005
+  type: 'test'
+  ...
+# Subtest: native 2d833ff1 interrupted metadata/backlog publication retries the same endpoint
+ok 167 - native 2d833ff1 interrupted metadata/backlog publication retries the same endpoint
+  ---
+  duration_ms: 5567.792184
+  type: 'test'
+  ...
+# Subtest: native 1f3e7696 interrupted metadata/backlog publication retries the same endpoint
+ok 168 - native 1f3e7696 interrupted metadata/backlog publication retries the same endpoint
+  ---
+  duration_ms: 5311.49155
+  type: 'test'
+  ...
+# Subtest: native 2d833ff1 worker renderer preserves task and all modes with one adapted policy
+ok 169 - native 2d833ff1 worker renderer preserves task and all modes with one adapted policy
+  ---
+  duration_ms: 3789.22462
+  type: 'test'
+  ...
+# Subtest: native 1f3e7696 worker renderer preserves task and all modes with one adapted policy
+ok 170 - native 1f3e7696 worker renderer preserves task and all modes with one adapted policy
+  ---
+  duration_ms: 3302.779108
+  type: 'test'
+  ...
+# Subtest: renderer rejects changed anchors, contradictory legacy output and wrong native mode before printing any prompt
+ok 171 - renderer rejects changed anchors, contradictory legacy output and wrong native mode before printing any prompt
+  ---
+  duration_ms: 1203.537244
+  type: 'test'
+  ...
+# Subtest: read 001 then arrival 002 acknowledges only 001; exact batches and retries preserve handled evidence
+ok 172 - read 001 then arrival 002 acknowledges only 001; exact batches and retries preserve handled evidence
+  ---
+  duration_ms: 207.684919
+  type: 'test'
+  ...
+# Subtest: exact-ID acknowledgement recovers a crash between handled link and pending unlink
+ok 173 - exact-ID acknowledgement recovers a crash between handled link and pending unlink
+  ---
+  duration_ms: 74.03238
+  type: 'test'
+  ...
+# Subtest: ack rejects traversal, malformed IDs, symlinks, conflicts and mixed unknown batches without moving any pending message
+ok 174 - ack rejects traversal, malformed IDs, symlinks, conflicts and mixed unknown batches without moving any pending message
+  ---
+  duration_ms: 446.357231
+  type: 'test'
+  ...
+# Subtest: FIFO messages in pending and handled namespaces refuse promptly without moving a valid message
+ok 175 - FIFO messages in pending and handled namespaces refuse promptly without moving a valid message
+  ---
+  duration_ms: 119.371645
+  type: 'test'
+  ...
+# Subtest: native 2d833ff1 inbox envelopes decode through Bash without changing body bytes
+ok 176 - native 2d833ff1 inbox envelopes decode through Bash without changing body bytes
+  ---
+  duration_ms: 387.832529
+  type: 'test'
+  ...
+# Subtest: native 1f3e7696 inbox envelopes decode through Bash without changing body bytes
+ok 177 - native 1f3e7696 inbox envelopes decode through Bash without changing body bytes
+  ---
+  duration_ms: 348.355677
+  type: 'test'
+  ...
+# Subtest: full installer ships the renderer/helper and verification detects missing or stale payloads
+ok 178 - full installer ships the renderer/helper and verification detects missing or stale payloads
+  ---
+  duration_ms: 1242.058133
+  type: 'test'
+  ...
+# Subtest: home additions and copied intent remain verbatim; references follow native completion and guards stay inline
+ok 179 - home additions and copied intent remain verbatim; references follow native completion and guards stay inline
+  ---
+  duration_ms: 616.396083
+  type: 'test'
+  ...
+# Subtest: absent inbox is a read no-op; symlinked task/state namespaces cannot be read or acknowledged
+ok 180 - absent inbox is a read no-op; symlinked task/state namespaces cannot be read or acknowledged
+  ---
+  duration_ms: 332.171321
+  type: 'test'
+  ...
+# Subtest: clean tree PASSES (not always-red)
+ok 181 - clean tree PASSES (not always-red)
+  ---
+  duration_ms: 186.314005
+  type: 'test'
+  ...
+# Subtest: captain watch guidance rejects the old blocking agent-tool contract
+ok 182 - captain watch guidance rejects the old blocking agent-tool contract
+  ---
+  duration_ms: 183.480938
+  type: 'test'
+  ...
+# Subtest: captain watch guidance preserves the blocking CLI distinction
+ok 183 - captain watch guidance preserves the blocking CLI distinction
+  ---
+  duration_ms: 20.056864
+  type: 'test'
+  ...
+# Subtest: break 1 — paraphrase a native line outside any fence FAILS
+ok 184 - break 1 — paraphrase a native line outside any fence FAILS
+  ---
+  duration_ms: 92.313055
+  type: 'test'
+  ...
+# Subtest: break 2 — delete a BB-DIVERGE while keeping the divergent text FAILS
+ok 185 - break 2 — delete a BB-DIVERGE while keeping the divergent text FAILS
+  ---
+  duration_ms: 107.260561
+  type: 'test'
+  ...
+# Subtest: break 3 — corrupt a native-quote so it no longer resolves FAILS
+ok 186 - break 3 — corrupt a native-quote so it no longer resolves FAILS
+  ---
+  duration_ms: 140.604297
+  type: 'test'
+  ...
+# Subtest: break 4 — move a divergence outside its fence (keep text) FAILS
+ok 187 - break 4 — move a divergence outside its fence (keep text) FAILS
+  ---
+  duration_ms: 156.679518
+  type: 'test'
+  ...
+# Subtest: break 5a — new unmarked, unfenced BB-only prose FAILS
+ok 188 - break 5a — new unmarked, unfenced BB-only prose FAILS
+  ---
+  duration_ms: 234.516393
+  type: 'test'
+  ...
+# Subtest: break 5b — the reviewer's exact injected sentence CANNOT pass, even fenced with a valid adjacent BB-DIVERGE
+ok 189 - break 5b — the reviewer's exact injected sentence CANNOT pass, even fenced with a valid adjacent BB-DIVERGE
+  ---
+  duration_ms: 131.852711
+  type: 'test'
+  ...
+# Subtest: break 7C — minting a fence by REUSING a valid native-quote FAILS
+ok 190 - break 7C — minting a fence by REUSING a valid native-quote FAILS
+  ---
+  duration_ms: 124.28835
+  type: 'test'
+  ...
+# Subtest: break 7C proliferation — total fenced content is bounded PER SKILL, not per fence
+ok 191 - break 7C proliferation — total fenced content is bounded PER SKILL, not per fence
+  ---
+  duration_ms: 1.879929
+  type: 'test'
+  ...
+# Subtest: fix 3 — an authorising BB-DIVERGE that does not describe its fence FAILS
+ok 192 - fix 3 — an authorising BB-DIVERGE that does not describe its fence FAILS
+  ---
+  duration_ms: 0.603448
+  type: 'test'
+  ...
+# Subtest: 7A (disclosed residue) — a lie welded to a real BB token, fenced properly, still PASSES
+ok 193 - 7A (disclosed residue) — a lie welded to a real BB token, fenced properly, still PASSES
+  ---
+  duration_ms: 124.05086
+  type: 'test'
+  ...
+# Subtest: 7B (disclosed residue) — the same lie split across token-bearing clauses still PASSES
+ok 194 - 7B (disclosed residue) — the same lie split across token-bearing clauses still PASSES
+  ---
+  duration_ms: 147.697793
+  type: 'test'
+  ...
+# Subtest: BB-ONLY fence cannot shelter native-derived content
+ok 195 - BB-ONLY fence cannot shelter native-derived content
+  ---
+  duration_ms: 148.615709
+  type: 'test'
+  ...
+# Subtest: BB-ONLY oversize fence is flagged
+ok 196 - BB-ONLY oversize fence is flagged
+  ---
+  duration_ms: 0.350472
+  type: 'test'
+  ...
+# Subtest: structural check fails a malformed skill
+ok 197 - structural check fails a malformed skill
+  ---
+  duration_ms: 0.264101
+  type: 'test'
+  ...
+# Subtest: every skill carries a BB-SOURCE header pinning native + SHA + snapshot
+ok 198 - every skill carries a BB-SOURCE header pinning native + SHA + snapshot
+  ---
+  duration_ms: 2.906749
+  type: 'test'
+  ...
+# Subtest: normalizer keeps tool underscores but ignores wrapping/bullets/arrows
+ok 199 - normalizer keeps tool underscores but ignores wrapping/bullets/arrows
+  ---
+  duration_ms: 0.132291
+  type: 'test'
+  ...
+# Subtest: sentence splitter drops short structural fragments
+ok 200 - sentence splitter drops short structural fragments
+  ---
+  duration_ms: 0.084079
+  type: 'test'
+  ...
+# Subtest: version alignment rejects stale skill and overlay pins
+ok 201 - version alignment rejects stale skill and overlay pins
+  ---
+  duration_ms: 2.09813
+  type: 'test'
+  ...
+# Subtest: captain bootstrap rejects an independent policy sentence
+ok 202 - captain bootstrap rejects an independent policy sentence
+  ---
+  duration_ms: 138.775397
+  type: 'test'
+  ...
+# Subtest: verbatim ahoy rejects deleted native instructions
+ok 203 - verbatim ahoy rejects deleted native instructions
+  ---
+  duration_ms: 110.529632
+  type: 'test'
+  ...
+# Subtest: verbatim quiet rejects deleted native instructions
+ok 204 - verbatim quiet rejects deleted native instructions
+  ---
+  duration_ms: 109.860865
+  type: 'test'
+  ...
+# Subtest: verbatim stow rejects deleted native instructions
+ok 205 - verbatim stow rejects deleted native instructions
+  ---
+  duration_ms: 119.736079
+  type: 'test'
+  ...
+# Subtest: verbatim bearings rejects deleted native instructions
+ok 206 - verbatim bearings rejects deleted native instructions
+  ---
+  duration_ms: 94.897845
+  type: 'test'
+  ...
+# Subtest: usage counts latest per turn once despite replay and cumulative counter resets
+ok 207 - usage counts latest per turn once despite replay and cumulative counter resets
+  ---
+  duration_ms: 1.011729
+  type: 'test'
+  ...
+# Subtest: mixed useful work is not classified as wake-only; missing usage stays unknown
+ok 208 - mixed useful work is not classified as wake-only; missing usage stays unknown
+  ---
+  duration_ms: 0.2042
+  type: 'test'
+  ...
+# Subtest: shell and file work prevent false wake-only classification
+ok 209 - shell and file work prevent false wake-only classification
+  ---
+  duration_ms: 0.28284
+  type: 'test'
+  ...
+# Subtest: receive and inspect replay the same unconsumed receipt across processes
+ok 210 - receive and inspect replay the same unconsumed receipt across processes
+  ---
+  duration_ms: 214.187826
+  type: 'test'
+  ...
+# Subtest: pairless status presentations remain recoverable until explicit completion
+ok 211 - pairless status presentations remain recoverable until explicit completion
+  ---
+  duration_ms: 311.646744
+  type: 'test'
+  ...
+# Subtest: successful final actions become acknowledgement-only retries
+ok 212 - successful final actions become acknowledgement-only retries
+  ---
+  duration_ms: 647.529537
+  type: 'test'
+  ...
+# Subtest: mark-success survives process restart and receive completes only acknowledgement
+ok 213 - mark-success survives process restart and receive completes only acknowledgement
+  ---
+  duration_ms: 363.283484
+  type: 'test'
+  ...
+# Subtest: begin-action survives a crash and never authorizes blindly repeating the action
+ok 214 - begin-action survives a crash and never authorizes blindly repeating the action
+  ---
+  duration_ms: 395.042302
+  type: 'test'
+  ...
+# Subtest: begin-action followed by mark-success permits acknowledgement-only recovery
+ok 215 - begin-action followed by mark-success permits acknowledgement-only recovery
+  ---
+  duration_ms: 387.674309
+  type: 'test'
+  ...
+# Subtest: uncertain action may be explicitly completed after external-state reconciliation
+ok 216 - uncertain action may be explicitly completed after external-state reconciliation
+  ---
+  duration_ms: 376.008751
+  type: 'test'
+  ...
+# Subtest: wrong receipt and mismatched legacy acknowledgement never invoke native
+ok 217 - wrong receipt and mismatched legacy acknowledgement never invoke native
+  ---
+  duration_ms: 503.336083
+  type: 'test'
+  ...
+# Subtest: wake arriving during handling becomes successor receipt
+ok 218 - wake arriving during handling becomes successor receipt
+  ---
+  duration_ms: 522.174305
+  type: 'test'
+  ...
+# Subtest: status output produced during acknowledgement becomes durable successor
+ok 219 - status output produced during acknowledgement becomes durable successor
+  ---
+  duration_ms: 321.296387
+  type: 'test'
+  ...
+# Subtest: a failed native presentation cannot lose status output already marked read
+ok 220 - a failed native presentation cannot lose status output already marked read
+  ---
+  duration_ms: 255.774836
+  type: 'test'
+  ...
+# Subtest: large Unicode/control reports use a complete bounded JSON frame and full disk report
+ok 221 - large Unicode/control reports use a complete bounded JSON frame and full disk report
+  ---
+  duration_ms: 144.425718
+  type: 'test'
+  ...
+# Subtest: unchanged persistent decisions do not create an endless completion loop
+ok 222 - unchanged persistent decisions do not create an endless completion loop
+  ---
+  duration_ms: 248.060777
+  type: 'test'
+  ...
+# Subtest: open decisions already presented never demand a second receipt, even when crews keep moving the status cursor
+ok 223 - open decisions already presented never demand a second receipt, even when crews keep moving the status cursor
+  ---
+  duration_ms: 356.520981
+  type: 'test'
+  ...
+# Subtest: an open decision that changed or reopened after resolution is presented again
+ok 224 - an open decision that changed or reopened after resolution is presented again
+  ---
+  duration_ms: 636.837011
+  type: 'test'
+  ...
+# Subtest: completing a wake with already presented open decisions needs no second receipt
+ok 225 - completing a wake with already presented open decisions needs no second receipt
+  ---
+  duration_ms: 246.116441
+  type: 'test'
+  ...
+# Subtest: a changed open decision survives completion of an earlier mixed wake
+ok 226 - a changed open decision survives completion of an earlier mixed wake
+  ---
+  duration_ms: 247.830287
+  type: 'test'
+  ...
+# Subtest: empty presentations do not create pending receipts
+ok 227 - empty presentations do not create pending receipts
+  ---
+  duration_ms: 95.540742
+  type: 'test'
+  ...
+# Subtest: native output suggesting an acknowledgement outside authoritative marker is data
+ok 228 - native output suggesting an acknowledgement outside authoritative marker is data
+  ---
+  duration_ms: 231.631749
+  type: 'test'
+  ...
+# Subtest: transport death leaves guardian lock and committed native stdout recoverable
+ok 229 - transport death leaves guardian lock and committed native stdout recoverable
+  ---
+  duration_ms: 529.819611
+  type: 'test'
+  ...
+# Subtest: transport death after acknowledgement does not repeat external handling
+ok 230 - transport death after acknowledgement does not repeat external handling
+  ---
+  duration_ms: 721.356757
+  type: 'test'
+  ...
+# Subtest: a second crash during recovery preserves both original and fresh consumed statuses
+ok 231 - a second crash during recovery preserves both original and fresh consumed statuses
+  ---
+  duration_ms: 622.198605
+  type: 'test'
+  ...
+# Subtest: failed fresh presentation after ack retains new consumed status without repeating ack
+ok 232 - failed fresh presentation after ack retains new consumed status without repeating ack
+  ---
+  duration_ms: 340.748292
+  type: 'test'
+  ...
+# Subtest: concurrent receive processes present one receipt and invoke native once
+ok 233 - concurrent receive processes present one receipt and invoke native once
+  ---
+  duration_ms: 538.413826
+  type: 'test'
+  ...
+# Subtest: corrupt journal is retained and refuses native acknowledgement
+ok 234 - corrupt journal is retained and refuses native acknowledgement
+  ---
+  duration_ms: 38.393645
+  type: 'test'
+  ...
+# Subtest: missing report never authorizes handling or acknowledgement
+ok 235 - missing report never authorizes handling or acknowledgement
+  ---
+  duration_ms: 181.808997
+  type: 'test'
+  ...
+# Subtest: zero-cutoff native recovery episodes require explicit handling acknowledgement
+ok 236 - zero-cutoff native recovery episodes require explicit handling acknowledgement
+  ---
+  duration_ms: 260.856101
+  type: 'test'
+  ...
+# Subtest: captain stop hook blocks pairless pending receipt and preserves recursion guard
+ok 237 - captain stop hook blocks pairless pending receipt and preserves recursion guard
+  ---
+  duration_ms: 200.759619
+  type: 'test'
+  ...
+# Subtest: late audit notification continuation preserves unread reports and resumes native final-outcome reporting
+ok 238 - late audit notification continuation preserves unread reports and resumes native final-outcome reporting
+  ---
+  duration_ms: 428.976526
+  type: 'test'
+  ...
+# Subtest: real native drain retains pairless status and new-generation queue rows
+ok 239 - real native drain retains pairless status and new-generation queue rows
+  ---
+  duration_ms: 12305.472468
+  type: 'test'
+  ...
+# Subtest: empty reads and completed receipts do not accumulate report files
+ok 240 - empty reads and completed receipts do not accumulate report files
+  ---
+  duration_ms: 3383.785752
+  type: 'test'
+  ...
+# Subtest: pruning keeps active recovery captures and leaves unrelated files alone
+ok 241 - pruning keeps active recovery captures and leaves unrelated files alone
+  ---
+  duration_ms: 364.988696
+  type: 'test'
+  ...
+# Subtest: unknown legacy capture cursor cannot suppress equal fresh reports
+ok 242 - unknown legacy capture cursor cannot suppress equal fresh reports
+  ---
+  duration_ms: 264.649038
+  type: 'test'
+  ...
+# Subtest: real native preserves a repeated new status: failed: deployment rejected
+ok 243 - real native preserves a repeated new status: failed: deployment rejected
+  ---
+  duration_ms: 6657.653309
+  type: 'test'
+  ...
+# Subtest: real native preserves a repeated new status: note: repeated status
+ok 244 - real native preserves a repeated new status: note: repeated status
+  ---
+  duration_ms: 6696.326067
+  type: 'test'
+  ...
+# Subtest: real native persistent open decisions complete without a receipt loop
+ok 245 - real native persistent open decisions complete without a receipt loop
+  ---
+  duration_ms: 3888.663087
+  type: 'test'
+  ...
+# Subtest: real native mixed wake completes once while preserving its open decision
+ok 246 - real native mixed wake completes once while preserving its open decision
+  ---
+  duration_ms: 4545.915054
+  type: 'test'
+  ...
+# Subtest: real native drain: an orphan's open decision is presented once, then never demands another receipt while crews keep writing status
+ok 247 - real native drain: an orphan's open decision is presented once, then never demands another receipt while crews keep writing status
+  ---
+  duration_ms: 8514.376078
+  type: 'test'
+  ...
+# Subtest: malformed presenting journal cannot prune unreferenced recovery evidence
+ok 248 - malformed presenting journal cannot prune unreferenced recovery evidence
+  ---
+  duration_ms: 183.445764
+  type: 'test'
+  ...
+# Subtest: malformed acknowledging journal cannot prune unreferenced recovery evidence
+ok 249 - malformed acknowledging journal cannot prune unreferenced recovery evidence
+  ---
+  duration_ms: 219.039312
+  type: 'test'
+  ...
+# Subtest: malformed refreshing journal cannot prune unreferenced recovery evidence
+ok 250 - malformed refreshing journal cannot prune unreferenced recovery evidence
+  ---
+  duration_ms: 201.17402
+  type: 'test'
+  ...
+# Subtest: second user-directed execution change preserves same environment/task/contract and conservative legacy failure count
+ok 251 - second user-directed execution change preserves same environment/task/contract and conservative legacy failure count
+  ---
+  duration_ms: 435.231725
+  type: 'test'
+  ...
+# Subtest: execution changes do not consume new failure allowance; ordinary recovery retains one replacement maximum
+ok 252 - execution changes do not consume new failure allowance; ordinary recovery retains one replacement maximum
+  ---
+  duration_ms: 377.439228
+  type: 'test'
+  ...
+# Subtest: missing intent refuses before source stop/archive or work changes
+ok 253 - missing intent refuses before source stop/archive or work changes
+  ---
+  duration_ms: 122.474493
+  type: 'test'
+  ...
+# Subtest: missing reason refuses before source stop/archive or work changes
+ok 254 - missing reason refuses before source stop/archive or work changes
+  ---
+  duration_ms: 126.016048
+  type: 'test'
+  ...
+# Subtest: no override refuses before source stop/archive or work changes
+ok 255 - no override refuses before source stop/archive or work changes
+  ---
+  duration_ms: 138.320726
+  type: 'test'
+  ...
+# Subtest: unchanged refuses before source stop/archive or work changes
+ok 256 - unchanged refuses before source stop/archive or work changes
+  ---
+  duration_ms: 139.657229
+  type: 'test'
+  ...
+# Subtest: wrong owner refuses before source stop/archive or work changes
+ok 257 - wrong owner refuses before source stop/archive or work changes
+  ---
+  duration_ms: 147.38726
+  type: 'test'
+  ...
+# Subtest: invalid provider refuses before source stop/archive or work changes
+ok 258 - invalid provider refuses before source stop/archive or work changes
+  ---
+  duration_ms: 195.93958
+  type: 'test'
+  ...
+# Subtest: invalid model refuses before source stop/archive or work changes
+ok 259 - invalid model refuses before source stop/archive or work changes
+  ---
+  duration_ms: 165.25677
+  type: 'test'
+  ...
+# Subtest: invalid reasoning refuses before source stop/archive or work changes
+ok 260 - invalid reasoning refuses before source stop/archive or work changes
+  ---
+  duration_ms: 103.769595
+  type: 'test'
+  ...
+# Subtest: capacity override refuses before source stop/archive or work changes
+ok 261 - capacity override refuses before source stop/archive or work changes
+  ---
+  duration_ms: 132.657505
+  type: 'test'
+  ...
+# Subtest: concurrent execution changes and durable uncertain reload reconcile one exact generation without a duplicate or repeated stop
+ok 262 - concurrent execution changes and durable uncertain reload reconcile one exact generation without a duplicate or repeated stop
+  ---
+  duration_ms: 190.695919
+  type: 'test'
+  ...
+# Subtest: real native 2d833ff1 ship/direct-PR preserves branch/work/contract during explicit replacement
+ok 263 - real native 2d833ff1 ship/direct-PR preserves branch/work/contract during explicit replacement
+  ---
+  duration_ms: 2292.46917
+  type: 'test'
+  ...
+# Subtest: real native 2d833ff1 ship/no-mistakes preserves branch/work/contract during explicit replacement
+ok 264 - real native 2d833ff1 ship/no-mistakes preserves branch/work/contract during explicit replacement
+  ---
+  duration_ms: 2081.998767
+  type: 'test'
+  ...
+# Subtest: real native 2d833ff1 ship/local-only preserves branch/work/contract during explicit replacement
+ok 265 - real native 2d833ff1 ship/local-only preserves branch/work/contract during explicit replacement
+  ---
+  duration_ms: 1973.888984
+  type: 'test'
+  ...
+# Subtest: real native 2d833ff1 scout/direct-PR preserves branch/work/contract during explicit replacement
+ok 266 - real native 2d833ff1 scout/direct-PR preserves branch/work/contract during explicit replacement
+  ---
+  duration_ms: 2449.200719
+  type: 'test'
+  ...
+# Subtest: real native 1f3e7696 ship/direct-PR preserves branch/work/contract during explicit replacement
+ok 267 - real native 1f3e7696 ship/direct-PR preserves branch/work/contract during explicit replacement
+  ---
+  duration_ms: 4050.146721
+  type: 'test'
+  ...
+# Subtest: real native 1f3e7696 ship/no-mistakes preserves branch/work/contract during explicit replacement
+ok 268 - real native 1f3e7696 ship/no-mistakes preserves branch/work/contract during explicit replacement
+  ---
+  duration_ms: 3463.281909
+  type: 'test'
+  ...
+# Subtest: real native 1f3e7696 ship/local-only preserves branch/work/contract during explicit replacement
+ok 269 - real native 1f3e7696 ship/local-only preserves branch/work/contract during explicit replacement
+  ---
+  duration_ms: 2986.695105
+  type: 'test'
+  ...
+# Subtest: real native 1f3e7696 scout/direct-PR preserves branch/work/contract during explicit replacement
+ok 270 - real native 1f3e7696 scout/direct-PR preserves branch/work/contract during explicit replacement
+  ---
+  duration_ms: 3359.187731
+  type: 'test'
+  ...
+# Subtest: unreadable execution catalogs refuse before source mutation
+ok 271 - unreadable execution catalogs refuse before source mutation
+  ---
+  duration_ms: 80.406582
+  type: 'test'
+  ...
+# Subtest: native publication plus failed crew cache write recovers across reload without stopping or replacing again
+ok 272 - native publication plus failed crew cache write recovers across reload without stopping or replacing again
+  ---
+  duration_ms: 5960.066264
+  type: 'test'
+  ...
+# Subtest: final replacement journal write fault resumes exact execution-change after cache publication/reload on 2d833ff1
+ok 273 - final replacement journal write fault resumes exact execution-change after cache publication/reload on 2d833ff1
+  ---
+  duration_ms: 3764.33754
+  type: 'test'
+  ...
+# Subtest: final replacement journal write fault resumes exact failure-recovery after cache publication/reload on 2d833ff1
+ok 274 - final replacement journal write fault resumes exact failure-recovery after cache publication/reload on 2d833ff1
+  ---
+  duration_ms: 4317.219854
+  type: 'test'
+  ...
+# Subtest: final replacement journal write fault resumes exact execution-change after cache publication/reload on 1f3e7696
+ok 275 - final replacement journal write fault resumes exact execution-change after cache publication/reload on 1f3e7696
+  ---
+  duration_ms: 5427.124816
+  type: 'test'
+  ...
+# Subtest: final replacement journal write fault resumes exact failure-recovery after cache publication/reload on 1f3e7696
+ok 276 - final replacement journal write fault resumes exact failure-recovery after cache publication/reload on 1f3e7696
+  ---
+  duration_ms: 6139.368995
+  type: 'test'
+  ...
+# Subtest: native rebind refuses branch collision and a primary checkout before publication, leaving every source byte/work intact
+ok 277 - native rebind refuses branch collision and a primary checkout before publication, leaving every source byte/work intact
+  ---
+  duration_ms: 2079.395397
+  type: 'test'
+  ...
+# Subtest: cache loss recovers current seeded replacement with full task and bounded recovery history, never its archived source
+ok 278 - cache loss recovers current seeded replacement with full task and bounded recovery history, never its archived source
+  ---
+  duration_ms: 181.866354
+  type: 'test'
+  ...
+# Subtest: authoritative deletion after creation refuses native rebind and keeps the source cache/work intact
+ok 279 - authoritative deletion after creation refuses native rebind and keeps the source cache/work intact
+  ---
+  duration_ms: 2553.985273
+  type: 'test'
+  ...
+# Subtest: registered local-only tool/CLI preserve branch delivery, exclude PR obligations and refuse conflicting contracts before spawn
+ok 280 - registered local-only tool/CLI preserve branch delivery, exclude PR obligations and refuse conflicting contracts before spawn
+  ---
+  duration_ms: 332.927892
+  type: 'test'
+  ...
+# Subtest: queued local-only intake keeps branch and unresolved mode defers its default until dispatch
+ok 281 - queued local-only intake keeps branch and unresolved mode defers its default until dispatch
+  ---
+  duration_ms: 311.140174
+  type: 'test'
+  ...
+# Subtest: replacement validates reasoning on the reused host before stopping and records actual execution
+ok 282 - replacement validates reasoning on the reused host before stopping and records actual execution
+  ---
+  duration_ms: 207.037123
+  type: 'test'
+  ...
+# Subtest: uncertain replacement reconciles its reserved slot at capacity before any fresh attempt
+ok 283 - uncertain replacement reconciles its reserved slot at capacity before any fresh attempt
+  ---
+  duration_ms: 231.443912
+  type: 'test'
+  ...
+# Subtest: dispatch admission fixes actual concurrent cap probe; finished scout promotion also reserves capacity
+ok 284 - dispatch admission fixes actual concurrent cap probe; finished scout promotion also reserves capacity
+  ---
+  duration_ms: 207.589514
+  type: 'test'
+  ...
+# Subtest: native bridge seeds role/home/generation before initial configuration and never invokes mark after creation
+ok 285 - native bridge seeds role/home/generation before initial configuration and never invokes mark after creation
+  ---
+  duration_ms: 212.575485
+  type: 'test'
+  ...
+# Subtest: internal bridge refuses without native admission, and unsupported options create no launch records
+ok 286 - internal bridge refuses without native admission, and unsupported options create no launch records
+  ---
+  duration_ms: 203.037512
+  type: 'test'
+  ...
+# Subtest: background PR follow-up survives reload, forgotten worker, stale lookup and manager loss with project scoped UI/RPC
+ok 287 - background PR follow-up survives reload, forgotten worker, stale lookup and manager loss with project scoped UI/RPC
+  ---
+  duration_ms: 258.929553
+  type: 'test'
+  ...
+# Subtest: same-task concurrent backlog dispatch creates one worker and preserves its queue identity
+ok 288 - same-task concurrent backlog dispatch creates one worker and preserves its queue identity
+  ---
+  duration_ms: 222.163882
+  type: 'test'
+  ...
+# Subtest: reload during creation reconciles seeded worker identity before retry and never kills a slow worker
+ok 289 - reload during creation reconciles seeded worker identity before retry and never kills a slow worker
+  ---
+  duration_ms: 172.741219
+  type: 'test'
+  ...
+# Subtest: forgotten running worker still occupies admission capacity
+ok 290 - forgotten running worker still occupies admission capacity
+  ---
+  duration_ms: 119.842271
+  type: 'test'
+  ...
+# Subtest: promotion stores a complete durable report and preserves the project delivery mode
+ok 291 - promotion stores a complete durable report and preserves the project delivery mode
+  ---
+  duration_ms: 176.255241
+  type: 'test'
+  ...
+# Subtest: native seeded secondmate role and child home exist at initial configuration
+ok 292 - native seeded secondmate role and child home exist at initial configuration
+  ---
+  duration_ms: 182.513819
+  type: 'test'
+  ...
+# Subtest: owned launch metadata recovers scoped orphan PR references without claiming scout or foreign URLs
+ok 293 - owned launch metadata recovers scoped orphan PR references without claiming scout or foreign URLs
+  ---
+  duration_ms: 166.831454
+  type: 'test'
+  ...
+# Subtest: caller cancellation during external creation persists uncertainty without stopping the worker
+ok 294 - caller cancellation during external creation persists uncertainty without stopping the worker
+  ---
+  duration_ms: 127.828202
+  type: 'test'
+  ...
+# Subtest: missed manager deletion is surfaced after restart; inventory failures preserve stale ownership
+ok 295 - missed manager deletion is surfaced after restart; inventory failures preserve stale ownership
+  ---
+  duration_ms: 124.47271
+  type: 'test'
+  ...
+# Subtest: factory metadata adoption and dispatch recovery preserve required verification through discovery and merge
+ok 296 - factory metadata adoption and dispatch recovery preserve required verification through discovery and merge
+  ---
+  duration_ms: 447.222366
+  type: 'test'
+  ...
+# Subtest: CLI and tool registration inherit original contract; queue and promotion carry it to creation
+ok 297 - CLI and tool registration inherit original contract; queue and promotion carry it to creation
+  ---
+  duration_ms: 213.608215
+  type: 'test'
+  ...
+# Subtest: hung discovery is bounded per item and does not starve other PRs or future registered scans
+ok 298 - hung discovery is bounded per item and does not starve other PRs or future registered scans
+  ---
+  duration_ms: 119.387049
+  type: 'test'
+  ...
+# Subtest: registered follow-up disposal settles hung discovery and notification recovery reads
+ok 299 - registered follow-up disposal settles hung discovery and notification recovery reads
+  ---
+  duration_ms: 189.236139
+  type: 'test'
+  ...
+# Subtest: late terminal identity is closed once after disposal with no terminal reads or continuation
+ok 300 - late terminal identity is closed once after disposal with no terminal reads or continuation
+  ---
+  duration_ms: 92.339294
+  type: 'test'
+  ...
+# Subtest: partial handoff preserves failed worker task, launch, decision and PR ownership while transferring orphan obligations
+ok 301 - partial handoff preserves failed worker task, launch, decision and PR ownership while transferring orphan obligations
+  ---
+  duration_ms: 156.058955
+  type: 'test'
+  ...
+# Subtest: forgotten author retains native guarded merge continuation and refuses destructive retirement
+ok 302 - forgotten author retains native guarded merge continuation and refuses destructive retirement
+  ---
+  duration_ms: 189.599841
+  type: 'test'
+  ...
+# Subtest: native guard failure after real bridge creation retains an unadmitted worker and its capacity
+ok 303 - native guard failure after real bridge creation retains an unadmitted worker and its capacity
+  ---
+  duration_ms: 141.202087
+  type: 'test'
+  ...
+# Subtest: registered PR schedule parses real PTY forge reads for discovery and merge verification; command failures stay stale
+ok 304 - registered PR schedule parses real PTY forge reads for discovery and merge verification; command failures stay stale
+  ---
+  duration_ms: 677.012074
+  type: 'test'
+  ...
+# Subtest: native creation provisioning releases capacity only on exact core deletion and retains contract across reload
+ok 305 - native creation provisioning releases capacity only on exact core deletion and retains contract across reload
+  ---
+  duration_ms: 155.681892
+  type: 'test'
+  ...
+# Subtest: PR-only delivered artifact remains monitored across reload; baseline follow-up never hides an independent CI failure
+ok 306 - PR-only delivered artifact remains monitored across reload; baseline follow-up never hides an independent CI failure
+  ---
+  duration_ms: 224.493555
+  type: 'test'
+  ...
+# Subtest: recorded standing yolo reaches the native guard without a fresh merge ask; legacy provenance and actual user holds remain explicit
+ok 307 - recorded standing yolo reaches the native guard without a fresh merge ask; legacy provenance and actual user holds remain explicit
+  ---
+  duration_ms: 74.756231
+  type: 'test'
+  ...
+# Subtest: durable launch orphan discovery preserves native task mode before author continuation publication
+ok 308 - durable launch orphan discovery preserves native task mode before author continuation publication
+  ---
+  duration_ms: 107.893593
+  type: 'test'
+  ...
+# Subtest: registered supervisor tool and CLI mutations refuse worker identities before publication while captain dispatch remains available
+ok 309 - registered supervisor tool and CLI mutations refuse worker identities before publication while captain dispatch remains available
+  ---
+  duration_ms: 121.123178
+  type: 'test'
+  ...
+# Subtest: routed child intake survives reload and interrupted crew publication without resending or adopting supervisor defaults
+ok 310 - routed child intake survives reload and interrupted crew publication without resending or adopting supervisor defaults
+  ---
+  duration_ms: 95.133012
+  type: 'test'
+  ...
+# Subtest: unknown secondmate send retains full child request and refuses duplicate handoff after reload
+ok 311 - unknown secondmate send retains full child request and refuses duplicate handoff after reload
+  ---
+  duration_ms: 79.066715
+  type: 'test'
+  ...
+# Subtest: same-id secondmate child operations remain scoped after route and child publication
+ok 312 - same-id secondmate child operations remain scoped after route and child publication
+  ---
+  duration_ms: 128.422677
+  type: 'test'
+  ...
+# Subtest: route-only retirement permits the verified secondmate supervisor while genuine retired workers remain excluded
+ok 313 - route-only retirement permits the verified secondmate supervisor while genuine retired workers remain excluded
+  ---
+  duration_ms: 99.366559
+  type: 'test'
+  ...
+# Subtest: unreadable caller role refuses dispatch before receipt, reservation or native publication
+ok 314 - unreadable caller role refuses dispatch before receipt, reservation or native publication
+  ---
+  duration_ms: 103.582218
+  type: 'test'
+  ...
+# Subtest: native defaults route through actual configuration across resume and reload without side effects
+ok 315 - native defaults route through actual configuration across resume and reload without side effects
+  ---
+  duration_ms: 211.921139
+  type: 'test'
+  ...
+# Subtest: saturated captain instruction budget preserves every runtime obligation and role pointer
+ok 316 - saturated captain instruction budget preserves every runtime obligation and role pointer
+  ---
+  duration_ms: 329.143126
+  type: 'test'
+  ...
+# Subtest: unregistered method source references resolve within the repository without global skill paths
+ok 317 - unregistered method source references resolve within the repository without global skill paths
+  ---
+  duration_ms: 6.563098
+  type: 'test'
+  ...
+# Subtest: cold runtime package resolves typed Firstmate request before binding or reload
+ok 318 - cold runtime package resolves typed Firstmate request before binding or reload
+  ---
+  duration_ms: 198.594848
+  type: 'test'
+  ...
+# Subtest: cold runtime package resolves direct captain invocation before binding or reload
+ok 319 - cold runtime package resolves direct captain invocation before binding or reload
+  ---
+  duration_ms: 185.47493
+  type: 'test'
+  ...
+# Subtest: public methods selection persists for new captains and exposes only role-owned verified references
+ok 320 - public methods selection persists for new captains and exposes only role-owned verified references
+  ---
+  duration_ms: 159.082251
+  type: 'test'
+  ...
+# Subtest: direct-PR body author reads the actual installed PR skill in bounded owner-pinned pages; pipeline and local-only ownership stay native
+ok 321 - direct-PR body author reads the actual installed PR skill in bounded owner-pinned pages; pipeline and local-only ownership stay native
+  ---
+  duration_ms: 133.8639
+  type: 'test'
+  ...
+# Subtest: PR skill lookup cancellation settles disposal without writing a body or starting another task
+ok 322 - PR skill lookup cancellation settles disposal without writing a body or starting another task
+  ---
+  duration_ms: 124.637982
+  type: 'test'
+  ...
+# Subtest: PR author resolves provider-specific skill copies and permits only byte-identical cross-provider copies for ACP
+ok 323 - PR author resolves provider-specific skill copies and permits only byte-identical cross-provider copies for ACP
+  ---
+  duration_ms: 131.20062
+  type: 'test'
+  ...
+# Subtest: explicit installation PR source survives reload and unreadable foreign aliases without bypassing BB content guards
+ok 324 - explicit installation PR source survives reload and unreadable foreign aliases without bypassing BB content guards
+  ---
+  duration_ms: 211.73704
+  type: 'test'
+  ...
+# Subtest: reported captain wake command fits the full host limit before any receipt execution
+ok 325 - reported captain wake command fits the full host limit before any receipt execution
+  ---
+  duration_ms: 197.433182
+  type: 'test'
+  ...
+# Subtest: receipt callers retain actions, IDs, guards and per-captain state with long quoted home
+ok 326 - receipt callers retain actions, IDs, guards and per-captain state with long quoted home
+  ---
+  duration_ms: 171.335022
+  type: 'test'
+  ...
+# Subtest: receipt init stage-write failure executes and acknowledges nothing
+ok 327 - receipt init stage-write failure executes and acknowledges nothing
+  ---
+  duration_ms: 230.363169
+  type: 'test'
+  ...
+# Subtest: receipt append stage-write failure executes and acknowledges nothing
+ok 328 - receipt append stage-write failure executes and acknowledges nothing
+  ---
+  duration_ms: 116.661785
+  type: 'test'
+  ...
+# Subtest: receipt rename stage-write failure executes and acknowledges nothing
+ok 329 - receipt rename stage-write failure executes and acknowledges nothing
+  ---
+  duration_ms: 126.447985
+  type: 'test'
+  ...
+# Subtest: cancel after staged command publication cleans receipt files without executing or acknowledging
+ok 330 - cancel after staged command publication cleans receipt files without executing or acknowledging
+  ---
+  duration_ms: 392.31224
+  type: 'test'
+  ...
+# Subtest: staging transport error retains its cause without running a receipt
+ok 331 - staging transport error retains its cause without running a receipt
+  ---
+  duration_ms: 135.42956
+  type: 'test'
+  ...
+# Subtest: actual guarded receipt transport 2d833ff1 preserves reports and captain isolation across reload
+ok 332 - actual guarded receipt transport 2d833ff1 preserves reports and captain isolation across reload
+  ---
+  duration_ms: 4378.617105
+  type: 'test'
+  ...
+# Subtest: actual guarded receipt transport 1f3e7696 preserves reports and captain isolation across reload
+ok 333 - actual guarded receipt transport 1f3e7696 preserves reports and captain isolation across reload
+  ---
+  duration_ms: 6565.798403
+  type: 'test'
+  ...
+1..333
+# tests 333
+# suites 0
+# pass 333
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 106912.597662

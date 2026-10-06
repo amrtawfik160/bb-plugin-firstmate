@@ -9,6 +9,10 @@ Do the normal things: keep the diff small, run `tsc` and `npm test` before you
 open a PR, follow the surrounding code's idiom. The rest of this file is the one
 part that is not optional.
 
+For clean CI coverage and owned acceptance preflight, read
+[verification entry points](docs/verification/session-retro-20261005.md#verification-entry-points).
+CI checks the supported offline profile; full native and live model acceptance remain separate requirements below.
+
 ## The verification standard
 
 This standard exists because it had to. Fourteen PRs shipped native ownership of
@@ -159,11 +163,29 @@ would correctly fail the guard); revisit only if CRLF status files ever appear.
 
 ## Skill fidelity: copy native, mark every divergence
 
-`skills/calm/` and `skills/catch-up/` are BB-authored presentation skills, not
-copies of upstream skills. Calm points to the adapted escalation contract rather
-than duplicating its policy. Catch-up owns only the requested recovery format;
-it uses existing observations and grants no new execution authority. Keep these
-separate from the pinned upstream inventory and fidelity snapshots.
+`skills/calm/`, `skills/catch-up/`, `skills/captain-methods/` and
+`skills/worker-methods/` are retained BB-authored source exceptions, separate from
+the native fidelity inventory. They remain **unregistered**. Native section 9
+owns reporting. Calm/catch-up are never injected as policy or method pointers.
+Unconfigured installations expose no selected methods. Explicit installation
+selection (`bb firstmate methods enable selected-v1 --reason <user-selection>`)
+uses the existing settings API, a role-specific trigger pointer and the bounded
+`firstmate_methods` reader; it does not load static skill bodies or append them
+to native contracts. The reader verifies the versioned ten-file BB methods
+inventory. Any source change requires reviewed hashes and causal public-read
+proof. Direct-PR ships alone resolve their actual workspace `/pr` entry through
+public SDK skills APIs; external no-mistakes author loading remains a separate
+unverified boundary. See [selected methods evidence](docs/verification/selected-methods-20261005.md).
+
+Only the `/captain` and `/firstmate` transport entries are registered. Read native
+policy through `firstmate_skill` from the exact selected audited runtime, rather
+than expose globally pinned policy skills to captains on another revision.
+`server.native-policy.test.mjs` composes actual captain and worker configuration
+with both native sources and the worker renderer. The versioned
+`docs/verification/native-transport-allowlist.v1.json` records transport bytes;
+changing it requires an explicit boundary justification and causal proof. Native
+skill bytes, task text, task modes and native authority/completion gates remain
+independent invariants. Configuration equality is not a claim about model behavior.
 
 The imported skills under [`skills/`](skills/) are not independent BB rewrites of firstmate
 policy — they are **native firstmate's own instructions, copied**, with edits only
@@ -185,7 +207,7 @@ The pinned native source is vendored, read-only, under `native-snapshot/<sha>/�
 mirroring native's own paths (`.agents/skills/<name>/SKILL.md`, or a named slice
 such as `AGENTS.section-9.md`). This is what the check diffs against, so it runs
 fully offline. It is a copy of native at the pin — never edit it by hand; re-vendor
-from the native clone when you bump a pin. Native is currently at `2d833ff1`.
+from the native clone when you bump a pin. Native is currently at `1f3e7696`.
 
 ### Pin the native source per skill (`BB-SOURCE`)
 
@@ -194,8 +216,8 @@ Every re-derived skill carries, right after its frontmatter, a machine-parseable
 
     <!-- BB-SOURCE
          native: .agents/skills/afk/SKILL.md
-         sha: 2d833ff147cd26a5c461e914e06854e0eb2707ce
-         snapshot: native-snapshot/2d833ff1/.agents/skills/afk/SKILL.md
+         sha: 1f3e769616fdf9f31f85f4c3e6a9f71606634238
+         snapshot: native-snapshot/1f3e7696/.agents/skills/afk/SKILL.md
          fidelity: adapted        # verbatim | adapted
          note: … -->
 

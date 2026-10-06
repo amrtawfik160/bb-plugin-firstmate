@@ -2,23 +2,25 @@
 
 BB is a spawn-capable firstmate backend: a BB thread is the session endpoint, and a BB managed worktree is the task copy. The `bin/` toolbelt stays the policy engine (brief, gate, inbox, watch, merge, teardown, afk, bearings, backlog). BB replaces tmux/herdr/zellij/orca/cmux for that home.
 
-The crewmate is the BB agent started by `bb thread spawn`, not a TUI harness launched in a pane.
+The native adapter calls the plugin's internal `bb firstmate create-worker` bridge. The bridge uses public SDK creation metadata to establish the worker role before its first turn.
 
 ## Setup
 
-Prerequisites: `bb` CLI enrolled on the host, `python3` (JSON parse), and a BB project id.
+Prerequisites: the Firstmate plugin loaded in BB, `bb` CLI enrolled on the host, `python3` (JSON parse), and a BB project id with a matching source checkout on the execution host.
 
 Select BB with local `config/backend` containing `bb`, `FM_BACKEND=bb`, or `bb firstmate init --real` (plugin overlay writes both). Never auto-detected.
 
 Also set `config/bb-project` or `FM_BB_PROJECT_ID` to the BB project that should own spawned threads.
 
+Set `FM_BB_MACHINE` or `BB_MACHINE` to the execution host. Plugin invocation supplies this value. The adapter refuses an unspecified host rather than selecting an unrelated connected host.
+
 Optional:
 
 - `FM_BB_PARENT_THREAD_ID` / `BB_THREAD_ID` — parent (captain) thread
-- `FM_BB_MACHINE` / `BB_MACHINE` — host for managed-worktree (plugin `fm` sets this)
 - `FM_BB_PROVIDER` `FM_BB_MODEL` `FM_BB_PERMISSION_MODE`
 - `FM_BB_VISIBLE=0` / `FM_BB_HIDDEN=1` — hide child threads from the sidebar (default visible)
-- `FM_BB_SHARED_ENV=1` — skip managed-worktree (ships should not)
+- `FM_BB_SHARED_ENV=1` — shared checkout for scouts; refused for native ships
+- `FM_BB_PROJECT_DEFAULTS=1` — omitted model/reasoning use BB project defaults, rather than native profile defaults
 
 Plugin entry: `bb firstmate fm spawn -- --mode direct-PR -- ship '<task>'` runs `fm-spawn.sh` on the host with `FM_BACKEND=bb`.
 
@@ -29,18 +31,18 @@ Plugin entry: `bb firstmate fm spawn -- --mode direct-PR -- ship '<task>'` runs 
 The overlay therefore does **not** edit those tracked files. `install-bb-backend.py` builds a parallel **mirror bin** at `<home>/bin-bb`:
 
 - every native `bin/` entry is **symlinked** into `bin-bb/` (so it keeps inheriting upstream on every ff-update),
-- **except** the eight no-seam files, which are generated as **patched copies** (native source + the overlay patches), and
+- **except** the ten no-seam files, which are generated as **patched copies** (native source + the overlay patches), and
 - `bin-bb/backends/` mirrors the native adapters plus the real `bb.sh`.
 
 Native scripts derive `SCRIPT_DIR`/`FM_BACKEND_LIB_DIR` from their own `BASH_SOURCE`, so invoking `bin-bb/fm-*.sh` makes every `. "$SCRIPT_DIR/fm-*.sh"` resolve **inside `bin-bb`**: the patched `fm-backend.sh` (with the bb dispatch arms) and the `bb.sh` adapter are picked up for **all** scripts, with zero edits to tracked files. The plugin routes `bin` → `bin-bb` at runtime (`fmBinDirAssign` / `$FM_BINDIR`) whenever the marker `config/bb-overlay` and `bin-bb/` are present, and falls back to native `bin` otherwise.
 
 `bin-bb/` is registered in `<home>/.git/info/exclude` (a per-clone, untracked git exclude that is **not** part of the repository), and `config/` is already gitignored upstream. So `git -C <home> status --porcelain` stays **empty** — which is exactly what the plugin's `fetch` + `git merge --ff-only` auto-update requires: with the old in-place patch the tree was permanently dirty and the update **always skipped**; the mirror keeps it clean so the clone actually fast-forwards.
 
-Re-run the installer after an ff-update: it re-mirrors (picking up new native `bin/` files) and regenerates the eight patched copies against the new native source.
+Re-run the installer after an ff-update: it re-mirrors (picking up new native `bin/` files) and regenerates the ten patched copies against the new native source.
 
-The install is **atomic and loud** (see `install-bb-backend.py`, `build_mirror` / `_atomic_swap`): the new mirror is built in full inside a `bin-bb.staging` directory and swapped into place with `os.rename` **only on complete success**, so a failed install can never replace a working mirror with a broken/partial one — on any failure the staging tree is discarded and the existing `bin-bb` is left **exactly as it was**. If upstream changed one of the eight files so a hunk no longer applies, the install **aborts non-zero with a loud `INSTALL FAILED` banner** (detected via `patch`'s exit code **and** any reject file — not the exit code alone), never printing `BB backend ready` over a failure. (The earlier installer rebuilt in place: it `rmtree`d the live mirror first, so a patch failure mid-rebuild left `bin-bb` missing the three dispatch copies — a host-wide `unknown backend 'bb'` outage on a shared home.)
+The install is **atomic and loud** (see `install-bb-backend.py`, `build_mirror` / `_atomic_swap`): the new mirror is built in full inside a `bin-bb.staging` directory and swapped into place with `os.rename` **only on complete success**, so a failed install can never replace a working mirror with a broken/partial one — on any failure the staging tree is discarded and the existing `bin-bb` is left **exactly as it was**. If upstream changed one of the ten files so a hunk no longer applies, the install **aborts non-zero with a loud `INSTALL FAILED` banner** (detected via `patch`'s exit code **and** any reject file — not the exit code alone), never printing `BB backend ready` over a failure. (The earlier installer rebuilt in place: it `rmtree`d the live mirror first, so a patch failure mid-rebuild left `bin-bb` missing the three dispatch copies — a host-wide `unknown backend 'bb'` outage on a shared home.)
 
-The overlay patches are refreshed against a **pinned upstream base** recorded in [`overlay/patch-base.txt`](patch-base.txt) (currently the current `kunchenguid/firstmate` HEAD). Because the patches edit upstream prose/comments they are version-specific — they apply at that base and drift as upstream evolves. [`scripts/patch-drift-check.mjs`](../scripts/patch-drift-check.mjs) fetches the live upstream HEAD and dry-run-applies the patches exactly as the installer does, so drift is caught **ahead of a migration** rather than during one; when it flags drift, refresh the patches against HEAD, re-run the live proofs, and bump `patch-base.txt`.
+The overlay patches target audited commit `1f3e769616fdf9f31f85f4c3e6a9f71606634238`, recorded in [`overlay/patch-base.txt`](../patch-base.txt). Installation and drift checking require exact application: fuzz, offsets and rejected hunks fail. The current source loader uses positional siblings (`set -- fm-composer-lib.sh fm-transition-lib.sh`). An installation exit code does not prove backend loading; source the installed backend and resolve `fm_backend_bb_create_task` as a separate check.
 
 ## Task shape and metadata
 
@@ -60,7 +62,7 @@ harness=bb
 
 | firstmate op | BB |
 | --- | --- |
-| create_task | `bb thread spawn --new-environment worktree --prompt <brief>` |
+| create_task | Internal `bb firstmate create-worker` → public `sdk.threads.spawn`, with creation metadata and durable reservation |
 | capture | `bb thread output` |
 | send_text_submit | `bb thread tell --mode steer` (inject active turn, otherwise start one) |
 | send_key C-c | `bb thread tell --mode steer` interrupt |
@@ -71,6 +73,10 @@ harness=bb
 | event wait | `bb thread wait --status idle` (first window to finish) |
 
 Composer submit/retry is a no-op: BB has no TUI composer. Delivery is the tell JSON succeeding.
+
+Creation response deadlines and plugin disposal preserve uncertain reservations. A late real worker is retained and recovered by exact task/project/manager/home/generation metadata. A ready environment alone does not certify native post-creation isolation. SDK 0.4.104 has no pre-turn hold or creation cancellation API. The native worker starts with the correct role, but native readiness stays unresolved until native guards publish its thread metadata.
+
+PR delivery has a separate SQLite register. Worker retirement and wake acknowledgement do not complete an open PR. Bounded follow-up observes current-head checks/review, preserves stale state on forge failure, and wakes the owning manager for already-authorized work. Merge remains native guarded merge. See [launch and delivery evidence](../../docs/verification/launch-pr-lifecycle-progress.md).
 
 ## Supervision model (auto-arm)
 
@@ -98,9 +104,9 @@ Under `notifyOwner=real` the durable crew→captain wake plane is partitioned **
 - Relay/mail/voice stay firstmate scripts if those planes are enabled; they are not rewritten in the BB plugin.
 - Native `bb firstmate dispatch` uses the plugin SDK (pluginMetadata, Fleet UI) and, when `fmHome` is set, writes the same `state/<id>.meta` ledger `fm-spawn` does. `bb firstmate fm` is how the bash toolbelt drives the same BB runtime.
 
-## The eight files still carried as patched copies (and the upstream seam we want)
+## The ten files still carried as patched copies (and the upstream seam we want)
 
-The mirror keeps the tracked tree clean, but `fm-backend.sh`, `fm-spawn.sh`, `fm-teardown.sh`, `fm-merge-local.sh`, `fm-bootstrap.sh`, `fm-busy-lib.sh`, `fm-secondmate-liveness-lib.sh`, and `fm-watch.sh` are still carried as **patched copies** in `bin-bb`, because their edits cannot be expressed through any native seam:
+The mirror keeps the tracked tree clean, but `fm-backend.sh`, `fm-spawn.sh`, `fm-teardown.sh`, `fm-merge-local.sh`, `fm-bootstrap.sh`, `fm-tasks-axi-lib.sh`, `fm-quota-axi-lib.sh`, `fm-busy-lib.sh`, `fm-secondmate-liveness-lib.sh`, and `fm-watch.sh` are still carried as **patched copies** in `bin-bb`, because their edits cannot be expressed through any native seam:
 
 - **`fm-backend.sh` — registration + dispatch.** `FM_BACKEND_KNOWN`/`FM_BACKEND_SPAWN` are literal strings and each `fm_backend_*` function is a literal `case` with a `*)` reject/`unknown` arm. There is no drop-in dir, no `FM_BACKEND_KNOWN_EXTRA`, no config-driven registration, and no post-source hook, so a new backend name and its dispatch arms cannot be added at runtime.
 - **`fm-spawn.sh` — spawn flow.** The worktree-creation `case "$BACKEND"` block, the two `[ "$BACKEND" != orca ]` Treehouse-skip conditionals, and the relaunch/meta handling are **inline in the main body**, not overridable functions.
@@ -116,7 +122,9 @@ The mirror keeps the tracked tree clean, but `fm-backend.sh`, `fm-spawn.sh`, `fm
 
 - **`fm-watch.sh` — BB input wait evidence.** Before a wedge alarm, a BB task probes `bb firstmate activity` with a five-second bound and requires the matching version/thread ID plus a positive integer interaction count. Native `wait_record` then defers/rechecks the captain-owned wait; clearing the interaction restores ordinary alarms at the next threshold. Failed, malformed or timed-out probes print an error and leave native checks active. Worker status and progress are untouched.
 
-Because these are `case`/`if` blocks in tracked bodies (not functions with a `*)` that dispatches to `fm_backend_<name>_*`), no function override or env hook can inject them; a real copy is the only faithful option. The mirror confines the drift to exactly these eight files while every other script inherits upstream.
+- **`fm-tasks-axi-lib.sh` / `fm-quota-axi-lib.sh` — bounded BB dependency reads.** Native feature/version parsing stays intact; only BB read probes receive a timeout through the shared native runner. Feature help retains stderr. See the bounded-startup section below.
+
+Because these are `case`/`if` blocks in tracked bodies (not functions with a `*)` that dispatches to `fm_backend_<name>_*`), no function override or env hook can inject them; a real copy is the only faithful option. The mirror confines the drift to exactly these ten files while every other script inherits upstream.
 
 **Minimal upstream-friendly seams we would contribute to `kunchenguid/firstmate`** so these copies could shrink to a pure drop-in (no copied bodies):
 
@@ -128,7 +136,7 @@ Because these are `case`/`if` blocks in tracked bodies (not functions with a `*)
 
 5. **Backend-specific browser dependency.** Let the backend select its browser dependency rather than putting AXI browser in the universal tool list.
 
-With (1)–(5), the entire bb overlay becomes `config/backends.d/bb.sh` + `bin/backends/bb.sh` with **zero** copied native bodies. Until then, the eight patched copies are the honest, documented cost, isolated in `bin-bb`.
+With (1)–(5), the entire bb overlay becomes `config/backends.d/bb.sh` + `bin/backends/bb.sh` with **zero** copied native bodies. Until then, the ten patched copies are the honest, documented cost, isolated in `bin-bb`.
 
 ## Migrating a home off the in-place patch (safe; run by an operator, not the plugin)
 
@@ -213,14 +221,13 @@ git -C "$FMH" status --porcelain                              # expect empty
 
 `bin-bb` contains a complete bb-capable mirror at every step (the old one until the instant the new one swaps in at step 3), so native `bin` — which rejects bb once fast-forwarded — is never the only path. Run `node scripts/patch-drift-check.mjs` before starting: if it reports drift, the patches need refreshing (and `patch-base.txt` bumping) before step 3 can succeed.
 
-## Paths that do NOT reach bb through the mirror (F4/F5)
+## Absolute native entry points
 
-The mirror redirects the plugin's entry points via `$FM_BINDIR`, and each patched copy's own internal dispatch self-calls are rewritten to `$SCRIPT_DIR` at install time (so `fm-spawn.sh` batch/array dispatch, which re-invokes itself per pair with `--backend bb`, stays inside the mirror). Two native references still resolve to pristine `bin/` and would report `unknown backend 'bb'` if reached with `backend=bb`:
+The mirror redirects plugin entry points via `$FM_BINDIR`. Patched spawn, bootstrap and secondmate-liveness entry points preserve the mirror for internal dispatch. Native seeded secondmate homes are supported. The creation bridge verifies the child home and parent identity and installs its adapter before spawning a captain-role thread. Registered domain routing is a separate feature.
 
-- **`bin/fm-bootstrap.sh` secondmate spawn** (`FM_SPAWN_NO_GUARD=1 "$FM_ROOT/bin/fm-spawn.sh" … --secondmate`). This is a symlinked (not patched) mirror entry, so its absolute `$FM_ROOT/bin/` call reaches native. **Not a functional regression:** `backend=bb` refuses `--secondmate` outright (`fm-spawn.sh`: "backend=bb does not support --secondmate spawns yet"), so a bb captain never completes a secondmate spawn under either scheme — the mirror only changes the error text (`unknown backend` vs the explicit refusal). If bb ever gains secondmate support, this call must be rewritten to `$FM_BINDIR`/`$SCRIPT_DIR`, or better, fixed by the upstream seam below.
 - **`bin/fm-remote-entrypoint.sh`** resolves `realpath "${BASH_SOURCE[0]}"`, so a symlinked `bin-bb` entry resolves back to native `bin` and bypasses the mirror. This is the remote-job entrypoint, outside the bb dispatch path; noted for completeness.
 
-The clean fix for both is the **upstream seam** proposed above (a generic `*)` dispatch fallthrough in native `bin/fm-backend.sh`): once native itself dispatches a registered backend to `fm_backend_<name>_*`, every `$FM_ROOT/bin/` reference reaches a bb-aware script with no mirror rewrite at all.
+The **upstream seam** proposed above (a generic backend dispatch fallthrough) would remove the need for these mirror adaptations.
 
 `FM_TEST_HOME=/path/to/native node scripts/native-bb-pending-input-check.mjs`
 executes the installed native alarm functions with controlled BB responses: pending
@@ -237,3 +244,41 @@ BB host-terminal RPCs run outside that ancestry, so supervisor startup uses the 
 The command binds `FM_HOME`, `FM_ROOT_OVERRIDE`, and `FM_BACKEND=bb`, then executes the original native entry point through the `bin-bb` mirror.
 The BB SessionStart hook uses the same bindings and mirror.
 Actual native lock refusals preserve the upstream read-only contract.
+
+
+### Startup workspace and live acceptance
+
+BB binds the managed workspace during `sdk.threads.spawn`. Only native
+`spawn_enter_recorded_worktree` skips its shell `cd` for the BB backend. The
+following native cwd assertion still verifies the recorded path. A captain's
+explicit `cd` instruction remains ordinary worker input; the adapter does not
+filter it.
+
+Run live acceptance only on the authorized isolated BB server. Set
+`bb machine list --json` on that server and choose its connected host. Set
+`FM_BB_MACHINE` to that host ID before running
+`node scripts/live-mirror-check.mjs`. It is required because a thread's host
+cannot be assumed to match a separate test server. Select provider, model and
+reasoning explicitly for the test server when its project has no defaults.
+The implementation agent does not run this script under its no-real-worker
+constraint; the parent performs acceptance after review.
+
+## Bounded BB startup probes
+
+BB owns ACP/provider execution through the SDK catalog. The mirrored bootstrap
+does not require an inactive native Cursor CLI merely because `crew-harness` is
+`cursor`; other native backend/tool/version checks remain intact. Only the BB
+mirror wraps local read-only version/help dependency probes in the native
+process-group-aware timeout helper, with a five-second bound per probe. Failure
+names the tool and returns its actual nonzero status; it never satisfies a
+version floor. The bootstrap, tasks-axi and quota-axi library changes are exact
+patches for both audited pins. Native tracked scripts and session lock policy
+remain unchanged. The installed manifest and remote payload include
+`fm-bb-probe-lib.sh`; a stale or missing helper requires a mirror refresh.
+
+Captain binding has a separate end-to-end 60-second RPC deadline. It does not
+execute the native session-start script through a detached terminal. The complete
+native session digest must still run under the agent harness, including bootstrap,
+lock checks and native supervision startup. A timeout banner is unresolved, even
+when native returns exit zero. See
+[the startup verification](../../docs/verification/captain-startup.md).

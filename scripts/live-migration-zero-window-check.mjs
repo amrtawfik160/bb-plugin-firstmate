@@ -20,8 +20,9 @@
 //
 // The clone chain is pinned to the patch base (overlay/patch-base.txt) so the overlay
 // patches — which the migration installs — actually apply; the synthetic "upstream"
-// commits deliberately do NOT touch the patched files, so the fast-forward and the
-// re-install against the advanced HEAD both keep applying.
+// commits deliberately do NOT touch the patched files. The exact source registry
+// still refuses their unknown SHA, preserving the working mirror; returning to an
+// audited source permits refresh without a bb-less window.
 //
 // The NEW order additionally exercises a FAILED re-install (step G): a re-install whose
 // patch no longer applies must abort ATOMICALLY — exit non-zero and loud, leave the
@@ -92,7 +93,7 @@ try {
   // upstream = clone pinned at the patch base, then advanced by 2 commits (a new
   // sourced bin/ sibling + a doc edit that do NOT touch the patched files) so `home`
   // can be BEHIND it, exactly like the live home. Keeping the patched files untouched
-  // is what lets the re-install against the advanced HEAD keep applying.
+  // demonstrates that matching patch context is insufficient to admit an unknown SHA.
   const cloned = cloneAtBase(checkout, upstream);
   if (!cloned.ok) { console.log(`SKIP: ${cloned.reason}`); rmSync(scratch, { recursive: true, force: true }); process.exit(0); }
   // cloneAtBase leaves upstream DETACHED at the base; put it on a branch so the two
@@ -143,8 +144,15 @@ try {
     if (fastForward().code !== 0) throw new Error("ff-only failed");
     probe("E: after fast-forward (mirror still dispatches bb; --verify flags stale)");
     console.log(`  --verify after ff (expected STALE): ${verify().code === 0 ? "healthy" : "STALE"}`);
-    if (install().code !== 0) throw new Error("re-install failed");
-    probe("F: after re-install against new HEAD");
+    const unknownBefore = mirrorFingerprint();
+    const refused = install();
+    if (refused.code === 0 || !/unsupported native source SHA/.test(refused.out)) throw new Error(`unknown source must refuse: ${refused.out}`);
+    if (mirrorFingerprint() !== unknownBefore) throw new Error("unknown source refusal replaced the working mirror");
+    probe("F: after refused unknown-source refresh (mirror intact)");
+    if (git(home, "checkout", "--quiet", "--detach", patchBase()).code !== 0) throw new Error("return to audited source failed");
+    probe("F1: after return to audited source (mirror serves bb)");
+    if (install().code !== 0) throw new Error("audited source re-install failed");
+    probe("F2: after re-install against audited source");
     console.log(`  --verify after re-install (expected healthy): ${verify().code === 0 ? "healthy" : "STALE"}`);
 
     // ---- Step G: a FAILED re-install must not open a window ---------------
@@ -190,10 +198,10 @@ try {
   if (!OLD_ORDER) {
     const clean = git(home, "status", "--porcelain").out.trim() === "";
     const healthy = verify().code === 0;
-    const ffTip = git(home, "rev-parse", "HEAD").out.trim() === git(home, "rev-parse", "@{u}").out.trim();
+    const auditedSource = git(home, "rev-parse", "HEAD").out.trim() === patchBase();
     const nativeRejects = REJECTS_BB.test(sh("bash", ["-c", `. "${join(home, "bin", "fm-backend.sh")}"; fm_backend_validate bb`]).out);
-    console.log(`\nend state: clean=${clean} verifyHealthy=${healthy} ff'd-to-upstream=${ffTip} nativeRejectsBb=${nativeRejects}`);
-    if (!(clean && healthy && ffTip && nativeRejects)) throw new Error("end-state check failed");
+    console.log(`\nend state: clean=${clean} verifyHealthy=${healthy} audited-source=${auditedSource} nativeRejectsBb=${nativeRejects}`);
+    if (!(clean && healthy && auditedSource && nativeRejects)) throw new Error("end-state check failed");
   }
 } finally {
   try { rmSync(scratch, { recursive: true, force: true }); } catch {}

@@ -23,6 +23,7 @@ export const rpcContract = defineRpcContract({
       }),
     ]),
     output: z.object({
+      deliveries:z.array(z.object({ id:z.string(),url:z.string(),owner:z.string().nullable(),status:z.string(),blocker:z.string(),nextAction:z.string(),freshness:z.string(),ownerNeeded:z.boolean(),deliverySatisfiedAt:z.number().nullable().optional(),workers:z.array(z.string()).default([]),failures:z.array(z.object({id:z.string(),name:z.string(),url:z.string(),headSha:z.string(),resolvedAt:z.number().nullable(),accounting:z.object({scope:z.enum(["author","baseline"]),taskId:z.string(),worker:z.string(),evidence:z.string(),actor:z.string(),at:z.number()}).optional()})).default([]) })).default([]),
       head: z.string(),
       calls: z.array(z.string()),
       landed: z.array(z.string()),

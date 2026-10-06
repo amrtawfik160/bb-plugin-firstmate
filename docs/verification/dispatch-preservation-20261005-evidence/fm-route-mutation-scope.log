@@ -1,0 +1,31 @@
+✖ same-id secondmate child operations remain scoped after route and child publication (186.82359ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 0
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 507.7686
+
+✖ failing tests:
+
+test at server.launch-delivery.test.mjs:614:1
+✖ same-id secondmate child operations remain scoped after route and child publication (186.82359ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + 'thr_child'
+  - 'thr_mate'
+         ^
+  
+      at TestContext.<anonymous> (file:///root/github_projects/bb-plugin-firstmate-launch-pr-lifecycle/server.launch-delivery.test.mjs:626:146)
+      at async Test.run (node:internal/test_runner/test:1332:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'thr_child',
+    expected: 'thr_mate',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }

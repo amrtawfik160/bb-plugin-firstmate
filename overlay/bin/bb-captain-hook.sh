@@ -21,20 +21,22 @@ case "$thread" in *[!A-Za-z0-9_-]*) exit 0 ;; esac
 marker="${HOME}/.bb-firstmate/captains/${thread}"
 [ -f "$marker" ] || exit 0
 home=$(sed -n 's/^home=//p' "$marker" 2>/dev/null | head -n 1)
+root=$(sed -n 's/^root=//p' "$marker" 2>/dev/null | head -n 1)
+root=${root:-$home}
 state=$(sed -n 's/^state=//p' "$marker" 2>/dev/null | head -n 1)
 [ -n "$home" ] && [ -n "$state" ] || {
   printf 'firstmate: invalid captain marker thread=%s path=%s\n' "$thread" "$marker" >&2; exit 1;
 }
 run_native() {
   local leaf=$1; shift
-  local run="$home/bin-bb/$leaf"
+  local run="$root/bin-bb/$leaf"
   [ -x "$run" ] || {
     printf 'firstmate: captain=%s missing executable %s\n' "$thread" "$run" >&2; return 1;
   }
   cd "$home" 2>/dev/null || {
     printf 'firstmate: captain=%s cannot enter home %s\n' "$thread" "$home" >&2; return 1;
   }
-  printf '%s' "$payload" | FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_STATE_OVERRIDE="$state" FM_BACKEND=bb FM_SUPERVISION_MODEL=autoarm "$run" "$@"
+  printf '%s' "$payload" | FM_HOME="$home" FM_ROOT_OVERRIDE="$root" FM_STATE_OVERRIDE="$state" FM_BACKEND=bb FM_SUPERVISION_MODEL=autoarm "$run" "$@"
 }
 
 bb_keeper_healthy() {
@@ -57,6 +59,13 @@ bb_keeper_healthy() {
     && [ "$watcher_beat" -le "$now" ] && [ $((now - watcher_beat)) -le 300 ]
 }
 
+# BB private Stop feedback continues a turn that may already contain a report.
+# Point that continuation back to native section 9, without consuming reports
+# or introducing a second reporting policy. Reporting sentences are exact native text.
+resume_outcome_report() {
+  printf '%s\n' 'Private Stop continuation: native AGENTS.md section 9 applies before handling. Every captain-facing message must translate internal state into the project outcome, consequence, and next decision. Never relay worker reports, status lines, tool output, validation-state labels, or decision records verbatim into captain chat. Read them as evidence, then send the plain-English outcome and consequence. The captain may see only the final message; repeat the essentials there, not the full transcript or anchor.' >&2
+}
+
 case "$mode" in
   stop)
     native_args=()
@@ -71,12 +80,14 @@ case "$mode" in
     [ "$active" = "true" ] && exit 0
     queue="${state}/.wake-queue"
     if [ -e "${state}/.bb-wake-receipt.json" ]; then
+      resume_outcome_report
       printf 'firstmate: a durable wake receipt still needs handling. Call firstmate_wake with ack=true to recover it; after handling all reports, pass handledWake on the final successful Firstmate action or firstmate_wake.\n' >&2
       exit 2
     fi
     [ -s "$queue" ] || exit 0
     rows=$(awk 'END { print NR }' "$queue" 2>/dev/null || echo 0)
     [ "${rows:-0}" -gt 0 ] 2>/dev/null || exit 0
+    resume_outcome_report
     printf 'firstmate: %s unhandled crew wake(s) for this captain. Call firstmate_wake with ack=true, handle all reports, then pass handledWake on the final successful Firstmate action or firstmate_wake.\n' "$rows" >&2
     exit 2
     ;;

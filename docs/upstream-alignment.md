@@ -1,7 +1,15 @@
+# Current launch and PR delivery alignment
+
+The audited pin is `1f3e769616fdf9f31f85f4c3e6a9f71606634238`. All four overlay patches apply exactly with zero fuzz and zero offset. The backend source loader uses the upstream positional sibling list (`set -- fm-composer-lib.sh fm-transition-lib.sh`). Native skill bytes and adapted clauses are checked against this pin.
+
+BB-specific adaptations add atomic creation metadata, durable launch reservations, host-consistent execution selection and an independent SQLite PR delivery register. They preserve native backlog, brief, isolation, authority and guarded-merge policy. Seeded secondmate homes are supported separately from registered domain routing. `wait-no-turns` remains native home-local opt-in. Detailed proofs and core API boundaries are in [verification](verification/launch-pr-lifecycle-progress.md).
+
+The historical audit below explains existing transport adaptations; where it names an older pin, the current pin above governs installed source and skill snapshots.
+
 # Audited native version
 
 The script surface, overlay patches and all 21 fidelity-managed skill files use
-`2d833ff147cd26a5c461e914e06854e0eb2707ce`. This is an audited commit, not a claim
+`1f3e769616fdf9f31f85f4c3e6a9f71606634238`. This is an audited commit, not a claim
 that the plugin follows upstream HEAD. `npm run fidelity` rejects a different
 skill or overlay pin; `--native` also checks the snapshot against Git objects.
 BB-specific captain, firstmate, ahoy, quiet and stow instructions remain adapters,
@@ -69,7 +77,7 @@ The preceding `4299683d` update added three callable scripts: `fm-git-strip-ai-t
 Use a disposable native clone containing the audited commit, never a live home:
 
 ```sh
-FM_TEST_HOME=/path/to/clone node scripts/patch-drift-check.mjs --ref 2d833ff147cd26a5c461e914e06854e0eb2707ce
+FM_TEST_HOME=/path/to/clone node scripts/patch-drift-check.mjs --ref 1f3e769616fdf9f31f85f4c3e6a9f71606634238
 npm run fidelity -- --native /path/to/clone
 FM_TEST_HOME=/path/to/clone node --experimental-strip-types scripts/live-mirror-check.mjs
 ```

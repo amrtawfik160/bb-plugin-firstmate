@@ -42,7 +42,7 @@ test("activity captures real tool progress and excludes watchdog/accounting chur
 function fixture(body: (run: (code: string) => ReturnType<typeof spawnSync>, files: string) => void) {
   const dir = mkdtempSync(join(tmpdir(), "fm-activity-test-"));
   const bin = join(dir, "bin"); mkdirSync(bin);
-  const snapshot = { version: 1, threadId: "thr_test", status: "active", output: "assistant unchanged", activity: { seq: 8, type: "item/completed", createdAt: 100 } };
+  const snapshot = { version: 1, threadId: "thr_test", status: "active", runtimeStatus: "active", interactionCount: 0, output: "assistant unchanged", activity: { seq: 8, type: "item/completed", createdAt: 100 } };
   writeFileSync(join(dir, "activity"), JSON.stringify(snapshot));
   writeFileSync(join(dir, "show"), JSON.stringify({ thread: { status: "active", queuedMessageCount: 3 } }));
   writeFileSync(join(dir, "receipt"), JSON.stringify({ ok: true, delivery: "sent" }));
@@ -121,9 +121,22 @@ test("open interaction, unavailable host, and a queued turn are not active execu
   snapshot.interactionCount = 0; snapshot.runtimeStatus = "host-reconnecting";
   writeFileSync(join(dir, "activity"), JSON.stringify(snapshot));
   assert.equal(busy(), "unknown");
+  snapshot.interactionCount = 1;
+  writeFileSync(join(dir, "activity"), JSON.stringify(snapshot));
+  assert.equal(busy(), "unknown", "an interaction cannot make an unavailable host idle");
   snapshot.runtimeStatus = "pending"; snapshot.status = "pending"; snapshot.queuedMessageCount = 1;
   writeFileSync(join(dir, "activity"), JSON.stringify(snapshot));
   assert.equal(busy(), "unknown");
+}));
+
+test("BB idle transport evidence rejects incomplete, malformed and foreign activity snapshots", () => fixture((run, dir) => {
+  const idle = { ...JSON.parse(readFileSync(join(dir, "activity"), "utf8")), status: "idle", runtimeStatus: "idle" };
+  const busy = () => run("fm_backend_bb_busy_state thr_test").stdout;
+  writeFileSync(join(dir, "activity"), JSON.stringify(idle));assert.equal(busy(), "idle");
+  for (const patch of [{ version: true }, { threadId: "thr_foreign" }, { runtimeStatus: null }, { runtimeStatus: "future-state" }, { interactionCount: null }, { interactionCount: true }, { interactionCount: -1 }, { status: null }, { status: "future-state", interactionCount: 1 }]) {
+    writeFileSync(join(dir, "activity"), JSON.stringify({ ...idle, ...patch }));assert.equal(busy(), "unknown", JSON.stringify(patch));
+  }
+  writeFileSync(join(dir, "activity"), "not JSON");assert.equal(busy(), "unknown");
 }));
 
 

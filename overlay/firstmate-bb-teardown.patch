@@ -1,8 +1,8 @@
 diff --git a/bin/fm-teardown.sh b/bin/fm-teardown.sh
-index a1cf67c2..a45177a7 100755
+index 24ed4644..dd5252de 100755
 --- a/bin/fm-teardown.sh
 +++ b/bin/fm-teardown.sh
-@@ -365,7 +365,7 @@ if [ -f "$META" ] && [ ! -L "$META" ]; then
+@@ -426,7 +426,7 @@ if [ -f "$META" ] && [ ! -L "$META" ]; then
    TEARDOWN_LOCK_WT=$(fm_meta_get "$META" worktree)
    TEARDOWN_LOCK_PROJECT=$(fm_meta_get "$META" project)
    if [ "$TEARDOWN_LOCK_KIND" != secondmate ] \
@@ -11,8 +11,8 @@ index a1cf67c2..a45177a7 100755
       && fm_treehouse_pool_slot "$TEARDOWN_LOCK_PROJECT" "$TEARDOWN_LOCK_WT"; then
      TREEHOUSE_SLOT_LOCK_REQUIRED=1
      TREEHOUSE_PROJECT_LOCK=$(fm_treehouse_project_lock_path "$TEARDOWN_LOCK_PROJECT") || {
-@@ -1071,7 +1071,7 @@ CLEANUP_RECOVERY=$TEARDOWN_CLEANUP_RECOVERY
-
+@@ -1140,7 +1140,7 @@ CLEANUP_RECOVERY=$TEARDOWN_CLEANUP_RECOVERY
+ 
  KIND=$TEARDOWN_META_KIND
  EXPECTED_TREEHOUSE_PROJECT_LOCK=
 -if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] \
@@ -20,7 +20,7 @@ index a1cf67c2..a45177a7 100755
     && fm_treehouse_pool_slot "$PROJ" "$WT"; then
    EXPECTED_TREEHOUSE_PROJECT_LOCK=$(fm_treehouse_project_lock_path "$PROJ") || {
      echo "REFUSED: cannot resolve the shared Treehouse project lock for ${PROJ:-<missing>}; nothing was changed" >&2
-@@ -2860,7 +2860,7 @@ preflight_descendant_treehouse_slots() {
+@@ -2942,7 +2942,7 @@ preflight_descendant_treehouse_slots() {
      backend=$(fm_backend_of_meta "$meta")
      worktree=$(meta_value "$meta" worktree)
      project=$(meta_value "$meta" project)
@@ -29,7 +29,7 @@ index a1cf67c2..a45177a7 100755
        continue
      fi
      if ! fm_treehouse_pool_slot "$project" "$worktree"; then
-@@ -2893,7 +2893,7 @@ preflight_descendant_treehouse_slots() {
+@@ -2975,7 +2975,7 @@ preflight_descendant_treehouse_slots() {
      backend=$(fm_backend_of_meta "$meta")
      worktree=$(meta_value "$meta" worktree)
      project=$(meta_value "$meta" project)
@@ -38,7 +38,7 @@ index a1cf67c2..a45177a7 100755
        continue
      fi
      if ! fm_treehouse_pool_slot "$project" "$worktree"; then
-@@ -3508,6 +3508,13 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
+@@ -3591,6 +3591,13 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
        || { endpoint_close_refusal "$ID" "$BACKEND" "$T" 0; exit 1; }
    fi
    fm_backend_remove_worktree "$BACKEND" "$ORCA_WORKTREE_ID"
@@ -52,7 +52,7 @@ index a1cf67c2..a45177a7 100755
  elif [ "$KIND" != secondmate ] && ! teardown_owns_worktree; then
    :
  elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
-@@ -3583,7 +3590,7 @@ elif [ "$BACKEND" = herdr ]; then
+@@ -3682,7 +3689,7 @@ elif [ "$BACKEND" = herdr ]; then
    else
      echo "warning: herdr session presentation lock path is unavailable; skipping the pane close rather than closing unlocked" >&2
    fi

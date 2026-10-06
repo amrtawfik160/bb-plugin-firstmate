@@ -68,13 +68,27 @@ try {
     console.log("note: checked commit differs from the pinned base; verifying the patches still apply.");
   }
 
+  // Resolve through the installer's registry, so audited old/new pins exercise
+  // their own loader loops. Unknown upstream HEAD is unsupported until audited.
+  const selected = sh("python3", ["-c", [
+    "import importlib.util,json,pathlib,sys",
+    "p=pathlib.Path(sys.argv[1]);s=importlib.util.spec_from_file_location('installer',p/'install-bb-backend.py');m=importlib.util.module_from_spec(s);s.loader.exec_module(m)",
+    "print(json.dumps([str(x) for x in m.select_patch_set(pathlib.Path(sys.argv[2]),p)[1]]))",
+  ].join("\n"), OVERLAY, clone]);
+  if(selected.code !== 0) {
+    console.log(`UNSUPPORTED: no audited patch set for ${head}. ${selected.out}`);
+    process.exitCode = 1;
+    throw new Error("native source must be audited before patch application");
+  }
+  const patches = JSON.parse(selected.stdout);
+
   // Dry-run apply exactly as install-bb-backend.py does (patch -p1 --forward --batch),
   // but with --dry-run so nothing is written. A failure is ANY of: non-zero exit, a
   // "FAILED" line, or an "ignored" (already/partly-applied) line.
   let drifted = false;
-  for (const p of ["firstmate-bb-backend.patch", "firstmate-bb-teardown.patch", "firstmate-bb-local-merge.patch", "firstmate-bb-browser.patch"]) {
-    const r = sh("patch", ["-p1", "--forward", "--batch", "--dry-run", "-i", join(OVERLAY, p)], { cwd: clone });
-    const bad = r.code !== 0 || /FAILED/.test(r.out) || /hunks ignored|fuzz/.test(r.out);
+  for (const p of patches) {
+    const r = sh("patch", ["-p1", "--fuzz=0", "--forward", "--batch", "--dry-run", "-i", p], { cwd: clone });
+    const bad = r.code !== 0 || /FAILED/.test(r.out) || /hunks ignored|fuzz|offset/.test(r.out);
     console.log(`\n== ${p}: ${bad ? "DRIFTED" : "applies clean"} (patch exit=${r.code}) ==`);
     if (bad) {
       drifted = true;

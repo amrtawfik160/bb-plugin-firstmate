@@ -8,8 +8,8 @@ metadata:
 
 <!-- BB-SOURCE
      native: .agents/skills/stow/SKILL.md
-     sha: 2d833ff147cd26a5c461e914e06854e0eb2707ce
-     snapshot: native-snapshot/2d833ff1/skills/stow/SKILL.md
+     sha: 1f3e769616fdf9f31f85f4c3e6a9f71606634238
+     snapshot: native-snapshot/1f3e7696/skills/stow/SKILL.md
      fidelity: verbatim -->
 
 <!-- maintainers: this is the firstmate-internal skill. The public, installer-facing counterpart lives at skills/stow/SKILL.md - deliberately a separate file with no shared code or environment branching. Keep them independent. -->

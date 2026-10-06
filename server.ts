@@ -1,5 +1,11 @@
+import {METHODS_PROFILE,METHODS_REVISION,methodPointer,methodResource,installedPrResource,selectedPrSource,prSourcePage,type PrSource} from "./lib/selected-methods.ts";
 // bb-plugin-firstmate — firstmate-style crews native to BB.
 import { deflateSync } from "node:zlib";
+import { CAPTAIN_ROLE_INSTRUCTIONS } from "./lib/captain-role.ts";
+import { contractPage, contractCursorSection } from "./lib/contract-transport.ts";
+import { routedIntakeSchema, renderRoutedIntake } from "./lib/secondmate-intake.ts";
+import { skillPage, skillCursorRequest } from "./lib/skill-transport.ts";
+import { DISPATCH_TRANSPORT, FM_WRAPPER_HELP, taskDelivery, nativeDispatchIntake } from "./lib/dispatch-intake.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -49,16 +55,28 @@ import {
   type Verdict,
 } from "./lib/policy.ts";
 import { parseWakeReceipt, renderWakeReceipt, type WakeReceipt } from "./lib/wake-receipt.ts";
-import { readBbActivity } from "./lib/bb-activity.ts";
+import { BB_ACTIVITY_TYPES, readBbActivity } from "./lib/bb-activity.ts";
 import { ORPHAN_SWEEP_BUDGET_MS, ORPHAN_SWEEP_INTERVAL_MS, parseStaleLavishSources, staleLavishSourceScript } from "./lib/orphan-decisions.ts";
 import { nativeBearingsProjection } from "./lib/native-bearings.ts";
 import { createSnapshotReads } from "./lib/snapshot-reads.ts";
+import { scoutReports } from "./lib/scout-report.ts";
+import { replacementPlan, type ReplacementIntent } from "./lib/replacement.ts";
+import {pluginAssetRoot} from "./lib/plugin-assets.ts";
+import {createNativeRuntime, runtimeRootAssign} from "./lib/native-runtime.ts";
+import { boundedCaptainStartup, captainBindingText } from "./lib/captain-startup.ts";
+import { createQueueStore, type QueueItem } from "./lib/queue-store.ts";
+import { createLaunches, launchKey, launchTaskKey, discoverLaunch, launchIntakeSchema, type LaunchRecord } from "./lib/launch.ts";
+import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
+import { optionHelp } from "./lib/cli-help.ts";
+import { AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython, nativeDescriptions } from "./lib/native-policy.ts";
+import { createDeliveries, canonicalPr, deliveryLine, parseForge, type DeliveryRecord } from "./lib/pr-delivery.ts";
+import { captureHostCommand, decodeHostCapture } from "./lib/host-capture.ts";
+import { selectExecution, validateLaunchCapabilities } from "./lib/execution-selection.ts";
 import { rpcContract } from "./rpc.ts";
 import {
   UPSTREAM_FIRSTMATE_SHA,
   PINNED_SCRIPT_SUPPORT_FILES,
   UPSTREAM_SCRIPT_NAMES,
-  UPSTREAM_SKILL_NAMES,
 } from "./lib/upstream-surface.ts";
 import {
   FIRSTMATE_ATTENTION_MARKER,
@@ -69,6 +87,7 @@ const shapeSchema = z.enum(["ship", "scout"]);
 const modeSchema = z.enum(["direct-PR", "no-mistakes", "local-only"]);
 
 const crewSchema = z.object({
+  yolo:z.boolean().optional(),
   id: z.string(),
   task: z.string(),
   projectId: z.string(),
@@ -96,6 +115,7 @@ const crewSchema = z.object({
   // Recovery relaunches so far and the threads they replaced, so the stuck ladder
   // stops at its second failure and a replaced thread id still resolves.
   relaunches: z.number().optional(),
+  replacementGeneration:z.number().int().positive().optional(),
   priorThreadIds: z.array(z.string()).optional(),
   // The dispatch title the captain asked for. Relaunch reuses it and captain-facing
   // labels prefer it over the raw task quote.
@@ -105,6 +125,10 @@ const crewSchema = z.object({
   prUrl: z.string().optional(),
   // true = `task` holds only a prefix; the full brief lives under crew-task:<id>.
   taskSpilled: z.boolean().optional(),
+  launchKey: z.string().optional(),
+  deliveryRequirement: z.enum(["branch", "pr", "merged", "merged-and-verified"]).optional(),
+  branchPrefix:z.string().max(120).optional(),
+  routedIntake:routedIntakeSchema.optional(),
   createdAt: z.string(),
 });
 type Crew = z.infer<typeof crewSchema>;
@@ -115,38 +139,6 @@ function crewLabel(crew: { task: string; title?: string }): string {
   return title !== "" ? title : crew.task;
 }
 
-const queueItemSchema = z.object({
-  nativeHome: z.string().optional(),
-  id: z.string(),
-  title: z.string(),
-  detail: z.string().default(""),
-  projectId: z.string(),
-  shape: shapeSchema.default("ship"),
-  mode: z.string().default(""),
-  blockedBy: z.array(z.string()).default([]),
-  // Crew launch choices carried from `queue add` to `queue dispatch`.
-  providerId: z.string().optional(),
-  model: z.string().optional(),
-  reasoningLevel: z.string().optional(),
-  waitUntil: z.string().nullable().default(null),
-  status: z.enum(["queued", "dispatched", "done", "dropped"]).default("queued"),
-  crewId: z.string().nullable().default(null),
-  // D4: the captain thread that queued this row. Scopes the backlog to its owner
-  // (own-by-default in deck/bearings/session, host-wide under --all), matching how
-  // crews/session already scope. Optional for back-compat: rows persisted before
-  // this field are unattributed and surface only under --all.
-  parentThreadId: z.string().nullish(),
-  // The real data/backlog.md row id (fm-tasks-axi.sh) when queueOwner=real, so
-  // dispatch/done/drop can drive the paired backlog transition. We now supply this
-  // id ourselves (native caller-owns-the-id convention) = the KV item id on a
-  // successful add. undefined = KV-only (real mode off, or the add failed).
-  backlogId: z.string().optional(),
-  // Legacy (kept for back-compat with rows persisted before the id-ownership
-  // switch, when an unparseable `add` output was quarantined). No longer written.
-  backlogUnparsed: z.boolean().optional(),
-  createdAt: z.string(),
-});
-type QueueItem = z.infer<typeof queueItemSchema>;
 
 const decisionSchema = z.object({
   nativeTaskId: z.string().optional(),
@@ -165,6 +157,7 @@ const decisionSchema = z.object({
 type Decision = z.infer<typeof decisionSchema>;
 
 const doneSchema = z.object({
+  deliveryRequirement:z.enum(["branch","pr","merged","merged-and-verified"]).optional(),
   id: z.string(),
   task: z.string(),
   shape: shapeSchema.default("ship"),
@@ -179,8 +172,9 @@ const doneSchema = z.object({
 type DoneEntry = z.infer<typeof doneSchema>;
 
 const postureSchema = z.object({
-  mode: modeSchema.default("direct-PR"),
+  mode: modeSchema.default("no-mistakes"),
   yolo: z.boolean().default(false),
+  provenance:z.object({source:z.literal("captain-instruction"),actor:z.string(),at:z.string(),reason:z.string()}).optional(),
 });
 type Posture = z.infer<typeof postureSchema>;
 
@@ -302,24 +296,12 @@ const CAPTAIN_LIVE_WINDOW_MS = 24 * 60 * 60_000;
 const READ_THROUGH_GRACE_MS = 15 * 60_000;
 // Row cap for a text crew listing, so `crews all=true` never floods the context.
 const MAX_CREW_LIST_ROWS = 40;
-// Newest of these is "tool/file activity". Output text alone false-alarms while a crew is editing.
-const TOOL_ACTIVITY_TYPES = [
-  "item/toolCall/progress",
-  "item/mcpToolCall/progress",
-  "item/commandExecution/outputDelta",
-  "item/fileChange/outputDelta",
-  "item/backgroundTask/progress",
-  "item/backgroundTask/completed",
-  "item/delegation/progress",
-  "item/delegation/completed",
-  "turn/diff/updated",
-] as const;
 const MAX_QUEUE = 100;
 const MAX_DECISIONS = 100;
 const MAX_DONE = 10;
 const MAX_TASK = 4000;
 const MAX_OUTPUT = 4000;
-const PLUGIN_ROOT = dirname(fileURLToPath(import.meta.url));
+const PLUGIN_ROOT = pluginAssetRoot(import.meta.url);
 const OVERLAY_DIR = join(PLUGIN_ROOT, "overlay");
 const FM_SCRIPT = /^[a-z0-9][a-z0-9-]*$/;
 
@@ -468,7 +450,7 @@ function shQuote(text: string): string {
 // so a home that is not bb-installed (or a pre-migration home) transparently uses bin.
 function fmBinDirAssign(fmHome: string): string {
   const q = shQuote(fmHome);
-  return `FM_BINDIR=${q}/bin; if [ -f ${q}/config/bb-overlay ] && [ -d ${q}/bin-bb ]; then FM_BINDIR=${q}/bin-bb; fi`;
+  return `${runtimeRootAssign(fmHome)}; FM_BINDIR="$FM_RUNTIME_ROOT/bin"; if [ -f "$FM_RUNTIME_ROOT/config/bb-overlay" ] && [ -d "$FM_RUNTIME_ROOT/bin-bb" ]; then FM_BINDIR="$FM_RUNTIME_ROOT/bin-bb"; fi`;
 }
 
 // Loud staleness guard (F2). The plugin's own fast-forward (initRealMode) always
@@ -481,17 +463,23 @@ function fmBinDirAssign(fmHome: string): string {
 // callers no longer swallow that. Wired into BOTH the dispatch paths (runFmScript,
 // fm-brief scaffold) and the SUPERVISION paths (the watch keeper's per-re-arm check and
 // checkWatcher's per-poll check), so a stale watcher-arm is loud too. Runs only when
-// FM_BINDIR is the mirror. Cheap (~6ms: sed + git rev-parse). Must be emitted AFTER
+// FM_BINDIR is the mirror. Checks HEAD and hashes the small owned transport bundle. Must be emitted AFTER
 // fmBinDirAssign.
 function fmMirrorStaleGuard(fmHome: string): string {
   const q = shQuote(fmHome);
+  // Compare actual owned transport files, including newly shipped companions.
+  // A bundle marker alone cannot prove an interrupted/manual refresh copied them.
+  const payloads=Object.fromEntries(OVERLAY_INSTALL_INPUTS.filter(rel=>rel.startsWith("bin/")).map(rel=>[
+    rel.slice(4), createHash("sha256").update(readFileSync(join(OVERLAY_DIR,rel))).digest("hex"),
+  ]));
+  const verifyPayloads="import hashlib,json,pathlib,sys;root=pathlib.Path(sys.argv[1]);expected=json.loads(sys.argv[2]);bad=[name for name,digest in expected.items() if (root/name).is_symlink() or not (root/name).is_file() or hashlib.sha256((root/name).read_bytes()).hexdigest()!=digest];print('FM_MIRROR_STALE: BB transport payloads stale/missing: '+', '.join(bad),file=sys.stderr) if bad else None;sys.exit(1 if bad else 0)";
   return (
-    `if [ "$FM_BINDIR" = ${q}/bin-bb ]; then ` +
+    `if [ "\${FM_BUNDLED_VERIFIED:-}" != 1 ] && [ "$FM_BINDIR" = ${q}/bin-bb ]; then ` +
     `__fm_mh=$(sed -n 's/^head=//p' ${q}/bin-bb/.mirror-manifest 2>/dev/null); ` +
     `__fm_ch=$(git -C ${q} rev-parse HEAD 2>/dev/null || true); ` +
     `if [ -n "$__fm_mh" ] && [ -n "$__fm_ch" ] && [ "$__fm_mh" != "$__fm_ch" ]; then ` +
     `echo "FM_MIRROR_STALE: bb mirror built at $__fm_mh but HEAD is $__fm_ch; re-run install-bb-backend.py --home ${fmHome}" >&2; ` +
-    `fi; fi`
+    `fi; python3 -c ${shQuote(verifyPayloads)} "$FM_BINDIR" ${shQuote(JSON.stringify(payloads))} || exit 1; fi`
   );
 }
 
@@ -557,7 +545,7 @@ export function fmBackendEnv(input: {
     input.projectId !== undefined ? `export FM_BB_PROJECT_ID=${shQuote(input.projectId)}` : "",
     input.parentThreadId !== undefined ? `export FM_BB_PARENT_THREAD_ID=${shQuote(input.parentThreadId)}` : "",
     `export FM_BB_MACHINE=${shQuote(input.hostId)}`,
-    "export FM_BB_VISIBLE=1",
+
     // A bb-backed home has no live watcher holding the lock between wakes (the keeper re-arms
     // fm-watch, which exits on every actionable wake), so fm-harness detection — run by the bb
     // daemon detached from any agent — resolves to `unknown` → the `persistent` model, which
@@ -620,7 +608,7 @@ export function fmWatchKeeperScript(hostId: string, fmHome: string, interval: nu
     `export FM_ROOT=${shQuote(fmHome)}`,
     "export FM_BACKEND=bb",
     `export FM_BB_MACHINE=${shQuote(hostId)}`,
-    "export FM_BB_VISIBLE=1",
+
     // The bb-backed home is the auto-arm supervision model (see fmBackendEnv): the keeper re-arms
     // fm-watch, which runs only between wakes. Declare it so the watcher it launches judges a
     // fresh beacon with no live lock-holder as healthy.
@@ -979,7 +967,7 @@ export function selectContract(content: string, section: string | undefined): { 
 export function captainStartupCommand(home: string, script: string, args: readonly string[] = []): string | null {
   const stem = normalizeFmScript(script);
   if (!["session-start", "sessionstart-run", "sessionstart-nudge"].includes(stem)) return null;
-  return `cd ${shQuote(home)} && FM_HOME=${shQuote(home)} FM_ROOT_OVERRIDE=${shQuote(home)} FM_BACKEND=bb ${shQuote(`${home}/bin-bb/fm-${stem}.sh`)}${args.map(arg => ` ${shQuote(arg)}`).join("")}`;
+  return `cd ${shQuote(home)} && { ${fmBinDirAssign(home)}; FM_HOME=${shQuote(home)} FM_BACKEND=bb "$FM_BINDIR/fm-${stem}.sh"${args.map(arg => ` ${shQuote(arg)}`).join("")}; }`;
 }
 
 // BB thread ids named in an fm-watch line ("stale: bb:thr_abc (idle 257s, …)").
@@ -1025,26 +1013,29 @@ export function wakeAckFromOutput(out: string): { ackThrough: number; recoveryGe
   return m ? { ackThrough: Number(m[1]), recoveryGeneration: m[2]! } : null;
 }
 
-// A long-lived captain's context only grows, and every wake re-reads all of it, so
-// a 500k-token captain paid ~500k tokens per model call just to absorb a doorbell.
-// Compact an idle captain once it passes the budget, at most once per cooldown.
+// The token budget is a floor, not evidence of pressure on a larger model.
 export function captainCompactDue(input: {
   usedTokens: number | null;
+  modelContextWindow: number | null;
+  estimated: boolean;
   budget: number;
   lastCompactAt: number | null;
   now: number;
   cooldownMs: number;
 }): boolean {
-  if (!(input.budget > 0) || input.usedTokens === null || input.usedTokens < input.budget) return false;
+  if (!Number.isFinite(input.budget) || !(input.budget > 0) || input.estimated !== false) return false;
+  const { usedTokens, modelContextWindow } = input;
+  if (usedTokens === null || modelContextWindow === null || !Number.isFinite(usedTokens) || !Number.isFinite(modelContextWindow)) return false;
+  if (modelContextWindow <= 0 || usedTokens > modelContextWindow || usedTokens < Math.max(input.budget, modelContextWindow * 0.9)) return false;
   return input.lastCompactAt === null || input.now - input.lastCompactAt >= input.cooldownMs;
 }
 
 // Captain providers that run the user-level Stop/SessionStart hooks this plugin installs.
 export const HOOKED_CAPTAIN_PROVIDERS: ReadonlySet<string> = new Set(["claude-code", "codex"]);
 
-// Extra deck guidance for a captain whose harness skips those hooks (ACP providers
-// such as Grok): nothing enforces the wake guard or runs session start there, so the
-// rules the hooks would have enforced are stated explicitly.
+// Compatibility presentation export for consumers of hook availability. Deck
+// now returns bound startup guidance for every provider through captain-startup;
+// it no longer performs an extra provider lookup for this optional note.
 export function unhookedCaptainNote(providerId: string): string {
   if (providerId === "" || HOOKED_CAPTAIN_PROVIDERS.has(providerId)) return "";
   return [
@@ -1086,7 +1077,7 @@ export function captainHookCommand(mode: "stop" | "stop-autoarm" | "session-star
   return `h="$HOME/.${CAPTAIN_HOOK_MARK}"; [ -n "\${BB_THREAD_ID:-}" ] || exit 0; [ -f "$HOME/.bb-firstmate/captains/$BB_THREAD_ID" ] || exit 0; [ -x "$h" ] || { echo "firstmate: registered captain missing hook $h" >&2; exit 1; }; exec "$h" ${mode}${claude ? " --claude" : ""}`;
 }
 export function captainHookInstallScript(input: {
-  threadId: string; home: string; state: string; ownHome: boolean; scriptB64: string;
+  threadId: string; home: string; state: string; ownHome: boolean; scriptB64: string; runtimeRoot?:string;
 }): string {
   const q = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
   const install = (file: string, claude: boolean) => {
@@ -1102,7 +1093,7 @@ export function captainHookInstallScript(input: {
   return ["set -e", "command -v jq >/dev/null",
     'd="$HOME/.bb-firstmate"; mkdir -p "$d/bin" "$d/captains"',
     `printf %s ${q(input.scriptB64)} | base64 -d > "$d/bin/bb-captain-hook.sh.tmp" && chmod 0755 "$d/bin/bb-captain-hook.sh.tmp" && mv "$d/bin/bb-captain-hook.sh.tmp" "$d/bin/bb-captain-hook.sh"`,
-    `printf 'home=%s\nstate=%s\nown_home=%s\n' ${q(input.home)} ${q(input.state)} ${input.ownHome ? "1" : "0"} > "$d/captains/${input.threadId}"`,
+    `printf 'home=%s\nstate=%s\nown_home=%s\nroot=%s\n' ${q(input.home)} ${q(input.state)} ${input.ownHome ? "1" : "0"} ${q(input.runtimeRoot??input.home)} > "$d/captains/${input.threadId}"`,
     'mkdir -p "$HOME/.claude" "$HOME/.codex"',
     install('"$HOME/.claude/settings.json"', true), install('"$HOME/.codex/hooks.json"', false),
     "echo captain-hooks-ok",
@@ -1118,12 +1109,25 @@ function overlayBytes(rel: string): string {
 export const OVERLAY_INSTALL_INPUTS = [
   "bin/backends/bb.sh",
   "bin/backends/bb-worker-transport.txt",
+  "bin/backends/bb-worker-prompt.py",
   "bin/fm-inbox-take.sh",
+  "bin/fm-inbox-take.py",
+  "bin/fm-launch-adopt.sh",
+  "bin/fm-launch-adopt.py",
+  "bin/fm-worker-rebind.sh",
+  "bin/fm-worker-rebind.py",
+  "bin/fm-bb-probe-lib.sh",
+  "bin/fm-worker-checkpoint.py",
   "docs/bb-backend.md",
   "firstmate-bb-backend.patch",
   "firstmate-bb-teardown.patch",
   "firstmate-bb-local-merge.patch",
   "firstmate-bb-browser.patch",
+  "patch-sets.json",
+  "compat/2d833ff147cd26a5c461e914e06854e0eb2707ce/firstmate-bb-backend.patch",
+  "compat/2d833ff147cd26a5c461e914e06854e0eb2707ce/firstmate-bb-teardown.patch",
+  "compat/2d833ff147cd26a5c461e914e06854e0eb2707ce/firstmate-bb-local-merge.patch",
+  "compat/2d833ff147cd26a5c461e914e06854e0eb2707ce/firstmate-bb-browser.patch",
   "install-bb-backend.py",
 ] as const;
 
@@ -1135,11 +1139,6 @@ export function overlayFingerprint(dir = OVERLAY_DIR): string {
     digest.update(Buffer.concat([Buffer.from(rel), Buffer.from([0]), bytes, Buffer.from([0])]));
   }
   return digest.digest("hex");
-}
-
-export function nativeWorkerTransport(home: string, taskId: string): string {
-  return readFileSync(join(OVERLAY_DIR, "bin/backends/bb-worker-transport.txt"), "utf8").trim()
-    .replaceAll("{FM_HOME}", home).replaceAll("{FM_BINDIR}", `${home}/bin-bb`).replaceAll("{TASK_ID}", taskId);
 }
 
 function normalizeFmScript(raw: string): string {
@@ -1255,6 +1254,9 @@ function flagStr(flags: Map<string, FlagValue>, ...keys: string[]): string | und
   }
   return undefined;
 }
+function flagStrAllowEmpty(flags:Map<string,FlagValue>,key:string):string|undefined {
+  const value=flags.get(key);return typeof value==='string' ? value : Array.isArray(value) ? value[0] : undefined;
+}
 
 function flagAll(flags: Map<string, FlagValue>, ...keys: string[]): string[] {
   const out: string[] = [];
@@ -1350,17 +1352,24 @@ function summarizePR(value: unknown): string {
   return parts.length > 0 ? parts.join(" ") : "none";
 }
 
-const CAPTAIN_SKILLS = ["captain", "firstmate", "calm", "catch-up", ...UPSTREAM_SKILL_NAMES] as const;
+// BB packages only selected skill directories. Keep the complete cold-entry
+// reference closure available before deck binding, without role methods.
+const CAPTAIN_BOOTSTRAP_SKILLS = ["firstmate", "captain"] as const;
+const CAPTAIN_BOOTSTRAP_TOOLS = ["firstmate_deck", "firstmate_contract"] as const;
+const CAPTAIN_SKILLS = ["captain", "firstmate"] as const;
 const CAPTAIN_TOOLS = [
   "firstmate_dispatch",
+  "firstmate_runtime",
   "firstmate_deck",
   "firstmate_tell",
   "firstmate_interrupt",
   "firstmate_watch",
   "firstmate_contract",
+  "firstmate_skill",
   "firstmate_bearings",
   "firstmate_wake",
   "firstmate_deliver",
+  "firstmate_deliveries",
   "firstmate_merge",
   "firstmate_decide",
   "firstmate_crew",
@@ -1384,16 +1393,15 @@ const CAPTAIN_TOOLS = [
   "firstmate_fm",
 ] as const;
 
-const CAPTAIN_CONTRACT_POINTER = "Before orchestrating, read firstmate_contract without a section for the complete native supervisor contract. If its startup digest is absent, call firstmate_fm script=session-start and run the supplied command through your agent shell.";
+const CAPTAIN_CONTRACT_POINTER = "Before orchestrating, call firstmate_deck (ACP/CLI: bb firstmate deck --json) to bind this thread's native home, then read firstmate_contract without a section and follow every cursor (ACP/CLI: bb firstmate contract --paged, then --cursor) for the complete native supervisor contract and its selected-runtime skill trigger catalog. If the startup digest is absent, run deck's exact command through your agent shell; firstmate_fm script=session-start returns it again. Failed prerequisites, lock refusal or a truncated digest remain unresolved.";
 
 const BB_SKILL_RUNTIME_CONTRACT = [
   "BB adapter for every upstream firstmate skill:",
   "The complete native supervisor contract and imported upstream skills own policy; the following mappings only adapt execution to BB.",
-  "Calm reporting is the captain default: read the calm skill before replying to supervision events. It owns BB presentation, including silent routine wakes; keep required outcomes and escalations visible. The captain can invoke /catch-up for a concise recovery brief.",
   "Translate bin/fm-<name>.sh calls to firstmate_fm with script=<name> and the same arguments; use bb firstmate fm <name> only when a shell command is required.",
-  "In imported skills, ../../../AGENTS.md means the complete contract returned by firstmate_contract, and ../../../bin, data, state, config, and docs refer to fmHome rather than this plugin directory.",
+  "Load native policy skills and their references with firstmate_skill (ACP/CLI: bb firstmate skill <name> [reference] [--source <selected-root source-file>] --paged), following every returned cursor to the end marker; it reads this captain’s selected runtime. Native AGENTS.md means firstmate_contract; bin and docs mean the selected runtime, while data, state and config mean the exact bound captain home returned by deck.",
   "Map workers, panes, and tabs to BB crew threads via firstmate_dispatch/tell/interrupt/retry/stop. Call firstmate_watch once per batch; it hands off to private durable wakes. End the turn; never retry or poll.",
-  "Use BB interactions for captain questions and approvals.",
+  "Use BB interactions for captain questions and approvals. firstmate_deliveries retains open PRs after worker retirement and wake acknowledgement. Continue authorized review/fix/merge work using the author for fixes and preserving the agreed native review and validation path, including independent review when required; merge through firstmate_merge. Inspect unresolved delivery records after compaction or handoff.",
   "Run firstmate_toolchain for native dependency detection. For browser work use the /browser skill and browser_script (or bb browser script), with profileId unset for the thread-isolated default. This replaces native chrome-devtools-axi transport. Read config/lavish-axi-host for remote Lavish access and use bb connect expose for a board the captain should see.",
   "Treat tmux, herdr, zellij, cmux, orca, and harness-specific hook setup as reference material unless the active backend explicitly names that runtime.",
 ].join(" ");
@@ -1527,16 +1535,27 @@ function isBlankTitle(title: unknown): boolean {
 
 export default async function plugin(bb: BbPluginApi) {
   bb.log.info("loaded");
+  const queueStore = createQueueStore(bb.storage.database(), () => bb.storage.kv.get(QUEUE_KEY));
+  const launches = createLaunches(bb.storage.database());
+  const reports=scoutReports(bb.storage.database());
+  const deliveries = createDeliveries(bb.storage.database());
+  const launchAbort = new AbortController();
+  const nativeRuntime=createNativeRuntime({assets:join(PLUGIN_ROOT,"runtime-assets"),files:()=>bb.sdk.files,disposal:launchAbort.signal,run:runStructuredOnHost});
+  let followUpWork:Promise<void>|undefined;
+  bb.onDispose(async () => { launchAbort.abort();await followUpWork?.catch(()=>{}); });
 
   const baseSettings = bb.settings.define({
+    selectedMethods: { type:"select",label:"Explicit installation-wide BB methods selection; native policy stays authoritative",options:["off","selected-v1"],default:"off" },
+    selectedPrSource:{type:"string",label:"Validated /pr ID/revision/hash; select through methods enable --pr-skill",default:""},
+    selectedMethodsReason: { type:"string",label:"Recorded explicit methods selection source/reason",default:"" },
     firstmateRepo: {
       type: "string",
-      label: "Firstmate repo URL (used by init --real)",
+      label: "Firstmate attribution URL; bundled startup never clones or updates it",
       default: "https://github.com/kunchenguid/firstmate",
     },
     fmHome: {
       type: "string",
-      label: "Firstmate home on the host (bin/ + config/). Set by init --real.",
+      label: "Legacy external Firstmate source/home; blank uses the bundled pinned runtime and durable per-thread homes.",
       default: "",
     },
     fmScriptCount: {
@@ -1561,7 +1580,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
     fmSkillsManifest: {
       type: "string",
-      label: "Version-pinned inventory of fmHome/.agents/skills (JSON {head,skills[]}); set by init/deck, injected into captain sessions.",
+      label: "Diagnostic inventory of the selected native runtime's .agents/skills (JSON {head,skills[]}); refreshed by init/deck. Policy reads use firstmate_skill.",
       default: "",
     },
     fullParityOnDeck: {
@@ -1571,7 +1590,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
     transport: {
       type: "select",
-      label: "Crew dispatch transport: native BB spawn, or the real fm-brief.sh + fm-spawn.sh scripts (backend=bb). Falls back to native if real spawn fails before a thread exists.",
+      label: "Crew dispatch transport: native BB spawn, or the real fm-brief.sh + fm-spawn.sh scripts (backend=bb). Real spawn failure refuses dispatch; no fallback worker is started.",
       options: ["native", "real"],
       default: "native",
     },
@@ -1598,7 +1617,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
     queueOwner: {
       type: "select",
-      label: "Backlog owner: kv (BB KV list) or real (fm-tasks-axi.sh + data/backlog.md; needs tasks-axi on the host). Real writes through to KV as a cache; falls back to KV with a log if the real backlog is unreachable.",
+      label: "Backlog owner: kv (BB SQLite queue) or real (native backlog + SQLite queue; needs tasks-axi on the host). Native failures retain a gated record for explicit reconcile.",
       options: ["kv", "real"],
       default: "kv",
     },
@@ -1659,7 +1678,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
     captainCompactAtTokens: {
       type: "number",
-      label: "Compact an idle captain or crew thread once its context passes this many tokens (at most every 20 minutes per thread). 0 = off.",
+      label: "Minimum measured tokens for automatic compaction. Also requires 90% context usage, an idle thread, and no provider-managed compaction threshold. Unchanged readings are not retried; minimum interval is 20 minutes. 0 = off.",
       default: 200000,
     },
     defaultProvider: {
@@ -1715,6 +1734,8 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
+  let methodsProfile=(await baseSettings.get()).selectedMethods;
+  baseSettings.onChange(next=>{methodsProfile=next.selectedMethods;});
   const knownCaptainsRef = new Set<string>();
   type HomeScope = { captain?: string; home?: string; host?: string };
   const homeScope = new AsyncLocalStorage<HomeScope>();
@@ -1737,6 +1758,39 @@ export default async function plugin(bb: BbPluginApi) {
     if (captain && typeof home === "string") captainHomes.set(captain, home);
     return homeScope.run({ captain, home: typeof home === "string" ? home : undefined, host: typeof host === "string" ? host : undefined }, fn);
   }
+  // Role exclusion is enforced at the public invocation boundary, before ledger
+  // receipts, home provisioning or supervisor mutations. Static tool selection
+  // alone cannot stop a worker from invoking the CLI.
+  async function supervisorCallerIdentity(ctx:unknown) {
+    const threadId=ctxString(ctx,"threadId");
+    if (!threadId) return undefined; // Internal/native harness calls still prove native admission.
+    const signal=AbortSignal.any([launchAbort.signal,AbortSignal.timeout(STUCK_HOST_CALL_MS),...(asRecord(ctx)["signal"]?[asRecord(ctx)["signal"] as AbortSignal]:[])]);
+    const meta=asRecord(await raceAbort(bb.sdk.threads.getPluginMetadata({threadId,pluginId:"firstmate",signal}),signal));
+    const known=(await raceAbort(readCrews(),signal)).some(c=>!isSecondmateRoute(c) && (c.threadId===threadId || c.priorThreadIds?.includes(threadId)));
+    const retired=await raceAbort(bb.storage.kv.get(`crew-retired:${threadId}`),signal)===true;
+    const project=ctxString(ctx,"projectId");
+    const routeOnly=retired && !known && !metaFlag(meta,"crew") && metaFlag(meta,"captain") && !!project && launches.routeOnlyThread(threadId,project) &&
+      (await raceAbort(readSecondmates(),signal)).some(m=>m.threadId===threadId && (m.projectId===project || m.projects.includes(project)));
+    const worker=metaFlag(meta,"crew") || known || launches.isDeletedWorker(threadId) || retired && !routeOnly;
+    return {threadId,meta,worker};
+  }
+  async function requireSupervisorCaller(ctx:unknown,argv?:string[]):Promise<void> {
+    const identity=await supervisorCallerIdentity(ctx);
+    if(!identity?.worker)return;
+    const {meta}=identity;
+    if(argv?.[0]==="methods" && (argv[1]==="status" || argv[1]==="read"))return;
+    if (argv?.[0]==="help" || argv?.[0]==="guide" || argv?.[0]==="--help") return;
+    // The native status append itself is a worker shell command. Preserve its
+    // optional fleet-ledger notification and exact-task inbox bridge only.
+    if (argv?.[0]==="fm" && typeof meta["crewId"]==="string" && typeof meta["nativeHome"]==="string") {
+      const parsed=parseFmArgv(argv.slice(1)),home=flagFromArgv(argv,"home") ?? (await settings.get()).fmHome;
+      const id=meta["crewId"],ownedHome=meta["nativeHome"];
+      const inbox=parsed.script==="inbox-take" && parsed.args[0]===id && (parsed.args.length===1 || parsed.args[1]==="--ack" && parsed.args.length>2 && parsed.args.slice(2).every(value=>/^\d+\.msg$/.test(value)));
+      const status=parsed.script==="fleet-ledger" && parsed.args.length===3 && parsed.args[0]==="appended" && parsed.args[1]===`${ownedHome}/config` && parsed.args[2]===`${ownedHome}/state/${id}.status`;
+      if (home===ownedHome && (inbox || status)) return;
+    }
+    throw new Error("Worker threads: Firstmate worker caller cannot invoke supervisor operations. Use the native brief's exact-task inbox and status commands; captain identity takes no precedence over worker identity.");
+  }
   const homeProvisioners = new Map<string, Promise<string | null>>();
   async function ensureCaptainHome(ctx: unknown, signal?: AbortSignal): Promise<string | null> {
     const captain = ctxString(ctx, "threadId") ?? "";
@@ -1745,7 +1799,7 @@ export default async function plugin(bb: BbPluginApi) {
       provision = provisionCaptainHome(ctx, signal).finally(() => homeProvisioners.delete(captain));
       homeProvisioners.set(captain, provision);
     }
-    const home = await provision;
+    const home = await raceAbort(provision,signal);
     const scope = homeScope.getStore();
     if (scope && scope.captain === captain && home) {
       scope.home = home;
@@ -1756,7 +1810,7 @@ export default async function plugin(bb: BbPluginApi) {
   async function provisionCaptainHome(ctx: unknown, signal?: AbortSignal): Promise<string | null> {
     const captain = ctxString(ctx, "threadId");
     const base = (await baseSettings.get()).fmHome.trim();
-    if (!captain || !base) return null;
+    if (!captain) return null;
     if (!/^[A-Za-z0-9_-]+$/.test(captain)) throw new Error("Invalid captain identity.");
     const existing = await bb.storage.kv.get<string>(`native-home:${captain}`);
     if (typeof existing === "string" && existing) {
@@ -1764,6 +1818,9 @@ export default async function plugin(bb: BbPluginApi) {
       if (scope) scope.home = existing;
       return existing;
     }
+    const seeded=await recoverSeededRuntime(ctx,signal);
+    if (seeded) return seeded;
+    if (!base) return provisionBundledCaptain(ctx,signal);
     // Never detach an active away mandate from its native authority record.
     if ((await readAfk(captain))?.on) throw new Error("Return from away mode before isolating this captain's home.");
     const hostId = await resolveHostId(undefined, ctx);
@@ -1780,123 +1837,82 @@ export default async function plugin(bb: BbPluginApi) {
       `fi`,
     ].join("\n"), 180_000, signal);
     requireNativeSuccess(clone, "captain home initialization");
+    signal?.throwIfAborted();
     await installBbBackend(hostId, home, ctxString(ctx, "projectId"), 180_000, signal);
     // Old worker prompts still name the old home; pin them there before activating
     // this home. Never move records underneath a running worker.
     await mutateCrews(crews => crews.map(crew => ({ ...crew, nativeHome: crew.nativeHome ?? base })));
-    await writeQueue((await readQueue()).map(row => ({ ...row, nativeHome: row.nativeHome ?? base })));
+    await queueStore.ready();
+    queueStore.transform(row => row.nativeHome === undefined, row => ({ ...row, nativeHome: base }));
     await writeDecisions((await readDecisions()).map(row => ({ ...row, nativeHome: row.nativeHome ?? base })));
+    signal?.throwIfAborted();
+    await bb.storage.kv.set(`native-home-host:${captain}`, hostId);
+    signal?.throwIfAborted();
     await bb.storage.kv.set(`native-home:${captain}`, home);
     captainHomes.set(captain, home);
-    await bb.storage.kv.set(`native-home-host:${captain}`, hostId);
-    await bb.sdk.threads.updatePluginMetadata({ threadId: captain, set: { nativeHome: home, captain: "true" } });
+    signal?.throwIfAborted();
+    await raceAbort(bb.sdk.threads.updatePluginMetadata({ threadId: captain, set: { nativeHome: home, captain: "true" } }),signal,STUCK_HOST_CALL_MS);
     const scope = homeScope.getStore();
     if (scope) scope.home = home;
     return home;
   }
 
-  // The real firstmate skills inventory (fmHome/.agents/skills), version-pinned to
-  // fmHome HEAD. BB plugins cannot register a dynamic skill root from the sync
-  // configure() callback (skill ids there must resolve to statically-declared
-  // manifest dirs). The pinned upstream skills are now statically bundled and
-  // registered from this plugin's skill root; this live manifest remains drift
-  // evidence for the installed fmHome (new/removed upstream skills). Crews still
-  // get none. Refreshed on init/deck and whenever fmHome HEAD changes.
-  const SKILLS_MANIFEST_MAX = 2400;
-  let skillsManifestCache = "";
-  try {
-    skillsManifestCache = renderSkillsManifest((await settings.get()).fmSkillsManifest);
-  } catch {
-    // default empty
+  async function recoverSeededRuntime(ctx:unknown,signal?:AbortSignal):Promise<string|null> {
+    const captain=ctxString(ctx,"threadId");
+    if(!captain)return null;
+    const metadata=asRecord(await raceAbort(bb.sdk.threads.getPluginMetadata({threadId:captain,signal}),signal,STUCK_HOST_CALL_MS));
+    if(!metaFlag(metadata,"captain") || typeof metadata["nativeRuntimeRelease"]!=="string")return null;
+    const home=metadata["nativeHome"],parentHome=metadata["nativeParentHome"],taskId=metadata["nativeTaskId"];
+    const thread=await raceAbort(bb.sdk.threads.get({threadId:captain,signal}),signal,STUCK_HOST_CALL_MS);
+    if(typeof home!=="string" || typeof parentHome!=="string" || typeof taskId!=="string" || !thread.parentThreadId || !thread.environmentId)throw new Error("Seeded bundled home lacks exact native parent/task/environment identity; no shared-home fallback.");
+    const environment=await raceAbort(bb.sdk.environments.get({environmentId:thread.environmentId,signal}),signal,STUCK_HOST_CALL_MS);
+    if(environment.path!==home || environment.status!=="ready")throw new Error("Seeded captain environment is not its ready native home.");
+    const bound=await nativeRuntime.operation(environment.hostId,"bind-seeded",{home,captain,release:metadata["nativeRuntimeRelease"],parentHome,parentCaptain:thread.parentThreadId,taskId},signal);
+    await bb.storage.kv.set(`native-home-host:${captain}`,environment.hostId);
+    await bb.storage.kv.set(`native-runtime:${captain}`,bound.selection);
+    await bb.storage.kv.set(`captain-for-home:${home}`,captain);
+    await bb.storage.kv.set(`native-home:${captain}`,home);
+    captainHomes.set(captain,home);
+    return home;
   }
 
-  function renderSkillsManifest(raw: string): string {
-    const trimmed = (raw ?? "").trim();
-    if (trimmed === "") return "";
-    try {
-      const parsed = JSON.parse(trimmed) as { head?: unknown; skills?: unknown };
-      const head = typeof parsed.head === "string" && parsed.head !== "" ? parsed.head.slice(0, 12) : "unknown";
-      const skills = Array.isArray(parsed.skills) ? parsed.skills : [];
-      if (skills.length === 0) return "";
-      const lines = skills
-        .map((s) => {
-          const rec = asRecord(s);
-          const name = typeof rec["name"] === "string" ? rec["name"] : "";
-          const desc = typeof rec["desc"] === "string" ? rec["desc"] : "";
-          return name === "" ? "" : `- ${name}${desc === "" ? "" : `: ${desc}`}`;
-        })
-        .filter((l) => l !== "");
-      if (lines.length === 0) return "";
-      const body = [
-        `== Real firstmate skills (fmHome/.agents/skills @ ${head}; ${lines.length} available) ==`,
-        "Pinned copies are registered as BB skills; this live inventory reports fmHome drift.",
-        ...lines,
-      ].join("\n");
-      return truncate(body, SKILLS_MANIFEST_MAX);
-    } catch {
-      return "";
-    }
+  async function provisionBundledCaptain(ctx:unknown,signal?:AbortSignal,path?:string,explicitHost?:string):Promise<string> {
+    const captain=ctxString(ctx,"threadId");
+    if(!captain || !/^thr_[A-Za-z0-9_-]+$/.test(captain))throw new Error("Bundled captain binding requires this owning BB thread; use runtime install for host-only installation.");
+    const envId=await threadEnv(captain,signal);
+    if(!envId)throw new Error("Captain environment/host unavailable; no bundled bytes transferred.");
+    const environment=await raceAbort(bb.sdk.environments.get({environmentId:envId,signal}),signal,STUCK_HOST_CALL_MS);
+    const host=environment.hostId;
+    if(explicitHost && explicitHost!==host)throw new Error("Runtime host must match the owning captain environment; no cross-host path transfer.");
+    const installed=await nativeRuntime.operation(host,"install",{},signal);
+    const home=path??`${installed.store}/homes/${captain}`;
+    const bound=await nativeRuntime.operation(host,"bind",{home,captain,projectId:ctxString(ctx,"projectId")},signal);
+    signal?.throwIfAborted();
+    await bb.storage.kv.set(`native-home-host:${captain}`,host);
+    await bb.storage.kv.set(`native-runtime:${captain}`,bound.selection);
+    await bb.storage.kv.set(`native-home:${captain}`,home);
+    await bb.storage.kv.set(`captain-for-home:${home}`,captain);
+    captainHomes.set(captain,home);
+    const scope=homeScope.getStore();if(scope){scope.home=home;scope.host=host;}
+    await raceAbort(bb.sdk.threads.updatePluginMetadata({threadId:captain,set:{nativeHome:home,captain:"true"}}),signal,STUCK_HOST_CALL_MS);
+    bb.log.info(`bundled native captain bound captain=${captain} host=${host} home=${home} selected=${JSON.stringify(bound.selection)} installed=${installed.distribution.release}; no external source fallback`);
+    return home;
   }
 
-  // Read fmHome HEAD + the .agents/skills inventory on the host, store a
-  // version-pinned JSON manifest, and refresh the injected cache. Skips the host
-  // read when HEAD is unchanged. Best-effort.
+  // Diagnostic inventory only. SDK configure accepts static skill names, so
+  // captain policy reads use the exact selected native runtime instead of
+  // injecting a globally copied inventory. Crews receive no captain skills.
+  // Diagnostic settings preserve complete descriptions from the same verified
+  // catalog as policy reads. This inventory is never injected into role context.
   async function refreshSkillsManifest(hostId: string, fmHome: string, signal?: AbortSignal): Promise<void> {
     try {
-      const skillsDir = `${fmHome}/.agents/skills`;
-      const py =
-        "import json,os,sys;d=sys.argv[1];out=[];\n" +
-        "dirs=sorted([n for n in os.listdir(d) if os.path.isdir(os.path.join(d,n))]) if os.path.isdir(d) else []\n" +
-        "for n in dirs:\n" +
-        "  desc=''\n" +
-        "  p=os.path.join(d,n,'SKILL.md')\n" +
-        "  try:\n" +
-        "    txt=open(p,encoding='utf-8',errors='replace').read()\n" +
-        "    for line in txt.splitlines():\n" +
-        "      s=line.strip()\n" +
-        "      if s.lower().startswith('description:'):\n" +
-        "        desc=s.split(':',1)[1].strip().strip('\\'\"');break\n" +
-        "  except Exception:\n" +
-        "    pass\n" +
-        "  out.append({'name':n,'desc':desc[:160]})\n" +
-        "sys.stdout.write(json.dumps(out))";
-      const cmd = [
-        `HEAD=$(git -C ${shQuote(fmHome)} rev-parse HEAD 2>/dev/null || echo unknown)`,
-        `printf 'FM_HEAD=%s\\n' "$HEAD"`,
-        `python3 -c ${shQuote(py)} ${shQuote(skillsDir)} 2>/dev/null || echo '[]'`,
-      ].join("\n");
-      const res = await runOnHost(hostId, cmd, 20_000, signal);
-      const headMatch = /FM_HEAD=(\S+)/.exec(res.output);
-      const head = headMatch?.[1] ?? "unknown";
-      const jsonStart = res.output.indexOf("[");
-      if (jsonStart < 0) return;
-      const skillsJson = res.output.slice(jsonStart).trim();
-      let skills: unknown;
-      try {
-        skills = JSON.parse(skillsJson);
-      } catch {
-        return;
-      }
-      if (!Array.isArray(skills)) return;
-      // Skip the persist when HEAD is unchanged and we already have a manifest.
-      try {
-        const prevRaw = (await settings.get()).fmSkillsManifest.trim();
-        if (prevRaw !== "") {
-          const prev = JSON.parse(prevRaw) as { head?: unknown };
-          if (typeof prev.head === "string" && prev.head === head && skillsManifestCache !== "") return;
-        }
-      } catch {
-        // fall through and persist
-      }
-      const manifest = JSON.stringify({ head, skills });
-      skillsManifestCache = renderSkillsManifest(manifest);
-      try {
-        await settings.experimental_set({ fmSkillsManifest: manifest });
-      } catch {
-        // cache still holds it for this process
-      }
-    } catch {
-      // best-effort; captain keeps the contract without the skill inventory
+      const captain=homeScope.getStore()?.captain ?? await bb.storage.kv.get<string>(`captain-for-home:${fmHome}`);
+      const selection=captain?await bb.storage.kv.get<{root:string}>(`native-runtime:${captain}`):null;
+      const catalog=await nativePolicyLookup(hostId,selection?.root??fmHome,{operation:'catalog'},signal??AbortSignal.any([launchAbort.signal,AbortSignal.timeout(30_000)]));
+      const skills=nativeDescriptions(catalog.entries!).map(({name,description})=>({name,desc:description}));
+      await settings.experimental_set({fmSkillsManifest:JSON.stringify({schema:2,head:catalog.commit,skills})});
+    } catch (error) {
+      bb.log.warn(`Diagnostic native skill inventory remains stale: ${String(error)}`);
     }
   }
 
@@ -1982,16 +1998,34 @@ export default async function plugin(bb: BbPluginApi) {
         out.push(crew);
         continue;
       }
-      await bb.storage.kv.set(`${CREW_TASK_PREFIX}${crew.id}`, crew.task);
+      await bb.storage.kv.set(crewTaskStorageKey(crew), crew.task);
       out.push({ ...crew, task: crew.task.slice(0, TASK_INLINE_MAX), taskSpilled: true });
     }
     return out;
   }
+  function crewTaskStorageKey(crew: Crew): string {
+    const identity=crew.launchKey ?? launchKey(crew.projectId,crew.parentThreadId ?? "",crew.nativeHome ?? "",crew.id);
+    return `${CREW_TASK_PREFIX}${createHash("sha256").update(identity).digest("hex")}`;
+  }
   // The full brief, for the few paths that re-send it (relaunch, brief publish, context).
   async function fullCrewTask(crew: Crew): Promise<string> {
     if (crew.taskSpilled !== true) return crew.task;
-    const full = await bb.storage.kv.get<unknown>(`${CREW_TASK_PREFIX}${crew.id}`);
-    return typeof full === "string" && full.startsWith(crew.task) ? full : crew.task;
+    const record=crew.launchKey ? launches.get(crew.launchKey) : launches.forTask(crew.projectId,crew.parentThreadId ?? "",crew.id);
+    if(record && (record.projectId!==crew.projectId || record.owner!==(crew.parentThreadId ?? "") || record.taskId!==crew.id || record.home!==(crew.nativeHome ?? "")))throw new Error("Original full task ownership conflicts with the launch record.");
+    const complete=(value:unknown):value is string=>typeof value==="string" && value.trimStart().startsWith(crew.task) && value.trimStart().length>crew.task.length;
+    const durable=record?.replacement?.task ?? (record?.intake ? launchIntakeSchema.parse(record.intake).task : undefined) ?? (record ? launches.adoptionTask(record.key) : undefined);
+    if(complete(durable))return durable;
+    const key=crewTaskStorageKey(crew),scoped=await bb.storage.kv.get<unknown>(key);
+    if(complete(scoped))return scoped;
+    const legacy=await bb.storage.kv.get<unknown>(`${CREW_TASK_PREFIX}${crew.id}`);
+    if(complete(legacy))try {
+      const metadata=asRecord(await raceAbort(bb.sdk.threads.getPluginMetadata({threadId:crew.threadId}),launchAbort.signal,STUCK_HOST_CALL_MS));
+      const thread=await raceAbort(bb.sdk.threads.get({threadId:crew.threadId}),launchAbort.signal,STUCK_HOST_CALL_MS);
+      if(thread.projectId===crew.projectId && (thread.parentThreadId ?? null)===crew.parentThreadId && metadata["crewId"]===crew.id && metadata["task"]===legacy && (legacy.length<500 || metadata["taskSpilled"]===false) && (!metadata["nativeHome"] || metadata["nativeHome"]===crew.nativeHome) && (!metadata["launchKey"] || metadata["launchKey"]===crew.launchKey)) {
+        await bb.storage.kv.set(key,legacy);return legacy;
+      }
+    } catch(error) { if(launchAbort.signal.aborted)throw error; }
+    throw new Error(`Original full task unavailable for ${crew.id}; recover it from the exact owned worker or native brief. Legacy task-ID storage alone does not prove ownership. Worker and evidence retained.`);
   }
   async function readCrews(): Promise<Crew[]> {
     // MAX_CREWS bounds one supervision pass, never the durable register.
@@ -2001,13 +2035,14 @@ export default async function plugin(bb: BbPluginApi) {
     await mutateCrews(async crews => {
       // A sweep may already have read the old thread metadata. Keep a durable
       // tombstone so that result cannot resurrect an explicitly retired thread.
-      await bb.storage.kv.set(`crew-retired:${crew.threadId}`, true);
-      return crews.filter(c => c.id !== crew.id || c.threadId !== crew.threadId);
+      if (isSecondmateRoute(crew)) await bb.storage.kv.set(`route-retired:${crew.launchKey ?? JSON.stringify([crew.parentThreadId,crew.projectId,crew.nativeHome,crew.id])}`,true);
+      else await bb.storage.kv.set(`crew-retired:${crew.threadId}`, true);
+      return crews.filter(c => !(c.id===crew.id && c.threadId===crew.threadId && c.projectId===crew.projectId && c.parentThreadId===crew.parentThreadId));
     });
-    if (crew.taskSpilled === true && !(await readCrews()).some((c) => c.id === crew.id)) {
-      await bb.storage.kv.delete(`${CREW_TASK_PREFIX}${crew.id}`).catch(() => {});
+    if (crew.taskSpilled === true && !(await readCrews()).some((c) => crewTaskStorageKey(c) === crewTaskStorageKey(crew))) {
+      await bb.storage.kv.delete(crewTaskStorageKey(crew)).catch(() => {});
     }
-    if (await clearWaiting(crew.id).catch(() => false)) await dropResumeRows(crew, "all");
+    if (!isSecondmateRoute(crew) && await clearWaiting(crew.id).catch(() => false)) await dropResumeRows(crew, "all");
     if (!isSecondmateRoute(crew)) {
       try {
         await bb.sdk.threads.updatePluginMetadata({ threadId: crew.threadId, set: { crew: "false" }, remove: ["crewId"] });
@@ -2017,7 +2052,8 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
   async function readQueue(): Promise<QueueItem[]> {
-    return readList(QUEUE_KEY, queueItemSchema, Number.POSITIVE_INFINITY);
+    await queueStore.ready();
+    return queueStore.list();
   }
   const ledgerMutations = new Map<string, Promise<void>>();
   async function serializeLedger<T>(key: string, operation: () => Promise<T>): Promise<T> {
@@ -2070,16 +2106,6 @@ export default async function plugin(bb: BbPluginApi) {
     const wake = argv[0] === "wake" || (argv[0] === "fm" && argv.some(arg => ["wake-drain", "fm-wake-drain.sh"].includes(arg)));
     return wake ? serializeLedger(`receipt:${captain ?? "legacy"}`, operation) : withLedgerOperation(argv[0] ?? "", captain, operation);
   }
-  async function writeQueue(items: QueueItem[]): Promise<void> {
-    await serializeLedger(QUEUE_KEY, async () => {
-      const owner = homeScope.getStore();
-      if (owner?.home && owner.captain) {
-        const foreign = (await readQueue()).filter(row => row.parentThreadId !== owner.captain);
-        items = [...items.filter(row => row.parentThreadId === owner.captain), ...foreign];
-      }
-      await bb.storage.kv.set(QUEUE_KEY, items);
-    });
-  }
   async function readDecisions(): Promise<Decision[]> {
     return readList(DECISIONS_KEY, decisionSchema, Number.POSITIVE_INFINITY);
   }
@@ -2111,7 +2137,65 @@ export default async function plugin(bb: BbPluginApi) {
   }
   async function postureOf(projectId: string): Promise<Posture> {
     const all = await readPostures();
-    return all[projectId] ?? { mode: "direct-PR", yolo: false };
+    return all[projectId] ?? { mode: "no-mistakes", yolo: false };
+  }
+  async function postureContext(projectId:string,ctx:unknown) {
+    const signal=AbortSignal.any([launchAbort.signal,...(asRecord(ctx)["signal"] ? [asRecord(ctx)["signal"] as AbortSignal] : [])]);
+    const cached=(await raceAbort(readPostures(),signal,STUCK_HOST_CALL_MS))[projectId];
+    const home=(await raceAbort(settings.get(),signal,STUCK_HOST_CALL_MS)).fmHome;
+    let native:{mode:string;yolo:boolean;branchPrefix:string;output:string;registered:boolean}|null=null;
+    if (home) {
+      const host=await raceAbort(resolveHostForProject(projectId,ctxString(ctx,"threadId"),signal),signal,STUCK_HOST_CALL_MS);
+      const path=await raceAbort(projectCheckoutPath(projectId,host),signal,STUCK_HOST_CALL_MS);
+      if (!path) throw new Error("No matching project checkout on captain host; cannot read native posture.");
+      const name=path.split('/').filter(Boolean).at(-1)!;
+      const result=await runFmScript({script:"project-mode",args:["--raw",name],hostId:host,fmHome:home,timeoutMs:30_000,signal});
+      requireNativeSuccess(result,"native registered project posture");
+      const rows=result.output.split('\n').filter(line=>/^(no-mistakes(?:-prod-only)?|direct-PR|local-only) (on|off)$/.test(line.trim()));
+      if (rows.length!==1) throw new Error("Native posture read did not yield one complete mode/yolo record; inspect native project-mode output.");
+      const [mode,yolo]=rows[0]!.trim().split(' ');
+      const prefix=await runFmScript({script:"project-mode",args:["--branch-prefix",name],hostId:host,fmHome:home,timeoutMs:30_000,signal});
+      requireNativeSuccess(prefix,"native registered branch prefix");
+      const prefixRows=prefix.output.replace(/\r?\n$/, '').split(/\r?\n/).filter(line=>!line.startsWith('warn:'));
+      const branchPrefix=prefixRows[0] ?? '';
+      if (prefixRows.length!==1 || /\s/.test(branchPrefix)) throw new Error("Native branch prefix read is malformed; inspect project-mode output.");
+      native={mode:mode!,yolo:yolo==='on',branchPrefix,output:result.output,registered:!result.output.includes("defaulting")};
+    }
+    return {projectId,native,plugin:cached??null,default:{mode:"no-mistakes",yolo:false},
+      authority:cached?.provenance ? {status:"recorded-captain-instruction",...cached.provenance} : (cached?.yolo || native?.yolo) ? {status:"legacy-unverified",note:"Preserve prior standing posture. Resolve from existing captain approval; missing provenance is not proof of absent approval. A registry flag alone does not prove approval."} : {status:"off"},
+      precedence:"Native registry is mechanical intake context. Current explicit user instructions and project instructions choose task mode/authority. Captain-approved yolo is standing authority for green in-scope merges; a fresh merge request is not required. Only an actual user hold overrides that authority; supervisor-written constraints do not become user holds. Native merge guards remain mandatory."};
+  }
+  async function intakePosture(projectId:string,ctx:unknown,explicitMode?:DeliveryMode):Promise<Posture> {
+    if (!ctxString(ctx,"threadId") || !homeScope.getStore()?.home) return postureOf(projectId);
+    const context=await postureContext(projectId,ctx);
+    if (context.plugin?.provenance) return context.plugin;
+    if (explicitMode) {
+      if (context.plugin && context.native?.registered && context.plugin.yolo!==context.native.yolo) throw new Error("Native registry and legacy BB merge-authority selections disagree. Resolve existing authority through firstmate_posture before launch; explicit task mode does not override yolo.");
+      return {mode:explicitMode,yolo:context.plugin?.yolo ?? context.native?.yolo ?? false};
+    }
+    if (context.native?.registered) {
+      if (context.plugin && (context.plugin.mode!==context.native.mode || context.plugin.yolo!==context.native.yolo)) throw new Error("Native registry and legacy BB posture disagree. Inspect firstmate_posture; select explicit task mode under the current user instruction, preserving prior authority.");
+      if (context.native.mode==='no-mistakes-prod-only') throw new Error("Native conditional project posture requires task-surface intake; choose explicit mode after reading selected project-management policy.");
+      return {mode:modeSchema.parse(context.native.mode),yolo:context.native.yolo};
+    }
+    return context.plugin ?? {mode:"no-mistakes",yolo:false};
+  }
+  async function setPosture(projectId:string,mode:DeliveryMode|undefined,yolo:boolean|undefined,reason:string|undefined,ctx:unknown) {
+    const actor=ctxString(ctx,"threadId");if (!actor) throw new Error("Posture change requires owning captain context.");
+    const all=await readPostures();
+    const context=homeScope.getStore()?.home ? await postureContext(projectId,ctx) : null;
+    const registered=context?.native?.registered===true;
+    const native=context?.native;
+    const current:Posture=all[projectId] ?? {mode:native?.mode==='no-mistakes-prod-only' ? 'no-mistakes' : native ? modeSchema.parse(native.mode) : 'no-mistakes',yolo:native?.yolo??false};
+    if ((all[projectId] || registered) && mode!==undefined && mode!==current.mode && !reason?.trim()) throw new Error("Changing a registered BB mode requires the current user override/reason; task-specific modes need not rewrite the registry.");
+    const next={mode:mode??current.mode,yolo:yolo??current.yolo,
+      provenance:{source:"captain-instruction" as const,actor,at:new Date().toISOString(),reason:reason?.trim() || "Explicit posture set by owning captain under the user's authority"}};
+    // Keep provenance with the existing posture, not a competing authority ledger.
+    // A mode-only edit must not manufacture evidence for unexplained legacy yolo.
+    if (yolo===undefined && current.yolo && !current.provenance) {
+      all[projectId]={mode:next.mode,yolo:next.yolo};
+    } else all[projectId]=next;
+    await bb.storage.kv.set(POSTURES_KEY,all);return all[projectId]!;
   }
   async function readSecondmates(): Promise<Secondmate[]> {
     return readList(SECONDMATES_KEY, secondmateSchema, 50);
@@ -2154,16 +2238,9 @@ export default async function plugin(bb: BbPluginApi) {
     if (prev.held.length === 0) return `Quiet off${wake}`;
     return `Quiet off\nHeld while quiet:\n${prev.held.join("\n---\n")}${wake}`;
   }
-  async function markQueueForCrew(crewId: string, status: "done"): Promise<void> {
-    const items = await readQueue();
-    let changed = false;
-    for (const item of items) {
-      if (item.crewId === crewId && item.status === "dispatched") {
-        item.status = status;
-        changed = true;
-      }
-    }
-    if (changed) await writeQueue(items);
+  async function markQueueForCrew(crew: Crew, status: "done"): Promise<void> {
+    await queueStore.ready();
+    queueStore.transform(row => row.crewId === crew.id && row.projectId === crew.projectId && (row.parentThreadId??null) === crew.parentThreadId && row.status === "dispatched", row => ({...row,status}));
   }
 
   const watchStateSchema = z.record(
@@ -2366,6 +2443,7 @@ export default async function plugin(bb: BbPluginApi) {
     crew: Crew,
     display: string,
     signal?: AbortSignal,
+    dedupMarker?: string,
   ): Promise<{ durable: boolean }> {
     const fmHome = (crew.parentThreadId ? await bb.storage.kv.get<string>(`native-home:${crew.parentThreadId}`) : null) || await crewNativeHome(crew);
     if (fmHome === "" || isSecondmateRoute(crew)) return { durable: false };
@@ -2388,18 +2466,27 @@ export default async function plugin(bb: BbPluginApi) {
     // double it, collapse whitespace). `note:` is the informational unread surface.
     const note = display.replace(/[\r\n\t]+/g, " ").replace(/^\s*note:\s*/i, "").trim().slice(0, 800);
     const noteB64 = Buffer.from(note, "utf8").toString("base64");
+    const dedupPath=dedupMarker ? `${stateDir}/.pr-notice-${createHash("sha256").update(dedupMarker).digest("hex")}` : undefined;
     const script = [
       `export FM_HOME=${shQuote(fmHome)}`,
-      `export FM_ROOT=${shQuote(fmHome)}`,
+      fmBinDirAssign(fmHome),
       `export FM_STATE_OVERRIDE=${shQuote(stateDir)}`,
-      `[ -f ${shQuote(lib)} ] || { echo "error: missing ${lib}" >&2; exit 127; }`,
+      `lib=${shQuote(lib)}; [ "\${FM_BUNDLED_VERIFIED:-}" != 1 ] || lib="$FM_BINDIR/fm-wake-lib.sh"`,
+      `[ -f "$lib" ] || { echo "error: missing $lib" >&2; exit 127; }`,
       `mkdir -p ${shQuote(stateDir)}`,
-      `. ${shQuote(lib)}`,
+      `. "$lib"`,
       `note=$(printf '%s' ${shQuote(noteB64)} | base64 -d)`,
-      `printf 'note: %s\\n' "$note" >> ${shQuote(statusPath)}`,
-      `fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK" || exit 1`,
+      ...(dedupMarker ? [
+        `fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK" || exit 1`,
+        `if test -f ${shQuote(dedupPath!)}; then fm_lock_release "$FM_WAKE_QUEUE_LOCK"; exit 0; fi`,
+        `if ! grep -Fq -- ${shQuote(dedupMarker)} ${shQuote(statusPath)} 2>/dev/null; then printf 'note: %s\\n' "$note" >> ${shQuote(statusPath)}; fi`,
+      ] : [
+        `printf 'note: %s\\n' "$note" >> ${shQuote(statusPath)}`,
+        `fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK" || exit 1`,
+      ]),
       `fm_wake_append_locked signal ${shQuote(key)} ${shQuote(`crew ${crew.id} update`)} || { fm_lock_release "$FM_WAKE_QUEUE_LOCK"; exit 1; }`,
       `seq=$(cat ${shQuote(`${stateDir}/.wake-queue.seq`)} 2>/dev/null || true)`,
+      ...(dedupPath ? [`printf '%s\\n' "$seq" > ${shQuote(dedupPath)}`] : []),
       `fm_lock_release "$FM_WAKE_QUEUE_LOCK"`,
       `printf 'FM_BB_WAKE_SEQ=%s\\n' "$seq"`,
     ].join("\n");
@@ -3054,22 +3141,9 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  async function projectCheckoutPath(projectId: string): Promise<string | null> {
-    try {
-      const listed = await bb.sdk.environments.list({ projectId });
-      const preferred = listed.find((e) => !e.isWorktree && e.status === "ready" && typeof e.path === "string" && e.path !== "");
-      if (preferred?.path) return preferred.path;
-    } catch {
-      // try project sources
-    }
-    try {
-      const project = await bb.sdk.projects.get({ projectId });
-      const def = project.sources.find((s) => s.isDefault) ?? project.sources[0];
-      if (def !== undefined && def.path !== "") return def.path;
-    } catch {
-      // none
-    }
-    return null;
+  async function projectCheckoutPath(projectId: string, hostId?: string): Promise<string | null> {
+    try { return (await selectExecution(bb, projectId, hostId)).checkout; }
+    catch { return null; }
   }
 
   async function publishFmMeta(input: {
@@ -3095,7 +3169,7 @@ export default async function plugin(bb: BbPluginApi) {
     const worktree = input.crew.worktree && !input.scheduled
       ? ((await waitThreadPath(input.crew.threadId, 45_000)) ?? "")
       : "";
-    const project = (await projectCheckoutPath(input.crew.projectId)) ?? worktree;
+    const project = (await projectCheckoutPath(input.crew.projectId, hostId)) ?? worktree;
     const posture = await postureOf(input.crew.projectId);
     const body = formatFmMeta({
       id: input.crew.id,
@@ -3104,7 +3178,7 @@ export default async function plugin(bb: BbPluginApi) {
       project,
       kind: input.crew.shape,
       mode: input.crew.shape === "ship" ? input.crew.posture : undefined,
-      yolo: input.crew.shape === "ship" ? (posture.yolo ? "on" : "off") : undefined,
+      yolo: input.crew.shape === "ship" ? ((input.crew.yolo ?? posture.yolo) ? "on" : "off") : undefined,
       model: input.model ?? input.crew.model ?? undefined,
       provider: input.provider ?? input.crew.providerId ?? undefined,
       effort: input.crew.reasoningLevel ?? undefined,
@@ -3142,7 +3216,7 @@ export default async function plugin(bb: BbPluginApi) {
   // Firstmate-spec brief for a BB-dispatched crew, not just a synthetic prompt.
   // Best-effort and idempotent (never overwrites an existing brief); a missing
   // script or host failure is silent — the crew already has the structured prompt.
-  async function publishFmBrief(crew: Crew, hostId: string | undefined, task: string): Promise<boolean> {
+  async function publishFmBrief(crew: Crew, hostId: string | undefined, task: string, projectDir?:string,signal?:AbortSignal): Promise<boolean> {
     const fmHome = await crewNativeHome(crew);
     if (fmHome === "") return false;
     if (isSecondmateRoute(crew)) return false;
@@ -3162,24 +3236,25 @@ export default async function plugin(bb: BbPluginApi) {
     // fm_brief_intent_address_line does not refuse the brief (B1).
     // Headed task text supplies its own spec section; never nest it under the template's.
     const sections = briefSections(task.trim());
-    const intentB64 = Buffer.from(normalizeCaptainIntent(sections.intent).slice(0, 3000), "utf8").toString("base64");
-    // Only a spec the captain's own text supplied travels separately; otherwise the
-    // fixed default below fills {FIRSTMATE_SPEC} (no plugin-synthesized judgement).
+    const intentB64 = Buffer.from(normalizeCaptainIntent(sections.intent), "utf8").toString("base64");
+    const defaultSpec = crew.shape === "scout"
+      ? "Investigate the captain's intent within its stated scope. Deliver a written report with commands, outcomes, revision, limits, and recommendations. Distinguish observed behavior from inference; follow the report-only completion contract."
+      : "Implement the captain's intent above exactly; do not widen scope. Small diff, own branch, deliver per the mode contract, then report DONE/BLOCKED/FAILED.";
+    // Captain-authored specifications retain precedence over the role default.
     const specEnv = sections.spec === null
       ? ""
-      : `FM_TASK_OWN_SPEC=${Buffer.from(sections.spec.slice(0, 3000), "utf8").toString("base64")} `;
+      : `FM_TASK_OWN_SPEC=${Buffer.from(sections.spec, "utf8").toString("base64")} `;
     // fm-brief refuses --mode on scouts and requires it on ships; a ship's posture
     // is exactly the delivery mode the brief records.
     const scaffold =
       crew.shape === "scout"
-        ? `${briefRef} ${shQuote(crew.id)} crew --scout`
-        : `${briefRef} ${shQuote(crew.id)} crew --mode ${shQuote(crew.posture)}`;
+        ? `${briefRef} ${shQuote(crew.id)} ${shQuote(projectDir ?? 'crew')} --scout`
+        : `${briefRef} ${shQuote(crew.id)} ${shQuote(projectDir ?? 'crew')} --mode ${shQuote(crew.posture)}${crew.branchPrefix !== undefined ? ` --branch-prefix ${shQuote(crew.branchPrefix)}` : ''}`;
     const py =
       "import base64,os,sys;p=sys.argv[1];" +
       'intent=base64.b64decode(os.environ["FM_INTENT"]).decode();' +
-      'spec=base64.b64decode(os.environ["FM_TASK_OWN_SPEC"]).decode() if "FM_TASK_OWN_SPEC" in os.environ else "Implement the captain\'s intent above exactly; do not widen scope. Small diff, own branch, deliver per the mode contract, then report DONE/BLOCKED/FAILED.";' +
+      'spec=base64.b64decode(os.environ["FM_TASK_OWN_SPEC"]).decode() if "FM_TASK_OWN_SPEC" in os.environ else ' + JSON.stringify(defaultSpec) + ';' +
       "s=open(p).read();s=s.replace('{TASK}',intent).replace('{FIRSTMATE_SPEC}',spec);" +
-      "s+='\\n\\nBB-DIVERGE: Keep durable artifacts under data/<task-id>/ in this firstmate home, not the worktree tmp/. The worktree tmp/ is removed when the workspace is archived.\\n';" +
       "open(p,'w').write(s)";
     const script = [
       `export FM_HOME=${shQuote(fmHome)}`,
@@ -3196,7 +3271,13 @@ export default async function plugin(bb: BbPluginApi) {
       `FM_INTENT=${intentB64} ${specEnv}python3 -c ${shQuote(py)} ${shQuote(brief)} || { echo "fm-brief fill failed" >&2; exit 1; }`,
     ].join("\n");
     try {
-      const res = await runOnHost(host, script, 30_000);
+      // Preserve the entire accepted intent/specification. Check the same full
+      // quoting envelope as execution; oversized scripts use bounded staging.
+      let inline = true;
+      try { wrapHostCommand(script); } catch { inline = false; }
+      const res = inline
+        ? await runOnHost(host, script, 30_000, signal)
+        : await runOnHost(host, "bash", 30_000, signal, script);
       if (res.output.includes("FM_MIRROR_STALE")) {
         const line = res.output.split("\n").find((l) => l.includes("FM_MIRROR_STALE"))?.trim() ?? "FM_MIRROR_STALE";
         bb.log.error(`bb mirror is STALE while scaffolding brief crew=${crew.id}: ${line}. Re-run the overlay installer against ${fmHome}.`);
@@ -3258,7 +3339,7 @@ export default async function plugin(bb: BbPluginApi) {
   // Read a single key from a real state/<id>.meta on the host. Returns the value,
   // "" when the key is absent, or null when the host/state is unreadable. Used by
   // the real transport to learn the thread id the real fm-spawn.sh created.
-  async function readFmMetaField(hostId: string, crewId: string, key: string, home?: string): Promise<string | null> {
+  async function readFmMetaField(hostId: string, crewId: string, key: string, home?: string,signal?:AbortSignal): Promise<string | null> {
     const fmHome = home ?? (await settings.get()).fmHome.trim();
     if (fmHome === "") return null;
     const dest = `${fmHome}/state/${crewId}.meta`;
@@ -3267,11 +3348,13 @@ export default async function plugin(bb: BbPluginApi) {
         hostId,
         `[ -f ${shQuote(dest)} ] && grep ${shQuote(`^${key}=`)} ${shQuote(dest)} | tail -1 | cut -d= -f2- || echo FM_META_ABSENT`,
         15_000,
+        signal,
       );
       const out = res.output.trim();
       if (out === "" || out.includes("FM_META_ABSENT")) return "";
       return out;
-    } catch {
+    } catch (error) {
+      if (signal?.aborted) throw error;
       return null;
     }
   }
@@ -3299,65 +3382,17 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  // Find a BB thread the real fm-spawn.sh created for this task but did not record
-  // in state/<id>.meta — the narrow hard-kill window between `bb thread spawn` and
-  // the meta write (fm-spawn's own BB_ABORT_CLEANUP trap handles graceful failures,
-  // so this only fires on a SIGKILL / host death). Matched by the deterministic
-  // thread title suffix ` · <taskId>` (legacy `fm-<taskId>` is also accepted) or
-  // the crewId recorded by `mark-crew --task`. Only
-  // threads not already tracked as crews are considered, so this never steals a
-  // live crew's thread. Returns the thread id to adopt, or null.
-  async function findOrphanThreadForTask(taskId: string): Promise<string | null> {
-    const known = new Set((await readCrews()).map((c) => c.threadId).filter((t) => t !== ""));
-    const legacyTitle = `fm-${taskId}`;
-    const titleSuffix = ` · ${taskId}`;
-    // R4: the orphan is created by the `bb thread spawn` CLI inside fm-spawn and
-    // tagged by a SEPARATE `bb firstmate mark-crew` call. In the SIGKILL window
-    // between those two, BB may not yet attribute originPluginId=firstmate to the
-    // thread, so a filtered list would miss it. Do a filtered pass first (cheap),
-    // then, only if it finds nothing, a broad unfiltered pass — both matched by
-    // the deterministic task-id suffix (set by the overlay at spawn time), its
-    // legacy `fm-<taskId>` prefix, or the crewId metadata. This makes adoption
-    // independent of the origin filter.
-    const match = async (rows: unknown[]): Promise<string | null> => {
-      for (const row of rows) {
-        const rec = asRecord(row);
-        const tid = rec["id"];
-        if (typeof tid !== "string" || known.has(tid)) continue;
-        const title = rec["title"];
-        if (
-          typeof title === "string"
-          && (title.endsWith(titleSuffix) || title === legacyTitle || title.startsWith(`${legacyTitle} `))
-        ) return tid;
-        try {
-          const meta = asRecord(await bb.sdk.threads.getPluginMetadata({ threadId: tid, pluginId: "firstmate" }));
-          if (meta["crewId"] === taskId) return tid;
-        } catch {
-          // metadata unreadable; title match already tried
-        }
-      }
-      return null;
-    };
-    const rowsOf = (found: unknown): unknown[] =>
-      Array.isArray(found)
-        ? found
-        : Array.isArray(asRecord(found)["threads"])
-          ? (asRecord(found)["threads"] as unknown[])
-          : [];
-    // A transient BB API failure (a 504 while the crew is being created) must not read
-    // as "no orphan": that refuses a dispatch whose crew already exists.
-    for (let attempt = 0; ; attempt++) {
-      try {
-        const filtered = await match(rowsOf(await bb.sdk.threads.list({ originPluginId: "firstmate", includeHidden: true, limit: 50 })));
-        if (filtered !== null) return filtered;
-        // Broad fallback: no origin filter (catches a not-yet-tagged CLI spawn).
-        return await match(rowsOf(await bb.sdk.threads.list({ includeHidden: true, limit: 50 })));
-      } catch (error) {
-        if (attempt >= 2) {
-          bb.log.warn(`orphan thread discovery failed for crew=${taskId}: ${error instanceof Error ? error.message : String(error)}`);
-          return null; // Leave dispatch refused when orphan discovery is unavailable.
-        }
-        await sleep(1000 * (attempt + 1));
+  // Native creation and recovery share exact, durable metadata identity.
+  // A title is human-facing text and cannot establish task ownership.
+  async function findOrphanThreadForTask(taskId:string,scope:{projectId:string;parentThreadId:string|null;home?:string}):Promise<string|null> {
+    const key=launchKey(scope.projectId,scope.parentThreadId ?? "",scope.home ?? "",taskId);
+    const record=launches.get(key);
+    if (!record) return null;
+    for (let attempt=0; ; attempt++) {
+      try { return await discoverLaunch(bb,record,launchAbort.signal); }
+      catch(error) {
+        if (attempt>=2 || launchAbort.signal.aborted || !TRANSIENT_SPAWN_FAILURE.test(String(error))) throw error;
+        await raceAbort(sleep(1000*(attempt+1)),launchAbort.signal);
       }
     }
   }
@@ -3378,6 +3413,9 @@ export default async function plugin(bb: BbPluginApi) {
       permissionMode?: PermissionMode;
       // True when this dispatch mints the backlog row itself (not a queue item's row).
       ownsRow?: boolean;
+      visible?: boolean;
+      checkout?:string;
+      dispatchProfileReason?:string;
     },
     hostId: string,
     signal?: AbortSignal,
@@ -3405,7 +3443,7 @@ export default async function plugin(bb: BbPluginApi) {
       );
       throw new Error("Real transport requires queueOwner=real.");
     }
-    const projectDir = await projectCheckoutPath(input.projectId);
+    const projectDir = input.checkout ?? await projectCheckoutPath(input.projectId, hostId);
     if (projectDir === null || projectDir === "") {
       throw new Error(`No project checkout for real dispatch ${crew.id}.`);
     }
@@ -3421,7 +3459,17 @@ export default async function plugin(bb: BbPluginApi) {
     // Scaffold the authoritative brief first — a ship spawn reads its recorded
     // "Delivery contract: mode=" line and refuses a mismatch, so the brief must
     // exist (with the right mode) before fm-spawn.sh runs.
-    await publishFmBrief(crew, hostId, input.task);
+    if (!await publishFmBrief(crew, hostId, input.task, projectDir,signal)) throw new Error('Native brief publication failed; no resolver/backlog/spawn executed.');
+    const resolved=await runFmScript({script:'dispatch-resolve',args:[`${fmHome}/data/${crew.id}/brief.md`],hostId,fmHome,timeoutMs:30_000,signal});
+    // Preserve every candidate/result without manufacturing an intake judgment.
+    const resolutionPath=`${fmHome}/data/${crew.id}/dispatch-resolution-${randomUUID()}.txt`;
+    if (!await writeHostBytes(hostId,resolutionPath,`${resolved.output}\nBB execution: ${crew.providerId ?? 'project default'} / ${crew.model ?? 'project default'} / ${crew.reasoningLevel ?? 'project default'}\nBB intake reason: ${input.dispatchProfileReason ?? '(not supplied)'}\n`,STUCK_HOST_CALL_MS,signal,true)) throw new Error('Could not retain native dispatch resolution; no backlog/spawn executed.');
+    let resolution:string;
+    try { resolution=nativeDispatchIntake(resolved.exitCode,resolved.output,input.dispatchProfileReason); }
+    catch(error) { throw new Error(`Task ${crew.id}: ${String(error)} (resolution evidence: ${resolutionPath})`); }
+    if (resolution!=='off' && (!crew.providerId || !crew.model)) throw new Error('Enabled native dispatch resolution needs an explicit validated BB provider/model selection; reuse taskId after native intake.');
+    if (resolution!=='off') await validateProviderChoice(crew.providerId!,crew.model!,crew.projectId,crew.parentThreadId??undefined,strictReasoning(crew.reasoningLevel??undefined),hostId,true);
+    bb.log.info(`real transport dispatch-resolve crew=${crew.id} status=${resolution} evidence=${resolutionPath}${input.dispatchProfileReason ? ` override=${input.dispatchProfileReason}` : ''}`);
     // C1: create the backlog row (id = crew id, so meta/brief/backlog/thread all
     // agree) BEFORE spawning. tasks-axi add is idempotent (repeat returns
     // ok/already), so a retry or a queue-dispatched crew whose row already exists
@@ -3446,18 +3494,27 @@ export default async function plugin(bb: BbPluginApi) {
     const args =
       crew.shape === "scout"
         ? [crew.id, projectDir, "--scout", "--backend", "bb", "--harness", "bb"]
-        : [crew.id, projectDir, "--mode", crew.posture, "--yolo", posture.yolo ? "on" : "off", "--backend", "bb", "--harness", "bb"];
+        : [crew.id, projectDir, "--mode", crew.posture, "--yolo", (crew.yolo ?? posture.yolo) ? "on" : "off", "--backend", "bb", "--harness", "bb"];
+    if (crew.shape==='ship' && crew.branchPrefix!==undefined) args.push('--branch-prefix',crew.branchPrefix);
     if (crew.model !== null && crew.model !== "") args.push("--model", crew.model);
     if (crew.reasoningLevel !== null) args.push("--effort", crew.reasoningLevel);
     const capped = capPermission(input.permissionMode, await parentPermission(input.parentThreadId));
     const env: Record<string, string> = {
       FM_BB_THREAD_TITLE: crewThreadTitle(input.task, crew.shape, crew.id, input.title),
+      FM_BB_VISIBLE: input.visible === false ? "0" : "1",
+      FM_BB_PROJECT_DEFAULTS:"1",
+      FM_BB_MODEL:crew.model ?? "",
+      FM_BB_REASONING:crew.reasoningLevel ?? "",
+      FM_BB_DELIVERY_REQUIREMENT:crew.deliveryRequirement ?? "merged",
     };
     if (crew.providerId !== null && crew.providerId !== "") env.FM_BB_PROVIDER = crew.providerId;
     if (capped !== undefined) env.FM_BB_PERMISSION_MODE = capped;
     let spawnFailed = false;
     let spawnFailure = "Native spawn returned without a recorded worker.";
     try {
+      // Earlier failures are known pre-spawn refusals. Only crossing native
+      // spawn can have an uncertain external worker outcome.
+      launches.update(launchKey(crew.projectId,crew.parentThreadId ?? '',crew.nativeHome ?? '',crew.id),{nativeInvoked:true});
       const res = await withHomeSpawnGate(fmHome, () => runFmScript({
         script: "spawn",
         args,
@@ -3471,6 +3528,9 @@ export default async function plugin(bb: BbPluginApi) {
       }));
       if (res.exitCode !== 0) {
         spawnFailed = true;
+        const pendingKey=launchKey(crew.projectId,crew.parentThreadId ?? "",crew.nativeHome ?? "",crew.id);
+        const pending=launches.get(pendingKey);
+        if (pending?.state === "reserved" && /spawn refused|brief (?:was )?refused|task .* has no backlog item/.test(res.output) && !TRANSIENT_SPAWN_FAILURE.test(res.output)) launches.update(pendingKey,{ state:"failed",error:"Native explicitly refused before BB creation" });
         spawnFailure = `fm-spawn exit ${res.exitCode}: ${res.output.slice(-2000)}`;
         // LOUD (B1): a non-zero fm-spawn exit (e.g. the brief-refusal that made every
         // real spawn fail) must be an error, not a muffled warn.
@@ -3487,16 +3547,15 @@ export default async function plugin(bb: BbPluginApi) {
     // honour it rather than native-spawning a duplicate.
     const threadId = await readFmMetaField(hostId, crew.id, "bb_thread_id", await crewNativeHome(crew));
     if (threadId !== null && threadId !== "") return threadId;
-    // No recorded thread. fm-spawn may still have created one and been hard-killed
-    // before writing bb_thread_id. Adopt that orphan instead of native-spawning a
-    // duplicate; only when none exists do we fall back to native (return null).
-    let orphan = await findOrphanThreadForTask(crew.id);
+    // Missing native metadata does not prove absence. Adopt only exact creation
+    // metadata; otherwise retain the unresolved reservation for reconciliation.
+    let orphan = await findOrphanThreadForTask(crew.id,{ projectId:crew.projectId,parentThreadId:crew.parentThreadId,home:crew.nativeHome });
     // A timed-out or gateway-failed spawn can still finish creating the thread a moment
     // later; look again before reporting a failure for a crew that exists.
     if (orphan === null && spawnFailed && TRANSIENT_SPAWN_FAILURE.test(spawnFailure)) {
       for (const delayMs of [2000, 4000]) {
         await sleep(delayMs);
-        orphan = await findOrphanThreadForTask(crew.id);
+        orphan = await findOrphanThreadForTask(crew.id,{ projectId:crew.projectId,parentThreadId:crew.parentThreadId,home:crew.nativeHome });
         if (orphan !== null) break;
       }
     }
@@ -3616,22 +3675,21 @@ export default async function plugin(bb: BbPluginApi) {
 
     if (await queueIsReal()) {
       const items = await readQueue();
-      let dirty = false;
       for (const item of items) {
-        if (homeScope.getStore()?.home && (item.parentThreadId !== captainThreadId || (item.nativeHome && item.nativeHome !== fmHome))) continue;
+        if (!ownedByScopedCaptain(item.parentThreadId) || item.nativeHome && item.nativeHome !== fmHome) continue;
         if (item.status === "done" || item.status === "dropped") { out.queue.skipped++; continue; }
         // Already projected (has a row id): never re-add — keeps migrate-owners
         // idempotent. We reuse the KV item id as the backlog row id (native
         // caller-owns-the-id convention), so the row is deterministic.
-        if (item.backlogId !== undefined && item.backlogId !== "") { out.queue.skipped++; continue; }
-        const proj = await projectQueueAdd(item.id, item.title, item.shape, item.projectId);
+        if (item.nativePending || item.backlogId !== undefined && item.backlogId !== "") { out.queue.skipped++; continue; }
+        queueStore.patch(item,{nativePending:true});
+        const proj = await projectQueueAdd(item.id, item.title, item.shape, item.projectId,item.nativeHome);
         if (!proj.ok) { out.queue.skipped++; continue; }
         item.backlogId = item.id;
         if (item.status === "dispatched") await projectQueueTransition(item, "start");
         out.queue.projected++;
-        dirty = true;
+        queueStore.patch(item, {backlogId:item.id,nativePending:false});
       }
-      if (dirty) await writeQueue(items);
     }
 
     if (await decisionsIsReal()) {
@@ -3670,9 +3728,9 @@ export default async function plugin(bb: BbPluginApi) {
     if (parentThreadId === undefined) return undefined;
     try {
       const opts = await bb.sdk.threads.defaultExecutionOptions({ threadId: parentThreadId });
-      return toPermissionMode(asRecord(opts)["permissionMode"]);
+      return toPermissionMode(asRecord(opts)["permissionMode"]) ?? "accept-edits";
     } catch {
-      return undefined;
+      return "accept-edits";
     }
   }
 
@@ -3801,21 +3859,37 @@ export default async function plugin(bb: BbPluginApi) {
             );
             if (!metaFlag(meta, "crew")) return null;
             const id = typeof meta["crewId"] === "string" ? meta["crewId"] : row.threadId.slice(0, 8);
+            const launch = typeof meta["launchKey"] === "string" ? launches.get(meta["launchKey"]) : launches.forTask(row.projectId,typeof row.parentThreadId === "string" ? row.parentThreadId : "",id);
+            const latestLaunch=launches.forTask(row.projectId,typeof row.parentThreadId === "string"?row.parentThreadId:"",id);
+            const original=launch?.replacement?crewSchema.parse(launch.replacement.sourceCrew):undefined;
+            if (launch?.replacement && !launch.replacement.published) {
+              if (launches.isDeletedWorker(launch.replacement.sourceThreadId) || await bb.storage.kv.get(`crew-retired:${launch.replacement.sourceThreadId}`)===true) return null;
+              return original!;
+            }
+            if (latestLaunch?.replacement && latestLaunch.replacement.sourceThreadId===row.threadId && latestLaunch.threadId!==row.threadId) return null;
+
             return {
+              ...original,
               id,
+              launchKey:typeof meta["launchKey"] === "string" ? meta["launchKey"] : launch?.key,
+              deliveryRequirement:recoveredContract(meta,launch),
+              yolo:launch?.yolo ?? (typeof meta["yolo"]==="boolean" ? meta["yolo"] : undefined),
               nativeHome: typeof meta["nativeHome"] === "string" ? meta["nativeHome"] : (await baseSettings.get()).fmHome.trim(),
               task: typeof meta["task"] === "string" ? meta["task"] : "(recovered crew)",
               ...(typeof meta["title"] === "string" && meta["title"] !== "" ? { title: meta["title"] } : {}),
               projectId: row.projectId,
               threadId: row.threadId,
               parentThreadId: typeof row.parentThreadId === "string" ? row.parentThreadId : null,
-              providerId: null,
-              model: null,
-              reasoningLevel: null,
+              providerId:launch?.execution?.providerId ?? null,
+              model:launch?.execution?.model ?? null,
+              reasoningLevel:launch?.execution?.reasoningLevel ?? null,
+              relaunches:launch?.replacement?.recoveryCount ?? Math.max(typeof meta.relaunches==='number'?meta.relaunches:0,(launch?.generation ?? (typeof meta.generation==='number'?meta.generation:1))-1),
+              replacementGeneration:launch?.generation ?? (typeof meta.generation==='number'?meta.generation:1),
+              ...(launch?.replacement?{priorThreadIds:[...(original?.priorThreadIds??[]),launch.replacement.sourceThreadId],taskSpilled:true}:{}),
               worktree: metaFlag(meta, "worktree"),
               shape: toShape(meta["shape"]),
               posture: typeof meta["posture"] === "string" ? meta["posture"] : "direct-PR",
-              createdAt: "",
+              createdAt:original?.createdAt??"",
             };
           } catch {
             return null;
@@ -3871,7 +3945,7 @@ export default async function plugin(bb: BbPluginApi) {
               for (const gone of crews) {
                 if (!kept.includes(gone)) {
                   bb.log.info(`read-through: crew ${gone.id} dropped (no real state/<id>.meta)`);
-                  await markQueueForCrew(gone.id, "done").catch(() => {});
+                  await markQueueForCrew(gone, "done").catch(() => {});
                 }
               }
               const removed = crews.filter(c => !kept.includes(c));
@@ -3916,18 +3990,9 @@ export default async function plugin(bb: BbPluginApi) {
   // out. Returns the refusal text, or null when there is room for `adding` more.
   async function crewCapRefusal(parentThreadId: string | undefined, adding: number): Promise<string | null> {
     if (parentThreadId === undefined) return null;
-    const raw = (await settings.get()).maxActiveCrews;
-    const cap = Number.isFinite(raw) ? Math.max(0, Math.trunc(raw)) : DEFAULT_MAX_ACTIVE_CREWS;
+    const {cap,activeTaskIds}=await launchCapacity(parentThreadId);
     if (cap === 0) return null;
-    const mine = (await listCrews({ owner: parentThreadId })).filter((c) => !isSecondmateRoute(c));
-    const statusByThread = await statusesFor(mine);
-    const statuses = mine.map((c) => statusByThread.get(c.threadId) ?? "unknown");
-    // A crew still starting already holds a slot; not counting it let a quick
-    // fan-out of dispatches overshoot the cap. A crew parked on WAITING: is idle
-    // between turns but its scheduled resume starts one, so it holds a slot too.
-    const waiting = await readWaiting();
-    const parked = await Promise.all(mine.map((c, i) => statuses[i] === "idle" ? isCrewWaiting(c, waiting) : Promise.resolve(false)));
-    const running = statuses.filter((st, i) => st === "active" || st === "pending" || st === "starting" || parked[i]).length;
+    const running=new Set([...activeTaskIds,...launches.heldTaskIds(parentThreadId)]).size;
     if (running + adding <= cap) return null;
     return `Crew cap reached: ${running} crews running (cap ${cap}). Queue this with firstmate_queue and dispatch when a crew finishes, or ask the captain to raise the cap.`;
   }
@@ -4008,10 +4073,30 @@ export default async function plugin(bb: BbPluginApi) {
 
   // Accept a crew id, or any thread id the crew has run on: captains often only
   // hold the thread id from a completion ping.
-  async function findCrew(id: string): Promise<Crew | undefined> {
+  async function findCrew(id: string,caller?:string,allowForeign=false): Promise<Crew | undefined> {
+    caller=caller??homeScope.getStore()?.captain;
     const all = await listCrewsAll();
-    return all.find((entry) => entry.id === id)
-      ?? all.find((entry) => entry.threadId === id || (entry.priorThreadIds ?? []).includes(id));
+    const matches=all.filter(entry=>entry.id===id || entry.threadId===id || (entry.priorThreadIds ?? []).includes(id));
+    const home=homeScope.getStore()?.home;
+    const ownerMatches=caller ? matches.filter(entry=>entry.parentThreadId===caller) : matches;
+    const homeMatches=home ? ownerMatches.filter(entry=>entry.nativeHome===home) : [];
+    // Explicit handoff preserves the worker's original home. Prefer this home
+    // when it resolves a collision, but never move recorded paths on handoff.
+    const owned=homeMatches.length ? homeMatches : ownerMatches;
+    const candidates=owned.length ? owned : matches;
+    if (candidates.length>1) throw new Error(`Ambiguous crew ${id}; use its exact worker thread identity in its owning captain home.`);
+    const found=candidates[0];
+    if (found && caller && !owned.length && found.parentThreadId && !allowForeign) {
+      throw new Error(`Refusing to access crew ${id}: it belongs to captain @thread:${found.parentThreadId}, the owning captain. Take that deck with: bb firstmate handoff --from ${found.parentThreadId}. Or use explicit supported --override-owner for this action.`);
+    }
+    if (found) { const launch=found.launchKey ? launches.get(found.launchKey) : launches.forTask(found.projectId,found.parentThreadId ?? "",found.id);
+      return launch?.deliveryRequirement ? {...found,launchKey:launch.key,deliveryRequirement:recoveredContract({deliveryRequirement:found.deliveryRequirement},launch)} : found; }
+    if (!caller) return undefined;
+    const projectId=(await bb.sdk.threads.get({threadId:caller})).projectId;
+    const record=deliveries.taskRecord(caller,projectId,id);
+    if (!record?.continuation) return undefined;
+    const recovered=crewSchema.parse(record.continuation);
+    return {...recovered,parentThreadId:record.owner,deliveryRequirement:record.requirement,prUrl:record.url};
   }
 
   async function findCrewByThread(threadId: string): Promise<Crew | undefined> {
@@ -4058,21 +4143,27 @@ export default async function plugin(bb: BbPluginApi) {
     model: string | undefined,
     projectId: string,
     parentThreadId: string | undefined,
+    reasoningLevel?: ReasoningLevel,
+    selectedHost?:string,
+    strict=false,
   ): Promise<void> {
-    const pid = (providerId ?? "").trim();
+    let resolvedProvider=providerId;
+    if (!resolvedProvider && (model || reasoningLevel)) try { resolvedProvider=(await bb.sdk.projects.defaultExecutionOptions({projectId}))?.providerId; } catch { /* default is unresolved */ }
+    const pid = (resolvedProvider ?? "").trim();
     const mid = (model ?? "").trim();
-    if (pid === "" && mid === "") return;
+    if (pid === "" && mid === "" && reasoningLevel === undefined) return;
     const envId = parentThreadId !== undefined ? await threadEnv(parentThreadId) : null;
-    const routing = envId !== null ? { environmentId: envId } : {};
+    const routing = selectedHost ? {hostId:selectedHost} : envId !== null ? { environmentId: envId } : {};
     let providers: unknown;
     try {
       providers = await raceAbort(bb.sdk.providers.list(routing), undefined, STUCK_HOST_CALL_MS);
     } catch (error) {
+      if (strict) throw new Error("Execution change refused: provider catalog unreadable.");
       bb.log.warn(`provider catalog unreadable (project=${projectId}); dispatch not pre-validated: ${error instanceof Error ? error.message : String(error)}`);
       return;
     }
     const rows = Array.isArray(providers) ? providers.map(asRecord) : [];
-    if (rows.length === 0) return;
+    if (rows.length === 0) {if (strict) throw new Error("Execution change refused: provider catalog is empty.");return;}
     if (pid !== "") {
       const ids = rows.map((p) => p["id"]).filter((id): id is string => typeof id === "string");
       const hit = rows.find((p) => p["id"] === pid);
@@ -4083,6 +4174,10 @@ export default async function plugin(bb: BbPluginApi) {
           `Unknown providerId "${pid}"${near.length > 0 ? ` — did you mean ${near.map((id) => `"${id}"`).join(" or ")}?` : "."} Known providers: ${ids.join(", ")}. Nothing was spawned.`,
         );
       }
+      if (strict && reasoningLevel && !Array.isArray(hit["reasoningLevels"])) throw new Error("Execution change refused: reasoning capability is unknown.");
+      if (reasoningLevel && Array.isArray(hit["reasoningLevels"]) && !hit["reasoningLevels"].some((level:unknown) => asRecord(level)["id"] === reasoningLevel)) {
+        throw new Error(`Provider "${pid}" does not advertise reasoning level "${reasoningLevel}". Nothing was spawned.`);
+      }
       if (hit["available"] === false) {
         throw new Error(`Provider "${pid}" is installed but not available on this host (sign-in or install needed). Nothing was spawned.`);
       }
@@ -4092,11 +4187,13 @@ export default async function plugin(bb: BbPluginApi) {
     try {
       catalog = asRecord(await raceAbort(bb.sdk.providers.models({ ...routing, ...(pid !== "" ? { providerId: pid } : {}) }), undefined, STUCK_HOST_CALL_MS));
     } catch {
+      if (strict) throw new Error("Execution change refused: model catalog unreadable.");
       return;
     }
     const models = Array.isArray(catalog["models"]) ? (catalog["models"] as unknown[]).map(asRecord) : [];
-    if (catalog["modelLoadError"] != null || models.length === 0) return;
+    if (catalog["modelLoadError"] != null || models.length === 0) {if (strict) throw new Error("Execution change refused: model catalog is unresolved.");return;}
     if (models.some((m) => m["id"] === mid || m["model"] === mid)) return;
+    if (strict) throw new Error(`Execution change refused: model ${mid} is not in the selected provider catalog.`);
     // The catalog lists canonical ids only; providers also accept aliases and
     // selected models outside it, so an unlisted model is not a refusal. A model
     // the provider really rejects shows up as a thread born in error, which
@@ -4131,7 +4228,284 @@ export default async function plugin(bb: BbPluginApi) {
     return "";
   }
 
-  async function dispatchCrew(input: {
+  async function createNativeWorker(flags: Map<string, FlagValue>, ctx: unknown) {
+    const taskId = flagStr(flags, "task"), projectId = flagStr(flags, "project"), home = flagStr(flags, "home");
+    const hostId = flagStr(flags, "host"), path = flagStr(flags, "path"), promptFile = flagStr(flags, "prompt-file");
+    const owner = flagStr(flags, "parent") ?? ctxString(ctx, "threadId") ?? "";
+    const shape = flagStr(flags, "shape") ?? "ship";
+    if (!taskId || !/^[A-Za-z0-9._-]+$/.test(taskId) || !projectId || !home?.startsWith("/") || !hostId || !path?.startsWith("/") || !promptFile?.startsWith("/")) throw new Error("Internal creation requires task, project, home, host, path and prompt file.");
+    if (!["ship", "scout", "secondmate"].includes(shape)) throw new Error("Unsupported native worker shape.");
+    if (flags.has("shared-env") && shape === "ship") throw new Error("Native ship isolation is mandatory.");
+    const nativePid=flagStr(flags,"native-pid");
+    if (!nativePid || !/^\d+$/.test(nativePid)) throw new Error("Internal creation requires a native spawn process identity.");
+    const admission=await runOnHost(hostId,["set -eu",
+      `test -d ${shQuote(`${home}/state/.spawn-${taskId}.lock`)}`,
+      `[ "$(cat ${shQuote(`${home}/state/.spawn-${taskId}.lock/pid`)})" = ${shQuote(nativePid)} ]`,
+      `kill -0 ${shQuote(nativePid)}`,
+      `native_command=$(ps -p ${shQuote(nativePid)} -o command=)`,
+      `case "$native_command" in *fm-spawn.sh*) ;; *) echo 'error: creation must follow native fm-spawn guards' >&2; exit 1 ;; esac`,
+    ].join("\n"),15_000,launchAbort.signal);
+    requireNativeSuccess(admission,"native launch admission proof");
+    const selection = await selectExecution(bb, projectId, hostId);
+    if (shape !== "secondmate" && selection.checkout !== path) throw new Error("Native project path does not match selected host checkout.");
+    const permissionMode = capPermission(toPermissionMode(flagStr(flags, "permission-mode")), await parentPermission(owner || undefined));
+    const parentRuntime=shape==="secondmate"?await bb.storage.kv.get<{release:string}>(`native-runtime:${owner}`):undefined;
+    if (shape === "secondmate") {
+      const proof = await runOnHost(hostId, ["set -eu",
+        `[ "$(cat ${shQuote(`${path}/.fm-secondmate-home`)})" = ${shQuote(taskId)} ]`,
+        `. ${shQuote(`${home}/bin/fm-secondmate-parent-lib.sh`)}`,
+        `fm_secondmate_parent_record_parse ${shQuote(`${path}/.fm-secondmate-parent`)}`,
+        `[ "$FM_SECONDMATE_PARENT_ROUTE" = local ]`,
+        `[ "$(realpath "$FM_SECONDMATE_PARENT_HOME")" = "$(realpath ${shQuote(home)})" ]`,
+        `test -f ${shQuote(`${path}/AGENTS.md`)}`,
+      ].join("\n"), 15_000, launchAbort.signal);
+      requireNativeSuccess(proof, "secondmate home identity");
+      if(parentRuntime) {
+        // Seeded child source came from this exact selected version. Use that
+        // version's verified adapter, including after a plugin update.
+        const prepared=await runOnHost(hostId,[fmBinDirAssign(home),fmMirrorStaleGuard(home),`python3 "$FM_RUNTIME_ROOT/../overlay/install-bb-backend.py" --home ${shQuote(path)} --overlay "$FM_RUNTIME_ROOT/../overlay" --project-id ${shQuote(projectId)}`].join("\n"),60_000,launchAbort.signal);
+        requireNativeSuccess(prepared,"seeded selected runtime adapter");
+      } else await installBbBackend(hostId, path, projectId, 180_000, launchAbort.signal);
+    }
+    await validateProviderChoice(flagStr(flags,"provider"),flagStr(flags,"model"),projectId,owner || undefined,strictReasoning(flagStr(flags,"reasoning-level")),hostId);
+    const read = await bb.sdk.files.read({ hostId, path: promptFile });
+    if (!("content" in read) || read.sizeBytes > 1_000_000) throw new Error("Native prompt is missing or exceeds 1MB.");
+    const prompt = read.contentEncoding === "base64" ? Buffer.from(read.content,"base64").toString("utf8") : read.content;
+    const key = launchKey(projectId, owner, home, taskId);
+    const deliveryRequirement=taskDelivery(flagStr(flags,"delivery-mode") ?? "direct-PR",z.enum(["branch","pr","merged","merged-and-verified"]).optional().parse(flagStr(flags,"delivery-requirement")),shape);
+    let record = await launches.reserve({ key, taskId, projectId, owner, home, generation:1,shape,nativeInvoked:true,deliveryMode:flagStr(flags,"delivery-mode"),deliveryRequirement,state:"reserved",threadId:null,hostId,updatedAt:Date.now() }, () => launchCapacity(owner || undefined));
+    record = await reconcileLaunch(record);
+    const suppliedContract=flagStr(flags,"delivery-requirement");
+    if (suppliedContract && suppliedContract !== recoveredContract({},record)) throw new Error("Creation retry cannot change the original delivery contract.");
+    const created = await launches.create(key, () => bb.sdk.threads.spawn({ projectId, parentThreadId:owner || undefined,
+      environment: shape === "secondmate" || flags.has("shared-env")
+        ? { type:"host",hostId,workspace:{ type:"unmanaged",path } }
+        : { type:"host",hostId,workspace:{ type:"managed-worktree",baseBranch:{ kind:"default" } } },
+      prompt, title:flagStr(flags,"title"),providerId:flagStr(flags,"provider"),model:flagStr(flags,"model"),
+      reasoningLevel: strictReasoning(flagStr(flags,"reasoning-level")), permissionMode,
+      visibility:flags.has("hidden") ? "hidden" : "visible",
+      pluginMetadata: { launchKey:key,generation:1,nativeHome:shape === "secondmate" ? path : home,
+        ...(shape === "secondmate" ? { captain:"true",nativeTaskId:taskId,nativeParentHome:home,...(parentRuntime?{nativeRuntimeRelease:parentRuntime.release}:{}) } : { crew:"true",crewId:taskId,shape,posture:flagStr(flags,"delivery-mode") ?? "direct-PR",worktree:!flags.has("shared-env"),deliveryRequirement:recoveredContract({},record) }) },
+    }), launchAbort.signal);
+    if (shape === "secondmate") {
+      if(parentRuntime) {
+        const bound=await nativeRuntime.operation(hostId,"bind-seeded",{home:path,captain:created.threadId!,release:parentRuntime.release,parentHome:home,parentCaptain:owner,taskId},launchAbort.signal);
+        await bb.storage.kv.set(`native-runtime:${created.threadId}`,bound.selection);
+        await bb.storage.kv.set(`captain-for-home:${path}`,created.threadId!);
+      }
+      await bb.storage.kv.set(`native-home:${created.threadId}`,path);
+      await bb.storage.kv.set(`native-home-host:${created.threadId}`,hostId);
+      captainHomes.set(created.threadId!,path);
+    }
+    const deadline = Date.now()+15_000;
+    do {
+      launchAbort.signal.throwIfAborted();
+      const thread = await raceAbort(bb.sdk.threads.get({ threadId:created.threadId! }),launchAbort.signal,STUCK_HOST_CALL_MS);
+      if (thread.environmentId) {
+        const env = await raceAbort(bb.sdk.environments.get({ environmentId:thread.environmentId }),launchAbort.signal,STUCK_HOST_CALL_MS);
+        if (env.hostId !== hostId) throw new Error("Created worker environment host differs from selected host.");
+        if (env.path && env.status === "ready") {
+          let execution:LaunchRecord["execution"]={providerId:thread.providerId ?? null,model:null,reasoningLevel:null};
+          try { const actual=await raceAbort(bb.sdk.threads.defaultExecutionOptions({threadId:thread.id}),launchAbort.signal,STUCK_HOST_CALL_MS); if (actual) execution={...execution,model:actual.model,reasoningLevel:actual.reasoningLevel}; } catch { /* unresolved defaults remain null */ }
+          launches.update(key,{ path:env.path,state:"provisioning",execution });
+          return { id:created.threadId!,path:env.path };
+        }
+      }
+      await raceAbort(sleep(500), launchAbort.signal);
+    } while (Date.now()<deadline);
+    launches.update(key,{ state:"provisioning",error:"Environment is still provisioning; native isolation guard has not run." });
+    throw new Error(`Worker ${created.threadId} is still provisioning. It is retained under task ${taskId}; reconcile before retrying.`);
+  }
+
+  function strictReasoning(value: unknown): ReasoningLevel | undefined {
+    if (value === undefined) return undefined;
+    const result = toReasoningLevel(value);
+    if (result === undefined) throw new Error(`Unsupported reasoning level ${String(value)}.`);
+    return result;
+  }
+
+  async function launchCapacity(owner: string | undefined) {
+    const raw = (await settings.get()).maxActiveCrews;
+    const cap = Number.isFinite(raw) ? Math.max(0, Math.trunc(raw)) : DEFAULT_MAX_ACTIVE_CREWS;
+    const mine = (await readCrews()).filter(c => c.parentThreadId === (owner ?? null) && !isSecondmateRoute(c) && !launches.isDeletedWorker(c.threadId));
+    const statuses = await statusesFor(mine);
+    const activeTaskIds: string[] = [];
+    for (const c of mine) {
+      const st = statuses.get(c.threadId);
+      if (st === "active" || st === "pending" || st === "starting" || st === "unknown" || await isCrewWaiting(c)) activeTaskIds.push(launchTaskKey(c.projectId,c.id));
+    }
+    // Worker retention is independent of launch capacity. A forgotten running
+    // worker still consumes admission capacity until core reports completion.
+    for (let offset=0; ; offset+=100) {
+      const records=launches.list(owner ?? "",100,offset);
+      for (const record of records) {
+        if (record.state !== "running" || !record.threadId || record.shape === "secondmate-route") continue;
+        try {
+          const thread=await raceAbort(bb.sdk.threads.get({threadId:record.threadId}),launchAbort.signal,STUCK_HOST_CALL_MS);
+          if (["active","pending","starting"].includes(thread.status)) activeTaskIds.push(launchTaskKey(record.projectId,record.taskId));
+        } catch { activeTaskIds.push(launchTaskKey(record.projectId,record.taskId)); }
+      }
+      if (records.length<100) break;
+    }
+    return { cap, activeTaskIds };
+  }
+
+  async function adoptLegacyLaunch(taskId:string, threadId:string, owner:string, projectId:string, check:boolean, callerSignal?:AbortSignal) {
+    if (!/^[A-Za-z0-9._-]{1,100}$/.test(taskId) || [".",".."].includes(taskId) || !/^thr_[A-Za-z0-9]+$/.test(threadId)) throw new Error("Exact task and BB thread identities are required.");
+    const signal=AbortSignal.any([launchAbort.signal,AbortSignal.timeout(60_000),...(callerSignal ? [callerSignal] : [])]);
+    const read=<T>(p:Promise<T>)=>adoptionRead(p,signal);
+    const home=await read(bb.storage.kv.get<string>(`native-home:${owner}`));
+    if (!home || home !== (await settings.get()).fmHome.trim()) throw new Error("Adoption requires the owning captain's explicitly bound native home.");
+    const captain=await read(bb.sdk.threads.get({threadId:owner,signal}));
+    const captainMeta=await read(bb.sdk.threads.getPluginMetadata({threadId:owner,signal}));
+    if (!metaFlag(captainMeta,"captain") || captain.projectId !== projectId || captain.archivedAt || captain.deletedAt) throw new Error("Adoption must run in the live owning captain and exact project context.");
+    const record=launches.forTask(projectId,owner,taskId);
+    assertAdoptableReservation(record,owner,projectId,home,threadId);
+    return launches.once(`adopt:${record.key}`,async()=>{
+      if (launches.isDeletedWorker(threadId) || await read(bb.storage.kv.get(`crew-retired:${threadId}`)) === true) throw new Error("Worker was explicitly deleted or retired; adoption refused.");
+      const identity=await inspectAdoptionIdentity(bb,record,threadId,signal);
+      const crews=await read(readCrews());
+      const conflict=(c:Crew)=>c.projectId===projectId && c.id===taskId && (c.threadId!==threadId || c.parentThreadId!==owner || c.nativeHome && c.nativeHome!==home || c.shape!==record.shape || c.posture!==record.deliveryMode || c.deliveryRequirement && c.deliveryRequirement!==record.deliveryRequirement);
+      if (crews.some(conflict) || crews.some(c=>c.threadId===threadId && (c.id!==taskId || c.projectId!==projectId))) throw new Error("Crew register identity or immutable delivery contract conflicts.");
+      const execution={model:identity.execution.model,reasoningLevel:identity.execution.reasoningLevel,permissionMode:identity.execution.permissionMode};
+      const plan={record,threadId,environmentId:identity.environment.id,worktree:identity.environment.path!,createdAt:identity.thread.createdAt,eventId:identity.eventId,prompt:identity.prompt,execution,proof:record.adoption?.proof};
+      const resultSchema=z.object({proof:z.string(),briefSha:z.string(),promptSha:z.string(),task:z.string(),outcome:z.string(),branch:z.string(),head:z.string(),existing:z.boolean()});
+      async function native(action:"--check"|"--publish") {
+        const command=[...fmBackendEnv({fmHome:home!,hostId:record!.hostId!,projectId,parentThreadId:owner}),fmBinDirAssign(home!),fmMirrorStaleGuard(home!),"export FM_BINDIR",`bash "$FM_BINDIR/fm-launch-adopt.sh" ${action}`].join("\n");
+        const raw=await runOnHost(record!.hostId!,captureHostCommand(command),20_000,signal,JSON.stringify(plan));
+        requireNativeSuccess(raw,"legacy adoption host transport");
+        const captured=decodeHostCapture(raw.output.trim());
+        if (captured.exitCode !== 0) throw new Error(captured.stderr.trim() || captured.output.trim() || "Native adoption guard refused.");
+        return resultSchema.parse(JSON.parse(captured.output));
+      }
+      const inspected=await native("--check");
+      const summary={taskId,threadId,worktree:plan.worktree,workerStatus:identity.thread.status,deliveryRequirement:record.deliveryRequirement,originalAdmission:"unconfirmed",merge:"separate native guarded operation",status:inspected.outcome};
+      if (check) return { ...summary,adopted:false,eligible:true };
+      signal.throwIfAborted();
+      if (launches.isDeletedWorker(threadId) || await read(bb.storage.kv.get(`crew-retired:${threadId}`)) === true) throw new Error("Worker was retired during preflight; adoption refused.");
+      const adoption={threadId,environmentId:plan.environmentId,worktree:plan.worktree,proof:inspected.proof,briefSha:inspected.briefSha,promptSha:inspected.promptSha,createdAt:plan.createdAt,originalUpdatedAt:record.adoption?.originalUpdatedAt ?? record.updatedAt,originalError:record.adoption?.originalError ?? record.error,execution,phase:"publishing" as const};
+      const pending=launches.claimAdoption(record,adoption,inspected.task);
+      if (pending.state === "deleted") throw new Error("Worker was deleted during adoption; registration refused.");
+      plan.proof=adoption.proof;
+      const published=await native("--publish");
+      // Re-read public identity immediately before BB publication. Do not bind a
+      // worker that moved/retired during host validation or an interrupted retry.
+      const latest=await inspectAdoptionIdentity(bb,record,threadId,signal);
+      if (latest.environment.id!==plan.environmentId || latest.environment.path!==plan.worktree || latest.eventId!==plan.eventId || latest.prompt!==plan.prompt || launches.isDeletedWorker(threadId) || await read(bb.storage.kv.get(`crew-retired:${threadId}`)) === true) throw new Error("Worker identity changed during adoption; registration remains unresolved.");
+      await read(bb.sdk.threads.updatePluginMetadata({threadId,signal,set:{crew:"true",crewId:taskId,shape:record.shape,nativeHome:home,launchKey:record.key,generation:record.generation,posture:record.deliveryMode!,deliveryRequirement:record.deliveryRequirement!,worktree:"true",adopted:"true"}}));
+      const task=inspected.task;
+      await read(mutateCrews(async current=>{
+        if (current.some(conflict) || await bb.storage.kv.get(`crew-retired:${threadId}`) === true || launches.isDeletedWorker(threadId)) throw new Error("Task was retired or changed during adoption cache publication.");
+        const prior=current.find(c=>c.threadId===threadId);
+        const crew:Crew={...prior,id:taskId,threadId,projectId,parentThreadId:owner,nativeHome:home,launchKey:record.key,deliveryRequirement:record.deliveryRequirement!,shape:toShape(record.shape),posture:record.deliveryMode!,task:task.slice(0,TASK_INLINE_MAX),taskSpilled:task.length>TASK_INLINE_MAX,worktree:true,metaWritten:true,createdAt:prior?.createdAt || new Date(plan.createdAt).toISOString(),providerId:prior?.providerId ?? record.execution?.providerId ?? identity.thread.providerId,model:prior?.model ?? execution.model,reasoningLevel:prior?.reasoningLevel ?? execution.reasoningLevel};
+        return [...current.filter(c=>c.threadId!==threadId),crew];
+      }));
+      signal.throwIfAborted();
+      const completed=launches.update(record.key,{state:"running",adoption:{...adoption,phase:"complete"},error:undefined});
+      if (completed.state === "deleted") throw new Error("Worker was deleted during publication; launch remains deleted.");
+      bb.log.info(`legacy launch adopted task=${taskId} thread=${threadId}; no turn started; original native admission unconfirmed`);
+      return {...summary,workerStatus:latest.thread.status,status:published.outcome,adopted:true,eligible:true};
+    });
+  }
+
+  async function reconcileLaunch(record: LaunchRecord,signal=launchAbort.signal): Promise<LaunchRecord> {
+    if (record.adoption?.phase === "publishing") throw new Error(`Launch ${record.taskId} has an interrupted explicit adoption; repeat launches adopt with its exact worker identity.`);
+    if (record.threadId) return record;
+    if (record.state !== "creating" && record.state !== "uncertain") return record;
+    const found = await discoverLaunch(bb, record, signal);
+    signal.throwIfAborted();
+    if (found) return launches.update(record.key, { threadId: found, state: "provisioning", error: undefined });
+    throw new Error(`Launch ${record.taskId} remains uncertain after bounded reconciliation. Its slot is retained; no replacement was created.`);
+  }
+
+  async function launchEnvironmentReady(record:LaunchRecord,env:{hostId:string;status:string;path:string|null},signal?:AbortSignal) {
+    if (record.adoption?.phase === "publishing" || record.replacement && !record.replacement.published) return false;
+    if (env.status !== "ready" || !env.path || (record.hostId && env.hostId !== record.hostId)) return false;
+    if (!record.nativeInvoked) return true;
+    return await readFmMetaField(env.hostId,record.taskId,"bb_thread_id",record.home,signal) === record.threadId;
+  }
+
+  async function dispatchCrew(input: Parameters<typeof dispatchCrewBody>[0]): Promise<Crew> {
+    if (input.task.length>MAX_TASK) throw new Error(`Task exceeds ${MAX_TASK} UTF-16 units; split the assignment before dispatch. No brief, reservation or worker was created.`);
+    const requestedRequirement=input.deliveryRequirement;
+    if (input.crewId && !/^[A-Za-z0-9._-]{1,100}$/.test(input.crewId)) throw new Error("Invalid task retry identity.");
+    if (input.deliveryRequirement && !["branch","pr","merged","merged-and-verified"].includes(input.deliveryRequirement)) throw new Error("Unsupported delivery contract.");
+    input={...input,deliveryRequirement:taskDelivery(input.mode,input.deliveryRequirement,input.shape)};
+    if (input.branchPrefix!==undefined && input.shape!=='ship') throw new Error('branchPrefix applies only to ship dispatch.');
+    const transport=(await settings.get()).transport;
+    if (transport!=='real' && (input.branchPrefix!==undefined || input.dispatchProfileReason!==undefined)) throw new Error('Native branch prefix/profile intake needs transport=real (deck/init --real); SDK compatibility dispatch cannot bind a native branch or run native resolution.');
+    validateLaunchCapabilities({ ...input, transport });
+    const taskId = input.crewId || randomUUID().slice(0, 8);
+    const home = (await settings.get()).fmHome.trim();
+    const key = launchKey(input.projectId, input.parentThreadId ?? "", home, taskId);
+    return launches.once(`dispatch:${key}`, async () => {
+      const record = await launches.reserve({ key, taskId, projectId: input.projectId, owner: input.parentThreadId ?? "",
+        home, generation: 1, intake:launchIntakeSchema.parse(input),shape: input.shape, deliveryMode:input.mode, yolo:input.yolo, branchPrefix:input.branchPrefix,deliveryRequirement:input.deliveryRequirement ?? "merged", state: "reserved", threadId: null, updatedAt: Date.now() }, () => launchCapacity(input.parentThreadId));
+      if(record.intake) {
+        const original=launchIntakeSchema.parse(record.intake);
+        for(const field of ["task","shape","mode","worktree","visible"] as const)if(input[field]!==original[field])throw new Error(`Retry cannot change the original task intake ${field}. Use the exact original assignment.`);
+        for(const field of ["providerId","model","reasoningLevel","permissionMode","title","dispatchProfileReason"] as const)if(input[field]!==undefined && input[field]!==original[field])throw new Error(`Retry cannot change the original task intake ${field}; an execution change belongs to retry.`);
+        input={...input,...original};
+      }
+      const resolved = await reconcileLaunch(record);
+      if (resolved.routedIntake && await bb.storage.kv.get(`route-retired:${resolved.key}`)===true) throw new Error(`Routed request ${taskId} was explicitly forgotten; this handoff cannot be resent or recovered as active.`);
+      if (resolved.state === "deleted") throw new Error(`Worker for launch ${taskId} was deleted by BB core. This attempt cannot be resumed.`);
+      if (requestedRequirement && requestedRequirement !== recoveredContract({},resolved)) throw new Error("Retry cannot change the original delivery contract.");
+      if (input.yolo!==undefined && resolved.yolo!==undefined && input.yolo!==resolved.yolo) throw new Error("Retry cannot change the original merge-authority selection.");
+      if (input.branchPrefix!==undefined && input.branchPrefix!==(resolved.branchPrefix ?? 'fm/')) throw new Error('Retry cannot change the recorded ship branch prefix.');
+      input={...input,branchPrefix:resolved.branchPrefix};
+      input={...input,yolo:resolved.yolo??input.yolo,deliveryRequirement:recoveredContract({},resolved)};
+      if (resolved.threadId && ((await settings.get()).transport !== "real" || resolved.state === "running")) {
+        const crew = (await readCrews()).find(c => c.id === taskId && c.projectId === input.projectId && c.parentThreadId === (input.parentThreadId ?? null));
+        if (crew) return crew;
+        const original=resolved.intake ?? (resolved.routedIntake ? launchIntakeSchema.parse(resolved.routedIntake.dispatch) : undefined);
+        if(!original)throw new Error(`Original launch intake missing for ${taskId}; recover the exact owned task before retry. Worker and reservation retained.`);
+        const recovered: Crew = { id: taskId, task: original.task.trim(), projectId: resolved.projectId, parentThreadId: resolved.owner || null,
+          threadId: resolved.threadId, nativeHome: resolved.home, providerId: resolved.execution?.providerId ?? original.providerId ?? null, model: resolved.execution?.model ?? original.model ?? null, reasoningLevel: resolved.execution?.reasoningLevel ?? original.reasoningLevel ?? null,
+          worktree: original.worktree, shape: original.shape, posture: original.shape === "scout" ? "scout" : original.mode,
+          ...(original.title!==undefined ? {title:original.title} : {}),branchPrefix:resolved.branchPrefix,
+          yolo:resolved.yolo,launchKey: key, metaWritten: false, createdAt: new Date().toISOString() };
+        recovered.deliveryRequirement=recoveredContract({},resolved);
+        if (resolved.routedIntake) {
+          const child=resolved.routedIntake.dispatch;
+          Object.assign(recovered,{task:child.task,providerId:child.providerId??null,model:child.model??null,reasoningLevel:child.reasoningLevel??null,posture:`secondmate:${child.mode}`,worktree:false,routedIntake:resolved.routedIntake,branchPrefix:child.branchPrefix,yolo:resolved.routedIntake.posture.yolo});
+        }
+        await mutateCrews(rows => [recovered, ...rows.filter(c => !(c.id===taskId && c.projectId===input.projectId && c.parentThreadId===(input.parentThreadId??null)))]);
+        return recovered;
+      }
+      if(!resolved.intake && !resolved.routedIntake)throw new Error(`Original launch intake missing for ${taskId}; unresolved legacy launch cannot use retry input. Worker and reservation retained.`);
+      try {
+        const crew = await dispatchCrewBody({ ...input, crewId: taskId, ownsRow:input.crewId === undefined });
+        crew.launchKey = key;
+        if (isSecondmateRoute(crew)) {
+          // The recipient thread's environment/model is supervisor context only.
+          await mutateCrews(rows=>rows.map(c=>c.id===taskId && c.projectId===input.projectId && c.parentThreadId===(input.parentThreadId??null)?crew:c));
+          return crew;
+        }
+        let actualProvider = crew.providerId;
+        let thread: Awaited<ReturnType<typeof bb.sdk.threads.defaultExecutionOptions>> | null = null;
+        try { actualProvider = (await raceAbort(bb.sdk.threads.get({ threadId:crew.threadId }),launchAbort.signal,STUCK_HOST_CALL_MS)).providerId; } catch { /* unresolved */ }
+        try { thread = await raceAbort(bb.sdk.threads.defaultExecutionOptions({ threadId:crew.threadId }),launchAbort.signal,STUCK_HOST_CALL_MS); } catch { /* project defaults unresolved; never claim parent inheritance */ }
+        const envId=await threadEnv(crew.threadId);
+        let ready=false;
+        if (envId) try { const env=await raceAbort(bb.sdk.environments.get({environmentId:envId}),launchAbort.signal,STUCK_HOST_CALL_MS); ready=await launchEnvironmentReady({...launches.get(key)!,threadId:crew.threadId},env,launchAbort.signal); } catch { /* provisioning is unresolved */ }
+        launches.update(key, { threadId: crew.threadId, shape:isSecondmateRoute(crew) ? "secondmate-route" : crew.shape, state: ready || isSecondmateRoute(crew) ? "running" : "provisioning", execution: {
+          providerId: actualProvider, model: thread?.model ?? crew.model,
+          reasoningLevel: thread?.reasoningLevel ?? crew.reasoningLevel } });
+        if (thread) { crew.providerId = actualProvider; crew.model = thread.model; crew.reasoningLevel = thread.reasoningLevel; }
+        await mutateCrews(rows => rows.map(c => c.id===taskId && c.projectId===input.projectId && c.parentThreadId===(input.parentThreadId??null) ? crew : c));
+        if (!ready && launches.get(key)?.nativeInvoked && !isSecondmateRoute(crew)) throw new Error("Native admission/publication remains unresolved; worker and capacity are retained.");
+        return crew;
+      } catch (error) {
+        const latest = launches.get(key)!;
+        if (latest.state === "reserved" && !latest.nativeInvoked) launches.update(key, { state: "failed", error: String(error) });
+        else if (latest.state !== "failed" && latest.state !== "deleted") launches.update(key, { state: latest.threadId ? "provisioning" : "uncertain", error: String(error) });
+        throw new Error(`Launch ${taskId} (${launches.get(key)?.state ?? "uncertain"}): ${String(error)}. Reuse taskId=${taskId} for reconciliation; do not create a fresh retry identity.`);
+      }
+    });
+  }
+
+  async function dispatchCrewBody(input: {
     task: string;
     projectId: string;
     parentThreadId?: string;
@@ -4140,6 +4514,7 @@ export default async function plugin(bb: BbPluginApi) {
     // its native backlog row, brief, meta and thread all share ONE id (C1) — no
     // second backlog row for one piece of work. Omitted → a fresh random id.
     crewId?: string;
+    ownsRow?: boolean;
     providerId?: string;
     model?: string;
     reasoningLevel?: ReasoningLevel;
@@ -4148,16 +4523,29 @@ export default async function plugin(bb: BbPluginApi) {
     visible: boolean;
     shape: Shape;
     mode: DeliveryMode;
+    yolo?:boolean;
     sendAt?: number;
+    deliveryRequirement?: "branch" | "pr" | "merged" | "merged-and-verified";
+    branchPrefix?:string;
+    dispatchProfileReason?:string;
+    signal?:AbortSignal;
   }): Promise<Crew> {
-    const task = input.task.trim().slice(0, MAX_TASK);
+    const task = input.task.trim();
     if (task === "") throw new Error("Empty task.");
     const mates = await readSecondmates();
     const mate = input.mode === "local-only" ? undefined : pickSecondmate(mates, input.projectId, task);
     if (mate !== undefined && mate.threadId !== input.parentThreadId) {
-      // The mate thread may be dead/archived — if the routing send throws, do NOT
-      // fail the dispatch: log and fall through to a normal native spawn so the
-      // task is never lost. (The captain can re-register a live secondmate later.)
+      // Persist the route before sending. An unknown send outcome is not proof
+      // that the domain captain did not receive the task.
+      const routeKey=launchKey(input.projectId,input.parentThreadId ?? "",(await settings.get()).fmHome.trim(),input.crewId!);
+      const prior=launches.get(routeKey)?.routedIntake;
+      const requestedIntake=routedIntakeSchema.parse({schema:1,origin:{captainId:input.parentThreadId??null,home:(await settings.get()).fmHome.trim()},
+        dispatch:{task,taskId:input.crewId!,projectId:input.projectId,title:input.title,providerId:input.providerId,model:input.model,reasoningLevel:input.reasoningLevel,permissionMode:capPermission(input.permissionMode,await parentPermission(input.parentThreadId)),
+          worktree:input.worktree,visible:input.visible,shape:input.shape,mode:input.mode,deliveryRequirement:input.deliveryRequirement??"merged",branchPrefix:input.branchPrefix,dispatchProfileReason:input.dispatchProfileReason},
+        posture:{mode:input.mode,yolo:input.yolo??false,provenance:(await postureOf(input.projectId)).provenance}});
+      if (prior && JSON.stringify(prior.dispatch)!==JSON.stringify(requestedIntake.dispatch)) throw new Error('Routed intake cannot change while its handoff is unresolved.');
+      const intake=prior ?? requestedIntake;
+      launches.update(routeKey,{state:"creating",nativeInvoked:true,shape:"secondmate-route",routedIntake:intake});
       try {
         await bb.sdk.threads.send({
           threadId: mate.threadId,
@@ -4165,25 +4553,28 @@ export default async function plugin(bb: BbPluginApi) {
           input: [
             {
               type: "text",
-              text: `Routed work from main captain.\nShape: ${input.shape}\nMode: ${input.mode}\n\n${task}\n\nDispatch a crew for this. Reply with the crew id when underway.`,
+              text: renderRoutedIntake(intake),
               mentions: [],
             },
           ],
         });
         const routed: Crew = {
-          id: `sm-${randomUUID().slice(0, 6)}`,
-          task: `[secondmate ${mate.threadId}] ${task}`,
+          id: input.crewId!,
+          task, routedIntake:intake, nativeHome:intake.origin.home,
+          branchPrefix:intake.dispatch.branchPrefix,yolo:intake.posture.yolo,
           projectId: input.projectId,
           threadId: mate.threadId,
           parentThreadId: input.parentThreadId ?? null,
-          providerId: null,
-          model: null,
-          reasoningLevel: null,
+          providerId: intake.dispatch.providerId ?? null,
+          model: intake.dispatch.model ?? null,
+          reasoningLevel: intake.dispatch.reasoningLevel ?? null,
           worktree: false,
           shape: input.shape,
           posture: `secondmate:${input.mode}`,
+          deliveryRequirement:input.deliveryRequirement ?? "merged",
           createdAt: new Date().toISOString(),
         };
+        launches.update(routeKey,{threadId:mate.threadId,state:"running"});
         await mutateCrews(crews => [routed, ...crews]);
         return routed;
       } catch (error) {
@@ -4191,6 +4582,8 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
     const crew: Crew = {
+      yolo:input.yolo,deliveryRequirement: input.deliveryRequirement ?? "merged",
+      ...(input.branchPrefix!==undefined ? {branchPrefix:input.branchPrefix} : {}),
       nativeHome: (await settings.get()).fmHome.trim(),
       id: input.crewId !== undefined && input.crewId !== "" ? input.crewId : randomUUID().slice(0, 8),
       task,
@@ -4208,21 +4601,23 @@ export default async function plugin(bb: BbPluginApi) {
     };
     // A bad provider/model makes BB create a thread that is already in error. Check
     // BB's own catalog first so the refusal happens before anything is spawned.
-    await validateProviderChoice(input.providerId, input.model, input.projectId, input.parentThreadId);
+    const selectedHost=await resolveHostForProject(input.projectId,input.parentThreadId,input.signal);
+    const selection=await selectExecution(bb,input.projectId,selectedHost);
+    const selectionKey=launchKey(input.projectId,input.parentThreadId ?? "",crew.nativeHome ?? "",crew.id);
+    launches.update(selectionKey,{hostId:selection.hostId,path:selection.checkout});
+    await validateProviderChoice(input.providerId,input.model,input.projectId,input.parentThreadId,input.reasoningLevel,selection.hostId);
     // Real mode delegates policy to native; a refusal cannot select a less strict transport.
     const cur = await settings.get();
-    const scheduledFuture = input.sendAt !== undefined && input.sendAt > Date.now();
     if (cur.transport === "real") {
       if (cur.fmHome.trim() === "") throw new Error("Real transport needs fmHome. Run init --real before dispatch.");
-      if (scheduledFuture) throw new Error("Real transport does not support sendAt. Queue the task with waitUntil instead.");
       try {
-        const rtHost = await resolveHostForProject(input.projectId, input.parentThreadId);
+        const rtHost = selection.hostId;
         const realThreadId = await dispatchViaRealTransport(
           crew,
           { task: input.task, projectId: input.projectId, parentThreadId: input.parentThreadId,
             title: input.title, permissionMode: input.permissionMode,
-            ownsRow: input.crewId === undefined || input.crewId === "" },
-          rtHost,
+            ownsRow: input.ownsRow, visible: input.visible,checkout:selection.checkout,dispatchProfileReason:input.dispatchProfileReason },
+          rtHost,input.signal,
         );
         if (realThreadId !== null && realThreadId !== "") {
           crew.threadId = realThreadId;
@@ -4230,7 +4625,7 @@ export default async function plugin(bb: BbPluginApi) {
           // fm-spawn started the row — record that this crew owns a real row so its
           // close survives a later settings flip.
           crew.backlogRow = true;
-          await mutateCrews(crews => [crew, ...crews.filter(c => c.id !== crew.id)]);
+          await mutateCrews(crews => [crew, ...crews.filter(c => !(c.id===crew.id && c.projectId===crew.projectId && c.parentThreadId===crew.parentThreadId))]);
           await publishFleet();
           await noteMachineCeiling(crew.id, realThreadId, capPermission(input.permissionMode, await parentPermission(input.parentThreadId)));
           // fm-spawn ran ~30s while this crew may already have ended its first turn;
@@ -4252,16 +4647,19 @@ export default async function plugin(bb: BbPluginApi) {
     let hostId: string | undefined;
     let environment: Parameters<typeof bb.sdk.threads.spawn>[0]["environment"];
     if (input.worktree) {
-      hostId = await resolveHostForProject(input.projectId, input.parentThreadId);
+      hostId = selection.hostId;
       environment = {
         type: "host",
         hostId,
         workspace: { type: "managed-worktree", baseBranch: { kind: "default" } },
       };
     } else {
-      environment = { type: "project-default" };
+      hostId=selection.hostId;
+      const source=selection;
+      environment=source.environmentId ? {type:"reuse",environmentId:source.environmentId} : {type:"host",hostId,workspace:{type:"unmanaged",path:source.checkout}};
     }
-    const spawned = await bb.sdk.threads.spawn({
+    const key = launchKey(input.projectId, input.parentThreadId ?? "", crew.nativeHome ?? "", crew.id);
+    const created = await launches.create(key, () => bb.sdk.threads.spawn({
       projectId: input.projectId,
       environment,
       prompt: crewPrompt({
@@ -4278,23 +4676,22 @@ export default async function plugin(bb: BbPluginApi) {
       reasoningLevel: input.reasoningLevel,
       permissionMode: capped,
       visibility: input.visible ? "visible" : "hidden",
-      sendAt: input.sendAt,
       pluginMetadata: {
         crew: "true",
+        launchKey: key, generation: 1,
         crewId: crew.id,
         nativeHome: crew.nativeHome ?? "",
         task: task.slice(0, 500),
         ...(crew.title !== undefined ? { title: crew.title } : {}),
         shape: input.shape,
-        posture: crew.posture,
+        posture: crew.posture,...(crew.yolo!==undefined ? {yolo:crew.yolo} : {}), deliveryRequirement:input.deliveryRequirement ?? "merged",
         worktree: input.worktree,
       },
-    });
-    crew.threadId = threadIdOf(spawned);
-    await mutateCrews(crews => [crew, ...crews.filter(c => c.id !== crew.id)]);
+    }), input.signal ? AbortSignal.any([input.signal,launchAbort.signal]) : launchAbort.signal);
+    crew.threadId = created.threadId!;
+    await mutateCrews(crews => [crew, ...crews.filter(c => !(c.id===crew.id && c.projectId===crew.projectId && c.parentThreadId===crew.parentThreadId))]);
     await publishFleet();
-    const scheduled = input.sendAt !== undefined && input.sendAt > Date.now();
-    const okMeta = await publishFmMeta({ crew, hostId, scheduled, model: input.model, provider: input.providerId });
+    const okMeta = await publishFmMeta({ crew, hostId, scheduled:false, model: input.model, provider: input.providerId });
     // R5: only record a known-failed write. undefined (write succeeded, or real
     // mode is off) stays reapable; false marks "meta write failed, do not reap on
     // absence" so read-through can't reap a live crew whose meta never landed.
@@ -4303,10 +4700,7 @@ export default async function plugin(bb: BbPluginApi) {
       await mutateCrews(crews => crews.map((c) => (c.id === crew.id ? crew : c)));
     }
     await publishFmBrief(crew, hostId, input.task);
-    // Same record-after-spawn race as the real transport, though the native window
-    // is far smaller. Skip a future-scheduled send: its thread sits idle until sendAt
-    // and has not run yet, so its "idle" is not a turn-end to report.
-    if (!scheduled) await reconcileCrewTerminal(crew).catch(() => {});
+    await reconcileCrewTerminal(crew).catch(() => {});
     await noteMachineCeiling(crew.id, crew.threadId, capped);
     return crew;
   }
@@ -4315,47 +4709,116 @@ export default async function plugin(bb: BbPluginApi) {
   // fresh thread that may switch provider/model/reasoning. Unlike threads.retry
   // (a same-thread failed-turn resubmit), this mirrors fm-control relaunch —
   // the new thread runs at the requested reasoning from turn 1.
+  async function scoutPromotionReport(scout: Crew, owner?: string): Promise<string> {
+    if (scout.shape !== "scout") throw new Error(`Crew ${scout.id} is not a scout.`);
+    if (scout.parentThreadId !== (owner ?? null)) throw new Error("Promotion requires the owning captain or explicit handoff.");
+    if (await crewStatus(scout) !== "idle") throw new Error("Promotion requires a finished successful scout.");
+    const home = await crewNativeHome(scout);
+    const completeOutput=home ? undefined : await bb.sdk.threads.output({threadId:scout.threadId});
+    const report=completeOutput === undefined ? undefined : typeof completeOutput === "string" ? completeOutput : String(asRecord(completeOutput)["output"] ?? "");
+    const stream = await crewStatusLines(scout,report);
+    const status = latestStatus(stream.lines);
+    if (!status || status.verb !== "done" || foldOpenDecisions(stream.lines, stream.kind).length > 0) throw new Error("Promotion requires DONE with no open blockers.");
+    const reportPath = home ? `${home}/data/${scout.id}/report.md` : "";
+    if (reportPath) {
+      const hostId = await resolveHostForProject(scout.projectId, scout.parentThreadId ?? undefined);
+      const result = await bb.sdk.files.read({ hostId, path: reportPath });
+      if (!("content" in result) || result.sizeBytes === 0) throw new Error("Scout durable report is missing or unreadable.");
+      return `Read the complete durable scout report at ${reportPath} on host ${hostId}. Keep the recommendation and acceptance criteria intact.`;
+    }
+    // Compatibility scouts persist the entire final output as a durable artifact.
+    if (!report?.trim()) throw new Error("Scout durable report is missing or unreadable.");
+    reports.put(scout.projectId,owner ?? "",scout.id,report);
+    return `Read the complete durable scout report with: bb firstmate scout-report ${scout.id}. Keep its recommendations and acceptance criteria intact.`;
+  }
+
+  async function rebindReplacement(source:Crew,next:Crew,hostId:string,worktree:string,generation:number,check=false,briefSha?:string) {
+    const home=await crewNativeHome(source);if (!home) return "";
+    const project=await projectCheckoutPath(source.projectId,hostId);
+    if (!project) throw new Error("Replacement native project checkout is unresolved.");
+    const result=await runFmScript({script:"worker-rebind",signal:launchAbort.signal,args:[check?"--check":"--publish"],hostId,fmHome:home,projectId:source.projectId,timeoutMs:30_000,
+      stdin:JSON.stringify({home,owner:source.parentThreadId??"",taskId:source.id,sourceThreadId:source.threadId,threadId:next.threadId,worktree,project,shape:source.shape,mode:source.posture,generation,check,briefSha,providerId:next.providerId,model:next.model,reasoningLevel:next.reasoningLevel})});
+    requireNativeSuccess(result,check?"worker replacement preflight":"worker replacement publication");
+    const sha=/^FM_BB_REBIND_SOURCE_SHA=([a-f0-9]{64})$/m.exec(result.output)?.[1];if (!sha) throw new Error("Replacement native source evidence missing.");return sha;
+  }
+
   async function relaunchCrew(
     crew: Crew,
-    opts: { providerId?: string; model?: string; reasoningLevel?: ReasoningLevel; note?: string },
+    opts: { providerId?: string; model?: string; reasoningLevel?: ReasoningLevel; note?: string; overCap?: boolean;intent?:ReplacementIntent;caller?:string },
   ): Promise<Crew> {
+    const request=JSON.stringify([crew.projectId,crew.parentThreadId,crew.id,crew.threadId,opts]);
+    return launches.once(`replacement-request:${request}`,()=>serializeLedger(`replacement-task:${crew.projectId}:${crew.parentThreadId}:${crew.id}`,async()=>{
+      const current=(await readCrews()).find(c=>c.id===crew.id && c.projectId===crew.projectId && c.parentThreadId===crew.parentThreadId);
+      if (!current || current.threadId!==crew.threadId) throw new Error("Worker changed or retired while replacement was queued; inspect before another request.");
+      // Cache publication precedes the durable completion marker. If that final
+      // write failed, resume using the immutable original source, not the new
+      // worker's execution or consumed recovery count. The existing reservation
+      // still enforces the exact request and retains its returned worker identity.
+      const pending=launches.forTask(current.projectId,current.parentThreadId??"",current.id);
+      let source=current;
+      if (pending?.replacement && !pending.replacement.published && pending.threadId===current.threadId) {
+        source=crewSchema.parse(pending.replacement.sourceCrew);
+        if (!['provisioning','uncertain'].includes(pending.state) || launches.isDeletedWorker(current.threadId) || await bb.storage.kv.get(`crew-retired:${current.threadId}`)===true ||
+            current.launchKey!==pending.key || current.replacementGeneration!==pending.generation ||
+            source.threadId!==pending.replacement.sourceThreadId || source.id!==current.id || source.projectId!==current.projectId ||
+            source.parentThreadId!==current.parentThreadId || source.nativeHome!==current.nativeHome || (source.nativeHome??"")!==pending.home ||
+            source.shape!==current.shape || source.posture!==current.posture || source.deliveryRequirement!==current.deliveryRequirement) {
+          throw new Error("Pending replacement publication conflicts with current worker identity or task contract; inspect before retry.");
+        }
+      }
+      return replaceCrew(source,opts);
+    }));
+  }
+  async function replaceCrew(crew:Crew,opts:{providerId?:string;model?:string;reasoningLevel?:ReasoningLevel;note?:string;overCap?:boolean;intent?:ReplacementIntent;caller?:string}):Promise<Crew> {
+    const intent=opts.intent??'failure-recovery';
+    const explicit=intent==='execution-change';
+    if (explicit && opts.overCap) throw new Error("Execution change does not permit a capacity override.");
+    if (explicit && (!opts.caller || crew.parentThreadId!==opts.caller || !(opts.note??'').trim())) throw new Error("Execution change requires the owning captain and an explicit user-directed reason.");
+    if (launches.isDeletedWorker(crew.threadId) || await bb.storage.kv.get(`crew-retired:${crew.threadId}`)===true) throw new Error("Source worker was deleted or explicitly retired; replacement refused.");
+    crew={...crew,deliveryRequirement:await contractForCrew(crew)};
     if (isSecondmateRoute(crew)) {
       throw new Error(`Crew ${crew.id} is a secondmate route — relaunch the domain captain thread directly.`);
     }
     if (await isCaptainThread(crew.threadId)) {
       throw new Error("Refusing to relaunch the captain thread.");
     }
-    if ((crew.relaunches ?? 0) >= MAX_CREW_RELAUNCHES) {
+    if (!explicit && (crew.relaunches ?? 0) >= MAX_CREW_RELAUNCHES) {
       throw new Error(
         `Crew ${crew.id} was already relaunched ${crew.relaunches} time(s). Stuck ladder: second failure means report it failed with preserved work; do not relaunch again.`,
       );
     }
     const envId = await threadEnv(crew.threadId);
     if (envId === null) throw new Error(`Crew ${crew.id} has no environment to reuse.`);
-    const providerId = opts.providerId ?? crew.providerId ?? undefined;
-    const model = opts.model ?? crew.model ?? undefined;
-    const reasoningLevel = opts.reasoningLevel ?? toReasoningLevel(crew.reasoningLevel);
+    const actual=explicit?await raceAbort(bb.sdk.threads.defaultExecutionOptions({threadId:crew.threadId}),launchAbort.signal,STUCK_HOST_CALL_MS):undefined;
+    const originalThread=explicit?await raceAbort(bb.sdk.threads.get({threadId:crew.threadId}),launchAbort.signal,STUCK_HOST_CALL_MS):undefined;
+    if (explicit && (!actual || !originalThread?.providerId || originalThread.projectId!==crew.projectId || originalThread.parentThreadId!==opts.caller)) throw new Error("Execution change refused: authoritative current execution/ownership is unresolved.");
+    if (explicit && opts.reasoningLevel===undefined && toReasoningLevel(actual!.reasoningLevel)===undefined) throw new Error("Current reasoning value is unsupported; supply an explicit supported target rather than omit it.");
+    const providerId = opts.providerId ?? originalThread?.providerId ?? crew.providerId ?? undefined;
+    const model = opts.model ?? actual?.model ?? crew.model ?? undefined;
+    const reasoningLevel = opts.reasoningLevel ?? toReasoningLevel(actual?.reasoningLevel??crew.reasoningLevel);
+    if (explicit && providerId===originalThread!.providerId && model===actual!.model && reasoningLevel===actual!.reasoningLevel) throw new Error("Execution change requires an actual provider/model/reasoning change; unchanged execution remains subject to failure recovery limits.");
     // Validate a replacement before the old thread is stopped, never after.
-    if (opts.providerId !== undefined || opts.model !== undefined) {
-      await validateProviderChoice(providerId, model, crew.projectId, crew.parentThreadId ?? undefined);
-    }
-    const capped = capPermission(undefined, await parentPermission(crew.parentThreadId ?? undefined));
+    const reusedEnvironment=await raceAbort(bb.sdk.environments.get({environmentId:envId}),launchAbort.signal,STUCK_HOST_CALL_MS);
+    if (explicit && (reusedEnvironment.status!=="ready" || crew.worktree && !reusedEnvironment.isWorktree || !reusedEnvironment.path)) throw new Error("Execution change requires the ready original worktree.");
+    await validateProviderChoice(providerId, model, crew.projectId, crew.parentThreadId ?? undefined,reasoningLevel,reusedEnvironment.hostId,explicit);
+    const capped = capPermission(actual?toPermissionMode(actual.permissionMode):undefined, await parentPermission(crew.parentThreadId ?? undefined));
     await ensureWorkspace(crew.threadId, crew);
     const note = (opts.note ?? "").trim();
     const task = await fullCrewTask(crew);
     const fmHome = await crewNativeHome(crew);
     let workerPrompt: string;
     if (fmHome !== "") {
-      const hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
-      const brief = `${fmHome}/data/${crew.id}/brief.md`;
+      const hostId = reusedEnvironment.hostId;
+      const briefDir = `${fmHome}/data/${crew.id}`;
       const command = [
         `export FM_HOME=${shQuote(fmHome)} FM_ROOT=${shQuote(fmHome)}`,
         fmBinDirAssign(fmHome),
         fmMirrorStaleGuard(fmHome),
         `. "$FM_BINDIR/backends/bb.sh"`,
-        `fm_backend_bb_worker_prompt ${shQuote(brief)} ${shQuote(crew.shape)} ${shQuote(crew.id)}`,
+        `brief=${shQuote(`${briefDir}/launch-brief.md`)}; [ -e "$brief" ] || brief=${shQuote(`${briefDir}/brief.md`)}`,
+        `fm_backend_bb_worker_prompt "$brief" ${shQuote(crew.shape)} ${shQuote(crew.id)} ${shQuote(crew.posture)}`,
       ].join("\n");
-      const result = await runOnHost(hostId, command, 30_000);
+      const result = await runOnHost(hostId, command, 30_000,launchAbort.signal);
       if (result.exitCode !== 0 || result.output.trim() === "") {
         throw new Error(`Native relaunch brief unavailable for crew ${crew.id}: ${result.output.trim() || `exit ${result.exitCode}`}. Prior thread preserved.`);
       }
@@ -4367,12 +4830,36 @@ export default async function plugin(bb: BbPluginApi) {
     const prompt = [workerPrompt, "",
       `RELAUNCH: the prior thread was replaced. Continue the same task in this same worktree.${note !== "" ? ` Progress note: ${note}` : ""}`,
     ].join("\n");
-    // Release only after the replacement's native instructions are readable.
-    await bb.sdk.threads.stop({ threadId: crew.threadId });
-    const spawned = await bb.sdk.threads.spawn({
+    const plan=replacementPlan(crew,launches.forTask(crew.projectId,crew.parentThreadId??"",crew.id),{
+      sourceCrew:{...crew,task,taskSpilled:false},sourceThreadId:crew.threadId,environmentId:envId,intent,reason:note,recoveryCount:(crew.relaunches??0)+(explicit?0:1),task,prompt,
+      target:{providerId:providerId??null,model:model??null,reasoningLevel:reasoningLevel??null},
+    });
+    const key = launchKey(crew.projectId,crew.parentThreadId ?? "",crew.nativeHome ?? "",crew.id,plan.generation);
+    let reservation = await launches.reserve({ key,taskId:crew.id,projectId:crew.projectId,owner:crew.parentThreadId ?? "",home:crew.nativeHome ?? "",
+      generation:plan.generation,replacement:plan.contract,shape:crew.shape,deliveryMode:crew.posture,deliveryRequirement:crew.deliveryRequirement,state:"reserved",threadId:null,hostId:reusedEnvironment.hostId,path:reusedEnvironment.path ?? undefined,updatedAt:Date.now() }, () => launchCapacity(crew.parentThreadId ?? undefined),opts.overCap);
+    if (JSON.stringify(reservation.replacement?.target)!==JSON.stringify(plan.contract.target) || reservation.replacement?.sourceThreadId!==crew.threadId || reservation.replacement.intent!==intent || reservation.replacement.reason!==note) throw new Error("Replacement reservation conflicts with this exact request.");
+    reservation = await reconcileLaunch(reservation);
+    if (fmHome) {
+      const sha=await rebindReplacement(crew,{...crew,threadId:reservation.threadId??crew.threadId,providerId:providerId??null,model:model??null,reasoningLevel:reasoningLevel??null},reusedEnvironment.hostId,reusedEnvironment.path??"",plan.generation,true,reservation.replacement!.nativeBriefSha);
+      if (!reservation.replacement!.nativeBriefSha) reservation=launches.update(key,{replacement:{...reservation.replacement!,nativeBriefSha:sha}});
+    }
+    // Release only after the replacement's native instructions are readable and a
+    // durable slot exists. Unknown creation is reconciled before stopping again.
+    if (!reservation.threadId) {
+      if (!reservation.replacement!.stopped) {
+        await raceAbort(bb.sdk.threads.stop({ threadId: crew.threadId }),launchAbort.signal,STUCK_HOST_CALL_MS);
+        reservation=launches.update(key,{replacement:{...reservation.replacement!,stopped:true}});
+      }
+      if (!reservation.replacement!.archived) {
+        const source=await raceAbort(bb.sdk.threads.get({threadId:crew.threadId}),launchAbort.signal,STUCK_HOST_CALL_MS);
+        if (!source.archivedAt) await raceAbort(bb.sdk.threads.archive({threadId:crew.threadId}),launchAbort.signal,STUCK_HOST_CALL_MS);
+        reservation=launches.update(key,{replacement:{...reservation.replacement!,archived:true}});
+      }
+    }
+    const replacement = await launches.create(key, () => bb.sdk.threads.spawn({
       projectId: crew.projectId,
       environment: { type: "reuse", environmentId: envId },
-      prompt,
+      prompt:reservation.replacement!.prompt,
       title: crewThreadTitle(task, crew.shape, crew.id, crew.title),
       parentThreadId: crew.parentThreadId ?? undefined,
       providerId,
@@ -4381,32 +4868,42 @@ export default async function plugin(bb: BbPluginApi) {
       permissionMode: capped,
       visibility: "visible",
       pluginMetadata: {
-        crew: "true",
-        crewId: crew.id,
+        crew: "true", launchKey:key,generation:reservation.generation,
+        crewId: crew.id, replacementIntent:intent,relaunches:plan.contract.recoveryCount,replacementGeneration:plan.generation,taskSpilled:task.length>500,
         nativeHome: crew.nativeHome ?? "",
         task: task.slice(0, 500),
         ...(crew.title !== undefined ? { title: crew.title } : {}),
         shape: crew.shape,
-        posture: crew.posture,
+        posture: crew.posture,deliveryRequirement:crew.deliveryRequirement ?? "merged",
         worktree: crew.worktree,
       },
-    });
-    const oldThreadId = crew.threadId;
+    }),launchAbort.signal);
     const next: Crew = {
       ...crew,
-      threadId: threadIdOf(spawned),
+      threadId: replacement.threadId!,
       providerId: providerId ?? null,
       model: model ?? null,
       reasoningLevel: reasoningLevel ?? null,
-      relaunches: (crew.relaunches ?? 0) + 1,
+      relaunches: plan.contract.recoveryCount,
+      replacementGeneration:plan.generation,launchKey:key,
       priorThreadIds: [...(crew.priorThreadIds ?? []), crew.threadId],
     };
-    await mutateCrews(crews => crews.map((c) => (c.id === crew.id ? next : c)));
-    if (oldThreadId !== next.threadId) {
-      try { await bb.sdk.threads.archive({ threadId: oldThreadId }); } catch { /* best effort */ }
-    }
+    try {
+      const actualExecution=await raceAbort(bb.sdk.threads.defaultExecutionOptions({threadId:next.threadId}),launchAbort.signal,STUCK_HOST_CALL_MS);
+      if (actualExecution) {next.model=actualExecution.model;next.reasoningLevel=actualExecution.reasoningLevel;}
+    } catch { /* Defaults remain explicitly unresolved. */ }
+    try { next.providerId=(await raceAbort(bb.sdk.threads.get({threadId:next.threadId}),launchAbort.signal,STUCK_HOST_CALL_MS)).providerId; }
+    catch { /* Keep the requested provider when core cannot report it. */ }
+    launches.update(key,{ state:"provisioning",execution:{providerId:next.providerId,model:next.model,reasoningLevel:next.reasoningLevel} });
+
+    // The old thread was archived before creation; unknown outcomes retain the
+    // reserved replacement slot and recover by exact generation metadata.
+    if (launches.isDeletedWorker(next.threadId) || launches.get(key)?.state==='deleted') throw new Error("Replacement was deleted; native publication refused, preserved work requires inspection.");
+    if (fmHome && !await rebindReplacement(crew,next,reusedEnvironment.hostId,reusedEnvironment.path??"",plan.generation,false,reservation.replacement!.nativeBriefSha)) throw new Error("Replacement worker exists; native endpoint publication pending. Repeat this exact retry request; do not create another worker.");
+    if (launches.isDeletedWorker(next.threadId)) throw new Error("Replacement was deleted during publication; crew cache remains unresolved.");
+    await mutateCrews(crews => crews.map((c) => (c.id === crew.id && c.projectId===crew.projectId && c.parentThreadId===crew.parentThreadId ? next : c)));
     await publishFleet();
-    await publishFmMeta({ crew: next, scheduled: false });
+    launches.update(key,{state:reusedEnvironment.status === "ready" && reusedEnvironment.path ? "running" : "provisioning",replacement:{...launches.get(key)!.replacement!,published:true}});
     return next;
   }
 
@@ -4434,9 +4931,10 @@ export default async function plugin(bb: BbPluginApi) {
     const b64 = Buffer.from(body.slice(0, MAX_TASK), "utf8").toString("base64");
     const script = [
       `export FM_HOME=${shQuote(fmHome)}`,
-      `export FM_ROOT=${shQuote(fmHome)}`,
-      `[ -f ${shQuote(lib)} ] || { echo "error: missing ${lib}" >&2; exit 127; }`,
-      `. ${shQuote(lib)}`,
+      fmBinDirAssign(fmHome),
+      `lib=${shQuote(lib)}; [ "\${FM_BUNDLED_VERIFIED:-}" != 1 ] || lib="$FM_BINDIR/fm-task-inbox-lib.sh"`,
+      `[ -f "$lib" ] || { echo "error: missing $lib" >&2; exit 127; }`,
+      `. "$lib"`,
       `mkdir -p ${shQuote(stateDir)}`,
       `body=$(printf '%s' ${shQuote(b64)} | base64 -d)`,
       `record=$(fm_task_inbox_write ${shQuote(stateDir)} ${shQuote(crewId)} "$body"${fireAndForget ? " fire-and-forget" : ""}) || exit $?`,
@@ -4527,7 +5025,7 @@ export default async function plugin(bb: BbPluginApi) {
       // BB-DIVERGE: the native doorbell tells the worker to hand-roll list/read/mv.
       // Name the helper that performs those steps. The native prefix stays so a
       // worker that only knows the old line can still follow it.
-      const doorbell = `${written.doorbell} On BB, run FM_HOME=${home} ${home}/bin-bb/fm-inbox-take.sh ${crew.id} and, after you act, run it again with --ack.`;
+      const doorbell = `${written.doorbell} On BB, run FM_HOME=${home} ${home}/bin-bb/fm-inbox-take.sh ${crew.id} and, after you act, run the helper's printed acknowledgement command with only the displayed immutable message IDs you handled (--ack 001.msg [002.msg ...]). Bare --ack refuses; new arrivals remain pending.`;
       const previous = await bb.storage.kv.get<InboxDelivery>(key);
       const delivery: InboxDelivery = previous && previous.home === home && previous.crewId === crew.id
         ? previous : { threadId: crew.threadId, hostId, home, crewId: crew.id, senderThreadId: crew.parentThreadId ?? undefined, doorbell, queueIds: [], records: [], retry: false };
@@ -4604,6 +5102,18 @@ export default async function plugin(bb: BbPluginApi) {
       }
       throw error;
     }
+  }
+
+  async function resumeRetainedAuthor(crew:Crew,caller?:string) {
+    if (!caller || crew.parentThreadId !== caller || (await readCrews()).some(c=>c.threadId === crew.threadId)) return;
+    const record=deliveries.taskRecord(caller,crew.projectId,crew.id);
+    if (!record?.continuation || !record.workers.includes(crew.threadId)) return;
+    const thread=await bb.sdk.threads.get({threadId:crew.threadId});
+    if (thread.projectId !== crew.projectId) throw new Error("Retained author project mismatch; explicit recovery is required.");
+    // Forget clears the role flag. Restore only this owned, durable worker before
+    // any requested fix turn can receive a fresh agent configuration.
+    await bb.sdk.threads.updatePluginMetadata({threadId:crew.threadId,set:{crew:"true",crewId:crew.id,shape:crew.shape,posture:crew.posture,nativeHome:record.home,deliveryRequirement:record.requirement,...(crew.launchKey ? {launchKey:crew.launchKey} : {})}});
+    if (thread.archivedAt != null) await bb.sdk.threads.unarchive({threadId:crew.threadId});
   }
 
   async function tellCrew(crew: Crew, message: string, interrupt: boolean, queue = false): Promise<string> {
@@ -4704,6 +5214,7 @@ export default async function plugin(bb: BbPluginApi) {
     const uncommitted = uncommittedRes.status === "fulfilled" ? extractPaths(uncommittedRes.value) : [];
     const pr = prRes.status === "fulfilled" ? summarizePR(prRes.value) : "unknown";
     const prF = prRes.status === "fulfilled" ? prFacts(prRes.value) : prFacts(null);
+    if (prF.url) await rememberPrUrl(crew,prF.url);
     const posture = await postureOf(crew.projectId);
     const files = [...new Set([...committed, ...uncommitted])];
     const lines = [
@@ -4794,7 +5305,7 @@ export default async function plugin(bb: BbPluginApi) {
       nativeHome: (await settings.get()).fmHome,
       id,
       title: title.slice(0, 500),
-      detail: [title.slice(500), tasksAxiField(res.output, "body")].filter((part) => part !== "").join("\n\n").slice(0, MAX_TASK),
+      detail: [title.slice(500), tasksAxiField(res.output, "body")].filter((part) => part !== "").join("\n\n"),
       projectId,
       shape: tasksAxiField(res.output, "kind") === "scout" ? "scout" : "ship",
       mode: "",
@@ -4813,6 +5324,7 @@ export default async function plugin(bb: BbPluginApi) {
     json: Record<string, unknown>;
     rpc: {
       head: string;
+      deliveries: DeliveryRecord[];
       calls: string[];
       landed: string[];
       ready: Array<{
@@ -4883,7 +5395,7 @@ export default async function plugin(bb: BbPluginApi) {
     const active = rows.filter((r) => r.status !== "idle" && r.status !== "error").length;
     const errors = count("error");
     const due = decisions.filter((d) => decisionDue(d, now));
-    const dispatchable = queue.filter((q) => q.status === "queued" && queueGate(q, queue, now) === null);
+    const dispatchable = queue.filter((q) => q.status === "queued" && storedQueueGate(q, queue, now) === null);
     const calls = [
       ...due.map(
         (d) =>
@@ -4905,7 +5417,7 @@ export default async function plugin(bb: BbPluginApi) {
         .filter((row) => row.status === "idle" && !row.failed && row.openDecisions.length === 0 && row.prUrl !== "")
         .map(
           (row) =>
-            `PR ready ${row.id}: ${row.prUrl} — merge: bb firstmate merge ${row.id} --yes`,
+            `PR follow-up ${row.id}: ${row.prUrl} — inspect: bb firstmate deliveries list`,
         ),
       ...dispatchable.map(
         (q) => `○ ${q.id} [${q.shape}] :: ${truncate(q.title, 70)} — dispatchable: bb firstmate queue dispatch ${q.id}`,
@@ -4931,7 +5443,7 @@ export default async function plugin(bb: BbPluginApi) {
       ...queue
         .filter((q) => q.status === "queued")
         .map((q) => {
-          const gate = queueGate(q, queue, now);
+          const gate = storedQueueGate(q, queue, now);
           return `○ ${q.id} [${q.shape}] :: ${truncate(q.title, 70)}${gate !== null ? ` — ${gate}` : " — dispatchable"}`;
         }),
       ...decisions
@@ -4957,7 +5469,11 @@ export default async function plugin(bb: BbPluginApi) {
       prUrl: row.prUrl,
       worktree: row.worktree,
     });
+    const outstanding = await scopedDeliveries(owner);
+    const launchNotes = launches.list(owner).filter(r => r.state !== "running" && r.state !== "failed").map(r => `Launch ${r.taskId}: ${r.state}, worker ${r.threadId ?? "unknown"}. ${r.error ?? ""}`);
+    calls.push(...launchNotes);
     const rpc = {
+      deliveries: outstanding,
       head: text.split("\n")[0] ?? text,
       calls,
       landed,
@@ -4969,8 +5485,9 @@ export default async function plugin(bb: BbPluginApi) {
       supervision: (await settings.get()).supervisionEnabled === true,
     };
     return {
-      text,
+      text: text + (outstanding.length ? "\n\nUnresolved PR deliveries\n" + outstanding.map(deliveryLine).join("\n") : ""),
       json: {
+        deliveries: outstanding,
         total: rows.length, idle, active, errors, crews: rows, decisionsDue: due, queue: queue.filter((q) => q.status === "queued"), done,
       },
       rpc,
@@ -5025,9 +5542,10 @@ export default async function plugin(bb: BbPluginApi) {
         posture: crew?.posture ?? "", task: String(r["name"] ?? id), threadId: crew?.threadId ?? "",
         prUrl: "", worktree: crew?.worktree ?? false };
     }));
-    const text = snapshots.map(s => s.text).join("\n\n");
+    const outstanding = await scopedDeliveries(owner);
+    const text = snapshots.map(s => s.text).join("\n\n") + (outstanding.length ? "\n\nUnresolved PR deliveries\n"+outstanding.map(deliveryLine).join("\n") : "");
     return { text, json: snapshots.length === 1 ? snapshots[0]!.model : { homes: snapshots.map(s => s.model) },
-      rpc: { head: text.split("\n")[0] ?? text, calls: snapshots.flatMap(s => s.calls),
+      rpc: { deliveries: outstanding, head: text.split("\n")[0] ?? text, calls: snapshots.flatMap(s => s.calls),
         landed: snapshots.flatMap(s => s.landed), ready: [], running, next: snapshots.flatMap(s => s.next),
         afk: (await readAfk(owner))?.on === true, quiet: await isQuiet(owner),
         supervision: (await settings.get()).supervisionEnabled === true } };
@@ -5088,32 +5606,35 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  async function settleDeck(threadId: string): Promise<void> {
-    await bb.sdk.threads.updatePluginMetadata({
+  async function settleDeck(threadId: string,signal?:AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    await raceAbort(bb.sdk.threads.updatePluginMetadata({
       threadId,
       set: { captain: "true" },
-    });
+    }),signal,STUCK_HOST_CALL_MS);
+    signal?.throwIfAborted();
     try {
       await settings.experimental_set({ supervisionEnabled: true });
     } catch {
       // settings may already be on
     }
     try {
-      const thread = asRecord(await bb.sdk.threads.get({ threadId }));
+      const thread = asRecord(await raceAbort(bb.sdk.threads.get({ threadId }),signal,STUCK_HOST_CALL_MS));
+      signal?.throwIfAborted();
       if (typeof thread["projectId"] === "string") {
         await bb.storage.kv.set(`${CAPTAIN_PROJECT_PREFIX}${threadId}`, thread["projectId"]);
         knownCaptainsRef.add(threadId);
       }
       const patch: { threadId: string; title?: string; visibility?: "visible" } = { threadId };
       if (isBlankTitle(thread["title"])) {
-        patch.title = await captainLabel(thread["projectId"]);
+        patch.title = await raceAbort(captainLabel(thread["projectId"]),signal,STUCK_HOST_CALL_MS);
       }
       if (thread["visibility"] !== "visible") patch.visibility = "visible";
       if (patch.title !== undefined || patch.visibility !== undefined) {
-        await bb.sdk.threads.update(patch);
+        signal?.throwIfAborted();await raceAbort(bb.sdk.threads.update(patch),signal,STUCK_HOST_CALL_MS);
       }
       if (thread["pinnedAt"] == null) {
-        await bb.sdk.threads.pin({ threadId });
+        signal?.throwIfAborted();await raceAbort(bb.sdk.threads.pin({ threadId }),signal,STUCK_HOST_CALL_MS);
       }
     } catch (error) {
       bb.log.warn(
@@ -5223,10 +5744,17 @@ export default async function plugin(bb: BbPluginApi) {
   async function foreignPrOwner(
     caller: { owner: string | null; projectId: string; exceptCrewId?: string },
     matches: (url: string) => boolean,
-  ): Promise<{ crew: Crew; owner: string; url: string } | null> {
+    references?:{ids:string[];numbers:number[]},
+  ): Promise<{ crew: Crew; owner: string|null; url: string } | null> {
     if (caller.owner === null || caller.owner === "") return null;
     const others = new Set((await sameProjectCaptains(caller.owner)).others);
-    if (others.size === 0) return null;
+    const obligation=references ? deliveries.conflict(caller.projectId,caller.owner,references.ids,references.numbers) : undefined;
+    if (obligation) {
+      const r=obligation;
+      const crew:Crew={id:r.taskId,task:`PR delivery ${r.id}`,projectId:r.projectId,threadId:r.workers.at(-1) ?? "",parentThreadId:r.owner,
+        nativeHome:r.home,providerId:null,model:null,reasoningLevel:null,worktree:true,shape:"ship",posture:"direct-PR",createdAt:new Date(r.updatedAt).toISOString()};
+      return {crew,owner:r.owner,url:r.url};
+    }
     const candidates = (await listCrewsAll()).filter((c) =>
       c.projectId === caller.projectId && c.parentThreadId !== null && others.has(c.parentThreadId)
       && c.id !== caller.exceptCrewId && !isSecondmateRoute(c));
@@ -5261,19 +5789,274 @@ export default async function plugin(bb: BbPluginApi) {
       if (key !== null && refs.keys.has(key)) return true;
       const n = /\/pull\/(\d+)/.exec(url)?.[1];
       return n !== undefined && refs.numbers.has(n);
-    });
+    },{ids:[...refs.keys],numbers:[...refs.numbers].map(Number)});
     if (hit === null) return null;
-    return `Refusing to dispatch: the task targets ${hit.url}, the PR of crew ${hit.crew.id} owned by captain @thread:${hit.owner}. Coordinate with that captain first, or pass overrideOwner=true (--override-owner) when the captain told you to take it over.`;
+    return `Refusing to dispatch: the task targets ${hit.url}, the PR of crew ${hit.crew.id} owned by ${hit.owner ? `captain @thread:${hit.owner}` : "an unassigned manager"}. Coordinate with that captain first, or pass overrideOwner=true (--override-owner) when the captain told you to take it over.`;
   }
 
-  async function rememberPrUrl(crew: Crew, url: string): Promise<void> {
-    if (url === "" || crew.prUrl === url) return;
+  async function scopedDeliveries(owner?: string, projectId?: string) {
+    if (owner && !projectId) {
+      projectId=await bb.storage.kv.get<string>(`${CAPTAIN_PROJECT_PREFIX}${owner}`);
+      if (!projectId) try { projectId=(await bb.sdk.threads.get({threadId:owner})).projectId; } catch { /* owner-scoped fallback */ }
+    }
+    return deliveries.list({ owner, projectId, includeLost:!!projectId, limit: 50 });
+  }
+  function recoveredContract(meta:Record<string,unknown>,record?:LaunchRecord):NonNullable<Crew["deliveryRequirement"]> {
+    const value=meta["deliveryRequirement"];
+    if (value !== undefined && !["branch","pr","merged","merged-and-verified"].includes(String(value))) throw new Error("Recovered task has an invalid delivery contract.");
+    if (record?.deliveryRequirement && value !== undefined && record.deliveryRequirement !== value) throw new Error("Recovered metadata disagrees with the durable delivery contract.");
+    if (record) {
+      if (!record.deliveryRequirement && value === undefined) throw new Error("Durable launch has no readable original delivery contract; explicit recovery is required.");
+      return record.deliveryRequirement ?? (value as NonNullable<Crew["deliveryRequirement"]>);
+    }
+    if (value !== undefined) return value as NonNullable<Crew["deliveryRequirement"]>;
+    if (meta["launchKey"]) throw new Error("Recovered launch has no readable delivery contract; explicit recovery is required.");
+    return "merged"; // Pre-register legacy tasks used the documented merged default.
+  }
+  async function contractForCrew(crew:Crew,signal?:AbortSignal) {
+    const record=crew.launchKey ? launches.get(crew.launchKey) : launches.forTask(crew.projectId,crew.parentThreadId ?? "",crew.id);
+    if (crew.deliveryRequirement || record?.deliveryRequirement) return recoveredContract({deliveryRequirement:crew.deliveryRequirement},record);
+    let metadata:Record<string,unknown>;
+    try { metadata=await raceAbort(bb.sdk.threads.getPluginMetadata({threadId:crew.threadId,signal}),signal,STUCK_HOST_CALL_MS); }
+    catch(error) { if (signal?.aborted || record || crew.launchKey) throw error; return "merged" as const; }
+    return recoveredContract(metadata,record);
+  }
+  async function registerCrewPr(crew: Crew, url: string,signal?:AbortSignal) {
+    if (crew.shape !== "ship" || crew.posture === "local-only" || isSecondmateRoute(crew) || !url) return;
+    const identity = canonicalPr(url);
+    const prior=deliveries.get(identity.id);
+    if (prior && (prior.taskId !== crew.id || prior.owner !== crew.parentThreadId)) {
+      bb.log.warn(`PR ${identity.id} already tracked by task ${prior.taskId}; preserving its owner.`);
+      return;
+    }
+    const home=await raceAbort(crewNativeHome(crew),signal,STUCK_HOST_CALL_MS);
+    const requirement=await contractForCrew(crew,signal);
+    if (requirement==='branch') throw new Error('A branch delivery contract cannot become a PR obligation.');
+    const task=await raceAbort(fullCrewTask(crew),signal,STUCK_HOST_CALL_MS);
+    signal?.throwIfAborted();
+    deliveries.register({url,taskId:crew.id,projectId:crew.projectId,owner:crew.parentThreadId,home,worker:crew.threadId,requirement,continuation:{...crew,task,taskSpilled:false}});
+  }
+  async function discoverCrewDelivery(crew: Crew,signal?:AbortSignal) {
+    if (crew.shape !== "ship" || crew.posture === "local-only" || isSecondmateRoute(crew)) return;
+    if (crew.prUrl) { await registerCrewPr(crew, crew.prUrl,signal); return; }
+    const envId = await threadEnv(crew.threadId,signal);
+    if (!envId) return;
+    const hostId = await resolveHostForProject(crew.projectId,crew.parentThreadId ?? undefined,signal);
+    // Environment/branch identity proves provenance. Report URLs alone do not.
+    await resolveCrewPr(crew,envId,hostId,signal);
+  }
+  async function reconcileDelivery(record:DeliveryRecord,signal?:AbortSignal) {
+    return serializeLedger(`delivery:${record.id}`,async()=>{
+    record=deliveries.get(record.id) ?? record;
+    if (["complete","explicitly-abandoned"].includes(record.status)) return record;
+    try {
+      if (!record.owner) { record.ownerNeeded=true; deliveries.save(record); return; }
+      let owner:Awaited<ReturnType<typeof bb.sdk.threads.get>>;
+      try { owner=await raceAbort(bb.sdk.threads.get({threadId:record.owner,signal}),signal,STUCK_HOST_CALL_MS); }
+      catch(error) {
+        // A get failure alone can be transient. Only complete, successful scoped
+        // inventories can establish that the manager is absent after missed events.
+        let complete=true,found=false;
+        for (const archived of [false,true]) {
+          for (let offset=0; offset<500; offset+=50) {
+            const rows=await raceAbort(bb.sdk.threads.list({projectId:record.projectId,archived,includeHidden:true,limit:50,offset,signal}),signal,STUCK_HOST_CALL_MS);
+            const match=rows.find(row=>row.id===record.owner);
+            if (match) { if (archived) deliveries.ownerLost(record.owner);found=true;break; }
+            if (rows.length<50) break;
+            if (offset===450) complete=false;
+          }
+        }
+        if (complete && !found) {deliveries.ownerLost(record.owner);return;}
+        throw error;
+      }
+      if (owner.archivedAt != null || owner.projectId !== record.projectId) { deliveries.ownerLost(record.owner); return; }
+      const hostId = await resolveHostForProject(record.projectId,record.owner,signal);
+      const result = await runStructuredOnHost(hostId, `gh pr view ${shQuote(record.url)} --json state,isDraft,headRefOid,statusCheckRollup,reviewDecision,reviews,mergeable,mergeCommit`,30_000,signal);
+      if (result.exitCode !== 0) throw new Error(result.stderr || result.output || `Forge lookup exit ${result.exitCode}`);
+      const observation = parseForge(JSON.parse(result.output));
+      // Standing yolo allows asking the manager to continue; only native merge
+      // can establish task-level authority and required checks at execution.
+      const posture=await raceAbort(postureOf(record.projectId),signal,STUCK_HOST_CALL_MS);
+      const authorized=posture.yolo && !!posture.provenance;
+      const unverifiedStanding=!posture.provenance && (posture.yolo || record.continuation?.["yolo"]===true);
+      signal?.throwIfAborted();
+      return deliveries.observe(record.id,observation,authorized,Date.now(),unverifiedStanding);
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      return deliveries.stale(record.id,String(error));
+    }
+    });
+  }
+  async function notifyDelivery(record: DeliveryRecord, signal?: AbortSignal) {
+    return serializeLedger(`delivery:${record.id}`, () => deliveries.notify(record.id, async r => {
+      const owner = await raceAbort(bb.sdk.threads.get({ threadId:r.owner! }),signal,STUCK_HOST_CALL_MS);
+      if (owner.archivedAt != null) { deliveries.ownerLost(r.owner!); return false; }
+      const current=deliveries.get(r.id);
+      if (current?.owner !== r.owner || current.notification.desired !== r.notification.desired || current.ownerNeeded) return false;
+      const crew: Crew = { id:r.taskId,task:`PR delivery ${r.id}`,projectId:r.projectId,threadId:r.workers.at(-1) ?? "",
+        parentThreadId:r.owner,providerId:null,model:null,reasoningLevel:null,worktree:true,shape:"ship",posture:"direct-PR",
+        nativeHome:r.home,createdAt:new Date(r.updatedAt).toISOString() };
+      const text = `FM_DELIVERY_NOTICE=${r.id}:${r.notification.desired} PR observation. ${deliveryLine(r)}. Inspect firstmate_deliveries. Reuse the author for fixes and preserve the task’s native review and validation contract. Continue only already-authorized work. PR-only artifact delivery and check health are separate; record each independent failure, preserving author and authorized baseline follow-up identities. Use firstmate_merge for any authorized merge; this notice grants no authority. Wake acknowledgement does not clear PR health follow-up.`;
+      if (r.notification.queued !== r.notification.desired) {
+        const queued = await enqueueCaptainWake(crew,text,signal,`FM_DELIVERY_NOTICE=${r.id}:${r.notification.desired}`);
+        if (queued.durable && !deliveries.markQueued(r.id,r.owner!,r.notification.desired!)) return false;
+      }
+      const latest=deliveries.get(r.id);
+      if (latest?.owner !== r.owner || latest.notification.desired !== r.notification.desired || latest.ownerNeeded) return false;
+      const accepted=await deliverToCaptain(r.owner!,text,r.taskId,signal,true);
+      if (!accepted) throw new Error("Notification outcome is uncertain; reconcile accepted input before retrying.");
+      return true;
+    },Date.now(), async r => {
+      const marker=`FM_DELIVERY_NOTICE=${r.id}:${r.notification.desired}`;
+      try {
+        const held=await raceAbort(bb.storage.kv.get(`${CAPTAIN_WAKE_HOLD_PREFIX}${r.owner}`),signal,STUCK_HOST_CALL_MS);
+        if (JSON.stringify(held)?.includes(marker)) return "accepted";
+        const queued=await raceAbort(bb.sdk.threads.queuedMessages.list({ threadId:r.owner!,signal }),signal,STUCK_HOST_CALL_MS);
+        if (queued.some(q=>!q.failureReason && JSON.stringify(q.content).includes(marker))) return "accepted";
+        const events=await raceAbort(bb.sdk.threads.events.list({ threadId:r.owner!,order:"desc",limit:"100",signal }),signal,STUCK_HOST_CALL_MS);
+        if (events.some(e=>JSON.stringify(e.data).includes(marker))) return "accepted";
+        if (events.length<100 || events.at(-1)!.createdAt < (r.notification.attemptedAt ?? 0)) return "absent";
+        return "unknown";
+      } catch { return "unknown"; }
+    }));
+  }
+  let deliveryDoneCursor=0;
+  async function recoverDoneDeliveries(signal?:AbortSignal) {
+    const done=(await raceAbort(readDone(),signal,STUCK_HOST_CALL_MS)).filter(r=>r.shape === "ship" && r.pr && r.parentThreadId);
+    const batch=[...done.slice(deliveryDoneCursor),...done.slice(0,deliveryDoneCursor)].slice(0,10);
+    deliveryDoneCursor=done.length ? (deliveryDoneCursor+batch.length)%done.length : 0;
+    for (const row of batch) {
+      signal?.throwIfAborted();
+      await boundedFollowUp(async signal=>{
+        const identity=canonicalPr(row.pr);
+        if (deliveries.get(identity.id)) return;
+        const owner=row.parentThreadId!;
+        const savedProject=await raceAbort(bb.storage.kv.get<string>(`${CAPTAIN_PROJECT_PREFIX}${owner}`),signal,STUCK_HOST_CALL_MS);
+        let projectId=savedProject;
+        if (!projectId) projectId=(await raceAbort(bb.sdk.threads.get({threadId:owner,signal}),signal,STUCK_HOST_CALL_MS)).projectId;
+        if (!projectId) return;
+        const home=await raceAbort(bb.storage.kv.get<string>(`native-home:${owner}`),signal,STUCK_HOST_CALL_MS) ?? "";
+        const requirement=row.deliveryRequirement ?? recoveredContract({},launches.forTask(projectId,owner,row.crewId));
+        if (requirement==='branch') return;
+        deliveries.register({url:row.pr,taskId:row.crewId,projectId,owner,home,worker:"",requirement});
+      },signal).catch(error=>bb.log.warn(`PR inventory recovery ${row.crewId}: ${String(error)}`));
+    }
+  }
+  let deliveryDiscoveryCursor = 0;
+  let launchRecoveryCursor=0;
+  async function launchRecoveryPass(signal?: AbortSignal) {
+    const batch=launches.list(undefined,10,launchRecoveryCursor);
+    launchRecoveryCursor=batch.length === 10 ? launchRecoveryCursor+10 : 0;
+    const retained=await raceAbort(readCrews(),signal,STUCK_HOST_CALL_MS);
+    for (const record of batch) {
+      signal?.throwIfAborted();
+      await boundedFollowUp(async signal=>{
+        if (record.state === "creating" || record.state === "uncertain") {
+          await reconcileLaunch(record,signal).catch(error => bb.log.warn(String(error)));
+        }
+        const recovered=launches.get(record.key)!;
+        if (recovered.state === "provisioning" && recovered.threadId) try {
+          const thread=await raceAbort(bb.sdk.threads.get({threadId:recovered.threadId,signal}),signal,STUCK_HOST_CALL_MS);
+          if (thread.environmentId) {
+            const env=await raceAbort(bb.sdk.environments.get({environmentId:thread.environmentId}),signal,STUCK_HOST_CALL_MS);
+            if (await launchEnvironmentReady(recovered,env,signal)) {
+              signal?.throwIfAborted();
+              if (env.path) launches.update(recovered.key,{state:"running",path:env.path,hostId:env.hostId,error:undefined});
+            }
+          }
+        } catch(error) { if (signal?.aborted) throw error; bb.log.warn(`Provisioning remains unresolved ${record.taskId}: ${String(error)}`); }
+        if (recovered.state === "deleted" || recovered.shape !== "ship" || recovered.deliveryMode === "local-only" || !recovered.threadId || !recovered.owner || retained.some(c=>c.threadId === recovered.threadId)) return;
+        try {
+          const metadata=await raceAbort(bb.sdk.threads.getPluginMetadata({threadId:recovered.threadId}),signal,STUCK_HOST_CALL_MS);
+          if (metadata.launchKey !== recovered.key || metadata.nativeHome !== recovered.home || metadata.crewId !== recovered.taskId) return;
+          // Only exact, owned launch metadata can recover an orphan reference.
+          const crew:Crew={id:recovered.taskId,task:"Recovered owned launch",projectId:recovered.projectId,parentThreadId:recovered.owner,
+            threadId:recovered.threadId,nativeHome:recovered.home,providerId:null,model:null,reasoningLevel:null,worktree:true,shape:"ship",posture:modeSchema.parse(recovered.deliveryMode),
+            yolo:recovered.yolo,launchKey:recovered.key,deliveryRequirement:recoveredContract(metadata,recovered),createdAt:new Date(recovered.updatedAt).toISOString()};
+          await discoverCrewDelivery(crew,signal);
+        } catch(error) { if (signal?.aborted) throw error; bb.log.warn(`Owned PR reference recovery ${record.taskId}: ${String(error)}`); }
+      },signal).catch(error=>bb.log.warn(`Launch recovery ${record.taskId}: ${String(error)}`));
+    }
+  }
+  async function deliveryPass(signal?: AbortSignal) {
+    await recoverDoneDeliveries(signal);
+    const crews = await raceAbort(readCrews(),signal,STUCK_HOST_CALL_MS);
+    const batch = [...crews.slice(deliveryDiscoveryCursor),...crews.slice(0,deliveryDiscoveryCursor)].slice(0,10);
+    deliveryDiscoveryCursor = crews.length ? (deliveryDiscoveryCursor+batch.length)%crews.length : 0;
+    for (const crew of batch) {
+      signal?.throwIfAborted();
+      await boundedFollowUp(s=>discoverCrewDelivery(crew,s),signal).catch(error => bb.log.warn(`PR discovery ${crew.id}: ${String(error)}`));
+    }
+    for (const record of deliveries.list({ due:Date.now(),limit:10 })) {
+      signal?.throwIfAborted();
+      await boundedFollowUp(async s=>{await reconcileDelivery(record,s);await notifyDelivery(record,s);},signal).catch(error=>bb.log.warn(`PR follow-up ${record.id}: ${String(error)}`));
+    }
+    // Notification failure stays due independently of forge polling backoff.
+    for (const record of deliveries.pendingNotifications()) {
+      if (record.notification.desired !== record.notification.delivered) await boundedFollowUp(s=>notifyDelivery(record,s),signal).catch(error=>bb.log.warn(`PR notification ${record.id}: ${String(error)}`));
+    }
+  }
+  const deliveryParams = z.object({
+    action:z.enum(["list","inspect","register","reconcile","assign","abandon","verify","account"]),
+    id:z.string().optional(),crewId:z.string().optional(),url:z.string().optional(),from:z.string().nullable().optional(),
+    requirement:z.enum(["pr","merged","merged-and-verified"]).optional(),reason:z.string().optional(),commitSha:z.string().optional().describe("Freshly observed merged commit SHA for required verification"),
+    authorized:z.boolean().optional().describe("Explicit user authority for abandonment or changing the delivery contract"),
+    failureId:z.string().optional(),scope:z.enum(["author","baseline"]).optional(),followUpTask:z.string().optional(),
+    all:z.boolean().optional().describe("Read-only project view across managers"),
+    offset:z.number().int().min(0).optional(),limit:z.number().int().min(1).max(100).optional(),
+  });
+  async function deliveryOperation(input:z.infer<typeof deliveryParams>,ctx:unknown) {
+    const owner=ctxString(ctx,"threadId");
+    if (!owner) throw new Error("Deliverables require a manager thread.");
+    const thread=await bb.sdk.threads.get({ threadId:owner });
+    const projectId=thread.projectId;
+    if (input.action === "list") return deliveries.list({ owner:input.all ? undefined : owner,projectId,includeLost:true,limit:input.limit,offset:input.offset });
+    if (input.action === "register") {
+      const crew=await findCrew(input.crewId ?? "");
+      if (!crew || crew.parentThreadId !== owner || crew.projectId !== projectId || crew.shape !== "ship") throw new Error("Register requires an owned ship on this project.");
+      if (input.requirement && !input.authorized) throw new Error("Setting an explicit delivery contract requires user authority; an existing contract cannot be replaced by registration.");
+      const original=await contractForCrew(crew);
+      if (original==='branch') throw new Error('Branch delivery is satisfied by the native ready-in-branch artifact; it cannot be registered as a PR contract.');
+      if (input.requirement && input.requirement !== original) throw new Error("Registration cannot change the original delivery contract.");
+      const record=deliveries.register({ url:input.url ?? crew.prUrl ?? "",taskId:crew.id,projectId,owner,home:await crewNativeHome(crew),worker:crew.threadId,requirement:original,continuation:{...crew,task:await fullCrewTask(crew),taskSpilled:false} });
+      return [record];
+    }
+    const r=deliveries.get(input.id ?? "");
+    if (!r || r.projectId !== projectId) throw new Error("Unknown deliverable on this project.");
+    if (input.action === "inspect") return [r];
+    if (input.action === "assign") {
+      if (input.from !== r.owner) throw new Error("Assignment requires the explicitly named previous manager.");
+      return serializeLedger(`delivery:${r.id}`,async()=>[deliveries.assign(r.id,r.owner,owner,projectId)]);
+    }
+    if (r.owner !== owner) throw new Error("Only the owning manager can reconcile or dispose this deliverable. Use explicit assignment first.");
+    if (input.action === "abandon") {
+      if (!input.authorized) throw new Error("Explicit abandonment needs user authority and a recorded reason.");
+      return [deliveries.abandon(r.id,owner,input.reason ?? "")];
+    }
+    if (input.action === "account") {
+      if (!input.authorized) throw new Error("Accounting records existing authorized follow-up only; it does not grant fix or merge authority.");
+      const crew=await findCrew(input.followUpTask ?? r.taskId,owner);
+      if (!crew || crew.parentThreadId!==owner || crew.projectId!==projectId) throw new Error("Follow-up requires an existing owned worker on this project.");
+      return [deliveries.accountFailure(r.id,owner,input.failureId ?? "",input.scope ?? "author",crew.id,crew.threadId,input.reason ?? "")];
+    }
+    if (input.action === "verify") return [deliveries.verify(r.id,owner,input.commitSha ?? "",input.reason ?? "")];
+    await reconcileDelivery(r,asRecord(ctx)["signal"] as AbortSignal | undefined);
+    await notifyDelivery(deliveries.get(r.id)!);
+    return [deliveries.get(r.id)!];
+  }
+
+  async function rememberPrUrl(crew: Crew, url: string,signal?:AbortSignal): Promise<void> {
+    if (url === "") return;
+    await registerCrewPr(crew,url,signal);
+    if (crew.prUrl === url) return;
     crew.prUrl = url;
-    await mutateCrews((crews) => crews.map((c) => (c.id === crew.id && c.threadId === crew.threadId ? { ...c, prUrl: url } : c)));
+    signal?.throwIfAborted();
+    await raceAbort(mutateCrews((crews) => crews.map((c) => (c.id === crew.id && c.threadId === crew.threadId ? { ...c, prUrl: url } : c))),signal,STUCK_HOST_CALL_MS);
   }
 
-  async function markDeck(threadId: string): Promise<void> {
-    await settleDeck(threadId);
+  async function markDeck(threadId: string,signal?:AbortSignal): Promise<void> {
+    await settleDeck(threadId,signal);
+    signal?.throwIfAborted();
     await publishFleet();
   }
 
@@ -5283,54 +6066,56 @@ export default async function plugin(bb: BbPluginApi) {
 
   // Live PR state + mergeability through gh on the crew's host. null when gh cannot
   // answer (the caller then relies on native/BB reads, never on a guess).
-  async function ghPrView(hostId: string, url: string): Promise<{ state: string; mergeable: string } | null> {
+  async function ghPrView(hostId: string, url: string,signal?:AbortSignal): Promise<{ state: string; mergeable: string } | null> {
     try {
-      const res = await runOnHost(hostId, `gh pr view ${shQuote(url)} --json state,mergeable 2>/dev/null || true`, 30_000);
-      const parsed = asRecord(JSON.parse(res.output.trim() || "null"));
+      const res = await runStructuredOnHost(hostId, `gh pr view ${shQuote(url)} --json state,mergeable`, 30_000,signal);
+      if (res.exitCode !== 0) throw new Error(res.stderr || res.output || `Forge lookup exit ${res.exitCode}`);
+      const parsed = asRecord(JSON.parse(res.output));
       const state = parsed["state"];
       if (typeof state !== "string") return null;
       const mergeable = parsed["mergeable"];
       return { state: state.toLowerCase(), mergeable: typeof mergeable === "string" ? mergeable.toUpperCase() : "UNKNOWN" };
-    } catch {
+    } catch(error) {
+      if (signal?.aborted) throw error;
       return null;
     }
   }
 
   // A crew's PR even when BB's environment cache has none — e.g. the crew pushed to
   // an EXISTING PR. Order: environment PR, the recorded crew PR url, gh by the
-  // crew's branch, then the last PR url the crew itself reported.
+  // crew's branch. A report URL alone does not establish task provenance.
   async function resolveCrewPr(
     crew: Crew,
     envId: string,
     hostId: string | null,
+    signal?:AbortSignal,
   ): Promise<{ url: string; state: string; source: string } | null> {
     let env = prFacts(null);
-    try { env = prFacts(await bb.sdk.environments.pullRequest({ environmentId: envId })); } catch { /* fall through */ }
+    try { env = prFacts(await raceAbort(bb.sdk.environments.pullRequest({ environmentId: envId,signal }),signal,STUCK_HOST_CALL_MS)); } catch(error) { if (signal?.aborted) throw error; }
     if (env.available && env.url !== "") {
-      await rememberPrUrl(crew, env.url);
+      await rememberPrUrl(crew, env.url,signal);
       return { url: env.url, state: env.state, source: "environment" };
     }
     if (hostId === null) return null;
     const candidates: Array<{ url: string; source: string }> = [];
     if (crew.prUrl !== undefined && crew.prUrl !== "") candidates.push({ url: crew.prUrl, source: "recorded" });
     try {
-      const e = asRecord(await bb.sdk.environments.get({ environmentId: envId }));
+      const e = asRecord(await raceAbort(bb.sdk.environments.get({ environmentId: envId,signal }),signal,STUCK_HOST_CALL_MS));
       const branch = typeof e["branchName"] === "string" ? e["branchName"] : "";
       const path = typeof e["path"] === "string" ? e["path"] : "";
       if (branch !== "" && path !== "") {
-        const res = await runOnHost(hostId,
-          `cd ${shQuote(path)} && gh pr list --head ${shQuote(branch)} --state all --json url --limit 1 2>/dev/null || true`, 30_000);
-        const rows: unknown = JSON.parse(res.output.trim() || "[]");
+        const res = await runStructuredOnHost(hostId,
+          `cd ${shQuote(path)} && gh pr list --head ${shQuote(branch)} --state all --json url --limit 1`, 30_000,signal);
+        if (res.exitCode !== 0) throw new Error(res.stderr || res.output || `Forge lookup exit ${res.exitCode}`);
+        const rows: unknown = JSON.parse(res.output);
         const url = Array.isArray(rows) ? asRecord(rows[0])["url"] : undefined;
         if (typeof url === "string" && url !== "") candidates.push({ url, source: `gh (branch ${branch})` });
       }
-    } catch { /* next source */ }
-    const reported = [...((await crewOutput(crew)) ?? "").matchAll(/https:\/\/github\.com\/[^\s)>\]]+\/pull\/\d+/g)].map((m) => m[0]);
-    if (reported.length > 0) candidates.push({ url: reported[reported.length - 1]!, source: "crew report" });
+    } catch(error) { if (signal?.aborted) throw error; }
     for (const c of candidates) {
-      const view = await ghPrView(hostId, c.url);
+      const view = await ghPrView(hostId, c.url,signal);
       if (view === null && c.source !== "recorded") continue;
-      await rememberPrUrl(crew, c.url);
+      await rememberPrUrl(crew, c.url,signal);
       return { url: c.url, state: view?.state ?? "", source: c.source };
     }
     return null;
@@ -5396,10 +6181,25 @@ export default async function plugin(bb: BbPluginApi) {
     if (projectId === "") throw new Error("This captain thread has no project, so handoff cannot tell which crews belong here.");
     const all = await readCrews();
     const owned = all.filter((crew) => crew.parentThreadId === from && crew.projectId === projectId);
+    // A forgotten worker can still be the authoritative author of an outstanding
+    // delivery. Its trusted continuation participates in the same reparent gates.
+    for (let offset=0; ; offset+=100) {
+      const selected=onlyCrewId ? deliveries.taskRecord(from,projectId,onlyCrewId) : undefined;
+      const records=onlyCrewId ? (selected ? [selected] : []) : deliveries.list({owner:from,projectId,limit:100,offset});
+      for (const record of records) {
+        if (!record.continuation || owned.some(c=>c.id === record.taskId)) continue;
+        if (onlyCrewId && record.taskId !== onlyCrewId && !record.workers.includes(onlyCrewId)) continue;
+        const continuation=crewSchema.parse(record.continuation);
+        owned.push({...continuation,parentThreadId:from,deliveryRequirement:record.requirement,prUrl:record.url});
+      }
+      if (records.length<100) break;
+      if (offset>=400) throw new Error("Handoff inventory exceeds 500 PR records; hand off one explicit task at a time.");
+    }
     const moving = onlyCrewId === undefined
       ? owned
       : owned.filter((crew) => crew.id === onlyCrewId || crew.threadId === onlyCrewId);
-    if (moving.length === 0) {
+    const hasDeliveries = deliveries.hasOwned(from,projectId,onlyCrewId);
+    if (moving.length === 0 && !hasDeliveries) {
       throw new Error(`No crews owned by captain @thread:${from} on this project. firstmate_promote turns a scout into a ship. firstmate_migrate_state backfills KV into state files. Neither moves a deck.`);
     }
     const updateParent = bb.sdk.threads.update as (input: { threadId: string; parentThreadId: string }) => Promise<unknown>;
@@ -5412,13 +6212,17 @@ export default async function plugin(bb: BbPluginApi) {
       }
       try {
         await updateParent({ threadId: crew.threadId, parentThreadId: to });
+        launches.reassignWorker(crew.threadId,from,to,projectId);
         moved.push(crew.id);
       } catch (error) {
         failed.push(`${crew.id}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
     const movedSet = new Set(moved);
-    if (movedSet.size === 0) throw new Error(`Handoff moved no crews. ${failed.join("; ")}`);
+    if (movedSet.size === 0 && !hasDeliveries) throw new Error(`Handoff moved no crews. ${failed.join("; ")}`);
+    const failedTasks=moving.filter(c=>!movedSet.has(c.id)).map(c=>c.id);
+    const selectedTask=moving.find(c=>c.id === onlyCrewId || c.threadId === onlyCrewId)?.id ?? onlyCrewId;
+    const deliveriesMoved=deliveries.transferOwner(from,to,projectId,selectedTask,failedTasks);
     {
       await mutateCrews((crews) => crews.map((crew) => (
         movedSet.has(crew.id) && crew.parentThreadId === from ? { ...crew, parentThreadId: to } : crew
@@ -5429,10 +6233,8 @@ export default async function plugin(bb: BbPluginApi) {
         if (onlyCrewId !== undefined) return row.crewId != null && movedSet.has(row.crewId);
         return row.crewId == null || movedSet.has(row.crewId);
       };
-      await serializeLedger(QUEUE_KEY, async () => {
-        const items = await readQueue();
-        await bb.storage.kv.set(QUEUE_KEY, items.map((row) => (takes(row) ? { ...row, parentThreadId: to } : row)));
-      });
+      await queueStore.ready();
+      queueStore.transform(takes, row => ({...row,parentThreadId:to}));
       await serializeLedger(DECISIONS_KEY, async () => {
         const items = await readDecisions();
         await bb.storage.kv.set(DECISIONS_KEY, items.map((row) => (takes(row) ? { ...row, parentThreadId: to } : row)));
@@ -5440,23 +6242,26 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const lines = [
       `Handed off ${moved.length} crew(s) from @thread:${from} to @thread:${to}: ${moved.join(", ") || "(none)"}.`,
-      "BB thread parent updated. Native state files stay in each crew's existing home.",
+      `Transferred ${deliveriesMoved} unresolved PR deliveries.`,
+      moved.length ? "BB thread parent updated. Native state files stay in each crew's existing home." : "Worker ownership kept. Any transferred orphan obligations are listed above.",
       "Wakes, tell, and decide for these crews now use this captain.",
     ];
-    if (failed.length > 0) lines.push(`Kept: ${failed.join("; ")}`);
+    if (moved.length === 0 && deliveriesMoved > 0) lines.push("Only orphan PR obligations transferred; worker ownership is unchanged.");
+    if (failed.length > 0) lines.push(`Kept: ${failed.join("; ")}. Their task-associated PR obligations remain with the previous captain.`);
     return lines.join("\n");
   }
 
-  async function guardForeignPr(crew: Crew, url: string, override: boolean): Promise<void> {
+  async function guardForeignPr(crew: Crew, url: string, override: boolean, caller?:string): Promise<void> {
     if (override || url === "") return;
     const key = prKeyOf(url) ?? url;
     const hit = await foreignPrOwner(
-      { owner: crew.parentThreadId, projectId: crew.projectId, exceptCrewId: crew.id },
+      { owner: caller ?? crew.parentThreadId, projectId: crew.projectId, exceptCrewId: crew.id },
       (u) => (prKeyOf(u) ?? u) === key,
+      {ids:[key],numbers:[]},
     );
     if (hit !== null) {
       throw new Error(
-        `Refusing: ${url} is the PR of crew ${hit.crew.id}, owned by captain @thread:${hit.owner}. Coordinate with that captain before landing it, or pass overrideOwner=true (--override-owner) when the captain told you to.`,
+        `Refusing: ${url} is the PR of crew ${hit.crew.id}, owned by ${hit.owner ? `captain @thread:${hit.owner}` : "an unassigned manager"}. Coordinate with that captain before landing it, or pass overrideOwner=true (--override-owner) when the captain told you to.`,
       );
     }
   }
@@ -5471,6 +6276,7 @@ export default async function plugin(bb: BbPluginApi) {
     const posture = await postureOf(crew.projectId);
     // Captain authority (yes/yolo) and check waivers are separate: neither waiver
     // grants authority, so either waiver without --yes still refuses.
+    if (!yes && !posture.provenance && (posture.yolo || crew.yolo)) throw new Error("Standing yolo is preserved, but its approval provenance is unverified. Resolve existing captain approval, then record that standing approval with firstmate_posture set yolo=true and its reason. Already-approved green in-scope work needs no fresh per-PR request; an unexplained registry flag alone is not approval. Native user-hold and check gates still apply.");
     if (!posture.yolo && !yes) {
       throw new Error(
         `Needs captain's word: re-run with --yes, or set yolo (bb firstmate posture set --project ${crew.projectId} --yolo on).`,
@@ -5484,7 +6290,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (isSecondmateRoute(crew)) {
       throw new Error(`Crew ${crew.id} is a secondmate route, not a ship to merge.`);
     }
-    const local = crew.posture === "local-only" || (crew.shape === "ship" && posture.mode === "local-only");
+    const local = crew.posture === "local-only";
     const nativeHome = await crewNativeHome(crew);
     if (nativeHome !== "") {
       const hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
@@ -5498,7 +6304,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (pr === null) {
         throw new Error(`No PR for crew ${crew.id}: BB's environment has none, none is recorded, gh finds none for its branch, and its report names none.`);
       }
-      await guardForeignPr(crew, pr.url, override);
+      await guardForeignPr(crew, pr.url, override,opts.caller);
       if (pr.state !== "merged") {
         const args = [crew.id, pr.url];
         if (allowRedCheck?.trim()) args.push("--allow-red", allowRedCheck.trim());
@@ -5528,7 +6334,7 @@ export default async function plugin(bb: BbPluginApi) {
       return `Merged ${pr.url}\nCrew ${crew.id} retired.`;
     }
     if (local) return mergeLocal(crew, envId);
-    if (crew.posture === "no-mistakes" || posture.mode === "no-mistakes") {
+    if (crew.posture === "no-mistakes") {
       const dirty = extractPaths(
         await bb.sdk.environments.diffFiles({ environmentId: envId, target: "uncommitted" }),
       );
@@ -5542,7 +6348,7 @@ export default async function plugin(bb: BbPluginApi) {
       throw new Error("Refusing: this BB merge path cannot verify required check contexts; --allow-missing is supported only through the native PR merge gate.");
     }
     await rememberPrUrl(crew, f.url);
-    await guardForeignPr(crew, f.url, override);
+    await guardForeignPr(crew, f.url, override,opts.caller);
     if (f.state === "merged") {
       await retireLanded(crew, "merged (already landed)", f.url);
       return `Already merged: ${f.url}\nCrew ${crew.id} retired.`;
@@ -5591,6 +6397,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function retireLanded(crew: Crew, outcome: string, pr: string): Promise<void> {
+    if (pr) await registerCrewPr(crew,pr);
     const nativeHome = await crewNativeHome(crew);
     if (nativeHome !== "" && !isSecondmateRoute(crew)) {
       const hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
@@ -5600,8 +6407,8 @@ export default async function plugin(bb: BbPluginApi) {
       await bb.sdk.threads.stop({ threadId: crew.threadId });
       await bb.sdk.threads.archive({ threadId: crew.threadId });
     }
-    await markQueueForCrew(crew.id, "done");
-    await recordDone({ task: crewLabel(crew).slice(0, 200), shape: crew.shape, crewId: crew.id, outcome, pr, parentThreadId: crew.parentThreadId });
+    await markQueueForCrew(crew, "done");
+    await recordDone({ task: crewLabel(crew).slice(0, 200), shape: crew.shape, crewId: crew.id, outcome, pr, parentThreadId: crew.parentThreadId,deliveryRequirement:await contractForCrew(crew) });
     await removeCrew(crew);
     await publishFleet();
   }
@@ -5668,7 +6475,10 @@ export default async function plugin(bb: BbPluginApi) {
         } catch { /* unknown: not landed */ }
       }
       if (!pr.available) continue;
-      if (state !== "merged" && state !== "closed") continue;
+      if (state !== "merged") {
+        if (url) await registerCrewPr(crew,url);
+        continue;
+      }
       // The background sweep only retires LANDED work. A PR closed unmerged may be
       // one the captain closed to redo, so only a captain's own bearings retires it.
       if (opts.notify === true && state !== "merged") continue;
@@ -5797,13 +6607,37 @@ export default async function plugin(bb: BbPluginApi) {
     force: boolean,
     opts: { caller?: string; overrideOwner?: boolean } = {},
   ): Promise<string> {
-    const crew = (await readCrews()).find(entry => entry.id === id) ?? await findCrew(id);
+    const crew = await findCrew(id,opts.caller,opts.overrideOwner===true);
     if (crew === undefined) throw new Error(`No crew ${id}. Run "bb firstmate crews".`);
     const notMine = opts.overrideOwner === true ? null : await ownerRefusal(crew, opts.caller, "forget");
     if (notMine !== null) throw new Error(notMine);
     if (stop && isSecondmateRoute(crew) && !force) {
       throw new Error(`Refusing: ${id} is a secondmate route. Drop with forget (no --stop), or --force to also stop that thread.`);
     }
+    if (isSecondmateRoute(crew) && !stop) {
+      // Retire only the request projection; the domain captain owns its child
+      // tree, native state, runtime, and same-ID worker protocol records.
+      await removeCrew(crew);
+      await publishFleet();
+      return `Forgot secondmate route ${id}; domain captain and child work are retained.`;
+    }
+    await discoverCrewDelivery(crew);
+    let preserveAuthority=deliveries.hasOwned(crew.parentThreadId ?? "",crew.projectId,crew.id);
+    if (stop && preserveAuthority) {
+      // A known merge can satisfy the merged contract even before the next scan.
+      // It cannot satisfy required verification or an unrelated PR obligation.
+      const record=deliveries.taskRecord(crew.parentThreadId ?? "",crew.projectId,crew.id);
+      const envId=await threadEnv(crew.threadId);
+      if (record && envId) {
+        const hostId=await resolveHostForProject(crew.projectId,crew.parentThreadId ?? undefined);
+        const pr=await resolveCrewPr(crew,envId,hostId);
+        if (pr?.state === "merged" && canonicalPr(pr.url).id === record.id) {
+          deliveries.observe(record.id,{headSha:record.headSha,state:"merged",draft:false,checks:"unknown",review:"unknown",mergeable:"unknown",reviewHeadSha:null,mergeCommitSha:null},false);
+        }
+      }
+      preserveAuthority=deliveries.hasOwned(crew.parentThreadId ?? "",crew.projectId,crew.id);
+    }
+    if (stop && preserveAuthority) throw new Error("Outstanding PR delivery requires this task's native authority and environment. Forget without --stop, or complete/explicitly abandon its delivery before teardown.");
     let worktreeRemoved = false;
     let nativeTeardown = false;
     const notes: string[] = [];
@@ -5931,14 +6765,16 @@ export default async function plugin(bb: BbPluginApi) {
           crewId: crew.id,
           outcome: parseOutcome(out) ?? "",
           pr: f.url,
+          deliveryRequirement:await contractForCrew(crew),
           parentThreadId: crew.parentThreadId,
         });
-        await markQueueForCrew(crew.id, "done");
+        await markQueueForCrew(crew, "done");
       }
     } catch {
       // best effort
     }
-    if (!nativeTeardown) {
+    if (preserveAuthority) notes.push("Outstanding PR continuation retained with native task authority and environment.");
+    if (!nativeTeardown && !preserveAuthority) {
       try {
         await withTransientRetry(() => dropFmMeta(crew));
         // forget/drop removes the crew's own backlog row (dropped on forget, C1).
@@ -6029,32 +6865,50 @@ export default async function plugin(bb: BbPluginApi) {
     timeoutMs: number,
     signal?: AbortSignal,
   ): Promise<{ exitCode: number | null; output: string }> {
-    const session = await bb.sdk.terminals.create({
-      cols: 120,
-      rows: 30,
-      scope: { kind: "host_path", hostId, cwd: "/tmp" },
-      start: { mode: "command", command: wrapHostCommand(command) },
-      title: "firstmate-host",
-    });
-    const terminalId = asRecord(session)["id"] as string;
+    signal?.throwIfAborted();
+    // Capture only the cleanup callback while the plugin context is live. A late
+    // create reply must still be closed after disposal invalidates bb.sdk access.
+    const terminalClose=bb.sdk.terminals.close;
+    let terminalId:string|undefined;
+    let creationLost=false,closing=false;
+    async function closeOnce() {
+      if (!terminalId || closing) return;
+      closing=true;
+      try {await raceAbort(terminalClose({terminalId,mode:"force"}),undefined,1000);} catch { /* bounded cleanup */ }
+    }
     let nextSeq = 0;
     let output = "";
     let lastOutputError = "";
     try {
+      const pending=bb.sdk.terminals.create({
+        cols: 120,
+        rows: 30,
+        scope: { kind: "host_path", hostId, cwd: "/tmp" },
+        start: { mode: "command", command: wrapHostCommand(command) },
+        title: "firstmate-host",
+      }).then(async session=>{
+        terminalId=asRecord(session)["id"] as string;
+        if (creationLost) await closeOnce();
+        return session;
+      });
+      const session=await raceAbort(pending,signal,Math.min(timeoutMs,STUCK_HOST_CALL_MS));
+      const activeTerminalId=asRecord(session)["id"];
+      if (typeof activeTerminalId !== "string") throw new Error("Terminal creation returned no identity.");
+      signal?.throwIfAborted();
       const deadline = Date.now() + timeoutMs;
       for (;;) {
         if (signal?.aborted) throw new Error("Aborted.");
         if (Date.now() >= deadline) throw new Error(`Timed out waiting for host command (host ${hostId}, terminal ${terminalId}, budget ${timeoutMs / 1000}s).${lastOutputError ? ` Last output read: ${lastOutputError}` : ""}`);
-        const cur = await bb.sdk.terminals.get({ terminalId });
+        const cur = await raceAbort(bb.sdk.terminals.get({ terminalId:activeTerminalId }),signal,Math.min(STUCK_HOST_CALL_MS,Math.max(1,deadline-Date.now())));
         const status = asRecord(cur)["status"];
         if (status === "disconnected") throw new Error("Terminal disconnected.");
         let outputRead = false;
         try {
-          const chunk = await bb.sdk.terminals.output({
-            terminalId,
+          const chunk = await raceAbort(bb.sdk.terminals.output({
+            terminalId:activeTerminalId,
             sinceSeq: nextSeq,
             tailBytes: 65536,
-          });
+          }),signal,Math.min(STUCK_HOST_CALL_MS,Math.max(1,deadline-Date.now())));
           const rec = asRecord(chunk);
           if (typeof rec["nextSeq"] === "number") nextSeq = rec["nextSeq"];
           output += decodeChunks(chunk);
@@ -6075,12 +6929,15 @@ export default async function plugin(bb: BbPluginApi) {
         await sleep(250);
       }
     } finally {
-      try {
-        await bb.sdk.terminals.close({ terminalId, mode: "force" });
-      } catch {
-        // best effort
-      }
+      creationLost=true;
+      await closeOnce();
     }
+  }
+
+  async function runStructuredOnHost(hostId:string,command:string,timeoutMs:number,signal?:AbortSignal) {
+    const result=await runOnHost(hostId,captureHostCommand(command),timeoutMs,signal);
+    if (result.exitCode !== 0) throw new Error(result.output || `Host capture exit ${result.exitCode}`);
+    return decodeHostCapture(result.output);
   }
 
   // Run a command on the host, optionally feeding it `stdin`. Stdin is NOT sent
@@ -6122,6 +6979,7 @@ export default async function plugin(bb: BbPluginApi) {
     content: string,
     timeoutMs = 15_000,
     signal?: AbortSignal,
+    propagateError = false,
   ): Promise<boolean> {
     const dir = path.replace(/\/[^/]*$/, "") || "/";
     const nonce = randomUUID();
@@ -6161,6 +7019,7 @@ export default async function plugin(bb: BbPluginApi) {
     } catch (error) {
       await cleanup();
       bb.log.warn(`host file write ${path} failed: ${error instanceof Error ? error.message : String(error)}`);
+      if (propagateError) throw error;
       return false;
     }
   }
@@ -6169,6 +7028,10 @@ export default async function plugin(bb: BbPluginApi) {
   // update its crews kept the old bb.sh (old spawn brief, old liveness rules) until
   // someone re-decked. Rebuild a home whose manifest names a different overlay.
   async function refreshStaleMirror(hostId: string, home: string, captain: string, signal?: AbortSignal): Promise<void> {
+    if(await bb.storage.kv.get(`native-runtime:${captain}`)) {
+      await nativeRuntime.operation(hostId,"inspect",{home,captain},signal);
+      return;
+    }
     const q = shQuote(home);
     const probe = await runOnHost(hostId,
       `if [ -d ${q}/bin-bb ]; then printf 'FM_OVERLAY=%s FM_BUILT_HEAD=%s FM_HEAD=%s\\n' "$(sed -n 's/^overlay=//p' ${q}/bin-bb/.mirror-manifest 2>/dev/null)" "$(sed -n 's/^head=//p' ${q}/bin-bb/.mirror-manifest 2>/dev/null)" "$(git -C ${q} rev-parse HEAD 2>/dev/null)"; else echo FM_NO_MIRROR; fi`,
@@ -6195,7 +7058,18 @@ export default async function plugin(bb: BbPluginApi) {
     projectId: string | undefined,
     timeoutMs: number,
     signal?: AbortSignal,
+    verifyFirst=false,
   ): Promise<string> {
+    const selectedProbe=await runOnHost(hostId,`if [ -f ${shQuote(`${home}/config/bb-runtime-selected.json`)} ]; then echo FM_RUNTIME_BUNDLED; else echo FM_RUNTIME_EXTERNAL; fi`,Math.min(15_000,timeoutMs),signal);
+    if(selectedProbe.exitCode===0 && selectedProbe.output.includes("FM_RUNTIME_BUNDLED")) {
+      const captain=homeScope.getStore()?.captain ?? await bb.storage.kv.get<string>(`captain-for-home:${home}`);
+      if(!captain)throw new Error("Bundled runtime verification requires the owning captain context; no external installer fallback.");
+      const checked=await nativeRuntime.operation(hostId,"inspect",{home,captain},signal);
+      await bb.storage.kv.set(`native-runtime:${captain}`,checked.selected);
+      await bb.storage.kv.set(`captain-for-home:${home}`,captain);
+      bb.log.info(`bundled native runtime verified home=${home} host=${hostId}; no external source fallback`);
+      return `mirror OK: verified bundled runtime ${JSON.stringify(checked.selected)}`;
+    }
     const overlayHome = OVERLAY_DIR;
     const installer = join(overlayHome, "install-bb-backend.py");
     const localProbe = await runOnHost(
@@ -6205,6 +7079,10 @@ export default async function plugin(bb: BbPluginApi) {
       signal,
     );
     if (localProbe.output.includes("FM_OVERLAY_LOCAL")) {
+      if (verifyFirst) {
+        const verified=await runOnHost(hostId,`python3 ${shQuote(installer)} --home ${shQuote(home)} --overlay ${shQuote(overlayHome)} --verify`,Math.min(30_000,timeoutMs),signal);
+        if(verified.exitCode===0 && verified.output.includes("mirror OK:"))return verified.output;
+      }
       const result = await runOnHost(
         hostId,
         `python3 ${shQuote(installer)} --home ${shQuote(home)} --overlay ${shQuote(overlayHome)}${projectId === undefined ? "" : ` --project-id ${shQuote(projectId)}`}`,
@@ -6259,6 +7137,17 @@ export default async function plugin(bb: BbPluginApi) {
     summary: string;
   }> {
     const current = await settings.get();
+    if(!opts.path && (!current.fmHome.trim() || await bb.storage.kv.get(`native-runtime:${ctxString(ctx,"threadId")??''}`))) {
+      const hostId=await resolveHostId(opts.machine,ctx);
+      const before=await bb.storage.kv.get<string>(`native-home:${ctxString(ctx,"threadId")??''}`);
+      const path=await provisionBundledCaptain(ctx,signal,undefined,hostId);
+      const projectId=ctxString(ctx,"projectId")??"";
+      const status=await nativeRuntime.operation(hostId,"inspect",{home:path,captain:ctxString(ctx,"threadId")},signal);
+      const toolchain=await checkToolchain(hostId,path,signal);
+      await refreshSkillsManifest(hostId,path,signal);
+      const summary=`Bundled Firstmate runtime selected on host ${hostId}.\nHome: ${path}\nInstalled release: ${status.distribution.release}\nSelected: ${JSON.stringify(status.selected)}\nUpstream: ${status.distribution.upstreamCommit}\nNative startup/lock readiness remains pending; no external repository or network clone used.\n${toolchain.output}`;
+      return {hostId,path,existed:!!before,projectId,overlay:"Verified bundled native plus adapter",tools:toolchain.output,summary};
+    }
     const repo = current.firstmateRepo !== "" ? current.firstmateRepo : "https://github.com/kunchenguid/firstmate";
     const name = opts.name ?? "firstmate";
     const timeoutMs = opts.timeoutMs ?? 180000;
@@ -6288,38 +7177,13 @@ export default async function plugin(bb: BbPluginApi) {
         : `tasks-axi present${axiVer !== "" ? ` (v${axiVer}; needs >=${TASKS_AXI_MIN})` : ` (version unknown; needs >=${TASKS_AXI_MIN})`}`;
     const clone = await runOnHost(
       hostId,
-      `if [ -d ${shQuote(`${path}/.git`)} ]; then echo FM_EXISTS; else git clone ${shQuote(repo)} ${shQuote(path)} && git -C ${shQuote(path)} checkout --detach ${shQuote(UPSTREAM_FIRSTMATE_SHA)}; fi`,
+      `if [ -d ${shQuote(`${path}/.git`)} ]; then echo FM_EXISTS; else echo "No existing external native home at the explicit path; run bb firstmate deck in the owning thread to bind the bundled runtime." >&2; exit 2; fi`,
       timeoutMs,
       signal,
     );
     if (clone.exitCode !== 0) throw new Error(`Clone failed:\n${truncate(clone.output, 1000)}`);
     const existed = clone.output.includes("FM_EXISTS");
-    // Version skew: a reused clone can lag the referenced source. Fast-forward it
-    // (ff-only, and only when the tree is clean so a dirty overlay is never lost).
-    let ffNote = existed ? "reused clone: no fast-forward attempted" : "fresh clone";
-    if (existed) {
-      const q = shQuote(path);
-      const ff = await runOnHost(
-        hostId,
-        [
-          `if [ -n "$(git -C ${q} status --porcelain 2>/dev/null)" ]; then echo FM_FF_SKIP_DIRTY; else`,
-          `git -C ${q} cat-file -e ${shQuote(`${UPSTREAM_FIRSTMATE_SHA}^{commit}`)} 2>/dev/null || git -C ${q} fetch --quiet origin ${shQuote(UPSTREAM_FIRSTMATE_SHA)} || exit 1;`,
-          `if git -C ${q} merge-base --is-ancestor HEAD ${shQuote(UPSTREAM_FIRSTMATE_SHA)}; then git -C ${q} merge --ff-only ${shQuote(UPSTREAM_FIRSTMATE_SHA)} 2>&1 && echo FM_FF_OK || echo FM_FF_NOFF; else echo FM_FF_NOFF; fi; fi`,
-        ].join("\n"),
-        timeoutMs,
-        signal,
-      );
-      const out = ff.output;
-      ffNote = out.includes("FM_FF_SKIP_DIRTY")
-        ? "reused clone: fast-forward skipped (working tree dirty)"
-        : out.includes("FM_FF_OK")
-          ? "reused clone: fast-forwarded to audited native pin"
-          : out.includes("FM_FF_NOFF")
-            ? "reused clone: not fast-forwardable (diverged); left as-is"
-            : out.includes("FM_FF_NO_UPSTREAM")
-              ? "reused clone: no upstream to fast-forward"
-              : "reused clone: fast-forward attempted";
-    }
+    const ffNote = "external home preserved; no fetch or native update attempted";
     let projectId: string;
     try {
       const created = await bb.sdk.projects.create({ name, source: { type: "local_path", hostId, path } });
@@ -6368,9 +7232,7 @@ export default async function plugin(bb: BbPluginApi) {
     return { hostId, path, existed, projectId, overlay: overlayOut, tools: tools.output, summary };
   }
 
-  const FULL_PARITY_MIGRATION_KEY = "full-parity-migrated-home";
-
-  async function activateFullParityForDeck(captainThreadId: string | undefined): Promise<string> {
+  async function activateFullParityForDeck(): Promise<string> {
     const before = await settings.get();
     const fmHome = before.fmHome.trim();
     if (!before.fullParityOnDeck || fmHome === "") return "";
@@ -6389,35 +7251,17 @@ export default async function plugin(bb: BbPluginApi) {
       // can start repeated manager turns with no new crew event; durable wakes
       // remain recoverable through firstmate_wake and deck/session catch-up.
       turnEndGuard: "off",
-      supervisionEnabled: true,
+      supervisionEnabled: before.supervisionEnabled,
       nudgeEnabled: false,
     });
 
-    // Existing plugin state may predate the real owners. Import it once per home;
-    // every migration is itself idempotent and refuses destructive overwrites.
-    const migratedHome = await bb.storage.kv.get<unknown>(`${FULL_PARITY_MIGRATION_KEY}:${fmHome}`);
-    if (migratedHome !== fmHome) {
-      try {
-        const state = await migrateState();
-        const owners = await migrateOwners(captainThreadId);
-        if (state.failed.length === 0 && owners.memory) {
-          await bb.storage.kv.set(`${FULL_PARITY_MIGRATION_KEY}:${fmHome}`, fmHome);
-        } else {
-          bb.log.warn(
-            `full parity migration incomplete home=${fmHome} stateFailed=${state.failed.length} memory=${owners.memory}`,
-          );
-        }
-      } catch (error) {
-        bb.log.warn(`full parity migration deferred: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    }
-    await refreshCaptainMemory();
-    return "Full Firstmate profile: active (real state, memory, watcher, backlog, decisions, durable messaging, and wake guard).";
+    // Binding does not scan or project the legacy fleet. The explicit migration
+    // commands retain native overwrite guards; native startup owns its own digest.
+    return "BB native owners configured; native lock, bootstrap and session digest still require the agent shell. Legacy import remains an explicit migrate-state/migrate-owners operation.";
   }
 
-  // Real firstmate is the default. On deck, if it is not already initialized,
-  // clone + overlay it now (best-effort); on any failure, surface the single
-  // one-time command the captain must run. Returns a line for the deck digest.
+  // Install hooks only after the exact captain home is bound. A failed write
+  // cannot stamp setup as verified. Native startup still runs in the agent shell.
   async function installCaptainHooks(
     hostId: string,
     threadId: string | undefined,
@@ -6427,16 +7271,21 @@ export default async function plugin(bb: BbPluginApi) {
     if (threadId === undefined || !/^[A-Za-z0-9_-]+$/.test(threadId)) return;
     const stored = await bb.storage.kv.get<string>(`native-home:${threadId}`);
     const home = typeof stored === "string" && stored !== "" ? stored : fallbackHome;
+    const selection=await bb.storage.kv.get<Record<string,unknown>>(`native-runtime:${threadId}`);
     const script = captainHookInstallScript({
       threadId,
+      runtimeRoot:typeof selection?.["root"]==="string"?selection["root"]:home,
       home,
       state: wakeStateDir(home, threadId),
-      ownHome: home.endsWith(`-bb-homes/${threadId}`),
+      ownHome: captainHomes.get(threadId)===home || home.endsWith(`-bb-homes/${threadId}`),
       scriptB64: overlayBytes("bin/bb-captain-hook.sh"),
     });
-    const res = await runOnHost(hostId, `bash -c ${shQuote(script)}`, 60_000, signal);
+    // The hook bytes plus shell quoting can exceed BB's composed command cap.
+    // Stage the complete installer through the existing bounded stdin transport;
+    // nothing installs until staging succeeds, and runOnHost removes that file.
+    const res = await runOnHost(hostId, "bash", 60_000, signal, script);
     if (res.exitCode !== 0 || !res.output.includes("captain-hooks-ok")) {
-      bb.log.warn(`captain hook install failed captain=${threadId} host=${hostId}: ${truncate(res.output, 400)}`);
+      throw new Error(`Captain hook install failed captain=${threadId} host=${hostId}: ${truncate(res.output, 400)}`);
     } else {
       bb.log.info(`captain hooks installed captain=${threadId} home=${home}`);
     }
@@ -6452,23 +7301,32 @@ export default async function plugin(bb: BbPluginApi) {
         // Re-apply the plugin-owned BB adapter on every deck. Upstream scripts stay
         // untouched; this refreshes the mirror when the plugin's transport semantics
         // change (for example queue → live steer) without requiring a manual re-init.
-        await installBbBackend(
+        const adapter=await installBbBackend(
           hostId,
           current.fmHome,
           ctxString(ctx, "projectId"),
           180_000,
           signal,
+          true,
         );
-        await refreshSkillsManifest(hostId, current.fmHome, signal);
-        await refreshCaptainMemory();
-        await installCaptainHooks(hostId, ctxString(ctx, "threadId"), current.fmHome, signal);
+        const setupKey=`captain-adapter-setup:${ctxString(ctx,"threadId")??''}`;
+        const runtimeSelection=await bb.storage.kv.get(`native-runtime:${ctxString(ctx,"threadId")??''}`);
+        const hookRevision=createHash('sha256').update(Buffer.from(overlayBytes('bin/bb-captain-hook.sh'),'base64')).digest('hex');
+        const stamp=JSON.stringify([current.fmHome,hostId,overlayFingerprint(),runtimeSelection,hookRevision]);
+        const verifiedSetup=adapter.includes("mirror OK:") && await bb.storage.kv.get(setupKey)===stamp;
+        if (!verifiedSetup) await refreshSkillsManifest(hostId, current.fmHome, signal);
+        if (!current.fullParityOnDeck) await refreshCaptainMemory();
+        if (!verifiedSetup) {
+          await installCaptainHooks(hostId, ctxString(ctx, "threadId"), current.fmHome, signal);
+          signal?.throwIfAborted();await bb.storage.kv.set(setupKey,stamp);
+        }
       } catch (error) {
         if (current.fullParityOnDeck) throw new Error(`Native setup failed; captain is not ready: ${error instanceof Error ? error.message : String(error)}`);
         bb.log.warn(`Native adapter refresh failed in compatibility mode: ${String(error)}`);
       }
-      const profile = await activateFullParityForDeck(ctxString(ctx, "threadId"));
+      const profile = await activateFullParityForDeck();
       return [
-        `Real firstmate: active (fmHome ${current.fmHome}; ${toolbeltPhrase(current.fmScriptCount, current.fmSkillCount)}).`,
+        `Real firstmate: ${current.fullParityOnDeck?"bound":"active"} (fmHome ${current.fmHome}; ${toolbeltPhrase(current.fmScriptCount, current.fmSkillCount)}).`,
         profile,
         `Dispatch through the full toolbelt: bb firstmate fm spawn -- --mode direct-PR -- ship "<task>".`,
       ].filter((line) => line !== "").join("\n");
@@ -6476,13 +7334,14 @@ export default async function plugin(bb: BbPluginApi) {
     try {
       const res = await initRealMode(ctx, signal, {});
       if ((await baseSettings.get()).fullParityOnDeck) await ensureCaptainHome(ctx, signal);
-      const profile = await activateFullParityForDeck(ctxString(ctx, "threadId"));
+      const profile = await activateFullParityForDeck();
       return [
-        `Real firstmate: initialized now (${res.existed ? "reused clone" : "cloned"}).`,
+        `Real firstmate: initialized now (${res.existed ? "reused home" : "installed"}).`,
         profile,
         res.summary,
       ].filter((line) => line !== "").join("\n");
     } catch (error) {
+      if ((await baseSettings.get()).fullParityOnDeck) throw new Error(`Native initialization failed: ${error instanceof Error?error.message:String(error)}. Configure a valid native source with bb firstmate init --real --machine <host> before retry.`);
       return [
         "Real firstmate: not active yet. Run this once to unlock the full toolbelt",
         `(${toolbeltPhrase(current.fmScriptCount, current.fmSkillCount)}):`,
@@ -6497,6 +7356,35 @@ export default async function plugin(bb: BbPluginApi) {
     const digest = await sessionDigest(all ? undefined : ctxString(ctx, "threadId"));
     const others = await otherCaptainsNote(ctxString(ctx, "threadId"), signal);
     return [others, digest].filter(Boolean).join("\n");
+  }
+
+  async function takeDeck(ctx:unknown,signal?:AbortSignal,all=false,digest=false) {
+    const threadId=ctxString(ctx,"threadId");if(!threadId)throw new Error("No thread: run this from a BB thread.");
+    return boundedCaptainStartup([launchAbort.signal,...(signal?[signal]:[])],async(startSignal,stage)=>{
+      // Bind before registering a watcher or enabling a captain. New threads
+      // must never read the shared base home's fleet as their startup digest.
+      stage('host identity');
+      if((await baseSettings.get()).fullParityOnDeck) {
+        const envId=await threadEnv(threadId,startSignal);if(!envId)throw new Error("Captain environment/host unavailable; bind from its actual BB thread environment.");
+        const shellEnv=await raceAbort(bb.sdk.environments.get({environmentId:envId}),startSignal,STUCK_HOST_CALL_MS);
+        const expectedHost=homeScope.getStore()?.host||(await baseSettings.get()).fmHostId.trim();
+        if(expectedHost && expectedHost!==shellEnv.hostId)throw new Error("Native source/bound home is on another host; no path will be passed into this captain's host. Configure a matching native source explicitly.");
+      }
+      stage('native home binding');const setup=await ensureRealModeForDeck(ctx,startSignal);
+      startSignal.throwIfAborted();const current=await settings.get();
+      const home=current.fmHome.trim();const host=current.fmHostId.trim()||(home?await raceAbort(resolveHostId(undefined,ctx),startSignal,STUCK_HOST_CALL_MS):'');
+      if(current.fullParityOnDeck) {
+        if(!home || await bb.storage.kv.get(`native-home:${threadId}`)!==home)throw new Error("Captain home binding is missing; shared-home fallback refused.");
+        stage('native prerequisites');const tools=await checkToolchain(host,home,startSignal);
+        if(!tools.ready)throw new Error(`Native prerequisite check refused:\n${tools.output}`);
+      }
+      stage('captain registration');await markDeck(threadId,startSignal);startSignal.throwIfAborted();
+      await raceAbort(rememberWatchCaptain(ctx,threadId),startSignal,STUCK_HOST_CALL_MS);startSignal.throwIfAborted();
+      const renderedDigest=(!current.fullParityOnDeck||all||digest)?(stage('requested session digest'),await raceAbort(deckDigest(ctx,startSignal,all),startSignal)):undefined;
+      const command=home?(captainStartupCommand(home,'session-start')??''):'';
+      return {captain:true,threadId,realMode:!!home,nativeHome:home,hostId:host,ready:false,requiresAgentShell:!!home,startupCommand:command,digest:renderedDigest??null,
+        text:captainBindingText({home,host,command,setup,digest:renderedDigest})};
+    });
   }
 
   async function runFmScript(input: {
@@ -6532,8 +7420,8 @@ export default async function plugin(bb: BbPluginApi) {
         receipt = { action: "legacy-ack", id: `${input.args[1]}:${input.args[3]}` };
       } else throw new Error("Use firstmate_wake for wake presentation/completion; unsupported native wake arguments.");
     }
-    // Compressed source stays under BB's 10KB command limit without staging a
-    // helper on every wake. Journal/report files are still written on the host.
+    // Compression reduces staged bytes; it does not bound the composed command
+    // after the environment, stale guard, scoped paths and shell quoting are added.
     const receiptRunner = receipt ? `import base64,zlib; exec(zlib.decompress(base64.b64decode("${deflateSync(Buffer.from(overlayBytes("bin/bb-wake-receipt.py"), "base64")).toString("base64")}")))` : "";
     const invocation = receipt
       ? `python3 -c ${shQuote(receiptRunner)} ${shQuote(wakeStateDir(input.fmHome, input.parentThreadId))} ${shQuote(receipt.action)} ${shQuote(receipt.id ?? "")} "$FM_BINDIR/${scriptLeaf}"`
@@ -6549,11 +7437,27 @@ export default async function plugin(bb: BbPluginApi) {
       fmBinDirAssign(input.fmHome),
       fmMirrorStaleGuard(input.fmHome),
       `if [ ! -f "$FM_BINDIR/${scriptLeaf}" ]; then echo "error: missing $FM_BINDIR/${scriptLeaf}" >&2; exit 127; fi`,
+      ["update","test-run","test-isolation-proof","lint","lint-workflows"].includes(script) ? 'if [ "${FM_BUNDLED_VERIFIED:-}" = 1 ]; then echo "Bundled native development/update command refused; use a development source checkout for lint/tests or install a tested BB plugin release and use bb firstmate runtime select --check." >&2; exit 2; fi' : "",
       invocation,
     ]
       .filter((line) => line !== "")
       .join("\n");
-    const result = await runOnHost(input.hostId, prelude, input.timeoutMs, input.signal, input.stdin);
+    const result = receipt ? await (async () => {
+      // The receipt helper is plugin-shipped, not installer-owned. Stage the whole
+      // guarded script, including helper/arguments, so only a fixed-length temp
+      // path travels in the host command. Optional stdin is separately staged by
+      // runOnHost; no receipt/native invocation starts until both writes succeed.
+      const staged = `/tmp/.fm-receipt-${randomUUID()}.sh`;
+      try {
+        if (!(await writeHostBytes(input.hostId, staged, prelude, input.timeoutMs, input.signal, true))) {
+          throw new Error("Failed to stage wake receipt command; no receipt action was executed.");
+        }
+        return await runOnHost(input.hostId, `bash ${shQuote(staged)}`, input.timeoutMs, input.signal, input.stdin);
+      } finally {
+        // Cancellation must not prevent cleanup of a fully staged command.
+        await runHostCommand(input.hostId, `rm -f ${shQuote(staged)} ${shQuote(staged)}.fm-b64-* ${shQuote(staged)}.fm-out-*`, 10_000).catch(() => {});
+      }
+    })() : await runOnHost(input.hostId, prelude, input.timeoutMs, input.signal, input.stdin);
     if (result.output.includes("FM_MIRROR_STALE")) {
       const line = result.output.split("\n").find((l) => l.includes("FM_MIRROR_STALE"))?.trim() ?? "FM_MIRROR_STALE";
       bb.log.error(`bb mirror is STALE on host ${input.hostId} running fm-${script}: ${line}. Re-run the overlay installer against ${input.fmHome}; new native scripts are unmirrored and the three patched copies are frozen behind upstream.`);
@@ -6576,8 +7480,8 @@ export default async function plugin(bb: BbPluginApi) {
     const mirrorBb = `${fmHome}/bin-bb/backends/bb.sh`;
     const res = await runOnHost(
       hostId,
-      `{ find ${shQuote(bin)} -maxdepth 2 -type f -printf '%P\\n' 2>/dev/null; ` +
-        `[ -f ${shQuote(mirrorBb)} ] && printf 'backends/bb.sh\\n' || true; } | LC_ALL=C sort -u`,
+      `${fmBinDirAssign(fmHome)}; { find "$FM_RUNTIME_ROOT/bin" -maxdepth 2 -type f -printf '%P\\n' 2>/dev/null; ` +
+        `[ -f "$FM_RUNTIME_ROOT/bin-bb/backends/bb.sh" ] && printf 'backends/bb.sh\\n' || true; } | LC_ALL=C sort -u`,
       20_000,
       asRecord(ctx)["signal"] as AbortSignal | undefined,
     );
@@ -6590,17 +7494,20 @@ export default async function plugin(bb: BbPluginApi) {
       .map((name) => name.slice(3, -3));
     const entryFiles = new Set(names.map((name) => `fm-${name}.sh`));
     const support = files.filter((name) => !entryFiles.has(name));
-    return compareUpstreamScriptSurface(names, query, support);
+    const captain=homeScope.getStore()?.captain;
+    const bundled=captain?await bb.storage.kv.get(`native-runtime:${captain}`):null;
+    return {...compareUpstreamScriptSurface(names, query, support),...(bundled?{bundledUnavailable:["update","test-run","test-isolation-proof","lint","lint-workflows"]}:{})};
   }
 
-  function renderScriptSurface(surface: ReturnType<typeof compareUpstreamScriptSurface>): string {
+  function renderScriptSurface(surface: ReturnType<typeof compareUpstreamScriptSurface> & {bundledUnavailable?:string[]}): string {
     const drift = [
       surface.missing.length > 0 ? `missing: ${surface.missing.join(", ")}` : "",
       surface.extra.length > 0 ? `new upstream: ${surface.extra.join(", ")}` : "",
     ].filter((line) => line !== "");
     return [
-      `Firstmate scripts: ${surface.installed} callable + ${surface.installedSupport} support/adapters installed / ${surface.expected} + ${surface.expectedSupport} pinned @ ${surface.sha.slice(0, 12)}`,
+      `Firstmate scripts: ${surface.installed} ${surface.bundledUnavailable?"installed entries":"callable"} + ${surface.installedSupport} support/adapters installed / ${surface.expected} + ${surface.expectedSupport} pinned @ ${surface.sha.slice(0, 12)}`,
       ...drift,
+      ...(surface.bundledUnavailable?[`Bundled development/update entries unavailable through Firstmate tools: ${surface.bundledUnavailable.join(", ")}; use a development checkout or an explicit tested release selection.`]:[]),
       surface.missingSupport.length > 0 ? `missing support: ${surface.missingSupport.join(", ")}` : "",
       surface.extraSupport.length > 0 ? `new support: ${surface.extraSupport.join(", ")}` : "",
       surface.matches.length > 0 ? surface.matches.join("\n") : "No matching scripts.",
@@ -6878,9 +7785,10 @@ export default async function plugin(bb: BbPluginApi) {
     const scriptPath = `${fmHome}/bin/fm-afk-contract.sh`;
     const prelude = [
       `export FM_HOME=${shQuote(fmHome)}`,
-      `export FM_ROOT=${shQuote(fmHome)}`,
-      `if [ ! -f ${shQuote(scriptPath)} ]; then echo "error: missing ${scriptPath}" >&2; exit 127; fi`,
-      `${shQuote(scriptPath)} ${args.map(shQuote).join(" ")}`,
+      fmBinDirAssign(fmHome),
+      `script=${shQuote(scriptPath)}; [ "\${FM_BUNDLED_VERIFIED:-}" != 1 ] || script="$FM_BINDIR/fm-afk-contract.sh"`,
+      `[ -f "$script" ] || { echo "error: missing $script" >&2; exit 127; }`,
+      `"$script" ${args.map(shQuote).join(" ")}`,
     ].join("\n");
     try {
       return await runOnHost(hostId, prelude, 30_000, undefined, stdin);
@@ -7309,7 +8217,9 @@ export default async function plugin(bb: BbPluginApi) {
     const prelude = [
       `export FM_HOME=${shQuote(home)}`,
       `export FM_STATE_OVERRIDE=${shQuote(`${home}/state`)}`,
-      `. ${shQuote(library)}`,
+      fmBinDirAssign(home),
+      `library=${shQuote(library)}; [ "\${FM_BUNDLED_VERIFIED:-}" != 1 ] || library="$FM_BINDIR/fm-afk-contract.sh"`,
+      `. "$library"`,
     ];
     const cachedEpoch = Math.floor(Date.parse(previous.since) / 1000);
     if (!Number.isSafeInteger(cachedEpoch)) return false;
@@ -7325,7 +8235,7 @@ export default async function plugin(bb: BbPluginApi) {
       `  __fm_source=archive`,
       // Legacy KV was timestamped around, rather than by, native entry.
       `  for __fm_epoch in $(seq ${cachedEpoch - 4} ${cachedEpoch + 4}); do`,
-      `    __fm_record=$(${shQuote(library)} archived "$__fm_epoch" 2>/dev/null) || continue`,
+      `    __fm_record=$("$library" archived "$__fm_epoch" 2>/dev/null) || continue`,
       `    fm_bb_afk_identity "$__fm_record"`,
       `  done`,
       `fi`,
@@ -7460,9 +8370,80 @@ export default async function plugin(bb: BbPluginApi) {
     throw new Error(`Native ${operation} failed: ${reason}. BB state was not advanced; reconcile native state before retrying.`);
   }
 
-  async function projectQueueAdd(id: string, title: string, shape: Shape, projectId: string): Promise<{ ok: boolean }> {
+  function validateQueueText(title:string,detail:string) {
+    if (title.length > 500 || detail.length > MAX_TASK || (detail ? `${title}\n\n${detail}` : title).length > MAX_TASK) throw new Error(`Queue text exceeds limits (title 500, full task ${MAX_TASK} characters); nothing truncated or filed.`);
+  }
+  function storedQueueGate(item:QueueItem,all:QueueItem[],now:number) {
+    if (item.nativePending) return "native publication unresolved; run queue reconcile with the exact id";
+    return queueGate(item,all.filter(row=>row.projectId===item.projectId && (row.parentThreadId??null)===(item.parentThreadId??null)),now);
+  }
+  async function publishQueueAdd(item:QueueItem) {
+    // Intent is durable BEFORE the external add. A timeout retains the full spec;
+    // reconciliation reads the exact native id and never repeats an unknown add.
+    try {
+      const projected=await projectQueueAdd(item.id,item.title,item.shape,item.projectId,item.nativeHome);
+      if (projected.ok) { queueStore.patch(item,{backlogId:item.id,nativePending:false});item.backlogId=item.id;item.nativePending=false; }
+    } catch (error) {
+      throw new Error(`Queue ${item.id} saved; native add unresolved. Inspect native row, then queue reconcile ${item.id}. ${error instanceof Error?error.message:String(error)}`);
+    }
+  }
+  function findQueueItem(items:QueueItem[],id:string|undefined,project:string|undefined):QueueItem|undefined {
+    const matches=items.filter(row=>row.id===id && (project===undefined || row.projectId===project));
+    if (matches.length>1) throw new Error(`Queue id ${id} is ambiguous; pass its exact project.`);
+    return matches[0];
+  }
+  async function reconcileQueue(id:string,project:string|undefined,owner:string|undefined,input:Partial<QueueItem>={}) {
+    if (!owner || !project || !/^[A-Za-z0-9._-]+$/.test(id) || !(await queueIsReal())) throw new Error("Queue reconcile requires the owning captain, exact project/id and native backlog.");
+    await queueStore.ready();
+    const existing=queueStore.get({id,projectId:project,parentThreadId:owner});
+    const reservation=launches.forTask(project,owner,id);
+    // Handoff retains a task's original home. Only an owned durable record or
+    // exact owned launch supplies that home; never accept a caller override.
+    const home=existing?.nativeHome || reservation?.home || (await settings.get()).fmHome;
+    if (existing && reservation && existing.nativeHome && existing.nativeHome!==reservation.home) throw new Error("Queue reconcile refused: stored queue/launch homes conflict.");
+    if (existing) for (const key of ['title','detail','mode','deliveryRequirement','providerId','model','reasoningLevel'] as const) {
+      if (input[key]!==undefined && input[key]!==existing[key]) throw new Error(`Queue reconcile cannot change original ${key}.`);
+    }
+    const read=await runTasksAxi(["show",id,"--full"],{projectId:project,home});
+    requireNativeSuccess(read,`queue reconcile ${id}`);
+    const state=tasksAxiField(read!.output,"state"),title=tasksAxiField(read!.output,"title"),kind=tasksAxiField(read!.output,"kind");
+    if (tasksAxiField(read!.output,"id")!==id || !title || !['ship','scout'].includes(kind) || !['queued','in_flight','done'].includes(state) || /\(truncated, \d+ chars total/.test(title)) throw new Error("Native row is not a readable task in a recoverable state.");
+    if (existing && (existing.title!==title || existing.shape!==kind || existing.backlogId && existing.backlogId!==id)) throw new Error("Native row conflicts with the saved queue identity/title/kind.");
+    if (existing && ['done','dropped'].includes(existing.status)) return existing; // never reopen history
+    if (state==='queued') {
+      if (existing) return queueStore.patch(existing,{backlogId:id,nativePending:false});
+      // An old native-only row cannot prove the lost BB options/full task. The
+      // owner explicitly supplies that contract, after inspecting the exact row.
+      if (input.title!==title || input.detail===undefined || input.mode===undefined || input.deliveryRequirement===undefined) throw new Error("Native-only queued repair needs original --title, --detail, --mode and --delivery-requirement plus original execution/dependency/time options. Native title alone cannot recover a lost BB spec.");
+      if (await bb.storage.kv.get(`native-home:${owner}`)!==home) throw new Error("Native-only queued repair requires this captain's isolated native home; shared-home provenance is ambiguous.");
+      await validateProviderChoice(input.providerId,input.model,project,owner);
+      modeSchema.parse(input.mode);
+      validateQueueText(title,input.detail);
+      const record:QueueItem={...input,id,title,detail:input.detail,projectId:project,parentThreadId:owner,nativeHome:home,shape:kind as Shape,mode:input.mode,deliveryRequirement:input.deliveryRequirement,blockedBy:input.blockedBy??[],waitUntil:input.waitUntil??null,status:'queued',crewId:null,backlogId:id,createdAt:new Date().toISOString()};
+      return queueStore.add(record);
+    }
+    const candidates=(await readCrews()).filter(c=>c.id===id && c.projectId===project && c.parentThreadId===owner && c.nativeHome===home);
+    const launch=reservation;
+    if (candidates.length!==1 || !launch || launch.state!=='running' || launch.home!==home || launch.threadId!==candidates[0]!.threadId || launch.shape!==kind || launches.isDeletedWorker(launch.threadId)) throw new Error("Native in-flight/completed queue repair needs one exact registered, admitted launch and worker; no replacement created.");
+    const crew=candidates[0]!;
+    if (await bb.storage.kv.get(`crew-retired:${crew.threadId}`)===true) throw new Error("Queue repair refused: worker was explicitly retired.");
+    const thread=await raceAbort(bb.sdk.threads.get({threadId:crew.threadId}),launchAbort.signal,STUCK_HOST_CALL_MS);
+    const meta=await raceAbort(bb.sdk.threads.getPluginMetadata({threadId:crew.threadId}),launchAbort.signal,STUCK_HOST_CALL_MS);
+    if (thread.projectId!==project || thread.parentThreadId!==owner || meta.crewId!==id || meta.launchKey!==launch.key || meta.nativeHome!==home || await readFmMetaField(launch.hostId || await resolveHostId(undefined,{threadId:owner}),id,"bb_thread_id",home)!==crew.threadId) throw new Error("Exact BB/native worker identity does not match queue recovery.");
+    const task=await fullCrewTask(crew);
+    if (!task || task==='(recovered crew)' || crew.taskSpilled && task===crew.task || crew.shape!==kind || crew.deliveryRequirement!==launch.deliveryRequirement || crew.posture!==launch.deliveryMode) throw new Error("Original full task or immutable execution/delivery provenance is missing or conflicting.");
+    let record=existing;
+    if (!record) {
+      // Full task is retained verbatim, even if the native short title differs.
+      record={id,title,detail:task,projectId:project,parentThreadId:owner,nativeHome:home,shape:crew.shape,mode:crew.posture,blockedBy:[],waitUntil:null,status:'dispatched',crewId:id,backlogId:id,createdAt:crew.createdAt,deliveryRequirement:crew.deliveryRequirement,...(crew.providerId?{providerId:crew.providerId}:{}),...(crew.model?{model:crew.model}:{}),...(crew.reasoningLevel?{reasoningLevel:crew.reasoningLevel}:{})};
+      queueStore.add(record);
+    }
+    return queueStore.patch(record,{status:state==='done'?'done':'dispatched',crewId:id,backlogId:id,nativePending:false});
+  }
+
+  async function projectQueueAdd(id: string, title: string, shape: Shape, projectId: string, home?:string): Promise<{ ok: boolean }> {
     if (!(await queueIsReal())) return { ok: false };
-    const res = await runTasksAxi(["add", id, title.slice(0, 500), "--kind", shape], { projectId });
+    const res = await runTasksAxi(["add", id, title.slice(0, 500), "--kind", shape], { projectId,home });
     requireNativeSuccess(res, `backlog add ${id}`);
     return { ok: true };
   }
@@ -7570,7 +8551,7 @@ export default async function plugin(bb: BbPluginApi) {
           threadId,
           order: "desc",
           limit: "1",
-          types: TOOL_ACTIVITY_TYPES,
+          types: BB_ACTIVITY_TYPES,
         }),
         signal,
         STUCK_HOST_CALL_MS,
@@ -8243,17 +9224,42 @@ export default async function plugin(bb: BbPluginApi) {
       "1. Real firstmate bin/ scripts (the full toolbelt): bb firstmate fm <script> …",
       `   ${toolbeltPhrase(scriptCount, skillCount)} keep policy`,
       "   (brief, gate, inbox, watch, merge, afk, bearings, backlog). `/captain` (deck)",
-      "   auto-clones + overlays this on first run; no manual step if the host has git/gh.",
+      "   installs the pinned bundle on clean hosts; native prerequisites and harness startup remain required.",
       "2. Native deck (plugin SDK / Fleet UI): bb firstmate deck, then dispatch/tell/watch/merge.",
       "   BB is the session backend (threads + managed-worktree), like tmux/orca — not a rewrite of bin/.",
-      "Primary dispatch (real toolbelt, after deck/init --real):",
-      "  bb firstmate fm spawn -- --mode direct-PR -- ship \"fix flaky login test\"",
-      "Native dispatch (BB transport; writes state/<id>.meta when fmHome is set, so the scripts see Fleet crews):",
+      "Primary native dispatch (after deck/init --real; BB owns brief/resolver/backlog/spawn):",
       "  bb firstmate dispatch --project <proj> -- \"fix flaky login test\"",
-      `One-time activation if auto-init was skipped: bb firstmate init --real  (repo ${repo}; overlays backends/bb.sh, sets config/backend=bb, persists fmHome)`,
+      DISPATCH_TRANSPORT,
+      `Pinned bundle/native attribution: ${repo}. Inspect bb firstmate runtime status --json; no startup fetch or implicit runtime selection upgrade.`,
     ].join("\n");
   }
 
+
+  const dispatchParams = z.object({
+    task: z.string().min(1).max(MAX_TASK),
+    taskId:z.string().regex(/^[A-Za-z0-9._-]+$/).optional().describe("Stable retry identity; reuse after an uncertain launch"),
+    projectId: z.string().optional().describe("BB project id; defaults to the current thread's project"),
+    title: z.string().max(120).optional(),
+    providerId: z.string().optional(),
+    model: z.string().optional(),
+    reasoningLevel: z.enum(["low", "medium", "high", "xhigh", "max", "ultra", "none", "ultracode"]).optional()
+      .describe("Reasoning effort applied to the crew from turn 1"),
+    permissionMode: z.enum(["accept-edits", "auto", "full"]).optional(),
+    shape: shapeSchema.optional(),
+    mode: modeSchema.optional(),
+    branchPrefix:z.string().max(120).optional().describe("Native ship-branch prefix selected at intake; passed unchanged to brief and spawn, default fm/; empty gives a bare task-id branch"),
+    dispatchProfileReason:z.string().min(1).max(1000).optional().describe("Native enabled dispatch-resolve intake decision/override reason for explicit BB provider/model selection; does not grant approval"),
+    worktree: z.boolean().optional(),
+    sharedEnv: z.boolean().optional().describe("Unsupported for native ship transport; shared-worktree requests refuse before creation"),
+    visible: z.boolean().optional().describe("Show in the BB sidebar as a nested subagent (default true)"),
+    deliveryRequirement:z.enum(["branch","pr","merged","merged-and-verified"]).optional().describe("local-only defaults to branch (ready in branch, no push/PR/merge); PR modes default to merged, which requires existing native merge authority, never grants it"),
+    sendAt: z.never().optional().describe("Unsupported for Firstmate launch; use backlog waitUntil eligibility and explicit dispatch"),
+    overrideOwner: z.boolean().optional()
+      .describe("Proceed even though the task targets a PR another captain's crew owns (only on the captain's word)"),
+  });
+
+  const dispatchHelp='bb firstmate dispatch [options] -- "<task>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","sendAt"])+"\n  --task <text>  Repeat for bounded fan-out; --hidden hides the worker.\n  sendAt/--send-at is unsupported; native ship isolation is mandatory.";
+  const queueHelp='bb firstmate queue add [options] -- "<title>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider"},["task","taskId","overrideOwner","sendAt","title","permissionMode","sharedEnv","worktree","visible"])+"\n  --detail <full-task>\n  --after <queue-id>  Repeat for dependencies, which remain dispatch gates.\n  --wait-until <ISO-time>  Eligibility only; explicit dispatch required.\n  dispatch preserves the queued shape, mode, contract, dependencies and identity; only provider/model/reasoning/permission/visibility/worktree options override at dispatch; dispatch-profile-reason records completed native intake.\n  list | next | done <queue-id> | drop <queue-id> | prune | reconcile <exact-id> --project <id> [original options]"+"\nDispatch: bb firstmate queue dispatch <queue-id> [options]\n"+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","taskId","overrideOwner","sendAt","title","shape","mode","deliveryRequirement","branchPrefix"]);
   const usage = [
     "Usage:",
     "  bb firstmate guide [--json]",
@@ -8261,17 +9267,29 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb firstmate init [--real] [--machine m] [--path p] [--name n] [--json]",
     "  bb firstmate scripts [query] [--json]   # list + verify every installed fm-* script",
     "  bb firstmate fm [--timeout s] <script> [args...]   # real bin/fm-<script>.sh with FM_BACKEND=bb",
-    "  bb firstmate deck | session [--json]",
-    '  bb firstmate dispatch --project <id> [--task t ...] [--shape ship|scout] [--mode m] [--title t] [--provider p] [--model m] [--reasoning-level low|medium|high|xhigh|max] [--permission-mode m] [--shared-env] [--worktree] [--hidden] [--send-at ms] -- "<task>"',
+    "  bb firstmate deck [--digest|--all] [--json] | session [--json]",
+    "  bb firstmate contract [section,...] [--paged | --cursor <cursor>] [--json] # read every page; default CLI returns complete native policy",
+    "  bb firstmate skill <name> [relative-reference] [--source <selected-root source-file>] [--paged] [--json] # operator full read; agent bounded pages",
+    "  bb firstmate skill --cursor <cursor> [--json] # continue the same verified skill/reference",
+    "  bb firstmate skill --list [--paged] [--json] # complete diagnostic descriptions; not an alternate policy catalog",
+    "  bb firstmate runtime status|install|select|migrate|rollback [exact-release|external] [--check] [--json]",
+    dispatchHelp,
+    "  bb firstmate launches list [--limit n] [--offset n] [--json]   # uncertain slots require reconciliation",
+    "  bb firstmate launches adopt <task-id> --thread <thread-id> [--check] [--json]   # exact legacy registration repair; no turn or merge",
+    "  bb firstmate deliveries list|inspect|register|reconcile|assign|abandon|verify [id] [--from manager] [--reason evidence] [--authorized]",
+    "  bb firstmate deliveries account <id> --failure <id> --scope author|baseline --follow-up-task <existing-task> --reason <evidence> --authorized",
+    "  sendAt is unsupported; backlog waitUntil requires later explicit dispatch.",
     "  bb firstmate crews | crew <id> | watch [id ...] [--timeout s] [--json]",
-    '  bb firstmate tell <id> [--queue] -- "<message>" | interrupt <id> | stop <id> | retry <id> [--model m] [--provider p] [--reasoning-level l] [--reason r]',
+    '  bb firstmate tell <id> [--queue] -- "<message>" | interrupt <id> | stop <id> | retry <id> [--model m] [--provider p] [--reasoning-level l] [--intent failure-recovery|execution-change] [--reason r]',
+    "  bb firstmate scout-report <id> [--json]   # complete owned promotion artifact",
     "  bb firstmate bearings | deliver <id> | merge <id> [--yes] [--allow-red <check-name>] [--allow-missing <check-name>] | promote <id>",
     "  bb firstmate handoff --from <previous-captain-thread> [--crew <id>]",
-    '  bb firstmate queue add --project <id> [--shape s] [--mode m] [--after <qid>] [--wait-until <iso>] -- "<title>"',
+    '  bb firstmate queue reconcile <id> --project <id> [--title <original> --detail <full> --mode <mode> --delivery-requirement <contract> --provider <id> --model <id> --reasoning-level <level> --after <id> --wait-until <iso>]',
+    queueHelp,
     "  bb firstmate queue [list|next|dispatch <qid>|done <qid>|drop <qid>|prune]",
     '  bb firstmate decide ask [--option o ...] [--crew <id>] -- "<question>"',
     "  bb firstmate decide [list|answer <id>|defer <id>|drop <id>]",
-    "  bb firstmate posture [set --project <id> [--mode m] [--yolo on|off]]",
+    "  bb firstmate posture [set --project <id> [--mode m] [--yolo on|off] [--reason current-user-override]]",
     "  bb firstmate memory [show|set-captain|add-learning|drop-learning <n>|clear <captain|learnings>]",
     "  bb firstmate afk [on|off|status] [-- \"words\"]",
     "  bb firstmate quiet [on|off|status]",
@@ -8280,25 +9298,6 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb firstmate forget <id> [--stop] [--force]",
     "  bb firstmate mark-crew <thread-id> [--shape ship|scout]",
   ].join("\n");
-
-  const dispatchParams = z.object({
-    task: z.string().min(1).max(MAX_TASK),
-    projectId: z.string().optional().describe("BB project id; defaults to the current thread's project"),
-    title: z.string().max(120).optional(),
-    providerId: z.string().optional(),
-    model: z.string().optional(),
-    reasoningLevel: z.enum(["low", "medium", "high", "xhigh", "max"]).optional()
-      .describe("Reasoning effort applied to the crew from turn 1"),
-    permissionMode: z.enum(["accept-edits", "auto", "full"]).optional(),
-    shape: shapeSchema.optional(),
-    mode: modeSchema.optional(),
-    worktree: z.boolean().optional(),
-    sharedEnv: z.boolean().optional().describe("Ship on the project checkout instead of an isolated worktree"),
-    visible: z.boolean().optional().describe("Show in the BB sidebar as a nested subagent (default true)"),
-    sendAt: z.number().int().optional().describe("Epoch ms to start the crew (queued until then)"),
-    overrideOwner: z.boolean().optional()
-      .describe("Proceed even though the task targets a PR another captain's crew owns (only on the captain's word)"),
-  });
 
   function toolError(text: string) {
     return { content: [{ type: "text" as const, text }], isError: true };
@@ -8333,6 +9332,7 @@ export default async function plugin(bb: BbPluginApi) {
       presentation: { ...tool.presentation, suppress: true },
       async execute(params, ctx) {
         try {
+          await requireSupervisorCaller(ctx);
           const captain = ctxString(ctx, "threadId");
           const receiptCall = typeof asRecord(params)["handledWake"] === "string" || tool.name === "firstmate_wake" || (tool.name === "firstmate_fm" && normalizeFmScript(String(asRecord(params)["script"] ?? "")) === "wake-drain");
           const run = () => withLedgerOperation(tool.name, captain, () => inCaptainHome(captain, async () => {
@@ -8372,21 +9372,92 @@ export default async function plugin(bb: BbPluginApi) {
     });
   }) as BbPluginApi["agents"]["registerTool"];
 
-  async function readCaptainContract(ctx: unknown, section?: string) {
+  async function readCaptainContract(ctx: unknown, section?: string, paged = false, cursor?: string) {
+    if (cursor) {
+      const originalSection = contractCursorSection(cursor);
+      if (section !== undefined && section !== originalSection) throw new Error("Do not change contract section during a cursor read; restart without cursor.");
+      section = originalSection;
+    }
     const current = await settings.get();
+    if (!homeScope.getStore()?.captain || !homeScope.getStore()?.home) return toolError("No bound captain home. Call firstmate_deck or bb firstmate deck before reading the native contract; shared-home fallback refused.");
     if (current.fmHome.trim() === "") return toolError("Initialize real Firstmate with firstmate_deck first.");
-    const hostId = current.fmHostId.trim() || await resolveHostId(undefined, ctx);
-    const path = `${current.fmHome}/AGENTS.md`;
-    const result = await bb.sdk.files.read({ hostId, path });
+    const callerSignal = asRecord(ctx)["signal"] as AbortSignal | undefined;
+    const signal = AbortSignal.any([launchAbort.signal, AbortSignal.timeout(30_000), ...(callerSignal ? [callerSignal] : [])]);
+    const hostId = current.fmHostId.trim() || await raceAbort(resolveHostId(undefined, ctx), signal, STUCK_HOST_CALL_MS);
+    const contractCaptain=ctxString(ctx,"threadId");
+    if(contractCaptain && await bb.storage.kv.get(`runtime-selection-pending:${contractCaptain}`)) {
+      const inspected=await nativeRuntime.operation(hostId,"inspect",{home:current.fmHome,captain:contractCaptain},signal);
+      await bb.storage.kv.set(`native-runtime:${contractCaptain}`,inspected.selected??null);
+      // Preserve the pending action until explicit status/retry reconciles it.
+    }
+    const runtimeSelection=await bb.storage.kv.get<Record<string,unknown>>(`native-runtime:${contractCaptain??''}`);
+    const path = `${typeof runtimeSelection?.["root"]==="string"?runtimeSelection["root"]:current.fmHome}/AGENTS.md`;
+    let result;
+    try {
+      result = await raceAbort(bb.sdk.files.read({ hostId, path }), signal, STUCK_HOST_CALL_MS);
+      signal.throwIfAborted();
+    } catch (error) {
+      if (signal.aborted) throw new Error(`Native contract read cancelled at ${path}: ${String(signal.reason ?? error)}. Contract remains incomplete; this read attempted no native startup.`);
+      throw new Error(`Native contract read failed at ${path}: ${String(error)}. Complete contract is unavailable; repair this host read before startup or orchestration.`);
+    }
     if (!("content" in result)) return toolError("Native contract read returned no content.");
     if (result.sizeBytes > 200_000) return toolError("Native contract exceeds 200KB; read it directly in the Firstmate home.");
     const content = result.contentEncoding === "base64"
       ? Buffer.from(result.content, "base64").toString("utf8") : result.content;
     const picked = selectContract(content, section);
     const done = picked.complete
-      ? "The firstmate_contract read is now complete."
+      ? "This transport contains the complete native contract; read all of it and its trigger catalog before orchestration."
       : "This firstmate_contract read covers the listed sections; read any other section by name before acting in its area.";
-    return `${picked.text}\n\n## BB runtime adaptations\n${BB_SKILL_RUNTIME_CONTRACT}\n${done} Treat native policy refusals as refusals. Read durable reports with firstmate_wake; pass handledWake on the final successful action after handling the whole batch.\n`;
+    const catalog=await nativePolicyLookup(hostId,path.slice(0,-'/AGENTS.md'.length),{operation:'catalog'},signal);
+    if (catalog.contractSha256!==createHash('sha256').update(content).digest('hex')) throw new Error('Native contract changed during selected-runtime trigger read; complete contract/catalog read remains unresolved.');
+    const triggers=`## Selected native skill trigger catalog @ ${catalog.commit}\n${catalog.root}\n\n${catalog.entries!.map(entry=>`### ${entry.path}\nNative file SHA-256: ${entry.sha256}\n\n\`\`\`yaml\n${entry.frontmatter}\n\`\`\``).join('\n\n')}`;
+    const text = `${picked.text}\n\n${triggers}\n\n## BB runtime adaptations\n${BB_SKILL_RUNTIME_CONTRACT}\n${DISPATCH_TRANSPORT}\n${done} Treat native policy refusals as refusals. Read durable reports with firstmate_wake; pass handledWake on the final successful action after handling the whole batch.\n`;
+    return paged || cursor ? contractPage(text, JSON.stringify([contractCaptain, current.fmHome, hostId, catalog.root, catalog.commit]), section, cursor) : text;
+  }
+
+  async function nativePolicyLookup(host:string,root:string,request:Record<string,unknown>,signal:AbortSignal) {
+    const helper=`/tmp/.fm-policy-${randomUUID()}.py`;
+    const distribution=JSON.parse(readFileSync(join(PLUGIN_ROOT,"runtime-assets/distribution.json"),"utf8"));
+    try {
+      if (!await writeHostBytes(host,helper,nativePolicyReadPython,STUCK_HOST_CALL_MS,signal,true)) throw new Error('Failed to stage selected native policy reader; no policy read executed.');
+      const result=await runStructuredOnHost(host,`python3 ${shQuote(helper)} ${shQuote(root)} ${shQuote(JSON.stringify(request))} ${shQuote(JSON.stringify(AUDITED_POLICY_COMMITS))} ${shQuote(distribution.snapshotCommit)}`,30_000,signal);
+      if (result.exitCode!==0) throw new Error(`Selected native policy read refused: ${result.stderr || result.output || `exit ${result.exitCode}`}`);
+      return JSON.parse(result.output) as {commit:string;root:string;path?:string;fragment?:string;sha256?:string;sizeBytes?:number;contractSha256?:string;entries?:Array<{path:string;sha256:string;frontmatter:string}>};
+    } finally {await runHostCommand(host,`rm -f ${shQuote(helper)}`,1000).catch(()=>{});}
+  }
+
+  async function readNativeSkill(ctx:unknown,name?:string,reference?:string,source?:string,paged=false,cursor?:string,list=false) {
+    const resumed=cursor?skillCursorRequest(cursor):undefined;
+    if (resumed && ((list && !resumed.list) || (name!==undefined && name!==resumed.name) || (reference!==undefined && reference!==resumed.reference) || (source!==undefined && source!==resumed.source))) throw new Error('Native skill cursor resource differs from request; restart without cursor.');
+    if (list && (name || reference!==undefined || source!==undefined)) throw new Error('Use --list without native resource arguments.');
+    const request=resumed??(list?{list:true as const}:{name:name??'',...(reference!==undefined?{reference}:{}),...(source!==undefined?{source}:{})});
+    ({name,reference,source}=request);
+    const resource=request.list?undefined:nativeSkillPath(name??'',reference,source);
+    const signal=AbortSignal.any([launchAbort.signal,AbortSignal.timeout(30_000),...(asRecord(ctx)["signal"]?[asRecord(ctx)["signal"] as AbortSignal]:[])]);
+    const current=await raceAbort(settings.get(),signal,STUCK_HOST_CALL_MS),captain=ctxString(ctx,"threadId");
+    if (!captain || !homeScope.getStore()?.home) throw new Error("Bind this captain with firstmate_deck before native policy reads; no global policy fallback.");
+    const host=await raceAbort(resolveHostId(undefined,ctx),signal,STUCK_HOST_CALL_MS);
+    if (await raceAbort(bb.storage.kv.get(`runtime-selection-pending:${captain}`),signal,STUCK_HOST_CALL_MS)) {
+      const inspected=await nativeRuntime.operation(host,"inspect",{home:current.fmHome,captain},signal);
+      await raceAbort(bb.storage.kv.set(`native-runtime:${captain}`,inspected.selected??null),signal,STUCK_HOST_CALL_MS);
+    }
+    const selection=await raceAbort(bb.storage.kv.get<{root:string}>(`native-runtime:${captain}`),signal,STUCK_HOST_CALL_MS);
+    const root=selection?.root??current.fmHome;
+    if (!resource) {
+      const catalog=await nativePolicyLookup(host,root,{operation:'catalog'},signal);
+      const skills=nativeDescriptions(catalog.entries!);
+      const inventory={diagnostic:true,commit:catalog.commit,root:catalog.root,skills};
+      await raceAbort(settings.experimental_set({fmSkillsManifest:JSON.stringify({schema:2,head:catalog.commit,skills:skills.map(({name,description})=>({name,desc:description}))})}),signal,STUCK_HOST_CALL_MS);
+      const text=JSON.stringify(inventory,null,2);
+      return paged || cursor ? skillPage(text,JSON.stringify([captain,current.fmHome,host,catalog.root,catalog.commit]),request,cursor) : text;
+    }
+    const record=await nativePolicyLookup(host,root,{operation:'read',...resource},signal);
+    const file=await raceAbort(bb.sdk.files.read({hostId:host,path:`${root}/${resource.path}`}),signal,STUCK_HOST_CALL_MS);
+    if (!('content' in file)) throw new Error('Complete native policy file content unavailable');
+    const data=Buffer.from(file.content,file.contentEncoding==='base64'?'base64':'utf8');
+    if (data.length!==record.sizeBytes || createHash('sha256').update(data).digest('hex')!==record.sha256) throw new Error('Native policy changed or was truncated during file transfer; read remains unresolved');
+    const text=`Native policy @ ${record.commit}: ${record.root}/${record.path}${record.fragment?'#'+record.fragment:''}\nSource file (--source): ${record.path}\n\n${data.toString('utf8')}`;
+    return paged || cursor ? skillPage(text,JSON.stringify([captain,current.fmHome,host,record.root,record.commit]),request,cursor) : text;
   }
 
   async function checkToolchain(hostId: string, fmHome: string, signal?: AbortSignal) {
@@ -8403,7 +9474,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const output = [body, "Browser: use /browser with browser_script or bb browser script; leave profileId unset."].join("\n");
     return {
-      ready: !/^(MISSING:|BACKEND_INVALID:)/m.test(output),
+      ready: !/^(MISSING:|MISSING_MANUAL:|BACKEND_INVALID:)/m.test(output),
       presentationReady: !/^PRESENTATION_UNAVAILABLE:/m.test(output),
       output,
     };
@@ -8428,36 +9499,88 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_contract",
-    description: "Read the current native Firstmate supervisor contract and the BB runtime adaptations. Without section: the complete upstream contract verbatim. section=<number or title, comma-separated> reads those sections; section=\"all\" reads everything. Read before orchestrating and after an upstream update.",
+    description: "Read the native supervisor contract, complete selected-runtime skill trigger catalog and BB adaptations in bounded pages. Start without cursor, then follow EVERY returned cursor before orchestrating. Native bytes remain verbatim across pages. section selects sections; all selects the entire contract. Cursor pins the captain/home and verified snapshot; changed bytes require restarting. Repeat after an upstream update or lost context.",
     parameters: z.object({
       section: z.string().max(200).optional().describe('Contract section(s) by number or title, comma-separated (e.g. "7,8"), or "all".'),
+      cursor: z.string().max(1200).optional().describe("Exact continuation from previous page; omit section on continuation. Read every page in order."),
     }),
-    async execute({ section }, ctx) {
-      return readCaptainContract(ctx, section);
+    async execute({ section, cursor }, ctx) {
+      return readCaptainContract(ctx, section, true, cursor);
     },
   });
 
+  async function selectedMethods(ctx:unknown,input:{action:string;profile?:string;reason?:string;prSkillId?:string;name?:string;reference?:string;source?:string;cursor?:string},paged=true) {
+    if(!["status","enable","disable","read"].includes(input.action))throw new Error("Unknown methods action; use bb firstmate help methods.");
+    const identity=await supervisorCallerIdentity(ctx);
+    const role=identity?.worker?"worker":"captain";
+    if(input.action==="status") return {profile:methodsProfile,role,revision:METHODS_REVISION,prSkillId:selectedPrSource((await baseSettings.get()).selectedPrSource)?.id??null,reason:(await baseSettings.get()).selectedMethodsReason};
+    if(input.action==="enable" || input.action==="disable") {
+      await requireSupervisorCaller(ctx);
+      if(!identity || !metaFlag(identity.meta,"captain")) throw new Error("Methods selection requires the bound captain context.");
+      if(!input.reason?.trim()) throw new Error("Explicit installation selection requires its user-directed reason.");
+      if(input.action==="enable" && input.profile!==undefined && input.profile!==METHODS_PROFILE)throw new Error("Unknown selected methods profile.");
+      const profile=input.action==="enable"?METHODS_PROFILE:"off";
+      let sourceSelection:string|undefined;
+      if(input.prSkillId!==undefined){
+        if(input.action!=="enable")throw new Error("Select /pr only through methods enable.");
+        const signal=AbortSignal.any([launchAbort.signal,AbortSignal.timeout(STUCK_HOST_CALL_MS),...(asRecord(ctx)["signal"]?[asRecord(ctx)["signal"] as AbortSignal]:[])]);
+        const resolved=await installedPrResource(bb.sdk,identity.threadId,ctxString(ctx,"projectId"),signal,raceAbort,input.prSkillId);
+        sourceSelection=JSON.stringify(resolved.source);
+      }
+      await baseSettings.experimental_set({selectedMethods:profile,...(sourceSelection!==undefined?{selectedPrSource:sourceSelection}:{}),selectedMethodsReason:JSON.stringify({actor:identity.threadId,at:new Date().toISOString(),reason:input.reason})});
+      return {profile,revision:METHODS_REVISION};
+    }
+    if(methodsProfile!==METHODS_PROFILE)throw new Error("BB methods are not selected for this installation. Native defaults remain active.");
+    if(!identity || !identity.worker && !metaFlag(identity.meta,"captain"))throw new Error("Read selected methods from a bound captain or native worker role.");
+    const resumed=input.cursor?skillCursorRequest(input.cursor):undefined;
+    if(resumed && ((input.name!==undefined && input.name!==resumed.name) || (input.reference!==undefined && input.reference!==resumed.reference) || (input.source!==undefined && input.source!==resumed.source)))throw new Error("Method cursor resource differs from request.");
+    const request=resumed??{name:input.name??`${role}-methods`,...(input.reference!==undefined?{reference:input.reference}:{}),...(input.source!==undefined?{source:input.source}:{})};
+    let resource:{text:string;source?:PrSource}, externalIdentity:unknown=null;
+    if(request.name==="pr") {
+      if(!identity.worker || identity.meta.shape!=="ship" || identity.meta.posture!=="direct-PR")throw new Error("/pr belongs to the direct-PR ship body author; native pipeline/local-only ownership stays unchanged.");
+      if(request.reference!==undefined || request.source!==undefined)throw new Error("Read the resolved /pr entry body without method-relative references.");
+      const signal=AbortSignal.any([launchAbort.signal,AbortSignal.timeout(STUCK_HOST_CALL_MS),...(asRecord(ctx)["signal"]?[asRecord(ctx)["signal"] as AbortSignal]:[])]);
+      const selected=selectedPrSource((await baseSettings.get()).selectedPrSource);
+      const resolved=await installedPrResource(bb.sdk,identity.threadId,ctxString(ctx,"projectId"),signal,raceAbort,selected?.id);
+      if(selected && (resolved.source.revision!==selected.revision || resolved.source.sha256!==selected.sha256))throw new Error("Selected /pr source changed; reselect its verified current ID with an explicit installation selection reason before body writing.");
+      resource=resolved;externalIdentity=resolved.identity;
+    } else resource=methodResource(PLUGIN_ROOT,role,request.name!,request.reference,request.source);
+    const scope=JSON.stringify(["BB-methods",identity.threadId,identity.meta.nativeHome??null,role,methodsProfile,METHODS_REVISION,externalIdentity]);
+    if(!paged && !input.cursor)return resource.text;
+    const page=skillPage(resource.text,scope,request,input.cursor,"methods");
+    return resource.source?prSourcePage(page,resource.source,FIRSTMATE_ROUTINE_MARKER):page;
+  }
+  bb.agents.registerTool({
+    name:"firstmate_methods",description:"Read the explicitly selected installation's role-owned BB methods in bounded pages; native policy remains authoritative. Status is read-only. Enable/disable require a captain and an explicit user-directed selection reason.",
+    parameters:z.object({action:z.enum(["status","enable","disable","read"]).default("read"),profile:z.string().optional(),reason:z.string().max(1000).optional(),prSkillId:z.string().min(1).max(1000).optional(),name:z.string().optional(),reference:z.string().max(1000).optional(),source:z.string().max(1000).optional(),cursor:z.string().max(4096).optional()}),
+    presentation:{suppress:true},
+    async execute(input,ctx){try{const result=await selectedMethods(ctx,input);return markCaptainToolResult(typeof result==="string"?result:JSON.stringify(result));}catch(error){return markCaptainToolResult(toolError(error instanceof Error?error.message:String(error)));}}
+  });
+  registerCaptainTool({
+    name:"firstmate_skill",description:"Read verified native policy from this captain's selected runtime in bounded pages. Follow every returned cursor until END OF NATIVE SKILL TRANSPORT before applying it; no global copied policy fallback.",
+    parameters:z.object({name:z.string().optional().describe("Exact native skill name for the first page"),list:z.boolean().optional().describe("Inspect full diagnostic descriptions from the verified selected catalog; omit resource arguments"),reference:z.string().max(1000).optional().describe("Native relative link, including .. and #fragment inside selected runtime"),source:z.string().max(1000).optional().describe("Exact selected-root relative source file for nested links; default .agents/skills/<name>/SKILL.md"),cursor:z.string().max(4096).optional().describe("Exact continuation cursor; omit other arguments to continue the same verified resource")}),
+    async execute({name,reference,source,cursor,list},ctx){return readNativeSkill(ctx,name,reference,source,true,cursor,list);},
+  });
   registerCaptainTool({
     name: "firstmate_dispatch",
     description:
-      "Dispatch a firstmate-style crewmate: spawns a child BB thread for one task (ship crews get an isolated worktree by default) and records it as a crew.",
+      `Dispatch one native crewmate after intake; BB owns the brief→dispatch-resolve→backlog→guarded spawn sequence. ${DISPATCH_TRANSPORT}`,
     presentation: { label: { pending: "Dispatching crewmate", completed: "Dispatched crewmate" } },
     parameters: dispatchParams,
-    async execute({ task, projectId, title, providerId, model, reasoningLevel, permissionMode, shape, mode, worktree, sharedEnv, visible, sendAt, overrideOwner }, ctx) {
+    async execute({ task, taskId, projectId, title, providerId, model, reasoningLevel, permissionMode, shape, mode, branchPrefix,dispatchProfileReason,worktree, sharedEnv, visible, sendAt, deliveryRequirement, overrideOwner }, ctx) {
       const ctxRecord = asRecord(ctx);
       const resolvedProject =
         projectId ?? (typeof ctxRecord["projectId"] === "string" ? ctxRecord["projectId"] : undefined);
       if (resolvedProject === undefined) return toolError("No project: pass projectId.");
       const parentThreadId = typeof ctxRecord["threadId"] === "string" ? ctxRecord["threadId"] : undefined;
-      const capped = await crewCapRefusal(parentThreadId, 1);
-      if (capped !== null) return toolError(capped);
+
       if (overrideOwner !== true) {
         const conflict = await dispatchPrConflict(task, resolvedProject, parentThreadId);
         if (conflict !== null) return toolError(conflict);
       }
       const current = await settings.get();
       const resolvedShape = shape ?? "ship";
-      const posture = await postureOf(resolvedProject);
+      const posture = resolvedShape==="ship" ? await intakePosture(resolvedProject,ctx,mode) : await postureOf(resolvedProject);
       const wt = resolveWorktree({
         shape: resolvedShape,
         sharedEnv: sharedEnv === true,
@@ -8467,7 +9590,7 @@ export default async function plugin(bb: BbPluginApi) {
       let crew: Crew;
       try {
         crew = await dispatchCrew({
-          task,
+          task,crewId:taskId,
           projectId: resolvedProject,
           parentThreadId: typeof ctxRecord["threadId"] === "string" ? ctxRecord["threadId"] : undefined,
           title,
@@ -8478,12 +9601,13 @@ export default async function plugin(bb: BbPluginApi) {
           worktree: wt.worktree,
           visible: visible !== false,
           shape: resolvedShape,
-          mode: toMode(mode, posture.mode),
-          sendAt,
+          mode: toMode(mode, posture.mode),yolo:posture.yolo,
+          sendAt,deliveryRequirement,branchPrefix,dispatchProfileReason,signal:ctxRecord["signal"] as AbortSignal | undefined,
         });
       } catch (error) {
         return toolError(`Dispatch failed: ${error instanceof Error ? error.message : String(error)}`);
       }
+      if (isSecondmateRoute(crew)) return `Routed ${crew.shape} request ${crew.id} to secondmate thread ${crew.threadId}; child launch remains pending. Exact child intake is retained; this supervisor's execution is separate. Track with: bb firstmate crew ${crew.id}`;
       const warn = wt.sharedOverride ? " WARN: ship crew on shared env." : "";
       const status = await crewStatus(crew);
       if (status === "error") {
@@ -8495,21 +9619,12 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_deck",
-    description: "Mark this thread as the firstmate captain and return the session digest (memory, bearings, afk). Your own crews by default; pass all=true to see every captain's crews on the host.",
-    presentation: { label: { pending: "Taking the deck", completed: "On deck" } },
-    parameters: z.object({ all: z.boolean().optional().describe("Show every captain's crews host-wide, not just your own") }),
-    async execute({ all }, ctx) {
-      const record = asRecord(ctx);
-      const threadId = record["threadId"];
-      if (typeof threadId !== "string") return toolError("No thread to mark as captain.");
-      await markDeck(threadId);
-      await rememberWatchCaptain(ctx, threadId);
-      const signal = record["signal"] as AbortSignal | undefined;
-      const real = await ensureRealModeForDeck(ctx, signal);
-      let providerId = "";
-      try { providerId = (await bb.sdk.threads.get({ threadId })).providerId ?? ""; } catch { /* note is best-effort */ }
-      const note = unhookedCaptainNote(providerId);
-      return `Captain, on deck.\n${real}\n${await deckDigest(ctx, signal, all === true)}${note === "" ? "" : `\n\n${note}`}`;
+    instructions: CAPTAIN_ROLE_INSTRUCTIONS,
+    description: "Bind this captain to its exact native home and return the required agent-shell startup command; readiness is unverified until the native digest succeeds. Optional digest/all explicitly requests a fleet digest.",
+    presentation: { label: { pending: "Binding captain home", completed: "Home bound; verify native startup" } },
+    parameters: z.object({ all: z.boolean().optional().describe("Explicitly scan every captain's crews"), digest:z.boolean().optional().describe("Explicitly request the session/fleet digest before native startup") }),
+    async execute({ all,digest }, ctx) {
+      return (await takeDeck(ctx,asRecord(ctx)["signal"] as AbortSignal|undefined,all===true,digest===true)).text;
     },
   });
 
@@ -8524,12 +9639,13 @@ export default async function plugin(bb: BbPluginApi) {
       resolveKey: z.string().optional().describe("Key of the crew's open decision this steer answers (from crew/bearings); closes it in real state"),
       overCap: z.boolean().optional().describe("Wake an idle crew even past the running-crew cap (only on the captain's word)"),
     }),
-    async execute({ crewId, message, queue, resolveKey, overCap }) {
-      const crew = await findCrew(crewId);
+    async execute({ crewId, message, queue, resolveKey, overCap },ctx) {
+      const crew = await findCrew(crewId,ctxString(ctx,"threadId"));
       if (crew === undefined) return toolError(`No crew ${crewId}.`);
       try {
         const capped = await capRefusalToWake(crew, overCap === true);
         if (capped !== null) return toolError(capped);
+        await resumeRetainedAuthor(crew,ctxString(ctx,"threadId"));
         const sent = await tellCrew(crew, message, false, queue === true);
         if (resolveKey !== undefined && resolveKey.trim() !== "") {
           const closed = await appendResolvedStatus(crew, resolveKey.trim(), message);
@@ -8602,8 +9718,8 @@ export default async function plugin(bb: BbPluginApi) {
     name: "firstmate_deliver",
     description: "Crew delivery: outcome + committed/uncommitted diff + PR state.",
     parameters: z.object({ crewId: z.string() }),
-    async execute({ crewId }) {
-      const crew = await findCrew(crewId);
+    async execute({ crewId },ctx) {
+      const crew = await findCrew(crewId,ctxString(ctx,"threadId"));
       if (crew === undefined) return toolError(`No crew ${crewId}.`);
       return (await deliverLines(crew)).text;
     },
@@ -8624,7 +9740,7 @@ export default async function plugin(bb: BbPluginApi) {
         .describe("Land a crew/PR owned by another captain (only when the captain explicitly said so)"),
     }),
     async execute({ crewId, yes, allowRedCheck, allowMissingCheck, overrideOwner }, ctx) {
-      const crew = await findCrew(crewId);
+      const crew = await findCrew(crewId,ctxString(ctx,"threadId"),overrideOwner===true);
       if (crew === undefined) return toolError(`No crew ${crewId}.`);
       try {
         return await mergeCrew(crew, yes === true, allowRedCheck, allowMissingCheck, { caller: ctxString(ctx, "threadId"), overrideOwner: overrideOwner === true });
@@ -8748,31 +9864,34 @@ export default async function plugin(bb: BbPluginApi) {
   registerCaptainTool({
     name: "firstmate_retry",
     description:
-      "Re-run a crew. With no provider/model/reasoning override, re-submits the failed turn on the same thread. With any override, relaunches a fresh thread in the SAME worktree at the new provider/model/reasoning (recovery relaunch).",
+      "Re-run a crew. With no provider/model/reasoning override, re-submits the failed turn on the same thread. With any override, relaunches a fresh thread in the SAME worktree at the new provider/model/reasoning (recovery relaunch). Explicit intent=execution-change with user-directed reason validates a changed execution under its owner without consuming failure recovery allowance.",
     parameters: z.object({
       crewId: z.string(),
       reason: z.string().optional(),
       model: z.string().optional().describe("Replacement model — triggers a relaunch reusing the worktree"),
       providerId: z.string().optional().describe("Replacement provider — triggers a relaunch reusing the worktree"),
-      reasoningLevel: z.enum(["low", "medium", "high", "xhigh", "max"]).optional()
+      reasoningLevel: z.enum(["low", "medium", "high", "xhigh", "max", "ultra", "none", "ultracode"]).optional()
         .describe("Replacement reasoning effort — triggers a relaunch reusing the worktree"),
+      intent:z.enum(["failure-recovery","execution-change"]).optional().describe("execution-change requires an explicit user-directed reason and an actual validated change, under the owning captain; does not consume failure recovery allowance"),
       overCap: z.boolean().optional().describe("Retry even past the running-crew cap (only on the captain's word)"),
     }),
-    async execute({ crewId, reason, model, providerId, reasoningLevel, overCap }) {
-      const crew = await findCrew(crewId);
+    async execute({ crewId, reason, model, providerId, reasoningLevel, overCap,intent },ctx) {
+      const crew = await findCrew(crewId,ctxString(ctx,"threadId"));
       if (crew === undefined) return toolError(`No crew ${crewId}.`);
       const replace = model !== undefined || providerId !== undefined || reasoningLevel !== undefined;
       try {
-        const capped = await capRefusalToWake(crew, overCap === true);
-        if (capped !== null) return toolError(capped);
+        if (intent==='execution-change' && !replace) throw new Error("Execution change requires an explicit provider/model/reasoning override.");
         if (!replace) {
+          const capped = await capRefusalToWake(crew, overCap === true);
+          if (capped !== null) return toolError(capped);
+          await resumeRetainedAuthor(crew,ctxString(ctx,"threadId"));
           return await retryCrewTurn(crew, reason);
         }
         const next = await relaunchCrew(crew, {
           model,
           providerId,
           reasoningLevel: toReasoningLevel(reasoningLevel),
-          note: reason,
+          note: reason, overCap:overCap === true,intent,caller:ctxString(ctx,"threadId"),
         });
         return `Relaunched crew ${crewId} as thread ${next.threadId} (${next.providerId ?? "default provider"}/${next.model ?? "default model"}/${next.reasoningLevel ?? "default reasoning"}), same worktree.`;
       } catch (error) {
@@ -8780,6 +9899,9 @@ export default async function plugin(bb: BbPluginApi) {
       }
     },
   });
+
+  registerCaptainTool({ name:"firstmate_deliveries",description:"Durable PR health and obligations independent of worker retention. List, inspect, register, reconcile, account each independent failure to an existing authorized follow-up, explicitly assign, abandon with authority, or record agreed merge verification.",parameters:deliveryParams,
+    async execute(input,ctx) { return (await deliveryOperation(input,ctx)).map(deliveryLine).join("\n") || "No unresolved deliverables."; } });
 
   registerCaptainTool({
     name: "firstmate_promote",
@@ -8789,9 +9911,9 @@ export default async function plugin(bb: BbPluginApi) {
       const scout = await findCrew(crewId);
       if (scout === undefined) return toolError(`No crew ${crewId}.`);
       if (scout.shape !== "scout") return toolError(`Crew ${crewId} is ${scout.shape}, not scout.`);
-      const report = (await crewOutput(scout, 2000)) ?? "(no scout report)";
+      const report = await scoutPromotionReport(scout, ctxString(ctx, "threadId"));
       const current = await settings.get();
-      const posture = await postureOf(scout.projectId);
+      const posture = await intakePosture(scout.projectId,ctx,mode);
       const ctxRecord = asRecord(ctx);
       const ship = await dispatchCrew({
         task: `Captain's intent: implement the scout's recommended path. Do not reopen the investigation.\nAcceptance: the scout report's recommendation, nothing else.\n\nFirstmate spec: follow the report. Out of scope: extra hardening not named there.\n\nScout report (crew ${scout.id}):\n${report}`,
@@ -8803,7 +9925,8 @@ export default async function plugin(bb: BbPluginApi) {
         worktree: true,
         visible: true,
         shape: "ship",
-        mode: toMode(mode, posture.mode),
+        mode: toMode(mode, posture.mode),yolo:posture.yolo,
+        deliveryRequirement:await contractForCrew(scout),
       });
       await recordDone({
         task: scout.task.slice(0, 200),
@@ -8922,9 +10045,9 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_queue",
-    description: "Backlog with deps/time gates. add files work (with the crew's providerId/model/reasoningLevel); dispatch starts a crew when ungated — also for a queued row filed straight into the native backlog. drop/done also close a native backlog row that has no queue item; prune forgets finished (done/dropped) queue items.",
+    description: "Backlog with deps/time gates. add files work (with the crew's providerId/model/reasoningLevel); dispatch starts a crew when ungated — also for a queued row filed straight into the native backlog. drop/done also close a native backlog row that has no queue item; prune forgets finished (done/dropped) queue items. reconcile repairs exact native publication or existing admitted worker registration without launching; native-only queued repair requires the original full contract.",
     parameters: z.object({
-      action: z.enum(["add", "list", "next", "dispatch", "done", "drop", "prune"]),
+      action: z.enum(["add", "list", "next", "dispatch", "done", "drop", "prune", "reconcile"]),
       title: z.string().optional(),
       projectId: z.string().optional(),
       queueId: z.string().optional(),
@@ -8935,13 +10058,20 @@ export default async function plugin(bb: BbPluginApi) {
       detail: z.string().optional(),
       providerId: z.string().optional().describe("Crew provider (add: stored for dispatch; dispatch: overrides the stored one)"),
       model: z.string().optional().describe("Crew model (add: stored; dispatch: overrides)"),
-      reasoningLevel: z.enum(["low", "medium", "high", "xhigh", "max"]).optional()
+      reasoningLevel: z.enum(["low", "medium", "high", "xhigh", "max", "ultra", "none", "ultracode"]).optional()
         .describe("Crew reasoning effort (add: stored; dispatch: overrides)"),
+      deliveryRequirement:z.enum(["branch","pr","merged","merged-and-verified"]).optional(),
+      branchPrefix:z.string().max(120).optional(),dispatchProfileReason:z.string().min(1).max(1000).optional(),
     }),
-    async execute({ action, title, projectId, queueId, shape, mode, after, waitUntil, detail, providerId, model, reasoningLevel }, ctx) {
+    async execute({ action, title, projectId, queueId, shape, mode, after, waitUntil, detail, providerId, model, reasoningLevel, deliveryRequirement,branchPrefix,dispatchProfileReason }, ctx) {
       const items = (await readQueue()).filter(row => ownedByScopedCaptain(row.parentThreadId));
       const ctxProject = ctxString(ctx, "projectId");
       const captain = ctxString(ctx, "threadId");
+      if (action === "reconcile") {
+        if (!queueId) return toolError("Need exact queueId.");
+        const row=await reconcileQueue(queueId,projectId??ctxProject,captain,{title,detail,mode,deliveryRequirement,providerId,model,reasoningLevel,blockedBy:after,waitUntil});
+        return `Reconciled queue ${row.id} [${row.status}]${row.crewId?` with existing crew ${row.crewId}; no turn started`:''}.`;
+      }
       if (action === "list") {
         const now = Date.now();
         const kvIds = new Set(items.flatMap((q) => [q.id, q.backlogId ?? ""]));
@@ -8951,7 +10081,7 @@ export default async function plugin(bb: BbPluginApi) {
         if (live.length === 0 && real.length === 0) return "Queue empty.";
         return [
           ...live.map((q) => {
-            const gate = q.status === "queued" ? queueGate(q, items, now) : null;
+            const gate = q.status === "queued" ? storedQueueGate(q, items, now) : null;
             return `${q.id} [${q.status}] ${q.shape} :: ${truncate(q.title, 70)}${gate !== null ? ` — ${gate}` : ""}${q.crewId !== null ? ` (crew ${q.crewId})` : ""}`;
           }),
           ...real.map((r) => `${r.id} [queued] ${r.kind || "task"} :: ${truncate(r.title, 70)} — native backlog row`),
@@ -8959,7 +10089,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
       if (action === "next") {
         const now = Date.now();
-        const open = items.filter((q) => q.status === "queued" && queueGate(q, items, now) === null);
+        const open = items.filter((q) => q.status === "queued" && storedQueueGate(q, items, now) === null);
         if (open.length === 0) return "Nothing dispatchable.";
         const first = [...open].reverse()[0] as QueueItem;
         return `${first.id} [${first.shape}] ${first.projectId} :: ${first.title}`;
@@ -8973,13 +10103,13 @@ export default async function plugin(bb: BbPluginApi) {
         } catch (error) {
           return toolError(error instanceof Error ? error.message : String(error));
         }
+        validateQueueText(title, detail ?? "");
         const newId = randomUUID().slice(0, 8);
-        const proj = await projectQueueAdd(newId, title, shape ?? "ship", pid);
         const item: QueueItem = {
           nativeHome: (await settings.get()).fmHome,
           id: newId,
-          title: title.slice(0, 500),
-          detail: (detail ?? "").slice(0, MAX_TASK),
+          title,
+          detail: detail ?? "",
           projectId: pid,
           shape: shape ?? "ship",
           mode: mode ?? "",
@@ -8987,47 +10117,49 @@ export default async function plugin(bb: BbPluginApi) {
           ...(providerId !== undefined && providerId !== "" ? { providerId } : {}),
           ...(model !== undefined && model !== "" ? { model } : {}),
           ...(reasoningLevel !== undefined ? { reasoningLevel } : {}),
+          deliveryRequirement:mode ? taskDelivery(mode,deliveryRequirement,shape??'ship') : deliveryRequirement,branchPrefix,dispatchProfileReason,
           waitUntil: waitUntil ?? null,
           status: "queued",
           crewId: null,
           parentThreadId: captain ?? null,
-          ...(proj.ok ? { backlogId: newId } : {}),
+          ...(await queueIsReal() ? {nativePending:true} : {}),
           createdAt: new Date().toISOString(),
         };
-        await writeQueue([item, ...items]);
+        queueStore.add(item);
+        await publishQueueAdd(item);
         await publishFleet();
         return `Queued ${item.id} [${item.shape}] :: ${truncate(item.title, 80)}`;
       }
       if (action === "prune") {
         const kept = items.filter((q) => !isFinishedQueueItem(q));
-        await writeQueue(kept);
+        queueStore.transform(row => ownedByScopedCaptain(row.parentThreadId) && isFinishedQueueItem(row), () => null);
         await publishFleet();
         return `Pruned ${items.length - kept.length} finished queue item(s).`;
       }
-      let item = items.find((q) => q.id === queueId);
+      let item = findQueueItem(items,queueId,projectId??ctxProject);
       let adopted = false;
       if (item === undefined && queueId !== undefined && (action === "dispatch" || action === "drop" || action === "done")) {
         // A row filed straight into the native backlog: adopt it into the queue. Closing one
         // needs no queue item afterwards, so drop/done never persist the adopted copy.
         const row = await adoptRealBacklogRow(queueId, projectId ?? ctxProject, captain, action === "dispatch");
-        if (row !== null) { item = row; adopted = true; if (action === "dispatch") items.unshift(row); }
+        if (row !== null) { item = row; adopted = true; if (action === "dispatch") { queueStore.add(row); items.unshift(row); } }
       }
       if (queueId === undefined || item === undefined) return toolError(`No queued item ${queueId ?? ""}.`);
       if (action === "drop" || action === "done") {
         item.status = action === "drop" ? "dropped" : "done";
         await projectQueueTransition(item, action === "drop" ? "rm" : "done");
-        if (!adopted) await writeQueue(items);
+        if (!adopted) queueStore.patch(item, {status:item.status});
         await publishFleet();
         return `Queue ${queueId} ${item.status}${adopted ? " (native backlog row)" : ""}`;
       }
-      const gate = queueGate(item, items, Date.now());
+      const gate = storedQueueGate(item, items, Date.now());
       if (gate !== null) return toolError(`Item ${queueId} gated: ${gate}.`);
       // Queue dispatch starts a crew like any dispatch, so the same cap applies.
-      const capped = await crewCapRefusal(captain, 1);
-      if (capped !== null) return toolError(capped);
-      const registry = await postureOf(item.projectId);
+
+      const registry = item.shape==="ship" ? await intakePosture(item.projectId,ctx,item.mode ? modeSchema.parse(item.mode) : undefined) : await postureOf(item.projectId);
       const current = await settings.get();
       const brief = item.detail !== "" ? `${item.title}\n\n${item.detail}` : item.title;
+      if (brief.length > MAX_TASK) throw new Error(`Queue task ${item.id} exceeds ${MAX_TASK} characters; full record retained, dispatch refused.`);
       let crew: Crew;
       try {
         crew = await dispatchCrew({
@@ -9039,11 +10171,12 @@ export default async function plugin(bb: BbPluginApi) {
           providerId: providerId ?? item.providerId ?? (current.defaultProvider !== "" ? current.defaultProvider : undefined),
           model: model ?? item.model,
           reasoningLevel: toReasoningLevel(reasoningLevel ?? item.reasoningLevel),
+          deliveryRequirement:item.deliveryRequirement,branchPrefix:item.branchPrefix,dispatchProfileReason:dispatchProfileReason ?? item.dispatchProfileReason,
           permissionMode: toPermissionMode(current.defaultPermissionMode),
           worktree: resolveWorktree({ shape: item.shape }).worktree,
           visible: true,
           shape: item.shape,
-          mode: toMode(item.mode !== "" ? item.mode : undefined, registry.mode),
+          mode: toMode(item.mode !== "" ? item.mode : undefined, registry.mode),yolo:registry.yolo,
         });
       } catch (error) {
         return toolError(`Queue dispatch ${queueId} failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -9055,7 +10188,7 @@ export default async function plugin(bb: BbPluginApi) {
       // here would double-transition, so only start when the plugin owns the transition
       // (native transport, or real fell back to native).
       if (current.transport !== "real") await projectQueueTransition(item, "start");
-      await writeQueue(items);
+      queueStore.patch(item, {status:item.status,crewId:item.crewId});
       await publishFleet();
       const status = await crewStatus(crew);
       const failure = status === "error" ? await threadFailureDetail(crew.threadId) : "";
@@ -9158,32 +10291,12 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   registerCaptainTool({
-    name: "firstmate_posture",
-    description: "Per-project delivery mode (direct-PR / no-mistakes / local-only) and yolo merge authority.",
-    parameters: z.object({
-      action: z.enum(["get", "set"]),
-      projectId: z.string().optional(),
-      mode: modeSchema.optional(),
-      yolo: z.boolean().optional(),
-    }),
-    async execute({ action, projectId, mode, yolo }, ctx) {
-      const pid = projectId ?? ctxString(ctx, "projectId");
-      const all = await readPostures();
-      if (action === "get") {
-        if (pid === undefined) {
-          const keys = Object.keys(all);
-          if (keys.length === 0) return "No postures set (default everywhere: direct-PR, yolo off).";
-          return keys.map((k) => `${k}: ${all[k]?.mode}${all[k]?.yolo ? "+yolo" : ""}`).join("\n");
-        }
-        const p = all[pid] ?? { mode: "direct-PR" as DeliveryMode, yolo: false };
-        return `Posture ${pid}: ${p.mode}${p.yolo ? "+yolo" : ""}`;
-      }
-      if (pid === undefined) return toolError("Need projectId.");
-      const cur = all[pid] ?? { mode: "direct-PR" as DeliveryMode, yolo: false };
-      const next = { mode: toMode(mode, cur.mode), yolo: yolo ?? cur.yolo };
-      all[pid] = next;
-      await bb.storage.kv.set(POSTURES_KEY, all);
-      return `Posture ${pid}: ${next.mode}${next.yolo ? "+yolo" : ""}`;
+    name:"firstmate_posture",description:"Read actual native registry plus BB posture and standing merge-authority provenance. Explicit set records the owning captain’s current user-directed posture; task-specific mode does not rewrite registry.",
+    parameters:z.object({action:z.enum(["get","set"]),projectId:z.string().optional(),mode:modeSchema.optional(),yolo:z.boolean().optional().describe("Captain-approved standing authority only; not a fresh approval requirement"),reason:z.string().optional().describe("Current user override/reason; required for changing registered mode")}),
+    async execute({action,projectId,mode,yolo,reason},ctx){
+      const pid=projectId??ctxString(ctx,"projectId");if (!pid) return JSON.stringify(await readPostures());
+      if(action==="get")return JSON.stringify(await postureContext(pid,ctx),null,2);
+      return JSON.stringify(await setPosture(pid,mode,yolo,reason,ctx));
     },
   });
 
@@ -9252,6 +10365,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (current.fmHome === "") return toolError("No firstmate home. Run bb firstmate init --real.");
       try {
         const startup = captainStartupCommand(current.fmHome, script, args ?? []);
+        if (startup!==null && current.fullParityOnDeck && !homeScope.getStore()?.home) return toolError("Native startup requires a bound captain home. Call firstmate_deck or bb firstmate deck; shared-home fallback refused.");
         if (startup !== null) return `BB startup transport: run this exact command through your agent's shell tool, which runs under the harness. The host-terminal RPC cannot provide that ancestry. No native startup or lock acquisition has been attempted by this tool.\n\n${startup}`;
         const hostId = await resolveHostId(undefined, ctx);
         const result = await runFmScript({
@@ -9279,33 +10393,78 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
+  async function runtimeForContext(ctx:unknown,action:"status"|"install"|"select"|"migrate"|"rollback",release?:string,check=false,machine?:string) {
+    const captain=ctxString(ctx,"threadId");
+    const signal=asRecord(ctx)["signal"] as AbortSignal|undefined;
+    if(captain) {
+      const metadata=await raceAbort(bb.sdk.threads.getPluginMetadata({threadId:captain,signal}),signal,STUCK_HOST_CALL_MS);
+      if(metaFlag(asRecord(metadata),"crew"))throw new Error("Worker threads cannot install, select or migrate captain runtimes.");
+    }
+    const home=captain?await bb.storage.kv.get<string>(`native-home:${captain}`):null;
+    const boundHost=captain?await bb.storage.kv.get<string>(`native-home-host:${captain}`):null;
+    const host=boundHost||await resolveHostId(machine,ctx);
+    if(machine && boundHost && machine!==boundHost)throw new Error("Runtime host selection differs from the owning captain home.");
+    if(captain) {
+      const environmentId=await threadEnv(captain,signal);
+      if(!environmentId)throw new Error("Runtime operation requires this thread's authoritative environment/host.");
+      const environment=await raceAbort(bb.sdk.environments.get({environmentId,signal}),signal,STUCK_HOST_CALL_MS);
+      if(environment.hostId!==host)throw new Error("Runtime operation host differs from the captain environment; no cross-host path use.");
+    }
+    if(action!=="status" && action!=="install") {
+      if(!captain || !home || !boundHost || !await isCaptainThread(captain))throw new Error("Runtime selection requires the owning bound captain; call deck first. No ownership transfer.");
+      if(!release || !( /^[0-9a-f]{64}$/.test(release) || action==="rollback" && release==="external"))throw new Error("Specify one exact installed release ID from runtime status; rollback external is allowed only for a recorded external migration.");
+      if(launches.hasRuntimeConsumers(captain))throw new Error("Runtime selection refused while this captain has running/reserved/uncertain launches; reconcile them first without respawning.");
+    }
+    if(check && (action==="status" || action==="install"))throw new Error("--check is supported only for runtime select/migrate/rollback.");
+    if(release && action==="install")throw new Error("runtime install stages this plugin release; it does not accept an alternative release ID.");
+    const pendingKey=`runtime-selection-pending:${captain??''}`;
+    const pending=await bb.storage.kv.get<Record<string,unknown>>(pendingKey);
+    const mutation=action!=="install" && action!=="status" && !check;
+    if(mutation && pending && (pending["release"]!==release || pending["action"]!==action))throw new Error("An earlier runtime selection remains unresolved; inspect runtime status before choosing another release.");
+    if(mutation && !pending)await bb.storage.kv.set(pendingKey,{action,release,previous:await bb.storage.kv.get(`native-runtime:${captain}`),startedAt:Date.now()});
+    const result=await nativeRuntime.operation(host,action,{home:home??undefined,captain:home?captain:undefined,release,check},signal);
+    if(action==="status" && pending && captain && result.selectionCompatible===true) {
+      // A status read is authoritative after publication/response/KV failures.
+      await bb.storage.kv.set(`native-runtime:${captain}`,result.selected??null);
+      await bb.storage.kv.delete(pendingKey);
+    }
+    if(action!=="install" && action!=="status" && !check && captain) {
+      await bb.storage.kv.set(`native-runtime:${captain}`,result.selection??null);
+      await bb.storage.kv.delete(`captain-adapter-setup:${captain}`);
+      await bb.storage.kv.delete(pendingKey);
+    }
+    return {host,...result,pendingSelection:await bb.storage.kv.get(pendingKey)??null};
+  }
+  registerCaptainTool({name:"firstmate_runtime",description:"Inspect installed versus selected native runtime. Install a pinned release or explicitly check/select/migrate/rollback this owning captain's quiescent home; no worker turns or task-state changes.",
+    parameters:z.object({action:z.enum(["status","install","select","migrate","rollback"]).default("status"),release:z.string().regex(/^(?:[0-9a-f]{64}|external)$/).optional(),check:z.boolean().optional()}),
+    async execute({action,release,check},ctx){try{return JSON.stringify(await runtimeForContext(ctx,action,release,check));}catch(error){return toolError(error instanceof Error?error.message:String(error));}}
+  });
+
   bb.agents.configure((context) => {
     const meta = asRecord(context.pluginMetadata);
     if (metaFlag(meta, "crew")) {
       return {
-        tools: [],
+        tools: methodsProfile===METHODS_PROFILE?["firstmate_methods"]:[],
         skills: [],
         instructions:
-          `The native launch brief owns this worker role and policy. BB crew threads have no captain tools or skills. ${nativeWorkerTransport(typeof meta["nativeHome"] === "string" ? meta["nativeHome"] : "", typeof meta["crewId"] === "string" ? meta["crewId"] : "<task-id>")}`,
+          "The native launch brief owns this worker role, BB transport and task policy. BB crew threads have no captain tools or skills. Follow that brief and its exact-ID steering inbox procedure. Do not delegate or change the selected provider, model, or effort. Worker completion is a handoff, not captain merge or deployment completion."+(methodsProfile===METHODS_PROFILE?" "+methodPointer("worker")+(meta.shape==="ship" && meta.posture==="direct-PR"?" Before creating or updating a PR body, read the actual workspace /pr skill using firstmate_methods action=read name=pr, following every cursor. Missing /pr leaves body writing pending; report that missing dependency.":""):""),
       };
     }
     const marked = metaFlag(meta, "captain");
     const base = marked
-      ? `${CAPTAIN_CONTRACT_POINTER} ${BB_SKILL_RUNTIME_CONTRACT}`
+      ? `${CAPTAIN_CONTRACT_POINTER} ${BB_SKILL_RUNTIME_CONTRACT}${methodsProfile===METHODS_PROFILE?" "+methodPointer("captain"):""}`
       : "Firstmate crews are available. Run /captain or firstmate_deck to take the deck.";
-    // The complete contract is a tool read; reserve the SDK window for pointers
-    // and recall. Divide the remaining space so neither memory nor skills vanish.
+    // The complete contract and selected native skills are tool reads. Reserve
+    // the SDK window for transport pointers and existing user memory.
     const remaining = Math.max(0, 4096 - base.length - 4);
     const memoryBudget = Math.floor(remaining * 0.6);
-    const skillsBudget = remaining - memoryBudget;
     const memoryBlock = marked && !meta["nativeHome"] && captainMemoryCache !== ""
       ? `\n\n${truncate(captainMemoryCache, memoryBudget)}` : "";
-    const skillsBlock = marked && skillsManifestCache !== ""
-      ? `\n\n${truncate(skillsManifestCache, skillsBudget)}` : "";
+    const skillsBlock = ""; // Selected native policy is read through firstmate_skill, never the global manifest cache.
     const instructions = truncate(`${base}${memoryBlock}${skillsBlock}`, 4096);
     return {
-      tools: [...CAPTAIN_TOOLS],
-      skills: marked ? [...CAPTAIN_SKILLS] : ["firstmate"],
+      tools: marked ? [...CAPTAIN_TOOLS,...(methodsProfile===METHODS_PROFILE?["firstmate_methods"]:[])] : [...CAPTAIN_BOOTSTRAP_TOOLS],
+      skills: marked ? [...CAPTAIN_SKILLS] : [...CAPTAIN_BOOTSTRAP_SKILLS],
       instructions,
     };
   });
@@ -9634,6 +10793,7 @@ export default async function plugin(bb: BbPluginApi) {
     lastAssistantText: string | null,
   ): Promise<void> {
     if (isSecondmateRoute(crew)) return;
+    await discoverCrewDelivery(crew).catch(error => bb.log.warn(`PR discovery ${crew.id}: ${String(error)}`));
     const stopped = await turnWasStopped(thread);
     // BB already reports interruptions to the parent. A completion wake here can
     // cause the manager to resume work the user just stopped.
@@ -9760,21 +10920,43 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   const CAPTAIN_COMPACT_COOLDOWN_MS = 20 * 60_000;
+  const compactionChecks = new Set<string>();
   async function maybeCompactThread(threadId: string, stampKey: string, signal?: AbortSignal): Promise<void> {
+    if (compactionChecks.has(threadId)) return;
+    compactionChecks.add(threadId);
+    try { await checkThreadCompaction(threadId, stampKey, signal); }
+    finally { compactionChecks.delete(threadId); }
+  }
+
+  async function checkThreadCompaction(threadId: string, stampKey: string, signal?: AbortSignal): Promise<void> {
     const budget = Number((await settings.get()).captainCompactAtTokens);
     if (!(budget > 0)) return;
     const key = stampKey;
     const last = await bb.storage.kv.get<unknown>(key);
-    let usedTokens: number | null = null;
+    let usage: Awaited<ReturnType<typeof bb.sdk.threads.context>>["usage"];
     try {
-      usedTokens = (await raceAbort(bb.sdk.threads.context({ threadId }), signal, STUCK_HOST_CALL_MS)).usage?.usedTokens ?? null;
+      usage = (await raceAbort(bb.sdk.threads.context({ threadId }), signal, STUCK_HOST_CALL_MS)).usage;
     } catch (error) {
       if (isAbortError(error)) throw error;
       return;
     }
+    if (!usage) return;
+    const { usedTokens, modelContextWindow, estimated } = usage;
+    const nativeThreshold = usage.snapshot?.autoCompactAtTokens;
+    if (typeof nativeThreshold === "number" && Number.isFinite(nativeThreshold) && nativeThreshold > 0) return;
+    const evidenceKey = `thread-compaction-evidence:${threadId}`;
+    if (estimated === false && Number.isFinite(usedTokens) && usedTokens >= 0 && Number.isFinite(modelContextWindow) && modelContextWindow > 0 && usedTokens < modelContextWindow * 0.9) {
+      await bb.storage.kv.delete(evidenceKey);
+    }
     const now = Date.now();
-    if (!captainCompactDue({ usedTokens, budget, lastCompactAt: typeof last === "number" ? last : null, now, cooldownMs: CAPTAIN_COMPACT_COOLDOWN_MS })) return;
-    // Stamp first: a provider that cannot compact must not be retried on every idle.
+    if (!captainCompactDue({ usedTokens, modelContextWindow, estimated, budget, lastCompactAt: typeof last === "number" ? last : null, now, cooldownMs: CAPTAIN_COMPACT_COOLDOWN_MS })) return;
+    const evidence = JSON.stringify([usedTokens, modelContextWindow, usage.snapshot?.providerSessionId ?? null, usage.snapshot?.capturedAt ?? null]);
+    if (await bb.storage.kv.get(evidenceKey) === evidence) return;
+    const thread = await raceAbort(bb.sdk.threads.get({ threadId }), signal, STUCK_HOST_CALL_MS);
+    if (thread.status !== "idle" || thread.archivedAt != null) return;
+    // Persist the attempted reading before calling the provider so a reload or
+    // unchanged failed attempt cannot compact the same context again.
+    await bb.storage.kv.set(evidenceKey, evidence);
     await bb.storage.kv.set(key, now);
     try {
       await raceAbort(bb.sdk.threads.compact({ threadId }), signal, STUCK_HOST_CALL_MS);
@@ -9893,28 +11075,34 @@ export default async function plugin(bb: BbPluginApi) {
     summary: "Run firstmate-style crews: dispatch crewmate threads, track them, bring back results",
     commands: [
       { name: "guide", summary: "Setup guide for firstmate inside BB", usage: "bb firstmate guide [--json]" },
-      { name: "init", summary: "Native deck setup (add --real to clone firstmate and overlay the BB backend)", usage: "bb firstmate init [--real] [--json]" },
-      { name: "contract", summary: "Read the full native supervisor contract (or named sections)", usage: "bb firstmate contract [section,...]" },
+      { name: "runtime", summary: "Pinned native runtime status, installation and explicit selection", usage: "bb firstmate runtime status|install|select|migrate|rollback [release-id] [--check] [--json]" },
+      { name: "init", summary: "Native deck setup (add --real for the bundled runtime or an existing explicit external home)", usage: "bb firstmate init [--real] [--json]" },
+      { name: "contract", summary: "Read the complete native contract and trigger catalog; follow every cursor in bounded mode", usage: "bb firstmate contract [section,...] [--paged | --cursor <cursor>] [--json]" },
       { name: "toolchain", summary: "Check native AXI and Lavish dependencies without mutations", usage: "bb firstmate toolchain [--json]" },
       { name: "scripts", summary: "List + verify every installed fm-* script", usage: "bb firstmate scripts [query] [--json]" },
-      { name: "fm", summary: "Run a real firstmate bin/ script with FM_BACKEND=bb", usage: "bb firstmate fm [--timeout s] <script> [args...]" },
-      { name: "deck", summary: "Mark this thread captain + session digest", usage: "bb firstmate deck [--json]" },
+      { name: "fm", summary: "Run a real firstmate bin/ script with FM_BACKEND=bb", usage: FM_WRAPPER_HELP },
+      { name: "deck", summary: "Bind native home and return agent-shell startup (not ready until native digest)", usage: "bb firstmate deck [--digest|--all] [--json]" },
       { name: "session", summary: "Session digest: memory + bearings + afk", usage: "bb firstmate session [--json]" },
-      { name: "dispatch", summary: "Dispatch crewmate child threads", usage: 'bb firstmate dispatch --project <id> -- "<task>"' },
+      { name:"methods",summary:"Status or explicit installation selection; bounded role-owned method reads",usage:"bb firstmate methods status | enable selected-v1 --reason <user-selection> [--pr-skill <exact-skill-id>] | disable --reason <reason> | read [captain-methods|worker-methods|pr] [relative-reference] [--source <source>] [--paged|--cursor <cursor>] [--json]" },
+      { name:"skill", summary:"Read selected native policy or diagnostic descriptions without mixing runtime versions", usage:"bb firstmate skill <name> [relative-reference] [--source <selected-root source-file>] [--paged] [--json]; skill --cursor <cursor>; skill --list [--paged] [--json]" },
+      { name: "dispatch", summary: "Dispatch crewmate child threads", usage: dispatchHelp },
       { name: "crews", summary: "List recorded crews with live status", usage: "bb firstmate crews [--json]" },
       { name: "crew", summary: "Show one crew with last output", usage: "bb firstmate crew <crew-id> [--json]" },
       { name: "watch", summary: "Wait for crews via bb thread wait", usage: "bb firstmate watch [crew-id ...] [--timeout <sec>] [--json]" },
       { name: "tell", summary: "Steer a running crew mid-turn (course correction); --queue for a non-urgent note", usage: 'bb firstmate tell <crew-id> [--queue] [--resolve-key <key>] -- "<message>"' },
       { name: "interrupt", summary: "Steer a hard stop without teardown", usage: "bb firstmate interrupt <crew-id>" },
       { name: "stop", summary: "Stop a crew thread", usage: "bb firstmate stop <crew-id>" },
-      { name: "retry", summary: "Re-submit a failed turn, or relaunch with a new model/provider/reasoning", usage: "bb firstmate retry <crew-id> [--model m] [--provider p] [--reasoning-level l]" },
+      { name: "retry", summary: "Retry failure, or explicitly change execution under the owning captain with a user-directed reason", usage: "bb firstmate retry <crew-id> [--model m] [--provider p] [--reasoning-level l] [--intent execution-change --reason r]" },
       { name: "activity", summary: "Bounded real BB activity for the native watcher", usage: "bb firstmate activity <thread-id> --json" },
       { name: "bearings", summary: "Fleet digest", usage: "bb firstmate bearings [--json]" },
       { name: "wake", summary: "Drain the durable crew→captain wake queue (present, or --ack-through <seq> --recovery-generation <gen>)", usage: "bb firstmate wake [--ack-through <seq> --recovery-generation <gen>]" },
+      { name: "deliveries", summary: "Durable PR health and follow-up", usage: "bb firstmate deliveries list|inspect|register|reconcile|assign|abandon|verify [id] [--from <manager>] [--reason <evidence>] [--authorized]\nbb firstmate deliveries account <id> --failure <id> --scope author|baseline --follow-up-task <existing-task> --reason <evidence> --authorized" },
+      { name: "launches", summary: "Inspect reservations or explicitly adopt an existing legacy worker", usage: "bb firstmate launches list | adopt <task-id> --thread <thread-id> [--check] [--json]" },
       { name: "deliver", summary: "Outcome + committed/uncommitted diff + PR", usage: "bb firstmate deliver <crew-id>" },
       { name: "merge", summary: "Merge PR or local-only ff-only land", usage: "bb firstmate merge <crew-id> [--yes]" },
+      { name:"scout-report",summary:"Read the complete owned promotion artifact",usage:"bb firstmate scout-report <id> [--json]" },
       { name: "promote", summary: "Scout → new ship carrying the report", usage: "bb firstmate promote <crew-id>" },
-      { name: "queue", summary: "Backlog with deps/time gates; drop/done close a native row too, prune forgets finished items", usage: 'bb firstmate queue add --project <id> -- "<title>"' },
+      { name: "queue", summary: "Backlog with deps/time gates; reconcile restores exact native linkage without launching; prune forgets finished items", usage: queueHelp },
       { name: "decide", summary: "Durable decisions", usage: 'bb firstmate decide ask -- "<question>"' },
       { name: "posture", summary: "Per-project delivery mode + yolo", usage: "bb firstmate posture set --project <id> [--mode m]" },
       { name: "memory", summary: "Captain prefs + learnings", usage: "bb firstmate memory show" },
@@ -9923,13 +11111,19 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "secondmate", summary: "Register a domain captain thread", usage: "bb firstmate secondmate list|register|drop" },
       { name: "supervision", summary: "Event pings + stuck checker", usage: "bb firstmate supervision on|off|status" },
       { name: "forget", summary: "Drop a crew record", usage: "bb firstmate forget <crew-id> [--stop] [--force]" },
+      { name: "create-worker", summary: "Internal atomic native worker creation", usage: "bb firstmate create-worker --task <id> --project <id> --home <path> --host <id> --path <path> --prompt-file <path>" },
+      { name: "launches", summary: "Inspect durable launch reservations", usage: "bb firstmate launches [--json]" },
       { name: "mark-crew", summary: "Tag a thread as a firstmate crew (used by the real-mode bb backend)", usage: "bb firstmate mark-crew <thread-id> [--shape ship|scout]" },
       { name: "migrate-state", summary: "Import the KV crew cache into authoritative real state (idempotent)", usage: "bb firstmate migrate-state [--json]" },
       { name: "migrate-owners", summary: "Project KV queue/decisions/afk/quiet/memory into the real files for owners set to real (idempotent)", usage: "bb firstmate migrate-owners [--json]" },
     ],
     async run(argv, ctx) {
+      try { await requireSupervisorCaller(ctx,argv); }
+      catch(error) { return {exitCode:1,stderr:error instanceof Error?error.message:String(error)}; }
       return withCliOperation(argv, ctxString(ctx, "threadId"), () => inCaptainHome(ctxString(ctx, "threadId"), async () => {
       if (argv[0] === "fm") {
+        const helpIndex=argv.findIndex(arg=>arg==='--help'||arg==='-h'),separator=argv.indexOf('--');
+        if(helpIndex>=0 && (separator<0 || helpIndex<separator)) return {exitCode:0,stdout:FM_WRAPPER_HELP};
         const json = argv.includes("--json");
         const fail = (message: string) => ({ exitCode: 1, stderr: message });
         const signal = asRecord(ctx)["signal"] as AbortSignal | undefined;
@@ -9938,8 +11132,9 @@ export default async function plugin(bb: BbPluginApi) {
           const fmHome = flagFromArgv(argv, "home") ?? (current.fmHome !== "" ? current.fmHome : undefined);
           if (fmHome === undefined) return fail("No firstmate home. Run: bb firstmate init --real");
           const parsed = parseFmArgv(argv.slice(1));
-          if (parsed.script === undefined) return fail("Usage: bb firstmate fm [--timeout s] <script> [args...]\nExample: bb firstmate fm spawn -- --mode direct-PR -- ship \"fix login\"");
+          if (parsed.script === undefined) return fail(FM_WRAPPER_HELP);
           const startup = captainStartupCommand(fmHome, parsed.script, parsed.args);
+          if (startup!==null && current.fullParityOnDeck && (!homeScope.getStore()?.home || homeScope.getStore()?.home!==fmHome)) return fail("Native startup requires this captain's exact bound home. Run bb firstmate deck; shared/explicit foreign-home fallback refused.");
           if (startup !== null) return { exitCode: 0, stdout: json
             ? JSON.stringify({ requiresAgentShell: true, command: startup })
             : `Run through the agent's shell (native lock requires harness ancestry):\n${startup}` };
@@ -9978,20 +11173,38 @@ export default async function plugin(bb: BbPluginApi) {
       const ctxThread = typeof ctxRecord["threadId"] === "string" ? ctxRecord["threadId"] : undefined;
 
       try {
+        if(flags.has("help")) return {exitCode:0,stdout:command==="dispatch" ? dispatchHelp : command==="queue" ? queueHelp : usage};
         switch (command) {
           case undefined:
           case "help":
           case "--help":
             return { exitCode: 0, stdout: usage };
+          case "runtime": {
+            const action=rest[0]??"status";
+            if(!["status","install","select","migrate","rollback"].includes(action))return fail("Use runtime status|install|select|migrate|rollback, one exact release ID, and optional --check.");
+            const result=await runtimeForContext(ctx,action as "status"|"install"|"select"|"migrate"|"rollback",rest[1],flags.has("check"),flagStr(flags,"machine"));
+            return reply(result,JSON.stringify(result,null,2));
+          }
           case "guide": {
             const repo = current.firstmateRepo !== "" ? current.firstmateRepo : "https://github.com/kunchenguid/firstmate";
             const text = guideText(repo, current.fmScriptCount, current.fmSkillCount);
             return reply({ guide: text }, text);
           }
+          case "methods": {
+            const action=rest[0]??"status";
+            if(!["status","enable","disable","read"].includes(action))return fail("Use methods status|enable|disable|read.");
+            const value=await selectedMethods(ctx,{action,profile:action==="enable"?rest[1]:undefined,reason:flagStr(flags,"reason"),prSkillId:flagStr(flags,"pr-skill"),name:action==="read"?rest[1]:undefined,reference:action==="read"?rest[2]:undefined,source:flagStr(flags,"source"),cursor:flagStr(flags,"cursor")},flags.has("paged"));
+            return typeof value==="string"?reply({text:value},value):reply(value,JSON.stringify(value));
+          }
+          case "skill": {
+            if (!rest[0] && !flagStr(flags,'cursor') && !flags.has('list')) return fail("Use bb firstmate skill <native-name> [relative-reference] [--source <selected-root source-file>] [--paged], then skill --cursor <cursor>; skill --list inspects diagnostic descriptions. Bind with bb firstmate deck first.");
+            const list=flags.has('list'),text=await readNativeSkill(ctx,rest[0],rest[1],flagStr(flags,'source'),flags.has('paged'),flagStr(flags,'cursor'),list);
+            return list && flags.has('json') && !flags.has('paged') && !flagStr(flags,'cursor') ? reply(JSON.parse(text),text) : reply({text},text);
+          }
           case "contract": {
             // The operator CLI reads the whole contract unless a section is named.
-            const text = await readCaptainContract(ctx, rest.join(" ").trim() || "all");
-            if (typeof text !== "string") return fail("Native contract could not be read.");
+            const text = await readCaptainContract(ctx, rest.join(" ").trim() || undefined, flags.get("paged") === true, flagStr(flags, "cursor"));
+            if (typeof text !== "string") return fail(text.content.filter(c=>c.type==='text').map(c=>c.text).join('\n')||"Native contract could not be read.");
             return reply({ contract: text }, text);
           }
           case "toolchain": {
@@ -10003,16 +11216,8 @@ export default async function plugin(bb: BbPluginApi) {
             return reply(surface, renderScriptSurface(surface));
           }
           case "deck": {
-            if (ctxThread === undefined) return fail("No thread: run this from a BB thread.");
-            await markDeck(ctxThread);
-            await rememberWatchCaptain(ctx, ctxThread);
-            const real = await ensureRealModeForDeck(ctx, signal);
-            const realMode = (await settings.get()).fmHome.trim() !== "";
-            const digest = await deckDigest(ctx, signal, flags.has("all"));
-            return reply(
-              { captain: true, threadId: ctxThread, realMode, digest },
-              `Captain, on deck.\n${real}\n${digest}`,
-            );
+            const result=await takeDeck(ctx,signal,flags.has("all"),flags.has("digest"));
+            const {text,...data}=result;return reply(data,text);
           }
           case "session": {
             const digest = await sessionDigest(flags.has("all") ? undefined : ctxThread);
@@ -10050,20 +11255,22 @@ export default async function plugin(bb: BbPluginApi) {
             if (tasks.length > maxFanout) return fail(`Too many tasks (max ${maxFanout}; raise the maxFanout setting).`);
             const projectId = flagStr(flags, "project") ?? ctxProject;
             if (projectId === undefined) return fail("No project: pass --project <id> (see bb project list).");
+            if(flagStr(flags,"mode")) modeSchema.parse(flagStr(flags,"mode"));
+            if(flagStr(flags,"shape")) shapeSchema.parse(flagStr(flags,"shape"));
+            if(flagStr(flags,"delivery-requirement")) z.enum(["branch","pr","merged","merged-and-verified"]).parse(flagStr(flags,"delivery-requirement"));
             const shape = toShape(flagStr(flags, "shape"));
             const wt = resolveWorktree({
               shape,
               sharedEnv: flags.has("shared-env"),
               worktreeFlag: flags.has("worktree"),
             });
-            const registry = await postureOf(projectId);
+            const registry = shape==="ship" ? await intakePosture(projectId,ctx,flagStr(flags,"mode") ? modeSchema.parse(flagStr(flags,"mode")) : undefined) : await postureOf(projectId);
             const mode = toMode(flagStr(flags, "mode"), registry.mode);
             const titleFlag = flagStr(flags, "title");
             const sendAtRaw = flagStr(flags, "send-at");
             const sendAt = sendAtRaw === undefined ? undefined : Number(sendAtRaw);
             if (sendAt !== undefined && !Number.isFinite(sendAt)) return fail("Bad --send-at (epoch ms).");
-            const capped = await crewCapRefusal(ctxThread, tasks.length);
-            if (capped !== null) return fail(capped);
+
             if (!flags.has("override-owner")) {
               for (const t of tasks) {
                 const conflict = await dispatchPrConflict(t, projectId, ctxThread);
@@ -10074,18 +11281,19 @@ export default async function plugin(bb: BbPluginApi) {
             for (let i = 0; i < tasks.length; i++) {
               const crew = await dispatchCrew({
                 task: tasks[i] as string,
+                crewId:tasks.length === 1 ? flagStr(flags,"task-id") : undefined,
                 projectId,
                 parentThreadId: ctxThread,
                 title: titleFlag === undefined ? undefined : tasks.length === 1 ? titleFlag : `${titleFlag} #${i + 1}`,
                 providerId: flagStr(flags, "provider") ?? (current.defaultProvider !== "" ? current.defaultProvider : undefined),
                 model: flagStr(flags, "model"),
-                reasoningLevel: toReasoningLevel(flagStr(flags, "reasoning-level")),
+                reasoningLevel: strictReasoning(flagStr(flags, "reasoning-level")),
                 permissionMode: toPermissionMode(flagStr(flags, "permission-mode") ?? current.defaultPermissionMode),
                 worktree: wt.worktree,
                 visible: !flags.has("hidden"),
                 shape,
-                mode,
-                sendAt,
+                mode,yolo:registry.yolo,
+                sendAt,signal,branchPrefix:flagStrAllowEmpty(flags,'branch-prefix'),dispatchProfileReason:flagStr(flags,'dispatch-profile-reason'),deliveryRequirement:flagStr(flags,"delivery-requirement") as "branch" | "pr" | "merged" | "merged-and-verified" | undefined,
               });
               dispatched.push({ ...crew, status: await crewStatus(crew) });
             }
@@ -10106,7 +11314,7 @@ export default async function plugin(bb: BbPluginApi) {
             const text = [
               ...dispatched.map(
                 (c) =>
-                  `Dispatched ${c.shape} crew ${c.id} as thread ${c.threadId} [${c.status}] (${c.worktree ? "worktree" : "shared-env"}, ${c.posture})${dispatchStatusNote(c.status, failures.get(c.id))}${permissionLine(c.id)}\nTrack: bb firstmate crew ${c.id}`,
+                  isSecondmateRoute(c) ? `Routed ${c.shape} request ${c.id} to secondmate thread ${c.threadId}; child launch remains pending.\nTrack: bb firstmate crew ${c.id}` : `Dispatched ${c.shape} crew ${c.id} as thread ${c.threadId} [${c.status}] (${c.worktree ? "worktree" : "shared-env"}, ${c.posture})${dispatchStatusNote(c.status, failures.get(c.id))}${permissionLine(c.id)}\nTrack: bb firstmate crew ${c.id}`,
               ),
               ...hints,
             ].join("\n");
@@ -10188,13 +11396,14 @@ export default async function plugin(bb: BbPluginApi) {
                 ? "INTERRUPT: stop the current action. Await new orders. Do not teardown or discard work."
                 : (flagStr(flags, "message") ?? rest.slice(1).join(" ").trim());
             if (id === undefined || message === "") return fail(usage);
-            const crew = await findCrew(id);
+            const crew = await findCrew(id,ctxThread);
             if (crew === undefined) return fail(`No crew ${id}. Run "bb firstmate crews".`);
             const wantQueue = command === "tell" && flags.get("queue") === true;
             if (command === "tell") {
               const overCap = await capRefusalToWake(crew, flags.has("over-cap"));
               if (overCap !== null) return fail(overCap);
             }
+            if (command === "tell") await resumeRetainedAuthor(crew,ctxThread);
             const text = await tellCrew(crew, message, command === "interrupt", wantQueue);
             const resolveKey = command === "tell" ? (flagStr(flags, "resolve-key") ?? "").trim() : "";
             const resolved = resolveKey !== "" ? await appendResolvedStatus(crew, resolveKey, message) : false;
@@ -10217,23 +11426,57 @@ export default async function plugin(bb: BbPluginApi) {
           case "retry": {
             const id = rest[0];
             if (id === undefined) return fail(usage);
-            const crew = await findCrew(id);
+            const crew = await findCrew(id,ctxThread);
             if (crew === undefined) return fail(`No crew ${id}.`);
             const model = flagStr(flags, "model");
             const providerId = flagStr(flags, "provider");
-            const reasoningLevel = toReasoningLevel(flagStr(flags, "reasoning-level"));
+            const reasoningLevel = strictReasoning(flagStr(flags, "reasoning-level"));
             const reason = flagStr(flags, "reason");
-            const overCap = await capRefusalToWake(crew, flags.has("over-cap"));
-            if (overCap !== null) return fail(overCap);
+            const intent=z.enum(["failure-recovery","execution-change"]).parse(flagStr(flags,"intent")??"failure-recovery");
+            if (intent==='execution-change' && model===undefined && providerId===undefined && reasoningLevel===undefined) return fail("Execution change requires an explicit provider/model/reasoning override.");
             if (model === undefined && providerId === undefined && reasoningLevel === undefined) {
+              const overCap = await capRefusalToWake(crew, flags.has("over-cap"));
+              if (overCap !== null) return fail(overCap);
+              await resumeRetainedAuthor(crew,ctxThread);
               const outcome = await retryCrewTurn(crew, reason);
               return reply({ retried: outcome.startsWith("Retried"), id }, outcome);
             }
-            const next = await relaunchCrew(crew, { model, providerId, reasoningLevel, note: reason });
+            const next = await relaunchCrew(crew, { model, providerId, reasoningLevel, note: reason, overCap:flags.has("over-cap"),intent,caller:ctxThread });
             return reply(
               { relaunched: true, id, threadId: next.threadId, model: next.model, providerId: next.providerId, reasoningLevel: next.reasoningLevel },
               `Relaunched crew ${id} as thread ${next.threadId} (${next.providerId ?? "default provider"}/${next.model ?? "default model"}/${next.reasoningLevel ?? "default reasoning"}), same worktree.`,
             );
+          }
+          case "deliveries": {
+            const input=deliveryParams.parse({ action:rest[0] ?? "list",id:rest[1],crewId:flagStr(flags,"crew"),url:flagStr(flags,"url"),from:flagStr(flags,"from") === "none" ? null : flagStr(flags,"from"),
+              failureId:flagStr(flags,"failure"),scope:flagStr(flags,"scope"),followUpTask:flagStr(flags,"follow-up-task"),requirement:flagStr(flags,"requirement"),reason:flagStr(flags,"reason"),commitSha:flagStr(flags,"commit"),authorized:flags.has("authorized"),all:flags.has("all"),
+              limit:flagStr(flags,"limit") ? Number(flagStr(flags,"limit")) : undefined,offset:flagStr(flags,"offset") ? Number(flagStr(flags,"offset")) : undefined });
+            const rows=await deliveryOperation(input,ctx);
+            return reply(rows,rows.map(deliveryLine).join("\n") || "No unresolved deliverables.");
+          }
+          case "create-worker": {
+            const result = await createNativeWorker(flags, ctx);
+            return reply(result, JSON.stringify(result));
+          }
+          case "scout-report": {
+            if (!ctxThread || !rest[0]) return fail("Scout report requires a thread and task id.");
+            const thread=await bb.sdk.threads.get({threadId:ctxThread});
+            const project=ctxProject ?? thread.projectId;
+            const report=reports.get(project,ctxThread,rest[0]) ?? (thread.parentThreadId ? reports.get(project,thread.parentThreadId,rest[0]) : undefined);
+            if (report === undefined) return fail("No owned durable scout report on this project.");
+            return reply({taskId:rest[0],report},report);
+          }
+          case "launches": {
+            if (rest[0] === "adopt") {
+              const threadId=flagStr(flags,"thread");
+              if (!ctxThread || !ctxProject || rest.length!==2 || !threadId) return fail("Usage in owning captain/project: bb firstmate launches adopt <task-id> --thread <id> [--check] [--json]");
+              if ([...flags.keys()].some(key=>!["thread","check","json"].includes(key))) return fail("Adoption cannot change launch options or authority.");
+              const result=await adoptLegacyLaunch(rest[1]!,threadId,ctxThread,ctxProject,flags.has("check"),signal);
+              return reply(result,`${result.adopted ? "Adopted" : "Eligible"} task ${result.taskId}, thread ${result.threadId}, worktree ${result.worktree}; worker ${result.workerStatus}. Original admission unconfirmed. Merge remains a separate native guarded operation.`);
+            }
+            if (rest.length>0 && (rest[0]!=="list" || rest.length>1)) return fail(usage);
+            const rows = launches.list(ctxThread,Math.max(1,Number(flagStr(flags,"limit")) || 50),Math.max(0,Number(flagStr(flags,"offset")) || 0));
+            return reply(rows, rows.map(r => `${r.taskId} ${r.state} ${r.threadId ?? "unknown worker"} ${r.error ?? ""}`).join("\n"));
           }
           case "mark-captain": {
             const threadId = rest[0];
@@ -10263,6 +11506,9 @@ export default async function plugin(bb: BbPluginApi) {
           case "mark-crew": {
             const id = rest[0];
             if (id === undefined) return fail("Usage: bb firstmate mark-crew <thread-id> [--shape ship|scout] [--task <id>]");
+            if(flagStr(flags,"mode")) modeSchema.parse(flagStr(flags,"mode"));
+            if(flagStr(flags,"shape")) shapeSchema.parse(flagStr(flags,"shape"));
+            if(flagStr(flags,"delivery-requirement")) z.enum(["branch","pr","merged","merged-and-verified"]).parse(flagStr(flags,"delivery-requirement"));
             const shape = toShape(flagStr(flags, "shape"));
             const taskId = (flagStr(flags, "task") ?? "").trim();
             // Record the fm task id as crewId so a plugin-side fallback can find and
@@ -10295,7 +11541,7 @@ export default async function plugin(bb: BbPluginApi) {
           case "deliver": {
             const id = rest[0];
             if (id === undefined) return fail(usage);
-            const crew = await findCrew(id);
+            const crew = await findCrew(id,ctxThread);
             if (crew === undefined) return fail(`No crew ${id}.`);
             const d = await deliverLines(crew);
             return reply(d.json, d.text);
@@ -10303,7 +11549,7 @@ export default async function plugin(bb: BbPluginApi) {
           case "merge": {
             const id = rest[0];
             if (id === undefined) return fail(usage);
-            const crew = await findCrew(id);
+            const crew = await findCrew(id,ctxThread,flags.has("override-owner"));
             if (crew === undefined) return fail(`No crew ${id}.`);
             const text = await mergeCrew(crew, flags.has("yes"), flagStr(flags, "allow-red"), flagStr(flags, "allow-missing"), {
               caller: ctxThread, overrideOwner: flags.has("override-owner"),
@@ -10323,8 +11569,8 @@ export default async function plugin(bb: BbPluginApi) {
             const scout = await findCrew(id);
             if (scout === undefined) return fail(`No crew ${id}.`);
             if (scout.shape !== "scout") return fail(`Crew ${id} is ${scout.shape}, not scout.`);
-            const report = (await crewOutput(scout, 2000)) ?? "(no scout report)";
-            const registry = await postureOf(scout.projectId);
+            const report = await scoutPromotionReport(scout, ctxString(ctx, "threadId"));
+            const registry = await intakePosture(scout.projectId,ctx,flagStr(flags,"mode") ? modeSchema.parse(flagStr(flags,"mode")) : undefined);
             const ship = await dispatchCrew({
               task: `Captain's intent: implement the scout's recommended path.\n\nScout report (crew ${scout.id}):\n${report}`,
               projectId: scout.projectId,
@@ -10335,7 +11581,8 @@ export default async function plugin(bb: BbPluginApi) {
               worktree: true,
               visible: !flags.has("hidden"),
               shape: "ship",
-              mode: toMode(flagStr(flags, "mode"), registry.mode),
+              mode: toMode(flagStr(flags, "mode"), registry.mode),yolo:registry.yolo,
+              deliveryRequirement:await contractForCrew(scout),
             });
             await recordDone({
               task: scout.task.slice(0, 200),
@@ -10454,34 +11701,45 @@ export default async function plugin(bb: BbPluginApi) {
           case "queue": {
             const sub = rest[0] ?? "list";
             const items = (await readQueue()).filter(row => ownedByScopedCaptain(row.parentThreadId));
+            if (sub === "reconcile") {
+              const id=rest[1];if (!id) return fail("Need exact queue id.");
+              const row=await reconcileQueue(id,flagStr(flags,"project")??ctxProject,ctxThread,{title:flagStr(flags,"title"),detail:flagStr(flags,"detail"),mode:flagStr(flags,"mode"),deliveryRequirement:flagStr(flags,"delivery-requirement") as QueueItem['deliveryRequirement'],providerId:flagStr(flags,"provider"),model:flagStr(flags,"model"),reasoningLevel:strictReasoning(flagStr(flags,"reasoning-level")),blockedBy:flagAll(flags,"after"),waitUntil:flagStr(flags,"wait-until")});
+              return reply(row,`Reconciled queue ${id} [${row.status}]. Existing worker kept; no turn started.`);
+            }
             if (sub === "add") {
               const title = rest.slice(1).join(" ").trim();
               if (title === "") return fail(usage);
               const projectId = flagStr(flags, "project") ?? ctxProject;
               if (projectId === undefined) return fail("No project: pass --project <id>.");
+              validateQueueText(title, flagStr(flags,"detail") ?? "");
+              await validateProviderChoice(flagStr(flags,"provider"),flagStr(flags,"model"),projectId,ctxThread);
               const newId = randomUUID().slice(0, 8);
+              if(flagStr(flags,"mode")) modeSchema.parse(flagStr(flags,"mode"));
+              if(flagStr(flags,"shape")) shapeSchema.parse(flagStr(flags,"shape"));
               const shapeVal = toShape(flagStr(flags, "shape"));
-              const proj = await projectQueueAdd(newId, title, shapeVal, projectId);
               const item: QueueItem = {
           nativeHome: (await settings.get()).fmHome,
                 id: newId,
-                title: title.slice(0, 500),
-                detail: (flagStr(flags, "detail") ?? "").slice(0, MAX_TASK),
+                title,
+                detail: flagStr(flags, "detail") ?? "",
                 projectId,
                 shape: shapeVal,
                 mode: flagStr(flags, "mode") ?? "",
                 blockedBy: flagAll(flags, "after"),
                 ...(flagStr(flags, "provider") !== undefined ? { providerId: flagStr(flags, "provider") } : {}),
                 ...(flagStr(flags, "model") !== undefined ? { model: flagStr(flags, "model") } : {}),
-                ...(toReasoningLevel(flagStr(flags, "reasoning-level")) !== undefined ? { reasoningLevel: toReasoningLevel(flagStr(flags, "reasoning-level")) } : {}),
+                ...(toReasoningLevel(flagStr(flags, "reasoning-level")) !== undefined ? { reasoningLevel: strictReasoning(flagStr(flags, "reasoning-level")) } : {}),
+                deliveryRequirement:flagStr(flags,'mode') ? taskDelivery(flagStr(flags,'mode')!,z.enum(["branch","pr","merged","merged-and-verified"]).optional().parse(flagStr(flags,"delivery-requirement")),shapeVal) : z.enum(["branch","pr","merged","merged-and-verified"]).optional().parse(flagStr(flags,"delivery-requirement")),
+                branchPrefix:flagStrAllowEmpty(flags,'branch-prefix'),dispatchProfileReason:flagStr(flags,'dispatch-profile-reason'),
                 waitUntil: flagStr(flags, "wait-until") ?? null,
                 status: "queued",
                 crewId: null,
                 parentThreadId: ctxThread ?? null,
-                ...(proj.ok ? { backlogId: newId } : {}),
+                ...(await queueIsReal() ? {nativePending:true} : {}),
                 createdAt: new Date().toISOString(),
               };
-              await writeQueue([item, ...items]);
+              queueStore.add(item);
+              await publishQueueAdd(item);
               return reply(item, `Queued ${item.id} [${item.shape}] :: ${truncate(item.title, 80)}`);
             }
             if (sub === "list") {
@@ -10489,32 +11747,32 @@ export default async function plugin(bb: BbPluginApi) {
               if (live.length === 0) return reply([], "Queue empty.");
               const now = Date.now();
               const lines = live.map((q) => {
-                const gate = q.status === "queued" ? queueGate(q, items, now) : null;
+                const gate = q.status === "queued" ? storedQueueGate(q, items, now) : null;
                 return `${q.id} [${q.status}] ${q.shape} :: ${truncate(q.title, 70)}${gate !== null ? ` — ${gate}` : ""}${q.crewId !== null ? ` (crew ${q.crewId})` : ""}`;
               });
               return reply(items, lines.join("\n"));
             }
             if (sub === "next") {
               const now = Date.now();
-              const open = items.filter((q) => q.status === "queued" && queueGate(q, items, now) === null);
+              const open = items.filter((q) => q.status === "queued" && storedQueueGate(q, items, now) === null);
               if (open.length === 0) return reply([], "Nothing dispatchable.");
               const first = [...open].reverse()[0] as QueueItem;
               return reply(first, `${first.id} [${first.shape}] ${first.projectId} :: ${first.title}\nDispatch: bb firstmate queue dispatch ${first.id}`);
             }
             if (sub === "dispatch") {
               const qid = rest[1];
-              let item = items.find((q) => q.id === qid);
+              let item = findQueueItem(items,qid,flagStr(flags,"project")??ctxProject);
               if (item === undefined && qid !== undefined) {
                 const row = await adoptRealBacklogRow(qid, flagStr(flags, "project") ?? ctxProject, ctxThread);
-                if (row !== null) { item = row; items.unshift(row); }
+                if (row !== null) { item = row; queueStore.add(row); items.unshift(row); }
               }
               if (qid === undefined || item === undefined) return fail(`No queued item ${qid ?? ""}.`);
-              const gate = queueGate(item, items, Date.now());
+              const gate = storedQueueGate(item, items, Date.now());
               if (gate !== null) return fail(`Item ${qid} gated: ${gate}.`);
-              const capped = await crewCapRefusal(ctxThread, 1);
-              if (capped !== null) return fail(capped);
-              const registry = await postureOf(item.projectId);
+
+              const registry = item.shape==="ship" ? await intakePosture(item.projectId,ctx,item.mode ? modeSchema.parse(item.mode) : undefined) : await postureOf(item.projectId);
               const brief = item.detail !== "" ? `${item.title}\n\n${item.detail}` : item.title;
+              if (brief.length > MAX_TASK) throw new Error(`Queue task ${item.id} exceeds ${MAX_TASK} characters; full record retained, dispatch refused.`);
               const crew = await dispatchCrew({
                 task: brief,
                 projectId: item.projectId,
@@ -10523,35 +11781,36 @@ export default async function plugin(bb: BbPluginApi) {
                 crewId: item.id,
                 providerId: flagStr(flags, "provider") ?? item.providerId ?? (current.defaultProvider !== "" ? current.defaultProvider : undefined),
                 model: flagStr(flags, "model") ?? item.model,
-                reasoningLevel: toReasoningLevel(flagStr(flags, "reasoning-level") ?? item.reasoningLevel),
+                reasoningLevel: strictReasoning(flagStr(flags, "reasoning-level") ?? item.reasoningLevel),
+                deliveryRequirement:item.deliveryRequirement,branchPrefix:item.branchPrefix,dispatchProfileReason:flagStr(flags,'dispatch-profile-reason') ?? item.dispatchProfileReason,
                 permissionMode: toPermissionMode(flagStr(flags, "permission-mode") ?? current.defaultPermissionMode),
                 worktree: resolveWorktree({ shape: item.shape, sharedEnv: flags.has("shared-env"), worktreeFlag: flags.has("worktree") }).worktree,
                 visible: !flags.has("hidden"),
                 shape: item.shape,
-                mode: toMode(item.mode !== "" ? item.mode : undefined, registry.mode),
+                mode: toMode(item.mode !== "" ? item.mode : undefined, registry.mode),yolo:registry.yolo,
               });
               item.status = "dispatched";
               item.crewId = crew.id;
               // fm-spawn.sh performs the queued→In-flight start itself for real-transport
               // dispatches; only start here when the plugin owns the transition.
               if (current.transport !== "real") await projectQueueTransition(item, "start");
-              await writeQueue(items);
+              queueStore.patch(item, {status:item.status,crewId:item.crewId});
               return reply({ ...crew, status: await crewStatus(crew), queueId: qid }, `Dispatched queue ${qid} as ${crew.shape} crew ${crew.id}${permissionLine(crew.id)}`);
             }
             if (sub === "drop" || sub === "done") {
               const qid = rest[1];
-              let item = items.find((q) => q.id === qid);
+              let item = findQueueItem(items,qid,flagStr(flags,"project")??ctxProject);
               const adopted = item === undefined && qid !== undefined;
               if (item === undefined && qid !== undefined) item = await adoptRealBacklogRow(qid, flagStr(flags, "project") ?? ctxProject, ctxThread, false) ?? undefined;
               if (qid === undefined || item === undefined) return fail(`No queued item ${qid ?? ""}.`);
               item.status = sub === "drop" ? "dropped" : "done";
               await projectQueueTransition(item, sub === "drop" ? "rm" : "done");
-              if (!adopted) await writeQueue(items);
+              if (!adopted) queueStore.patch(item, {status:item.status});
               return reply({ id: qid, status: item.status }, `Queue ${qid} ${item.status}${adopted ? " (native backlog row)" : ""}`);
             }
             if (sub === "prune") {
               const kept = items.filter((q) => !isFinishedQueueItem(q));
-              await writeQueue(kept);
+              queueStore.transform(row => ownedByScopedCaptain(row.parentThreadId) && isFinishedQueueItem(row), () => null);
               return reply({ pruned: items.length - kept.length }, `Pruned ${items.length - kept.length} finished queue item(s).`);
             }
             return fail(usage);
@@ -10633,28 +11892,14 @@ export default async function plugin(bb: BbPluginApi) {
             return fail(usage);
           }
           case "posture": {
-            const sub = rest[0];
-            if (sub === "set") {
-              const projectId = flagStr(flags, "project") ?? ctxProject;
-              if (projectId === undefined) return fail("No project: pass --project <id>.");
-              const all = await readPostures();
-              const cur = all[projectId] ?? { mode: "direct-PR" as DeliveryMode, yolo: false };
-              const mode = toMode(flagStr(flags, "mode"), cur.mode);
-              const yoloRaw = flagStr(flags, "yolo");
-              const yolo = yoloRaw === undefined ? cur.yolo : yoloRaw === "on" || yoloRaw === "true";
-              all[projectId] = { mode, yolo };
-              await bb.storage.kv.set(POSTURES_KEY, all);
-              return reply({ projectId, mode, yolo }, `Posture ${projectId}: ${mode}${yolo ? "+yolo" : ""}`);
+            const projectId=flagStr(flags,"project")??ctxProject;
+            if(!projectId)return reply(await readPostures(),JSON.stringify(await readPostures(),null,2));
+            if(rest[0]==="set") {
+              const raw=flagStr(flags,"yolo");if(raw!==undefined && !["on","off","true","false"].includes(raw))return fail("--yolo must be on|off");
+              const value=await setPosture(projectId,flagStr(flags,"mode")?modeSchema.parse(flagStr(flags,"mode")):undefined,raw===undefined?undefined:raw==="on"||raw==="true",flagStr(flags,"reason"),ctx);
+              return reply({projectId,...value},JSON.stringify(value,null,2));
             }
-            const all = await readPostures();
-            const projectId = flagStr(flags, "project") ?? ctxProject ?? null;
-            if (projectId !== null) {
-              const p = all[projectId] ?? { mode: "direct-PR" as DeliveryMode, yolo: false };
-              return reply({ projectId, ...p }, `Posture ${projectId}: ${p.mode}${p.yolo ? "+yolo" : ""}`);
-            }
-            const keys = Object.keys(all);
-            if (keys.length === 0) return reply({}, "No postures set (default everywhere: direct-PR, yolo off).");
-            return reply(all, keys.map((k) => `${k}: ${all[k]?.mode}${all[k]?.yolo ? "+yolo" : ""}`).join("\n"));
+            const value=await postureContext(projectId,ctx);return reply(value,JSON.stringify(value,null,2));
           }
           case "memory": {
             const sub = rest[0] ?? "show";
@@ -10731,6 +11976,21 @@ export default async function plugin(bb: BbPluginApi) {
       }));
     },
   });
+
+  async function boundedFollowUp<T>(action:(signal:AbortSignal)=>Promise<T>,parent=launchAbort.signal):Promise<T> {
+    parent.throwIfAborted();
+    const budget=new AbortController();
+    const signal=AbortSignal.any([parent,budget.signal]);
+    const timer=setTimeout(()=>budget.abort(new Error("PR follow-up item deadline exceeded")),STUCK_HOST_CALL_MS);
+    try {return await raceAbort(action(signal),signal);} finally {clearTimeout(timer);}
+  }
+  bb.background.schedule("pr-delivery-follow-up", "* * * * *", async () => {
+    if (followUpWork || launchAbort.signal.aborted) return;
+    followUpWork=(async()=>{await launchRecoveryPass(launchAbort.signal);await deliveryPass(launchAbort.signal);await raceAbort(publishFleet(),launchAbort.signal,STUCK_HOST_CALL_MS);})();
+    try {await followUpWork;} finally {followUpWork=undefined;}
+  });
+  bb.events.on("thread.archived", ({ thread }) => { deliveries.ownerLost(thread.id); });
+  bb.events.on("thread.deleted", ({ thread }) => { launches.workerDeleted(thread.id); deliveries.ownerLost(thread.id); });
 
   bb.background.service("crew-watch", {
     async start(signal) {

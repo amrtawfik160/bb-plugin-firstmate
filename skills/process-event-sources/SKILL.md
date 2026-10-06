@@ -10,8 +10,7 @@ description: >-
   Owns the arming commands, the condition->action eligibility boundary, the
   durable result read, which wakes must be routed to their adapter instead of
   acknowledged generically, the handled acknowledgement contract, the one-owner
-  rule, the precise durability boundary, and the Lavish adapter's loss
-  limitation.
+  rule, and the precise durability boundary.
 user-invocable: false
 metadata:
   internal: true
@@ -19,8 +18,8 @@ metadata:
 
 <!-- BB-SOURCE
      native: .agents/skills/process-event-sources/SKILL.md
-     sha: 2d833ff147cd26a5c461e914e06854e0eb2707ce
-     snapshot: native-snapshot/2d833ff1/.agents/skills/process-event-sources/SKILL.md
+     sha: 1f3e769616fdf9f31f85f4c3e6a9f71606634238
+     snapshot: native-snapshot/1f3e7696/.agents/skills/process-event-sources/SKILL.md
      fidelity: verbatim
 -->
 
@@ -42,10 +41,9 @@ bin/fm-procevent-lavish.sh arm <artifact.html>
 ```
 
 A worker-owned board uses `bin/fm-procevent-lavish.sh arm <artifact.html> --for <task-id>` and re-arms with its reply after each nonterminal round; the existing handled marker is the acknowledgement.
-Arm it once, then re-arm only when a round is actually waiting: arming again with nothing to acknowledge is refused, because it would discard the reply your listener is still holding.
-Posting that reply is best effort: a rare crash while the listener consumes the staged file drops that one round's reply rather than posting it twice, and robust reply delivery waits on lavish-axi's exclusive listener.
+Arm it once, then re-arm only when a round is actually waiting: arming again with nothing to acknowledge is refused.
 A terminal round is never re-armed: the board stays yours until you acknowledge it with `bin/fm-procevent.sh handled <source-id> <sequence>`, which retires it, and until then `retire` refuses the board too.
-Never arm a board that a live task hosts; follow the crew-hosted Lavish board contract in [`docs/configuration.md`](../../../docs/configuration.md#crew-hosted-lavish-review-boards).
+Never arm a board that a live task hosts; follow the [crew-hosted Lavish board contract](../../../docs/configuration.md#crew-hosted-lavish-review-boards) for reply acceptance and older-version limits.
 
 Registering a source is not the same fact as listening to it.
 Lavish `arm` waits until this registration's listener is confirmed running and does not report ready without that evidence; other adapters still record the source for the watcher's next reconcile.

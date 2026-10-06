@@ -1,0 +1,17 @@
+{
+  "generator": {
+    "git": "git version 2.43.0",
+    "python": "3.12.3"
+  },
+  "nativeBundle": {
+    "bytes": 2590114,
+    "sha256": "e3fec6500bdff95ca824ee7d0ee16579f4fd42b9cc7b7cb9cd674930ba02c414"
+  },
+  "nativeFiles": 383,
+  "schema": 1,
+  "snapshotCommit": "4cdbef4dbf44a721e55cf0ad01524ee27b377e05",
+  "sourceManifestSha256": "098f5aae7887df23ae1e696634a937b83fd08c02d32a3b34b06f65cef639b58f",
+  "stateContract": "native-flat-v1",
+  "upstreamCommit": "1f3e769616fdf9f31f85f4c3e6a9f71606634238",
+  "upstreamSource": "https://github.com/kunchenguid/firstmate"
+}

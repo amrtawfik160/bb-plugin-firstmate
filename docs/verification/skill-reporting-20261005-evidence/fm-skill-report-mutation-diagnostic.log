@@ -1,0 +1,28 @@
+✖ public diagnostic inventory preserves folded native descriptions and all trigger branches without becoming role policy (843.16323ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 0
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1171.435298
+
+✖ failing tests:
+
+test at server.native-policy.test.mjs:144:1
+✖ public diagnostic inventory preserves folded native descriptions and all trigger branches without becoming role policy (843.16323ms)
+  AssertionError [ERR_ASSERTION]: The expression evaluated to a falsy value:
+
+    assert.ok(afk.description.endsWith('on the first unmarked message renders the return brief from durable records before ordinary work resumes.'))
+
+      at TestContext.<anonymous> (file:///root/github_projects/bb-plugin-firstmate-launch-pr-lifecycle/server.native-policy.test.mjs:152:10)
+      at async Test.run (node:internal/test_runner/test:1332:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: false,
+    expected: true,
+    operator: '==',
+    diff: 'simple'
+  }

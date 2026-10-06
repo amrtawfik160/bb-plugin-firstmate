@@ -20,8 +20,9 @@ This installer never edits a tracked file. It builds a parallel "mirror bin" at
 
   - every native bin/ entry is SYMLINKED into bin-bb/ (so it keeps inheriting
     upstream on every ff-update),
-  - EXCEPT eight files with no native seam -- fm-backend.sh, fm-spawn.sh,
-    fm-teardown.sh, fm-merge-local.sh, fm-bootstrap.sh, fm-busy-lib.sh, fm-secondmate-liveness-lib.sh, fm-watch.sh -- which are generated as patched COPIES, and
+  - EXCEPT ten files with no native seam -- fm-backend.sh, fm-spawn.sh,
+    fm-teardown.sh, fm-merge-local.sh, fm-bootstrap.sh, fm-tasks-axi-lib.sh,
+    fm-quota-axi-lib.sh, fm-busy-lib.sh, fm-secondmate-liveness-lib.sh, fm-watch.sh -- which are generated as patched COPIES, and
   - bin-bb/backends/ mirrors the native adapters plus the real bb.sh adapter.
 
 Native scripts derive SCRIPT_DIR and FM_BACKEND_LIB_DIR from their own
@@ -37,14 +38,15 @@ empty and the fetch + ff-only path actually fast-forwards. config/ is already
 gitignored upstream, so config/backend and config/bb-project stay invisible too.
 
 Re-run this installer after an ff-update: it re-mirrors (picking up any new native
-bin files) and regenerates the eight patched copies against the new native
-source. If a patch no longer applies because upstream changed one of the eight
+bin files) and regenerates the ten patched copies against the new native
+source. If a patch no longer applies because upstream changed one of the ten
 files, the install fails LOUDLY here instead of silently shipping a stale copy.
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -55,7 +57,7 @@ from pathlib import Path
 
 # Native backend dispatch and managed-branch landing have no extension seam. Carried as
 # patched copies in the mirror; everything else in bin/ is symlinked.
-PATCHED_FILES = ("fm-backend.sh", "fm-spawn.sh", "fm-teardown.sh", "fm-merge-local.sh", "fm-bootstrap.sh", "fm-busy-lib.sh", "fm-secondmate-liveness-lib.sh", "fm-watch.sh")
+PATCHED_FILES = ("fm-backend.sh", "fm-spawn.sh", "fm-teardown.sh", "fm-merge-local.sh", "fm-bootstrap.sh", "fm-tasks-axi-lib.sh", "fm-quota-axi-lib.sh", "fm-busy-lib.sh", "fm-secondmate-liveness-lib.sh", "fm-watch.sh")
 # Extra files the backend patch also touches but which we do NOT ship (docs only);
 # staged in the temp tree so their hunks apply, then discarded.
 PATCH_STAGE_EXTRA = ("docs/configuration.md",)
@@ -116,12 +118,60 @@ def head_commit(home: Path) -> str:
     return ""
 
 
-def pristine_source(home: Path, relpath: str) -> str:
+def audited_source_identity(home: Path) -> str:
+    """BB package identity differs from native upstream identity; verify the export.
+
+    This is a packaging adaptation, not a new source/patch policy: only unchanged,
+    hash-verified native bytes may select the existing exact upstream patch set.
+    External Git homes without the tracked descriptor retain exact-HEAD behavior.
+    """
+    descriptor = home / ".bb-native-runtime.json"
+    if not descriptor.exists():
+        return head_commit(home)
+    if descriptor.is_symlink():
+        raise ValueError("native runtime descriptor must be a regular file")
+    raw = descriptor.read_bytes()
+    committed = subprocess.run(["git", "-C", str(home), "show", "HEAD:.bb-native-runtime.json"], capture_output=True)
+    if committed.returncode != 0 or committed.stdout != raw:
+        raise ValueError("native runtime descriptor differs from committed packaging identity")
+    try:
+        metadata = json.loads(raw)
+        if metadata["schema"] != 1 or metadata["format"] != "filtered-git-snapshot-v1" or metadata["stateContract"] != "native-flat-v1":
+            raise ValueError("unknown native runtime format/state contract")
+        source = metadata["upstreamCommit"]
+        if not re.fullmatch(r"[0-9a-f]{40}", source) or not isinstance(metadata["files"], dict) or not metadata["files"]:
+            raise ValueError("incomplete native runtime source descriptor")
+        for name, record in metadata["files"].items():
+            relative = Path(name)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError(f"invalid native runtime member {name}")
+            path = home / relative
+            mode = record["mode"]
+            if mode == "120000":
+                if not path.is_symlink() or not path.resolve().is_relative_to(home):
+                    raise ValueError(f"invalid native runtime symlink {name}")
+                data = os.readlink(path).encode()
+            elif mode in ("100644", "100755"):
+                if path.is_symlink() or not path.is_file():
+                    raise ValueError(f"missing native runtime file {name}")
+                data = path.read_bytes()
+                if bool(path.stat().st_mode & 0o111) != (mode == "100755"):
+                    raise ValueError(f"native runtime mode mismatch {name}")
+            else:
+                raise ValueError(f"unsupported native runtime mode {name}")
+            if hashlib.sha256(data).hexdigest() != record["sha256"]:
+                raise ValueError(f"native runtime bytes mismatch {name}")
+        return source
+    except (KeyError, TypeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid native runtime source descriptor: {error}") from error
+
+
+def pristine_source(home: Path, relpath: str, ref: str = "HEAD") -> str:
     """Return the committed (HEAD) bytes of a tracked file, so patching works even
     when the live working tree still carries the old in-place edits."""
     try:
         out = subprocess.run(
-            ["git", "-C", str(home), "show", f"HEAD:{relpath}"],
+            ["git", "-C", str(home), "show", f"{ref}:{relpath}"],
             capture_output=True,
             text=True,
         )
@@ -133,32 +183,65 @@ def pristine_source(home: Path, relpath: str) -> str:
     return (home / relpath).read_text()
 
 
-def generate_patched_copies(home: Path, overlay: Path, dest_dir: Path) -> dict[str, str]:
+def select_patch_set(home: Path, overlay: Path) -> tuple[str, list[Path], str]:
+    """One authoritative registry of exact audited source/patch pairs."""
+    head = head_commit(home)
+    registry = overlay / "patch-sets.json"
+    try:
+        data = json.loads(registry.read_text())
+        if data.get("schema") != 1 or not isinstance(data.get("sets"), dict):
+            raise ValueError("unsupported patch registry schema")
+        source = audited_source_identity(home)
+        if (home / ".bb-native-runtime.json").exists():
+            attestation = data.get("bundledSnapshots", {}).get(head)
+            if not isinstance(attestation, dict) or attestation.get("upstreamCommit") != source or attestation.get("sourceManifestSha256") != hashlib.sha256((home / ".bb-native-runtime.json").read_bytes()).hexdigest():
+                raise ValueError(f"unsupported bundled Git/source identity {head}; no audited snapshot attestation")
+        if not re.fullmatch(r"[0-9a-f]{40}", head) or source not in data["sets"]:
+            raise ValueError(f"unsupported native source SHA {head or '<unknown>'}; no audited exact patch set")
+        names = data["sets"][source]
+        if not isinstance(names, list) or len(names) != 4 or len(set(names)) != 4:
+            raise ValueError("audited patch set must contain four distinct files")
+        patches = []
+        digest = hashlib.sha256()
+        for name in names:
+            if not isinstance(name, str) or name not in OVERLAY_INSTALL_INPUTS or not name.endswith(".patch"):
+                raise ValueError(f"unshipped/invalid patch input: {name}")
+            path = overlay / name
+            if path.is_symlink() or not path.is_file() or any(parent.is_symlink() for parent in path.parents if parent != overlay.parent):
+                raise ValueError(f"missing or symlinked patch input: {name}")
+            digest.update(name.encode() + b"\0" + path.read_bytes() + b"\0")
+            patches.append(path)
+        return head, patches, digest.hexdigest()
+    except (OSError, json.JSONDecodeError, TypeError, KeyError) as error:
+        raise ValueError(f"invalid audited patch registry: {error}") from error
+
+
+def generate_patched_copies(home: Path, overlay: Path, dest_dir: Path, selection: tuple[str, list[Path], str] | None = None) -> dict[str, str]:
     """Apply the overlay patches to pristine native sources in a scratch tree, rewrite
     internal dispatch self-references to stay in the mirror (F4), and copy the three
     resulting files into the mirror. Fails loudly if a patch does not apply (surfacing
     upstream drift instead of shipping a stale copy). Returns {file: native-source-sha}
     so the manifest can detect a later out-of-band drift of the frozen copies (F2)."""
-    backend_patch = overlay / "firstmate-bb-backend.patch"
-    teardown_patch = overlay / "firstmate-bb-teardown.patch"
-    for patch in (backend_patch, teardown_patch, overlay / "firstmate-bb-local-merge.patch", overlay / "firstmate-bb-browser.patch"):
-        if not patch.is_file():
-            die(f"missing {patch}")
+    try:
+        native_sha, patches, _ = selection or select_patch_set(home, overlay)
+    except ValueError as error:
+        die_loud("native source/patch selection refused", str(error))
+    print(f"selected audited native patch set {audited_source_identity(home)} (Git identity {native_sha})")
 
     source_shas: dict[str, str] = {}
     with tempfile.TemporaryDirectory(prefix="fm-bb-patch-") as tmp:
         tmproot = Path(tmp)
         staged = [f"bin/{f}" for f in PATCHED_FILES] + list(PATCH_STAGE_EXTRA)
         for rel in staged:
-            native = pristine_source(home, rel)
+            native = pristine_source(home, rel, native_sha)
             if rel.startswith("bin/"):
                 source_shas[rel[len("bin/"):]] = sha256_text(native)
             target = tmproot / rel
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(native)
-        for patch in (backend_patch, teardown_patch, overlay / "firstmate-bb-local-merge.patch", overlay / "firstmate-bb-browser.patch"):
+        for patch in patches:
             result = subprocess.run(
-                ["patch", "-p1", "--forward", "--batch", "-i", str(patch)],
+                ["patch", "-p1", "--fuzz=0", "--forward", "--batch", "-i", str(patch)],
                 cwd=tmproot,
                 capture_output=True,
                 text=True,
@@ -173,7 +256,7 @@ def generate_patched_copies(home: Path, overlay: Path, dest_dir: Path) -> dict[s
             # line in the output. Any one of these aborts the whole install.
             combined = f"{result.stdout}\n{result.stderr}"
             rejects = sorted(str(p.relative_to(tmproot)) for p in tmproot.rglob("*.rej"))
-            failed_hunks = "FAILED" in combined or "hunks ignored" in combined
+            failed_hunks = "FAILED" in combined or "hunks ignored" in combined or "offset" in combined or "fuzz" in combined
             if result.returncode != 0 or rejects or failed_hunks:
                 die_loud(
                     f"a hunk of {patch.name} did not apply to the pristine native source",
@@ -205,13 +288,35 @@ def generate_patched_copies(home: Path, overlay: Path, dest_dir: Path) -> dict[s
 OVERLAY_INSTALL_INPUTS = (
     "bin/backends/bb.sh",
     "bin/backends/bb-worker-transport.txt",
+    "bin/backends/bb-worker-prompt.py",
     "bin/fm-inbox-take.sh",
+    "bin/fm-inbox-take.py",
+    "bin/fm-launch-adopt.sh",
+    "bin/fm-launch-adopt.py",
+    "bin/fm-worker-rebind.sh",
+    "bin/fm-worker-rebind.py",
+    "bin/fm-bb-probe-lib.sh",
+    "bin/fm-worker-checkpoint.py",
     "docs/bb-backend.md",
     "firstmate-bb-backend.patch",
     "firstmate-bb-teardown.patch",
     "firstmate-bb-local-merge.patch",
     "firstmate-bb-browser.patch",
+    "patch-sets.json",
+    "compat/2d833ff147cd26a5c461e914e06854e0eb2707ce/firstmate-bb-backend.patch",
+    "compat/2d833ff147cd26a5c461e914e06854e0eb2707ce/firstmate-bb-teardown.patch",
+    "compat/2d833ff147cd26a5c461e914e06854e0eb2707ce/firstmate-bb-local-merge.patch",
+    "compat/2d833ff147cd26a5c461e914e06854e0eb2707ce/firstmate-bb-browser.patch",
     "install-bb-backend.py",
+)
+
+
+# Owned transport payloads must be real current copies, not merely covered by
+# a claimed bundle fingerprint. Native siblings remain symlinks by design.
+TRANSPORT_PAYLOADS = (
+    "backends/bb.sh", "backends/bb-worker-transport.txt",
+    "backends/bb-worker-prompt.py", "fm-inbox-take.sh", "fm-inbox-take.py",
+    "fm-launch-adopt.sh", "fm-launch-adopt.py", "fm-worker-rebind.sh", "fm-worker-rebind.py", "fm-bb-probe-lib.sh", "fm-worker-checkpoint.py",
 )
 
 
@@ -236,6 +341,10 @@ def build_mirror(home: Path, overlay: Path) -> Path:
     (The previous version rmtree'd the live mirror first and rebuilt in place, so a
     patch failure mid-rebuild left bin-bb missing the three dispatch copies — a
     host-wide `unknown backend 'bb'` outage on a shared home. Never again.)"""
+    try:
+        selection = select_patch_set(home, overlay)
+    except ValueError as error:
+        die_loud("native source/patch selection refused", str(error))
     bin_dir = home / "bin"
     mirror = home / MIRROR_DIRNAME
     if (mirror.exists() or mirror.is_symlink()) and (not mirror.is_dir() or mirror.is_symlink()):
@@ -258,16 +367,19 @@ def build_mirror(home: Path, overlay: Path) -> Path:
             # staging matches the final mirror, so ../bin resolves either way.
             os.symlink(os.path.join("..", "bin", entry), staging / entry)
 
-        source_shas = generate_patched_copies(home, overlay, staging)
-        helper = overlay / "bin" / "fm-inbox-take.sh"
-        if not helper.is_file():
-            die(f"missing {helper}")
-        dest_helper = staging / "fm-inbox-take.sh"
-        if dest_helper.exists() or dest_helper.is_symlink():
-            dest_helper.unlink()
-        shutil.copy2(helper, dest_helper)
-        os.chmod(dest_helper, 0o755)
-        write_manifest(home, staging, native_entries, source_shas, overlay_fingerprint(overlay))
+        source_shas = generate_patched_copies(home, overlay, staging, selection)
+        for helper_name in ("fm-inbox-take.sh", "fm-inbox-take.py", "fm-launch-adopt.sh", "fm-launch-adopt.py", "fm-worker-rebind.sh", "fm-worker-rebind.py", "fm-bb-probe-lib.sh", "fm-worker-checkpoint.py"):
+            helper = overlay / "bin" / helper_name
+            if not helper.is_file():
+                die(f"missing {helper}")
+            dest_helper = staging / helper_name
+            if dest_helper.exists() or dest_helper.is_symlink():
+                dest_helper.unlink()
+            shutil.copy2(helper, dest_helper)
+            os.chmod(dest_helper, 0o755)
+        write_manifest(home, staging, native_entries, source_shas, overlay_fingerprint(overlay), selection)
+        if head_commit(home) != selection[0]:
+            die_loud("native source moved during install", "Refusing to publish a mirror built against another source SHA.")
     except BaseException:
         # Includes die_loud()/die()'s SystemExit: discard the half-built staging and
         # leave the previously-working mirror untouched.
@@ -298,33 +410,38 @@ def _atomic_swap(mirror: Path, staging: Path) -> None:
     _rm_path(backup)
 
 
-def write_manifest(home: Path, mirror: Path, native_entries: list[str], source_shas: dict[str, str], overlay_sha: str) -> None:
+def write_manifest(home: Path, mirror: Path, native_entries: list[str], source_shas: dict[str, str], overlay_sha: str, selection: tuple[str, list[Path], str]) -> None:
     """Record what the mirror was built from so a later out-of-band fast-forward can be
     detected as stale (F2). Lines: head=<sha>, overlay=<sha>, entries=<name,name,...>,
     src=<file>:<sha>."""
     lines = [
         "# firstmate bb mirror manifest (bb-plugin-firstmate) — do not edit",
-        f"head={head_commit(home)}",
+        f"head={selection[0]}",
+        f"patch-set={audited_source_identity(home)}",
+        f"patch-set-sha={selection[2]}",
         f"overlay={overlay_sha}",
         f"entries={','.join(native_entries)}",
     ]
     for f in PATCHED_FILES:
         lines.append(f"src={f}:{source_shas.get(f, '')}")
+        lines.append(f"generated={f}:{hashlib.sha256((mirror / f).read_bytes()).hexdigest()}")
+    for relative in TRANSPORT_PAYLOADS:
+        lines.append(f"payload={relative}:{hashlib.sha256((mirror / relative).read_bytes()).hexdigest()}")
     (mirror / MANIFEST_NAME).write_text("\n".join(lines) + "\n")
 
 
 def read_manifest(mirror: Path) -> dict[str, str] | None:
     path = mirror / MANIFEST_NAME
-    if not path.is_file():
+    if path.is_symlink() or not path.is_file():
         return None
     data: dict[str, str] = {}
     for line in path.read_text().splitlines():
         if line.startswith("#") or "=" not in line:
             continue
         key, _, val = line.partition("=")
-        if key == "src":
+        if key in ("src", "payload", "generated"):
             name, _, sha = val.partition(":")
-            data[f"src:{name}"] = sha
+            data[f"{key}:{name}"] = sha
         else:
             data[key] = val
     return data
@@ -337,11 +454,20 @@ def verify_mirror(home: Path, overlay: Path | None = None) -> list[str]:
     source of each frozen copy has not drifted since the copy was generated (F2)."""
     mirror = home / MIRROR_DIRNAME
     reasons: list[str] = []
-    if not mirror.is_dir():
+    if mirror.is_symlink() or not mirror.is_dir():
         return ["mirror bin-bb/ is absent"]
     manifest = read_manifest(mirror)
     if manifest is None:
         return ["mirror manifest is missing (built by an older overlay); re-run the installer"]
+    for relative in TRANSPORT_PAYLOADS:
+        target = mirror / relative
+        want = manifest.get(f"payload:{relative}", "")
+        if target.is_symlink() or not target.is_file():
+            reasons.append(f"owned BB transport payload missing or symlinked: {relative}")
+        elif not want or hashlib.sha256(target.read_bytes()).hexdigest() != want:
+            reasons.append(f"owned BB transport payload stale/unrecorded: {relative}")
+        elif overlay is not None and target.read_bytes() != (overlay / "bin" / relative).read_bytes():
+            reasons.append(f"owned BB transport payload differs from current overlay: {relative}")
     # Missing siblings: any native bin entry without a mirror counterpart breaks a
     # SCRIPT_DIR source in whatever mirror script needs it.
     bin_dir = home / "bin"
@@ -352,11 +478,29 @@ def verify_mirror(home: Path, overlay: Path | None = None) -> list[str]:
                 reasons.append(f"mirror is missing sibling '{entry}' (native bin/ has it) — a ff without re-install")
             elif target.is_symlink() and not target.exists():
                 reasons.append(f"mirror sibling '{entry}' is a dangling symlink")
+            elif entry not in PATCHED_FILES and entry not in TRANSPORT_PAYLOADS and entry != "backends":
+                if not target.is_symlink() or os.readlink(target) != os.path.join("..", "bin", entry):
+                    reasons.append(f"mirror sibling '{entry}' has a mismatched native link")
+        backend_dir = bin_dir / "backends"
+        if backend_dir.is_dir():
+            for entry in sorted(os.listdir(backend_dir)):
+                if f"backends/{entry}" in TRANSPORT_PAYLOADS:
+                    continue
+                target = mirror / "backends" / entry
+                if not target.is_symlink() or os.readlink(target) != os.path.join("..", "..", "bin", "backends", entry) or not target.exists():
+                    reasons.append(f"mirror backend '{entry}' has a mismatched native link")
     # HEAD drift: the plugin's own ff re-mirrors, but an out-of-band ff does not.
     current = head_commit(home)
     recorded = manifest.get("head", "")
     if current and recorded and current != recorded:
         reasons.append(f"HEAD moved since the mirror was built ({recorded[:12]} -> {current[:12]}); re-run the installer")
+    if overlay is not None:
+        try:
+            selected_sha, _, selected_digest = select_patch_set(home, overlay)
+            if manifest.get("patch-set") != audited_source_identity(home) or manifest.get("patch-set-sha") != selected_digest:
+                reasons.append("audited native patch-set identity/digest differs from mirror manifest; re-run the installer")
+        except ValueError as error:
+            reasons.append(str(error))
     # Overlay drift: the plugin shipped a newer adapter or patch set since this build.
     if overlay is not None and overlay.is_dir():
         built = manifest.get("overlay", "")
@@ -367,6 +511,12 @@ def verify_mirror(home: Path, overlay: Path | None = None) -> list[str]:
     # Frozen-copy drift: the pristine native source of a patched copy changed since the
     # copy was generated, so the copy no longer reflects upstream.
     for f in PATCHED_FILES:
+        target = mirror / f
+        generated = manifest.get(f"generated:{f}", "")
+        if target.is_symlink() or not target.is_file():
+            reasons.append(f"generated mirror script missing or symlinked: {f}")
+        elif not generated or hashlib.sha256(target.read_bytes()).hexdigest() != generated:
+            reasons.append(f"generated mirror script corrupted/unrecorded: {f}")
         want = manifest.get(f"src:{f}", "")
         have = sha256_text(pristine_source(home, f"bin/{f}"))
         if want and have != want:
@@ -388,6 +538,7 @@ def _mirror_backends(native_backends: Path, dest: Path, overlay: Path) -> None:
         die(f"missing adapter {adapter}")
     shutil.copy2(adapter, dest / "bb.sh")
     shutil.copy2(overlay / "bin" / "backends" / "bb-worker-transport.txt", dest / "bb-worker-transport.txt")
+    shutil.copy2(overlay / "bin" / "backends" / "bb-worker-prompt.py", dest / "bb-worker-prompt.py")
     os.chmod(dest / "bb.sh", 0o755)
     print(f"installed {dest / 'bb.sh'}")
 
@@ -519,6 +670,10 @@ def main() -> None:
 
     overlay = Path(args.overlay).resolve() if args.overlay else Path(__file__).resolve().parent
 
+    try:
+        select_patch_set(home, overlay)
+    except ValueError as error:
+        die_loud("native source/patch selection refused", str(error))
     write_exclude(home)  # exclude first, so the mirror never flashes as dirty
     mirror = build_mirror(home, overlay)
     install_docs(home, overlay)

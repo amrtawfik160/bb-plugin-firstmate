@@ -1,0 +1,25 @@
+✖ route-only retirement permits the verified secondmate supervisor while genuine retired workers remain excluded (140.805144ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 0
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 438.510699
+
+✖ failing tests:
+
+test at server.launch-delivery.test.mjs:637:1
+✖ route-only retirement permits the verified secondmate supervisor while genuine retired workers remain excluded (140.805144ms)
+  AssertionError [ERR_ASSERTION]: route retirement is not worker retirement
+      at TestContext.<anonymous> (file:///root/github_projects/bb-plugin-firstmate-launch-pr-lifecycle/server.launch-delivery.test.mjs:645:10)
+      at async Test.run (node:internal/test_runner/test:1332:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: true,
+    expected: true,
+    operator: 'notStrictEqual',
+    diff: 'simple'
+  }

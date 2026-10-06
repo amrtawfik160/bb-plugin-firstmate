@@ -1,0 +1,25 @@
+✖ public paged PR reads expose exact SDK source provenance outside the unchanged full body (88.440654ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 0
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 394.395492
+
+✖ failing tests:
+
+test at server.methods.test.mjs:222:1
+✖ public paged PR reads expose exact SDK source provenance outside the unchanged full body (88.440654ms)
+  AssertionError [ERR_ASSERTION]: the public page must expose resolved SDK provenance
+      at TestContext.<anonymous> (file:///root/github_projects/bb-plugin-firstmate-launch-pr-lifecycle/server.methods.test.mjs:242:72)
+      at async Test.run (node:internal/test_runner/test:1332:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: null,
+    expected: true,
+    operator: '==',
+    diff: 'simple'
+  }

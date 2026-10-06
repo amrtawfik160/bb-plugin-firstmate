@@ -1,0 +1,5 @@
+
+> bb-plugin-firstmate@0.4.0 fidelity
+> node --experimental-strip-types scripts/skill-fidelity.ts --native /tmp/fm-prompt-fixture-diRWgF
+
+skill-fidelity: OK — 33 skills, 12 BB-DIVERGE anchors, 7 BB-ONLY fences authorised, snapshot fresh vs native.

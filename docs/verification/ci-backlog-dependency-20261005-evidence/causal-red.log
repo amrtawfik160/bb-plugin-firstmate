@@ -1,0 +1,32 @@
+✖ clean CI resolves the locked native backlog CLI while refusing real BB transport (8.554116ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 0
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 83.610032
+
+✖ failing tests:
+
+test at scripts/ci-check.test.mjs:13:1
+✖ clean CI resolves the locked native backlog CLI while refusing real BB transport (8.554116ms)
+  AssertionError [ERR_ASSERTION]: native tests must not depend on a globally installed tasks-axi
+  + actual - expected
+  
+  + '/usr/lib/node_modules/tasks-axi/dist/bin/tasks-axi.js'
+  - '/root/github_projects/bb-plugin-firstmate-launch-pr-lifecycle/scripts/ci-tools/node_modules/tasks-axi/dist/bin/tasks-axi.js'
+  
+      at TestContext.<anonymous> (file:///root/github_projects/bb-plugin-firstmate-launch-pr-lifecycle/scripts/ci-check.test.mjs:20:10)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1325:25)
+      at Test.start (node:internal/test_runner/test:1191:17)
+      at startSubtestAfterBootstrap (node:internal/test_runner/harness:385:17) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: '/usr/lib/node_modules/tasks-axi/dist/bin/tasks-axi.js',
+    expected: '/root/github_projects/bb-plugin-firstmate-launch-pr-lifecycle/scripts/ci-tools/node_modules/tasks-axi/dist/bin/tasks-axi.js',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }

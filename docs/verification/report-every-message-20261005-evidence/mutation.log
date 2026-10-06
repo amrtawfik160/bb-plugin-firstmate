@@ -1,0 +1,27 @@
+✖ late audit notification continuation preserves unread reports and resumes native final-outcome reporting (47.368116ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 0
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 182.730911
+
+✖ failing tests:
+
+test at scripts/wake-receipt.test.ts:420:1
+✖ late audit notification continuation preserves unread reports and resumes native final-outcome reporting (47.368116ms)
+  AssertionError [ERR_ASSERTION]: native every-message translation applies before private receipt handling, not only afterward
+      at TestContext.<anonymous> (file:///root/github_projects/bb-plugin-firstmate-launch-pr-lifecycle/scripts/wake-receipt.test.ts:433:10)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1325:25)
+      at Test.start (node:internal/test_runner/test:1191:17)
+      at startSubtestAfterBootstrap (node:internal/test_runner/harness:385:17) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: false,
+    expected: true,
+    operator: '==',
+    diff: 'simple'
+  }

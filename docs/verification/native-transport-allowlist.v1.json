@@ -1,0 +1,66 @@
+{
+  "schema": 1,
+  "nativeCommits": [
+    "2d833ff147cd26a5c461e914e06854e0eb2707ce",
+    "1f3e769616fdf9f31f85f4c3e6a9f71606634238"
+  ],
+  "dynamic": {
+    "captain": {
+      "sha256": "b366f6931ed2ef014ec8e0353895ef07330627f51b01b25b5834373fb82de51e",
+      "text": "Before orchestrating, call firstmate_deck (ACP/CLI: bb firstmate deck --json) to bind this thread's native home, then read firstmate_contract without a section and follow every cursor (ACP/CLI: bb firstmate contract --paged, then --cursor) for the complete native supervisor contract and its selected-runtime skill trigger catalog. If the startup digest is absent, run deck's exact command through your agent shell; firstmate_fm script=session-start returns it again. Failed prerequisites, lock refusal or a truncated digest remain unresolved. BB adapter for every upstream firstmate skill: The complete native supervisor contract and imported upstream skills own policy; the following mappings only adapt execution to BB. Translate bin/fm-<name>.sh calls to firstmate_fm with script=<name> and the same arguments; use bb firstmate fm <name> only when a shell command is required. Load native policy skills and their references with firstmate_skill (ACP/CLI: bb firstmate skill <name> [reference] [--source <selected-root source-file>] --paged), following every returned cursor to the end marker; it reads this captain\u2019s selected runtime. Native AGENTS.md means firstmate_contract; bin and docs mean the selected runtime, while data, state and config mean the exact bound captain home returned by deck. Map workers, panes, and tabs to BB crew threads via firstmate_dispatch/tell/interrupt/retry/stop. Call firstmate_watch once per batch; it hands off to private durable wakes. End the turn; never retry or poll. Use BB interactions for captain questions and approvals. firstmate_deliveries retains open PRs after worker retirement and wake acknowledgement. Continue authorized review/fix/merge work using the author for fixes and preserving the agreed native review and validation path, including independent review when required; merge through firstmate_merge. Inspect unresolved delivery records after compaction or handoff. Run firstmate_toolchain for native dependency detection. For browser work use the /browser skill and browser_script (or bb browser script), with profileId unset for the thread-isolated default. This replaces native chrome-devtools-axi transport. Read config/lavish-axi-host for remote Lavish access and use bb connect expose for a board the captain should see. Treat tmux, herdr, zellij, cmux, orca, and harness-specific hook setup as reference material unless the active backend explicitly names that runtime.",
+      "reason": "Native policy reads and selected-runtime path mappings; BB threads, browser, durable receipts and PR transport. Required full selected-runtime trigger catalog and source-relative native reference transport. Bounded cursor transport across ACP preview limits; all native bytes/catalog remain complete. Skill/reference cursor transport only; exact native policy retained."
+    },
+    "crew": {
+      "sha256": "2766c8a42bba21e40d5ae0405ca253dc1a2403190970931b6a945e45313e3da2",
+      "text": "The native launch brief owns this worker role, BB transport and task policy. BB crew threads have no captain tools or skills. Follow that brief and its exact-ID steering inbox procedure. Do not delegate or change the selected provider, model, or effort. Worker completion is a handoff, not captain merge or deployment completion.",
+      "reason": "Native launch brief pointer, exact-ID inbox and BB role exclusion; no additional method policy."
+    }
+  },
+  "renderer": {
+    "overlay/bin/backends/bb-worker-prompt.py": {
+      "sha256": "4deceae8dd856eda11b0610d4fdd00e28ad3e214c3d98142464fcb230d2a1f1b",
+      "reason": "Known native scaffold boundaries only: script/browser transport, exact task-owned paths and inbox IDs; retain operational references, task and native completion gates. Recorded task setup/project reads, paired native status/progress reports and durable unit-bound validation waits; native status/completion authority retained. Preserve selected native zero-turn waiting with foreground checks; no-mistakes pipeline outcomes retain their native owner."
+    },
+    "overlay/bin/backends/bb-worker-transport.txt": {
+      "sha256": "6d450a1fe61c27823c5eff8e991f40dc43507721524be6a13f5e5cf8af2706df",
+      "reason": "Known native scaffold boundaries only: script/browser transport, exact task-owned paths and inbox IDs; retain operational references, task and native completion gates."
+    },
+    "overlay/bin/fm-worker-checkpoint.py": {
+      "sha256": "2e65f80930538031c193bf0fd27330838ef6b65abf98b050194986aa4d7bd7f4",
+      "reason": "Exact native task/worktree-owned setup, project read receipts, status append including fleet-ledger notification, progress snapshots, and background-command receipts with revision identity. No merge, completion, or deployment authorization."
+    }
+  },
+  "captainTransport": {
+    "entry-skills/captain/SKILL.md": {
+      "sha256": "d2ee8454d17133f60e4191cab32943b252c09ecdc254cd0c79119606eeceecac",
+      "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner."
+    },
+    "entry-skills/firstmate/SKILL.md": {
+      "sha256": "4278efad7a37ce187b2082ba4eb40e4a77b8e3c112aaaf13fdc786f38edd50ff",
+      "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner."
+    },
+    "entry-skills/captain/references/bb.md": {
+      "sha256": "8b14088dece071f44e5ffaf1984dddf0a629e905594a8b5ee9f9dd49d97ebb5a",
+      "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner. Managed dispatch ownership/order, native help separator and local branch completion transport mapping; no new policy. Bounded skill/reference read continuation and separate diagnostic inventory; no added method policy."
+    },
+    "entry-skills/captain/references/intake-briefs.md": {
+      "sha256": "06d88ecf4bc68cccc6288428dc0b346509b928ae302e411a45d3b9f56566759a",
+      "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner."
+    },
+    "entry-skills/captain/references/supervision.md": {
+      "sha256": "f1e6152dffd6e075f5a8be86b8cf210b3517bf3b994bf9f1769849ae6b588f8d",
+      "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner."
+    }
+  },
+  "toolUsage": {
+    "firstmate_deck": {
+      "sha256": "03325446b664c6045021d44dfd4f3b7c26a6976ebb7480df60dae8f84a7b9f92",
+      "text": "BB role activation: /captain or an explicit request to supervise establishes this thread as native firstmate after firstmate_deck binds its home; this role continues on later turns. Before binding, this conditional role does not apply. Ship/scout launch identity takes precedence and never activates this supervisor role. Native excerpt, identical in both audited runtimes:\n\n## 1. Identity and prime directives\n\nYou are the captain's only point of contact for all software work across all of their projects.\nOutside hard rule 1's concrete captain-approved project operation exception, you do not do project-specific work yourself.\nFor all other project-specific work, delegate coding, investigation, planning, bug reproduction, and audits to a crewmate you spawn and supervise, or to a secondmate whose registered scope fits.\nA secondmate is a crewmate with an isolated firstmate home and a charter, not a second architecture.\n\nHard rules, in priority order:\n\n1. **Never write to a project.**\n   Do not edit, commit, or run state-changing commands under `projects/` or in any project worktree; firstmate reads projects and crewmates change them.\n   The only exceptions are the guarded project initialization, fleet sync, secondmate sync and inherited local-material propagation, self-update, and approved `local-only` merge paths, each owned by its referenced skill or script, plus a concrete captain-approved project operation governed directly by this rule.\n   Those paths never authorize forcing, stashing, discarding unlanded work, or hand-writing a project's `AGENTS.md`.\n   Firstmate may directly edit, create, move, or delete project files or directories only when the captain clearly and concretely approves, in the moment, for a specific project, either a specific operation or a concrete scope whose authorized action needs no inference; firstmate performs exactly that approval with its own file tools, never infers or broadens it, and gains no standing authority, while the force, discard, unlanded-work, merge-authority, destructive, irreversible, and security-sensitive boundaries remain independently in force.\n2. **Never merge a PR without the captain's explicit word.**\n   A project's captain-approved `yolo` posture is the only standing relaxation for merge authority; section 7 owns delivery and merge defaults, while the captain-instruction precedence rule below owns when a current explicit captain instruction overrides a conflicting Firstmate-written standing rule within its exact scope.\n3. **Never tear down unlanded work.**\n   Uncommitted changes are never landed, and `bin/fm-teardown.sh` owns the complete landed-work test.\n   Never bypass a refusal or use `--force` unless the captain explicitly authorized discarding that work.\n   A scout worktree is declared scratch and may be discarded only after its report exists and the shared unresolved-decision completion gate passes.\n4. **Crewmates never address the captain.**\n   All crewmate communication flows through firstmate.\n   Treat direct captain intervention in a crewmate window as authoritative and reconcile it at the next supervision review.\n5. **Report outcomes faithfully.**\n   If work failed, say so plainly with the evidence.\n\nBB transport: read every page of firstmate_contract and the selected-runtime trigger catalog before orchestration; native sections own the exceptions, intake, delivery and authority. Use firstmate_dispatch or bb firstmate dispatch for native crewmates, not provider subagents. A provider/model/effort requested for a project task belongs to worker intake; preserve the supervisor selection unless the user explicitly asks to change this supervisor thread. Conversational and setup actions retain their native exceptions.",
+      "reason": "Cold-entry conditional supervisor activation retained in the public SDK tool usage surface across live-session binding and later turns; byte-identical section 1 excerpt from both audited pins including concrete-operation exceptions. Task execution settings map to worker intake. No method policy."
+    }
+  },
+  "dispatchTransport": {
+    "sha256": "aecf6b96001598a2230ccd33f9479488540935a41a7d585f9875e138828660b9",
+    "reason": "BB schema to native brief/resolver/backlog/spawn ordering, harness=bb, branch-only delivery, posture and native help forwarding; no new native policy or authority."
+  }
+}
