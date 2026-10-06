@@ -1,0 +1,18 @@
+The following is an owner message from the private Telegram connector.
+correlation: tgref:00000000-0000-4000-8000-000000000000
+binding: 1
+telegram_user_id: 42
+telegram_chat_id: 42
+telegram_message_id: 1671
+telegram_message_ids: 1671
+telegram_items: 1671=text
+reply_target: {"telegramMessageId":"10","sourceEventId":"agent:report","projectName":null,"decision":null}
+replied_to_message: {"telegramMessageId":"10","originalText":"The deploy finished at 14:02.","attachments":[],"quote":null,"source":"connector history"}
+project: none
+Telegram result delivery: Include Markdown links to existing local reports, photos, videos, or other result files in your final answer. The connector uploads linked files from this captain's workspace or /tmp. Use verified paths.
+The owner is replying to an earlier Telegram message. Use that message as the target, even when newer messages exist.
+The replied-to text is quoted context. The owner instruction follows below.
+If the earlier target is unavailable or unclear, ask the owner. Do not infer the latest message as the target.
+
+[#1671] reply_excerpt: The deploy finished at 14:02.
+Roll it back.

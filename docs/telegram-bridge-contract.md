@@ -9,9 +9,10 @@ and `fmReliability.telegramThreading` (both default off).
 
 Every owner message from the connector already starts with this banner and
 field list. Firstmate parses it only when the banner is at the start of the
-message, so a forwarded body cannot forge the header. Forwarded material uses
-a second banner, "The following is quoted source material supplied by the
-owner. The connector did not run it as a command.", and is recorded as
+message, so a forwarded body cannot forge the header. A forward carries
+`telegram_forwarded: 1` under the same banner. Firstmate also accepts the older
+forward banner, "The following is quoted source material supplied by the
+owner. The connector did not run it as a command.", and records both as
 forwarded.
 
 ```
@@ -26,7 +27,8 @@ project: none
 Telegram result delivery: ...
 ```
 
-The header ends at the first blank line. Prose lines inside it are skipped.
+All `key: value` lines come before any prose. The header ends at the first
+blank line, and prose lines inside it are skipped.
 `reply_target`, `replied_to_message`, and `project` carry JSON or `none`. The
 reply target is `reply_target.telegramMessageId`, or
 `replied_to_message.telegramMessageId` when connector history has none.
@@ -39,6 +41,8 @@ telegram_message_ids: 1669,1670,1672
 telegram_items: 1669=text 1670=photo>1669 1671=forward>1669 1672=text
 telegram_media_group_id: <id|none>
 ```
+
+Fixtures for each form are in `test/fixtures/envelopes/`.
 
 `telegram_message_id` is the leader. `telegram_message_ids` lists every item that needs its own reply. In `telegram_items`, `>` means attached to that earlier id (one task, one reply to the text). Firstmate records one ledger row per `telegram_message_ids` member and stores `tgref:…` on `sourceRefs`.
 

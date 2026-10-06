@@ -144,3 +144,29 @@ test("a header with no reply or project keeps both empty", () => {
   assert.equal(parsed?.repliedTo, null);
   assert.equal(parsed?.project, null);
 });
+
+test("final Telegram connector fixtures parse to their owner message", () => {
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ["plain-text", { messageId: "1669", forwarded: false, replyTo: null, mediaGroupId: null, items: "1669=text", body: "[#1669] Check the deploy status for parknwash." }],
+    ["forward", { messageId: "1670", forwarded: true, replyTo: null, items: "1670=forward" }],
+    ["reply-to", { messageId: "1671", forwarded: false, replyTo: "10", repliedTo: { telegramMessageId: "10", originalText: "The deploy finished at 14:02." }, body: "[#1671] reply_excerpt: The deploy finished at 14:02.\nRoll it back." }],
+    ["album", { messageId: "1672", mediaGroupId: "13800000000000001", items: "1672=album", messageIds: ["1672"] }],
+  ];
+  for (const [name, expected] of cases) {
+    const parsed = parseConnectorHeader(fixture(name));
+    assert.ok(parsed, `${name} must parse`);
+    assert.equal(parsed.chatId, "42", name);
+    assert.equal(parsed.correlation, "tgref:00000000-0000-4000-8000-000000000000", name);
+    assert.equal(parsed.project, null, name);
+    for (const [key, value] of Object.entries(expected)) assert.deepEqual(parsed[key as keyof typeof parsed], value, `${name}.${key}`);
+  }
+  assert.match(parseConnectorHeader(fixture("forward"))!.body, /^\[#1670\] The owner forwarded this content\./);
+  assert.match(parseConnectorHeader(fixture("album"))!.body, /^Two screenshots of the error\nfile: photo\.jpg/);
+});
+
+test("an album item may name the message it attaches to", () => {
+  assert.deepEqual(parseTelegramItems("10=text 11=photo>10"), [
+    { id: "10", kind: "text", attachedTo: null },
+    { id: "11", kind: "photo", attachedTo: "10" },
+  ]);
+});

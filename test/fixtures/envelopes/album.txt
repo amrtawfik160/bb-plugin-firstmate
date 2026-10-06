@@ -1,0 +1,17 @@
+The following is an owner message from the private Telegram connector.
+correlation: tgref:00000000-0000-4000-8000-000000000000
+binding: 1
+telegram_user_id: 42
+telegram_chat_id: 42
+telegram_message_id: 1672
+telegram_message_ids: 1672
+telegram_items: 1672=album
+telegram_media_group_id: 13800000000000001
+reply_target: none
+project: none
+Telegram result delivery: Include Markdown links to existing local reports, photos, videos, or other result files in your final answer. The connector uploads linked files from this captain's workspace or /tmp. Use verified paths.
+
+Two screenshots of the error
+file: photo.jpg (photo, image/jpeg, 6 bytes)
+(no caption)
+file: photo.jpg (photo, image/jpeg, 6 bytes)

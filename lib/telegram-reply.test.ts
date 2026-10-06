@@ -89,3 +89,8 @@ test("an ack with threaded replies off is not applicable, not delivered", async 
   const result = await sendTelegramReply({ payload: { ...replyPayload, kind: "ack" }, callRpc: async () => ({ queued: 0, duplicate: false, mode: "off" }) });
   assert.equal(result.outcome, "not-applicable");
 });
+
+test("telegram.reply returns queued 0 for an unbound chat or empty text, which is not delivery", async () => {
+  await assert.rejects(sendTelegramReply({ payload: { ...replyPayload, text: "" }, callRpc: async () => ({ queued: 0, duplicate: false, mode: "on" }) }), /not queued/);
+  await assert.rejects(sendTelegramReply({ payload: replyPayload, callRpc: async () => ({ queued: 0, duplicate: false, mode: "off" }) }), /not queued/);
+});

@@ -172,3 +172,12 @@ test("a released reply reservation can be claimed again", () => {
   ledger.releaseOutbox(row, "reply");
   assert.equal(ledger.claimOutbox(row, "reply", "answer", 2).sent, true);
 });
+
+test("an album row from the final connector keeps its media group id", () => {
+  const ledger = store();
+  const text = readFileSync(new URL("../test/fixtures/envelopes/album.txt", import.meta.url), "utf8");
+  ledger.record(userEvent({ text, telegram: parseInboundTelegram(text) }));
+  const [row] = ledger.listOpen("thr_cap");
+  assert.equal(row?.messageId, "1672");
+  assert.equal(row?.mediaGroupId, "13800000000000001");
+});

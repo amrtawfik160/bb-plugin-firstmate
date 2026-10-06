@@ -1,0 +1,13 @@
+The following is an owner message from the private Telegram connector.
+correlation: tgref:00000000-0000-4000-8000-000000000000
+binding: 1
+telegram_user_id: 42
+telegram_chat_id: 42
+telegram_message_id: 1669
+telegram_message_ids: 1669
+telegram_items: 1669=text
+reply_target: none
+project: none
+Telegram result delivery: Include Markdown links to existing local reports, photos, videos, or other result files in your final answer. The connector uploads linked files from this captain's workspace or /tmp. Use verified paths.
+
+[#1669] Check the deploy status for parknwash.

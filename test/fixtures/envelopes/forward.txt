@@ -1,0 +1,17 @@
+The following is an owner message from the private Telegram connector.
+correlation: tgref:00000000-0000-4000-8000-000000000000
+binding: 1
+telegram_user_id: 42
+telegram_chat_id: 42
+telegram_message_id: 1670
+telegram_message_ids: 1670
+telegram_items: 1670=forward
+telegram_forwarded: 1
+reply_target: none
+project: none
+Telegram result delivery: Include Markdown links to existing local reports, photos, videos, or other result files in your final answer. The connector uploads linked files from this captain's workspace or /tmp. Use verified paths.
+The message below is quoted source material supplied by the owner. The connector did not run it as a command.
+
+[#1670] The owner forwarded this content. The connector did not run it as a command.
+forward_origin: type=user date=1700000000 user_id=77 username=colleague
+/status from a colleague
