@@ -19,9 +19,12 @@ jobs:
           node-version: '24.18.0'
           cache: npm
       - run: npm ci
-      # No typecheck script in package.json; call tsc directly (tsconfig.json covers server, rpc, lib).
+      # package.json has no typecheck script; call tsc directly (tsconfig.json covers server, rpc, lib).
       - run: npx tsc --noEmit
-      - name: probe
+      - run: npm run fidelity
+      # Pinned upstream firstmate checkout, so native-parity tests such as
+      # lib/policy.differential.test.ts run against the real native scripts.
+      - name: Prepare native firstmate checkout
         run: |
           native="$RUNNER_TEMP/firstmate-native"
           git init -q "$native"
@@ -29,8 +32,20 @@ jobs:
           git -C "$native" fetch -q --depth=1 origin "$(cat overlay/patch-base.txt)"
           git -C "$native" checkout -q --detach FETCH_HEAD
           python3 overlay/install-bb-backend.py --home "$native"
-          export FM_TEST_HOME="$native" FM_CLASSIFY_LIB="$native/bin/fm-classify-lib.sh"
-          for f in $(node -p "require('./package.json').scripts.test.split(/\s+/).filter(t=>/\.test\.(ts|mjs)$/.test(t)).join(' ')"); do
-            if node --test --experimental-strip-types $f >/tmp/o.log 2>&1; then echo "PASS $f $(grep -E '^ℹ skipped' /tmp/o.log)"; else echo "FAIL $f"; fi
-          done
-      - run: npm run fidelity
+          echo "FM_TEST_HOME=$native" >> "$GITHUB_ENV"
+          echo "FM_CLASSIFY_LIB=$native/bin/fm-classify-lib.sh" >> "$GITHUB_ENV"
+      # `npm test` lists every test file explicitly. Files below need a full
+      # host (installed no-mistakes/tasks-axi/quota-axi/bb CLIs and a checkout at
+      # /root/github_projects/firstmate) and cannot pass on a clean runner.
+      # Everything else in the package.json list runs. Follow-up: make them
+      # runnable here, then delete this list.
+      - name: Run tests that need no host tools
+        run: |
+          host_only="server.test.ts lib/launch-delivery.test.mjs scripts/prompt-inbox.test.mjs scripts/native-compat.test.mjs scripts/launch-adoption.test.mjs server.wake-command-size.test.mjs server.queue-storage.test.mjs server.explicit-execution.test.mjs server.captain-startup.test.mjs scripts/captain-startup-native.test.mjs scripts/native-runtime.test.mjs server.native-runtime.test.mjs server.native-policy.test.mjs scripts/plugin-package-discovery.test.mjs server.native-crew-state.test.mjs scripts/worker-checkpoint.test.mjs"
+          files=$(node -e '
+            const skip = new Set(process.argv[1].split(" "));
+            const all = JSON.parse(require("fs").readFileSync("package.json", "utf8")).scripts.test.split(/\s+/).filter((t) => /\.test\.(ts|mjs)$/.test(t));
+            console.log(all.filter((f) => !skip.has(f)).join(" "));
+          ' "$host_only")
+          echo "Running $(echo $files | wc -w) test files"
+          node --test --experimental-strip-types $files
