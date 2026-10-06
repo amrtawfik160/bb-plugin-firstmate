@@ -71,13 +71,13 @@ test('uncertain replacement reconciles its reserved slot at capacity before any 
 });
 test('dispatch admission fixes actual concurrent cap probe; finished scout promotion also reserves capacity',async()=>{
  const host=await base();try {
- await host.bb.storage.kv.set('crews',[1,2,3,4].map(n=>row(n)));
+ await host.bb.storage.kv.set('crews',[1,2,3,4,5,6,7,8,9].map(n=>row(n)));
  let spawned=0;host.harness.sdk.stub('threads.spawn',async()=>{spawned++;await new Promise(r=>setTimeout(r,10));return{id:'thr_new'};});
  const results=await Promise.all(['a','b'].map(task=>host.harness.behavior.runCli(['dispatch','--project','proj_1','--',task],ctx)));
  assert.equal(spawned,1);assert.equal(results.filter(r=>r.exitCode===0).length,1);assert.match(results.find(r=>r.exitCode!==0).stderr,/cap reached/);
- await host.bb.storage.kv.set('crews',[...[1,2,3,4,5].map(n=>row(n)),row(6,'scout')]);
- host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:threadId==='thr_c6'?'idle':'active'}));
- const promoted=await host.harness.behavior.runCli(['promote','c6'],ctx);assert.equal(promoted.exitCode,1);assert.match(promoted.stderr,/cap reached/);assert.equal(spawned,1);
+ await host.bb.storage.kv.set('crews',[...[1,2,3,4,5,6,7,8,9,10].map(n=>row(n)),row(11,'scout')]);
+ host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:threadId==='thr_c11'?'idle':'active'}));
+ const promoted=await host.harness.behavior.runCli(['promote','c11'],ctx);assert.equal(promoted.exitCode,1);assert.match(promoted.stderr,/cap reached/);assert.equal(spawned,1);
  }finally{await host.harness.lifecycle.dispose();}
 });
 test('native bridge seeds role/home/generation before initial configuration and never invokes mark after creation',async()=>{
