@@ -26,7 +26,7 @@
       "reason": "Known native scaffold boundaries only: script/browser transport, exact task-owned paths and inbox IDs; retain operational references, task and native completion gates."
     },
     "overlay/bin/fm-worker-checkpoint.py": {
-      "sha256": "2e65f80930538031c193bf0fd27330838ef6b65abf98b050194986aa4d7bd7f4",
+      "sha256": "95badd1c1f07c9891842ffc3136e63fd15949045a88abb11067779a54cb36c89",
       "reason": "Exact native task/worktree-owned setup, project read receipts, status append including fleet-ledger notification, progress snapshots, and background-command receipts with revision identity. No merge, completion, or deployment authorization."
     }
   },

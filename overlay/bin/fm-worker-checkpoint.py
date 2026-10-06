@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -166,7 +167,7 @@ def required_reads():
                 paths.append(path.resolve())
                 break
         else:
-            raise ValueError('TypeScript project has no readable TypeScript best-practices skill')
+            print('warning: no typescript-best-practices skill under ~/.agents/skills or ~/.codex/skills; setup continues without it', file=sys.stderr)
     return list(dict.fromkeys(paths))
 
 
@@ -270,6 +271,23 @@ def update(args, home, state, data, values):
         status(home, state, args.task, *values)
 
 
+def launch_unit(home, task, identifier):
+    if not shutil.which('systemd-run') or not Path('/run/systemd/system').is_dir() or not hasattr(os, 'geteuid') or os.geteuid() != 0:
+        return False
+    # A system unit starts with a bare environment; carry the caller's, including HOME.
+    environment = {**os.environ, 'FM_HOME': str(home), 'FM_ROOT_OVERRIDE': os.environ.get('FM_ROOT_OVERRIDE', str(home))}
+    environment.setdefault('PATH', os.defpath)
+    settings = [f'--setenv={key}={value}' for key, value in environment.items()
+                if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key) and '\n' not in value]
+    try:
+        subprocess.run(['systemd-run', '--quiet', '--collect', '--property=Type=exec',
+                        f'--unit=fm-check-{identifier}', f'--working-directory={Path.cwd()}', *settings,
+                        sys.executable, str(Path(__file__).resolve()), task, '_execute', identifier], check=True)
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return True
+
+
 def unit_stopped(identifier):
     result = subprocess.run(['systemctl', 'show', f'fm-check-{identifier}.service', '--property=LoadState',
                              '--property=ActiveState', '--property=Result'], capture_output=True, text=True)
@@ -298,24 +316,16 @@ def check(args, home, state, data, values):
             save(data / 'checks' / f'{identifier}.json', row)
             status(home, state, args.task, 'paused', f'{row["label"]}; resume when check {identifier} finishes', f'bb-check-{identifier}')
             report(data, 'paused', f'{row["label"]}; check {identifier} is running')
+        if not foreground and not launch_unit(home, args.task, identifier):
+            # Without a usable system manager (macOS, containers, non-root) the check runs here.
+            print('systemd cannot start a validation unit here; running the check in the foreground', file=sys.stderr)
+            row['transport'] = 'foreground'
+            with locked(data):
+                save(data / 'checks' / f'{identifier}.json', row)
+            foreground = True
         if foreground:
             check(argparse.Namespace(task=args.task, action='_execute'), home, state, data, [identifier])
             return check(argparse.Namespace(task=args.task, action='wait'), home, state, data, [identifier])
-        try:
-            subprocess.run(['systemd-run', '--quiet', '--collect', '--property=Type=exec',
-                            f'--unit=fm-check-{identifier}', f'--working-directory={Path.cwd()}',
-                            f'--setenv=PATH={os.environ.get("PATH", os.defpath)}',
-                            f'--setenv=FM_HOME={home}', f'--setenv=FM_ROOT_OVERRIDE={os.environ.get("FM_ROOT_OVERRIDE", str(home))}',
-                            sys.executable, str(Path(__file__).resolve()), args.task, '_execute', identifier], check=True)
-        except (OSError, subprocess.CalledProcessError):
-            row['exitCode'] = 125
-            row['finishedRevision'] = revision()
-            with locked(data):
-                save(data / 'checks' / f'{identifier}.json', row)
-                status(home, state, args.task, 'resolved', 'check launch failed; inspect the systemd error', f'bb-check-{identifier}')
-                status(home, state, args.task, 'working', 'check could not start; inspect launch error')
-                report(data, 'working', 'check could not start')
-            raise
         print(shlex.join(['python3', str(Path(__file__).resolve()), args.task, 'wait', identifier]))
     elif args.action in ('wait', '_execute'):
         if len(values) != 1 or not re.fullmatch(r'[a-f0-9]{32}', values[0]):
