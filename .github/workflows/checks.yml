@@ -1,0 +1,34 @@
+name: Firstmate checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.18.0'
+          cache: npm
+      - run: npm ci
+      - run: npm ci --prefix scripts/ci-tools
+      - run: npm run typecheck
+      - run: npm run fidelity
+      - run: npm run runtime:verify
+      - name: Prepare owned, exact native test sources
+        shell: bash
+        run: |
+          native="$RUNNER_TEMP/firstmate-native"
+          git init "$native"
+          git -C "$native" remote add origin https://github.com/kunchenguid/firstmate.git
+          git -C "$native" fetch --depth=1 origin 2d833ff147cd26a5c461e914e06854e0eb2707ce:refs/heads/audited-old 1f3e769616fdf9f31f85f4c3e6a9f71606634238:refs/heads/audited-current
+          git -C "$native" checkout --detach 1f3e769616fdf9f31f85f4c3e6a9f71606634238
+          python3 overlay/install-bb-backend.py --home "$native"
+          echo "FIRSTMATE_TEST_NATIVE=$native" >> "$GITHUB_ENV"
+      - run: npm run test:ci
+      - name: Build with the locked BB 0.44.0 tool
+        run: scripts/ci-tools/node_modules/.bin/bb plugin build .
+      - run: git diff --exit-code
+      - run: git diff --check

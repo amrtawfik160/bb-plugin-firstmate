@@ -3,7 +3,7 @@ import test from 'node:test';
 import {spawnSync} from 'node:child_process';
 import {readFileSync,writeFileSync,rmSync} from 'node:fs';
 import {join} from 'node:path';
-import {createFakePluginHost,makeThreadResponse} from '@get-bb/plugin-sdk/testing';
+import {createFakePluginHost,makeThreadResponse,makePluginAgentConfigurationContext} from '@get-bb/plugin-sdk/testing';
 import plugin from './server.ts';
 import {createLaunches} from './lib/launch.ts';
 import {createDeliveries} from './lib/pr-delivery.ts';
@@ -36,7 +36,7 @@ function stubs(host,state,f) {
  });
 }
 async function factory(relaunches=1,f,previous,state={n:0,execution:new Map(),meta:new Map(),archived:new Set()}) {
- const host=previous??createFakePluginHost({pluginId:'firstmate',settings:f?{fmHome:f.home,fmHostId:'host_1'}:{}});if(!previous){await plugin(host.bb);await host.bb.storage.kv.set('crews',[crew(f?.home,relaunches)]);}
+ const host=previous??createFakePluginHost({pluginId:'firstmate',settings:f?{fmHome:f.home,fmHostId:'host_1',selectedMethods:'selected-v1'}:{}});if(!previous){await plugin(host.bb);await host.bb.storage.kv.set('crews',[crew(f?.home,relaunches)]);}
  stubs(host,state,f);return{host,state};
 }
 test('second user-directed execution change preserves same environment/task/contract and conservative legacy failure count',async()=>{
@@ -89,6 +89,12 @@ for(const pin of pins) for(const [shape,mode] of [['ship','direct-PR'],['ship','
  const result=await host.harness.behavior.runCli(change(),ctx);assert.equal(result.exitCode,0,result.stderr);assert.deepEqual(f.invariant(),before);
  const meta=readFileSync(join(f.home,'state/c1.meta'),'utf8');assert.match(meta,/^bb_thread_id=thr_new1$/m);assert.match(meta,/^spawn_gen=bb-r3$/m);assert.match(meta,/^native_extra=keep$/m);if(shape==='ship'){assert.match(meta,/^branch=fm\/c1$/m);assert.ok(meta.includes(`mode=${mode}`));assert.match(meta,/^yolo=off$/m);}
  const spawned=host.harness.sdk.callsTo('threads.spawn')[0][0];assert.equal(spawned.environment.environmentId,'env_wt');assert.ok(spawned.prompt.includes(f.task));assert.equal(spawned.pluginMetadata.shape,shape);assert.equal(spawned.pluginMetadata.nativeHome,f.home);
+ const configured=await host.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({pluginMetadata:spawned.pluginMetadata}));
+ assert.deepEqual(configured.tools.map(t=>t.name),['firstmate_methods']);assert.deepEqual(configured.skills,[]);assert.match(configured.instructions,/worker-methods/);assert.doesNotMatch(configured.instructions,/captain-methods|Calm/);
+ if(shape==='ship' && mode==='direct-PR')assert.match(configured.instructions,/name=pr/);else assert.doesNotMatch(configured.instructions,/name=pr/);
+ const author=host.harness.registrations.agentTools.find(t=>t.name==='firstmate_methods');
+ const methods=await author.execute({action:'read',name:'worker-methods'},{threadId:'thr_new1',projectId:'proj_1'});assert.equal(typeof methods,'string',JSON.stringify(methods));assert.match(methods,/native launch brief owns role/);
+
  assert.equal(seen.filter(c=>c.includes('/fm-worker-rebind.sh') && (c.includes('--check')||c.includes('--publish'))).length,2);assert.equal(host.harness.sdk.callsTo('threads.send').length,0);assert.equal(host.harness.sdk.callsTo('environments.remove').length,0);
  }finally{if(host)await host.harness.lifecycle.dispose();f.clean();}
 });

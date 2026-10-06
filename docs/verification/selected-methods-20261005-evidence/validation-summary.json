@@ -1,0 +1,40 @@
+{
+  "baseline": "71e4bb3",
+  "fullSuite": {
+    "tests": 860,
+    "passed": 860,
+    "failed": 0,
+    "skipped": 0,
+    "durationSeconds": 190.831403887
+  },
+  "causalMutationsKilled": 13,
+  "publicMethodsCases": 10,
+  "nativeInitialCompositionCases": 2,
+  "nativeReplacementCases": 8,
+  "actualBbPackageCases": 3,
+  "nativePins": [
+    "2d833ff147cd26a5c461e914e06854e0eb2707ce",
+    "1f3e769616fdf9f31f85f4c3e6a9f71606634238"
+  ],
+  "typecheck": "passed",
+  "fidelity": "passed",
+  "runtimeIntegrity": "passed",
+  "build": {
+    "status": "passed",
+    "bbVersion": "0.44.0",
+    "sdkPin": "0.4.104"
+  },
+  "newModelAcceptance": "pending parent",
+  "productionActivation": "not performed",
+  "externalNoMistakesPrAuthorRead": "unresolved",
+  "everyMessageReportingAcceptance": "failed; final outcome passed",
+  "testedProductionSha256": {
+    "server.ts": "5f4583cceb34cd86fdb85cc9ffdb0c8c878f748ad9486a34fdc89243903b00df",
+    "lib/selected-methods.ts": "f253563b3b8d1ced6a150382606b3b4510c2eca27075be55899b77bb7287facf",
+    "lib/method-assets.ts": "aad6c0ad4b64a1d7f9be1c263f9dc3626503e1ab64ed691f58e63be0c37315f8",
+    "lib/skill-transport.ts": "a1c33ab9432761b94435a4d5be7f41beaa32cd63e394aaa84eeb59e7ce95cbf0",
+    "skills/captain-methods/SKILL.md": "b8fe374c2f6ba11a07e9b4295f6eadb89f51532b95cf724c7f60075e31affa5c",
+    "skills/worker-methods/SKILL.md": "ae650a616cebb9eedac8dcc8af7f6952fe9d63b7ebb41811ab73f461f8b06fcf",
+    "skills/worker-methods/references/product-verification.md": "58969d5ce4be511de3ab325472088d39e9809bb10823b2bc57f4f19eadd15225"
+  }
+}

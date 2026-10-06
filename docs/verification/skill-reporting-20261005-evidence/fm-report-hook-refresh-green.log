@@ -1,0 +1,15 @@
+✔ captain cli first binding and bound resume use only exact home on 2d833ff1 (3929.022786ms)
+✔ captain tool first binding and bound resume use only exact home on 2d833ff1 (3820.073432ms)
+✔ captain cli first binding and bound resume use only exact home on 1f3e7696 (4220.992277ms)
+✔ captain tool first binding and bound resume use only exact home on 1f3e7696 (4029.095883ms)
+✔ actual registered cli clean captain binding stages package on authoritative host without external source (6185.964351ms)
+✔ actual registered tool clean captain binding stages package on authoritative host without external source (6293.139176ms)
+✔ bound captain refresh replaces a legacy cached hook without changing runtime selection or reports (5714.440529ms)
+ℹ tests 7
+ℹ suites 0
+ℹ pass 7
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 18522.688487

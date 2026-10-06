@@ -1,0 +1,20 @@
+✔ native defaults route through actual configuration across resume and reload without side effects (152.323177ms)
+✔ saturated captain instruction budget preserves every runtime obligation and role pointer (121.700791ms)
+✔ unregistered method source references resolve within the repository without global skill paths (1.535566ms)
+✔ cold runtime package resolves typed Firstmate request before binding or reload (78.427949ms)
+✔ cold runtime package resolves direct captain invocation before binding or reload (83.270273ms)
+✔ public methods selection persists for new captains and exposes only role-owned verified references (83.885459ms)
+✔ direct-PR body author reads the actual installed PR skill in bounded owner-pinned pages; pipeline and local-only ownership stay native (70.827072ms)
+✔ public paged PR reads expose exact SDK source provenance outside the unchanged full body (71.29303ms)
+✔ public PR reads refuse oversized UTF-8 or escaped provenance and complete serialized pages without truncation (73.6538ms)
+✔ PR skill lookup cancellation settles disposal without writing a body or starting another task (58.21925ms)
+✔ PR author resolves provider-specific skill copies and permits only byte-identical cross-provider copies for ACP (61.297049ms)
+✔ explicit installation PR source survives reload and unreadable foreign aliases without bypassing BB content guards (93.130435ms)
+ℹ tests 12
+ℹ suites 0
+ℹ pass 12
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1251.132545

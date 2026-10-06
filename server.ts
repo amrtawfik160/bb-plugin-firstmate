@@ -1,5 +1,11 @@
+import {METHODS_PROFILE,METHODS_REVISION,methodPointer,methodResource,installedPrResource,selectedPrSource,prSourcePage,type PrSource} from "./lib/selected-methods.ts";
 // bb-plugin-firstmate — firstmate-style crews native to BB.
 import { deflateSync } from "node:zlib";
+import { CAPTAIN_ROLE_INSTRUCTIONS } from "./lib/captain-role.ts";
+import { contractPage, contractCursorSection } from "./lib/contract-transport.ts";
+import { routedIntakeSchema, renderRoutedIntake } from "./lib/secondmate-intake.ts";
+import { skillPage, skillCursorRequest } from "./lib/skill-transport.ts";
+import { DISPATCH_TRANSPORT, FM_WRAPPER_HELP, taskDelivery, nativeDispatchIntake } from "./lib/dispatch-intake.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -73,7 +79,7 @@ import { correlationOf, oldestUnanswered, refuseLaterThanOldest, sendTelegramRep
 import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRecord } from "./lib/launch.ts";
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
 import { optionHelp } from "./lib/cli-help.ts";
-import { AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython } from "./lib/native-policy.ts";
+import { AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython, nativeDescriptions } from "./lib/native-policy.ts";
 import { createDeliveries, canonicalPr, deliveryLine, parseForge, type DeliveryRecord } from "./lib/pr-delivery.ts";
 import { captureHostCommand, decodeHostCapture } from "./lib/host-capture.ts";
 import { selectExecution, validateLaunchCapabilities } from "./lib/execution-selection.ts";
@@ -131,7 +137,9 @@ const crewSchema = z.object({
   // true = `task` holds only a prefix; the full brief lives under crew-task:<id>.
   taskSpilled: z.boolean().optional(),
   launchKey: z.string().optional(),
-  deliveryRequirement: z.enum(["pr", "merged", "merged-and-verified"]).optional(),
+  deliveryRequirement: z.enum(["branch", "pr", "merged", "merged-and-verified"]).optional(),
+  branchPrefix:z.string().max(120).optional(),
+  routedIntake:routedIntakeSchema.optional(),
   sourceRefs: z.array(z.string()).optional(),
   createdAt: z.string(),
 });
@@ -161,7 +169,7 @@ const decisionSchema = z.object({
 type Decision = z.infer<typeof decisionSchema>;
 
 const doneSchema = z.object({
-  deliveryRequirement:z.enum(["pr","merged","merged-and-verified"]).optional(),
+  deliveryRequirement:z.enum(["branch","pr","merged","merged-and-verified"]).optional(),
   id: z.string(),
   task: z.string(),
   shape: shapeSchema.default("ship"),
@@ -1258,6 +1266,9 @@ function flagStr(flags: Map<string, FlagValue>, ...keys: string[]): string | und
   }
   return undefined;
 }
+function flagStrAllowEmpty(flags:Map<string,FlagValue>,key:string):string|undefined {
+  const value=flags.get(key);return typeof value==='string' ? value : Array.isArray(value) ? value[0] : undefined;
+}
 
 function flagAll(flags: Map<string, FlagValue>, ...keys: string[]): string[] {
   const out: string[] = [];
@@ -1395,13 +1406,13 @@ const CAPTAIN_TOOLS = [
   "firstmate_fm",
 ] as const;
 
-const CAPTAIN_CONTRACT_POINTER = "Before orchestrating, call firstmate_deck (ACP/CLI: bb firstmate deck --json) to bind this thread's native home, then read firstmate_contract without a section (bb firstmate contract) for the complete native supervisor contract and its selected-runtime skill trigger catalog. If the startup digest is absent, run deck's exact command through your agent shell; firstmate_fm script=session-start returns it again. Failed prerequisites, lock refusal or a truncated digest remain unresolved.";
+const CAPTAIN_CONTRACT_POINTER = "Before orchestrating, call firstmate_deck (ACP/CLI: bb firstmate deck --json) to bind this thread's native home, then read firstmate_contract without a section and follow every cursor (ACP/CLI: bb firstmate contract --paged, then --cursor) for the complete native supervisor contract and its selected-runtime skill trigger catalog. If the startup digest is absent, run deck's exact command through your agent shell; firstmate_fm script=session-start returns it again. Failed prerequisites, lock refusal or a truncated digest remain unresolved.";
 
 const BB_SKILL_RUNTIME_CONTRACT = [
   "BB adapter for every upstream firstmate skill:",
   "The complete native supervisor contract and imported upstream skills own policy; the following mappings only adapt execution to BB.",
   "Translate bin/fm-<name>.sh calls to firstmate_fm with script=<name> and the same arguments; use bb firstmate fm <name> only when a shell command is required.",
-  "Load native policy skills and their references with firstmate_skill (bb firstmate skill <name> [reference] [--source <selected-root source-file>]); it reads this captain’s selected runtime. Native AGENTS.md means firstmate_contract; bin and docs mean the selected runtime, while data, state and config mean the exact bound captain home returned by deck.",
+  "Load native policy skills and their references with firstmate_skill (ACP/CLI: bb firstmate skill <name> [reference] [--source <selected-root source-file>] --paged), following every returned cursor to the end marker; it reads this captain’s selected runtime. Native AGENTS.md means firstmate_contract; bin and docs mean the selected runtime, while data, state and config mean the exact bound captain home returned by deck.",
   "Map workers, panes, and tabs to BB crew threads via firstmate_dispatch/tell/interrupt/retry/stop. Call firstmate_watch once per batch; it hands off to private durable wakes. End the turn; never retry or poll.",
   "Use BB interactions for captain questions and approvals. firstmate_deliveries retains open PRs after worker retirement and wake acknowledgement. Continue authorized review/fix/merge work using the author for fixes and preserving the agreed native review and validation path, including independent review when required; merge through firstmate_merge. Inspect unresolved delivery records after compaction or handoff.",
   "Run firstmate_toolchain for native dependency detection. For browser work use the /browser skill and browser_script (or bb browser script), with profileId unset for the thread-isolated default. This replaces native chrome-devtools-axi transport. Read config/lavish-axi-host for remote Lavish access and use bb connect expose for a board the captain should see.",
@@ -1553,6 +1564,9 @@ export default async function plugin(bb: BbPluginApi) {
   bb.onDispose(async () => { launchAbort.abort();await followUpWork?.catch(()=>{}); });
 
   const baseSettings = bb.settings.define({
+    selectedMethods: { type:"select",label:"Explicit installation-wide BB methods selection; native policy stays authoritative",options:["off","selected-v1"],default:"off" },
+    selectedPrSource:{type:"string",label:"Validated /pr ID/revision/hash; select through methods enable --pr-skill",default:""},
+    selectedMethodsReason: { type:"string",label:"Recorded explicit methods selection source/reason",default:"" },
     firstmateRepo: {
       type: "string",
       label: "Firstmate attribution URL; bundled startup never clones or updates it",
@@ -1744,6 +1758,8 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
+  let methodsProfile=(await baseSettings.get()).selectedMethods;
+  baseSettings.onChange(next=>{methodsProfile=next.selectedMethods;});
   const knownCaptainsRef = new Set<string>();
   type HomeScope = { captain?: string; home?: string; host?: string };
   const homeScope = new AsyncLocalStorage<HomeScope>();
@@ -1785,6 +1801,39 @@ export default async function plugin(bb: BbPluginApi) {
     const host = captain ? await bb.storage.kv.get<string>(`native-home-host:${captain}`) : null;
     if (captain && typeof home === "string") captainHomes.set(captain, home);
     return homeScope.run({ captain, home: typeof home === "string" ? home : undefined, host: typeof host === "string" ? host : undefined }, fn);
+  }
+  // Role exclusion is enforced at the public invocation boundary, before ledger
+  // receipts, home provisioning or supervisor mutations. Static tool selection
+  // alone cannot stop a worker from invoking the CLI.
+  async function supervisorCallerIdentity(ctx:unknown) {
+    const threadId=ctxString(ctx,"threadId");
+    if (!threadId) return undefined; // Internal/native harness calls still prove native admission.
+    const signal=AbortSignal.any([launchAbort.signal,AbortSignal.timeout(STUCK_HOST_CALL_MS),...(asRecord(ctx)["signal"]?[asRecord(ctx)["signal"] as AbortSignal]:[])]);
+    const meta=asRecord(await raceAbort(bb.sdk.threads.getPluginMetadata({threadId,pluginId:"firstmate",signal}),signal));
+    const known=(await raceAbort(readCrews(),signal)).some(c=>!isSecondmateRoute(c) && (c.threadId===threadId || c.priorThreadIds?.includes(threadId)));
+    const retired=await raceAbort(bb.storage.kv.get(`crew-retired:${threadId}`),signal)===true;
+    const project=ctxString(ctx,"projectId");
+    const routeOnly=retired && !known && !metaFlag(meta,"crew") && metaFlag(meta,"captain") && !!project && launches.routeOnlyThread(threadId,project) &&
+      (await raceAbort(readSecondmates(),signal)).some(m=>m.threadId===threadId && (m.projectId===project || m.projects.includes(project)));
+    const worker=metaFlag(meta,"crew") || known || launches.isDeletedWorker(threadId) || retired && !routeOnly;
+    return {threadId,meta,worker};
+  }
+  async function requireSupervisorCaller(ctx:unknown,argv?:string[]):Promise<void> {
+    const identity=await supervisorCallerIdentity(ctx);
+    if(!identity?.worker)return;
+    const {meta}=identity;
+    if(argv?.[0]==="methods" && (argv[1]==="status" || argv[1]==="read"))return;
+    if (argv?.[0]==="help" || argv?.[0]==="guide" || argv?.[0]==="--help") return;
+    // The native status append itself is a worker shell command. Preserve its
+    // optional fleet-ledger notification and exact-task inbox bridge only.
+    if (argv?.[0]==="fm" && typeof meta["crewId"]==="string" && typeof meta["nativeHome"]==="string") {
+      const parsed=parseFmArgv(argv.slice(1)),home=flagFromArgv(argv,"home") ?? (await settings.get()).fmHome;
+      const id=meta["crewId"],ownedHome=meta["nativeHome"];
+      const inbox=parsed.script==="inbox-take" && parsed.args[0]===id && (parsed.args.length===1 || parsed.args[1]==="--ack" && parsed.args.length>2 && parsed.args.slice(2).every(value=>/^\d+\.msg$/.test(value)));
+      const status=parsed.script==="fleet-ledger" && parsed.args.length===3 && parsed.args[0]==="appended" && parsed.args[1]===`${ownedHome}/config` && parsed.args[2]===`${ownedHome}/state/${id}.status`;
+      if (home===ownedHome && (inbox || status)) return;
+    }
+    throw new Error("Worker threads: Firstmate worker caller cannot invoke supervisor operations. Use the native brief's exact-task inbox and status commands; captain identity takes no precedence over worker identity.");
   }
   const homeProvisioners = new Map<string, Promise<string | null>>();
   async function ensureCaptainHome(ctx: unknown, signal?: AbortSignal): Promise<string | null> {
@@ -1897,104 +1946,17 @@ export default async function plugin(bb: BbPluginApi) {
   // Diagnostic inventory only. SDK configure accepts static skill names, so
   // captain policy reads use the exact selected native runtime instead of
   // injecting a globally copied inventory. Crews receive no captain skills.
-  const SKILLS_MANIFEST_MAX = 2400;
-  let skillsManifestCache = "";
-  try {
-    skillsManifestCache = renderSkillsManifest((await settings.get()).fmSkillsManifest);
-  } catch {
-    // default empty
-  }
-
-  function renderSkillsManifest(raw: string): string {
-    const trimmed = (raw ?? "").trim();
-    if (trimmed === "") return "";
-    try {
-      const parsed = JSON.parse(trimmed) as { head?: unknown; skills?: unknown };
-      const head = typeof parsed.head === "string" && parsed.head !== "" ? parsed.head.slice(0, 12) : "unknown";
-      const skills = Array.isArray(parsed.skills) ? parsed.skills : [];
-      if (skills.length === 0) return "";
-      const lines = skills
-        .map((s) => {
-          const rec = asRecord(s);
-          const name = typeof rec["name"] === "string" ? rec["name"] : "";
-          const desc = typeof rec["desc"] === "string" ? rec["desc"] : "";
-          return name === "" ? "" : `- ${name}${desc === "" ? "" : `: ${desc}`}`;
-        })
-        .filter((l) => l !== "");
-      if (lines.length === 0) return "";
-      const body = [
-        `== Real firstmate skills (fmHome/.agents/skills @ ${head}; ${lines.length} available) ==`,
-        "Read selected native skills via firstmate_skill; this inventory is diagnostic only.",
-        ...lines,
-      ].join("\n");
-      return truncate(body, SKILLS_MANIFEST_MAX);
-    } catch {
-      return "";
-    }
-  }
-
-  // Read fmHome HEAD + the .agents/skills inventory on the host, store a
-  // version-pinned JSON manifest, and refresh the diagnostic cache. Skips the host
-  // read when HEAD is unchanged. Best-effort.
+  // Diagnostic settings preserve complete descriptions from the same verified
+  // catalog as policy reads. This inventory is never injected into role context.
   async function refreshSkillsManifest(hostId: string, fmHome: string, signal?: AbortSignal): Promise<void> {
     try {
       const captain=homeScope.getStore()?.captain ?? await bb.storage.kv.get<string>(`captain-for-home:${fmHome}`);
       const selection=captain?await bb.storage.kv.get<{root:string}>(`native-runtime:${captain}`):null;
-      const inventoryRoot=selection?.root??fmHome;
-      const skillsDir = `${inventoryRoot}/.agents/skills`;
-      const py =
-        "import json,os,sys;d=sys.argv[1];out=[];\n" +
-        "dirs=sorted([n for n in os.listdir(d) if os.path.isdir(os.path.join(d,n))]) if os.path.isdir(d) else []\n" +
-        "for n in dirs:\n" +
-        "  desc=''\n" +
-        "  p=os.path.join(d,n,'SKILL.md')\n" +
-        "  try:\n" +
-        "    txt=open(p,encoding='utf-8',errors='replace').read()\n" +
-        "    for line in txt.splitlines():\n" +
-        "      s=line.strip()\n" +
-        "      if s.lower().startswith('description:'):\n" +
-        "        desc=s.split(':',1)[1].strip().strip('\\'\"');break\n" +
-        "  except Exception:\n" +
-        "    pass\n" +
-        "  out.append({'name':n,'desc':desc[:160]})\n" +
-        "sys.stdout.write(json.dumps(out))";
-      const cmd = [
-        `HEAD=$(git -C ${shQuote(inventoryRoot)} rev-parse HEAD 2>/dev/null || echo unknown)`,
-        `printf 'FM_HEAD=%s\\n' "$HEAD"`,
-        `python3 -c ${shQuote(py)} ${shQuote(skillsDir)} 2>/dev/null || echo '[]'`,
-      ].join("\n");
-      const res = await runOnHost(hostId, cmd, 20_000, signal);
-      const headMatch = /FM_HEAD=(\S+)/.exec(res.output);
-      const head = headMatch?.[1] ?? "unknown";
-      const jsonStart = res.output.indexOf("[");
-      if (jsonStart < 0) return;
-      const skillsJson = res.output.slice(jsonStart).trim();
-      let skills: unknown;
-      try {
-        skills = JSON.parse(skillsJson);
-      } catch {
-        return;
-      }
-      if (!Array.isArray(skills)) return;
-      // Skip the persist when HEAD is unchanged and we already have a manifest.
-      try {
-        const prevRaw = (await settings.get()).fmSkillsManifest.trim();
-        if (prevRaw !== "") {
-          const prev = JSON.parse(prevRaw) as { head?: unknown };
-          if (typeof prev.head === "string" && prev.head === head && skillsManifestCache !== "") return;
-        }
-      } catch {
-        // fall through and persist
-      }
-      const manifest = JSON.stringify({ head, skills });
-      skillsManifestCache = renderSkillsManifest(manifest);
-      try {
-        await settings.experimental_set({ fmSkillsManifest: manifest });
-      } catch {
-        // cache still holds it for this process
-      }
-    } catch {
-      // best-effort; captain keeps the contract without the skill inventory
+      const catalog=await nativePolicyLookup(hostId,selection?.root??fmHome,{operation:'catalog'},signal??AbortSignal.any([launchAbort.signal,AbortSignal.timeout(30_000)]));
+      const skills=nativeDescriptions(catalog.entries!).map(({name,description})=>({name,desc:description}));
+      await settings.experimental_set({fmSkillsManifest:JSON.stringify({schema:2,head:catalog.commit,skills})});
+    } catch (error) {
+      bb.log.warn(`Diagnostic native skill inventory remains stale: ${String(error)}`);
     }
   }
 
@@ -2103,13 +2065,14 @@ export default async function plugin(bb: BbPluginApi) {
     await mutateCrews(async crews => {
       // A sweep may already have read the old thread metadata. Keep a durable
       // tombstone so that result cannot resurrect an explicitly retired thread.
-      await bb.storage.kv.set(`crew-retired:${crew.threadId}`, true);
-      return crews.filter(c => c.id !== crew.id || c.threadId !== crew.threadId);
+      if (isSecondmateRoute(crew)) await bb.storage.kv.set(`route-retired:${crew.launchKey ?? JSON.stringify([crew.parentThreadId,crew.projectId,crew.nativeHome,crew.id])}`,true);
+      else await bb.storage.kv.set(`crew-retired:${crew.threadId}`, true);
+      return crews.filter(c => !(c.id===crew.id && c.threadId===crew.threadId && c.projectId===crew.projectId && c.parentThreadId===crew.parentThreadId));
     });
     if (crew.taskSpilled === true && !(await readCrews()).some((c) => c.id === crew.id)) {
       await bb.storage.kv.delete(`${CREW_TASK_PREFIX}${crew.id}`).catch(() => {});
     }
-    if (await clearWaiting(crew.id).catch(() => false)) await dropResumeRows(crew, "all");
+    if (!isSecondmateRoute(crew) && await clearWaiting(crew.id).catch(() => false)) await dropResumeRows(crew, "all");
     if (!isSecondmateRoute(crew)) {
       try {
         await bb.sdk.threads.updatePluginMetadata({ threadId: crew.threadId, set: { crew: "false" }, remove: ["crewId"] });
@@ -2210,7 +2173,7 @@ export default async function plugin(bb: BbPluginApi) {
     const signal=AbortSignal.any([launchAbort.signal,...(asRecord(ctx)["signal"] ? [asRecord(ctx)["signal"] as AbortSignal] : [])]);
     const cached=(await raceAbort(readPostures(),signal,STUCK_HOST_CALL_MS))[projectId];
     const home=(await raceAbort(settings.get(),signal,STUCK_HOST_CALL_MS)).fmHome;
-    let native:{mode:string;yolo:boolean;output:string;registered:boolean}|null=null;
+    let native:{mode:string;yolo:boolean;branchPrefix:string;output:string;registered:boolean}|null=null;
     if (home) {
       const host=await raceAbort(resolveHostForProject(projectId,ctxString(ctx,"threadId"),signal),signal,STUCK_HOST_CALL_MS);
       const path=await raceAbort(projectCheckoutPath(projectId,host),signal,STUCK_HOST_CALL_MS);
@@ -2221,7 +2184,12 @@ export default async function plugin(bb: BbPluginApi) {
       const rows=result.output.split('\n').filter(line=>/^(no-mistakes(?:-prod-only)?|direct-PR|local-only) (on|off)$/.test(line.trim()));
       if (rows.length!==1) throw new Error("Native posture read did not yield one complete mode/yolo record; inspect native project-mode output.");
       const [mode,yolo]=rows[0]!.trim().split(' ');
-      native={mode:mode!,yolo:yolo==='on',output:result.output,registered:!result.output.includes("defaulting")};
+      const prefix=await runFmScript({script:"project-mode",args:["--branch-prefix",name],hostId:host,fmHome:home,timeoutMs:30_000,signal});
+      requireNativeSuccess(prefix,"native registered branch prefix");
+      const prefixRows=prefix.output.replace(/\r?\n$/, '').split(/\r?\n/).filter(line=>!line.startsWith('warn:'));
+      const branchPrefix=prefixRows[0] ?? '';
+      if (prefixRows.length!==1 || /\s/.test(branchPrefix)) throw new Error("Native branch prefix read is malformed; inspect project-mode output.");
+      native={mode:mode!,yolo:yolo==='on',branchPrefix,output:result.output,registered:!result.output.includes("defaulting")};
     }
     return {projectId,native,plugin:cached??null,default:{mode:"no-mistakes",yolo:false},
       authority:cached?.provenance ? {status:"recorded-captain-instruction",...cached.provenance} : (cached?.yolo || native?.yolo) ? {status:"legacy-unverified",note:"Preserve prior standing posture. Resolve from existing captain approval; missing provenance is not proof of absent approval. A registry flag alone does not prove approval."} : {status:"off"},
@@ -3304,7 +3272,7 @@ export default async function plugin(bb: BbPluginApi) {
   // Firstmate-spec brief for a BB-dispatched crew, not just a synthetic prompt.
   // Best-effort and idempotent (never overwrites an existing brief); a missing
   // script or host failure is silent — the crew already has the structured prompt.
-  async function publishFmBrief(crew: Crew, hostId: string | undefined, task: string): Promise<boolean> {
+  async function publishFmBrief(crew: Crew, hostId: string | undefined, task: string, projectDir?:string,signal?:AbortSignal): Promise<boolean> {
     const fmHome = await crewNativeHome(crew);
     if (fmHome === "") return false;
     if (isSecondmateRoute(crew)) return false;
@@ -3324,20 +3292,20 @@ export default async function plugin(bb: BbPluginApi) {
     // fm_brief_intent_address_line does not refuse the brief (B1).
     // Headed task text supplies its own spec section; never nest it under the template's.
     const sections = briefSections(task.trim());
-    const intentB64 = Buffer.from(normalizeCaptainIntent(sections.intent).slice(0, 3000), "utf8").toString("base64");
+    const intentB64 = Buffer.from(normalizeCaptainIntent(sections.intent), "utf8").toString("base64");
     const defaultSpec = crew.shape === "scout"
       ? "Investigate the captain's intent within its stated scope. Deliver a written report with commands, outcomes, revision, limits, and recommendations. Distinguish observed behavior from inference; follow the report-only completion contract."
       : "Implement the captain's intent above exactly; do not widen scope. Small diff, own branch, deliver per the mode contract, then report DONE/BLOCKED/FAILED.";
     // Captain-authored specifications retain precedence over the role default.
     const specEnv = sections.spec === null
       ? ""
-      : `FM_TASK_OWN_SPEC=${Buffer.from(sections.spec.slice(0, 3000), "utf8").toString("base64")} `;
+      : `FM_TASK_OWN_SPEC=${Buffer.from(sections.spec, "utf8").toString("base64")} `;
     // fm-brief refuses --mode on scouts and requires it on ships; a ship's posture
     // is exactly the delivery mode the brief records.
     const scaffold =
       crew.shape === "scout"
-        ? `${briefRef} ${shQuote(crew.id)} crew --scout`
-        : `${briefRef} ${shQuote(crew.id)} crew --mode ${shQuote(crew.posture)}`;
+        ? `${briefRef} ${shQuote(crew.id)} ${shQuote(projectDir ?? 'crew')} --scout`
+        : `${briefRef} ${shQuote(crew.id)} ${shQuote(projectDir ?? 'crew')} --mode ${shQuote(crew.posture)}${crew.branchPrefix !== undefined ? ` --branch-prefix ${shQuote(crew.branchPrefix)}` : ''}`;
     const py =
       "import base64,os,sys;p=sys.argv[1];" +
       'intent=base64.b64decode(os.environ["FM_INTENT"]).decode();' +
@@ -3359,7 +3327,13 @@ export default async function plugin(bb: BbPluginApi) {
       `FM_INTENT=${intentB64} ${specEnv}python3 -c ${shQuote(py)} ${shQuote(brief)} || { echo "fm-brief fill failed" >&2; exit 1; }`,
     ].join("\n");
     try {
-      const res = await runOnHost(host, script, 30_000);
+      // Preserve the entire accepted intent/specification. Check the same full
+      // quoting envelope as execution; oversized scripts use bounded staging.
+      let inline = true;
+      try { wrapHostCommand(script); } catch { inline = false; }
+      const res = inline
+        ? await runOnHost(host, script, 30_000, signal)
+        : await runOnHost(host, "bash", 30_000, signal, script);
       if (res.output.includes("FM_MIRROR_STALE")) {
         const line = res.output.split("\n").find((l) => l.includes("FM_MIRROR_STALE"))?.trim() ?? "FM_MIRROR_STALE";
         bb.log.error(`bb mirror is STALE while scaffolding brief crew=${crew.id}: ${line}. Re-run the overlay installer against ${fmHome}.`);
@@ -3497,6 +3471,7 @@ export default async function plugin(bb: BbPluginApi) {
       ownsRow?: boolean;
       visible?: boolean;
       checkout?:string;
+      dispatchProfileReason?:string;
     },
     hostId: string,
     signal?: AbortSignal,
@@ -3540,7 +3515,17 @@ export default async function plugin(bb: BbPluginApi) {
     // Scaffold the authoritative brief first — a ship spawn reads its recorded
     // "Delivery contract: mode=" line and refuses a mismatch, so the brief must
     // exist (with the right mode) before fm-spawn.sh runs.
-    await publishFmBrief(crew, hostId, input.task);
+    if (!await publishFmBrief(crew, hostId, input.task, projectDir,signal)) throw new Error('Native brief publication failed; no resolver/backlog/spawn executed.');
+    const resolved=await runFmScript({script:'dispatch-resolve',args:[`${fmHome}/data/${crew.id}/brief.md`],hostId,fmHome,timeoutMs:30_000,signal});
+    // Preserve every candidate/result without manufacturing an intake judgment.
+    const resolutionPath=`${fmHome}/data/${crew.id}/dispatch-resolution-${randomUUID()}.txt`;
+    if (!await writeHostBytes(hostId,resolutionPath,`${resolved.output}\nBB execution: ${crew.providerId ?? 'project default'} / ${crew.model ?? 'project default'} / ${crew.reasoningLevel ?? 'project default'}\nBB intake reason: ${input.dispatchProfileReason ?? '(not supplied)'}\n`,STUCK_HOST_CALL_MS,signal,true)) throw new Error('Could not retain native dispatch resolution; no backlog/spawn executed.');
+    let resolution:string;
+    try { resolution=nativeDispatchIntake(resolved.exitCode,resolved.output,input.dispatchProfileReason); }
+    catch(error) { throw new Error(`Task ${crew.id}: ${String(error)} (resolution evidence: ${resolutionPath})`); }
+    if (resolution!=='off' && (!crew.providerId || !crew.model)) throw new Error('Enabled native dispatch resolution needs an explicit validated BB provider/model selection; reuse taskId after native intake.');
+    if (resolution!=='off') await validateProviderChoice(crew.providerId!,crew.model!,crew.projectId,crew.parentThreadId??undefined,strictReasoning(crew.reasoningLevel??undefined),hostId,true);
+    bb.log.info(`real transport dispatch-resolve crew=${crew.id} status=${resolution} evidence=${resolutionPath}${input.dispatchProfileReason ? ` override=${input.dispatchProfileReason}` : ''}`);
     // C1: create the backlog row (id = crew id, so meta/brief/backlog/thread all
     // agree) BEFORE spawning. tasks-axi add is idempotent (repeat returns
     // ok/already), so a retry or a queue-dispatched crew whose row already exists
@@ -3566,6 +3551,7 @@ export default async function plugin(bb: BbPluginApi) {
       crew.shape === "scout"
         ? [crew.id, projectDir, "--scout", "--backend", "bb", "--harness", "bb"]
         : [crew.id, projectDir, "--mode", crew.posture, "--yolo", (crew.yolo ?? posture.yolo) ? "on" : "off", "--backend", "bb", "--harness", "bb"];
+    if (crew.shape==='ship' && crew.branchPrefix!==undefined) args.push('--branch-prefix',crew.branchPrefix);
     if (crew.model !== null && crew.model !== "") args.push("--model", crew.model);
     if (crew.reasoningLevel !== null) args.push("--effort", crew.reasoningLevel);
     const capped = capPermission(input.permissionMode, await parentPermission(input.parentThreadId));
@@ -3582,6 +3568,9 @@ export default async function plugin(bb: BbPluginApi) {
     let spawnFailed = false;
     let spawnFailure = "Native spawn returned without a recorded worker.";
     try {
+      // Earlier failures are known pre-spawn refusals. Only crossing native
+      // spawn can have an uncertain external worker outcome.
+      launches.update(launchKey(crew.projectId,crew.parentThreadId ?? '',crew.nativeHome ?? '',crew.id),{nativeInvoked:true});
       const res = await withHomeSpawnGate(fmHome, () => runFmScript({
         script: "spawn",
         args,
@@ -4140,10 +4129,22 @@ export default async function plugin(bb: BbPluginApi) {
 
   // Accept a crew id, or any thread id the crew has run on: captains often only
   // hold the thread id from a completion ping.
-  async function findCrew(id: string,caller?:string): Promise<Crew | undefined> {
+  async function findCrew(id: string,caller?:string,allowForeign=false): Promise<Crew | undefined> {
     caller=caller??homeScope.getStore()?.captain;
     const all = await listCrewsAll();
-    const found=all.find(entry=>entry.id === id) ?? all.find(entry=>entry.threadId === id || (entry.priorThreadIds ?? []).includes(id));
+    const matches=all.filter(entry=>entry.id===id || entry.threadId===id || (entry.priorThreadIds ?? []).includes(id));
+    const home=homeScope.getStore()?.home;
+    const ownerMatches=caller ? matches.filter(entry=>entry.parentThreadId===caller) : matches;
+    const homeMatches=home ? ownerMatches.filter(entry=>entry.nativeHome===home) : [];
+    // Explicit handoff preserves the worker's original home. Prefer this home
+    // when it resolves a collision, but never move recorded paths on handoff.
+    const owned=homeMatches.length ? homeMatches : ownerMatches;
+    const candidates=owned.length ? owned : matches;
+    if (candidates.length>1) throw new Error(`Ambiguous crew ${id}; use its exact worker thread identity in its owning captain home.`);
+    const found=candidates[0];
+    if (found && caller && !owned.length && found.parentThreadId && !allowForeign) {
+      throw new Error(`Refusing to access crew ${id}: it belongs to captain @thread:${found.parentThreadId}, the owning captain. Take that deck with: bb firstmate handoff --from ${found.parentThreadId}. Or use explicit supported --override-owner for this action.`);
+    }
     if (found) { const launch=found.launchKey ? launches.get(found.launchKey) : launches.forTask(found.projectId,found.parentThreadId ?? "",found.id);
       return launch?.deliveryRequirement ? {...found,launchKey:launch.key,deliveryRequirement:recoveredContract({deliveryRequirement:found.deliveryRequirement},launch)} : found; }
     if (!caller) return undefined;
@@ -4327,7 +4328,8 @@ export default async function plugin(bb: BbPluginApi) {
     if (!("content" in read) || read.sizeBytes > 1_000_000) throw new Error("Native prompt is missing or exceeds 1MB.");
     const prompt = read.contentEncoding === "base64" ? Buffer.from(read.content,"base64").toString("utf8") : read.content;
     const key = launchKey(projectId, owner, home, taskId);
-    let record = await launches.reserve({ key, taskId, projectId, owner, home, generation:1,shape,nativeInvoked:true,deliveryMode:flagStr(flags,"delivery-mode"),deliveryRequirement:z.enum(["pr","merged","merged-and-verified"]).parse(flagStr(flags,"delivery-requirement") ?? "merged"),state:"reserved",threadId:null,hostId,updatedAt:Date.now() }, () => launchCapacity(owner || undefined));
+    const deliveryRequirement=taskDelivery(flagStr(flags,"delivery-mode") ?? "direct-PR",z.enum(["branch","pr","merged","merged-and-verified"]).optional().parse(flagStr(flags,"delivery-requirement")),shape);
+    let record = await launches.reserve({ key, taskId, projectId, owner, home, generation:1,shape,nativeInvoked:true,deliveryMode:flagStr(flags,"delivery-mode"),deliveryRequirement,state:"reserved",threadId:null,hostId,updatedAt:Date.now() }, () => launchCapacity(owner || undefined));
     record = await reconcileLaunch(record);
     const suppliedContract=flagStr(flags,"delivery-requirement");
     if (suppliedContract && suppliedContract !== recoveredContract({},record)) throw new Error("Creation retry cannot change the original delivery contract.");
@@ -4421,7 +4423,9 @@ export default async function plugin(bb: BbPluginApi) {
     parentThreadId: string;
     shape?: Shape;
     mode?: string;
-    deliveryRequirement?: "pr" | "merged" | "merged-and-verified";
+    deliveryRequirement?: "branch" | "pr" | "merged" | "merged-and-verified";
+    branchPrefix?: string;
+    dispatchProfileReason?: string;
     sourceRefs?: string[];
   }): Promise<string | null> {
     const flags = await reliabilityFlags();
@@ -4451,6 +4455,8 @@ export default async function plugin(bb: BbPluginApi) {
       parentThreadId: input.parentThreadId,
       createdAt: new Date().toISOString(),
       ...(input.sourceRefs && input.sourceRefs.length > 0 ? { sourceRefs: input.sourceRefs } : {}),
+      ...(input.branchPrefix !== undefined ? { branchPrefix: input.branchPrefix } : {}),
+      ...(input.dispatchProfileReason !== undefined ? { dispatchProfileReason: input.dispatchProfileReason } : {}),
     };
     queueStore.add(queued);
     for (const key of input.sourceRefs ?? []) {
@@ -4486,6 +4492,9 @@ export default async function plugin(bb: BbPluginApi) {
           shape: item.shape,
           mode: toMode(item.mode !== "" ? item.mode : undefined, "direct-PR"),
           sourceRefs: item.sourceRefs,
+          deliveryRequirement: item.deliveryRequirement,
+          branchPrefix: item.branchPrefix,
+          dispatchProfileReason: item.dispatchProfileReason,
         });
         queueStore.patch(item, { status: "dispatched", crewId: crew.id });
       } catch (error) {
@@ -4602,19 +4611,28 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function dispatchCrew(input: Parameters<typeof dispatchCrewBody>[0]): Promise<Crew> {
+    if (input.task.length>MAX_TASK) throw new Error(`Task exceeds ${MAX_TASK} UTF-16 units; split the assignment before dispatch. No brief, reservation or worker was created.`);
+    const requestedRequirement=input.deliveryRequirement;
     if (input.crewId && !/^[A-Za-z0-9._-]{1,100}$/.test(input.crewId)) throw new Error("Invalid task retry identity.");
-    if (input.deliveryRequirement && !["pr","merged","merged-and-verified"].includes(input.deliveryRequirement)) throw new Error("Unsupported delivery contract.");
-    validateLaunchCapabilities({ ...input, transport: (await settings.get()).transport });
+    if (input.deliveryRequirement && !["branch","pr","merged","merged-and-verified"].includes(input.deliveryRequirement)) throw new Error("Unsupported delivery contract.");
+    input={...input,deliveryRequirement:taskDelivery(input.mode,input.deliveryRequirement,input.shape)};
+    if (input.branchPrefix!==undefined && input.shape!=='ship') throw new Error('branchPrefix applies only to ship dispatch.');
+    const transport=(await settings.get()).transport;
+    if (transport!=='real' && (input.branchPrefix!==undefined || input.dispatchProfileReason!==undefined)) throw new Error('Native branch prefix/profile intake needs transport=real (deck/init --real); SDK compatibility dispatch cannot bind a native branch or run native resolution.');
+    validateLaunchCapabilities({ ...input, transport });
     const taskId = input.crewId || randomUUID().slice(0, 8);
     const home = (await settings.get()).fmHome.trim();
     const key = launchKey(input.projectId, input.parentThreadId ?? "", home, taskId);
     return launches.once(`dispatch:${key}`, async () => {
       const record = await launches.reserve({ key, taskId, projectId: input.projectId, owner: input.parentThreadId ?? "",
-        home, generation: 1, shape: input.shape, deliveryMode:input.mode, yolo:input.yolo, deliveryRequirement:input.deliveryRequirement ?? "merged", state: "reserved", threadId: null, updatedAt: Date.now() }, () => launchCapacity(input.parentThreadId));
+        home, generation: 1, shape: input.shape, deliveryMode:input.mode, yolo:input.yolo, branchPrefix:input.branchPrefix,deliveryRequirement:input.deliveryRequirement ?? "merged", state: "reserved", threadId: null, updatedAt: Date.now() }, () => launchCapacity(input.parentThreadId));
       const resolved = await reconcileLaunch(record);
+      if (resolved.routedIntake && await bb.storage.kv.get(`route-retired:${resolved.key}`)===true) throw new Error(`Routed request ${taskId} was explicitly forgotten; this handoff cannot be resent or recovered as active.`);
       if (resolved.state === "deleted") throw new Error(`Worker for launch ${taskId} was deleted by BB core. This attempt cannot be resumed.`);
-      if (input.deliveryRequirement && input.deliveryRequirement !== recoveredContract({},resolved)) throw new Error("Retry cannot change the original delivery contract.");
+      if (requestedRequirement && requestedRequirement !== recoveredContract({},resolved)) throw new Error("Retry cannot change the original delivery contract.");
       if (input.yolo!==undefined && resolved.yolo!==undefined && input.yolo!==resolved.yolo) throw new Error("Retry cannot change the original merge-authority selection.");
+      if (input.branchPrefix!==undefined && input.branchPrefix!==(resolved.branchPrefix ?? 'fm/')) throw new Error('Retry cannot change the recorded ship branch prefix.');
+      input={...input,branchPrefix:resolved.branchPrefix};
       input={...input,yolo:resolved.yolo??input.yolo,deliveryRequirement:recoveredContract({},resolved)};
       if (resolved.threadId && ((await settings.get()).transport !== "real" || resolved.state === "running")) {
         const crew = (await readCrews()).find(c => c.id === taskId && c.projectId === input.projectId && c.parentThreadId === (input.parentThreadId ?? null));
@@ -4624,12 +4642,21 @@ export default async function plugin(bb: BbPluginApi) {
           worktree: input.worktree, shape: input.shape, posture: input.shape === "scout" ? "scout" : input.mode,
           yolo:resolved.yolo,launchKey: key, metaWritten: false, sourceRefs: input.sourceRefs, createdAt: new Date().toISOString() };
         recovered.deliveryRequirement=recoveredContract({},resolved);
-        await mutateCrews(rows => [recovered, ...rows.filter(c => c.id !== taskId)]);
+        if (resolved.routedIntake) {
+          const child=resolved.routedIntake.dispatch;
+          Object.assign(recovered,{task:child.task,providerId:child.providerId??null,model:child.model??null,reasoningLevel:child.reasoningLevel??null,posture:`secondmate:${child.mode}`,worktree:false,routedIntake:resolved.routedIntake,branchPrefix:child.branchPrefix,yolo:resolved.routedIntake.posture.yolo});
+        }
+        await mutateCrews(rows => [recovered, ...rows.filter(c => !(c.id===taskId && c.projectId===input.projectId && c.parentThreadId===(input.parentThreadId??null)))]);
         return recovered;
       }
       try {
         const crew = await dispatchCrewBody({ ...input, crewId: taskId, ownsRow:input.crewId === undefined });
         crew.launchKey = key;
+        if (isSecondmateRoute(crew)) {
+          // The recipient thread's environment/model is supervisor context only.
+          await mutateCrews(rows=>rows.map(c=>c.id===taskId && c.projectId===input.projectId && c.parentThreadId===(input.parentThreadId??null)?crew:c));
+          return crew;
+        }
         let actualProvider = crew.providerId;
         let thread: Awaited<ReturnType<typeof bb.sdk.threads.defaultExecutionOptions>> | null = null;
         try { actualProvider = (await raceAbort(bb.sdk.threads.get({ threadId:crew.threadId }),launchAbort.signal,STUCK_HOST_CALL_MS)).providerId; } catch { /* unresolved */ }
@@ -4641,7 +4668,7 @@ export default async function plugin(bb: BbPluginApi) {
           providerId: actualProvider, model: thread?.model ?? crew.model,
           reasoningLevel: thread?.reasoningLevel ?? crew.reasoningLevel } });
         if (thread) { crew.providerId = actualProvider; crew.model = thread.model; crew.reasoningLevel = thread.reasoningLevel; }
-        await mutateCrews(rows => rows.map(c => c.id === taskId ? crew : c));
+        await mutateCrews(rows => rows.map(c => c.id===taskId && c.projectId===input.projectId && c.parentThreadId===(input.parentThreadId??null) ? crew : c));
         if (!ready && launches.get(key)?.nativeInvoked && !isSecondmateRoute(crew)) throw new Error("Native admission/publication remains unresolved; worker and capacity are retained.");
         return crew;
       } catch (error) {
@@ -4673,11 +4700,13 @@ export default async function plugin(bb: BbPluginApi) {
     mode: DeliveryMode;
     yolo?:boolean;
     sendAt?: number;
-    deliveryRequirement?: "pr" | "merged" | "merged-and-verified";
+    deliveryRequirement?: "branch" | "pr" | "merged" | "merged-and-verified";
+    branchPrefix?:string;
+    dispatchProfileReason?:string;
     sourceRefs?: string[];
     signal?:AbortSignal;
   }): Promise<Crew> {
-    const task = input.task.trim().slice(0, MAX_TASK);
+    const task = input.task.trim();
     if (task === "") throw new Error("Empty task.");
     const mates = await readSecondmates();
     const mate = input.mode === "local-only" ? undefined : pickSecondmate(mates, input.projectId, task);
@@ -4685,7 +4714,14 @@ export default async function plugin(bb: BbPluginApi) {
       // Persist the route before sending. An unknown send outcome is not proof
       // that the domain captain did not receive the task.
       const routeKey=launchKey(input.projectId,input.parentThreadId ?? "",(await settings.get()).fmHome.trim(),input.crewId!);
-      launches.update(routeKey,{state:"creating",nativeInvoked:true,shape:"secondmate-route"});
+      const prior=launches.get(routeKey)?.routedIntake;
+      const requestedIntake=routedIntakeSchema.parse({schema:1,origin:{captainId:input.parentThreadId??null,home:(await settings.get()).fmHome.trim()},
+        dispatch:{task,taskId:input.crewId!,projectId:input.projectId,title:input.title,providerId:input.providerId,model:input.model,reasoningLevel:input.reasoningLevel,permissionMode:capPermission(input.permissionMode,await parentPermission(input.parentThreadId)),
+          worktree:input.worktree,visible:input.visible,shape:input.shape,mode:input.mode,deliveryRequirement:input.deliveryRequirement??"merged",branchPrefix:input.branchPrefix,dispatchProfileReason:input.dispatchProfileReason},
+        posture:{mode:input.mode,yolo:input.yolo??false,provenance:(await postureOf(input.projectId)).provenance}});
+      if (prior && JSON.stringify(prior.dispatch)!==JSON.stringify(requestedIntake.dispatch)) throw new Error('Routed intake cannot change while its handoff is unresolved.');
+      const intake=prior ?? requestedIntake;
+      launches.update(routeKey,{state:"creating",nativeInvoked:true,shape:"secondmate-route",routedIntake:intake});
       try {
         await bb.sdk.threads.send({
           threadId: mate.threadId,
@@ -4693,20 +4729,21 @@ export default async function plugin(bb: BbPluginApi) {
           input: [
             {
               type: "text",
-              text: `Routed work from main captain.\nTask: ${input.crewId}\nShape: ${input.shape}\nMode: ${input.mode}\nDelivery requirement: ${input.deliveryRequirement ?? "merged"}\n\n${task}\n\nDispatch a crew for this. Reply with the crew id when underway.`,
+              text: renderRoutedIntake(intake),
               mentions: [],
             },
           ],
         });
         const routed: Crew = {
           id: input.crewId!,
-          task: `[secondmate ${mate.threadId}] ${task}`,
+          task, routedIntake:intake, nativeHome:intake.origin.home,
+          branchPrefix:intake.dispatch.branchPrefix,yolo:intake.posture.yolo,
           projectId: input.projectId,
           threadId: mate.threadId,
           parentThreadId: input.parentThreadId ?? null,
-          providerId: null,
-          model: null,
-          reasoningLevel: null,
+          providerId: intake.dispatch.providerId ?? null,
+          model: intake.dispatch.model ?? null,
+          reasoningLevel: intake.dispatch.reasoningLevel ?? null,
           worktree: false,
           shape: input.shape,
           posture: `secondmate:${input.mode}`,
@@ -4722,6 +4759,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const crew: Crew = {
       yolo:input.yolo,deliveryRequirement: input.deliveryRequirement ?? "merged",
+      ...(input.branchPrefix!==undefined ? {branchPrefix:input.branchPrefix} : {}),
       nativeHome: (await settings.get()).fmHome.trim(),
       id: input.crewId !== undefined && input.crewId !== "" ? input.crewId : randomUUID().slice(0, 8),
       task,
@@ -4751,13 +4789,11 @@ export default async function plugin(bb: BbPluginApi) {
       if (cur.fmHome.trim() === "") throw new Error("Real transport needs fmHome. Run init --real before dispatch.");
       try {
         const rtHost = selection.hostId;
-        const nativeKey = launchKey(input.projectId,input.parentThreadId ?? "",crew.nativeHome ?? "",crew.id);
-        launches.update(nativeKey,{ nativeInvoked:true });
         const realThreadId = await dispatchViaRealTransport(
           crew,
           { task: input.task, projectId: input.projectId, parentThreadId: input.parentThreadId,
             title: input.title, permissionMode: input.permissionMode,
-            ownsRow: input.ownsRow, visible: input.visible,checkout:selection.checkout },
+            ownsRow: input.ownsRow, visible: input.visible,checkout:selection.checkout,dispatchProfileReason:input.dispatchProfileReason },
           rtHost,input.signal,
         );
         if (realThreadId !== null && realThreadId !== "") {
@@ -4766,7 +4802,7 @@ export default async function plugin(bb: BbPluginApi) {
           // fm-spawn started the row — record that this crew owns a real row so its
           // close survives a later settings flip.
           crew.backlogRow = true;
-          await mutateCrews(crews => [crew, ...crews.filter(c => c.id !== crew.id)]);
+          await mutateCrews(crews => [crew, ...crews.filter(c => !(c.id===crew.id && c.projectId===crew.projectId && c.parentThreadId===crew.parentThreadId))]);
           await publishFleet();
           await noteMachineCeiling(crew.id, realThreadId, capPermission(input.permissionMode, await parentPermission(input.parentThreadId)));
           // fm-spawn ran ~30s while this crew may already have ended its first turn;
@@ -4830,7 +4866,7 @@ export default async function plugin(bb: BbPluginApi) {
       },
     }), input.signal ? AbortSignal.any([input.signal,launchAbort.signal]) : launchAbort.signal);
     crew.threadId = created.threadId!;
-    await mutateCrews(crews => [crew, ...crews.filter(c => c.id !== crew.id)]);
+    await mutateCrews(crews => [crew, ...crews.filter(c => !(c.id===crew.id && c.projectId===crew.projectId && c.parentThreadId===crew.parentThreadId))]);
     await publishFleet();
     const okMeta = await publishFmMeta({ crew, hostId, scheduled:false, model: input.model, provider: input.providerId });
     // R5: only record a known-failed write. undefined (write succeeded, or real
@@ -5944,7 +5980,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
   function recoveredContract(meta:Record<string,unknown>,record?:LaunchRecord):NonNullable<Crew["deliveryRequirement"]> {
     const value=meta["deliveryRequirement"];
-    if (value !== undefined && !["pr","merged","merged-and-verified"].includes(String(value))) throw new Error("Recovered task has an invalid delivery contract.");
+    if (value !== undefined && !["branch","pr","merged","merged-and-verified"].includes(String(value))) throw new Error("Recovered task has an invalid delivery contract.");
     if (record?.deliveryRequirement && value !== undefined && record.deliveryRequirement !== value) throw new Error("Recovered metadata disagrees with the durable delivery contract.");
     if (record) {
       if (!record.deliveryRequirement && value === undefined) throw new Error("Durable launch has no readable original delivery contract; explicit recovery is required.");
@@ -5972,6 +6008,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const home=await raceAbort(crewNativeHome(crew),signal,STUCK_HOST_CALL_MS);
     const requirement=await contractForCrew(crew,signal);
+    if (requirement==='branch') throw new Error('A branch delivery contract cannot become a PR obligation.');
     const task=await raceAbort(fullCrewTask(crew),signal,STUCK_HOST_CALL_MS);
     signal?.throwIfAborted();
     deliveries.register({url,taskId:crew.id,projectId:crew.projectId,owner:crew.parentThreadId,home,worker:crew.threadId,requirement,continuation:{...crew,task,taskSpilled:false}});
@@ -6076,7 +6113,9 @@ export default async function plugin(bb: BbPluginApi) {
         if (!projectId) projectId=(await raceAbort(bb.sdk.threads.get({threadId:owner,signal}),signal,STUCK_HOST_CALL_MS)).projectId;
         if (!projectId) return;
         const home=await raceAbort(bb.storage.kv.get<string>(`native-home:${owner}`),signal,STUCK_HOST_CALL_MS) ?? "";
-        deliveries.register({url:row.pr,taskId:row.crewId,projectId,owner,home,worker:"",requirement:row.deliveryRequirement ?? recoveredContract({},launches.forTask(projectId,owner,row.crewId))});
+        const requirement=row.deliveryRequirement ?? recoveredContract({},launches.forTask(projectId,owner,row.crewId));
+        if (requirement==='branch') return;
+        deliveries.register({url:row.pr,taskId:row.crewId,projectId,owner,home,worker:"",requirement});
       },signal).catch(error=>bb.log.warn(`PR inventory recovery ${row.crewId}: ${String(error)}`));
     }
   }
@@ -6154,6 +6193,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (!crew || crew.parentThreadId !== owner || crew.projectId !== projectId || crew.shape !== "ship") throw new Error("Register requires an owned ship on this project.");
       if (input.requirement && !input.authorized) throw new Error("Setting an explicit delivery contract requires user authority; an existing contract cannot be replaced by registration.");
       const original=await contractForCrew(crew);
+      if (original==='branch') throw new Error('Branch delivery is satisfied by the native ready-in-branch artifact; it cannot be registered as a PR contract.');
       if (input.requirement && input.requirement !== original) throw new Error("Registration cannot change the original delivery contract.");
       const record=deliveries.register({ url:input.url ?? crew.prUrl ?? "",taskId:crew.id,projectId,owner,home:await crewNativeHome(crew),worker:crew.threadId,requirement:original,continuation:{...crew,task:await fullCrewTask(crew),taskSpilled:false} });
       return [record];
@@ -6744,12 +6784,19 @@ export default async function plugin(bb: BbPluginApi) {
     force: boolean,
     opts: { caller?: string; overrideOwner?: boolean } = {},
   ): Promise<string> {
-    const crew = (await readCrews()).find(entry => entry.id === id) ?? await findCrew(id);
+    const crew = await findCrew(id,opts.caller,opts.overrideOwner===true);
     if (crew === undefined) throw new Error(`No crew ${id}. Run "bb firstmate crews".`);
     const notMine = opts.overrideOwner === true ? null : await ownerRefusal(crew, opts.caller, "forget");
     if (notMine !== null) throw new Error(notMine);
     if (stop && isSecondmateRoute(crew) && !force) {
       throw new Error(`Refusing: ${id} is a secondmate route. Drop with forget (no --stop), or --force to also stop that thread.`);
+    }
+    if (isSecondmateRoute(crew) && !stop) {
+      // Retire only the request projection; the domain captain owns its child
+      // tree, native state, runtime, and same-ID worker protocol records.
+      await removeCrew(crew);
+      await publishFleet();
+      return `Forgot secondmate route ${id}; domain captain and child work are retained.`;
     }
     await discoverCrewDelivery(crew);
     let preserveAuthority=deliveries.hasOwned(crew.parentThreadId ?? "",crew.projectId,crew.id);
@@ -7410,7 +7457,10 @@ export default async function plugin(bb: BbPluginApi) {
       ownHome: captainHomes.get(threadId)===home || home.endsWith(`-bb-homes/${threadId}`),
       scriptB64: overlayBytes("bin/bb-captain-hook.sh"),
     });
-    const res = await runOnHost(hostId, `bash -c ${shQuote(script)}`, 60_000, signal);
+    // The hook bytes plus shell quoting can exceed BB's composed command cap.
+    // Stage the complete installer through the existing bounded stdin transport;
+    // nothing installs until staging succeeds, and runOnHost removes that file.
+    const res = await runOnHost(hostId, "bash", 60_000, signal, script);
     if (res.exitCode !== 0 || !res.output.includes("captain-hooks-ok")) {
       throw new Error(`Captain hook install failed captain=${threadId} host=${hostId}: ${truncate(res.output, 400)}`);
     } else {
@@ -7438,7 +7488,8 @@ export default async function plugin(bb: BbPluginApi) {
         );
         const setupKey=`captain-adapter-setup:${ctxString(ctx,"threadId")??''}`;
         const runtimeSelection=await bb.storage.kv.get(`native-runtime:${ctxString(ctx,"threadId")??''}`);
-        const stamp=JSON.stringify([current.fmHome,hostId,overlayFingerprint(),runtimeSelection]);
+        const hookRevision=createHash('sha256').update(Buffer.from(overlayBytes('bin/bb-captain-hook.sh'),'base64')).digest('hex');
+        const stamp=JSON.stringify([current.fmHome,hostId,overlayFingerprint(),runtimeSelection,hookRevision]);
         const verifiedSetup=adapter.includes("mirror OK:") && await bb.storage.kv.get(setupKey)===stamp;
         if (!verifiedSetup) await refreshSkillsManifest(hostId, current.fmHome, signal);
         if (!current.fullParityOnDeck) await refreshCaptainMemory();
@@ -9353,10 +9404,9 @@ export default async function plugin(bb: BbPluginApi) {
       "   installs the pinned bundle on clean hosts; native prerequisites and harness startup remain required.",
       "2. Native deck (plugin SDK / Fleet UI): bb firstmate deck, then dispatch/tell/watch/merge.",
       "   BB is the session backend (threads + managed-worktree), like tmux/orca — not a rewrite of bin/.",
-      "Primary dispatch (real toolbelt, after deck/init --real):",
-      "  bb firstmate fm spawn -- --mode direct-PR -- ship \"fix flaky login test\"",
-      "Native dispatch (BB transport; writes state/<id>.meta when fmHome is set, so the scripts see Fleet crews):",
+      "Primary native dispatch (after deck/init --real; BB owns brief/resolver/backlog/spawn):",
       "  bb firstmate dispatch --project <proj> -- \"fix flaky login test\"",
+      DISPATCH_TRANSPORT,
       `Pinned bundle/native attribution: ${repo}. Inspect bb firstmate runtime status --json; no startup fetch or implicit runtime selection upgrade.`,
     ].join("\n");
   }
@@ -9374,10 +9424,12 @@ export default async function plugin(bb: BbPluginApi) {
     permissionMode: z.enum(["accept-edits", "auto", "full"]).optional(),
     shape: shapeSchema.optional(),
     mode: modeSchema.optional(),
+    branchPrefix:z.string().max(120).optional().describe("Native ship-branch prefix selected at intake; passed unchanged to brief and spawn, default fm/; empty gives a bare task-id branch"),
+    dispatchProfileReason:z.string().min(1).max(1000).optional().describe("Native enabled dispatch-resolve intake decision/override reason for explicit BB provider/model selection; does not grant approval"),
     worktree: z.boolean().optional(),
     sharedEnv: z.boolean().optional().describe("Unsupported for native ship transport; shared-worktree requests refuse before creation"),
     visible: z.boolean().optional().describe("Show in the BB sidebar as a nested subagent (default true)"),
-    deliveryRequirement:z.enum(["pr","merged","merged-and-verified"]).optional().describe("Agreed delivery contract; default is merge without deployment"),
+    deliveryRequirement:z.enum(["branch","pr","merged","merged-and-verified"]).optional().describe("local-only defaults to branch (ready in branch, no push/PR/merge); PR modes default to merged, which requires existing native merge authority, never grants it"),
     sendAt: z.never().optional().describe("Unsupported for Firstmate launch; use backlog waitUntil eligibility and explicit dispatch"),
     overrideOwner: z.boolean().optional()
       .describe("Proceed even though the task targets a PR another captain's crew owns (only on the captain's word)"),
@@ -9385,7 +9437,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   const dispatchHelp='bb firstmate dispatch [options] -- "<task>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","sendAt"])+"\n  --task <text>  Repeat for bounded fan-out; --hidden hides the worker.\n  sendAt/--send-at is unsupported; native ship isolation is mandatory.";
-  const queueHelp='bb firstmate queue add [options] -- "<title>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider"},["task","taskId","overrideOwner","sendAt","title","permissionMode","sharedEnv","worktree","visible"])+"\n  --detail <full-task>\n  --after <queue-id>  Repeat for dependencies, which remain dispatch gates.\n  --wait-until <ISO-time>  Eligibility only; explicit dispatch required.\n  dispatch preserves the queued shape, mode, contract, dependencies and identity; only provider/model/reasoning/permission/visibility/worktree options override at dispatch.\n  list | next | done <queue-id> | drop <queue-id> | prune | reconcile <exact-id> --project <id> [original options]"+"\nDispatch: bb firstmate queue dispatch <queue-id> [options]\n"+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","taskId","overrideOwner","sendAt","title","shape","mode","deliveryRequirement"]);
+  const queueHelp='bb firstmate queue add [options] -- "<title>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider"},["task","taskId","overrideOwner","sendAt","title","permissionMode","sharedEnv","worktree","visible"])+"\n  --detail <full-task>\n  --after <queue-id>  Repeat for dependencies, which remain dispatch gates.\n  --wait-until <ISO-time>  Eligibility only; explicit dispatch required.\n  dispatch preserves the queued shape, mode, contract, dependencies and identity; only provider/model/reasoning/permission/visibility/worktree options override at dispatch; dispatch-profile-reason records completed native intake.\n  list | next | done <queue-id> | drop <queue-id> | prune | reconcile <exact-id> --project <id> [original options]"+"\nDispatch: bb firstmate queue dispatch <queue-id> [options]\n"+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","taskId","overrideOwner","sendAt","title","shape","mode","deliveryRequirement","branchPrefix"]);
   const usage = [
     "Usage:",
     "  bb firstmate guide [--json]",
@@ -9394,8 +9446,10 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb firstmate scripts [query] [--json]   # list + verify every installed fm-* script",
     "  bb firstmate fm [--timeout s] <script> [args...]   # real bin/fm-<script>.sh with FM_BACKEND=bb",
     "  bb firstmate deck [--digest|--all] [--json] | session [--json]",
-    "  bb firstmate contract [section,...] [--json] # complete native policy",
-    "  bb firstmate skill <name> [relative-reference] [--source <selected-root source-file>] [--json] # complete selected native policy",
+    "  bb firstmate contract [section,...] [--paged | --cursor <cursor>] [--json] # read every page; default CLI returns complete native policy",
+    "  bb firstmate skill <name> [relative-reference] [--source <selected-root source-file>] [--paged] [--json] # operator full read; agent bounded pages",
+    "  bb firstmate skill --cursor <cursor> [--json] # continue the same verified skill/reference",
+    "  bb firstmate skill --list [--paged] [--json] # complete diagnostic descriptions; not an alternate policy catalog",
     "  bb firstmate runtime status|install|select|migrate|rollback [exact-release|external] [--check] [--json]",
     dispatchHelp,
     "  bb firstmate launches list [--limit n] [--offset n] [--json]   # uncertain slots require reconciliation",
@@ -9456,6 +9510,7 @@ export default async function plugin(bb: BbPluginApi) {
       presentation: { ...tool.presentation, suppress: true },
       async execute(params, ctx) {
         try {
+          await requireSupervisorCaller(ctx);
           const captain = ctxString(ctx, "threadId");
           const receiptCall = typeof asRecord(params)["handledWake"] === "string" || tool.name === "firstmate_wake" || (tool.name === "firstmate_fm" && normalizeFmScript(String(asRecord(params)["script"] ?? "")) === "wake-drain");
           const run = () => withLedgerOperation(tool.name, captain, () => inCaptainHome(captain, async () => {
@@ -9495,7 +9550,12 @@ export default async function plugin(bb: BbPluginApi) {
     });
   }) as BbPluginApi["agents"]["registerTool"];
 
-  async function readCaptainContract(ctx: unknown, section?: string) {
+  async function readCaptainContract(ctx: unknown, section?: string, paged = false, cursor?: string) {
+    if (cursor) {
+      const originalSection = contractCursorSection(cursor);
+      if (section !== undefined && section !== originalSection) throw new Error("Do not change contract section during a cursor read; restart without cursor.");
+      section = originalSection;
+    }
     const current = await settings.get();
     if (!homeScope.getStore()?.captain || !homeScope.getStore()?.home) return toolError("No bound captain home. Call firstmate_deck or bb firstmate deck before reading the native contract; shared-home fallback refused.");
     if (current.fmHome.trim() === "") return toolError("Initialize real Firstmate with firstmate_deck first.");
@@ -9524,12 +9584,13 @@ export default async function plugin(bb: BbPluginApi) {
       ? Buffer.from(result.content, "base64").toString("utf8") : result.content;
     const picked = selectContract(content, section);
     const done = picked.complete
-      ? "The firstmate_contract read is now complete."
+      ? "This transport contains the complete native contract; read all of it and its trigger catalog before orchestration."
       : "This firstmate_contract read covers the listed sections; read any other section by name before acting in its area.";
     const catalog=await nativePolicyLookup(hostId,path.slice(0,-'/AGENTS.md'.length),{operation:'catalog'},signal);
     if (catalog.contractSha256!==createHash('sha256').update(content).digest('hex')) throw new Error('Native contract changed during selected-runtime trigger read; complete contract/catalog read remains unresolved.');
     const triggers=`## Selected native skill trigger catalog @ ${catalog.commit}\n${catalog.root}\n\n${catalog.entries!.map(entry=>`### ${entry.path}\nNative file SHA-256: ${entry.sha256}\n\n\`\`\`yaml\n${entry.frontmatter}\n\`\`\``).join('\n\n')}`;
-    return `${picked.text}\n\n${triggers}\n\n## BB runtime adaptations\n${BB_SKILL_RUNTIME_CONTRACT}\n${done} Treat native policy refusals as refusals. Read durable reports with firstmate_wake; pass handledWake on the final successful action after handling the whole batch.\n`;
+    const text = `${picked.text}\n\n${triggers}\n\n## BB runtime adaptations\n${BB_SKILL_RUNTIME_CONTRACT}\n${DISPATCH_TRANSPORT}\n${done} Treat native policy refusals as refusals. Read durable reports with firstmate_wake; pass handledWake on the final successful action after handling the whole batch.\n`;
+    return paged || cursor ? contractPage(text, JSON.stringify([contractCaptain, current.fmHome, hostId, catalog.root, catalog.commit]), section, cursor) : text;
   }
 
   async function nativePolicyLookup(host:string,root:string,request:Record<string,unknown>,signal:AbortSignal) {
@@ -9543,8 +9604,13 @@ export default async function plugin(bb: BbPluginApi) {
     } finally {await runHostCommand(host,`rm -f ${shQuote(helper)}`,1000).catch(()=>{});}
   }
 
-  async function readNativeSkill(ctx:unknown,name:string,reference?:string,source?:string) {
-    const resource=nativeSkillPath(name,reference,source);
+  async function readNativeSkill(ctx:unknown,name?:string,reference?:string,source?:string,paged=false,cursor?:string,list=false) {
+    const resumed=cursor?skillCursorRequest(cursor):undefined;
+    if (resumed && ((list && !resumed.list) || (name!==undefined && name!==resumed.name) || (reference!==undefined && reference!==resumed.reference) || (source!==undefined && source!==resumed.source))) throw new Error('Native skill cursor resource differs from request; restart without cursor.');
+    if (list && (name || reference!==undefined || source!==undefined)) throw new Error('Use --list without native resource arguments.');
+    const request=resumed??(list?{list:true as const}:{name:name??'',...(reference!==undefined?{reference}:{}),...(source!==undefined?{source}:{})});
+    ({name,reference,source}=request);
+    const resource=request.list?undefined:nativeSkillPath(name??'',reference,source);
     const signal=AbortSignal.any([launchAbort.signal,AbortSignal.timeout(30_000),...(asRecord(ctx)["signal"]?[asRecord(ctx)["signal"] as AbortSignal]:[])]);
     const current=await raceAbort(settings.get(),signal,STUCK_HOST_CALL_MS),captain=ctxString(ctx,"threadId");
     if (!captain || !homeScope.getStore()?.home) throw new Error("Bind this captain with firstmate_deck before native policy reads; no global policy fallback.");
@@ -9555,12 +9621,21 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const selection=await raceAbort(bb.storage.kv.get<{root:string}>(`native-runtime:${captain}`),signal,STUCK_HOST_CALL_MS);
     const root=selection?.root??current.fmHome;
+    if (!resource) {
+      const catalog=await nativePolicyLookup(host,root,{operation:'catalog'},signal);
+      const skills=nativeDescriptions(catalog.entries!);
+      const inventory={diagnostic:true,commit:catalog.commit,root:catalog.root,skills};
+      await raceAbort(settings.experimental_set({fmSkillsManifest:JSON.stringify({schema:2,head:catalog.commit,skills:skills.map(({name,description})=>({name,desc:description}))})}),signal,STUCK_HOST_CALL_MS);
+      const text=JSON.stringify(inventory,null,2);
+      return paged || cursor ? skillPage(text,JSON.stringify([captain,current.fmHome,host,catalog.root,catalog.commit]),request,cursor) : text;
+    }
     const record=await nativePolicyLookup(host,root,{operation:'read',...resource},signal);
     const file=await raceAbort(bb.sdk.files.read({hostId:host,path:`${root}/${resource.path}`}),signal,STUCK_HOST_CALL_MS);
     if (!('content' in file)) throw new Error('Complete native policy file content unavailable');
     const data=Buffer.from(file.content,file.contentEncoding==='base64'?'base64':'utf8');
     if (data.length!==record.sizeBytes || createHash('sha256').update(data).digest('hex')!==record.sha256) throw new Error('Native policy changed or was truncated during file transfer; read remains unresolved');
-    return `Native policy @ ${record.commit}: ${record.root}/${record.path}${record.fragment?'#'+record.fragment:''}\nSource file (--source): ${record.path}\n\n${data.toString('utf8')}`;
+    const text=`Native policy @ ${record.commit}: ${record.root}/${record.path}${record.fragment?'#'+record.fragment:''}\nSource file (--source): ${record.path}\n\n${data.toString('utf8')}`;
+    return paged || cursor ? skillPage(text,JSON.stringify([captain,current.fmHome,host,record.root,record.commit]),request,cursor) : text;
   }
 
   async function checkToolchain(hostId: string, fmHome: string, signal?: AbortSignal) {
@@ -9602,27 +9677,75 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_contract",
-    description: "Read the current native Firstmate supervisor contract, complete selected-runtime skill trigger catalog and BB runtime adaptations. Without section: the complete upstream contract verbatim. section=<number or title, comma-separated> reads those sections; section=\"all\" reads everything. Read before orchestrating and after an upstream update.",
+    description: "Read the native supervisor contract, complete selected-runtime skill trigger catalog and BB adaptations in bounded pages. Start without cursor, then follow EVERY returned cursor before orchestrating. Native bytes remain verbatim across pages. section selects sections; all selects the entire contract. Cursor pins the captain/home and verified snapshot; changed bytes require restarting. Repeat after an upstream update or lost context.",
     parameters: z.object({
       section: z.string().max(200).optional().describe('Contract section(s) by number or title, comma-separated (e.g. "7,8"), or "all".'),
+      cursor: z.string().max(1200).optional().describe("Exact continuation from previous page; omit section on continuation. Read every page in order."),
     }),
-    async execute({ section }, ctx) {
-      return readCaptainContract(ctx, section);
+    async execute({ section, cursor }, ctx) {
+      return readCaptainContract(ctx, section, true, cursor);
     },
   });
 
+  async function selectedMethods(ctx:unknown,input:{action:string;profile?:string;reason?:string;prSkillId?:string;name?:string;reference?:string;source?:string;cursor?:string},paged=true) {
+    if(!["status","enable","disable","read"].includes(input.action))throw new Error("Unknown methods action; use bb firstmate help methods.");
+    const identity=await supervisorCallerIdentity(ctx);
+    const role=identity?.worker?"worker":"captain";
+    if(input.action==="status") return {profile:methodsProfile,role,revision:METHODS_REVISION,prSkillId:selectedPrSource((await baseSettings.get()).selectedPrSource)?.id??null,reason:(await baseSettings.get()).selectedMethodsReason};
+    if(input.action==="enable" || input.action==="disable") {
+      await requireSupervisorCaller(ctx);
+      if(!identity || !metaFlag(identity.meta,"captain")) throw new Error("Methods selection requires the bound captain context.");
+      if(!input.reason?.trim()) throw new Error("Explicit installation selection requires its user-directed reason.");
+      if(input.action==="enable" && input.profile!==undefined && input.profile!==METHODS_PROFILE)throw new Error("Unknown selected methods profile.");
+      const profile=input.action==="enable"?METHODS_PROFILE:"off";
+      let sourceSelection:string|undefined;
+      if(input.prSkillId!==undefined){
+        if(input.action!=="enable")throw new Error("Select /pr only through methods enable.");
+        const signal=AbortSignal.any([launchAbort.signal,AbortSignal.timeout(STUCK_HOST_CALL_MS),...(asRecord(ctx)["signal"]?[asRecord(ctx)["signal"] as AbortSignal]:[])]);
+        const resolved=await installedPrResource(bb.sdk,identity.threadId,ctxString(ctx,"projectId"),signal,raceAbort,input.prSkillId);
+        sourceSelection=JSON.stringify(resolved.source);
+      }
+      await baseSettings.experimental_set({selectedMethods:profile,...(sourceSelection!==undefined?{selectedPrSource:sourceSelection}:{}),selectedMethodsReason:JSON.stringify({actor:identity.threadId,at:new Date().toISOString(),reason:input.reason})});
+      return {profile,revision:METHODS_REVISION};
+    }
+    if(methodsProfile!==METHODS_PROFILE)throw new Error("BB methods are not selected for this installation. Native defaults remain active.");
+    if(!identity || !identity.worker && !metaFlag(identity.meta,"captain"))throw new Error("Read selected methods from a bound captain or native worker role.");
+    const resumed=input.cursor?skillCursorRequest(input.cursor):undefined;
+    if(resumed && ((input.name!==undefined && input.name!==resumed.name) || (input.reference!==undefined && input.reference!==resumed.reference) || (input.source!==undefined && input.source!==resumed.source)))throw new Error("Method cursor resource differs from request.");
+    const request=resumed??{name:input.name??`${role}-methods`,...(input.reference!==undefined?{reference:input.reference}:{}),...(input.source!==undefined?{source:input.source}:{})};
+    let resource:{text:string;source?:PrSource}, externalIdentity:unknown=null;
+    if(request.name==="pr") {
+      if(!identity.worker || identity.meta.shape!=="ship" || identity.meta.posture!=="direct-PR")throw new Error("/pr belongs to the direct-PR ship body author; native pipeline/local-only ownership stays unchanged.");
+      if(request.reference!==undefined || request.source!==undefined)throw new Error("Read the resolved /pr entry body without method-relative references.");
+      const signal=AbortSignal.any([launchAbort.signal,AbortSignal.timeout(STUCK_HOST_CALL_MS),...(asRecord(ctx)["signal"]?[asRecord(ctx)["signal"] as AbortSignal]:[])]);
+      const selected=selectedPrSource((await baseSettings.get()).selectedPrSource);
+      const resolved=await installedPrResource(bb.sdk,identity.threadId,ctxString(ctx,"projectId"),signal,raceAbort,selected?.id);
+      if(selected && (resolved.source.revision!==selected.revision || resolved.source.sha256!==selected.sha256))throw new Error("Selected /pr source changed; reselect its verified current ID with an explicit installation selection reason before body writing.");
+      resource=resolved;externalIdentity=resolved.identity;
+    } else resource=methodResource(PLUGIN_ROOT,role,request.name!,request.reference,request.source);
+    const scope=JSON.stringify(["BB-methods",identity.threadId,identity.meta.nativeHome??null,role,methodsProfile,METHODS_REVISION,externalIdentity]);
+    if(!paged && !input.cursor)return resource.text;
+    const page=skillPage(resource.text,scope,request,input.cursor,"methods");
+    return resource.source?prSourcePage(page,resource.source,FIRSTMATE_ROUTINE_MARKER):page;
+  }
+  bb.agents.registerTool({
+    name:"firstmate_methods",description:"Read the explicitly selected installation's role-owned BB methods in bounded pages; native policy remains authoritative. Status is read-only. Enable/disable require a captain and an explicit user-directed selection reason.",
+    parameters:z.object({action:z.enum(["status","enable","disable","read"]).default("read"),profile:z.string().optional(),reason:z.string().max(1000).optional(),prSkillId:z.string().min(1).max(1000).optional(),name:z.string().optional(),reference:z.string().max(1000).optional(),source:z.string().max(1000).optional(),cursor:z.string().max(4096).optional()}),
+    presentation:{suppress:true},
+    async execute(input,ctx){try{const result=await selectedMethods(ctx,input);return markCaptainToolResult(typeof result==="string"?result:JSON.stringify(result));}catch(error){return markCaptainToolResult(toolError(error instanceof Error?error.message:String(error)));}}
+  });
   registerCaptainTool({
-    name:"firstmate_skill",description:"Read a complete native policy skill or reference from this captain’s selected runtime; both audited revisions supported, no global copied policy fallback.",
-    parameters:z.object({name:z.string(),reference:z.string().optional().describe("Native relative link, including .. and #fragment inside selected runtime; returns complete document"),source:z.string().optional().describe("Exact selected-root relative source file for nested links; default .agents/skills/<name>/SKILL.md")}),
-    async execute({name,reference,source},ctx){return readNativeSkill(ctx,name,reference,source);},
+    name:"firstmate_skill",description:"Read verified native policy from this captain's selected runtime in bounded pages. Follow every returned cursor until END OF NATIVE SKILL TRANSPORT before applying it; no global copied policy fallback.",
+    parameters:z.object({name:z.string().optional().describe("Exact native skill name for the first page"),list:z.boolean().optional().describe("Inspect full diagnostic descriptions from the verified selected catalog; omit resource arguments"),reference:z.string().max(1000).optional().describe("Native relative link, including .. and #fragment inside selected runtime"),source:z.string().max(1000).optional().describe("Exact selected-root relative source file for nested links; default .agents/skills/<name>/SKILL.md"),cursor:z.string().max(4096).optional().describe("Exact continuation cursor; omit other arguments to continue the same verified resource")}),
+    async execute({name,reference,source,cursor,list},ctx){return readNativeSkill(ctx,name,reference,source,true,cursor,list);},
   });
   registerCaptainTool({
     name: "firstmate_dispatch",
     description:
-      "Dispatch a firstmate-style crewmate: spawns a child BB thread for one task (ship crews get an isolated worktree by default) and records it as a crew.",
+      `Dispatch one native crewmate after intake; BB owns the brief→dispatch-resolve→backlog→guarded spawn sequence. ${DISPATCH_TRANSPORT}`,
     presentation: { label: { pending: "Dispatching crewmate", completed: "Dispatched crewmate" } },
     parameters: dispatchParams,
-    async execute({ task, taskId, projectId, title, providerId, model, reasoningLevel, permissionMode, shape, mode, worktree, sharedEnv, visible, sendAt, deliveryRequirement, overrideOwner, sourceRefs }, ctx) {
+    async execute({ task, taskId, projectId, title, providerId, model, reasoningLevel, permissionMode, shape, mode, branchPrefix,dispatchProfileReason,worktree, sharedEnv, visible, sendAt, deliveryRequirement, overrideOwner, sourceRefs }, ctx) {
       const ctxRecord = asRecord(ctx);
       const resolvedProject =
         projectId ?? (typeof ctxRecord["projectId"] === "string" ? ctxRecord["projectId"] : undefined);
@@ -9639,6 +9762,8 @@ export default async function plugin(bb: BbPluginApi) {
           shape,
           mode,
           deliveryRequirement,
+          branchPrefix,
+          dispatchProfileReason,
           sourceRefs,
         });
         if (queued) return queued;
@@ -9658,7 +9783,7 @@ export default async function plugin(bb: BbPluginApi) {
           providerId, model, reasoningLevel: toReasoningLevel(reasoningLevel),
           permissionMode: toPermissionMode(permissionMode ?? (await settings.get()).defaultPermissionMode),
           worktree: worktree === true, visible: visible !== false, shape: shape ?? "ship",
-          mode: toMode(mode, "direct-PR"), sendAt, deliveryRequirement,
+          mode: toMode(mode, "direct-PR"), sendAt, deliveryRequirement, branchPrefix, dispatchProfileReason,
           signal: ctxRecord["signal"] as AbortSignal | undefined,
         };
         followUpWork = (followUpWork ?? Promise.resolve()).then(async () => {
@@ -9714,11 +9839,12 @@ export default async function plugin(bb: BbPluginApi) {
           visible: visible !== false,
           shape: resolvedShape,
           mode: toMode(mode, posture.mode),yolo:posture.yolo,
-          sendAt,deliveryRequirement,signal:ctxRecord["signal"] as AbortSignal | undefined,
+          sendAt,deliveryRequirement,branchPrefix,dispatchProfileReason,signal:ctxRecord["signal"] as AbortSignal | undefined,
         });
       } catch (error) {
         return toolError(`Dispatch failed: ${error instanceof Error ? error.message : String(error)}`);
       }
+      if (isSecondmateRoute(crew)) return `Routed ${crew.shape} request ${crew.id} to secondmate thread ${crew.threadId}; child launch remains pending. Exact child intake is retained; this supervisor's execution is separate. Track with: bb firstmate crew ${crew.id}`;
       const warn = wt.sharedOverride ? " WARN: ship crew on shared env." : "";
       const status = await crewStatus(crew);
       if (status === "error") {
@@ -9730,6 +9856,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_deck",
+    instructions: CAPTAIN_ROLE_INSTRUCTIONS,
     description: "Bind this captain to its exact native home and return the required agent-shell startup command; readiness is unverified until the native digest succeeds. Optional digest/all explicitly requests a fleet digest.",
     presentation: { label: { pending: "Binding captain home", completed: "Home bound; verify native startup" } },
     parameters: z.object({ all: z.boolean().optional().describe("Explicitly scan every captain's crews"), digest:z.boolean().optional().describe("Explicitly request the session/fleet digest before native startup") }),
@@ -9899,7 +10026,7 @@ export default async function plugin(bb: BbPluginApi) {
         .describe("Land a crew/PR owned by another captain (only when the captain explicitly said so)"),
     }),
     async execute({ crewId, yes, allowRedCheck, allowMissingCheck, overrideOwner }, ctx) {
-      const crew = await findCrew(crewId,ctxString(ctx,"threadId"));
+      const crew = await findCrew(crewId,ctxString(ctx,"threadId"),overrideOwner===true);
       if (crew === undefined) return toolError(`No crew ${crewId}.`);
       try {
         return await mergeCrew(crew, yes === true, allowRedCheck, allowMissingCheck, { caller: ctxString(ctx, "threadId"), overrideOwner: overrideOwner === true });
@@ -10219,9 +10346,10 @@ export default async function plugin(bb: BbPluginApi) {
       model: z.string().optional().describe("Crew model (add: stored; dispatch: overrides)"),
       reasoningLevel: z.enum(["low", "medium", "high", "xhigh", "max", "ultra", "none", "ultracode"]).optional()
         .describe("Crew reasoning effort (add: stored; dispatch: overrides)"),
-      deliveryRequirement:z.enum(["pr","merged","merged-and-verified"]).optional(),
+      deliveryRequirement:z.enum(["branch","pr","merged","merged-and-verified"]).optional(),
+      branchPrefix:z.string().max(120).optional(),dispatchProfileReason:z.string().min(1).max(1000).optional(),
     }),
-    async execute({ action, title, projectId, queueId, shape, mode, after, waitUntil, detail, providerId, model, reasoningLevel, deliveryRequirement }, ctx) {
+    async execute({ action, title, projectId, queueId, shape, mode, after, waitUntil, detail, providerId, model, reasoningLevel, deliveryRequirement,branchPrefix,dispatchProfileReason }, ctx) {
       const items = (await readQueue()).filter(row => ownedByScopedCaptain(row.parentThreadId));
       const ctxProject = ctxString(ctx, "projectId");
       const captain = ctxString(ctx, "threadId");
@@ -10275,7 +10403,7 @@ export default async function plugin(bb: BbPluginApi) {
           ...(providerId !== undefined && providerId !== "" ? { providerId } : {}),
           ...(model !== undefined && model !== "" ? { model } : {}),
           ...(reasoningLevel !== undefined ? { reasoningLevel } : {}),
-          deliveryRequirement:deliveryRequirement ?? "merged",
+          deliveryRequirement:mode ? taskDelivery(mode,deliveryRequirement,shape??'ship') : deliveryRequirement,branchPrefix,dispatchProfileReason,
           waitUntil: waitUntil ?? null,
           status: "queued",
           crewId: null,
@@ -10329,7 +10457,7 @@ export default async function plugin(bb: BbPluginApi) {
           providerId: providerId ?? item.providerId ?? (current.defaultProvider !== "" ? current.defaultProvider : undefined),
           model: model ?? item.model,
           reasoningLevel: toReasoningLevel(reasoningLevel ?? item.reasoningLevel),
-          deliveryRequirement:item.deliveryRequirement,
+          deliveryRequirement:item.deliveryRequirement,branchPrefix:item.branchPrefix,dispatchProfileReason:dispatchProfileReason ?? item.dispatchProfileReason,
           permissionMode: toPermissionMode(current.defaultPermissionMode),
           worktree: resolveWorktree({ shape: item.shape }).worktree,
           visible: true,
@@ -10602,15 +10730,15 @@ export default async function plugin(bb: BbPluginApi) {
     const meta = asRecord(context.pluginMetadata);
     if (metaFlag(meta, "crew")) {
       return {
-        tools: [],
+        tools: methodsProfile===METHODS_PROFILE?["firstmate_methods"]:[],
         skills: [],
         instructions:
-          "The native launch brief owns this worker role, BB transport and task policy. BB crew threads have no captain tools or skills. Follow that brief and its exact-ID steering inbox procedure. Do not delegate or change the selected provider, model, or effort. Worker completion is a handoff, not captain merge or deployment completion.",
+          "The native launch brief owns this worker role, BB transport and task policy. BB crew threads have no captain tools or skills. Follow that brief and its exact-ID steering inbox procedure. Do not delegate or change the selected provider, model, or effort. Worker completion is a handoff, not captain merge or deployment completion."+(methodsProfile===METHODS_PROFILE?" "+methodPointer("worker")+(meta.shape==="ship" && meta.posture==="direct-PR"?" Before creating or updating a PR body, read the actual workspace /pr skill using firstmate_methods action=read name=pr, following every cursor. Missing /pr leaves body writing pending; report that missing dependency.":""):""),
       };
     }
     const marked = metaFlag(meta, "captain");
     const base = marked
-      ? `${CAPTAIN_CONTRACT_POINTER} ${BB_SKILL_RUNTIME_CONTRACT}`
+      ? `${CAPTAIN_CONTRACT_POINTER} ${BB_SKILL_RUNTIME_CONTRACT}${methodsProfile===METHODS_PROFILE?" "+methodPointer("captain"):""}`
       : "Firstmate crews are available. Run /captain or firstmate_deck to take the deck.";
     // The complete contract and selected native skills are tool reads. Reserve
     // the SDK window for transport pointers and existing user memory.
@@ -10624,7 +10752,7 @@ export default async function plugin(bb: BbPluginApi) {
       flagsCache.handoffContract === "on",
     );
     return {
-      tools: marked ? [...CAPTAIN_TOOLS] : [...CAPTAIN_BOOTSTRAP_TOOLS],
+      tools: marked ? [...CAPTAIN_TOOLS,...(methodsProfile===METHODS_PROFILE?["firstmate_methods"]:[])] : [...CAPTAIN_BOOTSTRAP_TOOLS],
       skills: marked ? [...CAPTAIN_SKILLS] : [...CAPTAIN_BOOTSTRAP_SKILLS],
       instructions,
     };
@@ -11359,13 +11487,14 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "guide", summary: "Setup guide for firstmate inside BB", usage: "bb firstmate guide [--json]" },
       { name: "runtime", summary: "Pinned native runtime status, installation and explicit selection", usage: "bb firstmate runtime status|install|select|migrate|rollback [release-id] [--check] [--json]" },
       { name: "init", summary: "Native deck setup (add --real for the bundled runtime or an existing explicit external home)", usage: "bb firstmate init [--real] [--json]" },
-      { name: "contract", summary: "Read the full native supervisor contract (or named sections)", usage: "bb firstmate contract [section,...]" },
+      { name: "contract", summary: "Read the complete native contract and trigger catalog; follow every cursor in bounded mode", usage: "bb firstmate contract [section,...] [--paged | --cursor <cursor>] [--json]" },
       { name: "toolchain", summary: "Check native AXI and Lavish dependencies without mutations", usage: "bb firstmate toolchain [--json]" },
       { name: "scripts", summary: "List + verify every installed fm-* script", usage: "bb firstmate scripts [query] [--json]" },
-      { name: "fm", summary: "Run a real firstmate bin/ script with FM_BACKEND=bb", usage: "bb firstmate fm [--timeout s] <script> [args...]" },
+      { name: "fm", summary: "Run a real firstmate bin/ script with FM_BACKEND=bb", usage: FM_WRAPPER_HELP },
       { name: "deck", summary: "Bind native home and return agent-shell startup (not ready until native digest)", usage: "bb firstmate deck [--digest|--all] [--json]" },
       { name: "session", summary: "Session digest: memory + bearings + afk", usage: "bb firstmate session [--json]" },
-      { name:"skill", summary:"Read selected native policy without mixing runtime versions", usage:"bb firstmate skill <name> [relative-reference] [--source <selected-root source-file>] [--json]" },
+      { name:"methods",summary:"Status or explicit installation selection; bounded role-owned method reads",usage:"bb firstmate methods status | enable selected-v1 --reason <user-selection> [--pr-skill <exact-skill-id>] | disable --reason <reason> | read [captain-methods|worker-methods|pr] [relative-reference] [--source <source>] [--paged|--cursor <cursor>] [--json]" },
+      { name:"skill", summary:"Read selected native policy or diagnostic descriptions without mixing runtime versions", usage:"bb firstmate skill <name> [relative-reference] [--source <selected-root source-file>] [--paged] [--json]; skill --cursor <cursor>; skill --list [--paged] [--json]" },
       { name: "dispatch", summary: "Dispatch crewmate child threads", usage: dispatchHelp },
       { name: "crews", summary: "List recorded crews with live status", usage: "bb firstmate crews [--json]" },
       { name: "crew", summary: "Show one crew with last output", usage: "bb firstmate crew <crew-id> [--json]" },
@@ -11399,8 +11528,12 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "migrate-owners", summary: "Project KV queue/decisions/afk/quiet/memory into the real files for owners set to real (idempotent)", usage: "bb firstmate migrate-owners [--json]" },
     ],
     async run(argv, ctx) {
+      try { await requireSupervisorCaller(ctx,argv); }
+      catch(error) { return {exitCode:1,stderr:error instanceof Error?error.message:String(error)}; }
       return withCliOperation(argv, ctxString(ctx, "threadId"), () => inCaptainHome(ctxString(ctx, "threadId"), async () => {
       if (argv[0] === "fm") {
+        const helpIndex=argv.findIndex(arg=>arg==='--help'||arg==='-h'),separator=argv.indexOf('--');
+        if(helpIndex>=0 && (separator<0 || helpIndex<separator)) return {exitCode:0,stdout:FM_WRAPPER_HELP};
         const json = argv.includes("--json");
         const fail = (message: string) => ({ exitCode: 1, stderr: message });
         const signal = asRecord(ctx)["signal"] as AbortSignal | undefined;
@@ -11409,7 +11542,7 @@ export default async function plugin(bb: BbPluginApi) {
           const fmHome = flagFromArgv(argv, "home") ?? (current.fmHome !== "" ? current.fmHome : undefined);
           if (fmHome === undefined) return fail("No firstmate home. Run: bb firstmate init --real");
           const parsed = parseFmArgv(argv.slice(1));
-          if (parsed.script === undefined) return fail("Usage: bb firstmate fm [--timeout s] <script> [args...]\nExample: bb firstmate fm spawn -- --mode direct-PR -- ship \"fix login\"");
+          if (parsed.script === undefined) return fail(FM_WRAPPER_HELP);
           const startup = captainStartupCommand(fmHome, parsed.script, parsed.args);
           if (startup!==null && current.fullParityOnDeck && (!homeScope.getStore()?.home || homeScope.getStore()?.home!==fmHome)) return fail("Native startup requires this captain's exact bound home. Run bb firstmate deck; shared/explicit foreign-home fallback refused.");
           if (startup !== null) return { exitCode: 0, stdout: json
@@ -11467,13 +11600,20 @@ export default async function plugin(bb: BbPluginApi) {
             const text = guideText(repo, current.fmScriptCount, current.fmSkillCount);
             return reply({ guide: text }, text);
           }
+          case "methods": {
+            const action=rest[0]??"status";
+            if(!["status","enable","disable","read"].includes(action))return fail("Use methods status|enable|disable|read.");
+            const value=await selectedMethods(ctx,{action,profile:action==="enable"?rest[1]:undefined,reason:flagStr(flags,"reason"),prSkillId:flagStr(flags,"pr-skill"),name:action==="read"?rest[1]:undefined,reference:action==="read"?rest[2]:undefined,source:flagStr(flags,"source"),cursor:flagStr(flags,"cursor")},flags.has("paged"));
+            return typeof value==="string"?reply({text:value},value):reply(value,JSON.stringify(value));
+          }
           case "skill": {
-            if (!rest[0]) return fail("Use bb firstmate skill <native-name> [relative-reference] [--source <selected-root source-file>]. Bind with bb firstmate deck first.");
-            const text=await readNativeSkill(ctx,rest[0],rest[1],flagStr(flags,'source'));return reply({text},text);
+            if (!rest[0] && !flagStr(flags,'cursor') && !flags.has('list')) return fail("Use bb firstmate skill <native-name> [relative-reference] [--source <selected-root source-file>] [--paged], then skill --cursor <cursor>; skill --list inspects diagnostic descriptions. Bind with bb firstmate deck first.");
+            const list=flags.has('list'),text=await readNativeSkill(ctx,rest[0],rest[1],flagStr(flags,'source'),flags.has('paged'),flagStr(flags,'cursor'),list);
+            return list && flags.has('json') && !flags.has('paged') && !flagStr(flags,'cursor') ? reply(JSON.parse(text),text) : reply({text},text);
           }
           case "contract": {
             // The operator CLI reads the whole contract unless a section is named.
-            const text = await readCaptainContract(ctx, rest.join(" ").trim() || "all");
+            const text = await readCaptainContract(ctx, rest.join(" ").trim() || undefined, flags.get("paged") === true, flagStr(flags, "cursor"));
             if (typeof text !== "string") return fail(text.content.filter(c=>c.type==='text').map(c=>c.text).join('\n')||"Native contract could not be read.");
             return reply({ contract: text }, text);
           }
@@ -11527,7 +11667,7 @@ export default async function plugin(bb: BbPluginApi) {
             if (projectId === undefined) return fail("No project: pass --project <id> (see bb project list).");
             if(flagStr(flags,"mode")) modeSchema.parse(flagStr(flags,"mode"));
             if(flagStr(flags,"shape")) shapeSchema.parse(flagStr(flags,"shape"));
-            if(flagStr(flags,"delivery-requirement")) z.enum(["pr","merged","merged-and-verified"]).parse(flagStr(flags,"delivery-requirement"));
+            if(flagStr(flags,"delivery-requirement")) z.enum(["branch","pr","merged","merged-and-verified"]).parse(flagStr(flags,"delivery-requirement"));
             const shape = toShape(flagStr(flags, "shape"));
             const wt = resolveWorktree({
               shape,
@@ -11581,7 +11721,7 @@ export default async function plugin(bb: BbPluginApi) {
                 visible: !flags.has("hidden"),
                 shape,
                 mode,yolo:registry.yolo,
-                sendAt,signal,deliveryRequirement:flagStr(flags,"delivery-requirement") as "pr" | "merged" | "merged-and-verified" | undefined,
+                sendAt,signal,branchPrefix:flagStrAllowEmpty(flags,'branch-prefix'),dispatchProfileReason:flagStr(flags,'dispatch-profile-reason'),deliveryRequirement:flagStr(flags,"delivery-requirement") as "branch" | "pr" | "merged" | "merged-and-verified" | undefined,
               });
               dispatched.push({ ...crew, status: await crewStatus(crew) });
             }
@@ -11603,7 +11743,7 @@ export default async function plugin(bb: BbPluginApi) {
               ...queuedNotes,
               ...dispatched.map(
                 (c) =>
-                  `Dispatched ${c.shape} crew ${c.id} as thread ${c.threadId} [${c.status}] (${c.worktree ? "worktree" : "shared-env"}, ${c.posture})${dispatchStatusNote(c.status, failures.get(c.id))}${permissionLine(c.id)}\nTrack: bb firstmate crew ${c.id}`,
+                  isSecondmateRoute(c) ? `Routed ${c.shape} request ${c.id} to secondmate thread ${c.threadId}; child launch remains pending.\nTrack: bb firstmate crew ${c.id}` : `Dispatched ${c.shape} crew ${c.id} as thread ${c.threadId} [${c.status}] (${c.worktree ? "worktree" : "shared-env"}, ${c.posture})${dispatchStatusNote(c.status, failures.get(c.id))}${permissionLine(c.id)}\nTrack: bb firstmate crew ${c.id}`,
               ),
               ...hints,
             ].join("\n");
@@ -11797,7 +11937,7 @@ export default async function plugin(bb: BbPluginApi) {
             if (id === undefined) return fail("Usage: bb firstmate mark-crew <thread-id> [--shape ship|scout] [--task <id>]");
             if(flagStr(flags,"mode")) modeSchema.parse(flagStr(flags,"mode"));
             if(flagStr(flags,"shape")) shapeSchema.parse(flagStr(flags,"shape"));
-            if(flagStr(flags,"delivery-requirement")) z.enum(["pr","merged","merged-and-verified"]).parse(flagStr(flags,"delivery-requirement"));
+            if(flagStr(flags,"delivery-requirement")) z.enum(["branch","pr","merged","merged-and-verified"]).parse(flagStr(flags,"delivery-requirement"));
             const shape = toShape(flagStr(flags, "shape"));
             const taskId = (flagStr(flags, "task") ?? "").trim();
             // Record the fm task id as crewId so a plugin-side fallback can find and
@@ -11838,7 +11978,7 @@ export default async function plugin(bb: BbPluginApi) {
           case "merge": {
             const id = rest[0];
             if (id === undefined) return fail(usage);
-            const crew = await findCrew(id,ctxThread);
+            const crew = await findCrew(id,ctxThread,flags.has("override-owner"));
             if (crew === undefined) return fail(`No crew ${id}.`);
             const text = await mergeCrew(crew, flags.has("yes"), flagStr(flags, "allow-red"), flagStr(flags, "allow-missing"), {
               caller: ctxThread, overrideOwner: flags.has("override-owner"),
@@ -12018,7 +12158,8 @@ export default async function plugin(bb: BbPluginApi) {
                 ...(flagStr(flags, "provider") !== undefined ? { providerId: flagStr(flags, "provider") } : {}),
                 ...(flagStr(flags, "model") !== undefined ? { model: flagStr(flags, "model") } : {}),
                 ...(toReasoningLevel(flagStr(flags, "reasoning-level")) !== undefined ? { reasoningLevel: strictReasoning(flagStr(flags, "reasoning-level")) } : {}),
-                deliveryRequirement:z.enum(["pr","merged","merged-and-verified"]).parse(flagStr(flags,"delivery-requirement") ?? "merged"),
+                deliveryRequirement:flagStr(flags,'mode') ? taskDelivery(flagStr(flags,'mode')!,z.enum(["branch","pr","merged","merged-and-verified"]).optional().parse(flagStr(flags,"delivery-requirement")),shapeVal) : z.enum(["branch","pr","merged","merged-and-verified"]).optional().parse(flagStr(flags,"delivery-requirement")),
+                branchPrefix:flagStrAllowEmpty(flags,'branch-prefix'),dispatchProfileReason:flagStr(flags,'dispatch-profile-reason'),
                 waitUntil: flagStr(flags, "wait-until") ?? null,
                 status: "queued",
                 crewId: null,
@@ -12070,7 +12211,7 @@ export default async function plugin(bb: BbPluginApi) {
                 providerId: flagStr(flags, "provider") ?? item.providerId ?? (current.defaultProvider !== "" ? current.defaultProvider : undefined),
                 model: flagStr(flags, "model") ?? item.model,
                 reasoningLevel: strictReasoning(flagStr(flags, "reasoning-level") ?? item.reasoningLevel),
-                deliveryRequirement:item.deliveryRequirement,
+                deliveryRequirement:item.deliveryRequirement,branchPrefix:item.branchPrefix,dispatchProfileReason:flagStr(flags,'dispatch-profile-reason') ?? item.dispatchProfileReason,
                 permissionMode: toPermissionMode(flagStr(flags, "permission-mode") ?? current.defaultPermissionMode),
                 worktree: resolveWorktree({ shape: item.shape, sharedEnv: flags.has("shared-env"), worktreeFlag: flags.has("worktree") }).worktree,
                 visible: !flags.has("hidden"),

@@ -1,0 +1,40 @@
+✖ accepted dispatch intent and specification 2d833ff1 reach real native briefs and rendered workers without tail loss (2119.383015ms)
+✖ accepted dispatch intent and specification 1f3e7696 reach real native briefs and rendered workers without tail loss (1978.540093ms)
+ℹ tests 2
+ℹ suites 0
+ℹ pass 0
+ℹ fail 2
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 4420.950397
+
+✖ failing tests:
+
+test at server.native-policy.test.mjs:420:23
+✖ accepted dispatch intent and specification 2d833ff1 reach real native briefs and rendered workers without tail loss (2119.383015ms)
+  AssertionError [ERR_ASSERTION]: all accepted intent bytes reach the authoritative native brief
+      at TestContext.<anonymous> (file:///root/github_projects/bb-plugin-firstmate-launch-pr-lifecycle/server.native-policy.test.mjs:438:11)
+      at async Test.run (node:internal/test_runner/test:1332:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: false,
+    expected: true,
+    operator: '==',
+    diff: 'simple'
+  }
+
+test at server.native-policy.test.mjs:420:23
+✖ accepted dispatch intent and specification 1f3e7696 reach real native briefs and rendered workers without tail loss (1978.540093ms)
+  AssertionError [ERR_ASSERTION]: all accepted intent bytes reach the authoritative native brief
+      at TestContext.<anonymous> (file:///root/github_projects/bb-plugin-firstmate-launch-pr-lifecycle/server.native-policy.test.mjs:438:11)
+      at async Test.run (node:internal/test_runner/test:1332:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:911:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: false,
+    expected: true,
+    operator: '==',
+    diff: 'simple'
+  }

@@ -1,0 +1,105 @@
+✖ public methods selection persists for new captains and exposes only role-owned verified references (94.240872ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 0
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 375.335951
+
+✖ failing tests:
+
+test at server.methods.test.mjs:166:1
+✖ public methods selection persists for new captains and exposes only role-owned verified references (94.240872ms)
+  AssertionError [ERR_ASSERTION]: Usage:
+    bb firstmate guide [--json]
+    bb firstmate toolchain [--json]   # native AXI + Lavish compatibility, read-only
+    bb firstmate init [--real] [--machine m] [--path p] [--name n] [--json]
+    bb firstmate scripts [query] [--json]   # list + verify every installed fm-* script
+    bb firstmate fm [--timeout s] <script> [args...]   # real bin/fm-<script>.sh with FM_BACKEND=bb
+    bb firstmate deck [--digest|--all] [--json] | session [--json]
+    bb firstmate contract [section,...] [--paged | --cursor <cursor>] [--json] # read every page; default CLI returns complete native policy
+    bb firstmate skill <name> [relative-reference] [--source <selected-root source-file>] [--paged] [--json] # operator full read; agent bounded pages
+    bb firstmate skill --cursor <cursor> [--json] # continue the same verified skill/reference
+    bb firstmate skill --list [--paged] [--json] # complete diagnostic descriptions; not an alternate policy catalog
+    bb firstmate runtime status|install|select|migrate|rollback [exact-release|external] [--check] [--json]
+  bb firstmate dispatch [options] -- "<task>"
+    --task-id <value>  Stable retry identity; reuse after an uncertain launch
+    --project <value>  BB project id; defaults to the current thread's project
+    --title <value>
+    --provider <value>
+    --model <value>
+    --reasoning-level <low|medium|high|xhigh|max|ultra|none|ultracode>  Reasoning effort applied to the crew from turn 1
+    --permission-mode <accept-edits|auto|full>
+    --shape <ship|scout>
+    --mode <direct-PR|no-mistakes|local-only>
+    --branch-prefix <value>  Native ship-branch prefix selected at intake; passed unchanged to brief and spawn, default fm/; empty gives a bare task-id branch
+    --dispatch-profile-reason <value>  Native enabled dispatch-resolve intake decision/override reason for explicit BB provider/model selection; does not grant approval
+    --worktree
+    --shared-env  Unsupported for native ship transport; shared-worktree requests refuse before creation
+    --hidden  Hide crew in the sidebar (default visible)
+    --delivery-requirement <branch|pr|merged|merged-and-verified>  local-only defaults to branch (ready in branch, no push/PR/merge); PR modes default to merged, which requires existing native merge authority, never grants it
+    --override-owner  Proceed even though the task targets a PR another captain's crew owns (only on the captain's word)
+    --task <text>  Repeat for bounded fan-out; --hidden hides the worker.
+    sendAt/--send-at is unsupported; native ship isolation is mandatory.
+    bb firstmate launches list [--limit n] [--offset n] [--json]   # uncertain slots require reconciliation
+    bb firstmate launches adopt <task-id> --thread <thread-id> [--check] [--json]   # exact legacy registration repair; no turn or merge
+    bb firstmate deliveries list|inspect|register|reconcile|assign|abandon|verify [id] [--from manager] [--reason evidence] [--authorized]
+    bb firstmate deliveries account <id> --failure <id> --scope author|baseline --follow-up-task <existing-task> --reason <evidence> --authorized
+    sendAt is unsupported; backlog waitUntil requires later explicit dispatch.
+    bb firstmate crews | crew <id> | watch [id ...] [--timeout s] [--json]
+    bb firstmate tell <id> [--queue] -- "<message>" | interrupt <id> | stop <id> | retry <id> [--model m] [--provider p] [--reasoning-level l] [--intent failure-recovery|execution-change] [--reason r]
+    bb firstmate scout-report <id> [--json]   # complete owned promotion artifact
+    bb firstmate bearings | deliver <id> | merge <id> [--yes] [--allow-red <check-name>] [--allow-missing <check-name>] | promote <id>
+    bb firstmate handoff --from <previous-captain-thread> [--crew <id>]
+    bb firstmate queue reconcile <id> --project <id> [--title <original> --detail <full> --mode <mode> --delivery-requirement <contract> --provider <id> --model <id> --reasoning-level <level> --after <id> --wait-until <iso>]
+  bb firstmate queue add [options] -- "<title>"
+    --project <value>  BB project id; defaults to the current thread's project
+    --provider <value>
+    --model <value>
+    --reasoning-level <low|medium|high|xhigh|max|ultra|none|ultracode>  Reasoning effort applied to the crew from turn 1
+    --shape <ship|scout>
+    --mode <direct-PR|no-mistakes|local-only>
+    --branch-prefix <value>  Native ship-branch prefix selected at intake; passed unchanged to brief and spawn, default fm/; empty gives a bare task-id branch
+    --dispatch-profile-reason <value>  Native enabled dispatch-resolve intake decision/override reason for explicit BB provider/model selection; does not grant approval
+    --delivery-requirement <branch|pr|merged|merged-and-verified>  local-only defaults to branch (ready in branch, no push/PR/merge); PR modes default to merged, which requires existing native merge authority, never grants it
+    --detail <full-task>
+    --after <queue-id>  Repeat for dependencies, which remain dispatch gates.
+    --wait-until <ISO-time>  Eligibility only; explicit dispatch required.
+    dispatch preserves the queued shape, mode, contract, dependencies and identity; only provider/model/reasoning/permission/visibility/worktree options override at dispatch; dispatch-profile-reason records completed native intake.
+    list | next | done <queue-id> | drop <queue-id> | prune | reconcile <exact-id> --project <id> [original options]
+  Dispatch: bb firstmate queue dispatch <queue-id> [options]
+    --project <value>  BB project id; defaults to the current thread's project
+    --provider <value>
+    --model <value>
+    --reasoning-level <low|medium|high|xhigh|max|ultra|none|ultracode>  Reasoning effort applied to the crew from turn 1
+    --permission-mode <accept-edits|auto|full>
+    --dispatch-profile-reason <value>  Native enabled dispatch-resolve intake decision/override reason for explicit BB provider/model selection; does not grant approval
+    --worktree
+    --shared-env  Unsupported for native ship transport; shared-worktree requests refuse before creation
+    --hidden  Hide crew in the sidebar (default visible)
+    bb firstmate queue [list|next|dispatch <qid>|done <qid>|drop <qid>|prune]
+    bb firstmate decide ask [--option o ...] [--crew <id>] -- "<question>"
+    bb firstmate decide [list|answer <id>|defer <id>|drop <id>]
+    bb firstmate posture [set --project <id> [--mode m] [--yolo on|off] [--reason current-user-override]]
+    bb firstmate memory [show|set-captain|add-learning|drop-learning <n>|clear <captain|learnings>]
+    bb firstmate afk [on|off|status] [-- "words"]
+    bb firstmate quiet [on|off|status]
+    bb firstmate secondmate [list|register --project <id> --thread <id> [--scope <text>] [--projects a,b]|drop <project>]
+    bb firstmate supervision [on|off|status]
+    bb firstmate forget <id> [--stop] [--force]
+    bb firstmate mark-crew <thread-id> [--shape ship|scout]
+  
+  1 !== 0
+  
+      at TestContext.<anonymous> (file:///root/github_projects/bb-plugin-firstmate-launch-pr-lifecycle/server.methods.test.mjs:171:93)
+      at async Test.run (node:internal/test_runner/test:1332:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: 1,
+    expected: 0,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }

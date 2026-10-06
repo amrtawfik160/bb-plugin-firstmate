@@ -1,0 +1,7 @@
+This plugin pins @get-bb/plugin-sdk 0.4.104; this bb's SDK is 0.5.29 — `bb plugin types` updates the pin.
+dist/server.js
+dist/server.js.map
+dist/server.meta.json
+dist/app.js
+dist/app.css
+dist/app.meta.json

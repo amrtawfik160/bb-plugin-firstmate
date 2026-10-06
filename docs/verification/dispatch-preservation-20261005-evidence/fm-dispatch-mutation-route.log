@@ -1,0 +1,50 @@
+✖ secondmate public dispatch 2d833ff1 carries exact child intake independently of supervisor execution through native child brief (956.401294ms)
+✖ secondmate public dispatch 1f3e7696 carries exact child intake independently of supervisor execution through native child brief (773.691326ms)
+ℹ tests 2
+ℹ suites 0
+ℹ pass 0
+ℹ fail 2
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 2059.632893
+
+✖ failing tests:
+
+test at server.native-policy.test.mjs:466:23
+✖ secondmate public dispatch 2d833ff1 carries exact child intake independently of supervisor execution through native child brief (956.401294ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + undefined
+  - 'requested-model'
+  
+      at TestContext.<anonymous> (file:///root/github_projects/bb-plugin-firstmate-launch-pr-lifecycle/server.native-policy.test.mjs:485:174)
+      at async Test.run (node:internal/test_runner/test:1332:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: 'requested-model',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at server.native-policy.test.mjs:466:23
+✖ secondmate public dispatch 1f3e7696 carries exact child intake independently of supervisor execution through native child brief (773.691326ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + undefined
+  - 'requested-model'
+  
+      at TestContext.<anonymous> (file:///root/github_projects/bb-plugin-firstmate-launch-pr-lifecycle/server.native-policy.test.mjs:485:174)
+      at async Test.run (node:internal/test_runner/test:1332:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:911:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: 'requested-model',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }

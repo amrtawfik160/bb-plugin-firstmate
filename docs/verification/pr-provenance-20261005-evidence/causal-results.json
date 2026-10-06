@@ -1,0 +1,26 @@
+[
+  {
+    "mutation": "omit-source-metadata",
+    "test": "public paged PR reads expose",
+    "exitCode": 1,
+    "killed": true
+  },
+  {
+    "mutation": "omit-metadata-byte-bound",
+    "test": "public PR reads refuse oversized",
+    "exitCode": 1,
+    "killed": true
+  },
+  {
+    "mutation": "omit-complete-serialized-bound",
+    "test": "public PR reads refuse oversized",
+    "exitCode": 1,
+    "killed": true
+  },
+  {
+    "mutation": "interpret-literal-source-replacement-tokens",
+    "test": "public paged PR reads expose",
+    "exitCode": 1,
+    "killed": true
+  }
+]

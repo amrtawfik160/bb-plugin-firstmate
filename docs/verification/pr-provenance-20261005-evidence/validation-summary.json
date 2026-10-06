@@ -1,0 +1,31 @@
+{
+  "baseline": "9b2bdaa665be61f61273940ceae953c3e08963fa",
+  "methods": {
+    "passed": 12,
+    "failed": 0,
+    "skipped": 0
+  },
+  "realNativeComposition": {
+    "passed": 2,
+    "failed": 0,
+    "skipped": 0,
+    "pins": [
+      "2d833ff147cd26a5c461e914e06854e0eb2707ce",
+      "1f3e769616fdf9f31f85f4c3e6a9f71606634238"
+    ]
+  },
+  "causalMutationsKilled": 4,
+  "metadataBytesMax": 2048,
+  "completeSerializedResponseBytesExclusiveMax": 12000,
+  "typecheck": "passed",
+  "fidelity": "passed",
+  "runtimeIntegrity": "passed",
+  "build": "passed with BB0.44.0",
+  "workerReadAcceptance": "parent pending refreshed package",
+  "productionChanges": false,
+  "testedSha256": {
+    "lib/selected-methods.ts": "f2528e416e1d09c737e1c2ad012d4b4ab7283e45de5c01ebd679c205cf344dc5",
+    "server.ts": "68597b476ccf834656e4413e1d80fc1a8d545a03b7a7159912dd695f52bf11c9",
+    "server.methods.test.mjs": "edc14ae2966f2739ad5d2d2f0198e65a9d103fd0783f461ad6ee802642e3fdd3"
+  }
+}

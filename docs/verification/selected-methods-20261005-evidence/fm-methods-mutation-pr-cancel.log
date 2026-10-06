@@ -1,0 +1,18 @@
+✖ PR skill lookup cancellation settles disposal without writing a body or starting another task (1114.247269ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 0
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1431.004673
+
+✖ failing tests:
+
+test at server.methods.test.mjs:221:1
+✖ PR skill lookup cancellation settles disposal without writing a body or starting another task (1114.247269ms)
+  Error: PR reader did not settle disposal
+      at Timeout.<anonymous> (file:///root/github_projects/bb-plugin-firstmate-launch-pr-lifecycle/server.methods.test.mjs:229:102)
+      at listOnTimeout (node:internal/timers:605:17)
+      at process.processTimers (node:internal/timers:541:7)

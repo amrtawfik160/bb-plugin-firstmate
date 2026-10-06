@@ -6,7 +6,9 @@ import {mkdtempSync,mkdirSync,readFileSync,writeFileSync,openSync,closeSync,real
 import {tmpdir} from 'node:os';import {dirname,join,resolve} from 'node:path';import {createServer} from 'node:net';
 import {createFakePluginHost,makePluginAgentConfigurationContext} from '@get-bb/plugin-sdk/testing';
 import plugin from '../server.ts';import {followRuntimeReferences} from './captain-packaging-check.mjs';
+import {METHOD_ASSET_HASHES} from '../lib/method-assets.ts';
 import {resolveInstalledBbRuntime} from './bb-runtime-fixture.mjs';
+import {acceptancePreflight} from './acceptance-preflight.mjs';import {createHash} from 'node:crypto';
 const exec=promisify(execFile),root=resolve('.');
 async function freePort(){const socket=createServer();await new Promise(r=>socket.listen(0,'127.0.0.1',r));const port=socket.address().port;await new Promise(r=>socket.close(r));return port;}
 const discoveryEnv={...process.env};for(const key of Object.keys(discoveryEnv))if(key.startsWith('BB_'))delete discoveryEnv[key];
@@ -65,6 +67,32 @@ for(const entrypoint of ['javascriptCli','nativeCli'])test('installed BB discove
    }
   }finally{await host.harness.lifecycle.dispose();}
   const state=await cli(['plugin','list','--json']);
+  const installed=state.plugins.find(p=>p.id==='firstmate');
+  for(const [asset,expectedHash] of Object.entries(METHOD_ASSET_HASHES))assert.equal(createHash('sha256').update(readFileSync(join(installed.rootDir,'skills',asset))).digest('hex'),expectedHash,'installed selected method asset '+asset);
+  const selected=createFakePluginHost({pluginId:'firstmate',agentSkillIds:ids,settings:{selectedMethods:'selected-v1'}});await plugin(selected.bb);
+  try{
+   for(const role of [{captain:'true'},{crew:'true',captain:'true',shape:'ship',posture:'direct-PR'}]){
+    const cfg=await selected.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({pluginMetadata:role}));
+    assert.ok(cfg.tools.some(t=>t.name==='firstmate_methods'));assert.ok(!cfg.skills.some(id=>id.includes('methods')));assert.doesNotMatch(cfg.instructions,/Calm/);
+    assert.match(cfg.instructions,role.crew?/worker-methods/:/captain-methods/);
+   }
+  }finally{await selected.harness.lifecycle.dispose();}
+
+  const machines=await cli(['machine','list','--json']);const machine=machines.find(h=>h.status==='connected');assert.ok(machine,'exact owned host available: '+JSON.stringify(machines));
+  const expected={serverUrl:env.BB_SERVER_URL,launchId:home,dataDir:data,pluginRoot:installed.rootDir,hostId:machine.id,
+    buildSha256:createHash('sha256').update(readFileSync(join(installed.rootDir,'dist/server.js'))).digest('hex'),release:JSON.parse(readFileSync(join(installed.rootDir,'runtime-assets/distribution.json'))).release};
+  const preflight=()=>acceptancePreflight(expected,{binary,environment:env});
+  await cli(['plugin','disable','firstmate','--json']);
+  await assert.rejects(preflight(),/not enabled\/running/);
+  await cli(['plugin','reload','firstmate','--json']);
+  await assert.rejects(preflight(),/not enabled\/running/,'reload must not be mistaken for enabling');
+  await cli(['plugin','enable','firstmate','--json']);
+  let accepted;
+  for(let n=0;n<50;n++){try{accepted=await preflight();break;}catch(error){if(n===49)throw error;await new Promise(r=>setTimeout(r,100));}}
+  assert.equal(accepted.plugin.running,true);assert.equal(accepted.selectedRuntime.checked,false);assert.equal(accepted.modelLaunchObserved,false);
+  await assert.rejects(acceptancePreflight({...expected,launchId:'wrong-server'},{binary,environment:env}),/Wrong server launch identity/);
+  await assert.rejects(acceptancePreflight({...expected,hostId:'host_foreign'},{binary,environment:env}),/absent\/disconnected/);
+  await assert.rejects(acceptancePreflight({...expected,buildSha256:'0'.repeat(64)},{binary,environment:env}),/reviewed artifact hash/);
   writeFileSync(join(home,'evidence.json'),JSON.stringify({entrypoint,binary,runtime,entries,state},null,2));
  }catch(error){throw new Error(String(error)+'\nOwned server log: '+logPath+'\n'+readFileSync(logPath,'utf8').slice(-6000));}
  finally{

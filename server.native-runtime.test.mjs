@@ -6,7 +6,7 @@ import {tmpdir} from 'node:os';
 import {spawnSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import {createFakePluginHost,makeThreadResponse} from '@get-bb/plugin-sdk/testing';
-import plugin from './server.ts';
+import plugin,{overlayFingerprint} from './server.ts';
 import {distribution,helper,assets,secondRelease} from './scripts/native-runtime-fixture.mjs';
 import {createLaunches,launchKey} from './lib/launch.ts';
 const ctx={threadId:'thr_fresh',projectId:'proj_fixture'};
@@ -59,6 +59,21 @@ test('seeded bundled captain recovers exact child binding before first deck with
 test('runtime factory registration is load-safe before SDK bind',async()=>{
  const host=createFakePluginHost({pluginId:'firstmate'});const descriptor=Object.getOwnPropertyDescriptor(host.bb,'sdk');Object.defineProperty(host.bb,'sdk',{configurable:true,get(){throw new Error('SDK is not bound');}});
  try {await plugin(host.bb);assert.ok(host.harness.registrations.agentTools.find(t=>t.name==='firstmate_runtime'));}finally{Object.defineProperty(host.bb,'sdk',descriptor);await host.harness.lifecycle.dispose();}
+});
+test('bound captain refresh replaces a legacy cached hook without changing runtime selection or reports',async()=>{
+ const f=await factory();try{
+  const first=await f.host.harness.behavior.runCli(['deck','--json'],ctx);assert.equal(first.exitCode,0,first.stderr);
+  const home=await f.host.bb.storage.kv.get(`native-home:${ctx.threadId}`),selection=await f.host.bb.storage.kv.get(`native-runtime:${ctx.threadId}`);
+  writeFileSync(join(home,'state/retained.status'),'audit complete; captain decision still pending\n');
+  const installed=join(f.directory,'.bb-firstmate/bin/bb-captain-hook.sh');writeFileSync(installed,'#!/bin/sh\n# Legacy hook without resumed native outcome guidance\nexit 0\n',{mode:0o755});
+  // Prior release's persisted setup identity covered only mirror and runtime.
+  await f.host.bb.storage.kv.set(`captain-adapter-setup:${ctx.threadId}`,JSON.stringify([home,'host_remote',overlayFingerprint(),selection]));
+  const resume=await f.host.harness.behavior.runCli(['deck','--json'],ctx);assert.equal(resume.exitCode,0,resume.stderr);
+  assert.match(readFileSync(installed,'utf8'),/AGENTS\.md section 9/);
+  assert.deepEqual(await f.host.bb.storage.kv.get(`native-runtime:${ctx.threadId}`),selection);
+  assert.equal(readFileSync(join(home,'state/retained.status'),'utf8'),'audit complete; captain decision still pending\n');
+  assert.equal(f.host.harness.sdk.callsTo('threads.spawn').length,0);assert.equal(f.host.harness.sdk.callsTo('threads.send').length,0);
+ }finally{await f.clean();}
 });
 test('published selection plus failed BB cache write recovers across factory reload without another selection or worker',async()=>{
  let f=await factory();try {
