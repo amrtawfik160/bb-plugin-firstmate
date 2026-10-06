@@ -63,8 +63,15 @@ tool exists.
   owned by a durable on-host **keeper**: a small script (written to
   `state/.bb-watch-keeper.sh` via the atomic host-file writer, launched detached
   with `setsid nohup` — proven on the live host to survive the BB terminal
-  force-close) that re-arms `fm-watch-arm.sh` every ~`grace/3`s and self-exits when
-  its pidfile no longer names it. The supervisor cycle only **(re)launches the
+  force-close) that re-arms `fm-watch-arm.sh` every ~`grace/3`s. The re-arm runs
+  in the background because it can block while it follows a watcher. The keeper
+  checks its exit conditions every interval and stops its re-arm when it exits:
+  its pidfile no longer names it, its owner beat is stale, or it gets TERM. It
+  removes the pidfile only while the pidfile still names it, so it never removes
+  a successor's pidfile. It trims `state/.bb-watch-arm.log` to the newest
+  256 KiB once the log passes 1 MiB. When a captain thread is deleted, the
+  captain-home service stops that home's keeper and records the home as retired.
+  Later passes and reloads skip it. The supervisor cycle only **(re)launches the
   keeper when its pid is dead**; a watcher exiting on a wake is normal and no longer
   triggers relaunch/backoff (the old design re-armed on beacon staleness then backed
   off, so after every wake the watcher stayed down for a growing window). BB only
@@ -76,7 +83,9 @@ tool exists.
   beats **one keeper per crew host** (per-host beacon keys), and BB's
   stuck-suppression is decided **per crew's own host** — a live watcher on host A
   never silences a stuck crew on host B. A keeper that will not stay up (a genuine
-  crash loop) is relaunched with exponential backoff (60s → 30m cap). Wake-reason relay is scoped: only actionable `stale:`
+  crash loop) is relaunched with exponential backoff (60s → 30m cap). The stale-mirror
+  alarm reads only the poll's own guard output, never the keeper log tail, and
+  logs each change once. Wake-reason relay is scoped: only actionable `stale:`
   lines go to the **owning captain** (the crew named in the line), deduped with
   volatile counters/times normalized out; routine `check:`/`heartbeat:` trace is
   never relayed.

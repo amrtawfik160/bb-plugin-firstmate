@@ -23,7 +23,9 @@ Missing provenance, conflicting identities and retired tasks refuse. See the
 
 PR follow-up requires host `gh`, `bash` and `python3`. Structured forge reads capture stdout separately from stderr and terminal progress. Missing tools, failed commands and malformed JSON leave records stale for retry.
 
-The background follow-up schedule reads bounded batches each minute with error backoff. Unchanged waiting PRs do not start model turns. Actionable transitions and overdue actions notify the owning manager through existing wake delivery. Notification acceptance is persisted and ambiguous sends are reconciled before retry. Hidden notifications alone do not imply token savings.
+The background follow-up schedule reads bounded batches each minute with error backoff. Unchanged waiting PRs do not start model turns.
+
+Background retries have an end. Uncertain launch reconciliation, crew PR discovery and refused cleanup of landed crews each back off from one minute to 30 minutes. A failure is logged once, and again only when its reason changes. After 8 failed attempts the item becomes "Needs captain". Background retries stop, the owning captain gets one notice, and bearings lists the item until it is resolved. Nothing is deleted. A captain action, such as a dispatch with the same task ID or `firstmate_forget`, still runs. Actionable transitions and overdue actions notify the owning manager through existing wake delivery. Notification acceptance is persisted and ambiguous sends are reconciled before retry. Hidden notifications alone do not imply token savings.
 
 `bb firstmate deliveries list --json` lists unresolved work; `inspect`, `register`, `reconcile`, `assign`, `abandon` and `verify` share the `firstmate_deliveries` tool. List accepts bounded `--limit` and `--offset`; `--all` is a read-only project view. Fleet, bearings and session show owner, blocker, next action and PR link. Worker forget preserves records and a scoped continuation snapshot. Outstanding work retains native task authority and its environment; destructive `forget --stop` refuses until delivery completes or is explicitly abandoned. Explicit handoff transfers ownership, including records whose worker was forgotten. Lost managers leave visible owner-needed records; assignment requires naming the previous manager.
 
@@ -178,6 +180,10 @@ Each flag in `fmReliability` is off until set, for example
 
 - `asyncDispatch` returns from dispatch at once and spawns in the background
   with the same worktree, posture, and provider setup as a direct dispatch.
+  The reserved job is stored with its full input. If the captain is out of
+  provider quota, the job waits until the reported reset time, or backs off
+  when no reset time is known. The per-minute schedule resumes due jobs, also
+  after a reload. A job whose worker already exists does not spawn a second one.
   Work past `maxActiveCrews` (default 10) queues and starts when a slot opens.
   Only that over-cap work drains automatically. A `firstmate_queue` backlog
   still needs an explicit dispatch. A crew whose status cannot be read keeps
@@ -190,6 +196,9 @@ Each flag in `fmReliability` is off until set, for example
   one reminder per open item with backoff.
 - `telegramThreading` sends acks and replies through the Telegram plugin's
   `telegram.reply` RPC. See the [bridge contract](docs/telegram-bridge-contract.md).
+  If the RPC reports that threaded replies are off in the connector while this
+  flag is on, the plugin logs one warning and bearings shows the mismatch
+  until a reply reports threading on again.
 
 Without any flag, an idle crew with no DONE, BLOCKED, or FAILED line is reported
 as having no outcome, not as done.
