@@ -45,12 +45,14 @@ export type DispatchJobState = "reserved" | "queued" | "spawning" | "started" | 
 export type DispatchJob = {
   crewId: string;
   captainThreadId: string;
+  // The full dispatch input as JSON, so a reload can resume the job unchanged.
   payload: string;
   state: DispatchJobState;
   createdAt: number;
   startedAt: number | null;
   error: string | null;
   backoffUntil: number | null;
+  attempts?: number;
 };
 
 type Database = {
@@ -75,8 +77,10 @@ export function createDispatchJobs(db: Database) {
       .run(job.crewId, job.captainThreadId, job.state, job.createdAt, JSON.stringify(job));
     return job;
   }
+  // A "spawning" job is due too: if its process died mid-spawn, the launch ledger
+  // makes the resumed dispatch reuse the worker it already created.
   function due(now: number, limit = 20): DispatchJob[] {
-    const rows = db.prepare("SELECT record FROM dispatch_jobs WHERE state IN ('reserved','queued') ORDER BY created_at LIMIT ?").all(limit) as { record: string }[];
+    const rows = db.prepare("SELECT record FROM dispatch_jobs WHERE state IN ('reserved','queued','spawning') ORDER BY created_at LIMIT ?").all(limit) as { record: string }[];
     return rows.map((r) => JSON.parse(r.record) as DispatchJob).filter((job) => job.backoffUntil == null || job.backoffUntil <= now);
   }
   return { get, save, due };

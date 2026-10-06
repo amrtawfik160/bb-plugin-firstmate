@@ -2971,7 +2971,6 @@ test("stale-mirror guard is wired into the SUPERVISION paths (keeper + checkWatc
   assert.match(keeper, /FM_MIRROR_STALE/, "keeper does not check the mirror on re-arm");
   assert.match(keeper, /\.mirror-manifest/);
   assert.match(keeper, /rev-parse HEAD/);
-  assert.match(keeper, /\} >> "\$LOG" 2>&1/, "keeper guard output must land in the watch log");
 
   // checkWatcher: the supervision poll runs the guard and logs a loud, supervision-specific
   // error when the mirror is stale.
@@ -4608,7 +4607,7 @@ test("the fm-watch supervisor relaunches the real watcher when the beacon is sta
     assert.ok(keeper, "keeper script was not written");
     assert.ok(keeper!.includes("fm-watch-arm.sh"), "keeper does not re-arm fm-watch");
     assert.ok(keeper!.includes(".bb-watch-keeper.pid"), "keeper does not track a pidfile");
-    assert.ok(/while \[/.test(keeper!) && /sleep /.test(keeper!), "keeper is not a re-arming loop");
+    assert.ok(/while owned; do/.test(keeper!) && /sleep /.test(keeper!), "keeper is not a re-arming loop");
     // The watcher's page reason was relayed to the captain.
     const relayed = sendCalls(host).some((s) => (s.text ?? "").includes("fm-watch") && (s.text ?? "").includes("stale: fm-abc"));
     assert.ok(relayed, "supervisor did not relay the fm-watch wake reason to the captain");

@@ -285,9 +285,11 @@ test('hung discovery is bounded per item and does not starve other PRs or future
   await host.bb.storage.kv.set('crews',[row(1),{...row(2),prUrl:'https://github.com/acme/healthy/pull/2'}]);
   let calls=0;host.harness.sdk.stub('environments.pullRequest',async()=>{calls++;return new Promise(()=>{});});
   hostCommands(host,()=>({payload:JSON.stringify(forge({isDraft:true}))}));
-  t.mock.timers.enable({apis:['setTimeout']});
+  t.mock.timers.enable({apis:['setTimeout','Date'],now:Date.now()});
   const scan=host.harness.behavior.runSchedule('pr-delivery-follow-up');await until(()=>calls===1);t.mock.timers.tick(15001);await scan;
   assert.equal(createDeliveries(host.bb.storage.database()).get('acme/healthy#2').status,'draft');
+  // The timed-out item backs off for one minute before the next scan retries it.
+  t.mock.timers.tick(60_000);
   const again=host.harness.behavior.runSchedule('pr-delivery-follow-up');await until(()=>calls===2);t.mock.timers.tick(15001);await again;
   assert.equal(calls,2,'followingUp was released after timeout');
  }finally{t.mock.timers.reset();await host.harness.lifecycle.dispose();}

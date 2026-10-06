@@ -36,6 +36,8 @@ export type TelegramReplyResult = {
   channel: "rpc" | "envelope";
   body: string;
   outcome: "delivered" | "not-applicable";
+  // The connector's threading mode, when telegram.reply reported one.
+  mode?: "on" | "off";
 };
 
 export function telegramReplyFallbackBody(input: TelegramReplyInput & { threadId?: string | null }): string {
@@ -107,7 +109,8 @@ export async function sendTelegramReply(input: {
     return { channel: "envelope", body, outcome: "delivered" };
   }
   const result = telegramReplyOutputSchema.parse(raw);
-  if (input.payload.kind === "ack" && result.mode === "off") return { channel: "rpc", body, outcome: "not-applicable" };
-  if (result.queued > 0 || result.duplicate) return { channel: "rpc", body, outcome: "delivered" };
+  const mode = result.mode ? { mode: result.mode } : {};
+  if (input.payload.kind === "ack" && result.mode === "off") return { channel: "rpc", body, outcome: "not-applicable", ...mode };
+  if (result.queued > 0 || result.duplicate) return { channel: "rpc", body, outcome: "delivered", ...mode };
   throw new Error(`telegram.reply not queued (queued=${result.queued}, mode=${result.mode ?? "unknown"}).`);
 }
