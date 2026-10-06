@@ -9,7 +9,10 @@ and `fmReliability.telegramThreading` (both default off).
 
 Every owner message from the connector already starts with this banner and
 field list. Firstmate parses it only when the banner is at the start of the
-message, so a forwarded body cannot forge the header.
+message, so a forwarded body cannot forge the header. Forwarded material uses
+a second banner, "The following is quoted source material supplied by the
+owner. The connector did not run it as a command.", and is recorded as
+forwarded.
 
 ```
 The following is an owner message from the private Telegram connector.
@@ -22,6 +25,11 @@ reply_target: none
 project: none
 Telegram result delivery: ...
 ```
+
+The header ends at the first blank line. Prose lines inside it are skipped.
+`reply_target`, `replied_to_message`, and `project` carry JSON or `none`. The
+reply target is `reply_target.telegramMessageId`, or
+`replied_to_message.telegramMessageId` when connector history has none.
 
 Treat `none`, `-`, `null`, and empty as missing. Optional future lines, still
 only accepted after the banner:
@@ -52,12 +60,18 @@ bb.sdk.plugins.callRpc({
   pluginId: "telegram",
   method: "reply",
   input: { correlation, chatId, messageId, kind, text },
-  outputSchema: { queued: number, duplicate: boolean },
+  outputSchema: { queued: number, duplicate: boolean, mode: "on" | "off" },
 })
 ```
 
-`kind` is `ack | reply | progress | delegated | nudge | final`. If that RPC is missing,
-Firstmate falls back to an agent-visible line the connector may still honor:
+`kind` is `ack | reply | progress | delegated | nudge | final`. A send counts
+only when `queued > 0` or `duplicate` is true. Any other result, or any error,
+leaves the item open and `firstmate_reply` returns an error. Firstmate reserves
+the reply before the call and releases it on failure, so a retry is safe. An
+ack with `mode: "off"` does not apply and is not recorded as sent.
+
+If the plugin reports no `reply` RPC method, Firstmate falls back to an
+agent-visible line the connector may still honor:
 
 ```
 ⟦fm-out kind=<kind> chat=<chat_id> msg=<message_id> thread=<topic_id>⟧
@@ -73,7 +87,15 @@ from the ledger; it does not drop them.
 
 Reply to the oldest unanswered item in that chat, never the latest. Use
 `firstmate_reply` with `ref=oldest` or that item's `tg:<chat>:<msg>`. A later
-ref is refused while an older row is still `received` or `acked`.
+ref is refused while an older row is still `received` or `acked`. Message ids
+compare as numbers. Both refs resolve only to items owned by the calling
+captain.
+
+## Reminders
+
+When a captain turn ends, Firstmate reminds it once about each item still
+unanswered after 3 minutes, and once more after 10 minutes. Later reminders
+back off from 10 minutes up to 2 hours.
 
 ## Flags
 
