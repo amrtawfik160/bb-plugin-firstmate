@@ -75,6 +75,37 @@ test("duplicate sends are suppressed", () => {
   assert.equal(replay.replies().filter((r) => r.kind === "reply").length, 1);
 });
 
+test("three quick separate questions stay three items with three replies", () => {
+  const { ledger, replay } = harness();
+  replay.ingest({ chatId: "9", messageId: "1", text: "task a", at: 0, senderId: "amr" });
+  replay.ingest({ chatId: "9", messageId: "2", text: "task b", at: 200, senderId: "amr" });
+  replay.ingest({ chatId: "9", messageId: "3", text: "task c", at: 400, senderId: "amr" });
+  replay.flush(3_000);
+  assert.equal(ledger.listOpen("thr_cap").length, 3);
+  assert.equal(replay.replies().filter((r) => r.kind === "ack").length, 3);
+  for (const id of ["1", "2", "3"]) {
+    assert.ok(replay.answer(id, `answer ${id}`, 4_000));
+  }
+  assert.equal(replay.replies().filter((r) => r.kind === "reply").length, 3);
+});
+
+test("a restart mid-burst flushes from the ledger and does not lose rows", () => {
+  const db = new Database(":memory:");
+  const first = createInboundLedger(db);
+  const replay = createTelegramReplay({ ledger: first, captainThreadId: "thr_cap", coalesceMs: 2500 });
+  replay.ingest({ chatId: "9", messageId: "21", text: "first question", at: 0, senderId: "amr" });
+  replay.ingest({ chatId: "9", messageId: "22", text: "second question", at: 150, senderId: "amr" });
+  replay.restart();
+  const restored = createInboundLedger(db);
+  const resumed = createTelegramReplay({ ledger: restored, captainThreadId: "thr_cap", coalesceMs: 2500 });
+  const acks = resumed.flush(3_000);
+  assert.equal(restored.listOpen("thr_cap").length, 2);
+  assert.equal(acks.length, 2);
+  assert.deepEqual(acks.map((row) => row.messageId).sort(), ["21", "22"]);
+  assert.equal(restored.get({ source: "telegram", chatId: "9", messageId: "21" })?.state, "acked");
+  assert.equal(restored.get({ source: "telegram", chatId: "9", messageId: "22" })?.state, "acked");
+});
+
 test("a mid-turn status question is a ledger row plus a steer, not a fold", () => {
   const { ledger, replay } = harness();
   replay.ingest({ chatId: "9", messageId: "1", text: "do the long task", at: 0, senderId: "amr" });

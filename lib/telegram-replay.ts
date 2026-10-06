@@ -4,7 +4,7 @@ import {
   COALESCE_WINDOW_MS,
   coalesceBatches,
   formatOutboundEnvelope,
-  parseTelegramEnvelope,
+  parseInboundTelegram,
   stripTelegramEnvelope,
   telegramReplyParameters,
   telegramSourceRef,
@@ -43,8 +43,17 @@ export type ReplayHarness = {
 };
 
 function envelopeOf(update: ReplayUpdate): TelegramEnvelope {
-  const parsed = parseTelegramEnvelope(update.text);
-  if (parsed) return parsed;
+  const parsed = parseInboundTelegram(update.text);
+  if (parsed) {
+    return {
+      ...parsed,
+      mediaGroupId: update.mediaGroupId ?? parsed.mediaGroupId,
+      forwarded: update.forwarded === true || parsed.forwarded,
+      senderId: update.senderId ?? parsed.senderId,
+      threadId: update.threadId ?? parsed.threadId,
+      replyTo: update.replyTo ?? parsed.replyTo,
+    };
+  }
   return {
     chatId: update.chatId,
     messageId: update.messageId,
@@ -97,18 +106,39 @@ export function createTelegramReplay(input: {
     return reply;
   }
 
+  function updatesFromLedger(): ReplayUpdate[] {
+    return input.ledger.listOpen(captain)
+      .filter((row) => row.state === "received")
+      .map((row) => ({
+        chatId: row.chatId,
+        messageId: row.messageId,
+        text: row.preview,
+        at: row.receivedAt,
+        senderId: row.senderId ?? undefined,
+        mediaGroupId: row.mediaGroupId,
+        forwarded: row.forwarded,
+        threadId: row.topicId,
+        replyTo: row.replyTo,
+      }));
+  }
+
   function flush(now: number): ReplayReply[] {
-    if (waitUntil !== null && now < waitUntil) return [];
-    const batch = pending.splice(0, pending.length);
+    if (pending.length > 0 && waitUntil !== null && now < waitUntil) return [];
+    let batch = pending.splice(0, pending.length);
     waitUntil = null;
+    if (batch.length === 0) batch = updatesFromLedger();
     if (batch.length === 0) return [];
     const groups = coalesceBatches(
       batch.map((u) => ({
         chatId: u.chatId,
-        senderId: u.senderId ?? null,
-        mediaGroupId: u.mediaGroupId ?? null,
+        senderId: u.senderId ?? envelopeOf(u).senderId,
+        mediaGroupId: u.mediaGroupId ?? envelopeOf(u).mediaGroupId,
         receivedAt: u.at,
         messageId: u.messageId,
+        forwarded: u.forwarded === true || envelopeOf(u).forwarded,
+        kind: (u.forwarded === true || u.mediaGroupId || envelopeOf(u).mediaGroupId || envelopeOf(u).forwarded)
+          ? "media" as const
+          : "text" as const,
       })),
       windowMs,
     );
@@ -153,7 +183,7 @@ export function createTelegramReplay(input: {
         messageId: row.messageId,
         replyTo: row.replyTo,
         mediaGroupId: row.mediaGroupId,
-        forwarded: false,
+        forwarded: row.forwarded,
         threadId: row.topicId,
         senderId: row.senderId,
       };

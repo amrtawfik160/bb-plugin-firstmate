@@ -1,70 +1,79 @@
 # Telegram bridge contract
 
-This plugin has no Telegram client. Amr talks to First Mate through a BB Telegram
-bridge that lives outside this repo. The public plugin that matches that role is
-[VKirill/bb-plugin-telegram-projects](https://github.com/VKirill/bb-plugin-telegram-projects).
-A retired private `MGrin/bb-plugin-telegram` and `lbildzinkas/firstmate-telegram`
-exist; none are in this repository. The injected line "If the earlier target is
-unavailable or unclear, ask the owner. Do not infer the latest message as the
-target." is also absent here.
+This plugin has no Telegram client. Amr talks to First Mate through his local BB
+plugin **Telegram v0.1.0**. Firstmate only records inbound refs and asks that
+plugin to send replies. All of this stays behind `fmReliability.inboundLedger`
+and `fmReliability.telegramThreading` (both default off).
 
-Verified on that public bridge (v0.9.0 source): inbound `threads.send` / `spawn`
-carries only the user text. `message_id`, `chat_id`, `media_group_id`, and
-`reply_to` stay in the bridge store. Outbound posts use `message_thread_id`
-(forum topic) and do not set `reply_parameters`.
+## Inbound header
 
-## What this plugin implements
-
-When `fmReliability.telegramThreading` and `inboundLedger` are on, Firstmate:
-
-1. Parses an inbound envelope from message text or `experimental_submission`.
-2. Keys the inbound ledger as `(source, chat_id, message_id)`.
-3. Coalesces one chat/sender burst over 2.5s and by `media_group_id`.
-4. Acks and replies through an outbound envelope plus
-   `reply_parameters: { message_id, allow_sending_without_reply: true }`,
-   keeping `message_thread_id` for topics.
-5. Dedupes sends on `(source ref, reply kind)` in SQLite.
-
-## Inbound envelope the bridge must add
-
-First line of every forwarded user update:
+Every owner message from the connector already starts with this banner and
+field list. Firstmate parses it only when the banner is at the start of the
+message, so a forwarded body cannot forge the header.
 
 ```
-⟦tg chat=<chat_id> msg=<message_id> reply_to=<id|-> group=<media_group_id|-> fwd=<0|1> thread=<topic_id|-> from=<user_id>⟧
+The following is an owner message from the private Telegram connector.
+correlation: tgref:<uuid>
+binding: 5
+telegram_user_id: <id>
+telegram_chat_id: <id>
+telegram_message_id: 1669
+reply_target: none
+project: none
+Telegram result delivery: ...
 ```
 
-Prefer the same fields on `experimental_submit` as JSON
-`{chat_id,message_id,reply_to,media_group_id,fwd,message_thread_id,from}`.
-Put a caption and its media on the same BB message. Keep every source id when
-coalescing a media group. Filter the bot's own messages.
-
-Replace the vague "do not infer the latest message" line with the explicit ref.
-
-## Outbound envelope the bridge must honor
-
-Firstmate posts an agent-visible (or plugin) line:
+Treat `none`, `-`, `null`, and empty as missing. Optional future lines, still
+only accepted after the banner:
 
 ```
-⟦fm-out kind=<ack|reply|progress|delegated> chat=<chat_id> msg=<message_id> thread=<topic_id>⟧
+telegram_message_ids: 1669, 1670
+telegram_items: <connector payload>
+telegram_media_group_id: <album id>
 ```
 
-followed by the user-visible body. The bridge must send that body with:
+The `⟦tg chat=… msg=…⟧` stamp remains an alternative inbound format.
+
+## Coalesce
+
+Use a sliding quiet gap. Separate text questions stay separate ledger items,
+each with its own ack and reply target. Attach only media, forwards, or
+uncaptioned photos to the preceding text in the same chat from the same sender.
+Keep every source id on that attached group.
+
+## Outbound: bridge RPC first
+
+When `telegramThreading` is on, Firstmate calls the Telegram plugin:
 
 ```
-{
-  "chat_id": "<chat_id>",
-  "text": "<body without the fm-out line>",
-  "reply_parameters": { "message_id": <msg>, "allow_sending_without_reply": true },
-  "message_thread_id": <topic_id if present>
-}
+bb.sdk.plugins.callRpc({
+  pluginId: "telegram",
+  method: "reply",
+  input: { chatId, messageId, kind, text },
+})
+```
+
+`kind` is `ack | reply | progress | delegated | nudge`. If that RPC is missing,
+Firstmate falls back to an agent-visible line the connector may still honor:
+
+```
+⟦fm-out kind=<kind> chat=<chat_id> msg=<message_id> thread=<topic_id>⟧
+<user-visible body>
 ```
 
 Do not send a second unthreaded copy of the same `(chat, msg, kind)`. Firstmate
 already suppresses duplicates. After a plugin reload, ack only rows still in
-`received` and younger than 15 minutes.
+`received` and younger than 15 minutes. A restart mid-burst flushes those rows
+from the ledger; it does not drop them.
+
+## Final-answer rule
+
+Reply to the oldest unanswered item in that chat, never the latest. Use
+`firstmate_reply` with `ref=oldest` or that item's `tg:<chat>:<msg>`. A later
+ref is refused while an older row is still `received` or `acked`.
 
 ## Flags
 
-All of this is off until `fmReliability` JSON enables `inboundLedger` (`shadow`
-or `on`) and `telegramThreading` (`on`). Shadow records the ledger and writes
-no Telegram traffic.
+All of this is off until `fmReliability` JSON enables `inboundLedger`
+(`shadow` or `on`) and `telegramThreading` (`on`). Shadow records the ledger
+and writes no Telegram traffic.

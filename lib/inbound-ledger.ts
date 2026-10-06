@@ -25,6 +25,7 @@ export type InboundRow = InboundKey & {
   senderId: string | null;
   topicId: string | null;
   replyTo: string | null;
+  forwarded: boolean;
   isBotOwn: boolean;
   isAck: boolean;
 };
@@ -110,6 +111,7 @@ export function eventToRow(event: LedgerEvent): InboundRow | null {
     senderId: tg?.senderId ?? null,
     topicId: tg?.threadId ?? null,
     replyTo: tg?.replyTo ?? null,
+    forwarded: tg?.forwarded === true,
     isBotOwn: false,
     isAck: false,
   };
