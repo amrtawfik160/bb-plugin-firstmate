@@ -57,7 +57,7 @@ import { LEFTOVER_TIMER_CONTRACT, WAITING_PROTOCOL, latestStatus, statusProtocol
 import { UPSTREAM_SCRIPT_NAMES, PINNED_SCRIPT_SUPPORT_FILES, UPSTREAM_SKILL_NAMES } from "./lib/upstream-surface.ts";
 import { FIRSTMATE_ROUTINE_MARKER } from "./lib/timeline-noise.ts";
 
-const CAPTAIN_TEST_SKILLS = ["captain", "firstmate"] as const;
+const CAPTAIN_TEST_SKILLS = ["captain", "firstmate", "skill-routing"] as const;
 const SKILLS = [...new Set([...CAPTAIN_TEST_SKILLS, ...UPSTREAM_SKILL_NAMES])] as const;
 
 // No fixture sends bytes on the host shell's stdin; native input is explicitly
@@ -127,7 +127,7 @@ test("crews get no dispatch tools", async () => {
       makePluginAgentConfigurationContext({ pluginMetadata: { crew: "true" } }),
     );
     assert.deepEqual(cfg.tools.map((t) => t.name), []);
-    assert.deepEqual(cfg.skills, []);
+    assert.deepEqual(cfg.skills, ["skill-routing"]);
     assert.match(cfg.instructions ?? "", /native launch brief/);
     assert.match(cfg.instructions ?? "", /exact-ID steering inbox/);
     assert.doesNotMatch(cfg.instructions ?? "", /browser_script|systemd-run|data\/<task-id>\//, "rendered launch brief is the single policy owner");
@@ -159,7 +159,7 @@ test("captain metadata loads the full skill set", async () => {
     );
     assert.ok(cfg.skills.includes("captain"));
     assert.ok(cfg.tools.some(t=>t.name==="firstmate_skill"));
-    assert.deepEqual([...cfg.skills].sort(), [...CAPTAIN_TEST_SKILLS].sort(), "captain must receive only bootstrap/transport skills; native policy reads are selected per home");
+    assert.deepEqual([...cfg.skills].sort(), [...CAPTAIN_TEST_SKILLS].sort(), "captain must receive only bootstrap/transport skills and skill routing; native policy reads are selected per home");
     assert.ok(cfg.tools.some((tool) => tool.name === "firstmate_wake"));
     assert.ok(cfg.tools.some((tool) => tool.name === "firstmate_toolchain"));
     assert.match(cfg.instructions ?? "", /firstmate_toolchain/);

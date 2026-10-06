@@ -53,13 +53,13 @@ for(const entrypoint of ['javascriptCli','nativeCli'])test('installed BB discove
   const result=await cli(['skill','list','--json']);
   const entries=result.skills.filter(s=>s.pluginId==='firstmate');
   const ids=entries.map(s=>s.name.replace(/^firstmate:/,'')).sort();
-  assert.deepEqual(ids,['captain','firstmate'],'actual BB root discovery must supply both bootstrap skills and no native/method bodies');
+  assert.deepEqual(ids,['captain','firstmate','skill-routing'],'actual BB root discovery must supply both bootstrap skills, skill routing, and no native/method bodies');
   const source=join(root,'entry-skills');
   for(const entry of entries){assert.ok(entry.filePath.includes('/entry-skills/'));assert.ok(readFileSync(entry.filePath,'utf8').length);}
-  for(const entry of ['captain/SKILL.md','firstmate/SKILL.md'])followRuntimeReferences(source,entry);
+  for(const entry of ['captain/SKILL.md','firstmate/SKILL.md','skill-routing/SKILL.md'])followRuntimeReferences(source,entry);
   const host=createFakePluginHost({pluginId:'firstmate',agentSkillIds:ids});await plugin(host.bb);
   try{
-   for(const [metadata,skills] of [[{},['captain','firstmate']],[{captain:'true'},['captain','firstmate']],[{crew:'true',captain:'true'},[]]]){
+   for(const [metadata,skills] of [[{},['captain','firstmate']],[{captain:'true'},['captain','firstmate','skill-routing']],[{crew:'true',captain:'true'},['skill-routing']]]){
     const cfg=await host.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({pluginMetadata:metadata}));assert.deepEqual(cfg.skills.sort(),skills);
     if(metadata.crew)assert.deepEqual(cfg.tools,[]);
    }

@@ -27,10 +27,10 @@ test('native defaults route through actual configuration across resume and reloa
   try {
     const cases = [
       [{}, [], ['firstmate']],
-      [{ captain: 'true' }, [], ['captain']],
-      [{ captain: 'true', nativeHome: '/owned-home' }, [], ['captain']],
-      [{ crew: 'true' }, [], []],
-      [{ crew: 'true', captain: 'true', nativeHome: '/owned-home' }, [], []],
+      [{ captain: 'true' }, [], ['captain', 'skill-routing']],
+      [{ captain: 'true', nativeHome: '/owned-home' }, [], ['captain', 'skill-routing']],
+      [{ crew: 'true' }, [], ['skill-routing']],
+      [{ crew: 'true', captain: 'true', nativeHome: '/owned-home' }, [], ['skill-routing']],
     ];
     const stateBefore = await host.bb.storage.kv.get('crews');
     for (const reload of [false, true]) {
@@ -42,8 +42,8 @@ test('native defaults route through actual configuration across resume and reloa
         assert.ok((cfg.instructions ?? '').length <= 4096);
         if (metadata.crew) {
           assert.deepEqual(cfg.tools, []);
-          assert.deepEqual(cfg.skills, []);
-          for (const obligation of [/native launch brief/, /exact-ID steering inbox/,
+          assert.deepEqual(cfg.skills, ['skill-routing']);
+          for (const obligation of [/native launch brief/, /exact-ID steering inbox/, /Read the skill-routing skill/,
             /Do not delegate/, /selected provider, model, or effort/,
             /not captain merge or deployment completion/]) assert.match(cfg.instructions, obligation);
           assert.doesNotMatch(cfg.instructions, /firstmate_contract|captain-methods|Calm reporting/);
@@ -76,6 +76,7 @@ test('saturated captain instruction budget preserves every runtime obligation an
       assert.ok(cfg.instructions.length <= 4096);
       assert.ok(cfg.instructions.startsWith(base), 'optional caches cannot truncate the complete runtime base');
       for (const obligation of [/read firstmate_contract without a section/, /script=session-start/,
+        /read the skill-routing skill and name its matched pstack and Matt Pocock skills in the brief/,
         /firstmate_skill/, /firstmate_watch once per batch/, /End the turn; never retry or poll/,
         /author for fixes/, /independent review when required/, /merge through firstmate_merge/,
         /Inspect unresolved delivery records after compaction or handoff/,
@@ -155,7 +156,7 @@ for (const [route, entry, explicit] of [
           assert.ok(bound.tools.some(t=>t.name==='firstmate_skill'));
           const crew = await configure(host, { crew: 'true', captain: 'true' });
           assert.deepEqual(crew.tools, []);
-          assert.deepEqual(crew.skills, []);
+          assert.deepEqual(crew.skills, ['skill-routing']);
         } finally { rmSync(directory, { recursive: true, force: true }); }
       }
       assert.equal(host.harness.inspection.sdk.calls.length, 0);

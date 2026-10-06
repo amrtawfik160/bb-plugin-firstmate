@@ -8,7 +8,8 @@ user-invocable: false
 
 This BB-owned skill adds methods, not lifecycle policy. The native supervisor
 contract, imported skills, and existing task and delivery records remain
-authoritative. Do not execute raw pstack skills or load their whole corpus.
+authoritative. Use pstack and Matt Pocock skills as the `skill-routing` table
+matches them, under its Firstmate rules.
 
 Read only the reference for the current trigger:
 
