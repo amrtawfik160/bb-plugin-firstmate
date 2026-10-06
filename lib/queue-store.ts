@@ -9,6 +9,7 @@ export const queueItemSchema = z.object({
   reasoningLevel:z.string().optional(), deliveryRequirement:z.enum(['pr','merged','merged-and-verified']).optional(),
   waitUntil:z.string().nullable().default(null), status:z.enum(['queued','dispatched','done','dropped']).default('queued'),
   crewId:z.string().nullable().default(null), parentThreadId:z.string().nullish(), backlogId:z.string().optional(),
+  sourceRefs:z.array(z.string()).optional(),
   backlogUnparsed:z.boolean().optional(), createdAt:z.string(), nativePending:z.boolean().optional(),
 }).strict();
 export type QueueItem = z.infer<typeof queueItemSchema>;
