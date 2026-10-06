@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { isBotOrAckText, parseSourceRef, telegramSourceRef, type TelegramEnvelope } from "./telegram-envelope.ts";
+import { isBotOrAckText, parseSourceRef, parseTelegramItems, stripTelegramEnvelope, telegramSourceRef, type TelegramEnvelope } from "./telegram-envelope.ts";
 
 export type InboundSource = "bb" | "telegram";
 export type InboundState = "received" | "acked" | "answered" | "delegated";
@@ -94,6 +94,7 @@ export function eventToRow(event: LedgerEvent): InboundRow | null {
   const ref = source === "telegram"
     ? telegramSourceRef({ chatId, messageId })
     : `bb:${chatId}:${messageId}`;
+  const correlation = tg?.correlation ? tg.correlation : null;
   return {
     source,
     chatId,
@@ -101,12 +102,12 @@ export function eventToRow(event: LedgerEvent): InboundRow | null {
     captainThreadId: event.captainThreadId,
     receivedAt: event.receivedAt,
     textHash: hashText(event.text),
-    preview: previewOf(event.text),
+    preview: previewOf(stripTelegramEnvelope(event.text) || event.text),
     state: "received",
     ackedAt: null,
     answeredAt: null,
     crewId: null,
-    sourceRefs: [ref],
+    sourceRefs: correlation ? [ref, correlation] : [ref],
     mediaGroupId: tg?.mediaGroupId ?? null,
     senderId: tg?.senderId ?? null,
     topicId: tg?.threadId ?? null,
@@ -115,6 +116,28 @@ export function eventToRow(event: LedgerEvent): InboundRow | null {
     isBotOwn: false,
     isAck: false,
   };
+}
+
+export function expandTelegramRows(event: LedgerEvent): InboundRow[] {
+  const primary = eventToRow(event);
+  if (!primary) return [];
+  const tg = event.telegram;
+  const ids = tg?.messageIds?.filter(Boolean) ?? [];
+  if (ids.length === 0) return [primary];
+  const items = parseTelegramItems(tg?.items);
+  const byId = new Map(items.map((item) => [item.id, item]));
+  return ids.map((id) => {
+    const decl = byId.get(id);
+    return {
+      ...primary,
+      messageId: id,
+      sourceRefs: [
+        telegramSourceRef({ chatId: primary.chatId, messageId: id }),
+        ...primary.sourceRefs.filter((ref) => ref.startsWith("tgref:")),
+      ],
+      forwarded: decl?.kind === "forward" || primary.forwarded,
+    };
+  });
 }
 
 function parseRow(record: string): InboundRow {
@@ -193,15 +216,22 @@ export function createInboundLedger(db: Database): CreateInboundLedger {
   }
 
   function record(event: LedgerEvent): InboundRow | null {
-    const next = eventToRow(event);
-    if (!next) return null;
+    const rows = expandTelegramRows(event);
+    if (rows.length === 0) return null;
     return db.transaction(() => {
-      const existing = get(next);
-      if (existing) return existing;
-      save(next);
-      const last = db.prepare("SELECT max(seq) AS seq FROM inbound_chat_queue WHERE chat_id=?").get(next.chatId) as { seq: number | null };
-      db.prepare("INSERT INTO inbound_chat_queue VALUES (?,?,?,?)").run(next.chatId, (last.seq ?? 0) + 1, next.source, next.messageId);
-      return next;
+      let first: InboundRow | null = null;
+      for (const next of rows) {
+        const existing = get(next);
+        if (existing) {
+          first ??= existing;
+          continue;
+        }
+        save(next);
+        const last = db.prepare("SELECT max(seq) AS seq FROM inbound_chat_queue WHERE chat_id=?").get(next.chatId) as { seq: number | null };
+        db.prepare("INSERT INTO inbound_chat_queue VALUES (?,?,?,?)").run(next.chatId, (last.seq ?? 0) + 1, next.source, next.messageId);
+        first ??= next;
+      }
+      return first;
     })();
   }
 

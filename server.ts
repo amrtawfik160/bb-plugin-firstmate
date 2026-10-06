@@ -69,7 +69,7 @@ import { inboundHookDecision } from "./lib/inbound-dispatch.ts";
 import { DEFAULT_RELIABILITY_FLAGS, reliabilityFlagsFromSettings } from "./lib/reliability-flags.ts";
 import { sanitizeSettingValue } from "./lib/settings-schema.ts";
 import { coalesceBatches, formatOutboundEnvelope, parseInboundTelegram, parseTelegramSubmission, stripTelegramEnvelope, telegramReplyParameters, telegramSourceRef } from "./lib/telegram-envelope.ts";
-import { oldestUnanswered, refuseLaterThanOldest, sendTelegramReply } from "./lib/telegram-reply.ts";
+import { correlationOf, oldestUnanswered, refuseLaterThanOldest, sendTelegramReply } from "./lib/telegram-reply.ts";
 import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRecord } from "./lib/launch.ts";
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
 import { optionHelp } from "./lib/cli-help.ts";
@@ -9762,7 +9762,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (older) return toolError(`Reply to the oldest unanswered item ${older.source === "telegram" ? telegramSourceRef(older) : `bb:${older.chatId}:${older.messageId}`}, never the latest.`);
       const sent = row.source === "telegram"
         ? await sendTelegramReply({
-            payload: { chatId: row.chatId, messageId: row.messageId, kind: "reply", text: stripTelegramEnvelope(text), threadId: row.topicId },
+            payload: { chatId: row.chatId, messageId: row.messageId, kind: "reply", text: stripTelegramEnvelope(text), threadId: row.topicId, correlation: correlationOf(row) },
             callRpc: flags.telegramThreading === "on" ? (args) => bb.sdk.plugins.callRpc(args) : null,
           }).catch((error) => {
             bb.log.warn(`firstmate_reply telegram send failed: ${String(error)}`);
@@ -11142,7 +11142,7 @@ export default async function plugin(bb: BbPluginApi) {
               const primary = inboundLedger.get(keys[0]!);
               if (!primary || !ackEligible(primary, now)) continue;
               const sent = await sendTelegramReply({
-                payload: { chatId: primary.chatId, messageId: primary.messageId, kind: "ack", text: ACK_TEXT, threadId: primary.topicId },
+                payload: { chatId: primary.chatId, messageId: primary.messageId, kind: "ack", text: ACK_TEXT, threadId: primary.topicId, correlation: correlationOf(primary) },
                 callRpc: flags.telegramThreading === "on" ? (args) => bb.sdk.plugins.callRpc(args) : null,
               }).catch((error) => {
                 bb.log.warn(`inbound telegram ack failed: ${String(error)}`);

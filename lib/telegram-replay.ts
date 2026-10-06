@@ -5,6 +5,7 @@ import {
   coalesceBatches,
   formatOutboundEnvelope,
   parseInboundTelegram,
+  parseTelegramItems,
   stripTelegramEnvelope,
   telegramReplyParameters,
   telegramSourceRef,
@@ -168,7 +169,19 @@ export function createTelegramReplay(input: {
     ingest(update) {
       const row = input.ledger.record(eventOf(update));
       if (!row) return { coalesced: false, waitUntil };
-      pending.push(update);
+      const env = envelopeOf(update);
+      const items = parseTelegramItems(env.items);
+      const ids = env.messageIds?.length ? env.messageIds : [update.messageId];
+      for (const id of ids) {
+        const decl = items.find((item) => item.id === id);
+        pending.push({
+          ...update,
+          chatId: env.chatId || update.chatId,
+          messageId: id,
+          forwarded: update.forwarded === true || decl?.kind === "forward",
+          mediaGroupId: update.mediaGroupId ?? (decl && decl.kind !== "text" ? env.mediaGroupId : null),
+        });
+      }
       waitUntil = (waitUntil ?? update.at) + 0;
       waitUntil = Math.max(waitUntil, update.at + windowMs);
       return { coalesced: pending.length > 1, waitUntil };

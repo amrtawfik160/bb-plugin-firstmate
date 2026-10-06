@@ -27,10 +27,12 @@ Treat `none`, `-`, `null`, and empty as missing. Optional future lines, still
 only accepted after the banner:
 
 ```
-telegram_message_ids: 1669, 1670
-telegram_items: <connector payload>
-telegram_media_group_id: <album id>
+telegram_message_ids: 1669,1670,1672
+telegram_items: 1669=text 1670=photo>1669 1671=forward>1669 1672=text
+telegram_media_group_id: <id|none>
 ```
+
+`telegram_message_id` is the leader. `telegram_message_ids` lists every item that needs its own reply. In `telegram_items`, `>` means attached to that earlier id (one task, one reply to the text). Firstmate records one ledger row per `telegram_message_ids` member and stores `tgref:…` on `sourceRefs`.
 
 The `⟦tg chat=… msg=…⟧` stamp remains an alternative inbound format.
 
@@ -49,11 +51,12 @@ When `telegramThreading` is on, Firstmate calls the Telegram plugin:
 bb.sdk.plugins.callRpc({
   pluginId: "telegram",
   method: "reply",
-  input: { chatId, messageId, kind, text },
+  input: { correlation, chatId, messageId, kind, text },
+  outputSchema: { queued: number, duplicate: boolean },
 })
 ```
 
-`kind` is `ack | reply | progress | delegated | nudge`. If that RPC is missing,
+`kind` is `ack | reply | progress | delegated | nudge | final`. If that RPC is missing,
 Firstmate falls back to an agent-visible line the connector may still honor:
 
 ```

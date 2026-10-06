@@ -25,6 +25,12 @@ export type ConnectorHeader = TelegramEnvelope & {
   body: string;
 };
 
+export type TelegramItemDecl = {
+  id: string;
+  kind: string;
+  attachedTo: string | null;
+};
+
 const MISSING = new Set(["", "-", "null", "undefined", "none"]);
 
 function dash(value: string | undefined): string | null {
@@ -39,8 +45,19 @@ function splitIds(value: string | null): string[] {
   return value.split(/[\s,]+/).map((part) => part.trim()).filter((part) => dash(part) !== null);
 }
 
+export function parseTelegramItems(raw: string | null | undefined): TelegramItemDecl[] {
+  if (!raw) return [];
+  const out: TelegramItemDecl[] = [];
+  for (const token of raw.trim().split(/\s+/)) {
+    const match = /^(\d+)=([A-Za-z][A-Za-z0-9_-]*)(?:>(\d+))?$/.exec(token);
+    if (!match) continue;
+    out.push({ id: match[1]!, kind: match[2]!.toLowerCase(), attachedTo: match[3] ?? null });
+  }
+  return out;
+}
+
 export function parseConnectorHeader(text: string): ConnectorHeader | null {
-  const start = text.replace(/^\uFEFF/, "");
+  const start = text.replace(/^\uFEFF/, "").trimStart();
   if (!start.startsWith(CONNECTOR_BANNER)) return null;
   const rest = start.slice(CONNECTOR_BANNER.length).replace(/^\r?\n/, "");
   const lines = rest.split(/\r?\n/);

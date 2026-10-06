@@ -5,13 +5,14 @@ import type { InboundRow } from "./inbound-ledger.ts";
 export const TELEGRAM_BRIDGE_PLUGIN_ID = "telegram";
 export const TELEGRAM_REPLY_METHOD = "reply";
 
-export type TelegramReplyKind = "ack" | "reply" | "progress" | "delegated" | "nudge";
+export type TelegramReplyKind = "ack" | "reply" | "progress" | "delegated" | "nudge" | "final";
 
 export type TelegramReplyInput = {
   chatId: string;
   messageId: string;
   kind: TelegramReplyKind;
   text: string;
+  correlation?: string;
 };
 
 export type TelegramReplyRpcArgs = {
@@ -21,7 +22,14 @@ export type TelegramReplyRpcArgs = {
   outputSchema: typeof telegramReplyOutputSchema;
 };
 
-export const telegramReplyOutputSchema = z.unknown();
+export const telegramReplyOutputSchema = z.object({
+  queued: z.number(),
+  duplicate: z.boolean(),
+});
+
+export function correlationOf(row: Pick<InboundRow, "sourceRefs">): string | undefined {
+  return row.sourceRefs.find((ref) => ref.startsWith("tgref:"));
+}
 
 export type TelegramReplyResult = {
   channel: "rpc" | "envelope";
@@ -79,6 +87,7 @@ export async function sendTelegramReply(input: {
         messageId: input.payload.messageId,
         kind: input.payload.kind,
         text: input.payload.text,
+        ...(input.payload.correlation ? { correlation: input.payload.correlation } : {}),
       },
       outputSchema: telegramReplyOutputSchema,
     });

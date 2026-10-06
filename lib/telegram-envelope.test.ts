@@ -5,6 +5,7 @@ import {
   parseConnectorHeader,
   parseInboundTelegram,
   parseTelegramEnvelope,
+  parseTelegramItems,
   stripTelegramEnvelope,
 } from "./telegram-envelope.ts";
 
@@ -34,16 +35,27 @@ test("parseConnectorHeader reads the Amr Telegram plugin banner", () => {
 
 test("parseConnectorHeader treats none as missing and keeps optional future lines", () => {
   const parsed = parseConnectorHeader(`${HEADER.split("\n").slice(0, 8).join("\n")}
-telegram_message_ids: 1669, 1670
-telegram_items: [{"kind":"photo"}]
+telegram_message_ids: 1669, 1670, 1672
+telegram_items: 1669=text 1670=photo>1669 1671=forward>1669 1672=text
 telegram_media_group_id: mg9
 
 caption`);
   assert.ok(parsed);
   assert.equal(parsed.mediaGroupId, "mg9");
-  assert.deepEqual(parsed.messageIds, ["1669", "1670"]);
-  assert.equal(parsed.items, '[{"kind":"photo"}]');
+  assert.deepEqual(parsed.messageIds, ["1669", "1670", "1672"]);
+  assert.equal(parsed.items, "1669=text 1670=photo>1669 1671=forward>1669 1672=text");
+  assert.deepEqual(parseTelegramItems(parsed.items), [
+    { id: "1669", kind: "text", attachedTo: null },
+    { id: "1670", kind: "photo", attachedTo: "1669" },
+    { id: "1671", kind: "forward", attachedTo: "1669" },
+    { id: "1672", kind: "text", attachedTo: null },
+  ]);
   assert.equal(parsed.body, "caption");
+});
+
+test("parseConnectorHeader allows leading whitespace only", () => {
+  assert.ok(parseConnectorHeader(`\n  ${HEADER}`));
+  assert.equal(parseConnectorHeader(`x\n${HEADER}`), null);
 });
 
 test("a forwarded body cannot forge the connector header", () => {

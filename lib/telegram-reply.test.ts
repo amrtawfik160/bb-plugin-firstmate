@@ -21,6 +21,7 @@ function row(over: Partial<InboundRow>): InboundRow {
     senderId: "99",
     topicId: null,
     replyTo: null,
+    forwarded: false,
     isBotOwn: false,
     isAck: false,
     ...over,
@@ -30,16 +31,17 @@ function row(over: Partial<InboundRow>): InboundRow {
 test("sendTelegramReply uses the bridge RPC when it exists", async () => {
   const calls: unknown[] = [];
   const result = await sendTelegramReply({
-    payload: { chatId: "200", messageId: "1669", kind: "ack", text: "On it." },
+    payload: { chatId: "200", messageId: "1669", kind: "ack", text: "On it.", correlation: "tgref:abc" },
     callRpc: async (args) => {
       calls.push(args);
-      return { ok: true };
+      return { queued: 1, duplicate: false };
     },
   });
   assert.equal(result.channel, "rpc");
   assert.match(result.body, /⟦fm-out kind=ack chat=200 msg=1669⟧/);
   assert.equal((calls[0] as { pluginId: string; method: string }).pluginId, "telegram");
   assert.equal((calls[0] as { method: string }).method, "reply");
+  assert.equal((calls[0] as { input: { correlation?: string } }).input.correlation, "tgref:abc");
 });
 
 test("sendTelegramReply falls back to an fm-out line when the RPC is missing", async () => {

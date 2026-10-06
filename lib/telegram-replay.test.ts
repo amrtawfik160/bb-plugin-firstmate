@@ -106,6 +106,27 @@ test("a restart mid-burst flushes from the ledger and does not lose rows", () =>
   assert.equal(restored.get({ source: "telegram", chatId: "9", messageId: "22" })?.state, "acked");
 });
 
+test("connector header fixtures key on telegram_message_id 1669 and reply_target none", () => {
+  const { ledger, replay } = harness();
+  const text = `The following is an owner message from the private Telegram connector.
+correlation: tgref:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+binding: 5
+telegram_user_id: 99
+telegram_chat_id: 200
+telegram_message_id: 1669
+reply_target: none
+project: none
+Telegram result delivery: Include Markdown links to existing local reports.
+Status of the deploy?`;
+  replay.ingest({ chatId: "200", messageId: "1669", text, at: 0, senderId: "99" });
+  replay.flush(3_000);
+  const row = ledger.get({ source: "telegram", chatId: "200", messageId: "1669" });
+  assert.ok(row);
+  assert.equal(row.replyTo, null);
+  assert.ok(row.sourceRefs.includes("tgref:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
+  assert.equal(replay.replies()[0]?.reply_parameters.message_id, 1669);
+});
+
 test("a mid-turn status question is a ledger row plus a steer, not a fold", () => {
   const { ledger, replay } = harness();
   replay.ingest({ chatId: "9", messageId: "1", text: "do the long task", at: 0, senderId: "amr" });
