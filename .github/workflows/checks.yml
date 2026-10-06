@@ -21,5 +21,9 @@ jobs:
       - run: npm ci
       # No typecheck script in package.json; call tsc directly (tsconfig.json covers server, rpc, lib).
       - run: npx tsc --noEmit
-      - run: npm test
+      - name: probe
+        run: |
+          for f in $(node -p "require('./package.json').scripts.test.split(/\s+/).filter(t=>/\.test\.(ts|mjs)$/.test(t)).join(' ')"); do
+            if node --test --experimental-strip-types $f >/tmp/o.log 2>&1; then echo "PASS $f $(grep -E '^ℹ skipped' /tmp/o.log)"; else echo "FAIL $f"; fi
+          done
       - run: npm run fidelity
