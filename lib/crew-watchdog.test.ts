@@ -19,7 +19,7 @@ import {
 
 test("watchdog trips on loops and 429s", () => {
   let state = emptyWatchdog("c1", "thr_c1", 0);
-  for (let i = 0; i < WATCHDOG_NEAR_IDENTICAL; i++) state = observeOutput(state, "replace /foo/ with /bar/");
+  for (let i = 0; i < WATCHDOG_NEAR_IDENTICAL + 1; i++) state = observeOutput(state, "replace /foo/ with /bar/");
   assert.equal(watchdogTrip(state, 10), "loop");
   state = emptyWatchdog("c2", "thr_c2", 0);
   for (let i = 0; i < WATCHDOG_MAX_429; i++) state = observeRateLimit(state);
