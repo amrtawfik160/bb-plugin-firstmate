@@ -68,7 +68,8 @@ import { ACK_TEXT, ackEligible, createInboundLedger, sweeperSteerText } from "./
 import { inboundHookDecision } from "./lib/inbound-dispatch.ts";
 import { DEFAULT_RELIABILITY_FLAGS, reliabilityFlagsFromSettings } from "./lib/reliability-flags.ts";
 import { sanitizeSettingValue } from "./lib/settings-schema.ts";
-import { formatOutboundEnvelope, parseTelegramEnvelope, parseTelegramSubmission, stripTelegramEnvelope, telegramReplyParameters } from "./lib/telegram-envelope.ts";
+import { coalesceBatches, formatOutboundEnvelope, parseInboundTelegram, parseTelegramSubmission, stripTelegramEnvelope, telegramReplyParameters, telegramSourceRef } from "./lib/telegram-envelope.ts";
+import { correlationOf, oldestUnanswered, refuseLaterThanOldest, sendTelegramReply } from "./lib/telegram-reply.ts";
 import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRecord } from "./lib/launch.ts";
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
 import { optionHelp } from "./lib/cli-help.ts";
@@ -9739,7 +9740,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_reply",
-    description: "Answer one inbound user message by its ledger ref. One reply per ref. Telegram replies carry reply_parameters.",
+    description: "Answer the oldest unanswered inbound item (ref=oldest or that item's tg:/bb: ref). Final answers never target a later item while an older one in the same chat is still open.",
     parameters: z.object({
       ref: z.string().min(1),
       text: z.string().min(1).max(4000),
@@ -9747,28 +9748,42 @@ export default async function plugin(bb: BbPluginApi) {
     async execute({ ref, text }) {
       const flags = await reliabilityFlags();
       if (flags.inboundLedger === "off") return toolError("Inbound ledger is off.");
-      const parts = ref.split(":");
-      if (parts.length < 3) return toolError("ref must be tg:<chat>:<msg> or bb:<thread>:<row>.");
-      const key = { source: parts[0] === "tg" ? "telegram" as const : "bb" as const, chatId: parts[1]!, messageId: parts.slice(2).join(":") };
-      const row = inboundLedger.get(key);
+      const open = inboundLedger.listOpen();
+      const row = ref === "oldest"
+        ? oldestUnanswered(open)
+        : inboundLedger.get((() => {
+          const parts = ref.split(":");
+          if (parts.length < 3) return { source: "bb" as const, chatId: "", messageId: "" };
+          return { source: parts[0] === "tg" ? "telegram" as const : "bb" as const, chatId: parts[1]!, messageId: parts.slice(2).join(":") };
+        })());
+      if (ref !== "oldest" && ref.split(":").length < 3) return toolError("ref must be oldest, tg:<chat>:<msg>, or bb:<thread>:<row>.");
       if (!row) return toolError(`No inbound row ${ref}.`);
-      const body = row.source === "telegram"
-        ? `${formatOutboundEnvelope({ kind: "reply", chatId: row.chatId, messageId: row.messageId, threadId: row.topicId })}\n${stripTelegramEnvelope(text)}`
-        : text;
-      const claimed = inboundLedger.claimOutbox(row, "reply", body, Date.now());
-      if (!claimed.sent) return `Already replied to ${ref}.`;
+      const older = flags.telegramThreading === "on" ? refuseLaterThanOldest({ chosen: row, open }) : null;
+      if (older) return toolError(`Reply to the oldest unanswered item ${older.source === "telegram" ? telegramSourceRef(older) : `bb:${older.chatId}:${older.messageId}`}, never the latest.`);
+      const sent = row.source === "telegram"
+        ? await sendTelegramReply({
+            payload: { chatId: row.chatId, messageId: row.messageId, kind: "reply", text: stripTelegramEnvelope(text), threadId: row.topicId, correlation: correlationOf(row) },
+            callRpc: flags.telegramThreading === "on" ? (args) => bb.sdk.plugins.callRpc(args) : null,
+          }).catch((error) => {
+            bb.log.warn(`firstmate_reply telegram send failed: ${String(error)}`);
+            return { channel: "envelope" as const, body: `${formatOutboundEnvelope({ kind: "reply", chatId: row.chatId, messageId: row.messageId, threadId: row.topicId })}\n${stripTelegramEnvelope(text)}` };
+          })
+        : { channel: "envelope" as const, body: text };
+      const claimed = inboundLedger.claimOutbox(row, "reply", sent.body, Date.now());
+      if (!claimed.sent) return `Already replied to ${row.source === "telegram" ? telegramSourceRef(row) : ref}.`;
       inboundLedger.markAnswered(row, Date.now());
       if (row.source === "bb") {
         await bb.sdk.threads.send({
           threadId: row.captainThreadId,
           mode: "steer",
-          input: [{ type: "text", text: body, mentions: [] }],
+          input: [{ type: "text", text: sent.body, mentions: [] }],
         }).catch((error) => bb.log.warn(`firstmate_reply send failed: ${String(error)}`));
       }
       const params = row.source === "telegram" ? telegramReplyParameters({ chatId: row.chatId, messageId: row.messageId, threadId: row.topicId }) : null;
+      const used = row.source === "telegram" ? telegramSourceRef(row) : `bb:${row.chatId}:${row.messageId}`;
       return params
-        ? `Replied to ${ref} with reply_parameters ${JSON.stringify(params.reply_parameters)}.`
-        : `Replied to ${ref}.`;
+        ? `Replied to ${used} via ${sent.channel} with reply_parameters ${JSON.stringify(params.reply_parameters)}.`
+        : `Replied to ${used}.`;
     },
   });
 
@@ -11067,7 +11082,7 @@ export default async function plugin(bb: BbPluginApi) {
         const senderIsCrew = sender !== null && (await readCrews()).some((c) => c.threadId === sender);
         const flags = await reliabilityFlags();
         const text = context.input.text;
-        const telegram = parseTelegramSubmission(context.experimental_submission?.data) ?? parseTelegramEnvelope(text);
+        const telegram = parseTelegramSubmission(context.experimental_submission?.data) ?? parseInboundTelegram(text);
         const inbound = inboundHookDecision({
           flags,
           attempt: context.attempt,
@@ -11087,7 +11102,7 @@ export default async function plugin(bb: BbPluginApi) {
                 receivedAt: Date.now() + i,
                 bbThreadId: threadId,
                 bbRowId: String(asRecord(row)["id"] ?? `${Date.now()}:${i}`),
-                telegram: parseTelegramEnvelope(String(asRecord(row)["text"] ?? text)) ?? (i === 0 ? telegram : null),
+                telegram: parseInboundTelegram(String(asRecord(row)["text"] ?? text)) ?? (i === 0 ? telegram : null),
                 initiator: String(context.initiator),
                 senderThreadId: sender,
               }))
@@ -11108,21 +11123,47 @@ export default async function plugin(bb: BbPluginApi) {
               return { action: "wait", reason: inbound.reason ?? "Coalescing inbound burst", sendAt: inbound.sendAt };
             }
             coalesceUntil.delete(key);
-            for (const row of inboundLedger.listOpen(threadId)) {
-              if (!ackEligible(row, Date.now())) continue;
-              const body = row.source === "telegram"
-                ? `${formatOutboundEnvelope({ kind: "ack", chatId: row.chatId, messageId: row.messageId, threadId: row.topicId })}\n${ACK_TEXT}`
-                : `received #${row.messageId}: ${row.preview}`;
-              const claimed = inboundLedger.claimOutbox(row, "ack", body, Date.now());
+            const now = Date.now();
+            const open = inboundLedger.listOpen(threadId);
+            const telegramGroups = coalesceBatches(
+              open.filter((row) => row.source === "telegram").map((row) => ({
+                chatId: row.chatId,
+                senderId: row.senderId,
+                mediaGroupId: row.mediaGroupId,
+                receivedAt: row.receivedAt,
+                messageId: row.messageId,
+                forwarded: row.forwarded,
+                kind: row.mediaGroupId || row.forwarded ? "media" as const : "text" as const,
+              })),
+            );
+            for (const group of telegramGroups) {
+              const keys = group.map((item) => ({ source: "telegram" as const, chatId: item.chatId, messageId: item.messageId }));
+              inboundLedger.mergeSourceRefs(keys, keys.map((item) => telegramSourceRef(item)));
+              const primary = inboundLedger.get(keys[0]!);
+              if (!primary || !ackEligible(primary, now)) continue;
+              const sent = await sendTelegramReply({
+                payload: { chatId: primary.chatId, messageId: primary.messageId, kind: "ack", text: ACK_TEXT, threadId: primary.topicId, correlation: correlationOf(primary) },
+                callRpc: flags.telegramThreading === "on" ? (args) => bb.sdk.plugins.callRpc(args) : null,
+              }).catch((error) => {
+                bb.log.warn(`inbound telegram ack failed: ${String(error)}`);
+                return { channel: "envelope" as const, body: `${formatOutboundEnvelope({ kind: "ack", chatId: primary.chatId, messageId: primary.messageId, threadId: primary.topicId })}\n${ACK_TEXT}` };
+              });
+              const claimed = inboundLedger.claimOutbox(primary, "ack", sent.body, now);
+              if (!claimed.sent) continue;
+              inboundLedger.markAcked(primary, now);
+              for (const extra of keys.slice(1)) inboundLedger.markAcked(extra, now);
+            }
+            for (const row of open.filter((item) => item.source === "bb")) {
+              if (!ackEligible(row, now)) continue;
+              const body = `received #${row.messageId}: ${row.preview}`;
+              const claimed = inboundLedger.claimOutbox(row, "ack", body, now);
               if (claimed.sent) {
-                inboundLedger.markAcked(row, Date.now());
-                if (row.source === "bb") {
-                  await bb.sdk.threads.send({
-                    threadId,
-                    mode: "steer",
-                    input: [{ type: "text", text: body, mentions: [], visibility: "agent-only" }],
-                  }).catch((error) => bb.log.warn(`inbound ack failed: ${String(error)}`));
-                }
+                inboundLedger.markAcked(row, now);
+                await bb.sdk.threads.send({
+                  threadId,
+                  mode: "steer",
+                  input: [{ type: "text", text: body, mentions: [], visibility: "agent-only" }],
+                }).catch((error) => bb.log.warn(`inbound ack failed: ${String(error)}`));
               }
             }
           }

@@ -10,7 +10,7 @@ import {
   createInboundLedger,
   sweeperSteerText,
 } from "./inbound-ledger.ts";
-import { parseTelegramEnvelope } from "./telegram-envelope.ts";
+import { parseConnectorHeader, parseInboundTelegram, parseTelegramEnvelope } from "./telegram-envelope.ts";
 
 function store() {
   return createInboundLedger(new Database(":memory:"));
@@ -39,6 +39,48 @@ test("a burst of 3 messages produces 3 ledger rows", () => {
   }
   assert.equal(ledger.listOpen("thr_cap").length, 3);
   assert.deepEqual(ledger.chatOrder("9").map((k) => k.messageId), ["10", "11", "12"]);
+});
+
+test("connector header rows key on telegram chat and message id", () => {
+  const ledger = store();
+  const text = `The following is an owner message from the private Telegram connector.
+correlation: tgref:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+binding: 5
+telegram_user_id: 99
+telegram_chat_id: 200
+telegram_message_id: 1669
+reply_target: none
+project: none
+Telegram result delivery: captain
+What is the status?`;
+  const row = ledger.record(userEvent({ text, telegram: parseInboundTelegram(text) }));
+  assert.equal(row?.source, "telegram");
+  assert.equal(row?.chatId, "200");
+  assert.equal(row?.messageId, "1669");
+  assert.equal(parseConnectorHeader(text)?.body, "What is the status?");
+  assert.ok(row?.sourceRefs.includes("tgref:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
+});
+
+test("telegram_message_ids create one row per member and keep tgref", () => {
+  const ledger = store();
+  const text = `The following is an owner message from the private Telegram connector.
+correlation: tgref:11111111-2222-3333-4444-555555555555
+binding: 5
+telegram_user_id: 99
+telegram_chat_id: 200
+telegram_message_id: 1669
+telegram_message_ids: 1669,1670,1672
+telegram_items: 1669=text 1670=photo>1669 1671=forward>1669 1672=text
+reply_target: none
+project: none
+Telegram result delivery: files
+[#1669] first
+[#1672] second`;
+  const first = ledger.record(userEvent({ text, telegram: parseInboundTelegram(text) }));
+  assert.equal(first?.messageId, "1669");
+  assert.equal(ledger.listOpen("thr_cap").length, 3);
+  assert.deepEqual(ledger.listOpen("thr_cap").map((row) => row.messageId), ["1669", "1670", "1672"]);
+  assert.ok(ledger.get({ source: "telegram", chatId: "200", messageId: "1672" })?.sourceRefs.includes("tgref:11111111-2222-3333-4444-555555555555"));
 });
 
 test("bot own messages and acks stay out of the ledger", () => {
