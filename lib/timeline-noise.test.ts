@@ -3,9 +3,11 @@ import test from "node:test";
 import {
   FIRSTMATE_ATTENTION_MARKER,
   FIRSTMATE_ROUTINE_MARKER,
+  captainProgressLabel,
   captainTimelineNoiseDecision,
   firstmateTimelineNoiseDecision,
   isRoutineReasoningRow,
+  paneTimelineNoiseDecision,
 } from "./timeline-noise.ts";
 
 test("captain timeline hides pending and successful Firstmate tools", () => {
@@ -65,4 +67,27 @@ test("recognizes BB reasoning labels without matching normal messages", () => {
   assert.equal(isRoutineReasoningRow("Thought for 4s"), true);
   assert.equal(isRoutineReasoningRow("I thought about the risk."), false);
   assert.equal(isRoutineReasoningRow("Thoughtful outcome"), false);
+});
+
+test("firstmate hide rules do not apply outside captain panes", () => {
+  assert.equal(paneTimelineNoiseDecision({
+    text: "firstmate_bearings {}",
+    inCaptainPane: false,
+    genericExpandableWork: false,
+  }), "unrelated");
+  assert.equal(paneTimelineNoiseDecision({
+    text: "firstmate_bearings {}",
+    inCaptainPane: true,
+    genericExpandableWork: false,
+  }), "hide");
+});
+
+test("progress UI collapses hidden captain work into a compact label", () => {
+  assert.equal(paneTimelineNoiseDecision({
+    text: "Thinking",
+    inCaptainPane: true,
+    genericExpandableWork: true,
+    progressUi: true,
+  }), "progress");
+  assert.equal(captainProgressLabel(4, 8), "First Mate is working (4 steps, 8m)");
 });

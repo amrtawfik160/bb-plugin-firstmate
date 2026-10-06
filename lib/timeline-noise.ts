@@ -36,3 +36,27 @@ export function captainTimelineNoiseDecision(
   if (!genericExpandableWork) return "unrelated";
   return MATERIAL_TOOL_STATE.test(text) ? "show" : "hide";
 }
+
+export type PaneTimelineDecision = TimelineNoiseDecision | "progress";
+
+export function paneTimelineNoiseDecision(input: {
+  text: string;
+  inCaptainPane: boolean;
+  genericExpandableWork: boolean;
+  progressUi?: boolean;
+}): PaneTimelineDecision {
+  if (!input.inCaptainPane) {
+    const firstmate = firstmateTimelineNoiseDecision(input.text);
+    if (firstmate === "hide") return "unrelated";
+    return firstmate === "show" ? "show" : "unrelated";
+  }
+  const decision = captainTimelineNoiseDecision(input.text, input.genericExpandableWork);
+  if (decision === "hide" && input.progressUi === true) return "progress";
+  return decision;
+}
+
+export function captainProgressLabel(hiddenCount: number, elapsedMin: number): string {
+  const steps = Math.max(0, hiddenCount);
+  const minutes = Math.max(0, elapsedMin);
+  return `First Mate is working (${steps} steps, ${minutes}m)`;
+}

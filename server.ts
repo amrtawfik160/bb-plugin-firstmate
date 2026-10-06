@@ -59,6 +59,16 @@ import {pluginAssetRoot} from "./lib/plugin-assets.ts";
 import {createNativeRuntime, runtimeRootAssign} from "./lib/native-runtime.ts";
 import { boundedCaptainStartup, captainBindingText } from "./lib/captain-startup.ts";
 import { createQueueStore, type QueueItem } from "./lib/queue-store.ts";
+import { admissionDecision, createDispatchJobs, spawnBackoffMs } from "./lib/async-dispatch.ts";
+import { createWatchdogStore, observeOutput, observeRateLimit, observeTurn, providerErrorIsRateLimit, tripWatchdog, watchdogFailText, watchdogTrip } from "./lib/crew-watchdog.ts";
+import { createDoorbellHold, doorbellHoldDecision } from "./lib/doorbell-hold.ts";
+import { HANDOFF_WAKE_AMENDMENT, captainInstructionsWithHandoff } from "./lib/handoff-contract.ts";
+import { honestIdleVerdictPresentation, interruptIsStopped, readyClaim } from "./lib/honest-status.ts";
+import { ACK_TEXT, ackEligible, createInboundLedger, sweeperSteerText } from "./lib/inbound-ledger.ts";
+import { inboundHookDecision } from "./lib/inbound-dispatch.ts";
+import { DEFAULT_RELIABILITY_FLAGS, reliabilityFlagsFromSettings } from "./lib/reliability-flags.ts";
+import { sanitizeSettingValue } from "./lib/settings-schema.ts";
+import { formatOutboundEnvelope, parseTelegramEnvelope, parseTelegramSubmission, stripTelegramEnvelope, telegramReplyParameters } from "./lib/telegram-envelope.ts";
 import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRecord } from "./lib/launch.ts";
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
 import { optionHelp } from "./lib/cli-help.ts";
@@ -121,6 +131,7 @@ const crewSchema = z.object({
   taskSpilled: z.boolean().optional(),
   launchKey: z.string().optional(),
   deliveryRequirement: z.enum(["pr", "merged", "merged-and-verified"]).optional(),
+  sourceRefs: z.array(z.string()).optional(),
   createdAt: z.string(),
 });
 type Crew = z.infer<typeof crewSchema>;
@@ -512,10 +523,10 @@ const INTERNAL_WAKE_GUIDANCE = [
   "Call firstmate_wake once. Handle the full report, then pass its receipt id as handledWake on your final successful Firstmate action; use firstmate_wake handledWake only when no action remains. Never repeat a successful action to retry acknowledgement.",
 ].join(" ");
 
-function captainWakeInput(text: string) {
+function captainWakeInput(text: string, extra = "") {
   return [{
     type: "text" as const,
-    text: `${text}\n\n${INTERNAL_WAKE_GUIDANCE}`,
+    text: `${text}\n\n${INTERNAL_WAKE_GUIDANCE}${extra}`,
     mentions: [],
     visibility: "agent-only" as const,
   }];
@@ -1348,6 +1359,7 @@ const CAPTAIN_BOOTSTRAP_TOOLS = ["firstmate_deck", "firstmate_contract"] as cons
 const CAPTAIN_SKILLS = ["captain", "firstmate"] as const;
 const CAPTAIN_TOOLS = [
   "firstmate_dispatch",
+  "firstmate_reply",
   "firstmate_runtime",
   "firstmate_deck",
   "firstmate_tell",
@@ -1473,6 +1485,7 @@ export function formatFmMeta(input: {
   provider?: string;
   effort?: string;
   spawnGen?: string;
+  sourceRefs?: string[];
 }): string {
   const spawnGen =
     input.spawnGen ?? `s${Math.floor(Date.now() / 1000)}.${process.pid}.${Math.floor(Math.random() * 10000)}`;
@@ -1498,6 +1511,7 @@ export function formatFmMeta(input: {
   lines.push(`spawn_gen=${spawnGen}`);
   lines.push("backend=bb");
   lines.push(`bb_thread_id=${input.threadId}`);
+  if (input.sourceRefs && input.sourceRefs.length > 0) lines.push(`source_refs=${input.sourceRefs.join(",")}`);
   return `${lines.join("\n")}\n`;
 }
 
@@ -1528,6 +1542,10 @@ export default async function plugin(bb: BbPluginApi) {
   const launches = createLaunches(bb.storage.database());
   const reports=scoutReports(bb.storage.database());
   const deliveries = createDeliveries(bb.storage.database());
+  const inboundLedger = createInboundLedger(bb.storage.database());
+  const crewWatchdog = createWatchdogStore(bb.storage.database());
+  const dispatchJobs = createDispatchJobs(bb.storage.database());
+  const doorbellHold = createDoorbellHold(bb.storage.database());
   const launchAbort = new AbortController();
   const nativeRuntime=createNativeRuntime({assets:join(PLUGIN_ROOT,"runtime-assets"),files:()=>bb.sdk.files,disposal:launchAbort.signal,run:runStructuredOnHost});
   let followUpWork:Promise<void>|undefined;
@@ -1710,13 +1728,18 @@ export default async function plugin(bb: BbPluginApi) {
     },
     maxActiveCrews: {
       type: "number",
-      label: "Max running crews per captain before dispatch refuses (0 = no cap)",
+      label: "Max running crews per captain (default 10, 0 = no cap). Over-cap work queues when asyncDispatch is on.",
       default: DEFAULT_MAX_ACTIVE_CREWS,
     },
     maxFanout: {
       type: "number",
       label: `Max crews in one fan-out dispatch or watch batch (default ${DEFAULT_MAX_FANOUT}, at most ${MAX_FANOUT_CEILING})`,
       default: DEFAULT_MAX_FANOUT,
+    },
+    fmReliability: {
+      type: "string",
+      label: "Reliability flags JSON (all off by default)",
+      default: "",
     },
   });
 
@@ -1736,6 +1759,26 @@ export default async function plugin(bb: BbPluginApi) {
       return scope?.home ? { ...value, fmHome: scope.home, ...(scope.host ? { fmHostId: scope.host } : {}) } : value;
     },
   };
+  let flagsCache = { ...DEFAULT_RELIABILITY_FLAGS };
+  async function reliabilityFlags() {
+    flagsCache = reliabilityFlagsFromSettings(await settings.get());
+    return flagsCache;
+  }
+  await reliabilityFlags();
+  const coalesceUntil = new Map<string, number>();
+  async function sanitizeDiagnosticSettings() {
+    try {
+      const current = await settings.get();
+      const next: Record<string, string> = {};
+      for (const key of ["fmSkillsManifest", "captainMemory", "captainContract"] as const) {
+        const value = String(current[key] ?? "");
+        const cleaned = sanitizeSettingValue(value);
+        if (cleaned.truncated) next[key] = cleaned.value;
+      }
+      if (Object.keys(next).length > 0) await settings.experimental_set(next);
+    } catch { /* settings UI stay on last good values */ }
+  }
+  await sanitizeDiagnosticSettings();
   async function inCaptainHome<T>(captain: string | undefined, fn: () => Promise<T>): Promise<T> {
     const home = captain ? await bb.storage.kv.get<string>(`native-home:${captain}`) : null;
     const host = captain ? await bb.storage.kv.get<string>(`native-home-host:${captain}`) : null;
@@ -2391,6 +2434,22 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function sendCaptainWake(parentThreadId: string, text: string, crewId: string, signal?: AbortSignal): Promise<boolean> {
+    const flags = await reliabilityFlags();
+    if (flags.asyncDispatch === "on" && doorbellHoldDecision({
+      attempt: "join-turn",
+      initiator: "agent",
+      text,
+      targetIsCaptain: true,
+      flagOn: true,
+    }) === "hold") {
+      try {
+        const captain = await raceAbort(bb.sdk.threads.get({ threadId: parentThreadId }), signal, STUCK_HOST_CALL_MS);
+        if (captain.status === "active" || captain.status === "starting") {
+          doorbellHold.enqueue({ captainThreadId: parentThreadId, text, crewId, urgent: false, createdAt: Date.now() });
+          return true;
+        }
+      } catch { /* fall through to steer */ }
+    }
     try {
       // Abort-RESPONSIVE (no artificial timeout): a healthy send completes as before; only a
       // reload (signal abort) abandons the await so the supervisor can stop within its grace.
@@ -2406,7 +2465,7 @@ export default async function plugin(bb: BbPluginApi) {
           // Multiple concurrent crew reports are each steered into the same turn;
           // the durable wake plane remains the ordered recovery source.
           mode: "steer",
-          input: captainWakeInput(text),
+          input: captainWakeInput(text, flags.handoffContract === "on" ? ` ${HANDOFF_WAKE_AMENDMENT}` : ""),
         }),
         signal,
       );
@@ -2563,28 +2622,37 @@ export default async function plugin(bb: BbPluginApi) {
     // failure renders as "✅ … done" and a FAILED crew is offered `deliver`. Only
     // the idle kind is verdict-driven; review/needs-decision/error/unknown/
     // interaction carry their own harness-signalled meaning.
-    const idlePresent = kind === "idle" ? idleVerdictPresentation(crew.id, verdictOf(outcome)) : null;
+    const honest = (await reliabilityFlags()).honestStatus === "on";
+    const idlePresent = kind === "idle"
+      ? (honest ? honestIdleVerdictPresentation(crew.id, verdictOf(outcome)) : idleVerdictPresentation(crew.id, verdictOf(outcome)))
+      : null;
+    const reviewPresent = kind === "review" && honest ? readyClaim(crew.id, outcome ?? output) : null;
     const head =
       idlePresent !== null
         ? idlePresent.head
+        : reviewPresent !== null
+          ? reviewPresent.head
         : kind === "review"
           ? `🔎 crew ${crew.id} ready for review`
           : kind === "needs-decision"
             ? `⚖️ crew ${crew.id} NEEDS DECISION`
             : kind === "error"
               ? `❌ crew ${crew.id} failed`
-              : kind === "unknown"
-                ? `❓ crew ${crew.id} gone`
+              : kind === "unknown" || kind === "unreachable"
+                ? (honest ? `❓ crew ${crew.id} unreachable` : `❓ crew ${crew.id} gone`)
                 : kind === "interaction"
                   ? `✋ crew ${crew.id} needs input`
                   : `⏳ crew ${crew.id} ${kind}`;
     const lines = [`${head} [${crew.shape}] :: ${truncate(crewLabel(crew), 100)}`];
     if (prUrl !== "") lines.push(prUrl);
+    if ((crew.sourceRefs ?? []).length > 0) lines.push(`refs=${crew.sourceRefs!.join(",")}`);
     if (outcome !== null) lines.push(outcome);
     else if (output !== null && output !== "") lines.push(truncate(output.replace(/\n/g, " "), 400));
     lines.push(
       idlePresent !== null
         ? idlePresent.next
+        : reviewPresent !== null
+          ? reviewPresent.next
         : kind === "error"
           ? `next: bb firstmate retry|tell|forget ${crew.id}`
           : kind === "needs-decision"
@@ -2688,7 +2756,7 @@ export default async function plugin(bb: BbPluginApi) {
       const thread = await raceAbort(bb.sdk.threads.get({ threadId: crew.threadId }), signal, STUCK_HOST_CALL_MS);
       return threadField(thread, "status");
     } catch {
-      return "unknown";
+      return (await reliabilityFlags()).honestStatus === "on" ? "unreachable" : "unknown";
     }
   }
 
@@ -3200,6 +3268,7 @@ export default async function plugin(bb: BbPluginApi) {
       model: input.model ?? input.crew.model ?? undefined,
       provider: input.provider ?? input.crew.providerId ?? undefined,
       effort: input.crew.reasoningLevel ?? undefined,
+      sourceRefs: input.crew.sourceRefs,
     });
     const stateDir = `${fmHome}/state`;
     const dest = `${stateDir}/${input.crew.id}.meta`;
@@ -4311,12 +4380,13 @@ export default async function plugin(bb: BbPluginApi) {
   async function launchCapacity(owner: string | undefined) {
     const raw = (await settings.get()).maxActiveCrews;
     const cap = Number.isFinite(raw) ? Math.max(0, Math.trunc(raw)) : DEFAULT_MAX_ACTIVE_CREWS;
+    const countUnknown = (await reliabilityFlags()).asyncDispatch !== "on";
     const mine = (await readCrews()).filter(c => c.parentThreadId === (owner ?? null) && !isSecondmateRoute(c) && !launches.isDeletedWorker(c.threadId));
     const statuses = await statusesFor(mine);
     const activeTaskIds: string[] = [];
     for (const c of mine) {
       const st = statuses.get(c.threadId);
-      if (st === "active" || st === "pending" || st === "starting" || st === "unknown" || await isCrewWaiting(c)) activeTaskIds.push(launchTaskKey(c.projectId,c.id));
+      if (st === "active" || st === "pending" || st === "starting" || (countUnknown && st === "unknown") || await isCrewWaiting(c)) activeTaskIds.push(launchTaskKey(c.projectId,c.id));
     }
     // Worker retention is independent of launch capacity. A forgotten running
     // worker still consumes admission capacity until core reports completion.
@@ -4327,11 +4397,132 @@ export default async function plugin(bb: BbPluginApi) {
         try {
           const thread=await raceAbort(bb.sdk.threads.get({threadId:record.threadId}),launchAbort.signal,STUCK_HOST_CALL_MS);
           if (["active","pending","starting"].includes(thread.status)) activeTaskIds.push(launchTaskKey(record.projectId,record.taskId));
-        } catch { activeTaskIds.push(launchTaskKey(record.projectId,record.taskId)); }
+        } catch {
+          if (countUnknown) activeTaskIds.push(launchTaskKey(record.projectId,record.taskId));
+          else {
+            try {
+              const retry=await raceAbort(bb.sdk.threads.get({threadId:record.threadId}),launchAbort.signal,STUCK_HOST_CALL_MS);
+              if (["active","pending","starting"].includes(retry.status)) activeTaskIds.push(launchTaskKey(record.projectId,record.taskId));
+            } catch { /* unknown after retry is not a live slot */ }
+          }
+        }
       }
       if (records.length<100) break;
     }
     return { cap, activeTaskIds };
+  }
+
+  async function enqueueWhenOverCap(input: {
+    task: string;
+    taskId?: string;
+    title?: string;
+    projectId: string;
+    parentThreadId: string;
+    shape?: Shape;
+    mode?: string;
+    deliveryRequirement?: "pr" | "merged" | "merged-and-verified";
+    sourceRefs?: string[];
+  }): Promise<string | null> {
+    const flags = await reliabilityFlags();
+    if (flags.asyncDispatch !== "on") return null;
+    const { cap, activeTaskIds } = await launchCapacity(input.parentThreadId);
+    const running = new Set([...activeTaskIds, ...launches.heldTaskIds(input.parentThreadId)]).size;
+    const admit = admissionDecision({
+      cap,
+      statuses: Array.from({ length: running }, () => "active"),
+      flagOn: true,
+    });
+    if (admit.action !== "queue") return null;
+    await queueStore.ready();
+    const queued: QueueItem = {
+      nativeHome: (await settings.get()).fmHome,
+      id: input.taskId ?? randomUUID().slice(0, 8),
+      title: input.title ?? input.task.slice(0, 80),
+      detail: input.task,
+      projectId: input.projectId,
+      shape: input.shape ?? "ship",
+      mode: input.mode ?? "",
+      blockedBy: [],
+      deliveryRequirement: input.deliveryRequirement ?? "merged",
+      waitUntil: null,
+      status: "queued",
+      crewId: null,
+      parentThreadId: input.parentThreadId,
+      createdAt: new Date().toISOString(),
+      ...(input.sourceRefs && input.sourceRefs.length > 0 ? { sourceRefs: input.sourceRefs } : {}),
+    };
+    queueStore.add(queued);
+    for (const key of input.sourceRefs ?? []) {
+      const parsed = key.includes(":")
+        ? { source: key.startsWith("tg:") ? "telegram" as const : "bb" as const, chatId: key.split(":")[1] ?? "", messageId: key.split(":").slice(2).join(":") }
+        : null;
+      if (parsed && parsed.chatId) inboundLedger.markDelegated(parsed, queued.id, Date.now());
+    }
+    return `Queued as ${queued.id} (crew cap ${admit.cap}; will dispatch when a slot opens).`;
+  }
+
+  async function drainQueuedDispatches(owner?: string): Promise<void> {
+    if ((await reliabilityFlags()).asyncDispatch !== "on") return;
+    await queueStore.ready();
+    const items = (owner !== undefined ? queueStore.list(owner) : queueStore.list())
+      .filter((row) => row.status === "queued");
+    for (const item of items) {
+      const parent = item.parentThreadId ?? owner;
+      if (!parent) continue;
+      const { cap, activeTaskIds } = await launchCapacity(parent);
+      const running = new Set([...activeTaskIds, ...launches.heldTaskIds(parent)]).size;
+      if (cap > 0 && running >= cap) continue;
+      const brief = item.detail !== "" ? `${item.title}\n\n${item.detail}` : item.title;
+      try {
+        const crew = await dispatchCrew({
+          task: brief,
+          projectId: item.projectId,
+          parentThreadId: parent,
+          title: item.title,
+          crewId: item.id,
+          worktree: resolveWorktree({ shape: item.shape }).worktree,
+          visible: true,
+          shape: item.shape,
+          mode: toMode(item.mode !== "" ? item.mode : undefined, "direct-PR"),
+          sourceRefs: item.sourceRefs,
+        });
+        queueStore.patch(item, { status: "dispatched", crewId: crew.id });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (/Crew cap reached/.test(message)) continue;
+        bb.log.warn(`queued dispatch ${item.id}: ${message}`);
+      }
+    }
+    for (const job of dispatchJobs.due(Date.now())) {
+      if (owner && job.captainThreadId !== owner) continue;
+      const hold = await captainHoldState(job.captainThreadId);
+      const wait = spawnBackoffMs({ rateLimited: hold.hold, resetsAt: null, now: Date.now() });
+      if (wait > 0) {
+        dispatchJobs.save({ ...job, backoffUntil: Date.now() + wait });
+        continue;
+      }
+    }
+  }
+
+  async function drainCaptainReliability(captainThreadId: string, signal?: AbortSignal): Promise<void> {
+    const flags = await reliabilityFlags();
+    if (flags.asyncDispatch === "on") {
+      for (const row of doorbellHold.drain(captainThreadId)) {
+        await sendCaptainWake(captainThreadId, row.text, row.crewId ?? "held-doorbell", signal)
+          .catch((error) => bb.log.warn(`held doorbell drain: ${String(error)}`));
+      }
+      await drainQueuedDispatches(captainThreadId);
+    }
+    if (flags.inboundLedger === "on") {
+      for (const action of inboundLedger.openForSweep(Date.now())) {
+        if (action.row.captainThreadId !== captainThreadId) continue;
+        await bb.sdk.threads.send({
+          threadId: captainThreadId,
+          mode: "steer",
+          input: [{ type: "text", text: sweeperSteerText(action), mentions: [], visibility: "agent-only" }],
+        }).catch((error) => bb.log.warn(`inbound sweeper: ${String(error)}`));
+      }
+    }
   }
 
   async function adoptLegacyLaunch(taskId:string, threadId:string, owner:string, projectId:string, check:boolean, callerSignal?:AbortSignal) {
@@ -4430,7 +4621,7 @@ export default async function plugin(bb: BbPluginApi) {
         const recovered: Crew = { id: taskId, task: input.task, projectId: input.projectId, parentThreadId: input.parentThreadId ?? null,
           threadId: resolved.threadId, nativeHome: home, providerId: null, model: null, reasoningLevel: null,
           worktree: input.worktree, shape: input.shape, posture: input.shape === "scout" ? "scout" : input.mode,
-          yolo:resolved.yolo,launchKey: key, metaWritten: false, createdAt: new Date().toISOString() };
+          yolo:resolved.yolo,launchKey: key, metaWritten: false, sourceRefs: input.sourceRefs, createdAt: new Date().toISOString() };
         recovered.deliveryRequirement=recoveredContract({},resolved);
         await mutateCrews(rows => [recovered, ...rows.filter(c => c.id !== taskId)]);
         return recovered;
@@ -4482,6 +4673,7 @@ export default async function plugin(bb: BbPluginApi) {
     yolo?:boolean;
     sendAt?: number;
     deliveryRequirement?: "pr" | "merged" | "merged-and-verified";
+    sourceRefs?: string[];
     signal?:AbortSignal;
   }): Promise<Crew> {
     const task = input.task.trim().slice(0, MAX_TASK);
@@ -4542,6 +4734,7 @@ export default async function plugin(bb: BbPluginApi) {
       shape: input.shape,
       posture: input.shape === "scout" ? "scout" : input.mode,
       ...(input.title !== undefined && input.title.trim() !== "" ? { title: input.title.trim().slice(0, 200) } : {}),
+      ...(input.sourceRefs && input.sourceRefs.length > 0 ? { sourceRefs: input.sourceRefs } : {}),
       createdAt: new Date().toISOString(),
     };
     // A bad provider/model makes BB create a thread that is already in error. Check
@@ -9187,6 +9380,7 @@ export default async function plugin(bb: BbPluginApi) {
     sendAt: z.never().optional().describe("Unsupported for Firstmate launch; use backlog waitUntil eligibility and explicit dispatch"),
     overrideOwner: z.boolean().optional()
       .describe("Proceed even though the task targets a PR another captain's crew owns (only on the captain's word)"),
+    sourceRefs: z.array(z.string()).optional().describe("Inbound ledger refs this crew answers (tg:chat:msg or bb:thread:row)"),
   });
 
   const dispatchHelp='bb firstmate dispatch [options] -- "<task>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","sendAt"])+"\n  --task <text>  Repeat for bounded fan-out; --hidden hides the worker.\n  sendAt/--send-at is unsupported; native ship isolation is mandatory.";
@@ -9427,12 +9621,68 @@ export default async function plugin(bb: BbPluginApi) {
       "Dispatch a firstmate-style crewmate: spawns a child BB thread for one task (ship crews get an isolated worktree by default) and records it as a crew.",
     presentation: { label: { pending: "Dispatching crewmate", completed: "Dispatched crewmate" } },
     parameters: dispatchParams,
-    async execute({ task, taskId, projectId, title, providerId, model, reasoningLevel, permissionMode, shape, mode, worktree, sharedEnv, visible, sendAt, deliveryRequirement, overrideOwner }, ctx) {
+    async execute({ task, taskId, projectId, title, providerId, model, reasoningLevel, permissionMode, shape, mode, worktree, sharedEnv, visible, sendAt, deliveryRequirement, overrideOwner, sourceRefs }, ctx) {
       const ctxRecord = asRecord(ctx);
       const resolvedProject =
         projectId ?? (typeof ctxRecord["projectId"] === "string" ? ctxRecord["projectId"] : undefined);
       if (resolvedProject === undefined) return toolError("No project: pass projectId.");
       const parentThreadId = typeof ctxRecord["threadId"] === "string" ? ctxRecord["threadId"] : undefined;
+      const flags = await reliabilityFlags();
+      if (flags.asyncDispatch === "on" && parentThreadId) {
+        const queued = await enqueueWhenOverCap({
+          task,
+          taskId,
+          title,
+          projectId: resolvedProject,
+          parentThreadId,
+          shape,
+          mode,
+          deliveryRequirement,
+          sourceRefs,
+        });
+        if (queued) return queued;
+        const reservedId = taskId ?? randomUUID().slice(0, 8);
+        dispatchJobs.save({
+          crewId: reservedId,
+          captainThreadId: parentThreadId,
+          payload: JSON.stringify({ task, projectId: resolvedProject, sourceRefs: sourceRefs ?? [] }),
+          state: "reserved",
+          createdAt: Date.now(),
+          startedAt: null,
+          error: null,
+          backoffUntil: null,
+        });
+        const spawnInput = {
+          task, crewId: reservedId, projectId: resolvedProject, parentThreadId, title, sourceRefs,
+          providerId, model, reasoningLevel: toReasoningLevel(reasoningLevel),
+          permissionMode: toPermissionMode(permissionMode ?? (await settings.get()).defaultPermissionMode),
+          worktree: worktree === true, visible: visible !== false, shape: shape ?? "ship",
+          mode: toMode(mode, "direct-PR"), sendAt, deliveryRequirement,
+          signal: ctxRecord["signal"] as AbortSignal | undefined,
+        };
+        followUpWork = (followUpWork ?? Promise.resolve()).then(async () => {
+          const job = dispatchJobs.get(reservedId);
+          if (!job || job.state === "started" || job.state === "failed") return;
+          const hold = await captainHoldState(parentThreadId);
+          const wait = spawnBackoffMs({ rateLimited: hold.hold, resetsAt: null, now: Date.now() });
+          if (wait > 0) await sleep(wait);
+          dispatchJobs.save({ ...job, state: "spawning", startedAt: Date.now() });
+          try {
+            await dispatchCrew(spawnInput);
+            const done = dispatchJobs.get(reservedId);
+            if (done) dispatchJobs.save({ ...done, state: "started" });
+            for (const ref of sourceRefs ?? []) {
+              const parts = ref.split(":");
+              if (parts.length >= 3) inboundLedger.markDelegated({ source: parts[0] === "tg" ? "telegram" : "bb", chatId: parts[1]!, messageId: parts.slice(2).join(":") }, reservedId, Date.now());
+            }
+          } catch (error) {
+            const failed = dispatchJobs.get(reservedId);
+            if (failed) dispatchJobs.save({ ...failed, state: "failed", error: String(error) });
+            bb.log.warn(`async dispatch ${reservedId}: ${String(error)}`);
+          }
+        });
+        return `Reserved crew ${reservedId}. Spawn continues in the background.`;
+      }
 
       if (overrideOwner !== true) {
         const conflict = await dispatchPrConflict(task, resolvedProject, parentThreadId);
@@ -9453,6 +9703,7 @@ export default async function plugin(bb: BbPluginApi) {
           task,crewId:taskId,
           projectId: resolvedProject,
           parentThreadId: typeof ctxRecord["threadId"] === "string" ? ctxRecord["threadId"] : undefined,
+          sourceRefs,
           title,
           providerId: providerId ?? (current.defaultProvider !== "" ? current.defaultProvider : undefined),
           model,
@@ -9483,6 +9734,41 @@ export default async function plugin(bb: BbPluginApi) {
     parameters: z.object({ all: z.boolean().optional().describe("Explicitly scan every captain's crews"), digest:z.boolean().optional().describe("Explicitly request the session/fleet digest before native startup") }),
     async execute({ all,digest }, ctx) {
       return (await takeDeck(ctx,asRecord(ctx)["signal"] as AbortSignal|undefined,all===true,digest===true)).text;
+    },
+  });
+
+  registerCaptainTool({
+    name: "firstmate_reply",
+    description: "Answer one inbound user message by its ledger ref. One reply per ref. Telegram replies carry reply_parameters.",
+    parameters: z.object({
+      ref: z.string().min(1),
+      text: z.string().min(1).max(4000),
+    }),
+    async execute({ ref, text }) {
+      const flags = await reliabilityFlags();
+      if (flags.inboundLedger === "off") return toolError("Inbound ledger is off.");
+      const parts = ref.split(":");
+      if (parts.length < 3) return toolError("ref must be tg:<chat>:<msg> or bb:<thread>:<row>.");
+      const key = { source: parts[0] === "tg" ? "telegram" as const : "bb" as const, chatId: parts[1]!, messageId: parts.slice(2).join(":") };
+      const row = inboundLedger.get(key);
+      if (!row) return toolError(`No inbound row ${ref}.`);
+      const body = row.source === "telegram"
+        ? `${formatOutboundEnvelope({ kind: "reply", chatId: row.chatId, messageId: row.messageId, threadId: row.topicId })}\n${stripTelegramEnvelope(text)}`
+        : text;
+      const claimed = inboundLedger.claimOutbox(row, "reply", body, Date.now());
+      if (!claimed.sent) return `Already replied to ${ref}.`;
+      inboundLedger.markAnswered(row, Date.now());
+      if (row.source === "bb") {
+        await bb.sdk.threads.send({
+          threadId: row.captainThreadId,
+          mode: "steer",
+          input: [{ type: "text", text: body, mentions: [] }],
+        }).catch((error) => bb.log.warn(`firstmate_reply send failed: ${String(error)}`));
+      }
+      const params = row.source === "telegram" ? telegramReplyParameters({ chatId: row.chatId, messageId: row.messageId, threadId: row.topicId }) : null;
+      return params
+        ? `Replied to ${ref} with reply_parameters ${JSON.stringify(params.reply_parameters)}.`
+        : `Replied to ${ref}.`;
     },
   });
 
@@ -10318,7 +10604,10 @@ export default async function plugin(bb: BbPluginApi) {
     const memoryBlock = marked && !meta["nativeHome"] && captainMemoryCache !== ""
       ? `\n\n${truncate(captainMemoryCache, memoryBudget)}` : "";
     const skillsBlock = ""; // Selected native policy is read through firstmate_skill, never the global manifest cache.
-    const instructions = truncate(`${base}${memoryBlock}${skillsBlock}`, 4096);
+    const instructions = captainInstructionsWithHandoff(
+      truncate(`${base}${memoryBlock}${skillsBlock}`, 4096),
+      flagsCache.handoffContract === "on",
+    );
     return {
       tools: marked ? [...CAPTAIN_TOOLS] : [...CAPTAIN_BOOTSTRAP_TOOLS],
       skills: marked ? [...CAPTAIN_SKILLS] : [...CAPTAIN_BOOTSTRAP_SKILLS],
@@ -10467,9 +10756,13 @@ export default async function plugin(bb: BbPluginApi) {
         types: ["system/thread/interrupted"],
       });
       let interruptAt: number | null = null;
+      const honest = (await reliabilityFlags()).honestStatus === "on";
       for (const row of interrupts) {
         const reason = asRecord(row.data)["reason"];
-        if (reason !== "manual-stop" && reason !== "host-daemon-restarted") continue;
+        const stopped = honest
+          ? interruptIsStopped(reason)
+          : reason === "manual-stop" || reason === "host-daemon-restarted";
+        if (!stopped) continue;
         if (typeof row.createdAt === "number") {
           interruptAt = row.createdAt;
           break;
@@ -10650,6 +10943,20 @@ export default async function plugin(bb: BbPluginApi) {
     lastAssistantText: string | null,
   ): Promise<void> {
     if (isSecondmateRoute(crew)) return;
+    if ((await reliabilityFlags()).honestStatus === "on") {
+      let state = crewWatchdog.loadOrCreate(crew.id, crew.threadId, Date.parse(crew.createdAt) || Date.now());
+      state = observeTurn(state);
+      if (lastAssistantText) state = observeOutput(state, lastAssistantText);
+      const reason = watchdogTrip(state, Date.now());
+      if (reason !== null) {
+        state = tripWatchdog(state, Date.now(), lastAssistantText ?? "");
+        crewWatchdog.save(state);
+        await notifyCaptain(crew, "error", watchdogFailText(state));
+        if (crew.parentThreadId) await drainQueuedDispatches(crew.parentThreadId);
+        return;
+      }
+      crewWatchdog.save(state);
+    }
     await discoverCrewDelivery(crew).catch(error => bb.log.warn(`PR discovery ${crew.id}: ${String(error)}`));
     const stopped = await turnWasStopped(thread);
     // BB already reports interruptions to the parent. A completion wake here can
@@ -10758,10 +11065,83 @@ export default async function plugin(bb: BbPluginApi) {
         }
         const sender = typeof context.senderThreadId === "string" && context.senderThreadId !== "mixed" ? context.senderThreadId : null;
         const senderIsCrew = sender !== null && (await readCrews()).some((c) => c.threadId === sender);
+        const flags = await reliabilityFlags();
+        const text = context.input.text;
+        const telegram = parseTelegramSubmission(context.experimental_submission?.data) ?? parseTelegramEnvelope(text);
+        const inbound = inboundHookDecision({
+          flags,
+          attempt: context.attempt,
+          initiator: String(context.initiator),
+          text,
+          now: Date.now(),
+          queuedCount: (context.queuedMessages ?? []).length,
+          telegram,
+          coalesceDeadline: coalesceUntil.get(`${threadId}:${telegram?.chatId ?? threadId}`) ?? null,
+        });
+        if (inbound.record) {
+          const queued = context.queuedMessages ?? [];
+          const events = queued.length > 0
+            ? queued.map((row, i) => ({
+                captainThreadId: threadId,
+                text: String(asRecord(row)["text"] ?? asRecord(asRecord(row)["input"])["text"] ?? text),
+                receivedAt: Date.now() + i,
+                bbThreadId: threadId,
+                bbRowId: String(asRecord(row)["id"] ?? `${Date.now()}:${i}`),
+                telegram: parseTelegramEnvelope(String(asRecord(row)["text"] ?? text)) ?? (i === 0 ? telegram : null),
+                initiator: String(context.initiator),
+                senderThreadId: sender,
+              }))
+            : [{
+                captainThreadId: threadId,
+                text,
+                receivedAt: Date.now(),
+                bbThreadId: threadId,
+                telegram,
+                initiator: String(context.initiator),
+                senderThreadId: sender,
+              }];
+          for (const event of events) inboundLedger.record(event);
+          if (flags.inboundLedger === "on") {
+            const key = `${threadId}:${telegram?.chatId ?? threadId}`;
+            if (inbound.action === "wait" && inbound.sendAt) {
+              coalesceUntil.set(key, inbound.sendAt);
+              return { action: "wait", reason: inbound.reason ?? "Coalescing inbound burst", sendAt: inbound.sendAt };
+            }
+            coalesceUntil.delete(key);
+            for (const row of inboundLedger.listOpen(threadId)) {
+              if (!ackEligible(row, Date.now())) continue;
+              const body = row.source === "telegram"
+                ? `${formatOutboundEnvelope({ kind: "ack", chatId: row.chatId, messageId: row.messageId, threadId: row.topicId })}\n${ACK_TEXT}`
+                : `received #${row.messageId}: ${row.preview}`;
+              const claimed = inboundLedger.claimOutbox(row, "ack", body, Date.now());
+              if (claimed.sent) {
+                inboundLedger.markAcked(row, Date.now());
+                if (row.source === "bb") {
+                  await bb.sdk.threads.send({
+                    threadId,
+                    mode: "steer",
+                    input: [{ type: "text", text: body, mentions: [], visibility: "agent-only" }],
+                  }).catch((error) => bb.log.warn(`inbound ack failed: ${String(error)}`));
+                }
+              }
+            }
+          }
+        }
+        if (flags.asyncDispatch === "on" && doorbellHoldDecision({
+          attempt: context.attempt,
+          initiator: String(context.initiator),
+          text,
+          targetIsCaptain: true,
+          flagOn: true,
+        }) === "hold") {
+          heldPingCaptains.add(threadId);
+          doorbellHold.enqueue({ captainThreadId: threadId, text, crewId: sender, urgent: false, createdAt: Date.now() });
+          return { action: "wait", reason: "Crew doorbell held until the captain turn ends." };
+        }
         const decision = crewPingHoldDecision({
           attempt: context.attempt,
           initiator: String(context.initiator),
-          text: context.input.text,
+          text,
           targetIsCaptain: true,
           senderIsCrew,
         });
@@ -10855,6 +11235,9 @@ export default async function plugin(bb: BbPluginApi) {
     }
     // A captain that completed a turn can take the wakes held while it was unavailable.
     await releaseHeldCaptainWakes(thread.id).catch((error) => bb.log.warn(`held wake release failed captain=${thread.id}: ${String(error)}`));
+    if (knownCaptains.has(thread.id)) {
+      await drainCaptainReliability(thread.id).catch((error) => bb.log.warn(`captain reliability drain failed ${thread.id}: ${String(error)}`));
+    }
     await inCaptainHome(thread.id, () => reconcileReturnedAfk(thread.id)).catch(error => bb.log.warn(`AFK return: ${String(error)}`));
     // Turn-end backstop for the captain (no-op unless turnEndGuard=re-ring and this
     // is the captain thread). Captains are not crews.
@@ -10864,6 +11247,7 @@ export default async function plugin(bb: BbPluginApi) {
     await maybeCompactCrew(thread.id).catch((error) => bb.log.warn(`crew compaction check failed ${thread.id}: ${String(error)}`));
     liveTerminalHandled.add(thread.id);
     await handleCrewIdle(crew, thread, lastAssistantText);
+    if (crew.parentThreadId) await drainQueuedDispatches(crew.parentThreadId).catch((error) => bb.log.warn(`queued dispatch drain: ${String(error)}`));
   });
   bb.events.on("thread.failed", async ({ thread, error }) => {
     const crew = await findCrewByThread(thread.id);
@@ -11123,9 +11507,27 @@ export default async function plugin(bb: BbPluginApi) {
               }
             }
             const dispatched = [];
+            const queuedNotes: string[] = [];
             for (let i = 0; i < tasks.length; i++) {
+              const task = tasks[i] as string;
+              if (ctxThread) {
+                const queued = await enqueueWhenOverCap({
+                  task,
+                  taskId: tasks.length === 1 ? flagStr(flags, "task-id") : undefined,
+                  title: titleFlag === undefined ? undefined : tasks.length === 1 ? titleFlag : `${titleFlag} #${i + 1}`,
+                  projectId,
+                  parentThreadId: ctxThread,
+                  shape,
+                  mode,
+                  deliveryRequirement: flagStr(flags, "delivery-requirement") as "pr" | "merged" | "merged-and-verified" | undefined,
+                });
+                if (queued) {
+                  queuedNotes.push(queued);
+                  continue;
+                }
+              }
               const crew = await dispatchCrew({
-                task: tasks[i] as string,
+                task,
                 crewId:tasks.length === 1 ? flagStr(flags,"task-id") : undefined,
                 projectId,
                 parentThreadId: ctxThread,
@@ -11157,6 +11559,7 @@ export default async function plugin(bb: BbPluginApi) {
             const failures = new Map<string, string>();
             for (const c of dispatched) if (c.status === "error") failures.set(c.id, await threadFailureDetail(c.threadId));
             const text = [
+              ...queuedNotes,
               ...dispatched.map(
                 (c) =>
                   `Dispatched ${c.shape} crew ${c.id} as thread ${c.threadId} [${c.status}] (${c.worktree ? "worktree" : "shared-env"}, ${c.posture})${dispatchStatusNote(c.status, failures.get(c.id))}${permissionLine(c.id)}\nTrack: bb firstmate crew ${c.id}`,
@@ -12046,6 +12449,9 @@ export default async function plugin(bb: BbPluginApi) {
             for (const captain of [...knownCaptainsRef]) {
               if (signal.aborted) break;
               await compactIdleCaptain(captain, signal);
+              await drainCaptainReliability(captain, signal).catch((error) => {
+                if (!signal.aborted) bb.log.warn(`captain reliability sweep ${captain}: ${String(error)}`);
+              });
             }
           }
         } catch (error) {

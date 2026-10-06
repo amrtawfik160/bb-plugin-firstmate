@@ -8,8 +8,8 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./rpc.ts";
 import {
-  captainTimelineNoiseDecision,
   isRoutineReasoningRow,
+  paneTimelineNoiseDecision,
 } from "./lib/timeline-noise.ts";
 import "./app.css";
 import { createFleetRefresh } from "./lib/fleet-refresh.ts";
@@ -176,14 +176,22 @@ export default definePluginApp((app) => {
     mount({ signal }) {
       const concealed = new Map<HTMLElement, { display: string; priority: string }>();
       let frame: number | null = null;
+      // No settings hook exists yet, so live captain rows keep the hide path.
+      const progressUi = false;
 
-      const restore = (row: HTMLElement) => {
+      const unconceal = (row: HTMLElement) => {
         const previous = concealed.get(row);
         if (previous === undefined) return;
         if (previous.display === "") row.style.removeProperty("display");
         else row.style.setProperty("display", previous.display, previous.priority);
-        row.removeAttribute("data-firstmate-timeline-noise");
         concealed.delete(row);
+      };
+
+      const restore = (row: HTMLElement) => {
+        unconceal(row);
+        if (row.hasAttribute("data-firstmate-timeline-noise")) {
+          row.removeAttribute("data-firstmate-timeline-noise");
+        }
       };
 
       const reconcile = () => {
@@ -204,16 +212,26 @@ export default definePluginApp((app) => {
             continue;
           }
           const inCaptainPane = [...captainPanes].some((pane) => pane.contains(node));
-          const genericRoutineWork = inCaptainPane && (
+          const text = node.textContent ?? "";
+          const genericExpandableWork = inCaptainPane && (
             node.querySelector(
               'button[aria-label="Show details"], button[aria-label="Hide details"]',
-            ) !== null || isRoutineReasoningRow(node.textContent ?? "")
+            ) !== null || isRoutineReasoningRow(text)
           );
-          const decision = captainTimelineNoiseDecision(
-            node.textContent ?? "",
-            genericRoutineWork,
-          );
-          if (decision !== "hide") {
+          const decision = paneTimelineNoiseDecision({
+            text,
+            inCaptainPane,
+            genericExpandableWork,
+            progressUi,
+          });
+          if (decision === "progress") {
+            unconceal(node);
+            if (node.getAttribute("data-firstmate-timeline-noise") !== "progress") {
+              node.setAttribute("data-firstmate-timeline-noise", "progress");
+            }
+            continue;
+          }
+          if (decision !== "hide" || !inCaptainPane) {
             restore(node);
             continue;
           }
@@ -255,6 +273,9 @@ export default definePluginApp((app) => {
         observer.disconnect();
         if (frame !== null) window.cancelAnimationFrame(frame);
         for (const row of [...concealed.keys()]) restore(row);
+        for (const row of document.querySelectorAll<HTMLElement>("[data-firstmate-timeline-noise]")) {
+          row.removeAttribute("data-firstmate-timeline-noise");
+        }
       };
     },
   });

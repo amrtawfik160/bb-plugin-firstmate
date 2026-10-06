@@ -547,7 +547,7 @@ export const SECRET_HYGIENE_CONTRACT = "Never print production secrets: do not r
 export const MAX_CREW_RELAUNCHES = 1;
 
 // Default ceiling on concurrently running crews per captain (0 = no cap).
-export const DEFAULT_MAX_ACTIVE_CREWS = 5;
+export const DEFAULT_MAX_ACTIVE_CREWS = 10;
 
 // Crews per fan-out dispatch and per watch batch. The default was a hard 10 while a
 // captain approved 12; a configured value is honored up to the register ceiling.
