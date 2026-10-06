@@ -19,5 +19,7 @@ jobs:
           node-version: '24.18.0'
           cache: npm
       - run: npm ci
+      # No typecheck script in package.json; call tsc directly (tsconfig.json covers server, rpc, lib).
+      - run: npx tsc --noEmit
       - run: npm test
       - run: npm run fidelity
