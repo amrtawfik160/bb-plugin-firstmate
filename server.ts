@@ -60,7 +60,7 @@ import {createNativeRuntime, runtimeRootAssign} from "./lib/native-runtime.ts";
 import { boundedCaptainStartup, captainBindingText } from "./lib/captain-startup.ts";
 import { createQueueStore, type QueueItem } from "./lib/queue-store.ts";
 import { admissionDecision, createDispatchJobs, spawnBackoffMs } from "./lib/async-dispatch.ts";
-import { createWatchdogStore, observeOutput, observeRateLimit, observeTurn, providerErrorIsRateLimit, tripWatchdog, watchdogFailText, watchdogTrip } from "./lib/crew-watchdog.ts";
+import { createWatchdogStore, observeIdleTurn, tripWatchdog, watchdogNoticeText, watchdogTrip } from "./lib/crew-watchdog.ts";
 import { createDoorbellHold, doorbellHoldDecision } from "./lib/doorbell-hold.ts";
 import { HANDOFF_WAKE_AMENDMENT, captainInstructionsWithHandoff } from "./lib/handoff-contract.ts";
 import { honestIdleVerdictPresentation, interruptIsStopped, readyClaim } from "./lib/honest-status.ts";
@@ -1550,7 +1550,7 @@ export default async function plugin(bb: BbPluginApi) {
   const launchAbort = new AbortController();
   const nativeRuntime=createNativeRuntime({assets:join(PLUGIN_ROOT,"runtime-assets"),files:()=>bb.sdk.files,disposal:launchAbort.signal,run:runStructuredOnHost});
   let followUpWork:Promise<void>|undefined;
-  bb.onDispose(async () => { launchAbort.abort();await followUpWork?.catch(()=>{}); });
+  bb.onDispose(async () => { launchAbort.abort();await Promise.allSettled([followUpWork,...dispatchWork]); });
 
   const baseSettings = bb.settings.define({
     firstmateRepo: {
@@ -4381,13 +4381,13 @@ export default async function plugin(bb: BbPluginApi) {
   async function launchCapacity(owner: string | undefined) {
     const raw = (await settings.get()).maxActiveCrews;
     const cap = Number.isFinite(raw) ? Math.max(0, Math.trunc(raw)) : DEFAULT_MAX_ACTIVE_CREWS;
-    const countUnknown = (await reliabilityFlags()).asyncDispatch !== "on";
     const mine = (await readCrews()).filter(c => c.parentThreadId === (owner ?? null) && !isSecondmateRoute(c) && !launches.isDeletedWorker(c.threadId));
     const statuses = await statusesFor(mine);
     const activeTaskIds: string[] = [];
+    // An unreadable crew may still be running, so it keeps its slot (fail closed).
     for (const c of mine) {
       const st = statuses.get(c.threadId);
-      if (st === "active" || st === "pending" || st === "starting" || (countUnknown && st === "unknown") || await isCrewWaiting(c)) activeTaskIds.push(launchTaskKey(c.projectId,c.id));
+      if (st === "active" || st === "pending" || st === "starting" || st === "unknown" || await isCrewWaiting(c)) activeTaskIds.push(launchTaskKey(c.projectId,c.id));
     }
     // Worker retention is independent of launch capacity. A forgotten running
     // worker still consumes admission capacity until core reports completion.
@@ -4399,18 +4399,41 @@ export default async function plugin(bb: BbPluginApi) {
           const thread=await raceAbort(bb.sdk.threads.get({threadId:record.threadId}),launchAbort.signal,STUCK_HOST_CALL_MS);
           if (["active","pending","starting"].includes(thread.status)) activeTaskIds.push(launchTaskKey(record.projectId,record.taskId));
         } catch {
-          if (countUnknown) activeTaskIds.push(launchTaskKey(record.projectId,record.taskId));
-          else {
-            try {
-              const retry=await raceAbort(bb.sdk.threads.get({threadId:record.threadId}),launchAbort.signal,STUCK_HOST_CALL_MS);
-              if (["active","pending","starting"].includes(retry.status)) activeTaskIds.push(launchTaskKey(record.projectId,record.taskId));
-            } catch { /* unknown after retry is not a live slot */ }
-          }
+          activeTaskIds.push(launchTaskKey(record.projectId,record.taskId));
         }
       }
       if (records.length<100) break;
     }
     return { cap, activeTaskIds };
+  }
+
+  // Background spawns are tracked apart from the per-minute follow-up pass, so a
+  // finished spawn never blocks that pass and unload waits only for live spawns.
+  const dispatchWork = new Set<Promise<void>>();
+  function trackDispatchJob(job: Promise<void>) {
+    dispatchWork.add(job);
+    void job.finally(() => dispatchWork.delete(job));
+  }
+  async function runReservedDispatch(reservedId: string, captain: string, input: Parameters<typeof dispatchCrew>[0]): Promise<void> {
+    const job = dispatchJobs.get(reservedId);
+    if (!job || job.state === "started" || job.state === "failed") return;
+    try {
+      const hold = await captainHoldState(captain);
+      const wait = spawnBackoffMs({ rateLimited: hold.hold, resetsAt: null, now: Date.now() });
+      if (wait > 0) await raceAbort(sleep(wait), launchAbort.signal);
+      dispatchJobs.save({ ...job, state: "spawning", startedAt: Date.now() });
+      await dispatchCrew(input);
+      const done = dispatchJobs.get(reservedId);
+      if (done) dispatchJobs.save({ ...done, state: "started" });
+      for (const ref of input.sourceRefs ?? []) {
+        const key = parseSourceRef(ref);
+        if (key) inboundLedger.markDelegated(key, reservedId, Date.now());
+      }
+    } catch (error) {
+      const failed = dispatchJobs.get(reservedId);
+      if (failed) dispatchJobs.save({ ...failed, state: "failed", error: String(error) });
+      bb.log.warn(`async dispatch ${reservedId}: ${String(error)}`);
+    }
   }
 
   async function enqueueWhenOverCap(input: {
@@ -4423,6 +4446,9 @@ export default async function plugin(bb: BbPluginApi) {
     mode?: string;
     deliveryRequirement?: "pr" | "merged" | "merged-and-verified";
     sourceRefs?: string[];
+    providerId?: string;
+    model?: string;
+    reasoningLevel?: string;
   }): Promise<string | null> {
     const flags = await reliabilityFlags();
     if (flags.asyncDispatch !== "on") return null;
@@ -4450,6 +4476,10 @@ export default async function plugin(bb: BbPluginApi) {
       crewId: null,
       parentThreadId: input.parentThreadId,
       createdAt: new Date().toISOString(),
+      overCap: true,
+      ...(input.providerId ? { providerId: input.providerId } : {}),
+      ...(input.model ? { model: input.model } : {}),
+      ...(input.reasoningLevel ? { reasoningLevel: input.reasoningLevel } : {}),
       ...(input.sourceRefs && input.sourceRefs.length > 0 ? { sourceRefs: input.sourceRefs } : {}),
     };
     queueStore.add(queued);
@@ -4462,32 +4492,21 @@ export default async function plugin(bb: BbPluginApi) {
     return `Queued as ${queued.id} (crew cap ${admit.cap}; will dispatch when a slot opens).`;
   }
 
+  // Drains only work that dispatch queued for lack of a slot. A captain's
+  // firstmate_queue backlog waits for an explicit queue dispatch.
   async function drainQueuedDispatches(owner?: string): Promise<void> {
     if ((await reliabilityFlags()).asyncDispatch !== "on") return;
     await queueStore.ready();
-    const items = (owner !== undefined ? queueStore.list(owner) : queueStore.list())
-      .filter((row) => row.status === "queued");
-    for (const item of items) {
-      const parent = item.parentThreadId ?? owner;
+    const all = owner !== undefined ? queueStore.list(owner) : queueStore.list();
+    const now = Date.now();
+    for (const item of all.filter((row) => row.overCap === true && row.status === "queued" && storedQueueGate(row, all, now) === null)) {
+      const parent = item.parentThreadId;
       if (!parent) continue;
       const { cap, activeTaskIds } = await launchCapacity(parent);
       const running = new Set([...activeTaskIds, ...launches.heldTaskIds(parent)]).size;
       if (cap > 0 && running >= cap) continue;
-      const brief = item.detail !== "" ? `${item.title}\n\n${item.detail}` : item.title;
       try {
-        const crew = await dispatchCrew({
-          task: brief,
-          projectId: item.projectId,
-          parentThreadId: parent,
-          title: item.title,
-          crewId: item.id,
-          worktree: resolveWorktree({ shape: item.shape }).worktree,
-          visible: true,
-          shape: item.shape,
-          mode: toMode(item.mode !== "" ? item.mode : undefined, "direct-PR"),
-          sourceRefs: item.sourceRefs,
-        });
-        queueStore.patch(item, { status: "dispatched", crewId: crew.id });
+        await inCaptainHome(parent, () => dispatchQueueItem(item, parent, { threadId: parent, projectId: item.projectId }));
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (/Crew cap reached/.test(message)) continue;
@@ -8498,6 +8517,39 @@ export default async function plugin(bb: BbPluginApi) {
   function validateQueueText(title:string,detail:string) {
     if (title.length > 500 || detail.length > MAX_TASK || (detail ? `${title}\n\n${detail}` : title).length > MAX_TASK) throw new Error(`Queue text exceeds limits (title 500, full task ${MAX_TASK} characters); nothing truncated or filed.`);
   }
+  async function dispatchQueueItem(item: QueueItem, captain: string | undefined, ctx: unknown, overrides: { providerId?: string; model?: string; reasoningLevel?: string } = {}): Promise<Crew> {
+    const registry = item.shape==="ship" ? await intakePosture(item.projectId,ctx,item.mode ? modeSchema.parse(item.mode) : undefined) : await postureOf(item.projectId);
+    const current = await settings.get();
+    const brief = item.detail !== "" ? `${item.title}\n\n${item.detail}` : item.title;
+    if (brief.length > MAX_TASK) throw new Error(`Queue task ${item.id} exceeds ${MAX_TASK} characters; full record retained, dispatch refused.`);
+    const crew = await dispatchCrew({
+      task: brief,
+      projectId: item.projectId,
+      parentThreadId: captain,
+      title: item.title,
+      crewId: item.id,
+      providerId: overrides.providerId ?? item.providerId ?? (current.defaultProvider !== "" ? current.defaultProvider : undefined),
+      model: overrides.model ?? item.model,
+      reasoningLevel: toReasoningLevel(overrides.reasoningLevel ?? item.reasoningLevel),
+      deliveryRequirement:item.deliveryRequirement,
+      permissionMode: toPermissionMode(current.defaultPermissionMode),
+      worktree: resolveWorktree({ shape: item.shape }).worktree,
+      visible: true,
+      shape: item.shape,
+      mode: toMode(item.mode !== "" ? item.mode : undefined, registry.mode),yolo:registry.yolo,
+      sourceRefs: item.sourceRefs,
+    });
+    item.status = "dispatched";
+    item.crewId = crew.id;
+    // Real transport spawns through fm-spawn.sh, which performs the queued→In-flight
+    // start itself (it owns the crew.id row once its endpoint exists). Starting again
+    // here would double-transition, so only start when the plugin owns the transition
+    // (native transport, or real fell back to native). Over-cap items have no native row.
+    if (current.transport !== "real" && item.overCap !== true) await projectQueueTransition(item, "start");
+    queueStore.patch(item, {status:item.status,crewId:item.crewId});
+    await publishFleet();
+    return crew;
+  }
   function storedQueueGate(item:QueueItem,all:QueueItem[],now:number) {
     if (item.nativePending) return "native publication unresolved; run queue reconcile with the exact id";
     return queueGate(item,all.filter(row=>row.projectId===item.projectId && (row.parentThreadId??null)===(item.parentThreadId??null)),now);
@@ -9627,20 +9679,44 @@ export default async function plugin(bb: BbPluginApi) {
         projectId ?? (typeof ctxRecord["projectId"] === "string" ? ctxRecord["projectId"] : undefined);
       if (resolvedProject === undefined) return toolError("No project: pass projectId.");
       const parentThreadId = typeof ctxRecord["threadId"] === "string" ? ctxRecord["threadId"] : undefined;
-      const flags = await reliabilityFlags();
-      if (flags.asyncDispatch === "on" && parentThreadId) {
+      if (overrideOwner !== true) {
+        const conflict = await dispatchPrConflict(task, resolvedProject, parentThreadId);
+        if (conflict !== null) return toolError(conflict);
+      }
+      const background = (await reliabilityFlags()).asyncDispatch === "on" && parentThreadId !== undefined;
+      if (background) {
         const queued = await enqueueWhenOverCap({
-          task,
-          taskId,
-          title,
-          projectId: resolvedProject,
-          parentThreadId,
-          shape,
-          mode,
-          deliveryRequirement,
-          sourceRefs,
+          task, taskId, title, projectId: resolvedProject, parentThreadId, shape, mode, deliveryRequirement, sourceRefs,
+          providerId, model, reasoningLevel,
         });
         if (queued) return queued;
+      }
+      const current = await settings.get();
+      const resolvedShape = shape ?? "ship";
+      const posture = resolvedShape==="ship" ? await intakePosture(resolvedProject,ctx,mode) : await postureOf(resolvedProject);
+      const wt = resolveWorktree({
+        shape: resolvedShape,
+        sharedEnv: sharedEnv === true,
+        worktreeFlag: worktree === true,
+        explicit: worktree,
+      });
+      const spawnInput = {
+        task, crewId: taskId,
+        projectId: resolvedProject,
+        parentThreadId,
+        sourceRefs,
+        title,
+        providerId: providerId ?? (current.defaultProvider !== "" ? current.defaultProvider : undefined),
+        model,
+        reasoningLevel: toReasoningLevel(reasoningLevel),
+        permissionMode: toPermissionMode(permissionMode ?? current.defaultPermissionMode),
+        worktree: wt.worktree,
+        visible: visible !== false,
+        shape: resolvedShape,
+        mode: toMode(mode, posture.mode), yolo: posture.yolo,
+        sendAt, deliveryRequirement,
+      };
+      if (background) {
         const reservedId = taskId ?? randomUUID().slice(0, 8);
         dispatchJobs.save({
           crewId: reservedId,
@@ -9652,69 +9728,12 @@ export default async function plugin(bb: BbPluginApi) {
           error: null,
           backoffUntil: null,
         });
-        const spawnInput = {
-          task, crewId: reservedId, projectId: resolvedProject, parentThreadId, title, sourceRefs,
-          providerId, model, reasoningLevel: toReasoningLevel(reasoningLevel),
-          permissionMode: toPermissionMode(permissionMode ?? (await settings.get()).defaultPermissionMode),
-          worktree: worktree === true, visible: visible !== false, shape: shape ?? "ship",
-          mode: toMode(mode, "direct-PR"), sendAt, deliveryRequirement,
-          signal: ctxRecord["signal"] as AbortSignal | undefined,
-        };
-        followUpWork = (followUpWork ?? Promise.resolve()).then(async () => {
-          const job = dispatchJobs.get(reservedId);
-          if (!job || job.state === "started" || job.state === "failed") return;
-          const hold = await captainHoldState(parentThreadId);
-          const wait = spawnBackoffMs({ rateLimited: hold.hold, resetsAt: null, now: Date.now() });
-          if (wait > 0) await sleep(wait);
-          dispatchJobs.save({ ...job, state: "spawning", startedAt: Date.now() });
-          try {
-            await dispatchCrew(spawnInput);
-            const done = dispatchJobs.get(reservedId);
-            if (done) dispatchJobs.save({ ...done, state: "started" });
-            for (const ref of sourceRefs ?? []) {
-              const parts = ref.split(":");
-              if (parts.length >= 3) inboundLedger.markDelegated({ source: parts[0] === "tg" ? "telegram" : "bb", chatId: parts[1]!, messageId: parts.slice(2).join(":") }, reservedId, Date.now());
-            }
-          } catch (error) {
-            const failed = dispatchJobs.get(reservedId);
-            if (failed) dispatchJobs.save({ ...failed, state: "failed", error: String(error) });
-            bb.log.warn(`async dispatch ${reservedId}: ${String(error)}`);
-          }
-        });
+        trackDispatchJob(runReservedDispatch(reservedId, parentThreadId, { ...spawnInput, crewId: reservedId, signal: launchAbort.signal }));
         return `Reserved crew ${reservedId}. Spawn continues in the background.`;
       }
-
-      if (overrideOwner !== true) {
-        const conflict = await dispatchPrConflict(task, resolvedProject, parentThreadId);
-        if (conflict !== null) return toolError(conflict);
-      }
-      const current = await settings.get();
-      const resolvedShape = shape ?? "ship";
-      const posture = resolvedShape==="ship" ? await intakePosture(resolvedProject,ctx,mode) : await postureOf(resolvedProject);
-      const wt = resolveWorktree({
-        shape: resolvedShape,
-        sharedEnv: sharedEnv === true,
-        worktreeFlag: worktree === true,
-        explicit: worktree,
-      });
       let crew: Crew;
       try {
-        crew = await dispatchCrew({
-          task,crewId:taskId,
-          projectId: resolvedProject,
-          parentThreadId: typeof ctxRecord["threadId"] === "string" ? ctxRecord["threadId"] : undefined,
-          sourceRefs,
-          title,
-          providerId: providerId ?? (current.defaultProvider !== "" ? current.defaultProvider : undefined),
-          model,
-          reasoningLevel: toReasoningLevel(reasoningLevel),
-          permissionMode: toPermissionMode(permissionMode ?? current.defaultPermissionMode),
-          worktree: wt.worktree,
-          visible: visible !== false,
-          shape: resolvedShape,
-          mode: toMode(mode, posture.mode),yolo:posture.yolo,
-          sendAt,deliveryRequirement,signal:ctxRecord["signal"] as AbortSignal | undefined,
-        });
+        crew = await dispatchCrew({ ...spawnInput, signal: ctxRecord["signal"] as AbortSignal | undefined });
       } catch (error) {
         return toolError(`Dispatch failed: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -10316,40 +10335,12 @@ export default async function plugin(bb: BbPluginApi) {
       if (gate !== null) return toolError(`Item ${queueId} gated: ${gate}.`);
       // Queue dispatch starts a crew like any dispatch, so the same cap applies.
 
-      const registry = item.shape==="ship" ? await intakePosture(item.projectId,ctx,item.mode ? modeSchema.parse(item.mode) : undefined) : await postureOf(item.projectId);
-      const current = await settings.get();
-      const brief = item.detail !== "" ? `${item.title}\n\n${item.detail}` : item.title;
-      if (brief.length > MAX_TASK) throw new Error(`Queue task ${item.id} exceeds ${MAX_TASK} characters; full record retained, dispatch refused.`);
       let crew: Crew;
       try {
-        crew = await dispatchCrew({
-          task: brief,
-          projectId: item.projectId,
-          parentThreadId: captain,
-          title: item.title,
-          crewId: item.id,
-          providerId: providerId ?? item.providerId ?? (current.defaultProvider !== "" ? current.defaultProvider : undefined),
-          model: model ?? item.model,
-          reasoningLevel: toReasoningLevel(reasoningLevel ?? item.reasoningLevel),
-          deliveryRequirement:item.deliveryRequirement,
-          permissionMode: toPermissionMode(current.defaultPermissionMode),
-          worktree: resolveWorktree({ shape: item.shape }).worktree,
-          visible: true,
-          shape: item.shape,
-          mode: toMode(item.mode !== "" ? item.mode : undefined, registry.mode),yolo:registry.yolo,
-        });
+        crew = await dispatchQueueItem(item, captain, ctx, { providerId, model, reasoningLevel });
       } catch (error) {
         return toolError(`Queue dispatch ${queueId} failed: ${error instanceof Error ? error.message : String(error)}`);
       }
-      item.status = "dispatched";
-      item.crewId = crew.id;
-      // Real transport spawns through fm-spawn.sh, which performs the queued→In-flight
-      // start itself (it owns the crew.id row once its endpoint exists). Starting again
-      // here would double-transition, so only start when the plugin owns the transition
-      // (native transport, or real fell back to native).
-      if (current.transport !== "real") await projectQueueTransition(item, "start");
-      queueStore.patch(item, {status:item.status,crewId:item.crewId});
-      await publishFleet();
       const status = await crewStatus(crew);
       const failure = status === "error" ? await threadFailureDetail(crew.threadId) : "";
       return `Dispatched ${adopted ? "native backlog row" : "queue"} ${queueId} as ${crew.shape} crew ${crew.id} (${status}).${dispatchStatusNote(status, failure)}${permissionLine(crew.id)}`;
@@ -10960,25 +10951,20 @@ export default async function plugin(bb: BbPluginApi) {
     lastAssistantText: string | null,
   ): Promise<void> {
     if (isSecondmateRoute(crew)) return;
-    if ((await reliabilityFlags()).honestStatus === "on") {
-      let state = crewWatchdog.loadOrCreate(crew.id, crew.threadId, Date.parse(crew.createdAt) || Date.now());
-      state = observeTurn(state);
-      if (lastAssistantText) state = observeOutput(state, lastAssistantText);
-      const reason = watchdogTrip(state, Date.now());
-      if (reason !== null) {
-        state = tripWatchdog(state, Date.now(), lastAssistantText ?? "");
-        crewWatchdog.save(state);
-        await notifyCaptain(crew, "error", watchdogFailText(state));
-        if (crew.parentThreadId) await drainQueuedDispatches(crew.parentThreadId);
-        return;
-      }
-      crewWatchdog.save(state);
-    }
     await discoverCrewDelivery(crew).catch(error => bb.log.warn(`PR discovery ${crew.id}: ${String(error)}`));
     const stopped = await turnWasStopped(thread);
     // BB already reports interruptions to the parent. A completion wake here can
     // cause the manager to resume work the user just stopped.
     if (stopped) return;
+    if ((await reliabilityFlags()).honestStatus === "on") {
+      // Reports once per stuck stretch and never stops the crew; normal idle handling continues.
+      const before = crewWatchdog.loadOrCreate(crew.id, crew.threadId, Date.parse(crew.createdAt) || Date.now());
+      let state = observeIdleTurn(before, lastAssistantText);
+      const notify = state.trippedAt === null && watchdogTrip(state, Date.now()) !== null;
+      if (notify) state = tripWatchdog(state, Date.now(), lastAssistantText ?? "");
+      crewWatchdog.save(state);
+      if (notify) await notifyCaptain(crew, "needs-decision", watchdogNoticeText(state));
+    }
     if (await isNativeWorker(crew)) {
       await dropNudge(crew.id);
       if (await clearWaiting(crew.id)) await dropResumeRows(crew, "all");
@@ -11184,8 +11170,8 @@ export default async function plugin(bb: BbPluginApi) {
           targetIsCaptain: true,
           flagOn: true,
         }) === "hold") {
+          // BB keeps the held message and re-delivers it on recheck; a stored copy would arrive twice.
           heldPingCaptains.add(threadId);
-          doorbellHold.enqueue({ captainThreadId: threadId, text, crewId: sender, urgent: false, createdAt: Date.now() });
           return { action: "wait", reason: "Crew doorbell held until the captain turn ends." };
         }
         const decision = crewPingHoldDecision({
@@ -11570,6 +11556,9 @@ export default async function plugin(bb: BbPluginApi) {
                   shape,
                   mode,
                   deliveryRequirement: flagStr(flags, "delivery-requirement") as "pr" | "merged" | "merged-and-verified" | undefined,
+                  providerId: flagStr(flags, "provider"),
+                  model: flagStr(flags, "model"),
+                  reasoningLevel: flagStr(flags, "reasoning-level"),
                 });
                 if (queued) {
                   queuedNotes.push(queued);
