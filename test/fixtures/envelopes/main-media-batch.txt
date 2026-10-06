@@ -1,0 +1,13 @@
+The following is an owner message from the private Telegram connector.
+correlation: tgref:inb_1
+binding: 3
+telegram_user_id: 99
+telegram_chat_id: 200
+telegram_message_id: 1669
+telegram_message_ids: 1669,1670,1671
+telegram_items: 1669=text 1670=photo>1669 1671=photo>1669
+telegram_media_group_id: mg_7
+reply_target: none
+project: {"name":"firstmate","projectId":"proj_fm","captainThreadId":"thr_cap"}
+
+Look at these

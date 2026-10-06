@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   coalesceBatches,
@@ -95,4 +96,51 @@ test("media, forwards, and uncaptioned photos attach to the preceding text", () 
   ]);
   assert.equal(batches.length, 1);
   assert.deepEqual(batches[0]!.map((row) => row.messageId), ["10", "11", "12"]);
+});
+
+const fixture = (name: string) => readFileSync(new URL(`../test/fixtures/envelopes/${name}.txt`, import.meta.url), "utf8");
+
+test("connector fixtures from both Telegram plugin versions parse to their owner message", () => {
+  const cases: Array<[string, string, string]> = [
+    ["main-owner", "1669", "Fix the login bug"],
+    ["main-media-batch", "1669", "Look at these"],
+    ["live-owner", "1669", "Status?"],
+    ["live-reply", "1669", "Roll it back"],
+    ["live-forwarded", "1669", "Forwarded: server is down"],
+  ];
+  for (const [name, messageId, body] of cases) {
+    const parsed = parseConnectorHeader(fixture(name));
+    assert.ok(parsed, `${name} must parse`);
+    assert.equal(parsed.chatId, "200", name);
+    assert.equal(parsed.messageId, messageId, name);
+    assert.equal(parsed.correlation, "tgref:inb_1", name);
+    assert.equal(parsed.body, body, name);
+  }
+});
+
+test("the forwarded-message banner is a connector header and marks the item forwarded", () => {
+  const parsed = parseInboundTelegram(fixture("live-forwarded"));
+  assert.ok(parsed);
+  assert.equal(parsed.forwarded, true);
+  assert.equal(stripTelegramEnvelope(fixture("live-forwarded")), "Forwarded: server is down");
+});
+
+test("reply_target JSON keeps the replied-to Telegram message id", () => {
+  const parsed = parseConnectorHeader(fixture("live-reply"));
+  assert.ok(parsed);
+  assert.equal(parsed.replyTo, "1650");
+  assert.deepEqual(parsed.repliedTo, { telegramMessageId: "1650", originalText: "Deploy done" });
+  assert.deepEqual(parsed.project, { name: "firstmate", projectId: "proj_fm", captainThreadId: "thr_cap" });
+});
+
+test("replied_to_message supplies the reply target when connector history has none", () => {
+  const text = fixture("live-reply").replace(/^reply_target: .*$/m, "reply_target: none");
+  assert.equal(parseConnectorHeader(text)?.replyTo, "1650");
+});
+
+test("a header with no reply or project keeps both empty", () => {
+  const parsed = parseConnectorHeader(fixture("live-owner"));
+  assert.equal(parsed?.replyTo, null);
+  assert.equal(parsed?.repliedTo, null);
+  assert.equal(parsed?.project, null);
 });

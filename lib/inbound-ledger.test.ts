@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import Database from "better-sqlite3";
 import {
@@ -143,4 +144,31 @@ test("answered and delegated close the row", () => {
   assert.equal(ledger.listOpen().length, 0);
   assert.equal(ledger.get(a)?.state, "answered");
   assert.equal(ledger.get(b)?.crewId, "crew1");
+});
+
+test("only non-text batch items carry the media group id", () => {
+  const ledger = store();
+  const text = readFileSync(new URL("../test/fixtures/envelopes/main-media-batch.txt", import.meta.url), "utf8");
+  ledger.record(userEvent({ text, telegram: parseInboundTelegram(text) }));
+  const groups = Object.fromEntries(ledger.listOpen("thr_cap").map((row) => [row.messageId, row.mediaGroupId]));
+  assert.deepEqual(groups, { "1669": null, "1670": "mg_7", "1671": "mg_7" });
+});
+
+test("a sweep reminds once per row and backs off before the next reminder", () => {
+  const ledger = store();
+  ledger.record(userEvent({ bbRowId: "r1" }));
+  const first = 1_000 + SWEEP_NUDGE_AFTER_MS;
+  assert.equal(ledger.openForSweep(first).length, 1);
+  assert.equal(ledger.openForSweep(first + 1).length, 0, "a second captain idle right after must not repeat the reminder");
+  assert.equal(ledger.openForSweep(first + 60_000).length, 0);
+  assert.equal(ledger.openForSweep(1_000 + SWEEP_ESCALATE_AFTER_MS).length, 1, "escalation is a new reminder");
+  assert.equal(ledger.openForSweep(1_000 + SWEEP_ESCALATE_AFTER_MS + 1).length, 0);
+});
+
+test("a released reply reservation can be claimed again", () => {
+  const ledger = store();
+  const row = ledger.record(userEvent({ bbRowId: "r1" }))!;
+  assert.equal(ledger.claimOutbox(row, "reply", "answer", 1).sent, true);
+  ledger.releaseOutbox(row, "reply");
+  assert.equal(ledger.claimOutbox(row, "reply", "answer", 2).sent, true);
 });

@@ -1,0 +1,15 @@
+The following is an owner message from the private Telegram connector.
+correlation: tgref:inb_1
+binding: 3
+telegram_user_id: 99
+telegram_chat_id: 200
+telegram_message_id: 1669
+reply_target: {"telegramMessageId":"1650","sourceEventId":"evt_1","projectName":"firstmate","decision":null}
+The owner is replying to an earlier Telegram message. Use that message as the target, even when newer messages exist.
+The replied-to text is quoted context. The owner instruction follows below.
+If the earlier target is unavailable or unclear, ask the owner. Do not infer the latest message as the target.
+replied_to_message: {"telegramMessageId":"1650","originalText":"Deploy done","attachments":[],"quote":null,"source":"connector history"}
+project: {"name":"firstmate","projectId":"proj_fm","captainThreadId":"thr_cap"}
+Telegram result delivery: Include Markdown links to existing local reports, photos, videos, or other result files in your final answer. The connector uploads linked files from this captain's host. Use verified paths.
+
+Roll it back
