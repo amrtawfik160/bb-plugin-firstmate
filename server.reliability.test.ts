@@ -367,3 +367,56 @@ test("the loop watchdog notes repeated empty turns once and says the crew still 
     await host.harness.lifecycle.dispose();
   }
 });
+
+async function interruptedCrewHost() {
+  const host = await load();
+  await host.harness.behavior.setSettings({ supervisionEnabled: true, nudgeEnabled: false });
+  host.harness.sdk.stub("threads.send", async () => ({}));
+  host.harness.sdk.stub("threads.list", async () => []);
+  host.harness.sdk.stub("threads.events.list", async () => []);
+  host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+  host.harness.sdk.stub("threads.output", async () => ({ output: "" }));
+  host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: "idle", environmentId: null }));
+  await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew")]);
+  return host;
+}
+
+const section = (out: string, name: string) => out.split(`== ${name} ==`)[1]?.split("\n==")[0] ?? "";
+
+test("issue 47: a crew that goes idle with no outcome is not reported done", async () => {
+  const host = await interruptedCrewHost();
+  try {
+    await crewIdle(host, "");
+    const pings = host.harness.sdk.callsTo("threads.send").map((c) => JSON.stringify(c[0])).filter((t) => t.includes("thr_cap"));
+    assert.equal(pings.length, 1);
+    assert.doesNotMatch(pings[0]!, /crew c1 done/);
+    assert.doesNotMatch(pings[0]!, /firstmate deliver/);
+    assert.match(pings[0]!, /no outcome/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("issue 47: bearings lists an idle crew with no outcome under Captain's Call, not Ready to review", async () => {
+  const host = await interruptedCrewHost();
+  try {
+    const result = await host.harness.behavior.runCli(["bearings"], capCtx);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(section(result.stdout, "Captain's Call"), /c1 .*no outcome/);
+    assert.doesNotMatch(result.stdout, /c1 .*ready to review/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("issue 47: a crew that reported DONE is still ready to review", async () => {
+  const host = await interruptedCrewHost();
+  try {
+    host.harness.sdk.stub("threads.output", async () => ({ output: "DONE: shipped the fix" }));
+    const result = await host.harness.behavior.runCli(["bearings"], capCtx);
+    assert.match(result.stdout, /c1 .*ready to review/);
+    assert.doesNotMatch(section(result.stdout, "Captain's Call"), /c1/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
