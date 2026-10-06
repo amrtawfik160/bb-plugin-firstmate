@@ -49,7 +49,7 @@ import {
   type Verdict,
 } from "./lib/policy.ts";
 import { parseWakeReceipt, renderWakeReceipt, type WakeReceipt } from "./lib/wake-receipt.ts";
-import { readBbActivity } from "./lib/bb-activity.ts";
+import { BB_ACTIVITY_TYPES, readBbActivity } from "./lib/bb-activity.ts";
 import { ORPHAN_SWEEP_BUDGET_MS, ORPHAN_SWEEP_INTERVAL_MS, parseStaleLavishSources, staleLavishSourceScript } from "./lib/orphan-decisions.ts";
 import { nativeBearingsProjection } from "./lib/native-bearings.ts";
 import { createSnapshotReads } from "./lib/snapshot-reads.ts";
@@ -288,18 +288,6 @@ const CAPTAIN_LIVE_WINDOW_MS = 24 * 60 * 60_000;
 const READ_THROUGH_GRACE_MS = 15 * 60_000;
 // Row cap for a text crew listing, so `crews all=true` never floods the context.
 const MAX_CREW_LIST_ROWS = 40;
-// Newest of these is "tool/file activity". Output text alone false-alarms while a crew is editing.
-const TOOL_ACTIVITY_TYPES = [
-  "item/toolCall/progress",
-  "item/mcpToolCall/progress",
-  "item/commandExecution/outputDelta",
-  "item/fileChange/outputDelta",
-  "item/backgroundTask/progress",
-  "item/backgroundTask/completed",
-  "item/delegation/progress",
-  "item/delegation/completed",
-  "turn/diff/updated",
-] as const;
 const MAX_QUEUE = 100;
 const MAX_DECISIONS = 100;
 const MAX_DONE = 10;
@@ -1121,6 +1109,7 @@ export const OVERLAY_INSTALL_INPUTS = [
   "bin/fm-worker-rebind.sh",
   "bin/fm-worker-rebind.py",
   "bin/fm-bb-probe-lib.sh",
+  "bin/fm-worker-checkpoint.py",
   "docs/bb-backend.md",
   "firstmate-bb-backend.patch",
   "firstmate-bb-teardown.patch",
@@ -3266,8 +3255,10 @@ export default async function plugin(bb: BbPluginApi) {
     // Headed task text supplies its own spec section; never nest it under the template's.
     const sections = briefSections(task.trim());
     const intentB64 = Buffer.from(normalizeCaptainIntent(sections.intent).slice(0, 3000), "utf8").toString("base64");
-    // Only a spec the captain's own text supplied travels separately; otherwise the
-    // fixed default below fills {FIRSTMATE_SPEC} (no plugin-synthesized judgement).
+    const defaultSpec = crew.shape === "scout"
+      ? "Investigate the captain's intent within its stated scope. Deliver a written report with commands, outcomes, revision, limits, and recommendations. Distinguish observed behavior from inference; follow the report-only completion contract."
+      : "Implement the captain's intent above exactly; do not widen scope. Small diff, own branch, deliver per the mode contract, then report DONE/BLOCKED/FAILED.";
+    // Captain-authored specifications retain precedence over the role default.
     const specEnv = sections.spec === null
       ? ""
       : `FM_TASK_OWN_SPEC=${Buffer.from(sections.spec.slice(0, 3000), "utf8").toString("base64")} `;
@@ -3280,7 +3271,7 @@ export default async function plugin(bb: BbPluginApi) {
     const py =
       "import base64,os,sys;p=sys.argv[1];" +
       'intent=base64.b64decode(os.environ["FM_INTENT"]).decode();' +
-      'spec=base64.b64decode(os.environ["FM_TASK_OWN_SPEC"]).decode() if "FM_TASK_OWN_SPEC" in os.environ else "Implement the captain\'s intent above exactly; do not widen scope. Small diff, own branch, deliver per the mode contract, then report DONE/BLOCKED/FAILED.";' +
+      'spec=base64.b64decode(os.environ["FM_TASK_OWN_SPEC"]).decode() if "FM_TASK_OWN_SPEC" in os.environ else ' + JSON.stringify(defaultSpec) + ';' +
       "s=open(p).read();s=s.replace('{TASK}',intent).replace('{FIRSTMATE_SPEC}',spec);" +
       "open(p,'w').write(s)";
     const script = [
@@ -8492,7 +8483,7 @@ export default async function plugin(bb: BbPluginApi) {
           threadId,
           order: "desc",
           limit: "1",
-          types: TOOL_ACTIVITY_TYPES,
+          types: BB_ACTIVITY_TYPES,
         }),
         signal,
         STUCK_HOST_CALL_MS,

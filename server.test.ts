@@ -1094,6 +1094,32 @@ async function runStuckOnce(
   return meta;
 }
 
+test("completed worker tools prevent false inactivity alerts without output deltas", async () => {
+  const host = await load();
+  try {
+    stubBusyCrew(host);
+    const now = Date.now();
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew", "thr_cap")]);
+    await host.bb.storage.kv.set("watch", {
+      c1: { status: "active", hash: "same", at: now - 50 * 60_000, stuck: false },
+    });
+    const events = [
+      { seq: 1, type: "item/commandExecution/outputDelta", createdAt: now - 50 * 60_000 },
+      { seq: 2, type: "item/completed", createdAt: now - 1000, data: { item: { type: "toolCall" } } },
+      { seq: 3, type: "thread/tokenUsage/updated", createdAt: now },
+    ];
+    host.harness.sdk.stub("threads.events.list", async (args: { types: string[] }) =>
+      events.filter(event => args.types.includes(event.type)).slice(-1));
+    assert.equal((await runStuckOnce(host)).notified, 0);
+    assert.equal(sendCalls(host).length, 0);
+    const watch = await host.bb.storage.kv.get<Record<string, { activityAt: number }>>("watch");
+    assert.equal(watch?.["c1"]?.activityAt, now - 1000);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("stale output with fresh tool activity does not page", async () => {
   const host = await load();
   try {
@@ -9633,6 +9659,21 @@ test("real dispatch of headed task text fills intent and spec from the task's ow
     assert.equal(b64("FM_TASK_OWN_SPEC"), "Touch only auth.ts.");
     const add = seen.find((c) => c.includes("fm-tasks-axi.sh") && c.includes("'add'"))!;
     assert.ok(add.includes("fix the login redirect"), add);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("report-only dispatch fills an investigation specification without implementation boilerplate", async () => {
+  const host = realHost();
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRealTransportBacklog(host, { threadIdAfterSpawn: "thr_real" });
+    const result = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--shape", "scout", "--", "Investigate missing Telegram delivery and report evidence."], { projectId: "proj_1" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    const fill = seen.find((command) => command.includes("FM_INTENT="))!;
+    assert.doesNotMatch(fill, /Implement the captain|Small diff, own branch/);
+    assert.match(fill, /written report/);
   } finally {
     await host.harness.lifecycle.dispose();
   }

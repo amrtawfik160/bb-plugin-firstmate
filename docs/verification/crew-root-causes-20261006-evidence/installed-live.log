@@ -1,0 +1,22 @@
+✔ setup requires complete, unchanged instruction reads including CRLF and added project guides (608.40174ms)
+✔ no-mistakes setup executes doctor and initializes only an uninitialized repository (244.463287ms)
+✔ report writes native status and factual worktree report together while retaining notes (258.194883ms)
+✔ background validation records paused before execution and resolves its exact wait key with durable evidence (1412.808524ms)
+✔ validation reports failure and resolves waits when command startup fails (343.597759ms)
+✔ validation refuses a stale result after staged work changes (1439.196173ms)
+✔ validation refuses a stale result after unstaged work changes (1409.999201ms)
+✔ validation refuses a stale result after untracked work changes (1455.482687ms)
+✔ task ownership rejects another worktree, thread and symlinked artifact namespace (203.057436ms)
+✔ first reporting migration preserves the prior authored report and allows setup failures to be reported (191.439696ms)
+✔ setup cannot substitute a lighter delivery mode for the native task mode (69.951599ms)
+✔ a validation unit that ends without a receipt becomes a failed check and closes its wait (400.050988ms)
+✔ a failed progress write cannot publish terminal completion (186.868216ms)
+✔ native zero-turn waiting uses foreground checks and refuses background polling (275.503541ms)
+ℹ tests 14
+ℹ suites 0
+ℹ pass 14
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 8560.762998

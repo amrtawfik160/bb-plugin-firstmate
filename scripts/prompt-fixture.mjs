@@ -14,7 +14,7 @@ export function fixture(pin=pins[1]) {
  mkdirSync(join(home,'config'),{recursive:true});mkdirSync(join(home,'state'),{recursive:true});mkdirSync(join(home,'bin-bb/backends'),{recursive:true});
  for(const entry of readdirSync(join(home,'bin'))) if(entry!=='backends') symlinkSync(join(home,'bin',entry),join(home,'bin-bb',entry));
  for(const entry of ['bb.sh','bb-worker-prompt.py','bb-worker-transport.txt']) cpSync(join(overlay,'bin/backends',entry),join(home,'bin-bb/backends',entry));
- for(const entry of ['fm-inbox-take.sh','fm-inbox-take.py','fm-launch-adopt.sh','fm-launch-adopt.py','fm-worker-rebind.sh','fm-worker-rebind.py','fm-bb-probe-lib.sh']) cpSync(join(overlay,'bin',entry),join(home,'bin-bb',entry));
+ for(const entry of ['fm-inbox-take.sh','fm-inbox-take.py','fm-launch-adopt.sh','fm-launch-adopt.py','fm-worker-rebind.sh','fm-worker-rebind.py','fm-bb-probe-lib.sh','fm-worker-checkpoint.py']) cpSync(join(overlay,'bin',entry),join(home,'bin-bb',entry));
  writeFileSync(join(home,'config/bb-overlay'),'bb\n');
  return home;
 }
