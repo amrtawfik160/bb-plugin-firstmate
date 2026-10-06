@@ -9,11 +9,19 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
-  createFakePluginHost,
+  createFakePluginHost as sdkFakePluginHost,
   makePluginAgentConfigurationContext,
   makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
 import {createQueueStore} from "./lib/queue-store.ts";
+// Public invocation now reads authoritative caller role before any mutation.
+// Older cases exercised no role lookup; give them an explicit ordinary caller,
+// while role-specific fixtures override this stub with exact thread identities.
+function createFakePluginHost(...args: Parameters<typeof sdkFakePluginHost>) {
+  const host=sdkFakePluginHost(...args);
+  host.harness.sdk.stub("threads.getPluginMetadata",async()=>({}));
+  return host;
+}
 async function durableQueue(host: ReturnType<typeof createFakePluginHost>) { const queue=createQueueStore(host.bb.storage.database(),()=>host.bb.storage.kv.get("queue"));await queue.ready();return queue.list(); }
 import plugin, {
   OVERLAY_INSTALL_INPUTS,
@@ -167,8 +175,8 @@ test("captain metadata loads the full skill set", async () => {
     assert.match(cfg.instructions ?? "", /lavish-axi/);
     assert.deepEqual(
       cfg.tools.map((tool) => tool.name).sort(),
-      host.harness.inspection.registrations.agentTools.map((tool) => tool.name).sort(),
-      "captain sessions must expose every registered firstmate tool",
+      host.harness.inspection.registrations.agentTools.filter((tool) => tool.name !== "firstmate_methods").map((tool) => tool.name).sort(),
+      "native-default captain sessions expose every native tool; installation-selected methods stay off",
     );
     assert.match(cfg.instructions ?? "", /complete native supervisor contract/);
     assert.doesNotMatch(cfg.instructions ?? "", /Do not narrate tool calls|Never do crew work|Never merge/);
@@ -3883,6 +3891,7 @@ function stubRealTransportHost(
   host.harness.sdk.stub("terminals.close", async () => ({}));
   host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
     const cmd = cmds.get(args.terminalId) ?? "";
+    if (cmd.includes("fm-dispatch-resolve.sh")) return hostRcPayload("dispatch-resolve: off (fixture)\n", 0);
     if (cmd.includes("fm-spawn.sh")) {
       spawned = true;
       return hostRcPayload("", opts.spawnExit);
@@ -3955,7 +3964,7 @@ test("real transport runs one fm-spawn at a time per home, so a slow spawn does 
       const id = `term_${++n}`;
       const cmd = args.start?.command ?? "";
       cmds.set(id, cmd);
-      if (cmd.includes("fm-spawn.sh")) {
+    if (cmd.includes("fm-spawn.sh")) {
         firstSpawn ??= id;
         inFlight++;
         maxInFlight = Math.max(maxInFlight, inFlight);
@@ -3964,7 +3973,8 @@ test("real transport runs one fm-spawn at a time per home, so a slow spawn does 
     });
     host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
       const cmd = cmds.get(args.terminalId) ?? "";
-      if (cmd.includes("fm-spawn.sh")) {
+      if (cmd.includes("fm-dispatch-resolve.sh")) return hostRcPayload("dispatch-resolve: off (fixture)\n", 0);
+    if (cmd.includes("fm-spawn.sh")) {
         if (args.terminalId === firstSpawn && !releaseFirst) return { chunks: [], nextSeq: 0 };
         if (!spawnDone.has(args.terminalId)) { spawnDone.add(args.terminalId); inFlight--; }
         return hostRcPayload("", 0);
@@ -4098,6 +4108,7 @@ function stubRaceHost(
   host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
     const cmd = cmds.get(args.terminalId) ?? "";
     if (cmd.includes(".status") && cmd.includes("cat --")) return hostRcPayload(opts.output.toLowerCase(), 0);
+    if (cmd.includes("fm-dispatch-resolve.sh")) return hostRcPayload("dispatch-resolve: off (fixture)\n", 0);
     if (cmd.includes("fm-spawn.sh")) {
       spawned = true;
       return hostRcPayload("", 0);
@@ -4248,6 +4259,8 @@ function stubRealTransportBacklog(
     spawnOutput?: string;
     threadIdAfterSpawn?: string;
     orphan?: boolean;
+    resolveOutput?:string;
+    resolveExit?:number;
   },
 ) {
   host.harness.sdk.stub("threadSections.list", async () => []);
@@ -4281,6 +4294,7 @@ function stubRealTransportBacklog(
   host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
     const cmd = cmds.get(args.terminalId) ?? "";
     if (cmd.includes("fm-tasks-axi.sh") && cmd.includes("'add'")) return hostRcPayload("", opts.addExit ?? 0);
+    if (cmd.includes("fm-dispatch-resolve.sh")) return hostRcPayload(opts.resolveOutput ?? "dispatch-resolve: off (fixture)\n", opts.resolveExit ?? 0);
     if (cmd.includes("fm-spawn.sh")) {
       spawned = true;
       return hostRcPayload(opts.spawnOutput ?? "", opts.spawnExit ?? 0);
@@ -4299,6 +4313,31 @@ function crewIdFromStdout(stdout: string): string {
   assert.ok(m, `no crew id in: ${stdout}`);
   return m![1]!;
 }
+
+test("native resolver decisions are retained before launch and explicit BB intake resumes the same task without hidden profile mapping", async()=>{
+  const host=realHost();await plugin(host.bb);
+  try {
+    host.harness.sdk.stub('providers.list',async()=>[{id:'fixture-provider',available:true,reasoningLevels:[{id:'high'}]}]);
+    host.harness.sdk.stub('providers.models',async()=>({modelLoadError:null,models:[{id:'fixture-model',model:'fixture-model'}]}));
+    const options={resolveOutput:'dispatch-resolve:\n  status: clear\n  profile: --harness codex --model native-profile --effort high\n',threadIdAfterSpawn:'thr_real'};
+    const {seen}=stubRealTransportBacklog(host,options);
+    const args=['dispatch','--task-id','resolver-choice','--project','proj_1','--provider','fixture-provider','--model','fixture-model','--reasoning-level','high'];
+    const first=await host.harness.behavior.runCli([...args,'--','bounded task'],{projectId:'proj_1'});
+    assert.equal(first.exitCode,1);assert.match(first.stderr,/dispatchProfileReason/);
+    assert.ok(seen.some(c=>c.includes('fm-dispatch-resolve.sh')));
+    assert.ok(!seen.some(c=>c.includes('fm-tasks-axi.sh')&&c.includes("'add'")));assert.ok(!seen.some(c=>c.includes('fm-spawn.sh')));
+    const records=JSON.parse((await host.harness.behavior.runCli(['launches','--json'])).stdout);assert.equal(records[0].state,'failed');assert.ok(!records[0].nativeInvoked,'known pre-spawn refusal holds no unknown worker');
+    const result=await host.harness.behavior.runCli([...args,'--dispatch-profile-reason','Current user chose the validated BB worker execution rather than the native CLI profile','--','bounded task'],{projectId:'proj_1'});
+    assert.equal(result.exitCode,0,result.stderr);
+    const spawn=seen.filter(c=>c.includes('fm-spawn.sh'));assert.equal(spawn.length,1);
+    const command=unwrapHostCommand(spawn[0]);
+    assert.ok(command.includes("FM_BB_PROVIDER='fixture-provider'"));assert.ok(command.includes("FM_BB_MODEL='fixture-model'"));assert.ok(command.includes("'--harness' 'bb'"));
+    assert.equal(host.harness.sdk.callsTo('threads.spawn').length,0,'no compatibility fallback');
+    const failed=stubRealTransportBacklog(host,{resolveOutput:'error: malformed rules',resolveExit:2});
+    const refused=await host.harness.behavior.runCli(['dispatch','--task-id','config-refusal','--dispatch-profile-reason','an override','--','task'],{projectId:'proj_1'});
+    assert.equal(refused.exitCode,1);assert.match(refused.stderr,/configuration\/usage refusal/);assert.equal(failed.seen.filter(c=>c.includes('fm-spawn.sh')).length,0);
+  }finally{await host.harness.lifecycle.dispose();}
+});
 
 test("C1: real transport adds the backlog row (id=crew id, --kind ship) BEFORE fm-spawn", async () => {
   const host = realHost();
@@ -4729,6 +4768,7 @@ function stubOrphanTransportHost(
   // fm-spawn exits 0, but the meta never records bb_thread_id (hard-kill window).
   host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
     const cmd = cmds.get(args.terminalId) ?? "";
+    if (cmd.includes("fm-dispatch-resolve.sh")) return hostRcPayload("dispatch-resolve: off (fixture)\n", 0);
     if (cmd.includes("bb_thread_id")) return hostRcPayload("FM_META_ABSENT", 0);
     return hostRcPayload("", 0);
   });
@@ -4741,8 +4781,8 @@ function stubOrphanTransportHost(
       title: opts.byTitle ? `Ship · Fix flaky login · ${captured.taskId}` : "renamed-window",
     },
   ]);
-  host.harness.sdk.stub("threads.getPluginMetadata", async () =>
-    opts.byTitle ? {} : { crew: "true", crewId: captured.taskId, nativeHome:"/tmp/fm-home",
+  host.harness.sdk.stub("threads.getPluginMetadata", async ({threadId}: {threadId:string}) =>
+    opts.byTitle || !["thr_orphan","thr_late"].includes(threadId) ? {} : { crew: "true", crewId: captured.taskId, nativeHome:"/tmp/fm-home",
       launchKey:JSON.stringify(["proj_1","thr_cap","/tmp/fm-home",captured.taskId,1]),generation:1 },
   );
   return captured;
@@ -4866,6 +4906,7 @@ function stubRoutedHost(
   host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
     const cmd = cmds.get(args.terminalId) ?? "";
     const r = router(cmd);
+    if (cmd.includes("fm-dispatch-resolve.sh") && r.payload === undefined && r.code === undefined) r.payload = "dispatch-resolve: off (fixture)\n";
     const code = r.code ?? 0;
     // Only successful commands mutate the virtual FS (a forced-failure decode never
     // renames over the target — mirrors the atomic write's truncate-safety).
@@ -6075,6 +6116,7 @@ test("R4 orphan adoption via broad list when the thread is not tagged firstmate-
     // fm-spawn exits 0 but the meta never records bb_thread_id (SIGKILL window).
     host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
       const cmd = cmds.get(args.terminalId) ?? "";
+      if (cmd.includes("fm-dispatch-resolve.sh")) return hostRcPayload("dispatch-resolve: off (fixture)\n", 0);
       if (cmd.includes("bb_thread_id")) return hostRcPayload("FM_META_ABSENT", 0);
       return hostRcPayload("", 0);
     });
@@ -6083,7 +6125,7 @@ test("R4 orphan adoption via broad list when the thread is not tagged firstmate-
     host.harness.sdk.stub("threads.list", async (args: { originPluginId?: string }) =>
       args.originPluginId === "firstmate" ? [] : [{ id: "thr_orphan", projectId: "proj_1", parentThreadId: "thr_cap", title: "renamed" }],
     );
-    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ crew: "true", crewId: captured.taskId,nativeHome:"/tmp/fm-home",
+    host.harness.sdk.stub("threads.getPluginMetadata", async ({threadId}: {threadId:string}) => threadId!=="thr_orphan" ? {} : ({ crew: "true", crewId: captured.taskId,nativeHome:"/tmp/fm-home",
       launchKey:JSON.stringify(["proj_1","thr_cap","/tmp/fm-home",captured.taskId,1]),generation:1 }));
     const result = await host.harness.behavior.runCli(
       ["dispatch", "--project", "proj_1", "--", "adopt me"],
@@ -7404,13 +7446,13 @@ test("IT current native AFK entry writes a valid durable record", { skip: !FM_IN
 });
 
 
-test("native captain contract tool returns the entire source beyond the SDK instruction limit", async () => {
+test("native captain contract tool pages the entire source below ACP truncation", async () => {
   const host = ownerHost();
   await plugin(host.bb);
   await host.bb.storage.kv.set("native-home:thr_cap", "/tmp/fm-home");
   await host.bb.storage.kv.set("native-home-host:thr_cap", "host_1");
   try {
-    const content = "# Firstmate\n" + "supervision policy\n".repeat(5000) + "END_OF_NATIVE_CONTRACT";
+    const content = "# Firstmate\n" + "supervision policy 🧭\n".repeat(5000) + "END_OF_NATIVE_CONTRACT";
     // This unit isolates the complete SDK transport; real dual-pin tests verify
     // catalog production from tracked native bytes through the staged helper.
     stubRoutedHost(host, command => ({payload: command.includes('FM_HOST_CAPTURE_V1') ? JSON.stringify({
@@ -7425,11 +7467,25 @@ test("native captain contract tool returns the entire source beyond the SDK inst
     assert.match(cfg.instructions ?? "", /read firstmate_contract/);
     const tool = host.harness.inspection.registrations.agentTools.find(t => t.name === "firstmate_contract");
     assert.ok(tool);
-    const result = await tool.execute({}, { threadId: "thr_cap", projectId: "proj_1" } as never);
-    assert.equal(typeof result, "string");
-    assert.ok((result as string).startsWith(content), "full native text must survive transport and instruction budgets");
-    assert.match(result as string, /BB runtime adaptations/);
-    assert.match(result as string, /description: A fixture trigger/);
+    let cursor: string | undefined, assembled = "", count = 0;
+    do {
+      const result = await tool.execute(cursor ? { cursor } : {}, { threadId: "thr_cap", projectId: "proj_1" } as never);
+      assert.equal(typeof result, "string");
+      // The actual Grok preview cuts at 19.5KB. Every result, including BB's
+      // tool marker and continuation header, must fit before that boundary.
+      assert.ok(Buffer.byteLength(result as string) < 19_500);
+      const preview = Buffer.from(result as string).subarray(0, 19_500).toString("utf8");
+      const body = /\nBEGIN_PAGE\n([\s\S]*)\nEND_PAGE\n/.exec(preview);
+      assert.ok(body, "whole page must survive ACP preview");
+      assembled += body[1];
+      cursor = /firstmate_contract \{"cursor":"([A-Za-z0-9_-]+)"\}/.exec(preview)?.[1];
+      assert.ok(++count < 40);
+      if (!cursor) assert.match(preview, /END OF CONTRACT TRANSPORT/);
+    } while (cursor);
+    assert.ok(count > 1);
+    assert.ok(assembled.startsWith(content), "all native bytes must survive UTF-8 page boundaries");
+    assert.match(assembled, /BB runtime adaptations/);
+    assert.match(assembled, /description: A fixture trigger/);
   } finally { await host.harness.lifecycle.dispose(); }
 });
 
@@ -9208,11 +9264,14 @@ test("merge refuses another captain's crew, or a PR another captain's crew owns,
     const forced = await host.harness.behavior.runCli(["merge", "c1", "--yes", "--override-owner"], { threadId: "thr_capA" });
     assert.equal(forced.exitCode, 0, forced.stderr);
     assert.match(forced.stdout, /Already merged/);
-    // A crew left by a thread that is no live captain (e.g. this captain's own old
-    // thread) is not "another captain's": no refusal.
+    // Foreign records retain exact ownership even when their captain is inactive.
+    // Explicit one-action override remains supported; inactivity is not takeover.
     await host.bb.storage.kv.set("crews", [shipRow("c3", "thr_c3", "thr_old")]);
     const orphaned = await host.harness.behavior.runCli(["merge", "c3", "--yes"], { threadId: "thr_capA" });
-    assert.equal(orphaned.exitCode, 0, orphaned.stderr);
+    assert.equal(orphaned.exitCode, 1, orphaned.stderr);
+    assert.match(orphaned.stderr,/owning captain/);
+    const orphanOverride=await host.harness.behavior.runCli(["merge","c3","--yes","--override-owner"],{threadId:"thr_capA"});
+    assert.equal(orphanOverride.exitCode,0,orphanOverride.stderr);
     // A registered captain thread abandoned for days (never archived) is no live owner.
     host.harness.sdk.stub("threads.get", async (input: { threadId: string }) => ({
       ...makeThreadResponse({ id: input.threadId, status: "idle", environmentId: "env_wt" }),
@@ -9220,7 +9279,8 @@ test("merge refuses another captain's crew, or a PR another captain's crew owns,
     }));
     await host.bb.storage.kv.set("crews", [shipRow("c4", "thr_c4", "thr_capB")]);
     const abandoned = await host.harness.behavior.runCli(["merge", "c4", "--yes"], { threadId: "thr_capA" });
-    assert.equal(abandoned.exitCode, 0, abandoned.stderr);
+    assert.equal(abandoned.exitCode,1,abandoned.stderr);
+    assert.match(abandoned.stderr,/owning captain/);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -9864,6 +9924,7 @@ test("real transport re-looks for the thread after a 504 spawn failure and adopt
     // fm-spawn fails with a gateway timeout; the recorded thread id is absent.
     host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
       const cmd = cmds.get(args.terminalId) ?? "";
+      if (cmd.includes("fm-dispatch-resolve.sh")) return hostRcPayload("dispatch-resolve: off (fixture)\n", 0);
       if (cmd.includes("bb_thread_id")) return hostRcPayload("FM_META_ABSENT", 0);
       if (cmd.includes("fm-spawn")) return hostRcPayload("HTTP 504 Gateway Timeout", 1);
       return hostRcPayload("", 0);

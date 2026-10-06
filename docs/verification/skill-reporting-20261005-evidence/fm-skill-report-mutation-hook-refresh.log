@@ -1,0 +1,28 @@
+✖ bound captain refresh replaces a legacy cached hook without changing runtime selection or reports (4701.636568ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 0
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 4987.695623
+
+✖ failing tests:
+
+test at server.native-runtime.test.mjs:63:1
+✖ bound captain refresh replaces a legacy cached hook without changing runtime selection or reports (4701.636568ms)
+  AssertionError [ERR_ASSERTION]: The input did not match the regular expression /AGENTS\.md section 9/. Input:
+
+  '#!/bin/sh\n# Legacy hook without resumed native outcome guidance\nexit 0\n'
+
+      at TestContext.<anonymous> (file:///root/github_projects/bb-plugin-firstmate-launch-pr-lifecycle/server.native-runtime.test.mjs:72:10)
+      at async Test.run (node:internal/test_runner/test:1332:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: '#!/bin/sh\n# Legacy hook without resumed native outcome guidance\nexit 0\n',
+    expected: /AGENTS\.md section 9/,
+    operator: 'match',
+    diff: 'simple'
+  }

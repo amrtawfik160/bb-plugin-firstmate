@@ -1,0 +1,19 @@
+✔ uncertain replacement reconciles its reserved slot at capacity before any fresh attempt (169.667385ms)
+✔ reload during creation reconciles seeded worker identity before retry and never kills a slow worker (131.030037ms)
+✔ registered supervisor tool and CLI mutations refuse worker identities before publication while captain dispatch remains available (128.735198ms)
+✔ routed child intake survives reload and interrupted crew publication without resending or adopting supervisor defaults (154.469086ms)
+✔ unknown secondmate send retains full child request and refuses duplicate handoff after reload (103.940989ms)
+✔ accepted dispatch intent and specification 2d833ff1 reach real native briefs and rendered workers without tail loss (4856.110918ms)
+✔ accepted dispatch intent and specification 1f3e7696 reach real native briefs and rendered workers without tail loss (5133.092044ms)
+✔ worker CLI exact inbox and native status notification 2d833ff1 remain callable while foreign task and supervisor bridge refuse (865.810702ms)
+✔ worker CLI exact inbox and native status notification 1f3e7696 remain callable while foreign task and supervisor bridge refuse (891.906107ms)
+✔ secondmate public dispatch 2d833ff1 carries exact child intake independently of supervisor execution through native child brief (1820.541071ms)
+✔ secondmate public dispatch 1f3e7696 carries exact child intake independently of supervisor execution through native child brief (1672.751681ms)
+ℹ tests 11
+ℹ suites 0
+ℹ pass 11
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 15589.840013

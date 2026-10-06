@@ -1,0 +1,10 @@
+✔ captain metadata loads the full skill set (127.753258ms)
+✔ captain tool activity is folded by default (80.984268ms)
+ℹ tests 2
+ℹ suites 0
+ℹ pass 2
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 648.388089

@@ -1,0 +1,28 @@
+✖ direct-PR body author reads the actual installed PR skill in bounded owner-pinned pages; pipeline and local-only ownership stay native (108.761418ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 0
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 408.59071
+
+✖ failing tests:
+
+test at server.methods.test.mjs:190:1
+✖ direct-PR body author reads the actual installed PR skill in bounded owner-pinned pages; pipeline and local-only ownership stay native (108.761418ms)
+  AssertionError [ERR_ASSERTION]: The input did not match the regular expression /before creating or updating a PR body/. Input:
+  
+  'The native launch brief owns this worker role, BB transport and task policy. BB crew threads have no captain tools or skills. Follow that brief and its exact-ID steering inbox procedure. Do not delegate or change the selected provider, model, or effort. Worker completion is a handoff, not captain merge or deployment completion. Installation-selected BB methods: use firstmate_methods action=read name=worker-methods for the assigned trigger. Branches: consequential behavior/shared-state/retry/migration proof; changed UI journey verification (verification-skill creation/upkeep only when assigned); consequential decision trail; assigned investigation/design/bounded review. Read only that reference and every cursor; the native brief owns scope, result channel and pipeline.'
+  
+      at TestContext.<anonymous> (file:///root/github_projects/bb-plugin-firstmate-launch-pr-lifecycle/server.methods.test.mjs:199:82)
+      at async Test.run (node:internal/test_runner/test:1332:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'The native launch brief owns this worker role, BB transport and task policy. BB crew threads have no captain tools or skills. Follow that brief and its exact-ID steering inbox procedure. Do not delegate or change the selected provider, model, or effort. Worker completion is a handoff, not captain merge or deployment completion. Installation-selected BB methods: use firstmate_methods action=read name=worker-methods for the assigned trigger. Branches: consequential behavior/shared-state/retry/migration proof; changed UI journey verification (verification-skill creation/upkeep only when assigned); consequential decision trail; assigned investigation/design/bounded review. Read only that reference and every cursor; the native brief owns scope, result channel and pipeline.',
+    expected: /before creating or updating a PR body/,
+    operator: 'match',
+    diff: 'simple'
+  }

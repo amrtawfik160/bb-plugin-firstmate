@@ -1,0 +1,11 @@
+✔ installed BB runtime lookup accepts both official entrypoints from the same package (4.145502ms)
+✔ installed BB discovers only shipped entry skills and resolves actual role configuration via javascriptCli (14804.606507ms)
+✔ installed BB discovers only shipped entry skills and resolves actual role configuration via nativeCli (13348.515162ms)
+ℹ tests 3
+ℹ suites 0
+ℹ pass 3
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 28463.766772

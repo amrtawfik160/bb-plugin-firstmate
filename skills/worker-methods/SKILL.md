@@ -10,7 +10,7 @@ The native launch brief owns role, scope, transport, and task policy. This
 BB-owned skill grants no captain authority. Do not delegate, spawn reviewers,
 change the exact selected provider/model/effort, merge, deploy, or write outside
 the assigned scope. Keep the recorded worktree and exact-ID steering procedure.
-Report scope gaps to the captain rather than expanding the assignment.
+Return scope gaps to the supervising manager through the native brief's result channel; keep the assignment's scope.
 
 Read only the reference for the current task trigger:
 

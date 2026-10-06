@@ -1,0 +1,16 @@
+✔ real native 2d833ff1 ship/direct-PR preserves branch/work/contract during explicit replacement (2083.939374ms)
+✔ real native 2d833ff1 ship/no-mistakes preserves branch/work/contract during explicit replacement (1968.562027ms)
+✔ real native 2d833ff1 ship/local-only preserves branch/work/contract during explicit replacement (1912.697974ms)
+✔ real native 2d833ff1 scout/direct-PR preserves branch/work/contract during explicit replacement (2495.852121ms)
+✔ real native 1f3e7696 ship/direct-PR preserves branch/work/contract during explicit replacement (4384.633884ms)
+✔ real native 1f3e7696 ship/no-mistakes preserves branch/work/contract during explicit replacement (4155.249155ms)
+✔ real native 1f3e7696 ship/local-only preserves branch/work/contract during explicit replacement (4127.64784ms)
+✔ real native 1f3e7696 scout/direct-PR preserves branch/work/contract during explicit replacement (3548.665525ms)
+ℹ tests 8
+ℹ suites 0
+ℹ pass 8
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 24992.42136

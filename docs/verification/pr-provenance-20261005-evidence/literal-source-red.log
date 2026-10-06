@@ -1,0 +1,28 @@
+✖ public paged PR reads expose exact SDK source provenance outside the unchanged full body (115.369845ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 0
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 413.288307
+
+✖ failing tests:
+
+test at server.methods.test.mjs:222:1
+✖ public paged PR reads expose exact SDK source provenance outside the unchanged full body (115.369845ms)
+  AssertionError [ERR_ASSERTION]: {"content":[{"type":"text","text":"PR paged response exceeds 12000 UTF-8 bytes including JSON escaping; no source or body was truncated. Use an unpaged operator read for this resource."},{"type":"text","text":"⁢⁣⁢⁣⁢"}],"isError":true}
+  
+  'object' !== 'string'
+  
+      at TestContext.<anonymous> (file:///root/github_projects/bb-plugin-firstmate-launch-pr-lifecycle/server.methods.test.mjs:241:12)
+      at async Test.run (node:internal/test_runner/test:1332:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: 'object',
+    expected: 'string',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }

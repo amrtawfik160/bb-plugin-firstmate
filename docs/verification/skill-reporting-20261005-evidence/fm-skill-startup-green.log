@@ -1,0 +1,11 @@
+✔ captain cli first binding and bound resume use only exact home on 2d833ff1 (3911.488547ms)
+✔ actual registered cli clean captain binding stages package on authoritative host without external source (6416.154692ms)
+✔ actual registered tool clean captain binding stages package on authoritative host without external source (6344.328829ms)
+ℹ tests 3
+ℹ suites 0
+ℹ pass 3
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 13071.378208

@@ -1,0 +1,29 @@
+{
+  "baseline": "0e521d679bece15867b1f24967b14ce0e00bd4ca",
+  "tasksAxi": "0.2.6",
+  "bb": "0.44.0",
+  "ci": {
+    "tests": 333,
+    "passed": 333,
+    "failed": 0,
+    "skipped": 0,
+    "seconds": 106.912597662
+  },
+  "nativeTargeted": {
+    "tests": 4,
+    "passed": 4,
+    "failed": 0,
+    "skipped": 0,
+    "pins": [
+      "2d833ff147cd26a5c461e914e06854e0eb2707ce",
+      "1f3e769616fdf9f31f85f4c3e6a9f71606634238"
+    ]
+  },
+  "causalMutation": "Removing locked CI-tools PATH fails executable-ownership regression",
+  "typecheck": "passed",
+  "fidelity": "passed",
+  "runtimeIntegrity": "passed",
+  "build": "passed",
+  "productionChanges": false,
+  "hostedRerun": "pending new commit push"
+}
