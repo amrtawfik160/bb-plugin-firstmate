@@ -5,6 +5,10 @@ export const FIRSTMATE_OUT_ENVELOPE_RE =
   /⟦fm-out\s+kind=(?<kind>[a-z]+)\s+chat=(?<chat>[^\s⟧]+)\s+msg=(?<msg>[^\s⟧]+)(?:\s+thread=(?<thread>[^\s⟧]+))?⟧/u;
 
 export const CONNECTOR_BANNER = "The following is an owner message from the private Telegram connector.";
+export const FORWARDED_BANNER = "The following is quoted source material supplied by the owner. The connector did not run it as a command.";
+
+export type TelegramProject = { name: string | null; projectId: string | null; captainThreadId: string | null };
+export type TelegramRepliedTo = { telegramMessageId: string; originalText: string | null };
 
 export type TelegramEnvelope = {
   chatId: string;
@@ -18,7 +22,8 @@ export type TelegramEnvelope = {
   binding?: string | null;
   messageIds?: string[];
   items?: string | null;
-  project?: string | null;
+  project?: TelegramProject | null;
+  repliedTo?: TelegramRepliedTo | null;
 };
 
 export type ConnectorHeader = TelegramEnvelope & {
@@ -56,42 +61,77 @@ export function parseTelegramItems(raw: string | null | undefined): TelegramItem
   return out;
 }
 
+function jsonRecord(value: string | null): Record<string, unknown> | null {
+  if (!value) return null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+function idText(value: unknown): string | null {
+  return typeof value === "string" || typeof value === "number" ? dash(String(value)) : null;
+}
+
+function textOrNull(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
 export function parseConnectorHeader(text: string): ConnectorHeader | null {
   const start = text.replace(/^\uFEFF/, "").trimStart();
-  if (!start.startsWith(CONNECTOR_BANNER)) return null;
-  const rest = start.slice(CONNECTOR_BANNER.length).replace(/^\r?\n/, "");
+  const banner = [CONNECTOR_BANNER, FORWARDED_BANNER].find((candidate) => start.startsWith(candidate));
+  if (banner === undefined) return null;
+  const rest = start.slice(banner.length).replace(/^\r?\n/, "");
   const lines = rest.split(/\r?\n/);
   const fields = new Map<string, string>();
-  let index = 0;
-  for (; index < lines.length; index++) {
+  // The live connector puts prose lines inside the header, so only the first
+  // blank line ends it. Without one, the body starts after the last header line.
+  let bodyStart = -1;
+  let lastHeader = -1;
+  for (let index = 0; index < lines.length; index++) {
     const line = lines[index]!;
     if (line.trim() === "") {
-      index += 1;
+      bodyStart = index + 1;
       break;
     }
-    if (line.startsWith("Telegram result delivery:")) continue;
+    if (line.startsWith("Telegram result delivery:")) {
+      lastHeader = index;
+      continue;
+    }
     const match = /^([A-Za-z][A-Za-z0-9_]*):\s*(.*)$/.exec(line);
-    if (!match) break;
+    if (!match) continue;
     fields.set(match[1]!.toLowerCase(), match[2]!.trim());
+    lastHeader = index;
   }
+  if (bodyStart < 0) bodyStart = lastHeader + 1;
   const chatId = dash(fields.get("telegram_chat_id"));
   const messageIds = splitIds(dash(fields.get("telegram_message_ids")) ?? "");
   const messageId = dash(fields.get("telegram_message_id")) ?? messageIds[0] ?? null;
   if (!chatId || !messageId) return null;
+  const rawTarget = dash(fields.get("reply_target") ?? fields.get("telegram_reply_to"));
+  const target = jsonRecord(rawTarget);
+  const replied = jsonRecord(dash(fields.get("replied_to_message")));
+  const repliedId = idText(replied?.telegramMessageId);
+  const project = jsonRecord(dash(fields.get("project")));
   return {
     chatId,
     messageId,
-    replyTo: dash(fields.get("reply_target") ?? fields.get("telegram_reply_to")),
+    replyTo: (target ? idText(target.telegramMessageId) : rawTarget) ?? repliedId,
+    repliedTo: repliedId ? { telegramMessageId: repliedId, originalText: textOrNull(replied?.originalText) } : null,
     mediaGroupId: dash(fields.get("telegram_media_group_id")),
-    forwarded: fields.get("telegram_forwarded") === "1" || fields.get("telegram_forwarded") === "true",
+    forwarded: banner === FORWARDED_BANNER || fields.get("telegram_forwarded") === "1" || fields.get("telegram_forwarded") === "true",
     threadId: dash(fields.get("telegram_thread_id") ?? fields.get("telegram_message_thread_id")),
     senderId: dash(fields.get("telegram_user_id")),
     correlation: dash(fields.get("correlation")),
     binding: dash(fields.get("binding")),
     messageIds: messageIds.length > 0 ? messageIds : [messageId],
     items: dash(fields.get("telegram_items")),
-    project: dash(fields.get("project")),
-    body: lines.slice(index).join("\n").trim(),
+    project: project
+      ? { name: textOrNull(project.name), projectId: textOrNull(project.projectId), captainThreadId: textOrNull(project.captainThreadId) }
+      : null,
+    body: lines.slice(bodyStart).join("\n").trim(),
   };
 }
 

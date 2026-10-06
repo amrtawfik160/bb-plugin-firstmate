@@ -64,12 +64,12 @@ import { createWatchdogStore, observeOutput, observeRateLimit, observeTurn, prov
 import { createDoorbellHold, doorbellHoldDecision } from "./lib/doorbell-hold.ts";
 import { HANDOFF_WAKE_AMENDMENT, captainInstructionsWithHandoff } from "./lib/handoff-contract.ts";
 import { honestIdleVerdictPresentation, interruptIsStopped, readyClaim } from "./lib/honest-status.ts";
-import { ACK_TEXT, ackEligible, createInboundLedger, sweeperSteerText } from "./lib/inbound-ledger.ts";
+import { ACK_TEXT, ackEligible, createInboundLedger, inboundKey, sweeperSteerText } from "./lib/inbound-ledger.ts";
 import { inboundHookDecision } from "./lib/inbound-dispatch.ts";
 import { DEFAULT_RELIABILITY_FLAGS, reliabilityFlagsFromSettings } from "./lib/reliability-flags.ts";
 import { sanitizeSettingValue } from "./lib/settings-schema.ts";
-import { coalesceBatches, formatOutboundEnvelope, parseInboundTelegram, parseTelegramSubmission, stripTelegramEnvelope, telegramReplyParameters, telegramSourceRef } from "./lib/telegram-envelope.ts";
-import { correlationOf, oldestUnanswered, refuseLaterThanOldest, sendTelegramReply } from "./lib/telegram-reply.ts";
+import { coalesceBatches, parseInboundTelegram, parseSourceRef, parseTelegramSubmission, stripTelegramEnvelope, telegramReplyParameters, telegramSourceRef } from "./lib/telegram-envelope.ts";
+import { correlationOf, oldestUnanswered, refuseLaterThanOldest, sendTelegramReply, telegramReplyFallbackBody } from "./lib/telegram-reply.ts";
 import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRecord } from "./lib/launch.ts";
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
 import { optionHelp } from "./lib/cli-help.ts";
@@ -4515,8 +4515,7 @@ export default async function plugin(bb: BbPluginApi) {
       await drainQueuedDispatches(captainThreadId);
     }
     if (flags.inboundLedger === "on") {
-      for (const action of inboundLedger.openForSweep(Date.now())) {
-        if (action.row.captainThreadId !== captainThreadId) continue;
+      for (const action of inboundLedger.openForSweep(Date.now(), captainThreadId)) {
         await bb.sdk.threads.send({
           threadId: captainThreadId,
           mode: "steer",
@@ -9745,44 +9744,47 @@ export default async function plugin(bb: BbPluginApi) {
       ref: z.string().min(1),
       text: z.string().min(1).max(4000),
     }),
-    async execute({ ref, text }) {
+    async execute({ ref, text }, ctx) {
       const flags = await reliabilityFlags();
       if (flags.inboundLedger === "off") return toolError("Inbound ledger is off.");
-      const open = inboundLedger.listOpen();
-      const row = ref === "oldest"
-        ? oldestUnanswered(open)
-        : inboundLedger.get((() => {
-          const parts = ref.split(":");
-          if (parts.length < 3) return { source: "bb" as const, chatId: "", messageId: "" };
-          return { source: parts[0] === "tg" ? "telegram" as const : "bb" as const, chatId: parts[1]!, messageId: parts.slice(2).join(":") };
-        })());
-      if (ref !== "oldest" && ref.split(":").length < 3) return toolError("ref must be oldest, tg:<chat>:<msg>, or bb:<thread>:<row>.");
-      if (!row) return toolError(`No inbound row ${ref}.`);
+      const captain = ctxString(ctx, "threadId");
+      if (!captain) return toolError("firstmate_reply runs only in a captain thread.");
+      const key = ref === "oldest" ? null : parseSourceRef(ref);
+      if (ref !== "oldest" && key === null) return toolError("ref must be oldest, tg:<chat>:<msg>, or bb:<thread>:<row>.");
+      const open = inboundLedger.listOpen(captain);
+      const found = key === null ? oldestUnanswered(open) : inboundLedger.get(key);
+      const row = found?.captainThreadId === captain ? found : undefined;
+      if (!row) return toolError(`No inbound row ${ref} for this captain.`);
+      const used = row.source === "telegram" ? telegramSourceRef(row) : `bb:${row.chatId}:${row.messageId}`;
       const older = flags.telegramThreading === "on" ? refuseLaterThanOldest({ chosen: row, open }) : null;
       if (older) return toolError(`Reply to the oldest unanswered item ${older.source === "telegram" ? telegramSourceRef(older) : `bb:${older.chatId}:${older.messageId}`}, never the latest.`);
-      const sent = row.source === "telegram"
-        ? await sendTelegramReply({
+      const body = row.source === "telegram"
+        ? telegramReplyFallbackBody({ chatId: row.chatId, messageId: row.messageId, kind: "reply", text: stripTelegramEnvelope(text), threadId: row.topicId })
+        : text;
+      // Reserve first so a concurrent or repeated reply never reaches Telegram twice.
+      if (!inboundLedger.claimOutbox(row, "reply", body, Date.now()).sent) return `Already replied to ${used}.`;
+      let channel: "rpc" | "envelope" = "envelope";
+      try {
+        if (row.source === "telegram") {
+          channel = (await sendTelegramReply({
             payload: { chatId: row.chatId, messageId: row.messageId, kind: "reply", text: stripTelegramEnvelope(text), threadId: row.topicId, correlation: correlationOf(row) },
             callRpc: flags.telegramThreading === "on" ? (args) => bb.sdk.plugins.callRpc(args) : null,
-          }).catch((error) => {
-            bb.log.warn(`firstmate_reply telegram send failed: ${String(error)}`);
-            return { channel: "envelope" as const, body: `${formatOutboundEnvelope({ kind: "reply", chatId: row.chatId, messageId: row.messageId, threadId: row.topicId })}\n${stripTelegramEnvelope(text)}` };
-          })
-        : { channel: "envelope" as const, body: text };
-      const claimed = inboundLedger.claimOutbox(row, "reply", sent.body, Date.now());
-      if (!claimed.sent) return `Already replied to ${row.source === "telegram" ? telegramSourceRef(row) : ref}.`;
-      inboundLedger.markAnswered(row, Date.now());
-      if (row.source === "bb") {
-        await bb.sdk.threads.send({
-          threadId: row.captainThreadId,
-          mode: "steer",
-          input: [{ type: "text", text: sent.body, mentions: [] }],
-        }).catch((error) => bb.log.warn(`firstmate_reply send failed: ${String(error)}`));
+          })).channel;
+        } else {
+          await bb.sdk.threads.send({
+            threadId: row.captainThreadId,
+            mode: "steer",
+            input: [{ type: "text", text: body, mentions: [] }],
+          });
+        }
+      } catch (error) {
+        inboundLedger.releaseOutbox(row, "reply");
+        return toolError(`Reply to ${used} was not delivered; the item stays open. ${error instanceof Error ? error.message : String(error)}`);
       }
+      inboundLedger.markAnswered(row, Date.now());
       const params = row.source === "telegram" ? telegramReplyParameters({ chatId: row.chatId, messageId: row.messageId, threadId: row.topicId }) : null;
-      const used = row.source === "telegram" ? telegramSourceRef(row) : `bb:${row.chatId}:${row.messageId}`;
       return params
-        ? `Replied to ${used} via ${sent.channel} with reply_parameters ${JSON.stringify(params.reply_parameters)}.`
+        ? `Replied to ${used} via ${channel} with reply_parameters ${JSON.stringify(params.reply_parameters)}.`
         : `Replied to ${used}.`;
     },
   });
@@ -11056,6 +11058,8 @@ export default async function plugin(bb: BbPluginApi) {
   const knownCaptains = knownCaptainsRef;
   for (const key of await bb.storage.kv.list(CAPTAIN_PROJECT_PREFIX)) knownCaptains.add(key.slice(CAPTAIN_PROJECT_PREFIX.length));
   const heldPingCaptains = new Set<string>();
+  // Threaded replies off: an ack does not apply, and asking again on every dispatch would only repeat the RPC.
+  const ackNotApplicable = new Set<string>();
   try {
     bb.experimental_hooks.on("message.dispatch", async (context) => {
       try {
@@ -11140,16 +11144,21 @@ export default async function plugin(bb: BbPluginApi) {
               const keys = group.map((item) => ({ source: "telegram" as const, chatId: item.chatId, messageId: item.messageId }));
               inboundLedger.mergeSourceRefs(keys, keys.map((item) => telegramSourceRef(item)));
               const primary = inboundLedger.get(keys[0]!);
-              if (!primary || !ackEligible(primary, now)) continue;
+              if (!primary || !ackEligible(primary, now) || ackNotApplicable.has(inboundKey(primary))) continue;
+              const body = telegramReplyFallbackBody({ chatId: primary.chatId, messageId: primary.messageId, kind: "ack", text: ACK_TEXT, threadId: primary.topicId });
+              if (!inboundLedger.claimOutbox(primary, "ack", body, now).sent) continue;
               const sent = await sendTelegramReply({
                 payload: { chatId: primary.chatId, messageId: primary.messageId, kind: "ack", text: ACK_TEXT, threadId: primary.topicId, correlation: correlationOf(primary) },
                 callRpc: flags.telegramThreading === "on" ? (args) => bb.sdk.plugins.callRpc(args) : null,
               }).catch((error) => {
                 bb.log.warn(`inbound telegram ack failed: ${String(error)}`);
-                return { channel: "envelope" as const, body: `${formatOutboundEnvelope({ kind: "ack", chatId: primary.chatId, messageId: primary.messageId, threadId: primary.topicId })}\n${ACK_TEXT}` };
+                return null;
               });
-              const claimed = inboundLedger.claimOutbox(primary, "ack", sent.body, now);
-              if (!claimed.sent) continue;
+              if (sent?.outcome !== "delivered") {
+                inboundLedger.releaseOutbox(primary, "ack");
+                if (sent?.outcome === "not-applicable") ackNotApplicable.add(inboundKey(primary));
+                continue;
+              }
               inboundLedger.markAcked(primary, now);
               for (const extra of keys.slice(1)) inboundLedger.markAcked(extra, now);
             }
