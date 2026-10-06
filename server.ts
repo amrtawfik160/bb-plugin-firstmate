@@ -2627,6 +2627,7 @@ export default async function plugin(bb: BbPluginApi) {
     const idlePresent = kind === "idle"
       ? (honest ? honestIdleVerdictPresentation(crew.id, verdictOf(outcome)) : idleVerdictPresentation(crew.id, verdictOf(outcome)))
       : null;
+    if (kind === "idle" && verdict === null) bb.log.warn(`crew ${crew.id} went idle with no recorded outcome; not reported as done`);
     const reviewPresent = kind === "review" && honest ? readyClaim(crew.id, outcome ?? output) : null;
     const head =
       idlePresent !== null
@@ -5534,7 +5535,11 @@ export default async function plugin(bb: BbPluginApi) {
         // investigate), NOT a review-ready ship — its idle thread status must not
         // let it fall through to "ready to review (crew/deliver)".
         const failed = status === "idle" && latest !== null && latest.verb === "failed";
-        return { ...crew, status, prUrl: pr.url, openDecisions, failed, prSummary: summarizePR({ pullRequest: { url: pr.url, number: pr.number, title: pr.title, state: pr.state, checks: { state: pr.checksState } } }) };
+        // Native workers report through their status file, not chat, so only chat-reporting crews
+        // need a DONE line. Without one, an idle crew has no outcome (often an interrupted turn).
+        const noOutcome = status === "idle" && !failed && openDecisions.length === 0 && latest?.verb !== "done"
+          && !isSecondmateRoute(crew) && !(await isNativeWorker(crew));
+        return { ...crew, status, prUrl: pr.url, openDecisions, failed, noOutcome, prSummary: summarizePR({ pullRequest: { url: pr.url, number: pr.number, title: pr.title, state: pr.state, checks: { state: pr.checksState } } }) };
       }),
     );
     const now = Date.now();
@@ -5567,6 +5572,9 @@ export default async function plugin(bb: BbPluginApi) {
         .filter((row) => row.status === "idle" && row.failed)
         .map((row) => `! ${formatCrew(row, row.status)} — FAILED: retry/investigate (retry? tell? forget?)`),
       ...rows
+        .filter((row) => row.noOutcome)
+        .map((row) => `! ${formatCrew(row, row.status)} — no outcome: idle without DONE/BLOCKED/FAILED, possibly interrupted (tell? retry? forget?)`),
+      ...rows
         .filter((row) => row.status === "idle" && !row.failed && row.openDecisions.length > 0)
         .map((row) => {
           const d = row.openDecisions[row.openDecisions.length - 1]!;
@@ -5586,7 +5594,7 @@ export default async function plugin(bb: BbPluginApi) {
       (d) =>
         `✓ ${truncate(d.task.split("\n")[0] ?? d.task, 80)}${d.pr !== "" ? ` — ${d.pr}` : ""}${d.outcome !== "" ? ` (${truncate(d.outcome, 60)})` : ""}`,
     );
-    const readyRows = rows.filter((row) => row.status === "idle" && !row.failed && row.openDecisions.length === 0);
+    const readyRows = rows.filter((row) => row.status === "idle" && !row.failed && !row.noOutcome && row.openDecisions.length === 0);
     const ready = readyRows.map((row) => {
       const pr = row.prUrl !== "" ? ` ${row.prUrl}` : "";
       return `• ${formatCrew(row, row.status)}${pr} — ready to review (crew/deliver)`;

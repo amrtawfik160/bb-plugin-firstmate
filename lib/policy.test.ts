@@ -331,10 +331,9 @@ test("idleVerdictPresentation: BLOCKED/FAILED never render as done and never off
   assert.doesNotMatch(failed.next, /deliver/);
   assert.match(failed.next, /retry\|tell\|forget c1/);
 
-  // A verdict-less idle keeps the prior done/deliver shape.
   const unknown = idleVerdictPresentation("c1", null);
-  assert.equal(unknown.head, "✅ crew c1 done");
-  assert.match(unknown.next, /deliver c1/);
+  assert.equal(unknown.head, "❓ crew c1 idle with no outcome");
+  assert.doesNotMatch(unknown.next, /deliver/);
 });
 
 test("verdictMarker gives a distinct glyph per verdict", () => {

@@ -112,9 +112,8 @@ export interface VerdictPresentation {
  *   DONE    → ✅ done,    deliver
  *   BLOCKED → 🚧 blocked, tell|retry|forget (unblock/steer, never deliver)
  *   FAILED  → ❌ failed,  retry|tell|forget (retry/investigate, never deliver)
- * A verdict-less idle (verdict null — ambiguous) keeps the done/deliver shape,
- * matching the prior default; the doorbell-suppression gate independently errs
- * toward telling the captain for any non-DONE outcome.
+ * A verdict-less idle (verdict null) has no recorded outcome. An interrupted
+ * turn looks like this, so it never renders as done and never offers deliver.
  */
 export function idleVerdictPresentation(crewId: string, verdict: Verdict | null): VerdictPresentation {
   switch (verdict) {
@@ -122,8 +121,10 @@ export function idleVerdictPresentation(crewId: string, verdict: Verdict | null)
       return { head: `🚧 crew ${crewId} blocked`, next: `next: bb firstmate tell|retry|forget ${crewId}` };
     case "FAILED":
       return { head: `❌ crew ${crewId} failed`, next: `next: bb firstmate retry|tell|forget ${crewId}` };
-    default:
+    case "DONE":
       return { head: `✅ crew ${crewId} done`, next: `next: bb firstmate deliver ${crewId}` };
+    default:
+      return { head: `❓ crew ${crewId} idle with no outcome`, next: `next: bb firstmate tell|retry|forget ${crewId}` };
   }
 }
 
