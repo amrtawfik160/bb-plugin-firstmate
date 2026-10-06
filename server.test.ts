@@ -2767,7 +2767,7 @@ test("retry shortens a long reason instead of failing on BB's 200-char limit", a
 test("dispatch refuses past the running-crew cap", async () => {
   const host = await load();
   try {
-    await host.bb.storage.kv.set("crews", [1, 2, 3, 4, 5].map((n) => shipRow(`c${n}`, `thr_c${n}`, "thr_cap")));
+    await host.bb.storage.kv.set("crews", Array.from({ length: 10 }, (_, i) => shipRow(`c${i + 1}`, `thr_c${i + 1}`, "thr_cap")));
     host.harness.sdk.stub("threads.list", async () => []);
     host.harness.sdk.stub("threads.get", async (input: unknown) =>
       makeThreadResponse({ id: String((input as { threadId?: string }).threadId), status: "active" }),
@@ -2777,7 +2777,7 @@ test("dispatch refuses past the running-crew cap", async () => {
       { projectId: "proj_1", threadId: "thr_cap" },
     );
     assert.notEqual(result.exitCode, 0, result.stdout);
-    assert.match(result.stderr, /Crew cap reached: 5 crews running or reserved \(cap 5\)/);
+    assert.match(result.stderr, /Crew cap reached: 10 crews running or reserved \(cap 10\)/);
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
   } finally {
     await host.harness.lifecycle.dispose();
@@ -9291,22 +9291,22 @@ test("tell/retry refuse to wake an idle crew past the running-crew cap unless ov
   const host = await load();
   try {
     await host.bb.storage.kv.set("crews", [
-      ...[1, 2, 3, 4, 5].map((n) => shipRow(`c${n}`, `thr_c${n}`, "thr_cap")),
-      shipRow("c6", "thr_c6", "thr_cap"),
+      ...Array.from({ length: 10 }, (_, i) => shipRow(`c${i + 1}`, `thr_c${i + 1}`, "thr_cap")),
+      shipRow("c11", "thr_c11", "thr_cap"),
     ]);
     host.harness.sdk.stub("threads.list", async () => []);
     host.harness.sdk.stub("threads.get", async (input: { threadId: string }) =>
-      makeThreadResponse({ id: input.threadId, status: input.threadId === "thr_c6" ? "idle" : "active" }));
+      makeThreadResponse({ id: input.threadId, status: input.threadId === "thr_c11" ? "idle" : "active" }));
     host.harness.sdk.stub("threads.send", async () => ({}));
     host.harness.sdk.stub("threads.retry", async () => ({}));
-    const told = await host.harness.behavior.runCli(["tell", "c6", "--", "pick it back up"], { threadId: "thr_cap" });
+    const told = await host.harness.behavior.runCli(["tell", "c11", "--", "pick it back up"], { threadId: "thr_cap" });
     assert.equal(told.exitCode, 1);
-    assert.match(told.stderr, /Crew cap reached: 5 crews running \(cap 5\)\. Waking idle crew c6/);
+    assert.match(told.stderr, /Crew cap reached: 10 crews running \(cap 10\)\. Waking idle crew c11/);
     assert.equal(host.harness.sdk.callsTo("threads.send").length, 0);
-    const retried = await agentTool(host, "firstmate_retry").execute({ crewId: "c6" }, { threadId: "thr_cap" } as never);
+    const retried = await agentTool(host, "firstmate_retry").execute({ crewId: "c11" }, { threadId: "thr_cap" } as never);
     assert.ok(isToolError(retried), toolText(retried));
     assert.equal(host.harness.sdk.callsTo("threads.retry").length, 0);
-    const over = await host.harness.behavior.runCli(["tell", "c6", "--over-cap", "--", "pick it back up"], { threadId: "thr_cap" });
+    const over = await host.harness.behavior.runCli(["tell", "c11", "--over-cap", "--", "pick it back up"], { threadId: "thr_cap" });
     assert.equal(over.exitCode, 0, over.stderr);
     assert.equal(host.harness.sdk.callsTo("threads.send").length, 1);
     // Steering a crew that is already running adds no turn, so the cap does not apply.
@@ -10005,13 +10005,13 @@ test("wake drain retires a Lavish source whose artifact is gone through the nati
 test("the crew cap counts crews that are still starting", async () => {
   const host = await load();
   try {
-    await host.bb.storage.kv.set("crews", [1, 2, 3, 4, 5].map((n) => shipRow(`c${n}`, `thr_c${n}`, "thr_cap")));
+    await host.bb.storage.kv.set("crews", Array.from({ length: 10 }, (_, i) => shipRow(`c${i + 1}`, `thr_c${i + 1}`, "thr_cap")));
     host.harness.sdk.stub("threads.list", async () => []);
     host.harness.sdk.stub("threads.get", async (input: { threadId: string }) =>
       makeThreadResponse({ id: input.threadId, status: "starting" }));
     const result = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--", "fix flaky login"], { projectId: "proj_1", threadId: "thr_cap" });
     assert.equal(result.exitCode, 1);
-    assert.match(result.stderr, /Crew cap reached: 5 crews running/);
+    assert.match(result.stderr, /Crew cap reached: 10 crews running/);
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
   } finally {
     await host.harness.lifecycle.dispose();
@@ -10021,7 +10021,7 @@ test("the crew cap counts crews that are still starting", async () => {
 test("queue dispatch obeys the running-crew cap", async () => {
   const host = await load();
   try {
-    await host.bb.storage.kv.set("crews", [1, 2, 3, 4, 5].map((n) => shipRow(`c${n}`, `thr_c${n}`, "thr_cap")));
+    await host.bb.storage.kv.set("crews", Array.from({ length: 10 }, (_, i) => shipRow(`c${i + 1}`, `thr_c${i + 1}`, "thr_cap")));
     host.harness.sdk.stub("threads.list", async () => []);
     host.harness.sdk.stub("threads.get", async (input: { threadId: string }) =>
       makeThreadResponse({ id: input.threadId, status: "active" }));
@@ -10032,6 +10032,53 @@ test("queue dispatch obeys the running-crew cap", async () => {
     assert.ok(isToolError(dispatched), toolText(dispatched));
     assert.match(toolText(dispatched), /Crew cap reached/);
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("async dispatch queues tool work past the running-crew cap", async () => {
+  const host = await load();
+  try {
+    await host.harness.behavior.setSettings({ fmReliability: JSON.stringify({ asyncDispatch: "on" }) });
+    await host.bb.storage.kv.set("crews", Array.from({ length: 10 }, (_, i) => shipRow(`c${i + 1}`, `thr_c${i + 1}`, "thr_cap")));
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async (input: { threadId: string }) =>
+      makeThreadResponse({ id: input.threadId, status: "active" }));
+    const result = await agentTool(host, "firstmate_dispatch").execute(
+      { task: "fix flaky login", projectId: "proj_1" },
+      { projectId: "proj_1", threadId: "thr_cap" } as never,
+    );
+    assert.ok(!isToolError(result), toolText(result));
+    assert.match(toolText(result), /Queued as \S+ \(crew cap 10/);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
+    const queued = await durableQueue(host);
+    assert.equal(queued.length, 1);
+    assert.match(queued[0]!.detail, /fix flaky login/);
+    assert.equal(queued[0]!.status, "queued");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("async dispatch CLI queues work past the running-crew cap", async () => {
+  const host = await load();
+  try {
+    await host.harness.behavior.setSettings({ fmReliability: JSON.stringify({ asyncDispatch: "on" }) });
+    await host.bb.storage.kv.set("crews", Array.from({ length: 10 }, (_, i) => shipRow(`c${i + 1}`, `thr_c${i + 1}`, "thr_cap")));
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async (input: { threadId: string }) =>
+      makeThreadResponse({ id: input.threadId, status: "active" }));
+    const result = await host.harness.behavior.runCli(
+      ["dispatch", "--project", "proj_1", "--", "fix flaky login"],
+      { projectId: "proj_1", threadId: "thr_cap" },
+    );
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(`${result.stdout}\n${result.stderr}`, /Queued as \S+ \(crew cap 10/);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
+    const queued = await durableQueue(host);
+    assert.equal(queued.length, 1);
+    assert.equal(queued[0]!.status, "queued");
   } finally {
     await host.harness.lifecycle.dispose();
   }
