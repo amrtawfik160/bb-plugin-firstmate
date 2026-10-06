@@ -332,6 +332,25 @@ test("a terminated keeper also stops its blocked re-arm", async () => {
   }
 });
 
+test("a keeper whose bb mirror is stale logs it to the watch log and does not re-arm", async () => {
+  const home = keeperHome('echo ARMED');
+  mkdirSync(join(home, "config"));
+  writeFileSync(join(home, "config", "bb-overlay"), "");
+  mkdirSync(join(home, "bin-bb"));
+  writeFileSync(join(home, "bin-bb", "fm-watch-arm.sh"), "#!/bin/bash\necho ARMED\n");
+  chmodSync(join(home, "bin-bb", "fm-watch-arm.sh"), 0o755);
+  try {
+    const keeper = startKeeper(home);
+    assert.equal(await withTimeout(exited(keeper), 5000), 1);
+    const log = readFileSync(join(home, "state", ".bb-watch-arm.log"), "utf8");
+    assert.match(log, /FM_MIRROR_STALE: BB transport payloads stale\/missing: /);
+    assert.doesNotMatch(log, /ARMED/);
+    assert.equal(existsSync(join(home, "state", ".bb-watch-keeper.pid")), false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("a deleted captain's home stops its keeper and is not re-logged after a reload", async () => {
   let host = await load({ watchOwner: "fm-watch" });
   const stubs = (h: Host, gets: string[]) => {

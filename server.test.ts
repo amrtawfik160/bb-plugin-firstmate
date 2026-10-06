@@ -2971,7 +2971,6 @@ test("stale-mirror guard is wired into the SUPERVISION paths (keeper + checkWatc
   assert.match(keeper, /FM_MIRROR_STALE/, "keeper does not check the mirror on re-arm");
   assert.match(keeper, /\.mirror-manifest/);
   assert.match(keeper, /rev-parse HEAD/);
-  assert.match(keeper, /\} >> "\$LOG" 2>&1/, "keeper guard output must land in the watch log");
 
   // checkWatcher: the supervision poll runs the guard and logs a loud, supervision-specific
   // error when the mirror is stale.
