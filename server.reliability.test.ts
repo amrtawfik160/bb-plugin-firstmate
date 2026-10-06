@@ -179,3 +179,191 @@ test("captain idles repeat an unanswered-item reminder only after backoff", asyn
     await host.harness.lifecycle.dispose();
   }
 });
+
+const asyncOn = (host: Host, extra: Record<string, string> = {}) =>
+  host.harness.behavior.setSettings({ fmReliability: JSON.stringify({ asyncDispatch: "on", ...extra }) });
+
+function stubSpawn(host: Host, status: (threadId: string) => string = () => "starting") {
+  host.harness.sdk.stub("threadSections.list", async () => []);
+  host.harness.sdk.stub("threadSections.create", async () => ({ id: "sec_crews" }));
+  host.harness.sdk.stub("environments.list", async () => [{ hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" }]);
+  host.harness.sdk.stub("threads.list", async () => []);
+  host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_new" }));
+  host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: status(threadId) }));
+}
+
+async function until(check: () => boolean, ms = 4000) {
+  const deadline = Date.now() + ms;
+  while (!check() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.ok(check(), "condition not reached in time");
+}
+
+const capCtx = { projectId: "proj_1", threadId: "thr_cap" } as never;
+const spawnArgs = (host: Host) => host.harness.sdk.callsTo("threads.spawn").map((c) => c[0] as {
+  providerId?: string; environment?: { workspace?: { type?: string } };
+});
+
+function crewRow(id: string, threadId: string) {
+  return { id, task: "fix login", projectId: "proj_1", threadId, parentThreadId: "thr_cap", providerId: null, model: null, reasoningLevel: null, worktree: true, shape: "ship", posture: "direct-PR", createdAt: "2026-09-18T00:00:00.000Z" };
+}
+
+test("an async dispatch does not block the per-minute follow-up after it finishes", async () => {
+  const host = await load();
+  try {
+    await asyncOn(host);
+    stubSpawn(host);
+    const reserved = await tool(host, "firstmate_dispatch").execute({ task: "fix flaky login", projectId: "proj_1" }, capCtx);
+    assert.match(text(reserved), /Reserved crew/);
+    await until(() => host.harness.sdk.callsTo("threads.spawn").length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const before = host.harness.inspection.realtimeSignals.length;
+    await host.harness.behavior.runSchedule("pr-delivery-follow-up");
+    assert.ok(host.harness.inspection.realtimeSignals.length > before, "the follow-up pass ran and published the fleet");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("an async dispatch uses the same worktree, provider, and posture setup as a direct dispatch", async () => {
+  const host = await load();
+  try {
+    await asyncOn(host);
+    await host.harness.behavior.setSettings({ defaultProvider: "codex" });
+    stubSpawn(host);
+    await tool(host, "firstmate_dispatch").execute({ task: "fix flaky login", projectId: "proj_1" }, capCtx);
+    await until(() => host.harness.sdk.callsTo("threads.spawn").length === 1);
+    const [args] = spawnArgs(host);
+    assert.equal(args!.environment?.workspace?.type, "managed-worktree");
+    assert.equal(args!.providerId, "codex");
+    const crews = await host.bb.storage.kv.get<Array<{ posture: string }>>("crews");
+    assert.equal(crews?.[0]?.posture, "no-mistakes");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+async function captainIdle(host: Host) {
+  await host.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_cap", status: "idle" }), lastAssistantText: "ok" });
+}
+
+async function knownCaptainHost() {
+  const host = await load(async (h) => { await h.bb.storage.kv.set("captain-project:thr_cap", "proj_1"); });
+  host.harness.sdk.stub("threads.send", async () => ({}));
+  host.harness.sdk.stub("threads.events.list", async () => []);
+  host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
+  return host;
+}
+
+test("a captain idle drains only over-cap dispatches, never the queued backlog", async () => {
+  const host = await knownCaptainHost();
+  try {
+    await asyncOn(host);
+    stubSpawn(host);
+    const added = await tool(host, "firstmate_queue").execute({ action: "add", title: "later: tidy docs" }, capCtx);
+    assert.match(text(added), /Queued/);
+    await captainIdle(host);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("an over-cap dispatch starts with its own provider and a worktree once a slot opens", async () => {
+  const host = await knownCaptainHost();
+  try {
+    await asyncOn(host);
+    await host.bb.storage.kv.set("crews", Array.from({ length: 10 }, (_, i) => crewRow(`c${i + 1}`, `thr_c${i + 1}`)));
+    let busy = true;
+    stubSpawn(host, () => (busy ? "active" : "idle"));
+    const queued = await tool(host, "firstmate_dispatch").execute({ task: "fix flaky login", projectId: "proj_1", providerId: "codex" }, capCtx);
+    assert.match(text(queued), /Queued as/);
+    busy = false;
+    await captainIdle(host);
+    const [args] = spawnArgs(host);
+    assert.ok(args, "the over-cap item started");
+    assert.equal(args.providerId, "codex");
+    assert.equal(args.environment?.workspace?.type, "managed-worktree");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a crew whose status read fails still holds a cap slot", async () => {
+  const host = await load();
+  try {
+    await asyncOn(host);
+    await host.bb.storage.kv.set("crews", Array.from({ length: 10 }, (_, i) => crewRow(`c${i + 1}`, `thr_c${i + 1}`)));
+    stubSpawn(host);
+    host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => {
+      if (threadId.startsWith("thr_c")) throw new Error("host unreachable");
+      return makeThreadResponse({ id: threadId, status: "starting" });
+    });
+    const result = await tool(host, "firstmate_dispatch").execute({ task: "fix flaky login", projectId: "proj_1" }, capCtx);
+    assert.match(text(result), /Queued as/);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a held crew doorbell reaches the captain once", async () => {
+  const host = await knownCaptainHost();
+  try {
+    await asyncOn(host);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: "idle" }));
+    const doorbell = "🔔 crew c1 done [ship] :: fix login";
+    const decision = await host.harness.inspection.registrations.hooks["message.dispatch"]!({
+      thread: makeThreadResponse({ id: "thr_cap", status: "active" }),
+      attempt: "join-turn", initiator: "system", senderThreadId: null, queuedMessages: [],
+      input: { blocks: [], text: doorbell },
+    } as never);
+    assert.equal(decision.action, "wait", "BB holds the original doorbell and re-delivers it");
+    await captainIdle(host);
+    const copies = host.harness.sdk.callsTo("threads.send").filter((c) => JSON.stringify(c[0]).includes("crew c1 done"));
+    assert.equal(copies.length, 0, "the plugin must not send a second copy");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+async function watchedCrewHost() {
+  const host = await load();
+  await host.harness.behavior.setSettings({ fmReliability: JSON.stringify({ honestStatus: "on" }), supervisionEnabled: true });
+  host.harness.sdk.stub("threads.send", async () => ({}));
+  host.harness.sdk.stub("threads.list", async () => []);
+  host.harness.sdk.stub("threads.events.list", async () => []);
+  host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: "idle", environmentId: null }));
+  await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew")]);
+  return host;
+}
+
+const crewIdle = (host: Host, lastAssistantText: string) => host.harness.behavior.emitThreadEvent("thread.idle", {
+  thread: makeThreadResponse({ id: "thr_crew", status: "idle", projectId: "proj_1" }), lastAssistantText,
+});
+const watchdogNotes = (host: Host) => host.harness.sdk.callsTo("threads.send")
+  .map((c) => JSON.stringify(c[0])).filter((t) => /[Ww]atchdog/.test(t));
+
+test("the loop watchdog ignores crews that keep producing new output", async () => {
+  const host = await watchedCrewHost();
+  try {
+    for (let i = 0; i < 10; i++) await crewIdle(host, `working: step ${i} edited file ${i}`);
+    assert.deepEqual(watchdogNotes(host), []);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("the loop watchdog notes repeated empty turns once and says the crew still runs", async () => {
+  const host = await watchedCrewHost();
+  try {
+    for (let i = 0; i < 12; i++) await crewIdle(host, "");
+    const notes = watchdogNotes(host);
+    assert.equal(notes.length, 1);
+    assert.doesNotMatch(notes[0]!, /stopped crew/);
+    assert.match(notes[0]!, /not stopped/);
+    assert.equal(host.harness.sdk.callsTo("threads.stop").length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
