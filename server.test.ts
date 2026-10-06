@@ -4608,7 +4608,7 @@ test("the fm-watch supervisor relaunches the real watcher when the beacon is sta
     assert.ok(keeper, "keeper script was not written");
     assert.ok(keeper!.includes("fm-watch-arm.sh"), "keeper does not re-arm fm-watch");
     assert.ok(keeper!.includes(".bb-watch-keeper.pid"), "keeper does not track a pidfile");
-    assert.ok(/while \[/.test(keeper!) && /sleep /.test(keeper!), "keeper is not a re-arming loop");
+    assert.ok(/while owned; do/.test(keeper!) && /sleep /.test(keeper!), "keeper is not a re-arming loop");
     // The watcher's page reason was relayed to the captain.
     const relayed = sendCalls(host).some((s) => (s.text ?? "").includes("fm-watch") && (s.text ?? "").includes("stale: fm-abc"));
     assert.ok(relayed, "supervisor did not relay the fm-watch wake reason to the captain");

@@ -62,6 +62,7 @@ import { createQueueStore, type QueueItem } from "./lib/queue-store.ts";
 import { admissionDecision, createDispatchJobs, spawnBackoffMs } from "./lib/async-dispatch.ts";
 import { createWatchdogStore, observeIdleTurn, tripWatchdog, watchdogNoticeText, watchdogTrip } from "./lib/crew-watchdog.ts";
 import { createDoorbellHold, doorbellHoldDecision } from "./lib/doorbell-hold.ts";
+import { createRetryLedger, type RetryItem, type RetryKind } from "./lib/retry-ledger.ts";
 import { HANDOFF_WAKE_AMENDMENT, captainInstructionsWithHandoff } from "./lib/handoff-contract.ts";
 import { honestIdleVerdictPresentation, interruptIsStopped, readyClaim } from "./lib/honest-status.ts";
 import { ACK_TEXT, ackEligible, createInboundLedger, inboundKey, sweeperSteerText } from "./lib/inbound-ledger.ts";
@@ -595,11 +596,18 @@ export function fmWatchKeeperInterval(graceSec: number): number {
   return Math.max(10, Math.min(20, Math.floor(grace / 3)));
 }
 
+// The watch log keeps the newest FM_WATCH_LOG_KEEP bytes once it passes FM_WATCH_LOG_MAX.
+// Every writer appends (O_APPEND), so truncating in place is safe for open writers.
+export const FM_WATCH_LOG_MAX = 1_048_576;
+export const FM_WATCH_LOG_KEEP = 262_144;
+
 // The durable keeper: a standalone bash script (written to the host as a FILE via writeHostFile
-// so there is no shell-quoting hazard). It records its own pid, self-exits when the pidfile no
-// longer names it (teardown removes it), and re-arms fm-watch every `interval`s. fm-watch-arm.sh
-// is idempotent (attaches to a live watcher), so the loop is cheap while a watcher blocks and only
-// forks a new one after one exits.
+// so there is no shell-quoting hazard). It records its own pid and re-arms fm-watch every
+// `interval`s. fm-watch-arm.sh is idempotent (attaches to a live watcher) and can block for
+// hours while it follows one, so the keeper runs it in the background and keeps checking its
+// own exit conditions: the pidfile still names it (teardown removes it, a successor
+// overwrites it) and the owner beat is fresh. On exit it stops its re-arm and removes the
+// pidfile only while the pidfile still names it.
 export function fmWatchKeeperScript(hostId: string, fmHome: string, interval: number): string {
   const pid = `${fmHome}/${FM_WATCH_KEEPER_PID}`;
   const log = `${fmHome}/state/.bb-watch-arm.log`;
@@ -634,22 +642,41 @@ export function fmWatchKeeperScript(hostId: string, fmHome: string, interval: nu
     `LOG=${shQuote(log)}`,
     `OWNER_BEAT=${shQuote(ownerBeat)}`,
     `OWNER_TTL=${ttl}`,
+    `LOG_MAX=${FM_WATCH_LOG_MAX}`,
+    `LOG_KEEP=${FM_WATCH_LOG_KEEP}`,
+    "ARM_PID=",
     'echo $$ > "$PID"',
-    `trap 'rm -f "$PID"' EXIT`,
-    // Loop while BOTH hold: (a) the pidfile still names this process (fast teardown
-    // removes/overwrites it), and (b) the owner beat is fresh (D7 self-exit — the owner
-    // stopped refreshing it, so the plugin is gone even if it never reached this host).
-    'while [ "$(cat "$PID" 2>/dev/null)" = "$$" ]; do',
+    'cleanup() { if [ -n "$ARM_PID" ]; then kill "$ARM_PID" 2>/dev/null; wait "$ARM_PID" 2>/dev/null; fi; if [ "$(cat "$PID" 2>/dev/null)" = "$$" ]; then rm -f "$PID"; fi; }',
+    "trap cleanup EXIT",
+    "trap 'exit 143' TERM INT HUP",
+    // (a) the pidfile still names this process, and (b) the owner beat is fresh (D7 self-exit:
+    // the owner stopped refreshing it, so the plugin or its captain is gone).
+    "owned() {",
+    '  [ "$(cat "$PID" 2>/dev/null)" = "$$" ] || return 1',
     '  OB=$(cat "$OWNER_BEAT" 2>/dev/null || echo 0); case "$OB" in ""|*[!0-9]*) OB=0 ;; esac',
     '  NOW=$(date +%s)',
-    '  if [ "$OB" -eq 0 ] || [ $(( NOW - OB )) -gt "$OWNER_TTL" ]; then break; fi',
+    '  if [ "$OB" -eq 0 ] || [ $(( NOW - OB )) -gt "$OWNER_TTL" ]; then return 1; fi',
+    "}",
+    "trim_log() {",
+    '  SIZE=$(stat -c %s "$LOG" 2>/dev/null || echo 0)',
+    '  if [ "$SIZE" -gt "$LOG_MAX" ] && tail -c "$LOG_KEEP" "$LOG" > "$LOG.trim" 2>/dev/null; then cat "$LOG.trim" > "$LOG"; fi',
+    '  rm -f "$LOG.trim"',
+    "}",
+    "while owned; do",
+    "  trim_log",
     // F2 (re-review): the keeper re-arms fm-watch FROM the mirror, so a stale mirror here
     // (missing sibling / drifted copy after an out-of-band ff) would silently degrade
-    // supervision — exactly the failure this effort removed. Check on every re-arm and
-    // record FM_MIRROR_STALE into the watch log; checkWatcher reads that log tail and
-    // surfaces it loudly. Cheap (~6ms: sed + git rev-parse).
+    // supervision. Check on every re-arm and record FM_MIRROR_STALE into the watch log;
+    // the supervision poll runs the same guard and reports it. Cheap (~6ms: sed + git rev-parse).
     `  { ${fmMirrorStaleGuard(fmHome)} ; } >> "$LOG" 2>&1`,
-    '  "$ARM" >> "$LOG" 2>&1 || true',
+    '  "$ARM" >> "$LOG" 2>&1 &',
+    "  ARM_PID=$!",
+    '  while kill -0 "$ARM_PID" 2>/dev/null; do',
+    "    owned || exit 0",
+    `    sleep ${interval}`,
+    "  done",
+    '  wait "$ARM_PID" 2>/dev/null',
+    "  ARM_PID=",
     `  sleep ${interval}`,
     "done",
   ].join("\n");
@@ -1547,7 +1574,26 @@ export default async function plugin(bb: BbPluginApi) {
   const crewWatchdog = createWatchdogStore(bb.storage.database());
   const dispatchJobs = createDispatchJobs(bb.storage.database());
   const doorbellHold = createDoorbellHold(bb.storage.database());
+  const retries = createRetryLedger(bb.storage.database());
   const launchAbort = new AbortController();
+  // The mirror guard prints FM_MIRROR_STALE on every run while a mirror is stale.
+  // Keyed by host and home, so each change is logged once instead of on every poll.
+  const mirrorStaleSeen = new Map<string, string>();
+  function noteMirrorStale(hostId: string, fmHome: string, guardOutput: string, describe: (line: string) => string): void {
+    const key = `${hostId}:${fmHome}`;
+    const line = guardOutput.split("\n").find((l) => l.includes("FM_MIRROR_STALE"))?.trim();
+    const prior = mirrorStaleSeen.get(key);
+    if (line === undefined) {
+      if (prior !== undefined) {
+        mirrorStaleSeen.delete(key);
+        bb.log.info(`bb mirror on host ${hostId} for ${fmHome} is no longer stale.`);
+      }
+      return;
+    }
+    if (prior === line) return;
+    mirrorStaleSeen.set(key, line);
+    bb.log.error(describe(line));
+  }
   const nativeRuntime=createNativeRuntime({assets:join(PLUGIN_ROOT,"runtime-assets"),files:()=>bb.sdk.files,disposal:launchAbort.signal,run:runStructuredOnHost});
   let followUpWork:Promise<void>|undefined;
   bb.onDispose(async () => { launchAbort.abort();await Promise.allSettled([followUpWork,...dispatchWork]); });
@@ -2106,6 +2152,8 @@ export default async function plugin(bb: BbPluginApi) {
       await bb.storage.kv.set(`crew-retired:${crew.threadId}`, true);
       return crews.filter(c => c.id !== crew.id || c.threadId !== crew.threadId);
     });
+    retries.clear("pr-discovery", crew.threadId);
+    retries.clear("landed-retire", crew.threadId);
     if (crew.taskSpilled === true && !(await readCrews()).some((c) => c.id === crew.id)) {
       await bb.storage.kv.delete(`${CREW_TASK_PREFIX}${crew.id}`).catch(() => {});
     }
@@ -2330,6 +2378,25 @@ export default async function plugin(bb: BbPluginApi) {
   // Wakes held while a captain cannot take a turn (provider limit, errored thread).
   // KV-backed so a reload keeps them; released as ONE wake when the captain is back.
   const CAPTAIN_WAKE_HOLD_PREFIX = "captain-wake-hold:";
+  // telegram.reply reports the connector's threading mode. A change is logged once
+  // and the mismatch stays in bearings until it clears.
+  const TELEGRAM_THREADING_KEY = "telegram-threading";
+  const telegramThreadingSchema = z.object({ mismatch: z.boolean(), since: z.number() });
+  const TELEGRAM_THREADING_MISMATCH = "Telegram threaded replies are off in the Telegram connector, but Firstmate's telegramThreading flag is on, so replies arrive unthreaded. Turn threading on in the connector, or set telegramThreading off.";
+  let telegramMismatch: boolean | undefined;
+  async function noteTelegramThreading(mode: "on" | "off" | undefined): Promise<void> {
+    if (mode === undefined) return;
+    const mismatch = mode === "off";
+    if (telegramMismatch === undefined) {
+      const prior = telegramThreadingSchema.safeParse(await bb.storage.kv.get(TELEGRAM_THREADING_KEY));
+      telegramMismatch = prior.success && prior.data.mismatch;
+    }
+    if (telegramMismatch === mismatch) return;
+    telegramMismatch = mismatch;
+    await bb.storage.kv.set(TELEGRAM_THREADING_KEY, { mismatch, since: Date.now() });
+    if (mismatch) bb.log.warn(TELEGRAM_THREADING_MISMATCH);
+    else bb.log.info("Telegram threaded replies now match Firstmate's telegramThreading flag.");
+  }
   const MAX_HELD_WAKES = 40;
   const heldWakeSchema = z.object({ since: z.number(), reason: z.string(), lines: z.array(z.string()), dueAt: z.number().optional() });
   const wakeBatchTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -2351,7 +2418,7 @@ export default async function plugin(bb: BbPluginApi) {
     void run.finally(() => { if (heldWakeLocks.get(captain) === run) heldWakeLocks.delete(captain); }).catch(() => {});
     return raceAbort(run, signal, STUCK_HOST_CALL_MS);
   }
-  async function captainHoldState(parentThreadId: string, signal?: AbortSignal): Promise<{ hold: boolean; reason: string; status: string | null; archived: boolean }> {
+  async function captainHoldState(parentThreadId: string, signal?: AbortSignal): Promise<{ hold: boolean; reason: string; status: string | null; archived: boolean; resetsAt: number | null }> {
     let status: string | null = null;
     let archived = false;
     try {
@@ -2373,7 +2440,7 @@ export default async function plugin(bb: BbPluginApi) {
     } catch (error) {
       if (isAbortError(error)) throw error;
     }
-    return { ...captainWakeHold({ status, rateLimit, now: Date.now() }), status, archived };
+    return { ...captainWakeHold({ status, rateLimit, now: Date.now() }), status, archived, resetsAt: rateLimit?.resetsAt ?? null };
   }
   async function holdCaptainWake(parentThreadId: string, text: string, reason: string, dueAt?: number): Promise<void> {
     await withHeldWakeLock(parentThreadId, async () => {
@@ -3361,10 +3428,7 @@ export default async function plugin(bb: BbPluginApi) {
     ].join("\n");
     try {
       const res = await runOnHost(host, script, 30_000);
-      if (res.output.includes("FM_MIRROR_STALE")) {
-        const line = res.output.split("\n").find((l) => l.includes("FM_MIRROR_STALE"))?.trim() ?? "FM_MIRROR_STALE";
-        bb.log.error(`bb mirror is STALE while scaffolding brief crew=${crew.id}: ${line}. Re-run the overlay installer against ${fmHome}.`);
-      }
+      noteMirrorStale(host, fmHome, res.output, (line) => `bb mirror is STALE while scaffolding brief crew=${crew.id}: ${line}. Re-run the overlay installer against ${fmHome}.`);
       if (res.exitCode !== 0) {
         bb.log.warn(`fm brief scaffold failed crew=${crew.id} exit=${res.exitCode}: ${res.output.trim().slice(-400)}`);
         return false;
@@ -4415,15 +4479,27 @@ export default async function plugin(bb: BbPluginApi) {
     dispatchWork.add(job);
     void job.finally(() => dispatchWork.delete(job));
   }
-  async function runReservedDispatch(reservedId: string, captain: string, input: Parameters<typeof dispatchCrew>[0]): Promise<void> {
+  // One attempt of a reserved background dispatch. A held captain sets the job's
+  // backoff (the provider reset time when known) and returns; resumeDispatchJobs runs
+  // it again once due, in this process or after a reload. The launch ledger keys the
+  // spawn by crew id, so a job that already created its worker never spawns another.
+  const dispatchInFlight = new Set<string>();
+  async function runReservedDispatch(reservedId: string): Promise<void> {
     const job = dispatchJobs.get(reservedId);
-    if (!job || job.state === "started" || job.state === "failed") return;
+    if (!job || job.state === "started" || job.state === "failed" || dispatchInFlight.has(reservedId)) return;
+    dispatchInFlight.add(reservedId);
     try {
-      const hold = await captainHoldState(captain);
-      const wait = spawnBackoffMs({ rateLimited: hold.hold, resetsAt: null, now: Date.now() });
-      if (wait > 0) await raceAbort(sleep(wait), launchAbort.signal);
-      dispatchJobs.save({ ...job, state: "spawning", startedAt: Date.now() });
-      await dispatchCrew(input);
+      const input = JSON.parse(job.payload) as Omit<Parameters<typeof dispatchCrew>[0], "signal">;
+      if (typeof input.shape !== "string") throw new Error(`Job ${reservedId} predates resumable dispatch and lacks its options; dispatch again with taskId=${reservedId}.`);
+      const hold = await captainHoldState(job.captainThreadId, launchAbort.signal);
+      const now = Date.now();
+      const wait = spawnBackoffMs({ rateLimited: hold.hold, resetsAt: hold.resetsAt, now, attempt: job.attempts ?? 0 });
+      if (wait > 0) {
+        dispatchJobs.save({ ...job, backoffUntil: now + wait, attempts: (job.attempts ?? 0) + 1 });
+        return;
+      }
+      dispatchJobs.save({ ...job, state: "spawning", startedAt: now, backoffUntil: null });
+      await dispatchCrew({ ...input, crewId: reservedId, signal: launchAbort.signal });
       const done = dispatchJobs.get(reservedId);
       if (done) dispatchJobs.save({ ...done, state: "started" });
       for (const ref of input.sourceRefs ?? []) {
@@ -4431,9 +4507,19 @@ export default async function plugin(bb: BbPluginApi) {
         if (key) inboundLedger.markDelegated(key, reservedId, Date.now());
       }
     } catch (error) {
+      // An unload interrupts the attempt; the job stays due and the next load resumes it.
+      if (launchAbort.signal.aborted) return;
       const failed = dispatchJobs.get(reservedId);
       if (failed) dispatchJobs.save({ ...failed, state: "failed", error: String(error) });
       bb.log.warn(`async dispatch ${reservedId}: ${String(error)}`);
+    } finally {
+      dispatchInFlight.delete(reservedId);
+    }
+  }
+  function resumeDispatchJobs(owner?: string): void {
+    if (launchAbort.signal.aborted) return;
+    for (const job of dispatchJobs.due(Date.now())) {
+      if (owner === undefined || job.captainThreadId === owner) trackDispatchJob(runReservedDispatch(job.crewId));
     }
   }
 
@@ -4514,15 +4600,7 @@ export default async function plugin(bb: BbPluginApi) {
         bb.log.warn(`queued dispatch ${item.id}: ${message}`);
       }
     }
-    for (const job of dispatchJobs.due(Date.now())) {
-      if (owner && job.captainThreadId !== owner) continue;
-      const hold = await captainHoldState(job.captainThreadId);
-      const wait = spawnBackoffMs({ rateLimited: hold.hold, resetsAt: null, now: Date.now() });
-      if (wait > 0) {
-        dispatchJobs.save({ ...job, backoffUntil: Date.now() + wait });
-        continue;
-      }
-    }
+    resumeDispatchJobs(owner);
   }
 
   async function drainCaptainReliability(captainThreadId: string, signal?: AbortSignal): Promise<void> {
@@ -5479,7 +5557,21 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
 
-  async function bearingsSnapshot(owner?: string, opts: { realBacklog?: boolean } = {}): Promise<{
+  // Items a background loop gave up on, plus the Telegram threading mismatch. They stay
+  // listed until resolved; the captain was told once when each one started.
+  async function captainAttention(owner?: string): Promise<string[]> {
+    const lines = retries.needsCaptain(owner).map(needsCaptainLine);
+    const threading = telegramThreadingSchema.safeParse(await bb.storage.kv.get(TELEGRAM_THREADING_KEY));
+    if (threading.success && threading.data.mismatch) lines.push(`Needs captain: ${TELEGRAM_THREADING_MISMATCH}`);
+    return lines;
+  }
+  async function bearingsSnapshot(owner?: string, opts: { realBacklog?: boolean } = {}): ReturnType<typeof bearingsBase> {
+    const snap = await bearingsBase(owner, opts);
+    const attention = await captainAttention(owner);
+    if (attention.length === 0) return snap;
+    return { ...snap, text: `${snap.text}\n\n${attention.join("\n")}`, rpc: { ...snap.rpc, calls: [...snap.rpc.calls, ...attention] } };
+  }
+  async function bearingsBase(owner?: string, opts: { realBacklog?: boolean } = {}): Promise<{
     text: string;
     json: Record<string, unknown>;
     rpc: {
@@ -6086,6 +6178,29 @@ export default async function plugin(bb: BbPluginApi) {
       } catch { return "unknown"; }
     }));
   }
+  // One failed attempt of a background retry loop. Logs only when the state changes
+  // (first failure, new reason, escalation) and tells the owning captain once when
+  // the item reaches needs-captain. Escalation stops background retries only; the
+  // work it names is kept.
+  async function retryFailed(input: { kind: RetryKind; subject: string; owner: string | null; label: string; hint: string; reason: string; logPrefix: (attempt: number) => string; notify?: boolean }, signal?: AbortSignal): Promise<void> {
+    const { item, logged, escalated } = retries.fail({ ...input, now: Date.now() });
+    if (escalated) {
+      bb.log.warn(`Needs captain: ${item.label} after ${item.attempts} attempts; background retries stopped.`);
+      if (input.notify !== false && item.owner && retries.claimNotice(item.kind, item.subject)) {
+        await deliverToCaptain(item.owner, `⚠️ ${needsCaptainLine(item)} Background retries stopped; nothing was deleted.`, item.subject, signal, true)
+          .catch((error) => bb.log.info(`Needs captain notice for ${item.label} not delivered: ${String(error)}`));
+      }
+    } else if (logged) {
+      bb.log.warn(`${input.logPrefix(item.attempts)}: ${item.reason}`);
+    }
+  }
+  function retryCleared(kind: RetryKind, subject: string): void {
+    const prior = retries.clear(kind, subject);
+    if (prior) bb.log.info(`${prior.label} recovered after ${prior.attempts} failed attempt(s).`);
+  }
+  function needsCaptainLine(item: RetryItem): string {
+    return `Needs captain: ${item.label} (${item.attempts} attempts): ${truncate(item.reason.replace(/\s+/g, " "), 300)}${/[.!?]$/.test(item.reason.trim()) ? "" : "."} ${item.hint}`.trim();
+  }
   let deliveryDoneCursor=0;
   async function recoverDoneDeliveries(signal?:AbortSignal) {
     const done=(await raceAbort(readDone(),signal,STUCK_HOST_CALL_MS)).filter(r=>r.shape === "ship" && r.pr && r.parentThreadId);
@@ -6115,8 +6230,17 @@ export default async function plugin(bb: BbPluginApi) {
     for (const record of batch) {
       signal?.throwIfAborted();
       await boundedFollowUp(async signal=>{
-        if (record.state === "creating" || record.state === "uncertain") {
-          await reconcileLaunch(record,signal).catch(error => bb.log.warn(String(error)));
+        if (record.state !== "creating" && record.state !== "uncertain") retryCleared("launch-reconcile", record.key);
+        else if (retries.isDue("launch-reconcile", record.key, Date.now())) {
+          try {
+            await reconcileLaunch(record,signal);
+            retryCleared("launch-reconcile", record.key);
+          } catch (error) {
+            if (signal?.aborted) throw error;
+            await retryFailed({ kind: "launch-reconcile", subject: record.key, owner: record.owner || null, label: `Launch ${record.taskId}`,
+              hint: `Its slot is retained. Dispatch again with taskId=${record.taskId} to reconcile, or adopt the exact worker.`,
+              reason: error instanceof Error ? error.message : String(error), logPrefix: (attempt) => `Launch reconciliation ${record.taskId} (attempt ${attempt})` }, signal);
+          }
         }
         const recovered=launches.get(record.key)!;
         if (recovered.state === "provisioning" && recovered.threadId) try {
@@ -6149,7 +6273,16 @@ export default async function plugin(bb: BbPluginApi) {
     deliveryDiscoveryCursor = crews.length ? (deliveryDiscoveryCursor+batch.length)%crews.length : 0;
     for (const crew of batch) {
       signal?.throwIfAborted();
-      await boundedFollowUp(s=>discoverCrewDelivery(crew,s),signal).catch(error => bb.log.warn(`PR discovery ${crew.id}: ${String(error)}`));
+      if (!retries.isDue("pr-discovery", crew.threadId, Date.now())) continue;
+      try {
+        await boundedFollowUp(s=>discoverCrewDelivery(crew,s),signal);
+        retryCleared("pr-discovery", crew.threadId);
+      } catch (error) {
+        if (signal?.aborted) continue;
+        await retryFailed({ kind: "pr-discovery", subject: crew.threadId, owner: crew.parentThreadId, label: `PR discovery for crew ${crew.id}`,
+          hint: `If the crew opened a PR, register it with firstmate_delivery action=register crewId=${crew.id}.`,
+          reason: error instanceof Error ? error.message : String(error), logPrefix: (attempt) => `PR discovery ${crew.id} (attempt ${attempt})` }, signal);
+      }
     }
     for (const record of deliveries.list({ due:Date.now(),limit:10 })) {
       signal?.throwIfAborted();
@@ -6582,10 +6715,15 @@ export default async function plugin(bb: BbPluginApi) {
   // real state/<id>.meta ledger. Only idle/error crews are checked — an active
   // crew's PR is not landed yet — so this adds no PR reads beyond bearings.
   // A refused native teardown (e.g. uncommitted work in the crew worktree) keeps
-  // the crew. One refusal must not fail the whole digest/fleet view, and the
-  // slow teardown is not re-run on every poll.
-  const landedRetireBackoff = new Map<string, number>();
-  const LANDED_RETIRE_BACKOFF_MS = 10 * 60_000;
+  // the crew. One refusal must not fail the whole digest/fleet view; the retry
+  // ledger backs the slow teardown off and stops it at the bound.
+  // fm-guard prints advisory WARNING banners before every native command
+  // (`fm-guard.sh || true`); they never cause the refusal, so drop them from it.
+  function refusalReason(error: unknown): string {
+    const text = error instanceof Error ? error.message : String(error);
+    const stripped = text.replace(/WARNING: [^\n]*(?:\n|$)/g, "").trim();
+    return stripped === "" ? text.trim() : stripped;
+  }
 
   // Tell a crew's OWNING captain its PR landed outside its own merge (by the user or
   // another captain), once per crew+PR. Without this the owner believed "the user
@@ -6622,7 +6760,7 @@ export default async function plugin(bb: BbPluginApi) {
       // verifies other people's PRs) delivers a report, so a merged PR on its
       // environment must never retire it while the captain still needs it.
       if (crew.shape !== "ship") continue;
-      if ((landedRetireBackoff.get(crew.id) ?? 0) > Date.now()) continue;
+      if (!retries.isDue("landed-retire", crew.threadId, Date.now())) continue;
       const status = statusByThread.get(crew.threadId) ?? "unknown";
       if (status !== "idle" && status !== "error") continue;
       let pr = await prForCrew(crew);
@@ -6666,12 +6804,14 @@ export default async function plugin(bb: BbPluginApi) {
       try {
         await retireLanded(crew, state === "merged" ? "merged externally" : "PR closed externally", url);
         retired.add(crew.id);
-        landedRetireBackoff.delete(crew.id);
+        retryCleared("landed-retire", crew.threadId);
         if (tell) await tellCaptainLanded(crew, url, true, "", opts.signal).catch(() => {});
       } catch (error) {
-        landedRetireBackoff.set(crew.id, Date.now() + LANDED_RETIRE_BACKOFF_MS);
-        const reason = error instanceof Error ? error.message : String(error);
-        bb.log.warn(`landed crew retire refused crew=${crew.id} pr=${url} (crew kept): ${reason}`);
+        const reason = refusalReason(error);
+        // The refusal notice below (or the captain's own bearings) is the one notification.
+        await retryFailed({ kind: "landed-retire", subject: crew.threadId, owner: crew.parentThreadId, label: `Cleanup of landed crew ${crew.id}`,
+          hint: `The work is landed and kept. Resolve the refusal, then run firstmate_forget crewId=${crew.id} stop=true.`,
+          reason, notify: false, logPrefix: (attempt) => `landed crew retire refused crew=${crew.id} pr=${url} (crew kept, attempt ${attempt})` }, opts.signal);
         if (tell) {
           await rememberPrUrl(crew, url).catch(() => {});
           await tellCaptainLanded(crew, url, false, reason, opts.signal).catch(() => {});
@@ -7610,10 +7750,7 @@ export default async function plugin(bb: BbPluginApi) {
         await runHostCommand(input.hostId, `rm -f ${shQuote(staged)} ${shQuote(staged)}.fm-b64-* ${shQuote(staged)}.fm-out-*`, 10_000).catch(() => {});
       }
     })() : await runOnHost(input.hostId, prelude, input.timeoutMs, input.signal, input.stdin);
-    if (result.output.includes("FM_MIRROR_STALE")) {
-      const line = result.output.split("\n").find((l) => l.includes("FM_MIRROR_STALE"))?.trim() ?? "FM_MIRROR_STALE";
-      bb.log.error(`bb mirror is STALE on host ${input.hostId} running fm-${script}: ${line}. Re-run the overlay installer against ${input.fmHome}; new native scripts are unmirrored and the three patched copies are frozen behind upstream.`);
-    }
+    noteMirrorStale(input.hostId, input.fmHome, result.output, (line) => `bb mirror is STALE on host ${input.hostId} running fm-${script}: ${line}. Re-run the overlay installer against ${input.fmHome}; new native scripts are unmirrored and the three patched copies are frozen behind upstream.`);
     const parsed = receipt && result.exitCode === 0 ? parseWakeReceipt(result.output) : undefined;
     return {
       ...result,
@@ -8902,10 +9039,15 @@ export default async function plugin(bb: BbPluginApi) {
     ].join("\n");
     try {
       const res = await runOnHost(hostId, readScript, 30_000, signal);
-      const ageMatch = /FM_BEAT_AGE=(-?\d+)/.exec(res.output);
+      // Markers come only from this poll. The keeper log tail after the separator keeps
+      // old lines (a stale-mirror line from hours ago) that must not re-raise an alarm.
+      const tailIdx = res.output.indexOf("---FM_LOGTAIL---");
+      const poll = tailIdx < 0 ? res.output : res.output.slice(0, tailIdx);
+      const logTail = tailIdx < 0 ? "" : res.output.slice(tailIdx + "---FM_LOGTAIL---".length).trim();
+      const ageMatch = /FM_BEAT_AGE=(-?\d+)/.exec(poll);
       const beatAge = ageMatch ? Number(ageMatch[1]) : -1;
-      const keeperAlive = /FM_KEEPER=alive/.test(res.output);
-      const noArm = res.output.includes("FM_WATCH_NO_ARM");
+      const keeperAlive = /FM_KEEPER=alive/.test(poll);
+      const noArm = poll.includes("FM_WATCH_NO_ARM");
       // B3(b): surface a failed owner-beat write loudly — the keeper is about to
       // self-exit even though the plugin thinks it is healthy. Treat an explicit
       // FM_OWNER_BEAT=fail as unwritable; absence of the marker (a truncated read) is
@@ -8913,23 +9055,16 @@ export default async function plugin(bb: BbPluginApi) {
       // Log-only surfacing (accepted by the captain): a failed beat write means the
       // keeper is about to self-exit while the plugin thinks it is healthy. Absence of
       // the marker (a truncated read) is not asserted as a failure.
-      if (res.output.includes("FM_OWNER_BEAT=fail")) {
+      if (poll.includes("FM_OWNER_BEAT=fail")) {
         bb.log.error(
           `fm-watch-supervisor: owner-beat write FAILED on host ${hostId} (${ownerBeat} not writable — full/read-only state dir?); the keeper will self-exit and real supervision will stop. Fix the state dir.`,
         );
       }
-      // F2 (re-review): a stale mirror on the SUPERVISION path (this poll's own guard, or
-      // the keeper's re-arm guard captured in the log tail) means the watcher fm-watch is
-      // armed from unmirrored/drifted scripts — supervision degrading silently. Surface it
-      // loudly on the supervision channel too, not just on dispatch.
-      if (res.output.includes("FM_MIRROR_STALE")) {
-        const line = res.output.split("\n").find((l) => l.includes("FM_MIRROR_STALE"))?.trim() ?? "FM_MIRROR_STALE";
-        bb.log.error(
-          `fm-watch-supervisor: bb mirror is STALE on host ${hostId}: ${line}. The keeper re-arms fm-watch from this mirror, so supervision is degrading — re-run the overlay installer against ${fmHome}.`,
-        );
-      }
-      const tailIdx = res.output.indexOf("---FM_LOGTAIL---");
-      const logTail = tailIdx < 0 ? "" : res.output.slice(tailIdx + "---FM_LOGTAIL---".length).trim();
+      // F2 (re-review): a stale mirror on the SUPERVISION path means fm-watch is armed
+      // from unmirrored/drifted scripts. This poll runs the same guard as the keeper's
+      // re-arm, so its own output is the current verdict.
+      noteMirrorStale(hostId, fmHome, poll, (line) =>
+        `fm-watch-supervisor: bb mirror is STALE on host ${hostId}: ${line}. The keeper re-arms fm-watch from this mirror, so supervision is degrading — re-run the overlay installer against ${fmHome}.`);
       if (noArm) {
         bb.log.warn("fm-watch-supervisor: no fm-watch-arm.sh at fmHome; cannot run the real watcher.");
       }
@@ -9729,14 +9864,14 @@ export default async function plugin(bb: BbPluginApi) {
         dispatchJobs.save({
           crewId: reservedId,
           captainThreadId: parentThreadId,
-          payload: JSON.stringify({ task, projectId: resolvedProject, sourceRefs: sourceRefs ?? [] }),
+          payload: JSON.stringify({ ...spawnInput, crewId: reservedId }),
           state: "reserved",
           createdAt: Date.now(),
           startedAt: null,
           error: null,
           backoffUntil: null,
         });
-        trackDispatchJob(runReservedDispatch(reservedId, parentThreadId, { ...spawnInput, crewId: reservedId, signal: launchAbort.signal }));
+        trackDispatchJob(runReservedDispatch(reservedId));
         return `Reserved crew ${reservedId}. Spawn continues in the background.`;
       }
       let crew: Crew;
@@ -9793,10 +9928,12 @@ export default async function plugin(bb: BbPluginApi) {
       let channel: "rpc" | "envelope" = "envelope";
       try {
         if (row.source === "telegram") {
-          channel = (await sendTelegramReply({
+          const sent = await sendTelegramReply({
             payload: { chatId: row.chatId, messageId: row.messageId, kind: "reply", text: stripTelegramEnvelope(text), threadId: row.topicId, correlation: correlationOf(row) },
             callRpc: flags.telegramThreading === "on" ? (args) => bb.sdk.plugins.callRpc(args) : null,
-          })).channel;
+          });
+          channel = sent.channel;
+          await noteTelegramThreading(sent.mode).catch((error) => bb.log.warn(`telegram threading state: ${String(error)}`));
         } else {
           await bb.sdk.threads.send({
             threadId: row.captainThreadId,
@@ -11148,6 +11285,7 @@ export default async function plugin(bb: BbPluginApi) {
                 bb.log.warn(`inbound telegram ack failed: ${String(error)}`);
                 return null;
               });
+              await noteTelegramThreading(sent?.mode).catch((error) => bb.log.warn(`telegram threading state: ${String(error)}`));
               if (sent?.outcome !== "delivered") {
                 inboundLedger.releaseOutbox(primary, "ack");
                 if (sent?.outcome === "not-applicable") ackNotApplicable.add(inboundKey(primary));
@@ -12280,7 +12418,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
   bb.background.schedule("pr-delivery-follow-up", "* * * * *", async () => {
     if (followUpWork || launchAbort.signal.aborted) return;
-    followUpWork=(async()=>{await launchRecoveryPass(launchAbort.signal);await deliveryPass(launchAbort.signal);await raceAbort(publishFleet(),launchAbort.signal,STUCK_HOST_CALL_MS);})();
+    followUpWork=(async()=>{await launchRecoveryPass(launchAbort.signal);resumeDispatchJobs();await deliveryPass(launchAbort.signal);await raceAbort(publishFleet(),launchAbort.signal,STUCK_HOST_CALL_MS);})();
     try {await followUpWork;} finally {followUpWork=undefined;}
   });
   bb.events.on("thread.archived", ({ thread }) => { deliveries.ownerLost(thread.id); });
@@ -12514,18 +12652,30 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
+  // A deleted captain 404s forever. Its keeper would otherwise keep re-arming fm-watch
+  // until the owner beat expired. Stop it, and record the home as retired so later
+  // passes and reloads skip it. The home's files and its native-home binding are kept.
+  const RETIRED_HOME_PREFIX = "captain-home-retired:";
+  async function retireDeletedCaptainHome(captain: string, signal?: AbortSignal): Promise<void> {
+    const home = await bb.storage.kv.get<string>(`native-home:${captain}`);
+    const host = await bb.storage.kv.get<string>(`native-home-host:${captain}`);
+    if (typeof home === "string" && home.trim() !== "" && typeof host === "string" && host !== "") {
+      await stopFmWatchKeeper(host, home, signal);
+    }
+    await bb.storage.kv.set(`${RETIRED_HOME_PREFIX}${captain}`, true);
+    bb.log.info(`captain home ${captain}: thread deleted; keeper stopped and the home is retired from supervision`);
+  }
+
   bb.background.service("captain-home-watch", {
     async start(signal) {
       const seen = new Map<string, Set<string>>();
-      // A deleted captain 404s forever; without this every pass logged it again.
-      const deletedCaptains = new Set<string>();
       // Homes whose bb mirror was checked against this load's overlay (once per load).
       const overlayChecked = new Set<string>();
       while (!signal.aborted) {
         for (const key of await bb.storage.kv.list("native-home:")) {
           if (signal.aborted) break;
           const captain = key.slice("native-home:".length);
-          if (deletedCaptains.has(captain)) continue;
+          if ((await bb.storage.kv.get(`${RETIRED_HOME_PREFIX}${captain}`)) === true) continue;
           try {
             await inCaptainHome(captain, async () => {
               const s = await settings.get();
@@ -12565,9 +12715,10 @@ export default async function plugin(bb: BbPluginApi) {
           } catch (error) {
             if (signal.aborted) continue;
             if (/\bHTTP 404\b.*Thread not found/i.test(String(error))) {
-              deletedCaptains.add(captain);
               seen.delete(captain);
-              bb.log.info(`captain home ${captain}: thread deleted; skipping it until the next reload`);
+              await retireDeletedCaptainHome(captain, signal).catch((cause) => {
+                if (!signal.aborted) bb.log.warn(`captain home ${captain}: thread deleted; retiring the home failed: ${String(cause)}`);
+              });
               continue;
             }
             bb.log.warn(`captain home ${captain}: ${String(error)}`);
