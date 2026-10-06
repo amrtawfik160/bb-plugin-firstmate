@@ -1038,7 +1038,7 @@ test("nudgeEnabled false leaves the idle ping to supervision", async () => {
     const sends = sendCalls(host);
     assert.equal(sends.length, 1);
     assert.equal(sends[0]?.threadId, "thr_cap");
-    assert.match(sends[0]?.text ?? "", /crew c1 done/);
+    assert.match(sends[0]?.text ?? "", /crew c1 idle with no outcome/);
   } finally {
     await host.harness.lifecycle.dispose();
   }

@@ -18,6 +18,12 @@ tool exists.
 - Event supervision: `thread.idle` / `thread.failed` / `turn.failed` /
   `interaction.pending`. Stuck checker still samples output. Crews get no
   dispatch tools.
+- Crew cap of 10 per captain (`maxActiveCrews`). Reliability flags in
+  `fmReliability` add background dispatch with an over-cap queue, honest
+  status with a loop watchdog, an inbound ledger with `firstmate_reply`, and
+  Telegram threaded replies. All are off by default; see the README.
+- An idle crew without a DONE, BLOCKED, or FAILED line is reported as having no
+  outcome and appears under Captain's Call, never as ready to review.
 - Real firstmate `bin/` is the default: `/captain` (deck) auto-clones + overlays
   the full toolbelt on first run (or prints one command, `bb firstmate init
   --real`, if the host can't), fast-forwards (ff-only, clean tree) a reused

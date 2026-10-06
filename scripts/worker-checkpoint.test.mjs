@@ -144,3 +144,35 @@ test('native zero-turn waiting uses foreground checks and refuses background pol
   const status=readFileSync(join(f.home,'state/task.status'),'utf8');assert.match(status,/paused /);assert.match(status,/resolved /);
  }finally{f.close();}
 });
+
+test('a TypeScript project without the best-practices skill sets up with a warning',()=>{
+ const f=fixture();try {
+  writeFileSync(join(f.worktree,'app.ts'),'export const x = 1;\n');f.git('add','app.ts');f.git('commit','-qm','ts');
+  const home=join(f.dir,'bare-home');mkdirSync(home);
+  const result=spawnSync('python3',[helper,'task','setup','direct-PR'],{cwd:f.worktree,env:{...f.env,HOME:home},encoding:'utf8',input:''});
+  assert.equal(result.status,0,result.stderr);
+  assert.match(result.stderr,/warning: .*typescript-best-practices/);
+ }finally{f.close();}
+});
+
+test('a background check runs in the foreground when systemd cannot start the unit',{skip:!!process.env.FM_CHECKPOINT_LIVE},()=>{
+ const f=fixture();try {
+  writeFileSync(join(f.bin,'systemd-run'),'#!/bin/sh\necho "Failed to connect to bus: No such file or directory" >&2\nexit 1\n',{mode:0o755});
+  f.setup();
+  const result=f.run('check','focused check','--','python3','-c','print("ran in foreground")');
+  assert.equal(result.status,0,result.stderr);
+  assert.match(result.stdout,/ran in foreground/);
+  const [row]=f.checks();assert.equal(row.exitCode,0);assert.equal(row.transport,'foreground');
+ }finally{f.close();}
+});
+
+test('a background check gives the unit HOME and the caller environment',{skip:!!process.env.FM_CHECKPOINT_LIVE},()=>{
+ const f=fixture();try {
+  writeFileSync(join(f.bin,'systemd-run'),`#!/usr/bin/python3\nimport subprocess,sys\na=sys.argv[1:]\nenv={}\nwhile a and a[0].startswith('--'):\n item=a.pop(0)\n if item.startswith('--setenv='):\n  k,v=item[len('--setenv='):].split('=',1);env[k]=v\nsys.exit(subprocess.run(a,env=env).returncode)\n`,{mode:0o755});
+  f.setup();
+  const probe=`import os; assert os.environ.get('HOME')==${JSON.stringify(f.env.HOME??'')}, os.environ.get('HOME'); assert os.environ.get('FM_FIXTURE_VAR')=='kept'`;
+  const result=spawnSync('python3',[helper,'task','check','env check','--','python3','-c',probe],{cwd:f.worktree,env:{...f.env,FM_FIXTURE_VAR:'kept'},encoding:'utf8',input:''});
+  assert.equal(result.status,0,result.stderr);
+  const [row]=f.checks();assert.equal(row.exitCode,0,readFileSync(join(f.data,'checks',`${row.id}.log`),'utf8'));
+ }finally{f.close();}
+});

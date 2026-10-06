@@ -171,6 +171,43 @@ BB-specific behavior in this fork:
 | `maxActiveCrews` | 10 | Concurrent crews per captain (0 = no cap). When `fmReliability.asyncDispatch` is on, over-cap work queues instead of refusing, and spawn uses quota-aware backoff |
 | `fmReliability` | empty JSON | Off-by-default flags. `inboundLedger` (`off`/`shadow`/`on`), `honestStatus`, `handoffContract`, `asyncDispatch`, `telegramThreading`, `captainProgressUi`. Telegram uses Amr's local Telegram v0.1.0 connector header and `telegram.reply` RPC; see [docs/telegram-bridge-contract.md](docs/telegram-bridge-contract.md) |
 
+### Reliability flags
+
+Each flag in `fmReliability` is off until set, for example
+`{"asyncDispatch":"on","honestStatus":"on"}`.
+
+- `asyncDispatch` returns from dispatch at once and spawns in the background
+  with the same worktree, posture, and provider setup as a direct dispatch.
+  Work past `maxActiveCrews` (default 10) queues and starts when a slot opens.
+  Only that over-cap work drains automatically. A `firstmate_queue` backlog
+  still needs an explicit dispatch. A crew whose status cannot be read keeps
+  its slot.
+- `honestStatus` reports an unreachable crew as unreachable. Its watchdog tells
+  the captain once when a crew ends 8 turns in a row with no new output. The
+  watchdog does not stop the crew.
+- `inboundLedger` records each owner message. With `on`, `firstmate_reply`
+  answers the oldest open item for the calling captain, and the captain gets
+  one reminder per open item with backoff.
+- `telegramThreading` sends acks and replies through the Telegram plugin's
+  `telegram.reply` RPC. See the [bridge contract](docs/telegram-bridge-contract.md).
+
+Without any flag, an idle crew with no DONE, BLOCKED, or FAILED line is reported
+as having no outcome, not as done.
+
+On load, the plugin trims `fmSkillsManifest`, `captainContract`, and
+`captainMemory` settings longer than 4096 characters so the settings UI stays
+responsive. Deck and init rebuild the manifest and memory caches from the
+native home. `captainContract` is unused.
+
+### Worker helper requirements
+
+Native workers record setup, reads, and checks with `fm-worker-checkpoint.py`.
+It needs `python3` and `git`. In a TypeScript project, setup asks the worker to
+read `typescript-best-practices` from `~/.agents/skills` or `~/.codex/skills`.
+When that skill is missing, setup warns and continues. Background checks run as
+systemd units only when the caller is root on a host with systemd. Elsewhere,
+such as macOS or a container, checks run in the foreground.
+
 ## Skills
 
 The plugin registers `/captain` and `/firstmate` as startup and transport instructions. Native `AGENTS.md` owns policy, including section 9 reporting. Captain and crew configuration no longer loads BB method or presentation skills. The source directories `captain-methods`, `worker-methods`, `calm` and `catch-up` remain unregistered: SDK 0.4.104 has no verified user-only opt-in selection surface, so these files are not automatic instructions.

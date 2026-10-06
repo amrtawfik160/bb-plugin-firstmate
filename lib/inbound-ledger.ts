@@ -28,6 +28,9 @@ export type InboundRow = InboundKey & {
   forwarded: boolean;
   isBotOwn: boolean;
   isAck: boolean;
+  remindedAt?: number | null;
+  reminders?: number;
+  remindedKind?: SweepAction["kind"] | null;
 };
 
 export type OutboxRow = InboundKey & {
@@ -52,6 +55,7 @@ export type LedgerEvent = {
 export const ACK_CUTOFF_MS = 15 * 60_000;
 export const SWEEP_NUDGE_AFTER_MS = 3 * 60_000;
 export const SWEEP_ESCALATE_AFTER_MS = 10 * 60_000;
+export const SWEEP_REMIND_MAX_MS = 2 * 60 * 60_000;
 export const ACK_TEXT = "On it.";
 
 type Database = {
@@ -128,9 +132,11 @@ export function expandTelegramRows(event: LedgerEvent): InboundRow[] {
   const byId = new Map(items.map((item) => [item.id, item]));
   return ids.map((id) => {
     const decl = byId.get(id);
+    const media = items.length === 0 || (decl !== undefined && decl.kind !== "text");
     return {
       ...primary,
       messageId: id,
+      mediaGroupId: media ? primary.mediaGroupId : null,
       sourceRefs: [
         telegramSourceRef({ chatId: primary.chatId, messageId: id }),
         ...primary.sourceRefs.filter((ref) => ref.startsWith("tgref:")),
@@ -159,6 +165,15 @@ export function sweepActions(rows: readonly InboundRow[], now: number): SweepAct
   return out;
 }
 
+// One reminder per level; repeats of the same level back off exponentially.
+export function reminderDue(action: SweepAction, now: number): boolean {
+  const row = action.row;
+  if (row.remindedAt == null || row.remindedKind == null) return true;
+  if (action.kind === "escalate" && row.remindedKind === "nudge") return true;
+  const backoff = Math.min(SWEEP_REMIND_MAX_MS, SWEEP_ESCALATE_AFTER_MS * 2 ** Math.max(0, (row.reminders ?? 1) - 1));
+  return now - row.remindedAt >= backoff;
+}
+
 export function sweeperSteerText(action: SweepAction): string {
   const ref = inboundKey(action.row);
   const preview = action.row.preview;
@@ -183,11 +198,12 @@ export type CreateInboundLedger = {
   markDelegated(key: InboundKey, crewId: string, at: number): InboundRow | undefined;
   mergeSourceRefs(keys: InboundKey[], refs: string[]): void;
   claimOutbox(row: InboundKey, kind: OutboxKind, content: string, at: number): { sent: boolean; existing?: OutboxRow };
+  releaseOutbox(row: InboundKey, kind: OutboxKind): void;
   rememberOutgoing(row: InboundKey, kind: OutboxKind, outgoingMessageId: string): void;
   outboxGet(row: InboundKey, kind: OutboxKind): OutboxRow | undefined;
   enqueueChat(chatId: string, key: InboundKey): number;
   chatOrder(chatId: string): InboundKey[];
-  openForSweep(now: number): SweepAction[];
+  openForSweep(now: number, captainThreadId?: string): SweepAction[];
 };
 
 export function createInboundLedger(db: Database): CreateInboundLedger {
@@ -295,6 +311,10 @@ export function createInboundLedger(db: Database): CreateInboundLedger {
       })();
     },
     claimOutbox,
+    releaseOutbox(row, kind) {
+      db.prepare("DELETE FROM inbound_outbox WHERE source=? AND chat_id=? AND message_id=? AND kind=?")
+        .run(row.source, row.chatId, row.messageId, kind);
+    },
     rememberOutgoing(row, kind, outgoingMessageId) {
       const existing = db.prepare("SELECT record FROM inbound_outbox WHERE source=? AND chat_id=? AND message_id=? AND kind=?")
         .get(row.source, row.chatId, row.messageId, kind) as { record: string } | undefined;
@@ -319,8 +339,14 @@ export function createInboundLedger(db: Database): CreateInboundLedger {
       const rows = db.prepare("SELECT source, message_id FROM inbound_chat_queue WHERE chat_id=? ORDER BY seq").all(chatId) as { source: InboundSource; message_id: string }[];
       return rows.map((r) => ({ source: r.source, chatId, messageId: r.message_id }));
     },
-    openForSweep(now) {
-      return sweepActions(listOpen(), now);
+    openForSweep(now, captainThreadId) {
+      return db.transaction(() => {
+        const due = sweepActions(listOpen(captainThreadId), now).filter((action) => reminderDue(action, now));
+        for (const action of due) {
+          save({ ...action.row, remindedAt: now, remindedKind: action.kind, reminders: (action.row.reminders ?? 0) + 1 });
+        }
+        return due;
+      })();
     },
   };
 }

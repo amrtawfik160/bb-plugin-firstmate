@@ -12,7 +12,7 @@ import {
 } from "./honest-status.ts";
 
 test("null verdict is unknown, not done", () => {
-  assert.equal(idleVerdictPresentation("c1", null).head, "✅ crew c1 done");
+  assert.equal(idleVerdictPresentation("c1", null).head, "❓ crew c1 idle with no outcome");
   const honest = honestIdleVerdictPresentation("c1", null);
   assert.equal(honest.head, "❓ crew c1 unknown");
   assert.doesNotMatch(honest.head, /done/);

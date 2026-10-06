@@ -1,9 +1,8 @@
 import { createHash } from "node:crypto";
 
+// Consecutive idle turns that add no new output (empty or repeated).
 export const WATCHDOG_MAX_TURNS = 8;
-export const WATCHDOG_MAX_WALL_MS = 45 * 60_000;
 export const WATCHDOG_MAX_429 = 2;
-export const WATCHDOG_NEAR_IDENTICAL = 15;
 
 export type WatchdogReason = "turns" | "wall-clock" | "rate-limit" | "loop";
 
@@ -39,28 +38,22 @@ export function hashOutput(text: string): string {
   return createHash("sha256").update(text.replace(/\s+/g, " ").trim()).digest("hex");
 }
 
-export function observeOutput(state: WatchdogState, text: string): WatchdogState {
-  const next = hashOutput(text);
-  if (state.lastOutputHash !== null && state.lastOutputHash === next) {
-    return { ...state, lastOutputHash: next, nearIdentical: state.nearIdentical + 1 };
-  }
-  return { ...state, lastOutputHash: next, nearIdentical: 0 };
-}
-
-export function observeTurn(state: WatchdogState): WatchdogState {
-  return { ...state, turns: state.turns + 1 };
+export function observeIdleTurn(state: WatchdogState, text: string | null): WatchdogState {
+  const trimmed = (text ?? "").trim();
+  if (trimmed === "") return { ...state, turns: state.turns + 1 };
+  const next = hashOutput(trimmed);
+  if (next === state.lastOutputHash) return { ...state, turns: state.turns + 1, nearIdentical: state.nearIdentical + 1 };
+  return { ...state, turns: 0, nearIdentical: 0, lastOutputHash: next, trippedAt: null, reason: null, savedState: null };
 }
 
 export function observeRateLimit(state: WatchdogState): WatchdogState {
   return { ...state, rateLimitCount: state.rateLimitCount + 1 };
 }
 
-export function watchdogTrip(state: WatchdogState, now: number): WatchdogReason | null {
+export function watchdogTrip(state: WatchdogState, _now: number): WatchdogReason | null {
   if (state.trippedAt !== null) return state.reason;
   if (state.rateLimitCount >= WATCHDOG_MAX_429) return "rate-limit";
-  if (state.nearIdentical >= WATCHDOG_NEAR_IDENTICAL) return "loop";
-  if (state.turns >= WATCHDOG_MAX_TURNS) return "turns";
-  if (now - state.startedAt >= WATCHDOG_MAX_WALL_MS) return "wall-clock";
+  if (state.turns >= WATCHDOG_MAX_TURNS) return state.nearIdentical > 0 ? "loop" : "turns";
   return null;
 }
 
@@ -70,9 +63,11 @@ export function tripWatchdog(state: WatchdogState, now: number, savedState: stri
   return { ...state, trippedAt: now, reason, savedState };
 }
 
-export function watchdogFailText(state: WatchdogState): string {
-  const reason = state.reason ?? "unknown";
-  return `Watchdog stopped crew ${state.crewId} (${reason}). State saved. next: bb firstmate tell|retry|forget ${state.crewId}`;
+export function watchdogNoticeText(state: WatchdogState): string {
+  const why = state.reason === "rate-limit"
+    ? "hit repeated rate limits"
+    : `ended ${state.turns} turns in a row with no new output`;
+  return `Watchdog: crew ${state.crewId} ${why}. It was not stopped. next: bb firstmate tell|stop|forget ${state.crewId}`;
 }
 
 export function providerErrorIsRateLimit(row: { type?: string; data?: unknown }): boolean {

@@ -1,0 +1,11 @@
+The following is an owner message from the private Telegram connector.
+correlation: tgref:inb_1
+binding: 3
+telegram_user_id: 99
+telegram_chat_id: 200
+telegram_message_id: 1669
+reply_target: none
+project: none
+Telegram result delivery: Include Markdown links to existing local reports, photos, videos, or other result files in your final answer. The connector uploads linked files from this captain's host. Use verified paths.
+
+Status?

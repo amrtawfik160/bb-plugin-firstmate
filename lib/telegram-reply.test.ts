@@ -64,3 +64,33 @@ test("final answers target the oldest unanswered item, never the latest", () => 
   assert.equal(refuseLaterThanOldest({ chosen: open[1]!, open })?.messageId, "10");
   assert.equal(refuseLaterThanOldest({ chosen: open[0]!, open }), null);
 });
+
+test("oldest unanswered compares Telegram message ids as numbers", () => {
+  const open = [row({ messageId: "10", receivedAt: 5 }), row({ messageId: "9", receivedAt: 5 })];
+  assert.equal(oldestUnanswered(open)?.messageId, "9");
+  assert.equal(refuseLaterThanOldest({ chosen: open[0]!, open })?.messageId, "9");
+});
+
+const replyPayload = { chatId: "200", messageId: "1669", kind: "reply" as const, text: "done" };
+
+test("telegram.reply counts only queued or duplicate results as delivered", async () => {
+  assert.equal((await sendTelegramReply({ payload: replyPayload, callRpc: async () => ({ queued: 2, duplicate: false, mode: "on" }) })).outcome, "delivered");
+  assert.equal((await sendTelegramReply({ payload: replyPayload, callRpc: async () => ({ queued: 0, duplicate: true, mode: "on" }) })).outcome, "delivered");
+  await assert.rejects(sendTelegramReply({ payload: replyPayload, callRpc: async () => ({ queued: 0, duplicate: false, mode: "on" }) }), /not queued/);
+});
+
+test("telegram.reply errors other than a missing method are not delivery", async () => {
+  await assert.rejects(sendTelegramReply({ payload: replyPayload, callRpc: async () => { throw new Error("Telegram API unavailable"); } }), /unavailable/);
+  const missing = await sendTelegramReply({ payload: replyPayload, callRpc: async () => { throw new Error('plugin "telegram" has no rpc method "reply"'); } });
+  assert.equal(missing.channel, "envelope");
+});
+
+test("an ack with threaded replies off is not applicable, not delivered", async () => {
+  const result = await sendTelegramReply({ payload: { ...replyPayload, kind: "ack" }, callRpc: async () => ({ queued: 0, duplicate: false, mode: "off" }) });
+  assert.equal(result.outcome, "not-applicable");
+});
+
+test("telegram.reply returns queued 0 for an unbound chat or empty text, which is not delivery", async () => {
+  await assert.rejects(sendTelegramReply({ payload: { ...replyPayload, text: "" }, callRpc: async () => ({ queued: 0, duplicate: false, mode: "on" }) }), /not queued/);
+  await assert.rejects(sendTelegramReply({ payload: replyPayload, callRpc: async () => ({ queued: 0, duplicate: false, mode: "off" }) }), /not queued/);
+});
