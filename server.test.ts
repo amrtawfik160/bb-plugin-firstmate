@@ -7789,9 +7789,27 @@ test("IT captain homes isolate native backlog, memory and away authority", { ski
   }
 });
 
-test("IT native local merge respects captain hold and lands BB-named branch", { skip: !FM_INTEGRATION }, async () => {
-  const home = scratchFmHome();
-  mkdirSync(join(home, "data"));
+// The shipped native snapshot plus this checkout's overlay, so the mirror never
+// depends on a host checkout's own (possibly stale) bin-bb.
+function bundledNativeHome(): string {
+  const home = mkdtempSync(join(tmpdir(), "fm-it-native-"));
+  const unpacked = mkdtempSync(join(tmpdir(), "fm-it-bundle-"));
+  try {
+    const step = (command: string, args: string[]) => {
+      const r = spawnSync(command, args, { encoding: "utf8" });
+      assert.equal(r.status, 0, r.stdout + r.stderr);
+    };
+    step("tar", ["-xzf", join(dirname(OVERLAY_ROOT), "runtime-assets/runtime.tar.gz"), "-C", unpacked, "native.bundle"]);
+    rmSync(home, { recursive: true });
+    step("git", ["clone", "--quiet", "--branch", "main", join(unpacked, "native.bundle"), home]);
+    step("python3", [join(OVERLAY_ROOT, "install-bb-backend.py"), "--home", home, "--overlay", OVERLAY_ROOT]);
+  } finally { rmSync(unpacked, { recursive: true, force: true }); }
+  for (const name of ["data", "state"]) mkdirSync(join(home, name), { recursive: true });
+  return home;
+}
+
+test("IT native local merge respects captain hold and lands BB-named branch", async () => {
+  const home = bundledNativeHome();
   const project = join(home, "project");
   const wt = join(home, "worker");
   const host = itHost(home, {});
@@ -7800,9 +7818,7 @@ test("IT native local merge respects captain hold and lands BB-named branch", { 
     assert.equal(r.status, 0, r.stderr); return r.stdout.trim();
   };
   try {
-    mkdirSync(project); mkdirSync(join(home, "config")); mkdirSync(join(home, "fakebin"));
-    symlinkSync(join(process.env.FM_TEST_HOME ?? "/root/firstmate", "bin-bb"), join(home, "bin-bb"));
-    writeFileSync(join(home, "config/bb-overlay"), "bin-bb\n");
+    mkdirSync(project); mkdirSync(join(home, "fakebin"));
     git("init", "-b", "main", project);
     git("-C", project, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "base");
     const base = git("-C", project, "rev-parse", "HEAD");
