@@ -11,9 +11,9 @@
       "reason": "Native policy reads and selected-runtime path mappings; BB threads, browser, durable receipts and PR transport. Required full selected-runtime trigger catalog and source-relative native reference transport. Skill-routing pointer: name matched pstack and Matt Pocock skills in each dispatch brief. Telegram pointer: answer each owner message with firstmate_reply and check firstmate_inbox."
     },
     "crew": {
-      "sha256": "e1234333f803a207f8cf1b19be254ca93862cc84674e1b85c20a078e37d846b6",
-      "text": "The native launch brief owns this worker role, BB transport and task policy. BB crew threads have no captain tools or captain skills. Follow that brief and its exact-ID steering inbox procedure. Read the skill-routing skill and follow the skills it matches to your task, under its Firstmate rules. Do not delegate or change the selected provider, model, or effort. Never print a secret value: read variable names only, and never print .env or secret files, environment dumps or credential values. Never use Telegram tools (mcp__telegram__*) and never send a message as the owner. Worker completion is a handoff, not captain merge or deployment completion.",
-      "reason": "Native launch brief pointer, exact-ID inbox and BB role exclusion. One skill-routing pointer, bounded by its Firstmate rules; no other method policy. Hard rules: no secret values printed and no Telegram tools or messages as the owner."
+      "sha256": "956c08125bdbeabb5de8c7a82d4526c8e0973f292f8cccac0af7ba1dacdae0c1",
+      "text": "The native launch brief owns this worker role, BB transport and task policy. BB crew threads have no captain tools or captain skills. Follow that brief and its exact-ID steering inbox procedure. Read the skill-routing skill and follow the skills it matches to your task, under its Firstmate rules. Do not delegate or change the selected provider, model, or effort. Never print a secret value: read variable names only, and never print .env or secret files, environment dumps or credential values. When a task needs Telegram, use the Telegram tools (mcp__telegram__*) connected to this host. Worker completion is a handoff, not captain merge or deployment completion.",
+      "reason": "Native launch brief pointer, exact-ID inbox and BB role exclusion. One skill-routing pointer, bounded by its Firstmate rules; no other method policy. Hard rules: no secret values printed; Telegram tools on this host are used when a task needs them."
     }
   },
   "renderer": {
@@ -52,8 +52,8 @@
       "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner. Captain rules: owner standing approvals, crew work stays with crews, merges only through firstmate_merge."
     },
     "entry-skills/skill-routing/SKILL.md": {
-      "sha256": "55f90ef66949c70cefbc9728599cb5c79ad8a7159a665c0e4c7ec0a7fd4ca62a",
-      "reason": "BB-owned task-to-skill table selected for bound captains and crews; its Firstmate rules keep delegation, model choice, merge and delivery with Firstmate. Poteto mode runs on every crewmate task; Firstmate rules still win and the supervisor's replies keep the user's style. Memory-heavy commands run through the fm-heavy host slot wrapper. Firstmate adds the skills block to every brief; crews never print secret values and never use Telegram tools."
+      "sha256": "ab61c5097b0e502ce67ea478a84e9f0c27e9a837b2c99d70f3123123f4b133a9",
+      "reason": "BB-owned task-to-skill table selected for bound captains and crews; its Firstmate rules keep delegation, model choice, merge and delivery with Firstmate. Poteto mode runs on every crewmate task; Firstmate rules still win and the supervisor's replies keep the user's style. Memory-heavy commands run through the fm-heavy host slot wrapper. Firstmate adds the skills block to every brief; crews never print secret values and use this host's Telegram tools when a task needs them."
     },
     "entry-skills/captain/references/telegram.md": {
       "sha256": "0a57b7a7b9e210c8c4583c0e421e7de62adfdadeb40b268b225f90f2ddaa0da2",
