@@ -68,10 +68,11 @@ import { honestIdleVerdictPresentation, interruptIsStopped, readyClaim } from ".
 import { ACK_TEXT, ackEligible, createInboundLedger, formatOwnerInbox, inboundKey, quotedReplyKind, sweeperSteerText, type InboundRow } from "./lib/inbound-ledger.ts";
 import { inboundHookDecision } from "./lib/inbound-dispatch.ts";
 import { formatWorkersForTelegram } from "./lib/telegram-commands.ts";
+import { askIdFromSourceEventId, createOwnerAsks, formatAskCard, formatBoard, formatUtcTime, mayDefault, recommendedLabel, type AskKind } from "./lib/owner-asks.ts";
 import { DEFAULT_RELIABILITY_FLAGS, reliabilityFlagsFromSettings } from "./lib/reliability-flags.ts";
 import { sanitizeSettingValue } from "./lib/settings-schema.ts";
-import { coalesceBatches, parseInboundTelegram, parseSourceRef, parseTelegramSubmission, stripTelegramEnvelope, telegramReplyParameters, telegramSourceRef } from "./lib/telegram-envelope.ts";
-import { connectorReplied, correlationOf, oldestUnanswered, sendTelegramReply, telegramReplyFallbackBody } from "./lib/telegram-reply.ts";
+import { coalesceBatches, parseConnectorHeader, parseInboundTelegram, parseSourceRef, parseTelegramSubmission, stripTelegramEnvelope, telegramReplyParameters, telegramSourceRef } from "./lib/telegram-envelope.ts";
+import { connectorReplied, correlationOf, isTelegramRpcMissing, oldestUnanswered, sendTelegramReply, TELEGRAM_BRIDGE_PLUGIN_ID, telegramReplyFallbackBody } from "./lib/telegram-reply.ts";
 import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRecord } from "./lib/launch.ts";
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
 import { optionHelp } from "./lib/cli-help.ts";
@@ -1392,6 +1393,8 @@ const CAPTAIN_TOOLS = [
   "firstmate_dispatch",
   "firstmate_reply",
   "firstmate_inbox",
+  "firstmate_ask",
+  "firstmate_resolve_ask",
   "firstmate_runtime",
   "firstmate_deck",
   "firstmate_tell",
@@ -1575,6 +1578,7 @@ export default async function plugin(bb: BbPluginApi) {
   const reports=scoutReports(bb.storage.database());
   const deliveries = createDeliveries(bb.storage.database());
   const inboundLedger = createInboundLedger(bb.storage.database());
+  const ownerAsks = createOwnerAsks(bb.storage.database());
   const crewWatchdog = createWatchdogStore(bb.storage.database());
   const dispatchJobs = createDispatchJobs(bb.storage.database());
   const doorbellHold = createDoorbellHold(bb.storage.database());
@@ -1791,6 +1795,11 @@ export default async function plugin(bb: BbPluginApi) {
       type: "string",
       label: "Reliability flags JSON (all off by default)",
       default: "",
+    },
+    askDefaultMinutes: {
+      type: "number",
+      label: "Minutes before a reversible owner ask with a recommended option proceeds with it (0 = never). Approvals and irreversible asks never proceed on their own.",
+      default: 240,
     },
   });
 
@@ -4607,7 +4616,31 @@ export default async function plugin(bb: BbPluginApi) {
     resumeDispatchJobs(owner);
   }
 
+  // Best effort: the connector redraws its pinned board. A missing method or a failure changes nothing here.
+  async function refreshOwnerBoard(): Promise<void> {
+    if ((await reliabilityFlags()).telegramThreading !== "on") return;
+    try {
+      await bb.sdk.plugins.callRpc({ pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "refreshBoard", input: {}, outputSchema: z.object({ ok: z.boolean() }) });
+    } catch (error) {
+      if (!isTelegramRpcMissing(error)) bb.log.warn(`telegram refreshBoard: ${String(error)}`);
+    }
+  }
+
+  // An overdue reversible ask proceeds with its recommended option; the captain thread is told once.
+  async function defaultOverdueAsks(captainThreadId: string): Promise<void> {
+    const due = ownerAsks.takeDue(captainThreadId, Date.now());
+    for (const ask of due) {
+      await bb.sdk.threads.send({
+        threadId: captainThreadId,
+        mode: "steer",
+        input: [{ type: "text", text: `No answer to ask ${ask.id} by its deadline: go ahead with "${ask.resolution}" as recommended, and tell the captain in one short message that you did.`, mentions: [], visibility: "agent-only" }],
+      }).catch((error) => bb.log.warn(`owner ask default ${ask.id}: ${String(error)}`));
+    }
+    if (due.length > 0) await refreshOwnerBoard();
+  }
+
   async function drainCaptainReliability(captainThreadId: string, signal?: AbortSignal): Promise<void> {
+    await defaultOverdueAsks(captainThreadId).catch((error) => bb.log.warn(`owner ask deadlines: ${String(error)}`));
     const flags = await reliabilityFlags();
     if (flags.asyncDispatch === "on") {
       for (const row of doorbellHold.drain(captainThreadId)) {
@@ -9925,6 +9958,77 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   registerCaptainTool({
+    name: "firstmate_ask",
+    description: "Ask the captain one question, blocker or approval as a Telegram card with up to 4 option buttons. It stays on the captain's board until answered. Returns at once: keep working on other things. The answer arrives as an owner message replying to the card. irreversible=true or kind=approval never proceeds on a deadline; a reversible ask with a recommended option proceeds with it at its deadline.",
+    parameters: z.object({
+      question: z.string().min(1).max(1500),
+      kind: z.enum(["question", "blocker", "approval"]),
+      options: z.array(z.object({ label: z.string().min(1).max(40), value: z.string().min(1).max(64).optional() })).max(4).optional(),
+      recommended: z.number().int().min(0).optional().describe("Index of the recommended option"),
+      defaultAfterMinutes: z.number().min(5).max(10080).optional().describe("Proceed with the recommended option after this many minutes without an answer (reversible asks only)"),
+      irreversible: z.boolean().optional().describe("A gated action (production deploy, money, deleting data, customer messages): never proceeds without an answer"),
+    }),
+    async execute({ question, kind, options, recommended, defaultAfterMinutes, irreversible }, ctx) {
+      const captain = ctxString(ctx, "threadId");
+      if (!captain) return toolError("firstmate_ask runs only in a captain thread.");
+      const choices = (options ?? []).map((option) => ({ label: option.label, value: option.value ?? option.label }));
+      if (recommended !== undefined && recommended >= choices.length) return toolError(`recommended must be the index of one of the ${choices.length} option(s).`);
+      const gated = !mayDefault({ kind: kind as AskKind, irreversible: irreversible === true });
+      if (gated && defaultAfterMinutes !== undefined) {
+        return toolError(`defaultAfterMinutes is not allowed for ${kind === "approval" ? "an approval" : "an irreversible ask"}: it waits for the captain's answer. Remove defaultAfterMinutes.`);
+      }
+      if (defaultAfterMinutes !== undefined && recommended === undefined) return toolError("defaultAfterMinutes needs a recommended option to proceed with.");
+      const minutes = gated || recommended === undefined ? 0 : defaultAfterMinutes ?? Number((await settings.get()).askDefaultMinutes ?? 240);
+      const now = Date.now();
+      const ask = ownerAsks.create({
+        captain, kind: kind as AskKind, text: question.trim(), options: choices,
+        recommended: recommended ?? null, defaultAt: minutes > 0 ? now + Math.round(minutes * 60_000) : null,
+        irreversible: irreversible === true, createdAt: now,
+      });
+      const deadline = ask.defaultAt !== null ? ` If no answer by ${formatUtcTime(ask.defaultAt)}, it proceeds with "${recommendedLabel(ask)}" and you are told to go ahead.` : "";
+      const done = `Ask ${ask.id} is open and on the captain's board.${deadline} Keep working on other things; the answer arrives as an owner message that replies to ask ${ask.id}.`;
+      if ((await reliabilityFlags()).telegramThreading !== "on") {
+        return `${done}\nWarning: not sent to Telegram because telegramThreading is off. Put the question in your final message too.`;
+      }
+      let warning = "";
+      try {
+        const sent = z.object({ queued: z.number(), duplicate: z.boolean() }).parse(await bb.sdk.plugins.callRpc({
+          pluginId: TELEGRAM_BRIDGE_PLUGIN_ID,
+          method: "ask",
+          input: { askId: ask.id, text: formatAskCard(ask), options: ask.options, ...(ask.recommended !== null ? { recommended: ask.recommended } : {}) },
+          outputSchema: z.object({ queued: z.number(), duplicate: z.boolean() }),
+        }));
+        if (sent.queued <= 0 && !sent.duplicate) warning = "the Telegram connector queued nothing";
+      } catch (error) {
+        warning = error instanceof Error ? error.message : String(error);
+      }
+      await refreshOwnerBoard();
+      return warning === ""
+        ? `Sent ask ${ask.id} to the captain on Telegram. ${done}`
+        : `${done}\nWarning: the question card was not sent to Telegram (${warning}). The ask stays open on the board; put the question in your final message too.`;
+    },
+  });
+
+  registerCaptainTool({
+    name: "firstmate_resolve_ask",
+    description: "Close one open ask from firstmate_ask when you learn the answer another way (resolution = the answer), or cancel it when it no longer matters (cancelled=true).",
+    parameters: z.object({
+      id: z.string().min(1).max(64),
+      resolution: z.string().min(1).max(2000),
+      cancelled: z.boolean().optional(),
+    }),
+    async execute({ id, resolution, cancelled }, ctx) {
+      const captain = ctxString(ctx, "threadId");
+      if (!captain) return toolError("firstmate_resolve_ask runs only in a captain thread.");
+      const closed = ownerAsks.resolve(id, captain, cancelled === true ? "cancelled" : "answered", resolution, Date.now());
+      if (!closed) return toolError(`No open ask ${id} for this captain.`);
+      await refreshOwnerBoard();
+      const left = ownerAsks.listOpen(captain).length;
+      return `Ask ${id} ${closed.state}. ${left === 0 ? "No ask is open." : `${left} ask(s) still open.`}`;
+    },
+  });
+
+  registerCaptainTool({
     name: "firstmate_reply",
     description: "Reply to one owner message as a Telegram reply to it (ref=oldest, tg:<chat>:<msg>, or bb:<thread>:<row>; any open message, in any order). quote=exact words from that message, such as one of several questions; each different quote is its own reply. more=true keeps the message open because more replies to it will follow.",
     parameters: z.object({
@@ -10812,6 +10916,9 @@ export default async function plugin(bb: BbPluginApi) {
       const snapshot = (await settings.get()).fmHome.trim() !== ""
         ? await fleetSnapshots.read(threadId, () => nativeBearingsSnapshot(threadId, snapshotAbort.signal), 15_000)
         : await bearingsSnapshot(threadId);
+      if (command === "board") {
+        return { text: formatBoard({ asks: ownerAsks.listOpen(threadId), calls: snapshot.rpc.calls, now: Date.now() }), away: snapshot.rpc.afk };
+      }
       return { text: formatWorkersForTelegram(snapshot.rpc) };
     },
     async fleet(input) {
@@ -11237,6 +11344,22 @@ export default async function plugin(bb: BbPluginApi) {
   const knownCaptains = knownCaptainsRef;
   for (const key of await bb.storage.kv.list(CAPTAIN_PROJECT_PREFIX)) knownCaptains.add(key.slice(CAPTAIN_PROJECT_PREFIX.length));
   const heldPingCaptains = new Set<string>();
+  // An owner reply to an ask card, or a tap on one of its buttons, answers that ask.
+  // Only the connector header at the start of the message counts, so quoted text cannot answer one.
+  async function recordAskAnswers(captainThreadId: string, text: string, queued: readonly unknown[]): Promise<void> {
+    const texts = queued.length > 0
+      ? queued.map((row) => String(asRecord(row)["text"] ?? asRecord(asRecord(row)["input"])["text"] ?? text))
+      : [text];
+    let answered = 0;
+    for (const message of texts) {
+      const header = parseConnectorHeader(message);
+      const id = askIdFromSourceEventId(header?.sourceEventId);
+      if (!header || header.forwarded || id === null) continue;
+      if (ownerAsks.resolve(id, captainThreadId, "answered", header.body.slice(0, 2000), Date.now())) answered++;
+    }
+    if (answered > 0) await refreshOwnerBoard();
+  }
+
   // Threaded replies off: an ack does not apply, and asking again on every dispatch would only repeat the RPC.
   const ackNotApplicable = new Set<string>();
   try {
@@ -11266,6 +11389,9 @@ export default async function plugin(bb: BbPluginApi) {
         const flags = await reliabilityFlags();
         const text = context.input.text;
         const telegram = parseTelegramSubmission(context.experimental_submission?.data) ?? parseInboundTelegram(text);
+        if (String(context.initiator) === "user") {
+          await recordAskAnswers(threadId, text, context.queuedMessages ?? []).catch((error) => bb.log.warn(`owner ask answer: ${String(error)}`));
+        }
         const inbound = inboundHookDecision({
           flags,
           attempt: context.attempt,

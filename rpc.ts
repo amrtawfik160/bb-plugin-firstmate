@@ -14,12 +14,12 @@ const crewRow = z.object({
 
 export const rpcContract = defineRpcContract({
   telegramCommand: {
-    experimental_description: "Answer a Telegram owner command (/inbox or /workers) for one captain thread as plain text.",
+    experimental_description: "Answer a Telegram owner command (/inbox, /workers, or the board) for one captain thread as plain text. For board, away is the captain's /afk posture.",
     input: z.object({
-      command: z.enum(["inbox", "workers"]),
+      command: z.enum(["inbox", "workers", "board"]),
       threadId: z.string().min(1),
     }),
-    output: z.object({ text: z.string() }),
+    output: z.object({ text: z.string(), away: z.boolean().optional() }),
   },
   fleet: {
     // null is the pre-0.4.0 app contract. Keep it during live reloads because

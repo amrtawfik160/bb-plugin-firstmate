@@ -200,6 +200,10 @@ Each flag in `fmReliability` is off until set, for example
   If the RPC reports that threaded replies are off in the connector while this
   flag is on, the plugin logs one warning and bearings shows the mismatch
   until a reply reports threading on again.
+  It also sends `firstmate_ask` questions as Telegram cards with buttons. Open
+  asks stay on the owner's board until answered. A reversible ask with a
+  recommended option proceeds with it after `askDefaultMinutes` (default 240,
+  0 = never). Approvals and irreversible asks never proceed on their own.
 
 Without any flag, an idle crew with no DONE, BLOCKED, or FAILED line is reported
 as having no outcome, not as done.
