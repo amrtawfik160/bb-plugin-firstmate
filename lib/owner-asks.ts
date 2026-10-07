@@ -83,7 +83,7 @@ export function formatAge(ms: number): string {
 
 export function clip(text: string, max: number): string {
   const flat = text.replace(/\s+/g, " ").trim();
-  return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
+  return flat.length <= max ? flat : `${flat.slice(0, max - 1).trimEnd()}…`;
 }
 
 /** The question card text the connector sends to the owner. */

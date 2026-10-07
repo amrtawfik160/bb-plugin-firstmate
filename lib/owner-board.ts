@@ -52,9 +52,11 @@ function prLine(pr: BoardPr): string {
 }
 
 function taskLine(task: OwnerTask, now: number, extra: { state?: string; prs?: readonly BoardPr[]; tail?: string }): string {
+  // A finished task's age says nothing the owner needs.
+  const age = extra.tail === undefined ? formatAge(now - task.createdAt) : "";
   const stale = isOpenTask(task) && now - task.updatedAt >= STALE_TASK_MS ? `stale ${formatAge(now - task.updatedAt)}` : "";
   const prs = (extra.prs ?? []).map((pr) => `${shortRef(pr.ref)} ${pr.state}`).join("; ");
-  return [`${task.id} ${task.project ? `${task.project} · ` : ""}${clip(task.title, 60)}`, extra.state ?? "", formatAge(now - task.createdAt), prs, stale, extra.tail ?? ""]
+  return [`${task.id} ${task.project ? `${task.project} · ` : ""}${clip(task.title, 60)}`, extra.state ?? "", age, prs, stale, extra.tail ?? ""]
     .filter((part) => part !== "")
     .join(" · ");
 }

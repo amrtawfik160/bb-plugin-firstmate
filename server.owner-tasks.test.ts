@@ -140,7 +140,7 @@ test("the task follows its crew's PR: ready to merge needs the owner, then merge
       "📌 Needs you: nothing right now.",
       "",
       "✅ Done since you last looked (1)",
-      "- T1 Areliaa · Memory screen · 0 min · merged",
+      "- T1 Areliaa · Memory screen · merged",
       "",
       "🔧 In progress: nothing open.",
     ].join("\n"));
@@ -230,7 +230,7 @@ test("the board and the digest read closed tasks and PRs merged since the owner 
       "📌 Needs you: nothing right now.",
       "",
       "✅ Done since you last looked (2)",
-      "- T2 Brands audit · 2 h · dropped: Owner moved it to next week",
+      "- T2 Brands audit · dropped: Owner moved it to next week",
       "- PR app#283 Bump the email template · merged",
       "",
       "🔧 In progress (1)",
@@ -239,7 +239,7 @@ test("the board and the digest read closed tasks and PRs merged since the owner 
     assert.match(await command(host, { command: "board", since: Date.now() - 30 * HOUR }), /\n- PR app#270 /, "an older since brings back older merges");
     assert.equal(await command(host, { command: "digest" }), [
       "Done (2)",
-      "- T2 Brands audit · 2 h · dropped: Owner moved it to next week",
+      "- T2 Brands audit · dropped: Owner moved it to next week",
       "- PR app#283 Bump the email template · merged",
       "",
       "Stale (1): T1",
