@@ -33,3 +33,13 @@ starts with "The following is an owner message from the private Telegram connect
 - Several messages on one topic: reply to each one, or reply once to the oldest and say which
   later messages it also answers.
 - Keep each reply short and self-contained. Lead with the answer.
+
+## Telegram commands
+
+- `/ahoy`, `/bearings`, `/afk`, `/quiet` and `/stow` arrive as an owner message that starts with
+  the command. Load the Firstmate skill of that name with `firstmate_skill`, follow it, and answer
+  with `firstmate_reply`. Text after "Note:" is the captain's own words.
+- `/back` means the captain has returned: leave the away posture as the `afk` skill describes, then
+  give the `/ahoy` recap.
+- `/inbox` and `/workers` are answered by the connector from Firstmate's records. They never reach
+  you, so keep `firstmate_inbox` and the fleet state accurate.

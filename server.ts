@@ -67,6 +67,7 @@ import { HANDOFF_WAKE_AMENDMENT, captainInstructionsWithHandoff } from "./lib/ha
 import { honestIdleVerdictPresentation, interruptIsStopped, readyClaim } from "./lib/honest-status.ts";
 import { ACK_TEXT, ackEligible, createInboundLedger, formatOwnerInbox, inboundKey, quotedReplyKind, sweeperSteerText, type InboundRow } from "./lib/inbound-ledger.ts";
 import { inboundHookDecision } from "./lib/inbound-dispatch.ts";
+import { formatWorkersForTelegram } from "./lib/telegram-commands.ts";
 import { DEFAULT_RELIABILITY_FLAGS, reliabilityFlagsFromSettings } from "./lib/reliability-flags.ts";
 import { sanitizeSettingValue } from "./lib/settings-schema.ts";
 import { coalesceBatches, parseInboundTelegram, parseSourceRef, parseTelegramSubmission, stripTelegramEnvelope, telegramReplyParameters, telegramSourceRef } from "./lib/telegram-envelope.ts";
@@ -10794,6 +10795,17 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.rpc.register(rpcContract, {
+    async telegramCommand({ command, threadId }) {
+      if (!(await isCaptainThread(threadId))) return { text: "The Telegram captain is not a Firstmate captain thread." };
+      if (command === "inbox") {
+        if ((await reliabilityFlags()).inboundLedger === "off") return { text: "Message tracking is off." };
+        return { text: formatOwnerInbox(inboundLedger.listPending(threadId), Date.now()) };
+      }
+      const snapshot = (await settings.get()).fmHome.trim() !== ""
+        ? await fleetSnapshots.read(threadId, () => nativeBearingsSnapshot(threadId, snapshotAbort.signal), 15_000)
+        : await bearingsSnapshot(threadId);
+      return { text: formatWorkersForTelegram(snapshot.rpc) };
+    },
     async fleet(input) {
       const threadId = input?.threadId;
       const owner = threadId ?? undefined;
@@ -10809,6 +10821,9 @@ export default async function plugin(bb: BbPluginApi) {
         captain,
       };
     },
+  }, {
+    experimental_discoverable: true,
+    experimental_description: "Firstmate fleet view and Telegram owner command answers for one captain thread.",
   });
 
   bb.ui.registerMentionProvider({

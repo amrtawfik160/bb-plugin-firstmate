@@ -56,8 +56,8 @@
       "reason": "BB-owned task-to-skill table selected for bound captains and crews; its Firstmate rules keep delegation, model choice, merge and delivery with Firstmate."
     },
     "entry-skills/captain/references/telegram.md": {
-      "sha256": "a473303951ad5a4d519287060986abc140d9c4433ef27b4326314db2aa1e92f3",
-      "reason": "BB-only Telegram owner-message transport: what reaches Telegram, per-message tracking with firstmate_inbox, and threaded or quoted answers with firstmate_reply; native final-response policy unchanged."
+      "sha256": "0c0778430d0620e01e86eaa2dd57de0e4259939c5501985f1486398e7595468c",
+      "reason": "BB-only Telegram owner-message transport: what reaches Telegram, per-message tracking with firstmate_inbox, and threaded or quoted answers with firstmate_reply; native final-response policy unchanged. Telegram commands map to the native ahoy, bearings, afk, quiet and stow skills."
     }
   }
 }
