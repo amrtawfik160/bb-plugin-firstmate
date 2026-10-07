@@ -30,6 +30,7 @@ import {
   quietShouldSend,
   resolveWorktree,
   statusLinesFrom,
+  TERMINAL_VERBS,
   statusProtocolSummary,
   toMode,
   toPermissionMode,
@@ -8132,7 +8133,15 @@ export default async function plugin(bb: BbPluginApi) {
       if (latestStatus(lines)?.verb === "done") done.add(id.trim());
     }
     const finished = records.filter((r) => done.has(r.taskId));
-    return { threads: new Set(finished.flatMap((r) => r.workers)), crewIds: new Set(finished.map((r) => r.taskId)) };
+    // A DONE crew steered back to work is running again; its wedge alert still matters.
+    const resting = new Set<string>();
+    for (const threadId of new Set(finished.flatMap((r) => r.workers).filter((w) => wanted.threads.includes(w)))) {
+      try {
+        const status = (await bb.sdk.threads.get({ threadId })).status;
+        if (status === "idle" || status === "error") resting.add(threadId);
+      } catch { /* unknown state keeps the alert */ }
+    }
+    return { threads: resting, crewIds: new Set(finished.map((r) => r.taskId)) };
   }
 
   async function hideFinishedCrewWakes(out: string, captainThreadId: string, hostId: string, fmHome: string, signal?: AbortSignal): Promise<string> {
@@ -11450,19 +11459,27 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   // 25 of 63 audited crews ended a turn with no outcome line, so the captain could not
-  // tell finished from interrupted (fleet audit 2026-10-07). Ask once; the turn that
-  // answers is not asked again. The mark shows in bearings until an outcome arrives.
+  // tell finished from interrupted (fleet audit 2026-10-07). Ask once; until an outcome
+  // arrives the crew is not asked again and bearings shows it as "no outcome".
   async function askForOutcomeLine(crew: Crew): Promise<boolean> {
     if ((await settings.get()).supervisionEnabled !== true) return false;
     const key = `${NO_OUTCOME_PREFIX}${crew.threadId}`;
-    const ask = (await bb.storage.kv.get<{ asked: boolean }>(key))?.asked !== true;
-    await bb.storage.kv.set(key, { asked: ask });
-    if (!ask) return false;
+    if (await bb.storage.kv.get(key) !== undefined) return false;
+    await bb.storage.kv.set(key, { asked: true });
     try {
       await tellCrew(crew, OUTCOME_LINE_REQUEST, false, true);
       return true;
     } catch (error) {
       bb.log.warn(`outcome line request failed for crew ${crew.id}: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  }
+  // A native worker may state its outcome only in its status file.
+  async function nativeOutcomeRecorded(crew: Crew): Promise<boolean> {
+    try {
+      const verb = latestStatus((await crewStatusLines(crew)).lines)?.verb;
+      return verb !== undefined && TERMINAL_VERBS.has(verb);
+    } catch {
       return false;
     }
   }
@@ -11512,7 +11529,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (await isNativeWorker(crew)) {
       await dropNudge(crew.id);
       if (await clearWaiting(crew.id)) await dropResumeRows(crew, "all");
-      if (hasStatusProtocol(lastAssistantText) || isWaitingYield(lastAssistantText)) await clearNoOutcome(crew);
+      if (hasStatusProtocol(lastAssistantText) || isWaitingYield(lastAssistantText) || await nativeOutcomeRecorded(crew)) await clearNoOutcome(crew);
       else await askForOutcomeLine(crew);
       const current = await settings.get();
       // The native watcher classifies its status and BB activity events. A
@@ -11542,7 +11559,7 @@ export default async function plugin(bb: BbPluginApi) {
       await clearWaiting(crew.id);
       const outcome = await applyProtocolNudge(crew);
       if (outcome !== "off") return;
-      if (await askForOutcomeLine(crew)) return;
+      await askForOutcomeLine(crew);
     }
     const current = await settings.get();
     if (current.supervisionEnabled !== true) return;
@@ -11933,7 +11950,7 @@ export default async function plugin(bb: BbPluginApi) {
   // The owner had to type "Continue" after a pool outage (fleet audit 2026-10-07: a
   // 21-minute stall). Resume the failed turn after the pool has had time to free.
   async function resumeExhaustedCaptain(threadId: string, info: FailedTurnInfo): Promise<void> {
-    if (!providerExhausted(info, info ? "" : await threadFailureDetail(threadId))) return;
+    if (!providerExhausted(info) && !providerExhausted(null, await threadFailureDetail(threadId))) return;
     const key = `${CAPTAIN_RESUME_PREFIX}${threadId}`;
     const scheduled = (await bb.storage.kv.get<number>(key)) ?? 0;
     const delay = captainResumeDelay(scheduled);
@@ -11954,7 +11971,7 @@ export default async function plugin(bb: BbPluginApi) {
   // to another provider in the same worktree, once per hour, and make it re-verify.
   async function failoverExhaustedCrew(crew: Crew, info: FailedTurnInfo): Promise<void> {
     if ((await settings.get()).supervisionEnabled !== true) return;
-    if (!providerExhausted(info, info ? "" : await threadFailureDetail(crew.threadId))) return;
+    if (!providerExhausted(info) && !providerExhausted(null, await threadFailureDetail(crew.threadId))) return;
     const key = `crew-failover:${crew.projectId}:${crew.parentThreadId ?? ""}:${crew.id}`;
     const last = await bb.storage.kv.get<number>(key);
     if (typeof last === "number" && Date.now() - last < FAILOVER_WINDOW_MS) return;
@@ -11966,11 +11983,17 @@ export default async function plugin(bb: BbPluginApi) {
     }
     await bb.storage.kv.set(key, Date.now());
     const note = `Provider failover: the prior turn failed because ${failed ?? "the provider"} was out of capacity. Before you continue, re-verify the work in progress yourself: re-read the diff, re-run the affected tests, and check the state of any push, PR, or deploy the prior thread started. Do not rely on its claims.`;
-    const next = await relaunchCrew(crew, { providerId: target.providerId, ...(target.model ? { model: target.model } : {}), note, intent: "failure-recovery" });
+    let next: Crew;
+    try {
+      next = await relaunchCrew(crew, { providerId: target.providerId, ...(target.model ? { model: target.model } : {}), ...(target.reasoningLevel ? { reasoningLevel: target.reasoningLevel } : {}), note, intent: "failure-recovery" });
+    } catch (error) {
+      await notifyCaptain(crew, "needs-decision", `NEEDS DECISION: ${failed ?? "provider"} was out of capacity and the failover to ${target.providerId} was refused: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
     await notifyCaptain(next, "failed over", `${failed ?? "provider"} was out of capacity. Relaunched on ${target.providerId}${target.model ? `/${target.model}` : ""} in the same worktree; it re-verifies the work in progress first.`);
   }
 
-  async function failoverExecution(crew: Crew, failed: string | null): Promise<{ providerId: string; model: string | null } | null> {
+  async function failoverExecution(crew: Crew, failed: string | null): Promise<{ providerId: string; model: string | null; reasoningLevel: ReasoningLevel | undefined } | null> {
     const preferred: ExecutionChoice[] = [];
     if (crew.parentThreadId) {
       try {
@@ -11985,15 +12008,23 @@ export default async function plugin(bb: BbPluginApi) {
     } catch { /* the catalog remains */ }
     const envId = await threadEnv(crew.threadId);
     const routing = envId !== null ? { environmentId: envId } : {};
-    const catalog = (await bb.sdk.providers.list(routing)).map(asRecord)
-      .flatMap((p) => typeof p["id"] === "string" ? [{ id: p["id"], available: p["available"] !== false }] : []);
-    const target = failoverTarget({ failedProviderId: failed, shape: crew.shape, preferred, catalog });
-    if (target === null || target.model !== null) return target;
+    const rows = (await bb.sdk.providers.list(routing)).map(asRecord);
+    const catalog = rows.flatMap((p) => typeof p["id"] === "string" ? [{ id: p["id"], available: p["available"] !== false }] : []);
+    const picked = failoverTarget({ failedProviderId: failed, shape: crew.shape, preferred, catalog });
+    if (picked === null) return null;
+    // The old reasoning level carries over unless the new provider lacks it.
+    const levels = rows.find((p) => p["id"] === picked.providerId)?.["reasoningLevels"];
+    const advertised = Array.isArray(levels) ? levels.map(asRecord) : null;
+    const keep = advertised === null || crew.reasoningLevel == null || advertised.some((l) => l["id"] === crew.reasoningLevel);
+    const fallback = advertised?.find((l) => l["isDefault"] === true) ?? advertised?.[0];
+    const reasoningLevel = keep ? undefined : toReasoningLevel(fallback?.["id"]);
+    const target = { ...picked, reasoningLevel };
+    if (target.model !== null) return target;
     // Without a model the replacement would inherit the failed provider's model.
     const models = asRecord(await bb.sdk.providers.models({ ...routing, providerId: target.providerId }))["models"];
-    const rows = Array.isArray(models) ? models.map(asRecord) : [];
-    const pick = rows.find((m) => m["isDefault"] === true) ?? rows[0];
-    return { providerId: target.providerId, model: typeof pick?.["model"] === "string" ? pick["model"] : null };
+    const entries = Array.isArray(models) ? models.map(asRecord) : [];
+    const pick = entries.find((m) => m["isDefault"] === true) ?? entries[0];
+    return { ...target, model: typeof pick?.["model"] === "string" ? pick["model"] : null };
   }
 
   bb.cli.register({

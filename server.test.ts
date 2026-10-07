@@ -1035,9 +1035,8 @@ test("nudgeEnabled false leaves the idle ping to supervision", async () => {
     await host.harness.behavior.setSettings({ nudgeEnabled: false, supervisionEnabled: true });
     const emitted = await emitIdle(host, "still working");
     assert.deepEqual(emitted.errors, []);
-    const sends = sendCalls(host);
+    const sends = sendCalls(host).filter((s) => s.threadId === "thr_cap");
     assert.equal(sends.length, 1);
-    assert.equal(sends[0]?.threadId, "thr_cap");
     assert.match(sends[0]?.text ?? "", /crew c1 idle with no outcome/);
   } finally {
     await host.harness.lifecycle.dispose();
@@ -11143,6 +11142,9 @@ test("native worker idle honors durable status without imposing chat verdicts or
   try {
     stubIdleSdk(host);
     host.harness.sdk.stub("threads.queuedMessages.list", async () => []);
+    // The status file holds the outcome, so no chat verdict is requested.
+    stubRoutedHost(host, (cmd) => cmd.includes("/state/c1.status") ? { payload: "done: report saved" } : {});
+    stubIdleSdk(host);
     await host.bb.storage.kv.set("crews", [{ ...crewRow("c1", "thr_crew", "thr_cap"), nativeHome: "/tmp/fm-home", backlogRow: true }]);
     for (const reply of ["Finished; report saved.", "WAITING: old injected vocabulary", null]) {
       const event = await emitIdle(host, reply);

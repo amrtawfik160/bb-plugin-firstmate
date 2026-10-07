@@ -284,6 +284,7 @@ test("a wake drain hides idle alerts for a DONE crew whose PR the tracker owns, 
   await plugin(host.bb);
   try {
     stubRoutedHost(host, finishedCrewRouter());
+    host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: "idle" }));
     trackPrs(host);
     const result = await host.harness.behavior.runCli(["wake"], { projectId: "proj_1", threadId: "thr_cap" });
     assert.equal(result.exitCode, 0, result.stderr);
@@ -315,6 +316,49 @@ test("an inactive-outcome check for a DONE crew whose PR the tracker owns does n
     await run.done;
     assert.equal(sendCalls(host).filter((s) => s.threadId === "thr_cap").length, 0, "no captain wake");
     assert.ok(dropped(), "the relay logs why it dropped the check");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a wake drain keeps the wedge alert of a DONE crew that was steered back to work", async () => {
+  const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { fmHome: "/tmp/fm-home", notifyOwner: "real", fmHostId: "host_1" } });
+  await plugin(host.bb);
+  try {
+    stubRoutedHost(host, finishedCrewRouter());
+    host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: threadId === "thr_c1" ? "active" : "idle" }));
+    trackPrs(host);
+    const result = await host.harness.behavior.runCli(["wake"], { projectId: "proj_1", threadId: "thr_cap" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /stale: bb:thr_c1/);
+    assert.doesNotMatch(result.stdout, /child=c1/, "the finished outcome row is still hidden");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a pool outage reported only in the error text still fails over, with the new provider's default reasoning level when it lacks the old one", async () => {
+  const host = await failoverHost([{ id: "claude-code", available: true }, { id: "codex", available: true }]);
+  try {
+    await host.bb.storage.kv.set("crews", [{ ...shipRow("c1", "thr_crew", "thr_cap"), providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "max" }]);
+    host.harness.sdk.stub("providers.list", async () => [{ id: "claude-code", available: true }, { id: "codex", available: true, reasoningLevels: [{ id: "medium", isDefault: true }, { id: "high" }] }]);
+    host.harness.sdk.stub("threads.events.list", async () => [{ type: "provider/error", data: { message: "Provider error", detail: "API Error: Request rejected (429) · No Account Pooler account is currently eligible." } }]);
+    await host.harness.behavior.emitThreadEvent("turn.failed", turnFailed("thr_crew", { category: "unknown", httpStatusCode: null, providerCode: null }));
+    const spawns = host.harness.sdk.callsTo("threads.spawn");
+    assert.equal(spawns.length, 1);
+    assert.equal((spawns[0]![0] as { reasoningLevel?: string }).reasoningLevel, "medium", "max is not offered by codex, so its default is used");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a refused failover is reported to the captain as a decision", async () => {
+  const host = await failoverHost([{ id: "claude-code", available: true }, { id: "codex", available: true }]);
+  try {
+    await host.bb.storage.kv.set("crews", [{ ...shipRow("c1", "thr_crew", "thr_cap"), providerId: "claude-code", relaunches: 1 }]);
+    await host.harness.behavior.emitThreadEvent("turn.failed", turnFailed("thr_crew", POOL_429));
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
+    assert.ok(sendCalls(host).some((s) => s.threadId === "thr_cap" && /failover to codex was refused/.test(s.text)));
   } finally {
     await host.harness.lifecycle.dispose();
   }
