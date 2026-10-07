@@ -11072,16 +11072,18 @@ export default async function plugin(bb: BbPluginApi) {
     if(action!=="status" && action!=="install") {
       if(!captain || !home || !boundHost || !await isCaptainThread(captain))throw new Error("Runtime selection requires the owning bound captain; call deck first. No ownership transfer.");
       if(!release || !( /^[0-9a-f]{64}$/.test(release) || action==="rollback" && release==="external"))throw new Error("Specify one exact installed release ID from runtime status; rollback external is allowed only for a recorded external migration.");
-      if(launches.hasRuntimeConsumers(captain))throw new Error("Runtime selection refused while this captain has running/reserved/uncertain launches; reconcile them first without respawning.");
     }
+    const consumers=action!=="status" && action!=="install" && launches.hasRuntimeConsumers(captain!);
     if(check && (action==="status" || action==="install"))throw new Error("--check is supported only for runtime select/migrate/rollback.");
     if(release && action==="install")throw new Error("runtime install stages this plugin release; it does not accept an alternative release ID.");
     const pendingKey=`runtime-selection-pending:${captain??''}`;
     const pending=await bb.storage.kv.get<Record<string,unknown>>(pendingKey);
     const mutation=action!=="install" && action!=="status" && !check;
+    // The host refuses a native change under live launches; learn that before recording a pending selection.
+    if(mutation && consumers)await nativeRuntime.operation(host,action,{home:home??undefined,captain:home?captain:undefined,release,check:true,consumers},signal);
     if(mutation && pending && (pending["release"]!==release || pending["action"]!==action))throw new Error("An earlier runtime selection remains unresolved; inspect runtime status before choosing another release.");
     if(mutation && !pending)await bb.storage.kv.set(pendingKey,{action,release,previous:await bb.storage.kv.get(`native-runtime:${captain}`),startedAt:Date.now()});
-    const result=await nativeRuntime.operation(host,action,{home:home??undefined,captain:home?captain:undefined,release,check},signal);
+    const result=await nativeRuntime.operation(host,action,{home:home??undefined,captain:home?captain:undefined,release,check,consumers},signal);
     if(action==="status" && pending && captain && result.selectionCompatible===true) {
       // A status read is authoritative after publication/response/KV failures.
       await bb.storage.kv.set(`native-runtime:${captain}`,result.selected??null);

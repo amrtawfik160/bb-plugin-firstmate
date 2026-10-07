@@ -19,18 +19,20 @@ export function runtimeFixture() {
  return{directory,store,home,env,call,owned,json,install,bind,ready,clean:()=>rmSync(directory,{recursive:true,force:true})};
 }
 
-export function secondRelease(f) {
+export function secondRelease(f,appended={},name='next.tar.gz') {
  const result=ok(run('python3',['-c',`import hashlib,io,json,tarfile,gzip,sys
 from pathlib import Path
 original=Path(sys.argv[1]);out=Path(sys.argv[2]);files={}
 with tarfile.open(original,'r:gz') as bundle:
  for entry in bundle.getmembers():files[entry.name]=bundle.extractfile(entry).read()
 manifest=json.loads(files['release-manifest.json']);manifest['pluginVersion']='0.4.1-fixture'
+for payload,suffix in json.loads(sys.argv[3]).items():
+ files[payload]+=suffix.encode();manifest['payloads'][payload]=hashlib.sha256(files[payload]).hexdigest()
 files['release-manifest.json']=(json.dumps(manifest,sort_keys=True,separators=(',',':'))+'\\n').encode()
 release=hashlib.sha256(files['release-manifest.json']).hexdigest();raw=io.BytesIO()
 with tarfile.open(fileobj=raw,mode='w',format=tarfile.USTAR_FORMAT) as bundle:
  for name,data in sorted(files.items()):
   item=tarfile.TarInfo(name);item.size=len(data);item.mode=420;item.mtime=0;bundle.addfile(item,io.BytesIO(data))
 compressed=gzip.compress(raw.getvalue(),mtime=0);out.write_bytes(compressed)
-print(json.dumps({'release':release,'sha256':hashlib.sha256(compressed).hexdigest()}))`,join(assets,'runtime.tar.gz'),join(f.directory,'next.tar.gz')]));return JSON.parse(result);
+print(json.dumps({'release':release,'sha256':hashlib.sha256(compressed).hexdigest()}))`,join(assets,'runtime.tar.gz'),join(f.directory,name),JSON.stringify(appended)]));return{...JSON.parse(result),archive:join(f.directory,name)};
 }
