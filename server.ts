@@ -8882,6 +8882,9 @@ export default async function plugin(bb: BbPluginApi) {
       throw new Error(`Queue ${item.id} saved; native add unresolved. Inspect native row, then queue reconcile ${item.id}. ${error instanceof Error?error.message:String(error)}`);
     }
   }
+  // Callers pass only an explicit project. Defaulting to the captain's own project
+  // missed items queued for other projects, and the shared native backlog row was
+  // then adopted under the captain's project and launched in the wrong repository.
   function findQueueItem(items:QueueItem[],id:string|undefined,project:string|undefined):QueueItem|undefined {
     const matches=items.filter(row=>row.id===id && (project===undefined || row.projectId===project));
     if (matches.length>1) throw new Error(`Queue id ${id} is ambiguous; pass its exact project.`);
@@ -10726,7 +10729,7 @@ export default async function plugin(bb: BbPluginApi) {
         await publishFleet();
         return `Pruned ${items.length - kept.length} finished queue item(s).`;
       }
-      let item = findQueueItem(items,queueId,projectId??ctxProject);
+      let item = findQueueItem(items,queueId,projectId);
       let adopted = false;
       if (item === undefined && queueId !== undefined && (action === "dispatch" || action === "drop" || action === "done")) {
         // A row filed straight into the native backlog: adopt it into the queue. Closing one
@@ -12505,7 +12508,7 @@ export default async function plugin(bb: BbPluginApi) {
             }
             if (sub === "dispatch") {
               const qid = rest[1];
-              let item = findQueueItem(items,qid,flagStr(flags,"project")??ctxProject);
+              let item = findQueueItem(items,qid,flagStr(flags,"project"));
               if (item === undefined && qid !== undefined) {
                 const row = await adoptRealBacklogRow(qid, flagStr(flags, "project") ?? ctxProject, ctxThread);
                 if (row !== null) { item = row; queueStore.add(row); items.unshift(row); }
@@ -12543,7 +12546,7 @@ export default async function plugin(bb: BbPluginApi) {
             }
             if (sub === "drop" || sub === "done") {
               const qid = rest[1];
-              let item = findQueueItem(items,qid,flagStr(flags,"project")??ctxProject);
+              let item = findQueueItem(items,qid,flagStr(flags,"project"));
               const adopted = item === undefined && qid !== undefined;
               if (item === undefined && qid !== undefined) item = await adoptRealBacklogRow(qid, flagStr(flags, "project") ?? ctxProject, ctxThread, false) ?? undefined;
               if (qid === undefined || item === undefined) return fail(`No queued item ${qid ?? ""}.`);
