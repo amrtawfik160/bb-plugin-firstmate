@@ -52,8 +52,8 @@
       "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner."
     },
     "entry-skills/skill-routing/SKILL.md": {
-      "sha256": "29c7a60b31fcdbf674405e4ac8157048d48925bcaf89899444e00ec2c5a94ae1",
-      "reason": "BB-owned task-to-skill table selected for bound captains and crews; its Firstmate rules keep delegation, model choice, merge and delivery with Firstmate."
+      "sha256": "ef805276f9d099d5ccb2284306af1548df11d89ae619eed5b4e2136d6d0e6e57",
+      "reason": "BB-owned task-to-skill table selected for bound captains and crews; its Firstmate rules keep delegation, model choice, merge and delivery with Firstmate. Poteto mode runs on every crewmate task; Firstmate rules still win and the supervisor's replies keep the user's style."
     },
     "entry-skills/captain/references/telegram.md": {
       "sha256": "0c0778430d0620e01e86eaa2dd57de0e4259939c5501985f1486398e7595468c",

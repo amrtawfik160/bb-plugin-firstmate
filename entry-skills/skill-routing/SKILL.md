@@ -15,6 +15,18 @@ installed, continue without it and say so in your report.
 The supervisor names the matched skills in each dispatch brief. A crewmate
 follows the skills its brief names and any row that matches its own work.
 
+## Poteto mode on every crewmate task
+
+Every crewmate task, ship or scout, runs in poteto mode. Read
+`poteto-mode/SKILL.md` in full before any other step, then open the playbook
+that matches the task (the rows below name it; use `investigation.md` for a
+scout with no other match) and follow its steps. The supervisor names
+`poteto-mode` and the playbook in every brief.
+
+Poteto mode is for crewmate work only. The supervisor's own replies to the
+user keep the user's reply style. Principle names and evidence labels go in
+the crewmate's result report, never in a message for the user.
+
 | Task | Skills |
 |---|---|
 | Bug, failure, crash, or flaky test | `diagnosing-bugs`; poteto-mode `bug-fix.md`; `tdd` for the regression test |
@@ -47,4 +59,6 @@ Where a routed skill conflicts with Firstmate, follow Firstmate:
 - Skip Cursor-only steps: `deslop`, `control-ui`, `control-cli`, `create-skill`,
   and `pstack-models.mdc`.
 - A crewmate's questions go to the supervisor through the brief's result channel.
-- Load only the skills a matched row names.
+- Poteto mode's Autonomy and Subagents sections give way to the brief: pause
+  where the brief or Firstmate says to, and spawn no `poteto-agent` or `Task`.
+- Load only the skills a matched row names, plus poteto mode.
