@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# fm-heavy <command> [args...]
+# Runs a memory-heavy command (full type check, full test suite, production
+# build) while holding one of FM_HEAVY_SLOTS (default 2) host-wide slots, so
+# crews queue instead of pushing the shared cgroup into the OOM killer.
+# A slot is an exclusive flock on $FM_HEAVY_DIR/<i>.lock held by this process;
+# the kernel releases it when the process exits, so a crash leaves nothing behind.
+set -u
+[ $# -gt 0 ] || { echo "usage: fm-heavy <command> [args...]" >&2; exit 2; }
+
+if ! command -v flock >/dev/null 2>&1; then
+  echo "fm-heavy: flock not found; running without a slot" >&2
+  exec "$@"
+fi
+
+dir=${FM_HEAVY_DIR:-/tmp/fm-heavy-slots}
+slots=${FM_HEAVY_SLOTS:-2}
+case $slots in ''|*[!0-9]*|0) slots=2 ;; esac
+mkdir -p "$dir" 2>/dev/null
+
+notified=0
+while :; do
+  opened=0
+  for ((i = 1; i <= slots; i++)); do
+    { exec 9>>"$dir/$i.lock"; } 2>/dev/null || continue
+    opened=1
+    flock -n 9 && break 2
+    exec 9>&-
+  done
+  if [ "$opened" = 0 ]; then
+    echo "fm-heavy: cannot open slot files in $dir; running without a slot" >&2
+    exec "$@"
+  fi
+  if [ "$notified" = 0 ]; then
+    echo "fm-heavy: waiting for a heavy-check slot" >&2
+    notified=1
+  fi
+  sleep 2
+done
+
+# Job control gives the command its own process group and keeps SIGINT
+# deliverable to it; the lock fd is closed in the command so a daemon it
+# leaves behind cannot hold the slot forever.
+set -m
+"$@" 9>&- &
+child=$!
+for sig in INT TERM HUP; do
+  trap "kill -$sig -- -$child 2>/dev/null" "$sig"
+done
+while :; do
+  wait "$child"
+  rc=$?
+  kill -0 "$child" 2>/dev/null || exit "$rc"
+done

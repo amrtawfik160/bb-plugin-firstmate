@@ -8261,7 +8261,7 @@ test("captain hook install merges user-level Claude and Codex hooks idempotently
     writeFileSync(join(home, ".claude/settings.json"), JSON.stringify({ permissions: { allow: ["x"] }, hooks: { Stop: [{ hooks: [{ type: "command", command: "echo existing" }] }] } }));
     const script = captainHookInstallScript({
       threadId: "thr_cap", home: "/fm", state: "/fm/state/cap-thr_cap", ownHome: false,
-      scriptB64: readFileSync(CAPTAIN_HOOK).toString("base64"),
+      hookPath: CAPTAIN_HOOK, heavyPath: join(dirname(CAPTAIN_HOOK), "fm-heavy"),
     });
     for (let i = 0; i < 3; i++) {
       const res = spawnSync("bash", ["-c", script], { encoding: "utf8", env: { PATH: process.env.PATH ?? "", HOME: home } });
@@ -8277,6 +8277,36 @@ test("captain hook install merges user-level Claude and Codex hooks idempotently
     assert.ok(existsSync(join(home, ".claude/settings.json.bak-bb-firstmate")));
     assert.equal(readFileSync(join(home, ".bb-firstmate/captains/thr_cap"), "utf8"), "home=/fm\nstate=/fm/state/cap-thr_cap\nown_home=0\nroot=/fm\n");
     assert.ok(lstatSync(join(home, ".bb-firstmate/bin/bb-captain-hook.sh")).mode & 0o100, "hook script is executable");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("captain setup installs fm-heavy once and leaves an unchanged copy alone", () => {
+  const home = mkdtempSync(join(tmpdir(), "fm-heavy-install-"));
+  try {
+    const install = (heavy: Buffer) => {
+      const heavyPath = join(home, "staged-fm-heavy");
+      writeFileSync(heavyPath, heavy);
+      const script = captainHookInstallScript({
+        threadId: "thr_cap", home: "/fm", state: "/fm/state/cap-thr_cap", ownHome: false,
+        hookPath: CAPTAIN_HOOK, heavyPath,
+      });
+      const res = spawnSync("bash", ["-c", script], { encoding: "utf8", env: { PATH: process.env.PATH ?? "", HOME: home } });
+      assert.equal(res.status, 0, res.stderr);
+    };
+    const target = join(home, ".bb-firstmate/bin/fm-heavy");
+    const shipped = readFileSync(join(dirname(CAPTAIN_HOOK), "fm-heavy"));
+    install(shipped);
+    assert.deepEqual(readFileSync(target), shipped);
+    assert.ok(lstatSync(target).mode & 0o100, "fm-heavy is executable");
+    const first = lstatSync(target);
+    install(shipped);
+    const second = lstatSync(target);
+    assert.equal(second.ino, first.ino, "unchanged script is not rewritten");
+    assert.equal(second.mtimeMs, first.mtimeMs);
+    install(Buffer.from("#!/bin/sh\nexec \"$@\"\n"));
+    assert.equal(readFileSync(target, "utf8"), "#!/bin/sh\nexec \"$@\"\n", "changed script is replaced");
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
