@@ -40,8 +40,8 @@
       "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner."
     },
     "entry-skills/captain/references/bb.md": {
-      "sha256": "7ad5512a7bf21494491a5271a8cf75d2e2a53146bee8b10e773a1f07330d6962",
-      "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner."
+      "sha256": "46617c895c4023dc9ce6ab7e92abfd1c0edb0a67af25c11c748ffdbe2ddd2ad5",
+      "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner. Runtime select allows an adapter-only release switch while crews run; running crews keep their recorded release."
     },
     "entry-skills/captain/references/intake-briefs.md": {
       "sha256": "06d88ecf4bc68cccc6288428dc0b346509b928ae302e411a45d3b9f56566759a",
@@ -56,8 +56,8 @@
       "reason": "BB-owned task-to-skill table selected for bound captains and crews; its Firstmate rules keep delegation, model choice, merge and delivery with Firstmate. Poteto mode runs on every crewmate task; Firstmate rules still win and the supervisor's replies keep the user's style. Memory-heavy commands run through the fm-heavy host slot wrapper. Firstmate adds the skills block to every brief; crews never print secret values and use this host's Telegram tools when a task needs them."
     },
     "entry-skills/captain/references/telegram.md": {
-      "sha256": "0a57b7a7b9e210c8c4583c0e421e7de62adfdadeb40b268b225f90f2ddaa0da2",
-      "reason": "BB-only Telegram owner-message transport: what reaches Telegram, per-message tracking with firstmate_inbox, and threaded or quoted answers with firstmate_reply; native final-response policy unchanged. Telegram commands map to the native ahoy, bearings, afk, quiet and stow skills. Owner asks go through firstmate_ask and close by answer, firstmate_resolve_ask, or a reversible default. Every open PR is tracked with firstmate_deliveries so it shows on the board; no native policy change. Wake-only turns end with no text; firstmate_inbox ends every turn that handled owner messages; standing approvals are checked before asking."
+      "sha256": "b1d52b24298e03e35842752f546ea22f29752bcbaed34a6ec31e8301b6623094",
+      "reason": "BB-only Telegram owner-message transport: what reaches Telegram, per-message tracking with firstmate_inbox, and threaded or quoted answers with firstmate_reply; native final-response policy unchanged. Telegram commands map to the native ahoy, bearings, afk, quiet and stow skills. Owner asks go through firstmate_ask and close by answer, firstmate_resolve_ask, or a reversible default. Every open PR is tracked with firstmate_deliveries so it shows on the board; no native policy change. Wake-only turns end with no text; firstmate_inbox ends every turn that handled owner messages; standing approvals are checked before asking. Dispatch for an owner message carries its ref and opens an owner task; a reply never closes the task; firstmate_task closes it as done or dropped with a reason."
     }
   }
 }
