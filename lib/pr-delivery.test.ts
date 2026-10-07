@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { boardPullRequests, type DeliveryRecord } from "./pr-delivery.ts";
+import { DatabaseSync } from "node:sqlite";
+import { formatBoard } from "./owner-asks.ts";
+import { boardPullRequests, createDeliveries, parseForge, type DeliveryRecord } from "./pr-delivery.ts";
 
 function record(n: number, over: Partial<DeliveryRecord> = {}): DeliveryRecord {
   return {
@@ -48,4 +50,54 @@ test("a PR's age on the board comes from GitHub when known", () => {
   const [known, unknown] = boardPullRequests([record(1, { openedAt: 500 }), record(2)]);
   assert.equal(known!.openedAt, 500);
   assert.equal(unknown!.openedAt, 1_002);
+});
+
+function db() {
+  const raw = new DatabaseSync(":memory:");
+  return Object.assign(raw, {
+    transaction<T>(fn: () => T) {
+      return () => {
+        raw.exec("BEGIN");
+        try { const out = fn(); raw.exec("COMMIT"); return out; } catch (error) { raw.exec("ROLLBACK"); throw error; }
+      };
+    },
+  });
+}
+
+/** GitHub's answer for hazw80801/runants#1759 on Oct 7: green, mergeable, and the captain's do-not-merge comment. */
+function runants1759(over: Record<string, unknown> = {}) {
+  return {
+    headRefOid: "3ef8a02", state: "OPEN", isDraft: false, mergeable: "MERGEABLE", reviewDecision: "", reviews: [],
+    statusCheckRollup: [{ conclusion: "SUCCESS" }, { conclusion: "SUCCESS" }, { conclusion: "SUCCESS" }],
+    title: "style(ui): restyle empty states and surfaces toward Shopify admin look", createdAt: "2026-10-07T16:17:52Z",
+    commits: [{ oid: "3ef8a02", committedDate: "2026-10-07T16:15:00Z" }],
+    labels: [],
+    comments: [{ author: { login: "amrtawfik160" }, createdAt: "2026-10-07T18:35:27Z", body: "Not ready: the first screenshots were mock pages, not the real app. The worker is redoing the restyle on real routes. Do not merge yet." }],
+    ...over,
+  };
+}
+
+function boardFor(forge: Record<string, unknown>): string {
+  const store = createDeliveries(db() as never);
+  store.register({ url: "https://github.com/hazw80801/runants/pull/1759", taskId: "runants-shopify-ui", projectId: "proj_1", owner: "thr_cap", home: "", worker: "thr_crew" });
+  for (let pass = 0; pass < 2; pass++) store.observe("hazw80801/runants#1759", parseForge(forge), false);
+  return formatBoard({ asks: [], calls: [], prs: boardPullRequests(store.list({ owner: "thr_cap" })), now: 0 });
+}
+
+test("a green PR with a do-not-merge comment on its current head is on hold, not ready to merge", () => {
+  assert.equal(boardFor(runants1759()), [
+    "📌 Nothing needs you right now.",
+    "",
+    "Open pull requests (1):",
+    "- hazw80801/runants#1759 style(ui): restyle empty states and surfaces toward Shopify admin look — on hold (do not merge)",
+  ].join("\n"));
+});
+
+test("a do-not-merge label holds the PR whatever its head", () => {
+  assert.match(boardFor(runants1759({ comments: [], labels: [{ name: "do-not-merge" }] })), /#1759 .* — on hold \(do not merge\)$/);
+});
+
+test("a new commit after the do-not-merge comment lifts the hold, and an approval comment does not hold", () => {
+  assert.match(boardFor(runants1759({ commits: [{ oid: "3ef8a02", committedDate: "2026-10-07T19:00:00Z" }] })), /#1759 .* — ready to merge$/);
+  assert.match(boardFor(runants1759({ comments: [{ author: { login: "amrtawfik160" }, createdAt: "2026-10-07T18:35:27Z", body: "Checked on the real app. Merge it." }] })), /#1759 .* — ready to merge$/);
 });

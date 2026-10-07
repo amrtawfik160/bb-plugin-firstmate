@@ -3,7 +3,7 @@ import type { BbPluginApi } from '@get-bb/plugin-sdk';
 import type { BoardPr } from './owner-asks.ts';
 type Database = ReturnType<BbPluginApi['storage']['database']>;
 export type DeliveryRequirement = 'pr' | 'merged' | 'merged-and-verified';
-export type DeliveryStatus = 'draft' | 'waiting-checks' | 'failing-checks' | 'waiting-review' | 'waiting-native-gates' | 'changes-requested' | 'waiting-approval' | 'ready-to-merge' | 'merged-needs-verification' | 'closed-needs-disposition' | 'pr-delivered' | 'complete' | 'explicitly-abandoned';
+export type DeliveryStatus = 'draft' | 'waiting-checks' | 'failing-checks' | 'waiting-review' | 'waiting-native-gates' | 'changes-requested' | 'on-hold' | 'waiting-approval' | 'ready-to-merge' | 'merged-needs-verification' | 'closed-needs-disposition' | 'pr-delivered' | 'complete' | 'explicitly-abandoned';
 export interface CheckFailure {
   id:string; name:string; url:string; headSha:string; resolvedAt:number|null;
   accounting?:{scope:'author'|'baseline'; taskId:string; worker:string; evidence:string; actor:string; at:number};
@@ -28,6 +28,8 @@ export interface ForgeObservation {
   mergeable: 'mergeable' | 'conflicting' | 'unknown';
   reviewHeadSha:string|null; mergeCommitSha:string|null; failedChecks?:{id:string;name:string;url:string}[];
   title?:string; openedAt?:number;
+  /** A do-not-merge verdict that applies to the current head, quoted; null when none. */
+  hold?:string|null;
 }
 export function canonicalPr(url: string) {
   const m = /^https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)(?:[/?#].*)?$/.exec(url.trim());
@@ -44,6 +46,7 @@ const BOARD_PR_STATE: Record<DeliveryStatus, string | null> = {
   'waiting-checks': 'checks running',
   'failing-checks': 'checks failing',
   'changes-requested': 'changes requested',
+  'on-hold': 'on hold (do not merge)',
   'waiting-review': 'waiting for review',
   'waiting-native-gates': 'waiting for review',
   'pr-delivered': 'waiting for review',
@@ -153,6 +156,8 @@ export function createDeliveries(db: Database) {
       r.status = 'closed-needs-disposition'; r.blocker = 'PR closed without merge'; r.nextAction = 'Reopen, replace, or explicitly abandon with a reason';
     } else if (o.draft) {
       r.status='draft'; r.blocker='PR is a draft'; r.nextAction='Finish work and mark ready';
+    } else if (o.hold) {
+      r.status='on-hold'; r.blocker=`Do-not-merge verdict: ${o.hold}`; r.nextAction='Do not merge. A new commit or removing the label lifts the hold';
     } else if (o.review === 'changes-requested') {
       r.status='changes-requested'; r.blocker='Reviewer requested changes'; r.nextAction='Reuse the author for fixes, then repeat the agreed review and validation';
     } else if (o.checks === 'failing') {
@@ -174,7 +179,7 @@ export function createDeliveries(db: Database) {
     if (r.requirement === 'pr' && o.state === 'open' && !o.draft) {
       r.deliverySatisfiedAt=prior.deliverySatisfiedAt ?? now;
       // Artifact delivery is fulfilled independently of CI and review health.
-      if (o.checks==='failing' || o.review==='changes-requested') {
+      if (o.checks==='failing' || o.review==='changes-requested' || o.hold) {
         r.nextAction='Inspect every independent failure. Reuse the author for branch-specific fixes; record baseline evidence and an existing authorized follow-up task separately. No merge authority is added.';
       } else {
         r.status='pr-delivered'; r.blocker=o.checks==='passing' ? '' : 'PR delivered; checks pending or unknown';
@@ -278,6 +283,22 @@ export function createDeliveries(db: Database) {
   return { get,save,list,conflict,hasOwned,taskRecord,register,observe,stale,assign,ownerLost,markOwnerNeeded,ownerRestored,transferOwner,accountFailure,abandon,verify,markQueued,notify,pendingNotifications };
 }
 
+const DO_NOT_MERGE = /\b(?:do not|don'?t|dont)[\s-]+merge\b|\bdo-not-merge\b/i;
+/** A captain or crew says "do not merge" with a PR label, or with a comment written after
+ * the current head's commit. A later commit is new work, so it lifts a comment hold. */
+function holdOf(r:Record<string,unknown>):string|null {
+  const labels=Array.isArray(r.labels) ? r.labels as Record<string,unknown>[] : [];
+  const label=labels.map(l=>String(l.name ?? '')).find(name=>DO_NOT_MERGE.test(name.replace(/[-_]/g,' ')) || /^(?:hold|on[\s-]hold)$/i.test(name));
+  if (label) return `label "${label}"`;
+  const commits=Array.isArray(r.commits) ? r.commits as Record<string,unknown>[] : [];
+  const headAt=Date.parse(String(commits.at(-1)?.committedDate ?? ''));
+  const notes=[...(Array.isArray(r.comments) ? r.comments : []),...(Array.isArray(r.reviews) ? r.reviews : [])] as Record<string,unknown>[];
+  const verdict=notes.filter(n=>{
+    const at=Date.parse(String(n.createdAt ?? n.submittedAt ?? ''));
+    return DO_NOT_MERGE.test(String(n.body ?? '')) && (!Number.isFinite(headAt) || !Number.isFinite(at) || at>=headAt);
+  }).at(-1);
+  return verdict ? String(verdict.body).replace(/\s+/g,' ').trim().slice(0,200) : null;
+}
 /** Parse forge data conservatively. A successful lookup with unknown fields
  * cannot turn checks green or waive independent review. */
 export function parseForge(value: unknown): ForgeObservation {
@@ -298,5 +319,5 @@ export function parseForge(value: unknown): ForgeObservation {
       return {id:createHash('sha256').update(JSON.stringify([name,url])).digest('hex').slice(0,24),name,url};
     }),
     checks:checkState, review:approved ? 'approved' : r.reviewDecision === 'CHANGES_REQUESTED' ? 'changes-requested' : r.reviewDecision === 'REVIEW_REQUIRED' ? 'required' : 'unknown',
-    mergeable:r.mergeable === 'MERGEABLE' ? 'mergeable' : r.mergeable === 'CONFLICTING' ? 'conflicting' : 'unknown' };
+    mergeable:r.mergeable === 'MERGEABLE' ? 'mergeable' : r.mergeable === 'CONFLICTING' ? 'conflicting' : 'unknown', hold:holdOf(r) };
 }

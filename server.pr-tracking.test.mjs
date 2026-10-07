@@ -142,6 +142,29 @@ test('open PRs on a crew branch are tracked for that crew captain, and other PRs
  }finally{await host.harness.lifecycle.dispose();}
 });
 
+test('a crew PR is tracked when the crew pushed its own fm/ branch, not the worktree branch BB recorded',async()=>{
+ const host=await base();try {
+  await host.bb.storage.kv.set('crews',[crew('verify','thr_c1','thr_cap')]);
+  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'active',environmentId:`env_${threadId}`}));
+  // On Oct 7 BB still recorded bb/ship-… while the crew's checkout was on fm/<task>, the branch its brief makes it push.
+  host.harness.sdk.stub('environments.get',async({environmentId})=>({id:environmentId,hostId:'host_1',status:'ready',isWorktree:true,path:`/wt/${environmentId}`,branchName:'bb/ship-verification-harness-fixes-thr_c1'}));
+  hostCommands(host,command=>{
+   if(command.includes('branch --show-current'))return{payload:'fm/verify\n'};
+   if(command.includes('gh pr list') && command.includes('--state open'))return{payload:JSON.stringify(openPrs)};
+   if(command.includes('gh pr list'))return{payload:'[]'};
+   if(command.includes('gh pr view'))return{payload:JSON.stringify(forge('OPEN'))};
+   return{code:0};
+  });
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  const tracked=createDeliveries(host.bb.storage.database()).list({includeComplete:true}).map(r=>[r.id,r.owner,r.taskId]).sort();
+  assert.deepEqual(tracked,[
+   ['acme/repo#10','thr_cap','verify'],
+   ['acme/repo#11','thr_cap','verify'],
+   ['acme/repo#12','thr_cap','verify'],
+  ]);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
 test('a captain can track a PR it opened itself without a crew',async()=>{
  const host=await base();try {
   host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'active'}));

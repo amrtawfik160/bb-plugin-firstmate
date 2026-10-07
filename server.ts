@@ -6246,7 +6246,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (ownerState === "lost") record=deliveries.markOwnerNeeded(record.id) ?? record;
       else if (ownerState === "live") record=deliveries.ownerRestored(record.id) ?? record;
       const hostId = await resolveHostForProject(record.projectId,ownerState === "live" ? record.owner ?? undefined : undefined,signal);
-      const result = await runStructuredOnHost(hostId, `gh pr view ${shQuote(record.url)} --json state,isDraft,headRefOid,statusCheckRollup,reviewDecision,reviews,mergeable,mergeCommit,title,createdAt`,30_000,signal);
+      const result = await runStructuredOnHost(hostId, `gh pr view ${shQuote(record.url)} --json state,isDraft,headRefOid,statusCheckRollup,reviewDecision,reviews,mergeable,mergeCommit,title,createdAt,comments,labels,commits`,30_000,signal);
       if (result.exitCode !== 0) throw new Error(result.stderr || result.output || `Forge lookup exit ${result.exitCode}`);
       const observation = parseForge(JSON.parse(result.output));
       // Standing yolo allows asking the manager to continue; only native merge
@@ -6400,7 +6400,7 @@ export default async function plugin(bb: BbPluginApi) {
     const crews = (await raceAbort(readCrews(), signal, STUCK_HOST_CALL_MS))
       .filter((c) => c.shape === "ship" && c.worktree && c.posture !== "local-only" && !isSecondmateRoute(c) && c.parentThreadId);
     for (const threadId of crewBranches.keys()) if (!crews.some((c) => c.threadId === threadId)) crewBranches.delete(threadId);
-    const groups = new Map<string, { hostId: string; paths: string[]; crews: Array<{ crew: Crew; branch: string }> }>();
+    const groups = new Map<string, { hostId: string; paths: string[]; crews: Array<{ crew: Crew; branch: string; path: string }> }>();
     for (const crew of crews) {
       signal?.throwIfAborted();
       let found = crewBranches.get(crew.threadId);
@@ -6420,7 +6420,7 @@ export default async function plugin(bb: BbPluginApi) {
       const key = `${crew.projectId}\t${found.hostId}`;
       const group = groups.get(key) ?? { hostId: found.hostId, paths: [], crews: [] };
       group.paths.push(found.path);
-      group.crews.push({ crew, branch: found.branch });
+      group.crews.push({ crew, branch: found.branch, path: found.path });
       groups.set(key, group);
     }
     for (const group of groups.values()) {
@@ -6432,10 +6432,15 @@ export default async function plugin(bb: BbPluginApi) {
           if (res.exitCode === 0) { listed = JSON.parse(res.output); break; }
         }
         if (!Array.isArray(listed)) return;
+        // BB keeps the worktree's first branch name; crews push the branch their brief
+        // creates (fm/<task>), so the checkout's current branch is read as well.
+        const current = await runStructuredOnHost(group.hostId, group.crews.map(({ path }) => `printf '%s\\n' "$(git -C ${shQuote(path)} branch --show-current 2>/dev/null)"`).join("; "), 30_000, s)
+          .then((res) => res.output.split("\n"), (error) => { if (s.aborted) throw error; return [] as string[]; });
+        const branches = group.crews.flatMap(({ crew, branch }, i) => [{ crew, branch }, ...(current[i]?.trim() ? [{ crew, branch: current[i]!.trim() }] : [])]);
         for (const pr of listed.map(asRecord)) {
           const url = typeof pr["url"] === "string" ? pr["url"] : "", head = typeof pr["headRefName"] === "string" ? pr["headRefName"] : "";
           if (!url || !head) continue;
-          const owner = group.crews
+          const owner = branches
             .filter(({ branch }) => head === branch || head.startsWith(`${branch}-`) || head.startsWith(`${branch}/`))
             .sort((a, b) => b.branch.length - a.branch.length)[0];
           if (!owner) continue;
