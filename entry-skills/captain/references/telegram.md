@@ -22,8 +22,10 @@ starts with "The following is an owner message from the private Telegram connect
 - Call `firstmate_inbox` to list every owner message that still needs a final answer, with its
   ref and age. Call it as the last step of every turn that handled an owner message, and answer
   or dispatch every item it lists before the turn ends.
-- When a crew takes a task, pass the item's ref in `sourceRefs` on `firstmate_dispatch`. The item
-  then shows as "with crew" until you reply with the crew's result.
+- When a crew takes a task, pass the item's ref in `sourceRefs` on `firstmate_dispatch`; a dispatch
+  in a turn an owner message started is refused without it. The dispatch opens an owner task on the
+  board. A reply never closes it: its PR merging does, or `firstmate_task` close with done or
+  dropped (dropped needs a reason). Work you do yourself gets a task through `firstmate_task` open.
 - Turn-end reminders name any item left unanswered. Answer it or dispatch it; never drop it.
 
 ## Reply to the message you are answering

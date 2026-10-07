@@ -111,9 +111,9 @@ function prSection(prs: readonly BoardPr[]): string {
 }
 
 /** Plain text for the Telegram board: open asks oldest first, then crew items waiting
- * for the owner, then the captain's open pull requests. The header counts only items
- * waiting on the owner. */
-export function formatBoard(input: { asks: readonly OwnerAsk[]; calls: readonly string[]; prs?: readonly BoardPr[]; now: number }): string {
+ * for the owner, then the owner's open tasks, then the captain's open pull requests.
+ * The header counts only items waiting on the owner. */
+export function formatBoard(input: { asks: readonly OwnerAsk[]; calls: readonly string[]; prs?: readonly BoardPr[]; tasks?: string; now: number }): string {
   const asks = [...input.asks].filter((ask) => ask.state === "open").sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
   const items = [
     ...asks.map((ask) => {
@@ -124,8 +124,7 @@ export function formatBoard(input: { asks: readonly OwnerAsk[]; calls: readonly 
     }),
     ...input.calls.map((call) => clip(call, 160)),
   ];
-  const prs = prSection(input.prs ?? []);
-  const after = prs === "" ? "" : `\n\n${prs}`;
+  const after = [input.tasks ?? "", prSection(input.prs ?? [])].filter((part) => part !== "").map((part) => `\n\n${part}`).join("");
   if (items.length === 0) return `${BOARD_EMPTY}${after}`;
   const lines = items.slice(0, BOARD_MAX_LINES).map((item, index) => `${index + 1}. ${item}`);
   if (items.length > BOARD_MAX_LINES) lines.push(`…and ${items.length - BOARD_MAX_LINES} more`);
