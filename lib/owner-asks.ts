@@ -108,6 +108,7 @@ export type OwnerAsks = {
   link(id: string, captain: string, messageUrl: string): boolean;
   get(id: string): OwnerAsk | undefined;
   listOpen(captain: string): OwnerAsk[];
+  listCandidates(captain: string, now: number): OwnerAsk[];
   /** Close one open ask owned by this captain; undefined when it is missing, foreign, or already closed. */
   resolve(id: string, captain: string, state: Exclude<AskState, "open">, resolution: string, at: number): OwnerAsk | undefined;
   /** Mark this captain's overdue reversible asks defaulted and return them, each exactly once. */
@@ -224,6 +225,9 @@ export function createOwnerAsks(db: Database): OwnerAsks {
     },
     get,
     listOpen,
+    listCandidates(captain, now) {
+      return (db.prepare("SELECT * FROM owner_ask WHERE captain=? AND (state='open' OR (state='answered' AND resolved_at>=?)) ORDER BY created_at, id").all(captain, now - 86_400_000) as AskRecord[]).map(fromRecord);
+    },
     resolve(id, captain, state, resolution, at) {
       return db.transaction(() => {
         const current = get(id);

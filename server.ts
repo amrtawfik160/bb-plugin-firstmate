@@ -11234,6 +11234,12 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.rpc.register(rpcContract, {
+    async listAsks({ threadId }) {
+      if (!(await isCaptainThread(threadId))) throw new Error("Ask lookup requires a Firstmate captain thread.");
+      return { asks: ownerAsks.listCandidates(threadId, Date.now()).map(({ id, text, options, state, resolvedAt }) => ({
+        id, text, options, state: state as "open" | "answered", resolvedAt,
+      })) };
+    },
     async autoAsk({ threadId, text, options, sourceRef, messageUrl }) {
       if (!(await isCaptainThread(threadId))) throw new Error("Automatic asks require a Firstmate captain thread.");
       const { ask, created } = ownerAsks.ensure({ captain: threadId, kind: "question", text, options, sourceRef, messageUrl, createdAt: Date.now() });

@@ -53,3 +53,28 @@ test("automatic ask RPCs validate the captain, reuse explicit records and close 
     await host.harness.lifecycle.dispose();
   }
 });
+
+
+test("listAsks includes open and recently answered asks only for its captain", async () => {
+  const host = await captainHost();
+  try {
+    const asks = createOwnerAsks(host.bb.storage.database());
+    const now = Date.now();
+    const options = [{ label: "Publish", value: "publish" }, { label: "Wait", value: "wait" }];
+    for (const id of ["open", "recent", "old", "cancelled", "foreign"]) {
+      asks.create({ id, captain: id === "foreign" ? "thr_other" : "thr_cap", kind: "question", text: "Publish Safi?", options, createdAt: now - 172_800_000 });
+    }
+    asks.resolve("recent", "thr_cap", "answered", "Publish", now - 60_000);
+    asks.resolve("old", "thr_cap", "answered", "Publish", now - 86_400_001);
+    asks.resolve("cancelled", "thr_cap", "cancelled", "Obsolete", now);
+    assert.deepEqual(await host.harness.behavior.callRpc("listAsks", { threadId: "thr_cap" }), { asks: [
+      { id: "open", text: "Publish Safi?", options, state: "open", resolvedAt: null },
+      { id: "recent", text: "Publish Safi?", options, state: "answered", resolvedAt: now - 60_000 },
+    ] });
+    await assert.rejects(host.harness.behavior.callRpc("listAsks", { threadId: "thr_other" }), /captain thread/);
+    assert.equal(asks.get("recent")?.resolution, "Publish");
+    assert.equal(asks.get("open")?.state, "open");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});

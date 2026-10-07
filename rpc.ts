@@ -13,6 +13,15 @@ const crewRow = z.object({
 });
 
 export const rpcContract = defineRpcContract({
+  listAsks: {
+    experimental_description: "Read open asks and asks answered in the last 24 hours for one captain. Does not create or resolve asks.",
+    input: z.object({ threadId: z.string().min(1) }),
+    output: z.object({ asks: z.array(z.object({
+      id: z.string(), text: z.string(),
+      options: z.array(z.object({ label: z.string(), value: z.string() })),
+      state: z.enum(["open", "answered"]), resolvedAt: z.number().nullable(),
+    })) }),
+  },
   autoAsk: {
     input: z.object({
       threadId: z.string().min(1),
