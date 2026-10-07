@@ -417,7 +417,7 @@ test("issue 47: a crew that goes idle with no outcome is not reported done", asy
   const host = await interruptedCrewHost();
   try {
     await crewIdle(host, "");
-    const pings = host.harness.sdk.callsTo("threads.send").map((c) => JSON.stringify(c[0])).filter((t) => t.includes("thr_cap"));
+    const pings = host.harness.sdk.callsTo("threads.send").filter((c) => (c[0] as { threadId?: string }).threadId === "thr_cap").map((c) => JSON.stringify(c[0]));
     assert.equal(pings.length, 1);
     assert.doesNotMatch(pings[0]!, /crew c1 done/);
     assert.doesNotMatch(pings[0]!, /firstmate deliver/);
