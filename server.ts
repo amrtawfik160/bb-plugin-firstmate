@@ -77,7 +77,7 @@ import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRe
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
 import { optionHelp } from "./lib/cli-help.ts";
 import { AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython } from "./lib/native-policy.ts";
-import { boardPullRequests, createDeliveries, canonicalPr, deliveryLine, parseForge, type DeliveryRecord } from "./lib/pr-delivery.ts";
+import { boardPullRequests, createDeliveries, LOST_OWNER_RECHECK_MS, canonicalPr, deliveryLine, parseForge, type DeliveryRecord } from "./lib/pr-delivery.ts";
 import { captureHostCommand, decodeHostCapture } from "./lib/host-capture.ts";
 import { selectExecution, validateLaunchCapabilities } from "./lib/execution-selection.ts";
 import { rpcContract } from "./rpc.ts";
@@ -6225,8 +6225,8 @@ export default async function plugin(bb: BbPluginApi) {
       const unverifiedStanding=!posture.provenance && (posture.yolo || record.continuation?.["yolo"]===true);
       signal?.throwIfAborted();
       const observed=deliveries.observe(record.id,observation,authorized,Date.now(),unverifiedStanding);
-      // Without a manager nobody acts on minute-by-minute health; look hourly until it merges or closes.
-      if (observed.ownerNeeded && !["complete","explicitly-abandoned"].includes(observed.status)) return deliveries.save({...observed,nextCheckAt:Date.now()+3_600_000});
+      // Without a manager nobody acts on minute-by-minute health; look less often until it merges or closes.
+      if (observed.ownerNeeded && !["complete","explicitly-abandoned"].includes(observed.status)) return deliveries.save({...observed,nextCheckAt:Date.now()+LOST_OWNER_RECHECK_MS});
       return observed;
     } catch (error) {
       if (signal?.aborted) throw error;
