@@ -63,7 +63,7 @@ When `telegramThreading` is on, Firstmate calls the Telegram plugin:
 bb.sdk.plugins.callRpc({
   pluginId: "telegram",
   method: "reply",
-  input: { correlation, chatId, messageId, kind, text },
+  input: { correlation, chatId, messageId, kind, text, quote? },
   outputSchema: { queued: number, duplicate: boolean, mode: "on" | "off" },
 })
 ```
@@ -87,13 +87,22 @@ already suppresses duplicates. After a plugin reload, ack only rows still in
 `received` and younger than 15 minutes. A restart mid-burst flushes those rows
 from the ledger; it does not drop them.
 
-## Final-answer rule
+## Answering
 
-Reply to the oldest unanswered item in that chat, never the latest. Use
-`firstmate_reply` with `ref=oldest` or that item's `tg:<chat>:<msg>`. A later
-ref is refused while an older row is still `received` or `acked`. Message ids
-compare as numbers. Both refs resolve only to items owned by the calling
-captain.
+`firstmate_reply` answers one owner message as a Telegram reply attached to it.
+`ref` is `oldest`, `tg:<chat>:<msg>`, or `bb:<thread>:<row>`. Any open item can
+be answered, in any order, so a quick answer never waits behind a long task.
+Message ids compare as numbers. Refs resolve only to items owned by the calling
+captain. The result lists every owner message that still needs a final answer.
+
+One owner message with several questions gets one reply per question. Pass
+`quote` with the exact words of the question; Firstmate forwards it to the
+`reply` RPC, and the connector sends it as Telegram `reply_parameters.quote`.
+Each different quote is its own reply and its own duplicate guard. `more=true`
+keeps the item open for the next reply.
+
+`firstmate_inbox` lists every item still waiting: `received` and `acked` items,
+and `delegated` items with their crew.
 
 ## Reminders
 

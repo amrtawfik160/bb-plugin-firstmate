@@ -65,12 +65,12 @@ import { createDoorbellHold, doorbellHoldDecision } from "./lib/doorbell-hold.ts
 import { createRetryLedger, type RetryItem, type RetryKind } from "./lib/retry-ledger.ts";
 import { HANDOFF_WAKE_AMENDMENT, captainInstructionsWithHandoff } from "./lib/handoff-contract.ts";
 import { honestIdleVerdictPresentation, interruptIsStopped, readyClaim } from "./lib/honest-status.ts";
-import { ACK_TEXT, ackEligible, createInboundLedger, inboundKey, sweeperSteerText } from "./lib/inbound-ledger.ts";
+import { ACK_TEXT, ackEligible, createInboundLedger, formatOwnerInbox, inboundKey, quotedReplyKind, sweeperSteerText, type InboundRow } from "./lib/inbound-ledger.ts";
 import { inboundHookDecision } from "./lib/inbound-dispatch.ts";
 import { DEFAULT_RELIABILITY_FLAGS, reliabilityFlagsFromSettings } from "./lib/reliability-flags.ts";
 import { sanitizeSettingValue } from "./lib/settings-schema.ts";
 import { coalesceBatches, parseInboundTelegram, parseSourceRef, parseTelegramSubmission, stripTelegramEnvelope, telegramReplyParameters, telegramSourceRef } from "./lib/telegram-envelope.ts";
-import { correlationOf, oldestUnanswered, refuseLaterThanOldest, sendTelegramReply, telegramReplyFallbackBody } from "./lib/telegram-reply.ts";
+import { correlationOf, oldestUnanswered, sendTelegramReply, telegramReplyFallbackBody } from "./lib/telegram-reply.ts";
 import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRecord } from "./lib/launch.ts";
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
 import { optionHelp } from "./lib/cli-help.ts";
@@ -1390,6 +1390,7 @@ const CAPTAIN_SKILLS = ["captain", "firstmate", "skill-routing"] as const;
 const CAPTAIN_TOOLS = [
   "firstmate_dispatch",
   "firstmate_reply",
+  "firstmate_inbox",
   "firstmate_runtime",
   "firstmate_deck",
   "firstmate_tell",
@@ -1424,7 +1425,7 @@ const CAPTAIN_TOOLS = [
   "firstmate_fm",
 ] as const;
 
-const CAPTAIN_CONTRACT_POINTER = "Before orchestrating, call firstmate_deck (ACP/CLI: bb firstmate deck --json) to bind this thread's native home, then read firstmate_contract without a section (bb firstmate contract) for the complete native supervisor contract and its selected-runtime skill trigger catalog. If the startup digest is absent, run deck's exact command through your agent shell; firstmate_fm script=session-start returns it again. Failed prerequisites, lock refusal or a truncated digest remain unresolved. Before each dispatch, read the skill-routing skill and name its matched pstack and Matt Pocock skills in the brief.";
+const CAPTAIN_CONTRACT_POINTER = "Before orchestrating, call firstmate_deck (ACP/CLI: bb firstmate deck --json) to bind this thread's native home, then read firstmate_contract without a section (bb firstmate contract) for the complete native supervisor contract and its selected-runtime skill trigger catalog. If the startup digest is absent, run deck's exact command through your agent shell; firstmate_fm script=session-start returns it again. Failed prerequisites, lock refusal or a truncated digest remain unresolved. Before each dispatch, read the skill-routing skill and name its matched pstack and Matt Pocock skills in the brief. For owner messages from Telegram, read the captain skill's Telegram reference: answer each message with firstmate_reply (one quoted reply per question) and check firstmate_inbox before ending a turn.";
 
 const BB_SKILL_RUNTIME_CONTRACT = [
   "BB adapter for every upstream firstmate skill:",
@@ -9902,13 +9903,28 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   registerCaptainTool({
+    name: "firstmate_inbox",
+    description: "List every owner message that still needs a final answer: open ones and ones handed to a crew, oldest first, with the ref to pass to firstmate_reply.",
+    parameters: z.object({}),
+    async execute(_input, ctx) {
+      const flags = await reliabilityFlags();
+      if (flags.inboundLedger === "off") return toolError("Inbound ledger is off.");
+      const captain = ctxString(ctx, "threadId");
+      if (!captain) return toolError("firstmate_inbox runs only in a captain thread.");
+      return formatOwnerInbox(inboundLedger.listPending(captain), Date.now());
+    },
+  });
+
+  registerCaptainTool({
     name: "firstmate_reply",
-    description: "Answer the oldest unanswered inbound item (ref=oldest or that item's tg:/bb: ref). Final answers never target a later item while an older one in the same chat is still open.",
+    description: "Reply to one owner message as a Telegram reply to it (ref=oldest, tg:<chat>:<msg>, or bb:<thread>:<row>; any open message, in any order). quote=exact words from that message, such as one of several questions; each different quote is its own reply. more=true keeps the message open because more replies to it will follow.",
     parameters: z.object({
       ref: z.string().min(1),
       text: z.string().min(1).max(4000),
+      quote: z.string().min(1).max(1024).optional(),
+      more: z.boolean().optional(),
     }),
-    async execute({ ref, text }, ctx) {
+    async execute({ ref, text, quote, more }, ctx) {
       const flags = await reliabilityFlags();
       if (flags.inboundLedger === "off") return toolError("Inbound ledger is off.");
       const captain = ctxString(ctx, "threadId");
@@ -9919,19 +9935,24 @@ export default async function plugin(bb: BbPluginApi) {
       const found = key === null ? oldestUnanswered(open) : inboundLedger.get(key);
       const row = found?.captainThreadId === captain ? found : undefined;
       if (!row) return toolError(`No inbound row ${ref} for this captain.`);
-      const used = row.source === "telegram" ? telegramSourceRef(row) : `bb:${row.chatId}:${row.messageId}`;
-      const older = flags.telegramThreading === "on" ? refuseLaterThanOldest({ chosen: row, open }) : null;
-      if (older) return toolError(`Reply to the oldest unanswered item ${older.source === "telegram" ? telegramSourceRef(older) : `bb:${older.chatId}:${older.messageId}`}, never the latest.`);
+      const refOf = (item: InboundRow) => item.source === "telegram" ? telegramSourceRef(item) : `bb:${item.chatId}:${item.messageId}`;
+      const used = refOf(row);
+      const claimKind = quotedReplyKind(quote);
       const body = row.source === "telegram"
         ? telegramReplyFallbackBody({ chatId: row.chatId, messageId: row.messageId, kind: "reply", text: stripTelegramEnvelope(text), threadId: row.topicId })
         : text;
       // Reserve first so a concurrent or repeated reply never reaches Telegram twice.
-      if (!inboundLedger.claimOutbox(row, "reply", body, Date.now()).sent) return `Already replied to ${used}.`;
+      if (!inboundLedger.claimOutbox(row, claimKind, body, Date.now()).sent) {
+        return quote ? `Already replied to ${used} for that quote.` : `Already replied to ${used}.`;
+      }
       let channel: "rpc" | "envelope" = "envelope";
       try {
         if (row.source === "telegram") {
           const sent = await sendTelegramReply({
-            payload: { chatId: row.chatId, messageId: row.messageId, kind: "reply", text: stripTelegramEnvelope(text), threadId: row.topicId, correlation: correlationOf(row) },
+            payload: {
+              chatId: row.chatId, messageId: row.messageId, kind: "reply", text: stripTelegramEnvelope(text), threadId: row.topicId,
+              correlation: correlationOf(row), ...(quote ? { quote } : {}),
+            },
             callRpc: flags.telegramThreading === "on" ? (args) => bb.sdk.plugins.callRpc(args) : null,
           });
           channel = sent.channel;
@@ -9944,14 +9965,16 @@ export default async function plugin(bb: BbPluginApi) {
           });
         }
       } catch (error) {
-        inboundLedger.releaseOutbox(row, "reply");
+        inboundLedger.releaseOutbox(row, claimKind);
         return toolError(`Reply to ${used} was not delivered; the item stays open. ${error instanceof Error ? error.message : String(error)}`);
       }
-      inboundLedger.markAnswered(row, Date.now());
+      if (more !== true) inboundLedger.markAnswered(row, Date.now());
       const params = row.source === "telegram" ? telegramReplyParameters({ chatId: row.chatId, messageId: row.messageId, threadId: row.topicId }) : null;
-      return params
+      const sentLine = params
         ? `Replied to ${used} via ${channel} with reply_parameters ${JSON.stringify(params.reply_parameters)}.`
         : `Replied to ${used}.`;
+      const stillOpen = inboundLedger.listPending(captain);
+      return stillOpen.length === 0 ? `${sentLine} No owner message is waiting.` : `${sentLine}\n${formatOwnerInbox(stillOpen, Date.now())}`;
     },
   });
 

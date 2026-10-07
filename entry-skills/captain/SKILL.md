@@ -26,3 +26,12 @@ If the native startup digest is absent, execute the command returned by `firstma
 For `firstmate_dispatch`, a failed prerequisite, native lock refusal or truncated startup remains unresolved under the native contract, so report its named failure before retry and obtain a complete successful digest before orchestrating.
 After successful native startup use [the BB harness reference](references/bb.md) for `firstmate_watch`, script paths, thread operations and optional `bb firstmate session` and follow its runtime-selection instructions and `bb firstmate runtime status --json` before any explicit upgrade, migration or rollback.
 <!-- /BB-ONLY -->
+
+<!-- BB-DIVERGE
+     native: AGENTS.md § 9
+     native-quote: its **final response message** must stand alone with all key information from the whole turn
+     bb: owner messages from Telegram are tracked and answered one by one with firstmate_inbox and firstmate_reply.
+     reason: the captain may read only Telegram, so each answer is a Telegram reply attached to the message it answers. -->
+<!-- BB-ONLY: Telegram owner-message transport. -->
+For owner messages from Telegram, track each one with `firstmate_inbox` and answer each with `firstmate_reply`, one quoted reply per question, as [the Telegram reference](references/telegram.md) describes.
+<!-- /BB-ONLY -->
