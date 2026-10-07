@@ -80,6 +80,7 @@ import { AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython } from 
 import { boardPullRequests, createDeliveries, LOST_OWNER_RECHECK_MS, canonicalPr, deliveryLine, parseForge, type DeliveryRecord } from "./lib/pr-delivery.ts";
 import { captureHostCommand, decodeHostCapture } from "./lib/host-capture.ts";
 import { selectExecution, validateLaunchCapabilities } from "./lib/execution-selection.ts";
+import { crewSkillBlock } from "./lib/crew-contract.ts";
 import { rpcContract } from "./rpc.ts";
 import {
   UPSTREAM_FIRSTMATE_SHA,
@@ -3428,9 +3429,9 @@ export default async function plugin(bb: BbPluginApi) {
       ? "Investigate the captain's intent within its stated scope. Deliver a written report with commands, outcomes, revision, limits, and recommendations. Distinguish observed behavior from inference; follow the report-only completion contract."
       : "Implement the captain's intent above exactly; do not widen scope. Small diff, own branch, deliver per the mode contract, then report DONE/BLOCKED/FAILED.";
     // Captain-authored specifications retain precedence over the role default.
-    const specEnv = sections.spec === null
-      ? ""
-      : `FM_TASK_OWN_SPEC=${Buffer.from(sections.spec.slice(0, 3000), "utf8").toString("base64")} `;
+    // The skills block follows the cap so a long specification never cuts it off.
+    const spec = `${(sections.spec ?? defaultSpec).slice(0, 3000)}\n\n${crewSkillBlock(crew.shape, task)}`;
+    const specEnv = `FM_TASK_OWN_SPEC=${Buffer.from(spec, "utf8").toString("base64")} `;
     // fm-brief refuses --mode on scouts and requires it on ships; a ship's posture
     // is exactly the delivery mode the brief records.
     const scaffold =
@@ -3440,7 +3441,7 @@ export default async function plugin(bb: BbPluginApi) {
     const py =
       "import base64,os,sys;p=sys.argv[1];" +
       'intent=base64.b64decode(os.environ["FM_INTENT"]).decode();' +
-      'spec=base64.b64decode(os.environ["FM_TASK_OWN_SPEC"]).decode() if "FM_TASK_OWN_SPEC" in os.environ else ' + JSON.stringify(defaultSpec) + ';' +
+      'spec=base64.b64decode(os.environ["FM_TASK_OWN_SPEC"]).decode();' +
       "s=open(p).read();s=s.replace('{TASK}',intent).replace('{FIRSTMATE_SPEC}',spec);" +
       "open(p,'w').write(s)";
     const script = [

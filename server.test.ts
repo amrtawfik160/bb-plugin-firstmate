@@ -9710,7 +9710,7 @@ test("real dispatch of headed task text fills intent and spec from the task's ow
     const fill = seen.find((c) => c.includes("FM_INTENT="))!;
     const b64 = (name: string) => Buffer.from(new RegExp(`${name}=([A-Za-z0-9+/=]+)`).exec(fill)![1]!, "base64").toString("utf8");
     assert.equal(b64("FM_INTENT"), "fix the login redirect");
-    assert.equal(b64("FM_TASK_OWN_SPEC"), "Touch only auth.ts.");
+    assert.ok(b64("FM_TASK_OWN_SPEC").startsWith("Touch only auth.ts.\n\n### Skills"), b64("FM_TASK_OWN_SPEC"));
     const add = seen.find((c) => c.includes("fm-tasks-axi.sh") && c.includes("'add'"))!;
     assert.ok(add.includes("fix the login redirect"), add);
   } finally {
@@ -9771,8 +9771,9 @@ test("report-only dispatch fills an investigation specification without implemen
     const result = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--shape", "scout", "--", "Investigate missing Telegram delivery and report evidence."], { projectId: "proj_1" });
     assert.equal(result.exitCode, 0, result.stderr);
     const fill = seen.find((command) => command.includes("FM_INTENT="))!;
-    assert.doesNotMatch(fill, /Implement the captain|Small diff, own branch/);
-    assert.match(fill, /written report/);
+    const spec = Buffer.from(/FM_TASK_OWN_SPEC=([A-Za-z0-9+/=]+)/.exec(fill)![1]!, "base64").toString("utf8");
+    assert.doesNotMatch(spec, /Implement the captain|Small diff, own branch/);
+    assert.match(spec, /written report/);
   } finally {
     await host.harness.lifecycle.dispose();
   }
