@@ -8282,6 +8282,34 @@ test("captain hook install merges user-level Claude and Codex hooks idempotently
   }
 });
 
+test("captain setup installs fm-heavy once and leaves an unchanged copy alone", () => {
+  const home = mkdtempSync(join(tmpdir(), "fm-heavy-install-"));
+  try {
+    const install = (heavyB64: string) => {
+      const script = captainHookInstallScript({
+        threadId: "thr_cap", home: "/fm", state: "/fm/state/cap-thr_cap", ownHome: false,
+        scriptB64: readFileSync(CAPTAIN_HOOK).toString("base64"), heavyB64,
+      });
+      const res = spawnSync("bash", ["-c", script], { encoding: "utf8", env: { PATH: process.env.PATH ?? "", HOME: home } });
+      assert.equal(res.status, 0, res.stderr);
+    };
+    const target = join(home, ".bb-firstmate/bin/fm-heavy");
+    const shipped = readFileSync(join(dirname(CAPTAIN_HOOK), "fm-heavy"));
+    install(shipped.toString("base64"));
+    assert.deepEqual(readFileSync(target), shipped);
+    assert.ok(lstatSync(target).mode & 0o100, "fm-heavy is executable");
+    const first = lstatSync(target);
+    install(shipped.toString("base64"));
+    const second = lstatSync(target);
+    assert.equal(second.ino, first.ino, "unchanged script is not rewritten");
+    assert.equal(second.mtimeMs, first.mtimeMs);
+    install(Buffer.from("#!/bin/sh\nexec \"$@\"\n").toString("base64"));
+    assert.equal(readFileSync(target, "utf8"), "#!/bin/sh\nexec \"$@\"\n", "changed script is replaced");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("crew pings are held only while a captain's turn is running", () => {
   const base = { attempt: "join-turn", initiator: "system", text: "@thread:thr_x completed:\n\nDONE: ok", targetIsCaptain: true, senderIsCrew: false };
   assert.equal(crewPingHoldDecision(base), "hold");
