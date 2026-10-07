@@ -4,6 +4,8 @@ import test from "node:test";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import plugin from "./server.ts";
 import { createInboundLedger } from "./lib/inbound-ledger.ts";
+import { createLaunches } from "./lib/launch.ts";
+import { createDeliveries } from "./lib/pr-delivery.ts";
 import { createOwnerAsks } from "./lib/owner-asks.ts";
 import { parseInboundTelegram } from "./lib/telegram-envelope.ts";
 
@@ -733,6 +735,34 @@ test("telegramCommand board caps the list at 15 lines", async () => {
         "…and 2 more",
         "",
         "Tap a question's button or reply to it to answer.",
+      ].join("\n"),
+    });
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("telegramCommand board keeps decisions, drops launch bookkeeping, and lists this captain's open pull requests", async () => {
+  const host = await boardHost();
+  try {
+    const db = host.bb.storage.database();
+    createLaunches(db).save({ key: "k1", taskId: "rebase-2118-2129", projectId: "proj_1", owner: "thr_cap", home: "", generation: 1, shape: "ship", state: "uncertain", threadId: null, error: "Error: reply lost", updatedAt: 1 } as never);
+    createLaunches(db).save({ key: "k2", taskId: "runants-playbook-ui-polish", projectId: "proj_1", owner: "thr_cap", home: "", generation: 2, shape: "ship", state: "reserved", threadId: null, updatedAt: 2 } as never);
+    await host.bb.storage.kv.set("decisions", [{ id: "d1", question: "Use Postgres?", options: ["yes", "no"], crewId: null, parentThreadId: "thr_cap", status: "open", createdAt: "2026-10-07T00:00:00.000Z" }]);
+    const store = createDeliveries(db);
+    store.register({ url: "https://github.com/acme/repo/pull/7", taskId: "c1", projectId: "proj_1", owner: "thr_cap", home: "", worker: "thr_c1", title: "Fix the login form", openedAt: 1 });
+    store.register({ url: "https://github.com/acme/repo/pull/8", taskId: "c2", projectId: "proj_1", owner: "thr_other", home: "", worker: "thr_c2", title: "Not mine" });
+    const merged = store.register({ url: "https://github.com/acme/repo/pull/9", taskId: "c3", projectId: "proj_1", owner: "thr_cap", home: "", worker: "thr_c3" });
+    store.save({ ...merged, status: "complete" });
+    assert.deepEqual(await board(host), {
+      away: false,
+      text: [
+        "📌 Waiting on you (1)",
+        "",
+        '1. ? d1 :: Use Postgres? (yes / no) — answer: decide answer d1 -- "<answer>"',
+        "",
+        "Open pull requests (1):",
+        "- acme/repo#7 Fix the login form — checks running",
       ].join("\n"),
     });
   } finally {

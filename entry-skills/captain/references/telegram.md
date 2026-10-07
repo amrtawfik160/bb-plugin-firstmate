@@ -56,6 +56,13 @@ for hours. Ask rarely, and make each ask easy to find and to answer.
 - While the captain is away, the connector may batch routine progress. Asks, blockers, failures
   and results the captain asked for always go out at once.
 
+## Open pull requests
+
+- Every PR that you or a crew opens must be tracked by Firstmate; the board lists open tracked PRs.
+- Firstmate finds PRs on a crew's branch by itself. If you opened a PR outside a crew, register it:
+  `firstmate_deliveries action=register url=<PR url>` (shell: `bb firstmate deliveries register --url <PR url>`).
+- Never end a day with an open PR that is not on the board.
+
 ## Telegram commands
 
 - `/ahoy`, `/bearings`, `/afk`, `/quiet` and `/stow` arrive as an owner message that starts with

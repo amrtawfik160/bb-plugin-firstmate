@@ -56,8 +56,8 @@
       "reason": "BB-owned task-to-skill table selected for bound captains and crews; its Firstmate rules keep delegation, model choice, merge and delivery with Firstmate. Poteto mode runs on every crewmate task; Firstmate rules still win and the supervisor's replies keep the user's style."
     },
     "entry-skills/captain/references/telegram.md": {
-      "sha256": "c9a752ec7184292732326f3987b0340e5b049c9eb0c2283974b35f1fbd2b865e",
-      "reason": "BB-only Telegram owner-message transport: what reaches Telegram, per-message tracking with firstmate_inbox, and threaded or quoted answers with firstmate_reply; native final-response policy unchanged. Telegram commands map to the native ahoy, bearings, afk, quiet and stow skills. Owner asks go through firstmate_ask and close by answer, firstmate_resolve_ask, or a reversible default; no native policy change."
+      "sha256": "a78380388985add0ff1a301d7c5856c4227377430e2ae0f7e1cfc9a20233c151",
+      "reason": "BB-only Telegram owner-message transport: what reaches Telegram, per-message tracking with firstmate_inbox, and threaded or quoted answers with firstmate_reply; native final-response policy unchanged. Telegram commands map to the native ahoy, bearings, afk, quiet and stow skills. Owner asks go through firstmate_ask and close by answer, firstmate_resolve_ask, or a reversible default. Every open PR is tracked with firstmate_deliveries so it shows on the board; no native policy change."
     }
   }
 }

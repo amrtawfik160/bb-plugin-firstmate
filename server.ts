@@ -77,7 +77,7 @@ import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRe
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
 import { optionHelp } from "./lib/cli-help.ts";
 import { AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython } from "./lib/native-policy.ts";
-import { createDeliveries, canonicalPr, deliveryLine, parseForge, type DeliveryRecord } from "./lib/pr-delivery.ts";
+import { boardPullRequests, createDeliveries, canonicalPr, deliveryLine, parseForge, type DeliveryRecord } from "./lib/pr-delivery.ts";
 import { captureHostCommand, decodeHostCapture } from "./lib/host-capture.ts";
 import { selectExecution, validateLaunchCapabilities } from "./lib/execution-selection.ts";
 import { rpcContract } from "./rpc.ts";
@@ -5604,17 +5604,21 @@ export default async function plugin(bb: BbPluginApi) {
 
   // Items a background loop gave up on, plus the Telegram threading mismatch. They stay
   // listed until resolved; the captain was told once when each one started.
-  async function captainAttention(owner?: string): Promise<string[]> {
-    const lines = retries.needsCaptain(owner).map(needsCaptainLine);
+  // `owner` marks the lines the owner can act on (a connector setting only the owner
+  // can change); retry escalations are the captain's to clean up.
+  async function captainAttention(owner?: string): Promise<Array<{ text: string; owner: boolean }>> {
+    const lines = retries.needsCaptain(owner).map((item) => ({ text: needsCaptainLine(item), owner: false }));
     const threading = telegramThreadingSchema.safeParse(await bb.storage.kv.get(TELEGRAM_THREADING_KEY));
-    if (threading.success && threading.data.mismatch) lines.push(`Needs captain: ${TELEGRAM_THREADING_MISMATCH}`);
+    if (threading.success && threading.data.mismatch) lines.push({ text: `Needs captain: ${TELEGRAM_THREADING_MISMATCH}`, owner: true });
     return lines;
   }
   async function bearingsSnapshot(owner?: string, opts: { realBacklog?: boolean } = {}): ReturnType<typeof bearingsBase> {
     const snap = await bearingsBase(owner, opts);
     const attention = await captainAttention(owner);
     if (attention.length === 0) return snap;
-    return { ...snap, text: `${snap.text}\n\n${attention.join("\n")}`, rpc: { ...snap.rpc, calls: [...snap.rpc.calls, ...attention] } };
+    const texts = attention.map((line) => line.text);
+    return { ...snap, text: `${snap.text}\n\n${texts.join("\n")}`, rpc: { ...snap.rpc, calls: [...snap.rpc.calls, ...texts],
+      ownerCalls: [...snap.rpc.ownerCalls, ...attention.filter((line) => line.owner).map((line) => line.text)] } };
   }
   async function bearingsBase(owner?: string, opts: { realBacklog?: boolean } = {}): Promise<{
     text: string;
@@ -5623,6 +5627,8 @@ export default async function plugin(bb: BbPluginApi) {
       head: string;
       deliveries: DeliveryRecord[];
       calls: string[];
+      /** The subset of `calls` the owner can act on: decisions and blockers, not launch or retry bookkeeping. */
+      ownerCalls: string[];
       landed: string[];
       ready: Array<{
         id: string; status: string; shape: string; posture: string;
@@ -5697,11 +5703,20 @@ export default async function plugin(bb: BbPluginApi) {
     const errors = count("error");
     const due = decisions.filter((d) => decisionDue(d, now));
     const dispatchable = queue.filter((q) => q.status === "queued" && storedQueueGate(q, queue, now) === null);
-    const calls = [
+    const decisionCalls = [
       ...due.map(
         (d) =>
           `? ${d.id} :: ${truncate(d.question, 90)}${d.options.length > 0 ? ` (${d.options.join(" / ")})` : ""}${d.crewId !== null ? ` [crew ${d.crewId}]` : ""} — answer: decide answer ${d.id} -- "<answer>"`,
       ),
+      ...rows
+        .filter((row) => row.status === "idle" && !row.failed && row.openDecisions.length > 0)
+        .map((row) => {
+          const d = row.openDecisions[row.openDecisions.length - 1]!;
+          return `? ${row.id} — ${d.verb.toUpperCase()} [${d.key}]: ${truncate(d.note, 80)} — steer: bb firstmate tell ${row.id} -- "<answer>"`;
+        }),
+    ];
+    const calls = [
+      ...decisionCalls.slice(0, due.length),
       ...rows
         .filter((row) => row.status === "error")
         .map((row) => `! ${formatCrew(row, row.status)} — NEEDS DECISION: turn failed (retry? tell? forget?)`),
@@ -5711,12 +5726,7 @@ export default async function plugin(bb: BbPluginApi) {
       ...rows
         .filter((row) => row.noOutcome)
         .map((row) => `! ${formatCrew(row, row.status)} — no outcome: idle without DONE/BLOCKED/FAILED, possibly interrupted (tell? retry? forget?)`),
-      ...rows
-        .filter((row) => row.status === "idle" && !row.failed && row.openDecisions.length > 0)
-        .map((row) => {
-          const d = row.openDecisions[row.openDecisions.length - 1]!;
-          return `? ${row.id} — ${d.verb.toUpperCase()} [${d.key}]: ${truncate(d.note, 80)} — steer: bb firstmate tell ${row.id} -- "<answer>"`;
-        }),
+      ...decisionCalls.slice(due.length),
       ...rows
         .filter((row) => row.status === "idle" && !row.failed && row.openDecisions.length === 0 && row.prUrl !== "")
         .map(
@@ -5780,6 +5790,7 @@ export default async function plugin(bb: BbPluginApi) {
       deliveries: outstanding,
       head: text.split("\n")[0] ?? text,
       calls,
+      ownerCalls: decisionCalls,
       landed,
       ready: readyRows.map(toRow),
       running: runningRows.map(toRow),
@@ -5850,6 +5861,8 @@ export default async function plugin(bb: BbPluginApi) {
     const text = snapshots.map(s => s.text).join("\n\n") + (outstanding.length ? "\n\nUnresolved PR deliveries\n"+outstanding.map(deliveryLine).join("\n") : "");
     return { text, json: snapshots.length === 1 ? snapshots[0]!.model : { homes: snapshots.map(s => s.model) },
       rpc: { deliveries: outstanding, head: text.split("\n")[0] ?? text, calls: snapshots.flatMap(s => s.calls),
+        // Native calls are open decisions and captain holds only.
+        ownerCalls: snapshots.flatMap(s => s.calls),
         landed: snapshots.flatMap(s => s.landed), ready: [], running, next: snapshots.flatMap(s => s.next),
         afk: (await readAfk(owner))?.on === true, quiet: await isQuiet(owner),
         supervision: (await settings.get()).supervisionEnabled === true } };
@@ -6125,7 +6138,7 @@ export default async function plugin(bb: BbPluginApi) {
     catch(error) { if (signal?.aborted || record || crew.launchKey) throw error; return "merged" as const; }
     return recoveredContract(metadata,record);
   }
-  async function registerCrewPr(crew: Crew, url: string,signal?:AbortSignal) {
+  async function registerCrewPr(crew: Crew, url: string,signal?:AbortSignal,facts:{title?:string;openedAt?:number}={}) {
     if (crew.shape !== "ship" || crew.posture === "local-only" || isSecondmateRoute(crew) || !url) return;
     const identity = canonicalPr(url);
     const prior=deliveries.get(identity.id);
@@ -6137,7 +6150,7 @@ export default async function plugin(bb: BbPluginApi) {
     const requirement=await contractForCrew(crew,signal);
     const task=await raceAbort(fullCrewTask(crew),signal,STUCK_HOST_CALL_MS);
     signal?.throwIfAborted();
-    deliveries.register({url,taskId:crew.id,projectId:crew.projectId,owner:crew.parentThreadId,home,worker:crew.threadId,requirement,continuation:{...crew,task,taskSpilled:false}});
+    deliveries.register({url,taskId:crew.id,projectId:crew.projectId,owner:crew.parentThreadId,home,worker:crew.threadId,requirement,continuation:{...crew,task,taskSpilled:false},...facts});
   }
   async function discoverCrewDelivery(crew: Crew,signal?:AbortSignal) {
     if (crew.shape !== "ship" || crew.posture === "local-only" || isSecondmateRoute(crew)) return;
@@ -6148,33 +6161,44 @@ export default async function plugin(bb: BbPluginApi) {
     // Environment/branch identity proves provenance. Report URLs alone do not.
     await resolveCrewPr(crew,envId,hostId,signal);
   }
+  // Whether a delivery's recorded manager thread still exists. A captain may own
+  // crews in other projects, so the thread's own project is not compared.
+  async function deliveryOwnerState(record:DeliveryRecord,signal?:AbortSignal):Promise<"live"|"lost"|"unknown"> {
+    if (!record.owner) return "lost";
+    try {
+      const owner=await raceAbort(bb.sdk.threads.get({threadId:record.owner,signal}),signal,STUCK_HOST_CALL_MS);
+      return owner.archivedAt != null ? "lost" : "live";
+    } catch(error) {
+      if (signal?.aborted) throw error;
+      // A get failure alone can be transient. Only complete, successful scoped
+      // inventories can establish that the manager is absent after missed events.
+      try {
+        let complete=true;
+        for (const archived of [false,true]) {
+          for (let offset=0; offset<500; offset+=50) {
+            const rows=await raceAbort(bb.sdk.threads.list({projectId:record.projectId,archived,includeHidden:true,limit:50,offset,signal}),signal,STUCK_HOST_CALL_MS);
+            if (rows.some(row=>row.id===record.owner)) return archived ? "lost" : "unknown";
+            if (rows.length<50) break;
+            if (offset===450) complete=false;
+          }
+        }
+        return complete ? "lost" : "unknown";
+      } catch(inventoryError) { if (signal?.aborted) throw inventoryError; return "unknown"; }
+    }
+  }
   async function reconcileDelivery(record:DeliveryRecord,signal?:AbortSignal) {
     return serializeLedger(`delivery:${record.id}`,async()=>{
     record=deliveries.get(record.id) ?? record;
     if (["complete","explicitly-abandoned"].includes(record.status)) return record;
     try {
-      if (!record.owner) { record.ownerNeeded=true; deliveries.save(record); return; }
-      let owner:Awaited<ReturnType<typeof bb.sdk.threads.get>>;
-      try { owner=await raceAbort(bb.sdk.threads.get({threadId:record.owner,signal}),signal,STUCK_HOST_CALL_MS); }
-      catch(error) {
-        // A get failure alone can be transient. Only complete, successful scoped
-        // inventories can establish that the manager is absent after missed events.
-        let complete=true,found=false;
-        for (const archived of [false,true]) {
-          for (let offset=0; offset<500; offset+=50) {
-            const rows=await raceAbort(bb.sdk.threads.list({projectId:record.projectId,archived,includeHidden:true,limit:50,offset,signal}),signal,STUCK_HOST_CALL_MS);
-            const match=rows.find(row=>row.id===record.owner);
-            if (match) { if (archived) deliveries.ownerLost(record.owner);found=true;break; }
-            if (rows.length<50) break;
-            if (offset===450) complete=false;
-          }
-        }
-        if (complete && !found) {deliveries.ownerLost(record.owner);return;}
-        throw error;
-      }
-      if (owner.archivedAt != null || owner.projectId !== record.projectId) { deliveries.ownerLost(record.owner); return; }
-      const hostId = await resolveHostForProject(record.projectId,record.owner,signal);
-      const result = await runStructuredOnHost(hostId, `gh pr view ${shQuote(record.url)} --json state,isDraft,headRefOid,statusCheckRollup,reviewDecision,reviews,mergeable,mergeCommit`,30_000,signal);
+      // The forge state is read whatever happened to the manager: a merged or
+      // closed PR must leave the open list even when its captain is gone.
+      const ownerState=await deliveryOwnerState(record,signal);
+      signal?.throwIfAborted();
+      if (ownerState === "lost") record=deliveries.markOwnerNeeded(record.id) ?? record;
+      else if (ownerState === "live") record=deliveries.ownerRestored(record.id) ?? record;
+      const hostId = await resolveHostForProject(record.projectId,ownerState === "live" ? record.owner ?? undefined : undefined,signal);
+      const result = await runStructuredOnHost(hostId, `gh pr view ${shQuote(record.url)} --json state,isDraft,headRefOid,statusCheckRollup,reviewDecision,reviews,mergeable,mergeCommit,title,createdAt`,30_000,signal);
       if (result.exitCode !== 0) throw new Error(result.stderr || result.output || `Forge lookup exit ${result.exitCode}`);
       const observation = parseForge(JSON.parse(result.output));
       // Standing yolo allows asking the manager to continue; only native merge
@@ -6183,7 +6207,10 @@ export default async function plugin(bb: BbPluginApi) {
       const authorized=posture.yolo && !!posture.provenance;
       const unverifiedStanding=!posture.provenance && (posture.yolo || record.continuation?.["yolo"]===true);
       signal?.throwIfAborted();
-      return deliveries.observe(record.id,observation,authorized,Date.now(),unverifiedStanding);
+      const observed=deliveries.observe(record.id,observation,authorized,Date.now(),unverifiedStanding);
+      // Without a manager nobody acts on minute-by-minute health; look hourly until it merges or closes.
+      if (observed.ownerNeeded && !["complete","explicitly-abandoned"].includes(observed.status)) return deliveries.save({...observed,nextCheckAt:Date.now()+3_600_000});
+      return observed;
     } catch (error) {
       if (signal?.aborted) throw error;
       return deliveries.stale(record.id,String(error));
@@ -6311,6 +6338,71 @@ export default async function plugin(bb: BbPluginApi) {
       },signal).catch(error=>bb.log.warn(`Launch recovery ${record.taskId}: ${String(error)}`));
     }
   }
+  // Every open PR a crew opens is tracked, not only the first one it reports.
+  // A crew's worktree branch proves provenance: an open PR whose head is that
+  // branch, or a branch named after it (`<branch>-…`, `<branch>/…`), belongs to
+  // the crew with the longest matching branch, owned by that crew's captain.
+  // One GitHub list per project and host, at most every five minutes.
+  const OPEN_PR_SWEEP_MS = 5 * 60_000;
+  let lastOpenPrSweep = 0;
+  const crewBranches = new Map<string, { branch: string; path: string; hostId: string }>();
+  async function openPrSweep(signal?: AbortSignal) {
+    if (Date.now() - lastOpenPrSweep < OPEN_PR_SWEEP_MS) return;
+    lastOpenPrSweep = Date.now();
+    const crews = (await raceAbort(readCrews(), signal, STUCK_HOST_CALL_MS))
+      .filter((c) => c.shape === "ship" && c.worktree && c.posture !== "local-only" && !isSecondmateRoute(c) && c.parentThreadId);
+    for (const threadId of crewBranches.keys()) if (!crews.some((c) => c.threadId === threadId)) crewBranches.delete(threadId);
+    const groups = new Map<string, { hostId: string; paths: string[]; crews: Array<{ crew: Crew; branch: string }> }>();
+    for (const crew of crews) {
+      signal?.throwIfAborted();
+      let found = crewBranches.get(crew.threadId);
+      if (!found) {
+        found = await boundedFollowUp(async (s) => {
+          const envId = await threadEnv(crew.threadId, s);
+          if (!envId) return undefined;
+          const env = asRecord(await raceAbort(bb.sdk.environments.get({ environmentId: envId, signal: s }), s, STUCK_HOST_CALL_MS));
+          const branch = typeof env["branchName"] === "string" ? env["branchName"] : "";
+          const path = typeof env["path"] === "string" ? env["path"] : "";
+          const hostId = typeof env["hostId"] === "string" ? env["hostId"] : "";
+          return branch && path && hostId && env["isWorktree"] !== false ? { branch, path, hostId } : undefined;
+        }, signal).catch((error) => { if (signal?.aborted) throw error; return undefined; });
+        if (!found) continue;
+        crewBranches.set(crew.threadId, found);
+      }
+      const key = `${crew.projectId}\t${found.hostId}`;
+      const group = groups.get(key) ?? { hostId: found.hostId, paths: [], crews: [] };
+      group.paths.push(found.path);
+      group.crews.push({ crew, branch: found.branch });
+      groups.set(key, group);
+    }
+    for (const group of groups.values()) {
+      signal?.throwIfAborted();
+      await boundedFollowUp(async (s) => {
+        let listed: unknown;
+        for (const path of [...new Set(group.paths)].slice(0, 3)) {
+          const res = await runStructuredOnHost(group.hostId, `cd ${shQuote(path)} && gh pr list --state open --author ${shQuote("@me")} --json number,url,title,headRefName,createdAt --limit 100`, 30_000, s);
+          if (res.exitCode === 0) { listed = JSON.parse(res.output); break; }
+        }
+        if (!Array.isArray(listed)) return;
+        for (const pr of listed.map(asRecord)) {
+          const url = typeof pr["url"] === "string" ? pr["url"] : "", head = typeof pr["headRefName"] === "string" ? pr["headRefName"] : "";
+          if (!url || !head) continue;
+          const owner = group.crews
+            .filter(({ branch }) => head === branch || head.startsWith(`${branch}-`) || head.startsWith(`${branch}/`))
+            .sort((a, b) => b.branch.length - a.branch.length)[0];
+          if (!owner) continue;
+          const title = typeof pr["title"] === "string" && pr["title"].trim() ? pr["title"].trim().slice(0, 300) : undefined;
+          const opened = typeof pr["createdAt"] === "string" ? Date.parse(pr["createdAt"]) : NaN;
+          let id: string;
+          try { id = canonicalPr(url).id; } catch { continue; }
+          const prior = deliveries.get(id);
+          if (prior) { if (title && !prior.title) deliveries.save({ ...prior, title }); continue; }
+          await registerCrewPr(owner.crew, url, s, { title, ...(Number.isFinite(opened) ? { openedAt: opened } : {}) })
+            .catch((error) => { if (s.aborted) throw error; bb.log.warn(`Open PR tracking ${id}: ${String(error)}`); });
+        }
+      }, signal).catch((error) => { if (!signal?.aborted) bb.log.warn(`Open PR sweep: ${String(error)}`); });
+    }
+  }
   async function deliveryPass(signal?: AbortSignal) {
     await recoverDoneDeliveries(signal);
     const crews = await raceAbort(readCrews(),signal,STUCK_HOST_CALL_MS);
@@ -6337,6 +6429,7 @@ export default async function plugin(bb: BbPluginApi) {
     for (const record of deliveries.pendingNotifications()) {
       if (record.notification.desired !== record.notification.delivered) await boundedFollowUp(s=>notifyDelivery(record,s),signal).catch(error=>bb.log.warn(`PR notification ${record.id}: ${String(error)}`));
     }
+    await openPrSweep(signal).catch(error=>{ if (!signal?.aborted) bb.log.warn(`Open PR sweep: ${String(error)}`); });
   }
   const deliveryParams = z.object({
     action:z.enum(["list","inspect","register","reconcile","assign","abandon","verify","account"]),
@@ -6353,6 +6446,14 @@ export default async function plugin(bb: BbPluginApi) {
     const thread=await bb.sdk.threads.get({ threadId:owner });
     const projectId=thread.projectId;
     if (input.action === "list") return deliveries.list({ owner:input.all ? undefined : owner,projectId,includeLost:true,limit:input.limit,offset:input.offset });
+    if (input.action === "register" && !input.crewId) {
+      // A PR the captain opened itself: tracked under the captain until it merges.
+      if (!input.url) throw new Error("Register needs --url <PR url> for a PR you opened, or --crew <id> for a crew's PR.");
+      if (input.requirement && !input.authorized) throw new Error("Setting an explicit delivery contract requires user authority; an existing contract cannot be replaced by registration.");
+      const identity=canonicalPr(input.url);
+      const home=await bb.storage.kv.get<string>(`native-home:${owner}`) ?? "";
+      return [deliveries.register({ url:identity.url,taskId:`captain:${identity.id}`,projectId,owner,home,worker:"",requirement:input.requirement ?? "merged" })];
+    }
     if (input.action === "register") {
       const crew=await findCrew(input.crewId ?? "");
       if (!crew || crew.parentThreadId !== owner || crew.projectId !== projectId || crew.shape !== "ship") throw new Error("Register requires an owned ship on this project.");
@@ -10917,7 +11018,8 @@ export default async function plugin(bb: BbPluginApi) {
         ? await fleetSnapshots.read(threadId, () => nativeBearingsSnapshot(threadId, snapshotAbort.signal), 15_000)
         : await bearingsSnapshot(threadId);
       if (command === "board") {
-        return { text: formatBoard({ asks: ownerAsks.listOpen(threadId), calls: snapshot.rpc.calls, now: Date.now() }), away: snapshot.rpc.afk };
+        const prs = boardPullRequests(deliveries.list({ owner: threadId, limit: 100 }));
+        return { text: formatBoard({ asks: ownerAsks.listOpen(threadId), calls: snapshot.rpc.ownerCalls, prs, now: Date.now() }), away: snapshot.rpc.afk };
       }
       return { text: formatWorkersForTelegram(snapshot.rpc) };
     },
@@ -10931,8 +11033,9 @@ export default async function plugin(bb: BbPluginApi) {
       const snapshot = (await settings.get()).fmHome.trim() !== ""
         ? await fleetSnapshots.read(owner ?? "__all__", () => nativeBearingsSnapshot(owner, snapshotAbort.signal), 15_000)
         : await bearingsSnapshot(owner);
+      const { ownerCalls: _ownerCalls, ...rpc } = snapshot.rpc;
       return {
-        ...snapshot.rpc,
+        ...rpc,
         captain,
       };
     },
@@ -11698,7 +11801,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "activity", summary: "Bounded real BB activity for the native watcher", usage: "bb firstmate activity <thread-id> --json" },
       { name: "bearings", summary: "Fleet digest", usage: "bb firstmate bearings [--json]" },
       { name: "wake", summary: "Drain the durable crew→captain wake queue (present, or --ack-through <seq> --recovery-generation <gen>)", usage: "bb firstmate wake [--ack-through <seq> --recovery-generation <gen>]" },
-      { name: "deliveries", summary: "Durable PR health and follow-up", usage: "bb firstmate deliveries list|inspect|register|reconcile|assign|abandon|verify [id] [--from <manager>] [--reason <evidence>] [--authorized]\nbb firstmate deliveries account <id> --failure <id> --scope author|baseline --follow-up-task <existing-task> --reason <evidence> --authorized" },
+      { name: "deliveries", summary: "Durable PR health and follow-up", usage: "bb firstmate deliveries list|inspect|register|reconcile|assign|abandon|verify [id] [--from <manager>] [--reason <evidence>] [--authorized]\nbb firstmate deliveries register --url <PR url> [--crew <id>]   (no --crew: a PR you opened yourself)\nbb firstmate deliveries account <id> --failure <id> --scope author|baseline --follow-up-task <existing-task> --reason <evidence> --authorized" },
       { name: "launches", summary: "Inspect reservations or explicitly adopt an existing legacy worker", usage: "bb firstmate launches list | adopt <task-id> --thread <thread-id> [--check] [--json]" },
       { name: "deliver", summary: "Outcome + committed/uncommitted diff + PR", usage: "bb firstmate deliver <crew-id>" },
       { name: "merge", summary: "Merge PR or local-only ff-only land", usage: "bb firstmate merge <crew-id> [--yes]" },

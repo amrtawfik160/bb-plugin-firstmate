@@ -78,6 +78,66 @@ test("formatBoard stays within 3500 characters", () => {
   assert.ok(formatBoard({ asks, calls: [], now: NOW }).length <= 3500);
 });
 
+const pr = (n: number, over: Partial<{ title: string; state: string; openedAt: number }> = {}) =>
+  ({ ref: `acme/repo#${n}`, title: `PR ${n}`, state: "checks running", openedAt: NOW - n * MIN, ...over });
+
+test("formatBoard shows open pull requests under the empty state", () => {
+  const text = formatBoard({
+    asks: [], calls: [], now: NOW,
+    prs: [
+      { ref: "acme/repo#9", state: "ready to merge", openedAt: NOW - MIN },
+      { ref: "acme/web#7", title: `Fix the login form ${"x".repeat(80)}`, state: "checks failing", openedAt: NOW - 60 * MIN },
+    ],
+  });
+  assert.equal(text, [
+    "📌 Nothing needs you right now.",
+    "",
+    "Open pull requests (2):",
+    `- acme/web#7 Fix the login form ${"x".repeat(50)}… — checks failing`,
+    "- acme/repo#9 — ready to merge",
+  ].join("\n"));
+});
+
+test("formatBoard counts only waiting items in the header and lists pull requests after them", () => {
+  const text = formatBoard({
+    asks: [ask({ id: "a000001", text: "Ship it?" })],
+    calls: ["? d1 :: Use Postgres? (yes / no)"],
+    prs: [pr(1, { state: "waiting on you" })],
+    now: NOW,
+  });
+  assert.equal(text, [
+    "📌 Waiting on you (2)",
+    "",
+    "1. ❓ Ship it? (5 min, ask a000001)",
+    "2. ? d1 :: Use Postgres? (yes / no)",
+    "",
+    "Tap a question's button or reply to it to answer.",
+    "",
+    "Open pull requests (1):",
+    "- acme/repo#1 PR 1 — waiting on you",
+  ].join("\n"));
+});
+
+test("formatBoard lists at most 10 pull requests, oldest first", () => {
+  const prs = Array.from({ length: 13 }, (_, i) => pr(i + 1));
+  const text = formatBoard({ asks: [], calls: [], prs, now: NOW });
+  assert.equal(text, [
+    "📌 Nothing needs you right now.",
+    "",
+    "Open pull requests (13):",
+    ...Array.from({ length: 10 }, (_, i) => `- acme/repo#${13 - i} PR ${13 - i} — checks running`),
+    "…and 3 more",
+  ].join("\n"));
+});
+
+test("formatBoard with many asks and pull requests stays within 3500 characters", () => {
+  const asks = Array.from({ length: 15 }, (_, i) => ask({ id: `a00000${i}`, text: "w".repeat(1500) }));
+  const prs = Array.from({ length: 12 }, (_, i) => pr(i + 1, { title: "t".repeat(200) }));
+  const text = formatBoard({ asks, calls: [], prs, now: NOW });
+  assert.ok(text.length <= 3500, String(text.length));
+  assert.match(text, /Open pull requests \(12\):/);
+});
+
 test("formatAskCard titles the card by kind and states the recommendation and deadline", () => {
   assert.equal(
     formatAskCard({ kind: "question", text: "Dark mode by default?", options: [{ label: "Yes", value: "yes" }, { label: "No", value: "no" }], recommended: 0, defaultAt: Date.UTC(2026, 9, 7, 16, 5) }),
