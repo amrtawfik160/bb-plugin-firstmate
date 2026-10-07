@@ -9,6 +9,7 @@ export interface CheckFailure {
 }
 export interface DeliveryRecord {
   id: string; repository: string; number: number; url: string; headSha: string; mergeCommitSha:string|null;
+  title?:string; openedAt?:number;
   taskId: string; projectId: string; owner: string | null; home: string;
   continuation?:Record<string,unknown>;
   deliverySatisfiedAt?:number|null; forgeState?:ForgeObservation['state']; failures?:CheckFailure[];
@@ -25,6 +26,7 @@ export interface ForgeObservation {
   checks: 'pending' | 'passing' | 'failing' | 'unknown'; review: 'approved' | 'changes-requested' | 'required' | 'unknown';
   mergeable: 'mergeable' | 'conflicting' | 'unknown';
   reviewHeadSha:string|null; mergeCommitSha:string|null; failedChecks?:{id:string;name:string;url:string}[];
+  title?:string; openedAt?:number;
 }
 export function canonicalPr(url: string) {
   const m = /^https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)(?:[/?#].*)?$/.exec(url.trim());
@@ -86,15 +88,15 @@ export function createDeliveries(db: Database) {
     const row=db.prepare("SELECT record FROM deliveries WHERE owner=? AND project=? AND status NOT IN ('complete','explicitly-abandoned') AND (json_extract(record,'$.taskId')=? OR EXISTS(SELECT 1 FROM json_each(json_extract(record,'$.workers')) WHERE value=?)) ORDER BY due,id LIMIT 1").get(owner,projectId,id,id) as {record:string}|undefined;
     return row ? JSON.parse(row.record) as DeliveryRecord : undefined;
   }
-  function register(input: { url: string; taskId: string; projectId: string; owner: string | null; home: string; worker: string; requirement?: DeliveryRequirement; continuation?:Record<string,unknown> }) {
+  function register(input: { url: string; taskId: string; projectId: string; owner: string | null; home: string; worker: string; requirement?: DeliveryRequirement; continuation?:Record<string,unknown>; title?:string; openedAt?:number }) {
     const identity = canonicalPr(input.url);
     const prior = get(identity.id);
     if (prior) {
       if (prior.projectId !== input.projectId || prior.owner !== input.owner || prior.taskId !== input.taskId) throw new Error(`PR ${identity.id} already belongs to another task or manager. Explicit assignment is required.`);
       if (input.requirement && prior.requirement !== input.requirement) throw new Error("Delivery contract is already agreed; registration cannot silently replace it.");
-      return save({ ...prior, continuation:input.continuation ?? prior.continuation, workers: [...new Set([...prior.workers,input.worker])].slice(-100) });
+      return save({ ...prior, title:prior.title ?? input.title, openedAt:prior.openedAt ?? input.openedAt, continuation:input.continuation ?? prior.continuation, workers: [...new Set([...prior.workers,input.worker])].slice(-100) });
     }
-    return save({ ...identity, headSha:'', mergeCommitSha:null,taskId:input.taskId, projectId:input.projectId, owner:input.owner,
+    return save({ ...identity, ...(input.title ? { title:input.title } : {}), ...(input.openedAt ? { openedAt:input.openedAt } : {}), headSha:'', mergeCommitSha:null,taskId:input.taskId, projectId:input.projectId, owner:input.owner,
       home:input.home, continuation:input.continuation, workers:[input.worker], requirement:input.requirement ?? 'merged', status:'waiting-checks',
       blocker:'Forge observation pending', nextAction:'Observe PR checks and review', nextCheckAt:Date.now(), observedAt:null,
       freshness:'stale', error:null, errors:0, ownerNeeded:input.owner === null, verifiedCommitSha:null, disposition:null,
@@ -104,7 +106,7 @@ export function createDeliveries(db: Database) {
     const prior = get(id); if (!prior) throw new Error('Unknown deliverable');
     if (terminal(prior)) return prior;
     const changedHead = prior.headSha !== o.headSha;
-    let r: DeliveryRecord = { ...prior, headSha:o.headSha, mergeCommitSha:o.mergeCommitSha,verifiedCommitSha:changedHead ? null : prior.verifiedCommitSha,
+    let r: DeliveryRecord = { ...prior, title:o.title ?? prior.title, openedAt:o.openedAt ?? prior.openedAt, headSha:o.headSha, mergeCommitSha:o.mergeCommitSha,verifiedCommitSha:changedHead ? null : prior.verifiedCommitSha,
       forgeState:o.state, observedAt:now, freshness:'fresh', error:null, errors:0, updatedAt:now, nextCheckAt:now+60_000 };
     const currentFailures=o.failedChecks ?? (o.checks==='failing' ? [{id:'unknown-check',name:'Unidentified failing check; inspect forge',url:r.url}] : []);
     const failures=changedHead ? [] : (prior.failures ?? []);
@@ -176,6 +178,17 @@ export function createDeliveries(db: Database) {
     db.prepare(`UPDATE deliveries SET due=?,record=json_set(record,'$.ownerNeeded',json('true'),'$.nextAction','Explicitly assign a new manager','$.nextCheckAt',?,'$.notification.desired','owner-needed:'||id||':'||owner)
       WHERE owner=? AND status NOT IN ('complete','explicitly-abandoned')`).run(now+3_600_000,now+3_600_000,owner);
   }
+  /** Mark one record as needing a new manager without delaying the owner's other records. */
+  function markOwnerNeeded(id:string) {
+    const r=get(id); if (!r || terminal(r) || r.ownerNeeded) return r;
+    return save({ ...r, ownerNeeded:true, nextAction:'Explicitly assign a new manager', notification:{ ...r.notification, desired:`owner-needed:${r.id}:${r.owner}`, attempted:null } });
+  }
+  /** The recorded manager is alive again (or was marked lost by mistake). */
+  function ownerRestored(id:string) {
+    const r=get(id); if (!r || !r.owner || !r.ownerNeeded) return r;
+    const desired=r.notification.desired?.startsWith('owner-needed:') ? null : r.notification.desired;
+    return save({ ...r, ownerNeeded:false, notification:{ ...r.notification, desired, attempted:null } });
+  }
   function transferOwner(from:string,to:string,projectId:string,taskId?:string,excludedTasks:string[] = []) {
     const now=Date.now();
     const filter=(taskId === undefined ? '' : " AND json_extract(record,'$.taskId')=?") + (excludedTasks.length ? ` AND json_extract(record,'$.taskId') NOT IN (${excludedTasks.map(()=>'?').join(',')})` : '');
@@ -234,7 +247,7 @@ export function createDeliveries(db: Database) {
       const latest=get(id)!; if (latest.owner !== r.owner || latest.notification.desired !== signature || latest.ownerNeeded) return false; latest.notification.retryAt=now+60_000; save(latest); return false;
     }
   }
-  return { get,save,list,conflict,hasOwned,taskRecord,register,observe,stale,assign,ownerLost,transferOwner,accountFailure,abandon,verify,markQueued,notify,pendingNotifications };
+  return { get,save,list,conflict,hasOwned,taskRecord,register,observe,stale,assign,ownerLost,markOwnerNeeded,ownerRestored,transferOwner,accountFailure,abandon,verify,markQueued,notify,pendingNotifications };
 }
 
 /** Parse forge data conservatively. A successful lookup with unknown fields
@@ -249,7 +262,9 @@ export function parseForge(value: unknown): ForgeObservation {
   const checkState=checks === null ? 'unknown' : checks.some(c=>failing.includes(String(c.conclusion ?? c.state))) ? 'failing' : checks.some(c=>!passing.includes(String(c.conclusion ?? c.state))) ? 'pending' : 'passing';
   const approvals=Array.isArray(r.reviews) ? (r.reviews as Record<string,unknown>[]).filter(review=>review.state === 'APPROVED' && (review.commit as Record<string,unknown>|undefined)?.oid === r.headRefOid) : [];
   const approved=r.reviewDecision === 'APPROVED' && approvals.length>0;
-  return { mergeCommitSha:typeof (r.mergeCommit as Record<string,unknown>|undefined)?.oid === 'string' ? (r.mergeCommit as {oid:string}).oid : null,reviewHeadSha:approved ? r.headRefOid : null,headSha:r.headRefOid,state:String(r.state).toLowerCase() as ForgeObservation['state'], draft:r.isDraft === true,
+  const openedAt=typeof r.createdAt === 'string' ? Date.parse(r.createdAt) : NaN;
+  return { ...(typeof r.title === 'string' && r.title.trim() ? { title:r.title.trim().slice(0,300) } : {}), ...(Number.isFinite(openedAt) ? { openedAt } : {}),
+    mergeCommitSha:typeof (r.mergeCommit as Record<string,unknown>|undefined)?.oid === 'string' ? (r.mergeCommit as {oid:string}).oid : null,reviewHeadSha:approved ? r.headRefOid : null,headSha:r.headRefOid,state:String(r.state).toLowerCase() as ForgeObservation['state'], draft:r.isDraft === true,
     failedChecks:(checks??[]).filter(c=>failing.includes(String(c.conclusion ?? c.state))).map(c=>{
       const name=String(c.name ?? c.context ?? 'Unidentified check'),url=String(c.detailsUrl ?? c.targetUrl ?? '');
       return {id:createHash('sha256').update(JSON.stringify([name,url])).digest('hex').slice(0,24),name,url};

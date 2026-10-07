@@ -6148,33 +6148,44 @@ export default async function plugin(bb: BbPluginApi) {
     // Environment/branch identity proves provenance. Report URLs alone do not.
     await resolveCrewPr(crew,envId,hostId,signal);
   }
+  // Whether a delivery's recorded manager thread still exists. A captain may own
+  // crews in other projects, so the thread's own project is not compared.
+  async function deliveryOwnerState(record:DeliveryRecord,signal?:AbortSignal):Promise<"live"|"lost"|"unknown"> {
+    if (!record.owner) return "lost";
+    try {
+      const owner=await raceAbort(bb.sdk.threads.get({threadId:record.owner,signal}),signal,STUCK_HOST_CALL_MS);
+      return owner.archivedAt != null ? "lost" : "live";
+    } catch(error) {
+      if (signal?.aborted) throw error;
+      // A get failure alone can be transient. Only complete, successful scoped
+      // inventories can establish that the manager is absent after missed events.
+      try {
+        let complete=true;
+        for (const archived of [false,true]) {
+          for (let offset=0; offset<500; offset+=50) {
+            const rows=await raceAbort(bb.sdk.threads.list({projectId:record.projectId,archived,includeHidden:true,limit:50,offset,signal}),signal,STUCK_HOST_CALL_MS);
+            if (rows.some(row=>row.id===record.owner)) return archived ? "lost" : "unknown";
+            if (rows.length<50) break;
+            if (offset===450) complete=false;
+          }
+        }
+        return complete ? "lost" : "unknown";
+      } catch(inventoryError) { if (signal?.aborted) throw inventoryError; return "unknown"; }
+    }
+  }
   async function reconcileDelivery(record:DeliveryRecord,signal?:AbortSignal) {
     return serializeLedger(`delivery:${record.id}`,async()=>{
     record=deliveries.get(record.id) ?? record;
     if (["complete","explicitly-abandoned"].includes(record.status)) return record;
     try {
-      if (!record.owner) { record.ownerNeeded=true; deliveries.save(record); return; }
-      let owner:Awaited<ReturnType<typeof bb.sdk.threads.get>>;
-      try { owner=await raceAbort(bb.sdk.threads.get({threadId:record.owner,signal}),signal,STUCK_HOST_CALL_MS); }
-      catch(error) {
-        // A get failure alone can be transient. Only complete, successful scoped
-        // inventories can establish that the manager is absent after missed events.
-        let complete=true,found=false;
-        for (const archived of [false,true]) {
-          for (let offset=0; offset<500; offset+=50) {
-            const rows=await raceAbort(bb.sdk.threads.list({projectId:record.projectId,archived,includeHidden:true,limit:50,offset,signal}),signal,STUCK_HOST_CALL_MS);
-            const match=rows.find(row=>row.id===record.owner);
-            if (match) { if (archived) deliveries.ownerLost(record.owner);found=true;break; }
-            if (rows.length<50) break;
-            if (offset===450) complete=false;
-          }
-        }
-        if (complete && !found) {deliveries.ownerLost(record.owner);return;}
-        throw error;
-      }
-      if (owner.archivedAt != null || owner.projectId !== record.projectId) { deliveries.ownerLost(record.owner); return; }
-      const hostId = await resolveHostForProject(record.projectId,record.owner,signal);
-      const result = await runStructuredOnHost(hostId, `gh pr view ${shQuote(record.url)} --json state,isDraft,headRefOid,statusCheckRollup,reviewDecision,reviews,mergeable,mergeCommit`,30_000,signal);
+      // The forge state is read whatever happened to the manager: a merged or
+      // closed PR must leave the open list even when its captain is gone.
+      const ownerState=await deliveryOwnerState(record,signal);
+      signal?.throwIfAborted();
+      if (ownerState === "lost") record=deliveries.markOwnerNeeded(record.id) ?? record;
+      else if (ownerState === "live") record=deliveries.ownerRestored(record.id) ?? record;
+      const hostId = await resolveHostForProject(record.projectId,ownerState === "live" ? record.owner ?? undefined : undefined,signal);
+      const result = await runStructuredOnHost(hostId, `gh pr view ${shQuote(record.url)} --json state,isDraft,headRefOid,statusCheckRollup,reviewDecision,reviews,mergeable,mergeCommit,title,createdAt`,30_000,signal);
       if (result.exitCode !== 0) throw new Error(result.stderr || result.output || `Forge lookup exit ${result.exitCode}`);
       const observation = parseForge(JSON.parse(result.output));
       // Standing yolo allows asking the manager to continue; only native merge
@@ -6183,7 +6194,10 @@ export default async function plugin(bb: BbPluginApi) {
       const authorized=posture.yolo && !!posture.provenance;
       const unverifiedStanding=!posture.provenance && (posture.yolo || record.continuation?.["yolo"]===true);
       signal?.throwIfAborted();
-      return deliveries.observe(record.id,observation,authorized,Date.now(),unverifiedStanding);
+      const observed=deliveries.observe(record.id,observation,authorized,Date.now(),unverifiedStanding);
+      // Without a manager nobody acts on minute-by-minute health; look hourly until it merges or closes.
+      if (observed.ownerNeeded && !["complete","explicitly-abandoned"].includes(observed.status)) return deliveries.save({...observed,nextCheckAt:Date.now()+3_600_000});
+      return observed;
     } catch (error) {
       if (signal?.aborted) throw error;
       return deliveries.stale(record.id,String(error));
