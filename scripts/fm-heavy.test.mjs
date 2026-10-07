@@ -100,7 +100,7 @@ test('a command killed directly frees its slot', async () => {
 test('without flock the command still runs, with a warning', async () => {
   const {dir,env}=fixture();
   try {
-    const r=await run(['/bin/bash','-c','exit 4'],{...env,PATH:'/nonexistent'});
+    const r=await run(['/bin/bash','-c','exit 4'],{...env,PATH:'/nonexistent'}).done;
     assert.equal(r.code,4);
     assert.match(r.stderr,/fm-heavy: flock not found/);
   } finally { rmSync(dir,{recursive:true,force:true}); }

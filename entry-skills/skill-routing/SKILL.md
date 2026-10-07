@@ -62,3 +62,8 @@ Where a routed skill conflicts with Firstmate, follow Firstmate:
 - Poteto mode's Autonomy and Subagents sections give way to the brief: pause
   where the brief or Firstmate says to, and spawn no `poteto-agent` or `Task`.
 - Load only the skills a matched row names, plus poteto mode.
+- Crews share one host's memory. Run full type checks, full test suites,
+  production builds, and any command that can use over 1 GB through
+  `~/.bb-firstmate/bin/fm-heavy <command>`. It waits for a free slot, then runs
+  the command. Run small targeted tests directly. If `fm-heavy` is missing, run
+  the command directly and say so in your report.

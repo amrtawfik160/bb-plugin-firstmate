@@ -8261,7 +8261,7 @@ test("captain hook install merges user-level Claude and Codex hooks idempotently
     writeFileSync(join(home, ".claude/settings.json"), JSON.stringify({ permissions: { allow: ["x"] }, hooks: { Stop: [{ hooks: [{ type: "command", command: "echo existing" }] }] } }));
     const script = captainHookInstallScript({
       threadId: "thr_cap", home: "/fm", state: "/fm/state/cap-thr_cap", ownHome: false,
-      scriptB64: readFileSync(CAPTAIN_HOOK).toString("base64"),
+      scriptB64: readFileSync(CAPTAIN_HOOK).toString("base64"), heavyB64: readFileSync(join(dirname(CAPTAIN_HOOK), "fm-heavy")).toString("base64"),
     });
     for (let i = 0; i < 3; i++) {
       const res = spawnSync("bash", ["-c", script], { encoding: "utf8", env: { PATH: process.env.PATH ?? "", HOME: home } });

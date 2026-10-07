@@ -1112,7 +1112,7 @@ export function captainHookCommand(mode: "stop" | "stop-autoarm" | "session-star
   return `h="$HOME/.${CAPTAIN_HOOK_MARK}"; [ -n "\${BB_THREAD_ID:-}" ] || exit 0; [ -f "$HOME/.bb-firstmate/captains/$BB_THREAD_ID" ] || exit 0; [ -x "$h" ] || { echo "firstmate: registered captain missing hook $h" >&2; exit 1; }; exec "$h" ${mode}${claude ? " --claude" : ""}`;
 }
 export function captainHookInstallScript(input: {
-  threadId: string; home: string; state: string; ownHome: boolean; scriptB64: string; runtimeRoot?:string;
+  threadId: string; home: string; state: string; ownHome: boolean; scriptB64: string; heavyB64: string; runtimeRoot?:string;
 }): string {
   const q = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
   const install = (file: string, claude: boolean) => {
@@ -1128,6 +1128,7 @@ export function captainHookInstallScript(input: {
   return ["set -e", "command -v jq >/dev/null",
     'd="$HOME/.bb-firstmate"; mkdir -p "$d/bin" "$d/captains"',
     `printf %s ${q(input.scriptB64)} | base64 -d > "$d/bin/bb-captain-hook.sh.tmp" && chmod 0755 "$d/bin/bb-captain-hook.sh.tmp" && mv "$d/bin/bb-captain-hook.sh.tmp" "$d/bin/bb-captain-hook.sh"`,
+    `printf %s ${q(input.heavyB64)} | base64 -d > "$d/bin/fm-heavy.tmp" && if [ -x "$d/bin/fm-heavy" ] && cmp -s "$d/bin/fm-heavy.tmp" "$d/bin/fm-heavy"; then rm -f "$d/bin/fm-heavy.tmp"; else chmod 0755 "$d/bin/fm-heavy.tmp" && mv "$d/bin/fm-heavy.tmp" "$d/bin/fm-heavy"; fi`,
     `printf 'home=%s\nstate=%s\nown_home=%s\nroot=%s\n' ${q(input.home)} ${q(input.state)} ${input.ownHome ? "1" : "0"} ${q(input.runtimeRoot??input.home)} > "$d/captains/${input.threadId}"`,
     'mkdir -p "$HOME/.claude" "$HOME/.codex"',
     install('"$HOME/.claude/settings.json"', true), install('"$HOME/.codex/hooks.json"', false),
@@ -7721,6 +7722,7 @@ export default async function plugin(bb: BbPluginApi) {
       state: wakeStateDir(home, threadId),
       ownHome: captainHomes.get(threadId)===home || home.endsWith(`-bb-homes/${threadId}`),
       scriptB64: overlayBytes("bin/bb-captain-hook.sh"),
+      heavyB64: overlayBytes("bin/fm-heavy"),
     });
     const res = await runOnHost(hostId, `bash -c ${shQuote(script)}`, 60_000, signal);
     if (res.exitCode !== 0 || !res.output.includes("captain-hooks-ok")) {
@@ -7750,7 +7752,7 @@ export default async function plugin(bb: BbPluginApi) {
         );
         const setupKey=`captain-adapter-setup:${ctxString(ctx,"threadId")??''}`;
         const runtimeSelection=await bb.storage.kv.get(`native-runtime:${ctxString(ctx,"threadId")??''}`);
-        const stamp=JSON.stringify([current.fmHome,hostId,overlayFingerprint(),runtimeSelection]);
+        const stamp=JSON.stringify([current.fmHome,hostId,overlayFingerprint(),runtimeSelection,createHash("sha256").update(overlayBytes("bin/fm-heavy")).digest("hex")]);
         const verifiedSetup=adapter.includes("mirror OK:") && await bb.storage.kv.get(setupKey)===stamp;
         if (!verifiedSetup) await refreshSkillsManifest(hostId, current.fmHome, signal);
         if (!current.fullParityOnDeck) await refreshCaptainMemory();
