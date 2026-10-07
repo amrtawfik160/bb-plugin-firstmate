@@ -84,3 +84,48 @@ test('twelve PRs of a deleted captain all complete without one pass pushing the 
   assert.deepEqual(store.list({owner:'thr_gone'}).map(r=>r.id),[]);
  }finally{await host.harness.lifecycle.dispose();}
 });
+
+const crew=(id,threadId,owner)=>({id,task:'fix login',projectId:'proj_1',threadId,parentThreadId:owner,providerId:null,model:null,reasoningLevel:null,worktree:true,shape:'ship',posture:'direct-PR',createdAt:'2026-10-07T00:00:00.000Z'});
+const openPrs=[
+ {number:10,url:'https://github.com/acme/repo/pull/10',title:'Fix the login form',headRefName:'fm/verify',createdAt:'2026-10-07T10:00:00Z'},
+ {number:11,url:'https://github.com/acme/repo/pull/11',title:'Show versions in the probe',headRefName:'fm/verify-probe',createdAt:'2026-10-07T11:00:00Z'},
+ {number:12,url:'https://github.com/acme/repo/pull/12',title:'Other captain work',headRefName:'fm/verify-extra-1',createdAt:'2026-10-07T11:30:00Z'},
+ {number:13,url:'https://github.com/acme/repo/pull/13',title:'Opened outside any crew',headRefName:'docs/turn-transport',createdAt:'2026-10-07T12:00:00Z'},
+];
+
+test('open PRs on a crew branch are tracked for that crew captain, and other PRs are not',async()=>{
+ const host=await base();try {
+  await host.bb.storage.kv.set('crews',[crew('c1','thr_c1','thr_cap'),crew('c2','thr_c2','thr_other')]);
+  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'active',environmentId:`env_${threadId}`}));
+  host.harness.sdk.stub('environments.get',async({environmentId})=>({id:environmentId,hostId:'host_1',status:'ready',isWorktree:true,path:`/wt/${environmentId}`,branchName:environmentId==='env_thr_c1'?'fm/verify':'fm/verify-extra'}));
+  const sweeps=[];
+  hostCommands(host,command=>{
+   if(command.includes('gh pr list') && command.includes('--state open')){sweeps.push(command);return{payload:JSON.stringify(openPrs)};}
+   // The older per-crew lookup asks for the single most recent PR on the exact branch.
+   if(command.includes('gh pr list')){const head=command.includes('fm/verify-extra')?'fm/verify-extra':'fm/verify';return{payload:JSON.stringify(openPrs.filter(p=>p.headRefName===head).map(p=>({url:p.url})))};}
+   if(command.includes('gh pr view'))return{payload:JSON.stringify({...forge('OPEN'),title:openPrs.find(p=>p.number===prNumber(command))?.title})};
+   return{code:0};
+  });
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  const store=createDeliveries(host.bb.storage.database());
+  const tracked=store.list({includeComplete:true}).map(r=>[r.id,r.owner,r.taskId,r.title]).sort();
+  assert.deepEqual(tracked,[
+   ['acme/repo#10','thr_cap','c1','Fix the login form'],
+   ['acme/repo#11','thr_cap','c1','Show versions in the probe'],
+   ['acme/repo#12','thr_other','c2','Other captain work'],
+  ]);
+  assert.equal(sweeps.length,1,'the open-PR sweep runs at most once every five minutes');
+  assert.match(sweeps[0],/--author \S*@me/);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('a captain can track a PR it opened itself without a crew',async()=>{
+ const host=await base();try {
+  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'active'}));
+  const result=await host.harness.behavior.runCli(['deliveries','register','--url','https://github.com/acme/repo/pull/13'],{threadId:'thr_cap',projectId:'proj_1'});
+  assert.equal(result.exitCode,0,result.stderr);
+  const r=createDeliveries(host.bb.storage.database()).get('acme/repo#13');
+  assert.equal(r.owner,'thr_cap');assert.equal(r.requirement,'merged');assert.equal(r.taskId,'captain:acme/repo#13');
+ }finally{await host.harness.lifecycle.dispose();}
+});
