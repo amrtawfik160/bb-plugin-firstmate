@@ -420,3 +420,62 @@ test("issue 47: a crew that reported DONE is still ready to review", async () =>
     await host.harness.lifecycle.dispose();
   }
 });
+
+test("firstmate_reply answers one message with several questions as one quoted reply per question", async () => {
+  const host = await load();
+  try {
+    await telegramFlags(host);
+    recordTelegram(host, "thr_cap", "1669");
+    host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
+    const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
+    const send = (quote: string, more?: boolean) =>
+      tool(host, "firstmate_reply").execute({ ref: "tg:200:1669", text: `About: ${quote}`, quote, ...(more === undefined ? {} : { more }) }, ctx);
+    const first = await send("Is the deploy done?", true);
+    assert.ok(!isError(first), text(first));
+    assert.equal(ledgerRow(host, "1669")?.state, "received", "more=true keeps the message open");
+    assert.match(text(first), /tg:200:1669/, "the result lists what is still waiting");
+    assert.ok(!isError(await send("Who owns billing?")));
+    assert.equal(ledgerRow(host, "1669")?.state, "answered");
+    assert.match(text(await send("Who owns billing?")), /Already replied to tg:200:1669 for that quote/);
+    const quotes = host.harness.sdk.callsTo("plugins.callRpc").map((call) => (call[0] as { input: { quote?: string } }).input.quote);
+    assert.deepEqual(quotes, ["Is the deploy done?", "Who owns billing?"]);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("firstmate_reply answers a later message while an older one is still open, and lists the older one", async () => {
+  const host = await load();
+  try {
+    await telegramFlags(host);
+    recordTelegram(host, "thr_cap", "1669", 1_000);
+    recordTelegram(host, "thr_cap", "1670", 2_000);
+    host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
+    const result = await reply(host, "thr_cap", "tg:200:1670");
+    assert.ok(!isError(result), text(result));
+    assert.equal(ledgerRow(host, "1670")?.state, "answered");
+    assert.equal(ledgerRow(host, "1669")?.state, "received");
+    assert.match(text(result), /1 owner message\(s\) still need a final answer:\n- tg:200:1669/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("firstmate_inbox lists open and delegated owner messages for the calling captain only", async () => {
+  const host = await load();
+  try {
+    await telegramFlags(host);
+    recordTelegram(host, "thr_cap", "1669", 1_000);
+    recordTelegram(host, "thr_cap", "1670", 2_000);
+    recordTelegram(host, "thr_other", "1671", 3_000);
+    createInboundLedger(host.bb.storage.database()).markDelegated({ source: "telegram", chatId: "200", messageId: "1670" }, "thr_crew", 2_500);
+    const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
+    const listed = text(await tool(host, "firstmate_inbox").execute({}, ctx));
+    assert.match(listed, /^2 owner message\(s\) still need a final answer:/);
+    assert.match(listed, /tg:200:1669 \(\d+ min, needs your reply\)/);
+    assert.match(listed, /tg:200:1670 \(\d+ min, with crew thr_crew\)/);
+    assert.equal(listed.includes("1671"), false);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});

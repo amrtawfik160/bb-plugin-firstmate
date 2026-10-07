@@ -13,6 +13,8 @@ export type TelegramReplyInput = {
   kind: TelegramReplyKind;
   text: string;
   correlation?: string;
+  /** Exact text from the owner message this reply answers. Telegram shows it as a quote. */
+  quote?: string;
 };
 
 export type TelegramReplyRpcArgs = {
@@ -101,6 +103,7 @@ export async function sendTelegramReply(input: {
         kind: input.payload.kind,
         text: input.payload.text,
         ...(input.payload.correlation ? { correlation: input.payload.correlation } : {}),
+        ...(input.payload.quote ? { quote: input.payload.quote } : {}),
       },
       outputSchema: telegramReplyOutputSchema,
     });

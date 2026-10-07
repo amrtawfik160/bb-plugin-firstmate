@@ -192,8 +192,9 @@ Each flag in `fmReliability` is off until set, for example
   the captain once when a crew ends 8 turns in a row with no new output. The
   watchdog does not stop the crew.
 - `inboundLedger` records each owner message. With `on`, `firstmate_reply`
-  answers the oldest open item for the calling captain, and the captain gets
-  one reminder per open item with backoff.
+  answers any open item for the calling captain, with an optional `quote` for
+  one of several questions. `firstmate_inbox` lists every item still waiting,
+  and the captain gets one reminder per open item with backoff.
 - `telegramThreading` sends acks and replies through the Telegram plugin's
   `telegram.reply` RPC. See the [bridge contract](docs/telegram-bridge-contract.md).
   If the RPC reports that threaded replies are off in the connector while this

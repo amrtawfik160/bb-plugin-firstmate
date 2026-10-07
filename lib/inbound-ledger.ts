@@ -4,6 +4,13 @@ import { isBotOrAckText, parseSourceRef, parseTelegramItems, stripTelegramEnvelo
 export type InboundSource = "bb" | "telegram";
 export type InboundState = "received" | "acked" | "answered" | "delegated";
 export type OutboxKind = "ack" | "reply" | "progress" | "delegated" | "nudge";
+/** A reply that quotes one part of the owner message, such as one of several questions, gets its own key. */
+export type OutboxClaimKind = OutboxKind | `reply:q${string}`;
+
+export function quotedReplyKind(quote: string | null | undefined): OutboxClaimKind {
+  const trimmed = quote?.trim() ?? "";
+  return trimmed === "" ? "reply" : `reply:q${hashText(trimmed).slice(0, 12)}`;
+}
 
 export type InboundKey = {
   source: InboundSource;
@@ -193,18 +200,32 @@ export type CreateInboundLedger = {
   record(event: LedgerEvent): InboundRow | null;
   get(key: InboundKey): InboundRow | undefined;
   listOpen(captainThreadId?: string): InboundRow[];
+  /** Open rows plus rows handed to a crew: every owner message that still needs a final answer. */
+  listPending(captainThreadId: string): InboundRow[];
   markAcked(key: InboundKey, at: number): InboundRow | undefined;
   markAnswered(key: InboundKey, at: number): InboundRow | undefined;
   markDelegated(key: InboundKey, crewId: string, at: number): InboundRow | undefined;
   mergeSourceRefs(keys: InboundKey[], refs: string[]): void;
-  claimOutbox(row: InboundKey, kind: OutboxKind, content: string, at: number): { sent: boolean; existing?: OutboxRow };
-  releaseOutbox(row: InboundKey, kind: OutboxKind): void;
+  claimOutbox(row: InboundKey, kind: OutboxClaimKind, content: string, at: number): { sent: boolean; existing?: OutboxRow };
+  releaseOutbox(row: InboundKey, kind: OutboxClaimKind): void;
   rememberOutgoing(row: InboundKey, kind: OutboxKind, outgoingMessageId: string): void;
   outboxGet(row: InboundKey, kind: OutboxKind): OutboxRow | undefined;
   enqueueChat(chatId: string, key: InboundKey): number;
   chatOrder(chatId: string): InboundKey[];
   openForSweep(now: number, captainThreadId?: string): SweepAction[];
 };
+
+/** One line per owner message still waiting for a final answer, so none is forgotten however many arrive. */
+export function formatOwnerInbox(rows: InboundRow[], now: number): string {
+  if (rows.length === 0) return "No owner message is waiting.";
+  const lines = rows.map((row) => {
+    const ref = row.source === "telegram" ? `tg:${row.chatId}:${row.messageId}` : `bb:${row.chatId}:${row.messageId}`;
+    const age = Math.max(0, Math.round((now - row.receivedAt) / 60_000));
+    const status = row.state === "delegated" ? `with crew ${row.crewId ?? "unknown"}` : "needs your reply";
+    return `- ${ref} (${age} min, ${status}): '${row.preview}'`;
+  });
+  return [`${rows.length} owner message(s) still need a final answer:`, ...lines].join("\n");
+}
 
 export function createInboundLedger(db: Database): CreateInboundLedger {
   db.exec(`CREATE TABLE IF NOT EXISTS inbound_ledger (
@@ -268,23 +289,30 @@ export function createInboundLedger(db: Database): CreateInboundLedger {
     })();
   }
 
-  function claimOutbox(row: InboundKey, kind: OutboxKind, content: string, at: number) {
+  function claimOutbox(row: InboundKey, kind: OutboxClaimKind, content: string, at: number) {
     const contentHash = hashText(content);
     return db.transaction(() => {
       const existing = db.prepare("SELECT record FROM inbound_outbox WHERE source=? AND chat_id=? AND message_id=? AND kind=?")
         .get(row.source, row.chatId, row.messageId, kind) as { record: string } | undefined;
       if (existing) return { sent: false, existing: JSON.parse(existing.record) as OutboxRow };
-      const out: OutboxRow = { ...row, kind, contentHash, sentAt: at, outgoingMessageId: null };
+      const out: OutboxRow = { ...row, kind: kind as OutboxKind, contentHash, sentAt: at, outgoingMessageId: null };
       db.prepare("INSERT INTO inbound_outbox VALUES (?,?,?,?,?,?,?,?)")
         .run(row.source, row.chatId, row.messageId, kind, contentHash, at, null, JSON.stringify(out));
       return { sent: true };
     })();
   }
 
+  function listPending(captainThreadId: string): InboundRow[] {
+    const rows = db.prepare("SELECT record FROM inbound_ledger WHERE captain=? AND state IN ('received','acked','delegated') ORDER BY received_at")
+      .all(captainThreadId) as { record: string }[];
+    return rows.map((r) => parseRow(r.record));
+  }
+
   return {
     record,
     get,
     listOpen,
+    listPending,
     markAcked(key, at) {
       return transition(key, (row) => row.state === "received" ? { ...row, state: "acked", ackedAt: at } : row);
     },
