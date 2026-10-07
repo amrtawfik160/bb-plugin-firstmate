@@ -73,6 +73,28 @@ test('a PR wrongly marked as needing a manager recovers once its captain is seen
  }finally{await host.harness.lifecycle.dispose();}
 });
 
+test('a PR whose captain was marked lost is read on GitHub again within ten minutes',async(t)=>{
+ const host=await base();try {
+  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle',archivedAt:threadId==='thr_old'?1:null}));
+  const store=createDeliveries(host.bb.storage.database());
+  store.register({url:'https://github.com/acme/repo/pull/20',taskId:'t20',projectId:'proj_1',owner:'thr_cap',home:'',worker:'thr_w20',requirement:'pr'});
+  store.register({url:'https://github.com/acme/repo/pull/21',taskId:'t21',projectId:'proj_1',owner:'thr_old',home:'',worker:'thr_w21',requirement:'pr'});
+  let state='OPEN';
+  hostCommands(host,command=>command.includes('gh pr view') ? {payload:JSON.stringify(forge(state))} : {code:0});
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.equal(store.get('acme/repo#21').ownerNeeded,true);
+  store.ownerLost('thr_cap');
+  state='MERGED';
+  const start=Date.now();
+  t.mock.method(Date,'now',()=>start+10*60_000);
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  const live=store.get('acme/repo#20');
+  assert.equal(live.status,'complete','a merged PR of a captain wrongly marked lost completes');
+  assert.equal(live.ownerNeeded,false);
+  assert.equal(store.get('acme/repo#21').status,'complete','a merged PR of an archived captain completes');
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
 test('twelve PRs of a deleted captain all complete without one pass pushing the rest back an hour',async()=>{
  const host=await base();try {
   host.harness.sdk.stub('threads.get',async()=>{throw new Error('HTTP 404: Thread not found');});
