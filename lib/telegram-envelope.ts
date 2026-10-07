@@ -24,6 +24,8 @@ export type TelegramEnvelope = {
   items?: string | null;
   project?: TelegramProject | null;
   repliedTo?: TelegramRepliedTo | null;
+  /** reply_target.sourceEventId: the connector outbox item the owner replied to, such as `ask:<id>`. */
+  sourceEventId?: string;
 };
 
 export type ConnectorHeader = TelegramEnvelope & {
@@ -115,6 +117,7 @@ export function parseConnectorHeader(text: string): ConnectorHeader | null {
   const replied = jsonRecord(dash(fields.get("replied_to_message")));
   const repliedId = idText(replied?.telegramMessageId);
   const project = jsonRecord(dash(fields.get("project")));
+  const sourceEventId = target ? idText(target.sourceEventId) : null;
   return {
     chatId,
     messageId,
@@ -131,6 +134,7 @@ export function parseConnectorHeader(text: string): ConnectorHeader | null {
     project: project
       ? { name: textOrNull(project.name), projectId: textOrNull(project.projectId), captainThreadId: textOrNull(project.captainThreadId) }
       : null,
+    ...(sourceEventId ? { sourceEventId } : {}),
     body: lines.slice(bodyStart).join("\n").trim(),
   };
 }

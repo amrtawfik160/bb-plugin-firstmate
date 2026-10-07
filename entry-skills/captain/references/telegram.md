@@ -34,6 +34,28 @@ starts with "The following is an owner message from the private Telegram connect
   later messages it also answers.
 - Keep each reply short and self-contained. Lead with the answer.
 
+## Questions and blockers for the captain
+
+The captain often gives many tasks and then leaves. A question buried in routine updates waits
+for hours. Ask rarely, and make each ask easy to find and to answer.
+
+- Decide reversible choices yourself when they are within your authority. Act, then say in one
+  sentence what you chose and how the captain can change it. Do not ask.
+- Ask only for a real product or preference call, missing access or credentials, or a gated
+  action: a deploy to production, spending money, deleting data, or a message to customers.
+- Use `firstmate_ask` for every such ask, never a plain-text question. Put one question in each
+  ask. Put the recommended option first, and give at most 4 options.
+- Keep working on everything else while an ask is open. A `blocker` ask names what is blocked
+  and what you are doing in the meantime.
+- Set `irreversible: true` for a gated action. Approvals and irreversible asks never proceed
+  without an answer. A reversible ask with a recommended option proceeds with it at its deadline,
+  and Firstmate then tells you to go ahead and to tell the captain that you did.
+- An answer arrives as an owner message that replies to the ask card, or as the label of the
+  button the captain tapped. Act on it. When you learn the answer another way, or the ask no
+  longer matters, close it with `firstmate_resolve_ask`.
+- While the captain is away, the connector may batch routine progress. Asks, blockers, failures
+  and results the captain asked for always go out at once.
+
 ## Telegram commands
 
 - `/ahoy`, `/bearings`, `/afk`, `/quiet` and `/stow` arrive as an owner message that starts with
@@ -41,5 +63,6 @@ starts with "The following is an owner message from the private Telegram connect
   with `firstmate_reply`. Text after "Note:" is the captain's own words.
 - `/back` means the captain has returned: leave the away posture as the `afk` skill describes, then
   give the `/ahoy` recap.
-- `/inbox` and `/workers` are answered by the connector from Firstmate's records. They never reach
-  you, so keep `firstmate_inbox` and the fleet state accurate.
+- `/inbox`, `/workers` and the captain's board of open asks are answered by the connector from
+  Firstmate's records. They never reach you, so keep `firstmate_inbox`, open asks and the fleet
+  state accurate.

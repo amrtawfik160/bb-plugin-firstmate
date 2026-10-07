@@ -4,6 +4,7 @@ import test from "node:test";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import plugin from "./server.ts";
 import { createInboundLedger } from "./lib/inbound-ledger.ts";
+import { createOwnerAsks } from "./lib/owner-asks.ts";
 import { parseInboundTelegram } from "./lib/telegram-envelope.ts";
 
 type Host = ReturnType<typeof createFakePluginHost>;
@@ -523,6 +524,217 @@ test("telegramCommand answers /inbox and /workers for the captain only", async (
     assert.ok(workers.text.length > 0, workers.text);
     const stranger = await host.harness.behavior.callRpc("telegramCommand", { command: "inbox", threadId: "thr_other" }) as { text: string };
     assert.match(stranger.text, /not a Firstmate captain/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+type RpcCall = { pluginId: string; method: string; input: Record<string, unknown> };
+const rpcCalls = (host: Host) => host.harness.sdk.callsTo("plugins.callRpc").map((c) => c[0] as RpcCall);
+const asks = (host: Host) => createOwnerAsks(host.bb.storage.database());
+const askTool = (host: Host, params: Record<string, unknown>, captain = "thr_cap") =>
+  tool(host, "firstmate_ask").execute(params, { threadId: captain, projectId: "proj_1" } as never);
+const connectorOk = (host: Host) => host.harness.sdk.stub("plugins.callRpc", async (args: RpcCall) => (
+  args.method === "refreshBoard" ? { ok: true } : { queued: 1, duplicate: false, mode: "on" }
+));
+const hhmm = (at: number) => new Date(at).toISOString().slice(11, 16);
+
+test("firstmate_ask records the ask and sends the connector a question card with its options and recommendation", async () => {
+  const host = await load();
+  try {
+    await telegramFlags(host);
+    await host.harness.behavior.setSettings({ askDefaultMinutes: 30 });
+    connectorOk(host);
+    const result = await askTool(host, {
+      question: "Dark mode by default?", kind: "question",
+      options: [{ label: "Yes" }, { label: "No", value: "no" }], recommended: 0,
+    });
+    assert.ok(!isError(result), text(result));
+    const id = /ask (a[0-9a-z]{6})/.exec(text(result))?.[1];
+    assert.ok(id, text(result));
+    assert.match(text(result), /Keep working on other things/);
+    const stored = asks(host).get(id)!;
+    assert.equal(stored.state, "open");
+    assert.equal(stored.captain, "thr_cap");
+    assert.equal(stored.defaultAt! - stored.createdAt, 30 * 60_000, "the deadline comes from askDefaultMinutes");
+    const calls = rpcCalls(host);
+    assert.deepEqual(calls.map((c) => [c.pluginId, c.method]), [["telegram", "ask"], ["telegram", "refreshBoard"]]);
+    assert.deepEqual(calls[0]!.input, {
+      askId: id,
+      text: `❓ Question\n\nDark mode by default?\n\nRecommended: Yes\nIf no answer by ${hhmm(stored.defaultAt!)} UTC, I'll go with Yes.`,
+      options: [{ label: "Yes", value: "Yes" }, { label: "No", value: "no" }],
+      recommended: 0,
+    });
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("firstmate_ask keeps the ask open and warns when the connector cannot send the card", async () => {
+  const host = await load();
+  try {
+    await telegramFlags(host);
+    host.harness.sdk.stub("plugins.callRpc", async () => { throw new Error("Telegram API unavailable"); });
+    const result = await askTool(host, { question: "Need the Stripe key.", kind: "blocker" });
+    assert.ok(!isError(result), text(result));
+    assert.match(text(result), /Warning: the question card was not sent to Telegram \(Telegram API unavailable\)/);
+    const id = /ask (a[0-9a-z]{6})/.exec(text(result))![1]!;
+    assert.equal(asks(host).get(id)?.state, "open");
+    assert.equal(asks(host).get(id)?.defaultAt, null);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("firstmate_ask refuses a deadline on an approval or an irreversible ask, and never gives one a default", async () => {
+  const host = await load();
+  try {
+    await telegramFlags(host);
+    connectorOk(host);
+    const options = [{ label: "Deploy" }, { label: "Wait" }];
+    const approval = await askTool(host, { question: "Deploy billing?", kind: "approval", options, recommended: 0, defaultAfterMinutes: 30 });
+    assert.ok(isError(approval), text(approval));
+    assert.match(text(approval), /defaultAfterMinutes is not allowed for an approval/);
+    const gated = await askTool(host, { question: "Delete old data?", kind: "question", options, recommended: 1, defaultAfterMinutes: 30, irreversible: true });
+    assert.ok(isError(gated), text(gated));
+    assert.match(text(gated), /defaultAfterMinutes is not allowed for an irreversible ask/);
+    assert.deepEqual(asks(host).listOpen("thr_cap"), []);
+    assert.equal(rpcCalls(host).length, 0);
+    const waiting = await askTool(host, { question: "Delete old data?", kind: "question", options, recommended: 1, irreversible: true });
+    const id = /ask (a[0-9a-z]{6})/.exec(text(waiting))![1]!;
+    assert.equal(asks(host).get(id)?.defaultAt, null, "askDefaultMinutes never applies to an irreversible ask");
+    assert.equal(rpcCalls(host)[0]!.input.text, "❓ Question\n\nDelete old data?\n\nRecommended: Wait");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+const askReply = (askId: string, body = "Roll it back") => envelope("live-reply")
+  .replace('"sourceEventId":"evt_1"', `"sourceEventId":"ask:${askId}"`)
+  .replace(/Roll it back$/, body);
+
+test("an owner reply to an ask card answers that ask and refreshes the board; another captain's ask is untouched", async () => {
+  const host = await captainHost();
+  try {
+    connectorOk(host);
+    const opts = [{ label: "Yes", value: "yes" }];
+    asks(host).create({ id: "a000001", captain: "thr_cap", kind: "question", text: "Ship it?", options: opts, recommended: 0, createdAt: 1 });
+    asks(host).create({ id: "a000002", captain: "thr_other", kind: "question", text: "Other?", options: opts, createdAt: 2 });
+    const hook = host.harness.inspection.registrations.hooks["message.dispatch"]!;
+    const send = (body: string) => hook({
+      thread: makeThreadResponse({ id: "thr_cap", status: "active" }),
+      attempt: "join-turn", initiator: "user", senderThreadId: null, queuedMessages: [],
+      input: { blocks: [], text: body },
+    } as never);
+    await send(askReply("a000002"));
+    assert.equal(asks(host).get("a000002")?.state, "open");
+    assert.equal(rpcCalls(host).filter((c) => c.method === "refreshBoard").length, 0);
+    await send(askReply("a000001", "Yes"));
+    const answered = asks(host).get("a000001")!;
+    assert.equal(answered.state, "answered");
+    assert.equal(answered.resolution, "Yes");
+    assert.equal(rpcCalls(host).filter((c) => c.method === "refreshBoard").length, 1);
+    const header = parseInboundTelegram(askReply("a000001", "Yes"))!;
+    const row = createInboundLedger(host.bb.storage.database()).get({ source: "telegram", chatId: header.chatId, messageId: header.messageId });
+    assert.equal(row?.state, "answered", "an answer to a card raises no unanswered reminder");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a captain idle defaults an overdue reversible ask once and never an irreversible one", async () => {
+  const host = await knownCaptainHost();
+  try {
+    await telegramFlags(host);
+    connectorOk(host);
+    host.harness.sdk.stub("threads.list", async () => []);
+    const opts = [{ label: "Use Postgres", value: "pg" }, { label: "Use SQLite", value: "sqlite" }];
+    const past = Date.now() - 60_000;
+    asks(host).create({ id: "a000001", captain: "thr_cap", kind: "question", text: "Which DB?", options: opts, recommended: 0, defaultAt: past, createdAt: 1 });
+    asks(host).create({ id: "a000002", captain: "thr_cap", kind: "question", text: "Drop table?", options: opts, recommended: 1, defaultAt: past, irreversible: true, createdAt: 2 });
+    asks(host).create({ id: "a000003", captain: "thr_cap", kind: "question", text: "Later?", options: opts, recommended: 0, defaultAt: Date.now() + 3_600_000, createdAt: 3 });
+    await captainIdle(host);
+    await captainIdle(host);
+    const steers = host.harness.sdk.callsTo("threads.send")
+      .map((c) => c[0] as { threadId: string; input: Array<{ text: string; visibility?: string }> })
+      .filter((a) => /No answer to ask/.test(a.input[0]?.text ?? ""));
+    assert.equal(steers.length, 1);
+    assert.equal(steers[0]!.threadId, "thr_cap");
+    assert.equal(steers[0]!.input[0]!.visibility, "agent-only");
+    assert.equal(steers[0]!.input[0]!.text, 'No answer to ask a000001 by its deadline: go ahead with "Use Postgres" as recommended, and tell the captain in one short message that you did.');
+    assert.equal(asks(host).get("a000001")?.state, "defaulted");
+    assert.equal(asks(host).get("a000001")?.resolution, "Use Postgres");
+    assert.equal(asks(host).get("a000002")?.state, "open");
+    assert.equal(asks(host).get("a000003")?.state, "open");
+    assert.equal(rpcCalls(host).filter((c) => c.method === "refreshBoard").length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+async function boardHost() {
+  const host = await load();
+  await telegramFlags(host);
+  host.harness.sdk.stub("threads.getPluginMetadata", async ({ threadId }: { threadId: string }) => (threadId === "thr_cap" ? { captain: "true" } : {}));
+  host.harness.sdk.stub("threads.list", async () => []);
+  return host;
+}
+const board = (host: Host) => host.harness.behavior.callRpc("telegramCommand", { command: "board", threadId: "thr_cap" }) as Promise<{ text: string; away?: boolean }>;
+
+test("telegramCommand board says nothing is waiting and reports the captain is not away", async () => {
+  const host = await boardHost();
+  try {
+    assert.deepEqual(await board(host), { text: "📌 Nothing needs you right now.", away: false });
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("telegramCommand board lists open asks then crew items, and reports /afk as away", async () => {
+  const host = await boardHost();
+  try {
+    await host.bb.storage.kv.set("afk:cap-thr_cap", { on: true, words: "", since: "2026-10-07T00:00:00.000Z", held: [] });
+    await host.bb.storage.kv.set("telegram-threading", { mismatch: true, since: 1 });
+    const created = Date.now() - 5 * 60_000;
+    const at = Date.UTC(2026, 9, 7, 14, 30);
+    asks(host).create({ id: "a000001", captain: "thr_cap", kind: "blocker", text: "Need the Stripe key.", options: [], createdAt: created });
+    asks(host).create({ id: "a000002", captain: "thr_cap", kind: "question", text: "Dark mode?", options: [{ label: "Yes", value: "y" }], recommended: 0, defaultAt: at, createdAt: created + 1 });
+    asks(host).create({ id: "a000003", captain: "thr_other", kind: "question", text: "Not mine", options: [], createdAt: created });
+    assert.deepEqual(await board(host), {
+      away: true,
+      text: [
+        "📌 Waiting on you (3)",
+        "",
+        "1. ⛔ Need the Stripe key. (5 min, ask a000001)",
+        "2. ❓ Dark mode? (5 min, ask a000002) Recommended: Yes. Auto at 14:30 UTC.",
+        "3. Needs captain: Telegram threaded replies are off in the Telegram connector, but Firstmate's telegramThreading flag is on, so replies arrive unthreaded. Turn th…",
+        "",
+        "Tap a question's button or reply to it to answer.",
+      ].join("\n"),
+    });
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("telegramCommand board caps the list at 15 lines", async () => {
+  const host = await boardHost();
+  try {
+    const created = Date.now() - 5 * 60_000;
+    for (let i = 1; i <= 17; i++) {
+      asks(host).create({ id: `a0000${String(i).padStart(2, "0")}`, captain: "thr_cap", kind: "question", text: `Question ${i}?`, options: [], createdAt: created + i });
+    }
+    assert.deepEqual(await board(host), {
+      away: false,
+      text: [
+        "📌 Waiting on you (17)",
+        "",
+        ...Array.from({ length: 15 }, (_, i) => `${i + 1}. ❓ Question ${i + 1}? (5 min, ask a0000${String(i + 1).padStart(2, "0")})`),
+        "…and 2 more",
+        "",
+        "Tap a question's button or reply to it to answer.",
+      ].join("\n"),
+    });
   } finally {
     await host.harness.lifecycle.dispose();
   }

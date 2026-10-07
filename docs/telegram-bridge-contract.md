@@ -106,19 +106,90 @@ and `delegated` items with their crew.
 
 ## Owner commands
 
-The connector answers `/inbox` and `/workers` itself by calling Firstmate:
+The connector answers `/inbox`, `/workers` and its board itself by calling Firstmate:
 
 ```
 bb.sdk.plugins.callRpc({
   pluginId: "firstmate",
   method: "telegramCommand",
-  input: { command: "inbox" | "workers", threadId: <bound captain> },
-  outputSchema: { text: string },
+  input: { command: "inbox" | "workers" | "board", threadId: <bound captain> },
+  outputSchema: { text: string, away?: boolean },
 })
 ```
 
+`away` is set only for `board`. It is the captain's `/afk` posture, the same
+flag the fleet snapshot exposes as `afk`. The board text is plain text, at
+most 3500 characters:
+
+```
+📌 Waiting on you (<N>)
+
+1. <❓|⛔|✅> <question, first 140 chars> (<age>, ask <id>) Recommended: <label>. Auto at <HH:MM UTC>.
+2. <crew item from the fleet "Waiting for you" list, first 160 chars>
+…and <k> more
+
+Tap a question's button or reply to it to answer.
+```
+
+Open asks come first, oldest first, then crew items. The list stops at 15
+lines. The last line appears only when an ask is open. With nothing waiting
+the text is `📌 Nothing needs you right now.`
+
 `/ahoy`, `/bearings`, `/afk`, `/back`, `/quiet` and `/stow` reach the captain as an
 owner message that names the skill to run. All of them appear in Telegram's "/" menu.
+
+## Owner asks
+
+`firstmate_ask` records a question, blocker or approval (`owner_ask` table) and,
+when `telegramThreading` is on, calls the connector:
+
+```
+bb.sdk.plugins.callRpc({
+  pluginId: "telegram",
+  method: "ask",
+  input: {
+    askId,            // [A-Za-z0-9_-], at most 64; Firstmate uses "a" + 6 base36 chars
+    text,             // at most 3500
+    options,          // at most 4 of { label (at most 40), value (at most 64) }; may be empty
+    recommended?,     // index into options
+  },
+  outputSchema: { queued: number, duplicate: boolean },
+})
+```
+
+The connector sends a card with one button per option. Its outbox source id
+is `ask:<askId>`. The card counts as sent when `queued > 0` or `duplicate` is
+true. On any other result or error the ask stays open, shows on the board, and
+the tool result carries a warning. The card text is:
+
+```
+<❓ Question | ⛔ Blocker | ✅ Approval needed>
+
+<question>
+
+Recommended: <label>
+If no answer by <HH:MM UTC>, I'll go with <label>.
+```
+
+The last two lines appear only with a recommended option and a deadline.
+
+The owner answers with an ordinary owner message under the connector banner.
+Its `reply_target` JSON carries `"sourceEventId":"ask:<askId>"`. For a button
+tap the message text is the button label. Firstmate marks the ask answered,
+with the message body as the resolution, only when the ask is open and owned
+by the receiving captain.
+
+A reversible ask with a recommended option gets a deadline: the
+`defaultAfterMinutes` argument, or the `askDefaultMinutes` setting (default
+240, 0 = never). When a captain turn ends after the deadline, or on the
+periodic pass, Firstmate marks it defaulted and steers the captain, agent-only,
+to go ahead with the recommended option. Approvals and asks with
+`irreversible: true` refuse a deadline and never default.
+`firstmate_resolve_ask` closes an ask as answered or cancelled.
+
+After an ask is created, answered, defaulted or cancelled, Firstmate calls
+`refreshBoard` (input `{}`, output `{ ok: boolean }`) on the connector. It is
+best effort: errors and a missing method are ignored.
 
 ## Reminders
 

@@ -133,6 +133,13 @@ test("reply_target JSON keeps the replied-to Telegram message id", () => {
   assert.deepEqual(parsed.project, { name: "firstmate", projectId: "proj_fm", captainThreadId: "thr_cap" });
 });
 
+test("reply_target JSON exposes the connector source event id, such as an ask card", () => {
+  assert.equal(parseConnectorHeader(fixture("live-reply"))?.sourceEventId, "evt_1");
+  const ask = fixture("live-reply").replace('"sourceEventId":"evt_1"', '"sourceEventId":"ask:a1b2c3d"');
+  assert.equal(parseInboundTelegram(ask)?.sourceEventId, "ask:a1b2c3d");
+  assert.equal(parseConnectorHeader(fixture("live-owner"))?.sourceEventId, undefined);
+});
+
 test("replied_to_message supplies the reply target when connector history has none", () => {
   const text = fixture("live-reply").replace(/^reply_target: .*$/m, "reply_target: none");
   assert.equal(parseConnectorHeader(text)?.replyTo, "1650");
