@@ -8553,6 +8553,21 @@ test("captain compaction is due only past the budget and outside the cooldown", 
   assert.equal(captainCompactDue({ ...base, usedTokens: 900_000, lastCompactAt: null }), true);
 });
 
+test("live repro: an idle captain at 790k estimated tokens under a 967k provider threshold is compacted once", async () => {
+  const { host, idle } = await compactionHost();
+  try {
+    host.harness.sdk.stub("threads.context", async () => ({ usage: {
+      usedTokens: 789701, modelContextWindow: 1000000, estimated: true,
+      snapshot: { autoCompactAtTokens: 967000, providerSessionId: "db9ad6cf", capturedAt: "2026-10-07T14:02:53.934Z" },
+    } }));
+    await idle();
+    await idle();
+    assert.equal(host.harness.sdk.callsTo("threads.compact").length, 1, "an unchanged reading is not compacted twice");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 async function compactionHost() {
   const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { captainCompactAtTokens: 200000 } });
   await host.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
@@ -8569,10 +8584,9 @@ function stubCompactionHost(host: Awaited<ReturnType<typeof load>>) {
 }
 
 for (const [name, usage] of Object.entries({
-  estimated: { usedTokens: 910000, modelContextWindow: 1000000, estimated: true },
   "over-window provider total": { usedTokens: 2103251, modelContextWindow: 256000, estimated: false },
   "missing capacity": { usedTokens: 910000, estimated: false },
-  "provider-managed compaction": { usedTokens: 910000, modelContextWindow: 1000000, estimated: false, snapshot: { autoCompactAtTokens: 950000 } },
+  "a lower provider-managed threshold": { usedTokens: 910000, modelContextWindow: 1000000, estimated: false, snapshot: { autoCompactAtTokens: 550000 } },
 })) {
   test(`automatic compaction ignores ${name}`, async () => {
     const { host, idle } = await compactionHost();
