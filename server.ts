@@ -1764,6 +1764,11 @@ export default async function plugin(bb: BbPluginApi) {
       label: "Default crew provider id (blank = BB resolves)",
       default: "",
     },
+    shipAntigravityGuard: {
+      type: "boolean",
+      label: "Run ship (PR) work requested on acp-antigravity on the project default provider instead, unless the owner asked for antigravity",
+      default: true,
+    },
     defaultPermissionMode: {
       type: "select",
       label: "Default crew permission mode",
@@ -4762,6 +4767,9 @@ export default async function plugin(bb: BbPluginApi) {
     return await readFmMetaField(env.hostId,record.taskId,"bb_thread_id",record.home,signal) === record.threadId;
   }
 
+  // 0 of 15 acp-antigravity crews followed the worker contract (no checkpoint
+  // reports, outcome lines or /pr skill), so ship work leaves it by default.
+  const GUARDED_SHIP_PROVIDER = "acp-antigravity";
   async function dispatchCrew(input: Parameters<typeof dispatchCrewBody>[0]): Promise<Crew> {
     if (input.crewId && !/^[A-Za-z0-9._-]{1,100}$/.test(input.crewId)) throw new Error("Invalid task retry identity.");
     if (input.deliveryRequirement && !["pr","merged","merged-and-verified"].includes(input.deliveryRequirement)) throw new Error("Unsupported delivery contract.");
@@ -4836,10 +4844,15 @@ export default async function plugin(bb: BbPluginApi) {
     sendAt?: number;
     deliveryRequirement?: "pr" | "merged" | "merged-and-verified";
     sourceRefs?: string[];
+    ownerRequestedProvider?: boolean;
     signal?:AbortSignal;
   }): Promise<Crew> {
     const task = input.task.trim().slice(0, MAX_TASK);
     if (task === "") throw new Error("Empty task.");
+    if (input.shape === "ship" && input.providerId === GUARDED_SHIP_PROVIDER && input.ownerRequestedProvider !== true && (await settings.get()).shipAntigravityGuard !== false) {
+      const fallback = (await settings.get()).defaultProvider;
+      input = { ...input, providerId: fallback !== "" && fallback !== GUARDED_SHIP_PROVIDER ? fallback : undefined, model: undefined };
+    }
     const mates = await readSecondmates();
     const mate = input.mode === "local-only" ? undefined : pickSecondmate(mates, input.projectId, task);
     if (mate !== undefined && mate.threadId !== input.parentThreadId) {
@@ -9753,10 +9766,11 @@ export default async function plugin(bb: BbPluginApi) {
     overrideOwner: z.boolean().optional()
       .describe("Proceed even though the task targets a PR another captain's crew owns (only on the captain's word)"),
     sourceRefs: z.array(z.string()).optional().describe("Inbound ledger refs this crew answers (tg:chat:msg or bb:thread:row)"),
+    ownerRequestedProvider: z.boolean().optional().describe("The owner named this provider in their own words; keeps acp-antigravity for ship work"),
   });
 
   const dispatchHelp='bb firstmate dispatch [options] -- "<task>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","sendAt"])+"\n  --task <text>  Repeat for bounded fan-out; --hidden hides the worker.\n  sendAt/--send-at is unsupported; native ship isolation is mandatory.";
-  const queueHelp='bb firstmate queue add [options] -- "<title>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider"},["task","taskId","overrideOwner","sendAt","title","permissionMode","sharedEnv","worktree","visible"])+"\n  --detail <full-task>\n  --after <queue-id>  Repeat for dependencies, which remain dispatch gates.\n  --wait-until <ISO-time>  Eligibility only; explicit dispatch required.\n  dispatch preserves the queued shape, mode, contract, dependencies and identity; only provider/model/reasoning/permission/visibility/worktree options override at dispatch.\n  list | next | done <queue-id> | drop <queue-id> | prune | reconcile <exact-id> --project <id> [original options]"+"\nDispatch: bb firstmate queue dispatch <queue-id> [options]\n"+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","taskId","overrideOwner","sendAt","title","shape","mode","deliveryRequirement"]);
+  const queueHelp='bb firstmate queue add [options] -- "<title>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider"},["task","taskId","overrideOwner","sendAt","title","permissionMode","sharedEnv","worktree","visible","ownerRequestedProvider"])+"\n  --detail <full-task>\n  --after <queue-id>  Repeat for dependencies, which remain dispatch gates.\n  --wait-until <ISO-time>  Eligibility only; explicit dispatch required.\n  dispatch preserves the queued shape, mode, contract, dependencies and identity; only provider/model/reasoning/permission/visibility/worktree options override at dispatch.\n  list | next | done <queue-id> | drop <queue-id> | prune | reconcile <exact-id> --project <id> [original options]"+"\nDispatch: bb firstmate queue dispatch <queue-id> [options]\n"+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","taskId","overrideOwner","sendAt","title","shape","mode","deliveryRequirement","ownerRequestedProvider"]);
   const usage = [
     "Usage:",
     "  bb firstmate guide [--json]",
@@ -9993,7 +10007,7 @@ export default async function plugin(bb: BbPluginApi) {
       "Dispatch a firstmate-style crewmate: spawns a child BB thread for one task (ship crews get an isolated worktree by default) and records it as a crew.",
     presentation: { label: { pending: "Dispatching crewmate", completed: "Dispatched crewmate" } },
     parameters: dispatchParams,
-    async execute({ task, taskId, projectId, title, providerId, model, reasoningLevel, permissionMode, shape, mode, worktree, sharedEnv, visible, sendAt, deliveryRequirement, overrideOwner, sourceRefs }, ctx) {
+    async execute({ task, taskId, projectId, title, providerId, model, reasoningLevel, permissionMode, shape, mode, worktree, sharedEnv, visible, sendAt, deliveryRequirement, overrideOwner, sourceRefs, ownerRequestedProvider }, ctx) {
       const ctxRecord = asRecord(ctx);
       const resolvedProject =
         projectId ?? (typeof ctxRecord["projectId"] === "string" ? ctxRecord["projectId"] : undefined);
@@ -10034,7 +10048,7 @@ export default async function plugin(bb: BbPluginApi) {
         visible: visible !== false,
         shape: resolvedShape,
         mode: toMode(mode, posture.mode), yolo: posture.yolo,
-        sendAt, deliveryRequirement,
+        sendAt, deliveryRequirement, ownerRequestedProvider,
       };
       if (background) {
         const reservedId = taskId ?? randomUUID().slice(0, 8);
@@ -10062,7 +10076,10 @@ export default async function plugin(bb: BbPluginApi) {
       if (status === "error") {
         return toolError(`Dispatch of ${crew.shape} crew ${crew.id} (thread ${crew.threadId}) FAILED:${dispatchStatusNote(status, await threadFailureDetail(crew.threadId))}`);
       }
-      return `Dispatched ${crew.shape} crew ${crew.id} as thread ${crew.threadId} (${status}, ${crew.posture}).${warn}${dispatchStatusNote(status)}${permissionLine(crew.id)} Track with: bb firstmate crew ${crew.id}`;
+      const moved = spawnInput.providerId === GUARDED_SHIP_PROVIDER && crew.providerId !== GUARDED_SHIP_PROVIDER
+        ? ` Note: ${GUARDED_SHIP_PROVIDER} is not used for ship work, so this crew runs on the project default provider (${crew.providerId ?? "BB default"}). Pass ownerRequestedProvider only when the owner asked for ${GUARDED_SHIP_PROVIDER}; the owner can turn this off with the shipAntigravityGuard setting.`
+        : "";
+      return `Dispatched ${crew.shape} crew ${crew.id} as thread ${crew.threadId} (${status}, ${crew.posture}).${warn}${moved}${dispatchStatusNote(status)}${permissionLine(crew.id)} Track with: bb firstmate crew ${crew.id}`;
     },
   });
 
