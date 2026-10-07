@@ -11425,6 +11425,12 @@ export default async function plugin(bb: BbPluginApi) {
                 senderThreadId: sender,
               }];
           for (const event of events) inboundLedger.record(event);
+          // An answer to an ask card needs action, not a reply, so it never raises an unanswered reminder.
+          for (const event of events) {
+            const header = parseConnectorHeader(event.text);
+            if (!header || header.forwarded || askIdFromSourceEventId(header.sourceEventId) === null) continue;
+            inboundLedger.markAnswered({ source: "telegram", chatId: header.chatId, messageId: header.messageId }, Date.now());
+          }
           if (flags.inboundLedger === "on") {
             const key = `${threadId}:${telegram?.chatId ?? threadId}`;
             if (inbound.action === "wait" && inbound.sendAt) {

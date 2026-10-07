@@ -634,6 +634,9 @@ test("an owner reply to an ask card answers that ask and refreshes the board; an
     assert.equal(answered.state, "answered");
     assert.equal(answered.resolution, "Yes");
     assert.equal(rpcCalls(host).filter((c) => c.method === "refreshBoard").length, 1);
+    const header = parseInboundTelegram(askReply("a000001", "Yes"))!;
+    const row = createInboundLedger(host.bb.storage.database()).get({ source: "telegram", chatId: header.chatId, messageId: header.messageId });
+    assert.equal(row?.state, "answered", "an answer to a card raises no unanswered reminder");
   } finally {
     await host.harness.lifecycle.dispose();
   }
