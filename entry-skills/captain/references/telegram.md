@@ -26,6 +26,7 @@ starts with "The following is an owner message from the private Telegram connect
   in a turn an owner message started is refused without it. The dispatch opens an owner task on the
   board. A reply never closes it: its PR merging does, or `firstmate_task` close with done or
   dropped (dropped needs a reason). Work you do yourself gets a task through `firstmate_task` open.
+- Each owner job gets its own dispatch and task; a job from another thread or your own passes `origin` instead.
 - Turn-end reminders name any item left unanswered. Answer it or dispatch it; never drop it.
 
 ## Reply to the message you are answering

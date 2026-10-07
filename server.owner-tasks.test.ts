@@ -90,13 +90,13 @@ test("Oct 7 repro: a reply of only 'Started' answered the owner message, and now
   }
 });
 
-test("a dispatch in a turn started by an owner message must carry that message's ref", async () => {
+test("a dispatch in a turn started by an owner message must carry that message's ref or name another origin", async () => {
   const host = await captainHost();
   try {
     await ownerSays(host, "2202", "Run the Brands audit");
     const refused = await dispatch(host, { task: "Run the Brands audit" });
     assert.ok(isError(refused));
-    assert.equal(text(refused), 'This turn started from owner message tg:200:2202. Pass sourceRefs: ["tg:200:2202"] so the owner\'s task is tracked until it closes.');
+    assert.equal(text(refused), 'This turn started from owner message tg:200:2202. If this job is the owner\'s, pass sourceRefs: ["tg:200:2202"]. If it came from elsewhere, pass origin: {"kind":"thread","threadId":"<thread>"} or {"kind":"captain","reason":"<why>"}.');
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
     await crewPings(host);
     const after = await dispatch(host, { task: "Rebase the docs branch", taskId: "docs-rebase" });
@@ -106,14 +106,55 @@ test("a dispatch in a turn started by an owner message must carry that message's
   }
 });
 
-test("a second dispatch for the same owner message joins its task instead of opening another", async () => {
+test("Oct 7 repro: one owner message with two jobs opens two tasks, each titled by its own dispatch", async () => {
   const host = await captainHost();
   try {
-    await ownerSays(host, "2203", "Weekly email test to amr@cyndra.ai");
-    await dispatch(host, { task: "Send the weekly email test", taskId: "weekly-email", title: "Weekly email test", sourceRefs: ["tg:200:2203"] });
-    const redo = await dispatch(host, { task: "Redo the weekly email test", taskId: "weekly-email-2", sourceRefs: ["tg:200:2203"] });
-    assert.match(text(redo), /Owner task T1 tracks it/);
-    assert.deepEqual(createOwnerTasks(host.bb.storage.database()).get("T1")?.crewIds, ["weekly-email", "weekly-email-2"]);
+    await ownerSays(host, "2215", "Five Safi jobs: debts in Arrange home, the glass glitch, ...");
+    const first = await dispatch(host, { task: "Show debts in Arrange home items", taskId: "safi-arrange-debts", title: "Safi: debts in Arrange home items", sourceRefs: ["tg:200:2215"] });
+    const second = await dispatch(host, { task: "Research then fix the Apple glass glitch", taskId: "safi-glass-glitch", title: "Safi: Apple glass glitch", sourceRefs: ["tg:200:2215"] });
+    assert.match(text(first), /Owner task T1 tracks it/);
+    assert.match(text(second), /Owner task T2 tracks it/);
+    assert.equal(await board(host), [
+      "📌 Needs you: nothing right now.",
+      "",
+      "✅ Done since you last looked: nothing new.",
+      "",
+      "🔧 In progress (2)",
+      "- T1 Areliaa · Safi: debts in Arrange home items · 0 min",
+      "- T2 Areliaa · Safi: Apple glass glitch · 0 min",
+    ].join("\n"));
+    const tasks = createOwnerTasks(host.bb.storage.database());
+    assert.equal(tasks.open({ captain: "thr_cap", project: "Areliaa", title: "Retry", sourceRefs: ["tg:200:2215"], crewId: "safi-glass-glitch", at: Date.now() }).id, "T2", "a retried dispatch keeps its task");
+    assert.deepEqual(tasks.list("thr_cap").map((task) => [task.id, task.crewIds]), [["T1", ["safi-arrange-debts"]], ["T2", ["safi-glass-glitch"]]]);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("Oct 7 repro: in an owner turn, a job another thread asked for names its origin and opens no owner task", async () => {
+  const host = await captainHost();
+  try {
+    await ownerSays(host, "2215", "Five Safi jobs: debts in Arrange home, the glass glitch, ...");
+    const deploy = await dispatch(host, { task: "Deploy and merge #2155 then #2156", taskId: "deploy-2155-2156", title: "Deploy + merge #2155 then #2156", origin: { kind: "thread", threadId: "thr_u6n35axzg5" } });
+    assert.equal(text(deploy), "Reserved crew deploy-2155-2156. Spawn continues in the background.");
+    assert.equal(await board(host), [
+      "📌 Needs you: nothing right now.",
+      "",
+      "✅ Done since you last looked: nothing new.",
+      "",
+      "🔧 In progress: nothing open.",
+    ].join("\n"));
+    await dispatch(host, { task: "Show debts in Arrange home items", taskId: "safi-arrange-debts", title: "Safi: debts in Arrange home items", sourceRefs: ["tg:200:2215"] });
+    assert.equal(await board(host), [
+      "📌 Needs you: nothing right now.",
+      "",
+      "✅ Done since you last looked: nothing new.",
+      "",
+      "🔧 In progress (1)",
+      "- T1 Areliaa · Safi: debts in Arrange home items · 0 min",
+    ].join("\n"));
+    const captainOwn = await dispatch(host, { task: "Clean the host disk", taskId: "disk-clean", origin: { kind: "captain", reason: "routine upkeep" } });
+    assert.equal(text(captainOwn), "Reserved crew disk-clean. Spawn continues in the background.");
   } finally {
     await host.harness.lifecycle.dispose();
   }

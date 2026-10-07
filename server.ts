@@ -9869,11 +9869,15 @@ export default async function plugin(bb: BbPluginApi) {
     overrideOwner: z.boolean().optional()
       .describe("Proceed even though the task targets a PR another captain's crew owns (only on the captain's word)"),
     sourceRefs: z.array(z.string()).optional().describe("Inbound ledger refs this crew answers (tg:chat:msg or bb:thread:row)"),
+    origin: z.discriminatedUnion("kind", [
+      z.object({ kind: z.literal("thread"), threadId: z.string().min(1) }),
+      z.object({ kind: z.literal("captain"), reason: z.string().min(1).max(200) }),
+    ]).optional().describe("Where a job that is not the owner's came from; it opens no owner task"),
     ownerRequestedProvider: z.boolean().optional().describe("The owner named this provider in their own words; keeps acp-antigravity for ship work"),
   });
 
-  const dispatchHelp='bb firstmate dispatch [options] -- "<task>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","sendAt"])+"\n  --task <text>  Repeat for bounded fan-out; --hidden hides the worker.\n  sendAt/--send-at is unsupported; native ship isolation is mandatory.";
-  const queueHelp='bb firstmate queue add [options] -- "<title>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider"},["task","taskId","overrideOwner","sendAt","title","permissionMode","sharedEnv","worktree","visible","ownerRequestedProvider"])+"\n  --detail <full-task>\n  --after <queue-id>  Repeat for dependencies, which remain dispatch gates.\n  --wait-until <ISO-time>  Eligibility only; explicit dispatch required.\n  dispatch preserves the queued shape, mode, contract, dependencies and identity; only provider/model/reasoning/permission/visibility/worktree options override at dispatch.\n  list | next | done <queue-id> | drop <queue-id> | prune | reconcile <exact-id> --project <id> [original options]"+"\nDispatch: bb firstmate queue dispatch <queue-id> [options]\n"+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","taskId","overrideOwner","sendAt","title","shape","mode","deliveryRequirement","ownerRequestedProvider"]);
+  const dispatchHelp='bb firstmate dispatch [options] -- "<task>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","sendAt","origin"])+"\n  --task <text>  Repeat for bounded fan-out; --hidden hides the worker.\n  sendAt/--send-at is unsupported; native ship isolation is mandatory.";
+  const queueHelp='bb firstmate queue add [options] -- "<title>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider"},["task","taskId","overrideOwner","sendAt","title","permissionMode","sharedEnv","worktree","visible","ownerRequestedProvider","origin"])+"\n  --detail <full-task>\n  --after <queue-id>  Repeat for dependencies, which remain dispatch gates.\n  --wait-until <ISO-time>  Eligibility only; explicit dispatch required.\n  dispatch preserves the queued shape, mode, contract, dependencies and identity; only provider/model/reasoning/permission/visibility/worktree options override at dispatch.\n  list | next | done <queue-id> | drop <queue-id> | prune | reconcile <exact-id> --project <id> [original options]"+"\nDispatch: bb firstmate queue dispatch <queue-id> [options]\n"+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","taskId","overrideOwner","sendAt","title","shape","mode","deliveryRequirement","ownerRequestedProvider","origin"]);
   const usage = [
     "Usage:",
     "  bb firstmate guide [--json]",
@@ -10107,10 +10111,10 @@ export default async function plugin(bb: BbPluginApi) {
   registerCaptainTool({
     name: "firstmate_dispatch",
     description:
-      "Dispatch a firstmate-style crewmate: spawns a child BB thread for one task (ship crews get an isolated worktree by default) and records it as a crew.",
+      "Dispatch a firstmate-style crewmate: spawns a child BB thread for one task (ship crews get an isolated worktree by default) and records it as a crew. Each owner job opens its own owner task: pass the owner's sourceRefs, or origin when the job came from another thread or the captain.",
     presentation: { label: { pending: "Dispatching crewmate", completed: "Dispatched crewmate" } },
     parameters: dispatchParams,
-    async execute({ task, taskId, projectId, title, providerId, model, reasoningLevel, permissionMode, shape, mode, worktree, sharedEnv, visible, sendAt, deliveryRequirement, overrideOwner, sourceRefs, ownerRequestedProvider }, ctx) {
+    async execute({ task, taskId, projectId, title, providerId, model, reasoningLevel, permissionMode, shape, mode, worktree, sharedEnv, visible, sendAt, deliveryRequirement, overrideOwner, sourceRefs, origin, ownerRequestedProvider }, ctx) {
       const ctxRecord = asRecord(ctx);
       const resolvedProject =
         projectId ?? (typeof ctxRecord["projectId"] === "string" ? ctxRecord["projectId"] : undefined);
@@ -10121,14 +10125,13 @@ export default async function plugin(bb: BbPluginApi) {
         const key = parseSourceRef(ref);
         return key === null ? [] : [`${key.source === "telegram" ? "tg" : "bb"}:${key.chatId}:${key.messageId}`];
       });
-      if (turnRefs.length > 0 && !passedRefs.some((ref) => turnRefs.includes(ref))) {
-        return toolError(`This turn started from owner message ${turnRefs.join(", ")}. Pass sourceRefs: ${JSON.stringify(turnRefs)} so the owner's task is tracked until it closes.`);
+      if (turnRefs.length > 0 && origin === undefined && !passedRefs.some((ref) => turnRefs.includes(ref))) {
+        return toolError(`This turn started from owner message ${turnRefs.join(", ")}. If this job is the owner's, pass sourceRefs: ${JSON.stringify(turnRefs)}. If it came from elsewhere, pass origin: {"kind":"thread","threadId":"<thread>"} or {"kind":"captain","reason":"<why>"}.`);
       }
       const trackTask = async (crewId: string): Promise<string> => {
-        if (parentThreadId === undefined || passedRefs.length === 0) return "";
-        const owner = passedRefs.map((ref) => parseSourceRef(ref)).map((key) => key === null ? undefined : inboundLedger.get(key)).find((row) => row !== undefined);
+        if (parentThreadId === undefined || origin !== undefined || passedRefs.length === 0) return "";
         const opened = ownerTasks.open({
-          captain: parentThreadId, project: await projectLabel(resolvedProject), title: title ?? owner?.preview ?? task.split("\n")[0]!.slice(0, 120),
+          captain: parentThreadId, project: await projectLabel(resolvedProject), title: title ?? task.split("\n")[0]!.slice(0, 120),
           sourceRefs: passedRefs, crewId, at: Date.now(),
         });
         await refreshOwnerBoard();
@@ -10357,8 +10360,7 @@ export default async function plugin(bb: BbPluginApi) {
       const sentLine = params
         ? `Replied to ${used} via ${channel} with reply_parameters ${JSON.stringify(params.reply_parameters)}.`
         : `Replied to ${used}.`;
-      const task = ownerTasks.findOpenByRef(captain, used);
-      const taskNote = task ? `\nTask ${task.id} stays open (${task.state}): a reply does not close it. Close it with firstmate_task when it is done or dropped.` : "";
+      const taskNote = ownerTasks.openByRef(captain, used).map((task) => `\nTask ${task.id} stays open (${task.state}): a reply does not close it. Close it with firstmate_task when it is done or dropped.`).join("");
       const stillOpen = inboundLedger.listPending(captain);
       return (stillOpen.length === 0 ? `${sentLine} No owner message is waiting.` : `${sentLine}\n${formatOwnerInbox(stillOpen, Date.now())}`) + taskNote;
     },

@@ -110,11 +110,12 @@ export function taskLine(task: OwnerTask, now: number): string {
 }
 
 export type OwnerTasks = {
-  /** Open a task for these owner messages, or add the crew to the open task that already has one of them. */
+  /** Open one task per job. Several tasks may share an owner message; a retried dispatch
+   * (same crew) or a repeated open (same title and message) returns the task it already has. */
   open(input: NewOwnerTask): OwnerTask;
   get(id: string): OwnerTask | undefined;
   list(captain: string, scope?: { includeClosed?: boolean }): OwnerTask[];
-  findOpenByRef(captain: string, ref: string): OwnerTask | undefined;
+  openByRef(captain: string, ref: string): OwnerTask[];
   move(id: string, captain: string, move: TaskMove, at: number): OwnerTask;
   linkPr(id: string, captain: string, pr: string, at: number): OwnerTask;
   /** Move each open task to the state its pull requests prove. Returns the tasks that changed. */
@@ -143,8 +144,8 @@ export function createOwnerTasks(db: Database): OwnerTasks {
     return rows.map((row) => JSON.parse(row.record) as OwnerTask);
   }
 
-  function findOpenByRef(captain: string, ref: string): OwnerTask | undefined {
-    return list(captain).find((task) => task.sourceRefs.includes(ref));
+  function openByRef(captain: string, ref: string): OwnerTask[] {
+    return list(captain).filter((task) => task.sourceRefs.includes(ref));
   }
 
   function owned(id: string, captain: string): OwnerTask {
@@ -156,13 +157,15 @@ export function createOwnerTasks(db: Database): OwnerTasks {
   return {
     open(input) {
       return db.transaction(() => {
-        const existing = input.sourceRefs.map((ref) => findOpenByRef(input.captain, ref)).find(Boolean);
+        const title = input.title.replace(/\s+/g, " ").trim().slice(0, 200);
+        const existing = input.crewId
+          ? list(input.captain, { includeClosed: true }).find((task) => task.crewIds.includes(input.crewId!))
+          : list(input.captain).find((task) => task.crewIds.length === 0 && task.title === title && task.sourceRefs.some((ref) => input.sourceRefs.includes(ref)));
         if (existing) {
-          const crewIds = input.crewId && !existing.crewIds.includes(input.crewId) ? [...existing.crewIds, input.crewId] : existing.crewIds;
           const sourceRefs = [...new Set([...existing.sourceRefs, ...input.sourceRefs])];
           const prs = [...new Set([...existing.prs, ...(input.prs ?? [])])];
-          if (crewIds === existing.crewIds && sourceRefs.length === existing.sourceRefs.length && prs.length === existing.prs.length) return existing;
-          return save({ ...existing, crewIds, sourceRefs, prs, state: existing.state === "ready" ? "working" : existing.state, updatedAt: input.at });
+          if (sourceRefs.length === existing.sourceRefs.length && prs.length === existing.prs.length) return existing;
+          return save({ ...existing, sourceRefs, prs, updatedAt: input.at });
         }
         const last = db.prepare("SELECT max(seq) AS seq FROM owner_task").get() as { seq: number | null };
         const seq = (last.seq ?? 0) + 1;
@@ -170,7 +173,7 @@ export function createOwnerTasks(db: Database): OwnerTasks {
           id: `T${seq}`,
           captain: input.captain,
           project: input.project,
-          title: input.title.replace(/\s+/g, " ").trim().slice(0, 200),
+          title,
           sourceRefs: [...new Set(input.sourceRefs)],
           state: "working",
           prs: [...new Set(input.prs ?? [])],
@@ -185,7 +188,7 @@ export function createOwnerTasks(db: Database): OwnerTasks {
     },
     get,
     list,
-    findOpenByRef,
+    openByRef,
     move(id, captain, move, at) {
       return db.transaction(() => {
         const task = owned(id, captain);
