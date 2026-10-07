@@ -9812,6 +9812,37 @@ test("bearings counts the real backlog, and queue dispatch adopts a hand-filed n
   }
 });
 
+test("queue dispatch without projectId launches a queued item in its own project, not the captain's", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate", agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", queueOwner: "real", fmHostId: "host_1" },
+  });
+  await plugin(host.bb);
+  try {
+    stubRoutedHost(host, (wrapped) => {
+      const cmd = unwrapHostCommand(wrapped);
+      if (cmd.includes("fm-tasks-axi.sh") && cmd.includes("'show'")) {
+        return { payload: "task:\n  id: ra-2\n  title: RunAnts PR 2\n  state: queued\n  kind: ship\n" };
+      }
+      return {};
+    });
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew" }));
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "starting", environmentId: "env_wt" }));
+    host.harness.sdk.stub("environments.get", async () => ({ id: "env_wt", hostId: "host_1", path: "/wt", isWorktree: true, status: "ready" }));
+    const queue = agentTool(host, "firstmate_queue");
+    const captainCtx = { threadId: "thr_cap", projectId: "proj_cyndra" } as never;
+    const added = toolText(await queue.execute({ action: "add", title: "RunAnts PR 2", projectId: "proj_runants" }, captainCtx));
+    const id = /Queued (\S+)/.exec(added)![1]!;
+    const dispatched = await queue.execute({ action: "dispatch", queueId: id }, captainCtx);
+    assert.ok(!isToolError(dispatched), toolText(dispatched));
+    const spawn = host.harness.sdk.callsTo("threads.spawn")[0]![0] as { projectId?: string };
+    assert.equal(spawn.projectId, "proj_runants");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("queue dispatch of a native row reads the FULL task text, not the truncated list title", async () => {
   const host = createFakePluginHost({
     pluginId: "firstmate", agentSkillIds: SKILLS,
