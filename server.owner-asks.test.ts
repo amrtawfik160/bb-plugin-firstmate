@@ -32,12 +32,20 @@ test("automatic ask RPCs validate the captain, reuse explicit records and close 
     assert.deepEqual(await host.harness.behavior.callRpc("linkAsk", { threadId: "thr_other", id: "aexisting", messageUrl: "https://t.me/c/200/3001" }), { ok: false });
     assert.deepEqual(await host.harness.behavior.callRpc("linkAsk", { threadId: "thr_cap", id: "aexisting", messageUrl: "https://t.me/c/200/3001" }), { ok: true });
     const board = await host.harness.behavior.callRpc("telegramCommand", { threadId: "thr_cap", command: "board" }) as { text: string };
-    assert.equal(board.text, "📌 Waiting on you (1)\n\n1. ✅ Publish Safi? (0 min, ask aexisting) https://t.me/c/200/3001\n\nTap a question's button or reply to it to answer.");
+    assert.equal(board.text, [
+      "📌 Needs you (1)",
+      "1. ✅ Publish Safi? (0 min, ask aexisting) https://t.me/c/200/3001",
+      "Tap a question's button or reply to it to answer.",
+      "",
+      "✅ Done since you last looked: nothing new.",
+      "",
+      "🔧 In progress: nothing open.",
+    ].join("\n"));
     assert.deepEqual(await host.harness.behavior.callRpc("resolveAsk", { threadId: "thr_other", id: "aexisting", resolution: "Publish" }), { ok: false });
     assert.deepEqual(await host.harness.behavior.callRpc("resolveAsk", { threadId: "thr_cap", id: "aexisting", resolution: "Publish" }), { ok: true });
     assert.equal(asks.get("aexisting")?.resolution, "Publish");
     assert.deepEqual(await host.harness.behavior.callRpc("autoAsk", input), { id: "aexisting", created: false, state: "answered" });
-    assert.deepEqual(await host.harness.behavior.callRpc("telegramCommand", { threadId: "thr_cap", command: "board" }), { text: "📌 Nothing needs you right now.", away: false });
+    assert.deepEqual(await host.harness.behavior.callRpc("telegramCommand", { threadId: "thr_cap", command: "board" }), { text: "📌 Needs you: nothing right now.\n\n✅ Done since you last looked: nothing new.\n\n🔧 In progress: nothing open.", away: false });
     await assert.rejects(host.harness.behavior.callRpc("autoAsk", { ...input, threadId: "thr_other" }), /Automatic asks require a Firstmate captain thread/);
     const sent = host.harness.sdk.callsTo("plugins.callRpc").map((call) => call[0] as { method: string });
     assert.equal(sent.filter((call) => call.method === "ask").length, 0);

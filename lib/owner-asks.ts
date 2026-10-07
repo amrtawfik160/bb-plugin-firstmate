@@ -54,7 +54,7 @@ export const ASK_KIND_TITLE: Record<AskKind, string> = {
   approval: "✅ Approval needed",
 };
 
-const ASK_KIND_EMOJI: Record<AskKind, string> = { question: "❓", blocker: "⛔", approval: "✅" };
+export const ASK_KIND_EMOJI: Record<AskKind, string> = { question: "❓", blocker: "⛔", approval: "✅" };
 
 export function newAskId(): string {
   return `a${randomInt(0, 36 ** 6).toString(36).padStart(6, "0")}`;
@@ -81,9 +81,9 @@ export function formatAge(ms: number): string {
   return `${Math.floor(hours / 24)} d`;
 }
 
-function clip(text: string, max: number): string {
+export function clip(text: string, max: number): string {
   const flat = text.replace(/\s+/g, " ").trim();
-  return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
+  return flat.length <= max ? flat : `${flat.slice(0, max - 1).trimEnd()}…`;
 }
 
 /** The question card text the connector sends to the owner. */
@@ -94,50 +94,6 @@ export function formatAskCard(ask: Pick<OwnerAsk, "kind" | "text" | "options" | 
     ...(label !== null && ask.defaultAt !== null ? [`If no answer by ${formatUtcTime(ask.defaultAt)}, I'll go with ${label}.`] : []),
   ];
   return [ASK_KIND_TITLE[ask.kind], "", ask.text.trim(), ...(footer.length > 0 ? ["", ...footer] : [])].join("\n");
-}
-
-export const BOARD_MAX_LINES = 15;
-export const BOARD_MAX_CHARS = 3500;
-export const BOARD_EMPTY = "📌 Nothing needs you right now.";
-export const BOARD_ANSWER_HINT = "Tap a question's button or reply to it to answer.";
-
-export const BOARD_MAX_PRS = 10;
-
-/** One open pull request line on the board; `state` is already plain words. */
-export type BoardPr = { ref: string; title?: string; state: string; openedAt: number };
-
-function prSection(prs: readonly BoardPr[]): string {
-  if (prs.length === 0) return "";
-  const sorted = [...prs].sort((a, b) => a.openedAt - b.openedAt || a.ref.localeCompare(b.ref));
-  const lines = sorted.slice(0, BOARD_MAX_PRS).map((pr) => `- ${pr.ref}${pr.title ? ` ${clip(pr.title, 70)}` : ""} — ${pr.state}`);
-  if (sorted.length > BOARD_MAX_PRS) lines.push(`…and ${sorted.length - BOARD_MAX_PRS} more`);
-  return [`Open pull requests (${prs.length}):`, ...lines].join("\n");
-}
-
-/** Plain text for the Telegram board: open asks oldest first, then crew items waiting
- * for the owner, then the owner's open tasks, then the captain's open pull requests.
- * The header counts only items waiting on the owner. */
-export function formatBoard(input: { asks: readonly OwnerAsk[]; calls: readonly string[]; prs?: readonly BoardPr[]; tasks?: string; now: number }): string {
-  const asks = [...input.asks].filter((ask) => ask.state === "open").sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
-  const items = [
-    ...asks.map((ask) => {
-      const label = recommendedLabel(ask);
-      return `${ASK_KIND_EMOJI[ask.kind]} ${clip(ask.text, 140)} (${formatAge(input.now - ask.createdAt)}, ask ${ask.id})`
-        + (label !== null ? ` Recommended: ${label}.` : "")
-        + (ask.defaultAt !== null && label !== null ? ` Auto at ${formatUtcTime(ask.defaultAt)}.` : "")
-        + (ask.messageUrl ? ` ${ask.messageUrl}` : "");
-    }),
-    ...input.calls.map((call) => clip(call, 160)),
-  ];
-  const after = [input.tasks ?? "", prSection(input.prs ?? [])].filter((part) => part !== "").map((part) => `\n\n${part}`).join("");
-  if (items.length === 0) return `${BOARD_EMPTY}${after}`;
-  const lines = items.slice(0, BOARD_MAX_LINES).map((item, index) => `${index + 1}. ${item}`);
-  if (items.length > BOARD_MAX_LINES) lines.push(`…and ${items.length - BOARD_MAX_LINES} more`);
-  const tail = (asks.length > 0 ? `\n\n${BOARD_ANSWER_HINT}` : "") + after;
-  const head = `📌 Waiting on you (${items.length})\n\n`;
-  const body = lines.join("\n");
-  const room = BOARD_MAX_CHARS - head.length - tail.length;
-  return `${head}${body.length <= room ? body : `${body.slice(0, room - 1)}…`}${tail}`;
 }
 
 /** `ask:<id>` is the connector's outbox source id for an ask card; replies and taps carry it back. */

@@ -71,8 +71,9 @@ import { honestIdleVerdictPresentation, interruptIsStopped, readyClaim } from ".
 import { ACK_TEXT, ackEligible, createInboundLedger, expandTelegramRows, formatOwnerInbox, inboundKey, quotedReplyKind, sweeperSteerText, type InboundRow } from "./lib/inbound-ledger.ts";
 import { inboundHookDecision } from "./lib/inbound-dispatch.ts";
 import { formatWorkersForTelegram } from "./lib/telegram-commands.ts";
-import { createOwnerTasks, taskLine, taskSection, type OwnerTask, type TaskState } from "./lib/owner-tasks.ts";
-import { askIdFromSourceEventId, createOwnerAsks, formatAskCard, formatBoard, formatUtcTime, mayDefault, recommendedLabel, type AskKind } from "./lib/owner-asks.ts";
+import { formatBoard, formatDigest, type BoardInput } from "./lib/owner-board.ts";
+import { createOwnerTasks, taskLine, type OwnerTask, type TaskState } from "./lib/owner-tasks.ts";
+import { askIdFromSourceEventId, createOwnerAsks, formatAskCard, formatUtcTime, mayDefault, recommendedLabel, type AskKind } from "./lib/owner-asks.ts";
 import { DEFAULT_RELIABILITY_FLAGS, reliabilityFlagsFromSettings } from "./lib/reliability-flags.ts";
 import { sanitizeSettingValue } from "./lib/settings-schema.ts";
 import { coalesceBatches, parseConnectorHeader, parseInboundTelegram, parseSourceRef, parseTelegramSubmission, stripTelegramEnvelope, telegramReplyParameters, telegramSourceRef } from "./lib/telegram-envelope.ts";
@@ -81,7 +82,7 @@ import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRe
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
 import { optionHelp } from "./lib/cli-help.ts";
 import { AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython } from "./lib/native-policy.ts";
-import { boardPullRequests, createDeliveries, LOST_OWNER_RECHECK_MS, canonicalPr, deliveryLine, parseForge, type DeliveryRecord } from "./lib/pr-delivery.ts";
+import { createDeliveries, LOST_OWNER_RECHECK_MS, canonicalPr, deliveryLine, parseForge, type DeliveryRecord } from "./lib/pr-delivery.ts";
 import { captureHostCommand, decodeHostCapture } from "./lib/host-capture.ts";
 import { selectExecution, validateLaunchCapabilities } from "./lib/execution-selection.ts";
 import { crewSkillBlock, redactSecrets } from "./lib/crew-contract.ts";
@@ -11251,7 +11252,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (ok) await refreshOwnerBoard();
       return { ok };
     },
-    async telegramCommand({ command, threadId }) {
+    async telegramCommand({ command, threadId, since }) {
       if (!(await isCaptainThread(threadId))) return { text: "The Telegram captain is not a Firstmate captain thread." };
       if (command === "inbox") {
         if ((await reliabilityFlags()).inboundLedger === "off") return { text: "Message tracking is off." };
@@ -11260,11 +11261,13 @@ export default async function plugin(bb: BbPluginApi) {
       const snapshot = (await settings.get()).fmHome.trim() !== ""
         ? await fleetSnapshots.read(threadId, () => nativeBearingsSnapshot(threadId, snapshotAbort.signal), 15_000)
         : await bearingsSnapshot(threadId);
-      if (command === "board") {
-        const prs = boardPullRequests(deliveries.list({ owner: threadId, limit: 100 }));
+      if (command === "board" || command === "digest") {
         const now = Date.now();
-        const tasks = reconcileTasks(threadId, now);
-        return { text: formatBoard({ asks: ownerAsks.listOpen(threadId), calls: snapshot.rpc.ownerCalls, prs, tasks: taskSection(tasks, now), now }), away: snapshot.rpc.afk };
+        const from = since ?? now - (command === "board" ? 24 : 12) * 60 * 60_000;
+        reconcileTasks(threadId, now);
+        const records = new Map([...deliveries.list({ owner: threadId, limit: 100 }), ...deliveries.mergedSince(threadId, from)].map((r) => [r.id, r]));
+        const input: BoardInput = { asks: ownerAsks.listOpen(threadId), calls: snapshot.rpc.ownerCalls, tasks: ownerTasks.list(threadId, { includeClosed: true }), records: [...records.values()], since: from, now };
+        return command === "board" ? { text: formatBoard(input), away: snapshot.rpc.afk } : { text: formatDigest(input) };
       }
       return { text: formatWorkersForTelegram(snapshot.rpc) };
     },

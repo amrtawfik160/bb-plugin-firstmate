@@ -106,34 +106,56 @@ and `delegated` items with their crew.
 
 ## Owner commands
 
-The connector answers `/inbox`, `/workers` and its board itself by calling Firstmate:
+The connector answers `/inbox`, `/workers`, its board and its digest itself by calling Firstmate:
 
 ```
 bb.sdk.plugins.callRpc({
   pluginId: "firstmate",
   method: "telegramCommand",
-  input: { command: "inbox" | "workers" | "board", threadId: <bound captain> },
+  input: { command: "inbox" | "workers" | "board" | "digest", threadId: <bound captain>, since?: <ms> },
   outputSchema: { text: string, away?: boolean },
 })
 ```
 
+`since` is when the owner last looked. When it is missing, `board` uses 24
+hours ago and `digest` uses 12 hours ago.
+
 `away` is set only for `board`. It is the captain's `/afk` posture, the same
 flag the fleet snapshot exposes as `afk`. The board text is plain text, at
-most 3500 characters:
+most 3900 characters, in three sections:
 
 ```
-📌 Waiting on you (<N>)
-
+📌 Needs you (<N>)
 1. <❓|⛔|✅> <question, first 140 chars> (<age>, ask <id>) Recommended: <label>. Auto at <HH:MM UTC>.
 2. <crew item from the fleet "Waiting for you" list, first 160 chars>
-…and <k> more
-
+3. T15 <project> · <task title> · ready for you · <age> · <repo>#<n> ready to merge
+4. PR <repo>#<n> <PR title> · ready to merge
 Tap a question's button or reply to it to answer.
+
+✅ Done since you last looked (<N>)
+- T7 <project> · <task title> · <age> · merged
+- PR <repo>#<n> <PR title> · merged
+
+🔧 In progress (<N>)
+- T13 <project> · <task title> · <age> · <repo>#<n> on hold (do not merge) · stale 2 d
+Other PRs: <repo>#<n> <state>; <repo>#<n> <state>
 ```
 
-Open asks come first, oldest first, then crew items. The list stops at 15
-lines. The last line appears only when an ask is open. With nothing waiting
-the text is `📌 Nothing needs you right now.`
+Needs you lists open asks oldest first, then crew items, then tasks that need
+the owner or are ready, then pull requests waiting on the owner that no task
+owns. It stops at 15 lines. The hint line appears only when an ask is open.
+Done lists tasks merged, live, done or dropped since `since`, then merged pull
+requests no task owns, newest first, at most 8 lines. In progress lists
+working tasks with their open pull requests, then one line for every other
+open pull request. An empty section is one line, for example
+`📌 Needs you: nothing right now.` When the board is too long, lines leave
+from the end of In progress first, then Done, then Needs you, and an
+`…and <k> more` line takes their place. Headers always show the true counts.
+
+The digest uses the same lines without emoji: `Needs you (<N>)` (at most 5),
+`Done (<N>)` (at most 8), and `Stale (<N>): T1, T2` for open tasks with no
+update for 24 hours. It leaves out empty blocks and is the empty string when
+there is nothing to report.
 
 `/ahoy`, `/bearings`, `/afk`, `/back`, `/quiet` and `/stow` reach the captain as an
 owner message that names the skill to run. All of them appear in Telegram's "/" menu.

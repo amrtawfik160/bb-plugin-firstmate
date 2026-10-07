@@ -683,10 +683,10 @@ async function boardHost() {
 }
 const board = (host: Host) => host.harness.behavior.callRpc("telegramCommand", { command: "board", threadId: "thr_cap" }) as Promise<{ text: string; away?: boolean }>;
 
-test("telegramCommand board says nothing is waiting and reports the captain is not away", async () => {
+test("telegramCommand board says nothing needs the owner and reports the captain is not away", async () => {
   const host = await boardHost();
   try {
-    assert.deepEqual(await board(host), { text: "📌 Nothing needs you right now.", away: false });
+    assert.deepEqual(await board(host), { text: "📌 Needs you: nothing right now.\n\n✅ Done since you last looked: nothing new.\n\n🔧 In progress: nothing open.", away: false });
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -705,13 +705,15 @@ test("telegramCommand board lists open asks then crew items, and reports /afk as
     assert.deepEqual(await board(host), {
       away: true,
       text: [
-        "📌 Waiting on you (3)",
-        "",
+        "📌 Needs you (3)",
         "1. ⛔ Need the Stripe key. (5 min, ask a000001)",
         "2. ❓ Dark mode? (5 min, ask a000002) Recommended: Yes. Auto at 14:30 UTC.",
         "3. Needs captain: Telegram threaded replies are off in the Telegram connector, but Firstmate's telegramThreading flag is on, so replies arrive unthreaded. Turn th…",
-        "",
         "Tap a question's button or reply to it to answer.",
+        "",
+        "✅ Done since you last looked: nothing new.",
+        "",
+        "🔧 In progress: nothing open.",
       ].join("\n"),
     });
   } finally {
@@ -729,12 +731,14 @@ test("telegramCommand board caps the list at 15 lines", async () => {
     assert.deepEqual(await board(host), {
       away: false,
       text: [
-        "📌 Waiting on you (17)",
-        "",
+        "📌 Needs you (17)",
         ...Array.from({ length: 15 }, (_, i) => `${i + 1}. ❓ Question ${i + 1}? (5 min, ask a0000${String(i + 1).padStart(2, "0")})`),
         "…and 2 more",
-        "",
         "Tap a question's button or reply to it to answer.",
+        "",
+        "✅ Done since you last looked: nothing new.",
+        "",
+        "🔧 In progress: nothing open.",
       ].join("\n"),
     });
   } finally {
@@ -757,12 +761,13 @@ test("telegramCommand board keeps decisions, drops launch bookkeeping, and lists
     assert.deepEqual(await board(host), {
       away: false,
       text: [
-        "📌 Waiting on you (1)",
-        "",
+        "📌 Needs you (1)",
         '1. ? d1 :: Use Postgres? (yes / no) — answer: decide answer d1 -- "<answer>"',
         "",
-        "Open pull requests (1):",
-        "- acme/repo#7 Fix the login form — checks running",
+        "✅ Done since you last looked: nothing new.",
+        "",
+        "🔧 In progress: nothing open.",
+        "Other PRs: repo#7 checks running",
       ].join("\n"),
     });
   } finally {

@@ -1,4 +1,4 @@
-import { formatAge } from "./owner-asks.ts";
+import { clip, formatAge } from "./owner-asks.ts";
 import type { DeliveryRecord } from "./pr-delivery.ts";
 
 /** One piece of work the owner asked for, tracked until it closes. A reply to the owner
@@ -103,30 +103,10 @@ const STATE_WORDS: Record<TaskState, string> = {
   dropped: "dropped",
 };
 
-export const BOARD_MAX_TASKS = 15;
-
-function clip(text: string, max: number): string {
-  const flat = text.replace(/\s+/g, " ").trim();
-  return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
-}
-
 export function taskLine(task: OwnerTask, now: number): string {
   const stale = now - task.updatedAt >= STALE_TASK_MS ? ` · stale, no update for ${formatAge(now - task.updatedAt)}` : "";
   const project = task.project ? ` · ${task.project}` : "";
   return `- ${task.id}${project} · ${clip(task.title, 70)} — ${STATE_WORDS[task.state]}, ${formatAge(now - task.createdAt)}${stale}${task.backfilled ? " · backfilled" : ""}`;
-}
-
-/** The board's "Your tasks in progress" section; empty when nothing is open. */
-export function taskSection(tasks: readonly OwnerTask[], now: number): string {
-  const open = tasks.filter(isOpenTask).sort((a, b) => a.createdAt - b.createdAt || taskNumber(a.id) - taskNumber(b.id));
-  if (open.length === 0) return "";
-  const lines = open.slice(0, BOARD_MAX_TASKS).map((task) => taskLine(task, now));
-  if (open.length > BOARD_MAX_TASKS) lines.push(`…and ${open.length - BOARD_MAX_TASKS} more`);
-  return [`Your tasks in progress (${open.length}):`, ...lines].join("\n");
-}
-
-function taskNumber(id: string): number {
-  return Number(id.slice(1)) || 0;
 }
 
 export type OwnerTasks = {
