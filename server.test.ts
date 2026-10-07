@@ -3526,6 +3526,26 @@ test("firstmate_crew folds the full status protocol from crew output", async () 
   }
 });
 
+test("crew output relayed to the captain hides secret values but keeps variable names", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle" }));
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+    host.harness.sdk.stub("threads.output", async () => ({
+      output: "needs-decision [key=env]: CONVEX_DEPLOY_KEY=prod:happy-otter-123|eyJ2MiI6ImFiY2RlZjAxMjM0NTY3ODkifQ== failed; DB_PASSWORD: hunter2-Secret! and token 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    }));
+    const result = await host.harness.behavior.runCli(["crew", "c1"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /CONVEX_DEPLOY_KEY=\[redacted\]/);
+    assert.match(result.stdout, /DB_PASSWORD: \[redacted\]/);
+    for (const value of ["happy-otter-123", "eyJ2MiI6", "hunter2", "9f86d081884c7d659a2f"]) assert.ok(!result.stdout.includes(value), `${value} leaked: ${result.stdout}`);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 // Wiring regression: the fold's kind must be resolved from the crew's on-host
 // state/<id>.meta the way native `_fm_status_kind` does — NOT hardcoded "ship".
 // These drive the real host-status path (fmHome set) with a stream that ends
@@ -9710,9 +9730,54 @@ test("real dispatch of headed task text fills intent and spec from the task's ow
     const fill = seen.find((c) => c.includes("FM_INTENT="))!;
     const b64 = (name: string) => Buffer.from(new RegExp(`${name}=([A-Za-z0-9+/=]+)`).exec(fill)![1]!, "base64").toString("utf8");
     assert.equal(b64("FM_INTENT"), "fix the login redirect");
-    assert.equal(b64("FM_TASK_OWN_SPEC"), "Touch only auth.ts.");
+    assert.ok(b64("FM_TASK_OWN_SPEC").startsWith("Touch only auth.ts.\n\n### Skills"), b64("FM_TASK_OWN_SPEC"));
     const add = seen.find((c) => c.includes("fm-tasks-axi.sh") && c.includes("'add'"))!;
     assert.ok(add.includes("fix the login redirect"), add);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("every real brief names skill-routing, poteto mode and the playbook that matches the task", async () => {
+  for (const [args, playbook, specStart] of [
+    [["--", "fix the flaky login redirect"], "bug-fix.md", "Implement the captain's intent"],
+    [["--", "Add a CSV export to the reports page"], "feature.md", "Implement the captain's intent"],
+    [["--shape", "scout", "--", "Fix nothing; find why Telegram delivery stalls"], "investigation.md", "Investigate the captain's intent"],
+    [["--", "## Captain's intent\nAdd CSV export\n\n## Firstmate spec\nTouch only auth.ts."], "feature.md", "Touch only auth.ts."],
+  ] as const) {
+    const host = realHost();
+    await plugin(host.bb);
+    try {
+      const { seen } = stubRealTransportBacklog(host, { threadIdAfterSpawn: "thr_real" });
+      const result = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", ...args], { projectId: "proj_1" });
+      assert.equal(result.exitCode, 0, result.stderr);
+      const fill = seen.find((c) => c.includes("FM_INTENT="))!;
+      const encoded = /FM_TASK_OWN_SPEC=([A-Za-z0-9+/=]+)/.exec(fill);
+      assert.ok(encoded, `no Firstmate spec for ${args.join(" ")}`);
+      const spec = Buffer.from(encoded[1]!, "base64").toString("utf8");
+      assert.ok(spec.startsWith(specStart), spec);
+      assert.match(spec, /skill-routing/);
+      assert.match(spec, /poteto-mode\/SKILL\.md/);
+      assert.ok(spec.includes(`poteto-mode/playbooks/${playbook}`), spec);
+    } finally {
+      await host.harness.lifecycle.dispose();
+    }
+  }
+});
+
+test("a BB-transport crew prompt also names skill-routing, poteto mode and the matched playbook", async () => {
+  const host = await load();
+  try {
+    host.harness.sdk.stub("environments.list", async () => [{ hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" }]);
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew" }));
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "starting" }));
+    const result = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--", "fix the crash on save"], { projectId: "proj_1" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    const spawn = host.harness.sdk.callsTo("threads.spawn")[0]![0] as { prompt: string };
+    assert.match(spawn.prompt, /skill-routing/);
+    assert.match(spawn.prompt, /poteto-mode\/SKILL\.md/);
+    assert.match(spawn.prompt, /poteto-mode\/playbooks\/bug-fix\.md/);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -9726,8 +9791,9 @@ test("report-only dispatch fills an investigation specification without implemen
     const result = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--shape", "scout", "--", "Investigate missing Telegram delivery and report evidence."], { projectId: "proj_1" });
     assert.equal(result.exitCode, 0, result.stderr);
     const fill = seen.find((command) => command.includes("FM_INTENT="))!;
-    assert.doesNotMatch(fill, /Implement the captain|Small diff, own branch/);
-    assert.match(fill, /written report/);
+    const spec = Buffer.from(/FM_TASK_OWN_SPEC=([A-Za-z0-9+/=]+)/.exec(fill)![1]!, "base64").toString("utf8");
+    assert.doesNotMatch(spec, /Implement the captain|Small diff, own branch/);
+    assert.match(spec, /written report/);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -9750,6 +9816,39 @@ test("a refused brief removes the backlog row its own dispatch created", async (
     assert.match(result.stderr, /backlog row .* was removed/);
   } finally {
     await host.harness.lifecycle.dispose();
+  }
+});
+
+test("ship work requested on acp-antigravity runs on the project default unless the owner asked for it", async () => {
+  for (const [input, settings, expected] of [
+    [{ task: "fix login" }, {}, undefined],
+    [{ task: "fix login", ownerRequestedProvider: true }, {}, "acp-antigravity"],
+    [{ task: "why does login fail", shape: "scout" }, {}, "acp-antigravity"],
+    [{ task: "fix login" }, { shipAntigravityGuard: false }, "acp-antigravity"],
+  ] as const) {
+    const host = await load();
+    try {
+      await host.harness.behavior.setSettings(settings);
+      host.harness.sdk.stub("environments.list", async () => [{ hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" }]);
+      host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew" }));
+      host.harness.sdk.stub("threads.list", async () => []);
+      host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "starting" }));
+      const result = await agentTool(host, "firstmate_dispatch").execute(
+        { ...input, projectId: "proj_1", providerId: "acp-antigravity", model: "gemini-3.8-flash" },
+        { projectId: "proj_1" } as never,
+      );
+      assert.ok(!isToolError(result), toolText(result));
+      const spawn = host.harness.sdk.callsTo("threads.spawn")[0]![0] as { providerId?: string; model?: string };
+      assert.equal(spawn.providerId, expected, JSON.stringify(input));
+      if (expected === undefined) {
+        assert.equal(spawn.model, undefined);
+        assert.match(toolText(result), /acp-antigravity is not used for ship work.*project default/);
+      } else {
+        assert.doesNotMatch(toolText(result), /not used for ship work/);
+      }
+    } finally {
+      await host.harness.lifecycle.dispose();
+    }
   }
 });
 
@@ -9807,6 +9906,37 @@ test("bearings counts the real backlog, and queue dispatch adopts a hand-filed n
     const spawn = host.harness.sdk.callsTo("threads.spawn")[0]![0] as { title?: string };
     assert.equal(spawn.title, "Ship · Build the export · oq-a");
     assert.ok(routed.seen.map(unwrapHostCommand).some((c) => c.includes("fm-tasks-axi.sh") && c.includes("'start'") && c.includes("'oq-a'")));
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("queue dispatch without projectId launches a queued item in its own project, not the captain's", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate", agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", queueOwner: "real", fmHostId: "host_1" },
+  });
+  await plugin(host.bb);
+  try {
+    stubRoutedHost(host, (wrapped) => {
+      const cmd = unwrapHostCommand(wrapped);
+      if (cmd.includes("fm-tasks-axi.sh") && cmd.includes("'show'")) {
+        return { payload: "task:\n  id: ra-2\n  title: RunAnts PR 2\n  state: queued\n  kind: ship\n" };
+      }
+      return {};
+    });
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew" }));
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "starting", environmentId: "env_wt" }));
+    host.harness.sdk.stub("environments.get", async () => ({ id: "env_wt", hostId: "host_1", path: "/wt", isWorktree: true, status: "ready" }));
+    const queue = agentTool(host, "firstmate_queue");
+    const captainCtx = { threadId: "thr_cap", projectId: "proj_cyndra" } as never;
+    const added = toolText(await queue.execute({ action: "add", title: "RunAnts PR 2", projectId: "proj_runants" }, captainCtx));
+    const id = /Queued (\S+)/.exec(added)![1]!;
+    const dispatched = await queue.execute({ action: "dispatch", queueId: id }, captainCtx);
+    assert.ok(!isToolError(dispatched), toolText(dispatched));
+    const spawn = host.harness.sdk.callsTo("threads.spawn")[0]![0] as { projectId?: string };
+    assert.equal(spawn.projectId, "proj_runants");
   } finally {
     await host.harness.lifecycle.dispose();
   }

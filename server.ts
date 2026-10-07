@@ -80,6 +80,7 @@ import { AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython } from 
 import { boardPullRequests, createDeliveries, LOST_OWNER_RECHECK_MS, canonicalPr, deliveryLine, parseForge, type DeliveryRecord } from "./lib/pr-delivery.ts";
 import { captureHostCommand, decodeHostCapture } from "./lib/host-capture.ts";
 import { selectExecution, validateLaunchCapabilities } from "./lib/execution-selection.ts";
+import { crewSkillBlock, redactSecrets } from "./lib/crew-contract.ts";
 import { rpcContract } from "./rpc.ts";
 import {
   UPSTREAM_FIRSTMATE_SHA,
@@ -1763,6 +1764,11 @@ export default async function plugin(bb: BbPluginApi) {
       label: "Default crew provider id (blank = BB resolves)",
       default: "",
     },
+    shipAntigravityGuard: {
+      type: "boolean",
+      label: "Run ship (PR) work requested on acp-antigravity on the project default provider instead, unless the owner asked for antigravity",
+      default: true,
+    },
     defaultPermissionMode: {
       type: "select",
       label: "Default crew permission mode",
@@ -3209,7 +3215,7 @@ export default async function plugin(bb: BbPluginApi) {
     try {
       const result = await raceAbort(bb.sdk.threads.output({ threadId: crew.threadId }), signal, STUCK_HOST_CALL_MS);
       const text = asRecord(result)["output"];
-      return typeof text === "string" ? truncate(text, max) : null;
+      return typeof text === "string" ? truncate(redactSecrets(text), max) : null;
     } catch {
       return null;
     }
@@ -3264,7 +3270,7 @@ export default async function plugin(bb: BbPluginApi) {
       const result = await runOnHost(hostId,
         `if [ -L ${path} ] || [ ! -e ${path} ]; then exit 3; elif [ -f ${path} ] && [ -r ${path} ]; then cat -- ${path}; else echo "unreadable native status" >&2; exit 1; fi`, 15_000);
       if (result.exitCode !== 0 && result.exitCode !== 3) throw new Error(`Native status read failed crew=${crew.id}: ${result.output || `exit ${result.exitCode}`}`);
-      return { lines: result.exitCode === 3 ? [] : result.output.split(/\r?\n/), kind: await foldKind(crew, hostId) };
+      return { lines: result.exitCode === 3 ? [] : redactSecrets(result.output).split(/\r?\n/), kind: await foldKind(crew, hostId) };
     }
     return { lines: statusLinesFrom(output === undefined ? await crewOutput(crew) : output),
       kind: isSecondmateRoute(crew) ? "secondmate" : crew.shape };
@@ -3428,9 +3434,9 @@ export default async function plugin(bb: BbPluginApi) {
       ? "Investigate the captain's intent within its stated scope. Deliver a written report with commands, outcomes, revision, limits, and recommendations. Distinguish observed behavior from inference; follow the report-only completion contract."
       : "Implement the captain's intent above exactly; do not widen scope. Small diff, own branch, deliver per the mode contract, then report DONE/BLOCKED/FAILED.";
     // Captain-authored specifications retain precedence over the role default.
-    const specEnv = sections.spec === null
-      ? ""
-      : `FM_TASK_OWN_SPEC=${Buffer.from(sections.spec.slice(0, 3000), "utf8").toString("base64")} `;
+    // The skills block follows the cap so a long specification never cuts it off.
+    const spec = `${(sections.spec ?? defaultSpec).slice(0, 3000)}\n\n${crewSkillBlock(crew.shape, task)}`;
+    const specEnv = `FM_TASK_OWN_SPEC=${Buffer.from(spec, "utf8").toString("base64")} `;
     // fm-brief refuses --mode on scouts and requires it on ships; a ship's posture
     // is exactly the delivery mode the brief records.
     const scaffold =
@@ -3440,7 +3446,7 @@ export default async function plugin(bb: BbPluginApi) {
     const py =
       "import base64,os,sys;p=sys.argv[1];" +
       'intent=base64.b64decode(os.environ["FM_INTENT"]).decode();' +
-      'spec=base64.b64decode(os.environ["FM_TASK_OWN_SPEC"]).decode() if "FM_TASK_OWN_SPEC" in os.environ else ' + JSON.stringify(defaultSpec) + ';' +
+      'spec=base64.b64decode(os.environ["FM_TASK_OWN_SPEC"]).decode();' +
       "s=open(p).read();s=s.replace('{TASK}',intent).replace('{FIRSTMATE_SPEC}',spec);" +
       "open(p,'w').write(s)";
     const script = [
@@ -4761,6 +4767,9 @@ export default async function plugin(bb: BbPluginApi) {
     return await readFmMetaField(env.hostId,record.taskId,"bb_thread_id",record.home,signal) === record.threadId;
   }
 
+  // 0 of 15 acp-antigravity crews followed the worker contract (no checkpoint
+  // reports, outcome lines or /pr skill), so ship work leaves it by default.
+  const GUARDED_SHIP_PROVIDER = "acp-antigravity";
   async function dispatchCrew(input: Parameters<typeof dispatchCrewBody>[0]): Promise<Crew> {
     if (input.crewId && !/^[A-Za-z0-9._-]{1,100}$/.test(input.crewId)) throw new Error("Invalid task retry identity.");
     if (input.deliveryRequirement && !["pr","merged","merged-and-verified"].includes(input.deliveryRequirement)) throw new Error("Unsupported delivery contract.");
@@ -4835,10 +4844,15 @@ export default async function plugin(bb: BbPluginApi) {
     sendAt?: number;
     deliveryRequirement?: "pr" | "merged" | "merged-and-verified";
     sourceRefs?: string[];
+    ownerRequestedProvider?: boolean;
     signal?:AbortSignal;
   }): Promise<Crew> {
     const task = input.task.trim().slice(0, MAX_TASK);
     if (task === "") throw new Error("Empty task.");
+    if (input.shape === "ship" && input.providerId === GUARDED_SHIP_PROVIDER && input.ownerRequestedProvider !== true && (await settings.get()).shipAntigravityGuard !== false) {
+      const fallback = (await settings.get()).defaultProvider;
+      input = { ...input, providerId: fallback !== "" && fallback !== GUARDED_SHIP_PROVIDER ? fallback : undefined, model: undefined };
+    }
     const mates = await readSecondmates();
     const mate = input.mode === "local-only" ? undefined : pickSecondmate(mates, input.projectId, task);
     if (mate !== undefined && mate.threadId !== input.parentThreadId) {
@@ -5029,7 +5043,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     // Compatibility scouts persist the entire final output as a durable artifact.
     if (!report?.trim()) throw new Error("Scout durable report is missing or unreadable.");
-    reports.put(scout.projectId,owner ?? "",scout.id,report);
+    reports.put(scout.projectId,owner ?? "",scout.id,redactSecrets(report));
     return `Read the complete durable scout report with: bb firstmate scout-report ${scout.id}. Keep its recommendations and acceptance criteria intact.`;
   }
 
@@ -8882,6 +8896,9 @@ export default async function plugin(bb: BbPluginApi) {
       throw new Error(`Queue ${item.id} saved; native add unresolved. Inspect native row, then queue reconcile ${item.id}. ${error instanceof Error?error.message:String(error)}`);
     }
   }
+  // Callers pass only an explicit project. Defaulting to the captain's own project
+  // missed items queued for other projects, and the shared native backlog row was
+  // then adopted under the captain's project and launched in the wrong repository.
   function findQueueItem(items:QueueItem[],id:string|undefined,project:string|undefined):QueueItem|undefined {
     const matches=items.filter(row=>row.id===id && (project===undefined || row.projectId===project));
     if (matches.length>1) throw new Error(`Queue id ${id} is ambiguous; pass its exact project.`);
@@ -9076,7 +9093,7 @@ export default async function plugin(bb: BbPluginApi) {
     try {
       const result = await raceAbort(bb.sdk.threads.output({ threadId: crew.threadId }), signal, STUCK_HOST_CALL_MS);
       const text = asRecord(result)["output"];
-      return { ok: true, text: typeof text === "string" ? truncate(text, 300) : "" };
+      return { ok: true, text: typeof text === "string" ? truncate(redactSecrets(text), 300) : "" };
     } catch {
       return { ok: false };
     }
@@ -9749,10 +9766,11 @@ export default async function plugin(bb: BbPluginApi) {
     overrideOwner: z.boolean().optional()
       .describe("Proceed even though the task targets a PR another captain's crew owns (only on the captain's word)"),
     sourceRefs: z.array(z.string()).optional().describe("Inbound ledger refs this crew answers (tg:chat:msg or bb:thread:row)"),
+    ownerRequestedProvider: z.boolean().optional().describe("The owner named this provider in their own words; keeps acp-antigravity for ship work"),
   });
 
   const dispatchHelp='bb firstmate dispatch [options] -- "<task>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","sendAt"])+"\n  --task <text>  Repeat for bounded fan-out; --hidden hides the worker.\n  sendAt/--send-at is unsupported; native ship isolation is mandatory.";
-  const queueHelp='bb firstmate queue add [options] -- "<title>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider"},["task","taskId","overrideOwner","sendAt","title","permissionMode","sharedEnv","worktree","visible"])+"\n  --detail <full-task>\n  --after <queue-id>  Repeat for dependencies, which remain dispatch gates.\n  --wait-until <ISO-time>  Eligibility only; explicit dispatch required.\n  dispatch preserves the queued shape, mode, contract, dependencies and identity; only provider/model/reasoning/permission/visibility/worktree options override at dispatch.\n  list | next | done <queue-id> | drop <queue-id> | prune | reconcile <exact-id> --project <id> [original options]"+"\nDispatch: bb firstmate queue dispatch <queue-id> [options]\n"+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","taskId","overrideOwner","sendAt","title","shape","mode","deliveryRequirement"]);
+  const queueHelp='bb firstmate queue add [options] -- "<title>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider"},["task","taskId","overrideOwner","sendAt","title","permissionMode","sharedEnv","worktree","visible","ownerRequestedProvider"])+"\n  --detail <full-task>\n  --after <queue-id>  Repeat for dependencies, which remain dispatch gates.\n  --wait-until <ISO-time>  Eligibility only; explicit dispatch required.\n  dispatch preserves the queued shape, mode, contract, dependencies and identity; only provider/model/reasoning/permission/visibility/worktree options override at dispatch.\n  list | next | done <queue-id> | drop <queue-id> | prune | reconcile <exact-id> --project <id> [original options]"+"\nDispatch: bb firstmate queue dispatch <queue-id> [options]\n"+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","taskId","overrideOwner","sendAt","title","shape","mode","deliveryRequirement","ownerRequestedProvider"]);
   const usage = [
     "Usage:",
     "  bb firstmate guide [--json]",
@@ -9989,7 +10007,7 @@ export default async function plugin(bb: BbPluginApi) {
       "Dispatch a firstmate-style crewmate: spawns a child BB thread for one task (ship crews get an isolated worktree by default) and records it as a crew.",
     presentation: { label: { pending: "Dispatching crewmate", completed: "Dispatched crewmate" } },
     parameters: dispatchParams,
-    async execute({ task, taskId, projectId, title, providerId, model, reasoningLevel, permissionMode, shape, mode, worktree, sharedEnv, visible, sendAt, deliveryRequirement, overrideOwner, sourceRefs }, ctx) {
+    async execute({ task, taskId, projectId, title, providerId, model, reasoningLevel, permissionMode, shape, mode, worktree, sharedEnv, visible, sendAt, deliveryRequirement, overrideOwner, sourceRefs, ownerRequestedProvider }, ctx) {
       const ctxRecord = asRecord(ctx);
       const resolvedProject =
         projectId ?? (typeof ctxRecord["projectId"] === "string" ? ctxRecord["projectId"] : undefined);
@@ -10030,7 +10048,7 @@ export default async function plugin(bb: BbPluginApi) {
         visible: visible !== false,
         shape: resolvedShape,
         mode: toMode(mode, posture.mode), yolo: posture.yolo,
-        sendAt, deliveryRequirement,
+        sendAt, deliveryRequirement, ownerRequestedProvider,
       };
       if (background) {
         const reservedId = taskId ?? randomUUID().slice(0, 8);
@@ -10058,7 +10076,10 @@ export default async function plugin(bb: BbPluginApi) {
       if (status === "error") {
         return toolError(`Dispatch of ${crew.shape} crew ${crew.id} (thread ${crew.threadId}) FAILED:${dispatchStatusNote(status, await threadFailureDetail(crew.threadId))}`);
       }
-      return `Dispatched ${crew.shape} crew ${crew.id} as thread ${crew.threadId} (${status}, ${crew.posture}).${warn}${dispatchStatusNote(status)}${permissionLine(crew.id)} Track with: bb firstmate crew ${crew.id}`;
+      const moved = spawnInput.providerId === GUARDED_SHIP_PROVIDER && crew.providerId !== GUARDED_SHIP_PROVIDER
+        ? ` Note: ${GUARDED_SHIP_PROVIDER} is not used for ship work, so this crew runs on the project default provider (${crew.providerId ?? "BB default"}). Pass ownerRequestedProvider only when the owner asked for ${GUARDED_SHIP_PROVIDER}; the owner can turn this off with the shipAntigravityGuard setting.`
+        : "";
+      return `Dispatched ${crew.shape} crew ${crew.id} as thread ${crew.threadId} (${status}, ${crew.posture}).${warn}${moved}${dispatchStatusNote(status)}${permissionLine(crew.id)} Track with: bb firstmate crew ${crew.id}`;
     },
   });
 
@@ -10726,7 +10747,7 @@ export default async function plugin(bb: BbPluginApi) {
         await publishFleet();
         return `Pruned ${items.length - kept.length} finished queue item(s).`;
       }
-      let item = findQueueItem(items,queueId,projectId??ctxProject);
+      let item = findQueueItem(items,queueId,projectId);
       let adopted = false;
       if (item === undefined && queueId !== undefined && (action === "dispatch" || action === "drop" || action === "done")) {
         // A row filed straight into the native backlog: adopt it into the queue. Closing one
@@ -11009,7 +11030,7 @@ export default async function plugin(bb: BbPluginApi) {
         tools: [],
         skills: ["skill-routing"],
         instructions:
-          "The native launch brief owns this worker role, BB transport and task policy. BB crew threads have no captain tools or captain skills. Follow that brief and its exact-ID steering inbox procedure. Read the skill-routing skill and follow the skills it matches to your task, under its Firstmate rules. Do not delegate or change the selected provider, model, or effort. Worker completion is a handoff, not captain merge or deployment completion.",
+          "The native launch brief owns this worker role, BB transport and task policy. BB crew threads have no captain tools or captain skills. Follow that brief and its exact-ID steering inbox procedure. Read the skill-routing skill and follow the skills it matches to your task, under its Firstmate rules. Do not delegate or change the selected provider, model, or effort. Never print a secret value: read variable names only, and never print .env or secret files, environment dumps or credential values. Never use Telegram tools (mcp__telegram__*) and never send a message as the owner. Worker completion is a handoff, not captain merge or deployment completion.",
       };
     }
     const marked = metaFlag(meta, "captain");
@@ -12505,7 +12526,7 @@ export default async function plugin(bb: BbPluginApi) {
             }
             if (sub === "dispatch") {
               const qid = rest[1];
-              let item = findQueueItem(items,qid,flagStr(flags,"project")??ctxProject);
+              let item = findQueueItem(items,qid,flagStr(flags,"project"));
               if (item === undefined && qid !== undefined) {
                 const row = await adoptRealBacklogRow(qid, flagStr(flags, "project") ?? ctxProject, ctxThread);
                 if (row !== null) { item = row; queueStore.add(row); items.unshift(row); }
@@ -12543,7 +12564,7 @@ export default async function plugin(bb: BbPluginApi) {
             }
             if (sub === "drop" || sub === "done") {
               const qid = rest[1];
-              let item = findQueueItem(items,qid,flagStr(flags,"project")??ctxProject);
+              let item = findQueueItem(items,qid,flagStr(flags,"project"));
               const adopted = item === undefined && qid !== undefined;
               if (item === undefined && qid !== undefined) item = await adoptRealBacklogRow(qid, flagStr(flags, "project") ?? ctxProject, ctxThread, false) ?? undefined;
               if (qid === undefined || item === undefined) return fail(`No queued item ${qid ?? ""}.`);

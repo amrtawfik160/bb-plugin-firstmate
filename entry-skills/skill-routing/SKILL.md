@@ -12,15 +12,17 @@ user-invoke-only, so read the file directly. A poteto-mode playbook is
 `poteto-mode/playbooks/<file>` in the same folders. When a named skill is not
 installed, continue without it and say so in your report.
 
-The supervisor names the matched skills in each dispatch brief. A crewmate
-follows the skills its brief names and any row that matches its own work.
+Firstmate adds a skills block to every dispatch brief. It names this skill,
+poteto mode and the matched playbook. The supervisor names any other matched
+skills. A crewmate follows the skills its brief names and any row that matches
+its own work.
 
 ## Poteto mode on every crewmate task
 
 Every crewmate task, ship or scout, runs in poteto mode. Read
 `poteto-mode/SKILL.md` in full before any other step, then open the playbook
 that matches the task (the rows below name it; use `investigation.md` for a
-scout with no other match) and follow its steps. The supervisor names
+scout with no other match) and follow its steps. Firstmate names
 `poteto-mode` and the playbook in every brief.
 
 Poteto mode is for crewmate work only. The supervisor's own replies to the
@@ -62,6 +64,11 @@ Where a routed skill conflicts with Firstmate, follow Firstmate:
 - Poteto mode's Autonomy and Subagents sections give way to the brief: pause
   where the brief or Firstmate says to, and spawn no `poteto-agent` or `Task`.
 - Load only the skills a matched row names, plus poteto mode.
+- Never print a secret value. Read variable names only. Do not print `.env`
+  or secret files, environment dumps or credential values. If a value is
+  printed by mistake, say so in your report so the owner can rotate it.
+- Never use Telegram tools (`mcp__telegram__*`) and never send a message as
+  the owner. Send questions to the supervisor through the brief's result channel.
 - Crews share one host's memory. Run full type checks, full test suites,
   production builds, and any command that can use over 1 GB through
   `~/.bb-firstmate/bin/fm-heavy <command>`. It waits for a free slot, then runs
