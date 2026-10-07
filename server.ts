@@ -1049,19 +1049,31 @@ export function wakeAckFromOutput(out: string): { ackThrough: number; recoveryGe
 }
 
 // The token budget is a floor, not evidence of pressure on a larger model.
+/**
+ * Compact once usage passes `ratio` of the window (and at least `budget` tokens). A provider
+ * threshold only wins when it is lower: a 1M-token window that the provider compacts at 96.7%
+ * otherwise rereads ~800k tokens on every captain wake. Estimated readings count; the caller
+ * never retries an unchanged reading and waits `cooldownMs` between compactions.
+ */
 export function captainCompactDue(input: {
   usedTokens: number | null;
   modelContextWindow: number | null;
   estimated: boolean;
   budget: number;
+  ratio: number;
+  providerThreshold: number | null;
   lastCompactAt: number | null;
   now: number;
   cooldownMs: number;
 }): boolean {
-  if (!Number.isFinite(input.budget) || !(input.budget > 0) || input.estimated !== false) return false;
+  if (!Number.isFinite(input.budget) || !(input.budget > 0)) return false;
+  if (!Number.isFinite(input.ratio) || !(input.ratio > 0) || input.ratio > 1) return false;
   const { usedTokens, modelContextWindow } = input;
   if (usedTokens === null || modelContextWindow === null || !Number.isFinite(usedTokens) || !Number.isFinite(modelContextWindow)) return false;
-  if (modelContextWindow <= 0 || usedTokens > modelContextWindow || usedTokens < Math.max(input.budget, modelContextWindow * 0.9)) return false;
+  const trigger = Math.max(input.budget, modelContextWindow * input.ratio);
+  if (modelContextWindow <= 0 || usedTokens > modelContextWindow || usedTokens < trigger) return false;
+  const provider = input.providerThreshold;
+  if (provider !== null && Number.isFinite(provider) && provider > 0 && provider <= trigger) return false;
   return input.lastCompactAt === null || input.now - input.lastCompactAt >= input.cooldownMs;
 }
 
@@ -1737,8 +1749,13 @@ export default async function plugin(bb: BbPluginApi) {
     },
     captainCompactAtTokens: {
       type: "number",
-      label: "Minimum measured tokens for automatic compaction. Also requires 90% context usage, an idle thread, and no provider-managed compaction threshold. Unchanged readings are not retried; minimum interval is 20 minutes. 0 = off.",
+      label: "Minimum tokens for automatic compaction of an idle captain or crew. Also requires the context share below. A provider threshold wins only when it is lower. Unchanged readings are not retried; minimum interval is 20 minutes. 0 = off.",
       default: 200000,
+    },
+    captainCompactAtRatio: {
+      type: "number",
+      label: "Compact an idle captain or crew once its context is this full (0.1 to 1, default 0.6).",
+      default: 0.6,
     },
     defaultProvider: {
       type: "string",
@@ -11631,7 +11648,9 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function checkThreadCompaction(threadId: string, stampKey: string, signal?: AbortSignal): Promise<void> {
-    const budget = Number((await settings.get()).captainCompactAtTokens);
+    const current = await settings.get();
+    const budget = Number(current.captainCompactAtTokens);
+    const ratio = Number(current.captainCompactAtRatio);
     if (!(budget > 0)) return;
     const key = stampKey;
     const last = await bb.storage.kv.get<unknown>(key);
@@ -11645,13 +11664,13 @@ export default async function plugin(bb: BbPluginApi) {
     if (!usage) return;
     const { usedTokens, modelContextWindow, estimated } = usage;
     const nativeThreshold = usage.snapshot?.autoCompactAtTokens;
-    if (typeof nativeThreshold === "number" && Number.isFinite(nativeThreshold) && nativeThreshold > 0) return;
     const evidenceKey = `thread-compaction-evidence:${threadId}`;
     if (estimated === false && Number.isFinite(usedTokens) && usedTokens >= 0 && Number.isFinite(modelContextWindow) && modelContextWindow > 0 && usedTokens < modelContextWindow * 0.9) {
       await bb.storage.kv.delete(evidenceKey);
     }
     const now = Date.now();
-    if (!captainCompactDue({ usedTokens, modelContextWindow, estimated, budget, lastCompactAt: typeof last === "number" ? last : null, now, cooldownMs: CAPTAIN_COMPACT_COOLDOWN_MS })) return;
+    const providerThreshold = typeof nativeThreshold === "number" ? nativeThreshold : null;
+    if (!captainCompactDue({ usedTokens, modelContextWindow, estimated, budget, ratio, providerThreshold, lastCompactAt: typeof last === "number" ? last : null, now, cooldownMs: CAPTAIN_COMPACT_COOLDOWN_MS })) return;
     const evidence = JSON.stringify([usedTokens, modelContextWindow, usage.snapshot?.providerSessionId ?? null, usage.snapshot?.capturedAt ?? null]);
     if (await bb.storage.kv.get(evidenceKey) === evidence) return;
     const thread = await raceAbort(bb.sdk.threads.get({ threadId }), signal, STUCK_HOST_CALL_MS);
