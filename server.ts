@@ -6351,6 +6351,7 @@ export default async function plugin(bb: BbPluginApi) {
     lastOpenPrSweep = Date.now();
     const crews = (await raceAbort(readCrews(), signal, STUCK_HOST_CALL_MS))
       .filter((c) => c.shape === "ship" && c.worktree && c.posture !== "local-only" && !isSecondmateRoute(c) && c.parentThreadId);
+    for (const threadId of crewBranches.keys()) if (!crews.some((c) => c.threadId === threadId)) crewBranches.delete(threadId);
     const groups = new Map<string, { hostId: string; paths: string[]; crews: Array<{ crew: Crew; branch: string }> }>();
     for (const crew of crews) {
       signal?.throwIfAborted();
