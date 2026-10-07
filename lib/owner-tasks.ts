@@ -73,7 +73,8 @@ export function moveTask(task: OwnerTask, move: TaskMove, at: number): OwnerTask
   return { ...task, state: move.to, ...(outcome ? { outcome } : {}), updatedAt: at };
 }
 
-const OPEN_PR_READY = new Set<DeliveryRecord["status"]>(["ready-to-merge", "waiting-approval", "pr-delivered"]);
+// Same words as the board's PR line: only "ready to merge" is ready for the owner.
+const OPEN_PR_READY = new Set<DeliveryRecord["status"]>(["ready-to-merge", "waiting-approval"]);
 
 /** The task state its pull requests prove, or null when they prove nothing yet.
  * Merged needs every linked PR off the open list; live needs the agreed merge verification. */
