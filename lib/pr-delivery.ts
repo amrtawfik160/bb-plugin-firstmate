@@ -1,6 +1,5 @@
 import { createHash } from 'node:crypto';
 import type { BbPluginApi } from '@get-bb/plugin-sdk';
-import type { BoardPr } from './owner-asks.ts';
 type Database = ReturnType<BbPluginApi['storage']['database']>;
 export type DeliveryRequirement = 'pr' | 'merged' | 'merged-and-verified';
 export type DeliveryStatus = 'draft' | 'waiting-checks' | 'failing-checks' | 'waiting-review' | 'waiting-native-gates' | 'changes-requested' | 'on-hold' | 'changed-since-hold' | 'waiting-approval' | 'ready-to-merge' | 'merged-needs-verification' | 'closed-needs-disposition' | 'pr-delivered' | 'complete' | 'explicitly-abandoned';
@@ -42,6 +41,8 @@ export function canonicalPr(url: string) {
 export function deliveryLine(r: DeliveryRecord) {
   return `${r.id} [${r.status}${r.freshness === 'stale' ? ', stale' : ''}${r.ownerNeeded ? ', owner needed' : ''}] owner=${r.owner ?? 'unassigned'} ${r.url}\n  ${r.deliverySatisfiedAt ? 'Agreed delivery satisfied; ' : ''}${r.blocker || 'No known blocker'}. Next: ${r.nextAction}${(r.failures ?? []).filter(f=>f.resolvedAt===null).map(f=>`\n  ${f.id}: ${f.name} ${f.url} — ${f.accounting ? `${f.accounting.scope} follow-up task=${f.accounting.taskId} worker=${f.accounting.worker}` : `unaccounted; author=${r.workers.at(-1) ?? 'unknown'}`}`).join('')}`;
 }
+/** One open pull request on the owner's board; `state` is already plain words. */
+export type BoardPr = { ref: string; title?: string; state: string; openedAt: number };
 /** One plain owner-facing state per tracked status; null leaves the PR off the board (merged or closed). */
 const BOARD_PR_STATE: Record<DeliveryStatus, string | null> = {
   'draft': 'draft',
@@ -302,7 +303,12 @@ export function createDeliveries(db: Database) {
       const latest=get(id)!; if (latest.owner !== r.owner || latest.notification.desired !== signature || latest.ownerNeeded) return false; latest.notification.retryAt=now+60_000; save(latest); return false;
     }
   }
-  return { get,save,list,conflict,hasOwned,taskRecord,register,observe,stale,assign,ownerLost,markOwnerNeeded,ownerRestored,transferOwner,accountFailure,abandon,clearHold,forTasks,verify,markQueued,notify,pendingNotifications };
+  /** This manager's PRs that merged at or after `since`, newest first. updatedAt stands in for the merge time. */
+  function mergedSince(owner:string, since:number, limit=50) {
+    const rows=db.prepare("SELECT record FROM deliveries WHERE owner=? AND json_extract(record,'$.forgeState')='merged' AND json_extract(record,'$.updatedAt')>=? ORDER BY json_extract(record,'$.updatedAt') DESC,id LIMIT ?").all(owner,since,Math.max(1,Math.min(limit,100))) as {record:string}[];
+    return rows.map(row=>JSON.parse(row.record) as DeliveryRecord);
+  }
+  return { get,save,list,mergedSince,conflict,hasOwned,taskRecord,register,observe,stale,assign,ownerLost,markOwnerNeeded,ownerRestored,transferOwner,accountFailure,abandon,clearHold,forTasks,verify,markQueued,notify,pendingNotifications };
 }
 
 const DO_NOT_MERGE = /\b(?:do not|don'?t|dont)[\s-]+merge\b|\bdo-not-merge\b/i;

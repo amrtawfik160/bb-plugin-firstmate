@@ -32,10 +32,11 @@ export const rpcContract = defineRpcContract({
     output: z.object({ ok: z.boolean() }),
   },
   telegramCommand: {
-    experimental_description: "Answer a Telegram owner command (/inbox, /workers, or the board) for one captain thread as plain text. For board, away is the captain's /afk posture.",
+    experimental_description: "Answer a Telegram owner command (/inbox, /workers, the board, or the digest) for one captain thread as plain text. The board has three sections: Needs you, Done since you last looked, In progress. since (ms) is when the owner last looked: board defaults to 24 h ago, digest to 12 h ago. The digest text is empty when there is nothing to report. For board, away is the captain's /afk posture.",
     input: z.object({
-      command: z.enum(["inbox", "workers", "board"]),
+      command: z.enum(["inbox", "workers", "board", "digest"]),
       threadId: z.string().min(1),
+      since: z.number().int().nonnegative().optional(),
     }),
     output: z.object({ text: z.string(), away: z.boolean().optional() }),
   },

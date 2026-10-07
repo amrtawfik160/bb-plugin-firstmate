@@ -9,7 +9,8 @@ import { createDeliveries } from "./lib/pr-delivery.ts";
 
 type Host = ReturnType<typeof createFakePluginHost>;
 
-const HOUR = 60 * 60_000;
+const MIN = 60_000;
+const HOUR = 60 * MIN;
 const capCtx = { threadId: "thr_cap", projectId: "proj_1" } as never;
 const envelope = readFileSync(new URL("./test/fixtures/envelopes/live-owner.txt", import.meta.url), "utf8");
 
@@ -77,10 +78,12 @@ test("Oct 7 repro: a reply of only 'Started' answered the owner message, and now
     assert.match(text(replied), /\nTask T1 stays open \(working\): a reply does not close it\./);
     // The task is a separate fact: it is still open.
     assert.equal(await board(host), [
-      "📌 Nothing needs you right now.",
+      "📌 Needs you: nothing right now.",
       "",
-      "Your tasks in progress (1):",
-      "- T1 · Areliaa · Fix the Metricool sync — working, 0 min",
+      "✅ Done since you last looked: nothing new.",
+      "",
+      "🔧 In progress (1)",
+      "- T1 Areliaa · Fix the Metricool sync · 0 min",
     ].join("\n"));
   } finally {
     await host.harness.lifecycle.dispose();
@@ -116,7 +119,7 @@ test("a second dispatch for the same owner message joins its task instead of ope
   }
 });
 
-test("the task follows its crew's PR: ready to merge, then merged leaves the board", async () => {
+test("the task follows its crew's PR: ready to merge needs the owner, then merged moves it to Done", async () => {
   const host = await captainHost();
   try {
     await ownerSays(host, "2204", "Add the memory screen");
@@ -125,16 +128,22 @@ test("the task follows its crew's PR: ready to merge, then merged leaves the boa
     const pr = store.register({ url: "https://github.com/acme/app/pull/2091", taskId: "memory-screen", projectId: "proj_1", owner: "thr_cap", home: "", worker: "thr_new", title: "Memory screen" });
     store.save({ ...pr, status: "ready-to-merge" });
     assert.equal(await board(host), [
-      "📌 Nothing needs you right now.",
+      "📌 Needs you (1)",
+      "1. T1 Areliaa · Memory screen · ready for you · 0 min · app#2091 ready to merge",
       "",
-      "Your tasks in progress (1):",
-      "- T1 · Areliaa · Memory screen — ready for you, 0 min",
+      "✅ Done since you last looked: nothing new.",
       "",
-      "Open pull requests (1):",
-      "- acme/app#2091 Memory screen — ready to merge",
+      "🔧 In progress: nothing open.",
     ].join("\n"));
     store.save({ ...store.get("acme/app#2091")!, status: "complete", forgeState: "merged", mergeCommitSha: "m1" });
-    assert.equal(await board(host), "📌 Nothing needs you right now.");
+    assert.equal(await board(host), [
+      "📌 Needs you: nothing right now.",
+      "",
+      "✅ Done since you last looked (1)",
+      "- T1 Areliaa · Memory screen · 0 min · merged",
+      "",
+      "🔧 In progress: nothing open.",
+    ].join("\n"));
     const task = createOwnerTasks(host.bb.storage.database()).get("T1")!;
     assert.deepEqual([task.state, task.prs], ["merged", ["acme/app#2091"]]);
   } finally {
@@ -177,7 +186,7 @@ test("firstmate_task drops a task only with a reason, and a closed task never re
   }
 });
 
-test("the board flags a task with no update for 24 hours as stale and marks backfilled tasks", async () => {
+test("the board flags a task with no update for 24 hours as stale", async () => {
   const host = await captainHost();
   try {
     const tasks = createOwnerTasks(host.bb.storage.database());
@@ -185,12 +194,58 @@ test("the board flags a task with no update for 24 hours as stale and marks back
     tasks.open({ captain: "thr_cap", project: null, title: "Brands audit", sourceRefs: ["tg:200:2102"], at: Date.now() - 2 * HOUR });
     tasks.open({ captain: "thr_other", project: null, title: "Not mine", sourceRefs: ["tg:200:2103"], at: Date.now() });
     assert.equal(await board(host), [
-      "📌 Nothing needs you right now.",
+      "📌 Needs you: nothing right now.",
       "",
-      "Your tasks in progress (2):",
-      "- T1 · Areliaa · Metricool fix — working, 30 h · stale, no update for 30 h · backfilled",
-      "- T2 · Brands audit — working, 2 h",
+      "✅ Done since you last looked: nothing new.",
+      "",
+      "🔧 In progress (2)",
+      "- T1 Areliaa · Metricool fix · 30 h · stale 30 h",
+      "- T2 Brands audit · 2 h",
     ].join("\n"));
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+const command = async (host: Host, input: Record<string, unknown>) =>
+  (await host.harness.behavior.callRpc("telegramCommand", { threadId: "thr_cap", ...input }) as { text: string }).text;
+
+test("the board and the digest read closed tasks and PRs merged since the owner last looked", async () => {
+  const host = await captainHost();
+  try {
+    const tasks = createOwnerTasks(host.bb.storage.database());
+    const store = createDeliveries(host.bb.storage.database());
+    tasks.open({ captain: "thr_cap", project: "Areliaa", title: "Metricool fix", sourceRefs: ["tg:200:2301"], crewId: "metricool-fix", prs: ["acme/app#1759"], at: Date.now() - 30 * HOUR });
+    tasks.open({ captain: "thr_cap", project: null, title: "Brands audit", sourceRefs: ["tg:200:2302"], at: Date.now() - 2 * HOUR });
+    tasks.move("T2", "thr_cap", { to: "dropped", reason: "Owner moved it to next week" }, Date.now() - HOUR);
+    const held = store.register({ url: "https://github.com/acme/app/pull/1759", taskId: "metricool-fix", projectId: "proj_1", owner: "thr_cap", home: "", worker: "thr_new" });
+    store.save({ ...held, status: "on-hold" });
+    const unlinked = store.register({ url: "https://github.com/acme/app/pull/283", taskId: "c9", projectId: "proj_1", owner: "thr_cap", home: "", worker: "thr_c9", title: "Bump the email template" });
+    store.save({ ...unlinked, status: "complete", forgeState: "merged", mergeCommitSha: "m9", updatedAt: Date.now() - 2 * HOUR });
+    const old = store.register({ url: "https://github.com/acme/app/pull/270", taskId: "c8", projectId: "proj_1", owner: "thr_cap", home: "", worker: "thr_c8" });
+    store.save({ ...old, status: "complete", forgeState: "merged", mergeCommitSha: "m8", updatedAt: Date.now() - 26 * HOUR });
+    const text = await board(host);
+    assert.deepEqual(text.split("\n\n").map((section) => section.split("\n")[0]), ["📌 Needs you: nothing right now.", "✅ Done since you last looked (2)", "🔧 In progress (1)"]);
+    assert.equal(text, [
+      "📌 Needs you: nothing right now.",
+      "",
+      "✅ Done since you last looked (2)",
+      "- T2 Brands audit · 2 h · dropped: Owner moved it to next week",
+      "- PR app#283 Bump the email template · merged",
+      "",
+      "🔧 In progress (1)",
+      "- T1 Areliaa · Metricool fix · 30 h · app#1759 on hold (do not merge) · stale 30 h",
+    ].join("\n"));
+    assert.match(await command(host, { command: "board", since: Date.now() - 30 * HOUR }), /\n- PR app#270 /, "an older since brings back older merges");
+    assert.equal(await command(host, { command: "digest" }), [
+      "Done (2)",
+      "- T2 Brands audit · 2 h · dropped: Owner moved it to next week",
+      "- PR app#283 Bump the email template · merged",
+      "",
+      "Stale (1): T1",
+    ].join("\n"));
+    tasks.move("T1", "thr_cap", { to: "done" }, Date.now() - 20 * HOUR);
+    assert.equal(await command(host, { command: "digest", since: Date.now() - 10 * MIN }), "");
   } finally {
     await host.harness.lifecycle.dispose();
   }
