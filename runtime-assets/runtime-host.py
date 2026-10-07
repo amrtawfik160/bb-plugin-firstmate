@@ -4,7 +4,7 @@
 All operations are host-local, offline, serialized and publication is atomic.
 Selection never edits task state, configuration policy, hooks or worker paths.
 """
-import argparse, contextlib, fcntl, stat, hashlib, importlib.util, json, os, re, shutil, subprocess, tarfile, tempfile, time, uuid, sys, selectors
+import argparse, contextlib, glob, fcntl, stat, hashlib, importlib.util, json, os, re, shutil, subprocess, tarfile, tempfile, time, uuid, sys, selectors
 from pathlib import Path
 sys.dont_write_bytecode=True
 
@@ -151,6 +151,33 @@ def blockers(home):
         if list(state.glob(pattern)): reasons.append(f'native/BB runtime consumer present: {pattern}')
     return reasons
 
+NATIVE_IDENTITY=('upstreamCommit','snapshotCommit','stateContract')
+ADAPTER_PAYLOADS=('overlay/','runtime-host.py')
+def native_difference(current,target):
+    for key in NATIVE_IDENTITY:
+        if current[key]!=target[key]: return key
+    names=sorted(set(current['payloads'])|set(target['payloads']))
+    return next((name for name in names if not name.startswith(ADAPTER_PAYLOADS) and current['payloads'].get(name)!=target['payloads'].get(name)),None)
+
+def selection_refusal(current,target,consumers):
+    # Consumers keep the release root they recorded. Only BB adapter bytes may
+    # change beneath their native state; current None is an external checkout.
+    if not consumers: return None
+    difference='external native checkout' if current is None else native_difference(current,target)
+    if difference is None: return None
+    return f"runtime selection refused: {'; '.join(consumers)}; native difference: {difference}. Existing runtime/state are unchanged; reconcile consumers first without respawning."
+
+def release_references(home):
+    found={}
+    state=home/'state'
+    for meta in sorted(state.glob('*.meta'))[:200]:
+        task=meta.name[:-len('.meta')]
+        for entry in state.glob(glob.escape(task)+'.*'):
+            for path in [entry] if entry.is_file() else entry.glob('*') if entry.is_dir() and not entry.is_symlink() else []:
+                if path.is_symlink() or not path.is_file() or path.stat().st_size>1<<20: continue
+                for release in re.findall(rb'/versions/([0-9a-f]{64})/',path.read_bytes()): found.setdefault(release.decode(),set()).add(task)
+    return [{'release':release,'tasks':sorted(tasks)} for release,tasks in sorted(found.items())]
+
 def bind(args):
     root,manifest=verify_version(args.store,args.release)
     owner(args.captain)
@@ -270,8 +297,10 @@ def select(args):
             current.select_patch_set(args.home,root/'overlay')
             errors=current.verify_mirror(args.home,root/'overlay')
             if errors: raise ValueError('external migration requires a verified matching adapter: '+'; '.join(errors))
-        reasons=blockers(args.home)
-        if reasons: raise ValueError('runtime selection refused: '+'; '.join(reasons)+'. Existing runtime/state are unchanged; keep this home external until consumers retire.')
+        consumers=blockers(args.home)+(['BB launches are running/reserved/uncertain'] if args.consumers else [])
+        current=verify_version(args.store,previous['release'])[1] if consumers and previous and not external else None
+        refusal=selection_refusal(current,manifest,consumers)
+        if refusal: raise ValueError(refusal)
         if previous and previous['stateContract']!=manifest['stateContract']: raise ValueError('state schema rollback/migration unsupported; selection unchanged')
         if external:
             if not args.check:
@@ -320,13 +349,14 @@ def status(args):
     if value:
         try: inspect(args)
         except Exception as error: compatible=False;selection_error=str(error)
-    return {'selectionCompatible':compatible,'selectionError':selection_error,'external':external,'installed':installed,'selected':value,'home':str(args.home) if args.home else None,
+    referenced=release_references(args.home) if args.home and (args.home/'state').is_dir() else []
+    return {'selectionCompatible':compatible,'selectionError':selection_error,'external':external,'installed':installed,'selected':value,'referencedReleases':referenced,'home':str(args.home) if args.home else None,
             'mode':'bundled' if value else 'external' if args.home else 'unbound','migrationRequiredForBundledMode':bool(args.home and not value)}
 
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('action',choices=['install','bind','bind-seeded','select','migrate','rollback','status','inspect','resolve'])
     parser.add_argument('--store',type=Path,required=True);parser.add_argument('--archive');parser.add_argument('--sha256');parser.add_argument('--release');parser.add_argument('--audited-sources',default='[]')
-    parser.add_argument('--parent-home',type=Path);parser.add_argument('--parent-captain');parser.add_argument('--task-id');parser.add_argument('--project-id');parser.add_argument('--home',type=Path);parser.add_argument('--captain');parser.add_argument('--host');parser.add_argument('--check',action='store_true')
+    parser.add_argument('--parent-home',type=Path);parser.add_argument('--parent-captain');parser.add_argument('--task-id');parser.add_argument('--project-id');parser.add_argument('--home',type=Path);parser.add_argument('--captain');parser.add_argument('--host');parser.add_argument('--check',action='store_true');parser.add_argument('--consumers',action='store_true')
     args=parser.parse_args()
     if not args.store.is_absolute() or (args.home and not args.home.is_absolute()): raise ValueError('runtime store/home must be absolute host paths')
     if args.store.is_symlink() or any(parent.is_symlink() for parent in args.store.parents): raise ValueError('symlinked runtime store refused')

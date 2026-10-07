@@ -26,7 +26,7 @@ export function createNativeRuntime(input:{
   run:(host:string,command:string,budgetMs:number,signal?:AbortSignal)=>Promise<{output:string;exitCode:number|null;stderr?:string}>;
 }) {
   async function operation(host:string, action:'install'|'bind-seeded'|'bind'|'status'|'inspect'|'select'|'migrate'|'rollback', args:{
-    home?:string;captain?:string;release?:string;check?:boolean;projectId?:string;parentHome?:string;parentCaptain?:string;taskId?:string;
+    home?:string;captain?:string;release?:string;check?:boolean;consumers?:boolean;projectId?:string;parentHome?:string;parentCaptain?:string;taskId?:string;
   }={}, parent?:AbortSignal):Promise<Record<string,unknown>&{distribution:Distribution;store:string}> {
     const assets=loadRuntimeAssets(input.assets);
     const files=input.files(), remove=files.remove;
@@ -69,7 +69,7 @@ export function createNativeRuntime(input:{
       const verification=`python3 -c ${quote('import hashlib,sys;sys.exit(0 if hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest()==sys.argv[2] else 2)')} ${quote(helper)} ${quote(assets.distribution.helperSha256)}`;
       const options=['--store',store,'--audited-sources',JSON.stringify(assets.distribution.auditedSources),...(action==='install'?['--archive',`${temporary}/runtime.tar.gz`,'--sha256',assets.distribution.archiveSha256]:[]),
         ...(args.parentHome?['--parent-home',args.parentHome]:[]),...(args.parentCaptain?['--parent-captain',args.parentCaptain]:[]),...(args.taskId?['--task-id',args.taskId]:[]),...(args.projectId?['--project-id',args.projectId]:[]),...(args.home?['--home',args.home]:[]),...(args.captain?['--captain',args.captain,'--host',host]:[]),
-        ...(action==='bind'||action==='bind-seeded'||action==='select'||action==='migrate'||action==='rollback'||action==='status' && args.release?['--release',args.release??assets.distribution.release]:[]),...(args.check?['--check']:[])];
+        ...(action==='bind'||action==='bind-seeded'||action==='select'||action==='migrate'||action==='rollback'||action==='status' && args.release?['--release',args.release??assets.distribution.release]:[]),...(args.check?['--check']:[]),...(args.consumers?['--consumers']:[])];
       signal.throwIfAborted();
       const result=await input.run(host,`${verification} && python3 ${quote(helper)} ${quote(action)} ${options.map(quote).join(' ')}`,90_000,signal);
       if(result.exitCode!==0)throw new Error(result.stderr||result.output||`Runtime ${action} failed (${result.exitCode}); no readiness claimed.`);
