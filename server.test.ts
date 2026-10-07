@@ -8524,8 +8524,19 @@ test("wake ack pair parses from both the native and the rewritten form", () => {
   assert.equal(wakeAckFromOutput("Wake queue empty."), null);
 });
 
+test("live repro: a captain at 790k of 1M estimated tokens under a 967k provider threshold is due for compaction", () => {
+  const live = {
+    budget: 200_000, ratio: 0.6, usedTokens: 789_701, modelContextWindow: 1_000_000, estimated: true,
+    providerThreshold: 967_000, lastCompactAt: null, now: 10_000_000, cooldownMs: 1_200_000,
+  };
+  assert.equal(captainCompactDue(live), true);
+  assert.equal(captainCompactDue({ ...live, usedTokens: 590_000 }), false, "below 60% waits");
+  assert.equal(captainCompactDue({ ...live, providerThreshold: 500_000 }), false, "a lower provider threshold compacts first");
+  assert.equal(captainCompactDue({ ...live, lastCompactAt: live.now - 60_000 }), false, "cooldown");
+});
+
 test("captain compaction is due only past the budget and outside the cooldown", () => {
-  const base = { budget: 200_000, modelContextWindow: 1_000_000, estimated: false, now: 10_000_000, cooldownMs: 1_200_000 };
+  const base = { budget: 200_000, ratio: 0.9, providerThreshold: null, modelContextWindow: 1_000_000, estimated: false, now: 10_000_000, cooldownMs: 1_200_000 };
   assert.equal(captainCompactDue({ ...base, usedTokens: 910_000, lastCompactAt: null }), true);
   assert.equal(captainCompactDue({ ...base, usedTokens: 150_000, lastCompactAt: null }), false);
   assert.equal(captainCompactDue({ ...base, usedTokens: 910_000, lastCompactAt: base.now - 60_000 }), false);
@@ -8535,7 +8546,7 @@ test("captain compaction is due only past the budget and outside the cooldown", 
   for (const overrides of [
     { usedTokens: 899_999 }, { usedTokens: 1_000_001 }, { usedTokens: NaN },
     { usedTokens: Infinity }, { modelContextWindow: null }, { modelContextWindow: 0 },
-    { modelContextWindow: NaN }, { estimated: true }, { budget: Infinity },
+    { modelContextWindow: NaN }, { budget: Infinity }, { ratio: 0 }, { ratio: 1.5 },
   ]) {
     assert.equal(captainCompactDue({ ...base, usedTokens: 900_000, lastCompactAt: null, ...overrides }), false, JSON.stringify(overrides));
   }
