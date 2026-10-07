@@ -9819,6 +9819,39 @@ test("a refused brief removes the backlog row its own dispatch created", async (
   }
 });
 
+test("ship work requested on acp-antigravity runs on the project default unless the owner asked for it", async () => {
+  for (const [input, settings, expected] of [
+    [{ task: "fix login" }, {}, undefined],
+    [{ task: "fix login", ownerRequestedProvider: true }, {}, "acp-antigravity"],
+    [{ task: "why does login fail", shape: "scout" }, {}, "acp-antigravity"],
+    [{ task: "fix login" }, { shipAntigravityGuard: false }, "acp-antigravity"],
+  ] as const) {
+    const host = await load();
+    try {
+      await host.harness.behavior.setSettings(settings);
+      host.harness.sdk.stub("environments.list", async () => [{ hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" }]);
+      host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew" }));
+      host.harness.sdk.stub("threads.list", async () => []);
+      host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "starting" }));
+      const result = await agentTool(host, "firstmate_dispatch").execute(
+        { ...input, projectId: "proj_1", providerId: "acp-antigravity", model: "gemini-3.8-flash" },
+        { projectId: "proj_1" } as never,
+      );
+      assert.ok(!isToolError(result), toolText(result));
+      const spawn = host.harness.sdk.callsTo("threads.spawn")[0]![0] as { providerId?: string; model?: string };
+      assert.equal(spawn.providerId, expected, JSON.stringify(input));
+      if (expected === undefined) {
+        assert.equal(spawn.model, undefined);
+        assert.match(toolText(result), /acp-antigravity is not used for ship work.*project default/);
+      } else {
+        assert.doesNotMatch(toolText(result), /not used for ship work/);
+      }
+    } finally {
+      await host.harness.lifecycle.dispose();
+    }
+  }
+});
+
 test("queue add carries providerId/model/reasoningLevel through to the dispatched crew", async () => {
   const host = await load();
   try {
