@@ -6125,7 +6125,7 @@ export default async function plugin(bb: BbPluginApi) {
     catch(error) { if (signal?.aborted || record || crew.launchKey) throw error; return "merged" as const; }
     return recoveredContract(metadata,record);
   }
-  async function registerCrewPr(crew: Crew, url: string,signal?:AbortSignal) {
+  async function registerCrewPr(crew: Crew, url: string,signal?:AbortSignal,facts:{title?:string;openedAt?:number}={}) {
     if (crew.shape !== "ship" || crew.posture === "local-only" || isSecondmateRoute(crew) || !url) return;
     const identity = canonicalPr(url);
     const prior=deliveries.get(identity.id);
@@ -6137,7 +6137,7 @@ export default async function plugin(bb: BbPluginApi) {
     const requirement=await contractForCrew(crew,signal);
     const task=await raceAbort(fullCrewTask(crew),signal,STUCK_HOST_CALL_MS);
     signal?.throwIfAborted();
-    deliveries.register({url,taskId:crew.id,projectId:crew.projectId,owner:crew.parentThreadId,home,worker:crew.threadId,requirement,continuation:{...crew,task,taskSpilled:false}});
+    deliveries.register({url,taskId:crew.id,projectId:crew.projectId,owner:crew.parentThreadId,home,worker:crew.threadId,requirement,continuation:{...crew,task,taskSpilled:false},...facts});
   }
   async function discoverCrewDelivery(crew: Crew,signal?:AbortSignal) {
     if (crew.shape !== "ship" || crew.posture === "local-only" || isSecondmateRoute(crew)) return;
@@ -6325,6 +6325,70 @@ export default async function plugin(bb: BbPluginApi) {
       },signal).catch(error=>bb.log.warn(`Launch recovery ${record.taskId}: ${String(error)}`));
     }
   }
+  // Every open PR a crew opens is tracked, not only the first one it reports.
+  // A crew's worktree branch proves provenance: an open PR whose head is that
+  // branch, or a branch named after it (`<branch>-…`, `<branch>/…`), belongs to
+  // the crew with the longest matching branch, owned by that crew's captain.
+  // One GitHub list per project and host, at most every five minutes.
+  const OPEN_PR_SWEEP_MS = 5 * 60_000;
+  let lastOpenPrSweep = 0;
+  const crewBranches = new Map<string, { branch: string; path: string; hostId: string }>();
+  async function openPrSweep(signal?: AbortSignal) {
+    if (Date.now() - lastOpenPrSweep < OPEN_PR_SWEEP_MS) return;
+    lastOpenPrSweep = Date.now();
+    const crews = (await raceAbort(readCrews(), signal, STUCK_HOST_CALL_MS))
+      .filter((c) => c.shape === "ship" && c.worktree && c.posture !== "local-only" && !isSecondmateRoute(c) && c.parentThreadId);
+    const groups = new Map<string, { hostId: string; paths: string[]; crews: Array<{ crew: Crew; branch: string }> }>();
+    for (const crew of crews) {
+      signal?.throwIfAborted();
+      let found = crewBranches.get(crew.threadId);
+      if (!found) {
+        found = await boundedFollowUp(async (s) => {
+          const envId = await threadEnv(crew.threadId, s);
+          if (!envId) return undefined;
+          const env = asRecord(await raceAbort(bb.sdk.environments.get({ environmentId: envId, signal: s }), s, STUCK_HOST_CALL_MS));
+          const branch = typeof env["branchName"] === "string" ? env["branchName"] : "";
+          const path = typeof env["path"] === "string" ? env["path"] : "";
+          const hostId = typeof env["hostId"] === "string" ? env["hostId"] : "";
+          return branch && path && hostId && env["isWorktree"] !== false ? { branch, path, hostId } : undefined;
+        }, signal).catch((error) => { if (signal?.aborted) throw error; return undefined; });
+        if (!found) continue;
+        crewBranches.set(crew.threadId, found);
+      }
+      const key = `${crew.projectId}\t${found.hostId}`;
+      const group = groups.get(key) ?? { hostId: found.hostId, paths: [], crews: [] };
+      group.paths.push(found.path);
+      group.crews.push({ crew, branch: found.branch });
+      groups.set(key, group);
+    }
+    for (const group of groups.values()) {
+      signal?.throwIfAborted();
+      await boundedFollowUp(async (s) => {
+        let listed: unknown;
+        for (const path of [...new Set(group.paths)].slice(0, 3)) {
+          const res = await runStructuredOnHost(group.hostId, `cd ${shQuote(path)} && gh pr list --state open --author ${shQuote("@me")} --json number,url,title,headRefName,createdAt --limit 100`, 30_000, s);
+          if (res.exitCode === 0) { listed = JSON.parse(res.output); break; }
+        }
+        if (!Array.isArray(listed)) return;
+        for (const pr of listed.map(asRecord)) {
+          const url = typeof pr["url"] === "string" ? pr["url"] : "", head = typeof pr["headRefName"] === "string" ? pr["headRefName"] : "";
+          if (!url || !head) continue;
+          const owner = group.crews
+            .filter(({ branch }) => head === branch || head.startsWith(`${branch}-`) || head.startsWith(`${branch}/`))
+            .sort((a, b) => b.branch.length - a.branch.length)[0];
+          if (!owner) continue;
+          const title = typeof pr["title"] === "string" && pr["title"].trim() ? pr["title"].trim().slice(0, 300) : undefined;
+          const opened = typeof pr["createdAt"] === "string" ? Date.parse(pr["createdAt"]) : NaN;
+          let id: string;
+          try { id = canonicalPr(url).id; } catch { continue; }
+          const prior = deliveries.get(id);
+          if (prior) { if (title && !prior.title) deliveries.save({ ...prior, title }); continue; }
+          await registerCrewPr(owner.crew, url, s, { title, ...(Number.isFinite(opened) ? { openedAt: opened } : {}) })
+            .catch((error) => { if (s.aborted) throw error; bb.log.warn(`Open PR tracking ${id}: ${String(error)}`); });
+        }
+      }, signal).catch((error) => { if (!signal?.aborted) bb.log.warn(`Open PR sweep: ${String(error)}`); });
+    }
+  }
   async function deliveryPass(signal?: AbortSignal) {
     await recoverDoneDeliveries(signal);
     const crews = await raceAbort(readCrews(),signal,STUCK_HOST_CALL_MS);
@@ -6351,6 +6415,7 @@ export default async function plugin(bb: BbPluginApi) {
     for (const record of deliveries.pendingNotifications()) {
       if (record.notification.desired !== record.notification.delivered) await boundedFollowUp(s=>notifyDelivery(record,s),signal).catch(error=>bb.log.warn(`PR notification ${record.id}: ${String(error)}`));
     }
+    await openPrSweep(signal).catch(error=>{ if (!signal?.aborted) bb.log.warn(`Open PR sweep: ${String(error)}`); });
   }
   const deliveryParams = z.object({
     action:z.enum(["list","inspect","register","reconcile","assign","abandon","verify","account"]),
@@ -6367,6 +6432,14 @@ export default async function plugin(bb: BbPluginApi) {
     const thread=await bb.sdk.threads.get({ threadId:owner });
     const projectId=thread.projectId;
     if (input.action === "list") return deliveries.list({ owner:input.all ? undefined : owner,projectId,includeLost:true,limit:input.limit,offset:input.offset });
+    if (input.action === "register" && !input.crewId) {
+      // A PR the captain opened itself: tracked under the captain until it merges.
+      if (!input.url) throw new Error("Register needs --url <PR url> for a PR you opened, or --crew <id> for a crew's PR.");
+      if (input.requirement && !input.authorized) throw new Error("Setting an explicit delivery contract requires user authority; an existing contract cannot be replaced by registration.");
+      const identity=canonicalPr(input.url);
+      const home=await bb.storage.kv.get<string>(`native-home:${owner}`) ?? "";
+      return [deliveries.register({ url:identity.url,taskId:`captain:${identity.id}`,projectId,owner,home,worker:"",requirement:input.requirement ?? "merged" })];
+    }
     if (input.action === "register") {
       const crew=await findCrew(input.crewId ?? "");
       if (!crew || crew.parentThreadId !== owner || crew.projectId !== projectId || crew.shape !== "ship") throw new Error("Register requires an owned ship on this project.");
