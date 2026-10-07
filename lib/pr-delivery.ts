@@ -62,6 +62,9 @@ export function boardPullRequests(records: readonly DeliveryRecord[]): BoardPr[]
     return [{ ref: r.id, ...(r.title ? { title: r.title } : {}), state: r.ownerNeeded ? 'waiting on you' : state, openedAt: r.openedAt ?? r.updatedAt }];
   });
 }
+/** How often a PR without a live manager is read on GitHub, so a merge or close
+ * still leaves the open list within minutes. */
+export const LOST_OWNER_RECHECK_MS = 5 * 60_000;
 const terminal = (r: DeliveryRecord) => r.status === 'complete' || r.status === 'explicitly-abandoned';
 function notificationKey(r: DeliveryRecord) {
   return createHash('sha256').update(JSON.stringify([r.headSha, r.status, r.owner, r.ownerNeeded, r.blocker, (r.failures??[]).filter(f=>f.resolvedAt===null).map(f=>[f.id,f.accounting??null])])).digest('hex');
@@ -201,7 +204,7 @@ export function createDeliveries(db: Database) {
   function ownerLost(owner:string) {
     const now=Date.now();
     db.prepare(`UPDATE deliveries SET due=?,record=json_set(record,'$.ownerNeeded',json('true'),'$.nextAction','Explicitly assign a new manager','$.nextCheckAt',?,'$.notification.desired','owner-needed:'||id||':'||owner)
-      WHERE owner=? AND status NOT IN ('complete','explicitly-abandoned')`).run(now+3_600_000,now+3_600_000,owner);
+      WHERE owner=? AND status NOT IN ('complete','explicitly-abandoned')`).run(now+LOST_OWNER_RECHECK_MS,now+LOST_OWNER_RECHECK_MS,owner);
   }
   /** Mark one record as needing a new manager without delaying the owner's other records. */
   function markOwnerNeeded(id:string) {
