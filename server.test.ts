@@ -9718,6 +9718,51 @@ test("real dispatch of headed task text fills intent and spec from the task's ow
   }
 });
 
+test("every real brief names skill-routing, poteto mode and the playbook that matches the task", async () => {
+  for (const [args, playbook, specStart] of [
+    [["--", "fix the flaky login redirect"], "bug-fix.md", "Implement the captain's intent"],
+    [["--", "Add a CSV export to the reports page"], "feature.md", "Implement the captain's intent"],
+    [["--shape", "scout", "--", "Fix nothing; find why Telegram delivery stalls"], "investigation.md", "Investigate the captain's intent"],
+    [["--", "## Captain's intent\nAdd CSV export\n\n## Firstmate spec\nTouch only auth.ts."], "feature.md", "Touch only auth.ts."],
+  ] as const) {
+    const host = realHost();
+    await plugin(host.bb);
+    try {
+      const { seen } = stubRealTransportBacklog(host, { threadIdAfterSpawn: "thr_real" });
+      const result = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", ...args], { projectId: "proj_1" });
+      assert.equal(result.exitCode, 0, result.stderr);
+      const fill = seen.find((c) => c.includes("FM_INTENT="))!;
+      const encoded = /FM_TASK_OWN_SPEC=([A-Za-z0-9+/=]+)/.exec(fill);
+      assert.ok(encoded, `no Firstmate spec for ${args.join(" ")}`);
+      const spec = Buffer.from(encoded[1]!, "base64").toString("utf8");
+      assert.ok(spec.startsWith(specStart), spec);
+      assert.match(spec, /skill-routing/);
+      assert.match(spec, /poteto-mode\/SKILL\.md/);
+      assert.ok(spec.includes(`poteto-mode/playbooks/${playbook}`), spec);
+    } finally {
+      await host.harness.lifecycle.dispose();
+    }
+  }
+});
+
+test("a BB-transport crew prompt also names skill-routing, poteto mode and the matched playbook", async () => {
+  const host = await load();
+  try {
+    host.harness.sdk.stub("environments.list", async () => [{ hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" }]);
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew" }));
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "starting" }));
+    const result = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--", "fix the crash on save"], { projectId: "proj_1" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    const spawn = host.harness.sdk.callsTo("threads.spawn")[0]![0] as { prompt: string };
+    assert.match(spawn.prompt, /skill-routing/);
+    assert.match(spawn.prompt, /poteto-mode\/SKILL\.md/);
+    assert.match(spawn.prompt, /poteto-mode\/playbooks\/bug-fix\.md/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("report-only dispatch fills an investigation specification without implementation boilerplate", async () => {
   const host = realHost();
   await plugin(host.bb);
