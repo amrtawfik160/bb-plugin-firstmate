@@ -479,3 +479,24 @@ test("firstmate_inbox lists open and delegated owner messages for the calling ca
     await host.harness.lifecycle.dispose();
   }
 });
+
+test("telegramCommand answers /inbox and /workers for the captain only", async () => {
+  const host = await load();
+  try {
+    await telegramFlags(host);
+    host.harness.sdk.stub("threads.getPluginMetadata", async ({ threadId }: { threadId: string }) => (
+      threadId === "thr_cap" ? { captain: "true" } : {}
+    ));
+    host.harness.sdk.stub("threads.list", async () => []);
+    recordTelegram(host, "thr_cap", "1669");
+    const inbox = await host.harness.behavior.callRpc("telegramCommand", { command: "inbox", threadId: "thr_cap" }) as { text: string };
+    assert.match(inbox.text, /^1 owner message\(s\) still need a final answer:\n- tg:200:1669/);
+    const workers = await host.harness.behavior.callRpc("telegramCommand", { command: "workers", threadId: "thr_cap" }) as { text: string };
+    assert.equal(typeof workers.text, "string");
+    assert.ok(workers.text.length > 0, workers.text);
+    const stranger = await host.harness.behavior.callRpc("telegramCommand", { command: "inbox", threadId: "thr_other" }) as { text: string };
+    assert.match(stranger.text, /not a Firstmate captain/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});

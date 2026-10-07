@@ -13,6 +13,14 @@ const crewRow = z.object({
 });
 
 export const rpcContract = defineRpcContract({
+  telegramCommand: {
+    experimental_description: "Answer a Telegram owner command (/inbox or /workers) for one captain thread as plain text.",
+    input: z.object({
+      command: z.enum(["inbox", "workers"]),
+      threadId: z.string().min(1),
+    }),
+    output: z.object({ text: z.string() }),
+  },
   fleet: {
     // null is the pre-0.4.0 app contract. Keep it during live reloads because
     // already-open BB tabs can run the previous bundle until they refresh.

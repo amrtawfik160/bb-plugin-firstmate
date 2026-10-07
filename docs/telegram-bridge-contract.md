@@ -104,6 +104,22 @@ keeps the item open for the next reply.
 `firstmate_inbox` lists every item still waiting: `received` and `acked` items,
 and `delegated` items with their crew.
 
+## Owner commands
+
+The connector answers `/inbox` and `/workers` itself by calling Firstmate:
+
+```
+bb.sdk.plugins.callRpc({
+  pluginId: "firstmate",
+  method: "telegramCommand",
+  input: { command: "inbox" | "workers", threadId: <bound captain> },
+  outputSchema: { text: string },
+})
+```
+
+`/ahoy`, `/bearings`, `/afk`, `/back`, `/quiet` and `/stow` reach the captain as an
+owner message that names the skill to run. All of them appear in Telegram's "/" menu.
+
 ## Reminders
 
 When a captain turn ends, Firstmate reminds it once about each item still
