@@ -11233,6 +11233,24 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.rpc.register(rpcContract, {
+    async autoAsk({ threadId, text, options, sourceRef, messageUrl }) {
+      if (!(await isCaptainThread(threadId))) throw new Error("Automatic asks require a Firstmate captain thread.");
+      const { ask, created } = ownerAsks.ensure({ captain: threadId, kind: "question", text, options, sourceRef, messageUrl, createdAt: Date.now() });
+      await refreshOwnerBoard();
+      return { id: ask.id, created, state: ask.state };
+    },
+    async linkAsk({ threadId, id, messageUrl }) {
+      if (!(await isCaptainThread(threadId))) return { ok: false };
+      const ok = ownerAsks.link(id, threadId, messageUrl);
+      if (ok) await refreshOwnerBoard();
+      return { ok };
+    },
+    async resolveAsk({ threadId, id, resolution }) {
+      if (!(await isCaptainThread(threadId))) return { ok: false };
+      const ok = ownerAsks.resolve(id, threadId, "answered", resolution, Date.now()) !== undefined;
+      if (ok) await refreshOwnerBoard();
+      return { ok };
+    },
     async telegramCommand({ command, threadId }) {
       if (!(await isCaptainThread(threadId))) return { text: "The Telegram captain is not a Firstmate captain thread." };
       if (command === "inbox") {

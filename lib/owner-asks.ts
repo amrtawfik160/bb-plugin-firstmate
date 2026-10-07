@@ -18,10 +18,14 @@ export type OwnerAsk = {
   resolution: string | null;
   createdAt: number;
   resolvedAt: number | null;
+  sourceRef?: string;
+  messageUrl?: string;
 };
 
 export type NewOwnerAsk = Pick<OwnerAsk, "captain" | "kind" | "text" | "options"> & {
   id?: string;
+  sourceRef?: string;
+  messageUrl?: string;
   recommended?: number | null;
   defaultAt?: number | null;
   irreversible?: boolean;
@@ -41,7 +45,7 @@ type Database = {
 type AskRecord = {
   id: string; captain: string; kind: string; text: string; options: string; recommended: number | null;
   default_at: number | null; irreversible: number; state: string; resolution: string | null;
-  created_at: number; resolved_at: number | null;
+  created_at: number; resolved_at: number | null; source_ref: string | null; message_url: string | null;
 };
 
 export const ASK_KIND_TITLE: Record<AskKind, string> = {
@@ -120,7 +124,8 @@ export function formatBoard(input: { asks: readonly OwnerAsk[]; calls: readonly 
       const label = recommendedLabel(ask);
       return `${ASK_KIND_EMOJI[ask.kind]} ${clip(ask.text, 140)} (${formatAge(input.now - ask.createdAt)}, ask ${ask.id})`
         + (label !== null ? ` Recommended: ${label}.` : "")
-        + (ask.defaultAt !== null && label !== null ? ` Auto at ${formatUtcTime(ask.defaultAt)}.` : "");
+        + (ask.defaultAt !== null && label !== null ? ` Auto at ${formatUtcTime(ask.defaultAt)}.` : "")
+        + (ask.messageUrl ? ` ${ask.messageUrl}` : "");
     }),
     ...input.calls.map((call) => clip(call, 160)),
   ];
@@ -143,6 +148,8 @@ export function askIdFromSourceEventId(sourceEventId: string | null | undefined)
 
 export type OwnerAsks = {
   create(input: NewOwnerAsk): OwnerAsk;
+  ensure(input: NewOwnerAsk & { sourceRef: string }): { ask: OwnerAsk; created: boolean };
+  link(id: string, captain: string, messageUrl: string): boolean;
   get(id: string): OwnerAsk | undefined;
   listOpen(captain: string): OwnerAsk[];
   /** Close one open ask owned by this captain; undefined when it is missing, foreign, or already closed. */
@@ -170,7 +177,21 @@ function fromRecord(row: AskRecord): OwnerAsk {
     resolution: row.resolution,
     createdAt: row.created_at,
     resolvedAt: row.resolved_at,
+    ...(row.source_ref ? { sourceRef: row.source_ref } : {}),
+    ...(row.message_url ? { messageUrl: row.message_url } : {}),
   };
+}
+
+function normalizeDecisionText(text: string): string {
+  return text.normalize("NFKC").toLowerCase()
+    .replace(/\(recommended\)/g, "")
+    .replace(/[*_`]/g, "")
+    .replace(/^\s*[a-z][.)]\s+/gm, "")
+    .replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+}
+
+function decisionKey(ask: Pick<OwnerAsk, "text" | "options">): string {
+  return JSON.stringify([normalizeDecisionText(ask.text), ask.options.map((option) => normalizeDecisionText(option.label))]);
 }
 
 export function createOwnerAsks(db: Database): OwnerAsks {
@@ -180,40 +201,70 @@ export function createOwnerAsks(db: Database): OwnerAsks {
     resolution TEXT, created_at INTEGER NOT NULL, resolved_at INTEGER);
     CREATE INDEX IF NOT EXISTS owner_ask_open ON owner_ask(captain, state, created_at);`);
 
+  db.exec(`CREATE TABLE IF NOT EXISTS owner_ask_source (
+    captain TEXT NOT NULL, source_ref TEXT NOT NULL, ask_id TEXT NOT NULL,
+    PRIMARY KEY(captain, source_ref));
+    CREATE TABLE IF NOT EXISTS owner_ask_link (
+      id TEXT PRIMARY KEY, message_url TEXT NOT NULL);`);
+
+  const select = `SELECT owner_ask.*,
+    (SELECT source_ref FROM owner_ask_source WHERE ask_id=owner_ask.id ORDER BY source_ref LIMIT 1) AS source_ref,
+    owner_ask_link.message_url FROM owner_ask LEFT JOIN owner_ask_link USING(id)`;
+
   function get(id: string): OwnerAsk | undefined {
-    const row = db.prepare("SELECT * FROM owner_ask WHERE id=?").get(id) as AskRecord | undefined;
+    const row = db.prepare(`${select} WHERE owner_ask.id=?`).get(id) as AskRecord | undefined;
     return row ? fromRecord(row) : undefined;
   }
 
   function listOpen(captain: string): OwnerAsk[] {
-    return (db.prepare("SELECT * FROM owner_ask WHERE captain=? AND state='open' ORDER BY created_at, id").all(captain) as AskRecord[]).map(fromRecord);
+    return (db.prepare(`${select} WHERE captain=? AND state='open' ORDER BY created_at, owner_ask.id`).all(captain) as AskRecord[]).map(fromRecord);
+  }
+
+  function create(input: NewOwnerAsk): OwnerAsk {
+    let id = input.id ?? newAskId();
+    while (input.id === undefined && get(id)) id = newAskId();
+    const ask: OwnerAsk = {
+      id,
+      captain: input.captain,
+      kind: input.kind,
+      text: input.text,
+      options: input.options,
+      recommended: input.recommended ?? null,
+      defaultAt: input.defaultAt ?? null,
+      irreversible: input.irreversible === true,
+      state: "open",
+      resolution: null,
+      createdAt: input.createdAt,
+      resolvedAt: null,
+      ...(input.sourceRef ? { sourceRef: input.sourceRef } : {}),
+      ...(input.messageUrl ? { messageUrl: input.messageUrl } : {}),
+    };
+    db.prepare("INSERT INTO owner_ask VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(
+      ask.id, ask.captain, ask.kind, ask.text, JSON.stringify(ask.options), ask.recommended, ask.defaultAt,
+      ask.irreversible ? 1 : 0, ask.state, null, ask.createdAt, null,
+    );
+    if (input.sourceRef) db.prepare("INSERT INTO owner_ask_source VALUES (?,?,?)").run(input.captain, input.sourceRef, ask.id);
+    if (input.messageUrl) db.prepare("INSERT INTO owner_ask_link VALUES (?,?)").run(ask.id, input.messageUrl);
+    return ask;
   }
 
   return {
-    create(input) {
+    create: (input) => db.transaction(() => create(input))(),
+    ensure(input) {
       return db.transaction(() => {
-        let id = input.id ?? newAskId();
-        while (input.id === undefined && get(id)) id = newAskId();
-        const ask: OwnerAsk = {
-          id,
-          captain: input.captain,
-          kind: input.kind,
-          text: input.text,
-          options: input.options,
-          recommended: input.recommended ?? null,
-          defaultAt: input.defaultAt ?? null,
-          irreversible: input.irreversible === true,
-          state: "open",
-          resolution: null,
-          createdAt: input.createdAt,
-          resolvedAt: null,
-        };
-        db.prepare("INSERT INTO owner_ask VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(
-          ask.id, ask.captain, ask.kind, ask.text, JSON.stringify(ask.options), ask.recommended, ask.defaultAt,
-          ask.irreversible ? 1 : 0, ask.state, null, ask.createdAt, null,
-        );
-        return ask;
+        const source = db.prepare("SELECT ask_id FROM owner_ask_source WHERE captain=? AND source_ref=?").get(input.captain, input.sourceRef) as { ask_id: string } | undefined;
+        const key = decisionKey(input);
+        const existing = source ? get(source.ask_id) : listOpen(input.captain).find((ask) => decisionKey(ask) === key);
+        const ask = existing ?? create(input);
+        db.prepare("INSERT OR IGNORE INTO owner_ask_source VALUES (?,?,?)").run(input.captain, input.sourceRef, ask.id);
+        return { ask, created: !existing };
       })();
+    },
+    link(id, captain, messageUrl) {
+      const current = get(id);
+      if (!current || current.captain !== captain) return false;
+      db.prepare("INSERT INTO owner_ask_link VALUES (?,?) ON CONFLICT(id) DO UPDATE SET message_url=excluded.message_url").run(id, messageUrl);
+      return true;
     },
     get,
     listOpen,

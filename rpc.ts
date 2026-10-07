@@ -13,6 +13,24 @@ const crewRow = z.object({
 });
 
 export const rpcContract = defineRpcContract({
+  autoAsk: {
+    input: z.object({
+      threadId: z.string().min(1),
+      text: z.string().min(1).max(16000),
+      options: z.array(z.object({ label: z.string().min(1).max(1000), value: z.string().min(1).max(1000) })).max(26),
+      sourceRef: z.string().min(1).max(512),
+      messageUrl: z.string().url().optional(),
+    }),
+    output: z.object({ id: z.string(), created: z.boolean(), state: z.enum(["open", "answered", "defaulted", "cancelled"]) }),
+  },
+  linkAsk: {
+    input: z.object({ threadId: z.string().min(1), id: z.string().min(1).max(64), messageUrl: z.string().url() }),
+    output: z.object({ ok: z.boolean() }),
+  },
+  resolveAsk: {
+    input: z.object({ threadId: z.string().min(1), id: z.string().min(1).max(64), resolution: z.string().min(1).max(2000) }),
+    output: z.object({ ok: z.boolean() }),
+  },
   telegramCommand: {
     experimental_description: "Answer a Telegram owner command (/inbox, /workers, or the board) for one captain thread as plain text. For board, away is the captain's /afk posture.",
     input: z.object({

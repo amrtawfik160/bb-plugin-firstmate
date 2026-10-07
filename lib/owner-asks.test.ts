@@ -172,3 +172,36 @@ test("the store resolves only the owner's open asks and defaults only reversible
   assert.equal(asks.resolve("a2", "thr_cap", "answered", "again", NOW), undefined);
   assert.deepEqual(asks.listOpen("thr_cap").map((a) => a.id), ["a3"]);
 });
+
+test("automatic decisions reuse explicit asks, survive restart, and retain answered source identities", () => {
+  const database = db();
+  const asks = createOwnerAsks(database);
+  asks.create({ id: "aexplicit", captain: "thr_cap", kind: "approval", text: "Publish Safi #491?", options: [{ label: "Publish", value: "publish" }, { label: "Wait", value: "wait" }], createdAt: NOW });
+  const input = { captain: "thr_cap", kind: "question" as const, text: "**Publish Safi #491?**", options: [{ label: "A. Publish (Recommended)", value: "A" }, { label: "B. Wait", value: "B" }], sourceRef: "tg:200:3001:decision:0", createdAt: NOW };
+  const first = asks.ensure(input);
+  assert.deepEqual({ id: first.ask.id, created: first.created, state: first.ask.state }, { id: "aexplicit", created: false, state: "open" });
+  assert.equal(asks.link("aexplicit", "thr_other", "https://t.me/c/200/3001"), false);
+  assert.equal(asks.link("aexplicit", "thr_cap", "https://t.me/c/200/3001"), true);
+  const restarted = createOwnerAsks(database);
+  assert.equal(restarted.get("aexplicit")?.messageUrl, "https://t.me/c/200/3001");
+  assert.equal(restarted.ensure({ ...input, sourceRef: "tg:200:3002:decision:0" }).ask.id, "aexplicit");
+  assert.equal(restarted.resolve("aexplicit", "thr_cap", "answered", "Publish", NOW)?.resolution, "Publish");
+  const replay = restarted.ensure(input);
+  assert.deepEqual({ id: replay.ask.id, created: replay.created, state: replay.ask.state }, { id: "aexplicit", created: false, state: "answered" });
+  assert.equal(restarted.listOpen("thr_cap").length, 0);
+  assert.equal(restarted.ensure({ ...input, sourceRef: "tg:200:3003:decision:0" }).created, true);
+});
+
+test("old ask databases migrate without losing open asks and unparsed decisions link from the board", () => {
+  const database = db();
+  database.exec(`CREATE TABLE owner_ask (id TEXT PRIMARY KEY, captain TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL, options TEXT NOT NULL, recommended INTEGER, default_at INTEGER, irreversible INTEGER NOT NULL, state TEXT NOT NULL, resolution TEXT, created_at INTEGER NOT NULL, resolved_at INTEGER);
+    INSERT INTO owner_ask VALUES ('aold','thr_cap','question','Sign in to RunAnts?','[]',NULL,NULL,0,'open',NULL,0,NULL);`);
+  const asks = createOwnerAsks(database);
+  assert.equal(asks.get("aold")?.text, "Sign in to RunAnts?");
+  database.prepare("INSERT INTO owner_ask VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run("arollback", "thr_other", "question", "Old plugin still asks?", "[]", null, null, 0, "open", null, NOW, null);
+  assert.equal(asks.get("arollback")?.text, "Old plugin still asks?");
+  assert.equal(database.prepare("PRAGMA table_info(owner_ask)").all().length, 12);
+  const result = asks.ensure({ id: "anew", captain: "thr_cap", kind: "question", text: "Approve cleanup?", options: [], sourceRef: "tg:200:3004:decision:0", messageUrl: "https://t.me/c/200/3004", createdAt: NOW });
+  assert.deepEqual({ id: result.ask.id, created: result.created }, { id: "anew", created: true });
+  assert.equal(formatBoard({ asks: [result.ask], calls: [], now: NOW }), "📌 Waiting on you (1)\n\n1. ❓ Approve cleanup? (0 min, ask anew) https://t.me/c/200/3004\n\nTap a question's button or reply to it to answer.");
+});
