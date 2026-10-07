@@ -18,6 +18,21 @@ import time
 import uuid
 
 
+# Mirrors lib/crew-contract.ts redactSecrets. A KEY name needs a prefix so native
+# decision keys ([key=api]) survive; 40-hex git commit IDs stay readable.
+SECRET_ASSIGNMENT = re.compile(r'''\b([A-Za-z0-9_-]*(?:[A-Za-z0-9][_-]?key|secret|token|passw(?:or)?d|credential))(["']?\s*[:=]\s*)(["']?)(?!\[redacted\])[^\s"']+''', re.I)
+DEPLOY_KEY = re.compile(r'\b(?:prod|dev|preview):[A-Za-z0-9-]+\|[A-Za-z0-9+/=_-]{8,}')
+LONG_HEX = re.compile(r'\b[0-9a-f]{48,}\b', re.I)
+LONG_BASE64 = re.compile(r'[A-Za-z0-9+/_-]{40,}={0,2}')
+
+
+def redact(text):
+    text = DEPLOY_KEY.sub('[redacted]', text)
+    text = SECRET_ASSIGNMENT.sub(lambda m: m.group(1) + m.group(2) + m.group(3) + '[redacted]', text)
+    text = LONG_HEX.sub('[redacted]', text)
+    return LONG_BASE64.sub(lambda m: '[redacted]' if re.search('[A-Z]', m[0]) and re.search('[a-z]', m[0]) and re.search('[0-9]', m[0]) else m[0], text)
+
+
 def git(*args):
     result = subprocess.run(['git', *args], capture_output=True, check=True)
     return result.stdout
@@ -118,7 +133,7 @@ def status(home, state, task, phase, summary, key=None):
     with os.fdopen(descriptor, 'a') as stream:
         if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
             raise ValueError('native task status must be a regular file')
-        stream.write(f'{stamp}: {summary}\n')
+        stream.write(f'{stamp}: {redact(summary)}\n')
     root = Path(os.environ.get('FM_ROOT_OVERRIDE', str(home)))
     ledger = root / 'bin-bb/fm-fleet-ledger.sh'
     if (home / 'config/fleet-ledger').exists() and ledger.exists():
@@ -150,7 +165,7 @@ def report(data, phase, summary):
     lines += ['', 'Check results describe only the recorded commands and revision. Application or production behavior requires its own evidence.', '']
     if (data / 'progress-before-checkpoint.md').exists():
         lines += ['Previous authored report retained at progress-before-checkpoint.md; its claims have not been revalidated.', '']
-    atomic(data / 'progress.md', '\n'.join(lines))
+    atomic(data / 'progress.md', redact('\n'.join(lines)))
     save(marker, {'schema': 1, 'revision': current, 'phase': phase})
 
 
@@ -377,7 +392,7 @@ def check(args, home, state, data, values):
                 return
             log = path.with_suffix('.log')
             if log.exists():
-                print(log.read_text()[-8000:], end='')
+                print(redact(log.read_text()[-8000:]), end='')
             if row.get('finishedRevision') != row['revision'] or row['revision'] != revision():
                 raise ValueError('worktree changed during or after validation; rerun on the final revision')
             if row.get('error'):

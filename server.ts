@@ -80,7 +80,7 @@ import { AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython } from 
 import { boardPullRequests, createDeliveries, LOST_OWNER_RECHECK_MS, canonicalPr, deliveryLine, parseForge, type DeliveryRecord } from "./lib/pr-delivery.ts";
 import { captureHostCommand, decodeHostCapture } from "./lib/host-capture.ts";
 import { selectExecution, validateLaunchCapabilities } from "./lib/execution-selection.ts";
-import { crewSkillBlock } from "./lib/crew-contract.ts";
+import { crewSkillBlock, redactSecrets } from "./lib/crew-contract.ts";
 import { rpcContract } from "./rpc.ts";
 import {
   UPSTREAM_FIRSTMATE_SHA,
@@ -3210,7 +3210,7 @@ export default async function plugin(bb: BbPluginApi) {
     try {
       const result = await raceAbort(bb.sdk.threads.output({ threadId: crew.threadId }), signal, STUCK_HOST_CALL_MS);
       const text = asRecord(result)["output"];
-      return typeof text === "string" ? truncate(text, max) : null;
+      return typeof text === "string" ? truncate(redactSecrets(text), max) : null;
     } catch {
       return null;
     }
@@ -3265,7 +3265,7 @@ export default async function plugin(bb: BbPluginApi) {
       const result = await runOnHost(hostId,
         `if [ -L ${path} ] || [ ! -e ${path} ]; then exit 3; elif [ -f ${path} ] && [ -r ${path} ]; then cat -- ${path}; else echo "unreadable native status" >&2; exit 1; fi`, 15_000);
       if (result.exitCode !== 0 && result.exitCode !== 3) throw new Error(`Native status read failed crew=${crew.id}: ${result.output || `exit ${result.exitCode}`}`);
-      return { lines: result.exitCode === 3 ? [] : result.output.split(/\r?\n/), kind: await foldKind(crew, hostId) };
+      return { lines: result.exitCode === 3 ? [] : redactSecrets(result.output).split(/\r?\n/), kind: await foldKind(crew, hostId) };
     }
     return { lines: statusLinesFrom(output === undefined ? await crewOutput(crew) : output),
       kind: isSecondmateRoute(crew) ? "secondmate" : crew.shape };
@@ -5030,7 +5030,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     // Compatibility scouts persist the entire final output as a durable artifact.
     if (!report?.trim()) throw new Error("Scout durable report is missing or unreadable.");
-    reports.put(scout.projectId,owner ?? "",scout.id,report);
+    reports.put(scout.projectId,owner ?? "",scout.id,redactSecrets(report));
     return `Read the complete durable scout report with: bb firstmate scout-report ${scout.id}. Keep its recommendations and acceptance criteria intact.`;
   }
 
@@ -9080,7 +9080,7 @@ export default async function plugin(bb: BbPluginApi) {
     try {
       const result = await raceAbort(bb.sdk.threads.output({ threadId: crew.threadId }), signal, STUCK_HOST_CALL_MS);
       const text = asRecord(result)["output"];
-      return { ok: true, text: typeof text === "string" ? truncate(text, 300) : "" };
+      return { ok: true, text: typeof text === "string" ? truncate(redactSecrets(text), 300) : "" };
     } catch {
       return { ok: false };
     }
