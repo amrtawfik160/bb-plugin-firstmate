@@ -3,7 +3,7 @@ import type { BbPluginApi } from '@get-bb/plugin-sdk';
 import type { BoardPr } from './owner-asks.ts';
 type Database = ReturnType<BbPluginApi['storage']['database']>;
 export type DeliveryRequirement = 'pr' | 'merged' | 'merged-and-verified';
-export type DeliveryStatus = 'draft' | 'waiting-checks' | 'failing-checks' | 'waiting-review' | 'waiting-native-gates' | 'changes-requested' | 'on-hold' | 'waiting-approval' | 'ready-to-merge' | 'merged-needs-verification' | 'closed-needs-disposition' | 'pr-delivered' | 'complete' | 'explicitly-abandoned';
+export type DeliveryStatus = 'draft' | 'waiting-checks' | 'failing-checks' | 'waiting-review' | 'waiting-native-gates' | 'changes-requested' | 'on-hold' | 'changed-since-hold' | 'waiting-approval' | 'ready-to-merge' | 'merged-needs-verification' | 'closed-needs-disposition' | 'pr-delivered' | 'complete' | 'explicitly-abandoned';
 export interface CheckFailure {
   id:string; name:string; url:string; headSha:string; resolvedAt:number|null;
   accounting?:{scope:'author'|'baseline'; taskId:string; worker:string; evidence:string; actor:string; at:number};
@@ -20,6 +20,8 @@ export interface DeliveryRecord {
   ownerNeeded: boolean; verifiedCommitSha: string | null; disposition: { reason: string; actor: string; at: number } | null;
   notification: { desired: string | null; delivered: string | null; queued: string | null; retryAt: number; attempted?: string | null; attemptedAt?: number };
   actionDueAt: number;
+  /** Head commit that carried a do-not-merge verdict. Set until the PR merges or the captain clears it. */
+  heldHead?: string | null;
   updatedAt: number;
 }
 export interface ForgeObservation {
@@ -47,6 +49,7 @@ const BOARD_PR_STATE: Record<DeliveryStatus, string | null> = {
   'failing-checks': 'checks failing',
   'changes-requested': 'changes requested',
   'on-hold': 'on hold (do not merge)',
+  'changed-since-hold': 'changed since hold, needs a check',
   'waiting-review': 'waiting for review',
   'waiting-native-gates': 'waiting for review',
   'pr-delivered': 'waiting for review',
@@ -73,7 +76,7 @@ function notificationKey(r: DeliveryRecord) {
   return createHash('sha256').update(JSON.stringify([r.headSha, r.status, r.owner, r.ownerNeeded, r.blocker, (r.failures??[]).filter(f=>f.resolvedAt===null).map(f=>[f.id,f.accounting??null])])).digest('hex');
 }
 function actionable(r: DeliveryRecord) {
-  return r.ownerNeeded || ['failing-checks','changes-requested','waiting-review','waiting-native-gates','waiting-approval','ready-to-merge','merged-needs-verification','closed-needs-disposition'].includes(r.status);
+  return r.ownerNeeded || ['failing-checks','changes-requested','changed-since-hold','waiting-review','waiting-native-gates','waiting-approval','ready-to-merge','merged-needs-verification','closed-needs-disposition'].includes(r.status);
 }
 export function createDeliveries(db: Database) {
   db.exec(`CREATE TABLE IF NOT EXISTS deliveries (id TEXT PRIMARY KEY, owner TEXT, project TEXT NOT NULL, status TEXT NOT NULL, due INTEGER NOT NULL, record TEXT NOT NULL);
@@ -147,6 +150,7 @@ export function createDeliveries(db: Database) {
       if (old) old.resolvedAt=null;
       else r.failures.push({...failure,headSha:o.headSha,resolvedAt:null});
     }
+    r.heldHead=o.state!=='open' ? null : o.hold ? o.headSha : prior.heldHead === o.headSha ? null : prior.heldHead ?? null;
     if (o.state === 'merged') {
       r.status = r.requirement === 'merged-and-verified' && (r.verifiedCommitSha !== o.mergeCommitSha || r.mergeCommitSha === null) ? 'merged-needs-verification' : 'complete';
       if (r.status==='complete') r.deliverySatisfiedAt=prior.deliverySatisfiedAt ?? now;
@@ -157,7 +161,9 @@ export function createDeliveries(db: Database) {
     } else if (o.draft) {
       r.status='draft'; r.blocker='PR is a draft'; r.nextAction='Finish work and mark ready';
     } else if (o.hold) {
-      r.status='on-hold'; r.blocker=`Do-not-merge verdict: ${o.hold}`; r.nextAction='Do not merge. A new commit or removing the label lifts the hold';
+      r.status='on-hold'; r.blocker=`Do-not-merge verdict: ${o.hold}`; r.nextAction='Do not merge. New commits need a captain check before the hold lifts';
+    } else if (r.heldHead) {
+      r.status='changed-since-hold'; r.blocker='New commits since the do-not-merge verdict; nobody has checked them yet'; r.nextAction='Check the new commits, then merge or clear the hold with a reason';
     } else if (o.review === 'changes-requested') {
       r.status='changes-requested'; r.blocker='Reviewer requested changes'; r.nextAction='Reuse the author for fixes, then repeat the agreed review and validation';
     } else if (o.checks === 'failing') {
@@ -179,7 +185,7 @@ export function createDeliveries(db: Database) {
     if (r.requirement === 'pr' && o.state === 'open' && !o.draft) {
       r.deliverySatisfiedAt=prior.deliverySatisfiedAt ?? now;
       // Artifact delivery is fulfilled independently of CI and review health.
-      if (o.checks==='failing' || o.review==='changes-requested' || o.hold) {
+      if (o.checks==='failing' || o.review==='changes-requested' || o.hold || r.heldHead) {
         r.nextAction='Inspect every independent failure. Reuse the author for branch-specific fixes; record baseline evidence and an existing authorized follow-up task separately. No merge authority is added.';
       } else {
         r.status='pr-delivered'; r.blocker=o.checks==='passing' ? '' : 'PR delivered; checks pending or unknown';
@@ -242,6 +248,22 @@ export function createDeliveries(db: Database) {
     if (!reason.trim()) throw new Error('Abandonment requires a reason and explicit authority');
     return save({ ...r, status:'explicitly-abandoned', notification:{...r.notification,desired:null,attempted:null}, disposition:{ reason:reason.trim(), actor, at:Date.now() }, blocker:'',nextAction:'Explicitly abandoned',updatedAt:Date.now() });
   }
+  /** The captain checked the commits pushed after a hold and lifts it. */
+  function clearHold(id:string, actor:string, reason:string) {
+    const r=get(id); if (!r || r.owner !== actor) throw new Error('Only the owning manager can clear a hold');
+    if (!reason.trim()) throw new Error('Clearing a hold needs a reason: what you checked');
+    if (!r.heldHead) throw new Error(`${r.id} has no hold to clear`);
+    if (r.status==='on-hold') throw new Error(`${r.id} still has a do-not-merge verdict on its current head; remove the label or comment first`);
+    return save({ ...r, heldHead:null, status:'waiting-checks', blocker:'Hold cleared; readiness not yet re-read', nextAction:'Observe PR checks and review', nextCheckAt:0, disposition:{ reason:reason.trim(), actor, at:Date.now() }, updatedAt:Date.now() });
+  }
+  /** Every record, open or closed, that belongs to one of these crew tasks or PR ids. */
+  function forTasks(taskIds:readonly string[], ids:readonly string[]=[]) {
+    if (!taskIds.length && !ids.length) return [];
+    const matching:string[]=[];
+    if (taskIds.length) matching.push(`json_extract(record,'$.taskId') IN (${taskIds.map(()=>'?').join(',')})`);
+    if (ids.length) matching.push(`id IN (${ids.map(()=>'?').join(',')})`);
+    return (db.prepare(`SELECT record FROM deliveries WHERE ${matching.join(' OR ')} ORDER BY id`).all(...taskIds,...ids) as {record:string}[]).map(row=>JSON.parse(row.record) as DeliveryRecord);
+  }
   function verify(id:string, actor:string, commitSha:string, evidence:string) {
     const r=get(id); if (!r || r.owner !== actor || r.status !== 'merged-needs-verification' || r.mergeCommitSha !== commitSha || !r.mergeCommitSha || r.freshness !== 'fresh' || !evidence.trim()) throw new Error('Verification requires the owning manager, freshly observed merged commit, and evidence');
     return save({ ...r, status:'complete', verifiedCommitSha:commitSha, notification:{...r.notification,desired:null,attempted:null},disposition:{ reason:evidence,actor,at:Date.now() },blocker:'',nextAction:'Delivery contract satisfied',updatedAt:Date.now() });
@@ -280,7 +302,7 @@ export function createDeliveries(db: Database) {
       const latest=get(id)!; if (latest.owner !== r.owner || latest.notification.desired !== signature || latest.ownerNeeded) return false; latest.notification.retryAt=now+60_000; save(latest); return false;
     }
   }
-  return { get,save,list,conflict,hasOwned,taskRecord,register,observe,stale,assign,ownerLost,markOwnerNeeded,ownerRestored,transferOwner,accountFailure,abandon,verify,markQueued,notify,pendingNotifications };
+  return { get,save,list,conflict,hasOwned,taskRecord,register,observe,stale,assign,ownerLost,markOwnerNeeded,ownerRestored,transferOwner,accountFailure,abandon,clearHold,forTasks,verify,markQueued,notify,pendingNotifications };
 }
 
 const DO_NOT_MERGE = /\b(?:do not|don'?t|dont)[\s-]+merge\b|\bdo-not-merge\b/i;

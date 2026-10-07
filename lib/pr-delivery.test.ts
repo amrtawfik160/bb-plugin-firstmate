@@ -101,3 +101,35 @@ test("a new commit after the do-not-merge comment lifts the hold, and an approva
   assert.match(boardFor(runants1759({ commits: [{ oid: "3ef8a02", committedDate: "2026-10-07T19:00:00Z" }] })), /#1759 .* — ready to merge$/);
   assert.match(boardFor(runants1759({ comments: [{ author: { login: "amrtawfik160" }, createdAt: "2026-10-07T18:35:27Z", body: "Checked on the real app. Merge it." }] })), /#1759 .* — ready to merge$/);
 });
+
+/** Observe each GitHub answer in turn for #1759, as the follow-up sweep does, and return the board after the last. */
+function boardAfter(...answers: Record<string, unknown>[]): { board: string; store: ReturnType<typeof createDeliveries> } {
+  const store = createDeliveries(db() as never);
+  store.register({ url: "https://github.com/hazw80801/runants/pull/1759", taskId: "runants-shopify-ui", projectId: "proj_1", owner: "thr_cap", home: "", worker: "thr_crew" });
+  for (const answer of answers) store.observe("hazw80801/runants#1759", parseForge(answer), false);
+  return { store, board: formatBoard({ asks: [], calls: [], prs: boardPullRequests(store.list({ owner: "thr_cap" })), now: 0 }) };
+}
+const redo = { headRefOid: "9c41d07", commits: [{ oid: "3ef8a02", committedDate: "2026-10-07T16:15:00Z" }, { oid: "9c41d07", committedDate: "2026-10-07T20:10:00Z" }] };
+const TITLE = "style(ui): restyle empty states and surfaces toward Shopify admin look";
+
+test("a held PR that gets new commits needs a captain check before it can show ready to merge", () => {
+  const { board, store } = boardAfter(runants1759(), runants1759(redo), runants1759(redo));
+  assert.equal(board, [
+    "📌 Nothing needs you right now.",
+    "",
+    "Open pull requests (1):",
+    `- hazw80801/runants#1759 ${TITLE} — changed since hold, needs a check`,
+  ].join("\n"));
+  assert.throws(() => store.clearHold("hazw80801/runants#1759", "thr_cap", " "), /needs a reason/);
+  store.clearHold("hazw80801/runants#1759", "thr_cap", "Checked the redo on the real routes");
+  store.observe("hazw80801/runants#1759", parseForge(runants1759(redo)), false);
+  assert.match(formatBoard({ asks: [], calls: [], prs: boardPullRequests(store.list({ owner: "thr_cap" })), now: 0 }), /#1759 .* — ready to merge$/);
+});
+
+test("removing the hold label on the same head lifts the hold without a check, and a merge ends it", () => {
+  const labelled = runants1759({ comments: [], labels: [{ name: "do-not-merge" }] });
+  assert.match(boardAfter(labelled, runants1759({ comments: [] })).board, /#1759 .* — ready to merge$/);
+  const merged = boardAfter(runants1759(), runants1759({ ...redo, state: "MERGED", mergeCommit: { oid: "m1" } }));
+  assert.equal(merged.store.get("hazw80801/runants#1759")?.status, "complete");
+  assert.equal(merged.store.get("hazw80801/runants#1759")?.heldHead, null);
+});

@@ -68,9 +68,10 @@ import { createDoorbellHold, doorbellHoldDecision } from "./lib/doorbell-hold.ts
 import { createRetryLedger, type RetryItem, type RetryKind } from "./lib/retry-ledger.ts";
 import { HANDOFF_WAKE_AMENDMENT, captainInstructionsWithHandoff } from "./lib/handoff-contract.ts";
 import { honestIdleVerdictPresentation, interruptIsStopped, readyClaim } from "./lib/honest-status.ts";
-import { ACK_TEXT, ackEligible, createInboundLedger, formatOwnerInbox, inboundKey, quotedReplyKind, sweeperSteerText, type InboundRow } from "./lib/inbound-ledger.ts";
+import { ACK_TEXT, ackEligible, createInboundLedger, expandTelegramRows, formatOwnerInbox, inboundKey, quotedReplyKind, sweeperSteerText, type InboundRow } from "./lib/inbound-ledger.ts";
 import { inboundHookDecision } from "./lib/inbound-dispatch.ts";
 import { formatWorkersForTelegram } from "./lib/telegram-commands.ts";
+import { createOwnerTasks, taskLine, taskSection, type OwnerTask, type TaskState } from "./lib/owner-tasks.ts";
 import { askIdFromSourceEventId, createOwnerAsks, formatAskCard, formatBoard, formatUtcTime, mayDefault, recommendedLabel, type AskKind } from "./lib/owner-asks.ts";
 import { DEFAULT_RELIABILITY_FLAGS, reliabilityFlagsFromSettings } from "./lib/reliability-flags.ts";
 import { sanitizeSettingValue } from "./lib/settings-schema.ts";
@@ -1419,6 +1420,7 @@ const CAPTAIN_SKILLS = ["captain", "firstmate", "skill-routing"] as const;
 const CAPTAIN_TOOLS = [
   "firstmate_dispatch",
   "firstmate_reply",
+  "firstmate_task",
   "firstmate_inbox",
   "firstmate_ask",
   "firstmate_resolve_ask",
@@ -1606,6 +1608,7 @@ export default async function plugin(bb: BbPluginApi) {
   const deliveries = createDeliveries(bb.storage.database());
   const inboundLedger = createInboundLedger(bb.storage.database());
   const ownerAsks = createOwnerAsks(bb.storage.database());
+  const ownerTasks = createOwnerTasks(bb.storage.database());
   const crewWatchdog = createWatchdogStore(bb.storage.database());
   const dispatchJobs = createDispatchJobs(bb.storage.database());
   const doorbellHold = createDoorbellHold(bb.storage.database());
@@ -1863,6 +1866,8 @@ export default async function plugin(bb: BbPluginApi) {
   }
   await reliabilityFlags();
   const coalesceUntil = new Map<string, number>();
+  // Owner message refs of the input that last reached each captain; a crew ping or wake clears them.
+  const ownerTurnRefs = new Map<string, string[]>();
   async function sanitizeDiagnosticSettings() {
     try {
       const current = await settings.get();
@@ -4653,6 +4658,21 @@ export default async function plugin(bb: BbPluginApi) {
     resumeDispatchJobs(owner);
   }
 
+  function reconcileTasks(captain: string, now: number): OwnerTask[] {
+    ownerTasks.reconcile(captain, (task) => deliveries.forTasks(task.crewIds, task.prs), now);
+    return ownerTasks.list(captain);
+  }
+
+  async function projectLabel(projectId: string | undefined): Promise<string | null> {
+    if (!projectId) return null;
+    try {
+      const project = await bb.sdk.projects.get({ projectId });
+      return project.name.trim() || null;
+    } catch {
+      return null;
+    }
+  }
+
   // Best effort: the connector redraws its pinned board. A missing method or a failure changes nothing here.
   async function refreshOwnerBoard(): Promise<void> {
     if ((await reliabilityFlags()).telegramThreading !== "on") return;
@@ -6485,7 +6505,7 @@ export default async function plugin(bb: BbPluginApi) {
     await openPrSweep(signal).catch(error=>{ if (!signal?.aborted) bb.log.warn(`Open PR sweep: ${String(error)}`); });
   }
   const deliveryParams = z.object({
-    action:z.enum(["list","inspect","register","reconcile","assign","abandon","verify","account"]),
+    action:z.enum(["list","inspect","register","reconcile","assign","abandon","clear-hold","verify","account"]),
     id:z.string().optional(),crewId:z.string().optional(),url:z.string().optional(),from:z.string().nullable().optional(),
     requirement:z.enum(["pr","merged","merged-and-verified"]).optional(),reason:z.string().optional(),commitSha:z.string().optional().describe("Freshly observed merged commit SHA for required verification"),
     authorized:z.boolean().optional().describe("Explicit user authority for abandonment or changing the delivery contract"),
@@ -6535,6 +6555,7 @@ export default async function plugin(bb: BbPluginApi) {
       return [deliveries.accountFailure(r.id,owner,input.failureId ?? "",input.scope ?? "author",crew.id,crew.threadId,input.reason ?? "")];
     }
     if (input.action === "verify") return [deliveries.verify(r.id,owner,input.commitSha ?? "",input.reason ?? "")];
+    if (input.action === "clear-hold") return [deliveries.clearHold(r.id,owner,input.reason ?? "")];
     await reconcileDelivery(r,asRecord(ctx)["signal"] as AbortSignal | undefined);
     await notifyDelivery(deliveries.get(r.id)!);
     return [deliveries.get(r.id)!];
@@ -9866,7 +9887,7 @@ export default async function plugin(bb: BbPluginApi) {
     dispatchHelp,
     "  bb firstmate launches list [--limit n] [--offset n] [--json]   # uncertain slots require reconciliation",
     "  bb firstmate launches adopt <task-id> --thread <thread-id> [--check] [--json]   # exact legacy registration repair; no turn or merge",
-    "  bb firstmate deliveries list|inspect|register|reconcile|assign|abandon|verify [id] [--from manager] [--reason evidence] [--authorized]",
+    "  bb firstmate deliveries list|inspect|register|reconcile|assign|abandon|clear-hold|verify [id] [--from manager] [--reason evidence] [--authorized]",
     "  bb firstmate deliveries account <id> --failure <id> --scope author|baseline --follow-up-task <existing-task> --reason <evidence> --authorized",
     "  sendAt is unsupported; backlog waitUntil requires later explicit dispatch.",
     "  bb firstmate crews | crew <id> | watch [id ...] [--timeout s] [--json]",
@@ -10094,17 +10115,36 @@ export default async function plugin(bb: BbPluginApi) {
         projectId ?? (typeof ctxRecord["projectId"] === "string" ? ctxRecord["projectId"] : undefined);
       if (resolvedProject === undefined) return toolError("No project: pass projectId.");
       const parentThreadId = typeof ctxRecord["threadId"] === "string" ? ctxRecord["threadId"] : undefined;
+      const turnRefs = parentThreadId === undefined ? [] : ownerTurnRefs.get(parentThreadId) ?? [];
+      const passedRefs = (sourceRefs ?? []).flatMap((ref) => {
+        const key = parseSourceRef(ref);
+        return key === null ? [] : [`${key.source === "telegram" ? "tg" : "bb"}:${key.chatId}:${key.messageId}`];
+      });
+      if (turnRefs.length > 0 && !passedRefs.some((ref) => turnRefs.includes(ref))) {
+        return toolError(`This turn started from owner message ${turnRefs.join(", ")}. Pass sourceRefs: ${JSON.stringify(turnRefs)} so the owner's task is tracked until it closes.`);
+      }
+      const trackTask = async (crewId: string): Promise<string> => {
+        if (parentThreadId === undefined || passedRefs.length === 0) return "";
+        const owner = passedRefs.map((ref) => parseSourceRef(ref)).map((key) => key === null ? undefined : inboundLedger.get(key)).find((row) => row !== undefined);
+        const opened = ownerTasks.open({
+          captain: parentThreadId, project: await projectLabel(resolvedProject), title: title ?? owner?.preview ?? task.split("\n")[0]!.slice(0, 120),
+          sourceRefs: passedRefs, crewId, at: Date.now(),
+        });
+        await refreshOwnerBoard();
+        return ` Owner task ${opened.id} tracks it until it is merged, live, done, or dropped; a reply does not close it.`;
+      };
       if (overrideOwner !== true) {
         const conflict = await dispatchPrConflict(task, resolvedProject, parentThreadId);
         if (conflict !== null) return toolError(conflict);
       }
       const background = (await reliabilityFlags()).asyncDispatch === "on" && parentThreadId !== undefined;
+      const crewKey = taskId ?? randomUUID().slice(0, 8);
       if (background) {
         const queued = await enqueueWhenOverCap({
-          task, taskId, title, projectId: resolvedProject, parentThreadId, shape, mode, deliveryRequirement, sourceRefs,
+          task, taskId: crewKey, title, projectId: resolvedProject, parentThreadId, shape, mode, deliveryRequirement, sourceRefs,
           providerId, model, reasoningLevel,
         });
-        if (queued) return queued;
+        if (queued) return `${queued}${await trackTask(crewKey)}`;
       }
       const current = await settings.get();
       const resolvedShape = shape ?? "ship";
@@ -10132,7 +10172,7 @@ export default async function plugin(bb: BbPluginApi) {
         sendAt, deliveryRequirement, ownerRequestedProvider,
       };
       if (background) {
-        const reservedId = taskId ?? randomUUID().slice(0, 8);
+        const reservedId = crewKey;
         dispatchJobs.save({
           crewId: reservedId,
           captainThreadId: parentThreadId,
@@ -10144,7 +10184,7 @@ export default async function plugin(bb: BbPluginApi) {
           backoffUntil: null,
         });
         trackDispatchJob(runReservedDispatch(reservedId));
-        return `Reserved crew ${reservedId}. Spawn continues in the background.`;
+        return `Reserved crew ${reservedId}. Spawn continues in the background.${await trackTask(reservedId)}`;
       }
       let crew: Crew;
       try {
@@ -10160,7 +10200,7 @@ export default async function plugin(bb: BbPluginApi) {
       const moved = spawnInput.providerId === GUARDED_SHIP_PROVIDER && crew.providerId !== GUARDED_SHIP_PROVIDER
         ? ` Note: ${GUARDED_SHIP_PROVIDER} is not used for ship work, so this crew runs on the project default provider (${crew.providerId ?? "BB default"}). Pass ownerRequestedProvider only when the owner asked for ${GUARDED_SHIP_PROVIDER}; the owner can turn this off with the shipAntigravityGuard setting.`
         : "";
-      return `Dispatched ${crew.shape} crew ${crew.id} as thread ${crew.threadId} (${status}, ${crew.posture}).${warn}${moved}${dispatchStatusNote(status)}${permissionLine(crew.id)} Track with: bb firstmate crew ${crew.id}`;
+      return `Dispatched ${crew.shape} crew ${crew.id} as thread ${crew.threadId} (${status}, ${crew.posture}).${warn}${moved}${dispatchStatusNote(status)}${permissionLine(crew.id)} Track with: bb firstmate crew ${crew.id}${await trackTask(crew.id)}`;
     },
   });
 
@@ -10316,8 +10356,62 @@ export default async function plugin(bb: BbPluginApi) {
       const sentLine = params
         ? `Replied to ${used} via ${channel} with reply_parameters ${JSON.stringify(params.reply_parameters)}.`
         : `Replied to ${used}.`;
+      const task = ownerTasks.findOpenByRef(captain, used);
+      const taskNote = task ? `\nTask ${task.id} stays open (${task.state}): a reply does not close it. Close it with firstmate_task when it is done or dropped.` : "";
       const stillOpen = inboundLedger.listPending(captain);
-      return stillOpen.length === 0 ? `${sentLine} No owner message is waiting.` : `${sentLine}\n${formatOwnerInbox(stillOpen, Date.now())}`;
+      return (stillOpen.length === 0 ? `${sentLine} No owner message is waiting.` : `${sentLine}\n${formatOwnerInbox(stillOpen, Date.now())}`) + taskNote;
+    },
+  });
+
+  registerCaptainTool({
+    name: "firstmate_task",
+    description: "Owner tasks: one per owner request, open until it is merged, live, done, or dropped. A reply never closes one. list shows open tasks. open tracks an owner request you work on yourself (refs required). close moves a task to done (outcome) or dropped (reason required). set marks it needs_you, working, or ready. link adds a PR (owner/repo#n or URL) so its merge moves the task.",
+    parameters: z.object({
+      action: z.enum(["list", "open", "close", "set", "link"]),
+      id: z.string().regex(/^T\d+$/).optional(),
+      title: z.string().min(1).max(200).optional(),
+      refs: z.array(z.string()).optional().describe("Owner message refs, tg:<chat>:<msg>"),
+      state: z.enum(["done", "dropped", "needs_you", "working", "ready"]).optional(),
+      reason: z.string().max(500).optional().describe("Outcome for done; required reason for dropped"),
+      pr: z.string().optional(),
+    }),
+    async execute({ action, id, title, refs, state, reason, pr }, ctx) {
+      const captain = ctxString(ctx, "threadId");
+      if (!captain) return toolError("firstmate_task runs only in a captain thread.");
+      const now = Date.now();
+      try {
+        if (action === "list") {
+          const open = reconcileTasks(captain, now);
+          return open.length === 0 ? "No owner task is open." : [`${open.length} owner task(s) open:`, ...open.map((item) => taskLine(item, now))].join("\n");
+        }
+        if (action === "open") {
+          const keys = (refs ?? []).map((ref) => parseSourceRef(ref));
+          if (!title || keys.length === 0 || keys.some((key) => key === null)) return toolError("open needs a title and refs: [\"tg:<chat>:<msg>\"].");
+          const sourceRefs = keys.map((key) => `${key!.source === "telegram" ? "tg" : "bb"}:${key!.chatId}:${key!.messageId}`);
+          const opened = ownerTasks.open({ captain, project: await projectLabel(ctxString(ctx, "projectId")), title, sourceRefs, at: now });
+          await refreshOwnerBoard();
+          return `Task ${opened.id} is open (${opened.state}).`;
+        }
+        if (!id) return toolError(`${action} needs id (T<n>).`);
+        let changed: OwnerTask;
+        if (action === "link") {
+          if (!pr) return toolError("link needs pr.");
+          const ref = /^[\w.-]+\/[\w.-]+#\d+$/.test(pr.trim()) ? pr.trim().toLowerCase() : canonicalPr(pr).id;
+          ownerTasks.linkPr(id, captain, ref, now);
+          reconcileTasks(captain, now);
+          changed = ownerTasks.get(id)!;
+        } else {
+          const to: TaskState | undefined = state;
+          if (to === undefined) return toolError(`${action} needs state.`);
+          if (action === "close" && to !== "done" && to !== "dropped") return toolError("close takes state done or dropped.");
+          if (action === "set" && (to === "done" || to === "dropped")) return toolError("Use action close for done or dropped.");
+          changed = ownerTasks.move(id, captain, to === "dropped" ? { to, reason: reason ?? "" } : { to, reason }, now);
+        }
+        await refreshOwnerBoard();
+        return `Task ${changed.id} is ${changed.state}${changed.dropReason ? ` (${changed.dropReason})` : ""}.`;
+      } catch (error) {
+        return toolError(error instanceof Error ? error.message : String(error));
+      }
     },
   });
 
@@ -10593,7 +10687,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  registerCaptainTool({ name:"firstmate_deliveries",description:"Durable PR health and obligations independent of worker retention. List, inspect, register, reconcile, account each independent failure to an existing authorized follow-up, explicitly assign, abandon with authority, or record agreed merge verification.",parameters:deliveryParams,
+  registerCaptainTool({ name:"firstmate_deliveries",description:"Durable PR health and obligations independent of worker retention. List, inspect, register, reconcile, account each independent failure to an existing authorized follow-up, explicitly assign, abandon with authority, clear-hold after checking commits pushed since a do-not-merge verdict (reason required), or record agreed merge verification.",parameters:deliveryParams,
     async execute(input,ctx) { return (await deliveryOperation(input,ctx)).map(deliveryLine).join("\n") || "No unresolved deliverables."; } });
 
   registerCaptainTool({
@@ -11150,7 +11244,9 @@ export default async function plugin(bb: BbPluginApi) {
         : await bearingsSnapshot(threadId);
       if (command === "board") {
         const prs = boardPullRequests(deliveries.list({ owner: threadId, limit: 100 }));
-        return { text: formatBoard({ asks: ownerAsks.listOpen(threadId), calls: snapshot.rpc.ownerCalls, prs, now: Date.now() }), away: snapshot.rpc.afk };
+        const now = Date.now();
+        const tasks = reconcileTasks(threadId, now);
+        return { text: formatBoard({ asks: ownerAsks.listOpen(threadId), calls: snapshot.rpc.ownerCalls, prs, tasks: taskSection(tasks, now), now }), away: snapshot.rpc.afk };
       }
       return { text: formatWorkersForTelegram(snapshot.rpc) };
     },
@@ -11665,6 +11761,7 @@ export default async function plugin(bb: BbPluginApi) {
         if (String(context.initiator) === "user") {
           await recordAskAnswers(threadId, text, context.queuedMessages ?? []).catch((error) => bb.log.warn(`owner ask answer: ${String(error)}`));
         }
+        let turnRefs: string[] = [];
         const inbound = inboundHookDecision({
           flags,
           attempt: context.attempt,
@@ -11698,6 +11795,7 @@ export default async function plugin(bb: BbPluginApi) {
                 senderThreadId: sender,
               }];
           for (const event of events) inboundLedger.record(event);
+          turnRefs = [...new Set(events.flatMap((event) => expandTelegramRows(event)).map((row) => telegramSourceRef(row)))];
           // An answer to an ask card needs action, not a reply, so it never raises an unanswered reminder.
           for (const event of events) {
             const header = parseConnectorHeader(event.text);
@@ -11780,7 +11878,11 @@ export default async function plugin(bb: BbPluginApi) {
           targetIsCaptain: true,
           senderIsCrew,
         });
-        if (decision === "proceed") return { action: "proceed" };
+        if (decision === "proceed") {
+          if (turnRefs.length > 0) ownerTurnRefs.set(threadId, turnRefs);
+          else ownerTurnRefs.delete(threadId);
+          return { action: "proceed" };
+        }
         heldPingCaptains.add(threadId);
         return { action: "wait", reason: "Crew update held until the captain's current turn ends (firstmate batches crew pings)." };
       } catch {
@@ -12059,7 +12161,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "activity", summary: "Bounded real BB activity for the native watcher", usage: "bb firstmate activity <thread-id> --json" },
       { name: "bearings", summary: "Fleet digest", usage: "bb firstmate bearings [--json]" },
       { name: "wake", summary: "Drain the durable crew→captain wake queue (present, or --ack-through <seq> --recovery-generation <gen>)", usage: "bb firstmate wake [--ack-through <seq> --recovery-generation <gen>]" },
-      { name: "deliveries", summary: "Durable PR health and follow-up", usage: "bb firstmate deliveries list|inspect|register|reconcile|assign|abandon|verify [id] [--from <manager>] [--reason <evidence>] [--authorized]\nbb firstmate deliveries register --url <PR url> [--crew <id>]   (no --crew: a PR you opened yourself)\nbb firstmate deliveries account <id> --failure <id> --scope author|baseline --follow-up-task <existing-task> --reason <evidence> --authorized" },
+      { name: "deliveries", summary: "Durable PR health and follow-up", usage: "bb firstmate deliveries list|inspect|register|reconcile|assign|abandon|clear-hold|verify [id] [--from <manager>] [--reason <evidence>] [--authorized]\nbb firstmate deliveries register --url <PR url> [--crew <id>]   (no --crew: a PR you opened yourself)\nbb firstmate deliveries account <id> --failure <id> --scope author|baseline --follow-up-task <existing-task> --reason <evidence> --authorized" },
       { name: "launches", summary: "Inspect reservations or explicitly adopt an existing legacy worker", usage: "bb firstmate launches list | adopt <task-id> --thread <thread-id> [--check] [--json]" },
       { name: "deliver", summary: "Outcome + committed/uncommitted diff + PR", usage: "bb firstmate deliver <crew-id>" },
       { name: "merge", summary: "Merge PR or local-only ff-only land", usage: "bb firstmate merge <crew-id> [--yes]" },
