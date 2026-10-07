@@ -99,6 +99,10 @@ export function shouldIgnoreInbound(event: LedgerEvent): boolean {
 export function eventToRow(event: LedgerEvent): InboundRow | null {
   if (shouldIgnoreInbound(event)) return null;
   const tg = event.telegram ?? null;
+  // Only owner messages from the Telegram connector are tracked. Plain BB text in a captain
+  // thread includes this plugin's own reminders, acks and delivery notices; tracking those
+  // made each reminder a new item with its own reminder, a loop that never ends.
+  if (!tg) return null;
   const source: InboundSource = tg ? "telegram" : "bb";
   const chatId = tg?.chatId ?? event.bbThreadId;
   const messageId = tg?.messageId ?? event.bbRowId ?? `${event.receivedAt}:${hashText(event.text).slice(0, 12)}`;
@@ -240,6 +244,14 @@ export function createInboundLedger(db: Database): CreateInboundLedger {
     CREATE TABLE IF NOT EXISTS inbound_chat_queue (
     chat_id TEXT NOT NULL, seq INTEGER NOT NULL, source TEXT NOT NULL, message_id TEXT NOT NULL,
     PRIMARY KEY (chat_id, seq));`);
+
+  // Rows from plain BB text were the plugin's own reminders and notices (see eventToRow).
+  // Close any left open so they stop raising reminders.
+  for (const found of db.prepare("SELECT record FROM inbound_ledger WHERE source='bb' AND state IN ('received','acked')").all() as { record: string }[]) {
+    const row = parseRow(found.record);
+    db.prepare("UPDATE inbound_ledger SET state='answered', record=? WHERE source=? AND chat_id=? AND message_id=?")
+      .run(JSON.stringify({ ...row, state: "answered", answeredAt: row.answeredAt ?? Date.now() }), row.source, row.chatId, row.messageId);
+  }
 
   function get(key: InboundKey): InboundRow | undefined {
     const found = db.prepare("SELECT record FROM inbound_ledger WHERE source=? AND chat_id=? AND message_id=?").get(key.source, key.chatId, key.messageId) as { record: string } | undefined;

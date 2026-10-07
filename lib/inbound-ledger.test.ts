@@ -17,16 +17,34 @@ function store() {
   return createInboundLedger(new Database(":memory:"));
 }
 
+let nextMessageId = 500;
+
+/** A Telegram owner message; only those are tracked. */
 function userEvent(over: Record<string, unknown> = {}) {
+  const msg = nextMessageId++;
   return {
     captainThreadId: "thr_cap",
     text: "What are you currently working on?",
     receivedAt: 1_000,
     bbThreadId: "thr_cap",
     initiator: "user",
+    telegram: parseTelegramEnvelope(`⟦tg chat=9 msg=${msg} reply_to=- group=- fwd=0 thread=- from=amr⟧`),
     ...over,
   };
 }
+
+test("plain BB text and this plugin's own reminders and notices are never tracked", () => {
+  const ledger = store();
+  for (const text of [
+    "What are you currently working on?",
+    "Unanswered for 590 min: bb:thr_cap:1:abc 'FM_DELIVERY_NOTICE=x' — answer or dispatch now.",
+    "received #1791364638983:f9ee328a57ab: Unanswered for 590 min",
+    "FM_DELIVERY_NOTICE=cyndra-ai/cyndra-saas#2112:89eb5160",
+  ]) {
+    assert.equal(ledger.record(userEvent({ text, telegram: undefined })), null, text);
+  }
+  assert.equal(ledger.listOpen("thr_cap").length, 0);
+});
 
 test("a burst of 3 messages produces 3 ledger rows", () => {
   const ledger = store();
@@ -180,4 +198,17 @@ test("an album row from the final connector keeps its media group id", () => {
   const [row] = ledger.listOpen("thr_cap");
   assert.equal(row?.messageId, "1672");
   assert.equal(row?.mediaGroupId, "13800000000000001");
+});
+
+test("opening the ledger closes rows left open from plain BB text", () => {
+  const db = new Database(":memory:");
+  const ledger = createInboundLedger(db);
+  const kept = ledger.record(userEvent())!;
+  const legacy = { ...kept, source: "bb" as const, chatId: "thr_cap", messageId: "1:abc", sourceRefs: ["bb:thr_cap:1:abc"] };
+  db.prepare("INSERT INTO inbound_ledger VALUES (?,?,?,?,?,?,?)")
+    .run("bb", "thr_cap", "1:abc", "thr_cap", 1_000, "received", JSON.stringify(legacy));
+  assert.equal(ledger.listOpen("thr_cap").length, 2);
+  const reopened = createInboundLedger(db);
+  assert.deepEqual(reopened.listOpen("thr_cap").map((row) => row.source), ["telegram"]);
+  assert.equal(reopened.get({ source: "bb", chatId: "thr_cap", messageId: "1:abc" })?.state, "answered");
 });
