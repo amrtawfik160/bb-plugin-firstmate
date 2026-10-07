@@ -176,3 +176,18 @@ test('a background check gives the unit HOME and the caller environment',{skip:!
   const [row]=f.checks();assert.equal(row.exitCode,0,readFileSync(join(f.data,'checks',`${row.id}.log`),'utf8'));
  }finally{f.close();}
 });
+
+test('reports and check output hide secret values but keep variable names',()=>{
+ const f=fixture();try {
+  f.setup();
+  const secrets=['prod:happy-otter-123|eyJ2MiI6ImFiY2RlZjAxMjM0NTY3ODkifQ==','sk_live_51HabcdefGHIJKLmnop','hunter2-Secret!','9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08'];
+  const notes=`CONVEX_DEPLOY_KEY=${secrets[0]}\nexport STRIPE_SECRET_KEY="${secrets[1]}"\nDB_PASSWORD: ${secrets[2]}\nsha ${secrets[3]}\n`;
+  const result=spawnSync('python3',[helper,'task','report','working',`deploy used API_TOKEN=${secrets[1]}`],{cwd:f.worktree,env:f.env,input:notes,encoding:'utf8'});
+  assert.equal(result.status,0,result.stderr);
+  const check=f.run('check','env dump','--','python3','-c',`print("CONVEX_DEPLOY_KEY=${secrets[0]}")`);assert.equal(check.status,0,check.stderr);
+  const id=/wait ([a-f0-9]{32})/.exec(check.stdout)?.[1];const waited=id?f.run('wait',id):check;
+  const surfaces={status:readFileSync(join(f.home,'state/task.status'),'utf8'),progress:readFileSync(join(f.data,'progress.md'),'utf8'),output:waited.stdout+waited.stderr};
+  for(const [name,text] of Object.entries(surfaces))for(const secret of secrets)assert.ok(!text.includes(secret),`${name} leaked ${secret}`);
+  assert.match(surfaces.status,/API_TOKEN=\[redacted\]/);assert.match(surfaces.progress,/CONVEX_DEPLOY_KEY=\[redacted\]/);assert.match(surfaces.progress,/STRIPE_SECRET_KEY="\[redacted\]"/);assert.match(surfaces.output,/CONVEX_DEPLOY_KEY=\[redacted\]/);
+ }finally{f.close();}
+});

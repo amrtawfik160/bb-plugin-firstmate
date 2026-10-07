@@ -3526,6 +3526,26 @@ test("firstmate_crew folds the full status protocol from crew output", async () 
   }
 });
 
+test("crew output relayed to the captain hides secret values but keeps variable names", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle" }));
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+    host.harness.sdk.stub("threads.output", async () => ({
+      output: "needs-decision [key=env]: CONVEX_DEPLOY_KEY=prod:happy-otter-123|eyJ2MiI6ImFiY2RlZjAxMjM0NTY3ODkifQ== failed; DB_PASSWORD: hunter2-Secret! and token 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    }));
+    const result = await host.harness.behavior.runCli(["crew", "c1"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /CONVEX_DEPLOY_KEY=\[redacted\]/);
+    assert.match(result.stdout, /DB_PASSWORD: \[redacted\]/);
+    for (const value of ["happy-otter-123", "eyJ2MiI6", "hunter2", "9f86d081884c7d659a2f"]) assert.ok(!result.stdout.includes(value), `${value} leaked: ${result.stdout}`);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 // Wiring regression: the fold's kind must be resolved from the crew's on-host
 // state/<id>.meta the way native `_fm_status_kind` does — NOT hardcoded "ship".
 // These drive the real host-status path (fmHome set) with a stream that ends
