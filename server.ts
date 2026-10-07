@@ -3,7 +3,7 @@ import { deflateSync } from "node:zlib";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
@@ -1112,7 +1112,7 @@ export function captainHookCommand(mode: "stop" | "stop-autoarm" | "session-star
   return `h="$HOME/.${CAPTAIN_HOOK_MARK}"; [ -n "\${BB_THREAD_ID:-}" ] || exit 0; [ -f "$HOME/.bb-firstmate/captains/$BB_THREAD_ID" ] || exit 0; [ -x "$h" ] || { echo "firstmate: registered captain missing hook $h" >&2; exit 1; }; exec "$h" ${mode}${claude ? " --claude" : ""}`;
 }
 export function captainHookInstallScript(input: {
-  threadId: string; home: string; state: string; ownHome: boolean; scriptB64: string; heavyB64: string; runtimeRoot?:string;
+  threadId: string; home: string; state: string; ownHome: boolean; hookPath: string; heavyPath: string; runtimeRoot?:string;
 }): string {
   const q = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
   const install = (file: string, claude: boolean) => {
@@ -1127,8 +1127,8 @@ export function captainHookInstallScript(input: {
   };
   return ["set -e", "command -v jq >/dev/null",
     'd="$HOME/.bb-firstmate"; mkdir -p "$d/bin" "$d/captains"',
-    `printf %s ${q(input.scriptB64)} | base64 -d > "$d/bin/bb-captain-hook.sh.tmp" && chmod 0755 "$d/bin/bb-captain-hook.sh.tmp" && mv "$d/bin/bb-captain-hook.sh.tmp" "$d/bin/bb-captain-hook.sh"`,
-    `printf %s ${q(input.heavyB64)} | base64 -d > "$d/bin/fm-heavy.tmp" && if [ -x "$d/bin/fm-heavy" ] && cmp -s "$d/bin/fm-heavy.tmp" "$d/bin/fm-heavy"; then rm -f "$d/bin/fm-heavy.tmp"; else chmod 0755 "$d/bin/fm-heavy.tmp" && mv "$d/bin/fm-heavy.tmp" "$d/bin/fm-heavy"; fi`,
+    `cp ${q(input.hookPath)} "$d/bin/bb-captain-hook.sh.tmp" && chmod 0755 "$d/bin/bb-captain-hook.sh.tmp" && mv "$d/bin/bb-captain-hook.sh.tmp" "$d/bin/bb-captain-hook.sh"`,
+    `h=${q(input.heavyPath)}; if [ ! -x "$d/bin/fm-heavy" ] || ! cmp -s "$h" "$d/bin/fm-heavy"; then cp "$h" "$d/bin/fm-heavy.tmp" && chmod 0755 "$d/bin/fm-heavy.tmp" && mv "$d/bin/fm-heavy.tmp" "$d/bin/fm-heavy"; fi`,
     `printf 'home=%s\nstate=%s\nown_home=%s\nroot=%s\n' ${q(input.home)} ${q(input.state)} ${input.ownHome ? "1" : "0"} ${q(input.runtimeRoot??input.home)} > "$d/captains/${input.threadId}"`,
     'mkdir -p "$HOME/.claude" "$HOME/.codex"',
     install('"$HOME/.claude/settings.json"', true), install('"$HOME/.codex/hooks.json"', false),
@@ -7715,16 +7715,24 @@ export default async function plugin(bb: BbPluginApi) {
     const stored = await bb.storage.kv.get<string>(`native-home:${threadId}`);
     const home = typeof stored === "string" && stored !== "" ? stored : fallbackHome;
     const selection=await bb.storage.kv.get<Record<string,unknown>>(`native-runtime:${threadId}`);
+    const stage = `/tmp/.fm-captain-bin-${randomUUID()}`;
+    const hookPath = `${stage}/bb-captain-hook.sh`, heavyPath = `${stage}/fm-heavy`;
+    for (const path of [hookPath, heavyPath]) {
+      if (!(await writeHostBytes(hostId, path, readFileSync(join(OVERLAY_DIR, "bin", basename(path)), "utf8"), 60_000, signal, true))) {
+        throw new Error(`Captain hook staging failed captain=${threadId} host=${hostId} file=${basename(path)}`);
+      }
+    }
     const script = captainHookInstallScript({
       threadId,
       runtimeRoot:typeof selection?.["root"]==="string"?selection["root"]:home,
       home,
       state: wakeStateDir(home, threadId),
       ownHome: captainHomes.get(threadId)===home || home.endsWith(`-bb-homes/${threadId}`),
-      scriptB64: overlayBytes("bin/bb-captain-hook.sh"),
-      heavyB64: overlayBytes("bin/fm-heavy"),
+      hookPath,
+      heavyPath,
     });
-    const res = await runOnHost(hostId, `bash -c ${shQuote(script)}`, 60_000, signal);
+    const res = await runOnHost(hostId, `bash -c ${shQuote(script)}`, 60_000, signal)
+      .finally(() => runHostCommand(hostId, `rm -rf ${shQuote(stage)}`, 10_000).catch(() => {}));
     if (res.exitCode !== 0 || !res.output.includes("captain-hooks-ok")) {
       throw new Error(`Captain hook install failed captain=${threadId} host=${hostId}: ${truncate(res.output, 400)}`);
     } else {

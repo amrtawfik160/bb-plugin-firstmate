@@ -8261,7 +8261,7 @@ test("captain hook install merges user-level Claude and Codex hooks idempotently
     writeFileSync(join(home, ".claude/settings.json"), JSON.stringify({ permissions: { allow: ["x"] }, hooks: { Stop: [{ hooks: [{ type: "command", command: "echo existing" }] }] } }));
     const script = captainHookInstallScript({
       threadId: "thr_cap", home: "/fm", state: "/fm/state/cap-thr_cap", ownHome: false,
-      scriptB64: readFileSync(CAPTAIN_HOOK).toString("base64"), heavyB64: readFileSync(join(dirname(CAPTAIN_HOOK), "fm-heavy")).toString("base64"),
+      hookPath: CAPTAIN_HOOK, heavyPath: join(dirname(CAPTAIN_HOOK), "fm-heavy"),
     });
     for (let i = 0; i < 3; i++) {
       const res = spawnSync("bash", ["-c", script], { encoding: "utf8", env: { PATH: process.env.PATH ?? "", HOME: home } });
@@ -8285,25 +8285,27 @@ test("captain hook install merges user-level Claude and Codex hooks idempotently
 test("captain setup installs fm-heavy once and leaves an unchanged copy alone", () => {
   const home = mkdtempSync(join(tmpdir(), "fm-heavy-install-"));
   try {
-    const install = (heavyB64: string) => {
+    const install = (heavy: Buffer) => {
+      const heavyPath = join(home, "staged-fm-heavy");
+      writeFileSync(heavyPath, heavy);
       const script = captainHookInstallScript({
         threadId: "thr_cap", home: "/fm", state: "/fm/state/cap-thr_cap", ownHome: false,
-        scriptB64: readFileSync(CAPTAIN_HOOK).toString("base64"), heavyB64,
+        hookPath: CAPTAIN_HOOK, heavyPath,
       });
       const res = spawnSync("bash", ["-c", script], { encoding: "utf8", env: { PATH: process.env.PATH ?? "", HOME: home } });
       assert.equal(res.status, 0, res.stderr);
     };
     const target = join(home, ".bb-firstmate/bin/fm-heavy");
     const shipped = readFileSync(join(dirname(CAPTAIN_HOOK), "fm-heavy"));
-    install(shipped.toString("base64"));
+    install(shipped);
     assert.deepEqual(readFileSync(target), shipped);
     assert.ok(lstatSync(target).mode & 0o100, "fm-heavy is executable");
     const first = lstatSync(target);
-    install(shipped.toString("base64"));
+    install(shipped);
     const second = lstatSync(target);
     assert.equal(second.ino, first.ino, "unchanged script is not rewritten");
     assert.equal(second.mtimeMs, first.mtimeMs);
-    install(Buffer.from("#!/bin/sh\nexec \"$@\"\n").toString("base64"));
+    install(Buffer.from("#!/bin/sh\nexec \"$@\"\n"));
     assert.equal(readFileSync(target, "utf8"), "#!/bin/sh\nexec \"$@\"\n", "changed script is replaced");
   } finally {
     rmSync(home, { recursive: true, force: true });
