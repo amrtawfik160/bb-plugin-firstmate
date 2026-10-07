@@ -24,6 +24,7 @@ export async function factory(options={}) {
  });host.harness.sdk.stub('terminals.get',async()=>({status:'running'}));host.harness.sdk.stub('terminals.output',async({terminalId})=>({nextSeq:1,chunks:[{dataBase64:Buffer.from(outputs.get(terminalId)).toString('base64')}]}));host.harness.sdk.stub('terminals.close',async()=>({}));
  const clean=async()=>{await host.harness.lifecycle.dispose();rmSync(directory,{recursive:true,force:true});};return{host,directory,seen,metadata,env,clean};
 }
+function install(f,release){const r=spawnSync('python3',[helper,'install','--store',join(f.directory,'.local/share/bb-firstmate'),'--archive',release.archive,'--sha256',release.sha256],{encoding:'utf8'});assert.equal(r.status,0,r.stdout+r.stderr);}
 for(const entry of ['cli','tool'])test(`actual registered ${entry} clean captain binding stages package on authoritative host without external source`,async()=>{
  const f=await factory();try{
  const r=entry==='cli'?await f.host.harness.behavior.runCli(['deck','--json'],ctx):await f.host.harness.registrations.agentTools.find(t=>t.name==='firstmate_deck').execute({},ctx);
@@ -36,8 +37,19 @@ for(const entry of ['cli','tool'])test(`actual registered ${entry} clean captain
 });
 test('runtime commands retain exact captain/project scope and refuse mutation with live reservation',async()=>{
  const f=await factory();try{assert.equal((await f.host.harness.behavior.runCli(['deck','--json'],ctx)).exitCode,0);const home=await f.host.bb.storage.kv.get(`native-home:${ctx.threadId}`);const store=createLaunches(f.host.bb.storage.database());store.save({key:launchKey(ctx.projectId,ctx.threadId,home,'held'),taskId:'held',projectId:ctx.projectId,owner:ctx.threadId,home,generation:1,state:'uncertain',threadId:null,hostId:'host_remote',shape:'ship',deliveryRequirement:'merged-and-verified',updatedAt:1});
- const before=f.seen.length;const refusal=await f.host.harness.behavior.runCli(['runtime','select',distribution.release,'--check'],ctx);assert.equal(refusal.exitCode,1);assert.match(refusal.stderr,/running\/reserved\/uncertain/);assert.equal(f.seen.length,before);
+ const native=secondRelease(f,{'NOTICE':'\nnative fixture change\n'});install(f,native);const refusal=await f.host.harness.behavior.runCli(['runtime','select',native.release,'--check'],ctx);assert.equal(refusal.exitCode,1);assert.match(refusal.stderr,/running\/reserved\/uncertain; native difference: NOTICE/);
  const wrong=await f.host.harness.behavior.runCli(['runtime','status','--machine','host_foreign'],ctx);assert.equal(wrong.exitCode,1);assert.match(wrong.stderr,/differs/);const worker={threadId:'thr_worker',projectId:ctx.projectId};f.metadata.set(worker.threadId,{crew:'true'});const denied=await f.host.harness.registrations.agentTools.find(t=>t.name==='firstmate_runtime').execute({action:'install'},worker);assert.equal(denied.isError,true);assert.match(JSON.stringify(denied),/Worker threads/);
+ }finally{await f.clean();}
+});
+test('adapter-only release selects while crews run; their recorded release stays installed and is reported',async()=>{
+ const f=await factory();try{
+ assert.equal((await f.host.harness.behavior.runCli(['deck','--json'],ctx)).exitCode,0);const home=await f.host.bb.storage.kv.get(`native-home:${ctx.threadId}`),old=await f.host.bb.storage.kv.get(`native-runtime:${ctx.threadId}`);
+ const adapter=secondRelease(f,{'overlay/bin/fm-worker-checkpoint.py':'\n# adapter fixture change\n'});install(f,adapter);
+ createLaunches(f.host.bb.storage.database()).save({key:launchKey(ctx.projectId,ctx.threadId,home,'c1'),taskId:'c1',projectId:ctx.projectId,owner:ctx.threadId,home,generation:1,state:'running',threadId:'thr_crew',hostId:'host_remote',shape:'ship',deliveryRequirement:'merged-and-verified',updatedAt:1});
+ mkdirSync(join(home,'state/c1.git-hooks'));writeFileSync(join(home,'state/c1.meta'),'bb_thread_id=thr_crew\n');writeFileSync(join(home,'state/c1.git-hooks/commit-msg'),`#!/bin/sh\nexec ${old.root}/bin-bb/fm-commit-msg-hook.sh "$@"\n`);
+ const checked=await f.host.harness.behavior.runCli(['runtime','select',adapter.release,'--check'],ctx);assert.equal(checked.exitCode,0,checked.stderr);
+ const selected=await f.host.harness.behavior.runCli(['runtime','select',adapter.release],ctx);assert.equal(selected.exitCode,0,selected.stderr);assert.equal(JSON.parse(readFileSync(join(home,'config/bb-runtime-selected.json'),'utf8')).release,adapter.release);assert.ok(existsSync(old.root));
+ const status=await f.host.harness.behavior.runCli(['runtime','status','--json'],ctx);assert.equal(status.exitCode,0,status.stderr);const value=JSON.parse(status.stdout);assert.equal(value.selected.release,adapter.release);assert.deepEqual(value.referencedReleases,[{release:distribution.release,tasks:['c1']}]);
  }finally{await f.clean();}
 });
 test('partial home KV publication recovers installed/bound bytes rather than resetting state or creating workers',async()=>{

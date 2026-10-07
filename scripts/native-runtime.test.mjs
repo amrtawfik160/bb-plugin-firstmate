@@ -106,6 +106,31 @@ test('tested bundled selection/rollback keep both versions, task state and polic
  const invalid=f.call('rollback',[...f.owned,'--release','b'.repeat(64)]);assert.equal(invalid.status,2);assert.deepEqual(state(f.home),before);
  }finally{f.clean();}
 });
+test('live consumers allow a release change only when it is confined to BB adapter payloads',()=>{
+ const current={upstreamCommit:'u1',snapshotCommit:'s1',stateContract:'native-flat-v1',adapterRevision:'a1',pluginVersion:'0.4.0',
+  payloads:{'native.bundle':'n1','native-manifest.json':'m1','NOTICE':'x1','LICENSE.firstmate':'l1','runtime-host.py':'h1','overlay/bin/fm-worker-checkpoint.py':'c1'}};
+ const target=(fields={},payloads={})=>({...current,...fields,payloads:{...current.payloads,...payloads}});
+ const running=['BB launches are running/reserved/uncertain'];
+ const rows=[
+  ['adapter file diff with running launches',current,target({adapterRevision:'a2'},{'overlay/bin/fm-worker-checkpoint.py':'c2'}),running,null],
+  ['helper and plugin version diff with retained native tasks',current,target({pluginVersion:'0.4.1'},{'runtime-host.py':'h2'}),['retained native task identities still reference this home'],null],
+  ['native bundle diff',current,target({},{'native.bundle':'n2'}),running,'native difference: native.bundle'],
+  ['native notice diff',current,target({},{'NOTICE':'x2'}),running,'native difference: NOTICE'],
+  ['new native payload',current,target({},{'bin/fm-new.sh':'z'}),running,'native difference: bin/fm-new.sh'],
+  ['snapshot commit diff',current,target({snapshotCommit:'s2'}),running,'native difference: snapshotCommit'],
+  ['upstream commit diff',current,target({upstreamCommit:'u2'}),running,'native difference: upstreamCommit'],
+  ['state contract diff',current,target({stateContract:'native-flat-v2'}),running,'native difference: stateContract'],
+  ['external current runtime',null,target(),running,'native difference: external native checkout'],
+  ['no consumers keeps existing selection rules',current,target({snapshotCommit:'s2'}),[],null],
+ ];
+ const decided=JSON.parse(ok(run('python3',['-c',`import importlib.util,json,sys
+spec=importlib.util.spec_from_file_location('runtime_host',sys.argv[1]);host=importlib.util.module_from_spec(spec);spec.loader.exec_module(host)
+print(json.dumps([host.selection_refusal(current,target,consumers) for _,current,target,consumers,_ in json.loads(sys.argv[2])]))`,helper,JSON.stringify(rows)])));
+ rows.forEach(([name,,,consumers,expected],index)=>{
+  if(expected===null)assert.equal(decided[index],null,name);
+  else assert.equal(decided[index],`runtime selection refused: ${consumers.join('; ')}; ${expected}. Existing runtime/state are unchanged; reconcile consumers first without respawning.`,name);
+ });
+});
 test('native task-set lock prevents selection during admission; read-only check does not steal native locks',()=>{
  const f=runtimeFixture();try{
  f.ready();const next=secondRelease(f);f.json(f.call('install',['--archive',join(f.directory,'next.tar.gz'),'--sha256',next.sha256]));const path=join(f.home,'state/.task-set.lock');mkdirSync(path);writeFileSync(join(path,'pid'),`${process.pid}\n`);writeFileSync(join(path,'host'),ok(run('hostname',[])).trim()+'\n');const before=readFileSync(join(path,'pid'),'utf8');
