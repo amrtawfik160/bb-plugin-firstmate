@@ -97,8 +97,23 @@ export const BOARD_MAX_CHARS = 3500;
 export const BOARD_EMPTY = "📌 Nothing needs you right now.";
 export const BOARD_ANSWER_HINT = "Tap a question's button or reply to it to answer.";
 
-/** Plain text for the Telegram board: open asks oldest first, then crew items waiting for the owner. */
-export function formatBoard(input: { asks: readonly OwnerAsk[]; calls: readonly string[]; now: number }): string {
+export const BOARD_MAX_PRS = 10;
+
+/** One open pull request line on the board; `state` is already plain words. */
+export type BoardPr = { ref: string; title?: string; state: string; openedAt: number };
+
+function prSection(prs: readonly BoardPr[]): string {
+  if (prs.length === 0) return "";
+  const sorted = [...prs].sort((a, b) => a.openedAt - b.openedAt || a.ref.localeCompare(b.ref));
+  const lines = sorted.slice(0, BOARD_MAX_PRS).map((pr) => `- ${pr.ref}${pr.title ? ` ${clip(pr.title, 70)}` : ""} — ${pr.state}`);
+  if (sorted.length > BOARD_MAX_PRS) lines.push(`…and ${sorted.length - BOARD_MAX_PRS} more`);
+  return [`Open pull requests (${prs.length}):`, ...lines].join("\n");
+}
+
+/** Plain text for the Telegram board: open asks oldest first, then crew items waiting
+ * for the owner, then the captain's open pull requests. The header counts only items
+ * waiting on the owner. */
+export function formatBoard(input: { asks: readonly OwnerAsk[]; calls: readonly string[]; prs?: readonly BoardPr[]; now: number }): string {
   const asks = [...input.asks].filter((ask) => ask.state === "open").sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
   const items = [
     ...asks.map((ask) => {
@@ -109,10 +124,12 @@ export function formatBoard(input: { asks: readonly OwnerAsk[]; calls: readonly 
     }),
     ...input.calls.map((call) => clip(call, 160)),
   ];
-  if (items.length === 0) return BOARD_EMPTY;
+  const prs = prSection(input.prs ?? []);
+  const after = prs === "" ? "" : `\n\n${prs}`;
+  if (items.length === 0) return `${BOARD_EMPTY}${after}`;
   const lines = items.slice(0, BOARD_MAX_LINES).map((item, index) => `${index + 1}. ${item}`);
   if (items.length > BOARD_MAX_LINES) lines.push(`…and ${items.length - BOARD_MAX_LINES} more`);
-  const tail = asks.length > 0 ? `\n\n${BOARD_ANSWER_HINT}` : "";
+  const tail = (asks.length > 0 ? `\n\n${BOARD_ANSWER_HINT}` : "") + after;
   const head = `📌 Waiting on you (${items.length})\n\n`;
   const body = lines.join("\n");
   const room = BOARD_MAX_CHARS - head.length - tail.length;

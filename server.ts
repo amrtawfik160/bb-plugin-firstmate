@@ -77,7 +77,7 @@ import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRe
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
 import { optionHelp } from "./lib/cli-help.ts";
 import { AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython } from "./lib/native-policy.ts";
-import { createDeliveries, canonicalPr, deliveryLine, parseForge, type DeliveryRecord } from "./lib/pr-delivery.ts";
+import { boardPullRequests, createDeliveries, canonicalPr, deliveryLine, parseForge, type DeliveryRecord } from "./lib/pr-delivery.ts";
 import { captureHostCommand, decodeHostCapture } from "./lib/host-capture.ts";
 import { selectExecution, validateLaunchCapabilities } from "./lib/execution-selection.ts";
 import { rpcContract } from "./rpc.ts";
@@ -5604,17 +5604,21 @@ export default async function plugin(bb: BbPluginApi) {
 
   // Items a background loop gave up on, plus the Telegram threading mismatch. They stay
   // listed until resolved; the captain was told once when each one started.
-  async function captainAttention(owner?: string): Promise<string[]> {
-    const lines = retries.needsCaptain(owner).map(needsCaptainLine);
+  // `owner` marks the lines the owner can act on (a connector setting only the owner
+  // can change); retry escalations are the captain's to clean up.
+  async function captainAttention(owner?: string): Promise<Array<{ text: string; owner: boolean }>> {
+    const lines = retries.needsCaptain(owner).map((item) => ({ text: needsCaptainLine(item), owner: false }));
     const threading = telegramThreadingSchema.safeParse(await bb.storage.kv.get(TELEGRAM_THREADING_KEY));
-    if (threading.success && threading.data.mismatch) lines.push(`Needs captain: ${TELEGRAM_THREADING_MISMATCH}`);
+    if (threading.success && threading.data.mismatch) lines.push({ text: `Needs captain: ${TELEGRAM_THREADING_MISMATCH}`, owner: true });
     return lines;
   }
   async function bearingsSnapshot(owner?: string, opts: { realBacklog?: boolean } = {}): ReturnType<typeof bearingsBase> {
     const snap = await bearingsBase(owner, opts);
     const attention = await captainAttention(owner);
     if (attention.length === 0) return snap;
-    return { ...snap, text: `${snap.text}\n\n${attention.join("\n")}`, rpc: { ...snap.rpc, calls: [...snap.rpc.calls, ...attention] } };
+    const texts = attention.map((line) => line.text);
+    return { ...snap, text: `${snap.text}\n\n${texts.join("\n")}`, rpc: { ...snap.rpc, calls: [...snap.rpc.calls, ...texts],
+      ownerCalls: [...snap.rpc.ownerCalls, ...attention.filter((line) => line.owner).map((line) => line.text)] } };
   }
   async function bearingsBase(owner?: string, opts: { realBacklog?: boolean } = {}): Promise<{
     text: string;
@@ -5623,6 +5627,8 @@ export default async function plugin(bb: BbPluginApi) {
       head: string;
       deliveries: DeliveryRecord[];
       calls: string[];
+      /** The subset of `calls` the owner can act on: decisions and blockers, not launch or retry bookkeeping. */
+      ownerCalls: string[];
       landed: string[];
       ready: Array<{
         id: string; status: string; shape: string; posture: string;
@@ -5697,11 +5703,20 @@ export default async function plugin(bb: BbPluginApi) {
     const errors = count("error");
     const due = decisions.filter((d) => decisionDue(d, now));
     const dispatchable = queue.filter((q) => q.status === "queued" && storedQueueGate(q, queue, now) === null);
-    const calls = [
+    const decisionCalls = [
       ...due.map(
         (d) =>
           `? ${d.id} :: ${truncate(d.question, 90)}${d.options.length > 0 ? ` (${d.options.join(" / ")})` : ""}${d.crewId !== null ? ` [crew ${d.crewId}]` : ""} — answer: decide answer ${d.id} -- "<answer>"`,
       ),
+      ...rows
+        .filter((row) => row.status === "idle" && !row.failed && row.openDecisions.length > 0)
+        .map((row) => {
+          const d = row.openDecisions[row.openDecisions.length - 1]!;
+          return `? ${row.id} — ${d.verb.toUpperCase()} [${d.key}]: ${truncate(d.note, 80)} — steer: bb firstmate tell ${row.id} -- "<answer>"`;
+        }),
+    ];
+    const calls = [
+      ...decisionCalls.slice(0, due.length),
       ...rows
         .filter((row) => row.status === "error")
         .map((row) => `! ${formatCrew(row, row.status)} — NEEDS DECISION: turn failed (retry? tell? forget?)`),
@@ -5711,12 +5726,7 @@ export default async function plugin(bb: BbPluginApi) {
       ...rows
         .filter((row) => row.noOutcome)
         .map((row) => `! ${formatCrew(row, row.status)} — no outcome: idle without DONE/BLOCKED/FAILED, possibly interrupted (tell? retry? forget?)`),
-      ...rows
-        .filter((row) => row.status === "idle" && !row.failed && row.openDecisions.length > 0)
-        .map((row) => {
-          const d = row.openDecisions[row.openDecisions.length - 1]!;
-          return `? ${row.id} — ${d.verb.toUpperCase()} [${d.key}]: ${truncate(d.note, 80)} — steer: bb firstmate tell ${row.id} -- "<answer>"`;
-        }),
+      ...decisionCalls.slice(due.length),
       ...rows
         .filter((row) => row.status === "idle" && !row.failed && row.openDecisions.length === 0 && row.prUrl !== "")
         .map(
@@ -5780,6 +5790,7 @@ export default async function plugin(bb: BbPluginApi) {
       deliveries: outstanding,
       head: text.split("\n")[0] ?? text,
       calls,
+      ownerCalls: decisionCalls,
       landed,
       ready: readyRows.map(toRow),
       running: runningRows.map(toRow),
@@ -5850,6 +5861,8 @@ export default async function plugin(bb: BbPluginApi) {
     const text = snapshots.map(s => s.text).join("\n\n") + (outstanding.length ? "\n\nUnresolved PR deliveries\n"+outstanding.map(deliveryLine).join("\n") : "");
     return { text, json: snapshots.length === 1 ? snapshots[0]!.model : { homes: snapshots.map(s => s.model) },
       rpc: { deliveries: outstanding, head: text.split("\n")[0] ?? text, calls: snapshots.flatMap(s => s.calls),
+        // Native calls are open decisions and captain holds only.
+        ownerCalls: snapshots.flatMap(s => s.calls),
         landed: snapshots.flatMap(s => s.landed), ready: [], running, next: snapshots.flatMap(s => s.next),
         afk: (await readAfk(owner))?.on === true, quiet: await isQuiet(owner),
         supervision: (await settings.get()).supervisionEnabled === true } };
@@ -11004,7 +11017,8 @@ export default async function plugin(bb: BbPluginApi) {
         ? await fleetSnapshots.read(threadId, () => nativeBearingsSnapshot(threadId, snapshotAbort.signal), 15_000)
         : await bearingsSnapshot(threadId);
       if (command === "board") {
-        return { text: formatBoard({ asks: ownerAsks.listOpen(threadId), calls: snapshot.rpc.calls, now: Date.now() }), away: snapshot.rpc.afk };
+        const prs = boardPullRequests(deliveries.list({ owner: threadId, limit: 100 }));
+        return { text: formatBoard({ asks: ownerAsks.listOpen(threadId), calls: snapshot.rpc.ownerCalls, prs, now: Date.now() }), away: snapshot.rpc.afk };
       }
       return { text: formatWorkersForTelegram(snapshot.rpc) };
     },
@@ -11018,8 +11032,9 @@ export default async function plugin(bb: BbPluginApi) {
       const snapshot = (await settings.get()).fmHome.trim() !== ""
         ? await fleetSnapshots.read(owner ?? "__all__", () => nativeBearingsSnapshot(owner, snapshotAbort.signal), 15_000)
         : await bearingsSnapshot(owner);
+      const { ownerCalls: _ownerCalls, ...rpc } = snapshot.rpc;
       return {
-        ...snapshot.rpc,
+        ...rpc,
         captain,
       };
     },
