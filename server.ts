@@ -71,7 +71,7 @@ import { formatWorkersForTelegram } from "./lib/telegram-commands.ts";
 import { DEFAULT_RELIABILITY_FLAGS, reliabilityFlagsFromSettings } from "./lib/reliability-flags.ts";
 import { sanitizeSettingValue } from "./lib/settings-schema.ts";
 import { coalesceBatches, parseInboundTelegram, parseSourceRef, parseTelegramSubmission, stripTelegramEnvelope, telegramReplyParameters, telegramSourceRef } from "./lib/telegram-envelope.ts";
-import { correlationOf, oldestUnanswered, sendTelegramReply, telegramReplyFallbackBody } from "./lib/telegram-reply.ts";
+import { connectorReplied, correlationOf, oldestUnanswered, sendTelegramReply, telegramReplyFallbackBody } from "./lib/telegram-reply.ts";
 import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRecord } from "./lib/launch.ts";
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
 import { optionHelp } from "./lib/cli-help.ts";
@@ -4617,6 +4617,14 @@ export default async function plugin(bb: BbPluginApi) {
       await drainQueuedDispatches(captainThreadId);
     }
     if (flags.inboundLedger === "on") {
+      if (flags.telegramThreading === "on") {
+        try {
+          const replied = await connectorReplied({ open: inboundLedger.listOpen(captainThreadId), callRpc: (args) => bb.sdk.plugins.callRpc(args) });
+          for (const key of replied) inboundLedger.markAnswered({ source: "telegram", ...key }, Date.now());
+        } catch (error) {
+          bb.log.warn(`telegram replied check: ${String(error)}`);
+        }
+      }
       for (const action of inboundLedger.openForSweep(Date.now(), captainThreadId)) {
         await bb.sdk.threads.send({
           threadId: captainThreadId,

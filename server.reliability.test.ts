@@ -180,6 +180,33 @@ test("captain idles repeat an unanswered-item reminder only after backoff", asyn
   }
 });
 
+test("live repro: no reminder for an owner message the connector already answered with the captain's turn text", async () => {
+  const host = await captainHost();
+  try {
+    host.harness.sdk.stub("threads.send", async () => ({}));
+    host.harness.sdk.stub("threads.events.list", async () => []);
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
+    const asked: unknown[] = [];
+    host.harness.sdk.stub("plugins.callRpc", async (args: { method: string; input: { messageIds: string[] } }) => {
+      asked.push(args.input);
+      return args.method === "replied" ? { replied: args.input.messageIds.filter((id) => id === "1926") } : { queued: 1, duplicate: false, mode: "on" };
+    });
+    recordTelegram(host, "thr_cap", "1926", Date.now() - 4 * 60_000);
+    recordTelegram(host, "thr_cap", "1927", Date.now() - 4 * 60_000);
+    await host.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_cap", status: "idle" }), lastAssistantText: "ok" });
+    const reminders = host.harness.sdk.callsTo("threads.send")
+      .map((c) => (c[0] as { input: Array<{ text: string }> }).input[0]?.text ?? "")
+      .filter((text) => /Unanswered/.test(text));
+    assert.deepEqual(asked, [{ chatId: "200", messageIds: ["1926", "1927"] }]);
+    assert.equal(reminders.length, 1, reminders.join("\n"));
+    assert.match(reminders[0]!, /1927/);
+    assert.equal(ledgerRow(host, "1926")?.state, "answered");
+    assert.equal(ledgerRow(host, "1927")?.state, "received");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 const asyncOn = (host: Host, extra: Record<string, string> = {}) =>
   host.harness.behavior.setSettings({ fmReliability: JSON.stringify({ asyncDispatch: "on", ...extra }) });
 

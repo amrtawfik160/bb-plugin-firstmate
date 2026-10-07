@@ -117,3 +117,39 @@ export async function sendTelegramReply(input: {
   if (result.queued > 0 || result.duplicate) return { channel: "rpc", body, outcome: "delivered", ...mode };
   throw new Error(`telegram.reply not queued (queued=${result.queued}, mode=${result.mode ?? "unknown"}).`);
 }
+
+export const TELEGRAM_REPLIED_METHOD = "replied";
+export const telegramRepliedOutputSchema = z.object({ replied: z.array(z.string()) });
+
+/**
+ * Open Telegram items that the connector already answered in Telegram, for example with the
+ * captain's turn text. Firstmate must not remind the captain about them, or the captain answers
+ * the same message twice. A connector without the method answers nothing.
+ */
+export async function connectorReplied(input: {
+  open: Array<{ source: string; chatId: string; messageId: string }>;
+  callRpc: (args: { pluginId: string; method: string; input: { chatId: string; messageIds: string[] }; outputSchema: typeof telegramRepliedOutputSchema }) => Promise<unknown>;
+}): Promise<Array<{ chatId: string; messageId: string }>> {
+  const byChat = new Map<string, string[]>();
+  for (const row of input.open) {
+    if (row.source !== "telegram") continue;
+    byChat.set(row.chatId, [...(byChat.get(row.chatId) ?? []), row.messageId]);
+  }
+  const found: Array<{ chatId: string; messageId: string }> = [];
+  for (const [chatId, messageIds] of byChat) {
+    let raw: unknown;
+    try {
+      raw = await input.callRpc({
+        pluginId: TELEGRAM_BRIDGE_PLUGIN_ID,
+        method: TELEGRAM_REPLIED_METHOD,
+        input: { chatId, messageIds: messageIds.slice(0, 200) },
+        outputSchema: telegramRepliedOutputSchema,
+      });
+    } catch (error) {
+      if (isTelegramRpcMissing(error)) return found;
+      throw error;
+    }
+    for (const messageId of telegramRepliedOutputSchema.parse(raw).replied) found.push({ chatId, messageId });
+  }
+  return found;
+}
