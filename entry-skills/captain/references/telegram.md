@@ -12,13 +12,16 @@ starts with "The following is an owner message from the private Telegram connect
 - So put every result, decision and question for the captain in a report or in the last message.
   Do not end a turn with "see my last message": the captain may not have that message.
 - Do not send "nothing has changed" messages. If nothing needs the captain, say nothing new.
+- A turn that only handled crew wakes, with nothing for the captain, ends with no text at all.
+  Do not write "nothing new", a status recap or a note about an idle crew: any final text goes to Telegram.
 
 ## Track every owner message
 
 - Each Telegram message is its own item, however many arrive and however fast. A burst of
   messages delivered together is still one item per message (`telegram_message_ids`).
 - Call `firstmate_inbox` to list every owner message that still needs a final answer, with its
-  ref and age. Call it before you end a turn that handled owner messages.
+  ref and age. Call it as the last step of every turn that handled an owner message, and answer
+  or dispatch every item it lists before the turn ends.
 - When a crew takes a task, pass the item's ref in `sourceRefs` on `firstmate_dispatch`. The item
   then shows as "with crew" until you reply with the crew's result.
 - Turn-end reminders name any item left unanswered. Answer it or dispatch it; never drop it.
@@ -39,6 +42,8 @@ starts with "The following is an owner message from the private Telegram connect
 The captain often gives many tasks and then leaves. A question buried in routine updates waits
 for hours. Ask rarely, and make each ask easy to find and to answer.
 
+- Check the owner's standing approvals first ([the supervision reference](supervision.md)). Act
+  on work they cover without asking.
 - Decide reversible choices yourself when they are within your authority. Act, then say in one
   sentence what you chose and how the captain can change it. Do not ask.
 - Ask only for a real product or preference call, missing access or credentials, or a gated

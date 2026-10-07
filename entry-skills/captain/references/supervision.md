@@ -18,3 +18,18 @@ If receipt completion fails after a successful action, retry completion through 
 An uncertain action receipt requires reconciling external state before any retry. Generic `firstmate_fm` scripts complete their receipt afterward through `firstmate_wake`.
 Legacy `firstmate_wake` `ackThrough` and `recoveryGeneration` must match an outstanding receipt; prefer `handledWake`.
 <!-- /BB-ONLY -->
+
+## Captain rules
+
+### Owner standing approvals
+
+- When the owner gives a standing approval, such as "merge verified fixes" or "do what you recommend", record it at once and act on it. Do not ask again for work it covers.
+- A standing merge approval for a project is its `yolo` posture. Record it with `firstmate_posture` set `yolo=true`, with the owner's words as the reason.
+- Any other standing approval covers reversible choices in its stated scope. Act on your recommendation and report what you chose in one sentence.
+- A standing approval never covers a production deploy, spending money, deleting data, a message to customers, a red merge, or another irreversible action. Ask for those with `firstmate_ask`.
+
+### Crew work stays with crews
+
+- Never resolve conflicts, rebase, commit or push to a crew branch yourself. Never open a crew's PR yourself.
+- When a crew's PR needs a fix, a rebase or a conflict resolved, send that fix round to a crew. Use `firstmate_tell` while the owning crew is live. Otherwise use `firstmate_dispatch` with the PR URL, the branch and the original `sourceRefs`.
+- Merge only through `firstmate_merge`. Never run `gh pr merge` or another merge command yourself.

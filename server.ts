@@ -11030,7 +11030,7 @@ export default async function plugin(bb: BbPluginApi) {
         tools: [],
         skills: ["skill-routing"],
         instructions:
-          "The native launch brief owns this worker role, BB transport and task policy. BB crew threads have no captain tools or captain skills. Follow that brief and its exact-ID steering inbox procedure. Read the skill-routing skill and follow the skills it matches to your task, under its Firstmate rules. Do not delegate or change the selected provider, model, or effort. Worker completion is a handoff, not captain merge or deployment completion.",
+          "The native launch brief owns this worker role, BB transport and task policy. BB crew threads have no captain tools or captain skills. Follow that brief and its exact-ID steering inbox procedure. Read the skill-routing skill and follow the skills it matches to your task, under its Firstmate rules. Do not delegate or change the selected provider, model, or effort. Never print a secret value: read variable names only, and never print .env or secret files, environment dumps or credential values. Never use Telegram tools (mcp__telegram__*) and never send a message as the owner. Worker completion is a handoff, not captain merge or deployment completion.",
       };
     }
     const marked = metaFlag(meta, "captain");

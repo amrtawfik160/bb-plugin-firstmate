@@ -11,9 +11,9 @@
       "reason": "Native policy reads and selected-runtime path mappings; BB threads, browser, durable receipts and PR transport. Required full selected-runtime trigger catalog and source-relative native reference transport. Skill-routing pointer: name matched pstack and Matt Pocock skills in each dispatch brief. Telegram pointer: answer each owner message with firstmate_reply and check firstmate_inbox."
     },
     "crew": {
-      "sha256": "470b1eacb480393a39b3c8108eed1c66c2bd9a1ef7f378e5d569d6b7831e8712",
-      "text": "The native launch brief owns this worker role, BB transport and task policy. BB crew threads have no captain tools or captain skills. Follow that brief and its exact-ID steering inbox procedure. Read the skill-routing skill and follow the skills it matches to your task, under its Firstmate rules. Do not delegate or change the selected provider, model, or effort. Worker completion is a handoff, not captain merge or deployment completion.",
-      "reason": "Native launch brief pointer, exact-ID inbox and BB role exclusion. One skill-routing pointer, bounded by its Firstmate rules; no other method policy."
+      "sha256": "e1234333f803a207f8cf1b19be254ca93862cc84674e1b85c20a078e37d846b6",
+      "text": "The native launch brief owns this worker role, BB transport and task policy. BB crew threads have no captain tools or captain skills. Follow that brief and its exact-ID steering inbox procedure. Read the skill-routing skill and follow the skills it matches to your task, under its Firstmate rules. Do not delegate or change the selected provider, model, or effort. Never print a secret value: read variable names only, and never print .env or secret files, environment dumps or credential values. Never use Telegram tools (mcp__telegram__*) and never send a message as the owner. Worker completion is a handoff, not captain merge or deployment completion.",
+      "reason": "Native launch brief pointer, exact-ID inbox and BB role exclusion. One skill-routing pointer, bounded by its Firstmate rules; no other method policy. Hard rules: no secret values printed and no Telegram tools or messages as the owner."
     }
   },
   "renderer": {
@@ -26,14 +26,14 @@
       "reason": "Known native scaffold boundaries only: script/browser transport, exact task-owned paths and inbox IDs; retain operational references, task and native completion gates."
     },
     "overlay/bin/fm-worker-checkpoint.py": {
-      "sha256": "95badd1c1f07c9891842ffc3136e63fd15949045a88abb11067779a54cb36c89",
-      "reason": "Exact native task/worktree-owned setup, project read receipts, status append including fleet-ledger notification, progress snapshots, and background-command receipts with revision identity. No merge, completion, or deployment authorization."
+      "sha256": "02a9fba855e9f7b6489be118705b3edecbdc44009f701de900b8d612e2e42937",
+      "reason": "Exact native task/worktree-owned setup, project read receipts, status append including fleet-ledger notification, progress snapshots, and background-command receipts with revision identity. No merge, completion, or deployment authorization. Redacts secret-looking values from status, progress and printed check output."
     }
   },
   "captainTransport": {
     "entry-skills/captain/SKILL.md": {
-      "sha256": "b9de2a7ff1400501533ceffd23d119772d09929fd1ff20e53fccc0e200b3a720",
-      "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner."
+      "sha256": "1010d3290939053d9539101ad13c6049ae8f4d0cff6eeadd3fb919948cceb9c0",
+      "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner. Merge only through firstmate_merge; crew fix rounds go to crews; standing approvals recorded through firstmate_posture."
     },
     "entry-skills/firstmate/SKILL.md": {
       "sha256": "4278efad7a37ce187b2082ba4eb40e4a77b8e3c112aaaf13fdc786f38edd50ff",
@@ -48,16 +48,16 @@
       "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner."
     },
     "entry-skills/captain/references/supervision.md": {
-      "sha256": "f1e6152dffd6e075f5a8be86b8cf210b3517bf3b994bf9f1769849ae6b588f8d",
-      "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner."
+      "sha256": "eff00767e6660d1071bde3896114a1fd6eee7cfa0d57b223a45af30dad7a7323",
+      "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner. Captain rules: owner standing approvals, crew work stays with crews, merges only through firstmate_merge."
     },
     "entry-skills/skill-routing/SKILL.md": {
-      "sha256": "6bd4eb1b5628a53eca0c881360e249495ef6fadeb9d4feaf555bdf5365feaf32",
-      "reason": "BB-owned task-to-skill table selected for bound captains and crews; its Firstmate rules keep delegation, model choice, merge and delivery with Firstmate. Poteto mode runs on every crewmate task; Firstmate rules still win and the supervisor's replies keep the user's style. Memory-heavy commands run through the fm-heavy host slot wrapper."
+      "sha256": "55f90ef66949c70cefbc9728599cb5c79ad8a7159a665c0e4c7ec0a7fd4ca62a",
+      "reason": "BB-owned task-to-skill table selected for bound captains and crews; its Firstmate rules keep delegation, model choice, merge and delivery with Firstmate. Poteto mode runs on every crewmate task; Firstmate rules still win and the supervisor's replies keep the user's style. Memory-heavy commands run through the fm-heavy host slot wrapper. Firstmate adds the skills block to every brief; crews never print secret values and never use Telegram tools."
     },
     "entry-skills/captain/references/telegram.md": {
-      "sha256": "a78380388985add0ff1a301d7c5856c4227377430e2ae0f7e1cfc9a20233c151",
-      "reason": "BB-only Telegram owner-message transport: what reaches Telegram, per-message tracking with firstmate_inbox, and threaded or quoted answers with firstmate_reply; native final-response policy unchanged. Telegram commands map to the native ahoy, bearings, afk, quiet and stow skills. Owner asks go through firstmate_ask and close by answer, firstmate_resolve_ask, or a reversible default. Every open PR is tracked with firstmate_deliveries so it shows on the board; no native policy change."
+      "sha256": "0a57b7a7b9e210c8c4583c0e421e7de62adfdadeb40b268b225f90f2ddaa0da2",
+      "reason": "BB-only Telegram owner-message transport: what reaches Telegram, per-message tracking with firstmate_inbox, and threaded or quoted answers with firstmate_reply; native final-response policy unchanged. Telegram commands map to the native ahoy, bearings, afk, quiet and stow skills. Owner asks go through firstmate_ask and close by answer, firstmate_resolve_ask, or a reversible default. Every open PR is tracked with firstmate_deliveries so it shows on the board; no native policy change. Wake-only turns end with no text; firstmate_inbox ends every turn that handled owner messages; standing approvals are checked before asking."
     }
   }
 }

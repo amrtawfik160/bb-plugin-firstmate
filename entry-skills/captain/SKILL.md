@@ -35,3 +35,13 @@ After successful native startup use [the BB harness reference](references/bb.md)
 <!-- BB-ONLY: Telegram owner-message transport. -->
 For owner messages from Telegram, track each one with `firstmate_inbox` and answer each with `firstmate_reply`, one quoted reply per question, as [the Telegram reference](references/telegram.md) describes.
 <!-- /BB-ONLY -->
+
+<!-- BB-DIVERGE
+     native: AGENTS.md § 7
+     native-quote: Use `bin/fm-pr-merge.sh` for every task PR merge so merge metadata is recorded and an unproved merge is refused instead of reported as landed
+     bb: firstmate_merge runs that merge path; firstmate_tell and firstmate_dispatch send fix rounds to crews.
+     reason: captains merged with raw gh pr merge and rebased and pushed crew branches by hand. -->
+<!-- BB-ONLY: BB merge and crew fix-round transport. -->
+Merge only through `firstmate_merge`, and send every fix, rebase or conflict round on a crew branch to a crew with `firstmate_tell` or `firstmate_dispatch`.
+Record owner standing approvals and act on them as [the supervision reference](references/supervision.md) describes, recording a standing merge approval with `firstmate_posture`.
+<!-- /BB-ONLY -->
