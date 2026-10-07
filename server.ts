@@ -61,6 +61,8 @@ import { boundedCaptainStartup, captainBindingText } from "./lib/captain-startup
 import { createQueueStore, type QueueItem } from "./lib/queue-store.ts";
 import { admissionDecision, createDispatchJobs, spawnBackoffMs } from "./lib/async-dispatch.ts";
 import { createWatchdogStore, observeIdleTurn, tripWatchdog, watchdogNoticeText, watchdogTrip } from "./lib/crew-watchdog.ts";
+import { captainResumeDelay, FAILOVER_WINDOW_MS, failoverTarget, providerExhausted, type ExecutionChoice, type FailedTurnInfo } from "./lib/provider-failover.ts";
+import { finishedCrewCandidates, isFinishedCrewWake, parseWakeRow, withoutFinishedCrewWakes, type FinishedCrews } from "./lib/finished-crew-wakes.ts";
 import { createDoorbellHold, doorbellHoldDecision } from "./lib/doorbell-hold.ts";
 import { createRetryLedger, type RetryItem, type RetryKind } from "./lib/retry-ledger.ts";
 import { HANDOFF_WAKE_AMENDMENT, captainInstructionsWithHandoff } from "./lib/handoff-contract.ts";
@@ -578,6 +580,16 @@ export const FM_WATCH_KEEPER_SH = "state/.bb-watch-keeper.sh";
 export const FM_WATCH_OWNER_BEAT = "state/.bb-watch-owner.beat";
 const FM_WATCH_CAPTAIN_PREFIX = "fm-watch-captain:";
 const CAPTAIN_PROJECT_PREFIX = "captain-project:";
+const CAPTAIN_RESUME_PREFIX = "captain-resume:";
+const NO_OUTCOME_PREFIX = "crew-no-outcome:";
+const OUTCOME_LINE_REQUEST = [
+  "OUTCOME LINE MISSING: your last turn ended without an outcome line. Reply now with exactly one line that states where the task stands, then stop:",
+  "  DONE: <one-line outcome>",
+  "  BLOCKED: <what you need, exactly>",
+  "  WAITING: <the external run you are waiting on>",
+  "  FAILED: <what failed + evidence>",
+  "Do not redo the task.",
+].join("\n");
 // B3(a): the owner beat is refreshed by the supervisor TICK (every ~checkMs, 15–30s),
 // not by the keeper's own re-arm interval, and only when the host read/refresh call
 // SUCCEEDS. A transiently slow or briefly-unreachable host makes several ticks fail in
@@ -5677,7 +5689,10 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }> {
     if ((await settings.get()).fmHome.trim() !== "") {
-      return fleetSnapshots.read(owner ?? "__all__", () => nativeBearingsSnapshot(owner, snapshotAbort.signal));
+      const snapshot = await fleetSnapshots.read(owner ?? "__all__", () => nativeBearingsSnapshot(owner, snapshotAbort.signal));
+      const silent = await crewsWithoutOutcome(owner);
+      return silent.length === 0 ? snapshot : { ...snapshot,
+        text: `${snapshot.text}\n\nNo outcome\n${silent.map((c) => `• ${c.id} — no outcome: last turn ended without DONE:, BLOCKED:, or WAITING:; asked for it`).join("\n")}` };
     }
     const tracked = (await listCrews({ owner })).slice(0, 20);
     // A crew landed under another captain's view is announced to its own captain.
@@ -5712,8 +5727,8 @@ export default async function plugin(bb: BbPluginApi) {
         const failed = status === "idle" && latest !== null && latest.verb === "failed";
         // Native workers report through their status file, not chat, so only chat-reporting crews
         // need a DONE line. Without one, an idle crew has no outcome (often an interrupted turn).
-        const noOutcome = status === "idle" && !failed && openDecisions.length === 0 && latest?.verb !== "done"
-          && !isSecondmateRoute(crew) && !(await isNativeWorker(crew));
+        const noOutcome = status === "idle" && !failed && openDecisions.length === 0 && (latest?.verb !== "done"
+          && !isSecondmateRoute(crew) && !(await isNativeWorker(crew)) || await bb.storage.kv.get(`${NO_OUTCOME_PREFIX}${crew.threadId}`) !== undefined);
         return { ...crew, status, prUrl: pr.url, openDecisions, failed, noOutcome, prSummary: summarizePR({ pullRequest: { url: pr.url, number: pr.number, title: pr.title, state: pr.state, checks: { state: pr.checksState } } }) };
       }),
     );
@@ -8085,8 +8100,9 @@ export default async function plugin(bb: BbPluginApi) {
       // --ack-through`, which pasted verbatim acks the UNPARTITIONED root queue and can
       // consume another captain's rows. Rewrite it to the partition-safe bb command so
       // the emitted instruction can only ever touch the caller's own plane.
-      const out = rewriteWakeAckLine(res.output).trim();
-      if (res.exitCode !== 0) throw new Error(`native exit ${res.exitCode}: ${out || "no diagnostic output"}`);
+      const raw = rewriteWakeAckLine(res.output).trim();
+      if (res.exitCode !== 0) throw new Error(`native exit ${res.exitCode}: ${raw || "no diagnostic output"}`);
+      const out = captainThreadId ? await hideFinishedCrewWakes(raw, captainThreadId, hostId, fmHome, signal) : raw;
       // After a successful drain and under its own short budget, so a slow host can only
       // delay housekeeping, never the drain itself. Its effect shows from the next drain.
       if (args.length === 0 && (receipt === undefined || receipt.action === "receive")) {
@@ -8098,6 +8114,52 @@ export default async function plugin(bb: BbPluginApi) {
       bb.log.warn(message);
       throw new Error(message);
     }
+  }
+
+  // Crews among `wanted` whose open PR the delivery tracker owns for this captain and
+  // whose native status file ends in done.
+  async function finishedCrewsWithTrackedPrs(owner: string, hostId: string, fmHome: string, wanted: { threads: string[]; crewIds: string[] }, signal?: AbortSignal): Promise<FinishedCrews> {
+    const records = deliveries.list({ owner, limit: 100 })
+      .filter((r) => wanted.crewIds.includes(r.taskId) || r.workers.some((w) => wanted.threads.includes(w)));
+    if (records.length === 0) return { threads: new Set(), crewIds: new Set() };
+    const command = records
+      .map((r) => `printf '@@FM_STATUS %s\\n' ${shQuote(r.taskId)}; tail -n 200 -- ${shQuote(`${r.home || fmHome}/state/${r.taskId}.status`)} 2>/dev/null`)
+      .join("; ");
+    const result = await runOnHost(hostId, command, 15_000, signal);
+    const done = new Set<string>();
+    for (const section of result.output.split(/^@@FM_STATUS /m).slice(1)) {
+      const [id = "", ...lines] = section.split(/\r?\n/);
+      if (latestStatus(lines)?.verb === "done") done.add(id.trim());
+    }
+    const finished = records.filter((r) => done.has(r.taskId));
+    return { threads: new Set(finished.flatMap((r) => r.workers)), crewIds: new Set(finished.map((r) => r.taskId)) };
+  }
+
+  async function hideFinishedCrewWakes(out: string, captainThreadId: string, hostId: string, fmHome: string, signal?: AbortSignal): Promise<string> {
+    const rows = out.split("\n").map(parseWakeRow).filter((r) => r !== null);
+    const wanted = finishedCrewCandidates(rows);
+    if (wanted.threads.length === 0 && wanted.crewIds.length === 0) return out;
+    try {
+      const filtered = withoutFinishedCrewWakes(out, await finishedCrewsWithTrackedPrs(captainThreadId, hostId, fmHome, wanted, signal));
+      if (filtered.hidden > 0) bb.log.info(`wake drain: hid ${filtered.hidden} idle alert(s) for DONE crews whose PRs the tracker owns (captain ${captainThreadId})`);
+      return filtered.text;
+    } catch (error) {
+      bb.log.warn(`wake drain: finished-crew filter skipped: ${error instanceof Error ? error.message : String(error)}`);
+      return out;
+    }
+  }
+
+  // An fm-watch "check: inactive-outcome" names no crew. It is noise when every undrained
+  // inactive-outcome row in the captain's queue is for a finished crew with a tracked PR.
+  async function inactiveOutcomesAllFinished(captain: string, hostId: string, signal?: AbortSignal): Promise<boolean> {
+    const fmHome = homeScope.getStore()?.home || (await settings.get()).fmHome.trim();
+    if (fmHome === "") return false;
+    const queue = `${wakeStateDir(fmHome, captain)}/.wake-queue`;
+    const res = await runOnHost(hostId, `[ ! -f ${shQuote(queue)} ] || awk -F '\\t' '$3=="check" && $4 ~ /^inactive-outcome:/' ${shQuote(queue)}`, 15_000, signal);
+    const rows = res.output.split("\n").map(parseWakeRow).filter((r) => r !== null);
+    if (rows.length === 0) return false;
+    const finished = await finishedCrewsWithTrackedPrs(captain, hostId, fmHome, finishedCrewCandidates(rows), signal);
+    return rows.every((row) => isFinishedCrewWake(row, finished));
   }
 
   // Count actionable (signal/stale) undrained wakes, deduped on (kind,key) to match
@@ -9454,6 +9516,11 @@ export default async function plugin(bb: BbPluginApi) {
         if (soleHostParent === undefined) {
           seen.add(key);
           bb.log.info(`fm-watch relay: dropping unattributable line on host ${hostId} (${hostParents.size} captains; no crew in line)`);
+          continue;
+        }
+        if (/^check: inactive-outcome\b/.test(line) && await inactiveOutcomesAllFinished(soleHostParent, hostId, signal).catch(() => false)) {
+          seen.add(key);
+          bb.log.info(`fm-watch relay: dropping inactive-outcome check; every pending one is a finished crew whose PR the tracker owns`);
           continue;
         }
         if (!seen.has(`${key}>${soleHostParent}`)) pushFor(soleHostParent, line, key);
@@ -11382,6 +11449,32 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  // 25 of 63 audited crews ended a turn with no outcome line, so the captain could not
+  // tell finished from interrupted (fleet audit 2026-10-07). Ask once; the turn that
+  // answers is not asked again. The mark shows in bearings until an outcome arrives.
+  async function askForOutcomeLine(crew: Crew): Promise<boolean> {
+    if ((await settings.get()).supervisionEnabled !== true) return false;
+    const key = `${NO_OUTCOME_PREFIX}${crew.threadId}`;
+    const ask = (await bb.storage.kv.get<{ asked: boolean }>(key))?.asked !== true;
+    await bb.storage.kv.set(key, { asked: ask });
+    if (!ask) return false;
+    try {
+      await tellCrew(crew, OUTCOME_LINE_REQUEST, false, true);
+      return true;
+    } catch (error) {
+      bb.log.warn(`outcome line request failed for crew ${crew.id}: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  }
+  async function clearNoOutcome(crew: Crew): Promise<void> {
+    await bb.storage.kv.delete(`${NO_OUTCOME_PREFIX}${crew.threadId}`);
+  }
+  async function crewsWithoutOutcome(owner: string | undefined): Promise<Crew[]> {
+    const owned = (await readCrews()).filter((c) => owner === undefined || owner === "" || c.parentThreadId === owner);
+    const marked = await Promise.all(owned.map(async (c) => await bb.storage.kv.get(`${NO_OUTCOME_PREFIX}${c.threadId}`) !== undefined));
+    return owned.filter((_, i) => marked[i]);
+  }
+
   // A crew's worker thread can reach idle/error BEFORE its record carries its
   // threadId: the real transport spawns through fm-spawn.sh (~30s) and only learns
   // the thread id — the moment the crew register can persist it — after that returns, while
@@ -11419,6 +11512,8 @@ export default async function plugin(bb: BbPluginApi) {
     if (await isNativeWorker(crew)) {
       await dropNudge(crew.id);
       if (await clearWaiting(crew.id)) await dropResumeRows(crew, "all");
+      if (hasStatusProtocol(lastAssistantText) || isWaitingYield(lastAssistantText)) await clearNoOutcome(crew);
+      else await askForOutcomeLine(crew);
       const current = await settings.get();
       // The native watcher classifies its status and BB activity events. A
       // compatibility event supervisor may relay declarations, but never chat.
@@ -11433,10 +11528,12 @@ export default async function plugin(bb: BbPluginApi) {
       return;
     }
     if (isWaitingYield(lastAssistantText)) {
+      await clearNoOutcome(crew);
       await handleWaitingYield(crew, lastAssistantText);
       return;
     }
     if (hasStatusProtocol(lastAssistantText)) {
+      await clearNoOutcome(crew);
       if (await clearWaiting(crew.id)) await dropResumeRows(crew, "all");
     } else {
       // A leftover timer or background command woke a parked crew, which ended with no
@@ -11445,6 +11542,7 @@ export default async function plugin(bb: BbPluginApi) {
       await clearWaiting(crew.id);
       const outcome = await applyProtocolNudge(crew);
       if (outcome !== "off") return;
+      if (await askForOutcomeLine(crew)) return;
     }
     const current = await settings.get();
     if (current.supervisionEnabled !== true) return;
@@ -11751,6 +11849,7 @@ export default async function plugin(bb: BbPluginApi) {
     // A captain that completed a turn can take the wakes held while it was unavailable.
     await releaseHeldCaptainWakes(thread.id).catch((error) => bb.log.warn(`held wake release failed captain=${thread.id}: ${String(error)}`));
     if (knownCaptains.has(thread.id)) {
+      await bb.storage.kv.delete(`${CAPTAIN_RESUME_PREFIX}${thread.id}`);
       await drainCaptainReliability(thread.id).catch((error) => bb.log.warn(`captain reliability drain failed ${thread.id}: ${String(error)}`));
     }
     await inCaptainHome(thread.id, () => reconcileReturnedAfk(thread.id)).catch(error => bb.log.warn(`AFK return: ${String(error)}`));
@@ -11820,11 +11919,82 @@ export default async function plugin(bb: BbPluginApi) {
     const summary = `${view.kind} ${interactionId || "(unknown id)"}: ${view.summary}`;
     await notifyCaptain(crew, "interaction", `${summary}\n${command}`);
   });
-  bb.events.on("turn.failed", async ({ threadId }) => {
+  bb.events.on("turn.failed", async ({ threadId, errorInfo }) => {
+    if (knownCaptains.has(threadId)) {
+      await resumeExhaustedCaptain(threadId, errorInfo).catch((error) => bb.log.warn(`captain ${threadId} resume: ${String(error)}`));
+      return;
+    }
     const crew = await findCrewByThread(threadId);
     if (crew === undefined || isSecondmateRoute(crew)) return;
     // thread.failed already paged the lifecycle error; this fires after the thread is in error.
+    await failoverExhaustedCrew(crew, errorInfo).catch((error) => bb.log.warn(`crew ${crew.id} failover: ${String(error)}`));
   });
+
+  // The owner had to type "Continue" after a pool outage (fleet audit 2026-10-07: a
+  // 21-minute stall). Resume the failed turn after the pool has had time to free.
+  async function resumeExhaustedCaptain(threadId: string, info: FailedTurnInfo): Promise<void> {
+    if (!providerExhausted(info, info ? "" : await threadFailureDetail(threadId))) return;
+    const key = `${CAPTAIN_RESUME_PREFIX}${threadId}`;
+    const scheduled = (await bb.storage.kv.get<number>(key)) ?? 0;
+    const delay = captainResumeDelay(scheduled);
+    if (delay === null) {
+      bb.log.warn(`captain ${threadId}: provider still out of capacity after ${scheduled} automatic resumes; waiting for the owner`);
+      return;
+    }
+    await bb.storage.kv.set(key, scheduled + 1);
+    try {
+      await bb.sdk.threads.retry({ threadId, sendAt: Date.now() + delay, reason: "Firstmate: provider was out of capacity; resuming" });
+      bb.log.info(`captain ${threadId}: resume ${scheduled + 1} scheduled in ${delay / 60_000} min`);
+    } catch (error) {
+      if (bbFailure(error).code !== "retry_already_queued") throw error;
+    }
+  }
+
+  // Crews died mid-deploy when the pool ran dry (fleet audit 2026-10-07). Move the crew
+  // to another provider in the same worktree, once per hour, and make it re-verify.
+  async function failoverExhaustedCrew(crew: Crew, info: FailedTurnInfo): Promise<void> {
+    if ((await settings.get()).supervisionEnabled !== true) return;
+    if (!providerExhausted(info, info ? "" : await threadFailureDetail(crew.threadId))) return;
+    const key = `crew-failover:${crew.projectId}:${crew.parentThreadId ?? ""}:${crew.id}`;
+    const last = await bb.storage.kv.get<number>(key);
+    if (typeof last === "number" && Date.now() - last < FAILOVER_WINDOW_MS) return;
+    const failed = (await bb.sdk.threads.get({ threadId: crew.threadId })).providerId ?? crew.providerId;
+    const target = await failoverExecution(crew, failed);
+    if (target === null) {
+      bb.log.warn(`crew ${crew.id}: ${failed ?? "provider"} is out of capacity and no other provider fits; left for the captain`);
+      return;
+    }
+    await bb.storage.kv.set(key, Date.now());
+    const note = `Provider failover: the prior turn failed because ${failed ?? "the provider"} was out of capacity. Before you continue, re-verify the work in progress yourself: re-read the diff, re-run the affected tests, and check the state of any push, PR, or deploy the prior thread started. Do not rely on its claims.`;
+    const next = await relaunchCrew(crew, { providerId: target.providerId, ...(target.model ? { model: target.model } : {}), note, intent: "failure-recovery" });
+    await notifyCaptain(next, "failed over", `${failed ?? "provider"} was out of capacity. Relaunched on ${target.providerId}${target.model ? `/${target.model}` : ""} in the same worktree; it re-verifies the work in progress first.`);
+  }
+
+  async function failoverExecution(crew: Crew, failed: string | null): Promise<{ providerId: string; model: string | null } | null> {
+    const preferred: ExecutionChoice[] = [];
+    if (crew.parentThreadId) {
+      try {
+        const captain = await bb.sdk.threads.get({ threadId: crew.parentThreadId });
+        const options = asRecord(await bb.sdk.threads.defaultExecutionOptions({ threadId: crew.parentThreadId }));
+        preferred.push({ providerId: captain.providerId ?? null, model: typeof options["model"] === "string" ? options["model"] : null });
+      } catch { /* the project default and catalog remain */ }
+    }
+    try {
+      const project = asRecord(await bb.sdk.projects.defaultExecutionOptions({ projectId: crew.projectId }));
+      preferred.push({ providerId: typeof project["providerId"] === "string" ? project["providerId"] : null, model: typeof project["model"] === "string" ? project["model"] : null });
+    } catch { /* the catalog remains */ }
+    const envId = await threadEnv(crew.threadId);
+    const routing = envId !== null ? { environmentId: envId } : {};
+    const catalog = (await bb.sdk.providers.list(routing)).map(asRecord)
+      .flatMap((p) => typeof p["id"] === "string" ? [{ id: p["id"], available: p["available"] !== false }] : []);
+    const target = failoverTarget({ failedProviderId: failed, shape: crew.shape, preferred, catalog });
+    if (target === null || target.model !== null) return target;
+    // Without a model the replacement would inherit the failed provider's model.
+    const models = asRecord(await bb.sdk.providers.models({ ...routing, providerId: target.providerId }))["models"];
+    const rows = Array.isArray(models) ? models.map(asRecord) : [];
+    const pick = rows.find((m) => m["isDefault"] === true) ?? rows[0];
+    return { providerId: target.providerId, model: typeof pick?.["model"] === "string" ? pick["model"] : null };
+  }
 
   bb.cli.register({
     name: "firstmate",
