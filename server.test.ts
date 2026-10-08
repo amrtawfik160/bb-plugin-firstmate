@@ -11278,6 +11278,29 @@ test("native worker idle honors durable status without imposing chat verdicts or
   } finally { await host.harness.lifecycle.dispose(); }
 });
 
+test("a native worker's chat-only WAITING: yield is recorded as a paused line the watcher can read", async () => {
+  const host = ownerHost({ transport: "real", watchOwner: "fm-watch", supervisionEnabled: true });
+  await plugin(host.bb);
+  try {
+    stubIdleSdk(host);
+    host.harness.sdk.stub("threads.queuedMessages.list", async () => []);
+    let status = "working [at=5]: started";
+    const { seen } = stubRoutedHost(host, (cmd) => cmd.includes("cat -- ") && cmd.includes("/state/c1.status") ? { payload: status } : {});
+    stubIdleSdk(host);
+    await host.bb.storage.kv.set("crews", [{ ...crewRow("c1", "thr_crew", "thr_cap"), nativeHome: "/tmp/fm-home", backlogRow: true }]);
+    const appends = () => seen.filter((cmd) => /paused \[at=\d+\]: WAITING \(chat\): CI on PR #12.* >> \S*\/tmp\/fm-home\/state\/c1\.status/.test(cmd));
+    assert.deepEqual((await emitIdle(host, "WAITING: CI on PR #12")).errors, []);
+    assert.equal(appends().length, 1, "the watcher reads the status file, never chat");
+    status = "working [at=5]: started\npaused [at=9]: WAITING (chat): CI on PR #12";
+    assert.deepEqual((await emitIdle(host, "WAITING: CI on PR #12")).errors, []);
+    assert.equal(appends().length, 1, "a standing declaration is not repeated");
+    status = "working [at=5]: started";
+    assert.deepEqual((await emitIdle(host, "Still looking at it.")).errors, []);
+    assert.equal(appends().length, 1, "only a WAITING: yield declares a wait");
+    assert.equal(sendCalls(host).filter((call) => !JSON.stringify(call).includes("OUTCOME LINE MISSING")).length, 0, "the captain is not woken");
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
 test("native Bearings uses canonical decisions and gates across CLI, tool, session and RPC", async () => {
   const host = ownerHost({ transport: "real" });
   await plugin(host.bb);
