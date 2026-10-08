@@ -10284,7 +10284,7 @@ export default async function plugin(bb: BbPluginApi) {
     name: "firstmate_ask",
     description: "Ask the captain one question, blocker or approval as a Telegram card with up to 4 option buttons. It stays on the captain's board until answered. Returns at once: keep working on other things. The answer arrives from a button tap or a card reply containing just its option letter. irreversible=true or kind=approval never proceeds on a deadline; a reversible ask with a recommended option proceeds with it at its deadline.",
     parameters: z.object({
-      impact: z.string().trim().min(1).max(300).regex(/^[^\r\n]+$/).describe("One plain sentence explaining what this means for the owner’s business"),
+      impact: z.string().optional().describe("Optional. One plain sentence explaining what this means for the owner’s business"),
       question: z.string().min(1).max(1500).describe("One question; put option text in options, not in the question"),
       kind: z.enum(["question", "blocker", "approval"]),
       options: z.array(z.object({ label: z.string().min(1).max(1000), value: z.string().min(1).max(64).optional() })).max(4).optional(),
@@ -10295,7 +10295,6 @@ export default async function plugin(bb: BbPluginApi) {
     async execute({ impact, question, kind, options, recommended, defaultAfterMinutes, irreversible }, ctx) {
       const captain = ctxString(ctx, "threadId");
       if (!captain) return toolError("firstmate_ask runs only in a captain thread.");
-      if (!impact?.trim() || /[\r\n]/.test(impact)) return toolError("impact must be one line explaining what this means for the owner’s business.");
       const choices = (options ?? []).map((option, index) => ({ label: option.label, value: option.value ?? String.fromCharCode(65 + index) }));
       if (recommended !== undefined && recommended >= choices.length) return toolError(`recommended must be the index of one of the ${choices.length} option(s).`);
       const gated = !mayDefault({ kind: kind as AskKind, irreversible: irreversible === true });
@@ -10306,7 +10305,7 @@ export default async function plugin(bb: BbPluginApi) {
       const minutes = gated || recommended === undefined ? 0 : defaultAfterMinutes ?? Number((await settings.get()).askDefaultMinutes ?? 240);
       const now = Date.now();
       const ask = ownerAsks.create({
-        captain, kind: kind as AskKind, impact: impact.trim(), text: question.trim(), options: choices,
+        captain, kind: kind as AskKind, impact: impact?.replace(/\s+/g, " ").trim(), text: question.trim(), options: choices,
         recommended: recommended ?? null, defaultAt: minutes > 0 ? now + Math.round(minutes * 60_000) : null,
         irreversible: irreversible === true, createdAt: now,
       });
