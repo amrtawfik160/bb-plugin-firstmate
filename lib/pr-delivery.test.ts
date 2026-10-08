@@ -34,15 +34,15 @@ test("each tracked PR status maps to one plain board state, and finished PRs are
   ]);
   assert.deepEqual(rows.map((r) => [r.ref, r.title ?? null, r.state]), [
     ["acme/repo#1", null, "checks running"],
-    ["acme/repo#2", null, "checks failing"],
+    ["acme/repo#2", null, "checks failed"],
     ["acme/repo#3", "Ship it", "ready to merge"],
     ["acme/repo#4", null, "ready to merge"],
-    ["acme/repo#5", null, "waiting for review"],
-    ["acme/repo#6", null, "waiting for review"],
+    ["acme/repo#5", null, "ready to merge"],
+    ["acme/repo#6", null, "ready to merge"],
     ["acme/repo#7", null, "waiting on you"],
     ["acme/repo#8", null, "draft"],
     ["acme/repo#9", null, "changes requested"],
-    ["acme/repo#10", null, "waiting for review"],
+    ["acme/repo#10", null, "ready to merge"],
   ]);
 });
 
@@ -99,12 +99,12 @@ test("a green PR with a do-not-merge comment on its current head is on hold, not
     "✅ Done since you last looked: nothing new.",
     "",
     "🔧 In progress: nothing open.",
-    "Other PRs: [runants#1759](https://github.com/hazw80801/runants/pull/1759) on hold (do not merge)",
+    "Other PRs: [runants#1759](https://github.com/hazw80801/runants/pull/1759) on hold",
   ].join("\n"));
 });
 
 test("a do-not-merge label holds the PR whatever its head", () => {
-  assert.match(boardFor(runants1759({ comments: [], labels: [{ name: "do-not-merge" }] })), /^Other PRs: \[runants#1759\]\(https:\/\/github\.com\/hazw80801\/runants\/pull\/1759\) on hold \(do not merge\)$/m);
+  assert.match(boardFor(runants1759({ comments: [], labels: [{ name: "do-not-merge" }] })), /^Other PRs: \[runants#1759\]\(https:\/\/github\.com\/hazw80801\/runants\/pull\/1759\) on hold$/m);
 });
 
 test("a new commit after the do-not-merge comment lifts the hold, and an approval comment does not hold", () => {

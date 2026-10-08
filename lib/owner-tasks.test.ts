@@ -20,9 +20,10 @@ test("every allowed move succeeds and every other move is refused", () => {
     }
   }
   assert.deepEqual(allowed, [
-    "working->needs_you", "working->ready", "working->merged", "working->live", "working->done", "working->dropped",
-    "needs_you->working", "needs_you->ready", "needs_you->merged", "needs_you->live", "needs_you->done", "needs_you->dropped",
-    "ready->working", "ready->needs_you", "ready->merged", "ready->live", "ready->done", "ready->dropped",
+    "working->needs_you", "working->ready", "working->check", "working->merged", "working->live", "working->done", "working->dropped",
+    "needs_you->working", "needs_you->ready", "needs_you->check", "needs_you->merged", "needs_you->live", "needs_you->done", "needs_you->dropped",
+    "ready->working", "ready->needs_you", "ready->check", "ready->merged", "ready->live", "ready->done", "ready->dropped",
+    "check->working", "check->needs_you", "check->ready", "check->merged", "check->live", "check->done", "check->dropped",
     "merged->live", "merged->done",
   ]);
 });
@@ -37,7 +38,7 @@ const pr = (over: Partial<DeliveryRecord>) => ({ id: "a/b#1", status: "waiting-c
 test("pull requests prove working, ready, merged, or live", () => {
   assert.equal(stateFromPrs([]), null);
   assert.equal(stateFromPrs([pr({ status: "ready-to-merge" }), pr({ status: "failing-checks" })]), "working");
-  assert.equal(stateFromPrs([pr({ status: "pr-delivered", requirement: "pr" })]), "working", "a PR the board shows as waiting for review is not ready");
+  assert.equal(stateFromPrs([pr({ status: "pr-delivered", requirement: "pr" })]), "working", "a delivered PR the captain has not merged is not ready for the owner");
   assert.equal(stateFromPrs([pr({ status: "ready-to-merge" }), pr({ status: "complete", forgeState: "merged", mergeCommitSha: "m" })]), "ready");
   assert.equal(stateFromPrs([pr({ status: "complete", forgeState: "merged", mergeCommitSha: "m" }), pr({ status: "explicitly-abandoned" })]), "merged");
   assert.equal(stateFromPrs([pr({ status: "complete", forgeState: "merged", mergeCommitSha: "m", requirement: "merged-and-verified", verifiedCommitSha: "m" })]), "live");

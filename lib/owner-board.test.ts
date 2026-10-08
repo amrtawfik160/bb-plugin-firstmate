@@ -78,7 +78,7 @@ test("the board shows what needs the owner, what finished since they last looked
     "",
     "🔧 In progress (2)",
     "- T1 Areliaa · Fix the Metricool sync · 2 d · stale 2 d",
-    "- T13 RunAnts · Improve RunAnts UI to look like Shopify, with screenshots · 5 h · [runants#1759](https://github.com/hazw80801/runants/pull/1759) on hold (do not merge)",
+    "- T13 RunAnts · Improve RunAnts UI to look like Shopify, with screenshots · 5 h · [runants#1759](https://github.com/hazw80801/runants/pull/1759) on hold",
     "Other PRs: [runants#1771](https://github.com/hazw80801/runants/pull/1771) checks running",
   ].join("\n"));
 });
@@ -100,7 +100,7 @@ test("with no task running, open pull requests still show under the empty In pro
     "✅ Done since you last looked: nothing new.",
     "",
     "🔧 In progress: nothing open.",
-    "Other PRs: [repo#9](https://github.com/acme/repo/pull/9) draft; [web#7](https://github.com/acme/web/pull/7) checks failing",
+    "Other PRs: [repo#9](https://github.com/acme/repo/pull/9) draft; [web#7](https://github.com/acme/web/pull/7) checks failed",
   ].join("\n"));
 });
 
@@ -188,7 +188,7 @@ test("every PR on the board links to its GitHub page under its short name", () =
     "- PR [areliaa#283](https://github.com/amrtawfik160/areliaa/pull/283) Bump the email template · merged",
     "",
     "🔧 In progress (1)",
-    "- T2 Cyndra · Memory screen · 1 h · [cyndra-saas#2146](https://github.com/cyndra-ai/cyndra-saas/pull/2146) waiting for review",
+    "- T2 Cyndra · Memory screen · 1 h · [cyndra-saas#2146](https://github.com/cyndra-ai/cyndra-saas/pull/2146) ready to merge",
     "Other PRs: [runants#1771](https://github.com/hazw80801/runants/pull/1771) draft",
   ].join("\n"));
 });
@@ -242,4 +242,37 @@ test("the digest caps Needs you at 5 and stale ids at 15, and skips empty blocks
 
 test("the digest is empty when nothing needs the owner, nothing finished, and nothing is stale", () => {
   assert.equal(formatDigest(input({ tasks: [task("T1")], records: [pr("acme/repo#1"), merged("acme/repo#2", { updatedAt: SINCE - 1 })] })), "");
+});
+
+test("Oct 8 repro: PR words say what the PR needs, and nobody is told a PR waits for their review", () => {
+  const prs = [
+    pr("cyndra-ai/cyndra-saas#2163", { taskId: "perf-7", status: "waiting-native-gates" }),
+    pr("cyndra-ai/cyndra-saas#2164", { taskId: "perf-1", status: "waiting-review" }),
+    pr("cyndra-ai/cyndra-saas#2167", { taskId: "perf-5", status: "waiting-checks" }),
+    pr("cyndra-ai/cyndra-saas#2168", { taskId: "perf-5", status: "failing-checks" }),
+    pr("hazw80801/runants#1759", { taskId: "runants-ui", status: "changed-since-hold" }),
+    pr("hazw80801/runants#1760", { taskId: "runants-ui", status: "on-hold" }),
+    pr("amrtawfik160/safi#510", { taskId: "safi-pdf", status: "pr-delivered", requirement: "pr", blocker: "PR delivered; checks pending or unknown" }),
+  ];
+  assert.equal(formatBoard(input({
+    tasks: [
+      task("T32", { project: "Cyndra", title: "Perf 1", crewIds: ["perf-1"] }),
+      task("T35", { project: "Cyndra", title: "Perf 5+6", crewIds: ["perf-5"] }),
+      task("T36", { project: "Cyndra", title: "Perf 7", crewIds: ["perf-7"] }),
+      task("T13", { project: "RunAnts", title: "Shopify UI", crewIds: ["runants-ui"] }),
+      task("T41", { project: "Safi", title: "Export PDF", crewIds: ["safi-pdf"] }),
+    ],
+    records: prs,
+  })), [
+    "📌 Needs you: nothing right now.",
+    "",
+    "✅ Done since you last looked: nothing new.",
+    "",
+    "🔧 In progress (5)",
+    "- T13 RunAnts · Shopify UI · 1 h · [runants#1759](https://github.com/hazw80801/runants/pull/1759) changed since hold, needs a check; [runants#1760](https://github.com/hazw80801/runants/pull/1760) on hold",
+    "- T32 Cyndra · Perf 1 · 1 h · [cyndra-saas#2164](https://github.com/cyndra-ai/cyndra-saas/pull/2164) ready to merge",
+    "- T35 Cyndra · Perf 5+6 · 1 h · [cyndra-saas#2167](https://github.com/cyndra-ai/cyndra-saas/pull/2167) checks running; [cyndra-saas#2168](https://github.com/cyndra-ai/cyndra-saas/pull/2168) checks failed",
+    "- T36 Cyndra · Perf 7 · 1 h · [cyndra-saas#2163](https://github.com/cyndra-ai/cyndra-saas/pull/2163) ready to merge",
+    "- T41 Safi · Export PDF · 1 h · [safi#510](https://github.com/amrtawfik160/safi/pull/510) checks running",
+  ].join("\n"));
 });
