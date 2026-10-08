@@ -10296,7 +10296,7 @@ export default async function plugin(bb: BbPluginApi) {
       const captain = ctxString(ctx, "threadId");
       if (!captain) return toolError("firstmate_ask runs only in a captain thread.");
       if (!impact?.trim() || /[\r\n]/.test(impact)) return toolError("impact must be one line explaining what this means for the owner’s business.");
-      const choices = (options ?? []).map((option) => ({ label: option.label, value: option.value ?? option.label }));
+      const choices = (options ?? []).map((option, index) => ({ label: option.label, value: option.value ?? String.fromCharCode(65 + index) }));
       if (recommended !== undefined && recommended >= choices.length) return toolError(`recommended must be the index of one of the ${choices.length} option(s).`);
       const gated = !mayDefault({ kind: kind as AskKind, irreversible: irreversible === true });
       if (gated && defaultAfterMinutes !== undefined) {

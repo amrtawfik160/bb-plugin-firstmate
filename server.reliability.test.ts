@@ -564,7 +564,7 @@ test("firstmate_ask records the ask and sends the connector a question card with
     assert.deepEqual(calls[0]!.input, {
       askId: id,
       text: `Customers can use this feature.\n\n❓ Question\n\nDark mode by default?\nA. Yes\nB. No\n\nRecommended: Yes\nIf no answer by ${hhmm(stored.defaultAt!)} UTC, I'll go with Yes.`,
-      options: [{ label: "Yes", value: "Yes" }, { label: "No", value: "no" }],
+      options: [{ label: "Yes", value: "A" }, { label: "No", value: "no" }],
       recommended: 0,
     });
   } finally {
@@ -777,4 +777,18 @@ test("telegramCommand board keeps decisions, drops launch bookkeeping, and lists
   } finally {
     await host.harness.lifecycle.dispose();
   }
+});
+
+
+test("long option text stays whole and defaults to a short letter value", async () => {
+  const host = await captainHost();
+  try {
+    connectorOk(host);
+    const label = "Find and verify the addresses the business uses to reach its servers before changing the production setting.";
+    const result = await askTool(host, { impact: "New customers can start their agents again.", question: "How should we repair access?", kind: "question", options: [{ label }] });
+    assert.equal(isError(result), false);
+    const sent = rpcCalls(host).find((call) => call.method === "ask")!;
+    assert.deepEqual(sent.input.options, [{ label, value: "A" }]);
+    assert.equal(sent.input.text, `New customers can start their agents again.\n\n❓ Question\n\nHow should we repair access?\nA. ${label}`);
+  } finally { await host.harness.lifecycle.dispose(); }
 });
