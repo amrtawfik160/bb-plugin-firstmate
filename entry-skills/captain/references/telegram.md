@@ -26,8 +26,9 @@ A turn that only handled crew wakes, with nothing for the owner, ends with no te
 - Call `firstmate_inbox` to list every owner message that still needs a final answer, with its
   ref and age. Call it as the last step of every turn that handled an owner message, and answer
   or dispatch every item it lists before the turn ends.
-- When a crew takes a task, pass the item's ref in `sourceRefs` on `firstmate_dispatch`; a dispatch
-  in a turn an owner message started is refused without it. The dispatch opens an owner task on the
+- When a crew takes a task, pass the item's ref in `sourceRefs` on `firstmate_dispatch`. In a turn an
+  owner message started, a dispatch without it still runs, but opens no owner task and returns a
+  warning. The dispatch opens an owner task on the
   board. A reply never closes it: its PR merging does, or `firstmate_task` close with done or
   dropped (dropped needs a reason). Work you do yourself gets a task through `firstmate_task` open.
 - Each owner job gets its own dispatch and task; a job from another thread or your own passes `origin` instead.
