@@ -6575,7 +6575,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
   const deliveryParams = z.object({
     action:z.enum(["list","inspect","register","reconcile","assign","abandon","clear-hold","verify","account"]),
-    id:z.string().optional(),crewId:z.string().optional(),url:z.string().optional(),from:z.string().nullable().optional(),
+    id:z.string().optional().describe("Deliverable id owner/repo#number; url works instead"),crewId:z.string().optional(),url:z.string().optional().describe("PR link"),from:z.string().nullable().optional(),
     requirement:z.enum(["pr","merged","merged-and-verified"]).optional(),reason:z.string().optional(),commitSha:z.string().optional().describe("Freshly observed merged commit SHA for required verification"),
     authorized:z.boolean().optional().describe("Explicit user authority for abandonment or changing the delivery contract"),
     failureId:z.string().optional(),scope:z.enum(["author","baseline"]).optional(),followUpTask:z.string().optional(),
@@ -6605,8 +6605,11 @@ export default async function plugin(bb: BbPluginApi) {
       const record=deliveries.register({ url:input.url ?? crew.prUrl ?? "",taskId:crew.id,projectId,owner,home:await crewNativeHome(crew),worker:crew.threadId,requirement:original,continuation:{...crew,task:await fullCrewTask(crew),taskSpilled:false} });
       return [record];
     }
-    const r=deliveries.get(input.id ?? "");
-    if (!r || r.projectId !== projectId) throw new Error("Unknown deliverable on this project.");
+    if (!input.id && !input.url) throw new Error(`${input.action} needs the PR: Pass id (owner/repo#number) or url (the PR link).`);
+    const id=input.id ?? canonicalPr(input.url ?? "").id;
+    const r=deliveries.get(id);
+    // The owning manager reaches its own records in any project; everyone else stays inside their project.
+    if (!r || (r.projectId !== projectId && r.owner !== owner)) throw new Error(`Unknown deliverable ${id}. Pass id (owner/repo#number) or url (the PR link) of a PR tracked for this manager or project.`);
     if (input.action === "inspect") return [r];
     if (input.action === "assign") {
       if (input.from !== r.owner) throw new Error("Assignment requires the explicitly named previous manager.");
