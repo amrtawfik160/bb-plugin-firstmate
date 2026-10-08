@@ -10166,10 +10166,9 @@ export default async function plugin(bb: BbPluginApi) {
       if (taskRef !== undefined && (parentThreadId === undefined || ownerTasks.get(taskRef)?.captain !== parentThreadId)) {
         return toolError(`No owner task ${taskRef} for this captain. Check firstmate_task list.`);
       }
-      if (turnRefs.length > 0 && origin === undefined && taskRef === undefined && !passedRefs.some((ref) => turnRefs.includes(ref))) {
-        return toolError(`This turn started from owner message ${turnRefs.join(", ")}. If this job is the owner's, pass sourceRefs: ${JSON.stringify(turnRefs)}. If it came from elsewhere, pass origin: {"kind":"thread","threadId":"<thread>"} or {"kind":"captain","reason":"<why>"}.`);
-      }
+      const untagged = turnRefs.length > 0 && origin === undefined && taskRef === undefined && !passedRefs.some((ref) => turnRefs.includes(ref));
       const trackTask = async (crewId: string): Promise<string> => {
+        if (untagged) return `\nWarning: no owner task tracks this crew. This turn started from owner message ${turnRefs.join(", ")}. If this job is the owner's, pass sourceRefs: ${JSON.stringify(turnRefs)}; for a follow-up, pass taskRef; otherwise pass origin.`;
         if (parentThreadId === undefined) return "";
         const named = [...`${title ?? ""}\n${task}`.matchAll(/\bT\d+\b/g)].map((match) => ownerTasks.get(match[0])).find((item) => item?.captain === parentThreadId && isOpenTask(item));
         const held = taskRef !== undefined ? ownerTasks.get(taskRef) : named ?? await prTask(parentThreadId, resolvedProject, title, task);
@@ -11274,8 +11273,11 @@ export default async function plugin(bb: BbPluginApi) {
       };
     }
     const marked = metaFlag(meta, "captain");
+    // These instructions are re-sent every turn, so they survive compaction; reference reads do not.
+    const telegramRule = marked && inboundLedger.hasTelegram(context.thread.id)
+      ? " After each context compaction, re-read the captain skill's Telegram reference before you answer the owner." : "";
     const base = marked
-      ? `${CAPTAIN_CONTRACT_POINTER} ${BB_SKILL_RUNTIME_CONTRACT}`
+      ? `${CAPTAIN_CONTRACT_POINTER}${telegramRule} ${BB_SKILL_RUNTIME_CONTRACT}`
       : "Firstmate crews are available. Run /captain or firstmate_deck to take the deck.";
     // The complete contract and selected native skills are tool reads. Reserve
     // the SDK window for transport pointers and existing user memory.

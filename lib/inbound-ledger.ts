@@ -206,6 +206,7 @@ export type CreateInboundLedger = {
   listOpen(captainThreadId?: string): InboundRow[];
   /** Open rows plus rows handed to a crew: every owner message that still needs a final answer. */
   listPending(captainThreadId: string): InboundRow[];
+  hasTelegram(captainThreadId: string): boolean;
   markAcked(key: InboundKey, at: number): InboundRow | undefined;
   markAnswered(key: InboundKey, at: number): InboundRow | undefined;
   markDelegated(key: InboundKey, crewId: string, at: number): InboundRow | undefined;
@@ -291,6 +292,10 @@ export function createInboundLedger(db: Database): CreateInboundLedger {
     return rows.map((r) => parseRow(r.record));
   }
 
+  function hasTelegram(captainThreadId: string): boolean {
+    return db.prepare("SELECT 1 FROM inbound_ledger WHERE captain=? AND source='telegram' LIMIT 1").get(captainThreadId) != null;
+  }
+
   function transition(key: InboundKey, change: (row: InboundRow) => InboundRow): InboundRow | undefined {
     return db.transaction(() => {
       const current = get(key);
@@ -325,6 +330,7 @@ export function createInboundLedger(db: Database): CreateInboundLedger {
     get,
     listOpen,
     listPending,
+    hasTelegram,
     markAcked(key, at) {
       return transition(key, (row) => row.state === "received" ? { ...row, state: "acked", ackedAt: at } : row);
     },
