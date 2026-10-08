@@ -68,6 +68,16 @@ def meaningful(report):
     return "\n".join(lines).strip()
 
 
+def arrived_mid_drain(report):
+    """True when a presentation shows nothing but the guard's notice of newer rows.
+
+    The native guard runs last, so it reports rows queued while the drain ran.
+    """
+    surface = meaningful(report)
+    return (bool(surface) and not ack_pair(report)
+            and all(line.startswith("WARNING: queued wakes pending - drain them") for line in surface.splitlines()))
+
+
 SECTION = re.compile(r"^[A-Z][A-Z ]{3,}[A-Z](?: \(|:)")
 
 
@@ -255,6 +265,12 @@ class Journal:
         os.waitpid(pid, 0)
         return self.capture_result()
 
+    def present(self, phase):
+        # One repeat returns the newer rows now; handing back the bare notice
+        # costs the captain a whole turn just to ask again.
+        report = self.native([], phase)
+        return self.native([], phase) if arrived_mid_drain(report) else report
+
     def capture_result(self):
         output, result_path = self.capture_paths()
         if not result_path.exists():
@@ -271,7 +287,7 @@ class Journal:
 
     def start(self):
         self.current = {"version": 1, "id": uuid.uuid4().hex, "phase": "presenting", "pair": None}
-        report = self.native([], "presenting")
+        report = self.present("presenting")
         self.finish_presentation(report)
 
     def finish_presentation(self, report):
@@ -363,7 +379,7 @@ class Journal:
             self.current.update(phase="acknowledged", ackReport=prior + acknowledgement)
             self.save()
         if self.current["phase"] == "acknowledged":
-            fresh = self.native([], "refreshing")
+            fresh = self.present("refreshing")
         elif self.current["phase"] == "refreshing":
             try:
                 fresh = self.capture_result()
