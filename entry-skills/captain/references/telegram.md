@@ -4,16 +4,20 @@ The captain often reads only Telegram. A message that stays in the BB thread may
 These rules apply when owner messages arrive from the private Telegram connector (the message
 starts with "The following is an owner message from the private Telegram connector.").
 
-## What reaches Telegram
+## Write for the owner
 
-- The last message of each turn always goes to Telegram.
-- An earlier message in the same turn goes only when it is a report (about 300 characters or more)
-  or asks the captain a question. Short working notes ("Checking CI now.") stay in BB.
-- So put every result, decision and question for the captain in a report or in the last message.
-  Do not end a turn with "see my last message": the captain may not have that message.
-- Do not send "nothing has changed" messages. If nothing needs the captain, say nothing new.
-- A turn that only handled crew wakes, with nothing for the captain, ends with no text at all.
-  Do not write "nothing new", a status recap or a note about an idle crew: any final text goes to Telegram.
+Lead with the answer in a few short lines. Send one message per piece of news.
+Do not repeat in-progress lists; the pinned board shows them. The final text already
+reaches Telegram; never write "on Telegram". After `firstmate_reply`, closing text
+in that turn goes to the digest, so do not repeat your reply.
+
+For specs, explanations, plans, comparisons or long details, build a Lavish artifact.
+Run `lavish-axi --help` and `lavish-axi playbook <id>` for the format. Export one
+standalone file with `lavish-axi export <file> --out /tmp/<short-name>.html`, then
+link that `/tmp` file in the short message so the connector sends it as a document.
+Do not use `lavish-axi share`; it publishes to a third-party site.
+
+A turn that only handled crew wakes, with nothing for the owner, ends with no text.
 
 ## Track every owner message
 
@@ -52,15 +56,17 @@ for hours. Ask rarely, and make each ask easy to find and to answer.
 - Ask only for a real product or preference call, missing access or credentials, or a gated
   action: a deploy to production, spending money, deleting data, or a message to customers.
 - Use `firstmate_ask` for every such ask, never a plain-text question. Put one question in each
-  ask. Put the recommended option first, and give at most 4 options.
+  ask. Supply `impact`, one plain sentence explaining what it means for the business.
+  Put option text in `options`, not in the question. Put the recommended option first,
+  and give at most 4 options.
 - Keep working on everything else while an ask is open. A `blocker` ask names what is blocked
   and what you are doing in the meantime.
 - Set `irreversible: true` for a gated action. Approvals and irreversible asks never proceed
   without an answer. A reversible ask with a recommended option proceeds with it at its deadline,
   and Firstmate then tells you to go ahead and to tell the captain that you did.
-- An answer arrives as an owner message that replies to the ask card, or as the label of the
-  button the captain tapped. Act on it. When you learn the answer another way, or the ask no
-  longer matters, close it with `firstmate_resolve_ask`.
+- A button tap or a reply with just its letter answers a card. Other replies are normal
+  owner messages. When you learn the answer another way, correct it with `firstmate_resolve_ask`,
+  even after it was answered; `reopen=true` opens it again. Cancel asks that no longer matter.
 - While the captain is away, the connector may batch routine progress. Asks, blockers, failures
   and results the captain asked for always go out at once.
 

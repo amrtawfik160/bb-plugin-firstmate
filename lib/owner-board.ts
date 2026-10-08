@@ -19,7 +19,7 @@ export const BOARD_MAX_NEEDS_YOU = 15;
 export const BOARD_MAX_DONE = 8;
 export const DIGEST_MAX_NEEDS_YOU = 5;
 export const DIGEST_MAX_STALE = 15;
-export const BOARD_ANSWER_HINT = "Tap a question's button or reply to it to answer.";
+export const BOARD_ANSWER_HINT = "Tap a question's button or reply with just its letter.";
 
 const WAITING_WORDS: Partial<Record<OwnerTask["state"], string>> = { needs_you: "needs you", ready: "ready for you", check: "finished, check" };
 const DONE_STATES = new Set<OwnerTask["state"]>(["merged", "live", "done", "dropped"]);
@@ -88,7 +88,7 @@ function collect(input: BoardInput, ref: PrRef) {
     ...waiting.map((task) => taskLine(task, input.now, ref, { state: WAITING_WORDS[task.state], prs: folded(task) })),
     ...ownerPrs.map((pr) => prLine(pr, ref)),
   ].map((line, index) => `${index + 1}. ${line}`);
-  const doneTasks = tasks.filter((task) => DONE_STATES.has(task.state) && task.updatedAt >= input.since).sort((a, b) => b.updatedAt - a.updatedAt || byNumber(b, a));
+  const doneTasks = tasks.filter((task) => DONE_STATES.has(task.state) && !(task.state === "dropped" && /duplicate|merged into T\d+/i.test(task.dropReason ?? "")) && task.updatedAt >= input.since).sort((a, b) => b.updatedAt - a.updatedAt || byNumber(b, a));
   // A record's updatedAt is the last time it was observed; for a merged PR that is close to its merge.
   const mergedPrs = input.records.filter((r) => r.forgeState === "merged" && r.updatedAt >= input.since && !linked.has(r.id)).sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id));
   const done = [

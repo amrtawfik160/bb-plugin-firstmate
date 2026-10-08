@@ -22,16 +22,6 @@ export const rpcContract = defineRpcContract({
       state: z.enum(["open", "answered"]), resolvedAt: z.number().nullable(),
     })) }),
   },
-  autoAsk: {
-    input: z.object({
-      threadId: z.string().min(1),
-      text: z.string().min(1).max(16000),
-      options: z.array(z.object({ label: z.string().min(1).max(1000), value: z.string().min(1).max(1000) })).max(26),
-      sourceRef: z.string().min(1).max(512),
-      messageUrl: z.string().url().optional(),
-    }),
-    output: z.object({ id: z.string(), created: z.boolean(), state: z.enum(["open", "answered", "defaulted", "cancelled"]) }),
-  },
   linkAsk: {
     input: z.object({ threadId: z.string().min(1), id: z.string().min(1).max(64), messageUrl: z.string().url() }),
     output: z.object({ ok: z.boolean() }),

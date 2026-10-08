@@ -10,6 +10,7 @@ export type OwnerAsk = {
   captain: string;
   kind: AskKind;
   text: string;
+  impact?: string;
   options: AskOption[];
   recommended: number | null;
   defaultAt: number | null;
@@ -23,6 +24,7 @@ export type OwnerAsk = {
 };
 
 export type NewOwnerAsk = Pick<OwnerAsk, "captain" | "kind" | "text" | "options"> & {
+  impact?: string;
   id?: string;
   sourceRef?: string;
   messageUrl?: string;
@@ -45,7 +47,7 @@ type Database = {
 type AskRecord = {
   id: string; captain: string; kind: string; text: string; options: string; recommended: number | null;
   default_at: number | null; irreversible: number; state: string; resolution: string | null;
-  created_at: number; resolved_at: number | null; source_ref: string | null; message_url: string | null;
+  created_at: number; resolved_at: number | null; impact: string | null; source_ref: string | null; message_url: string | null;
 };
 
 export const ASK_KIND_TITLE: Record<AskKind, string> = {
@@ -87,13 +89,13 @@ export function clip(text: string, max: number): string {
 }
 
 /** The question card text the connector sends to the owner. */
-export function formatAskCard(ask: Pick<OwnerAsk, "kind" | "text" | "options" | "recommended" | "defaultAt">): string {
+export function formatAskCard(ask: Pick<OwnerAsk, "kind" | "text" | "impact" | "options" | "recommended" | "defaultAt">): string {
   const label = recommendedLabel(ask);
   const footer = [
     ...(label !== null ? [`Recommended: ${label}`] : []),
     ...(label !== null && ask.defaultAt !== null ? [`If no answer by ${formatUtcTime(ask.defaultAt)}, I'll go with ${label}.`] : []),
   ];
-  return [ASK_KIND_TITLE[ask.kind], "", ask.text.trim(), ...(footer.length > 0 ? ["", ...footer] : [])].join("\n");
+  return [...(ask.impact ? [ask.impact, ""] : []), ASK_KIND_TITLE[ask.kind], "", ask.text.trim(), ...ask.options.map((option, index) => `${String.fromCharCode(65 + index)}. ${option.label.replace(/^[A-Z][.)]\s*/i, "")}`), ...(footer.length > 0 ? ["", ...footer] : [])].join("\n");
 }
 
 /** `ask:<id>` is the connector's outbox source id for an ask card; replies and taps carry it back. */
@@ -104,13 +106,12 @@ export function askIdFromSourceEventId(sourceEventId: string | null | undefined)
 
 export type OwnerAsks = {
   create(input: NewOwnerAsk): OwnerAsk;
-  ensure(input: NewOwnerAsk & { sourceRef: string }): { ask: OwnerAsk; created: boolean };
   link(id: string, captain: string, messageUrl: string): boolean;
   get(id: string): OwnerAsk | undefined;
   listOpen(captain: string): OwnerAsk[];
   listCandidates(captain: string, now: number): OwnerAsk[];
-  /** Close one open ask owned by this captain; undefined when it is missing, foreign, or already closed. */
-  resolve(id: string, captain: string, state: Exclude<AskState, "open">, resolution: string, at: number): OwnerAsk | undefined;
+  /** Correct or reopen an ask owned by this captain. */
+  resolve(id: string, captain: string, state: AskState, resolution: string, at: number): OwnerAsk | undefined;
   /** Mark this captain's overdue reversible asks defaulted and return them, each exactly once. */
   takeDue(captain: string, now: number): OwnerAsk[];
 };
@@ -126,6 +127,7 @@ function fromRecord(row: AskRecord): OwnerAsk {
     captain: row.captain,
     kind: row.kind as AskKind,
     text: row.text,
+    ...(row.impact ? { impact: row.impact } : {}),
     options,
     recommended: row.recommended,
     defaultAt: row.default_at,
@@ -139,18 +141,6 @@ function fromRecord(row: AskRecord): OwnerAsk {
   };
 }
 
-function normalizeDecisionText(text: string): string {
-  return text.normalize("NFKC").toLowerCase()
-    .replace(/\(recommended\)/g, "")
-    .replace(/[*_`]/g, "")
-    .replace(/^\s*[a-z][.)]\s+/gm, "")
-    .replace(/[^\p{L}\p{N}]+/gu, " ").trim();
-}
-
-function decisionKey(ask: Pick<OwnerAsk, "text" | "options">): string {
-  return JSON.stringify([normalizeDecisionText(ask.text), ask.options.map((option) => normalizeDecisionText(option.label))]);
-}
-
 export function createOwnerAsks(db: Database): OwnerAsks {
   db.exec(`CREATE TABLE IF NOT EXISTS owner_ask (
     id TEXT PRIMARY KEY, captain TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL, options TEXT NOT NULL,
@@ -161,10 +151,12 @@ export function createOwnerAsks(db: Database): OwnerAsks {
   db.exec(`CREATE TABLE IF NOT EXISTS owner_ask_source (
     captain TEXT NOT NULL, source_ref TEXT NOT NULL, ask_id TEXT NOT NULL,
     PRIMARY KEY(captain, source_ref));
+    CREATE TABLE IF NOT EXISTS owner_ask_impact (id TEXT PRIMARY KEY, impact TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS owner_ask_link (
       id TEXT PRIMARY KEY, message_url TEXT NOT NULL);`);
 
   const select = `SELECT owner_ask.*,
+    (SELECT impact FROM owner_ask_impact WHERE id=owner_ask.id) AS impact,
     (SELECT source_ref FROM owner_ask_source WHERE ask_id=owner_ask.id ORDER BY source_ref LIMIT 1) AS source_ref,
     owner_ask_link.message_url FROM owner_ask LEFT JOIN owner_ask_link USING(id)`;
 
@@ -185,6 +177,7 @@ export function createOwnerAsks(db: Database): OwnerAsks {
       captain: input.captain,
       kind: input.kind,
       text: input.text,
+      ...(input.impact ? { impact: input.impact } : {}),
       options: input.options,
       recommended: input.recommended ?? null,
       defaultAt: input.defaultAt ?? null,
@@ -200,6 +193,7 @@ export function createOwnerAsks(db: Database): OwnerAsks {
       ask.id, ask.captain, ask.kind, ask.text, JSON.stringify(ask.options), ask.recommended, ask.defaultAt,
       ask.irreversible ? 1 : 0, ask.state, null, ask.createdAt, null,
     );
+    if (input.impact) db.prepare("INSERT INTO owner_ask_impact VALUES (?,?)").run(id, input.impact);
     if (input.sourceRef) db.prepare("INSERT INTO owner_ask_source VALUES (?,?,?)").run(input.captain, input.sourceRef, ask.id);
     if (input.messageUrl) db.prepare("INSERT INTO owner_ask_link VALUES (?,?)").run(ask.id, input.messageUrl);
     return ask;
@@ -207,16 +201,6 @@ export function createOwnerAsks(db: Database): OwnerAsks {
 
   return {
     create: (input) => db.transaction(() => create(input))(),
-    ensure(input) {
-      return db.transaction(() => {
-        const source = db.prepare("SELECT ask_id FROM owner_ask_source WHERE captain=? AND source_ref=?").get(input.captain, input.sourceRef) as { ask_id: string } | undefined;
-        const key = decisionKey(input);
-        const existing = source ? get(source.ask_id) : listOpen(input.captain).find((ask) => decisionKey(ask) === key);
-        const ask = existing ?? create(input);
-        db.prepare("INSERT OR IGNORE INTO owner_ask_source VALUES (?,?,?)").run(input.captain, input.sourceRef, ask.id);
-        return { ask, created: !existing };
-      })();
-    },
     link(id, captain, messageUrl) {
       const current = get(id);
       if (!current || current.captain !== captain) return false;
@@ -231,9 +215,9 @@ export function createOwnerAsks(db: Database): OwnerAsks {
     resolve(id, captain, state, resolution, at) {
       return db.transaction(() => {
         const current = get(id);
-        if (!current || current.captain !== captain || current.state !== "open") return undefined;
-        db.prepare("UPDATE owner_ask SET state=?, resolution=?, resolved_at=? WHERE id=?").run(state, resolution, at, id);
-        return { ...current, state, resolution, resolvedAt: at };
+        if (!current || current.captain !== captain) return undefined;
+        db.prepare("UPDATE owner_ask SET state=?, resolution=?, resolved_at=? WHERE id=?").run(state, state === "open" ? null : resolution, state === "open" ? null : at, id);
+        return { ...current, state, resolution: state === "open" ? null : resolution, resolvedAt: state === "open" ? null : at };
       })();
     },
     takeDue(captain, now) {
@@ -247,4 +231,9 @@ export function createOwnerAsks(db: Database): OwnerAsks {
       })();
     },
   };
+}
+
+export function askLetterAnswer(ask: Pick<OwnerAsk, "options">, text: string): string | null {
+  const letter = /^([a-z])\.?$/i.exec(text.trim())?.[1]?.toUpperCase();
+  return letter ? ask.options[letter.charCodeAt(0) - 65]?.label ?? null : null;
 }

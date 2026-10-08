@@ -124,7 +124,7 @@ test("Needs you lists open asks oldest first, then crew items, then tasks and PR
     `4. ${"x".repeat(159)}…`,
     "5. T3 Pick the pricing page copy · needs you · 30 h · stale 25 h",
     "6. PR [repo#4](https://github.com/acme/repo/pull/4) Lost manager · waiting on you",
-    "Tap a question's button or reply to it to answer.",
+    "Tap a question's button or reply with just its letter.",
     "",
     "✅ Done since you last looked: nothing new.",
     "",
@@ -158,7 +158,7 @@ test("an overfull board drops In progress lines first and keeps every Needs you 
     "📌 Needs you (2)",
     "1. ❓ Ship it? (5 min, ask a000001)",
     "2. ? d1 :: Use Postgres? (yes / no)",
-    "Tap a question's button or reply to it to answer.",
+    "Tap a question's button or reply with just its letter.",
     "",
     "✅ Done since you last looked: nothing new.",
     "",
@@ -275,4 +275,10 @@ test("Oct 8 repro: PR words say what the PR needs, and nobody is told a PR waits
     "- T36 Cyndra · Perf 7 · 1 h · [cyndra-saas#2163](https://github.com/cyndra-ai/cyndra-saas/pull/2163) ready to merge",
     "- T41 Safi · Export PDF · 1 h · [safi#510](https://github.com/amrtawfik160/safi/pull/510) checks running",
   ].join("\n"));
+});
+
+test("dropped duplicate tasks stay out of both done lists", () => {
+  const facts = input({ tasks: [task("T44", { state: "dropped", dropReason: "Duplicate of T2" }), task("T38", { state: "dropped", dropReason: "Merged into T37: the same PR" })] });
+  assert.equal(formatBoard(facts), "📌 Needs you: nothing right now.\n\n✅ Done since you last looked: nothing new.\n\n🔧 In progress: nothing open.");
+  assert.equal(formatDigest(facts), "");
 });
