@@ -7910,7 +7910,7 @@ export default async function plugin(bb: BbPluginApi) {
         );
         const setupKey=`captain-adapter-setup:${ctxString(ctx,"threadId")??''}`;
         const runtimeSelection=await bb.storage.kv.get(`native-runtime:${ctxString(ctx,"threadId")??''}`);
-        const stamp=JSON.stringify([current.fmHome,hostId,overlayFingerprint(),runtimeSelection,createHash("sha256").update(overlayBytes("bin/fm-heavy")).digest("hex")]);
+        const stamp=JSON.stringify([current.fmHome,hostId,overlayFingerprint(),runtimeSelection,...["bin/fm-heavy","bin/bb-captain-hook.sh"].map(rel=>createHash("sha256").update(readFileSync(join(OVERLAY_DIR,rel))).digest("hex"))]);
         const verifiedSetup=adapter.includes("mirror OK:") && await bb.storage.kv.get(setupKey)===stamp;
         if (!verifiedSetup) await refreshSkillsManifest(hostId, current.fmHome, signal);
         if (!current.fullParityOnDeck) await refreshCaptainMemory();

@@ -63,8 +63,21 @@ case "$mode" in
   stop)
     native_args=()
     [ "${2:-}" != "--claude" ] || native_args+=(--claude)
-    run_native fm-turnend-guard.sh "${native_args[@]}"
-    rc=$?
+    # stdout passes through; the guard's block text is held until the verdict is final.
+    guard() {
+      exec 3>&1
+      blocked=$(run_native fm-turnend-guard.sh "${native_args[@]}" 2>&1 >&3)
+      rc=$?
+      exec 3>&-
+    }
+    guard
+    # The keeper starts the next watcher a second or so after one exits. A turn
+    # ending inside that gap finds no lock holder, so let the healthy keeper re-arm.
+    if [ "$rc" != 0 ] && bb_keeper_healthy; then
+      sleep "${BB_CAPTAIN_REARM_WAIT:-5}"
+      guard
+    fi
+    [ -z "$blocked" ] || printf '%s\n' "$blocked" >&2
     [ "$rc" = 0 ] || exit "$rc"
     active=false
     if command -v jq >/dev/null 2>&1 && [ -n "$payload" ]; then

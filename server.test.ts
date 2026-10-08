@@ -8222,6 +8222,64 @@ test("captain stop hook blocks once on unhandled wakes and is a no-op elsewhere"
   }
 });
 
+test("captain stop hook waits out the keeper's re-arm gap once, and still blocks without a healthy keeper", async () => {
+  const home = mkdtempSync(join(tmpdir(), "fm-hook-"));
+  const state = join(home, "state");
+  mkdirSync(state);
+  mkdirSync(join(home, "bin-bb"));
+  mkdirSync(join(home, ".bb-firstmate/captains"), { recursive: true });
+  writeFileSync(join(home, ".bb-firstmate/captains/thr_cap"), `home=${home}\nstate=${state}\nown_home=1\n`);
+  // Blind until the next watcher holds the lock: the first `blind` runs block, later runs pass.
+  writeFileSync(join(home, "bin-bb/fm-turnend-guard.sh"), `#!/bin/bash
+n=$(( $(cat "${state}/runs" 2>/dev/null || echo 0) + 1 )); echo "$n" > "${state}/runs"
+[ "$n" -gt "$(cat "${state}/blind")" ] && exit 0
+echo "TURN WOULD END BLIND run $n" >&2; exit 2
+`, { mode: 0o755 });
+  const keeperPath = join(state, ".bb-watch-keeper.sh");
+  writeFileSync(keeperPath, "#!/bin/bash\nwhile :; do sleep 0.1; done\n");
+  const keeper = spawn("bash", [keeperPath], { stdio: "ignore" });
+  await new Promise<void>((resolve, reject) => { keeper.once("spawn", resolve); keeper.once("error", reject); });
+  const stop = (blind: number) => {
+    writeFileSync(join(state, "blind"), String(blind));
+    rmSync(join(state, "runs"), { force: true });
+    const result = spawnSync("bash", [CAPTAIN_HOOK, "stop", "--claude"], {
+      input: "{}", encoding: "utf8",
+      env: { PATH: process.env.PATH ?? "", HOME: home, BB_THREAD_ID: "thr_cap", BB_CAPTAIN_REARM_WAIT: "0.2" },
+    });
+    return { ...result, runs: Number(readFileSync(join(state, "runs"), "utf8")) };
+  };
+  try {
+    const blindWithoutKeeper = stop(1);
+    assert.equal(blindWithoutKeeper.status, 2, "no keeper files: blocks as before");
+    assert.equal(blindWithoutKeeper.runs, 1);
+    assert.equal(blindWithoutKeeper.stderr, "TURN WOULD END BLIND run 1\n");
+
+    const now = Math.floor(Date.now() / 1000);
+    writeFileSync(join(state, ".bb-watch-keeper.pid"), `${keeper.pid}\n`);
+    writeFileSync(join(state, ".bb-watch-owner.beat"), `${now}\n`);
+    writeFileSync(join(state, ".last-watcher-beat"), "");
+    const gap = stop(1);
+    assert.equal(gap.status, 0, gap.stderr);
+    assert.equal(gap.runs, 2, "the guard runs once more after the wait");
+    assert.equal(gap.stderr, "", "the stale blind banner is not shown");
+
+    const stillBlind = stop(2);
+    assert.equal(stillBlind.status, 2, "a second failure blocks exactly as today");
+    assert.equal(stillBlind.runs, 2, "one retry only");
+    assert.equal(stillBlind.stderr, "TURN WOULD END BLIND run 2\n");
+
+    assert.equal(stop(0).runs, 1, "a passing guard is not run twice");
+
+    utimesSync(join(state, ".last-watcher-beat"), now - 301, now - 301);
+    const staleWatcher = stop(1);
+    assert.equal(staleWatcher.status, 2, "a watcher silent past its grace is not waited for");
+    assert.equal(staleWatcher.runs, 1);
+  } finally {
+    keeper.kill("SIGKILL");
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("captain session-start hook runs native session start only in the captain's own home", () => {
   const home = mkdtempSync(join(tmpdir(), "fm-hook-"));
   try {
