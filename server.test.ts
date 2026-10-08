@@ -4483,11 +4483,10 @@ test("C2: the plugin writes NO canned intake-judgement essay to the brief (nativ
       { projectId: "proj_1" },
     );
     assert.equal(result.exitCode, 0, result.stderr);
-    // The brief is filled by a python fill carrying the base64 intent (FM_INTENT).
-    const briefCmd = seen.find((c) => c.includes("FM_INTENT="));
-    assert.ok(briefCmd, "brief fill command not seen");
-    assert.ok(!briefCmd!.includes("FM_SPEC="), "no separate judgement-bearing spec should be injected");
-    assert.ok(!/[Ii]ntake judgement/.test(briefCmd!), "no canned intake-judgement essay");
+    const fill = briefFill(seen);
+    assert.ok(fill, "brief fill payload not seen");
+    assert.deepEqual(Object.keys(fill).sort(), ["intent", "spec"], "no separate judgement-bearing spec should be injected");
+    assert.ok(!/[Ii]ntake judgement/.test(fill.spec), "no canned intake-judgement essay");
     // The plugin also runs no fm-project-mode.sh probe — posture reconciliation is
     // left entirely to native (mode is carried on the brief's Delivery contract).
     assert.ok(!seen.some((c) => c.includes("fm-project-mode.sh")), "plugin must not synthesize a posture judgement");
@@ -5893,11 +5892,9 @@ test("B1: dispatch normalises the leading Captain-label out of the brief intent 
       { projectId: "proj_1" },
     );
     assert.equal(result.exitCode, 0, result.stderr);
-    const scaffold = hostCommands.find((c) => c.includes("FM_INTENT="));
-    assert.ok(scaffold, `no brief fill command in ${hostCommands.join("\n---\n")}`);
-    const m = /FM_INTENT=([A-Za-z0-9+/=]+)/.exec(scaffold!);
-    assert.ok(m, "no FM_INTENT b64 in the scaffold command");
-    const decoded = Buffer.from(m![1]!, "base64").toString("utf8");
+    const fill = briefFill(hostCommands);
+    assert.ok(fill, `no brief fill payload in ${hostCommands.join("\n---\n")}`);
+    const decoded = fill.intent;
     assert.equal(decoded, "fix flaky login", `brief intent body must be normalised, got ${JSON.stringify(decoded)}`);
     assert.ok(!NATIVE_INTENT_ADDRESS.test(decoded), "brief intent body still trips native refusal");
   } finally {
@@ -9754,10 +9751,9 @@ test("real dispatch of headed task text fills intent and spec from the task's ow
     const task = "## Captain's intent\nfix the login redirect\n\n## Firstmate spec\nTouch only auth.ts.";
     const result = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--", task], { projectId: "proj_1" });
     assert.equal(result.exitCode, 0, result.stderr);
-    const fill = seen.find((c) => c.includes("FM_INTENT="))!;
-    const b64 = (name: string) => Buffer.from(new RegExp(`${name}=([A-Za-z0-9+/=]+)`).exec(fill)![1]!, "base64").toString("utf8");
-    assert.equal(b64("FM_INTENT"), "fix the login redirect");
-    assert.ok(b64("FM_TASK_OWN_SPEC").startsWith("Touch only auth.ts.\n\n### Skills"), b64("FM_TASK_OWN_SPEC"));
+    const fill = briefFill(seen)!;
+    assert.equal(fill.intent, "fix the login redirect");
+    assert.ok(fill.spec.startsWith("Touch only auth.ts.\n\n### Skills"), fill.spec);
     const add = seen.find((c) => c.includes("fm-tasks-axi.sh") && c.includes("'add'"))!;
     assert.ok(add.includes("fix the login redirect"), add);
   } finally {
@@ -9778,10 +9774,9 @@ test("every real brief names skill-routing, poteto mode and the playbook that ma
       const { seen } = stubRealTransportBacklog(host, { threadIdAfterSpawn: "thr_real" });
       const result = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", ...args], { projectId: "proj_1" });
       assert.equal(result.exitCode, 0, result.stderr);
-      const fill = seen.find((c) => c.includes("FM_INTENT="))!;
-      const encoded = /FM_TASK_OWN_SPEC=([A-Za-z0-9+/=]+)/.exec(fill);
-      assert.ok(encoded, `no Firstmate spec for ${args.join(" ")}`);
-      const spec = Buffer.from(encoded[1]!, "base64").toString("utf8");
+      const fill = briefFill(seen);
+      assert.ok(fill, `no Firstmate spec for ${args.join(" ")}`);
+      const spec = fill.spec;
       assert.ok(spec.startsWith(specStart), spec);
       assert.match(spec, /skill-routing/);
       assert.match(spec, /poteto-mode\/SKILL\.md/);
@@ -9807,8 +9802,7 @@ test("a real brief picks the playbook from the dispatch title, and --playbook ov
       const { seen } = stubRealTransportBacklog(host, { threadIdAfterSpawn: "thr_real" });
       const result = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", ...args], { projectId: "proj_1" });
       assert.equal(result.exitCode, 0, result.stderr);
-      const fill = seen.find((c) => c.includes("FM_INTENT="))!;
-      const spec = Buffer.from(/FM_TASK_OWN_SPEC=([A-Za-z0-9+/=]+)/.exec(fill)![1]!, "base64").toString("utf8");
+      const spec = briefFill(seen)!.spec;
       assert.ok(spec.includes(expected), `${args.join(" ")}\n${spec}`);
       assert.ok(spec.includes("pstack always has priority. If a skill or rule conflicts with it, pstack wins."), spec);
     } finally {
@@ -9858,8 +9852,7 @@ test("report-only dispatch fills an investigation specification without implemen
     const { seen } = stubRealTransportBacklog(host, { threadIdAfterSpawn: "thr_real" });
     const result = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--shape", "scout", "--", "Investigate missing Telegram delivery and report evidence."], { projectId: "proj_1" });
     assert.equal(result.exitCode, 0, result.stderr);
-    const fill = seen.find((command) => command.includes("FM_INTENT="))!;
-    const spec = Buffer.from(/FM_TASK_OWN_SPEC=([A-Za-z0-9+/=]+)/.exec(fill)![1]!, "base64").toString("utf8");
+    const spec = briefFill(seen)!.spec;
     assert.doesNotMatch(spec, /Implement the captain|Small diff, own branch/);
     assert.match(spec, /written report/);
   } finally {

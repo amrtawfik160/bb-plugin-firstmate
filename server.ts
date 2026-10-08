@@ -3442,18 +3442,19 @@ export default async function plugin(bb: BbPluginApi) {
   // fm-brief.sh, then fill its {TASK}/{FIRSTMATE_SPEC} placeholders so real tools
   // (fm-bearings-snapshot, teardown, a manual `fm` relaunch) see a Captain-intent /
   // Firstmate-spec brief for a BB-dispatched crew, not just a synthetic prompt.
-  // Best-effort and idempotent (never overwrites an existing brief); a missing
-  // script or host failure is silent — the crew already has the structured prompt.
-  async function publishFmBrief(crew: Crew, hostId: string | undefined, task: string): Promise<boolean> {
+  // Idempotent (never overwrites an existing brief). A missing script is not a
+  // failure; a host or scaffold failure is returned so the caller decides — real
+  // transport cannot spawn without the brief, a BB crew already has its prompt.
+  async function publishFmBrief(crew: Crew, hostId: string | undefined, task: string): Promise<{ ok: true } | { ok: false; error: string }> {
     const fmHome = await crewNativeHome(crew);
-    if (fmHome === "") return false;
-    if (isSecondmateRoute(crew)) return false;
+    if (fmHome === "") return { ok: false, error: "no native home" };
+    if (isSecondmateRoute(crew)) return { ok: false, error: "secondmate routes carry no brief" };
     let host = hostId;
     if (host === undefined || host === "") {
       try {
         host = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
-      } catch {
-        return false;
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
       }
     }
     const brief = `${fmHome}/data/${crew.id}/brief.md`;
@@ -3464,14 +3465,16 @@ export default async function plugin(bb: BbPluginApi) {
     // fm_brief_intent_address_line does not refuse the brief (B1).
     // Headed task text supplies its own spec section; never nest it under the template's.
     const sections = briefSections(task.trim());
-    const intentB64 = Buffer.from(normalizeCaptainIntent(sections.intent).slice(0, 3000), "utf8").toString("base64");
+    const intent = normalizeCaptainIntent(sections.intent).slice(0, 3000);
     const defaultSpec = crew.shape === "scout"
       ? "Investigate the captain's intent within its stated scope. Deliver a written report with commands, outcomes, revision, limits, and recommendations. Distinguish observed behavior from inference; follow the report-only completion contract."
       : "Implement the captain's intent above exactly; do not widen scope. Small diff, own branch, deliver per the mode contract, then report DONE/BLOCKED/FAILED.";
     // Captain-authored specifications retain precedence over the role default.
     // The skills block follows the cap so a long specification never cuts it off.
     const spec = `${(sections.spec ?? defaultSpec).slice(0, 3000)}\n\n${crewSkillBlock({ ...crew, task })}`;
-    const specEnv = `FM_TASK_OWN_SPEC=${Buffer.from(spec, "utf8").toString("base64")} `;
+    // Intent plus spec plus skills block outgrow one host command, so the fill
+    // reads them from a staged host file.
+    const fill = `/tmp/.fm-brief-fill-${randomUUID()}`;
     // fm-brief refuses --mode on scouts and requires it on ships; a ship's posture
     // is exactly the delivery mode the brief records.
     const scaffold =
@@ -3479,10 +3482,8 @@ export default async function plugin(bb: BbPluginApi) {
         ? `${briefRef} ${shQuote(crew.id)} crew --scout`
         : `${briefRef} ${shQuote(crew.id)} crew --mode ${shQuote(crew.posture)}`;
     const py =
-      "import base64,os,sys;p=sys.argv[1];" +
-      'intent=base64.b64decode(os.environ["FM_INTENT"]).decode();' +
-      'spec=base64.b64decode(os.environ["FM_TASK_OWN_SPEC"]).decode();' +
-      "s=open(p).read();s=s.replace('{TASK}',intent).replace('{FIRSTMATE_SPEC}',spec);" +
+      "import json,sys;p=sys.argv[1];d=json.load(open(sys.argv[2]));" +
+      "s=open(p).read();s=s.replace('{TASK}',d['intent']).replace('{FIRSTMATE_SPEC}',d['spec']);" +
       "open(p,'w').write(s)";
     const script = [
       `export FM_HOME=${shQuote(fmHome)}`,
@@ -3496,20 +3497,24 @@ export default async function plugin(bb: BbPluginApi) {
       // scaffold's stderr and surface it so publishFmBrief logs it (best-effort still:
       // the crew already has the structured prompt, so a failure only logs, not throws).
       `if ! __fm_err=$(${scaffold} 2>&1); then echo "fm-brief scaffold failed: $__fm_err" >&2; exit 1; fi`,
-      `FM_INTENT=${intentB64} ${specEnv}python3 -c ${shQuote(py)} ${shQuote(brief)} || { echo "fm-brief fill failed" >&2; exit 1; }`,
+      `python3 -c ${shQuote(py)} ${shQuote(brief)} ${shQuote(fill)} || { echo "fm-brief fill failed" >&2; exit 1; }`,
     ].join("\n");
     try {
+      if (!(await writeHostBytes(host, fill, JSON.stringify({ intent, spec }), 30_000))) throw new Error("could not stage the brief text on the host");
       const res = await runOnHost(host, script, 30_000);
       noteMirrorStale(host, fmHome, res.output, (line) => `bb mirror is STALE while scaffolding brief crew=${crew.id}: ${line}. Re-run the overlay installer against ${fmHome}.`);
       if (res.exitCode !== 0) {
         bb.log.warn(`fm brief scaffold failed crew=${crew.id} exit=${res.exitCode}: ${res.output.trim().slice(-400)}`);
-        return false;
+        return { ok: false, error: `exit ${res.exitCode}: ${res.output.trim().slice(-400)}` };
       }
       bb.log.info(`fm brief scaffolded crew=${crew.id} path=${brief}`);
-      return true;
+      return { ok: true };
     } catch (error) {
-      bb.log.warn(`fm brief scaffold failed crew=${crew.id} ${error instanceof Error ? error.message : String(error)}`);
-      return false;
+      const reason = error instanceof Error ? error.message : String(error);
+      bb.log.warn(`fm brief scaffold failed crew=${crew.id} ${reason}`);
+      return { ok: false, error: reason };
+    } finally {
+      await runOnHost(host, `rm -f ${shQuote(fill)}`, 10_000).catch(() => {});
     }
   }
 
@@ -3677,7 +3682,13 @@ export default async function plugin(bb: BbPluginApi) {
     // Scaffold the authoritative brief first — a ship spawn reads its recorded
     // "Delivery contract: mode=" line and refuses a mismatch, so the brief must
     // exist (with the right mode) before fm-spawn.sh runs.
-    await publishFmBrief(crew, hostId, input.task);
+    const scaffolded = await publishFmBrief(crew, hostId, input.task);
+    if (!scaffolded.ok) {
+      // Nothing was spawned and no backlog row was added, so the launch holds no slot.
+      const pendingKey=launchKey(crew.projectId,crew.parentThreadId ?? "",crew.nativeHome ?? "",crew.id);
+      if (launches.get(pendingKey)?.state === "reserved") launches.update(pendingKey,{ state:"failed",error:"Brief could not be written before BB creation" });
+      throw new Error(`The brief for ${crew.id} could not be written (${scaffolded.error}). No worker was created.`);
+    }
     // C1: create the backlog row (id = crew id, so meta/brief/backlog/thread all
     // agree) BEFORE spawning. tasks-axi add is idempotent (repeat returns
     // ok/already), so a retry or a queue-dispatched crew whose row already exists
