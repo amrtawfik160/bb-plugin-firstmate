@@ -72,7 +72,7 @@ import { ACK_TEXT, ackEligible, createInboundLedger, expandTelegramRows, formatO
 import { inboundHookDecision } from "./lib/inbound-dispatch.ts";
 import { formatWorkersForTelegram } from "./lib/telegram-commands.ts";
 import { formatBoard, formatDigest, type BoardInput } from "./lib/owner-board.ts";
-import { createOwnerTasks, taskLine, type OwnerTask, type TaskState } from "./lib/owner-tasks.ts";
+import { createOwnerTasks, sameProject, taskLine, type CrewFinish, type OwnerTask, type TaskState } from "./lib/owner-tasks.ts";
 import { askIdFromSourceEventId, createOwnerAsks, formatAskCard, formatUtcTime, mayDefault, recommendedLabel, type AskKind } from "./lib/owner-asks.ts";
 import { DEFAULT_RELIABILITY_FLAGS, reliabilityFlagsFromSettings } from "./lib/reliability-flags.ts";
 import { sanitizeSettingValue } from "./lib/settings-schema.ts";
@@ -4664,6 +4664,39 @@ export default async function plugin(bb: BbPluginApi) {
     return ownerTasks.list(captain);
   }
 
+  /** The owner task that already holds the PR a dispatch is for: named in its title, or the only PR its task names. */
+  async function prTask(captain: string, projectId: string, title: string | undefined, task: string): Promise<OwnerTask | undefined> {
+    const named = (text: string) => {
+      const refs = prRefsIn(text);
+      for (const m of text.matchAll(/\b([\w.-]+\/[\w.-]+)#(\d+)\b/g)) refs.keys.add(`${m[1]!.toLowerCase()}#${m[2]}`);
+      for (const m of text.matchAll(/(?:^|[\s(])#(\d+)\b/g)) refs.numbers.add(m[1]!);
+      return refs;
+    };
+    const refs = named(title ?? "");
+    const fromTask = named(task);
+    // A task text may mention other PRs in passing; only a text about one PR names it.
+    if (new Set([...fromTask.keys].map((key) => key.split("#")[1]!).concat([...fromTask.numbers])).size === 1) {
+      for (const key of fromTask.keys) refs.keys.add(key);
+      for (const n of fromTask.numbers) refs.numbers.add(n);
+    }
+    if (refs.keys.size + refs.numbers.size === 0) return undefined;
+    const project = await projectLabel(projectId);
+    return ownerTasks.holding(captain, (pr, held) => refs.keys.has(pr) || (refs.numbers.has(pr.split("#")[1]!) && sameProject(held.project, project)));
+  }
+
+  /** A crew finished: settle its owner task once no other crew of that task still runs. */
+  async function finishTask(crew: Crew, finish: CrewFinish): Promise<void> {
+    if (!crew.parentThreadId) return;
+    try {
+      const running = new Set((await readCrews()).filter((c) => c.threadId !== crew.threadId).map((c) => c.id));
+      const before = ownerTasks.list(crew.parentThreadId, { includeClosed: true }).find((task) => task.crewIds.includes(crew.id));
+      const after = ownerTasks.finishCrew(crew.parentThreadId, crew.id, finish, (id) => running.has(id), (task) => deliveries.forTasks(task.crewIds, task.prs), Date.now());
+      if (after !== undefined && after.state !== before?.state) await refreshOwnerBoard();
+    } catch (error) {
+      bb.log.warn(`owner task for crew ${crew.id}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   async function projectLabel(projectId: string | undefined): Promise<string | null> {
     if (!projectId) return null;
     try {
@@ -6913,7 +6946,7 @@ export default async function plugin(bb: BbPluginApi) {
     return `Landed locally (ff-only) ${branch}\nCrew ${crew.id} retired.`;
   }
 
-  async function retireLanded(crew: Crew, outcome: string, pr: string): Promise<void> {
+  async function retireLanded(crew: Crew, outcome: string, pr: string, landed = true): Promise<void> {
     if (pr) await registerCrewPr(crew,pr);
     const nativeHome = await crewNativeHome(crew);
     if (nativeHome !== "" && !isSecondmateRoute(crew)) {
@@ -6927,6 +6960,7 @@ export default async function plugin(bb: BbPluginApi) {
     await markQueueForCrew(crew, "done");
     await recordDone({ task: crewLabel(crew).slice(0, 200), shape: crew.shape, crewId: crew.id, outcome, pr, parentThreadId: crew.parentThreadId,deliveryRequirement:await contractForCrew(crew) });
     await removeCrew(crew);
+    await finishTask(crew, { delivered: landed, outcome });
     await publishFleet();
   }
 
@@ -7023,7 +7057,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (!terminal) continue;
       const tell = state === "merged" && (opts.notify === true || (opts.notifyUnless !== undefined && crew.parentThreadId !== opts.notifyUnless));
       try {
-        await retireLanded(crew, state === "merged" ? "merged externally" : "PR closed externally", url);
+        await retireLanded(crew, state === "merged" ? "merged externally" : "PR closed externally", url, state === "merged");
         retired.add(crew.id);
         retryCleared("landed-retire", crew.threadId);
         if (tell) await tellCaptainLanded(crew, url, true, "", opts.signal).catch(() => {});
@@ -7272,15 +7306,17 @@ export default async function plugin(bb: BbPluginApi) {
         }
       }
     }
+    let lastOutcome: string | null = null;
     try {
       if ((await crewStatus(crew)) === "idle") {
         const out = await crewOutput(crew, 300);
+        lastOutcome = parseOutcome(out);
         const f = await prForCrew(crew);
         await recordDone({
           task: crewLabel(crew).slice(0, 200),
           shape: crew.shape,
           crewId: crew.id,
-          outcome: parseOutcome(out) ?? "",
+          outcome: lastOutcome ?? "",
           pr: f.url,
           deliveryRequirement:await contractForCrew(crew),
           parentThreadId: crew.parentThreadId,
@@ -7323,6 +7359,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
     await removeCrew(crew);
+    await finishTask(crew, { delivered: verdictOf(lastOutcome) === "DONE", outcome: lastOutcome ?? "" });
     await publishFleet();
     await dropNudge(id);
     return `Forgot crew ${id}${worktreeRemoved ? " (worktree removed)" : ""}${notes.length > 0 ? ` — ${notes.join("; ")}` : ""}`;
@@ -9874,10 +9911,11 @@ export default async function plugin(bb: BbPluginApi) {
       z.object({ kind: z.literal("captain"), reason: z.string().min(1).max(200) }),
     ]).optional().describe("Where a job that is not the owner's came from; it opens no owner task"),
     ownerRequestedProvider: z.boolean().optional().describe("The owner named this provider in their own words; keeps acp-antigravity for ship work"),
+    taskRef: z.string().regex(/^T\d+$/).optional().describe("Owner task this crew continues, e.g. T8: the crew joins it, no new task opens, and an open task goes back to working"),
   });
 
-  const dispatchHelp='bb firstmate dispatch [options] -- "<task>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","sendAt","origin"])+"\n  --task <text>  Repeat for bounded fan-out; --hidden hides the worker.\n  sendAt/--send-at is unsupported; native ship isolation is mandatory.";
-  const queueHelp='bb firstmate queue add [options] -- "<title>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider"},["task","taskId","overrideOwner","sendAt","title","permissionMode","sharedEnv","worktree","visible","ownerRequestedProvider","origin"])+"\n  --detail <full-task>\n  --after <queue-id>  Repeat for dependencies, which remain dispatch gates.\n  --wait-until <ISO-time>  Eligibility only; explicit dispatch required.\n  dispatch preserves the queued shape, mode, contract, dependencies and identity; only provider/model/reasoning/permission/visibility/worktree options override at dispatch.\n  list | next | done <queue-id> | drop <queue-id> | prune | reconcile <exact-id> --project <id> [original options]"+"\nDispatch: bb firstmate queue dispatch <queue-id> [options]\n"+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","taskId","overrideOwner","sendAt","title","shape","mode","deliveryRequirement","ownerRequestedProvider","origin"]);
+  const dispatchHelp='bb firstmate dispatch [options] -- "<task>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","sendAt","origin","taskRef"])+"\n  --task <text>  Repeat for bounded fan-out; --hidden hides the worker.\n  sendAt/--send-at is unsupported; native ship isolation is mandatory.";
+  const queueHelp='bb firstmate queue add [options] -- "<title>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider"},["task","taskId","overrideOwner","sendAt","title","permissionMode","sharedEnv","worktree","visible","ownerRequestedProvider","origin","taskRef"])+"\n  --detail <full-task>\n  --after <queue-id>  Repeat for dependencies, which remain dispatch gates.\n  --wait-until <ISO-time>  Eligibility only; explicit dispatch required.\n  dispatch preserves the queued shape, mode, contract, dependencies and identity; only provider/model/reasoning/permission/visibility/worktree options override at dispatch.\n  list | next | done <queue-id> | drop <queue-id> | prune | reconcile <exact-id> --project <id> [original options]"+"\nDispatch: bb firstmate queue dispatch <queue-id> [options]\n"+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","taskId","overrideOwner","sendAt","title","shape","mode","deliveryRequirement","ownerRequestedProvider","origin","taskRef"]);
   const usage = [
     "Usage:",
     "  bb firstmate guide [--json]",
@@ -10111,10 +10149,10 @@ export default async function plugin(bb: BbPluginApi) {
   registerCaptainTool({
     name: "firstmate_dispatch",
     description:
-      "Dispatch a firstmate-style crewmate: spawns a child BB thread for one task (ship crews get an isolated worktree by default) and records it as a crew. Each owner job opens its own owner task: pass the owner's sourceRefs, or origin when the job came from another thread or the captain.",
+      "Dispatch a firstmate-style crewmate: spawns a child BB thread for one task (ship crews get an isolated worktree by default) and records it as a crew. Each owner job opens its own owner task: pass the owner's sourceRefs, or origin when the job came from another thread or the captain. A follow-up on an existing task (fix round, deploy, check) passes taskRef instead; a dispatch for a PR a task already holds joins that task.",
     presentation: { label: { pending: "Dispatching crewmate", completed: "Dispatched crewmate" } },
     parameters: dispatchParams,
-    async execute({ task, taskId, projectId, title, providerId, model, reasoningLevel, permissionMode, shape, mode, worktree, sharedEnv, visible, sendAt, deliveryRequirement, overrideOwner, sourceRefs, origin, ownerRequestedProvider }, ctx) {
+    async execute({ task, taskId, projectId, title, providerId, model, reasoningLevel, permissionMode, shape, mode, worktree, sharedEnv, visible, sendAt, deliveryRequirement, overrideOwner, sourceRefs, origin, ownerRequestedProvider, taskRef }, ctx) {
       const ctxRecord = asRecord(ctx);
       const resolvedProject =
         projectId ?? (typeof ctxRecord["projectId"] === "string" ? ctxRecord["projectId"] : undefined);
@@ -10125,11 +10163,21 @@ export default async function plugin(bb: BbPluginApi) {
         const key = parseSourceRef(ref);
         return key === null ? [] : [`${key.source === "telegram" ? "tg" : "bb"}:${key.chatId}:${key.messageId}`];
       });
-      if (turnRefs.length > 0 && origin === undefined && !passedRefs.some((ref) => turnRefs.includes(ref))) {
+      if (taskRef !== undefined && (parentThreadId === undefined || ownerTasks.get(taskRef)?.captain !== parentThreadId)) {
+        return toolError(`No owner task ${taskRef} for this captain. Check firstmate_task list.`);
+      }
+      if (turnRefs.length > 0 && origin === undefined && taskRef === undefined && !passedRefs.some((ref) => turnRefs.includes(ref))) {
         return toolError(`This turn started from owner message ${turnRefs.join(", ")}. If this job is the owner's, pass sourceRefs: ${JSON.stringify(turnRefs)}. If it came from elsewhere, pass origin: {"kind":"thread","threadId":"<thread>"} or {"kind":"captain","reason":"<why>"}.`);
       }
       const trackTask = async (crewId: string): Promise<string> => {
-        if (parentThreadId === undefined || origin !== undefined || passedRefs.length === 0) return "";
+        if (parentThreadId === undefined) return "";
+        const held = taskRef !== undefined ? ownerTasks.get(taskRef) : await prTask(parentThreadId, resolvedProject, title, task);
+        if (held !== undefined) {
+          const joined = ownerTasks.attach(held.id, parentThreadId, { crewId, sourceRefs: origin === undefined ? [...passedRefs, ...turnRefs] : [], at: Date.now() });
+          await refreshOwnerBoard();
+          return ` Owner task ${joined.id} (${joined.state}) tracks it; no new task was opened.`;
+        }
+        if (origin !== undefined || passedRefs.length === 0) return "";
         const opened = ownerTasks.open({
           captain: parentThreadId, project: await projectLabel(resolvedProject), title: title ?? task.split("\n")[0]!.slice(0, 120),
           sourceRefs: passedRefs, crewId, at: Date.now(),
@@ -11649,6 +11697,9 @@ export default async function plugin(bb: BbPluginApi) {
     // BB already reports interruptions to the parent. A completion wake here can
     // cause the manager to resume work the user just stopped.
     if (stopped) return;
+    const outcome = parseOutcome(lastAssistantText);
+    // A crew's DONE without a PR is its delivery; a PR, once there, decides the task instead.
+    if (verdictOf(outcome) === "DONE" && (await prForCrew(crew)).url === "") await finishTask(crew, { delivered: true, outcome: outcome! });
     if ((await reliabilityFlags()).honestStatus === "on") {
       // Reports once per stuck stretch and never stops the crew; normal idle handling continues.
       const before = crewWatchdog.loadOrCreate(crew.id, crew.threadId, Date.parse(crew.createdAt) || Date.now());

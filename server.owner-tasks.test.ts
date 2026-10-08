@@ -275,7 +275,7 @@ test("the board and the digest read closed tasks and PRs merged since the owner 
       "- PR [app#283](https://github.com/acme/app/pull/283) Bump the email template · merged",
       "",
       "🔧 In progress (1)",
-      "- T1 Areliaa · Metricool fix · 30 h · [app#1759](https://github.com/acme/app/pull/1759) on hold (do not merge) · stale 30 h",
+      "- T1 Areliaa · Metricool fix · 30 h · [app#1759](https://github.com/acme/app/pull/1759) on hold · stale 30 h",
     ].join("\n"));
     assert.match(await command(host, { command: "board", since: Date.now() - 30 * HOUR }), /\n- PR \[app#270\]\(https:\/\/github\.com\/acme\/app\/pull\/270\) /, "an older since brings back older merges");
     assert.equal(await command(host, { command: "digest" }), [
@@ -287,6 +287,154 @@ test("the board and the digest read closed tasks and PRs merged since the owner 
     ].join("\n"));
     tasks.move("T1", "thr_cap", { to: "done" }, Date.now() - 20 * HOUR);
     assert.equal(await command(host, { command: "digest", since: Date.now() - 10 * MIN }), "");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+/** A crew row the captain registered, and the thread state forget reads. */
+async function seedCrew(host: Host, id: string, output: string) {
+  const crews = ((await host.bb.storage.kv.get("crews")) as unknown[] | undefined) ?? [];
+  await host.bb.storage.kv.set("crews", [...crews, { id, task: id, projectId: "proj_1", threadId: `thr_${id}`, parentThreadId: "thr_cap", providerId: null, model: null, reasoningLevel: null, worktree: true, shape: "scout", posture: "direct-PR", createdAt: "2026-10-07T20:00:00.000Z" }]);
+  host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, projectId: "proj_1", status: "idle", environmentId: null }));
+  host.harness.sdk.stub("threads.output", async () => ({ output }));
+  host.harness.sdk.stub("threads.stop", async () => ({}));
+  host.harness.sdk.stub("threads.updatePluginMetadata", async () => ({}));
+}
+
+const forget = async (host: Host, crewId: string) => {
+  const result = await host.harness.behavior.runCli(["forget", crewId], { threadId: "thr_cap" });
+  assert.equal(result.exitCode, 0, result.stderr);
+};
+
+test("Oct 8 repro: a crew that reports done closes its task, and one retired without a report asks for a check", async () => {
+  const host = await captainHost();
+  try {
+    const tasks = createOwnerTasks(host.bb.storage.database());
+    tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Partner onboarding guide (PDF)", sourceRefs: ["tg:200:2192"], crewId: "partner-guide", at: Date.now() - 4 * HOUR });
+    tasks.open({ captain: "thr_cap", project: "Areliaa", title: "Deploy + verify the offers live", sourceRefs: ["tg:200:2204"], crewId: "offers-verify", at: Date.now() - 2 * HOUR });
+    await seedCrew(host, "partner-guide", "DONE: sent cyndra-partner-onboarding-guide.pdf to the owner");
+    await forget(host, "partner-guide");
+    host.harness.sdk.stub("threads.output", async () => ({ output: "Still reading the deploy logs" }));
+    await seedCrew(host, "offers-verify", "Still reading the deploy logs");
+    await forget(host, "offers-verify");
+    assert.equal(await board(host), [
+      "📌 Needs you (1)",
+      "1. T2 Areliaa · Deploy + verify the offers live · finished, check · 2 h",
+      "",
+      "✅ Done since you last looked (1)",
+      "- T1 Cyndra · Partner onboarding guide (PDF) · done",
+      "",
+      "🔧 In progress: nothing open.",
+    ].join("\n"));
+    assert.equal(tasks.get("T1")!.outcome, "DONE: sent cyndra-partner-onboarding-guide.pdf to the owner");
+    assert.equal(tasks.get("T2")!.outcome, "Crew retired without reporting done");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("Oct 8 repro: a follow-up dispatch with taskRef continues T8, clears its needs-you, and opens no new task", async () => {
+  const host = await captainHost();
+  try {
+    const tasks = createOwnerTasks(host.bb.storage.database());
+    tasks.open({ captain: "thr_cap", project: "Cyndra", title: "QA fixes: about 12 small polish items", sourceRefs: ["tg:200:1838"], at: Date.now() - 15 * HOUR });
+    tasks.move("T1", "thr_cap", { to: "needs_you", reason: "Asked for the polish list" }, Date.now() - 3 * HOUR);
+    await ownerSays(host, "2221", "Find the polish items yourself and fix them");
+    const missing = await dispatch(host, { task: "Find and fix the QA polish items", taskId: "t8-polish-qa", taskRef: "T9" });
+    assert.equal(text(missing), "No owner task T9 for this captain. Check firstmate_task list.");
+    const joined = await dispatch(host, { task: "Find and fix the QA polish items", taskId: "t8-polish-qa", title: "Cyndra T8: find + fix QA polish items", taskRef: "T1" });
+    assert.equal(text(joined), "Reserved crew t8-polish-qa. Spawn continues in the background. Owner task T1 (working) tracks it; no new task was opened.");
+    assert.deepEqual(tasks.list("thr_cap", { includeClosed: true }).map((task) => [task.id, task.state, task.crewIds, task.sourceRefs]), [["T1", "working", ["t8-polish-qa"], ["tg:200:1838", "tg:200:2221"]]]);
+    const store = createDeliveries(host.bb.storage.database());
+    const pr = store.register({ url: "https://github.com/cyndra-ai/cyndra-saas/pull/2159", taskId: "t8-polish-qa", projectId: "proj_1", owner: "thr_cap", home: "", worker: "thr_new" });
+    store.save({ ...pr, status: "complete", forgeState: "merged", mergeCommitSha: "m1" });
+    assert.equal(await board(host), [
+      "📌 Needs you: nothing right now.",
+      "",
+      "✅ Done since you last looked (1)",
+      "- T1 Cyndra · QA fixes: about 12 small polish items · merged",
+      "",
+      "🔧 In progress: nothing open.",
+    ].join("\n"));
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("Oct 8 repro: a deploy dispatch for a PR another task holds joins that task instead of opening a second one", async () => {
+  const host = await captainHost();
+  try {
+    const tasks = createOwnerTasks(host.bb.storage.database());
+    const store = createDeliveries(host.bb.storage.database());
+    tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Perf 4: billing contention", sourceRefs: ["tg:200:2235"], crewId: "perf-4-billing", prs: ["cyndra-ai/cyndra-saas#2162"], at: Date.now() - HOUR });
+    const pr = store.register({ url: "https://github.com/cyndra-ai/cyndra-saas/pull/2162", taskId: "perf-4-billing", projectId: "proj_1", owner: "thr_cap", home: "", worker: "thr_p4" });
+    store.save({ ...pr, status: "waiting-native-gates" });
+    await ownerSays(host, "2243", "Approved, deploy it");
+    const deploy = await dispatch(host, {
+      task: "Deploy https://github.com/Cyndra-AI/cyndra-saas/pull/2162 to production, then merge it", taskId: "deploy-2162-billing",
+      title: "Deploy + merge #2162 billing (owner approved)", sourceRefs: ["tg:200:2243"],
+    });
+    assert.equal(text(deploy), "Reserved crew deploy-2162-billing. Spawn continues in the background. Owner task T1 (working) tracks it; no new task was opened.");
+    assert.deepEqual(tasks.list("thr_cap").map((task) => [task.id, task.crewIds]), [["T1", ["perf-4-billing", "deploy-2162-billing"]]]);
+    assert.equal(await board(host), [
+      "📌 Needs you: nothing right now.",
+      "",
+      "✅ Done since you last looked: nothing new.",
+      "",
+      "🔧 In progress (1)",
+      "- T1 Cyndra · Perf 4: billing contention · 1 h · [cyndra-saas#2162](https://github.com/cyndra-ai/cyndra-saas/pull/2162) ready to merge",
+    ].join("\n"));
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("Oct 8 repro: one project name per project, and a title does not repeat it", async () => {
+  const host = await captainHost();
+  try {
+    host.harness.sdk.stub("projects.get", async () => ({ id: "proj_1", name: "Cyndra SaaS", kind: "repo" }));
+    const tasks = createOwnerTasks(host.bb.storage.database());
+    tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Audit the brands", sourceRefs: ["tg:200:1592"], at: Date.now() - HOUR });
+    tasks.open({ captain: "thr_cap", project: "Safi", title: "Safi: legend dashes to the right", sourceRefs: ["tg:200:2249"], at: Date.now() - HOUR });
+    tasks.open({ captain: "thr_cap", project: "Areliaa", title: "Areliaa fixes: order numbers, refund amount", sourceRefs: ["tg:200:1602"], at: Date.now() - HOUR });
+    await ownerSays(host, "2192", "Write the partner onboarding guide as a PDF");
+    await dispatch(host, { task: "Write the partner onboarding guide", taskId: "partner-guide", title: "Cyndra: partner onboarding guide (PDF)", sourceRefs: ["tg:200:2192"] });
+    assert.equal(await board(host), [
+      "📌 Needs you: nothing right now.",
+      "",
+      "✅ Done since you last looked: nothing new.",
+      "",
+      "🔧 In progress (4)",
+      "- T1 Cyndra · Audit the brands · 1 h",
+      "- T2 Safi · Legend dashes to the right · 1 h",
+      "- T3 Areliaa · Fixes: order numbers, refund amount · 1 h",
+      "- T4 Cyndra · Partner onboarding guide (PDF) · 0 min",
+    ].join("\n"));
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("Oct 8 repro: a research crew that ends its turn with DONE closes its task before anyone retires it", async () => {
+  const host = await captainHost();
+  try {
+    const tasks = createOwnerTasks(host.bb.storage.database());
+    tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Performance research (Astra)", sourceRefs: ["tg:200:2232"], crewId: "perf-research", at: Date.now() - HOUR });
+    await seedCrew(host, "perf-research", "DONE: plan with 7 fixes sent to the captain");
+    const emitted = await host.harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: "thr_perf-research", status: "idle", projectId: "proj_1" }),
+      lastAssistantText: "DONE: plan with 7 fixes sent to the captain",
+    });
+    assert.deepEqual(emitted.errors, []);
+    assert.equal(await board(host), [
+      "📌 Needs you: nothing right now.",
+      "",
+      "✅ Done since you last looked (1)",
+      "- T1 Cyndra · Performance research (Astra) · done",
+      "",
+      "🔧 In progress: nothing open.",
+    ].join("\n"));
   } finally {
     await host.harness.lifecycle.dispose();
   }
