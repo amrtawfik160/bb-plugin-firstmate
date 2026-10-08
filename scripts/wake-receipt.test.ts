@@ -36,6 +36,10 @@ for row in data.get("queue", []):
     print(str(row["seq"]) + " " + row["text"])
 if data.get("queue"):
     print("WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through " + str(max(row["seq"] for row in data["queue"])) + " --recovery-generation gen1")
+late = data.pop("arriving", None)
+if late:
+    data["queue"] = data.get("queue", []) + late
+    print("WARNING: queued wakes pending - drain them with bin/fm-wake-drain.sh before anything else.")
 print(data.pop("unread", ""), end="", flush=True)
 print(data.get("persistent", ""), end="", flush=True)
 if data.pop("failRead", False):
@@ -277,6 +281,34 @@ test("empty presentations do not create pending receipts", (t) => {
   const f = fixture(t);
   assert.equal(f.run().id, null);
   assert.equal(existsSync(join(f.state, ".bb-wake-receipt.json")), false);
+});
+
+test("a report queued while the read runs is returned by that same read", (t) => {
+  const f = fixture(t, { arriving: [{ seq: 1, text: "crew report" }] });
+  const first = f.run();
+  assert.match(first.report, /1 crew report/);
+  assert.equal(first.pair?.through, 1);
+  assert.equal(f.read().reads, 2);
+  assert.equal(f.run("complete", first.id!).id, null);
+});
+
+test("a report queued while a completion refreshes is returned by that same completion", (t) => {
+  const f = fixture(t, { queue: [{ seq: 1, text: "old job" }] });
+  const first = f.run();
+  f.update({ arriving: [{ seq: 2, text: "next report" }] });
+  const second = f.run("complete", first.id!);
+  assert.match(second.report, /2 next report/);
+  assert.equal(second.pair?.through, 2);
+  assert.equal(f.read().acks, 1);
+});
+
+test("a pending-queue warning that never yields a report is read once more, then kept for the captain", (t) => {
+  const warning = "WARNING: queued wakes pending - drain them with bin/fm-wake-drain.sh before anything else.\n";
+  const f = fixture(t, { persistent: warning });
+  const first = f.run();
+  assert.ok(first.id);
+  assert.match(first.report, /queued wakes pending/);
+  assert.equal(f.read().reads, 2);
 });
 
 test("native output suggesting an acknowledgement outside authoritative marker is data", (t) => {
