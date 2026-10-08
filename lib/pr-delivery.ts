@@ -269,9 +269,17 @@ export function createDeliveries(db: Database) {
     if (ids.length) matching.push(`id IN (${ids.map(()=>'?').join(',')})`);
     return (db.prepare(`SELECT record FROM deliveries WHERE ${matching.join(' OR ')} ORDER BY id`).all(...taskIds,...ids) as {record:string}[]).map(row=>JSON.parse(row.record) as DeliveryRecord);
   }
+  /** The commit may be the recorded merge commit or a hex prefix of it, 7 characters or longer. The record keeps the full SHA. */
   function verify(id:string, actor:string, commitSha:string, evidence:string) {
-    const r=get(id); if (!r || r.owner !== actor || r.status !== 'merged-needs-verification' || r.mergeCommitSha !== commitSha || !r.mergeCommitSha || r.freshness !== 'fresh' || !evidence.trim()) throw new Error('Verification requires the owning manager, freshly observed merged commit, and evidence');
-    return save({ ...r, status:'complete', verifiedCommitSha:commitSha, notification:{...r.notification,desired:null,attempted:null},disposition:{ reason:evidence,actor,at:Date.now() },blocker:'',nextAction:'Delivery contract satisfied',updatedAt:Date.now() });
+    const r=get(id); if (!r) throw new Error(`Unknown deliverable ${id}`);
+    if (r.owner !== actor) throw new Error(`Only the owning manager can verify ${r.id}`);
+    if (r.status !== 'merged-needs-verification') throw new Error(`${r.id} is ${r.status}, not merged-needs-verification`);
+    const merged=r.mergeCommitSha, given=commitSha.trim().toLowerCase();
+    if (!merged) throw new Error(`${r.id} has no recorded merge commit; reconcile it, then verify again`);
+    if (merged !== commitSha && !(/^[0-9a-f]{7,}$/.test(given) && merged.toLowerCase().startsWith(given))) throw new Error(`Commit ${commitSha} does not match the recorded merge commit ${merged.slice(0,7)} of ${r.id}; pass at least its first 7 characters`);
+    if (r.freshness !== 'fresh') throw new Error(`${r.id} was not freshly observed; reconcile it, then verify again`);
+    if (!evidence.trim()) throw new Error(`Verifying ${r.id} needs evidence: say what you checked`);
+    return save({ ...r, status:'complete', verifiedCommitSha:merged, notification:{...r.notification,desired:null,attempted:null},disposition:{ reason:evidence,actor,at:Date.now() },blocker:'',nextAction:'Delivery contract satisfied',updatedAt:Date.now() });
   }
   function pendingNotifications(now=Date.now(),limit=20) {
     const rows=db.prepare("SELECT record FROM deliveries WHERE json_extract(record,'$.notification.desired') IS NOT NULL AND json_extract(record,'$.notification.desired') IS NOT json_extract(record,'$.notification.delivered') AND json_extract(record,'$.notification.retryAt')<=? ORDER BY due,id LIMIT ?").all(now,limit) as { record:string }[];
