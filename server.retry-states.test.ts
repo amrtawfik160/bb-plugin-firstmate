@@ -234,14 +234,14 @@ test("a refused landed-crew cleanup reports the refusal without advisory banners
 
 // B3: the keeper script, run for real against a temporary home.
 
-function keeperHome(armBody: string) {
+function keeperHome(armBody: string, interval = 0.1) {
   const home = mkdtempSync(join(tmpdir(), "fm-keeper-"));
   mkdirSync(join(home, "bin"));
   mkdirSync(join(home, "state"));
   writeFileSync(join(home, "bin", "fm-watch-arm.sh"), `#!/bin/bash\n${armBody}\n`);
   chmodSync(join(home, "bin", "fm-watch-arm.sh"), 0o755);
   writeFileSync(join(home, "state", ".bb-watch-owner.beat"), `${Math.floor(Date.now() / 1000)}\n`);
-  writeFileSync(join(home, "state", ".bb-watch-keeper.sh"), fmWatchKeeperScript("host_1", home, 0.1));
+  writeFileSync(join(home, "state", ".bb-watch-keeper.sh"), fmWatchKeeperScript("host_1", home, interval));
   return home;
 }
 
@@ -328,6 +328,40 @@ test("a terminated keeper also stops its blocked re-arm", async () => {
     assert.notEqual(await withTimeout(exited(keeper), 5000), "timeout");
     await until(() => !alive(arm), 3000);
     assert.equal(existsSync(join(home, "state", ".bb-watch-keeper.pid")), false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// Each arm records when it started and ended, so a test can measure the gap between watchers.
+const TIMED_ARM = 'date +%s.%N >> "$FM_HOME/state/starts"; sleep "$(cat "$FM_HOME/state/arm-secs")"; date +%s.%N >> "$FM_HOME/state/ends"';
+const times = (home: string, name: string) => existsSync(join(home, "state", name))
+  ? readFileSync(join(home, "state", name), "utf8").trim().split("\n").map(Number)
+  : [];
+
+test("after a watcher exits normally the keeper re-arms within seconds, not a full interval", { timeout: 30_000 }, async () => {
+  const home = keeperHome(TIMED_ARM, fmWatchKeeperInterval(60));
+  writeFileSync(join(home, "state", "arm-secs"), "6\n");
+  try {
+    startKeeper(home);
+    await until(() => times(home, "starts").length >= 2, 20_000);
+    const gap = times(home, "starts")[1] - times(home, "ends")[0];
+    assert.ok(gap < 3, `re-arm gap was ${gap.toFixed(1)}s`);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("an arm that exits at once still backs off for the keeper interval", { timeout: 30_000 }, async () => {
+  const home = keeperHome(TIMED_ARM, 4);
+  writeFileSync(join(home, "state", "arm-secs"), "0\n");
+  try {
+    startKeeper(home);
+    await until(() => times(home, "starts").length >= 1, 5000);
+    await new Promise((r) => setTimeout(r, 9000));
+    const starts = times(home, "starts");
+    assert.ok(starts.length >= 2 && starts.length <= 3, `arm started ${starts.length} times in 9s`);
+    for (let i = 1; i < starts.length; i++) assert.ok(starts[i] - starts[i - 1] >= 3.5, `back-off was ${(starts[i] - starts[i - 1]).toFixed(1)}s`);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
