@@ -1,4 +1,4 @@
-import { crewSkillBlock } from "./crew-contract.ts";
+import { crewSkillBlock, type PlaybookChoice } from "./crew-contract.ts";
 export type Shape = "ship" | "scout";
 export type DeliveryMode = "direct-PR" | "no-mistakes" | "local-only";
 export type PermissionMode = "accept-edits" | "auto" | "full";
@@ -575,6 +575,9 @@ export function crewPrompt(input: {
   shape: Shape;
   mode: DeliveryMode;
   isolated: boolean;
+  title?: string;
+  providerId?: string | null;
+  playbook?: PlaybookChoice;
 }): string {
   const { task, parentThreadId, shape, mode, isolated } = input;
   const head = [
@@ -633,7 +636,7 @@ export function crewPrompt(input: {
               "Then push + open a PR. Report DONE with the PR URL.",
               "After DONE: outcome, PR URL, changed files, validation run, blockers/next step.",
             ];
-  return [...head, ...tail, "", crewSkillBlock(shape, task)].join("\n");
+  return [...head, ...tail, "", crewSkillBlock(input)].join("\n");
 }
 
 export interface BearingsRow {

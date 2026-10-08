@@ -1,23 +1,81 @@
+import { homedir } from "node:os";
 import type { Shape } from "./policy.ts";
 
-// First matching row wins. A scout always investigates; ship work that names a
-// defect is a bug fix, and every other ship task is a feature.
-const PLAYBOOKS: ReadonlyArray<{ playbook: string; matches: (shape: Shape, task: string) => boolean }> = [
-  { playbook: "investigation.md", matches: (shape) => shape === "scout" },
-  { playbook: "bug-fix.md", matches: (_shape, task) => /\b(?:bugs?|fix(?:es|ed|ing)?|broken|breaks?|crash(?:es|ed)?|fail(?:s|ed|ing|ure)?|errors?|regression|flaky|wrong|incorrect|not working|doesn'?t work|stuck|hangs?|leaks?)\b/i.test(task) },
-  { playbook: "feature.md", matches: () => true },
+export const PLAYBOOK_CHOICES = ["feature", "bug-fix", "perf-issue", "refactoring", "prototype", "investigation", "visual-parity", "babysit", "none"] as const;
+export type PlaybookChoice = (typeof PLAYBOOK_CHOICES)[number];
+
+// Matched against the dispatch title only; the task body names too many words.
+// First matching row wins. `none` is a deploy or operator task: it follows the
+// delivery contract, not a playbook.
+const TITLE_ROWS: ReadonlyArray<{ playbook: PlaybookChoice; pattern: RegExp }> = [
+  { playbook: "none", pattern: /^(?:[\w .-]+:\s*)?(?:deploy|redeploy|merge|release|publish|land|roll ?out|roll ?back|rollback|restart)\b/i },
+  { playbook: "babysit", pattern: /\b(?:babysit|get (?:it |the pr |ci )?green|review comments|bugbot|ci (?:red|failures?))\b/i },
+  { playbook: "perf-issue", pattern: /\b(?:perf|performance|slow(?:ness|er|down)?|latency|speed ?up|contention|throughput|memory usage|cpu)\b/i },
+  { playbook: "prototype", pattern: /\b(?:prototype|sketch|mock ?up|spike|poc|proof of concept)\b/i },
+  { playbook: "visual-parity", pattern: /\b(?:visual parity|pixel|parity|match(?:es)? (?:the )?(?:figma|design|mock|screenshot)s?)\b/i },
+  { playbook: "refactoring", pattern: /\b(?:refactor\w*|rename|extract|dedupe|de-?duplicate|restructure|reorgani[sz]e|clean ?up)\b/i },
+  { playbook: "bug-fix", pattern: /\b(?:bugs?|fix(?:es|ed|ing)?|broken|breaks?|crash(?:es|ed)?|fail(?:s|ed|ing|ure)?|errors?|regression|flaky|wrong|incorrect|not working|doesn'?t work|stuck|hangs?|leaks?)\b/i },
+  { playbook: "investigation", pattern: /\b(?:spec|specs|investigat\w*|audit|research|explore|why|how does|rfc|design doc|proposal)\b/i },
 ];
 
-export function crewPlaybook(shape: Shape, task: string): string {
-  return PLAYBOOKS.find((row) => row.matches(shape, task))!.playbook;
+// A heading line ("## Captain's intent") is structure, not a title.
+function titleOf(title: string | undefined, task: string): string {
+  if (title !== undefined && title.trim() !== "") return title;
+  return task.split("\n").find((line) => line.trim() !== "" && !/^\s*#/.test(line)) ?? "";
 }
 
-export function crewSkillBlock(shape: Shape, task: string): string {
-  return [
+export function crewPlaybook(input: { shape: Shape; title?: string; task: string; playbook?: PlaybookChoice }): PlaybookChoice {
+  if (input.playbook !== undefined) return input.playbook;
+  if (input.shape === "scout") return "investigation";
+  const title = titleOf(input.title, input.task);
+  return TITLE_ROWS.find((row) => row.pattern.test(title))?.playbook ?? "feature";
+}
+
+// Where each BB provider reads skills on this host. Every listed folder holds
+// the same pstack install; an unknown provider gets the shared agents folder.
+const SKILL_ROOTS: Readonly<Record<string, string>> = {
+  "claude-code": ".claude/skills",
+  codex: ".codex/skills",
+  "acp-cursor": ".cursor/skills",
+  "acp-grok": ".grok/skills",
+  "acp-antigravity": ".gemini/skills",
+  pi: ".pi/agent/skills",
+};
+
+export function crewSkillRoot(providerId: string | null | undefined): string {
+  return `${homedir()}/${SKILL_ROOTS[providerId ?? ""] ?? ".agents/skills"}`;
+}
+
+export function crewSkillBlock(input: { shape: Shape; title?: string; task: string; providerId?: string | null; playbook?: PlaybookChoice }): string {
+  const playbook = crewPlaybook(input);
+  const root = crewSkillRoot(input.providerId);
+  const lines = [
     "### Skills (Firstmate adds this to every brief)",
-    "Before any other step, read the skill-routing skill and follow the rows that match this task, under its Firstmate rules.",
-    `Then read \`poteto-mode/SKILL.md\` in full and follow \`poteto-mode/playbooks/${crewPlaybook(shape, task)}\`.`,
-  ].join("\n");
+    "pstack always has priority. If a skill or rule conflicts with it, pstack wins.",
+    "Until the owner confirms otherwise: spawn no sub-agents (no Task, poteto-agent or parallel workers). Do that work yourself, in this session.",
+    "Until the owner confirms otherwise: Firstmate decides who merges and deploys. Follow the brief's delivery contract for merge and deploy.",
+    `Skills on this host are in \`${root}/<name>/SKILL.md\`. If one is not installed, continue without it and say so in your report.`,
+    "1. Read the skill-routing skill. Load the skills its matched rows name, plus poteto-mode, plus every skill the chosen playbook names.",
+    `2. Read \`${root}/poteto-mode/SKILL.md\` in full.`,
+  ];
+  if (playbook === "none") {
+    lines.push("3. No playbook: this is a deploy or operator task. Follow the brief's delivery contract.");
+  } else {
+    lines.push(
+      `3. Follow \`${root}/poteto-mode/playbooks/${playbook}.md\`.`,
+      "4. Copy every step of that playbook into your to-do list, before any other to-do.",
+      "5. Your final report lists each playbook step as \"✓ <step>\" or \"skip: <step>: <reason>\".",
+    );
+  }
+  lines.push("Save each screenshot as its own full-size PNG file. Never combine, stitch or downscale screenshots; link each file separately.");
+  if (input.shape !== "scout") lines.push(`Before you open a PR, run /no-comments (\`${root}/no-comments/SKILL.md\`) over your diff.`);
+  if (playbook === "bug-fix") {
+    lines.push(
+      "Bug-fix proof: your final report gives the commit id of the failing test, committed before the fix.",
+      "It also gives proof that the fix works on the real product, or \"not possible: <reason>\".",
+    );
+  }
+  return lines.join("\n");
 }
 
 // Mirrored in overlay/bin/fm-worker-checkpoint.py. A KEY name needs a prefix so

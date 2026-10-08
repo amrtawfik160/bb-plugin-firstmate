@@ -1,6 +1,7 @@
 import type { BbPluginApi } from '@get-bb/plugin-sdk';
 import { z } from 'zod';
 import { createHash } from 'node:crypto';
+import { PLAYBOOK_CHOICES } from './crew-contract.ts';
 
 export const queueItemSchema = z.object({
   nativeHome:z.string().optional(), id:z.string().min(1), title:z.string(), detail:z.string().default(''),
@@ -10,6 +11,7 @@ export const queueItemSchema = z.object({
   waitUntil:z.string().nullable().default(null), status:z.enum(['queued','dispatched','done','dropped']).default('queued'),
   crewId:z.string().nullable().default(null), parentThreadId:z.string().nullish(), backlogId:z.string().optional(),
   sourceRefs:z.array(z.string()).optional(), overCap:z.boolean().optional(),
+  playbook:z.enum(PLAYBOOK_CHOICES).optional(),
   backlogUnparsed:z.boolean().optional(), createdAt:z.string(), nativePending:z.boolean().optional(),
 }).strict();
 export type QueueItem = z.infer<typeof queueItemSchema>;
