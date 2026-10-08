@@ -9780,6 +9780,47 @@ test("every real brief names skill-routing, poteto mode and the playbook that ma
   }
 });
 
+test("a real brief picks the playbook from the dispatch title, and --playbook overrides it", async () => {
+  for (const [args, expected] of [
+    [["--title", "Deploy + merge #2155", "--", "Fix the failing check, then deploy"], "3. No playbook: this is a deploy or operator task."],
+    [["--title", "Perf 1: workflow admission contention", "--", "Fix the slow admission error"], "poteto-mode/playbooks/perf-issue.md"],
+    [["--title", "Cyndra: spec for Slack connect", "--", "fix nothing; write the spec"], "poteto-mode/playbooks/investigation.md"],
+    [["--title", "Redesign Import from screenshots", "--", "the import is broken; redesign it"], "poteto-mode/playbooks/feature.md"],
+    [["--title", "Fix agent computer feature", "--", "Add the missing feature"], "poteto-mode/playbooks/bug-fix.md"],
+    [["--title", "Fix agent computer feature", "--playbook", "refactoring", "--", "Add the missing feature"], "poteto-mode/playbooks/refactoring.md"],
+  ] as const) {
+    const host = realHost();
+    await plugin(host.bb);
+    try {
+      const { seen } = stubRealTransportBacklog(host, { threadIdAfterSpawn: "thr_real" });
+      const result = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", ...args], { projectId: "proj_1" });
+      assert.equal(result.exitCode, 0, result.stderr);
+      const fill = seen.find((c) => c.includes("FM_INTENT="))!;
+      const spec = Buffer.from(/FM_TASK_OWN_SPEC=([A-Za-z0-9+/=]+)/.exec(fill)![1]!, "base64").toString("utf8");
+      assert.ok(spec.includes(expected), `${args.join(" ")}\n${spec}`);
+      assert.ok(spec.includes("pstack always has priority. If a skill or rule conflicts with it, pstack wins."), spec);
+    } finally {
+      await host.harness.lifecycle.dispose();
+    }
+  }
+});
+
+test("firstmate_dispatch takes an explicit playbook that overrides the title", async () => {
+  const host = await load();
+  try {
+    host.harness.sdk.stub("environments.list", async () => [{ hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" }]);
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew" }));
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "starting" }));
+    await agentTool(host, "firstmate_dispatch").execute({ task: "Add the export", title: "Add CSV export", projectId: "proj_1", playbook: "prototype" }, { projectId: "proj_1" } as never);
+    const spawn = host.harness.sdk.callsTo("threads.spawn")[0]![0] as { prompt: string };
+    assert.match(spawn.prompt, /poteto-mode\/playbooks\/prototype\.md/);
+    assert.match(spawn.prompt, /4\. Copy every step of that playbook into your to-do list, before any other to-do\./);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("a BB-transport crew prompt also names skill-routing, poteto mode and the matched playbook", async () => {
   const host = await load();
   try {

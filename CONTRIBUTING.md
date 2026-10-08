@@ -168,9 +168,10 @@ user-only opt-in boundary. Native section 9 owns default reporting.
 
 `entry-skills/skill-routing/` is the one registered BB-authored exception. It is
 selected for bound captains and crews. It maps a task to the poteto pstack and
-Matt Pocock skills installed on the host. Its "Firstmate rules win" block bounds
-them: no subagents, one model, and Firstmate keeps merge, delivery, and
-concurrency. Edit the table there, not in the methods skills. It is outside the
+Matt Pocock skills installed on the host. pstack has priority over its other
+rules, except two lines marked "Until the owner confirms otherwise": crews
+spawn no sub-agents, and Firstmate decides who merges and deploys. Edit the
+table there, not in the methods skills. It is outside the
 native fidelity inventory, and the transport allowlist pins its bytes.
 
 Only the `/captain` and `/firstmate` transport entries and `skill-routing` are

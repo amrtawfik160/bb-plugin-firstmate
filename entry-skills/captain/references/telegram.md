@@ -17,6 +17,9 @@ standalone file with `lavish-axi export <file> --out /tmp/<short-name>.html`, th
 link that `/tmp` file in the short message so the connector sends it as a document.
 Do not use `lavish-axi share`; it publishes to a third-party site.
 
+Save each screenshot as its own full-size PNG file. Never combine, stitch or downscale
+screenshots; link each file separately.
+
 A turn that only handled crew wakes, with nothing for the owner, ends with no text.
 
 ## Track every owner message

@@ -85,7 +85,7 @@ import { AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython } from 
 import { createDeliveries, LOST_OWNER_RECHECK_MS, canonicalPr, deliveryLine, parseForge, type DeliveryRecord } from "./lib/pr-delivery.ts";
 import { captureHostCommand, decodeHostCapture } from "./lib/host-capture.ts";
 import { selectExecution, validateLaunchCapabilities } from "./lib/execution-selection.ts";
-import { crewSkillBlock, redactSecrets } from "./lib/crew-contract.ts";
+import { crewSkillBlock, PLAYBOOK_CHOICES, redactSecrets } from "./lib/crew-contract.ts";
 import { rpcContract } from "./rpc.ts";
 import {
   UPSTREAM_FIRSTMATE_SHA,
@@ -134,6 +134,8 @@ const crewSchema = z.object({
   // The dispatch title the captain asked for. Relaunch reuses it and captain-facing
   // labels prefer it over the raw task quote.
   title: z.string().optional(),
+  // The captain's explicit pstack playbook; it overrides the title match.
+  playbook: z.enum(PLAYBOOK_CHOICES).optional(),
   // Last PR url seen for this crew (BB environment PR, gh by branch, or the crew's own
   // report). Lets merge/forget/ownership checks resolve a PR the environment cache misses.
   prUrl: z.string().optional(),
@@ -3454,7 +3456,7 @@ export default async function plugin(bb: BbPluginApi) {
       : "Implement the captain's intent above exactly; do not widen scope. Small diff, own branch, deliver per the mode contract, then report DONE/BLOCKED/FAILED.";
     // Captain-authored specifications retain precedence over the role default.
     // The skills block follows the cap so a long specification never cuts it off.
-    const spec = `${(sections.spec ?? defaultSpec).slice(0, 3000)}\n\n${crewSkillBlock(crew.shape, task)}`;
+    const spec = `${(sections.spec ?? defaultSpec).slice(0, 3000)}\n\n${crewSkillBlock({ ...crew, task })}`;
     const specEnv = `FM_TASK_OWN_SPEC=${Buffer.from(spec, "utf8").toString("base64")} `;
     // fm-brief refuses --mode on scouts and requires it on ships; a ship's posture
     // is exactly the delivery mode the brief records.
@@ -4592,6 +4594,7 @@ export default async function plugin(bb: BbPluginApi) {
     providerId?: string;
     model?: string;
     reasoningLevel?: string;
+    playbook?: Crew["playbook"];
   }): Promise<string | null> {
     const flags = await reliabilityFlags();
     if (flags.asyncDispatch !== "on") return null;
@@ -4624,6 +4627,7 @@ export default async function plugin(bb: BbPluginApi) {
       ...(input.model ? { model: input.model } : {}),
       ...(input.reasoningLevel ? { reasoningLevel: input.reasoningLevel } : {}),
       ...(input.sourceRefs && input.sourceRefs.length > 0 ? { sourceRefs: input.sourceRefs } : {}),
+      ...(input.playbook !== undefined ? { playbook: input.playbook } : {}),
     };
     queueStore.add(queued);
     for (const key of input.sourceRefs ?? []) {
@@ -4912,6 +4916,7 @@ export default async function plugin(bb: BbPluginApi) {
     deliveryRequirement?: "pr" | "merged" | "merged-and-verified";
     sourceRefs?: string[];
     ownerRequestedProvider?: boolean;
+    playbook?: Crew["playbook"];
     signal?:AbortSignal;
   }): Promise<Crew> {
     const task = input.task.trim().slice(0, MAX_TASK);
@@ -4976,6 +4981,7 @@ export default async function plugin(bb: BbPluginApi) {
       shape: input.shape,
       posture: input.shape === "scout" ? "scout" : input.mode,
       ...(input.title !== undefined && input.title.trim() !== "" ? { title: input.title.trim().slice(0, 200) } : {}),
+      ...(input.playbook !== undefined ? { playbook: input.playbook } : {}),
       ...(input.sourceRefs && input.sourceRefs.length > 0 ? { sourceRefs: input.sourceRefs } : {}),
       createdAt: new Date().toISOString(),
     };
@@ -5050,6 +5056,9 @@ export default async function plugin(bb: BbPluginApi) {
         shape: input.shape,
         mode: input.mode,
         isolated: input.worktree,
+        title: crew.title,
+        providerId: crew.providerId,
+        playbook: crew.playbook,
       }),
       title: crewThreadTitle(task, input.shape, crew.id, input.title),
       parentThreadId: input.parentThreadId,
@@ -5207,7 +5216,8 @@ export default async function plugin(bb: BbPluginApi) {
       workerPrompt = result.output;
     } else {
       workerPrompt = crewPrompt({ task, parentThreadId: crew.parentThreadId ?? undefined,
-        shape: crew.shape, mode: toMode(crew.posture, "direct-PR"), isolated: crew.worktree });
+        shape: crew.shape, mode: toMode(crew.posture, "direct-PR"), isolated: crew.worktree,
+        title: crew.title, providerId, playbook: crew.playbook });
     }
     const prompt = [workerPrompt, "",
       `RELAUNCH: the prior thread was replaced. Continue the same task in this same worktree.${note !== "" ? ` Progress note: ${note}` : ""}`,
@@ -9004,7 +9014,7 @@ export default async function plugin(bb: BbPluginApi) {
       visible: true,
       shape: item.shape,
       mode: toMode(item.mode !== "" ? item.mode : undefined, registry.mode),yolo:registry.yolo,
-      sourceRefs: item.sourceRefs,
+      sourceRefs: item.sourceRefs, playbook: item.playbook,
     });
     item.status = "dispatched";
     item.crewId = crew.id;
@@ -9912,10 +9922,11 @@ export default async function plugin(bb: BbPluginApi) {
     ]).optional().describe("Where a job that is not the owner's came from; it opens no owner task"),
     ownerRequestedProvider: z.boolean().optional().describe("The owner named this provider in their own words; keeps acp-antigravity for ship work"),
     taskRef: z.string().regex(/^T\d+$/).optional().describe("Owner task this crew continues, e.g. T8: the crew joins it, no new task opens, and an open task goes back to working"),
+    playbook: z.enum(PLAYBOOK_CHOICES).optional().describe("pstack playbook for the crew; overrides the match on the title. none = deploy or operator task, which follows the delivery contract"),
   });
 
   const dispatchHelp='bb firstmate dispatch [options] -- "<task>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","sendAt","origin","taskRef"])+"\n  --task <text>  Repeat for bounded fan-out; --hidden hides the worker.\n  sendAt/--send-at is unsupported; native ship isolation is mandatory.";
-  const queueHelp='bb firstmate queue add [options] -- "<title>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider"},["task","taskId","overrideOwner","sendAt","title","permissionMode","sharedEnv","worktree","visible","ownerRequestedProvider","origin","taskRef"])+"\n  --detail <full-task>\n  --after <queue-id>  Repeat for dependencies, which remain dispatch gates.\n  --wait-until <ISO-time>  Eligibility only; explicit dispatch required.\n  dispatch preserves the queued shape, mode, contract, dependencies and identity; only provider/model/reasoning/permission/visibility/worktree options override at dispatch.\n  list | next | done <queue-id> | drop <queue-id> | prune | reconcile <exact-id> --project <id> [original options]"+"\nDispatch: bb firstmate queue dispatch <queue-id> [options]\n"+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","taskId","overrideOwner","sendAt","title","shape","mode","deliveryRequirement","ownerRequestedProvider","origin","taskRef"]);
+  const queueHelp='bb firstmate queue add [options] -- "<title>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider"},["task","taskId","overrideOwner","sendAt","title","permissionMode","sharedEnv","worktree","visible","ownerRequestedProvider","origin","taskRef","playbook"])+"\n  --detail <full-task>\n  --after <queue-id>  Repeat for dependencies, which remain dispatch gates.\n  --wait-until <ISO-time>  Eligibility only; explicit dispatch required.\n  dispatch preserves the queued shape, mode, contract, dependencies and identity; only provider/model/reasoning/permission/visibility/worktree options override at dispatch.\n  list | next | done <queue-id> | drop <queue-id> | prune | reconcile <exact-id> --project <id> [original options]"+"\nDispatch: bb firstmate queue dispatch <queue-id> [options]\n"+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","taskId","overrideOwner","sendAt","title","shape","mode","deliveryRequirement","ownerRequestedProvider","origin","taskRef","playbook"]);
   const usage = [
     "Usage:",
     "  bb firstmate guide [--json]",
@@ -10152,7 +10163,7 @@ export default async function plugin(bb: BbPluginApi) {
       "Dispatch a firstmate-style crewmate: spawns a child BB thread for one task (ship crews get an isolated worktree by default) and records it as a crew. Each owner job opens its own owner task: pass the owner's sourceRefs, or origin when the job came from another thread or the captain. A follow-up on an existing task (fix round, deploy, check) passes taskRef instead; a dispatch for a PR a task already holds joins that task.",
     presentation: { label: { pending: "Dispatching crewmate", completed: "Dispatched crewmate" } },
     parameters: dispatchParams,
-    async execute({ task, taskId, projectId, title, providerId, model, reasoningLevel, permissionMode, shape, mode, worktree, sharedEnv, visible, sendAt, deliveryRequirement, overrideOwner, sourceRefs, origin, ownerRequestedProvider, taskRef }, ctx) {
+    async execute({ task, taskId, projectId, title, providerId, model, reasoningLevel, permissionMode, shape, mode, worktree, sharedEnv, visible, sendAt, deliveryRequirement, overrideOwner, sourceRefs, origin, ownerRequestedProvider, taskRef, playbook }, ctx) {
       const ctxRecord = asRecord(ctx);
       const resolvedProject =
         projectId ?? (typeof ctxRecord["projectId"] === "string" ? ctxRecord["projectId"] : undefined);
@@ -10194,7 +10205,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (background) {
         const queued = await enqueueWhenOverCap({
           task, taskId: crewKey, title, projectId: resolvedProject, parentThreadId, shape, mode, deliveryRequirement, sourceRefs,
-          providerId, model, reasoningLevel,
+          providerId, model, reasoningLevel, playbook,
         });
         if (queued) return `${queued}${await trackTask(crewKey)}`;
       }
@@ -10221,7 +10232,7 @@ export default async function plugin(bb: BbPluginApi) {
         visible: visible !== false,
         shape: resolvedShape,
         mode: toMode(mode, posture.mode), yolo: posture.yolo,
-        sendAt, deliveryRequirement, ownerRequestedProvider,
+        sendAt, deliveryRequirement, ownerRequestedProvider, playbook,
       };
       if (background) {
         const reservedId = crewKey;
@@ -12413,6 +12424,7 @@ export default async function plugin(bb: BbPluginApi) {
             const registry = shape==="ship" ? await intakePosture(projectId,ctx,flagStr(flags,"mode") ? modeSchema.parse(flagStr(flags,"mode")) : undefined) : await postureOf(projectId);
             const mode = toMode(flagStr(flags, "mode"), registry.mode);
             const titleFlag = flagStr(flags, "title");
+            const playbook = flagStr(flags, "playbook") === undefined ? undefined : z.enum(PLAYBOOK_CHOICES).parse(flagStr(flags, "playbook"));
             const sendAtRaw = flagStr(flags, "send-at");
             const sendAt = sendAtRaw === undefined ? undefined : Number(sendAtRaw);
             if (sendAt !== undefined && !Number.isFinite(sendAt)) return fail("Bad --send-at (epoch ms).");
@@ -12440,6 +12452,7 @@ export default async function plugin(bb: BbPluginApi) {
                   providerId: flagStr(flags, "provider"),
                   model: flagStr(flags, "model"),
                   reasoningLevel: flagStr(flags, "reasoning-level"),
+                  playbook,
                 });
                 if (queued) {
                   queuedNotes.push(queued);
@@ -12461,6 +12474,7 @@ export default async function plugin(bb: BbPluginApi) {
                 shape,
                 mode,yolo:registry.yolo,
                 sendAt,signal,deliveryRequirement:flagStr(flags,"delivery-requirement") as "pr" | "merged" | "merged-and-verified" | undefined,
+                playbook,
               });
               dispatched.push({ ...crew, status: await crewStatus(crew) });
             }
@@ -12955,6 +12969,7 @@ export default async function plugin(bb: BbPluginApi) {
                 visible: !flags.has("hidden"),
                 shape: item.shape,
                 mode: toMode(item.mode !== "" ? item.mode : undefined, registry.mode),yolo:registry.yolo,
+                playbook: item.playbook,
               });
               item.status = "dispatched";
               item.crewId = crew.id;
