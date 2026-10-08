@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
-import plugin, { fmWatchKeeperScript } from "./server.ts";
+import plugin, { fmWatchKeeperInterval, fmWatchKeeperScript } from "./server.ts";
 import { createDispatchJobs } from "./lib/async-dispatch.ts";
 import { createLaunches } from "./lib/launch.ts";
 import { createInboundLedger } from "./lib/inbound-ledger.ts";
@@ -381,6 +382,160 @@ test("a deleted captain's home stops its keeper and is not re-logged after a rel
     assert.deepEqual(logs(host, "info", /thr_gone/), []);
   } finally {
     await host.harness.lifecycle.dispose();
+  }
+});
+
+// A keeper resolves its runtime bin dir once, so the supervisor replaces it when the
+// selected release or the keeper script changes. Host commands run in real bash.
+
+const RELEASE_A = "a".repeat(64);
+const RELEASE_B = "b".repeat(64);
+
+function releaseHome() {
+  const dir = mkdtempSync(join(tmpdir(), "fm-release-"));
+  const home = join(dir, "home");
+  const store = join(dir, "store");
+  mkdirSync(join(home, "state"), { recursive: true });
+  mkdirSync(join(home, "config"));
+  for (const release of [RELEASE_A, RELEASE_B]) {
+    const bin = join(store, "versions", release, "runtime", "bin");
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(join(store, "versions", release, "runtime-host.py"), `print(${JSON.stringify(join(store, "versions", release, "runtime"))})\n`);
+    writeFileSync(join(bin, "fm-watch-arm.sh"), [
+      "#!/bin/bash",
+      `echo "${release.slice(0, 1)} \${1:-arm} root=\${FM_ROOT_OVERRIDE:-}" >> "$FM_HOME/state/arms.log"`,
+      'if [ "${1:-}" = --stop ]; then kill "$(cat "$FM_HOME/state/.watch.lock/pid")"; echo "watcher: stopped"; exit 0; fi',
+      "exec sleep 60",
+    ].join("\n"));
+    chmodSync(join(bin, "fm-watch-arm.sh"), 0o755);
+  }
+  const select = (release: string) => {
+    const helper = join(store, "versions", release, "runtime-host.py");
+    writeFileSync(join(home, "config", "bb-runtime-selected.json"), JSON.stringify({
+      schema: 1, stateContract: "native-flat-v1", release, store, host: "host_1", captain: "thr_cap",
+      root: join(store, "versions", release, "runtime"),
+      helperSha256: createHash("sha256").update(readFileSync(helper)).digest("hex"),
+    }));
+  };
+  select(RELEASE_A);
+  writeFileSync(join(home, "state", ".bb-watch-owner.beat"), `${Math.floor(Date.now() / 1000)}\n`);
+  return { dir, home, store, select, bin: (release: string) => join(store, "versions", release, "runtime", "bin") };
+}
+
+function runHostForReal(host: Host, home: string) {
+  const outputs = new Map<string, string>();
+  let n = 0;
+  host.harness.sdk.stub("terminals.create", async (args: { start?: { command?: string } }) => {
+    const id = `t_${++n}`;
+    const wrapped = args.start?.command ?? "";
+    const inner = /^__fm_cmd='([\s\S]*?)'; set \+e; "/.exec(wrapped)?.[1].replace(/'\\''/g, "'") ?? wrapped;
+    const res = spawnSync("bash", ["-c", inner], { encoding: "utf8", cwd: "/tmp", timeout: 30_000, env: { ...process.env, HOME: home } });
+    outputs.set(id, `${res.stdout}${res.stderr}\n__FM_HOST_RC:${res.status ?? 1}\n`);
+    return { id };
+  });
+  host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+  host.harness.sdk.stub("terminals.close", async () => ({}));
+  host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) =>
+    ({ nextSeq: 1, chunks: [{ dataBase64: Buffer.from(outputs.get(args.terminalId) ?? "").toString("base64") }] }));
+}
+
+const keeperPid = (home: string) => {
+  try { return Number(readFileSync(join(home, "state", ".bb-watch-keeper.pid"), "utf8").trim() || 0); } catch { return 0; }
+};
+
+// The captain service supervises a captain's own home; the fm-watch service, the configured home.
+async function superviseOnce(f: ReturnType<typeof releaseHome>, service: "captain-home-watch" | "fm-watch-supervisor", check: () => boolean) {
+  const home = f.home;
+  const host = await load(service === "fm-watch-supervisor"
+    ? { fmHome: home, watchOwner: "fm-watch", fmHostId: "host_1", watchHeartbeatSec: 30 }
+    : { watchOwner: "fm-watch", watchHeartbeatSec: 30 });
+  try {
+    if (service === "captain-home-watch") {
+      await host.bb.storage.kv.set("native-home:thr_cap", home);
+      await host.bb.storage.kv.set("native-home-host:thr_cap", "host_1");
+    }
+    host.harness.sdk.stub("threads.send", async () => ({}));
+    host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: "active", environmentId: null }));
+    runHostForReal(host, f.dir);
+    const run = host.harness.behavior.runService(service);
+    const deadline = Date.now() + 15_000;
+    while (!check() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+    run.controller.abort();
+    await run.done;
+    assert.ok(check(), "supervisor did not reach the expected state");
+    return host;
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+}
+
+function stopKeeperTree(home: string, pids: number[]) {
+  for (const pid of [...pids, keeperPid(home)]) {
+    try { process.kill(-pid, "SIGKILL"); } catch { /* not a group leader */ }
+    try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+  }
+  spawnSync("pkill", ["-KILL", "-f", home]);
+}
+
+test("after the selection switches, the keeper, its watcher and the captain marker all move to the new release", { timeout: 40_000 }, async () => {
+  const f = releaseHome();
+  const script = join(f.home, "state", ".bb-watch-keeper.sh");
+  const arms = join(f.home, "state", "arms.log");
+  const watcher = spawn("sleep", ["60"], { stdio: "ignore", detached: true });
+  watcher.unref();
+  let oldKeeper = 0;
+  try {
+    writeFileSync(script, fmWatchKeeperScript("host_1", f.home, fmWatchKeeperInterval(30)));
+    const keeper = spawn("bash", [script], { stdio: "ignore", detached: true });
+    keeper.unref();
+    oldKeeper = keeper.pid!;
+    await until(() => existsSync(arms) && /^a arm/m.test(readFileSync(arms, "utf8")), 5000);
+    mkdirSync(join(f.home, "state", ".watch.lock"));
+    writeFileSync(join(f.home, "state", ".watch.lock", "pid"), `${watcher.pid}\n`);
+    writeFileSync(join(f.home, "state", ".watch.lock", "watcher-path"), `${f.bin(RELEASE_A)}/fm-watch.sh\n`);
+
+    const marker = join(f.dir, ".bb-firstmate", "captains", "thr_cap");
+    mkdirSync(join(f.dir, ".bb-firstmate", "captains"), { recursive: true });
+    writeFileSync(marker, `home=${f.home}\nstate=${f.home}/state\nown_home=1\nroot=${f.store}/versions/${RELEASE_A}/runtime\n`);
+
+    f.select(RELEASE_B);
+    await superviseOnce(f, "captain-home-watch", () => /^b arm/m.test(readFileSync(arms, "utf8")) && /\/b{64}\//.test(readFileSync(marker, "utf8")));
+
+    assert.notEqual(keeperPid(f.home), oldKeeper);
+    assert.equal(alive(keeperPid(f.home)), true);
+    assert.equal(readFileSync(join(f.home, "state", ".bb-watch-keeper.bindir"), "utf8"), `${f.bin(RELEASE_B)}\n`);
+    assert.match(readFileSync(arms, "utf8"), new RegExp(`^a --stop root=${f.store}/versions/${RELEASE_A}/runtime$`, "m"));
+    assert.notEqual(await withTimeout(exited(watcher), 5000), "timeout");
+    assert.equal(readFileSync(marker, "utf8"), `home=${f.home}\nstate=${f.home}/state\nown_home=1\nroot=${f.store}/versions/${RELEASE_B}/runtime\n`);
+    await until(() => !alive(oldKeeper), 15_000);
+  } finally {
+    stopKeeperTree(f.home, [oldKeeper, watcher.pid!]);
+    rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+test("a keeper running an outdated script is replaced with the current script", { timeout: 40_000 }, async () => {
+  const f = releaseHome();
+  const script = join(f.home, "state", ".bb-watch-keeper.sh");
+  const arms = join(f.home, "state", "arms.log");
+  const current = fmWatchKeeperScript("host_1", f.home, fmWatchKeeperInterval(30));
+  let oldKeeper = 0;
+  try {
+    writeFileSync(script, current.replace(/^printf '%s\\n' "\$FM_BINDIR".*\n/m, ""));
+    const keeper = spawn("bash", [script], { stdio: "ignore", detached: true });
+    keeper.unref();
+    oldKeeper = keeper.pid!;
+    await until(() => existsSync(arms) && /^a arm/m.test(readFileSync(arms, "utf8")), 5000);
+
+    await superviseOnce(f, "fm-watch-supervisor", () => keeperPid(f.home) !== oldKeeper && keeperPid(f.home) !== 0);
+
+    assert.equal(readFileSync(script, "utf8"), current);
+    assert.equal(alive(keeperPid(f.home)), true);
+    assert.doesNotMatch(readFileSync(arms, "utf8"), /--stop/);
+    await until(() => !alive(oldKeeper), 15_000);
+  } finally {
+    stopKeeperTree(f.home, [oldKeeper]);
+    rmSync(f.dir, { recursive: true, force: true });
   }
 });
 
