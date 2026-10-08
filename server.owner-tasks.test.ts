@@ -170,7 +170,7 @@ test("the task follows its crew's PR: ready to merge needs the owner, then merge
     store.save({ ...pr, status: "ready-to-merge" });
     assert.equal(await board(host), [
       "📌 Needs you (1)",
-      "1. T1 Areliaa · Memory screen · ready for you · 0 min · app#2091 ready to merge",
+      "1. T1 Areliaa · Memory screen · ready for you · 0 min · [app#2091](https://github.com/acme/app/pull/2091) ready to merge",
       "",
       "✅ Done since you last looked: nothing new.",
       "",
@@ -272,12 +272,12 @@ test("the board and the digest read closed tasks and PRs merged since the owner 
       "",
       "✅ Done since you last looked (2)",
       "- T2 Brands audit · dropped: Owner moved it to next week",
-      "- PR app#283 Bump the email template · merged",
+      "- PR [app#283](https://github.com/acme/app/pull/283) Bump the email template · merged",
       "",
       "🔧 In progress (1)",
-      "- T1 Areliaa · Metricool fix · 30 h · app#1759 on hold (do not merge) · stale 30 h",
+      "- T1 Areliaa · Metricool fix · 30 h · [app#1759](https://github.com/acme/app/pull/1759) on hold (do not merge) · stale 30 h",
     ].join("\n"));
-    assert.match(await command(host, { command: "board", since: Date.now() - 30 * HOUR }), /\n- PR app#270 /, "an older since brings back older merges");
+    assert.match(await command(host, { command: "board", since: Date.now() - 30 * HOUR }), /\n- PR \[app#270\]\(https:\/\/github\.com\/acme\/app\/pull\/270\) /, "an older since brings back older merges");
     assert.equal(await command(host, { command: "digest" }), [
       "Done (2)",
       "- T2 Brands audit · dropped: Owner moved it to next week",

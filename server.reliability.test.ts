@@ -767,7 +767,7 @@ test("telegramCommand board keeps decisions, drops launch bookkeeping, and lists
         "✅ Done since you last looked: nothing new.",
         "",
         "🔧 In progress: nothing open.",
-        "Other PRs: repo#7 checks running",
+        "Other PRs: [repo#7](https://github.com/acme/repo/pull/7) checks running",
       ].join("\n"),
     });
   } finally {

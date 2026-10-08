@@ -67,19 +67,19 @@ function liveLike(): BoardInput {
 test("the board shows what needs the owner, what finished since they last looked, and what is still running", () => {
   assert.equal(formatBoard(liveLike()), [
     "📌 Needs you (2)",
-    "1. T15 Cyndra · Memory screen · ready for you · 4 h · cyndra-saas#2115 ready to merge",
-    "2. PR runants#1770 Fix the checkout total rounding on the cart page… · ready to merge",
+    "1. T15 Cyndra · Memory screen · ready for you · 4 h · [cyndra-saas#2115](https://github.com/cyndra-ai/cyndra-saas/pull/2115) ready to merge",
+    "2. PR [runants#1770](https://github.com/hazw80801/runants/pull/1770) Fix the checkout total rounding on the cart page… · ready to merge",
     "",
     "✅ Done since you last looked (4)",
     "- T7 Areliaa · Agent group chats part 2 · merged",
     "- T14 Weekly email test to amr@cyndra.ai · done",
     "- T16 Brands audit · dropped: Owner moved the audit to next week",
-    "- PR areliaa#283 Bump the email template · merged",
+    "- PR [areliaa#283](https://github.com/amrtawfik160/areliaa/pull/283) Bump the email template · merged",
     "",
     "🔧 In progress (2)",
     "- T1 Areliaa · Fix the Metricool sync · 2 d · stale 2 d",
-    "- T13 RunAnts · Improve RunAnts UI to look like Shopify, with screenshots · 5 h · runants#1759 on hold (do not merge)",
-    "Other PRs: runants#1771 checks running",
+    "- T13 RunAnts · Improve RunAnts UI to look like Shopify, with screenshots · 5 h · [runants#1759](https://github.com/hazw80801/runants/pull/1759) on hold (do not merge)",
+    "Other PRs: [runants#1771](https://github.com/hazw80801/runants/pull/1771) checks running",
   ].join("\n"));
 });
 
@@ -100,7 +100,7 @@ test("with no task running, open pull requests still show under the empty In pro
     "✅ Done since you last looked: nothing new.",
     "",
     "🔧 In progress: nothing open.",
-    "Other PRs: repo#9 draft; web#7 checks failing",
+    "Other PRs: [repo#9](https://github.com/acme/repo/pull/9) draft; [web#7](https://github.com/acme/web/pull/7) checks failing",
   ].join("\n"));
 });
 
@@ -123,7 +123,7 @@ test("Needs you lists open asks oldest first, then crew items, then tasks and PR
     `3. ⛔ ${"q".repeat(139)}… (0 min, ask a000003)`,
     `4. ${"x".repeat(159)}…`,
     "5. T3 Pick the pricing page copy · needs you · 30 h · stale 25 h",
-    "6. PR repo#4 Lost manager · waiting on you",
+    "6. PR [repo#4](https://github.com/acme/repo/pull/4) Lost manager · waiting on you",
     "Tap a question's button or reply to it to answer.",
     "",
     "✅ Done since you last looked: nothing new.",
@@ -169,6 +169,45 @@ test("an overfull board drops In progress lines first and keeps every Needs you 
   assert.ok(kept > 0 && kept < 60);
   assert.equal(text, board(kept));
   assert.ok(text.length <= BOARD_MAX_CHARS, String(text.length));
+});
+
+test("every PR on the board links to its GitHub page under its short name", () => {
+  assert.equal(formatBoard(input({
+    tasks: [task("T2", { project: "Cyndra", title: "Memory screen", prs: ["cyndra-ai/cyndra-saas#2146"] })],
+    records: [
+      pr("cyndra-ai/cyndra-saas#2140", { status: "failing-checks", ownerNeeded: true, title: "Lost manager" }),
+      pr("cyndra-ai/cyndra-saas#2146", { status: "waiting-review" }),
+      merged("amrtawfik160/areliaa#283", { title: "Bump the email template" }),
+      pr("hazw80801/runants#1771", { status: "draft" }),
+    ],
+  })), [
+    "📌 Needs you (1)",
+    "1. PR [cyndra-saas#2140](https://github.com/cyndra-ai/cyndra-saas/pull/2140) Lost manager · waiting on you",
+    "",
+    "✅ Done since you last looked (1)",
+    "- PR [areliaa#283](https://github.com/amrtawfik160/areliaa/pull/283) Bump the email template · merged",
+    "",
+    "🔧 In progress (1)",
+    "- T2 Cyndra · Memory screen · 1 h · [cyndra-saas#2146](https://github.com/cyndra-ai/cyndra-saas/pull/2146) waiting for review",
+    "Other PRs: [runants#1771](https://github.com/hazw80801/runants/pull/1771) draft",
+  ].join("\n"));
+});
+
+test("the board limit counts what the owner sees, so long link addresses drop nothing", () => {
+  const records = Array.from({ length: 15 }, (_, i) => pr(`acme/repo#${i + 1}`, { ownerNeeded: true, url: `https://github.com/acme/repo/pull/${i + 1}?${"q".repeat(300)}`, openedAt: NOW - (15 - i) * MIN }));
+  const text = formatBoard(input({ records }));
+  assert.ok(text.length > BOARD_MAX_CHARS, String(text.length));
+  assert.equal(text, [
+    "📌 Needs you (15)",
+    ...records.map((r, i) => `${i + 1}. PR [repo#${i + 1}](${r.url}) · waiting on you`),
+    "",
+    "✅ Done since you last looked: nothing new.",
+    "",
+    "🔧 In progress: nothing open.",
+  ].join("\n"));
+  const digest = formatDigest(input({ records }));
+  assert.ok(!digest.includes("]("), digest);
+  assert.match(digest, /^1\. PR repo#1 · waiting on you$/m);
 });
 
 test("the digest lists what needs the owner, what finished, and which tasks went quiet", () => {

@@ -42,7 +42,7 @@ export function deliveryLine(r: DeliveryRecord) {
   return `${r.id} [${r.status}${r.freshness === 'stale' ? ', stale' : ''}${r.ownerNeeded ? ', owner needed' : ''}] owner=${r.owner ?? 'unassigned'} ${r.url}\n  ${r.deliverySatisfiedAt ? 'Agreed delivery satisfied; ' : ''}${r.blocker || 'No known blocker'}. Next: ${r.nextAction}${(r.failures ?? []).filter(f=>f.resolvedAt===null).map(f=>`\n  ${f.id}: ${f.name} ${f.url} — ${f.accounting ? `${f.accounting.scope} follow-up task=${f.accounting.taskId} worker=${f.accounting.worker}` : `unaccounted; author=${r.workers.at(-1) ?? 'unknown'}`}`).join('')}`;
 }
 /** One open pull request on the owner's board; `state` is already plain words. */
-export type BoardPr = { ref: string; title?: string; state: string; openedAt: number };
+export type BoardPr = { ref: string; url: string; title?: string; state: string; openedAt: number };
 /** One plain owner-facing state per tracked status; null leaves the PR off the board (merged or closed). */
 const BOARD_PR_STATE: Record<DeliveryStatus, string | null> = {
   'draft': 'draft',
@@ -66,7 +66,7 @@ export function boardPullRequests(records: readonly DeliveryRecord[]): BoardPr[]
   return records.flatMap((r) => {
     const state = BOARD_PR_STATE[r.status];
     if (state === null || state === undefined || r.forgeState === 'merged' || r.forgeState === 'closed') return [];
-    return [{ ref: r.id, ...(r.title ? { title: r.title } : {}), state: r.ownerNeeded ? 'waiting on you' : state, openedAt: r.openedAt ?? r.updatedAt }];
+    return [{ ref: r.id, url: r.url, ...(r.title ? { title: r.title } : {}), state: r.ownerNeeded ? 'waiting on you' : state, openedAt: r.openedAt ?? r.updatedAt }];
   });
 }
 /** How often a PR without a live manager is read on GitHub, so a merge or close
