@@ -577,6 +577,9 @@ export function fmBackendEnv(input: {
 // fm-watch keeper paths + cadence (host-relative to fmHome).
 export const FM_WATCH_KEEPER_PID = "state/.bb-watch-keeper.pid";
 export const FM_WATCH_KEEPER_SH = "state/.bb-watch-keeper.sh";
+// The runtime bin dir the live keeper resolved at start. The keeper resolves it once, so
+// the supervisor compares it with the current selection to find a keeper left on an old release.
+export const FM_WATCH_KEEPER_BINDIR = "state/.bb-watch-keeper.bindir";
 // D7: the plugin (the keeper's OWNER) refreshes this beat every supervisor tick while
 // watchOwner=fm-watch. The keeper self-exits when the beat goes stale, so a keeper
 // whose owner is gone (plugin disposed/disabled/crashed, or the flag flipped and the
@@ -668,6 +671,7 @@ export function fmWatchKeeperScript(hostId: string, fmHome: string, interval: nu
     `LOG_KEEP=${FM_WATCH_LOG_KEEP}`,
     "ARM_PID=",
     'echo $$ > "$PID"',
+    `printf '%s\\n' "$FM_BINDIR" > ${shQuote(`${fmHome}/${FM_WATCH_KEEPER_BINDIR}`)}`,
     'cleanup() { if [ -n "$ARM_PID" ]; then kill "$ARM_PID" 2>/dev/null; wait "$ARM_PID" 2>/dev/null; fi; if [ "$(cat "$PID" 2>/dev/null)" = "$$" ]; then rm -f "$PID"; fi; }',
     "trap cleanup EXIT",
     "trap 'exit 143' TERM INT HUP",
@@ -9341,13 +9345,20 @@ export default async function plugin(bb: BbPluginApi) {
     graceSec: number,
     allowRelaunch: boolean,
     signal?: AbortSignal,
+    captain?: string,
   ): Promise<{ beatAge: number; relaunched: boolean; keeperAlive: boolean; logTail: string } | null> {
     const beat = `${fmHome}/state/.last-watcher-beat`;
     const log = `${fmHome}/state/.bb-watch-arm.log`;
     const pid = `${fmHome}/${FM_WATCH_KEEPER_PID}`;
     const keeperScript = `${fmHome}/${FM_WATCH_KEEPER_SH}`;
     const ownerBeat = `${fmHome}/${FM_WATCH_OWNER_BEAT}`;
+    const keeperBindir = `${fmHome}/${FM_WATCH_KEEPER_BINDIR}`;
+    const watchLock = `${fmHome}/state/.watch.lock`;
     const interval = fmWatchKeeperInterval(graceSec);
+    const keeperBody = fmWatchKeeperScript(hostId, fmHome, interval);
+    // The captain hook marker pins root= to the runtime selected at deck time; its Stop hook runs
+    // that release's turn-end guard, which rejects a lock held by a watcher from any other release.
+    const marker = captain !== undefined && /^[A-Za-z0-9_-]+$/.test(captain) ? `"$HOME/.bb-firstmate/captains/${captain}"` : null;
     // Phase 1: refresh the owner beat (D7 self-exit heartbeat — written BEFORE any
     // keeper launch so a freshly launched keeper always sees a fresh beat), then read
     // beacon age + keeper liveness + a log tail (no other side effects).
@@ -9364,6 +9375,15 @@ export default async function plugin(bb: BbPluginApi) {
       "KEEPER=dead",
       `if [ -f ${shQuote(pid)} ]; then KP=$(cat ${shQuote(pid)} 2>/dev/null || echo); if [ -n "$KP" ] && kill -0 "$KP" 2>/dev/null; then KEEPER=alive; fi; fi`,
       `[ -x "$FM_BINDIR/fm-watch-arm.sh" ] || echo FM_WATCH_NO_ARM`,
+      // A live keeper resolved its bin dir once at start, so a release switch or a plugin
+      // upgrade leaves it arming the old scripts. Report what it runs against what it should.
+      `if [ "$KEEPER" = alive ]; then printf 'FM_KEEPER_BINDIR=%s\\nFM_KEEPER_SHA=%s\\n' "$(head -n 1 ${shQuote(keeperBindir)} 2>/dev/null)" "$(sha256sum ${shQuote(keeperScript)} 2>/dev/null | cut -c1-64)"; fi`,
+      `printf 'FM_CURRENT_BINDIR=%s\\nFM_CURRENT_ROOT=%s\\n' "$FM_BINDIR" "$FM_RUNTIME_ROOT"`,
+      ...(marker === null ? [] : [`if [ -f ${marker} ] && [ "$(sed -n 's/^home=//p' ${marker} | head -n 1)" = ${shQuote(fmHome)} ]; then printf 'FM_MARKER_ROOT=%s\\n' "$(sed -n 's/^root=//p' ${marker} | head -n 1)"; fi`]),
+      // A live watcher armed from another runtime root holds the lock under a watcher path
+      // the current release's lock check rejects, so every new arm fails until it stops.
+      `WP=$(cat ${shQuote(`${watchLock}/watcher-path`)} 2>/dev/null || true); WPID=$(cat ${shQuote(`${watchLock}/pid`)} 2>/dev/null || true)`,
+      `if [ -n "$WP" ] && [ -n "$WPID" ] && kill -0 "$WPID" 2>/dev/null; then case "$WP" in "$FM_RUNTIME_ROOT"/*) ;; *) printf 'FM_FOREIGN_WATCHER=%s\\n' "$WP" ;; esac; fi`,
       // F2 (re-review): supervision runs fm-watch-arm FROM the mirror, so a stale mirror
       // here degrades supervision silently. Check on every supervision poll; the emitted
       // FM_MIRROR_STALE line is surfaced loudly by the caller below.
@@ -9381,7 +9401,22 @@ export default async function plugin(bb: BbPluginApi) {
       const logTail = tailIdx < 0 ? "" : res.output.slice(tailIdx + "---FM_LOGTAIL---".length).trim();
       const ageMatch = /FM_BEAT_AGE=(-?\d+)/.exec(poll);
       const beatAge = ageMatch ? Number(ageMatch[1]) : -1;
-      const keeperAlive = /FM_KEEPER=alive/.test(poll);
+      const field = (name: string) => new RegExp(`^${name}=(.*)$`, "m").exec(poll)?.[1] ?? "";
+      const keeperRunning = /FM_KEEPER=alive/.test(poll);
+      const currentBindir = field("FM_CURRENT_BINDIR");
+      const recordedBindir = field("FM_KEEPER_BINDIR");
+      const staleKeeper = !keeperRunning ? null
+        : field("FM_KEEPER_SHA") !== createHash("sha256").update(keeperBody).digest("hex") ? "its script is outdated"
+        : recordedBindir !== "" && currentBindir !== "" && recordedBindir !== currentBindir ? `it runs ${recordedBindir}, the selection is ${currentBindir}`
+        : null;
+      const foreignWatcher = field("FM_FOREIGN_WATCHER");
+      const currentRoot = field("FM_CURRENT_ROOT");
+      if (marker !== null && /^FM_MARKER_ROOT=/m.test(poll) && currentRoot !== "" && field("FM_MARKER_ROOT") !== currentRoot) {
+        const moved = await runOnHost(hostId, `m=${marker}; t="$m.tmp.$$"; { grep -v '^root=' "$m"; printf 'root=%s\\n' ${shQuote(currentRoot)}; } > "$t" && mv -f "$t" "$m"`, 15_000, signal);
+        const note = `captain marker for ${captain} on host ${hostId}: root ${field("FM_MARKER_ROOT") || "(unset)"} -> ${currentRoot}`;
+        if (moved.exitCode === 0) bb.log.info(`fm-watch-supervisor: moved ${note}`);
+        else bb.log.warn(`fm-watch-supervisor: FAILED to move ${note}: ${truncate(moved.output.trim(), 300)}`);
+      }
       const noArm = poll.includes("FM_WATCH_NO_ARM");
       // B3(b): surface a failed owner-beat write loudly — the keeper is about to
       // self-exit even though the plugin thinks it is healthy. Treat an explicit
@@ -9404,11 +9439,31 @@ export default async function plugin(bb: BbPluginApi) {
         bb.log.warn("fm-watch-supervisor: no fm-watch-arm.sh at fmHome; cannot run the real watcher.");
       }
       let relaunched = false;
-      // Phase 2: (re)launch the keeper only when it is down (and arm exists, and we
+      let keeperAlive = keeperRunning;
+      // Phase 2: replace a stale keeper. Removing its pidfile and killing it runs its own
+      // trap, which stops its re-arm; the owner beat stays so the successor is not starved.
+      if (staleKeeper !== null && allowRelaunch && !noArm) {
+        bb.log.info(`fm-watch-supervisor: replacing the keeper on host ${hostId} because ${staleKeeper}.`);
+        await runOnHost(hostId, `KP=$(cat ${shQuote(pid)} 2>/dev/null || echo); rm -f ${shQuote(pid)}; [ -n "$KP" ] && kill "$KP" 2>/dev/null || true`, 15_000, signal);
+        keeperAlive = false;
+      }
+      // Phase 3: stop a watcher left from another release with that release's own arm script.
+      // The current release's --stop only clears a lock it does not match; it never stops the process.
+      if (foreignWatcher !== "" && allowRelaunch && !noArm) {
+        const oldBin = foreignWatcher.replace(/\/[^/]*$/, "");
+        const stop = await runOnHost(hostId, [
+          `if [ ! -x ${shQuote(`${oldBin}/fm-watch-arm.sh`)} ]; then echo FM_FOREIGN_ARM_MISSING; exit 1; fi`,
+          `FM_HOME=${shQuote(fmHome)} FM_ROOT_OVERRIDE=${shQuote(oldBin.replace(/\/[^/]*$/, ""))} FM_STATE_OVERRIDE=${shQuote(`${fmHome}/state`)} ${shQuote(`${oldBin}/fm-watch-arm.sh`)} --stop`,
+        ].join("\n"), 30_000, signal);
+        const stopLog = `stopping the watcher from another release (${foreignWatcher}) on host ${hostId}: ${truncate(stop.output.trim(), 300)}`;
+        if (stop.exitCode === 0) bb.log.info(`fm-watch-supervisor: ${stopLog}`);
+        else bb.log.warn(`fm-watch-supervisor: FAILED ${stopLog}`);
+      }
+      // Phase 4: (re)launch the keeper only when it is down (and arm exists, and we
       // are not in crash-loop backoff). Write the keeper script as a file, then
       // detach-launch it.
       if (!keeperAlive && allowRelaunch && !noArm) {
-        const wrote = await writeHostFile(hostId, keeperScript, fmWatchKeeperScript(hostId, fmHome, interval), signal);
+        const wrote = await writeHostFile(hostId, keeperScript, keeperBody, signal);
         if (wrote) {
           const launch = [
             `mkdir -p ${shQuote(`${fmHome}/state`)}`,
@@ -13450,7 +13505,7 @@ export default async function plugin(bb: BbPluginApi) {
               const prior = fmWatchBeatSchema.safeParse(await bb.storage.kv.get(fmWatchBeatKey(host)));
               const now = Date.now();
               const backoff = prior.success ? prior.data.backoffUntil ?? 0 : 0;
-              const result = await superviseFmWatch(host, s.fmHome, grace, now >= backoff, signal);
+              const result = await superviseFmWatch(host, s.fmHome, grace, now >= backoff, signal, captain);
               if (!result) return;
               const streak = result.keeperAlive ? 0 : result.relaunched ? (prior.success ? prior.data.consecutiveRelaunch ?? 0 : 0) + 1 : 0;
               await bb.storage.kv.set(fmWatchBeatKey(host), {
