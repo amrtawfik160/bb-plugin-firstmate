@@ -177,6 +177,22 @@ export function isWaitingYield(text: string | null | undefined): boolean {
   return false;
 }
 
+/**
+ * The native `paused` line for a crew that declared its wait only in chat. fm-watch reads
+ * the status file, never chat, so it re-flags such a crew as idle every few minutes; a
+ * `paused` line moves it to the watcher's long recheck cadence. Null when the reply is not
+ * a `WAITING:` yield, or the status file's latest event is already a declaration. A later
+ * `note:` retracts a pause for fm-watch, so the wait is declared again after one.
+ */
+export function waitingPauseLine(text: string | null | undefined, statusLines: string[], nowSec: number): string | null {
+  if (!isWaitingYield(text)) return null;
+  // fm-classify-lib counts `note` as an event; latestStatus does not.
+  const latest = statusLines.map((line) => statusLineVerb(line).toLowerCase()).filter((verb) => verb === "note" || STATUS_VERBS.has(verb)).at(-1);
+  if (latest !== undefined && latest !== "working" && latest !== "note") return null;
+  const yieldLine = text!.split(/\r?\n/).find((line) => statusLineVerb(line).toLowerCase() === "waiting") ?? "";
+  return `paused [at=${nowSec}]: WAITING (chat): ${yieldLine.slice(yieldLine.indexOf(":") + 1).trim().slice(0, 200)}`;
+}
+
 // ── Full status protocol ─────────────────────────────────────────────────────
 // The complete firstmate status vocabulary and the keyed open-decision fold,
 // ported line-for-line from bin/fm-classify-lib.sh so BB reads the same state

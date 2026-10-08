@@ -17,6 +17,7 @@ import {
   hasStatusProtocol,
   hasTerminalVerdict,
   isWaitingYield,
+  waitingPauseLine,
   idleVerdictPresentation,
   looksReadOnly,
   foldOpenDecisions,
@@ -11736,6 +11737,26 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  // A native worker that declares its wait only in chat (the outcome-line request offers
+  // `WAITING:`) leaves nothing in its status file, so fm-watch re-flags it as idle every
+  // few minutes: 45 of 64 stale cycles for one captain on 2026-10-08. Record the wait as
+  // the native `paused` line, which fm-watch re-surfaces once per FM_PAUSE_RESURFACE_SECS
+  // (4 hours by default). Best-effort.
+  async function declareNativeWait(crew: Crew, text: string | null): Promise<void> {
+    if (!isWaitingYield(text) || isSecondmateRoute(crew)) return;
+    try {
+      const line = waitingPauseLine(text, (await crewStatusLines(crew)).lines, Math.floor(Date.now() / 1000));
+      if (line === null) return;
+      const path = shQuote(`${await crewNativeHome(crew)}/state/${crew.id}.status`);
+      const hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
+      const res = await runOnHost(hostId, `[ -L ${path} ] || printf '%s\\n' ${shQuote(line)} >> ${path}`, 15_000);
+      if (res.exitCode === 0) bb.log.info(`fm wait declared crew=${crew.id}: chat WAITING recorded as paused`);
+      else bb.log.warn(`fm wait declare failed crew=${crew.id} exit=${res.exitCode}`);
+    } catch (error) {
+      bb.log.warn(`fm wait declare failed crew=${crew.id}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   // 25 of 63 audited crews ended a turn with no outcome line, so the captain could not
   // tell finished from interrupted (fleet audit 2026-10-07). Ask once; until an outcome
   // arrives the crew is not asked again and bearings shows it as "no outcome".
@@ -11812,6 +11833,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (await clearWaiting(crew.id)) await dropResumeRows(crew, "all");
       if (hasStatusProtocol(lastAssistantText) || isWaitingYield(lastAssistantText) || await nativeOutcomeRecorded(crew)) await clearNoOutcome(crew);
       else await askForOutcomeLine(crew);
+      await declareNativeWait(crew, lastAssistantText);
       const current = await settings.get();
       // The native watcher classifies its status and BB activity events. A
       // compatibility event supervisor may relay declarations, but never chat.
