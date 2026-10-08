@@ -121,24 +121,28 @@ bb.sdk.plugins.callRpc({
 hours ago and `digest` uses 12 hours ago.
 
 `away` is set only for `board`. It is the captain's `/afk` posture, the same
-flag the fleet snapshot exposes as `afk`. The board text is plain text, at
-most 3900 characters, in three sections:
+flag the fleet snapshot exposes as `afk`. The board text is plain text with
+one exception: every PR reference is a link written `[<repo>#<n>](<PR url>)`,
+for example `[cyndra-saas#2146](https://github.com/cyndra-ai/cyndra-saas/pull/2146)`.
+The connector turns exactly this form into a Telegram link. The board is at
+most 3900 visible characters, where a link counts as its label only. It has
+three sections:
 
 ```
 📌 Needs you (<N>)
 1. <❓|⛔|✅> <question, first 140 chars> (<age>, ask <id>) Recommended: <label>. Auto at <HH:MM UTC>.
 2. <crew item from the fleet "Waiting for you" list, first 160 chars>
-3. T15 <project> · <task title> · ready for you · <age> · <repo>#<n> ready to merge
-4. PR <repo>#<n> <PR title> · ready to merge
+3. T15 <project> · <task title> · ready for you · <age> · [<repo>#<n>](<PR url>) ready to merge
+4. PR [<repo>#<n>](<PR url>) <PR title> · ready to merge
 Tap a question's button or reply to it to answer.
 
 ✅ Done since you last looked (<N>)
 - T7 <project> · <task title> · <age> · merged
-- PR <repo>#<n> <PR title> · merged
+- PR [<repo>#<n>](<PR url>) <PR title> · merged
 
 🔧 In progress (<N>)
-- T13 <project> · <task title> · <age> · <repo>#<n> on hold (do not merge) · stale 2 d
-Other PRs: <repo>#<n> <state>; <repo>#<n> <state>
+- T13 <project> · <task title> · <age> · [<repo>#<n>](<PR url>) on hold (do not merge) · stale 2 d
+Other PRs: [<repo>#<n>](<PR url>) <state>; [<repo>#<n>](<PR url>) <state>
 ```
 
 Needs you lists open asks oldest first, then crew items, then tasks that need
@@ -152,7 +156,7 @@ open pull request. An empty section is one line, for example
 from the end of In progress first, then Done, then Needs you, and an
 `…and <k> more` line takes their place. Headers always show the true counts.
 
-The digest uses the same lines without emoji: `Needs you (<N>)` (at most 5),
+The digest uses the same lines without emoji and without links: `Needs you (<N>)` (at most 5),
 `Done (<N>)` (at most 8), and `Stale (<N>): T1, T2` for open tasks with no
 update for 24 hours. It leaves out empty blocks and is the empty string when
 there is nothing to report.

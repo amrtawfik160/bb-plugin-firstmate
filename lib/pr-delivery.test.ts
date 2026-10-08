@@ -99,17 +99,17 @@ test("a green PR with a do-not-merge comment on its current head is on hold, not
     "✅ Done since you last looked: nothing new.",
     "",
     "🔧 In progress: nothing open.",
-    "Other PRs: runants#1759 on hold (do not merge)",
+    "Other PRs: [runants#1759](https://github.com/hazw80801/runants/pull/1759) on hold (do not merge)",
   ].join("\n"));
 });
 
 test("a do-not-merge label holds the PR whatever its head", () => {
-  assert.match(boardFor(runants1759({ comments: [], labels: [{ name: "do-not-merge" }] })), /^Other PRs: runants#1759 on hold \(do not merge\)$/m);
+  assert.match(boardFor(runants1759({ comments: [], labels: [{ name: "do-not-merge" }] })), /^Other PRs: \[runants#1759\]\(https:\/\/github\.com\/hazw80801\/runants\/pull\/1759\) on hold \(do not merge\)$/m);
 });
 
 test("a new commit after the do-not-merge comment lifts the hold, and an approval comment does not hold", () => {
-  assert.match(boardFor(runants1759({ commits: [{ oid: "3ef8a02", committedDate: "2026-10-07T19:00:00Z" }] })), /^1\. PR runants#1759 style\(ui\): .* · ready to merge$/m);
-  assert.match(boardFor(runants1759({ comments: [{ author: { login: "amrtawfik160" }, createdAt: "2026-10-07T18:35:27Z", body: "Checked on the real app. Merge it." }] })), /^1\. PR runants#1759 style\(ui\): .* · ready to merge$/m);
+  assert.match(boardFor(runants1759({ commits: [{ oid: "3ef8a02", committedDate: "2026-10-07T19:00:00Z" }] })), /^1\. PR \[runants#1759\]\(https:\/\/github\.com\/hazw80801\/runants\/pull\/1759\) style\(ui\): .* · ready to merge$/m);
+  assert.match(boardFor(runants1759({ comments: [{ author: { login: "amrtawfik160" }, createdAt: "2026-10-07T18:35:27Z", body: "Checked on the real app. Merge it." }] })), /^1\. PR \[runants#1759\]\(https:\/\/github\.com\/hazw80801\/runants\/pull\/1759\) style\(ui\): .* · ready to merge$/m);
 });
 
 /** Observe each GitHub answer in turn for #1759, as the follow-up sweep does, and return the board after the last. */
@@ -129,7 +129,7 @@ test("a held PR that gets new commits needs a captain check before it can show r
     "✅ Done since you last looked: nothing new.",
     "",
     "🔧 In progress: nothing open.",
-    "Other PRs: runants#1759 changed since hold, needs a check",
+    "Other PRs: [runants#1759](https://github.com/hazw80801/runants/pull/1759) changed since hold, needs a check",
   ].join("\n"));
   assert.throws(() => store.clearHold("hazw80801/runants#1759", "thr_cap", " "), /needs a reason/);
   store.clearHold("hazw80801/runants#1759", "thr_cap", "Checked the redo on the real routes");
@@ -139,7 +139,7 @@ test("a held PR that gets new commits needs a captain check before it can show r
 
 test("removing the hold label on the same head lifts the hold without a check, and a merge ends it", () => {
   const labelled = runants1759({ comments: [], labels: [{ name: "do-not-merge" }] });
-  assert.match(boardAfter(labelled, runants1759({ comments: [] })).board, /^1\. PR runants#1759 style\(ui\): .* · ready to merge$/m);
+  assert.match(boardAfter(labelled, runants1759({ comments: [] })).board, /^1\. PR \[runants#1759\]\(https:\/\/github\.com\/hazw80801\/runants\/pull\/1759\) style\(ui\): .* · ready to merge$/m);
   const merged = boardAfter(runants1759(), runants1759({ ...redo, state: "MERGED", mergeCommit: { oid: "m1" } }));
   assert.equal(merged.store.get("hazw80801/runants#1759")?.status, "complete");
   assert.equal(merged.store.get("hazw80801/runants#1759")?.heldHead, null);
