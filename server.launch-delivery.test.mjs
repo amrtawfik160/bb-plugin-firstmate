@@ -515,3 +515,19 @@ test('durable launch orphan discovery preserves native task mode before author c
   assert.equal(host.harness.sdk.callsTo('threads.spawn').length,0);assert.equal(host.harness.sdk.callsTo('environments.mergePullRequest').length,0);
  }finally{await host.harness.lifecycle.dispose();}
 });
+test('a captain records merge verification by PR link for a crew it owns in another project',async()=>{
+ const host=await base();try {
+  const store=createDeliveries(host.bb.storage.database());
+  const merged=(url,projectId)=>{const r=store.register({url,taskId:'t1',projectId,owner:'thr_cap',home:'',worker:'thr_c1',requirement:'merged-and-verified'});
+   return store.observe(r.id,{headSha:'h1',state:'merged',draft:false,checks:'passing',review:'approved',mergeable:'unknown',reviewHeadSha:null,mergeCommitSha:'merge1'},true);};
+  assert.equal(merged('https://github.com/Acme/Other/pull/293','proj_other').status,'merged-needs-verification');
+  const out=await tool(host,'firstmate_deliveries').execute({action:'verify',url:'https://github.com/Acme/Other/pull/293',commitSha:'merge1',reason:'Live page checked after deploy'},ctx);
+  assert.match(typeof out==="string"?out:JSON.stringify(out),/acme\/other#293 \[complete\]/);
+  assert.equal(store.get('acme/other#293').verifiedCommitSha,'merge1');
+  merged('https://github.com/acme/other/pull/294','proj_other');
+  const foreign=await host.harness.behavior.runCli(['deliveries','inspect','acme/other#294'],{threadId:'thr_foreign',projectId:'proj_1'});
+  assert.equal(foreign.exitCode,1,'a manager that does not own the record still cannot reach another project');
+  const missing=await host.harness.behavior.runCli(['deliveries','verify'],ctx);
+  assert.match(missing.stderr,/Pass id \(owner\/repo#number\) or url \(the PR link\)/);
+ }finally{await host.harness.lifecycle.dispose();}
+});
