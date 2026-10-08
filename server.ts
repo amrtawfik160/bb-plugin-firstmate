@@ -10305,7 +10305,7 @@ export default async function plugin(bb: BbPluginApi) {
       const minutes = gated || recommended === undefined ? 0 : defaultAfterMinutes ?? Number((await settings.get()).askDefaultMinutes ?? 240);
       const now = Date.now();
       const ask = ownerAsks.create({
-        captain, kind: kind as AskKind, impact: impact?.replace(/\s+/g, " ").trim(), text: question.trim(), options: choices,
+        captain, kind: kind as AskKind, impact: impact?.replace(/\s+/g, " ").trim().slice(0, 300), text: question.trim(), options: choices,
         recommended: recommended ?? null, defaultAt: minutes > 0 ? now + Math.round(minutes * 60_000) : null,
         irreversible: irreversible === true, createdAt: now,
       });
