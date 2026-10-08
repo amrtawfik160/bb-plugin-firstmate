@@ -72,8 +72,8 @@ import { ACK_TEXT, ackEligible, createInboundLedger, expandTelegramRows, formatO
 import { inboundHookDecision } from "./lib/inbound-dispatch.ts";
 import { formatWorkersForTelegram } from "./lib/telegram-commands.ts";
 import { formatBoard, formatDigest, type BoardInput } from "./lib/owner-board.ts";
-import { createOwnerTasks, sameProject, taskLine, type CrewFinish, type OwnerTask, type TaskState } from "./lib/owner-tasks.ts";
-import { askIdFromSourceEventId, createOwnerAsks, formatAskCard, formatUtcTime, mayDefault, recommendedLabel, type AskKind } from "./lib/owner-asks.ts";
+import { createOwnerTasks, isOpenTask, sameProject, taskLine, type CrewFinish, type OwnerTask, type TaskState } from "./lib/owner-tasks.ts";
+import { askLetterAnswer, askIdFromSourceEventId, createOwnerAsks, formatAskCard, formatUtcTime, mayDefault, recommendedLabel, type AskKind } from "./lib/owner-asks.ts";
 import { DEFAULT_RELIABILITY_FLAGS, reliabilityFlagsFromSettings } from "./lib/reliability-flags.ts";
 import { sanitizeSettingValue } from "./lib/settings-schema.ts";
 import { coalesceBatches, parseConnectorHeader, parseInboundTelegram, parseSourceRef, parseTelegramSubmission, stripTelegramEnvelope, telegramReplyParameters, telegramSourceRef } from "./lib/telegram-envelope.ts";
@@ -10171,7 +10171,8 @@ export default async function plugin(bb: BbPluginApi) {
       }
       const trackTask = async (crewId: string): Promise<string> => {
         if (parentThreadId === undefined) return "";
-        const held = taskRef !== undefined ? ownerTasks.get(taskRef) : await prTask(parentThreadId, resolvedProject, title, task);
+        const named = [...`${title ?? ""}\n${task}`.matchAll(/\bT\d+\b/g)].map((match) => ownerTasks.get(match[0])).find((item) => item?.captain === parentThreadId && isOpenTask(item));
+        const held = taskRef !== undefined ? ownerTasks.get(taskRef) : named ?? await prTask(parentThreadId, resolvedProject, title, task);
         if (held !== undefined) {
           const joined = ownerTasks.attach(held.id, parentThreadId, { crewId, sourceRefs: origin === undefined ? [...passedRefs, ...turnRefs] : [], at: Date.now() });
           await refreshOwnerBoard();
@@ -10281,18 +10282,20 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_ask",
-    description: "Ask the captain one question, blocker or approval as a Telegram card with up to 4 option buttons. It stays on the captain's board until answered. Returns at once: keep working on other things. The answer arrives as an owner message replying to the card. irreversible=true or kind=approval never proceeds on a deadline; a reversible ask with a recommended option proceeds with it at its deadline.",
+    description: "Ask the captain one question, blocker or approval as a Telegram card with up to 4 option buttons. It stays on the captain's board until answered. Returns at once: keep working on other things. The answer arrives from a button tap or a card reply containing just its option letter. irreversible=true or kind=approval never proceeds on a deadline; a reversible ask with a recommended option proceeds with it at its deadline.",
     parameters: z.object({
-      question: z.string().min(1).max(1500),
+      impact: z.string().trim().min(1).max(300).regex(/^[^\r\n]+$/).describe("One plain sentence explaining what this means for the owner’s business"),
+      question: z.string().min(1).max(1500).describe("One question; put option text in options, not in the question"),
       kind: z.enum(["question", "blocker", "approval"]),
-      options: z.array(z.object({ label: z.string().min(1).max(40), value: z.string().min(1).max(64).optional() })).max(4).optional(),
+      options: z.array(z.object({ label: z.string().min(1).max(1000), value: z.string().min(1).max(64).optional() })).max(4).optional(),
       recommended: z.number().int().min(0).optional().describe("Index of the recommended option"),
       defaultAfterMinutes: z.number().min(5).max(10080).optional().describe("Proceed with the recommended option after this many minutes without an answer (reversible asks only)"),
       irreversible: z.boolean().optional().describe("A gated action (production deploy, money, deleting data, customer messages): never proceeds without an answer"),
     }),
-    async execute({ question, kind, options, recommended, defaultAfterMinutes, irreversible }, ctx) {
+    async execute({ impact, question, kind, options, recommended, defaultAfterMinutes, irreversible }, ctx) {
       const captain = ctxString(ctx, "threadId");
       if (!captain) return toolError("firstmate_ask runs only in a captain thread.");
+      if (!impact?.trim() || /[\r\n]/.test(impact)) return toolError("impact must be one line explaining what this means for the owner’s business.");
       const choices = (options ?? []).map((option) => ({ label: option.label, value: option.value ?? option.label }));
       if (recommended !== undefined && recommended >= choices.length) return toolError(`recommended must be the index of one of the ${choices.length} option(s).`);
       const gated = !mayDefault({ kind: kind as AskKind, irreversible: irreversible === true });
@@ -10303,7 +10306,7 @@ export default async function plugin(bb: BbPluginApi) {
       const minutes = gated || recommended === undefined ? 0 : defaultAfterMinutes ?? Number((await settings.get()).askDefaultMinutes ?? 240);
       const now = Date.now();
       const ask = ownerAsks.create({
-        captain, kind: kind as AskKind, text: question.trim(), options: choices,
+        captain, kind: kind as AskKind, impact: impact.trim(), text: question.trim(), options: choices,
         recommended: recommended ?? null, defaultAt: minutes > 0 ? now + Math.round(minutes * 60_000) : null,
         irreversible: irreversible === true, createdAt: now,
       });
@@ -10326,27 +10329,37 @@ export default async function plugin(bb: BbPluginApi) {
       }
       await refreshOwnerBoard();
       return warning === ""
-        ? `Sent ask ${ask.id} to the captain on Telegram. ${done}`
+        ? `Question card ${ask.id} sent. ${done}`
         : `${done}\nWarning: the question card was not sent to Telegram (${warning}). The ask stays open on the board; put the question in your final message too.`;
     },
   });
 
   registerCaptainTool({
     name: "firstmate_resolve_ask",
-    description: "Close one open ask from firstmate_ask when you learn the answer another way (resolution = the answer), or cancel it when it no longer matters (cancelled=true).",
+    description: "Correct or close an ask from firstmate_ask, or reopen it with reopen=true, when you learn the answer another way (resolution = the answer), or cancel it when it no longer matters (cancelled=true).",
     parameters: z.object({
       id: z.string().min(1).max(64),
       resolution: z.string().min(1).max(2000),
       cancelled: z.boolean().optional(),
+      reopen: z.boolean().optional(),
     }),
-    async execute({ id, resolution, cancelled }, ctx) {
+    async execute({ id, resolution, cancelled, reopen }, ctx) {
       const captain = ctxString(ctx, "threadId");
       if (!captain) return toolError("firstmate_resolve_ask runs only in a captain thread.");
-      const closed = ownerAsks.resolve(id, captain, cancelled === true ? "cancelled" : "answered", resolution, Date.now());
-      if (!closed) return toolError(`No open ask ${id} for this captain.`);
+      const closed = ownerAsks.resolve(id, captain, reopen === true ? "open" : cancelled === true ? "cancelled" : "answered", resolution, Date.now());
+      if (!closed) return toolError(`No ask ${id} for this captain.`);
+      let warning = "";
+      try {
+        const result = z.object({ ok: z.boolean() }).parse(await bb.sdk.plugins.callRpc({
+          pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "editAsk",
+          input: { askId: id, resolution, at: closed.resolvedAt ?? Date.now(), ...(reopen === true ? { reopen: true } : {}) },
+          outputSchema: z.object({ ok: z.boolean() }),
+        }));
+        if (!result.ok) warning = " The Telegram card could not be updated.";
+      } catch (error) { warning = ` The Telegram card could not be updated (${error instanceof Error ? error.message : String(error)}).`; }
       await refreshOwnerBoard();
       const left = ownerAsks.listOpen(captain).length;
-      return `Ask ${id} ${closed.state}. ${left === 0 ? "No ask is open." : `${left} ask(s) still open.`}`;
+      return `Ask ${id} ${closed.state}. ${left === 0 ? "No ask is open." : `${left} ask(s) still open.`}${warning}`;
     },
   });
 
@@ -11290,12 +11303,6 @@ export default async function plugin(bb: BbPluginApi) {
         id, text, options, state: state as "open" | "answered", resolvedAt,
       })) };
     },
-    async autoAsk({ threadId, text, options, sourceRef, messageUrl }) {
-      if (!(await isCaptainThread(threadId))) throw new Error("Automatic asks require a Firstmate captain thread.");
-      const { ask, created } = ownerAsks.ensure({ captain: threadId, kind: "question", text, options, sourceRef, messageUrl, createdAt: Date.now() });
-      await refreshOwnerBoard();
-      return { id: ask.id, created, state: ask.state };
-    },
     async linkAsk({ threadId, id, messageUrl }) {
       if (!(await isCaptainThread(threadId))) return { ok: false };
       const ok = ownerAsks.link(id, threadId, messageUrl);
@@ -11804,7 +11811,9 @@ export default async function plugin(bb: BbPluginApi) {
       const header = parseConnectorHeader(message);
       const id = askIdFromSourceEventId(header?.sourceEventId);
       if (!header || header.forwarded || id === null) continue;
-      if (ownerAsks.resolve(id, captainThreadId, "answered", header.body.slice(0, 2000), Date.now())) answered++;
+      const ask = ownerAsks.get(id);
+      const answer = ask ? askLetterAnswer(ask, header.body) : null;
+      if (ask?.state === "open" && answer !== null && ownerAsks.resolve(id, captainThreadId, "answered", answer, Date.now())) answered++;
     }
     if (answered > 0) await refreshOwnerBoard();
   }
@@ -11879,7 +11888,9 @@ export default async function plugin(bb: BbPluginApi) {
           // An answer to an ask card needs action, not a reply, so it never raises an unanswered reminder.
           for (const event of events) {
             const header = parseConnectorHeader(event.text);
-            if (!header || header.forwarded || askIdFromSourceEventId(header.sourceEventId) === null) continue;
+            const id = askIdFromSourceEventId(header?.sourceEventId);
+            const ask = id ? ownerAsks.get(id) : undefined;
+            if (!header || header.forwarded || !ask || ask.captain !== threadId || askLetterAnswer(ask, header.body) === null) continue;
             inboundLedger.markAnswered({ source: "telegram", chatId: header.chatId, messageId: header.messageId }, Date.now());
           }
           if (flags.inboundLedger === "on") {

@@ -535,7 +535,7 @@ type RpcCall = { pluginId: string; method: string; input: Record<string, unknown
 const rpcCalls = (host: Host) => host.harness.sdk.callsTo("plugins.callRpc").map((c) => c[0] as RpcCall);
 const asks = (host: Host) => createOwnerAsks(host.bb.storage.database());
 const askTool = (host: Host, params: Record<string, unknown>, captain = "thr_cap") =>
-  tool(host, "firstmate_ask").execute(params, { threadId: captain, projectId: "proj_1" } as never);
+  tool(host, "firstmate_ask").execute({ impact: "Customers can use this feature.", ...params }, { threadId: captain, projectId: "proj_1" } as never);
 const connectorOk = (host: Host) => host.harness.sdk.stub("plugins.callRpc", async (args: RpcCall) => (
   args.method === "refreshBoard" ? { ok: true } : { queued: 1, duplicate: false, mode: "on" }
 ));
@@ -563,7 +563,7 @@ test("firstmate_ask records the ask and sends the connector a question card with
     assert.deepEqual(calls.map((c) => [c.pluginId, c.method]), [["telegram", "ask"], ["telegram", "refreshBoard"]]);
     assert.deepEqual(calls[0]!.input, {
       askId: id,
-      text: `❓ Question\n\nDark mode by default?\n\nRecommended: Yes\nIf no answer by ${hhmm(stored.defaultAt!)} UTC, I'll go with Yes.`,
+      text: `Customers can use this feature.\n\n❓ Question\n\nDark mode by default?\nA. Yes\nB. No\n\nRecommended: Yes\nIf no answer by ${hhmm(stored.defaultAt!)} UTC, I'll go with Yes.`,
       options: [{ label: "Yes", value: "Yes" }, { label: "No", value: "no" }],
       recommended: 0,
     });
@@ -605,7 +605,7 @@ test("firstmate_ask refuses a deadline on an approval or an irreversible ask, an
     const waiting = await askTool(host, { question: "Delete old data?", kind: "question", options, recommended: 1, irreversible: true });
     const id = /ask (a[0-9a-z]{6})/.exec(text(waiting))![1]!;
     assert.equal(asks(host).get(id)?.defaultAt, null, "askDefaultMinutes never applies to an irreversible ask");
-    assert.equal(rpcCalls(host)[0]!.input.text, "❓ Question\n\nDelete old data?\n\nRecommended: Wait");
+    assert.equal(rpcCalls(host)[0]!.input.text, "Customers can use this feature.\n\n❓ Question\n\nDelete old data?\nA. Deploy\nB. Wait\n\nRecommended: Wait");
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -615,7 +615,7 @@ const askReply = (askId: string, body = "Roll it back") => envelope("live-reply"
   .replace('"sourceEventId":"evt_1"', `"sourceEventId":"ask:${askId}"`)
   .replace(/Roll it back$/, body);
 
-test("an owner reply to an ask card answers that ask and refreshes the board; another captain's ask is untouched", async () => {
+test("only a letter reply to an ask card answers that ask and refreshes the board; another captain's ask is untouched", async () => {
   const host = await captainHost();
   try {
     connectorOk(host);
@@ -631,7 +631,11 @@ test("an owner reply to an ask card answers that ask and refreshes the board; an
     await send(askReply("a000002"));
     assert.equal(asks(host).get("a000002")?.state, "open");
     assert.equal(rpcCalls(host).filter((c) => c.method === "refreshBoard").length, 0);
-    await send(askReply("a000001", "Yes"));
+    await send(askReply("a000001", "What?"));
+    assert.equal(asks(host).get("a000001")?.state, "open");
+    const pending = createInboundLedger(host.bb.storage.database()).listPending("thr_cap");
+    assert.equal(pending.length, 1);
+    await send(askReply("a000001", "a."));
     const answered = asks(host).get("a000001")!;
     assert.equal(answered.state, "answered");
     assert.equal(answered.resolution, "Yes");
@@ -709,7 +713,7 @@ test("telegramCommand board lists open asks then crew items, and reports /afk as
         "1. ⛔ Need the Stripe key. (5 min, ask a000001)",
         "2. ❓ Dark mode? (5 min, ask a000002) Recommended: Yes. Auto at 14:30 UTC.",
         "3. Needs captain: Telegram threaded replies are off in the Telegram connector, but Firstmate's telegramThreading flag is on, so replies arrive unthreaded. Turn th…",
-        "Tap a question's button or reply to it to answer.",
+        "Tap a question's button or reply with just its letter.",
         "",
         "✅ Done since you last looked: nothing new.",
         "",
@@ -734,7 +738,7 @@ test("telegramCommand board caps the list at 15 lines", async () => {
         "📌 Needs you (17)",
         ...Array.from({ length: 15 }, (_, i) => `${i + 1}. ❓ Question ${i + 1}? (5 min, ask a0000${String(i + 1).padStart(2, "0")})`),
         "…and 2 more",
-        "Tap a question's button or reply to it to answer.",
+        "Tap a question's button or reply with just its letter.",
         "",
         "✅ Done since you last looked: nothing new.",
         "",

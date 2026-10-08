@@ -22,20 +22,18 @@ async function captainHost() {
 }
 
 
-test("automatic ask RPCs validate the captain, reuse explicit records and close linked decisions", async () => {
+test("explicit ask RPCs validate the captain and correct answered decisions", async () => {
   const host = await captainHost();
   try {
     const asks = createOwnerAsks(host.bb.storage.database());
     asks.create({ id: "aexisting", captain: "thr_cap", kind: "approval", text: "Publish Safi?", options: [{ label: "Publish", value: "publish" }, { label: "Wait", value: "wait" }], createdAt: Date.now() });
-    const input = { threadId: "thr_cap", text: "**Publish Safi?**", options: [{ label: "A. Publish (Recommended)", value: "A" }, { label: "B. Wait", value: "B" }], sourceRef: "tg:200:3001:decision:0" };
-    assert.deepEqual(await host.harness.behavior.callRpc("autoAsk", input), { id: "aexisting", created: false, state: "open" });
     assert.deepEqual(await host.harness.behavior.callRpc("linkAsk", { threadId: "thr_other", id: "aexisting", messageUrl: "https://t.me/c/200/3001" }), { ok: false });
     assert.deepEqual(await host.harness.behavior.callRpc("linkAsk", { threadId: "thr_cap", id: "aexisting", messageUrl: "https://t.me/c/200/3001" }), { ok: true });
     const board = await host.harness.behavior.callRpc("telegramCommand", { threadId: "thr_cap", command: "board" }) as { text: string };
     assert.equal(board.text, [
       "📌 Needs you (1)",
       "1. ✅ Publish Safi? (0 min, ask aexisting) https://t.me/c/200/3001",
-      "Tap a question's button or reply to it to answer.",
+      "Tap a question's button or reply with just its letter.",
       "",
       "✅ Done since you last looked: nothing new.",
       "",
@@ -44,9 +42,10 @@ test("automatic ask RPCs validate the captain, reuse explicit records and close 
     assert.deepEqual(await host.harness.behavior.callRpc("resolveAsk", { threadId: "thr_other", id: "aexisting", resolution: "Publish" }), { ok: false });
     assert.deepEqual(await host.harness.behavior.callRpc("resolveAsk", { threadId: "thr_cap", id: "aexisting", resolution: "Publish" }), { ok: true });
     assert.equal(asks.get("aexisting")?.resolution, "Publish");
-    assert.deepEqual(await host.harness.behavior.callRpc("autoAsk", input), { id: "aexisting", created: false, state: "answered" });
+    assert.deepEqual(await host.harness.behavior.callRpc("resolveAsk", { threadId: "thr_cap", id: "aexisting", resolution: "Owner approved the address repair at 12:00 Cairo." }), { ok: true });
+    assert.equal(asks.get("aexisting")?.resolution, "Owner approved the address repair at 12:00 Cairo.");
     assert.deepEqual(await host.harness.behavior.callRpc("telegramCommand", { threadId: "thr_cap", command: "board" }), { text: "📌 Needs you: nothing right now.\n\n✅ Done since you last looked: nothing new.\n\n🔧 In progress: nothing open.", away: false });
-    await assert.rejects(host.harness.behavior.callRpc("autoAsk", { ...input, threadId: "thr_other" }), /Automatic asks require a Firstmate captain thread/);
+
     const sent = host.harness.sdk.callsTo("plugins.callRpc").map((call) => call[0] as { method: string });
     assert.equal(sent.filter((call) => call.method === "ask").length, 0);
   } finally {
@@ -77,4 +76,37 @@ test("listAsks includes open and recently answered asks only for its captain", a
   } finally {
     await host.harness.lifecycle.dispose();
   }
+});
+
+test("captain can correct an answered ask and reopen it", async () => {
+  const host = await captainHost();
+  try {
+    const asks = createOwnerAsks(host.bb.storage.database());
+    asks.create({ id: "assh", captain: "thr_cap", kind: "question", text: "Addresses?", options: [], createdAt: 1 });
+    asks.resolve("assh", "thr_cap", "answered", "What?", 2);
+    const tool = host.harness.inspection.registrations.agentTools.find((item) => item.name === "firstmate_resolve_ask")!;
+    const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
+    await tool.execute({ id: "assh", resolution: "Owner approved the repair at 12:00 Cairo. T43 tracks it." }, ctx);
+    assert.equal(asks.get("assh")?.resolution, "Owner approved the repair at 12:00 Cairo. T43 tracks it.");
+    const edits = () => host.harness.sdk.callsTo("plugins.callRpc").map((call) => call[0] as { method: string; input: { askId: string; resolution: string; at: number; reopen?: boolean } }).filter((call) => call.method === "editAsk");
+    assert.deepEqual(edits().map((call) => ({ ...call.input, at: 0 })), [{ askId: "assh", resolution: "Owner approved the repair at 12:00 Cairo. T43 tracks it.", at: 0 }]);
+    await tool.execute({ id: "assh", resolution: "Recorded by mistake", reopen: true }, ctx);
+    assert.deepEqual({ ...edits()[1]!.input, at: 0 }, { askId: "assh", resolution: "Recorded by mistake", at: 0, reopen: true });
+    assert.equal(asks.get("assh")?.state, "open");
+    assert.equal(asks.get("assh")?.resolution, null);
+    assert.equal(asks.get("assh")?.resolvedAt, null);
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+
+test("firstmate_ask requires one line of owner impact", async () => {
+  const host = await captainHost();
+  try {
+    const tool = host.harness.inspection.registrations.agentTools.find((item) => item.name === "firstmate_ask")!;
+    for (const impact of [undefined, "", "Customer access.\nAnother line."]) {
+      const result = await tool.execute({ question: "Find addresses?", kind: "question", impact }, { threadId: "thr_cap" } as never);
+      assert.equal(typeof result === "object" && result !== null && "isError" in result && result.isError, true);
+    }
+    assert.equal(createOwnerAsks(host.bb.storage.database()).listOpen("thr_cap").length, 0);
+  } finally { await host.harness.lifecycle.dispose(); }
 });

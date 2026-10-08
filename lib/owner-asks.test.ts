@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { askIdFromSourceEventId, createOwnerAsks, formatAskCard, newAskId } from "./owner-asks.ts";
+import { askLetterAnswer, askIdFromSourceEventId, createOwnerAsks, formatAskCard, newAskId } from "./owner-asks.ts";
 import { formatBoard } from "./owner-board.ts";
 
 const NOW = Date.UTC(2026, 9, 7, 12, 0);
@@ -21,12 +21,12 @@ function db() {
 test("formatAskCard titles the card by kind and states the recommendation and deadline", () => {
   assert.equal(
     formatAskCard({ kind: "question", text: "Dark mode by default?", options: [{ label: "Yes", value: "yes" }, { label: "No", value: "no" }], recommended: 0, defaultAt: Date.UTC(2026, 9, 7, 16, 5) }),
-    "❓ Question\n\nDark mode by default?\n\nRecommended: Yes\nIf no answer by 16:05 UTC, I'll go with Yes.",
+    "❓ Question\n\nDark mode by default?\nA. Yes\nB. No\n\nRecommended: Yes\nIf no answer by 16:05 UTC, I'll go with Yes.",
   );
   assert.equal(formatAskCard({ kind: "blocker", text: "Need the Stripe key.", options: [], recommended: null, defaultAt: null }), "⛔ Blocker\n\nNeed the Stripe key.");
   assert.equal(
     formatAskCard({ kind: "approval", text: "Deploy?", options: [{ label: "Deploy", value: "d" }], recommended: 0, defaultAt: null }),
-    "✅ Approval needed\n\nDeploy?\n\nRecommended: Deploy",
+    "✅ Approval needed\n\nDeploy?\nA. Deploy\n\nRecommended: Deploy",
   );
 });
 
@@ -49,27 +49,9 @@ test("the store resolves only the owner's open asks and defaults only reversible
   assert.equal(asks.resolve("a4", "thr_cap", "answered", "x", NOW), undefined);
   assert.equal(asks.get("a4")?.state, "open");
   assert.equal(asks.resolve("a2", "thr_cap", "cancelled", "not needed", NOW)?.state, "cancelled");
-  assert.equal(asks.resolve("a2", "thr_cap", "answered", "again", NOW), undefined);
-  assert.deepEqual(asks.listOpen("thr_cap").map((a) => a.id), ["a3"]);
-});
-
-test("automatic decisions reuse explicit asks, survive restart, and retain answered source identities", () => {
-  const database = db();
-  const asks = createOwnerAsks(database);
-  asks.create({ id: "aexplicit", captain: "thr_cap", kind: "approval", text: "Publish Safi #491?", options: [{ label: "Publish", value: "publish" }, { label: "Wait", value: "wait" }], createdAt: NOW });
-  const input = { captain: "thr_cap", kind: "question" as const, text: "**Publish Safi #491?**", options: [{ label: "A. Publish (Recommended)", value: "A" }, { label: "B. Wait", value: "B" }], sourceRef: "tg:200:3001:decision:0", createdAt: NOW };
-  const first = asks.ensure(input);
-  assert.deepEqual({ id: first.ask.id, created: first.created, state: first.ask.state }, { id: "aexplicit", created: false, state: "open" });
-  assert.equal(asks.link("aexplicit", "thr_other", "https://t.me/c/200/3001"), false);
-  assert.equal(asks.link("aexplicit", "thr_cap", "https://t.me/c/200/3001"), true);
-  const restarted = createOwnerAsks(database);
-  assert.equal(restarted.get("aexplicit")?.messageUrl, "https://t.me/c/200/3001");
-  assert.equal(restarted.ensure({ ...input, sourceRef: "tg:200:3002:decision:0" }).ask.id, "aexplicit");
-  assert.equal(restarted.resolve("aexplicit", "thr_cap", "answered", "Publish", NOW)?.resolution, "Publish");
-  const replay = restarted.ensure(input);
-  assert.deepEqual({ id: replay.ask.id, created: replay.created, state: replay.ask.state }, { id: "aexplicit", created: false, state: "answered" });
-  assert.equal(restarted.listOpen("thr_cap").length, 0);
-  assert.equal(restarted.ensure({ ...input, sourceRef: "tg:200:3003:decision:0" }).created, true);
+  assert.equal(asks.resolve("a2", "thr_cap", "answered", "Corrected answer", NOW)?.resolution, "Corrected answer");
+  assert.equal(asks.resolve("a2", "thr_cap", "open", "Reopen", NOW)?.state, "open");
+  assert.deepEqual(asks.listOpen("thr_cap").map((a) => a.id), ["a2", "a3"]);
 });
 
 test("old ask databases migrate without losing open asks and unparsed decisions link from the board", () => {
@@ -81,15 +63,31 @@ test("old ask databases migrate without losing open asks and unparsed decisions 
   database.prepare("INSERT INTO owner_ask VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run("arollback", "thr_other", "question", "Old plugin still asks?", "[]", null, null, 0, "open", null, NOW, null);
   assert.equal(asks.get("arollback")?.text, "Old plugin still asks?");
   assert.equal(database.prepare("PRAGMA table_info(owner_ask)").all().length, 12);
-  const result = asks.ensure({ id: "anew", captain: "thr_cap", kind: "question", text: "Approve cleanup?", options: [], sourceRef: "tg:200:3004:decision:0", messageUrl: "https://t.me/c/200/3004", createdAt: NOW });
-  assert.deepEqual({ id: result.ask.id, created: result.created }, { id: "anew", created: true });
-  assert.equal(formatBoard({ asks: [result.ask], calls: [], tasks: [], records: [], since: 0, now: NOW }), [
+  const result = asks.create({ id: "anew", captain: "thr_cap", kind: "question", text: "Approve cleanup?", options: [], sourceRef: "tg:200:3004:decision:0", messageUrl: "https://t.me/c/200/3004", createdAt: NOW });
+  assert.equal(result.id, "anew");
+  assert.equal(formatBoard({ asks: [result], calls: [], tasks: [], records: [], since: 0, now: NOW }), [
     "📌 Needs you (1)",
     "1. ❓ Approve cleanup? (0 min, ask anew) https://t.me/c/200/3004",
-    "Tap a question's button or reply to it to answer.",
+    "Tap a question's button or reply with just its letter.",
     "",
     "✅ Done since you last looked: nothing new.",
     "",
     "🔧 In progress: nothing open.",
   ].join("\n"));
+});
+
+test("impact survives restart while old 12-column writers still work", () => {
+  const database = db();
+  const asks = createOwnerAsks(database);
+  const ask = asks.create({ id: "aimpact", captain: "thr_cap", kind: "question", impact: "New customers can start their agents again.", text: "Find the addresses?", options: [{ label: "Find and verify the full address list before changing production.", value: "find" }], createdAt: NOW });
+  assert.equal(createOwnerAsks(database).get("aimpact")?.impact, "New customers can start their agents again.");
+  assert.equal(formatAskCard(ask), "New customers can start their agents again.\n\n❓ Question\n\nFind the addresses?\nA. Find and verify the full address list before changing production.");
+  assert.equal(database.prepare("PRAGMA table_info(owner_ask)").all().length, 12);
+});
+
+
+test("card answers accept only a valid letter, optionally followed by a period", () => {
+  const ask = { options: [{ label: "Send the list", value: "send" }, { label: "Find the list", value: "find" }] };
+  for (const text of ["B", "b", "B.", " b. "]) assert.equal(askLetterAnswer(ask, text), "Find the list");
+  for (const text of ["What?", "B. send me a link", "1 B", "7B", "C", "Find the list", "B!", "B\nA"]) assert.equal(askLetterAnswer(ask, text), null);
 });
