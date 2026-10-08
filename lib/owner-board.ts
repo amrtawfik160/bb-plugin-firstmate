@@ -21,7 +21,7 @@ export const DIGEST_MAX_NEEDS_YOU = 5;
 export const DIGEST_MAX_STALE = 15;
 export const BOARD_ANSWER_HINT = "Tap a question's button or reply to it to answer.";
 
-const OWNER_PR_STATES = new Set(["waiting on you", "ready to merge"]);
+const WAITING_WORDS: Partial<Record<OwnerTask["state"], string>> = { needs_you: "needs you", ready: "ready for you", check: "finished, check" };
 const DONE_STATES = new Set<OwnerTask["state"]>(["merged", "live", "done", "dropped"]);
 
 /** A section's own facts: `count` is the true total shown in its header. */
@@ -80,12 +80,12 @@ function collect(input: BoardInput, ref: PrRef) {
   const folded = (task: OwnerTask) => open.filter((pr) => linkedTo.get(task.id)!.has(pr.ref));
   const tasks = [...input.tasks].sort(byNumber);
   const asks = input.asks.filter((ask) => ask.state === "open").sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
-  const waiting = tasks.filter((task) => task.state === "needs_you" || task.state === "ready");
-  const ownerPrs = open.filter((pr) => !linked.has(pr.ref) && OWNER_PR_STATES.has(pr.state));
+  const waiting = tasks.filter((task) => task.state === "needs_you" || task.state === "ready" || task.state === "check");
+  const ownerPrs = open.filter((pr) => !linked.has(pr.ref) && pr.needsOwner);
   const needsYou = [
     ...asks.map((ask) => askLine(ask, input.now)),
     ...input.calls.map((call) => clip(call, 160)),
-    ...waiting.map((task) => taskLine(task, input.now, ref, { state: task.state === "ready" ? "ready for you" : "needs you", prs: folded(task) })),
+    ...waiting.map((task) => taskLine(task, input.now, ref, { state: WAITING_WORDS[task.state], prs: folded(task) })),
     ...ownerPrs.map((pr) => prLine(pr, ref)),
   ].map((line, index) => `${index + 1}. ${line}`);
   const doneTasks = tasks.filter((task) => DONE_STATES.has(task.state) && task.updatedAt >= input.since).sort((a, b) => b.updatedAt - a.updatedAt || byNumber(b, a));
@@ -93,10 +93,10 @@ function collect(input: BoardInput, ref: PrRef) {
   const mergedPrs = input.records.filter((r) => r.forgeState === "merged" && r.updatedAt >= input.since && !linked.has(r.id)).sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id));
   const done = [
     ...doneTasks.map((task) => taskLine(task, input.now, ref, { tail: doneTail(task) })),
-    ...mergedPrs.map((r) => prLine({ ref: r.id, url: r.url, ...(r.title ? { title: r.title } : {}), state: "merged", openedAt: r.openedAt ?? r.updatedAt }, ref)),
+    ...mergedPrs.map((r) => prLine({ ref: r.id, url: r.url, ...(r.title ? { title: r.title } : {}), state: "merged", needsOwner: false, openedAt: r.openedAt ?? r.updatedAt }, ref)),
   ].map((line) => `- ${line}`);
   const working = tasks.filter((task) => task.state === "working");
-  const otherPrs = open.filter((pr) => !linked.has(pr.ref) && !OWNER_PR_STATES.has(pr.state));
+  const otherPrs = open.filter((pr) => !linked.has(pr.ref) && !pr.needsOwner);
   const inProgress = [
     ...working.map((task) => `- ${taskLine(task, input.now, ref, { prs: folded(task) })}`),
     ...(otherPrs.length > 0 ? [`Other PRs: ${otherPrs.map((pr) => `${ref(pr)} ${pr.state}`).join("; ")}`] : []),

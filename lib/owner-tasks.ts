@@ -3,19 +3,21 @@ import type { DeliveryRecord } from "./pr-delivery.ts";
 
 /** One piece of work the owner asked for, tracked until it closes. A reply to the owner
  * never closes it: replying and finishing are separate facts. */
-export type TaskState = "working" | "needs_you" | "ready" | "merged" | "live" | "done" | "dropped";
+export type TaskState = "working" | "needs_you" | "ready" | "check" | "merged" | "live" | "done" | "dropped";
 
 export const TASK_TRANSITIONS: Record<TaskState, readonly TaskState[]> = {
-  working: ["needs_you", "ready", "merged", "live", "done", "dropped"],
-  needs_you: ["working", "ready", "merged", "live", "done", "dropped"],
-  ready: ["working", "needs_you", "merged", "live", "done", "dropped"],
+  working: ["needs_you", "ready", "check", "merged", "live", "done", "dropped"],
+  needs_you: ["working", "ready", "check", "merged", "live", "done", "dropped"],
+  ready: ["working", "needs_you", "check", "merged", "live", "done", "dropped"],
+  // Every crew finished without proving a delivery: the captain checks the work, then closes or restarts it.
+  check: ["working", "needs_you", "ready", "merged", "live", "done", "dropped"],
   merged: ["live", "done"],
   live: [],
   done: [],
   dropped: [],
 };
 
-export const OPEN_TASK_STATES: readonly TaskState[] = ["working", "needs_you", "ready"];
+export const OPEN_TASK_STATES: readonly TaskState[] = ["working", "needs_you", "ready", "check"];
 // Merged is closed for the owner but still waits for deploy evidence to become live.
 const RECONCILED: readonly TaskState[] = [...OPEN_TASK_STATES, "merged"];
 export const STALE_TASK_MS = 24 * 60 * 60_000;
@@ -97,6 +99,7 @@ const STATE_WORDS: Record<TaskState, string> = {
   working: "working",
   needs_you: "needs you",
   ready: "ready for you",
+  check: "finished, check",
   merged: "merged",
   live: "live",
   done: "done",
@@ -109,6 +112,43 @@ export function taskLine(task: OwnerTask, now: number): string {
   return `- ${task.id}${project} · ${clip(task.title, 70)} — ${STATE_WORDS[task.state]}, ${formatAge(now - task.createdAt)}${stale}${task.backfilled ? " · backfilled" : ""}`;
 }
 
+/** One spelling per project: the first word, matched without case. "Cyndra SaaS" and "Cyndra" are one project. */
+const projectKey = (label: string) => label.trim().split(/\s+/)[0]!.toLowerCase();
+
+export function sameProject(a: string | null, b: string | null): boolean {
+  return a !== null && b !== null && projectKey(a) === projectKey(b);
+}
+
+export function projectName(label: string | null, known: readonly (string | null)[]): string | null {
+  const name = label?.trim().split(/\s+/)[0];
+  if (!name) return null;
+  return known.find((other) => other !== null && projectKey(other) === name.toLowerCase()) ?? name;
+}
+
+/** "Safi: legend dashes" under project Safi reads "Legend dashes". */
+export function taskTitle(title: string, project: string | null): string {
+  const clean = title.replace(/\s+/g, " ").trim().slice(0, 200);
+  if (!project) return clean;
+  const word = new RegExp(`^${projectKey(project).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b[\\s:·—-]*`, "i");
+  const rest = clean.replace(word, "");
+  return rest === "" || rest === clean ? clean : rest[0]!.toUpperCase() + rest.slice(1);
+}
+
+/** How a crew left: delivered means it reported DONE or its work landed. */
+export type CrewFinish = { delivered: boolean; outcome: string };
+
+/** The state a task takes when its last crew finishes, or null to leave it. Pull requests decide
+ * when the task has any; without one, a delivered crew closes it and any other end needs a check. */
+export function finishedState(task: OwnerTask, records: readonly DeliveryRecord[], finish: CrewFinish): TaskMove | null {
+  if (!isOpenTask(task)) return null;
+  const proved = stateFromPrs(linkedPrs(task, records));
+  if (proved === "merged" || proved === "live") return { to: proved, reason: finish.outcome };
+  if (proved !== null) return null;
+  return finish.delivered
+    ? { to: "done", reason: finish.outcome || "Crew reported done" }
+    : { to: "check", reason: finish.outcome || "Crew retired without reporting done" };
+}
+
 export type OwnerTasks = {
   /** Open one task per job. Several tasks may share an owner message; a retried dispatch
    * (same crew) or a repeated open (same title and message) returns the task it already has. */
@@ -118,6 +158,13 @@ export type OwnerTasks = {
   openByRef(captain: string, ref: string): OwnerTask[];
   move(id: string, captain: string, move: TaskMove, at: number): OwnerTask;
   linkPr(id: string, captain: string, pr: string, at: number): OwnerTask;
+  /** Put another crew on an existing task. Work restarts, so an open task goes back to working. */
+  attach(id: string, captain: string, input: { crewId: string; sourceRefs: readonly string[]; at: number }): OwnerTask;
+  /** The task, open or closed, that already holds one of these PRs. */
+  holding(captain: string, prs: (pr: string, task: OwnerTask) => boolean): OwnerTask | undefined;
+  /** A crew finished. When no other crew of its task still runs, settle the task. */
+  finishCrew(captain: string, crewId: string, finish: CrewFinish, running: (crewId: string) => boolean,
+    recordsFor: (task: OwnerTask) => readonly DeliveryRecord[], at: number): OwnerTask | undefined;
   /** Move each open task to the state its pull requests prove. Returns the tasks that changed. */
   reconcile(captain: string, recordsFor: (task: OwnerTask) => readonly DeliveryRecord[], at: number): OwnerTask[];
 };
@@ -157,7 +204,8 @@ export function createOwnerTasks(db: Database): OwnerTasks {
   return {
     open(input) {
       return db.transaction(() => {
-        const title = input.title.replace(/\s+/g, " ").trim().slice(0, 200);
+        const project = projectName(input.project, list(input.captain, { includeClosed: true }).map((task) => task.project));
+        const title = taskTitle(input.title, project);
         const existing = input.crewId
           ? list(input.captain, { includeClosed: true }).find((task) => task.crewIds.includes(input.crewId!))
           : list(input.captain).find((task) => task.crewIds.length === 0 && task.title === title && task.sourceRefs.some((ref) => input.sourceRefs.includes(ref)));
@@ -172,7 +220,7 @@ export function createOwnerTasks(db: Database): OwnerTasks {
         const task: OwnerTask = {
           id: `T${seq}`,
           captain: input.captain,
-          project: input.project,
+          project,
           title,
           sourceRefs: [...new Set(input.sourceRefs)],
           state: "working",
@@ -201,6 +249,28 @@ export function createOwnerTasks(db: Database): OwnerTasks {
         const task = owned(id, captain);
         if (task.prs.includes(pr)) return task;
         return save({ ...task, prs: [...task.prs, pr], updatedAt: at });
+      })();
+    },
+    attach(id, captain, input) {
+      return db.transaction(() => {
+        const task = owned(id, captain);
+        const crewIds = task.crewIds.includes(input.crewId) ? task.crewIds : [...task.crewIds, input.crewId];
+        const sourceRefs = [...new Set([...task.sourceRefs, ...input.sourceRefs])];
+        const restarted = isOpenTask(task) && task.state !== "working" ? moveTask(task, { to: "working" }, input.at) : task;
+        if (restarted === task && crewIds === task.crewIds && sourceRefs.length === task.sourceRefs.length) return task;
+        return save({ ...restarted, crewIds, sourceRefs, updatedAt: input.at });
+      })();
+    },
+    holding(captain, prs) {
+      const tasks = list(captain, { includeClosed: true });
+      return tasks.find((task) => isOpenTask(task) && task.prs.some((pr) => prs(pr, task))) ?? tasks.find((task) => task.prs.some((pr) => prs(pr, task)));
+    },
+    finishCrew(captain, crewId, finish, running, recordsFor, at) {
+      return db.transaction(() => {
+        const task = list(captain, { includeClosed: true }).find((item) => item.crewIds.includes(crewId));
+        if (!task || task.crewIds.some((other) => other !== crewId && running(other))) return task;
+        const move = finishedState(task, recordsFor(task), finish);
+        return move === null ? task : save(moveTask(task, move, at));
       })();
     },
     reconcile(captain, recordsFor, at) {

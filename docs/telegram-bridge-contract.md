@@ -141,7 +141,7 @@ Tap a question's button or reply to it to answer.
 - PR [<repo>#<n>](<PR url>) <PR title> · merged
 
 🔧 In progress (<N>)
-- T13 <project> · <task title> · <age> · [<repo>#<n>](<PR url>) on hold (do not merge) · stale 2 d
+- T13 <project> · <task title> · <age> · [<repo>#<n>](<PR url>) on hold · stale 2 d
 Other PRs: [<repo>#<n>](<PR url>) <state>; [<repo>#<n>](<PR url>) <state>
 ```
 

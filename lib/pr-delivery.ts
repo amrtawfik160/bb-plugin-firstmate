@@ -41,19 +41,21 @@ export function canonicalPr(url: string) {
 export function deliveryLine(r: DeliveryRecord) {
   return `${r.id} [${r.status}${r.freshness === 'stale' ? ', stale' : ''}${r.ownerNeeded ? ', owner needed' : ''}] owner=${r.owner ?? 'unassigned'} ${r.url}\n  ${r.deliverySatisfiedAt ? 'Agreed delivery satisfied; ' : ''}${r.blocker || 'No known blocker'}. Next: ${r.nextAction}${(r.failures ?? []).filter(f=>f.resolvedAt===null).map(f=>`\n  ${f.id}: ${f.name} ${f.url} — ${f.accounting ? `${f.accounting.scope} follow-up task=${f.accounting.taskId} worker=${f.accounting.worker}` : `unaccounted; author=${r.workers.at(-1) ?? 'unknown'}`}`).join('')}`;
 }
-/** One open pull request on the owner's board; `state` is already plain words. */
-export type BoardPr = { ref: string; url: string; title?: string; state: string; openedAt: number };
-/** One plain owner-facing state per tracked status; null leaves the PR off the board (merged or closed). */
+/** One open pull request on the owner's board; `state` is already plain words.
+ * `needsOwner` is true when the owner must act: a lost manager, or a merge only the owner approves. */
+export type BoardPr = { ref: string; url: string; title?: string; state: string; needsOwner: boolean; openedAt: number };
+/** One plain owner-facing state per tracked status; null leaves the PR off the board (merged or closed).
+ * Nobody asks the owner to review, so passing checks without a hold read "ready to merge". */
 const BOARD_PR_STATE: Record<DeliveryStatus, string | null> = {
   'draft': 'draft',
   'waiting-checks': 'checks running',
-  'failing-checks': 'checks failing',
+  'failing-checks': 'checks failed',
   'changes-requested': 'changes requested',
-  'on-hold': 'on hold (do not merge)',
+  'on-hold': 'on hold',
   'changed-since-hold': 'changed since hold, needs a check',
-  'waiting-review': 'waiting for review',
-  'waiting-native-gates': 'waiting for review',
-  'pr-delivered': 'waiting for review',
+  'waiting-review': 'ready to merge',
+  'waiting-native-gates': 'ready to merge',
+  'pr-delivered': 'ready to merge',
   'waiting-approval': 'ready to merge',
   'ready-to-merge': 'ready to merge',
   'merged-needs-verification': null,
@@ -64,9 +66,11 @@ const BOARD_PR_STATE: Record<DeliveryStatus, string | null> = {
 /** The open PRs to show the owner. A PR that needs a new manager is waiting on the owner. */
 export function boardPullRequests(records: readonly DeliveryRecord[]): BoardPr[] {
   return records.flatMap((r) => {
-    const state = BOARD_PR_STATE[r.status];
+    // A PR-only delivery keeps its status while checks run; its blocker says so.
+    const state = r.status === 'pr-delivered' && r.blocker !== '' ? 'checks running' : BOARD_PR_STATE[r.status];
     if (state === null || state === undefined || r.forgeState === 'merged' || r.forgeState === 'closed') return [];
-    return [{ ref: r.id, url: r.url, ...(r.title ? { title: r.title } : {}), state: r.ownerNeeded ? 'waiting on you' : state, openedAt: r.openedAt ?? r.updatedAt }];
+    const needsOwner = r.ownerNeeded || r.status === 'waiting-approval' || r.status === 'ready-to-merge';
+    return [{ ref: r.id, url: r.url, ...(r.title ? { title: r.title } : {}), state: r.ownerNeeded ? 'waiting on you' : state, needsOwner, openedAt: r.openedAt ?? r.updatedAt }];
   });
 }
 /** How often a PR without a live manager is read on GitHub, so a merge or close
