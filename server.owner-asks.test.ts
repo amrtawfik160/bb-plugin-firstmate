@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import plugin from "./server.ts";
-import { createOwnerAsks } from "./lib/owner-asks.ts";
+import { createOwnerAsks, formatAskCard } from "./lib/owner-asks.ts";
 async function captainHost() {
   const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: ["captain", "firstmate"] });
   await host.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
@@ -99,14 +99,12 @@ test("captain can correct an answered ask and reopen it", async () => {
 });
 
 
-test("firstmate_ask requires one line of owner impact", async () => {
+test("firstmate_ask opens a card when the captain leaves out impact", async () => {
   const host = await captainHost();
   try {
-    const tool = host.harness.inspection.registrations.agentTools.find((item) => item.name === "firstmate_ask")!;
-    for (const impact of [undefined, "", "Customer access.\nAnother line."]) {
-      const result = await tool.execute({ question: "Find addresses?", kind: "question", impact }, { threadId: "thr_cap" } as never);
-      assert.equal(typeof result === "object" && result !== null && "isError" in result && result.isError, true);
-    }
-    assert.equal(createOwnerAsks(host.bb.storage.database()).listOpen("thr_cap").length, 0);
+    const result = await host.harness.behavior.callAgentTool("firstmate_ask", { question: "Decision 12: switch the brands audit to weekly?", kind: "question", options: [{ label: "Weekly" }, { label: "Keep daily" }] }, { threadId: "thr_cap" });
+    assert.equal(typeof result === "object" && result !== null && "isError" in result, false);
+    const [ask] = createOwnerAsks(host.bb.storage.database()).listOpen("thr_cap");
+    assert.equal(formatAskCard(ask!), "❓ Question\n\nDecision 12: switch the brands audit to weekly?\nA. Weekly\nB. Keep daily");
   } finally { await host.harness.lifecycle.dispose(); }
 });
