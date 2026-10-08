@@ -611,13 +611,17 @@ const OUTCOME_LINE_REQUEST = [
 export function fmWatchOwnerBeatTtl(interval: number): number {
   return Math.max(600, interval * 30);
 }
-// How often the on-host keeper re-arms fm-watch. fm-watch exits on every actionable wake and
-// must be re-armed; the keeper (not the plugin's slow cycle) owns that, so the gap after a wake
-// is bounded by this, not by the supervision interval + grace.
+// The on-host keeper's back-off after an arm that exits within seconds. fm-watch exits on every
+// actionable wake and must be re-armed; the keeper (not the plugin's slow cycle) owns that and
+// re-arms about a second after a normal exit, not after the supervision interval + grace.
 export function fmWatchKeeperInterval(graceSec: number): number {
   const grace = Math.max(30, Math.trunc(graceSec));
   return Math.max(10, Math.min(20, Math.floor(grace / 3)));
 }
+
+// An arm that exits sooner than this failed or had nothing to follow, so the keeper backs off
+// for the full interval before the next re-arm instead of re-arming at once.
+const FM_WATCH_ARM_FAST_EXIT_SEC = 5;
 
 // The watch log keeps the newest FM_WATCH_LOG_KEEP bytes once it passes FM_WATCH_LOG_MAX.
 // Every writer appends (O_APPEND), so truncating in place is safe for open writers.
@@ -625,8 +629,8 @@ export const FM_WATCH_LOG_MAX = 1_048_576;
 export const FM_WATCH_LOG_KEEP = 262_144;
 
 // The durable keeper: a standalone bash script (written to the host as a FILE via writeHostFile
-// so there is no shell-quoting hazard). It records its own pid and re-arms fm-watch every
-// `interval`s. fm-watch-arm.sh is idempotent (attaches to a live watcher) and can block for
+// so there is no shell-quoting hazard). It records its own pid and re-arms fm-watch as soon
+// as the previous arm exits, or after `interval`s when that arm exited within seconds. fm-watch-arm.sh is idempotent (attaches to a live watcher) and can block for
 // hours while it follows one, so the keeper runs it in the background and keeps checking its
 // own exit conditions: the pidfile still names it (teardown removes it, a successor
 // overwrites it) and the owner beat is fresh. On exit it stops its re-arm and removes the
@@ -638,6 +642,7 @@ export function fmWatchKeeperScript(hostId: string, fmHome: string, interval: nu
   const log = `${fmHome}/state/.bb-watch-arm.log`;
   const ownerBeat = `${fmHome}/${FM_WATCH_OWNER_BEAT}`;
   const ttl = fmWatchOwnerBeatTtl(interval);
+  const poll = Math.min(1, interval);
   return [
     "#!/bin/bash",
     "# BB firstmate fm-watch keeper (managed; do not edit).",
@@ -695,15 +700,20 @@ export function fmWatchKeeperScript(hostId: string, fmHome: string, interval: nu
     // supervision. Check on every re-arm and record FM_MIRROR_STALE into the watch log;
     // the supervision poll runs the same guard and reports it. Cheap (~6ms: sed + git rev-parse).
     `  ( ${fmMirrorStaleGuard(fmHome)} ) >> "$LOG" 2>&1 || exit 1`,
+    "  ARM_START=$SECONDS",
     '  "$ARM" >> "$LOG" 2>&1 &',
     "  ARM_PID=$!",
+    // Poll the arm every second: a captain turn woken by the watcher's exit often ends within
+    // seconds, and the Stop guard finds no watcher while the keeper is still asleep.
     '  while kill -0 "$ARM_PID" 2>/dev/null; do',
     "    owned || exit 0",
-    `    sleep ${interval}`,
+    `    sleep ${poll}`,
     "  done",
     '  wait "$ARM_PID" 2>/dev/null',
     "  ARM_PID=",
-    `  sleep ${interval}`,
+    // An arm that ran for a while followed a watcher that exited on a wake: re-arm at once. An
+    // arm that exited within seconds failed or found nothing to do: back off so it cannot spin.
+    `  if [ $(( SECONDS - ARM_START )) -lt ${FM_WATCH_ARM_FAST_EXIT_SEC} ]; then sleep ${interval}; else sleep ${poll}; fi`,
     "done",
   ].join("\n");
 }
