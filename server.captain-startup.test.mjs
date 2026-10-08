@@ -3,6 +3,7 @@ import test from 'node:test';
 import {spawnSync} from 'node:child_process';
 import {mkdirSync,writeFileSync,readFileSync,rmSync} from 'node:fs';
 import {join} from 'node:path';
+import {createHash} from 'node:crypto';
 import {createFakePluginHost,makeThreadResponse} from '@get-bb/plugin-sdk/testing';
 import plugin from './server.ts';
 import {boundedCaptainStartup} from './lib/captain-startup.ts';
@@ -39,6 +40,18 @@ for(const pin of pins)for(const entry of ['cli','tool'])test(`captain ${entry} f
  const second=f.seen.slice(prior);assert.equal(second.filter(c=>c.includes('git clone')).length,0);assert.equal(second.filter(c=>c.startsWith('python3 ')&&c.includes('install-bb-backend.py')&&!c.includes('--verify')&&!c.includes('FM_OVERLAY_LOCAL')).length,0,second.join('\n---\n'));assert.equal(second.filter(c=>c.includes('FM_HEAD=')||c.includes('captain-hooks-ok')).length,0);assert.ok(second.some(c=>c.includes('--verify')));
  const contract=await f.host.harness.behavior.runCli(['contract'],ctx);assert.equal(contract.exitCode,0,contract.stderr);assert.ok(f.host.harness.sdk.callsTo('files.read').every(c=>c[0].path.startsWith(f.home+'/')));
  const startup=await f.host.harness.behavior.runCli(['fm','session-start','--json'],ctx);assert.equal(startup.exitCode,0,startup.stderr);assert.ok(JSON.parse(startup.stdout).command.includes(f.home));assert.equal(f.host.harness.sdk.callsTo('threads.spawn').length,0);
+ }finally{await f.clean();}
+});
+test('a changed captain hook file is installed again on the next deck',async()=>{
+ const f=await setup();try{
+ const deck=async()=>{const r=await f.host.harness.behavior.runCli(['deck','--json'],ctx);assert.equal(r.exitCode,0,r.stderr);};
+ await deck();
+ const hook=readFileSync('overlay/bin/bb-captain-hook.sh');const installed=join(f.runtime,'.bb-firstmate/bin/bb-captain-hook.sh');
+ const key=`captain-adapter-setup:${ctx.threadId}`;const stamp=JSON.parse(await f.host.bb.storage.kv.get(key));
+ const at=stamp.indexOf(createHash('sha256').update(hook).digest('hex'));assert.notEqual(at,-1,'the setup stamp records the hook file');
+ stamp[at]='hash-of-the-previous-hook';await f.host.bb.storage.kv.set(key,JSON.stringify(stamp));writeFileSync(installed,'previous hook\n');
+ const prior=f.seen.length;await deck();
+ assert.equal(f.seen.slice(prior).filter(c=>c.includes('captain-hooks-ok')).length,1);assert.deepEqual(readFileSync(installed),hook);
  }finally{await f.clean();}
 });
 for(const failure of ['clone','bootstrap'])test(`failed ${failure} aborts captain setup without a watcher or claimed readiness`,async()=>{
