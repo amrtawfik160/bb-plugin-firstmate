@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
+import { createFakePluginHost, makePluginAgentConfigurationContext, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import plugin from "./server.ts";
+import { manifestSkillIds } from "./scripts/plugin-skill-fixture.mjs";
 import { createInboundLedger } from "./lib/inbound-ledger.ts";
 import { createOwnerTasks } from "./lib/owner-tasks.ts";
 import { createDeliveries } from "./lib/pr-delivery.ts";
@@ -15,7 +16,7 @@ const capCtx = { threadId: "thr_cap", projectId: "proj_1" } as never;
 const envelope = readFileSync(new URL("./test/fixtures/envelopes/live-owner.txt", import.meta.url), "utf8");
 
 async function captainHost() {
-  const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: ["captain", "firstmate"] });
+  const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: manifestSkillIds(new URL(".", import.meta.url).pathname) });
   await host.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
   await plugin(host.bb);
   await host.harness.behavior.setSettings({ fmReliability: JSON.stringify({ inboundLedger: "on", telegramThreading: "on", asyncDispatch: "on" }) });
@@ -90,14 +91,14 @@ test("Oct 7 repro: a reply of only 'Started' answered the owner message, and now
   }
 });
 
-test("a dispatch in a turn started by an owner message must carry that message's ref or name another origin", async () => {
+test("a dispatch in an owner-started turn without the owner's ref or another origin runs with a warning and opens no task", async () => {
   const host = await captainHost();
   try {
     await ownerSays(host, "2202", "Run the Brands audit");
-    const refused = await dispatch(host, { task: "Run the Brands audit" });
-    assert.ok(isError(refused));
-    assert.equal(text(refused), 'This turn started from owner message tg:200:2202. If this job is the owner\'s, pass sourceRefs: ["tg:200:2202"]. If it came from elsewhere, pass origin: {"kind":"thread","threadId":"<thread>"} or {"kind":"captain","reason":"<why>"}.');
-    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
+    const untagged = await dispatch(host, { task: "Run the Brands audit", taskId: "brands-audit" });
+    assert.ok(!isError(untagged), text(untagged));
+    assert.equal(text(untagged), 'Reserved crew brands-audit. Spawn continues in the background.\nWarning: no owner task tracks this crew. This turn started from owner message tg:200:2202. If this job is the owner\'s, pass sourceRefs: ["tg:200:2202"]; for a follow-up, pass taskRef; otherwise pass origin.');
+    assert.deepEqual(createOwnerTasks(host.bb.storage.database()).list("thr_cap"), []);
     await crewPings(host);
     const after = await dispatch(host, { task: "Rebase the docs branch", taskId: "docs-rebase" });
     assert.equal(text(after), "Reserved crew docs-rebase. Spawn continues in the background.", "a turn a crew started needs no owner ref");
@@ -454,5 +455,19 @@ test("a dispatch naming an open task in title or task joins it unless taskRef ov
       assert.deepEqual(tasks.get("T2")?.crewIds, ["explicit-ref"]);
       assert.equal(tasks.list("thr_cap").length, 2);
     } finally { await host.harness.lifecycle.dispose(); }
+  }
+});
+
+test("Oct 8 repro: a captain that receives Telegram messages is told to re-read the Telegram reference after each compaction", async () => {
+  const host = await captainHost();
+  try {
+    const instructions = async () => (await host.harness.behavior.resolveAgentConfiguration(
+      makePluginAgentConfigurationContext({ pluginMetadata: { captain: "true" }, thread: { id: "thr_cap" } }))).instructions ?? "";
+    const rule = "After each context compaction, re-read the captain skill's Telegram reference before you answer the owner.";
+    assert.equal((await instructions()).includes(rule), false, "a captain with no Telegram messages gets no Telegram rule");
+    await ownerSays(host, "2230", "Status?");
+    assert.equal((await instructions()).includes(rule), true);
+  } finally {
+    await host.harness.lifecycle.dispose();
   }
 });
