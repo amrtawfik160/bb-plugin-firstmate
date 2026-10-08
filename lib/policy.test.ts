@@ -25,6 +25,8 @@ import {
   verdictMarker,
   idleVerdictPresentation,
   isWaitingYield,
+  waitingPauseLine,
+  statusLineVerb,
   protocolNudgeText,
 } from "./policy.ts";
 
@@ -340,6 +342,20 @@ test("verdictMarker gives a distinct glyph per verdict", () => {
   assert.equal(verdictMarker("DONE"), "✅ DONE");
   assert.equal(verdictMarker("BLOCKED"), "🚧 BLOCKED");
   assert.equal(verdictMarker("FAILED"), "❌ FAILED");
+});
+
+test("a chat-only WAITING: yield becomes a native paused line unless the status file already declares", () => {
+  const line = waitingPauseLine("ACK\n\nWAITING: CI on PR #12\nmore detail", ["working [at=5]: started", "note: x"], 1700000000);
+  assert.equal(line, "paused [at=1700000000]: WAITING (chat): CI on PR #12");
+  assert.equal(statusLineVerb(line!), "paused");
+  assert.equal(waitingPauseLine("WAITING: CI", [], 9), "paused [at=9]: WAITING (chat): CI", "a worker that never wrote a status line");
+  for (const declared of ["paused [at=5]: CI on PR #12", "needs-decision: pick one", "blocked: no key", "done: shipped", "failed: build"]) {
+    assert.equal(waitingPauseLine("WAITING: CI", ["working: started", declared], 9), null, declared);
+  }
+  assert.equal(waitingPauseLine("WAITING: CI", ["paused [at=5]: WAITING (chat): CI", "note: PR observation"], 9), "paused [at=9]: WAITING (chat): CI",
+    "fm-watch ends a pause at any later event, so a note after it needs a new declaration");
+  assert.equal(waitingPauseLine("Still waiting on CI.", [], 9), null, "prose is not a yield");
+  assert.equal(waitingPauseLine("DONE: shipped", [], 9), null);
 });
 
 test("WAITING: is a yield, not a verdict; the first protocol line decides", () => {
