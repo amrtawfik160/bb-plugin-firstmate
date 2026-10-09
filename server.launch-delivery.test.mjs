@@ -402,7 +402,7 @@ sys.exit(int(open(os.path.join(os.path.dirname(__file__),"exit")).read()))
   host.harness.sdk.stub('environments.get',async()=>({id:'env_wt',hostId:'host_1',status:'ready',path:dir,branchName:'owned-task'}));
   host.harness.sdk.stub('threads.send',async()=>({delivery:'queued'}));host.harness.sdk.stub('threads.queuedMessages.list',async()=>[]);
   let n=0;const commands=new Map(),outputs=new Map();
-  host.harness.sdk.stub('terminals.create',async args=>{const id=`pty${++n}`;commands.set(id,args.start.command);outputs.set(id,runPty(args.start.command.replaceAll('gh pr ',`${dir}/gh pr `)));return{id};});
+  host.harness.sdk.stub('terminals.create',async args=>{const id=`pty${++n}`;commands.set(id,args.start.command);outputs.set(id,runPty(args.start.command.replaceAll('gh pr ',`${dir}/gh pr `).replace(/; sleep 86400$/, '')));return{id};});
   host.harness.sdk.stub('terminals.get',async()=>({status:'exited'}));host.harness.sdk.stub('terminals.close',async()=>({}));
   host.harness.sdk.stub('terminals.output',async({terminalId})=>({nextSeq:1,chunks:[{dataBase64:Buffer.from(outputs.get(terminalId)).toString('base64')}]}));
   await host.harness.behavior.runSchedule('pr-delivery-follow-up');

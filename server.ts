@@ -437,16 +437,16 @@ function parseHostRc(raw: string): { exitCode: number; output: string } | null {
 }
 
 // Wrap a command so its exit code is recoverable from terminal scrollback. The BB
-// host terminal is a PTY; we run the command and print a parseable RC marker. The
-// terminal then exits on its own: scrollback stays readable after exit, and a caller
-// killed mid-command (a BB server restart) never leaves a terminal open. Bulky or
-// arbitrary payloads never travel as terminal stdin — the PTY line discipline (canonical mode) buffers+echoes input without delivering it to
+// host terminal is a PTY; we run the command, print a parseable RC marker, then
+// `sleep` so the marker survives until we read it (the terminal is force-closed by
+// the caller). Bulky/arbitrary payloads never travel as terminal stdin — the PTY
+// line discipline (canonical mode) buffers+echoes input without delivering it to
 // the reading process, so writes hung until timeout; payloads are staged to a host
 // file via writeHostBytes and fed with `< file` instead.
 function wrapHostCommand(command: string): string {
   const assigned = `__fm_cmd=${shQuote(command)}`;
   const run = '"${SHELL:-/bin/bash}" -lc "$__fm_cmd"';
-  const script = `${assigned}; set +e; ${run}; __fm_ec=$?; printf '\\n${HOST_RC_MARKER}:%s\\n' "$__fm_ec"`;
+  const script = `${assigned}; set +e; ${run}; __fm_ec=$?; printf '\\n${HOST_RC_MARKER}:%s\\n' "$__fm_ec"; sleep 86400`;
   if (script.length > HOST_COMMAND_MAX) {
     throw new Error(`Host command too long (${script.length} > ${HOST_COMMAND_MAX}). Stage bulky payloads with writeHostBytes.`);
   }
