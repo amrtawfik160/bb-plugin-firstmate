@@ -4,9 +4,22 @@ import { spawnSync } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { crewPlaybook, crewSkillBlock, PLAYBOOK_CHOICES, skillRoutingLinkScript } from "./crew-contract.ts";
+import { BRIEF_SKILLS, crewPlaybook, crewSkillBlock, crewSkillRoot, PLAYBOOK_CHOICES, skillCheckScript, skillRoutingLinkScript } from "./crew-contract.ts";
 
 const HOME = homedir();
+
+const IN_PLACE_OF_A_SKIP = [
+  "Do these steps this way and report them as ✓, not as a skip:",
+  "- A step or skill that spawns a sub-agent, an extra reviewer or another model (delegate, architect, interrogate, how, why, no-comments): do it yourself in this session with the model you were given. Add \"(done in session)\".",
+  "- A Cursor-only tool: for create-skill read writing-for-agents; for /loop repeat the step yourself; for origin or gt use gh-axi.",
+  "- Opening a PR, merge and deploy: do what the brief's delivery contract says. If proof needs a deploy you may not run, prove it on the nearest surface you can run and name what is left for Firstmate.",
+];
+
+const OBSTACLES = [
+  "### Obstacles (Firstmate adds this to every brief)",
+  "Work through an ordinary obstacle yourself: retry with a smaller query or pagination, restore or commit a change your own install made, use another tool, or wait and retry. This replaces any \"same obstacle twice\" rule in this brief.",
+  "Report blocked only for what only the captain or the owner can give: a secret, an approval, a decision, access that was withheld, or a destructive or irreversible step. Every stop rule in this brief still applies.",
+];
 
 test("the playbook comes from the dispatch title, not the task body", () => {
   const body = "Fix the failing error, then deploy and merge.";
@@ -50,9 +63,10 @@ test("a feature brief gives full paths, the step checklist, no-comments and the 
     `3. Follow \`${HOME}/.claude/skills/poteto-mode/playbooks/feature.md\`.`,
     "4. Copy every step of that playbook into your to-do list, before any other to-do.",
     "5. Your final report lists each playbook step as \"✓ <step>\" or \"skip: <step>: <reason>\".",
-    "When a playbook step says to delegate to a sub-agent, do that step yourself in this session and report it as ✓ with \"(done in session)\", not as a skip.",
+    ...IN_PLACE_OF_A_SKIP,
     "Save each screenshot as its own full-size PNG file. Never combine, stitch or downscale screenshots; link each file separately.",
     `Before you open a PR, run /no-comments (\`${HOME}/.claude/skills/no-comments/SKILL.md\`) over your diff.`,
+    ...OBSTACLES,
   ].join("\n"));
 });
 
@@ -62,6 +76,7 @@ test("a bug-fix brief asks for the failing-test commit and proof on the real pro
   assert.ok(block.endsWith([
     "Bug-fix proof: your final report gives the commit id of the failing test, committed before the fix.",
     "It also gives proof that the fix works on the real product, or \"not possible: <reason>\".",
+    ...OBSTACLES,
   ].join("\n")), block);
 });
 
@@ -94,7 +109,7 @@ test("every brief says to load skills as files, names the skill-routing file and
     const block = crewSkillBlock({ shape: "ship", title: "Fix agent computer feature", task: "", providerId });
     assert.ok(block.includes("Load a skill by reading that file. Do not rely on a Skill tool for pstack skills; they are user-invocable only."), block);
     assert.ok(block.includes(`1. Read \`${HOME}/${root}/skill-routing/SKILL.md\`.`), block);
-    assert.ok(block.includes("When a playbook step says to delegate to a sub-agent, do that step yourself in this session and report it as ✓ with \"(done in session)\", not as a skip."), block);
+    assert.ok(block.includes(IN_PLACE_OF_A_SKIP.join("\n")), block);
     assert.ok(block.includes("spawn no sub-agents"), block);
   }
   const deploy = crewSkillBlock({ shape: "ship", title: "Deploy + merge #2155", task: "" });
@@ -178,5 +193,88 @@ test("the captain Telegram guide gives the same screenshot rule as the crew brie
   assert.ok(guide.includes("Save each screenshot as its own full-size PNG file. Never combine, stitch or downscale screenshots; link each file separately."), guide);
   for (const shape of ["ship", "scout"] as const) {
     assert.ok(crewSkillBlock({ shape, title: "Redesign Import from screenshots", task: "" }).includes("Never combine, stitch or downscale screenshots; link each file separately."), shape);
+  }
+});
+
+test("every brief tells a worker to work through an ordinary obstacle and when blocked is allowed", () => {
+  for (const [shape, title] of [["ship", "Add a CSV export"], ["ship", "Deploy + merge #2155"], ["scout", "Why does Telegram stall"]] as const) {
+    const block = crewSkillBlock({ shape, title, task: "", providerId: "codex" });
+    assert.ok(block.endsWith(OBSTACLES.join("\n")), block);
+  }
+});
+
+const ROUTING = readFileSync(new URL("../entry-skills/skill-routing/SKILL.md", import.meta.url), "utf8");
+
+function routingTableNames(): { skills: string[]; playbooks: string[] } {
+  const names = ROUTING.split("\n").filter((line) => /^\| [^|]+ \| .+ \|$/.test(line) && !line.startsWith("| Task ") && !line.startsWith("|---"))
+    .flatMap((line) => [...line.split("|")[2]!.matchAll(/`([^`]+)`/g)].map((m) => m[1]!));
+  return {
+    skills: names.filter((name) => !name.endsWith(".md") && name !== "principle-*"),
+    playbooks: names.filter((name) => name.endsWith(".md")).map((name) => name.slice(0, -3)),
+  };
+}
+
+test("a brief names only skills from the declared table, under the provider's own folder", () => {
+  const declared = new Set<string>(BRIEF_SKILLS);
+  const playbooks = new Set<string>(PLAYBOOK_CHOICES);
+  for (const providerId of ["claude-code", "codex", "acp-grok"]) {
+    const root = crewSkillRoot(providerId);
+    for (const shape of ["ship", "scout"] as const) {
+      for (const playbook of PLAYBOOK_CHOICES) {
+        const block = crewSkillBlock({ shape, title: "x", task: "", providerId, playbook });
+        const paths = [...block.matchAll(/`(\/[^`]+)`/g)].map((m) => m[1]!);
+        assert.ok(paths.length >= 3, block);
+        for (const path of paths) {
+          assert.ok(path.startsWith(`${root}/`), `${providerId} brief names a path outside ${root}: ${path}`);
+          const [skill, ...rest] = path.slice(root.length + 1).split("/");
+          assert.ok(skill === "<name>" || declared.has(skill!), `${providerId} brief names undeclared skill: ${path}`);
+          if (rest[0] === "playbooks") assert.ok(playbooks.has(rest[1]!.replace(/\.md$/, "")), `undeclared playbook: ${path}`);
+          else assert.deepEqual(rest, ["SKILL.md"], path);
+        }
+        for (const [, name] of block.matchAll(/(?:^|[\s(])\/([a-z][a-z-]+)\b/gm)) {
+          assert.ok(declared.has(name!) || name === "loop", `${providerId} brief names undeclared slash skill: /${name}`);
+        }
+        for (const [, name] of block.matchAll(/for ([a-z-]+) read ([a-z-]+)/g)) assert.ok(!declared.has(name!), `${name} has a stand-in, so it must not be declared`);
+        for (const [, , standIn] of block.matchAll(/for ([a-z-]+) read ([a-z-]+)/g)) assert.ok(declared.has(standIn!), `stand-in is undeclared: ${standIn}`);
+      }
+    }
+  }
+});
+
+test("the routing table names only declared skills and playbooks", () => {
+  const declared = new Set<string>(BRIEF_SKILLS);
+  const { skills, playbooks } = routingTableNames();
+  assert.ok(skills.length >= 15 && playbooks.length >= 8, "the table parser found the rows");
+  for (const skill of skills) assert.ok(declared.has(skill), `skill-routing names undeclared skill: ${skill}`);
+  for (const playbook of playbooks) assert.ok((PLAYBOOK_CHOICES as readonly string[]).includes(playbook), `skill-routing names undeclared playbook: ${playbook}`);
+  for (const absent of ["diagnose", "create-skill"]) assert.ok(!declared.has(absent), `${absent} is not an installable skill`);
+});
+
+test("the live skill check reports each installed provider's missing skills and playbooks", () => {
+  const home = mkdtempSync(join(tmpdir(), "fm-skill-check-"));
+  try {
+    const install = (root: string, skip: readonly string[]) => {
+      for (const skill of BRIEF_SKILLS) {
+        if (skip.includes(skill)) continue;
+        mkdirSync(join(home, root, skill), { recursive: true });
+        writeFileSync(join(home, root, skill, "SKILL.md"), "x\n");
+      }
+      mkdirSync(join(home, root, "principle-prove-it-works"), { recursive: true });
+      writeFileSync(join(home, root, "principle-prove-it-works/SKILL.md"), "x\n");
+      mkdirSync(join(home, root, "poteto-mode/playbooks"), { recursive: true });
+      for (const playbook of PLAYBOOK_CHOICES) if (playbook !== "none" && !skip.includes(`${playbook}.md`)) writeFileSync(join(home, root, "poteto-mode/playbooks", `${playbook}.md`), "x\n");
+    };
+    install(".claude/skills", []);
+    install(".codex/skills", ["pr", "tdd", "babysit.md"]);
+    mkdirSync(join(home, ".grok"));
+    const result = spawnSync("bash", ["-c", skillCheckScript()], { encoding: "utf8", env: { PATH: process.env.PATH ?? "", HOME: home } });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(result.stdout.trim().split("\n"), [
+      `skills ok: claude-code ${home}/.claude/skills`,
+      `SKILLS_MISSING: codex ${home}/.codex/skills: tdd pr poteto-mode/playbooks/babysit.md`,
+      `SKILLS_MISSING: acp-grok ${home}/.grok/skills: no skills folder`,
+    ]);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
   }
 });

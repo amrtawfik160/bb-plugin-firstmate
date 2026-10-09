@@ -54,6 +54,24 @@ test('crew brief names the browser plugin command that exists, not the absent co
  }finally{rmSync(home,{recursive:true,force:true});}
 });
 
+test('crew brief makes a worker work through ordinary obstacles and keeps every safety stop',()=>{
+ const home=fixture();try {
+  for(const [id,kind,mode,waitless] of [['blocked-ship','ship','direct-PR',false],['blocked-scout','scout','',false],['blocked-pipeline','ship','no-mistakes',true]]) {
+   if(waitless) writeFileSync(join(home,'config/wait-no-turns'),'1\n');
+   const f=scaffold(home,id,kind,mode);const output=ok(render(home,f.source,kind,id,mode));
+   assert.doesNotMatch(output,/same obstacle twice/,'two failures of an ordinary step are not a reason to stop');
+   assert.doesNotMatch(output,/when you are stuck and need help/);
+   assert.ok(output.includes('5. Work through an ordinary obstacle yourself first: retry with a smaller query or pagination, restore or commit a change your own command made (such as an install that rewrote a lockfile), use another tool, or wait and retry. Append `blocked [at=<epoch>]: {what you need}` and stop only for what only firstmate or the owner can give: a secret, an approval, a decision, access that was withheld, or a destructive or irreversible step. Every other stop rule in this brief still applies.'),output);
+   assert.ok(output.includes('   Use `blocked:` only as rule 5 allows.'),output);
+   assert.ok(output.includes('A command that changes tracked files (a dependency install, a code generator) is not source-stable: run it directly, then restore or commit what it changed.'),output);
+   assert.ok(output.includes('append `blocked [at=<epoch>]: launched in primary checkout, not an isolated worktree` to the status file and stop.'),'isolation stop stays');
+   assert.match(output,/6\. If a decision belongs above the implementation worker \(product choices, destructive actions\),\n   append `needs-decision \[at=<epoch>\]: \{summary of options\}` and stop\./,'decision stop stays');
+   assert.ok(output.includes('`blocked [at=<epoch>]: {what you need}` and stop; firstmate arranges it.'),'shared infrastructure stop stays');
+   assert.match(output,/1\. Never push to the default branch/);
+  }
+ }finally{rmSync(home,{recursive:true,force:true});}
+});
+
 test('renderer rejects changed anchors, contradictory legacy output and wrong native mode before printing any prompt',()=>{
  const home=fixture();try {
   const f=scaffold(home,'strict');

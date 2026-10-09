@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
@@ -377,6 +378,15 @@ test("crews are taught to wait in-turn and yield WAITING:, never a false DONE:",
   assert.match(text, /WAITING: <what you are waiting on>/);
   assert.match(text, /Never write DONE: for work that is not done/);
   assert.match(protocolNudgeText(1, 3), /WAITING: <what>/);
+});
+
+test("every BLOCKED outcome line asks for what only the captain or the owner can give", () => {
+  const line = "BLOCKED: <what only the captain or the owner can give>";
+  assert.ok(crewPrompt({ task: "fix login", parentThreadId: "thr_cap", shape: "ship", mode: "direct-PR", isolated: true }).includes(`  ${line}`));
+  assert.ok(protocolNudgeText(1, 3).includes(`●    ${line}`));
+  const server = readFileSync(new URL("../server.ts", import.meta.url), "utf8");
+  assert.ok(server.includes("`  ${BLOCKED_OUTCOME_LINE}`"), "the outcome-line request uses the shared line");
+  for (const source of [server, readFileSync(new URL("./policy.ts", import.meta.url), "utf8")]) assert.ok(!source.includes("<what you need, exactly>"));
 });
 
 test("crews are taught not to leave timers that ping the captain with empty completions", () => {
