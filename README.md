@@ -188,6 +188,7 @@ Each flag in `fmReliability` is off until set, for example
   Work past `maxActiveCrews` (default 10) queues and starts when a slot opens.
   A job that finds its slot taken at spawn time waits the same way. A spawn
   that fails for another reason is reported to the captain.
+  The queue is checked when a crew or captain turn ends and once a minute.
   Only that over-cap work drains automatically. A `firstmate_queue` backlog
   still needs an explicit dispatch. A crew whose status cannot be read keeps
   its slot.

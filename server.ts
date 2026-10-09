@@ -4709,6 +4709,16 @@ export default async function plugin(bb: BbPluginApi) {
     }
     resumeDispatchJobs(owner);
   }
+  // A slot that opens when a crew fails, is stopped or is forgotten ends no crew turn,
+  // so the per-minute pass drains too. One drain at a time, apart from that pass.
+  let queueDrain: Promise<void> | undefined;
+  function drainQueuedDispatchesInBackground(): void {
+    if (queueDrain || launchAbort.signal.aborted) return;
+    queueDrain = drainQueuedDispatches()
+      .catch((error) => bb.log.warn(`queued dispatch drain: ${String(error)}`))
+      .finally(() => { queueDrain = undefined; });
+    trackDispatchJob(queueDrain);
+  }
 
   function reconcileTasks(captain: string, now: number): OwnerTask[] {
     ownerTasks.reconcile(captain, (task) => deliveries.forTasks(task.crewIds, task.prs), now);
@@ -13344,7 +13354,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
   bb.background.schedule("pr-delivery-follow-up", "* * * * *", async () => {
     if (followUpWork || launchAbort.signal.aborted) return;
-    followUpWork=(async()=>{await launchRecoveryPass(launchAbort.signal);resumeDispatchJobs();await deliveryPass(launchAbort.signal);await raceAbort(publishFleet(),launchAbort.signal,STUCK_HOST_CALL_MS);})();
+    followUpWork=(async()=>{await launchRecoveryPass(launchAbort.signal);resumeDispatchJobs();drainQueuedDispatchesInBackground();await deliveryPass(launchAbort.signal);await raceAbort(publishFleet(),launchAbort.signal,STUCK_HOST_CALL_MS);})();
     try {await followUpWork;} finally {followUpWork=undefined;}
   });
   bb.events.on("thread.archived", ({ thread }) => { deliveries.ownerLost(thread.id); });
