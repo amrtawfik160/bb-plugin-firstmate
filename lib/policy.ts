@@ -467,6 +467,9 @@ export function statusProtocolSummary(lines: string[], kind: string = "ship"): s
 
 const TURNEND_RULE = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
 
+// A worker works through ordinary obstacles itself; BLOCKED is for what it cannot get alone.
+export const BLOCKED_OUTCOME_LINE = "BLOCKED: <what only the captain or the owner can give>";
+
 /** Doorbell copy in the upstream turn-end guard banner shape. */
 export function protocolNudgeText(nag: number, max: number): string {
   return [
@@ -476,7 +479,7 @@ export function protocolNudgeText(nag: number, max: number): string {
     "●  A verdict is the marker at the start of the reply, or a standalone line.",
     "●  Re-state the outcome in that protocol. Do not redo the task.",
     "●    DONE: <one-line outcome>",
-    "●    BLOCKED: <what you need, exactly>",
+    `●    ${BLOCKED_OUTCOME_LINE}`,
     "●    FAILED: <what failed + evidence>",
     "●  Still waiting on a long external run (pipeline, CI)? Reply WAITING: <what> instead.",
     `●${TURNEND_RULE}`,
@@ -620,7 +623,7 @@ export function crewPrompt(input: {
     "",
     "Status protocol: when finished, your final message MUST start with exactly one of these lines:",
     "  DONE: <one-line outcome>",
-    "  BLOCKED: <what you need, exactly>",
+    `  ${BLOCKED_OUTCOME_LINE}`,
     "  FAILED: <what failed + evidence>",
     "Then the detail. Keep it sparse: outcomes and blockers only, no progress narration.",
     WAITING_PROTOCOL,

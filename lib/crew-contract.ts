@@ -48,6 +48,35 @@ export function crewSkillRoot(providerId: string | null | undefined): string {
   return `${homedir()}/${SKILL_ROOTS[providerId ?? ""] ?? FALLBACK_SKILL_ROOT}`;
 }
 
+// Every skill a brief, the skill-routing table or a brief-named playbook sends a
+// crew to. A name outside this list fails the brief tests; `skillCheckScript`
+// reports which of these a live host lacks. create-skill is a Cursor built-in
+// with no file, so the brief gives writing-for-agents in its place.
+export const BRIEF_SKILLS = [
+  "skill-routing", "poteto-mode", "no-comments", "diagnosing-bugs", "tdd", "benchmark-checklist", "codebase-design",
+  "improve-codebase-architecture", "grill-with-docs", "to-spec", "to-tickets", "interrogate", "how", "why", "architect",
+  "arena", "prototype", "code-review", "blast-radius", "pr", "unslop", "technical-writing", "writing-for-agents",
+  "zoom-out", "deslop", "figure-it-out", "control-cli", "control-ui",
+] as const;
+
+// Read-only. A provider that is not installed (no parent folder) is skipped.
+export function skillCheckScript(): string {
+  const playbooks = PLAYBOOK_CHOICES.filter((choice) => choice !== "none");
+  return [
+    "check() {",
+    '  p=$1; d="$HOME/$2"; m=""',
+    '  [ -d "$(dirname "$d")" ] || return 0',
+    '  [ -d "$d" ] || { echo "SKILLS_MISSING: $p $d: no skills folder"; return 0; }',
+    `  for s in ${BRIEF_SKILLS.join(" ")}; do [ -r "$d/$s/SKILL.md" ] || m="$m $s"; done`,
+    '  ls "$d"/principle-*/SKILL.md >/dev/null 2>&1 || m="$m principle-*"',
+    `  for b in ${playbooks.join(" ")}; do [ -r "$d/poteto-mode/playbooks/$b.md" ] || m="$m poteto-mode/playbooks/$b.md"; done`,
+    '  if [ -z "$m" ]; then echo "skills ok: $p $d"; else echo "SKILLS_MISSING: $p $d:$m"; fi',
+    "}",
+    ...Object.entries(SKILL_ROOTS).map(([providerId, root]) => `check ${providerId} ${root}`),
+    `check other ${FALLBACK_SKILL_ROOT}`,
+  ].join("\n");
+}
+
 // skill-routing ships with this plugin, not with pstack, so no provider folder
 // holds it until this runs. A provider that is not installed (no parent folder)
 // is skipped; a real folder or a working link is the owner's and stays.
@@ -87,7 +116,10 @@ export function crewSkillBlock(input: { shape: Shape; title?: string; task: stri
       `3. Follow \`${root}/poteto-mode/playbooks/${playbook}.md\`.`,
       "4. Copy every step of that playbook into your to-do list, before any other to-do.",
       "5. Your final report lists each playbook step as \"✓ <step>\" or \"skip: <step>: <reason>\".",
-      "When a playbook step says to delegate to a sub-agent, do that step yourself in this session and report it as ✓ with \"(done in session)\", not as a skip.",
+      "Report these steps as ✓, not as a skip:",
+      "- A step or skill that spawns a sub-agent, reviewer or other model (delegate, architect, interrogate, how, why, no-comments): do it yourself in this session, on your own model. Add \"(done in session)\".",
+      "- Cursor-only tools: for create-skill read writing-for-agents; for /loop repeat the step yourself; for origin or gt use gh-axi.",
+      "- Opening a PR, merge, deploy: follow the brief's delivery contract. If proof needs a deploy you may not run, prove it on the nearest surface you can and name what is left for Firstmate.",
     );
   }
   lines.push("Save each screenshot as its own full-size PNG file. Never combine, stitch or downscale screenshots; link each file separately.");
@@ -98,6 +130,11 @@ export function crewSkillBlock(input: { shape: Shape; title?: string; task: stri
       "It also gives proof that the fix works on the real product, or \"not possible: <reason>\".",
     );
   }
+  lines.push(
+    "### Obstacles",
+    "Clear an ordinary obstacle yourself: retry with a smaller query or pagination, restore or commit what your own install changed, use another tool, or wait and retry. This replaces any \"same obstacle twice\" rule.",
+    "Report blocked only for what only the captain or the owner can give: a secret, an approval, a decision, withheld access, or a destructive or irreversible step. Every other stop rule still applies.",
+  );
   return lines.join("\n");
 }
 
