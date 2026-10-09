@@ -39,13 +39,13 @@ function bbTerm(a, input) {
   return r.stdout;
 }
 function wrap(command) {
-  const script = `__fm_cmd=${shQuote(command)}; set +e; "\${SHELL:-/bin/bash}" -lc "$__fm_cmd"; __fm_ec=$?; printf '\\n${HOST_RC_MARKER}:%s\\n' "$__fm_ec"; sleep 86400`;
+  const script = `__fm_cmd=${shQuote(command)}; set +e; "\${SHELL:-/bin/bash}" -lc "$__fm_cmd"; __fm_ec=$?; printf '\\n${HOST_RC_MARKER}:%s\\n' "$__fm_ec"`;
   if (script.length > HOST_COMMAND_MAX) throw new Error(`Host command too long (${script.length} > ${HOST_COMMAND_MAX}).`);
   return script;
 }
 // OLD (buggy) wrapper: pipes stdin into the command via `head -c N` — hangs on a PTY.
 function wrapOld(command, stdinBytes) {
-  return `__fm_cmd=${shQuote(command)}; set +e; printf '\\n${HOST_STDIN_READY}\\n'; head -c ${stdinBytes} | "\${SHELL:-/bin/bash}" -lc "$__fm_cmd"; __fm_ec=$?; printf '\\n${HOST_RC_MARKER}:%s\\n' "$__fm_ec"; sleep 86400`;
+  return `__fm_cmd=${shQuote(command)}; set +e; printf '\\n${HOST_STDIN_READY}\\n'; head -c ${stdinBytes} | "\${SHELL:-/bin/bash}" -lc "$__fm_cmd"; __fm_ec=$?; printf '\\n${HOST_RC_MARKER}:%s\\n' "$__fm_ec"`;
 }
 async function runHostCommand(command, timeoutMs = 15000) {
   const created = JSON.parse(bbTerm(["create", "--host", HOST, "--cwd", "/tmp", "--json", "--command", wrap(command)]));
