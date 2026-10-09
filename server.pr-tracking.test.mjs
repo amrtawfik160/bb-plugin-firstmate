@@ -165,6 +165,34 @@ test('a crew PR is tracked when the crew pushed its own fm/ branch, not the work
  }finally{await host.harness.lifecycle.dispose();}
 });
 
+// Oct 9: after a merged PR retired crews 698172dd and others, the PR notice wrote a
+// new state/<id>.status note and a wake pointer, waking the captain about a gone crew.
+test('a PR notice for a retired crew writes no status note and no wake, but still reaches the captain',async()=>{
+ const host=await base();try {
+  await host.bb.storage.kv.set('crews',[crew('live1','thr_live1','thr_cap')]);
+  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle'}));
+  const sent=[];host.harness.sdk.stub('threads.send',async args=>{sent.push(JSON.stringify(args.input));return{delivery:'queued'};});
+  const store=createDeliveries(host.bb.storage.database());
+  store.register({url:'https://github.com/acme/repo/pull/30',taskId:'gone1',projectId:'proj_1',owner:'thr_cap',home:'/fm',worker:'thr_gone1',requirement:'pr'});
+  store.register({url:'https://github.com/acme/repo/pull/31',taskId:'live1',projectId:'proj_1',owner:'thr_cap',home:'/fm',worker:'thr_live1',requirement:'pr'});
+  const wakes=[];
+  hostCommands(host,command=>{
+   if(command.includes('gh pr view'))return{payload:JSON.stringify(forge('MERGED'))};
+   if(command.includes('fm_wake_append_locked')){
+    // The host has no .meta for the retired crew; the script must stop before the note.
+    if(command.includes('/fm/state/gone1.meta'))return{payload:'FM_BB_WAKE_SKIPPED=retired'};
+    wakes.push(command);return{payload:'FM_BB_WAKE_SEQ=1'};
+   }
+   return{code:0};
+  });
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.equal(wakes.filter(c=>c.includes('gone1.status')).length,0,'no status note or wake for a retired crew');
+  assert.equal(wakes.filter(c=>c.includes('live1.status')).length,1,'a live crew still gets its status note and wake');
+  assert.ok(sent.some(s=>s.includes('FM_DELIVERY_NOTICE=acme/repo#30')),'the retired crew notice still reaches the captain directly');
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
 test('a captain can track a PR it opened itself without a crew',async()=>{
  const host=await base();try {
   host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'active'}));

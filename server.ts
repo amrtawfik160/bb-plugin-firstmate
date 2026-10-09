@@ -2665,6 +2665,7 @@ export default async function plugin(bb: BbPluginApi) {
     display: string,
     signal?: AbortSignal,
     dedupMarker?: string,
+    requireMeta = false,
   ): Promise<{ durable: boolean }> {
     const fmHome = (crew.parentThreadId ? await bb.storage.kv.get<string>(`native-home:${crew.parentThreadId}`) : null) || await crewNativeHome(crew);
     if (fmHome === "" || isSecondmateRoute(crew)) return { durable: false };
@@ -2694,6 +2695,8 @@ export default async function plugin(bb: BbPluginApi) {
       `export FM_STATE_OVERRIDE=${shQuote(stateDir)}`,
       `lib=${shQuote(lib)}; [ "\${FM_BUNDLED_VERIFIED:-}" != 1 ] || lib="$FM_BINDIR/fm-wake-lib.sh"`,
       `[ -f "$lib" ] || { echo "error: missing $lib" >&2; exit 127; }`,
+      // A retired crew has no state/<id>.meta; a note would recreate its .status and wake the captain about a gone crew.
+      ...(requireMeta ? [`[ -f ${shQuote(`${fmHome}/state/${crew.id}.meta`)} ] || { printf 'FM_BB_WAKE_SKIPPED=retired\\n'; exit 0; }`] : []),
       `mkdir -p ${shQuote(stateDir)}`,
       `. "$lib"`,
       `note=$(printf '%s' ${shQuote(noteB64)} | base64 -d)`,
@@ -2715,6 +2718,10 @@ export default async function plugin(bb: BbPluginApi) {
       const res = await runOnHost(hostId, script, 15_000, signal);
       if (res.exitCode !== 0) {
         bb.log.warn(`fm wake enqueue failed crew=${crew.id} exit=${res.exitCode}`);
+        return { durable: false };
+      }
+      if (res.output.includes("FM_BB_WAKE_SKIPPED=retired")) {
+        bb.log.info(`fm wake skipped crew=${crew.id}: crew is retired (no record, no state/<id>.meta)`);
         return { durable: false };
       }
       bb.log.info(`fm wake enqueued crew=${crew.id} key=${key} (note→status + pointer)`);
@@ -6369,7 +6376,9 @@ export default async function plugin(bb: BbPluginApi) {
         nativeHome:r.home,createdAt:new Date(r.updatedAt).toISOString() };
       const text = `FM_DELIVERY_NOTICE=${r.id}:${r.notification.desired} PR observation. ${deliveryLine(r)}. Inspect firstmate_deliveries. Reuse the author for fixes and preserve the task’s native review and validation contract. Continue only already-authorized work. PR-only artifact delivery and check health are separate; record each independent failure, preserving author and authorized baseline follow-up identities. Use firstmate_merge for any authorized merge; this notice grants no authority. Wake acknowledgement does not clear PR health follow-up.`;
       if (r.notification.queued !== r.notification.desired) {
-        const queued = await enqueueCaptainWake(crew,text,signal,`FM_DELIVERY_NOTICE=${r.id}:${r.notification.desired}`);
+        // A retired crew gets no status note or wake; the direct send below still reaches the captain.
+        const live=(await readCrews()).some(c=>c.id===r.taskId);
+        const queued = await enqueueCaptainWake(crew,text,signal,`FM_DELIVERY_NOTICE=${r.id}:${r.notification.desired}`,!live);
         if (queued.durable && !deliveries.markQueued(r.id,r.owner!,r.notification.desired!)) return false;
       }
       const latest=deliveries.get(r.id);
