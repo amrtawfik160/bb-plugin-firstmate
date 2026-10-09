@@ -4,6 +4,7 @@ import test from "node:test";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import plugin from "./server.ts";
 import { createDispatchJobs } from "./lib/async-dispatch.ts";
+import { createDoorbellHold } from "./lib/doorbell-hold.ts";
 import { createInboundLedger } from "./lib/inbound-ledger.ts";
 import { createLaunches } from "./lib/launch.ts";
 import { createDeliveries } from "./lib/pr-delivery.ts";
@@ -839,6 +840,32 @@ test("two background dispatches for the last free slot start one crew now and th
     await host.harness.behavior.runSchedule("pr-delivery-follow-up");
     await until(() => jobState(host, waiting) === "started");
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 2);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a held crew doorbell that fails to send on release is kept for the next release", async () => {
+  const host = await knownCaptainHost();
+  try {
+    await asyncOn(host);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: "idle" }));
+    const store = createDoorbellHold(host.bb.storage.database());
+    for (const crewId of ["c1", "c2"]) {
+      store.enqueue({ captainThreadId: "thr_cap", text: `🔔 crew ${crewId} idle [ship] :: fix login`, crewId, urgent: false, createdAt: 1 });
+    }
+    const doorbells = () => captainSends(host).filter((sent) => /crew c[12] idle/.test(sent));
+
+    host.harness.sdk.stub("threads.send", async () => { throw new Error("Server session is not open"); });
+    await captainIdle(host);
+    assert.equal(store.pending("thr_cap"), 2, "a failed send must not drop the held doorbells");
+
+    host.harness.sdk.stub("threads.send", async () => ({}));
+    await captainIdle(host);
+    assert.equal(store.pending("thr_cap"), 0);
+    assert.equal(doorbells().filter((sent) => /crew c1 idle/.test(sent)).length, 1);
+    assert.equal(doorbells().filter((sent) => /crew c2 idle/.test(sent)).length, 1);
   } finally {
     await host.harness.lifecycle.dispose();
   }
