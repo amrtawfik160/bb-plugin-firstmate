@@ -328,3 +328,15 @@ which sentences and anchors need attention.
   for a separate upstream clone, `$CAPTAIN_HOMES`, `$PLUGIN_CHECKOUT`). Link
   source by repository-relative path. `scripts/docs-host-ids.test.mjs` fails on a
   live id or a path under the host's root home.
+
+## CI runs every test file
+
+`npm test` lists each test file by name, and CI runs that same list on a
+GitHub-hosted runner, as root, with the pinned host tools installed
+(`bb-app`, `no-mistakes`, `gh-axi`, `tasks-axi`, `quota-axi`) and the pinned
+upstream checkout. Add a new test file to the `test` script in `package.json`.
+To keep a file out of CI, add it to `.github/ci-skipped-tests.json` with the
+reason; `scripts/ci-test-coverage.mjs` fails the `test-coverage` job when a
+tracked test file is neither run nor on that list. Do not add a self-hosted
+runner: this repository is public, and a fork's pull request would run its code
+on that host.
