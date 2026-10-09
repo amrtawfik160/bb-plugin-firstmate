@@ -20,6 +20,7 @@ Use `bb firstmate dispatch --help`, `bb firstmate queue --help` and `bb firstmat
 - The `bb firstmate watch` CLI remains blocking via BB `threads.wait` for operator use.
 - Retry the same failed turn with `firstmate_retry`. A provider, model, or reasoning override relaunches a replacement thread in the same worktree.
 - Deliver with `firstmate_deliver`; land only through `firstmate_merge`.
+- Retire a finished crew with `firstmate_forget stop=true` (`bb firstmate forget <id> --stop`), not the raw `fm teardown`; forget also does the BB-side cleanup.
 - Run an upstream script with `firstmate_fm`, passing the script stem and its original arguments.
 
 The plugin applies the crew marker and task id as thread metadata. Crew threads receive no captain tools or captain skills, which prevents nested dispatch.
