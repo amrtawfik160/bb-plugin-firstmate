@@ -10,6 +10,7 @@ import { z } from "zod";
 import {
   afkShouldSend,
   bearingsText,
+  BLOCKED_OUTCOME_LINE,
   capPermission,
   crewPrompt,
   decisionDue,
@@ -86,7 +87,7 @@ import { AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython } from 
 import { createDeliveries, LOST_OWNER_RECHECK_MS, canonicalPr, deliveryLine, parseForge, type DeliveryRecord } from "./lib/pr-delivery.ts";
 import { captureHostCommand, decodeHostCapture } from "./lib/host-capture.ts";
 import { selectExecution, validateLaunchCapabilities } from "./lib/execution-selection.ts";
-import { crewSkillBlock, PLAYBOOK_CHOICES, redactSecrets, skillRoutingLinkScript } from "./lib/crew-contract.ts";
+import { crewSkillBlock, PLAYBOOK_CHOICES, redactSecrets, skillCheckScript, skillRoutingLinkScript } from "./lib/crew-contract.ts";
 import { rpcContract } from "./rpc.ts";
 import {
   UPSTREAM_FIRSTMATE_SHA,
@@ -597,7 +598,7 @@ const NO_OUTCOME_PREFIX = "crew-no-outcome:";
 const OUTCOME_LINE_REQUEST = [
   "OUTCOME LINE MISSING: your last turn ended without an outcome line. Reply now with exactly one line that states where the task stands, then stop:",
   "  DONE: <one-line outcome>",
-  "  BLOCKED: <what you need, exactly>",
+  `  ${BLOCKED_OUTCOME_LINE}`,
   "  WAITING: <the external run you are waiting on>",
   "  FAILED: <what failed + evidence>",
   "Do not redo the task.",
@@ -10057,7 +10058,7 @@ export default async function plugin(bb: BbPluginApi) {
   const usage = [
     "Usage:",
     "  bb firstmate guide [--json]",
-    "  bb firstmate toolchain [--json]   # native AXI + Lavish compatibility, read-only",
+    "  bb firstmate toolchain [--json]   # native AXI + Lavish compatibility and brief skills per provider, read-only",
     "  bb firstmate init [--real] [--machine m] [--path p] [--name n] [--json]",
     "  bb firstmate scripts [query] [--json]   # list + verify every installed fm-* script",
     "  bb firstmate fm [--timeout s] <script> [args...]   # real bin/fm-<script>.sh with FM_BACKEND=bb",
@@ -10255,7 +10256,22 @@ export default async function plugin(bb: BbPluginApi) {
     const current = await settings.get();
     if (!current.fmHome.trim()) throw new Error("Initialize native Firstmate before checking its toolchain.");
     const hostId = current.fmHostId.trim() || await resolveHostId(undefined, ctx);
-    return checkToolchain(hostId, current.fmHome.trim(), signal);
+    const toolchain = await checkToolchain(hostId, current.fmHome.trim(), signal);
+    return { ...toolchain, output: `${toolchain.output}\n${await briefSkillReport(hostId, signal)}` };
+  }
+
+  // Advisory: a missing skill never makes the toolchain unready, because a brief
+  // tells the worker to continue without it.
+  async function briefSkillReport(hostId: string, signal?: AbortSignal): Promise<string> {
+    const head = "Skills a brief may name, per installed provider:";
+    try {
+      const res = await runOnHost(hostId, `bash -c ${shQuote(skillCheckScript())}`, 30_000, signal);
+      const lines = res.output.split("\n").filter((line) => /^(skills ok|SKILLS_MISSING): /.test(line));
+      if (res.exitCode !== 0) return `${head}\nSKILLS_UNKNOWN: check failed: ${truncate(res.output, 400)}`;
+      return [head, ...(lines.length > 0 ? lines : ["SKILLS_MISSING: no provider skills folder found"])].join("\n");
+    } catch (error) {
+      return `${head}\nSKILLS_UNKNOWN: check failed: ${error instanceof Error ? error.message : String(error)}`;
+    }
   }
 
   registerCaptainTool({

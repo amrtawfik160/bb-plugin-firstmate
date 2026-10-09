@@ -8119,6 +8119,7 @@ test("IT BB bootstrap uses browser plugin without requiring AXI browser", { skip
     assert.match(report.output, /Browser: use \/browser with browser_script/);
     assert.match(report.output, /bb plugin run browser script/);
     assert.doesNotMatch(report.output, /bb browser script/, "bb browser has no script command");
+    assert.match(report.output, /\nSkills a brief may name, per installed provider:\n(?:skills ok|SKILLS_MISSING): /, "a missing brief skill is reported per provider");
     assert.doesNotMatch(report.output, /MISSING: chrome-devtools-axi/);
     const native = spawnSync(join(home, "bin/fm-bootstrap.sh"), [], {
       env: { ...process.env, FM_HOME: home, FM_BACKEND: "tmux", BASH_ENV: probe, FM_BOOTSTRAP_DETECT_ONLY: "1", FM_BOOTSTRAP_NETWORK: "skip" },

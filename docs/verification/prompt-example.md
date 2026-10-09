@@ -71,9 +71,10 @@ If the top-level path is the primary checkout or not the worktree you were launc
    Firstmate may still raise one first-sight alert; the declared wait then uses the existing long recheck cadence instead of repeated possible-wedge alarms.
    When you know when the wait clears, include `until <YYYY-MM-DDTHH:MMZ>` (UTC) for a recheck at that time.
    Follow the resolution rule below when the wait clears, then resume the task.
-   Use `blocked:` when you are stuck and need help.
+   Use `blocked:` only as rule 5 allows.
 
-5. If you hit the same obstacle twice, append `blocked [at=<epoch>]: {why}` and stop; firstmate will help.
+<!-- BB-DIVERGE: native fm-brief.sh Rules / rule 5; ordinary obstacles are the worker's to clear. -->
+5. Work through an ordinary obstacle yourself first: retry with a smaller query or pagination, restore or commit a change your own command made (such as an install that rewrote a lockfile), use another tool, or wait and retry. Append `blocked [at=<epoch>]: {what you need}` and stop only for what only firstmate or the owner can give: a secret, an approval, a decision, access that was withheld, or a destructive or irreversible step. Every other stop rule in this brief still applies.
 6. If a decision belongs above the implementation worker (product choices, destructive actions),
    append `needs-decision [at=<epoch>]: {summary of options}` and stop. Firstmate will reply with the decision.
 

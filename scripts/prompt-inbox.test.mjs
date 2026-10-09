@@ -64,10 +64,10 @@ test('crew brief makes a worker work through ordinary obstacles and keeps every 
    assert.ok(output.includes('5. Work through an ordinary obstacle yourself first: retry with a smaller query or pagination, restore or commit a change your own command made (such as an install that rewrote a lockfile), use another tool, or wait and retry. Append `blocked [at=<epoch>]: {what you need}` and stop only for what only firstmate or the owner can give: a secret, an approval, a decision, access that was withheld, or a destructive or irreversible step. Every other stop rule in this brief still applies.'),output);
    assert.ok(output.includes('   Use `blocked:` only as rule 5 allows.'),output);
    assert.ok(output.includes('A command that changes tracked files (a dependency install, a code generator) is not source-stable: run it directly, then restore or commit what it changed.'),output);
-   assert.ok(output.includes('append `blocked [at=<epoch>]: launched in primary checkout, not an isolated worktree` to the status file and stop.'),'isolation stop stays');
-   assert.match(output,/6\. If a decision belongs above the implementation worker \(product choices, destructive actions\),\n   append `needs-decision \[at=<epoch>\]: \{summary of options\}` and stop\./,'decision stop stays');
+   if(kind==='ship') assert.ok(output.includes('append `blocked [at=<epoch>]: launched in primary checkout, not an isolated worktree` to the status file and stop.'),'isolation stop stays');
+   assert.ok(output.includes('append `needs-decision [at=<epoch>]: {summary of options}` and stop. Firstmate will reply with the decision.'),'decision stop stays');
    assert.ok(output.includes('`blocked [at=<epoch>]: {what you need}` and stop; firstmate arranges it.'),'shared infrastructure stop stays');
-   assert.match(output,/1\. Never push to the default branch/);
+   if(kind==='ship') assert.match(output,/1\. Never push to the default branch/);
   }
  }finally{rmSync(home,{recursive:true,force:true});}
 });

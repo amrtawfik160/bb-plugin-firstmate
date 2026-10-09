@@ -9,16 +9,16 @@ import { BRIEF_SKILLS, crewPlaybook, crewSkillBlock, crewSkillRoot, PLAYBOOK_CHO
 const HOME = homedir();
 
 const IN_PLACE_OF_A_SKIP = [
-  "Do these steps this way and report them as ✓, not as a skip:",
-  "- A step or skill that spawns a sub-agent, an extra reviewer or another model (delegate, architect, interrogate, how, why, no-comments): do it yourself in this session with the model you were given. Add \"(done in session)\".",
-  "- A Cursor-only tool: for create-skill read writing-for-agents; for /loop repeat the step yourself; for origin or gt use gh-axi.",
-  "- Opening a PR, merge and deploy: do what the brief's delivery contract says. If proof needs a deploy you may not run, prove it on the nearest surface you can run and name what is left for Firstmate.",
+  "Report these steps as ✓, not as a skip:",
+  "- A step or skill that spawns a sub-agent, reviewer or other model (delegate, architect, interrogate, how, why, no-comments): do it yourself in this session, on your own model. Add \"(done in session)\".",
+  "- Cursor-only tools: for create-skill read writing-for-agents; for /loop repeat the step yourself; for origin or gt use gh-axi.",
+  "- Opening a PR, merge, deploy: follow the brief's delivery contract. If proof needs a deploy you may not run, prove it on the nearest surface you can and name what is left for Firstmate.",
 ];
 
 const OBSTACLES = [
-  "### Obstacles (Firstmate adds this to every brief)",
-  "Work through an ordinary obstacle yourself: retry with a smaller query or pagination, restore or commit a change your own install made, use another tool, or wait and retry. This replaces any \"same obstacle twice\" rule in this brief.",
-  "Report blocked only for what only the captain or the owner can give: a secret, an approval, a decision, access that was withheld, or a destructive or irreversible step. Every stop rule in this brief still applies.",
+  "### Obstacles",
+  "Clear an ordinary obstacle yourself: retry with a smaller query or pagination, restore or commit what your own install changed, use another tool, or wait and retry. This replaces any \"same obstacle twice\" rule.",
+  "Report blocked only for what only the captain or the owner can give: a secret, an approval, a decision, withheld access, or a destructive or irreversible step. Every other stop rule still applies.",
 ];
 
 test("the playbook comes from the dispatch title, not the task body", () => {
@@ -276,5 +276,16 @@ test("the live skill check reports each installed provider's missing skills and 
     ]);
   } finally {
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("the block stays short for every provider, shape and playbook", () => {
+  for (const providerId of ["claude-code", "codex", "acp-grok", "acp-antigravity", "pi"]) {
+    for (const shape of ["ship", "scout"] as const) {
+      for (const playbook of PLAYBOOK_CHOICES) {
+        const size = crewSkillBlock({ shape, title: "x", task: "", providerId, playbook }).length;
+        assert.ok(size <= 2700, `${providerId} ${shape} ${playbook}: ${size} characters`);
+      }
+    }
   }
 });

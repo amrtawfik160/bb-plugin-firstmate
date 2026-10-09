@@ -1,6 +1,10 @@
 # AXI toolchain
 
 `bb firstmate toolchain --json` (or `firstmate_toolchain`) checks native bootstrap compatibility without installing dependencies.
+
+It also lists, for each installed provider skills folder, which skills a crew brief may name are missing:
+`skills ok: <provider> <folder>` or `SKILLS_MISSING: <provider> <folder>: <names>`.
+The names come from `BRIEF_SKILLS` in `lib/crew-contract.ts`. A missing skill does not make the toolchain unready.
 Use the home's `bin/fm-tasks-axi.sh` for backlog operations, `gh-axi` for GitHub, `quota-axi` for quota decisions, and `lavish-axi` for visual review.
 The native `no-mistakes` pipeline remains worker-owned when that delivery mode is selected.
 Missing essential tools block their workflows; Lavish readiness is reported separately for visual work.
