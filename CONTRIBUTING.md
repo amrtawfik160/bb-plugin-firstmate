@@ -333,7 +333,7 @@ which sentences and anchors need attention.
 
 `npm test` lists each test file by name, and CI runs that same list on a
 GitHub-hosted runner, as root, with the pinned host tools installed
-(`bb-app`, `no-mistakes`, `gh-axi`, `tasks-axi`, `quota-axi`) and the pinned
+(`bb-app`, `no-mistakes`, `gh-axi`, `tasks-axi`, `quota-axi`, `lavish-axi`) and the pinned
 upstream checkout. Add a new test file to the `test` script in `package.json`.
 To keep a file out of CI, add it to `.github/ci-skipped-tests.json` with the
 reason; `scripts/ci-test-coverage.mjs` fails the `test-coverage` job when a

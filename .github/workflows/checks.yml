@@ -39,13 +39,13 @@ jobs:
       # release checksum.
       - name: Install host tools
         run: |
-          npm install -g bb-app@0.45.0 gh-axi@0.1.35 tasks-axi@0.2.6 quota-axi@0.1.53
+          npm install -g bb-app@0.45.0 gh-axi@0.1.35 tasks-axi@0.2.6 quota-axi@0.1.53 lavish-axi@0.1.78
           mkdir -p "$RUNNER_TEMP/tools"
           curl -fsSL -o "$RUNNER_TEMP/no-mistakes.tar.gz" https://github.com/kunchenguid/no-mistakes/releases/download/v1.79.0/no-mistakes-v1.79.0-linux-amd64.tar.gz
           echo "d178c8a5134763b8e5f6d82545a3a76285fbbcdc13d09020d1091ec80a3f8da6  $RUNNER_TEMP/no-mistakes.tar.gz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/no-mistakes.tar.gz" -C "$RUNNER_TEMP/tools" no-mistakes
           echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
-          for tool in bb gh-axi tasks-axi quota-axi; do command -v "$tool"; done
+          for tool in bb gh-axi tasks-axi quota-axi lavish-axi; do command -v "$tool"; done
           "$RUNNER_TEMP/tools/no-mistakes" --version
       # Pinned upstream firstmate checkouts, so native-parity tests run against
       # the real native scripts. FIRSTMATE_TEST_NATIVE is a full clone that holds
