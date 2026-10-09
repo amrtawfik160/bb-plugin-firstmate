@@ -1751,6 +1751,24 @@ test("scout forget: a missing native task record falls back to BB-side cleanup i
   } finally { await host.harness.lifecycle.dispose(); }
 });
 
+test("ship forget --stop: a missing native task record still retires on the BB side", async () => {
+  const host = await load();
+  try {
+    stubForgetSdk(host, { dirty: [] });
+    const routed = stubRoutedHost(host, cmd => unwrapHostCommand(cmd).includes('"$FM_BINDIR/fm-teardown.sh"')
+      ? { payload: "error: teardown refused: task record is not a regular file at /pinned-home/state/c1.meta", code: 1 }
+      : {});
+    host.harness.sdk.stub("threads.get", async (args: { threadId: string }) =>
+      makeThreadResponse({ id: args.threadId, status: "idle", environmentId: "env_wt" }));
+    await host.bb.storage.kv.set("crews", [{ ...shipRow("c1", "thr_crew", "thr_cap"), nativeHome: "/pinned-home", backlogRow: true }]);
+    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(host.harness.sdk.callsTo("threads.archive").length, 1);
+    assert.ok(routed.seen.map(unwrapHostCommand).some(cmd => cmd.includes("/pinned-home/state/c1.status")), "leftover native state is retired");
+    assert.deepEqual(await crewsKv(host), []);
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
 test("scout forget: another task's missing record is still a refusal", async () => {
   const { host } = await nativeScoutForgetFixture({
     refusal: "error: teardown refused: task record is not a regular file at /pinned-home/state/other.meta .",
@@ -9651,6 +9669,63 @@ test("merge trusts fm-pr-merge's verified MERGED readback over BB's stale PR cac
     assert.doesNotMatch(result.stdout, /Landing not yet confirmed/);
     assert.match(result.stdout, /Merged https:\/\/github\.com\/o\/r\/pull\/1\nCrew c1 retired/);
     assert.deepEqual(await host.bb.storage.kv.get("crews"), []);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// Native already retired the task (or never recorded it): teardown refuses with
+// "task record is not a regular file". Only that refusal, for this crew, means
+// nothing native is left; the landed crew is then retired on the BB side.
+async function mergeWithTeardownRefusal(refusal: string) {
+  const host = nativeMergeHost();
+  await plugin(host.bb);
+  const url = "https://github.com/o/r/pull/1";
+  await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+  const routed = stubNativeMerge(host, (cmd) => {
+    if (cmd.includes("fm-pr-merge.sh")) return { payload: `verified: ${url} is merged (state=MERGED, merged=true, isInMergeQueue=false)` };
+    if (cmd.includes('"$FM_BINDIR/fm-teardown.sh"')) return { payload: refusal, code: 1 };
+    return {};
+  }, {
+    outcome: "available",
+    pullRequest: { url, number: 1, title: "t", state: "open", checks: { state: "passing" }, mergeability: { mergeable: "MERGEABLE" } },
+  });
+  host.harness.sdk.stub("threads.stop", async () => ({}));
+  host.harness.sdk.stub("threads.archive", async () => ({}));
+  host.harness.sdk.stub("environments.get", async () => ({ id: "env_wt", hostId: "host_1", path: "/wt", isWorktree: true, status: "ready", mergeBaseBranch: "main" }));
+  host.harness.sdk.stub("environments.diffFiles", async () => ({ files: [] }));
+  host.harness.sdk.stub("environments.delete", async () => ({ ok: true as const }));
+  const result = await host.harness.behavior.runCli(["merge", "c1", "--yes"]);
+  return { host, routed, result };
+}
+
+test("merge: a missing native task record retires the landed crew on the BB side", async () => {
+  const { host, routed, result } = await mergeWithTeardownRefusal(
+    "error: teardown refused: task record is not a regular file at /tmp/fm-home/state/c1.meta",
+  );
+  try {
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /Crew c1 retired/);
+    assert.match(result.stdout, /no native task record; cleaned up on the BB side/);
+    assert.equal(host.harness.sdk.callsTo("threads.stop").length, 1);
+    assert.equal(host.harness.sdk.callsTo("threads.archive").length, 1);
+    assert.ok(host.harness.sdk.callsTo("environments.diffFiles").length > 0, "unlanded-work check runs first");
+    assert.ok(routed.seen.map(unwrapHostCommand).some(cmd => cmd.includes("/tmp/fm-home/state/c1.status")), "leftover native state is retired");
+    assert.deepEqual(await host.bb.storage.kv.get("crews"), []);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("merge: another task's missing record is still a teardown refusal", async () => {
+  const { host, result } = await mergeWithTeardownRefusal(
+    "error: teardown refused: task record is not a regular file at /tmp/fm-home/state/other.meta",
+  );
+  try {
+    assert.notEqual(result.exitCode, 0);
+    assert.match(result.stderr, /other\.meta/);
+    assert.equal(host.harness.sdk.callsTo("threads.archive").length, 0);
+    assert.equal(((await host.bb.storage.kv.get("crews")) as Array<{ id: string }>)[0]?.id, "c1");
   } finally {
     await host.harness.lifecycle.dispose();
   }

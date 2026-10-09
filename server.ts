@@ -6889,8 +6889,8 @@ export default async function plugin(bb: BbPluginApi) {
       if (local) {
         const result = await runFmScript({ script: "merge-local", args: [crew.id], fmHome: nativeHome, hostId, timeoutMs: 180_000 });
         requireNativeSuccess(result, `local merge ${crew.id}`);
-        await retireLanded(crew, "local ff-only", "");
-        return `${result.output.trim()}\nCrew ${crew.id} retired.`;
+        const note = await retireLanded(crew, "local ff-only", "");
+        return `${result.output.trim()}\nCrew ${crew.id} retired.${note}`;
       }
       const pr = await resolveCrewPr(crew, envId, hostId);
       if (pr === null) {
@@ -6922,8 +6922,8 @@ export default async function plugin(bb: BbPluginApi) {
         }
         if (!landed) return `${result.output.trim()}\nLanding not yet confirmed; crew ${crew.id} retained. Check the merge queue before teardown.`;
       }
-      await retireLanded(crew, "merged through native gate", pr.url);
-      return `Merged ${pr.url}\nCrew ${crew.id} retired.`;
+      const note = await retireLanded(crew, "merged through native gate", pr.url);
+      return `Merged ${pr.url}\nCrew ${crew.id} retired.${note}`;
     }
     if (local) return mergeLocal(crew, envId);
     if (crew.posture === "no-mistakes") {
@@ -6988,13 +6988,22 @@ export default async function plugin(bb: BbPluginApi) {
     return `Landed locally (ff-only) ${branch}\nCrew ${crew.id} retired.`;
   }
 
-  async function retireLanded(crew: Crew, outcome: string, pr: string, landed = true): Promise<void> {
+  // Returns a note for the caller's result; "" when native teardown did the work.
+  async function retireLanded(crew: Crew, outcome: string, pr: string, landed = true): Promise<string> {
     if (pr) await registerCrewPr(crew,pr);
     const nativeHome = await crewNativeHome(crew);
+    const notes: string[] = [];
     if (nativeHome !== "" && !isSecondmateRoute(crew)) {
       const hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
       const result = await runFmScript({ script: "teardown", args: [crew.id], fmHome: nativeHome, hostId, timeoutMs: 180_000 });
-      requireNativeSuccess(result, `teardown ${crew.id} (work landed; cleanup pending)`);
+      if (noNativeTaskRecord(result, crew.id)) {
+        if (!(await isCaptainThread(crew.threadId))) await retireOnBbSide(crew, false, notes);
+        const leftover = await retireNativeTaskState(crew);
+        if (leftover !== "") notes.push(`WARN: ${leftover}`);
+        notes.unshift("no native task record; cleaned up on the BB side");
+      } else {
+        requireNativeSuccess(result, `teardown ${crew.id} (work landed; cleanup pending)`);
+      }
     } else if (!(await isCaptainThread(crew.threadId))) {
       await bb.sdk.threads.stop({ threadId: crew.threadId });
       await bb.sdk.threads.archive({ threadId: crew.threadId });
@@ -7004,6 +7013,7 @@ export default async function plugin(bb: BbPluginApi) {
     await removeCrew(crew);
     await finishTask(crew, { delivered: landed, outcome });
     await publishFleet();
+    return notes.length > 0 ? ` — ${notes.join("; ")}` : "";
   }
 
   // Live-check tracked crews against the forge and retire any whose PR was
@@ -7199,6 +7209,91 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  // BB-side retirement of a crew thread that native teardown did not retire:
+  // refuse unlanded work (unless force), stop and archive the thread, and delete
+  // a scout's own worktree. Returns whether a worktree was removed.
+  async function retireOnBbSide(crew: Crew, force: boolean, notes: string[]): Promise<boolean> {
+    const thread = await bb.sdk.threads.get({ threadId: crew.threadId });
+    const envId = thread.environmentId;
+    if (!force && crew.worktree && !envId) throw new Error(`Cannot verify worktree for crew ${crew.id}: environment unavailable.`);
+    let worktreeRemoved = false;
+    // A crew's dedicated managed worktree is the environment to tear down. A
+    // shared-env crew (crew.worktree === false) runs in the project-default
+    // environment — never delete that; deleting it would take out the shared
+    // checkout other crews use. So resolve the worktree env id only for an
+    // isolated crew and only when the environment confirms isWorktree.
+    let worktreeEnvId: string | null = null;
+    if (envId !== null && crew.worktree) {
+      try {
+        const env = await bb.sdk.environments.get({ environmentId: envId });
+        if (asRecord(env)["isWorktree"] === true) worktreeEnvId = envId;
+      } catch (error) {
+        if (!force) throw new Error(`Cannot verify environment for crew ${crew.id}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (!force && envId !== null) {
+      // Unlanded-work protection. "Unlanded" is BOTH uncommitted changes AND
+      // committed-but-unpushed commits (F1) — either is work that only exists in
+      // this worktree, and our hard rule is never to destroy it. We refuse on
+      // either, loudly, leaving the thread AND the worktree intact. This makes
+      // the safety DELIBERATE, not a side effect of the teardown primitive
+      // happening to preserve the branch (see the note at environments.delete).
+      const diff = await withTransientRetry(() => bb.sdk.environments.diffFiles({ environmentId: envId, target: "uncommitted" }));
+      const dirty = checkedDiffPaths(diff).filter((path) => !isScratchPath(path));
+      if (dirty.length > 0) {
+        throw new Error(
+          `Refusing: crew ${crew.id} has ${dirty.length} uncommitted file(s) (${dirty.slice(0, 5).join(", ")}${dirty.length > 5 ? "…" : ""}). Deliver first, or re-run with --force to discard.`,
+        );
+      }
+      const unpushed = await committedUnpushedCommits(envId);
+      if (unpushed.length > 0) {
+        const landedPr = await mergedPrCoversHead(crew, envId);
+        if (landedPr === null) {
+          throw new Error(
+            `Refusing: crew ${crew.id} has committed but UNPUSHED work on its branch (${unpushed.length >= 20 ? "at least " : ""}${unpushed.length} commit(s): ${unpushed.slice(0, 5).map(sha => sha.slice(0, 12)).join(", ")}${unpushed.length > 5 ? "…" : ""}). Those commits exist only in this worktree's branch. Open a PR / push first, or re-run with --force to discard.`,
+          );
+        }
+        notes.push(`branch commits landed via merged ${landedPr}`);
+      }
+    }
+    await bb.sdk.threads.stop({ threadId: crew.threadId });
+    await bb.sdk.threads.archive({ threadId: crew.threadId });
+    // D2: native fm-teardown removes the git worktree; do the same so worktrees
+    // do not accumulate on disk after forget. Only reached once the tree is clean
+    // and has no committed-unpushed work (or --force), so no unlanded work is
+    // discarded here.
+    //
+    // What this primitive deletes, precisely (F1): BB's `environments.delete` for
+    // a managed worktree runs `git worktree remove` on the shared parent repo. It
+    // removes the WORKING TREE only — it does NOT delete the crew's branch and
+    // does NOT drop git stash entries; both live in the shared parent repo and
+    // survive removal. We do NOT rely on that for safety: the guard above already
+    // refuses committed-unpushed work, so removal here is of a worktree whose work
+    // is either landed/pushed or explicitly force-discarded. This comment is the
+    // contract — if a future BB version prunes branches or drops stashes on delete,
+    // the guard (not this primitive) is still what prevents data loss.
+    // Ships stay archived through BB's retirement grace. A finished scout's
+    // scratch checkout is deleted now so it does not sit through that grace.
+    if (worktreeEnvId !== null && crew.shape === "scout") {
+      try {
+        await bb.sdk.environments.delete({ environmentId: worktreeEnvId });
+        await markEnvDeleted(worktreeEnvId, crew);
+        worktreeRemoved = true;
+      } catch (error) {
+        notes.push(`environment ${worktreeEnvId} was not deleted: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    return worktreeRemoved;
+  }
+
+  // Native teardown refuses with this when the task's record is gone (native
+  // already retired it, or spawn never wrote it): nothing native is left to tear
+  // down. Only this crew's own record counts; any other refusal still fails.
+  function noNativeTaskRecord(result: { exitCode: number | null; output: string } | null, id: string): boolean {
+    return result !== null && result.exitCode !== 0
+      && new RegExp(`task record is not a regular file at \\S*/state/${id}\\.meta\\b`).test(result.output);
+  }
+
   const SCOUT_GATE_REFUSAL = /has not passed the captain-call completion gate/;
 
   async function forgetCrew(
@@ -7265,11 +7360,7 @@ export default async function plugin(bb: BbPluginApi) {
             result = { ...result, output: `${result.output.trim()}\ncaptain-hold complete --none refused: ${gate.output.trim()}` };
           }
         }
-        // No native task record (spawn never wrote it, or native already retired it):
-        // there is nothing native to tear down, so BB-side cleanup below takes over.
-        const noRecord = result.exitCode !== 0
-          && new RegExp(`task record is not a regular file at \\S*/state/${crew.id}\\.meta\\b`).test(result.output);
-        if (noRecord) {
+        if (noNativeTaskRecord(result, crew.id)) {
           notes.push("no native task record; cleaned up on the BB side");
         } else {
           requireNativeSuccess(result, `teardown ${crew.id} (crew retained for retry)`);
@@ -7277,77 +7368,7 @@ export default async function plugin(bb: BbPluginApi) {
         }
       }
     }
-    if (stop && !nativeTeardown) {
-      const thread = await bb.sdk.threads.get({ threadId: crew.threadId });
-      const envId = thread.environmentId;
-      if (!force && crew.worktree && !envId) throw new Error(`Cannot verify worktree for crew ${id}: environment unavailable.`);
-      // A crew's dedicated managed worktree is the environment to tear down. A
-      // shared-env crew (crew.worktree === false) runs in the project-default
-      // environment — never delete that; deleting it would take out the shared
-      // checkout other crews use. So resolve the worktree env id only for an
-      // isolated crew and only when the environment confirms isWorktree.
-      let worktreeEnvId: string | null = null;
-      if (envId !== null && crew.worktree) {
-        try {
-          const env = await bb.sdk.environments.get({ environmentId: envId });
-          if (asRecord(env)["isWorktree"] === true) worktreeEnvId = envId;
-        } catch (error) {
-          if (!force) throw new Error(`Cannot verify environment for crew ${id}: ${error instanceof Error ? error.message : String(error)}`);
-        }
-      }
-      if (!force && envId !== null) {
-        // Unlanded-work protection. "Unlanded" is BOTH uncommitted changes AND
-        // committed-but-unpushed commits (F1) — either is work that only exists in
-        // this worktree, and our hard rule is never to destroy it. We refuse on
-        // either, loudly, leaving the thread AND the worktree intact. This makes
-        // the safety DELIBERATE, not a side effect of the teardown primitive
-        // happening to preserve the branch (see the note at environments.delete).
-        const diff = await withTransientRetry(() => bb.sdk.environments.diffFiles({ environmentId: envId, target: "uncommitted" }));
-        const dirty = checkedDiffPaths(diff).filter((path) => !isScratchPath(path));
-        if (dirty.length > 0) {
-          throw new Error(
-            `Refusing: crew ${id} has ${dirty.length} uncommitted file(s) (${dirty.slice(0, 5).join(", ")}${dirty.length > 5 ? "…" : ""}). Deliver first, or re-run with --force to discard.`,
-          );
-        }
-        const unpushed = await committedUnpushedCommits(envId);
-        if (unpushed.length > 0) {
-          const landedPr = await mergedPrCoversHead(crew, envId);
-          if (landedPr === null) {
-            throw new Error(
-              `Refusing: crew ${id} has committed but UNPUSHED work on its branch (${unpushed.length >= 20 ? "at least " : ""}${unpushed.length} commit(s): ${unpushed.slice(0, 5).map(sha => sha.slice(0, 12)).join(", ")}${unpushed.length > 5 ? "…" : ""}). Those commits exist only in this worktree's branch. Open a PR / push first, or re-run with --force to discard.`,
-            );
-          }
-          notes.push(`branch commits landed via merged ${landedPr}`);
-        }
-      }
-      await bb.sdk.threads.stop({ threadId: crew.threadId });
-      await bb.sdk.threads.archive({ threadId: crew.threadId });
-      // D2: native fm-teardown removes the git worktree; do the same so worktrees
-      // do not accumulate on disk after forget. Only reached once the tree is clean
-      // and has no committed-unpushed work (or --force), so no unlanded work is
-      // discarded here.
-      //
-      // What this primitive deletes, precisely (F1): BB's `environments.delete` for
-      // a managed worktree runs `git worktree remove` on the shared parent repo. It
-      // removes the WORKING TREE only — it does NOT delete the crew's branch and
-      // does NOT drop git stash entries; both live in the shared parent repo and
-      // survive removal. We do NOT rely on that for safety: the guard above already
-      // refuses committed-unpushed work, so removal here is of a worktree whose work
-      // is either landed/pushed or explicitly force-discarded. This comment is the
-      // contract — if a future BB version prunes branches or drops stashes on delete,
-      // the guard (not this primitive) is still what prevents data loss.
-      // Ships stay archived through BB's retirement grace. A finished scout's
-      // scratch checkout is deleted now so it does not sit through that grace.
-      if (worktreeEnvId !== null && crew.shape === "scout") {
-        try {
-          await bb.sdk.environments.delete({ environmentId: worktreeEnvId });
-          await markEnvDeleted(worktreeEnvId, crew);
-          worktreeRemoved = true;
-        } catch (error) {
-          notes.push(`environment ${worktreeEnvId} was not deleted: ${error instanceof Error ? error.message : String(error)}`);
-        }
-      }
-    }
+    if (stop && !nativeTeardown) worktreeRemoved = await retireOnBbSide(crew, force, notes);
     let lastOutcome: string | null = null;
     try {
       if ((await crewStatus(crew)) === "idle") {
