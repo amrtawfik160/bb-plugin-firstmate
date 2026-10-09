@@ -22,6 +22,19 @@ jobs:
       # package.json has no typecheck script; call tsc directly (tsconfig.json covers server, rpc, lib).
       - run: npx tsc --noEmit
       - run: npm run fidelity
+      # The native tests call the same tools a captain host has. Versions are
+      # the ones the suite passes with; no-mistakes is checked against its
+      # release checksum.
+      - name: Install host tools
+        run: |
+          npm install -g bb-app@0.45.0 gh-axi@0.1.35 tasks-axi@0.2.6 quota-axi@0.1.53
+          mkdir -p "$RUNNER_TEMP/tools"
+          curl -fsSL -o "$RUNNER_TEMP/no-mistakes.tar.gz" https://github.com/kunchenguid/no-mistakes/releases/download/v1.79.0/no-mistakes-v1.79.0-linux-amd64.tar.gz
+          echo "d178c8a5134763b8e5f6d82545a3a76285fbbcdc13d09020d1091ec80a3f8da6  $RUNNER_TEMP/no-mistakes.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/no-mistakes.tar.gz" -C "$RUNNER_TEMP/tools" no-mistakes
+          echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
+          for tool in bb gh-axi tasks-axi quota-axi; do command -v "$tool"; done
+          "$RUNNER_TEMP/tools/no-mistakes" --version
       # Pinned upstream firstmate checkouts, so native-parity tests run against
       # the real native scripts. FIRSTMATE_TEST_NATIVE is a full clone that holds
       # every audited pin; FM_TEST_HOME is the patch base with the overlay installed.
@@ -41,8 +54,13 @@ jobs:
       # reasoned skip list in .github/ci-skipped-tests.json.
       - name: Every test file is run or skipped with a reason
         run: node scripts/ci-test-coverage.mjs
+      # As root, like a captain host: the worker checkpoint starts systemd units
+      # only as root, and the runtime fixtures remove read-only release folders.
       - name: Run tests
         run: |
           files=$(node scripts/ci-test-coverage.mjs --run-list)
           echo "Running $(echo $files | wc -w) test files"
-          node --test --experimental-strip-types $files
+          sudo git config --system --add safe.directory '*'
+          sudo env "PATH=$PATH" HOME=/root \
+            FIRSTMATE_TEST_NATIVE="$FIRSTMATE_TEST_NATIVE" FM_TEST_HOME="$FM_TEST_HOME" FM_CLASSIFY_LIB="$FM_CLASSIFY_LIB" \
+            node --test --experimental-strip-types $files
