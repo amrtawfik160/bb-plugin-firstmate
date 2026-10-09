@@ -7,7 +7,6 @@ export type ReliabilityFlags = {
   handoffContract: FlagToggle;
   asyncDispatch: FlagToggle;
   telegramThreading: FlagToggle;
-  captainProgressUi: FlagToggle;
 };
 
 export const DEFAULT_RELIABILITY_FLAGS: ReliabilityFlags = {
@@ -16,7 +15,6 @@ export const DEFAULT_RELIABILITY_FLAGS: ReliabilityFlags = {
   handoffContract: "off",
   asyncDispatch: "off",
   telegramThreading: "off",
-  captainProgressUi: "off",
 };
 
 const INBOUND = new Set<InboundLedgerMode>(["off", "shadow", "on"]);
@@ -51,7 +49,6 @@ export function parseReliabilityFlags(raw: unknown): ReliabilityFlags {
     handoffContract: asToggle(row.handoffContract, DEFAULT_RELIABILITY_FLAGS.handoffContract),
     asyncDispatch: asToggle(row.asyncDispatch, DEFAULT_RELIABILITY_FLAGS.asyncDispatch),
     telegramThreading: asToggle(row.telegramThreading, DEFAULT_RELIABILITY_FLAGS.telegramThreading),
-    captainProgressUi: asToggle(row.captainProgressUi, DEFAULT_RELIABILITY_FLAGS.captainProgressUi),
   };
 }
 

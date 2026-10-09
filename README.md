@@ -172,7 +172,7 @@ BB-specific behavior in this fork:
 | `nudgeMaxPerCrew` | 3 | Nudges per crew task before NEEDS DECISION |
 | `nudgeCooldownSeconds` | 60 | Minimum gap between nudges for one crew |
 | `maxActiveCrews` | 10 | Concurrent crews per captain (0 = no cap). When `fmReliability.asyncDispatch` is on, over-cap work queues instead of refusing, and spawn uses quota-aware backoff |
-| `fmReliability` | empty JSON | Off-by-default flags. `inboundLedger` (`off`/`shadow`/`on`), `honestStatus`, `handoffContract`, `asyncDispatch`, `telegramThreading`, `captainProgressUi`. Telegram uses Amr's local Telegram v0.1.0 connector header and `telegram.reply` RPC; see [docs/telegram-bridge-contract.md](docs/telegram-bridge-contract.md) |
+| `fmReliability` | empty JSON | Off-by-default flags. `inboundLedger` (`off`/`shadow`/`on`), `honestStatus`, `handoffContract`, `asyncDispatch`, `telegramThreading`. Telegram uses Amr's local Telegram v0.1.0 connector header and `telegram.reply` RPC; see [docs/telegram-bridge-contract.md](docs/telegram-bridge-contract.md) |
 
 ### Reliability flags
 
@@ -186,6 +186,8 @@ Each flag in `fmReliability` is off until set, for example
   when no reset time is known. The per-minute schedule resumes due jobs, also
   after a reload. A job whose worker already exists does not spawn a second one.
   Work past `maxActiveCrews` (default 10) queues and starts when a slot opens.
+  A job that finds its slot taken at spawn time waits the same way. A spawn
+  that fails for another reason is reported to the captain.
   Only that over-cap work drains automatically. A `firstmate_queue` backlog
   still needs an explicit dispatch. A crew whose status cannot be read keeps
   its slot.

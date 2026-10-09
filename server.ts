@@ -11898,7 +11898,7 @@ export default async function plugin(bb: BbPluginApi) {
       // Reports once per stuck stretch and never stops the crew; normal idle handling continues.
       const before = crewWatchdog.loadOrCreate(crew.id, crew.threadId, Date.parse(crew.createdAt) || Date.now());
       let state = observeIdleTurn(before, lastAssistantText);
-      const notify = state.trippedAt === null && watchdogTrip(state, Date.now()) !== null;
+      const notify = state.trippedAt === null && watchdogTrip(state) !== null;
       if (notify) state = tripWatchdog(state, Date.now(), lastAssistantText ?? "");
       crewWatchdog.save(state);
       if (notify) await notifyCaptain(crew, "needs-decision", watchdogNoticeText(state));

@@ -15,3 +15,9 @@ test("reliability flags accept shadow ledger and independent toggles", () => {
     honestStatus: "on",
   });
 });
+
+test("reliability flags carry only flags the plugin reads", () => {
+  assert.deepEqual(Object.keys(parseReliabilityFlags('{"captainProgressUi":"on"}')).sort(), [
+    "asyncDispatch", "handoffContract", "honestStatus", "inboundLedger", "telegramThreading",
+  ]);
+});

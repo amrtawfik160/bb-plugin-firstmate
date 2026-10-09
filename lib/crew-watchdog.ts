@@ -2,16 +2,14 @@ import { createHash } from "node:crypto";
 
 // Consecutive idle turns that add no new output (empty or repeated).
 export const WATCHDOG_MAX_TURNS = 8;
-export const WATCHDOG_MAX_429 = 2;
 
-export type WatchdogReason = "turns" | "wall-clock" | "rate-limit" | "loop";
+export type WatchdogReason = "turns" | "loop";
 
 export type WatchdogState = {
   crewId: string;
   threadId: string;
   startedAt: number;
   turns: number;
-  rateLimitCount: number;
   lastOutputHash: string | null;
   nearIdentical: number;
   trippedAt: number | null;
@@ -25,7 +23,6 @@ export function emptyWatchdog(crewId: string, threadId: string, startedAt: numbe
     threadId,
     startedAt,
     turns: 0,
-    rateLimitCount: 0,
     lastOutputHash: null,
     nearIdentical: 0,
     trippedAt: null,
@@ -46,41 +43,20 @@ export function observeIdleTurn(state: WatchdogState, text: string | null): Watc
   return { ...state, turns: 0, nearIdentical: 0, lastOutputHash: next, trippedAt: null, reason: null, savedState: null };
 }
 
-export function observeRateLimit(state: WatchdogState): WatchdogState {
-  return { ...state, rateLimitCount: state.rateLimitCount + 1 };
-}
-
-export function watchdogTrip(state: WatchdogState, _now: number): WatchdogReason | null {
+export function watchdogTrip(state: WatchdogState): WatchdogReason | null {
   if (state.trippedAt !== null) return state.reason;
-  if (state.rateLimitCount >= WATCHDOG_MAX_429) return "rate-limit";
   if (state.turns >= WATCHDOG_MAX_TURNS) return state.nearIdentical > 0 ? "loop" : "turns";
   return null;
 }
 
 export function tripWatchdog(state: WatchdogState, now: number, savedState: string): WatchdogState {
-  const reason = watchdogTrip(state, now);
+  const reason = watchdogTrip(state);
   if (reason === null) return state;
   return { ...state, trippedAt: now, reason, savedState };
 }
 
 export function watchdogNoticeText(state: WatchdogState): string {
-  const why = state.reason === "rate-limit"
-    ? "hit repeated rate limits"
-    : `ended ${state.turns} turns in a row with no new output`;
-  return `Watchdog: crew ${state.crewId} ${why}. It was not stopped. next: bb firstmate tell|stop|forget ${state.crewId}`;
-}
-
-export function providerErrorIsRateLimit(row: { type?: string; data?: unknown }): boolean {
-  if (row.type !== "provider/error") return false;
-  const data = row.data !== null && typeof row.data === "object" && !Array.isArray(row.data)
-    ? row.data as Record<string, unknown>
-    : {};
-  const info = data.errorInfo !== null && typeof data.errorInfo === "object" && !Array.isArray(data.errorInfo)
-    ? data.errorInfo as Record<string, unknown>
-    : {};
-  if (info.category === "rate-limit") return true;
-  const detail = String(data.detail ?? data.message ?? "");
-  return /429|rate.?limit|quota|resource.?exhausted/i.test(detail);
+  return `Watchdog: crew ${state.crewId} ended ${state.turns} turns in a row with no new output. It was not stopped. next: bb firstmate tell|stop|forget ${state.crewId}`;
 }
 
 type Database = {
