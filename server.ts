@@ -425,6 +425,7 @@ function stripAnsi(text: string): string {
 
 const HOST_RC_MARKER = "__FM_HOST_RC";
 const HOST_COMMAND_MAX = 10000;
+const HOST_TERMINAL_LINGER_S = 30;
 
 function parseHostRc(raw: string): { exitCode: number; output: string } | null {
   const text = stripAnsi(raw);
@@ -438,15 +439,17 @@ function parseHostRc(raw: string): { exitCode: number; output: string } | null {
 
 // Wrap a command so its exit code is recoverable from terminal scrollback. The BB
 // host terminal is a PTY; we run the command, print a parseable RC marker, then
-// `sleep` so the marker survives until we read it (the terminal is force-closed by
-// the caller). Bulky/arbitrary payloads never travel as terminal stdin — the PTY
-// line discipline (canonical mode) buffers+echoes input without delivering it to
+// linger. BB rejects a terminal whose process exits before it is marked open (HTTP 409,
+// open timeout 10 s), so the linger outlasts that window. It stays bounded: the caller
+// force-closes the terminal, and when that close is lost (a BB restart mid-command) the
+// terminal still exits on its own. Scrollback stays readable after exit. Bulky or
+// arbitrary payloads never travel as terminal stdin — the PTY line discipline (canonical mode) buffers+echoes input without delivering it to
 // the reading process, so writes hung until timeout; payloads are staged to a host
 // file via writeHostBytes and fed with `< file` instead.
 function wrapHostCommand(command: string): string {
   const assigned = `__fm_cmd=${shQuote(command)}`;
   const run = '"${SHELL:-/bin/bash}" -lc "$__fm_cmd"';
-  const script = `${assigned}; set +e; ${run}; __fm_ec=$?; printf '\\n${HOST_RC_MARKER}:%s\\n' "$__fm_ec"; sleep 86400`;
+  const script = `${assigned}; set +e; ${run}; __fm_ec=$?; printf '\\n${HOST_RC_MARKER}:%s\\n' "$__fm_ec"; sleep ${HOST_TERMINAL_LINGER_S}`;
   if (script.length > HOST_COMMAND_MAX) {
     throw new Error(`Host command too long (${script.length} > ${HOST_COMMAND_MAX}). Stage bulky payloads with writeHostBytes.`);
   }
