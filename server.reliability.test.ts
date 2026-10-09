@@ -872,3 +872,20 @@ test("a held crew doorbell that fails to send on release is kept for the next re
     await host.harness.lifecycle.dispose();
   }
 });
+
+test("an over-cap dispatch starts within a minute when a slot opens without a crew turn ending", async () => {
+  const host = await knownCaptainHost();
+  try {
+    await asyncOn(host);
+    await host.bb.storage.kv.set("crews", Array.from({ length: 10 }, (_, i) => crewRow(`c${i + 1}`, `thr_c${i + 1}`)));
+    let failed = false;
+    stubSpawn(host, (threadId) => (threadId === "thr_cap" ? "idle" : failed && threadId === "thr_c1" ? "error" : "active"));
+    const queued = await tool(host, "firstmate_dispatch").execute({ task: "fix flaky login", projectId: "proj_1" }, capCtx);
+    assert.match(text(queued), /Queued as/);
+    failed = true;
+    await host.harness.behavior.runSchedule("pr-delivery-follow-up");
+    await until(() => host.harness.sdk.callsTo("threads.spawn").length === 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
