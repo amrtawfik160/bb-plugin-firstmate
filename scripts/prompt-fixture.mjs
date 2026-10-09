@@ -18,15 +18,15 @@ export function fixture(pin=pins[1]) {
  writeFileSync(join(home,'config/bb-overlay'),'bb\n');
  return home;
 }
-export function scaffold(home,id,kind='ship',mode='direct-PR',lab=false) {
+export function scaffold(home,id,kind='ship',mode='direct-PR',lab=false,specText=null) {
  const args=[join(home,'bin/fm-brief.sh'),id,'/example/project',...(kind==='scout'?['--scout']:['--mode',mode]),...(lab?['--herdr-lab']:[])];
  ok(run('bash',args,{FM_HOME:home,FM_ROOT_OVERRIDE:home,FM_STATE_OVERRIDE:join(home,'state')}));
  const source=join(home,'data',id,'brief.md');
  // Native-looking phrases in user Task are deliberate regression bait. They
  // remain user text, including script paths, through the rendering boundary.
  const task=`Smooth canvas zoom and align the workflow status with its action button.\nPreserve this quoted policy text verbatim: Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.\nStay inside this worktree; modify nothing outside it.\nUser evidence path: ${home}/bin/fm-send.sh\n## User acceptance\nPreserve cursor anchoring, reduced motion and responsive wrapping. Do not merge or deploy.`;
- const spec='Reproduce behavior, make bounded changes, run focused checks and the native delivery contract.';
- const text=readFileSync(source,'utf8').replace('{TASK}',task).replace('{FIRSTMATE_SPEC}',spec);
+ const spec=specText??'Reproduce behavior, make bounded changes, run focused checks and the native delivery contract.';
+ const text=readFileSync(source,'utf8').replace('{TASK}',task).replace('{FIRSTMATE_SPEC}',()=>spec);
  writeFileSync(source,text);return{source,text,task,spec};
 }
 export function render(home,source,kind,id,mode='') {

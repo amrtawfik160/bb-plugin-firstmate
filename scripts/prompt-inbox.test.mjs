@@ -5,6 +5,7 @@ import { join,resolve,dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import {overlay,pins,run,ok,fixture,scaffold,render} from './prompt-fixture.mjs';
+import {crewSkillBlock} from '../lib/crew-contract.ts';
 
 for(const pin of pins) test(`native ${pin.slice(0,8)} worker renderer preserves task and all modes with one adapted policy`,()=>{
  const home=fixture(pin);try {
@@ -68,6 +69,28 @@ test('crew brief makes a worker work through ordinary obstacles and keeps every 
    assert.ok(output.includes('append `needs-decision [at=<epoch>]: {summary of options}` and stop. Firstmate will reply with the decision.'),'decision stop stays');
    assert.ok(output.includes('`blocked [at=<epoch>]: {what you need}` and stop; firstmate arranges it.'),'shared infrastructure stop stays');
    if(kind==='ship') assert.match(output,/1\. Never push to the default branch/);
+  }
+ }finally{rmSync(home,{recursive:true,force:true});}
+});
+
+// The final text a crew receives: the native scaffold, the dispatch spec with
+// Firstmate's skills block, and the BB renderer on top.
+const POINTER='5. Follow the Obstacles section of the Task above. When it allows a stop, append `blocked [at=<epoch>]: {what you need}` and stop.';
+test('a dispatched brief states the obstacle rule once, in its Obstacles section, for every provider',()=>{
+ const home=fixture();try {
+  for(const [index,providerId] of ['claude-code','codex','acp-grok'].entries()) for(const [kind,mode] of [['ship','direct-PR'],['scout','']]) {
+   const id=`one-rule-${kind}-${index}`,block=crewSkillBlock({shape:kind,title:'Add a CSV export',task:'',providerId});
+   const f=scaffold(home,id,kind,mode,false,`Implement the captain's intent above exactly.\n\n${block}`);
+   assert.match(f.text,/\n5\. If you hit the same obstacle twice, append `blocked \[at=<epoch>\]: \{why\}` and stop; firstmate will help\.\n/,'the native source still holds rule 5');
+   const output=ok(render(home,f.source,kind,id,mode));
+   assert.ok(output.includes(block),'the skills block reaches the worker unchanged');
+   assert.doesNotMatch(output,/same obstacle twice/,`${providerId} ${kind}: no trace of the native rule`);
+   assert.equal(output.split('ordinary obstacle').length-1,1,`${providerId} ${kind}: the rule is stated once`);
+   assert.equal(output.split('\n### Obstacles\n').length-1,1);
+   assert.ok(output.includes(POINTER),output);
+   assert.equal(output.split('\n5. ').filter((_,i)=>i>0).filter(rest=>!rest.startsWith('Your final report lists')).length,1,'Rules has one rule 5');
+   assert.ok(output.includes('   Use `blocked:` only as the Obstacles section allows.'),output);
+   assert.doesNotMatch(output,/only as rule 5 allows/);
   }
  }finally{rmSync(home,{recursive:true,force:true});}
 });
