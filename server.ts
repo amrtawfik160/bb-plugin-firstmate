@@ -86,7 +86,7 @@ import { AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython } from 
 import { createDeliveries, LOST_OWNER_RECHECK_MS, canonicalPr, deliveryLine, parseForge, type DeliveryRecord } from "./lib/pr-delivery.ts";
 import { captureHostCommand, decodeHostCapture } from "./lib/host-capture.ts";
 import { selectExecution, validateLaunchCapabilities } from "./lib/execution-selection.ts";
-import { crewSkillBlock, PLAYBOOK_CHOICES, redactSecrets } from "./lib/crew-contract.ts";
+import { crewSkillBlock, PLAYBOOK_CHOICES, redactSecrets, skillRoutingLinkScript } from "./lib/crew-contract.ts";
 import { rpcContract } from "./rpc.ts";
 import {
   UPSTREAM_FIRSTMATE_SHA,
@@ -7923,6 +7923,19 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  // Runs on every deck, outside the setup stamp, so a link removed later comes back.
+  async function ensureSkillRoutingLinks(hostId: string, signal?: AbortSignal): Promise<void> {
+    try {
+      const res = await runOnHost(hostId, `bash -c ${shQuote(skillRoutingLinkScript(join(PLUGIN_ROOT, "entry-skills", "skill-routing")))}`, 30_000, signal);
+      const lines = res.output.split("\n").filter((line) => line.startsWith("skill-routing-link "));
+      const changed = lines.filter((line) => !line.startsWith("skill-routing-link kept "));
+      if (res.exitCode !== 0) bb.log.warn(`skill-routing link step failed host=${hostId}: ${truncate(res.output, 400)}`);
+      else if (changed.length > 0) bb.log.info(`skill-routing links host=${hostId}: ${changed.map((line) => line.slice("skill-routing-link ".length)).join("; ")}`);
+    } catch (error) {
+      bb.log.warn(`skill-routing link step failed host=${hostId}: ${String(error)}`);
+    }
+  }
+
   async function ensureRealModeForDeck(ctx: unknown, signal: AbortSignal | undefined): Promise<string> {
     if ((await baseSettings.get()).fullParityOnDeck) await ensureCaptainHome(ctx, signal);
     const current = await settings.get();
@@ -7951,6 +7964,7 @@ export default async function plugin(bb: BbPluginApi) {
           await installCaptainHooks(hostId, ctxString(ctx, "threadId"), current.fmHome, signal);
           signal?.throwIfAborted();await bb.storage.kv.set(setupKey,stamp);
         }
+        await ensureSkillRoutingLinks(hostId, signal);
       } catch (error) {
         if (current.fullParityOnDeck) throw new Error(`Native setup failed; captain is not ready: ${error instanceof Error ? error.message : String(error)}`);
         bb.log.warn(`Native adapter refresh failed in compatibility mode: ${String(error)}`);

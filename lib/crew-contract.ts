@@ -42,8 +42,29 @@ const SKILL_ROOTS: Readonly<Record<string, string>> = {
   pi: ".pi/agent/skills",
 };
 
+const FALLBACK_SKILL_ROOT = ".agents/skills";
+
 export function crewSkillRoot(providerId: string | null | undefined): string {
-  return `${homedir()}/${SKILL_ROOTS[providerId ?? ""] ?? ".agents/skills"}`;
+  return `${homedir()}/${SKILL_ROOTS[providerId ?? ""] ?? FALLBACK_SKILL_ROOT}`;
+}
+
+// skill-routing ships with this plugin, not with pstack, so no provider folder
+// holds it until this runs. A provider that is not installed (no parent folder)
+// is skipped; a real folder or a working link is the owner's and stays.
+export function skillRoutingLinkScript(target: string): string {
+  const q = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
+  return [
+    `t=${q(target)}`,
+    '[ -f "$t/SKILL.md" ] || { echo "skill-routing-link target-missing $t"; exit 0; }',
+    `for r in ${[...Object.values(SKILL_ROOTS), FALLBACK_SKILL_ROOT].join(" ")}; do`,
+    '  d="$HOME/$r"; p="$d/skill-routing"',
+    '  [ -d "$(dirname "$d")" ] || continue',
+    '  if [ -L "$p" ] && [ ! -e "$p" ]; then rm -f "$p"; s=repaired',
+    '  elif [ -e "$p" ] || [ -L "$p" ]; then echo "skill-routing-link kept $p"; continue',
+    '  else s=linked; fi',
+    '  if mkdir -p "$d" && ln -s "$t" "$p"; then echo "skill-routing-link $s $p"; else echo "skill-routing-link failed $p"; fi',
+    "done",
+  ].join("\n");
 }
 
 export function crewSkillBlock(input: { shape: Shape; title?: string; task: string; providerId?: string | null; playbook?: PlaybookChoice }): string {
@@ -54,8 +75,9 @@ export function crewSkillBlock(input: { shape: Shape; title?: string; task: stri
     "pstack always has priority. If a skill or rule conflicts with it, pstack wins.",
     "Until the owner confirms otherwise: spawn no sub-agents (no Task, poteto-agent or parallel workers). Do that work yourself, in this session.",
     "Until the owner confirms otherwise: Firstmate decides who merges and deploys. Follow the brief's delivery contract for merge and deploy.",
-    `Skills on this host are in \`${root}/<name>/SKILL.md\`. If one is not installed, continue without it and say so in your report.`,
-    "1. Read the skill-routing skill. Load the skills its matched rows name, plus poteto-mode, plus every skill the chosen playbook names.",
+    `Skills on this host are in \`${root}/<name>/SKILL.md\`. Load a skill by reading that file. Do not rely on a Skill tool for pstack skills; they are user-invocable only.`,
+    "If a skill is not installed, continue without it and say so in your report.",
+    `1. Read \`${root}/skill-routing/SKILL.md\`. Load the skills its matched rows name, plus poteto-mode, plus every skill the chosen playbook names.`,
     `2. Read \`${root}/poteto-mode/SKILL.md\` in full.`,
   ];
   if (playbook === "none") {
@@ -65,6 +87,7 @@ export function crewSkillBlock(input: { shape: Shape; title?: string; task: stri
       `3. Follow \`${root}/poteto-mode/playbooks/${playbook}.md\`.`,
       "4. Copy every step of that playbook into your to-do list, before any other to-do.",
       "5. Your final report lists each playbook step as \"✓ <step>\" or \"skip: <step>: <reason>\".",
+      "When a playbook step says to delegate to a sub-agent, do that step yourself in this session and report it as ✓ with \"(done in session)\", not as a skip.",
     );
   }
   lines.push("Save each screenshot as its own full-size PNG file. Never combine, stitch or downscale screenshots; link each file separately.");

@@ -1,8 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { crewPlaybook, crewSkillBlock, PLAYBOOK_CHOICES } from "./crew-contract.ts";
+import { spawnSync } from "node:child_process";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
+import { crewPlaybook, crewSkillBlock, PLAYBOOK_CHOICES, skillRoutingLinkScript } from "./crew-contract.ts";
 
 const HOME = homedir();
 
@@ -41,12 +43,14 @@ test("a feature brief gives full paths, the step checklist, no-comments and the 
     "pstack always has priority. If a skill or rule conflicts with it, pstack wins.",
     "Until the owner confirms otherwise: spawn no sub-agents (no Task, poteto-agent or parallel workers). Do that work yourself, in this session.",
     "Until the owner confirms otherwise: Firstmate decides who merges and deploys. Follow the brief's delivery contract for merge and deploy.",
-    `Skills on this host are in \`${HOME}/.claude/skills/<name>/SKILL.md\`. If one is not installed, continue without it and say so in your report.`,
-    "1. Read the skill-routing skill. Load the skills its matched rows name, plus poteto-mode, plus every skill the chosen playbook names.",
+    `Skills on this host are in \`${HOME}/.claude/skills/<name>/SKILL.md\`. Load a skill by reading that file. Do not rely on a Skill tool for pstack skills; they are user-invocable only.`,
+    "If a skill is not installed, continue without it and say so in your report.",
+    `1. Read \`${HOME}/.claude/skills/skill-routing/SKILL.md\`. Load the skills its matched rows name, plus poteto-mode, plus every skill the chosen playbook names.`,
     `2. Read \`${HOME}/.claude/skills/poteto-mode/SKILL.md\` in full.`,
     `3. Follow \`${HOME}/.claude/skills/poteto-mode/playbooks/feature.md\`.`,
     "4. Copy every step of that playbook into your to-do list, before any other to-do.",
     "5. Your final report lists each playbook step as \"✓ <step>\" or \"skip: <step>: <reason>\".",
+    "When a playbook step says to delegate to a sub-agent, do that step yourself in this session and report it as ✓ with \"(done in session)\", not as a skip.",
     "Save each screenshot as its own full-size PNG file. Never combine, stitch or downscale screenshots; link each file separately.",
     `Before you open a PR, run /no-comments (\`${HOME}/.claude/skills/no-comments/SKILL.md\`) over your diff.`,
   ].join("\n"));
@@ -82,6 +86,61 @@ test("each provider's brief points at the folder where that provider reads skill
     const block = crewSkillBlock({ shape: "ship", title: "Perf 1: workflow admission contention", task: "", providerId });
     assert.ok(block.includes(`2. Read \`${HOME}/${root}/poteto-mode/SKILL.md\` in full.`), `${providerId}: ${block}`);
     assert.ok(block.includes(`3. Follow \`${HOME}/${root}/poteto-mode/playbooks/perf-issue.md\`.`), `${providerId}: ${block}`);
+  }
+});
+
+test("every brief says to load skills as files, names the skill-routing file and counts in-session delegate steps as done", () => {
+  for (const [providerId, root] of [["claude-code", ".claude/skills"], ["codex", ".codex/skills"], [null, ".agents/skills"]] as const) {
+    const block = crewSkillBlock({ shape: "ship", title: "Fix agent computer feature", task: "", providerId });
+    assert.ok(block.includes("Load a skill by reading that file. Do not rely on a Skill tool for pstack skills; they are user-invocable only."), block);
+    assert.ok(block.includes(`1. Read \`${HOME}/${root}/skill-routing/SKILL.md\`.`), block);
+    assert.ok(block.includes("When a playbook step says to delegate to a sub-agent, do that step yourself in this session and report it as ✓ with \"(done in session)\", not as a skip."), block);
+    assert.ok(block.includes("spawn no sub-agents"), block);
+  }
+  const deploy = crewSkillBlock({ shape: "ship", title: "Deploy + merge #2155", task: "" });
+  assert.ok(deploy.includes(`1. Read \`${HOME}/.agents/skills/skill-routing/SKILL.md\`.`), deploy);
+  assert.ok(!deploy.includes("(done in session)"), deploy);
+});
+
+test("the skill-routing link step links a missing entry, repairs a broken link and leaves a real folder or a working link alone", () => {
+  const home = mkdtempSync(join(tmpdir(), "fm-skill-link-"));
+  try {
+    const target = join(home, "plugin/entry-skills/skill-routing");
+    const other = join(home, "other/skill-routing");
+    for (const dir of [target, other]) {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "SKILL.md"), "routing\n");
+    }
+    mkdirSync(join(home, ".claude"));
+    mkdirSync(join(home, ".codex/skills"), { recursive: true });
+    symlinkSync(join(home, "gone/skill-routing"), join(home, ".codex/skills/skill-routing"));
+    mkdirSync(join(home, ".cursor/skills/skill-routing"), { recursive: true });
+    writeFileSync(join(home, ".cursor/skills/skill-routing/SKILL.md"), "owner copy\n");
+    mkdirSync(join(home, ".grok/skills"), { recursive: true });
+    symlinkSync(other, join(home, ".grok/skills/skill-routing"));
+    const run = () => spawnSync("bash", ["-c", skillRoutingLinkScript(target)], { encoding: "utf8", env: { PATH: process.env.PATH ?? "", HOME: home } });
+    const first = run();
+    assert.equal(first.status, 0, first.stderr);
+    assert.deepEqual(first.stdout.trim().split("\n").sort(), [
+      `skill-routing-link kept ${home}/.cursor/skills/skill-routing`,
+      `skill-routing-link kept ${home}/.grok/skills/skill-routing`,
+      `skill-routing-link linked ${home}/.claude/skills/skill-routing`,
+      `skill-routing-link repaired ${home}/.codex/skills/skill-routing`,
+    ]);
+    assert.equal(readlinkSync(join(home, ".claude/skills/skill-routing")), target);
+    assert.equal(readlinkSync(join(home, ".codex/skills/skill-routing")), target);
+    assert.ok(lstatSync(join(home, ".cursor/skills/skill-routing")).isDirectory(), "a real folder is never replaced");
+    assert.equal(readFileSync(join(home, ".cursor/skills/skill-routing/SKILL.md"), "utf8"), "owner copy\n");
+    assert.equal(readlinkSync(join(home, ".grok/skills/skill-routing")), other, "a working link is never replaced");
+    for (const absent of [".gemini", ".pi", ".agents"]) assert.ok(!existsSync(join(home, absent)), `${absent} must not be created`);
+    const second = run();
+    assert.equal(second.status, 0, second.stderr);
+    assert.ok(second.stdout.trim().split("\n").every((line) => line.startsWith("skill-routing-link kept ")), second.stdout);
+    const missing = spawnSync("bash", ["-c", skillRoutingLinkScript(join(home, "no-plugin/skill-routing"))], { encoding: "utf8", env: { PATH: process.env.PATH ?? "", HOME: home } });
+    assert.equal(missing.status, 0, missing.stderr);
+    assert.match(missing.stdout, /^skill-routing-link target-missing /);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
   }
 });
 
