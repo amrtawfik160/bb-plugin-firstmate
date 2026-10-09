@@ -1488,7 +1488,7 @@ const BB_SKILL_RUNTIME_CONTRACT = [
   "Load native policy skills and their references with firstmate_skill (bb firstmate skill <name> [reference] [--source <selected-root source-file>]); it reads this captain’s selected runtime. Native AGENTS.md means firstmate_contract; bin and docs mean the selected runtime, while data, state and config mean the exact bound captain home returned by deck.",
   "Map workers, panes, and tabs to BB crew threads via firstmate_dispatch/tell/interrupt/retry/stop. Call firstmate_watch once per batch; it hands off to private durable wakes. End the turn; never retry or poll.",
   "Use BB interactions for captain questions and approvals. firstmate_deliveries retains open PRs after worker retirement and wake acknowledgement. Continue authorized review/fix/merge work using the author for fixes and preserving the agreed native review and validation path, including independent review when required; merge through firstmate_merge. Inspect unresolved delivery records after compaction or handoff.",
-  "Run firstmate_toolchain for native dependency detection. For browser work use the /browser skill and browser_script (or bb browser script), with profileId unset for the thread-isolated default. This replaces native chrome-devtools-axi transport. Read config/lavish-axi-host for remote Lavish access and use bb connect expose for a board the captain should see.",
+  "Run firstmate_toolchain for native dependency detection. For browser work use the /browser skill and browser_script (or bb plugin run browser script), with profileId unset for the thread-isolated default. This replaces native chrome-devtools-axi transport. Read config/lavish-axi-host for remote Lavish access and use bb connect expose for a board the captain should see.",
   "Treat tmux, herdr, zellij, cmux, orca, and harness-specific hook setup as reference material unless the active backend explicitly names that runtime.",
 ].join(" ");
 
@@ -10229,7 +10229,7 @@ export default async function plugin(bb: BbPluginApi) {
       const tally = await bbCliErrorTally(hostId, signal);
       if (tally !== "") body = `${body}\n${tally}`;
     }
-    const output = [body, "Browser: use /browser with browser_script or bb browser script; leave profileId unset."].join("\n");
+    const output = [body, "Browser: use /browser with browser_script or bb plugin run browser script; leave profileId unset."].join("\n");
     return {
       ready: !/^(MISSING:|MISSING_MANUAL:|BACKEND_INVALID:)/m.test(output),
       presentationReady: !/^PRESENTATION_UNAVAILABLE:/m.test(output),

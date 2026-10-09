@@ -44,6 +44,16 @@ for(const pin of pins) test(`native ${pin.slice(0,8)} worker renderer preserves 
  }finally{rmSync(home,{recursive:true,force:true});}
 });
 
+test('crew brief names the browser plugin command that exists, not the absent core one',()=>{
+ const home=fixture();try {
+  for(const [id,kind,mode] of [['browser-ship','ship','direct-PR'],['browser-scout','scout','']]) {
+   const f=scaffold(home,id,kind,mode);const output=ok(render(home,f.source,kind,id,mode));
+   assert.match(output,/browser_script \(or bb plugin run browser script\)/);
+   assert.doesNotMatch(output,/bb browser script/,'bb browser has no script command');
+  }
+ }finally{rmSync(home,{recursive:true,force:true});}
+});
+
 test('renderer rejects changed anchors, contradictory legacy output and wrong native mode before printing any prompt',()=>{
  const home=fixture();try {
   const f=scaffold(home,'strict');

@@ -132,7 +132,8 @@ Confirmed live crew reports stay durable during the captain turn and are acknowl
 
 Run `bb firstmate toolchain` (or `firstmate_toolchain`) to check the native AXI
 dependencies and Lavish compatibility without changing fleet state. Captain
-and crew instructions use `/browser` (`browser_script`) for browser work, with
+and crew instructions use `/browser` (`browser_script`, or
+`bb plugin run browser script` from a shell) for browser work, with
 thread-isolated profiles. Other AXI tools, including Lavish, retain their roles. See the
 [toolchain requirements and verification](docs/axi-toolchain.md).
 
@@ -247,18 +248,46 @@ native re-rings for that record; ordinary tells retain native recovery behavior.
 
 ## Automatic compaction
 
-Firstmate compacts idle captain and crew threads only when measured usage reaches
-90% of the model's context window and the `captainCompactAtTokens` minimum.
-Estimated usage, unknown capacity, and totals larger than the context window do
-not trigger it. When the provider reports its own automatic compaction threshold,
-Firstmate leaves compaction to that provider.
+Firstmate compacts an idle captain or crew thread when its used tokens reach
+the trigger. Two settings define the trigger:
 
-The minimum interval remains 20 minutes per thread. An unchanged reading cannot
-trigger another attempt after that interval or a plugin reload; usage that falls
-below 90% clears that reading so future growth can qualify again. Concurrent
-checks share one attempt, and thread status is checked again before compaction.
-Set `captainCompactAtTokens` to `0` to disable Firstmate's automatic compaction.
-Manual compaction and the provider's own compaction remain available.
+- `captainCompactAtTokens`: a minimum token count. Default `200000`. `0` turns
+  Firstmate's automatic compaction off.
+- `captainCompactAtRatio`: a share of the model's context window. Default
+  `0.6`. Range `0.1` to `1`. A value of `0` or less, or above `1`, also turns
+  it off.
+
+The trigger is the larger of the two:
+
+```
+trigger = max(captainCompactAtTokens, context window x captainCompactAtRatio)
+```
+
+Worked examples with the defaults:
+
+| Context window | Window x 0.6 | Trigger |
+| --- | --- | --- |
+| 200,000 tokens | 120,000 tokens | 200,000 tokens (the minimum wins) |
+| 1,000,000 tokens | 600,000 tokens | 600,000 tokens (the ratio wins) |
+
+On a 200,000-token window the default trigger equals the whole window, so
+Firstmate in practice leaves that thread to the provider. Lower
+`captainCompactAtTokens` (for example to `120000`) to compact such a thread at
+60%.
+
+Estimated readings count. Unknown usage, unknown window size, and usage larger
+than the window do not trigger compaction. When the provider reports its own
+automatic compaction threshold, Firstmate leaves compaction to the provider
+only if that threshold is at or below the trigger. A higher provider threshold
+does not stop Firstmate.
+
+Firstmate checks a thread when its turn ends, and sweeps idle captains every 30
+minutes. The minimum interval between attempts is 20 minutes per thread. An
+unchanged reading cannot trigger another attempt after that interval or a
+plugin reload. A measured reading below 90% of the window clears the stored
+reading, so later growth can qualify again. Concurrent checks share one
+attempt, and thread status is checked again before compaction. Manual
+compaction and the provider's own compaction remain available.
 
 ## Development
 

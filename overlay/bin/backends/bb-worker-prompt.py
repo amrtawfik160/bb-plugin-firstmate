@@ -125,7 +125,7 @@ def render(brief, kind, task_id, home, bindir, role, transport, mode=''):
     references.append('# Native no-mistakes daemon operational reference\n' + before_inbox[daemon_start:pool_start])
     before_inbox = before_inbox[:daemon_start] + '     Before reporting a pipeline block, read and follow the Native no-mistakes daemon operational reference below. It distinguishes a real daemon/socket block from a drive call timeout while the run continues.\n' + before_inbox[pool_start:]
     rules = before_inbox + new_inbox + memory
-    browser = '3. Use gh-axi for GitHub operations. For browser work use the /browser skill and browser_script (or bb browser script), leaving profileId unset for this thread\'s isolated default profile. Do not use the AXI browser or install its hooks.'
+    browser = '3. Use gh-axi for GitHub operations. For browser work use the /browser skill and browser_script (or bb plugin run browser script), leaving profileId unset for this thread\'s isolated default profile. The CLI form is bb plugin run browser script --purpose <text> --code <source> --origin <origin> [--json]; --json prints one object {ok, output, screenshots}. Do not use the AXI browser or install its hooks.'
     rules = rules.replace(BROWSER, '<!-- BB-DIVERGE: native fm-brief.sh Rules / rule 3; BB browser transport. -->\n' + browser, 1)
     allowed = f'2. Work in the task worktree. The only writes allowed outside it are the task status file `{status}`, message acknowledgement files under `{inbox}/` and `{inbox}/handled/`, and task artifacts under `{artifact}`'
     if kind == 'scout':

@@ -343,7 +343,7 @@ fm_backend_bb_create_task() {  # <window-name> <project-path> <task-id> <kind> <
   if [ "$kind" = secondmate ]; then
     prompt="You are a persistent Firstmate secondmate captain inside BB.
 Your native home is $project. Read $project/AGENTS.md and data/charter.md. Take the deck using firstmate_deck; your home binding is installed by the launcher. Dispatch and supervise crews within your charter using native Firstmate policy and AXI tools. Persist open work in your home before stopping.
-For browser work use the /browser skill and browser_script (or bb browser script), leaving profileId unset for this thread's isolated default profile. This overrides native chrome-devtools-axi instructions; do not use the AXI browser or install its hooks.
+For browser work use the /browser skill and browser_script (or bb plugin run browser script), leaving profileId unset for this thread's isolated default profile. This overrides native chrome-devtools-axi instructions; do not use the AXI browser or install its hooks.
 
 $prompt"
   else

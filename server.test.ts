@@ -165,6 +165,8 @@ test("captain metadata loads the full skill set", async () => {
     assert.ok(cfg.tools.some((tool) => tool.name === "firstmate_toolchain"));
     assert.match(cfg.instructions ?? "", /firstmate_toolchain/);
     assert.match(cfg.instructions ?? "", /\/browser skill and browser_script/);
+    assert.match(cfg.instructions ?? "", /bb plugin run browser script/);
+    assert.doesNotMatch(cfg.instructions ?? "", /bb browser script/, "bb browser has no script command");
     assert.match(cfg.instructions ?? "", /lavish-axi/);
     assert.deepEqual(
       cfg.tools.map((tool) => tool.name).sort(),
@@ -7929,6 +7931,8 @@ test("IT BB secondmate launch keeps captain role and seeded home; stop failures 
     assert.ok(launch.includes("--prompt-file"));
     assert.match(prompt, /persistent Firstmate secondmate captain/);
     assert.match(prompt, /\/browser skill and browser_script/);
+    assert.match(prompt, /bb plugin run browser script/);
+    assert.doesNotMatch(prompt, /bb browser script/, "bb browser has no script command");
     assert.match(prompt, /profileId unset/);
     assert.doesNotMatch(prompt, /Do not dispatch nested crews/);
     assert.ok(launch.includes("--shape") && launch.includes("secondmate"));
@@ -8113,6 +8117,8 @@ test("IT BB bootstrap uses browser plugin without requiring AXI browser", { skip
     const report = JSON.parse(result.stdout);
     assert.equal(report.ready, true, report.output);
     assert.match(report.output, /Browser: use \/browser with browser_script/);
+    assert.match(report.output, /bb plugin run browser script/);
+    assert.doesNotMatch(report.output, /bb browser script/, "bb browser has no script command");
     assert.doesNotMatch(report.output, /MISSING: chrome-devtools-axi/);
     const native = spawnSync(join(home, "bin/fm-bootstrap.sh"), [], {
       env: { ...process.env, FM_HOME: home, FM_BACKEND: "tmux", BASH_ENV: probe, FM_BOOTSTRAP_DETECT_ONLY: "1", FM_BOOTSTRAP_NETWORK: "skip" },
