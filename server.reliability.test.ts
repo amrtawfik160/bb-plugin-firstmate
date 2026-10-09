@@ -861,11 +861,13 @@ test("a held crew doorbell that fails to send on release is kept for the next re
     await captainIdle(host);
     assert.equal(store.pending("thr_cap"), 2, "a failed send must not drop the held doorbells");
 
+    const refused = doorbells().length;
     host.harness.sdk.stub("threads.send", async () => ({}));
     await captainIdle(host);
     assert.equal(store.pending("thr_cap"), 0);
-    assert.equal(doorbells().filter((sent) => /crew c1 idle/.test(sent)).length, 1);
-    assert.equal(doorbells().filter((sent) => /crew c2 idle/.test(sent)).length, 1);
+    const delivered = doorbells().slice(refused);
+    assert.equal(delivered.filter((sent) => /crew c1 idle/.test(sent)).length, 1);
+    assert.equal(delivered.filter((sent) => /crew c2 idle/.test(sent)).length, 1);
   } finally {
     await host.harness.lifecycle.dispose();
   }

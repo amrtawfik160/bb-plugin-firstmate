@@ -4604,9 +4604,19 @@ export default async function plugin(bb: BbPluginApi) {
     } catch (error) {
       // An unload interrupts the attempt; the job stays due and the next load resumes it.
       if (launchAbort.signal.aborted) return;
+      const message = error instanceof Error ? error.message : String(error);
       const failed = dispatchJobs.get(reservedId);
-      if (failed) dispatchJobs.save({ ...failed, state: "failed", error: String(error) });
-      bb.log.warn(`async dispatch ${reservedId}: ${String(error)}`);
+      // Another dispatch took the last slot after this one was admitted. The job keeps
+      // its full input and stays due, so it starts once a slot opens.
+      if (failed && /Crew cap reached/.test(message)) {
+        dispatchJobs.save({ ...failed, state: "queued", error: message });
+        return;
+      }
+      if (failed) dispatchJobs.save({ ...failed, state: "failed", error: message });
+      bb.log.warn(`async dispatch ${reservedId}: ${message}`);
+      // The tool already answered "Reserved", so this is the captain's only notice.
+      await deliverToCaptain(job.captainThreadId, `Dispatch failed: crew ${reservedId} did not start: ${truncate(message, 300)} Fix the cause, then dispatch again with taskId=${reservedId}.`, reservedId, undefined, true)
+        .catch((notifyError) => bb.log.warn(`async dispatch ${reservedId} failure notice: ${String(notifyError)}`));
     } finally {
       dispatchInFlight.delete(reservedId);
     }
@@ -4776,8 +4786,10 @@ export default async function plugin(bb: BbPluginApi) {
     const flags = await reliabilityFlags();
     if (flags.asyncDispatch === "on") {
       for (const row of doorbellHold.drain(captainThreadId)) {
-        await sendCaptainWake(captainThreadId, row.text, row.crewId ?? "held-doorbell", signal)
-          .catch((error) => bb.log.warn(`held doorbell drain: ${String(error)}`));
+        // A send that fails, or that a reload cuts, keeps the doorbell held for the next drain.
+        const sent = await sendCaptainWake(captainThreadId, row.text, row.crewId ?? "held-doorbell", signal)
+          .catch((error) => { bb.log.warn(`held doorbell drain: ${String(error)}`); return false; });
+        if (!sent) doorbellHold.enqueue({ captainThreadId, text: row.text, crewId: row.crewId, urgent: row.urgent, createdAt: row.createdAt });
       }
       await drainQueuedDispatches(captainThreadId);
     }
