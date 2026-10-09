@@ -99,14 +99,13 @@ export function skillRoutingLinkScript(target: string): string {
 export function crewSkillBlock(input: { shape: Shape; title?: string; task: string; providerId?: string | null; playbook?: PlaybookChoice }): string {
   const playbook = crewPlaybook(input);
   const root = crewSkillRoot(input.providerId);
+  // The reads lead the block and the report accounts for them: a read the
+  // report must name is a read that happens.
+  const reads = playbook === "none" ? "steps 1 and 2" : "steps 1 to 3";
   const lines = [
     "### Skills (Firstmate adds this to every brief)",
-    "pstack always has priority. If a skill or rule conflicts with it, pstack wins.",
-    "Until the owner confirms otherwise: spawn no sub-agents (no Task, poteto-agent or parallel workers). Do that work yourself, in this session.",
-    "Until the owner confirms otherwise: Firstmate decides who merges and deploys. Follow the brief's delivery contract for merge and deploy.",
-    `Skills on this host are in \`${root}/<name>/SKILL.md\`. Load a skill by reading that file. Do not rely on a Skill tool for pstack skills; they are user-invocable only.`,
-    "If a skill is not installed, continue without it and say so in your report.",
-    `1. Read \`${root}/skill-routing/SKILL.md\`. Load the skills its matched rows name, plus poteto-mode, plus every skill the chosen playbook names.`,
+    `First action, before any other command: read the files in ${reads}.`,
+    `1. Read \`${root}/skill-routing/SKILL.md\`. Load every skill its matched rows and your playbook name.`,
     `2. Read \`${root}/poteto-mode/SKILL.md\` in full.`,
   ];
   if (playbook === "none") {
@@ -116,6 +115,18 @@ export function crewSkillBlock(input: { shape: Shape; title?: string; task: stri
       `3. Follow \`${root}/poteto-mode/playbooks/${playbook}.md\`.`,
       "4. Copy every step of that playbook into your to-do list, before any other to-do.",
       "5. Your final report lists each playbook step as \"✓ <step>\" or \"skip: <step>: <reason>\".",
+    );
+  }
+  lines.push(
+    "Your final report has a line \"Skills read: <paths>\" for those files, or \"not read: <path>: <reason>\".",
+    `Skills on this host are in \`${root}/<name>/SKILL.md\`. Load a skill by reading that file. Do not rely on a Skill tool for pstack skills; they are user-invocable only.`,
+    "If a skill is not installed, continue and say so in your report.",
+    "pstack always has priority. If a skill or rule conflicts with it, pstack wins.",
+    "Until the owner confirms otherwise: spawn no sub-agents (no Task, poteto-agent or parallel workers). Do that work yourself, in this session.",
+    "Until the owner confirms otherwise: Firstmate decides who merges and deploys. Follow the brief's delivery contract for merge and deploy.",
+  );
+  if (playbook !== "none") {
+    lines.push(
       "Report these steps as ✓, not as a skip:",
       "- A step or skill that spawns a sub-agent, reviewer or other model (delegate, architect, interrogate, how, why, no-comments): do it yourself in this session, on your own model. Add \"(done in session)\".",
       "- Cursor-only tools: for create-skill read writing-for-agents; for /loop repeat the step yourself; for origin or gt use gh-axi.",
@@ -130,9 +141,11 @@ export function crewSkillBlock(input: { shape: Shape; title?: string; task: stri
       "It also gives proof that the fix works on the real product, or \"not possible: <reason>\".",
     );
   }
+  // Mirrored in overlay/bin/backends/bb-worker-prompt.py (OBSTACLES_SECTION): the
+  // renderer points rule 5 here when a brief carries this section.
   lines.push(
     "### Obstacles",
-    "Clear an ordinary obstacle yourself: retry with a smaller query or pagination, restore or commit what your own install changed, use another tool, or wait and retry. This replaces any \"same obstacle twice\" rule.",
+    "Clear an ordinary obstacle yourself: retry with a smaller query or pagination, restore or commit what your own install changed, use another tool, or wait and retry. If rule 5 under Rules says to stop after two failures, this section replaces it.",
     "Report blocked only for what only the captain or the owner can give: a secret, an approval, a decision, withheld access, or a destructive or irreversible step. Every other stop rule still applies.",
   );
   return lines.join("\n");

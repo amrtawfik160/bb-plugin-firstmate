@@ -20,6 +20,9 @@ WRITES = {
 }
 SAME_OBSTACLE = '5. If you hit the same obstacle twice, append `blocked [at=<epoch>]: {why}` and stop; firstmate will help.'
 STUCK = '   Use `blocked:` when you are stuck and need help.'
+# Mirrored from lib/crew-contract.ts: the opening of the Obstacles section that
+# Firstmate adds to a dispatched brief.
+OBSTACLES_SECTION = '\n### Obstacles\nClear an ordinary obstacle yourself: '
 UNSTABLE_CHECK = ' A command that changes tracked files (a dependency install, a code generator) is not source-stable: run it directly, then restore or commit what it changed.'
 OLD_ARTIFACT = '\n\nBB-DIVERGE: Keep durable artifacts under data/<task-id>/ in this firstmate home, not the worktree tmp/. The worktree tmp/ is removed when the workspace is archived.\n'
 
@@ -128,8 +131,15 @@ def render(brief, kind, task_id, home, bindir, role, transport, mode=''):
     references.append('# Native no-mistakes daemon operational reference\n' + before_inbox[daemon_start:pool_start])
     before_inbox = before_inbox[:daemon_start] + '     Before reporting a pipeline block, read and follow the Native no-mistakes daemon operational reference below. It distinguishes a real daemon/socket block from a drive call timeout while the run continues.\n' + before_inbox[pool_start:]
     require(before_inbox.count(SAME_OBSTACLE) == 1 and before_inbox.count(STUCK) == 1, 'native blocked-rule anchor changed')
-    obstacles = '5. Work through an ordinary obstacle yourself first: retry with a smaller query or pagination, restore or commit a change your own command made (such as an install that rewrote a lockfile), use another tool, or wait and retry. Append `blocked [at=<epoch>]: {what you need}` and stop only for what only firstmate or the owner can give: a secret, an approval, a decision, access that was withheld, or a destructive or irreversible step. Every other stop rule in this brief still applies.'
-    before_inbox = before_inbox.replace(SAME_OBSTACLE, '<!-- BB-DIVERGE: native fm-brief.sh Rules / rule 5; ordinary obstacles are the worker\'s to clear. -->\n' + obstacles, 1).replace(STUCK, '   Use `blocked:` only as rule 5 allows.', 1)
+    # A dispatched brief states the obstacle rule in its own Obstacles section;
+    # rule 5 then only points there. A brief without it gets the rule here.
+    if task.count(OBSTACLES_SECTION) == 1:
+        obstacles = '5. Follow the Obstacles section of the Task above. When it allows a stop, append `blocked [at=<epoch>]: {what you need}` and stop.'
+        stuck = '   Use `blocked:` only as the Obstacles section allows.'
+    else:
+        obstacles = '5. Work through an ordinary obstacle yourself first: retry with a smaller query or pagination, restore or commit a change your own command made (such as an install that rewrote a lockfile), use another tool, or wait and retry. Append `blocked [at=<epoch>]: {what you need}` and stop only for what only firstmate or the owner can give: a secret, an approval, a decision, access that was withheld, or a destructive or irreversible step. Every other stop rule in this brief still applies.'
+        stuck = '   Use `blocked:` only as rule 5 allows.'
+    before_inbox = before_inbox.replace(SAME_OBSTACLE, '<!-- BB-DIVERGE: native fm-brief.sh Rules / rule 5; ordinary obstacles are the worker\'s to clear. -->\n' + obstacles, 1).replace(STUCK, stuck, 1)
     rules = before_inbox + new_inbox + memory
     browser = '3. Use gh-axi for GitHub operations. For browser work use the /browser skill and browser_script (or bb plugin run browser script), leaving profileId unset for this thread\'s isolated default profile. The CLI form is bb plugin run browser script --purpose <text> --code <source> --origin <origin> [--json]; --json prints one object {ok, output, screenshots}. Do not use the AXI browser or install its hooks.'
     rules = rules.replace(BROWSER, '<!-- BB-DIVERGE: native fm-brief.sh Rules / rule 3; BB browser transport. -->\n' + browser, 1)

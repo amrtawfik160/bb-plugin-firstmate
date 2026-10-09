@@ -85,7 +85,7 @@ test('a dispatched brief states the obstacle rule once, in its Obstacles section
    const output=ok(render(home,f.source,kind,id,mode));
    assert.ok(output.includes(block),'the skills block reaches the worker unchanged');
    assert.doesNotMatch(output,/same obstacle twice/,`${providerId} ${kind}: no trace of the native rule`);
-   assert.equal(output.split('ordinary obstacle').length-1,1,`${providerId} ${kind}: the rule is stated once`);
+   assert.equal(output.split('n ordinary obstacle yourself').length-1,1,`${providerId} ${kind}: the rule is stated once`);
    assert.equal(output.split('\n### Obstacles\n').length-1,1);
    assert.ok(output.includes(POINTER),output);
    assert.equal(output.split('\n5. ').filter((_,i)=>i>0).filter(rest=>!rest.startsWith('Your final report lists')).length,1,'Rules has one rule 5');
