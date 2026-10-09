@@ -889,3 +889,26 @@ test("an over-cap dispatch starts within a minute when a slot opens without a cr
     await host.harness.lifecycle.dispose();
   }
 });
+
+test("turning asyncDispatch off still starts the over-cap work and sends the doorbells it already holds", async () => {
+  const host = await knownCaptainHost();
+  try {
+    await asyncOn(host);
+    await host.bb.storage.kv.set("crews", Array.from({ length: 10 }, (_, i) => crewRow(`c${i + 1}`, `thr_c${i + 1}`)));
+    let busy = true;
+    stubSpawn(host, (threadId) => (threadId === "thr_cap" || !busy ? "idle" : "active"));
+    const queued = await tool(host, "firstmate_dispatch").execute({ task: "fix flaky login", projectId: "proj_1" }, capCtx);
+    assert.match(text(queued), /Queued as/);
+    const store = createDoorbellHold(host.bb.storage.database());
+    store.enqueue({ captainThreadId: "thr_cap", text: "🔔 crew c1 idle [ship] :: fix login", crewId: "c1", urgent: false, createdAt: 1 });
+
+    await host.harness.behavior.setSettings({ fmReliability: JSON.stringify({ asyncDispatch: "off" }) });
+    busy = false;
+    await captainIdle(host);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 1, "the queued dispatch started");
+    assert.equal(store.pending("thr_cap"), 0);
+    assert.equal(captainSends(host).filter((sent) => /crew c1 idle/.test(sent)).length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
