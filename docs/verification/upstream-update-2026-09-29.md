@@ -32,8 +32,8 @@ to `2d833ff147cd26a5c461e914e06854e0eb2707ce` (36 upstream commits).
 
 ## Installed outcome
 
-- `bin/fm-update.sh` fast-forwarded `/root/firstmate` and the three live captain
-  homes (`thr_4e7xd2z94s`, `thr_pn4bde9b68`, `thr_yr4ppi2r3i`) to the pin. No
+- `bin/fm-update.sh` fast-forwarded `$FIRSTMATE_HOME` and the three live captain
+  homes (`thr_example20`, `thr_example21`, `thr_example22`) to the pin. No
   secondmates needed a restart or a re-read nudge.
 - Every home's BB mirror was rebuilt and passes `--verify`. Every tracked tree
   is clean.

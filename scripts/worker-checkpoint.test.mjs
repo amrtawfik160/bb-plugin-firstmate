@@ -180,7 +180,7 @@ test('a background check gives the unit HOME and the caller environment',{skip:!
 test('reports and check output hide secret values but keep variable names',()=>{
  const f=fixture();try {
   f.setup();
-  const secrets=['prod:happy-otter-123|eyJ2MiI6ImFiY2RlZjAxMjM0NTY3ODkifQ==','sk_live_51HabcdefGHIJKLmnop','hunter2-Secret!','9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08'];
+  const secrets=['prod:happy-otter-123|eyJ2MiI6ImFiY2RlZjAxMjM0NTY3ODkifQ==','sk_live_51HabcdefGHIJKLmnop','hunter2-Secret!','9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08']; // gitleaks:allow (made-up fixture values)
   const notes=`CONVEX_DEPLOY_KEY=${secrets[0]}\nexport STRIPE_SECRET_KEY="${secrets[1]}"\nDB_PASSWORD: ${secrets[2]}\nsha ${secrets[3]}\n`;
   const result=spawnSync('python3',[helper,'task','report','working',`deploy used API_TOKEN=${secrets[1]}`],{cwd:f.worktree,env:f.env,input:notes,encoding:'utf8'});
   assert.equal(result.status,0,result.stderr);

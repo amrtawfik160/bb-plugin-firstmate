@@ -18,7 +18,7 @@ Validation:
 
 - `npm test`: 563 passed, 2 skipped, 0 failed (565 total). The two skips are existing scout report/inventory recovery cases.
 - `npx tsc --noEmit`: passed.
-- `npm run fidelity -- --native /root/firstmate`: passed; 33 checked files, 12 divergence anchors, 7 adaptation fences.
+- `npm run fidelity -- --native $FIRSTMATE_HOME`: passed; 33 checked files, 12 divergence anchors, 7 adaptation fences.
 - `scripts/live-startup-harness-check.mjs`: real full native startup acquired the calling harness lock and recorded startup completion; the detached process refused read-only and preserved that owner. Tracked native files stayed clean.
 - `--mutate-host-transport`: failed the real harness-lock acquisition assertion, reproducing the old transport bug.
 - Tool and CLI regression cases reject detached startup execution and preserve shell arguments literally.

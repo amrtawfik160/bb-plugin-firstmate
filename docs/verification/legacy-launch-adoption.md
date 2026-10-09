@@ -23,8 +23,8 @@ home, host, project checkout, task, generation, mode and delivery requirement.
 For the supplied case, the proposed exact command is:
 
 ```sh
-bb firstmate launches adopt 574cbb72 --thread thr_bu9ygrwxem --check --json
-bb firstmate launches adopt 574cbb72 --thread thr_bu9ygrwxem --json
+bb firstmate launches adopt 574cbb72 --thread thr_example02 --check --json
+bb firstmate launches adopt 574cbb72 --thread thr_example02 --json
 ```
 
 These commands have **not** been run on the supplied captain or worker. The

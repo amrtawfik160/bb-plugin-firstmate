@@ -12,7 +12,7 @@ The final candidate `5f00f7e81cea525b9e4fd34a725939c0e06eab7f` passed independen
 
 ## Live repair
 
-The owning captain is `thr_mhk69hwvxe`, task `574cbb72`, worker `thr_bu9ygrwxem`, project `proj_5s59gfpfqq`.
+The owning captain is `thr_example03`, task `574cbb72`, worker `thr_example02`, project `proj_example01`.
 
 The supported `launches adopt ... --check` command confirmed eligibility using the actual SDK identity, original prompt, native task, environment, and repository evidence. The same command without `--check` completed registration. `firstmate crew 574cbb72` returned the existing worker, owner, execution settings, preserved native done state, and no open decisions.
 
@@ -24,6 +24,6 @@ Separate durable obligations were registered for [PR 2043](https://github.com/Cy
 
 ## Evidence
 
-Raw parent logs and preservation snapshots are under `/tmp/fm-adoption-parent/`. Durable selected evidence is under `/root/firstmate-bb-homes/thr_jm4qnewqmf/data/legacy-launch-adoption-20261004/`.
+Raw parent logs and preservation snapshots are under `/tmp/fm-adoption-parent/`. Durable selected evidence is under `$CAPTAIN_HOMES/thr_example04/data/legacy-launch-adoption-20261004/`.
 
 This acceptance proves registration and delivery tracking. It does not claim either PR has merged.

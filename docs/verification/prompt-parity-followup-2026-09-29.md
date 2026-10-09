@@ -2,7 +2,7 @@
 
 Requirement: preserve upstream Firstmate prompts and behavior; change only what BB environment/CLI transport requires.
 
-Upstream: `/root/firstmate`, `2d833ff147cd26a5c461e914e06854e0eb2707ce`. Plugin baseline: `ee1a87afc63d377d0cf69b610c142399f08ec062`, plus the existing uncommitted parity changes. The review includes active runtime paths outside that diff. Two independent reviewers covered Standards and Spec. This audit initially changed documentation only. The findings below record that audit baseline; subsequent fixes and remaining validation limits are tracked in [the resolution report](native-policy-fixes-2026-09-29.md).
+Upstream: `$FIRSTMATE_HOME`, `2d833ff147cd26a5c461e914e06854e0eb2707ce`. Plugin baseline: `ee1a87afc63d377d0cf69b610c142399f08ec062`, plus the existing uncommitted parity changes. The review includes active runtime paths outside that diff. Two independent reviewers covered Standards and Spec. This audit initially changed documentation only. The findings below record that audit baseline; subsequent fixes and remaining validation limits are tracked in [the resolution report](native-policy-fixes-2026-09-29.md).
 
 ## Standards
 

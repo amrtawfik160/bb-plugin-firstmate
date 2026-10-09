@@ -46,7 +46,7 @@ The actual discovery test now runs separately through both entrypoints. Each ser
 env -u BB_CLI -u BB_INFERENCE -u BB_INFERENCE_FALLBACK -u BB_TRANSCRIPTION \
   -u BB_THREAD_ID -u BB_PROJECT_ID -u BB_ENVIRONMENT_ID -u BB_HOST_ID \
   -u BB_SERVER_URL -u BB_HOST_DAEMON_PORT -u BB_DATA_DIR \
-  HOME=/root SHELL=/bin/bash PATH=/root/.local/bin:/root/.bun/bin:/usr/local/bin:/usr/bin:/bin \
+  HOME="$HOME" SHELL=/bin/bash PATH=$HOME/.local/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin \
   FIRSTMATE_KEEP_PACKAGE_EVIDENCE=1 \
   node --test --experimental-strip-types scripts/plugin-package-discovery.test.mjs
 node scripts/bb-runtime-fixture-mutation.mjs

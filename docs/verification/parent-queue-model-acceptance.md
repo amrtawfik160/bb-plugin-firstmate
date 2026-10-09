@@ -20,4 +20,4 @@ The installed native rebind helper passed `--check` against the actual stopped `
 
 The owning Firstmate received the supported explicit execution-change command targeting `acp-grok / grok-4.6 / xhigh`. Parent did not execute that replacement; the owner must apply its current user instruction and invocation-time catalog validation. Real replacement/recovery behavior is proven by disposable native helpers and SDK execution fixtures, not claimed as a production model launch here.
 
-Evidence is retained under `/root/firstmate-bb-homes/thr_jm4qnewqmf/data/queue-storage-20261004/` and `data/model-change-20261004/`. Native adapter backups and per-home checks are under `/tmp/fm-queue-model-activation/`.
+Evidence is retained under `$CAPTAIN_HOMES/thr_example04/data/queue-storage-20261004/` and `data/model-change-20261004/`. Native adapter backups and per-home checks are under `/tmp/fm-queue-model-activation/`.
