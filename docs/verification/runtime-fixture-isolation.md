@@ -13,7 +13,7 @@ Unsetting `BB_CLI` did not fix them because Bash changed executable search order
 The fixtures inherited a fake-first `PATH`, then used Node `spawnSync('bash',
 ['-c', ...])` with default piped stdin. In this environment Node supplies a
 socket-backed pipe. With `SHLVL` absent or zero, Bash's remote-shell startup
-detection reads `$HOME/.bashrc`; `/root/.bashrc` prepends `.bun/bin` and
+detection reads `$HOME/.bashrc`; the host's `~/.bashrc` prepends `.bun/bin` and
 `.local/bin` **before** the fixture directory. `bb` then resolves to the real CLI.
 An existing shell normally supplies a higher `SHLVL`, explaining the passing
 single-test and implementation-shell runs.
@@ -61,8 +61,8 @@ condition. All four native fixture variables point at the owned current mirror.
 env -u SHLVL -u BB_CLI -u BB_INFERENCE -u BB_INFERENCE_FALLBACK \
   -u BB_TRANSCRIPTION -u BB_THREAD_ID -u BB_PROJECT_ID -u BB_ENVIRONMENT_ID \
   -u BB_HOST_ID -u BB_SERVER_URL -u BB_HOST_DAEMON_PORT -u BB_DATA_DIR \
-  HOME=/root SHELL=/bin/bash \
-  PATH=/root/.local/bin:/root/.bun/bin:/usr/local/bin:/usr/bin:/bin \
+  HOME="$HOME" SHELL=/bin/bash \
+  PATH=$HOME/.local/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin \
   FM_TEST_HOME=$(cat /tmp/fm-runtime-native-fixture-final-path) \
   FIRSTMATE_TEST_NATIVE=$(cat /tmp/fm-runtime-native-fixture-final-path) \
   FM_SCOUT_NATIVE_BIN=$(cat /tmp/fm-runtime-native-fixture-final-path)/bin-bb \
@@ -79,7 +79,7 @@ new causal startup/PATH regression; the previous suite contained 798 tests.
 
 The same four focused checks also ran through an owned transient systemd unit:
 `systemd-run --wait --collect --unit=fm-fixture-isolation-owned-20261005
---property=WorkingDirectory=/root/github_projects/bb-plugin-firstmate-launch-pr-lifecycle
+--property=WorkingDirectory=$PLUGIN_CHECKOUT
 --property=RuntimeMaxSec=90`, followed by the complete focused command above.
 Result: **4/4 passed**, service exit 0. Evidence:
 `/tmp/fm-runtime-fixture-isolation-systemd-command.log` and

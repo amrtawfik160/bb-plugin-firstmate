@@ -42,11 +42,11 @@ All 11 packaged method files matched source bytes in the respective runtime pack
 
 ## Production activation
 
-Firstmate was reloaded from the integrated primary checkout. The installed plugin reports running, all four services report running, and live skill discovery lists both role-specific method skills from the plugin source. The two supervisor threads requested by the user received the update: `thr_mhk69hwvxe` and `thr_xpz3a9mtgx`. Existing workers were not restarted. Existing threads may retain old catalogs until configuration is assembled again; the update includes an exact source fallback for the next natural checkpoint. Delivery of the message is not a claim that every ongoing task has already used the methods.
+Firstmate was reloaded from the integrated primary checkout. The installed plugin reports running, all four services report running, and live skill discovery lists both role-specific method skills from the plugin source. The two supervisor threads requested by the user received the update: `thr_example03` and `thr_example05`. Existing workers were not restarted. Existing threads may retain old catalogs until configuration is assembled again; the update includes an exact source fallback for the next natural checkpoint. Delivery of the message is not a claim that every ongoing task has already used the methods.
 
 ## Evidence
 
-Durable root: `/root/firstmate-bb-homes/thr_jm4qnewqmf/data/pstack-implementation-20261004/`.
+Durable root: `$CAPTAIN_HOMES/thr_example04/data/pstack-implementation-20261004/`.
 
 - `integration.patch`, `integrated-files.json`, and `baseline-hashes.json`.
 - `parent-tests.log`, `parent-opt-in-tests.log`, `parent-typecheck.log`, `parent-fidelity.log`, and `parent-build.log`.

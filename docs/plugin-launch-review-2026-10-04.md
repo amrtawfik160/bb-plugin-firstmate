@@ -13,8 +13,8 @@ Reviewed the current checkout, including existing uncommitted changes. Inspected
 | BB CLI | 0.44.0 |
 | Plugin SDK | 0.4.104 |
 | Plugin manifest | 0.4.0 |
-| Installed native home `/root/firstmate` | `2d833ff1`, 2026-09-28 |
-| Separate checkout `/root/github_projects/firstmate` | `6f0f1399`, 2026-09-22 |
+| Installed native home `$FIRSTMATE_HOME` | `2d833ff1`, 2026-09-28 |
+| Separate checkout `$FIRSTMATE_CHECKOUT` | `6f0f1399`, 2026-09-22 |
 | Upstream HEAD fetched for review | `1f3e7696`, 2026-10-03 |
 
 Upstream HEAD contains 35 commits beyond the plugin pin. Fetching updated Git objects; it did not change either native working checkout.
@@ -33,7 +33,7 @@ This establishes an ordering defect and a silent failure path. Whether a particu
 
 **Change:** add a plugin-owned worker-creation command that invokes `sdk.threads.spawn` with metadata in the creation request. Native scripts should call this command. Preserve native brief, authority, backlog, and isolation checks.
 
-Source: [native adapter](/root/github_projects/bb-plugin-firstmate/overlay/bin/backends/bb.sh:423), [role configuration](/root/github_projects/bb-plugin-firstmate/server.ts:9285), [existing atomic SDK path](/root/github_projects/bb-plugin-firstmate/server.ts:4267).
+Source: [native adapter](../overlay/bin/backends/bb.sh#L423), [role configuration](../server.ts#L9285), [existing atomic SDK path](../server.ts#L4267).
 
 ### 2. Launch admission is neither centralized nor atomic
 
@@ -50,7 +50,7 @@ The native transport has additional native gates. These reproductions do not cla
 
 Promotion also needs a completed scout and a durable report. Its current 2,000-character output read can omit findings; pass the report artifact instead.
 
-Source: [cap check](/root/github_projects/bb-plugin-firstmate/server.ts:3920), [dispatch entry](/root/github_projects/bb-plugin-firstmate/server.ts:8455), [promotion](/root/github_projects/bb-plugin-firstmate/server.ts:8788).
+Source: [cap check](../server.ts#L3920), [dispatch entry](../server.ts#L8455), [promotion](../server.ts#L8788).
 
 Run the non-destructive reproduction:
 
@@ -66,7 +66,7 @@ Future `sendAt` is advertised but explicitly rejected in native mode. The error 
 
 **Change:** define transport capabilities once. Reject unsupported options before creating the brief or backlog row. Keep native ship isolation mandatory. Forward visibility explicitly. Make scheduling behavior explicit and recheck native authority when a scheduled task becomes eligible.
 
-Source: [native dispatch inputs](/root/github_projects/bb-plugin-firstmate/server.ts:3374), [forced visibility](/root/github_projects/bb-plugin-firstmate/server.ts:559), [schedule refusal](/root/github_projects/bb-plugin-firstmate/server.ts:4217).
+Source: [native dispatch inputs](../server.ts#L3374), [forced visibility](../server.ts#L559), [schedule refusal](../server.ts#L4217).
 
 ### 4. Host and checkout can be selected independently
 
@@ -76,7 +76,7 @@ For a project on multiple machines, the selected path can belong to a different 
 
 **Change:** resolve one tuple containing project, host, environment, checkout, provider, and model. Use it for validation, native commands, and worker creation. Do not fall back to the first connected machine when identity is uncertain.
 
-Source: [checkout selection](/root/github_projects/bb-plugin-firstmate/server.ts:3060), [host selection](/root/github_projects/bb-plugin-firstmate/server.ts:4032), [adapter fallback](/root/github_projects/bb-plugin-firstmate/overlay/bin/backends/bb.sh:373).
+Source: [checkout selection](../server.ts#L3060), [host selection](../server.ts#L4032), [adapter fallback](../overlay/bin/backends/bb.sh#L373).
 
 ### 5. Creation and readiness need separate states
 
@@ -88,7 +88,7 @@ A slow environment can therefore be treated as a failed launch. A returned threa
 
 Where BB cannot provide a required pre-start boundary, request a supported held-creation mechanism. Do not simulate a hold with an arbitrary delay.
 
-Source: [path polling](/root/github_projects/bb-plugin-firstmate/overlay/bin/backends/bb.sh:455), [post-creation isolation check](/root/github_projects/bb-plugin-firstmate/overlay/firstmate-bb-backend.patch:401).
+Source: [path polling](../overlay/bin/backends/bb.sh#L455), [post-creation isolation check](../overlay/firstmate-bb-backend.patch#L401).
 
 ## What the bb-cli review changes
 
@@ -127,7 +127,7 @@ The required adapter change for the new pin is `set -- fm-composer-lib.sh fm-tra
 
 Changing only that clause in the disposable generated backend restored backend loading and passed both previously failing cleanup tests. The repository overlay and installed native home remain unchanged.
 
-Source: [overlay clause](/root/github_projects/bb-plugin-firstmate/overlay/firstmate-bb-backend.patch:84), [upstream loader change](https://github.com/kunchenguid/firstmate/commit/589ccec821bf6310ce888e2a702e4fc9258eb1e8).
+Source: [overlay clause](../overlay/firstmate-bb-backend.patch#L84), [upstream loader change](https://github.com/kunchenguid/firstmate/commit/589ccec821bf6310ce888e2a702e4fc9258eb1e8).
 
 **Update process:** test the new pin in a scratch home, regenerate snapshots and skill metadata, run native integration checks, then perform a bounded live acceptance task. Add a strict patch check so fuzzy application requires explicit review.
 
@@ -159,7 +159,7 @@ The user reports that Firstmate repeatedly opens PRs and loses follow-up until r
 
 The existing machinery can retain a PR URL and report a merge. It does not guarantee continued ownership and a next action for every open PR. A handled notification also does not establish completed delivery.
 
-Sources: [merge reconciliation](/root/github_projects/bb-plugin-firstmate/server.ts:5674), [worker removal](/root/github_projects/bb-plugin-firstmate/server.ts:5927), [native merge poll](/root/firstmate/bin/fm-pr-poll.sh:1), [landing instructions](/root/github_projects/bb-plugin-firstmate/skills/ship-landing/SKILL.md:18).
+Sources: [merge reconciliation](../server.ts#L5674), [worker removal](../server.ts#L5927), [native merge poll](https://github.com/kunchenguid/firstmate/blob/2d833ff147cd26a5c461e914e06854e0eb2707ce/bin/fm-pr-poll.sh#L1), [landing instructions](../skills/ship-landing/SKILL.md#L18).
 
 ### Proposed behavior
 

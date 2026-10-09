@@ -18,8 +18,8 @@
   },
   "renderer": {
     "overlay/bin/backends/bb-worker-prompt.py": {
-      "sha256": "2f6c5e3d9ec8f413c2038f88ffd1162e603eac449c54644580fb04de7488ce11",
-      "reason": "Known native scaffold boundaries only: script/browser transport, exact task-owned paths and inbox IDs; retain operational references, task and native completion gates. Recorded task setup/project reads, paired native status/progress reports and durable unit-bound validation waits; native status/completion authority retained. Preserve selected native zero-turn waiting with foreground checks; no-mistakes pipeline outcomes retain their native owner. Rule 5 blocked wording: a worker clears ordinary obstacles itself and reports blocked only for a secret, approval, decision, withheld access or an irreversible step; every other native stop rule is kept verbatim."
+      "sha256": "3357ef75f521f8a5e97d5d53ffd98fa0cf6437f8c1c4a4b5c9de0003688a86a2",
+      "reason": "Known native scaffold boundaries only: script/browser transport, exact task-owned paths and inbox IDs; retain operational references, task and native completion gates. Recorded task setup/project reads, paired native status/progress reports and durable unit-bound validation waits; native status/completion authority retained. Preserve selected native zero-turn waiting with foreground checks; no-mistakes pipeline outcomes retain their native owner. Rule 5 blocked wording: a worker clears ordinary obstacles itself and reports blocked only for a secret, approval, decision, withheld access or an irreversible step; every other native stop rule is kept verbatim. A dispatched brief already states that rule in its Obstacles section, so rule 5 then only points there and the rule is stated once."
     },
     "overlay/bin/backends/bb-worker-transport.txt": {
       "sha256": "6d450a1fe61c27823c5eff8e991f40dc43507721524be6a13f5e5cf8af2706df",

@@ -49,7 +49,7 @@ The initial full run passed 821/822 tests; the local-merge fixture linked an old
 env -u BB_CLI -u BB_INFERENCE -u BB_INFERENCE_FALLBACK -u BB_TRANSCRIPTION \
   -u BB_THREAD_ID -u BB_PROJECT_ID -u BB_ENVIRONMENT_ID -u BB_HOST_ID \
   -u BB_SERVER_URL -u BB_HOST_DAEMON_PORT -u BB_DATA_DIR \
-  HOME=/root SHELL=/bin/bash PATH=/root/.local/bin:/root/.bun/bin:/usr/local/bin:/usr/bin:/bin \
+  HOME="$HOME" SHELL=/bin/bash PATH=$HOME/.local/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin \
   FM_TEST_HOME=/tmp/fm-crew-state-native-yq_lrbsn/home \
   FIRSTMATE_TEST_NATIVE=/tmp/fm-crew-state-native-yq_lrbsn/home \
   FM_SCOUT_NATIVE_BIN=/tmp/fm-crew-state-native-yq_lrbsn/home/bin-bb \

@@ -132,7 +132,7 @@ divergence, across every task kind (ship/scout collapse, secondmate/unknown do
 not). Extend the corpus whenever you touch the fold or find a new native edge.
 
 - It drives the script at `FM_CLASSIFY_LIB` (default
-  `/root/firstmate/bin/fm-classify-lib.sh`). On a host **with** native it runs and
+  `$FIRSTMATE_HOME/bin/fm-classify-lib.sh`). On a host **with** native it runs and
   proves equivalence.
 - **Equivalence is conditional on passing the crew's real kind.** The fold only
   matches native when the caller supplies the kind native derives from the crew's
@@ -322,3 +322,21 @@ which sentences and anchors need attention.
   real trade-off. Do not add an ADR for the obvious choice; do add one when a
   future reader would otherwise "fix" something that was deliberate. Use the
   format already in that directory.
+- This repository is public. A doc names a thread, host, project or environment
+  by placeholder (`thr_example01`, `host_example01`) and a host folder by
+  variable (`$HOME`, `$FIRSTMATE_HOME` for the native home, `$FIRSTMATE_CHECKOUT`
+  for a separate upstream clone, `$CAPTAIN_HOMES`, `$PLUGIN_CHECKOUT`). Link
+  source by repository-relative path. `scripts/docs-host-ids.test.mjs` fails on a
+  live id or a path under the host's root home.
+
+## CI runs every test file
+
+`npm test` lists each test file by name, and CI runs that same list on a
+GitHub-hosted runner, as root, with the pinned host tools installed
+(`bb-app`, `no-mistakes`, `gh-axi`, `tasks-axi`, `quota-axi`, `lavish-axi`) and the pinned
+upstream checkout. Add a new test file to the `test` script in `package.json`.
+To keep a file out of CI, add it to `.github/ci-skipped-tests.json` with the
+reason; `scripts/ci-test-coverage.mjs` fails the `test-coverage` job when a
+tracked test file is neither run nor on that list. Do not add a self-hosted
+runner: this repository is public, and a fork's pull request would run its code
+on that host.

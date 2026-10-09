@@ -72,8 +72,8 @@ The repository's permanent regression suite, mutation checks, and exact native c
 
 Final code at `098db97773c4cb0399c38e39d2fc7c824e6c0503`: **641 tests passed, zero failed, zero skipped** in the parent’s independent full run. The increase from 636 is five added capture/deletion regressions. The final narrow standards review found no blockers and passed six focused tests.
 
-The scratch plugin was disabled, its disposable lifecycle project was removed, and both isolated BB services were stopped. The production plugin was not reloaded. The deployed `/root/firstmate` checkout was not upgraded.
+The scratch plugin was disabled, its disposable lifecycle project was removed, and both isolated BB services were stopped. The production plugin was not reloaded. The deployed `$FIRSTMATE_HOME` checkout was not upgraded.
 
 Integration applies only the implementation delta after the saved baseline. Original source files matched their saved hashes before integration; pre-existing edits are preserved.
 
-Integrated source checks also passed: TypeScript, skill fidelity against the scratch native pin, plugin build, and whitespace validation. All 99 changed paths matched the reviewed commit contents immediately after integration. Production inspection confirmed Firstmate still running its prior version with no PR-follow-up schedule; `/root/firstmate` remains at `2d833ff147cd26a5c461e914e06854e0eb2707ce`. Both acceptance services are inactive.
+Integrated source checks also passed: TypeScript, skill fidelity against the scratch native pin, plugin build, and whitespace validation. All 99 changed paths matched the reviewed commit contents immediately after integration. Production inspection confirmed Firstmate still running its prior version with no PR-follow-up schedule; `$FIRSTMATE_HOME` remains at `2d833ff147cd26a5c461e914e06854e0eb2707ce`. Both acceptance services are inactive.

@@ -17,8 +17,16 @@ const IN_PLACE_OF_A_SKIP = [
 
 const OBSTACLES = [
   "### Obstacles",
-  "Clear an ordinary obstacle yourself: retry with a smaller query or pagination, restore or commit what your own install changed, use another tool, or wait and retry. This replaces any \"same obstacle twice\" rule.",
+  "Clear an ordinary obstacle yourself: retry with a smaller query or pagination, restore or commit what your own install changed, use another tool, or wait and retry. If rule 5 under Rules says to stop after two failures, this section replaces it.",
   "Report blocked only for what only the captain or the owner can give: a secret, an approval, a decision, withheld access, or a destructive or irreversible step. Every other stop rule still applies.",
+];
+
+const SKILLS_READ = "Your final report has a line \"Skills read: <paths>\" for those files, or \"not read: <path>: <reason>\".";
+
+const HOUSE_RULES = [
+  "pstack always has priority. If a skill or rule conflicts with it, pstack wins.",
+  "Until the owner confirms otherwise: spawn no sub-agents (no Task, poteto-agent or parallel workers). Do that work yourself, in this session.",
+  "Until the owner confirms otherwise: Firstmate decides who merges and deploys. Follow the brief's delivery contract for merge and deploy.",
 ];
 
 test("the playbook comes from the dispatch title, not the task body", () => {
@@ -53,21 +61,43 @@ test("a captain's explicit playbook overrides the title, and a scout investigate
 test("a feature brief gives full paths, the step checklist, no-comments and the pstack rule", () => {
   assert.equal(crewSkillBlock({ shape: "ship", title: "Add a CSV export", task: "", providerId: "claude-code" }), [
     "### Skills (Firstmate adds this to every brief)",
-    "pstack always has priority. If a skill or rule conflicts with it, pstack wins.",
-    "Until the owner confirms otherwise: spawn no sub-agents (no Task, poteto-agent or parallel workers). Do that work yourself, in this session.",
-    "Until the owner confirms otherwise: Firstmate decides who merges and deploys. Follow the brief's delivery contract for merge and deploy.",
-    `Skills on this host are in \`${HOME}/.claude/skills/<name>/SKILL.md\`. Load a skill by reading that file. Do not rely on a Skill tool for pstack skills; they are user-invocable only.`,
-    "If a skill is not installed, continue without it and say so in your report.",
-    `1. Read \`${HOME}/.claude/skills/skill-routing/SKILL.md\`. Load the skills its matched rows name, plus poteto-mode, plus every skill the chosen playbook names.`,
+    "First action, before any other command: read the files in steps 1 to 3.",
+    `1. Read \`${HOME}/.claude/skills/skill-routing/SKILL.md\`. Load every skill its matched rows and your playbook name.`,
     `2. Read \`${HOME}/.claude/skills/poteto-mode/SKILL.md\` in full.`,
     `3. Follow \`${HOME}/.claude/skills/poteto-mode/playbooks/feature.md\`.`,
     "4. Copy every step of that playbook into your to-do list, before any other to-do.",
     "5. Your final report lists each playbook step as \"✓ <step>\" or \"skip: <step>: <reason>\".",
+    SKILLS_READ,
+    `Skills on this host are in \`${HOME}/.claude/skills/<name>/SKILL.md\`. Load a skill by reading that file. Do not rely on a Skill tool for pstack skills; they are user-invocable only.`,
+    "If a skill is not installed, continue and say so in your report.",
+    ...HOUSE_RULES,
     ...IN_PLACE_OF_A_SKIP,
     "Save each screenshot as its own full-size PNG file. Never combine, stitch or downscale screenshots; link each file separately.",
     `Before you open a PR, run /no-comments (\`${HOME}/.claude/skills/no-comments/SKILL.md\`) over your diff.`,
     ...OBSTACLES,
   ].join("\n"));
+});
+
+// 9 Oct: 7 of 10 Sonnet crews never opened poteto-mode/SKILL.md, though every
+// crew read the playbook, the one file the report had to account for.
+test("the file reads are the first lines of the block and the report must name the files read", () => {
+  for (const providerId of ["claude-code", "codex", "acp-grok"]) {
+    const root = crewSkillRoot(providerId);
+    for (const shape of ["ship", "scout"] as const) {
+      for (const playbook of PLAYBOOK_CHOICES) {
+        const lines = crewSkillBlock({ shape, title: "x", task: "", providerId, playbook }).split("\n");
+        const reads = playbook === "none" ? "steps 1 and 2" : "steps 1 to 3";
+        assert.equal(lines[0], "### Skills (Firstmate adds this to every brief)");
+        assert.equal(lines[1], `First action, before any other command: read the files in ${reads}.`);
+        assert.ok(lines[2]!.startsWith(`1. Read \`${root}/skill-routing/SKILL.md\`.`), lines[2]);
+        assert.equal(lines[3], `2. Read \`${root}/poteto-mode/SKILL.md\` in full.`);
+        if (playbook !== "none") assert.equal(lines[4], `3. Follow \`${root}/poteto-mode/playbooks/${playbook}.md\`.`);
+        const report = lines.indexOf(SKILLS_READ);
+        assert.equal(report, playbook === "none" ? 5 : 7, `${providerId} ${shape} ${playbook}`);
+        for (const rule of HOUSE_RULES) assert.ok(lines.indexOf(rule) > report, rule);
+      }
+    }
+  }
 });
 
 test("a bug-fix brief asks for the failing-test commit and proof on the real product", () => {

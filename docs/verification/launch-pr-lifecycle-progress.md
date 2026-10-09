@@ -2,7 +2,7 @@
 
 Baseline: `95f589359627ff65b859f3ae5393b153dda273ed`.
 Implementation/native compatibility commit: `87507587ebace16e1c3a619e8594e16427e9918e`.
-Implementation checkout: `/root/github_projects/bb-plugin-firstmate-launch-pr-lifecycle`.
+Implementation checkout: `$PLUGIN_CHECKOUT`.
 The baseline's existing server, README, review and reproduction changes are preserved.
 
 This document is the recovery checkpoint and review matrix. Initial implementation validation and the parent-review corrections are recorded below. No live plugin was installed or reloaded, no real worker/model task was launched, and no PR was created or merged.
@@ -12,7 +12,7 @@ This document is the recovery checkpoint and review matrix. Initial implementati
 - Installed dependency and lockfile contract: `@get-bb/plugin-sdk` **0.4.104**. `bb --version`: **0.44.0**.
 - Public SDK declarations and live CLI help were consulted for creation metadata, project defaults, environment selection, reasoning levels, events, queued inputs, SQLite storage, background schedules and disposal. No private SDK transport or invented hold API is used.
 - Audited native Git object: `1f3e769616fdf9f31f85f4c3e6a9f71606634238`. This is an exact pin, not a moving upstream HEAD.
-- `/root/firstmate` remains at deployed commit `2d833ff147cd26a5c461e914e06854e0eb2707ce`. The source checkouts were only read. Scratch clones and scratch fleet fixtures were used for native validation.
+- `$FIRSTMATE_HOME` remains at deployed commit `2d833ff147cd26a5c461e914e06854e0eb2707ce`. The source checkouts were only read. Scratch clones and scratch fleet fixtures were used for native validation.
 - Dependency verification uses a local `node_modules` symlink to the original checkout's installed dependencies. No shared dependency was changed. The Git ignore pattern covers this symlink as well as a directory; the symlink is not committed.
 - `bb plugin build .` succeeds against the pinned package. It reports that this host's bundled SDK is **0.5.29**. The dependency pin was deliberately preserved. Build success is not live runtime acceptance.
 
@@ -81,7 +81,7 @@ node --test --experimental-strip-types \
 Scratch setup used local clone and detached checkout, without changing the source clone:
 
 ```bash
-git clone --quiet --local --no-hardlinks /root/github_projects/firstmate /tmp/fm-launch-pr-verified
+git clone --quiet --local --no-hardlinks $FIRSTMATE_CHECKOUT /tmp/fm-launch-pr-verified
 git -C /tmp/fm-launch-pr-verified checkout --quiet --detach 1f3e769616fdf9f31f85f4c3e6a9f71606634238
 python3 overlay/install-bb-backend.py --home /tmp/fm-launch-pr-verified --project-id proj_1
 python3 overlay/install-bb-backend.py --home /tmp/fm-launch-pr-verified --project-id proj_1 --verify
@@ -107,7 +107,7 @@ Results: backend source exposes `fm_backend_bb_create_task`; four patches apply 
 Pin/manifest/snapshot refresh is reproducible without checking out or editing native:
 
 ```bash
-node scripts/refresh-native-pin.mjs /root/github_projects/firstmate 1f3e769616fdf9f31f85f4c3e6a9f71606634238
+node scripts/refresh-native-pin.mjs $FIRSTMATE_CHECKOUT 1f3e769616fdf9f31f85f4c3e6a9f71606634238
 ```
 
 It reads native Git objects. Re-running it at the audited pin was byte-identical across skill files, snapshots, pin and manifest. Adapted policy anchors still require human audit and fidelity verification. The manifest names **194 callable scripts** and **22 support files/adapters**.

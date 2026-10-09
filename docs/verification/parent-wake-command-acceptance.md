@@ -13,8 +13,8 @@ Activated candidate `279e8da` on 2026-10-04 after independent review and verific
 
 Plugin reloaded with all four services running. This change modifies server transport only; no native upgrade or adapter installation was needed.
 
-The real owning captain `thr_mhk69hwvxe` successfully read its wake queue through the staged script. A second read returned the same receipt with the replay marker. At handoff, receipt `d720626489e14c8dbcb641e8c514bd7e` was `ready`; no acknowledgement was requested. The full report remained in the captain's native `.bb-wake-reports` directory. No newly created temporary receipt scripts remained after execution.
+The real owning captain `thr_example03` successfully read its wake queue through the staged script. A second read returned the same receipt with the replay marker. At handoff, receipt `d720626489e14c8dbcb641e8c514bd7e` was `ready`; no acknowledgement was requested. The full report remained in the captain's native `.bb-wake-reports` directory. No newly created temporary receipt scripts remained after execution.
 
 The owning captain received the receipt and report location, with instructions to read and handle the entire report before completing the receipt. This acceptance does not claim its reports have been handled.
 
-Durable evidence: `/root/firstmate-bb-homes/thr_jm4qnewqmf/data/wake-command-size-20261004/`. It includes final tests, causal mutation, live transport results, queue snapshots, retained report, live replay, and receipt state at handoff.
+Durable evidence: `$CAPTAIN_HOMES/thr_example04/data/wake-command-size-20261004/`. It includes final tests, causal mutation, live transport results, queue snapshots, retained report, live replay, and receipt state at handoff.

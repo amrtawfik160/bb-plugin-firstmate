@@ -1,6 +1,6 @@
 # Native policy fixes — 2026-09-29
 
-Requirement: retain upstream Firstmate prompts and behavior, adapting only BB environment and CLI transport. Native reference: `/root/firstmate` at `2d833ff147cd26a5c461e914e06854e0eb2707ce`. Plugin baseline: `ee1a87afc63d377d0cf69b610c142399f08ec062`; this report accompanies the native-policy fix PR.
+Requirement: retain upstream Firstmate prompts and behavior, adapting only BB environment and CLI transport. Native reference: `$FIRSTMATE_HOME` at `2d833ff147cd26a5c461e914e06854e0eb2707ce`. Plugin baseline: `ee1a87afc63d377d0cf69b610c142399f08ec062`; this report accompanies the native-policy fix PR.
 
 ## Resolved audit findings
 
@@ -25,7 +25,7 @@ The SDK-only compatibility dispatch path retains its legacy lifecycle; this repo
 
 - `npm test`: **569 tests; 567 passed, zero failed, two skipped**. Includes native replacement refusal, shared prompt transport, native idle handling, canonical Bearings across entry points, and registered-hook failures.
 - `npx tsc --noEmit`, Bash syntax and `git diff --check`: passed.
-- `npm run fidelity -- --native /root/firstmate`: passed; 33 skills, 12 declared BB-DIVERGE anchors, seven BB-ONLY fences; native snapshot fresh.
+- `npm run fidelity -- --native $FIRSTMATE_HOME`: passed; 33 skills, 12 declared BB-DIVERGE anchors, seven BB-ONLY fences; native snapshot fresh.
 - `node scripts/live-native-policy-check.mjs --live-cli`: executes pinned native startup, hooks, status folding, snapshot, reconcile publication, native brief scaffold and retry prompt construction on disposable homes. Actual installed `bb firstmate fm --home ... session-start --json` returns the agent-shell command; executing it beneath this agent records the native harness lock and matching completed-startup marker. Tool/SDK command routing uses the official fake plugin host; its host-command bridge executes real native scripts. BB worker spawn/send operations are recorded rather than dispatched. This does **not** prove a live model worker dispatch or every provider's hook delivery.
 - Real synchronous Stop: an in-flight task with empty wake queue and absent watcher exits 2 with `TURN WOULD END BLIND`; active-loop payload allows the subsequent stop. Claude guard routing and empty-home native autoarm are exercised. Missing session runner fails visibly.
 - Native fold retains the two-hour-old metaless `release` question after actual plugin wake presentation; no synthetic close appears.

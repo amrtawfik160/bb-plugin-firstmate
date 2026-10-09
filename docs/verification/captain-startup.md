@@ -7,7 +7,7 @@ remain intact; worker-method refinements are outside this correction.
 
 ## Incident and diagnosis
 
-Read-only evidence: `/tmp/captain-slow-events.json`, thread `thr_8j32bnxm3b`.
+Read-only evidence: `/tmp/captain-slow-events.json`, thread `thr_example01`.
 The user invoked `/captain` at 21:36:06 UTC on 2026-10-04 and interrupted at
 21:48:14 UTC. The ACP Cursor agent used Grok 4.7, xhigh. It read skills but called
 no Firstmate agent tools. It searched filesystem, plugin bundles and SQLite
@@ -17,7 +17,7 @@ instead of following a supported binding/contract/startup sequence.
 | --- | --- |
 | Events 158 / 161 | `bb firstmate deck --json 2>&1` started at 21:40:01 and was presented as completed at 21:40:32. Output contained only BB's removed `BB_INFERENCE_FALLBACK` warning, no deck JSON. |
 | Event 182 | A subsequent process snapshot still showed the deck CLI process. The per-thread home existed. A shared-home bearings process was also present. |
-| Event 517 | The agent guessed `/root/firstmate` and ran native session-start there. Native returned exit zero with `STARTUP TRUNCATED`, its 120-second bound, and incomplete `bootstrap`. |
+| Event 517 | The agent guessed `$FIRSTMATE_HOME` and ran native session-start there. Native returned exit zero with `STARTUP TRUNCATED`, its 120-second bound, and incomplete `bootstrap`. |
 | Event 542 | The same guessed-home startup was retried and interrupted. |
 
 The events do **not** identify the exact hung bootstrap child. Source tracing
@@ -60,7 +60,7 @@ client behavior, not evidence that deck or native startup completed.
    guards. Binding does not bulk-project an unrelated legacy fleet.
 
 For this incident's thread, the binding response must name
-`/root/firstmate-bb-homes/thr_8j32bnxm3b`, not the shared source clone. No command
+`$CAPTAIN_HOMES/thr_example01`, not the shared source clone. No command
 was executed in that home during this verification.
 
 ## Implementation and policy boundary

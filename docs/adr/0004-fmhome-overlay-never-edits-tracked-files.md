@@ -20,7 +20,7 @@ clone runs stale policy scripts while the plugin reports real mode active.
 
 This ADR records the target invariant; the **current overlay violates it**. As of
 this writing the live clone patches tracked files in place —
-`git -C /root/firstmate status --porcelain` shows ` M bin/fm-backend.sh`,
+`git -C $FIRSTMATE_HOME status --porcelain` shows ` M bin/fm-backend.sh`,
 ` M bin/fm-spawn.sh`, ` M bin/fm-teardown.sh` (plus `docs/configuration.md`).
 That dirty tree is the **observed cause** of the silent ff-only freeze: the live
 clone sits 9 commits behind upstream. Restructuring the overlay so additions live

@@ -103,7 +103,7 @@ was restricted to these fixture processes. Installed BB CLI was 0.44.0, Node
 0.5.29; the project dependency pin was retained.
 
 ```sh
-python3 scripts/generate-native-runtime.py --source /root/github_projects/firstmate --output /tmp/fm-runtime-reproduced-release
+python3 scripts/generate-native-runtime.py --source $FIRSTMATE_CHECKOUT --output /tmp/fm-runtime-reproduced-release
 cmp runtime-assets/native.bundle /tmp/fm-runtime-reproduced-release/native.bundle
 cmp runtime-assets/native-manifest.json /tmp/fm-runtime-reproduced-release/native-manifest.json
 npm run runtime:verify
