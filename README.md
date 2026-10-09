@@ -191,7 +191,8 @@ Each flag in `fmReliability` is off until set, for example
   The queue is checked when a crew or captain turn ends and once a minute.
   Only that over-cap work drains automatically. A `firstmate_queue` backlog
   still needs an explicit dispatch. A crew whose status cannot be read keeps
-  its slot.
+  its slot. Turning the flag off stops new background, queued and held work;
+  work already reserved, queued or held still completes.
 - `honestStatus` reports an unreachable crew as unreachable. Its watchdog tells
   the captain once when a crew ends 8 turns in a row with no new output. The
   watchdog does not stop the crew.

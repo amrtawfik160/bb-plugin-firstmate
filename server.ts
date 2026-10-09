@@ -4687,9 +4687,9 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   // Drains only work that dispatch queued for lack of a slot. A captain's
-  // firstmate_queue backlog waits for an explicit queue dispatch.
+  // firstmate_queue backlog waits for an explicit queue dispatch. The flag gates
+  // new queueing only, so work queued before it was turned off still starts.
   async function drainQueuedDispatches(owner?: string): Promise<void> {
-    if ((await reliabilityFlags()).asyncDispatch !== "on") return;
     await queueStore.ready();
     const all = owner !== undefined ? queueStore.list(owner) : queueStore.list();
     const now = Date.now();
@@ -4794,15 +4794,14 @@ export default async function plugin(bb: BbPluginApi) {
   async function drainCaptainReliability(captainThreadId: string, signal?: AbortSignal): Promise<void> {
     await defaultOverdueAsks(captainThreadId).catch((error) => bb.log.warn(`owner ask deadlines: ${String(error)}`));
     const flags = await reliabilityFlags();
-    if (flags.asyncDispatch === "on") {
-      for (const row of doorbellHold.drain(captainThreadId)) {
-        // A send that fails, or that a reload cuts, keeps the doorbell held for the next drain.
-        const sent = await sendCaptainWake(captainThreadId, row.text, row.crewId ?? "held-doorbell", signal)
-          .catch((error) => { bb.log.warn(`held doorbell drain: ${String(error)}`); return false; });
-        if (!sent) doorbellHold.enqueue({ captainThreadId, text: row.text, crewId: row.crewId, urgent: row.urgent, createdAt: row.createdAt });
-      }
-      await drainQueuedDispatches(captainThreadId);
+    // Not gated on asyncDispatch: what was held or queued while it was on still goes out after it is turned off.
+    for (const row of doorbellHold.drain(captainThreadId)) {
+      // A send that fails, or that a reload cuts, keeps the doorbell held for the next drain.
+      const sent = await sendCaptainWake(captainThreadId, row.text, row.crewId ?? "held-doorbell", signal)
+        .catch((error) => { bb.log.warn(`held doorbell drain: ${String(error)}`); return false; });
+      if (!sent) doorbellHold.enqueue({ captainThreadId, text: row.text, crewId: row.crewId, urgent: row.urgent, createdAt: row.createdAt });
     }
+    await drainQueuedDispatches(captainThreadId).catch((error) => bb.log.warn(`queued dispatch drain: ${String(error)}`));
     if (flags.inboundLedger === "on") {
       if (flags.telegramThreading === "on") {
         try {
