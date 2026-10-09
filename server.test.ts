@@ -668,6 +668,30 @@ test("deck reuses shared home when automatic native profile is explicitly disabl
   }
 });
 
+test("host command terminal exits when its command ends, so a lost close cannot leave it open", async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", fullParityOnDeck: false },
+  });
+  await plugin(host.bb);
+  try {
+    stubCaptainDeck(host);
+    await host.harness.behavior.setSettings({ fmHostId: "host_1" });
+    stubRoutedHost(host, () => ({}));
+    await host.harness.behavior.runCli(["deck"], { threadId: "thr_cap", projectId: "proj_1" });
+    const created = host.harness.sdk.callsTo("terminals.create")[0]?.[0] as { start: { command: string } } | undefined;
+    assert.ok(created, "deck ran a host command");
+    const envelope = created.start.command.replace(/^__fm_cmd='[\s\S]*?'; set \+e; /, "__fm_cmd='echo done'; set +e; ");
+    const run = spawnSync("bash", ["-c", envelope], { encoding: "utf8", timeout: 5000, env: { ...process.env, SHELL: "/bin/bash" } });
+    assert.equal(run.error, undefined, "the terminal process outlived its command");
+    assert.equal(run.status, 0);
+    assert.match(run.stdout, /done\n\n__FM_HOST_RC:0\n$/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("deck refuses missing environment before native setup or claimed readiness", async () => {
   const host = await load();
   try {
