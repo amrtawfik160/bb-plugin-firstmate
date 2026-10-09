@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {spawnSync} from 'node:child_process';
-import {mkdirSync,writeFileSync,readFileSync,rmSync} from 'node:fs';
+import {existsSync,lstatSync,mkdirSync,readlinkSync,symlinkSync,writeFileSync,readFileSync,rmSync} from 'node:fs';
 import {join} from 'node:path';
 import {createHash} from 'node:crypto';
 import {createFakePluginHost,makeThreadResponse} from '@get-bb/plugin-sdk/testing';
@@ -52,6 +52,21 @@ test('a changed captain hook file is installed again on the next deck',async()=>
  stamp[at]='hash-of-the-previous-hook';await f.host.bb.storage.kv.set(key,JSON.stringify(stamp));writeFileSync(installed,'previous hook\n');
  const prior=f.seen.length;await deck();
  assert.equal(f.seen.slice(prior).filter(c=>c.includes('captain-hooks-ok')).length,1);assert.deepEqual(readFileSync(installed),hook);
+ }finally{await f.clean();}
+});
+test('every deck links skill-routing into each installed provider skill folder and repairs a broken link',async()=>{
+ const f=await setup();try{
+ const deck=async()=>{const r=await f.host.harness.behavior.runCli(['deck','--json'],ctx);assert.equal(r.exitCode,0,r.stderr);};
+ const target=join(process.cwd(),'entry-skills/skill-routing');
+ mkdirSync(join(f.runtime,'.cursor/skills/skill-routing'),{recursive:true});
+ await deck();
+ for(const root of ['.claude/skills','.codex/skills'])assert.equal(readlinkSync(join(f.runtime,root,'skill-routing')),target,root);
+ assert.ok(lstatSync(join(f.runtime,'.cursor/skills/skill-routing')).isDirectory(),'a real folder is never replaced');
+ assert.equal(existsSync(join(f.runtime,'.grok')),false);
+ const link=join(f.runtime,'.claude/skills/skill-routing');rmSync(link);symlinkSync(join(f.runtime,'gone'),link);
+ const prior=f.seen.length;await deck();
+ assert.equal(f.seen.slice(prior).filter(c=>c.includes('captain-hooks-ok')).length,0,'the link step does not wait for a hook reinstall');
+ assert.equal(readlinkSync(link),target);
  }finally{await f.clean();}
 });
 for(const failure of ['clone','bootstrap'])test(`failed ${failure} aborts captain setup without a watcher or claimed readiness`,async()=>{
