@@ -9,6 +9,18 @@ concurrency:
   group: checks-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  # Fails when a tracked test file is neither in the run list nor on the
+  # reasoned skip list in .github/ci-skipped-tests.json.
+  test-coverage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.18.0'
+      - name: Every test file is run or skipped with a reason
+        run: node scripts/ci-test-coverage.mjs
   checks:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -50,10 +62,6 @@ jobs:
           echo "FIRSTMATE_TEST_NATIVE=$source" >> "$GITHUB_ENV"
           echo "FM_TEST_HOME=$native" >> "$GITHUB_ENV"
           echo "FM_CLASSIFY_LIB=$native/bin/fm-classify-lib.sh" >> "$GITHUB_ENV"
-      # Fails when a tracked test file is neither in the run list nor on the
-      # reasoned skip list in .github/ci-skipped-tests.json.
-      - name: Every test file is run or skipped with a reason
-        run: node scripts/ci-test-coverage.mjs
       # As root, like a captain host: the worker checkpoint starts systemd units
       # only as root, and the runtime fixtures remove read-only release folders.
       - name: Run tests
