@@ -340,7 +340,11 @@ test('forgotten author retains native guarded merge continuation and refuses des
   host.harness.sdk.stub('environments.pullRequest',async()=>({outcome:'unavailable'}));
   const commands=hostCommands(host,command=>command.includes('gh pr view')?{payload:JSON.stringify(forge())}:{code:0});
   const refusal=await host.harness.behavior.runCli(['forget','c1','--stop','--force'],ctx);assert.equal(refusal.exitCode,1);assert.match(refusal.stderr,/Outstanding PR delivery/);assert.equal(host.harness.sdk.callsTo('threads.archive').length,0);
+  // Forget now archives the author's thread after the unlanded-work checks and keeps its environment.
+  host.harness.sdk.stub('environments.get',async()=>({id:'env_wt',hostId:'host_1',path:'/wt',isWorktree:true,status:'ready',mergeBaseBranch:'main'}));
+  host.harness.sdk.stub('environments.diffFiles',async()=>({files:[]}));
   const forgotten=await host.harness.behavior.runCli(['forget','c1'],ctx);assert.equal(forgotten.exitCode,0,forgotten.stderr);assert.equal((await host.bb.storage.kv.get('crews')).length,0);
+  assert.equal(host.harness.sdk.callsTo('threads.archive').length,1);assert.equal(host.harness.sdk.callsTo('environments.delete').length,0);
   assert.ok([...commands.values()].every(c=>!c.includes('fm-check-unregister')&&!c.includes('fm-teardown')),'native authority is retained');
   host=await host.harness.lifecycle.reload(plugin);commonStubs(host);
   host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle',environmentId:'env_wt',archivedAt:threadId==='thr_c1'?1:null}));
