@@ -14,8 +14,8 @@ assignment.
    procedures against source. Use the project's harness first. A maintenance
    assignment edits only the verification skill, map, and owned harness; report
    product regressions instead of changing product code or hiding them in docs.
-3. Use the BB browser skill and browser_script or bb browser script for web
-   driving. Leave profileId unset for the thread-isolated default unless the
+3. Use the BB browser skill and browser_script or bb plugin run browser script
+   for web driving. Leave profileId unset for the thread-isolated default unless the
    owner explicitly selected a shared profile. One app driver owns the session;
    workers do not launch parallel drivers. Follow BB's sign-in procedure.
 4. Health-check before driving and after surprises. Exercise the changed user

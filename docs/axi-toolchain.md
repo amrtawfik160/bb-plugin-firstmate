@@ -7,7 +7,11 @@ Missing essential tools block their workflows; Lavish readiness is reported sepa
 
 ## Browser policy
 
-Firstmate uses BB's `/browser` skill and `browser_script` (or `bb browser script`).
+Firstmate uses BB's `/browser` skill and `browser_script` (or `bb plugin run browser script`).
+The command belongs to the browser plugin: `bb plugin run browser script --purpose <text> --code <source> --origin <origin> [--json]`.
+`bb browser` has no `script` command.
+With `--json` it prints one object, `{ok, output, screenshots}`.
+Run `bb plugin run browser` for the full usage text.
 Leave `profileId` unset for the thread's isolated default profile.
 This overrides imported native AXI browser instructions for captains, secondmates, and crews.
 The bootstrap overlay removes `chrome-devtools-axi` from BB's required tools; other native backends retain their original dependencies.
