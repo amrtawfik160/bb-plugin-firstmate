@@ -6,6 +6,11 @@ import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/tes
 import plugin from "./server.ts";
 import { createDeliveries } from "./lib/pr-delivery.ts";
 import { UPSTREAM_SKILL_NAMES } from "./lib/upstream-surface.ts";
+import { quietStaleVerdict, staleQueueRows } from "./lib/finished-crew-wakes.ts";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const SKILLS = [...new Set(["captain", "firstmate", "skill-routing", ...UPSTREAM_SKILL_NAMES])];
 type Host = ReturnType<typeof createFakePluginHost>;
@@ -359,6 +364,298 @@ test("a refused failover is reported to the captain as a decision", async () => 
     await host.harness.behavior.emitThreadEvent("turn.failed", turnFailed("thr_crew", POOL_429));
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
     assert.ok(sendCalls(host).some((s) => s.threadId === "thr_cap" && /failover to codex was refused/.test(s.text)));
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// False alerts, forgotten crews, repeated completions and lost acknowledgements
+// (crews of 2026-10-09).
+
+const idleCrew = { forgotten: false, threadStatus: "idle", archived: false, statusVerb: null, lastMessage: null } as const;
+
+test("a stale row is a false alert only for a resting crew that declared a wait, finished, or was forgotten", () => {
+  assert.equal(quietStaleVerdict({ ...idleCrew, statusVerb: "paused" }), "declared-wait");
+  assert.equal(quietStaleVerdict({ ...idleCrew, lastMessage: "waiting" }), "declared-wait");
+  assert.equal(quietStaleVerdict({ ...idleCrew, statusVerb: "resolved", lastMessage: "waiting" }), "declared-wait");
+  assert.equal(quietStaleVerdict({ ...idleCrew, statusVerb: "done" }), "finished");
+  assert.equal(quietStaleVerdict({ ...idleCrew, lastMessage: "done" }), "finished");
+  assert.equal(quietStaleVerdict({ ...idleCrew, archived: true, threadStatus: null, statusVerb: "done" }), "finished");
+  assert.equal(quietStaleVerdict({ ...idleCrew, forgotten: true, threadStatus: "active" }), "forgotten");
+  assert.equal(quietStaleVerdict(idleCrew), "surface", "no declaration and no outcome still surfaces");
+  assert.equal(quietStaleVerdict({ ...idleCrew, statusVerb: "working" }), "surface");
+  assert.equal(quietStaleVerdict({ ...idleCrew, statusVerb: "working", lastMessage: "waiting" }), "surface", "the status file wins over chat");
+  assert.equal(quietStaleVerdict({ ...idleCrew, statusVerb: "blocked" }), "surface");
+  assert.equal(quietStaleVerdict({ ...idleCrew, threadStatus: "active", statusVerb: "paused" }), "surface", "a running thread can still be wedged");
+  assert.equal(quietStaleVerdict({ ...idleCrew, threadStatus: null, statusVerb: "paused" }), "surface", "an unreadable thread keeps its alert");
+  assert.deepEqual(staleQueueRows([
+    "1791366841\t7\tstale\tbb:thr_a\tstale: bb:thr_a (idle 451s, possible wedge, escalation 4)",
+    "1791366842\t8\tsignal\tc1.status\tcrew c1 update",
+    "1791366843\t9\tstale\tbb:thr_b\tstale: bb:thr_b",
+    "not a row",
+  ].join("\n")), [{ seq: 7, threadId: "thr_a" }, { seq: 9, threadId: "thr_b" }]);
+});
+
+const QUEUE_ROWS = [
+  "1791366841\t1\tstale\tbb:thr_w\tstale: bb:thr_w (idle 317s, possible wedge, escalation 2)",
+  "1791366842\t2\tstale\tbb:thr_d\tstale: bb:thr_d (idle 314s, possible wedge, escalation 1)",
+  "1791366843\t3\tstale\tbb:thr_f\tstale: bb:thr_f (idle 339s, agent missing - the recorded endpoint is gone, so this is not a wedge)",
+  "1791366844\t4\tstale\tbb:thr_u\tstale: bb:thr_u (idle 300s, possible wedge, escalation 1)",
+  "1791366845\t5\tstale\tbb:thr_r\tstale: bb:thr_r (idle 300s, possible wedge, escalation 1)",
+  "1791366846\t6\tsignal\tcu.status\tcrew cu update",
+];
+const QUIET_STATUS: Record<string, string> = {
+  cw: "working [at=1]: started\npaused [at=5]: waiting for the six CI jobs\nnote: FM_DELIVERY_NOTICE=acme/repo#1:abc PR observation.",
+  cd: "working [at=1]: started\ndone [at=9]: PR https://github.com/acme/repo/pull/2\nnote: FM_DELIVERY_NOTICE=acme/repo#2:def PR observation.",
+  cu: "working [at=1]: started",
+  cr: "paused [at=5]: waiting for CI",
+};
+async function seedQuietCrews(host: Host, home: string) {
+  await host.bb.storage.kv.set("crews", ["cw", "cd", "cu", "cr"].map((id) => ({ ...shipRow(id, `thr_${id.slice(1)}`, "thr_cap"), nativeHome: home })));
+  await host.bb.storage.kv.set("forgotten-crew:thr_f", "thr_cap");
+  host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: threadId === "thr_r" ? "active" : "idle" }));
+  host.harness.sdk.stub("threads.output", async () => ({ output: "" }));
+}
+
+test("a wake read removes stale rows about waiting, finished and forgotten crews from the queue, and keeps the rest", async () => {
+  const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { fmHome: "/tmp/fm-home", notifyOwner: "real", fmHostId: "host_1" } });
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRoutedHost(host, (cmd) => {
+      if (cmd.includes("bb-quiet")) return {};
+      if (cmd.includes('$3=="stale"')) return { payload: QUEUE_ROWS.join("\n") };
+      const crew = Object.keys(QUIET_STATUS).find((id) => cmd.includes(`/state/${id}.status`));
+      if (crew !== undefined) return { payload: QUIET_STATUS[crew]! };
+      return { payload: wakeFrame("") };
+    });
+    await seedQuietCrews(host, "/tmp/fm-home");
+    const result = await host.harness.behavior.runCli(["wake"], { projectId: "proj_1", threadId: "thr_cap" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    const prunes = seen.filter((cmd) => cmd.includes("bb-quiet"));
+    assert.equal(prunes.length, 1, "one removal under the queue lock");
+    assert.match(prunes[0]!, /drop=[^ ]*\|1\|2\|3\|/, "the waiting, finished and forgotten crews' rows go");
+    assert.doesNotMatch(prunes[0]!, /\|4\||\|5\||\|6\|/, "an undeclared crew, a running crew and a status update stay");
+    assert.match(prunes[0]!, /fm_lock_acquire_wait/);
+    const read = seen.findIndex((cmd) => cmd.includes("bb-wake-receipt") || cmd.includes(".fm-receipt-"));
+    assert.ok(seen.indexOf(prunes[0]!) < read, "the rows are gone before the read presents the queue");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// Runs the real native libraries when this machine has them (same switch as server.test.ts).
+const FM_TEST_BIN = process.env.FM_TEST_BIN ?? join(process.env.FM_TEST_HOME ?? "/root/firstmate", "bin");
+const HAVE_NATIVE = existsSync(join(FM_TEST_BIN, "fm-wake-lib.sh")) && existsSync(join(FM_TEST_BIN, "fm-classify-lib.sh"));
+
+function stubRealHost(host: Host) {
+  const cmds = new Map<string, string>();
+  let n = 0;
+  host.harness.sdk.stub("threadSections.list", async () => []);
+  host.harness.sdk.stub("threadSections.create", async () => ({ id: "sec" }));
+  host.harness.sdk.stub("environments.list", async () => [{ hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" }]);
+  host.harness.sdk.stub("threads.send", async () => ({}));
+  host.harness.sdk.stub("threads.list", async () => []);
+  host.harness.sdk.stub("threads.events.list", async () => []);
+  host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+  host.harness.sdk.stub("terminals.create", async (args: { start?: { command?: string } }) => {
+    const id = `t_${++n}`;
+    cmds.set(id, args.start?.command ?? "");
+    return { id };
+  });
+  host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+  host.harness.sdk.stub("terminals.close", async () => ({}));
+  host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
+    const wrapped = cmds.get(args.terminalId) ?? "";
+    const m = /^__fm_cmd='([\s\S]*?)'; set \+e; "/.exec(wrapped);
+    const r = spawnSync("bash", ["-c", m ? m[1]!.replace(/'\\''/g, "'") : wrapped], { encoding: "utf8", timeout: 30_000, stdio: ["ignore", "pipe", "pipe"] });
+    return hostRcPayload((r.stdout ?? "") + (r.stderr ?? ""), typeof r.status === "number" ? r.status : 1);
+  });
+}
+// Named as thr_cap's own home, so the captain's wake state is the home's state directory.
+function scratchHome(): { home: string; root: string } {
+  const root = mkdtempSync(join(tmpdir(), "fm-quiet-"));
+  const home = join(root, "firstmate-bb-homes/thr_cap");
+  mkdirSync(join(home, "state"), { recursive: true });
+  symlinkSync(FM_TEST_BIN, join(home, "bin"));
+  return { home, root };
+}
+function nativeDeclaredWait(home: string, crew: string): string {
+  return spawnSync("bash", ["-c", '. "$1"; status_declared_wait_line "$2"', "_", join(FM_TEST_BIN, "fm-classify-lib.sh"), join(home, `state/${crew}.status`)], { encoding: "utf8" }).stdout.trim();
+}
+
+test("native: a plugin note written after a crew's paused line leaves the wait standing for the watcher", { skip: !HAVE_NATIVE }, async () => {
+  const { home, root } = scratchHome();
+  const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { fmHome: home, notifyOwner: "real", fmHostId: "host_1", supervisionEnabled: true, captainWakeBatchMs: 0 } });
+  await plugin(host.bb);
+  try {
+    stubRealHost(host);
+    host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: "idle", environmentId: null }));
+    const paused = "paused [at=1791586043]: waiting for the six CI jobs";
+    writeFileSync(join(home, "state/c1.status"), `working [at=1791585843]: typecheck finished\n${paused}\n`);
+    assert.equal(nativeDeclaredWait(home, "c1"), paused);
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    assert.deepEqual((await emitIdle(host, "BLOCKED: the staging deploy needs an owner sign-in")).errors, []);
+    const status = readFileSync(join(home, "state/c1.status"), "utf8");
+    assert.match(status, /^note: .*BLOCKED/m, "the report is still written as a note");
+    assert.equal(nativeDeclaredWait(home, "c1"), paused, "the watcher still reads the declared wait");
+    writeFileSync(join(home, "state/c1.status"), "working [at=1791585843]: building\n");
+    assert.deepEqual((await emitIdle(host, "BLOCKED: a second, different problem")).errors, []);
+    assert.equal(nativeDeclaredWait(home, "c1"), "", "a crew that declared nothing gains no wait");
+    assert.doesNotMatch(readFileSync(join(home, "state/c1.status"), "utf8"), /^paused/m);
+  } finally {
+    await host.harness.lifecycle.dispose();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("native: the queue loses only the rows about quiet crews", { skip: !HAVE_NATIVE }, async () => {
+  const { home, root } = scratchHome();
+  const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { fmHome: home, notifyOwner: "real", fmHostId: "host_1" } });
+  await plugin(host.bb);
+  try {
+    stubRealHost(host);
+    await seedQuietCrews(host, home);
+    for (const [id, text] of Object.entries(QUIET_STATUS)) writeFileSync(join(home, `state/${id}.status`), `${text}\n`);
+    writeFileSync(join(home, "state/.wake-queue"), `${QUEUE_ROWS.join("\n")}\n`);
+    await host.harness.behavior.runCli(["wake"], { projectId: "proj_1", threadId: "thr_cap" });
+    const left = readFileSync(join(home, "state/.wake-queue"), "utf8").split("\n").filter(Boolean).map((row) => row.split("\t")[1]);
+    for (const seq of ["1", "2", "3"]) assert.ok(!left.includes(seq), `row ${seq} is about a quiet crew`);
+    for (const seq of ["4", "5"]) assert.ok(left.includes(seq), `row ${seq} still surfaces`);
+  } finally {
+    await host.harness.lifecycle.dispose();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a plugin note restates the crew's paused line through the watcher's own reader", async () => {
+  const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { fmHome: "/tmp/fm-home", notifyOwner: "real", fmHostId: "host_1", supervisionEnabled: true } });
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRoutedHost(host, () => ({}));
+    stubIdleSdk(host);
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    assert.deepEqual((await emitIdle(host, "BLOCKED: the staging deploy needs an owner sign-in")).errors, []);
+    const enqueue = seen.find((cmd) => cmd.includes("fm_wake_append_locked"));
+    assert.ok(enqueue, "the report is queued");
+    assert.match(enqueue!, /status_declared_wait_line/);
+    assert.match(enqueue!, /status_is_paused/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+function stubForget(host: Host, opts: { dirty?: string[]; unpushed?: number } = {}) {
+  stubRoutedHost(host, (cmd) => cmd.includes("rev-list") ? { payload: Array.from({ length: opts.unpushed ?? 0 }, (_, i) => String(i + 1).padStart(40, "0")).join("\n") } : {});
+  host.harness.sdk.stub("threads.list", async () => []);
+  host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: "idle", projectId: "proj_1", environmentId: threadId === "thr_cap" ? null : "env_wt" }));
+  host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+  host.harness.sdk.stub("threads.updatePluginMetadata", async () => ({}));
+  host.harness.sdk.stub("threads.archive", async () => ({}));
+  host.harness.sdk.stub("threads.stop", async () => ({}));
+  host.harness.sdk.stub("threads.output", async () => ({ output: "DONE: PR open https://github.com/acme/repo/pull/1" }));
+  host.harness.sdk.stub("environments.get", async () => ({ id: "env_wt", hostId: "host_1", path: "/wt", isWorktree: true, status: "ready", mergeBaseBranch: "main" }));
+  host.harness.sdk.stub("environments.diffFiles", async () => ({ files: (opts.dirty ?? []).map((path) => ({ path })) }));
+  host.harness.sdk.stub("environments.pullRequest", async () => ({ pullRequest: { url: "https://github.com/acme/repo/pull/1", state: "open" } }));
+  host.harness.sdk.stub("environments.delete", async () => ({ ok: true as const }));
+}
+const openDeliveries = (host: Host) => createDeliveries(host.bb.storage.database()).list({ owner: "thr_cap" });
+
+test("forgetting a crew with an open PR keeps the PR tracked, archives the thread and marks its alerts as dropped", async () => {
+  const host = await load();
+  try {
+    stubForget(host);
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    createDeliveries(host.bb.storage.database()).register({ url: "https://github.com/acme/repo/pull/1", taskId: "c1", projectId: "proj_1", owner: "thr_cap", home: "", worker: "thr_crew", requirement: "merged" });
+    const result = await host.harness.behavior.runCli(["forget", "c1"], { projectId: "proj_1", threadId: "thr_cap" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /thread archived/);
+    assert.equal(host.harness.sdk.callsTo("threads.archive").length, 1);
+    assert.equal(host.harness.sdk.callsTo("environments.delete").length, 0, "the PR delivery still needs the environment");
+    assert.equal(await host.bb.storage.kv.get("forgotten-crew:thr_crew"), "thr_cap");
+    assert.equal(openDeliveries(host).length, 1, "the PR delivery stays tracked");
+    assert.deepEqual(await host.bb.storage.kv.get("crews"), []);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("forgetting a crew with an open PR refuses on unlanded work unless forced, and changes nothing", async () => {
+  for (const unlanded of [{ dirty: ["src/app.ts"] }, { unpushed: 2 }]) {
+    const host = await load();
+    try {
+      stubForget(host, unlanded);
+      // The open PR does not cover the local commits.
+      host.harness.sdk.stub("environments.pullRequest", async () => ({ pullRequest: { url: "https://github.com/acme/repo/pull/1", state: "open" } }));
+      await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+      createDeliveries(host.bb.storage.database()).register({ url: "https://github.com/acme/repo/pull/1", taskId: "c1", projectId: "proj_1", owner: "thr_cap", home: "", worker: "thr_crew", requirement: "merged" });
+      const refused = await host.harness.behavior.runCli(["forget", "c1"], { projectId: "proj_1", threadId: "thr_cap" });
+      assert.notEqual(refused.exitCode, 0);
+      assert.match(refused.stderr, /Refusing: crew c1 has/);
+      assert.equal(host.harness.sdk.callsTo("threads.archive").length, 0);
+      assert.equal(((await host.bb.storage.kv.get("crews")) as unknown[]).length, 1, "the crew record is kept");
+      const forced = await host.harness.behavior.runCli(["forget", "c1", "--force"], { projectId: "proj_1", threadId: "thr_cap" });
+      assert.equal(forced.exitCode, 0, forced.stderr);
+      assert.equal(host.harness.sdk.callsTo("threads.archive").length, 1);
+    } finally {
+      await host.harness.lifecycle.dispose();
+    }
+  }
+});
+
+test("a crew forgotten earlier, with its PR tracked in another project, is finished by the same forget", async () => {
+  const host = await load();
+  try {
+    stubForget(host);
+    await host.bb.storage.kv.set("crews", []);
+    createDeliveries(host.bb.storage.database()).register({ url: "https://github.com/acme/other/pull/7", taskId: "c9", projectId: "proj_2", owner: "thr_cap", home: "", worker: "thr_old", requirement: "merged",
+      continuation: { ...shipRow("c9", "thr_old", "thr_cap"), projectId: "proj_2" } });
+    const result = await host.harness.behavior.runCli(["forget", "c9"], { projectId: "proj_1", threadId: "thr_cap" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.deepEqual(host.harness.sdk.callsTo("threads.archive").map((call) => (call[0] as { threadId: string }).threadId), ["thr_old"]);
+    assert.equal(await host.bb.storage.kv.get("forgotten-crew:thr_old"), "thr_cap");
+    assert.equal(openDeliveries(host).length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a crew that just reported DONE is not compacted, so BB sends no second completion message", async () => {
+  const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { captainCompactAtTokens: 200000 } });
+  await plugin(host.bb);
+  try {
+    stubIdleSdk(host);
+    host.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 910000, modelContextWindow: 1000000, estimated: false } }));
+    host.harness.sdk.stub("threads.compact", async () => ({ ok: true }));
+    await seedCrew(host);
+    await emitIdle(host, "DONE: PR https://github.com/acme/repo/pull/1 is open and checks are green.");
+    assert.equal(host.harness.sdk.callsTo("threads.compact").length, 0);
+    await emitIdle(host, "WAITING: the six CI jobs");
+    assert.equal(host.harness.sdk.callsTo("threads.compact").length, 1, "a crew with turns still ahead is compacted as before");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("acknowledging a wake receipt that already completed succeeds and returns what is unread now", async () => {
+  const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { fmHome: "/tmp/fm-home", notifyOwner: "real", fmHostId: "host_1" } });
+  await plugin(host.bb);
+  try {
+    // The receipt command is staged in a host file; each run of that file is one journal action.
+    let runs = 0;
+    const { seen } = stubRoutedHost(host, (cmd) => {
+      if (!/^__fm_cmd='bash [^;]*\.fm-receipt-/.test(cmd)) return {};
+      return ++runs === 1
+        ? { payload: "Wake receipt absent or changed; no action or acknowledgement authorized", code: 1 }
+        : { payload: wakeFrame("1791366846\t6\tsignal\tcu.status\tcrew cu update") };
+    });
+    const result = await host.harness.behavior.runCli(["wake", "--handled-wake", "8e0f3c22a5c7491e87fd22ea7629533a"], { projectId: "proj_1", threadId: "thr_cap" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /8e0f3c22a5c7491e87fd22ea7629533a is already complete/);
+    assert.match(result.stdout, /crew cu update/, "the same call returns what is unread now");
+    assert.match(result.stdout, /WAKE_RECEIPT: fixture/);
+    assert.equal(runs, 2, "one acknowledgement attempt, then one read");
+    assert.ok(seen.length > 0);
   } finally {
     await host.harness.lifecycle.dispose();
   }
