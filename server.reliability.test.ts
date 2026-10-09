@@ -3,6 +3,8 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import plugin from "./server.ts";
+import { createDispatchJobs } from "./lib/async-dispatch.ts";
+import { createDoorbellHold } from "./lib/doorbell-hold.ts";
 import { createInboundLedger } from "./lib/inbound-ledger.ts";
 import { createLaunches } from "./lib/launch.ts";
 import { createDeliveries } from "./lib/pr-delivery.ts";
@@ -791,4 +793,122 @@ test("long option text stays whole and defaults to a short letter value", async 
     assert.deepEqual(sent.input.options, [{ label, value: "A" }]);
     assert.equal(sent.input.text, `New customers can start their agents again.\n\n❓ Question\n\nHow should we repair access?\nA. ${label}`);
   } finally { await host.harness.lifecycle.dispose(); }
+});
+
+const jobState = (host: Host, id: string) => createDispatchJobs(host.bb.storage.database()).get(id)?.state;
+const captainSends = (host: Host) => host.harness.sdk.callsTo("threads.send")
+  .filter((c) => (c[0] as { threadId?: string }).threadId === "thr_cap").map((c) => JSON.stringify(c[0]));
+
+test("a background dispatch that fails tells the captain", async () => {
+  const host = await knownCaptainHost();
+  try {
+    await asyncOn(host);
+    stubSpawn(host);
+    host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: "idle" }));
+    host.harness.sdk.stub("threads.spawn", async () => { throw new Error("Host is not connected"); });
+    const reserved = await tool(host, "firstmate_dispatch").execute({ task: "fix flaky login", projectId: "proj_1", taskId: "job-fail" }, capCtx);
+    assert.match(text(reserved), /Reserved crew job-fail/);
+    await until(() => jobState(host, "job-fail") === "failed");
+    await until(() => captainSends(host).some((sent) => /job-fail/.test(sent)));
+    const [note] = captainSends(host).filter((sent) => /job-fail/.test(sent));
+    assert.match(note!, /Dispatch failed/);
+    assert.match(note!, /Host is not connected/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("two background dispatches for the last free slot start one crew now and the other when a slot opens", async () => {
+  const host = await knownCaptainHost();
+  try {
+    await asyncOn(host);
+    await host.bb.storage.kv.set("crews", Array.from({ length: 9 }, (_, i) => crewRow(`c${i + 1}`, `thr_c${i + 1}`)));
+    let busy = true;
+    stubSpawn(host, (threadId) => (threadId === "thr_cap" || (!busy && threadId === "thr_c1") ? "idle" : "active"));
+    const dispatch = tool(host, "firstmate_dispatch");
+    const results = await Promise.all([
+      dispatch.execute({ task: "fix flaky login", projectId: "proj_1", taskId: "job-a" }, capCtx),
+      dispatch.execute({ task: "fix slow search", projectId: "proj_1", taskId: "job-b" }, capCtx),
+    ]);
+    for (const result of results) assert.ok(!isError(result), text(result));
+    await until(() => host.harness.sdk.callsTo("threads.spawn").length === 1);
+    await until(() => ["job-a", "job-b"].some((id) => jobState(host, id) === "queued"));
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 1, "the cap holds");
+    const waiting = ["job-a", "job-b"].find((id) => jobState(host, id) === "queued")!;
+    assert.deepEqual(captainSends(host).filter((sent) => /Dispatch failed/.test(sent)), []);
+    busy = false;
+    await host.harness.behavior.runSchedule("pr-delivery-follow-up");
+    await until(() => jobState(host, waiting) === "started");
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 2);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a held crew doorbell that fails to send on release is kept for the next release", async () => {
+  const host = await knownCaptainHost();
+  try {
+    await asyncOn(host);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: "idle" }));
+    const store = createDoorbellHold(host.bb.storage.database());
+    for (const crewId of ["c1", "c2"]) {
+      store.enqueue({ captainThreadId: "thr_cap", text: `🔔 crew ${crewId} idle [ship] :: fix login`, crewId, urgent: false, createdAt: 1 });
+    }
+    const doorbells = () => captainSends(host).filter((sent) => /crew c[12] idle/.test(sent));
+
+    host.harness.sdk.stub("threads.send", async () => { throw new Error("Server session is not open"); });
+    await captainIdle(host);
+    assert.equal(store.pending("thr_cap"), 2, "a failed send must not drop the held doorbells");
+
+    const refused = doorbells().length;
+    host.harness.sdk.stub("threads.send", async () => ({}));
+    await captainIdle(host);
+    assert.equal(store.pending("thr_cap"), 0);
+    const delivered = doorbells().slice(refused);
+    assert.equal(delivered.filter((sent) => /crew c1 idle/.test(sent)).length, 1);
+    assert.equal(delivered.filter((sent) => /crew c2 idle/.test(sent)).length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("an over-cap dispatch starts within a minute when a slot opens without a crew turn ending", async () => {
+  const host = await knownCaptainHost();
+  try {
+    await asyncOn(host);
+    await host.bb.storage.kv.set("crews", Array.from({ length: 10 }, (_, i) => crewRow(`c${i + 1}`, `thr_c${i + 1}`)));
+    let failed = false;
+    stubSpawn(host, (threadId) => (threadId === "thr_cap" ? "idle" : failed && threadId === "thr_c1" ? "error" : "active"));
+    const queued = await tool(host, "firstmate_dispatch").execute({ task: "fix flaky login", projectId: "proj_1" }, capCtx);
+    assert.match(text(queued), /Queued as/);
+    failed = true;
+    await host.harness.behavior.runSchedule("pr-delivery-follow-up");
+    await until(() => host.harness.sdk.callsTo("threads.spawn").length === 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("turning asyncDispatch off still starts the over-cap work and sends the doorbells it already holds", async () => {
+  const host = await knownCaptainHost();
+  try {
+    await asyncOn(host);
+    await host.bb.storage.kv.set("crews", Array.from({ length: 10 }, (_, i) => crewRow(`c${i + 1}`, `thr_c${i + 1}`)));
+    let busy = true;
+    stubSpawn(host, (threadId) => (threadId === "thr_cap" || !busy ? "idle" : "active"));
+    const queued = await tool(host, "firstmate_dispatch").execute({ task: "fix flaky login", projectId: "proj_1" }, capCtx);
+    assert.match(text(queued), /Queued as/);
+    const store = createDoorbellHold(host.bb.storage.database());
+    store.enqueue({ captainThreadId: "thr_cap", text: "🔔 crew c1 idle [ship] :: fix login", crewId: "c1", urgent: false, createdAt: 1 });
+
+    await host.harness.behavior.setSettings({ fmReliability: JSON.stringify({ asyncDispatch: "off" }) });
+    busy = false;
+    await captainIdle(host);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 1, "the queued dispatch started");
+    assert.equal(store.pending("thr_cap"), 0);
+    assert.equal(captainSends(host).filter((sent) => /crew c1 idle/.test(sent)).length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
 });

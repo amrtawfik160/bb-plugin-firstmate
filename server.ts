@@ -4604,9 +4604,19 @@ export default async function plugin(bb: BbPluginApi) {
     } catch (error) {
       // An unload interrupts the attempt; the job stays due and the next load resumes it.
       if (launchAbort.signal.aborted) return;
+      const message = error instanceof Error ? error.message : String(error);
       const failed = dispatchJobs.get(reservedId);
-      if (failed) dispatchJobs.save({ ...failed, state: "failed", error: String(error) });
-      bb.log.warn(`async dispatch ${reservedId}: ${String(error)}`);
+      // Another dispatch took the last slot after this one was admitted. The job keeps
+      // its full input and stays due, so it starts once a slot opens.
+      if (failed && /Crew cap reached/.test(message)) {
+        dispatchJobs.save({ ...failed, state: "queued", error: message });
+        return;
+      }
+      if (failed) dispatchJobs.save({ ...failed, state: "failed", error: message });
+      bb.log.warn(`async dispatch ${reservedId}: ${message}`);
+      // The tool already answered "Reserved", so this is the captain's only notice.
+      await deliverToCaptain(job.captainThreadId, `Dispatch failed: crew ${reservedId} did not start: ${truncate(message, 300)} Fix the cause, then dispatch again with taskId=${reservedId}.`, reservedId, undefined, true)
+        .catch((notifyError) => bb.log.warn(`async dispatch ${reservedId} failure notice: ${String(notifyError)}`));
     } finally {
       dispatchInFlight.delete(reservedId);
     }
@@ -4677,9 +4687,9 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   // Drains only work that dispatch queued for lack of a slot. A captain's
-  // firstmate_queue backlog waits for an explicit queue dispatch.
+  // firstmate_queue backlog waits for an explicit queue dispatch. The flag gates
+  // new queueing only, so work queued before it was turned off still starts.
   async function drainQueuedDispatches(owner?: string): Promise<void> {
-    if ((await reliabilityFlags()).asyncDispatch !== "on") return;
     await queueStore.ready();
     const all = owner !== undefined ? queueStore.list(owner) : queueStore.list();
     const now = Date.now();
@@ -4698,6 +4708,16 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
     resumeDispatchJobs(owner);
+  }
+  // A slot that opens when a crew fails, is stopped or is forgotten ends no crew turn,
+  // so the per-minute pass drains too. One drain at a time, apart from that pass.
+  let queueDrain: Promise<void> | undefined;
+  function drainQueuedDispatchesInBackground(): void {
+    if (queueDrain || launchAbort.signal.aborted) return;
+    queueDrain = drainQueuedDispatches()
+      .catch((error) => bb.log.warn(`queued dispatch drain: ${String(error)}`))
+      .finally(() => { queueDrain = undefined; });
+    trackDispatchJob(queueDrain);
   }
 
   function reconcileTasks(captain: string, now: number): OwnerTask[] {
@@ -4774,13 +4794,14 @@ export default async function plugin(bb: BbPluginApi) {
   async function drainCaptainReliability(captainThreadId: string, signal?: AbortSignal): Promise<void> {
     await defaultOverdueAsks(captainThreadId).catch((error) => bb.log.warn(`owner ask deadlines: ${String(error)}`));
     const flags = await reliabilityFlags();
-    if (flags.asyncDispatch === "on") {
-      for (const row of doorbellHold.drain(captainThreadId)) {
-        await sendCaptainWake(captainThreadId, row.text, row.crewId ?? "held-doorbell", signal)
-          .catch((error) => bb.log.warn(`held doorbell drain: ${String(error)}`));
-      }
-      await drainQueuedDispatches(captainThreadId);
+    // Not gated on asyncDispatch: what was held or queued while it was on still goes out after it is turned off.
+    for (const row of doorbellHold.drain(captainThreadId)) {
+      // A send that fails, or that a reload cuts, keeps the doorbell held for the next drain.
+      const sent = await sendCaptainWake(captainThreadId, row.text, row.crewId ?? "held-doorbell", signal)
+        .catch((error) => { bb.log.warn(`held doorbell drain: ${String(error)}`); return false; });
+      if (!sent) doorbellHold.enqueue({ captainThreadId, text: row.text, crewId: row.crewId, urgent: row.urgent, createdAt: row.createdAt });
     }
+    await drainQueuedDispatches(captainThreadId).catch((error) => bb.log.warn(`queued dispatch drain: ${String(error)}`));
     if (flags.inboundLedger === "on") {
       if (flags.telegramThreading === "on") {
         try {
@@ -11886,7 +11907,7 @@ export default async function plugin(bb: BbPluginApi) {
       // Reports once per stuck stretch and never stops the crew; normal idle handling continues.
       const before = crewWatchdog.loadOrCreate(crew.id, crew.threadId, Date.parse(crew.createdAt) || Date.now());
       let state = observeIdleTurn(before, lastAssistantText);
-      const notify = state.trippedAt === null && watchdogTrip(state, Date.now()) !== null;
+      const notify = state.trippedAt === null && watchdogTrip(state) !== null;
       if (notify) state = tripWatchdog(state, Date.now(), lastAssistantText ?? "");
       crewWatchdog.save(state);
       if (notify) await notifyCaptain(crew, "needs-decision", watchdogNoticeText(state));
@@ -13332,7 +13353,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
   bb.background.schedule("pr-delivery-follow-up", "* * * * *", async () => {
     if (followUpWork || launchAbort.signal.aborted) return;
-    followUpWork=(async()=>{await launchRecoveryPass(launchAbort.signal);resumeDispatchJobs();await deliveryPass(launchAbort.signal);await raceAbort(publishFleet(),launchAbort.signal,STUCK_HOST_CALL_MS);})();
+    followUpWork=(async()=>{await launchRecoveryPass(launchAbort.signal);resumeDispatchJobs();drainQueuedDispatchesInBackground();await deliveryPass(launchAbort.signal);await raceAbort(publishFleet(),launchAbort.signal,STUCK_HOST_CALL_MS);})();
     try {await followUpWork;} finally {followUpWork=undefined;}
   });
   bb.events.on("thread.archived", ({ thread }) => { deliveries.ownerLost(thread.id); });
