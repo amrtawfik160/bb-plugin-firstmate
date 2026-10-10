@@ -83,5 +83,24 @@ export function createDispatchJobs(db: Database) {
     const rows = db.prepare("SELECT record FROM dispatch_jobs WHERE state IN ('reserved','queued','spawning') ORDER BY created_at LIMIT ?").all(limit) as { record: string }[];
     return rows.map((r) => JSON.parse(r.record) as DispatchJob).filter((job) => job.backoffUntil == null || job.backoffUntil <= now);
   }
-  return { get, save, due };
+  // Jobs a captain accepted that have no crew yet. Started and failed jobs are history.
+  function pending(captain: string): DispatchJob[] {
+    const rows = db.prepare("SELECT record FROM dispatch_jobs WHERE captain=? AND state IN ('reserved','queued','spawning') ORDER BY created_at").all(captain) as { record: string }[];
+    return rows.map((r) => JSON.parse(r.record) as DispatchJob);
+  }
+  return { get, save, due, pending };
+}
+
+/** One captain-facing line for a background dispatch that has no crew yet. */
+export function dispatchJobLine(job: DispatchJob, now: number): string {
+  let title = "";
+  try {
+    const input = JSON.parse(job.payload) as { title?: unknown; task?: unknown };
+    title = typeof input.title === "string" && input.title !== "" ? input.title : typeof input.task === "string" ? input.task.split("\n")[0]! : "";
+  } catch { /* an unreadable payload still lists by id */ }
+  const why = job.backoffUntil != null && job.backoffUntil > now ? `provider limit; next try ${new Date(job.backoffUntil).toISOString()}`
+    : job.state === "queued" ? "waiting for a crew slot"
+    : job.state === "spawning" ? "crew is being created"
+    : "accepted; crew not created yet";
+  return `${job.crewId} [background ${job.state}] :: ${title.slice(0, 70)} — ${why}`;
 }

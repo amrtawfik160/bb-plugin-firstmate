@@ -320,6 +320,79 @@ test("an over-cap dispatch starts with its own provider and a worktree once a sl
   }
 });
 
+test("an over-cap dispatch starts with the permission mode, worktree choice and visibility it was given", async () => {
+  const host = await knownCaptainHost();
+  try {
+    await asyncOn(host);
+    host.harness.sdk.stub("threads.defaultExecutionOptions", async () => ({ permissionMode: "full" }));
+    await host.harness.behavior.setSettings({ defaultPermissionMode: "accept-edits" });
+    await host.bb.storage.kv.set("crews", Array.from({ length: 10 }, (_, i) => crewRow(`c${i + 1}`, `thr_c${i + 1}`)));
+    let busy = true;
+    stubSpawn(host, () => (busy ? "active" : "idle"));
+    // This scout would default to the shared checkout, accept-edits and a visible thread.
+    const queued = await tool(host, "firstmate_dispatch").execute({
+      task: "map the login flow", projectId: "proj_1", shape: "scout", permissionMode: "full", worktree: true, visible: false,
+    }, capCtx);
+    assert.match(text(queued), /Queued as/);
+    busy = false;
+    await captainIdle(host);
+    const [args] = host.harness.sdk.callsTo("threads.spawn").map((c) => c[0] as {
+      permissionMode?: string; visibility?: string; environment?: { workspace?: { type?: string } };
+    });
+    assert.ok(args, "the over-cap item started");
+    assert.equal(args.permissionMode, "full");
+    assert.equal(args.environment?.workspace?.type, "managed-worktree");
+    assert.equal(args.visibility, "hidden");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("an over-cap queue record without the three stored options starts with the defaults", async () => {
+  const host = await knownCaptainHost();
+  try {
+    await asyncOn(host);
+    host.harness.sdk.stub("threads.defaultExecutionOptions", async () => ({ permissionMode: "full" }));
+    await host.harness.behavior.setSettings({ defaultPermissionMode: "accept-edits" });
+    await host.bb.storage.kv.set("crews", Array.from({ length: 10 }, (_, i) => crewRow(`c${i + 1}`, `thr_c${i + 1}`)));
+    let busy = true;
+    stubSpawn(host, () => (busy ? "active" : "idle"));
+    const queued = await tool(host, "firstmate_dispatch").execute({ task: "map the login flow", projectId: "proj_1", shape: "scout" }, capCtx);
+    assert.match(text(queued), /Queued as/);
+    busy = false;
+    await captainIdle(host);
+    const [args] = host.harness.sdk.callsTo("threads.spawn").map((c) => c[0] as {
+      permissionMode?: string; visibility?: string; environment?: { workspace?: { type?: string } };
+    });
+    assert.ok(args, "the over-cap item started");
+    assert.equal(args.permissionMode, "accept-edits");
+    assert.notEqual(args.environment?.workspace?.type, "managed-worktree");
+    assert.equal(args.visibility, "visible");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("the queue list shows an over-cap dispatch waiting for a slot and a background dispatch that has no crew yet", async () => {
+  const host = await knownCaptainHost();
+  try {
+    await asyncOn(host);
+    await host.bb.storage.kv.set("crews", Array.from({ length: 9 }, (_, i) => crewRow(`c${i + 1}`, `thr_c${i + 1}`)));
+    stubSpawn(host, () => "active");
+    host.harness.sdk.stub("threads.spawn", () => new Promise(() => {}));
+    const reserved = await tool(host, "firstmate_dispatch").execute({ task: "fix flaky login", taskId: "job-a", projectId: "proj_1" }, capCtx);
+    assert.match(text(reserved), /Reserved crew job-a/);
+    await until(() => host.harness.sdk.callsTo("threads.spawn").length === 1);
+    const queued = await tool(host, "firstmate_dispatch").execute({ task: "tidy the docs", taskId: "job-b", projectId: "proj_1" }, capCtx);
+    assert.match(text(queued), /Queued as job-b/);
+    const list = text(await tool(host, "firstmate_queue").execute({ action: "list" }, capCtx));
+    assert.match(list, /^job-b \[queued\] ship :: tidy the docs — waiting for a crew slot; starts by itself$/m);
+    assert.match(list, /^job-a \[background spawning\] :: fix flaky login — crew is being created/m);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("a crew whose status read fails still holds a cap slot", async () => {
   const host = await load();
   try {

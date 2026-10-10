@@ -8,7 +8,8 @@
 #
 #   stop           Runs native fm-turnend-guard, then guards the BB presentation receipt.
 #   stop-autoarm   Defer to a healthy BB keeper; otherwise use native asyncRewake.
-#   session-start  Runs native startup inside the harness process tree.
+#   session-start  Runs native startup inside the harness process tree; queued wakes
+#                  are shown as a pointer at firstmate_wake, never as raw rows.
 #
 # Only registered captain threads use these home bindings.
 set -u
@@ -106,9 +107,20 @@ case "$mode" in
     # Only a captain with its own native home owns that home's session lock; a
     # legacy captain on the shared base home would take it from the others.
     [ "$(sed -n 's/^own_home=//p' "$marker" 2>/dev/null | head -n 1)" = "1" ] || exit 0
-    run_native fm-sessionstart-run.sh
-    exit $?
-
+    # The pinned digest prints the raw native drain. Its acknowledgement command
+    # bypasses the plugin receipt, and its rows include ones the plugin removes,
+    # so both are replaced by one pointer at firstmate_wake. Rows stay queued.
+    run_native fm-sessionstart-run.sh | awk '
+      function point() {
+        if (!said) print "firstmate: crew wake reports may be waiting for this captain. Call firstmate_wake with ack=true to read them, handle all reports, then pass handledWake on the final successful Firstmate action or firstmate_wake."
+        said = 1
+      }
+      /^[0-9]+\t[0-9]+\t[^\t]+\t[^\t]*\t/ { point(); next }
+      /^WAKE_ACK_REQUIRED:/ || /--ack-through [0-9]+ --recovery-generation / { point(); next }
+      /^WARNING: queued wakes pending - drain them/ { point(); next }
+      { print }
+    '
+    exit "${PIPESTATUS[0]}"
     ;;
 esac
 exit 0

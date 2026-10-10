@@ -12,6 +12,8 @@ export const queueItemSchema = z.object({
   crewId:z.string().nullable().default(null), parentThreadId:z.string().nullish(), backlogId:z.string().optional(),
   sourceRefs:z.array(z.string()).optional(), overCap:z.boolean().optional(),
   playbook:z.enum(PLAYBOOK_CHOICES).optional(),
+  // Set only on an over-cap dispatch that named them; absent means the default at start.
+  permissionMode:z.enum(['accept-edits','auto','full']).optional(), worktree:z.boolean().optional(), visible:z.boolean().optional(),
   backlogUnparsed:z.boolean().optional(), createdAt:z.string(), nativePending:z.boolean().optional(),
 }).strict();
 export type QueueItem = z.infer<typeof queueItemSchema>;
