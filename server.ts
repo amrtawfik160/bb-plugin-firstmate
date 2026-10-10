@@ -1079,6 +1079,16 @@ export function watchRelayDedupKey(line: string): string {
   return flat.replace(/\(([^)]*)\)/g, (_m, inner: string) => `(${inner.replace(/\d+/g, "#")})`);
 }
 
+// True when a presented wake read carries a receipt but no report: only the receipt
+// lines and the native notice that newer rows are queued.
+export function wakeBatchIsEmpty(out: string): boolean {
+  return out.split(/\r?\n/).every((line) => {
+    const text = line.trim();
+    return text === "" || text === "No unread reports." || /^WAKE_RECEIPT: /.test(text) || /^WARNING: queued wakes pending/.test(text)
+      || /^Handle the whole batch, then pass handledWake/.test(text);
+  });
+}
+
 // Pull the ack pair out of a presented wake drain (native or rewritten form).
 export function wakeAckFromOutput(out: string): { ackThrough: number; recoveryGeneration: string } | null {
   const m =
@@ -7345,7 +7355,9 @@ export default async function plugin(bb: BbPluginApi) {
   // captain's own project; this covers the captain's deliveries in every other project.
   function retainedCrew(id: string, caller: string | undefined): Crew | undefined {
     if (!caller) return undefined;
-    const record = deliveries.ownedTaskRecord(caller, id);
+    // An open delivery first. A finished one still names the crew, so its leftover native
+    // record and thread can be retired with forget --stop.
+    const record = deliveries.ownedTaskRecord(caller, id) ?? deliveries.ownedTaskRecord(caller, id, true);
     if (!record?.continuation) return undefined;
     return { ...crewSchema.parse(record.continuation), parentThreadId: record.owner, deliveryRequirement: record.requirement, prUrl: record.url };
   }
@@ -8282,6 +8294,7 @@ export default async function plugin(bb: BbPluginApi) {
     hostOverride?: string,
     signal?: AbortSignal,
     receipt?: { action: "receive" | "inspect" | "begin-action" | "mark-success" | "complete"; id?: string },
+    emptyAfterHide = 0,
   ): Promise<string> {
     const current = await settings.get();
     const fmHome = current.fmHome.trim();
@@ -8302,8 +8315,9 @@ export default async function plugin(bb: BbPluginApi) {
       args.push("--ack-through", String(Math.max(0, Math.trunc(ackThrough))), "--recovery-generation", recoveryGeneration);
     }
     try {
-      // Before a fresh read only: an open receipt already holds its report.
-      if (captainThreadId && args.length === 0 && (receipt === undefined || receipt.action === "receive")) {
+      // Before every native read of the queue: a fresh read, and the re-read that follows
+      // an acknowledgement.
+      if (captainThreadId && args.length === 0 && (receipt === undefined || receipt.action === "receive" || receipt.action === "complete")) {
         await pruneQuietStaleRows(captainThreadId, hostId, fmHome, signal).catch((error) => {
           if (isAbortError(error)) throw error;
           bb.log.warn(`quiet stale prune skipped captain=${captainThreadId}: ${error instanceof Error ? error.message : String(error)}`);
@@ -8326,6 +8340,13 @@ export default async function plugin(bb: BbPluginApi) {
       }
       if (res.exitCode !== 0) throw new Error(`native exit ${res.exitCode}: ${raw || "no diagnostic output"}`);
       const out = captainThreadId ? await hideFinishedCrewWakes(raw, captainThreadId, hostId, fmHome, signal) : raw;
+      // A receipt opened before its rows were removed can hold nothing but hidden rows.
+      // The plugin completes it, so the captain is not handed an empty batch to acknowledge.
+      const open = res.receipt;
+      if (out !== raw && open?.id && open.phase === "ready" && emptyAfterHide < 2 && wakeBatchIsEmpty(out)) {
+        bb.log.info(`wake drain: receipt ${open.id} held only hidden rows; completed without the captain`);
+        return await drainWakes(captainThreadId, undefined, undefined, hostOverride, signal, { action: "complete", id: open.id }, emptyAfterHide + 1);
+      }
       // After a successful drain and under its own short budget, so a slow host can only
       // delay housekeeping, never the drain itself. Its effect shows from the next drain.
       if (args.length === 0 && (receipt === undefined || receipt.action === "receive")) {
@@ -8411,9 +8432,16 @@ export default async function plugin(bb: BbPluginApi) {
   async function pruneQuietStaleRows(captain: string, hostId: string, fmHome: string, signal?: AbortSignal): Promise<number> {
     const stateDir = wakeStateDir(fmHome, captain);
     const queue = shQuote(`${stateDir}/.wake-queue`);
-    const read = await runOnHost(hostId, `[ ! -f ${queue} ] || awk -F '\\t' '$3=="stale"' ${queue}`, 15_000, signal);
+    const read = await runOnHost(hostId, `[ ! -f ${queue} ] || awk -F '\\t' '$3=="stale" || ($3=="check" && $4 ~ /^inactive-outcome:/)' ${queue}`, 15_000, signal);
     const rows = staleQueueRows(read.output);
-    if (rows.length === 0) return 0;
+    // Rows a wake read would hide: a DONE crew whose PR the tracker owns. That covers a
+    // crew forgotten before forget marked its thread. A hidden row still opened a receipt
+    // with an empty batch (5 in a row for one captain on 2026-10-10), so it goes too.
+    const queued = read.output.split("\n").map(parseWakeRow).filter((row) => row !== null);
+    const finished = queued.length === 0 ? { threads: new Set<string>(), crewIds: new Set<string>() }
+      : await finishedCrewsWithTrackedPrs(captain, hostId, fmHome, finishedCrewCandidates(queued), signal);
+    const hidden = queued.filter((row) => isFinishedCrewWake(row, finished)).map((row) => row.seq);
+    if (rows.length === 0 && hidden.length === 0) return 0;
     const crews = await readCrews();
     const verdicts = new Map<string, QuietVerdict>();
     for (const threadId of new Set(rows.map((row) => row.threadId))) {
@@ -8422,7 +8450,10 @@ export default async function plugin(bb: BbPluginApi) {
         return "surface" as const; // unreadable crew state keeps its alert
       }));
     }
-    const quiet = rows.filter((row) => verdicts.get(row.threadId) !== "surface");
+    const quiet = [
+      ...rows.filter((row) => verdicts.get(row.threadId) !== "surface"),
+      ...hidden.filter((seq) => !rows.some((row) => row.seq === seq && verdicts.get(row.threadId) !== "surface")).map((seq) => ({ seq, threadId: "tracked-pr" })),
+    ];
     if (quiet.length === 0) return 0;
     const lib = `${fmHome}/bin/fm-wake-lib.sh`;
     const script = [
@@ -8435,7 +8466,7 @@ export default async function plugin(bb: BbPluginApi) {
       `[ -s ${queue} ] || exit 0`,
       `fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK" || exit 1`,
       `tmp=${queue}.bb-quiet.$$; rc=0`,
-      `awk -F '\\t' -v drop=${shQuote(`|${quiet.map((row) => row.seq).join("|")}|`)} '!($3=="stale" && index(drop, "|" $2 "|"))' ${queue} > "$tmp" && cat "$tmp" > ${queue} || rc=1`,
+      `awk -F '\\t' -v drop=${shQuote(`|${quiet.map((row) => row.seq).join("|")}|`)} '!(($3=="stale" || $3=="check") && index(drop, "|" $2 "|"))' ${queue} > "$tmp" && cat "$tmp" > ${queue} || rc=1`,
       `rm -f "$tmp"; fm_lock_release "$FM_WAKE_QUEUE_LOCK"; exit $rc`,
     ].join("\n");
     const res = await runOnHost(hostId, script, 15_000, signal);
@@ -8443,8 +8474,8 @@ export default async function plugin(bb: BbPluginApi) {
       bb.log.warn(`quiet stale prune failed captain=${captain} exit=${res.exitCode}: ${truncate(res.output.trim(), 200)}`);
       return 0;
     }
-    const why = [...new Set(quiet.map((row) => `${row.threadId}=${verdicts.get(row.threadId)}`))].join(", ");
-    bb.log.info(`wake queue: removed ${quiet.length} stale row(s) about crews that are waiting, finished or forgotten (captain ${captain}: ${why})`);
+    const why = [...new Set(quiet.map((row) => `${row.threadId}=${verdicts.get(row.threadId) ?? "finished"}`))].join(", ");
+    bb.log.info(`wake queue: removed ${quiet.length} row(s) about crews that are waiting, finished or forgotten (captain ${captain}: ${why})`);
     return quiet.length;
   }
 

@@ -127,9 +127,9 @@ export function createDeliveries(db: Database) {
     const row=db.prepare("SELECT record FROM deliveries WHERE owner=? AND project=? AND status NOT IN ('complete','explicitly-abandoned') AND (json_extract(record,'$.taskId')=? OR EXISTS(SELECT 1 FROM json_each(json_extract(record,'$.workers')) WHERE value=?)) ORDER BY due,id LIMIT 1").get(owner,projectId,id,id) as {record:string}|undefined;
     return row ? JSON.parse(row.record) as DeliveryRecord : undefined;
   }
-  /** taskRecord across every project of this owner. */
-  function ownedTaskRecord(owner:string,id:string) {
-    const row=db.prepare("SELECT record FROM deliveries WHERE owner=? AND status NOT IN ('complete','explicitly-abandoned') AND (json_extract(record,'$.taskId')=? OR EXISTS(SELECT 1 FROM json_each(json_extract(record,'$.workers')) WHERE value=?)) ORDER BY due,id LIMIT 1").get(owner,id,id) as {record:string}|undefined;
+  /** taskRecord across every project of this owner; open deliveries only unless includeComplete. */
+  function ownedTaskRecord(owner:string,id:string,includeComplete=false) {
+    const row=db.prepare(`SELECT record FROM deliveries WHERE owner=? ${includeComplete ? "" : "AND status NOT IN ('complete','explicitly-abandoned')"} AND (json_extract(record,'$.taskId')=? OR EXISTS(SELECT 1 FROM json_each(json_extract(record,'$.workers')) WHERE value=?)) ORDER BY due,id LIMIT 1`).get(owner,id,id) as {record:string}|undefined;
     return row ? JSON.parse(row.record) as DeliveryRecord : undefined;
   }
   function register(input: { url: string; taskId: string; projectId: string; owner: string | null; home: string; worker: string; requirement?: DeliveryRequirement; continuation?:Record<string,unknown>; title?:string; openedAt?:number }) {
