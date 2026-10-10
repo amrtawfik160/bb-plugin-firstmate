@@ -41,21 +41,38 @@ export function captainResumeDelay(scheduled: number): number | null {
   return CAPTAIN_RESUME_DELAYS_MS[scheduled] ?? null;
 }
 
+// Cursor at its plan limit ends the turn as completed with "Upgrade your plan to
+// continue" as the only assistant text (crews af4986b1 and d883a2a4, 2026-10-10), so
+// no turn failure fires. Only a whole short message counts: a crew report that quotes
+// the wording is a report.
+const PLAN_LIMIT = /upgrade your plan|plan limit|quota (?:exceeded|exhausted)|exceeded your (?:current )?quota|out of (?:credits|quota)/i;
+
+export function planLimitNotice(text: string | null): boolean {
+  const body = (text ?? "").trim();
+  return body.length <= 120 && !/^(?:DONE|BLOCKED|FAILED|NEEDS[ _-]DECISION|WAITING)\b/i.test(body) && PLAN_LIMIT.test(body);
+}
+
+export function planLimitError(detail: string): boolean {
+  return PLAN_LIMIT.test(detail);
+}
+
+export const PROVIDER_UNAVAILABLE_MS = 60 * 60_000;
 export const PROVIDER_UNAVAILABLE_KEY = "provider-unavailable";
 export type UnavailableProviders = Record<string, { until: number; reason: string }>;
 
-export function planLimitNotice(_text: string | null): boolean {
-  return false;
+/** The reset the error names ("try again in 25 minutes"), else 60 minutes; at most a day. */
+export function unavailableUntil(text: string, now: number): number {
+  const named = /\bin\s+(\d+)\s*(min|hour|hr)/i.exec(text);
+  if (named === null) return now + PROVIDER_UNAVAILABLE_MS;
+  const ms = Number(named[1]) * (named[2]!.toLowerCase() === "min" ? 60_000 : 60 * 60_000);
+  return now + Math.min(Math.max(ms, 60_000), 24 * 60 * 60_000);
 }
 
-export function planLimitError(_detail: string): boolean {
-  return false;
+export function utcMinute(at: number): string {
+  return `${new Date(at).toISOString().slice(0, 16).replace("T", " ")} UTC`;
 }
 
-export function unavailableUntil(_text: string, _now: number): number {
-  return 0;
-}
-
-export function unavailableProviderLines(_marks: UnavailableProviders | undefined, _now: number): string[] {
-  return [];
+export function unavailableProviderLines(marks: UnavailableProviders | undefined, now: number): string[] {
+  return Object.entries(marks ?? {}).filter(([, mark]) => mark.until > now)
+    .map(([id, mark]) => `PROVIDER_UNAVAILABLE: ${id} is ${mark.reason}; dispatches with no provider named skip it until ${utcMinute(mark.until)}.`);
 }
