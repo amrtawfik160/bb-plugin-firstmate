@@ -1172,6 +1172,23 @@ export const CAPTAIN_HOOK_MARK = "bb-firstmate/bin/bb-captain-hook.sh";
 export function captainHookCommand(mode: "stop" | "stop-autoarm" | "session-start", claude = false): string {
   return `h="$HOME/.${CAPTAIN_HOOK_MARK}"; [ -n "\${BB_THREAD_ID:-}" ] || exit 0; [ -f "$HOME/.bb-firstmate/captains/$BB_THREAD_ID" ] || exit 0; [ -x "$h" ] || { echo "firstmate: registered captain missing hook $h" >&2; exit 1; }; exec "$h" ${mode}${claude ? " --claude" : ""}`;
 }
+// Prints captain-hook-stale only where a captain marker exists and the installed
+// hook is not this executable file; a host with no hash tool is left to the copy's own compare.
+export function captainHookCheckScript(sha256: string): string {
+  return ['d="$HOME/.bb-firstmate"; f="$d/bin/bb-captain-hook.sh"',
+    '[ -n "$(ls -A "$d/captains" 2>/dev/null)" ] || { echo captain-hook-unregistered; exit 0; }',
+    'have=$( (sha256sum "$f" 2>/dev/null || shasum -a 256 "$f" 2>/dev/null) | cut -d" " -f1)',
+    `if [ -x "$f" ] && [ "$have" = ${shQuote(sha256)} ]; then echo captain-hook-current; else echo captain-hook-stale; fi`,
+  ].join("\n");
+}
+const captainHookCopy = (hookPath: string) =>
+  `cp ${hookPath} "$d/bin/bb-captain-hook.sh.tmp" && chmod 0755 "$d/bin/bb-captain-hook.sh.tmp" && mv "$d/bin/bb-captain-hook.sh.tmp" "$d/bin/bb-captain-hook.sh"`;
+// The hook file alone: no marker, no user settings.
+export function captainHookFileInstallScript(hookPath: string): string {
+  return ["set -e", 'd="$HOME/.bb-firstmate"; mkdir -p "$d/bin"', `h=${shQuote(hookPath)}`,
+    `if [ -x "$d/bin/bb-captain-hook.sh" ] && cmp -s "$h" "$d/bin/bb-captain-hook.sh"; then echo captain-hook-current; else ${captainHookCopy('"$h"')} && echo captain-hook-installed; fi`,
+  ].join("\n");
+}
 export function captainHookInstallScript(input: {
   threadId: string; home: string; state: string; ownHome: boolean; hookPath: string; heavyPath: string; runtimeRoot?:string;
 }): string {
@@ -1188,7 +1205,7 @@ export function captainHookInstallScript(input: {
   };
   return ["set -e", "command -v jq >/dev/null",
     'd="$HOME/.bb-firstmate"; mkdir -p "$d/bin" "$d/captains"',
-    `cp ${q(input.hookPath)} "$d/bin/bb-captain-hook.sh.tmp" && chmod 0755 "$d/bin/bb-captain-hook.sh.tmp" && mv "$d/bin/bb-captain-hook.sh.tmp" "$d/bin/bb-captain-hook.sh"`,
+    captainHookCopy(q(input.hookPath)),
     `h=${q(input.heavyPath)}; if [ ! -x "$d/bin/fm-heavy" ] || ! cmp -s "$h" "$d/bin/fm-heavy"; then cp "$h" "$d/bin/fm-heavy.tmp" && chmod 0755 "$d/bin/fm-heavy.tmp" && mv "$d/bin/fm-heavy.tmp" "$d/bin/fm-heavy"; fi`,
     `printf 'home=%s\nstate=%s\nown_home=%s\nroot=%s\n' ${q(input.home)} ${q(input.state)} ${input.ownHome ? "1" : "0"} ${q(input.runtimeRoot??input.home)} > "$d/captains/${input.threadId}"`,
     'mkdir -p "$HOME/.claude" "$HOME/.codex"',
@@ -4667,6 +4684,7 @@ export default async function plugin(bb: BbPluginApi) {
     permissionMode?: PermissionMode;
     worktree?: boolean;
     visible?: boolean;
+    ownerRequestedProvider?: boolean;
   }): Promise<string | null> {
     const flags = await reliabilityFlags();
     if (flags.asyncDispatch !== "on") return null;
@@ -4703,6 +4721,7 @@ export default async function plugin(bb: BbPluginApi) {
       ...(input.permissionMode !== undefined ? { permissionMode: input.permissionMode } : {}),
       ...(input.worktree !== undefined ? { worktree: input.worktree } : {}),
       ...(input.visible !== undefined ? { visible: input.visible } : {}),
+      ...(input.ownerRequestedProvider === true ? { ownerRequestedProvider: true } : {}),
     };
     queueStore.add(queued);
     for (const key of input.sourceRefs ?? []) {
@@ -8005,6 +8024,33 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  // A plugin load brings the hook file up to date on each host with a registered
+  // captain; the marker and the user settings stay as the deck wrote them.
+  async function refreshCaptainHookFiles(signal: AbortSignal): Promise<void> {
+    const hosts = new Set<string>();
+    for (const key of await bb.storage.kv.list("native-home-host:")) {
+      if ((await bb.storage.kv.get(`${RETIRED_HOME_PREFIX}${key.slice("native-home-host:".length)}`)) === true) continue;
+      const host = await bb.storage.kv.get<string>(key);
+      if (typeof host === "string" && host !== "") hosts.add(host);
+    }
+    const hook = readFileSync(join(OVERLAY_DIR, "bin/bb-captain-hook.sh"), "utf8");
+    const check = captainHookCheckScript(createHash("sha256").update(hook).digest("hex"));
+    for (const hostId of hosts) {
+      if (signal.aborted) return;
+      try {
+        if (!/^captain-hook-stale\r?$/m.test((await runOnHost(hostId, `bash -c ${shQuote(check)}`, 30_000, signal)).output)) continue;
+        const stage = `/tmp/.fm-captain-bin-${randomUUID()}`;
+        if (!(await writeHostBytes(hostId, `${stage}/bb-captain-hook.sh`, hook, 60_000, signal))) throw new Error("staging failed");
+        const res = await runOnHost(hostId, `bash -c ${shQuote(captainHookFileInstallScript(`${stage}/bb-captain-hook.sh`))}`, 60_000, signal)
+          .finally(() => runHostCommand(hostId, `rm -rf ${shQuote(stage)}`, 10_000).catch(() => {}));
+        if (/^captain-hook-installed\r?$/m.test(res.output)) bb.log.info(`captain hook file installed host=${hostId}`);
+        else if (res.exitCode !== 0) throw new Error(truncate(res.output, 400));
+      } catch (error) {
+        if (!signal.aborted) bb.log.warn(`captain hook file refresh failed host=${hostId}: ${String(error)}`);
+      }
+    }
+  }
+
   // Runs on every deck, outside the setup stamp, so a link removed later comes back.
   async function ensureSkillRoutingLinks(hostId: string, signal?: AbortSignal): Promise<void> {
     try {
@@ -9275,6 +9321,7 @@ export default async function plugin(bb: BbPluginApi) {
       shape: item.shape,
       mode: toMode(item.mode !== "" ? item.mode : undefined, registry.mode),yolo:registry.yolo,
       sourceRefs: item.sourceRefs, playbook: item.playbook,
+      ownerRequestedProvider: item.ownerRequestedProvider,
     });
     item.status = "dispatched";
     item.crewId = crew.id;
@@ -10553,6 +10600,7 @@ export default async function plugin(bb: BbPluginApi) {
             ? { worktree: resolveWorktree({ shape: shape ?? "ship", sharedEnv: sharedEnv === true, worktreeFlag: worktree === true, explicit: worktree }).worktree }
             : {}),
           visible,
+          ownerRequestedProvider,
         });
         if (queued) return `${queued}${await trackTask(crewKey)}`;
       }
@@ -12801,6 +12849,9 @@ export default async function plugin(bb: BbPluginApi) {
             const sendAtRaw = flagStr(flags, "send-at");
             const sendAt = sendAtRaw === undefined ? undefined : Number(sendAtRaw);
             if (sendAt !== undefined && !Number.isFinite(sendAt)) return fail("Bad --send-at (epoch ms).");
+            // Refused before the over-cap queue, which would otherwise take the task and drop the time.
+            if (sendAt !== undefined) validateLaunchCapabilities({ transport: current.transport, shape, worktree: wt.worktree, sendAt });
+            const ownerRequestedProvider = flags.has("owner-requested-provider");
 
             if (!flags.has("override-owner")) {
               for (const t of tasks) {
@@ -12829,6 +12880,7 @@ export default async function plugin(bb: BbPluginApi) {
                   permissionMode: toPermissionMode(flagStr(flags, "permission-mode")),
                   ...(flags.has("shared-env") || flags.has("worktree") ? { worktree: wt.worktree } : {}),
                   ...(flags.has("hidden") ? { visible: false } : {}),
+                  ownerRequestedProvider,
                 });
                 if (queued) {
                   queuedNotes.push(queued);
@@ -12850,7 +12902,7 @@ export default async function plugin(bb: BbPluginApi) {
                 shape,
                 mode,yolo:registry.yolo,
                 sendAt,signal,deliveryRequirement:flagStr(flags,"delivery-requirement") as "pr" | "merged" | "merged-and-verified" | undefined,
-                playbook,
+                playbook, ownerRequestedProvider,
               });
               dispatched.push({ ...crew, status: await crewStatus(crew) });
             }
@@ -13794,6 +13846,8 @@ export default async function plugin(bb: BbPluginApi) {
       const seen = new Map<string, Set<string>>();
       // Homes whose bb mirror was checked against this load's overlay (once per load).
       const overlayChecked = new Set<string>();
+      // Once per load, after the first supervision pass.
+      let hookRefresh: Promise<void> | undefined;
       while (!signal.aborted) {
         for (const key of await bb.storage.kv.list("native-home:")) {
           if (signal.aborted) break;
@@ -13847,6 +13901,7 @@ export default async function plugin(bb: BbPluginApi) {
             bb.log.warn(`captain home ${captain}: ${String(error)}`);
           }
         }
+        hookRefresh ??= refreshCaptainHookFiles(signal).catch((error) => bb.log.warn(`captain hook file refresh failed: ${String(error)}`));
         await new Promise<void>(resolve => {
           if (signal.aborted) return resolve();
           const onAbort = () => { clearTimeout(timer); resolve(); };
@@ -13854,6 +13909,7 @@ export default async function plugin(bb: BbPluginApi) {
           signal.addEventListener("abort", onAbort, { once: true });
         });
       }
+      await hookRefresh;
     },
   });
 

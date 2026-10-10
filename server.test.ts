@@ -8886,7 +8886,8 @@ test("captain home watcher stops archived homes without refreshing their owner b
     const commandStarted = new Promise<void>(resolve => { entered = resolve; });
     let command = "";
     host.harness.sdk.stub("terminals.create", async (input: { start: { command: string } }) => {
-      command = unwrapHostCommand(input.start.command); entered(); return { id: "term_retired" };
+      if (command === "") command = unwrapHostCommand(input.start.command);
+      entered(); return { id: "term_retired" };
     });
     host.harness.sdk.stub("terminals.output", async () => ({ nextSeq: 1, chunks: [] }));
     host.harness.sdk.stub("terminals.get", async () => ({ status: "exited", exitCode: 0 }));
