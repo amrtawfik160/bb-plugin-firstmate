@@ -40,3 +40,22 @@ export const CAPTAIN_RESUME_DELAYS_MS: readonly number[] = [2, 5, 10].map((m) =>
 export function captainResumeDelay(scheduled: number): number | null {
   return CAPTAIN_RESUME_DELAYS_MS[scheduled] ?? null;
 }
+
+export const PROVIDER_UNAVAILABLE_KEY = "provider-unavailable";
+export type UnavailableProviders = Record<string, { until: number; reason: string }>;
+
+export function planLimitNotice(_text: string | null): boolean {
+  return false;
+}
+
+export function planLimitError(_detail: string): boolean {
+  return false;
+}
+
+export function unavailableUntil(_text: string, _now: number): number {
+  return 0;
+}
+
+export function unavailableProviderLines(_marks: UnavailableProviders | undefined, _now: number): string[] {
+  return [];
+}
