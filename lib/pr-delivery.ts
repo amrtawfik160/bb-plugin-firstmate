@@ -127,6 +127,11 @@ export function createDeliveries(db: Database) {
     const row=db.prepare("SELECT record FROM deliveries WHERE owner=? AND project=? AND status NOT IN ('complete','explicitly-abandoned') AND (json_extract(record,'$.taskId')=? OR EXISTS(SELECT 1 FROM json_each(json_extract(record,'$.workers')) WHERE value=?)) ORDER BY due,id LIMIT 1").get(owner,projectId,id,id) as {record:string}|undefined;
     return row ? JSON.parse(row.record) as DeliveryRecord : undefined;
   }
+  /** taskRecord across every project of this owner; open deliveries only unless includeComplete. */
+  function ownedTaskRecord(owner:string,id:string,includeComplete=false) {
+    const row=db.prepare(`SELECT record FROM deliveries WHERE owner=? ${includeComplete ? "" : "AND status NOT IN ('complete','explicitly-abandoned')"} AND (json_extract(record,'$.taskId')=? OR EXISTS(SELECT 1 FROM json_each(json_extract(record,'$.workers')) WHERE value=?)) ORDER BY due,id LIMIT 1`).get(owner,id,id) as {record:string}|undefined;
+    return row ? JSON.parse(row.record) as DeliveryRecord : undefined;
+  }
   function register(input: { url: string; taskId: string; projectId: string; owner: string | null; home: string; worker: string; requirement?: DeliveryRequirement; continuation?:Record<string,unknown>; title?:string; openedAt?:number }) {
     const identity = canonicalPr(input.url);
     const prior = get(identity.id);
@@ -320,7 +325,7 @@ export function createDeliveries(db: Database) {
     const rows=db.prepare("SELECT record FROM deliveries WHERE owner=? AND json_extract(record,'$.forgeState')='merged' AND json_extract(record,'$.updatedAt')>=? ORDER BY json_extract(record,'$.updatedAt') DESC,id LIMIT ?").all(owner,since,Math.max(1,Math.min(limit,100))) as {record:string}[];
     return rows.map(row=>JSON.parse(row.record) as DeliveryRecord);
   }
-  return { get,save,list,mergedSince,conflict,hasOwned,taskRecord,register,observe,stale,assign,ownerLost,markOwnerNeeded,ownerRestored,transferOwner,accountFailure,abandon,clearHold,forTasks,verify,markQueued,notify,pendingNotifications };
+  return { get,save,list,mergedSince,conflict,hasOwned,taskRecord,ownedTaskRecord,register,observe,stale,assign,ownerLost,markOwnerNeeded,ownerRestored,transferOwner,accountFailure,abandon,clearHold,forTasks,verify,markQueued,notify,pendingNotifications };
 }
 
 const DO_NOT_MERGE = /\b(?:do not|don'?t|dont)[\s-]+merge\b|\bdo-not-merge\b/i;

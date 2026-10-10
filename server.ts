@@ -65,7 +65,7 @@ import { createQueueStore, type QueueItem } from "./lib/queue-store.ts";
 import { admissionDecision, createDispatchJobs, spawnBackoffMs } from "./lib/async-dispatch.ts";
 import { createWatchdogStore, observeIdleTurn, tripWatchdog, watchdogNoticeText, watchdogTrip } from "./lib/crew-watchdog.ts";
 import { captainResumeDelay, FAILOVER_WINDOW_MS, failoverTarget, providerExhausted, type ExecutionChoice, type FailedTurnInfo } from "./lib/provider-failover.ts";
-import { finishedCrewCandidates, isFinishedCrewWake, parseWakeRow, withoutFinishedCrewWakes, type FinishedCrews } from "./lib/finished-crew-wakes.ts";
+import { finishedCrewCandidates, isFinishedCrewWake, parseWakeRow, quietStaleVerdict, staleQueueRows, withoutFinishedCrewWakes, type FinishedCrews, type QuietVerdict } from "./lib/finished-crew-wakes.ts";
 import { createDoorbellHold, doorbellHoldDecision } from "./lib/doorbell-hold.ts";
 import { createRetryLedger, type RetryItem, type RetryKind } from "./lib/retry-ledger.ts";
 import { HANDOFF_WAKE_AMENDMENT, captainInstructionsWithHandoff } from "./lib/handoff-contract.ts";
@@ -595,6 +595,8 @@ const FM_WATCH_CAPTAIN_PREFIX = "fm-watch-captain:";
 const CAPTAIN_PROJECT_PREFIX = "captain-project:";
 const CAPTAIN_RESUME_PREFIX = "captain-resume:";
 const NO_OUTCOME_PREFIX = "crew-no-outcome:";
+// Thread of a crew forgotten while its PR delivery stays tracked → the captain that forgot it.
+const FORGOTTEN_CREW_PREFIX = "forgotten-crew:";
 const OUTCOME_LINE_REQUEST = [
   "OUTCOME LINE MISSING: your last turn ended without an outcome line. Reply now with exactly one line that states where the task stands, then stop:",
   "  DONE: <one-line outcome>",
@@ -1075,6 +1077,16 @@ export function watchRelayDedupKey(line: string): string {
   const flat = line.replace(/\s+/g, " ").trim();
   if (/^check:/.test(flat)) return flat;
   return flat.replace(/\(([^)]*)\)/g, (_m, inner: string) => `(${inner.replace(/\d+/g, "#")})`);
+}
+
+// True when a presented wake read carries a receipt but no report: only the receipt
+// lines and the native notice that newer rows are queued.
+export function wakeBatchIsEmpty(out: string): boolean {
+  return out.split(/\r?\n/).every((line) => {
+    const text = line.trim();
+    return text === "" || text === "No unread reports." || /^WAKE_RECEIPT: /.test(text) || /^WARNING: queued wakes pending/.test(text)
+      || /^Handle the whole batch, then pass handledWake/.test(text);
+  });
 }
 
 // Pull the ack pair out of a presented wake drain (native or rewritten form).
@@ -2701,12 +2713,22 @@ export default async function plugin(bb: BbPluginApi) {
       `mkdir -p ${shQuote(stateDir)}`,
       `. "$lib"`,
       `note=$(printf '%s' ${shQuote(noteB64)} | base64 -d)`,
+      // fm-classify-lib counts `note` as a status event, so a note written after the crew's
+      // `paused` line ends that wait for fm-watch, which then climbs the wedge ladder on a
+      // crew that is only waiting (35b7a466 on 2026-10-09: paused 22:47, PR note, then
+      // "escalation 3" at 23:10). Restate the pause after the note. Only `paused` is
+      // restated: it is not captain-relevant, so a drain never prints the copy.
+      `fm_bb_note() {`,
+      `  held=$( . "$(dirname "$lib")/fm-classify-lib.sh" >/dev/null 2>&1 && line=$(status_declared_wait_line ${shQuote(statusPath)}) && status_is_paused "$line" && printf '%s' "$line" ) || held=`,
+      `  printf 'note: %s\\n' "$note" >> ${shQuote(statusPath)}`,
+      `  [ -z "$held" ] || [ "$(tail -n 1 ${shQuote(statusPath)})" != "note: $note" ] || printf '%s\\n' "$held" >> ${shQuote(statusPath)}`,
+      `}`,
       ...(dedupMarker ? [
         `fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK" || exit 1`,
         `if test -f ${shQuote(dedupPath!)}; then fm_lock_release "$FM_WAKE_QUEUE_LOCK"; exit 0; fi`,
-        `if ! grep -Fq -- ${shQuote(dedupMarker)} ${shQuote(statusPath)} 2>/dev/null; then printf 'note: %s\\n' "$note" >> ${shQuote(statusPath)}; fi`,
+        `if ! grep -Fq -- ${shQuote(dedupMarker)} ${shQuote(statusPath)} 2>/dev/null; then fm_bb_note; fi`,
       ] : [
-        `printf 'note: %s\\n' "$note" >> ${shQuote(statusPath)}`,
+        `fm_bb_note`,
         `fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK" || exit 1`,
       ]),
       `fm_wake_append_locked signal ${shQuote(key)} ${shQuote(`crew ${crew.id} update`)} || { fm_lock_release "$FM_WAKE_QUEUE_LOCK"; exit 1; }`,
@@ -5564,6 +5586,8 @@ export default async function plugin(bb: BbPluginApi) {
     // any requested fix turn can receive a fresh agent configuration.
     await bb.sdk.threads.updatePluginMetadata({threadId:crew.threadId,set:{crew:"true",crewId:crew.id,shape:crew.shape,posture:crew.posture,nativeHome:record.home,deliveryRequirement:record.requirement,...(crew.launchKey ? {launchKey:crew.launchKey} : {})}});
     if (thread.archivedAt != null) await bb.sdk.threads.unarchive({threadId:crew.threadId});
+    // The captain is working with this crew again, so its alerts count again.
+    await bb.storage.kv.delete(`${FORGOTTEN_CREW_PREFIX}${crew.threadId}`);
   }
 
   async function tellCrew(crew: Crew, message: string, interrupt: boolean, queue = false): Promise<string> {
@@ -7243,7 +7267,7 @@ export default async function plugin(bb: BbPluginApi) {
   // BB-side retirement of a crew thread that native teardown did not retire:
   // refuse unlanded work (unless force), stop and archive the thread, and delete
   // a scout's own worktree. Returns whether a worktree was removed.
-  async function retireOnBbSide(crew: Crew, force: boolean, notes: string[]): Promise<boolean> {
+  async function retireOnBbSide(crew: Crew, force: boolean, notes: string[], keepEnvironment = false): Promise<boolean> {
     const thread = await bb.sdk.threads.get({ threadId: crew.threadId });
     const envId = thread.environmentId;
     if (!force && crew.worktree && !envId) throw new Error(`Cannot verify worktree for crew ${crew.id}: environment unavailable.`);
@@ -7305,7 +7329,7 @@ export default async function plugin(bb: BbPluginApi) {
     // the guard (not this primitive) is still what prevents data loss.
     // Ships stay archived through BB's retirement grace. A finished scout's
     // scratch checkout is deleted now so it does not sit through that grace.
-    if (worktreeEnvId !== null && crew.shape === "scout") {
+    if (worktreeEnvId !== null && crew.shape === "scout" && !keepEnvironment) {
       try {
         await bb.sdk.environments.delete({ environmentId: worktreeEnvId });
         await markEnvDeleted(worktreeEnvId, crew);
@@ -7327,13 +7351,24 @@ export default async function plugin(bb: BbPluginApi) {
 
   const SCOUT_GATE_REFUSAL = /has not passed the captain-call completion gate/;
 
+  // A crew forgotten earlier keeps only its PR delivery. findCrew recovers it inside the
+  // captain's own project; this covers the captain's deliveries in every other project.
+  function retainedCrew(id: string, caller: string | undefined): Crew | undefined {
+    if (!caller) return undefined;
+    // An open delivery first. A finished one still names the crew, so its leftover native
+    // record and thread can be retired with forget --stop.
+    const record = deliveries.ownedTaskRecord(caller, id) ?? deliveries.ownedTaskRecord(caller, id, true);
+    if (!record?.continuation) return undefined;
+    return { ...crewSchema.parse(record.continuation), parentThreadId: record.owner, deliveryRequirement: record.requirement, prUrl: record.url };
+  }
+
   async function forgetCrew(
     id: string,
     stop: boolean,
     force: boolean,
     opts: { caller?: string; overrideOwner?: boolean } = {},
   ): Promise<string> {
-    const crew = (await readCrews()).find(entry => entry.id === id) ?? await findCrew(id);
+    const crew = (await readCrews()).find(entry => entry.id === id) ?? await findCrew(id) ?? retainedCrew(id, opts.caller ?? homeScope.getStore()?.captain);
     if (crew === undefined) throw new Error(`No crew ${id}. Run "bb firstmate crews".`);
     const notMine = opts.overrideOwner === true ? null : await ownerRefusal(crew, opts.caller, "forget");
     if (notMine !== null) throw new Error(notMine);
@@ -7400,6 +7435,18 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
     if (stop && !nativeTeardown) worktreeRemoved = await retireOnBbSide(crew, force, notes);
+    // A crew with an open PR has one outcome: its PR delivery stays tracked with the
+    // native task record, its thread is archived, and the watcher's alerts about it are
+    // dropped. Left idle and unarchived, 2c11e942 and ed6037b4 drew 3 wedge and 2
+    // "agent missing" alerts in 32 minutes on 2026-10-09. The unlanded-work checks run
+    // first; the environment is kept because the delivery still needs it.
+    let archivedRetained = false;
+    if (!stop && preserveAuthority && !isSecondmateRoute(crew) && !(await isCaptainThread(crew.threadId))) {
+      await retireOnBbSide(crew, force, notes, true);
+      if (crew.parentThreadId) await bb.storage.kv.set(`${FORGOTTEN_CREW_PREFIX}${crew.threadId}`, crew.parentThreadId);
+      archivedRetained = true;
+      notes.push("thread archived; watcher alerts for this crew are dropped (a message to the crew reopens the thread)");
+    }
     let lastOutcome: string | null = null;
     try {
       if ((await crewStatus(crew)) === "idle") {
@@ -7439,7 +7486,7 @@ export default async function plugin(bb: BbPluginApi) {
     // Forgetting without stop leaves the thread alive. A running turn is the captain's to
     // stop, but an idle thread's leftover timers/monitors would wake it and keep it
     // pushing to a branch a new crew may own, so release its runtime; say so when it runs.
-    if (!stop && !nativeTeardown && !isSecondmateRoute(crew) && !(await isCaptainThread(crew.threadId))) {
+    if (!stop && !nativeTeardown && !archivedRetained && !isSecondmateRoute(crew) && !(await isCaptainThread(crew.threadId))) {
       try {
         const status = await crewStatus(crew);
         if (status === "idle") {
@@ -8247,6 +8294,7 @@ export default async function plugin(bb: BbPluginApi) {
     hostOverride?: string,
     signal?: AbortSignal,
     receipt?: { action: "receive" | "inspect" | "begin-action" | "mark-success" | "complete"; id?: string },
+    emptyAfterHide = 0,
   ): Promise<string> {
     const current = await settings.get();
     const fmHome = current.fmHome.trim();
@@ -8267,6 +8315,14 @@ export default async function plugin(bb: BbPluginApi) {
       args.push("--ack-through", String(Math.max(0, Math.trunc(ackThrough))), "--recovery-generation", recoveryGeneration);
     }
     try {
+      // Before every native read of the queue: a fresh read, and the re-read that follows
+      // an acknowledgement.
+      if (captainThreadId && args.length === 0 && (receipt === undefined || receipt.action === "receive" || receipt.action === "complete")) {
+        await pruneQuietStaleRows(captainThreadId, hostId, fmHome, signal).catch((error) => {
+          if (isAbortError(error)) throw error;
+          bb.log.warn(`quiet stale prune skipped captain=${captainThreadId}: ${error instanceof Error ? error.message : String(error)}`);
+        });
+      }
       // D6: drain/ack only the CALLER captain's own scoped state plane.
       const res = await runFmScript({ script: "wake-drain", args, hostId, fmHome, parentThreadId: captainThreadId, receipt, env: wakeStateEnv(fmHome, captainThreadId), timeoutMs: fmTimeoutMs("wake-drain", undefined), signal });
       // B2: the native WAKE_ACK_REQUIRED line names the raw `bin/fm-wake-drain.sh
@@ -8274,8 +8330,23 @@ export default async function plugin(bb: BbPluginApi) {
       // consume another captain's rows. Rewrite it to the partition-safe bb command so
       // the emitted instruction can only ever touch the caller's own plane.
       const raw = rewriteWakeAckLine(res.output).trim();
+      // An acknowledgement can finish on the host while its reply is lost to a plugin
+      // reload or a server restart (receipt 8e0f3c22 on 2026-10-08). The journal then no
+      // longer holds that receipt, and the retry used to fail. Nothing is left to
+      // acknowledge, so the retry succeeds and returns whatever is unread now.
+      if (res.exitCode !== 0 && receipt?.action === "complete" && receipt.id && /Wake receipt absent or changed/.test(raw)) {
+        const current = await drainWakes(captainThreadId, undefined, undefined, hostOverride, signal, { action: "receive" });
+        return `Wake receipt ${receipt.id} is already complete or was replaced; nothing was acknowledged twice.\n${current}`;
+      }
       if (res.exitCode !== 0) throw new Error(`native exit ${res.exitCode}: ${raw || "no diagnostic output"}`);
       const out = captainThreadId ? await hideFinishedCrewWakes(raw, captainThreadId, hostId, fmHome, signal) : raw;
+      // A receipt opened before its rows were removed can hold nothing but hidden rows.
+      // The plugin completes it, so the captain is not handed an empty batch to acknowledge.
+      const open = res.receipt;
+      if (out !== raw && open?.id && open.phase === "ready" && emptyAfterHide < 2 && wakeBatchIsEmpty(out)) {
+        bb.log.info(`wake drain: receipt ${open.id} held only hidden rows; completed without the captain`);
+        return await drainWakes(captainThreadId, undefined, undefined, hostOverride, signal, { action: "complete", id: open.id }, emptyAfterHide + 1);
+      }
       // After a successful drain and under its own short budget, so a slow host can only
       // delay housekeeping, never the drain itself. Its effect shows from the next drain.
       if (args.length === 0 && (receipt === undefined || receipt.action === "receive")) {
@@ -8328,6 +8399,84 @@ export default async function plugin(bb: BbPluginApi) {
       bb.log.warn(`wake drain: finished-crew filter skipped: ${error instanceof Error ? error.message : String(error)}`);
       return out;
     }
+  }
+
+  // Why a stale row about this crew thread is a false alert, or "surface" when it is not.
+  async function quietCrewVerdict(threadId: string, captain: string, crews: readonly Crew[], signal?: AbortSignal): Promise<QuietVerdict> {
+    const crew = crews.find((c) => c.threadId === threadId && c.parentThreadId === captain);
+    if (crew === undefined) {
+      return await bb.storage.kv.get(`${FORGOTTEN_CREW_PREFIX}${threadId}`) === captain ? "forgotten" : "surface";
+    }
+    let threadStatus: string | null = null, archived = false;
+    try {
+      const thread = await raceAbort(bb.sdk.threads.get({ threadId }), signal, STUCK_HOST_CALL_MS);
+      threadStatus = thread.status;
+      archived = thread.archivedAt != null;
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+    }
+    if (!archived && threadStatus !== "idle" && threadStatus !== "error") return "surface";
+    const statusVerb = latestStatus((await crewStatusLines(crew)).lines)?.verb ?? null;
+    let lastMessage: "waiting" | "done" | null = null;
+    if (statusVerb === null || statusVerb === "resolved") {
+      const out = await crewOutput(crew, MAX_OUTPUT, signal);
+      lastMessage = isWaitingYield(out) ? "waiting" : verdictOf(parseOutcome(out)) === "DONE" ? "done" : null;
+    }
+    return quietStaleVerdict({ forgotten: false, threadStatus, archived, statusVerb, lastMessage });
+  }
+
+  // The captain's stop hook counts every row left in the wake queue, and a wake read
+  // prints every row. So a stale row about a crew that declared a wait, finished, or was
+  // forgotten is taken out of the queue here, by sequence number and under the queue lock.
+  // Rows about any other crew stay. Returns how many rows were removed.
+  async function pruneQuietStaleRows(captain: string, hostId: string, fmHome: string, signal?: AbortSignal): Promise<number> {
+    const stateDir = wakeStateDir(fmHome, captain);
+    const queue = shQuote(`${stateDir}/.wake-queue`);
+    const read = await runOnHost(hostId, `[ ! -f ${queue} ] || awk -F '\\t' '$3=="stale" || ($3=="check" && $4 ~ /^inactive-outcome:/)' ${queue}`, 15_000, signal);
+    const rows = staleQueueRows(read.output);
+    // Rows a wake read would hide: a DONE crew whose PR the tracker owns. That covers a
+    // crew forgotten before forget marked its thread. A hidden row still opened a receipt
+    // with an empty batch (5 in a row for one captain on 2026-10-10), so it goes too.
+    const queued = read.output.split("\n").map(parseWakeRow).filter((row) => row !== null);
+    const finished = queued.length === 0 ? { threads: new Set<string>(), crewIds: new Set<string>() }
+      : await finishedCrewsWithTrackedPrs(captain, hostId, fmHome, finishedCrewCandidates(queued), signal);
+    const hidden = queued.filter((row) => isFinishedCrewWake(row, finished)).map((row) => row.seq);
+    if (rows.length === 0 && hidden.length === 0) return 0;
+    const crews = await readCrews();
+    const verdicts = new Map<string, QuietVerdict>();
+    for (const threadId of new Set(rows.map((row) => row.threadId))) {
+      verdicts.set(threadId, await quietCrewVerdict(threadId, captain, crews, signal).catch((error) => {
+        if (isAbortError(error)) throw error;
+        return "surface" as const; // unreadable crew state keeps its alert
+      }));
+    }
+    const quiet = [
+      ...rows.filter((row) => verdicts.get(row.threadId) !== "surface"),
+      ...hidden.filter((seq) => !rows.some((row) => row.seq === seq && verdicts.get(row.threadId) !== "surface")).map((seq) => ({ seq, threadId: "tracked-pr" })),
+    ];
+    if (quiet.length === 0) return 0;
+    const lib = `${fmHome}/bin/fm-wake-lib.sh`;
+    const script = [
+      `export FM_HOME=${shQuote(fmHome)}`,
+      fmBinDirAssign(fmHome),
+      `export FM_STATE_OVERRIDE=${shQuote(stateDir)}`,
+      `lib=${shQuote(lib)}; [ "\${FM_BUNDLED_VERIFIED:-}" != 1 ] || lib="$FM_BINDIR/fm-wake-lib.sh"`,
+      `[ -f "$lib" ] || { echo "error: missing $lib" >&2; exit 127; }`,
+      `. "$lib"`,
+      `[ -s ${queue} ] || exit 0`,
+      `fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK" || exit 1`,
+      `tmp=${queue}.bb-quiet.$$; rc=0`,
+      `awk -F '\\t' -v drop=${shQuote(`|${quiet.map((row) => row.seq).join("|")}|`)} '!(($3=="stale" || $3=="check") && index(drop, "|" $2 "|"))' ${queue} > "$tmp" && cat "$tmp" > ${queue} || rc=1`,
+      `rm -f "$tmp"; fm_lock_release "$FM_WAKE_QUEUE_LOCK"; exit $rc`,
+    ].join("\n");
+    const res = await runOnHost(hostId, script, 15_000, signal);
+    if (res.exitCode !== 0) {
+      bb.log.warn(`quiet stale prune failed captain=${captain} exit=${res.exitCode}: ${truncate(res.output.trim(), 200)}`);
+      return 0;
+    }
+    const why = [...new Set(quiet.map((row) => `${row.threadId}=${verdicts.get(row.threadId) ?? "finished"}`))].join(", ");
+    bb.log.info(`wake queue: removed ${quiet.length} row(s) about crews that are waiting, finished or forgotten (captain ${captain}: ${why})`);
+    return quiet.length;
   }
 
   // An fm-watch "check: inactive-outcome" names no crew. It is noise when every undrained
@@ -9707,6 +9856,14 @@ export default async function plugin(bb: BbPluginApi) {
       if (await ownsOtherHome(hostFallback)) hostFallback = undefined;
     }
     const soleHostParent = rememberedCaptain ?? hostFallback;
+    // The relay below already keeps these lines out of the captain's chat; the queue row
+    // behind each one would still hold the captain's next turn end. Once per new line.
+    if (scope?.captain && scope.home && lines.some((line) => /^stale:/.test(line) && !seen.has(`${hostId}|${relayDedupKey(line)}`))) {
+      await pruneQuietStaleRows(scope.captain, hostId, scope.home, signal).catch((error) => {
+        if (isAbortError(error)) throw error;
+        bb.log.warn(`quiet stale prune skipped captain=${scope.captain}: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }
     const ownedCrews = crews.filter((c) => c.parentThreadId !== null && c.parentThreadId !== "" && (!scope?.home || c.nativeHome === scope.home || (!c.nativeHome && c.parentThreadId === scope.captain)));
     // Stale lines name crews by BB thread id; only a crew whose thread is still
     // running can be wedged. An idle/failed thread already rang its doorbell.
@@ -11193,7 +11350,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_forget",
-    description: "Drop a crew record. stop=true archives the thread (refuses dirty work unless force).",
+    description: "Drop a crew record. stop=true archives the thread (refuses dirty work unless force). For a crew with an open PR leave stop off: the PR stays tracked and the thread is archived after the same check.",
     parameters: z.object({
       crewId: z.string(),
       stop: z.boolean().optional(),
@@ -12272,7 +12429,13 @@ export default async function plugin(bb: BbPluginApi) {
     await inCaptainHome(thread.id, () => captainTurnEndGuard(thread.id)).catch(() => {});
     const crew = await findCrewByThread(thread.id);
     if (crew === undefined || isSecondmateRoute(crew)) return;
-    await maybeCompactCrew(thread.id).catch((error) => bb.log.warn(`crew compaction check failed ${thread.id}: ${String(error)}`));
+    // BB announces the end of a compaction turn to the captain as a second "completed"
+    // message with the crew's last text (13 of 13 crew compactions on 2026-10-09), and no
+    // plugin hook can drop it. A crew that just reported DONE has no next turn for the
+    // smaller context to pay for, so it is not compacted.
+    if (verdictOf(parseOutcome(lastAssistantText)) !== "DONE") {
+      await maybeCompactCrew(thread.id).catch((error) => bb.log.warn(`crew compaction check failed ${thread.id}: ${String(error)}`));
+    }
     liveTerminalHandled.add(thread.id);
     await handleCrewIdle(crew, thread, lastAssistantText);
     if (crew.parentThreadId) await drainQueuedDispatches(crew.parentThreadId).catch((error) => bb.log.warn(`queued dispatch drain: ${String(error)}`));
