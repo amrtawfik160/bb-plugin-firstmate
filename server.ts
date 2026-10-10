@@ -62,7 +62,7 @@ import {pluginAssetRoot} from "./lib/plugin-assets.ts";
 import {createNativeRuntime, runtimeRootAssign} from "./lib/native-runtime.ts";
 import { boundedCaptainStartup, captainBindingText } from "./lib/captain-startup.ts";
 import { createQueueStore, type QueueItem } from "./lib/queue-store.ts";
-import { admissionDecision, createDispatchJobs, spawnBackoffMs } from "./lib/async-dispatch.ts";
+import { admissionDecision, createDispatchJobs, dispatchJobLine, spawnBackoffMs } from "./lib/async-dispatch.ts";
 import { createWatchdogStore, observeIdleTurn, tripWatchdog, watchdogNoticeText, watchdogTrip } from "./lib/crew-watchdog.ts";
 import { captainResumeDelay, FAILOVER_WINDOW_MS, failoverTarget, providerExhausted, type ExecutionChoice, type FailedTurnInfo } from "./lib/provider-failover.ts";
 import { finishedCrewCandidates, isFinishedCrewWake, parseWakeRow, quietStaleVerdict, staleQueueRows, withoutFinishedCrewWakes, type FinishedCrews, type QuietVerdict } from "./lib/finished-crew-wakes.ts";
@@ -4664,6 +4664,9 @@ export default async function plugin(bb: BbPluginApi) {
     model?: string;
     reasoningLevel?: string;
     playbook?: Crew["playbook"];
+    permissionMode?: PermissionMode;
+    worktree?: boolean;
+    visible?: boolean;
   }): Promise<string | null> {
     const flags = await reliabilityFlags();
     if (flags.asyncDispatch !== "on") return null;
@@ -4697,6 +4700,9 @@ export default async function plugin(bb: BbPluginApi) {
       ...(input.reasoningLevel ? { reasoningLevel: input.reasoningLevel } : {}),
       ...(input.sourceRefs && input.sourceRefs.length > 0 ? { sourceRefs: input.sourceRefs } : {}),
       ...(input.playbook !== undefined ? { playbook: input.playbook } : {}),
+      ...(input.permissionMode !== undefined ? { permissionMode: input.permissionMode } : {}),
+      ...(input.worktree !== undefined ? { worktree: input.worktree } : {}),
+      ...(input.visible !== undefined ? { visible: input.visible } : {}),
     };
     queueStore.add(queued);
     for (const key of input.sourceRefs ?? []) {
@@ -9263,9 +9269,9 @@ export default async function plugin(bb: BbPluginApi) {
       model: overrides.model ?? item.model,
       reasoningLevel: toReasoningLevel(overrides.reasoningLevel ?? item.reasoningLevel),
       deliveryRequirement:item.deliveryRequirement,
-      permissionMode: toPermissionMode(current.defaultPermissionMode),
-      worktree: resolveWorktree({ shape: item.shape }).worktree,
-      visible: true,
+      permissionMode: toPermissionMode(item.permissionMode ?? current.defaultPermissionMode),
+      worktree: item.worktree ?? resolveWorktree({ shape: item.shape }).worktree,
+      visible: item.visible ?? true,
       shape: item.shape,
       mode: toMode(item.mode !== "" ? item.mode : undefined, registry.mode),yolo:registry.yolo,
       sourceRefs: item.sourceRefs, playbook: item.playbook,
@@ -9280,6 +9286,14 @@ export default async function plugin(bb: BbPluginApi) {
     queueStore.patch(item, {status:item.status,crewId:item.crewId});
     await publishFleet();
     return crew;
+  }
+  // An over-cap dispatch waits for a slot, not for an explicit queue dispatch.
+  function queueListLine(q: QueueItem, all: QueueItem[], now: number): string {
+    const gate = q.status === "queued" ? storedQueueGate(q, all, now) ?? (q.overCap === true ? "waiting for a crew slot; starts by itself" : null) : null;
+    return `${q.id} [${q.status}] ${q.shape} :: ${truncate(q.title, 70)}${gate !== null ? ` — ${gate}` : ""}${q.crewId !== null ? ` (crew ${q.crewId})` : ""}`;
+  }
+  function backgroundJobLines(captain: string | undefined, now: number): string[] {
+    return captain === undefined ? [] : dispatchJobs.pending(captain).map((job) => dispatchJobLine(job, now));
   }
   function storedQueueGate(item:QueueItem,all:QueueItem[],now:number) {
     if (item.nativePending) return "native publication unresolved; run queue reconcile with the exact id";
@@ -10534,6 +10548,11 @@ export default async function plugin(bb: BbPluginApi) {
         const queued = await enqueueWhenOverCap({
           task, taskId: crewKey, title, projectId: resolvedProject, parentThreadId, shape, mode, deliveryRequirement, sourceRefs,
           providerId, model, reasoningLevel, playbook,
+          permissionMode: toPermissionMode(permissionMode),
+          ...(worktree !== undefined || sharedEnv === true
+            ? { worktree: resolveWorktree({ shape: shape ?? "ship", sharedEnv: sharedEnv === true, worktreeFlag: worktree === true, explicit: worktree }).worktree }
+            : {}),
+          visible,
         });
         if (queued) return `${queued}${await trackTask(crewKey)}`;
       }
@@ -11265,13 +11284,12 @@ export default async function plugin(bb: BbPluginApi) {
         const real = ((await realQueuedRows()) ?? []).filter((r) => !kvIds.has(r.id));
         // A finished (done/dropped) item is history, not work: it stays out of the list.
         const live = items.filter((q) => !isFinishedQueueItem(q));
-        if (live.length === 0 && real.length === 0) return "Queue empty.";
+        const background = backgroundJobLines(captain, now);
+        if (live.length === 0 && real.length === 0 && background.length === 0) return "Queue empty.";
         return [
-          ...live.map((q) => {
-            const gate = q.status === "queued" ? storedQueueGate(q, items, now) : null;
-            return `${q.id} [${q.status}] ${q.shape} :: ${truncate(q.title, 70)}${gate !== null ? ` — ${gate}` : ""}${q.crewId !== null ? ` (crew ${q.crewId})` : ""}`;
-          }),
+          ...live.map((q) => queueListLine(q, items, now)),
           ...real.map((r) => `${r.id} [queued] ${r.kind || "task"} :: ${truncate(r.title, 70)} — native backlog row`),
+          ...background,
         ].join("\n");
       }
       if (action === "next") {
@@ -12808,6 +12826,9 @@ export default async function plugin(bb: BbPluginApi) {
                   model: flagStr(flags, "model"),
                   reasoningLevel: flagStr(flags, "reasoning-level"),
                   playbook,
+                  permissionMode: toPermissionMode(flagStr(flags, "permission-mode")),
+                  ...(flags.has("shared-env") || flags.has("worktree") ? { worktree: wt.worktree } : {}),
+                  ...(flags.has("hidden") ? { visible: false } : {}),
                 });
                 if (queued) {
                   queuedNotes.push(queued);
@@ -13280,13 +13301,10 @@ export default async function plugin(bb: BbPluginApi) {
             }
             if (sub === "list") {
               const live = items.filter((q) => !isFinishedQueueItem(q));
-              if (live.length === 0) return reply([], "Queue empty.");
               const now = Date.now();
-              const lines = live.map((q) => {
-                const gate = q.status === "queued" ? storedQueueGate(q, items, now) : null;
-                return `${q.id} [${q.status}] ${q.shape} :: ${truncate(q.title, 70)}${gate !== null ? ` — ${gate}` : ""}${q.crewId !== null ? ` (crew ${q.crewId})` : ""}`;
-              });
-              return reply(items, lines.join("\n"));
+              const background = backgroundJobLines(ctxThread, now);
+              if (live.length === 0 && background.length === 0) return reply([], "Queue empty.");
+              return reply(items, [...live.map((q) => queueListLine(q, items, now)), ...background].join("\n"));
             }
             if (sub === "next") {
               const now = Date.now();

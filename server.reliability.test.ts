@@ -373,6 +373,26 @@ test("an over-cap queue record without the three stored options starts with the 
   }
 });
 
+test("the queue list shows an over-cap dispatch waiting for a slot and a background dispatch that has no crew yet", async () => {
+  const host = await knownCaptainHost();
+  try {
+    await asyncOn(host);
+    await host.bb.storage.kv.set("crews", Array.from({ length: 9 }, (_, i) => crewRow(`c${i + 1}`, `thr_c${i + 1}`)));
+    stubSpawn(host, () => "active");
+    host.harness.sdk.stub("threads.spawn", () => new Promise(() => {}));
+    const reserved = await tool(host, "firstmate_dispatch").execute({ task: "fix flaky login", taskId: "job-a", projectId: "proj_1" }, capCtx);
+    assert.match(text(reserved), /Reserved crew job-a/);
+    await until(() => host.harness.sdk.callsTo("threads.spawn").length === 1);
+    const queued = await tool(host, "firstmate_dispatch").execute({ task: "tidy the docs", taskId: "job-b", projectId: "proj_1" }, capCtx);
+    assert.match(text(queued), /Queued as job-b/);
+    const list = text(await tool(host, "firstmate_queue").execute({ action: "list" }, capCtx));
+    assert.match(list, /^job-b \[queued\] ship :: tidy the docs — waiting for a crew slot; starts by itself$/m);
+    assert.match(list, /^job-a \[background spawning\] :: fix flaky login — crew is being created/m);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("a crew whose status read fails still holds a cap slot", async () => {
   const host = await load();
   try {
