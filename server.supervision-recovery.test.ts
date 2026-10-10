@@ -660,3 +660,46 @@ test("acknowledging a wake receipt that already completed succeeds and returns w
     await host.harness.lifecycle.dispose();
   }
 });
+
+test("a wake read removes the rows it would only hide: a DONE crew with a tracked PR and no crew record", async () => {
+  const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { fmHome: "/tmp/fm-home", notifyOwner: "real", fmHostId: "host_1" } });
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRoutedHost(host, finishedCrewRouter((cmd) => cmd.includes("bb-quiet") ? "" : cmd.includes('$3=="stale"') ? WAKE_ROWS.join("\n") : cmd.includes(".fm-receipt-") ? wakeFrame("") : null));
+    host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: "idle" }));
+    await host.bb.storage.kv.set("crews", []);
+    trackPrs(host);
+    const result = await host.harness.behavior.runCli(["wake"], { projectId: "proj_1", threadId: "thr_cap" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    const prunes = seen.filter((cmd) => cmd.includes("bb-quiet"));
+    assert.equal(prunes.length, 1);
+    assert.match(prunes[0]!, /drop=[^ ]*\|127\|128\|/, "the DONE crew's wedge row and its finished-outcome row go");
+    assert.doesNotMatch(prunes[0]!, /\|129\|/, "the crew that is not DONE keeps its row");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a receipt that holds only hidden rows is completed by the plugin, not handed to the captain", async () => {
+  const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { fmHome: "/tmp/fm-home", notifyOwner: "real", fmHostId: "host_1" } });
+  await plugin(host.bb);
+  try {
+    let runs = 0;
+    stubRoutedHost(host, finishedCrewRouter((cmd) => {
+      if (cmd.includes('$3=="stale"')) return ""; // the receipt was opened before its rows could be removed
+      if (!/^__fm_cmd='bash [^;]*\.fm-receipt-/.test(cmd)) return null;
+      return ++runs === 1
+        ? wakeFrame([WAKE_ROWS[0], WAKE_ROWS[1], "WARNING: queued wakes pending - drain them"].join("\n"))
+        : "FM_BB_RECEIPT=" + JSON.stringify({ id: null, phase: "empty", report: "No unread reports.", path: "", replayed: false, truncated: false });
+    }));
+    host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: "idle" }));
+    trackPrs(host);
+    const result = await host.harness.behavior.runCli(["wake"], { projectId: "proj_1", threadId: "thr_cap" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(runs, 2, "one read, then the plugin's own acknowledgement");
+    assert.doesNotMatch(result.stdout, /WAKE_RECEIPT|queued wakes pending|thr_c1/);
+    assert.match(result.stdout, /No unread reports\./);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
