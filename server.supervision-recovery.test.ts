@@ -703,3 +703,23 @@ test("a receipt that holds only hidden rows is completed by the plugin, not hand
     await host.harness.lifecycle.dispose();
   }
 });
+
+test("forget on a crew whose thread is already archived asks nothing of its retired environment", async () => {
+  const host = await load();
+  try {
+    stubForget(host);
+    host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: "idle", projectId: "proj_1", environmentId: threadId === "thr_cap" ? null : "env_wt", archivedAt: threadId === "thr_cap" ? null : 1 }));
+    host.harness.sdk.stub("environments.diffFiles", async () => { throw new Error("HTTP 409: Environment unavailable"); });
+    const store = createDeliveries(host.bb.storage.database());
+    store.register({ url: "https://github.com/acme/repo/pull/1", taskId: "c1", projectId: "proj_1", owner: "thr_cap", home: "", worker: "thr_crew", requirement: "merged", continuation: shipRow("c1", "thr_crew", "thr_cap") });
+    await host.bb.storage.kv.set("crews", []);
+    const result = await host.harness.behavior.runCli(["forget", "c1"], { projectId: "proj_1", threadId: "thr_cap" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /already archived/);
+    assert.equal(await host.bb.storage.kv.get("forgotten-crew:thr_crew"), "thr_cap");
+    assert.equal(host.harness.sdk.callsTo("threads.archive").length + host.harness.sdk.callsTo("threads.stop").length, 0);
+    assert.equal(openDeliveries(host).length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});

@@ -7269,6 +7269,13 @@ export default async function plugin(bb: BbPluginApi) {
   // a scout's own worktree. Returns whether a worktree was removed.
   async function retireOnBbSide(crew: Crew, force: boolean, notes: string[], keepEnvironment = false): Promise<boolean> {
     const thread = await bb.sdk.threads.get({ threadId: crew.threadId });
+    // Someone archived this thread already. BB has retired its environment, so there is
+    // nothing left here to check, stop or remove (6 leftover crews on 2026-10-10 answered
+    // "HTTP 409: Environment unavailable").
+    if (thread.archivedAt != null) {
+      notes.push("thread was already archived");
+      return false;
+    }
     const envId = thread.environmentId;
     if (!force && crew.worktree && !envId) throw new Error(`Cannot verify worktree for crew ${crew.id}: environment unavailable.`);
     let worktreeRemoved = false;
@@ -7445,7 +7452,7 @@ export default async function plugin(bb: BbPluginApi) {
       await retireOnBbSide(crew, force, notes, true);
       if (crew.parentThreadId) await bb.storage.kv.set(`${FORGOTTEN_CREW_PREFIX}${crew.threadId}`, crew.parentThreadId);
       archivedRetained = true;
-      notes.push("thread archived; watcher alerts for this crew are dropped (a message to the crew reopens the thread)");
+      notes.push(`${notes.includes("thread was already archived") ? "" : "thread archived; "}watcher alerts for this crew are dropped (a message to the crew reopens the thread)`);
     }
     let lastOutcome: string | null = null;
     try {
