@@ -449,6 +449,50 @@ test("captain stop hook blocks pairless pending receipt and preserves recursion 
   assert.equal(run('{"stop_hook_active":true}').status, 0);
 });
 
+test("captain session-start hook after a compaction points at firstmate_wake and shows no queue row or legacy acknowledgement", (t) => {
+  const f = fixture(t);
+  mkdirSync(join(f.dir, "bin-bb"));
+  // The pinned session-start prints the raw native drain under WAKE QUEUE.
+  const digest = [
+    "", "WAKE QUEUE", "----------",
+    "1791589000\t3350\tstale\tbb:thr_b5wux8c43p\tstale: bb:thr_b5wux8c43p quiet 1800s, possible wedge",
+    "1791589001\t3351\tsignal\tworker.status\tdone: PR opened",
+    "WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through 3351 --recovery-generation 910993.1791589792.DgYyww",
+    "note: unread crew status line",
+    "WARNING: queued wakes pending - drain them with bin/fm-wake-drain.sh before anything else.",
+    "", "FLEET STATE", "----------", "2 crew(s) tracked",
+  ].join("\n");
+  writeFileSync(join(f.dir, "bin-bb/fm-sessionstart-run.sh"), `#!/bin/sh\ncat >/dev/null\ncat <<'DIGEST'\n${digest}\nDIGEST\n`, { mode: 0o755 });
+  const markers = join(f.dir, ".bb-firstmate/captains");
+  mkdirSync(markers, { recursive: true });
+  writeFileSync(join(markers, "thr_test"), `home=${f.dir}\nstate=${f.state}\nown_home=1\n`);
+  const result = spawnSync("bash", [join(root, "overlay/bin/bb-captain-hook.sh"), "session-start"], {
+    input: '{"source":"compact"}', encoding: "utf8", env: { ...process.env, HOME: f.dir, BB_THREAD_ID: "thr_test" },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stdout, /--ack-through|--recovery-generation|WAKE_ACK_REQUIRED|fm-wake-drain/);
+  assert.doesNotMatch(result.stdout, /thr_b5wux8c43p|PR opened/, "queue rows are read through firstmate_wake, which drops the rows the plugin removes");
+  assert.equal(result.stdout.match(/Call firstmate_wake with ack=true/g)?.length, 1);
+  assert.match(result.stdout, /WAKE QUEUE\n----------\nfirstmate: .*Call firstmate_wake with ack=true/);
+  assert.match(result.stdout, /note: unread crew status line/);
+  assert.match(result.stdout, /FLEET STATE\n----------\n2 crew\(s\) tracked/);
+});
+
+test("captain session-start hook leaves a digest with no queued wake unchanged", (t) => {
+  const f = fixture(t);
+  mkdirSync(join(f.dir, "bin-bb"));
+  const digest = "\nWAKE QUEUE\n----------\n(no queued wakes)\n\nFLEET STATE\n----------\n0 crew(s) tracked";
+  writeFileSync(join(f.dir, "bin-bb/fm-sessionstart-run.sh"), `#!/bin/sh\ncat >/dev/null\ncat <<'DIGEST'\n${digest}\nDIGEST\n`, { mode: 0o755 });
+  const markers = join(f.dir, ".bb-firstmate/captains");
+  mkdirSync(markers, { recursive: true });
+  writeFileSync(join(markers, "thr_test"), `home=${f.dir}\nstate=${f.state}\nown_home=1\n`);
+  const result = spawnSync("bash", [join(root, "overlay/bin/bb-captain-hook.sh"), "session-start"], {
+    input: '{"source":"compact"}', encoding: "utf8", env: { ...process.env, HOME: f.dir, BB_THREAD_ID: "thr_test" },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, digest + "\n");
+});
+
 test("real native drain retains pairless status and new-generation queue rows", { skip: !existsSync(join(nativeFixture, "bin/fm-wake-drain.sh")) }, (t) => {
   const f = fixture(t);
   const native = join(nativeFixture, "bin/fm-wake-drain.sh");
