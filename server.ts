@@ -64,7 +64,7 @@ import { boundedCaptainStartup, captainBindingText } from "./lib/captain-startup
 import { createQueueStore, type QueueItem } from "./lib/queue-store.ts";
 import { admissionDecision, createDispatchJobs, dispatchJobLine, spawnBackoffMs } from "./lib/async-dispatch.ts";
 import { createWatchdogStore, observeIdleTurn, tripWatchdog, watchdogNoticeText, watchdogTrip } from "./lib/crew-watchdog.ts";
-import { captainResumeDelay, FAILOVER_WINDOW_MS, failoverTarget, providerExhausted, type ExecutionChoice, type FailedTurnInfo } from "./lib/provider-failover.ts";
+import { captainResumeDelay, FAILOVER_WINDOW_MS, failoverTarget, planLimitError, planLimitNotice, PROVIDER_UNAVAILABLE_KEY, providerExhausted, unavailableProviderLines, unavailableUntil, utcMinute, type ExecutionChoice, type FailedTurnInfo, type UnavailableProviders } from "./lib/provider-failover.ts";
 import { finishedCrewCandidates, isFinishedCrewWake, parseWakeRow, quietStaleVerdict, staleQueueRows, withoutFinishedCrewWakes, type FinishedCrews, type QuietVerdict } from "./lib/finished-crew-wakes.ts";
 import { createDoorbellHold, doorbellHoldDecision } from "./lib/doorbell-hold.ts";
 import { createRetryLedger, type RetryItem, type RetryKind } from "./lib/retry-ledger.ts";
@@ -110,6 +110,9 @@ const crewSchema = z.object({
   threadId: z.string(),
   parentThreadId: z.string().nullable(),
   providerId: z.string().nullable(),
+  // true = the owner or captain named this provider at dispatch, so a provider at its
+  // plan limit fails the crew to the captain instead of moving it.
+  providerNamed: z.boolean().optional(),
   model: z.string().nullable().default(null),
   reasoningLevel: z.string().nullable().default(null),
   worktree: z.boolean(),
@@ -3249,6 +3252,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   const dispatchPermissionLines = new Map<string, string>();
+  const dispatchProviderNotes = new Map<string, string>();
 
   async function noteMachineCeiling(crewId: string, threadId: string, requested: PermissionMode | undefined): Promise<void> {
     dispatchPermissionLines.delete(crewId);
@@ -3272,7 +3276,8 @@ export default async function plugin(bb: BbPluginApi) {
 
   function permissionLine(crewId: string): string {
     const line = dispatchPermissionLines.get(crewId);
-    return line === undefined ? "" : `\n${line}`;
+    const skipped = dispatchProviderNotes.get(crewId);
+    return `${skipped === undefined ? "" : `\n${skipped}`}${line === undefined ? "" : `\n${line}`}`;
   }
 
   async function bbCliErrorTally(hostId: string, signal?: AbortSignal): Promise<string> {
@@ -5021,6 +5026,7 @@ export default async function plugin(bb: BbPluginApi) {
     deliveryRequirement?: "pr" | "merged" | "merged-and-verified";
     sourceRefs?: string[];
     ownerRequestedProvider?: boolean;
+    providerNamed?: boolean;
     playbook?: Crew["playbook"];
     signal?:AbortSignal;
   }): Promise<Crew> {
@@ -5028,7 +5034,16 @@ export default async function plugin(bb: BbPluginApi) {
     if (task === "") throw new Error("Empty task.");
     if (input.shape === "ship" && input.providerId === GUARDED_SHIP_PROVIDER && input.ownerRequestedProvider !== true && (await settings.get()).shipAntigravityGuard !== false) {
       const fallback = (await settings.get()).defaultProvider;
-      input = { ...input, providerId: fallback !== "" && fallback !== GUARDED_SHIP_PROVIDER ? fallback : undefined, model: undefined };
+      input = { ...input, providerId: fallback !== "" && fallback !== GUARDED_SHIP_PROVIDER ? fallback : undefined, model: undefined, providerNamed: false };
+    }
+    const providerNamed = input.providerNamed === true || input.ownerRequestedProvider === true;
+    let providerNote: string | undefined;
+    if (!providerNamed) {
+      const skip = await skipUnavailableProvider(input).catch((error) => { bb.log.warn(`provider availability check: ${String(error)}`); return null; });
+      if (skip !== null) {
+        input = { ...input, providerId: skip.providerId, model: skip.model ?? undefined, reasoningLevel: skip.reasoningLevel ?? input.reasoningLevel };
+        providerNote = skip.note;
+      }
     }
     const mates = await readSecondmates();
     const mate = input.mode === "local-only" ? undefined : pickSecondmate(mates, input.projectId, task);
@@ -5080,6 +5095,7 @@ export default async function plugin(bb: BbPluginApi) {
       threadId: "",
       parentThreadId: input.parentThreadId ?? null,
       providerId: input.providerId ?? null,
+      ...(providerNamed ? { providerNamed: true } : {}),
       model: input.model ?? null,
       reasoningLevel: input.reasoningLevel ?? null,
       worktree: input.worktree,
@@ -5090,6 +5106,7 @@ export default async function plugin(bb: BbPluginApi) {
       ...(input.sourceRefs && input.sourceRefs.length > 0 ? { sourceRefs: input.sourceRefs } : {}),
       createdAt: new Date().toISOString(),
     };
+    if (providerNote !== undefined) dispatchProviderNotes.set(crew.id, providerNote);
     // A bad provider/model makes BB create a thread that is already in error. Check
     // BB's own catalog first so the refusal happens before anything is spawned.
     const selectedHost=await resolveHostForProject(input.projectId,input.parentThreadId,input.signal);
@@ -9312,6 +9329,7 @@ export default async function plugin(bb: BbPluginApi) {
       title: item.title,
       crewId: item.id,
       providerId: overrides.providerId ?? item.providerId ?? (current.defaultProvider !== "" ? current.defaultProvider : undefined),
+      providerNamed: (overrides.providerId ?? item.providerId) !== undefined,
       model: overrides.model ?? item.model,
       reasoningLevel: toReasoningLevel(overrides.reasoningLevel ?? item.reasoningLevel),
       deliveryRequirement:item.deliveryRequirement,
@@ -10503,7 +10521,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (!current.fmHome.trim()) throw new Error("Initialize native Firstmate before checking its toolchain.");
     const hostId = current.fmHostId.trim() || await resolveHostId(undefined, ctx);
     const toolchain = await checkToolchain(hostId, current.fmHome.trim(), signal);
-    return { ...toolchain, output: `${toolchain.output}\n${await briefSkillReport(hostId, signal)}` };
+    return { ...toolchain, output: [toolchain.output, await briefSkillReport(hostId, signal), ...unavailableProviderLines(await unavailableProviders(), Date.now())].join("\n") };
   }
 
   // Advisory: a missing skill never makes the toolchain unready, because a brief
@@ -10620,6 +10638,7 @@ export default async function plugin(bb: BbPluginApi) {
         sourceRefs,
         title,
         providerId: providerId ?? (current.defaultProvider !== "" ? current.defaultProvider : undefined),
+        providerNamed: providerId !== undefined,
         model,
         reasoningLevel: toReasoningLevel(reasoningLevel),
         permissionMode: toPermissionMode(permissionMode ?? current.defaultPermissionMode),
@@ -12125,6 +12144,10 @@ export default async function plugin(bb: BbPluginApi) {
     lastAssistantText: string | null,
   ): Promise<void> {
     if (isSecondmateRoute(crew)) return;
+    if (planLimitNotice(lastAssistantText)) {
+      await crewAtPlanLimit(crew, lastAssistantText ?? "");
+      return;
+    }
     await discoverCrewDelivery(crew).catch(error => bb.log.warn(`PR discovery ${crew.id}: ${String(error)}`));
     const stopped = await turnWasStopped(thread);
     // BB already reports interruptions to the parent. A completion wake here can
@@ -12577,8 +12600,74 @@ export default async function plugin(bb: BbPluginApi) {
     const crew = await findCrewByThread(threadId);
     if (crew === undefined || isSecondmateRoute(crew)) return;
     // thread.failed already paged the lifecycle error; this fires after the thread is in error.
+    // A structured rate limit keeps the capacity failover below.
+    const detail = providerExhausted(errorInfo) ? "" : await threadFailureDetail(threadId);
+    if (planLimitError(detail)) {
+      await crewAtPlanLimit(crew, detail).catch((error) => bb.log.warn(`crew ${crew.id} plan limit: ${String(error)}`));
+      return;
+    }
     await failoverExhaustedCrew(crew, errorInfo).catch((error) => bb.log.warn(`crew ${crew.id} failover: ${String(error)}`));
   });
+
+  async function unavailableProviders(): Promise<UnavailableProviders> {
+    const marks = (await bb.storage.kv.get<UnavailableProviders>(PROVIDER_UNAVAILABLE_KEY)) ?? {};
+    const now = Date.now();
+    return Object.fromEntries(Object.entries(marks).filter(([, mark]) => mark.until > now));
+  }
+
+  // A dispatch with no provider named does not start on a provider known to be at its plan limit.
+  async function skipUnavailableProvider(input: { providerId?: string; projectId: string; parentThreadId?: string; shape: Shape; reasoningLevel?: ReasoningLevel }): Promise<{ providerId: string; model: string | null; reasoningLevel: ReasoningLevel | undefined; note: string } | null> {
+    const marks = await unavailableProviders();
+    if (Object.keys(marks).length === 0) return null;
+    let chosen = input.providerId;
+    if (chosen === undefined) {
+      const project = asRecord(await bb.sdk.projects.defaultExecutionOptions({ projectId: input.projectId }));
+      chosen = typeof project["providerId"] === "string" ? project["providerId"] : undefined;
+    }
+    const mark = chosen === undefined ? undefined : marks[chosen];
+    if (chosen === undefined || mark === undefined) return null;
+    const target = await failoverExecution({ projectId: input.projectId, parentThreadId: input.parentThreadId ?? null, shape: input.shape, reasoningLevel: input.reasoningLevel ?? null, threadId: input.parentThreadId ?? "" }, chosen);
+    if (target === null) return null;
+    return { ...target, note: `Note: ${chosen} is ${mark.reason} until ${utcMinute(mark.until)}; this crew runs on ${target.providerId}.` };
+  }
+
+  // The provider cannot serve this crew until its plan resets. A crew whose provider
+  // nobody named moves once to the next usable provider; a named provider is the
+  // owner's choice, so the crew fails to the captain instead of sitting idle.
+  async function crewAtPlanLimit(crew: Crew, detail: string): Promise<void> {
+    const seen = `crew-plan-limit:${crew.threadId}`;
+    // Every later message to the stopped thread gets the same notice back.
+    if (await bb.storage.kv.get(seen) === true) return;
+    await bb.storage.kv.set(seen, true);
+    const failed = (await bb.sdk.threads.get({ threadId: crew.threadId })).providerId ?? crew.providerId;
+    const provider = failed ?? "the provider";
+    if (failed) {
+      const until = unavailableUntil(detail, Date.now());
+      await bb.storage.kv.set(PROVIDER_UNAVAILABLE_KEY, { ...(await unavailableProviders()), [failed]: { until, reason: "at its plan limit" } });
+      bb.log.warn(`provider ${failed} is at its plan limit (crew ${crew.id}); dispatches with no provider named skip it until ${utcMinute(until)}`);
+    }
+    const loud = `crew ${crew.id}: provider ${provider} is at its plan limit; retry with another provider (bb firstmate retry ${crew.id} --provider <id>).`;
+    const key = `crew-failover:${crew.projectId}:${crew.parentThreadId ?? ""}:${crew.id}`;
+    if (crew.providerNamed === true || typeof (await bb.storage.kv.get(key)) === "number") {
+      await notifyCaptain(crew, "error", loud);
+      return;
+    }
+    const target = await failoverExecution(crew, failed);
+    if (target === null) {
+      await notifyCaptain(crew, "error", `${loud} No other usable provider was found.`);
+      return;
+    }
+    await bb.storage.kv.set(key, Date.now());
+    const note = `Provider failover: the prior thread stopped because ${provider} is at its plan limit. Before you continue, re-verify the work in progress yourself: re-read the diff, re-run the affected tests, and check the state of any push, PR, or deploy the prior thread started. Do not rely on its claims.`;
+    let next: Crew;
+    try {
+      next = await relaunchCrew(crew, { providerId: target.providerId, ...(target.model ? { model: target.model } : {}), ...(target.reasoningLevel ? { reasoningLevel: target.reasoningLevel } : {}), note, intent: "failure-recovery" });
+    } catch (error) {
+      await notifyCaptain(crew, "error", `${loud} The restart on ${target.providerId} was refused: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    await notifyCaptain(next, "failed over", `${provider} is at its plan limit; restarted on ${target.providerId}${target.model ? `/${target.model}` : ""} in the same worktree, same task and delivery contract.`);
+  }
 
   // The owner had to type "Continue" after a pool outage (fleet audit 2026-10-07: a
   // 21-minute stall). Resume the failed turn after the pool has had time to free.
@@ -12626,8 +12715,10 @@ export default async function plugin(bb: BbPluginApi) {
     await notifyCaptain(next, "failed over", `${failed ?? "provider"} was out of capacity. Relaunched on ${target.providerId}${target.model ? `/${target.model}` : ""} in the same worktree; it re-verifies the work in progress first.`);
   }
 
-  async function failoverExecution(crew: Crew, failed: string | null): Promise<{ providerId: string; model: string | null; reasoningLevel: ReasoningLevel | undefined } | null> {
+  async function failoverExecution(crew: Pick<Crew, "projectId" | "parentThreadId" | "shape" | "reasoningLevel" | "threadId">, failed: string | null): Promise<{ providerId: string; model: string | null; reasoningLevel: ReasoningLevel | undefined } | null> {
     const preferred: ExecutionChoice[] = [];
+    const configured = (await settings.get()).defaultProvider;
+    if (configured !== "") preferred.push({ providerId: configured, model: null });
     if (crew.parentThreadId) {
       try {
         const captain = await bb.sdk.threads.get({ threadId: crew.parentThreadId });
@@ -12639,10 +12730,11 @@ export default async function plugin(bb: BbPluginApi) {
       const project = asRecord(await bb.sdk.projects.defaultExecutionOptions({ projectId: crew.projectId }));
       preferred.push({ providerId: typeof project["providerId"] === "string" ? project["providerId"] : null, model: typeof project["model"] === "string" ? project["model"] : null });
     } catch { /* the catalog remains */ }
-    const envId = await threadEnv(crew.threadId);
+    const envId = crew.threadId !== "" ? await threadEnv(crew.threadId) : null;
     const routing = envId !== null ? { environmentId: envId } : {};
     const rows = (await bb.sdk.providers.list(routing)).map(asRecord);
-    const catalog = rows.flatMap((p) => typeof p["id"] === "string" ? [{ id: p["id"], available: p["available"] !== false }] : []);
+    const marked = await unavailableProviders();
+    const catalog = rows.flatMap((p) => typeof p["id"] === "string" ? [{ id: p["id"], available: p["available"] !== false && marked[p["id"]] === undefined }] : []);
     const picked = failoverTarget({ failedProviderId: failed, shape: crew.shape, preferred, catalog });
     if (picked === null) return null;
     // The old reasoning level carries over unless the new provider lacks it.
@@ -12894,6 +12986,7 @@ export default async function plugin(bb: BbPluginApi) {
                 parentThreadId: ctxThread,
                 title: titleFlag === undefined ? undefined : tasks.length === 1 ? titleFlag : `${titleFlag} #${i + 1}`,
                 providerId: flagStr(flags, "provider") ?? (current.defaultProvider !== "" ? current.defaultProvider : undefined),
+                providerNamed: flagStr(flags, "provider") !== undefined,
                 model: flagStr(flags, "model"),
                 reasoningLevel: strictReasoning(flagStr(flags, "reasoning-level")),
                 permissionMode: toPermissionMode(flagStr(flags, "permission-mode") ?? current.defaultPermissionMode),
@@ -13386,6 +13479,7 @@ export default async function plugin(bb: BbPluginApi) {
                 title: item.title,
                 crewId: item.id,
                 providerId: flagStr(flags, "provider") ?? item.providerId ?? (current.defaultProvider !== "" ? current.defaultProvider : undefined),
+                providerNamed: (flagStr(flags, "provider") ?? item.providerId) !== undefined,
                 model: flagStr(flags, "model") ?? item.model,
                 reasoningLevel: strictReasoning(flagStr(flags, "reasoning-level") ?? item.reasoningLevel),
                 deliveryRequirement:item.deliveryRequirement,

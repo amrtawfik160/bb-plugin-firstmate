@@ -7,6 +7,7 @@ import plugin from "./server.ts";
 import { createDeliveries } from "./lib/pr-delivery.ts";
 import { UPSTREAM_SKILL_NAMES } from "./lib/upstream-surface.ts";
 import { quietStaleVerdict, staleQueueRows } from "./lib/finished-crew-wakes.ts";
+import { planLimitError, planLimitNotice, PROVIDER_UNAVAILABLE_KEY, unavailableProviderLines, unavailableUntil } from "./lib/provider-failover.ts";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -722,4 +723,170 @@ test("forget on a crew whose thread is already archived asks nothing of its reti
   } finally {
     await host.harness.lifecycle.dispose();
   }
+});
+
+// ---------------------------------------------------------------------------
+// A provider at its plan limit (captain thr_pse43vv6tn, crews af4986b1 and d883a2a4,
+// 2026-10-10): Cursor ended the turn as completed with this text as its only message,
+// so no turn failure fired and both crews sat idle with no outcome.
+const CURSOR_PLAN_LIMIT = "\n\nUpgrade your plan to continue";
+const CURSOR_CATALOG = [{ id: "acp-cursor", available: true }, { id: "codex", available: true }, { id: "claude-code", available: true }];
+
+async function planLimitHost(crewPatch: Record<string, unknown> = {}, settings: Record<string, unknown> = {}) {
+  const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { supervisionEnabled: true, defaultProvider: "claude-code", ...settings } });
+  await plugin(host.bb);
+  await host.bb.storage.kv.set("crews", [{ ...shipRow("c1", "thr_crew", "thr_cap"), providerId: null, model: "grok-4.6", ...crewPatch }]);
+  host.harness.sdk.stub("threads.list", async () => []);
+  host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+  host.harness.sdk.stub("threads.send", async () => ({}));
+  host.harness.sdk.stub("threads.stop", async () => ({}));
+  host.harness.sdk.stub("threads.archive", async () => ({}));
+  host.harness.sdk.stub("threads.events.list", async () => []);
+  host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => threadId === "thr_cap"
+    ? makeThreadResponse({ id: "thr_cap", status: "idle", providerId: "codex", projectId: "proj_1" })
+    : makeThreadResponse({ id: threadId, status: "idle", providerId: threadId === "thr_crew" ? "acp-cursor" : "claude-code", environmentId: "env_wt", projectId: "proj_1", parentThreadId: "thr_cap" }));
+  host.harness.sdk.stub("threads.defaultExecutionOptions", async () => ({ model: "grok-4.6", reasoningLevel: null, permissionMode: "auto" }));
+  host.harness.sdk.stub("projects.defaultExecutionOptions", async () => ({ providerId: "acp-cursor", model: "grok-4.6" }));
+  host.harness.sdk.stub("environments.get", async () => ({ id: "env_wt", hostId: "host_1", status: "ready", path: "/repo/isolated", isWorktree: true }));
+  host.harness.sdk.stub("providers.list", async () => CURSOR_CATALOG);
+  host.harness.sdk.stub("providers.models", async ({ providerId }: { providerId: string }) => ({ models: [{ id: `${providerId}-default`, model: `${providerId}-default`, isDefault: true }] }));
+  host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew2" }));
+  return host;
+}
+
+function emitIdleOn(host: Host, threadId: string, lastAssistantText: string | null) {
+  return host.harness.behavior.emitThreadEvent("thread.idle", {
+    thread: makeThreadResponse({ id: threadId, status: "idle", projectId: "proj_1" }),
+    lastAssistantText,
+  });
+}
+
+test("the Cursor plan-limit notice is recognised only as a whole short message, and a failed turn's detail anywhere", () => {
+  assert.equal(planLimitNotice(CURSOR_PLAN_LIMIT), true);
+  assert.equal(planLimitNotice("Upgrade your plan to continue."), true);
+  assert.equal(planLimitNotice(null), false);
+  assert.equal(planLimitNotice("DONE: the pricing page now says \"Upgrade your plan to continue\" on the paywall."), false, "a crew report that quotes the wording is a report");
+  assert.equal(planLimitNotice("BLOCKED: Vercel answered: upgrade your plan to continue"), false);
+  assert.equal(planLimitError("Provider error: You have hit your usage limit. Upgrade your plan to continue."), true);
+  assert.equal(planLimitError("API Error: Request rejected (429) · No Account Pooler account is currently eligible."), false, "a rate limit keeps its own path");
+});
+
+test("the provider stays marked until the reset the error names, else 60 minutes", () => {
+  const now = Date.parse("2026-10-10T06:00:00.000Z");
+  assert.equal(unavailableUntil(CURSOR_PLAN_LIMIT, now), now + 60 * 60_000);
+  assert.equal(unavailableUntil("Usage limit reached. Try again in 25 minutes.", now), now + 25 * 60_000);
+  assert.equal(unavailableUntil("Quota exceeded; resets in 3 hours", now), now + 3 * 60 * 60_000);
+});
+
+test("a crew dispatched with no provider named that stops on a plan limit is restarted once on the default provider in the same worktree", async () => {
+  const host = await planLimitHost();
+  try {
+    const emitted = await emitIdleOn(host, "thr_crew", CURSOR_PLAN_LIMIT);
+    assert.deepEqual(emitted.errors, []);
+    const spawns = host.harness.sdk.callsTo("threads.spawn");
+    assert.equal(spawns.length, 1, "one replacement worker");
+    const args = spawns[0]![0] as { providerId?: string; model?: string; permissionMode?: string; environment?: unknown; pluginMetadata?: Record<string, unknown> };
+    assert.equal(args.providerId, "claude-code", "the configured default provider comes before the captain's own and the catalog order");
+    assert.equal(args.model, "claude-code-default", "the Cursor model does not follow the crew to another provider");
+    assert.deepEqual(args.environment, { type: "reuse", environmentId: "env_wt" });
+    assert.equal(args.pluginMetadata?.["posture"], "direct-PR");
+    assert.equal(args.pluginMetadata?.["deliveryRequirement"], "merged");
+    const toCaptain = sendCalls(host).filter((s) => s.threadId === "thr_cap");
+    assert.equal(toCaptain.length, 1, "one line to the captain");
+    assert.match(toCaptain[0]!.text, /acp-cursor is at its plan limit.*restarted on claude-code/s);
+    assert.equal(sendCalls(host).filter((s) => s.threadId === "thr_crew").length, 0, "the stopped worker is not asked for an outcome line");
+
+    // The captain's next steer made Cursor answer the same notice again on the old thread.
+    await emitIdleOn(host, "thr_crew", CURSOR_PLAN_LIMIT);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 1);
+    // The replacement's provider runs out too: no second switch, a loud failure instead.
+    await emitIdleOn(host, "thr_crew2", "Upgrade your plan to continue");
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 1, "restarted once");
+    assert.ok(sendCalls(host).some((s) => s.threadId === "thr_cap" && /crew c1: provider claude-code is at its plan limit; retry with another provider/.test(s.text)));
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a crew whose provider the owner or captain named is not switched: the captain is told at once, one time", async () => {
+  const host = await planLimitHost({ providerId: "acp-cursor", providerNamed: true });
+  try {
+    await emitIdleOn(host, "thr_crew", CURSOR_PLAN_LIMIT);
+    await emitIdleOn(host, "thr_crew", CURSOR_PLAN_LIMIT);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
+    const toCaptain = sendCalls(host).filter((s) => s.threadId === "thr_cap");
+    assert.equal(toCaptain.length, 1);
+    assert.match(toCaptain[0]!.text, /crew c1 failed/);
+    assert.match(toCaptain[0]!.text, /crew c1: provider acp-cursor is at its plan limit; retry with another provider/);
+    assert.equal(sendCalls(host).filter((s) => s.threadId === "thr_crew").length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a failed turn whose error names the plan limit takes the same path", async () => {
+  const host = await planLimitHost();
+  try {
+    host.harness.sdk.stub("threads.events.list", async () => [{ type: "provider/error", data: { message: "Provider error", detail: "Upgrade your plan to continue" } }]);
+    await host.harness.behavior.emitThreadEvent("turn.failed", turnFailed("thr_crew", { category: "unknown", httpStatusCode: null, providerCode: null }));
+    assert.equal((host.harness.sdk.callsTo("threads.spawn")[0]?.[0] as { providerId?: string } | undefined)?.providerId, "claude-code");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("an ordinary idle turn is not read as a plan limit", async () => {
+  const host = await planLimitHost();
+  try {
+    await emitIdleOn(host, "thr_crew", "DONE: fixed the paywall copy \"Upgrade your plan to continue\".");
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
+    assert.equal(await host.bb.storage.kv.get(PROVIDER_UNAVAILABLE_KEY), undefined);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+function stubDispatchSdk(host: Host) {
+  host.harness.sdk.stub("threadSections.list", async () => []);
+  host.harness.sdk.stub("threadSections.create", async () => ({ id: "sec_crews" }));
+  host.harness.sdk.stub("environments.list", async () => [{ hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" }]);
+  host.harness.sdk.stub("threads.spawn", async () => ({ id: `thr_new${host.harness.sdk.callsTo("threads.spawn").length}` }));
+  host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: "starting" }));
+  host.harness.sdk.stub("projects.defaultExecutionOptions", async () => ({ providerId: "acp-cursor", model: "grok-4.6" }));
+  host.harness.sdk.stub("providers.list", async () => CURSOR_CATALOG);
+  host.harness.sdk.stub("providers.models", async ({ providerId }: { providerId: string }) => ({ models: [{ id: `${providerId}-default`, model: `${providerId}-default`, isDefault: true }] }));
+}
+
+test("the plan limit is remembered: the next dispatch with no provider named skips that provider, a named one keeps it, and the mark expires", async () => {
+  const host = await load();
+  try {
+    stubDispatchSdk(host);
+    const now = Date.now();
+    await host.bb.storage.kv.set(PROVIDER_UNAVAILABLE_KEY, { "acp-cursor": { until: now + 30 * 60_000, reason: "at its plan limit" } });
+    const unnamed = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--", "fix flaky login"], { projectId: "proj_1" });
+    assert.equal(unnamed.exitCode, 0, unnamed.stderr);
+    const first = host.harness.sdk.callsTo("threads.spawn")[0]![0] as { providerId?: string; model?: string };
+    assert.equal(first.providerId, "codex", "BB's project default is Cursor, so the next provider in the catalog is used");
+    assert.equal(first.model, "codex-default");
+    assert.match(unnamed.stdout, /acp-cursor is at its plan limit until .* UTC; this crew runs on codex/);
+
+    const named = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--provider", "acp-cursor", "--", "fix flaky signup"], { projectId: "proj_1" });
+    assert.equal(named.exitCode, 0, named.stderr);
+    assert.equal((host.harness.sdk.callsTo("threads.spawn")[1]![0] as { providerId?: string }).providerId, "acp-cursor");
+    const crews = (await host.bb.storage.kv.get("crews")) as Array<{ providerId: string | null; providerNamed?: boolean }>;
+    assert.deepEqual(crews.map((c) => [c.providerId, c.providerNamed === true]), [["acp-cursor", true], ["codex", false]]);
+
+    await host.bb.storage.kv.set(PROVIDER_UNAVAILABLE_KEY, { "acp-cursor": { until: now - 1, reason: "at its plan limit" } });
+    await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--", "fix flaky logout"], { projectId: "proj_1" });
+    assert.equal((host.harness.sdk.callsTo("threads.spawn")[2]![0] as { providerId?: string }).providerId, undefined, "an expired mark changes nothing");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("the toolchain report lists a provider that unnamed dispatches skip, with the time it ends", () => {
+  const now = Date.parse("2026-10-10T06:00:00.000Z");
+  assert.deepEqual(unavailableProviderLines({ "acp-cursor": { until: now + 60 * 60_000, reason: "at its plan limit" }, codex: { until: now - 1, reason: "at its plan limit" } }, now),
+    ["PROVIDER_UNAVAILABLE: acp-cursor is at its plan limit; dispatches with no provider named skip it until 2026-10-10 07:00 UTC."]);
+  assert.deepEqual(unavailableProviderLines(undefined, now), []);
 });
