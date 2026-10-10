@@ -373,6 +373,85 @@ test("an over-cap queue record without the three stored options starts with the 
   }
 });
 
+async function fullCaptainHost() {
+  const host = await knownCaptainHost();
+  await asyncOn(host);
+  await host.bb.storage.kv.set("crews", Array.from({ length: 10 }, (_, i) => crewRow(`c${i + 1}`, `thr_c${i + 1}`)));
+  return host;
+}
+
+test("an over-cap dispatch keeps the provider the owner asked for, from the tool and from the command line", async () => {
+  for (const entry of ["tool", "cli"] as const) {
+    const host = await fullCaptainHost();
+    try {
+      let busy = true;
+      stubSpawn(host, () => (busy ? "active" : "idle"));
+      if (entry === "tool") {
+        const queued = await tool(host, "firstmate_dispatch").execute({
+          task: "fix flaky login", projectId: "proj_1", providerId: "acp-antigravity", ownerRequestedProvider: true,
+        }, capCtx);
+        assert.match(text(queued), /Queued as/);
+      } else {
+        const queued = await host.harness.behavior.runCli(
+          ["dispatch", "--project", "proj_1", "--provider", "acp-antigravity", "--owner-requested-provider", "--", "fix flaky login"], capCtx);
+        assert.equal(queued.exitCode, 0, queued.stderr);
+        assert.match(queued.stdout, /Queued as/);
+      }
+      busy = false;
+      await captainIdle(host);
+      const [args] = spawnArgs(host);
+      assert.ok(args, `the over-cap item started (${entry})`);
+      assert.equal(args.providerId, "acp-antigravity", entry);
+    } finally {
+      await host.harness.lifecycle.dispose();
+    }
+  }
+});
+
+test("an over-cap queue record without the owner-requested-provider flag starts on the project default", async () => {
+  const host = await fullCaptainHost();
+  try {
+    let busy = true;
+    stubSpawn(host, () => (busy ? "active" : "idle"));
+    const queued = await tool(host, "firstmate_dispatch").execute({ task: "fix flaky login", projectId: "proj_1", providerId: "acp-antigravity" }, capCtx);
+    assert.match(text(queued), /Queued as/);
+    busy = false;
+    await captainIdle(host);
+    const [args] = spawnArgs(host);
+    assert.ok(args, "the over-cap item started");
+    assert.equal(args.providerId, undefined);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("the command line keeps the provider the owner asked for when a crew slot is free", async () => {
+  const host = await knownCaptainHost();
+  try {
+    stubSpawn(host);
+    const result = await host.harness.behavior.runCli(
+      ["dispatch", "--project", "proj_1", "--provider", "acp-antigravity", "--owner-requested-provider", "--", "fix flaky login"], capCtx);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(spawnArgs(host)[0]?.providerId, "acp-antigravity");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("an over-cap dispatch with a scheduled send time is refused and nothing is queued", async () => {
+  const host = await fullCaptainHost();
+  try {
+    stubSpawn(host, () => "active");
+    const result = await host.harness.behavior.runCli(
+      ["dispatch", "--project", "proj_1", "--send-at", String(Date.now() + 3_600_000), "--", "fix flaky login"], capCtx);
+    assert.equal(result.exitCode, 1, result.stdout);
+    assert.match(result.stderr, /sendAt is unsupported for Firstmate launch/);
+    assert.match(text(await tool(host, "firstmate_queue").execute({ action: "list" }, capCtx)), /Queue empty/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("the queue list shows an over-cap dispatch waiting for a slot and a background dispatch that has no crew yet", async () => {
   const host = await knownCaptainHost();
   try {

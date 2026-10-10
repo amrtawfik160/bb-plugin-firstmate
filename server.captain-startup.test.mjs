@@ -54,6 +54,30 @@ test('a changed captain hook file is installed again on the next deck',async()=>
  assert.equal(f.seen.slice(prior).filter(c=>c.includes('captain-hooks-ok')).length,1);assert.deepEqual(readFileSync(installed),hook);
  }finally{await f.clean();}
 });
+test('a plugin load installs a changed captain hook file on each host that has a registered captain, and nothing else',async()=>{
+ const f=await setup();try{
+ const deck=await f.host.harness.behavior.runCli(['deck','--json'],ctx);assert.equal(deck.exitCode,0,deck.stderr);
+ const hook=readFileSync('overlay/bin/bb-captain-hook.sh');const installed=join(f.runtime,'.bb-firstmate/bin/bb-captain-hook.sh');
+ const untouched=['.bb-firstmate/captains/'+ctx.threadId,'.claude/settings.json','.codex/hooks.json'].map(rel=>join(f.runtime,rel));
+ const before=untouched.map(path=>readFileSync(path,'utf8'));
+ const installLogs=()=>f.host.harness.logEntries.filter(e=>e.level==='info'&&/captain hook file installed/.test(e.message)).map(e=>e.message);
+ const load=async(done)=>{const prior=f.seen.length;const run=f.host.harness.behavior.runService('captain-home-watch');const deadline=Date.now()+8000;
+  while(!done(f.seen.slice(prior))&&Date.now()<deadline)await new Promise(r=>setTimeout(r,10));
+  run.controller.abort();await run.done;return f.seen.slice(prior);};
+ const checked=seen=>seen.some(c=>c.includes('captain-hook-'));
+ writeFileSync(installed,'previous hook\n',{mode:0o755});
+ await load(()=>readFileSync(installed).equals(hook));
+ assert.deepEqual(readFileSync(installed),hook);assert.equal(lstatSync(installed).mode&0o777,0o755);
+ assert.deepEqual(untouched.map(path=>readFileSync(path,'utf8')),before,'marker and user settings are not rewritten');
+ assert.deepEqual(installLogs(),['captain hook file installed host=host_1']);
+ const again=await load(checked);
+ assert.ok(checked(again),'the next load checks the installed file');assert.equal(again.filter(c=>c.includes('bb-captain-hook.sh.tmp')).length,0,'an identical file is not installed again');
+ assert.equal(installLogs().length,1);
+ rmSync(untouched[0]);writeFileSync(installed,'previous hook\n',{mode:0o755});
+ const unregistered=await load(checked);
+ assert.ok(checked(unregistered));assert.equal(readFileSync(installed,'utf8'),'previous hook\n','a host without a registered captain marker is left alone');
+ }finally{await f.clean();}
+});
 test('every deck links skill-routing into each installed provider skill folder and repairs a broken link',async()=>{
  const f=await setup();try{
  const deck=async()=>{const r=await f.host.harness.behavior.runCli(['deck','--json'],ctx);assert.equal(r.exitCode,0,r.stderr);};
