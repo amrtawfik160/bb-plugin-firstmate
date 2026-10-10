@@ -144,6 +144,8 @@ const crewSchema = z.object({
   // Last PR url seen for this crew (BB environment PR, gh by branch, or the crew's own
   // report). Lets merge/forget/ownership checks resolve a PR the environment cache misses.
   prUrl: z.string().optional(),
+  // true = the captain merged this crew's PR with keepCrew; the landed-crew sweep leaves it.
+  keptAfterMerge: z.boolean().optional(),
   // true = `task` holds only a prefix; the full brief lives under crew-task:<id>.
   taskSpilled: z.boolean().optional(),
   launchKey: z.string().optional(),
@@ -6960,8 +6962,11 @@ export default async function plugin(bb: BbPluginApi) {
     yes: boolean,
     allowRedCheck?: string,
     allowMissingCheck?: string,
-    opts: { caller?: string; overrideOwner?: boolean } = {},
+    opts: { caller?: string; overrideOwner?: boolean; keepCrew?: boolean } = {},
   ): Promise<string> {
+    const keep = opts.keepCrew === true;
+    const settle = (outcome: string, pr: string) => keep ? keepLanded(crew, outcome, pr) : retireLanded(crew, outcome, pr);
+    const kept = `Crew ${crew.id} kept, not retired: its thread, worktree and firstmate_tell still work. Retire it later with firstmate_forget crewId=${crew.id} stop=true.`;
     const posture = await postureOf(crew.projectId);
     // Captain authority (yes/yolo) and check waivers are separate: neither waiver
     // grants authority, so either waiver without --yes still refuses.
@@ -6986,8 +6991,8 @@ export default async function plugin(bb: BbPluginApi) {
       if (local) {
         const result = await runFmScript({ script: "merge-local", args: [crew.id], fmHome: nativeHome, hostId, timeoutMs: 180_000 });
         requireNativeSuccess(result, `local merge ${crew.id}`);
-        const note = await retireLanded(crew, "local ff-only", "");
-        return `${result.output.trim()}\nCrew ${crew.id} retired.${note}`;
+        const note = await settle("local ff-only", "");
+        return `${result.output.trim()}\n${keep ? kept : `Crew ${crew.id} retired.${note}`}`;
       }
       const pr = await resolveCrewPr(crew, envId, hostId);
       if (pr === null) {
@@ -7019,10 +7024,10 @@ export default async function plugin(bb: BbPluginApi) {
         }
         if (!landed) return `${result.output.trim()}\nLanding not yet confirmed; crew ${crew.id} retained. Check the merge queue before teardown.`;
       }
-      const note = await retireLanded(crew, "merged through native gate", pr.url);
-      return `Merged ${pr.url}\nCrew ${crew.id} retired.${note}`;
+      const note = await settle("merged through native gate", pr.url);
+      return `Merged ${pr.url}\n${keep ? kept : `Crew ${crew.id} retired.${note}`}`;
     }
-    if (local) return mergeLocal(crew, envId);
+    if (local) return mergeLocal(crew, envId, keep ? kept : undefined);
     if (crew.posture === "no-mistakes") {
       const dirty = extractPaths(
         await bb.sdk.environments.diffFiles({ environmentId: envId, target: "uncommitted" }),
@@ -7039,8 +7044,8 @@ export default async function plugin(bb: BbPluginApi) {
     await rememberPrUrl(crew, f.url);
     await guardForeignPr(crew, f.url, override,opts.caller);
     if (f.state === "merged") {
-      await retireLanded(crew, "merged (already landed)", f.url);
-      return `Already merged: ${f.url}\nCrew ${crew.id} retired.`;
+      await settle("merged (already landed)", f.url);
+      return `Already merged: ${f.url}\n${keep ? kept : `Crew ${crew.id} retired.`}`;
     }
     f = await prepareEnvironmentPullRequest(envId);
     const waive = (allowRedCheck ?? "").trim();
@@ -7058,11 +7063,11 @@ export default async function plugin(bb: BbPluginApi) {
     await bb.sdk.environments.mergePullRequest({ environmentId: envId, method: "merge" });
     const output = await crewOutput(crew, 300);
     const waived = gate.waived.length > 0 ? ` (waived red check: ${gate.waived.join(", ")})` : "";
-    await retireLanded(crew, `${parseOutcome(output) ?? "merged"}${waived}`, f.url);
-    return `Merged ${f.url}${waived}\nCrew ${crew.id} retired (landed).`;
+    await settle(`${parseOutcome(output) ?? "merged"}${waived}`, f.url);
+    return `Merged ${f.url}${waived}\n${keep ? kept : `Crew ${crew.id} retired (landed).`}`;
   }
 
-  async function mergeLocal(crew: Crew, envId: string): Promise<string> {
+  async function mergeLocal(crew: Crew, envId: string, kept?: string): Promise<string> {
     const env = asRecord(await bb.sdk.environments.get({ environmentId: envId }));
     const branch = typeof env["branchName"] === "string" ? env["branchName"] : "";
     if (branch === "") throw new Error("Crew environment has no branch.");
@@ -7081,8 +7086,19 @@ export default async function plugin(bb: BbPluginApi) {
     if (result.exitCode !== 0) {
       throw new Error(`local ff-only merge failed:\n${truncate(result.output, 800)}`);
     }
-    await retireLanded(crew, `local ff-only ${branch} → ${main.path}`, "");
-    return `Landed locally (ff-only) ${branch}\nCrew ${crew.id} retired.`;
+    if (kept !== undefined) await keepLanded(crew, `local ff-only ${branch} → ${main.path}`, "");
+    else await retireLanded(crew, `local ff-only ${branch} → ${main.path}`, "");
+    return `Landed locally (ff-only) ${branch}\n${kept ?? `Crew ${crew.id} retired.`}`;
+  }
+
+  // The merge is recorded like a retirement's, but the crew stays: no teardown, no
+  // stop, no archive. The captain retires it later with forget --stop.
+  async function keepLanded(crew: Crew, outcome: string, pr: string): Promise<string> {
+    if (pr) await registerCrewPr(crew, pr);
+    await recordDone({ task: crewLabel(crew).slice(0, 200), shape: crew.shape, crewId: crew.id, outcome: `${outcome} (crew kept)`, pr, parentThreadId: crew.parentThreadId, deliveryRequirement: await contractForCrew(crew) });
+    await mutateCrews((crews) => crews.map((c) => c.id === crew.id && c.threadId === crew.threadId ? { ...c, keptAfterMerge: true, ...(pr ? { prUrl: pr } : {}) } : c));
+    await publishFleet();
+    return "";
   }
 
   // Returns a note for the caller's result; "" when native teardown did the work.
@@ -7164,6 +7180,7 @@ export default async function plugin(bb: BbPluginApi) {
       // verifies other people's PRs) delivers a report, so a merged PR on its
       // environment must never retire it while the captain still needs it.
       if (crew.shape !== "ship") continue;
+      if (crew.keptAfterMerge === true) continue;
       if (!retries.isDue("landed-retire", crew.threadId, Date.now())) continue;
       const status = statusByThread.get(crew.threadId) ?? "unknown";
       if (status !== "idle" && status !== "error") continue;
@@ -11012,12 +11029,14 @@ export default async function plugin(bb: BbPluginApi) {
         .describe("Exact name of one required check that has not reported; native verification is required, all other required checks must report and be green"),
       overrideOwner: z.boolean().optional()
         .describe("Land a crew/PR owned by another captain (only when the captain explicitly said so)"),
+      keepCrew: z.boolean().optional()
+        .describe("Merge but do not retire the crew: use when it still has work after the merge. firstmate_tell keeps working; retire it later with firstmate_forget stop=true"),
     }),
-    async execute({ crewId, yes, allowRedCheck, allowMissingCheck, overrideOwner }, ctx) {
+    async execute({ crewId, yes, allowRedCheck, allowMissingCheck, overrideOwner, keepCrew }, ctx) {
       const crew = await findCrew(crewId,ctxString(ctx,"threadId"));
       if (crew === undefined) return toolError(`No crew ${crewId}.`);
       try {
-        return await mergeCrew(crew, yes === true, allowRedCheck, allowMissingCheck, { caller: ctxString(ctx, "threadId"), overrideOwner: overrideOwner === true });
+        return await mergeCrew(crew, yes === true, allowRedCheck, allowMissingCheck, { caller: ctxString(ctx, "threadId"), overrideOwner: overrideOwner === true, keepCrew: keepCrew === true });
       } catch (error) {
         return toolError(error instanceof Error ? error.message : "Merge failed.");
       }
@@ -12780,7 +12799,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "deliveries", summary: "Durable PR health and follow-up", usage: "bb firstmate deliveries list|inspect|register|reconcile|assign|abandon|clear-hold|verify [id] [--from <manager>] [--reason <evidence>] [--authorized]\nbb firstmate deliveries register --url <PR url> [--crew <id>]   (no --crew: a PR you opened yourself)\nbb firstmate deliveries account <id> --failure <id> --scope author|baseline --follow-up-task <existing-task> --reason <evidence> --authorized" },
       { name: "launches", summary: "Inspect reservations or explicitly adopt an existing legacy worker", usage: "bb firstmate launches list | adopt <task-id> --thread <thread-id> [--check] [--json]" },
       { name: "deliver", summary: "Outcome + committed/uncommitted diff + PR", usage: "bb firstmate deliver <crew-id>" },
-      { name: "merge", summary: "Merge PR or local-only ff-only land", usage: "bb firstmate merge <crew-id> [--yes]" },
+      { name: "merge", summary: "Merge PR or local-only ff-only land", usage: "bb firstmate merge <crew-id> [--yes] [--keep-crew]" },
       { name:"scout-report",summary:"Read the complete owned promotion artifact",usage:"bb firstmate scout-report <id> [--json]" },
       { name: "promote", summary: "Scout → new ship carrying the report", usage: "bb firstmate promote <crew-id>" },
       { name: "queue", summary: "Backlog with deps/time gates; reconcile restores exact native linkage without launching; prune forgets finished items", usage: queueHelp },
@@ -13255,9 +13274,9 @@ export default async function plugin(bb: BbPluginApi) {
             const crew = await findCrew(id,ctxThread);
             if (crew === undefined) return fail(`No crew ${id}.`);
             const text = await mergeCrew(crew, flags.has("yes"), flagStr(flags, "allow-red"), flagStr(flags, "allow-missing"), {
-              caller: ctxThread, overrideOwner: flags.has("override-owner"),
+              caller: ctxThread, overrideOwner: flags.has("override-owner"), keepCrew: flags.has("keep-crew"),
             });
-            return reply({ merged: true, id }, text);
+            return reply({ merged: true, id, crewKept: flags.has("keep-crew") }, text);
           }
           case "handoff": {
             const from = flagStr(flags, "from");
