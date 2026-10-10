@@ -62,6 +62,7 @@ bb firstmate dispatch --project <project-id> -- "fix the flaky login test"
 bb firstmate watch                      # blocks until crews go idle (no polling)
 bb firstmate deliver <crew-id>          # committed + uncommitted diff, PR URL
 bb firstmate merge <crew-id> --yes      # merge green PR, or ff-only local land
+bb firstmate merge <crew-id> --yes --keep-crew   # merge, keep the crew for follow-up work
 # Attended-only, exact-check waivers: --allow-red <check> / --allow-missing <check>
 ```
 

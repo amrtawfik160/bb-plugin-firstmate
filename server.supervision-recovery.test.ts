@@ -890,3 +890,71 @@ test("the toolchain report lists a provider that unnamed dispatches skip, with t
     ["PROVIDER_UNAVAILABLE: acp-cursor is at its plan limit; dispatches with no provider named skip it until 2026-10-10 07:00 UTC."]);
   assert.deepEqual(unavailableProviderLines(undefined, now), []);
 });
+
+// ---------------------------------------------------------------------------
+// Crew d883a2a4 still had work after its PR merged (2026-10-10): the merge retired it,
+// the next tell answered "No crew d883a2a4", and the captain had to dispatch a new crew.
+function stubMergeSdk(host: Host) {
+  const calls = { merged: 0 };
+  host.harness.sdk.stub("threads.list", async () => []);
+  host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }));
+  host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+  host.harness.sdk.stub("threads.output", async () => ({ output: "DONE: shipped" }));
+  host.harness.sdk.stub("threads.archive", async () => ({}));
+  host.harness.sdk.stub("threads.stop", async () => ({}));
+  host.harness.sdk.stub("threads.send", async () => ({}));
+  host.harness.sdk.stub("environments.pullRequest", async () => ({
+    outcome: "available",
+    pullRequest: {
+      url: "https://github.com/o/r/pull/1", number: 1, title: "t", state: calls.merged > 0 ? "merged" : "open",
+      checks: { state: "no_checks", failedCount: 0, pendingCount: 0, passedCount: 0 },
+      mergeability: { mergeable: "MERGEABLE" },
+    },
+  }));
+  host.harness.sdk.stub("environments.mergePullRequest", async () => { calls.merged++; return {}; });
+  return calls;
+}
+
+test("merge with --keep-crew merges the PR and leaves the crew listed and tell-able", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    const calls = stubMergeSdk(host);
+    const result = await host.harness.behavior.runCli(["merge", "c1", "--yes", "--keep-crew"], { threadId: "thr_cap" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(calls.merged, 1);
+    assert.match(result.stdout, /Merged https:\/\/github\.com\/o\/r\/pull\/1/);
+    assert.match(result.stdout, /Crew c1 kept, not retired/);
+    assert.doesNotMatch(result.stdout, /Crew c1 retired/);
+    assert.equal(host.harness.sdk.callsTo("threads.stop").length, 0);
+    assert.equal(host.harness.sdk.callsTo("threads.archive").length, 0);
+    const crews = (await host.bb.storage.kv.get("crews")) as Array<{ id: string; prUrl?: string }>;
+    assert.deepEqual(crews.map((c) => [c.id, c.prUrl]), [["c1", "https://github.com/o/r/pull/1"]], "still listed, with its merged PR recorded");
+
+    // The landed-crew sweep (bearings) must not retire it for its earlier DONE and merged PR.
+    await host.harness.behavior.runCli(["bearings"], { threadId: "thr_cap" });
+    assert.equal(((await host.bb.storage.kv.get("crews")) as unknown[]).length, 1, "the sweep leaves a kept crew");
+
+    const tell = await host.harness.behavior.runCli(["tell", "c1", "--", "start the store build"], { threadId: "thr_cap" });
+    assert.equal(tell.exitCode, 0, tell.stderr);
+    assert.ok(sendCalls(host).some((s) => s.threadId === "thr_crew" && /start the store build/.test(s.text)));
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("merge without --keep-crew retires the crew as before and says so", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    stubMergeSdk(host);
+    const result = await host.harness.behavior.runCli(["merge", "c1", "--yes"], { threadId: "thr_cap" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /Crew c1 retired \(landed\)\./);
+    assert.deepEqual((await host.bb.storage.kv.get("crews")) as unknown[], []);
+    const tell = await host.harness.behavior.runCli(["tell", "c1", "--", "start the store build"], { threadId: "thr_cap" });
+    assert.match(tell.stderr, /No crew c1/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
