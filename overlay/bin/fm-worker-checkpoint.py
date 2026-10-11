@@ -286,6 +286,19 @@ def update(args, home, state, data, values):
         status(home, state, args.task, *values)
 
 
+HEAVY_COMMAND = re.compile(r'(?:^|[\s/:=._-])(?:tsc|tsgo|typecheck|type-check|vitest|jest|playwright|pytest|mocha|tests?|build)(?:$|[\s:=._-])', re.I)
+
+
+def limited(command):
+    """A type check, test run or build runs under the host-wide limiter when one is installed."""
+    text = shlex.join(command)
+    if 'fm-heavy' in text or not HEAVY_COMMAND.search(text):
+        return None
+    override = os.environ.get('FM_HEAVY_BIN')
+    candidates = [Path(override)] if override else [Path.home() / '.bb-firstmate/bin/fm-heavy', Path(__file__).resolve().parent / 'fm-heavy']
+    return next(([str(path), *command] for path in candidates if os.access(path, os.X_OK)), None)
+
+
 def launch_unit(home, task, identifier):
     if not shutil.which('systemd-run') or not Path('/run/systemd/system').is_dir() or not hasattr(os, 'geteuid') or os.geteuid() != 0:
         return False
@@ -351,7 +364,9 @@ def check(args, home, state, data, values):
             # Exclusive evidence creation makes duplicate execution refuse.
             with path.with_suffix('.log').open('x') as output:
                 try:
-                    result = subprocess.run(row['command'], stdout=output, stderr=subprocess.STDOUT)
+                    wrapped = limited(row['command'])
+                    row['limited'] = wrapped is not None
+                    result = subprocess.run(wrapped or row['command'], stdout=output, stderr=subprocess.STDOUT)
                     row['exitCode'] = result.returncode
                 except OSError as error:
                     output.write(str(error) + '\n')

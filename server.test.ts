@@ -3978,6 +3978,29 @@ function realHost() {
   });
 }
 
+test("toolchain shows the heavy-command limiter's slot count and how many commands hold or wait for a slot", async () => {
+  for (const [reply, code, expected] of [
+    ["fm-heavy: 2 slots, 2 held, 3 waiting", 0, "Heavy commands (fm-heavy): 2 slots, 2 held, 3 waiting"],
+    ["bash: fm-heavy: No such file or directory", 127, "HEAVY_LIMITER_UNKNOWN: fm-heavy --status failed: bash: fm-heavy: No such file or directory"],
+  ] as const) {
+    const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { fmHome: "/tmp/fm-home", fmHostId: "host_1" } });
+    await plugin(host.bb);
+    try {
+      const { seen } = stubRealTransportHost(host, { spawnExit: 0, threadIdAfterSpawn: "thr_real" });
+      host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) =>
+        seen[Number(args.terminalId.slice(5)) - 1]!.includes("fm-heavy") ? hostRcPayload(reply, code) : hostRcPayload("", 0));
+      const result = await host.harness.behavior.runCli(["toolchain", "--json"], { projectId: "proj_1" });
+      assert.equal(result.exitCode, 0, result.stderr);
+      const report = JSON.parse(result.stdout);
+      assert.ok(report.output.split("\n").includes(expected), report.output);
+      assert.equal(report.ready, true, "the limiter line is advisory");
+      assert.ok(seen.some((c) => c.includes('"$HOME/.bb-firstmate/bin/fm-heavy" --status')), seen.join("\n---\n"));
+    } finally {
+      await host.harness.lifecycle.dispose();
+    }
+  }
+});
+
 test("real transport dispatches through fm-spawn.sh and adopts its thread id", async () => {
   const host = realHost();
   await plugin(host.bb);

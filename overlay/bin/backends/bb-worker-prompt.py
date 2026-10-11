@@ -23,7 +23,7 @@ STUCK = '   Use `blocked:` when you are stuck and need help.'
 # Mirrored from lib/crew-contract.ts: the opening of the Obstacles section that
 # Firstmate adds to a dispatched brief.
 OBSTACLES_SECTION = '\n### Obstacles\nClear an ordinary obstacle yourself: '
-UNSTABLE_CHECK = ' A command that changes tracked files (a dependency install, a code generator) is not source-stable: run it directly, then restore or commit what it changed.'
+UNSTABLE_CHECK = ' The helper runs a type check, test run or build under the host limiter (`fm-heavy`), so do not start one outside it. A command that changes tracked files (a dependency install, a code generator) is not source-stable: run it directly, then restore or commit what it changed.'
 OLD_ARTIFACT = '\n\nBB-DIVERGE: Keep durable artifacts under data/<task-id>/ in this firstmate home, not the worktree tmp/. The worktree tmp/ is removed when the workspace is archived.\n'
 
 

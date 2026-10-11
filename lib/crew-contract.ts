@@ -124,6 +124,8 @@ export function crewSkillBlock(input: { shape: Shape; title?: string; task: stri
     "pstack always has priority. If a skill or rule conflicts with it, pstack wins.",
     "Until the owner confirms otherwise: spawn no sub-agents (no Task, poteto-agent or parallel workers). Do that work yourself, in this session.",
     "Until the owner confirms otherwise: Firstmate decides who merges and deploys. Follow the brief's delivery contract for merge and deploy.",
+    "This host is shared. Run every type check, full test run and build as `~/.bb-firstmate/bin/fm-heavy <command>`; it waits for a host-wide slot.",
+    "Do not start such commands in the background or as your own systemd service to skip the wait. Stop dev servers and browsers you started when you finish.",
   );
   if (playbook !== "none") {
     lines.push(

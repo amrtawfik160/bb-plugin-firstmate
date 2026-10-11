@@ -172,8 +172,23 @@ BB-specific behavior in this fork:
 | `nudgeEnabled` | on | Doorbell idle crews that missed the status protocol |
 | `nudgeMaxPerCrew` | 3 | Nudges per crew task before NEEDS DECISION |
 | `nudgeCooldownSeconds` | 60 | Minimum gap between nudges for one crew |
-| `maxActiveCrews` | 10 | Concurrent crews per captain (0 = no cap). When `fmReliability.asyncDispatch` is on, over-cap work queues instead of refusing, and spawn uses quota-aware backoff |
+| `maxActiveCrews` | 10 | Concurrent crews per captain (0 = no cap). When `fmReliability.asyncDispatch` is on, over-cap work queues instead of refusing, and spawn uses quota-aware backoff. See [Host memory](#host-memory) before raising it |
 | `fmReliability` | empty JSON | Off-by-default flags. `inboundLedger` (`off`/`shadow`/`on`), `honestStatus`, `handoffContract`, `asyncDispatch`, `telegramThreading`. Telegram uses Amr's local Telegram v0.1.0 connector header and `telegram.reply` RPC; see [docs/telegram-bridge-contract.md](docs/telegram-bridge-contract.md) |
+
+### Host memory
+
+Crews on one host share its memory. Measured on 10 Oct on a 16-core, 31 GB
+host: 11 crews at once filled swap and the kernel killed 294 processes. A
+`maxActiveCrews` above 6 does not fit a 31 GB host when crews run type checks,
+full test runs and builds.
+
+`~/.bb-firstmate/bin/fm-heavy <command>` runs a heavy command in one of
+`FM_HEAVY_SLOTS` host-wide slots (default 2) and makes the others wait. Set
+`FM_HEAVY_SLOTS` in the environment that crews inherit to change the count.
+Every brief tells crews to use it, and the worker check helper runs a type
+check, test run or build under it. `fm-heavy --status` and
+`bb firstmate toolchain` show the slot count and how many commands hold or wait
+for a slot.
 
 ### Reliability flags
 
