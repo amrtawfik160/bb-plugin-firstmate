@@ -89,3 +89,6 @@ Other Firstmate rules:
   `~/.bb-firstmate/bin/fm-heavy <command>`. It waits for a free slot, then runs
   the command. Run small targeted tests directly. If `fm-heavy` is missing, run
   the command directly and say so in your report.
+- Do not start a heavy command in the background or as your own systemd
+  service to skip the wait. Stop the dev servers and browsers you started when
+  you finish.

@@ -22,7 +22,7 @@ async function until(predicate,ms) {
 
 function fixture() {
   const dir=mkdtempSync(join(tmpdir(),'fm-heavy-'));
-  return {dir,env:{FM_HEAVY_DIR:join(dir,'slots'),FM_HEAVY_SLOTS:'2'}};
+  return {dir,env:{FM_HEAVY_DIR:join(dir,'slots'),FM_HEAVY_SLOTS:'2',FM_HEAVY_HELD:''}};
 }
 
 test('four heavy commands share two slots: at most two overlap and all finish', async () => {

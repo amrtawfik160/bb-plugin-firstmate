@@ -10339,7 +10339,7 @@ export default async function plugin(bb: BbPluginApi) {
   const usage = [
     "Usage:",
     "  bb firstmate guide [--json]",
-    "  bb firstmate toolchain [--json]   # native AXI + Lavish compatibility and brief skills per provider, read-only",
+    "  bb firstmate toolchain [--json]   # native AXI + Lavish compatibility, fm-heavy slots and brief skills per provider, read-only",
     "  bb firstmate init [--real] [--machine m] [--path p] [--name n] [--json]",
     "  bb firstmate scripts [query] [--json]   # list + verify every installed fm-* script",
     "  bb firstmate fm [--timeout s] <script> [args...]   # real bin/fm-<script>.sh with FM_BACKEND=bb",
@@ -10538,7 +10538,19 @@ export default async function plugin(bb: BbPluginApi) {
     if (!current.fmHome.trim()) throw new Error("Initialize native Firstmate before checking its toolchain.");
     const hostId = current.fmHostId.trim() || await resolveHostId(undefined, ctx);
     const toolchain = await checkToolchain(hostId, current.fmHome.trim(), signal);
-    return { ...toolchain, output: [toolchain.output, await briefSkillReport(hostId, signal), ...unavailableProviderLines(await unavailableProviders(), Date.now())].join("\n") };
+    return { ...toolchain, output: [toolchain.output, await heavyLimiterReport(hostId, signal), await briefSkillReport(hostId, signal), ...unavailableProviderLines(await unavailableProviders(), Date.now())].join("\n") };
+  }
+
+  // Advisory: without the limiter a heavy command still runs, only unqueued.
+  async function heavyLimiterReport(hostId: string, signal?: AbortSignal): Promise<string> {
+    try {
+      const res = await runOnHost(hostId, '"$HOME/.bb-firstmate/bin/fm-heavy" --status', 15_000, signal);
+      const line = res.output.split("\n").find((row) => /^fm-heavy: \d+ slots, \d+ held, \d+ waiting$/.test(row.trim()));
+      if (res.exitCode === 0 && line !== undefined) return `Heavy commands (fm-heavy): ${line.trim().slice("fm-heavy: ".length)}`;
+      return `HEAVY_LIMITER_UNKNOWN: fm-heavy --status failed: ${truncate(res.output.trim(), 400)}`;
+    } catch (error) {
+      return `HEAVY_LIMITER_UNKNOWN: fm-heavy --status failed: ${error instanceof Error ? error.message : String(error)}`;
+    }
   }
 
   // Advisory: a missing skill never makes the toolchain unready, because a brief
