@@ -4731,6 +4731,7 @@ export default async function plugin(bb: BbPluginApi) {
       ...(input.ownerRequestedProvider === true ? { ownerRequestedProvider: true } : {}),
     };
     queueStore.add(queued);
+    queueStore.clearStartRefusal(queued);
     for (const key of input.sourceRefs ?? []) {
       const parsed = key.includes(":")
         ? { source: key.startsWith("tg:") ? "telegram" as const : "bb" as const, chatId: key.split(":")[1] ?? "", messageId: key.split(":").slice(2).join(":") }
@@ -4756,12 +4757,28 @@ export default async function plugin(bb: BbPluginApi) {
       try {
         await inCaptainHome(parent, () => dispatchQueueItem(item, parent, { threadId: parent, projectId: item.projectId }));
       } catch (error) {
+        // An unload interrupts the attempt; the row stays queued and the next load retries it.
+        if (launchAbort.signal.aborted) return;
         const message = error instanceof Error ? error.message : String(error);
         if (/Crew cap reached/.test(message)) continue;
-        bb.log.warn(`queued dispatch ${item.id}: ${message}`);
+        await recordStartRefusal(item, parent, message);
       }
     }
     resumeDispatchJobs(owner);
+  }
+  // The row stays queued and is retried each pass, so the refusal is logged when the
+  // reason changes and the captain is told once per job, not once per pass.
+  async function recordStartRefusal(item: QueueItem, captain: string, message: string): Promise<void> {
+    const reason = truncate(message, 300);
+    const known = queueStore.startRefusal(item);
+    if (known?.reason !== reason) {
+      bb.log.warn(`queued dispatch ${item.id}: ${message}`);
+      queueStore.refuseStart(item, reason);
+    }
+    if (known?.noticed === true) return;
+    const told = await deliverToCaptain(captain, `Queued dispatch ${item.id} (${truncate(item.title, 70)}) did not start by itself: ${reason} It stays queued and is retried every minute. Fix the cause, or drop it with firstmate_queue action=drop queueId=${item.id} and dispatch again.`, item.id, undefined, true)
+      .catch((error) => { bb.log.warn(`queued dispatch ${item.id} refusal notice: ${String(error)}`); return false; });
+    if (told) queueStore.noticeStartRefusal(item);
   }
   // A slot that opens when a crew fails, is stopped or is forgotten ends no crew turn,
   // so the per-minute pass drains too. One drain at a time, apart from that pass.
@@ -9334,11 +9351,19 @@ export default async function plugin(bb: BbPluginApi) {
   function validateQueueText(title:string,detail:string) {
     if (title.length > 500 || detail.length > MAX_TASK || (detail ? `${title}\n\n${detail}` : title).length > MAX_TASK) throw new Error(`Queue text exceeds limits (title 500, full task ${MAX_TASK} characters); nothing truncated or filed.`);
   }
+  // An over-cap dispatch stored its task whole as the detail, with a title beside it. It
+  // starts from that task alone, as it would have with a free slot, so a task that
+  // passed dispatch is never too long here. A row added by hand joins title and detail.
+  function queueBrief(item: QueueItem): string {
+    if (item.overCap === true && item.detail !== "") return item.detail;
+    const brief = item.detail !== "" ? `${item.title}\n\n${item.detail}` : item.title;
+    if (brief.length > MAX_TASK) throw new Error(`Queue task ${item.id} exceeds ${MAX_TASK} characters; full record retained, dispatch refused.`);
+    return brief;
+  }
   async function dispatchQueueItem(item: QueueItem, captain: string | undefined, ctx: unknown, overrides: { providerId?: string; model?: string; reasoningLevel?: string } = {}): Promise<Crew> {
     const registry = item.shape==="ship" ? await intakePosture(item.projectId,ctx,item.mode ? modeSchema.parse(item.mode) : undefined) : await postureOf(item.projectId);
     const current = await settings.get();
-    const brief = item.detail !== "" ? `${item.title}\n\n${item.detail}` : item.title;
-    if (brief.length > MAX_TASK) throw new Error(`Queue task ${item.id} exceeds ${MAX_TASK} characters; full record retained, dispatch refused.`);
+    const brief = queueBrief(item);
     const crew = await dispatchCrew({
       task: brief,
       projectId: item.projectId,
@@ -9366,12 +9391,15 @@ export default async function plugin(bb: BbPluginApi) {
     // (native transport, or real fell back to native). Over-cap items have no native row.
     if (current.transport !== "real" && item.overCap !== true) await projectQueueTransition(item, "start");
     queueStore.patch(item, {status:item.status,crewId:item.crewId});
+    queueStore.clearStartRefusal(item);
     await publishFleet();
     return crew;
   }
   // An over-cap dispatch waits for a slot, not for an explicit queue dispatch.
   function queueListLine(q: QueueItem, all: QueueItem[], now: number): string {
-    const gate = q.status === "queued" ? storedQueueGate(q, all, now) ?? (q.overCap === true ? "waiting for a crew slot; starts by itself" : null) : null;
+    const refused = q.status === "queued" && q.overCap === true ? queueStore.startRefusal(q) : undefined;
+    const waiting = refused !== undefined ? `[refused] ${refused.reason}` : "waiting for a crew slot; starts by itself";
+    const gate = q.status === "queued" ? storedQueueGate(q, all, now) ?? (q.overCap === true ? waiting : null) : null;
     return `${q.id} [${q.status}] ${q.shape} :: ${truncate(q.title, 70)}${gate !== null ? ` — ${gate}` : ""}${q.crewId !== null ? ` (crew ${q.crewId})` : ""}`;
   }
   function backgroundJobLines(captain: string | undefined, now: number): string[] {
@@ -13501,8 +13529,7 @@ export default async function plugin(bb: BbPluginApi) {
               if (gate !== null) return fail(`Item ${qid} gated: ${gate}.`);
 
               const registry = item.shape==="ship" ? await intakePosture(item.projectId,ctx,item.mode ? modeSchema.parse(item.mode) : undefined) : await postureOf(item.projectId);
-              const brief = item.detail !== "" ? `${item.title}\n\n${item.detail}` : item.title;
-              if (brief.length > MAX_TASK) throw new Error(`Queue task ${item.id} exceeds ${MAX_TASK} characters; full record retained, dispatch refused.`);
+              const brief = queueBrief(item);
               const crew = await dispatchCrew({
                 task: brief,
                 projectId: item.projectId,

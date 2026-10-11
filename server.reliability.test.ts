@@ -1064,3 +1064,115 @@ test("turning asyncDispatch off still starts the over-cap work and sends the doo
     await host.harness.lifecycle.dispose();
   }
 });
+
+const queuedWarns = (host: Host, id: string) => host.harness.logEntries
+  .filter((e) => e.level === "warn" && e.message.startsWith(`queued dispatch ${id}:`)).map((e) => e.message);
+const queueList = async (host: Host) => text(await tool(host, "firstmate_queue").execute({ action: "list" }, capCtx));
+
+test("an over-cap dispatch of the longest allowed task starts by itself when a slot opens", async () => {
+  for (const title of [undefined, "Fix the flaky login on the sign-in page"]) {
+    const host = await fullCaptainHost();
+    try {
+      let busy = true;
+      stubSpawn(host, (threadId) => (threadId === "thr_cap" || !busy ? "idle" : "active"));
+      const task = "x".repeat(4000);
+      const queued = await tool(host, "firstmate_dispatch").execute({ task, title, taskId: "job-long", projectId: "proj_1" }, capCtx);
+      assert.match(text(queued), /Queued as job-long/);
+      busy = false;
+      await captainIdle(host);
+      assert.deepEqual(queuedWarns(host, "job-long"), []);
+      assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 1, "the queued dispatch started");
+      assert.ok(JSON.stringify(host.harness.sdk.callsTo("threads.spawn")[0]).includes(task), "the crew gets the whole task");
+      assert.match(await queueList(host), /^job-long \[dispatched\]/m);
+    } finally {
+      await host.harness.lifecycle.dispose();
+    }
+  }
+});
+
+test("an over-cap dispatch whose start is refused shows as refused, tells the captain once and logs once per reason", async () => {
+  const host = await fullCaptainHost();
+  try {
+    let busy = true;
+    let providers: Array<{ id: string; available?: boolean }> = [{ id: "codex" }];
+    stubSpawn(host, (threadId) => (threadId === "thr_cap" || !busy ? "idle" : "active"));
+    host.harness.sdk.stub("providers.list", async () => providers);
+    const queued = await tool(host, "firstmate_dispatch").execute({ task: "fix flaky login", taskId: "job-stuck", projectId: "proj_1", providerId: "codex" }, capCtx);
+    assert.match(text(queued), /Queued as job-stuck/);
+    assert.match(await queueList(host), /^job-stuck \[queued\] ship :: fix flaky login — waiting for a crew slot; starts by itself/m);
+    busy = false;
+    const notices = () => captainSends(host).filter((sent) => /job-stuck/.test(sent));
+
+    providers = [{ id: "codex", available: false }];
+    for (let pass = 0; pass < 3; pass++) await captainIdle(host);
+    const list = await queueList(host);
+    assert.match(list, /^job-stuck \[queued\] ship :: fix flaky login — \[refused\] .*Provider "codex" is installed but not available on this host/m);
+    assert.doesNotMatch(list, /starts by itself/);
+    assert.equal(notices().length, 1, notices().join("\n"));
+    assert.match(notices()[0]!, /did not start by itself: .*Provider \\"codex\\" is installed but not available/);
+    assert.equal(queuedWarns(host, "job-stuck").length, 1, queuedWarns(host, "job-stuck").join("\n"));
+
+    providers = [{ id: "claude-code" }];
+    for (let pass = 0; pass < 3; pass++) await captainIdle(host);
+    assert.match(await queueList(host), /^job-stuck \[queued\] .* — \[refused\] .*Unknown providerId "codex"/m);
+    assert.equal(queuedWarns(host, "job-stuck").length, 2, "a new reason is logged once");
+    assert.equal(notices().length, 1, "one notice per job");
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
+
+    providers = [{ id: "codex" }];
+    await captainIdle(host);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 1, "it starts once the cause is fixed");
+    const after = await queueList(host);
+    assert.match(after, /^job-stuck \[dispatched\]/m);
+    assert.doesNotMatch(after, /\[refused\]/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("an over-cap dispatch whose project is gone when a slot opens shows as refused and tells the captain", async () => {
+  const host = await fullCaptainHost();
+  try {
+    let busy = true;
+    stubSpawn(host, (threadId) => (threadId === "thr_cap" || !busy ? "idle" : "active"));
+    await tool(host, "firstmate_dispatch").execute({ task: "fix flaky login", taskId: "job-gone", projectId: "proj_1" }, capCtx);
+    busy = false;
+    host.harness.sdk.stub("environments.list", async () => { throw new Error("Project proj_1 not found"); });
+    for (let pass = 0; pass < 2; pass++) await captainIdle(host);
+    assert.match(await queueList(host), /^job-gone \[queued\] .* — \[refused\] .*Project proj_1 not found/m);
+    assert.equal(captainSends(host).filter((sent) => /job-gone/.test(sent)).length, 1);
+    assert.equal(queuedWarns(host, "job-gone").length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a refused over-cap dispatch stays marked refused while it waits for a slot again", async () => {
+  const host = await fullCaptainHost();
+  try {
+    let busy = true;
+    stubSpawn(host, (threadId) => (threadId === "thr_cap" || !busy ? "idle" : "active"));
+    host.harness.sdk.stub("threads.spawn", async () => { throw new Error("Host is not connected"); });
+    await tool(host, "firstmate_dispatch").execute({ task: "fix flaky login", taskId: "job-stuck", projectId: "proj_1" }, capCtx);
+    busy = false;
+    await captainIdle(host);
+    busy = true;
+    await captainIdle(host);
+    assert.match(await queueList(host), /^job-stuck \[queued\] .* — \[refused\] .*Host is not connected/m);
+    assert.equal(queuedWarns(host, "job-stuck").length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a queue row added by hand is still refused at add time when title and detail together are too long", async () => {
+  const host = await knownCaptainHost();
+  try {
+    const added = await tool(host, "firstmate_queue").execute({ action: "add", title: "tidy the docs", detail: "x".repeat(3995) }, capCtx);
+    assert.ok(isError(added), text(added));
+    assert.match(text(added), /Queue text exceeds limits/);
+    assert.match(await queueList(host), /Queue empty/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
