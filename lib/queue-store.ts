@@ -26,6 +26,7 @@ export const queueKey=(row:Pick<QueueItem,'id'|'parentThreadId'|'projectId'>)=>J
 export function createQueueStore(db:Database, legacy:()=>Promise<unknown>) {
   db.exec(`CREATE TABLE IF NOT EXISTS queue_records (key TEXT PRIMARY KEY, owner TEXT, project TEXT NOT NULL, ordinal INTEGER NOT NULL UNIQUE, record TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS queue_owner ON queue_records(owner,ordinal);
+    CREATE TABLE IF NOT EXISTS queue_start_refusals (key TEXT PRIMARY KEY, reason TEXT NOT NULL, noticed INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS queue_migration (id INTEGER PRIMARY KEY CHECK(id=1), original TEXT NOT NULL, sha256 TEXT NOT NULL, count INTEGER NOT NULL);`);
   const migrated=()=>!!db.prepare('SELECT 1 FROM queue_migration WHERE id=1').get();
   let pending:Promise<void>|undefined;
@@ -106,5 +107,17 @@ export function createQueueStore(db:Database, legacy:()=>Promise<unknown>) {
       return count;
     })();
   }
-  return {ready,get,list,add,patch,transform};
+  // Why the last automatic start of an over-cap dispatch was refused. Kept beside the
+  // record, not in it: the record schema is strict, so an older plugin could not read it.
+  type Identity=Pick<QueueItem,'id'|'parentThreadId'|'projectId'>;
+  function startRefusal(row:Identity):{reason:string;noticed:boolean}|undefined {
+    const found=db.prepare('SELECT reason,noticed FROM queue_start_refusals WHERE key=?').get(queueKey(row)) as {reason:string;noticed:number}|undefined;
+    return found?{reason:found.reason,noticed:found.noticed===1}:undefined;
+  }
+  function refuseStart(row:Identity,reason:string) {
+    db.prepare('INSERT INTO queue_start_refusals (key,reason) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET reason=excluded.reason').run(queueKey(row),reason);
+  }
+  function noticeStartRefusal(row:Identity) { db.prepare('UPDATE queue_start_refusals SET noticed=1 WHERE key=?').run(queueKey(row)); }
+  function clearStartRefusal(row:Identity) { db.prepare('DELETE FROM queue_start_refusals WHERE key=?').run(queueKey(row)); }
+  return {ready,get,list,add,patch,transform,startRefusal,refuseStart,noticeStartRefusal,clearStartRefusal};
 }
