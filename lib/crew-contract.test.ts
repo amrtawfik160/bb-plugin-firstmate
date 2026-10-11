@@ -29,6 +29,11 @@ const HOUSE_RULES = [
   "Until the owner confirms otherwise: Firstmate decides who merges and deploys. Follow the brief's delivery contract for merge and deploy.",
 ];
 
+const HOST_LIMIT = [
+  "This host is shared. Run every type check, full test run and build as `~/.bb-firstmate/bin/fm-heavy <command>`; it waits for a host-wide slot.",
+  "Do not start such commands in the background or as your own systemd service to skip the wait. Stop dev servers and browsers you started when you finish.",
+];
+
 test("the playbook comes from the dispatch title, not the task body", () => {
   const body = "Fix the failing error, then deploy and merge.";
   for (const [title, playbook] of [
@@ -71,6 +76,7 @@ test("a feature brief gives full paths, the step checklist, no-comments and the 
     `Skills on this host are in \`${HOME}/.claude/skills/<name>/SKILL.md\`. Load a skill by reading that file. Do not rely on a Skill tool for pstack skills; they are user-invocable only.`,
     "If a skill is not installed, continue and say so in your report.",
     ...HOUSE_RULES,
+    ...HOST_LIMIT,
     ...IN_PLACE_OF_A_SKIP,
     "Save each screenshot as its own full-size PNG file. Never combine, stitch or downscale screenshots; link each file separately.",
     `Before you open a PR, run /no-comments (\`${HOME}/.claude/skills/no-comments/SKILL.md\`) over your diff.`,
@@ -309,12 +315,25 @@ test("the live skill check reports each installed provider's missing skills and 
   }
 });
 
+// 10 Oct: three 8 GB type checks ran at once outside the limiter, and checks
+// started as crew-owned systemd services ran outside the crews' memory group.
+test("every brief sends heavy commands through the host limiter, for every provider, shape and playbook", () => {
+  for (const providerId of ["claude-code", "codex", "acp-cursor", "acp-grok", "acp-antigravity", "pi", null]) {
+    for (const shape of ["ship", "scout"] as const) {
+      for (const playbook of PLAYBOOK_CHOICES) {
+        const block = crewSkillBlock({ shape, title: "x", task: "", providerId, playbook });
+        assert.ok(block.includes(HOST_LIMIT.join("\n")), `${providerId} ${shape} ${playbook}`);
+      }
+    }
+  }
+});
+
 test("the block stays short for every provider, shape and playbook", () => {
   for (const providerId of ["claude-code", "codex", "acp-grok", "acp-antigravity", "pi"]) {
     for (const shape of ["ship", "scout"] as const) {
       for (const playbook of PLAYBOOK_CHOICES) {
         const size = crewSkillBlock({ shape, title: "x", task: "", providerId, playbook }).length;
-        assert.ok(size <= 2700, `${providerId} ${shape} ${playbook}: ${size} characters`);
+        assert.ok(size <= 3000, `${providerId} ${shape} ${playbook}: ${size} characters`);
       }
     }
   }

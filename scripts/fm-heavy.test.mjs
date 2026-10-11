@@ -105,3 +105,46 @@ test('without flock the command still runs, with a warning', async () => {
     assert.match(r.stderr,/fm-heavy: flock not found/);
   } finally { rmSync(dir,{recursive:true,force:true}); }
 });
+
+function status(env) {
+  return new Promise(resolveDone=>{
+    const child=spawn('/bin/bash',[heavy,'--status'],{env:{...process.env,...env},stdio:['ignore','pipe','pipe']});
+    let stdout='';child.stdout.on('data',chunk=>{stdout+=chunk;});
+    child.on('close',code=>resolveDone({code,stdout:stdout.trim()}));
+  });
+}
+
+test('--status reports the slot count and how many commands hold or wait for a slot', async () => {
+  const {dir,env}=fixture();
+  try {
+    const one={...env,FM_HEAVY_SLOTS:'1'};
+    assert.deepEqual(await status(one),{code:0,stdout:'fm-heavy: 1 slots, 0 held, 0 waiting'});
+    const marker=join(dir,'started');
+    const holder=run(['bash','-c',`touch ${marker}; exec sleep 30`],one);
+    assert.ok(await until(()=>existsSync(marker),5000),'holder started');
+    const waiters=[run(['true'],one),run(['true'],one)];
+    let seen='';
+    for(const deadline=Date.now()+5000;Date.now()<deadline&&seen!=='fm-heavy: 1 slots, 1 held, 2 waiting';)seen=(await status(one)).stdout;
+    assert.equal(seen,'fm-heavy: 1 slots, 1 held, 2 waiting');
+    for(const waiter of waiters)waiter.child.kill('SIGKILL');
+    await Promise.all(waiters.map(w=>w.done));
+    for(const deadline=Date.now()+5000;Date.now()<deadline&&seen!=='fm-heavy: 1 slots, 1 held, 0 waiting';)seen=(await status(one)).stdout;
+    assert.equal(seen,'fm-heavy: 1 slots, 1 held, 0 waiting','a killed waiter is not counted');
+    holder.child.kill('SIGTERM');await holder.done;
+    assert.equal((await status(one)).stdout,'fm-heavy: 1 slots, 0 held, 0 waiting');
+    assert.equal((await status({...env,FM_HEAVY_SLOTS:'3'})).stdout,'fm-heavy: 3 slots, 0 held, 0 waiting');
+  } finally { rmSync(dir,{recursive:true,force:true}); }
+});
+
+test('a heavy command that runs fm-heavy itself keeps its one slot and does not wait for a second', async () => {
+  const {dir,env}=fixture();
+  try {
+    const one={...env,FM_HEAVY_SLOTS:'1'};
+    const outer=run(['/bin/bash',heavy,'bash','-c','exit 6'],one);
+    const result=await Promise.race([outer.done,new Promise(r=>setTimeout(()=>r('timeout'),5000))]);
+    if(result==='timeout')outer.child.kill('SIGKILL');
+    assert.notEqual(result,'timeout','the nested call runs at once');
+    assert.equal(result.code,6);
+    assert.doesNotMatch(result.stderr,/waiting for a heavy-check slot/);
+  } finally { rmSync(dir,{recursive:true,force:true}); }
+});

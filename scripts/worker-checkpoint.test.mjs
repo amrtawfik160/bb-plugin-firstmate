@@ -70,6 +70,31 @@ test('background validation records paused before execution and resolves its exa
  }finally{f.close();}
 });
 
+test('a type check, test run or build started through the check helper runs under the host limiter; other commands and already limited commands run as given',()=>{
+ const f=fixture();try {
+  const log=join(f.dir,'heavy.log'),limiter=join(f.bin,'fm-heavy');
+  writeFileSync(limiter,`#!/bin/bash\necho "$*" >> ${log}\nexec "$@"\n`,{mode:0o755});
+  for(const tool of ['tsc','vitest','fake-bun'])writeFileSync(join(f.bin,tool),'#!/bin/bash\necho ran "$@"\n',{mode:0o755});
+  f.env.FM_HEAVY_BIN=limiter;f.setup();
+  const cases=[[['tsc','-b'],true],[['vitest','run'],true],[['fake-bun','run','typecheck'],true],[['fake-bun','run','build'],true],[['fake-bun','run','test:unit'],true],
+   [['python3','-c','print("quick probe")'],false],[['fake-bun','run','lint'],false],[[limiter,'tsc','-b'],'given']];
+  for(const [command] of cases)f.ok('check','check','--',...command);
+  const logged=readFileSync(log,'utf8').trim().split('\n');
+  assert.deepEqual(logged,[...cases.filter(([,heavy])=>heavy===true).map(([command])=>command.join(' ')),'tsc -b']);
+  const rows=f.checks();assert.equal(rows.length,cases.length);
+  for(const row of rows){assert.equal(row.exitCode,0);assert.equal(row.limited===true,cases.find(([command])=>command.join(' ')===row.command.join(' '))[1]===true,row.command.join(' '));}
+ }finally{f.close();}
+});
+
+test('without an installed limiter a heavy check still runs',()=>{
+ const f=fixture();try {
+  writeFileSync(join(f.bin,'tsc'),'#!/bin/bash\necho ran "$@"\n',{mode:0o755});
+  f.env.FM_HEAVY_BIN=join(f.dir,'absent');f.setup();f.ok('check','types','--','tsc','-b');
+  const [row]=f.checks();assert.equal(row.exitCode,0);assert.notEqual(row.limited,true);
+  assert.match(readFileSync(join(f.data,'checks',`${row.id}.log`),'utf8'),/ran -b/);
+ }finally{f.close();}
+});
+
 test('validation reports failure and resolves waits when command startup fails',()=>{
  const f=fixture();try {
   f.setup();f.ok('check','missing executable','--','/nonexistent/fm-check-fixture');const [row]=f.checks();
