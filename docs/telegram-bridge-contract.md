@@ -99,7 +99,10 @@ One owner message with several questions gets one reply per question. Pass
 `quote` with the exact words of the question; Firstmate forwards it to the
 `reply` RPC, and the connector sends it as Telegram `reply_parameters.quote`.
 Each different quote is its own reply and its own duplicate guard. `more=true`
-keeps the item open for the next reply.
+keeps the item open for the next reply. After a `more=true` reply without a
+quote, a later reply to the same item with a different text is sent as its own
+reply; the same text again is not sent. An item that got its final reply takes
+no further unquoted reply.
 
 `firstmate_reply` refuses, before anything is reserved or sent, a text that asks the
 owner to decide: option lines `A.` / `B.` (or `A)`, or `(A ... / B ...)`) with a

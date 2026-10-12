@@ -239,7 +239,7 @@ export function askLetterAnswer(ask: Pick<OwnerAsk, "options">, text: string): s
 }
 
 /** Re-sent to the captain every turn and printed at session start, so it survives a compaction. */
-export const OWNER_DECISION_RULE = "Send every decision, approval or blocker for the owner with firstmate_ask, one question per card, never as plain text in firstmate_reply or closing text. Decide reversible choices yourself and say in one sentence what you chose. Open cards are on the owner's board, so reports do not repeat them.";
+export const OWNER_DECISION_RULE = "Send every decision, approval or blocker for the owner with firstmate_ask, one question per card, never as plain text in firstmate_reply or closing text. Decide reversible choices yourself and say in one sentence what you chose. Open cards are on the owner's board, so reports do not repeat them. Full rules: firstmate_skill name=captain reference=references/telegram.md.";
 
 export const PLAIN_DECISION_GUIDANCE = "Send each decision with firstmate_ask: one question per card, option text in options, the recommended option first. Then send the report without the question. Open cards are on the owner's board, so a report does not list or count them.";
 

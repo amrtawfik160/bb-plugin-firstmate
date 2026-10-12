@@ -2,7 +2,7 @@
 import { deflateSync } from "node:zlib";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type BbPluginApi } from "@get-bb/plugin-sdk";
@@ -70,7 +70,7 @@ import { createDoorbellHold, doorbellHoldDecision } from "./lib/doorbell-hold.ts
 import { createRetryLedger, type RetryItem, type RetryKind } from "./lib/retry-ledger.ts";
 import { HANDOFF_WAKE_AMENDMENT, captainInstructionsWithHandoff } from "./lib/handoff-contract.ts";
 import { honestIdleVerdictPresentation, interruptIsStopped, readyClaim } from "./lib/honest-status.ts";
-import { ACK_TEXT, ackEligible, createInboundLedger, expandTelegramRows, formatOwnerInbox, inboundKey, quotedReplyKind, sweeperSteerText, type InboundRow } from "./lib/inbound-ledger.ts";
+import { ACK_TEXT, ackEligible, createInboundLedger, expandTelegramRows, followUpReplyKind, formatOwnerInbox, hashText, inboundKey, quotedReplyKind, sweeperSteerText, type InboundRow } from "./lib/inbound-ledger.ts";
 import { inboundHookDecision } from "./lib/inbound-dispatch.ts";
 import { formatWorkersForTelegram } from "./lib/telegram-commands.ts";
 import { digestOnce, EMPTY_DIGEST_MEMORY, formatBoard, type BoardInput, type DigestMemory } from "./lib/owner-board.ts";
@@ -10545,7 +10545,22 @@ export default async function plugin(bb: BbPluginApi) {
     } finally {await runHostCommand(host,`rm -f ${shQuote(helper)}`,1000).catch(()=>{});}
   }
 
+  // The captain, firstmate and skill-routing skills are the plugin's own files, not native policy:
+  // no selected runtime holds them, so they are read from the plugin.
+  function readEntrySkill(name:string,reference?:string,source?:string) {
+    const root=join(PLUGIN_ROOT,"entry-skills");
+    const resource=nativeSkillPath(name,reference,source ?? `entry-skills/${name}/SKILL.md`);
+    const inside=resource.path.startsWith("entry-skills/") ? resource.path.slice("entry-skills/".length) : null;
+    const file=inside===null ? null : join(root,inside);
+    if (file===null || !resource.path.endsWith(".md") || !existsSync(file) || !lstatSync(file).isFile() || realpathSync(file)!==join(realpathSync(root),inside!)) {
+      const references=join(root,name,"references");
+      const known=existsSync(references) ? readdirSync(references).filter(entry=>entry.endsWith(".md")).sort().map(entry=>`references/${entry}`) : [];
+      throw new Error(`No file ${resource.path} in the Firstmate plugin skill ${name}. Read it with firstmate_skill name=${name}${known.length ? ` reference=<one of: ${known.join(", ")}>` : ""}.`);
+    }
+    return `Firstmate plugin skill: ${resource.path}\nSource file (--source): ${resource.path}\n\n${readFileSync(file,"utf8")}`;
+  }
   async function readNativeSkill(ctx:unknown,name:string,reference?:string,source?:string) {
+    if ((/^[a-z0-9][a-z0-9-]{0,100}$/.test(name) && existsSync(join(PLUGIN_ROOT,"entry-skills",name,"SKILL.md"))) || source?.startsWith("entry-skills/")) return readEntrySkill(name,reference,source);
     const resource=nativeSkillPath(name,reference,source);
     const signal=AbortSignal.any([launchAbort.signal,AbortSignal.timeout(30_000),...(asRecord(ctx)["signal"]?[asRecord(ctx)["signal"] as AbortSignal]:[])]);
     const current=await raceAbort(settings.get(),signal,STUCK_HOST_CALL_MS),captain=ctxString(ctx,"threadId");
@@ -10641,7 +10656,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   registerCaptainTool({
-    name:"firstmate_skill",description:"Read a complete native policy skill or reference from this captain’s selected runtime; both audited revisions supported, no global copied policy fallback.",
+    name:"firstmate_skill",description:"Read a complete native policy skill or reference from this captain’s selected runtime; both audited revisions supported, no global copied policy fallback. The plugin's own captain, firstmate and skill-routing skills and their references are read by name too, for example name=captain reference=references/telegram.md.",
     parameters:z.object({name:z.string(),reference:z.string().optional().describe("Native relative link, including .. and #fragment inside selected runtime; returns complete document"),source:z.string().optional().describe("Exact selected-root relative source file for nested links; default .agents/skills/<name>/SKILL.md")}),
     async execute({name,reference,source},ctx){return readNativeSkill(ctx,name,reference,source);},
   });
@@ -10895,12 +10910,18 @@ export default async function plugin(bb: BbPluginApi) {
       if (decision !== null) {
         return toolError(`Not sent: this reply asks the owner to decide in plain text (${decision}). ${PLAIN_DECISION_GUIDANCE} If the text asks the owner to decide nothing, send it again with notADecision=true. ${used} stays open.`);
       }
-      const claimKind = quotedReplyKind(quote);
+      let claimKind = quotedReplyKind(quote);
       const body = row.source === "telegram"
         ? telegramReplyFallbackBody({ chatId: row.chatId, messageId: row.messageId, kind: "reply", text: stripTelegramEnvelope(text), threadId: row.topicId })
         : text;
       // Reserve first so a concurrent or repeated reply never reaches Telegram twice.
-      if (!inboundLedger.claimOutbox(row, claimKind, body, Date.now()).sent) {
+      let claim = inboundLedger.claimOutbox(row, claimKind, body, Date.now());
+      // more=true left the message open: a different text is the next reply to it, the same text is a repeat.
+      if (!claim.sent && !quote && row.state !== "answered" && claim.existing?.contentHash !== hashText(body)) {
+        claimKind = followUpReplyKind(body);
+        claim = inboundLedger.claimOutbox(row, claimKind, body, Date.now());
+      }
+      if (!claim.sent) {
         return quote ? `Already replied to ${used} for that quote.` : `Already replied to ${used}.`;
       }
       let channel: "rpc" | "envelope" = "envelope";
