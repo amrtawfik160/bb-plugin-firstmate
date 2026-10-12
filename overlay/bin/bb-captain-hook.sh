@@ -120,7 +120,11 @@ case "$mode" in
       /^WARNING: queued wakes pending - drain them/ { point(); next }
       { print }
     '
-    exit "${PIPESTATUS[0]}"
+    rc=${PIPESTATUS[0]}
+    # A compaction summary dropped this rule on 10 Oct 2026 and the question cards stopped.
+    # Keep the sentence equal to OWNER_DECISION_RULE in lib/owner-asks.ts.
+    printf '\nOWNER DECISIONS\n---------------\n%s\n' "Send every decision, approval or blocker for the owner with firstmate_ask, one question per card, never as plain text in firstmate_reply or closing text. Decide reversible choices yourself and say in one sentence what you chose. Open cards are on the owner's board, so reports do not repeat them."
+    exit "$rc"
     ;;
 esac
 exit 0

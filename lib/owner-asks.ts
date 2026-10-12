@@ -237,3 +237,32 @@ export function askLetterAnswer(ask: Pick<OwnerAsk, "options">, text: string): s
   const letter = /^([a-z])\.?$/i.exec(text.trim())?.[1]?.toUpperCase();
   return letter ? ask.options[letter.charCodeAt(0) - 65]?.label ?? null : null;
 }
+
+/** Re-sent to the captain every turn and printed at session start, so it survives a compaction. */
+export const OWNER_DECISION_RULE = "Send every decision, approval or blocker for the owner with firstmate_ask, one question per card, never as plain text in firstmate_reply or closing text. Decide reversible choices yourself and say in one sentence what you chose. Open cards are on the owner's board, so reports do not repeat them.";
+
+export const PLAIN_DECISION_GUIDANCE = "Send each decision with firstmate_ask: one question per card, option text in options, the recommended option first. Then send the report without the question. Open cards are on the owner's board, so a report does not list or count them.";
+
+// "A. text", "B) text", also behind a bullet or bold marks.
+const OPTION_LINE = /^[ \t]*(?:[-*•][ \t]+)?(?:\*\*|__)?([A-D])[.)](?:\*\*|__)?[ \t]+\S/gm;
+// "(A send, recommended / B change the wording first)"
+const INLINE_OPTIONS = /\(\s*A\b[^()\n]*\/\s*B\b[^()\n]*\)/;
+// Words that say a decision is waiting, with or without options.
+const WAITING_DECISION = /\bI need (?:\d+|an?|one|two|three|your) decisions? from you\b|\b(?:\d+|one|two|three) decisions? (?:wait|waits|are waiting|is waiting) for you\b|^[ \t]*Still open with you\b/im;
+const DECISION_CUE = /^[ \t]*(?:Decision|Question|Decision needed)[ \t]*:/im;
+
+/** What makes a plain-text message a decision for the owner, or null. Such a message belongs in firstmate_ask. */
+export function plainTextDecision(text: string): string | null {
+  const waiting = WAITING_DECISION.exec(text)?.[0].trim();
+  if (waiting) return `it says "${waiting}"`;
+  const letters = new Set([...text.matchAll(OPTION_LINE)].map((match) => match[1]));
+  const options = (letters.has("A") && letters.has("B")) || INLINE_OPTIONS.test(text);
+  if (!options) return null;
+  if (DECISION_CUE.test(text)) return "it lists options A and B under a decision or question heading";
+  return text.includes("?") ? "it asks a question and lists options A and B" : null;
+}
+
+/** The owner asked to see options, drafts or their open decisions, so a reply that lists them is the answer. */
+export function ownerAskedForOptions(ownerText: string): boolean {
+  return /\b(?:options?|choices|alternatives|drafts?|versions|variants|decisions?)\b/i.test(ownerText);
+}

@@ -8374,7 +8374,7 @@ test("captain session-start hook runs native session start only in the captain's
     writeFileSync(marker, `home=${fm}\nstate=${fm}/state\nown_home=1\n`);
     const own = runCaptainHook(home, "session-start", '{"source":"startup"}', "thr_cap");
     assert.equal(own.status, 0);
-    assert.equal(own.stdout.trim(), `ran ${fm} bb ${fm} ${fm} {"source":"startup"}`);
+    assert.equal(own.stdout, `ran ${fm} bb ${fm} ${fm} {"source":"startup"}\n\nOWNER DECISIONS\n---------------\n${OWNER_DECISION_RULE}\n`);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

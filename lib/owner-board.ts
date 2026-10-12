@@ -72,8 +72,15 @@ function doneTail(task: OwnerTask): string {
   return task.state === "dropped" ? `dropped: ${clip(task.dropReason ?? "", 60)}` : task.state;
 }
 
-/** Sort every fact once; the board and the digest pick from the same lists. */
-function collect(input: BoardInput, ref: PrRef) {
+/** What earlier digests already told the owner. `done` maps a finished item to the `since` of the
+ * digest that first listed it. */
+export type DigestMemory = { done: Record<string, number>; stale: { ids: string[]; at: number; since: number } | null };
+export const EMPTY_DIGEST_MEMORY: DigestMemory = { done: {}, stale: null };
+export const DIGEST_STALE_REPEAT_MS = 24 * 60 * 60_000;
+
+/** Sort every fact once; the board and the digest pick from the same lists. `listDone` drops
+ * finished items an earlier digest listed. */
+function collect(input: BoardInput, ref: PrRef, listDone: (key: string) => boolean = () => true) {
   const linkedTo = new Map(input.tasks.map((task) => [task.id, new Set(linkedPrs(task, input.records).map((r) => r.id))]));
   const linked = new Set([...linkedTo.values()].flatMap((ids) => [...ids]));
   const open = boardPullRequests(input.records).sort((a, b) => a.openedAt - b.openedAt || a.ref.localeCompare(b.ref));
@@ -91,10 +98,12 @@ function collect(input: BoardInput, ref: PrRef) {
   const doneTasks = tasks.filter((task) => DONE_STATES.has(task.state) && !(task.state === "dropped" && /duplicate|merged into T\d+/i.test(task.dropReason ?? "")) && task.updatedAt >= input.since).sort((a, b) => b.updatedAt - a.updatedAt || byNumber(b, a));
   // A record's updatedAt is the last time it was observed; for a merged PR that is close to its merge.
   const mergedPrs = input.records.filter((r) => r.forgeState === "merged" && r.updatedAt >= input.since && !linked.has(r.id)).sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id));
-  const done = [
-    ...doneTasks.map((task) => taskLine(task, input.now, ref, { tail: doneTail(task) })),
-    ...mergedPrs.map((r) => prLine({ ref: r.id, url: r.url, ...(r.title ? { title: r.title } : {}), state: "merged", needsOwner: false, openedAt: r.openedAt ?? r.updatedAt }, ref)),
-  ].map((line) => `- ${line}`);
+  const finished = [
+    ...doneTasks.map((task) => ({ key: `${task.id}:${task.state}`, line: taskLine(task, input.now, ref, { tail: doneTail(task) }) })),
+    ...mergedPrs.map((r) => ({ key: r.id, line: prLine({ ref: r.id, url: r.url, ...(r.title ? { title: r.title } : {}), state: "merged", needsOwner: false, openedAt: r.openedAt ?? r.updatedAt }, ref) })),
+  ];
+  const listed = finished.filter((item) => listDone(item.key));
+  const done = listed.map((item) => `- ${item.line}`);
   const working = tasks.filter((task) => task.state === "working");
   const otherPrs = open.filter((pr) => !linked.has(pr.ref) && !pr.needsOwner);
   const inProgress = [
@@ -106,6 +115,8 @@ function collect(input: BoardInput, ref: PrRef) {
     asks,
     needsYou: { count: needsYou.length, lines: needsYou },
     done: { count: done.length, lines: done },
+    finishedKeys: finished.map((item) => item.key),
+    listedKeys: listed.map((item) => item.key),
     inProgress: { count: working.length, lines: inProgress },
     stale,
   };
@@ -149,7 +160,27 @@ export function formatBoard(input: BoardInput): string {
 
 /** A short catch-up for the owner; empty when there is nothing to say. */
 export function formatDigest(input: BoardInput): string {
-  const facts = collect(input, plainRef);
+  return digestText(collect(input, plainRef), true);
+}
+
+/** The digest without what an earlier digest already said: a finished item is listed once, and an
+ * unchanged stale list once per day. The same `since` again means the earlier digest was not
+ * sent, so its items are listed again. */
+export function digestOnce(input: BoardInput, memory: DigestMemory): { text: string; memory: DigestMemory } {
+  const facts = collect(input, plainRef, (key) => memory.done[key] === undefined || memory.done[key] === input.since);
+  const last = memory.stale;
+  const showStale = last === null || last.since === input.since || last.ids.join() !== facts.stale.join() || input.now - last.at >= DIGEST_STALE_REPEAT_MS;
+  // Lines past the cap were not shown, so they stay new for the next digest.
+  const shown = new Set(facts.listedKeys.slice(0, BOARD_MAX_DONE));
+  const done = Object.fromEntries(facts.finishedKeys.flatMap((key) => {
+    const since = shown.has(key) ? memory.done[key] ?? input.since : memory.done[key];
+    return since === undefined ? [] : [[key, since]];
+  }));
+  const stale = facts.stale.length === 0 ? null : showStale ? { ids: facts.stale, at: input.now, since: input.since } : last;
+  return { text: digestText(facts, showStale), memory: { done, stale } };
+}
+
+function digestText(facts: ReturnType<typeof collect>, showStale: boolean): string {
   const stale = facts.stale.length > DIGEST_MAX_STALE ? [...facts.stale.slice(0, DIGEST_MAX_STALE), "…"] : facts.stale;
   const sections: Section[] = [
     { title: "Needs you", empty: "", cap: DIGEST_MAX_NEEDS_YOU, items: facts.needsYou },
@@ -157,7 +188,7 @@ export function formatDigest(input: BoardInput): string {
   ].filter((section) => section.items.count > 0);
   const blocks = [
     ...(sections.length > 0 ? [fit(sections, BOARD_MAX_CHARS)] : []),
-    ...(facts.stale.length > 0 ? [`Stale (${facts.stale.length}): ${stale.join(", ")}`] : []),
+    ...(showStale && facts.stale.length > 0 ? [`Stale (${facts.stale.length}): ${stale.join(", ")}`] : []),
   ];
   return blocks.join("\n\n");
 }
