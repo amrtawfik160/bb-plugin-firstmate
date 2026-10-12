@@ -1176,3 +1176,88 @@ test("a queue row added by hand is still refused at add time when title and deta
     await host.harness.lifecycle.dispose();
   }
 });
+
+function recordOwnerText(host: Host, messageId: string, words: string) {
+  const body = envelope("live-owner").replace("telegram_message_id: 1669", `telegram_message_id: ${messageId}`).replace(/Status\?$/, words);
+  return createInboundLedger(host.bb.storage.database()).record({
+    captainThreadId: "thr_cap", text: body, receivedAt: 1_000, bbThreadId: "thr_cap", initiator: "user", telegram: parseInboundTelegram(body),
+  })!;
+}
+
+const RELEASE_QUESTION = "Question: release the change that shows a plain icon first and the animated agent face after (#2284)?\n\nA. No, do not release it. I recommend this.\nB. Yes, release it.\n\nUntil you answer, #2284 is not released.";
+
+test("Oct 11 repro: firstmate_reply refuses a plain-text decision before anything reaches Telegram", async () => {
+  const host = await load();
+  try {
+    await telegramFlags(host);
+    recordOwnerText(host, "1669", "Status?");
+    host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
+    const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
+    const send = (words: string, extra: Record<string, unknown> = {}) => tool(host, "firstmate_reply").execute({ ref: "tg:200:1669", text: words, ...extra }, ctx);
+    for (const words of [
+      RELEASE_QUESTION,
+      "Three items need fixes before release. I need 1 decision from you for StraightLine.\n\nDecision: go for the StraightLine call notes (orders 8 to 11) or hold them until the recording fix is live.",
+      "Still open with you:\n\nSend the draft and the 2 card files to Jasher (A send, recommended / B change the wording first)",
+      "Recap: all finished Cyndra work is live. 12 decisions wait for you.",
+    ]) {
+      const refused = await send(words);
+      assert.ok(isError(refused), words);
+      assert.match(text(refused), /Not sent/);
+      assert.match(text(refused), /firstmate_ask/);
+      assert.match(text(refused), /without the question/);
+    }
+    assert.equal(host.harness.sdk.callsTo("plugins.callRpc").length, 0, "nothing was sent to the connector");
+    assert.equal(ledgerRow(host, "1669")?.state, "received", "the owner message stays open");
+    const report = await send("Results of the cards you answered:\n\nA: the plain icon change is released (#2284).\nB: the StraightLine call notes are on hold.", { more: true });
+    assert.ok(!isError(report), text(report));
+    const forced = await send(RELEASE_QUESTION, { notADecision: true, quote: "Status?" });
+    assert.ok(!isError(forced), text(forced));
+    assert.equal(host.harness.sdk.callsTo("plugins.callRpc").length, 2);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("firstmate_reply sends options and drafts the owner asked for", async () => {
+  const host = await load();
+  try {
+    await telegramFlags(host);
+    recordOwnerText(host, "1670", "what are my options");
+    recordOwnerText(host, "1671", "Draft 2 replies to Jasher for me");
+    host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
+    const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
+    const options = await tool(host, "firstmate_reply").execute({ ref: "tg:200:1670", text: "Your options:\n\nA. Release #2284 now.\nB. Hold it until Monday.\n\nWhich one do you want?" }, ctx);
+    assert.ok(!isError(options), text(options));
+    const drafts = await tool(host, "firstmate_reply").execute({ ref: "tg:200:1671", text: "Two drafts for Jasher:\n\nA. Hi Jasher, can we meet on Monday?\nB. Hi Jasher, are you free this week?" }, ctx);
+    assert.ok(!isError(drafts), text(drafts));
+    assert.equal(host.harness.sdk.callsTo("plugins.callRpc").length, 2);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a decision in the captain's closing text brings the card guidance back once", async () => {
+  const host = await captainHost();
+  try {
+    host.harness.sdk.stub("threads.send", async () => ({}));
+    host.harness.sdk.stub("threads.events.list", async () => []);
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
+    host.harness.sdk.stub("plugins.callRpc", async () => ({ replied: ["1669"], queued: 1, duplicate: false, mode: "on" }));
+    recordTelegram(host, "thr_cap", "1669", Date.now());
+    const idle = (lastAssistantText: string) => host.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_cap", status: "idle" }), lastAssistantText });
+    const notes = () => host.harness.sdk.callsTo("threads.send")
+      .map((c) => c[0] as { threadId: string; mode: string; input: Array<{ text: string; visibility?: string }> })
+      .filter((a) => /firstmate_ask/.test(a.input[0]?.text ?? ""));
+    await idle("PR 2146 is merged. Nothing waits for you.");
+    assert.equal(notes().length, 0);
+    await idle(RELEASE_QUESTION);
+    await idle(RELEASE_QUESTION);
+    await idle("Recap: all finished Cyndra work is live. 12 decisions wait for you.");
+    assert.equal(notes().length, 1, "one note, not one per turn");
+    assert.equal(notes()[0]!.threadId, "thr_cap");
+    assert.equal(notes()[0]!.input[0]!.visibility, "agent-only");
+    assert.match(notes()[0]!.input[0]!.text, /without the question/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});

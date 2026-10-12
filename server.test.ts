@@ -57,6 +57,7 @@ import plugin, {
 import { LEFTOVER_TIMER_CONTRACT, WAITING_PROTOCOL, latestStatus, statusProtocolSummary } from "./lib/policy.ts";
 import { UPSTREAM_SCRIPT_NAMES, PINNED_SCRIPT_SUPPORT_FILES, UPSTREAM_SKILL_NAMES } from "./lib/upstream-surface.ts";
 import { FIRSTMATE_ROUTINE_MARKER } from "./lib/timeline-noise.ts";
+import { OWNER_DECISION_RULE } from "./lib/owner-asks.ts";
 
 const CAPTAIN_TEST_SKILLS = ["captain", "firstmate", "skill-routing"] as const;
 const SKILLS = [...new Set([...CAPTAIN_TEST_SKILLS, ...UPSTREAM_SKILL_NAMES])] as const;
@@ -177,6 +178,9 @@ test("captain metadata loads the full skill set", async () => {
     assert.doesNotMatch(cfg.instructions ?? "", /Do not narrate tool calls|Never do crew work|Never merge/);
     assert.match(cfg.instructions ?? "", /call firstmate_watch once per batch/i);
     assert.match(cfg.instructions ?? "", /private durable wakes/i);
+    assert.match(cfg.instructions ?? "", /Send every decision, approval or blocker for the owner with firstmate_ask, one question per card, never as plain text/, "the card rule is in the text that is re-sent every turn");
+    assert.ok((cfg.instructions ?? "").includes(OWNER_DECISION_RULE));
+    assert.ok((cfg.instructions ?? "").length <= 4096);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -7524,6 +7528,7 @@ test("native captain contract tool returns the entire source beyond the SDK inst
     const tool = host.harness.inspection.registrations.agentTools.find(t => t.name === "firstmate_contract");
     assert.ok(tool);
     const result = await tool.execute({}, { threadId: "thr_cap", projectId: "proj_1" } as never);
+    assert.ok((result as string).includes(OWNER_DECISION_RULE), "the contract read states the card rule");
     assert.equal(typeof result, "string");
     assert.ok((result as string).startsWith(content), "full native text must survive transport and instruction budgets");
     assert.match(result as string, /BB runtime adaptations/);
