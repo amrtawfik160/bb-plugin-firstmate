@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { askLetterAnswer, askIdFromSourceEventId, createOwnerAsks, formatAskCard, newAskId } from "./owner-asks.ts";
+import { askLetterAnswer, askIdFromSourceEventId, createOwnerAsks, formatAskCard, newAskId, ownerAskedForOptions, PLAIN_DECISION_GUIDANCE, plainTextDecision } from "./owner-asks.ts";
 import { formatBoard } from "./owner-board.ts";
 
 const NOW = Date.UTC(2026, 9, 7, 12, 0);
@@ -90,4 +90,40 @@ test("card answers accept only a valid letter, optionally followed by a period",
   const ask = { options: [{ label: "Send the list", value: "send" }, { label: "Find the list", value: "find" }] };
   for (const text of ["B", "b", "B.", " b. "]) assert.equal(askLetterAnswer(ask, text), "Find the list");
   for (const text of ["What?", "B. send me a link", "1 B", "7B", "C", "Find the list", "B!", "B\nA"]) assert.equal(askLetterAnswer(ask, text), null);
+});
+
+// Sent to the owner as plain text on 11 and 12 Oct 2026, after the captain stopped sending cards.
+const PLAIN_DECISIONS = {
+  release: "Question: release the change that shows a plain icon first and the animated agent face after (#2284)?\n\nA. No, do not release it. I recommend this. The page loads slower for no gain.\nB. Yes, release it.\n\nUntil you answer, #2284 is not released.",
+  straightLine: "Three items need fixes before release. I need 1 decision from you for StraightLine.\n\nDecision: go for the StraightLine call notes (orders 8 to 11) or hold them until the recording fix is live.",
+  stillOpen: "Still open with you:\n\nSend the draft and the 2 card files to Jasher (A send, recommended / B change the wording first)",
+  recap: "Recap: all finished Cyndra work is live. 12 decisions wait for you.",
+};
+
+test("Oct 11 repro: a plain-text message that asks the owner to choose is recognised as a decision", () => {
+  for (const [name, text] of Object.entries(PLAIN_DECISIONS)) assert.equal(typeof plainTextDecision(text), "string", name);
+  assert.equal(typeof plainTextDecision("Which one do you want?\n\nA) Ship today\nB) Wait for the review"), "string", "A) option lines");
+  assert.equal(typeof plainTextDecision("Decision: the export format\n- **A.** CSV\n- **B.** PDF"), "string", "bullet and bold option lines with a cue");
+});
+
+test("reports, results of answered cards and changelogs are not decisions", () => {
+  for (const text of [
+    "Results of the cards you answered:\n\nA: the plain icon change is released (#2284).\nB: the StraightLine call notes are on hold.\n\nNothing else changed.",
+    "Changelog\n\n- Digest: a finished item is listed once.\n- Cards: every decision is a card.\n\nA. Digest fix is live.\nB. Card fix is live.",
+    "Rolled back. Is anything else broken? No: the checks pass.",
+    "The decision you made on 10 Oct is live: #2284 is not released.",
+    "Done. PR cyndra-saas#2146 is merged and deployed.",
+  ]) assert.equal(plainTextDecision(text), null, text);
+});
+
+test("an owner message that asks for options or drafts allows a reply that lists them", () => {
+  for (const asked of ["what are my options", "What are my options for the Jasher email?", "Draft 2 replies to Jasher for me", "give me 3 versions of the headline", "which decisions wait for me?"]) {
+    assert.equal(ownerAskedForOptions(asked), true, asked);
+  }
+  for (const asked of ["Status?", "Fix the Metricool sync", "release #2284 today"]) assert.equal(ownerAskedForOptions(asked), false, asked);
+});
+
+test("the guidance names the card tool and the report without the question", () => {
+  assert.match(PLAIN_DECISION_GUIDANCE, /firstmate_ask/);
+  assert.match(PLAIN_DECISION_GUIDANCE, /without the question/);
 });

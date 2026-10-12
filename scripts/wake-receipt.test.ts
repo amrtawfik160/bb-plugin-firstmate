@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { OWNER_DECISION_RULE } from "../lib/owner-asks.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const helper = join(root, "overlay/bin/bb-wake-receipt.py");
@@ -490,7 +491,25 @@ test("captain session-start hook leaves a digest with no queued wake unchanged",
     input: '{"source":"compact"}', encoding: "utf8", env: { ...process.env, HOME: f.dir, BB_THREAD_ID: "thr_test" },
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, digest + "\n");
+  assert.equal(result.stdout, `${digest}\n\nOWNER DECISIONS\n---------------\n${OWNER_DECISION_RULE}\n`);
+});
+
+test("captain session-start hook states the card rule after every compaction", (t) => {
+  const f = fixture(t);
+  mkdirSync(join(f.dir, "bin-bb"));
+  writeFileSync(join(f.dir, "bin-bb/fm-sessionstart-run.sh"), "#!/bin/sh\ncat >/dev/null\necho digest\n", { mode: 0o755 });
+  const markers = join(f.dir, ".bb-firstmate/captains");
+  mkdirSync(markers, { recursive: true });
+  writeFileSync(join(markers, "thr_test"), `home=${f.dir}\nstate=${f.state}\nown_home=1\n`);
+  for (const source of ["startup", "compact"]) {
+    const result = spawnSync("bash", [join(root, "overlay/bin/bb-captain-hook.sh"), "session-start"], {
+      input: JSON.stringify({ source }), encoding: "utf8", env: { ...process.env, HOME: f.dir, BB_THREAD_ID: "thr_test" },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /firstmate_ask/, source);
+    assert.match(result.stdout, /never as plain text/, source);
+    assert.ok(result.stdout.trimEnd().split("\n").length <= 6, "the block is 5 lines at most");
+  }
 });
 
 test("real native drain retains pairless status and new-generation queue rows", { skip: !existsSync(join(nativeFixture, "bin/fm-wake-drain.sh")) }, (t) => {

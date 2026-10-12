@@ -2,7 +2,7 @@
 import { deflateSync } from "node:zlib";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type BbPluginApi } from "@get-bb/plugin-sdk";
@@ -70,12 +70,12 @@ import { createDoorbellHold, doorbellHoldDecision } from "./lib/doorbell-hold.ts
 import { createRetryLedger, type RetryItem, type RetryKind } from "./lib/retry-ledger.ts";
 import { HANDOFF_WAKE_AMENDMENT, captainInstructionsWithHandoff } from "./lib/handoff-contract.ts";
 import { honestIdleVerdictPresentation, interruptIsStopped, readyClaim } from "./lib/honest-status.ts";
-import { ACK_TEXT, ackEligible, createInboundLedger, expandTelegramRows, formatOwnerInbox, inboundKey, quotedReplyKind, sweeperSteerText, type InboundRow } from "./lib/inbound-ledger.ts";
+import { ACK_TEXT, ackEligible, createInboundLedger, expandTelegramRows, followUpReplyKind, formatOwnerInbox, hashText, inboundKey, quotedReplyKind, sweeperSteerText, type InboundRow } from "./lib/inbound-ledger.ts";
 import { inboundHookDecision } from "./lib/inbound-dispatch.ts";
 import { formatWorkersForTelegram } from "./lib/telegram-commands.ts";
-import { formatBoard, formatDigest, type BoardInput } from "./lib/owner-board.ts";
+import { digestOnce, EMPTY_DIGEST_MEMORY, formatBoard, type BoardInput, type DigestMemory } from "./lib/owner-board.ts";
 import { createOwnerTasks, isOpenTask, sameProject, taskLine, type CrewFinish, type OwnerTask, type TaskState } from "./lib/owner-tasks.ts";
-import { askLetterAnswer, askIdFromSourceEventId, createOwnerAsks, formatAskCard, formatUtcTime, mayDefault, recommendedLabel, type AskKind } from "./lib/owner-asks.ts";
+import { askLetterAnswer, askIdFromSourceEventId, createOwnerAsks, formatAskCard, formatUtcTime, mayDefault, OWNER_DECISION_RULE, ownerAskedForOptions, PLAIN_DECISION_GUIDANCE, plainTextDecision, recommendedLabel, type AskKind } from "./lib/owner-asks.ts";
 import { DEFAULT_RELIABILITY_FLAGS, reliabilityFlagsFromSettings } from "./lib/reliability-flags.ts";
 import { sanitizeSettingValue } from "./lib/settings-schema.ts";
 import { coalesceBatches, parseConnectorHeader, parseInboundTelegram, parseSourceRef, parseTelegramSubmission, stripTelegramEnvelope, telegramReplyParameters, telegramSourceRef } from "./lib/telegram-envelope.ts";
@@ -1522,7 +1522,7 @@ const BB_SKILL_RUNTIME_CONTRACT = [
   "Translate bin/fm-<name>.sh calls to firstmate_fm with script=<name> and the same arguments; use bb firstmate fm <name> only when a shell command is required.",
   "Load native policy skills and their references with firstmate_skill (bb firstmate skill <name> [reference] [--source <selected-root source-file>]); it reads this captain’s selected runtime. Native AGENTS.md means firstmate_contract; bin and docs mean the selected runtime, while data, state and config mean the exact bound captain home returned by deck.",
   "Map workers, panes, and tabs to BB crew threads via firstmate_dispatch/tell/interrupt/retry/stop. Call firstmate_watch once per batch; it hands off to private durable wakes. End the turn; never retry or poll.",
-  "Use BB interactions for captain questions and approvals. firstmate_deliveries retains open PRs after worker retirement and wake acknowledgement. Continue authorized review/fix/merge work using the author for fixes and preserving the agreed native review and validation path, including independent review when required; merge through firstmate_merge. Inspect unresolved delivery records after compaction or handoff.",
+  `${OWNER_DECISION_RULE} firstmate_deliveries retains open PRs after worker retirement and wake acknowledgement. Continue authorized review/fix/merge work using the author for fixes and preserving the agreed native review and validation path, including independent review when required; merge through firstmate_merge. Inspect unresolved delivery records after compaction or handoff.`,
   "Run firstmate_toolchain for native dependency detection. For browser work use the /browser skill and browser_script (or bb plugin run browser script), with profileId unset for the thread-isolated default. This replaces native chrome-devtools-axi transport. Read config/lavish-axi-host for remote Lavish access and use bb connect expose for a board the captain should see.",
   "Treat tmux, herdr, zellij, cmux, orca, and harness-specific hook setup as reference material unless the active backend explicitly names that runtime.",
 ].join(" ");
@@ -4847,6 +4847,30 @@ export default async function plugin(bb: BbPluginApi) {
     } catch (error) {
       if (!isTelegramRpcMissing(error)) bb.log.warn(`telegram refreshBoard: ${String(error)}`);
     }
+  }
+
+  // What the digests already told the owner, so the next one does not repeat it.
+  const DIGEST_MEMORY_PREFIX = "digest-memory:";
+  const digestMemorySchema: z.ZodType<DigestMemory> = z.object({
+    done: z.record(z.string(), z.number()),
+    stale: z.object({ ids: z.array(z.string()), at: z.number(), since: z.number() }).nullable(),
+  });
+
+  // Closing text is already sent when the turn ends, so it cannot be refused. The captain is told
+  // once to move the decision to a card; the always-loaded rule covers the turns after that.
+  const CLOSING_DECISION_NOTE_MS = 6 * 60 * 60_000;
+  async function noteClosingDecision(captainThreadId: string, closingText: string | null | undefined): Promise<void> {
+    if (!closingText || plainTextDecision(closingText) === null || !inboundLedger.hasTelegram(captainThreadId)) return;
+    const key = `closing-decision-note:${captainThreadId}`;
+    const last = Number(await bb.storage.kv.get(key) ?? 0);
+    const now = Date.now();
+    if (now - last < CLOSING_DECISION_NOTE_MS) return;
+    await bb.storage.kv.set(key, now);
+    await bb.sdk.threads.send({
+      threadId: captainThreadId,
+      mode: "steer",
+      input: [{ type: "text", text: `Your last message asked the owner to decide in plain text. It has no buttons, is not on the owner's board and gets no reminder. ${PLAIN_DECISION_GUIDANCE} Do not send the report again. If the owner asked for those options or drafts, do nothing.`, mentions: [], visibility: "agent-only" }],
+    });
   }
 
   // An overdue reversible ask proceeds with its recommended option; the captain thread is told once.
@@ -10521,7 +10545,22 @@ export default async function plugin(bb: BbPluginApi) {
     } finally {await runHostCommand(host,`rm -f ${shQuote(helper)}`,1000).catch(()=>{});}
   }
 
+  // The captain, firstmate and skill-routing skills are the plugin's own files, not native policy:
+  // no selected runtime holds them, so they are read from the plugin.
+  function readEntrySkill(name:string,reference?:string,source?:string) {
+    const root=join(PLUGIN_ROOT,"entry-skills");
+    const resource=nativeSkillPath(name,reference,source ?? `entry-skills/${name}/SKILL.md`);
+    const inside=resource.path.startsWith("entry-skills/") ? resource.path.slice("entry-skills/".length) : null;
+    const file=inside===null ? null : join(root,inside);
+    if (file===null || !resource.path.endsWith(".md") || !existsSync(file) || !lstatSync(file).isFile() || realpathSync(file)!==join(realpathSync(root),inside!)) {
+      const references=join(root,name,"references");
+      const known=existsSync(references) ? readdirSync(references).filter(entry=>entry.endsWith(".md")).sort().map(entry=>`references/${entry}`) : [];
+      throw new Error(`No file ${resource.path} in the Firstmate plugin skill ${name}. Read it with firstmate_skill name=${name}${known.length ? ` reference=<one of: ${known.join(", ")}>` : ""}.`);
+    }
+    return `Firstmate plugin skill: ${resource.path}\nSource file (--source): ${resource.path}\n\n${readFileSync(file,"utf8")}`;
+  }
   async function readNativeSkill(ctx:unknown,name:string,reference?:string,source?:string) {
+    if ((/^[a-z0-9][a-z0-9-]{0,100}$/.test(name) && existsSync(join(PLUGIN_ROOT,"entry-skills",name,"SKILL.md"))) || source?.startsWith("entry-skills/")) return readEntrySkill(name,reference,source);
     const resource=nativeSkillPath(name,reference,source);
     const signal=AbortSignal.any([launchAbort.signal,AbortSignal.timeout(30_000),...(asRecord(ctx)["signal"]?[asRecord(ctx)["signal"] as AbortSignal]:[])]);
     const current=await raceAbort(settings.get(),signal,STUCK_HOST_CALL_MS),captain=ctxString(ctx,"threadId");
@@ -10617,7 +10656,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   registerCaptainTool({
-    name:"firstmate_skill",description:"Read a complete native policy skill or reference from this captain’s selected runtime; both audited revisions supported, no global copied policy fallback.",
+    name:"firstmate_skill",description:"Read a complete native policy skill or reference from this captain’s selected runtime; both audited revisions supported, no global copied policy fallback. The plugin's own captain, firstmate and skill-routing skills and their references are read by name too, for example name=captain reference=references/telegram.md.",
     parameters:z.object({name:z.string(),reference:z.string().optional().describe("Native relative link, including .. and #fragment inside selected runtime; returns complete document"),source:z.string().optional().describe("Exact selected-root relative source file for nested links; default .agents/skills/<name>/SKILL.md")}),
     async execute({name,reference,source},ctx){return readNativeSkill(ctx,name,reference,source);},
   });
@@ -10845,14 +10884,15 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_reply",
-    description: "Reply to one owner message as a Telegram reply to it (ref=oldest, tg:<chat>:<msg>, or bb:<thread>:<row>; any open message, in any order). quote=exact words from that message, such as one of several questions; each different quote is its own reply. more=true keeps the message open because more replies to it will follow.",
+    description: "Reply to one owner message as a Telegram reply to it (ref=oldest, tg:<chat>:<msg>, or bb:<thread>:<row>; any open message, in any order). quote=exact words from that message, such as one of several questions; each different quote is its own reply. more=true keeps the message open because more replies to it will follow. A text that asks the owner to decide (options A/B with a question, or a count of waiting decisions) is refused: send each decision with firstmate_ask.",
     parameters: z.object({
       ref: z.string().min(1),
       text: z.string().min(1).max(4000),
       quote: z.string().min(1).max(1024).optional(),
       more: z.boolean().optional(),
+      notADecision: z.boolean().optional().describe("Set true only when the text lists options but asks the owner to decide nothing, such as drafts the owner requested"),
     }),
-    async execute({ ref, text, quote, more }, ctx) {
+    async execute({ ref, text, quote, more, notADecision }, ctx) {
       const flags = await reliabilityFlags();
       if (flags.inboundLedger === "off") return toolError("Inbound ledger is off.");
       const captain = ctxString(ctx, "threadId");
@@ -10865,12 +10905,23 @@ export default async function plugin(bb: BbPluginApi) {
       if (!row) return toolError(`No inbound row ${ref} for this captain.`);
       const refOf = (item: InboundRow) => item.source === "telegram" ? telegramSourceRef(item) : `bb:${item.chatId}:${item.messageId}`;
       const used = refOf(row);
-      const claimKind = quotedReplyKind(quote);
+      // A decision in plain text has no buttons, no board line, no reminder and no default.
+      const decision = notADecision === true || ownerAskedForOptions(`${row.preview} ${quote ?? ""}`) ? null : plainTextDecision(text);
+      if (decision !== null) {
+        return toolError(`Not sent: this reply asks the owner to decide in plain text (${decision}). ${PLAIN_DECISION_GUIDANCE} If the text asks the owner to decide nothing, send it again with notADecision=true. ${used} stays open.`);
+      }
+      let claimKind = quotedReplyKind(quote);
       const body = row.source === "telegram"
         ? telegramReplyFallbackBody({ chatId: row.chatId, messageId: row.messageId, kind: "reply", text: stripTelegramEnvelope(text), threadId: row.topicId })
         : text;
       // Reserve first so a concurrent or repeated reply never reaches Telegram twice.
-      if (!inboundLedger.claimOutbox(row, claimKind, body, Date.now()).sent) {
+      let claim = inboundLedger.claimOutbox(row, claimKind, body, Date.now());
+      // more=true left the message open: a different text is the next reply to it, the same text is a repeat.
+      if (!claim.sent && !quote && row.state !== "answered" && claim.existing?.contentHash !== hashText(body)) {
+        claimKind = followUpReplyKind(body);
+        claim = inboundLedger.claimOutbox(row, claimKind, body, Date.now());
+      }
+      if (!claim.sent) {
         return quote ? `Already replied to ${used} for that quote.` : `Already replied to ${used}.`;
       }
       let channel: "rpc" | "envelope" = "envelope";
@@ -11814,7 +11865,11 @@ export default async function plugin(bb: BbPluginApi) {
         reconcileTasks(threadId, now);
         const records = new Map([...deliveries.list({ owner: threadId, limit: 100 }), ...deliveries.mergedSince(threadId, from)].map((r) => [r.id, r]));
         const input: BoardInput = { asks: ownerAsks.listOpen(threadId), calls: snapshot.rpc.ownerCalls, tasks: ownerTasks.list(threadId, { includeClosed: true }), records: [...records.values()], since: from, now };
-        return command === "board" ? { text: formatBoard(input), away: snapshot.rpc.afk } : { text: formatDigest(input) };
+        if (command === "board") return { text: formatBoard(input), away: snapshot.rpc.afk };
+        const memoryKey = `${DIGEST_MEMORY_PREFIX}${threadId}`;
+        const digest = digestOnce(input, digestMemorySchema.safeParse(await bb.storage.kv.get(memoryKey)).data ?? EMPTY_DIGEST_MEMORY);
+        await bb.storage.kv.set(memoryKey, digest.memory);
+        return { text: digest.text };
       }
       return { text: formatWorkersForTelegram(snapshot.rpc) };
     },
@@ -12577,6 +12632,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (knownCaptains.has(thread.id)) {
       await bb.storage.kv.delete(`${CAPTAIN_RESUME_PREFIX}${thread.id}`);
       await drainCaptainReliability(thread.id).catch((error) => bb.log.warn(`captain reliability drain failed ${thread.id}: ${String(error)}`));
+      await noteClosingDecision(thread.id, lastAssistantText).catch((error) => bb.log.warn(`closing decision note failed ${thread.id}: ${String(error)}`));
     }
     await inCaptainHome(thread.id, () => reconcileReturnedAfk(thread.id)).catch(error => bb.log.warn(`AFK return: ${String(error)}`));
     // Turn-end backstop for the captain (no-op unless turnEndGuard=re-ring and this

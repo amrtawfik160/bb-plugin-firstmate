@@ -99,7 +99,20 @@ One owner message with several questions gets one reply per question. Pass
 `quote` with the exact words of the question; Firstmate forwards it to the
 `reply` RPC, and the connector sends it as Telegram `reply_parameters.quote`.
 Each different quote is its own reply and its own duplicate guard. `more=true`
-keeps the item open for the next reply.
+keeps the item open for the next reply. After a `more=true` reply without a
+quote, a later reply to the same item with a different text is sent as its own
+reply; the same text again is not sent. An item that got its final reply takes
+no further unquoted reply.
+
+`firstmate_reply` refuses, before anything is reserved or sent, a text that asks the
+owner to decide: option lines `A.` / `B.` (or `A)`, or `(A ... / B ...)`) with a
+question mark or a `Decision:` / `Question:` heading, or the words "I need N
+decision(s) from you", "N decisions wait for you" or "Still open with you". The
+refusal tells the captain to send each decision with `firstmate_ask` and the report
+without the question. It does not refuse when the owner message asked for options,
+drafts, versions or decisions, or when the caller passes `notADecision=true`.
+Closing text cannot be refused; a decision in it brings the same guidance to the
+captain as one agent-only note, at most once in 6 hours.
 
 `firstmate_inbox` lists every item still waiting: `received` and `acked` items,
 and `delegated` items with their crew.
@@ -160,6 +173,13 @@ The digest uses the same lines without emoji and without links: `Needs you (<N>)
 `Done (<N>)` (at most 8), and `Stale (<N>): T1, T2` for open tasks with no
 update for 24 hours. It leaves out empty blocks and is the empty string when
 there is nothing to report.
+
+Firstmate remembers per captain what its digests already said. A finished item is
+listed under `Done` in one digest only, and `Done (<N>)` counts the new items. An
+unchanged `Stale` list is shown at most once in 24 hours; a changed list is shown
+at once. A digest asked for again with the same `since` repeats its items, because
+the connector moves `since` forward only after it queued the digest. `Needs you`
+is in every digest until the item is answered.
 
 `/ahoy`, `/bearings`, `/afk`, `/back`, `/quiet` and `/stow` reach the captain as an
 owner message that names the skill to run. All of them appear in Telegram's "/" menu.

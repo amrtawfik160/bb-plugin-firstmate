@@ -471,3 +471,36 @@ test("Oct 8 repro: a captain that receives Telegram messages is told to re-read 
     await host.harness.lifecycle.dispose();
   }
 });
+
+test("Oct 12 repro: the digest lists a finished item once and an unchanged stale list once per day", async () => {
+  const host = await captainHost();
+  try {
+    const tasks = createOwnerTasks(host.bb.storage.database());
+    const store = createDeliveries(host.bb.storage.database());
+    tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Quiet task", sourceRefs: ["tg:200:2401"], at: Date.now() - 30 * HOUR });
+    const record = store.register({ url: "https://github.com/cyndra-ai/cyndra-saas/pull/2146", taskId: "c1", projectId: "proj_1", owner: "thr_cap", home: "", worker: "thr_c1", title: "StraightLine recording fix" });
+    const observe = () => store.save({ ...store.get(record.id)!, status: "merged-needs-verification", forgeState: "merged", mergeCommitSha: "m1", updatedAt: Date.now() });
+    observe();
+    assert.equal(await command(host, { command: "digest", since: Date.now() - HOUR }), "Done (1)\n- PR cyndra-saas#2146 StraightLine recording fix · merged\n\nStale (1): T1");
+    for (const since of [Date.now() - 30 * MIN, Date.now() - 20 * MIN]) {
+      observe();
+      assert.equal(await command(host, { command: "digest", since }), "", "the next digests repeat nothing");
+    }
+    assert.match(await command(host, { command: "board" }), /Done since you last looked \(1\)\n- PR \[cyndra-saas#2146\]/, "the board still shows it");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("an open card is on the board, and firstmate_ask reports it as before", async () => {
+  const host = await captainHost();
+  try {
+    const result = text(await tool(host, "firstmate_ask").execute({ question: "Release #2284?", kind: "question", options: [{ label: "No" }, { label: "Yes" }], recommended: 0 }, { threadId: "thr_cap", projectId: "proj_1" } as never));
+    assert.match(result, /^Question card (a[0-9a-z]{6}) sent\. Ask \1 is open and on the captain's board\. If no answer by \d\d:\d\d UTC, it proceeds with "No" and you are told to go ahead\. Keep working on other things; the answer arrives as an owner message that replies to ask \1\.$/);
+    assert.match(await board(host), /^📌 Needs you \(1\)\n1\. ❓ Release #2284\? \(0 min, ask a[0-9a-z]{6}\) Recommended: No\. Auto at \d\d:\d\d UTC\.\nTap a question's button or reply with just its letter\./);
+    assert.match(await command(host, { command: "digest" }), /^Needs you \(1\)\n1\. ❓ Release #2284\?/);
+    assert.match(await command(host, { command: "digest" }), /^Needs you \(1\)\n1\. ❓ Release #2284\?/, "an open card is in every digest until it is answered");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});

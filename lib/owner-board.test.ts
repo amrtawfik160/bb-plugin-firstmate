@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { OwnerAsk } from "./owner-asks.ts";
-import { BOARD_MAX_CHARS, formatBoard, formatDigest, type BoardInput } from "./owner-board.ts";
+import { BOARD_MAX_CHARS, digestOnce, EMPTY_DIGEST_MEMORY, formatBoard, formatDigest, type BoardInput } from "./owner-board.ts";
 import type { OwnerTask } from "./owner-tasks.ts";
 import type { DeliveryRecord } from "./pr-delivery.ts";
 
@@ -281,4 +281,40 @@ test("dropped duplicate tasks stay out of both done lists", () => {
   const facts = input({ tasks: [task("T44", { state: "dropped", dropReason: "Duplicate of T2" }), task("T38", { state: "dropped", dropReason: "Merged into T37: the same PR" })] });
   assert.equal(formatBoard(facts), "📌 Needs you: nothing right now.\n\n✅ Done since you last looked: nothing new.\n\n🔧 In progress: nothing open.");
   assert.equal(formatDigest(facts), "");
+});
+
+test("Oct 12 repro: a finished item is listed in one digest only, though its record is refreshed every check", () => {
+  // The live record for cyndra-saas#2146 got a new updatedAt on every PR check, so it was "merged since the last digest" 7 times.
+  const record = (at: number) => merged("cyndra-ai/cyndra-saas#2146", { title: "StraightLine recording fix", updatedAt: at });
+  const done = task("T90", { title: "Email test", state: "done", updatedAt: NOW - HOUR });
+  const first = digestOnce(input({ tasks: [done], records: [record(NOW - HOUR)] }), EMPTY_DIGEST_MEMORY);
+  assert.equal(first.text, "Done (2)\n- T90 Email test · done\n- PR cyndra-saas#2146 StraightLine recording fix · merged");
+  const later = { since: NOW, now: NOW + 2 * HOUR };
+  const second = digestOnce(input({ ...later, tasks: [{ ...done, updatedAt: NOW + HOUR }], records: [record(NOW + HOUR)] }), first.memory);
+  assert.equal(second.text, "");
+  const fresh = digestOnce(input({ ...later, tasks: [done], records: [record(NOW + HOUR), merged("cyndra-ai/cyndra-saas#2150", { updatedAt: NOW + HOUR })] }), second.memory);
+  assert.equal(fresh.text, "Done (1)\n- PR cyndra-saas#2150 · merged", "a newly finished item is still listed, with the count of new items");
+});
+
+test("a digest that is asked for again with the same since repeats its items, because the first one was not sent", () => {
+  const facts = input({ records: [merged("acme/repo#2")], tasks: [task("T1", { updatedAt: NOW - 30 * HOUR })] });
+  const first = digestOnce(facts, EMPTY_DIGEST_MEMORY);
+  assert.equal(first.text, "Done (1)\n- PR repo#2 · merged\n\nStale (1): T1");
+  assert.equal(digestOnce({ ...facts, now: NOW + MIN }, first.memory).text, first.text);
+});
+
+test("Oct 12 repro: an unchanged stale list is shown at most once per day", () => {
+  const tasks = ["T108", "T111", "T115", "T117"].map((id) => task(id, { updatedAt: NOW - 30 * HOUR }));
+  let memory = EMPTY_DIGEST_MEMORY;
+  const at = (hours: number, list = tasks) => {
+    const out = digestOnce(input({ tasks: list, since: NOW + (hours - 2) * HOUR, now: NOW + hours * HOUR }), memory);
+    memory = out.memory;
+    return out.text;
+  };
+  assert.equal(at(0), "Stale (4): T108, T111, T115, T117");
+  assert.equal(at(2), "");
+  assert.equal(at(5), "");
+  assert.equal(at(8, [...tasks, task("T120", { updatedAt: NOW - 30 * HOUR })]), "Stale (5): T108, T111, T115, T117, T120", "a changed list is shown");
+  assert.equal(at(10, [...tasks, task("T120", { updatedAt: NOW - 30 * HOUR })]), "");
+  assert.equal(at(33, [...tasks, task("T120", { updatedAt: NOW - 30 * HOUR })]), "Stale (5): T108, T111, T115, T117, T120", "the same list returns after a day");
 });

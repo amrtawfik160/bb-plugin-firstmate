@@ -5,11 +5,16 @@ export type InboundSource = "bb" | "telegram";
 export type InboundState = "received" | "acked" | "answered" | "delegated";
 export type OutboxKind = "ack" | "reply" | "progress" | "delegated" | "nudge";
 /** A reply that quotes one part of the owner message, such as one of several questions, gets its own key. */
-export type OutboxClaimKind = OutboxKind | `reply:q${string}`;
+export type OutboxClaimKind = OutboxKind | `reply:q${string}` | `reply:t${string}`;
 
 export function quotedReplyKind(quote: string | null | undefined): OutboxClaimKind {
   const trimmed = quote?.trim() ?? "";
   return trimmed === "" ? "reply" : `reply:q${hashText(trimmed).slice(0, 12)}`;
+}
+
+/** The claim for an unquoted reply that follows a more=true reply: one per different text. */
+export function followUpReplyKind(text: string): OutboxClaimKind {
+  return `reply:t${hashText(text).slice(0, 12)}`;
 }
 
 export type InboundKey = {
