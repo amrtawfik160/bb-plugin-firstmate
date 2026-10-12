@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { appendFileSync, readdirSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, readdirSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -720,3 +720,93 @@ for (const phase of ["presenting", "acknowledging", "refreshing"]) {
     assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), journal);
   });
 }
+
+// Records which status files each native read was given, and reports nothing.
+const listingNative = `#!/usr/bin/env python3
+import json, os, pathlib, sys
+state = pathlib.Path(os.environ["FM_STATE_OVERRIDE"])
+if len(sys.argv) == 1:
+    seen = state / "seen.json"
+    reads = json.loads(seen.read_text()) if seen.exists() else []
+    reads.append(sorted(path.name for path in state.glob("*.status")))
+    seen.write_text(json.dumps(reads))
+`;
+const HOUR = 3600;
+const statusIdent = (path: string) => {
+  const [ident, epoch, birth] = spawnSync("stat", ["-c", "%d:%i|%W|%w", path], { encoding: "utf8", env: { ...process.env, LC_ALL: "C" } }).stdout.trim().split("|");
+  return epoch !== "0" && birth ? `strong:${ident}:${birth}` : `weak:${ident}`;
+};
+// One crew's files as the native read leaves them: read to the end, no open decision.
+function crewStatus(state: string, task: string, text: string, options: { meta?: boolean; ageSeconds?: number; presented?: number; backstop?: number; decision?: string; ident?: string; row?: boolean } = {}) {
+  const path = join(state, `${task}.status`);
+  writeFileSync(path, text);
+  if (options.meta) writeFileSync(join(state, `${task}.meta`), "kind=ship\n");
+  const at = Date.now() / 1000 - (options.ageSeconds ?? 2 * HOUR);
+  utimesSync(path, at, at);
+  const ident = options.ident ?? statusIdent(path);
+  const size = Buffer.byteLength(text);
+  writeFileSync(join(state, `.${task}.open-decisions-cursor`), `version=9:unknown\noffset=${size}\nident=${ident}\n${options.decision ?? ""}`);
+  if (options.row !== false) appendFileSync(join(state, ".status-presentation-cursor"), `${task}\t${ident}\t${options.presented ?? size}\t${options.backstop ?? 0}\n`);
+  return path;
+}
+const linux = process.platform === "linux";
+
+test("a retired crew's fully read status file leaves the folder the native read scans, kept whole in the archive", { skip: !linux }, (t) => {
+  const f = fixture(t);
+  const script = join(f.dir, "listing.py");
+  writeFileSync(script, listingNative, { mode: 0o700 });
+  const notes = "note: PR observation. org/repo#1 [complete]\nnote: PR observation. org/repo#2 [complete]\n";
+  for (const task of ["gone1", "gone2", "gone3"]) crewStatus(f.state, task, notes);
+  crewStatus(f.state, "live1", "working: half way\n", { meta: true });
+  writeFileSync(join(f.state, ".wake-queue"), "1791822185\t1\theartbeat\theartbeat\theartbeat\n");
+
+  assert.equal(f.run("receive", "", script).id, null);
+  assert.equal(f.run("receive", "", script).id, null);
+  const reads = JSON.parse(readFileSync(join(f.state, "seen.json"), "utf8"));
+  assert.deepEqual(reads[0], ["gone1.status", "gone2.status", "gone3.status", "live1.status"]);
+  assert.deepEqual(reads[1], ["live1.status"], "the second read is given the live crew only");
+  const archive = join(f.state, ".bb-status-archive");
+  assert.deepEqual(readdirSync(archive).sort(), ["gone1.status", "gone2.status", "gone3.status"]);
+  for (const task of ["gone1", "gone2", "gone3"]) assert.equal(readFileSync(join(archive, `${task}.status`), "utf8"), notes);
+});
+
+test("a status file that can still carry news to the captain stays where the native read finds it", { skip: !linux }, (t) => {
+  const f = fixture(t);
+  const script = join(f.dir, "listing.py");
+  writeFileSync(script, listingNative, { mode: 0o700 });
+  const note = "note: PR observation. org/repo#1 [complete]\n";
+  const kept: Record<string, string> = {
+    // A crew that still exists: running, blocked or waiting.
+    running: crewStatus(f.state, "running", "working: half way\n", { meta: true }),
+    blocked: crewStatus(f.state, "blocked", "blocked: need the key\n", { meta: true, decision: "default\tblocked\tneed the key\n" }),
+    waiting: crewStatus(f.state, "waiting", "paused: until the check ends\n", { meta: true }),
+    // A retired crew with a wake the captain has not received.
+    queued: crewStatus(f.state, "queued", note),
+    unread: crewStatus(f.state, "unread", note + "note: PR observation. org/repo#1 [merged]\n", { presented: Buffer.byteLength(note) }),
+    neverRead: crewStatus(f.state, "neverRead", note, { row: false }),
+    decision: crewStatus(f.state, "decision", "needs-decision: ship it?\n", { backstop: 25, decision: "default\tneeds-decision\tship it?\n" }),
+    outcome: crewStatus(f.state, "outcome", note + "done: shipped\n"),
+    recreated: crewStatus(f.state, "recreated", note, { ident: "strong:1:1:2026-01-01 00:00:00.000000000 +0000" }),
+    justWritten: crewStatus(f.state, "justWritten", note, { ageSeconds: 60 }),
+  };
+  writeFileSync(join(f.state, ".wake-queue"), "1791822241\t7\tsignal\tqueued.status\tcrew queued update\n");
+  const before = Object.fromEntries(Object.entries(kept).map(([task, path]) => [task, readFileSync(path, "utf8")]));
+
+  assert.equal(f.run("receive", "", script).id, null);
+  assert.equal(f.run("receive", "", script).id, null);
+  const reads = JSON.parse(readFileSync(join(f.state, "seen.json"), "utf8"));
+  assert.deepEqual(reads[1], Object.keys(kept).map(task => `${task}.status`).sort(), "every one is still given to the second read");
+  for (const [task, path] of Object.entries(kept)) assert.equal(readFileSync(path, "utf8"), before[task], task);
+  assert.deepEqual(existsSync(join(f.state, ".bb-status-archive")) ? readdirSync(join(f.state, ".bb-status-archive")) : [], []);
+});
+
+test("an outcome the captain already received does not hold a retired crew's status file back", { skip: !linux }, (t) => {
+  const f = fixture(t);
+  const script = join(f.dir, "listing.py");
+  writeFileSync(script, listingNative, { mode: 0o700 });
+  const text = "done: shipped\nnote: PR observation. org/repo#1 [complete]\n";
+  crewStatus(f.state, "reported", text, { backstop: Buffer.byteLength("done: shipped\n") });
+  assert.equal(f.run("receive", "", script).id, null);
+  assert.deepEqual(readdirSync(f.state).filter(name => name.endsWith(".status")), []);
+  assert.equal(readFileSync(join(f.state, ".bb-status-archive", "reported.status"), "utf8"), text);
+});
