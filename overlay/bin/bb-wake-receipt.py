@@ -5,6 +5,9 @@ Usage: bb-wake-receipt.py STATE ACTION EXPECTED NATIVE_SCRIPT
 Actions: receive, inspect ID, begin-action ID, mark-success ID, complete ID,
          legacy-ack THROUGH:GENERATION. receive uses an empty EXPECTED.
 Returns one bounded FM_BB_RECEIPT=<JSON> line; full reports stay on disk.
+FM_WAKE_RECEIPT_BUDGET bounds one call in seconds. A call that reaches it exits
+75 and names what is still running; the native run finishes on the host and the
+next call returns its result.
 """
 import fcntl
 import hashlib
@@ -15,15 +18,53 @@ import re
 import signal
 import subprocess
 import sys
+import time
 import uuid
 
 
 FRAME_LIMIT = 6000
+BUDGET_SECONDS = 150.0
+STILL_RUNNING_EXIT = 75
 PHASES = {"presenting", "ready", "acting", "handled", "acknowledging", "acknowledged", "refreshing"}
 ACK = re.compile(
     r"^WAKE_ACK_REQUIRED: [^\n]* --ack-through (\d+) --recovery-generation ([A-Za-z0-9._-]+)\s*$",
     re.MULTILINE,
 )
+
+
+class StillRunning(RuntimeError):
+    """The budget ran out while a native run or another call held the work."""
+
+
+def budget_seconds():
+    try:
+        value = float(os.environ.get("FM_WAKE_RECEIPT_BUDGET", ""))
+    except ValueError:
+        return BUDGET_SECONDS
+    return value if value > 0 else BUDGET_SECONDS
+
+
+def acquire(lock, holder, deadline):
+    # A drain cut off by its caller leaves a guardian holding this lock until the
+    # native run ends (measured 56 to 94 s on a 97-crew home). Waiting without a
+    # bound made the next drain time out as well, with no word on why.
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() < deadline:
+                time.sleep(0.05)
+                continue
+        try:
+            held = json.loads(holder.read_text())
+            who = (f"a wake {held['action']} (pid {held['pid']})"
+                   + (f", native run pid {held['native']}" if held.get("native") else "")
+                   + f", started {max(0, int(time.time() - held['since']))}s ago")
+        except (OSError, ValueError, KeyError, TypeError):
+            who = "an unknown process"
+        raise StillRunning(f"Wake receipt lock is held by {who}; that wake read is still running. "
+                           "Its result is kept and the next call returns it.")
 
 
 def sync_directory(path):
@@ -102,9 +143,11 @@ def status_cursor(state):
 
 
 class Journal:
-    def __init__(self, state, script):
+    def __init__(self, state, script, deadline=None, holder=None):
         self.state = state
         self.script = script
+        self.deadline = time.monotonic() + budget_seconds() if deadline is None else deadline
+        self.holder = holder
         self.path = state / ".bb-wake-receipt.json"
         self.reports = state / ".bb-wake-reports"
         self.reports.mkdir(mode=0o700, exist_ok=True)
@@ -262,14 +305,30 @@ class Journal:
                 os._exit(0)
             except BaseException:
                 os._exit(1)
-        os.waitpid(pid, 0)
+        if self.holder:
+            atomic_json(self.holder[0], dict(self.holder[1], native=pid))
+        # The guardian outlives this call, so stopping here loses nothing: it
+        # stores the result and the next call replays it from the journal.
+        while os.waitpid(pid, os.WNOHANG)[0] == 0:
+            if time.monotonic() >= self.deadline:
+                raise StillRunning(
+                    f"Native wake {'acknowledgement' if arguments else 'read'} is still running after "
+                    f"{budget_seconds():g}s (pid {pid}); it finishes on the host and its result is kept.")
+            time.sleep(0.05)
         return self.capture_result()
 
     def present(self, phase):
         # One repeat returns the newer rows now; handing back the bare notice
         # costs the captain a whole turn just to ask again.
+        started = time.monotonic()
         report = self.native([], phase)
-        return self.native([], phase) if arrived_mid_drain(report) else report
+        if not arrived_mid_drain(report):
+            return report
+        # The repeat costs as much as the read just made. Without that much
+        # budget left the notice stands and the next call brings the rows.
+        if self.deadline - time.monotonic() < time.monotonic() - started:
+            return report
+        return self.native([], phase)
 
     def capture_result(self):
         output, result_path = self.capture_paths()
@@ -434,9 +493,13 @@ def main():
     os.umask(0o077)
     state = Path(state).resolve()
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    deadline = time.monotonic() + budget_seconds()
+    holder = state / ".bb-wake-receipt.holder"
     with (state / ".bb-wake-receipt.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        journal = Journal(state, script)
+        acquire(lock, holder, deadline)
+        held = {"pid": os.getpid(), "action": action, "since": time.time()}
+        atomic_json(holder, held)
+        journal = Journal(state, script, deadline, (holder, held))
         journal.prune_reports()
         if action == "receive":
             journal.receive()
@@ -459,6 +522,9 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except StillRunning as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(STILL_RUNNING_EXIT)
     except Exception as error:
         print(str(error), file=sys.stderr)
         sys.exit(1)

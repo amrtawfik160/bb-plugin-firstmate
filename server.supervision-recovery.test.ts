@@ -677,7 +677,7 @@ test("a wake read that is still running on the host says so, names the next step
     assert.match(text, /pid 4242/, "the holder named by the host is kept");
     assert.doesNotMatch(text, /native exit 75/);
     // The staged receipt script travels base64-encoded in fixed-size chunks.
-    const staged = Buffer.from(seen.map((cmd) => /printf '%s' '\\''([A-Za-z0-9+\/=]+)'\\'' >> /.exec(cmd)?.[1] ?? "").join(""), "base64").toString("utf8");
+    const staged = Buffer.from(seen.map((cmd) => /printf '\\''%s'\\'' '\\''([A-Za-z0-9+\/=]+)'\\'' >> /.exec(cmd)?.[1] ?? "").join(""), "base64").toString("utf8");
     assert.match(staged, /export FM_WAKE_RECEIPT_BUDGET='150'/, "30 s under the 180 s host command budget");
   } finally {
     await host.harness.lifecycle.dispose();

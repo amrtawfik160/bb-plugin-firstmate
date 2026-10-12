@@ -432,6 +432,13 @@ function stripAnsi(text: string): string {
 const HOST_RC_MARKER = "__FM_HOST_RC";
 const HOST_COMMAND_MAX = 10000;
 const HOST_TERMINAL_LINGER_S = 30;
+// The wake receipt helper exits with this code when its own budget ends while a
+// native run, or another drain holding the receipt lock, is still working.
+const WAKE_STILL_RUNNING_EXIT = 75;
+// One native wake read took 56 to 94 s on a 97-crew home (2026-10-12), and one call
+// can make three native runs. The helper stops this far short of the host command
+// budget, so the captain gets its reason instead of a bare host timeout.
+const WAKE_RECEIPT_MARGIN_S = 30;
 
 function parseHostRc(raw: string): { exitCode: number; output: string } | null {
   const text = stripAnsi(raw);
@@ -8257,6 +8264,7 @@ export default async function plugin(bb: BbPluginApi) {
     const scriptLeaf = `fm-${script}.sh`;
     const extraEnv = Object.entries({
       ...(script === "wake-drain" ? wakeStateEnv(input.fmHome, input.parentThreadId) : {}),
+      ...(script === "wake-drain" ? { FM_WAKE_RECEIPT_BUDGET: String(Math.max(WAKE_RECEIPT_MARGIN_S, Math.floor(input.timeoutMs / 1000) - WAKE_RECEIPT_MARGIN_S)) } : {}),
       ...input.env,
     })
       .filter(([, v]) => v !== "")
@@ -8471,6 +8479,9 @@ export default async function plugin(bb: BbPluginApi) {
       if (res.exitCode !== 0 && receipt?.action === "complete" && receipt.id && /Wake receipt absent or changed/.test(raw)) {
         const current = await drainWakes(captainThreadId, undefined, undefined, hostOverride, signal, { action: "receive" });
         return `Wake receipt ${receipt.id} is already complete or was replaced; nothing was acknowledged twice.\n${current}`;
+      }
+      if (res.exitCode === WAKE_STILL_RUNNING_EXIT) {
+        throw new Error(`the wake read is still running on the host; no wake is lost. Call firstmate_wake again to get its result; do not repeat any action. ${raw}`);
       }
       if (res.exitCode !== 0) throw new Error(`native exit ${res.exitCode}: ${raw || "no diagnostic output"}`);
       const out = captainThreadId ? await hideFinishedCrewWakes(raw, captainThreadId, hostId, fmHome, signal) : raw;
