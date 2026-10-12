@@ -8,7 +8,7 @@ import { createDoorbellHold } from "./lib/doorbell-hold.ts";
 import { createInboundLedger } from "./lib/inbound-ledger.ts";
 import { createLaunches } from "./lib/launch.ts";
 import { createDeliveries } from "./lib/pr-delivery.ts";
-import { createOwnerAsks } from "./lib/owner-asks.ts";
+import { createOwnerAsks, OWNER_DECISION_RULE } from "./lib/owner-asks.ts";
 import { parseInboundTelegram } from "./lib/telegram-envelope.ts";
 
 type Host = ReturnType<typeof createFakePluginHost>;
@@ -1257,6 +1257,54 @@ test("a decision in the captain's closing text brings the card guidance back onc
     assert.equal(notes()[0]!.threadId, "thr_cap");
     assert.equal(notes()[0]!.input[0]!.visibility, "agent-only");
     assert.match(notes()[0]!.input[0]!.text, /without the question/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("captain report: after a reply sent with more=true, a different text to the same message is sent; the same text is sent once", async () => {
+  const host = await load();
+  try {
+    await telegramFlags(host);
+    recordTelegram(host, "thr_cap", "1669");
+    host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
+    const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
+    const send = (words: string, more?: boolean) => tool(host, "firstmate_reply").execute({ ref: "tg:200:1669", text: words, ...(more === undefined ? {} : { more }) }, ctx);
+    const sentTexts = () => host.harness.sdk.callsTo("plugins.callRpc").map((call) => (call[0] as { input: { text: string } }).input.text);
+    assert.ok(!isError(await send("The deploy is running.", true)));
+    assert.match(text(await send("The deploy is running.", true)), /Already replied to tg:200:1669/, "the same text is not sent twice");
+    const second = await send("The deploy is done.", true);
+    assert.ok(!isError(second), text(second));
+    assert.match(text(second), /Replied to tg:200:1669/);
+    assert.match(text(await send("The deploy is done.")), /Already replied to tg:200:1669/);
+    assert.equal(ledgerRow(host, "1669")?.state, "received", "more=true keeps the message open");
+    assert.ok(!isError(await send("All checks pass.")));
+    assert.equal(ledgerRow(host, "1669")?.state, "answered");
+    assert.match(text(await send("One more thing.")), /Already replied to tg:200:1669/, "a message that got its final reply takes no more");
+    assert.deepEqual(sentTexts(), ["The deploy is running.", "The deploy is done.", "All checks pass."]);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("captain report: firstmate_skill reads the captain's own reference files by name", async () => {
+  const host = await load();
+  try {
+    const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
+    const read = (input: Record<string, unknown>) => tool(host, "firstmate_skill").execute(input, ctx);
+    const telegram = await read({ name: "captain", reference: "references/telegram.md" });
+    assert.ok(!isError(telegram), text(telegram));
+    assert.ok(text(telegram).includes(readFileSync(new URL("./entry-skills/captain/references/telegram.md", import.meta.url), "utf8")));
+    assert.ok(text(await read({ name: "captain" })).includes(readFileSync(new URL("./entry-skills/captain/SKILL.md", import.meta.url), "utf8")));
+    // A link inside a reference resolves from that reference, as for native skills.
+    const nested = await read({ name: "captain", reference: "supervision.md", source: "entry-skills/captain/references/telegram.md" });
+    assert.ok(text(nested).includes(readFileSync(new URL("./entry-skills/captain/references/supervision.md", import.meta.url), "utf8")));
+    for (const reference of ["../../package.json", "../../../server.ts", "references/missing.md"]) {
+      const refused = await read({ name: "captain", reference });
+      assert.ok(isError(refused), reference);
+    }
+    assert.match(text(await read({ name: "captain", reference: "references/missing.md" })), /references\/telegram\.md/, "the error lists the files that exist");
+    assert.match(OWNER_DECISION_RULE, /firstmate_skill name=captain reference=references\/telegram\.md/, "the always-loaded block names the exact call");
   } finally {
     await host.harness.lifecycle.dispose();
   }
