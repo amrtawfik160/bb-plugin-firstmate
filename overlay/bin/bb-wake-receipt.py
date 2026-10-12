@@ -142,6 +142,67 @@ def status_cursor(state):
         return None
 
 
+QUIET_SECONDS = 3600
+# Lines the native read never presents as an outcome, and notes it presents once.
+QUIET_LINE = re.compile(r"(?:note|working|resolved|paused|captain-held)(?=[:\s\[])")
+
+
+def archive_retired_status(state):
+    """Move status files that can carry no more news out of the native read's folder.
+
+    The native read walks its cursor file once per status file: 95 files read in
+    75 to 83 s, the 20 whose crew still exists in 15 s. Called right after a
+    read, when its cursors are current. A file moves only when its crew is
+    retired (no .meta), nothing wrote to it for an hour, no queued wake names
+    it, both cursors show it read to the end with no open decision, and no
+    outcome line sits past the outcome cursor. Nothing is deleted.
+    """
+    try:
+        rows = {}
+        for row in (state / ".status-presentation-cursor").read_text().splitlines():
+            cells = row.split("\t")
+            if len(cells) in (3, 4):
+                rows[cells[0]] = cells
+        queue = state / ".wake-queue"
+        queued = queue.read_text() if queue.exists() else ""
+        now, sizes = time.time(), {}
+        for path in state.glob("*.status"):
+            info = path.lstat()
+            if (path.stem in rows and path.is_file() and not path.is_symlink()
+                    and not os.path.lexists(path.with_suffix(".meta"))
+                    and now - info.st_mtime >= QUIET_SECONDS and path.name not in queued):
+                sizes[str(path)] = info.st_size
+        if not sizes:
+            return
+        # File identity as the native cursors record it (_fm_open_decisions_file_ident).
+        done = subprocess.run(["stat", "-c", "%d:%i|%W|%w|%n", "--", *sizes], capture_output=True,
+                              text=True, env=dict(os.environ, LC_ALL="C"), check=True)
+        for line in done.stdout.splitlines():
+            ident, epoch, birth, name = line.split("|", 3)
+            ident = f"strong:{ident}:{birth}" if epoch != "0" and birth else f"weak:{ident}"
+            path, size = Path(name), sizes[name]
+            cells = rows[path.stem]
+            cursor = (state / f".{path.stem}.open-decisions-cursor").read_text().split("\n")
+            if (cells[1:3] != [ident, str(size)] or not cursor[0].startswith("version=")
+                    or cursor[1:3] != [f"offset={size}", f"ident={ident}"] or any(cursor[3:])):
+                continue
+            backstop = int(cells[3]) if cells[3:] and cells[3].isdigit() and int(cells[3]) <= size else 0
+            text = path.read_bytes()
+            if len(text) != size or any(line.strip() and not QUIET_LINE.match(line)
+                                        for line in text[backstop:].decode("utf8", "replace").splitlines()):
+                continue
+            archive = state / ".bb-status-archive"
+            archive.mkdir(mode=0o700, exist_ok=True)
+            target = archive / path.name
+            if target.exists():
+                target = archive / f"{path.name}.{int(now)}"
+            if not target.exists():
+                os.rename(path, target)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        # The read already has its report; a file left in place only costs time.
+        return
+
+
 class Journal:
     def __init__(self, state, script, deadline=None, holder=None):
         self.state = state
@@ -322,13 +383,12 @@ class Journal:
         # costs the captain a whole turn just to ask again.
         started = time.monotonic()
         report = self.native([], phase)
-        if not arrived_mid_drain(report):
-            return report
         # The repeat costs as much as the read just made. Without that much
         # budget left the notice stands and the next call brings the rows.
-        if self.deadline - time.monotonic() < time.monotonic() - started:
-            return report
-        return self.native([], phase)
+        if arrived_mid_drain(report) and self.deadline - time.monotonic() >= time.monotonic() - started:
+            report = self.native([], phase)
+        archive_retired_status(self.state)
+        return report
 
     def capture_result(self):
         output, result_path = self.capture_paths()
