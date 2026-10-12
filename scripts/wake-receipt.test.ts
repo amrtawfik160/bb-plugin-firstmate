@@ -21,7 +21,7 @@ data[key] = data.get(key, 0) + 1
 path.write_text(json.dumps(data))
 if data.get("pause") == key:
     (state / "started").touch()
-    time.sleep(0.4)
+    time.sleep(data.get("pauseSeconds", 0.4))
 if ack:
     through = int(sys.argv[2])
     if data.get("failAck"):
@@ -60,12 +60,12 @@ function fixture(t: { after: (fn: () => void) => void }, initial: Record<string,
   writeFileSync(script, fakeNative, { mode: 0o700 });
   const config = join(state, "fixture.json");
   writeFileSync(config, JSON.stringify(initial));
-  const raw = (action = "receive", expected = "", source = script) => spawnSync("python3", [helper, state, action, expected, source], {
+  const raw = (action = "receive", expected = "", source = script, env: Record<string, string> = {}) => spawnSync("python3", [helper, state, action, expected, source], {
     encoding: "utf8", timeout: 15_000,
-    env: { ...process.env, FM_ROOT_OVERRIDE: dir, FM_HOME: dir },
+    env: { ...process.env, FM_ROOT_OVERRIDE: dir, FM_HOME: dir, ...env },
   });
-  const run = (action = "receive", expected = "", source = script): Receipt => {
-    const result = raw(action, expected, source);
+  const run = (action = "receive", expected = "", source = script, env: Record<string, string> = {}): Receipt => {
+    const result = raw(action, expected, source, env);
     assert.equal(result.status, 0, result.stderr || result.error?.message);
     assert.ok(Buffer.byteLength(result.stdout) <= 6000, `oversized frame: ${Buffer.byteLength(result.stdout)}`);
     assert.match(result.stdout, /^FM_BB_RECEIPT=\{.*\}\n$/);
@@ -384,6 +384,47 @@ test("failed fresh presentation after ack retains new consumed status without re
   assert.match(recovered.report, /newly consumed status after ack/);
   assert.equal(f.read().acks, 1);
   assert.deepEqual(f.read().queue, []);
+});
+
+test("a read that outlasts the budget returns at the budget, and the next read delivers its report without reading again", (t) => {
+  const f = fixture(t, { queue: [{ seq: 1, text: "slow fleet report" }], pause: "reads", pauseSeconds: 2 });
+  const began = Date.now();
+  const slow = f.raw("receive", "", f.script, { FM_WAKE_RECEIPT_BUDGET: "0.5" });
+  assert.equal(slow.status, 75, slow.stderr || slow.stdout);
+  assert.ok(Date.now() - began < 1800, `returned after ${Date.now() - began} ms, not at the budget`);
+  assert.match(slow.stderr, /wake read is still running after .*result is kept/i);
+  const next = f.run();
+  assert.match(next.report, /1 slow fleet report/);
+  assert.equal(next.pair?.through, 1);
+  assert.equal(f.read().reads, 1);
+});
+
+test("a drain waiting on a held receipt lock stops at the budget and names the holder", async (t) => {
+  const f = fixture(t, { queue: [{ seq: 1, text: "held report" }], pause: "reads", pauseSeconds: 2 });
+  const child = spawn("python3", [helper, f.state, "receive", "", f.script], { stdio: "ignore" });
+  const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+  const deadline = Date.now() + 5000;
+  while (!existsSync(join(f.state, "started"))) {
+    assert.ok(Date.now() < deadline, "native did not start");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const began = Date.now();
+  const waiter = f.raw("receive", "", f.script, { FM_WAKE_RECEIPT_BUDGET: "0.5" });
+  assert.equal(waiter.status, 75, waiter.stderr || waiter.stdout);
+  assert.ok(Date.now() - began < 1500, `waited ${Date.now() - began} ms on the lock`);
+  assert.match(waiter.stderr, new RegExp(`lock is held by a wake receive \\(pid ${child.pid}\\)`));
+  await exited;
+  assert.match(f.run().report, /1 held report/);
+  assert.equal(f.read().reads, 1);
+});
+
+test("the second read for rows that arrived mid-read is skipped when the budget cannot cover it", (t) => {
+  const f = fixture(t, { arriving: [{ seq: 1, text: "late report" }], pause: "reads", pauseSeconds: 1 });
+  const first = f.run("receive", "", f.script, { FM_WAKE_RECEIPT_BUDGET: "1.6" });
+  assert.match(first.report, /queued wakes pending/);
+  assert.equal(f.read().reads, 1);
+  const second = f.run("complete", first.id!);
+  assert.match(second.report, /1 late report/);
 });
 
 test("concurrent receive processes present one receipt and invoke native once", async (t) => {

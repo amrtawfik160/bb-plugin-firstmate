@@ -662,6 +662,28 @@ test("acknowledging a wake receipt that already completed succeeds and returns w
   }
 });
 
+test("a wake read that is still running on the host says so, names the next step, and gets a budget below the host command budget", async () => {
+  const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { fmHome: "/tmp/fm-home", notifyOwner: "real", fmHostId: "host_1" } });
+  await plugin(host.bb);
+  try {
+    const { seen } = stubRoutedHost(host, (cmd) => /^__fm_cmd='bash [^;]*\.fm-receipt-/.test(cmd)
+      ? { payload: "Native wake read is still running after 150s (pid 4242); it finishes on the host and its result is kept.", code: 75 }
+      : {});
+    const result = await host.harness.behavior.runCli(["wake"], { projectId: "proj_1", threadId: "thr_cap" });
+    assert.notEqual(result.exitCode, 0);
+    const text = result.stdout + result.stderr;
+    assert.match(text, /still running on the host; no wake is lost/);
+    assert.match(text, /Call firstmate_wake again/);
+    assert.match(text, /pid 4242/, "the holder named by the host is kept");
+    assert.doesNotMatch(text, /native exit 75/);
+    // The staged receipt script travels base64-encoded in fixed-size chunks.
+    const staged = Buffer.from(seen.map((cmd) => /printf '\\''%s'\\'' '\\''([A-Za-z0-9+\/=]+)'\\'' >> /.exec(cmd)?.[1] ?? "").join(""), "base64").toString("utf8");
+    assert.match(staged, /export FM_WAKE_RECEIPT_BUDGET='150'/, "30 s under the 180 s host command budget");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("a wake read removes the rows it would only hide: a DONE crew with a tracked PR and no crew record", async () => {
   const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { fmHome: "/tmp/fm-home", notifyOwner: "real", fmHostId: "host_1" } });
   await plugin(host.bb);
