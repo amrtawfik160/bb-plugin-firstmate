@@ -27,6 +27,8 @@ async function base() {
  return host;
 }
 const forge=(state,extra={})=>({headRefOid:'sha1',state,isDraft:false,statusCheckRollup:[{status:'COMPLETED',conclusion:'SUCCESS'}],reviewDecision:'',reviews:[],mergeable:'MERGEABLE',mergeCommit:state==='MERGED'?{oid:'sha-merged'}:null,...extra});
+// The scan lists open PRs through the REST API, which has its own rate budget.
+const isOpenList=command=>command.includes('gh api') && command.includes('pulls?state=open');
 const prNumber=command=>Number(/\/pull\/(\d+)/.exec(command)?.[1]);
 
 test('merged and closed PRs leave the open list even when their captain thread is deleted or archived',async()=>{
@@ -123,7 +125,7 @@ test('open PRs on a crew branch are tracked for that crew captain, and other PRs
   host.harness.sdk.stub('environments.get',async({environmentId})=>({id:environmentId,hostId:'host_1',status:'ready',isWorktree:true,path:`/wt/${environmentId}`,branchName:environmentId==='env_thr_c1'?'fm/verify':'fm/verify-extra'}));
   const sweeps=[];
   hostCommands(host,command=>{
-   if(command.includes('gh pr list') && command.includes('--state open')){sweeps.push(command);return{payload:JSON.stringify(openPrs)};}
+   if(isOpenList(command)){sweeps.push(command);return{payload:JSON.stringify(openPrs)};}
    // The older per-crew lookup asks for the single most recent PR on the exact branch.
    if(command.includes('gh pr list')){const head=command.includes('fm/verify-extra')?'fm/verify-extra':'fm/verify';return{payload:JSON.stringify(openPrs.filter(p=>p.headRefName===head).map(p=>({url:p.url})))};}
    if(command.includes('gh pr view'))return{payload:JSON.stringify({...forge('OPEN'),title:openPrs.find(p=>p.number===prNumber(command))?.title})};
@@ -139,7 +141,7 @@ test('open PRs on a crew branch are tracked for that crew captain, and other PRs
    ['acme/repo#12','thr_other','c2','Other captain work'],
   ]);
   assert.equal(sweeps.length,2,'one open-PR list call per supervision cycle');
-  assert.match(sweeps[0],/--author \S*@me/);
+  assert.match(sweeps[0],/pulls\?state=open/);
  }finally{await host.harness.lifecycle.dispose();}
 });
 
@@ -151,7 +153,7 @@ test('a crew PR is tracked when the crew pushed its own fm/ branch, not the work
   host.harness.sdk.stub('environments.get',async({environmentId})=>({id:environmentId,hostId:'host_1',status:'ready',isWorktree:true,path:`/wt/${environmentId}`,branchName:'bb/ship-verification-harness-fixes-thr_c1'}));
   hostCommands(host,command=>{
    if(command.includes('branch --show-current'))return{payload:'fm/verify\n'};
-   if(command.includes('gh pr list') && command.includes('--state open'))return{payload:JSON.stringify(openPrs)};
+   if(isOpenList(command))return{payload:JSON.stringify(openPrs)};
    if(command.includes('gh pr list'))return{payload:'[]'};
    if(command.includes('gh pr view'))return{payload:JSON.stringify(forge('OPEN'))};
    return{code:0};
@@ -211,7 +213,7 @@ function sweepHost(host,{prs,current='',checkedOut='',lists=[]}) {
  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle',environmentId:`env_${threadId}`}));
  host.harness.sdk.stub('environments.get',async({environmentId})=>({id:environmentId,hostId:'host_1',status:'ready',isWorktree:true,path:`/wt/${environmentId.replace('env_','')}`,branchName:`bb/ship-some-task-${environmentId.replace('env_','')}`}));
  return hostCommands(host,command=>{
-  if(command.includes('gh pr list') && command.includes('--state open')){lists.push(command);return{payload:JSON.stringify(typeof prs==='function'?prs():prs)};}
+  if(isOpenList(command)){lists.push(command);return{payload:JSON.stringify(typeof prs==='function'?prs():prs)};}
   if(command.includes('gh pr list'))return{payload:'[]'};
   if(command.includes('gh pr view'))return{payload:JSON.stringify(forge('OPEN'))};
   if(command.includes('checkout: moving from'))return{payload:checkedOut};
@@ -270,7 +272,7 @@ test('a new PR gets its row in the next cycle, with one open-PR list call per re
   sweepHost(host,{prs:[]});
   hostCommands(host,command=>{
    if(command.includes('remote get-url'))return{payload:'git@github.com:acme/repo.git\n'};
-   if(command.includes('gh pr list') && command.includes('--state open')){lists.push(command);return{payload:JSON.stringify(open)};}
+   if(isOpenList(command)){lists.push(command);return{payload:JSON.stringify(open)};}
    if(command.includes('gh pr list'))return{payload:'[]'};
    if(command.includes('gh pr view'))return{payload:JSON.stringify(forge('OPEN'))};
    return{code:0};
@@ -324,5 +326,50 @@ test('bb firstmate prs lists open PRs with their tracking status and marks the u
   assert.match(text,/UNTRACKED.*https:\/\/github\.com\/acme\/repo\/pull\/2096/);
   assert.match(text,/1 of 2 open PRs untracked/);
   assert.deepEqual(rows(host),before,'the command is read-only');
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+// Found on the live host after #121: project bb-plugin-firstmate had only retired crews whose worktrees were removed, so its open PRs were never listed.
+test('open PRs are listed from the project main checkout when every crew worktree of the project is gone',async()=>{
+ const host=await base();try {
+  await host.bb.storage.kv.set('crews',[]);
+  createLaunches(host.bb.storage.database()).save(launch('dead1','thr_gone','thr_cap',{path:'/wt/removed'}));
+  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle'}));
+  hostCommands(host,command=>{
+   // Only the main checkout still exists on the host.
+   if(isOpenList(command))return /cd \S*\/repo\b/.test(command) ? {payload:JSON.stringify([pr(7,'fm/dead1-late'),pr(8,'docs/no-crew')])} : {code:3};
+   if(command.includes('gh pr view'))return{payload:JSON.stringify(forge('OPEN'))};
+   return{code:0};
+  });
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.deepEqual(rows(host),[['acme/repo#7','thr_cap','dead1']]);
+  const listed=JSON.parse((await host.harness.behavior.runCli(['prs','--json'],{threadId:'thr_cap',projectId:'proj_1'})).stdout);
+  assert.deepEqual(listed.map(p=>[p.number,p.tracked]),[[8,false],[7,true]]);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+// 13 Oct 17:30 UTC: after #121 the scan ran a GitHub search every minute per repository and
+// helped exhaust the search budget the whole fleet shares. The plain list API has its own budget.
+test('the open-PR scan does not use GitHub search, counts only PRs of the signed-in account, and lists a project with no live crew every ten minutes',async(t)=>{
+ const host=await base();try {
+  await host.bb.storage.kv.set('crews',[]);
+  createLaunches(host.bb.storage.database()).save(launch('aa11','thr_w1','thr_cap'));
+  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle'}));
+  const start=Date.now();let now=start;t.mock.method(Date,'now',()=>now);
+  const lists=[],all=[];
+  hostCommands(host,command=>{
+   all.push(command);
+   if(command.includes('gh api user'))return{payload:'me\n'};
+   if(isOpenList(command)){lists.push(command);return{payload:JSON.stringify([{...pr(1,'fm/aa11'),author:'me'},{...pr(2,'fm/aa11-by-someone-else'),author:'other'}])};}
+   if(command.includes('gh pr view'))return{payload:JSON.stringify(forge('OPEN'))};
+   return{code:0};
+  });
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.deepEqual(rows(host),[['acme/repo#1','thr_cap','aa11']]);
+  assert.equal(all.some(c=>c.includes('gh pr list') && c.includes('--author')),false,'no search query');
+  now=start+5*60_000;await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.equal(lists.length,1,'a project with only retired crews is not listed again within ten minutes');
+  now=start+10*60_000+1000;await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.equal(lists.length,2);
  }finally{await host.harness.lifecycle.dispose();}
 });

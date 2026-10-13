@@ -6705,7 +6705,7 @@ export default async function plugin(bb: BbPluginApi) {
   // Provenance is the PR's head branch (lib/pr-delivery.ts prBranchOwner): a branch
   // named after the crew, the crew's worktree branch, or a branch its worktree had
   // checked out. Launch records name retired crews. One GitHub list per repository
-  // per cycle; the checked-out branches are read only for a PR no name explains.
+  // per cycle (REST, not search); the checked-out branches are read only for a PR no name explains.
   const RETIRED_CREW_PR_WINDOW_MS = 14 * 86_400_000;
   const UNOWNED_PR_RECHECK_MS = 60 * 60_000;
   type PrCandidate = PrBranchCandidate & { crew: Crew; path: string; hostId: string; live: boolean; fresh: boolean };
@@ -6762,8 +6762,32 @@ export default async function plugin(bb: BbPluginApi) {
     projectRepos.set(key, repo);
     return repo;
   }
+  // A repository no live crew works in is listed every ten minutes, not every cycle.
+  const RETIRED_ONLY_LIST_MS = 10 * 60_000;
+  const openPrLists = new Map<string, { at: number; rows: Record<string, unknown>[] }>();
+  // "By this GitHub account": the login gh is signed in with on that host, read once.
+  const githubLogins = new Map<string, string>();
+  async function hostGithubLogin(hostId: string, signal?: AbortSignal): Promise<string> {
+    const known = githubLogins.get(hostId);
+    if (known !== undefined) return known;
+    const login = await runStructuredOnHost(hostId, "gh api user --jq .login", 30_000, signal)
+      .then((res) => res.exitCode === 0 ? res.output.trim().toLowerCase() : "", (error) => { if (signal?.aborted) throw error; return ""; });
+    if (login) githubLogins.set(hostId, login);
+    return login;
+  }
+  // A project's main checkout outlives every crew worktree, so it can always answer the list call.
+  const projectMains = new Map<string, { at: number; hostId: string; path: string } | { at: number; hostId?: undefined; path?: undefined }>();
+  async function projectMain(projectId: string, signal?: AbortSignal) {
+    const known = projectMains.get(projectId);
+    if (known && Date.now() - known.at < 60 * 60_000) return known;
+    const main = (await raceAbort(bb.sdk.environments.list({ projectId }), signal, STUCK_HOST_CALL_MS).catch((error) => { if (signal?.aborted) throw error; return []; }))
+      .find((e) => e.isWorktree === false && e.status === "ready" && e.path);
+    const found = main?.path ? { at: Date.now(), hostId: main.hostId, path: main.path } : { at: Date.now() };
+    projectMains.set(projectId, found);
+    return found;
+  }
   // Read-only: the open PRs of every repository crews work in, each matched to the crew that opened it.
-  async function readOpenPrs(signal?: AbortSignal, extra: Array<{ projectId: string; hostId: string; path: string }> = []): Promise<OpenPrSnapshot> {
+  async function readOpenPrs(signal?: AbortSignal, extraProjects: Iterable<string> = []): Promise<OpenPrSnapshot> {
     const candidates = await prCandidates(signal);
     const groups = new Map<string, { hostId: string; projects: Set<string>; paths: string[]; candidates: PrCandidate[] }>();
     const repoOf = new Map<string, string>();
@@ -6780,22 +6804,43 @@ export default async function plugin(bb: BbPluginApi) {
       group.candidates.push(candidate);
       groups.set(repo, group);
     }
-    for (const project of extra) {
-      if ([...groups.values()].some((g) => g.projects.has(project.projectId))) continue;
-      groups.set(`${project.projectId}\t${project.hostId}`, { hostId: project.hostId, projects: new Set([project.projectId]), paths: [project.path], candidates: [] });
+    for (const projectId of extraProjects) {
+      if ([...groups.values()].some((g) => g.projects.has(projectId))) continue;
+      const main = await projectMain(projectId, signal);
+      if (main.path) groups.set(`${projectId}\t${main.hostId}`, { hostId: main.hostId, projects: new Set([projectId]), paths: [], candidates: [] });
+    }
+    // Live worktrees first, then the main checkout, then worktrees of retired crews, which may be removed.
+    for (const group of groups.values()) {
+      const live = new Set(group.candidates.filter((c) => c.live).map((c) => c.path));
+      const mains: string[] = [];
+      for (const projectId of group.projects) {
+        const main = await projectMain(projectId, signal);
+        if (main.path && main.hostId === group.hostId) mains.push(main.path);
+      }
+      group.paths = [...[...live].slice(0, 3), ...mains, ...group.paths.filter((path) => !live.has(path))];
     }
     const snapshot: OpenPrSnapshot = { at: Date.now(), repos: [] };
-    for (const group of groups.values()) {
+    for (const [repo, group] of groups) {
       signal?.throwIfAborted();
       await boundedFollowUp(async (s) => {
-        // The first worktree that still exists answers; gh runs once.
-        const tries = [...new Set(group.paths)].slice(0, 8).map((path) => `if cd ${shQuote(path)} 2>/dev/null; then gh pr list --state open --author ${shQuote("@me")} --json number,url,title,headRefName,createdAt,updatedAt --limit 200; exit $?; fi`);
-        const res = await runStructuredOnHost(group.hostId, `${tries.join("; ")}; exit 3`, 30_000, s);
-        if (res.exitCode !== 0) return;
-        const listed: unknown = JSON.parse(res.output);
-        if (!Array.isArray(listed)) return;
+        // The first directory that still exists answers; gh runs once. The REST list has its own
+        // rate budget; `gh pr list --author` is a GitHub search, whose budget the whole fleet shares.
+        const live = group.candidates.some((c) => c.live);
+        const cached = openPrLists.get(repo);
+        let listed = cached && !live && Date.now() - cached.at < RETIRED_ONLY_LIST_MS ? cached.rows : undefined;
+        if (!listed) {
+          const fields = ".[] | {number, url: .html_url, title, headRefName: .head.ref, createdAt: .created_at, updatedAt: .updated_at, author: .user.login} | tojson";
+          const tries = [...new Set(group.paths)].slice(0, 8).map((path) => `if cd ${shQuote(path)} 2>/dev/null; then gh api --paginate ${shQuote("repos/{owner}/{repo}/pulls?state=open&per_page=100")} --jq ${shQuote(fields)}; exit $?; fi`);
+          const res = await runStructuredOnHost(group.hostId, `${tries.join("; ")}; exit 3`, 30_000, s);
+          if (res.exitCode !== 0) return;
+          // One JSON object per line and PR.
+          listed = res.output.split("\n").filter((line) => line.trim()).flatMap((line) => { const row: unknown = JSON.parse(line); return (Array.isArray(row) ? row : [row]).map(asRecord); });
+          openPrLists.set(repo, { at: Date.now(), rows: listed });
+        }
+        const me = await hostGithubLogin(group.hostId, s);
         const prs: OpenPr[] = [];
-        for (const row of listed.map(asRecord)) {
+        for (const row of listed) {
+          if (me && typeof row["author"] === "string" && row["author"].toLowerCase() !== me) continue;
           const url = typeof row["url"] === "string" ? row["url"] : "", head = typeof row["headRefName"] === "string" ? row["headRefName"] : "";
           if (!url || !head) continue;
           let identity: ReturnType<typeof canonicalPr>;
@@ -6808,7 +6853,7 @@ export default async function plugin(bb: BbPluginApi) {
         }
         // A PR no crew name explains and nothing tracks: ask git which worktree had its branch checked out.
         const unexplained = prs.filter((pr) => !pr.candidate && !deliveries.get(pr.id) && Date.now() - (unownedPrs.get(pr.id) ?? 0) >= UNOWNED_PR_RECHECK_MS).slice(0, 40);
-        if (unexplained.length && group.candidates.length) {
+        if (unexplained.length && group.candidates.length && group.paths.length) {
           const wanted = unexplained.map((pr) => `-e ${shQuote(pr.head)}`).join(" ");
           // Each worktree's own HEAD log names every branch it had checked out; no git process per worktree.
           const scan = `for p in ${[...new Set(group.paths)].slice(0, 8).map(shQuote).join(" ")}; do cd "$p" 2>/dev/null && break; done; c=$(cd "$(git rev-parse --git-common-dir)" && pwd) || exit 0; for d in "$c"/worktrees/*/; do w=$(dirname "$(cat "$d/gitdir" 2>/dev/null)"); { sed -n 's|^ref: refs/heads/||p' "$d/HEAD"; sed -n 's/^.*checkout: moving from .* to //p' "$d/logs/HEAD"; } 2>/dev/null | grep -Fx ${wanted} | sort -u | while IFS= read -r b; do printf '%s\\t%s\\n' "$w" "$b"; done; done`;
@@ -6848,16 +6893,8 @@ export default async function plugin(bb: BbPluginApi) {
     for (const r of deliveries.list({ owner: captain, limit: 100 })) projects.add(r.projectId);
     const covered = (snapshot: OpenPrSnapshot | undefined) => snapshot !== undefined && [...projects].every((id) => snapshot.repos.some((repo) => repo.projects.has(id)));
     let snapshot = openPrSnapshot && Date.now() - openPrSnapshot.at < 90_000 && covered(openPrSnapshot) ? openPrSnapshot : undefined;
-    if (!snapshot) {
-      // A project with no crew is listed from its main checkout.
-      const extra: Array<{ projectId: string; hostId: string; path: string }> = [];
-      for (const projectId of projects) {
-        const main = (await raceAbort(bb.sdk.environments.list({ projectId }), signal, STUCK_HOST_CALL_MS).catch((error) => { if (signal?.aborted) throw error; return []; }))
-          .find((e) => e.isWorktree === false && e.status === "ready" && e.path);
-        if (main?.path) extra.push({ projectId, hostId: main.hostId, path: main.path });
-      }
-      snapshot = await readOpenPrs(signal, extra);
-    }
+    // A project with no crew is listed from its main checkout.
+    if (!snapshot) snapshot = await readOpenPrs(signal, projects);
     const now = Date.now(), seen = new Set<string>();
     const rows = snapshot.repos.filter((repo) => [...repo.projects].some((id) => projects.has(id))).flatMap((repo) => repo.prs)
       .filter((pr) => !seen.has(pr.id) && !!seen.add(pr.id))
