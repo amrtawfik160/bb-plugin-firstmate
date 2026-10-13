@@ -49,6 +49,7 @@ the crewmate's result report, never in a message for the user.
 | Unclear spec or contested design | Supervisor: `grill-with-docs` with the user, then `to-spec` and `to-tickets` for work that spans crews; `interrogate` under the review bound below. Crewmate: report the open question in your result |
 | Investigation of how or why, or a spec | poteto-mode `investigation.md`; `how` or `why`, single-model |
 | Design question that needs running code | poteto-mode `prototype.md`; `prototype` |
+| Frontend or UI work (new screen, redesign, visual change) | `frontend-design`; the project's own design system and tokens win where they pin a choice |
 | Pixel-exact UI match | poteto-mode `visual-parity.md` |
 | PR review threads, conflicts or red CI | poteto-mode `babysit.md` |
 | Deploy, merge or other operator task | No playbook: follow the brief's delivery contract |
