@@ -3,8 +3,7 @@ import test from "node:test";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import plugin from "./server.ts";
 import { createLaunches } from "./lib/launch.ts";
-import * as queueStoreModule from "./lib/queue-store.ts";
-const { createQueueStore } = queueStoreModule;
+import { createQueueStore, startOrder } from "./lib/queue-store.ts";
 
 // 13 Oct: an owner-ordered job waited 58 minutes in the queue unseen. Its start by
 // hand was then refused by the away catch-up after the backlog row was added, and
@@ -270,7 +269,6 @@ test("when a slot opens, jobs with an owner message start before jobs without, o
 
 test("startOrder puts owner jobs first and the oldest first inside each group", () => {
   const row = (id: string, createdAt: string, sourceRefs?: string[]) => ({ id, createdAt, sourceRefs });
-  const startOrder = (queueStoreModule as unknown as { startOrder: <T extends { createdAt: string; sourceRefs?: string[] }>(rows: T[]) => T[] }).startOrder;
   const ordered = startOrder([
     row("own-new", "2026-10-13T16:00:00.000Z"), row("owner-new", "2026-10-13T15:58:00.000Z", ["bb:c:2"]),
     row("own-old", "2026-10-13T15:00:00.000Z"), row("owner-old", "2026-10-13T15:50:00.000Z", ["bb:c:1"]), row("empty-refs", "2026-10-13T14:00:00.000Z", []),

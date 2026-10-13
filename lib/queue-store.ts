@@ -19,6 +19,13 @@ export const queueItemSchema = z.object({
 }).strict();
 export type QueueItem = z.infer<typeof queueItemSchema>;
 type Database = ReturnType<BbPluginApi['storage']['database']>;
+/** Start order when a slot opens: jobs that carry an owner message first, the oldest first in each group. */
+export function startOrder<T extends Pick<QueueItem,'createdAt'|'sourceRefs'>>(rows:T[]):T[] {
+  const owner=(row:T)=>(row.sourceRefs?.length??0)>0?0:1;
+  const age=(row:T)=>{const at=Date.parse(row.createdAt);return Number.isFinite(at)?at:Number.MAX_SAFE_INTEGER;};
+  // list() returns the newest row first, so equal times fall back to the reverse of that.
+  return rows.map((row,i)=>({row,i})).sort((a,b)=>owner(a.row)-owner(b.row)||age(a.row)-age(b.row)||b.i-a.i).map(({row})=>row);
+}
 export const queueKey=(row:Pick<QueueItem,'id'|'parentThreadId'|'projectId'>)=>JSON.stringify([row.parentThreadId||null,row.projectId,row.id]);
 
 /** Only queue records move out of KV. The original KV value and an immutable
@@ -27,6 +34,7 @@ export function createQueueStore(db:Database, legacy:()=>Promise<unknown>) {
   db.exec(`CREATE TABLE IF NOT EXISTS queue_records (key TEXT PRIMARY KEY, owner TEXT, project TEXT NOT NULL, ordinal INTEGER NOT NULL UNIQUE, record TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS queue_owner ON queue_records(owner,ordinal);
     CREATE TABLE IF NOT EXISTS queue_start_refusals (key TEXT PRIMARY KEY, reason TEXT NOT NULL, noticed INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS queue_wait_notices (key TEXT PRIMARY KEY, noticed_at INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS queue_migration (id INTEGER PRIMARY KEY CHECK(id=1), original TEXT NOT NULL, sha256 TEXT NOT NULL, count INTEGER NOT NULL);`);
   const migrated=()=>!!db.prepare('SELECT 1 FROM queue_migration WHERE id=1').get();
   let pending:Promise<void>|undefined;
@@ -119,5 +127,8 @@ export function createQueueStore(db:Database, legacy:()=>Promise<unknown>) {
   }
   function noticeStartRefusal(row:Identity) { db.prepare('UPDATE queue_start_refusals SET noticed=1 WHERE key=?').run(queueKey(row)); }
   function clearStartRefusal(row:Identity) { db.prepare('DELETE FROM queue_start_refusals WHERE key=?').run(queueKey(row)); }
-  return {ready,get,list,add,patch,transform,startRefusal,refuseStart,noticeStartRefusal,clearStartRefusal};
+  // The captain is told once that an owner job is still waiting for a slot.
+  function waitNoticed(row:Identity):boolean { return !!db.prepare('SELECT 1 FROM queue_wait_notices WHERE key=?').get(queueKey(row)); }
+  function noticeWait(row:Identity,at:number) { db.prepare('INSERT OR IGNORE INTO queue_wait_notices VALUES (?,?)').run(queueKey(row),at); }
+  return {ready,get,list,add,patch,transform,startRefusal,refuseStart,noticeStartRefusal,clearStartRefusal,waitNoticed,noticeWait};
 }
