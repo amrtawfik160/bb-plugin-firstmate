@@ -326,3 +326,22 @@ test('bb firstmate prs lists open PRs with their tracking status and marks the u
   assert.deepEqual(rows(host),before,'the command is read-only');
  }finally{await host.harness.lifecycle.dispose();}
 });
+
+// Found on the live host after #121: project bb-plugin-firstmate had only retired crews whose worktrees were removed, so its open PRs were never listed.
+test('open PRs are listed from the project main checkout when every crew worktree of the project is gone',async()=>{
+ const host=await base();try {
+  await host.bb.storage.kv.set('crews',[]);
+  createLaunches(host.bb.storage.database()).save(launch('dead1','thr_gone','thr_cap',{path:'/wt/removed'}));
+  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle'}));
+  hostCommands(host,command=>{
+   // Only the main checkout still exists on the host.
+   if(command.includes('gh pr list') && command.includes('--state open'))return command.includes("cd '/repo'")||command.includes('cd /repo ') ? {payload:JSON.stringify([pr(7,'fm/dead1-late'),pr(8,'docs/no-crew')])} : {code:3};
+   if(command.includes('gh pr view'))return{payload:JSON.stringify(forge('OPEN'))};
+   return{code:0};
+  });
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.deepEqual(rows(host),[['acme/repo#7','thr_cap','dead1']]);
+  const listed=JSON.parse((await host.harness.behavior.runCli(['prs','--json'],{threadId:'thr_cap',projectId:'proj_1'})).stdout);
+  assert.deepEqual(listed.map(p=>[p.number,p.tracked]),[[8,false],[7,true]]);
+ }finally{await host.harness.lifecycle.dispose();}
+});
