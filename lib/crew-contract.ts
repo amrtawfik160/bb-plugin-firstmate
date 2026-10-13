@@ -56,7 +56,7 @@ export const BRIEF_SKILLS = [
   "skill-routing", "poteto-mode", "no-comments", "diagnosing-bugs", "tdd", "benchmark-checklist", "codebase-design",
   "improve-codebase-architecture", "grill-with-docs", "to-spec", "to-tickets", "interrogate", "how", "why", "architect",
   "arena", "prototype", "code-review", "blast-radius", "pr", "unslop", "technical-writing", "writing-for-agents",
-  "zoom-out", "deslop", "figure-it-out", "control-cli", "control-ui",
+  "zoom-out", "deslop", "figure-it-out", "control-cli", "control-ui", "frontend-design",
 ] as const;
 
 // Read-only. A provider that is not installed (no parent folder) is skipped.
