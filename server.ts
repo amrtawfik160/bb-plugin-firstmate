@@ -84,7 +84,7 @@ import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRe
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
 import { optionHelp } from "./lib/cli-help.ts";
 import { AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython } from "./lib/native-policy.ts";
-import { createDeliveries, LOST_OWNER_RECHECK_MS, canonicalPr, deliveryLine, parseForge, type DeliveryRecord } from "./lib/pr-delivery.ts";
+import { createDeliveries, LOST_OWNER_RECHECK_MS, canonicalPr, decisionLine, deliveryLine, parseForge, prBranchOwner, type DeliveryRecord, type PrBranchCandidate } from "./lib/pr-delivery.ts";
 import { captureHostCommand, decodeHostCapture } from "./lib/host-capture.ts";
 import { selectExecution, validateLaunchCapabilities } from "./lib/execution-selection.ts";
 import { crewSkillBlock, PLAYBOOK_CHOICES, redactSecrets, skillCheckScript, skillRoutingLinkScript } from "./lib/crew-contract.ts";
@@ -2805,12 +2805,17 @@ export default async function plugin(bb: BbPluginApi) {
     let prUrl = "";
     const outcome = parseOutcome(output);
     // A PR can exist while the crew is blocked, failed, or still working.
+    let otherOpenPrs: string[] = [];
     if (event === "idle" && verdictOf(outcome) === "DONE") {
       const pr = await prForCrew(crew);
-      if (pr.url !== "") {
+      // A crew with an open PR is not plainly done: every such PR is named for a decision.
+      const open = undecidedPrs(crew).map((r) => r.url);
+      const first = pr.url !== "" ? pr.url : open[0] ?? "";
+      if (first !== "") {
         kind = "review";
-        prUrl = pr.url;
+        prUrl = first;
       }
+      otherOpenPrs = open.filter((url) => url !== first && prKeyOf(url) !== prKeyOf(first));
     }
     const afk = await readAfk(parentThreadId);
     const quietState = await readQuiet(parentThreadId);
@@ -2849,6 +2854,7 @@ export default async function plugin(bb: BbPluginApi) {
                   : `⏳ crew ${crew.id} ${kind}`;
     const lines = [`${head} [${crew.shape}] :: ${truncate(crewLabel(crew), 100)}`];
     if (prUrl !== "") lines.push(prUrl);
+    if (otherOpenPrs.length > 0) lines.push(`${otherOpenPrs.length} more open PR(s) need a decision (merge, fix or close): ${otherOpenPrs.join(" ")}`);
     if ((crew.sourceRefs ?? []).length > 0) lines.push(`refs=${crew.sourceRefs!.join(",")}`);
     if (outcome !== null) lines.push(outcome);
     else if (output !== null && output !== "") lines.push(truncate(output.replace(/\n/g, " "), 400));
@@ -6424,8 +6430,9 @@ export default async function plugin(bb: BbPluginApi) {
     catch(error) { if (signal?.aborted || record || crew.launchKey) throw error; return "merged" as const; }
     return recoveredContract(metadata,record);
   }
-  async function registerCrewPr(crew: Crew, url: string,signal?:AbortSignal,facts:{title?:string;openedAt?:number}={}) {
-    if (crew.shape !== "ship" || crew.posture === "local-only" || isSecondmateRoute(crew) || !url) return;
+  // `provenBranch`: the PR head is this crew's branch, so a scout or a local-only crew that opened it is tracked too.
+  async function registerCrewPr(crew: Crew, url: string,signal?:AbortSignal,facts:{title?:string;openedAt?:number}={},provenBranch=false) {
+    if (isSecondmateRoute(crew) || !url || (!provenBranch && (crew.shape !== "ship" || crew.posture === "local-only"))) return;
     const identity = canonicalPr(url);
     const prior=deliveries.get(identity.id);
     if (prior && (prior.taskId !== crew.id || prior.owner !== crew.parentThreadId)) {
@@ -6484,7 +6491,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (ownerState === "lost") record=deliveries.markOwnerNeeded(record.id) ?? record;
       else if (ownerState === "live") record=deliveries.ownerRestored(record.id) ?? record;
       const hostId = await resolveHostForProject(record.projectId,ownerState === "live" ? record.owner ?? undefined : undefined,signal);
-      const result = await runStructuredOnHost(hostId, `gh pr view ${shQuote(record.url)} --json state,isDraft,headRefOid,statusCheckRollup,reviewDecision,reviews,mergeable,mergeCommit,title,createdAt,comments,labels,commits`,30_000,signal);
+      const result = await runStructuredOnHost(hostId, `gh pr view ${shQuote(record.url)} --json state,isDraft,headRefOid,statusCheckRollup,reviewDecision,reviews,mergeable,mergeCommit,title,createdAt,updatedAt,comments,labels,commits`,30_000,signal);
       if (result.exitCode !== 0) throw new Error(result.stderr || result.output || `Forge lookup exit ${result.exitCode}`);
       const observation = parseForge(JSON.parse(result.output));
       // Standing yolo allows asking the manager to continue; only native merge
@@ -6626,25 +6633,30 @@ export default async function plugin(bb: BbPluginApi) {
       },signal).catch(error=>bb.log.warn(`Launch recovery ${record.taskId}: ${String(error)}`));
     }
   }
-  // Every open PR a crew opens is tracked, not only the first one it reports.
-  // A crew's worktree branch proves provenance: an open PR whose head is that
-  // branch, or a branch named after it (`<branch>-…`, `<branch>/…`), belongs to
-  // the crew with the longest matching branch, owned by that crew's captain.
-  // One GitHub list per project and host, at most every five minutes.
-  const OPEN_PR_SWEEP_MS = 5 * 60_000;
-  let lastOpenPrSweep = 0;
+  // Every open PR a crew opens gets a delivery row within one supervision cycle: the
+  // second and later PRs, a scout's PR, and a PR opened after the crew was retired.
+  // Provenance is the PR's head branch (lib/pr-delivery.ts prBranchOwner): a branch
+  // named after the crew, the crew's worktree branch, or a branch its worktree had
+  // checked out. Launch records name retired crews. One GitHub list per repository
+  // per cycle; the checked-out branches are read only for a PR no name explains.
+  const RETIRED_CREW_PR_WINDOW_MS = 14 * 86_400_000;
+  const UNOWNED_PR_RECHECK_MS = 60 * 60_000;
+  type PrCandidate = PrBranchCandidate & { crew: Crew; path: string; hostId: string; live: boolean; fresh: boolean };
+  type OpenPr = { id: string; number: number; url: string; head: string; title?: string; openedAt?: number; touchedAt?: number; candidate?: PrCandidate };
+  type OpenPrSnapshot = { at: number; repos: Array<{ projects: Set<string>; prs: OpenPr[] }> };
   const crewBranches = new Map<string, { branch: string; path: string; hostId: string }>();
-  async function openPrSweep(signal?: AbortSignal) {
-    if (Date.now() - lastOpenPrSweep < OPEN_PR_SWEEP_MS) return;
-    lastOpenPrSweep = Date.now();
-    const crews = (await raceAbort(readCrews(), signal, STUCK_HOST_CALL_MS))
-      .filter((c) => c.shape === "ship" && c.worktree && c.posture !== "local-only" && !isSecondmateRoute(c) && c.parentThreadId);
+  const projectRepos = new Map<string, string>();
+  const unownedPrs = new Map<string, number>();
+  let openPrSnapshot: OpenPrSnapshot | undefined;
+  async function prCandidates(signal?: AbortSignal): Promise<PrCandidate[]> {
+    const crews = (await raceAbort(readCrews(), signal, STUCK_HOST_CALL_MS)).filter((c) => !isSecondmateRoute(c) && c.parentThreadId);
     for (const threadId of crewBranches.keys()) if (!crews.some((c) => c.threadId === threadId)) crewBranches.delete(threadId);
-    const groups = new Map<string, { hostId: string; paths: string[]; crews: Array<{ crew: Crew; branch: string; path: string }> }>();
-    for (const crew of crews) {
+    const records = launches.withWorkers();
+    const candidates: PrCandidate[] = [];
+    for (const crew of [...crews].sort((a, b) => a.createdAt.localeCompare(b.createdAt))) {
       signal?.throwIfAborted();
       let found = crewBranches.get(crew.threadId);
-      if (!found) {
+      if (!found && crew.worktree) {
         found = await boundedFollowUp(async (s) => {
           const envId = await threadEnv(crew.threadId, s);
           if (!envId) return undefined;
@@ -6654,49 +6666,173 @@ export default async function plugin(bb: BbPluginApi) {
           const hostId = typeof env["hostId"] === "string" ? env["hostId"] : "";
           return branch && path && hostId && env["isWorktree"] !== false ? { branch, path, hostId } : undefined;
         }, signal).catch((error) => { if (signal?.aborted) throw error; return undefined; });
-        if (!found) continue;
-        crewBranches.set(crew.threadId, found);
+        if (found) crewBranches.set(crew.threadId, found);
       }
-      const key = `${crew.projectId}\t${found.hostId}`;
-      const group = groups.get(key) ?? { hostId: found.hostId, paths: [], crews: [] };
-      group.paths.push(found.path);
-      group.crews.push({ crew, branch: found.branch, path: found.path });
-      groups.set(key, group);
+      const record = records.find((r) => r.threadId === crew.threadId);
+      const path = found?.path ?? record?.path ?? "", hostId = found?.hostId ?? record?.hostId ?? "";
+      if (!path || !hostId) continue;
+      candidates.push({ key: crew.threadId, taskId: crew.id, envBranch: found?.branch, crew, path, hostId, live: true, fresh: true });
     }
+    const liveThreads = new Set(crews.map((c) => c.threadId));
+    for (const r of records) {
+      if (!r.threadId || liveThreads.has(r.threadId) || !r.owner || !r.path || !r.hostId || (r.shape !== "ship" && r.shape !== "scout")) continue;
+      const posture = modeSchema.safeParse(r.deliveryMode);
+      const crew: Crew = { id: r.taskId, task: "Retired crew", projectId: r.projectId, parentThreadId: r.owner, threadId: r.threadId, nativeHome: r.home,
+        providerId: null, model: null, reasoningLevel: null, worktree: true, shape: r.shape, posture: posture.success ? posture.data : "direct-PR",
+        yolo: r.yolo, launchKey: r.key, deliveryRequirement: r.deliveryRequirement, createdAt: new Date(r.updatedAt).toISOString() };
+      candidates.push({ key: r.threadId, taskId: r.taskId, crew, path: r.path, hostId: r.hostId, live: false, fresh: Date.now() - r.updatedAt < RETIRED_CREW_PR_WINDOW_MS });
+    }
+    return candidates;
+  }
+  // The repository a project's worktrees push to, so two projects on one repository share one list call.
+  async function projectRepo(candidate: PrCandidate, signal?: AbortSignal): Promise<string> {
+    const key = `${candidate.crew.projectId}\t${candidate.hostId}`;
+    const known = projectRepos.get(key);
+    if (known) return known;
+    const remote = await boundedFollowUp((s) => runStructuredOnHost(candidate.hostId, `git -C ${shQuote(candidate.path)} remote get-url origin`, 30_000, s), signal)
+      .then((res) => res.exitCode === 0 ? res.output.trim().toLowerCase().replace(/\.git$/, "").replace(/^.*github\.com[:/]/, "") : "", (error) => { if (signal?.aborted) throw error; return ""; });
+    const repo = remote ? `${candidate.hostId}\t${remote}` : key;
+    projectRepos.set(key, repo);
+    return repo;
+  }
+  // Read-only: the open PRs of every repository crews work in, each matched to the crew that opened it.
+  async function readOpenPrs(signal?: AbortSignal, extra: Array<{ projectId: string; hostId: string; path: string }> = []): Promise<OpenPrSnapshot> {
+    const candidates = await prCandidates(signal);
+    const groups = new Map<string, { hostId: string; projects: Set<string>; paths: string[]; candidates: PrCandidate[] }>();
+    const repoOf = new Map<string, string>();
+    for (const candidate of [...candidates.filter((c) => c.fresh), ...candidates.filter((c) => !c.fresh)]) {
+      signal?.throwIfAborted();
+      const scope = `${candidate.crew.projectId}\t${candidate.hostId}`;
+      // An old retired crew never starts a list call by itself; it only joins the one its project already gets.
+      if (!candidate.fresh && !repoOf.has(scope)) continue;
+      const repo = repoOf.get(scope) ?? await projectRepo(candidate, signal);
+      repoOf.set(scope, repo);
+      const group = groups.get(repo) ?? { hostId: candidate.hostId, projects: new Set<string>(), paths: [], candidates: [] };
+      group.projects.add(candidate.crew.projectId);
+      if (candidate.live) group.paths.unshift(candidate.path); else group.paths.push(candidate.path);
+      group.candidates.push(candidate);
+      groups.set(repo, group);
+    }
+    for (const project of extra) {
+      if ([...groups.values()].some((g) => g.projects.has(project.projectId))) continue;
+      groups.set(`${project.projectId}\t${project.hostId}`, { hostId: project.hostId, projects: new Set([project.projectId]), paths: [project.path], candidates: [] });
+    }
+    const snapshot: OpenPrSnapshot = { at: Date.now(), repos: [] };
     for (const group of groups.values()) {
       signal?.throwIfAborted();
       await boundedFollowUp(async (s) => {
-        let listed: unknown;
-        for (const path of [...new Set(group.paths)].slice(0, 3)) {
-          const res = await runStructuredOnHost(group.hostId, `cd ${shQuote(path)} && gh pr list --state open --author ${shQuote("@me")} --json number,url,title,headRefName,createdAt --limit 100`, 30_000, s);
-          if (res.exitCode === 0) { listed = JSON.parse(res.output); break; }
-        }
+        // The first worktree that still exists answers; gh runs once.
+        const tries = [...new Set(group.paths)].slice(0, 8).map((path) => `if cd ${shQuote(path)} 2>/dev/null; then gh pr list --state open --author ${shQuote("@me")} --json number,url,title,headRefName,createdAt,updatedAt --limit 200; exit $?; fi`);
+        const res = await runStructuredOnHost(group.hostId, `${tries.join("; ")}; exit 3`, 30_000, s);
+        if (res.exitCode !== 0) return;
+        const listed: unknown = JSON.parse(res.output);
         if (!Array.isArray(listed)) return;
-        // BB keeps the worktree's first branch name; crews push the branch their brief
-        // creates (fm/<task>), so the checkout's current branch is read as well.
-        const current = await runStructuredOnHost(group.hostId, group.crews.map(({ path }) => `printf '%s\\n' "$(git -C ${shQuote(path)} branch --show-current 2>/dev/null)"`).join("; "), 30_000, s)
-          .then((res) => res.output.split("\n"), (error) => { if (s.aborted) throw error; return [] as string[]; });
-        const branches = group.crews.flatMap(({ crew, branch }, i) => [{ crew, branch }, ...(current[i]?.trim() ? [{ crew, branch: current[i]!.trim() }] : [])]);
-        for (const pr of listed.map(asRecord)) {
-          const url = typeof pr["url"] === "string" ? pr["url"] : "", head = typeof pr["headRefName"] === "string" ? pr["headRefName"] : "";
+        const prs: OpenPr[] = [];
+        for (const row of listed.map(asRecord)) {
+          const url = typeof row["url"] === "string" ? row["url"] : "", head = typeof row["headRefName"] === "string" ? row["headRefName"] : "";
           if (!url || !head) continue;
-          const owner = branches
-            .filter(({ branch }) => head === branch || head.startsWith(`${branch}-`) || head.startsWith(`${branch}/`))
-            .sort((a, b) => b.branch.length - a.branch.length)[0];
-          if (!owner) continue;
-          const title = typeof pr["title"] === "string" && pr["title"].trim() ? pr["title"].trim().slice(0, 300) : undefined;
-          const opened = typeof pr["createdAt"] === "string" ? Date.parse(pr["createdAt"]) : NaN;
-          let id: string;
-          try { id = canonicalPr(url).id; } catch { continue; }
-          const prior = deliveries.get(id);
-          if (prior) { if (title && !prior.title) deliveries.save({ ...prior, title }); continue; }
-          await registerCrewPr(owner.crew, url, s, { title, ...(Number.isFinite(opened) ? { openedAt: opened } : {}) })
-            .catch((error) => { if (s.aborted) throw error; bb.log.warn(`Open PR tracking ${id}: ${String(error)}`); });
+          let identity: ReturnType<typeof canonicalPr>;
+          try { identity = canonicalPr(url); } catch { continue; }
+          const opened = typeof row["createdAt"] === "string" ? Date.parse(row["createdAt"]) : NaN, touched = typeof row["updatedAt"] === "string" ? Date.parse(row["updatedAt"]) : NaN;
+          prs.push({ id: identity.id, number: identity.number, url: identity.url, head,
+            ...(typeof row["title"] === "string" && row["title"].trim() ? { title: row["title"].trim().slice(0, 300) } : {}),
+            ...(Number.isFinite(opened) ? { openedAt: opened } : {}), ...(Number.isFinite(touched) ? { touchedAt: touched } : {}),
+            candidate: prBranchOwner(head, group.candidates) });
         }
-      }, signal).catch((error) => { if (!signal?.aborted) bb.log.warn(`Open PR sweep: ${String(error)}`); });
+        // A PR no crew name explains and nothing tracks: ask git which worktree had its branch checked out.
+        const unexplained = prs.filter((pr) => !pr.candidate && !deliveries.get(pr.id) && Date.now() - (unownedPrs.get(pr.id) ?? 0) >= UNOWNED_PR_RECHECK_MS).slice(0, 40);
+        if (unexplained.length && group.candidates.length) {
+          const wanted = unexplained.map((pr) => `-e ${shQuote(pr.head)}`).join(" ");
+          // Each worktree's own HEAD log names every branch it had checked out; no git process per worktree.
+          const scan = `for p in ${[...new Set(group.paths)].slice(0, 8).map(shQuote).join(" ")}; do cd "$p" 2>/dev/null && break; done; c=$(cd "$(git rev-parse --git-common-dir)" && pwd) || exit 0; for d in "$c"/worktrees/*/; do w=$(dirname "$(cat "$d/gitdir" 2>/dev/null)"); { sed -n 's|^ref: refs/heads/||p' "$d/HEAD"; sed -n 's/^.*checkout: moving from .* to //p' "$d/logs/HEAD"; } 2>/dev/null | grep -Fx ${wanted} | sort -u | while IFS= read -r b; do printf '%s\\t%s\\n' "$w" "$b"; done; done`;
+          const lines = await runStructuredOnHost(group.hostId, scan, 30_000, s).then((r) => r.output.split("\n"), (error) => { if (s.aborted) throw error; return [] as string[]; });
+          const checkedOut = new Map<string, string[]>();
+          for (const line of lines) {
+            const [path, branch] = line.split("\t");
+            if (path && branch) checkedOut.set(path.replace(/\/+$/, ""), [...(checkedOut.get(path.replace(/\/+$/, "")) ?? []), branch.trim()]);
+          }
+          const withBranches = group.candidates.map((c) => ({ ...c, checkedOut: checkedOut.get(c.path.replace(/\/+$/, "")) ?? [] }));
+          for (const pr of unexplained) {
+            const owner = prBranchOwner(pr.head, withBranches);
+            if (owner) pr.candidate = group.candidates.find((c) => c.key === owner.key);
+            else unownedPrs.set(pr.id, Date.now());
+          }
+        }
+        snapshot.repos.push({ projects: group.projects, prs });
+      }, signal).catch((error) => { if (!signal?.aborted) bb.log.warn(`Open PR list: ${String(error)}`); });
+    }
+    return snapshot;
+  }
+  async function openPrSweep(signal?: AbortSignal) {
+    const snapshot = await readOpenPrs(signal);
+    openPrSnapshot = snapshot;
+    for (const pr of snapshot.repos.flatMap((repo) => repo.prs)) {
+      signal?.throwIfAborted();
+      if (deliveries.touch(pr.id, pr.touchedAt, pr.title) || !pr.candidate) continue;
+      await boundedFollowUp((s) => registerCrewPr(pr.candidate!.crew, pr.url, s, { title: pr.title, openedAt: pr.openedAt }, true), signal)
+        .then(() => { deliveries.touch(pr.id, pr.touchedAt); }, (error) => { if (signal?.aborted) throw error; bb.log.warn(`Open PR tracking ${pr.id}: ${String(error)}`); });
+    }
+  }
+  // Read-only view for a captain: every open PR by this GitHub account in the captain's projects, untracked first.
+  async function openPrReport(captain: string, project: string | undefined, signal?: AbortSignal) {
+    const projects = new Set<string>(project ? [project] : []);
+    if (!project) try { projects.add((await raceAbort(bb.sdk.threads.get({ threadId: captain, signal }), signal, STUCK_HOST_CALL_MS)).projectId); } catch (error) { if (signal?.aborted) throw error; }
+    for (const crew of await readCrews()) if (crew.parentThreadId === captain) projects.add(crew.projectId);
+    for (const r of deliveries.list({ owner: captain, limit: 100 })) projects.add(r.projectId);
+    const covered = (snapshot: OpenPrSnapshot | undefined) => snapshot !== undefined && [...projects].every((id) => snapshot.repos.some((repo) => repo.projects.has(id)));
+    let snapshot = openPrSnapshot && Date.now() - openPrSnapshot.at < 90_000 && covered(openPrSnapshot) ? openPrSnapshot : undefined;
+    if (!snapshot) {
+      // A project with no crew is listed from its main checkout.
+      const extra: Array<{ projectId: string; hostId: string; path: string }> = [];
+      for (const projectId of projects) {
+        const main = (await raceAbort(bb.sdk.environments.list({ projectId }), signal, STUCK_HOST_CALL_MS).catch((error) => { if (signal?.aborted) throw error; return []; }))
+          .find((e) => e.isWorktree === false && e.status === "ready" && e.path);
+        if (main?.path) extra.push({ projectId, hostId: main.hostId, path: main.path });
+      }
+      snapshot = await readOpenPrs(signal, extra);
+    }
+    const now = Date.now(), seen = new Set<string>();
+    const rows = snapshot.repos.filter((repo) => [...repo.projects].some((id) => projects.has(id))).flatMap((repo) => repo.prs)
+      .filter((pr) => !seen.has(pr.id) && !!seen.add(pr.id))
+      .map((pr) => {
+        const record = deliveries.get(pr.id);
+        return { number: pr.number, url: pr.url, title: pr.title ?? "", branch: pr.head, openedAt: pr.openedAt ?? null, touchedAt: pr.touchedAt ?? null,
+          tracked: record !== undefined, status: record?.status ?? null, owner: record?.owner ?? null, crewId: record?.taskId ?? pr.candidate?.taskId ?? null };
+      })
+      .sort((a, b) => Number(a.tracked) - Number(b.tracked) || b.number - a.number);
+    const idle = (at: number | null) => at === null || now - at < 86_400_000 ? "" : `, untouched ${Math.floor((now - at) / 86_400_000) >= 2 ? `${Math.floor((now - at) / 86_400_000)} days` : "24 hours"}`;
+    const lines = rows.map((r) => r.tracked
+      ? `tracked    #${r.number} ${truncate(r.title, 70)} [${r.branch}] — ${r.status}, crew ${r.crewId}${r.owner === captain ? "" : `, manager ${r.owner ?? "none"}`}${idle(r.touchedAt)} — ${r.url}`
+      : `UNTRACKED  #${r.number} ${truncate(r.title, 70)} [${r.branch}] — ${r.crewId ? `crew ${r.crewId}; its row is made in the next cycle` : "no crew branch or crew worktree matches"}${idle(r.touchedAt)} — ${r.url}`);
+    const untracked = rows.filter((r) => !r.tracked).length;
+    lines.push(rows.length === 0 ? "No open PRs by this GitHub account in this captain's projects."
+      : `${untracked} of ${rows.length} open PRs untracked.${untracked ? " Track one you want followed: bb firstmate deliveries register --url <PR url>" : ""}`);
+    return { rows, text: lines.join("\n") };
+  }
+  // A crew's PRs that still need a decision: open, so neither merged, closed nor explicitly abandoned.
+  function undecidedPrs(crew: Crew, exceptUrl = ""): DeliveryRecord[] {
+    let except = "";
+    try { if (exceptUrl) except = canonicalPr(exceptUrl).id; } catch { /* not a PR link */ }
+    return deliveries.undecided(crew.id, crew.projectId).filter((r) => r.id !== except && (r.owner === crew.parentThreadId || r.workers.includes(crew.threadId)));
+  }
+  // Once per day and per captain: the open PRs nobody touched for 24 hours, one line each.
+  async function askPrDecisions(signal?: AbortSignal) {
+    const now = Date.now();
+    const byOwner = new Map<string, DeliveryRecord[]>();
+    for (const r of deliveries.needingDecision(now)) byOwner.set(r.owner!, [...(byOwner.get(r.owner!) ?? []), r]);
+    for (const [owner, records] of byOwner) {
+      signal?.throwIfAborted();
+      const shown = records.slice(0, 25);
+      const text = [`Open PRs nobody touched for 24 hours (${records.length}). Decide for each: merge, fix or close.`, ...shown.map((r) => decisionLine(r, now)),
+        ...(records.length > shown.length ? [`…and ${records.length - shown.length} more: bb firstmate prs`] : [])].join("\n");
+      const told = await boundedFollowUp((s) => deliverToCaptain(owner, text, "pr-decisions", s, true), signal)
+        .catch((error) => { if (signal?.aborted) throw error; bb.log.warn(`PR decision list for ${owner}: ${String(error)}`); return false; });
+      if (told) deliveries.markDecisionAsked(records.map((r) => r.id), now);
     }
   }
   async function deliveryPass(signal?: AbortSignal) {
+    // First, so a PR opened this minute gets its row and its first GitHub read in this cycle.
+    await openPrSweep(signal).catch(error=>{ if (!signal?.aborted) bb.log.warn(`Open PR sweep: ${String(error)}`); });
     await recoverDoneDeliveries(signal);
     const crews = await raceAbort(readCrews(),signal,STUCK_HOST_CALL_MS);
     const batch = [...crews.slice(deliveryDiscoveryCursor),...crews.slice(0,deliveryDiscoveryCursor)].slice(0,10);
@@ -6722,7 +6858,7 @@ export default async function plugin(bb: BbPluginApi) {
     for (const record of deliveries.pendingNotifications()) {
       if (record.notification.desired !== record.notification.delivered) await boundedFollowUp(s=>notifyDelivery(record,s),signal).catch(error=>bb.log.warn(`PR notification ${record.id}: ${String(error)}`));
     }
-    await openPrSweep(signal).catch(error=>{ if (!signal?.aborted) bb.log.warn(`Open PR sweep: ${String(error)}`); });
+    await askPrDecisions(signal).catch(error=>{ if (!signal?.aborted) bb.log.warn(`PR decision list: ${String(error)}`); });
   }
   const deliveryParams = z.object({
     action:z.enum(["list","inspect","register","reconcile","assign","abandon","clear-hold","verify","account"]),
@@ -7012,9 +7148,16 @@ export default async function plugin(bb: BbPluginApi) {
     allowMissingCheck?: string,
     opts: { caller?: string; overrideOwner?: boolean; keepCrew?: boolean } = {},
   ): Promise<string> {
-    const keep = opts.keepCrew === true;
-    const settle = (outcome: string, pr: string) => keep ? keepLanded(crew, outcome, pr) : retireLanded(crew, outcome, pr);
-    const kept = `Crew ${crew.id} kept, not retired: its thread, worktree and firstmate_tell still work. Retire it later with firstmate_forget crewId=${crew.id} stop=true.`;
+    let keep = opts.keepCrew === true;
+    let kept = `Crew ${crew.id} kept, not retired: its thread, worktree and firstmate_tell still work. Retire it later with firstmate_forget crewId=${crew.id} stop=true.`;
+    // A crew with another PR still open is kept: its worktree is where that PR gets fixed.
+    const keepForOpenPrs = (mergedPr: string) => {
+      const others = keep ? [] : undecidedPrs(crew, mergedPr);
+      if (others.length === 0) return;
+      keep = true;
+      kept = `Crew ${crew.id} kept, not retired: ${others.length} other open PR(s) need a decision (merge, fix or close): ${others.map((r) => r.url).join(" ")}`;
+    };
+    const settle = (outcome: string, pr: string) => { keepForOpenPrs(pr); return keep ? keepLanded(crew, outcome, pr) : retireLanded(crew, outcome, pr); };
     const posture = await postureOf(crew.projectId);
     // Captain authority (yes/yolo) and check waivers are separate: neither waiver
     // grants authority, so either waiver without --yes still refuses.
@@ -7075,7 +7218,7 @@ export default async function plugin(bb: BbPluginApi) {
       const note = await settle("merged through native gate", pr.url);
       return `Merged ${pr.url}\n${keep ? kept : `Crew ${crew.id} retired.${note}`}`;
     }
-    if (local) return mergeLocal(crew, envId, keep ? kept : undefined);
+    if (local) { keepForOpenPrs(""); return mergeLocal(crew, envId, keep ? kept : undefined); }
     if (crew.posture === "no-mistakes") {
       const dirty = extractPaths(
         await bb.sdk.environments.diffFiles({ environmentId: envId, target: "uncommitted" }),
@@ -7269,6 +7412,13 @@ export default async function plugin(bb: BbPluginApi) {
         continue;
       }
       if (!terminal) continue;
+      // One merged PR does not finish a crew that has another PR open: teardown would
+      // remove the worktree those PRs are fixed from. Each open PR has its own row and notice.
+      const stillOpen = undecidedPrs(crew, url);
+      if (stillOpen.length > 0) {
+        if (url) await registerCrewPr(crew, url).catch(() => {});
+        continue;
+      }
       const tell = state === "merged" && (opts.notify === true || (opts.notifyUnless !== undefined && crew.parentThreadId !== opts.notifyUnless));
       try {
         await retireLanded(crew, state === "merged" ? "merged externally" : "PR closed externally", url, state === "merged");
@@ -7505,10 +7655,12 @@ export default async function plugin(bb: BbPluginApi) {
       }
       preserveAuthority=deliveries.hasOwned(crew.parentThreadId ?? "",crew.projectId,crew.id);
     }
-    if (stop && preserveAuthority) throw new Error("Outstanding PR delivery requires this task's native authority and environment. Forget without --stop, or complete/explicitly abandon its delivery before teardown.");
+    const openPrs = undecidedPrs(crew);
+    if (stop && preserveAuthority) throw new Error(`Outstanding PR delivery requires this task's native authority and environment. Forget without --stop, or complete/explicitly abandon its delivery before teardown.${openPrs.length ? ` Open PR(s) with no decision: ${openPrs.map((r) => r.url).join(" ")}` : ""}`);
     let worktreeRemoved = false;
     let nativeTeardown = false;
     const notes: string[] = [];
+    if (openPrs.length > 0) notes.push(`${openPrs.length} open PR(s) stay tracked for you and still need a decision (merge, fix or close): ${openPrs.map((r) => r.url).join(" ")}`);
     if (stop) {
       if (await isCaptainThread(crew.threadId)) {
         throw new Error(
@@ -10414,6 +10566,7 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb firstmate launches list [--limit n] [--offset n] [--json]   # uncertain slots require reconciliation",
     "  bb firstmate launches adopt <task-id> --thread <thread-id> [--check] [--json]   # exact legacy registration repair; no turn or merge",
     "  bb firstmate deliveries list|inspect|register|reconcile|assign|abandon|clear-hold|verify [id] [--from manager] [--reason evidence] [--authorized]",
+    "  bb firstmate prs [--json]   # read-only: open PRs by this GitHub account in your projects, untracked ones first",
     "  bb firstmate deliveries account <id> --failure <id> --scope author|baseline --follow-up-task <existing-task> --reason <evidence> --authorized",
     "  sendAt is unsupported; backlog waitUntil requires later explicit dispatch.",
     "  bb firstmate crews | crew <id> | watch [id ...] [--timeout s] [--json]",
@@ -12904,6 +13057,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "bearings", summary: "Fleet digest", usage: "bb firstmate bearings [--json]" },
       { name: "wake", summary: "Drain the durable crew→captain wake queue (present, or --ack-through <seq> --recovery-generation <gen>)", usage: "bb firstmate wake [--ack-through <seq> --recovery-generation <gen>]" },
       { name: "deliveries", summary: "Durable PR health and follow-up", usage: "bb firstmate deliveries list|inspect|register|reconcile|assign|abandon|clear-hold|verify [id] [--from <manager>] [--reason <evidence>] [--authorized]\nbb firstmate deliveries register --url <PR url> [--crew <id>]   (no --crew: a PR you opened yourself)\nbb firstmate deliveries account <id> --failure <id> --scope author|baseline --follow-up-task <existing-task> --reason <evidence> --authorized" },
+      { name: "prs", summary: "Read-only: open PRs by this GitHub account in the captain's projects with their tracking status, untracked first", usage: "bb firstmate prs [--json]" },
       { name: "launches", summary: "Inspect reservations or explicitly adopt an existing legacy worker", usage: "bb firstmate launches list | adopt <task-id> --thread <thread-id> [--check] [--json]" },
       { name: "deliver", summary: "Outcome + committed/uncommitted diff + PR", usage: "bb firstmate deliver <crew-id>" },
       { name: "merge", summary: "Merge PR or local-only ff-only land", usage: "bb firstmate merge <crew-id> [--yes] [--keep-crew]" },
@@ -13282,6 +13436,11 @@ export default async function plugin(bb: BbPluginApi) {
               limit:flagStr(flags,"limit") ? Number(flagStr(flags,"limit")) : undefined,offset:flagStr(flags,"offset") ? Number(flagStr(flags,"offset")) : undefined });
             const rows=await deliveryOperation(input,ctx);
             return reply(rows,rows.map(deliveryLine).join("\n") || "No unresolved deliverables.");
+          }
+          case "prs": {
+            if (!ctxThread) return fail("prs needs a captain thread.");
+            const report = await openPrReport(ctxThread, ctxProject ?? undefined, signal);
+            return reply(report.rows, report.text);
           }
           case "create-worker": {
             const result = await createNativeWorker(flags, ctx);

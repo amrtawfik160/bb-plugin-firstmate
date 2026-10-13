@@ -3,6 +3,7 @@ import test from 'node:test';
 import { createFakePluginHost,makeThreadResponse } from '@get-bb/plugin-sdk/testing';
 import plugin from './server.ts';
 import { createDeliveries } from './lib/pr-delivery.ts';
+import { createLaunches,launchKey } from './lib/launch.ts';
 
 // Answers host terminal commands the way server.launch-delivery.test.mjs does.
 function hostCommands(host,answer) {
@@ -137,7 +138,7 @@ test('open PRs on a crew branch are tracked for that crew captain, and other PRs
    ['acme/repo#11','thr_cap','c1','Show versions in the probe'],
    ['acme/repo#12','thr_other','c2','Other captain work'],
   ]);
-  assert.equal(sweeps.length,1,'the open-PR sweep runs at most once every five minutes');
+  assert.equal(sweeps.length,2,'one open-PR list call per supervision cycle');
   assert.match(sweeps[0],/--author \S*@me/);
  }finally{await host.harness.lifecycle.dispose();}
 });
@@ -200,5 +201,128 @@ test('a captain can track a PR it opened itself without a crew',async()=>{
   assert.equal(result.exitCode,0,result.stderr);
   const r=createDeliveries(host.bb.storage.database()).get('acme/repo#13');
   assert.equal(r.owner,'thr_cap');assert.equal(r.requirement,'merged');assert.equal(r.taskId,'captain:acme/repo#13');
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+// 13 Oct: captain thr_pse43vv6tn had open crew PRs with no delivery row. Each test below is one of those gaps.
+const pr=(n,head,updatedAt='2026-10-13T14:00:00Z')=>({number:n,url:`https://github.com/acme/repo/pull/${n}`,title:`PR ${n}`,headRefName:head,createdAt:'2026-10-13T14:00:00Z',updatedAt});
+const launch=(taskId,threadId,owner,extra={})=>({key:launchKey('proj_1',owner,'/fm',taskId),taskId,projectId:'proj_1',owner,home:'/fm',generation:1,shape:'ship',deliveryMode:'direct-PR',deliveryRequirement:'pr',state:'running',threadId,hostId:'host_1',path:`/wt/${threadId}`,updatedAt:Date.now(),...extra});
+function sweepHost(host,{prs,current='',checkedOut='',lists=[]}) {
+ host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle',environmentId:`env_${threadId}`}));
+ host.harness.sdk.stub('environments.get',async({environmentId})=>({id:environmentId,hostId:'host_1',status:'ready',isWorktree:true,path:`/wt/${environmentId.replace('env_','')}`,branchName:`bb/ship-some-task-${environmentId.replace('env_','')}`}));
+ return hostCommands(host,command=>{
+  if(command.includes('gh pr list') && command.includes('--state open')){lists.push(command);return{payload:JSON.stringify(typeof prs==='function'?prs():prs)};}
+  if(command.includes('gh pr list'))return{payload:'[]'};
+  if(command.includes('gh pr view'))return{payload:JSON.stringify(forge('OPEN'))};
+  if(command.includes('checkout: moving from'))return{payload:checkedOut};
+  if(command.includes('branch --show-current'))return{payload:current};
+  return{code:0};
+ });
+}
+const rows=host=>createDeliveries(host.bb.storage.database()).list({includeComplete:true}).map(r=>[r.id,r.owner,r.taskId]).sort();
+
+// #2337: crew c7c70edb opened three PRs on fm/c7c70edb, -agents and -workflows. It left
+// fm/c7c70edb-workflows 75 seconds after opening the PR, so no scan ever saw that branch checked out.
+test('every PR on a branch named after the crew is tracked, whatever branch the crew has checked out now',async()=>{
+ const host=await base();try {
+  await host.bb.storage.kv.set('crews',[crew('c7c70edb','thr_w1','thr_cap')]);
+  sweepHost(host,{prs:[pr(2333,'fm/c7c70edb'),pr(2336,'fm/c7c70edb-agents'),pr(2337,'fm/c7c70edb-workflows')],current:'fm/c7c70edb-agents\n'});
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.deepEqual(rows(host),[['acme/repo#2333','thr_cap','c7c70edb'],['acme/repo#2336','thr_cap','c7c70edb'],['acme/repo#2337','thr_cap','c7c70edb']]);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+// #2339: crew e64881c8 was dispatched as a scout and opened a PR anyway.
+test('a PR opened by a scout is tracked for its captain',async()=>{
+ const host=await base();try {
+  await host.bb.storage.kv.set('crews',[{...crew('e64881c8','thr_s1','thr_cap'),shape:'scout'}]);
+  sweepHost(host,{prs:[pr(2339,'fm/e64881c8-protected-test-tools')]});
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.deepEqual(rows(host),[['acme/repo#2339','thr_cap','e64881c8']]);
+  assert.equal(createDeliveries(host.bb.storage.database()).get('acme/repo#2339').requirement,'merged','a scout PR is never taken as delivered just because it is open');
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('a PR opened after the crew was retired is still tracked for the captain that launched it',async()=>{
+ const host=await base();try {
+  await host.bb.storage.kv.set('crews',[]);
+  createLaunches(host.bb.storage.database()).save(launch('1b4f6b8b','thr_w2','thr_cap'));
+  sweepHost(host,{prs:[pr(2349,'fm/1b4f6b8b-copy')]});
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.deepEqual(rows(host),[['acme/repo#2349','thr_cap','1b4f6b8b']]);
+  assert.equal(createDeliveries(host.bb.storage.database()).get('acme/repo#2349').requirement,'pr','the launch keeps the agreed delivery contract');
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('a PR on a branch with any name is tracked when that branch was checked out in a crew worktree',async()=>{
+ const host=await base();try {
+  await host.bb.storage.kv.set('crews',[crew('c9','thr_w9','thr_cap')]);
+  sweepHost(host,{prs:[pr(2096,'fix/runtime-crash'),pr(13,'docs/turn-transport')],checkedOut:'/wt/thr_w9\tfix/runtime-crash\n/somewhere/else\tdocs/turn-transport\n'});
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.deepEqual(rows(host),[['acme/repo#2096','thr_cap','c9']],'a PR from a worktree that is no crew stays untracked');
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('a new PR gets its row in the next cycle, with one open-PR list call per repository per cycle',async()=>{
+ const host=await base();try {
+  await host.bb.storage.kv.set('crews',[crew('aa11','thr_w1','thr_cap'),{...crew('bb22','thr_w2','thr_cap'),projectId:'proj_2'}]);
+  let open=[pr(1,'fm/aa11')];const lists=[];
+  sweepHost(host,{prs:[]});
+  hostCommands(host,command=>{
+   if(command.includes('remote get-url'))return{payload:'git@github.com:acme/repo.git\n'};
+   if(command.includes('gh pr list') && command.includes('--state open')){lists.push(command);return{payload:JSON.stringify(open)};}
+   if(command.includes('gh pr list'))return{payload:'[]'};
+   if(command.includes('gh pr view'))return{payload:JSON.stringify(forge('OPEN'))};
+   return{code:0};
+  });
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.equal(lists.length,1,'two projects on one repository share one list call');
+  open=[...open,pr(2,'fm/bb22-second')];
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.equal(lists.length,2);
+  assert.deepEqual(rows(host),[['acme/repo#1','thr_cap','aa11'],['acme/repo#2','thr_cap','bb22']]);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('an open PR nobody touched for 24 hours is put to the captain for a decision, one line per PR, once per day',async(t)=>{
+ const host=await base();try {
+  await host.bb.storage.kv.set('crews',[crew('aa11','thr_w1','thr_cap')]);
+  createLaunches(host.bb.storage.database()).save(launch('aa11','thr_w1','thr_cap'));
+  const sent=[];host.harness.sdk.stub('threads.send',async args=>{sent.push(JSON.stringify(args.input));return{delivery:'queued'};});
+  const start=Date.parse('2026-10-13T17:00:00Z');let now=start-25*60*60_000;t.mock.method(Date,'now',()=>now);
+  sweepHost(host,{prs:[pr(538,'fm/aa11','2026-10-10T09:00:00Z'),pr(539,'fm/aa11-fresh','2026-10-13T16:00:00Z')]});
+  const asks=()=>sent.filter(s=>s.includes('Decide for each'));
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.ok(sent.some(s=>s.includes('FM_DELIVERY_NOTICE=acme/repo#538')),'the captain is told about the new row');
+  assert.equal(asks().length,0,'a PR the captain just heard about is not asked about again the same day');
+  now=start;await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.equal(asks().length,1);
+  const text=JSON.parse(asks()[0]).map(part=>part.text ?? '').join('\n');
+  const lines=text.split('\n').filter(line=>line.includes('/pull/'));
+  assert.equal(lines.length,1,'one line per PR, and a PR touched today is left out');
+  assert.match(lines[0],/https:\/\/github\.com\/acme\/repo\/pull\/538/);assert.match(lines[0],/3 days/);
+  assert.match(text,/merge, fix or close/);
+  now=start+60*60_000;await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.equal(asks().length,1,'not repeated the same day');
+  now=start+24*60*60_000+60_000;await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.equal(asks().length,2,'asked again the next day while the PR stays open and untouched');
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('bb firstmate prs lists open PRs with their tracking status and marks the untracked ones',async()=>{
+ const host=await base();try {
+  await host.bb.storage.kv.set('crews',[crew('aa11','thr_w1','thr_cap')]);
+  await host.bb.storage.kv.set('captain-project:thr_cap','proj_1');
+  sweepHost(host,{prs:[pr(1,'fm/aa11'),pr(2096,'fix/opened-outside-any-crew','2026-10-06T19:09:05Z')]});
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  const before=rows(host);
+  const result=await host.harness.behavior.runCli(['prs','--json'],{threadId:'thr_cap',projectId:'proj_1'});
+  assert.equal(result.exitCode,0,result.stderr);
+  const listed=JSON.parse(result.stdout);
+  assert.deepEqual(listed.map(p=>[p.number,p.tracked,p.crewId ?? null]),[[2096,false,null],[1,true,'aa11']],'untracked first');
+  const text=(await host.harness.behavior.runCli(['prs'],{threadId:'thr_cap',projectId:'proj_1'})).stdout;
+  assert.match(text,/UNTRACKED.*https:\/\/github\.com\/acme\/repo\/pull\/2096/);
+  assert.match(text,/1 of 2 open PRs untracked/);
+  assert.deepEqual(rows(host),before,'the command is read-only');
  }finally{await host.harness.lifecycle.dispose();}
 });

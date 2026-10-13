@@ -10,6 +10,8 @@ export interface CheckFailure {
 export interface DeliveryRecord {
   id: string; repository: string; number: number; url: string; headSha: string; mergeCommitSha:string|null;
   title?:string; openedAt?:number;
+  /** Last activity GitHub recorded on the PR, and when the captain was last asked to decide on it. */
+  touchedAt?:number; decisionAskedAt?:number;
   taskId: string; projectId: string; owner: string | null; home: string;
   continuation?:Record<string,unknown>;
   deliverySatisfiedAt?:number|null; forgeState?:ForgeObservation['state']; failures?:CheckFailure[];
@@ -28,7 +30,7 @@ export interface ForgeObservation {
   checks: 'pending' | 'passing' | 'failing' | 'unknown'; review: 'approved' | 'changes-requested' | 'required' | 'unknown';
   mergeable: 'mergeable' | 'conflicting' | 'unknown';
   reviewHeadSha:string|null; mergeCommitSha:string|null; failedChecks?:{id:string;name:string;url:string}[];
-  title?:string; openedAt?:number;
+  title?:string; openedAt?:number; touchedAt?:number;
   /** A do-not-merge verdict that applies to the current head, quoted; null when none. */
   hold?:string|null;
 }
@@ -72,6 +74,28 @@ export function boardPullRequests(records: readonly DeliveryRecord[]): BoardPr[]
     const needsOwner = r.ownerNeeded || r.status === 'waiting-approval' || r.status === 'ready-to-merge';
     return [{ ref: r.id, url: r.url, ...(r.title ? { title: r.title } : {}), state: r.ownerNeeded ? 'waiting on you' : state, needsOwner, openedAt: r.openedAt ?? r.updatedAt }];
   });
+}
+/** A crew that may have opened a PR: its task id, the branch BB made for its worktree,
+ * and the branches that worktree has had checked out. */
+export type PrBranchCandidate = { key: string; taskId: string; envBranch?: string; checkedOut?: readonly string[] };
+const under = (head: string, branch: string) => head === branch || head.startsWith(`${branch}-`) || head.startsWith(`${branch}/`);
+/** The crew a PR head branch belongs to. A branch named after a crew (`fm/<task>`, `fm/<task>-…`)
+ * is that crew's, whatever is checked out now. Then the crew's worktree branch, then a branch
+ * its worktree had checked out. Earlier candidates win a tie. */
+export function prBranchOwner<T extends PrBranchCandidate>(head: string, candidates: readonly T[]): T | undefined {
+  const longest = (rows: Array<{ c: T; n: number }>) => rows.sort((a, b) => b.n - a.n)[0]?.c;
+  return longest(candidates.filter((c) => c.taskId && under(head, `fm/${c.taskId}`)).map((c) => ({ c, n: c.taskId.length })))
+    ?? longest(candidates.filter((c) => c.envBranch && under(head, c.envBranch)).map((c) => ({ c, n: c.envBranch!.length })))
+    ?? (/^(?:main|master|develop|HEAD)$/.test(head) ? undefined : candidates.find((c) => c.checkedOut?.includes(head)));
+}
+/** After this long without activity an open PR is put to its captain for a decision, once per period. */
+export const UNTOUCHED_PR_MS = 86_400_000;
+const open = (r: DeliveryRecord) => !terminal(r) && r.forgeState !== 'merged' && r.forgeState !== 'closed';
+/** One line for the captain: what the PR is, how long nobody touched it, and its link. */
+export function decisionLine(r: DeliveryRecord, now = Date.now()) {
+  const days = Math.floor((now - (r.touchedAt ?? now)) / 86_400_000);
+  const state = (boardPullRequests([r])[0]?.state ?? r.status).replace('waiting on you', 'needs a manager');
+  return `• ${r.title ?? r.id} — ${state}, untouched ${days >= 2 ? `${days} days` : '24 hours'} — ${r.url}`;
 }
 /** How often a PR without a live manager is read on GitHub, so a merge or close
  * still leaves the open list within minutes. */
@@ -150,7 +174,7 @@ export function createDeliveries(db: Database) {
     const prior = get(id); if (!prior) throw new Error('Unknown deliverable');
     if (terminal(prior)) return prior;
     const changedHead = prior.headSha !== o.headSha;
-    let r: DeliveryRecord = { ...prior, title:o.title ?? prior.title, openedAt:o.openedAt ?? prior.openedAt, headSha:o.headSha, mergeCommitSha:o.mergeCommitSha,verifiedCommitSha:changedHead ? null : prior.verifiedCommitSha,
+    let r: DeliveryRecord = { ...prior, title:o.title ?? prior.title, openedAt:o.openedAt ?? prior.openedAt, touchedAt:o.touchedAt ?? prior.touchedAt, headSha:o.headSha, mergeCommitSha:o.mergeCommitSha,verifiedCommitSha:changedHead ? null : prior.verifiedCommitSha,
       forgeState:o.state, observedAt:now, freshness:'fresh', error:null, errors:0, updatedAt:now, nextCheckAt:now+60_000 };
     const currentFailures=o.failedChecks ?? (o.checks==='failing' ? [{id:'unknown-check',name:'Unidentified failing check; inspect forge',url:r.url}] : []);
     const failures=changedHead ? [] : (prior.failures ?? []);
@@ -266,6 +290,26 @@ export function createDeliveries(db: Database) {
     if (r.status==='on-hold') throw new Error(`${r.id} still has a do-not-merge verdict on its current head; remove the label or comment first`);
     return save({ ...r, heldHead:null, status:'waiting-checks', blocker:'Hold cleared; readiness not yet re-read', nextAction:'Observe PR checks and review', nextCheckAt:0, disposition:{ reason:reason.trim(), actor, at:Date.now() }, updatedAt:Date.now() });
   }
+  /** This task's PRs with no decision yet: still open, so not merged, closed or explicitly abandoned. */
+  function undecided(taskId:string, projectId:string) {
+    const rows=db.prepare("SELECT record FROM deliveries WHERE project=? AND status NOT IN ('complete','explicitly-abandoned') AND json_extract(record,'$.taskId')=? ORDER BY json_extract(record,'$.number')").all(projectId,taskId) as {record:string}[];
+    return rows.map(row=>JSON.parse(row.record) as DeliveryRecord).filter(open);
+  }
+  /** Record GitHub's last-activity time (and a missing title) from the open-PR list. */
+  function touch(id:string, touchedAt:number|undefined, title?:string) {
+    const r=get(id); if (!r) return undefined;
+    if ((touchedAt === undefined || r.touchedAt === touchedAt) && (r.title || !title)) return r;
+    return save({ ...r, title:r.title ?? title, touchedAt:touchedAt ?? r.touchedAt });
+  }
+  /** Open PRs with a manager that nobody touched for 24 hours, and whose captain heard nothing about them in that time. */
+  function needingDecision(now=Date.now(), limit=200) {
+    const rows=db.prepare("SELECT record FROM deliveries WHERE owner IS NOT NULL AND status NOT IN ('complete','explicitly-abandoned','merged-needs-verification','closed-needs-disposition') AND json_extract(record,'$.touchedAt')<=? ORDER BY owner,json_extract(record,'$.touchedAt'),id LIMIT ?").all(now-UNTOUCHED_PR_MS,limit) as {record:string}[];
+    return rows.map(row=>JSON.parse(row.record) as DeliveryRecord)
+      .filter(r=>open(r) && !r.ownerNeeded && Math.max(r.decisionAskedAt ?? 0,r.notification.attemptedAt ?? 0)<=now-UNTOUCHED_PR_MS);
+  }
+  function markDecisionAsked(ids:readonly string[], now=Date.now()) {
+    for (const id of ids) { const r=get(id); if (r) save({ ...r, decisionAskedAt:now }); }
+  }
   /** Every record, open or closed, that belongs to one of these crew tasks or PR ids. */
   function forTasks(taskIds:readonly string[], ids:readonly string[]=[]) {
     if (!taskIds.length && !ids.length) return [];
@@ -325,7 +369,7 @@ export function createDeliveries(db: Database) {
     const rows=db.prepare("SELECT record FROM deliveries WHERE owner=? AND json_extract(record,'$.forgeState')='merged' AND json_extract(record,'$.updatedAt')>=? ORDER BY json_extract(record,'$.updatedAt') DESC,id LIMIT ?").all(owner,since,Math.max(1,Math.min(limit,100))) as {record:string}[];
     return rows.map(row=>JSON.parse(row.record) as DeliveryRecord);
   }
-  return { get,save,list,mergedSince,conflict,hasOwned,taskRecord,ownedTaskRecord,register,observe,stale,assign,ownerLost,markOwnerNeeded,ownerRestored,transferOwner,accountFailure,abandon,clearHold,forTasks,verify,markQueued,notify,pendingNotifications };
+  return { get,save,list,undecided,touch,needingDecision,markDecisionAsked,mergedSince,conflict,hasOwned,taskRecord,ownedTaskRecord,register,observe,stale,assign,ownerLost,markOwnerNeeded,ownerRestored,transferOwner,accountFailure,abandon,clearHold,forTasks,verify,markQueued,notify,pendingNotifications };
 }
 
 const DO_NOT_MERGE = /\b(?:do not|don'?t|dont)[\s-]+merge\b|\bdo-not-merge\b/i;
@@ -357,7 +401,8 @@ export function parseForge(value: unknown): ForgeObservation {
   const approvals=Array.isArray(r.reviews) ? (r.reviews as Record<string,unknown>[]).filter(review=>review.state === 'APPROVED' && (review.commit as Record<string,unknown>|undefined)?.oid === r.headRefOid) : [];
   const approved=r.reviewDecision === 'APPROVED' && approvals.length>0;
   const openedAt=typeof r.createdAt === 'string' ? Date.parse(r.createdAt) : NaN;
-  return { ...(typeof r.title === 'string' && r.title.trim() ? { title:r.title.trim().slice(0,300) } : {}), ...(Number.isFinite(openedAt) ? { openedAt } : {}),
+  const touchedAt=typeof r.updatedAt === 'string' ? Date.parse(r.updatedAt) : NaN;
+  return { ...(typeof r.title === 'string' && r.title.trim() ? { title:r.title.trim().slice(0,300) } : {}), ...(Number.isFinite(openedAt) ? { openedAt } : {}), ...(Number.isFinite(touchedAt) ? { touchedAt } : {}),
     mergeCommitSha:typeof (r.mergeCommit as Record<string,unknown>|undefined)?.oid === 'string' ? (r.mergeCommit as {oid:string}).oid : null,reviewHeadSha:approved ? r.headRefOid : null,headSha:r.headRefOid,state:String(r.state).toLowerCase() as ForgeObservation['state'], draft:r.isDraft === true,
     failedChecks:(checks??[]).filter(c=>failing.includes(String(c.conclusion ?? c.state))).map(c=>{
       const name=String(c.name ?? c.context ?? 'Unidentified check'),url=String(c.detailsUrl ?? c.targetUrl ?? '');

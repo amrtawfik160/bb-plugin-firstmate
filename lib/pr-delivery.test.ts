@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { formatBoard } from "./owner-board.ts";
-import { boardPullRequests, createDeliveries, parseForge, type DeliveryRecord } from "./pr-delivery.ts";
+import { boardPullRequests, createDeliveries, decisionLine, parseForge, prBranchOwner, type DeliveryRecord } from "./pr-delivery.ts";
 
 function record(n: number, over: Partial<DeliveryRecord> = {}): DeliveryRecord {
   return {
@@ -143,4 +143,51 @@ test("removing the hold label on the same head lifts the hold without a check, a
   const merged = boardAfter(runants1759(), runants1759({ ...redo, state: "MERGED", mergeCommit: { oid: "m1" } }));
   assert.equal(merged.store.get("hazw80801/runants#1759")?.status, "complete");
   assert.equal(merged.store.get("hazw80801/runants#1759")?.heldHead, null);
+});
+
+test("a PR branch belongs to the crew it is named after, then to the worktree it came from", () => {
+  const crews = [
+    { key: "a", taskId: "c7c70edb", envBranch: "bb/ship-audit-thr_a", checkedOut: ["fm/c7c70edb-agents", "main"] },
+    { key: "b", taskId: "c7c70edb9", envBranch: "bb/ship-other-thr_b", checkedOut: ["fix/crash", "fm/c7c70edb-agents", "main"] },
+  ];
+  assert.equal(prBranchOwner("fm/c7c70edb", crews)?.key, "a");
+  assert.equal(prBranchOwner("fm/c7c70edb-workflows", crews)?.key, "a", "a later branch of the same crew");
+  assert.equal(prBranchOwner("fm/c7c70edb9-x", crews)?.key, "b", "the longest crew id wins");
+  assert.equal(prBranchOwner("fm/c7c70edb-agents", crews)?.key, "a", "the name outranks another worktree that checked the branch out");
+  assert.equal(prBranchOwner("bb/ship-other-thr_b-2", crews)?.key, "b");
+  assert.equal(prBranchOwner("fix/crash", crews)?.key, "b");
+  assert.equal(prBranchOwner("main", crews), undefined, "a default branch proves nothing");
+  assert.equal(prBranchOwner("fm/c7c70edbx", crews), undefined);
+  assert.equal(prBranchOwner("docs/elsewhere", crews), undefined);
+});
+
+test("an open PR untouched for 24 hours is due for a decision once per day, in one line with its link", () => {
+  const store = createDeliveries(new DatabaseSync(":memory:") as never);
+  const day = 86_400_000, now = 10 * day;
+  store.save(record(1, { status: "pr-delivered", forgeState: "open", title: "Fix login", touchedAt: now - 3 * day - 1000 }));
+  store.save(record(2, { status: "waiting-approval", forgeState: "open", touchedAt: now - 1000 }));
+  store.save(record(3, { status: "complete", forgeState: "merged", touchedAt: now - 5 * day }));
+  store.save(record(4, { status: "closed-needs-disposition", forgeState: "closed", touchedAt: now - 5 * day }));
+  store.save(record(5, { status: "failing-checks", forgeState: "open", touchedAt: now - 2 * day, notification: { desired: "x", delivered: "x", queued: null, retryAt: 0, attemptedAt: now - 1000 } }));
+  store.save(record(6, { status: "pr-delivered", forgeState: "open", owner: null, ownerNeeded: true, touchedAt: now - 5 * day }));
+  const due = store.needingDecision(now);
+  assert.deepEqual(due.map((r) => r.number), [1], "fresh, decided, just-notified and unmanaged PRs are left out");
+  const line = decisionLine(due[0]!, now);
+  assert.equal(line.includes("\n"), false);
+  assert.match(line, /Fix login/); assert.match(line, /3 days/); assert.match(line, /https:\/\/github\.com\/acme\/repo\/pull\/1$/);
+  store.markDecisionAsked([due[0]!.id], now);
+  assert.deepEqual(store.needingDecision(now + day - 2000), []);
+  assert.deepEqual(store.needingDecision(now + day).map((r) => r.number), [1, 5, 2], "asked again a day later, with the PRs that went quiet since");
+});
+
+test("a crew's undecided PRs are the open ones: merged, closed and abandoned PRs have a decision", () => {
+  const store = createDeliveries(new DatabaseSync(":memory:") as never);
+  store.save(record(1, { taskId: "c1", status: "pr-delivered", forgeState: "open" }));
+  store.save(record(2, { taskId: "c1", status: "complete", forgeState: "merged" }));
+  store.save(record(3, { taskId: "c1", status: "merged-needs-verification", forgeState: "merged" }));
+  store.save(record(4, { taskId: "c1", status: "closed-needs-disposition", forgeState: "closed" }));
+  store.save(record(5, { taskId: "c1", status: "explicitly-abandoned", forgeState: "open" }));
+  store.save(record(6, { taskId: "c2", status: "waiting-checks" }));
+  assert.deepEqual(store.undecided("c1", "proj_1").map((r) => r.number), [1]);
+  assert.deepEqual(store.undecided("c2", "proj_1").map((r) => r.number), [6], "a PR not read on GitHub yet counts as open");
 });
