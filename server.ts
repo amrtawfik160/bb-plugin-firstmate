@@ -6638,7 +6638,7 @@ export default async function plugin(bb: BbPluginApi) {
   // Provenance is the PR's head branch (lib/pr-delivery.ts prBranchOwner): a branch
   // named after the crew, the crew's worktree branch, or a branch its worktree had
   // checked out. Launch records name retired crews. One GitHub list per repository
-  // per cycle; the checked-out branches are read only for a PR no name explains.
+  // per cycle (REST, not search); the checked-out branches are read only for a PR no name explains.
   const RETIRED_CREW_PR_WINDOW_MS = 14 * 86_400_000;
   const UNOWNED_PR_RECHECK_MS = 60 * 60_000;
   type PrCandidate = PrBranchCandidate & { crew: Crew; path: string; hostId: string; live: boolean; fresh: boolean };
@@ -6695,6 +6695,19 @@ export default async function plugin(bb: BbPluginApi) {
     projectRepos.set(key, repo);
     return repo;
   }
+  // A repository no live crew works in is listed every ten minutes, not every cycle.
+  const RETIRED_ONLY_LIST_MS = 10 * 60_000;
+  const openPrLists = new Map<string, { at: number; rows: Record<string, unknown>[] }>();
+  // "By this GitHub account": the login gh is signed in with on that host, read once.
+  const githubLogins = new Map<string, string>();
+  async function hostGithubLogin(hostId: string, signal?: AbortSignal): Promise<string> {
+    const known = githubLogins.get(hostId);
+    if (known !== undefined) return known;
+    const login = await runStructuredOnHost(hostId, "gh api user --jq .login", 30_000, signal)
+      .then((res) => res.exitCode === 0 ? res.output.trim().toLowerCase() : "", (error) => { if (signal?.aborted) throw error; return ""; });
+    if (login) githubLogins.set(hostId, login);
+    return login;
+  }
   // A project's main checkout outlives every crew worktree, so it can always answer the list call.
   const projectMains = new Map<string, { at: number; hostId: string; path: string } | { at: number; hostId?: undefined; path?: undefined }>();
   async function projectMain(projectId: string, signal?: AbortSignal) {
@@ -6740,17 +6753,27 @@ export default async function plugin(bb: BbPluginApi) {
       group.paths = [...[...live].slice(0, 3), ...mains, ...group.paths.filter((path) => !live.has(path))];
     }
     const snapshot: OpenPrSnapshot = { at: Date.now(), repos: [] };
-    for (const group of groups.values()) {
+    for (const [repo, group] of groups) {
       signal?.throwIfAborted();
       await boundedFollowUp(async (s) => {
-        // The first worktree that still exists answers; gh runs once.
-        const tries = [...new Set(group.paths)].slice(0, 8).map((path) => `if cd ${shQuote(path)} 2>/dev/null; then gh pr list --state open --author ${shQuote("@me")} --json number,url,title,headRefName,createdAt,updatedAt --limit 200; exit $?; fi`);
-        const res = await runStructuredOnHost(group.hostId, `${tries.join("; ")}; exit 3`, 30_000, s);
-        if (res.exitCode !== 0) return;
-        const listed: unknown = JSON.parse(res.output);
-        if (!Array.isArray(listed)) return;
+        // The first directory that still exists answers; gh runs once. The REST list has its own
+        // rate budget; `gh pr list --author` is a GitHub search, whose budget the whole fleet shares.
+        const live = group.candidates.some((c) => c.live);
+        const cached = openPrLists.get(repo);
+        let listed = cached && !live && Date.now() - cached.at < RETIRED_ONLY_LIST_MS ? cached.rows : undefined;
+        if (!listed) {
+          const fields = ".[] | {number, url: .html_url, title, headRefName: .head.ref, createdAt: .created_at, updatedAt: .updated_at, author: .user.login} | tojson";
+          const tries = [...new Set(group.paths)].slice(0, 8).map((path) => `if cd ${shQuote(path)} 2>/dev/null; then gh api --paginate ${shQuote("repos/{owner}/{repo}/pulls?state=open&per_page=100")} --jq ${shQuote(fields)}; exit $?; fi`);
+          const res = await runStructuredOnHost(group.hostId, `${tries.join("; ")}; exit 3`, 30_000, s);
+          if (res.exitCode !== 0) return;
+          // One JSON object per line and PR.
+          listed = res.output.split("\n").filter((line) => line.trim()).flatMap((line) => { const row: unknown = JSON.parse(line); return (Array.isArray(row) ? row : [row]).map(asRecord); });
+          openPrLists.set(repo, { at: Date.now(), rows: listed });
+        }
+        const me = await hostGithubLogin(group.hostId, s);
         const prs: OpenPr[] = [];
-        for (const row of listed.map(asRecord)) {
+        for (const row of listed) {
+          if (me && typeof row["author"] === "string" && row["author"].toLowerCase() !== me) continue;
           const url = typeof row["url"] === "string" ? row["url"] : "", head = typeof row["headRefName"] === "string" ? row["headRefName"] : "";
           if (!url || !head) continue;
           let identity: ReturnType<typeof canonicalPr>;
