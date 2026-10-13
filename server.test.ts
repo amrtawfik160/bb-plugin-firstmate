@@ -15,6 +15,7 @@ import {
 } from "@get-bb/plugin-sdk/testing";
 import {createQueueStore} from "./lib/queue-store.ts";
 import { createLaunches } from "./lib/launch.ts";
+import { createDeliveries } from "./lib/pr-delivery.ts";
 async function durableQueue(host: ReturnType<typeof createFakePluginHost>) { const queue=createQueueStore(host.bb.storage.database(),()=>host.bb.storage.kv.get("queue"));await queue.ready();return queue.list(); }
 import plugin, {
   OVERLAY_INSTALL_INPUTS,
@@ -2522,6 +2523,37 @@ test("bearings reconciles a crew whose PR merged externally", async () => {
     assert.equal(result.exitCode, 0, result.stderr);
     assert.deepEqual((await host.bb.storage.kv.get("crews")) as unknown[], []);
     assert.equal(host.harness.sdk.callsTo("threads.archive").length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// 13 Oct: crew 1b4f6b8b had #2338 and #2340 merged while #2341 and #2349 were still open.
+test("a crew whose PR merged is not retired while another of its PRs is open with no decision", async () => {
+  const host = await load();
+  try {
+    await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async () =>
+      makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }),
+    );
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
+    host.harness.sdk.stub("threads.output", async () => ({ output: "DONE: shipped" }));
+    host.harness.sdk.stub("threads.archive", async () => ({}));
+    host.harness.sdk.stub("threads.stop", async () => ({}));
+    host.harness.sdk.stub("environments.pullRequest", async () => ({
+      outcome: "available",
+      pullRequest: {
+        url: "https://github.com/o/r/pull/1", number: 1, title: "t", state: "merged",
+        checks: { state: "passing", failedCount: 0, pendingCount: 0, passedCount: 1 },
+        mergeability: { mergeable: "MERGEABLE" },
+      },
+    }));
+    createDeliveries(host.bb.storage.database()).register({ url: "https://github.com/o/r/pull/2", taskId: "c1", projectId: "proj_1", owner: "thr_cap", home: "", worker: "thr_crew", requirement: "pr" });
+    const result = await host.harness.behavior.runCli(["bearings"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(((await host.bb.storage.kv.get("crews")) as unknown[]).length, 1, "the crew stays while its second PR is open");
+    assert.equal(host.harness.sdk.callsTo("threads.archive").length, 0);
   } finally {
     await host.harness.lifecycle.dispose();
   }
