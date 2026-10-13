@@ -335,7 +335,7 @@ test('open PRs are listed from the project main checkout when every crew worktre
   host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle'}));
   hostCommands(host,command=>{
    // Only the main checkout still exists on the host.
-   if(command.includes('gh pr list') && command.includes('--state open'))return command.includes("cd '/repo'")||command.includes('cd /repo ') ? {payload:JSON.stringify([pr(7,'fm/dead1-late'),pr(8,'docs/no-crew')])} : {code:3};
+   if(command.includes('gh pr list') && command.includes('--state open'))return /cd \S*\/repo\b/.test(command) ? {payload:JSON.stringify([pr(7,'fm/dead1-late'),pr(8,'docs/no-crew')])} : {code:3};
    if(command.includes('gh pr view'))return{payload:JSON.stringify(forge('OPEN'))};
    return{code:0};
   });

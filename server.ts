@@ -6695,8 +6695,19 @@ export default async function plugin(bb: BbPluginApi) {
     projectRepos.set(key, repo);
     return repo;
   }
+  // A project's main checkout outlives every crew worktree, so it can always answer the list call.
+  const projectMains = new Map<string, { at: number; hostId: string; path: string } | { at: number; hostId?: undefined; path?: undefined }>();
+  async function projectMain(projectId: string, signal?: AbortSignal) {
+    const known = projectMains.get(projectId);
+    if (known && Date.now() - known.at < 60 * 60_000) return known;
+    const main = (await raceAbort(bb.sdk.environments.list({ projectId }), signal, STUCK_HOST_CALL_MS).catch((error) => { if (signal?.aborted) throw error; return []; }))
+      .find((e) => e.isWorktree === false && e.status === "ready" && e.path);
+    const found = main?.path ? { at: Date.now(), hostId: main.hostId, path: main.path } : { at: Date.now() };
+    projectMains.set(projectId, found);
+    return found;
+  }
   // Read-only: the open PRs of every repository crews work in, each matched to the crew that opened it.
-  async function readOpenPrs(signal?: AbortSignal, extra: Array<{ projectId: string; hostId: string; path: string }> = []): Promise<OpenPrSnapshot> {
+  async function readOpenPrs(signal?: AbortSignal, extraProjects: Iterable<string> = []): Promise<OpenPrSnapshot> {
     const candidates = await prCandidates(signal);
     const groups = new Map<string, { hostId: string; projects: Set<string>; paths: string[]; candidates: PrCandidate[] }>();
     const repoOf = new Map<string, string>();
@@ -6713,9 +6724,20 @@ export default async function plugin(bb: BbPluginApi) {
       group.candidates.push(candidate);
       groups.set(repo, group);
     }
-    for (const project of extra) {
-      if ([...groups.values()].some((g) => g.projects.has(project.projectId))) continue;
-      groups.set(`${project.projectId}\t${project.hostId}`, { hostId: project.hostId, projects: new Set([project.projectId]), paths: [project.path], candidates: [] });
+    for (const projectId of extraProjects) {
+      if ([...groups.values()].some((g) => g.projects.has(projectId))) continue;
+      const main = await projectMain(projectId, signal);
+      if (main.path) groups.set(`${projectId}\t${main.hostId}`, { hostId: main.hostId, projects: new Set([projectId]), paths: [], candidates: [] });
+    }
+    // Live worktrees first, then the main checkout, then worktrees of retired crews, which may be removed.
+    for (const group of groups.values()) {
+      const live = new Set(group.candidates.filter((c) => c.live).map((c) => c.path));
+      const mains: string[] = [];
+      for (const projectId of group.projects) {
+        const main = await projectMain(projectId, signal);
+        if (main.path && main.hostId === group.hostId) mains.push(main.path);
+      }
+      group.paths = [...[...live].slice(0, 3), ...mains, ...group.paths.filter((path) => !live.has(path))];
     }
     const snapshot: OpenPrSnapshot = { at: Date.now(), repos: [] };
     for (const group of groups.values()) {
@@ -6741,7 +6763,7 @@ export default async function plugin(bb: BbPluginApi) {
         }
         // A PR no crew name explains and nothing tracks: ask git which worktree had its branch checked out.
         const unexplained = prs.filter((pr) => !pr.candidate && !deliveries.get(pr.id) && Date.now() - (unownedPrs.get(pr.id) ?? 0) >= UNOWNED_PR_RECHECK_MS).slice(0, 40);
-        if (unexplained.length && group.candidates.length) {
+        if (unexplained.length && group.candidates.length && group.paths.length) {
           const wanted = unexplained.map((pr) => `-e ${shQuote(pr.head)}`).join(" ");
           // Each worktree's own HEAD log names every branch it had checked out; no git process per worktree.
           const scan = `for p in ${[...new Set(group.paths)].slice(0, 8).map(shQuote).join(" ")}; do cd "$p" 2>/dev/null && break; done; c=$(cd "$(git rev-parse --git-common-dir)" && pwd) || exit 0; for d in "$c"/worktrees/*/; do w=$(dirname "$(cat "$d/gitdir" 2>/dev/null)"); { sed -n 's|^ref: refs/heads/||p' "$d/HEAD"; sed -n 's/^.*checkout: moving from .* to //p' "$d/logs/HEAD"; } 2>/dev/null | grep -Fx ${wanted} | sort -u | while IFS= read -r b; do printf '%s\\t%s\\n' "$w" "$b"; done; done`;
@@ -6781,16 +6803,8 @@ export default async function plugin(bb: BbPluginApi) {
     for (const r of deliveries.list({ owner: captain, limit: 100 })) projects.add(r.projectId);
     const covered = (snapshot: OpenPrSnapshot | undefined) => snapshot !== undefined && [...projects].every((id) => snapshot.repos.some((repo) => repo.projects.has(id)));
     let snapshot = openPrSnapshot && Date.now() - openPrSnapshot.at < 90_000 && covered(openPrSnapshot) ? openPrSnapshot : undefined;
-    if (!snapshot) {
-      // A project with no crew is listed from its main checkout.
-      const extra: Array<{ projectId: string; hostId: string; path: string }> = [];
-      for (const projectId of projects) {
-        const main = (await raceAbort(bb.sdk.environments.list({ projectId }), signal, STUCK_HOST_CALL_MS).catch((error) => { if (signal?.aborted) throw error; return []; }))
-          .find((e) => e.isWorktree === false && e.status === "ready" && e.path);
-        if (main?.path) extra.push({ projectId, hostId: main.hostId, path: main.path });
-      }
-      snapshot = await readOpenPrs(signal, extra);
-    }
+    // A project with no crew is listed from its main checkout.
+    if (!snapshot) snapshot = await readOpenPrs(signal, projects);
     const now = Date.now(), seen = new Set<string>();
     const rows = snapshot.repos.filter((repo) => [...repo.projects].some((id) => projects.has(id))).flatMap((repo) => repo.prs)
       .filter((pr) => !seen.has(pr.id) && !!seen.add(pr.id))
