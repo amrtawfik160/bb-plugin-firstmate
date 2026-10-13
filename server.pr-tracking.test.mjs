@@ -214,7 +214,7 @@ function sweepHost(host,{prs,current='',checkedOut='',lists=[]}) {
   if(command.includes('gh pr list') && command.includes('--state open')){lists.push(command);return{payload:JSON.stringify(typeof prs==='function'?prs():prs)};}
   if(command.includes('gh pr list'))return{payload:'[]'};
   if(command.includes('gh pr view'))return{payload:JSON.stringify(forge('OPEN'))};
-  if(command.includes('reflog'))return{payload:checkedOut};
+  if(command.includes('checkout: moving from'))return{payload:checkedOut};
   if(command.includes('branch --show-current'))return{payload:current};
   return{code:0};
  });
@@ -287,11 +287,15 @@ test('a new PR gets its row in the next cycle, with one open-PR list call per re
 test('an open PR nobody touched for 24 hours is put to the captain for a decision, one line per PR, once per day',async(t)=>{
  const host=await base();try {
   await host.bb.storage.kv.set('crews',[crew('aa11','thr_w1','thr_cap')]);
+  createLaunches(host.bb.storage.database()).save(launch('aa11','thr_w1','thr_cap'));
   const sent=[];host.harness.sdk.stub('threads.send',async args=>{sent.push(JSON.stringify(args.input));return{delivery:'queued'};});
-  const start=Date.parse('2026-10-13T17:00:00Z');let now=start;t.mock.method(Date,'now',()=>now);
+  const start=Date.parse('2026-10-13T17:00:00Z');let now=start-25*60*60_000;t.mock.method(Date,'now',()=>now);
   sweepHost(host,{prs:[pr(538,'fm/aa11','2026-10-10T09:00:00Z'),pr(539,'fm/aa11-fresh','2026-10-13T16:00:00Z')]});
   const asks=()=>sent.filter(s=>s.includes('Decide for each'));
   await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.ok(sent.some(s=>s.includes('FM_DELIVERY_NOTICE=acme/repo#538')),'the captain is told about the new row');
+  assert.equal(asks().length,0,'a PR the captain just heard about is not asked about again the same day');
+  now=start;await host.harness.behavior.runSchedule('pr-delivery-follow-up');
   assert.equal(asks().length,1);
   const text=JSON.parse(asks()[0]).map(part=>part.text ?? '').join('\n');
   const lines=text.split('\n').filter(line=>line.includes('/pull/'));

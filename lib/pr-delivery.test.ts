@@ -176,8 +176,8 @@ test("an open PR untouched for 24 hours is due for a decision once per day, in o
   assert.equal(line.includes("\n"), false);
   assert.match(line, /Fix login/); assert.match(line, /3 days/); assert.match(line, /https:\/\/github\.com\/acme\/repo\/pull\/1$/);
   store.markDecisionAsked([due[0]!.id], now);
-  assert.deepEqual(store.needingDecision(now + day - 1000), []);
-  assert.deepEqual(store.needingDecision(now + day).map((r) => r.number), [1, 5]);
+  assert.deepEqual(store.needingDecision(now + day - 2000), []);
+  assert.deepEqual(store.needingDecision(now + day).map((r) => r.number), [1, 5, 2], "asked again a day later, with the PRs that went quiet since");
 });
 
 test("a crew's undecided PRs are the open ones: merged, closed and abandoned PRs have a decision", () => {
