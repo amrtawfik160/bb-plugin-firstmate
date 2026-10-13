@@ -204,6 +204,12 @@ Each flag in `fmReliability` is off until set, for example
   when no reset time is known. The per-minute schedule resumes due jobs, also
   after a reload. A job whose worker already exists does not spawn a second one.
   Work past `maxActiveCrews` (default 10) queues and starts when a slot opens.
+  The reply names the crews that hold the slots, so the captain can tell the
+  owner at once that the job waits. Queued jobs that carry an owner message
+  start before jobs without one, the oldest first. An owner job still without
+  a slot after 15 minutes brings the captain one notice with the same list.
+  A start that is refused before any thread exists ends as failed, holds no
+  slot, and the job stays queued and startable.
   A job that finds its slot taken at spawn time waits the same way. A spawn
   that fails for another reason is reported to the captain.
   The queue is checked when a crew or captain turn ends and once a minute.

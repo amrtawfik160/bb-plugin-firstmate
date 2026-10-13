@@ -61,7 +61,7 @@ import { replacementPlan, type ReplacementIntent } from "./lib/replacement.ts";
 import {pluginAssetRoot} from "./lib/plugin-assets.ts";
 import {createNativeRuntime, runtimeRootAssign} from "./lib/native-runtime.ts";
 import { boundedCaptainStartup, captainBindingText } from "./lib/captain-startup.ts";
-import { createQueueStore, type QueueItem } from "./lib/queue-store.ts";
+import { createQueueStore, startOrder, type QueueItem } from "./lib/queue-store.ts";
 import { admissionDecision, createDispatchJobs, dispatchJobLine, spawnBackoffMs } from "./lib/async-dispatch.ts";
 import { createWatchdogStore, observeIdleTurn, tripWatchdog, watchdogNoticeText, watchdogTrip } from "./lib/crew-watchdog.ts";
 import { captainResumeDelay, FAILOVER_WINDOW_MS, failoverTarget, planLimitError, planLimitNotice, PROVIDER_UNAVAILABLE_KEY, providerExhausted, unavailableProviderLines, unavailableUntil, utcMinute, type ExecutionChoice, type FailedTurnInfo, type UnavailableProviders } from "./lib/provider-failover.ts";
@@ -3716,10 +3716,16 @@ export default async function plugin(bb: BbPluginApi) {
   ): Promise<string | null> {
     const fmHome = await crewNativeHome(crew);
     if (fmHome === "") return null;
+    // BB creation claims the launch record before it creates a thread, so a start that
+    // stops while the record is still "reserved" created no thread: it ends failed and
+    // holds no crew slot, instead of "uncertain" with a slot nothing will ever fill.
+    const pendingKey=launchKey(crew.projectId,crew.parentThreadId ?? "",crew.nativeHome ?? "",crew.id);
+    const endedBeforeCreation=(reason:string)=>{ if (launches.get(pendingKey)?.state === "reserved") launches.update(pendingKey,{ state:"failed",error:reason }); };
+    const refused=(message:string)=>{ endedBeforeCreation(message.slice(0,300)); return new Error(message); };
     // Refuse a brief native would refuse BEFORE any backlog row exists, so a bad
     // task never leaves an orphan row behind.
     if (normalizeCaptainIntent(briefSections(input.task.trim()).intent).trim() === "") {
-      throw new Error("The task's Captain's intent section is empty; put the captain's words under it (or send plain task text).");
+      throw refused("The task's Captain's intent section is empty; put the captain's words under it (or send plain task text).");
     }
     // A crew may already carry a real thread (idempotent re-dispatch). Never spawn twice.
     const existing = await readFmMetaField(hostId, crew.id, "bb_thread_id", await crewNativeHome(crew));
@@ -3735,11 +3741,18 @@ export default async function plugin(bb: BbPluginApi) {
       bb.log.error(
         `real transport requires queueOwner=real: native fm-spawn.sh refuses to dispatch a task with no backlog record, and only queueOwner=real lets the plugin create+own that row (add <id> --kind <shape>, then done/rm on land/forget). queueOwner is currently kv — set queueOwner=real in the Firstmate plugin settings. Dispatch refused for crew=${crew.id}.`,
       );
-      throw new Error("Real transport requires queueOwner=real.");
+      throw refused("Real transport requires queueOwner=real.");
     }
     const projectDir = input.checkout ?? await projectCheckoutPath(input.projectId, hostId);
     if (projectDir === null || projectDir === "") {
-      throw new Error(`No project checkout for real dispatch ${crew.id}.`);
+      throw refused(`No project checkout for real dispatch ${crew.id}.`);
+    }
+    // The away catch-up refuses fm-spawn. Ask it before the brief and the backlog row
+    // exist, so a refused start leaves nothing behind and can simply be started again.
+    await reconcileReturnedAfk(input.parentThreadId);
+    const catchup = await returnCatchupRefusal(hostId, fmHome);
+    if (catchup !== null) {
+      throw refused(`Start of ${crew.id} was refused before it began: the away catch-up is still open. Nothing was created: no thread, no native backlog row, and no crew slot is held. Handle each blocker below (answer its decision, or resolve it), then make this one call: firstmate_fm script=afk-return args=["check"] (command line: bb firstmate fm afk-return -- check). When it reports "catch-up clear", start ${crew.id} again.\n${catchup}`);
     }
     // C2: a ship whose delivery mode carries less rigor than the project's native
     // standing posture makes fm-spawn print an advisory deviation notice. We do NOT
@@ -3756,8 +3769,7 @@ export default async function plugin(bb: BbPluginApi) {
     const scaffolded = await publishFmBrief(crew, hostId, input.task);
     if (!scaffolded.ok) {
       // Nothing was spawned and no backlog row was added, so the launch holds no slot.
-      const pendingKey=launchKey(crew.projectId,crew.parentThreadId ?? "",crew.nativeHome ?? "",crew.id);
-      if (launches.get(pendingKey)?.state === "reserved") launches.update(pendingKey,{ state:"failed",error:"Brief could not be written before BB creation" });
+      endedBeforeCreation("Brief could not be written before BB creation");
       throw new Error(`The brief for ${crew.id} could not be written (${scaffolded.error}). No worker was created.`);
     }
     // C1: create the backlog row (id = crew id, so meta/brief/backlog/thread all
@@ -3765,9 +3777,10 @@ export default async function plugin(bb: BbPluginApi) {
     // ok/already), so a retry or a queue-dispatched crew whose row already exists
     // is a no-op. fm-spawn.sh performs the queued→In-flight start itself once its
     // endpoint exists; the plugin only seeds the queued row and later closes it.
-    const backlogAdd = await projectQueueAdd(crew.id, backlogTitleOf(input.task), crew.shape, input.projectId);
+    const backlogAdd = await projectQueueAdd(crew.id, backlogTitleOf(input.task), crew.shape, input.projectId)
+      .catch((error) => { throw refused(error instanceof Error ? error.message : String(error)); });
     if (!backlogAdd.ok) {
-      throw new Error(`Backlog add failed for ${crew.id}; repair tasks-axi before dispatching a worker.`);
+      throw refused(`Backlog add failed for ${crew.id}; repair tasks-axi before dispatching a worker.`);
     }
     // D5: emit a positive signature for the backlog-FIRST step, paired with the
     // `real transport spawn crew=<id> ok` line the spawn emits below. Together they
@@ -3800,6 +3813,8 @@ export default async function plugin(bb: BbPluginApi) {
     if (capped !== undefined) env.FM_BB_PERMISSION_MODE = capped;
     let spawnFailed = false;
     let spawnFailure = "Native spawn returned without a recorded worker.";
+    // fm-spawn ran to its end and said no (a number), or never ran (the home's spawn gate).
+    let spawnEnded = false;
     try {
       const res = await withHomeSpawnGate(fmHome, () => runFmScript({
         script: "spawn",
@@ -3811,12 +3826,11 @@ export default async function plugin(bb: BbPluginApi) {
         env,
         timeoutMs: fmTimeoutMs("spawn", undefined),
         signal,
+        returnChecked: true,
       }));
       if (res.exitCode !== 0) {
         spawnFailed = true;
-        const pendingKey=launchKey(crew.projectId,crew.parentThreadId ?? "",crew.nativeHome ?? "",crew.id);
-        const pending=launches.get(pendingKey);
-        if (pending?.state === "reserved" && /spawn refused|brief (?:was )?refused|task .* has no backlog item/.test(res.output) && !TRANSIENT_SPAWN_FAILURE.test(res.output)) launches.update(pendingKey,{ state:"failed",error:"Native explicitly refused before BB creation" });
+        spawnEnded = typeof res.exitCode === "number" && !TRANSIENT_SPAWN_FAILURE.test(res.output);
         spawnFailure = `fm-spawn exit ${res.exitCode}: ${res.output.slice(-2000)}`;
         // LOUD (B1): a non-zero fm-spawn exit (e.g. the brief-refusal that made every
         // real spawn fail) must be an error, not a muffled warn.
@@ -3827,6 +3841,7 @@ export default async function plugin(bb: BbPluginApi) {
     } catch (error) {
       spawnFailed = true;
       spawnFailure = error instanceof Error ? error.message : String(error);
+      spawnEnded = /this spawn was not started/.test(spawnFailure);
       bb.log.warn(`real transport spawn crew=${crew.id} ${error instanceof Error ? error.message : String(error)}`);
     }
     // Even on a non-zero exit, a thread may already exist — read the meta and
@@ -3849,6 +3864,8 @@ export default async function plugin(bb: BbPluginApi) {
       bb.log.info(`real transport adopted orphan thread ${orphan} for crew=${crew.id} (fm-spawn left no bb_thread_id; spawnFailed=${spawnFailed})`);
       return orphan;
     }
+    // No thread in the native record or in BB, and fm-spawn is no longer running.
+    if (spawnEnded) endedBeforeCreation("Native start ended before BB creation");
     // Native retains queued work when policy refuses a spawn (for example an AFK cap).
     // Keep that row available for reconciliation instead of deleting it and bypassing the gate.
     // A refused BRIEF is different: the row names a task that can never spawn as written,
@@ -4717,6 +4734,10 @@ export default async function plugin(bb: BbPluginApi) {
     });
     if (admit.action !== "queue") return null;
     await queueStore.ready();
+    if (input.taskId !== undefined) {
+      const taken = queueStore.get({ id: input.taskId, projectId: input.projectId, parentThreadId: input.parentThreadId });
+      if (taken) throw new Error(queuedRowNote(taken));
+    }
     const queued: QueueItem = {
       nativeHome: (await settings.get()).fmHome,
       id: input.taskId ?? randomUUID().slice(0, 8),
@@ -4751,7 +4772,34 @@ export default async function plugin(bb: BbPluginApi) {
         : null;
       if (parsed && parsed.chatId) inboundLedger.markDelegated(parsed, queued.id, Date.now());
     }
-    return `Queued as ${queued.id} (crew cap ${admit.cap}; will dispatch when a slot opens).`;
+    const holders = await slotHolders(input.parentThreadId, [...activeTaskIds, ...launches.heldTaskIds(input.parentThreadId)]);
+    const tell = (input.sourceRefs?.length ?? 0) > 0 ? "Tell the owner now" : "If the owner asked for this, tell the owner now";
+    return `Queued as ${queued.id} (crew cap ${admit.cap}; will dispatch when a slot opens). It has NOT started. ${tell} that this job waits for a free crew slot. Slots are held by: ${holders}. To start it sooner: raise the crew cap (maxActiveCrews setting), or stop one of these crews.`;
+  }
+  // The crews and unfinished starts that fill a captain's slots, as "id (title)".
+  async function slotHolders(captain: string, taskKeys: string[]): Promise<string> {
+    const crews = (await readCrews()).filter((c) => c.parentThreadId === captain);
+    const rows = queueStore.list(captain);
+    const names = [...new Set(taskKeys)].map((key) => {
+      const [projectId, id] = JSON.parse(key) as [string, string];
+      const crew = crews.find((c) => c.id === id && c.projectId === projectId);
+      const title = crew ? crewLabel(crew) : rows.find((row) => row.id === id && row.projectId === projectId)?.title;
+      return `${id} (${truncate(title ?? "start not finished", 60)}${crew ? "" : title ? ", start not finished" : ""})`;
+    });
+    return names.length > 0 ? names.join("; ") : "no crew that this captain lists";
+  }
+  function queuedRowNote(row: QueueItem): string {
+    const name = `Task ${row.id} (${truncate(row.title, 70)})`;
+    if (row.status === "queued") return `${name}: ${row.id} is already queued and has not started. Nothing new was queued or started. It starts by itself when a crew slot opens. To start it now: firstmate_queue action=dispatch queueId=${row.id}. To remove it: firstmate_queue action=drop queueId=${row.id}.`;
+    if (row.status === "dispatched") return `${name} already started as crew ${row.crewId ?? row.id}. Nothing new was queued. Read it with firstmate_crew crewId=${row.crewId ?? row.id}.`;
+    return `${name} is a finished queue item (${row.status}). Nothing was queued. Dispatch with a new taskId, or clear finished items with firstmate_queue action=prune.`;
+  }
+  /** A dispatch that names a job still waiting in the queue starts nothing; it says where the job is. */
+  async function queuedDispatchNote(taskId: string | undefined, projectId: string, captain: string | undefined): Promise<string | null> {
+    if (taskId === undefined || captain === undefined) return null;
+    await queueStore.ready();
+    const row = queueStore.get({ id: taskId, projectId, parentThreadId: captain });
+    return row?.status === "queued" ? queuedRowNote(row) : null;
   }
 
   // Drains only work that dispatch queued for lack of a slot. A captain's
@@ -4761,23 +4809,38 @@ export default async function plugin(bb: BbPluginApi) {
     await queueStore.ready();
     const all = owner !== undefined ? queueStore.list(owner) : queueStore.list();
     const now = Date.now();
-    for (const item of all.filter((row) => row.overCap === true && row.status === "queued" && storedQueueGate(row, all, now) === null)) {
+    const noSlot: QueueItem[] = [];
+    for (const item of startOrder(all.filter((row) => row.overCap === true && row.status === "queued" && storedQueueGate(row, all, now) === null))) {
       const parent = item.parentThreadId;
       if (!parent) continue;
       const { cap, activeTaskIds } = await launchCapacity(parent);
       const running = new Set([...activeTaskIds, ...launches.heldTaskIds(parent)]).size;
-      if (cap > 0 && running >= cap) continue;
+      if (cap > 0 && running >= cap) { noSlot.push(item); continue; }
       try {
         await inCaptainHome(parent, () => dispatchQueueItem(item, parent, { threadId: parent, projectId: item.projectId }));
       } catch (error) {
         // An unload interrupts the attempt; the row stays queued and the next load retries it.
         if (launchAbort.signal.aborted) return;
         const message = error instanceof Error ? error.message : String(error);
-        if (/Crew cap reached/.test(message)) continue;
+        if (/Crew cap reached/.test(message)) { noSlot.push(item); continue; }
         await recordStartRefusal(item, parent, message);
       }
     }
+    for (const item of noSlot) await noticeOwnerJobWait(item, now);
     resumeDispatchJobs(owner);
+  }
+  // 13 Oct: an owner-ordered job waited 58 minutes for a slot and nothing told the
+  // captain. An owner job still without a slot after 15 minutes brings one notice.
+  const OWNER_JOB_WAIT_NOTICE_MS = 15 * 60_000;
+  async function noticeOwnerJobWait(item: QueueItem, now: number): Promise<void> {
+    const captain = item.parentThreadId;
+    const waited = now - Date.parse(item.createdAt);
+    if (!captain || (item.sourceRefs?.length ?? 0) === 0 || !(waited >= OWNER_JOB_WAIT_NOTICE_MS) || queueStore.waitNoticed(item)) return;
+    const { activeTaskIds } = await launchCapacity(captain);
+    const holders = await slotHolders(captain, [...activeTaskIds, ...launches.heldTaskIds(captain)]);
+    const told = await deliverToCaptain(captain, `Owner job ${item.id} (${truncate(item.title, 70)}) has waited ${Math.floor(waited / 60_000)} minutes for a crew slot and has not started. Tell the owner. Slots are held by: ${holders}. Options: A) wait, it starts by itself when a slot opens; B) raise the crew cap (maxActiveCrews setting), then firstmate_queue action=dispatch queueId=${item.id}; C) stop one of the crews above with firstmate_forget crewId=<id> stop=true. This is the only notice for this job.`, item.id, undefined, true)
+      .catch((error) => { bb.log.warn(`owner job ${item.id} wait notice: ${String(error)}`); return false; });
+    if (told) queueStore.noticeWait(item, now);
   }
   // The row stays queued and is retried each pass, so the refusal is logged when the
   // reason changes and the captain is told once per job, not once per pass.
@@ -5054,7 +5117,11 @@ export default async function plugin(bb: BbPluginApi) {
         const latest = launches.get(key)!;
         if (latest.state === "reserved" && !latest.nativeInvoked) launches.update(key, { state: "failed", error: String(error) });
         else if (latest.state !== "failed" && latest.state !== "deleted") launches.update(key, { state: latest.threadId ? "provisioning" : "uncertain", error: String(error) });
-        throw new Error(`Launch ${taskId} (${launches.get(key)?.state ?? "uncertain"}): ${String(error)}. Reuse taskId=${taskId} for reconciliation; do not create a fresh retry identity.`);
+        const ended = launches.get(key)?.state ?? "uncertain";
+        const next = ended === "failed"
+          ? `No worker was created and no crew slot is held. Fix the cause, then start ${taskId} again with the same id.`
+          : `Reuse taskId=${taskId} for reconciliation; do not create a fresh retry identity.`;
+        throw new Error(`Launch ${taskId} (${ended}): ${String(error)}. ${next}`);
       }
     });
   }
@@ -8406,10 +8473,12 @@ export default async function plugin(bb: BbPluginApi) {
     signal?: AbortSignal;
     stdin?: string;
     receipt?: { action: "receive" | "inspect" | "begin-action" | "mark-success" | "complete" | "legacy-ack"; id?: string };
+    // The caller already ran the away-return checks for this start.
+    returnChecked?: boolean;
   }): Promise<{ exitCode: number | null; output: string; scriptPath: string; receipt?: WakeReceipt }> {
     const script = normalizeFmScript(input.script);
-    if (script === "spawn") await reconcileReturnedAfk(input.parentThreadId);
-    if (["spawn", "pr-merge", "merge-local"].includes(script)) await guardReturnCatchup(input.hostId, input.fmHome);
+    if (script === "spawn" && input.returnChecked !== true) await reconcileReturnedAfk(input.parentThreadId);
+    if (["spawn", "pr-merge", "merge-local"].includes(script) && input.returnChecked !== true) await guardReturnCatchup(input.hostId, input.fmHome);
     // Native path for the RETURN value / diagnostics; the invocation below resolves
     // FM_BINDIR (bin-bb when the bb overlay is installed) on the host.
     const scriptPath = `${input.fmHome}/bin/fm-${script}.sh`;
@@ -9354,14 +9423,26 @@ export default async function plugin(bb: BbPluginApi) {
     await syncAfkFlag(captainThreadId);
   }
 
-  async function guardReturnCatchup(hostId: string, fmHome: string): Promise<void> {
+  function runReturnCatchup(hostId: string, fmHome: string) {
     // Active away mode is allowed to dispatch under native's away authority.
     // The catch-up marker is separate: ordinary work waits for its native check.
-    const result = await runOnHost(hostId, [
+    return runOnHost(hostId, [
       ...fmBackendEnv({ hostId, fmHome }), fmBinDirAssign(fmHome),
       `if [ -f ${shQuote(`${fmHome}/state/.afk-return-catchup`)} ]; then "$FM_BINDIR/fm-afk-return.sh" check; fi`,
     ].join("\n"), 180_000);
-    requireNativeSuccess(result, "AFK catch-up");
+  }
+  async function guardReturnCatchup(hostId: string, fmHome: string): Promise<void> {
+    requireNativeSuccess(await runReturnCatchup(hostId, fmHome), "AFK catch-up");
+  }
+  // Why the away catch-up still refuses new work, or null when it is clear. The check
+  // prints the whole return brief first; its own closing lines name what holds it.
+  async function returnCatchupRefusal(hostId: string, fmHome: string): Promise<string | null> {
+    const result = await runReturnCatchup(hostId, fmHome);
+    if (result.exitCode === 0) return null;
+    const cause = result.output.split(/\r?\n/).map((line) => line.trim())
+      .filter((line) => /^(fm-afk-return:|firstmate-actionable blocker:|catch-up )/.test(line));
+    bb.log.warn(`Native AFK catch-up refused a start: exit ${result.exitCode}: ${truncate(cause.join(" | ") || result.output.slice(-600), 800)}`);
+    return cause.length > 0 ? truncate(cause.join("\n"), 1200) : `exit ${result.exitCode}: ${result.output.trim().slice(-600)}`;
   }
 
   // Match native authority to one BB captain before treating chat as a return.
@@ -9627,10 +9708,15 @@ export default async function plugin(bb: BbPluginApi) {
       if (input[key]!==undefined && input[key]!==existing[key]) throw new Error(`Queue reconcile cannot change original ${key}.`);
     }
     const read=await runTasksAxi(["show",id,"--full"],{projectId:project,home});
+    // A job the plugin queued by itself has a native row only once a start added it.
+    const selfQueued=existing?.overCap===true && !existing.backlogId;
+    if (selfQueued && existing!.status==='queued' && read!==null && read.exitCode!==0 && /NOT_FOUND/.test(read.output)) return existing!;
     requireNativeSuccess(read,`queue reconcile ${id}`);
     const state=tasksAxiField(read!.output,"state"),title=tasksAxiField(read!.output,"title"),kind=tasksAxiField(read!.output,"kind");
     if (tasksAxiField(read!.output,"id")!==id || !title || !['ship','scout'].includes(kind) || !['queued','in_flight','done'].includes(state) || /\(truncated, \d+ chars total/.test(title)) throw new Error("Native row is not a readable task in a recoverable state.");
-    if (existing && (existing.title!==title || existing.shape!==kind || existing.backlogId && existing.backlogId!==id)) throw new Error("Native row conflicts with the saved queue identity/title/kind.");
+    // A start names that row from the task text, not from the queue title.
+    const startTitle=selfQueued?backlogTitleOf(queueBrief(existing!)).slice(0,500):undefined;
+    if (existing && (existing.title!==title && startTitle!==title || existing.shape!==kind || existing.backlogId && existing.backlogId!==id)) throw new Error("Native row conflicts with the saved queue identity/title/kind.");
     if (existing && ['done','dropped'].includes(existing.status)) return existing; // never reopen history
     if (state==='queued') {
       if (existing) return queueStore.patch(existing,{backlogId:id,nativePending:false});
@@ -9668,6 +9754,18 @@ export default async function plugin(bb: BbPluginApi) {
     const res = await runTasksAxi(["add", id, title.slice(0, 500), "--kind", shape], { projectId,home });
     requireNativeSuccess(res, `backlog add ${id}`);
     return { ok: true };
+  }
+
+  // Close a queue item's native row on drop/done. A job the plugin queued by itself
+  // carries no native row id: a start adds the row under the job id, so the row may or
+  // may not exist, and both are a clean close.
+  async function closeQueueItem(item: QueueItem, verb: "done" | "rm"): Promise<void> {
+    if (item.overCap !== true || item.backlogId) return projectQueueTransition(item, verb);
+    queueStore.clearStartRefusal(item);
+    if (!(await queueIsReal())) return;
+    const res = await runTasksAxi([verb, item.id], { projectId: item.projectId, home: item.nativeHome });
+    if (res !== null && res.exitCode !== 0 && /NOT_FOUND/.test(res.output)) return;
+    requireNativeSuccess(res, `backlog ${verb}`);
   }
 
   // Drive the paired backlog transition for a KV queue item. verb: start|done|rm.
@@ -10869,6 +10967,8 @@ export default async function plugin(bb: BbPluginApi) {
       }
       const background = (await reliabilityFlags()).asyncDispatch === "on" && parentThreadId !== undefined;
       const crewKey = taskId ?? randomUUID().slice(0, 8);
+      const waiting = await queuedDispatchNote(taskId, resolvedProject, parentThreadId);
+      if (waiting !== null) return waiting;
       if (background) {
         const queued = await enqueueWhenOverCap({
           task, taskId: crewKey, title, projectId: resolvedProject, parentThreadId, shape, mode, deliveryRequirement, sourceRefs,
@@ -10879,7 +10979,8 @@ export default async function plugin(bb: BbPluginApi) {
             : {}),
           visible,
           ownerRequestedProvider,
-        });
+        }).catch((error) => toolError(error instanceof Error ? error.message : String(error)));
+        if (queued !== null && typeof queued !== "string") return queued;
         if (queued) return `${queued}${await trackTask(crewKey)}`;
       }
       const current = await settings.get();
@@ -11693,7 +11794,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (queueId === undefined || item === undefined) return toolError(`No queued item ${queueId ?? ""}.`);
       if (action === "drop" || action === "done") {
         item.status = action === "drop" ? "dropped" : "done";
-        await projectQueueTransition(item, action === "drop" ? "rm" : "done");
+        await closeQueueItem(item, action === "drop" ? "rm" : "done");
         if (!adopted) queueStore.patch(item, {status:item.status});
         await publishFleet();
         return `Queue ${queueId} ${item.status}${adopted ? " (native backlog row)" : ""}`;
@@ -13236,6 +13337,8 @@ export default async function plugin(bb: BbPluginApi) {
             for (let i = 0; i < tasks.length; i++) {
               const task = tasks[i] as string;
               if (ctxThread) {
+                const waiting = tasks.length === 1 ? await queuedDispatchNote(flagStr(flags, "task-id"), projectId, ctxThread) : null;
+                if (waiting !== null) return fail(waiting);
                 const queued = await enqueueWhenOverCap({
                   task,
                   taskId: tasks.length === 1 ? flagStr(flags, "task-id") : undefined,
@@ -13789,7 +13892,7 @@ export default async function plugin(bb: BbPluginApi) {
               if (item === undefined && qid !== undefined) item = await adoptRealBacklogRow(qid, flagStr(flags, "project") ?? ctxProject, ctxThread, false) ?? undefined;
               if (qid === undefined || item === undefined) return fail(`No queued item ${qid ?? ""}.`);
               item.status = sub === "drop" ? "dropped" : "done";
-              await projectQueueTransition(item, sub === "drop" ? "rm" : "done");
+              await closeQueueItem(item, sub === "drop" ? "rm" : "done");
               if (!adopted) queueStore.patch(item, {status:item.status});
               return reply({ id: qid, status: item.status }, `Queue ${qid} ${item.status}${adopted ? " (native backlog row)" : ""}`);
             }
