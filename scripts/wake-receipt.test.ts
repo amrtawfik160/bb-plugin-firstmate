@@ -532,7 +532,7 @@ test("captain session-start hook leaves a digest with no queued wake unchanged",
     input: '{"source":"compact"}', encoding: "utf8", env: { ...process.env, HOME: f.dir, BB_THREAD_ID: "thr_test" },
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, `${digest}\n\nOWNER DECISIONS\n---------------\n${OWNER_DECISION_RULE}\n\nCAPTAIN RULES\n-------------\n${CAPTAIN_RULES}\n`);
+  assert.equal(result.stdout, `${digest}\n\nOWNER DECISIONS\n---------------\n${OWNER_DECISION_RULE}\n${CAPTAIN_RULES}\n`);
 });
 
 test("captain session-start hook states the card rule after every compaction", (t) => {

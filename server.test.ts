@@ -854,6 +854,7 @@ async function seedPlaybookCrew(host: Awaited<ReturnType<typeof load>>) {
     threadId: "thr_crew", parentThreadId: "thr_cap", providerId: "claude-code", worktree: true, shape: "ship", posture: "local-only",
     createdAt: "2026-10-14T00:00:00.000Z",
   }]);
+  host.harness.sdk.stub("environments.list", async () => [{ hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" }]);
   host.harness.sdk.stub("files.read", async (input: unknown) => {
     const path = String((input as { path?: string }).path ?? "");
     if (!path.endsWith("/poteto-mode/playbooks/feature.md")) throw new Error(`no file ${path}`);
@@ -8468,7 +8469,7 @@ test("captain session-start hook runs native session start only in the captain's
     writeFileSync(marker, `home=${fm}\nstate=${fm}/state\nown_home=1\n`);
     const own = runCaptainHook(home, "session-start", '{"source":"startup"}', "thr_cap");
     assert.equal(own.status, 0);
-    assert.equal(own.stdout, `ran ${fm} bb ${fm} ${fm} {"source":"startup"}\n\nOWNER DECISIONS\n---------------\n${OWNER_DECISION_RULE}\n\nCAPTAIN RULES\n-------------\n${CAPTAIN_RULES}\n`);
+    assert.equal(own.stdout, `ran ${fm} bb ${fm} ${fm} {"source":"startup"}\n\nOWNER DECISIONS\n---------------\n${OWNER_DECISION_RULE}\n${CAPTAIN_RULES}\n`);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

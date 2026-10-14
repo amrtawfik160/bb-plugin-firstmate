@@ -239,6 +239,9 @@ export function askLetterAnswer(ask: Pick<OwnerAsk, "options">, text: string): s
 }
 
 /** Re-sent to the captain every turn and printed at session start, so it survives a compaction. */
+// 10 Oct the captain ran gh pr merge; up to 13 Oct it ran Safi production publishes.
+// Keep this sentence equal to the CAPTAIN RULES block in overlay/bin/bb-captain-hook.sh.
+export const CAPTAIN_RULES = "Captain rules: do not deploy, publish, merge, commit or push yourself. A crew does that work, and a merge goes only through firstmate_merge. Before you tell the owner that something is open, check its firstmate_task or firstmate_deliveries record. Full rules: firstmate_skill name=captain reference=references/supervision.md.";
 export const OWNER_DECISION_RULE = "Send every decision, approval or blocker for the owner with firstmate_ask, one question per card, never as plain text in firstmate_reply or closing text. Decide reversible choices yourself and say in one sentence what you chose. Open cards are on the owner's board, so reports do not repeat them. Full rules: firstmate_skill name=captain reference=references/telegram.md.";
 
 export const PLAIN_DECISION_GUIDANCE = "Send each decision with firstmate_ask: one question per card, option text in options, the recommended option first. Then send the report without the question. Open cards are on the owner's board, so a report does not list or count them.";
