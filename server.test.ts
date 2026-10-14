@@ -2459,7 +2459,7 @@ test("merge lands a PR with zero checks (no_checks) on the captain's word", asyn
     const result = await host.harness.behavior.runCli(["merge", "c1", "--yes"]);
     assert.equal(result.exitCode, 0, result.stderr);
     assert.equal(merged, 1);
-    assert.match(result.stdout, /Merged https:\/\/github\.com\/o\/r\/pull\/1/);
+    assert.match(result.stdout, /Merged #1\nhttps:\/\/github\.com\/o\/r\/pull\/1/);
     assert.deepEqual((await host.bb.storage.kv.get("crews")) as unknown[], []);
   } finally {
     await host.harness.lifecycle.dispose();
@@ -9799,7 +9799,7 @@ test("merge trusts fm-pr-merge's verified MERGED readback over BB's stale PR cac
     const result = await host.harness.behavior.runCli(["merge", "c1", "--yes"]);
     assert.equal(result.exitCode, 0, result.stderr);
     assert.doesNotMatch(result.stdout, /Landing not yet confirmed/);
-    assert.match(result.stdout, /Merged https:\/\/github\.com\/o\/r\/pull\/1\nCrew c1 retired/);
+    assert.match(result.stdout, /Merged #1\nhttps:\/\/github\.com\/o\/r\/pull\/1\nCrew c1 retired/);
     assert.deepEqual(await host.bb.storage.kv.get("crews"), []);
   } finally {
     await host.harness.lifecycle.dispose();

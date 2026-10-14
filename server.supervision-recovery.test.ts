@@ -945,7 +945,7 @@ test("merge with --keep-crew merges the PR and leaves the crew listed and tell-a
     const result = await host.harness.behavior.runCli(["merge", "c1", "--yes", "--keep-crew"], { threadId: "thr_cap" });
     assert.equal(result.exitCode, 0, result.stderr);
     assert.equal(calls.merged, 1);
-    assert.match(result.stdout, /Merged https:\/\/github\.com\/o\/r\/pull\/1/);
+    assert.match(result.stdout, /Merged #1\nhttps:\/\/github\.com\/o\/r\/pull\/1/);
     assert.match(result.stdout, /Crew c1 kept, not retired/);
     assert.doesNotMatch(result.stdout, /Crew c1 retired/);
     assert.equal(host.harness.sdk.callsTo("threads.stop").length, 0);

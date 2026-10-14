@@ -7165,9 +7165,6 @@ export default async function plugin(bb: BbPluginApi) {
     if (current !== null && current.state !== "merged" && current.state !== "closed" && !openUrls.some((u) => prKeyOf(u) === prKeyOf(current.url))) openUrls.push(current.url);
     const recordOf = (url: string) => tracked.find((r) => r.id === prKeyOf(url));
     const sourceOf = (url: string) => current !== null && prKeyOf(current.url) === prKeyOf(url) ? current.source : "named";
-    const env = asRecord(await bb.sdk.environments.get({ environmentId: envId }).catch(() => ({})));
-    const envBranch = typeof env["branchName"] === "string" ? env["branchName"] : "";
-    const envPath = typeof env["path"] === "string" ? env["path"] : "";
     if (ref === null) {
       if (openUrls.length > 1) {
         const lines = await Promise.all(openUrls.map(async (url) => {
@@ -7188,6 +7185,10 @@ export default async function plugin(bb: BbPluginApi) {
         state: openUrls[0] !== undefined ? "open" : current!.state, source: sourceOf(url) };
     }
     if (hostId === null) throw new Error(`Refusing: cannot read PR ${ref.number} on GitHub, because crew ${crew.id} has no host.`);
+    let env: Record<string, unknown> = {};
+    try { env = asRecord(await bb.sdk.environments.get({ environmentId: envId })); } catch { /* the delivery row can still prove the PR */ }
+    const envBranch = typeof env["branchName"] === "string" ? env["branchName"] : "";
+    const envPath = typeof env["path"] === "string" ? env["path"] : "";
     const known = ref.kind === "url" ? ref.url : openUrls.find((u) => Number(/\/pull\/(\d+)/.exec(u)?.[1]) === ref.number);
     const view = known !== undefined ? await ghPrIdentity(hostId, known) : await ghPrIdentity(hostId, String(ref.number), envPath);
     if (view === null) throw new Error(`Refusing: GitHub has no readable PR ${ref.kind === "url" ? ref.url : `#${ref.number}`} for crew ${crew.id}; nothing was merged.`);
