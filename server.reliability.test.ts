@@ -976,7 +976,7 @@ test("long option text stays whole and defaults to a short letter value", async 
     assert.equal(isError(result), false);
     const sent = rpcCalls(host).find((call) => call.method === "ask")!;
     assert.deepEqual(sent.input.options, [{ label, value: "A" }]);
-    assert.equal(sent.input.text, `New customers can start their agents again.\n\n❓ Question\n\nHow should we repair access?\nA. ${label}`);
+    assert.equal(sent.input.text, `❓ How should we repair access?\nNew customers can start their agents again.\nA. ${label}`, "a label too long for its button is listed in full");
   } finally { await host.harness.lifecycle.dispose(); }
 });
 

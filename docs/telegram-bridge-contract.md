@@ -198,26 +198,42 @@ bb.sdk.plugins.callRpc({
     text,             // at most 3500
     options,          // at most 4 of { label (at most 40), value (at most 64) }; may be empty
     recommended?,     // index into options
+    card?: { kind, question, impact?, defaultAt, gated },  // lets the connector fold cards into a pack
   },
   outputSchema: { queued: number, duplicate: boolean },
 })
 ```
 
-The connector sends a card with one button per option. Its outbox source id
-is `ask:<askId>`. The card counts as sent when `queued > 0` or `duplicate` is
-true. On any other result or error the ask stays open, shows on the board, and
-the tool result carries a warning. The card text is:
+The connector sends a card with one button per option, one per row. Its outbox
+source id is `ask:<askId>`. The card counts as sent when `queued > 0` or
+`duplicate` is true. On any other result or error the ask stays open, shows on
+the board, and the tool result carries a warning. The card text is:
 
 ```
-<❓ Question | ⛔ Blocker | ✅ Approval needed>
+<❓|⛔|✅> <question>
+<impact>
+A. <label>          (all options, only when a label is longer than 42 characters)
 
-<question>
-
-Recommended: <label>
-If no answer by <HH:MM UTC>, I'll go with <label>.
+If no answer by <HH:MM UTC>, I go with ✓.
 ```
 
-The last two lines appear only with a recommended option and a deadline.
+The button of the recommended option ends with ✓. The last line appears only
+with a recommended option and a deadline.
+
+A card with `card.gated` false made within 60 seconds of the latest open card
+joins that card's Telegram message as a numbered pack with an "Accept all
+recommended" button and one button row per card. The first card is not held
+back; the connector edits its message. An owner answer given with pack numbers
+("Accept all recommended", `2B`, `1A 3C`) arrives as one owner message with
+`"sourceEventId":"pack:<first askId>"` and a body that ends with:
+
+```
+Answers recorded on the cards:
+- ask <askId>: <option label>
+```
+
+Firstmate resolves each listed ask that is open and owned by the receiving
+captain, and the message needs no reply.
 
 The owner answers with an ordinary owner message under the connector banner.
 Its `reply_target` JSON carries `"sourceEventId":"ask:<askId>"`. For a button
