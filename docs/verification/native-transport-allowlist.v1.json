@@ -48,8 +48,8 @@
       "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner."
     },
     "entry-skills/captain/references/supervision.md": {
-      "sha256": "818f9066ed38684262ccd7354b325105d79453ad185946322b4b458537a705e5",
-      "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner. Captain rules: owner standing approvals, crew work stays with crews, merges only through firstmate_merge, with keepCrew when the crew has work after the merge."
+      "sha256": "5496cdede76b65ec3878510560ff9c77f466fdf0dc43990703c3767be9fb491f",
+      "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner. Captain rules: owner standing approvals, crew work stays with crews, merges only through firstmate_merge naming the PR (crewId + pr), with keepCrew when the crew has work after the merge."
     },
     "entry-skills/skill-routing/SKILL.md": {
       "sha256": "7f770a479c176e0395fd0ed90c004e19d5213eb9c8302012a70bfb78f77238b2",
