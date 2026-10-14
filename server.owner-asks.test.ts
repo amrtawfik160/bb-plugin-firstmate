@@ -105,6 +105,6 @@ test("firstmate_ask opens a card when the captain leaves out impact", async () =
     const result = await host.harness.behavior.callAgentTool("firstmate_ask", { question: "Decision 12: switch the brands audit to weekly?", kind: "question", options: [{ label: "Weekly" }, { label: "Keep daily" }] }, { threadId: "thr_cap" });
     assert.equal(typeof result === "object" && result !== null && "isError" in result, false);
     const [ask] = createOwnerAsks(host.bb.storage.database()).listOpen("thr_cap");
-    assert.equal(formatAskCard(ask!), "❓ Question\n\nDecision 12: switch the brands audit to weekly?\nA. Weekly\nB. Keep daily");
+    assert.equal(formatAskCard(ask!), "❓ Decision 12: switch the brands audit to weekly?");
   } finally { await host.harness.lifecycle.dispose(); }
 });

@@ -50,12 +50,6 @@ type AskRecord = {
   created_at: number; resolved_at: number | null; impact: string | null; source_ref: string | null; message_url: string | null;
 };
 
-export const ASK_KIND_TITLE: Record<AskKind, string> = {
-  question: "❓ Question",
-  blocker: "⛔ Blocker",
-  approval: "✅ Approval needed",
-};
-
 export const ASK_KIND_EMOJI: Record<AskKind, string> = { question: "❓", blocker: "⛔", approval: "✅" };
 
 export function newAskId(): string {
@@ -88,14 +82,37 @@ export function clip(text: string, max: number): string {
   return flat.length <= max ? flat : `${flat.slice(0, max - 1).trimEnd()}…`;
 }
 
-/** The question card text the connector sends to the owner. */
+/** Characters a full-width Telegram button shows. Keep equal to BUTTON_ROOM in the connector's src/ask-pack.ts. */
+export const ASK_BUTTON_ROOM = 42;
+
+function optionText(label: string): string {
+  return label.replace(/^[A-Z][.):]\s*/i, "").trim();
+}
+
+/**
+ * The question card text the connector sends to the owner: the question first, then impact. The buttons carry
+ * the options and mark the recommended one with ✓, so the text lists options only when a button cannot show
+ * a whole label. The deadline is one short line.
+ */
 export function formatAskCard(ask: Pick<OwnerAsk, "kind" | "text" | "impact" | "options" | "recommended" | "defaultAt">): string {
   const label = recommendedLabel(ask);
-  const footer = [
-    ...(label !== null ? [`Recommended: ${label}`] : []),
-    ...(label !== null && ask.defaultAt !== null ? [`If no answer by ${formatUtcTime(ask.defaultAt)}, I'll go with ${label}.`] : []),
-  ];
-  return [...(ask.impact ? [ask.impact, ""] : []), ASK_KIND_TITLE[ask.kind], "", ask.text.trim(), ...ask.options.map((option, index) => `${String.fromCharCode(65 + index)}. ${option.label.replace(/^[A-Z][.)]\s*/i, "")}`), ...(footer.length > 0 ? ["", ...footer] : [])].join("\n");
+  const listed = ask.options.some((option) => optionText(option.label).length > ASK_BUTTON_ROOM)
+    ? ask.options.map((option, index) => `${String.fromCharCode(65 + index)}. ${optionText(option.label)}`)
+    : [];
+  const deadline = label !== null && ask.defaultAt !== null
+    ? ["", `If no answer by ${formatUtcTime(ask.defaultAt)}, I go with ✓.`]
+    : [];
+  return [`${ASK_KIND_EMOJI[ask.kind]} ${ask.text.trim()}`, ...(ask.impact ? [ask.impact] : []), ...listed, ...deadline].join("\n");
+}
+
+/**
+ * The cards a pack answer recorded. The connector sends "Accept all recommended", "2B" or "1A 3C" with one
+ * "- ask <id>: <option label>" line per card under "Answers recorded on the cards:".
+ */
+export function packAnswers(body: string): Array<{ id: string; answer: string }> {
+  const at = body.indexOf("Answers recorded on the cards:");
+  if (at < 0) return [];
+  return [...body.slice(at).matchAll(/^- ask ([A-Za-z0-9_-]{1,64}): (.+)$/gm)].map((match) => ({ id: match[1]!, answer: match[2]!.trim() }));
 }
 
 /** `ask:<id>` is the connector's outbox source id for an ask card; replies and taps carry it back. */

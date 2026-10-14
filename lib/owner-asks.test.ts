@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { askLetterAnswer, askIdFromSourceEventId, cardRepeat, createOwnerAsks, formatAskCard, newAskId, ownerAskedForOptions, PLAIN_DECISION_GUIDANCE, plainTextDecision } from "./owner-asks.ts";
+import { askLetterAnswer, askIdFromSourceEventId, cardRepeat, createOwnerAsks, formatAskCard, newAskId, ownerAskedForOptions, packAnswers, PLAIN_DECISION_GUIDANCE, plainTextDecision } from "./owner-asks.ts";
 import { formatBoard } from "./owner-board.ts";
 
 const NOW = Date.UTC(2026, 9, 7, 12, 0);
@@ -18,16 +18,27 @@ function db() {
   });
 }
 
-test("formatAskCard titles the card by kind and states the recommendation and deadline", () => {
+// 14 Oct: each card repeated its options, "Recommended: ..." and "If no answer by ..., I'll go with ..." under the question.
+test("formatAskCard puts the question first and the deadline in one short line; the buttons carry the options and the ✓", () => {
   assert.equal(
     formatAskCard({ kind: "question", text: "Dark mode by default?", options: [{ label: "Yes", value: "yes" }, { label: "No", value: "no" }], recommended: 0, defaultAt: Date.UTC(2026, 9, 7, 16, 5) }),
-    "❓ Question\n\nDark mode by default?\nA. Yes\nB. No\n\nRecommended: Yes\nIf no answer by 16:05 UTC, I'll go with Yes.",
+    "❓ Dark mode by default?\n\nIf no answer by 16:05 UTC, I go with ✓.",
   );
-  assert.equal(formatAskCard({ kind: "blocker", text: "Need the Stripe key.", options: [], recommended: null, defaultAt: null }), "⛔ Blocker\n\nNeed the Stripe key.");
+  assert.equal(formatAskCard({ kind: "blocker", text: "Need the Stripe key.", options: [], recommended: null, defaultAt: null }), "⛔ Need the Stripe key.");
+  assert.equal(formatAskCard({ kind: "approval", text: "Deploy?", options: [{ label: "Deploy", value: "d" }], recommended: 0, defaultAt: null }), "✅ Deploy?");
+  // A label longer than a button shows is listed in full, because its button ends early.
   assert.equal(
-    formatAskCard({ kind: "approval", text: "Deploy?", options: [{ label: "Deploy", value: "d" }], recommended: 0, defaultAt: null }),
-    "✅ Approval needed\n\nDeploy?\nA. Deploy\n\nRecommended: Deploy",
+    formatAskCard({ kind: "question", text: "Who provides the proxies?", options: [{ label: "A. Cyndra buys one proxy provider account and bills it through credits", value: "A" }, { label: "B. Each customer brings their own proxy", value: "B" }], recommended: 1, defaultAt: Date.UTC(2026, 9, 14, 22, 26) }),
+    "❓ Who provides the proxies?\nA. Cyndra buys one proxy provider account and bills it through credits\nB. Each customer brings their own proxy\n\nIf no answer by 22:26 UTC, I go with ✓.",
   );
+});
+
+test("packAnswers reads the cards a pack answer recorded, one line per card", () => {
+  assert.deepEqual(packAnswers("1A 3C\nAnswers recorded on the cards:\n- ask apx0v8q: A. Lower: 50 a day max\n- ask agqtl7j: C. 90 days, then delete"), [
+    { id: "apx0v8q", answer: "A. Lower: 50 a day max" },
+    { id: "agqtl7j", answer: "C. 90 days, then delete" },
+  ]);
+  assert.deepEqual(packAnswers("- ask apx0v8q: quoted without the heading"), []);
 });
 
 test("ask ids are short and readable, and only ask:<id> source ids name an ask", () => {
@@ -81,7 +92,7 @@ test("impact survives restart while old 12-column writers still work", () => {
   const asks = createOwnerAsks(database);
   const ask = asks.create({ id: "aimpact", captain: "thr_cap", kind: "question", impact: "New customers can start their agents again.", text: "Find the addresses?", options: [{ label: "Find and verify the full address list before changing production.", value: "find" }], createdAt: NOW });
   assert.equal(createOwnerAsks(database).get("aimpact")?.impact, "New customers can start their agents again.");
-  assert.equal(formatAskCard(ask), "New customers can start their agents again.\n\n❓ Question\n\nFind the addresses?\nA. Find and verify the full address list before changing production.");
+  assert.equal(formatAskCard(ask), "❓ Find the addresses?\nNew customers can start their agents again.\nA. Find and verify the full address list before changing production.");
   assert.equal(database.prepare("PRAGMA table_info(owner_ask)").all().length, 12);
 });
 

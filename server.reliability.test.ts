@@ -717,9 +717,11 @@ test("firstmate_ask records the ask and sends the connector a question card with
     assert.deepEqual(calls.map((c) => [c.pluginId, c.method]), [["telegram", "ask"], ["telegram", "refreshBoard"]]);
     assert.deepEqual(calls[0]!.input, {
       askId: id,
-      text: `Customers can use this feature.\n\n❓ Question\n\nDark mode by default?\nA. Yes\nB. No\n\nRecommended: Yes\nIf no answer by ${hhmm(stored.defaultAt!)} UTC, I'll go with Yes.`,
+      text: `❓ Dark mode by default?\nCustomers can use this feature.\n\nIf no answer by ${hhmm(stored.defaultAt!)} UTC, I go with ✓.`,
       options: [{ label: "Yes", value: "A" }, { label: "No", value: "no" }],
       recommended: 0,
+      // What the connector needs to fold this card into a pack with others sent within a minute.
+      card: { kind: "question", question: "Dark mode by default?", impact: "Customers can use this feature.", defaultAt: stored.defaultAt, gated: false },
     });
   } finally {
     await host.harness.lifecycle.dispose();
@@ -759,7 +761,8 @@ test("firstmate_ask refuses a deadline on an approval or an irreversible ask, an
     const waiting = await askTool(host, { question: "Delete old data?", kind: "question", options, recommended: 1, irreversible: true });
     const id = /ask (a[0-9a-z]{6})/.exec(text(waiting))![1]!;
     assert.equal(asks(host).get(id)?.defaultAt, null, "askDefaultMinutes never applies to an irreversible ask");
-    assert.equal(rpcCalls(host)[0]!.input.text, "Customers can use this feature.\n\n❓ Question\n\nDelete old data?\nA. Deploy\nB. Wait\n\nRecommended: Wait");
+    assert.equal(rpcCalls(host)[0]!.input.text, "❓ Delete old data?\nCustomers can use this feature.");
+    assert.equal((rpcCalls(host)[0]!.input.card as { gated: boolean }).gated, true, "an irreversible ask never joins a pack");
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -797,6 +800,36 @@ test("only a letter reply to an ask card answers that ask and refreshes the boar
     const header = parseInboundTelegram(askReply("a000001", "Yes"))!;
     const row = createInboundLedger(host.bb.storage.database()).get({ source: "telegram", chatId: header.chatId, messageId: header.messageId });
     assert.equal(row?.state, "answered", "an answer to a card raises no unanswered reminder");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// Telegram folds cards sent within a minute into one pack; "Accept all recommended" or "1A 3C" answers several at once.
+test("a pack answer resolves each card it lists and raises no unanswered reminder", async () => {
+  const host = await captainHost();
+  try {
+    connectorOk(host);
+    const opts = [{ label: "A. 30 days, then delete", value: "A" }, { label: "C. 90 days, then delete", value: "C" }];
+    asks(host).create({ id: "apx0v8q", captain: "thr_cap", kind: "question", text: "Lower the caps?", options: [{ label: "A. Lower", value: "A" }], recommended: 0, createdAt: 1 });
+    asks(host).create({ id: "agqtl7j", captain: "thr_cap", kind: "question", text: "Keep data how long?", options: opts, recommended: 0, createdAt: 2 });
+    asks(host).create({ id: "a1bhepn", captain: "thr_cap", kind: "question", text: "Pricing?", options: opts, recommended: 0, createdAt: 3 });
+    asks(host).create({ id: "aforeign", captain: "thr_other", kind: "question", text: "Other?", options: opts, createdAt: 4 });
+    const hook = host.harness.inspection.registrations.hooks["message.dispatch"]!;
+    const body = "1A 3C\nAnswers recorded on the cards:\n- ask apx0v8q: A. Lower\n- ask agqtl7j: C. 90 days, then delete\n- ask aforeign: C. 90 days, then delete";
+    const message = envelope("live-reply").replace('"sourceEventId":"evt_1"', '"sourceEventId":"pack:apx0v8q"').replace(/Roll it back$/, body);
+    await hook({
+      thread: makeThreadResponse({ id: "thr_cap", status: "active" }),
+      attempt: "join-turn", initiator: "user", senderThreadId: null, queuedMessages: [],
+      input: { blocks: [], text: message },
+    } as never);
+    assert.equal(asks(host).get("apx0v8q")?.resolution, "A. Lower");
+    assert.equal(asks(host).get("agqtl7j")?.resolution, "C. 90 days, then delete");
+    assert.equal(asks(host).get("a1bhepn")?.state, "open", "a card the answer does not list stays open");
+    assert.equal(asks(host).get("aforeign")?.state, "open", "another captain's card is untouched");
+    const header = parseInboundTelegram(message)!;
+    const row = createInboundLedger(host.bb.storage.database()).get({ source: "telegram", chatId: header.chatId, messageId: header.messageId });
+    assert.equal(row?.state, "answered", "a pack answer needs action, not a reply");
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -943,7 +976,7 @@ test("long option text stays whole and defaults to a short letter value", async 
     assert.equal(isError(result), false);
     const sent = rpcCalls(host).find((call) => call.method === "ask")!;
     assert.deepEqual(sent.input.options, [{ label, value: "A" }]);
-    assert.equal(sent.input.text, `New customers can start their agents again.\n\n❓ Question\n\nHow should we repair access?\nA. ${label}`);
+    assert.equal(sent.input.text, `❓ How should we repair access?\nNew customers can start their agents again.\nA. ${label}`, "a label too long for its button is listed in full");
   } finally { await host.harness.lifecycle.dispose(); }
 });
 

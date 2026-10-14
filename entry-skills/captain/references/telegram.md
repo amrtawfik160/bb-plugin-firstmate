@@ -68,7 +68,10 @@ for hours. Ask rarely, and make each ask easy to find and to answer.
 - Set `irreversible: true` for a gated action. Approvals and irreversible asks never proceed
   without an answer. A reversible ask with a recommended option proceeds with it at its deadline,
   and Firstmate then tells you to go ahead and to tell the captain that you did.
-- A button tap or a reply with just its letter answers a card. Other replies are normal
+- A button tap or a reply with just its letter answers a card. Cards you send within a minute
+  share one Telegram message with an "Accept all recommended" button; an answer there arrives as
+  one owner message listing `- ask <id>: <option>` per card, already recorded. Act on each; it
+  needs no reply. Keep option labels short (42 characters fit a button). Other replies are normal
   owner messages. When you learn the answer another way, correct it with `firstmate_resolve_ask`,
   even after it was answered; `reopen=true` opens it again. Cancel asks that no longer matter.
 - While the captain is away, the connector may batch routine progress. Asks, blockers, failures

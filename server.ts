@@ -75,7 +75,7 @@ import { inboundHookDecision } from "./lib/inbound-dispatch.ts";
 import { formatWorkersForTelegram } from "./lib/telegram-commands.ts";
 import { digestOnce, EMPTY_DIGEST_MEMORY, formatBoard, type BoardInput, type DigestMemory } from "./lib/owner-board.ts";
 import { createOwnerTasks, isOpenTask, sameProject, taskLine, type CrewFinish, type OwnerTask, type TaskState } from "./lib/owner-tasks.ts";
-import { askLetterAnswer, askIdFromSourceEventId, cardRepeat, clip, createOwnerAsks, formatAge, formatAskCard, formatUtcTime, mayDefault, CAPTAIN_RULES, OWNER_DECISION_RULE, ownerAskedForOptions, PLAIN_DECISION_GUIDANCE, plainTextDecision, recommendedLabel, type AskKind } from "./lib/owner-asks.ts";
+import { askLetterAnswer, askIdFromSourceEventId, packAnswers, cardRepeat, clip, createOwnerAsks, formatAge, formatAskCard, formatUtcTime, mayDefault, CAPTAIN_RULES, OWNER_DECISION_RULE, ownerAskedForOptions, PLAIN_DECISION_GUIDANCE, plainTextDecision, recommendedLabel, type AskKind } from "./lib/owner-asks.ts";
 import { DEFAULT_RELIABILITY_FLAGS, reliabilityFlagsFromSettings } from "./lib/reliability-flags.ts";
 import { sanitizeSettingValue } from "./lib/settings-schema.ts";
 import { coalesceBatches, parseConnectorHeader, parseInboundTelegram, parseSourceRef, parseTelegramSubmission, stripTelegramEnvelope, telegramReplyParameters, telegramSourceRef } from "./lib/telegram-envelope.ts";
@@ -11143,12 +11143,12 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_ask",
-    description: "Ask the captain one question, blocker or approval as a Telegram card with up to 4 option buttons. It stays on the captain's board until answered. Returns at once: keep working on other things. The answer arrives from a button tap or a card reply containing just its option letter. irreversible=true or kind=approval never proceeds on a deadline; a reversible ask with a recommended option proceeds with it at its deadline.",
+    description: "Ask the captain one question, blocker or approval as a Telegram card with up to 4 option buttons. It stays on the captain's board until answered. Returns at once: keep working on other things. The answer arrives from a button tap or a card reply containing just its option letter. Reversible cards sent within a minute of each other share one Telegram message with an \"Accept all recommended\" button; an answer there arrives as one owner message with a line \"- ask <id>: <option>\" per card it answered. irreversible=true or kind=approval never proceeds on a deadline and keeps its own message; a reversible ask with a recommended option proceeds with it at its deadline.",
     parameters: z.object({
       impact: z.string().optional().describe("Optional. One plain sentence explaining what this means for the owner’s business"),
-      question: z.string().min(1).max(1500).describe("One question; put option text in options, not in the question"),
+      question: z.string().min(1).max(1500).describe("One question, asked in the first sentence; put option text in options, not in the question. Cards sent together that start with the same subject and a colon (\"DM Pro plugin: ...\") get that subject as their shared title"),
       kind: z.enum(["question", "blocker", "approval"]),
-      options: z.array(z.object({ label: z.string().min(1).max(1000), value: z.string().min(1).max(64).optional() })).max(4).optional(),
+      options: z.array(z.object({ label: z.string().min(1).max(1000).describe("Short: up to 42 characters fit a button whole"), value: z.string().min(1).max(64).optional() })).max(4).optional(),
       recommended: z.number().int().min(0).optional().describe("Index of the recommended option"),
       defaultAfterMinutes: z.number().min(5).max(10080).optional().describe("Proceed with the recommended option after this many minutes without an answer (reversible asks only)"),
       irreversible: z.boolean().optional().describe("A gated action (production deploy, money, deleting data, customer messages): never proceeds without an answer"),
@@ -11180,7 +11180,11 @@ export default async function plugin(bb: BbPluginApi) {
         const sent = z.object({ queued: z.number(), duplicate: z.boolean() }).parse(await bb.sdk.plugins.callRpc({
           pluginId: TELEGRAM_BRIDGE_PLUGIN_ID,
           method: "ask",
-          input: { askId: ask.id, text: formatAskCard(ask), options: ask.options, ...(ask.recommended !== null ? { recommended: ask.recommended } : {}) },
+          input: {
+            askId: ask.id, text: formatAskCard(ask), options: ask.options, ...(ask.recommended !== null ? { recommended: ask.recommended } : {}),
+            // The connector folds reversible cards sent within a minute into one message with "Accept all recommended".
+            card: { kind: ask.kind, question: ask.text, ...(ask.impact ? { impact: ask.impact } : {}), defaultAt: ask.defaultAt, gated },
+          },
           outputSchema: z.object({ queued: z.number(), duplicate: z.boolean() }),
         }));
         if (sent.queued <= 0 && !sent.duplicate) warning = "the Telegram connector queued nothing";
@@ -12748,6 +12752,12 @@ export default async function plugin(bb: BbPluginApi) {
     let answered = 0;
     for (const message of texts) {
       const header = parseConnectorHeader(message);
+      if (header && !header.forwarded && header.sourceEventId?.startsWith("pack:")) {
+        for (const { id, answer } of packAnswers(header.body)) {
+          if (ownerAsks.get(id)?.state === "open" && ownerAsks.resolve(id, captainThreadId, "answered", answer, Date.now())) answered++;
+        }
+        continue;
+      }
       const id = askIdFromSourceEventId(header?.sourceEventId);
       if (!header || header.forwarded || id === null) continue;
       const ask = ownerAsks.get(id);
@@ -12829,7 +12839,8 @@ export default async function plugin(bb: BbPluginApi) {
             const header = parseConnectorHeader(event.text);
             const id = askIdFromSourceEventId(header?.sourceEventId);
             const ask = id ? ownerAsks.get(id) : undefined;
-            if (!header || header.forwarded || !ask || ask.captain !== threadId || askLetterAnswer(ask, header.body) === null) continue;
+            const packAnswer = header?.sourceEventId?.startsWith("pack:") === true && packAnswers(header.body).some((item) => ownerAsks.get(item.id)?.captain === threadId);
+            if (!header || header.forwarded || (!packAnswer && (!ask || ask.captain !== threadId || askLetterAnswer(ask, header.body) === null))) continue;
             inboundLedger.markAnswered({ source: "telegram", chatId: header.chatId, messageId: header.messageId }, Date.now());
           }
           if (flags.inboundLedger === "on") {
