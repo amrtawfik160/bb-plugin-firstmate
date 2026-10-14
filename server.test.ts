@@ -11157,6 +11157,73 @@ test("IT inbox parity: a missing record is not an acknowledgement", { skip: !FM_
   } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
 });
 
+// The exact error BB's client throws for a write to an archived thread
+// (ensureThreadIsWritable → ApiError(409, "thread_not_writable") → BbHttpError).
+class BbHttpError extends Error {
+  override name = "BbHttpError";
+  readonly status = 409;
+  readonly code = "thread_not_writable";
+  readonly body = { code: "thread_not_writable", message: "Thread is archived", details: { reason: "archived", archivedAt: "2026-10-14T02:54:29.000Z", threadStatus: "idle" } };
+  constructor() { super("HTTP 409: Thread is archived"); }
+}
+
+// Live 14 Oct: a steer to crew 42fc1ad4 landed 3s after its thread was archived;
+// the sweep re-rang it every 30s and logged the 409 about 85 times an hour.
+test("inbox delivery to an archived thread is closed once with the reason and never retried", async () => {
+  let host = ownerHost({ tellOwner: "real" });
+  await plugin(host.bb);
+  try {
+    stubRoutedHost(host, (cmd) => cmd.includes("python3 -c") ? { payload: "pending\n" } : { code: 0 });
+    host.harness.sdk.stub("threads.queuedMessages.list", async () => []);
+    host.harness.sdk.stub("threads.send", async () => { throw new BbHttpError(); });
+    const key = "inbox-delivery:thr_crew";
+    await host.bb.storage.kv.set(key, {
+      threadId: "thr_crew", hostId: "host_1", home: "/tmp/fm-home", crewId: "c1", senderThreadId: "thr_cap",
+      doorbell: ": Firstmate instruction waiting: c1", queueIds: [], records: ["001.msg"], retry: true,
+    });
+    const archivedLogs = () => host.harness.logEntries.filter(e => /archived/i.test(e.message));
+    for (let pass = 0; pass < 3; pass++) {
+      const run = host.harness.behavior.runService("captain-wake-release");
+      try {
+        for (let n = 0; n < 100 && archivedLogs().length === 0; n++) await new Promise(r => setTimeout(r, 10));
+        await new Promise(r => setTimeout(r, 30));
+      } finally { run.controller.abort(); await run.done; }
+      if (pass === 1) {
+        host = await host.harness.lifecycle.reload(plugin);
+        stubRoutedHost(host, (cmd) => cmd.includes("python3 -c") ? { payload: "pending\n" } : { code: 0 });
+        host.harness.sdk.stub("threads.queuedMessages.list", async () => []);
+        host.harness.sdk.stub("threads.send", async () => { throw new BbHttpError(); });
+      }
+    }
+    const sends = host.harness.sdk.callsTo("threads.send").length;
+    assert.ok(sends <= 1, `an archived target is never re-rung: ${sends} sends`);
+    const record = await host.bb.storage.kv.get<{ closed?: string; retry: boolean }>(key);
+    assert.match(record?.closed ?? "", /archived/, "the delivery is marked closed with the reason");
+    assert.equal(record?.retry, false);
+    const lines = host.harness.logEntries.map(e => e.message);
+    assert.ok(!lines.some(m => m.startsWith("inbox reconciliation:")), `no per-cycle error line: ${lines.join("\n")}`);
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("IT inbox parity: a tell to an archived crew thread says NOT delivered, never 'pending retry'", { skip: !FM_INTEGRATION }, async () => {
+  const home = scratchFmHome();
+  const host = itHost(home, { tellOwner: "real" });
+  await plugin(host.bb);
+  try {
+    stubRealExecHost(host);
+    await seedCrew(host);
+    host.harness.sdk.stub("threads.queuedMessages.list", async () => []);
+    host.harness.sdk.stub("threads.send", async () => { throw new BbHttpError(); });
+    const result = await host.harness.behavior.runCli(["tell", "c1", "--message=fix two defects"], { projectId: "proj_1" });
+    assert.match(result.stdout, /NOT delivered/);
+    assert.match(result.stdout, /archived/);
+    assert.doesNotMatch(result.stdout, /pending retry/);
+    const record = await host.bb.storage.kv.get<{ closed?: string; retry: boolean }>("inbox-delivery:thr_crew");
+    assert.match(record?.closed ?? "", /archived/);
+    assert.equal(record?.retry, false);
+  } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
+});
+
 test("interaction wake names the id, kind, and the matching command", async () => {
   const host = await load();
   try {
