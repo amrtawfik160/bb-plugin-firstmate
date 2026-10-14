@@ -5603,8 +5603,24 @@ export default async function plugin(bb: BbPluginApi) {
   type InboxDelivery = {
     threadId: string; hostId: string; home: string; crewId: string; senderThreadId?: string;
     doorbell: string; queueIds: string[]; records: string[]; retry: boolean;
+    // Set when the delivery can never land; the sweep skips it from then on.
+    closed?: string;
   };
   const INBOX_DELIVERY_PREFIX = "inbox-delivery:";
+
+  // BB refuses every write to an archived thread with 409 thread_not_writable.
+  // Retrying cannot succeed; only an unarchive (crew revive) reopens the thread.
+  function isArchivedThreadError(error: unknown): boolean {
+    const failure = bbFailure(error);
+    return failure.code === "thread_not_writable" && (failure.reason === "archived" || /Thread is archived/.test(failure.message));
+  }
+
+  async function closeInboxDelivery(key: string, delivery: InboxDelivery): Promise<void> {
+    delivery.closed = `target thread ${delivery.threadId} is archived`;
+    delivery.retry = false;
+    await bb.storage.kv.set(key, delivery);
+    bb.log.warn(`inbox delivery closed crew=${delivery.crewId} thread=${delivery.threadId} from=${delivery.senderThreadId ?? "unknown"}: ${delivery.closed}; unread record(s) ${(delivery.records ?? []).join(", ")} in ${delivery.home}/state/${delivery.crewId}.inbox were NOT delivered`);
+  }
 
   async function inboxQueueRows(delivery: InboxDelivery, signal?: AbortSignal) {
     const rows = await raceAbort(bb.sdk.threads.queuedMessages.list({ threadId: delivery.threadId, signal }), signal, STUCK_HOST_CALL_MS);
@@ -5618,30 +5634,38 @@ export default async function plugin(bb: BbPluginApi) {
   async function reconcileInboxDelivery(key: string, signal?: AbortSignal): Promise<void> {
     await raceAbort(serializeLedger(key, async () => {
       const delivery = await bb.storage.kv.get<InboxDelivery>(key);
-      if (!delivery || signal?.aborted) return;
-      const rows = await inboxQueueRows(delivery, signal);
-      const dir = `${delivery.home}/state/${delivery.crewId}.inbox`;
-      const probeScript = "import os,sys,json; d=sys.argv[1]; entries=list(os.scandir(d)); records=json.loads(sys.argv[2]); pending=any(e.name.endswith('.msg') for e in entries); acknowledged=bool(records) and all(os.path.isfile(os.path.join(d,'handled',r)) for r in records); print('pending' if pending else 'empty' if acknowledged else 'unconfirmed')";
-      const probe = await runOnHost(delivery.hostId,
-        `python3 -c ${shQuote(probeScript)} ${shQuote(dir)} ${shQuote(JSON.stringify(delivery.records ?? []))}`, STUCK_HOST_CALL_MS, signal);
-      if (probe.exitCode !== 0) return; // Unreadable is never acknowledged.
-      if (probe.output.trim() === "empty") {
-        for (const row of rows) {
-          if (signal?.aborted) return;
-          await raceAbort(bb.sdk.threads.queuedMessages.delete({ threadId: delivery.threadId, queuedMessageId: row.id }), signal, STUCK_HOST_CALL_MS);
-        }
-        await bb.storage.kv.delete(key);
-      } else if (probe.output.trim() === "pending" && delivery.retry && rows.length === 0) {
-        const result = await raceAbort(bb.sdk.threads.send({
-          threadId: delivery.threadId, mode: "queue-if-active", senderThreadId: delivery.senderThreadId,
-          input: [{ type: "text", text: delivery.doorbell, mentions: [] }],
-        }), signal, STUCK_HOST_CALL_MS);
-        const row = asRecord(asRecord(result)["queuedMessage"]);
-        delivery.queueIds = typeof row["id"] === "string" ? [row["id"]] : [];
-        delivery.retry = false;
-        await bb.storage.kv.set(key, delivery);
+      if (!delivery || delivery.closed || signal?.aborted) return;
+      try { await reconcileOpenInboxDelivery(key, delivery, signal); }
+      catch (error) {
+        if (!isArchivedThreadError(error)) throw error;
+        await closeInboxDelivery(key, delivery);
       }
     }), signal, STUCK_HOST_CALL_MS);
+  }
+
+  async function reconcileOpenInboxDelivery(key: string, delivery: InboxDelivery, signal?: AbortSignal): Promise<void> {
+    const rows = await inboxQueueRows(delivery, signal);
+    const dir = `${delivery.home}/state/${delivery.crewId}.inbox`;
+    const probeScript = "import os,sys,json; d=sys.argv[1]; entries=list(os.scandir(d)); records=json.loads(sys.argv[2]); pending=any(e.name.endswith('.msg') for e in entries); acknowledged=bool(records) and all(os.path.isfile(os.path.join(d,'handled',r)) for r in records); print('pending' if pending else 'empty' if acknowledged else 'unconfirmed')";
+    const probe = await runOnHost(delivery.hostId,
+      `python3 -c ${shQuote(probeScript)} ${shQuote(dir)} ${shQuote(JSON.stringify(delivery.records ?? []))}`, STUCK_HOST_CALL_MS, signal);
+    if (probe.exitCode !== 0) return; // Unreadable is never acknowledged.
+    if (probe.output.trim() === "empty") {
+      for (const row of rows) {
+        if (signal?.aborted) return;
+        await raceAbort(bb.sdk.threads.queuedMessages.delete({ threadId: delivery.threadId, queuedMessageId: row.id }), signal, STUCK_HOST_CALL_MS);
+      }
+      await bb.storage.kv.delete(key);
+    } else if (probe.output.trim() === "pending" && delivery.retry && rows.length === 0) {
+      const result = await raceAbort(bb.sdk.threads.send({
+        threadId: delivery.threadId, mode: "queue-if-active", senderThreadId: delivery.senderThreadId,
+        input: [{ type: "text", text: delivery.doorbell, mentions: [] }],
+      }), signal, STUCK_HOST_CALL_MS);
+      const row = asRecord(asRecord(result)["queuedMessage"]);
+      delivery.queueIds = typeof row["id"] === "string" ? [row["id"]] : [];
+      delivery.retry = false;
+      await bb.storage.kv.set(key, delivery);
+    }
   }
 
   // Native parity: write once, ring a constant pointer, let the worker acknowledge.
@@ -5672,6 +5696,7 @@ export default async function plugin(bb: BbPluginApi) {
       delivery.records = [...(delivery.records ?? []), record.slice(record.lastIndexOf("/") + 1)];
       // Persist before sending: reload or a failed send can retry the notification.
       delivery.retry = true;
+      delete delivery.closed;
       await bb.storage.kv.set(key, delivery);
       const wasActive = queue ? false : await crewInTurn(crew);
       try {
@@ -5703,6 +5728,10 @@ export default async function plugin(bb: BbPluginApi) {
           ? `Steered into crew ${crew.id}'s running turn (native inbox notification; worker acknowledgement pending)`
           : `Told crew ${crew.id} (started a turn; native inbox acknowledgement pending)`;
       } catch (error) {
+        if (isArchivedThreadError(error)) {
+          await closeInboxDelivery(key, delivery);
+          return `Instruction for crew ${crew.id} NOT delivered: its thread ${crew.threadId} is archived, so it will not be retried. The text stays unread at ${record}; send it to a live crew instead.`;
+        }
         bb.log.warn(`inbox notification crew=${crew.id}: ${String(error)}`);
         return `Recorded instruction for crew ${crew.id} at ${record}; notification pending retry.`;
       }
