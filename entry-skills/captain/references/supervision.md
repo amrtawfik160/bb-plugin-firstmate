@@ -33,4 +33,5 @@ Legacy `firstmate_wake` `ackThrough` and `recoveryGeneration` must match an outs
 - Never resolve conflicts, rebase, commit or push to a crew branch yourself. Never open a crew's PR yourself.
 - When a crew's PR needs a fix, a rebase or a conflict resolved, send that fix round to a crew. Use `firstmate_tell` while the owning crew is live. Otherwise use `firstmate_dispatch` with the PR URL, the branch and the original `sourceRefs`.
 - Merge only through `firstmate_merge`. Never run `gh pr merge` or another merge command yourself.
+- Merge with `firstmate_merge` crewId + pr: name the PR (`pr`, number or link; CLI `--pr`). A crew with more than one open PR refuses a merge without `pr` and lists its open PRs. Check that the first line of the result names the PR you meant.
 - `firstmate_merge` retires the crew at merge. When the crew still has work after its PR merges, pass `keepCrew: true` (`--keep-crew`); retire it later with `firstmate_forget` `stop=true`.

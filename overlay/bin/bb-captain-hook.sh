@@ -125,7 +125,7 @@ case "$mode" in
     # Keep the sentence equal to OWNER_DECISION_RULE in lib/owner-asks.ts.
     printf '\nOWNER DECISIONS\n---------------\n%s\n' "Send every decision, approval or blocker for the owner with firstmate_ask, one question per card, never as plain text in firstmate_reply or closing text. Decide reversible choices yourself and say in one sentence what you chose. Open cards are on the owner's board, so reports do not repeat them. Full rules: firstmate_skill name=captain reference=references/telegram.md."
     # Keep the sentence equal to CAPTAIN_RULES in lib/owner-asks.ts.
-    printf '%s\n' "Captain rules: do not deploy, publish, merge, commit or push yourself. A crew does that work, and a merge goes only through firstmate_merge. Before you tell the owner that something is open, check its firstmate_task or firstmate_deliveries record. Full rules: firstmate_skill name=captain reference=references/supervision.md."
+    printf '%s\n' "Captain rules: do not deploy, publish, merge, commit or push yourself. A crew does that work. Merge with firstmate_merge crewId + pr. Before you tell the owner that something is open, check its firstmate_task or firstmate_deliveries record. Full rules: firstmate_skill name=captain reference=references/supervision.md."
     exit "$rc"
     ;;
 esac
