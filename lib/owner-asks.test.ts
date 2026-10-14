@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { askLetterAnswer, askIdFromSourceEventId, createOwnerAsks, formatAskCard, newAskId, ownerAskedForOptions, PLAIN_DECISION_GUIDANCE, plainTextDecision } from "./owner-asks.ts";
+import { askLetterAnswer, askIdFromSourceEventId, cardRepeat, createOwnerAsks, formatAskCard, newAskId, ownerAskedForOptions, PLAIN_DECISION_GUIDANCE, plainTextDecision } from "./owner-asks.ts";
 import { formatBoard } from "./owner-board.ts";
 
 const NOW = Date.UTC(2026, 9, 7, 12, 0);
@@ -126,4 +126,43 @@ test("an owner message that asks for options or drafts allows a reply that lists
 test("the guidance names the card tool and the report without the question", () => {
   assert.match(PLAIN_DECISION_GUIDANCE, /firstmate_ask/);
   assert.match(PLAIN_DECISION_GUIDANCE, /without the question/);
+});
+
+// Cards sent and closing text that repeated them on 14 Oct 2026 (09:17 and 09:30 UTC).
+const SAVINGS_CARD = {
+  id: "asav001", createdAt: NOW - 60_000,
+  text: "Safi savings: some users already had money in their goals before this change. Should that old money also come out of \"money on hand\"?",
+  options: [
+    { label: "B: Yes. Take existing goal money out of money on hand too. This needs a one-time change to production data, with a backup first.", value: "B" },
+    { label: "A: No. Only money added after the release leaves money on hand. Old goal money stays in money on hand. No data changes.", value: "A" },
+  ],
+};
+const RESTART_CARD = {
+  id: "arst001", createdAt: NOW - 30_000,
+  text: "Seven Cyndra agent-runtime changes are ready. They include the Hermes parts and earlier fixes. They go live only when customer agents restart. When should I run that restart?",
+  options: [
+    { label: "A: Tomorrow, 15 Oct, in the normal quiet window, 07:00–08:00 UTC (10:00–11:00 Cairo). More Hermes parts can join the same batch.", value: "A" },
+    { label: "B: Today, outside the normal window. Customers may see a short gap in replies while their agent restarts.", value: "B" },
+    { label: "C: Hold. Do not restart until you name a time.", value: "C" },
+  ],
+};
+
+test("Oct 14 repro: a message that restates the question of a card sent minutes ago is a repeat", () => {
+  const savings = cardRepeat("I sent you one question card: should money already in savings goals also come out of \"money on hand\"? I recommend yes. That needs a one-time change to production data, with a backup taken first.\n\n**Safi savings change:**\n- It is being released now.", [SAVINGS_CARD], NOW);
+  assert.equal(savings?.ask.id, "asav001");
+  assert.match(savings!.sentence, /money on hand/);
+  const restart = cardRepeat("All Cyndra changes on tonight's release list are now live.\n\nI sent you one question card. Seven agent changes go live only when customer agents restart. I recommend the quiet window tomorrow: 07:00–08:00 UTC, which is 10:00–11:00 Cairo time.", [SAVINGS_CARD, RESTART_CARD], NOW);
+  assert.equal(restart?.ask.id, "arst001");
+});
+
+test("a report on the same subject, a bare card count and a card older than 30 minutes are not repeats", () => {
+  for (const text of [
+    "1 card sent.",
+    "I sent you one question about Safi. Next, the Safi crew releases the change.",
+    "The Safi savings change is merged. The crew is now releasing it: the server first, then the app update to preview and production.",
+    "The Safi savings change is live in the preview app and the production app. Money you put into a goal now leaves money on hand, and Accounts shows the new \"Savings\" section.",
+    "Nothing new needs your decision. Every Cyndra change on tonight's list is released, and no agent was restarted.",
+  ]) assert.equal(cardRepeat(text, [SAVINGS_CARD, RESTART_CARD], NOW), null, text);
+  const old = { ...SAVINGS_CARD, createdAt: NOW - 31 * 60_000 };
+  assert.equal(cardRepeat("Should money already in savings goals also come out of money on hand?", [old], NOW), null);
 });

@@ -9557,7 +9557,7 @@ test("a PR merged outside its captain retires the crew and tells the OWNING capt
   }
 });
 
-test("tell/retry refuse to wake an idle crew past the running-crew cap unless overCap", async () => {
+test("Oct 14 repro: a tell to an idle crew is delivered at the crew cap; retry still keeps to the cap unless overCap", async () => {
   const host = await load();
   try {
     await host.bb.storage.kv.set("crews", [
@@ -9569,19 +9569,20 @@ test("tell/retry refuse to wake an idle crew past the running-crew cap unless ov
       makeThreadResponse({ id: input.threadId, status: input.threadId === "thr_c11" ? "idle" : "active" }));
     host.harness.sdk.stub("threads.send", async () => ({}));
     host.harness.sdk.stub("threads.retry", async () => ({}));
+    // The cap limits new crews. Follow-up work for a crew that exists is never refused for it.
     const told = await host.harness.behavior.runCli(["tell", "c11", "--", "pick it back up"], { threadId: "thr_cap" });
-    assert.equal(told.exitCode, 1);
-    assert.match(told.stderr, /Crew cap reached: 10 crews running \(cap 10\)\. Waking idle crew c11/);
-    assert.equal(host.harness.sdk.callsTo("threads.send").length, 0);
+    assert.equal(told.exitCode, 0, told.stderr);
+    assert.doesNotMatch(told.stdout, /Crew cap reached/);
+    assert.equal(host.harness.sdk.callsTo("threads.send").length, 1);
+    const tool = await agentTool(host, "firstmate_tell").execute({ crewId: "c11", message: "send me your list" }, { threadId: "thr_cap" } as never);
+    assert.ok(!isToolError(tool), toolText(tool));
+    assert.equal(host.harness.sdk.callsTo("threads.send").length, 2);
     const retried = await agentTool(host, "firstmate_retry").execute({ crewId: "c11" }, { threadId: "thr_cap" } as never);
     assert.ok(isToolError(retried), toolText(retried));
+    assert.match(toolText(retried), /Crew cap reached: 10 crews running \(cap 10\)/);
     assert.equal(host.harness.sdk.callsTo("threads.retry").length, 0);
-    const over = await host.harness.behavior.runCli(["tell", "c11", "--over-cap", "--", "pick it back up"], { threadId: "thr_cap" });
-    assert.equal(over.exitCode, 0, over.stderr);
-    assert.equal(host.harness.sdk.callsTo("threads.send").length, 1);
-    // Steering a crew that is already running adds no turn, so the cap does not apply.
-    const running = await host.harness.behavior.runCli(["tell", "c1", "--", "also check the tests"], { threadId: "thr_cap" });
-    assert.equal(running.exitCode, 0, running.stderr);
+    const over = await agentTool(host, "firstmate_retry").execute({ crewId: "c11", overCap: true }, { threadId: "thr_cap" } as never);
+    assert.ok(!isToolError(over), toolText(over));
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -10876,8 +10877,8 @@ test("IT receipts replay across reload, reject failed final actions and complete
     assert.match(String(replay), new RegExp(`WAKE_RECEIPT: ${id} \\(replayed\\)`));
     const failed = await tool("firstmate_deliver").execute({ crewId: "absent", handledWake: id }, ctx);
     assert.equal((failed as { isError: boolean }).isError, true);
-    assert.equal(JSON.parse(readFileSync(journal, "utf8")).phase, "acting", "failed action remains uncertain until reconciled");
-    assert.match(JSON.stringify(failed), /Reconcile external state/);
+    assert.equal(JSON.parse(readFileSync(journal, "utf8")).phase, "ready", "a crew id that does not exist is refused before the action begins");
+    assert.doesNotMatch(JSON.stringify(failed), /uncertain/);
     await tool("firstmate_wake").execute({ handledWake: id }, ctx);
     await emitIdle(host, "BLOCKED: new receipt delivery must survive until handled");
     const next = await tool("firstmate_wake").execute({}, ctx);
