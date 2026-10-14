@@ -11202,6 +11202,7 @@ test("inbox delivery to an archived thread is closed once with the reason and ne
     assert.equal(record?.retry, false);
     const lines = host.harness.logEntries.map(e => e.message);
     assert.ok(!lines.some(m => m.startsWith("inbox reconciliation:")), `no per-cycle error line: ${lines.join("\n")}`);
+    assert.ok(lines.filter(m => m.startsWith("inbox delivery closed")).length <= 1, "the close is logged once");
   } finally { await host.harness.lifecycle.dispose(); }
 });
 
