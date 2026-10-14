@@ -75,7 +75,7 @@ import { inboundHookDecision } from "./lib/inbound-dispatch.ts";
 import { formatWorkersForTelegram } from "./lib/telegram-commands.ts";
 import { digestOnce, EMPTY_DIGEST_MEMORY, formatBoard, type BoardInput, type DigestMemory } from "./lib/owner-board.ts";
 import { createOwnerTasks, isOpenTask, sameProject, taskLine, type CrewFinish, type OwnerTask, type TaskState } from "./lib/owner-tasks.ts";
-import { askLetterAnswer, askIdFromSourceEventId, createOwnerAsks, formatAskCard, formatUtcTime, mayDefault, OWNER_DECISION_RULE, ownerAskedForOptions, PLAIN_DECISION_GUIDANCE, plainTextDecision, recommendedLabel, type AskKind } from "./lib/owner-asks.ts";
+import { askLetterAnswer, askIdFromSourceEventId, cardRepeat, clip, createOwnerAsks, formatAge, formatAskCard, formatUtcTime, mayDefault, OWNER_DECISION_RULE, ownerAskedForOptions, PLAIN_DECISION_GUIDANCE, plainTextDecision, recommendedLabel, type AskKind } from "./lib/owner-asks.ts";
 import { DEFAULT_RELIABILITY_FLAGS, reliabilityFlagsFromSettings } from "./lib/reliability-flags.ts";
 import { sanitizeSettingValue } from "./lib/settings-schema.ts";
 import { coalesceBatches, parseConnectorHeader, parseInboundTelegram, parseSourceRef, parseTelegramSubmission, stripTelegramEnvelope, telegramReplyParameters, telegramSourceRef } from "./lib/telegram-envelope.ts";
@@ -4300,8 +4300,8 @@ export default async function plugin(bb: BbPluginApi) {
     return `Crew cap reached: ${running} crews running (cap ${cap}). Queue this with firstmate_queue and dispatch when a crew finishes, or ask the captain to raise the cap.`;
   }
 
-  // Steering or retrying an IDLE crew starts a turn, i.e. adds a running crew. Apply
-  // the same cap dispatch does (a captain once revived idle crews to 7 running).
+  // Retrying an IDLE crew starts a turn, i.e. adds a running crew. Apply the same cap
+  // dispatch does (a captain once revived idle crews to 7 running). A tell is exempt.
   async function capRefusalToWake(crew: Crew, overCap: boolean): Promise<string | null> {
     if (overCap || isSecondmateRoute(crew) || crew.parentThreadId === null) return null;
     if (await crewInTurn(crew)) return null;
@@ -4310,7 +4310,7 @@ export default async function plugin(bb: BbPluginApi) {
     const refusal = await crewCapRefusal(crew.parentThreadId, 1);
     if (refusal === null) return null;
     const head = refusal.split(". ")[0] ?? refusal;
-    return `${head}. Waking idle crew ${crew.id} would start one more turn over the cap: wait for a running crew to finish, or pass overCap=true (--over-cap) when the captain approved going over it.`;
+    return `${head}. Retrying idle crew ${crew.id} would start one more turn over the cap: wait for a running crew to finish, or pass overCap=true (--over-cap) when the captain approved going over it.`;
   }
 
   // An owner-scoped crew view that comes back empty must never read as "the fleet is empty":
@@ -10741,6 +10741,9 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
 
+  // Tools whose first step looks up crewId and stops with "No crew <id>" when it is not found.
+  const CREW_ID_TOOLS = new Set(["firstmate_tell", "firstmate_deliver", "firstmate_merge", "firstmate_crew", "firstmate_stop", "firstmate_retry", "firstmate_promote", "firstmate_interrupt"]);
+
   // BB's public suppress flag only folds low-value rows. The app content script
   // removes Firstmate's pending/success rows entirely; invisible result markers
   // let it restore failures while keeping the tool output available to the model.
@@ -10766,6 +10769,11 @@ export default async function plugin(bb: BbPluginApi) {
             const signal = asRecord(ctx)["signal"] as AbortSignal | undefined;
             const journal = (action: "inspect" | "begin-action" | "mark-success" | "complete") => drainWakes(captain, undefined, undefined, undefined, signal, { action, id });
             if (id && tool.name === "firstmate_wake") return markCaptainToolResult(await journal("complete"));
+            // A crew id that does not exist is refused before the action begins, so the wake stays ready
+            // instead of "uncertain". Crews retire when their PR merges, so a follow-up often names one.
+            if (id && CREW_ID_TOOLS.has(tool.name) && typeof operation["crewId"] === "string" && await findCrew(operation["crewId"], captain) === undefined) {
+              return markCaptainToolResult(toolError(`No crew ${operation["crewId"]}. Nothing was sent and wake ${id} is still open. A crew retires when its PR merges or it is forgotten; dispatch a new crew for follow-up work, then complete the wake with handledWake.`));
+            }
             if (id) await journal("begin-action");
             let result: Awaited<ReturnType<typeof execute>>;
             const uncertain = `Wake ${id}: action outcome is uncertain. Reconcile external state before acting again, then complete with firstmate_wake handledWake. Do not blindly repeat ${tool.name}.`;
@@ -11186,7 +11194,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_reply",
-    description: "Reply to one owner message as a Telegram reply to it (ref=oldest, tg:<chat>:<msg>, or bb:<thread>:<row>; any open message, in any order). quote=exact words from that message, such as one of several questions; each different quote is its own reply. more=true keeps the message open because more replies to it will follow. A text that asks the owner to decide (options A/B with a question, or a count of waiting decisions) is refused: send each decision with firstmate_ask.",
+    description: "Reply to one owner message as a Telegram reply to it (ref=oldest, tg:<chat>:<msg>, or bb:<thread>:<row>; any open message, in any order). quote=exact words from that message, such as one of several questions; each different quote is its own reply. more=true keeps the message open because more replies to it will follow. A text that asks the owner to decide (options A/B with a question, or a count of waiting decisions) is refused: send each decision with firstmate_ask. A text that restates the question of a card sent in the last 30 minutes is refused too.",
     parameters: z.object({
       ref: z.string().min(1),
       text: z.string().min(1).max(4000),
@@ -11211,6 +11219,11 @@ export default async function plugin(bb: BbPluginApi) {
       const decision = notADecision === true || ownerAskedForOptions(`${row.preview} ${quote ?? ""}`) ? null : plainTextDecision(text);
       if (decision !== null) {
         return toolError(`Not sent: this reply asks the owner to decide in plain text (${decision}). ${PLAIN_DECISION_GUIDANCE} If the text asks the owner to decide nothing, send it again with notADecision=true. ${used} stays open.`);
+      }
+      // The card already carries the question, its options and the recommendation; a prose copy is noise.
+      const repeat = flags.telegramThreading !== "on" || ownerAskedForOptions(`${row.preview} ${quote ?? ""}`) ? null : cardRepeat(text, ownerAsks.listOpen(captain), Date.now());
+      if (repeat !== null) {
+        return toolError(`Not sent: this reply repeats the question of card ${repeat.ask.id}, sent ${formatAge(Date.now() - repeat.ask.createdAt)} ago ("${clip(repeat.sentence, 160)}"). The owner already has the card with its options and your recommendation. Drop the repeat; if anything, say only "1 card sent". ${used} stays open.`);
       }
       let claimKind = quotedReplyKind(quote);
       const body = row.source === "telegram"
@@ -11321,14 +11334,13 @@ export default async function plugin(bb: BbPluginApi) {
       message: z.string().min(1).max(MAX_TASK),
       queue: z.boolean().optional().describe("Non-urgent note: queue it instead of steering into the crew's running turn (read when the turn ends). Default false = steer now."),
       resolveKey: z.string().optional().describe("Key of the crew's open decision this steer answers (from crew/bearings); closes it in real state"),
-      overCap: z.boolean().optional().describe("Wake an idle crew even past the running-crew cap (only on the captain's word)"),
     }),
-    async execute({ crewId, message, queue, resolveKey, overCap },ctx) {
+    async execute({ crewId, message, queue, resolveKey },ctx) {
       const crew = await findCrew(crewId,ctxString(ctx,"threadId"));
       if (crew === undefined) return toolError(`No crew ${crewId}.`);
       try {
-        const capped = await capRefusalToWake(crew, overCap === true);
-        if (capped !== null) return toolError(capped);
+        // The crew cap limits new crews only: follow-up work for a crew that exists is never refused for it.
+        // A full host defers the turn in BB, and tellCrew reports that delivery as queued.
         await resumeRetainedAuthor(crew,ctxString(ctx,"threadId"));
         const sent = await tellCrew(crew, message, false, queue === true);
         if (resolveKey !== undefined && resolveKey.trim() !== "") {
@@ -13522,10 +13534,6 @@ export default async function plugin(bb: BbPluginApi) {
             const crew = await findCrew(id,ctxThread);
             if (crew === undefined) return fail(`No crew ${id}. Run "bb firstmate crews".`);
             const wantQueue = command === "tell" && flags.get("queue") === true;
-            if (command === "tell") {
-              const overCap = await capRefusalToWake(crew, flags.has("over-cap"));
-              if (overCap !== null) return fail(overCap);
-            }
             if (command === "tell") await resumeRetainedAuthor(crew,ctxThread);
             const text = await tellCrew(crew, message, command === "interrupt", wantQueue);
             const resolveKey = command === "tell" ? (flagStr(flags, "resolve-key") ?? "").trim() : "";

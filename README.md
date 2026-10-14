@@ -174,7 +174,7 @@ BB-specific behavior in this fork:
 | `nudgeEnabled` | on | Doorbell idle crews that missed the status protocol |
 | `nudgeMaxPerCrew` | 3 | Nudges per crew task before NEEDS DECISION |
 | `nudgeCooldownSeconds` | 60 | Minimum gap between nudges for one crew |
-| `maxActiveCrews` | 10 | Concurrent crews per captain (0 = no cap). When `fmReliability.asyncDispatch` is on, over-cap work queues instead of refusing, and spawn uses quota-aware backoff. See [Host memory](#host-memory) before raising it |
+| `maxActiveCrews` | 10 | Concurrent crews per captain (0 = no cap). When `fmReliability.asyncDispatch` is on, over-cap work queues instead of refusing, and spawn uses quota-aware backoff. The cap limits new crews only: a tell to an existing crew is never refused for it. See [Host memory](#host-memory) before raising it |
 | `fmReliability` | empty JSON | Off-by-default flags. `inboundLedger` (`off`/`shadow`/`on`), `honestStatus`, `handoffContract`, `asyncDispatch`, `telegramThreading`. Telegram uses Amr's local Telegram v0.1.0 connector header and `telegram.reply` RPC; see [docs/telegram-bridge-contract.md](docs/telegram-bridge-contract.md) |
 
 ### Host memory

@@ -262,6 +262,41 @@ export function plainTextDecision(text: string): string | null {
   return text.includes("?") ? "it asks a question and lists options A and B" : null;
 }
 
+export const CARD_REPEAT_WINDOW_MS = 30 * 60_000;
+// Function words and words about the card itself ("I sent you one question card", "I recommend")
+// say nothing about its subject, so they never count toward a repeat.
+const REPEAT_STOP = new Set(("the and but not for are was were has have had been being this that these those with from into onto " +
+  "your you yours our ours they them their there here what when which who whom whose why how will would should could can may might must " +
+  "also than then just only very its it's one sent send question questions card cards recommend recommended answer option options " +
+  "about any all each some more most other such too own same before after again now").split(" "));
+const MIN_REPEAT_WORDS = 5;
+const REPEAT_SHARE = 0.8;
+
+function repeatWords(text: string): string[] {
+  return (text.toLowerCase().match(/[\p{L}\p{N}][\p{L}\p{N}'-]*/gu) ?? [])
+    .map((word) => word.replace(/'s$/, ""))
+    .filter((word) => word.length >= 3 && !REPEAT_STOP.has(word))
+    .map((word) => word.length > 3 && word.endsWith("s") && !word.endsWith("ss") ? word.slice(0, -1) : word);
+}
+
+/**
+ * The sentence of `text` that restates an open card sent in the last 30 minutes, or null. A sentence repeats
+ * a card when at least 5 of its subject words and 80% of them come from the card question and option labels.
+ */
+export function cardRepeat<A extends Pick<OwnerAsk, "id" | "text" | "options" | "createdAt">>(text: string, asks: A[], now: number): { ask: A; sentence: string } | null {
+  const recent = asks.filter((ask) => now - ask.createdAt <= CARD_REPEAT_WINDOW_MS)
+    .map((ask) => ({ ask, words: new Set(repeatWords([ask.text, ...ask.options.map((option) => option.label)].join(" "))) }));
+  if (recent.length === 0) return null;
+  for (const sentence of text.split(/(?<=[.?!])\s+|\n+/)) {
+    const words = repeatWords(sentence);
+    if (words.length < MIN_REPEAT_WORDS) continue;
+    for (const { ask, words: card } of recent) {
+      if (words.filter((word) => card.has(word)).length >= REPEAT_SHARE * words.length) return { ask, sentence: sentence.trim() };
+    }
+  }
+  return null;
+}
+
 /** The owner asked to see options, drafts or their open decisions, so a reply that lists them is the answer. */
 export function ownerAskedForOptions(ownerText: string): boolean {
   return /\b(?:options?|choices|alternatives|drafts?|versions|variants|decisions?)\b/i.test(ownerText);
