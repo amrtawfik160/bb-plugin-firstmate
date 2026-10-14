@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { BRIEF_SKILLS, crewPlaybook, crewSkillBlock, crewSkillRoot, PLAYBOOK_CHOICES, skillCheckScript, skillRoutingLinkScript } from "./crew-contract.ts";
+import { BRIEF_SKILLS, crewPlaybook, crewSkillBlock, crewSkillRoot, PLAYBOOK_CHOICES, playbookStepCount, reportGapNote, reportGapRequest, reportGaps, skillCheckScript, skillRoutingLinkScript } from "./crew-contract.ts";
 
 const HOME = homedir();
 
@@ -337,4 +337,61 @@ test("the block stays short for every provider, shape and playbook", () => {
       }
     }
   }
+});
+
+// 13-14 Oct: Codex crews wrote the playbook steps into <home>/data/<crew>/todo.md
+// (17 of 17); Claude Code and Grok crews kept no to-do list at all (0 of 19).
+test("a playbook brief names one to-do file in the crew's data folder for every provider", () => {
+  const dataDir = "/root/.local/share/bb-firstmate/homes/thr_cap/data/0151f78d";
+  const line = `4. Write every step of that playbook into \`${dataDir}/todo.md\` before any other work. Tick each step there as you go.`;
+  for (const providerId of ["claude-code", "codex", "acp-grok", "acp-cursor", "pi", null]) {
+    for (const playbook of PLAYBOOK_CHOICES) {
+      const lines = crewSkillBlock({ shape: "ship", title: "x", task: "", providerId, playbook, dataDir }).split("\n");
+      if (playbook === "none") assert.ok(!lines.some((l) => l.includes("todo.md")), `${providerId} none`);
+      else assert.equal(lines[5], line, `${providerId} ${playbook}`);
+    }
+  }
+});
+
+const FEATURE_PLAYBOOK = [
+  "### Feature", "", "**You own this task.**", "",
+  "1. `how` over the affected subsystem.", "2. `architect` for parallel design exploration.",
+  "3. Write the throughput checkpoint as four todo items:", "   - Parallelism: fan-out.", "4. Delegate code-writing.",
+  "5. Verify on the matching surface.", "6. Rebase into small, ordered commits.", "", "7. If the design is contested, `interrogate`.", "8. Run **Opening a PR**.",
+].join("\n");
+
+test("the step count of a playbook is its numbered top-level lines", () => {
+  assert.equal(playbookStepCount(FEATURE_PLAYBOOK), 8);
+  assert.equal(playbookStepCount(""), 0);
+});
+
+// Real reports from 14 Oct. 0151f78d (Claude Code, feature) had neither part;
+// 26f314d4 (Grok, bug-fix) and 2ac602f3 (Codex, babysit) had both.
+test("a DONE report missing the skills line or step lines names what is missing", () => {
+  const claude0151 = "# Per-re-import webhook event key\n\n14 October 2026. Worker 0151f78d. PR: https://github.com/Cyndra-AI/cyndra-saas/pull/2413\nNothing was deployed.\n\nDONE: PR 2413 open";
+  assert.deepEqual(reportGaps(claude0151, 8), ["a \"Skills read:\" line", "playbook step lines (0 of 8)"]);
+  const grok26f3 = [
+    "- ✓ 1. Reproduce it yourself on the matching surface via the control skill.",
+    "- ✓ 2. Binary-search the cause. (done in session)",
+    "- ✓ 3. Plan the fix. (done in session)",
+    "- ✓ 4. Verify on the same surface. Original repro now passes.",
+    "- ✓ 5. Stage the commits so the failing repro lands before the fix in git history.",
+    "- ✓ 6. Run Opening a PR: PR 305 updated in place. No merge, no deploy.",
+    "", "## Skills read", "", "- /root/.grok/skills/skill-routing/SKILL.md",
+  ].join("\n");
+  assert.deepEqual(reportGaps(grok26f3, 6), []);
+  const codex2ac6 = "✓ Declare the mode.\n✓ Work the merge frontier.\nskip: Triage Bugbot: no findings\nSkills read: /root/.codex/skills/poteto-mode/SKILL.md";
+  assert.deepEqual(reportGaps(codex2ac6, 3), []);
+  assert.deepEqual(reportGaps(grok26f3.split("\n").slice(2).join("\n"), 6), ["playbook step lines (4 of 6)"]);
+  assert.deepEqual(reportGaps("not read: /root/.claude/skills/tdd/SKILL.md: not installed\n✓ one", 1), []);
+});
+
+test("the captain note and the crew request name the crew and the missing parts", () => {
+  const gaps = ["a \"Skills read:\" line", "playbook step lines (0 of 8)"];
+  assert.equal(reportGapNote("0151f78d", gaps), "Report check: crew 0151f78d's DONE report lacks a \"Skills read:\" line; playbook step lines (0 of 8). Asked the crew to add them. Its delivery is not held.");
+  assert.equal(reportGapRequest(gaps), [
+    "REPORT INCOMPLETE: your final report lacks a \"Skills read:\" line; playbook step lines (0 of 8).",
+    "Reply with only the missing parts: a line \"Skills read: <paths>\", and one line per playbook step, \"✓ <step>\" or \"skip: <step>: <reason>\".",
+    "Do not redo the task. End with your DONE: line again.",
+  ].join("\n"));
 });

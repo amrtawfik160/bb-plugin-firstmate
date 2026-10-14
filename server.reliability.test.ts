@@ -8,7 +8,7 @@ import { createDoorbellHold } from "./lib/doorbell-hold.ts";
 import { createInboundLedger } from "./lib/inbound-ledger.ts";
 import { createLaunches } from "./lib/launch.ts";
 import { createDeliveries } from "./lib/pr-delivery.ts";
-import { createOwnerAsks, OWNER_DECISION_RULE } from "./lib/owner-asks.ts";
+import { CAPTAIN_RULES, createOwnerAsks, OWNER_DECISION_RULE } from "./lib/owner-asks.ts";
 import { parseInboundTelegram } from "./lib/telegram-envelope.ts";
 
 type Host = ReturnType<typeof createFakePluginHost>;
@@ -1335,6 +1335,10 @@ test("captain report: firstmate_skill reads the captain's own reference files by
     }
     assert.match(text(await read({ name: "captain", reference: "references/missing.md" })), /references\/telegram\.md/, "the error lists the files that exist");
     assert.match(OWNER_DECISION_RULE, /firstmate_skill name=captain reference=references\/telegram\.md/, "the always-loaded block names the exact call");
+    assert.match(CAPTAIN_RULES, /firstmate_skill name=captain reference=references\/supervision\.md/, "the captain rules name the exact call");
+    assert.ok(text(await read({ name: "captain", reference: "references/supervision.md" })).includes("## Captain rules"));
+    for (const act of ["deploy", "publish", "merge", "commit", "push", "firstmate_merge", "firstmate_task", "firstmate_deliveries"]) assert.ok(CAPTAIN_RULES.includes(act), act);
+    assert.ok(CAPTAIN_RULES.split(/(?<=\.) /).length <= 5, "at most five short sentences");
   } finally {
     await host.harness.lifecycle.dispose();
   }

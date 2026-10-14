@@ -58,7 +58,7 @@ import plugin, {
 import { LEFTOVER_TIMER_CONTRACT, WAITING_PROTOCOL, latestStatus, statusProtocolSummary } from "./lib/policy.ts";
 import { UPSTREAM_SCRIPT_NAMES, PINNED_SCRIPT_SUPPORT_FILES, UPSTREAM_SKILL_NAMES } from "./lib/upstream-surface.ts";
 import { FIRSTMATE_ROUTINE_MARKER } from "./lib/timeline-noise.ts";
-import { OWNER_DECISION_RULE } from "./lib/owner-asks.ts";
+import { CAPTAIN_RULES, OWNER_DECISION_RULE } from "./lib/owner-asks.ts";
 
 const CAPTAIN_TEST_SKILLS = ["captain", "firstmate", "skill-routing"] as const;
 const SKILLS = [...new Set([...CAPTAIN_TEST_SKILLS, ...UPSTREAM_SKILL_NAMES])] as const;
@@ -181,6 +181,8 @@ test("captain metadata loads the full skill set", async () => {
     assert.match(cfg.instructions ?? "", /private durable wakes/i);
     assert.match(cfg.instructions ?? "", /Send every decision, approval or blocker for the owner with firstmate_ask, one question per card, never as plain text/, "the card rule is in the text that is re-sent every turn");
     assert.ok((cfg.instructions ?? "").includes(OWNER_DECISION_RULE));
+    // 10 Oct the captain ran gh pr merge itself; up to 13 Oct it ran Safi production publishes.
+    assert.ok((cfg.instructions ?? "").includes(CAPTAIN_RULES), "the captain rules are in the text that is re-sent every turn");
     assert.ok((cfg.instructions ?? "").length <= 4096);
   } finally {
     await host.harness.lifecycle.dispose();
@@ -838,6 +840,65 @@ test("a protocol verdict does not nudge; supervision still pings the captain", a
     assert.equal(sends[0]?.threadId, "thr_cap");
     assert.match(sends[0]?.text ?? "", /DONE: shipped branch bb\/nudge/);
     assert.doesNotMatch(sends[0]?.text ?? "", /TURN ENDED WITHOUT A STATUS VERDICT/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// 14 Oct: 0151f78d (Claude Code, feature) and 42fc1ad4 (Grok, bug-fix) reported
+// DONE with no "Skills read:" line and no playbook step lines; nothing checked.
+const FEATURE_PLAYBOOK = "### Feature\n\n1. `how`.\n2. `architect`.\n3. Checkpoint:\n   - Parallelism.\n4. Delegate.\n5. Verify.\n6. Rebase.\n7. Interrogate.\n8. Run **Opening a PR**.\n";
+async function seedPlaybookCrew(host: Awaited<ReturnType<typeof load>>) {
+  await host.bb.storage.kv.set("crews", [{
+    id: "0151f78d", task: "Per-re-import webhook event key", title: "Add per-re-import webhook event key", projectId: "proj_1",
+    threadId: "thr_crew", parentThreadId: "thr_cap", providerId: "claude-code", worktree: true, shape: "ship", posture: "local-only",
+    createdAt: "2026-10-14T00:00:00.000Z",
+  }]);
+  host.harness.sdk.stub("files.read", async (input: unknown) => {
+    const path = String((input as { path?: string }).path ?? "");
+    if (!path.endsWith("/poteto-mode/playbooks/feature.md")) throw new Error(`no file ${path}`);
+    return { content: FEATURE_PLAYBOOK, contentEncoding: "utf8", sizeBytes: FEATURE_PLAYBOOK.length, path, sha256: "x" };
+  });
+}
+
+test("a playbook crew's DONE without skills and step lines gets one captain note and one request; delivery goes on", async () => {
+  const host = await load();
+  try {
+    stubIdleSdk(host);
+    await seedPlaybookCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    const report = "# Per-re-import webhook event key\n\nNothing was deployed.\n\nDONE: branch bb/event-key ready";
+    assert.deepEqual((await emitIdle(host, report)).errors, []);
+    const sends = sendCalls(host);
+    const toCaptain = sends.filter((s) => s.threadId === "thr_cap");
+    const toCrew = sends.filter((s) => s.threadId === "thr_crew");
+    assert.ok(toCaptain.some((s) => /DONE: branch bb\/event-key ready/.test(s.text)), "the done report is still delivered");
+    const notes = toCaptain.filter((s) => s.text.includes("Report check: crew 0151f78d"));
+    assert.equal(notes.length, 1, JSON.stringify(toCaptain));
+    assert.match(notes[0]!.text, /a "Skills read:" line; playbook step lines \(0 of 8\)/);
+    assert.equal(toCrew.length, 1, JSON.stringify(toCrew));
+    assert.match(toCrew[0]!.text, /^REPORT INCOMPLETE: your final report lacks/);
+    // The crew answers with only some of it; neither the note nor the request repeats.
+    assert.deepEqual((await emitIdle(host, "Skills read: /root/.claude/skills/poteto-mode/SKILL.md\nDONE: branch bb/event-key ready")).errors, []);
+    const again = sendCalls(host);
+    assert.equal(again.filter((s) => s.text.includes("Report check:")).length, 1);
+    assert.equal(again.filter((s) => s.threadId === "thr_crew").length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a playbook crew's DONE with skills and every step line gets no note", async () => {
+  const host = await load();
+  try {
+    stubIdleSdk(host);
+    await seedPlaybookCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    const steps = Array.from({ length: 8 }, (_, i) => i === 6 ? "skip: 7. Interrogate: design not contested" : `✓ ${i + 1}. step`).join("\n");
+    assert.deepEqual((await emitIdle(host, `${steps}\nSkills read: /root/.claude/skills/poteto-mode/SKILL.md\nDONE: branch ready`)).errors, []);
+    const sends = sendCalls(host);
+    assert.equal(sends.filter((s) => s.text.includes("Report check:")).length, 0);
+    assert.equal(sends.filter((s) => s.threadId === "thr_crew").length, 0);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -7561,6 +7622,7 @@ test("native captain contract tool returns the entire source beyond the SDK inst
     assert.ok(tool);
     const result = await tool.execute({}, { threadId: "thr_cap", projectId: "proj_1" } as never);
     assert.ok((result as string).includes(OWNER_DECISION_RULE), "the contract read states the card rule");
+    assert.ok((result as string).includes(CAPTAIN_RULES), "the contract read states the captain rules");
     assert.equal(typeof result, "string");
     assert.ok((result as string).startsWith(content), "full native text must survive transport and instruction budgets");
     assert.match(result as string, /BB runtime adaptations/);
@@ -8406,7 +8468,7 @@ test("captain session-start hook runs native session start only in the captain's
     writeFileSync(marker, `home=${fm}\nstate=${fm}/state\nown_home=1\n`);
     const own = runCaptainHook(home, "session-start", '{"source":"startup"}', "thr_cap");
     assert.equal(own.status, 0);
-    assert.equal(own.stdout, `ran ${fm} bb ${fm} ${fm} {"source":"startup"}\n\nOWNER DECISIONS\n---------------\n${OWNER_DECISION_RULE}\n`);
+    assert.equal(own.stdout, `ran ${fm} bb ${fm} ${fm} {"source":"startup"}\n\nOWNER DECISIONS\n---------------\n${OWNER_DECISION_RULE}\n\nCAPTAIN RULES\n-------------\n${CAPTAIN_RULES}\n`);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
