@@ -1218,6 +1218,36 @@ test("Oct 11 repro: firstmate_reply refuses a plain-text decision before anythin
   }
 });
 
+test("Oct 14 repro: firstmate_reply refuses a text that restates the question of a card sent minutes ago", async () => {
+  const host = await load();
+  try {
+    await telegramFlags(host);
+    recordOwnerText(host, "1672", "Status?");
+    host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
+    const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
+    const card = await tool(host, "firstmate_ask").execute({
+      kind: "approval", irreversible: true, recommended: 0,
+      question: "Safi savings: some users already had money in their goals before this change. Should that old money also come out of \"money on hand\"?",
+      options: [{ label: "B: Yes. Take existing goal money out of money on hand too." }, { label: "A: No. Old goal money stays in money on hand." }],
+    }, ctx);
+    assert.ok(!isError(card), text(card));
+    const sentBefore = host.harness.sdk.callsTo("plugins.callRpc").length;
+    const send = (words: string) => tool(host, "firstmate_reply").execute({ ref: "tg:200:1672", text: words, more: true }, ctx);
+    const refused = await send("I sent you one question card: should money already in savings goals also come out of \"money on hand\"? I recommend yes.\n\nThe Safi savings change is merged.");
+    assert.ok(isError(refused), text(refused));
+    assert.match(text(refused), /Not sent/);
+    assert.match(text(refused), /repeats the question of card a[0-9a-z]{6}/);
+    assert.match(text(refused), /"1 card sent"/);
+    assert.equal(host.harness.sdk.callsTo("plugins.callRpc").length, sentBefore, "nothing was sent to the connector");
+    assert.equal(ledgerRow(host, "1672")?.state, "received", "the owner message stays open");
+    const report = await send("1 card sent. The Safi savings change is merged.");
+    assert.ok(!isError(report), text(report));
+    assert.equal(host.harness.sdk.callsTo("plugins.callRpc").length, sentBefore + 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("firstmate_reply sends options and drafts the owner asked for", async () => {
   const host = await load();
   try {

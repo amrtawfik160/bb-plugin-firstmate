@@ -92,6 +92,18 @@ test('receipt callers retain actions, IDs, guards and per-captain state with lon
  }finally{await f.host.harness.lifecycle.dispose();}
 });
 
+test('Oct 13 repro: a tell to a crew id that does not exist is refused before the wake is marked in action',async()=>{
+ const f=await factory();try {
+  const id='a'.repeat(32);
+  const result=await f.tool('firstmate_tell').execute({crewId:'b6db2d88',message:'run one preview',handledWake:id},f.ctx);
+  assert.equal(result.isError,true);
+  assert.match(JSON.stringify(result),/No crew b6db2d88/);assert.match(JSON.stringify(result),/Nothing was sent/);
+  assert.doesNotMatch(JSON.stringify(result),/uncertain/);
+  assert.deepEqual(f.actions.map(row=>row.action),[],'the wake stays ready: no begin-action');
+  assert.equal(f.host.harness.sdk.callsTo('threads.send').length,0);
+ }finally{await f.host.harness.lifecycle.dispose();}
+});
+
 for(const failAt of ['init','append','rename']) test(`receipt ${failAt} stage-write failure executes and acknowledges nothing`,async()=>{
  const f=await factory(reportedHome,{failAt});try {
   const result=await f.tool('firstmate_wake').execute({handledWake:'a'.repeat(32)},f.ctx);
