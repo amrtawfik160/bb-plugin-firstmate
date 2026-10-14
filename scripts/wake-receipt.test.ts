@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { OWNER_DECISION_RULE } from "../lib/owner-asks.ts";
+import { CAPTAIN_RULES, OWNER_DECISION_RULE } from "../lib/owner-asks.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const helper = join(root, "overlay/bin/bb-wake-receipt.py");
@@ -532,7 +532,7 @@ test("captain session-start hook leaves a digest with no queued wake unchanged",
     input: '{"source":"compact"}', encoding: "utf8", env: { ...process.env, HOME: f.dir, BB_THREAD_ID: "thr_test" },
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, `${digest}\n\nOWNER DECISIONS\n---------------\n${OWNER_DECISION_RULE}\n`);
+  assert.equal(result.stdout, `${digest}\n\nOWNER DECISIONS\n---------------\n${OWNER_DECISION_RULE}\n${CAPTAIN_RULES}\n`);
 });
 
 test("captain session-start hook states the card rule after every compaction", (t) => {

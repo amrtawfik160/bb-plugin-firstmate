@@ -416,3 +416,8 @@ test("Bearings preserves native's four sections, including an empty fleet and pe
   assert.match(text, /== Underway ==\nAwaiting firstmate review/);
   assert.doesNotMatch(text.slice(0, text.indexOf("== Recently Landed ==")), /Awaiting firstmate review/);
 });
+
+test("a crew prompt with a data folder names its to-do file", () => {
+  const text = crewPrompt({ task: "fix login", parentThreadId: "thr_cap", shape: "ship", mode: "direct-PR", isolated: true, providerId: "claude-code", dataDir: "/fm/data/c1" });
+  assert.ok(text.includes("4. Write every step of that playbook into `/fm/data/c1/todo.md` before any other work. Tick each step there as you go."), text);
+});

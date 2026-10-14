@@ -75,7 +75,7 @@ import { inboundHookDecision } from "./lib/inbound-dispatch.ts";
 import { formatWorkersForTelegram } from "./lib/telegram-commands.ts";
 import { digestOnce, EMPTY_DIGEST_MEMORY, formatBoard, type BoardInput, type DigestMemory } from "./lib/owner-board.ts";
 import { createOwnerTasks, isOpenTask, sameProject, taskLine, type CrewFinish, type OwnerTask, type TaskState } from "./lib/owner-tasks.ts";
-import { askLetterAnswer, askIdFromSourceEventId, cardRepeat, clip, createOwnerAsks, formatAge, formatAskCard, formatUtcTime, mayDefault, OWNER_DECISION_RULE, ownerAskedForOptions, PLAIN_DECISION_GUIDANCE, plainTextDecision, recommendedLabel, type AskKind } from "./lib/owner-asks.ts";
+import { askLetterAnswer, askIdFromSourceEventId, cardRepeat, clip, createOwnerAsks, formatAge, formatAskCard, formatUtcTime, mayDefault, CAPTAIN_RULES, OWNER_DECISION_RULE, ownerAskedForOptions, PLAIN_DECISION_GUIDANCE, plainTextDecision, recommendedLabel, type AskKind } from "./lib/owner-asks.ts";
 import { DEFAULT_RELIABILITY_FLAGS, reliabilityFlagsFromSettings } from "./lib/reliability-flags.ts";
 import { sanitizeSettingValue } from "./lib/settings-schema.ts";
 import { coalesceBatches, parseConnectorHeader, parseInboundTelegram, parseSourceRef, parseTelegramSubmission, stripTelegramEnvelope, telegramReplyParameters, telegramSourceRef } from "./lib/telegram-envelope.ts";
@@ -87,7 +87,7 @@ import { AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython } from 
 import { createDeliveries, LOST_OWNER_RECHECK_MS, canonicalPr, decisionLine, deliveryLine, parseForge, prBranchOwner, type DeliveryRecord, type PrBranchCandidate } from "./lib/pr-delivery.ts";
 import { captureHostCommand, decodeHostCapture } from "./lib/host-capture.ts";
 import { selectExecution, validateLaunchCapabilities } from "./lib/execution-selection.ts";
-import { crewSkillBlock, PLAYBOOK_CHOICES, redactSecrets, skillCheckScript, skillRoutingLinkScript } from "./lib/crew-contract.ts";
+import { crewPlaybook, crewSkillBlock, crewSkillRoot, PLAYBOOK_CHOICES, playbookStepCount, redactSecrets, reportGapNote, reportGapRequest, reportGaps, skillCheckScript, skillRoutingLinkScript } from "./lib/crew-contract.ts";
 import { rpcContract } from "./rpc.ts";
 import {
   UPSTREAM_FIRSTMATE_SHA,
@@ -1529,7 +1529,7 @@ const BB_SKILL_RUNTIME_CONTRACT = [
   "Translate bin/fm-<name>.sh calls to firstmate_fm with script=<name> and the same arguments; use bb firstmate fm <name> only when a shell command is required.",
   "Load native policy skills and their references with firstmate_skill (bb firstmate skill <name> [reference] [--source <selected-root source-file>]); it reads this captain’s selected runtime. Native AGENTS.md means firstmate_contract; bin and docs mean the selected runtime, while data, state and config mean the exact bound captain home returned by deck.",
   "Map workers, panes, and tabs to BB crew threads via firstmate_dispatch/tell/interrupt/retry/stop. Call firstmate_watch once per batch; it hands off to private durable wakes. End the turn; never retry or poll.",
-  `${OWNER_DECISION_RULE} firstmate_deliveries retains open PRs after worker retirement and wake acknowledgement. Continue authorized review/fix/merge work using the author for fixes and preserving the agreed native review and validation path, including independent review when required; merge through firstmate_merge. Inspect unresolved delivery records after compaction or handoff.`,
+  `${OWNER_DECISION_RULE} ${CAPTAIN_RULES} firstmate_deliveries retains open PRs after worker retirement and wake acknowledgement. Continue authorized review/fix/merge work using the author for fixes and preserving the agreed native review and validation path, including independent review when required; merge through firstmate_merge. Inspect unresolved delivery records after compaction or handoff.`,
   "Run firstmate_toolchain for native dependency detection. For browser work use the /browser skill and browser_script (or bb plugin run browser script), with profileId unset for the thread-isolated default. This replaces native chrome-devtools-axi transport. Read config/lavish-axi-host for remote Lavish access and use bb connect expose for a board the captain should see.",
   "Treat tmux, herdr, zellij, cmux, orca, and harness-specific hook setup as reference material unless the active backend explicitly names that runtime.",
 ].join(" ");
@@ -3542,7 +3542,7 @@ export default async function plugin(bb: BbPluginApi) {
       : "Implement the captain's intent above exactly; do not widen scope. Small diff, own branch, deliver per the mode contract, then report DONE/BLOCKED/FAILED.";
     // Captain-authored specifications retain precedence over the role default.
     // The skills block follows the cap so a long specification never cuts it off.
-    const spec = `${(sections.spec ?? defaultSpec).slice(0, 3000)}\n\n${crewSkillBlock({ ...crew, task })}`;
+    const spec = `${(sections.spec ?? defaultSpec).slice(0, 3000)}\n\n${crewSkillBlock({ ...crew, task, dataDir: `${fmHome}/data/${crew.id}` })}`;
     // Intent plus spec plus skills block outgrow one host command, so the fill
     // reads them from a staged host file.
     const fill = `/tmp/.fm-brief-fill-${randomUUID()}`;
@@ -5304,6 +5304,7 @@ export default async function plugin(bb: BbPluginApi) {
         title: crew.title,
         providerId: crew.providerId,
         playbook: crew.playbook,
+        ...(crew.nativeHome ? { dataDir: `${crew.nativeHome}/data/${crew.id}` } : {}),
       }),
       title: crewThreadTitle(task, input.shape, crew.id, input.title),
       parentThreadId: input.parentThreadId,
@@ -5462,7 +5463,8 @@ export default async function plugin(bb: BbPluginApi) {
     } else {
       workerPrompt = crewPrompt({ task, parentThreadId: crew.parentThreadId ?? undefined,
         shape: crew.shape, mode: toMode(crew.posture, "direct-PR"), isolated: crew.worktree,
-        title: crew.title, providerId, playbook: crew.playbook });
+        title: crew.title, providerId, playbook: crew.playbook,
+        ...(crew.nativeHome ? { dataDir: `${crew.nativeHome}/data/${crew.id}` } : {}) });
     }
     const prompt = [workerPrompt, "",
       `RELAUNCH: the prior thread was replaced. Continue the same task in this same worktree.${note !== "" ? ` Progress note: ${note}` : ""}`,
@@ -12566,6 +12568,35 @@ export default async function plugin(bb: BbPluginApi) {
   // it — repeated same-turn idles must each still nudge/ping as before.)
   const liveTerminalHandled = new Set<string>();
 
+  // Once per crew: a playbook crew's first DONE report must carry the skills line
+  // and a step line per playbook step. A gap is noted and asked for, never held.
+  async function checkPlaybookReport(crew: Crew, lastAssistantText: string): Promise<void> {
+    if (crew.parentThreadId === null) return;
+    const playbook = crewPlaybook(crew);
+    if (playbook === "none") return;
+    const key = `report-check:${crew.threadId}`;
+    if (await bb.storage.kv.get(key) !== undefined) return;
+    const hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId);
+    const read = async (path: string): Promise<string> => {
+      try {
+        const result = await bb.sdk.files.read({ hostId, path });
+        return "content" in result && typeof result.content === "string" ? result.content : "";
+      } catch {
+        return "";
+      }
+    };
+    const steps = playbookStepCount(await read(`${crewSkillRoot(crew.providerId)}/poteto-mode/playbooks/${playbook}.md`));
+    // The step count comes from the playbook file; without it there is nothing to count against.
+    if (steps === 0) return;
+    const home = await crewNativeHome(crew);
+    const report = home === "" ? "" : await read(`${home}/data/${crew.id}/report.md`);
+    const gaps = reportGaps(`${lastAssistantText}\n${report}`, steps);
+    await bb.storage.kv.set(key, { gaps });
+    if (gaps.length === 0) return;
+    await deliverToCaptain(crew.parentThreadId, reportGapNote(crew.id, gaps), crew.id);
+    await tellCrew(crew, reportGapRequest(gaps), false, true);
+  }
+
   async function handleCrewIdle(
     crew: Crew,
     thread: { id: string; status: string; runtime?: { displayStatus?: string } },
@@ -12584,6 +12615,7 @@ export default async function plugin(bb: BbPluginApi) {
     const outcome = parseOutcome(lastAssistantText);
     // A crew's DONE without a PR is its delivery; a PR, once there, decides the task instead.
     if (verdictOf(outcome) === "DONE" && (await prForCrew(crew)).url === "") await finishTask(crew, { delivered: true, outcome: outcome! });
+    if (verdictOf(outcome) === "DONE") await checkPlaybookReport(crew, lastAssistantText ?? "").catch(error => bb.log.warn(`report check ${crew.id}: ${String(error)}`));
     if ((await reliabilityFlags()).honestStatus === "on") {
       // Reports once per stuck stretch and never stops the crew; normal idle handling continues.
       const before = crewWatchdog.loadOrCreate(crew.id, crew.threadId, Date.parse(crew.createdAt) || Date.now());

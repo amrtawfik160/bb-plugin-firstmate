@@ -96,7 +96,7 @@ export function skillRoutingLinkScript(target: string): string {
   ].join("\n");
 }
 
-export function crewSkillBlock(input: { shape: Shape; title?: string; task: string; providerId?: string | null; playbook?: PlaybookChoice }): string {
+export function crewSkillBlock(input: { shape: Shape; title?: string; task: string; providerId?: string | null; playbook?: PlaybookChoice; dataDir?: string }): string {
   const playbook = crewPlaybook(input);
   const root = crewSkillRoot(input.providerId);
   // The reads lead the block and the report accounts for them: a read the
@@ -113,7 +113,10 @@ export function crewSkillBlock(input: { shape: Shape; title?: string; task: stri
   } else {
     lines.push(
       `3. Follow \`${root}/poteto-mode/playbooks/${playbook}.md\`.`,
-      "4. Copy every step of that playbook into your to-do list, before any other to-do.",
+      // One file for every provider: Claude Code and Grok crews kept no to-do list.
+      input.dataDir !== undefined && input.dataDir !== ""
+        ? `4. Write every step of that playbook into \`${input.dataDir}/todo.md\` before any other work. Tick each step there as you go.`
+        : "4. Copy every step of that playbook into your to-do list, before any other to-do.",
       "5. Your final report lists each playbook step as \"✓ <step>\" or \"skip: <step>: <reason>\".",
     );
   }
@@ -151,6 +154,32 @@ export function crewSkillBlock(input: { shape: Shape; title?: string; task: stri
     "Report blocked only for what only the captain or the owner can give: a secret, an approval, a decision, withheld access, or a destructive or irreversible step. Every other stop rule still applies.",
   );
   return lines.join("\n");
+}
+
+export function playbookStepCount(playbook: string): number {
+  return playbook.match(/^\d+\.\s/gm)?.length ?? 0;
+}
+
+// What a DONE report lacks of the accounting the brief asks for: a skills line
+// and one "✓"/"skip:" line per playbook step.
+export function reportGaps(report: string, steps: number): string[] {
+  const gaps: string[] = [];
+  if (!/^[\s#*>-]*(?:skills read\b|not read:)/im.test(report)) gaps.push("a \"Skills read:\" line");
+  const lines = report.match(/^[ \t]*(?:[-*][ \t]*)?(?:\d+\.[ \t]*)?(?:✓|skip:)/gim)?.length ?? 0;
+  if (lines < Math.max(steps, 1)) gaps.push(`playbook step lines (${lines} of ${Math.max(steps, 1)})`);
+  return gaps;
+}
+
+export function reportGapNote(crewId: string, gaps: readonly string[]): string {
+  return `Report check: crew ${crewId}'s DONE report lacks ${gaps.join("; ")}. Asked the crew to add them. Its delivery is not held.`;
+}
+
+export function reportGapRequest(gaps: readonly string[]): string {
+  return [
+    `REPORT INCOMPLETE: your final report lacks ${gaps.join("; ")}.`,
+    "Reply with only the missing parts: a line \"Skills read: <paths>\", and one line per playbook step, \"✓ <step>\" or \"skip: <step>: <reason>\".",
+    "Do not redo the task. End with your DONE: line again.",
+  ].join("\n");
 }
 
 // Mirrored in overlay/bin/fm-worker-checkpoint.py. A KEY name needs a prefix so

@@ -597,6 +597,7 @@ export function crewPrompt(input: {
   title?: string;
   providerId?: string | null;
   playbook?: PlaybookChoice;
+  dataDir?: string;
 }): string {
   const { task, parentThreadId, shape, mode, isolated } = input;
   const head = [
