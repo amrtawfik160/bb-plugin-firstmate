@@ -37,7 +37,8 @@ export function correlationOf(row: Pick<InboundRow, "sourceRefs">): string | und
 export type TelegramReplyResult = {
   channel: "rpc" | "envelope";
   body: string;
-  outcome: "delivered" | "not-applicable";
+  // undelivered: no sender reached Telegram. body is the fm-out line, which nothing sends on its own.
+  outcome: "delivered" | "not-applicable" | "undelivered";
   // The connector's threading mode, when telegram.reply reported one.
   mode?: "on" | "off";
 };
@@ -91,7 +92,7 @@ export async function sendTelegramReply(input: {
   callRpc?: ((args: TelegramReplyRpcArgs) => Promise<unknown>) | null;
 }): Promise<TelegramReplyResult> {
   const body = telegramReplyFallbackBody(input.payload);
-  if (!input.callRpc) return { channel: "envelope", body, outcome: "delivered" };
+  if (!input.callRpc) return { channel: "envelope", body, outcome: "undelivered" };
   let raw: unknown;
   try {
     raw = await input.callRpc({
@@ -109,7 +110,7 @@ export async function sendTelegramReply(input: {
     });
   } catch (error) {
     if (!isTelegramRpcMissing(error)) throw error;
-    return { channel: "envelope", body, outcome: "delivered" };
+    return { channel: "envelope", body, outcome: "undelivered" };
   }
   const result = telegramReplyOutputSchema.parse(raw);
   const mode = result.mode ? { mode: result.mode } : {};

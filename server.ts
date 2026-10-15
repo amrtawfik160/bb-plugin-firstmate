@@ -11822,6 +11822,7 @@ export default async function plugin(bb: BbPluginApi) {
         if (otherKey === null) refused.push(`${other} is not a ref`);
         else if (inboundKey(otherKey) === inboundKey(row)) refused.push(`${other} is the ref this reply answers`);
         else if (found?.captainThreadId !== captain) refused.push(`${other} is not an owner message of this captain`);
+        else if (found.coveredBy === used) continue; // Closed by an earlier send of this reply: a repeat, not a refusal.
         else if (!pending.has(inboundKey(otherKey))) refused.push(`${other} is not open`);
         else covered.push(found);
       }
@@ -11852,7 +11853,9 @@ export default async function plugin(bb: BbPluginApi) {
       if (!claim.sent) {
         return quote ? `Already replied to ${used} for that quote.` : `Already replied to ${used}.`;
       }
+      const stayOpen = [used, ...covered.map(refOf)].join(", ");
       let channel: "rpc" | "envelope" = "envelope";
+      let undelivered: string | null = null;
       try {
         if (row.source === "telegram") {
           const sent = await sendTelegramReply({
@@ -11864,6 +11867,11 @@ export default async function plugin(bb: BbPluginApi) {
           });
           channel = sent.channel;
           await noteTelegramThreading(sent.mode).catch((error) => bb.log.warn(`telegram threading state: ${String(error)}`));
+          if (sent.outcome !== "delivered") {
+            undelivered = flags.telegramThreading === "on"
+              ? "the Telegram connector has no reply method"
+              : "Firstmate's telegramThreading flag is off, so this tool has no way to send to Telegram";
+          }
         } else {
           await bb.sdk.threads.send({
             threadId: row.captainThreadId,
@@ -11873,7 +11881,11 @@ export default async function plugin(bb: BbPluginApi) {
         }
       } catch (error) {
         inboundLedger.releaseOutbox(row, claimKind);
-        return toolError(`Reply to ${used} was not delivered; the item stays open. ${error instanceof Error ? error.message : String(error)}`);
+        return toolError(`Reply to ${used} was not delivered; ${stayOpen} ${covered.length === 0 ? "stays" : "stay"} open. ${error instanceof Error ? error.message : String(error)}`);
+      }
+      if (undelivered !== null) {
+        inboundLedger.releaseOutbox(row, claimKind);
+        return toolError(`Reply to ${used} was not delivered: ${undelivered}. Nothing reached the owner; ${stayOpen} ${covered.length === 0 ? "stays" : "stay"} open. Answer in your turn text instead.`);
       }
       if (more !== true) inboundLedger.markAnswered(row, Date.now());
       for (const other of covered) inboundLedger.markCovered(other, used, Date.now());
@@ -13384,7 +13396,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (answered > 0) await refreshOwnerBoard();
   }
 
-  // Threaded replies off: an ack does not apply, and asking again on every dispatch would only repeat the RPC.
+  // Threaded replies off, or no sender: an ack does not apply, and asking again on every dispatch would only repeat the RPC.
   const ackNotApplicable = new Set<string>();
   try {
     bb.experimental_hooks.on("message.dispatch", async (context) => {
@@ -13497,7 +13509,7 @@ export default async function plugin(bb: BbPluginApi) {
               await noteTelegramThreading(sent?.mode).catch((error) => bb.log.warn(`telegram threading state: ${String(error)}`));
               if (sent?.outcome !== "delivered") {
                 inboundLedger.releaseOutbox(primary, "ack");
-                if (sent?.outcome === "not-applicable") ackNotApplicable.add(inboundKey(primary));
+                if (sent?.outcome === "not-applicable" || sent?.outcome === "undelivered") ackNotApplicable.add(inboundKey(primary));
                 continue;
               }
               inboundLedger.markAcked(primary, now);

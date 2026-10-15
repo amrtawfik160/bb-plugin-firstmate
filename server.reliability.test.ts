@@ -796,7 +796,8 @@ test("firstmate_reply covers: repeating a successful call with the same covers r
     const before = ["1669", "1670", "1671"].map((id) => ledgerRow(host, id));
     const repeat = await tool(host, "firstmate_reply").execute(args, ctx);
     assert.ok(!isError(repeat), text(repeat));
-    assert.equal(text(repeat), "Already replied to tg:200:1669.");
+    assert.match(text(repeat), /^Already replied to tg:200:1669\./);
+    assert.doesNotMatch(text(repeat), /stays open|not open/);
     assert.equal(host.harness.sdk.callsTo("plugins.callRpc").length, 1, "the repeat sends nothing");
     assert.deepEqual(["1669", "1670", "1671"].map((id) => ledgerRow(host, id)), before);
   } finally {
