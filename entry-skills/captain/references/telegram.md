@@ -91,6 +91,15 @@ for hours. Ask rarely, and make each ask easy to find and to answer.
   with `firstmate_reply`. Text after "Note:" is the captain's own words.
 - `/back` means the captain has returned: leave the away posture as the `afk` skill describes, then
   give the `/ahoy` recap.
+- `/to-spec`, `/to-tickets`, `/implement-spec`, `/implement` and `/grill-me` arrive as an owner
+  message that names a Matt Pocock skill and its file for each provider. The subject is the replied
+  message, the text after "Note:", or the recent conversation.
+- `/to-spec` and `/to-tickets`: dispatch a scout or ship crew that loads that skill. Tickets go to
+  the project's GitHub issues. Reply with the spec file or the ticket links.
+- `/implement-spec` and `/implement`: dispatch ship crews that load that skill. For a spec with
+  tickets, create a `firstmate_program` for the epic when that tool exists, then dispatch every ready ticket.
+- `/grill-me`: Run the `grilling` skill yourself with the owner, one question per `firstmate_reply`,
+  not as a card. Continue until the owner says stop, then write the result and reply with its file.
 - `/inbox`, `/workers` and the captain's board of open asks are answered by the connector from
   Firstmate's records. They never reach you, so keep `firstmate_inbox`, open asks and the fleet
   state accurate.

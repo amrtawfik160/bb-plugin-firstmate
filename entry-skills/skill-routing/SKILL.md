@@ -47,6 +47,7 @@ the crewmate's result report, never in a message for the user.
 | Feature or behavior change | poteto-mode `feature.md`; `tdd` |
 | Refactor or architecture | poteto-mode `refactoring.md`; `codebase-design`; `improve-codebase-architecture`; the `principle-*` skills the playbook names |
 | Unclear spec or contested design | Supervisor: `grill-with-docs` with the user, then `to-spec` and `to-tickets` for work that spans crews; `interrogate` under the review bound below. Crewmate: report the open question in your result |
+| Owner asks for `/to-spec`, `/to-tickets`, `/implement-spec`, `/implement` or `/grill-me` | Supervisor: dispatch a crew that loads the named skill, `to-spec`, `to-tickets`, `implement-spec` or `implement`; for /grill-me, run `grilling` yourself with the owner. Crewmate: follow the skill your brief names |
 | Investigation of how or why, or a spec | poteto-mode `investigation.md`; `how` or `why`, single-model |
 | Design question that needs running code | poteto-mode `prototype.md`; `prototype` |
 | Frontend or UI work (new screen, redesign, visual change) | `frontend-design`; the project's own design system and tokens win where they pin a choice |
