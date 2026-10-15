@@ -645,6 +645,94 @@ test("firstmate_reply answers a later message while an older one is still open, 
   }
 });
 
+// 15 Oct: the owner forwarded 9 messages for one task; the captain sent one real reply and 7 "Included." replies.
+test("firstmate_reply covers: one Telegram reply answers several owner messages and closes the covered ones silently", async () => {
+  const host = await load();
+  try {
+    await telegramFlags(host);
+    recordTelegram(host, "thr_cap", "1669", 1_000);
+    recordTelegram(host, "thr_cap", "1670", 2_000);
+    recordTelegram(host, "thr_cap", "1671", 3_000);
+    recordTelegram(host, "thr_cap", "1672", 4_000);
+    createInboundLedger(host.bb.storage.database()).markDelegated({ source: "telegram", chatId: "200", messageId: "1671" }, "thr_crew", 3_500);
+    host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
+    const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
+    const result = await tool(host, "firstmate_reply").execute({ ref: "tg:200:1669", text: "Research started with all your filters.", covers: ["tg:200:1670", "tg:200:1671"] }, ctx);
+    assert.ok(!isError(result), text(result));
+    assert.equal(host.harness.sdk.callsTo("plugins.callRpc").length, 1, "one Telegram reply");
+    assert.equal((host.harness.sdk.callsTo("plugins.callRpc")[0]![0] as { input: { messageId: string } }).input.messageId, "1669");
+    for (const id of ["1669", "1670", "1671"]) assert.equal(ledgerRow(host, id)?.state, "answered", id);
+    assert.equal(ledgerRow(host, "1670")?.coveredBy, "tg:200:1669");
+    assert.equal(ledgerRow(host, "1671")?.coveredBy, "tg:200:1669");
+    assert.equal(ledgerRow(host, "1671")?.crewId, "thr_crew", "a covered item handed to a crew keeps its crew link");
+    assert.equal(ledgerRow(host, "1669")?.coveredBy ?? null, null);
+    assert.match(text(result), /tg:200:1670/);
+    assert.match(text(result), /1 owner message\(s\) still need a final answer:\n- tg:200:1672/);
+    const inbox = text(await tool(host, "firstmate_inbox").execute({}, ctx));
+    assert.doesNotMatch(inbox, /1670|1671/);
+    const reminders = createInboundLedger(host.bb.storage.database()).openForSweep(60 * 60_000, "thr_cap").map((action) => action.row.messageId);
+    assert.deepEqual(reminders, ["1672"], "covered items get no turn-end reminder");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("firstmate_reply covers: refuses a covered ref that is not open, another captain's, or the ref itself, and sends nothing", async () => {
+  const host = await load();
+  try {
+    await telegramFlags(host);
+    recordTelegram(host, "thr_cap", "1669", 1_000);
+    recordTelegram(host, "thr_cap", "1670", 2_000);
+    recordTelegram(host, "thr_cap", "1671", 3_000);
+    recordTelegram(host, "thr_other", "1672", 4_000);
+    createInboundLedger(host.bb.storage.database()).markAnswered({ source: "telegram", chatId: "200", messageId: "1671" }, 3_500);
+    host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
+    const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
+    const send = (ref: string, covers: string[]) => tool(host, "firstmate_reply").execute({ ref, text: "Started.", covers }, ctx);
+    for (const [ref, bad] of [
+      ["tg:200:1669", "tg:200:1671"],
+      ["tg:200:1669", "tg:200:1672"],
+      ["tg:200:1669", "tg:200:1669"],
+      ["oldest", "tg:200:1669"],
+      ["tg:200:1669", "tg:200:9999"],
+      ["tg:200:1669", "nonsense"],
+    ] as const) {
+      const refused = await send(ref, ["tg:200:1670", bad]);
+      assert.ok(isError(refused), `${ref} covers ${bad}: ${text(refused)}`);
+      assert.ok(text(refused).includes(bad), text(refused));
+    }
+    assert.equal(host.harness.sdk.callsTo("plugins.callRpc").length, 0, "no reply is sent when a covered ref is refused");
+    for (const id of ["1669", "1670"]) assert.equal(ledgerRow(host, id)?.state, "received", id);
+    assert.equal(ledgerRow(host, "1672")?.state, "received");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("firstmate_reply covers: a reply that is not delivered leaves the covered items open", async () => {
+  const host = await load();
+  try {
+    await telegramFlags(host);
+    recordTelegram(host, "thr_cap", "1669", 1_000);
+    recordTelegram(host, "thr_cap", "1670", 2_000);
+    host.harness.sdk.stub("plugins.callRpc", async () => { throw new Error("Telegram API unavailable"); });
+    const refused = await tool(host, "firstmate_reply").execute({ ref: "tg:200:1669", text: "Started.", covers: ["tg:200:1670"] }, { threadId: "thr_cap", projectId: "proj_1" } as never);
+    assert.ok(isError(refused), text(refused));
+    assert.equal(ledgerRow(host, "1670")?.state, "received");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("firstmate_reply and the captain Telegram guide tell the captain to answer forwarded messages once with covers", () => {
+  const source = readFileSync(new URL("./server.ts", import.meta.url), "utf8");
+  const description = source.slice(source.indexOf('name: "firstmate_reply"'), source.indexOf("parameters:", source.indexOf('name: "firstmate_reply"')));
+  assert.match(description, /covers/);
+  const guide = readFileSync(new URL("./entry-skills/captain/references/telegram.md", import.meta.url), "utf8").replace(/\s*\n\s*/g, " ");
+  assert.ok(guide.includes("`covers`"), guide);
+  assert.doesNotMatch(guide, /reply once to the oldest and say which later messages it also answers/);
+});
+
 test("firstmate_inbox lists open and delegated owner messages for the calling captain only", async () => {
   const host = await load();
   try {
