@@ -11827,7 +11827,7 @@ export default async function plugin(bb: BbPluginApi) {
       // closure an interrupted call left undone, of the covers that reply listed only. It closes this message only
       // when the delivered reply was final, so repeating a more=true text keeps the message open.
       const inFlight = `Not sent: the first send of this reply to ${used} is still running, so nothing is closed yet. Repeat the same call later.`;
-      const repeatKinds = quote ? [quotedReplyKind(quote)] : [quotedReplyKind(undefined), followUpReplyKind(body)];
+      const repeatKinds = [quotedReplyKind(quote), followUpReplyKind(body, quote)];
       const delivered = repeatKinds.map((kind) => inboundLedger.outboxGet(row, kind as OutboxKind)).find((out) => out?.contentHash === hashText(body));
       if (delivered) {
         if (delivered.inFlight === true) return toolError(inFlight);
@@ -11868,17 +11868,14 @@ export default async function plugin(bb: BbPluginApi) {
       // Reserve first so a concurrent or repeated reply never reaches Telegram twice.
       const reservation = { final: more !== true, covers: covered.map(refOf) };
       let claim = inboundLedger.claimOutbox(row, claimKind, body, Date.now(), reservation);
-      // more=true left the message open: a different text is the next reply to it, the same text is a repeat.
-      if (!claim.sent && !quote && (row.state !== "answered" || attach.length > 0) && claim.existing?.contentHash !== hashText(body)) {
-        claimKind = followUpReplyKind(body);
+      // This message (and quote) already has a reply: a different text is a follow-up reply to it, with the same quote.
+      if (!claim.sent) {
+        claimKind = followUpReplyKind(body, quote);
         claim = inboundLedger.claimOutbox(row, claimKind, body, Date.now(), reservation);
       }
+      // The follow-up claim is keyed by its text, so only a concurrent exact repeat finds it taken.
       if (!claim.sent) {
-        if (claim.existing?.inFlight === true && claim.existing.contentHash === hashText(body)) return toolError(inFlight);
-        // A quote takes one reply. A different text with it was never sent, so it is not "Already replied".
-        if (quote && claim.existing?.contentHash !== hashText(body)) {
-          return toolError(`Not sent: ${used} already has a different reply for that quote, so this text was not sent and nothing is closed. Send it without quote, or with the exact words of another question in ${used}.`);
-        }
+        if (claim.existing?.inFlight === true) return toolError(inFlight);
         return quote ? `Already replied to ${used} for that quote.` : `Already replied to ${used}.`;
       }
       const stayOpen = [used, ...covered.map(refOf)].join(", ");

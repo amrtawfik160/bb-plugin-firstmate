@@ -12,9 +12,10 @@ export function quotedReplyKind(quote: string | null | undefined): OutboxClaimKi
   return trimmed === "" ? "reply" : `reply:q${hashText(trimmed).slice(0, 12)}`;
 }
 
-/** The claim for an unquoted reply that follows a more=true reply: one per different text. */
-export function followUpReplyKind(text: string): OutboxClaimKind {
-  return `reply:t${hashText(text).slice(0, 12)}`;
+/** The claim for a reply that follows an earlier reply to the same message (and quote): one per different text. */
+export function followUpReplyKind(text: string, quote?: string | null): OutboxClaimKind {
+  const trimmed = quote?.trim() ?? "";
+  return `reply:t${hashText(trimmed === "" ? text : `${trimmed}\0${text}`).slice(0, 12)}`;
 }
 
 export type InboundKey = {
