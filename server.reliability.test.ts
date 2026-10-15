@@ -1804,6 +1804,45 @@ test("15 Oct inbox: the captain's next wake names each owner message whose crew 
   }
 });
 
+// FM-134 check: the hand-back was recorded before its wake was delivered, so a restart in between lost it for good.
+test("a restart while the hand-back wake is still being delivered sends it on the next wake, once", async () => {
+  let host = await captainHost();
+  try {
+    let deliveries = 0;
+    let started!: () => void;
+    const sending = new Promise<void>((resolve) => { started = resolve; });
+    // The first process sends the wake and exits before the send returns.
+    host.harness.sdk.stub("threads.send", () => { started(); return new Promise(() => {}); });
+    host.harness.sdk.stub("threads.events.list", async () => []);
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
+    recordTelegram(host, "thr_cap", "9200", Date.now() - 60_000);
+    const ledger = createInboundLedger(host.bb.storage.database());
+    ledger.markDelegated({ source: "telegram", chatId: "200", messageId: "9200" }, "c-gone", Date.now());
+    ledger.crewEnded("c-gone", Date.now());
+    void captainIdle(host);
+    await sending;
+    void captainIdle(host);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(handBacks(host).length, 1, "a second wake while the first is in flight sends nothing more");
+    assert.equal(createInboundLedger(host.bb.storage.database()).get({ source: "telegram", chatId: "200", messageId: "9200" })?.handedBackAt ?? null, null, "not recorded before delivery");
+
+    host = await host.harness.lifecycle.reload(plugin);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: "active" }));
+    host.harness.sdk.stub("threads.send", async () => { deliveries++; return {}; });
+    host.harness.sdk.stub("threads.events.list", async () => []);
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
+    await captainIdle(host);
+    assert.equal(deliveries, 1, "the reminder is sent after the restart");
+    assert.match(handBacks(host)[0]!.input[0]!.text, /- tg:200:9200 \(crew c-gone\): 'Status\?'/);
+    await captainIdle(host);
+    assert.equal(deliveries, 1, "and only once");
+    assert.notEqual(createInboundLedger(host.bb.storage.database()).get({ source: "telegram", chatId: "200", messageId: "9200" })?.handedBackAt ?? null, null);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("a crew that fails, stops, finishes or is archived hands its owner messages back on the captain's next wake", async () => {
   for (const [how, end] of [
     ["failed", (host: Host) => host.harness.behavior.emitThreadEvent("thread.failed", { thread: makeThreadResponse({ id: "thr_c1", status: "error" }), error: "boom" })],

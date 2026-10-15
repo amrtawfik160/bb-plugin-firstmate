@@ -91,3 +91,17 @@ test("more than 10 files, or more than 50 MB together, are refused", () => {
   writeFileSync(big2, Buffer.alloc(30 * 1024 * 1024));
   assert.deepEqual(reasons([big, big2]), [[big2, "Telegram takes at most 50 MB of files per reply."]]);
 });
+
+// The connector attaches each linked path once (src/outbound.ts localFileLinks), so a repeated path counts once.
+test("the same 30 MiB file attached twice is one 30 MiB upload and is sent", () => {
+  const dir = mkdtempSync("/tmp/fm-files-");
+  try {
+    const big = join(dir, "big.bin");
+    writeFileSync(big, Buffer.alloc(30 * 1024 * 1024));
+    assert.deepEqual(reasons([big, big]), []);
+    const small = Array.from({ length: 10 }, (_, i) => { const f = join(dir, `f${i}.txt`); writeFileSync(f, "x"); return f; });
+    assert.deepEqual(reasons([...small, small[0]!]), [], "ten distinct files and a repeat are ten uploads");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

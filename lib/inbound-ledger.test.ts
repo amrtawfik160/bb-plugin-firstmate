@@ -224,27 +224,35 @@ test("an owner message handed to a crew is handed back once when that crew ends,
   ledger.markDelegated(handed, "c1", 2_000);
   ledger.markDelegated(answered, "c1", 2_000);
   ledger.markDelegated(other, "c2", 2_000);
-  assert.deepEqual(ledger.takeHandBacks("thr_cap", 3_000), [], "no crew has ended");
+  assert.deepEqual(ledger.handBacksDue("thr_cap"), [], "no crew has ended");
 
   ledger.markAnswered(answered, 3_500);
   assert.deepEqual(ledger.crewEnded("c1", 4_000).map((row) => row.messageId), [handed.messageId], "only the open row of that crew");
   assert.deepEqual(ledger.crewEnded("c1", 4_100), [], "a second end changes nothing");
-  const taken = ledger.takeHandBacks("thr_cap", 5_000);
-  assert.deepEqual(taken.map((row) => row.messageId), [handed.messageId]);
+  // Reading what is due records nothing, so a wake lost before delivery (a failed send or a restart) leaves it due.
+  const due = ledger.handBacksDue("thr_cap");
+  assert.deepEqual(due.map((row) => row.messageId), [handed.messageId]);
+  assert.deepEqual(ledger.handBacksDue("thr_cap").map((row) => row.messageId), [handed.messageId], "still due until delivered");
+  assert.equal(ledger.get(handed)?.handedBackAt ?? null, null);
+  assert.deepEqual(ledger.handBacksDue("thr_other"), [], "only the captain's own items");
+
+  // Recorded only after the wake was delivered; then it is not due again.
+  ledger.markHandedBack(due, 5_000);
   assert.equal(ledger.get(handed)?.state, "delegated", "it still needs an answer");
   assert.equal(ledger.get(handed)?.handedBackAt, 5_000);
-  assert.deepEqual(ledger.takeHandBacks("thr_cap", 6_000), [], "once per item");
-  assert.deepEqual(ledger.takeHandBacks("thr_other", 6_000), [], "only the captain's own items");
+  assert.deepEqual(ledger.handBacksDue("thr_cap"), [], "once per item");
+  ledger.markHandedBack(due, 6_000);
+  assert.equal(ledger.get(handed)?.handedBackAt, 5_000, "a repeated record keeps the first delivery");
 
-  // A send that fails releases the item, so the next wake names it again.
-  ledger.releaseHandBacks(taken);
-  assert.deepEqual(ledger.takeHandBacks("thr_cap", 7_000).map((row) => row.messageId), [handed.messageId]);
-
-  // Handed to a new crew, it waits for that crew to end.
+  // Handed to a new crew, it waits for that crew to end, and a late record for the old wake does not count for it.
   ledger.markDelegated(handed, "c3", 8_000);
   assert.equal(ledger.get(handed)?.crewEndedAt ?? null, null);
   assert.equal(ledger.get(handed)?.handedBackAt ?? null, null);
-  assert.deepEqual(ledger.takeHandBacks("thr_cap", 9_000), []);
+  assert.deepEqual(ledger.handBacksDue("thr_cap"), []);
+  ledger.markHandedBack(due, 8_500);
+  assert.equal(ledger.get(handed)?.handedBackAt ?? null, null);
+  ledger.crewEnded("c3", 9_000);
+  assert.deepEqual(ledger.handBacksDue("thr_cap").map((row) => row.messageId), [handed.messageId]);
 });
 
 test("the hand-back names each owner message with its ref and words, and says to answer it with firstmate_reply now", () => {
@@ -257,7 +265,7 @@ test("the hand-back names each owner message with its ref and words, and says to
   ledger.markDelegated(c, "c2", 2_000);
   ledger.crewEnded("c1", 3_000);
   ledger.crewEnded("c2", 3_000);
-  assert.equal(handBackText(ledger.takeHandBacks("thr_cap", 4_000)), [
+  assert.equal(handBackText(ledger.handBacksDue("thr_cap")), [
     "These owner messages were handed to a crew that has ended, and they still have no answer. Answer each with firstmate_reply now:",
     `- tg:9:${a.messageId} (crew c1): 'Fix the login page'`,
     `- tg:9:${b.messageId} (crew c1): 'Send me the leads CSV'`,
