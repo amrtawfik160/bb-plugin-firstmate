@@ -4907,21 +4907,33 @@ export default async function plugin(bb: BbPluginApi) {
   // here Firstmate feeds it the facts it already has and tells the captain what changed.
   const PROGRAM_ISSUE_CHECK_MS = 30 * 60_000;
   const PROGRAM_MAX_FETCHED_ISSUES = 40;
+  // GitHub lists come 100 to a page; a program reads at most 5 pages (500 issues) of one list.
+  const PROGRAM_PAGE = 100;
+  const PROGRAM_MAX_PAGES = 5;
+  const PROGRAM_MAX_LISTED = PROGRAM_PAGE * PROGRAM_MAX_PAGES;
   const ghSubIssueSchema = z.object({ number: z.number(), title: z.string(), state: z.string(), repo: z.string(), blockers: z.number() });
+  const ghClosedSchema = z.object({ number: z.number(), pr: z.boolean(), updated: z.string() });
   const ghBlockersSchema = z.object({ repo: z.string(), number: z.number(), blockedBy: z.array(z.object({ repo: z.string(), number: z.number() })) });
   const jsonLines = (output: string) => output.split("\n").map((line) => line.trim()).filter((line) => line.startsWith("{")).map((line) => JSON.parse(line) as unknown);
 
   /** Read an epic's sub-issues and their GitHub "blocked by" links: one call for the list, one per issue that has blockers. */
   async function readEpic(hostId: string, epic: TicketRef, signal?: AbortSignal): Promise<{ title: string; issues: IssueFacts[] }> {
     const path = `repos/${repoOf(epic)}/issues/${numberOf(epic)}`;
-    const read = await runStructuredOnHost(hostId, [
-      `gh api ${shQuote(path)} --jq ${shQuote("{title}|tojson")}`,
-      `gh api ${shQuote(`${path}/sub_issues?per_page=100`)} --jq ${shQuote(`.[]|{number,title,state,repo:(.repository_url|sub(".*/repos/";"")),blockers:(.issue_dependencies_summary.total_blocked_by // 0)}|tojson`)}`,
-    ].join(" && "), 60_000, signal);
-    if (read.exitCode !== 0) throw new Error(`GitHub read of ${epic} failed: ${(read.stderr || read.output).trim().slice(0, 300)}`);
-    const [head, ...rows] = jsonLines(read.output);
-    const title = z.object({ title: z.string() }).parse(head).title;
-    const subs = rows.map((row) => ghSubIssueSchema.parse(row));
+    let title = "";
+    const subs: z.infer<typeof ghSubIssueSchema>[] = [];
+    // The first page comes with the epic's title. A page past the limit is read only to see whether it is empty.
+    for (let page = 1; page <= PROGRAM_MAX_PAGES + 1; page++) {
+      const read = await runStructuredOnHost(hostId, [
+        ...(page === 1 ? [`gh api ${shQuote(path)} --jq ${shQuote("{title}|tojson")}`] : []),
+        `gh api ${shQuote(`${path}/sub_issues?per_page=${PROGRAM_PAGE}&page=${page}`)} --jq ${shQuote(`.[]|{number,title,state,repo:(.repository_url|sub(".*/repos/";"")),blockers:(.issue_dependencies_summary.total_blocked_by // 0)}|tojson`)}`,
+      ].join(" && "), 60_000, signal);
+      if (read.exitCode !== 0) throw new Error(`GitHub read of ${epic} failed: ${(read.stderr || read.output).trim().slice(0, 300)}`);
+      const rows = jsonLines(read.output);
+      if (page === 1) title = z.object({ title: z.string() }).parse(rows.shift()).title;
+      if (page > PROGRAM_MAX_PAGES && rows.length > 0) throw new Error(`${epic} has more than ${PROGRAM_MAX_LISTED} sub-issues; a program reads at most ${PROGRAM_MAX_LISTED}. Split the epic.`);
+      subs.push(...rows.map((row) => ghSubIssueSchema.parse(row)));
+      if (rows.length < PROGRAM_PAGE) break;
+    }
     if (subs.length === 0) throw new Error(`${epic} has no sub-issues. Add the tickets as GitHub sub-issues of the epic, then create the program.`);
     const blocked = subs.filter((sub) => sub.blockers > 0);
     if (blocked.length > PROGRAM_MAX_FETCHED_ISSUES) throw new Error(`${epic} has ${blocked.length} blocked sub-issues; a program reads at most ${PROGRAM_MAX_FETCHED_ISSUES}. Split the epic.`);
@@ -4943,20 +4955,28 @@ export default async function plugin(bb: BbPluginApi) {
     return { title, issues };
   }
 
-  /** Ticket issues closed since `since`: one REST call per repo. */
-  async function closedTickets(hostId: string, program: Program, since: number, signal?: AbortSignal): Promise<Set<TicketRef>> {
+  /** Ticket issues closed since `since`, oldest update first, one REST call per page of 100. A repo with more
+   * than 500 is read up to its 500th issue: `readTo` is that issue's update time, where the next read goes on. */
+  async function closedTickets(hostId: string, program: Program, since: number, signal?: AbortSignal): Promise<{ closed: Set<TicketRef>; readTo: number | null }> {
     const open = program.tickets.filter(isOpenTicket).map((ticket) => ticket.ref);
     const repos = [...new Set(open.map(repoOf))];
     const closed = new Set<TicketRef>();
+    let readTo: number | null = null;
     for (const repo of repos) {
-      const res = await runStructuredOnHost(hostId, `gh api ${shQuote(`repos/${repo}/issues?state=closed&since=${new Date(since).toISOString()}&per_page=100`)} --jq '.[]|select(.pull_request==null)|.number'`, 60_000, signal);
-      if (res.exitCode !== 0) throw new Error(`GitHub read of closed issues in ${repo} failed: ${(res.stderr || res.output).trim().slice(0, 300)}`);
-      for (const line of res.output.split("\n")) {
-        const ref = /^\d+$/.test(line.trim()) ? ticketRef(`${repo}#${line.trim()}`) : null;
-        if (ref !== null && open.includes(ref)) closed.add(ref);
+      for (let page = 1; page <= PROGRAM_MAX_PAGES; page++) {
+        const url = `repos/${repo}/issues?state=closed&since=${new Date(since).toISOString()}&sort=updated&direction=asc&per_page=${PROGRAM_PAGE}&page=${page}`;
+        const res = await runStructuredOnHost(hostId, `gh api ${shQuote(url)} --jq '.[]|{number,pr:(.pull_request!=null),updated:.updated_at}|tojson'`, 60_000, signal);
+        if (res.exitCode !== 0) throw new Error(`GitHub read of closed issues in ${repo} failed: ${(res.stderr || res.output).trim().slice(0, 300)}`);
+        const rows = jsonLines(res.output).map((row) => ghClosedSchema.parse(row));
+        for (const row of rows) {
+          const ref = row.pr ? null : ticketRef(`${repo}#${row.number}`);
+          if (ref !== null && open.includes(ref)) closed.add(ref);
+        }
+        if (rows.length < PROGRAM_PAGE) break;
+        if (page === PROGRAM_MAX_PAGES) readTo = Math.min(readTo ?? Infinity, Date.parse(rows.at(-1)!.updated));
       }
     }
-    return closed;
+    return { closed, readTo };
   }
 
   const prKey = (pr: string) => /^[\w.-]+\/[\w.-]+#\d+$/.test(pr.trim()) ? pr.trim().toLowerCase() : canonicalPr(pr).id;
@@ -4985,6 +5005,29 @@ export default async function plugin(bb: BbPluginApi) {
     return facts;
   }
 
+  /** The crews that carry this captain's work: running, still starting (a launch or a background dispatch), or waiting for a slot. */
+  async function captainCrewIds(captain: string, gone?: string): Promise<Set<string>> {
+    return new Set([
+      ...(await readCrews()).filter((crew) => crew.parentThreadId === captain && crew.id !== gone).map((crew) => crew.id),
+      // A held launch is keyed [project, task]; its task is the crew id.
+      ...launches.heldTaskIds(captain).map((key) => (JSON.parse(key) as [string, string])[1]),
+      ...queueStore.list(captain).filter((row) => row.status === "queued").map((row) => row.id),
+      ...dispatchJobs.pending(captain).map((job) => job.crewId),
+    ]);
+  }
+
+  /** Send a program wake the record already claims. A second reconcile at the same time finds the claim and sends
+   * nothing; a wake that does not go out gives its claim back, so the next reconcile sends it. */
+  async function sendClaimedWake(program: Program, text: string, release: (current: Program) => Program, signal?: AbortSignal): Promise<Program> {
+    let sent = false;
+    try {
+      sent = await sendCaptainWake(program.captain, text, `program-${program.id}`, signal);
+    } finally {
+      if (!sent) programs.update(program.id, program.captain, release);
+    }
+    return programs.get(program.id) ?? program;
+  }
+
   /** Apply facts one at a time, so a fact the state machine refuses does not hold back the others. */
   function applyEach(program: Program, facts: readonly ProgramFact[], at: number): Program {
     let current = program;
@@ -5010,11 +5053,7 @@ export default async function plugin(bb: BbPluginApi) {
     const open = programs.list(captain);
     if (open.length === 0) return;
     // A crew still starting or waiting for a slot carries its ticket as much as a running one.
-    const alive = new Set([
-      ...(await readCrews()).filter((crew) => crew.id !== options.gone).map((crew) => crew.id),
-      ...launches.heldTaskIds(captain),
-      ...queueStore.list(captain).filter((row) => row.status === "queued").map((row) => row.id),
-    ]);
+    const alive = await captainCrewIds(captain, options.gone);
     let changed = false;
     for (const before of open) {
       const now = Date.now();
@@ -5023,20 +5062,36 @@ export default async function plugin(bb: BbPluginApi) {
         try {
           const hostId = await resolveHostId(undefined, { threadId: captain });
           // A small overlap so an issue closed during the last read is not missed.
-          const closed = await closedTickets(hostId, program, program.checkedAt - 5 * 60_000, options.signal);
+          const { closed, readTo } = await closedTickets(hostId, program, program.checkedAt - 5 * 60_000, options.signal);
           program = applyEach(program, [...closed].map((ticket) => ({ kind: "issue-closed", ticket }) as const), now);
-          program = programs.update(program.id, captain, (p) => ({ ...p, checkedAt: now }));
+          program = programs.update(program.id, captain, (p) => ({ ...p, checkedAt: readTo ?? now, checkFailure: null }));
         } catch (error) {
           if (options.signal?.aborted) throw error;
-          bb.log.warn(`program ${program.id} issue check: ${error instanceof Error ? error.message : String(error)}`);
+          const message = error instanceof Error ? error.message : String(error);
+          bb.log.warn(`program ${program.id} issue check: ${message}`);
+          // checkedAt stays, so the next read covers the closures this one missed; the board shows the failure.
+          program = programs.update(program.id, captain, (p) => ({ ...p, checkFailure: { at: now, error: message.slice(0, 300) } }));
         }
       }
-      const ready = newlyReady(program);
-      if (ready.refs.length > 0 && await sendCaptainWake(captain, readyWakeText(program, ready.refs), `program-${program.id}`, options.signal)) {
-        program = programs.update(program.id, captain, (p) => newlyReady(p).program);
+      // Each wake is claimed in the record before it is sent, so two reconciles at once send it once.
+      let ready: TicketRef[] = [];
+      program = programs.update(program.id, captain, (p) => {
+        const found = newlyReady(p);
+        ready = found.refs;
+        return found.program;
+      });
+      if (ready.length > 0) {
+        program = await sendClaimedWake(program, readyWakeText(program, ready), (p) => ({ ...p, announced: p.announced.filter((ref) => !ready.includes(ref)) }), options.signal);
       }
-      if (stallReminderDue(program, now) && await sendCaptainWake(captain, stallReminderText(program, now), `program-${program.id}`, options.signal)) {
-        program = programs.update(program.id, captain, (p) => ({ ...p, remindedAt: now }));
+      let remindedBefore: number | null = null;
+      let remind = false;
+      program = programs.update(program.id, captain, (p) => {
+        remind = stallReminderDue(p, now);
+        remindedBefore = p.remindedAt;
+        return remind ? { ...p, remindedAt: now } : p;
+      });
+      if (remind) {
+        program = await sendClaimedWake(program, stallReminderText(program, now), (p) => (p.remindedAt === now ? { ...p, remindedAt: remindedBefore } : p), options.signal);
       }
       closeFinishedProgram(program);
       changed ||= JSON.stringify(programCounts(program)) !== JSON.stringify(programCounts(before)) || isOpenProgram(program) !== isOpenProgram(before);
@@ -5086,7 +5141,11 @@ export default async function plugin(bb: BbPluginApi) {
     if (input.action === "list" || input.action === "refresh") {
       if (input.action === "refresh") await reconcilePrograms(captain, { checkIssues: true, signal });
       const open = programs.list(captain);
-      return open.length === 0 ? "No program is open." : open.map((program) => programText(program, now).split("\n").slice(0, 2).join("\n")).join("\n");
+      // A refresh says how fresh the ticket states are, and why not when GitHub could not be read.
+      const freshness = (program: Program) => input.action !== "refresh" ? []
+        : program.checkFailure ? [`Last GitHub read failed: ${program.checkFailure.error}`]
+        : [`Ticket states read from GitHub ${formatAge(Date.now() - program.checkedAt)} ago.`];
+      return open.length === 0 ? "No program is open." : open.map((program) => [...programText(program, now).split("\n").slice(0, 2), ...freshness(program)].join("\n")).join("\n");
     }
     if (input.action === "create") {
       const epic = input.epic ? ticketRef(input.epic) : null;
@@ -5108,10 +5167,14 @@ export default async function plugin(bb: BbPluginApi) {
       buildProgram("P0", { captain, project, title, source, sourceRefs, taskId: null, issues: read.issues, at: now });
       const taskId = task?.id ?? ownerTasks.open({ captain, project, title, sourceRefs, at: now }).id;
       const { program, outside } = programs.create({ captain, project, title, source, sourceRefs: [...new Set([...sourceRefs, ...(task?.sourceRefs ?? [])])], taskId, issues: read.issues, at: now });
+      // An epic whose tickets are all done or dropped is finished on arrival.
+      closeFinishedProgram(program);
       await refreshOwnerBoard();
       const ready = readyRefs(program).map((ref) => shortTicket(program, ref));
       return [
-        `Program ${program.id} is open and keeps owner task ${taskId} open until every ticket is done or dropped.`,
+        isOpenProgram(program)
+          ? `Program ${program.id} is open and keeps owner task ${taskId} open until every ticket is done or dropped.`
+          : `Program ${program.id} is closed; owner task ${taskId} is done.`,
         programText(program, now),
         ready.length > 0 ? `Ready now: ${ready.join(", ")}. Dispatch them with ticket set on each dispatch; Firstmate wakes you when more become ready.` : "No ticket is ready yet.",
         ...(outside.length > 0 ? [`Not tracked (outside this program): ${outside.join("; ")}.`] : []),
@@ -5142,6 +5205,7 @@ export default async function plugin(bb: BbPluginApi) {
           break;
         case "running":
           if (!input.crewId) throw new Error("running needs crewId.");
+          if (!(await captainCrewIds(captain)).has(input.crewId)) throw new Error(`No crew ${input.crewId} for this captain. Pass the id of a crew this captain dispatched.`);
           facts.push({ kind: "dispatched", ticket: ticket.ref, crewId: input.crewId });
           break;
         case "in-review":

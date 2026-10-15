@@ -60,6 +60,8 @@ export interface Program {
   remindedAt: number | null;
   /** The last time closed issues were read from GitHub. */
   checkedAt: number;
+  /** The last read of closed issues failed, and no read has worked since. Absent on older records. */
+  checkFailure?: { at: number; error: string } | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -272,8 +274,8 @@ export function shortTicket(program: Pick<Program, "tickets">, ref: TicketRef): 
   return repos.size === 1 ? `#${numberOf(ref)}` : ref.replace(/^[^/]*\//, "");
 }
 
-/** The one line the board and digest show per open program. */
-export function programLine(program: Program): string {
+/** The one line the board and digest show per open program. A failed GitHub read says how old the ticket states are. */
+export function programLine(program: Program, now: number): string {
   const c = programCounts(program);
   const parts = [
     `${c.done}/${c.total - c.dropped} done`,
@@ -284,7 +286,8 @@ export function programLine(program: Program): string {
     c.onOwner > 0 ? `${c.onOwner} on you` : "",
     c.dropped > 0 ? `${c.dropped} dropped` : "",
   ].filter((part) => part !== "");
-  return `${clip(program.title, 50)}: ${parts.join(", ")}`;
+  const failure = program.checkFailure ? ` · GitHub read failed ${formatAge(now - program.checkFailure.at)} ago; ticket states are ${formatAge(now - program.checkedAt)} old` : "";
+  return `${clip(program.title, 50)}: ${parts.join(", ")}${failure}`;
 }
 
 /** What the owner must act on in a program, or null: a stall past two hours, or a ticket blocked on
@@ -332,7 +335,7 @@ function ticketDetail(ticket: Ticket, program: Program): string {
 
 /** The program in full for the captain: its line, then one line per ticket. */
 export function programText(program: Program, now: number): string {
-  const head = `${program.id} ${programLine(program)}${program.taskId ? ` · task ${program.taskId}` : ""}${program.source ? ` · ${program.source}` : ""}${isOpenProgram(program) ? "" : " · closed"}`;
+  const head = `${program.id} ${programLine(program, now)}${program.taskId ? ` · task ${program.taskId}` : ""}${program.source ? ` · ${program.source}` : ""}${isOpenProgram(program) ? "" : " · closed"}`;
   const stall = programNeedsOwner(program, now);
   return [
     head,
@@ -349,7 +352,7 @@ export function readyWakeText(program: Program, refs: readonly TicketRef[]): str
 
 export function stallReminderText(program: Program, now: number): string {
   const ready = readyRefs(program).map((ref) => shortTicket(program, ref));
-  return `Program ${program.title} (${program.id}) has stalled: ${ready.join(", ")} ${ready.length === 1 ? "is" : "are"} ready and nothing has run for ${formatAge(now - stalledSince(program)!)}. ${programLine(program)}. Dispatch the ready tickets, or mark each one blocked or dropped with firstmate_program set. The owner sees this stall in the next digest.`;
+  return `Program ${program.title} (${program.id}) has stalled: ${ready.join(", ")} ${ready.length === 1 ? "is" : "are"} ready and nothing has run for ${formatAge(now - stalledSince(program)!)}. ${programLine(program, now)}. Dispatch the ready tickets, or mark each one blocked or dropped with firstmate_program set. The owner sees this stall in the next digest.`;
 }
 
 type Database = {

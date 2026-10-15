@@ -52,7 +52,7 @@ test("the DM Pro epic becomes 20 tickets: #2423 done, #2424 and #2428 ready, 17 
   assert.deepEqual(readyRefs(program), [ref(2424), ref(2428)]);
   assert.deepEqual(program.tickets.find((t) => t.ref === ref(2425))!.dependsOn, [ref(2423), ref(2424)]);
   assert.deepEqual(program.tickets.find((t) => t.ref === ref(2442))!.dependsOn, [ref(2430), ref(2437), ref(2424)]);
-  assert.equal(programLine(program), "DM Pro epic: 1/20 done, 2 ready, 17 waiting on deps");
+  assert.equal(programLine(program, 0), "DM Pro epic: 1/20 done, 2 ready, 17 waiting on deps");
   assert.deepEqual(newlyReady(program).refs, [], "the create result already lists the ready tickets");
 });
 
@@ -69,7 +69,7 @@ test("dispatch, PR and merge move a ticket, and its dependents become ready with
   const first = newlyReady(program);
   assert.deepEqual(first.refs, [ref(2425), ref(2427)]);
   assert.deepEqual(newlyReady(first.program).refs, [], "each ready ticket wakes the captain once");
-  assert.equal(programLine(first.program), "DM Pro epic: 2/20 done, 3 ready, 15 waiting on deps");
+  assert.equal(programLine(first.program, 0), "DM Pro epic: 2/20 done, 3 ready, 15 waiting on deps");
 });
 
 test("a crew that ends without a PR puts its ticket back to ready; a PR closed unmerged does the same", () => {
@@ -113,7 +113,7 @@ test("invalid moves are refused: done and dropped are final, dropping needs owne
 
 test("blocking on the owner shows on the owner's list; unblocking returns the ticket to its dependencies", () => {
   let program = applyFact(dmPro(), { kind: "blocked", ticket: ref(2428), reason: "Which X egress provider?", askId: null }, PLAN_AT + H);
-  assert.equal(programLine(program), "DM Pro epic: 1/20 done, 1 ready, 17 waiting on deps, 1 on you");
+  assert.equal(programLine(program, 0), "DM Pro epic: 1/20 done, 1 ready, 17 waiting on deps, 1 on you");
   assert.match(programNeedsOwner(program, PLAN_AT + H)!, /#2428 waits on you: Which X egress provider\?/);
   program = applyFact(program, { kind: "unblocked", ticket: ref(2428) }, PLAN_AT + 2 * H);
   assert.equal(kindOf(program, 2428), "ready");

@@ -113,7 +113,7 @@ function collect(input: BoardInput, ref: PrRef, listDone: (key: string) => boole
   const done = listed.map((item) => `- ${item.line}`);
   const working = tasks.filter((task) => task.state === "working");
   const otherPrs = open.filter((pr) => !linked.has(pr.ref) && !pr.needsOwner);
-  const programLines = programs.map((program) => `- ${program.id} ${program.project ? `${program.project} · ` : ""}${programLine(program)}`);
+  const programLines = programs.map((program) => `- ${program.id} ${program.project ? `${program.project} · ` : ""}${programLine(program, input.now)}`);
   const inProgress = [
     ...programLines,
     ...working.map((task) => `- ${taskLine(task, input.now, ref, { prs: folded(task) })}`),
