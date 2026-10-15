@@ -19,11 +19,10 @@ const EPIC_URL = "https://github.com/Cyndra-AI/cyndra-saas/issues/2422";
 const capCtx = { threadId: "thr_cap", projectId: "proj_1" } as never;
 
 type SubIssue = { number: number; title: string; state: string; blockedBy: number[] };
-type Closed = number | { number: number; updated: string };
 
-/** Host commands answered like a host with gh: the epic, its sub-issues, and closed-issue lists,
- * a page of 100 at a time like the GitHub API. */
-function github(host: Host, closedSince: () => Closed[] = () => [], options: { subIssues?: SubIssue[]; fail?: () => boolean } = {}) {
+/** Host commands answered like a host with gh: the epic and its sub-issues a page of 100 at a time
+ * like the GitHub API, and the state of each ticket a query names. */
+function github(host: Host, closed: () => number[] = () => [], options: { subIssues?: SubIssue[]; fail?: () => boolean } = {}) {
   const subIssues = options.subIssues ?? epic.subIssues;
   const commands: string[] = [];
   const terminals = new Map<string, string>();
@@ -50,15 +49,14 @@ function github(host: Host, closedSince: () => Closed[] = () => [], options: { s
         const issue = subIssues.find((i) => i.number === Number(m[1]))!;
         return JSON.stringify({ repo: "Cyndra-AI/cyndra-saas", number: issue.number, blockedBy: issue.blockedBy.map((n) => ({ repo: "Cyndra-AI/cyndra-saas", number: n })) });
       }).join("\n");
-    } else if (command.includes("issues?state=closed")) {
+    } else if (command.includes("gh api graphql")) {
       if (options.fail?.()) {
         exitCode = 1;
       } else {
-        // Issues updated since the given time, oldest first.
-        const since = Date.parse(decodeURIComponent(command.match(/since=([^&]+)/)![1]!));
-        const items = closedSince().map((c) => typeof c === "number" ? { number: c, updated: new Date().toISOString() } : c)
-          .filter((c) => Date.parse(c.updated) >= since).sort((a, b) => Date.parse(a.updated) - Date.parse(b.updated));
-        stdout = page(command, items.map((c) => JSON.stringify({ number: c.number, pr: false, updated: c.updated }))).join("\n");
+        // One line per ticket the query names, with its real state.
+        const shut = new Set(closed());
+        stdout = [...command.matchAll(/issue\(number:(\d+)\)/g)].map((m) => Number(m[1]))
+          .map((n) => JSON.stringify({ repo: "Cyndra-AI/cyndra-saas", number: n, state: shut.has(n) ? "CLOSED" : "OPEN" })).join("\n");
       }
     }
     const payload = JSON.stringify({ protocol: "FM_HOST_CAPTURE_V1", exitCode, stdout, stderr: exitCode === 0 ? "" : "HTTP 502: Bad Gateway" });
@@ -193,7 +191,7 @@ test("bb firstmate program runs the same operations from the CLI", async () => {
   }
 });
 
-test("14 Oct repro: ready tickets with nothing running for 2 hours remind the captain once, and closed issues are read every 30 minutes", async () => {
+test("14 Oct repro: ready tickets with nothing running for 2 hours remind the captain once, and ticket states are read every 30 minutes", async () => {
   const host = await captainHost();
   try {
     let closed: number[] = [];
@@ -210,7 +208,7 @@ test("14 Oct repro: ready tickets with nothing running for 2 hours remind the ca
     assert.equal(sent.length, 1, "one reminder, not one per turn");
     assert.match(sent[0]!, /Program DM Pro epic \(P1\) has stalled: #2424, #2428 are ready and nothing has run for 3 h\./);
     assert.match(await board(host), /📌 Needs you \(1\)\n1\. P1 DM Pro epic: #2424, #2428 ready, nothing running for 3 h/);
-    assert.equal(commands.filter((c) => c.includes("issues?state=closed")).length, 1, "the closed-issue list is read once per 30 minutes");
+    assert.equal(commands.filter((c) => c.includes("gh api graphql")).length, 1, "ticket states are read once per 30 minutes");
 
     // Someone closes #2428 on GitHub: refresh reads it now and #2429 becomes ready.
     closed = [2428, 9999];
@@ -249,7 +247,7 @@ test("a failed GitHub read shows in the refresh result and on the board, with th
     fail = true;
     const refreshed = await program(host, { action: "refresh" });
     assert.match(text(refreshed), /^P1 DM Pro epic: 1\/20 done, 2 ready, 17 waiting on deps · GitHub read failed 0 min ago; ticket states are 45 min old/);
-    assert.match(text(refreshed), /GitHub read of closed issues in cyndra-ai\/cyndra-saas failed: HTTP 502: Bad Gateway/);
+    assert.match(text(refreshed), /GitHub read of ticket states failed: HTTP 502: Bad Gateway/);
     assert.equal(store.get("P1")!.checkedAt, back, "the next refresh reads the missed closures again");
     assert.match(await board(host), /- P1 Cyndra · DM Pro epic: 1\/20 done, 2 ready, 17 waiting on deps · GitHub read failed 0 min ago; ticket states are 45 min old$/m);
 
@@ -294,26 +292,21 @@ test("running needs a crew this captain has", async () => {
   }
 });
 
-test("sub-issues and closed issues are read page by page, up to 500 each", async () => {
+test("sub-issues are read page by page up to 500; refresh reads each open ticket's own state, however busy the repo", async () => {
   const many = (count: number): SubIssue[] => Array.from({ length: count }, (_, i) => ({ number: 3001 + i, title: `Ticket ${i + 1}`, state: "open", blockedBy: [] }));
   const host = await captainHost();
   try {
-    // A busy repo: 600 issues closed since the last read, the ticket last of all.
-    const back = Date.now() - 3 * 60 * 60_000;
-    const closed: Closed[] = [
-      ...Array.from({ length: 600 }, (_, i) => ({ number: 10_000 + i, updated: new Date(back + i * 1000).toISOString() })),
-      { number: 3150, updated: new Date(back + 600 * 1000).toISOString() },
-    ];
-    github(host, () => closed, { subIssues: many(150) });
+    // A busy repo: 600 other issues closed in the same minute as ticket #3150.
+    const closed = [...Array.from({ length: 600 }, (_, i) => 10_000 + i), 3150];
+    const commands = github(host, () => closed, { subIssues: many(150) });
     assert.match(text(await createEpic(host)), /^Program P1 is open/);
     const store = createPrograms(host.bb.storage.database());
     assert.equal(store.get("P1")!.tickets.length, 150);
-    store.update("P1", "thr_cap", (p) => ({ ...p, checkedAt: back }));
-    // The first refresh reads 500 issues and keeps its place; the next one reads on from there.
-    await program(host, { action: "refresh" });
-    assert.equal(store.get("P1")!.tickets.find((t) => t.ref === "cyndra-ai/cyndra-saas#3150")!.state.kind, "ready");
     await program(host, { action: "refresh" });
     assert.equal(store.get("P1")!.tickets.find((t) => t.ref === "cyndra-ai/cyndra-saas#3150")!.state.kind, "done");
+    const reads = commands.filter((c) => c.includes("gh api graphql"));
+    assert.equal(reads.length, 2, "150 tickets are two queries of at most 100");
+    assert.equal(reads.flatMap((c) => [...c.matchAll(/issue\(number:/g)]).length, 150, "each open ticket is read, and nothing else");
   } finally {
     await host.harness.lifecycle.dispose();
   }
