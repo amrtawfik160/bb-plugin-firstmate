@@ -1,6 +1,7 @@
 import { ASK_KIND_EMOJI, clip, formatAge, formatUtcTime, recommendedLabel, type OwnerAsk } from "./owner-asks.ts";
 import { isOpenTask, linkedPrs, STALE_TASK_MS, type OwnerTask } from "./owner-tasks.ts";
 import { boardPullRequests, type BoardPr, type DeliveryRecord } from "./pr-delivery.ts";
+import { isOpenProgram, programLine, programNeedsOwner, type Program } from "./programs.ts";
 
 /** What the owner's board and digest are drawn from. `tasks` includes closed tasks;
  * `records` holds the captain's open PRs and the ones merged since `since`. */
@@ -9,6 +10,8 @@ export type BoardInput = {
   calls: readonly string[];
   tasks: readonly OwnerTask[];
   records: readonly DeliveryRecord[];
+  /** The captain's programs; closed ones are left out. */
+  programs?: readonly Program[];
   since: number;
   now: number;
 };
@@ -85,7 +88,10 @@ function collect(input: BoardInput, ref: PrRef, listDone: (key: string) => boole
   const linked = new Set([...linkedTo.values()].flatMap((ids) => [...ids]));
   const open = boardPullRequests(input.records).sort((a, b) => a.openedAt - b.openedAt || a.ref.localeCompare(b.ref));
   const folded = (task: OwnerTask) => open.filter((pr) => linkedTo.get(task.id)!.has(pr.ref));
-  const tasks = [...input.tasks].sort(byNumber);
+  const programs = (input.programs ?? []).filter(isOpenProgram);
+  // An open program speaks for the owner task it holds: one line per program, not one per task.
+  const heldTasks = new Set(programs.flatMap((program) => program.taskId ? [program.taskId] : []));
+  const tasks = [...input.tasks].filter((task) => !heldTasks.has(task.id)).sort(byNumber);
   const asks = input.asks.filter((ask) => ask.state === "open").sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
   const waiting = tasks.filter((task) => task.state === "needs_you" || task.state === "ready" || task.state === "check");
   const ownerPrs = open.filter((pr) => !linked.has(pr.ref) && pr.needsOwner);
@@ -93,6 +99,7 @@ function collect(input: BoardInput, ref: PrRef, listDone: (key: string) => boole
     ...asks.map((ask) => askLine(ask, input.now)),
     ...input.calls.map((call) => clip(call, 160)),
     ...waiting.map((task) => taskLine(task, input.now, ref, { state: WAITING_WORDS[task.state], prs: folded(task) })),
+    ...programs.flatMap((program) => programNeedsOwner(program, input.now) ?? []),
     ...ownerPrs.map((pr) => prLine(pr, ref)),
   ].map((line, index) => `${index + 1}. ${line}`);
   const doneTasks = tasks.filter((task) => DONE_STATES.has(task.state) && !(task.state === "dropped" && /duplicate|merged into T\d+/i.test(task.dropReason ?? "")) && task.updatedAt >= input.since).sort((a, b) => b.updatedAt - a.updatedAt || byNumber(b, a));
@@ -106,7 +113,9 @@ function collect(input: BoardInput, ref: PrRef, listDone: (key: string) => boole
   const done = listed.map((item) => `- ${item.line}`);
   const working = tasks.filter((task) => task.state === "working");
   const otherPrs = open.filter((pr) => !linked.has(pr.ref) && !pr.needsOwner);
+  const programLines = programs.map((program) => `- ${program.id} ${program.project ? `${program.project} · ` : ""}${programLine(program, input.now)}`);
   const inProgress = [
+    ...programLines,
     ...working.map((task) => `- ${taskLine(task, input.now, ref, { prs: folded(task) })}`),
     ...(otherPrs.length > 0 ? [`Other PRs: ${otherPrs.map((pr) => `${ref(pr)} ${pr.state}`).join("; ")}`] : []),
   ];
@@ -117,7 +126,8 @@ function collect(input: BoardInput, ref: PrRef, listDone: (key: string) => boole
     done: { count: done.length, lines: done },
     finishedKeys: finished.map((item) => item.key),
     listedKeys: listed.map((item) => item.key),
-    inProgress: { count: working.length, lines: inProgress },
+    inProgress: { count: programs.length + working.length, lines: inProgress },
+    programs: { count: programs.length, lines: programLines },
     stale,
   };
 }
@@ -185,6 +195,8 @@ function digestText(facts: ReturnType<typeof collect>, showStale: boolean): stri
   const sections: Section[] = [
     { title: "Needs you", empty: "", cap: DIGEST_MAX_NEEDS_YOU, items: facts.needsYou },
     { title: "Done", empty: "", cap: BOARD_MAX_DONE, items: facts.done },
+    // An open program is listed in every digest until each ticket is done or dropped.
+    { title: "Programs", empty: "", cap: Infinity, items: facts.programs },
   ].filter((section) => section.items.count > 0);
   const blocks = [
     ...(sections.length > 0 ? [fit(sections, BOARD_MAX_CHARS)] : []),

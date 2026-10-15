@@ -4,6 +4,7 @@ import type { OwnerAsk } from "./owner-asks.ts";
 import { BOARD_MAX_CHARS, digestOnce, EMPTY_DIGEST_MEMORY, formatBoard, formatDigest, type BoardInput } from "./owner-board.ts";
 import type { OwnerTask } from "./owner-tasks.ts";
 import type { DeliveryRecord } from "./pr-delivery.ts";
+import { buildProgram, ticketRef, type Program } from "./programs.ts";
 
 const NOW = Date.UTC(2026, 9, 7, 12, 0);
 const MIN = 60_000;
@@ -317,4 +318,32 @@ test("Oct 12 repro: an unchanged stale list is shown at most once per day", () =
   assert.equal(at(8, [...tasks, task("T120", { updatedAt: NOW - 30 * HOUR })]), "Stale (5): T108, T111, T115, T117, T120", "a changed list is shown");
   assert.equal(at(10, [...tasks, task("T120", { updatedAt: NOW - 30 * HOUR })]), "");
   assert.equal(at(33, [...tasks, task("T120", { updatedAt: NOW - 30 * HOUR })]), "Stale (5): T108, T111, T115, T117, T120", "the same list returns after a day");
+});
+
+const dmProProgram = (over: Partial<Program> = {}): Program => buildProgram("P1", {
+  captain: "thr_cap", project: "Cyndra", title: "DM Pro epic", source: "https://github.com/Cyndra-AI/cyndra-saas/issues/2422", sourceRefs: [], taskId: "T180", at: NOW - 13 * HOUR,
+  issues: [
+    { ref: ticketRef("cyndra-ai/cyndra-saas#2423")!, title: "Manifest", closed: true, blockedBy: [] },
+    { ref: ticketRef("cyndra-ai/cyndra-saas#2424")!, title: "Catalog", closed: false, blockedBy: [ticketRef("cyndra-ai/cyndra-saas#2423")!] },
+    { ref: ticketRef("cyndra-ai/cyndra-saas#2425")!, title: "Executor", closed: false, blockedBy: [ticketRef("cyndra-ai/cyndra-saas#2424")!] },
+  ],
+}).program;
+
+test("an open program is one line on the board and in every digest, in place of the owner task it holds", () => {
+  const view = input({ programs: [dmProProgram()], tasks: [task("T180", { title: "DM Pro epic" }), task("T9", { title: "Other work" })] });
+  const board = formatBoard(view);
+  assert.match(board, /🔧 In progress \(2\)\n- P1 Cyndra · DM Pro epic: 1\/3 done, 1 ready, 1 waiting on deps\n- T9 Other work/);
+  assert.doesNotMatch(board, /T180/);
+  // Nothing has run for 13 hours: the owner sees the stall under Needs you.
+  assert.match(board, /📌 Needs you \(1\)\n1\. P1 DM Pro epic: #2424 ready, nothing running for 13 h/);
+  const digest = digestOnce(view, EMPTY_DIGEST_MEMORY);
+  assert.match(digest.text, /Needs you \(1\)\n1\. P1 DM Pro epic: #2424 ready/);
+  assert.match(digest.text, /Programs \(1\)\n- P1 Cyndra · DM Pro epic: 1\/3 done/);
+  assert.match(digestOnce(view, digest.memory).text, /Programs \(1\)/, "an open program is never 'already told'");
+});
+
+test("a closed program leaves the board and the digest", () => {
+  const closed = { ...dmProProgram(), tickets: dmProProgram().tickets.map((t) => ({ ...t, state: { kind: "done", proof: { by: "issue-closed" } } as const })) };
+  assert.doesNotMatch(formatBoard(input({ programs: [closed] })), /P1/);
+  assert.equal(formatDigest(input({ programs: [closed] })), "");
 });
