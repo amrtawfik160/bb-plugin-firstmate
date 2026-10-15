@@ -76,7 +76,7 @@ import { formatWorkersForTelegram } from "./lib/telegram-commands.ts";
 import { digestOnce, EMPTY_DIGEST_MEMORY, formatBoard, type BoardInput, type DigestMemory } from "./lib/owner-board.ts";
 import { createOwnerTasks, isOpenTask, sameProject, stateFromPrs, taskLine, type CrewFinish, type OwnerTask, type TaskState } from "./lib/owner-tasks.ts";
 import {
-  applyFact, createPrograms, dependenciesIn, epicTableDependencies, isOpenProgram, isOpenTicket, newlyReady, numberOf, programCounts, programText, readyRefs, readyWakeText, refsIn, repoOf,
+  buildProgram, createPrograms, epicTableDependencies, isOpenProgram, isOpenTicket, newlyReady, numberOf, programCounts, programText, readyRefs, readyWakeText, refsIn, repoOf,
   shortTicket, stallReminderDue, stallReminderText, ticketRef, type IssueFacts, type Program, type ProgramFact, type TicketRef,
 } from "./lib/programs.ts";
 import { askLetterAnswer, askIdFromSourceEventId, packAnswers, cardRepeat, clip, createOwnerAsks, formatAge, formatAskCard, formatUtcTime, mayDefault, CAPTAIN_RULES, OWNER_DECISION_RULE, ownerAskedForOptions, PLAIN_DECISION_GUIDANCE, plainTextDecision, recommendedLabel, type AskKind } from "./lib/owner-asks.ts";
@@ -5095,6 +5095,8 @@ export default async function plugin(bb: BbPluginApi) {
       const read = await readEpic(hostId, epic, signal);
       const title = input.title ?? read.title.replace(/^epic:\s*/i, "");
       const project = await projectLabel(projectId);
+      // Refuse a bad epic (no tickets, a dependency circle) before an owner task opens for it.
+      buildProgram("P0", { captain, project, title, source, sourceRefs, taskId: null, epicBody: read.body, issues: read.issues, at: now });
       const taskId = task?.id ?? ownerTasks.open({ captain, project, title, sourceRefs, at: now }).id;
       const { program, outside } = programs.create({ captain, project, title, source, sourceRefs: [...new Set([...sourceRefs, ...(task?.sourceRefs ?? [])])], taskId, epicBody: read.body, issues: read.issues, at: now });
       await refreshOwnerBoard();
