@@ -7726,7 +7726,7 @@ export default async function plugin(bb: BbPluginApi) {
     return lines.join("\n");
   }
 
-  async function guardForeignPr(crew: Crew, url: string, override: boolean, caller?:string): Promise<void> {
+  async function guardForeignPr(crew: Crew, url: string, override: boolean, caller?:string, headSha = ""): Promise<void> {
     if (override || url === "") return;
     const key = prKeyOf(url) ?? url;
     const hit = await foreignPrOwner(
@@ -7735,6 +7735,9 @@ export default async function plugin(bb: BbPluginApi) {
       {ids:[key],numbers:[]},
     );
     if (hit !== null) {
+      // A crew of the same captain (a release crew) may land it once its current head is verified.
+      const actor = caller ? await findCrewByThread(caller) : undefined;
+      if (actor !== undefined && actor.parentThreadId === hit.owner && headSha !== "" && deliveries.get(key)?.verifiedCommitSha === headSha) return;
       throw new Error(
         `Refusing: ${url} is the PR of crew ${hit.crew.id}, owned by ${hit.owner ? `captain @thread:${hit.owner}` : "an unassigned manager"}. Coordinate with that captain before landing it, or pass overrideOwner=true (--override-owner) when the captain told you to.`,
       );
@@ -7791,7 +7794,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (pr === null) {
         throw new Error(`No PR for crew ${crew.id}: BB's environment has none, none is recorded, gh finds none for its branch, and its report names none.`);
       }
-      await guardForeignPr(crew, pr.url, override,opts.caller);
+      await guardForeignPr(crew, pr.url, override,opts.caller, pr.headSha);
       let waived = "";
       if (pr.state !== "merged") {
         const verification = requireVerification(pr, opts.allowUnverified, opts.caller ?? crew.parentThreadId ?? "");
@@ -7846,7 +7849,7 @@ export default async function plugin(bb: BbPluginApi) {
       throw new Error("Refusing: this BB merge path cannot verify required check contexts; --allow-missing is supported only through the native PR merge gate.");
     }
     await rememberPrUrl(crew, f.url);
-    await guardForeignPr(crew, f.url, override,opts.caller);
+    await guardForeignPr(crew, f.url, override,opts.caller, target?.headSha);
     if (f.state === "merged") {
       await settle("merged (already landed)", f.url);
       return `Already merged: ${landedLine}\n${keep ? kept : `Crew ${crew.id} retired.`}`;
