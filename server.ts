@@ -4907,12 +4907,12 @@ export default async function plugin(bb: BbPluginApi) {
   // here Firstmate feeds it the facts it already has and tells the captain what changed.
   const PROGRAM_ISSUE_CHECK_MS = 30 * 60_000;
   const PROGRAM_MAX_FETCHED_ISSUES = 40;
-  // GitHub lists come 100 to a page; a program reads at most 5 pages (500 issues) of one list.
+  // GitHub lists come 100 to a page; a program reads at most 5 pages (500 sub-issues) of an epic.
   const PROGRAM_PAGE = 100;
   const PROGRAM_MAX_PAGES = 5;
   const PROGRAM_MAX_LISTED = PROGRAM_PAGE * PROGRAM_MAX_PAGES;
   const ghSubIssueSchema = z.object({ number: z.number(), title: z.string(), state: z.string(), repo: z.string(), blockers: z.number() });
-  const ghClosedSchema = z.object({ number: z.number(), pr: z.boolean(), updated: z.string() });
+  const ghTicketStateSchema = z.object({ repo: z.string(), number: z.number(), state: z.string() });
   const ghBlockersSchema = z.object({ repo: z.string(), number: z.number(), blockedBy: z.array(z.object({ repo: z.string(), number: z.number() })) });
   const jsonLines = (output: string) => output.split("\n").map((line) => line.trim()).filter((line) => line.startsWith("{")).map((line) => JSON.parse(line) as unknown);
 
@@ -4955,28 +4955,25 @@ export default async function plugin(bb: BbPluginApi) {
     return { title, issues };
   }
 
-  /** Ticket issues closed since `since`, oldest update first, one REST call per page of 100. A repo with more
-   * than 500 is read up to its 500th issue: `readTo` is that issue's update time, where the next read goes on. */
-  async function closedTickets(hostId: string, program: Program, since: number, signal?: AbortSignal): Promise<{ closed: Set<TicketRef>; readTo: number | null }> {
+  /** The program's open tickets that are closed on GitHub: one GraphQL query per 100 tickets, each its own host command. */
+  async function closedTickets(hostId: string, program: Program, signal?: AbortSignal): Promise<Set<TicketRef>> {
     const open = program.tickets.filter(isOpenTicket).map((ticket) => ticket.ref);
-    const repos = [...new Set(open.map(repoOf))];
     const closed = new Set<TicketRef>();
-    let readTo: number | null = null;
-    for (const repo of repos) {
-      for (let page = 1; page <= PROGRAM_MAX_PAGES; page++) {
-        const url = `repos/${repo}/issues?state=closed&since=${new Date(since).toISOString()}&sort=updated&direction=asc&per_page=${PROGRAM_PAGE}&page=${page}`;
-        const res = await runStructuredOnHost(hostId, `gh api ${shQuote(url)} --jq '.[]|{number,pr:(.pull_request!=null),updated:.updated_at}|tojson'`, 60_000, signal);
-        if (res.exitCode !== 0) throw new Error(`GitHub read of closed issues in ${repo} failed: ${(res.stderr || res.output).trim().slice(0, 300)}`);
-        const rows = jsonLines(res.output).map((row) => ghClosedSchema.parse(row));
-        for (const row of rows) {
-          const ref = row.pr ? null : ticketRef(`${repo}#${row.number}`);
-          if (ref !== null && open.includes(ref)) closed.add(ref);
-        }
-        if (rows.length < PROGRAM_PAGE) break;
-        if (page === PROGRAM_MAX_PAGES) readTo = Math.min(readTo ?? Infinity, Date.parse(rows.at(-1)!.updated));
+    for (let i = 0; i < open.length; i += PROGRAM_PAGE) {
+      const byRepo = new Map<string, TicketRef[]>();
+      for (const ref of open.slice(i, i + PROGRAM_PAGE)) byRepo.set(repoOf(ref), [...(byRepo.get(repoOf(ref)) ?? []), ref]);
+      const query = [...byRepo].map(([repo, refs], r) => {
+        const [owner, name] = repo.split("/");
+        return `r${r}:repository(owner:${JSON.stringify(owner)},name:${JSON.stringify(name)}){nameWithOwner ${refs.map((ref) => `i${numberOf(ref)}:issue(number:${numberOf(ref)}){number state}`).join(" ")}}`;
+      }).join(" ");
+      const jq = `.data[]|.nameWithOwner as $repo|to_entries[]|select(.key!="nameWithOwner")|.value|{repo:$repo,number,state}|tojson`;
+      const res = await runStructuredOnHost(hostId, `gh api graphql -f query=${shQuote(`{${query}}`)} --jq ${shQuote(jq)}`, 60_000, signal);
+      if (res.exitCode !== 0) throw new Error(`GitHub read of ticket states failed: ${(res.stderr || res.output).trim().slice(0, 300)}`);
+      for (const row of jsonLines(res.output).map((line) => ghTicketStateSchema.parse(line))) {
+        if (row.state === "CLOSED") closed.add(ticketRef(`${row.repo}#${row.number}`)!);
       }
     }
-    return { closed, readTo };
+    return closed;
   }
 
   const prKey = (pr: string) => /^[\w.-]+\/[\w.-]+#\d+$/.test(pr.trim()) ? pr.trim().toLowerCase() : canonicalPr(pr).id;
@@ -5061,15 +5058,14 @@ export default async function plugin(bb: BbPluginApi) {
       if (options.checkIssues === true || now - program.checkedAt >= PROGRAM_ISSUE_CHECK_MS) {
         try {
           const hostId = await resolveHostId(undefined, { threadId: captain });
-          // A small overlap so an issue closed during the last read is not missed.
-          const { closed, readTo } = await closedTickets(hostId, program, program.checkedAt - 5 * 60_000, options.signal);
+          const closed = await closedTickets(hostId, program, options.signal);
           program = applyEach(program, [...closed].map((ticket) => ({ kind: "issue-closed", ticket }) as const), now);
-          program = programs.update(program.id, captain, (p) => ({ ...p, checkedAt: readTo ?? now, checkFailure: null }));
+          program = programs.update(program.id, captain, (p) => ({ ...p, checkedAt: now, checkFailure: null }));
         } catch (error) {
           if (options.signal?.aborted) throw error;
           const message = error instanceof Error ? error.message : String(error);
           bb.log.warn(`program ${program.id} issue check: ${message}`);
-          // checkedAt stays, so the next read covers the closures this one missed; the board shows the failure.
+          // checkedAt stays, so the board shows how old the ticket states are.
           program = programs.update(program.id, captain, (p) => ({ ...p, checkFailure: { at: now, error: message.slice(0, 300) } }));
         }
       }

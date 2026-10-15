@@ -58,9 +58,9 @@ export interface Program {
   /** The last time a ticket entered or left running or in review. */
   lastActiveAt: number;
   remindedAt: number | null;
-  /** The last time closed issues were read from GitHub. */
+  /** The last time ticket states were read from GitHub. */
   checkedAt: number;
-  /** The last read of closed issues failed, and no read has worked since. Absent on older records. */
+  /** The last read of ticket states failed, and no read has worked since. Absent on older records. */
   checkFailure?: { at: number; error: string } | null;
   createdAt: number;
   updatedAt: number;
