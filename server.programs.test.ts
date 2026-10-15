@@ -18,32 +18,50 @@ const epic = JSON.parse(readFileSync(new URL("./test/fixtures/dmpro-epic-2422.js
 const EPIC_URL = "https://github.com/Cyndra-AI/cyndra-saas/issues/2422";
 const capCtx = { threadId: "thr_cap", projectId: "proj_1" } as never;
 
-/** Host commands answered like a host with gh: the epic, its sub-issues, and closed-issue lists. */
-function github(host: Host, closedSince: () => number[] = () => []) {
+type SubIssue = { number: number; title: string; state: string; blockedBy: number[] };
+type Closed = number | { number: number; updated: string };
+
+/** Host commands answered like a host with gh: the epic, its sub-issues, and closed-issue lists,
+ * a page of 100 at a time like the GitHub API. */
+function github(host: Host, closedSince: () => Closed[] = () => [], options: { subIssues?: SubIssue[]; fail?: () => boolean } = {}) {
+  const subIssues = options.subIssues ?? epic.subIssues;
   const commands: string[] = [];
   const terminals = new Map<string, string>();
   let n = 0;
+  const page = (command: string, items: string[]) => {
+    const at = Number(command.match(/[?&]page=(\d+)/)?.[1] ?? 1);
+    return items.slice((at - 1) * 100, at * 100);
+  };
   host.harness.sdk.stub("terminals.create", async (args: { start: { command: string } }) => { const id = `term${++n}`; terminals.set(id, args.start.command); commands.push(args.start.command); return { id }; });
   host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
   host.harness.sdk.stub("terminals.close", async () => ({}));
   host.harness.sdk.stub("terminals.output", async ({ terminalId }: { terminalId: string }) => {
     const command = terminals.get(terminalId)!;
     let stdout = "";
+    let exitCode = 0;
     if (command.includes("sub_issues")) {
       stdout = [
-        JSON.stringify({ title: epic.epic.title }),
-        ...epic.subIssues.map((issue) => JSON.stringify({ number: issue.number, title: issue.title, state: issue.state, repo: "Cyndra-AI/cyndra-saas", blockers: issue.blockedBy.length })),
+        ...(command.includes("{title}|tojson") ? [JSON.stringify({ title: epic.epic.title })] : []),
+        ...page(command, subIssues.map((issue) => JSON.stringify({ number: issue.number, title: issue.title, state: issue.state, repo: "Cyndra-AI/cyndra-saas", blockers: issue.blockedBy.length }))),
       ].join("\n");
     } else if (command.includes("dependencies/blocked_by")) {
       // One gh call per blocked issue; each prints one line.
       stdout = [...command.matchAll(/issues\/(\d+)\/dependencies\/blocked_by/g)].map((m) => {
-        const issue = epic.subIssues.find((i) => i.number === Number(m[1]))!;
+        const issue = subIssues.find((i) => i.number === Number(m[1]))!;
         return JSON.stringify({ repo: "Cyndra-AI/cyndra-saas", number: issue.number, blockedBy: issue.blockedBy.map((n) => ({ repo: "Cyndra-AI/cyndra-saas", number: n })) });
       }).join("\n");
     } else if (command.includes("issues?state=closed")) {
-      stdout = closedSince().join("\n");
+      if (options.fail?.()) {
+        exitCode = 1;
+      } else {
+        // Issues updated since the given time, oldest first.
+        const since = Date.parse(decodeURIComponent(command.match(/since=([^&]+)/)![1]!));
+        const items = closedSince().map((c) => typeof c === "number" ? { number: c, updated: new Date().toISOString() } : c)
+          .filter((c) => Date.parse(c.updated) >= since).sort((a, b) => Date.parse(a.updated) - Date.parse(b.updated));
+        stdout = page(command, items.map((c) => JSON.stringify({ number: c.number, pr: false, updated: c.updated }))).join("\n");
+      }
     }
-    const payload = JSON.stringify({ protocol: "FM_HOST_CAPTURE_V1", exitCode: 0, stdout, stderr: "" });
+    const payload = JSON.stringify({ protocol: "FM_HOST_CAPTURE_V1", exitCode, stdout, stderr: exitCode === 0 ? "" : "HTTP 502: Bad Gateway" });
     return { nextSeq: 1, chunks: [{ dataBase64: Buffer.from(`${payload}\n__FM_HOST_RC:0\n`).toString("base64") }] };
   });
   return commands;
@@ -125,7 +143,7 @@ test("a merged PR closes the ticket and the captain gets one wake naming the tic
   try {
     github(host);
     await program(host, { action: "create", epic: EPIC_URL, title: "DM Pro epic", refs: ["tg:985604794:4404"] });
-    await program(host, { action: "set", id: "P1", tickets: ["#2424"], state: "running", crewId: "dmpro-2424" });
+    await tool(host, "firstmate_dispatch").execute({ projectId: "proj_1", task: "Build the plugin catalog", taskId: "dmpro-2424", ticket: "#2424", origin: { kind: "captain", reason: "program ticket" } }, capCtx);
     const deliveries = createDeliveries(host.bb.storage.database());
     deliveries.register({ url: "https://github.com/Cyndra-AI/cyndra-saas/pull/2450", taskId: "dmpro-2424", projectId: "proj_1", owner: "thr_cap", home: "", requirement: "merged" } as never);
     const record = deliveries.get("cyndra-ai/cyndra-saas#2450")!;
@@ -202,5 +220,110 @@ test("14 Oct repro: ready tickets with nothing running for 2 hours remind the ca
     assert.match(wakes(host).at(-1)!, /ticket #2429 is ready; dispatch it\./);
   } finally {
     await host.harness.lifecycle.dispose();
+  }
+});
+
+const createEpic = (host: Host) => program(host, { action: "create", epic: EPIC_URL, title: "DM Pro epic", refs: ["tg:985604794:4404"] });
+
+test("two refreshes at the same time send one wake for a ticket that became ready", async () => {
+  const host = await captainHost();
+  try {
+    github(host, () => [2428]);
+    await createEpic(host);
+    await Promise.all([program(host, { action: "refresh" }), program(host, { action: "refresh" })]);
+    assert.equal(wakes(host).filter((wake) => wake.includes("#2429")).length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a failed GitHub read shows in the refresh result and on the board, with the age of the data", async () => {
+  const host = await captainHost();
+  try {
+    let fail = false;
+    github(host, () => [], { fail: () => fail });
+    await createEpic(host);
+    const store = createPrograms(host.bb.storage.database());
+    const back = Date.now() - 45 * 60_000;
+    store.update("P1", "thr_cap", (p) => ({ ...p, checkedAt: back }));
+    fail = true;
+    const refreshed = await program(host, { action: "refresh" });
+    assert.match(text(refreshed), /^P1 DM Pro epic: 1\/20 done, 2 ready, 17 waiting on deps · GitHub read failed 0 min ago; ticket states are 45 min old/);
+    assert.match(text(refreshed), /GitHub read of closed issues in cyndra-ai\/cyndra-saas failed: HTTP 502: Bad Gateway/);
+    assert.equal(store.get("P1")!.checkedAt, back, "the next refresh reads the missed closures again");
+    assert.match(await board(host), /- P1 Cyndra · DM Pro epic: 1\/20 done, 2 ready, 17 waiting on deps · GitHub read failed 0 min ago; ticket states are 45 min old$/m);
+
+    fail = false;
+    const recovered = text(await program(host, { action: "refresh" }));
+    assert.doesNotMatch(recovered, /failed/);
+    assert.match(recovered, /Ticket states read from GitHub 0 min ago\./);
+    assert.doesNotMatch(await board(host), /failed/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("an epic whose tickets are all closed closes its program and owner task at once", async () => {
+  const host = await captainHost();
+  try {
+    github(host, () => [], { subIssues: epic.subIssues.map((issue) => ({ ...issue, state: "closed" })) });
+    const created = text(await createEpic(host));
+    assert.match(created, /Program P1 is closed; owner task T1 is done\./);
+    assert.equal(createOwnerTasks(host.bb.storage.database()).get("T1")!.state, "done");
+    assert.equal(text(await program(host, { action: "list" })), "No program is open.");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("running needs a crew this captain has", async () => {
+  const host = await captainHost();
+  try {
+    github(host);
+    await createEpic(host);
+    const refused = await program(host, { action: "set", id: "P1", tickets: ["#2424"], state: "running", crewId: "nonexistent-crew" });
+    assert.ok(isError(refused));
+    assert.match(text(refused), /No crew nonexistent-crew for this captain\./);
+    assert.equal(createPrograms(host.bb.storage.database()).get("P1")!.tickets.find((t) => t.ref === "cyndra-ai/cyndra-saas#2424")!.state.kind, "ready");
+    await tool(host, "firstmate_dispatch").execute({ projectId: "proj_1", task: "Build the plugin catalog", taskId: "dmpro-2424", origin: { kind: "captain", reason: "program ticket" } }, capCtx);
+    const running = await program(host, { action: "set", id: "P1", tickets: ["#2424"], state: "running", crewId: "dmpro-2424" });
+    assert.ok(!isError(running), text(running));
+    assert.match(text(running), /- #2424 .* — running crew dmpro-2424/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("sub-issues and closed issues are read page by page, up to 500 each", async () => {
+  const many = (count: number): SubIssue[] => Array.from({ length: count }, (_, i) => ({ number: 3001 + i, title: `Ticket ${i + 1}`, state: "open", blockedBy: [] }));
+  const host = await captainHost();
+  try {
+    // A busy repo: 600 issues closed since the last read, the ticket last of all.
+    const back = Date.now() - 3 * 60 * 60_000;
+    const closed: Closed[] = [
+      ...Array.from({ length: 600 }, (_, i) => ({ number: 10_000 + i, updated: new Date(back + i * 1000).toISOString() })),
+      { number: 3150, updated: new Date(back + 600 * 1000).toISOString() },
+    ];
+    github(host, () => closed, { subIssues: many(150) });
+    assert.match(text(await createEpic(host)), /^Program P1 is open/);
+    const store = createPrograms(host.bb.storage.database());
+    assert.equal(store.get("P1")!.tickets.length, 150);
+    store.update("P1", "thr_cap", (p) => ({ ...p, checkedAt: back }));
+    // The first refresh reads 500 issues and keeps its place; the next one reads on from there.
+    await program(host, { action: "refresh" });
+    assert.equal(store.get("P1")!.tickets.find((t) => t.ref === "cyndra-ai/cyndra-saas#3150")!.state.kind, "ready");
+    await program(host, { action: "refresh" });
+    assert.equal(store.get("P1")!.tickets.find((t) => t.ref === "cyndra-ai/cyndra-saas#3150")!.state.kind, "done");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+  const big = await captainHost();
+  try {
+    github(big, () => [], { subIssues: many(501) });
+    const refused = await createEpic(big);
+    assert.ok(isError(refused));
+    assert.match(text(refused), /has more than 500 sub-issues; a program reads at most 500\. Split the epic\./);
+  } finally {
+    await big.harness.lifecycle.dispose();
   }
 });
