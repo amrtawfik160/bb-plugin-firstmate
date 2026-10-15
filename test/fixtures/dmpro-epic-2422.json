@@ -1,0 +1,129 @@
+{
+ "epic": {
+  "number": 2422,
+  "title": "Epic: DM Pro plugin, a native Cyndra rebuild (X lead lists, DM campaigns, replies)",
+  "table": "| Issue | Estimate | Blocked by | Label |\n|---|---|---|---|\n| #2423 Plugins: manifest, registry and dashboard parity check | 2 d | none | ready-for-agent |\n| #2424 Plugins: catalog page and install / uninstall lifecycle with outreach terms | 3 d | #2423 | ready-for-agent |\n| #2425 Plugins: attach to an agent and run plugin actions through one executor on both proxy wires | 4 d | #2423, #2424 | ready-for-agent |\n| #2426 Plugins: dashboard frame, routes and the agent Plugins tab | 3 d | #2424, #2425 | ready-for-agent |\n| #2427 Plugins: billing hook (add-on entitlement, suspend on lapse, usage to credits) | 3 d | #2424 | needs-triage |\n| #2428 DM Pro: X worker spike (X client library, worker hosts, egress, session sealing) | 2 d | none | needs-triage |\n| #2429 DM Pro: X worker fleet and Convex job queue with leases | 4 d | #2428 | needs-triage |\n| #2430 DM Pro: connect an X account with a sealed session (Accounts screen) | 4 d | #2426, #2429 | ready-for-agent |\n| #2431 DM Pro: lead lists with CSV import and single add | 3 d | #2430 | ready-for-agent |\n| #2432 DM Pro: lead search on X (people search, followers, repliers) with an estimate first | 4 d | #2431, #2427 | ready-for-agent |\n| #2433 DM Pro: send one DM with approval, plus the Sent DMs screen | 3 d | #2430, #2425 | ready-for-agent |\n| #2434 DM Pro: campaign drafts (steps, messages, leads, accounts) | 3 d | #2431 | ready-for-agent |\n| #2435 DM Pro: campaign approval and locked campaign version | 3 d | #2434, #2425 | ready-for-agent |\n| #2436 DM Pro: replies inbox (sync, Replies screen, reply with approval) | 4 d | #2433 | ready-for-agent |\n| #2437 DM Pro: campaign sending with caps, warm-up ramp, active hours, pacing and auto-pause | 5 d | #2433, #2435, #2436 | needs-triage |\n| #2438 DM Pro: reply events start agent turns (notify or draft for approval) | 3 d | #2436, #2425 | needs-triage |\n| #2439 DM Pro: analytics (Overview screen and stats tool) | 2 d | #2437, #2436 | ready-for-agent |\n| #2440 DM Pro: agent skill and end-to-end success test | 2 d | #2432, #2437, #2438 | ready-for-agent |\n| #2441 DM Pro: audit, observability and admin safety controls | 3 d | #2437 | ready-for-agent |\n| #2442 DM Pro: uninstall and data retention | 2 d | #2430, #2437, #2424 | needs-triage |"
+ },
+ "subIssues": [
+  {
+   "number": 2423,
+   "title": "Plugins: manifest, registry and dashboard parity check",
+   "state": "closed",
+   "body": "## Blocked by\n- None (can start immediately)"
+  },
+  {
+   "number": 2424,
+   "title": "Plugins: catalog page and install / uninstall lifecycle with outreach terms",
+   "state": "open",
+   "body": "Blocked by: #2423\n## Blocked by\n- #2423"
+  },
+  {
+   "number": 2425,
+   "title": "Plugins: attach to an agent and run plugin actions through one executor on both proxy wires",
+   "state": "open",
+   "body": "Blocked by: #2423, #2424\n## Blocked by\n- #2423\n- #2424"
+  },
+  {
+   "number": 2426,
+   "title": "Plugins: dashboard frame, routes and the agent Plugins tab",
+   "state": "open",
+   "body": "Blocked by: #2424, #2425\n## Blocked by\n- #2424\n- #2425"
+  },
+  {
+   "number": 2427,
+   "title": "Plugins: billing hook (add-on entitlement, suspend on lapse, usage to credits)",
+   "state": "open",
+   "body": "Blocked by: #2424\n## Blocked by\n- #2424"
+  },
+  {
+   "number": 2428,
+   "title": "DM Pro: X worker spike (X client library, worker hosts, egress, session sealing)",
+   "state": "open",
+   "body": "## Blocked by\n- None (can start immediately)"
+  },
+  {
+   "number": 2429,
+   "title": "DM Pro: X worker fleet and Convex job queue with leases",
+   "state": "open",
+   "body": "Blocked by: #2428\n## Blocked by\n- #2428"
+  },
+  {
+   "number": 2430,
+   "title": "DM Pro: connect an X account with a sealed session (Accounts screen)",
+   "state": "open",
+   "body": "Blocked by: #2426, #2429\n## Blocked by\n- #2426\n- #2429"
+  },
+  {
+   "number": 2431,
+   "title": "DM Pro: lead lists with CSV import and single add",
+   "state": "open",
+   "body": "Blocked by: #2430\n## Blocked by\n- #2430"
+  },
+  {
+   "number": 2432,
+   "title": "DM Pro: lead search on X (people search, followers, repliers) with an estimate first",
+   "state": "open",
+   "body": "Blocked by: #2431, #2427\n## Blocked by\n- #2431\n- #2427"
+  },
+  {
+   "number": 2433,
+   "title": "DM Pro: send one DM with approval, plus the Sent DMs screen",
+   "state": "open",
+   "body": "Blocked by: #2430, #2425\n## Blocked by\n- #2430\n- #2425"
+  },
+  {
+   "number": 2434,
+   "title": "DM Pro: campaign drafts (steps, messages, leads, accounts)",
+   "state": "open",
+   "body": "Blocked by: #2431\n## Blocked by\n- #2431"
+  },
+  {
+   "number": 2435,
+   "title": "DM Pro: campaign approval and locked campaign version",
+   "state": "open",
+   "body": "Blocked by: #2434, #2425\n## Blocked by\n- #2434\n- #2425"
+  },
+  {
+   "number": 2436,
+   "title": "DM Pro: replies inbox (sync, Replies screen, reply with approval)",
+   "state": "open",
+   "body": "Blocked by: #2433\n## Blocked by\n- #2433"
+  },
+  {
+   "number": 2437,
+   "title": "DM Pro: campaign sending with caps, warm-up ramp, active hours, pacing and auto-pause",
+   "state": "open",
+   "body": "Blocked by: #2433, #2435, #2436\n## Blocked by\n- #2433\n- #2435\n- #2436"
+  },
+  {
+   "number": 2438,
+   "title": "DM Pro: reply events start agent turns (notify or draft for approval)",
+   "state": "open",
+   "body": "Blocked by: #2436, #2425\n## Blocked by\n- #2436\n- #2425"
+  },
+  {
+   "number": 2439,
+   "title": "DM Pro: analytics (Overview screen and stats tool)",
+   "state": "open",
+   "body": "Blocked by: #2437, #2436\n## Blocked by\n- #2437\n- #2436"
+  },
+  {
+   "number": 2440,
+   "title": "DM Pro: agent skill and end-to-end success test",
+   "state": "open",
+   "body": "Blocked by: #2432, #2437, #2438\n## Blocked by\n- #2432\n- #2437\n- #2438"
+  },
+  {
+   "number": 2441,
+   "title": "DM Pro: audit, observability and admin safety controls",
+   "state": "open",
+   "body": "Blocked by: #2437\n## Blocked by\n- #2437"
+  },
+  {
+   "number": 2442,
+   "title": "DM Pro: uninstall and data retention",
+   "state": "open",
+   "body": "Blocked by: #2430, #2437, #2424\n## Blocked by\n- #2430\n- #2437\n- #2424"
+  }
+ ]
+}
