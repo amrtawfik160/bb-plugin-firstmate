@@ -4912,7 +4912,11 @@ export default async function plugin(bb: BbPluginApi) {
   const PROGRAM_MAX_PAGES = 5;
   const PROGRAM_MAX_LISTED = PROGRAM_PAGE * PROGRAM_MAX_PAGES;
   const ghSubIssueSchema = z.object({ number: z.number(), title: z.string(), state: z.string(), repo: z.string(), blockers: z.number() });
-  const ghTicketStateSchema = z.object({ repo: z.string(), number: z.number(), state: z.string() });
+  // gh prints the whole GraphQL response, also when it exits 1 on an error.
+  const ghTicketStatesSchema = z.object({
+    data: z.record(z.string(), z.record(z.string(), z.object({ state: z.string() }).nullable()).nullable()).optional(),
+    errors: z.array(z.object({ type: z.string().optional(), path: z.array(z.unknown()).optional() })).optional(),
+  });
   const ghBlockersSchema = z.object({ repo: z.string(), number: z.number(), blockedBy: z.array(z.object({ repo: z.string(), number: z.number() })) });
   const jsonLines = (output: string) => output.split("\n").map((line) => line.trim()).filter((line) => line.startsWith("{")).map((line) => JSON.parse(line) as unknown);
 
@@ -4955,25 +4959,33 @@ export default async function plugin(bb: BbPluginApi) {
     return { title, issues };
   }
 
-  /** The program's open tickets that are closed on GitHub: one GraphQL query per 100 tickets, each its own host command. */
-  async function closedTickets(hostId: string, program: Program, signal?: AbortSignal): Promise<Set<TicketRef>> {
+  /** The program's open tickets that are closed on GitHub, and those GitHub has no issue for (deleted, or a PR):
+   * one GraphQL query per 100 tickets, each its own host command. */
+  async function closedTickets(hostId: string, program: Program, signal?: AbortSignal): Promise<{ closed: Set<TicketRef>; unreadable: TicketRef[] }> {
     const open = program.tickets.filter(isOpenTicket).map((ticket) => ticket.ref);
     const closed = new Set<TicketRef>();
+    const unreadable: TicketRef[] = [];
     for (let i = 0; i < open.length; i += PROGRAM_PAGE) {
       const byRepo = new Map<string, TicketRef[]>();
       for (const ref of open.slice(i, i + PROGRAM_PAGE)) byRepo.set(repoOf(ref), [...(byRepo.get(repoOf(ref)) ?? []), ref]);
       const query = [...byRepo].map(([repo, refs], r) => {
         const [owner, name] = repo.split("/");
-        return `r${r}:repository(owner:${JSON.stringify(owner)},name:${JSON.stringify(name)}){nameWithOwner ${refs.map((ref) => `i${numberOf(ref)}:issue(number:${numberOf(ref)}){number state}`).join(" ")}}`;
+        return `r${r}:repository(owner:${JSON.stringify(owner)},name:${JSON.stringify(name)}){${refs.map((ref) => `i${numberOf(ref)}:issue(number:${numberOf(ref)}){state}`).join(" ")}}`;
       }).join(" ");
-      const jq = `.data[]|.nameWithOwner as $repo|to_entries[]|select(.key!="nameWithOwner")|.value|{repo:$repo,number,state}|tojson`;
-      const res = await runStructuredOnHost(hostId, `gh api graphql -f query=${shQuote(`{${query}}`)} --jq ${shQuote(jq)}`, 60_000, signal);
-      if (res.exitCode !== 0) throw new Error(`GitHub read of ticket states failed: ${(res.stderr || res.output).trim().slice(0, 300)}`);
-      for (const row of jsonLines(res.output).map((line) => ghTicketStateSchema.parse(line))) {
-        if (row.state === "CLOSED") closed.add(ticketRef(`${row.repo}#${row.number}`)!);
-      }
+      const res = await runStructuredOnHost(hostId, `gh api graphql -f query=${shQuote(`{${query}}`)}`, 60_000, signal);
+      const body = ghTicketStatesSchema.safeParse((() => { try { return JSON.parse(res.output); } catch { return undefined; } })());
+      // Only a missing issue is one ticket's problem; any other error (network, auth, a missing repo) fails the read.
+      const data = body.success && (res.exitCode === 0 || body.data.errors?.every((e) => e.type === "NOT_FOUND" && e.path?.length === 2)) ? body.data.data : undefined;
+      if (data === undefined) throw new Error(`GitHub read of ticket states failed: ${(res.stderr || res.output).trim().slice(0, 300)}`);
+      [...byRepo].forEach(([, refs], r) => {
+        for (const ref of refs) {
+          const issue = data[`r${r}`]?.[`i${numberOf(ref)}`];
+          if (!issue) unreadable.push(ref);
+          else if (issue.state === "CLOSED") closed.add(ref);
+        }
+      });
     }
-    return closed;
+    return { closed, unreadable };
   }
 
   const prKey = (pr: string) => /^[\w.-]+\/[\w.-]+#\d+$/.test(pr.trim()) ? pr.trim().toLowerCase() : canonicalPr(pr).id;
@@ -5058,9 +5070,9 @@ export default async function plugin(bb: BbPluginApi) {
       if (options.checkIssues === true || now - program.checkedAt >= PROGRAM_ISSUE_CHECK_MS) {
         try {
           const hostId = await resolveHostId(undefined, { threadId: captain });
-          const closed = await closedTickets(hostId, program, options.signal);
+          const { closed, unreadable } = await closedTickets(hostId, program, options.signal);
           program = applyEach(program, [...closed].map((ticket) => ({ kind: "issue-closed", ticket }) as const), now);
-          program = programs.update(program.id, captain, (p) => ({ ...p, checkedAt: now, checkFailure: null }));
+          program = programs.update(program.id, captain, (p) => ({ ...p, checkedAt: now, checkFailure: null, unreadable }));
         } catch (error) {
           if (options.signal?.aborted) throw error;
           const message = error instanceof Error ? error.message : String(error);

@@ -62,6 +62,8 @@ export interface Program {
   checkedAt: number;
   /** The last read of ticket states failed, and no read has worked since. Absent on older records. */
   checkFailure?: { at: number; error: string } | null;
+  /** Tickets the last read found no issue for (deleted, or a PR); they keep their state. Absent on older records. */
+  unreadable?: TicketRef[];
   createdAt: number;
   updatedAt: number;
 }
@@ -287,7 +289,8 @@ export function programLine(program: Program, now: number): string {
     c.dropped > 0 ? `${c.dropped} dropped` : "",
   ].filter((part) => part !== "");
   const failure = program.checkFailure ? ` · GitHub read failed ${formatAge(now - program.checkFailure.at)} ago; ticket states are ${formatAge(now - program.checkedAt)} old` : "";
-  return `${clip(program.title, 50)}: ${parts.join(", ")}${failure}`;
+  const unreadable = program.unreadable?.length ? ` · GitHub cannot read ${program.unreadable.map((ref) => shortTicket(program, ref)).join(", ")} (deleted, or not an issue); its state is kept` : "";
+  return `${clip(program.title, 50)}: ${parts.join(", ")}${failure}${unreadable}`;
 }
 
 /** What the owner must act on in a program, or null: a stall past two hours, or a ticket blocked on
