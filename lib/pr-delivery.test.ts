@@ -127,7 +127,7 @@ function boardAfter(...answers: Record<string, unknown>[]): { board: string; sto
   return { store, board: boardOf(store) };
 }
 function verified(store: ReturnType<typeof createDeliveries>, r: DeliveryRecord) {
-  if (r.forgeState === "open" && r.verifiedCommitSha !== r.headSha) store.verify(r.id, "thr_cap", r.headSha, "Opened the routes in the browser");
+  if (r.forgeState === "open" && r.verifiedCommitSha !== r.headSha) store.verify(r.id, "thr_cap", r.headSha, { driven: "opened the routes in the browser", seen: "they render" });
 }
 const redo = { headRefOid: "9c41d07", commits: [{ oid: "3ef8a02", committedDate: "2026-10-07T16:15:00Z" }, { oid: "9c41d07", committedDate: "2026-10-07T20:10:00Z" }] };
 
@@ -223,9 +223,9 @@ test("a green PR without a verification record for its head is not merge-ready",
   assert.match(green.blocker, /^No verification record for head 1e13624/);
   assert.match(green.nextAction, /CI and unit tests are not verification/);
   assert.deepEqual(boardPullRequests([green]).map((p) => p.state), ["not verified"]);
-  assert.throws(() => store.verify(r.id, "thr_pse43vv6tn", "1e13624", "CI green, 112 unit tests pass"), /names only CI or tests/);
-  assert.throws(() => store.verify(r.id, "thr_pse43vv6tn", "abcdef0", "sent hello"), /does not match the current head 1e13624/);
-  const verified = store.verify(r.id, "thr_pse43vv6tn", "1e13624", "Sent hello to the staging bot; the reply arrived");
+  assert.throws(() => store.verify(r.id, "thr_pse43vv6tn", "1e13624", { driven: "", seen: "CI green, 112 unit tests pass" }), /needs driven/);
+  assert.throws(() => store.verify(r.id, "thr_pse43vv6tn", "abcdef0", { driven: "sent hello", seen: "a reply" }), /does not match the current head 1e13624/);
+  const verified = store.verify(r.id, "thr_pse43vv6tn", "1e13624", { driven: "sent hello to the staging bot", seen: "the reply arrived" });
   assert.equal(verified.verifiedCommitSha, HEAD_2315);
   assert.equal(store.observe(r.id, seen(), true, 2).status, "ready-to-merge");
   const pushed = store.observe(r.id, seen({ headSha: "2222222222222222222222222222222222222222", reviewHeadSha: "2222222222222222222222222222222222222222" }), true, 3);
@@ -254,14 +254,14 @@ test("PR 2315 merged outside Firstmate without a record is merged-unverified, an
   const later = store.observe(r.id, seen({ state: "merged", mergeCommitSha: MERGE_2315 }), false, 2 + 2 * 86_400_000);
   assert.equal(later.notification.desired, notice, "no repeat and no overdue notice");
   assert.ok(later.nextCheckAt >= 2 + 2 * 86_400_000 + 86_400_000 - 1, "a merged PR is not re-read every minute");
-  assert.equal(store.verify(r.id, "thr_pse43vv6tn", "bf33e4b", "Sent hello after the restart; the reply arrived").status, "complete");
+  assert.equal(store.verify(r.id, "thr_pse43vv6tn", "bf33e4b", { driven: "sent hello after the restart", seen: "the reply arrived" }).status, "complete");
 });
 
 test("a PR verified before merge, or merged with the owner's waiver, completes on merge", () => {
   const store = createDeliveries(new DatabaseSync(":memory:") as never);
   const r = track(store, "merged");
   store.observe(r.id, seen(), true, 1);
-  store.verify(r.id, "thr_pse43vv6tn", HEAD_2315, "Sent hello to the staging bot; the reply arrived");
+  store.verify(r.id, "thr_pse43vv6tn", HEAD_2315, { driven: "sent hello to the staging bot", seen: "the reply arrived" });
   assert.equal(store.observe(r.id, seen({ state: "merged", mergeCommitSha: MERGE_2315 }), true, 2).status, "complete");
   const other = createDeliveries(new DatabaseSync(":memory:") as never);
   const w = track(other, "merged");
@@ -293,4 +293,52 @@ test("the PR read keeps only what the observation uses, so a 100 KB answer fits 
   assert.equal(trimmed.state, "merged");
   assert.equal(trimmed.mergeCommitSha, "ca784e614e9456093c8ec56c52b4bee6e06923d8");
   assert.equal(trimmed.hold, "Do not merge: the redo still drops messages");
+});
+
+// PR 129 review: a "Do not merge" after character 2,000 of a long comment was cut by the
+// trim, so the hold disappeared.
+test("a do-not-merge after character 2,000 of a comment or review still holds the PR after the trim", () => {
+  const head = "a".repeat(40);
+  const late = `${"Explanation of the redo. ".repeat(120)}Do not merge: the redo still drops messages`;
+  for (const where of ["comments", "reviews"] as const) {
+    const full = {
+      state: "OPEN", isDraft: false, headRefOid: head, reviewDecision: "", mergeable: "MERGEABLE", labels: [], statusCheckRollup: [],
+      commits: [{ committedDate: "2026-10-15T09:00:00Z" }],
+      comments: where === "comments" ? [{ createdAt: "2026-10-15T10:00:00Z", body: late }] : [],
+      reviews: where === "reviews" ? [{ state: "COMMENTED", submittedAt: "2026-10-15T10:00:00Z", commit: { oid: head }, body: late }] : [],
+    };
+    assert.ok(late.indexOf("Do not merge") > 2000);
+    const jq = spawnSync("jq", ["-c", PR_VIEW_JQ], { input: JSON.stringify(full), encoding: "utf8" });
+    assert.equal(jq.status, 0, jq.stderr);
+    const hold = parseForge(JSON.parse(jq.stdout)).hold;
+    assert.ok(parseForge(full).hold, where);
+    assert.match(hold ?? "", /Do not merge: the redo still drops messages/, where);
+  }
+});
+
+// PR 129 review: "All checks have passed" made a verification record; a word list cannot
+// judge every wording. A record now takes two fields: what was driven and what was seen.
+test("a verification record needs what was driven and what was seen; a CI sentence alone records nothing", () => {
+  const store = createDeliveries(new DatabaseSync(":memory:") as never);
+  const r = track(store, "merged");
+  store.observe(r.id, seen(), true, 1);
+  for (const evidence of [{ driven: "", seen: "All checks have passed" }, { driven: "the staging bot", seen: " " }, "All checks have passed"] as never[]) {
+    assert.throws(() => store.verify(r.id, "thr_pse43vv6tn", "1e13624", evidence), /needs driven \(what you drove on the real changed surface\) and seen \(what you saw\)/);
+  }
+  assert.equal(store.get(r.id)!.verifiedCommitSha, null);
+  const done = store.verify(r.id, "thr_pse43vv6tn", "1e13624", { driven: "sent hello to the staging bot", seen: "the reply arrived in 2 s" });
+  assert.equal(done.verifiedCommitSha, HEAD_2315);
+  assert.deepEqual({ ...done.verification!, at: 0 }, { crewId: null, actor: "thr_pse43vv6tn", commitSha: HEAD_2315, driven: "sent hello to the staging bot", seen: "the reply arrived in 2 s", at: 0 });
+});
+
+// PR 129 review: a waiver given for head A still counted after a push to head B, so an
+// outside merge of B read complete instead of merged-unverified.
+test("an owner waiver covers only the head it was given for", () => {
+  const store = createDeliveries(new DatabaseSync(":memory:") as never);
+  const r = track(store, "merged");
+  store.observe(r.id, seen(), true, 1);
+  store.waive(r.id, "thr_pse43vv6tn", "ship it now, I will test on my phone", HEAD_2315);
+  const next = "2222222222222222222222222222222222222222";
+  store.observe(r.id, seen({ headSha: next, reviewHeadSha: next }), true, 2);
+  assert.equal(store.observe(r.id, seen({ headSha: next, reviewHeadSha: next, state: "merged", mergeCommitSha: MERGE_2315 }), true, 3).status, "merged-unverified");
 });

@@ -525,7 +525,7 @@ test('a captain records merge verification by PR link for a crew it owns in anot
   const merged=(url,projectId)=>{const r=store.register({url,taskId:'t1',projectId,owner:'thr_cap',home:'',worker:'thr_c1',requirement:'merged-and-verified'});
    return store.observe(r.id,{headSha:'h1',state:'merged',draft:false,checks:'passing',review:'approved',mergeable:'unknown',reviewHeadSha:null,mergeCommitSha:'merge1'},true);};
   assert.equal(merged('https://github.com/Acme/Other/pull/293','proj_other').status,'merged-needs-verification');
-  const out=await tool(host,'firstmate_deliveries').execute({action:'verify',url:'https://github.com/Acme/Other/pull/293',commitSha:'merge1',reason:'Live page checked after deploy'},ctx);
+  const out=await tool(host,'firstmate_deliveries').execute({action:'verify',url:'https://github.com/Acme/Other/pull/293',commitSha:'merge1',driven:'opened the live page after deploy',seen:'the new total'},ctx);
   assert.match(typeof out==="string"?out:JSON.stringify(out),/acme\/other#293 \[complete\]/);
   assert.equal(store.get('acme/other#293').verifiedCommitSha,'merge1');
   merged('https://github.com/acme/other/pull/294','proj_other');

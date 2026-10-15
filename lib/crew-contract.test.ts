@@ -37,6 +37,16 @@ const VERIFY_RULES = [
 
 const MERGE_RULE = "Merge only with `bb firstmate merge <crew> --pr <n>`; it refuses a PR without a verification record. Never use `gh pr merge` or the GitHub API.";
 
+// PR 129 review: a release crew's brief (no playbook) did not say how to drive, record
+// and merge each PR.
+const MERGE_SEQUENCE = [
+  "To merge a PR, do these steps at its current head:",
+  "Merge step 1: drive the change on the real surface, with the project's verify skill if it has one.",
+  "Merge step 2: `bb firstmate deliveries verify <owner/repo#n> --commit <head sha> --driven \"<what you drove>\" --seen \"<what you saw>\"`.",
+  "Merge step 3: `bb firstmate merge <crew> --pr <n>`, where <crew> is the crew that opened the PR.",
+  "After a new push, do steps 1 and 2 again. If you cannot drive the change, report \"blocked: <PR>: <reason>\".",
+];
+
 const HOST_LIMIT = [
   "This host is shared. Run every type check, full test run and build as `~/.bb-firstmate/bin/fm-heavy <command>`; it waits for a host-wide slot.",
   "Do not start such commands in the background or as your own systemd service to skip the wait. Stop dev servers and browsers you started when you finish.",
@@ -85,6 +95,7 @@ test("a feature brief gives full paths, the step checklist, no-comments and the 
     "If a skill is not installed, continue and say so in your report.",
     ...HOUSE_RULES,
     MERGE_RULE,
+    ...MERGE_SEQUENCE,
     ...HOST_LIMIT,
     ...IN_PLACE_OF_A_SKIP,
     ...VERIFY_RULES,
@@ -498,7 +509,7 @@ test("the NOT VERIFIED note goes to the captain and says the PR cannot merge wit
   assert.equal(note, [
     "NOT VERIFIED: crew 0940c38e's DONE report has its verify step pending: \"Verify on the same surface\".",
     "CI and unit tests are not verification.",
-    "Its PRs cannot merge until a verification record exists for the PR head: drive the changed surface, then firstmate_deliveries action=verify with the head commit and what you saw.",
+    "Its PRs cannot merge until a verification record exists for the PR head: drive the changed surface, then firstmate_deliveries action=verify with the head commit, driven and seen.",
     "Only the owner's own words can waive it: firstmate_merge allowUnverified=\"<owner words>\".",
   ].join("\n"));
   assert.match(notVerifiedRequest("pending: \"Verify on the same surface\""), /^VERIFY STEP NOT DONE: your report has the verify step pending/);
@@ -516,5 +527,13 @@ test("every brief says merges go only through bb firstmate merge, never gh pr me
   for (const playbook of PLAYBOOK_CHOICES) {
     const block = crewSkillBlock({ shape: "ship", title: "Release the 21 green PRs", task: "", playbook });
     assert.ok(block.includes(MERGE_RULE), `${playbook}\n${block}`);
+  }
+});
+
+test("every brief, including a release crew's, gives the per-PR drive, record and merge steps", () => {
+  assert.equal(crewPlaybook({ shape: "ship", title: "Release the green PRs", task: "" }), "none");
+  for (const playbook of PLAYBOOK_CHOICES) {
+    const block = crewSkillBlock({ shape: "ship", title: "Release the green PRs", task: "Merge the approved PRs", providerId: "codex", playbook });
+    assert.ok(block.includes([MERGE_RULE, ...MERGE_SEQUENCE].join("\n")), `${playbook}\n${block}`);
   }
 });

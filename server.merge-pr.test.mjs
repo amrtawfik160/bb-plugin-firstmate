@@ -55,7 +55,7 @@ async function deck(open=OPEN,{verified=true}={}) {
  for(const n of open){
   const r=store.register({url:url(n),taskId:CREW,projectId:'proj_1',owner:'thr_cap',home:'/native',worker:'thr_crew',requirement:'merged',title:title(n)});
   store.observe(r.id,seen(n),true);
-  if(verified) store.verify(r.id,'thr_cap',head(n),`Drove change ${n} in the staging app; it works`);
+  if(verified) store.verify(r.id,'thr_cap',head(n),{driven:`change ${n} in the staging app`,seen:`it works`});
  }
  return {host,store,commands:hostCommands(host,forge)};
 }
@@ -156,5 +156,45 @@ test('the CLI takes the owner waiver as --allow-unverified',async()=>{
   const cli=await host.harness.behavior.runCli(['merge',CREW,'--yes','--pr','2391','--allow-unverified','the owner said merge it now'],ctx);
   assert.equal(cli.exitCode,0,cli.stderr);assert.match(cli.stdout,/Not verified: the owner waived verification/);
   assert.equal(merges(commands).length,1);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+// PR 129 review: with one verified PR and a failed `gh pr view`, the merge trusted the
+// delivery row's cached head and reached the merge script.
+test('a merge whose current head cannot be read on GitHub is refused, even with a record or a waiver',async()=>{
+ const {host,commands}=await deck([2391]);try {
+  hostCommands(host,c=>c.includes('gh pr view')?{code:1,payload:'forge unavailable'}:forge(c));
+  const out=text(await tool(host,'firstmate_merge').execute({crewId:CREW,yes:true},ctx));
+  assert.match(out,/^Refusing: cannot read the current head of #2391 on GitHub, so its verification record cannot be checked; nothing was merged\./);
+  const waived=text(await tool(host,'firstmate_merge').execute({crewId:CREW,yes:true,allowUnverified:'merge it, I will test Telegram myself'},ctx));
+  assert.match(waived,/^Refusing: cannot read the current head of #2391/);
+  assert.deepEqual(merges(commands),[]);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+// PR 129 review: the waiver was saved before the merge ran, so a refused merge left it behind.
+test('a merge that does not land records no owner waiver',async()=>{
+ const {host,store}=await deck([2391],{verified:false});try {
+  hostCommands(host,c=>c.includes('fm-pr-merge.sh')?{code:1,payload:'merge failed: required check missing'}:forge(c));
+  await tool(host,'firstmate_merge').execute({crewId:CREW,yes:true,pr:2391,allowUnverified:'merge it, I will test Telegram myself'},ctx);
+  assert.equal(store.get('cyndra-ai/cyndra-saas#2391').unverifiedMerge ?? null,null);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+// PR 129 review: the release crew drove PRs it did not own and could not record them;
+// only the owning captain could.
+test('a crew records verification for a PR it drove; the record keeps its crew id, the head and the evidence',async()=>{
+ const {host,store,commands}=await deck([2391],{verified:false});try {
+  await host.bb.storage.kv.set('crews',[crew,{...crew,id:'rel00001',task:'release the green PRs',threadId:'thr_release',parentThreadId:'thr_other'}]);
+  const evidence=['--driven','sent hello to the staging bot at 2391239','--seen','the reply arrived in 2 s'];
+  const stranger=await host.harness.behavior.runCli(['deliveries','verify','cyndra-ai/cyndra-saas#2391','--commit',head(2391),...evidence],{threadId:'thr_stranger',projectId:'proj_1'});
+  assert.equal(stranger.exitCode,1);assert.match(stranger.stderr,/Only the owning manager or a Firstmate crew/);
+  const cli=await host.harness.behavior.runCli(['deliveries','verify','cyndra-ai/cyndra-saas#2391','--commit',head(2391).slice(0,7),...evidence],{threadId:'thr_release',projectId:'proj_1'});
+  assert.equal(cli.exitCode,0,cli.stderr);
+  const row=store.get('cyndra-ai/cyndra-saas#2391');
+  assert.equal(row.verifiedCommitSha,head(2391));
+  assert.deepEqual({...row.verification,at:0},{crewId:'rel00001',actor:'thr_release',commitSha:head(2391),driven:'sent hello to the staging bot at 2391239',seen:'the reply arrived in 2 s',at:0});
+  const out=text(await tool(host,'firstmate_merge').execute({crewId:CREW,yes:true,pr:2391},ctx));
+  assert.match(out,/^Merged #2391 Change 2391\n/);assert.equal(merges(commands).length,1);
  }finally{await host.harness.lifecycle.dispose();}
 });
