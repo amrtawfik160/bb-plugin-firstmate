@@ -70,7 +70,7 @@ import { createDoorbellHold, doorbellHoldDecision } from "./lib/doorbell-hold.ts
 import { createRetryLedger, type RetryItem, type RetryKind } from "./lib/retry-ledger.ts";
 import { HANDOFF_WAKE_AMENDMENT, captainInstructionsWithHandoff } from "./lib/handoff-contract.ts";
 import { honestIdleVerdictPresentation, interruptIsStopped, readyClaim } from "./lib/honest-status.ts";
-import { ACK_TEXT, ackEligible, createInboundLedger, expandTelegramRows, followUpReplyKind, formatOwnerInbox, hashText, inboundKey, quotedReplyKind, sweeperSteerText, type InboundRow } from "./lib/inbound-ledger.ts";
+import { ACK_TEXT, ackEligible, createInboundLedger, expandTelegramRows, followUpReplyKind, formatOwnerInbox, hashText, inboundKey, quotedReplyKind, sweeperSteerText, type InboundKey, type InboundRow, type OutboxKind } from "./lib/inbound-ledger.ts";
 import { inboundHookDecision } from "./lib/inbound-dispatch.ts";
 import { formatWorkersForTelegram } from "./lib/telegram-commands.ts";
 import { digestOnce, EMPTY_DIGEST_MEMORY, formatBoard, type BoardInput, type DigestMemory } from "./lib/owner-board.ts";
@@ -11812,6 +11812,28 @@ export default async function plugin(bb: BbPluginApi) {
       if (!row) return toolError(`No inbound row ${ref} for this captain.`);
       const refOf = (item: InboundRow) => item.source === "telegram" ? telegramSourceRef(item) : `bb:${item.chatId}:${item.messageId}`;
       const used = refOf(row);
+      const attach = files ?? [];
+      // The connector uploads each linked local file with the reply. It percent-decodes the link target, and a
+      // space or ")" ends the target, so every segment is encoded, parentheses too. The label cannot hold brackets.
+      const encode = (segment: string) => encodeURIComponent(segment).replace(/[()]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+      const link = (file: string) => `[${basename(file).replace(/[[\]]/g, "")}](${file.split("/").map(encode).join("/")})`;
+      const text = attach.length === 0 ? words : `${words}\n\n${attach.map(link).join("\n")}`;
+      const body = row.source === "telegram"
+        ? telegramReplyFallbackBody({ chatId: row.chatId, messageId: row.messageId, kind: "reply", text: stripTelegramEnvelope(text), threadId: row.topicId })
+        : text;
+      const coverNote = (closed: InboundRow[]) => closed.length === 0 ? "" : ` It also answers ${closed.map(refOf).join(", ")}, closed with no message of their own.`;
+      // The same text and quote already reserved for this message is an exact repeat: nothing is sent again,
+      // and the repeat finishes any closure an interrupted call left undone. It closes this message only when
+      // the delivered reply was final, so repeating a more=true text keeps the message open.
+      const repeatKinds = quote ? [quotedReplyKind(quote)] : [quotedReplyKind(undefined), followUpReplyKind(body)];
+      const delivered = repeatKinds.map((kind) => inboundLedger.outboxGet(row, kind as OutboxKind)).find((out) => out?.contentHash === hashText(body));
+      if (delivered) {
+        const pendingNow = new Set(inboundLedger.listPending(captain).map(inboundKey));
+        const listed = [...new Set(covers ?? [])].map(parseSourceRef)
+          .filter((other): other is InboundKey => other !== null && inboundKey(other) !== inboundKey(row) && pendingNow.has(inboundKey(other)));
+        const closed = inboundLedger.finishReply(delivered.final === true && more !== true ? row : null, listed, used, Date.now());
+        return (quote ? `Already replied to ${used} for that quote.` : `Already replied to ${used}.`) + coverNote(closed);
+      }
       // Every covered ref must be another open message of this captain, or nothing is sent.
       const pending = new Set(inboundLedger.listPending(captain).map(inboundKey));
       const covered: InboundRow[] = [];
@@ -11822,33 +11844,23 @@ export default async function plugin(bb: BbPluginApi) {
         if (otherKey === null) refused.push(`${other} is not a ref`);
         else if (inboundKey(otherKey) === inboundKey(row)) refused.push(`${other} is the ref this reply answers`);
         else if (found?.captainThreadId !== captain) refused.push(`${other} is not an owner message of this captain`);
-        else if (found.coveredBy === used) continue; // Closed by an earlier send of this reply: a repeat, not a refusal.
         else if (!pending.has(inboundKey(otherKey))) refused.push(`${other} is not open`);
         else covered.push(found);
       }
       if (refused.length > 0) return toolError(`Not sent: covers refused (${refused.join("; ")}). ${used} stays open.`);
-      const attach = files ?? [];
       const missing = attach.filter((file) => !existsSync(file));
       if (missing.length > 0) return toolError(`Not sent: no file at ${missing.join(", ")}. ${used} stays open.`);
       const notFile = attach.filter((file) => !statSync(file).isFile());
       if (notFile.length > 0) return toolError(`Not sent: ${notFile.join(", ")} is not a regular file. ${used} stays open.`);
       const lineSuffix = attach.filter((file) => /:\d+$/.test(file));
       if (lineSuffix.length > 0) return toolError(`Not sent: ${lineSuffix.join(", ")} ends in :<number>, which Telegram reads as a line number. Rename or copy the file. ${used} stays open.`);
-      // The connector uploads each linked local file with the reply. It percent-decodes the link target, and a
-      // space or ")" ends the target, so every segment is encoded, parentheses too. The label cannot hold brackets.
-      const encode = (segment: string) => encodeURIComponent(segment).replace(/[()]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
-      const link = (file: string) => `[${basename(file).replace(/[[\]]/g, "")}](${file.split("/").map(encode).join("/")})`;
-      const text = attach.length === 0 ? words : `${words}\n\n${attach.map(link).join("\n")}`;
       let claimKind = quotedReplyKind(quote);
-      const body = row.source === "telegram"
-        ? telegramReplyFallbackBody({ chatId: row.chatId, messageId: row.messageId, kind: "reply", text: stripTelegramEnvelope(text), threadId: row.topicId })
-        : text;
       // Reserve first so a concurrent or repeated reply never reaches Telegram twice.
-      let claim = inboundLedger.claimOutbox(row, claimKind, body, Date.now());
+      let claim = inboundLedger.claimOutbox(row, claimKind, body, Date.now(), more !== true);
       // more=true left the message open: a different text is the next reply to it, the same text is a repeat.
       if (!claim.sent && !quote && (row.state !== "answered" || attach.length > 0) && claim.existing?.contentHash !== hashText(body)) {
         claimKind = followUpReplyKind(body);
-        claim = inboundLedger.claimOutbox(row, claimKind, body, Date.now());
+        claim = inboundLedger.claimOutbox(row, claimKind, body, Date.now(), more !== true);
       }
       if (!claim.sent) {
         return quote ? `Already replied to ${used} for that quote.` : `Already replied to ${used}.`;
@@ -11887,13 +11899,16 @@ export default async function plugin(bb: BbPluginApi) {
         inboundLedger.releaseOutbox(row, claimKind);
         return toolError(`Reply to ${used} was not delivered: ${undelivered}. Nothing reached the owner; ${stayOpen} ${covered.length === 0 ? "stays" : "stay"} open. Answer in your turn text instead.`);
       }
-      if (more !== true) inboundLedger.markAnswered(row, Date.now());
-      for (const other of covered) inboundLedger.markCovered(other, used, Date.now());
+      // The reply and its covers close together; after a failure the identical call closes them with no second send.
+      try {
+        inboundLedger.finishReply(more === true ? null : row, covered, used, Date.now());
+      } catch (error) {
+        return toolError(`Reply to ${used} was delivered, but recording it failed; ${stayOpen} ${covered.length === 0 ? "stays" : "stay"} open. Repeat the same call to close ${covered.length === 0 ? "it" : "them"}: it sends nothing again. ${error instanceof Error ? error.message : String(error)}`);
+      }
       const params = row.source === "telegram" ? telegramReplyParameters({ chatId: row.chatId, messageId: row.messageId, threadId: row.topicId }) : null;
-      const coverNote = covered.length === 0 ? "" : ` It also answers ${covered.map(refOf).join(", ")}, closed with no message of their own.`;
       const sentLine = (params
         ? `Replied to ${used} via ${channel} with reply_parameters ${JSON.stringify(params.reply_parameters)}.`
-        : `Replied to ${used}.`) + coverNote;
+        : `Replied to ${used}.`) + coverNote(covered);
       const taskNote = ownerTasks.openByRef(captain, used).map((task) => `\nTask ${task.id} stays open (${task.state}): a reply does not close it. Close it with firstmate_task when it is done or dropped.`).join("");
       const stillOpen = inboundLedger.listPending(captain);
       return (stillOpen.length === 0 ? `${sentLine} No owner message is waiting.` : `${sentLine}\n${formatOwnerInbox(stillOpen, Date.now())}`) + taskNote;

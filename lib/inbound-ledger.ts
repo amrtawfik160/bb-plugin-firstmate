@@ -52,6 +52,8 @@ export type OutboxRow = InboundKey & {
   contentHash: string;
   sentAt: number;
   outgoingMessageId: string | null;
+  /** A reply sent without more=true: its exact repeat may close the message. Absent on older claims. */
+  final?: boolean;
 };
 
 export type LedgerEvent = {
@@ -216,11 +218,12 @@ export type CreateInboundLedger = {
   hasTelegram(captainThreadId: string): boolean;
   markAcked(key: InboundKey, at: number): InboundRow | undefined;
   markAnswered(key: InboundKey, at: number): InboundRow | undefined;
-  /** Answered by the reply to another message (by): no message of its own. A crew link stays. */
-  markCovered(key: InboundKey, by: string, at: number): InboundRow | undefined;
+  /** One transaction: answers the anchor (when given) and each open cover, answered by the reply to by with no
+   * message of its own and keeping its crew link, so a failure closes none. Returns the covers it closed. */
+  finishReply(anchor: InboundKey | null, covers: InboundKey[], by: string, at: number): InboundRow[];
   markDelegated(key: InboundKey, crewId: string, at: number): InboundRow | undefined;
   mergeSourceRefs(keys: InboundKey[], refs: string[]): void;
-  claimOutbox(row: InboundKey, kind: OutboxClaimKind, content: string, at: number): { sent: boolean; existing?: OutboxRow };
+  claimOutbox(row: InboundKey, kind: OutboxClaimKind, content: string, at: number, final?: boolean): { sent: boolean; existing?: OutboxRow };
   releaseOutbox(row: InboundKey, kind: OutboxClaimKind): void;
   rememberOutgoing(row: InboundKey, kind: OutboxKind, outgoingMessageId: string): void;
   outboxGet(row: InboundKey, kind: OutboxKind): OutboxRow | undefined;
@@ -315,13 +318,13 @@ export function createInboundLedger(db: Database): CreateInboundLedger {
     })();
   }
 
-  function claimOutbox(row: InboundKey, kind: OutboxClaimKind, content: string, at: number) {
+  function claimOutbox(row: InboundKey, kind: OutboxClaimKind, content: string, at: number, final?: boolean) {
     const contentHash = hashText(content);
     return db.transaction(() => {
       const existing = db.prepare("SELECT record FROM inbound_outbox WHERE source=? AND chat_id=? AND message_id=? AND kind=?")
         .get(row.source, row.chatId, row.messageId, kind) as { record: string } | undefined;
       if (existing) return { sent: false, existing: JSON.parse(existing.record) as OutboxRow };
-      const out: OutboxRow = { ...row, kind: kind as OutboxKind, contentHash, sentAt: at, outgoingMessageId: null };
+      const out: OutboxRow = { ...row, kind: kind as OutboxKind, contentHash, sentAt: at, outgoingMessageId: null, ...(final ? { final } : {}) };
       db.prepare("INSERT INTO inbound_outbox VALUES (?,?,?,?,?,?,?,?)")
         .run(row.source, row.chatId, row.messageId, kind, contentHash, at, null, JSON.stringify(out));
       return { sent: true };
@@ -349,11 +352,18 @@ export function createInboundLedger(db: Database): CreateInboundLedger {
         return { ...row, state: "answered", answeredAt: at, ackedAt: row.ackedAt ?? at };
       });
     },
-    markCovered(key, by, at) {
-      return transition(key, (row) => {
-        if (row.state === "answered") return row;
-        return { ...row, state: "answered", coveredBy: by, answeredAt: at, ackedAt: row.ackedAt ?? at };
-      });
+    finishReply(anchor, covers, by, at) {
+      return db.transaction(() => {
+        const current = anchor ? get(anchor) : undefined;
+        if (current && current.state !== "answered") save({ ...current, state: "answered", answeredAt: at, ackedAt: current.ackedAt ?? at });
+        const closed: InboundRow[] = [];
+        for (const key of covers) {
+          const row = get(key);
+          if (!row || row.state === "answered") continue;
+          closed.push(save({ ...row, state: "answered", coveredBy: by, answeredAt: at, ackedAt: row.ackedAt ?? at }));
+        }
+        return closed;
+      })();
     },
     markDelegated(key, crewId, at) {
       return transition(key, (row) => {
