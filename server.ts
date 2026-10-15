@@ -11790,15 +11790,16 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_reply",
-    description: "Reply to one owner message as a Telegram reply to it (ref=oldest, tg:<chat>:<msg>, or bb:<thread>:<row>; any open message, in any order). quote=exact words from that message, such as one of several questions; each different quote is its own reply. more=true keeps the message open because more replies to it will follow. A text that asks the owner to decide (options A/B with a question, or a count of waiting decisions) is refused: send each decision with firstmate_ask. A text that restates the question of a card sent in the last 30 minutes is refused too.",
+    description: "Reply to one owner message as a Telegram reply to it (ref=oldest, tg:<chat>:<msg>, or bb:<thread>:<row>; any open message, in any order). quote=exact words from that message, such as one of several questions; each different quote is its own reply. more=true keeps the message open because more replies to it will follow. A text that asks the owner to decide (options A/B with a question, or a count of waiting decisions) is refused: send each decision with firstmate_ask. A text that restates the question of a card sent in the last 30 minutes is refused too. covers=refs of other open messages this reply also answers, such as forwarded messages or a burst on one request: they close with no Telegram message of their own.",
     parameters: z.object({
       ref: z.string().min(1),
       text: z.string().min(1).max(4000),
       quote: z.string().min(1).max(1024).optional(),
       more: z.boolean().optional(),
       files: z.array(z.string().startsWith("/")).max(10).optional().describe("Absolute paths of files to attach, such as a crew's report.md"),
+      covers: z.array(z.string().min(1)).max(50).optional().describe("Refs of other open owner messages this reply also answers; each closes with no Telegram message"),
     }),
-    async execute({ ref, text: words, quote, more, files }, ctx) {
+    async execute({ ref, text: words, quote, more, files, covers }, ctx) {
       const flags = await reliabilityFlags();
       if (flags.inboundLedger === "off") return toolError("Inbound ledger is off.");
       const captain = ctxString(ctx, "threadId");
@@ -11811,6 +11812,20 @@ export default async function plugin(bb: BbPluginApi) {
       if (!row) return toolError(`No inbound row ${ref} for this captain.`);
       const refOf = (item: InboundRow) => item.source === "telegram" ? telegramSourceRef(item) : `bb:${item.chatId}:${item.messageId}`;
       const used = refOf(row);
+      // Every covered ref must be another open message of this captain, or nothing is sent.
+      const pending = new Set(inboundLedger.listPending(captain).map(inboundKey));
+      const covered: InboundRow[] = [];
+      const refused: string[] = [];
+      for (const other of new Set(covers ?? [])) {
+        const otherKey = parseSourceRef(other);
+        const found = otherKey === null ? undefined : inboundLedger.get(otherKey);
+        if (otherKey === null) refused.push(`${other} is not a ref`);
+        else if (inboundKey(otherKey) === inboundKey(row)) refused.push(`${other} is the ref this reply answers`);
+        else if (found?.captainThreadId !== captain) refused.push(`${other} is not an owner message of this captain`);
+        else if (!pending.has(inboundKey(otherKey))) refused.push(`${other} is not open`);
+        else covered.push(found);
+      }
+      if (refused.length > 0) return toolError(`Not sent: covers refused (${refused.join("; ")}). ${used} stays open.`);
       const attach = files ?? [];
       const missing = attach.filter((file) => !existsSync(file));
       if (missing.length > 0) return toolError(`Not sent: no file at ${missing.join(", ")}. ${used} stays open.`);
@@ -11861,10 +11876,12 @@ export default async function plugin(bb: BbPluginApi) {
         return toolError(`Reply to ${used} was not delivered; the item stays open. ${error instanceof Error ? error.message : String(error)}`);
       }
       if (more !== true) inboundLedger.markAnswered(row, Date.now());
+      for (const other of covered) inboundLedger.markCovered(other, used, Date.now());
       const params = row.source === "telegram" ? telegramReplyParameters({ chatId: row.chatId, messageId: row.messageId, threadId: row.topicId }) : null;
-      const sentLine = params
+      const coverNote = covered.length === 0 ? "" : ` It also answers ${covered.map(refOf).join(", ")}, closed with no message of their own.`;
+      const sentLine = (params
         ? `Replied to ${used} via ${channel} with reply_parameters ${JSON.stringify(params.reply_parameters)}.`
-        : `Replied to ${used}.`;
+        : `Replied to ${used}.`) + coverNote;
       const taskNote = ownerTasks.openByRef(captain, used).map((task) => `\nTask ${task.id} stays open (${task.state}): a reply does not close it. Close it with firstmate_task when it is done or dropped.`).join("");
       const stillOpen = inboundLedger.listPending(captain);
       return (stillOpen.length === 0 ? `${sentLine} No owner message is waiting.` : `${sentLine}\n${formatOwnerInbox(stillOpen, Date.now())}`) + taskNote;

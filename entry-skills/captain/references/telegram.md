@@ -47,8 +47,8 @@ A turn that only handled crew wakes, with nothing for the owner, ends with no te
 - Answer items in any order. A quick answer does not wait for a long task.
 - One message with several questions: send one reply per question. Pass `quote` with the exact
   words of that question from the captain's message, and `more=true` on every reply except the last.
-- Several messages on one topic: reply to each one, or reply once to the oldest and say which
-  later messages it also answers.
+- Forwarded messages or a burst on one request: send one reply to the oldest with `covers` set to
+  the refs of the others. They close with no message of their own; never send "Included." replies.
 - Keep each reply short and self-contained. Lead with the answer.
 
 ## Questions and blockers for the captain

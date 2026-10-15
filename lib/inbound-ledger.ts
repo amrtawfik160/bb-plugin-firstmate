@@ -32,6 +32,8 @@ export type InboundRow = InboundKey & {
   ackedAt: number | null;
   answeredAt: number | null;
   crewId: string | null;
+  /** The ref of the reply that also answered this message, when firstmate_reply covers it. */
+  coveredBy?: string | null;
   sourceRefs: string[];
   mediaGroupId: string | null;
   senderId: string | null;
@@ -214,6 +216,8 @@ export type CreateInboundLedger = {
   hasTelegram(captainThreadId: string): boolean;
   markAcked(key: InboundKey, at: number): InboundRow | undefined;
   markAnswered(key: InboundKey, at: number): InboundRow | undefined;
+  /** Answered by the reply to another message (by): no message of its own. A crew link stays. */
+  markCovered(key: InboundKey, by: string, at: number): InboundRow | undefined;
   markDelegated(key: InboundKey, crewId: string, at: number): InboundRow | undefined;
   mergeSourceRefs(keys: InboundKey[], refs: string[]): void;
   claimOutbox(row: InboundKey, kind: OutboxClaimKind, content: string, at: number): { sent: boolean; existing?: OutboxRow };
@@ -343,6 +347,12 @@ export function createInboundLedger(db: Database): CreateInboundLedger {
       return transition(key, (row) => {
         if (row.state === "answered") return row;
         return { ...row, state: "answered", answeredAt: at, ackedAt: row.ackedAt ?? at };
+      });
+    },
+    markCovered(key, by, at) {
+      return transition(key, (row) => {
+        if (row.state === "answered") return row;
+        return { ...row, state: "answered", coveredBy: by, answeredAt: at, ackedAt: row.ackedAt ?? at };
       });
     },
     markDelegated(key, crewId, at) {
