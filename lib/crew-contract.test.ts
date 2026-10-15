@@ -523,3 +523,12 @@ test("a release or operator brief gives the per-PR drive, record and merge steps
   assert.ok(release.includes([MERGE_RULE, ...HOST_LIMIT, ...MERGE_SEQUENCE].join("\n")), release);
   assert.ok(!crewSkillBlock({ shape: "ship", title: "Add a CSV export", task: "" }).includes(MERGE_SEQUENCE[0]!));
 });
+
+// PR 129 verdict 3: the captain rules promised a NOT VERIFIED note for a report naming
+// only CI; the report check reads the step's state, not its wording.
+test("the captain rules describe the report check and the record as they work", () => {
+  const rules = readFileSync(new URL("../entry-skills/captain/references/supervision.md", import.meta.url), "utf8");
+  assert.doesNotMatch(rules, /naming only CI/);
+  assert.match(rules, /verify step pending, skipped or blocked comes with a NOT VERIFIED note/);
+  assert.match(rules, /The report text is not judged; the evidence is the record's two fields, `driven` and `seen`\./);
+});
