@@ -233,10 +233,10 @@ export type CreateInboundLedger = {
   markDelegated(key: InboundKey, crewId: string, at: number): InboundRow | undefined;
   /** Records that a crew ended on each still-delegated row handed to it. Returns the rows it changed. */
   crewEnded(crewId: string, at: number): InboundRow[];
-  /** Reserves the captain's delegated rows whose crew ended and that were not handed back yet. */
-  takeHandBacks(captainThreadId: string, at: number): InboundRow[];
-  /** Undoes takeHandBacks for rows whose wake was not delivered, so the next wake names them. */
-  releaseHandBacks(keys: InboundKey[]): void;
+  /** The captain's delegated rows whose crew ended and whose hand-back wake was not delivered yet. Records nothing. */
+  handBacksDue(captainThreadId: string): InboundRow[];
+  /** Records the hand-back of each row still due after its wake was delivered. A crash before this repeats the wake once. */
+  markHandedBack(rows: InboundRow[], at: number): void;
   mergeSourceRefs(keys: InboundKey[], refs: string[]): void;
   /** reply: a firstmate_reply reservation, in flight until markDelivered. */
   claimOutbox(row: InboundKey, kind: OutboxClaimKind, content: string, at: number, reply?: { final: boolean; covers: string[] }): { sent: boolean; existing?: OutboxRow };
@@ -410,16 +410,16 @@ export function createInboundLedger(db: Database): CreateInboundLedger {
         .filter((row) => row.crewId === crewId && row.crewEndedAt == null)
         .map((row) => save({ ...row, crewEndedAt: at })))();
     },
-    takeHandBacks(captainThreadId, at) {
-      return db.transaction(() => delegatedRows(captainThreadId)
-        .filter((row) => row.crewEndedAt != null && row.handedBackAt == null)
-        .map((row) => save({ ...row, handedBackAt: at })))();
+    handBacksDue(captainThreadId) {
+      return delegatedRows(captainThreadId).filter((row) => row.crewEndedAt != null && row.handedBackAt == null);
     },
-    releaseHandBacks(keys) {
+    markHandedBack(rows, at) {
       db.transaction(() => {
-        for (const key of keys) {
-          const row = get(key);
-          if (row?.state === "delegated" && row.handedBackAt != null) save({ ...row, handedBackAt: null });
+        for (const sent of rows) {
+          const row = get(sent);
+          // A row handed to another crew since the wake was read waits for that crew; this wake does not count for it.
+          if (row?.state !== "delegated" || row.crewEndedAt == null || row.handedBackAt != null || row.crewId !== sent.crewId) continue;
+          save({ ...row, handedBackAt: at });
         }
       })();
     },

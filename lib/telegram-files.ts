@@ -28,9 +28,11 @@ export function telegramFileRefusals(files: readonly string[], where: { workspac
   const anyRoots = [...(where.workspace ? [resolve(where.workspace)] : []), ...rules.anyFileRoots];
   const documentRoots = [rules.captainDataDir(where.captainThreadId), ...rules.documentRoots];
   const refusals: TelegramFileRefusal[] = [];
-  if (files.length > rules.maxItems) refusals.push({ file: files.slice(rules.maxItems).join(", "), reason: `Telegram takes at most ${rules.maxItems} files per reply.` });
+  // The connector attaches each linked path once, in order of first mention, so limits apply to that list.
+  const unique = [...new Set(files)];
+  if (unique.length > rules.maxItems) refusals.push({ file: unique.slice(rules.maxItems).join(", "), reason: `Telegram takes at most ${rules.maxItems} files per reply.` });
   let total = 0;
-  for (const file of files.slice(0, rules.maxItems)) {
+  for (const file of unique.slice(0, rules.maxItems)) {
     // Both the named path and the file it resolves to through links must pass, as in the connector.
     let reason = refusal(resolve(file), anyRoots, rules.secretsDir, documentRoots);
     if (reason === null) {

@@ -5365,20 +5365,25 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  // Owner messages handed to a crew that ended go back to the captain once, on its next wake.
+  // Owner messages handed to a crew that ended go back to the captain once, on its next wake. The hand-back is recorded
+  // only after the wake is delivered, so a restart mid-delivery repeats it once and never loses it. The in-memory guard
+  // keeps a second wake from sending it again while the first is still in flight.
+  const handBacksInFlight = new Set<string>();
   async function handBackOwnerMessages(captainThreadId: string): Promise<void> {
-    await endCrewsOffTheList(captainThreadId);
-    const rows = inboundLedger.takeHandBacks(captainThreadId, Date.now());
-    if (rows.length === 0) return;
+    if (handBacksInFlight.has(captainThreadId)) return;
+    handBacksInFlight.add(captainThreadId);
     try {
+      await endCrewsOffTheList(captainThreadId);
+      const rows = inboundLedger.handBacksDue(captainThreadId);
+      if (rows.length === 0) return;
       await bb.sdk.threads.send({
         threadId: captainThreadId,
         mode: "steer",
         input: [{ type: "text", text: handBackText(rows), mentions: [], visibility: "agent-only" }],
       });
-    } catch (error) {
-      inboundLedger.releaseHandBacks(rows);
-      throw error;
+      inboundLedger.markHandedBack(rows, Date.now());
+    } finally {
+      handBacksInFlight.delete(captainThreadId);
     }
   }
 
