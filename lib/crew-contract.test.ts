@@ -232,6 +232,39 @@ test("the captain Telegram guide gives the same screenshot rule as the crew brie
   }
 });
 
+// 15 Oct: the owner asked to run Matt Pocock's /to-spec, /to-tickets, /implement-spec,
+// /implement and /grill-me from Telegram.
+const MATT_COMMANDS = [
+  ["/to-spec", "to-spec"],
+  ["/to-tickets", "to-tickets"],
+  ["/implement-spec", "implement-spec"],
+  ["/implement", "implement"],
+  ["/grill-me", "grilling"],
+] as const;
+
+test("the toolchain check declares the skills the owner's Telegram skill commands load", () => {
+  const declared = new Set<string>(BRIEF_SKILLS);
+  for (const [, skill] of MATT_COMMANDS) assert.ok(declared.has(skill), skill);
+  assert.match(skillCheckScript(), / implement implement-spec /);
+});
+
+test("skill-routing and the captain Telegram guide route each Matt Pocock skill command", () => {
+  const routing = readFileSync(new URL("../entry-skills/skill-routing/SKILL.md", import.meta.url), "utf8");
+  const row = routing.split("\n").find((line) => line.startsWith("| Owner asks for "));
+  assert.ok(row, "skill-routing has a row for owner skill commands");
+  for (const [command, skill] of MATT_COMMANDS) assert.ok(row.includes(`\`${command}\``) && row.includes(`\`${skill}\``), command);
+  const guide = readFileSync(new URL("../entry-skills/captain/references/telegram.md", import.meta.url), "utf8").replace(/\s*\n\s*/g, " ");
+  for (const [command] of MATT_COMMANDS) assert.ok(guide.includes(`\`${command}\``), command);
+  for (const text of [
+    "dispatch a scout or ship crew",
+    "GitHub issues",
+    "`firstmate_program`",
+    "dispatch every ready ticket",
+    "Run the `grilling` skill yourself",
+    "one question per `firstmate_reply`",
+  ]) assert.ok(guide.includes(text), text);
+});
+
 test("every brief tells a worker to work through an ordinary obstacle and when blocked is allowed", () => {
   for (const [shape, title] of [["ship", "Add a CSV export"], ["ship", "Deploy + merge #2155"], ["scout", "Why does Telegram stall"]] as const) {
     const block = crewSkillBlock({ shape, title, task: "", providerId: "codex" });
