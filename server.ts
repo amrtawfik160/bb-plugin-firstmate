@@ -88,7 +88,7 @@ import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRe
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
 import { optionHelp } from "./lib/cli-help.ts";
 import { AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython } from "./lib/native-policy.ts";
-import { createDeliveries, LOST_OWNER_RECHECK_MS, canonicalPr, decisionLine, deliveryLine, parseForge, prBranchOwner, type DeliveryRecord, type PrBranchCandidate } from "./lib/pr-delivery.ts";
+import { createDeliveries, LOST_OWNER_RECHECK_MS, canonicalPr, decisionLine, deliveryLine, parseForge, PR_VIEW_FIELDS, PR_VIEW_JQ, prBranchOwner, type DeliveryRecord, type PrBranchCandidate } from "./lib/pr-delivery.ts";
 import { captureHostCommand, decodeHostCapture } from "./lib/host-capture.ts";
 import { selectExecution, validateLaunchCapabilities } from "./lib/execution-selection.ts";
 import { crewPlaybook, crewSkillBlock, crewSkillRoot, notVerifiedNote, notVerifiedRequest, PLAYBOOK_CHOICES, playbookStepCount, redactSecrets, reportGapNote, reportGapRequest, reportGaps, skillCheckScript, skillRoutingLinkScript, verifyStepGap } from "./lib/crew-contract.ts";
@@ -6934,7 +6934,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (ownerState === "lost") record=deliveries.markOwnerNeeded(record.id) ?? record;
       else if (ownerState === "live") record=deliveries.ownerRestored(record.id) ?? record;
       const hostId = await resolveHostForProject(record.projectId,ownerState === "live" ? record.owner ?? undefined : undefined,signal);
-      const result = await runStructuredOnHost(hostId, `gh pr view ${shQuote(record.url)} --json state,isDraft,headRefOid,statusCheckRollup,reviewDecision,reviews,mergeable,mergeCommit,title,createdAt,updatedAt,comments,labels,commits`,30_000,signal);
+      const result = await runStructuredOnHost(hostId, `gh pr view ${shQuote(record.url)} --json ${PR_VIEW_FIELDS} --jq ${shQuote(PR_VIEW_JQ)}`,30_000,signal);
       if (result.exitCode !== 0) throw new Error(result.stderr || result.output || `Forge lookup exit ${result.exitCode}`);
       const observation = parseForge(JSON.parse(result.output));
       // Standing yolo allows asking the manager to continue; only native merge
@@ -7086,7 +7086,7 @@ export default async function plugin(bb: BbPluginApi) {
   const UNOWNED_PR_RECHECK_MS = 60 * 60_000;
   type PrCandidate = PrBranchCandidate & { crew: Crew; path: string; hostId: string; live: boolean; fresh: boolean };
   type OpenPr = { id: string; number: number; url: string; head: string; title?: string; openedAt?: number; touchedAt?: number; candidate?: PrCandidate };
-  type OpenPrSnapshot = { at: number; repos: Array<{ projects: Set<string>; prs: OpenPr[] }> };
+  type OpenPrSnapshot = { at: number; repos: Array<{ projects: Set<string>; prs: OpenPr[]; openIds: Set<string> }> };
   const crewBranches = new Map<string, { branch: string; path: string; hostId: string }>();
   const projectRepos = new Map<string, string>();
   const unownedPrs = new Map<string, number>();
@@ -7215,12 +7215,14 @@ export default async function plugin(bb: BbPluginApi) {
         }
         const me = await hostGithubLogin(group.hostId, s);
         const prs: OpenPr[] = [];
+        const openIds = new Set<string>();
         for (const row of listed) {
           if (me && typeof row["author"] === "string" && row["author"].toLowerCase() !== me) continue;
           const url = typeof row["url"] === "string" ? row["url"] : "", head = typeof row["headRefName"] === "string" ? row["headRefName"] : "";
           if (!url || !head) continue;
           let identity: ReturnType<typeof canonicalPr>;
           try { identity = canonicalPr(url); } catch { continue; }
+          openIds.add(identity.id);
           const opened = typeof row["createdAt"] === "string" ? Date.parse(row["createdAt"]) : NaN, touched = typeof row["updatedAt"] === "string" ? Date.parse(row["updatedAt"]) : NaN;
           prs.push({ id: identity.id, number: identity.number, url: identity.url, head,
             ...(typeof row["title"] === "string" && row["title"].trim() ? { title: row["title"].trim().slice(0, 300) } : {}),
@@ -7246,7 +7248,7 @@ export default async function plugin(bb: BbPluginApi) {
             else unownedPrs.set(pr.id, Date.now());
           }
         }
-        snapshot.repos.push({ projects: group.projects, prs });
+        snapshot.repos.push({ projects: group.projects, prs, openIds });
       }, signal).catch((error) => { if (!signal?.aborted) bb.log.warn(`Open PR list: ${String(error)}`); });
     }
     return snapshot;
@@ -7298,8 +7300,16 @@ export default async function plugin(bb: BbPluginApi) {
   // Once per day and per captain: the open PRs nobody touched for 24 hours, one line each.
   async function askPrDecisions(signal?: AbortSignal) {
     const now = Date.now();
+    const due = deliveries.needingDecision(now);
+    if (due.length === 0) return;
+    // A row can say open long after the PR merged when its GitHub reads fail. Only a PR
+    // in this cycle's open list is put to the captain as open.
+    const projects = new Set(due.map((r) => r.projectId));
+    let snapshot = openPrSnapshot && now - openPrSnapshot.at < 90_000 ? openPrSnapshot : undefined;
+    if (!snapshot || [...projects].some((id) => !snapshot!.repos.some((repo) => repo.projects.has(id)))) snapshot = await readOpenPrs(signal, projects);
+    const open = new Set(snapshot.repos.flatMap((repo) => [...repo.openIds]));
     const byOwner = new Map<string, DeliveryRecord[]>();
-    for (const r of deliveries.needingDecision(now)) byOwner.set(r.owner!, [...(byOwner.get(r.owner!) ?? []), r]);
+    for (const r of due) if (open.has(r.id)) byOwner.set(r.owner!, [...(byOwner.get(r.owner!) ?? []), r]);
     for (const [owner, records] of byOwner) {
       signal?.throwIfAborted();
       const shown = records.slice(0, 25);

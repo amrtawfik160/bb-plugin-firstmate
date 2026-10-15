@@ -416,6 +416,12 @@ export function createDeliveries(db: Database) {
 }
 
 const DO_NOT_MERGE = /\b(?:do not|don'?t|dont)[\s-]+merge\b|\bdo-not-merge\b/i;
+/** Fields `gh pr view --json` reads for one observation. */
+export const PR_VIEW_FIELDS = 'state,isDraft,headRefOid,statusCheckRollup,reviewDecision,reviews,mergeable,mergeCommit,title,createdAt,updatedAt,comments,labels,commits';
+/** Keeps what parseForge reads: the head commit's date, and comment and review text only
+ * where it holds the PR. The full answer for a long PR passes 100 KB; the host reader keeps
+ * the last 64 KB. */
+export const PR_VIEW_JQ = `def hold: (.body // "") | test(${JSON.stringify(DO_NOT_MERGE.source)}; "i"); .commits |= (.[-1:] | map({committedDate})) | .comments |= map(select(hold) | {createdAt, body: .body[0:2000]}) | .reviews |= map({state, submittedAt, commit: {oid: .commit.oid}, body: (if hold then .body[0:2000] else "" end)})`;
 /** A captain or crew says "do not merge" with a PR label, or with a comment written after
  * the current head's commit. A later commit is new work, so it lifts a comment hold. */
 function holdOf(r:Record<string,unknown>):string|null {
