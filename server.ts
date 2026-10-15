@@ -7622,15 +7622,20 @@ export default async function plugin(bb: BbPluginApi) {
     return facts;
   }
 
-  async function checkSummary(hostId: string, url: string): Promise<string> {
+  // The preview's check line, and the checks as mergeGate reads them.
+  type CheckView = { line: string; checksState: string; failed: number; pending: number; redChecks: string[] | null };
+  async function checkSummary(hostId: string, url: string): Promise<CheckView> {
+    const unread = { line: "could not be read", checksState: "unknown", failed: 0, pending: 0, redChecks: null };
     try {
       // gh pr checks exits non-zero while a check fails or runs; its JSON is still complete.
       const rows = JSON.parse((await runStructuredOnHost(hostId, `gh pr checks ${shQuote(url)} --json name,bucket`, 30_000)).output) as { name: string; bucket: string }[];
-      if (!Array.isArray(rows)) return "could not be read";
-      if (rows.length === 0) return "none reported";
+      if (!Array.isArray(rows)) return unread;
+      if (rows.length === 0) return { line: "none reported", checksState: "no_checks", failed: 0, pending: 0, redChecks: [] };
       const failing = rows.filter((r) => r.bucket === "fail" || r.bucket === "cancel").map((r) => r.name);
-      return `${rows.filter((r) => r.bucket === "pass").length} passing, ${failing.length} failing${failing.length ? ` (${failing.join(", ")})` : ""}, ${rows.filter((r) => r.bucket === "pending").length} pending`;
-    } catch { return "could not be read"; }
+      const pending = rows.filter((r) => r.bucket === "pending").length;
+      return { line: `${rows.filter((r) => r.bucket === "pass").length} passing, ${failing.length} failing${failing.length ? ` (${failing.join(", ")})` : ""}, ${pending} pending`,
+        checksState: failing.length ? "failing" : pending ? "pending" : "passing", failed: failing.length, pending, redChecks: failing };
+    } catch { return unread; }
   }
 
   async function awaitMergeableKnown(hostId: string, url: string): Promise<void> {
@@ -7737,22 +7742,19 @@ export default async function plugin(bb: BbPluginApi) {
     return lines.join("\n");
   }
 
-  async function guardForeignPr(crew: Crew, url: string, override: boolean, caller?:string, headSha = ""): Promise<void> {
-    if (override || url === "") return;
+  async function foreignPrRefusal(crew: Crew, url: string, override: boolean, caller?:string, headSha = ""): Promise<string | null> {
+    if (override || url === "") return null;
     const key = prKeyOf(url) ?? url;
     const hit = await foreignPrOwner(
       { owner: caller ?? crew.parentThreadId, projectId: crew.projectId, exceptCrewId: crew.id },
       (u) => (prKeyOf(u) ?? u) === key,
       {ids:[key],numbers:[]},
     );
-    if (hit !== null) {
-      // A crew of the same captain (a release crew) may land it once its current head is verified.
-      const actor = caller ? await findCrewByThread(caller) : undefined;
-      if (actor !== undefined && actor.parentThreadId === hit.owner && headSha !== "" && deliveries.get(key)?.verifiedCommitSha === headSha) return;
-      throw new Error(
-        `Refusing: ${url} is the PR of crew ${hit.crew.id}, owned by ${hit.owner ? `captain @thread:${hit.owner}` : "an unassigned manager"}. Coordinate with that captain before landing it, or pass overrideOwner=true (--override-owner) when the captain told you to.`,
-      );
-    }
+    if (hit === null) return null;
+    // A crew of the same captain (a release crew) may land it once its current head is verified.
+    const actor = caller ? await findCrewByThread(caller) : undefined;
+    if (actor !== undefined && actor.parentThreadId === hit.owner && headSha !== "" && deliveries.get(key)?.verifiedCommitSha === headSha) return null;
+    return `Refusing: ${url} is the PR of crew ${hit.crew.id}, owned by ${hit.owner ? `captain @thread:${hit.owner}` : "an unassigned manager"}. Coordinate with that captain before landing it, or pass overrideOwner=true (--override-owner) when the captain told you to.`;
   }
 
   async function mergeCrew(
@@ -7774,25 +7776,51 @@ export default async function plugin(bb: BbPluginApi) {
     const settle = (outcome: string, pr: string) => { keepForOpenPrs(pr); return keep ? keepLanded(crew, outcome, pr) : retireLanded(crew, outcome, pr); };
     // 15 Oct: a probe without --yes merged two PRs under a standing yolo posture. Only
     // --yes (yes=true) merges; without it the merge stops at a preview, whatever the posture.
-    const preview = (pr: MergeTarget | null, checks: string): string => {
+    // The preview comes before any ownership, verification or check refusal: it names each
+    // refusal --yes would hit and the steps that clear it. With --yes they throw in order.
+    const reasons: string[] = [];
+    let ownership = false;
+    const refuse = (message: string | null) => {
+      if (message === null) return;
+      if (yes) throw new Error(message);
+      reasons.push(message);
+    };
+    const preview = (pr: MergeTarget | null, checks: CheckView | null): string => {
       const flags = [pr !== null ? `--pr ${pr.number}` : "", opts.keepCrew === true ? "--keep-crew" : "", opts.overrideOwner === true ? "--override-owner" : "",
         allowRedCheck?.trim() ? `--allow-red ${shQuote(allowRedCheck.trim())}` : "", allowMissingCheck?.trim() ? `--allow-missing ${shQuote(allowMissingCheck.trim())}` : "",
         opts.allowUnverified?.trim() ? `--allow-unverified ${shQuote(opts.allowUnverified.trim())}` : "", "--yes"].filter(Boolean).join(" ");
       const lines = ["Not merged: this is a preview. A merge needs --yes (yes=true), whatever the posture."];
+      const steps: string[] = [];
       if (pr === null) lines.push(`Crew ${crew.id} is local-only: --yes fast-forwards its branch onto the default branch.`);
       else {
         const row = deliveries.get(prKeyOf(pr.url) ?? "");
         const record = pr.headSha !== "" && row?.verifiedCommitSha === pr.headSha
           ? `covers the current head${row.verification ? `; driven: ${row.verification.driven}; seen: ${row.verification.seen}` : ""}`
           : row?.verifiedCommitSha ? `covers ${row.verifiedCommitSha.slice(0, 7)}, not the current head; the merge will refuse` : "none for the current head; the merge will refuse";
-        lines.push(`PR: #${pr.number}${pr.title ? ` ${pr.title}` : ""} ${pr.url} (${pr.state})`, `Head: ${pr.headSha || "could not be read"}`, `Checks: ${checks}`, `Verification record: ${record}`);
+        lines.push(`PR: #${pr.number}${pr.title ? ` ${pr.title}` : ""} ${pr.url} (${pr.state})`, `Head: ${pr.headSha || "could not be read"}`, `Checks: ${checks?.line ?? "could not be read"}`, `Verification record: ${record}`);
+        if (pr.state !== "merged") {
+          try { requireVerification(pr, opts.allowUnverified, ""); } catch (error) {
+            reasons.push((error instanceof Error ? error.message : String(error)).split("\n")[0]!);
+            const sha = pr.headSha.slice(0, 7);
+            if (sha !== "") steps.push(`Drive the changed surface at head ${sha}, then record what you drove and saw: ${row === undefined ? `bb firstmate deliveries register --url ${pr.url}, then ` : ""}bb firstmate deliveries verify ${row?.id ?? prKeyOf(pr.url) ?? pr.url} --commit ${sha} --driven "<what you drove>" --seen "<what you saw>"`);
+          }
+          const gate = checks === null ? null : mergeGate({ prState: "open", mergeable: "MERGEABLE", ...checks, allowRedCheck: allowRedCheck?.trim() ?? "" });
+          if (gate !== null && !gate.ok) {
+            reasons.push(`Refusing: ${gate.reason}`);
+            steps.push("Checks: get them green, or name the one red check to waive with --allow-red '<check>'.");
+          }
+        }
       }
+      if (ownership) steps.push("Ownership: only if the owning captain told you to land it, add --override-owner.");
+      if (reasons.length > 0) lines.push("With --yes now, the merge would be refused:", ...reasons.map((r) => `- ${r.replace(/[;.] [Nn]othing was merged\./, ".")}`));
+      if (steps.length > 0) lines.push("Before you merge:", ...steps.map((s, i) => `${i + 1}. ${s}`));
       lines.push(`To merge: bb firstmate merge ${crew.id} ${flags}`);
       return lines.join("\n");
     };
     const override = opts.overrideOwner === true;
     const notMine = override ? null : await ownerRefusal(crew, opts.caller, "merge");
-    if (notMine !== null) throw new Error(notMine);
+    ownership = notMine !== null;
+    refuse(notMine);
     const envId = await threadEnv(crew.threadId);
     if (envId === null) throw new Error(`Crew ${crew.id} has no environment yet.`);
     if (isSecondmateRoute(crew)) {
@@ -7801,7 +7829,7 @@ export default async function plugin(bb: BbPluginApi) {
     const local = crew.posture === "local-only";
     const named = opts.pr !== undefined && opts.pr !== "";
     if (local && named) throw new Error(`Refusing: crew ${crew.id} is local-only. It lands by fast-forward, not through a PR, so drop pr.`);
-    if (local && !yes) return preview(null, "");
+    if (local && !yes) return preview(null, null);
     const nativeHome = await crewNativeHome(crew);
     if (nativeHome !== "") {
       const hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
@@ -7815,7 +7843,9 @@ export default async function plugin(bb: BbPluginApi) {
       if (pr === null) {
         throw new Error(`No PR for crew ${crew.id}: BB's environment has none, none is recorded, gh finds none for its branch, and its report names none.`);
       }
-      await guardForeignPr(crew, pr.url, override,opts.caller, pr.headSha);
+      const foreign = await foreignPrRefusal(crew, pr.url, override,opts.caller, pr.headSha);
+      ownership ||= foreign !== null;
+      refuse(foreign);
       if (!yes) return preview(pr, await checkSummary(hostId, pr.url));
       let waived = "";
       if (pr.state !== "merged") {
@@ -7868,13 +7898,19 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const landedLine = target !== null ? mergedLine(target) : f.url;
     if (allowMissingCheck?.trim()) {
-      throw new Error("Refusing: this BB merge path cannot verify required check contexts; --allow-missing is supported only through the native PR merge gate.");
+      refuse("Refusing: this BB merge path cannot verify required check contexts; --allow-missing is supported only through the native PR merge gate.");
     }
     await rememberPrUrl(crew, f.url);
-    await guardForeignPr(crew, f.url, override,opts.caller, target?.headSha);
+    const foreign = await foreignPrRefusal(crew, f.url, override,opts.caller, target?.headSha);
+    ownership ||= foreign !== null;
+    refuse(foreign);
     const fresh = target ?? { url: f.url, number: Number(/\/pull\/(\d+)/.exec(f.url)?.[1]), title: f.title, state: f.state, source: "environment",
       headSha: hostId === null ? "" : (await ghPrIdentity(hostId, f.url))?.headSha ?? "" };
-    if (!yes) return preview(fresh, hostId === null ? `${f.checksState}: ${f.passed} passing, ${f.failed} failing, ${f.pending} pending` : await checkSummary(hostId, f.url));
+    if (!yes) {
+      const waive = (allowRedCheck ?? "").trim();
+      return preview(fresh, { line: hostId === null ? `${f.checksState}: ${f.passed} passing, ${f.failed} failing, ${f.pending} pending` : (await checkSummary(hostId, f.url)).line,
+        checksState: f.checksState, failed: f.failed, pending: f.pending, redChecks: waive !== "" && f.checksState === "failing" ? await redCheckNames(crew, f.url) : null });
+    }
     if (f.state === "merged") {
       await settle("merged (already landed)", f.url);
       return `Already merged: ${landedLine}\n${keep ? kept : `Crew ${crew.id} retired.`}`;
