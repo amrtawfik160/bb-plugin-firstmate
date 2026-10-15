@@ -25,6 +25,8 @@ export interface DeliveryRecord {
   heldHead?: string | null;
   /** The owner's own words that waived verification for one merge of this head. */
   unverifiedMerge?: { words: string; actor: string; headSha: string; at: number } | null;
+  /** What was driven on the real changed surface at commitSha, and what was seen. crewId names the crew that recorded it. */
+  verification?: { crewId: string | null; actor: string; commitSha: string; driven: string; seen: string; at: number } | null;
   updatedAt: number;
 }
 export interface ForgeObservation {
@@ -106,14 +108,6 @@ export function decisionLine(r: DeliveryRecord, now = Date.now()) {
 export const LOST_OWNER_RECHECK_MS = 5 * 60_000;
 const verifiedHead = (r: DeliveryRecord) => r.verifiedCommitSha !== null && r.verifiedCommitSha === r.headSha;
 const short = (sha: string) => sha.slice(0, 7);
-// Words that name CI or a test run; only these and filler words means no surface was driven.
-const CI_TERMS = new Set(['ci','check','checks','job','jobs','workflow','workflows','pipeline','pipelines','github','actions','test','tests','unit','suite','suites','lint','typecheck','tsc','build','builds','scan','scans','gitleaks','vitest','jest','pytest','coverage']);
-const CI_FILLER = new Set(['green','red','pass','passes','passed','passing','success','successful','fail','failed','failing','pending','queued','running','waiting','wait','secret','dependency','required','type','all','every','each','other','the','a','an','and','or','on','in','of','for','to','with','too','now','still','until','after','are','is','was','were','be','been','its','it','this','that','via','by','at','as','from','ok','one','two','three','four','five','six','seven','eight','nine','ten','local','locally','run','ran','rerun','re-run','same','new']);
-/** True when a verification claim names only CI, checks or tests: no surface was driven. */
-export function namesOnlyCi(text: string): boolean {
-  const words = text.toLowerCase().match(/[a-z][a-z0-9'-]*/g) ?? [];
-  return words.some(w => CI_TERMS.has(w)) && words.every(w => CI_TERMS.has(w) || CI_FILLER.has(w));
-}
 const terminal = (r: DeliveryRecord) => r.status === 'complete' || r.status === 'explicitly-abandoned';
 function notificationKey(r: DeliveryRecord) {
   return createHash('sha256').update(JSON.stringify([r.headSha, r.status, r.owner, r.ownerNeeded, r.blocker, (r.failures??[]).filter(f=>f.resolvedAt===null).map(f=>[f.id,f.accounting??null])])).digest('hex');
@@ -204,11 +198,11 @@ export function createDeliveries(db: Database) {
       else r.failures.push({...failure,headSha:o.headSha,resolvedAt:null});
     }
     r.heldHead=o.state!=='open' ? null : o.hold ? o.headSha : prior.heldHead === o.headSha ? null : prior.heldHead ?? null;
-    if (o.state === 'merged' && r.requirement !== 'merged-and-verified' && r.verifiedCommitSha === null && !r.unverifiedMerge) {
+    if (o.state === 'merged' && r.requirement !== 'merged-and-verified' && r.verifiedCommitSha === null && r.unverifiedMerge?.headSha !== o.headSha) {
       // firstmate_merge refuses a PR without a record or the owner's waiver, so this merge came from gh or the GitHub API.
       r.status='merged-unverified'; r.nextCheckAt=now+86_400_000;
       r.blocker='Merged outside Firstmate with no verification record';
-      r.nextAction=r.mergeCommitSha ? `Drive the changed surface on merged commit ${short(r.mergeCommitSha)}, then record what you saw: firstmate_deliveries action=verify id=${r.id} commitSha=${short(r.mergeCommitSha)} reason=<evidence>. CI and unit tests are not verification` : 'Observe the merged commit before recording verification';
+      r.nextAction=r.mergeCommitSha ? `Drive the changed surface on merged commit ${short(r.mergeCommitSha)}, then record what you saw: firstmate_deliveries action=verify id=${r.id} commitSha=${short(r.mergeCommitSha)} driven=<what you drove> seen=<what you saw>. CI and unit tests are not verification` : 'Observe the merged commit before recording verification';
     } else if (o.state === 'merged') {
       r.status = r.requirement === 'merged-and-verified' && (r.verifiedCommitSha !== o.mergeCommitSha || r.mergeCommitSha === null) ? 'merged-needs-verification' : 'complete';
       if (r.status==='complete') r.deliverySatisfiedAt=prior.deliverySatisfiedAt ?? now;
@@ -243,7 +237,7 @@ export function createDeliveries(db: Database) {
     if (['ready-to-merge','waiting-approval','waiting-native-gates'].includes(r.status) && !verifiedHead(r)) {
       r.status='needs-verification';
       r.blocker=`No verification record for head ${short(r.headSha)}`;
-      r.nextAction=`Drive the changed surface on head ${short(r.headSha)}, then record what you saw: firstmate_deliveries action=verify id=${r.id} commitSha=${short(r.headSha)} reason=<evidence>. CI and unit tests are not verification`;
+      r.nextAction=`Drive the changed surface on head ${short(r.headSha)}, then record what you saw: firstmate_deliveries action=verify id=${r.id} commitSha=${short(r.headSha)} driven=<what you drove> seen=<what you saw>. CI and unit tests are not verification`;
     }
     if (r.requirement === 'pr' && o.state === 'open' && !o.draft) {
       r.deliverySatisfiedAt=prior.deliverySatisfiedAt ?? now;
@@ -348,12 +342,13 @@ export function createDeliveries(db: Database) {
     return (db.prepare(`SELECT record FROM deliveries WHERE ${matching.join(' OR ')} ORDER BY id`).all(...taskIds,...ids) as {record:string}[]).map(row=>JSON.parse(row.record) as DeliveryRecord);
   }
   const sameCommit = (full:string, given:string) => full === given || (/^[0-9a-f]{7,}$/.test(given.trim().toLowerCase()) && full.toLowerCase().startsWith(given.trim().toLowerCase()));
-  /** Records what someone saw on the real changed surface. An open PR is verified at its
-   * current head; a merged one at its merge commit. The commit may be a hex prefix of 7 or
-   * more characters; the record keeps the full SHA. Evidence that names only CI is refused. */
-  function verify(id:string, actor:string, commitSha:string, evidence:string) {
+  /** Records what was driven on the real changed surface and what was seen. An open PR is
+   * verified at its current head; a merged one at its merge commit. The commit may be a hex
+   * prefix of 7 or more characters; the record keeps the full SHA. The owning manager
+   * records it, or a crew the caller vouched for (crewId). */
+  function verify(id:string, actor:string, commitSha:string, evidence:{driven:string; seen:string}, crewId:string|null=null) {
     const r=get(id); if (!r) throw new Error(`Unknown deliverable ${id}`);
-    if (r.owner !== actor) throw new Error(`Only the owning manager can verify ${r.id}`);
+    if (crewId === null && r.owner !== actor) throw new Error(`Only the owning manager can verify ${r.id}`);
     const merged=r.status === 'merged-needs-verification' || r.status === 'merged-unverified';
     const openPr=!merged && !terminal(r) && r.forgeState === 'open';
     if (!merged && !openPr) throw new Error(`${r.id} is ${r.status}, not merged-needs-verification`);
@@ -362,11 +357,13 @@ export function createDeliveries(db: Database) {
       if (!sameCommit(r.mergeCommitSha,commitSha)) throw new Error(`Commit ${commitSha} does not match the recorded merge commit ${short(r.mergeCommitSha)} of ${r.id}; pass at least its first 7 characters`);
     } else if (!r.headSha || !sameCommit(r.headSha,commitSha)) throw new Error(`Commit ${commitSha} does not match the current head ${short(r.headSha)} of ${r.id}; pass at least its first 7 characters`);
     if (r.freshness !== 'fresh') throw new Error(`${r.id} was not freshly observed; reconcile it, then verify again`);
-    if (!evidence.trim()) throw new Error(`Verifying ${r.id} needs evidence: say what you checked`);
-    if (namesOnlyCi(evidence)) throw new Error(`Verifying ${r.id}: the evidence names only CI or tests. CI and unit tests are not verification; drive the changed surface and say what you saw`);
-    const disposition={ reason:evidence,actor,at:Date.now() };
-    if (openPr) return save({ ...r, verifiedCommitSha:r.headSha, disposition, nextCheckAt:0, updatedAt:Date.now() });
-    return save({ ...r, status:'complete', verifiedCommitSha:r.mergeCommitSha, notification:{...r.notification,desired:null,attempted:null},disposition,blocker:'',nextAction:'Delivery contract satisfied',updatedAt:Date.now() });
+    const driven=typeof evidence?.driven === 'string' ? evidence.driven.trim() : '', seen=typeof evidence?.seen === 'string' ? evidence.seen.trim() : '';
+    if (!driven || !seen) throw new Error(`Verifying ${r.id} needs driven (what you drove on the real changed surface) and seen (what you saw). CI and unit tests are not verification.`);
+    const at=Date.now(), sha=(openPr ? r.headSha : r.mergeCommitSha)!;
+    const verification={ crewId, actor, commitSha:sha, driven, seen, at };
+    const disposition={ reason:`driven: ${driven}; seen: ${seen}`,actor,at };
+    if (openPr) return save({ ...r, verifiedCommitSha:sha, verification, disposition, nextCheckAt:0, updatedAt:at });
+    return save({ ...r, status:'complete', verifiedCommitSha:sha, verification, notification:{...r.notification,desired:null,attempted:null},disposition,blocker:'',nextAction:'Delivery contract satisfied',updatedAt:at });
   }
   /** The owner's words that waive verification, recorded with the merge of this head. */
   function waive(id:string, actor:string, words:string, headSha:string) {
@@ -420,8 +417,9 @@ const DO_NOT_MERGE = /\b(?:do not|don'?t|dont)[\s-]+merge\b|\bdo-not-merge\b/i;
 export const PR_VIEW_FIELDS = 'state,isDraft,headRefOid,statusCheckRollup,reviewDecision,reviews,mergeable,mergeCommit,title,createdAt,updatedAt,comments,labels,commits';
 /** Keeps what parseForge reads: the head commit's date, and comment and review text only
  * where it holds the PR. The full answer for a long PR passes 100 KB; the host reader keeps
- * the last 64 KB. */
-export const PR_VIEW_JQ = `def hold: (.body // "") | test(${JSON.stringify(DO_NOT_MERGE.source)}; "i"); .commits |= (.[-1:] | map({committedDate})) | .comments |= map(select(hold) | {createdAt, body: .body[0:2000]}) | .reviews |= map({state, submittedAt, commit: {oid: .commit.oid}, body: (if hold then .body[0:2000] else "" end)})`;
+ * the last 64 KB. A held body keeps 2,000 characters from just before its hold, so a hold
+ * late in a long comment survives. */
+export const PR_VIEW_JQ = `def held: (.body // "") | [match(${JSON.stringify(DO_NOT_MERGE.source)}; "i").offset] | first; def holdtext: held as $at | .body[([$at - 100, 0] | max):($at + 1900)]; .commits |= (.[-1:] | map({committedDate})) | .comments |= map(select(held != null) | {createdAt, body: holdtext}) | .reviews |= map({state, submittedAt, commit: {oid: .commit.oid}, body: (if held != null then holdtext else "" end)})`;
 /** A captain or crew says "do not merge" with a PR label, or with a comment written after
  * the current head's commit. A later commit is new work, so it lifts a comment hold. */
 function holdOf(r:Record<string,unknown>):string|null {

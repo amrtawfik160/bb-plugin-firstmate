@@ -1,6 +1,5 @@
 import { homedir } from "node:os";
 import type { Shape } from "./policy.ts";
-import { namesOnlyCi } from "./pr-delivery.ts";
 
 export const PLAYBOOK_CHOICES = ["feature", "bug-fix", "perf-issue", "refactoring", "prototype", "investigation", "visual-parity", "babysit", "none"] as const;
 export type PlaybookChoice = (typeof PLAYBOOK_CHOICES)[number];
@@ -133,6 +132,16 @@ export function crewSkillBlock(input: { shape: Shape; title?: string; task: stri
     "This host is shared. Run every type check, full test run and build as `~/.bb-firstmate/bin/fm-heavy <command>`; it waits for a host-wide slot.",
     "Do not start such commands in the background or as your own systemd service to skip the wait. Stop dev servers and browsers you started when you finish.",
   );
+  // A release or operator crew merges other crews' PRs; it records what it drove itself.
+  if (playbook === "none") {
+    lines.push(
+      "To merge a PR, do these steps at its current head:",
+      "Merge step 1: drive the change on the real surface, with the project's verify skill if it has one.",
+      "Merge step 2: `bb firstmate deliveries verify <owner/repo#n> --commit <head sha> --driven \"<what you drove>\" --seen \"<what you saw>\"`.",
+      "Merge step 3: `bb firstmate merge <crew> --pr <n>`, where <crew> is the crew that opened the PR.",
+      "After a new push, do steps 1 and 2 again. If you cannot drive the change, report \"blocked: <PR>: <reason>\".",
+    );
+  }
   if (playbook !== "none") {
     lines.push(
       "Report these steps as ✓, not as a skip:",
@@ -206,11 +215,8 @@ export function verifyStepGap(report: string, playbook: string): string | null {
   if (lines.length === 0) return null;
   const line = lines.find((l) => l.number === step[1] || l.body.toLowerCase().startsWith(lead)) ?? lines.find((l) => /\bverif/i.test(l.body));
   if (line === undefined) return `missing: no "${title}" line`;
-  if (/^[✓✔✅]$/.test(line.mark)) {
-    const titleWords = new Set(title.toLowerCase().match(/[a-z]+/g) ?? []);
-    const detail = (line.body.toLowerCase().match(/[a-z][a-z0-9'-]*/g) ?? []).filter((w) => !titleWords.has(w)).join(" ");
-    return namesOnlyCi(detail) ? `names only CI or tests: "${line.body}"` : null;
-  }
+  // A ✓ line is not judged on its wording; the merge gate needs a record with driven and seen.
+  if (/^[✓✔✅]$/.test(line.mark)) return null;
   return `${STEP_STATE[line.mark] ?? "not done"}: "${line.body}"`;
 }
 
@@ -218,7 +224,7 @@ export function notVerifiedNote(crewId: string, gap: string): string {
   return [
     `NOT VERIFIED: crew ${crewId}'s DONE report has its verify step ${gap}.`,
     "CI and unit tests are not verification.",
-    "Its PRs cannot merge until a verification record exists for the PR head: drive the changed surface, then firstmate_deliveries action=verify with the head commit and what you saw.",
+    "Its PRs cannot merge until a verification record exists for the PR head: drive the changed surface, then firstmate_deliveries action=verify with the head commit, driven and seen.",
     "Only the owner's own words can waive it: firstmate_merge allowUnverified=\"<owner words>\".",
   ].join("\n");
 }

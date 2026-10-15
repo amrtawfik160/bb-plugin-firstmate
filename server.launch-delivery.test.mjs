@@ -349,7 +349,7 @@ test('forgotten author retains native guarded merge continuation and refuses des
   host=await host.harness.lifecycle.reload(plugin);commonStubs(host);
   host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle',environmentId:'env_wt',archivedAt:threadId==='thr_c1'?1:null}));
   host.harness.sdk.stub('environments.pullRequest',async()=>({outcome:'unavailable'}));
-  const resumed=hostCommands(host,command=>command.includes('gh pr view')?{payload:JSON.stringify(forge())}:command.includes('fm-pr-merge')?{code:1,payload:'native required check refuses merge'}:{code:0});
+  const resumed=hostCommands(host,command=>command.includes('gh pr view')?{payload:JSON.stringify(forge({url:'https://github.com/acme/retained/pull/1',number:1}))}:command.includes('fm-pr-merge')?{code:1,payload:'native required check refuses merge'}:{code:0});
   host.harness.sdk.stub('threads.updatePluginMetadata',async()=>({}));host.harness.sdk.stub('threads.unarchive',async()=>({}));host.harness.sdk.stub('threads.send',async()=>({delivery:'sent'}));
   const fix=await host.harness.behavior.runCli(['tell','c1','--message','Fix the failing check on this PR'],ctx);assert.equal(fix.exitCode,0,fix.stderr);
   assert.equal(host.harness.sdk.callsTo('threads.unarchive').length,1);
@@ -494,7 +494,7 @@ test('recorded standing yolo reaches the native guard without a fresh merge ask;
  host.harness.sdk.stub('environments.pullRequest',async()=>({outcome:'unavailable'}));
  let guarded=0;hostCommands(host,c=>{
  if(c.includes('/fm-pr-merge.sh')){guarded++;return{code:1,payload:'NATIVE_USER_HOLD_OR_CHECK_REFUSAL: retained task'};}
- if(c.includes('gh pr view'))return{payload:JSON.stringify({state:'OPEN',mergeable:'MERGEABLE'})};
+ if(c.includes('gh pr view'))return{payload:JSON.stringify({url:'https://github.com/acme/repo/pull/10',number:10,headRefOid:'sha10',state:'OPEN',mergeable:'MERGEABLE'})};
  return{code:0};
  });
  const standing=await host.harness.behavior.runCli(['merge','c1','--allow-unverified','the owner said merge it'],ctx);assert.equal(standing.exitCode,1);assert.match(standing.stderr,/NATIVE_USER_HOLD_OR_CHECK_REFUSAL/);assert.equal(guarded,1,'standing authority must reach the guarded route without a fresh request');

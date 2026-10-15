@@ -7353,7 +7353,8 @@ export default async function plugin(bb: BbPluginApi) {
   const deliveryParams = z.object({
     action:z.enum(["list","inspect","register","reconcile","assign","abandon","clear-hold","verify","account"]),
     id:z.string().optional().describe("Deliverable id owner/repo#number; url works instead"),crewId:z.string().optional(),url:z.string().optional().describe("PR link"),from:z.string().nullable().optional(),
-    requirement:z.enum(["pr","merged","merged-and-verified"]).optional(),reason:z.string().optional(),commitSha:z.string().optional().describe("Commit the verification evidence covers: an open PR's current head, or a merged PR's merge commit"),
+    requirement:z.enum(["pr","merged","merged-and-verified"]).optional(),reason:z.string().optional(),commitSha:z.string().optional().describe("Commit the verification covers: an open PR's current head, or a merged PR's merge commit"),
+    driven:z.string().optional().describe("verify: what you drove on the real changed surface at commitSha"),seen:z.string().optional().describe("verify: what you saw"),
     authorized:z.boolean().optional().describe("Explicit user authority for abandonment or changing the delivery contract"),
     failureId:z.string().optional(),scope:z.enum(["author","baseline"]).optional(),followUpTask:z.string().optional(),
     all:z.boolean().optional().describe("Read-only project view across managers"),
@@ -7392,6 +7393,14 @@ export default async function plugin(bb: BbPluginApi) {
       if (input.from !== r.owner) throw new Error("Assignment requires the explicitly named previous manager.");
       return serializeLedger(`delivery:${r.id}`,async()=>[deliveries.assign(r.id,r.owner,owner,projectId)]);
     }
+    if (input.action === "verify") {
+      const evidence={ driven:input.driven ?? "",seen:input.seen ?? "" };
+      if (r.owner === owner) return [deliveries.verify(r.id,owner,input.commitSha ?? "",evidence)];
+      // A crew that drove the change records it under its own crew id, without the captain.
+      const crew=await findCrewByThread(owner);
+      if (!crew || crew.projectId !== r.projectId) throw new Error(`Only the owning manager or a Firstmate crew on this project can verify ${r.id}.`);
+      return [deliveries.verify(r.id,owner,input.commitSha ?? "",evidence,crew.id)];
+    }
     if (r.owner !== owner) throw new Error("Only the owning manager can reconcile or dispose this deliverable. Use explicit assignment first.");
     if (input.action === "abandon") {
       if (!input.authorized) throw new Error("Explicit abandonment needs user authority and a recorded reason.");
@@ -7403,7 +7412,6 @@ export default async function plugin(bb: BbPluginApi) {
       if (!crew || crew.parentThreadId!==owner || crew.projectId!==projectId) throw new Error("Follow-up requires an existing owned worker on this project.");
       return [deliveries.accountFailure(r.id,owner,input.failureId ?? "",input.scope ?? "author",crew.id,crew.threadId,input.reason ?? "")];
     }
-    if (input.action === "verify") return [deliveries.verify(r.id,owner,input.commitSha ?? "",input.reason ?? "")];
     if (input.action === "clear-hold") return [deliveries.clearHold(r.id,owner,input.reason ?? "")];
     await reconcileDelivery(r,asRecord(ctx)["signal"] as AbortSignal | undefined);
     await notifyDelivery(deliveries.get(r.id)!);
@@ -7559,29 +7567,31 @@ export default async function plugin(bb: BbPluginApi) {
   const mergedLine = (t: MergeTarget) => `#${t.number}${t.title ? ` ${t.title}` : ""}\n${t.url}`;
 
   // 15 Oct: PR 2315 merged with its verify step pending and dropped every Telegram
-  // message. A merge needs a verification record for the PR's current head, or the
-  // owner's own words waiving it, recorded with the merge. Returns the waiver line.
-  function requireVerification(t: MergeTarget, waiver: string | undefined, actor: string): string {
-    const row = deliveries.get(prKeyOf(t.url) ?? "");
-    const head = t.headSha || row?.headSha || "";
+  // message. A merge needs a verification record for the PR's current head, read fresh
+  // from GitHub, or the owner's own words waiving it. Returns the waiver line and records
+  // the waiver once the merge goes through.
+  function requireVerification(t: MergeTarget, waiver: string | undefined, actor: string): { note: string; record: () => void } {
     const short = (sha: string) => sha.slice(0, 7);
-    if (row !== undefined && head !== "" && row.verifiedCommitSha === head) return "";
+    if (t.headSha === "") throw new Error(`Refusing: cannot read the current head of #${t.number} on GitHub, so its verification record cannot be checked; nothing was merged. Retry when GitHub answers.`);
+    const head = t.headSha;
+    const row = deliveries.get(prKeyOf(t.url) ?? "");
+    if (row !== undefined && row.verifiedCommitSha === head) return { note: "", record: () => {} };
     const words = (waiver ?? "").trim();
     if (words !== "") {
       if (words.split(/\s+/).length < 3) throw new Error(`Refusing: allowUnverified must be the owner's own words, quoted as they said them (three words or more), not ${JSON.stringify(words)}. Nothing was merged.`);
-      if (row !== undefined) deliveries.waive(row.id, actor, words, head);
-      return `\nNot verified: the owner waived verification for head ${short(head) || "(unknown)"} in these words: "${words}"`;
+      return { note: `\nNot verified: the owner waived verification for head ${short(head)} in these words: "${words}"`,
+        record: () => { if (row !== undefined) deliveries.waive(row.id, actor, words, head); } };
     }
     const missing = row === undefined
-      ? `#${t.number} has no verification record: no delivery row tracks it, so nothing records evidence for head ${short(head) || "(unknown)"}; nothing was merged.`
-      : row.verifiedCommitSha !== null && head !== ""
+      ? `#${t.number} has no verification record: no delivery row tracks it, so nothing records evidence for head ${short(head)}; nothing was merged.`
+      : row.verifiedCommitSha !== null
         ? `#${t.number}'s verification record covers ${short(row.verifiedCommitSha)}, not its current head ${short(head)}; nothing was merged.`
-        : `#${t.number} has no verification record for its current head ${short(head) || "(unknown)"}; nothing was merged.`;
+        : `#${t.number} has no verification record for its current head ${short(head)}; nothing was merged.`;
     const id = row?.id ?? prKeyOf(t.url) ?? t.url;
     throw new Error([
       `Refusing: ${missing}`,
-      "CI and unit tests are not verification. Drive the changed surface (the project's verify skill if it has one), then record what you saw:",
-      `${row === undefined ? `firstmate_deliveries action=register url=${t.url}, then ` : ""}firstmate_deliveries action=verify id=${id} commitSha=${short(head) || "<head commit>"} reason="<what you ran and saw>" (CLI: bb firstmate deliveries verify ${id} --commit ${short(head) || "<head commit>"} --reason "<what you ran and saw>").`,
+      "CI and unit tests are not verification. Drive the changed surface (the project's verify skill if it has one), then record what you drove and saw:",
+      `${row === undefined ? `firstmate_deliveries action=register url=${t.url}, then ` : ""}firstmate_deliveries action=verify id=${id} commitSha=${short(head)} driven="<what you drove>" seen="<what you saw>" (CLI: bb firstmate deliveries verify ${id} --commit ${short(head)} --driven "<what you drove>" --seen "<what you saw>").`,
       `Or, only if the owner waived verification in words: firstmate_merge allowUnverified="<the owner's own words>" (CLI: --allow-unverified "<the owner's own words>").`,
     ].join("\n"));
   }
@@ -7784,7 +7794,8 @@ export default async function plugin(bb: BbPluginApi) {
       await guardForeignPr(crew, pr.url, override,opts.caller);
       let waived = "";
       if (pr.state !== "merged") {
-        waived = requireVerification(pr, opts.allowUnverified, opts.caller ?? crew.parentThreadId ?? "");
+        const verification = requireVerification(pr, opts.allowUnverified, opts.caller ?? crew.parentThreadId ?? "");
+        waived = verification.note;
         const args = [crew.id, pr.url];
         if (allowRedCheck?.trim()) args.push("--allow-red", allowRedCheck.trim());
         if (allowMissingCheck?.trim()) args.push("--allow-missing", allowMissingCheck.trim());
@@ -7800,6 +7811,7 @@ export default async function plugin(bb: BbPluginApi) {
           result = await runFmScript({ script: "pr-merge", args, fmHome: nativeHome, hostId, timeoutMs: 180_000 });
         }
         requireNativeSuccess(result, `PR merge ${crew.id}`);
+        verification.record();
         // fm-pr-merge reads the PR back from GitHub before it prints this line, so it
         // is the authoritative landing proof; BB's PR cache can lag behind it.
         let landed = /verified: \S+ is merged \(state=MERGED/.test(result.output);
@@ -7839,8 +7851,10 @@ export default async function plugin(bb: BbPluginApi) {
       await settle("merged (already landed)", f.url);
       return `Already merged: ${landedLine}\n${keep ? kept : `Crew ${crew.id} retired.`}`;
     }
-    const unverified = requireVerification(target ?? { url: f.url, number: Number(/\/pull\/(\d+)/.exec(f.url)?.[1]), title: "", state: f.state, source: "environment", headSha: "" },
-      opts.allowUnverified, opts.caller ?? crew.parentThreadId ?? "");
+    const fresh = target ?? { url: f.url, number: Number(/\/pull\/(\d+)/.exec(f.url)?.[1]), title: "", state: f.state, source: "environment",
+      headSha: hostId === null ? "" : (await ghPrIdentity(hostId, f.url))?.headSha ?? "" };
+    const verification = requireVerification(fresh, opts.allowUnverified, opts.caller ?? crew.parentThreadId ?? "");
+    const unverified = verification.note;
     f = await prepareEnvironmentPullRequest(envId);
     const waive = (allowRedCheck ?? "").trim();
     const redChecks = waive !== "" && f.checksState === "failing" ? await redCheckNames(crew, f.url) : null;
@@ -7855,6 +7869,7 @@ export default async function plugin(bb: BbPluginApi) {
     });
     if (!gate.ok) throw new Error(`Refusing: ${gate.reason}`);
     await bb.sdk.environments.mergePullRequest({ environmentId: envId, method: "merge" });
+    verification.record();
     const output = await crewOutput(crew, 300);
     const waived = gate.waived.length > 0 ? ` (waived red check: ${gate.waived.join(", ")})` : "";
     await settle(`${parseOutcome(output) ?? "merged"}${waived}${unverified ? " (not verified; owner waived it)" : ""}`, f.url);
@@ -11200,7 +11215,8 @@ export default async function plugin(bb: BbPluginApi) {
     dispatchHelp,
     "  bb firstmate launches list [--limit n] [--offset n] [--json]   # uncertain slots require reconciliation",
     "  bb firstmate launches adopt <task-id> --thread <thread-id> [--check] [--json]   # exact legacy registration repair; no turn or merge",
-    "  bb firstmate deliveries list|inspect|register|reconcile|assign|abandon|clear-hold|verify [id] [--from manager] [--commit sha] [--reason evidence] [--authorized]",
+    "  bb firstmate deliveries list|inspect|register|reconcile|assign|abandon|clear-hold [id] [--from manager] [--reason evidence] [--authorized]",
+    '  bb firstmate deliveries verify <id> --commit <head sha> --driven "<what you drove>" --seen "<what you saw>"   # a crew that drove it may record it',
     "  bb firstmate prs [--json]   # read-only: open PRs by this GitHub account in your projects, untracked ones first",
     "  bb firstmate deliveries account <id> --failure <id> --scope author|baseline --follow-up-task <existing-task> --reason <evidence> --authorized",
     "  sendAt is unsupported; backlog waitUntil requires later explicit dispatch.",
@@ -12129,7 +12145,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  registerCaptainTool({ name:"firstmate_deliveries",description:"Durable PR health and obligations independent of worker retention. List, inspect, register, reconcile, account each independent failure to an existing authorized follow-up, explicitly assign, abandon with authority, clear-hold after checking commits pushed since a do-not-merge verdict (reason required), or record agreed merge verification.",parameters:deliveryParams,
+  registerCaptainTool({ name:"firstmate_deliveries",description:"Durable PR health and obligations independent of worker retention. List, inspect, register, reconcile, account each independent failure to an existing authorized follow-up, explicitly assign, abandon with authority, clear-hold after checking commits pushed since a do-not-merge verdict (reason required), or verify: record what was driven on the real changed surface (driven) and what was seen (seen) at commitSha. A crew that drove the change may record it.",parameters:deliveryParams,
     async execute(input,ctx) { return (await deliveryOperation(input,ctx)).map(deliveryLine).join("\n") || "No unresolved deliverables."; } });
 
   registerCaptainTool({
@@ -13791,7 +13807,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "activity", summary: "Bounded real BB activity for the native watcher", usage: "bb firstmate activity <thread-id> --json" },
       { name: "bearings", summary: "Fleet digest", usage: "bb firstmate bearings [--json]" },
       { name: "wake", summary: "Drain the durable crew→captain wake queue (present, or --ack-through <seq> --recovery-generation <gen>)", usage: "bb firstmate wake [--ack-through <seq> --recovery-generation <gen>]" },
-      { name: "deliveries", summary: "Durable PR health and follow-up", usage: "bb firstmate deliveries list|inspect|register|reconcile|assign|abandon|clear-hold|verify [id] [--from <manager>] [--commit <sha>] [--reason <evidence>] [--authorized]\nbb firstmate deliveries register --url <PR url> [--crew <id>]   (no --crew: a PR you opened yourself)\nbb firstmate deliveries account <id> --failure <id> --scope author|baseline --follow-up-task <existing-task> --reason <evidence> --authorized" },
+      { name: "deliveries", summary: "Durable PR health and follow-up", usage: "bb firstmate deliveries list|inspect|register|reconcile|assign|abandon|clear-hold [id] [--from <manager>] [--reason <evidence>] [--authorized]\nbb firstmate deliveries verify <id> --commit <head sha> --driven \"<what you drove>\" --seen \"<what you saw>\"   (the owning captain, or a crew that drove it)\nbb firstmate deliveries register --url <PR url> [--crew <id>]   (no --crew: a PR you opened yourself)\nbb firstmate deliveries account <id> --failure <id> --scope author|baseline --follow-up-task <existing-task> --reason <evidence> --authorized" },
       { name: "program", summary: "Programs (epics): one record per multi-ticket job, open until every ticket is done or dropped", usage: "bb firstmate program list | show <P-id> | refresh | create <epic-url> [--title t] [--task T<n>] [--ref tg:<chat>:<msg> ...] | set <P-id> <ticket> [<ticket> ...] --state blocked|dropped|ready|running|in-review|done [--reason r] [--ask id] [--crew id] [--pr ref]" },
       { name: "prs", summary: "Read-only: open PRs by this GitHub account in the captain's projects with their tracking status, untracked first", usage: "bb firstmate prs [--json]" },
       { name: "launches", summary: "Inspect reservations or explicitly adopt an existing legacy worker", usage: "bb firstmate launches list | adopt <task-id> --thread <thread-id> [--check] [--json]" },
@@ -14166,7 +14182,7 @@ export default async function plugin(bb: BbPluginApi) {
           }
           case "deliveries": {
             const input=deliveryParams.parse({ action:rest[0] ?? "list",id:rest[1],crewId:flagStr(flags,"crew"),url:flagStr(flags,"url"),from:flagStr(flags,"from") === "none" ? null : flagStr(flags,"from"),
-              failureId:flagStr(flags,"failure"),scope:flagStr(flags,"scope"),followUpTask:flagStr(flags,"follow-up-task"),requirement:flagStr(flags,"requirement"),reason:flagStr(flags,"reason"),commitSha:flagStr(flags,"commit"),authorized:flags.has("authorized"),all:flags.has("all"),
+              failureId:flagStr(flags,"failure"),scope:flagStr(flags,"scope"),followUpTask:flagStr(flags,"follow-up-task"),requirement:flagStr(flags,"requirement"),reason:flagStr(flags,"reason"),commitSha:flagStr(flags,"commit"),driven:flagStr(flags,"driven"),seen:flagStr(flags,"seen"),authorized:flags.has("authorized"),all:flags.has("all"),
               limit:flagStr(flags,"limit") ? Number(flagStr(flags,"limit")) : undefined,offset:flagStr(flags,"offset") ? Number(flagStr(flags,"offset")) : undefined });
             const rows=await deliveryOperation(input,ctx);
             return reply(rows,rows.map(deliveryLine).join("\n") || "No unresolved deliverables.");

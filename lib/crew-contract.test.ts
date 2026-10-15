@@ -5,7 +5,6 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSy
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { BRIEF_SKILLS, crewPlaybook, crewSkillBlock, crewSkillRoot, notVerifiedNote, notVerifiedRequest, PLAYBOOK_CHOICES, playbookStepCount, reportGapNote, reportGapRequest, reportGaps, skillCheckScript, skillRoutingLinkScript, verifyStepGap } from "./crew-contract.ts";
-import { namesOnlyCi } from "./pr-delivery.ts";
 
 const HOME = homedir();
 
@@ -95,7 +94,6 @@ test("a feature brief gives full paths, the step checklist, no-comments and the 
     "If a skill is not installed, continue and say so in your report.",
     ...HOUSE_RULES,
     MERGE_RULE,
-    ...MERGE_SEQUENCE,
     ...HOST_LIMIT,
     ...IN_PLACE_OF_A_SKIP,
     ...VERIFY_RULES,
@@ -477,12 +475,10 @@ test("the 0940c38e report's pending verify step is NOT VERIFIED", () => {
     "pending: \"Verify on the same surface (waiting Secret and dependency scan + the other five required jobs)\"");
 });
 
-test("a verify step that is skipped, blocked, missing or names only CI is NOT VERIFIED", () => {
+test("a verify step that is skipped, blocked or missing is NOT VERIFIED", () => {
   const withStep = (line: string) => REPORT_0940C38E.replace(/^- pending: Verify.*$/m, line);
   assert.match(verifyStepGap(withStep("- skip: Verify on the same surface: no staging access"), BUG_FIX_PLAYBOOK) ?? "", /^skipped: /);
   assert.match(verifyStepGap(withStep("- blocked: Verify on the same surface: no bot token"), BUG_FIX_PLAYBOOK) ?? "", /^blocked: /);
-  assert.match(verifyStepGap(withStep("- ✓ Verify on the same surface (CI green, 112 unit tests pass)"), BUG_FIX_PLAYBOOK) ?? "", /^names only CI or tests: /);
-  assert.match(verifyStepGap(withStep("- ✓ 4. Verify on the same surface: all required checks passed"), BUG_FIX_PLAYBOOK) ?? "", /^names only CI or tests: /);
   assert.equal(verifyStepGap(withStep(""), BUG_FIX_PLAYBOOK), "missing: no \"Verify on the same surface\" line");
 });
 
@@ -493,15 +489,6 @@ test("a verify step that drove the real surface passes, and a playbook without a
   assert.equal(verifyStepGap(REPORT_0940C38E.replace(/^- pending: Verify.*$/m, "✓ 4. step"), BUG_FIX_PLAYBOOK), null);
   const investigation = "### Investigation\n\n1. Route through the **how** skill.\n2. Throughput checkpoint stays one line.\n3. Produce the output.\n4. Apply the **unslop** skill.\n";
   assert.equal(verifyStepGap("✓ how\n✓ checkpoint", investigation), null);
-});
-
-test("evidence that names only CI or tests is not verification", () => {
-  for (const text of ["CI green", "all required checks passed", "112 unit tests pass", "waiting Secret and dependency scan + the other five required jobs", "lint, typecheck and build pass"]) {
-    assert.equal(namesOnlyCi(text), true, text);
-  }
-  for (const text of ["Smoke check passed", "sent hello to the staging bot; the reply arrived", "drove /status in Slack; CI green too", "passed"]) {
-    assert.equal(namesOnlyCi(text), false, text);
-  }
 });
 
 test("the NOT VERIFIED note goes to the captain and says the PR cannot merge without a record", () => {
@@ -530,10 +517,9 @@ test("every brief says merges go only through bb firstmate merge, never gh pr me
   }
 });
 
-test("every brief, including a release crew's, gives the per-PR drive, record and merge steps", () => {
+test("a release or operator brief gives the per-PR drive, record and merge steps after the host rules", () => {
   assert.equal(crewPlaybook({ shape: "ship", title: "Release the green PRs", task: "" }), "none");
-  for (const playbook of PLAYBOOK_CHOICES) {
-    const block = crewSkillBlock({ shape: "ship", title: "Release the green PRs", task: "Merge the approved PRs", providerId: "codex", playbook });
-    assert.ok(block.includes([MERGE_RULE, ...MERGE_SEQUENCE].join("\n")), `${playbook}\n${block}`);
-  }
+  const release = crewSkillBlock({ shape: "ship", title: "Release the green PRs", task: "Merge the approved PRs", providerId: "codex" });
+  assert.ok(release.includes([MERGE_RULE, ...HOST_LIMIT, ...MERGE_SEQUENCE].join("\n")), release);
+  assert.ok(!crewSkillBlock({ shape: "ship", title: "Add a CSV export", task: "" }).includes(MERGE_SEQUENCE[0]!));
 });

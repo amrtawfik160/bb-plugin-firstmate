@@ -2452,6 +2452,12 @@ function shipRow(id: string, threadId: string, parentThreadId: string | null, po
   };
 }
 
+// The merge gate reads the PR head fresh from GitHub; this is the answer for o/r#n.
+function prViewAnswer(cmd: string, extra: Record<string, unknown> = {}) {
+  const n = Number(/\/pull\/(\d+)/.exec(cmd)?.[1] ?? 1);
+  return JSON.stringify({ number: n, url: `https://github.com/o/r/pull/${n}`, title: "t", headRefName: "fm/c1-x", headRefOid: "a".repeat(40), state: "OPEN", mergeable: "MERGEABLE", ...extra });
+}
+
 function hostOutput(text: string, code = 0) {
   const body = `\n${text}\n__FM_HOST_RC:${code}\n`;
   return { nextSeq: 1, chunks: [{ dataBase64: Buffer.from(body).toString("base64") }] };
@@ -2487,6 +2493,7 @@ test("merge lands a PR with zero checks (no_checks) on the captain's word", asyn
   const host = await load();
   try {
     await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    stubRoutedHost(host, (cmd) => (unwrapHostCommand(cmd).includes("gh pr view") ? { payload: prViewAnswer(unwrapHostCommand(cmd)) } : {}));
     host.harness.sdk.stub("threads.list", async () => []);
     host.harness.sdk.stub("threads.get", async () =>
       makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }),
@@ -2508,7 +2515,7 @@ test("merge lands a PR with zero checks (no_checks) on the captain's word", asyn
     const result = await host.harness.behavior.runCli(["merge", "c1", "--allow-unverified", "the owner said merge it", "--yes"]);
     assert.equal(result.exitCode, 0, result.stderr);
     assert.equal(merged, 1);
-    assert.match(result.stdout, /Merged #1\nhttps:\/\/github\.com\/o\/r\/pull\/1/);
+    assert.match(result.stdout, /Merged #1 t\nhttps:\/\/github\.com\/o\/r\/pull\/1/);
     assert.deepEqual((await host.bb.storage.kv.get("crews")) as unknown[], []);
   } finally {
     await host.harness.lifecycle.dispose();
@@ -2593,7 +2600,11 @@ test("merge runs native merge and teardown before retiring the crew", async () =
       return { id: "term_1" };
     });
     host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
-    host.harness.sdk.stub("terminals.output", async () => hostOutput(""));
+    host.harness.sdk.stub("terminals.output", async () => {
+      const cmd = hostCommands.at(-1) ?? "";
+      if (!cmd.includes("gh pr view")) return hostOutput("");
+      return hostRcPayload(JSON.stringify({ protocol: "FM_HOST_CAPTURE_V1", exitCode: 0, stdout: prViewAnswer(unwrapHostCommand(cmd)), stderr: "" }), 0);
+    });
     host.harness.sdk.stub("terminals.close", async () => ({}));
     const result = await host.harness.behavior.runCli(["merge", "c1", "--allow-unverified", "the owner said merge it", "--yes", "--allow-missing", "required-check"]);
     assert.equal(result.exitCode, 0, result.stderr);
@@ -9821,7 +9832,11 @@ function nativeMergeHost() {
 }
 
 function stubNativeMerge(host: Awaited<ReturnType<typeof load>>, router: (cmd: string) => { payload?: string; code?: number }, pr: unknown) {
-  const routed = stubRoutedHost(host, (cmd) => router(unwrapHostCommand(cmd)));
+  const routed = stubRoutedHost(host, (cmd) => {
+    const c = unwrapHostCommand(cmd), r = router(c);
+    if (!c.includes("gh pr view") || (r.code ?? 0) !== 0) return r;
+    return { ...r, payload: prViewAnswer(c, r.payload ? JSON.parse(r.payload) : {}) };
+  });
   host.harness.sdk.stub("threads.list", async () => []);
   host.harness.sdk.stub("threads.get", async (input: { threadId: string }) =>
     makeThreadResponse({ id: input.threadId, status: "idle", environmentId: "env_wt" }));
@@ -9848,7 +9863,7 @@ test("merge trusts fm-pr-merge's verified MERGED readback over BB's stale PR cac
     const result = await host.harness.behavior.runCli(["merge", "c1", "--allow-unverified", "the owner said merge it", "--yes"]);
     assert.equal(result.exitCode, 0, result.stderr);
     assert.doesNotMatch(result.stdout, /Landing not yet confirmed/);
-    assert.match(result.stdout, /Merged #1\nhttps:\/\/github\.com\/o\/r\/pull\/1\nNot verified: the owner waived verification for head \(unknown\) in these words: "the owner said merge it"\nCrew c1 retired/);
+    assert.match(result.stdout, /Merged #1 t\nhttps:\/\/github\.com\/o\/r\/pull\/1\nNot verified: the owner waived verification for head aaaaaaa in these words: "the owner said merge it"\nCrew c1 retired/);
     assert.deepEqual(await host.bb.storage.kv.get("crews"), []);
   } finally {
     await host.harness.lifecycle.dispose();
@@ -9938,6 +9953,7 @@ test("merge polls a lazily computed UNKNOWN mergeability instead of refusing at 
   process.env.FM_MERGEABLE_POLL_MS = "0";
   try {
     await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    stubRoutedHost(host, (cmd) => (unwrapHostCommand(cmd).includes("gh pr view") ? { payload: prViewAnswer(unwrapHostCommand(cmd)) } : {}));
     host.harness.sdk.stub("threads.list", async () => []);
     host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }));
     host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
