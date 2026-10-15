@@ -198,3 +198,26 @@ test('a crew records verification for a PR it drove; the record keeps its crew i
   assert.match(out,/^Merged #2391 Change 2391\n/);assert.equal(merges(commands).length,1);
  }finally{await host.harness.lifecycle.dispose();}
 });
+
+// PR 129 repair: a release crew's merge of another crew's PR was refused as foreign,
+// even with its own verification record for the head.
+test('a crew of the same captain merges another crew\'s PR once its head is verified; another captain\'s crew is still refused',async()=>{
+ const {host,commands}=await deck([2391],{verified:false});try {
+  const release={...crew,id:'rel00001',task:'release the green PRs',threadId:'thr_release'};
+  const stranger={...crew,id:'rel00002',task:'release other PRs',threadId:'thr_rel_other',parentThreadId:'thr_other'};
+  await host.bb.storage.kv.set('crews',[crew,release,stranger]);
+  await host.bb.storage.kv.set('captain-project:thr_cap','proj_1');
+  await host.bb.storage.kv.set('captain-project:thr_other','proj_1');
+  const merge=threadId=>host.harness.behavior.runCli(['merge',CREW,'--yes','--pr','2391'],{threadId,projectId:'proj_1'});
+  const unverified=await merge('thr_release');
+  assert.equal(unverified.exitCode,1);assert.match(unverified.stderr,/is the PR of crew 9ceeb10f/);
+  const recorded=await host.harness.behavior.runCli(['deliveries','verify','cyndra-ai/cyndra-saas#2391','--commit',head(2391),'--driven','sent hello to the staging bot','--seen','the reply arrived'],{threadId:'thr_release',projectId:'proj_1'});
+  assert.equal(recorded.exitCode,0,recorded.stderr);
+  const other=await merge('thr_rel_other');
+  assert.equal(other.exitCode,1);assert.match(other.stderr,/is the PR of crew 9ceeb10f/);
+  assert.deepEqual(merges(commands),[]);
+  const cli=await merge('thr_release');
+  assert.equal(cli.exitCode,0,cli.stderr);assert.match(cli.stdout,/Merged #2391 Change 2391/);
+  assert.equal(merges(commands).length,1);
+ }finally{await host.harness.lifecycle.dispose();}
+});
