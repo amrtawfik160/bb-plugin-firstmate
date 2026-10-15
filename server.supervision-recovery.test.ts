@@ -918,6 +918,10 @@ test("the toolchain report lists a provider that unnamed dispatches skip, with t
 // the next tell answered "No crew d883a2a4", and the captain had to dispatch a new crew.
 function stubMergeSdk(host: Host) {
   const calls = { merged: 0 };
+  // The merge gate reads the PR head fresh from GitHub.
+  stubRoutedHost(host, (cmd) => (cmd.includes("gh pr view")
+    ? { payload: JSON.stringify({ number: 1, url: "https://github.com/o/r/pull/1", title: "t", headRefName: "fm/c1-x", headRefOid: "a".repeat(40), state: "OPEN" }) }
+    : {}));
   host.harness.sdk.stub("threads.list", async () => []);
   host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }));
   host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
@@ -942,10 +946,10 @@ test("merge with --keep-crew merges the PR and leaves the crew listed and tell-a
   try {
     await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
     const calls = stubMergeSdk(host);
-    const result = await host.harness.behavior.runCli(["merge", "c1", "--yes", "--keep-crew"], { threadId: "thr_cap" });
+    const result = await host.harness.behavior.runCli(["merge", "c1", "--allow-unverified", "the owner said merge it", "--yes", "--keep-crew"], { threadId: "thr_cap" });
     assert.equal(result.exitCode, 0, result.stderr);
     assert.equal(calls.merged, 1);
-    assert.match(result.stdout, /Merged #1\nhttps:\/\/github\.com\/o\/r\/pull\/1/);
+    assert.match(result.stdout, /Merged #1 t\nhttps:\/\/github\.com\/o\/r\/pull\/1/);
     assert.match(result.stdout, /Crew c1 kept, not retired/);
     assert.doesNotMatch(result.stdout, /Crew c1 retired/);
     assert.equal(host.harness.sdk.callsTo("threads.stop").length, 0);
@@ -970,7 +974,7 @@ test("merge without --keep-crew retires the crew as before and says so", async (
   try {
     await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
     stubMergeSdk(host);
-    const result = await host.harness.behavior.runCli(["merge", "c1", "--yes"], { threadId: "thr_cap" });
+    const result = await host.harness.behavior.runCli(["merge", "c1", "--allow-unverified", "the owner said merge it", "--yes"], { threadId: "thr_cap" });
     assert.equal(result.exitCode, 0, result.stderr);
     assert.match(result.stdout, /Crew c1 retired \(landed\)\./);
     assert.deepEqual((await host.bb.storage.kv.get("crews")) as unknown[], []);

@@ -41,8 +41,10 @@ test('merged and closed PRs leave the open list even when their captain thread i
   for(const [n,owner] of [[1,'thr_gone'],[2,'thr_archived'],[3,'thr_gone']]) store.register({url:`https://github.com/acme/repo/pull/${n}`,taskId:`t${n}`,projectId:'proj_1',owner,home:'',worker:`thr_w${n}`,requirement:'pr'});
   hostCommands(host,command=>command.includes('gh pr view') ? {payload:JSON.stringify(forge(prNumber(command)===3?'CLOSED':'MERGED'))} : {code:0});
   await host.harness.behavior.runSchedule('pr-delivery-follow-up');
-  assert.equal(store.get('acme/repo#1').status,'complete');
-  assert.equal(store.get('acme/repo#2').status,'complete');
+  // Merged on GitHub with no verification record: whoever takes these PRs over is told.
+  assert.equal(store.get('acme/repo#1').status,'merged-unverified');
+  assert.equal(store.get('acme/repo#2').status,'merged-unverified');
+  assert.equal(store.list({owner:'thr_gone'}).filter(r=>r.forgeState==='open').length,0);
   assert.equal(store.get('acme/repo#3').status,'closed-needs-disposition');
   assert.equal(store.get('acme/repo#3').ownerNeeded,true,'a lost captain is still shown as needing a new manager');
  }finally{await host.harness.lifecycle.dispose();}
@@ -58,7 +60,7 @@ test('a live captain keeps its PR in another project, and one lost record does n
   await host.harness.behavior.runSchedule('pr-delivery-follow-up');
   const cross=store.get('acme/other#5');
   assert.equal(cross.ownerNeeded,false);assert.equal(cross.owner,'thr_cap');assert.equal(cross.forgeState,'open');
-  assert.equal(store.get('acme/repo#6').status,'complete');
+  assert.equal(store.get('acme/repo#6').status,'merged-unverified');
  }finally{await host.harness.lifecycle.dispose();}
 });
 
@@ -92,13 +94,13 @@ test('a PR whose captain was marked lost is read on GitHub again within ten minu
   t.mock.method(Date,'now',()=>start+10*60_000);
   await host.harness.behavior.runSchedule('pr-delivery-follow-up');
   const live=store.get('acme/repo#20');
-  assert.equal(live.status,'complete','a merged PR of a captain wrongly marked lost completes');
+  assert.equal(live.status,'merged-unverified','a merged PR of a captain wrongly marked lost is read and marked');
   assert.equal(live.ownerNeeded,false);
-  assert.equal(store.get('acme/repo#21').status,'complete','a merged PR of an archived captain completes');
+  assert.equal(store.get('acme/repo#21').status,'merged-unverified','a merged PR of an archived captain is read and marked');
  }finally{await host.harness.lifecycle.dispose();}
 });
 
-test('twelve PRs of a deleted captain all complete without one pass pushing the rest back an hour',async()=>{
+test('twelve PRs of a deleted captain are all read as merged without one pass pushing the rest back an hour',async()=>{
  const host=await base();try {
   host.harness.sdk.stub('threads.get',async()=>{throw new Error('HTTP 404: Thread not found');});
   const store=createDeliveries(host.bb.storage.database());
@@ -106,7 +108,10 @@ test('twelve PRs of a deleted captain all complete without one pass pushing the 
   hostCommands(host,command=>command.includes('gh pr view') ? {payload:JSON.stringify(forge('MERGED'))} : {code:0});
   await host.harness.behavior.runSchedule('pr-delivery-follow-up');
   await host.harness.behavior.runSchedule('pr-delivery-follow-up');
-  assert.deepEqual(store.list({owner:'thr_gone'}).map(r=>r.id),[]);
+  const rows=store.list({owner:'thr_gone'});
+  assert.equal(rows.length,12);
+  assert.deepEqual([...new Set(rows.map(r=>`${r.forgeState} ${r.status}`))],['merged merged-unverified']);
+  assert.ok(rows.every(r=>r.nextCheckAt>=Date.now()+86_400_000-60_000),'a merged PR without a manager is not re-read every five minutes');
  }finally{await host.harness.lifecycle.dispose();}
 });
 
@@ -371,5 +376,35 @@ test('the open-PR scan does not use GitHub search, counts only PRs of the signed
   assert.equal(lists.length,1,'a project with only retired crews is not listed again within ten minutes');
   now=start+10*60_000+1000;await host.harness.behavior.runSchedule('pr-delivery-follow-up');
   assert.equal(lists.length,2);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+// 15 Oct: the daily reminder named cyndra-saas 2322 and 2326 as open. Both merged on 14 Oct.
+// Every GitHub read of them since 13 Oct failed to parse (about 100 KB of JSON, of which the
+// host reader keeps the last 64 KB), so their rows still said open.
+test('the daily reminder lists only PRs the current open-PR scan confirms open',async(t)=>{
+ const host=await base();try {
+  await host.bb.storage.kv.set('crews',[crew('aa11','thr_w1','thr_cap')]);
+  createLaunches(host.bb.storage.database()).save(launch('aa11','thr_w1','thr_cap'));
+  const sent=[];host.harness.sdk.stub('threads.send',async args=>{sent.push(JSON.stringify(args.input));return{delivery:'queued'};});
+  const now=Date.parse('2026-10-15T09:00:00Z');t.mock.method(Date,'now',()=>now);
+  const store=createDeliveries(host.bb.storage.database());
+  for(const n of [2322,2326]){
+   const r=store.register({url:`https://github.com/acme/repo/pull/${n}`,taskId:'aa11',projectId:'proj_1',owner:'thr_cap',home:'/fm',worker:'thr_w1',requirement:'pr'});
+   store.save({...r,status:'pr-delivered',forgeState:'open',headSha:'sha1',observedAt:Date.parse('2026-10-13T21:54:30Z'),touchedAt:Date.parse('2026-10-12T10:00:00Z'),notification:{...r.notification,desired:'x',delivered:'x'}});
+  }
+  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle',environmentId:`env_${threadId}`}));
+  host.harness.sdk.stub('environments.get',async({environmentId})=>({id:environmentId,hostId:'host_1',status:'ready',isWorktree:true,path:`/wt/${environmentId.replace('env_','')}`,branchName:'bb/ship-aa11'}));
+  hostCommands(host,command=>{
+   if(isOpenList(command))return{payload:JSON.stringify([pr(538,'fm/aa11','2026-10-10T09:00:00Z')])};
+   if(command.includes('gh pr view')&&(prNumber(command)===2322||prNumber(command)===2326))return{payload:'"}],"comments":[{"body":"truncated'};
+   if(command.includes('gh pr view'))return{payload:JSON.stringify(forge('OPEN'))};
+   return{code:0};
+  });
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  const asks=sent.filter(s=>s.includes('Decide for each'));
+  const text=asks.map(s=>JSON.parse(s).map(part=>part.text ?? '').join('\n')).join('\n');
+  assert.doesNotMatch(text,/pull\/2322|pull\/2326/,'a PR missing from the open list is not put to the captain as open');
  }finally{await host.harness.lifecycle.dispose();}
 });

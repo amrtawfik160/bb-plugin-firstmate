@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import type { BbPluginApi } from '@get-bb/plugin-sdk';
 type Database = ReturnType<BbPluginApi['storage']['database']>;
 export type DeliveryRequirement = 'pr' | 'merged' | 'merged-and-verified';
-export type DeliveryStatus = 'draft' | 'waiting-checks' | 'failing-checks' | 'waiting-review' | 'waiting-native-gates' | 'changes-requested' | 'on-hold' | 'changed-since-hold' | 'waiting-approval' | 'ready-to-merge' | 'merged-needs-verification' | 'closed-needs-disposition' | 'pr-delivered' | 'complete' | 'explicitly-abandoned';
+export type DeliveryStatus = 'draft' | 'waiting-checks' | 'failing-checks' | 'waiting-review' | 'waiting-native-gates' | 'changes-requested' | 'on-hold' | 'changed-since-hold' | 'waiting-approval' | 'ready-to-merge' | 'needs-verification' | 'merged-needs-verification' | 'merged-unverified' | 'closed-needs-disposition' | 'pr-delivered' | 'complete' | 'explicitly-abandoned';
 export interface CheckFailure {
   id:string; name:string; url:string; headSha:string; resolvedAt:number|null;
   accounting?:{scope:'author'|'baseline'; taskId:string; worker:string; evidence:string; actor:string; at:number};
@@ -23,6 +23,10 @@ export interface DeliveryRecord {
   actionDueAt: number;
   /** Head commit that carried a do-not-merge verdict. Set until the PR merges or the captain clears it. */
   heldHead?: string | null;
+  /** The owner's own words that waived verification for one merge of this head. */
+  unverifiedMerge?: { words: string; actor: string; headSha: string; at: number } | null;
+  /** What was driven on the real changed surface at commitSha, and what was seen. crewId names the crew that recorded it. */
+  verification?: { crewId: string | null; actor: string; commitSha: string; driven: string; seen: string; at: number } | null;
   updatedAt: number;
 }
 export interface ForgeObservation {
@@ -60,7 +64,9 @@ const BOARD_PR_STATE: Record<DeliveryStatus, string | null> = {
   'pr-delivered': 'ready to merge',
   'waiting-approval': 'ready to merge',
   'ready-to-merge': 'ready to merge',
+  'needs-verification': 'not verified',
   'merged-needs-verification': null,
+  'merged-unverified': null,
   'closed-needs-disposition': null,
   'complete': null,
   'explicitly-abandoned': null,
@@ -69,7 +75,7 @@ const BOARD_PR_STATE: Record<DeliveryStatus, string | null> = {
 export function boardPullRequests(records: readonly DeliveryRecord[]): BoardPr[] {
   return records.flatMap((r) => {
     // A PR-only delivery keeps its status while checks run; its blocker says so.
-    const state = r.status === 'pr-delivered' && r.blocker !== '' ? 'checks running' : BOARD_PR_STATE[r.status];
+    const state = r.status === 'pr-delivered' && r.blocker !== '' ? 'checks running' : r.status === 'pr-delivered' && !verifiedHead(r) ? 'not verified' : BOARD_PR_STATE[r.status];
     if (state === null || state === undefined || r.forgeState === 'merged' || r.forgeState === 'closed') return [];
     const needsOwner = r.ownerNeeded || r.status === 'waiting-approval' || r.status === 'ready-to-merge';
     return [{ ref: r.id, url: r.url, ...(r.title ? { title: r.title } : {}), state: r.ownerNeeded ? 'waiting on you' : state, needsOwner, openedAt: r.openedAt ?? r.updatedAt }];
@@ -100,12 +106,14 @@ export function decisionLine(r: DeliveryRecord, now = Date.now()) {
 /** How often a PR without a live manager is read on GitHub, so a merge or close
  * still leaves the open list within minutes. */
 export const LOST_OWNER_RECHECK_MS = 5 * 60_000;
+const verifiedHead = (r: DeliveryRecord) => r.verifiedCommitSha !== null && r.verifiedCommitSha === r.headSha;
+const short = (sha: string) => sha.slice(0, 7);
 const terminal = (r: DeliveryRecord) => r.status === 'complete' || r.status === 'explicitly-abandoned';
 function notificationKey(r: DeliveryRecord) {
   return createHash('sha256').update(JSON.stringify([r.headSha, r.status, r.owner, r.ownerNeeded, r.blocker, (r.failures??[]).filter(f=>f.resolvedAt===null).map(f=>[f.id,f.accounting??null])])).digest('hex');
 }
 function actionable(r: DeliveryRecord) {
-  return r.ownerNeeded || ['failing-checks','changes-requested','changed-since-hold','waiting-review','waiting-native-gates','waiting-approval','ready-to-merge','merged-needs-verification','closed-needs-disposition'].includes(r.status);
+  return r.ownerNeeded || ['failing-checks','changes-requested','changed-since-hold','waiting-review','waiting-native-gates','waiting-approval','ready-to-merge','needs-verification','merged-needs-verification','merged-unverified','closed-needs-disposition'].includes(r.status);
 }
 export function createDeliveries(db: Database) {
   db.exec(`CREATE TABLE IF NOT EXISTS deliveries (id TEXT PRIMARY KEY, owner TEXT, project TEXT NOT NULL, status TEXT NOT NULL, due INTEGER NOT NULL, record TEXT NOT NULL);
@@ -147,6 +155,11 @@ export function createDeliveries(db: Database) {
     return !!db.prepare(`SELECT 1 FROM deliveries WHERE owner=? AND project=? AND status NOT IN ('complete','explicitly-abandoned')${filter} LIMIT 1`)
       .get(owner,projectId,...(taskId === undefined ? [] : [taskId]));
   }
+  /** A delivery that still needs the task's worktree. A PR merged without a record does not:
+   * its merged commit is verified from the default branch. */
+  function needsTask(owner:string,projectId:string,taskId:string) {
+    return !!db.prepare("SELECT 1 FROM deliveries WHERE owner=? AND project=? AND status NOT IN ('complete','explicitly-abandoned','merged-unverified') AND json_extract(record,'$.taskId')=? LIMIT 1").get(owner,projectId,taskId);
+  }
   function taskRecord(owner:string,projectId:string,id:string) {
     const row=db.prepare("SELECT record FROM deliveries WHERE owner=? AND project=? AND status NOT IN ('complete','explicitly-abandoned') AND (json_extract(record,'$.taskId')=? OR EXISTS(SELECT 1 FROM json_each(json_extract(record,'$.workers')) WHERE value=?)) ORDER BY due,id LIMIT 1").get(owner,projectId,id,id) as {record:string}|undefined;
     return row ? JSON.parse(row.record) as DeliveryRecord : undefined;
@@ -185,7 +198,12 @@ export function createDeliveries(db: Database) {
       else r.failures.push({...failure,headSha:o.headSha,resolvedAt:null});
     }
     r.heldHead=o.state!=='open' ? null : o.hold ? o.headSha : prior.heldHead === o.headSha ? null : prior.heldHead ?? null;
-    if (o.state === 'merged') {
+    if (o.state === 'merged' && r.requirement !== 'merged-and-verified' && r.verifiedCommitSha === null && r.unverifiedMerge?.headSha !== o.headSha) {
+      // firstmate_merge refuses a PR without a record or the owner's waiver, so this merge came from gh or the GitHub API.
+      r.status='merged-unverified'; r.nextCheckAt=now+86_400_000;
+      r.blocker='Merged outside Firstmate with no verification record';
+      r.nextAction=r.mergeCommitSha ? `Drive the changed surface on merged commit ${short(r.mergeCommitSha)}, then record what you saw: firstmate_deliveries action=verify id=${r.id} commitSha=${short(r.mergeCommitSha)} driven=<what you drove> seen=<what you saw>. CI and unit tests are not verification` : 'Observe the merged commit before recording verification';
+    } else if (o.state === 'merged') {
       r.status = r.requirement === 'merged-and-verified' && (r.verifiedCommitSha !== o.mergeCommitSha || r.mergeCommitSha === null) ? 'merged-needs-verification' : 'complete';
       if (r.status==='complete') r.deliverySatisfiedAt=prior.deliverySatisfiedAt ?? now;
       r.blocker = r.status === 'complete' ? '' : r.mergeCommitSha ? 'Required verification has not been recorded' : 'Merged commit is not yet readable';
@@ -216,6 +234,11 @@ export function createDeliveries(db: Database) {
       r.status='waiting-native-gates';r.blocker='Standing yolo recorded; captain approval provenance is unverified';
       r.nextAction='Resolve recorded captain approval under native precedence. Already-approved green in-scope work needs no fresh merge request; an unexplained registry flag alone proves no approval. Preserve actual user holds, then use native guarded merge.';
     }
+    if (['ready-to-merge','waiting-approval','waiting-native-gates'].includes(r.status) && !verifiedHead(r)) {
+      r.status='needs-verification';
+      r.blocker=`No verification record for head ${short(r.headSha)}`;
+      r.nextAction=`Drive the changed surface on head ${short(r.headSha)}, then record what you saw: firstmate_deliveries action=verify id=${r.id} commitSha=${short(r.headSha)} driven=<what you drove> seen=<what you saw>. CI and unit tests are not verification`;
+    }
     if (r.requirement === 'pr' && o.state === 'open' && !o.draft) {
       r.deliverySatisfiedAt=prior.deliverySatisfiedAt ?? now;
       // Artifact delivery is fulfilled independently of CI and review health.
@@ -230,7 +253,7 @@ export function createDeliveries(db: Database) {
     r.notification={...prior.notification};
     if (actionable(r) || (r.deliverySatisfiedAt && !prior.deliverySatisfiedAt) || (r.status === 'complete' && prior.status !== 'complete')) r.notification.desired=notificationKey(r);
     if (!terminal(r)) {
-      if (now >= r.actionDueAt && r.status!=='pr-delivered') r.notification.desired=`overdue:${notificationKey(r)}:${r.actionDueAt}`;
+      if (now >= r.actionDueAt && r.status!=='pr-delivered' && r.status!=='merged-unverified') r.notification.desired=`overdue:${notificationKey(r)}:${r.actionDueAt}`;
       else if (!actionable(r) && !(r.deliverySatisfiedAt && !prior.deliverySatisfiedAt)) r.notification.desired=r.status==='pr-delivered' && prior.status==='pr-delivered' && !changedHead && prior.notification.desired!==prior.notification.delivered ? prior.notification.desired : null;
     }
     if (r.notification.desired !== prior.notification.desired) r.notification.attempted=null;
@@ -318,17 +341,34 @@ export function createDeliveries(db: Database) {
     if (ids.length) matching.push(`id IN (${ids.map(()=>'?').join(',')})`);
     return (db.prepare(`SELECT record FROM deliveries WHERE ${matching.join(' OR ')} ORDER BY id`).all(...taskIds,...ids) as {record:string}[]).map(row=>JSON.parse(row.record) as DeliveryRecord);
   }
-  /** The commit may be the recorded merge commit or a hex prefix of it, 7 characters or longer. The record keeps the full SHA. */
-  function verify(id:string, actor:string, commitSha:string, evidence:string) {
+  const sameCommit = (full:string, given:string) => full === given || (/^[0-9a-f]{7,}$/.test(given.trim().toLowerCase()) && full.toLowerCase().startsWith(given.trim().toLowerCase()));
+  /** Records what was driven on the real changed surface and what was seen. An open PR is
+   * verified at its current head; a merged one at its merge commit. The commit may be a hex
+   * prefix of 7 or more characters; the record keeps the full SHA. The owning manager
+   * records it, or a crew the caller vouched for (crewId). */
+  function verify(id:string, actor:string, commitSha:string, evidence:{driven:string; seen:string}, crewId:string|null=null) {
     const r=get(id); if (!r) throw new Error(`Unknown deliverable ${id}`);
-    if (r.owner !== actor) throw new Error(`Only the owning manager can verify ${r.id}`);
-    if (r.status !== 'merged-needs-verification') throw new Error(`${r.id} is ${r.status}, not merged-needs-verification`);
-    const merged=r.mergeCommitSha, given=commitSha.trim().toLowerCase();
-    if (!merged) throw new Error(`${r.id} has no recorded merge commit; reconcile it, then verify again`);
-    if (merged !== commitSha && !(/^[0-9a-f]{7,}$/.test(given) && merged.toLowerCase().startsWith(given))) throw new Error(`Commit ${commitSha} does not match the recorded merge commit ${merged.slice(0,7)} of ${r.id}; pass at least its first 7 characters`);
+    if (crewId === null && r.owner !== actor) throw new Error(`Only the owning manager can verify ${r.id}`);
+    const merged=r.status === 'merged-needs-verification' || r.status === 'merged-unverified';
+    const openPr=!merged && !terminal(r) && r.forgeState === 'open';
+    if (!merged && !openPr) throw new Error(`${r.id} is ${r.status}, not merged-needs-verification`);
+    if (merged) {
+      if (!r.mergeCommitSha) throw new Error(`${r.id} has no recorded merge commit; reconcile it, then verify again`);
+      if (!sameCommit(r.mergeCommitSha,commitSha)) throw new Error(`Commit ${commitSha} does not match the recorded merge commit ${short(r.mergeCommitSha)} of ${r.id}; pass at least its first 7 characters`);
+    } else if (!r.headSha || !sameCommit(r.headSha,commitSha)) throw new Error(`Commit ${commitSha} does not match the current head ${short(r.headSha)} of ${r.id}; pass at least its first 7 characters`);
     if (r.freshness !== 'fresh') throw new Error(`${r.id} was not freshly observed; reconcile it, then verify again`);
-    if (!evidence.trim()) throw new Error(`Verifying ${r.id} needs evidence: say what you checked`);
-    return save({ ...r, status:'complete', verifiedCommitSha:merged, notification:{...r.notification,desired:null,attempted:null},disposition:{ reason:evidence,actor,at:Date.now() },blocker:'',nextAction:'Delivery contract satisfied',updatedAt:Date.now() });
+    const driven=typeof evidence?.driven === 'string' ? evidence.driven.trim() : '', seen=typeof evidence?.seen === 'string' ? evidence.seen.trim() : '';
+    if (!driven || !seen) throw new Error(`Verifying ${r.id} needs driven (what you drove on the real changed surface) and seen (what you saw). CI and unit tests are not verification.`);
+    const at=Date.now(), sha=(openPr ? r.headSha : r.mergeCommitSha)!;
+    const verification={ crewId, actor, commitSha:sha, driven, seen, at };
+    const disposition={ reason:`driven: ${driven}; seen: ${seen}`,actor,at };
+    if (openPr) return save({ ...r, verifiedCommitSha:sha, verification, disposition, nextCheckAt:0, updatedAt:at });
+    return save({ ...r, status:'complete', verifiedCommitSha:sha, verification, notification:{...r.notification,desired:null,attempted:null},disposition,blocker:'',nextAction:'Delivery contract satisfied',updatedAt:at });
+  }
+  /** The owner's words that waive verification, recorded with the merge of this head. */
+  function waive(id:string, actor:string, words:string, headSha:string) {
+    const r=get(id); if (!r) throw new Error(`Unknown deliverable ${id}`);
+    return save({ ...r, unverifiedMerge:{ words:words.trim(), actor, headSha, at:Date.now() }, updatedAt:Date.now() });
   }
   function pendingNotifications(now=Date.now(),limit=20) {
     const rows=db.prepare("SELECT record FROM deliveries WHERE json_extract(record,'$.notification.desired') IS NOT NULL AND json_extract(record,'$.notification.desired') IS NOT json_extract(record,'$.notification.delivered') AND json_extract(record,'$.notification.retryAt')<=? ORDER BY due,id LIMIT ?").all(now,limit) as { record:string }[];
@@ -369,10 +409,17 @@ export function createDeliveries(db: Database) {
     const rows=db.prepare("SELECT record FROM deliveries WHERE owner=? AND json_extract(record,'$.forgeState')='merged' AND json_extract(record,'$.updatedAt')>=? ORDER BY json_extract(record,'$.updatedAt') DESC,id LIMIT ?").all(owner,since,Math.max(1,Math.min(limit,100))) as {record:string}[];
     return rows.map(row=>JSON.parse(row.record) as DeliveryRecord);
   }
-  return { get,save,list,undecided,touch,needingDecision,markDecisionAsked,mergedSince,conflict,hasOwned,taskRecord,ownedTaskRecord,register,observe,stale,assign,ownerLost,markOwnerNeeded,ownerRestored,transferOwner,accountFailure,abandon,clearHold,forTasks,verify,markQueued,notify,pendingNotifications };
+  return { get,save,list,undecided,touch,needingDecision,markDecisionAsked,mergedSince,conflict,hasOwned,needsTask,taskRecord,ownedTaskRecord,register,observe,stale,assign,ownerLost,markOwnerNeeded,ownerRestored,transferOwner,accountFailure,abandon,clearHold,forTasks,verify,waive,markQueued,notify,pendingNotifications };
 }
 
 const DO_NOT_MERGE = /\b(?:do not|don'?t|dont)[\s-]+merge\b|\bdo-not-merge\b/i;
+/** Fields `gh pr view --json` reads for one observation. */
+export const PR_VIEW_FIELDS = 'state,isDraft,headRefOid,statusCheckRollup,reviewDecision,reviews,mergeable,mergeCommit,title,createdAt,updatedAt,comments,labels,commits';
+/** Keeps what parseForge reads: the head commit's date, and comment and review text only
+ * where it holds the PR. The full answer for a long PR passes 100 KB; the host reader keeps
+ * the last 64 KB. A held body keeps 2,000 characters from just before its hold, so a hold
+ * late in a long comment survives. */
+export const PR_VIEW_JQ = `def held: (.body // "") | [match(${JSON.stringify(DO_NOT_MERGE.source)}; "i").offset] | first; def holdtext: held as $at | .body[([$at - 100, 0] | max):($at + 1900)]; .commits |= (.[-1:] | map({committedDate})) | .comments |= map(select(held != null) | {createdAt, body: holdtext}) | .reviews |= map({state, submittedAt, commit: {oid: .commit.oid}, body: (if held != null then holdtext else "" end)})`;
 /** A captain or crew says "do not merge" with a PR label, or with a comment written after
  * the current head's commit. A later commit is new work, so it lifts a comment hold. */
 function holdOf(r:Record<string,unknown>):string|null {

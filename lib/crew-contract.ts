@@ -128,15 +128,30 @@ export function crewSkillBlock(input: { shape: Shape; title?: string; task: stri
     "pstack always has priority. If a skill or rule conflicts with it, pstack wins.",
     "Until the owner confirms otherwise: spawn no sub-agents (no Task, poteto-agent or parallel workers). Do that work yourself, in this session.",
     "Until the owner confirms otherwise: Firstmate decides who merges and deploys. Follow the brief's delivery contract for merge and deploy.",
+    "Merge only via `bb firstmate merge <crew> --pr <n> --yes`; it refuses a PR with no verification record. Never use `gh pr merge` or GitHub's API.",
     "This host is shared. Run every type check, full test run and build as `~/.bb-firstmate/bin/fm-heavy <command>`; it waits for a host-wide slot.",
     "Do not start such commands in the background or as your own systemd service to skip the wait. Stop dev servers and browsers you started when you finish.",
   );
+  // A release or operator crew merges other crews' PRs; it records what it drove itself.
+  if (playbook === "none") {
+    lines.push(
+      "To merge a PR, do these steps at its current head:",
+      "Merge step 1: drive the change on the real surface, with the project's verify skill if it has one.",
+      "Merge step 2: `bb firstmate deliveries verify <owner/repo#n> --commit <head sha> --driven \"<what you drove>\" --seen \"<what you saw>\"`.",
+      "Merge step 3: `bb firstmate merge <crew> --pr <n> --yes`, where <crew> is the crew that opened the PR.",
+      "After a new push, do steps 1 and 2 again. If you cannot drive the change, report \"blocked: <PR>: <reason>\".",
+    );
+  }
   if (playbook !== "none") {
     lines.push(
       "Report these steps as ✓, not as a skip:",
       "- A step or skill that spawns a sub-agent, reviewer or other model (delegate, architect, interrogate, how, why, no-comments): do it yourself in this session, on your own model. Add \"(done in session)\".",
       "- Cursor-only tools: for create-skill read writing-for-agents; for /loop repeat the step yourself; for origin or gt use gh-axi.",
       "- Opening a PR, merge, deploy: follow the brief's delivery contract. If proof needs a deploy you may not run, prove it on the nearest surface you can and name what is left for Firstmate.",
+      // 15 Oct: a crew left "Verify on the same surface" pending on CI and handed a
+      // human a Telegram checklist; the PR merged and dropped every Telegram message.
+      "CI and unit tests are not verification. Your verify step means you drive the real changed surface, with the project's verify skill if it has one (e.g. `.agents/skills/verify-<app>/`), and report what you ran and saw.",
+      "If you cannot drive it, write \"blocked: <step>: <what stops you>\". Never mark it ✓ or pending, and never hand a human a manual checklist as verification.",
     );
   }
   lines.push("Save each screenshot as its own full-size PNG file. Never combine, stitch or downscale screenshots; link each file separately.");
@@ -144,7 +159,6 @@ export function crewSkillBlock(input: { shape: Shape; title?: string; task: stri
   if (playbook === "bug-fix") {
     lines.push(
       "Bug-fix proof: your final report gives the commit id of the failing test, committed before the fix.",
-      "It also gives proof that the fix works on the real product, or \"not possible: <reason>\".",
     );
   }
   // Mirrored in overlay/bin/backends/bb-worker-prompt.py (OBSTACLES_SECTION): the
@@ -166,7 +180,8 @@ export function playbookStepCount(playbook: string): number {
 export function reportGaps(report: string, steps: number): string[] {
   const gaps: string[] = [];
   if (!/^[\s#*>-]*(?:skills read\b|not read:)/im.test(report)) gaps.push("a \"Skills read:\" line");
-  const lines = report.match(/^[ \t]*(?:[-*][ \t]*)?(?:\d+\.[ \t]*)?(?:✓|skip:)/gim)?.length ?? 0;
+  // A pending or blocked line accounts for its step; verifyStepGap judges whether it was done.
+  const lines = report.match(/^[ \t]*(?:[-*][ \t]*)?(?:\d+\.[ \t]*)?(?:✓|skip:|pending:|blocked:)/gim)?.length ?? 0;
   if (lines < Math.max(steps, 1)) gaps.push(`playbook step lines (${lines} of ${Math.max(steps, 1)})`);
   return gaps;
 }
@@ -180,6 +195,45 @@ export function reportGapRequest(gaps: readonly string[]): string {
     `REPORT INCOMPLETE: your final report lacks ${gaps.join("; ")}.`,
     "Reply with only the missing parts: a line \"Skills read: <paths>\", and one line per playbook step, \"✓ <step>\" or \"skip: <step>: <reason>\".",
     "Do not redo the task. End with your DONE: line again.",
+  ].join("\n");
+}
+
+// A report step line: "✓ 4. Verify…", "- pending: Verify…", "4. skip: Verify…".
+const STEP_LINE = /^[ \t]*(?:[-*][ \t]*)?(?:(\d+)\.[ \t]*)?(✓|✔|✅|skip(?:ped)?:|pending:?|blocked:|todo:|not done:|☐|\[ \])[ \t]*(?:(\d+)\.[ \t]*)?(.*)$/gim;
+const STEP_STATE: Record<string, string> = { skip: "skipped", skipped: "skipped", pending: "pending", blocked: "blocked" };
+
+// Why a DONE report does not show the playbook's verify step done on the real
+// surface, or null. The verify step is the first step that starts with Verify or
+// Prove, or that rules out a wrong-surface result. A report with no step lines is
+// left to reportGaps.
+export function verifyStepGap(report: string, playbook: string): string | null {
+  const step = [...playbook.matchAll(/^(\d+)\.\s+(.*)$/gm)].find((m) => /^(?:\*\*)?(?:verify|prove)\b/i.test(m[2]!) || /wrong-surface/i.test(m[2]!));
+  if (step === undefined) return null;
+  const title = step[2]!.replace(/\*\*/g, "").split(/\.(?:\s|$)/)[0]!.trim();
+  const lead = title.toLowerCase().split(/\s+/).slice(0, 2).join(" ");
+  const lines = [...report.matchAll(STEP_LINE)].map((m) => ({ number: m[1] ?? m[3], mark: m[2]!.toLowerCase().replace(/:$/, ""), body: m[4]!.trim() }));
+  if (lines.length === 0) return null;
+  const line = lines.find((l) => l.number === step[1] || l.body.toLowerCase().startsWith(lead)) ?? lines.find((l) => /\bverif/i.test(l.body));
+  if (line === undefined) return `missing: no "${title}" line`;
+  // A ✓ line is not judged on its wording; the merge gate needs a record with driven and seen.
+  if (/^[✓✔✅]$/.test(line.mark)) return null;
+  return `${STEP_STATE[line.mark] ?? "not done"}: "${line.body}"`;
+}
+
+export function notVerifiedNote(crewId: string, gap: string): string {
+  return [
+    `NOT VERIFIED: crew ${crewId}'s DONE report has its verify step ${gap}.`,
+    "CI and unit tests are not verification.",
+    "Its PRs cannot merge until a verification record exists for the PR head: drive the changed surface, then firstmate_deliveries action=verify with the head commit, driven and seen.",
+    "Only the owner's own words can waive it: firstmate_merge allowUnverified=\"<owner words>\".",
+  ].join("\n");
+}
+
+export function notVerifiedRequest(gap: string): string {
+  return [
+    `VERIFY STEP NOT DONE: your report has the verify step ${gap}. CI and unit tests are not verification.`,
+    "Drive the changed surface yourself, with the project's verification skill if it has one (for example `.agents/skills/verify-<app>/` in the repo), and reply with what you ran and what you saw.",
+    "If you cannot drive it, reply \"blocked: <step>: <what stops you>\". Do not send a manual checklist for a human. End with your DONE: or BLOCKED: line again.",
   ].join("\n");
 }
 

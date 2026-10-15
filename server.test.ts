@@ -889,6 +889,55 @@ test("a playbook crew's DONE without skills and step lines gets one captain note
   }
 });
 
+// 15 Oct: crew 0940c38e (Grok, bug-fix) wrote final-report.md with its verify step pending
+// and a manual checklist for a human. PR 2315 merged and Telegram messages were dropped.
+const BUG_FIX_PLAYBOOK = "### Bug fix\n\n1. Reproduce it yourself.\n2. Binary-search the cause.\n3. Plan the fix.\n4. Verify on the same surface. The original repro now passes.\n5. Stage the commits.\n6. Run **Opening a PR**.\n";
+const REPORT_0940C38E = [
+  "# Crewmate 0940c38e final report (draft until CI green)", "", "PR: https://github.com/Cyndra-AI/cyndra-saas/pull/2315", "",
+  "## Human checks after the next runtime install", "", "Telegram", "1. Send \"hello\" in an allowed chat. The reply must use the tenant brand.", "",
+  "## Skills read", "", "- `/root/.grok/skills/poteto-mode/SKILL.md`", "",
+  "## Playbook steps", "",
+  "- ✓ Reproduce it yourself on the matching surface (gitleaks CI / local gitleaks --redact)",
+  "- ✓ Binary-search the cause (done in session)",
+  "- ✓ Plan the fix. Architect yourself. (done in session)",
+  "- pending: Verify on the same surface (waiting Secret and dependency scan + the other five required jobs)",
+  "- ✓ Stage the commits so the failing repro lands before the fix",
+  "- ✓ Opening a PR (done in session). Delivery contract: direct-PR, no merge/deploy.",
+].join("\n");
+
+test("crew 0940c38e's final report with a pending verify step is flagged NOT VERIFIED to the captain once", async () => {
+  const host = await load();
+  try {
+    stubIdleSdk(host);
+    await host.bb.storage.kv.set("crews", [{
+      id: "0940c38e", task: "close Telegram, Slack, and Discord audit gaps", title: "Fix Telegram, Slack and Discord audit gaps", projectId: "proj_1",
+      threadId: "thr_crew", parentThreadId: "thr_cap", providerId: "acp-grok", worktree: true, shape: "ship", posture: "direct-PR",
+      nativeHome: "/fmhome", createdAt: "2026-10-15T00:00:00.000Z",
+    }]);
+    host.harness.sdk.stub("environments.list", async () => [{ hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" }]);
+    host.harness.sdk.stub("files.read", async (input: unknown) => {
+      const path = String((input as { path?: string }).path ?? "");
+      const content = path.endsWith("/poteto-mode/playbooks/bug-fix.md") ? BUG_FIX_PLAYBOOK : path === "/fmhome/data/0940c38e/final-report.md" ? REPORT_0940C38E : null;
+      if (content === null) throw new Error(`no file ${path}`);
+      return { content, contentEncoding: "utf8", sizeBytes: content.length, path, sha256: "x" };
+    });
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    assert.deepEqual((await emitIdle(host, "DONE: PR https://github.com/Cyndra-AI/cyndra-saas/pull/2315")).errors, []);
+    const sends = sendCalls(host);
+    const notes = sends.filter((s) => s.threadId === "thr_cap" && s.text.includes("NOT VERIFIED: crew 0940c38e"));
+    assert.equal(notes.length, 1, JSON.stringify(sends));
+    assert.match(notes[0]!.text, /verify step pending: "Verify on the same surface \(waiting Secret and dependency scan/);
+    assert.match(notes[0]!.text, /cannot merge until a verification record exists/);
+    const toCrew = sends.filter((s) => s.threadId === "thr_crew");
+    assert.equal(toCrew.length, 1, JSON.stringify(toCrew));
+    assert.match(toCrew[0]!.text, /^VERIFY STEP NOT DONE/);
+    assert.deepEqual((await emitIdle(host, "DONE: PR https://github.com/Cyndra-AI/cyndra-saas/pull/2315")).errors, []);
+    assert.equal(sendCalls(host).filter((s) => s.text.includes("NOT VERIFIED:")).length, 1, "flagged once");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("a playbook crew's DONE with skills and every step line gets no note", async () => {
   const host = await load();
   try {
@@ -2403,6 +2452,12 @@ function shipRow(id: string, threadId: string, parentThreadId: string | null, po
   };
 }
 
+// The merge gate reads the PR head fresh from GitHub; this is the answer for o/r#n.
+function prViewAnswer(cmd: string, extra: Record<string, unknown> = {}) {
+  const n = Number(/\/pull\/(\d+)/.exec(cmd)?.[1] ?? 1);
+  return JSON.stringify({ number: n, url: `https://github.com/o/r/pull/${n}`, title: "t", headRefName: "fm/c1-x", headRefOid: "a".repeat(40), state: "OPEN", mergeable: "MERGEABLE", ...extra });
+}
+
 function hostOutput(text: string, code = 0) {
   const body = `\n${text}\n__FM_HOST_RC:${code}\n`;
   return { nextSeq: 1, chunks: [{ dataBase64: Buffer.from(body).toString("base64") }] };
@@ -2438,6 +2493,7 @@ test("merge lands a PR with zero checks (no_checks) on the captain's word", asyn
   const host = await load();
   try {
     await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    stubRoutedHost(host, (cmd) => (unwrapHostCommand(cmd).includes("gh pr view") ? { payload: prViewAnswer(unwrapHostCommand(cmd)) } : {}));
     host.harness.sdk.stub("threads.list", async () => []);
     host.harness.sdk.stub("threads.get", async () =>
       makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }),
@@ -2456,17 +2512,17 @@ test("merge lands a PR with zero checks (no_checks) on the captain's word", asyn
     }));
     let merged = 0;
     host.harness.sdk.stub("environments.mergePullRequest", async () => { merged++; return {}; });
-    const result = await host.harness.behavior.runCli(["merge", "c1", "--yes"]);
+    const result = await host.harness.behavior.runCli(["merge", "c1", "--allow-unverified", "the owner said merge it", "--yes"]);
     assert.equal(result.exitCode, 0, result.stderr);
     assert.equal(merged, 1);
-    assert.match(result.stdout, /Merged #1\nhttps:\/\/github\.com\/o\/r\/pull\/1/);
+    assert.match(result.stdout, /Merged #1 t\nhttps:\/\/github\.com\/o\/r\/pull\/1/);
     assert.deepEqual((await host.bb.storage.kv.get("crews")) as unknown[], []);
   } finally {
     await host.harness.lifecycle.dispose();
   }
 });
 
-test("allowRedCheck is separate from authority: no --yes still refuses", async () => {
+test("allowRedCheck is separate from authority: no --yes merges nothing and previews", async () => {
   const host = await load();
   try {
     await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
@@ -2474,9 +2530,13 @@ test("allowRedCheck is separate from authority: no --yes still refuses", async (
     host.harness.sdk.stub("threads.get", async () =>
       makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }),
     );
-    const result = await host.harness.behavior.runCli(["merge", "c1", "--allow-red", "flaky-e2e"]);
-    assert.equal(result.exitCode, 1);
-    assert.match(result.stderr, /captain's word/i);
+    host.harness.sdk.stub("environments.pullRequest", async () => ({ outcome: "available", pullRequest: { url: "https://github.com/o/r/pull/7", number: 7, title: "Fix", state: "open", checks: { state: "failing", failedCount: 1, pendingCount: 0, passedCount: 2 } } }));
+    const result = await host.harness.behavior.runCli(["merge", "c1", "--allow-unverified", "the owner said merge it", "--allow-red", "flaky-e2e"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /^Not merged: this is a preview/);
+    assert.match(result.stdout, /^Checks: failing: 2 passing, 1 failing, 0 pending$/m);
+    assert.match(result.stdout, /^To merge: bb firstmate merge c1 --pr 7 --allow-red 'flaky-e2e' --allow-unverified 'the owner said merge it' --yes$/m);
+    assert.equal(host.harness.sdk.callsTo("environments.mergePullRequest").length, 0);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -2499,7 +2559,7 @@ test("allowMissingCheck refuses when the BB merge path cannot read required cont
       },
     }));
     host.harness.sdk.stub("environments.mergePullRequest", async () => ({}));
-    const result = await host.harness.behavior.runCli(["merge", "c1", "--yes", "--allow-missing", "required-check"]);
+    const result = await host.harness.behavior.runCli(["merge", "c1", "--allow-unverified", "the owner said merge it", "--yes", "--allow-missing", "required-check"]);
     assert.equal(result.exitCode, 1);
     assert.match(result.stderr, /native PR merge gate/);
     assert.equal(host.harness.sdk.callsTo("environments.mergePullRequest").length, 0);
@@ -2544,9 +2604,13 @@ test("merge runs native merge and teardown before retiring the crew", async () =
       return { id: "term_1" };
     });
     host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
-    host.harness.sdk.stub("terminals.output", async () => hostOutput(""));
+    host.harness.sdk.stub("terminals.output", async () => {
+      const cmd = hostCommands.at(-1) ?? "";
+      if (!cmd.includes("gh pr view")) return hostOutput("");
+      return hostRcPayload(JSON.stringify({ protocol: "FM_HOST_CAPTURE_V1", exitCode: 0, stdout: prViewAnswer(unwrapHostCommand(cmd)), stderr: "" }), 0);
+    });
     host.harness.sdk.stub("terminals.close", async () => ({}));
-    const result = await host.harness.behavior.runCli(["merge", "c1", "--yes", "--allow-missing", "required-check"]);
+    const result = await host.harness.behavior.runCli(["merge", "c1", "--allow-unverified", "the owner said merge it", "--yes", "--allow-missing", "required-check"]);
     assert.equal(result.exitCode, 0, result.stderr);
     assert.ok(
       hostCommands.some((cmd) => cmd.includes("fm-teardown.sh") && cmd.includes("c1")),
@@ -8018,14 +8082,14 @@ test("IT native local merge respects captain hold and lands BB-named branch", as
     const native = (script: string, args: string[]) => spawnSync(join(home, "bin", `fm-${script}.sh`), args, { encoding: "utf8", env: { ...process.env, FM_HOME: home, FM_STATE_OVERRIDE: join(home, "state") } });
     const held = native("captain-hold", ["hold", "c1", "--title", "Repair", "--reason", "captain approval"]);
     assert.equal(held.status, 0, held.stderr);
-    const denied = await host.harness.behavior.runCli(["merge", "c1", "--yes"]);
+    const denied = await host.harness.behavior.runCli(["merge", "c1", "--allow-unverified", "the owner said merge it", "--yes"]);
     assert.equal(denied.exitCode, 1);
     assert.match(denied.stderr, /held for the captain/);
     assert.equal(git("-C", project, "rev-parse", "HEAD"), base);
     writeFileSync(join(home, "answer"), "approved");
     const released = native("captain-hold", ["answer", "c1", "--decision-file", join(home, "answer"), "--release"]);
     assert.equal(released.status, 0, released.stderr);
-    const landed = await host.harness.behavior.runCli(["merge", "c1", "--yes"]);
+    const landed = await host.harness.behavior.runCli(["merge", "c1", "--allow-unverified", "the owner said merge it", "--yes"]);
     assert.equal(landed.exitCode, 0, landed.stderr);
     assert.equal(git("-C", project, "rev-parse", "HEAD"), head);
     assert.ok(!existsSync(join(home, "state/c1.meta")), "native teardown removed the owned record");
@@ -9530,21 +9594,21 @@ test("merge refuses another captain's crew, or a PR another captain's crew owns,
       outcome: "available",
       pullRequest: { url: pr, number: 7, title: "t", state: "merged", checks: { state: "passing" }, mergeability: { mergeable: "MERGEABLE" } },
     }));
-    const theirs = await host.harness.behavior.runCli(["merge", "c2", "--yes"], { threadId: "thr_capA" });
+    const theirs = await host.harness.behavior.runCli(["merge", "c2", "--allow-unverified", "the owner said merge it", "--yes"], { threadId: "thr_capA" });
     assert.equal(theirs.exitCode, 1);
     assert.match(theirs.stderr, /belongs to captain @thread:thr_capB/);
     assert.match(theirs.stderr, /bb firstmate handoff --from thr_capB/);
-    const shared = await host.harness.behavior.runCli(["merge", "c1", "--yes"], { threadId: "thr_capA" });
+    const shared = await host.harness.behavior.runCli(["merge", "c1", "--allow-unverified", "the owner said merge it", "--yes"], { threadId: "thr_capA" });
     assert.equal(shared.exitCode, 1);
     assert.match(shared.stderr, /PR of crew c2, owned by captain @thread:thr_capB/);
     assert.equal(((await host.bb.storage.kv.get("crews")) as unknown[]).length, 2, "refusals retire nothing");
-    const forced = await host.harness.behavior.runCli(["merge", "c1", "--yes", "--override-owner"], { threadId: "thr_capA" });
+    const forced = await host.harness.behavior.runCli(["merge", "c1", "--allow-unverified", "the owner said merge it", "--yes", "--override-owner"], { threadId: "thr_capA" });
     assert.equal(forced.exitCode, 0, forced.stderr);
     assert.match(forced.stdout, /Already merged/);
     // A crew left by a thread that is no live captain (e.g. this captain's own old
     // thread) is not "another captain's": no refusal.
     await host.bb.storage.kv.set("crews", [shipRow("c3", "thr_c3", "thr_old")]);
-    const orphaned = await host.harness.behavior.runCli(["merge", "c3", "--yes"], { threadId: "thr_capA" });
+    const orphaned = await host.harness.behavior.runCli(["merge", "c3", "--allow-unverified", "the owner said merge it", "--yes"], { threadId: "thr_capA" });
     assert.equal(orphaned.exitCode, 0, orphaned.stderr);
     // A registered captain thread abandoned for days (never archived) is no live owner.
     host.harness.sdk.stub("threads.get", async (input: { threadId: string }) => ({
@@ -9552,7 +9616,7 @@ test("merge refuses another captain's crew, or a PR another captain's crew owns,
       updatedAt: input.threadId === "thr_capB" ? Date.now() - 3 * 24 * 3_600_000 : Date.now(),
     }));
     await host.bb.storage.kv.set("crews", [shipRow("c4", "thr_c4", "thr_capB")]);
-    const abandoned = await host.harness.behavior.runCli(["merge", "c4", "--yes"], { threadId: "thr_capA" });
+    const abandoned = await host.harness.behavior.runCli(["merge", "c4", "--allow-unverified", "the owner said merge it", "--yes"], { threadId: "thr_capA" });
     assert.equal(abandoned.exitCode, 0, abandoned.stderr);
   } finally {
     await host.harness.lifecycle.dispose();
@@ -9772,7 +9836,11 @@ function nativeMergeHost() {
 }
 
 function stubNativeMerge(host: Awaited<ReturnType<typeof load>>, router: (cmd: string) => { payload?: string; code?: number }, pr: unknown) {
-  const routed = stubRoutedHost(host, (cmd) => router(unwrapHostCommand(cmd)));
+  const routed = stubRoutedHost(host, (cmd) => {
+    const c = unwrapHostCommand(cmd), r = router(c);
+    if (!c.includes("gh pr view") || (r.code ?? 0) !== 0) return r;
+    return { ...r, payload: prViewAnswer(c, r.payload ? JSON.parse(r.payload) : {}) };
+  });
   host.harness.sdk.stub("threads.list", async () => []);
   host.harness.sdk.stub("threads.get", async (input: { threadId: string }) =>
     makeThreadResponse({ id: input.threadId, status: "idle", environmentId: "env_wt" }));
@@ -9796,10 +9864,10 @@ test("merge trusts fm-pr-merge's verified MERGED readback over BB's stale PR cac
       outcome: "available",
       pullRequest: { url, number: 1, title: "t", state: "open", checks: { state: "passing" }, mergeability: { mergeable: "MERGEABLE" } },
     });
-    const result = await host.harness.behavior.runCli(["merge", "c1", "--yes"]);
+    const result = await host.harness.behavior.runCli(["merge", "c1", "--allow-unverified", "the owner said merge it", "--yes"]);
     assert.equal(result.exitCode, 0, result.stderr);
     assert.doesNotMatch(result.stdout, /Landing not yet confirmed/);
-    assert.match(result.stdout, /Merged #1\nhttps:\/\/github\.com\/o\/r\/pull\/1\nCrew c1 retired/);
+    assert.match(result.stdout, /Merged #1 t\nhttps:\/\/github\.com\/o\/r\/pull\/1\nNot verified: the owner waived verification for head aaaaaaa in these words: "the owner said merge it"\nCrew c1 retired/);
     assert.deepEqual(await host.bb.storage.kv.get("crews"), []);
   } finally {
     await host.harness.lifecycle.dispose();
@@ -9827,7 +9895,7 @@ async function mergeWithTeardownRefusal(refusal: string) {
   host.harness.sdk.stub("environments.get", async () => ({ id: "env_wt", hostId: "host_1", path: "/wt", isWorktree: true, status: "ready", mergeBaseBranch: "main" }));
   host.harness.sdk.stub("environments.diffFiles", async () => ({ files: [] }));
   host.harness.sdk.stub("environments.delete", async () => ({ ok: true as const }));
-  const result = await host.harness.behavior.runCli(["merge", "c1", "--yes"]);
+  const result = await host.harness.behavior.runCli(["merge", "c1", "--allow-unverified", "the owner said merge it", "--yes"]);
   return { host, routed, result };
 }
 
@@ -9874,7 +9942,7 @@ test("merge resolves a crew PR the environment cache misses (crew pushed to an e
       if (cmd.includes("gh pr view")) return { payload: '{"state":"OPEN","mergeable":"MERGEABLE"}' };
       return {};
     }, { outcome: "absent" });
-    const result = await host.harness.behavior.runCli(["merge", "c1", "--yes"]);
+    const result = await host.harness.behavior.runCli(["merge", "c1", "--allow-unverified", "the owner said merge it", "--yes"]);
     assert.equal(result.exitCode, 0, result.stderr);
     const merge = routed.seen.map(unwrapHostCommand).find((c) => c.includes("fm-pr-merge.sh"));
     assert.ok(merge?.includes(`'${url}'`), `fm-pr-merge must get the resolved PR: ${merge}`);
@@ -9889,6 +9957,7 @@ test("merge polls a lazily computed UNKNOWN mergeability instead of refusing at 
   process.env.FM_MERGEABLE_POLL_MS = "0";
   try {
     await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
+    stubRoutedHost(host, (cmd) => (unwrapHostCommand(cmd).includes("gh pr view") ? { payload: prViewAnswer(unwrapHostCommand(cmd)) } : {}));
     host.harness.sdk.stub("threads.list", async () => []);
     host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }));
     host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
@@ -9906,7 +9975,7 @@ test("merge polls a lazily computed UNKNOWN mergeability instead of refusing at 
       },
     }));
     host.harness.sdk.stub("environments.mergePullRequest", async () => ({}));
-    const result = await host.harness.behavior.runCli(["merge", "c1", "--yes"]);
+    const result = await host.harness.behavior.runCli(["merge", "c1", "--allow-unverified", "the owner said merge it", "--yes"]);
     assert.equal(result.exitCode, 0, result.stderr);
     assert.equal(host.harness.sdk.callsTo("environments.mergePullRequest").length, 1);
   } finally {
