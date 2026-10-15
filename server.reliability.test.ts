@@ -805,6 +805,63 @@ test("firstmate_reply covers: repeating a successful call with the same covers r
   }
 });
 
+// Independent check of PR #133, round 2: a new quoted reply went out although every cover was already answered.
+test("firstmate_reply covers: a different reply to the same message refuses covers an earlier reply closed, and sends nothing", async () => {
+  const host = await load();
+  try {
+    await telegramFlags(host);
+    recordTelegram(host, "thr_cap", "1669", 1_000);
+    recordTelegram(host, "thr_cap", "1670", 2_000);
+    recordTelegram(host, "thr_cap", "1671", 3_000);
+    host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
+    const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
+    const args = { ref: "tg:200:1669", text: "All filters are included in the research.", covers: ["tg:200:1670", "tg:200:1671"] };
+    const first = await tool(host, "firstmate_reply").execute({ ...args, more: true }, ctx);
+    assert.ok(!isError(first), text(first));
+    assert.equal(ledgerRow(host, "1669")?.state, "received");
+    const quoted = await tool(host, "firstmate_reply").execute({ ...args, quote: "Status?" }, ctx);
+    assert.ok(isError(quoted), text(quoted));
+    assert.match(text(quoted), /covers refused/);
+    assert.match(text(quoted), /tg:200:1670 is not open/);
+    assert.equal(host.harness.sdk.callsTo("plugins.callRpc").length, 1, "the new reply is not sent");
+    assert.equal(ledgerRow(host, "1669")?.state, "received");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// Independent check of PR #133, round 2: a failed write after the send left covers open, and the identical retry could not close them.
+test("firstmate_reply covers: a ledger write failure after the send leaves every message open, and the identical retry closes them with no second send", async () => {
+  const host = await load();
+  try {
+    await telegramFlags(host);
+    recordTelegram(host, "thr_cap", "1669", 1_000);
+    recordTelegram(host, "thr_cap", "1670", 2_000);
+    recordTelegram(host, "thr_cap", "1671", 3_000);
+    recordTelegram(host, "thr_cap", "1672", 4_000);
+    createInboundLedger(host.bb.storage.database()).markDelegated({ source: "telegram", chatId: "200", messageId: "1671" }, "thr_crew", 3_500);
+    host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
+    const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
+    const args = { ref: "tg:200:1669", text: "All filters are included in the research.", covers: ["tg:200:1670", "tg:200:1671", "tg:200:1672"] };
+    const db = host.bb.storage.database();
+    db.exec("CREATE TRIGGER fail_cover BEFORE UPDATE ON inbound_ledger WHEN NEW.message_id='1671' AND NEW.state='answered' BEGIN SELECT RAISE(ABORT, 'simulated cover write failure'); END;");
+    const faulted = await tool(host, "firstmate_reply").execute(args, ctx);
+    assert.ok(isError(faulted), text(faulted));
+    assert.match(text(faulted), /Repeat the same call/);
+    assert.deepEqual(["1669", "1670", "1671", "1672"].map((id) => ledgerRow(host, id)?.state), ["received", "received", "delegated", "received"], "all or none closed");
+    db.exec("DROP TRIGGER fail_cover;");
+    const retried = await tool(host, "firstmate_reply").execute(args, ctx);
+    assert.ok(!isError(retried), text(retried));
+    assert.match(text(retried), /^Already replied to tg:200:1669\./);
+    assert.deepEqual(["1669", "1670", "1671", "1672"].map((id) => ledgerRow(host, id)?.state), ["answered", "answered", "answered", "answered"]);
+    assert.equal(ledgerRow(host, "1671")?.coveredBy, "tg:200:1669");
+    assert.equal(ledgerRow(host, "1671")?.crewId, "thr_crew");
+    assert.equal(host.harness.sdk.callsTo("plugins.callRpc").length, 1, "the retry sends nothing");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("firstmate_reply and the captain Telegram guide tell the captain to answer forwarded messages once with covers", () => {
   const source = readFileSync(new URL("./server.ts", import.meta.url), "utf8");
   const description = source.slice(source.indexOf('name: "firstmate_reply"'), source.indexOf("parameters:", source.indexOf('name: "firstmate_reply"')));
