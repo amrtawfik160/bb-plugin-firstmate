@@ -14,6 +14,8 @@ const title=n=>`Change ${n}`;
 const branch=n=>`fm/${CREW}-change-${n}`;
 const ctx={threadId:'thr_cap',projectId:'proj_1'};
 const crew={id:CREW,task:'review fixes',projectId:'proj_1',threadId:'thr_crew',parentThreadId:'thr_cap',nativeHome:'/native',providerId:null,model:null,reasoningLevel:null,worktree:true,shape:'ship',posture:'direct-PR',createdAt:'2026-10-14T00:00:00.000Z'};
+const heads=new Map();
+const head=n=>heads.get(n) ?? String(n).repeat(10).slice(0,40);
 const prNumber=command=>Number(/\/pull\/(\d+)/.exec(command)?.[1] ?? /gh pr view '?(\d+)/.exec(command)?.[1]);
 
 function hostCommands(host,answer) {
@@ -29,12 +31,14 @@ function forge(command) {
  if(command.includes('fm-pr-merge.sh')){const n=prNumber(command);return{payload:`verified: ${url(n)} is merged (state=MERGED, merged=true, isInMergeQueue=false)`};}
  if(command.includes('gh pr view')){
   const n=prNumber(command);
-  const head=n===2400?'fm/other-crew-fix':branch(n);
-  return{payload:JSON.stringify({number:n,url:url(n),title:title(n),headRefName:head,state:n===2350?'CLOSED':'OPEN',mergeable:'MERGEABLE'})};
+  const ref=n===2400?'fm/other-crew-fix':branch(n);
+  return{payload:JSON.stringify({number:n,url:url(n),title:title(n),headRefName:ref,headRefOid:head(n),state:n===2350?'CLOSED':'OPEN',mergeable:'MERGEABLE'})};
  }
  return{code:0};
 }
-async function deck(open=OPEN) {
+const seen=n=>({headSha:head(n),state:'open',draft:false,checks:'passing',review:'approved',reviewHeadSha:head(n),mergeCommitSha:null,mergeable:'mergeable'});
+async function deck(open=OPEN,{verified=true}={}) {
+ heads.clear();
  const host=createFakePluginHost({pluginId:'firstmate',agentSkillIds:['firstmate','captain'],settings:{fmHome:'/native',fmHostId:'host_1'}});await plugin(host.bb);
  host.harness.sdk.stub('threads.list',async()=>[]);
  host.harness.sdk.stub('threads.getPluginMetadata',async()=>({}));
@@ -48,7 +52,11 @@ async function deck(open=OPEN) {
  host.harness.sdk.stub('threads.send',async()=>({delivery:'queued'}));
  await host.bb.storage.kv.set('crews',[crew]);
  const store=createDeliveries(host.bb.storage.database());
- for(const n of open) store.register({url:url(n),taskId:CREW,projectId:'proj_1',owner:'thr_cap',home:'/native',worker:'thr_crew',requirement:'merged',title:title(n)});
+ for(const n of open){
+  const r=store.register({url:url(n),taskId:CREW,projectId:'proj_1',owner:'thr_cap',home:'/native',worker:'thr_crew',requirement:'merged',title:title(n)});
+  store.observe(r.id,seen(n),true);
+  if(verified) store.verify(r.id,'thr_cap',head(n),`Drove change ${n} in the staging app; it works`);
+ }
  return {host,store,commands:hostCommands(host,forge)};
 }
 const tool=(host,name)=>host.harness.inspection.registrations.agentTools.find(t=>t.name===name);
@@ -104,5 +112,49 @@ test('with exactly one open PR, pr stays optional and that PR is merged',async()
   const out=text(await tool(host,'firstmate_merge').execute({crewId:CREW,yes:true},ctx));
   assert.match(out,/^Merged #2391 Change 2391\n/);
   assert.ok(merges(commands)[0].includes(`'${url(2391)}'`));
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+// 15 Oct: Cyndra PR 2315 merged with its verify step pending and no verification record.
+test('a merge of a PR without a verification record for its head is refused and says what is missing',async()=>{
+ const {host,commands}=await deck([2391],{verified:false});try {
+  const out=text(await tool(host,'firstmate_merge').execute({crewId:CREW,yes:true,pr:2391},ctx));
+  assert.match(out,new RegExp(`^Refusing: #2391 has no verification record for its current head ${head(2391).slice(0,7)}; nothing was merged\\.`));
+  assert.match(out,/CI and unit tests are not verification/);
+  assert.match(out,/firstmate_deliveries action=verify id=cyndra-ai\/cyndra-saas#2391 commitSha=2391239/);
+  assert.match(out,/allowUnverified="<the owner's own words>"/);
+  const cli=await host.harness.behavior.runCli(['merge',CREW,'--yes','--pr','2391'],ctx);
+  assert.equal(cli.exitCode,1);assert.match(cli.stderr,/no verification record/);assert.match(cli.stderr,/--allow-unverified/);
+  assert.deepEqual(merges(commands),[],'nothing reached the merge script');
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('a verification record for an older head does not cover the current head',async()=>{
+ const {host,commands}=await deck([2391]);try {
+  heads.set(2391,'f'.repeat(40));
+  const out=text(await tool(host,'firstmate_merge').execute({crewId:CREW,yes:true,pr:2391},ctx));
+  assert.match(out,/^Refusing: #2391's verification record covers 2391239, not its current head fffffff; nothing was merged\./);
+  assert.deepEqual(merges(commands),[]);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('the owner waiver in words merges an unverified PR and is recorded with the merge',async()=>{
+ const {host,store,commands}=await deck([2391],{verified:false});try {
+  const short=text(await tool(host,'firstmate_merge').execute({crewId:CREW,yes:true,pr:2391,allowUnverified:'yes'},ctx));
+  assert.match(short,/allowUnverified must be the owner's own words/);
+  assert.deepEqual(merges(commands),[]);
+  const out=text(await tool(host,'firstmate_merge').execute({crewId:CREW,yes:true,pr:2391,allowUnverified:'merge it, I will test Telegram myself'},ctx));
+  assert.match(out,/^Merged #2391 Change 2391\nhttps:\/\/github\.com\/Cyndra-AI\/cyndra-saas\/pull\/2391\nNot verified: the owner waived verification for head 2391239 in these words: "merge it, I will test Telegram myself"\n/);
+  assert.equal(merges(commands).length,1);
+  const row=store.get('cyndra-ai/cyndra-saas#2391');
+  assert.equal(row.unverifiedMerge.words,'merge it, I will test Telegram myself');assert.equal(row.unverifiedMerge.headSha,head(2391));assert.equal(row.unverifiedMerge.actor,'thr_cap');
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('the CLI takes the owner waiver as --allow-unverified',async()=>{
+ const {host,commands}=await deck([2391],{verified:false});try {
+  const cli=await host.harness.behavior.runCli(['merge',CREW,'--yes','--pr','2391','--allow-unverified','the owner said merge it now'],ctx);
+  assert.equal(cli.exitCode,0,cli.stderr);assert.match(cli.stdout,/Not verified: the owner waived verification/);
+  assert.equal(merges(commands).length,1);
  }finally{await host.harness.lifecycle.dispose();}
 });

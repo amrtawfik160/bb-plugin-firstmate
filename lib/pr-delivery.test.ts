@@ -191,3 +191,70 @@ test("a crew's undecided PRs are the open ones: merged, closed and abandoned PRs
   assert.deepEqual(store.undecided("c1", "proj_1").map((r) => r.number), [1]);
   assert.deepEqual(store.undecided("c2", "proj_1").map((r) => r.number), [6], "a PR not read on GitHub yet counts as open");
 });
+
+// 15 Oct: Cyndra PR 2315 (PR-only delivery) merged through gh in a release window with no
+// verification record; its row went to complete with verifiedCommitSha null.
+const HEAD_2315 = "1e13624758430744eab185a675a89e67f16d1c7f";
+const MERGE_2315 = "bf33e4b58dd2c2a0b3e6ada3ed60104a3dfa44f0";
+const seen = (over: Partial<Parameters<ReturnType<typeof createDeliveries>["observe"]>[1]> = {}) => ({
+  headSha: HEAD_2315, state: "open" as const, draft: false, checks: "passing" as const, review: "approved" as const, reviewHeadSha: HEAD_2315,
+  mergeCommitSha: null, mergeable: "mergeable" as const, ...over,
+});
+const track = (store: ReturnType<typeof createDeliveries>, requirement: DeliveryRecord["requirement"]) =>
+  store.register({ url: "https://github.com/Cyndra-AI/cyndra-saas/pull/2315", taskId: "0940c38e", projectId: "proj_1", owner: "thr_pse43vv6tn", home: "/home", worker: "thr_crew", requirement });
+
+test("a green PR without a verification record for its head is not merge-ready", () => {
+  const store = createDeliveries(new DatabaseSync(":memory:") as never);
+  const r = track(store, "merged");
+  const green = store.observe(r.id, seen(), true, 1);
+  assert.equal(green.status, "needs-verification");
+  assert.match(green.blocker, /^No verification record for head 1e13624/);
+  assert.match(green.nextAction, /CI and unit tests are not verification/);
+  assert.deepEqual(boardPullRequests([green]).map((p) => p.state), ["not verified"]);
+  assert.throws(() => store.verify(r.id, "thr_pse43vv6tn", "1e13624", "CI green, 112 unit tests pass"), /names only CI or tests/);
+  assert.throws(() => store.verify(r.id, "thr_pse43vv6tn", "abcdef0", "sent hello"), /does not match the current head 1e13624/);
+  const verified = store.verify(r.id, "thr_pse43vv6tn", "1e13624", "Sent hello to the staging bot; the reply arrived");
+  assert.equal(verified.verifiedCommitSha, HEAD_2315);
+  assert.equal(store.observe(r.id, seen(), true, 2).status, "ready-to-merge");
+  const pushed = store.observe(r.id, seen({ headSha: "2222222222222222222222222222222222222222", reviewHeadSha: "2222222222222222222222222222222222222222" }), true, 3);
+  assert.equal(pushed.verifiedCommitSha, null, "a new head drops the record");
+  assert.equal(store.observe(r.id, seen({ headSha: pushed.headSha, reviewHeadSha: pushed.headSha }), true, 4).status, "needs-verification");
+});
+
+test("a PR-only delivery without a record shows not verified on the board", () => {
+  const store = createDeliveries(new DatabaseSync(":memory:") as never);
+  const r = track(store, "pr");
+  const open = store.observe(r.id, seen(), false, 1);
+  assert.equal(open.status, "pr-delivered");
+  assert.deepEqual(boardPullRequests([open]).map((p) => p.state), ["not verified"]);
+});
+
+test("PR 2315 merged outside Firstmate without a record is merged-unverified, and the captain is told once", () => {
+  const store = createDeliveries(new DatabaseSync(":memory:") as never);
+  const r = track(store, "pr");
+  store.observe(r.id, seen(), false, 1);
+  const merged = store.observe(r.id, seen({ state: "merged", mergeCommitSha: MERGE_2315 }), false, 2);
+  assert.equal(merged.status, "merged-unverified");
+  assert.match(merged.blocker, /^Merged outside Firstmate with no verification record/);
+  assert.notEqual(merged.notification.desired, null);
+  const notice = merged.notification.desired;
+  store.save({ ...store.get(r.id)!, notification: { ...store.get(r.id)!.notification, delivered: notice } });
+  const later = store.observe(r.id, seen({ state: "merged", mergeCommitSha: MERGE_2315 }), false, 2 + 2 * 86_400_000);
+  assert.equal(later.notification.desired, notice, "no repeat and no overdue notice");
+  assert.ok(later.nextCheckAt >= 2 + 2 * 86_400_000 + 86_400_000 - 1, "a merged PR is not re-read every minute");
+  assert.equal(store.verify(r.id, "thr_pse43vv6tn", "bf33e4b", "Sent hello after the restart; the reply arrived").status, "complete");
+});
+
+test("a PR verified before merge, or merged with the owner's waiver, completes on merge", () => {
+  const store = createDeliveries(new DatabaseSync(":memory:") as never);
+  const r = track(store, "merged");
+  store.observe(r.id, seen(), true, 1);
+  store.verify(r.id, "thr_pse43vv6tn", HEAD_2315, "Sent hello to the staging bot; the reply arrived");
+  assert.equal(store.observe(r.id, seen({ state: "merged", mergeCommitSha: MERGE_2315 }), true, 2).status, "complete");
+  const other = createDeliveries(new DatabaseSync(":memory:") as never);
+  const w = track(other, "merged");
+  other.observe(w.id, seen(), true, 1);
+  other.waive(w.id, "thr_pse43vv6tn", "ship it now, I will test on my phone", HEAD_2315);
+  assert.equal(other.get(w.id)!.unverifiedMerge?.words, "ship it now, I will test on my phone");
+  assert.equal(other.observe(w.id, seen({ state: "merged", mergeCommitSha: MERGE_2315 }), true, 2).status, "complete");
+});

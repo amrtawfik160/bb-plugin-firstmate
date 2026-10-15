@@ -4,7 +4,8 @@ import { spawnSync } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { BRIEF_SKILLS, crewPlaybook, crewSkillBlock, crewSkillRoot, PLAYBOOK_CHOICES, playbookStepCount, reportGapNote, reportGapRequest, reportGaps, skillCheckScript, skillRoutingLinkScript } from "./crew-contract.ts";
+import { BRIEF_SKILLS, crewPlaybook, crewSkillBlock, crewSkillRoot, notVerifiedNote, notVerifiedRequest, PLAYBOOK_CHOICES, playbookStepCount, reportGapNote, reportGapRequest, reportGaps, skillCheckScript, skillRoutingLinkScript, verifyStepGap } from "./crew-contract.ts";
+import { namesOnlyCi } from "./pr-delivery.ts";
 
 const HOME = homedir();
 
@@ -28,6 +29,14 @@ const HOUSE_RULES = [
   "Until the owner confirms otherwise: spawn no sub-agents (no Task, poteto-agent or parallel workers). Do that work yourself, in this session.",
   "Until the owner confirms otherwise: Firstmate decides who merges and deploys. Follow the brief's delivery contract for merge and deploy.",
 ];
+
+const VERIFY_RULES = [
+  "CI and unit tests are not verification. \"Verify on the same surface\", or your playbook's verify step, means you drive the real changed surface yourself and record what you saw.",
+  "Use the project's verification skill when it has one (for example `.agents/skills/verify-<app>/` in the repo). Your report gives the evidence: what you ran, what you saw, and links to screenshots or logs.",
+  "If you cannot drive that surface, report the verify step as \"blocked: <step>: <what stops you>\". Never mark it ✓ or pending, and never hand a human a manual checklist as if it were verification.",
+];
+
+const MERGE_RULE = "Merges go only through `bb firstmate merge <crew> --pr <n>`, which refuses a PR without a verification record. Never run `gh pr merge` or merge through the GitHub API.";
 
 const HOST_LIMIT = [
   "This host is shared. Run every type check, full test run and build as `~/.bb-firstmate/bin/fm-heavy <command>`; it waits for a host-wide slot.",
@@ -76,8 +85,10 @@ test("a feature brief gives full paths, the step checklist, no-comments and the 
     `Skills on this host are in \`${HOME}/.claude/skills/<name>/SKILL.md\`. Load a skill by reading that file. Do not rely on a Skill tool for pstack skills; they are user-invocable only.`,
     "If a skill is not installed, continue and say so in your report.",
     ...HOUSE_RULES,
+    MERGE_RULE,
     ...HOST_LIMIT,
     ...IN_PLACE_OF_A_SKIP,
+    ...VERIFY_RULES,
     "Save each screenshot as its own full-size PNG file. Never combine, stitch or downscale screenshots; link each file separately.",
     `Before you open a PR, run /no-comments (\`${HOME}/.claude/skills/no-comments/SKILL.md\`) over your diff.`,
     ...OBSTACLES,
@@ -427,4 +438,85 @@ test("the captain note and the crew request name the crew and the missing parts"
     "Reply with only the missing parts: a line \"Skills read: <paths>\", and one line per playbook step, \"✓ <step>\" or \"skip: <step>: <reason>\".",
     "Do not redo the task. End with your DONE: line again.",
   ].join("\n"));
+});
+
+// 15 Oct: crew 0940c38e (Grok, bug-fix) reported DONE with "pending: Verify on the same
+// surface (waiting Secret and dependency scan + the other five required jobs)" and a
+// manual Telegram checklist for a human. PR 2315 merged, and every incoming Telegram
+// message was dropped after the next restart.
+const BUG_FIX_PLAYBOOK = [
+  "### Bug fix", "",
+  "1. Reproduce it yourself on the matching surface via the control skill (Non-negotiables).",
+  "2. Binary-search the cause.",
+  "3. Plan the fix.",
+  "4. Verify on the same surface. The original repro now passes. \"Inconclusive\" or wrong-surface is not a pass. Flag it.",
+  "5. Stage the commits so the failing repro lands before the fix in git history.",
+  "6. Run **Opening a PR**.",
+].join("\n");
+const REPORT_0940C38E = [
+  "## Playbook steps", "",
+  "- ✓ Reproduce it yourself on the matching surface (gitleaks CI / local gitleaks --redact)",
+  "- ✓ Binary-search the cause (done in session)",
+  "- ✓ Plan the fix. Architect yourself. (done in session)",
+  "- pending: Verify on the same surface (waiting Secret and dependency scan + the other five required jobs)",
+  "- ✓ Stage the commits so the failing repro lands before the fix",
+  "- ✓ Opening a PR (done in session). Delivery contract: direct-PR, no merge/deploy.",
+].join("\n");
+
+test("the 0940c38e report's pending verify step is NOT VERIFIED", () => {
+  assert.equal(verifyStepGap(REPORT_0940C38E, BUG_FIX_PLAYBOOK),
+    "pending: \"Verify on the same surface (waiting Secret and dependency scan + the other five required jobs)\"");
+});
+
+test("a verify step that is skipped, blocked, missing or names only CI is NOT VERIFIED", () => {
+  const withStep = (line: string) => REPORT_0940C38E.replace(/^- pending: Verify.*$/m, line);
+  assert.match(verifyStepGap(withStep("- skip: Verify on the same surface: no staging access"), BUG_FIX_PLAYBOOK) ?? "", /^skipped: /);
+  assert.match(verifyStepGap(withStep("- blocked: Verify on the same surface: no bot token"), BUG_FIX_PLAYBOOK) ?? "", /^blocked: /);
+  assert.match(verifyStepGap(withStep("- ✓ Verify on the same surface (CI green, 112 unit tests pass)"), BUG_FIX_PLAYBOOK) ?? "", /^names only CI or tests: /);
+  assert.match(verifyStepGap(withStep("- ✓ 4. Verify on the same surface: all required checks passed"), BUG_FIX_PLAYBOOK) ?? "", /^names only CI or tests: /);
+  assert.equal(verifyStepGap(withStep(""), BUG_FIX_PLAYBOOK), "missing: no \"Verify on the same surface\" line");
+});
+
+test("a verify step that drove the real surface passes, and a playbook without a verify step is not checked", () => {
+  const driven = REPORT_0940C38E.replace(/^- pending: Verify.*$/m,
+    "- ✓ Verify on the same surface: sent hello to the staging bot in an allowed chat; the reply arrived (screenshot telegram-hello.png)");
+  assert.equal(verifyStepGap(driven, BUG_FIX_PLAYBOOK), null);
+  assert.equal(verifyStepGap(REPORT_0940C38E.replace(/^- pending: Verify.*$/m, "✓ 4. step"), BUG_FIX_PLAYBOOK), null);
+  const investigation = "### Investigation\n\n1. Route through the **how** skill.\n2. Throughput checkpoint stays one line.\n3. Produce the output.\n4. Apply the **unslop** skill.\n";
+  assert.equal(verifyStepGap("✓ how\n✓ checkpoint", investigation), null);
+});
+
+test("evidence that names only CI or tests is not verification", () => {
+  for (const text of ["CI green", "all required checks passed", "112 unit tests pass", "waiting Secret and dependency scan + the other five required jobs", "lint, typecheck and build pass"]) {
+    assert.equal(namesOnlyCi(text), true, text);
+  }
+  for (const text of ["Smoke check passed", "sent hello to the staging bot; the reply arrived", "drove /status in Slack; CI green too", "passed"]) {
+    assert.equal(namesOnlyCi(text), false, text);
+  }
+});
+
+test("the NOT VERIFIED note goes to the captain and says the PR cannot merge without a record", () => {
+  const note = notVerifiedNote("0940c38e", "pending: \"Verify on the same surface\"");
+  assert.equal(note, [
+    "NOT VERIFIED: crew 0940c38e's DONE report has its verify step pending: \"Verify on the same surface\".",
+    "CI and unit tests are not verification.",
+    "Its PRs cannot merge until a verification record exists for the PR head: drive the changed surface, then firstmate_deliveries action=verify with the head commit and what you saw.",
+    "Only the owner's own words can waive it: firstmate_merge allowUnverified=\"<owner words>\".",
+  ].join("\n"));
+  assert.match(notVerifiedRequest("pending: \"Verify on the same surface\""), /^VERIFY STEP NOT DONE: your report has the verify step pending/);
+});
+
+test("every playbook brief says CI is not verification, and a blocked surface is a blocker, not a checklist", () => {
+  for (const playbook of PLAYBOOK_CHOICES.filter((p) => p !== "none")) {
+    const block = crewSkillBlock({ shape: "ship", title: "x", task: "", providerId: "acp-grok", playbook });
+    assert.ok(block.includes(VERIFY_RULES.join("\n")), `${playbook}\n${block}`);
+  }
+  assert.ok(!crewSkillBlock({ shape: "ship", title: "Deploy + merge #2155", task: "" }).includes(VERIFY_RULES[0]!));
+});
+
+test("every brief says merges go only through bb firstmate merge, never gh pr merge or the API", () => {
+  for (const playbook of PLAYBOOK_CHOICES) {
+    const block = crewSkillBlock({ shape: "ship", title: "Release the 21 green PRs", task: "", playbook });
+    assert.ok(block.includes(MERGE_RULE), `${playbook}\n${block}`);
+  }
 });

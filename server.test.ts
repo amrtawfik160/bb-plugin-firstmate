@@ -889,6 +889,55 @@ test("a playbook crew's DONE without skills and step lines gets one captain note
   }
 });
 
+// 15 Oct: crew 0940c38e (Grok, bug-fix) wrote final-report.md with its verify step pending
+// and a manual checklist for a human. PR 2315 merged and Telegram messages were dropped.
+const BUG_FIX_PLAYBOOK = "### Bug fix\n\n1. Reproduce it yourself.\n2. Binary-search the cause.\n3. Plan the fix.\n4. Verify on the same surface. The original repro now passes.\n5. Stage the commits.\n6. Run **Opening a PR**.\n";
+const REPORT_0940C38E = [
+  "# Crewmate 0940c38e final report (draft until CI green)", "", "PR: https://github.com/Cyndra-AI/cyndra-saas/pull/2315", "",
+  "## Human checks after the next runtime install", "", "Telegram", "1. Send \"hello\" in an allowed chat. The reply must use the tenant brand.", "",
+  "## Skills read", "", "- `/root/.grok/skills/poteto-mode/SKILL.md`", "",
+  "## Playbook steps", "",
+  "- ✓ Reproduce it yourself on the matching surface (gitleaks CI / local gitleaks --redact)",
+  "- ✓ Binary-search the cause (done in session)",
+  "- ✓ Plan the fix. Architect yourself. (done in session)",
+  "- pending: Verify on the same surface (waiting Secret and dependency scan + the other five required jobs)",
+  "- ✓ Stage the commits so the failing repro lands before the fix",
+  "- ✓ Opening a PR (done in session). Delivery contract: direct-PR, no merge/deploy.",
+].join("\n");
+
+test("crew 0940c38e's final report with a pending verify step is flagged NOT VERIFIED to the captain once", async () => {
+  const host = await load();
+  try {
+    stubIdleSdk(host);
+    await host.bb.storage.kv.set("crews", [{
+      id: "0940c38e", task: "close Telegram, Slack, and Discord audit gaps", title: "Fix Telegram, Slack and Discord audit gaps", projectId: "proj_1",
+      threadId: "thr_crew", parentThreadId: "thr_cap", providerId: "acp-grok", worktree: true, shape: "ship", posture: "direct-PR",
+      nativeHome: "/fmhome", createdAt: "2026-10-15T00:00:00.000Z",
+    }]);
+    host.harness.sdk.stub("environments.list", async () => [{ hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" }]);
+    host.harness.sdk.stub("files.read", async (input: unknown) => {
+      const path = String((input as { path?: string }).path ?? "");
+      const content = path.endsWith("/poteto-mode/playbooks/bug-fix.md") ? BUG_FIX_PLAYBOOK : path === "/fmhome/data/0940c38e/final-report.md" ? REPORT_0940C38E : null;
+      if (content === null) throw new Error(`no file ${path}`);
+      return { content, contentEncoding: "utf8", sizeBytes: content.length, path, sha256: "x" };
+    });
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    assert.deepEqual((await emitIdle(host, "DONE: PR https://github.com/Cyndra-AI/cyndra-saas/pull/2315")).errors, []);
+    const sends = sendCalls(host);
+    const notes = sends.filter((s) => s.threadId === "thr_cap" && s.text.includes("NOT VERIFIED: crew 0940c38e"));
+    assert.equal(notes.length, 1, JSON.stringify(sends));
+    assert.match(notes[0]!.text, /verify step pending: "Verify on the same surface \(waiting Secret and dependency scan/);
+    assert.match(notes[0]!.text, /cannot merge until a verification record exists/);
+    const toCrew = sends.filter((s) => s.threadId === "thr_crew");
+    assert.equal(toCrew.length, 1, JSON.stringify(toCrew));
+    assert.match(toCrew[0]!.text, /^VERIFY STEP NOT DONE/);
+    assert.deepEqual((await emitIdle(host, "DONE: PR https://github.com/Cyndra-AI/cyndra-saas/pull/2315")).errors, []);
+    assert.equal(sendCalls(host).filter((s) => s.text.includes("NOT VERIFIED:")).length, 1, "flagged once");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("a playbook crew's DONE with skills and every step line gets no note", async () => {
   const host = await load();
   try {
