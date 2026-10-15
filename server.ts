@@ -2,7 +2,7 @@
 import { deflateSync } from "node:zlib";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type BbPluginApi } from "@get-bb/plugin-sdk";
@@ -79,7 +79,7 @@ import {
   buildProgram, createPrograms, isOpenProgram, isOpenTicket, newlyReady, numberOf, programCounts, programText, readyRefs, readyWakeText, repoOf,
   shortTicket, stallReminderDue, stallReminderText, ticketRef, type IssueFacts, type Program, type ProgramFact, type TicketRef,
 } from "./lib/programs.ts";
-import { askLetterAnswer, askIdFromSourceEventId, packAnswers, cardRepeat, clip, createOwnerAsks, formatAge, formatAskCard, formatUtcTime, mayDefault, CAPTAIN_RULES, OWNER_DECISION_RULE, ownerAskedForOptions, PLAIN_DECISION_GUIDANCE, plainTextDecision, recommendedLabel, type AskKind } from "./lib/owner-asks.ts";
+import { askLetterAnswer, askIdFromSourceEventId, packAnswers, clip, createOwnerAsks, formatAge, formatAskCard, formatUtcTime, mayDefault, CAPTAIN_RULES, OWNER_DECISION_RULE, recommendedLabel, type AskKind } from "./lib/owner-asks.ts";
 import { DEFAULT_RELIABILITY_FLAGS, reliabilityFlagsFromSettings } from "./lib/reliability-flags.ts";
 import { sanitizeSettingValue } from "./lib/settings-schema.ts";
 import { coalesceBatches, parseConnectorHeader, parseInboundTelegram, parseSourceRef, parseTelegramSubmission, stripTelegramEnvelope, telegramReplyParameters, telegramSourceRef } from "./lib/telegram-envelope.ts";
@@ -5292,23 +5292,6 @@ export default async function plugin(bb: BbPluginApi) {
     done: z.record(z.string(), z.number()),
     stale: z.object({ ids: z.array(z.string()), at: z.number(), since: z.number() }).nullable(),
   });
-
-  // Closing text is already sent when the turn ends, so it cannot be refused. The captain is told
-  // once to move the decision to a card; the always-loaded rule covers the turns after that.
-  const CLOSING_DECISION_NOTE_MS = 6 * 60 * 60_000;
-  async function noteClosingDecision(captainThreadId: string, closingText: string | null | undefined): Promise<void> {
-    if (!closingText || plainTextDecision(closingText) === null || !inboundLedger.hasTelegram(captainThreadId)) return;
-    const key = `closing-decision-note:${captainThreadId}`;
-    const last = Number(await bb.storage.kv.get(key) ?? 0);
-    const now = Date.now();
-    if (now - last < CLOSING_DECISION_NOTE_MS) return;
-    await bb.storage.kv.set(key, now);
-    await bb.sdk.threads.send({
-      threadId: captainThreadId,
-      mode: "steer",
-      input: [{ type: "text", text: `Your last message asked the owner to decide in plain text. It has no buttons, is not on the owner's board and gets no reminder. ${PLAIN_DECISION_GUIDANCE} Do not send the report again. If the owner asked for those options or drafts, do nothing.`, mentions: [], visibility: "agent-only" }],
-    });
-  }
 
   // An overdue reversible ask proceeds with its recommended option; the captain thread is told once.
   async function defaultOverdueAsks(captainThreadId: string): Promise<void> {
@@ -11598,14 +11581,16 @@ export default async function plugin(bb: BbPluginApi) {
       recommended: z.number().int().min(0).optional().describe("Index of the recommended option"),
       defaultAfterMinutes: z.number().min(5).max(10080).optional().describe("Proceed with the recommended option after this many minutes without an answer (reversible asks only)"),
       irreversible: z.boolean().optional().describe("A gated action (production deploy, money, deleting data, customer messages): never proceeds without an answer"),
+      startsNewWork: z.boolean().optional().describe("true when an option starts new work: a build, a new crew, a new ticket. The card then waits for the owner's answer"),
     }),
-    async execute({ impact, question, kind, options, recommended, defaultAfterMinutes, irreversible }, ctx) {
+    async execute({ impact, question, kind, options, recommended, defaultAfterMinutes, irreversible, startsNewWork }, ctx) {
       const captain = ctxString(ctx, "threadId");
       if (!captain) return toolError("firstmate_ask runs only in a captain thread.");
       const choices = (options ?? []).map((option, index) => ({ label: option.label, value: option.value ?? String.fromCharCode(65 + index) }));
       if (recommended !== undefined && recommended >= choices.length) return toolError(`recommended must be the index of one of the ${choices.length} option(s).`);
-      const gated = !mayDefault({ kind: kind as AskKind, irreversible: irreversible === true });
-      if (gated && defaultAfterMinutes !== undefined) {
+      const newWork = startsNewWork === true;
+      const gated = !mayDefault({ kind: kind as AskKind, irreversible: irreversible === true, startsNewWork: newWork });
+      if (gated && !newWork && defaultAfterMinutes !== undefined) {
         return toolError(`defaultAfterMinutes is not allowed for ${kind === "approval" ? "an approval" : "an irreversible ask"}: it waits for the captain's answer. Remove defaultAfterMinutes.`);
       }
       if (defaultAfterMinutes !== undefined && recommended === undefined) return toolError("defaultAfterMinutes needs a recommended option to proceed with.");
@@ -11614,9 +11599,11 @@ export default async function plugin(bb: BbPluginApi) {
       const ask = ownerAsks.create({
         captain, kind: kind as AskKind, impact: impact?.replace(/\s+/g, " ").trim().slice(0, 300), text: question.trim(), options: choices,
         recommended: recommended ?? null, defaultAt: minutes > 0 ? now + Math.round(minutes * 60_000) : null,
-        irreversible: irreversible === true, createdAt: now,
+        irreversible: irreversible === true, startsNewWork: newWork, createdAt: now,
       });
-      const deadline = ask.defaultAt !== null ? ` If no answer by ${formatUtcTime(ask.defaultAt)}, it proceeds with "${recommendedLabel(ask)}" and you are told to go ahead.` : "";
+      const deadline = ask.defaultAt !== null
+        ? ` If no answer by ${formatUtcTime(ask.defaultAt)}, it proceeds with "${recommendedLabel(ask)}" and you are told to go ahead.`
+        : newWork ? " It starts new work, so it has no default and waits for the owner's answer." : "";
       const done = `Ask ${ask.id} is open and on the captain's board.${deadline} Keep working on other things; the answer arrives as an owner message that replies to ask ${ask.id}.`;
       if ((await reliabilityFlags()).telegramThreading !== "on") {
         return `${done}\nWarning: not sent to Telegram because telegramThreading is off. Put the question in your final message too.`;
@@ -11681,9 +11668,9 @@ export default async function plugin(bb: BbPluginApi) {
       text: z.string().min(1).max(4000),
       quote: z.string().min(1).max(1024).optional(),
       more: z.boolean().optional(),
-      notADecision: z.boolean().optional().describe("Set true only when the text lists options but asks the owner to decide nothing, such as drafts the owner requested"),
+      files: z.array(z.string().startsWith("/")).max(10).optional().describe("Absolute paths of files to attach, such as a crew's report.md"),
     }),
-    async execute({ ref, text, quote, more, notADecision }, ctx) {
+    async execute({ ref, text: words, quote, more, files }, ctx) {
       const flags = await reliabilityFlags();
       if (flags.inboundLedger === "off") return toolError("Inbound ledger is off.");
       const captain = ctxString(ctx, "threadId");
@@ -11696,16 +11683,18 @@ export default async function plugin(bb: BbPluginApi) {
       if (!row) return toolError(`No inbound row ${ref} for this captain.`);
       const refOf = (item: InboundRow) => item.source === "telegram" ? telegramSourceRef(item) : `bb:${item.chatId}:${item.messageId}`;
       const used = refOf(row);
-      // A decision in plain text has no buttons, no board line, no reminder and no default.
-      const decision = notADecision === true || ownerAskedForOptions(`${row.preview} ${quote ?? ""}`) ? null : plainTextDecision(text);
-      if (decision !== null) {
-        return toolError(`Not sent: this reply asks the owner to decide in plain text (${decision}). ${PLAIN_DECISION_GUIDANCE} If the text asks the owner to decide nothing, send it again with notADecision=true. ${used} stays open.`);
-      }
-      // The card already carries the question, its options and the recommendation; a prose copy is noise.
-      const repeat = flags.telegramThreading !== "on" || ownerAskedForOptions(`${row.preview} ${quote ?? ""}`) ? null : cardRepeat(text, ownerAsks.listOpen(captain), Date.now());
-      if (repeat !== null) {
-        return toolError(`Not sent: this reply repeats the question of card ${repeat.ask.id}, sent ${formatAge(Date.now() - repeat.ask.createdAt)} ago ("${clip(repeat.sentence, 160)}"). The owner already has the card with its options and your recommendation. Drop the repeat; if anything, say only "1 card sent". ${used} stays open.`);
-      }
+      const attach = files ?? [];
+      const missing = attach.filter((file) => !existsSync(file));
+      if (missing.length > 0) return toolError(`Not sent: no file at ${missing.join(", ")}. ${used} stays open.`);
+      const notFile = attach.filter((file) => !statSync(file).isFile());
+      if (notFile.length > 0) return toolError(`Not sent: ${notFile.join(", ")} is not a regular file. ${used} stays open.`);
+      const lineSuffix = attach.filter((file) => /:\d+$/.test(file));
+      if (lineSuffix.length > 0) return toolError(`Not sent: ${lineSuffix.join(", ")} ends in :<number>, which Telegram reads as a line number. Rename or copy the file. ${used} stays open.`);
+      // The connector uploads each linked local file with the reply. It percent-decodes the link target, and a
+      // space or ")" ends the target, so every segment is encoded, parentheses too. The label cannot hold brackets.
+      const encode = (segment: string) => encodeURIComponent(segment).replace(/[()]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+      const link = (file: string) => `[${basename(file).replace(/[[\]]/g, "")}](${file.split("/").map(encode).join("/")})`;
+      const text = attach.length === 0 ? words : `${words}\n\n${attach.map(link).join("\n")}`;
       let claimKind = quotedReplyKind(quote);
       const body = row.source === "telegram"
         ? telegramReplyFallbackBody({ chatId: row.chatId, messageId: row.messageId, kind: "reply", text: stripTelegramEnvelope(text), threadId: row.topicId })
@@ -11713,7 +11702,7 @@ export default async function plugin(bb: BbPluginApi) {
       // Reserve first so a concurrent or repeated reply never reaches Telegram twice.
       let claim = inboundLedger.claimOutbox(row, claimKind, body, Date.now());
       // more=true left the message open: a different text is the next reply to it, the same text is a repeat.
-      if (!claim.sent && !quote && row.state !== "answered" && claim.existing?.contentHash !== hashText(body)) {
+      if (!claim.sent && !quote && (row.state !== "answered" || attach.length > 0) && claim.existing?.contentHash !== hashText(body)) {
         claimKind = followUpReplyKind(body);
         claim = inboundLedger.claimOutbox(row, claimKind, body, Date.now());
       }
@@ -13481,7 +13470,6 @@ export default async function plugin(bb: BbPluginApi) {
     if (knownCaptains.has(thread.id)) {
       await bb.storage.kv.delete(`${CAPTAIN_RESUME_PREFIX}${thread.id}`);
       await drainCaptainReliability(thread.id).catch((error) => bb.log.warn(`captain reliability drain failed ${thread.id}: ${String(error)}`));
-      await noteClosingDecision(thread.id, lastAssistantText).catch((error) => bb.log.warn(`closing decision note failed ${thread.id}: ${String(error)}`));
     }
     await inCaptainHome(thread.id, () => reconcileReturnedAfk(thread.id)).catch(error => bb.log.warn(`AFK return: ${String(error)}`));
     // Turn-end backstop for the captain (no-op unless turnEndGuard=re-ring and this

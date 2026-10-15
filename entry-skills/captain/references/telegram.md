@@ -66,6 +66,8 @@ for hours. Ask rarely, and make each ask easy to find and to answer.
   ask. Supply `impact`, one plain sentence explaining what it means for the business.
   Put option text in `options`, not in the question. Put the recommended option first,
   and give at most 4 options.
+- Set `startsNewWork: true` when an option starts new work: a build, a new crew, a new ticket.
+  That card waits for the owner's answer.
 - Keep working on everything else while an ask is open. A `blocker` ask names what is blocked
   and what you are doing in the meantime.
 - Set `irreversible: true` for a gated action. Approvals and irreversible asks never proceed
