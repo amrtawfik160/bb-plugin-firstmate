@@ -1775,7 +1775,7 @@ test("15 Oct inbox: the captain's next wake names each owner message whose crew 
     ledger.markAnswered({ source: "telegram", chatId: "200", messageId: "4575" }, now - 30_000);
     // c-live still runs; c-queued waits for a slot; c-gone and c-answered finished and left the crew list.
     await host.bb.storage.kv.set("crews", [crewRow("c-live", "thr_c-live")]);
-    createDispatchJobs(host.bb.storage.database()).save({ crewId: "c-queued", captainThreadId: "thr_cap", payload: "{}", state: "queued", createdAt: now, startedAt: null, error: null, backoffUntil: null });
+    createDispatchJobs(host.bb.storage.database()).save({ crewId: "c-queued", captainThreadId: "thr_cap", payload: "{}", state: "queued", createdAt: now, startedAt: null, error: null, backoffUntil: now + 60 * 60_000 });
 
     await captainIdle(host);
     assert.equal(handBacks(host).length, 1);

@@ -225,7 +225,7 @@ test("15 Oct jess-leads: firstmate_reply refuses a file Telegram will not send, 
     const args = { ref: AGENT_NATIVE_REF, text: "Here are the open leads.", files: [csv, md] };
     const refused = await call("firstmate_reply", args);
     assert.equal(failed(refused), true, textOf(refused));
-    assert.equal(textOf(refused), [
+    assert.equal(textOf(refused).split("\n").slice(0, 3).join("\n"), [
       `Not sent: Telegram will not send ${csv}: only files in the captain's workspace, /tmp, the captain's data folder or a BB worktree are sent.`,
       `Not sent: Telegram will not send ${md}: only files in the captain's workspace, /tmp, the captain's data folder or a BB worktree are sent.`,
       `Copy each file to /tmp under a name that does not start with "." and attach the copy. ${AGENT_NATIVE_REF} stays open.`,

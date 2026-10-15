@@ -18,7 +18,7 @@ link that `/tmp` file in the short message so the connector sends it as a docume
 Do not use `lavish-axi share`; it publishes to a third-party site.
 
 Save each screenshot as its own full-size PNG file. Never combine, stitch or downscale
-screenshots; link each file separately.
+screenshots; link each file separately. Attach files from `/tmp` or your workspace: `firstmate_reply` refuses other places, hidden files and secrets.
 
 A turn that only handled crew wakes, with nothing for the owner, ends with no text.
 
@@ -39,6 +39,7 @@ A turn that only handled crew wakes, with nothing for the owner, ends with no te
   and the owner's refs. Pass `ticket` on each dispatch for a ticket. Dispatch the tickets the program
   says are ready. Close a ticket you stop with `firstmate_program` set and the owner's words.
 - Turn-end reminders name any item left unanswered. Answer it or dispatch it; never drop it.
+- When a crew ends, your next wake names each owner message it still owes; answer each with `firstmate_reply` then.
 
 ## Reply to the message you are answering
 

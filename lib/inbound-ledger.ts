@@ -33,6 +33,10 @@ export type InboundRow = InboundKey & {
   ackedAt: number | null;
   answeredAt: number | null;
   crewId: string | null;
+  /** When the crew this row was handed to ended (done, failed, stopped, archived or off the crew list). */
+  crewEndedAt?: number | null;
+  /** When the captain was told that crew ended and this row still needs an answer. Once per row. */
+  handedBackAt?: number | null;
   /** The ref of the reply that also answered this message, when firstmate_reply covers it. */
   coveredBy?: string | null;
   sourceRefs: string[];
@@ -227,6 +231,12 @@ export type CreateInboundLedger = {
    * message of its own and keeping its crew link, so a failure closes none. Returns the covers it closed. */
   finishReply(anchor: InboundKey | null, covers: InboundKey[], by: string, at: number): InboundRow[];
   markDelegated(key: InboundKey, crewId: string, at: number): InboundRow | undefined;
+  /** Records that a crew ended on each still-delegated row handed to it. Returns the rows it changed. */
+  crewEnded(crewId: string, at: number): InboundRow[];
+  /** Reserves the captain's delegated rows whose crew ended and that were not handed back yet. */
+  takeHandBacks(captainThreadId: string, at: number): InboundRow[];
+  /** Undoes takeHandBacks for rows whose wake was not delivered, so the next wake names them. */
+  releaseHandBacks(keys: InboundKey[]): void;
   mergeSourceRefs(keys: InboundKey[], refs: string[]): void;
   /** reply: a firstmate_reply reservation, in flight until markDelivered. */
   claimOutbox(row: InboundKey, kind: OutboxClaimKind, content: string, at: number, reply?: { final: boolean; covers: string[] }): { sent: boolean; existing?: OutboxRow };
@@ -246,10 +256,17 @@ export function formatOwnerInbox(rows: InboundRow[], now: number): string {
   const lines = rows.map((row) => {
     const ref = row.source === "telegram" ? `tg:${row.chatId}:${row.messageId}` : `bb:${row.chatId}:${row.messageId}`;
     const age = Math.max(0, Math.round((now - row.receivedAt) / 60_000));
-    const status = row.state === "delegated" ? `with crew ${row.crewId ?? "unknown"}` : "needs your reply";
+    const status = row.state !== "delegated" ? "needs your reply"
+      : row.crewEndedAt != null ? `crew ${row.crewId ?? "unknown"} ended; needs your reply` : `with crew ${row.crewId ?? "unknown"}`;
     return `- ${ref} (${age} min, ${status}): '${row.preview}'`;
   });
   return [`${rows.length} owner message(s) still need a final answer:`, ...lines].join("\n");
+}
+
+/** The captain wake for owner messages whose crew ended with no answer to them. */
+export function handBackText(rows: InboundRow[]): string {
+  const lines = rows.map((row) => `- ${row.source === "telegram" ? telegramSourceRef(row) : `bb:${row.chatId}:${row.messageId}`} (crew ${row.crewId ?? "unknown"}): '${row.preview}'`);
+  return ["These owner messages were handed to a crew that has ended, and they still have no answer. Answer each with firstmate_reply now:", ...lines].join("\n");
 }
 
 export function createInboundLedger(db: Database): CreateInboundLedger {
@@ -340,6 +357,13 @@ export function createInboundLedger(db: Database): CreateInboundLedger {
     })();
   }
 
+  function delegatedRows(captainThreadId?: string): InboundRow[] {
+    const rows = (captainThreadId
+      ? db.prepare("SELECT record FROM inbound_ledger WHERE captain=? AND state='delegated' ORDER BY received_at").all(captainThreadId)
+      : db.prepare("SELECT record FROM inbound_ledger WHERE state='delegated' ORDER BY received_at").all()) as { record: string }[];
+    return rows.map((r) => parseRow(r.record));
+  }
+
   function listPending(captainThreadId: string): InboundRow[] {
     const rows = db.prepare("SELECT record FROM inbound_ledger WHERE captain=? AND state IN ('received','acked','delegated') ORDER BY received_at")
       .all(captainThreadId) as { record: string }[];
@@ -377,8 +401,27 @@ export function createInboundLedger(db: Database): CreateInboundLedger {
     markDelegated(key, crewId, at) {
       return transition(key, (row) => {
         if (row.state === "answered") return row;
-        return { ...row, state: "delegated", crewId, ackedAt: row.ackedAt ?? at };
+        if (row.state === "delegated" && row.crewId === crewId) return row;
+        return { ...row, state: "delegated", crewId, crewEndedAt: null, handedBackAt: null, ackedAt: row.ackedAt ?? at };
       });
+    },
+    crewEnded(crewId, at) {
+      return db.transaction(() => delegatedRows()
+        .filter((row) => row.crewId === crewId && row.crewEndedAt == null)
+        .map((row) => save({ ...row, crewEndedAt: at })))();
+    },
+    takeHandBacks(captainThreadId, at) {
+      return db.transaction(() => delegatedRows(captainThreadId)
+        .filter((row) => row.crewEndedAt != null && row.handedBackAt == null)
+        .map((row) => save({ ...row, handedBackAt: at })))();
+    },
+    releaseHandBacks(keys) {
+      db.transaction(() => {
+        for (const key of keys) {
+          const row = get(key);
+          if (row?.state === "delegated" && row.handedBackAt != null) save({ ...row, handedBackAt: null });
+        }
+      })();
     },
     mergeSourceRefs(keys, refs) {
       db.transaction(() => {

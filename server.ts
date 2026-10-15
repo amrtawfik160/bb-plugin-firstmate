@@ -70,7 +70,7 @@ import { createDoorbellHold, doorbellHoldDecision } from "./lib/doorbell-hold.ts
 import { createRetryLedger, type RetryItem, type RetryKind } from "./lib/retry-ledger.ts";
 import { HANDOFF_WAKE_AMENDMENT, captainInstructionsWithHandoff } from "./lib/handoff-contract.ts";
 import { honestIdleVerdictPresentation, interruptIsStopped, readyClaim } from "./lib/honest-status.ts";
-import { ACK_TEXT, ackEligible, createInboundLedger, expandTelegramRows, followUpReplyKind, formatOwnerInbox, hashText, inboundKey, quotedReplyKind, sweeperSteerText, type InboundKey, type InboundRow, type OutboxKind } from "./lib/inbound-ledger.ts";
+import { ACK_TEXT, ackEligible, createInboundLedger, expandTelegramRows, followUpReplyKind, formatOwnerInbox, handBackText, hashText, inboundKey, quotedReplyKind, sweeperSteerText, type InboundKey, type InboundRow, type OutboxKind } from "./lib/inbound-ledger.ts";
 import { inboundHookDecision } from "./lib/inbound-dispatch.ts";
 import { formatWorkersForTelegram } from "./lib/telegram-commands.ts";
 import { digestOnce, EMPTY_DIGEST_MEMORY, formatBoard, type BoardInput, type DigestMemory } from "./lib/owner-board.ts";
@@ -83,6 +83,7 @@ import { askLetterAnswer, askIdFromSourceEventId, packAnswers, clip, createOwner
 import { DEFAULT_RELIABILITY_FLAGS, reliabilityFlagsFromSettings } from "./lib/reliability-flags.ts";
 import { sanitizeSettingValue } from "./lib/settings-schema.ts";
 import { coalesceBatches, parseConnectorHeader, parseInboundTelegram, parseSourceRef, parseTelegramSubmission, stripTelegramEnvelope, telegramReplyParameters, telegramSourceRef } from "./lib/telegram-envelope.ts";
+import { telegramFileRefusals } from "./lib/telegram-files.ts";
 import { connectorReplied, correlationOf, isTelegramRpcMissing, oldestUnanswered, sendTelegramReply, TELEGRAM_BRIDGE_PLUGIN_ID, telegramReplyFallbackBody } from "./lib/telegram-reply.ts";
 import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRecord } from "./lib/launch.ts";
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
@@ -3348,6 +3349,18 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  /** The thread's environment path, the workspace the Telegram connector sends any file from. Null when unknown. */
+  async function threadWorkspace(threadId: string, signal?: AbortSignal): Promise<string | null> {
+    const envId = await threadEnv(threadId, signal);
+    if (envId === null) return null;
+    try {
+      const path = asRecord(await raceAbort(bb.sdk.environments.get({ environmentId: envId }), signal, STUCK_HOST_CALL_MS))["path"];
+      return typeof path === "string" && path !== "" ? path : null;
+    } catch {
+      return null;
+    }
+  }
+
   // The crew kind the fold must terminal-collapse under, resolved the way native
   // `_fm_status_kind` does — NOT hardcoded. Native reads the crew's sibling
   // state/<id>.meta and classifies a metaless/unreadable/symlink meta as
@@ -5334,6 +5347,38 @@ export default async function plugin(bb: BbPluginApi) {
           input: [{ type: "text", text: sweeperSteerText(action), mentions: [], visibility: "agent-only" }],
         }).catch((error) => bb.log.warn(`inbound sweeper: ${String(error)}`));
       }
+      await handBackOwnerMessages(captainThreadId).catch((error) => bb.log.warn(`owner message hand-back: ${String(error)}`));
+    }
+  }
+
+  /** A crew that left the crew list and does not wait to start has ended (delivered, forgotten or retired). */
+  async function endCrewsOffTheList(captainThreadId: string): Promise<void> {
+    const crewIds = new Set(inboundLedger.listPending(captainThreadId)
+      .filter((row) => row.state === "delegated" && row.crewEndedAt == null && row.crewId !== null).map((row) => row.crewId!));
+    if (crewIds.size === 0) return;
+    const listed = new Set((await readCrews()).map((crew) => crew.id));
+    const queued = new Set((await readQueue()).filter((item) => item.status === "queued").map((item) => item.id));
+    for (const crewId of crewIds) {
+      const job = dispatchJobs.get(crewId)?.state;
+      const starting = job === "reserved" || job === "queued" || job === "spawning";
+      if (!listed.has(crewId) && !queued.has(crewId) && !starting) inboundLedger.crewEnded(crewId, Date.now());
+    }
+  }
+
+  // Owner messages handed to a crew that ended go back to the captain once, on its next wake.
+  async function handBackOwnerMessages(captainThreadId: string): Promise<void> {
+    await endCrewsOffTheList(captainThreadId);
+    const rows = inboundLedger.takeHandBacks(captainThreadId, Date.now());
+    if (rows.length === 0) return;
+    try {
+      await bb.sdk.threads.send({
+        threadId: captainThreadId,
+        mode: "steer",
+        input: [{ type: "text", text: handBackText(rows), mentions: [], visibility: "agent-only" }],
+      });
+    } catch (error) {
+      inboundLedger.releaseHandBacks(rows);
+      throw error;
     }
   }
 
@@ -6873,13 +6918,19 @@ export default async function plugin(bb: BbPluginApi) {
     catch(error) { if (signal?.aborted || record || crew.launchKey) throw error; return "merged" as const; }
     return recoveredContract(metadata,record);
   }
+  // A second crew (a release operator, a fix crew) may work on a PR another task owns. That is normal, so it is said once.
+  const sharedPrsLogged = new Set<string>();
   // `provenBranch`: the PR head is this crew's branch, so a scout or a local-only crew that opened it is tracked too.
   async function registerCrewPr(crew: Crew, url: string,signal?:AbortSignal,facts:{title?:string;openedAt?:number}={},provenBranch=false) {
     if (isSecondmateRoute(crew) || !url || (!provenBranch && (crew.shape !== "ship" || crew.posture === "local-only"))) return;
     const identity = canonicalPr(url);
     const prior=deliveries.get(identity.id);
     if (prior && (prior.taskId !== crew.id || prior.owner !== crew.parentThreadId)) {
-      bb.log.warn(`PR ${identity.id} already tracked by task ${prior.taskId}; preserving its owner.`);
+      const said = `${identity.id}\0${crew.id}\0${crew.threadId}`;
+      if (!sharedPrsLogged.has(said)) {
+        sharedPrsLogged.add(said);
+        bb.log.info(`PR ${identity.id} already tracked by task ${prior.taskId}; preserving its owner (crew ${crew.id} works on it too).`);
+      }
       return;
     }
     const home=await raceAbort(crewNativeHome(crew),signal,STUCK_HOST_CALL_MS);
@@ -11796,7 +11847,7 @@ export default async function plugin(bb: BbPluginApi) {
       text: z.string().min(1).max(4000),
       quote: z.string().min(1).max(1024).optional(),
       more: z.boolean().optional(),
-      files: z.array(z.string().startsWith("/")).max(10).optional().describe("Absolute paths of files to attach, such as a crew's report.md"),
+      files: z.array(z.string().startsWith("/")).max(10).optional().describe("Absolute paths of files to attach, such as a crew's report.md. Telegram sends any file from the captain's workspace or /tmp, only documents and images from a BB worktree, and never hidden files or secrets"),
       covers: z.array(z.string().min(1)).max(50).optional().describe("Refs of other open owner messages this reply also answers; each closes with no Telegram message"),
     }),
     async execute({ ref, text: words, quote, more, files, covers }, ctx) {
@@ -11864,6 +11915,13 @@ export default async function plugin(bb: BbPluginApi) {
       if (notFile.length > 0) return toolError(`Not sent: ${notFile.join(", ")} is not a regular file. ${used} stays open.`);
       const lineSuffix = attach.filter((file) => /:\d+$/.test(file));
       if (lineSuffix.length > 0) return toolError(`Not sent: ${lineSuffix.join(", ")} ends in :<number>, which Telegram reads as a line number. Rename or copy the file. ${used} stays open.`);
+      if (row.source === "telegram" && attach.length > 0) {
+        const refusals = telegramFileRefusals(attach, { workspace: await threadWorkspace(captain), captainThreadId: captain });
+        if (refusals.length > 0) {
+          return toolError([...refusals.map((r) => `Not sent: Telegram will not send ${r.file}: ${r.reason}`),
+            `Copy each file to /tmp under a name that does not start with "." and attach the copy. ${used} stays open.`].join("\n"));
+        }
+      }
       let claimKind = quotedReplyKind(quote);
       // Reserve first so a concurrent or repeated reply never reaches Telegram twice.
       const reservation = { final: more !== true, covers: covered.map(refOf) };
@@ -13312,10 +13370,11 @@ export default async function plugin(bb: BbPluginApi) {
     }
     await discoverCrewDelivery(crew).catch(error => bb.log.warn(`PR discovery ${crew.id}: ${String(error)}`));
     const stopped = await turnWasStopped(thread);
+    const outcome = parseOutcome(lastAssistantText);
+    if (stopped || verdictOf(outcome) === "DONE" || verdictOf(outcome) === "FAILED") inboundLedger.crewEnded(crew.id, Date.now());
     // BB already reports interruptions to the parent. A completion wake here can
     // cause the manager to resume work the user just stopped.
     if (stopped) return;
-    const outcome = parseOutcome(lastAssistantText);
     // A crew's DONE without a PR is its delivery; a PR, once there, decides the task instead.
     if (verdictOf(outcome) === "DONE" && (await prForCrew(crew)).url === "") await finishTask(crew, { delivered: true, outcome: outcome! });
     if (verdictOf(outcome) === "DONE") await checkPlaybookReport(crew, lastAssistantText ?? "").catch(error => bb.log.warn(`report check ${crew.id}: ${String(error)}`));
@@ -13371,6 +13430,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function handleCrewFailed(crew: Crew, error: string | null): Promise<void> {
     if (isSecondmateRoute(crew)) return;
+    inboundLedger.crewEnded(crew.id, Date.now());
     const current = await settings.get();
     if (current.supervisionEnabled !== true) return;
     await notifyCaptain(crew, "error", error);
@@ -14880,7 +14940,11 @@ export default async function plugin(bb: BbPluginApi) {
     followUpWork=(async()=>{await launchRecoveryPass(launchAbort.signal);resumeDispatchJobs();drainQueuedDispatchesInBackground();await deliveryPass(launchAbort.signal);await raceAbort(publishFleet(),launchAbort.signal,STUCK_HOST_CALL_MS);})();
     try {await followUpWork;} finally {followUpWork=undefined;}
   });
-  bb.events.on("thread.archived", ({ thread }) => { deliveries.ownerLost(thread.id); });
+  bb.events.on("thread.archived", async ({ thread }) => {
+    deliveries.ownerLost(thread.id);
+    const crew = await findCrewByThread(thread.id);
+    if (crew !== undefined) inboundLedger.crewEnded(crew.id, Date.now());
+  });
   bb.events.on("thread.deleted", ({ thread }) => { launches.workerDeleted(thread.id); deliveries.ownerLost(thread.id); });
 
   bb.background.service("crew-watch", {
