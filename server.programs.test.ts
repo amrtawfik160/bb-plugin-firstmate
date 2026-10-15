@@ -12,8 +12,8 @@ type Host = ReturnType<typeof createFakePluginHost>;
 
 // The real case: epic Cyndra-AI/cyndra-saas#2422 on 15 Oct, when only #2423 was closed.
 const epic = JSON.parse(readFileSync(new URL("./test/fixtures/dmpro-epic-2422.json", import.meta.url), "utf8")) as {
-  epic: { number: number; title: string; table: string };
-  subIssues: { number: number; title: string; state: string; body: string }[];
+  epic: { number: number; title: string };
+  subIssues: { number: number; title: string; state: string; blockedBy: number[] }[];
 };
 const EPIC_URL = "https://github.com/Cyndra-AI/cyndra-saas/issues/2422";
 const capCtx = { threadId: "thr_cap", projectId: "proj_1" } as never;
@@ -31,9 +31,15 @@ function github(host: Host, closedSince: () => number[] = () => []) {
     let stdout = "";
     if (command.includes("sub_issues")) {
       stdout = [
-        JSON.stringify({ number: 2422, title: epic.epic.title, state: "open", body: `## Child issues\n\n${epic.epic.table}` }),
-        ...epic.subIssues.map((issue) => JSON.stringify({ ...issue, repo: "Cyndra-AI/cyndra-saas" })),
+        JSON.stringify({ title: epic.epic.title }),
+        ...epic.subIssues.map((issue) => JSON.stringify({ number: issue.number, title: issue.title, state: issue.state, repo: "Cyndra-AI/cyndra-saas", blockers: issue.blockedBy.length })),
       ].join("\n");
+    } else if (command.includes("dependencies/blocked_by")) {
+      // One gh call per blocked issue; each prints one line.
+      stdout = [...command.matchAll(/issues\/(\d+)\/dependencies\/blocked_by/g)].map((m) => {
+        const issue = epic.subIssues.find((i) => i.number === Number(m[1]))!;
+        return JSON.stringify({ repo: "Cyndra-AI/cyndra-saas", number: issue.number, blockedBy: issue.blockedBy.map((n) => ({ repo: "Cyndra-AI/cyndra-saas", number: n })) });
+      }).join("\n");
     } else if (command.includes("issues?state=closed")) {
       stdout = closedSince().join("\n");
     }
@@ -87,8 +93,9 @@ test("14 Oct repro: the DM Pro epic becomes a program the captain cannot lose, a
     assert.ok(!isError(created), text(created));
     assert.match(text(created), /^Program P1 is open and keeps owner task T1 open until every ticket is done or dropped\.\nP1 DM Pro epic: 1\/20 done, 2 ready, 17 waiting on deps · task T1 · https:\/\/github\.com\/cyndra-ai\/cyndra-saas\/issues\/2422/);
     assert.match(text(created), /\n- #2425 Plugins: attach to an agent .* — waiting on deps on #2424\n/);
-    assert.match(text(created), /\nReady now: #2424, #2428\. Dispatch them and name the ticket in each dispatch title/);
-    assert.equal(commands.filter((c) => c.includes("gh api")).length, 1, "one host command reads the epic and its sub-issues");
+    assert.match(text(created), /\nReady now: #2424, #2428\. Dispatch them with ticket set on each dispatch/);
+    assert.equal(commands.filter((c) => c.includes("gh api")).length, 2, "one host command reads the epic and its sub-issues, one reads the blocked-by links");
+    assert.equal([...commands.find((c) => c.includes("dependencies/blocked_by"))!.matchAll(/issues\/(\d+)\/dependencies\/blocked_by/g)].length, 18, "only the 18 sub-issues with blockers are read");
 
     // The same epic again is the same program.
     assert.match(text(await program(host, { action: "create", epic: "cyndra-ai/cyndra-saas#2422", refs: ["tg:985604794:4404"] })), /^Program P1 already tracks this epic\./);
@@ -101,9 +108,11 @@ test("14 Oct repro: the DM Pro epic becomes a program the captain cannot lose, a
     // One line per open program on the owner's board, in place of its task.
     assert.match(await board(host), /🔧 In progress \(1\)\n- P1 Cyndra · DM Pro epic: 1\/20 done, 2 ready, 17 waiting on deps$/);
 
-    // A dispatch that names a ticket in its title marks it running.
-    const dispatched = await tool(host, "firstmate_dispatch").execute({ projectId: "proj_1", task: "Build the plugin catalog", taskId: "dmpro-2424", title: "DM Pro #2424: catalog and install lifecycle", origin: "captain" }, capCtx);
+    // A dispatch with ticket marks it running; the title is not read.
+    const dispatched = await tool(host, "firstmate_dispatch").execute({ projectId: "proj_1", task: "Build the plugin catalog", taskId: "dmpro-2424", title: "Catalog and install lifecycle", ticket: "#2424", origin: { kind: "captain", reason: "program ticket" } }, capCtx);
     assert.match(text(dispatched), /Program P1 ticket #2424 is running\./);
+    const unknown = await tool(host, "firstmate_dispatch").execute({ projectId: "proj_1", task: "Other", taskId: "other", ticket: "#9999", origin: { kind: "captain", reason: "test" } }, capCtx);
+    assert.match(text(unknown), /Warning: the program does not track this crew: No open program has ticket #9999\./);
     const stored = createPrograms(host.bb.storage.database()).get("P1")!;
     assert.deepEqual(stored.tickets.find((t) => t.ref === "cyndra-ai/cyndra-saas#2424")!.state, { kind: "running", crewId: "dmpro-2424" });
   } finally {

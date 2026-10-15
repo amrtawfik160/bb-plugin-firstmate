@@ -321,11 +321,11 @@ test("Oct 12 repro: an unchanged stale list is shown at most once per day", () =
 });
 
 const dmProProgram = (over: Partial<Program> = {}): Program => buildProgram("P1", {
-  captain: "thr_cap", project: "Cyndra", title: "DM Pro epic", source: "https://github.com/Cyndra-AI/cyndra-saas/issues/2422", sourceRefs: [], taskId: "T180", epicBody: "", at: NOW - 13 * HOUR,
+  captain: "thr_cap", project: "Cyndra", title: "DM Pro epic", source: "https://github.com/Cyndra-AI/cyndra-saas/issues/2422", sourceRefs: [], taskId: "T180", at: NOW - 13 * HOUR,
   issues: [
-    { ref: ticketRef("cyndra-ai/cyndra-saas#2423")!, title: "Manifest", body: "", closed: true },
-    { ref: ticketRef("cyndra-ai/cyndra-saas#2424")!, title: "Catalog", body: "Blocked by: #2423", closed: false },
-    { ref: ticketRef("cyndra-ai/cyndra-saas#2425")!, title: "Executor", body: "Blocked by: #2424", closed: false },
+    { ref: ticketRef("cyndra-ai/cyndra-saas#2423")!, title: "Manifest", closed: true, blockedBy: [] },
+    { ref: ticketRef("cyndra-ai/cyndra-saas#2424")!, title: "Catalog", closed: false, blockedBy: [ticketRef("cyndra-ai/cyndra-saas#2423")!] },
+    { ref: ticketRef("cyndra-ai/cyndra-saas#2425")!, title: "Executor", closed: false, blockedBy: [ticketRef("cyndra-ai/cyndra-saas#2424")!] },
   ],
 }).program;
 

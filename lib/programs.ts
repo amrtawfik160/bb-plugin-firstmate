@@ -18,16 +18,6 @@ export function ticketRef(text: string, repo?: string): TicketRef | null {
 export const repoOf = (ref: TicketRef): string => ref.slice(0, ref.indexOf("#"));
 export const numberOf = (ref: TicketRef): number => Number(ref.slice(ref.indexOf("#") + 1));
 
-/** Every issue a text names: URLs, `owner/repo#n`, and `#n` read inside `repo`. */
-export function refsIn(text: string, repo?: string): TicketRef[] {
-  const found: TicketRef[] = [];
-  for (const m of text.matchAll(/https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/(?:issues|pull)\/\d+|\b[\w.-]+\/[\w.-]+#\d+|(?<![\w/])#\d+\b/gi)) {
-    const ref = ticketRef(m[0], repo);
-    if (ref !== null && !found.includes(ref)) found.push(ref);
-  }
-  return found;
-}
-
 /** Where a ticket stands. Each state carries the fact that proves it: a running ticket has its
  * crew, a done ticket its merged PR or closed issue, a dropped ticket the owner's words. */
 export type TicketState =
@@ -172,43 +162,10 @@ export function settle(program: Program, at: number): Program {
   return changed ? { ...program, tickets, updatedAt: at } : program;
 }
 
-/** One issue as read from GitHub, before it becomes a ticket. */
-export type IssueFacts = { ref: TicketRef; title: string; body: string; closed: boolean };
-
-/** Dependencies an issue body names: a "Blocked by:" or "Depends on:" line, or the bullets under a
- * "Blocked by" / "Depends on" heading. */
-export function dependenciesIn(body: string, repo: string): TicketRef[] {
-  const found: TicketRef[] = [];
-  const add = (text: string) => { for (const ref of refsIn(text, repo)) if (!found.includes(ref)) found.push(ref); };
-  let section = false;
-  for (const line of body.split(/\r?\n/)) {
-    const heading = line.match(/^\s{0,3}#{1,6}\s+(.*)$/);
-    if (heading) { section = /^(blocked by|depends on)\b/i.test(heading[1]!.trim()); continue; }
-    const inline = line.match(/^\s*(?:[-*]\s*)?\**(?:blocked by|depends on)\**\s*:\**\s*(.*)$/i);
-    if (inline) add(inline[1]!);
-    else if (section && /^\s*[-*]\s+/.test(line)) add(line);
-  }
-  return found;
-}
-
-/** Dependencies an epic's table gives: a row naming a ticket first and its blockers in a "Blocked by" column. */
-export function epicTableDependencies(body: string, repo: string): Map<TicketRef, TicketRef[]> {
-  const out = new Map<TicketRef, TicketRef[]>();
-  let column = -1;
-  for (const line of body.split(/\r?\n/)) {
-    if (!/^\s*\|/.test(line)) { column = -1; continue; }
-    const cells = line.trim().replace(/^\||\|$/g, "").split("|").map((cell) => cell.trim());
-    const found = cells.findIndex((cell) => /^(blocked by|depends on)$/i.test(cell));
-    if (found >= 0) { column = found; continue; }
-    if (column < 0 || cells.length <= column) continue;
-    const ticket = refsIn(cells[0]!, repo)[0];
-    if (ticket) out.set(ticket, refsIn(cells[column]!, repo));
-  }
-  return out;
-}
+/** One issue as read from GitHub, before it becomes a ticket: its GitHub "blocked by" links, not its text. */
+export type IssueFacts = { ref: TicketRef; title: string; closed: boolean; blockedBy: readonly TicketRef[] };
 
 export type NewProgram = Pick<Program, "captain" | "project" | "title" | "source" | "sourceRefs" | "taskId"> & {
-  epicBody: string;
   issues: readonly IssueFacts[];
   at: number;
 };
@@ -218,10 +175,9 @@ export type NewProgram = Pick<Program, "captain" | "project" | "title" | "source
 export function buildProgram(id: string, input: NewProgram): { program: Program; outside: string[] } {
   if (input.issues.length === 0) throw new Error("A program needs at least one ticket.");
   const refs = new Set(input.issues.map((issue) => issue.ref));
-  const table = epicTableDependencies(input.epicBody, input.issues[0] ? repoOf(input.issues[0].ref) : "");
   const outside: string[] = [];
   const tickets: Ticket[] = input.issues.map((issue) => {
-    const named = [...new Set([...dependenciesIn(issue.body, repoOf(issue.ref)), ...(table.get(issue.ref) ?? [])])].filter((ref) => ref !== issue.ref);
+    const named = [...new Set(issue.blockedBy)].filter((ref) => ref !== issue.ref);
     for (const ref of named) if (!refs.has(ref)) outside.push(`${issue.ref} depends on ${ref}`);
     return {
       ref: issue.ref,
@@ -232,7 +188,7 @@ export function buildProgram(id: string, input: NewProgram): { program: Program;
     };
   });
   const cycle = findCycle(tickets);
-  if (cycle !== null) throw new Error(`Tickets depend on each other in a circle: ${cycle.join(" -> ")}. Fix the issues' "Blocked by" lines first.`);
+  if (cycle !== null) throw new Error(`Tickets depend on each other in a circle: ${cycle.join(" -> ")}. Fix the issues' "blocked by" links on GitHub first.`);
   const program = settle({
     id, captain: input.captain, project: input.project, title: input.title.replace(/\s+/g, " ").trim().slice(0, 120),
     source: input.source, sourceRefs: [...new Set(input.sourceRefs)], taskId: input.taskId,
@@ -388,7 +344,7 @@ export function programText(program: Program, now: number): string {
 /** The one wake the captain gets when tickets become ready. */
 export function readyWakeText(program: Program, refs: readonly TicketRef[]): string {
   const names = refs.map((ref) => shortTicket(program, ref));
-  return `Program ${program.title} (${program.id}): ${names.length === 1 ? `ticket ${names[0]} is` : `tickets ${names.join(", ")} are`} ready; dispatch ${names.length === 1 ? "it" : "them"}. Name the ticket in the dispatch title so the program tracks it. If one should wait, mark it with firstmate_program set.`;
+  return `Program ${program.title} (${program.id}): ${names.length === 1 ? `ticket ${names[0]} is` : `tickets ${names.join(", ")} are`} ready; dispatch ${names.length === 1 ? "it" : "them"}. Pass ticket on each dispatch so the program tracks it. If one should wait, mark it with firstmate_program set.`;
 }
 
 export function stallReminderText(program: Program, now: number): string {

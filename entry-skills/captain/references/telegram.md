@@ -36,9 +36,8 @@ A turn that only handled crew wakes, with nothing for the owner, ends with no te
   dropped (dropped needs a reason). Work you do yourself gets a task through `firstmate_task` open.
 - Each owner job gets its own dispatch and task; a job from another thread or your own passes `origin` instead.
 - An owner job of several tickets (an epic) gets a program: `firstmate_program` create with the epic URL
-  and the owner's refs. Name the ticket (`#n`) in each dispatch title. The program wakes you when
-  tickets become ready and reminds you when ready tickets wait 2 hours with nothing running. Its owner
-  task stays open until every ticket is done or dropped; dropping a ticket needs the owner's words.
+  and the owner's refs. Pass `ticket` on each dispatch for a ticket. Dispatch the tickets the program
+  says are ready. Close a ticket you stop with `firstmate_program` set and the owner's words.
 - Turn-end reminders name any item left unanswered. Answer it or dispatch it; never drop it.
 
 ## Reply to the message you are answering

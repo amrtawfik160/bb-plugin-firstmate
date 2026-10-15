@@ -3,25 +3,25 @@ import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import {
-  applyFact, buildProgram, createPrograms, dependenciesIn, newlyReady, programCounts, programLine, programNeedsOwner, readyRefs, refsIn,
+  applyFact, buildProgram, createPrograms, newlyReady, programCounts, programLine, programNeedsOwner, readyRefs,
   stallReminderDue, stalledSince, ticketRef, TICKET_TRANSITIONS, type IssueFacts, type Program, type TicketKind, type TicketRef,
 } from "./programs.ts";
 
 // The real case: epic Cyndra-AI/cyndra-saas#2422, read on 15 Oct when only #2423 was closed.
 const epic = JSON.parse(readFileSync(new URL("../test/fixtures/dmpro-epic-2422.json", import.meta.url), "utf8")) as {
-  epic: { number: number; title: string; table: string };
-  subIssues: { number: number; title: string; state: string; body: string }[];
+  epic: { number: number; title: string };
+  subIssues: { number: number; title: string; state: string; blockedBy: number[] }[];
 };
 const REPO = "cyndra-ai/cyndra-saas";
 const ref = (n: number) => `${REPO}#${n}` as TicketRef;
-const issues: IssueFacts[] = epic.subIssues.map((i) => ({ ref: ref(i.number), title: i.title, body: i.body, closed: i.state === "closed" }));
+const issues: IssueFacts[] = epic.subIssues.map((i) => ({ ref: ref(i.number), title: i.title, closed: i.state === "closed", blockedBy: i.blockedBy.map(ref) }));
 const H = 60 * 60_000;
 // 14 Oct 19:25 UTC: the captain told the owner the plan.
 const PLAN_AT = Date.UTC(2026, 9, 14, 19, 25);
 
 const dmPro = (at = PLAN_AT): Program => buildProgram("P1", {
   captain: "thr_pse43vv6tn", project: "Cyndra", title: "DM Pro epic", source: "https://github.com/Cyndra-AI/cyndra-saas/issues/2422",
-  sourceRefs: ["tg:985604794:4404"], taskId: "T180", epicBody: epic.epic.table, issues, at,
+  sourceRefs: ["tg:985604794:4404"], taskId: "T180", issues, at,
 }).program;
 
 function db() {
@@ -38,14 +38,11 @@ function db() {
 
 const kindOf = (program: Program, n: number) => program.tickets.find((t) => t.ref === ref(n))!.state.kind;
 
-test("issue refs read from URLs, owner/repo#n and #n inside the repo", () => {
+test("a ticket parameter reads as an issue URL, owner/repo#n, or #n inside the repo", () => {
   assert.equal(ticketRef("https://github.com/Cyndra-AI/cyndra-saas/issues/2424"), ref(2424));
   assert.equal(ticketRef("Cyndra-AI/cyndra-saas#2424"), ref(2424));
   assert.equal(ticketRef("#2424", REPO), ref(2424));
   assert.equal(ticketRef("#2424"), null, "a bare number needs a repo");
-  assert.deepEqual(refsIn("DM Pro #2424: catalog (see Cyndra-AI/cyndra-saas#2423, T172)", REPO), [ref(2424), ref(2423)]);
-  assert.deepEqual(dependenciesIn("Blocked by: #2423, #2424\n\n## What\nmentions #9\n\n## Blocked by\n\n- #2425\n- None", REPO), [ref(2423), ref(2424), ref(2425)]);
-  assert.deepEqual(dependenciesIn("## Blocked by\n\n- None (can start immediately)", REPO), []);
 });
 
 test("the DM Pro epic becomes 20 tickets: #2423 done, #2424 and #2428 ready, 17 waiting on deps", () => {
@@ -57,12 +54,6 @@ test("the DM Pro epic becomes 20 tickets: #2423 done, #2424 and #2428 ready, 17 
   assert.deepEqual(program.tickets.find((t) => t.ref === ref(2442))!.dependsOn, [ref(2430), ref(2437), ref(2424)]);
   assert.equal(programLine(program), "DM Pro epic: 1/20 done, 2 ready, 17 waiting on deps");
   assert.deepEqual(newlyReady(program).refs, [], "the create result already lists the ready tickets");
-});
-
-test("the epic's table alone gives the dependencies when issue bodies name none", () => {
-  const bare = issues.map((issue) => ({ ...issue, body: "" }));
-  const program = buildProgram("P1", { captain: "c", project: null, title: "DM Pro", source: null, sourceRefs: [], taskId: null, epicBody: epic.epic.table, issues: bare, at: 0 }).program;
-  assert.deepEqual(readyRefs(program), [ref(2424), ref(2428)]);
 });
 
 test("dispatch, PR and merge move a ticket, and its dependents become ready with one wake", () => {
@@ -133,9 +124,9 @@ test("a dropped dependency frees its dependents; a program closes when every tic
   assert.equal(kindOf(program, 2429), "ready");
   const store = createPrograms(db());
   const created = store.create({ captain: "thr_cap", project: null, title: "Two", source: "https://github.com/o/r/issues/1", sourceRefs: [], taskId: "T1",
-    epicBody: "", issues: [{ ref: ticketRef("o/r#2")!, title: "a", body: "", closed: false }, { ref: ticketRef("o/r#3")!, title: "b", body: "Blocked by: #2", closed: false }], at: 0 }).program;
+    issues: [{ ref: ticketRef("o/r#2")!, title: "a", closed: false, blockedBy: [] }, { ref: ticketRef("o/r#3")!, title: "b", closed: false, blockedBy: [ticketRef("o/r#2")!] }], at: 0 }).program;
   assert.equal(store.holding("T1")?.id, created.id);
-  assert.equal(store.create({ captain: "thr_cap", project: null, title: "Again", source: "https://github.com/o/r/issues/1", sourceRefs: [], taskId: "T2", epicBody: "", issues: [{ ref: ticketRef("o/r#2")!, title: "a", body: "", closed: false }], at: 1 }).program.id, created.id, "the same epic is one program");
+  assert.equal(store.create({ captain: "thr_cap", project: null, title: "Again", source: "https://github.com/o/r/issues/1", sourceRefs: [], taskId: "T2", issues: [{ ref: ticketRef("o/r#2")!, title: "a", closed: false, blockedBy: [] }], at: 1 }).program.id, created.id, "the same epic is one program");
   program = store.apply(created.id, "thr_cap", [{ kind: "issue-closed", ticket: ticketRef("o/r#2")! }, { kind: "dropped", ticket: ticketRef("o/r#3")!, ownerWords: "not needed" }], 5);
   assert.equal(store.list("thr_cap").length, 0);
   assert.equal(store.list("thr_cap", { includeClosed: true }).length, 1);
@@ -144,6 +135,6 @@ test("a dropped dependency frees its dependents; a program closes when every tic
 });
 
 test("tickets that depend on each other in a circle are refused", () => {
-  assert.throws(() => buildProgram("P1", { captain: "c", project: null, title: "Loop", source: null, sourceRefs: [], taskId: null, epicBody: "", at: 0,
-    issues: [{ ref: ticketRef("o/r#1")!, title: "a", body: "Blocked by: #2", closed: false }, { ref: ticketRef("o/r#2")!, title: "b", body: "Blocked by: #1", closed: false }] }), /in a circle: o\/r#1 -> o\/r#2 -> o\/r#1/);
+  assert.throws(() => buildProgram("P1", { captain: "c", project: null, title: "Loop", source: null, sourceRefs: [], taskId: null, at: 0,
+    issues: [{ ref: ticketRef("o/r#1")!, title: "a", closed: false, blockedBy: [ticketRef("o/r#2")!] }, { ref: ticketRef("o/r#2")!, title: "b", closed: false, blockedBy: [ticketRef("o/r#1")!] }] }), /in a circle: o\/r#1 -> o\/r#2 -> o\/r#1/);
 });

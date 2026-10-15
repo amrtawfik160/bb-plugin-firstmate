@@ -76,7 +76,7 @@ import { formatWorkersForTelegram } from "./lib/telegram-commands.ts";
 import { digestOnce, EMPTY_DIGEST_MEMORY, formatBoard, type BoardInput, type DigestMemory } from "./lib/owner-board.ts";
 import { createOwnerTasks, isOpenTask, sameProject, stateFromPrs, taskLine, type CrewFinish, type OwnerTask, type TaskState } from "./lib/owner-tasks.ts";
 import {
-  buildProgram, createPrograms, epicTableDependencies, isOpenProgram, isOpenTicket, newlyReady, numberOf, programCounts, programText, readyRefs, readyWakeText, refsIn, repoOf,
+  buildProgram, createPrograms, isOpenProgram, isOpenTicket, newlyReady, numberOf, programCounts, programText, readyRefs, readyWakeText, repoOf,
   shortTicket, stallReminderDue, stallReminderText, ticketRef, type IssueFacts, type Program, type ProgramFact, type TicketRef,
 } from "./lib/programs.ts";
 import { askLetterAnswer, askIdFromSourceEventId, packAnswers, cardRepeat, clip, createOwnerAsks, formatAge, formatAskCard, formatUtcTime, mayDefault, CAPTAIN_RULES, OWNER_DECISION_RULE, ownerAskedForOptions, PLAIN_DECISION_GUIDANCE, plainTextDecision, recommendedLabel, type AskKind } from "./lib/owner-asks.ts";
@@ -4907,36 +4907,40 @@ export default async function plugin(bb: BbPluginApi) {
   // here Firstmate feeds it the facts it already has and tells the captain what changed.
   const PROGRAM_ISSUE_CHECK_MS = 30 * 60_000;
   const PROGRAM_MAX_FETCHED_ISSUES = 40;
-  const ghIssueSchema = z.object({ number: z.number(), title: z.string(), body: z.string(), state: z.string(), repo: z.string().optional() });
-  // Only headings, bullets and dependency lines: what dependenciesIn reads, without the whole spec.
-  const ISSUE_JQ = `{number,title,state,repo:(.repository_url|sub(".*/repos/";"")),body:((.body // "")|split("\\n")|map(select(test("^\\\\s*(#|[-*]|blocked by|depends on)";"i")))|join("\\n")|.[0:8000])}|tojson`;
+  const ghSubIssueSchema = z.object({ number: z.number(), title: z.string(), state: z.string(), repo: z.string(), blockers: z.number() });
+  const ghBlockersSchema = z.object({ repo: z.string(), number: z.number(), blockedBy: z.array(z.object({ repo: z.string(), number: z.number() })) });
+  const jsonLines = (output: string) => output.split("\n").map((line) => line.trim()).filter((line) => line.startsWith("{")).map((line) => JSON.parse(line) as unknown);
 
-  function issueLines(output: string): z.infer<typeof ghIssueSchema>[] {
-    return output.split("\n").map((line) => line.trim()).filter((line) => line.startsWith("{")).map((line) => ghIssueSchema.parse(JSON.parse(line)));
-  }
-
-  /** Read an epic and its child issues: the sub-issue list in one call, or the issues its body lists, at most 40. */
-  async function readEpic(hostId: string, epic: TicketRef, signal?: AbortSignal): Promise<{ title: string; body: string; issues: IssueFacts[] }> {
+  /** Read an epic's sub-issues and their GitHub "blocked by" links: one call for the list, one per issue that has blockers. */
+  async function readEpic(hostId: string, epic: TicketRef, signal?: AbortSignal): Promise<{ title: string; issues: IssueFacts[] }> {
     const path = `repos/${repoOf(epic)}/issues/${numberOf(epic)}`;
     const read = await runStructuredOnHost(hostId, [
-      `gh api ${shQuote(path)} --jq ${shQuote("{number,title,state,body:(.body // \"\")}|tojson")}`,
-      `gh api ${shQuote(`${path}/sub_issues?per_page=100`)} --jq ${shQuote(`.[]|${ISSUE_JQ}`)}`,
+      `gh api ${shQuote(path)} --jq ${shQuote("{title}|tojson")}`,
+      `gh api ${shQuote(`${path}/sub_issues?per_page=100`)} --jq ${shQuote(`.[]|{number,title,state,repo:(.repository_url|sub(".*/repos/";"")),blockers:(.issue_dependencies_summary.total_blocked_by // 0)}|tojson`)}`,
     ].join(" && "), 60_000, signal);
     if (read.exitCode !== 0) throw new Error(`GitHub read of ${epic} failed: ${(read.stderr || read.output).trim().slice(0, 300)}`);
-    const [head, ...children] = read.output.split("\n").filter((line) => line.trim().startsWith("{"));
-    const top = z.object({ title: z.string(), body: z.string() }).parse(JSON.parse(head ?? "{}"));
-    let found = issueLines(children.join("\n"));
-    if (found.length === 0) {
-      const listed = [...epicTableDependencies(top.body, repoOf(epic)).keys(),
-        ...top.body.split("\n").filter((line) => /^\s*[-*]\s*\[[ x]\]/i.test(line)).flatMap((line) => refsIn(line, repoOf(epic)).slice(0, 1))];
-      const refs = [...new Set(listed)].filter((ref) => ref !== epic).slice(0, PROGRAM_MAX_FETCHED_ISSUES);
-      if (refs.length === 0) throw new Error(`${epic} has no sub-issues and lists no child issues in its body.`);
-      const each = await runStructuredOnHost(hostId, refs.map((ref) => `gh api ${shQuote(`repos/${repoOf(ref)}/issues/${numberOf(ref)}`)} --jq ${shQuote(ISSUE_JQ)}`).join("; "), 120_000, signal);
-      found = issueLines(each.output);
+    const [head, ...rows] = jsonLines(read.output);
+    const title = z.object({ title: z.string() }).parse(head).title;
+    const subs = rows.map((row) => ghSubIssueSchema.parse(row));
+    if (subs.length === 0) throw new Error(`${epic} has no sub-issues. Add the tickets as GitHub sub-issues of the epic, then create the program.`);
+    const blocked = subs.filter((sub) => sub.blockers > 0);
+    if (blocked.length > PROGRAM_MAX_FETCHED_ISSUES) throw new Error(`${epic} has ${blocked.length} blocked sub-issues; a program reads at most ${PROGRAM_MAX_FETCHED_ISSUES}. Split the epic.`);
+    const links = new Map<string, TicketRef[]>();
+    if (blocked.length > 0) {
+      const each = await runStructuredOnHost(hostId, blocked.map((sub) => {
+        const jq = `{repo:${JSON.stringify(sub.repo)},number:${sub.number},blockedBy:[.[]|{repo:(.repository_url|sub(".*/repos/";"")),number}]}|tojson`;
+        return `gh api ${shQuote(`repos/${sub.repo}/issues/${sub.number}/dependencies/blocked_by?per_page=100`)} --jq ${shQuote(jq)}`;
+      }).join(" && "), 120_000, signal);
+      if (each.exitCode !== 0) throw new Error(`GitHub read of blocked-by links failed: ${(each.stderr || each.output).trim().slice(0, 300)}`);
+      for (const row of jsonLines(each.output).map((line) => ghBlockersSchema.parse(line))) {
+        links.set(`${row.repo}#${row.number}`.toLowerCase(), row.blockedBy.map((b) => ticketRef(`${b.repo}#${b.number}`)!));
+      }
     }
-    const issues = found.map((issue) => ({ ref: ticketRef(`${issue.repo ?? repoOf(epic)}#${issue.number}`)!, title: issue.title, body: issue.body, closed: issue.state.toLowerCase() === "closed" }))
-      .sort((a, b) => numberOf(a.ref) - numberOf(b.ref));
-    return { title: top.title, body: top.body, issues };
+    const issues = subs.map((sub) => {
+      const ref = ticketRef(`${sub.repo}#${sub.number}`)!;
+      return { ref, title: sub.title, closed: sub.state.toLowerCase() === "closed", blockedBy: links.get(ref) ?? [] };
+    }).sort((a, b) => numberOf(a.ref) - numberOf(b.ref));
+    return { title, issues };
   }
 
   /** Ticket issues closed since `since`: one REST call per repo. */
@@ -5040,21 +5044,26 @@ export default async function plugin(bb: BbPluginApi) {
     if (changed) await refreshOwnerBoard();
   }
 
-  /** A dispatch for a program ticket marks it running. The title names the tickets; without one there,
-   * a task text that names exactly one open ticket does. */
-  function trackProgramTickets(captain: string, crewId: string, title: string | undefined, task: string): string {
-    const notes: string[] = [];
-    for (const program of programs.list(captain)) {
-      const repo = programRepo(program);
-      const open = program.tickets.filter(isOpenTicket).map((ticket) => ticket.ref);
-      const inTitle = refsIn(title ?? "", repo).filter((ref) => open.includes(ref));
-      const inTask = refsIn(task, repo).filter((ref) => open.includes(ref));
-      const named = inTitle.length > 0 ? inTitle : inTask.length === 1 ? inTask : [];
-      if (named.length === 0) continue;
-      const updated = applyEach(program, named.map((ticket) => ({ kind: "dispatched", ticket, crewId }) as const), Date.now());
-      notes.push(` Program ${program.id} ticket ${named.map((ref) => shortTicket(updated, ref)).join(", ")} is running.`);
+  /** The open program ticket a `ticket` parameter names. A bare #n must match one open program's ticket. */
+  function programTicket(captain: string, text: string): { program: Program; ref: TicketRef } {
+    const found = programs.list(captain).flatMap((program) => {
+      const ref = ticketRef(text, programRepo(program));
+      return ref !== null && program.tickets.some((t) => t.ref === ref) ? [{ program, ref }] : [];
+    });
+    if (found.length === 0) throw new Error(`No open program has ticket ${text}. Check firstmate_program list.`);
+    if (found.length > 1) throw new Error(`Ticket ${text} is in ${found.map((f) => f.program.id).join(" and ")}; pass owner/repo#n.`);
+    return found[0]!;
+  }
+
+  /** A dispatch with `ticket` marks that program ticket running. */
+  function trackProgramTicket(captain: string, crewId: string, ticket: string): string {
+    try {
+      const { program, ref } = programTicket(captain, ticket);
+      const updated = programs.apply(program.id, captain, [{ kind: "dispatched", ticket: ref, crewId }], Date.now());
+      return ` Program ${program.id} ticket ${shortTicket(updated, ref)} is running.`;
+    } catch (error) {
+      return `\nWarning: the program does not track this crew: ${error instanceof Error ? error.message : String(error)}`;
     }
-    return notes.join("");
   }
 
   const programParams = z.object({
@@ -5096,15 +5105,15 @@ export default async function plugin(bb: BbPluginApi) {
       const title = input.title ?? read.title.replace(/^epic:\s*/i, "");
       const project = await projectLabel(projectId);
       // Refuse a bad epic (no tickets, a dependency circle) before an owner task opens for it.
-      buildProgram("P0", { captain, project, title, source, sourceRefs, taskId: null, epicBody: read.body, issues: read.issues, at: now });
+      buildProgram("P0", { captain, project, title, source, sourceRefs, taskId: null, issues: read.issues, at: now });
       const taskId = task?.id ?? ownerTasks.open({ captain, project, title, sourceRefs, at: now }).id;
-      const { program, outside } = programs.create({ captain, project, title, source, sourceRefs: [...new Set([...sourceRefs, ...(task?.sourceRefs ?? [])])], taskId, epicBody: read.body, issues: read.issues, at: now });
+      const { program, outside } = programs.create({ captain, project, title, source, sourceRefs: [...new Set([...sourceRefs, ...(task?.sourceRefs ?? [])])], taskId, issues: read.issues, at: now });
       await refreshOwnerBoard();
       const ready = readyRefs(program).map((ref) => shortTicket(program, ref));
       return [
         `Program ${program.id} is open and keeps owner task ${taskId} open until every ticket is done or dropped.`,
         programText(program, now),
-        ready.length > 0 ? `Ready now: ${ready.join(", ")}. Dispatch them and name the ticket in each dispatch title; Firstmate wakes you when more become ready.` : "No ticket is ready yet.",
+        ready.length > 0 ? `Ready now: ${ready.join(", ")}. Dispatch them with ticket set on each dispatch; Firstmate wakes you when more become ready.` : "No ticket is ready yet.",
         ...(outside.length > 0 ? [`Not tracked (outside this program): ${outside.join("; ")}.`] : []),
       ].join("\n");
     }
@@ -11075,10 +11084,11 @@ export default async function plugin(bb: BbPluginApi) {
     ownerRequestedProvider: z.boolean().optional().describe("The owner named this provider in their own words; keeps acp-antigravity for ship work"),
     taskRef: z.string().regex(/^T\d+$/).optional().describe("Owner task this crew continues, e.g. T8: the crew joins it, no new task opens, and an open task goes back to working"),
     playbook: z.enum(PLAYBOOK_CHOICES).optional().describe("pstack playbook for the crew; overrides the match on the title. none = deploy or operator task, which follows the delivery contract"),
+    ticket: z.string().optional().describe("Program ticket this crew works: #n, owner/repo#n or the issue URL. The program marks it running"),
   });
 
-  const dispatchHelp='bb firstmate dispatch [options] -- "<task>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","sendAt","origin","taskRef"])+"\n  --task <text>  Repeat for bounded fan-out; --hidden hides the worker.\n  sendAt/--send-at is unsupported; native ship isolation is mandatory.";
-  const queueHelp='bb firstmate queue add [options] -- "<title>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider"},["task","taskId","overrideOwner","sendAt","title","permissionMode","sharedEnv","worktree","visible","ownerRequestedProvider","origin","taskRef","playbook"])+"\n  --detail <full-task>\n  --after <queue-id>  Repeat for dependencies, which remain dispatch gates.\n  --wait-until <ISO-time>  Eligibility only; explicit dispatch required.\n  dispatch preserves the queued shape, mode, contract, dependencies and identity; only provider/model/reasoning/permission/visibility/worktree options override at dispatch.\n  list | next | done <queue-id> | drop <queue-id> | prune | reconcile <exact-id> --project <id> [original options]"+"\nDispatch: bb firstmate queue dispatch <queue-id> [options]\n"+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","taskId","overrideOwner","sendAt","title","shape","mode","deliveryRequirement","ownerRequestedProvider","origin","taskRef","playbook"]);
+  const dispatchHelp='bb firstmate dispatch [options] -- "<task>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","sendAt","origin","taskRef","ticket"])+"\n  --task <text>  Repeat for bounded fan-out; --hidden hides the worker.\n  sendAt/--send-at is unsupported; native ship isolation is mandatory.";
+  const queueHelp='bb firstmate queue add [options] -- "<title>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider"},["task","taskId","overrideOwner","sendAt","title","permissionMode","sharedEnv","worktree","visible","ownerRequestedProvider","origin","taskRef","playbook","ticket"])+"\n  --detail <full-task>\n  --after <queue-id>  Repeat for dependencies, which remain dispatch gates.\n  --wait-until <ISO-time>  Eligibility only; explicit dispatch required.\n  dispatch preserves the queued shape, mode, contract, dependencies and identity; only provider/model/reasoning/permission/visibility/worktree options override at dispatch.\n  list | next | done <queue-id> | drop <queue-id> | prune | reconcile <exact-id> --project <id> [original options]"+"\nDispatch: bb firstmate queue dispatch <queue-id> [options]\n"+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","taskId","overrideOwner","sendAt","title","shape","mode","deliveryRequirement","ownerRequestedProvider","origin","taskRef","playbook","ticket"]);
   const usage = [
     "Usage:",
     "  bb firstmate guide [--json]",
@@ -11366,7 +11376,7 @@ export default async function plugin(bb: BbPluginApi) {
       "Dispatch a firstmate-style crewmate: spawns a child BB thread for one task (ship crews get an isolated worktree by default) and records it as a crew. Each owner job opens its own owner task: pass the owner's sourceRefs, or origin when the job came from another thread or the captain. A follow-up on an existing task (fix round, deploy, check) passes taskRef instead; a dispatch for a PR a task already holds joins that task.",
     presentation: { label: { pending: "Dispatching crewmate", completed: "Dispatched crewmate" } },
     parameters: dispatchParams,
-    async execute({ task, taskId, projectId, title, providerId, model, reasoningLevel, permissionMode, shape, mode, worktree, sharedEnv, visible, sendAt, deliveryRequirement, overrideOwner, sourceRefs, origin, ownerRequestedProvider, taskRef, playbook }, ctx) {
+    async execute({ task, taskId, projectId, title, providerId, model, reasoningLevel, permissionMode, shape, mode, worktree, sharedEnv, visible, sendAt, deliveryRequirement, overrideOwner, sourceRefs, origin, ownerRequestedProvider, taskRef, playbook, ticket }, ctx) {
       const ctxRecord = asRecord(ctx);
       const resolvedProject =
         projectId ?? (typeof ctxRecord["projectId"] === "string" ? ctxRecord["projectId"] : undefined);
@@ -11400,7 +11410,7 @@ export default async function plugin(bb: BbPluginApi) {
         return ` Owner task ${opened.id} tracks it until it is merged, live, done, or dropped; a reply does not close it.`;
       };
       const trackTask = async (crewId: string): Promise<string> =>
-        (await trackOwnerTask(crewId)) + (parentThreadId === undefined ? "" : trackProgramTickets(parentThreadId, crewId, title, task));
+        (await trackOwnerTask(crewId)) + (parentThreadId === undefined || ticket === undefined ? "" : trackProgramTicket(parentThreadId, crewId, ticket));
       if (overrideOwner !== true) {
         const conflict = await dispatchPrConflict(task, resolvedProject, parentThreadId);
         if (conflict !== null) return toolError(conflict);
@@ -11726,7 +11736,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_program",
-    description: "Programs: an owner job of several tickets (an epic), open until every ticket is done or dropped. create reads the epic (URL or owner/repo#n), its child issues and their \"Blocked by\" lines; pass refs (owner messages) or task (an open owner task). Name the ticket (#n) in each dispatch title: the dispatch marks it running, its PR in review, the merge or a closed issue done. Firstmate wakes you once when tickets become ready and reminds you after 2 hours with ready tickets and nothing running. list, show id, refresh (reads GitHub now), set id tickets state: blocked (reason, askId), dropped (reason = the owner's words), ready (unblock, or the crew stopped), running (crewId), in-review (pr), done (merged pr, or a closed issue).",
+    description: "Programs: an owner job of several tickets (an epic), open until every ticket is done or dropped. create reads the epic (URL or owner/repo#n), its GitHub sub-issues and their \"blocked by\" links; pass refs (owner messages) or task (an open owner task). Pass ticket on each firstmate_dispatch for a ticket: the dispatch marks it running, its PR in review, the merge or a closed issue done. Firstmate wakes you once when tickets become ready and reminds you after 2 hours with ready tickets and nothing running. list, show id, refresh (reads GitHub now), set id tickets state: blocked (reason, askId), dropped (reason = the owner's words), ready (unblock, or the crew stopped), running (crewId), in-review (pr), done (merged pr, or a closed issue).",
     parameters: programParams,
     async execute(input, ctx) {
       const captain = ctxString(ctx, "threadId");
