@@ -242,3 +242,34 @@ test('without --yes a merge never happens, whatever the posture; it previews the
   assert.equal((await host.bb.storage.kv.get('crews')).length,1,'a preview retires no crew');
  }finally{await host.harness.lifecycle.dispose();}
 });
+
+// PR 129 verdict 2: a release crew on an old brief (no --yes) aimed at another crew's
+// unverified PR got the ownership refusal, not the preview with its next command.
+test('without --yes the preview comes before any refusal, names every reason --yes would refuse, and gives the next steps',async()=>{
+ const {host,commands}=await deck([2391],{verified:false});try {
+  const release={...crew,id:'rel00001',task:'release the green PRs',threadId:'thr_release'};
+  const stranger={...crew,id:'rel00002',task:'release other PRs',threadId:'thr_rel_other',parentThreadId:'thr_other'};
+  await host.bb.storage.kv.set('crews',[crew,release,stranger]);
+  await host.bb.storage.kv.set('captain-project:thr_cap','proj_1');
+  await host.bb.storage.kv.set('captain-project:thr_other','proj_1');
+  const sha=head(2391).slice(0,7);
+  for(const threadId of ['thr_release','thr_rel_other']){
+   const cli=await host.harness.behavior.runCli(['merge',CREW,'--pr','2391'],{threadId,projectId:'proj_1'});
+   assert.equal(cli.exitCode,0,cli.stderr);
+   assert.equal(cli.stdout.split('\n')[0],'Not merged: this is a preview. A merge needs --yes (yes=true), whatever the posture.');
+   assert.match(cli.stdout,/^With --yes now, the merge would be refused:$/m);
+   assert.match(cli.stdout,/^- Refusing: https:\/\/github\.com\/Cyndra-AI\/cyndra-saas\/pull\/2391 is the PR of crew 9ceeb10f/m);
+   assert.match(cli.stdout,new RegExp(`^- Refusing: #2391 has no verification record for its current head ${sha}\\.$`,'m'));
+   assert.match(cli.stdout,/^- Refusing: checks failing \(failed 1, pending 0\)/m);
+   assert.match(cli.stdout,new RegExp(`^1\\. Drive the changed surface at head ${sha}, then record what you drove and saw: bb firstmate deliveries verify cyndra-ai/cyndra-saas#2391 --commit ${sha} --driven "<what you drove>" --seen "<what you saw>"$`,'m'));
+   assert.match(cli.stdout,/^2\. Checks: get them green, or name the one red check to waive with --allow-red '<check>'\.$/m);
+   assert.match(cli.stdout,/^3\. Ownership: only if the owning captain told you to land it, add --override-owner\.$/m);
+   assert.match(cli.stdout,/^To merge: bb firstmate merge 9ceeb10f --pr 2391 --yes$/m);
+  }
+  const viaTool=text(await tool(host,'firstmate_merge').execute({crewId:CREW,pr:2391},{threadId:'thr_release',projectId:'proj_1'}));
+  assert.match(viaTool,/^Not merged: this is a preview/);
+  const refused=await host.harness.behavior.runCli(['merge',CREW,'--pr','2391','--yes'],{threadId:'thr_release',projectId:'proj_1'});
+  assert.equal(refused.exitCode,1);assert.match(refused.stderr,/is the PR of crew 9ceeb10f/,'with --yes the ownership refusal still comes first');
+  assert.deepEqual(merges(commands),[]);
+ }finally{await host.harness.lifecycle.dispose();}
+});
