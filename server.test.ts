@@ -2522,7 +2522,7 @@ test("merge lands a PR with zero checks (no_checks) on the captain's word", asyn
   }
 });
 
-test("allowRedCheck is separate from authority: no --yes still refuses", async () => {
+test("allowRedCheck is separate from authority: no --yes merges nothing and previews", async () => {
   const host = await load();
   try {
     await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
@@ -2530,9 +2530,13 @@ test("allowRedCheck is separate from authority: no --yes still refuses", async (
     host.harness.sdk.stub("threads.get", async () =>
       makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }),
     );
+    host.harness.sdk.stub("environments.pullRequest", async () => ({ outcome: "available", pullRequest: { url: "https://github.com/o/r/pull/7", number: 7, title: "Fix", state: "open", checks: { state: "failing", failedCount: 1, pendingCount: 0, passedCount: 2 } } }));
     const result = await host.harness.behavior.runCli(["merge", "c1", "--allow-unverified", "the owner said merge it", "--allow-red", "flaky-e2e"]);
-    assert.equal(result.exitCode, 1);
-    assert.match(result.stderr, /captain's word/i);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /^Not merged: this is a preview/);
+    assert.match(result.stdout, /^Checks: failing: 2 passing, 1 failing, 0 pending$/m);
+    assert.match(result.stdout, /^To merge: bb firstmate merge c1 --pr 7 --allow-red 'flaky-e2e' --allow-unverified 'the owner said merge it' --yes$/m);
+    assert.equal(host.harness.sdk.callsTo("environments.mergePullRequest").length, 0);
   } finally {
     await host.harness.lifecycle.dispose();
   }

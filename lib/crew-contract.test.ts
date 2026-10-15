@@ -34,7 +34,7 @@ const VERIFY_RULES = [
   "If you cannot drive it, write \"blocked: <step>: <what stops you>\". Never mark it ✓ or pending, and never hand a human a manual checklist as verification.",
 ];
 
-const MERGE_RULE = "Merge only with `bb firstmate merge <crew> --pr <n>`; it refuses a PR without a verification record. Never use `gh pr merge` or the GitHub API.";
+const MERGE_RULE = "Merge only via `bb firstmate merge <crew> --pr <n> --yes`; it refuses a PR with no verification record. Never use `gh pr merge` or GitHub's API.";
 
 // PR 129 review: a release crew's brief (no playbook) did not say how to drive, record
 // and merge each PR.
@@ -42,7 +42,7 @@ const MERGE_SEQUENCE = [
   "To merge a PR, do these steps at its current head:",
   "Merge step 1: drive the change on the real surface, with the project's verify skill if it has one.",
   "Merge step 2: `bb firstmate deliveries verify <owner/repo#n> --commit <head sha> --driven \"<what you drove>\" --seen \"<what you saw>\"`.",
-  "Merge step 3: `bb firstmate merge <crew> --pr <n>`, where <crew> is the crew that opened the PR.",
+  "Merge step 3: `bb firstmate merge <crew> --pr <n> --yes`, where <crew> is the crew that opened the PR.",
   "After a new push, do steps 1 and 2 again. If you cannot drive the change, report \"blocked: <PR>: <reason>\".",
 ];
 

@@ -29,6 +29,7 @@ function hostCommands(host,answer) {
 // GitHub as it stood: every listed PR open on its crew branch; 2400 belongs to another crew; 2350 is closed.
 function forge(command) {
  if(command.includes('fm-pr-merge.sh')){const n=prNumber(command);return{payload:`verified: ${url(n)} is merged (state=MERGED, merged=true, isInMergeQueue=false)`};}
+ if(command.includes('gh pr checks'))return{code:1,payload:JSON.stringify([{name:'build',bucket:'pass'},{name:'lint',bucket:'pass'},{name:'e2e',bucket:'fail'}])};
  if(command.includes('gh pr view')){
   const n=prNumber(command);
   const ref=n===2400?'fm/other-crew-fix':branch(n);
@@ -219,5 +220,25 @@ test('a crew of the same captain merges another crew\'s PR once its head is veri
   const cli=await merge('thr_release');
   assert.equal(cli.exitCode,0,cli.stderr);assert.match(cli.stdout,/Merged #2391 Change 2391/);
   assert.equal(merges(commands).length,1);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+// 15 Oct: `merge <crew> --pr <n>` without --yes, meant as a probe, merged Cyndra 2450 and 2449
+// because the project had a standing yolo posture; 2449 landed before its backend deploy.
+test('without --yes a merge never happens, whatever the posture; it previews the PR, head, checks, record and the command',async()=>{
+ const {host,commands}=await deck([2391]);try {
+  await host.bb.storage.kv.set('postures',{proj_1:{mode:'direct-PR',yolo:true,provenance:{source:'captain-instruction',actor:'thr_cap',at:'2026-10-05T00:00:00Z',reason:'standing green merges'}}});
+  const cli=await host.harness.behavior.runCli(['merge',CREW,'--pr','2391'],ctx);
+  assert.equal(cli.exitCode,0,cli.stderr);
+  assert.equal(cli.stdout.split('\n')[0],'Not merged: this is a preview. A merge needs --yes (yes=true), whatever the posture.');
+  assert.match(cli.stdout,/^PR: #2391 Change 2391 https:\/\/github\.com\/Cyndra-AI\/cyndra-saas\/pull\/2391 \(open\)$/m);
+  assert.ok(cli.stdout.includes(`Head: ${head(2391)}`));
+  assert.match(cli.stdout,/^Checks: 2 passing, 1 failing \(e2e\), 0 pending$/m);
+  assert.match(cli.stdout,/^Verification record: covers the current head; driven: change 2391 in the staging app; seen: it works$/m);
+  assert.match(cli.stdout,/^To merge: bb firstmate merge 9ceeb10f --pr 2391 --yes$/m);
+  const out=text(await tool(host,'firstmate_merge').execute({crewId:CREW,pr:2391},ctx));
+  assert.match(out,/^Not merged: this is a preview/);
+  assert.deepEqual(merges(commands),[]);
+  assert.equal((await host.bb.storage.kv.get('crews')).length,1,'a preview retires no crew');
  }finally{await host.harness.lifecycle.dispose();}
 });

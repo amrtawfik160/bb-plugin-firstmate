@@ -485,11 +485,10 @@ test('PR-only delivered artifact remains monitored across reload; baseline follo
  }finally{await host.harness.lifecycle.dispose();}
 });
 
-test('recorded standing yolo reaches the native guard without a fresh merge ask; legacy provenance and actual user holds remain explicit',async()=>{
+test('without --yes a merge previews under any posture; with --yes it reaches the native guard',async()=>{
  const host=await base({fmHome:'/scratch/native',fmHostId:'host_1'});try{
  await host.bb.storage.kv.set('crews',[{...row(1),nativeHome:'/scratch/native',prUrl:'https://github.com/acme/repo/pull/10'}]);
  await host.bb.storage.kv.set('postures',{proj_1:{mode:'direct-PR',yolo:true}});
- const legacy=await host.harness.behavior.runCli(['merge','c1'],ctx);assert.equal(legacy.exitCode,1);assert.match(legacy.stderr,/provenance is unverified/);assert.match(legacy.stderr,/no fresh per-PR request/);
  await host.bb.storage.kv.set('postures',{proj_1:{mode:'direct-PR',yolo:true,provenance:{source:'captain-instruction',actor:'thr_cap',at:'2026-10-05T00:00:00Z',reason:'User approved standing green in-scope merge; supervisor earlier wrote do-not-merge without user authority'}}});
  host.harness.sdk.stub('environments.pullRequest',async()=>({outcome:'unavailable'}));
  let guarded=0;hostCommands(host,c=>{
@@ -497,10 +496,12 @@ test('recorded standing yolo reaches the native guard without a fresh merge ask;
  if(c.includes('gh pr view'))return{payload:JSON.stringify({url:'https://github.com/acme/repo/pull/10',number:10,headRefOid:'sha10',state:'OPEN',mergeable:'MERGEABLE'})};
  return{code:0};
  });
- const standing=await host.harness.behavior.runCli(['merge','c1','--allow-unverified','the owner said merge it'],ctx);assert.equal(standing.exitCode,1);assert.match(standing.stderr,/NATIVE_USER_HOLD_OR_CHECK_REFUSAL/);assert.equal(guarded,1,'standing authority must reach the guarded route without a fresh request');
+ const preview=await host.harness.behavior.runCli(['merge','c1','--allow-unverified','the owner said merge it'],ctx);assert.equal(preview.exitCode,0,preview.stderr);assert.match(preview.stdout,/^Not merged: this is a preview/);assert.equal(guarded,0,'standing yolo alone never merges');
+ assert.match(preview.stdout,/^To merge: bb firstmate merge c1 --pr 10 --allow-unverified 'the owner said merge it' --yes$/m);
+ const standing=await host.harness.behavior.runCli(['merge','c1','--yes','--allow-unverified','the owner said merge it'],ctx);assert.equal(standing.exitCode,1);assert.match(standing.stderr,/NATIVE_USER_HOLD_OR_CHECK_REFUSAL/);assert.equal(guarded,1,'--yes reaches the guarded route');
  assert.equal((await host.bb.storage.kv.get('crews')).length,1);assert.equal(host.harness.sdk.callsTo('environments.mergePullRequest').length,0);
  await host.bb.storage.kv.set('postures',{proj_1:{mode:'direct-PR',yolo:false,provenance:{source:'captain-instruction',actor:'thr_cap',at:'2026-10-05T01:00:00Z',reason:'Actual user hold'}}});
- const held=await host.harness.behavior.runCli(['merge','c1'],ctx);assert.equal(held.exitCode,1);assert.match(held.stderr,/Needs captain/);assert.equal(guarded,1,'actual hold must retain its gate');
+ const held=await host.harness.behavior.runCli(['merge','c1'],ctx);assert.equal(held.exitCode,0,held.stderr);assert.match(held.stdout,/^Not merged: this is a preview/);assert.equal(guarded,1,'a preview reaches no merge');
  }finally{await host.harness.lifecycle.dispose();}
 });
 
