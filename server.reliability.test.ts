@@ -924,6 +924,60 @@ test("firstmate_reply covers: an exact repeat closes only the covers the deliver
   }
 });
 
+// Round 4: a different text with a quote that already had a reply returned "Already replied", although that text was never sent.
+test("firstmate_reply covers: a different text with a quote whose reply was not recorded as delivered is refused with the recovery, and closes nothing", async () => {
+  const host = await load();
+  try {
+    await telegramFlags(host);
+    recordTelegram(host, "thr_cap", "1669", 1_000);
+    recordTelegram(host, "thr_cap", "1670", 2_000);
+    recordTelegram(host, "thr_cap", "1671", 3_000);
+    recordTelegram(host, "thr_cap", "1672", 4_000);
+    createInboundLedger(host.bb.storage.database()).markDelegated({ source: "telegram", chatId: "200", messageId: "1671" }, "thr_crew", 3_500);
+    host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
+    const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
+    const args = { ref: "tg:200:1669", text: "All filters are included in the research.", quote: "Status?", covers: ["tg:200:1670", "tg:200:1671", "tg:200:1672"] };
+    const db = host.bb.storage.database();
+    db.exec("CREATE TRIGGER fail_delivery BEFORE UPDATE ON inbound_outbox BEGIN SELECT RAISE(ABORT, 'simulated delivery record failure'); END;");
+    assert.ok(isError(await tool(host, "firstmate_reply").execute(args, ctx)));
+    db.exec("DROP TRIGGER fail_delivery;");
+    const changed = await tool(host, "firstmate_reply").execute({ ...args, text: "The research covers every filter you sent." }, ctx);
+    assert.ok(isError(changed), text(changed));
+    assert.doesNotMatch(text(changed), /Already replied/);
+    assert.match(text(changed), /Not sent/);
+    assert.match(text(changed), /without quote/);
+    assert.deepEqual(["1669", "1670", "1671", "1672"].map((id) => ledgerRow(host, id)?.state), ["received", "received", "delegated", "received"], "nothing is closed");
+    assert.equal(host.harness.sdk.callsTo("plugins.callRpc").length, 1, "the changed text is not sent");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("firstmate_reply covers: a different final text with the quote of a more=true reply is refused with the recovery, and closes nothing", async () => {
+  const host = await load();
+  try {
+    await telegramFlags(host);
+    recordTelegram(host, "thr_cap", "1669", 1_000);
+    recordTelegram(host, "thr_cap", "1670", 2_000);
+    recordTelegram(host, "thr_cap", "1671", 3_000);
+    recordTelegram(host, "thr_cap", "1672", 4_000);
+    createInboundLedger(host.bb.storage.database()).markDelegated({ source: "telegram", chatId: "200", messageId: "1671" }, "thr_crew", 3_500);
+    host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
+    const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
+    const partial = await tool(host, "firstmate_reply").execute({ ref: "tg:200:1669", text: "The research is running.", quote: "Status?", more: true }, ctx);
+    assert.ok(!isError(partial), text(partial));
+    const final = await tool(host, "firstmate_reply").execute({ ref: "tg:200:1669", text: "The research is done.", quote: "Status?", covers: ["tg:200:1670", "tg:200:1671", "tg:200:1672"] }, ctx);
+    assert.ok(isError(final), text(final));
+    assert.doesNotMatch(text(final), /Already replied/);
+    assert.match(text(final), /Not sent/);
+    assert.match(text(final), /without quote/);
+    assert.deepEqual(["1669", "1670", "1671", "1672"].map((id) => ledgerRow(host, id)?.state), ["received", "received", "delegated", "received"], "nothing is closed");
+    assert.equal(host.harness.sdk.callsTo("plugins.callRpc").length, 1, "the final text is not sent");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("firstmate_reply and the captain Telegram guide tell the captain to answer forwarded messages once with covers", () => {
   const source = readFileSync(new URL("./server.ts", import.meta.url), "utf8");
   const description = source.slice(source.indexOf('name: "firstmate_reply"'), source.indexOf("parameters:", source.indexOf('name: "firstmate_reply"')));
