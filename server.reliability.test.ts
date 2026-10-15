@@ -152,6 +152,26 @@ for (const [label, result] of [
   });
 }
 
+for (const [label, threading, stub] of [
+  ["Firstmate's threading flag is off", "off", null],
+  ["the connector has no reply method", "on", async () => { throw Object.assign(new Error("unknown method"), { code: "unknown_method" }); }],
+] as const) {
+  test(`an ack is not recorded as sent when ${label}: nothing sends it`, async () => {
+    const host = await captainHost();
+    try {
+      await host.harness.behavior.setSettings({ fmReliability: JSON.stringify({ inboundLedger: "on", telegramThreading: threading }) });
+      host.harness.sdk.stub("plugins.callRpc", stub ?? (async () => ({ queued: 1, duplicate: false, mode: "on" })));
+      await ownerMessage(host);
+      await ownerMessage(host);
+      assert.equal(ledgerRow(host, "1669")?.state, "received");
+      assert.equal(createInboundLedger(host.bb.storage.database()).outboxGet({ source: "telegram", chatId: "200", messageId: "1669" }, "ack"), undefined);
+      assert.ok(host.harness.sdk.callsTo("plugins.callRpc").filter(([args]) => (args as { method: string }).method === "reply").length <= 1, "a missing sender is not asked again");
+    } finally {
+      await host.harness.lifecycle.dispose();
+    }
+  });
+}
+
 test("a delivered ack marks the item acknowledged", async () => {
   const host = await captainHost();
   try {
@@ -719,6 +739,66 @@ test("firstmate_reply covers: a reply that is not delivered leaves the covered i
     const refused = await tool(host, "firstmate_reply").execute({ ref: "tg:200:1669", text: "Started.", covers: ["tg:200:1670"] }, { threadId: "thr_cap", projectId: "proj_1" } as never);
     assert.ok(isError(refused), text(refused));
     assert.equal(ledgerRow(host, "1670")?.state, "received");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// Independent check of PR #133: with no sender the tool said "Replied ... via envelope", sent nothing, and closed every message.
+for (const [name, threading, stub] of [
+  ["threaded replies are off", "off", null],
+  ["the connector has no reply method", "on", async () => { throw Object.assign(new Error("unknown method"), { code: "unknown_method" }); }],
+] as const) {
+  test(`firstmate_reply covers: when ${name}, nothing reaches the owner, so the reply and its covered items stay open`, async () => {
+    const host = await load();
+    try {
+      await host.harness.behavior.setSettings({ fmReliability: JSON.stringify({ inboundLedger: "on", telegramThreading: threading }) });
+      recordTelegram(host, "thr_cap", "1669", 1_000);
+      recordTelegram(host, "thr_cap", "1670", 2_000);
+      recordTelegram(host, "thr_cap", "1671", 3_000);
+      createInboundLedger(host.bb.storage.database()).markDelegated({ source: "telegram", chatId: "200", messageId: "1671" }, "thr_crew", 3_500);
+      host.harness.sdk.stub("plugins.callRpc", stub ?? (async () => ({ queued: 1, duplicate: false, mode: "on" })));
+      const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
+      const args = { ref: "tg:200:1669", text: "Research started with all your filters.", covers: ["tg:200:1670", "tg:200:1671"] };
+      const result = await tool(host, "firstmate_reply").execute(args, ctx);
+      assert.ok(isError(result), text(result));
+      assert.match(text(result), /not delivered/);
+      assert.doesNotMatch(text(result), /Replied to/);
+      assert.match(text(result), /tg:200:1669, tg:200:1670, tg:200:1671 stay open/);
+      assert.equal(host.harness.sdk.callsTo("threads.send").length, 0);
+      assert.equal(ledgerRow(host, "1669")?.state, "received");
+      assert.equal(ledgerRow(host, "1670")?.state, "received");
+      assert.equal(ledgerRow(host, "1671")?.state, "delegated");
+      assert.equal(ledgerRow(host, "1670")?.coveredBy ?? null, null);
+      // Once a sender works, the same call goes through: the failed attempt reserved nothing.
+      await host.harness.behavior.setSettings({ fmReliability: JSON.stringify({ inboundLedger: "on", telegramThreading: "on" }) });
+      host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
+      const retried = await tool(host, "firstmate_reply").execute(args, ctx);
+      assert.ok(!isError(retried), text(retried));
+      for (const id of ["1669", "1670", "1671"]) assert.equal(ledgerRow(host, id)?.state, "answered", id);
+    } finally {
+      await host.harness.lifecycle.dispose();
+    }
+  });
+}
+
+test("firstmate_reply covers: repeating a successful call with the same covers reports Already replied", async () => {
+  const host = await load();
+  try {
+    await telegramFlags(host);
+    recordTelegram(host, "thr_cap", "1669", 1_000);
+    recordTelegram(host, "thr_cap", "1670", 2_000);
+    recordTelegram(host, "thr_cap", "1671", 3_000);
+    host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
+    const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
+    const args = { ref: "tg:200:1669", text: "Research started with all your filters.", covers: ["tg:200:1670", "tg:200:1671"] };
+    assert.ok(!isError(await tool(host, "firstmate_reply").execute(args, ctx)));
+    const before = ["1669", "1670", "1671"].map((id) => ledgerRow(host, id));
+    const repeat = await tool(host, "firstmate_reply").execute(args, ctx);
+    assert.ok(!isError(repeat), text(repeat));
+    assert.equal(text(repeat), "Already replied to tg:200:1669.");
+    assert.equal(host.harness.sdk.callsTo("plugins.callRpc").length, 1, "the repeat sends nothing");
+    assert.deepEqual(["1669", "1670", "1671"].map((id) => ledgerRow(host, id)), before);
   } finally {
     await host.harness.lifecycle.dispose();
   }

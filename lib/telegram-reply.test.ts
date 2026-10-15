@@ -52,7 +52,14 @@ test("sendTelegramReply falls back to an fm-out line when the RPC is missing", a
     },
   });
   assert.equal(result.channel, "envelope");
+  assert.equal(result.outcome, "undelivered", "nothing sends the fm-out line, so it is not delivery");
   assert.equal(result.body, telegramReplyFallbackBody({ chatId: "200", messageId: "1669", kind: "reply", text: "done" }));
+});
+
+test("sendTelegramReply with no sender reports the reply undelivered", async () => {
+  const result = await sendTelegramReply({ payload: { chatId: "200", messageId: "1669", kind: "reply", text: "done" }, callRpc: null });
+  assert.equal(result.channel, "envelope");
+  assert.equal(result.outcome, "undelivered");
 });
 
 test("final answers target the oldest unanswered item, never the latest", () => {
