@@ -273,3 +273,23 @@ test('without --yes the preview comes before any refusal, names every reason --y
   assert.deepEqual(merges(commands),[]);
  }finally{await host.harness.lifecycle.dispose();}
 });
+
+// PR 129 verdict 3: the preview took every PR as mergeable, so a verified, green PR with a
+// merge conflict previewed clean and --yes then refused CONFLICTING.
+test('the preview reads the PR mergeable state and names a conflict that --yes would refuse',async()=>{
+ const {host,commands}=await deck([2391]);try {
+  hostCommands(host,c=>c.includes('gh pr checks')?{payload:JSON.stringify([{name:'build',bucket:'pass'}])}
+   :c.includes('gh pr view')&&c.includes('--json state,mergeable')?{payload:JSON.stringify({state:'OPEN',mergeable:'CONFLICTING'})}:forge(c));
+  const conflict=/^- Refusing: PR not mergeable \(CONFLICTING\)\.$/m;
+  const native=await host.harness.behavior.runCli(['merge',CREW,'--pr','2391'],ctx);
+  assert.equal(native.exitCode,0,native.stderr);assert.match(native.stdout,conflict);
+  assert.match(native.stdout,/^1\. Conflict: have the crew rebase or resolve it, push, then verify the new head\.$/m);
+  await host.bb.storage.kv.set('crews',[{...crew,nativeHome:''}]);
+  host.harness.sdk.stub('environments.pullRequest',async()=>({outcome:'available',pullRequest:{url:url(2391),number:2391,state:'open',checks:{state:'passing',passedCount:2,failedCount:0,pendingCount:0},mergeability:{mergeable:'CONFLICTING'}}}));
+  const bbPath=await host.harness.behavior.runCli(['merge',CREW,'--pr','2391'],ctx);
+  assert.equal(bbPath.exitCode,0,bbPath.stderr);assert.match(bbPath.stdout,conflict);
+  const yes=await host.harness.behavior.runCli(['merge',CREW,'--pr','2391','--yes'],ctx);
+  assert.equal(yes.exitCode,1);assert.match(yes.stderr,/PR not mergeable \(CONFLICTING\)/);
+  assert.deepEqual(merges(commands),[]);assert.equal(host.harness.sdk.callsTo('environments.mergePullRequest').length,0);
+ }finally{await host.harness.lifecycle.dispose();}
+});
