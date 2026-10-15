@@ -48,7 +48,7 @@
       "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner."
     },
     "entry-skills/captain/references/supervision.md": {
-      "sha256": "10cf8e7aa6a7ca8d12cb92fdb2ff5cc363f96d677ada686bd4eeebc7a9739caa",
+      "sha256": "b35e7679bc801b262cae193250b0b71571c5fa655eece8f1dce632bbc1f88afa",
       "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner. Captain rules: owner standing approvals, crew work stays with crews, merges only through firstmate_merge naming the PR (crewId + pr), with keepCrew when the crew has work after the merge; without yes it merges nothing, whatever the posture, and returns a preview; a merge needs a verification record for the PR head (CI is not verification) or the owner's words in allowUnverified; the record takes driven and seen, and a crew that drove it may record it; a PR merged outside Firstmate with no record is merged-unverified."
     },
     "entry-skills/skill-routing/SKILL.md": {
