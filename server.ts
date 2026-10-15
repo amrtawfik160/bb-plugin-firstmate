@@ -7623,18 +7623,19 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   // The preview's check line, and the checks as mergeGate reads them.
-  type CheckView = { line: string; checksState: string; failed: number; pending: number; redChecks: string[] | null };
+  type CheckView = { line: string; checksState: string; failed: number; pending: number; redChecks: string[] | null; mergeable: string };
   async function checkSummary(hostId: string, url: string): Promise<CheckView> {
-    const unread = { line: "could not be read", checksState: "unknown", failed: 0, pending: 0, redChecks: null };
+    const mergeable = (await ghPrView(hostId, url))?.mergeable ?? "UNKNOWN";
+    const unread = { line: "could not be read", checksState: "unknown", failed: 0, pending: 0, redChecks: null, mergeable };
     try {
       // gh pr checks exits non-zero while a check fails or runs; its JSON is still complete.
       const rows = JSON.parse((await runStructuredOnHost(hostId, `gh pr checks ${shQuote(url)} --json name,bucket`, 30_000)).output) as { name: string; bucket: string }[];
       if (!Array.isArray(rows)) return unread;
-      if (rows.length === 0) return { line: "none reported", checksState: "no_checks", failed: 0, pending: 0, redChecks: [] };
+      if (rows.length === 0) return { line: "none reported", checksState: "no_checks", failed: 0, pending: 0, redChecks: [], mergeable };
       const failing = rows.filter((r) => r.bucket === "fail" || r.bucket === "cancel").map((r) => r.name);
       const pending = rows.filter((r) => r.bucket === "pending").length;
       return { line: `${rows.filter((r) => r.bucket === "pass").length} passing, ${failing.length} failing${failing.length ? ` (${failing.join(", ")})` : ""}, ${pending} pending`,
-        checksState: failing.length ? "failing" : pending ? "pending" : "passing", failed: failing.length, pending, redChecks: failing };
+        checksState: failing.length ? "failing" : pending ? "pending" : "passing", failed: failing.length, pending, redChecks: failing, mergeable };
     } catch { return unread; }
   }
 
@@ -7804,10 +7805,17 @@ export default async function plugin(bb: BbPluginApi) {
             const sha = pr.headSha.slice(0, 7);
             if (sha !== "") steps.push(`Drive the changed surface at head ${sha}, then record what you drove and saw: ${row === undefined ? `bb firstmate deliveries register --url ${pr.url}, then ` : ""}bb firstmate deliveries verify ${row?.id ?? prKeyOf(pr.url) ?? pr.url} --commit ${sha} --driven "<what you drove>" --seen "<what you saw>"`);
           }
-          const gate = checks === null ? null : mergeGate({ prState: "open", mergeable: "MERGEABLE", ...checks, allowRedCheck: allowRedCheck?.trim() ?? "" });
+          const gate = checks === null ? null : mergeGate({ prState: "open", ...checks, mergeable: "MERGEABLE", allowRedCheck: allowRedCheck?.trim() ?? "" });
           if (gate !== null && !gate.ok) {
             reasons.push(`Refusing: ${gate.reason}`);
             steps.push("Checks: get them green, or name the one red check to waive with --allow-red '<check>'.");
+          }
+          // GitHub computes mergeability lazily and --yes waits for it, so only a settled answer is a refusal.
+          const conflict = checks === null || ["MERGEABLE", "UNKNOWN", ""].includes(checks.mergeable) ? null
+            : mergeGate({ prState: "open", checksState: "passing", failed: 0, pending: 0, mergeable: checks.mergeable });
+          if (conflict !== null && !conflict.ok) {
+            reasons.push(`Refusing: ${conflict.reason}`);
+            steps.push("Conflict: have the crew rebase or resolve it, push, then verify the new head.");
           }
         }
       }
@@ -7909,7 +7917,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (!yes) {
       const waive = (allowRedCheck ?? "").trim();
       return preview(fresh, { line: hostId === null ? `${f.checksState}: ${f.passed} passing, ${f.failed} failing, ${f.pending} pending` : (await checkSummary(hostId, f.url)).line,
-        checksState: f.checksState, failed: f.failed, pending: f.pending, redChecks: waive !== "" && f.checksState === "failing" ? await redCheckNames(crew, f.url) : null });
+        checksState: f.checksState, failed: f.failed, pending: f.pending, mergeable: f.mergeable, redChecks: waive !== "" && f.checksState === "failing" ? await redCheckNames(crew, f.url) : null });
     }
     if (f.state === "merged") {
       await settle("merged (already landed)", f.url);
