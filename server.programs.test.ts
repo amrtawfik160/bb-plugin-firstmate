@@ -22,7 +22,7 @@ type SubIssue = { number: number; title: string; state: string; blockedBy: numbe
 
 /** Host commands answered like a host with gh: the epic and its sub-issues a page of 100 at a time
  * like the GitHub API, and the state of each ticket a query names. */
-function github(host: Host, closed: () => number[] = () => [], options: { subIssues?: SubIssue[]; fail?: () => boolean } = {}) {
+function github(host: Host, closed: () => number[] = () => [], options: { subIssues?: SubIssue[]; fail?: () => boolean; missing?: number[] } = {}) {
   const subIssues = options.subIssues ?? epic.subIssues;
   const commands: string[] = [];
   const terminals = new Map<string, string>();
@@ -53,13 +53,25 @@ function github(host: Host, closed: () => number[] = () => [], options: { subIss
       if (options.fail?.()) {
         exitCode = 1;
       } else {
-        // One line per ticket the query names, with its real state.
+        // Each ticket the query names, with its real state. A missing issue (deleted, or a PR) is null and a
+        // NOT_FOUND error; gh then exits 1 and prints the whole response, not the --jq rows.
         const shut = new Set(closed());
-        stdout = [...command.matchAll(/issue\(number:(\d+)\)/g)].map((m) => Number(m[1]))
-          .map((n) => JSON.stringify({ repo: "Cyndra-AI/cyndra-saas", number: n, state: shut.has(n) ? "CLOSED" : "OPEN" })).join("\n");
+        const missing = new Set(options.missing ?? []);
+        const numbers = [...command.matchAll(/issue\(number:(\d+)\)/g)].map((m) => Number(m[1]));
+        const found = numbers.filter((n) => !missing.has(n));
+        if (found.length < numbers.length || !command.includes("--jq")) {
+          exitCode = found.length < numbers.length ? 1 : 0;
+          stdout = JSON.stringify({
+            data: { r0: Object.fromEntries(numbers.map((n) => [`i${n}`, missing.has(n) ? null : { state: shut.has(n) ? "CLOSED" : "OPEN" }])) },
+            ...(exitCode === 1 ? { errors: numbers.filter((n) => missing.has(n)).map((n) => ({ type: "NOT_FOUND", path: ["r0", `i${n}`], message: `Could not resolve to an Issue with the number of ${n}.` })) } : {}),
+          });
+        } else {
+          stdout = found.map((n) => JSON.stringify({ repo: "Cyndra-AI/cyndra-saas", number: n, state: shut.has(n) ? "CLOSED" : "OPEN" })).join("\n");
+        }
       }
     }
-    const payload = JSON.stringify({ protocol: "FM_HOST_CAPTURE_V1", exitCode, stdout, stderr: exitCode === 0 ? "" : "HTTP 502: Bad Gateway" });
+    const stderr = exitCode === 0 ? "" : options.missing?.length ? options.missing.map((n) => `Could not resolve to an Issue with the number of ${n}.`).join("\n") : "HTTP 502: Bad Gateway";
+    const payload = JSON.stringify({ protocol: "FM_HOST_CAPTURE_V1", exitCode, stdout, stderr });
     return { nextSeq: 1, chunks: [{ dataBase64: Buffer.from(`${payload}\n__FM_HOST_RC:0\n`).toString("base64") }] };
   });
   return commands;
@@ -256,6 +268,28 @@ test("a failed GitHub read shows in the refresh result and on the board, with th
     assert.doesNotMatch(recovered, /failed/);
     assert.match(recovered, /Ticket states read from GitHub 0 min ago\./);
     assert.doesNotMatch(await board(host), /failed/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a ticket GitHub cannot read (deleted, or a PR) is named and keeps its state; every other ticket still updates", async () => {
+  const host = await captainHost();
+  try {
+    github(host);
+    await createEpic(host);
+    github(host, () => [2428], { missing: [2424] });
+    const refreshed = text(await program(host, { action: "refresh" }));
+    const store = createPrograms(host.bb.storage.database());
+    const state = (n: number) => store.get("P1")!.tickets.find((t) => t.ref === `cyndra-ai/cyndra-saas#${n}`)!.state.kind;
+    assert.equal(state(2428), "done", "a closed ticket in the same query still closes");
+    assert.equal(state(2424), "ready", "the unreadable ticket keeps its last state");
+    assert.match(refreshed, /^P1 DM Pro epic: 2\/20 done, .* · GitHub cannot read #2424 \(deleted, or not an issue\); its state is kept · task T1/);
+    assert.doesNotMatch(refreshed, /failed/);
+    assert.match(await board(host), /^- P1 Cyndra · DM Pro epic: 2\/20 done, .* · GitHub cannot read #2424 \(deleted, or not an issue\); its state is kept$/m);
+
+    github(host, () => [2428]);
+    assert.doesNotMatch(text(await program(host, { action: "refresh" })), /cannot read/);
   } finally {
     await host.harness.lifecycle.dispose();
   }
