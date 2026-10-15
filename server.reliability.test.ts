@@ -1753,3 +1753,81 @@ test("captain report: firstmate_skill reads the captain's own reference files by
     await host.harness.lifecycle.dispose();
   }
 });
+
+// 15 Oct 19:01 UTC: /inbox listed tg items 8135, 8129 and 4573 minutes old "with crew <id>". Their crews had finished
+// days earlier and their PRs had merged, and nothing told the captain to answer the owner.
+const handBacks = (host: Host) => host.harness.sdk.callsTo("threads.send")
+  .map((c) => c[0] as { threadId: string; input: Array<{ text: string; visibility?: string }> })
+  .filter((a) => /handed to a crew that has ended/.test(a.input[0]?.text ?? ""));
+
+test("15 Oct inbox: the captain's next wake names each owner message whose crew has ended, once, across restarts", async () => {
+  let host = await captainHost();
+  try {
+    host.harness.sdk.stub("threads.send", async () => ({}));
+    host.harness.sdk.stub("threads.events.list", async () => []);
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
+    const now = Date.now();
+    const ledger = createInboundLedger(host.bb.storage.database());
+    for (const [id, crew] of [["8135", "c-gone"], ["8129", "c-gone"], ["4573", "c-live"], ["4574", "c-queued"], ["4575", "c-answered"]] as const) {
+      recordTelegram(host, "thr_cap", id, now - Number(id) * 60_000);
+      ledger.markDelegated({ source: "telegram", chatId: "200", messageId: id }, crew, now - 60_000);
+    }
+    ledger.markAnswered({ source: "telegram", chatId: "200", messageId: "4575" }, now - 30_000);
+    // c-live still runs; c-queued waits for a slot; c-gone and c-answered finished and left the crew list.
+    await host.bb.storage.kv.set("crews", [crewRow("c-live", "thr_c-live")]);
+    createDispatchJobs(host.bb.storage.database()).save({ crewId: "c-queued", captainThreadId: "thr_cap", payload: "{}", state: "queued", createdAt: now, startedAt: null, error: null, backoffUntil: null });
+
+    await captainIdle(host);
+    assert.equal(handBacks(host).length, 1);
+    const [wake] = handBacks(host);
+    assert.equal(wake!.threadId, "thr_cap");
+    assert.equal(wake!.input[0]!.visibility, "agent-only");
+    assert.equal(wake!.input[0]!.text, [
+      "These owner messages were handed to a crew that has ended, and they still have no answer. Answer each with firstmate_reply now:",
+      "- tg:200:8135 (crew c-gone): 'Status?'",
+      "- tg:200:8129 (crew c-gone): 'Status?'",
+    ].join("\n"));
+    await captainIdle(host);
+    assert.equal(handBacks(host).length, 1, "once per item");
+
+    host = await host.harness.lifecycle.reload(plugin);
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: "active" }));
+    host.harness.sdk.stub("threads.send", async () => ({}));
+    host.harness.sdk.stub("threads.events.list", async () => []);
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
+    await captainIdle(host);
+    assert.equal(handBacks(host).length, 0, "not again after a restart");
+    assert.match(text(await tool(host, "firstmate_inbox").execute({}, { threadId: "thr_cap", projectId: "proj_1" } as never)), /tg:200:8135 \(\d+ min, crew c-gone ended; needs your reply\)/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a crew that fails, stops, finishes or is archived hands its owner messages back on the captain's next wake", async () => {
+  for (const [how, end] of [
+    ["failed", (host: Host) => host.harness.behavior.emitThreadEvent("thread.failed", { thread: makeThreadResponse({ id: "thr_c1", status: "error" }), error: "boom" })],
+    ["done", (host: Host) => host.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_c1", status: "idle" }), lastAssistantText: "DONE: login fixed" })],
+    ["stopped", (host: Host) => host.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_c1", status: "stopping" }), lastAssistantText: "Working on it" })],
+    ["archived", (host: Host) => host.harness.behavior.emitThreadEvent("thread.archived", { thread: makeThreadResponse({ id: "thr_c1", status: "idle", archivedAt: Date.now() }) })],
+  ] as const) {
+    const host = await captainHost();
+    try {
+      host.harness.sdk.stub("threads.send", async () => ({}));
+      host.harness.sdk.stub("threads.events.list", async () => []);
+      host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
+      host.harness.sdk.stub("threads.output", async () => ({ output: "DONE: login fixed" }));
+      recordTelegram(host, "thr_cap", "1669", Date.now() - 60_000);
+      createInboundLedger(host.bb.storage.database()).markDelegated({ source: "telegram", chatId: "200", messageId: "1669" }, "c1", Date.now());
+      await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_c1")]);
+      await captainIdle(host);
+      assert.equal(handBacks(host).length, 0, `${how}: the crew still runs`);
+      await end(host);
+      await captainIdle(host);
+      assert.equal(handBacks(host).length, 1, how);
+      assert.match(handBacks(host)[0]!.input[0]!.text, /- tg:200:1669 \(crew c1\): 'Status\?'/);
+    } finally {
+      await host.harness.lifecycle.dispose();
+    }
+  }
+});
