@@ -4,7 +4,7 @@ import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/tes
 import plugin from "./server.ts";
 import { createOwnerAsks, formatAskCard } from "./lib/owner-asks.ts";
 import { createInboundLedger } from "./lib/inbound-ledger.ts";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseInboundTelegram } from "./lib/telegram-envelope.ts";
@@ -210,4 +210,59 @@ test("PR 132 round 2: an attached path with spaces or brackets reaches the conne
     assert.equal(link[1], "report with spaces (final).md");
     assert.equal(decodeURIComponent(link[2]!), report);
   } finally { await host.harness.lifecycle.dispose(); }
+});
+
+// 15 Oct 18:02 UTC: the captain attached /root/tg-share/jess-leads-openleads.csv and .md. Firstmate said sent;
+// the connector refused both (only the captain workspace, /tmp, captain data and BB worktrees), so the owner got no files.
+test("15 Oct jess-leads: firstmate_reply refuses a file Telegram will not send, before anything is sent or reserved, and says to copy it to /tmp", async () => {
+  const { host, db, call, rpc } = await agentNativeCase();
+  const outside = mkdtempSync("/var/tmp/fm-tg-share-");
+  try {
+    const csv = join(outside, "jess-leads-openleads.csv");
+    const md = join(outside, "jess-leads-openleads.md");
+    writeFileSync(csv, "name,email\n");
+    writeFileSync(md, "# leads\n");
+    const args = { ref: AGENT_NATIVE_REF, text: "Here are the open leads.", files: [csv, md] };
+    const refused = await call("firstmate_reply", args);
+    assert.equal(failed(refused), true, textOf(refused));
+    assert.equal(textOf(refused).split("\n").slice(0, 3).join("\n"), [
+      `Not sent: Telegram will not send ${csv}: only files in the captain's workspace, /tmp, the captain's data folder or a BB worktree are sent.`,
+      `Not sent: Telegram will not send ${md}: only files in the captain's workspace, /tmp, the captain's data folder or a BB worktree are sent.`,
+      `Copy each file to /tmp under a name that does not start with "." and attach the copy. ${AGENT_NATIVE_REF} stays open.`,
+    ].join("\n"));
+    assert.equal(rpc().filter((c) => c.method === "reply").length, 0, "nothing reached the connector");
+    const ledger = createInboundLedger(db);
+    assert.equal(ledger.get({ source: "telegram", chatId: "985604794", messageId: "4498" })?.state, "received", "the item stays open");
+    assert.equal(ledger.outboxGet({ source: "telegram", chatId: "985604794", messageId: "4498" }, "reply"), undefined, "nothing is reserved");
+
+    const tmp = mkdtempSync(join("/tmp", "fm-tg-share-"));
+    const copies = [csv, md].map((file) => { const copy = join(tmp, file.split("/").at(-1)!); writeFileSync(copy, "x"); return copy; });
+    const sent = await call("firstmate_reply", { ...args, files: copies });
+    assert.equal(failed(sent), false, textOf(sent));
+    assert.equal(rpc().filter((c) => c.method === "reply").length, 1);
+  } finally {
+    rmSync(outside, { recursive: true, force: true });
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("firstmate_reply sends a file from the captain's workspace, which the connector allows", async () => {
+  const { host, call, rpc } = await agentNativeCase();
+  const workspace = mkdtempSync("/var/tmp/fm-captain-ws-");
+  try {
+    host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, projectId: "proj_1", status: "active", environmentId: threadId === "thr_cap" ? "env_cap" : null }));
+    host.harness.sdk.stub("environments.get", async ({ environmentId }: { environmentId: string }) => ({ id: environmentId, hostId: "host_1", status: "ready", path: workspace }));
+    const build = join(workspace, "build.zip");
+    writeFileSync(build, "zip");
+    const sent = await call("firstmate_reply", { ref: AGENT_NATIVE_REF, text: "The build.", files: [build] });
+    assert.equal(failed(sent), false, textOf(sent));
+    assert.equal(rpc().filter((c) => c.method === "reply").length, 1);
+    const hidden = join(workspace, ".env");
+    writeFileSync(hidden, "TOKEN=x");
+    const refused = await call("firstmate_reply", { ref: AGENT_NATIVE_REF, text: "The env.", files: [hidden] });
+    assert.match(textOf(refused), new RegExp(`^Not sent: Telegram will not send ${hidden}: hidden files, hidden folders and \\.env files are never sent\\.`));
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    await host.harness.lifecycle.dispose();
+  }
 });

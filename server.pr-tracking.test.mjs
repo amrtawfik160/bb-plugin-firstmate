@@ -408,3 +408,23 @@ test('the daily reminder lists only PRs the current open-PR scan confirms open',
   assert.doesNotMatch(text,/pull\/2322|pull\/2326/,'a PR missing from the open list is not put to the captain as open');
  }finally{await host.harness.lifecycle.dispose();}
 });
+
+// 15 Oct: a second crew working on cyndra-saas#2374, which another task owns, logged "already tracked ... preserving its
+// owner" as a warning on every discovery pass, 30 times in one hour. Keeping the owner is right; it is said once, as info.
+test('a second crew on a PR another task owns is logged once per PR and crew, at info level',async()=>{
+ const host=await base();try {
+  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle',environmentId:'env_wt'}));
+  const store=createDeliveries(host.bb.storage.database());
+  store.register({url:'https://github.com/acme/repo/pull/2374',taskId:'owner-task',projectId:'proj_1',owner:'thr_cap',home:'',worker:'thr_owner',requirement:'pr'});
+  const crew=id=>({id,task:'release',projectId:'proj_1',threadId:`thr_${id}`,parentThreadId:'thr_cap',providerId:null,model:null,reasoningLevel:null,worktree:true,shape:'ship',posture:'direct-PR',createdAt:'2026-10-15T00:00:00.000Z',prUrl:'https://github.com/acme/repo/pull/2374'});
+  await host.bb.storage.kv.set('crews',[crew('release-op'),crew('fix-crew')]);
+  hostCommands(host,command=>command.includes('gh pr view') ? {payload:JSON.stringify(forge('OPEN'))} : {payload:'[]',code:0});
+  for(let i=0;i<3;i++) await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  const said=host.harness.logEntries.filter(e=>/already tracked by task owner-task/.test(e.message));
+  assert.deepEqual(said.map(e=>[e.level,e.message]),[
+   ['info','PR acme/repo#2374 already tracked by task owner-task; preserving its owner (crew release-op works on it too).'],
+   ['info','PR acme/repo#2374 already tracked by task owner-task; preserving its owner (crew fix-crew works on it too).'],
+  ]);
+  assert.equal(store.get('acme/repo#2374').taskId,'owner-task');
+ }finally{await host.harness.lifecycle.dispose();}
+});
