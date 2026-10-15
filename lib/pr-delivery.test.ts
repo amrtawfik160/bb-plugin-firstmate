@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { formatBoard } from "./owner-board.ts";
-import { boardPullRequests, createDeliveries, decisionLine, parseForge, prBranchOwner, type DeliveryRecord } from "./pr-delivery.ts";
+import { spawnSync } from "node:child_process";
+import { boardPullRequests, createDeliveries, decisionLine, parseForge, PR_VIEW_JQ, prBranchOwner, type DeliveryRecord } from "./pr-delivery.ts";
 
 function record(n: number, over: Partial<DeliveryRecord> = {}): DeliveryRecord {
   return {
@@ -268,4 +269,28 @@ test("a PR verified before merge, or merged with the owner's waiver, completes o
   other.waive(w.id, "thr_pse43vv6tn", "ship it now, I will test on my phone", HEAD_2315);
   assert.equal(other.get(w.id)!.unverifiedMerge?.words, "ship it now, I will test on my phone");
   assert.equal(other.observe(w.id, seen({ state: "merged", mergeCommitSha: MERGE_2315 }), true, 2).status, "complete");
+});
+
+// 15 Oct: `gh pr view` for cyndra-saas 2322 returned 101,399 bytes (commits alone 83,705).
+// The host reader keeps the last 64 KB, so every read since 13 Oct failed to parse.
+test("the PR read keeps only what the observation uses, so a 100 KB answer fits the 64 KB host read", () => {
+  const head = "c".repeat(40);
+  const commits = Array.from({ length: 300 }, (_, i) => ({ oid: i === 299 ? head : String(i).padStart(40, "0"), committedDate: `2026-10-14T0${Math.floor(i / 100)}:00:00Z`,
+    messageHeadline: "x".repeat(80), messageBody: "y".repeat(160), authors: [{ email: "a@b.c", name: "A", login: "a" }] }));
+  const comments = Array.from({ length: 80 }, (_, i) => ({ author: { login: "a" }, createdAt: "2026-10-13T00:00:00Z", body: `${i} ${"z".repeat(3000)}` }));
+  comments.push({ author: { login: "amrtawfik160" }, createdAt: "2026-10-14T09:00:00Z", body: "Do not merge: the redo still drops messages" });
+  const full = {
+    state: "MERGED", isDraft: false, headRefOid: head, title: "fix(runtime): Telegram", createdAt: "2026-10-13T00:00:00Z", updatedAt: "2026-10-14T10:00:00Z",
+    statusCheckRollup: [{ name: "test", conclusion: "SUCCESS", detailsUrl: "https://ci" }], reviewDecision: "", reviews: [{ state: "COMMENTED", body: "w".repeat(5000), submittedAt: "2026-10-13T00:00:00Z", commit: { oid: head } }],
+    mergeable: "UNKNOWN", mergeCommit: { oid: "ca784e614e9456093c8ec56c52b4bee6e06923d8" }, labels: [], comments, commits,
+  };
+  assert.ok(JSON.stringify(full).length > 100_000);
+  const jq = spawnSync("jq", ["-c", PR_VIEW_JQ], { input: JSON.stringify(full), encoding: "utf8" });
+  assert.equal(jq.status, 0, jq.stderr);
+  assert.ok(jq.stdout.length < 65_536, `${jq.stdout.length} bytes`);
+  const trimmed = parseForge(JSON.parse(jq.stdout));
+  assert.deepEqual(trimmed, parseForge(full));
+  assert.equal(trimmed.state, "merged");
+  assert.equal(trimmed.mergeCommitSha, "ca784e614e9456093c8ec56c52b4bee6e06923d8");
+  assert.equal(trimmed.hold, "Do not merge: the redo still drops messages");
 });

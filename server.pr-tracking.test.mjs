@@ -378,3 +378,33 @@ test('the open-PR scan does not use GitHub search, counts only PRs of the signed
   assert.equal(lists.length,2);
  }finally{await host.harness.lifecycle.dispose();}
 });
+
+// 15 Oct: the daily reminder named cyndra-saas 2322 and 2326 as open. Both merged on 14 Oct.
+// Every GitHub read of them since 13 Oct failed to parse (about 100 KB of JSON, of which the
+// host reader keeps the last 64 KB), so their rows still said open.
+test('the daily reminder lists only PRs the current open-PR scan confirms open',async(t)=>{
+ const host=await base();try {
+  await host.bb.storage.kv.set('crews',[crew('aa11','thr_w1','thr_cap')]);
+  createLaunches(host.bb.storage.database()).save(launch('aa11','thr_w1','thr_cap'));
+  const sent=[];host.harness.sdk.stub('threads.send',async args=>{sent.push(JSON.stringify(args.input));return{delivery:'queued'};});
+  const now=Date.parse('2026-10-15T09:00:00Z');t.mock.method(Date,'now',()=>now);
+  const store=createDeliveries(host.bb.storage.database());
+  for(const n of [2322,2326]){
+   const r=store.register({url:`https://github.com/acme/repo/pull/${n}`,taskId:'aa11',projectId:'proj_1',owner:'thr_cap',home:'/fm',worker:'thr_w1',requirement:'pr'});
+   store.save({...r,status:'pr-delivered',forgeState:'open',headSha:'sha1',observedAt:Date.parse('2026-10-13T21:54:30Z'),touchedAt:Date.parse('2026-10-12T10:00:00Z'),notification:{...r.notification,desired:'x',delivered:'x'}});
+  }
+  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle',environmentId:`env_${threadId}`}));
+  host.harness.sdk.stub('environments.get',async({environmentId})=>({id:environmentId,hostId:'host_1',status:'ready',isWorktree:true,path:`/wt/${environmentId.replace('env_','')}`,branchName:'bb/ship-aa11'}));
+  hostCommands(host,command=>{
+   if(isOpenList(command))return{payload:JSON.stringify([pr(538,'fm/aa11','2026-10-10T09:00:00Z')])};
+   if(command.includes('gh pr view')&&(prNumber(command)===2322||prNumber(command)===2326))return{payload:'"}],"comments":[{"body":"truncated'};
+   if(command.includes('gh pr view'))return{payload:JSON.stringify(forge('OPEN'))};
+   return{code:0};
+  });
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  const asks=sent.filter(s=>s.includes('Decide for each'));
+  const text=asks.map(s=>JSON.parse(s).map(part=>part.text ?? '').join('\n')).join('\n');
+  assert.doesNotMatch(text,/pull\/2322|pull\/2326/,'a PR missing from the open list is not put to the captain as open');
+ }finally{await host.harness.lifecycle.dispose();}
+});
