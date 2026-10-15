@@ -11822,16 +11822,26 @@ export default async function plugin(bb: BbPluginApi) {
         ? telegramReplyFallbackBody({ chatId: row.chatId, messageId: row.messageId, kind: "reply", text: stripTelegramEnvelope(text), threadId: row.topicId })
         : text;
       const coverNote = (closed: InboundRow[]) => closed.length === 0 ? "" : ` It also answers ${closed.map(refOf).join(", ")}, closed with no message of their own.`;
-      // The same text and quote already reserved for this message is an exact repeat: nothing is sent again,
-      // and the repeat finishes any closure an interrupted call left undone. It closes this message only when
-      // the delivered reply was final, so repeating a more=true text keeps the message open.
+      // The same text and quote already reserved for this message is an exact repeat: nothing is sent again.
+      // While the first send is running, the repeat closes nothing. Once it is delivered, the repeat finishes any
+      // closure an interrupted call left undone, of the covers that reply listed only. It closes this message only
+      // when the delivered reply was final, so repeating a more=true text keeps the message open.
+      const inFlight = `Not sent: the first send of this reply to ${used} is still running, so nothing is closed yet. Repeat the same call later.`;
       const repeatKinds = quote ? [quotedReplyKind(quote)] : [quotedReplyKind(undefined), followUpReplyKind(body)];
       const delivered = repeatKinds.map((kind) => inboundLedger.outboxGet(row, kind as OutboxKind)).find((out) => out?.contentHash === hashText(body));
       if (delivered) {
+        if (delivered.inFlight === true) return toolError(inFlight);
+        const recorded = (delivered.covers ?? []).map(parseSourceRef).filter((other): other is InboundKey => other !== null);
+        const recordedKeys = new Set(recorded.map(inboundKey));
+        const extra = [...new Set(covers ?? [])].filter((other) => {
+          const otherKey = parseSourceRef(other);
+          return otherKey === null || !recordedKeys.has(inboundKey(otherKey));
+        });
+        if (extra.length > 0) {
+          return toolError(`Not sent: covers refused (${extra.map((other) => `${other} was not covered by the reply already sent to ${used}`).join("; ")}). Nothing is closed. Answer ${extra.length === 1 ? "it" : "them"} in a new reply.`);
+        }
         const pendingNow = new Set(inboundLedger.listPending(captain).map(inboundKey));
-        const listed = [...new Set(covers ?? [])].map(parseSourceRef)
-          .filter((other): other is InboundKey => other !== null && inboundKey(other) !== inboundKey(row) && pendingNow.has(inboundKey(other)));
-        const closed = inboundLedger.finishReply(delivered.final === true && more !== true ? row : null, listed, used, Date.now());
+        const closed = inboundLedger.finishReply(delivered.final === true && more !== true ? row : null, recorded.filter((other) => pendingNow.has(inboundKey(other))), used, Date.now());
         return (quote ? `Already replied to ${used} for that quote.` : `Already replied to ${used}.`) + coverNote(closed);
       }
       // Every covered ref must be another open message of this captain, or nothing is sent.
@@ -11856,13 +11866,15 @@ export default async function plugin(bb: BbPluginApi) {
       if (lineSuffix.length > 0) return toolError(`Not sent: ${lineSuffix.join(", ")} ends in :<number>, which Telegram reads as a line number. Rename or copy the file. ${used} stays open.`);
       let claimKind = quotedReplyKind(quote);
       // Reserve first so a concurrent or repeated reply never reaches Telegram twice.
-      let claim = inboundLedger.claimOutbox(row, claimKind, body, Date.now(), more !== true);
+      const reservation = { final: more !== true, covers: covered.map(refOf) };
+      let claim = inboundLedger.claimOutbox(row, claimKind, body, Date.now(), reservation);
       // more=true left the message open: a different text is the next reply to it, the same text is a repeat.
       if (!claim.sent && !quote && (row.state !== "answered" || attach.length > 0) && claim.existing?.contentHash !== hashText(body)) {
         claimKind = followUpReplyKind(body);
-        claim = inboundLedger.claimOutbox(row, claimKind, body, Date.now(), more !== true);
+        claim = inboundLedger.claimOutbox(row, claimKind, body, Date.now(), reservation);
       }
       if (!claim.sent) {
+        if (claim.existing?.inFlight === true && claim.existing.contentHash === hashText(body)) return toolError(inFlight);
         return quote ? `Already replied to ${used} for that quote.` : `Already replied to ${used}.`;
       }
       const stayOpen = [used, ...covered.map(refOf)].join(", ");
@@ -11898,6 +11910,11 @@ export default async function plugin(bb: BbPluginApi) {
       if (undelivered !== null) {
         inboundLedger.releaseOutbox(row, claimKind);
         return toolError(`Reply to ${used} was not delivered: ${undelivered}. Nothing reached the owner; ${stayOpen} ${covered.length === 0 ? "stays" : "stay"} open. Answer in your turn text instead.`);
+      }
+      try {
+        inboundLedger.markDelivered(row, claimKind);
+      } catch (error) {
+        return toolError(`Reply to ${used} was delivered, but recording the delivery failed; ${stayOpen} ${covered.length === 0 ? "stays" : "stay"} open, and a repeat of this call cannot close ${covered.length === 0 ? "it" : "them"}. ${error instanceof Error ? error.message : String(error)}`);
       }
       // The reply and its covers close together; after a failure the identical call closes them with no second send.
       try {

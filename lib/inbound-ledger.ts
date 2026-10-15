@@ -54,6 +54,10 @@ export type OutboxRow = InboundKey & {
   outgoingMessageId: string | null;
   /** A reply sent without more=true: its exact repeat may close the message. Absent on older claims. */
   final?: boolean;
+  /** firstmate_reply: the reservation is made but delivery is not confirmed yet, so a repeat closes nothing. */
+  inFlight?: boolean;
+  /** firstmate_reply: refs of the covers this reply listed. An exact repeat may close only these. */
+  covers?: string[];
 };
 
 export type LedgerEvent = {
@@ -223,7 +227,10 @@ export type CreateInboundLedger = {
   finishReply(anchor: InboundKey | null, covers: InboundKey[], by: string, at: number): InboundRow[];
   markDelegated(key: InboundKey, crewId: string, at: number): InboundRow | undefined;
   mergeSourceRefs(keys: InboundKey[], refs: string[]): void;
-  claimOutbox(row: InboundKey, kind: OutboxClaimKind, content: string, at: number, final?: boolean): { sent: boolean; existing?: OutboxRow };
+  /** reply: a firstmate_reply reservation, in flight until markDelivered. */
+  claimOutbox(row: InboundKey, kind: OutboxClaimKind, content: string, at: number, reply?: { final: boolean; covers: string[] }): { sent: boolean; existing?: OutboxRow };
+  /** Confirms a firstmate_reply reservation was delivered, so its exact repeat may finish the closure. */
+  markDelivered(row: InboundKey, kind: OutboxClaimKind): void;
   releaseOutbox(row: InboundKey, kind: OutboxClaimKind): void;
   rememberOutgoing(row: InboundKey, kind: OutboxKind, outgoingMessageId: string): void;
   outboxGet(row: InboundKey, kind: OutboxKind): OutboxRow | undefined;
@@ -318,13 +325,14 @@ export function createInboundLedger(db: Database): CreateInboundLedger {
     })();
   }
 
-  function claimOutbox(row: InboundKey, kind: OutboxClaimKind, content: string, at: number, final?: boolean) {
+  function claimOutbox(row: InboundKey, kind: OutboxClaimKind, content: string, at: number, reply?: { final: boolean; covers: string[] }) {
     const contentHash = hashText(content);
     return db.transaction(() => {
       const existing = db.prepare("SELECT record FROM inbound_outbox WHERE source=? AND chat_id=? AND message_id=? AND kind=?")
         .get(row.source, row.chatId, row.messageId, kind) as { record: string } | undefined;
       if (existing) return { sent: false, existing: JSON.parse(existing.record) as OutboxRow };
-      const out: OutboxRow = { ...row, kind: kind as OutboxKind, contentHash, sentAt: at, outgoingMessageId: null, ...(final ? { final } : {}) };
+      const out: OutboxRow = { ...row, kind: kind as OutboxKind, contentHash, sentAt: at, outgoingMessageId: null,
+        ...(reply ? { ...(reply.final ? { final: true } : {}), inFlight: true, covers: reply.covers } : {}) };
       db.prepare("INSERT INTO inbound_outbox VALUES (?,?,?,?,?,?,?,?)")
         .run(row.source, row.chatId, row.messageId, kind, contentHash, at, null, JSON.stringify(out));
       return { sent: true };
@@ -394,6 +402,15 @@ export function createInboundLedger(db: Database): CreateInboundLedger {
       parsed.outgoingMessageId = outgoingMessageId;
       db.prepare("UPDATE inbound_outbox SET outgoing_message_id=?, record=? WHERE source=? AND chat_id=? AND message_id=? AND kind=?")
         .run(outgoingMessageId, JSON.stringify(parsed), row.source, row.chatId, row.messageId, kind);
+    },
+    markDelivered(row, kind) {
+      const existing = db.prepare("SELECT record FROM inbound_outbox WHERE source=? AND chat_id=? AND message_id=? AND kind=?")
+        .get(row.source, row.chatId, row.messageId, kind) as { record: string } | undefined;
+      if (!existing) return;
+      const parsed = JSON.parse(existing.record) as OutboxRow;
+      delete parsed.inFlight;
+      db.prepare("UPDATE inbound_outbox SET record=? WHERE source=? AND chat_id=? AND message_id=? AND kind=?")
+        .run(JSON.stringify(parsed), row.source, row.chatId, row.messageId, kind);
     },
     outboxGet(row, kind) {
       const found = db.prepare("SELECT record FROM inbound_outbox WHERE source=? AND chat_id=? AND message_id=? AND kind=?")
