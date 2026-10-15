@@ -169,7 +169,12 @@ export type OwnerTasks = {
   reconcile(captain: string, recordsFor: (task: OwnerTask) => readonly DeliveryRecord[], at: number): OwnerTask[];
 };
 
-export function createOwnerTasks(db: Database): OwnerTasks {
+const CLOSING = new Set<TaskState>(["merged", "live", "done", "dropped"]);
+
+/** Why a task must stay open (an open program holds it), or null when it may close. */
+export type HeldOpen = (task: OwnerTask) => string | null;
+
+export function createOwnerTasks(db: Database, heldOpen: HeldOpen = () => null): OwnerTasks {
   db.exec(`CREATE TABLE IF NOT EXISTS owner_task (
     id TEXT PRIMARY KEY, seq INTEGER NOT NULL UNIQUE, captain TEXT NOT NULL, state TEXT NOT NULL, record TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS owner_task_captain ON owner_task(captain, state);`);
@@ -240,6 +245,8 @@ export function createOwnerTasks(db: Database): OwnerTasks {
     move(id, captain, move, at) {
       return db.transaction(() => {
         const task = owned(id, captain);
+        const held = CLOSING.has(move.to) && task.state !== move.to ? heldOpen(task) : null;
+        if (held !== null) throw new Error(held);
         const next = moveTask(task, move, at);
         return next === task ? task : save(next);
       })();
@@ -270,7 +277,8 @@ export function createOwnerTasks(db: Database): OwnerTasks {
         const task = list(captain, { includeClosed: true }).find((item) => item.crewIds.includes(crewId));
         if (!task || task.crewIds.some((other) => other !== crewId && running(other))) return task;
         const move = finishedState(task, recordsFor(task), finish);
-        return move === null ? task : save(moveTask(task, move, at));
+        if (move === null || (CLOSING.has(move.to) && heldOpen(task) !== null)) return task;
+        return save(moveTask(task, move, at));
       })();
     },
     reconcile(captain, recordsFor, at) {
@@ -284,7 +292,7 @@ export function createOwnerTasks(db: Database): OwnerTasks {
           let next = prs.length === task.prs.length ? task : { ...task, prs, updatedAt: at };
           // A PR proves progress, never a step back to a state the captain set by hand.
           if (proved !== null && proved !== next.state && TASK_TRANSITIONS[next.state].includes(proved)
-            && !(proved === "working" && next.state === "needs_you")) {
+            && !(proved === "working" && next.state === "needs_you") && !(CLOSING.has(proved) && heldOpen(next) !== null)) {
             next = moveTask(next, { to: proved }, at);
           }
           if (next !== task) changed.push(save(next));
