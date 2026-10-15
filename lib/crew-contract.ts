@@ -128,7 +128,7 @@ export function crewSkillBlock(input: { shape: Shape; title?: string; task: stri
     "pstack always has priority. If a skill or rule conflicts with it, pstack wins.",
     "Until the owner confirms otherwise: spawn no sub-agents (no Task, poteto-agent or parallel workers). Do that work yourself, in this session.",
     "Until the owner confirms otherwise: Firstmate decides who merges and deploys. Follow the brief's delivery contract for merge and deploy.",
-    "Merge only with `bb firstmate merge <crew> --pr <n>`; it refuses a PR without a verification record. Never use `gh pr merge` or the GitHub API.",
+    "Merge only via `bb firstmate merge <crew> --pr <n> --yes`; it refuses a PR with no verification record. Never use `gh pr merge` or GitHub's API.",
     "This host is shared. Run every type check, full test run and build as `~/.bb-firstmate/bin/fm-heavy <command>`; it waits for a host-wide slot.",
     "Do not start such commands in the background or as your own systemd service to skip the wait. Stop dev servers and browsers you started when you finish.",
   );
@@ -138,7 +138,7 @@ export function crewSkillBlock(input: { shape: Shape; title?: string; task: stri
       "To merge a PR, do these steps at its current head:",
       "Merge step 1: drive the change on the real surface, with the project's verify skill if it has one.",
       "Merge step 2: `bb firstmate deliveries verify <owner/repo#n> --commit <head sha> --driven \"<what you drove>\" --seen \"<what you saw>\"`.",
-      "Merge step 3: `bb firstmate merge <crew> --pr <n>`, where <crew> is the crew that opened the PR.",
+      "Merge step 3: `bb firstmate merge <crew> --pr <n> --yes`, where <crew> is the crew that opened the PR.",
       "After a new push, do steps 1 and 2 again. If you cannot drive the change, report \"blocked: <PR>: <reason>\".",
     );
   }

@@ -7622,6 +7622,17 @@ export default async function plugin(bb: BbPluginApi) {
     return facts;
   }
 
+  async function checkSummary(hostId: string, url: string): Promise<string> {
+    try {
+      // gh pr checks exits non-zero while a check fails or runs; its JSON is still complete.
+      const rows = JSON.parse((await runStructuredOnHost(hostId, `gh pr checks ${shQuote(url)} --json name,bucket`, 30_000)).output) as { name: string; bucket: string }[];
+      if (!Array.isArray(rows)) return "could not be read";
+      if (rows.length === 0) return "none reported";
+      const failing = rows.filter((r) => r.bucket === "fail" || r.bucket === "cancel").map((r) => r.name);
+      return `${rows.filter((r) => r.bucket === "pass").length} passing, ${failing.length} failing${failing.length ? ` (${failing.join(", ")})` : ""}, ${rows.filter((r) => r.bucket === "pending").length} pending`;
+    } catch { return "could not be read"; }
+  }
+
   async function awaitMergeableKnown(hostId: string, url: string): Promise<void> {
     for (let i = 0; i < MERGEABLE_POLL_TRIES; i++) {
       const view = await ghPrView(hostId, url);
@@ -7761,15 +7772,24 @@ export default async function plugin(bb: BbPluginApi) {
       kept = `Crew ${crew.id} kept, not retired: ${others.length} other open PR(s) need a decision (merge, fix or close): ${others.map((r) => r.url).join(" ")}`;
     };
     const settle = (outcome: string, pr: string) => { keepForOpenPrs(pr); return keep ? keepLanded(crew, outcome, pr) : retireLanded(crew, outcome, pr); };
-    const posture = await postureOf(crew.projectId);
-    // Captain authority (yes/yolo) and check waivers are separate: neither waiver
-    // grants authority, so either waiver without --yes still refuses.
-    if (!yes && !posture.provenance && (posture.yolo || crew.yolo)) throw new Error("Standing yolo is preserved, but its approval provenance is unverified. Resolve existing captain approval, then record that standing approval with firstmate_posture set yolo=true and its reason. Already-approved green in-scope work needs no fresh per-PR request; an unexplained registry flag alone is not approval. Native user-hold and check gates still apply.");
-    if (!posture.yolo && !yes) {
-      throw new Error(
-        `Needs captain's word: re-run with --yes, or set yolo (bb firstmate posture set --project ${crew.projectId} --yolo on).`,
-      );
-    }
+    // 15 Oct: a probe without --yes merged two PRs under a standing yolo posture. Only
+    // --yes (yes=true) merges; without it the merge stops at a preview, whatever the posture.
+    const preview = (pr: MergeTarget | null, checks: string): string => {
+      const flags = [pr !== null ? `--pr ${pr.number}` : "", opts.keepCrew === true ? "--keep-crew" : "", opts.overrideOwner === true ? "--override-owner" : "",
+        allowRedCheck?.trim() ? `--allow-red ${shQuote(allowRedCheck.trim())}` : "", allowMissingCheck?.trim() ? `--allow-missing ${shQuote(allowMissingCheck.trim())}` : "",
+        opts.allowUnverified?.trim() ? `--allow-unverified ${shQuote(opts.allowUnverified.trim())}` : "", "--yes"].filter(Boolean).join(" ");
+      const lines = ["Not merged: this is a preview. A merge needs --yes (yes=true), whatever the posture."];
+      if (pr === null) lines.push(`Crew ${crew.id} is local-only: --yes fast-forwards its branch onto the default branch.`);
+      else {
+        const row = deliveries.get(prKeyOf(pr.url) ?? "");
+        const record = pr.headSha !== "" && row?.verifiedCommitSha === pr.headSha
+          ? `covers the current head${row.verification ? `; driven: ${row.verification.driven}; seen: ${row.verification.seen}` : ""}`
+          : row?.verifiedCommitSha ? `covers ${row.verifiedCommitSha.slice(0, 7)}, not the current head; the merge will refuse` : "none for the current head; the merge will refuse";
+        lines.push(`PR: #${pr.number}${pr.title ? ` ${pr.title}` : ""} ${pr.url} (${pr.state})`, `Head: ${pr.headSha || "could not be read"}`, `Checks: ${checks}`, `Verification record: ${record}`);
+      }
+      lines.push(`To merge: bb firstmate merge ${crew.id} ${flags}`);
+      return lines.join("\n");
+    };
     const override = opts.overrideOwner === true;
     const notMine = override ? null : await ownerRefusal(crew, opts.caller, "merge");
     if (notMine !== null) throw new Error(notMine);
@@ -7781,6 +7801,7 @@ export default async function plugin(bb: BbPluginApi) {
     const local = crew.posture === "local-only";
     const named = opts.pr !== undefined && opts.pr !== "";
     if (local && named) throw new Error(`Refusing: crew ${crew.id} is local-only. It lands by fast-forward, not through a PR, so drop pr.`);
+    if (local && !yes) return preview(null, "");
     const nativeHome = await crewNativeHome(crew);
     if (nativeHome !== "") {
       const hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
@@ -7795,6 +7816,7 @@ export default async function plugin(bb: BbPluginApi) {
         throw new Error(`No PR for crew ${crew.id}: BB's environment has none, none is recorded, gh finds none for its branch, and its report names none.`);
       }
       await guardForeignPr(crew, pr.url, override,opts.caller, pr.headSha);
+      if (!yes) return preview(pr, await checkSummary(hostId, pr.url));
       let waived = "";
       if (pr.state !== "merged") {
         const verification = requireVerification(pr, opts.allowUnverified, opts.caller ?? crew.parentThreadId ?? "");
@@ -7850,12 +7872,13 @@ export default async function plugin(bb: BbPluginApi) {
     }
     await rememberPrUrl(crew, f.url);
     await guardForeignPr(crew, f.url, override,opts.caller, target?.headSha);
+    const fresh = target ?? { url: f.url, number: Number(/\/pull\/(\d+)/.exec(f.url)?.[1]), title: f.title, state: f.state, source: "environment",
+      headSha: hostId === null ? "" : (await ghPrIdentity(hostId, f.url))?.headSha ?? "" };
+    if (!yes) return preview(fresh, hostId === null ? `${f.checksState}: ${f.passed} passing, ${f.failed} failing, ${f.pending} pending` : await checkSummary(hostId, f.url));
     if (f.state === "merged") {
       await settle("merged (already landed)", f.url);
       return `Already merged: ${landedLine}\n${keep ? kept : `Crew ${crew.id} retired.`}`;
     }
-    const fresh = target ?? { url: f.url, number: Number(/\/pull\/(\d+)/.exec(f.url)?.[1]), title: "", state: f.state, source: "environment",
-      headSha: hostId === null ? "" : (await ghPrIdentity(hostId, f.url))?.headSha ?? "" };
     const verification = requireVerification(fresh, opts.allowUnverified, opts.caller ?? crew.parentThreadId ?? "");
     const unverified = verification.note;
     f = await prepareEnvironmentPullRequest(envId);
@@ -11970,7 +11993,7 @@ export default async function plugin(bb: BbPluginApi) {
   registerCaptainTool({
     name: "firstmate_merge",
     description:
-      "Merge one named crew PR (green+mergeable, or zero checks) or ff-only local-only land. Pass pr (number or link) when the crew has more than one open PR; without it such a merge is refused. Needs yes=true or yolo posture. Needs a verification record for the PR's current head (firstmate_deliveries action=verify); CI and unit tests are not verification. allowUnverified takes the owner's own words waiving that, and records them with the merge. allowRedCheck waives one exact failing check; allowMissingCheck waives one exact required check that has not reported through native verification. Neither grants authority.",
+      "Merge one named crew PR (green+mergeable, or zero checks) or ff-only local-only land. Pass pr (number or link) when the crew has more than one open PR; without it such a merge is refused. Merges only with yes=true (CLI --yes), whatever the posture; without it, it merges nothing and returns a preview: PR, head, checks, verification record and the command. Needs a verification record for the PR's current head (firstmate_deliveries action=verify); CI and unit tests are not verification. allowUnverified takes the owner's own words waiving that, and records them with the merge. allowRedCheck waives one exact failing check; allowMissingCheck waives one exact required check that has not reported through native verification. Neither grants authority.",
     parameters: z.object({
       crewId: z.string(),
       yes: z.boolean().optional(),
@@ -14311,7 +14334,7 @@ export default async function plugin(bb: BbPluginApi) {
               caller: ctxThread, overrideOwner: flags.has("override-owner"), keepCrew: flags.has("keep-crew"), pr: flagStr(flags, "pr"),
               allowUnverified: flagStr(flags, "allow-unverified"),
             });
-            return reply({ merged: true, id, pr: flagStr(flags, "pr") ?? null, crewKept: flags.has("keep-crew") }, text);
+            return reply({ merged: flags.has("yes"), preview: !flags.has("yes"), id, pr: flagStr(flags, "pr") ?? null, crewKept: flags.has("keep-crew") }, text);
           }
           case "handoff": {
             const from = flagStr(flags, "from");
