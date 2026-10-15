@@ -11875,6 +11875,10 @@ export default async function plugin(bb: BbPluginApi) {
       }
       if (!claim.sent) {
         if (claim.existing?.inFlight === true && claim.existing.contentHash === hashText(body)) return toolError(inFlight);
+        // A quote takes one reply. A different text with it was never sent, so it is not "Already replied".
+        if (quote && claim.existing?.contentHash !== hashText(body)) {
+          return toolError(`Not sent: ${used} already has a different reply for that quote, so this text was not sent and nothing is closed. Send it without quote, or with the exact words of another question in ${used}.`);
+        }
         return quote ? `Already replied to ${used} for that quote.` : `Already replied to ${used}.`;
       }
       const stayOpen = [used, ...covered.map(refOf)].join(", ");
