@@ -11896,6 +11896,14 @@ export default async function plugin(bb: BbPluginApi) {
             undelivered = flags.telegramThreading === "on"
               ? "the Telegram connector has no reply method"
               : "Firstmate's telegramThreading flag is off, so this tool has no way to send to Telegram";
+          } else if (sent.duplicate === true) {
+            // The connector keys a reply by message, kind and quote, not text. Its duplicate answer is delivery only when
+            // Firstmate itself recorded this same text and quote as delivered to this message.
+            const recorded = repeatKinds.filter((kind) => kind !== claimKind).map((kind) => inboundLedger.outboxGet(row, kind as OutboxKind))
+              .some((out) => out !== undefined && out.inFlight !== true && out.contentHash === hashText(body));
+            if (!recorded) {
+              undelivered = `the Telegram connector already holds a reply to this message${quote ? " with this quote" : ""} and dropped this text as a repeat`;
+            }
           }
         } else {
           await bb.sdk.threads.send({

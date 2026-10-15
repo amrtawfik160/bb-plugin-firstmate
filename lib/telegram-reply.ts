@@ -41,6 +41,8 @@ export type TelegramReplyResult = {
   outcome: "delivered" | "not-applicable" | "undelivered";
   // The connector's threading mode, when telegram.reply reported one.
   mode?: "on" | "off";
+  // The connector already held a reply with this message, kind and quote, so it sent nothing now, whatever the text.
+  duplicate?: boolean;
 };
 
 export function telegramReplyFallbackBody(input: TelegramReplyInput & { threadId?: string | null }): string {
@@ -115,7 +117,7 @@ export async function sendTelegramReply(input: {
   const result = telegramReplyOutputSchema.parse(raw);
   const mode = result.mode ? { mode: result.mode } : {};
   if (input.payload.kind === "ack" && result.mode === "off") return { channel: "rpc", body, outcome: "not-applicable", ...mode };
-  if (result.queued > 0 || result.duplicate) return { channel: "rpc", body, outcome: "delivered", ...mode };
+  if (result.queued > 0 || result.duplicate) return { channel: "rpc", body, outcome: "delivered", duplicate: result.queued <= 0 && result.duplicate, ...mode };
   throw new Error(`telegram.reply not queued (queued=${result.queued}, mode=${result.mode ?? "unknown"}).`);
 }
 
