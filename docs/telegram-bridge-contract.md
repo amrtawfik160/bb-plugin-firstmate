@@ -104,15 +104,11 @@ quote, a later reply to the same item with a different text is sent as its own
 reply; the same text again is not sent. An item that got its final reply takes
 no further unquoted reply.
 
-`firstmate_reply` refuses, before anything is reserved or sent, a text that asks the
-owner to decide: option lines `A.` / `B.` (or `A)`, or `(A ... / B ...)`) with a
-question mark or a `Decision:` / `Question:` heading, or the words "I need N
-decision(s) from you", "N decisions wait for you" or "Still open with you". The
-refusal tells the captain to send each decision with `firstmate_ask` and the report
-without the question. It does not refuse when the owner message asked for options,
-drafts, versions or decisions, or when the caller passes `notADecision=true`.
-Closing text cannot be refused; a decision in it brings the same guidance to the
-captain as one agent-only note, at most once in 6 hours.
+`firstmate_reply` sends the text as written; no check reads its words. `files` takes
+up to 10 absolute paths. A missing path or one that is not a regular file refuses
+the reply before anything is reserved or sent. Each file is appended as a Markdown
+link with every path segment percent-encoded, which the connector decodes and
+uploads with the reply.
 
 `firstmate_inbox` lists every item still waiting: `received` and `acked` items,
 and `delegated` items with their crew.

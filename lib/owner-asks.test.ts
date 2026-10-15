@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { askLetterAnswer, askIdFromSourceEventId, cardRepeat, createOwnerAsks, formatAskCard, newAskId, ownerAskedForOptions, packAnswers, PLAIN_DECISION_GUIDANCE, plainTextDecision } from "./owner-asks.ts";
+import * as ownerAsksModule from "./owner-asks.ts";
+import { askLetterAnswer, askIdFromSourceEventId, createOwnerAsks, formatAskCard, newAskId, packAnswers } from "./owner-asks.ts";
 import { formatBoard } from "./owner-board.ts";
 
 const NOW = Date.UTC(2026, 9, 7, 12, 0);
@@ -103,77 +104,32 @@ test("card answers accept only a valid letter, optionally followed by a period",
   for (const text of ["What?", "B. send me a link", "1 B", "7B", "C", "Find the list", "B!", "B\nA"]) assert.equal(askLetterAnswer(ask, text), null);
 });
 
-// Sent to the owner as plain text on 11 and 12 Oct 2026, after the captain stopped sending cards.
-const PLAIN_DECISIONS = {
-  release: "Question: release the change that shows a plain icon first and the animated agent face after (#2284)?\n\nA. No, do not release it. I recommend this. The page loads slower for no gain.\nB. Yes, release it.\n\nUntil you answer, #2284 is not released.",
-  straightLine: "Three items need fixes before release. I need 1 decision from you for StraightLine.\n\nDecision: go for the StraightLine call notes (orders 8 to 11) or hold them until the recording fix is live.",
-  stillOpen: "Still open with you:\n\nSend the draft and the 2 card files to Jasher (A send, recommended / B change the wording first)",
-  recap: "Recap: all finished Cyndra work is live. 12 decisions wait for you.",
-};
 
-test("Oct 11 repro: a plain-text message that asks the owner to choose is recognised as a decision", () => {
-  for (const [name, text] of Object.entries(PLAIN_DECISIONS)) assert.equal(typeof plainTextDecision(text), "string", name);
-  assert.equal(typeof plainTextDecision("Which one do you want?\n\nA) Ship today\nB) Wait for the review"), "string", "A) option lines");
-  assert.equal(typeof plainTextDecision("Decision: the export format\n- **A.** CSV\n- **B.** PDF"), "string", "bullet and bold option lines with a cue");
+// 15 Oct, 08:54 UTC: the agent-native card offered "Yes, build it" and said "If no answer by 12:54 UTC, I go with ✓".
+// The owner had not asked for a build. A card that starts new work waits for the owner and never defaults.
+test("a card that starts new work never gets a default and says it waits for the owner", () => {
+  const asks = createOwnerAsks(db());
+  const card = {
+    captain: "thr_cap", kind: "question" as const, recommended: 0, createdAt: NOW, startsNewWork: true,
+    text: "agent-native: may we add its first idea to our CI, so a check that could not run is reported separately from one that passed (1 to 2 days)?",
+    options: [{ label: "Yes, build it", value: "A" }, { label: "No", value: "B" }],
+  };
+  // A caller that still passes a deadline gets none: the stored ask has no default.
+  const ask = asks.create({ ...card, defaultAt: NOW + 4 * 3_600_000 });
+  assert.equal(ask.defaultAt, null);
+  assert.equal(asks.get(ask.id)?.startsNewWork, true);
+  assert.equal(asks.get(ask.id)?.defaultAt, null);
+  assert.deepEqual(asks.takeDue("thr_cap", NOW + 5 * 3_600_000), []);
+  assert.equal(asks.get(ask.id)?.state, "open");
+  assert.equal(formatAskCard(ask), `❓ ${card.text}\n\nThis starts new work, so I wait for your answer.`);
+  // A reversible card that starts no new work keeps its deadline.
+  const plain = asks.create({ ...card, startsNewWork: false, text: "Dark mode by default?", defaultAt: NOW + 60_000 });
+  assert.equal(asks.get(plain.id)?.startsNewWork, false);
+  assert.equal(asks.get(plain.id)?.defaultAt, NOW + 60_000);
 });
 
-test("reports, results of answered cards and changelogs are not decisions", () => {
-  for (const text of [
-    "Results of the cards you answered:\n\nA: the plain icon change is released (#2284).\nB: the StraightLine call notes are on hold.\n\nNothing else changed.",
-    "Changelog\n\n- Digest: a finished item is listed once.\n- Cards: every decision is a card.\n\nA. Digest fix is live.\nB. Card fix is live.",
-    "Rolled back. Is anything else broken? No: the checks pass.",
-    "The decision you made on 10 Oct is live: #2284 is not released.",
-    "Done. PR cyndra-saas#2146 is merged and deployed.",
-  ]) assert.equal(plainTextDecision(text), null, text);
-});
-
-test("an owner message that asks for options or drafts allows a reply that lists them", () => {
-  for (const asked of ["what are my options", "What are my options for the Jasher email?", "Draft 2 replies to Jasher for me", "give me 3 versions of the headline", "which decisions wait for me?"]) {
-    assert.equal(ownerAskedForOptions(asked), true, asked);
+test("no check judges reply prose: the plain-text decision and card-repeat matchers are gone", () => {
+  for (const name of ["plainTextDecision", "cardRepeat", "ownerAskedForOptions", "PLAIN_DECISION_GUIDANCE"]) {
+    assert.equal(name in ownerAsksModule, false, name);
   }
-  for (const asked of ["Status?", "Fix the Metricool sync", "release #2284 today"]) assert.equal(ownerAskedForOptions(asked), false, asked);
-});
-
-test("the guidance names the card tool and the report without the question", () => {
-  assert.match(PLAIN_DECISION_GUIDANCE, /firstmate_ask/);
-  assert.match(PLAIN_DECISION_GUIDANCE, /without the question/);
-});
-
-// Cards sent and closing text that repeated them on 14 Oct 2026 (09:17 and 09:30 UTC).
-const SAVINGS_CARD = {
-  id: "asav001", createdAt: NOW - 60_000,
-  text: "Safi savings: some users already had money in their goals before this change. Should that old money also come out of \"money on hand\"?",
-  options: [
-    { label: "B: Yes. Take existing goal money out of money on hand too. This needs a one-time change to production data, with a backup first.", value: "B" },
-    { label: "A: No. Only money added after the release leaves money on hand. Old goal money stays in money on hand. No data changes.", value: "A" },
-  ],
-};
-const RESTART_CARD = {
-  id: "arst001", createdAt: NOW - 30_000,
-  text: "Seven Cyndra agent-runtime changes are ready. They include the Hermes parts and earlier fixes. They go live only when customer agents restart. When should I run that restart?",
-  options: [
-    { label: "A: Tomorrow, 15 Oct, in the normal quiet window, 07:00–08:00 UTC (10:00–11:00 Cairo). More Hermes parts can join the same batch.", value: "A" },
-    { label: "B: Today, outside the normal window. Customers may see a short gap in replies while their agent restarts.", value: "B" },
-    { label: "C: Hold. Do not restart until you name a time.", value: "C" },
-  ],
-};
-
-test("Oct 14 repro: a message that restates the question of a card sent minutes ago is a repeat", () => {
-  const savings = cardRepeat("I sent you one question card: should money already in savings goals also come out of \"money on hand\"? I recommend yes. That needs a one-time change to production data, with a backup taken first.\n\n**Safi savings change:**\n- It is being released now.", [SAVINGS_CARD], NOW);
-  assert.equal(savings?.ask.id, "asav001");
-  assert.match(savings!.sentence, /money on hand/);
-  const restart = cardRepeat("All Cyndra changes on tonight's release list are now live.\n\nI sent you one question card. Seven agent changes go live only when customer agents restart. I recommend the quiet window tomorrow: 07:00–08:00 UTC, which is 10:00–11:00 Cairo time.", [SAVINGS_CARD, RESTART_CARD], NOW);
-  assert.equal(restart?.ask.id, "arst001");
-});
-
-test("a report on the same subject, a bare card count and a card older than 30 minutes are not repeats", () => {
-  for (const text of [
-    "1 card sent.",
-    "I sent you one question about Safi. Next, the Safi crew releases the change.",
-    "The Safi savings change is merged. The crew is now releasing it: the server first, then the app update to preview and production.",
-    "The Safi savings change is live in the preview app and the production app. Money you put into a goal now leaves money on hand, and Accounts shows the new \"Savings\" section.",
-    "Nothing new needs your decision. Every Cyndra change on tonight's list is released, and no agent was restarted.",
-  ]) assert.equal(cardRepeat(text, [SAVINGS_CARD, RESTART_CARD], NOW), null, text);
-  const old = { ...SAVINGS_CARD, createdAt: NOW - 31 * 60_000 };
-  assert.equal(cardRepeat("Should money already in savings goals also come out of money on hand?", [old], NOW), null);
 });

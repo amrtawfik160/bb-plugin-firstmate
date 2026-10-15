@@ -3,6 +3,11 @@ import test from "node:test";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import plugin from "./server.ts";
 import { createOwnerAsks, formatAskCard } from "./lib/owner-asks.ts";
+import { createInboundLedger } from "./lib/inbound-ledger.ts";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { parseInboundTelegram } from "./lib/telegram-envelope.ts";
 async function captainHost() {
   const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: ["captain", "firstmate"] });
   await host.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
@@ -106,5 +111,103 @@ test("firstmate_ask opens a card when the captain leaves out impact", async () =
     assert.equal(typeof result === "object" && result !== null && "isError" in result, false);
     const [ask] = createOwnerAsks(host.bb.storage.database()).listOpen("thr_cap");
     assert.equal(formatAskCard(ask!), "❓ Decision 12: switch the brands audit to weekly?");
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+// 15 Oct, chat @meraaiagentbot. 08:54 UTC a card "may we add its first idea to our CI?" went out with "Yes, build it"
+// recommended and a 12:54 UTC default, and the owner had to ask "Show me the idea lol" to see the crew's report.
+const AGENT_NATIVE_REF = "tg:985604794:4498";
+const AGENT_NATIVE_CARD = {
+  question: "agent-native: may we add its first idea to our CI, so a check that could not run is reported separately from one that passed (1 to 2 days)?",
+  kind: "question", options: [{ label: "Yes, build it" }, { label: "No" }], recommended: 0, defaultAfterMinutes: 240,
+};
+
+async function agentNativeCase() {
+  const host = await captainHost();
+  const db = host.bb.storage.database();
+  const body = [
+    "The following is an owner message from the private Telegram connector.",
+    "correlation: tgref:9b068a6f", "binding: 3", "telegram_user_id: 985604794", "telegram_chat_id: 985604794",
+    "telegram_message_id: 4498", "reply_target: none", "project: none", "",
+    "Check https://github.com/builderio/agent-native and see how it can help us in the platform",
+  ].join("\n");
+  createInboundLedger(db).record({ captainThreadId: "thr_cap", text: body, receivedAt: Date.now() - 4 * 60_000, bbThreadId: "thr_cap", initiator: "user", telegram: parseInboundTelegram(body) });
+  const call = (name: string, input: Record<string, unknown>) => host.harness.behavior.callAgentTool(name, input, { threadId: "thr_cap", projectId: "proj_1" });
+  const rpc = () => host.harness.sdk.callsTo("plugins.callRpc").map((c) => c[0] as { method: string; input: Record<string, unknown> });
+  return { host, db, call, rpc };
+}
+
+const failed = (result: unknown) => typeof result === "object" && result !== null && (result as { isError?: boolean }).isError === true;
+const textOf = (result: unknown) => typeof result === "string" ? result : (result as { content: Array<{ text?: string }> }).content.map((c) => c.text ?? "").join("\n");
+
+test("15 Oct agent-native: a card that starts new work has no default and says it waits for the owner", async () => {
+  const { host, db, call, rpc } = await agentNativeCase();
+  try {
+    const card = await call("firstmate_ask", { ...AGENT_NATIVE_CARD, startsNewWork: true });
+    assert.equal(failed(card), false, textOf(card));
+    const [ask] = createOwnerAsks(db).listOpen("thr_cap");
+    assert.equal(ask?.defaultAt, null, "a card that starts new work never defaults");
+    assert.match(textOf(card), /waits for the owner's answer/);
+    const askCall = rpc().find((c) => c.method === "ask")!;
+    assert.equal(askCall.input.text, `❓ ${AGENT_NATIVE_CARD.question}\n\nThis starts new work, so I wait for your answer.`);
+    assert.equal((askCall.input.card as { gated: boolean }).gated, true);
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("15 Oct agent-native: firstmate_reply links each attached file and refuses a path with no file", async () => {
+  const { host, call, rpc } = await agentNativeCase();
+  try {
+    const report = join(mkdtempSync(join(tmpdir(), "fm-report-")), "report.md");
+    const missing = await call("firstmate_reply", { ref: AGENT_NATIVE_REF, text: "agent-native: skip adoption, copy a few ideas.", files: [report] });
+    assert.equal(failed(missing), true, textOf(missing));
+    assert.match(textOf(missing), new RegExp(`^Not sent: no file at ${report}\\. ${AGENT_NATIVE_REF} stays open\\.`));
+    assert.equal(rpc().filter((c) => c.method === "reply").length, 0);
+
+    writeFileSync(report, "# agent-native\nSkip adoption; copy a few ideas with credit.\n");
+    const sent = await call("firstmate_reply", { ref: AGENT_NATIVE_REF, text: "agent-native: skip adoption, copy a few ideas.", files: [report] });
+    assert.equal(failed(sent), false, textOf(sent));
+    const reply = rpc().filter((c) => c.method === "reply").at(-1)!;
+    assert.ok(String(reply.input.text).endsWith(`\n\n[report.md](${report})`), String(reply.input.text));
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("PR 132 round 2: firstmate_reply refuses a directory or a relative path before anything is sent", async () => {
+  const { host, call, rpc } = await agentNativeCase();
+  try {
+    const folder = mkdtempSync(join(tmpdir(), "fm-report-"));
+    const directory = await call("firstmate_reply", { ref: AGENT_NATIVE_REF, text: "Here are the findings.", files: [folder] });
+    assert.equal(failed(directory), true, textOf(directory));
+    assert.match(textOf(directory), new RegExp(`^Not sent: ${folder} is not a regular file\\. ${AGENT_NATIVE_REF} stays open\\.`));
+    await assert.rejects(call("firstmate_reply", { ref: AGENT_NATIVE_REF, text: "Here are the findings.", files: ["report.md"] }), /must start with "\/"/);
+    assert.equal(rpc().filter((c) => c.method === "reply").length, 0, "nothing reached the connector");
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("PR 132 round 3: a file name ending in :<number> is refused before anything is sent, because the connector reads that ending as a line number", async () => {
+  const { host, call, rpc } = await agentNativeCase();
+  try {
+    const dir = mkdtempSync(join(tmpdir(), "fm-report-"));
+    writeFileSync(join(dir, "report.md"), "# a different file\n");
+    const colon = join(dir, "report.md:123");
+    writeFileSync(colon, "# the attached file\n");
+    const refused = await call("firstmate_reply", { ref: AGENT_NATIVE_REF, text: "Here are the findings.", files: [colon] });
+    assert.equal(failed(refused), true, textOf(refused));
+    assert.match(textOf(refused), new RegExp(`^Not sent: ${colon} ends in :<number>, which Telegram reads as a line number\\. Rename or copy the file\\. ${AGENT_NATIVE_REF} stays open\\.`));
+    assert.equal(rpc().filter((c) => c.method === "reply").length, 0, "nothing reached the connector");
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("PR 132 round 2: an attached path with spaces or brackets reaches the connector as a link that decodes to the exact path", async () => {
+  const { host, call, rpc } = await agentNativeCase();
+  try {
+    const report = join(mkdtempSync(join(tmpdir(), "fm report [r2] ")), "report with spaces (final).md");
+    writeFileSync(report, "# findings\n");
+    const sent = await call("firstmate_reply", { ref: AGENT_NATIVE_REF, text: "Here are the findings.", files: [report] });
+    assert.equal(failed(sent), false, textOf(sent));
+    const reply = String(rpc().filter((c) => c.method === "reply").at(-1)!.input.text);
+    const link = /\n\n\[([^\]\n]*)\]\(([^\s)]+)\)$/.exec(reply);
+    assert.ok(link, reply);
+    assert.equal(link[1], "report with spaces (final).md");
+    assert.equal(decodeURIComponent(link[2]!), report);
   } finally { await host.harness.lifecycle.dispose(); }
 });
