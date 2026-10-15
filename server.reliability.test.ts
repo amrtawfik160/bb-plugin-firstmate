@@ -1012,6 +1012,61 @@ test("firstmate_reply covers: a different unquoted text to an answered message i
   }
 });
 
+// Round 6: the connector keys a reply by chat, message, kind and quote, not text. It answered a changed follow-up with
+// {queued:0, duplicate:true} and sent nothing, yet Firstmate closed the message and its covers and said "Replied".
+for (const quote of [undefined, "Status?"]) {
+  test(`firstmate_reply covers: a connector duplicate for a changed reply is not delivery; nothing closes until the text is sent (quote=${quote ?? "none"})`, async () => {
+    const host = await load();
+    try {
+      await telegramFlags(host);
+      recordTelegram(host, "thr_cap", "1669", 1_000);
+      recordTelegram(host, "thr_cap", "1670", 2_000);
+      recordTelegram(host, "thr_cap", "1671", 3_000);
+      recordTelegram(host, "thr_cap", "1672", 4_000);
+      createInboundLedger(host.bb.storage.database()).markDelegated({ source: "telegram", chatId: "200", messageId: "1671" }, "thr_crew", 3_500);
+      // Like the connector: one send per chat, message, kind and quote; a later call with that key is a duplicate.
+      const telegram: string[] = [];
+      const held = new Set<string>();
+      let keyOf = (input: { chatId: string; messageId: string; kind: string; quote?: string; text: string }) => `${input.chatId}:${input.messageId}:${input.kind}:${input.quote ?? ""}`;
+      host.harness.sdk.stub("plugins.callRpc", async (args: { input: { chatId: string; messageId: string; kind: string; quote?: string; text: string } }) => {
+        const key = keyOf(args.input);
+        if (held.has(key)) return { queued: 0, duplicate: true, mode: "on" };
+        held.add(key);
+        telegram.push(args.input.text);
+        return { queued: 1, duplicate: false, mode: "on" };
+      });
+      const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
+      const states = () => ["1669", "1670", "1671", "1672"].map((id) => ledgerRow(host, id)?.state);
+      const first = await tool(host, "firstmate_reply").execute({ ref: "tg:200:1669", text: "The research is running.", quote, more: true }, ctx);
+      assert.ok(!isError(first), text(first));
+      assert.deepEqual(telegram, ["The research is running."]);
+      const args = { ref: "tg:200:1669", text: "The research is finished with every filter included.", quote, covers: ["tg:200:1670", "tg:200:1671", "tg:200:1672"] };
+      for (const attempt of ["changed reply", "exact repeat"]) {
+        const result = await tool(host, "firstmate_reply").execute(args, ctx);
+        assert.ok(isError(result), `${attempt}: ${text(result)}`);
+        assert.doesNotMatch(text(result), /Replied to|Already replied/, attempt);
+        assert.match(text(result), /Nothing reached the owner/, attempt);
+        assert.deepEqual(states(), ["received", "received", "delegated", "received"], attempt);
+        assert.equal(ledgerRow(host, "1670")?.coveredBy ?? null, null, attempt);
+        assert.deepEqual(telegram, ["The research is running."], `${attempt}: the final answer never reached Telegram`);
+      }
+      // A connector that keys by text too sends the follow-up; then it closes the message and its covers.
+      keyOf = (input) => `${input.chatId}:${input.messageId}:${input.kind}:${input.quote ?? ""}:${input.text}`;
+      const sent = await tool(host, "firstmate_reply").execute(args, ctx);
+      assert.ok(!isError(sent), text(sent));
+      assert.match(text(sent), /^Replied to tg:200:1669/);
+      assert.deepEqual(states(), ["answered", "answered", "answered", "answered"]);
+      assert.equal(ledgerRow(host, "1671")?.crewId, "thr_crew");
+      assert.deepEqual(telegram, ["The research is running.", "The research is finished with every filter included."]);
+      const repeat = await tool(host, "firstmate_reply").execute(args, ctx);
+      assert.match(text(repeat), /^Already replied to tg:200:1669/);
+      assert.equal(telegram.length, 2, "the exact repeat sends nothing");
+    } finally {
+      await host.harness.lifecycle.dispose();
+    }
+  });
+}
+
 test("firstmate_reply and the captain Telegram guide tell the captain to answer forwarded messages once with covers", () => {
   const source = readFileSync(new URL("./server.ts", import.meta.url), "utf8");
   const description = source.slice(source.indexOf('name: "firstmate_reply"'), source.indexOf("parameters:", source.indexOf('name: "firstmate_reply"')));

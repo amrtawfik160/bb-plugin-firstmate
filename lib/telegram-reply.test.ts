@@ -86,6 +86,12 @@ test("telegram.reply counts only queued or duplicate results as delivered", asyn
   await assert.rejects(sendTelegramReply({ payload: replyPayload, callRpc: async () => ({ queued: 0, duplicate: false, mode: "on" }) }), /not queued/);
 });
 
+// The connector answers duplicate when it already holds a reply with the same message, kind and quote, whatever the text.
+test("telegram.reply reports a duplicate answer, so a caller can tell it from a new send", async () => {
+  assert.equal((await sendTelegramReply({ payload: replyPayload, callRpc: async () => ({ queued: 0, duplicate: true, mode: "on" }) })).duplicate, true);
+  assert.equal((await sendTelegramReply({ payload: replyPayload, callRpc: async () => ({ queued: 1, duplicate: false, mode: "on" }) })).duplicate, false);
+});
+
 test("telegram.reply errors other than a missing method are not delivery", async () => {
   await assert.rejects(sendTelegramReply({ payload: replyPayload, callRpc: async () => { throw new Error("Telegram API unavailable"); } }), /unavailable/);
   const missing = await sendTelegramReply({ payload: replyPayload, callRpc: async () => { throw new Error('plugin "telegram" has no rpc method "reply"'); } });
