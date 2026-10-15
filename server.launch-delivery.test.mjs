@@ -127,11 +127,11 @@ test('background PR follow-up survives reload, forgotten worker, stale lookup an
  hostCommands(host,command=>command.includes('gh pr view') ? {payload:JSON.stringify(observation),code:unavailable?1:0} : {code:0});
  store=createDeliveries(host.bb.storage.database());r=store.get(r.id);r.nextCheckAt=0;store.save(r);
  observation.statusCheckRollup=[{status:'COMPLETED',conclusion:'SUCCESS'}];
- await host.harness.behavior.runSchedule('pr-delivery-follow-up');assert.equal(store.get(r.id).status,'waiting-approval');
+ await host.harness.behavior.runSchedule('pr-delivery-follow-up');assert.equal(store.get(r.id).status,'needs-verification','green is not merge-ready without a verification record');
  assert.equal(host.harness.sdk.callsTo('threads.send').length,1);
  r=store.get(r.id);r.nextCheckAt=0;store.save(r);await host.harness.behavior.runSchedule('pr-delivery-follow-up');assert.equal(host.harness.sdk.callsTo('threads.send').length,1);
  const shown=await host.harness.behavior.runCli(['deliveries','list','--json'],ctx);assert.equal(JSON.parse(shown.stdout).length,1);
- unavailable=true;r=store.get(r.id);r.nextCheckAt=0;store.save(r);await host.harness.behavior.runSchedule('pr-delivery-follow-up');assert.equal(store.get(r.id).freshness,'stale');assert.equal(store.get(r.id).status,'waiting-approval');
+ unavailable=true;r=store.get(r.id);r.nextCheckAt=0;store.save(r);await host.harness.behavior.runSchedule('pr-delivery-follow-up');assert.equal(store.get(r.id).freshness,'stale');assert.equal(store.get(r.id).status,'needs-verification');
  await host.harness.behavior.emitThreadEvent('thread.archived',{thread:makeThreadResponse({id:'thr_cap',projectId:'proj_1',archivedAt:Date.now()})});assert.equal(store.get(r.id).ownerNeeded,true);
  const other=await host.harness.behavior.runCli(['deliveries','list','--json'],{threadId:'thr_other',projectId:'proj_1'});assert.equal(JSON.parse(other.stdout)[0].ownerNeeded,true,'lost manager obligation is visibly project scoped');
  host.harness.sdk.stub('threads.getPluginMetadata',async()=>({captain:'true'}));
@@ -354,13 +354,13 @@ test('forgotten author retains native guarded merge continuation and refuses des
   const fix=await host.harness.behavior.runCli(['tell','c1','--message','Fix the failing check on this PR'],ctx);assert.equal(fix.exitCode,0,fix.stderr);
   assert.equal(host.harness.sdk.callsTo('threads.unarchive').length,1);
   assert.equal(host.harness.sdk.callsTo('threads.updatePluginMetadata').at(-1)[0].set.crew,'true');assert.equal(host.harness.sdk.callsTo('threads.send').at(-1)[0].threadId,'thr_c1');
-  const merge=await host.harness.behavior.runCli(['merge','c1','--yes'],ctx);assert.equal(merge.exitCode,1);assert.match(merge.stderr,/native required check refuses merge/);assert.ok([...resumed.values()].some(c=>c.includes('fm-pr-merge')));assert.ok([...resumed.values()].every(c=>!c.includes('gh pr merge')));
+  const merge=await host.harness.behavior.runCli(['merge','c1','--allow-unverified','the owner said merge it','--yes'],ctx);assert.equal(merge.exitCode,1);assert.match(merge.stderr,/native required check refuses merge/);assert.ok([...resumed.values()].some(c=>c.includes('fm-pr-merge')));assert.ok([...resumed.values()].every(c=>!c.includes('gh pr merge')));
   host.harness.sdk.stub('threads.update',async()=>{throw new Error('archived author reparent failed');});
   const blocked=await host.harness.behavior.runCli(['handoff','--from','thr_cap','--crew','c1'],{threadId:'thr_new',projectId:'proj_1'});assert.equal(blocked.exitCode,0,blocked.stderr);assert.match(blocked.stdout,/Kept: c1/);
   assert.equal(createDeliveries(host.bb.storage.database()).get('acme/retained#1').owner,'thr_cap');
   host.harness.sdk.stub('threads.update',async()=>({}));
   const transferred=await host.harness.behavior.runCli(['handoff','--from','thr_cap','--crew','c1'],{threadId:'thr_new',projectId:'proj_1'});assert.equal(transferred.exitCode,0,transferred.stderr);assert.equal(createDeliveries(host.bb.storage.database()).get('acme/retained#1').owner,'thr_new');
-  const foreign=await host.harness.behavior.runCli(['merge','c1','--yes'],{threadId:'thr_other',projectId:'proj_1'});assert.equal(foreign.exitCode,1);assert.match(foreign.stderr,/No crew/);
+  const foreign=await host.harness.behavior.runCli(['merge','c1','--allow-unverified','the owner said merge it','--yes'],{threadId:'thr_other',projectId:'proj_1'});assert.equal(foreign.exitCode,1);assert.match(foreign.stderr,/No crew/);
  }finally{await host.harness.lifecycle.dispose();}
 });
 test('native guard failure after real bridge creation retains an unadmitted worker and its capacity',async()=>{
@@ -497,7 +497,7 @@ test('recorded standing yolo reaches the native guard without a fresh merge ask;
  if(c.includes('gh pr view'))return{payload:JSON.stringify({state:'OPEN',mergeable:'MERGEABLE'})};
  return{code:0};
  });
- const standing=await host.harness.behavior.runCli(['merge','c1'],ctx);assert.equal(standing.exitCode,1);assert.match(standing.stderr,/NATIVE_USER_HOLD_OR_CHECK_REFUSAL/);assert.equal(guarded,1,'standing authority must reach the guarded route without a fresh request');
+ const standing=await host.harness.behavior.runCli(['merge','c1','--allow-unverified','the owner said merge it'],ctx);assert.equal(standing.exitCode,1);assert.match(standing.stderr,/NATIVE_USER_HOLD_OR_CHECK_REFUSAL/);assert.equal(guarded,1,'standing authority must reach the guarded route without a fresh request');
  assert.equal((await host.bb.storage.kv.get('crews')).length,1);assert.equal(host.harness.sdk.callsTo('environments.mergePullRequest').length,0);
  await host.bb.storage.kv.set('postures',{proj_1:{mode:'direct-PR',yolo:false,provenance:{source:'captain-instruction',actor:'thr_cap',at:'2026-10-05T01:00:00Z',reason:'Actual user hold'}}});
  const held=await host.harness.behavior.runCli(['merge','c1'],ctx);assert.equal(held.exitCode,1);assert.match(held.stderr,/Needs captain/);assert.equal(guarded,1,'actual hold must retain its gate');

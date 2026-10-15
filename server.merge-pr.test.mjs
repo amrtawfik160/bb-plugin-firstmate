@@ -60,7 +60,7 @@ async function deck(open=OPEN,{verified=true}={}) {
  return {host,store,commands:hostCommands(host,forge)};
 }
 const tool=(host,name)=>host.harness.inspection.registrations.agentTools.find(t=>t.name===name);
-const text=out=>typeof out==='string'?out:JSON.stringify(out);
+const text=out=>typeof out==='string'?out:out?.content?.[0]?.text ?? JSON.stringify(out);
 const merges=commands=>commands.filter(c=>c.includes('fm-pr-merge.sh'));
 
 test('a merge without pr on a crew with nine open PRs is refused before anything happens, and names every PR',async()=>{

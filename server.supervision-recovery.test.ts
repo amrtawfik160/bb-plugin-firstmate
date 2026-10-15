@@ -942,7 +942,7 @@ test("merge with --keep-crew merges the PR and leaves the crew listed and tell-a
   try {
     await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
     const calls = stubMergeSdk(host);
-    const result = await host.harness.behavior.runCli(["merge", "c1", "--yes", "--keep-crew"], { threadId: "thr_cap" });
+    const result = await host.harness.behavior.runCli(["merge", "c1", "--allow-unverified", "the owner said merge it", "--yes", "--keep-crew"], { threadId: "thr_cap" });
     assert.equal(result.exitCode, 0, result.stderr);
     assert.equal(calls.merged, 1);
     assert.match(result.stdout, /Merged #1\nhttps:\/\/github\.com\/o\/r\/pull\/1/);
@@ -970,7 +970,7 @@ test("merge without --keep-crew retires the crew as before and says so", async (
   try {
     await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
     stubMergeSdk(host);
-    const result = await host.harness.behavior.runCli(["merge", "c1", "--yes"], { threadId: "thr_cap" });
+    const result = await host.harness.behavior.runCli(["merge", "c1", "--allow-unverified", "the owner said merge it", "--yes"], { threadId: "thr_cap" });
     assert.equal(result.exitCode, 0, result.stderr);
     assert.match(result.stdout, /Crew c1 retired \(landed\)\./);
     assert.deepEqual((await host.bb.storage.kv.get("crews")) as unknown[], []);

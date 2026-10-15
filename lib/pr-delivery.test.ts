@@ -31,6 +31,9 @@ test("each tracked PR status maps to one plain board state, and finished PRs are
     record(13, { status: "complete" }),
     record(14, { status: "explicitly-abandoned" }),
     record(15, { status: "pr-delivered", forgeState: "merged" }),
+    record(16, { status: "pr-delivered", verifiedCommitSha: "sha" }),
+    record(17, { status: "needs-verification" }),
+    record(18, { status: "merged-unverified", forgeState: "merged" }),
   ]);
   assert.deepEqual(rows.map((r) => [r.ref, r.title ?? null, r.state]), [
     ["acme/repo#1", null, "checks running"],
@@ -38,11 +41,13 @@ test("each tracked PR status maps to one plain board state, and finished PRs are
     ["acme/repo#3", "Ship it", "ready to merge"],
     ["acme/repo#4", null, "ready to merge"],
     ["acme/repo#5", null, "ready to merge"],
-    ["acme/repo#6", null, "ready to merge"],
+    ["acme/repo#6", null, "not verified"],
     ["acme/repo#7", null, "waiting on you"],
     ["acme/repo#8", null, "draft"],
     ["acme/repo#9", null, "changes requested"],
     ["acme/repo#10", null, "ready to merge"],
+    ["acme/repo#16", null, "ready to merge"],
+    ["acme/repo#17", null, "not verified"],
   ]);
 });
 
@@ -80,7 +85,8 @@ function runants1759(over: Record<string, unknown> = {}) {
 function boardFor(forge: Record<string, unknown>): string {
   const store = createDeliveries(db() as never);
   store.register({ url: "https://github.com/hazw80801/runants/pull/1759", taskId: "runants-shopify-ui", projectId: "proj_1", owner: "thr_cap", home: "", worker: "thr_crew" });
-  for (let pass = 0; pass < 2; pass++) store.observe("hazw80801/runants#1759", parseForge(forge), false);
+  for (let pass = 0; pass < 2; pass++) verified(store, store.observe("hazw80801/runants#1759", parseForge(forge), false));
+  store.observe("hazw80801/runants#1759", parseForge(forge), false);
   return boardOf(store);
 }
 
@@ -116,8 +122,11 @@ test("a new commit after the do-not-merge comment lifts the hold, and an approva
 function boardAfter(...answers: Record<string, unknown>[]): { board: string; store: ReturnType<typeof createDeliveries> } {
   const store = createDeliveries(db() as never);
   store.register({ url: "https://github.com/hazw80801/runants/pull/1759", taskId: "runants-shopify-ui", projectId: "proj_1", owner: "thr_cap", home: "", worker: "thr_crew" });
-  for (const answer of answers) store.observe("hazw80801/runants#1759", parseForge(answer), false);
+  for (const answer of answers) verified(store, store.observe("hazw80801/runants#1759", parseForge(answer), false));
   return { store, board: boardOf(store) };
+}
+function verified(store: ReturnType<typeof createDeliveries>, r: DeliveryRecord) {
+  if (r.forgeState === "open" && r.verifiedCommitSha !== r.headSha) store.verify(r.id, "thr_cap", r.headSha, "Opened the routes in the browser");
 }
 const redo = { headRefOid: "9c41d07", commits: [{ oid: "3ef8a02", committedDate: "2026-10-07T16:15:00Z" }, { oid: "9c41d07", committedDate: "2026-10-07T20:10:00Z" }] };
 
@@ -133,6 +142,7 @@ test("a held PR that gets new commits needs a captain check before it can show r
   ].join("\n"));
   assert.throws(() => store.clearHold("hazw80801/runants#1759", "thr_cap", " "), /needs a reason/);
   store.clearHold("hazw80801/runants#1759", "thr_cap", "Checked the redo on the real routes");
+  verified(store, store.observe("hazw80801/runants#1759", parseForge(runants1759(redo)), false));
   store.observe("hazw80801/runants#1759", parseForge(runants1759(redo)), false);
   assert.equal(stateOf(store), "ready to merge");
 });
@@ -140,7 +150,7 @@ test("a held PR that gets new commits needs a captain check before it can show r
 test("removing the hold label on the same head lifts the hold without a check, and a merge ends it", () => {
   const labelled = runants1759({ comments: [], labels: [{ name: "do-not-merge" }] });
   assert.match(boardAfter(labelled, runants1759({ comments: [] })).board, /^1\. PR \[runants#1759\]\(https:\/\/github\.com\/hazw80801\/runants\/pull\/1759\) style\(ui\): .* · ready to merge$/m);
-  const merged = boardAfter(runants1759(), runants1759({ ...redo, state: "MERGED", mergeCommit: { oid: "m1" } }));
+  const merged = boardAfter(runants1759(), runants1759({ state: "MERGED", mergeCommit: { oid: "m1" } }));
   assert.equal(merged.store.get("hazw80801/runants#1759")?.status, "complete");
   assert.equal(merged.store.get("hazw80801/runants#1759")?.heldHead, null);
 });
@@ -206,7 +216,8 @@ const track = (store: ReturnType<typeof createDeliveries>, requirement: Delivery
 test("a green PR without a verification record for its head is not merge-ready", () => {
   const store = createDeliveries(new DatabaseSync(":memory:") as never);
   const r = track(store, "merged");
-  const green = store.observe(r.id, seen(), true, 1);
+  store.observe(r.id, seen(), true, 1);
+  const green = store.observe(r.id, seen(), true, 2);
   assert.equal(green.status, "needs-verification");
   assert.match(green.blocker, /^No verification record for head 1e13624/);
   assert.match(green.nextAction, /CI and unit tests are not verification/);

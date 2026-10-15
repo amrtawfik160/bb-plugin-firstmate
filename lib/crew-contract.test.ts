@@ -31,12 +31,11 @@ const HOUSE_RULES = [
 ];
 
 const VERIFY_RULES = [
-  "CI and unit tests are not verification. \"Verify on the same surface\", or your playbook's verify step, means you drive the real changed surface yourself and record what you saw.",
-  "Use the project's verification skill when it has one (for example `.agents/skills/verify-<app>/` in the repo). Your report gives the evidence: what you ran, what you saw, and links to screenshots or logs.",
-  "If you cannot drive that surface, report the verify step as \"blocked: <step>: <what stops you>\". Never mark it ✓ or pending, and never hand a human a manual checklist as if it were verification.",
+  "CI and unit tests are not verification. Your verify step means you drive the real changed surface, with the project's verify skill if it has one (e.g. `.agents/skills/verify-<app>/`), and report what you ran and saw.",
+  "If you cannot drive it, write \"blocked: <step>: <what stops you>\". Never mark it ✓ or pending, and never hand a human a manual checklist as verification.",
 ];
 
-const MERGE_RULE = "Merges go only through `bb firstmate merge <crew> --pr <n>`, which refuses a PR without a verification record. Never run `gh pr merge` or merge through the GitHub API.";
+const MERGE_RULE = "Merge only with `bb firstmate merge <crew> --pr <n>`; it refuses a PR without a verification record. Never use `gh pr merge` or the GitHub API.";
 
 const HOST_LIMIT = [
   "This host is shared. Run every type check, full test run and build as `~/.bb-firstmate/bin/fm-heavy <command>`; it waits for a host-wide slot.",
@@ -117,12 +116,11 @@ test("the file reads are the first lines of the block and the report must name t
   }
 });
 
-test("a bug-fix brief asks for the failing-test commit and proof on the real product", () => {
+test("a bug-fix brief asks for the failing-test commit; the verify rules ask for proof on the real surface", () => {
   const block = crewSkillBlock({ shape: "ship", title: "Fix agent computer feature", task: "", providerId: "codex" });
   assert.ok(block.includes(`3. Follow \`${HOME}/.codex/skills/poteto-mode/playbooks/bug-fix.md\`.`), block);
   assert.ok(block.endsWith([
     "Bug-fix proof: your final report gives the commit id of the failing test, committed before the fix.",
-    "It also gives proof that the fix works on the real product, or \"not possible: <reason>\".",
     ...OBSTACLES,
   ].join("\n")), block);
 });
@@ -377,7 +375,7 @@ test("the block stays short for every provider, shape and playbook", () => {
     for (const shape of ["ship", "scout"] as const) {
       for (const playbook of PLAYBOOK_CHOICES) {
         const size = crewSkillBlock({ shape, title: "x", task: "", providerId, playbook }).length;
-        assert.ok(size <= 3000, `${providerId} ${shape} ${playbook}: ${size} characters`);
+        assert.ok(size <= 3400, `${providerId} ${shape} ${playbook}: ${size} characters`);
       }
     }
   }
