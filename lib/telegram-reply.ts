@@ -37,9 +37,12 @@ export function correlationOf(row: Pick<InboundRow, "sourceRefs">): string | und
 export type TelegramReplyResult = {
   channel: "rpc" | "envelope";
   body: string;
-  outcome: "delivered" | "not-applicable";
+  // undelivered: no sender reached Telegram. body is the fm-out line, which nothing sends on its own.
+  outcome: "delivered" | "not-applicable" | "undelivered";
   // The connector's threading mode, when telegram.reply reported one.
   mode?: "on" | "off";
+  // The connector already held a reply with this message, kind and quote, so it sent nothing now, whatever the text.
+  duplicate?: boolean;
 };
 
 export function telegramReplyFallbackBody(input: TelegramReplyInput & { threadId?: string | null }): string {
@@ -91,7 +94,7 @@ export async function sendTelegramReply(input: {
   callRpc?: ((args: TelegramReplyRpcArgs) => Promise<unknown>) | null;
 }): Promise<TelegramReplyResult> {
   const body = telegramReplyFallbackBody(input.payload);
-  if (!input.callRpc) return { channel: "envelope", body, outcome: "delivered" };
+  if (!input.callRpc) return { channel: "envelope", body, outcome: "undelivered" };
   let raw: unknown;
   try {
     raw = await input.callRpc({
@@ -109,12 +112,12 @@ export async function sendTelegramReply(input: {
     });
   } catch (error) {
     if (!isTelegramRpcMissing(error)) throw error;
-    return { channel: "envelope", body, outcome: "delivered" };
+    return { channel: "envelope", body, outcome: "undelivered" };
   }
   const result = telegramReplyOutputSchema.parse(raw);
   const mode = result.mode ? { mode: result.mode } : {};
   if (input.payload.kind === "ack" && result.mode === "off") return { channel: "rpc", body, outcome: "not-applicable", ...mode };
-  if (result.queued > 0 || result.duplicate) return { channel: "rpc", body, outcome: "delivered", ...mode };
+  if (result.queued > 0 || result.duplicate) return { channel: "rpc", body, outcome: "delivered", duplicate: result.queued <= 0 && result.duplicate, ...mode };
   throw new Error(`telegram.reply not queued (queued=${result.queued}, mode=${result.mode ?? "unknown"}).`);
 }
 

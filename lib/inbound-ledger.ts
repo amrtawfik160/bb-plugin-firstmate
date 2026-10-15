@@ -12,9 +12,10 @@ export function quotedReplyKind(quote: string | null | undefined): OutboxClaimKi
   return trimmed === "" ? "reply" : `reply:q${hashText(trimmed).slice(0, 12)}`;
 }
 
-/** The claim for an unquoted reply that follows a more=true reply: one per different text. */
-export function followUpReplyKind(text: string): OutboxClaimKind {
-  return `reply:t${hashText(text).slice(0, 12)}`;
+/** The claim for a reply that follows an earlier reply to the same message (and quote): one per different text. */
+export function followUpReplyKind(text: string, quote?: string | null): OutboxClaimKind {
+  const trimmed = quote?.trim() ?? "";
+  return `reply:t${hashText(trimmed === "" ? text : `${trimmed}\0${text}`).slice(0, 12)}`;
 }
 
 export type InboundKey = {
@@ -32,6 +33,8 @@ export type InboundRow = InboundKey & {
   ackedAt: number | null;
   answeredAt: number | null;
   crewId: string | null;
+  /** The ref of the reply that also answered this message, when firstmate_reply covers it. */
+  coveredBy?: string | null;
   sourceRefs: string[];
   mediaGroupId: string | null;
   senderId: string | null;
@@ -50,6 +53,12 @@ export type OutboxRow = InboundKey & {
   contentHash: string;
   sentAt: number;
   outgoingMessageId: string | null;
+  /** A reply sent without more=true: its exact repeat may close the message. Absent on older claims. */
+  final?: boolean;
+  /** firstmate_reply: the reservation is made but delivery is not confirmed yet, so a repeat closes nothing. */
+  inFlight?: boolean;
+  /** firstmate_reply: refs of the covers this reply listed. An exact repeat may close only these. */
+  covers?: string[];
 };
 
 export type LedgerEvent = {
@@ -214,9 +223,15 @@ export type CreateInboundLedger = {
   hasTelegram(captainThreadId: string): boolean;
   markAcked(key: InboundKey, at: number): InboundRow | undefined;
   markAnswered(key: InboundKey, at: number): InboundRow | undefined;
+  /** One transaction: answers the anchor (when given) and each open cover, answered by the reply to by with no
+   * message of its own and keeping its crew link, so a failure closes none. Returns the covers it closed. */
+  finishReply(anchor: InboundKey | null, covers: InboundKey[], by: string, at: number): InboundRow[];
   markDelegated(key: InboundKey, crewId: string, at: number): InboundRow | undefined;
   mergeSourceRefs(keys: InboundKey[], refs: string[]): void;
-  claimOutbox(row: InboundKey, kind: OutboxClaimKind, content: string, at: number): { sent: boolean; existing?: OutboxRow };
+  /** reply: a firstmate_reply reservation, in flight until markDelivered. */
+  claimOutbox(row: InboundKey, kind: OutboxClaimKind, content: string, at: number, reply?: { final: boolean; covers: string[] }): { sent: boolean; existing?: OutboxRow };
+  /** Confirms a firstmate_reply reservation was delivered, so its exact repeat may finish the closure. */
+  markDelivered(row: InboundKey, kind: OutboxClaimKind): void;
   releaseOutbox(row: InboundKey, kind: OutboxClaimKind): void;
   rememberOutgoing(row: InboundKey, kind: OutboxKind, outgoingMessageId: string): void;
   outboxGet(row: InboundKey, kind: OutboxKind): OutboxRow | undefined;
@@ -311,13 +326,14 @@ export function createInboundLedger(db: Database): CreateInboundLedger {
     })();
   }
 
-  function claimOutbox(row: InboundKey, kind: OutboxClaimKind, content: string, at: number) {
+  function claimOutbox(row: InboundKey, kind: OutboxClaimKind, content: string, at: number, reply?: { final: boolean; covers: string[] }) {
     const contentHash = hashText(content);
     return db.transaction(() => {
       const existing = db.prepare("SELECT record FROM inbound_outbox WHERE source=? AND chat_id=? AND message_id=? AND kind=?")
         .get(row.source, row.chatId, row.messageId, kind) as { record: string } | undefined;
       if (existing) return { sent: false, existing: JSON.parse(existing.record) as OutboxRow };
-      const out: OutboxRow = { ...row, kind: kind as OutboxKind, contentHash, sentAt: at, outgoingMessageId: null };
+      const out: OutboxRow = { ...row, kind: kind as OutboxKind, contentHash, sentAt: at, outgoingMessageId: null,
+        ...(reply ? { ...(reply.final ? { final: true } : {}), inFlight: true, covers: reply.covers } : {}) };
       db.prepare("INSERT INTO inbound_outbox VALUES (?,?,?,?,?,?,?,?)")
         .run(row.source, row.chatId, row.messageId, kind, contentHash, at, null, JSON.stringify(out));
       return { sent: true };
@@ -344,6 +360,19 @@ export function createInboundLedger(db: Database): CreateInboundLedger {
         if (row.state === "answered") return row;
         return { ...row, state: "answered", answeredAt: at, ackedAt: row.ackedAt ?? at };
       });
+    },
+    finishReply(anchor, covers, by, at) {
+      return db.transaction(() => {
+        const current = anchor ? get(anchor) : undefined;
+        if (current && current.state !== "answered") save({ ...current, state: "answered", answeredAt: at, ackedAt: current.ackedAt ?? at });
+        const closed: InboundRow[] = [];
+        for (const key of covers) {
+          const row = get(key);
+          if (!row || row.state === "answered") continue;
+          closed.push(save({ ...row, state: "answered", coveredBy: by, answeredAt: at, ackedAt: row.ackedAt ?? at }));
+        }
+        return closed;
+      })();
     },
     markDelegated(key, crewId, at) {
       return transition(key, (row) => {
@@ -374,6 +403,15 @@ export function createInboundLedger(db: Database): CreateInboundLedger {
       parsed.outgoingMessageId = outgoingMessageId;
       db.prepare("UPDATE inbound_outbox SET outgoing_message_id=?, record=? WHERE source=? AND chat_id=? AND message_id=? AND kind=?")
         .run(outgoingMessageId, JSON.stringify(parsed), row.source, row.chatId, row.messageId, kind);
+    },
+    markDelivered(row, kind) {
+      const existing = db.prepare("SELECT record FROM inbound_outbox WHERE source=? AND chat_id=? AND message_id=? AND kind=?")
+        .get(row.source, row.chatId, row.messageId, kind) as { record: string } | undefined;
+      if (!existing) return;
+      const parsed = JSON.parse(existing.record) as OutboxRow;
+      delete parsed.inFlight;
+      db.prepare("UPDATE inbound_outbox SET record=? WHERE source=? AND chat_id=? AND message_id=? AND kind=?")
+        .run(JSON.stringify(parsed), row.source, row.chatId, row.messageId, kind);
     },
     outboxGet(row, kind) {
       const found = db.prepare("SELECT record FROM inbound_outbox WHERE source=? AND chat_id=? AND message_id=? AND kind=?")

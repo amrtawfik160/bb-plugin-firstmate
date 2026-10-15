@@ -52,7 +52,14 @@ test("sendTelegramReply falls back to an fm-out line when the RPC is missing", a
     },
   });
   assert.equal(result.channel, "envelope");
+  assert.equal(result.outcome, "undelivered", "nothing sends the fm-out line, so it is not delivery");
   assert.equal(result.body, telegramReplyFallbackBody({ chatId: "200", messageId: "1669", kind: "reply", text: "done" }));
+});
+
+test("sendTelegramReply with no sender reports the reply undelivered", async () => {
+  const result = await sendTelegramReply({ payload: { chatId: "200", messageId: "1669", kind: "reply", text: "done" }, callRpc: null });
+  assert.equal(result.channel, "envelope");
+  assert.equal(result.outcome, "undelivered");
 });
 
 test("final answers target the oldest unanswered item, never the latest", () => {
@@ -77,6 +84,12 @@ test("telegram.reply counts only queued or duplicate results as delivered", asyn
   assert.equal((await sendTelegramReply({ payload: replyPayload, callRpc: async () => ({ queued: 2, duplicate: false, mode: "on" }) })).outcome, "delivered");
   assert.equal((await sendTelegramReply({ payload: replyPayload, callRpc: async () => ({ queued: 0, duplicate: true, mode: "on" }) })).outcome, "delivered");
   await assert.rejects(sendTelegramReply({ payload: replyPayload, callRpc: async () => ({ queued: 0, duplicate: false, mode: "on" }) }), /not queued/);
+});
+
+// The connector answers duplicate when it already holds a reply with the same message, kind and quote, whatever the text.
+test("telegram.reply reports a duplicate answer, so a caller can tell it from a new send", async () => {
+  assert.equal((await sendTelegramReply({ payload: replyPayload, callRpc: async () => ({ queued: 0, duplicate: true, mode: "on" }) })).duplicate, true);
+  assert.equal((await sendTelegramReply({ payload: replyPayload, callRpc: async () => ({ queued: 1, duplicate: false, mode: "on" }) })).duplicate, false);
 });
 
 test("telegram.reply errors other than a missing method are not delivery", async () => {

@@ -70,7 +70,7 @@ import { createDoorbellHold, doorbellHoldDecision } from "./lib/doorbell-hold.ts
 import { createRetryLedger, type RetryItem, type RetryKind } from "./lib/retry-ledger.ts";
 import { HANDOFF_WAKE_AMENDMENT, captainInstructionsWithHandoff } from "./lib/handoff-contract.ts";
 import { honestIdleVerdictPresentation, interruptIsStopped, readyClaim } from "./lib/honest-status.ts";
-import { ACK_TEXT, ackEligible, createInboundLedger, expandTelegramRows, followUpReplyKind, formatOwnerInbox, hashText, inboundKey, quotedReplyKind, sweeperSteerText, type InboundRow } from "./lib/inbound-ledger.ts";
+import { ACK_TEXT, ackEligible, createInboundLedger, expandTelegramRows, followUpReplyKind, formatOwnerInbox, hashText, inboundKey, quotedReplyKind, sweeperSteerText, type InboundKey, type InboundRow, type OutboxKind } from "./lib/inbound-ledger.ts";
 import { inboundHookDecision } from "./lib/inbound-dispatch.ts";
 import { formatWorkersForTelegram } from "./lib/telegram-commands.ts";
 import { digestOnce, EMPTY_DIGEST_MEMORY, formatBoard, type BoardInput, type DigestMemory } from "./lib/owner-board.ts";
@@ -11790,15 +11790,16 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_reply",
-    description: "Reply to one owner message as a Telegram reply to it (ref=oldest, tg:<chat>:<msg>, or bb:<thread>:<row>; any open message, in any order). quote=exact words from that message, such as one of several questions; each different quote is its own reply. more=true keeps the message open because more replies to it will follow. A text that asks the owner to decide (options A/B with a question, or a count of waiting decisions) is refused: send each decision with firstmate_ask. A text that restates the question of a card sent in the last 30 minutes is refused too.",
+    description: "Reply to one owner message as a Telegram reply to it (ref=oldest, tg:<chat>:<msg>, or bb:<thread>:<row>; any open message, in any order). quote=exact words from that message, such as one of several questions; each different quote is its own reply. more=true keeps the message open because more replies to it will follow. A text that asks the owner to decide (options A/B with a question, or a count of waiting decisions) is refused: send each decision with firstmate_ask. A text that restates the question of a card sent in the last 30 minutes is refused too. covers=refs of other open messages this reply also answers, such as forwarded messages or a burst on one request: they close with no Telegram message of their own.",
     parameters: z.object({
       ref: z.string().min(1),
       text: z.string().min(1).max(4000),
       quote: z.string().min(1).max(1024).optional(),
       more: z.boolean().optional(),
       files: z.array(z.string().startsWith("/")).max(10).optional().describe("Absolute paths of files to attach, such as a crew's report.md"),
+      covers: z.array(z.string().min(1)).max(50).optional().describe("Refs of other open owner messages this reply also answers; each closes with no Telegram message"),
     }),
-    async execute({ ref, text: words, quote, more, files }, ctx) {
+    async execute({ ref, text: words, quote, more, files, covers }, ctx) {
       const flags = await reliabilityFlags();
       if (flags.inboundLedger === "off") return toolError("Inbound ledger is off.");
       const captain = ctxString(ctx, "threadId");
@@ -11812,32 +11813,74 @@ export default async function plugin(bb: BbPluginApi) {
       const refOf = (item: InboundRow) => item.source === "telegram" ? telegramSourceRef(item) : `bb:${item.chatId}:${item.messageId}`;
       const used = refOf(row);
       const attach = files ?? [];
+      // The connector uploads each linked local file with the reply. It percent-decodes the link target, and a
+      // space or ")" ends the target, so every segment is encoded, parentheses too. The label cannot hold brackets.
+      const encode = (segment: string) => encodeURIComponent(segment).replace(/[()]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+      const link = (file: string) => `[${basename(file).replace(/[[\]]/g, "")}](${file.split("/").map(encode).join("/")})`;
+      const text = attach.length === 0 ? words : `${words}\n\n${attach.map(link).join("\n")}`;
+      const body = row.source === "telegram"
+        ? telegramReplyFallbackBody({ chatId: row.chatId, messageId: row.messageId, kind: "reply", text: stripTelegramEnvelope(text), threadId: row.topicId })
+        : text;
+      const coverNote = (closed: InboundRow[]) => closed.length === 0 ? "" : ` It also answers ${closed.map(refOf).join(", ")}, closed with no message of their own.`;
+      // The same text and quote already reserved for this message is an exact repeat: nothing is sent again.
+      // While the first send is running, the repeat closes nothing. Once it is delivered, the repeat finishes any
+      // closure an interrupted call left undone, of the covers that reply listed only. It closes this message only
+      // when the delivered reply was final, so repeating a more=true text keeps the message open.
+      const inFlight = `Not sent: the first send of this reply to ${used} is still running, so nothing is closed yet. Repeat the same call later.`;
+      const repeatKinds = [quotedReplyKind(quote), followUpReplyKind(body, quote)];
+      const delivered = repeatKinds.map((kind) => inboundLedger.outboxGet(row, kind as OutboxKind)).find((out) => out?.contentHash === hashText(body));
+      if (delivered) {
+        if (delivered.inFlight === true) return toolError(inFlight);
+        const recorded = (delivered.covers ?? []).map(parseSourceRef).filter((other): other is InboundKey => other !== null);
+        const recordedKeys = new Set(recorded.map(inboundKey));
+        const extra = [...new Set(covers ?? [])].filter((other) => {
+          const otherKey = parseSourceRef(other);
+          return otherKey === null || !recordedKeys.has(inboundKey(otherKey));
+        });
+        if (extra.length > 0) {
+          return toolError(`Not sent: covers refused (${extra.map((other) => `${other} was not covered by the reply already sent to ${used}`).join("; ")}). Nothing is closed. Answer ${extra.length === 1 ? "it" : "them"} in a new reply.`);
+        }
+        const pendingNow = new Set(inboundLedger.listPending(captain).map(inboundKey));
+        const closed = inboundLedger.finishReply(delivered.final === true && more !== true ? row : null, recorded.filter((other) => pendingNow.has(inboundKey(other))), used, Date.now());
+        return (quote ? `Already replied to ${used} for that quote.` : `Already replied to ${used}.`) + coverNote(closed);
+      }
+      // Every covered ref must be another open message of this captain, or nothing is sent.
+      const pending = new Set(inboundLedger.listPending(captain).map(inboundKey));
+      const covered: InboundRow[] = [];
+      const refused: string[] = [];
+      for (const other of new Set(covers ?? [])) {
+        const otherKey = parseSourceRef(other);
+        const found = otherKey === null ? undefined : inboundLedger.get(otherKey);
+        if (otherKey === null) refused.push(`${other} is not a ref`);
+        else if (inboundKey(otherKey) === inboundKey(row)) refused.push(`${other} is the ref this reply answers`);
+        else if (found?.captainThreadId !== captain) refused.push(`${other} is not an owner message of this captain`);
+        else if (!pending.has(inboundKey(otherKey))) refused.push(`${other} is not open`);
+        else covered.push(found);
+      }
+      if (refused.length > 0) return toolError(`Not sent: covers refused (${refused.join("; ")}). ${used} stays open.`);
       const missing = attach.filter((file) => !existsSync(file));
       if (missing.length > 0) return toolError(`Not sent: no file at ${missing.join(", ")}. ${used} stays open.`);
       const notFile = attach.filter((file) => !statSync(file).isFile());
       if (notFile.length > 0) return toolError(`Not sent: ${notFile.join(", ")} is not a regular file. ${used} stays open.`);
       const lineSuffix = attach.filter((file) => /:\d+$/.test(file));
       if (lineSuffix.length > 0) return toolError(`Not sent: ${lineSuffix.join(", ")} ends in :<number>, which Telegram reads as a line number. Rename or copy the file. ${used} stays open.`);
-      // The connector uploads each linked local file with the reply. It percent-decodes the link target, and a
-      // space or ")" ends the target, so every segment is encoded, parentheses too. The label cannot hold brackets.
-      const encode = (segment: string) => encodeURIComponent(segment).replace(/[()]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
-      const link = (file: string) => `[${basename(file).replace(/[[\]]/g, "")}](${file.split("/").map(encode).join("/")})`;
-      const text = attach.length === 0 ? words : `${words}\n\n${attach.map(link).join("\n")}`;
       let claimKind = quotedReplyKind(quote);
-      const body = row.source === "telegram"
-        ? telegramReplyFallbackBody({ chatId: row.chatId, messageId: row.messageId, kind: "reply", text: stripTelegramEnvelope(text), threadId: row.topicId })
-        : text;
       // Reserve first so a concurrent or repeated reply never reaches Telegram twice.
-      let claim = inboundLedger.claimOutbox(row, claimKind, body, Date.now());
-      // more=true left the message open: a different text is the next reply to it, the same text is a repeat.
-      if (!claim.sent && !quote && (row.state !== "answered" || attach.length > 0) && claim.existing?.contentHash !== hashText(body)) {
-        claimKind = followUpReplyKind(body);
-        claim = inboundLedger.claimOutbox(row, claimKind, body, Date.now());
-      }
+      const reservation = { final: more !== true, covers: covered.map(refOf) };
+      let claim = inboundLedger.claimOutbox(row, claimKind, body, Date.now(), reservation);
+      // This message (and quote) already has a reply: a different text is a follow-up reply to it, with the same quote.
       if (!claim.sent) {
+        claimKind = followUpReplyKind(body, quote);
+        claim = inboundLedger.claimOutbox(row, claimKind, body, Date.now(), reservation);
+      }
+      // The follow-up claim is keyed by its text, so only a concurrent exact repeat finds it taken.
+      if (!claim.sent) {
+        if (claim.existing?.inFlight === true) return toolError(inFlight);
         return quote ? `Already replied to ${used} for that quote.` : `Already replied to ${used}.`;
       }
+      const stayOpen = [used, ...covered.map(refOf)].join(", ");
       let channel: "rpc" | "envelope" = "envelope";
+      let undelivered: string | null = null;
       try {
         if (row.source === "telegram") {
           const sent = await sendTelegramReply({
@@ -11849,6 +11892,19 @@ export default async function plugin(bb: BbPluginApi) {
           });
           channel = sent.channel;
           await noteTelegramThreading(sent.mode).catch((error) => bb.log.warn(`telegram threading state: ${String(error)}`));
+          if (sent.outcome !== "delivered") {
+            undelivered = flags.telegramThreading === "on"
+              ? "the Telegram connector has no reply method"
+              : "Firstmate's telegramThreading flag is off, so this tool has no way to send to Telegram";
+          } else if (sent.duplicate === true) {
+            // The connector keys a reply by message, kind and quote, not text. Its duplicate answer is delivery only when
+            // Firstmate itself recorded this same text and quote as delivered to this message.
+            const recorded = repeatKinds.filter((kind) => kind !== claimKind).map((kind) => inboundLedger.outboxGet(row, kind as OutboxKind))
+              .some((out) => out !== undefined && out.inFlight !== true && out.contentHash === hashText(body));
+            if (!recorded) {
+              undelivered = `the Telegram connector already holds a reply to this message${quote ? " with this quote" : ""} and dropped this text as a repeat`;
+            }
+          }
         } else {
           await bb.sdk.threads.send({
             threadId: row.captainThreadId,
@@ -11858,13 +11914,27 @@ export default async function plugin(bb: BbPluginApi) {
         }
       } catch (error) {
         inboundLedger.releaseOutbox(row, claimKind);
-        return toolError(`Reply to ${used} was not delivered; the item stays open. ${error instanceof Error ? error.message : String(error)}`);
+        return toolError(`Reply to ${used} was not delivered; ${stayOpen} ${covered.length === 0 ? "stays" : "stay"} open. ${error instanceof Error ? error.message : String(error)}`);
       }
-      if (more !== true) inboundLedger.markAnswered(row, Date.now());
+      if (undelivered !== null) {
+        inboundLedger.releaseOutbox(row, claimKind);
+        return toolError(`Reply to ${used} was not delivered: ${undelivered}. Nothing reached the owner; ${stayOpen} ${covered.length === 0 ? "stays" : "stay"} open. Answer in your turn text instead.`);
+      }
+      try {
+        inboundLedger.markDelivered(row, claimKind);
+      } catch (error) {
+        return toolError(`Reply to ${used} was delivered, but recording the delivery failed; ${stayOpen} ${covered.length === 0 ? "stays" : "stay"} open, and a repeat of this call cannot close ${covered.length === 0 ? "it" : "them"}. ${error instanceof Error ? error.message : String(error)}`);
+      }
+      // The reply and its covers close together; after a failure the identical call closes them with no second send.
+      try {
+        inboundLedger.finishReply(more === true ? null : row, covered, used, Date.now());
+      } catch (error) {
+        return toolError(`Reply to ${used} was delivered, but recording it failed; ${stayOpen} ${covered.length === 0 ? "stays" : "stay"} open. Repeat the same call to close ${covered.length === 0 ? "it" : "them"}: it sends nothing again. ${error instanceof Error ? error.message : String(error)}`);
+      }
       const params = row.source === "telegram" ? telegramReplyParameters({ chatId: row.chatId, messageId: row.messageId, threadId: row.topicId }) : null;
-      const sentLine = params
+      const sentLine = (params
         ? `Replied to ${used} via ${channel} with reply_parameters ${JSON.stringify(params.reply_parameters)}.`
-        : `Replied to ${used}.`;
+        : `Replied to ${used}.`) + coverNote(covered);
       const taskNote = ownerTasks.openByRef(captain, used).map((task) => `\nTask ${task.id} stays open (${task.state}): a reply does not close it. Close it with firstmate_task when it is done or dropped.`).join("");
       const stillOpen = inboundLedger.listPending(captain);
       return (stillOpen.length === 0 ? `${sentLine} No owner message is waiting.` : `${sentLine}\n${formatOwnerInbox(stillOpen, Date.now())}`) + taskNote;
@@ -13367,7 +13437,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (answered > 0) await refreshOwnerBoard();
   }
 
-  // Threaded replies off: an ack does not apply, and asking again on every dispatch would only repeat the RPC.
+  // Threaded replies off, or no sender: an ack does not apply, and asking again on every dispatch would only repeat the RPC.
   const ackNotApplicable = new Set<string>();
   try {
     bb.experimental_hooks.on("message.dispatch", async (context) => {
@@ -13480,7 +13550,7 @@ export default async function plugin(bb: BbPluginApi) {
               await noteTelegramThreading(sent?.mode).catch((error) => bb.log.warn(`telegram threading state: ${String(error)}`));
               if (sent?.outcome !== "delivered") {
                 inboundLedger.releaseOutbox(primary, "ack");
-                if (sent?.outcome === "not-applicable") ackNotApplicable.add(inboundKey(primary));
+                if (sent?.outcome === "not-applicable" || sent?.outcome === "undelivered") ackNotApplicable.add(inboundKey(primary));
                 continue;
               }
               inboundLedger.markAcked(primary, now);
