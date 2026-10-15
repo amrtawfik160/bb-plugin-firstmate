@@ -925,7 +925,8 @@ test("firstmate_reply covers: an exact repeat closes only the covers the deliver
 });
 
 // Round 4: a different text with a quote that already had a reply returned "Already replied", although that text was never sent.
-test("firstmate_reply covers: a different text with a quote whose reply was not recorded as delivered is refused with the recovery, and closes nothing", async () => {
+// Round 5: only an exact repeat is "Already replied"; any other text is sent as a follow-up reply, with its quote.
+test("firstmate_reply covers: a different text with a quote whose reply was not recorded as delivered is sent as a quoted follow-up and closes its covers", async () => {
   const host = await load();
   try {
     await telegramFlags(host);
@@ -941,19 +942,23 @@ test("firstmate_reply covers: a different text with a quote whose reply was not 
     db.exec("CREATE TRIGGER fail_delivery BEFORE UPDATE ON inbound_outbox BEGIN SELECT RAISE(ABORT, 'simulated delivery record failure'); END;");
     assert.ok(isError(await tool(host, "firstmate_reply").execute(args, ctx)));
     db.exec("DROP TRIGGER fail_delivery;");
-    const changed = await tool(host, "firstmate_reply").execute({ ...args, text: "The research covers every filter you sent." }, ctx);
-    assert.ok(isError(changed), text(changed));
-    assert.doesNotMatch(text(changed), /Already replied/);
-    assert.match(text(changed), /Not sent/);
-    assert.match(text(changed), /without quote/);
-    assert.deepEqual(["1669", "1670", "1671", "1672"].map((id) => ledgerRow(host, id)?.state), ["received", "received", "delegated", "received"], "nothing is closed");
-    assert.equal(host.harness.sdk.callsTo("plugins.callRpc").length, 1, "the changed text is not sent");
+    const changedArgs = { ...args, text: "The research covers every filter you sent." };
+    const changed = await tool(host, "firstmate_reply").execute(changedArgs, ctx);
+    assert.ok(!isError(changed), text(changed));
+    assert.match(text(changed), /^Replied to tg:200:1669/);
+    assert.deepEqual(["1669", "1670", "1671", "1672"].map((id) => ledgerRow(host, id)?.state), ["answered", "answered", "answered", "answered"]);
+    const calls = host.harness.sdk.callsTo("plugins.callRpc").map((call) => (call[0] as { input: { text: string; quote?: string } }).input);
+    assert.equal(calls.length, 2, "the changed text is sent");
+    assert.deepEqual([calls[1]!.text, calls[1]!.quote], ["The research covers every filter you sent.", "Status?"]);
+    const repeat = await tool(host, "firstmate_reply").execute(changedArgs, ctx);
+    assert.match(text(repeat), /^Already replied to tg:200:1669 for that quote\./);
+    assert.equal(host.harness.sdk.callsTo("plugins.callRpc").length, 2, "the exact repeat sends nothing");
   } finally {
     await host.harness.lifecycle.dispose();
   }
 });
 
-test("firstmate_reply covers: a different final text with the quote of a more=true reply is refused with the recovery, and closes nothing", async () => {
+test("firstmate_reply covers: a different final text with the quote of a more=true reply is sent as a quoted follow-up and closes the message and its covers", async () => {
   const host = await load();
   try {
     await telegramFlags(host);
@@ -967,12 +972,41 @@ test("firstmate_reply covers: a different final text with the quote of a more=tr
     const partial = await tool(host, "firstmate_reply").execute({ ref: "tg:200:1669", text: "The research is running.", quote: "Status?", more: true }, ctx);
     assert.ok(!isError(partial), text(partial));
     const final = await tool(host, "firstmate_reply").execute({ ref: "tg:200:1669", text: "The research is done.", quote: "Status?", covers: ["tg:200:1670", "tg:200:1671", "tg:200:1672"] }, ctx);
-    assert.ok(isError(final), text(final));
+    assert.ok(!isError(final), text(final));
     assert.doesNotMatch(text(final), /Already replied/);
-    assert.match(text(final), /Not sent/);
-    assert.match(text(final), /without quote/);
-    assert.deepEqual(["1669", "1670", "1671", "1672"].map((id) => ledgerRow(host, id)?.state), ["received", "received", "delegated", "received"], "nothing is closed");
-    assert.equal(host.harness.sdk.callsTo("plugins.callRpc").length, 1, "the final text is not sent");
+    assert.deepEqual(["1669", "1670", "1671", "1672"].map((id) => ledgerRow(host, id)?.state), ["answered", "answered", "answered", "answered"]);
+    assert.equal(ledgerRow(host, "1671")?.crewId, "thr_crew");
+    const calls = host.harness.sdk.callsTo("plugins.callRpc").map((call) => (call[0] as { input: { text: string; quote?: string } }).input);
+    assert.deepEqual(calls.map((call) => [call.text, call.quote]), [["The research is running.", "Status?"], ["The research is done.", "Status?"]]);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// Round 5: a different unquoted text to an answered message returned "Already replied" and sent nothing.
+test("firstmate_reply covers: a different unquoted text to an answered message is sent as a follow-up and closes its open cover", async () => {
+  const host = await load();
+  try {
+    await telegramFlags(host);
+    recordTelegram(host, "thr_cap", "1669", 1_000);
+    recordTelegram(host, "thr_cap", "1670", 2_000);
+    host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
+    const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
+    const first = await tool(host, "firstmate_reply").execute({ ref: "tg:200:1669", text: "The research is running." }, ctx);
+    assert.ok(!isError(first), text(first));
+    assert.equal(ledgerRow(host, "1669")?.state, "answered");
+    const args = { ref: "tg:200:1669", text: "The research is complete and the report is ready.", covers: ["tg:200:1670"] };
+    const changed = await tool(host, "firstmate_reply").execute(args, ctx);
+    assert.ok(!isError(changed), text(changed));
+    assert.doesNotMatch(text(changed), /Already replied/);
+    assert.match(text(changed), /^Replied to tg:200:1669/);
+    assert.deepEqual(["1669", "1670"].map((id) => ledgerRow(host, id)?.state), ["answered", "answered"]);
+    assert.equal(ledgerRow(host, "1670")?.coveredBy, "tg:200:1669");
+    const sent = () => host.harness.sdk.callsTo("plugins.callRpc").map((call) => (call[0] as { input: { text: string } }).input.text);
+    assert.deepEqual(sent(), ["The research is running.", "The research is complete and the report is ready."]);
+    const repeat = await tool(host, "firstmate_reply").execute(args, ctx);
+    assert.match(text(repeat), /^Already replied to tg:200:1669\./);
+    assert.equal(sent().length, 2, "the exact repeat sends nothing");
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -1610,7 +1644,7 @@ test("a decision in the captain's closing text brings no note", async () => {
   }
 });
 
-test("captain report: after a reply sent with more=true, a different text to the same message is sent; the same text is sent once", async () => {
+test("captain report: a different text to the same message is sent, before or after its final reply; the same text is sent once", async () => {
   const host = await load();
   try {
     await telegramFlags(host);
@@ -1628,8 +1662,11 @@ test("captain report: after a reply sent with more=true, a different text to the
     assert.equal(ledgerRow(host, "1669")?.state, "received", "more=true keeps the message open");
     assert.ok(!isError(await send("All checks pass.")));
     assert.equal(ledgerRow(host, "1669")?.state, "answered");
-    assert.match(text(await send("One more thing.")), /Already replied to tg:200:1669/, "a message that got its final reply takes no more");
-    assert.deepEqual(sentTexts(), ["The deploy is running.", "The deploy is done.", "All checks pass."]);
+    const more = await send("One more thing.");
+    assert.ok(!isError(more), text(more));
+    assert.match(text(more), /^Replied to tg:200:1669/, "a different text after the final reply is a follow-up");
+    assert.match(text(await send("One more thing.")), /Already replied to tg:200:1669/);
+    assert.deepEqual(sentTexts(), ["The deploy is running.", "The deploy is done.", "All checks pass.", "One more thing."]);
   } finally {
     await host.harness.lifecycle.dispose();
   }
