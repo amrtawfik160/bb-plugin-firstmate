@@ -12002,7 +12002,9 @@ export default async function plugin(bb: BbPluginApi) {
       }
       const params = row.source === "telegram" ? telegramReplyParameters({ chatId: row.chatId, messageId: row.messageId, threadId: row.topicId }) : null;
       const sentLine = (cardRepeat
-        ? `Not sent to Telegram: it only repeats the card you sent this turn, and that card answers ${used}. It is closed.`
+        ? more === true
+          ? `Not sent to Telegram: it only repeats the card you sent this turn. ${used} stays open (more=true).`
+          : `Not sent to Telegram: it only repeats the card you sent this turn, and that card answers ${used}. It is closed.`
         : params
           ? `Replied to ${used} via ${channel} with reply_parameters ${JSON.stringify(params.reply_parameters)}.`
           : `Replied to ${used}.`) + coverNote(covered);
@@ -12938,9 +12940,9 @@ export default async function plugin(bb: BbPluginApi) {
         const records = new Map([...deliveries.list({ owner: threadId, limit: 100 }), ...deliveries.mergedSince(threadId, from)].map((r) => [r.id, r]));
         const input: BoardInput = { asks: ownerAsks.listOpen(threadId), calls: snapshot.rpc.ownerCalls, tasks: ownerTasks.list(threadId, { includeClosed: true }), records: [...records.values()], programs: programs.list(threadId), since: from, now };
         if (command === "board") {
-          // The running crews per project, for the connector's board in each project topic; with none it counts its own.
-          const projects = workingByProject(input.tasks, snapshot.rpc.running.map((crew) => crew.id));
-          return { text: formatBoard(input), away: snapshot.rpc.afk, ...(projects.length > 0 ? { projects } : {}) };
+          // The running crews per project, for the connector's board in each project topic. Always sent:
+          // an empty list means no crew runs, and the connector shows 0 instead of counting task lines.
+          return { text: formatBoard(input), away: snapshot.rpc.afk, projects: workingByProject(input.tasks, snapshot.rpc.running.map((crew) => crew.id)) };
         }
         const memoryKey = `${DIGEST_MEMORY_PREFIX}${threadId}`;
         const digest = digestOnce(input, digestMemorySchema.safeParse(await bb.storage.kv.get(memoryKey)).data ?? EMPTY_DIGEST_MEMORY);
