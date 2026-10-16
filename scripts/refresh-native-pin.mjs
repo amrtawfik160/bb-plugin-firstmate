@@ -1,7 +1,7 @@
 // Reproducibly vendor audited Git objects. This never checks out or edits native.
 import { readFileSync,writeFileSync,readdirSync,mkdirSync } from 'node:fs';
 import { join,dirname } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync,spawnSync } from 'node:child_process';
 const [native,sha]=process.argv.slice(2);
 if (!native || !/^[a-f0-9]{40}$/.test(sha ?? '')) throw new Error('Usage: node scripts/refresh-native-pin.mjs <native clone> <audited SHA>');
 const git=(...args)=>execFileSync('git',['-C',native,...args],{ encoding:'utf8' });
@@ -9,11 +9,18 @@ const old=readFileSync('overlay/patch-base.txt','utf8').trim();
 function markdownFiles(root) {
   return readdirSync(root,{withFileTypes:true}).flatMap(entry=>entry.isDirectory() ? markdownFiles(join(root,entry.name)) : entry.name.endsWith('.md') ? [join(root,entry.name)] : []);
 }
-for (const file of markdownFiles('skills')) {
+const sourced=[...markdownFiles('skills'),...markdownFiles('entry-skills')].flatMap(file=>{
   const original=readFileSync(file,'utf8');
   const header=/<!-- BB-SOURCE\s+([\s\S]*?)-->/.exec(original);
-  if (!header) continue;
-  const source=/native:\s*(\S+)/.exec(header[1])[1];
+  return header ? [{ file,original,header,source:/native:\s*(\S+)/.exec(header[1])[1] }] : [];
+});
+const gone=sourced.filter(({ source })=>spawnSync('git',['-C',native,'cat-file','-e',`${sha}:${source}`]).status !== 0);
+if (gone.length > 0) {
+  for (const { file,source } of gone) console.log(`NATIVE_SOURCE_GONE: ${file} copies ${source}, which ${sha.slice(0,8)} does not have`);
+  console.log(`PIN REFUSED: ${sha} removed native files that BB skills copy. Nothing was written.`);
+  process.exit(1);
+}
+for (const { file,original,header,source } of sourced) {
   const snapshot=/snapshot:\s*(\S+)/.exec(header[1])[1];
   const next=snapshot.replace(old.slice(0,8),sha.slice(0,8));
   const text=git('show',`${sha}:${source}`);
@@ -40,4 +47,13 @@ const manifest=readFileSync('lib/upstream-surface.ts','utf8');
 const skills=JSON.parse(/UPSTREAM_SKILL_NAMES = (\[.*?\]) as const/.exec(manifest)[1]);
 writeFileSync('lib/upstream-surface.ts',`// Generated from kunchenguid/firstmate at ${sha} plus the BB backend adapter.\nexport const UPSTREAM_FIRSTMATE_SHA = ${JSON.stringify(sha)};\nexport const UPSTREAM_SCRIPT_NAMES = ${JSON.stringify(callable.sort())} as const;\nexport const UPSTREAM_SKILL_NAMES = ${JSON.stringify(skills)} as const;\nexport const PINNED_SCRIPT_SUPPORT_FILES = ${JSON.stringify([...new Set([...support,'backends/bb.sh'])].sort())} as const;\n`);
 writeFileSync('overlay/patch-base.txt',sha+'\n');
-console.log(`Vendored ${sha}. Run fidelity, strict overlay install and backend source proof before accepting this pin.`);
+const readme=readFileSync('native-snapshot/README.md','utf8');
+writeFileSync('native-snapshot/README.md',readme.replace(/Current snapshot: `[0-9a-f]{40}`/,`Current snapshot: \`${sha}\``));
+// The re-pin guard: owner rules intact, and native copies differ from the new pin only inside BB markers.
+const guards=[['scripts/owner-layer-check.mjs'],['--experimental-strip-types','scripts/skill-fidelity.ts']].map(args=>spawnSync(process.execPath,args,{ encoding:'utf8' }));
+for (const g of guards) { process.stdout.write(g.stdout); process.stderr.write(g.stderr); }
+if (guards.some(g=>g.status !== 0)) {
+  console.log(`PIN REFUSED: ${sha} drops or changes an owner rule or a BB divergence anchor. Fix the listed files, or discard this re-pin with git checkout and git clean.`);
+  process.exit(1);
+}
+console.log(`Vendored ${sha}. Run strict overlay install and backend source proof before accepting this pin.`);

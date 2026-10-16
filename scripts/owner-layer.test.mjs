@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync, execFileSync } from "node:child_process";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -26,15 +26,20 @@ function check(root, ...args) {
 
 const edit = (root, rel, fn) => writeFileSync(join(root, rel), fn(readFileSync(join(root, rel), "utf8")));
 
+test("the snapshot README names the current pin", () => {
+  assert.match(readFileSync(join(ROOT, "native-snapshot/README.md"), "utf8"), new RegExp(`Current snapshot: \`${PIN}\``));
+});
+
 test("every owner rule is present where the owner layer applies it", () => {
   const r = check(ROOT);
   assert.equal(r.status, 0, r.stdout + r.stderr);
   assert.match(r.stdout, new RegExp(`owner layer ok: ${PLUGIN_RULES.length} plugin rules`));
 });
 
-test("the owner map names every registered rule", () => {
-  const map = readFileSync(join(ROOT, "owner/README.md"), "utf8");
-  for (const rule of RULES) assert.ok(map.includes(`\`${rule.id}\``), `owner/README.md lacks ${rule.id}`);
+test("the owner map lists every registered rule with its old and new place", () => {
+  const r = check(ROOT, "--map");
+  assert.equal(r.status, 0, r.stderr);
+  for (const rule of RULES) assert.ok(r.stdout.includes(`| \`${rule.id}\` | ${rule.rule} | \`${rule.old}\` | \`${rule.file}\` |`), rule.id);
 });
 
 test("a dropped or reworded owner rule fails the check and names the rule", () => {
@@ -82,11 +87,24 @@ test("the host check reads host files only when asked and reports a missing rule
   }
 });
 
-// A native repo built from the vendored snapshot: the same files at a new commit.
+// Copies each snapshot to its BB-SOURCE native path: some snapshots sit at a
+// different path than native (skills/ahoy vs .agents/skills/ahoy).
+function bbSources(root, dir) {
+  return readdirSync(join(root, dir), { withFileTypes: true }).flatMap((entry) => {
+    const rel = join(dir, entry.name);
+    if (entry.isDirectory()) return bbSources(root, rel);
+    if (!entry.name.endsWith(".md")) return [];
+    const header = /<!-- BB-SOURCE\s+([\s\S]*?)-->/.exec(readFileSync(join(root, rel), "utf8"));
+    return header ? [{ native: /native:\s*(\S+)/.exec(header[1])[1], snapshot: /snapshot:\s*(\S+)/.exec(header[1])[1] }] : [];
+  });
+}
+
 function syntheticNative(mutate) {
   const native = mkdtempSync(join(tmpdir(), "owner-native-"));
-  cpSync(join(ROOT, "native-snapshot", PIN.slice(0, 8)), native, { recursive: true });
-  rmSync(join(native, "AGENTS.section-9.md"), { force: true });
+  for (const { native: path, snapshot } of [...bbSources(ROOT, "skills"), ...bbSources(ROOT, "entry-skills")]) {
+    mkdirSync(dirname(join(native, path)), { recursive: true });
+    cpSync(join(ROOT, snapshot), join(native, path));
+  }
   mkdirSync(join(native, "bin"), { recursive: true });
   writeFileSync(join(native, "bin/fm-example.sh"), "#!/bin/sh\n");
   mutate?.(native);
@@ -115,6 +133,7 @@ test("a re-pin keeps every owner rule and every adapted skill on the new pin", (
     }
     assert.match(readFileSync(join(root, "entry-skills/captain/SKILL.md"), "utf8"), new RegExp(`sha: ${sha}`));
     assert.equal(readFileSync(join(root, "native-snapshot", sha.slice(0, 8), "AGENTS.md"), "utf8"), readFileSync(join(native, "AGENTS.md"), "utf8"));
+    assert.match(readFileSync(join(root, "native-snapshot/README.md"), "utf8"), new RegExp(`Current snapshot: \`${sha}\``));
   } finally {
     rmSync(root, { recursive: true, force: true });
     rmSync(native, { recursive: true, force: true });
@@ -134,6 +153,22 @@ test("a re-pin fails when the new native drops a sentence an owner divergence qu
     assert.equal(r.status, 1, r.stdout + r.stderr);
     assert.match(r.stdout + r.stderr, /PIN REFUSED/);
     assert.match(r.stderr, /entry-skills\/captain\/SKILL\.md.*native-quote/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(native, { recursive: true, force: true });
+  }
+});
+
+test("a re-pin refuses before writing when the new native removes a file a BB skill copies", () => {
+  const root = copyRepo();
+  const { native, sha } = syntheticNative((dir) => rmSync(join(dir, ".agents/skills/ship-landing/SKILL.md")));
+  try {
+    const before = readFileSync(join(root, "lib/upstream-surface.ts"), "utf8");
+    const r = repin(root, native, sha);
+    assert.equal(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stdout, /NATIVE_SOURCE_GONE: skills\/ship-landing\/SKILL\.md copies \.agents\/skills\/ship-landing\/SKILL\.md/);
+    assert.match(r.stdout, /PIN REFUSED: .* Nothing was written\./);
+    assert.equal(readFileSync(join(root, "lib/upstream-surface.ts"), "utf8"), before);
   } finally {
     rmSync(root, { recursive: true, force: true });
     rmSync(native, { recursive: true, force: true });

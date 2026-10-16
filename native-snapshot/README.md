@@ -16,7 +16,7 @@ instructions (see [CONTRIBUTING.md](../CONTRIBUTING.md) "Skill fidelity").
   `npm run fidelity -- --native /path/to/firstmate` to prove the snapshot matches
   the live clone.
 
-Current snapshot: `2d833ff147cd26a5c461e914e06854e0eb2707ce`, the audited
+Current snapshot: `1f3e769616fdf9f31f85f4c3e6a9f71606634238`, the audited
 runtime/overlay pin. Every `BB-SOURCE` must use that full SHA; the offline fidelity
 check rejects a skill or overlay pin that differs from `lib/upstream-surface.ts`.
 Older snapshots remain historical fixtures and are never loaded at runtime.
