@@ -50,6 +50,10 @@ A turn that only handled crew wakes, with nothing for the owner, ends with no te
   words of that question from the captain's message, and `more=true` on every reply except the last.
 - Forwarded messages or a burst on one request: send one reply to the oldest with `covers` set to
   the refs of the others. They close with no message of their own; never send "Included." replies.
+- Each file of a forwarded batch reaches you as its own message. Its `telegram_batch_ids` header
+  lists every message of the batch, files too. Answer the batch once, to the oldest, with `covers`.
+- Pass `project` (as on the board, such as Safi) on `firstmate_reply` and `firstmate_ask` when the
+  answer or the card is about one project. With Telegram topics on, it lands in that project's topic.
 - Keep each reply short and self-contained. Lead with the answer.
 
 ## Questions and blockers for the captain

@@ -49,7 +49,7 @@ test("explicit ask RPCs validate the captain and correct answered decisions", as
     assert.equal(asks.get("aexisting")?.resolution, "Publish");
     assert.deepEqual(await host.harness.behavior.callRpc("resolveAsk", { threadId: "thr_cap", id: "aexisting", resolution: "Owner approved the address repair at 12:00 Cairo." }), { ok: true });
     assert.equal(asks.get("aexisting")?.resolution, "Owner approved the address repair at 12:00 Cairo.");
-    assert.deepEqual(await host.harness.behavior.callRpc("telegramCommand", { threadId: "thr_cap", command: "board" }), { text: "📌 Needs you: nothing right now.\n\n✅ Done since you last looked: nothing new.\n\n🔧 In progress: nothing open.", away: false });
+    assert.deepEqual(await host.harness.behavior.callRpc("telegramCommand", { threadId: "thr_cap", command: "board" }), { text: "📌 Needs you: nothing right now.\n\n✅ Done since you last looked: nothing new.\n\n🔧 In progress: nothing open.", away: false, projects: [] }, "no crew runs: zero crews, so Telegram does not count task lines");
 
     const sent = host.harness.sdk.callsTo("plugins.callRpc").map((call) => call[0] as { method: string });
     assert.equal(sent.filter((call) => call.method === "ask").length, 0);
@@ -264,5 +264,35 @@ test("firstmate_reply sends a file from the captain's workspace, which the conne
   } finally {
     rmSync(workspace, { recursive: true, force: true });
     await host.harness.lifecycle.dispose();
+  }
+});
+
+test("16 Oct project topics: a card and a reply carry the project the captain names, so Telegram puts them in its topic", async () => {
+  const { host, call, rpc } = await agentNativeCase();
+  try {
+    const card = await call("firstmate_ask", { ...AGENT_NATIVE_CARD, project: "Cyndra" });
+    assert.equal(failed(card), false, textOf(card));
+    assert.equal(rpc().find((c) => c.method === "ask")!.input.project, "Cyndra");
+    const reply = await call("firstmate_reply", { ref: AGENT_NATIVE_REF, text: "agent-native: skip adoption, copy a few ideas.", project: "Cyndra" });
+    assert.equal(failed(reply), false, textOf(reply));
+    assert.equal(rpc().find((c) => c.method === "reply")!.input.project, "Cyndra");
+    const plain = await call("firstmate_ask", { ...AGENT_NATIVE_CARD, question: "Another question with no project?" });
+    assert.equal(failed(plain), false, textOf(plain));
+    assert.equal("project" in rpc().filter((c) => c.method === "ask").at(-1)!.input, false, "no project: the connector asks Decisions");
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("16 Oct project topics: a reply held back as a card repeat says what really happened, with more=true too", async () => {
+  for (const more of [false, true]) {
+    const { host, call } = await agentNativeCase();
+    try {
+      host.harness.sdk.stub("plugins.callRpc", async (args: { method: string }) => (args.method === "reply" ? { queued: 0, duplicate: false, mode: "on", cardRepeat: true } : { ok: true, queued: 1, duplicate: false, mode: "on" }));
+      const reply = await call("firstmate_reply", { ref: AGENT_NATIVE_REF, text: "I sent a card about it.", ...(more ? { more: true } : {}) });
+      assert.equal(failed(reply), false, textOf(reply));
+      const open = createInboundLedger(host.bb.storage.database()).listPending("thr_cap").some((row) => `tg:${row.chatId}:${row.messageId}` === AGENT_NATIVE_REF);
+      assert.equal(open, more, more ? "more=true keeps the message open" : "the card answers it");
+      assert.match(textOf(reply), more ? new RegExp(`${AGENT_NATIVE_REF} stays open \\(more=true\\)`) : new RegExp(`answers ${AGENT_NATIVE_REF}\\. It is closed\\.`));
+      assert.doesNotMatch(textOf(reply), more ? /It is closed/ : /stays open/);
+    } finally { await host.harness.lifecycle.dispose(); }
   }
 });

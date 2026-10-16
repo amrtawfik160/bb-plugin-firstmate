@@ -73,7 +73,7 @@ import { honestIdleVerdictPresentation, interruptIsStopped, readyClaim } from ".
 import { ACK_TEXT, ackEligible, createInboundLedger, expandTelegramRows, followUpReplyKind, formatOwnerInbox, handBackText, hashText, inboundKey, quotedReplyKind, sweeperSteerText, type InboundKey, type InboundRow, type OutboxKind } from "./lib/inbound-ledger.ts";
 import { inboundHookDecision } from "./lib/inbound-dispatch.ts";
 import { formatWorkersForTelegram } from "./lib/telegram-commands.ts";
-import { digestOnce, EMPTY_DIGEST_MEMORY, formatBoard, type BoardInput, type DigestMemory } from "./lib/owner-board.ts";
+import { digestOnce, EMPTY_DIGEST_MEMORY, formatBoard, workingByProject, type BoardInput, type DigestMemory } from "./lib/owner-board.ts";
 import { createOwnerTasks, isOpenTask, sameProject, stateFromPrs, taskLine, type CrewFinish, type OwnerTask, type TaskState } from "./lib/owner-tasks.ts";
 import {
   buildProgram, createPrograms, isOpenProgram, isOpenTicket, newlyReady, numberOf, programCounts, programText, readyRefs, readyWakeText, repoOf,
@@ -11766,8 +11766,9 @@ export default async function plugin(bb: BbPluginApi) {
       defaultAfterMinutes: z.number().min(5).max(10080).optional().describe("Proceed with the recommended option after this many minutes without an answer (reversible asks only)"),
       irreversible: z.boolean().optional().describe("A gated action (production deploy, money, deleting data, customer messages): never proceeds without an answer"),
       startsNewWork: z.boolean().optional().describe("true when an option starts new work: a build, a new crew, a new ticket. The card then waits for the owner's answer"),
+      project: z.string().min(1).max(80).optional().describe("The project this card is about, as on the board (such as Safi). With Telegram topics on, the card goes to that project's topic"),
     }),
-    async execute({ impact, question, kind, options, recommended, defaultAfterMinutes, irreversible, startsNewWork }, ctx) {
+    async execute({ impact, question, kind, options, recommended, defaultAfterMinutes, irreversible, startsNewWork, project }, ctx) {
       const captain = ctxString(ctx, "threadId");
       if (!captain) return toolError("firstmate_ask runs only in a captain thread.");
       const choices = (options ?? []).map((option, index) => ({ label: option.label, value: option.value ?? String.fromCharCode(65 + index) }));
@@ -11801,6 +11802,8 @@ export default async function plugin(bb: BbPluginApi) {
             askId: ask.id, text: formatAskCard(ask), options: ask.options, ...(ask.recommended !== null ? { recommended: ask.recommended } : {}),
             // The connector folds reversible cards sent within a minute into one message with "Accept all recommended".
             card: { kind: ask.kind, question: ask.text, ...(ask.impact ? { impact: ask.impact } : {}), defaultAt: ask.defaultAt, gated },
+            // With Telegram topics on the card goes to its project's topic; without it the connector asks Decisions.
+            ...(project?.trim() ? { project: project.trim() } : {}),
           },
           outputSchema: z.object({ queued: z.number(), duplicate: z.boolean() }),
         }));
@@ -11854,8 +11857,9 @@ export default async function plugin(bb: BbPluginApi) {
       more: z.boolean().optional(),
       files: z.array(z.string().startsWith("/")).max(10).optional().describe("Absolute paths of files to attach, such as a crew's report.md. Telegram sends any file from the captain's workspace or /tmp, only documents and images from a BB worktree, and never hidden files or secrets"),
       covers: z.array(z.string().min(1)).max(50).optional().describe("Refs of other open owner messages this reply also answers; each closes with no Telegram message"),
+      project: z.string().min(1).max(80).optional().describe("The project this answer is about, as on the board (such as Safi). With Telegram topics on, the answer goes to that project's topic"),
     }),
-    async execute({ ref, text: words, quote, more, files, covers }, ctx) {
+    async execute({ ref, text: words, quote, more, files, covers, project }, ctx) {
       const flags = await reliabilityFlags();
       if (flags.inboundLedger === "off") return toolError("Inbound ledger is off.");
       const captain = ctxString(ctx, "threadId");
@@ -11944,16 +11948,18 @@ export default async function plugin(bb: BbPluginApi) {
       const stayOpen = [used, ...covered.map(refOf)].join(", ");
       let channel: "rpc" | "envelope" = "envelope";
       let undelivered: string | null = null;
+      let cardRepeat = false;
       try {
         if (row.source === "telegram") {
           const sent = await sendTelegramReply({
             payload: {
               chatId: row.chatId, messageId: row.messageId, kind: "reply", text: stripTelegramEnvelope(text), threadId: row.topicId,
-              correlation: correlationOf(row), ...(quote ? { quote } : {}),
+              correlation: correlationOf(row), ...(quote ? { quote } : {}), ...(project?.trim() ? { project: project.trim() } : {}),
             },
             callRpc: flags.telegramThreading === "on" ? (args) => bb.sdk.plugins.callRpc(args) : null,
           });
           channel = sent.channel;
+          cardRepeat = sent.cardRepeat === true;
           await noteTelegramThreading(sent.mode).catch((error) => bb.log.warn(`telegram threading state: ${String(error)}`));
           if (sent.outcome !== "delivered") {
             undelivered = flags.telegramThreading === "on"
@@ -11995,9 +12001,13 @@ export default async function plugin(bb: BbPluginApi) {
         return toolError(`Reply to ${used} was delivered, but recording it failed; ${stayOpen} ${covered.length === 0 ? "stays" : "stay"} open. Repeat the same call to close ${covered.length === 0 ? "it" : "them"}: it sends nothing again. ${error instanceof Error ? error.message : String(error)}`);
       }
       const params = row.source === "telegram" ? telegramReplyParameters({ chatId: row.chatId, messageId: row.messageId, threadId: row.topicId }) : null;
-      const sentLine = (params
-        ? `Replied to ${used} via ${channel} with reply_parameters ${JSON.stringify(params.reply_parameters)}.`
-        : `Replied to ${used}.`) + coverNote(covered);
+      const sentLine = (cardRepeat
+        ? more === true
+          ? `Not sent to Telegram: it only repeats the card you sent this turn. ${used} stays open (more=true).`
+          : `Not sent to Telegram: it only repeats the card you sent this turn, and that card answers ${used}. It is closed.`
+        : params
+          ? `Replied to ${used} via ${channel} with reply_parameters ${JSON.stringify(params.reply_parameters)}.`
+          : `Replied to ${used}.`) + coverNote(covered);
       const taskNote = ownerTasks.openByRef(captain, used).map((task) => `\nTask ${task.id} stays open (${task.state}): a reply does not close it. Close it with firstmate_task when it is done or dropped.`).join("");
       const stillOpen = inboundLedger.listPending(captain);
       return (stillOpen.length === 0 ? `${sentLine} No owner message is waiting.` : `${sentLine}\n${formatOwnerInbox(stillOpen, Date.now())}`) + taskNote;
@@ -12929,7 +12939,11 @@ export default async function plugin(bb: BbPluginApi) {
         reconcileTasks(threadId, now);
         const records = new Map([...deliveries.list({ owner: threadId, limit: 100 }), ...deliveries.mergedSince(threadId, from)].map((r) => [r.id, r]));
         const input: BoardInput = { asks: ownerAsks.listOpen(threadId), calls: snapshot.rpc.ownerCalls, tasks: ownerTasks.list(threadId, { includeClosed: true }), records: [...records.values()], programs: programs.list(threadId), since: from, now };
-        if (command === "board") return { text: formatBoard(input), away: snapshot.rpc.afk };
+        if (command === "board") {
+          // The running crews per project, for the connector's board in each project topic. Always sent:
+          // an empty list means no crew runs, and the connector shows 0 instead of counting task lines.
+          return { text: formatBoard(input), away: snapshot.rpc.afk, projects: workingByProject(input.tasks, snapshot.rpc.running.map((crew) => crew.id)) };
+        }
         const memoryKey = `${DIGEST_MEMORY_PREFIX}${threadId}`;
         const digest = digestOnce(input, digestMemorySchema.safeParse(await bb.storage.kv.get(memoryKey)).data ?? EMPTY_DIGEST_MEMORY);
         await bb.storage.kv.set(memoryKey, digest.memory);

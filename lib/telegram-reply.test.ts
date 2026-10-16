@@ -107,3 +107,12 @@ test("telegram.reply returns queued 0 for an unbound chat or empty text, which i
   await assert.rejects(sendTelegramReply({ payload: { ...replyPayload, text: "" }, callRpc: async () => ({ queued: 0, duplicate: false, mode: "on" }) }), /not queued/);
   await assert.rejects(sendTelegramReply({ payload: replyPayload, callRpc: async () => ({ queued: 0, duplicate: false, mode: "off" }) }), /not queued/);
 });
+
+test("a reply the connector held back as a repeat of its turn's card counts as answered by the card", async () => {
+  const result = await sendTelegramReply({
+    payload: { chatId: "200", messageId: "900", kind: "reply", text: "Decision needed: when should the fleet update? I sent a card." },
+    callRpc: async () => ({ queued: 0, duplicate: false, mode: "on", cardRepeat: true }),
+  });
+  assert.equal(result.outcome, "delivered");
+  assert.equal(result.cardRepeat, true);
+});
