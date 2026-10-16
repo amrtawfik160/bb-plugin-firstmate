@@ -347,3 +347,14 @@ test("a closed program leaves the board and the digest", () => {
   assert.doesNotMatch(formatBoard(input({ programs: [closed] })), /P1/);
   assert.equal(formatDigest(input({ programs: [closed] })), "");
 });
+
+test("crews working per project count the distinct running crews, not the task rows", async () => {
+  const { workingByProject } = await import("./owner-board.ts");
+  const task = (id: string, project: string | null, state: OwnerTask["state"], crewIds: string[]): OwnerTask => ({ id, captain: "thr_cap", project, title: id, sourceRefs: [], state, prs: [], crewIds, backfilled: false, createdAt: 0, updatedAt: 0 });
+  const tasks = [task("T1", "Safi", "working", ["a", "b", "c"]), task("T2", "Safi", "working", ["c"]), task("T3", "Cyndra", "working", ["d"]), task("T4", "Areliaa", "done", ["e"])];
+  // Independent check of 16 Oct: one working Safi task with three crews is three crews, not one.
+  assert.deepEqual(workingByProject(tasks, ["a", "b", "c"]), [{ name: "Safi", working: 3 }]);
+  assert.deepEqual(workingByProject(tasks, ["a", "c", "d"]), [{ name: "Safi", working: 2 }, { name: "Cyndra", working: 1 }], "a crew is counted once");
+  assert.deepEqual(workingByProject(tasks, []), [], "a working task with no running crew counts none");
+  assert.deepEqual(workingByProject(tasks, ["e", "z"]), [], "a crew of a closed task, or of no task, is not placed in a project");
+});
