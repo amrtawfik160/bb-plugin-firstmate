@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync, execFileSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -69,6 +69,22 @@ const file = edit.file.replace(/^~\\//, process.env.HOME + "/");
 const text = existsSync(file) ? readFileSync(file, "utf8") : "";
 if (edit.from !== undefined && !text.includes(edit.from)) { console.error("bad writer: text not found"); process.exit(9); }
 writeFileSync(file, edit.from === undefined ? text + edit.to : text.replace(edit.from, edit.to));
+`);
+  return path;
+}
+
+// A writer that vendors the pin, then runs \`code\` with fs, path, root and home in scope.
+function codeWriter(dir, code) {
+  const path = join(dir, "code-writer.mjs");
+  writeFileSync(path, `
+import { spawnSync } from "node:child_process";
+import * as fs from "node:fs";
+import * as path from "node:path";
+const r = spawnSync(process.execPath, ["scripts/vendor-native-pin.mjs", ...process.argv.slice(2)], { stdio: "inherit" });
+if (r.status !== 0) process.exit(r.status);
+const root = process.cwd();
+const home = process.env.HOME;
+${code}
 `);
   return path;
 }
@@ -184,4 +200,64 @@ test("a re-pin refuses before writing when the new native removes a file a BB sk
     assert.match(r.stdout, /PIN REFUSED: .* Nothing was written\./);
     assert.equal(readFileSync(join(root, "lib/upstream-surface.ts"), "utf8"), before);
   }, (dir) => rmSync(join(dir, ".agents/skills/ship-landing/SKILL.md")));
+});
+
+const CREW_RULES = "owner/crew-rules.ts";
+
+function assertRestored(root, files) {
+  for (const [rel, bytes] of Object.entries(files)) {
+    assert.ok(!lstatSync(join(root, rel)).isSymbolicLink(), `${rel} is still a link`);
+    assert.ok(lstatSync(join(root, rel)).isFile(), `${rel} is not a regular file`);
+    assert.equal(readFileSync(join(root, rel), "utf8"), bytes, `${rel} restored`);
+  }
+}
+
+const ownerFiles = (root) => Object.fromEntries(readdirSync(join(root, "owner")).map((name) => [`owner/${name}`, readFileSync(join(root, "owner", name), "utf8")]));
+
+const LINK_ATTACKS = [
+  ["a link to a file with the same bytes", `fs.writeFileSync(path.join(home, "copy.ts"), fs.readFileSync("${CREW_RULES}")); fs.rmSync("${CREW_RULES}"); fs.symlinkSync(path.join(home, "copy.ts"), "${CREW_RULES}");`],
+  ["a link to a host file", `fs.rmSync("${CREW_RULES}"); fs.symlinkSync(path.join(home, ".claude/CLAUDE.md"), "${CREW_RULES}");`],
+  ["a dangling link", `fs.rmSync("${CREW_RULES}"); fs.symlinkSync(path.join(home, "missing.ts"), "${CREW_RULES}");`],
+  ["the owner folder replaced by a link to the home", `fs.rmSync("owner", { recursive: true }); fs.symlinkSync(home, "owner");`],
+  ["the owner folder renamed", `fs.renameSync("owner", "renamed-owner");`],
+  ["the owner folder deleted", `fs.rmSync("owner", { recursive: true });`],
+];
+
+for (const [name, code] of LINK_ATTACKS) {
+  test(`a re-pin with ${name} is refused and every owner file restored as a regular file`, () => {
+    withRepin(({ root, home, native, sha }) => {
+      const owner = ownerFiles(root);
+      const host = readFileSync(join(home, ".claude/CLAUDE.md"), "utf8");
+      const r = repin(root, native, sha, { home, writer: codeWriter(home, code) });
+      assert.equal(r.status, 1, r.stdout + r.stderr);
+      assert.match(r.stdout, /OWNER_BYTES_CHANGED: owner/);
+      assert.match(r.stdout, /PIN REFUSED: .*restored and checked/);
+      assert.doesNotMatch(r.stdout + r.stderr, /RESTORE FAILED|ENOENT|EISDIR/);
+      assertRestored(root, owner);
+      assert.ok(!existsSync(join(root, "renamed-owner")), "renamed folder removed");
+      assert.equal(readFileSync(join(home, ".claude/CLAUDE.md"), "utf8"), host, "host file untouched by restore");
+    });
+  });
+}
+
+test("a re-pin that changes an owner script's mode is refused and the mode restored", () => {
+  withRepin(({ root, home, native, sha }) => {
+    const script = "scripts/skill-roots-check.sh";
+    const mode = statSync(join(root, script)).mode;
+    const r = repin(root, native, sha, { home, writer: codeWriter(home, `fs.chmodSync("${script}", 0o644);`) });
+    assert.equal(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stdout, /OWNER_BYTES_CHANGED: scripts\/skill-roots-check\.sh/);
+    assert.equal(statSync(join(root, script)).mode, mode);
+  });
+});
+
+test("a native file entry protects only that exact path, not a sibling with the same prefix", () => {
+  withRepin(({ root, home, native, sha }) => {
+    const sibling = "lib/upstream-surface.ts.owner.md";
+    writeFileSync(join(root, sibling), "owner policy\n");
+    const r = repin(root, native, sha, { home, writer: codeWriter(home, `fs.writeFileSync("${sibling}", "changed\\n");`) });
+    assert.equal(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stdout, /OWNER_BYTES_CHANGED: lib\/upstream-surface\.ts\.owner\.md/);
+    assert.equal(readFileSync(join(root, sibling), "utf8"), "owner policy\n");
+  });
 });
