@@ -1,7 +1,8 @@
-export const HANDOFF_UPSTREAM_COMMIT = "1f3e769616fdf9f31f85f4c3e6a9f71606634238";
+// Owner layer: captain behaviour fixes on top of native intake (owner decision Q5).
+import { UPSTREAM_FIRSTMATE_SHA } from "../lib/upstream-surface.ts";
 
 export const HANDOFF_FAST_PATH = [
-  "BB-DIVERGE intake fast path (upstream firstmate@" + HANDOFF_UPSTREAM_COMMIT.slice(0, 8) + " AGENTS.md intake/consult-first).",
+  "BB-DIVERGE intake fast path (upstream firstmate@" + UPSTREAM_FIRSTMATE_SHA.slice(0, 8) + " AGENTS.md intake/consult-first).",
   "For each new user message: answer in 2 sentences from what you already know, or call firstmate_dispatch now with the user's words as the task and its source ref.",
   "Do not read reports, project files, or drain wakes before that answer or dispatch. The crew does intake research.",
   "Never end a turn while a user message from this turn lacks a reply or a dispatch. One reply or dispatch per user message.",
