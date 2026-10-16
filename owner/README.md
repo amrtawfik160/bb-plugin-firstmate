@@ -7,7 +7,8 @@ clean copy below it.
 
 ## Ownership
 
-[`ownership.json`](ownership.json) puts every file in one of three groups.
+[`ownership.json`](ownership.json) puts every file in one of three groups. A
+path that ends in `/` covers that folder; any other path covers that file only.
 
 - **Native-owned:** `native-snapshot/`, `runtime-assets/`, `third-party/`,
   `lib/upstream-surface.ts`, `overlay/patch-base.txt`, and every skill copy
@@ -38,8 +39,11 @@ skills only from that folder. The Claude, Codex and agents skill roots link to
 owner-owned byte and each host file, then runs the writer
 (`scripts/vendor-native-pin.mjs`). It prints `PIN REFUSED` and exits 1 when:
 
-1. an owner-owned file or an owner region changed, was added or was deleted
-   (`OWNER_BYTES_CHANGED`). The file is restored.
+1. an owner-owned entry or an owner region changed, was added or was deleted
+   (`OWNER_BYTES_CHANGED`). An entry is its type, mode, bytes or link target;
+   links are never followed. The entry is restored, missing folders are
+   recreated, and a final check prints `RESTORE FAILED` for any entry it could
+   not restore.
 2. a host file changed (`HOST_FILE_CHANGED`). The file is restored. Set
    `FM_HOME` to the captain home so `data/captain.md` is included.
 3. a native copy differs from the pinned commit (`NATIVE_COPY_DIFFERS`).
