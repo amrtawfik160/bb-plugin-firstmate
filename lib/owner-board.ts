@@ -161,12 +161,17 @@ function fit(sections: readonly Section[], max: number, length: (text: string) =
 /** The pinned Telegram board: what needs the owner, what finished since `since`, what is still running. */
 /**
  * The crews working on each project, for the Telegram connector's pinned board in each project topic:
- * the working tasks per project, in the order the projects first appear. A task with no project is
- * not counted.
+ * each distinct crew that is running now (`runningCrewIds`, from the current crew records) counts once,
+ * in the project of the open task that lists it. A crew of no open task is not placed in a project; a
+ * working task with no running crew counts none. Projects come in the order their first crew appears.
  */
-export function workingByProject(tasks: BoardInput["tasks"]): Array<{ name: string; working: number }> {
+export function workingByProject(tasks: BoardInput["tasks"], runningCrewIds: readonly string[]): Array<{ name: string; working: number }> {
+  const open = tasks.filter((task) => isOpenTask(task) && task.project);
   const counts = new Map<string, number>();
-  for (const task of tasks) if (task.state === "working" && task.project) counts.set(task.project, (counts.get(task.project) ?? 0) + 1);
+  for (const crew of new Set(runningCrewIds)) {
+    const project = open.find((task) => task.crewIds.includes(crew))?.project;
+    if (project) counts.set(project, (counts.get(project) ?? 0) + 1);
+  }
   return [...counts].map(([name, working]) => ({ name, working }));
 }
 

@@ -12934,8 +12934,8 @@ export default async function plugin(bb: BbPluginApi) {
         const records = new Map([...deliveries.list({ owner: threadId, limit: 100 }), ...deliveries.mergedSince(threadId, from)].map((r) => [r.id, r]));
         const input: BoardInput = { asks: ownerAsks.listOpen(threadId), calls: snapshot.rpc.ownerCalls, tasks: ownerTasks.list(threadId, { includeClosed: true }), records: [...records.values()], programs: programs.list(threadId), since: from, now };
         if (command === "board") {
-          // The crews per project, for the connector's board in each project topic; with none it counts its own.
-          const projects = workingByProject(input.tasks);
+          // The running crews per project, for the connector's board in each project topic; with none it counts its own.
+          const projects = workingByProject(input.tasks, snapshot.rpc.running.map((crew) => crew.id));
           return { text: formatBoard(input), away: snapshot.rpc.afk, ...(projects.length > 0 ? { projects } : {}) };
         }
         const memoryKey = `${DIGEST_MEMORY_PREFIX}${threadId}`;
