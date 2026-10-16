@@ -1,59 +1,121 @@
-// Reproducibly vendor audited Git objects. This never checks out or edits native.
-import { readFileSync,writeFileSync,readdirSync,mkdirSync } from 'node:fs';
-import { join,dirname } from 'node:path';
-import { execFileSync,spawnSync } from 'node:child_process';
-const [native,sha]=process.argv.slice(2);
-if (!native || !/^[a-f0-9]{40}$/.test(sha ?? '')) throw new Error('Usage: node scripts/refresh-native-pin.mjs <native clone> <audited SHA>');
-const git=(...args)=>execFileSync('git',['-C',native,...args],{ encoding:'utf8' });
-const old=readFileSync('overlay/patch-base.txt','utf8').trim();
-function markdownFiles(root) {
-  return readdirSync(root,{withFileTypes:true}).flatMap(entry=>entry.isDirectory() ? markdownFiles(join(root,entry.name)) : entry.name.endsWith('.md') ? [join(root,entry.name)] : []);
+#!/usr/bin/env node
+// Guarded re-pin: node scripts/refresh-native-pin.mjs <native clone> <audited SHA>
+//
+// owner/ownership.json splits every file into native-owned and owner-owned.
+// The writer (scripts/vendor-native-pin.mjs) may change only native files and
+// the native regions of mixed files. This guard records every owner byte and
+// every host file before the writer runs, and refuses the pin (PIN REFUSED,
+// exit 1) when any of them changed: it restores them and names each one. It
+// then refuses when a native copy differs from the pin, or when skill fidelity
+// finds native text that differs outside a BB marker; those native files stay
+// written so a sync can fix the skills that copy them.
+import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { execFileSync, spawnSync } from "node:child_process";
+
+const [native, sha] = process.argv.slice(2);
+if (!native || !/^[a-f0-9]{40}$/.test(sha ?? "")) throw new Error("Usage: node scripts/refresh-native-pin.mjs <native clone> <audited SHA>");
+const manifest = JSON.parse(readFileSync("owner/ownership.json", "utf8"));
+
+function files(dir = ".") {
+  return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const rel = dir === "." ? entry.name : `${dir}/${entry.name}`;
+    if (manifest.skip.some((skip) => `${rel}/`.startsWith(skip))) return [];
+    return entry.isDirectory() ? files(rel) : [rel];
+  });
 }
-const sourced=[...markdownFiles('skills'),...markdownFiles('entry-skills')].flatMap(file=>{
-  const original=readFileSync(file,'utf8');
-  const header=/<!-- BB-SOURCE\s+([\s\S]*?)-->/.exec(original);
-  return header ? [{ file,original,header,source:/native:\s*(\S+)/.exec(header[1])[1] }] : [];
-});
-const gone=sourced.filter(({ source })=>spawnSync('git',['-C',native,'cat-file','-e',`${sha}:${source}`]).status !== 0);
-if (gone.length > 0) {
-  for (const { file,source } of gone) console.log(`NATIVE_SOURCE_GONE: ${file} copies ${source}, which ${sha.slice(0,8)} does not have`);
-  console.log(`PIN REFUSED: ${sha} removed native files that BB skills copy. Nothing was written.`);
-  process.exit(1);
+
+const header = (text) => /<!-- BB-SOURCE\s+([\s\S]*?)-->/.exec(text);
+const isSkillDoc = (rel) => /^(?:entry-skills|skills)\/.*\.md$/.test(rel);
+
+function kind(rel, text) {
+  if (manifest.native.paths.some((path) => rel === path || rel.startsWith(path))) return "native";
+  const source = isSkillDoc(rel) ? header(text) : null;
+  if (source === null) return "owner";
+  return /fidelity:\s*verbatim/.test(source[1]) ? "native" : "mixed";
 }
-for (const { file,original,header,source } of sourced) {
-  const snapshot=/snapshot:\s*(\S+)/.exec(header[1])[1];
-  const next=snapshot.replace(old.slice(0,8),sha.slice(0,8));
-  const text=git('show',`${sha}:${source}`);
-  mkdirSync(dirname(next),{ recursive:true });writeFileSync(next,text);
-  let updated=original.replaceAll(old,sha).replaceAll(`native-snapshot/${old.slice(0,8)}`,`native-snapshot/${sha.slice(0,8)}`);
-  if (old !== sha && /fidelity:\s*verbatim/.test(header[1])) {
-    const marker=/<!-- BB-SOURCE[\s\S]*?-->/.exec(updated)[0];
-    const frontmatter=/^---\n[\s\S]*?\n---\n/.exec(text)?.[0];
-    if (/^---\n/.test(original) && frontmatter) updated=frontmatter+'\n'+marker+'\n'+text.slice(frontmatter.length);
-    else {
-      const body=text.replace(/^---\n[\s\S]*?\n---\n/, '').trimStart();
-      updated=marker+'\n\n'+body;
-    }
+
+// A mixed file with its native regions blanked: the BB-SOURCE header and the
+// native: and native-quote: fields of each BB-DIVERGE comment.
+function ownerView(text) {
+  return text
+    .replace(/<!-- BB-SOURCE[\s\S]*?-->/, "<!-- BB-SOURCE -->")
+    .replace(/<!-- BB-DIVERGE[\s\S]*?-->/g, (block) => block.replace(/(\n\s*native(?:-quote)?:)[\s\S]*?(?=\n\s*[a-z-]+:\s|-->)/g, "$1"));
+}
+
+function hostFiles() {
+  return manifest.host.flatMap((file) => {
+    if (file.startsWith("~/")) return [join(process.env.HOME ?? homedir(), file.slice(2))];
+    if (file.startsWith("$FM_HOME/")) return process.env.FM_HOME ? [join(process.env.FM_HOME, file.slice("$FM_HOME/".length))] : [];
+    return [file];
+  });
+}
+
+function record() {
+  const repo = new Map();
+  for (const rel of files()) {
+    const bytes = readFileSync(rel);
+    repo.set(rel, { bytes, kind: kind(rel, bytes.toString("utf8")) });
   }
-  writeFileSync(file,updated);
+  const host = new Map(hostFiles().map((path) => [path, existsSync(path) ? readFileSync(path) : null]));
+  return { repo, host };
 }
-const agents=git('show',`${sha}:AGENTS.md`);
-const section=agents.slice(agents.indexOf('## 9.'),agents.indexOf('\n## 10.') === -1 ? undefined : agents.indexOf('\n## 10.'));
-writeFileSync(`native-snapshot/${sha.slice(0,8)}/AGENTS.section-9.md`,section);
-const scripts=git('ls-tree','-r','--name-only',sha,'bin').trim().split('\n').map(p=>p.slice(4));
-const callable=scripts.filter(p=>/^fm-[a-z0-9-]+\.sh$/.test(p)).map(p=>p.slice(3,-3));
-const support=scripts.filter(p=>!/^fm-[a-z0-9-]+\.sh$/.test(p));
-const manifest=readFileSync('lib/upstream-surface.ts','utf8');
-const skills=JSON.parse(/UPSTREAM_SKILL_NAMES = (\[.*?\]) as const/.exec(manifest)[1]);
-writeFileSync('lib/upstream-surface.ts',`// Generated from kunchenguid/firstmate at ${sha} plus the BB backend adapter.\nexport const UPSTREAM_FIRSTMATE_SHA = ${JSON.stringify(sha)};\nexport const UPSTREAM_SCRIPT_NAMES = ${JSON.stringify(callable.sort())} as const;\nexport const UPSTREAM_SKILL_NAMES = ${JSON.stringify(skills)} as const;\nexport const PINNED_SCRIPT_SUPPORT_FILES = ${JSON.stringify([...new Set([...support,'backends/bb.sh'])].sort())} as const;\n`);
-writeFileSync('overlay/patch-base.txt',sha+'\n');
-const readme=readFileSync('native-snapshot/README.md','utf8');
-writeFileSync('native-snapshot/README.md',readme.replace(/Current snapshot: `[0-9a-f]{40}`/,`Current snapshot: \`${sha}\``));
-// The re-pin guard: owner rules intact, and native copies differ from the new pin only inside BB markers.
-const guards=[['scripts/owner-layer-check.mjs'],['--experimental-strip-types','scripts/skill-fidelity.ts']].map(args=>spawnSync(process.execPath,args,{ encoding:'utf8' }));
-for (const g of guards) { process.stdout.write(g.stdout); process.stderr.write(g.stderr); }
-if (guards.some(g=>g.status !== 0)) {
-  console.log(`PIN REFUSED: ${sha} drops or changes an owner rule or a BB divergence anchor. Fix the listed files, or discard this re-pin with git checkout and git clean.`);
+
+const before = record();
+const writer = process.env.REPIN_WRITER ?? "scripts/vendor-native-pin.mjs";
+const wrote = spawnSync(process.execPath, [writer, native, sha], { stdio: "inherit" });
+const after = record();
+
+const changed = [];
+for (const [rel, was] of before.repo) {
+  if (was.kind === "native") continue;
+  const now = after.repo.get(rel);
+  const same = now !== undefined && (was.kind === "owner" ? now.bytes.equals(was.bytes) : ownerView(now.bytes.toString("utf8")) === ownerView(was.bytes.toString("utf8")));
+  if (same) continue;
+  changed.push(`OWNER_BYTES_CHANGED: ${rel}${now === undefined ? " (deleted)" : ""}`);
+  writeFileSync(rel, was.bytes);
+}
+for (const [rel, now] of after.repo) {
+  if (before.repo.has(rel) || now.kind === "native") continue;
+  changed.push(`OWNER_BYTES_CHANGED: ${rel} (added)`);
+  rmSync(rel);
+}
+for (const [path, was] of before.host) {
+  const now = after.host.get(path);
+  if (was === null ? now === null : now !== null && now.equals(was)) continue;
+  changed.push(`HOST_FILE_CHANGED: ${path}`);
+  if (was === null) rmSync(path, { force: true });
+  else writeFileSync(path, was);
+}
+
+const refuse = (lines, why) => {
+  for (const line of lines) console.log(line);
+  console.log(`PIN REFUSED: ${sha} ${why}`);
   process.exit(1);
+};
+if (changed.length > 0) refuse(changed, "changed owner-owned bytes. Each file above is restored; the native files it wrote stay for review.");
+if (wrote.status !== 0) process.exit(wrote.status ?? 1);
+const owned = [...before.repo.values()];
+console.log(`ownership ok: ${owned.filter((f) => f.kind === "owner").length} owner files, ${owned.filter((f) => f.kind === "mixed").length} mixed files, ${before.host.size} host files unchanged`);
+
+const differs = [];
+for (const [rel, now] of after.repo) {
+  const source = isSkillDoc(rel) ? header(now.bytes.toString("utf8")) : null;
+  if (source === null) continue;
+  const snapshot = /snapshot:\s*(\S+)/.exec(source[1])[1];
+  let pinned = execFileSync("git", ["-C", native, "show", `${sha}:${/native:\s*(\S+)/.exec(source[1])[1]}`]);
+  if (snapshot.endsWith("/AGENTS.section-9.md")) {
+    const agents = pinned.toString("utf8");
+    const end = agents.indexOf("\n## 10.");
+    pinned = Buffer.from(agents.slice(agents.indexOf("## 9."), end === -1 ? undefined : end));
+  }
+  if (!existsSync(snapshot) || !readFileSync(snapshot).equals(pinned)) differs.push(`NATIVE_COPY_DIFFERS: ${snapshot} is not ${sha.slice(0, 8)}'s file`);
 }
-console.log(`Vendored ${sha}. Run strict overlay install and backend source proof before accepting this pin.`);
+if (differs.length > 0) refuse([...new Set(differs)], "wrote native copies that differ from the pin.");
+
+const fidelity = spawnSync(process.execPath, ["--experimental-strip-types", "scripts/skill-fidelity.ts"], { encoding: "utf8" });
+process.stdout.write(fidelity.stdout);
+process.stderr.write(fidelity.stderr);
+if (fidelity.status !== 0) refuse([], "leaves native text that differs outside a BB marker. Fix the skills listed above, or discard this re-pin with git checkout and git clean.");
+console.log(`Re-pinned to ${sha}. Run strict overlay install and backend source proof before accepting this pin.`);

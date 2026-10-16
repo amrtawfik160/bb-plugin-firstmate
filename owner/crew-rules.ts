@@ -1,5 +1,5 @@
 // Owner layer: the owner's rules that every crew brief carries. lib/crew-contract.ts
-// places them in the skills block; owner/rules.json guards each one.
+// places them in the skills block. owner/ownership.json marks this file owner-owned.
 
 export const PSTACK_FIRST = "pstack always has priority. If a skill or rule conflicts with it, pstack wins.";
 
