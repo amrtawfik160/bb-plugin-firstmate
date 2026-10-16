@@ -15,6 +15,8 @@ export type TelegramReplyInput = {
   correlation?: string;
   /** Exact text from the owner message this reply answers. Telegram shows it as a quote. */
   quote?: string;
+  /** The project the answer is about. With Telegram topics on, the connector sends it to that project's topic. */
+  project?: string;
 };
 
 export type TelegramReplyRpcArgs = {
@@ -107,6 +109,7 @@ export async function sendTelegramReply(input: {
         text: input.payload.text,
         ...(input.payload.correlation ? { correlation: input.payload.correlation } : {}),
         ...(input.payload.quote ? { quote: input.payload.quote } : {}),
+        ...(input.payload.project ? { project: input.payload.project } : {}),
       },
       outputSchema: telegramReplyOutputSchema,
     });
