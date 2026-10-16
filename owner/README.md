@@ -35,17 +35,22 @@ skills only from that folder. The Claude, Codex and agents skill roots link to
 
 ## The guard
 
-`node scripts/refresh-native-pin.mjs <native clone> <sha>` records every
-owner-owned byte and each host file, then runs the writer
-(`scripts/vendor-native-pin.mjs`). It prints `PIN REFUSED` and exits 1 when:
+`node scripts/refresh-native-pin.mjs <native clone> <sha>` never writes this
+checkout. It runs the writer (`scripts/vendor-native-pin.mjs`) in a fresh git
+worktree on a new branch `native-pin/<sha8>`, with an empty `HOME` and no
+`FM_HOME`. Then it reads what git recorded on that branch against its base:
+names, modes, content and links. It prints `PIN REFUSED` and exits 1 when:
 
-1. an owner-owned entry or an owner region changed, was added or was deleted
-   (`OWNER_BYTES_CHANGED`). An entry is its type, mode, bytes or link target;
-   links are never followed. The entry is restored, missing folders are
-   recreated, and a final check prints `RESTORE FAILED` for any entry it could
-   not restore.
-2. a host file changed (`HOST_FILE_CHANGED`). The file is restored. Set
-   `FM_HOME` to the captain home so `data/captain.md` is included.
-3. a native copy differs from the pinned commit (`NATIVE_COPY_DIFFERS`).
-4. skill fidelity finds native text that differs outside a BB marker. The new
-   native files stay written, so the sync can fix the skills that copy them.
+1. an owner-owned path or an owner region changed, was added or was deleted
+   (`OWNER_CHANGED`);
+2. a native copy differs from the pinned commit (`NATIVE_COPY_DIFFERS`);
+3. a host file changed (`HOST_FILE_CHANGED`). The guard hashes the content the
+   captain reads, through a link, and records the link itself. Set `FM_HOME`
+   to the captain home so `data/captain.md` is included;
+4. this checkout changed, or the writer failed.
+
+A refused branch is deleted and never used. The guard restores nothing.
+Folder modes are not part of the result, because git records none.
+
+When only skill fidelity fails (native text differs outside a BB marker), the
+branch stays, so the sync can fix the skills that copy native there.

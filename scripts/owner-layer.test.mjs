@@ -87,8 +87,9 @@ function repin(root, native, sha, home, writerPath) {
 const liveState = (root) => git(root, "rev-parse", "HEAD") + git(root, "status", "--porcelain", "--untracked-files=all");
 const branchOf = (stdout) => /on branch (\S+) at (\S+)\./.exec(stdout);
 
-function withRepin(run, mutate) {
+function withRepin(run, mutate, setup) {
   const root = copyRepo();
+  setup?.(root);
   const home = fakeHost();
   const { native, sha } = syntheticNative(mutate);
   try {
@@ -96,6 +97,10 @@ function withRepin(run, mutate) {
     run({ root, home, native, sha });
     assert.equal(liveState(root), live, "the live checkout is never written");
   } finally {
+    for (const line of git(root, "worktree", "list", "--porcelain").split("\n")) {
+      const dir = line.startsWith("worktree ") ? line.slice("worktree ".length) : null;
+      if (dir !== null && dir !== root && existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+    }
     for (const dir of [root, home, native]) rmSync(dir, { recursive: true, force: true });
   }
 }
@@ -163,14 +168,14 @@ const OWNER_CHANGES = [
 for (const [name, file, code] of OWNER_CHANGES) {
   test(`the writer ${name} -> refused, branch not used`, () => {
     withRepin(({ root, home, native, sha }) => {
-      if (file.endsWith(".owner.md")) {
-        writeFileSync(join(root, file), "owner policy\n");
-        git(root, "add", file);
-        commit(root);
-      }
       const r = repin(root, native, sha, home, writer(home, root, code));
       refused(r, new RegExp(`OWNER_CHANGED: ${file.replace(/[.]/g, "\\.")} `));
       assert.equal(git(root, "branch", "--list", "native-pin/*"), "", "refused branch deleted");
+    }, undefined, (root) => {
+      if (!file.endsWith(".owner.md")) return;
+      writeFileSync(join(root, file), "owner policy\n");
+      git(root, "add", file);
+      commit(root);
     });
   });
 }

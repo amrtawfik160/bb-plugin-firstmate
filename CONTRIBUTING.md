@@ -208,9 +208,9 @@ fully offline. It is a copy of native at the pin — never edit it by hand; re-v
 from the native clone when you bump a pin. Native is currently at `1f3e7696`.
 
 Re-vendor with `node scripts/refresh-native-pin.mjs <native clone> <sha>`. It
-updates only native-owned files and the native regions of every `BB-SOURCE`
-skill under `skills/` and `entry-skills/`. It refuses the pin when any
-owner-owned byte or host file changed, or when this fidelity check fails. See
+writes the new pin on a sync branch in a fresh worktree, never in this
+checkout. It refuses the pin when the branch changes any owner-owned path or
+region, when a host file changed, or when this fidelity check fails. See
 [owner/README.md](owner/README.md).
 
 ### Pin the native source per skill (`BB-SOURCE`)
