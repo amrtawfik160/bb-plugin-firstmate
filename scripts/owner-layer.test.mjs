@@ -263,3 +263,26 @@ test("the new native removes a file a BB skill copies -> refused before writing"
     refused(r, /WRITER_FAILED/);
   }, (dir) => rmSync(join(dir, ".agents/skills/ship-landing/SKILL.md")));
 });
+
+test("an untracked owner file in the live checkout, edited by the writer through its path -> refused before the writer runs", () => {
+  const root = copyRepo();
+  const home = fakeHost();
+  const { native, sha } = syntheticNative();
+  try {
+    writeFileSync(join(root, "owner/local-policy.md"), "original policy\n");
+    const r = repin(root, native, sha, home, writer(home, root, `fs.writeFileSync(path.join(live, "owner/local-policy.md"), "changed policy\\n");`));
+    refused(r, /LIVE_CHECKOUT_DIRTY: .*owner\/local-policy\.md/);
+    assert.equal(readFileSync(join(root, "owner/local-policy.md"), "utf8"), "original policy\n");
+    assert.equal(git(root, "branch", "--list", "native-pin/*"), "");
+  } finally {
+    for (const dir of [root, home, native]) rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the writer creates an untracked file in the live checkout -> refused", () => {
+  withRepin(({ root, home, native, sha }) => {
+    const r = repin(root, native, sha, home, writer(home, root, `fs.writeFileSync(path.join(live, "owner/new-policy.md"), "x\\n");`));
+    refused(r, /LIVE_CHECKOUT_CHANGED/);
+    rmSync(join(root, "owner/new-policy.md"));
+  });
+});
