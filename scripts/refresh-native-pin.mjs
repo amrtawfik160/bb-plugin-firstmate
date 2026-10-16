@@ -9,6 +9,7 @@
 //   - a native copy differs from the pinned commit,
 //   - a host file, or the target of a host-file link, changed,
 //   - this checkout changed, or the writer failed.
+// It refuses to start unless this checkout is clean (no uncommitted or untracked paths).
 // A refused branch is deleted and never used. The guard restores nothing.
 // When only skill fidelity fails, the branch stays so a sync can fix the skills.
 import { createHash } from "node:crypto";
@@ -67,7 +68,23 @@ function hostState(path) {
   return { link, content };
 }
 
-const liveState = () => text(live, "rev-parse", "HEAD") + text(live, "status", "--porcelain", "--untracked-files=all") + createHash("sha256").update(git(live, "diff", "HEAD", "--binary")).digest("hex");
+// The checkout as the writer could reach it: HEAD, status, tracked changes, and
+// each untracked entry's content or link target.
+function liveState() {
+  const hash = createHash("sha256").update(text(live, "rev-parse", "HEAD")).update(git(live, "status", "--porcelain", "-z", "--untracked-files=all")).update(git(live, "diff", "HEAD", "--binary"));
+  for (const path of text(live, "ls-files", "-z", "--others", "--exclude-standard").split("\0").filter(Boolean)) {
+    const full = join(live, path);
+    try { hash.update(path).update(lstatSync(full).isSymbolicLink() ? `link ${readlinkSync(full)}` : readFileSync(full)); } catch (error) { hash.update(`${path} ${error.code}`); }
+  }
+  return hash.digest("hex");
+}
+
+const dirty = text(live, "status", "--porcelain", "--untracked-files=all").split("\n").filter(Boolean);
+if (dirty.length > 0) {
+  console.log(`LIVE_CHECKOUT_DIRTY: ${dirty.length} uncommitted or untracked paths: ${dirty.map((line) => line.slice(3)).join(", ")}`);
+  console.log(`PIN REFUSED: ${sha} needs a clean checkout. Commit or remove those paths first. No sync branch was made; the pin is not used.`);
+  process.exit(1);
+}
 
 const problems = [];
 const hostBefore = new Map(hostFiles().map((path) => [path, hostState(path)]));

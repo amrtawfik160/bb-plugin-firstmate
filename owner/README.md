@@ -36,7 +36,7 @@ skills only from that folder. The Claude, Codex and agents skill roots link to
 ## The guard
 
 `node scripts/refresh-native-pin.mjs <native clone> <sha>` never writes this
-checkout. It runs the writer (`scripts/vendor-native-pin.mjs`) in a fresh git
+checkout, and refuses to start unless it is clean (`LIVE_CHECKOUT_DIRTY`). It runs the writer (`scripts/vendor-native-pin.mjs`) in a fresh git
 worktree on a new branch `native-pin/<sha8>`, with an empty `HOME` and no
 `FM_HOME`. Then it reads what git recorded on that branch against its base:
 names, modes, content and links. It prints `PIN REFUSED` and exits 1 when:
@@ -47,7 +47,8 @@ names, modes, content and links. It prints `PIN REFUSED` and exits 1 when:
 3. a host file changed (`HOST_FILE_CHANGED`). The guard hashes the content the
    captain reads, through a link, and records the link itself. Set `FM_HOME`
    to the captain home so `data/captain.md` is included;
-4. this checkout changed, or the writer failed.
+4. this checkout changed (`LIVE_CHECKOUT_CHANGED`: HEAD, status, tracked
+   changes and each untracked file's content or link), or the writer failed.
 
 A refused branch is deleted and never used. The guard restores nothing.
 Folder modes are not part of the result, because git records none.
