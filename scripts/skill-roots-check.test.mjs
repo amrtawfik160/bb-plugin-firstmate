@@ -47,7 +47,7 @@ test("a skill whose content differs between roots is reported by name and fails"
     assert.equal(r.status, 1, r.stdout);
     assert.match(r.stdout, /^SKILL_DIFFERS: tdd claude=[0-9a-f]{12} codex=[0-9a-f]{12} agents=[0-9a-f]{12}$/m);
     assert.match(r.stdout, /^SKILL_DIFFERS: grilling claude=none codex=[0-9a-f]{12} agents=[0-9a-f]{12}$/m);
-    assert.match(r.stderr, /2 skills differ between skill roots: grilling tdd/);
+    assert.match(r.stderr, /2 skills differ between skill roots or have a broken link: grilling tdd/);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
