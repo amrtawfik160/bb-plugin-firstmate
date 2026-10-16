@@ -86,6 +86,8 @@ test("Oct 7 repro: a reply of only 'Started' answered the owner message, and now
       "🔧 In progress (1)",
       "- T1 Areliaa · Fix the Metricool sync · 0 min",
     ].join("\n"));
+    // The connector's per-project board counts the crews working on each project.
+    assert.deepEqual((await host.harness.behavior.callRpc("telegramCommand", { command: "board", threadId: "thr_cap" }) as { projects?: unknown }).projects, [{ name: "Areliaa", working: 1 }]);
   } finally {
     await host.harness.lifecycle.dispose();
   }

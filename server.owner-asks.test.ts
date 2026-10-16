@@ -266,3 +266,18 @@ test("firstmate_reply sends a file from the captain's workspace, which the conne
     await host.harness.lifecycle.dispose();
   }
 });
+
+test("16 Oct project topics: a card and a reply carry the project the captain names, so Telegram puts them in its topic", async () => {
+  const { host, call, rpc } = await agentNativeCase();
+  try {
+    const card = await call("firstmate_ask", { ...AGENT_NATIVE_CARD, project: "Cyndra" });
+    assert.equal(failed(card), false, textOf(card));
+    assert.equal(rpc().find((c) => c.method === "ask")!.input.project, "Cyndra");
+    const reply = await call("firstmate_reply", { ref: AGENT_NATIVE_REF, text: "agent-native: skip adoption, copy a few ideas.", project: "Cyndra" });
+    assert.equal(failed(reply), false, textOf(reply));
+    assert.equal(rpc().find((c) => c.method === "reply")!.input.project, "Cyndra");
+    const plain = await call("firstmate_ask", { ...AGENT_NATIVE_CARD, question: "Another question with no project?" });
+    assert.equal(failed(plain), false, textOf(plain));
+    assert.equal("project" in rpc().filter((c) => c.method === "ask").at(-1)!.input, false, "no project: the connector asks Decisions");
+  } finally { await host.harness.lifecycle.dispose(); }
+});
