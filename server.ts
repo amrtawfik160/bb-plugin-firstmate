@@ -11948,6 +11948,7 @@ export default async function plugin(bb: BbPluginApi) {
       const stayOpen = [used, ...covered.map(refOf)].join(", ");
       let channel: "rpc" | "envelope" = "envelope";
       let undelivered: string | null = null;
+      let cardRepeat = false;
       try {
         if (row.source === "telegram") {
           const sent = await sendTelegramReply({
@@ -11958,6 +11959,7 @@ export default async function plugin(bb: BbPluginApi) {
             callRpc: flags.telegramThreading === "on" ? (args) => bb.sdk.plugins.callRpc(args) : null,
           });
           channel = sent.channel;
+          cardRepeat = sent.cardRepeat === true;
           await noteTelegramThreading(sent.mode).catch((error) => bb.log.warn(`telegram threading state: ${String(error)}`));
           if (sent.outcome !== "delivered") {
             undelivered = flags.telegramThreading === "on"
@@ -11999,9 +12001,11 @@ export default async function plugin(bb: BbPluginApi) {
         return toolError(`Reply to ${used} was delivered, but recording it failed; ${stayOpen} ${covered.length === 0 ? "stays" : "stay"} open. Repeat the same call to close ${covered.length === 0 ? "it" : "them"}: it sends nothing again. ${error instanceof Error ? error.message : String(error)}`);
       }
       const params = row.source === "telegram" ? telegramReplyParameters({ chatId: row.chatId, messageId: row.messageId, threadId: row.topicId }) : null;
-      const sentLine = (params
-        ? `Replied to ${used} via ${channel} with reply_parameters ${JSON.stringify(params.reply_parameters)}.`
-        : `Replied to ${used}.`) + coverNote(covered);
+      const sentLine = (cardRepeat
+        ? `Not sent to Telegram: it only repeats the card you sent this turn, and that card answers ${used}. It is closed.`
+        : params
+          ? `Replied to ${used} via ${channel} with reply_parameters ${JSON.stringify(params.reply_parameters)}.`
+          : `Replied to ${used}.`) + coverNote(covered);
       const taskNote = ownerTasks.openByRef(captain, used).map((task) => `\nTask ${task.id} stays open (${task.state}): a reply does not close it. Close it with firstmate_task when it is done or dropped.`).join("");
       const stillOpen = inboundLedger.listPending(captain);
       return (stillOpen.length === 0 ? `${sentLine} No owner message is waiting.` : `${sentLine}\n${formatOwnerInbox(stillOpen, Date.now())}`) + taskNote;
