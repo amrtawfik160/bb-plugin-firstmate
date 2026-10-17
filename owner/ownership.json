@@ -19,7 +19,9 @@
   "host": [
     "~/.bb-server/AGENTS.md",
     "~/.claude/CLAUDE.md",
-    "$FM_HOME/data/captain.md"
+    "$FM_HOME/data/captain.md",
+    "$FM_HOME/data/captain.archive.md",
+    "$FM_HOME/data/corrections.jsonl"
   ],
   "skip": [".git/", "node_modules/"]
 }

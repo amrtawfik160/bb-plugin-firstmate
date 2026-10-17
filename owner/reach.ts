@@ -16,7 +16,7 @@ const glob = (pattern: string) => new RegExp(`^${pattern.split("*").map((part) =
 
 // "test/" and ".github/workflows/" are folders at any depth, "/docs/" a folder at the root,
 // "/docs/pins.json" a full path from the root, "*.md" a file name.
-function matches(path: string, patterns: readonly string[]): boolean {
+export function matches(path: string, patterns: readonly string[]): boolean {
   const folders = path.split("/");
   const name = folders.pop() ?? "";
   return patterns.some((pattern) => {

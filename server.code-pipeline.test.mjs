@@ -83,6 +83,11 @@ test('verify refuses a bug-fix PR whose crew report has no proof step, and recor
   assert.match(refused,/^(?:Error: )?Refusing to record verification for cyndra-ai\/cyndra-saas#2391: crew 9ceeb10f's report has its proof step pending: "P4 Prove on the real surface: waiting on CI"\./);
   assert.match(refused,/✓ P4 Prove on the real surface for cyndra-ai\/cyndra-saas#2391 at 2391239: driven <what>; seen <what>/);
   assert.equal(store.get(id(2391)).verifiedCommitSha,null);
+  // The weekly scorecard counts this refusal as a done claim without proof.
+  assert.deepEqual(store.get(id(2391)).proofRefusals.map(p=>[p.crewId,p.step]),[[BUILDER,4]]);
+  const card=await host.harness.behavior.runCli(['scorecard','--json'],ctx);
+  assert.equal(card.exitCode,0,card.stderr);
+  assert.deepEqual(JSON.parse(card.stdout).unproven.map(u=>[u.pr,u.crew]),[[id(2391),BUILDER]]);
  }finally{await host.harness.lifecycle.dispose();}
  const ok=await deck();try {
   text(await verify(ok.host,2391));

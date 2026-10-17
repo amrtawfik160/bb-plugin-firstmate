@@ -96,6 +96,8 @@ import { crewPipeline, crewPlaybook, crewSkillBlock, crewSkillRoot, notVerifiedN
 import { CREW_ROLES, crewExecution } from "./owner/crew-roles.ts";
 import { DISPATCH_VERSION, PROOF_STEP, pipelineGates, proofStep } from "./owner/pipelines.ts";
 import { changeReach } from "./owner/reach.ts";
+import { addCorrection, CAPTAIN_FILE, CORRECTION_RULE, correctionBrief, fixCorrection, LEDGER_FILE, readLedger, within } from "./owner/corrections.ts";
+import { redoneWork, renderScorecard, type ScorecardData } from "./owner/scorecard.ts";
 import { rpcContract } from "./rpc.ts";
 import {
   UPSTREAM_FIRSTMATE_SHA,
@@ -1546,7 +1548,7 @@ const BB_SKILL_RUNTIME_CONTRACT = [
   "Translate bin/fm-<name>.sh calls to firstmate_fm with script=<name> and the same arguments; use bb firstmate fm <name> only when a shell command is required.",
   "Load native policy skills and their references with firstmate_skill (bb firstmate skill <name> [reference] [--source <selected-root source-file>]); it reads this captain’s selected runtime. Native AGENTS.md means firstmate_contract; bin and docs mean the selected runtime, while data, state and config mean the exact bound captain home returned by deck.",
   "Map workers, panes, and tabs to BB crew threads via firstmate_dispatch/tell/interrupt/retry/stop. Call firstmate_watch once per batch; it hands off to private durable wakes. End the turn; never retry or poll.",
-  `${OWNER_DECISION_RULE} ${CAPTAIN_RULES} firstmate_deliveries retains open PRs after worker retirement and wake acknowledgement. Continue authorized review/fix/merge work using the author for fixes and preserving the agreed native review and validation path, including independent review when required; merge through firstmate_merge. Inspect unresolved delivery records after compaction or handoff.`,
+  `${OWNER_DECISION_RULE} ${CAPTAIN_RULES} ${CORRECTION_RULE} firstmate_deliveries retains open PRs after worker retirement and wake acknowledgement. Continue authorized review/fix/merge work using the author for fixes and preserving the agreed native review and validation path, including independent review when required; merge through firstmate_merge. Inspect unresolved delivery records after compaction or handoff.`,
   "Run firstmate_toolchain for native dependency detection. For browser work use the /browser skill and browser_script (or bb plugin run browser script), with profileId unset for the thread-isolated default. This replaces native chrome-devtools-axi transport. Read config/lavish-axi-host for remote Lavish access and use bb connect expose for a board the captain should see.",
   "Treat tmux, herdr, zellij, cmux, orca, and harness-specific hook setup as reference material unless the active backend explicitly names that runtime.",
 ].join(" ");
@@ -7458,6 +7460,7 @@ export default async function plugin(bb: BbPluginApi) {
     const step = proofStep(pipeline);
     const gap = pipelineProofGap(await crewReportFile(crew), step, { pr: r.id, head: r.headSha ?? "" });
     if (gap === null) return;
+    deliveries.recordProofRefusal(r.id, crew.id, step);
     const home = await crewNativeHome(crew);
     throw new Error([
       `Refusing to record verification for ${r.id}: crew ${crew.id}'s report has its proof step ${gap}.`,
@@ -14133,6 +14136,31 @@ export default async function plugin(bb: BbPluginApi) {
     return { ...target, model: typeof pick?.["model"] === "string" ? pick["model"] : null };
   }
 
+  // Owner decisions Q15, Q16, Q21: the corrections ledger and the weekly scorecard read the
+  // captain's own home. A read that fails for any reason but a missing file stops the write.
+  async function captainHomeOf(captain: string | undefined): Promise<string> {
+    const home = captain ? await bb.storage.kv.get<string>(`native-home:${captain}`) : null;
+    return (home ?? (await settings.get()).fmHome).trim();
+  }
+  async function readHomeText(home: string, rel: string): Promise<string> {
+    const hostId = await fleetHost();
+    if (hostId === null || hostId === "") throw new Error("No Firstmate host. Run bb firstmate deck first.");
+    try {
+      const result = await bb.sdk.files.read({ hostId, path: `${home}/${rel}` });
+      if (!("content" in result) || typeof result.content !== "string") return "";
+      return result.contentEncoding === "base64" ? Buffer.from(result.content, "base64").toString("utf8") : result.content;
+    } catch (error) {
+      if (/ENOENT|not found|no such file/i.test(String(error))) return "";
+      throw new Error(`Could not read ${home}/${rel}: ${String(error)}`);
+    }
+  }
+  async function writeHomeText(home: string, rel: string, text: string): Promise<void> {
+    const hostId = await fleetHost();
+    if (hostId === null || hostId === "") throw new Error("No Firstmate host. Run bb firstmate deck first.");
+    const result = await bb.sdk.files.write({ hostId, path: `${home}/${rel}`, rootPath: home, content: Buffer.from(text).toString("base64"), contentEncoding: "base64", createParents: true, expectedSha256: null, mode: 0o600 });
+    if (result.outcome !== "written") throw new Error(`Could not write ${home}/${rel}: ${result.outcome}`);
+  }
+
   bb.cli.register({
     name: "firstmate",
     summary: "Run firstmate-style crews: dispatch crewmate threads, track them, bring back results",
@@ -14170,6 +14198,8 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "decide", summary: "Durable decisions", usage: 'bb firstmate decide ask -- "<question>"' },
       { name: "posture", summary: "Per-project delivery mode + yolo", usage: "bb firstmate posture set --project <id> [--mode m]" },
       { name: "memory", summary: "Captain prefs + learnings", usage: "bb firstmate memory show" },
+      { name: "corrections", summary: "Owner corrections ledger: record one, record its fix, list them", usage: 'bb firstmate corrections add --ref <owner message ref> -- "<owner words>" | fix <C-id> --fix <PR url|data/captain.md> --changelog "<one line>" | list [--since <iso>] [--json]' },
+      { name: "scorecard", summary: "Weekly counts: owner corrections, redone work, checker findings, done claims without proof", usage: "bb firstmate scorecard [--captain <thread-id>] [--since <iso>] [--until <iso>] [--json]" },
       { name: "afk", summary: "Away posture", usage: "bb firstmate afk on|off|status|reconcile-return [--captain <thread-id>]" },
       { name: "quiet", summary: "Batch routine pings while present", usage: "bb firstmate quiet on|off|status" },
       { name: "secondmate", summary: "Register a domain captain thread", usage: "bb firstmate secondmate list|register|drop" },
@@ -15003,6 +15033,61 @@ export default async function plugin(bb: BbPluginApi) {
               return reply({projectId,...value},JSON.stringify(value,null,2));
             }
             const value=await postureContext(projectId,ctx);return reply(value,JSON.stringify(value,null,2));
+          }
+          case "corrections": {
+            const sub = rest[0] ?? "list";
+            const captain = flagStr(flags, "captain") ?? ctxThread;
+            const home = await captainHomeOf(captain);
+            if (home === "") return fail("No captain home. Run bb firstmate deck in the captain thread first.");
+            const ledger = await readHomeText(home, LEDGER_FILE);
+            if (sub === "add") {
+              const ref = flagStr(flags, "ref") ?? "";
+              const words = rest.slice(1).join(" ").trim();
+              if (ref === "" || words === "") return fail('Usage: bb firstmate corrections add --ref <owner message ref> -- "<owner words>"');
+              const added = addCorrection(ledger, { ref, words, at: new Date().toISOString() });
+              if (added.added) await writeHomeText(home, LEDGER_FILE, added.text);
+              const c = added.correction;
+              const brief = correctionBrief(c, home);
+              const dispatch = { role: "builder", playbook: "none", title: `Correction ${c.id}` };
+              return reply({ correction: c, added: added.added, ledger: `${home}/${LEDGER_FILE}`, dispatch, brief }, [
+                added.added ? `Recorded ${c.id} for ${ref} in ${home}/${LEDGER_FILE}.` : `${ref} is already recorded as ${c.id}.`,
+                `Dispatch the correction crew now: firstmate_dispatch role=builder playbook=none title="Correction ${c.id}", with this task:`,
+                "",
+                brief,
+                "",
+                `When it ends: bb firstmate corrections fix ${c.id} --fix "<its FIX line>" --changelog "<its CHANGELOG line>", then send the owner the CHANGELOG line.`,
+              ].join("\n"));
+            }
+            if (sub === "fix") {
+              const id = rest[1] ?? "";
+              const next = fixCorrection(ledger, { id, ref: flagStr(flags, "fix") ?? "", changelog: flagStr(flags, "changelog") ?? "", at: new Date().toISOString() }, await readHomeText(home, CAPTAIN_FILE));
+              await writeHomeText(home, LEDGER_FILE, next);
+              const row = readLedger(next).find((c) => c.id === id)!;
+              return reply(row, `Recorded the fix of ${id}: ${row.fix!.ref}. Send the owner: ${row.fix!.changelog}`);
+            }
+            if (sub !== "list") return fail(usage);
+            const since = flagStr(flags, "since");
+            const rows = since === undefined ? readLedger(ledger) : within(readLedger(ledger), Date.parse(since), Number.MAX_SAFE_INTEGER);
+            return reply(rows, rows.length === 0 ? "No owner corrections recorded." : rows.map((c) => `${c.id} ${c.at.slice(0, 10)} ${c.ref} ${c.fix ? `fixed: ${c.fix.ref}` : "open"}: ${c.words.split("\n")[0]}`).join("\n"));
+          }
+          case "scorecard": {
+            const captain = flagStr(flags, "captain") ?? ctxThread;
+            if (captain === undefined) return fail("Pass --captain <thread-id>.");
+            const until = flagStr(flags, "until") === undefined ? Date.now() : Date.parse(flagStr(flags, "until")!);
+            const since = flagStr(flags, "since") === undefined ? until - 7 * 86_400_000 : Date.parse(flagStr(flags, "since")!);
+            if (!Number.isFinite(since) || !Number.isFinite(until)) return fail("--since and --until take an ISO date.");
+            const home = await captainHomeOf(captain);
+            const ledger = home === "" ? [] : readLedger(await readHomeText(home, LEDGER_FILE));
+            const quality = deliveries.quality(since, until, captain);
+            const iso = (at: number) => new Date(at).toISOString();
+            const data: ScorecardData = {
+              since: iso(since), until: iso(until),
+              corrections: within(ledger, since, until).map((c) => ({ id: c.id, ref: c.ref, at: c.at, fixed: c.fix !== undefined })),
+              redone: redoneWork(ownerTasks.list(captain, { includeClosed: true }), await listCrewsAll(), since, until),
+              checkerFails: quality.checkerFails.map((f) => ({ ...f, at: iso(f.at) })),
+              unproven: quality.unproven.map((u) => ({ ...u, at: iso(u.at) })),
+            };
+            return reply({ ...data, captain, home }, renderScorecard(data));
           }
           case "memory": {
             const sub = rest[0] ?? "show";
