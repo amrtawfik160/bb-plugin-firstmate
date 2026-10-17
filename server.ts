@@ -624,6 +624,8 @@ const CAPTAIN_RESUME_PREFIX = "captain-resume:";
 const NO_OUTCOME_PREFIX = "crew-no-outcome:";
 // Thread of a crew forgotten while its PR delivery stays tracked → the captain that forgot it.
 const FORGOTTEN_CREW_PREFIX = "forgotten-crew:";
+const FOLLOW_UP_CONCURRENCY = 4;
+const FOLLOW_UP_DUE_LIMIT = 100;
 const OUTCOME_LINE_REQUEST = [
   "OUTCOME LINE MISSING: your last turn ended without an outcome line. Reply now with exactly one line that states where the task stands, then stop:",
   "  DONE: <one-line outcome>",
@@ -7421,10 +7423,16 @@ export default async function plugin(bb: BbPluginApi) {
           reason: error instanceof Error ? error.message : String(error), logPrefix: (attempt) => `PR discovery ${crew.id} (attempt ${attempt})` }, signal);
       }
     }
-    for (const record of deliveries.list({ due:Date.now(),limit:10 })) {
-      signal?.throwIfAborted();
-      await boundedFollowUp(async s=>{await reconcileDelivery(record,s);await notifyDelivery(record,s);},signal).catch(error=>bb.log.warn(`PR follow-up ${record.id}: ${String(error)}`));
-    }
+    // Every PR comes due each minute, so the cycle reads all of them, a few GitHub
+    // reads at a time; ten a cycle left 48 of 71 waiting and their heads minutes old.
+    const due=deliveries.list({ due:Date.now(),limit:FOLLOW_UP_DUE_LIMIT });
+    let next=0;
+    await Promise.all(Array.from({ length:Math.min(FOLLOW_UP_CONCURRENCY,due.length) },async()=>{
+      for (let record=due[next++]; record!==undefined; record=due[next++]) {
+        signal?.throwIfAborted();
+        await boundedFollowUp(async s=>{await reconcileDelivery(record!,s);await notifyDelivery(record!,s);},signal).catch(error=>bb.log.warn(`PR follow-up ${record!.id}: ${String(error)}`));
+      }
+    }));
     // Notification failure stays due independently of forge polling backoff.
     for (const record of deliveries.pendingNotifications()) {
       if (record.notification.desired !== record.notification.delivered) await boundedFollowUp(s=>notifyDelivery(record,s),signal).catch(error=>bb.log.warn(`PR notification ${record.id}: ${String(error)}`));
@@ -7518,13 +7526,19 @@ export default async function plugin(bb: BbPluginApi) {
     }
     if (!input.id && !input.url) throw new Error(`${input.action} needs the PR: Pass id (owner/repo#number) or url (the PR link).`);
     const id=input.id ?? canonicalPr(input.url ?? "").id;
-    const r=deliveries.get(id);
+    let r=deliveries.get(id);
     // The owning manager reaches its own records in any project; everyone else stays inside their project.
     if (!r || (r.projectId !== projectId && r.owner !== owner)) throw new Error(`Unknown deliverable ${id}. Pass id (owner/repo#number) or url (the PR link) of a PR tracked for this manager or project.`);
     if (input.action === "inspect") return [r];
     if (input.action === "assign") {
       if (input.from !== r.owner) throw new Error("Assignment requires the explicitly named previous manager.");
       return serializeLedger(`delivery:${r.id}`,async()=>[deliveries.assign(r.id,r.owner,owner,projectId)]);
+    }
+    if ((input.action === "check" || input.action === "verify") && r.forgeState === "open") {
+      // A verdict on an open PR covers its head on GitHub, not the head the follow-up
+      // loop last saw: a push since then must neither refuse it nor let an old head pass.
+      await reconcileDelivery(r,asRecord(ctx)["signal"] as AbortSignal | undefined);
+      r=deliveries.get(r.id) ?? r;
     }
     if (input.action === "check") return [await recordCheckerVerdict(r,owner,input.commitSha ?? "",input.verdict,input.notes ?? "",input.findings)];
     if (input.action === "verify") {
