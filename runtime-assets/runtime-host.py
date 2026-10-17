@@ -317,7 +317,9 @@ def select(args):
             current.select_patch_set(args.home,root/'overlay')
             errors=current.verify_mirror(args.home,root/'overlay')
             if errors: raise ValueError('external migration requires a verified matching adapter: '+'; '.join(errors))
-        consumers=(in_flight(args.home) if previous else blockers(args.home))+(['BB launches are running/reserved/uncertain'] if args.consumers else [])
+        # Only a switch between immutable bundled releases may run beside task
+        # records; migrating from or rolling back to an external checkout may not.
+        consumers=(in_flight(args.home) if previous and not external else blockers(args.home))+(['BB launches are running/reserved/uncertain'] if args.consumers else [])
         current=verify_version(args.store,previous['release'])[1] if consumers and previous and not external else None
         refusal=selection_refusal(current,manifest,consumers)
         if refusal: raise ValueError(refusal)
