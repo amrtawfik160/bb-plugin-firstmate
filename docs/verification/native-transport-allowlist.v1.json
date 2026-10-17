@@ -33,11 +33,11 @@
   },
   "captainTransport": {
     "entry-skills/captain/SKILL.md": {
-      "sha256": "1010d3290939053d9539101ad13c6049ae8f4d0cff6eeadd3fb919948cceb9c0",
+      "sha256": "24b03eda982f776696944a4001ba062636f011d7bc39f47cb96945245d0c151b",
       "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner. Merge only through firstmate_merge; crew fix rounds go to crews; standing approvals recorded through firstmate_posture."
     },
     "entry-skills/firstmate/SKILL.md": {
-      "sha256": "4278efad7a37ce187b2082ba4eb40e4a77b8e3c112aaaf13fdc786f38edd50ff",
+      "sha256": "f5a9af71ac6bf4eb23fdfce8873ce1d616c78860fe0b96cd7c4216685fbbb4ba",
       "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner."
     },
     "entry-skills/captain/references/bb.md": {
