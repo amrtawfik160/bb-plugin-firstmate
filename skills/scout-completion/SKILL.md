@@ -8,8 +8,8 @@ metadata:
 
 <!-- BB-SOURCE
      native: .agents/skills/scout-completion/SKILL.md
-     sha: 1f3e769616fdf9f31f85f4c3e6a9f71606634238
-     snapshot: native-snapshot/1f3e7696/.agents/skills/scout-completion/SKILL.md
+     sha: 15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4
+     snapshot: native-snapshot/15ad1bd6/.agents/skills/scout-completion/SKILL.md
      fidelity: verbatim
 -->
 
@@ -20,4 +20,4 @@ A report may recommend implementation but does not authorize it.
 Before treating the investigation or any visual review as complete, load `captain-hold-lifecycle`; teardown enforces that shared completion gate.
 When a scout's deliverable is a visual artifact the captain will iterate on, keep it alive and follow the crew-hosted Lavish board contract in `docs/configuration.md` rather than arming or polling the board from firstmate.
 When implementation is separately authorized, promote the existing scout through `bin/fm-promote.sh` rather than creating a duplicate task.
-The promoted worker must inventory scratch state, return to a clean default-branch base, carry over only intended fix changes, create the ship branch, and follow the project's selected delivery path while leaving scratch commits and debug edits behind and turning a reproduced bug into the regression test.
+The promoted worker must inventory scratch state, return to a clean copy of the task's base (its recorded base branch, else the default branch), carry over only intended fix changes, create the ship branch, and follow the project's selected delivery path while leaving scratch commits and debug edits behind and turning a reproduced bug into the regression test.

@@ -1,7 +1,7 @@
 <!-- BB-SOURCE
      native: .agents/skills/diagnostic-reasoning/SKILL.md
-     sha: 1f3e769616fdf9f31f85f4c3e6a9f71606634238
-     snapshot: native-snapshot/1f3e7696/.agents/skills/diagnostic-reasoning/SKILL.md
+     sha: 15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4
+     snapshot: native-snapshot/15ad1bd6/.agents/skills/diagnostic-reasoning/SKILL.md
      fidelity: verbatim
      note: Adopted as-is from native firstmate (pure procedure, zero harness
      dependency). Rendered prose is native's own; BB-only framing is fenced
@@ -10,10 +10,7 @@
 
 # diagnostic-reasoning
 
-<!-- Read before scoping a reported bug and before acting on a diagnostic report.
-     Native declares this trigger in its skill frontmatter; a BB captain reference
-     carries it as a comment so the rendered body stays native's own. -->
-
+Use this procedure before scoping a reported bug and before acting on a diagnostic report.
 This skill is the single owner of Firstmate's bug-diagnosis reasoning procedure.
 Firstmate applies it when briefing delegated investigation and evaluating the resulting evidence, without taking over project-specific investigation itself.
 
@@ -53,9 +50,3 @@ Before acting on the report, verify that its claimed cause explains the end-user
 If a load-bearing element is missing, route a focused follow-up investigation instead of treating confidence or implementation detail as proof.
 A diagnosis or implementation-ready recommendation is evidence, not authorization to change code.
 Implementation still requires the captain's request or another existing lifecycle authority, and the reproduction should become the regression test when a fix is authorized.
-
-<!-- BB-DIVERGE
-     native: .agents/skills/diagnostic-reasoning/SKILL.md (frontmatter)
-     native-quote: user-invocable: false
-     bb: adopted as a captain reference loaded on demand from the captain skill. The procedure itself is unchanged.
-     reason: BB has no agent-only skill loader; captain policy is carried as references. -->
