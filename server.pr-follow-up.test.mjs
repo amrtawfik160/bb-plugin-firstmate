@@ -100,7 +100,7 @@ test('a crew forgotten with its PR open has its native record retired once every
  const {host,store,gh}=await deck([]);try {
   const archived=new Set(['thr_c9','thr_c8','thr_c7','thr_crew']);
   host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle',environmentId:'env_wt',archivedAt:archived.has(threadId)?1:null}));
-  const deliver=(task,thread,n,status)=>{const r=store.register({url:url(n),taskId:task,projectId:'proj_1',owner:'thr_cap',home:'/native',worker:thread,requirement:'pr',continuation:crewRow(task,thread,{backlogRow:true})});
+  const deliver=(task,thread,n,status)=>{const r=store.register({url:url(n),taskId:task,projectId:'proj_1',owner:'thr_cap',home:'/native',worker:thread,requirement:'pr',continuation:crewRow(task,thread,{backlogRow:true,providerId:null,model:null})});
    store.save({...store.get(r.id),status,nextCheckAt:Date.now()+3_600_000});};
   deliver('c9','thr_c9',5001,'complete');deliver('c9','thr_c9',5002,'merged-unverified');
   deliver('c8','thr_c8',5003,'complete');deliver('c8','thr_c8',5004,'pr-delivered');
@@ -108,7 +108,7 @@ test('a crew forgotten with its PR open has its native record retired once every
   deliver(BUILDER,'thr_crew',5006,'complete');
   metas=['c9\tthr_c9','c8\tthr_c8','c7\tthr_c7','c5\tthr_c5',`${BUILDER}\tthr_crew`].join('\n')+'\n';
   await host.harness.behavior.runSchedule('pr-delivery-follow-up');
-  const removed=gh.commands.flatMap(c=>[.../rm -f '\/native\/state\/([^.']+)\.meta'/g.exec(c)?.slice(1) ?? []]);
+  const removed=gh.commands.flatMap(c=>/rm -f \S*\/native\/state\/([A-Za-z0-9_-]+)\.meta\b/.exec(c)?.slice(1) ?? []);
   assert.deepEqual(removed,['c9'],'only the forgotten crew whose deliveries all ended loses its record');
  }finally{await host.harness.lifecycle.dispose();}
 });

@@ -112,6 +112,8 @@ export const LOST_OWNER_RECHECK_MS = 5 * 60_000;
 const verifiedHead = (r: DeliveryRecord) => r.verifiedCommitSha !== null && r.verifiedCommitSha === r.headSha;
 const short = (sha: string) => sha.slice(0, 7);
 const terminal = (r: DeliveryRecord) => r.status === 'complete' || r.status === 'explicitly-abandoned';
+/** True when a delivery in this status no longer needs its task's native authority; needsTask's SQL lists the same three. */
+export const releasesTask = (status: DeliveryRecord['status']) => status === 'complete' || status === 'explicitly-abandoned' || status === 'merged-unverified';
 function notificationKey(r: DeliveryRecord) {
   return createHash('sha256').update(JSON.stringify([r.headSha, r.status, r.owner, r.ownerNeeded, r.blocker, (r.failures??[]).filter(f=>f.resolvedAt===null).map(f=>[f.id,f.accounting??null])])).digest('hex');
 }

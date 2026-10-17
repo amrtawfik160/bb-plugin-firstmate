@@ -89,7 +89,7 @@ import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRe
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
 import { optionHelp } from "./lib/cli-help.ts";
 import { AUDITED_BUNDLED_SNAPSHOTS, AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython } from "./lib/native-policy.ts";
-import { createDeliveries, LOST_OWNER_RECHECK_MS, canonicalPr, decisionLine, deliveryLine, parseForge, PR_VIEW_FIELDS, PR_VIEW_JQ, prBranchOwner, type DeliveryRecord, type PrBranchCandidate } from "./lib/pr-delivery.ts";
+import { createDeliveries, LOST_OWNER_RECHECK_MS, canonicalPr, decisionLine, deliveryLine, parseForge, PR_VIEW_FIELDS, PR_VIEW_JQ, prBranchOwner, releasesTask, type DeliveryRecord, type PrBranchCandidate } from "./lib/pr-delivery.ts";
 import { captureHostCommand, decodeHostCapture } from "./lib/host-capture.ts";
 import { selectExecution, validateLaunchCapabilities } from "./lib/execution-selection.ts";
 import { crewPipeline, crewPlaybook, crewSkillBlock, crewSkillRoot, notVerifiedNote, notVerifiedRequest, pipelineProofGap, PLAYBOOK_CHOICES, playbookStepCount, redactSecrets, reportGapNote, reportGapRequest, reportGaps, skillCheckScript, skillRoutingLinkScript, verifyStepGap } from "./lib/crew-contract.ts";
@@ -626,6 +626,7 @@ const NO_OUTCOME_PREFIX = "crew-no-outcome:";
 const FORGOTTEN_CREW_PREFIX = "forgotten-crew:";
 const FOLLOW_UP_CONCURRENCY = 4;
 const FOLLOW_UP_DUE_LIMIT = 100;
+const RETAINED_SWEEP_MS = 10 * 60_000;
 const OUTCOME_LINE_REQUEST = [
   "OUTCOME LINE MISSING: your last turn ended without an outcome line. Reply now with exactly one line that states where the task stands, then stop:",
   "  DONE: <one-line outcome>",
@@ -7403,6 +7404,45 @@ export default async function plugin(bb: BbPluginApi) {
       if (told) deliveries.markDecisionAsked(records.map((r) => r.id), now);
     }
   }
+  // A crew forgotten while its PR was open keeps its native record, so the merge keeps
+  // native task authority (forgetCrew). Nothing retired that record once its deliveries
+  // ended, and fm-watch kept scanning the archived crew every pass: 22 of the captain's
+  // 52 native records on 17 Oct. This retires each such record, with forget's own steps.
+  let retainedSweepAt = 0;
+  async function retireEndedRetainedRecords(signal?: AbortSignal) {
+    if (Date.now() - retainedSweepAt < RETAINED_SWEEP_MS) return;
+    retainedSweepAt = Date.now();
+    const all: DeliveryRecord[] = [];
+    for (let offset = 0; ; offset += 100) {
+      const page = deliveries.list({ includeComplete: true, limit: 100, offset });
+      all.push(...page);
+      if (page.length < 100) break;
+    }
+    const live = new Set((await raceAbort(readCrews(), signal, STUCK_HOST_CALL_MS)).map((crew) => crew.id));
+    for (const home of new Set(all.map((r) => r.home).filter((h) => h !== ""))) {
+      signal?.throwIfAborted();
+      const sample = all.find((r) => r.home === home)!;
+      const hostId = await resolveHostForProject(sample.projectId, sample.owner ?? undefined, signal);
+      const listed = await runOnHost(hostId, `for m in ${shQuote(home)}/state/*.meta; do [ -f "$m" ] || continue; t=\${m##*/}; printf '%s\\t%s\\n' "\${t%.meta}" "$(sed -n 's/^bb_thread_id=//p' "$m" | tail -n 1)"; done`, 15_000, signal);
+      if (listed.exitCode !== 0) throw new Error(`listing native records in ${home} failed (exit ${listed.exitCode})`);
+      for (const line of listed.output.split("\n")) {
+        const [id = "", thread = ""] = line.trim().split("\t");
+        if (!/^[A-Za-z0-9._-]+$/.test(id) || thread === "" || live.has(id)) continue;
+        const records = all.filter((r) => r.home === home && r.taskId === id && r.workers.includes(thread));
+        if (records.length === 0 || records.some((r) => !releasesTask(r.status)) || !records[0]!.continuation) continue;
+        if ((await raceAbort(bb.sdk.threads.get({ threadId: thread }), signal, STUCK_HOST_CALL_MS)).archivedAt == null) continue;
+        try {
+          const crew: Crew = { ...crewSchema.parse(records[0]!.continuation), nativeHome: home, parentThreadId: records[0]!.owner };
+          await dropFmMeta(crew);
+          await realBacklogTransitionForCrew(crew, "rm", true);
+          const leftover = await retireNativeTaskState(crew);
+          bb.log.info(`retired the native record of forgotten crew ${id}: its PR deliveries ended (${records.map((r) => `${r.id} ${r.status}`).join(", ")})${leftover ? `; ${leftover}` : ""}`);
+        } catch (error) {
+          bb.log.warn(`retiring the native record of forgotten crew ${id} failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    }
+  }
   async function deliveryPass(signal?: AbortSignal) {
     // First, so a PR opened this minute gets its row and its first GitHub read in this cycle.
     await openPrSweep(signal).catch(error=>{ if (!signal?.aborted) bb.log.warn(`Open PR sweep: ${String(error)}`); });
@@ -7433,6 +7473,7 @@ export default async function plugin(bb: BbPluginApi) {
         await boundedFollowUp(async s=>{await reconcileDelivery(record!,s);await notifyDelivery(record!,s);},signal).catch(error=>bb.log.warn(`PR follow-up ${record!.id}: ${String(error)}`));
       }
     }));
+    await retireEndedRetainedRecords(signal).catch((error) => { if (!signal?.aborted) bb.log.warn(`Retained native records: ${String(error)}`); });
     // Notification failure stays due independently of forge polling backoff.
     for (const record of deliveries.pendingNotifications()) {
       if (record.notification.desired !== record.notification.delivered) await boundedFollowUp(s=>notifyDelivery(record,s),signal).catch(error=>bb.log.warn(`PR notification ${record.id}: ${String(error)}`));
