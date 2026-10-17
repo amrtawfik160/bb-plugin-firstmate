@@ -5377,7 +5377,13 @@ export default async function plugin(bb: BbPluginApi) {
       const own = task.crewIds.map((id) => live.get(id)).filter((crew): crew is Crew => crew !== undefined);
       for (const crew of own) {
         let latest: { verb: string; note: string } | null = null;
-        try { latest = latestStatus((await crewStatusLines(crew)).lines); } catch (error) { bb.log.warn(`task sweep: status of crew ${crew.id}: ${String(error)}`); }
+        let lineAt: number | null = null;
+        try {
+          const lines = (await crewStatusLines(crew)).lines;
+          latest = latestStatus(lines);
+          const stamp = [...lines].reverse().find((line) => line.trim() !== "")?.match(/\[at=(\d+)\]/)?.[1];
+          lineAt = stamp === undefined ? null : Number(stamp) * 1000;
+        } catch (error) { bb.log.warn(`task sweep: status of crew ${crew.id}: ${String(error)}`); }
         if (latest === null) continue;
         const seen = `task-status-seen:${statusKey(crew.id, `${latest.verb} ${latest.note}`)}`;
         if (await bb.storage.kv.get(seen) !== undefined) continue;
@@ -5386,7 +5392,14 @@ export default async function plugin(bb: BbPluginApi) {
           const after = ownerTasks.crewReportedDone(captain, crew.id, latest.note, (id) => id !== crew.id && live.has(id), (item) => deliveries.forTasks(item.crewIds, item.prs), now);
           if (after !== undefined && after.state !== task.state) { changed = true; bb.log.info(`task ${task.id}: crew ${crew.id} reported done; ${task.state} -> ${after.state}`); }
         } else if (crewWaitsOnOwner(latest)) {
-          await askForCrew(captain, task, crew, latest.note, now);
+          // The captain may have asked already: a card on this task, or any card it sent after this status line.
+          const asked = ownerAsks.listOpen(captain).find((ask) => ask.task === task.id || (lineAt !== null && ask.createdAt >= lineAt));
+          if (asked === undefined) await askForCrew(captain, task, crew, latest.note, now);
+          else {
+            bb.log.info(`task ${task.id}: crew ${crew.id} waits on the owner; card ${asked.id} already asks, no new card`);
+            const current = ownerTasks.get(task.id);
+            if (current !== undefined && isOpenTask(current) && current.state !== "needs_you") ownerTasks.move(task.id, captain, { to: "needs_you", reason: latest.note }, now);
+          }
           changed = true;
         }
       }
