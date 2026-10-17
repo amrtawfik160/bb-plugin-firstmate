@@ -6,10 +6,11 @@ import {spawn} from 'node:child_process';
 import {runtimeFixture,assets,helper,distribution,secondRelease} from './native-runtime-fixture.mjs';
 import {fixture,pins,run,ok,overlay} from './prompt-fixture.mjs';
 import {captainStartupCommand} from '../server.ts';
+import {AUDITED_BUNDLED_SNAPSHOTS} from '../lib/native-policy.ts';
 function state(home){return Object.fromEntries(['state/.wake-queue','state/legacy.status','data/legacy/brief.md','config/delivery-mode'].map(p=>[p,readFileSync(join(home,p),'utf8')]));}
 function sentinels(home){mkdirSync(join(home,'data/legacy'),{recursive:true});writeFileSync(join(home,'state/.wake-queue'),'unhandled report PR https://github.com/fixture/repo/pull/1\n');writeFileSync(join(home,'state/legacy.status'),'waiting-checks\n');writeFileSync(join(home,'data/legacy/brief.md'),'Exact task; provider acp-grok; model grok-4.6; xhigh; merged-and-verified\n');writeFileSync(join(home,'config/delivery-mode'),'direct-PR\n');}
 
-test('shipped native assets are reproducible, complete and current against exact adapter inputs',()=>{ok(run('python3',['scripts/package-native-runtime.py','--check']));assert.equal(distribution.upstreamCommit,pins.at(-1));assert.match(readFileSync(join(assets,'LICENSE.firstmate'),'utf8'),/Copyright \(c\) 2026 Kun Chen/);});
+test('shipped native assets are reproducible, complete and current against exact adapter inputs',()=>{ok(run('python3',['scripts/package-native-runtime.py','--check']));assert.equal(distribution.upstreamCommit,pins.at(-1));assert.equal(AUDITED_BUNDLED_SNAPSHOTS[distribution.snapshotCommit],distribution.upstreamCommit,'captains bound to the shipped bundle can read its policy');assert.match(readFileSync(join(assets,'LICENSE.firstmate'),'utf8'),/Copyright \(c\) 2026 Kun Chen/);});
 test('offline clean installation and bound state use only shipped Git snapshot; reload verifies and reuses exact bytes',()=>{
  const f=runtimeFixture();try{const installed=f.json(f.install());assert.equal(installed.signature,'FM_BUNDLED_RUNTIME_INSTALLED');const bound=f.json(f.bind());assert.equal(bound.signature,'FM_BUNDLED_HOME_BOUND');const root=bound.selection.root;
  assert.equal(ok(run('git',['-C',root,'remote','-v'])), '');assert.equal(ok(run('git',['-C',f.home,'remote','-v'])), '');assert.equal(ok(run('git',['-C',root,'rev-list','--count','HEAD'])).trim(),'1');assert.equal(ok(run('git',['-C',root,'rev-parse','HEAD'])).trim(),distribution.snapshotCommit);
