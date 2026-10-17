@@ -467,14 +467,28 @@ test('the open list is asked again with its ETag, and a 304 keeps the rows it ha
  }finally{await d.host.harness.lifecycle.dispose();}
 });
 
-test('a cycle reads no due PR while little GitHub GraphQL quota is left, and reads them once it recovers',async()=>{
- let remaining=150;
- const d=await quietDeck(command=>command.includes('rate_limit')?{payload:JSON.stringify({remaining,reset:Math.floor(Date.now()/1000)+600})}:command.includes('gh pr view')?{payload:JSON.stringify(forge('OPEN'))}:isOpenList(command)?{payload:listed([])}:{code:0});try {
-  for(const n of [21,22,23]){d.track(n);d.store.save({...d.store.get(`acme/repo#${n}`),nextCheckAt:0});}
+test('the quota guard reads GraphQL points from the PR reads themselves: one probe, then nothing until the window resets',async()=>{
+ let remaining=150,reset=Math.floor(Date.now()/1000)+600;
+ const headers=()=>`< X-Ratelimit-Remaining: ${remaining}\n< X-Ratelimit-Reset: ${reset}\n< X-Ratelimit-Resource: graphql\n`;
+ const d=await quietDeck(command=>command.includes('gh pr view')?{payload:JSON.stringify(forge('OPEN')),stderr:headers()}:isOpenList(command)?{payload:listed([])}:{code:0});try {
+  for(const n of [21,22,23,24]){d.track(n);d.store.save({...d.store.get(`acme/repo#${n}`),nextCheckAt:0});}
   await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
-  assert.deepEqual(d.reads(),[],'no GraphQL read with 150 points left');
-  remaining=4000;
+  assert.equal(d.reads().length,1,'with no reading yet, one PR read probes the quota');
   await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
-  assert.deepEqual(d.reads(),[21,22,23]);
+  assert.equal(d.reads().length,1,'150 points left: no further read before the reset');
+  assert.ok(!d.commands.some(c=>c.includes('rate_limit')),'the rate_limit endpoint is not the meter');
+  assert.ok(d.commands.filter(c=>c.includes('gh pr view')).every(c=>c.includes('GH_DEBUG=api')),'PR reads expose their rate-limit headers');
+  remaining=4000;reset=Math.floor(Date.now()/1000)-1;
+  for(const n of [21,22,23,24]) d.store.save({...d.store.get(`acme/repo#${n}`),nextCheckAt:0});
+  await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+ }finally{await d.host.harness.lifecycle.dispose();}
+});
+
+test('background PR discovery uses the open list it already read: no branch lists or BB PR lookups for a covered crew',async()=>{
+ const d=await quietDeck(command=>isOpenList(command)?{payload:listed([{...openPrs[0],headSha:'sha1'}])}:command.includes('gh pr view')?{payload:JSON.stringify(forge('OPEN'))}:{code:0});try {
+  for(let cycle=0;cycle<3;cycle++) await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.equal(d.commands.filter(c=>c.includes('gh pr list')).length,0,'no per-crew branch list');
+  assert.equal(d.host.harness.sdk.callsTo('environments.pullRequest').length,0,'no per-crew BB PR lookup');
+  assert.equal(createDeliveries(d.host.bb.storage.database()).get('acme/repo#10')?.taskId,'c1','the open list still tracks the crew PR');
  }finally{await d.host.harness.lifecycle.dispose();}
 });

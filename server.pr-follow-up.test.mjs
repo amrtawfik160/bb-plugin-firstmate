@@ -12,6 +12,7 @@ const url=n=>`https://github.com/Cyndra-AI/cyndra-saas/pull/${n}`;
 const id=n=>`cyndra-ai/cyndra-saas#${n}`;
 const heads=new Map();
 let metas='';
+let ghStderr='';
 const states=new Map();
 const head=n=>heads.get(n) ?? String(n).repeat(10).slice(0,40);
 const crewRow=(id,threadId,extra)=>({id,task:'x',projectId:'proj_1',threadId,parentThreadId:'thr_cap',nativeHome:'/native',worktree:true,shape:'ship',posture:'direct-PR',createdAt:'2026-10-17T00:00:00.000Z',reasoningLevel:null,dispatchVersion:2,...extra});
@@ -29,7 +30,7 @@ function hostCommands(host,{delayMs=0}={}) {
   const command=byId.get(terminalId);const isRead=command.includes('gh pr view');
   if(isRead){gh.reads++;gh.inFlight++;gh.maxInFlight=Math.max(gh.maxInFlight,gh.inFlight);await new Promise(r=>setTimeout(r,delayMs));gh.inFlight--;}
   const out=forge(command);const captured=command.includes('FM_HOST_CAPTURE_V1');
-  const payload=captured?JSON.stringify({protocol:'FM_HOST_CAPTURE_V1',exitCode:out.code??0,stdout:out.payload??'',stderr:''}):out.payload??'';
+  const payload=captured?JSON.stringify({protocol:'FM_HOST_CAPTURE_V1',exitCode:out.code??0,stdout:out.payload??'',stderr:isRead?ghStderr:''}):out.payload??'';
   return{nextSeq:1,chunks:[{dataBase64:Buffer.from(`${payload}\n__FM_HOST_RC:${captured?0:out.code ?? 0}\n`).toString('base64')}]};
  });
  return gh;
@@ -41,7 +42,7 @@ function forge(command) {
  return{code:0};
 }
 async function deck(prs,{delayMs=0}={}) {
- heads.clear();metas='';states.clear();
+ heads.clear();metas='';states.clear();ghStderr='';
  const host=createFakePluginHost({pluginId:'firstmate',agentSkillIds:['firstmate','captain'],settings:{fmHome:'/native',fmHostId:'host_1'}});await plugin(host.bb);
  host.harness.sdk.stub('threads.list',async()=>[]);
  host.harness.sdk.stub('threads.getPluginMetadata',async()=>({}));
@@ -166,4 +167,17 @@ test('a checker refresh that overlaps the follow-up read of the same PR shares t
   assert.equal(gh.reads,1,'one GitHub read served both');
   assert.equal(store.get(id(2391)).check?.commitSha,head(2391));
  }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('retirement reads wait while the GraphQL headers of the last PR read show the reserve reached',async()=>{
+ const d=await sweepDeck();try {
+  states.set(5301,'MERGED');
+  d.deliver('c9','thr_c9',5301,'complete');
+  const r=d.store.register({url:url(5302),taskId:BUILDER,projectId:'proj_1',owner:'thr_cap',home:'/native',worker:'thr_crew',requirement:'pr'});d.store.save({...d.store.get(r.id),nextCheckAt:0});
+  ghStderr=`< X-Ratelimit-Remaining: 150\n< X-Ratelimit-Reset: ${Math.floor(Date.now()/1000)+600}\n< X-Ratelimit-Resource: graphql\n`;
+  metas='c9\tthr_c9\n';
+  await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.ok(!d.gh.commands.some(c=>c.includes('/pull/5301')),'no retirement read with 150 points left');
+  assert.deepEqual(d.removed(),[]);
+ }finally{await d.host.harness.lifecycle.dispose();}
 });
