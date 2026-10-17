@@ -98,7 +98,7 @@ test('a dispatched brief states the obstacle rule once, in its Obstacles section
 test('renderer rejects changed anchors, contradictory legacy output and wrong native mode before printing any prompt',()=>{
  const home=fixture();try {
   const f=scaffold(home,'strict');
-  for(const [from,to] of [['3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.','3. changed upstream browser policy.'],['The move IS the acknowledgement:','Changed inbox contract:'],['# Herdr lifecycle declaration - NOT ENABLED','# Unknown guard'],['Stay inside this worktree; modify nothing outside it.','Changed native allowed writes.']]) {
+  for(const [from,to] of [['3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.','3. changed upstream browser policy.'],['The move IS the acknowledgement:','Changed inbox contract:'],['# Herdr lifecycle declaration - NOT ENABLED','# Unknown guard'],['Keep project edits inside this worktree;','Changed native allowed writes.']]) {
    // Change the scaffold copy after Task, never the deliberate user quotation.
    const at=f.text.lastIndexOf(from);assert.ok(at>=0);writeFileSync(f.source,f.text.slice(0,at)+f.text.slice(at).replace(from,to));
    const result=render(home,f.source,'ship','strict','direct-PR');assert.notEqual(result.status,0);assert.equal(result.stdout,'');
