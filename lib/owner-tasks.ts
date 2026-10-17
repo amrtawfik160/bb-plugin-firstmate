@@ -206,8 +206,8 @@ export type OwnerTasks = {
 
 const CLOSING = new Set<TaskState>(["merged", "live", "done", "dropped"]);
 
-/** Why a task must stay open (an open program holds it), or null when it may close. */
-export type HeldOpen = (task: OwnerTask) => string | null;
+/** Why a task must stay open (an open program holds it, or a release has no read-back), or null when it may move to `to`. */
+export type HeldOpen = (task: OwnerTask, to: TaskState) => string | null;
 
 /**
  * `changed` runs after each write that changed a task, once its transaction is done: the Telegram
@@ -289,7 +289,7 @@ export function createOwnerTasks(db: Database, heldOpen: HeldOpen = () => null, 
     move(id, captain, move, at) {
       return db.transaction(() => {
         const task = owned(id, captain);
-        const held = CLOSING.has(move.to) && task.state !== move.to ? heldOpen(task) : null;
+        const held = CLOSING.has(move.to) && task.state !== move.to ? heldOpen(task, move.to) : null;
         if (held !== null) throw new Error(held);
         const next = moveTask(task, move, at);
         return next === task ? task : save(next);
@@ -321,7 +321,7 @@ export function createOwnerTasks(db: Database, heldOpen: HeldOpen = () => null, 
         const task = list(captain, { includeClosed: true }).find((item) => item.crewIds.includes(crewId));
         if (!task || task.crewIds.some((other) => other !== crewId && running(other))) return task;
         const move = finishedState(task, recordsFor(task), finish);
-        if (move === null || (CLOSING.has(move.to) && heldOpen(task) !== null)) return task;
+        if (move === null || (CLOSING.has(move.to) && heldOpen(task, move.to) !== null)) return task;
         return save(moveTask(task, move, at));
       })();
     },
@@ -336,7 +336,7 @@ export function createOwnerTasks(db: Database, heldOpen: HeldOpen = () => null, 
           let next = prs.length === task.prs.length ? task : { ...task, prs, updatedAt: at };
           // A PR proves progress, never a step back to a state the captain set by hand.
           if (proved !== null && proved !== next.state && TASK_TRANSITIONS[next.state].includes(proved)
-            && !(proved === "working" && next.state === "needs_you") && !(CLOSING.has(proved) && heldOpen(next) !== null)) {
+            && !(proved === "working" && next.state === "needs_you") && !(CLOSING.has(proved) && heldOpen(next, proved) !== null)) {
             next = moveTask(next, { to: proved }, at);
           }
           if (next !== task) changed.push(save(next));

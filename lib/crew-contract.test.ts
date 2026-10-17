@@ -518,7 +518,7 @@ test("the NOT VERIFIED note goes to the captain and says the PR cannot merge wit
     "NOT VERIFIED: crew 0940c38e's DONE report has its verify step pending: \"Verify on the same surface\".",
     "CI and unit tests are not verification.",
     "Its PRs cannot merge until a verification record exists for the PR head: drive the changed surface, then firstmate_deliveries action=verify with the head commit, driven and seen.",
-    "Only the owner's own words can waive it: firstmate_merge allowUnverified=\"<owner words>\".",
+    "Only the owner's own words can waive it, and only for an internal PR: firstmate_merge allowUnverified=\"<owner words>\". A production PR needs a crew's proof or the owner's Works tap.",
   ].join("\n"));
   assert.match(notVerifiedRequest("pending: \"Verify on the same surface\""), /^VERIFY STEP NOT DONE: your report has the verify step pending/);
 });
