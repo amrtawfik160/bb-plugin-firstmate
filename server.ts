@@ -627,6 +627,22 @@ const FORGOTTEN_CREW_PREFIX = "forgotten-crew:";
 const FOLLOW_UP_CONCURRENCY = 4;
 const FOLLOW_UP_DUE_LIMIT = 100;
 const RETAINED_SWEEP_MS = 10 * 60_000;
+const GRAPHQL_RESERVE = 1000;
+/** `gh api -i … --jq`: the status line and headers, a blank line, then one JSON row per line. A plain answer has rows only. */
+function parseListAnswer(output: string): { status: number; etag?: string; next: boolean; rows: Record<string, unknown>[] } {
+  let status = 200, etag: string | undefined, next = false, body = output;
+  if (/^HTTP\/\S+ \d{3}/.test(output.trimStart())) {
+    const text = output.trimStart().replace(/\r/g, "");
+    const end = text.indexOf("\n\n");
+    const head = end === -1 ? text : text.slice(0, end);
+    body = end === -1 ? "" : text.slice(end + 2);
+    status = Number(/^HTTP\/\S+ (\d{3})/.exec(head)![1]);
+    etag = /^etag:\s*(.+)$/im.exec(head)?.[1]?.trim();
+    next = /^link:.*rel="next"/im.test(head);
+  }
+  const rows = body.split("\n").filter((line) => line.trim().startsWith("{") || line.trim().startsWith("[")).flatMap((line) => { const row: unknown = JSON.parse(line); return (Array.isArray(row) ? row : [row]).map((r) => (r && typeof r === "object" ? r : {}) as Record<string, unknown>); });
+  return { status, ...(etag ? { etag } : {}), next, rows };
+}
 const OUTCOME_LINE_REQUEST = [
   "OUTCOME LINE MISSING: your last turn ended without an outcome line. Reply now with exactly one line that states where the task stands, then stop:",
   "  DONE: <one-line outcome>",
@@ -7169,8 +7185,8 @@ export default async function plugin(bb: BbPluginApi) {
   const RETIRED_CREW_PR_WINDOW_MS = 14 * 86_400_000;
   const UNOWNED_PR_RECHECK_MS = 60 * 60_000;
   type PrCandidate = PrBranchCandidate & { crew: Crew; path: string; hostId: string; live: boolean; fresh: boolean };
-  type OpenPr = { id: string; number: number; url: string; head: string; title?: string; openedAt?: number; touchedAt?: number; candidate?: PrCandidate };
-  type OpenPrSnapshot = { at: number; repos: Array<{ projects: Set<string>; prs: OpenPr[]; openIds: Set<string> }> };
+  type OpenPr = { id: string; number: number; url: string; head: string; headSha?: string; title?: string; openedAt?: number; touchedAt?: number; candidate?: PrCandidate };
+  type OpenPrSnapshot = { at: number; repos: Array<{ projects: Set<string>; prs: OpenPr[]; openIds: Set<string>; repo: string; allOpen: Set<string> }> };
   const crewBranches = new Map<string, { branch: string; path: string; hostId: string }>();
   const projectRepos = new Map<string, string>();
   const unownedPrs = new Map<string, number>();
@@ -7224,7 +7240,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
   // A repository no live crew works in is listed every ten minutes, not every cycle.
   const RETIRED_ONLY_LIST_MS = 10 * 60_000;
-  const openPrLists = new Map<string, { at: number; rows: Record<string, unknown>[] }>();
+  const openPrLists = new Map<string, { at: number; rows: Record<string, unknown>[]; etag?: string }>();
   // "By this GitHub account": the login gh is signed in with on that host, read once.
   const githubLogins = new Map<string, string>();
   async function hostGithubLogin(hostId: string, signal?: AbortSignal): Promise<string> {
@@ -7289,18 +7305,25 @@ export default async function plugin(bb: BbPluginApi) {
         const cached = openPrLists.get(repo);
         let listed = cached && !live && Date.now() - cached.at < RETIRED_ONLY_LIST_MS ? cached.rows : undefined;
         if (!listed) {
-          const fields = ".[] | {number, url: .html_url, title, headRefName: .head.ref, createdAt: .created_at, updatedAt: .updated_at, author: .user.login} | tojson";
-          const tries = [...new Set(group.paths)].slice(0, 8).map((path) => `if cd ${shQuote(path)} 2>/dev/null; then gh api --paginate ${shQuote("repos/{owner}/{repo}/pulls?state=open&per_page=100")} --jq ${shQuote(fields)}; exit $?; fi`);
-          const res = await runStructuredOnHost(group.hostId, `${tries.join("; ")}; exit 3`, 30_000, s);
-          if (res.exitCode !== 0) return;
-          // One JSON object per line and PR.
-          listed = res.output.split("\n").filter((line) => line.trim()).flatMap((line) => { const row: unknown = JSON.parse(line); return (Array.isArray(row) ? row : [row]).map(asRecord); });
-          openPrLists.set(repo, { at: Date.now(), rows: listed });
+          const fields = ".[] | {number, url: .html_url, title, headRefName: .head.ref, headSha: .head.sha, createdAt: .created_at, updatedAt: .updated_at, author: .user.login} | tojson";
+          const list = (flags: string) => `${[...new Set(group.paths)].slice(0, 8).map((path) => `if cd ${shQuote(path)} 2>/dev/null; then gh api ${flags} ${shQuote("repos/{owner}/{repo}/pulls?state=open&per_page=100")} --jq ${shQuote(fields)}; exit $?; fi`).join("; ")}; exit 3`;
+          // Asked with the last ETag, an unchanged list answers 304, which GitHub does not count.
+          const res = await runStructuredOnHost(group.hostId, list(`-i${cached?.etag ? ` -H ${shQuote(`If-None-Match: ${cached.etag}`)}` : ""}`), 30_000, s);
+          const answer = parseListAnswer(res.output);
+          if (answer.status === 304 && cached) listed = cached.rows;
+          else if (res.exitCode !== 0) return;
+          else if (answer.next) {
+            const all = await runStructuredOnHost(group.hostId, list("--paginate"), 30_000, s);
+            if (all.exitCode !== 0) return;
+            listed = parseListAnswer(all.output).rows;
+          } else listed = answer.rows;
+          openPrLists.set(repo, { at: Date.now(), rows: listed, ...(answer.etag && !answer.next ? { etag: answer.etag } : {}) });
         }
         const me = await hostGithubLogin(group.hostId, s);
         const prs: OpenPr[] = [];
-        const openIds = new Set<string>();
+        const openIds = new Set<string>(), allOpen = new Set<string>();
         for (const row of listed) {
+          try { if (typeof row["url"] === "string") allOpen.add(canonicalPr(row["url"]).id); } catch { /* not a PR link */ }
           if (me && typeof row["author"] === "string" && row["author"].toLowerCase() !== me) continue;
           const url = typeof row["url"] === "string" ? row["url"] : "", head = typeof row["headRefName"] === "string" ? row["headRefName"] : "";
           if (!url || !head) continue;
@@ -7308,7 +7331,7 @@ export default async function plugin(bb: BbPluginApi) {
           try { identity = canonicalPr(url); } catch { continue; }
           openIds.add(identity.id);
           const opened = typeof row["createdAt"] === "string" ? Date.parse(row["createdAt"]) : NaN, touched = typeof row["updatedAt"] === "string" ? Date.parse(row["updatedAt"]) : NaN;
-          prs.push({ id: identity.id, number: identity.number, url: identity.url, head,
+          prs.push({ id: identity.id, number: identity.number, url: identity.url, head, ...(typeof row["headSha"] === "string" && row["headSha"] ? { headSha: row["headSha"] } : {}),
             ...(typeof row["title"] === "string" && row["title"].trim() ? { title: row["title"].trim().slice(0, 300) } : {}),
             ...(Number.isFinite(opened) ? { openedAt: opened } : {}), ...(Number.isFinite(touched) ? { touchedAt: touched } : {}),
             candidate: prBranchOwner(head, group.candidates) });
@@ -7332,7 +7355,9 @@ export default async function plugin(bb: BbPluginApi) {
             else unownedPrs.set(pr.id, Date.now());
           }
         }
-        snapshot.repos.push({ projects: group.projects, prs, openIds });
+        // The repository is the origin remote, or else the one every listed PR names.
+        const named = new Set([...allOpen].map((id) => id.slice(0, id.lastIndexOf("#"))));
+        snapshot.repos.push({ projects: group.projects, prs, openIds, repo: repo.includes("/") ? repo.slice(repo.indexOf("\t") + 1) : named.size === 1 ? [...named][0]! : "", allOpen });
       }, signal).catch((error) => { if (!signal?.aborted) bb.log.warn(`Open PR list: ${String(error)}`); });
     }
     return snapshot;
@@ -7340,6 +7365,21 @@ export default async function plugin(bb: BbPluginApi) {
   async function openPrSweep(signal?: AbortSignal) {
     const snapshot = await readOpenPrs(signal);
     openPrSnapshot = snapshot;
+    // The free open list says which spaced-out PRs changed: a new head, or gone from the
+    // list (merged or closed). Only those are read on GitHub before their next turn.
+    const now = Date.now();
+    for (const repo of snapshot.repos) {
+      const heads = new Map(repo.prs.filter((pr) => pr.headSha).map((pr) => [pr.id, pr.headSha!]));
+      for (let offset = 0; repo.repo; offset += 100) {
+        const page = deliveries.list({ limit: 100, offset });
+        for (const r of page) {
+          if (r.nextCheckAt <= now || r.forgeState !== "open" || !r.id.startsWith(`${repo.repo}#`)) continue;
+          const head = heads.get(r.id);
+          if (!repo.allOpen.has(r.id) || (head && r.headSha && head !== r.headSha)) deliveries.save({ ...r, nextCheckAt: now });
+        }
+        if (page.length < 100) break;
+      }
+    }
     for (const pr of snapshot.repos.flatMap((repo) => repo.prs)) {
       signal?.throwIfAborted();
       if (deliveries.touch(pr.id, pr.touchedAt, pr.title) || !pr.candidate) continue;
@@ -7454,6 +7494,24 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
   }
+  let quotaWarnedUntil = 0;
+  async function graphqlQuotaLeft(signal?: AbortSignal): Promise<boolean> {
+    const first = deliveries.list({ due: Date.now(), limit: 1 })[0];
+    if (!first) return true;
+    try {
+      const hostId = await resolveHostForProject(first.projectId, first.owner ?? undefined, signal);
+      const res = await runStructuredOnHost(hostId, `gh api rate_limit --jq .resources.graphql`, 30_000, signal);
+      const limit = asRecord(JSON.parse(res.output || "{}"));
+      if (res.exitCode !== 0 || typeof limit["remaining"] !== "number") return true;
+      if (limit["remaining"] >= GRAPHQL_RESERVE) return true;
+      const reset = typeof limit["reset"] === "number" ? limit["reset"] * 1000 : Date.now() + 60_000;
+      if (Date.now() >= quotaWarnedUntil) { quotaWarnedUntil = reset; bb.log.warn(`PR follow-up paused: ${limit["remaining"]} GitHub GraphQL points left, under the ${GRAPHQL_RESERVE} kept for crews and verdict refreshes; resumes after ${new Date(reset).toISOString()}`); }
+      return false;
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      return true;
+    }
+  }
   async function deliveryPass(signal?: AbortSignal) {
     // First, so a PR opened this minute gets its row and its first GitHub read in this cycle.
     await openPrSweep(signal).catch(error=>{ if (!signal?.aborted) bb.log.warn(`Open PR sweep: ${String(error)}`); });
@@ -7476,7 +7534,9 @@ export default async function plugin(bb: BbPluginApi) {
     }
     // Every PR comes due each minute, so the cycle reads all of them, a few GitHub
     // reads at a time; ten a cycle left 48 of 71 waiting and their heads minutes old.
-    const due=deliveries.list({ due:Date.now(),limit:FOLLOW_UP_DUE_LIMIT });
+    // GraphQL points are shared with every crew on the host; keep a reserve for them and
+    // for verdict-time refreshes. Reading the limit itself costs nothing.
+    const due=await graphqlQuotaLeft(signal) ? deliveries.list({ due:Date.now(),limit:FOLLOW_UP_DUE_LIMIT }) : [];
     let next=0;
     await Promise.all(Array.from({ length:Math.min(FOLLOW_UP_CONCURRENCY,due.length) },async()=>{
       for (let record=due[next++]; record!==undefined; record=due[next++]) {

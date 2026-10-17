@@ -21,6 +21,8 @@ export interface DeliveryRecord {
   ownerNeeded: boolean; verifiedCommitSha: string | null; disposition: { reason: string; actor: string; at: number } | null;
   notification: { desired: string | null; delivered: string | null; queued: string | null; retryAt: number; attempted?: string | null; attemptedAt?: number };
   actionDueAt: number;
+  /** What the last forge read showed, and how many reads in a row showed it; unchanged reads space the next read out. */
+  forgeKey?: string; quietReads?: number;
   /** Head commit that carried a do-not-merge verdict. Set until the PR merges or the captain clears it. */
   heldHead?: string | null;
   /** The owner's own words that waived verification for one merge of this head. */
@@ -192,8 +194,15 @@ export function createDeliveries(db: Database) {
     const prior = get(id); if (!prior) throw new Error('Unknown deliverable');
     if (terminal(prior)) return prior;
     const changedHead = prior.headSha !== o.headSha;
+    // Every PR is read on GitHub's shared GraphQL quota. One that reads the same again and
+    // again is read half as often each time, up to every 30 minutes; any change brings it
+    // back to a minute, and pending checks to at most two. The open-PR list catches pushes
+    // and closes in between (server.ts openPrSweep).
+    const forgeKey = JSON.stringify([o.headSha, o.state, o.draft, o.checks, o.review, o.mergeable, o.hold ?? null]);
+    const quietReads = prior.forgeKey === forgeKey ? (prior.quietReads ?? 0) + 1 : 0;
+    const delay = Math.min(o.checks === 'pending' ? 2 * 60_000 : 30 * 60_000, 60_000 * 2 ** Math.min(quietReads, 6));
     let r: DeliveryRecord = { ...prior, title:o.title ?? prior.title, openedAt:o.openedAt ?? prior.openedAt, touchedAt:o.touchedAt ?? prior.touchedAt, headSha:o.headSha, mergeCommitSha:o.mergeCommitSha,verifiedCommitSha:changedHead ? null : prior.verifiedCommitSha,
-      forgeState:o.state, observedAt:now, freshness:'fresh', error:null, errors:0, updatedAt:now, nextCheckAt:now+60_000 };
+      forgeState:o.state, observedAt:now, freshness:'fresh', error:null, errors:0, updatedAt:now, nextCheckAt:now+delay, forgeKey, quietReads };
     const currentFailures=o.failedChecks ?? (o.checks==='failing' ? [{id:'unknown-check',name:'Unidentified failing check; inspect forge',url:r.url}] : []);
     const failures=changedHead ? [] : (prior.failures ?? []);
     r.failures=failures.map(f=>({...f,resolvedAt:o.checks==='passing' ? (f.resolvedAt ?? now) : f.resolvedAt}));
