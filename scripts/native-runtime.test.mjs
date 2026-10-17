@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {mkdirSync,writeFileSync,readFileSync,readdirSync,rmSync,cpSync,existsSync} from 'node:fs';
 import {join} from 'node:path';
-import {spawn} from 'node:child_process';
+import {spawn,spawnSync} from 'node:child_process';
 import {runtimeFixture,assets,helper,distribution,secondRelease} from './native-runtime-fixture.mjs';
 import {fixture,pins,run,ok,overlay} from './prompt-fixture.mjs';
 import {captainStartupCommand} from '../server.ts';
@@ -61,6 +61,21 @@ test('selection refuses foreign captain/host, retained tasks/native lock, unknow
  }finally{f.clean();rmSync(home,{recursive:true,force:true});}
 });
 
+test('a home with task records, its captain lock and a watcher moves to a new native release; only an operation in flight refuses',()=>{
+ const f=runtimeFixture();try {
+ f.ready();const next=secondRelease(f,{'NOTICE':'\nnext native fixture\n'},'native-next.tar.gz');f.json(f.call('install',['--archive',next.archive,'--sha256',next.sha256]));
+ const state=join(f.home,'state'),lock=(name,pid)=>{mkdirSync(join(state,name));writeFileSync(join(state,name,'pid'),`${pid}\n`);};
+ writeFileSync(join(state,'c1.meta'),'window=bb:thr_crew\nbackend=bb\n');writeFileSync(join(state,'c1.status'),'working: retained\n');
+ writeFileSync(join(state,'.lock'),`${process.pid}\n`);lock('.watch.lock',process.pid);writeFileSync(join(state,'.bb-watch-keeper.pid'),`${process.pid}\n`);
+ const dead=spawnSync('true');lock('.spawn-gone.lock',dead.pid);
+ lock('.spawn-c2.lock',process.pid);
+ const busy=f.call('select',[...f.owned,'--release',next.release]);assert.equal(busy.status,2);assert.match(busy.stdout,/native operation in flight: \.spawn-c2\.lock/);assert.equal(f.json(f.call('inspect',f.owned)).selected.release,distribution.release);
+ rmSync(join(state,'.spawn-c2.lock'),{recursive:true});
+ const moved=f.json(f.call('select',[...f.owned,'--release',next.release]));assert.equal(moved.selection.release,next.release);assert.equal(moved.selection.previous,distribution.release);
+ assert.equal(readFileSync(join(state,'c1.meta'),'utf8'),'window=bb:thr_crew\nbackend=bb\n');assert.equal(readFileSync(join(state,'c1.status'),'utf8'),'working: retained\n');
+ assert.ok(existsSync(join(f.store,'versions',distribution.release,'runtime/bin-bb')),'the previous release stays for records that name it');
+ }finally{f.clean();}
+});
 test('native-seeded secondmate seals parent runtime without changing charter, source or allocating a worker',()=>{
  const f=runtimeFixture();try{
  const root=f.ready(),child=join(f.directory,'secondmate');const env={FM_HOME:f.home,FM_ROOT_OVERRIDE:root,FM_BACKEND:'bb',FM_SECONDMATE_CHARTER:'Read-only fixture audit',FM_SECONDMATE_SCOPE:'Fixture',FM_SKIP_SECONDMATE_SYNC:'1'};
