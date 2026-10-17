@@ -400,6 +400,10 @@ test('registered PR schedule parses real PTY forge reads for discovery and merge
 import os,sys
 if sys.stdout.isatty(): print("Working...")
 print("forge stderr diagnostic",file=sys.stderr)
+if sys.argv[1] == "api":
+    for header in ("Remaining: 4000", "Reset: 4102444800", "Resource: graphql"): print("< X-Ratelimit-" + header, file=sys.stderr)
+    print("{}")
+    sys.exit(0)
 if sys.argv[2] == "list": print('[{"url":"https://github.com/acme/pty/pull/50"}]')
 else: print(open(os.path.join(os.path.dirname(__file__),"observation")).read())
 sys.exit(int(open(os.path.join(os.path.dirname(__file__),"exit")).read()))
@@ -411,7 +415,7 @@ sys.exit(int(open(os.path.join(os.path.dirname(__file__),"exit")).read()))
   host.harness.sdk.stub('environments.get',async()=>({id:'env_wt',hostId:'host_1',status:'ready',path:dir,branchName:'owned-task'}));
   host.harness.sdk.stub('threads.send',async()=>({delivery:'queued'}));host.harness.sdk.stub('threads.queuedMessages.list',async()=>[]);
   let n=0;const commands=new Map(),outputs=new Map();
-  host.harness.sdk.stub('terminals.create',async args=>{const id=`pty${++n}`;commands.set(id,args.start.command);outputs.set(id,runPty(args.start.command.replaceAll('gh pr ',`${dir}/gh pr `).replace(/; sleep 30$/, '')));return{id};});
+  host.harness.sdk.stub('terminals.create',async args=>{const id=`pty${++n}`;commands.set(id,args.start.command);outputs.set(id,runPty(args.start.command.replace(/(^|[^\w\/.-])gh (?=pr |api )/g,`$1${dir}/gh `).replace(/; sleep 30$/, '')));return{id};});
   host.harness.sdk.stub('terminals.get',async()=>({status:'exited'}));host.harness.sdk.stub('terminals.close',async()=>({}));
   host.harness.sdk.stub('terminals.output',async({terminalId})=>({nextSeq:1,chunks:[{dataBase64:Buffer.from(outputs.get(terminalId)).toString('base64')}]}));
   await host.harness.behavior.runSchedule('pr-delivery-follow-up');
