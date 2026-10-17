@@ -7567,7 +7567,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     if (!input.id && !input.url) throw new Error(`${input.action} needs the PR: Pass id (owner/repo#number) or url (the PR link).`);
     const id=input.id ?? canonicalPr(input.url ?? "").id;
-    let r=deliveries.get(id);
+    const r=deliveries.get(id);
     // The owning manager reaches its own records in any project; everyone else stays inside their project.
     if (!r || (r.projectId !== projectId && r.owner !== owner)) throw new Error(`Unknown deliverable ${id}. Pass id (owner/repo#number) or url (the PR link) of a PR tracked for this manager or project.`);
     if (input.action === "inspect") return [r];
@@ -7575,15 +7575,13 @@ export default async function plugin(bb: BbPluginApi) {
       if (input.from !== r.owner) throw new Error("Assignment requires the explicitly named previous manager.");
       return serializeLedger(`delivery:${r.id}`,async()=>[deliveries.assign(r.id,r.owner,owner,projectId)]);
     }
-    if ((input.action === "check" || input.action === "verify") && r.forgeState === "open") {
-      // A verdict on an open PR covers its head on GitHub, not the head the follow-up
-      // loop last saw: a push since then must neither refuse it nor let an old head pass.
-      await reconcileDelivery(r,asRecord(ctx)["signal"] as AbortSignal | undefined);
-      r=deliveries.get(r.id) ?? r;
-    }
-    if (input.action === "check") return [await recordCheckerVerdict(r,owner,input.commitSha ?? "",input.verdict,input.notes ?? "",input.findings)];
+    // A verdict on an open PR covers its head on GitHub, not the head the follow-up
+    // loop last saw: a push since then must neither refuse it nor let an old head pass.
+    const live=(input.action === "check" || input.action === "verify") && r.forgeState === "open"
+      ? await reconcileDelivery(r,asRecord(ctx)["signal"] as AbortSignal | undefined).then(()=>deliveries.get(r.id) ?? r) : r;
+    if (input.action === "check") return [await recordCheckerVerdict(live,owner,input.commitSha ?? "",input.verdict,input.notes ?? "",input.findings)];
     if (input.action === "verify") {
-      await requirePipelineProof(r);
+      await requirePipelineProof(live);
       const evidence={ driven:input.driven ?? "",seen:input.seen ?? "" };
       if (r.owner === owner) return [deliveries.verify(r.id,owner,input.commitSha ?? "",evidence)];
       // A crew that drove the change records it under its own crew id, without the captain.
