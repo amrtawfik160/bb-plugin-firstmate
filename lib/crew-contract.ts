@@ -1,6 +1,8 @@
 import { homedir } from "node:os";
 import type { Shape } from "./policy.ts";
-import { BUG_FIX_PROOF, HOUSE_RULES, OBSTACLES, OPERATOR_MERGE_STEPS, PLAYBOOK_RULES, SCREENSHOT_RULE } from "../owner/crew-rules.ts";
+import { BUG_FIX_PROOF, checkerSteps, HOUSE_RULES, OBSTACLES, OPERATOR_MERGE_STEPS, PLAYBOOK_RULES, SCREENSHOT_RULE } from "../owner/crew-rules.ts";
+import type { CrewRole } from "../owner/crew-roles.ts";
+import { codePipeline, CORE_PRINCIPLES, PROOF_STEP, type PipelineStep } from "../owner/pipelines.ts";
 
 export const PLAYBOOK_CHOICES = ["feature", "bug-fix", "perf-issue", "refactoring", "prototype", "investigation", "visual-parity", "babysit", "none"] as const;
 export type PlaybookChoice = (typeof PLAYBOOK_CHOICES)[number];
@@ -25,7 +27,8 @@ function titleOf(title: string | undefined, task: string): string {
   return task.split("\n").find((line) => line.trim() !== "" && !/^\s*#/.test(line)) ?? "";
 }
 
-export function crewPlaybook(input: { shape: Shape; title?: string; task: string; playbook?: PlaybookChoice }): PlaybookChoice {
+export function crewPlaybook(input: { shape: Shape; title?: string; task: string; playbook?: PlaybookChoice; role?: CrewRole }): PlaybookChoice {
+  if (input.role === "checker") return "none";
   if (input.playbook !== undefined) return input.playbook;
   if (input.shape === "scout") return "investigation";
   const title = titleOf(input.title, input.task);
@@ -59,6 +62,7 @@ export const BRIEF_SKILLS = [
   "implement", "implement-spec", "grilling", "interrogate", "how", "why", "architect",
   "arena", "prototype", "code-review", "blast-radius", "pr", "unslop", "technical-writing", "writing-for-agents",
   "zoom-out", "deslop", "figure-it-out", "control-cli", "control-ui", "frontend-design",
+  "sharpen", "verify-this", ...CORE_PRINCIPLES,
 ] as const;
 
 // Read-only. A provider that is not installed (no parent folder) is skipped.
@@ -98,9 +102,34 @@ export function skillRoutingLinkScript(target: string): string {
   ].join("\n");
 }
 
-export function crewSkillBlock(input: { shape: Shape; title?: string; task: string; providerId?: string | null; playbook?: PlaybookChoice; dataDir?: string }): string {
+// The fixed pipeline for a code task (owner/pipelines.ts), or null. A scout ships no code.
+export function crewPipeline(input: { shape: Shape; title?: string; task: string; playbook?: PlaybookChoice; role?: CrewRole }): readonly PipelineStep[] | null {
+  return input.shape === "ship" ? codePipeline(crewPlaybook(input)) : null;
+}
+
+function pipelineSection(playbook: PlaybookChoice, steps: readonly PipelineStep[], skill: (name: string) => string, dataDir: string | undefined): string[] {
+  const proof = steps.findIndex((step) => step.title === PROOF_STEP) + 1;
+  const report = dataDir !== undefined && dataDir !== "" ? `\`${dataDir}/report.md\`` : "your report file";
+  return [
+    `### Pipeline (${playbook.replace("-", " ")}). Do every step, in this order:`,
+    ...steps.map((step, i) => {
+      const how = step.title === PROOF_STEP
+        ? `: use the project's verify skill if it has one (e.g. \`.agents/skills/verify-<app>/\`), else read \`${skill(step.skills[0]!)}\``
+        : step.skills.length > 0 ? `: read ${step.skills.map((name) => `\`${skill(name)}\``).join(" and ")}` : "";
+      return `P${i + 1}. ${step.title}${how}. Evidence: ${step.evidence}.`;
+    }),
+    "Your final report has one line per pipeline step: \"✓ P<n> <step>: <evidence>\" or \"skip: P<n> <step>: <reason>\".",
+    `Write that report to ${report} before you record verification. \`bb firstmate deliveries verify\` refuses this crew's PR until the report has "✓ P${proof} ${PROOF_STEP}: driven <what>; seen <what>".`,
+  ];
+}
+
+export function crewSkillBlock(input: { shape: Shape; title?: string; task: string; providerId?: string | null; playbook?: PlaybookChoice; dataDir?: string; role?: CrewRole }): string {
   const playbook = crewPlaybook(input);
+  const pipeline = crewPipeline(input);
+  const checker = input.role === "checker";
   const root = crewSkillRoot(input.providerId);
+  const skill = (name: string) => `${root}/${name}/SKILL.md`;
+  const hasDataDir = input.dataDir !== undefined && input.dataDir !== "";
   // The reads lead the block and the report accounts for them: a read the
   // report must name is a read that happens.
   const reads = playbook === "none" ? "steps 1 and 2" : "steps 1 to 3";
@@ -110,29 +139,43 @@ export function crewSkillBlock(input: { shape: Shape; title?: string; task: stri
     `1. Read \`${root}/skill-routing/SKILL.md\`. Load every skill its matched rows and your playbook name.`,
     `2. Read \`${root}/poteto-mode/SKILL.md\` in full.`,
   ];
-  if (playbook === "none") {
+  if (checker) {
+    lines.push("3. No playbook: you are a checker. Follow the Checker section.");
+  } else if (playbook === "none") {
     lines.push("3. No playbook: this is a deploy or operator task. Follow the brief's delivery contract.");
+  } else if (pipeline !== null) {
+    lines.push(
+      `3. Follow \`${root}/poteto-mode/playbooks/${playbook}.md\`.`,
+      hasDataDir
+        ? `4. Write every pipeline step into \`${input.dataDir}/todo.md\`, then the playbook steps, before any other work. Tick each step there as you go.`
+        : "4. Copy every pipeline step, then the playbook steps, into your to-do list, before any other to-do.",
+      "5. Your final report lists each pipeline step as the Pipeline section says.",
+    );
   } else {
     lines.push(
       `3. Follow \`${root}/poteto-mode/playbooks/${playbook}.md\`.`,
       // One file for every provider: Claude Code and Grok crews kept no to-do list.
-      input.dataDir !== undefined && input.dataDir !== ""
+      hasDataDir
         ? `4. Write every step of that playbook into \`${input.dataDir}/todo.md\` before any other work. Tick each step there as you go.`
         : "4. Copy every step of that playbook into your to-do list, before any other to-do.",
       "5. Your final report lists each playbook step as \"✓ <step>\" or \"skip: <step>: <reason>\".",
     );
   }
+  const named = CORE_PRINCIPLES.map((name) => `\`${skill(name)}\``);
   lines.push(
     "Your final report has a line \"Skills read: <paths>\" for those files, or \"not read: <path>: <reason>\".",
+    `Core principles: read ${named.slice(0, -1).join(", ")} and ${named.at(-1)} in full. poteto-mode loads the other principles by their triggers.`,
     `Skills on this host are in \`${root}/<name>/SKILL.md\`. Load a skill by reading that file. Do not rely on a Skill tool for pstack skills; they are user-invocable only.`,
     "If a skill is not installed, continue and say so in your report.",
     ...HOUSE_RULES,
   );
-  if (playbook === "none") lines.push(...OPERATOR_MERGE_STEPS);
+  if (checker) lines.push(...checkerSteps(skill));
+  else if (playbook === "none") lines.push(...OPERATOR_MERGE_STEPS);
   else lines.push(...PLAYBOOK_RULES);
+  if (pipeline !== null) lines.push(...pipelineSection(playbook, pipeline, skill, input.dataDir));
   lines.push(SCREENSHOT_RULE);
-  if (input.shape !== "scout") lines.push(`Before you open a PR, run /no-comments (\`${root}/no-comments/SKILL.md\`) over your diff.`);
-  if (playbook === "bug-fix") lines.push(BUG_FIX_PROOF);
+  if (input.shape !== "scout" && !checker && pipeline === null) lines.push(`Before you open a PR, run /no-comments (\`${skill("no-comments")}\`) over your diff.`);
+  if (playbook === "bug-fix" && pipeline === null) lines.push(BUG_FIX_PROOF);
   lines.push(...OBSTACLES);
   return lines.join("\n");
 }
@@ -184,6 +227,19 @@ export function verifyStepGap(report: string, playbook: string): string | null {
   // A ✓ line is not judged on its wording; the merge gate needs a record with driven and seen.
   if (/^[✓✔✅]$/.test(line.mark)) return null;
   return `${STEP_STATE[line.mark] ?? "not done"}: "${line.body}"`;
+}
+
+const PROOF_LINE = new RegExp(`^[ \\t]*(?:[-*][ \\t]*)?(✓|✔|✅|skip(?:ped)?:|pending:?|blocked:|todo:|not done:|☐|\\[ \\])[ \\t]*((?:P?\\d+\\.?[ \\t]*)?${PROOF_STEP}\\b.*)$`, "im");
+
+// Why a pipeline crew's report does not show the proof step done with what was driven
+// and seen, or null.
+export function pipelineProofGap(report: string): string | null {
+  const line = PROOF_LINE.exec(report);
+  if (line === null) return `missing: no "✓ P4 ${PROOF_STEP}" line`;
+  const mark = line[1]!.toLowerCase().replace(/:$/, "");
+  const body = line[2]!.trim();
+  if (!/^[✓✔✅]$/.test(mark)) return `${STEP_STATE[mark] ?? "not done"}: "${body}"`;
+  return /\bdriven\b.+\bseen\b/i.test(body) ? null : "no evidence: the line lacks \"driven <what>; seen <what>\"";
 }
 
 export function notVerifiedNote(crewId: string, gap: string): string {

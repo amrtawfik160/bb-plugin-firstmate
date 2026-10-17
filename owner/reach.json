@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "about": "Which PRs reach customers or production and so need a checker crew on a different model before firstmate_merge (owner decision Q8). A repo not listed here reaches production. A PR whose every changed file matches internalPaths is internal and self-checks. A repo listed with reach internal never needs a checker.",
+  "internalPaths": ["docs/", "test/", "tests/", "__tests__/", ".github/", "*.md", "*.test.*", "*.spec.*"],
+  "repos": {}
+}
