@@ -149,6 +149,31 @@ FM_TEST_HOME=<clone> node scripts/patch-drift-check.mjs --ref 1f3e769616fdf9f31f
 FIRSTMATE_TEST_NATIVE=<clone> FM_TEST_HOME=<clone> npm test
 ```
 
-CANARY_SECTION
+## Canary (test captain)
 
-HANOON_SECTION
+Not run. BB loads a plugin for the whole server; `bb plugin install` has no
+per-thread scope. A second copy of this plugin would register the same tools
+and `bb firstmate` commands for every thread on the live server. So no way was
+found to run this branch for one thread on the live server without loading
+plugin code there. The options are in the PR description.
+
+## What the live captain and its crews see after merge and reload
+
+Every existing captain home stays on the 1f3e7696 bundle. A home changes
+bundle only when its owner selects another with `firstmate_runtime select`.
+The runtime refuses that while native task records remain in the home.
+
+- **Existing captains, the live one included.** Same native contract, skills
+  and scripts as today. `firstmate_skill` and `firstmate_contract` keep
+  working (the policy-reader fix). `firstmate_runtime status` lists the new
+  installed release. `bb firstmate scripts` lists 9 new native script names
+  as missing for that home; this inventory is diagnostic only.
+- **Their crews.** Unchanged. Crews use the selected release's own BB
+  backend and renderer.
+- **New captain homes, and a home after an owner-selected switch.** Native
+  15ad1bd6: the upstream-contribution authority rule, external memory tiers,
+  opt-in project capacity, the new scout cleanup and watcher fixes.
+- **Crews of those homes.** Ship briefs carry native's new rule 2 (scratch and
+  proof output under the task data folder, a clean worktree before done). The
+  worker role names the Firstmate skill file as a fallback. A CI-ready ship
+  note must name the actual PR.
