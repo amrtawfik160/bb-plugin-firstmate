@@ -7517,7 +7517,13 @@ export default async function plugin(bb: BbPluginApi) {
   // FOLLOW_UP_BURST, so a backlog cannot spend the hour in one cycle and leave a later
   // push waiting.
   let paceTokens = FOLLOW_UP_BURST, pacedAt = Date.now();
-  function chargeGithub() { if (backgroundBudget.getStore()) { backgroundReads.push(Date.now()); paceTokens -= 1; } }
+  // Each request also debits its host's GraphQL meter by one point before it runs; the
+  // response headers, where a request returns them, then set the true value.
+  function chargeGithub(hostId: string | null) {
+    const meter = hostId === null ? undefined : graphqlMeters.get(hostId);
+    if (meter) meter.remaining -= 1;
+    if (backgroundBudget.getStore()) { backgroundReads.push(Date.now()); paceTokens -= 1; }
+  }
   function backgroundAllowance() {
     const now = Date.now();
     while (backgroundReads.length && backgroundReads[0]! <= now - 3_600_000) backgroundReads.shift();
@@ -7535,7 +7541,7 @@ export default async function plugin(bb: BbPluginApi) {
     // gh's debug output carries whole response bodies; only the rate-limit headers, and the
     // last lines of a failure, come back.
     const wrapped = `t=$(mktemp) || exit 1; GH_DEBUG=api ${command} 2>"$t"; rc=$?; grep -i '^< x-ratelimit-' "$t" >&2; [ "$rc" -eq 0 ] || grep -v '^[<>*]' "$t" | tail -n 5 >&2; rm -f "$t"; exit "$rc"`;
-    chargeGithub();
+    chargeGithub(hostId);
     const res = await runStructuredOnHost(hostId, wrapped, timeoutMs, signal);
     let remaining: number | undefined, reset: number | undefined, seen = false;
     for (const line of res.stderr.split("\n")) {
@@ -7557,7 +7563,8 @@ export default async function plugin(bb: BbPluginApi) {
   function graphqlReadsAllowed(hostId: string): number {
     const meter = graphqlMeters.get(hostId);
     if (!meter || Date.now() >= meter.reset) return 0;
-    if (meter.remaining >= GRAPHQL_RESERVE) return Number.POSITIVE_INFINITY;
+    // A request may run only if its point leaves the reserve whole.
+    if (meter.remaining > GRAPHQL_RESERVE) return Number.POSITIVE_INFINITY;
     if (Date.now() >= quotaWarnedUntil) { quotaWarnedUntil = meter.reset; bb.log.warn(`PR follow-up paused: ${meter.remaining} GitHub GraphQL points left, under the ${GRAPHQL_RESERVE} kept for crews, merges and verdict refreshes; resumes after ${new Date(meter.reset).toISOString()}`); }
     return 0;
   }
@@ -7826,7 +7833,7 @@ export default async function plugin(bb: BbPluginApi) {
     let env = prFacts(null);
     if (hostId !== null && backgroundBudget.getStore()) await ensureGraphqlMeter(hostId,signal);
     if (backgroundMayRequest(hostId)) {
-      chargeGithub();
+      chargeGithub(hostId);
       try { env = prFacts(await raceAbort(bb.sdk.environments.pullRequest({ environmentId: envId,signal }),signal,STUCK_HOST_CALL_MS)); } catch(error) { if (signal?.aborted) throw error; }
     }
     if (env.available && env.url !== "") {
@@ -7841,7 +7848,7 @@ export default async function plugin(bb: BbPluginApi) {
       const branch = typeof e["branchName"] === "string" ? e["branchName"] : "";
       const path = typeof e["path"] === "string" ? e["path"] : "";
       if (branch !== "" && path !== "" && backgroundMayRequest(hostId)) {
-        chargeGithub();
+        chargeGithub(hostId);
         const res = await runStructuredOnHost(hostId,
           `cd ${shQuote(path)} && gh pr list --head ${shQuote(branch)} --state all --json url --limit 1`, 30_000,signal);
         if (res.exitCode !== 0) throw new Error(res.stderr || res.output || `Forge lookup exit ${res.exitCode}`);
