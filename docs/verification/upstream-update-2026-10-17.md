@@ -208,10 +208,12 @@ raised: a switch while a crew's model turn is running, with the real watcher.
    normally. It opened PR #3 and wrote its done line in that same turn.
 4. The watcher and keeper moved to the new release. Once, while the old
    keeper was replaced, the old release's `fm-watch-arm.sh` failed with
-   `trap: line 2: unexpected EOF while looking for matching ')'`. For about
-   one minute no watcher ran; the captain got the native "watcher down"
-   notice, and a new watcher on the new release started by itself. No wake
-   was lost.
+   `trap: line 2: unexpected EOF while looking for matching ')'`. The old
+   watcher was stopped at 01:44:28; the new one, on the new release, was
+   running by about 01:44:30 (from its process start time). The captain got
+   the native "watcher down" notice. The crew wrote no status line during
+   the switch, so this run does not show whether a wake can be lost; run 3
+   below tests that.
 5. `firstmate_merge` merged PR #3 (`6222b47`) on the switched home.
 
 ### Mid-turn switch with a wake inside the handoff (run 3)
@@ -230,6 +232,11 @@ logs, and the crew and captain event logs.
    delivered it, and the captain reported PR #4.
 4. After a forward switch, `firstmate_merge` merged PR #4 (`7dbd9dd`). The
    keeper log shows no shell error in this run.
+
+What this proves: in this run, one waking status line written inside a
+watcher handoff was queued by the new watcher and delivered to the captain.
+It is one timing sample, not proof for every timing. The first handoff had
+one 3-second sample with no live watcher (02:05:01); the second had none.
 
 Observations, not changed here:
 - The captain once asked for a Claude model on the project's default Codex
@@ -256,8 +263,9 @@ Run these as the live captain, in its own thread:
 6. `firstmate_contract`, read again in full. It must name 15ad1bd6.
 7. Check `firstmate_runtime action=status`: selected release has upstream
    15ad1bd6; old crews appear under `referencedReleases`.
-   Expect one "watcher down" notice while the old watcher is replaced; a
-   new watcher should start within about a minute.
+   The watcher is replaced within seconds: the canaries measured about 2 s
+   (run 2) and at most one 3-second sample without a live watcher (run 3).
+   One "watcher down" notice may appear (seen in run 2, not in run 3).
 8. Check that `state/.watch.lock/watcher-path` and
    `state/.bb-watch-keeper.bindir` in the home name the new release folder.
    The plugin log shows "replacing the keeper" when it moved them.
