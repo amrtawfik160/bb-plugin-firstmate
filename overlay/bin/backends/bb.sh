@@ -326,7 +326,7 @@ fm_backend_bb_worker_prompt() {  # <brief-path> <kind> <task-id> [delivery-mode]
   if fm_brief_intent_address_line "$brief" >/dev/null; then
     echo "error: native worker intent has an operator-address line" >&2; return 1;
   fi
-  role=$(fm_brief_worker_role "${FM_HOME:?}/state" "$id") || return 1
+  role=$(fm_brief_worker_role "${FM_HOME:?}/state" "$id" "${FM_ROOT:-$FM_HOME}") || return 1
   python3 "$fm_bin/backends/bb-worker-prompt.py" "$brief" "$kind" "$id" "$FM_HOME" "$fm_bin" "$role" "$mode"
 }
 
