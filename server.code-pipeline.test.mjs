@@ -75,7 +75,7 @@ const tool=(host,name)=>host.harness.inspection.registrations.agentTools.find(t=
 const text=out=>typeof out==='string'?out:out?.content?.[0]?.text ?? JSON.stringify(out);
 const merges=commands=>commands.filter(c=>c.includes('fm-pr-merge.sh'));
 const verify=(host,n,as='thr_cap')=>tool(host,'firstmate_deliveries').execute({action:'verify',id:id(n),commitSha:head(n).slice(0,7),driven:'a message to the staging bot across a restart',seen:'it was answered'},{threadId:as,projectId:'proj_1'});
-const check=(host,n,as,verdict='pass')=>tool(host,'firstmate_deliveries').execute({action:'check',id:id(n),commitSha:head(n).slice(0,7),verdict,notes:'read the diff; drove a restart on staging; the message was answered'},{threadId:as,projectId:'proj_1'});
+const check=(host,n,as,verdict='pass',findings)=>tool(host,'firstmate_deliveries').execute({action:'check',id:id(n),commitSha:head(n).slice(0,7),verdict,findings,notes:'read the diff; drove a restart on staging; the message was answered'},{threadId:as,projectId:'proj_1'});
 
 test('verify refuses a bug-fix PR whose crew report has no proof step, and records it once the report has one',async()=>{
  const {host,store}=await deck({report:PROVEN.replace(/^✓ P4 .*$/m,'pending: P4 Prove on the real surface: waiting on CI')});try {
@@ -83,6 +83,11 @@ test('verify refuses a bug-fix PR whose crew report has no proof step, and recor
   assert.match(refused,/^(?:Error: )?Refusing to record verification for cyndra-ai\/cyndra-saas#2391: crew 9ceeb10f's report has its proof step pending: "P4 Prove on the real surface: waiting on CI"\./);
   assert.match(refused,/✓ P4 Prove on the real surface for cyndra-ai\/cyndra-saas#2391 at 2391239: driven <what>; seen <what>/);
   assert.equal(store.get(id(2391)).verifiedCommitSha,null);
+  // The weekly scorecard counts this refused claim once, however often verification is tried.
+  await verify(host,2391);
+  const card=await host.harness.behavior.runCli(['scorecard','--json'],ctx);
+  assert.equal(card.exitCode,0,card.stderr);
+  assert.deepEqual(JSON.parse(card.stdout).unproven.map(u=>[u.pr,u.crew,u.run]),[[id(2391),BUILDER,'thr_crew']]);
  }finally{await host.harness.lifecycle.dispose();}
  const ok=await deck();try {
   text(await verify(ok.host,2391));
@@ -260,4 +265,13 @@ test('verify reads only the crew report.md: a stale done line elsewhere, or a la
    assert.equal(store.get(id(2391)).verifiedCommitSha,null,label);
   }finally{await host.harness.lifecycle.dispose();}
  }
+});
+
+test('each checker verdict reaches the weekly scorecard with its finding count',async()=>{
+ const {host}=await deck();try {
+  text(await check(host,2391,'thr_chk','fail',2));
+  const card=JSON.parse((await host.harness.behavior.runCli(['scorecard','--json'],ctx)).stdout);
+  assert.deepEqual(card.checks.map(c=>[c.pr,c.verdict,c.findings,c.model]),[[id(2391),'fail',2,'gpt-6-astra']]);
+  assert.match((await host.harness.behavior.runCli(['scorecard'],ctx)).stdout,/Checker findings: 2 findings in 1 fail verdict on 1 PR\. Source: checker verdicts\./);
+ }finally{await host.harness.lifecycle.dispose();}
 });

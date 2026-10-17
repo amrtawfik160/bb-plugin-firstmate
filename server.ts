@@ -96,6 +96,9 @@ import { crewPipeline, crewPlaybook, crewSkillBlock, crewSkillRoot, notVerifiedN
 import { CREW_ROLES, crewExecution } from "./owner/crew-roles.ts";
 import { DISPATCH_VERSION, PROOF_STEP, pipelineGates, proofStep } from "./owner/pipelines.ts";
 import { changeReach } from "./owner/reach.ts";
+import { addCorrection, CAPTAIN_FILE, CORRECTION_RULE, correctionBrief, fixCorrection, LEDGER_FILE, readLedger, within } from "./owner/corrections.ts";
+import { renderScorecard, type ScorecardData } from "./owner/scorecard.ts";
+import { createQualityEvents } from "./lib/quality-events.ts";
 import { rpcContract } from "./rpc.ts";
 import {
   UPSTREAM_FIRSTMATE_SHA,
@@ -1546,7 +1549,7 @@ const BB_SKILL_RUNTIME_CONTRACT = [
   "Translate bin/fm-<name>.sh calls to firstmate_fm with script=<name> and the same arguments; use bb firstmate fm <name> only when a shell command is required.",
   "Load native policy skills and their references with firstmate_skill (bb firstmate skill <name> [reference] [--source <selected-root source-file>]); it reads this captain’s selected runtime. Native AGENTS.md means firstmate_contract; bin and docs mean the selected runtime, while data, state and config mean the exact bound captain home returned by deck.",
   "Map workers, panes, and tabs to BB crew threads via firstmate_dispatch/tell/interrupt/retry/stop. Call firstmate_watch once per batch; it hands off to private durable wakes. End the turn; never retry or poll.",
-  `${OWNER_DECISION_RULE} ${CAPTAIN_RULES} firstmate_deliveries retains open PRs after worker retirement and wake acknowledgement. Continue authorized review/fix/merge work using the author for fixes and preserving the agreed native review and validation path, including independent review when required; merge through firstmate_merge. Inspect unresolved delivery records after compaction or handoff.`,
+  `${OWNER_DECISION_RULE} ${CAPTAIN_RULES} ${CORRECTION_RULE} firstmate_deliveries retains open PRs after worker retirement and wake acknowledgement. Continue authorized review/fix/merge work using the author for fixes and preserving the agreed native review and validation path, including independent review when required; merge through firstmate_merge. Inspect unresolved delivery records after compaction or handoff.`,
   "Run firstmate_toolchain for native dependency detection. For browser work use the /browser skill and browser_script (or bb plugin run browser script), with profileId unset for the thread-isolated default. This replaces native chrome-devtools-axi transport. Read config/lavish-axi-host for remote Lavish access and use bb connect expose for a board the captain should see.",
   "Treat tmux, herdr, zellij, cmux, orca, and harness-specific hook setup as reference material unless the active backend explicitly names that runtime.",
 ].join(" ");
@@ -1686,6 +1689,7 @@ export default async function plugin(bb: BbPluginApi) {
   const launches = createLaunches(bb.storage.database());
   const reports=scoutReports(bb.storage.database());
   const deliveries = createDeliveries(bb.storage.database());
+  const quality = createQualityEvents(bb.storage.database());
   const inboundLedger = createInboundLedger(bb.storage.database());
   const ownerAsks = createOwnerAsks(bb.storage.database());
   const programs = createPrograms(bb.storage.database());
@@ -5281,6 +5285,7 @@ export default async function plugin(bb: BbPluginApi) {
   /** A crew finished: settle its owner task once no other crew of that task still runs. */
   async function finishTask(crew: Crew, finish: CrewFinish): Promise<void> {
     if (!crew.parentThreadId) return;
+    quality.noteCrewEnded({ captain: crew.parentThreadId, crew: crew.id, outcome: finish.outcome || "retired", at: Date.now() });
     try {
       const running = new Set((await readCrews()).filter((c) => c.threadId !== crew.threadId).map((c) => c.id));
       const before = ownerTasks.list(crew.parentThreadId, { includeClosed: true }).find((task) => task.crewIds.includes(crew.id));
@@ -7431,7 +7436,7 @@ export default async function plugin(bb: BbPluginApi) {
     id:z.string().optional().describe("Deliverable id owner/repo#number; url works instead"),crewId:z.string().optional(),url:z.string().optional().describe("PR link"),from:z.string().nullable().optional(),
     requirement:z.enum(["pr","merged","merged-and-verified"]).optional(),reason:z.string().optional(),commitSha:z.string().optional().describe("Commit the verification covers: an open PR's current head, or a merged PR's merge commit"),
     driven:z.string().optional().describe("verify: what you drove on the real changed surface at commitSha"),seen:z.string().optional().describe("verify: what you saw"),
-    verdict:z.enum(["pass","fail"]).optional().describe("check: a checker crew's verdict on the PR head"),notes:z.string().optional().describe("check: what you checked, drove and saw, and each finding"),
+    verdict:z.enum(["pass","fail"]).optional().describe("check: a checker crew's verdict on the PR head"),findings:z.number().int().min(0).optional().describe("check: with verdict fail, how many findings the notes name"),notes:z.string().optional().describe("check: what you checked, drove and saw, and each finding"),
     authorized:z.boolean().optional().describe("Explicit user authority for abandonment or changing the delivery contract"),
     failureId:z.string().optional(),scope:z.enum(["author","baseline"]).optional(),followUpTask:z.string().optional(),
     all:z.boolean().optional().describe("Read-only project view across managers"),
@@ -7458,6 +7463,7 @@ export default async function plugin(bb: BbPluginApi) {
     const step = proofStep(pipeline);
     const gap = pipelineProofGap(await crewReportFile(crew), step, { pr: r.id, head: r.headSha ?? "" });
     if (gap === null) return;
+    quality.noteUnproven({ captain: crew.parentThreadId ?? r.owner ?? "", crew: crew.id, run: crew.threadId, pr: r.id, gap, at: Date.now() });
     const home = await crewNativeHome(crew);
     throw new Error([
       `Refusing to record verification for ${r.id}: crew ${crew.id}'s report has its proof step ${gap}.`,
@@ -7471,7 +7477,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   // Owner decision Q8: the checker is another crew, on another model than the builder.
-  async function recordCheckerVerdict(r: DeliveryRecord, caller: string, commitSha: string, verdict: "pass" | "fail" | undefined, notes: string) {
+  async function recordCheckerVerdict(r: DeliveryRecord, caller: string, commitSha: string, verdict: "pass" | "fail" | undefined, notes: string, findings?: number) {
     const checker = await findCrewByThread(caller);
     if (checker === undefined || checker.projectId !== r.projectId) throw new Error(`Refusing: only a checker crew records a verdict on ${r.id}. Dispatch one with firstmate_dispatch role=checker on a different model than the builder.`);
     const builder = r.taskId.startsWith("captain:") ? undefined : await findCrew(r.taskId);
@@ -7482,7 +7488,9 @@ export default async function plugin(bb: BbPluginApi) {
     const builderModel = builder === undefined ? "" : await crewModel(builder);
     if (builder !== undefined && builderModel === "") throw new Error(`Refusing: the model of builder crew ${builder.id} cannot be read, so the checker cannot be shown to differ from it.`);
     if (builderModel.toLowerCase() === model.toLowerCase()) throw new Error(`Refusing: checker crew ${checker.id} runs ${model}, the same model as builder crew ${builder!.id}. Dispatch the checker on a different model.`);
-    return deliveries.recordCheck(r.id, commitSha, { verdict, crewId: checker.id, providerId: checker.providerId, model, notes });
+    const recorded = deliveries.recordCheck(r.id, commitSha, { verdict, crewId: checker.id, providerId: checker.providerId, model, notes });
+    quality.noteCheck({ captain: r.owner ?? "", pr: r.id, commitSha: recorded.headSha ?? commitSha, crew: checker.id, model, verdict, findings: verdict === "fail" ? findings ?? null : 0, notes: notes.trim(), at: Date.now() });
+    return recorded;
   }
 
   async function deliveryOperation(input:z.infer<typeof deliveryParams>,ctx:unknown) {
@@ -7518,7 +7526,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (input.from !== r.owner) throw new Error("Assignment requires the explicitly named previous manager.");
       return serializeLedger(`delivery:${r.id}`,async()=>[deliveries.assign(r.id,r.owner,owner,projectId)]);
     }
-    if (input.action === "check") return [await recordCheckerVerdict(r,owner,input.commitSha ?? "",input.verdict,input.notes ?? "")];
+    if (input.action === "check") return [await recordCheckerVerdict(r,owner,input.commitSha ?? "",input.verdict,input.notes ?? "",input.findings)];
     if (input.action === "verify") {
       await requirePipelineProof(r);
       const evidence={ driven:input.driven ?? "",seen:input.seen ?? "" };
@@ -11767,6 +11775,7 @@ export default async function plugin(bb: BbPluginApi) {
         const held = taskRef !== undefined ? ownerTasks.get(taskRef) : named ?? await prTask(parentThreadId, resolvedProject, title, task);
         if (held !== undefined) {
           const joined = ownerTasks.attach(held.id, parentThreadId, { crewId, sourceRefs: origin === undefined ? [...passedRefs, ...turnRefs] : [], at: Date.now() });
+          quality.noteTaskCrew({ captain: parentThreadId, task: joined.id, title: joined.title, crew: crewId, role: role ?? "builder", shape: shape ?? "ship", at: Date.now() });
           await refreshOwnerBoard();
           return ` Owner task ${joined.id} (${joined.state}) tracks it; no new task was opened.`;
         }
@@ -11775,6 +11784,7 @@ export default async function plugin(bb: BbPluginApi) {
           captain: parentThreadId, project: await projectLabel(resolvedProject), title: title ?? task.split("\n")[0]!.slice(0, 120),
           sourceRefs: passedRefs, crewId, at: Date.now(),
         });
+        quality.noteTaskCrew({ captain: parentThreadId, task: opened.id, title: opened.title, crew: crewId, role: role ?? "builder", shape: shape ?? "ship", at: Date.now() });
         await refreshOwnerBoard();
         return ` Owner task ${opened.id} tracks it until it is merged, live, done, or dropped; a reply does not close it.`;
       };
@@ -13505,6 +13515,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (gap === null && reportGaps(report, steps).some((g) => g.startsWith("playbook step lines (0 "))) return;
     await bb.storage.kv.set(verifyKey, { gap });
     if (gap === null) return;
+    quality.noteUnproven({ captain: crew.parentThreadId, crew: crew.id, run: crew.threadId, pr: prKeyOf(crew.prUrl ?? "") ?? null, gap, at: Date.now() });
     await deliverToCaptain(crew.parentThreadId, notVerifiedNote(crew.id, gap), crew.id);
     await tellCrew(crew, notVerifiedRequest(gap), false, true);
   }
@@ -13523,6 +13534,7 @@ export default async function plugin(bb: BbPluginApi) {
     const stopped = await turnWasStopped(thread);
     const outcome = parseOutcome(lastAssistantText);
     if (stopped || verdictOf(outcome) === "DONE" || verdictOf(outcome) === "FAILED") inboundLedger.crewEnded(crew.id, Date.now());
+    if (crew.parentThreadId && (stopped || ["DONE", "FAILED", "BLOCKED"].includes(verdictOf(outcome) ?? ""))) quality.noteCrewEnded({ captain: crew.parentThreadId, crew: crew.id, outcome: stopped ? "stopped" : outcome ?? "", at: Date.now() });
     // BB already reports interruptions to the parent. A completion wake here can
     // cause the manager to resume work the user just stopped.
     if (stopped) return;
@@ -14133,6 +14145,46 @@ export default async function plugin(bb: BbPluginApi) {
     return { ...target, model: typeof pick?.["model"] === "string" ? pick["model"] : null };
   }
 
+  // Owner decisions Q15, Q16, Q21: the corrections ledger and the weekly scorecard read the
+  // captain's own home. A read that fails for any reason but a missing file stops the write.
+  async function captainHomeOf(captain: string | undefined): Promise<string> {
+    const home = captain ? await bb.storage.kv.get<string>(`native-home:${captain}`) : null;
+    return (home ?? (await settings.get()).fmHome).trim();
+  }
+  async function readHomeText(home: string, rel: string): Promise<string> {
+    return (await readHomeFile(home, rel)) ?? "";
+  }
+  /** null: the file does not exist. */
+  async function readHomeFile(home: string, rel: string): Promise<string | null> {
+    const hostId = await fleetHost();
+    if (hostId === null || hostId === "") throw new Error("No Firstmate host. Run bb firstmate deck first.");
+    try {
+      const result = await bb.sdk.files.read({ hostId, path: `${home}/${rel}` });
+      if (!("content" in result) || typeof result.content !== "string") throw new Error("the host returned no content");
+      return result.contentEncoding === "base64" ? Buffer.from(result.content, "base64").toString("utf8") : result.content;
+    } catch (error) {
+      if (/ENOENT|not found|no such file/i.test(String(error))) return null;
+      throw new Error(`Could not read ${home}/${rel}: ${String(error)}`);
+    }
+  }
+  // The ledger is append-only and shared: one change at a time in this server, and a
+  // compare-and-swap write against the bytes read, so another writer's event is never lost.
+  async function updateHomeText<T>(home: string, rel: string, change: (text: string) => { text: string | null; result: T }): Promise<T> {
+    return serializeLedger(`home-file:${home}/${rel}`, async () => {
+      const hostId = await fleetHost();
+      if (hostId === null || hostId === "") throw new Error("No Firstmate host. Run bb firstmate deck first.");
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const before = await readHomeFile(home, rel);
+        const { text, result } = change(before ?? "");
+        if (text === null) return result;
+        const sha = before === null ? null : createHash("sha256").update(before).digest("hex");
+        const written = await bb.sdk.files.write({ hostId, path: `${home}/${rel}`, rootPath: home, content: Buffer.from(text).toString("base64"), contentEncoding: "base64", createParents: true, expectedSha256: sha, mode: 0o600 });
+        if (written.outcome === "written") return result;
+      }
+      throw new Error(`Could not write ${home}/${rel}: another writer changed it 5 times in a row. Nothing was recorded; run the command again.`);
+    });
+  }
+
   bb.cli.register({
     name: "firstmate",
     summary: "Run firstmate-style crews: dispatch crewmate threads, track them, bring back results",
@@ -14170,6 +14222,8 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "decide", summary: "Durable decisions", usage: 'bb firstmate decide ask -- "<question>"' },
       { name: "posture", summary: "Per-project delivery mode + yolo", usage: "bb firstmate posture set --project <id> [--mode m]" },
       { name: "memory", summary: "Captain prefs + learnings", usage: "bb firstmate memory show" },
+      { name: "corrections", summary: "Owner corrections ledger: record one, record its fix, list them", usage: 'bb firstmate corrections add --ref <owner message ref> -- "<owner words>" | fix <C-id> --fix <PR url|data/captain.md> --changelog "<one line>" | list [--captain <thread-id>] [--since <iso>] [--until <iso>] [--json]' },
+      { name: "scorecard", summary: "Weekly counts: owner corrections, redone work, checker findings, done claims without proof", usage: "bb firstmate scorecard [--captain <thread-id>] [--since <iso>] [--until <iso>] [--json]" },
       { name: "afk", summary: "Away posture", usage: "bb firstmate afk on|off|status|reconcile-return [--captain <thread-id>]" },
       { name: "quiet", summary: "Batch routine pings while present", usage: "bb firstmate quiet on|off|status" },
       { name: "secondmate", summary: "Register a domain captain thread", usage: "bb firstmate secondmate list|register|drop" },
@@ -14534,7 +14588,7 @@ export default async function plugin(bb: BbPluginApi) {
           }
           case "deliveries": {
             const input=deliveryParams.parse({ action:rest[0] ?? "list",id:rest[1],crewId:flagStr(flags,"crew"),url:flagStr(flags,"url"),from:flagStr(flags,"from") === "none" ? null : flagStr(flags,"from"),
-              failureId:flagStr(flags,"failure"),scope:flagStr(flags,"scope"),followUpTask:flagStr(flags,"follow-up-task"),requirement:flagStr(flags,"requirement"),reason:flagStr(flags,"reason"),commitSha:flagStr(flags,"commit"),driven:flagStr(flags,"driven"),seen:flagStr(flags,"seen"),verdict:flagStr(flags,"verdict"),notes:flagStr(flags,"notes"),authorized:flags.has("authorized"),all:flags.has("all"),
+              failureId:flagStr(flags,"failure"),scope:flagStr(flags,"scope"),followUpTask:flagStr(flags,"follow-up-task"),requirement:flagStr(flags,"requirement"),reason:flagStr(flags,"reason"),commitSha:flagStr(flags,"commit"),driven:flagStr(flags,"driven"),seen:flagStr(flags,"seen"),verdict:flagStr(flags,"verdict"),notes:flagStr(flags,"notes"),findings:flagStr(flags,"findings") === undefined ? undefined : Number(flagStr(flags,"findings")),authorized:flags.has("authorized"),all:flags.has("all"),
               limit:flagStr(flags,"limit") ? Number(flagStr(flags,"limit")) : undefined,offset:flagStr(flags,"offset") ? Number(flagStr(flags,"offset")) : undefined });
             const rows=await deliveryOperation(input,ctx);
             return reply(rows,rows.map(deliveryLine).join("\n") || "No unresolved deliverables.");
@@ -15003,6 +15057,71 @@ export default async function plugin(bb: BbPluginApi) {
               return reply({projectId,...value},JSON.stringify(value,null,2));
             }
             const value=await postureContext(projectId,ctx);return reply(value,JSON.stringify(value,null,2));
+          }
+          case "corrections": {
+            const sub = rest[0] ?? "list";
+            const captain = flagStr(flags, "captain") ?? ctxThread;
+            const home = await captainHomeOf(captain);
+            if (home === "") return fail("No captain home. Run bb firstmate deck in the captain thread first.");
+            if (sub === "add") {
+              const ref = flagStr(flags, "ref") ?? "";
+              const words = rest.slice(1).join(" ").trim();
+              if (ref === "" || words === "") return fail('Usage: bb firstmate corrections add --ref <owner message ref> -- "<owner words>"');
+              const added = await updateHomeText(home, LEDGER_FILE, (ledger) => {
+                const next = addCorrection(ledger, { ref, words, at: new Date().toISOString() });
+                return { text: next.added ? next.text : null, result: next };
+              });
+              const c = added.correction;
+              if (!added.added) {
+                const state = c.fix === undefined ? "still open. Do not dispatch another crew: check firstmate_crews for the crew titled \"Correction " + c.id + "\"" : `fixed by ${c.fix.ref}. Do not dispatch another crew`;
+                return reply({ correction: c, added: false, ledger: `${home}/${LEDGER_FILE}` }, `${ref} is already recorded as ${c.id}, ${state}.`);
+              }
+              const brief = correctionBrief(c, home);
+              const dispatch = { role: "builder", playbook: "none", title: `Correction ${c.id}` };
+              return reply({ correction: c, added: true, ledger: `${home}/${LEDGER_FILE}`, dispatch, brief }, [
+                `Recorded ${c.id} for ${ref} in ${home}/${LEDGER_FILE}.`,
+                `Dispatch the correction crew now: firstmate_dispatch role=builder playbook=none title="Correction ${c.id}", with this task:`,
+                "",
+                brief,
+                "",
+                `When it ends: bb firstmate corrections fix ${c.id} --fix "<its FIX line>" --changelog "<its CHANGELOG line>", then send the owner the CHANGELOG line.`,
+              ].join("\n"));
+            }
+            if (sub === "fix") {
+              const id = rest[1] ?? "";
+              const captainMd = await readHomeText(home, CAPTAIN_FILE);
+              const next = await updateHomeText(home, LEDGER_FILE, (ledger) => {
+                const text = fixCorrection(ledger, { id, ref: flagStr(flags, "fix") ?? "", changelog: flagStr(flags, "changelog") ?? "", at: new Date().toISOString() }, captainMd);
+                return { text, result: text };
+              });
+              const row = readLedger(next).find((c) => c.id === id)!;
+              return reply(row, `Recorded the fix of ${id}: ${row.fix!.ref}. Send the owner: ${row.fix!.changelog}`);
+            }
+            if (sub !== "list") return fail(usage);
+            const since = flagStr(flags, "since") === undefined ? 0 : Date.parse(flagStr(flags, "since")!);
+            const until = flagStr(flags, "until") === undefined ? Number.MAX_SAFE_INTEGER : Date.parse(flagStr(flags, "until")!);
+            if (!Number.isFinite(since) || !Number.isFinite(until)) return fail("--since and --until take an ISO date.");
+            const rows = within(readLedger(await readHomeText(home, LEDGER_FILE)), since, until);
+            return reply(rows, rows.length === 0 ? "No owner corrections recorded." : rows.map((c) => `${c.id} ${c.at.slice(0, 10)} ${c.ref} ${c.fix ? `fixed: ${c.fix.ref}` : "open"}: ${c.words.split("\n")[0]}`).join("\n"));
+          }
+          case "scorecard": {
+            const captain = flagStr(flags, "captain") ?? ctxThread;
+            if (captain === undefined) return fail("Pass --captain <thread-id>.");
+            const until = flagStr(flags, "until") === undefined ? Date.now() : Date.parse(flagStr(flags, "until")!);
+            const since = flagStr(flags, "since") === undefined ? until - 7 * 86_400_000 : Date.parse(flagStr(flags, "since")!);
+            if (!Number.isFinite(since) || !Number.isFinite(until)) return fail("--since and --until take an ISO date.");
+            const home = await captainHomeOf(captain);
+            const ledger = home === "" ? [] : readLedger(await readHomeText(home, LEDGER_FILE));
+            const week = quality.week(since, until, captain);
+            const iso = (at: number) => new Date(at).toISOString();
+            const data: ScorecardData = {
+              since: iso(since), until: iso(until),
+              corrections: within(ledger, since, until).map((c) => ({ id: c.id, ref: c.ref, at: c.at, fixed: c.fix !== undefined })),
+              redone: week.redone.map((r) => ({ ...r, at: iso(r.at) })),
+              checks: week.checks.map((c) => ({ ...c, at: iso(c.at) })),
+              unproven: week.unproven.map((u) => ({ ...u, at: iso(u.at) })),
+            };
+            return reply({ ...data, captain, home }, renderScorecard(data));
           }
           case "memory": {
             const sub = rest[0] ?? "show";

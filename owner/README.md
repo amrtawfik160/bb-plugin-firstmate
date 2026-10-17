@@ -26,8 +26,14 @@ path that ends in `/` covers that folder; any other path covers that file only.
 Host files are owner-owned too, and outside the repo:
 `~/.bb-server/AGENTS.md` (reply style, project credentials),
 `~/.claude/CLAUDE.md` (changelog), and the captain home's
-`data/captain.md` (Hanoon's owner rules). The owner and the captain edit them
+`data/captain.md` (Hanoon's owner rules), `data/captain.archive.md` (his old
+rules) and `data/corrections.jsonl` (the owner corrections ledger). The owner and the captain edit them
 on purpose, so nothing checks their sentences. A re-pin must not change them.
+
+The weekly native sync (`native-sync.ts`), the corrections ledger
+(`corrections.ts`) and the weekly scorecard (`scorecard.ts`) are owner files;
+see [the native sync brief](../docs/native-sync.md) and
+[the learning loop](../docs/learning-loop.md).
 
 Rules inside plugin skills stay in `entry-skills/`, because BB loads plugin
 skills only from that folder. The Claude, Codex and agents skill roots link to

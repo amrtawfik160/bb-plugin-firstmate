@@ -120,7 +120,7 @@ test("a re-pin writes a sync branch that changes only native files and native re
   withRepin(({ root, home, native, sha }) => {
     const r = repin(root, native, sha, home);
     assert.equal(r.status, 0, r.stdout + r.stderr);
-    assert.match(r.stdout, /ownership ok: \d+ changed paths are native-owned; 3 host files unchanged/);
+    assert.match(r.stdout, /ownership ok: \d+ changed paths are native-owned; 5 host files unchanged/);
     assert.match(r.stdout, /skill-fidelity: OK/);
     const [, branch, dir] = branchOf(r.stdout);
     const changed = git(root, "diff", "--name-only", "HEAD", branch).split("\n").filter(Boolean);
@@ -202,7 +202,7 @@ test("the writer writes into the live checkout -> refused", () => {
   }
 });
 
-for (const file of [".claude/CLAUDE.md", ".bb-server/AGENTS.md", "fm/data/captain.md"]) {
+for (const file of [".claude/CLAUDE.md", ".bb-server/AGENTS.md", "fm/data/captain.md", "fm/data/corrections.jsonl", "fm/data/captain.archive.md"]) {
   test(`the writer edits the host file ~/${file} -> refused`, () => {
     withRepin(({ root, home, native, sha }) => {
       const r = repin(root, native, sha, home, writer(home, root, `fs.appendFileSync(path.join(home, "${file}"), "extra\\n");`));
