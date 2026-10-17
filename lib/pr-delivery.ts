@@ -27,8 +27,11 @@ export interface DeliveryRecord {
   unverifiedMerge?: { words: string; actor: string; headSha: string; at: number } | null;
   /** What was driven on the real changed surface at commitSha, and what was seen. crewId names the crew that recorded it. */
   verification?: { crewId: string | null; actor: string; commitSha: string; driven: string; seen: string; at: number } | null;
+  /** The last checker crew's verdict on this PR at commitSha, with the model it ran on. */
+  check?: CheckVerdict | null;
   updatedAt: number;
 }
+export interface CheckVerdict { verdict: 'pass' | 'fail'; commitSha: string; crewId: string; providerId: string | null; model: string; notes: string; at: number }
 export interface ForgeObservation {
   headSha: string; state: 'open' | 'closed' | 'merged'; draft: boolean;
   checks: 'pending' | 'passing' | 'failing' | 'unknown'; review: 'approved' | 'changes-requested' | 'required' | 'unknown';
@@ -365,6 +368,18 @@ export function createDeliveries(db: Database) {
     if (openPr) return save({ ...r, verifiedCommitSha:sha, verification, disposition, nextCheckAt:0, updatedAt:at });
     return save({ ...r, status:'complete', verifiedCommitSha:sha, verification, notification:{...r.notification,desired:null,attempted:null},disposition,blocker:'',nextAction:'Delivery contract satisfied',updatedAt:at });
   }
+  /** A checker crew's verdict on an open PR's current head. The caller proves the crew
+   * is not the builder and runs another model; this records what it found. */
+  function recordCheck(id:string, commitSha:string, input:Omit<CheckVerdict,'commitSha'|'at'>) {
+    const r=get(id); if (!r) throw new Error(`Unknown deliverable ${id}`);
+    if (terminal(r) || r.forgeState !== 'open') throw new Error(`${r.id} is ${r.status}, not an open PR; a checker verdict covers an open PR's head`);
+    if (!r.headSha || !sameCommit(r.headSha,commitSha)) throw new Error(`Commit ${commitSha} does not match the current head ${short(r.headSha)} of ${r.id}; pass at least its first 7 characters`);
+    if (r.freshness !== 'fresh') throw new Error(`${r.id} was not freshly observed; reconcile it, then check again`);
+    const notes=input.notes.trim();
+    if (!notes) throw new Error(`A checker verdict on ${r.id} needs notes: what you checked, drove and saw.`);
+    const at=Date.now();
+    return save({ ...r, check:{ ...input, notes, commitSha:r.headSha, at }, updatedAt:at });
+  }
   /** The owner's words that waive verification, recorded with the merge of this head. */
   function waive(id:string, actor:string, words:string, headSha:string) {
     const r=get(id); if (!r) throw new Error(`Unknown deliverable ${id}`);
@@ -409,7 +424,7 @@ export function createDeliveries(db: Database) {
     const rows=db.prepare("SELECT record FROM deliveries WHERE owner=? AND json_extract(record,'$.forgeState')='merged' AND json_extract(record,'$.updatedAt')>=? ORDER BY json_extract(record,'$.updatedAt') DESC,id LIMIT ?").all(owner,since,Math.max(1,Math.min(limit,100))) as {record:string}[];
     return rows.map(row=>JSON.parse(row.record) as DeliveryRecord);
   }
-  return { get,save,list,undecided,touch,needingDecision,markDecisionAsked,mergedSince,conflict,hasOwned,needsTask,taskRecord,ownedTaskRecord,register,observe,stale,assign,ownerLost,markOwnerNeeded,ownerRestored,transferOwner,accountFailure,abandon,clearHold,forTasks,verify,waive,markQueued,notify,pendingNotifications };
+  return { get,save,list,undecided,touch,needingDecision,markDecisionAsked,mergedSince,conflict,hasOwned,needsTask,taskRecord,ownedTaskRecord,register,observe,stale,assign,ownerLost,markOwnerNeeded,ownerRestored,transferOwner,accountFailure,abandon,clearHold,forTasks,verify,recordCheck,waive,markQueued,notify,pendingNotifications };
 }
 
 const DO_NOT_MERGE = /\b(?:do not|don'?t|dont)[\s-]+merge\b|\bdo-not-merge\b/i;

@@ -13,7 +13,8 @@ const url=n=>`https://github.com/Cyndra-AI/cyndra-saas/pull/${n}`;
 const title=n=>`Change ${n}`;
 const branch=n=>`fm/${CREW}-change-${n}`;
 const ctx={threadId:'thr_cap',projectId:'proj_1'};
-const crew={id:CREW,task:'review fixes',projectId:'proj_1',threadId:'thr_crew',parentThreadId:'thr_cap',nativeHome:'/native',providerId:null,model:null,reasoningLevel:null,worktree:true,shape:'ship',posture:'direct-PR',createdAt:'2026-10-14T00:00:00.000Z'};
+// babysit: the fix rounds on open PRs; the bug-fix and feature pipeline gates have their own tests.
+const crew={id:CREW,task:'review fixes',playbook:'babysit',projectId:'proj_1',threadId:'thr_crew',parentThreadId:'thr_cap',nativeHome:'/native',providerId:null,model:null,reasoningLevel:null,worktree:true,shape:'ship',posture:'direct-PR',createdAt:'2026-10-14T00:00:00.000Z'};
 const heads=new Map();
 const head=n=>heads.get(n) ?? String(n).repeat(10).slice(0,40);
 const prNumber=command=>Number(/\/pull\/(\d+)/.exec(command)?.[1] ?? /gh pr view '?(\d+)/.exec(command)?.[1]);
@@ -33,7 +34,7 @@ function forge(command) {
  if(command.includes('gh pr view')){
   const n=prNumber(command);
   const ref=n===2400?'fm/other-crew-fix':branch(n);
-  return{payload:JSON.stringify({number:n,url:url(n),title:title(n),headRefName:ref,headRefOid:head(n),state:n===2350?'CLOSED':'OPEN',mergeable:'MERGEABLE'})};
+  return{payload:JSON.stringify({number:n,url:url(n),title:title(n),headRefName:ref,headRefOid:head(n),state:n===2350?'CLOSED':'OPEN',mergeable:'MERGEABLE',files:[{path:`docs/change-${n}.md`}]})};
  }
  return{code:0};
 }

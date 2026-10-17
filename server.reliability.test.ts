@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { stubProviderCatalog } from "./test/provider-catalog.mjs";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
@@ -16,7 +17,7 @@ type Host = ReturnType<typeof createFakePluginHost>;
 async function load(seed: (host: Host) => Promise<void> = async () => {}) {
   const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: ["captain", "firstmate"] });
   await seed(host);
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   return host;
 }
 
@@ -280,13 +281,14 @@ test("an async dispatch uses the same worktree, provider, and posture setup as a
   const host = await load();
   try {
     await asyncOn(host);
+    // 17 Oct: the builder role default (owner/crew-roles.ts) replaces the defaultProvider setting.
     await host.harness.behavior.setSettings({ defaultProvider: "codex" });
     stubSpawn(host);
     await tool(host, "firstmate_dispatch").execute({ task: "fix flaky login", projectId: "proj_1" }, capCtx);
     await until(() => host.harness.sdk.callsTo("threads.spawn").length === 1);
     const [args] = spawnArgs(host);
     assert.equal(args!.environment?.workspace?.type, "managed-worktree");
-    assert.equal(args!.providerId, "codex");
+    assert.deepEqual([args!.providerId, (args as { model?: string }).model], ["claude-code", "claude-opus-5-5"]);
     const crews = await host.bb.storage.kv.get<Array<{ posture: string }>>("crews");
     assert.equal(crews?.[0]?.posture, "no-mistakes");
   } finally {

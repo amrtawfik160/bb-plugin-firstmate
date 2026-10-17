@@ -419,5 +419,5 @@ test("Bearings preserves native's four sections, including an empty fleet and pe
 
 test("a crew prompt with a data folder names its to-do file", () => {
   const text = crewPrompt({ task: "fix login", parentThreadId: "thr_cap", shape: "ship", mode: "direct-PR", isolated: true, providerId: "claude-code", dataDir: "/fm/data/c1" });
-  assert.ok(text.includes("4. Write every step of that playbook into `/fm/data/c1/todo.md` before any other work. Tick each step there as you go."), text);
+  assert.ok(text.includes("4. Write every pipeline step into `/fm/data/c1/todo.md`, then the playbook steps, before any other work. Tick each step there as you go."), text);
 });

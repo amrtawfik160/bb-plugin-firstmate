@@ -152,7 +152,7 @@ const OWNER_CHANGES = [
   ["deletes a routing row", "entry-skills/skill-routing/SKILL.md", `edit("entry-skills/skill-routing/SKILL.md", "| PR body | \`pr\` |\\n", "");`],
   ["deletes a telegram.md line", "entry-skills/captain/references/telegram.md", `edit("entry-skills/captain/references/telegram.md", "A turn that only handled crew wakes, with nothing for the owner, ends with no text.\\n", "");`],
   ["edits the BB-only text of a mixed file", "entry-skills/captain/SKILL.md", `edit("entry-skills/captain/SKILL.md", "Merge only through \`firstmate_merge\`", "Merge with gh");`],
-  ["edits a crew-brief rule", CREW_RULES, `edit("${CREW_RULES}", "spawn no sub-agents", "spawn sub-agents");`],
+  ["edits a crew-brief rule", CREW_RULES, `edit("${CREW_RULES}", "Spawn no sub-agents", "Spawn sub-agents");`],
   ["adds an owner file", "owner/extra.md", `fs.writeFileSync("owner/extra.md", "new rule\\n");`],
   ["replaces an owner file with a link to identical bytes", CREW_RULES, `fs.writeFileSync(path.join(home, "copy.ts"), fs.readFileSync("${CREW_RULES}")); fs.rmSync("${CREW_RULES}"); fs.symlinkSync(path.join(home, "copy.ts"), "${CREW_RULES}");`],
   ["replaces an owner file with a link to a host file", CREW_RULES, `fs.rmSync("${CREW_RULES}"); fs.symlinkSync(path.join(home, ".claude/CLAUDE.md"), "${CREW_RULES}");`],
@@ -162,7 +162,7 @@ const OWNER_CHANGES = [
   ["deletes owner/", CREW_RULES, `fs.rmSync("owner", { recursive: true });`],
   ["changes an owner script's mode", "scripts/skill-roots-check.sh", `fs.chmodSync("scripts/skill-roots-check.sh", 0o644);`],
   ["edits a sibling of a native file that shares its prefix", "lib/upstream-surface.ts.owner.md", `fs.writeFileSync("lib/upstream-surface.ts.owner.md", "changed\\n");`],
-  ["edits owner files and then locks owner/ against writes", CREW_RULES, `edit("${CREW_RULES}", "spawn no sub-agents", "spawn sub-agents"); edit("server.ts", "import", "import"); fs.chmodSync("owner", 0o555);`],
+  ["edits owner files and then locks owner/ against writes", CREW_RULES, `edit("${CREW_RULES}", "Spawn no sub-agents", "Spawn sub-agents"); edit("server.ts", "import", "import"); fs.chmodSync("owner", 0o555);`],
 ];
 
 for (const [name, file, code] of OWNER_CHANGES) {

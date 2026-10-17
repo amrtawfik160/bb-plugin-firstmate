@@ -42,13 +42,15 @@ the crewmate's result report, never in a message for the user.
 
 | Task | Skills |
 |---|---|
-| Bug, failure, crash, or flaky test | `diagnosing-bugs`; poteto-mode `bug-fix.md`; `tdd` for the regression test |
+| Bug, failure, crash, or flaky test | Code pipeline (bug) below; poteto-mode `bug-fix.md` |
 | Slowness or perf regression | `diagnosing-bugs`; poteto-mode `perf-issue.md`; `benchmark-checklist` before reporting a number |
-| Feature or behavior change | poteto-mode `feature.md`; `tdd` |
+| Feature or behavior change | Code pipeline (feature) below; poteto-mode `feature.md` |
 | Refactor or architecture | poteto-mode `refactoring.md`; `codebase-design`; `improve-codebase-architecture`; the `principle-*` skills the playbook names |
 | Unclear spec or contested design | Supervisor: `grill-with-docs` with the user, then `to-spec` and `to-tickets` for work that spans crews; `interrogate` under the review bound below. Crewmate: report the open question in your result |
 | Owner asks for `/to-spec`, `/to-tickets`, `/implement-spec`, `/implement` or `/grill-me` | Supervisor: dispatch a crew that loads the named skill, `to-spec`, `to-tickets`, `implement-spec` or `implement`; for /grill-me, run `grilling` yourself with the owner. Crewmate: follow the skill your brief names |
 | Investigation of how or why, or a spec | poteto-mode `investigation.md`; `how` or `why`, single-model |
+| Research or writing, no code | No fixed pipeline: the supervisor names the playbook and skills in the brief |
+| Check another crew's PR before merge (checker crew) | `code-review`; `blast-radius`; `interrogate` under the sub-agent rule below; record the verdict with bb firstmate deliveries check |
 | Design question that needs running code | poteto-mode `prototype.md`; `prototype` |
 | Frontend or UI work (new screen, redesign, visual change) | `frontend-design`; the project's own design system and tokens win where they pin a choice |
 | Pixel-exact UI match | poteto-mode `visual-parity.md` |
@@ -60,16 +62,54 @@ the crewmate's result report, never in a message for the user.
 | Editing a skill or agent instructions | `writing-for-agents` |
 | Stuck or drifting | `zoom-out` |
 
+## Code pipeline
+
+Bug and feature work follows a fixed pipeline. Firstmate writes it into the
+brief as steps P1 to P7. Refactor and perf work keep their rows above.
+
+| Pipeline | Steps |
+|---|---|
+| Bug | `diagnosing-bugs`; failing test with `tdd`; fix at the root; prove on the real surface with the project's verify skill, else `verify-this`; `blast-radius`; `no-comments`; `pr` |
+| Feature | `sharpen`; `architect`; build with `tdd`; prove on the real surface with the project's verify skill, else `verify-this`; `code-review`; `no-comments`; `pr` |
+
+The report has one line per step: "✓ P<n> <step>: <evidence>" or
+"skip: P<n> <step>: <reason>". Evidence names the test, or what you drove and
+what you saw. `bb firstmate deliveries verify` refuses a pipeline crew's PR
+until its report has "✓ P4 Prove on the real surface for <owner/repo#n> at
+<head sha>: driven <what>; seen <what>" for that PR at its current head. Only
+the crew's `report.md` counts. A blocked, pending or skipped P4 line for the same
+PR and head wins over a done one. After a new push, add a new P4 line.
+
+A PR that reaches customers or production needs a checker crew on a different
+model before it merges. The plugin's `owner/reach.json` decides that from the
+repo and the changed files. Deploy workflows, deploy configs and agent prompts
+always count as production. `firstmate_merge` refuses such a PR without a pass
+verdict from a crew that is not the builder.
+
+The P4 gate applies to crews dispatched from Firstmate's pipeline version on.
+The checker rule applies to every production merge, older PRs too.
+
+## Core principles
+
+Every brief names four principles to read in full:
+`principle-prove-it-works`, `principle-fix-root-causes`,
+`principle-attack-the-premise` and `principle-test-behavior-not-implementation`.
+poteto-mode loads the other principles by their triggers.
+
 ## Firstmate rules
 
 pstack always has priority. If a skill or rule conflicts with it, pstack wins.
 The two lines below are the only exceptions:
 
-- Until the owner confirms otherwise: crews spawn no sub-agents. Where a skill
-  spawns a `Task`, a `poteto-agent`, parallel workers or extra reviewers
-  (`how`, `why`, `swarm`, `arena`, `interrogate`), do that work yourself in
-  your own session with the provider, model and effort you were given. The
-  supervisor delegates only to crewmates through `firstmate_dispatch`.
+- Until the owner confirms otherwise: crews spawn no sub-agents, except for
+  `arena` or `interrogate` where the playbook calls for them: `arena` for a new
+  UI or design choice with no example in the code, `interrogate` for a risky
+  PR. Then spawn at most 3 extra agents for that step, and run their heavy
+  commands through `~/.bb-firstmate/bin/fm-heavy`. Where another skill spawns
+  a `Task`, a `poteto-agent`, parallel workers or extra reviewers (`how`,
+  `why`, `swarm`), do that work yourself in your own session with the
+  provider, model and effort you were given. The supervisor delegates only to
+  crewmates through `firstmate_dispatch`.
 - Until the owner confirms otherwise: Firstmate decides who merges and deploys.
   Follow the brief's delivery contract for merge and deploy in place of the
   merge and deploy steps of poteto-mode's playbooks.

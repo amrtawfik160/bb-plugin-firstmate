@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { stubProviderCatalog } from "./test/provider-catalog.mjs";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import { createFakePluginHost, makePluginAgentConfigurationContext, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
@@ -18,7 +19,7 @@ const envelope = readFileSync(new URL("./test/fixtures/envelopes/live-owner.txt"
 async function captainHost() {
   const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: manifestSkillIds(new URL(".", import.meta.url).pathname) });
   await host.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   await host.harness.behavior.setSettings({ fmReliability: JSON.stringify({ inboundLedger: "on", telegramThreading: "on", asyncDispatch: "on" }) });
   host.harness.sdk.stub("threads.getPluginMetadata", async ({ threadId }: { threadId: string }) => (threadId === "thr_cap" ? { captain: "true" } : {}));
   host.harness.sdk.stub("threads.list", async () => []);

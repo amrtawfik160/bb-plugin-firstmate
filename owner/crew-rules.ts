@@ -5,7 +5,8 @@ export const PSTACK_FIRST = "pstack always has priority. If a skill or rule conf
 
 export const HOUSE_RULES = [
   PSTACK_FIRST,
-  "Until the owner confirms otherwise: spawn no sub-agents (no Task, poteto-agent or parallel workers). Do that work yourself, in this session.",
+  // Q18: multi-agent pstack skills only where the playbook calls for them.
+  "Spawn no sub-agents, except where your playbook calls for `arena` (a new UI or design choice with no example in the code) or `interrogate` (a risky PR): then spawn at most 3 extra agents for that step, and run their heavy commands through `~/.bb-firstmate/bin/fm-heavy`. Do everything else yourself, in this session.",
   "Until the owner confirms otherwise: Firstmate decides who merges and deploys. Follow the brief's delivery contract for merge and deploy.",
   "Merge only via `bb firstmate merge <crew> --pr <n> --yes`; it refuses a PR with no verification record. Never use `gh pr merge` or GitHub's API.",
   "This host is shared. Run every type check, full test run and build as `~/.bb-firstmate/bin/fm-heavy <command>`; it waits for a host-wide slot.",
@@ -23,7 +24,7 @@ export const OPERATOR_MERGE_STEPS = [
 
 export const PLAYBOOK_RULES = [
   "Report these steps as ✓, not as a skip:",
-  "- A step or skill that spawns a sub-agent, reviewer or other model (delegate, architect, interrogate, how, why, no-comments): do it yourself in this session, on your own model. Add \"(done in session)\".",
+  "- A step or skill that spawns a sub-agent, reviewer or other model (delegate, architect, how, why, no-comments): do it yourself in this session, on your own model. Add \"(done in session)\".",
   "- Cursor-only tools: for create-skill read writing-for-agents; for /loop repeat the step yourself; for origin or gt use gh-axi.",
   "- Opening a PR, merge, deploy: follow the brief's delivery contract. If proof needs a deploy you may not run, prove it on the nearest surface you can and name what is left for Firstmate.",
   // 15 Oct: a crew left "Verify on the same surface" pending on CI and handed a
@@ -43,3 +44,15 @@ export const OBSTACLES = [
   "Clear an ordinary obstacle yourself: retry with a smaller query or pagination, restore or commit what your own install changed, use another tool, or wait and retry. If rule 5 under Rules says to stop after two failures, this section replaces it.",
   "Report blocked only for what only the captain or the owner can give: a secret, an approval, a decision, withheld access, or a destructive or irreversible step. Every other stop rule still applies.",
 ] as const;
+
+// Q8: a checker crew reviews another crew's PR on a different model before it merges.
+export function checkerSteps(skill: (name: string) => string): string[] {
+  return [
+    "### Checker (Firstmate adds this to a checker crew's brief)",
+    "You check another crew's PR before it merges. Do not change its branch.",
+    `1. Read the diff at the PR's current head. Review it with \`${skill("code-review")}\` and \`${skill("blast-radius")}\`.`,
+    "2. Drive the changed surface yourself, with the project's verify skill if it has one.",
+    "3. Record your verdict: `bb firstmate deliveries check <owner/repo#n> --commit <head sha> --verdict pass|fail --notes \"<what you checked, drove and saw>\"`.",
+    "4. A fail verdict names each finding. A new push needs a new check.",
+  ];
+}

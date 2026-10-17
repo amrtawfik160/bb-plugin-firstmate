@@ -4,13 +4,14 @@ import { spawnSync } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { BRIEF_SKILLS, crewPlaybook, crewSkillBlock, crewSkillRoot, notVerifiedNote, notVerifiedRequest, PLAYBOOK_CHOICES, playbookStepCount, reportGapNote, reportGapRequest, reportGaps, skillCheckScript, skillRoutingLinkScript, verifyStepGap } from "./crew-contract.ts";
+import { BRIEF_SKILLS, crewPipeline, crewPlaybook, crewSkillBlock, crewSkillRoot, notVerifiedNote, notVerifiedRequest, pipelineProofGap, PLAYBOOK_CHOICES, playbookStepCount, reportGapNote, reportGapRequest, reportGaps, skillCheckScript, skillRoutingLinkScript, verifyStepGap } from "./crew-contract.ts";
+import { CODE_PIPELINES } from "../owner/pipelines.ts";
 
 const HOME = homedir();
 
 const IN_PLACE_OF_A_SKIP = [
   "Report these steps as ✓, not as a skip:",
-  "- A step or skill that spawns a sub-agent, reviewer or other model (delegate, architect, interrogate, how, why, no-comments): do it yourself in this session, on your own model. Add \"(done in session)\".",
+  "- A step or skill that spawns a sub-agent, reviewer or other model (delegate, architect, how, why, no-comments): do it yourself in this session, on your own model. Add \"(done in session)\".",
   "- Cursor-only tools: for create-skill read writing-for-agents; for /loop repeat the step yourself; for origin or gt use gh-axi.",
   "- Opening a PR, merge, deploy: follow the brief's delivery contract. If proof needs a deploy you may not run, prove it on the nearest surface you can and name what is left for Firstmate.",
 ];
@@ -25,7 +26,7 @@ const SKILLS_READ = "Your final report has a line \"Skills read: <paths>\" for t
 
 const HOUSE_RULES = [
   "pstack always has priority. If a skill or rule conflicts with it, pstack wins.",
-  "Until the owner confirms otherwise: spawn no sub-agents (no Task, poteto-agent or parallel workers). Do that work yourself, in this session.",
+  "Spawn no sub-agents, except where your playbook calls for `arena` (a new UI or design choice with no example in the code) or `interrogate` (a risky PR): then spawn at most 3 extra agents for that step, and run their heavy commands through `~/.bb-firstmate/bin/fm-heavy`. Do everything else yourself, in this session.",
   "Until the owner confirms otherwise: Firstmate decides who merges and deploys. Follow the brief's delivery contract for merge and deploy.",
 ];
 
@@ -80,25 +81,36 @@ test("a captain's explicit playbook overrides the title, and a scout investigate
   assert.equal(crewPlaybook({ shape: "scout", title: "Fix nothing; find why Telegram stalls", task: "" }), "investigation");
 });
 
-test("a feature brief gives full paths, the step checklist, no-comments and the pstack rule", () => {
+test("a feature brief gives full paths, the pipeline checklist, the core principles and the pstack rule", () => {
+  const root = `${HOME}/.claude/skills`;
   assert.equal(crewSkillBlock({ shape: "ship", title: "Add a CSV export", task: "", providerId: "claude-code" }), [
     "### Skills (Firstmate adds this to every brief)",
     "First action, before any other command: read the files in steps 1 to 3.",
-    `1. Read \`${HOME}/.claude/skills/skill-routing/SKILL.md\`. Load every skill its matched rows and your playbook name.`,
-    `2. Read \`${HOME}/.claude/skills/poteto-mode/SKILL.md\` in full.`,
-    `3. Follow \`${HOME}/.claude/skills/poteto-mode/playbooks/feature.md\`.`,
-    "4. Copy every step of that playbook into your to-do list, before any other to-do.",
-    "5. Your final report lists each playbook step as \"✓ <step>\" or \"skip: <step>: <reason>\".",
+    `1. Read \`${root}/skill-routing/SKILL.md\`. Load every skill its matched rows and your playbook name.`,
+    `2. Read \`${root}/poteto-mode/SKILL.md\` in full.`,
+    `3. Follow \`${root}/poteto-mode/playbooks/feature.md\`.`,
+    "4. Copy every pipeline step, then the playbook steps, into your to-do list, before any other to-do.",
+    "5. Your final report lists each pipeline step as the Pipeline section says.",
     SKILLS_READ,
-    `Skills on this host are in \`${HOME}/.claude/skills/<name>/SKILL.md\`. Load a skill by reading that file. Do not rely on a Skill tool for pstack skills; they are user-invocable only.`,
+    principles(root),
+    `Skills on this host are in \`${root}/<name>/SKILL.md\`. Load a skill by reading that file. Do not rely on a Skill tool for pstack skills; they are user-invocable only.`,
     "If a skill is not installed, continue and say so in your report.",
     ...HOUSE_RULES,
     MERGE_RULE,
     ...HOST_LIMIT,
     ...IN_PLACE_OF_A_SKIP,
     ...VERIFY_RULES,
+    "### Pipeline (feature). Do every step, in this order:",
+    `P1. Sharpen: read \`${root}/sharpen/SKILL.md\`. Evidence: the sharpened request in one sentence.`,
+    `P2. Architect: read \`${root}/architect/SKILL.md\`. Evidence: the data shape and the design you chose.`,
+    `P3. TDD build: read \`${root}/tdd/SKILL.md\`. Evidence: the test names, each failing before its code.`,
+    `P4. Prove on the real surface: use the project's verify skill if it has one (e.g. \`.agents/skills/verify-<app>/\`), else read \`${root}/verify-this/SKILL.md\`. Evidence: the PR and head you proved, what you drove and what you saw.`,
+    `P5. Code review: read \`${root}/code-review/SKILL.md\`. Evidence: the findings and what you fixed.`,
+    `P6. No comments: read \`${root}/no-comments/SKILL.md\`. Evidence: the comments you removed, or none.`,
+    `P7. PR: read \`${root}/pr/SKILL.md\`. Evidence: the PR link.`,
+    "Your final report has one line per pipeline step: \"✓ P<n> <step>: <evidence>\" or \"skip: P<n> <step>: <reason>\".",
+    "Write that report to your report file before you record verification. `bb firstmate deliveries verify` refuses this crew's PR until the report has \"✓ P4 Prove on the real surface for <owner/repo#n> at <head sha>: driven <what>; seen <what>\" for that PR at its current head. After a new push, add a new P4 line.",
     "Save each screenshot as its own full-size PNG file. Never combine, stitch or downscale screenshots; link each file separately.",
-    `Before you open a PR, run /no-comments (\`${HOME}/.claude/skills/no-comments/SKILL.md\`) over your diff.`,
     ...OBSTACLES,
   ].join("\n"));
 });
@@ -119,19 +131,21 @@ test("the file reads are the first lines of the block and the report must name t
         if (playbook !== "none") assert.equal(lines[4], `3. Follow \`${root}/poteto-mode/playbooks/${playbook}.md\`.`);
         const report = lines.indexOf(SKILLS_READ);
         assert.equal(report, playbook === "none" ? 5 : 7, `${providerId} ${shape} ${playbook}`);
+        assert.equal(lines[report + 1], principles(root), `${providerId} ${shape} ${playbook}`);
         for (const rule of HOUSE_RULES) assert.ok(lines.indexOf(rule) > report, rule);
       }
     }
   }
 });
 
-test("a bug-fix brief asks for the failing-test commit; the verify rules ask for proof on the real surface", () => {
+test("a bug-fix brief asks for the failing-test commit in its pipeline; the verify rules ask for proof on the real surface", () => {
   const block = crewSkillBlock({ shape: "ship", title: "Fix agent computer feature", task: "", providerId: "codex" });
   assert.ok(block.includes(`3. Follow \`${HOME}/.codex/skills/poteto-mode/playbooks/bug-fix.md\`.`), block);
-  assert.ok(block.endsWith([
-    "Bug-fix proof: your final report gives the commit id of the failing test, committed before the fix.",
-    ...OBSTACLES,
-  ].join("\n")), block);
+  assert.ok(block.includes("Evidence: the test name and the commit id of the failing test."), block);
+  assert.ok(block.includes(VERIFY_RULES.join("\n")), block);
+  assert.ok(block.endsWith(OBSTACLES.join("\n")), block);
+  const refactor = crewSkillBlock({ shape: "ship", title: "x", task: "", providerId: "codex", playbook: "refactoring" });
+  assert.ok(refactor.includes(`Before you open a PR, run /no-comments (\`${HOME}/.codex/skills/no-comments/SKILL.md\`) over your diff.`), refactor);
 });
 
 test("a deploy brief has no playbook and follows the delivery contract", () => {
@@ -164,7 +178,7 @@ test("every brief says to load skills as files, names the skill-routing file and
     assert.ok(block.includes("Load a skill by reading that file. Do not rely on a Skill tool for pstack skills; they are user-invocable only."), block);
     assert.ok(block.includes(`1. Read \`${HOME}/${root}/skill-routing/SKILL.md\`.`), block);
     assert.ok(block.includes(IN_PLACE_OF_A_SKIP.join("\n")), block);
-    assert.ok(block.includes("spawn no sub-agents"), block);
+    assert.ok(block.includes("Spawn no sub-agents, except"), block);
   }
   const deploy = crewSkillBlock({ shape: "ship", title: "Deploy + merge #2155", task: "" });
   assert.ok(deploy.includes(`1. Read \`${HOME}/.agents/skills/skill-routing/SKILL.md\`.`), deploy);
@@ -231,7 +245,7 @@ test("skill-routing states the pstack rule, its two exceptions and the load rule
   const routing = readFileSync(new URL("../entry-skills/skill-routing/SKILL.md", import.meta.url), "utf8").replace(/\s*\n\s*/g, " ");
   for (const text of [
     "pstack always has priority. If a skill or rule conflicts with it, pstack wins.",
-    "Until the owner confirms otherwise: crews spawn no sub-agents.",
+    "Until the owner confirms otherwise: crews spawn no sub-agents, except for `arena` or `interrogate` where the playbook calls for them",
     "Until the owner confirms otherwise: Firstmate decides who merges and deploys.",
     "Load the skills the matched rows name, plus poteto-mode, plus every skill the chosen playbook names.",
     "Before you open a PR, run `/no-comments` over your diff.",
@@ -379,12 +393,18 @@ test("every brief sends heavy commands through the host limiter, for every provi
   }
 });
 
-test("the block stays short for every provider, shape and playbook", () => {
+// 17 Oct: the four core principles added about 420 characters to every brief, and the
+// code pipeline about 1,400 more to a bug-fix or feature brief.
+test("the block stays short for every provider, shape, playbook and role", () => {
   for (const providerId of ["claude-code", "codex", "acp-grok", "acp-antigravity", "pi"]) {
     for (const shape of ["ship", "scout"] as const) {
       for (const playbook of PLAYBOOK_CHOICES) {
-        const size = crewSkillBlock({ shape, title: "x", task: "", providerId, playbook }).length;
-        assert.ok(size <= 3400, `${providerId} ${shape} ${playbook}: ${size} characters`);
+        for (const role of ["builder", "checker"] as const) {
+          const input = { shape, title: "x", task: "", providerId, playbook, role };
+          const size = crewSkillBlock(input).length;
+          const bound = crewPipeline(input) === null ? 3900 : 5300;
+          assert.ok(size <= bound, `${providerId} ${shape} ${playbook} ${role}: ${size} characters`);
+        }
       }
     }
   }
@@ -399,6 +419,7 @@ test("a playbook brief names one to-do file in the crew's data folder for every 
     for (const playbook of PLAYBOOK_CHOICES) {
       const lines = crewSkillBlock({ shape: "ship", title: "x", task: "", providerId, playbook, dataDir }).split("\n");
       if (playbook === "none") assert.ok(!lines.some((l) => l.includes("todo.md")), `${providerId} none`);
+      else if (playbook === "bug-fix" || playbook === "feature") assert.equal(lines[5], `4. Write every pipeline step into \`${dataDir}/todo.md\`, then the playbook steps, before any other work. Tick each step there as you go.`, `${providerId} ${playbook}`);
       else assert.equal(lines[5], line, `${providerId} ${playbook}`);
     }
   }
@@ -531,4 +552,160 @@ test("the captain rules describe the report check and the record as they work", 
   assert.doesNotMatch(rules, /naming only CI/);
   assert.match(rules, /verify step pending, skipped or blocked comes with a NOT VERIFIED note/);
   assert.match(rules, /The report text is not judged; the evidence is the record's two fields, `driven` and `seen`\./);
+});
+
+// 16-17 Oct owner decisions Q4, Q8, Q18, Q19: a fixed pipeline for code work, a checker
+// crew for production changes, four core principles in every brief, and sub-agents only
+// for arena or interrogate.
+const principles = (root: string) =>
+  `Core principles: read \`${root}/principle-prove-it-works/SKILL.md\`, \`${root}/principle-fix-root-causes/SKILL.md\`, \`${root}/principle-attack-the-premise/SKILL.md\` and \`${root}/principle-test-behavior-not-implementation/SKILL.md\` in full. poteto-mode loads the other principles by their triggers.`;
+
+test("a bug-fix brief carries the fixed pipeline in order, with each skill's path and the evidence its report line gives", () => {
+  const root = `${HOME}/.codex/skills`;
+  const block = crewSkillBlock({ shape: "ship", title: "Fix the crash on save", task: "", providerId: "codex", dataDir: "/fm/data/c1" });
+  assert.ok(block.includes([
+    "### Pipeline (bug fix). Do every step, in this order:",
+    `P1. Diagnose: read \`${root}/diagnosing-bugs/SKILL.md\`. Evidence: the root cause and how you found it.`,
+    `P2. Failing test: read \`${root}/tdd/SKILL.md\`. Evidence: the test name and the commit id of the failing test.`,
+    "P3. Fix at the root. Evidence: where the system first went wrong and the fix commit id.",
+    `P4. Prove on the real surface: use the project's verify skill if it has one (e.g. \`.agents/skills/verify-<app>/\`), else read \`${root}/verify-this/SKILL.md\`. Evidence: the PR and head you proved, what you drove and what you saw.`,
+    `P5. Blast radius: read \`${root}/blast-radius/SKILL.md\`. Evidence: what else the change could break and what you ran to rule it out.`,
+    `P6. No comments: read \`${root}/no-comments/SKILL.md\`. Evidence: the comments you removed, or none.`,
+    `P7. PR: read \`${root}/pr/SKILL.md\`. Evidence: the PR link.`,
+    "Your final report has one line per pipeline step: \"✓ P<n> <step>: <evidence>\" or \"skip: P<n> <step>: <reason>\".",
+    "Write that report to `/fm/data/c1/report.md` before you record verification. `bb firstmate deliveries verify` refuses this crew's PR until the report has \"✓ P4 Prove on the real surface for <owner/repo#n> at <head sha>: driven <what>; seen <what>\" for that PR at its current head. After a new push, add a new P4 line.",
+  ].join("\n")), block);
+  assert.ok(block.includes("4. Write every pipeline step into `/fm/data/c1/todo.md`, then the playbook steps, before any other work. Tick each step there as you go."), block);
+  assert.ok(block.includes("5. Your final report lists each pipeline step as the Pipeline section says."), block);
+  assert.ok(block.includes(principles(root)), block);
+});
+
+test("a feature brief carries sharpen, architect, tdd build, proof, code review, no-comments and pr", () => {
+  const block = crewSkillBlock({ shape: "ship", title: "Add a CSV export", task: "", providerId: "claude-code" });
+  const steps = block.split("\n").filter((line) => /^P\d+\. /.test(line)).map((line) => line.split(/[:.] /)[1]);
+  assert.deepEqual(steps, ["Sharpen", "Architect", "TDD build", "Prove on the real surface", "Code review", "No comments", "PR"]);
+  assert.ok(block.includes("### Pipeline (feature). Do every step, in this order:"), block);
+});
+
+test("refactor, perf, research and operator briefs carry no pipeline; every brief names the four core principles", () => {
+  for (const providerId of ["claude-code", "codex", null]) {
+    const root = crewSkillRoot(providerId);
+    for (const shape of ["ship", "scout"] as const) {
+      for (const playbook of PLAYBOOK_CHOICES) {
+        const block = crewSkillBlock({ shape, title: "x", task: "", providerId, playbook });
+        assert.ok(block.includes(principles(root)), `${providerId} ${shape} ${playbook}`);
+        const piped = shape === "ship" && (playbook === "bug-fix" || playbook === "feature");
+        assert.equal(block.includes("### Pipeline"), piped, `${shape} ${playbook}`);
+      }
+    }
+  }
+});
+
+test("a checker brief reviews the PR head on a different model and records a verdict; it has no pipeline", () => {
+  const block = crewSkillBlock({ shape: "ship", title: "Check PR #12", task: "", providerId: "codex", role: "checker" });
+  assert.ok(block.includes([
+    "### Checker (Firstmate adds this to a checker crew's brief)",
+    "You check another crew's PR before it merges. Do not change its branch.",
+    `1. Read the diff at the PR's current head. Review it with \`${HOME}/.codex/skills/code-review/SKILL.md\` and \`${HOME}/.codex/skills/blast-radius/SKILL.md\`.`,
+    "2. Drive the changed surface yourself, with the project's verify skill if it has one.",
+    "3. Record your verdict: `bb firstmate deliveries check <owner/repo#n> --commit <head sha> --verdict pass|fail --notes \"<what you checked, drove and saw>\"`.",
+    "4. A fail verdict names each finding. A new push needs a new check.",
+  ].join("\n")), block);
+  assert.ok(!block.includes("### Pipeline"), block);
+  assert.ok(!block.includes("/playbooks/"), block);
+  assert.equal(crewPlaybook({ shape: "ship", title: "Fix the crash", task: "", role: "checker" }), "none");
+});
+
+test("crews spawn sub-agents only for arena or interrogate, at most 3, with heavy work through fm-heavy", () => {
+  const rule = "Spawn no sub-agents, except where your playbook calls for `arena` (a new UI or design choice with no example in the code) or `interrogate` (a risky PR): then spawn at most 3 extra agents for that step, and run their heavy commands through `~/.bb-firstmate/bin/fm-heavy`. Do everything else yourself, in this session.";
+  for (const playbook of PLAYBOOK_CHOICES) {
+    const block = crewSkillBlock({ shape: "ship", title: "x", task: "", playbook });
+    assert.ok(block.includes(rule), playbook);
+    assert.ok(!block.includes("spawn no sub-agents (no Task"), playbook);
+  }
+  const skip = crewSkillBlock({ shape: "ship", title: "Add a CSV export", task: "" });
+  assert.ok(skip.includes("- A step or skill that spawns a sub-agent, reviewer or other model (delegate, architect, how, why, no-comments): do it yourself in this session, on your own model. Add \"(done in session)\"."), skip);
+  const routing = ROUTING.replace(/\s*\n\s*/g, " ");
+  assert.ok(routing.includes("crews spawn no sub-agents, except for `arena` or `interrogate` where the playbook calls for them"), "skill-routing states the exception");
+});
+
+const HEAD = "abc1234def5678abc1234def5678abc1234def56";
+const PR = { pr: "o/r#9", head: HEAD };
+const PROOF = `✓ P4 Prove on the real surface for o/r#9 at ${HEAD.slice(0, 7)}: driven a save on the staging app with the lock held; seen the row saved after release`;
+const BUG_REPORT = [
+  "✓ P1 Diagnose: the queue drops a row when the lock times out",
+  "✓ P2 Failing test: drops no row on lock timeout (commit abc1234)",
+  "✓ P3 Fix at the root: lock wait moved before the read (commit def5678)",
+  PROOF,
+  "✓ P5 Blast radius: the two other lock callers run the same path; their tests pass",
+  "✓ P6 No comments: none",
+  "✓ P7 PR: https://github.com/o/r/pull/9",
+].join("\n");
+const withProof = (line: string) => BUG_REPORT.replace(/^✓ P4 .*$/m, line);
+
+test("a P4 line for this PR at its head, with what was driven and seen, passes the proof check", () => {
+  assert.equal(pipelineProofGap(BUG_REPORT, 4, PR), null);
+  assert.equal(pipelineProofGap(BUG_REPORT, 4), null, "the DONE check needs one well-formed P4 line");
+  assert.equal(pipelineProofGap(withProof(`- ✓ P4 Prove on the real surface for O/R#9 at ${HEAD}: driven x; seen y`), 4, PR), null);
+});
+
+test("a P4 line that is skipped, pending, blocked or missing names why", () => {
+  assert.equal(pipelineProofGap(withProof("skip: P4 Prove on the real surface: no staging access"), 4, PR), "skipped: \"P4 Prove on the real surface: no staging access\"");
+  assert.equal(pipelineProofGap(withProof("pending: P4 Prove on the real surface: waiting on CI"), 4, PR), "pending: \"P4 Prove on the real surface: waiting on CI\"");
+  assert.equal(pipelineProofGap(withProof("blocked: P4 Prove on the real surface: no bot token"), 4), "blocked: \"P4 Prove on the real surface: no bot token\"");
+  assert.equal(pipelineProofGap(withProof(""), 4), "missing: no \"✓ P4 Prove on the real surface\" line");
+});
+
+// FM138 verdict 1, finding 2.
+test("a P4 line with an empty driven or seen field, or at the wrong step, is refused", () => {
+  const empty = "malformed: the line must read \"✓ P4 Prove on the real surface for <owner/repo#n> at <head sha>: driven <what>; seen <what>\", with both fields filled";
+  assert.equal(pipelineProofGap(withProof("✓ P4 Prove on the real surface for o/r#9 at abc1234: driven ; seen"), 4, PR), empty);
+  assert.equal(pipelineProofGap(withProof("✓ P4 Prove on the real surface for o/r#9 at abc1234: driven the app; seen  "), 4, PR), empty);
+  assert.equal(pipelineProofGap(withProof("✓ P4 Prove on the real surface: CI is green"), 4, PR), empty);
+  assert.equal(pipelineProofGap(withProof("✓ P99 Prove on the real surface for o/r#9 at abc1234: driven browser; seen page"), 4, PR), "missing: no \"✓ P4 Prove on the real surface\" line");
+  assert.equal(pipelineProofGap(withProof("✓ Prove on the real surface for o/r#9 at abc1234: driven browser; seen page"), 4, PR), "missing: no \"✓ P4 Prove on the real surface\" line");
+});
+
+// FM138 verdict 1, finding 3.
+test("a P4 line for another PR or an older head does not prove this PR at this head", () => {
+  const want = `missing: no "✓ P4 Prove on the real surface for o/r#9 at ${HEAD.slice(0, 7)}" line`;
+  assert.equal(pipelineProofGap(withProof("✓ P4 Prove on the real surface for o/other#9 at abc1234: driven x; seen y"), 4, PR), want);
+  assert.equal(pipelineProofGap(withProof("✓ P4 Prove on the real surface for o/r#10 at abc1234: driven x; seen y"), 4, PR), want);
+  assert.equal(pipelineProofGap(withProof("✓ P4 Prove on the real surface for o/r#9 at 0000000: driven x; seen y"), 4, PR), want);
+  assert.match(pipelineProofGap(withProof("✓ P4 Prove on the real surface for o/r#9 at abc12: driven x; seen y"), 4, PR) ?? "", /^malformed: /, "fewer than 7 characters names no commit");
+  const two = `${BUG_REPORT}\n✓ P4 Prove on the real surface for o/r#10 at 1111111: driven y; seen z`;
+  assert.equal(pipelineProofGap(two, 4, PR), null, "one report can prove two PRs, one line each");
+  assert.equal(pipelineProofGap(two, 4, { pr: "o/r#10", head: "1111111aaaa" }), null);
+});
+
+test("a pipeline crew's DONE report is counted against the pipeline steps, and the request asks for pipeline lines", () => {
+  assert.match(reportGapRequest(["playbook step lines (3 of 7)"], true), /one line per pipeline step, "✓ P<n> <step>: <evidence>" or "skip: P<n> <step>: <reason>"\./);
+  assert.deepEqual(reportGaps(`${BUG_REPORT}\nSkills read: /x`, CODE_PIPELINES["bug-fix"].length), []);
+  assert.deepEqual(reportGaps(`${BUG_REPORT.split("\n").slice(0, 3).join("\n")}\nSkills read: /x`, CODE_PIPELINES["bug-fix"].length), ["playbook step lines (3 of 7)"]);
+});
+
+test("the captain rules name the dispatch skills, the crew models and the checker rule", () => {
+  const rules = readFileSync(new URL("../entry-skills/captain/references/supervision.md", import.meta.url), "utf8").replace(/\s*\n\s*/g, " ");
+  for (const text of [
+    "Read `poteto-help` and pick the playbook and skills for the task.",
+    "run `sharpen`, then `in-your-own-words`",
+    "run `interrogate` on it",
+    "prove it with `principle-prove-it-works` or `verify-this`",
+    "`principle-never-block-on-the-human`, `principle-sequence-verifiable-units`, `principle-encode-lessons-in-structure` and `principle-guard-the-context-window`",
+    "A builder (the default) runs claude-code `claude-opus-5-5`. A checker runs codex `gpt-6-astra`.",
+    "They apply to that task's crews only.",
+    "`firstmate_merge` refuses a production PR without a `pass` verdict for its current head.",
+  ]) assert.ok(rules.includes(text), text);
+});
+
+// FM138 verdict 2, finding 2: an open P4 line for this PR at this head wins over a done one.
+test("a blocked, pending or skipped P4 line for this PR and head wins over a done one, in either order", () => {
+  const blocked = `blocked: P4 Prove on the real surface for o/r#9 at ${HEAD.slice(0, 7)}: staging is down`;
+  for (const report of [`${BUG_REPORT}\n${blocked}`, `${blocked}\n${BUG_REPORT}`]) {
+    assert.equal(pipelineProofGap(report, 4, PR), `blocked: "P4 Prove on the real surface for o/r#9 at ${HEAD.slice(0, 7)}: staging is down"`);
+  }
+  assert.match(pipelineProofGap(`${BUG_REPORT}\npending: P4 Prove on the real surface for o/r#9 at ${HEAD}: waiting`, 4, PR) ?? "", /^pending: /);
+  assert.match(pipelineProofGap(`${BUG_REPORT}\nskip: P4 Prove on the real surface for o/r#9 at ${HEAD.slice(0, 7)}: no access`, 4, PR) ?? "", /^skipped: /);
+  assert.equal(pipelineProofGap(`${BUG_REPORT}\nblocked: P4 Prove on the real surface for o/r#10 at ${HEAD.slice(0, 7)}: other PR`, 4, PR), null, "another PR's open line is independent");
+  assert.equal(pipelineProofGap(`${BUG_REPORT}\nblocked: P4 Prove on the real surface for o/r#9 at 1111111: older head`, 4, PR), null, "an older head's open line is independent");
 });

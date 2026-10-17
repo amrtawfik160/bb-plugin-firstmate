@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { stubProviderCatalog } from "./test/provider-catalog.mjs";
 import test from 'node:test';
 import { createFakePluginHost,makeThreadResponse,makePluginAgentConfigurationContext } from '@get-bb/plugin-sdk/testing';
 import plugin from './server.ts';
@@ -21,7 +22,7 @@ function hostCommands(host,answer) {
  return commands;
 }
 async function base(settings={}) {
- const host=createFakePluginHost({pluginId:'firstmate',agentSkillIds:['firstmate','captain','skill-routing','calm','catch-up','captain-methods','worker-methods',...UPSTREAM_SKILL_NAMES],settings});await plugin(host.bb);
+ const host=createFakePluginHost({pluginId:'firstmate',agentSkillIds:['firstmate','captain','skill-routing','calm','catch-up','captain-methods','worker-methods',...UPSTREAM_SKILL_NAMES],settings});await plugin(host.bb); stubProviderCatalog(host);
  commonStubs(host);return host;
 }
 function commonStubs(host) {
@@ -239,7 +240,7 @@ test('missed manager deletion is surfaced after restart; inventory failures pres
 const tool=(host,name)=>host.harness.inspection.registrations.agentTools.find(t=>t.name===name);
 const turn=()=>new Promise(setImmediate);
 async function until(condition) { for(let i=0;i<300;i++){if(condition())return;await turn();}throw new Error('fixture did not reach boundary'); }
-const forge=(extra={})=>({headRefOid:'sha1',state:'OPEN',isDraft:false,statusCheckRollup:[],reviewDecision:null,reviews:[],mergeable:'MERGEABLE',...extra});
+const forge=(extra={})=>({headRefOid:'sha1',state:'OPEN',isDraft:false,statusCheckRollup:[],reviewDecision:null,reviews:[],mergeable:'MERGEABLE',files:[{path:'docs/x.md'}],...extra});
 
 test('factory metadata adoption and dispatch recovery preserve required verification through discovery and merge',async()=>{
  for(const route of ['metadata','dispatch']) {
@@ -493,7 +494,7 @@ test('without --yes a merge previews under any posture; with --yes it reaches th
  host.harness.sdk.stub('environments.pullRequest',async()=>({outcome:'unavailable'}));
  let guarded=0;hostCommands(host,c=>{
  if(c.includes('/fm-pr-merge.sh')){guarded++;return{code:1,payload:'NATIVE_USER_HOLD_OR_CHECK_REFUSAL: retained task'};}
- if(c.includes('gh pr view'))return{payload:JSON.stringify({url:'https://github.com/acme/repo/pull/10',number:10,headRefOid:'sha10',state:'OPEN',mergeable:'MERGEABLE'})};
+ if(c.includes('gh pr view'))return{payload:JSON.stringify({url:'https://github.com/acme/repo/pull/10',number:10,headRefOid:'sha10',state:'OPEN',mergeable:'MERGEABLE',files:[{path:'docs/x.md'}]})};
  return{code:0};
  });
  const preview=await host.harness.behavior.runCli(['merge','c1','--allow-unverified','the owner said merge it'],ctx);assert.equal(preview.exitCode,0,preview.stderr);assert.match(preview.stdout,/^Not merged: this is a preview/);assert.equal(guarded,0,'standing yolo alone never merges');

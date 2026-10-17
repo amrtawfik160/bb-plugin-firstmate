@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
+import { stubProviderCatalog } from "./test/provider-catalog.mjs";
 import plugin, { fmWatchKeeperInterval, fmWatchKeeperScript } from "./server.ts";
 import { createDispatchJobs } from "./lib/async-dispatch.ts";
 import { createLaunches } from "./lib/launch.ts";
@@ -20,6 +21,7 @@ const MINUTE = 60_000;
 async function load(settings: Record<string, unknown> = {}) {
   const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings });
   await plugin(host.bb);
+  stubProviderCatalog(host);
   return host;
 }
 
@@ -576,6 +578,7 @@ test("a keeper running an outdated script is replaced with the current script", 
 // B4: async dispatch resumes after a reload and honours the provider reset time.
 
 function stubSpawn(host: Host, limited: () => boolean, resetsAt: number) {
+  stubProviderCatalog(host);
   host.harness.sdk.stub("threadSections.list", async () => []);
   host.harness.sdk.stub("threadSections.create", async () => ({ id: "sec_crews" }));
   host.harness.sdk.stub("environments.list", async () => [{ hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" }]);

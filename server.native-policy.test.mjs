@@ -1,4 +1,5 @@
 import {manifestSkillIds} from './scripts/plugin-skill-fixture.mjs';
+import { stubProviderCatalog } from './test/provider-catalog.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {createHash} from 'node:crypto';
@@ -19,7 +20,7 @@ const manifest=JSON.parse(readFileSync('package.json','utf8'));
 const ids=manifestSkillIds(process.cwd());
 const hash=text=>createHash('sha256').update(text).digest('hex');
 async function hostFor(home) {
- const host=createFakePluginHost({pluginId:'firstmate',agentSkillIds:ids,settings:{fmHome:home,fmHostId:'host_1',fullParityOnDeck:false}});await plugin(host.bb);
+ const host=createFakePluginHost({pluginId:'firstmate',agentSkillIds:ids,settings:{fmHome:home,fmHostId:'host_1',fullParityOnDeck:false}});await plugin(host.bb);stubProviderCatalog(host);
  await host.bb.storage.kv.set('native-home:thr_cap',home);await host.bb.storage.kv.set('native-home-host:thr_cap','host_1');
  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',parentThreadId:threadId==='thr_cap'?null:'thr_cap',environmentId:'env_1'}));
  host.harness.sdk.stub('threads.getPluginMetadata',async()=>({captain:'true'}));
@@ -213,6 +214,7 @@ test('registered CLI help describes actual dispatch and queue execution/gates; p
   const dHelp=subcommands.find(c=>c.name==='dispatch').usage;for(const flag of ['--task-id','--override-owner','--permission-mode'])assert.ok(dHelp.includes(flag));
   const general=await f.host.harness.behavior.runCli(['help'],ctx);assert.ok(general.stdout.includes(dHelp));assert.ok(general.stdout.includes(qHelp));
   f.host.harness.sdk.stub('providers.list',async()=>[{id:'requested',available:true}]);
+  f.host.harness.sdk.stub('providers.models',async()=>({modelLoadError:null,models:[{id:'selected',model:'selected'}]}));
   const result=await f.host.harness.behavior.runCli(['queue','add','--project','proj_1','--provider','requested','--model','selected','--reasoning-level','xhigh','--mode','direct-PR','--delivery-requirement','pr','--shape','ship','--after','dependency','--wait-until','2030-01-01T00:00:00Z','--detail','Full task text','--json','--','Exact task'],ctx);
   assert.equal(result.exitCode,0,result.stderr);const row=JSON.parse(result.stdout);
   for(const [key,value] of Object.entries({title:'Exact task',detail:'Full task text',providerId:'requested',model:'selected',reasoningLevel:'xhigh',mode:'direct-PR',deliveryRequirement:'pr',shape:'ship',parentThreadId:'thr_cap'}))assert.equal(row[key],value);

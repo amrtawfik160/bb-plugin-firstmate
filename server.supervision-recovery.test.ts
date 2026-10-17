@@ -876,31 +876,32 @@ function stubDispatchSdk(host: Host) {
   host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: "starting" }));
   host.harness.sdk.stub("projects.defaultExecutionOptions", async () => ({ providerId: "acp-cursor", model: "grok-4.6" }));
   host.harness.sdk.stub("providers.list", async () => CURSOR_CATALOG);
-  host.harness.sdk.stub("providers.models", async ({ providerId }: { providerId: string }) => ({ models: [{ id: `${providerId}-default`, model: `${providerId}-default`, isDefault: true }] }));
+  host.harness.sdk.stub("providers.models", async ({ providerId }: { providerId: string }) => ({ models: [{ id: `${providerId}-default`, model: `${providerId}-default`, isDefault: true }, ...(providerId === "claude-code" ? [{ id: "claude-opus-5-5", model: "claude-opus-5-5" }] : []), ...(providerId === "acp-cursor" ? [{ id: "grok-4.6", model: "grok-4.6" }] : [])] }));
 }
 
+// 17 Oct: a dispatch with no provider named runs the builder default, claude-code.
 test("the plan limit is remembered: the next dispatch with no provider named skips that provider, a named one keeps it, and the mark expires", async () => {
   const host = await load();
   try {
     stubDispatchSdk(host);
     const now = Date.now();
-    await host.bb.storage.kv.set(PROVIDER_UNAVAILABLE_KEY, { "acp-cursor": { until: now + 30 * 60_000, reason: "at its plan limit" } });
+    await host.bb.storage.kv.set(PROVIDER_UNAVAILABLE_KEY, { "claude-code": { until: now + 30 * 60_000, reason: "at its plan limit" } });
     const unnamed = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--", "fix flaky login"], { projectId: "proj_1" });
     assert.equal(unnamed.exitCode, 0, unnamed.stderr);
     const first = host.harness.sdk.callsTo("threads.spawn")[0]![0] as { providerId?: string; model?: string };
-    assert.equal(first.providerId, "codex", "BB's project default is Cursor, so the next provider in the catalog is used");
-    assert.equal(first.model, "codex-default");
-    assert.match(unnamed.stdout, /acp-cursor is at its plan limit until .* UTC; this crew runs on codex/);
+    assert.deepEqual([first.providerId, first.model], ["acp-cursor", "grok-4.6"], "the builder default is at its plan limit, so BB's project default is used");
+    assert.match(unnamed.stdout, new RegExp(`claude-code is at its plan limit until .* UTC; this crew runs on ${first.providerId}`));
 
-    const named = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--provider", "acp-cursor", "--", "fix flaky signup"], { projectId: "proj_1" });
+    const named = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--provider", "claude-code", "--", "fix flaky signup"], { projectId: "proj_1" });
     assert.equal(named.exitCode, 0, named.stderr);
-    assert.equal((host.harness.sdk.callsTo("threads.spawn")[1]![0] as { providerId?: string }).providerId, "acp-cursor");
+    assert.equal((host.harness.sdk.callsTo("threads.spawn")[1]![0] as { providerId?: string }).providerId, "claude-code");
     const crews = (await host.bb.storage.kv.get("crews")) as Array<{ providerId: string | null; providerNamed?: boolean }>;
-    assert.deepEqual(crews.map((c) => [c.providerId, c.providerNamed === true]), [["acp-cursor", true], ["codex", false]]);
+    assert.deepEqual(crews.map((c) => [c.providerId, c.providerNamed === true]), [["claude-code", true], [first.providerId, false]]);
 
-    await host.bb.storage.kv.set(PROVIDER_UNAVAILABLE_KEY, { "acp-cursor": { until: now - 1, reason: "at its plan limit" } });
+    await host.bb.storage.kv.set(PROVIDER_UNAVAILABLE_KEY, { "claude-code": { until: now - 1, reason: "at its plan limit" } });
     await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--", "fix flaky logout"], { projectId: "proj_1" });
-    assert.equal((host.harness.sdk.callsTo("threads.spawn")[2]![0] as { providerId?: string }).providerId, undefined, "an expired mark changes nothing");
+    const third = host.harness.sdk.callsTo("threads.spawn")[2]![0] as { providerId?: string; model?: string };
+    assert.deepEqual([third.providerId, third.model], ["claude-code", "claude-opus-5-5"], "an expired mark leaves the builder default");
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -920,7 +921,7 @@ function stubMergeSdk(host: Host) {
   const calls = { merged: 0 };
   // The merge gate reads the PR head fresh from GitHub.
   stubRoutedHost(host, (cmd) => (cmd.includes("gh pr view")
-    ? { payload: JSON.stringify({ number: 1, url: "https://github.com/o/r/pull/1", title: "t", headRefName: "fm/c1-x", headRefOid: "a".repeat(40), state: "OPEN" }) }
+    ? { payload: JSON.stringify({ number: 1, url: "https://github.com/o/r/pull/1", title: "t", headRefName: "fm/c1-x", headRefOid: "a".repeat(40), state: "OPEN", files: [{ path: "docs/x.md" }] }) }
     : {}));
   host.harness.sdk.stub("threads.list", async () => []);
   host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }));

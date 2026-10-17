@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { stubProviderCatalog } from "./test/provider-catalog.mjs";
 import test from 'node:test';
 import {spawnSync} from 'node:child_process';
 import {mkdirSync,rmSync} from 'node:fs';
@@ -19,11 +20,11 @@ function sdk(host) {
  host.harness.sdk.stub('threads.defaultExecutionOptions',async()=>({permissionMode:'accept-edits',model:'gpt-6.1-sol',reasoningLevel:'xhigh'}));
  host.harness.sdk.stub('environments.list',async()=>[{id:'env_source',hostId:'host_1',status:'ready',isWorktree:false,path:'/repo'}]);
  host.harness.sdk.stub('environments.get',async()=>({id:'env_wt',hostId:'host_1',status:'ready',isWorktree:true,path:'/wt'}));
- host.harness.sdk.stub('providers.list',async()=>[{id:'codex',available:true,models:[{id:'gpt-6.1-sol'}],reasoningLevels:[{id:'xhigh'}]}]);
+ host.harness.sdk.stub('providers.list',async()=>[{id:'codex',available:true,models:[{id:'gpt-6.1-sol'}],reasoningLevels:[{id:'xhigh'}]},{id:'claude-code',available:true,reasoningLevels:[{id:'xhigh'}]}]);
  host.harness.sdk.stub('threads.output',async()=>({output:'DONE: done'}));host.harness.sdk.stub('threads.events.list',async()=>[]);
 }
 async function factory(settings={},previous) {
- const host=previous??createFakePluginHost({pluginId:'firstmate',settings});if(!previous)await plugin(host.bb);sdk(host);return host;
+ const host=previous??createFakePluginHost({pluginId:'firstmate',settings});if(!previous)await plugin(host.bb); stubProviderCatalog(host);sdk(host);return host;
 }
 function hostCommands(host,respond) {
  const commands=[];const outputs=new Map();let n=0;
