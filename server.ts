@@ -1861,7 +1861,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
     defaultProvider: {
       type: "string",
-      label: "Default crew provider id (blank = BB resolves)",
+      label: "Provider for ship work moved off acp-antigravity (blank = the role default). Crews run their role default from owner/crew-roles.ts",
       default: "",
     },
     shipAntigravityGuard: {
