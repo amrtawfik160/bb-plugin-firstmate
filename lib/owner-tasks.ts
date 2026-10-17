@@ -195,6 +195,22 @@ export function finishedState(task: OwnerTask, records: readonly DeliveryRecord[
     : { to: "check", reason: finish.outcome || "Crew retired without reporting done" };
 }
 
+/** Owner decision Q8: the step a task takes when a crew reports done. No PR: done. A merged PR: merged
+ * or live. Open PRs: ready to merge when each is verified at its head, else check (verify first).
+ * PRs closed without a merge: check. */
+export function reportedDoneState(task: OwnerTask, records: readonly DeliveryRecord[], outcome: string): TaskMove | null {
+  if (!isOpenTask(task)) return null;
+  const linked = linkedPrs(task, records);
+  const reason = outcome.trim() || "Crew reported done";
+  if (linked.length === 0) return { to: "done", reason };
+  const proved = stateFromPrs(linked);
+  if (proved === "merged" || proved === "live") return { to: proved, reason };
+  const open = linked.filter((r) => r.forgeState !== "merged" && r.forgeState !== "closed" && r.status !== "explicitly-abandoned" && r.status !== "closed-needs-disposition" && r.status !== "complete");
+  if (open.length > 0 && open.every((r) => r.verifiedCommitSha !== null && r.verifiedCommitSha === r.headSha)) return { to: "ready", reason: `${reason}. Next: merge ${open.map((r) => r.id).join(", ")}` };
+  if (open.length > 0) return { to: "check", reason: `${reason}. Next: verify ${open.map((r) => r.id).join(", ")} at its head` };
+  return { to: "check", reason: `${reason}. Its PRs closed without a merge` };
+}
+
 export type OwnerTasks = {
   /** Open one task per job. Several tasks may share an owner message; a retried dispatch
    * (same crew) or a repeated open (same title and message) returns the task it already has. */
@@ -213,6 +229,9 @@ export type OwnerTasks = {
   holding(captain: string, prs: (pr: string, task: OwnerTask) => boolean): OwnerTask | undefined;
   /** A crew finished. When no other crew of its task still runs, settle the task. */
   finishCrew(captain: string, crewId: string, finish: CrewFinish, running: (crewId: string) => boolean,
+    recordsFor: (task: OwnerTask) => readonly DeliveryRecord[], at: number): OwnerTask | undefined;
+  /** A crew reported done (a DONE line or a native done status). When no other crew of its task runs, move the task to its next step. */
+  crewReportedDone(captain: string, crewId: string, outcome: string, running: (crewId: string) => boolean,
     recordsFor: (task: OwnerTask) => readonly DeliveryRecord[], at: number): OwnerTask | undefined;
   /** Move each open task to the state its pull requests prove. Returns the tasks that changed. */
   reconcile(captain: string, recordsFor: (task: OwnerTask) => readonly DeliveryRecord[], at: number): OwnerTask[];
@@ -344,6 +363,15 @@ export function createOwnerTasks(db: Database, heldOpen: HeldOpen = () => null, 
         return save(moveTask(task, move, at));
       })();
     },
+    crewReportedDone(captain, crewId, outcome, running, recordsFor, at) {
+      return db.transaction(() => {
+        const task = list(captain).find((item) => item.crewIds.includes(crewId));
+        if (!task || task.crewIds.some((other) => other !== crewId && running(other))) return task;
+        const move = reportedDoneState(task, recordsFor(task), outcome);
+        if (move === null || move.to === task.state || (CLOSING.has(move.to) && heldOpen(task, move.to) !== null)) return task;
+        return save(moveTask(task, move, at));
+      })();
+    },
     reconcile(captain, recordsFor, at) {
       return db.transaction(() => {
         const changed: OwnerTask[] = [];
@@ -355,7 +383,7 @@ export function createOwnerTasks(db: Database, heldOpen: HeldOpen = () => null, 
           let next = prs.length === task.prs.length ? task : { ...task, prs, updatedAt: at };
           // A PR proves progress, never a step back to a state the captain set by hand.
           if (proved !== null && proved !== next.state && TASK_TRANSITIONS[next.state].includes(proved)
-            && !(proved === "working" && next.state === "needs_you") && !(CLOSING.has(proved) && heldOpen(next, proved) !== null)) {
+            && !(proved === "working" && (next.state === "needs_you" || next.state === "check")) && !(CLOSING.has(proved) && heldOpen(next, proved) !== null)) {
             next = moveTask(next, { to: proved }, at);
           }
           if (next !== task) changed.push(save(next));

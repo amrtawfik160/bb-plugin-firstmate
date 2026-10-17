@@ -68,7 +68,7 @@ async function captainHost(status: Record<string, string> = {}, options: { decis
   return { host, rpc, tasks, asks: createOwnerAsks(host.bb.storage.database()), restore: () => { globalThis.fetch = realFetch; } };
 }
 const tool = (host: Awaited<ReturnType<typeof captainHost>>["host"], name: string) => host.harness.inspection.registrations.agentTools.find((t) => t.name === name)!;
-const text = (out: unknown) => typeof out === "string" ? out : JSON.stringify(out);
+const text = (out: unknown) => typeof out === "string" ? out : (out as { content?: Array<{ text?: string }> })?.content?.[0]?.text ?? JSON.stringify(out);
 const askCards = (rpc: Call[]) => rpc.filter((call) => call.method === "ask");
 const decided = (choice: string, confidence: number) => async () => new Response(JSON.stringify({ answers: [{ name: "answered_by_rule", choice, confidence }] }), { status: 200 });
 

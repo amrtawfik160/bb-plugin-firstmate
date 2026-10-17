@@ -107,7 +107,7 @@ test("captain can correct an answered ask and reopen it", async () => {
 test("firstmate_ask opens a card when the captain leaves out impact", async () => {
   const host = await captainHost();
   try {
-    const result = await host.harness.behavior.callAgentTool("firstmate_ask", { question: "Decision 12: switch the brands audit to weekly?", kind: "question", options: [{ label: "Weekly" }, { label: "Keep daily" }] }, { threadId: "thr_cap" });
+    const result = await host.harness.behavior.callAgentTool("firstmate_ask", { question: "Decision 12: switch the brands audit to weekly?", kind: "question", options: [{ label: "Weekly" }, { label: "Keep daily" }], project: "Areliaa" }, { threadId: "thr_cap" });
     assert.equal(typeof result === "object" && result !== null && "isError" in result, false);
     const [ask] = createOwnerAsks(host.bb.storage.database()).listOpen("thr_cap");
     assert.equal(formatAskCard(ask!), "❓ Decision 12: switch the brands audit to weekly?");
@@ -119,7 +119,7 @@ test("firstmate_ask opens a card when the captain leaves out impact", async () =
 const AGENT_NATIVE_REF = "tg:985604794:4498";
 const AGENT_NATIVE_CARD = {
   question: "agent-native: may we add its first idea to our CI, so a check that could not run is reported separately from one that passed (1 to 2 days)?",
-  kind: "question", options: [{ label: "Yes, build it" }, { label: "No" }], recommended: 0, defaultAfterMinutes: 240,
+  kind: "question", options: [{ label: "Yes, build it" }, { label: "No" }], recommended: 0, defaultAfterMinutes: 240, project: "Cyndra",
 };
 
 async function agentNativeCase() {
@@ -276,9 +276,10 @@ test("16 Oct project topics: a card and a reply carry the project the captain na
     const reply = await call("firstmate_reply", { ref: AGENT_NATIVE_REF, text: "agent-native: skip adoption, copy a few ideas.", project: "Cyndra" });
     assert.equal(failed(reply), false, textOf(reply));
     assert.equal(rpc().find((c) => c.method === "reply")!.input.project, "Cyndra");
-    const plain = await call("firstmate_ask", { ...AGENT_NATIVE_CARD, question: "Another question with no project?" });
-    assert.equal(failed(plain), false, textOf(plain));
-    assert.equal("project" in rpc().filter((c) => c.method === "ask").at(-1)!.input, false, "no project: the connector asks Decisions");
+    // Owner decision Q7 (17 Oct): a card with no project is refused, not routed by Decisions.
+    const plain = await call("firstmate_ask", { ...AGENT_NATIVE_CARD, project: undefined, question: "Another question with no project?" });
+    assert.equal(failed(plain), true, textOf(plain));
+    assert.match(textOf(plain), /Refusing: a card names its project/);
   } finally { await host.harness.lifecycle.dispose(); }
 });
 
