@@ -1095,6 +1095,11 @@ for tid in sys.argv[1:]:
   while IFS=$'\t' read -r tid _ pending; do
     [ "$pending" = check ] && checks+=("$tid")
   done <<< "$rows"
+  # A pending interaction the list already confirms is handled first; the threads
+  # still to check are read by the next pass.
+  case $'\n'"$rows" in
+    *$'\t1\n'*|*$'\t1') checks=() rows=${rows//$'\tcheck'/$'\t0'} ;;
+  esac
   if [ "${#checks[@]}" -eq 0 ]; then
     [ -z "$rows" ] || printf '%s\n' "$rows"
     return 0

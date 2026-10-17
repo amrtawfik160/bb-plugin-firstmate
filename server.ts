@@ -7489,7 +7489,7 @@ export default async function plugin(bb: BbPluginApi) {
         // A ledger row can be closed-era: a PR reopened since keeps the task.
         const reopened: string[] = [];
         for (const r of records) {
-          if (graphqlReadsAllowed(hostId) === 0) { reopened.push(`${r.id} not read: GraphQL reserve reached`); break; }
+          if (graphqlReadsAllowed(hostId) === 0 || backgroundAllowance() <= 0) { reopened.push(`${r.id} not read: GitHub allowance or reserve reached`); break; }
           const read = await ghGraphql(hostId, `gh pr view ${shQuote(r.url)} --json state`, 30_000, signal);
           const state = read.exitCode === 0 ? String(asRecord(JSON.parse(read.output || "{}"))["state"] ?? "") : "";
           if (state !== "MERGED" && state !== "CLOSED") reopened.push(`${r.id} ${state || `unreadable (exit ${read.exitCode})`}`);
@@ -7507,7 +7507,16 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
   }
+  // One hourly count of the GitHub requests the background loop makes: PR reads, discovery
+  // lookups and branch lists, retirement reads. Verdict, merge and owner requests run
+  // outside the loop and are not charged.
   const backgroundReads: number[] = [];
+  const backgroundBudget = new AsyncLocalStorage<true>();
+  function chargeGithub() { if (backgroundBudget.getStore()) backgroundReads.push(Date.now()); }
+  function backgroundAllowance() {
+    while (backgroundReads.length && backgroundReads[0]! <= Date.now() - 3_600_000) backgroundReads.shift();
+    return FOLLOW_UP_READS_PER_HOUR - backgroundReads.length;
+  }
   const crewDiscoveredAt = new Map<string, number>();
   // GraphQL points left per host, from the X-Ratelimit headers of this plugin's own PR
   // reads: GitHub enforces those, and the rate_limit overview read 1,126 points more.
@@ -7517,6 +7526,7 @@ export default async function plugin(bb: BbPluginApi) {
     // gh's debug output carries whole response bodies; only the rate-limit headers, and the
     // last lines of a failure, come back.
     const wrapped = `t=$(mktemp) || exit 1; GH_DEBUG=api ${command} 2>"$t"; rc=$?; grep -i '^< x-ratelimit-' "$t" >&2; [ "$rc" -eq 0 ] || grep -v '^[<>*]' "$t" | tail -n 5 >&2; rm -f "$t"; exit "$rc"`;
+    chargeGithub();
     const res = await runStructuredOnHost(hostId, wrapped, timeoutMs, signal);
     let remaining: number | undefined, reset: number | undefined, seen = false;
     for (const line of res.stderr.split("\n")) {
@@ -7548,6 +7558,9 @@ export default async function plugin(bb: BbPluginApi) {
     try { return await resolveHostForProject(first.projectId, first.owner ?? undefined, signal); } catch (error) { if (signal?.aborted) throw error; return undefined; }
   }
   async function deliveryPass(signal?: AbortSignal) {
+    return backgroundBudget.run(true, () => backgroundDeliveryPass(signal));
+  }
+  async function backgroundDeliveryPass(signal?: AbortSignal) {
     // First, so a PR opened this minute gets its row and its first GitHub read in this cycle.
     await openPrSweep(signal).catch(error=>{ if (!signal?.aborted) bb.log.warn(`Open PR sweep: ${String(error)}`); });
     await recoverDoneDeliveries(signal);
@@ -7559,15 +7572,13 @@ export default async function plugin(bb: BbPluginApi) {
     // every 30 minutes, for a PR merged between two lists. Lookups count against the
     // hourly allowance and stop under the GraphQL reserve.
     const host = await backgroundHost(signal);
-    while (backgroundReads.length && backgroundReads[0]! <= Date.now()-3_600_000) backgroundReads.shift();
     for (const crew of batch) {
       signal?.throwIfAborted();
       if (openPrSnapshot?.repos.some((repo) => repo.projects.has(crew.projectId))
         && (deliveries.forTasks([crew.id]).length > 0 || Date.now() - (crewDiscoveredAt.get(crew.id) ?? 0) < COVERED_DISCOVERY_MS)) continue;
-      if (backgroundReads.length >= FOLLOW_UP_READS_PER_HOUR || (host !== undefined && graphqlReadsAllowed(host) === 0)) break;
+      if (backgroundAllowance() <= 0 || (host !== undefined && graphqlReadsAllowed(host) === 0)) break;
       if (!retries.isDue("pr-discovery", crew.threadId, Date.now())) continue;
       crewDiscoveredAt.set(crew.id, Date.now());
-      backgroundReads.push(Date.now());
       try {
         await boundedFollowUp(s=>discoverCrewDelivery(crew,s),signal);
         retryCleared("pr-discovery", crew.threadId);
@@ -7584,11 +7595,8 @@ export default async function plugin(bb: BbPluginApi) {
     // for verdict-time refreshes. Reading the limit itself costs nothing.
     // The loop also keeps to its own hourly allowance, so a burst of due PRs cannot spend
     // what merges, checks and other GitHub users on the host need.
-    const now=Date.now();
-    while (backgroundReads.length && backgroundReads[0]! <= now-3_600_000) backgroundReads.shift();
-    const allowance=Math.max(0,FOLLOW_UP_READS_PER_HOUR-backgroundReads.length);
-    const due=host !== undefined && graphqlReadsAllowed(host) === 0 ? [] : deliveries.list({ due:now,limit:Math.min(FOLLOW_UP_DUE_LIMIT,allowance) });
-    for (let i=0;i<due.length;i++) backgroundReads.push(now);
+    const allowance=backgroundAllowance();
+    const due=allowance <= 0 || (host !== undefined && graphqlReadsAllowed(host) === 0) ? [] : deliveries.list({ due:Date.now(),limit:Math.min(FOLLOW_UP_DUE_LIMIT,allowance) });
     const follow=(record:DeliveryRecord)=>boundedFollowUp(async s=>{await reconcileDelivery(record,s);await notifyDelivery(record,s);},signal).catch(error=>bb.log.warn(`PR follow-up ${record.id}: ${String(error)}`));
     // With no meter yet, or past its reset, one read probes the quota before the rest.
     let next=0;
@@ -7596,7 +7604,7 @@ export default async function plugin(bb: BbPluginApi) {
     await Promise.all(Array.from({ length:Math.min(FOLLOW_UP_CONCURRENCY,due.length) },async()=>{
       for (let record=due[next++]; record!==undefined; record=due[next++]) {
         signal?.throwIfAborted();
-        if (host !== undefined && graphqlReadsAllowed(host) === 0) break;
+        if (backgroundAllowance() <= 0 || (host !== undefined && graphqlReadsAllowed(host) === 0)) break;
         await follow(record);
       }
     }));
@@ -7785,6 +7793,7 @@ export default async function plugin(bb: BbPluginApi) {
     signal?:AbortSignal,
   ): Promise<{ url: string; state: string; source: string } | null> {
     let env = prFacts(null);
+    chargeGithub();
     try { env = prFacts(await raceAbort(bb.sdk.environments.pullRequest({ environmentId: envId,signal }),signal,STUCK_HOST_CALL_MS)); } catch(error) { if (signal?.aborted) throw error; }
     if (env.available && env.url !== "") {
       await rememberPrUrl(crew, env.url,signal);
@@ -7798,6 +7807,7 @@ export default async function plugin(bb: BbPluginApi) {
       const branch = typeof e["branchName"] === "string" ? e["branchName"] : "";
       const path = typeof e["path"] === "string" ? e["path"] : "";
       if (branch !== "" && path !== "") {
+        chargeGithub();
         const res = await runStructuredOnHost(hostId,
           `cd ${shQuote(path)} && gh pr list --head ${shQuote(branch)} --state all --json url --limit 1`, 30_000,signal);
         if (res.exitCode !== 0) throw new Error(res.stderr || res.output || `Forge lookup exit ${res.exitCode}`);
