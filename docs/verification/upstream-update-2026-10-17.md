@@ -155,7 +155,7 @@ Not run. BB loads a plugin for the whole server; `bb plugin install` has no
 per-thread scope. A second copy of this plugin would register the same tools
 and `bb firstmate` commands for every thread on the live server. So no way was
 found to run this branch for one thread on the live server without loading
-plugin code there. The options are in the PR description.
+plugin code there. The options went to the repair thread for a decision.
 
 ## What the live captain and its crews see after merge and reload
 
