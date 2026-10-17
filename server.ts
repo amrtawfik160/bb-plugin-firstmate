@@ -14163,7 +14163,8 @@ export default async function plugin(bb: BbPluginApi) {
       if (!("content" in result) || typeof result.content !== "string") throw new Error("the host returned no content");
       return result.contentEncoding === "base64" ? Buffer.from(result.content, "base64").toString("utf8") : result.content;
     } catch (error) {
-      if (/ENOENT|not found|no such file/i.test(String(error))) return null;
+      // A missing file: the BB host answers "HTTP 404: Path does not exist"; a local read says ENOENT.
+      if (/ENOENT|not found|no such file|does not exist|\bHTTP 404\b/i.test(String(error))) return null;
       throw new Error(`Could not read ${home}/${rel}: ${String(error)}`);
     }
   }
