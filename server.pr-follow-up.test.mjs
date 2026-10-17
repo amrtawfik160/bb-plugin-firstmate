@@ -11,6 +11,7 @@ const BUILDER='9ceeb10f';
 const url=n=>`https://github.com/Cyndra-AI/cyndra-saas/pull/${n}`;
 const id=n=>`cyndra-ai/cyndra-saas#${n}`;
 const heads=new Map();
+let metas='';
 const head=n=>heads.get(n) ?? String(n).repeat(10).slice(0,40);
 const crewRow=(id,threadId,extra)=>({id,task:'x',projectId:'proj_1',threadId,parentThreadId:'thr_cap',nativeHome:'/native',worktree:true,shape:'ship',posture:'direct-PR',createdAt:'2026-10-17T00:00:00.000Z',reasoningLevel:null,dispatchVersion:2,...extra});
 const CREWS=[
@@ -19,8 +20,8 @@ const CREWS=[
 ];
 
 function hostCommands(host,{delayMs=0}={}) {
- const byId=new Map();let n=0;const gh={inFlight:0,maxInFlight:0,reads:0};
- host.harness.sdk.stub('terminals.create',async args=>{const tid=`term${++n}`;byId.set(tid,args.start.command);return{id:tid};});
+ const byId=new Map();let n=0;const gh={inFlight:0,maxInFlight:0,reads:0,commands:[]};
+ host.harness.sdk.stub('terminals.create',async args=>{const tid=`term${++n}`;byId.set(tid,args.start.command);gh.commands.push(args.start.command);return{id:tid};});
  host.harness.sdk.stub('terminals.get',async()=>({status:'running'}));
  host.harness.sdk.stub('terminals.close',async()=>({}));
  host.harness.sdk.stub('terminals.output',async({terminalId})=>{
@@ -34,11 +35,12 @@ function hostCommands(host,{delayMs=0}={}) {
 }
 function forge(command) {
  const n=Number(/\/pull\/(\d+)/.exec(command)?.[1]);
+ if(command.includes('/state/*.meta'))return{payload:metas};
  if(command.includes('gh pr view'))return{payload:JSON.stringify({number:n,url:url(n),title:`Change ${n}`,headRefName:`fm/${BUILDER}-change-${n}`,headRefOid:head(n),state:'OPEN',isDraft:false,mergeable:'MERGEABLE',statusCheckRollup:[{status:'COMPLETED',conclusion:'SUCCESS'}],reviewDecision:'APPROVED',reviews:[]})};
  return{code:0};
 }
 async function deck(prs,{delayMs=0}={}) {
- heads.clear();
+ heads.clear();metas='';
  const host=createFakePluginHost({pluginId:'firstmate',agentSkillIds:['firstmate','captain'],settings:{fmHome:'/native',fmHostId:'host_1'}});await plugin(host.bb);
  host.harness.sdk.stub('threads.list',async()=>[]);
  host.harness.sdk.stub('threads.getPluginMetadata',async()=>({}));
@@ -91,5 +93,22 @@ test('one follow-up cycle reads every due PR, a few at a time',async()=>{
   assert.equal(due(),0,`${due()} PRs still due after one cycle (${gh.reads} GitHub reads)`);
   assert.ok(gh.maxInFlight>1,`reads ran one at a time (${gh.maxInFlight} in flight at most)`);
   assert.ok(gh.maxInFlight<=8,`${gh.maxInFlight} GitHub reads in flight at once`);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('a crew forgotten with its PR open has its native record retired once every delivery of it ends, and only then',async()=>{
+ const {host,store,gh}=await deck([]);try {
+  const archived=new Set(['thr_c9','thr_c8','thr_c7','thr_crew']);
+  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle',environmentId:'env_wt',archivedAt:archived.has(threadId)?1:null}));
+  const deliver=(task,thread,n,status)=>{const r=store.register({url:url(n),taskId:task,projectId:'proj_1',owner:'thr_cap',home:'/native',worker:thread,requirement:'pr',continuation:crewRow(task,thread,{backlogRow:true})});
+   store.save({...store.get(r.id),status,nextCheckAt:Date.now()+3_600_000});};
+  deliver('c9','thr_c9',5001,'complete');deliver('c9','thr_c9',5002,'merged-unverified');
+  deliver('c8','thr_c8',5003,'complete');deliver('c8','thr_c8',5004,'pr-delivered');
+  deliver('c5','thr_c5',5005,'complete');
+  deliver(BUILDER,'thr_crew',5006,'complete');
+  metas=['c9\tthr_c9','c8\tthr_c8','c7\tthr_c7','c5\tthr_c5',`${BUILDER}\tthr_crew`].join('\n')+'\n';
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  const removed=gh.commands.flatMap(c=>[.../rm -f '\/native\/state\/([^.']+)\.meta'/g.exec(c)?.slice(1) ?? []]);
+  assert.deepEqual(removed,['c9'],'only the forgotten crew whose deliveries all ended loses its record');
  }finally{await host.harness.lifecycle.dispose();}
 });
