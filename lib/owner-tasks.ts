@@ -323,7 +323,10 @@ export function createOwnerTasks(db: Database, heldOpen: HeldOpen = () => null, 
         const crewIds = task.crewIds.includes(input.crewId) ? task.crewIds : [...task.crewIds, input.crewId];
         const sourceRefs = [...new Set([...task.sourceRefs, ...input.sourceRefs])];
         const restarted = isOpenTask(task) && task.state !== "working" ? moveTask(task, { to: "working" }, input.at) : task;
-        const project = !task.projectId && input.project ? { projectId: input.project.id, project: projectName(input.project.label, list(captain, { includeClosed: true }).map((item) => item.project)) } : {};
+        // The label follows the crew only when the task had none, so an older task keeps its board label.
+        const project = !task.projectId && input.project
+          ? { projectId: input.project.id, project: task.project ?? projectName(input.project.label, list(captain, { includeClosed: true }).map((item) => item.project)) }
+          : {};
         if (restarted === task && crewIds === task.crewIds && sourceRefs.length === task.sourceRefs.length && !("projectId" in project)) return task;
         return save({ ...restarted, ...project, crewIds, sourceRefs, updatedAt: input.at });
       })();
