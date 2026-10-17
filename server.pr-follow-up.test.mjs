@@ -181,3 +181,35 @@ test('retirement reads wait while the GraphQL headers of the last PR read show t
   assert.deepEqual(d.removed(),[]);
  }finally{await d.host.harness.lifecycle.dispose();}
 });
+
+test('every background GitHub request, reads, discovery lookups and branch lists, counts against one hourly allowance, and a spent allowance reads nothing',async()=>{
+ const prs=Array.from({length:100},(_,i)=>7000+i);
+ const {host,store,gh}=await deck(prs);try {
+  const crews=[...CREWS,...Array.from({length:20},(_,i)=>crewRow(`d${i}`,`thr_d${i}`,{providerId:null,model:null}))];
+  await host.bb.storage.kv.set('crews',crews);
+  host.harness.sdk.stub('environments.pullRequest',async()=>({outcome:'unavailable'}));
+  const requests=()=>gh.reads+gh.commands.filter(c=>c.includes('gh pr list')).length+host.harness.sdk.callsTo('environments.pullRequest').length;
+  const perCycle=[];
+  for(let cycle=0;cycle<10;cycle++){
+   for(const n of prs){const r=store.get(id(n));store.save({...r,nextCheckAt:0});}
+   const before=requests();await host.harness.behavior.runSchedule('pr-delivery-follow-up');perCycle.push(requests()-before);
+  }
+  assert.ok(requests()<=500,`${requests()} background GitHub requests in one hour (${perCycle.join(',')})`);
+  assert.deepEqual(perCycle.slice(-2),[0,0],'a spent allowance makes no request at all');
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('retirement reads count against the hourly allowance and stop when it is spent',async(t)=>{
+ t.mock.timers.enable({apis:['Date'],now:Date.now()});
+ const d=await sweepDeck();try {
+  const prs=Array.from({length:100},(_,i)=>8000+i);
+  for(const n of prs){const r=d.store.register({url:url(n),taskId:BUILDER,projectId:'proj_1',owner:'thr_cap',home:'/native',worker:'thr_crew',requirement:'pr'});d.store.save({...d.store.get(r.id),nextCheckAt:0});}
+  for(let cycle=0;cycle<6;cycle++){for(const n of prs) d.store.save({...d.store.get(id(n)),nextCheckAt:0});await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');}
+  states.set(5401,'MERGED');d.deliver('c9','thr_c9',5401,'complete');metas='c9\tthr_c9\n';
+  // The sweep runs once every 10 minutes; the hourly allowance is still spent 11 minutes on.
+  t.mock.timers.tick(11*60_000);
+  await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.ok(d.gh.commands.some(c=>c.includes('/state/*.meta')),'the sweep ran again');
+  assert.ok(!d.gh.commands.some(c=>c.includes('/pull/5401')),'no retirement read once the hourly allowance is spent');
+ }finally{await d.host.harness.lifecycle.dispose();}
+});
