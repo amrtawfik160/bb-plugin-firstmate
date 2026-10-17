@@ -50,6 +50,18 @@ for(const pin of pins)test(`explicit external ${pin.slice(0,8)} migration/read-b
  const rollback=f.json(f.call('rollback',[...owned,'--release','external']));assert.equal(rollback.signature,'FM_EXTERNAL_ROLLBACK_PUBLISHED');assert.equal(existsSync(join(home,'config/bb-runtime-selected.json')),false);assert.deepEqual(state(home),before);assert.equal(f.json(f.call('rollback',[...owned,'--release','external'])).changed,false);assert.ok(existsSync(change.selection.root));
  }finally{f.clean();rmSync(home,{recursive:true,force:true});}
 });
+test('rollback to an external checkout keeps the strict rule: task records, primary lock and watcher refuse it',()=>{
+ const f=runtimeFixture(),home=fixture(pins.at(-2));try {
+ ok(run('python3',[join(overlay,'install-bb-backend.py'),'--home',home]));writeFileSync(join(home,'config/bb-captain'),'thr_fixture\n');f.json(f.install());const owned=['--home',home,'--captain','thr_fixture','--host','host_fixture'];
+ f.json(f.call('migrate',[...owned,'--release',distribution.release]));
+ for(const name of ['c1.meta','.lock','.watch.lock','.bb-watch-keeper.pid']){
+  writeFileSync(join(home,'state',name),'retained authoritative identity\n');
+  for(const extra of [['--check'],[]]){const refused=f.call('rollback',[...owned,'--release','external',...extra]);assert.equal(refused.status,2,name);assert.match(refused.stdout,/selection refused/,name);assert.ok(existsSync(join(home,'config/bb-runtime-selected.json')),name);}
+  rmSync(join(home,'state',name));
+ }
+ assert.equal(f.json(f.call('rollback',[...owned,'--release','external'])).signature,'FM_EXTERNAL_ROLLBACK_PUBLISHED');
+ }finally{f.clean();rmSync(home,{recursive:true,force:true});}
+});
 test('selection refuses foreign captain/host, retained tasks/native lock, unknown release and unaudited external version',()=>{
  const f=runtimeFixture(),home=fixture();try {
  const root=f.ready();sentinels(f.home);const before=state(f.home);for(const args of [[...f.owned.map(x=>x==='thr_fixture'?'thr_foreign':x)], [...f.owned.map(x=>x==='host_fixture'?'host_foreign':x)]]){assert.equal(f.call('inspect',args).status,2);assert.deepEqual(state(f.home),before);}
