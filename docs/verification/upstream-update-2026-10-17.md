@@ -41,6 +41,9 @@ That is 73 upstream commits.
   until its owner selects another, so after the reload every existing captain
   would have lost `firstmate_skill` and `firstmate_contract`. The reader now
   accepts each audited bundled snapshot with its native commit.
+- **Runtime switch with task records** (`scripts/runtime-host.py`,
+  `lib/launch.ts`). A home with task records can now move to a new audited
+  native release; see the section below.
 - **Audited pin lists.** 15ad1bd6 joins `AUDITED_POLICY_COMMITS`, the legacy
   repair `PINS`, the patch registry and both install-input lists, the test
   fixtures and the transport allowlist.
@@ -149,28 +152,90 @@ FM_TEST_HOME=<clone> node scripts/patch-drift-check.mjs --ref 1f3e769616fdf9f31f
 FIRSTMATE_TEST_NATIVE=<clone> FM_TEST_HOME=<clone> npm test
 ```
 
+## Moving a home with task records to a new native release
+
+The runtime refused any native change while a home kept task records, the
+captain's own primary lock or a watcher. It also read lock files by presence,
+so one dead spawn lock blocked for good. The plugin added a second refusal:
+it counted every launched crew (`running`) as a consumer. So the live captain
+could never leave the 1f3e7696 bundle.
+
+Native's own update (`updatefirstmate`) moves code under live tasks. Records
+keep naming their own immutable release folder, which stays on disk. The
+plugin's supervision already re-arms a watcher and keeper from another
+release. The state contract (`native-flat-v1`) is the same in both releases.
+
+The switch now refuses only while something is executing old code at that
+moment: a spawn or control lock held by a live process, or a BB launch that is
+reserved, creating, provisioning or uncertain. External-checkout migration
+keeps its stricter rule.
+
 ## Canary (test captain)
 
-Not run. BB loads a plugin for the whole server; `bb plugin install` has no
-per-thread scope. A second copy of this plugin would register the same tools
-and `bb firstmate` commands for every thread on the live server. So no way was
-found to run this branch for one thread on the live server without loading
-plugin code there. The options went to the repair thread for a decision.
+Run on an isolated BB server and host daemon (own data folder, ports 39710
+and 39711), with the real HOME so crews could sign in to the model provider.
+The live server never saw a canary thread (`bb thread show` on the live server
+returned 404 for the canary crew).
+
+1. Installed this repo's main (`2066fa5`) on the isolated server. Bound a
+   test captain (Claude Opus). Its home ran release `c9f623c8`, native
+   1f3e7696, the same release the live captain runs.
+2. Dispatched a crew there. It opened PR #1 in a private scratch repo and left
+   task records (`82228e59.meta`, status, git hooks).
+3. Installed this branch on the isolated server. On the old bundle,
+   `firstmate_skill` and `firstmate_contract` still read native 1f3e7696.
+4. `firstmate_runtime select` was refused by the plugin's launch check (the
+   finished crew counted as running). Fixed, test first, then the switch
+   passed: release `1e8f4d75`, native 15ad1bd6, `taskStateChanged: false`.
+   `referencedReleases` still listed the old crew on `c9f623c8`.
+5. Supervision moved by itself: watcher, keeper and captain marker now run
+   from the new release.
+6. `firstmate_merge` merged the pre-switch crew's PR #1 (`7b8f61c`). A new
+   dispatch made PR #2; its brief carried native's new rule 2 and the skill
+   file fallback. `firstmate_merge` merged it (`ebb4d54`). GitHub shows both
+   merged.
+
+Observations, not changed here:
+- The captain once asked for a Claude model on the project's default Codex
+  provider; that crew failed at its first turn. The captain retried with the
+  provider named.
+- After a recorded verification on PR #2, the delivery record showed
+  `waiting-checks` in a repo with no checks; the merge still went through.
+
+## Switching the live captain (after merge and reload)
+
+Run these as the live captain, in its own thread:
+
+1. `firstmate_runtime action=install`.
+2. `firstmate_runtime action=status`. Note the installed release whose
+   upstream commit is `15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4`.
+3. `firstmate_runtime action=select release=<that release> check=true`.
+4. If it refuses with "native operation in flight" or "BB launches are
+   running/reserved/uncertain": wait for that spawn or launch to finish, then
+   repeat step 3.
+5. `firstmate_runtime action=select release=<that release>`.
+6. `firstmate_contract`, read again in full. It must name 15ad1bd6.
+7. Check `firstmate_runtime action=status`: selected release has upstream
+   15ad1bd6; old crews appear under `referencedReleases`.
+8. Check the plugin log for "replacing the keeper" with the new release path.
+
+To undo: `firstmate_runtime action=rollback release=<previous release>`, with
+`check=true` first.
 
 ## What the live captain and its crews see after merge and reload
 
-Every existing captain home stays on the 1f3e7696 bundle. A home changes
-bundle only when its owner selects another with `firstmate_runtime select`.
-The runtime refuses that while native task records remain in the home.
+Every existing captain home stays on the 1f3e7696 bundle until its captain
+runs the switch above. Open crews keep running on the release they started
+with.
 
-- **Existing captains, the live one included.** Same native contract, skills
-  and scripts as today. `firstmate_skill` and `firstmate_contract` keep
+- **Existing captains before the switch, the live one included.** Same
+  native contract, skills and scripts as today. `firstmate_skill` and `firstmate_contract` keep
   working (the policy-reader fix). `firstmate_runtime status` lists the new
   installed release. `bb firstmate scripts` lists 9 new native script names
   as missing for that home; this inventory is diagnostic only.
 - **Their crews.** Unchanged. Crews use the selected release's own BB
   backend and renderer.
-- **New captain homes, and a home after an owner-selected switch.** Native
+- **New captain homes, and a home after the switch.** Native
   15ad1bd6: the upstream-contribution authority rule, external memory tiers,
   opt-in project capacity, the new scout cleanup and watcher fixes.
 - **Crews of those homes.** Ship briefs carry native's new rule 2 (scratch and
