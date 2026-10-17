@@ -14,12 +14,17 @@ export const REACH: ReachTable = JSON.parse(readFileSync(new URL("./reach.json",
 
 const glob = (pattern: string) => new RegExp(`^${pattern.split("*").map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join("[^/]*")}$`, "i");
 
-// "test/" and ".github/workflows/" are folders at any depth, "/docs/" a folder at the root, "*.md" a file name.
+// "test/" and ".github/workflows/" are folders at any depth, "/docs/" a folder at the root,
+// "/docs/pins.json" a full path from the root, "*.md" a file name.
 function matches(path: string, patterns: readonly string[]): boolean {
   const folders = path.split("/");
   const name = folders.pop() ?? "";
   return patterns.some((pattern) => {
-    if (!pattern.endsWith("/")) return glob(pattern).test(name);
+    if (!pattern.endsWith("/")) {
+      if (!pattern.slice(1).includes("/")) return glob(pattern).test(name);
+      const full = glob(pattern.replace(/^\//, ""));
+      return pattern.startsWith("/") ? full.test(path) : path.split("/").some((_, i, parts) => full.test(parts.slice(i).join("/")));
+    }
     const want = pattern.replace(/^\/|\/$/g, "").split("/");
     const at = (i: number) => want.every((part, j) => folders[i + j] === part);
     return pattern.startsWith("/") ? at(0) : folders.some((_, i) => at(i));

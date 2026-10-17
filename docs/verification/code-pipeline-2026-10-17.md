@@ -89,3 +89,18 @@ tests in `server.code-pipeline.test.mjs` cover both.
    every production merge, older PRs too. The captain dispatches a checker for
    an older PR only when he wants to merge it, so the open PRs are not all
    checked up front.
+
+## Fixes after the independent check (verdict 2: FIX)
+
+1. In this repo, the captain's shipped instructions are production paths:
+   `/entry-skills/`, `/skills/`, `/runtime-assets/`, `/overlay/`,
+   `/native-snapshot/` and `/docs/verification/native-transport-allowlist.v1.json`,
+   which pins their hashes. `captain.md` is a production file name in any repo.
+   A pattern with a folder and a file name now matches that full path.
+2. The P4 gate reads only the crew's `report.md`, not `final-report.md` or
+   the thread output. A blocked, pending or skipped P4 line for the PR and
+   head wins over a done one, in either order. Lines for another PR or an
+   older head stay independent.
+3. The CLI-help test regression came from the shared test catalog, which had
+   no model for the test's fake provider. The test now stubs a catalog with
+   its selected model. Validation stays fail-closed.

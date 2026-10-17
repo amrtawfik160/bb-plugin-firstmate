@@ -49,7 +49,7 @@ function forge(command) {
  if(command.includes('gh pr view'))return{payload:JSON.stringify({number:n,url:url(n),title:`Change ${n}`,headRefName:`fm/${BUILDER}-change-${n}`,headRefOid:head(n),state:'OPEN',mergeable:'MERGEABLE',files:(FILES[n]??[]).map(path=>({path}))})};
  return{code:0};
 }
-async function deck({report=PROVEN,crews=CREWS}={}) {
+async function deck({report=PROVEN,crews=CREWS,files={},output='DONE: PR open'}={}) {
  heads.clear();
  const host=createFakePluginHost({pluginId:'firstmate',agentSkillIds:['firstmate','captain'],settings:{fmHome:'/native',fmHostId:'host_1'}});await plugin(host.bb);
  host.harness.sdk.stub('threads.list',async()=>[]);
@@ -58,10 +58,11 @@ async function deck({report=PROVEN,crews=CREWS}={}) {
  host.harness.sdk.stub('environments.list',async()=>[{id:'env_source',hostId:'host_1',status:'ready',isWorktree:false,path:'/repo'}]);
  host.harness.sdk.stub('environments.get',async()=>({id:'env_wt',hostId:'host_1',status:'ready',isWorktree:true,path:'/wt',branchName:`fm/${BUILDER}-change-2391`}));
  host.harness.sdk.stub('environments.pullRequest',async()=>({outcome:'unavailable'}));
- host.harness.sdk.stub('threads.output',async()=>({output:'DONE: PR open'}));
+ host.harness.sdk.stub('threads.output',async()=>({output}));
  host.harness.sdk.stub('threads.events.list',async()=>[]);
  host.harness.sdk.stub('threads.send',async()=>({delivery:'queued'}));
- host.harness.sdk.stub('files.read',async({path})=>path===`/native/data/${BUILDER}/report.md`&&report!==null?{content:report}:(()=>{throw new Error('ENOENT');})());
+ const disk={...(report===null?{}:{'report.md':report}),...files};
+ host.harness.sdk.stub('files.read',async({path})=>{const name=path.startsWith(`/native/data/${BUILDER}/`)?path.slice(`/native/data/${BUILDER}/`.length):'';if(disk[name]!==undefined)return{content:disk[name]};throw new Error('ENOENT');});
  await host.bb.storage.kv.set('crews',crews);
  const store=createDeliveries(host.bb.storage.database());
  for(const n of [2391,2392]){
@@ -240,6 +241,23 @@ test('dispatch refuses when the provider catalog or its model list cannot be rea
    const out=text(await tool(host,'firstmate_dispatch').execute({projectId:'proj_1',task:'check PR 9',role:'checker',model:'not-a-real-model'},{projectId:'proj_1'}));
    assert.match(out,/cannot be checked against the catalog of provider "codex"[^]*Nothing was spawned\./,label);
    assert.equal(host.harness.sdk.callsTo('threads.spawn').length,0,label);
+  }finally{await host.harness.lifecycle.dispose();}
+ }
+});
+
+// FM138 verdict 2, finding 2: only the crew's current report.md proves P4, and an open line
+// there for this PR and head wins over a done one anywhere.
+test('verify reads only the crew report.md: a stale done line elsewhere, or a later open line, does not prove P4',async()=>{
+ const blocked=`blocked: P4 Prove on the real surface for cyndra-ai/cyndra-saas#2391 at ${head(2391).slice(0,7)}: staging is down`;
+ for(const [label,opts,want] of [
+  ['report.md blocked, final-report.md done',{report:blocked,files:{'final-report.md':PROVEN}},/proof step blocked: /],
+  ['report.md done then blocked',{report:`${PROVEN}\n${blocked}`},/proof step blocked: /],
+  ['only final-report.md',{report:null,files:{'final-report.md':PROVEN}},/proof step missing: /],
+  ['only the thread output',{report:null,output:PROVEN},/proof step missing: /],
+ ]){
+  const {host,store}=await deck(opts);try {
+   assert.match(text(await verify(host,2391)),want,label);
+   assert.equal(store.get(id(2391)).verifiedCommitSha,null,label);
   }finally{await host.harness.lifecycle.dispose();}
  }
 });

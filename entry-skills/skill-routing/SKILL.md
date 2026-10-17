@@ -76,8 +76,9 @@ The report has one line per step: "✓ P<n> <step>: <evidence>" or
 "skip: P<n> <step>: <reason>". Evidence names the test, or what you drove and
 what you saw. `bb firstmate deliveries verify` refuses a pipeline crew's PR
 until its report has "✓ P4 Prove on the real surface for <owner/repo#n> at
-<head sha>: driven <what>; seen <what>" for that PR at its current head. After
-a new push, add a new P4 line.
+<head sha>: driven <what>; seen <what>" for that PR at its current head. Only
+the crew's `report.md` counts. A blocked, pending or skipped P4 line for the same
+PR and head wins over a done one. After a new push, add a new P4 line.
 
 A PR that reaches customers or production needs a checker crew on a different
 model before it merges. The plugin's `owner/reach.json` decides that from the

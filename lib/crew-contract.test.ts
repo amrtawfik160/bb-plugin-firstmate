@@ -697,3 +697,15 @@ test("the captain rules name the dispatch skills, the crew models and the checke
     "`firstmate_merge` refuses a production PR without a `pass` verdict for its current head.",
   ]) assert.ok(rules.includes(text), text);
 });
+
+// FM138 verdict 2, finding 2: an open P4 line for this PR at this head wins over a done one.
+test("a blocked, pending or skipped P4 line for this PR and head wins over a done one, in either order", () => {
+  const blocked = `blocked: P4 Prove on the real surface for o/r#9 at ${HEAD.slice(0, 7)}: staging is down`;
+  for (const report of [`${BUG_REPORT}\n${blocked}`, `${blocked}\n${BUG_REPORT}`]) {
+    assert.equal(pipelineProofGap(report, 4, PR), `blocked: "P4 Prove on the real surface for o/r#9 at ${HEAD.slice(0, 7)}: staging is down"`);
+  }
+  assert.match(pipelineProofGap(`${BUG_REPORT}\npending: P4 Prove on the real surface for o/r#9 at ${HEAD}: waiting`, 4, PR) ?? "", /^pending: /);
+  assert.match(pipelineProofGap(`${BUG_REPORT}\nskip: P4 Prove on the real surface for o/r#9 at ${HEAD.slice(0, 7)}: no access`, 4, PR) ?? "", /^skipped: /);
+  assert.equal(pipelineProofGap(`${BUG_REPORT}\nblocked: P4 Prove on the real surface for o/r#10 at ${HEAD.slice(0, 7)}: other PR`, 4, PR), null, "another PR's open line is independent");
+  assert.equal(pipelineProofGap(`${BUG_REPORT}\nblocked: P4 Prove on the real surface for o/r#9 at 1111111: older head`, 4, PR), null, "an older head's open line is independent");
+});

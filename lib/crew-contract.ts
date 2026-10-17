@@ -233,27 +233,32 @@ export function verifyStepGap(report: string, playbook: string): string | null {
 
 // "✓ P4 Prove on the real surface for o/r#9 at abc1234: driven <what>; seen <what>"
 const PROOF_LINE = new RegExp(`^[ \\t]*(?:[-*][ \\t]*)?(✓|✔|✅|skip(?:ped)?:|pending:?|blocked:|todo:|not done:|☐|\\[ \\])[ \\t]*(P(\\d+)\\.?[ \\t]+${PROOF_STEP}\\b(.*))$`, "gim");
-const PROOF_BODY = /^\s+for\s+(\S+#\d+)\s+at\s+([0-9a-f]{7,40})\s*:\s*driven\s+(.*?)\s*;\s*seen\s+(.*?)\s*$/i;
+const PROOF_SCOPE = /^\s+for\s+(\S+#\d+)\s+at\s+([0-9a-f]{7,40})(?=\s*(?::|$))/i;
+const PROOF_BODY = /^\s+for\s+\S+#\d+\s+at\s+[0-9a-f]{7,40}\s*:\s*driven\s+(.*?)\s*;\s*seen\s+(.*?)\s*$/i;
 
 // Why a pipeline crew's report does not prove its proof step (P<step>), or null. With a
 // PR and head, only a line for that PR at that head counts.
 export function pipelineProofGap(report: string, step: number, scope?: { pr: string; head: string }): string | null {
   const lines = [...report.matchAll(PROOF_LINE)].filter((m) => Number(m[3]) === step).map((m) => {
     const mark = m[1]!.toLowerCase().replace(/:$/, "");
+    const scoped = PROOF_SCOPE.exec(m[4]!);
     const body = PROOF_BODY.exec(m[4]!);
     const done = /^[✓✔✅]$/.test(mark);
-    const filled = body !== null && body[3]!.trim() !== "" && body[4]!.trim() !== "";
-    return { mark, text: m[2]!.trim(), done, filled, pr: body?.[1]?.toLowerCase(), sha: body?.[2]?.toLowerCase() };
+    const filled = body !== null && body[1]!.trim() !== "" && body[2]!.trim() !== "";
+    return { mark, text: m[2]!.trim(), done, filled, pr: scoped?.[1]?.toLowerCase(), sha: scoped?.[2]?.toLowerCase() };
   });
   if (lines.length === 0) return `missing: no "✓ P${step} ${PROOF_STEP}" line`;
   const shown = scope === undefined ? lines : lines.filter((l) => l.pr === undefined || l.sha === undefined
     ? !l.done
     : l.pr === scope.pr.toLowerCase() && scope.head.toLowerCase().startsWith(l.sha));
+  // FM138 verdict 2: an open line for this PR and head (or one that names no PR) wins over a done one.
+  const open = scope === undefined ? undefined : shown.filter((l) => !l.done).at(-1);
+  if (open !== undefined) return `${STEP_STATE[open.mark] ?? "not done"}: "${open.text}"`;
   if (shown.some((l) => l.done && l.filled)) return null;
   const malformed = shown.find((l) => l.done) ?? (scope !== undefined ? lines.find((l) => l.done && !l.filled) : undefined);
   if (malformed !== undefined) return `malformed: the line must read "✓ P${step} ${PROOF_STEP} for <owner/repo#n> at <head sha>: driven <what>; seen <what>", with both fields filled`;
-  const open = shown.at(-1);
-  if (open !== undefined) return `${STEP_STATE[open.mark] ?? "not done"}: "${open.text}"`;
+  const last = shown.at(-1);
+  if (last !== undefined) return `${STEP_STATE[last.mark] ?? "not done"}: "${last.text}"`;
   return `missing: no "✓ P${step} ${PROOF_STEP} for ${scope!.pr} at ${scope!.head.slice(0, 7)}" line`;
 }
 

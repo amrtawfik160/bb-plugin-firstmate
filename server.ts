@@ -7437,21 +7437,16 @@ export default async function plugin(bb: BbPluginApi) {
     all:z.boolean().optional().describe("Read-only project view across managers"),
     offset:z.number().int().min(0).optional(),limit:z.number().int().min(1).max(100).optional(),
   });
-  // The crew's report: its native report files, then its last output. Empty when none can be read.
-  async function crewReportText(crew: Crew): Promise<string> {
+  // FM138 verdict 2: the P4 gate reads one authoritative source, the report.md the brief
+  // names. Empty when it cannot be read, so the gate fails closed.
+  async function crewReportFile(crew: Crew): Promise<string> {
     const home = await crewNativeHome(crew);
     const hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined).catch(() => "");
-    const read = async (path: string): Promise<string> => {
-      try {
-        const result = await bb.sdk.files.read({ hostId, path });
-        return "content" in result && typeof result.content === "string" ? result.content : "";
-      } catch { return ""; }
-    };
-    // 0940c38e wrote final-report.md, not report.md.
-    const files = home === "" || hostId === "" ? [] : await Promise.all(["report.md", "final-report.md"].map((name) => read(`${home}/data/${crew.id}/${name}`)));
-    let output = "";
-    try { output = String(asRecord(await raceAbort(bb.sdk.threads.output({ threadId: crew.threadId }), undefined, STUCK_HOST_CALL_MS))["output"] ?? ""); } catch { /* files alone */ }
-    return [...files, output].join("\n");
+    if (home === "" || hostId === "") return "";
+    try {
+      const result = await bb.sdk.files.read({ hostId, path: `${home}/data/${crew.id}/report.md` });
+      return "content" in result && typeof result.content === "string" ? result.content : "";
+    } catch { return ""; }
   }
 
   // Owner decision Q4: a bug-fix or feature crew's PR gets no verification record until
@@ -7461,7 +7456,7 @@ export default async function plugin(bb: BbPluginApi) {
     const pipeline = crew === undefined || !pipelineGates(crew) ? null : crewPipeline(crew);
     if (crew === undefined || pipeline === null) return;
     const step = proofStep(pipeline);
-    const gap = pipelineProofGap(await crewReportText(crew), step, { pr: r.id, head: r.headSha ?? "" });
+    const gap = pipelineProofGap(await crewReportFile(crew), step, { pr: r.id, head: r.headSha ?? "" });
     if (gap === null) return;
     const home = await crewNativeHome(crew);
     throw new Error([

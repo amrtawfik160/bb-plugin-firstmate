@@ -1,15 +1,60 @@
 {
   "schema": 2,
-  "about": "Which PRs reach customers or production and so need a checker crew on a different model before firstmate_merge (owner decision Q8). A repo not listed here reaches production. A changed file that matches productionPaths always reaches production. A PR whose every other changed file matches internalPaths is internal and self-checks. A repo listed with reach internal never needs a checker. A path ending in / is a folder at any depth; a leading / anchors it at the repo root; any other pattern matches the file name, with * as a wildcard. A repo name may use * too. A repo row may add its own productionPaths, such as the folder it deploys from.",
-  "internalPaths": ["/docs/", "test/", "tests/", "__tests__/", "*.md", "*.test.*", "*.spec.*"],
+  "about": "Which PRs reach customers or production and so need a checker crew on a different model before firstmate_merge (owner decision Q8). Order: a repo row with reach internal is internal, whatever it changes. Otherwise an unreadable file list is production. Otherwise a changed file that matches productionPaths (shared or the repo row's own) is production. Otherwise a PR whose every changed file matches internalPaths is internal and self-checks, and anything else is production. A repo not listed here is not internal. A pattern ending in / is a folder at any depth; a leading / anchors it at the repo root. A pattern with a / that does not end in / is a full path, anchored at the root with a leading /. Any other pattern matches the file name. * is a wildcard. A repo name may use * too.",
+  "internalPaths": [
+    "/docs/",
+    "test/",
+    "tests/",
+    "__tests__/",
+    "*.md",
+    "*.test.*",
+    "*.spec.*"
+  ],
   "productionPaths": [
-    ".github/workflows/", ".github/actions/",
-    "Dockerfile", "*.Dockerfile", "Dockerfile.*", "docker-compose*", "compose.yml", "compose.yaml",
-    "fly.toml", "vercel.json", "netlify.toml", "nixpacks.toml", "railway.json", "railway.toml", "render.yaml", "Procfile", "app.json", "eas.json", "app.config.*",
-    "AGENTS.md", "CLAUDE.md", "GEMINI.md", "SKILL.md", "skills/", "prompts/"
+    ".github/workflows/",
+    ".github/actions/",
+    "Dockerfile",
+    "*.Dockerfile",
+    "Dockerfile.*",
+    "docker-compose*",
+    "compose.yml",
+    "compose.yaml",
+    "fly.toml",
+    "vercel.json",
+    "netlify.toml",
+    "nixpacks.toml",
+    "railway.json",
+    "railway.toml",
+    "render.yaml",
+    "Procfile",
+    "app.json",
+    "eas.json",
+    "app.config.*",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "GEMINI.md",
+    "SKILL.md",
+    "skills/",
+    "prompts/",
+    "captain.md"
   ],
   "repos": {
-    "*/firstmate-demo": { "reach": "internal" },
-    "*/fm-canary-*": { "reach": "internal" }
+    "*/firstmate-demo": {
+      "reach": "internal"
+    },
+    "*/fm-canary-*": {
+      "reach": "internal"
+    },
+    "amrtawfik160/bb-plugin-firstmate": {
+      "reach": "production",
+      "productionPaths": [
+        "/entry-skills/",
+        "/skills/",
+        "/runtime-assets/",
+        "/overlay/",
+        "/native-snapshot/",
+        "/docs/verification/native-transport-allowlist.v1.json"
+      ]
+    }
   }
 }

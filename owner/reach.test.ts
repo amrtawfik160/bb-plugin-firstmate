@@ -86,3 +86,28 @@ test("a provider, model or effort the owner names wins for that crew only", () =
     { role: "builder", providerId: "claude-code", model: "claude-sonnet-5-5", reasoningLevel: undefined, named: true });
   assert.deepEqual(crewExecution({}), crewExecution({ role: "builder" }), "the next dispatch is back on the default");
 });
+
+// FM138 verdict 2, finding 1: the captain's shipped instructions and the hashes that pin
+// them change how the live captain behaves.
+test("in the Firstmate plugin repo, captain prompt files and their pinned hashes are production", () => {
+  for (const files of [
+    ["entry-skills/captain/references/supervision.md", "docs/verification/native-transport-allowlist.v1.json"],
+    ["entry-skills/captain/SKILL.md"],
+    ["entry-skills/skill-routing/SKILL.md"],
+    ["docs/verification/native-transport-allowlist.v1.json"],
+    ["runtime-assets/AGENTS.md"],
+  ]) {
+    assert.equal(changeReach({ repo: "amrtawfik160/bb-plugin-firstmate", files, complete: true }).reach, "production", files.join(" "));
+  }
+  assert.deepEqual(changeReach({ repo: "amrtawfik160/bb-plugin-firstmate", files: ["entry-skills/captain/references/supervision.md"], complete: true }),
+    { reach: "production", why: "entry-skills/captain/references/supervision.md is a production path" });
+  assert.equal(changeReach({ repo: "amrtawfik160/bb-plugin-firstmate", files: ["docs/verification/code-pipeline-2026-10-17.md"], complete: true }).reach, "internal", "a plain verification note is still a doc");
+  assert.equal(changeReach({ repo: "o/r", files: ["data/captain.md"], complete: true }).reach, "production", "a captain prompt file in any repo");
+});
+
+test("a path pattern with a folder and a file name matches that full path", () => {
+  const own = { internalPaths: ["/docs/"], productionPaths: [], repos: { "o/r": { reach: "production" as const, productionPaths: ["/docs/verification/pins.json"] } } };
+  assert.equal(changeReach({ repo: "o/r", files: ["docs/verification/pins.json"], complete: true }, own).reach, "production");
+  assert.equal(changeReach({ repo: "o/r", files: ["docs/verification/other.json"], complete: true }, own).reach, "internal");
+  assert.equal(changeReach({ repo: "o/r", files: ["x/docs/verification/pins.json"], complete: true }, own).reach, "production", "x/ is not docs/ at the root, so nothing marks it internal");
+});
