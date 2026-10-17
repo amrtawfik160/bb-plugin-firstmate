@@ -239,7 +239,7 @@ test('missed manager deletion is surfaced after restart; inventory failures pres
 const tool=(host,name)=>host.harness.inspection.registrations.agentTools.find(t=>t.name===name);
 const turn=()=>new Promise(setImmediate);
 async function until(condition) { for(let i=0;i<300;i++){if(condition())return;await turn();}throw new Error('fixture did not reach boundary'); }
-const forge=(extra={})=>({headRefOid:'sha1',state:'OPEN',isDraft:false,statusCheckRollup:[],reviewDecision:null,reviews:[],mergeable:'MERGEABLE',...extra});
+const forge=(extra={})=>({headRefOid:'sha1',state:'OPEN',isDraft:false,statusCheckRollup:[],reviewDecision:null,reviews:[],mergeable:'MERGEABLE',files:[{path:'docs/x.md'}],...extra});
 
 test('factory metadata adoption and dispatch recovery preserve required verification through discovery and merge',async()=>{
  for(const route of ['metadata','dispatch']) {
