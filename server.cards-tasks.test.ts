@@ -153,3 +153,19 @@ test("the task sweep closes tasks from done reports, opens a card for a crew tha
     assert.equal(asks.listOpen("thr_cap").filter((ask) => ask.task === tWait.id).length, 1, "one card per crew question");
   } finally { restore(); await host.harness.lifecycle.dispose(); }
 });
+
+// Isolated-server run (17 Oct): the captain had already sent its own card about crew B's wait, and
+// the sweep opened a second one.
+test("the sweep opens no crew card when the captain already sent a card after the crew's status line", async () => {
+  const at = Math.floor(Date.now() / 1000) - 600;
+  const { host, rpc, tasks, asks, restore } = await captainHost({ wait1: `blocked [at=${at}]: need owner to restore the repo\n` });
+  try {
+    await host.bb.storage.kv.set("crews", [crewRow("wait1", "thr_w1")]);
+    const task = tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Slug max", sourceRefs: ["tg:1:1"], crewId: "wait1", at: Date.now() });
+    asks.create({ captain: "thr_cap", kind: "question", text: "PR #6: the repo is gone. What should we do?", options: [], createdAt: at * 1000 + 60_000, project: "Cyndra" });
+    await host.harness.behavior.runSchedule("task-lifecycle");
+    assert.equal(asks.listOpen("thr_cap").length, 1, "no second card");
+    assert.equal(rpc.filter((call) => call.method === "ask").length, 0);
+    assert.equal(tasks.get(task.id)!.state, "needs_you", "the task still shows it waits on the owner");
+  } finally { restore(); await host.harness.lifecycle.dispose(); }
+});
