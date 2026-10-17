@@ -975,9 +975,23 @@ fm_backend_bb_map_status() {  # <bb-status> <pending 0|1>
   esac
 }
 
+# The BB wait sets FM_BACKEND_BB_DEADLINE_MS (epoch ms); every BB call it makes
+# gets only the time left. Without a deadline the command runs unbounded.
+fm_backend_bb_timed() {  # <command...>
+  local ms
+  [ -n "${FM_BACKEND_BB_DEADLINE_MS:-}" ] || { "$@"; return; }
+  ms=$((FM_BACKEND_BB_DEADLINE_MS - $(date +%s%3N)))
+  [ "$ms" -gt 0 ] || return 124
+  timeout "$((ms / 1000)).$(printf '%03d' $((ms % 1000)))" "$@"
+}
+
+fm_backend_bb_past_deadline() {
+  [ -n "${FM_BACKEND_BB_DEADLINE_MS:-}" ] && [ "$(date +%s%3N)" -ge "$FM_BACKEND_BB_DEADLINE_MS" ]
+}
+
 # 0 when the thread has an interaction still pending or resolving.
 fm_backend_bb_interactions_pending() {  # <thread-id>
-  bb thread interactions list --json "$1" 2>/dev/null | python3 -c '
+  fm_backend_bb_timed bb thread interactions list --json "$1" 2>/dev/null | python3 -c '
 import json, sys
 raw = sys.stdin.read().strip()
 if not raw:
@@ -1004,7 +1018,7 @@ sys.exit(1)
 fm_backend_bb_snapshot() {  # <thread-id> -> status<TAB>pending
   local id raw pending=0
   id=$(fm_backend_bb_thread_id "$1")
-  raw=$(fm_backend_bb_show "$id" 2>/dev/null) || return 1
+  raw=$(fm_backend_bb_tool_check && fm_backend_bb_timed bb thread show --json "$id" 2>/dev/null) || return 1
   if fm_backend_bb_interactions_pending "$id"; then
     pending=1
   fi
@@ -1032,7 +1046,8 @@ sys.stdout.write(status + "\t" + pending)
 }
 
 # Every thread's snapshot from one `bb thread list` read, one
-# <thread-id><TAB><status><TAB><pending> line per listed thread asked for. The
+# <thread-id><TAB><status><TAB><pending> line per thread asked for, in that order;
+# a thread the list omits has empty status and pending. The
 # list's hasPendingInteraction answers for a settled thread. A thread with a turn
 # in flight, or a row without the flag, still gets its interactions read: the
 # flag can lag an interaction that is still resolving. Those reads run in
@@ -1043,7 +1058,7 @@ fm_backend_bb_snapshots() {  # <thread-id...>
   local -a checks=()
   [ "$#" -gt 0 ] || return 0
   fm_backend_bb_tool_check || return 1
-  raw=$(bb thread list --json --include-hidden 2>/dev/null) || {
+  raw=$(fm_backend_bb_timed bb thread list --json --include-hidden 2>/dev/null) || {
     echo "error: bb thread list failed; the BB wait reads each window's thread instead" >&2
     return 1
   }
@@ -1055,15 +1070,18 @@ except Exception:
     sys.exit(1)
 if not isinstance(rows, list):
     sys.exit(1)
-wanted = set(sys.argv[1:])
-for row in rows:
-    if not isinstance(row, dict) or row.get("id") not in wanted:
+byid = {row.get("id"): row for row in rows if isinstance(row, dict)}
+for tid in sys.argv[1:]:
+    row = byid.get(tid)
+    if row is None:
+        sys.stdout.write("%s\t\t\n" % tid)
         continue
     status = row.get("status")
     if not isinstance(status, str) or not status:
         runtime = row.get("runtime")
         status = runtime.get("displayStatus") if isinstance(runtime, dict) else None
     if not isinstance(status, str) or not status or "\t" in status or "\n" in status:
+        sys.stdout.write("%s\t\t\n" % tid)
         continue
     flag = row.get("hasPendingInteraction")
     if flag is True:
@@ -1072,7 +1090,7 @@ for row in rows:
         pending = "0"
     else:
         pending = "check"
-    sys.stdout.write("%s\t%s\t%s\n" % (row["id"], status, pending))
+    sys.stdout.write("%s\t%s\t%s\n" % (tid, status, pending))
 ' "$@") || return 1
   while IFS=$'\t' read -r tid _ pending; do
     [ "$pending" = check ] && checks+=("$tid")
@@ -1081,13 +1099,10 @@ for row in rows:
     [ -z "$rows" ] || printf '%s\n' "$rows"
     return 0
   fi
-  left=30
-  [ -z "${FM_BACKEND_BB_DEADLINE_MS:-}" ] || left=$(( (FM_BACKEND_BB_DEADLINE_MS - $(date +%s%3N)) / 1000 ))
+  # Each read gets the time left when it starts, and none starts after the deadline.
   dir=$(mktemp -d "${TMPDIR:-/tmp}/fm-bb-interactions.XXXXXX") || return 1
-  if [ "$left" -ge 1 ]; then
-    # shellcheck disable=SC2016 # Positional parameters belong to the child shell.
-    printf '%s\n' "${checks[@]}" | xargs -P 16 -I{} timeout "$left" sh -c 'bb thread interactions list --json "$1" > "$2/$1" 2>/dev/null' _ {} "$dir" 2>/dev/null
-  fi
+  # shellcheck disable=SC2016 # Positional parameters belong to the child shell.
+  printf '%s\n' "${checks[@]}" | xargs -P 16 -I{} bash -c 'ms=30000; [ -z "$3" ] || ms=$(( $3 - $(date +%s%3N) )); [ "$ms" -gt 0 ] || exit 0; timeout "$((ms / 1000)).$(printf %03d $((ms % 1000)))" bb thread interactions list --json "$1" > "$2/$1" 2>/dev/null' _ {} "$dir" "${FM_BACKEND_BB_DEADLINE_MS:-}" 2>/dev/null
   printf '%s\n' "$rows" | python3 -c '
 import json, os, sys
 d = sys.argv[1]
@@ -1101,6 +1116,7 @@ def pending(tid):
 for line in sys.stdin:
     parts = line.rstrip("\n").split("\t")
     if len(parts) != 3:
+        sys.stdout.write("\t\t\n")
         continue
     tid, status, flag = parts
     if flag == "check":
@@ -1108,17 +1124,6 @@ for line in sys.stdin:
     sys.stdout.write("%s\t%s\t%s\n" % (tid, status, flag))
 ' "$dir"
   rm -rf "$dir"
-}
-
-fm_backend_bb_snapshot_in() {  # <thread-id> <snapshots> -> status<TAB>pending
-  local id status pending
-  while IFS=$'\t' read -r id status pending; do
-    if [ -n "$id" ] && [ "$id" = "$1" ]; then
-      printf '%s\t%s' "$status" "$pending"
-      return 0
-    fi
-  done <<< "$2"
-  return 1
 }
 
 fm_backend_bb_normalize_event() {  # <pane_id> <workspace_id> <to_status>
@@ -1261,41 +1266,56 @@ fm_backend_bb_race_idle() {  # <timeout_secs> <thread_id...>
 
 # One status read for all windows. Sets FM_BACKEND_BB_HIT to the first fresh
 # blocked record (return 0), FM_BACKEND_BB_TO_WAIT to the working thread ids, and
-# FM_BACKEND_BB_SEEN_OK=1 when any window was readable (return 1).
+# FM_BACKEND_BB_SEEN_OK=1 when any window was readable (return 1). Windows with a
+# pending interaction go first, so a deadline that cuts the scan short never drops one.
 fm_backend_bb_scan_windows() {  # <state_dir> <session> <window...>
-  local state=$1 session=$2 w tid snap snaps hit crc joined=
+  local state=$1 session=$2 w tid snap snaps hit crc joined= i line pass
   shift 2
-  local -a tids=()
+  local -a windows=("$@") tids=() snapl=()
   FM_BACKEND_BB_HIT=
   FM_BACKEND_BB_TO_WAIT=()
   FM_BACKEND_BB_SEEN_OK=0
-  for w in "$@"; do
-    tid=$(fm_backend_bb_thread_of_window "$w")
-    [ -z "$tid" ] || tids+=("$tid")
+  for w in "${windows[@]}"; do
+    tid=${w#*:}
+    tids+=("${tid#bb:}")
   done
   snaps=$(fm_backend_bb_snapshots "${tids[@]}") || snaps=
-  for w in "$@"; do
-    tid=$(fm_backend_bb_thread_of_window "$w")
-    snap=$(fm_backend_bb_snapshot_in "$tid" "$snaps") || snap=
-    hit=$(fm_backend_bb_consider_window "$state" "$session" "$w" "$snap")
-    crc=$?
-    case "$crc" in
-      0)
-        FM_BACKEND_BB_HIT=$hit
-        return 0
-        ;;
-      2)
-        case " $joined " in
-          *" $tid "*) ;;
-          *)
-            FM_BACKEND_BB_TO_WAIT+=("$tid")
-            joined="$joined $tid"
-            ;;
-        esac
-        FM_BACKEND_BB_SEEN_OK=1
-        ;;
-      1) FM_BACKEND_BB_SEEN_OK=1 ;;
-    esac
+  if [ -n "$snaps" ]; then
+    FM_BACKEND_BB_SEEN_OK=1
+    while IFS= read -r line; do snapl+=("$line"); done <<< "$snaps"
+  fi
+  for pass in blocked rest; do
+    for i in "${!windows[@]}"; do
+      fm_backend_bb_past_deadline && return 1
+      w=${windows[$i]} tid=${tids[$i]} line=${snapl[$i]:-} snap=
+      case "$line" in
+        "$tid"$'\t'?*$'\t'?*) snap=${line#*$'\t'} ;;
+      esac
+      if [ "$pass" = blocked ]; then
+        [ "${snap##*$'\t'}" = 1 ] || continue
+      else
+        [ "${snap##*$'\t'}" != 1 ] || [ -z "$snap" ] || continue
+      fi
+      hit=$(fm_backend_bb_consider_window "$state" "$session" "$w" "$snap")
+      crc=$?
+      case "$crc" in
+        0)
+          FM_BACKEND_BB_HIT=$hit
+          return 0
+          ;;
+        2)
+          case " $joined " in
+            *" $tid "*) ;;
+            *)
+              FM_BACKEND_BB_TO_WAIT+=("$tid")
+              joined="$joined $tid"
+              ;;
+          esac
+          FM_BACKEND_BB_SEEN_OK=1
+          ;;
+        1) FM_BACKEND_BB_SEEN_OK=1 ;;
+      esac
+    done
   done
   return 1
 }
