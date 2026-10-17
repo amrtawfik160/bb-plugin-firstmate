@@ -538,7 +538,7 @@ index 0a94356c..059753b9 100755
    if ! kimi_wait_for_ready; then
      kimi_spawn_fail "$KIMI_READY_FAILURE_DETAIL"
 diff --git a/bin/fm-watch.sh b/bin/fm-watch.sh
-index 1b4c3087..63f58044 100755
+index 1b4c3087..ad4f3619 100755
 --- a/bin/fm-watch.sh
 +++ b/bin/fm-watch.sh
 @@ -1317,6 +1317,15 @@
@@ -569,16 +569,19 @@ index 1b4c3087..63f58044 100755
  resurface_after_downtime() {
    # Handling successors already have a predecessor-delivered wake on the way.
    # Re-announcing from this cycle is what turned a lost handshake into an
-@@ -2767,7 +2781,7 @@
+@@ -2767,7 +2781,10 @@
  
    # Liveness beacon for fm-guard.sh: a fresh mtime here means a watcher is
    # alive. Supervision scripts warn when this goes stale with tasks in flight.
 -  touch "$STATE/.last-watcher-beat"
 +  watcher_beat
++  # BB-DIVERGE: the beacon also beats mid-scan, so it no longer marks a finished
++  # pass. This marker is touched only here, at the top of each pass.
++  touch "$STATE/.last-watcher-pass"
  
    # Opt-in fleet activity ledger (docs/fleet-ledger.md): pick up newly appended
    # status lines before this cycle can exit on a wake. Off costs one file test.
-@@ -3102,6 +3116,12 @@
+@@ -3102,6 +3119,12 @@
    # remembers the hash already classified, or the declaration a busy pane's
    # crossed turn bound already handed to the away-mode daemon).
    while IFS= read -r w; do

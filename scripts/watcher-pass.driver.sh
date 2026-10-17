@@ -24,10 +24,10 @@ pid=$!
 i=0
 while [ "$i" -lt 100 ] && [ ! -e "$pass_file" ]; do sleep 0.1; i=$((i + 1)); done
 [ -e "$pass_file" ] || { kill "$pid"; fail "the watcher never marked the top of a pass in $pass_file"; }
-first=$(file_mtime "$pass_file") at_first=$(cat "$count" 2>/dev/null || echo 0)
+first=$(stat -c %Y "$pass_file") at_first=$(cat "$count" 2>/dev/null || echo 0)
 i=0
 while [ "$i" -lt 400 ]; do
-  now=$(file_mtime "$pass_file")
+  now=$(stat -c %Y "$pass_file")
   [ "$now" != "$first" ] && break
   sleep 0.1
   i=$((i + 1))

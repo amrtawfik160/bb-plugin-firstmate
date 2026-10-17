@@ -1035,16 +1035,19 @@ sys.stdout.write(status + "\t" + pending)
 # <thread-id><TAB><status><TAB><pending> line per listed thread asked for. The
 # list's hasPendingInteraction answers for a settled thread. A thread with a turn
 # in flight, or a row without the flag, still gets its interactions read: the
-# flag can lag an interaction that is still resolving.
+# flag can lag an interaction that is still resolving. Those reads run in
+# parallel and stop at FM_BACKEND_BB_DEADLINE_MS (epoch ms) when it is set; a
+# read cut off reports no pending interaction and the next pass reads it again.
 fm_backend_bb_snapshots() {  # <thread-id...>
-  local raw tid status pending
+  local raw rows dir left tid
+  local -a checks=()
   [ "$#" -gt 0 ] || return 0
   fm_backend_bb_tool_check || return 1
   raw=$(bb thread list --json --include-hidden 2>/dev/null) || {
     echo "error: bb thread list failed; the BB wait reads each window's thread instead" >&2
     return 1
   }
-  printf '%s' "$raw" | python3 -c '
+  rows=$(printf '%s' "$raw" | python3 -c '
 import json, sys
 try:
     rows = json.load(sys.stdin)
@@ -1070,12 +1073,41 @@ for row in rows:
     else:
         pending = "check"
     sys.stdout.write("%s\t%s\t%s\n" % (row["id"], status, pending))
-' "$@" | while IFS=$'\t' read -r tid status pending; do
-    if [ "$pending" = check ]; then
-      if fm_backend_bb_interactions_pending "$tid"; then pending=1; else pending=0; fi
-    fi
-    printf '%s\t%s\t%s\n' "$tid" "$status" "$pending"
-  done
+' "$@") || return 1
+  while IFS=$'\t' read -r tid _ pending; do
+    [ "$pending" = check ] && checks+=("$tid")
+  done <<< "$rows"
+  if [ "${#checks[@]}" -eq 0 ]; then
+    [ -z "$rows" ] || printf '%s\n' "$rows"
+    return 0
+  fi
+  left=30
+  [ -z "${FM_BACKEND_BB_DEADLINE_MS:-}" ] || left=$(( (FM_BACKEND_BB_DEADLINE_MS - $(date +%s%3N)) / 1000 ))
+  dir=$(mktemp -d "${TMPDIR:-/tmp}/fm-bb-interactions.XXXXXX") || return 1
+  if [ "$left" -ge 1 ]; then
+    # shellcheck disable=SC2016 # Positional parameters belong to the child shell.
+    printf '%s\n' "${checks[@]}" | xargs -P 16 -I{} timeout "$left" sh -c 'bb thread interactions list --json "$1" > "$2/$1" 2>/dev/null' _ {} "$dir" 2>/dev/null
+  fi
+  printf '%s\n' "$rows" | python3 -c '
+import json, os, sys
+d = sys.argv[1]
+def pending(tid):
+    try:
+        data = json.loads(open(os.path.join(d, tid)).read().strip() or "null")
+    except Exception:
+        return False
+    rows = data.get("interactions") or data.get("items") or data.get("pending") or [] if isinstance(data, dict) else data
+    return isinstance(rows, list) and any(isinstance(r, dict) and r.get("status") in (None, "", "pending", "resolving") for r in rows)
+for line in sys.stdin:
+    parts = line.rstrip("\n").split("\t")
+    if len(parts) != 3:
+        continue
+    tid, status, flag = parts
+    if flag == "check":
+        flag = "1" if pending(tid) else "0"
+    sys.stdout.write("%s\t%s\t%s\n" % (tid, status, flag))
+' "$dir"
+  rm -rf "$dir"
 }
 
 fm_backend_bb_snapshot_in() {  # <thread-id> <snapshots> -> status<TAB>pending
@@ -1268,13 +1300,13 @@ fm_backend_bb_scan_windows() {  # <state_dir> <session> <window...>
   return 1
 }
 
-# Replaces fm-watch's `sleep POLL`, so it spends at most the budget plus one
-# closing scan, however many windows are recorded.
+# Replaces fm-watch's `sleep POLL`. Every step, the status reads included, stops
+# at one deadline, so the wait spends its budget however many windows are recorded.
 fm_backend_bb_wait_transition() {  # <session> <timeout_secs> <state_dir> <window...>
   local session=$1 timeout=$2 state=$3
   shift 3
   local -a windows=("$@")
-  local deadline left race_rc
+  local left race_rc
   [ "${#windows[@]}" -gt 0 ] || return 2
   case "$timeout" in
     ''|*[!0-9]*) return 2 ;;
@@ -1282,23 +1314,27 @@ fm_backend_bb_wait_transition() {  # <session> <timeout_secs> <state_dir> <windo
   if [ "${FM_BACKEND_EVENTS_CAPABILITY_CONFIRMED:-0}" != 1 ]; then
     fm_backend_bb_events_capable "$session" || return 2
   fi
-  deadline=$((SECONDS + timeout))
+  local FM_BACKEND_BB_DEADLINE_MS
+  FM_BACKEND_BB_DEADLINE_MS=$(( $(date +%s%3N) + timeout * 1000 ))
   if fm_backend_bb_scan_windows "$state" "$session" "${windows[@]}"; then
     printf '%s' "$FM_BACKEND_BB_HIT"
     return 0
   fi
-  left=$((deadline - SECONDS))
-  [ "$left" -ge 1 ] || left=1
   if [ "${#FM_BACKEND_BB_TO_WAIT[@]}" -eq 0 ]; then
     # Nothing in flight. Sleep the rest of the budget so an all-idle fleet does
     # not spin. Every window unreadable is an unusable push path.
     [ "$FM_BACKEND_BB_SEEN_OK" -eq 1 ] || return 2
-    sleep "$left"
+    left=$(( FM_BACKEND_BB_DEADLINE_MS - $(date +%s%3N) ))
+    [ "$left" -le 0 ] || sleep "$((left / 1000)).$(printf '%03d' $((left % 1000)))"
     return 1
   fi
+  # Whole seconds for the race, leaving half a second for the closing scan.
+  left=$(( (FM_BACKEND_BB_DEADLINE_MS - $(date +%s%3N) - 500) / 1000 ))
+  [ "$left" -ge 1 ] || return 1
   fm_backend_bb_race_idle "$left" "${FM_BACKEND_BB_TO_WAIT[@]}"
   race_rc=$?
   [ "$race_rc" -eq 2 ] && return 2
+  [ "$(date +%s%3N)" -lt "$FM_BACKEND_BB_DEADLINE_MS" ] || return 1
   if fm_backend_bb_scan_windows "$state" "$session" "${windows[@]}"; then
     printf '%s' "$FM_BACKEND_BB_HIT"
     return 0
