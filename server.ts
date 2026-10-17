@@ -7756,7 +7756,6 @@ export default async function plugin(bb: BbPluginApi) {
   // from a checker crew that is not the builder and runs another model. Returns the line
   // the merge result shows, or "" for an internal PR.
   async function requireChecker(t: MergeTarget, crew: Crew, hostId: string | null): Promise<string> {
-    if (!pipelineGates(crew)) return "";
     const short = (sha: string) => sha.slice(0, 7);
     const repo = /github\.com\/([^/]+\/[^/]+)\/pull\//.exec(t.url)?.[1] ?? t.url;
     const reach = changeReach({ repo, ...(await ghPrFiles(hostId, t.url)) });

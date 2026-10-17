@@ -203,16 +203,19 @@ test('verify refuses a P4 line written for another PR or an older head',async()=
  }
 });
 
-// Migration: a crew dispatched before this version keeps the old rules for its PRs.
-test('a crew dispatched before the pipeline version verifies without P4 and merges a production PR without a checker',async()=>{
+// Migration: a crew dispatched before this version needs no P4 line, because its report
+// was written without one. Its production PR still needs a checker before it merges.
+test('a crew dispatched before the pipeline version verifies without P4, and its production PR still needs a checker',async()=>{
  const legacy=CREWS.map(c=>{const {dispatchVersion,...rest}=c;return rest;});
  const {host,store,commands}=await deck({report:null,crews:legacy});try {
   text(await verify(host,2391));
   assert.equal(store.get(id(2391)).verifiedCommitSha,head(2391),'no P4 needed');
+  assert.match(text(await tool(host,'firstmate_merge').execute({crewId:BUILDER,yes:true,pr:2391},ctx)),/^Refusing: #2391 reaches production .* and has no checker verdict for its head 2391239; nothing was merged\./);
+  assert.deepEqual(merges(commands),[]);
+  text(await check(host,2391,'thr_chk'));
   const merged=text(await tool(host,'firstmate_merge').execute({crewId:BUILDER,yes:true,pr:2391},ctx));
   assert.match(merged,/^Merged #2391 Change 2391\n/);
-  assert.doesNotMatch(merged,/Checked:/);
-  assert.equal(merges(commands).length,1);
+  assert.match(merged,/Checked: crew chk1 \(gpt-6-astra\) passed head 2391239\./);
  }finally{await host.harness.lifecycle.dispose();}
 });
 

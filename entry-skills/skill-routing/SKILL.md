@@ -85,8 +85,8 @@ repo and the changed files. Deploy workflows, deploy configs and agent prompts
 always count as production. `firstmate_merge` refuses such a PR without a pass
 verdict from a crew that is not the builder.
 
-These gates apply to crews dispatched from Firstmate's pipeline version on.
-Older crews and their PRs keep the old rules.
+The P4 gate applies to crews dispatched from Firstmate's pipeline version on.
+The checker rule applies to every production merge, older PRs too.
 
 ## Core principles
 

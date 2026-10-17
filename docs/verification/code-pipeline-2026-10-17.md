@@ -61,3 +61,31 @@ that has a known bug (`slug "My Post Title"` printed `my-post title`).
 
 Not shown live: a checker on the builder's model and a fail verdict. The
 tests in `server.code-pipeline.test.mjs` cover both.
+
+## Fixes after the independent check (verdict 1: FIX)
+
+1. Deploy files are production. `owner/reach.json` gains `productionPaths`:
+   `.github/workflows/`, `.github/actions/`, Dockerfiles and compose files,
+   platform deploy configs (fly, vercel, netlify, nixpacks, railway, render,
+   Procfile, Expo `app.json`, `eas.json`, `app.config.*`) and agent prompts
+   (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `SKILL.md`, `skills/`, `prompts/`).
+   A production path wins over an internal one. `docs/` is internal only at
+   the repo root, so `apps/docs/app/api/route.ts` is production. A repo row
+   can add its own production paths, such as the folder it deploys from.
+   Only the scratch and demo repos (`*/fm-canary-*`, `*/firstmate-demo`)
+   are internal. The isolated run above used an `fm-canary-*` repo, which is
+   now internal; the tests use production repos for the refusal.
+2. P4 is parsed, not searched: the line must be `✓ P4 Prove on the real
+   surface for <owner/repo#n> at <head sha>: driven <what>; seen <what>`,
+   at the pipeline's proof step number, with both fields filled.
+3. `deliveries verify` accepts only a P4 line for that PR at its current
+   head (7 or more characters of the commit). Proof for another PR or an
+   older head does not count. One report can hold one P4 line per PR.
+4. Dispatch refuses when the provider list or the model catalog cannot be
+   read, is empty, or failed to load. Nothing is spawned.
+5. Migration: a crew dispatched by this version records `dispatchVersion: 2`.
+   Only such crews get the P4 verify gate and the pipeline DONE check, because
+   an older crew's report was written without P4. The checker rule applies to
+   every production merge, older PRs too. The captain dispatches a checker for
+   an older PR only when he wants to merge it, so the open PRs are not all
+   checked up front.

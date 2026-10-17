@@ -46,8 +46,9 @@ export function codePipeline(playbook: string): readonly PipelineStep[] | null {
   return Object.hasOwn(CODE_PIPELINES, playbook) ? CODE_PIPELINES[playbook as PipelineTask] : null;
 }
 
-// Q4/Q8 migration (17 Oct): crews dispatched from this version on carry it. Only they get
-// the P4 proof gate and the checker rule; older crews and their PRs keep the old rules.
+// Q4 migration (17 Oct): crews dispatched from this version on carry it. Only they get the
+// P4 proof gate, because an older crew's report was written without P4. The checker rule
+// covers every production merge, old PRs too.
 export const DISPATCH_VERSION = 2;
 export function pipelineGates(crew: { dispatchVersion?: number }): boolean {
   return (crew.dispatchVersion ?? 1) >= DISPATCH_VERSION;
