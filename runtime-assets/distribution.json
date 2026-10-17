@@ -1,7 +1,7 @@
 {
-  "adapterRevision": "5d1bbdbf537882a0954b3c1c2cf400f03977dc65d650a82f6eee875d90039229",
-  "archiveBytes": 2823099,
-  "archiveSha256": "ba51309f54a46d8596b3bfca6a79c556786302df52cdb8981dad57754e6e9108",
+  "adapterRevision": "ddbb7078a47e94c9c5f6bb540487b74355872b37f29f3d6f11a30a309d5a593c",
+  "archiveBytes": 2824163,
+  "archiveSha256": "5da0f2ce63ac19589a10050ebc6c173d30adccd7f435df2e289ea0b1e7773b15",
   "auditedSources": [
     "15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4",
     "1f3e769616fdf9f31f85f4c3e6a9f71606634238",
@@ -9,7 +9,7 @@
   ],
   "helperSha256": "ced8da32c0434c0673ab682e82ae0bf22a66c4113123b05e24b3b61addb88c52",
   "pluginVersion": "0.4.0",
-  "release": "249df218d2b3060a8c4aa3d5ac9ecf68624bb71c19118426c7cdc5812e919e66",
+  "release": "a6b3cb92893d56b93fbb513d294c90bd3bf27e9814b4ab015bed99f16273f2e0",
   "schema": 1,
   "snapshotCommit": "6555ce6848a81d930f17dd752c18424b09684dac",
   "stateContract": "native-flat-v1",

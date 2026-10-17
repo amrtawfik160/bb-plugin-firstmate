@@ -975,11 +975,9 @@ fm_backend_bb_map_status() {  # <bb-status> <pending 0|1>
   esac
 }
 
-fm_backend_bb_snapshot() {  # <thread-id> -> status<TAB>pending
-  local id raw pending=0
-  id=$(fm_backend_bb_thread_id "$1")
-  raw=$(fm_backend_bb_show "$id" 2>/dev/null) || return 1
-  if bb thread interactions list --json "$id" 2>/dev/null | python3 -c '
+# 0 when the thread has an interaction still pending or resolving.
+fm_backend_bb_interactions_pending() {  # <thread-id>
+  bb thread interactions list --json "$1" 2>/dev/null | python3 -c '
 import json, sys
 raw = sys.stdin.read().strip()
 if not raw:
@@ -1000,7 +998,14 @@ for row in rows:
     if status in (None, "", "pending", "resolving"):
         sys.exit(0)
 sys.exit(1)
-' >/dev/null 2>&1; then
+' >/dev/null 2>&1
+}
+
+fm_backend_bb_snapshot() {  # <thread-id> -> status<TAB>pending
+  local id raw pending=0
+  id=$(fm_backend_bb_thread_id "$1")
+  raw=$(fm_backend_bb_show "$id" 2>/dev/null) || return 1
+  if fm_backend_bb_interactions_pending "$id"; then
     pending=1
   fi
   printf '%s' "$raw" | python3 -c '
@@ -1024,6 +1029,64 @@ if not isinstance(status, str) or not status:
     sys.exit(1)
 sys.stdout.write(status + "\t" + pending)
 ' "$pending"
+}
+
+# Every thread's snapshot from one `bb thread list` read, one
+# <thread-id><TAB><status><TAB><pending> line per listed thread asked for. The
+# list's hasPendingInteraction answers for a settled thread. A thread with a turn
+# in flight, or a row without the flag, still gets its interactions read: the
+# flag can lag an interaction that is still resolving.
+fm_backend_bb_snapshots() {  # <thread-id...>
+  local raw tid status pending
+  [ "$#" -gt 0 ] || return 0
+  fm_backend_bb_tool_check || return 1
+  raw=$(bb thread list --json --include-hidden 2>/dev/null) || {
+    echo "error: bb thread list failed; the BB wait reads each window's thread instead" >&2
+    return 1
+  }
+  printf '%s' "$raw" | python3 -c '
+import json, sys
+try:
+    rows = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+if not isinstance(rows, list):
+    sys.exit(1)
+wanted = set(sys.argv[1:])
+for row in rows:
+    if not isinstance(row, dict) or row.get("id") not in wanted:
+        continue
+    status = row.get("status")
+    if not isinstance(status, str) or not status:
+        runtime = row.get("runtime")
+        status = runtime.get("displayStatus") if isinstance(runtime, dict) else None
+    if not isinstance(status, str) or not status or "\t" in status or "\n" in status:
+        continue
+    flag = row.get("hasPendingInteraction")
+    if flag is True:
+        pending = "1"
+    elif flag is False and status not in ("active", "running", "working", "starting", "pending", "queued"):
+        pending = "0"
+    else:
+        pending = "check"
+    sys.stdout.write("%s\t%s\t%s\n" % (row["id"], status, pending))
+' "$@" | while IFS=$'\t' read -r tid status pending; do
+    if [ "$pending" = check ]; then
+      if fm_backend_bb_interactions_pending "$tid"; then pending=1; else pending=0; fi
+    fi
+    printf '%s\t%s\t%s\n' "$tid" "$status" "$pending"
+  done
+}
+
+fm_backend_bb_snapshot_in() {  # <thread-id> <snapshots> -> status<TAB>pending
+  local id status pending
+  while IFS=$'\t' read -r id status pending; do
+    if [ -n "$id" ] && [ "$id" = "$1" ]; then
+      printf '%s\t%s' "$status" "$pending"
+      return 0
+    fi
+  done <<< "$2"
+  return 1
 }
 
 fm_backend_bb_normalize_event() {  # <pane_id> <workspace_id> <to_status>
@@ -1077,15 +1140,20 @@ fm_backend_bb_clear_transition() {  # <state_dir> <window>
 
 # 0: printed a fresh blocked record. 2: working, caller should wait for idle.
 # 1: observed and not waiting (idle, unknown, or already-escalated blocked).
-# 3: snapshot unreadable.
-fm_backend_bb_consider_window() {  # <state_dir> <session> <window>
-  local state=$1 session=$2 window=$3 tid snap status pending to pane record hit
+# 3: snapshot unreadable. Without a snapshot it reads the thread itself.
+fm_backend_bb_consider_window() {  # <state_dir> <session> <window> [status<TAB>pending]
+  local state=$1 session=$2 window=$3 snap=${4:-} tid status pending to pane record hit
   tid=$(fm_backend_bb_thread_of_window "$window")
   [ -n "$tid" ] || return 3
-  snap=$(fm_backend_bb_snapshot "$tid") || return 3
+  [ -n "$snap" ] || snap=$(fm_backend_bb_snapshot "$tid") || return 3
   status=${snap%%$'\t'*}
   pending=${snap#*$'\t'}
   to=$(fm_backend_bb_map_status "$status" "$pending")
+  # Idle defers and unknown falls back: neither yields a record or touches a
+  # marker, so skip building one. Most of a large fleet is idle.
+  case "$to" in
+    idle|unknown) return 1 ;;
+  esac
   pane=$(fm_backend_bb_pane_of_window "$session" "$window" "$state")
   record=$(fm_backend_bb_normalize_event "$pane" "" "$to")
   if hit=$(fm_backend_bb_apply_transition "$state" "$session" "$record"); then
@@ -1146,7 +1214,7 @@ fm_backend_bb_race_idle() {  # <timeout_secs> <thread_id...>
       esac
     done
     [ "$left" -eq 0 ] && break
-    if [ $((SECONDS - start)) -gt "$timeout" ]; then
+    if [ $((SECONDS - start)) -ge "$timeout" ]; then
       any_timeout=1
       break
     fi
@@ -1159,11 +1227,54 @@ fm_backend_bb_race_idle() {  # <timeout_secs> <thread_id...>
   return 1
 }
 
+# One status read for all windows. Sets FM_BACKEND_BB_HIT to the first fresh
+# blocked record (return 0), FM_BACKEND_BB_TO_WAIT to the working thread ids, and
+# FM_BACKEND_BB_SEEN_OK=1 when any window was readable (return 1).
+fm_backend_bb_scan_windows() {  # <state_dir> <session> <window...>
+  local state=$1 session=$2 w tid snap snaps hit crc joined=
+  shift 2
+  local -a tids=()
+  FM_BACKEND_BB_HIT=
+  FM_BACKEND_BB_TO_WAIT=()
+  FM_BACKEND_BB_SEEN_OK=0
+  for w in "$@"; do
+    tid=$(fm_backend_bb_thread_of_window "$w")
+    [ -z "$tid" ] || tids+=("$tid")
+  done
+  snaps=$(fm_backend_bb_snapshots "${tids[@]}") || snaps=
+  for w in "$@"; do
+    tid=$(fm_backend_bb_thread_of_window "$w")
+    snap=$(fm_backend_bb_snapshot_in "$tid" "$snaps") || snap=
+    hit=$(fm_backend_bb_consider_window "$state" "$session" "$w" "$snap")
+    crc=$?
+    case "$crc" in
+      0)
+        FM_BACKEND_BB_HIT=$hit
+        return 0
+        ;;
+      2)
+        case " $joined " in
+          *" $tid "*) ;;
+          *)
+            FM_BACKEND_BB_TO_WAIT+=("$tid")
+            joined="$joined $tid"
+            ;;
+        esac
+        FM_BACKEND_BB_SEEN_OK=1
+        ;;
+      1) FM_BACKEND_BB_SEEN_OK=1 ;;
+    esac
+  done
+  return 1
+}
+
+# Replaces fm-watch's `sleep POLL`, so it spends at most the budget plus one
+# closing scan, however many windows are recorded.
 fm_backend_bb_wait_transition() {  # <session> <timeout_secs> <state_dir> <window...>
   local session=$1 timeout=$2 state=$3
   shift 3
-  local -a windows=("$@") to_wait=()
-  local w hit tid crc seen_ok=0 race_rc joined=
+  local -a windows=("$@")
+  local deadline left race_rc
   [ "${#windows[@]}" -gt 0 ] || return 2
   case "$timeout" in
     ''|*[!0-9]*) return 2 ;;
@@ -1171,49 +1282,26 @@ fm_backend_bb_wait_transition() {  # <session> <timeout_secs> <state_dir> <windo
   if [ "${FM_BACKEND_EVENTS_CAPABILITY_CONFIRMED:-0}" != 1 ]; then
     fm_backend_bb_events_capable "$session" || return 2
   fi
-  for w in "${windows[@]}"; do
-    hit=$(fm_backend_bb_consider_window "$state" "$session" "$w")
-    crc=$?
-    case "$crc" in
-      0)
-        printf '%s' "$hit"
-        return 0
-        ;;
-      2)
-        tid=$(fm_backend_bb_thread_of_window "$w")
-        if [ -n "$tid" ]; then
-          case " $joined " in
-            *" $tid "*) ;;
-            *)
-              to_wait+=("$tid")
-              joined="$joined $tid"
-              ;;
-          esac
-        fi
-        seen_ok=1
-        ;;
-      1) seen_ok=1 ;;
-      *) : ;;
-    esac
-  done
-  if [ "${#to_wait[@]}" -eq 0 ]; then
-    # Nothing in flight. Sleep the budget so an all-idle fleet does not spin.
-    # Every window unreadable is an unusable push path.
-    [ "$seen_ok" -eq 1 ] || return 2
-    sleep "$timeout"
+  deadline=$((SECONDS + timeout))
+  if fm_backend_bb_scan_windows "$state" "$session" "${windows[@]}"; then
+    printf '%s' "$FM_BACKEND_BB_HIT"
+    return 0
+  fi
+  left=$((deadline - SECONDS))
+  [ "$left" -ge 1 ] || left=1
+  if [ "${#FM_BACKEND_BB_TO_WAIT[@]}" -eq 0 ]; then
+    # Nothing in flight. Sleep the rest of the budget so an all-idle fleet does
+    # not spin. Every window unreadable is an unusable push path.
+    [ "$FM_BACKEND_BB_SEEN_OK" -eq 1 ] || return 2
+    sleep "$left"
     return 1
   fi
-  fm_backend_bb_race_idle "$timeout" "${to_wait[@]}"
+  fm_backend_bb_race_idle "$left" "${FM_BACKEND_BB_TO_WAIT[@]}"
   race_rc=$?
   [ "$race_rc" -eq 2 ] && return 2
-  for w in "${windows[@]}"; do
-    hit=$(fm_backend_bb_consider_window "$state" "$session" "$w")
-    crc=$?
-    if [ "$crc" -eq 0 ]; then
-      printf '%s' "$hit"
-      return 0
-    fi
-  done
-  [ "$race_rc" -eq 0 ] || [ "$race_rc" -eq 1 ] && return 1
-  return 2
+  if fm_backend_bb_scan_windows "$state" "$session" "${windows[@]}"; then
+    printf '%s' "$FM_BACKEND_BB_HIT"
+    return 0
+  fi
+  return 1
 }
