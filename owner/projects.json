@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "about": "Owner decisions Q5 and Q11 (17 Oct). Each project names the surface its proof must come from, the release read-back its app builds need, and the shared test servers its crews lease one at a time. A PR belongs to the project whose repos list its repository (owner/repo, * is a wildcard); a crew belongs to the project whose repos list its repository or whose bbProjects list its BB project name. hostCanDrive lists the surfaces a crew on this host can drive itself; for any other surface the crew asks the owner to test the build, and his Works tap is the proof record.",
+  "about": "Owner decisions Q5 and Q11 (17 Oct). The Canary row is the isolated-server test project. Each project names the surface its proof must come from, the release read-back its app builds need, and the shared test servers its crews lease one at a time. A PR belongs to the project whose repos list its repository (owner/repo, * is a wildcard); a crew belongs to the project whose repos list its repository or whose bbProjects list its BB project name. hostCanDrive lists the surfaces a crew on this host can drive itself; for any other surface the crew asks the owner to test the build, and his Works tap is the proof record.",
   "surfaces": {
     "iphone": "the app on an iPhone or the iOS Simulator",
     "web": "the deployed web page in a browser",
@@ -42,6 +42,16 @@
       "repos": ["xtawfik/parknwash-*"],
       "bbProjects": ["Parknwash"],
       "proofSurface": "web"
+    },
+    {
+      "name": "Canary",
+      "repos": ["*/fm-canary-*"],
+      "bbProjects": ["fm-canary", "fm-canary-34"],
+      "proofSurface": "iphone",
+      "release": { "kind": "testflight", "group": "Canary Testers" },
+      "sharedServers": [
+        { "id": "canary-dev", "about": "the canary test server", "reset": "deploy main back to the canary test server" }
+      ]
     },
     {
       "name": "Telegram and agents",
