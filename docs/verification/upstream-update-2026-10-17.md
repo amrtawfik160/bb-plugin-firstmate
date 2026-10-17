@@ -195,6 +195,25 @@ returned 404 for the canary crew).
    file fallback. `firstmate_merge` merged it (`ebb4d54`). GitHub shows both
    merged.
 
+### Mid-turn switch
+
+A second run on a fresh isolated server closed the limit an independent check
+raised: a switch while a crew's model turn is running, with the real watcher.
+
+1. Main plugin; test captain on release `c9f623c8`. A crew started one
+   turn that ran `sleep 420`, then fixed a typo and opened a PR.
+2. During that turn: this branch installed, then `firstmate_runtime select`
+   to release `e99f6c5e` (native 15ad1bd6) passed.
+3. The crew's turn ran from before the switch to after it and completed
+   normally. It opened PR #3 and wrote its done line in that same turn.
+4. The watcher and keeper moved to the new release. Once, while the old
+   keeper was replaced, the old release's `fm-watch-arm.sh` failed with
+   `trap: line 2: unexpected EOF while looking for matching ')'`. For about
+   one minute no watcher ran; the captain got the native "watcher down"
+   notice, and a new watcher on the new release started by itself. No wake
+   was lost.
+5. `firstmate_merge` merged PR #3 (`6222b47`) on the switched home.
+
 Observations, not changed here:
 - The captain once asked for a Claude model on the project's default Codex
   provider; that crew failed at its first turn. The captain retried with the
@@ -220,6 +239,8 @@ Run these as the live captain, in its own thread:
 6. `firstmate_contract`, read again in full. It must name 15ad1bd6.
 7. Check `firstmate_runtime action=status`: selected release has upstream
    15ad1bd6; old crews appear under `referencedReleases`.
+   Expect one "watcher down" notice while the old watcher is replaced; a
+   new watcher should start within about a minute.
 8. Check that `state/.watch.lock/watcher-path` and
    `state/.bb-watch-keeper.bindir` in the home name the new release folder.
    The plugin log shows "replacing the keeper" when it moved them.
