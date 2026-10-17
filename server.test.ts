@@ -850,14 +850,15 @@ test("a protocol verdict does not nudge; supervision still pings the captain", a
 const FEATURE_PLAYBOOK = "### Feature\n\n1. `how`.\n2. `architect`.\n3. Checkpoint:\n   - Parallelism.\n4. Delegate.\n5. Verify.\n6. Rebase.\n7. Interrogate.\n8. Run **Opening a PR**.\n";
 async function seedPlaybookCrew(host: Awaited<ReturnType<typeof load>>) {
   await host.bb.storage.kv.set("crews", [{
-    id: "0151f78d", task: "Per-re-import webhook event key", title: "Add per-re-import webhook event key", projectId: "proj_1",
+    // refactoring: its report counts the playbook's steps. Bug-fix and feature crews count the pipeline's.
+    id: "0151f78d", task: "Per-re-import webhook event key", title: "Add per-re-import webhook event key", playbook: "refactoring", projectId: "proj_1",
     threadId: "thr_crew", parentThreadId: "thr_cap", providerId: "claude-code", worktree: true, shape: "ship", posture: "local-only",
     createdAt: "2026-10-14T00:00:00.000Z",
   }]);
   host.harness.sdk.stub("environments.list", async () => [{ hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" }]);
   host.harness.sdk.stub("files.read", async (input: unknown) => {
     const path = String((input as { path?: string }).path ?? "");
-    if (!path.endsWith("/poteto-mode/playbooks/feature.md")) throw new Error(`no file ${path}`);
+    if (!path.endsWith("/poteto-mode/playbooks/refactoring.md")) throw new Error(`no file ${path}`);
     return { content: FEATURE_PLAYBOOK, contentEncoding: "utf8", sizeBytes: FEATURE_PLAYBOOK.length, path, sha256: "x" };
   });
 }
@@ -926,11 +927,13 @@ test("crew 0940c38e's final report with a pending verify step is flagged NOT VER
     const sends = sendCalls(host);
     const notes = sends.filter((s) => s.threadId === "thr_cap" && s.text.includes("NOT VERIFIED: crew 0940c38e"));
     assert.equal(notes.length, 1, JSON.stringify(sends));
-    assert.match(notes[0]!.text, /verify step pending: "Verify on the same surface \(waiting Secret and dependency scan/);
+    // A bug-fix crew is judged on its pipeline's proof step; the playbook's pending verify line is not it.
+    assert.match(notes[0]!.text, /verify step missing: no "✓ P4 Prove on the real surface" line/);
     assert.match(notes[0]!.text, /cannot merge until a verification record exists/);
     const toCrew = sends.filter((s) => s.threadId === "thr_crew");
-    assert.equal(toCrew.length, 1, JSON.stringify(toCrew));
-    assert.match(toCrew[0]!.text, /^VERIFY STEP NOT DONE/);
+    assert.equal(toCrew.length, 2, JSON.stringify(toCrew));
+    assert.match(toCrew[0]!.text, /^REPORT INCOMPLETE: your final report lacks playbook step lines \(6 of 7\)\.\nReply with only the missing parts: a line "Skills read: <paths>", and one line per pipeline step, "✓ P<n> <step>: <evidence>"/);
+    assert.match(toCrew[1]!.text, /^VERIFY STEP NOT DONE/);
     assert.deepEqual((await emitIdle(host, "DONE: PR https://github.com/Cyndra-AI/cyndra-saas/pull/2315")).errors, []);
     assert.equal(sendCalls(host).filter((s) => s.text.includes("NOT VERIFIED:")).length, 1, "flagged once");
   } finally {
@@ -949,6 +952,36 @@ test("a playbook crew's DONE with skills and every step line gets no note", asyn
     const sends = sendCalls(host);
     assert.equal(sends.filter((s) => s.text.includes("Report check:")).length, 0);
     assert.equal(sends.filter((s) => s.threadId === "thr_crew").length, 0);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// 17 Oct owner decision Q4: a feature or bug-fix crew reports the 7 pipeline steps, and its
+// proof step decides NOT VERIFIED.
+test("a feature crew's DONE is counted against the pipeline and judged on its proof step", async () => {
+  const host = await load();
+  try {
+    stubIdleSdk(host);
+    await host.bb.storage.kv.set("crews", [{
+      id: "0151f78d", task: "Per-re-import webhook event key", title: "Add per-re-import webhook event key", projectId: "proj_1",
+      threadId: "thr_crew", parentThreadId: "thr_cap", providerId: "claude-code", worktree: true, shape: "ship", posture: "local-only",
+      createdAt: "2026-10-14T00:00:00.000Z",
+    }]);
+    host.harness.sdk.stub("environments.list", async () => [{ hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" }]);
+    host.harness.sdk.stub("files.read", async (input: unknown) => {
+      const path = String((input as { path?: string }).path ?? "");
+      if (!path.endsWith("/poteto-mode/playbooks/feature.md")) throw new Error(`no file ${path}`);
+      return { content: FEATURE_PLAYBOOK, contentEncoding: "utf8", sizeBytes: FEATURE_PLAYBOOK.length, path, sha256: "x" };
+    });
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    const steps = ["Sharpen", "Architect", "TDD build", "Prove on the real surface: CI is green", "Code review", "No comments", "PR"].map((step, i) => `✓ P${i + 1} ${step}`).join("\n");
+    assert.deepEqual((await emitIdle(host, `${steps}\nSkills read: /root/.claude/skills/poteto-mode/SKILL.md\nDONE: branch ready`)).errors, []);
+    const sends = sendCalls(host);
+    assert.equal(sends.filter((s) => s.text.includes("Report check:")).length, 0, "7 of 7 pipeline lines");
+    const notes = sends.filter((s) => s.threadId === "thr_cap" && s.text.includes("NOT VERIFIED: crew 0151f78d"));
+    assert.equal(notes.length, 1, JSON.stringify(sends));
+    assert.match(notes[0]!.text, /verify step no evidence: the line lacks "driven <what>; seen <what>"/);
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -2455,7 +2488,7 @@ function shipRow(id: string, threadId: string, parentThreadId: string | null, po
 // The merge gate reads the PR head fresh from GitHub; this is the answer for o/r#n.
 function prViewAnswer(cmd: string, extra: Record<string, unknown> = {}) {
   const n = Number(/\/pull\/(\d+)/.exec(cmd)?.[1] ?? 1);
-  return JSON.stringify({ number: n, url: `https://github.com/o/r/pull/${n}`, title: "t", headRefName: "fm/c1-x", headRefOid: "a".repeat(40), state: "OPEN", mergeable: "MERGEABLE", ...extra });
+  return JSON.stringify({ number: n, url: `https://github.com/o/r/pull/${n}`, title: "t", headRefName: "fm/c1-x", headRefOid: "a".repeat(40), state: "OPEN", mergeable: "MERGEABLE", files: [{ path: "docs/x.md" }], ...extra });
 }
 
 function hostOutput(text: string, code = 0) {
@@ -9734,7 +9767,7 @@ test("read-through keeps a dispatched crew whose thread still waits for a host s
   }
 });
 
-test("dispatch refuses an unknown providerId before spawning, names the catalog id, and lets unlisted models through", async () => {
+test("dispatch refuses an unknown providerId or an unlisted model before spawning, and names the catalog ids", async () => {
   const host = await load();
   try {
     host.harness.sdk.stub("environments.list", async () => [{ hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" }]);
@@ -9748,10 +9781,11 @@ test("dispatch refuses an unknown providerId before spawning, names the catalog 
     assert.equal(bad.exitCode, 1);
     assert.match(bad.stderr, /Unknown providerId "grok" — did you mean "acp-grok"\?/);
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0, "nothing is spawned for a bad provider");
-    // An unlisted model (alias or selected model) is not refused; a real rejection surfaces as a thread in error.
+    // 17 Oct step 2 canary: an unlisted model was let through and the crew failed at its first turn.
     const aliasModel = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--provider", "acp-grok", "--model", "grok-latest", "--", "fix login"], { projectId: "proj_1" });
-    assert.equal(aliasModel.exitCode, 0, aliasModel.stderr);
-    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 1, "an unlisted model still dispatches");
+    assert.equal(aliasModel.exitCode, 1);
+    assert.match(aliasModel.stderr, /Provider "acp-grok" does not offer model "grok-latest"\. It offers: grok-4\. Nothing was spawned\./);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0, "an unlisted model is not dispatched");
     const good = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--provider", "acp-grok", "--model", "grok-4", "--", "fix login"], { projectId: "proj_1" });
     assert.equal(good.exitCode, 0, good.stderr);
   } finally {

@@ -199,10 +199,12 @@ export function reportGapNote(crewId: string, gaps: readonly string[]): string {
   return `Report check: crew ${crewId}'s DONE report lacks ${gaps.join("; ")}. Asked the crew to add them. Its delivery is not held.`;
 }
 
-export function reportGapRequest(gaps: readonly string[]): string {
+export function reportGapRequest(gaps: readonly string[], pipeline = false): string {
   return [
     `REPORT INCOMPLETE: your final report lacks ${gaps.join("; ")}.`,
-    "Reply with only the missing parts: a line \"Skills read: <paths>\", and one line per playbook step, \"✓ <step>\" or \"skip: <step>: <reason>\".",
+    pipeline
+      ? "Reply with only the missing parts: a line \"Skills read: <paths>\", and one line per pipeline step, \"✓ P<n> <step>: <evidence>\" or \"skip: P<n> <step>: <reason>\"."
+      : "Reply with only the missing parts: a line \"Skills read: <paths>\", and one line per playbook step, \"✓ <step>\" or \"skip: <step>: <reason>\".",
     "Do not redo the task. End with your DONE: line again.",
   ].join("\n");
 }

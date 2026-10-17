@@ -653,7 +653,22 @@ test("a pipeline report whose proof step is skipped, pending, missing or has no 
   assert.equal(pipelineProofGap(withProof("✓ P4 Prove on the real surface: CI is green")), "no evidence: the line lacks \"driven <what>; seen <what>\"");
 });
 
-test("a pipeline crew's DONE report is counted against the pipeline steps", () => {
+test("a pipeline crew's DONE report is counted against the pipeline steps, and the request asks for pipeline lines", () => {
+  assert.match(reportGapRequest(["playbook step lines (3 of 7)"], true), /one line per pipeline step, "✓ P<n> <step>: <evidence>" or "skip: P<n> <step>: <reason>"\./);
   assert.deepEqual(reportGaps(`${BUG_REPORT}\nSkills read: /x`, CODE_PIPELINES["bug-fix"].length), []);
   assert.deepEqual(reportGaps(`${BUG_REPORT.split("\n").slice(0, 3).join("\n")}\nSkills read: /x`, CODE_PIPELINES["bug-fix"].length), ["playbook step lines (3 of 7)"]);
+});
+
+test("the captain rules name the dispatch skills, the crew models and the checker rule", () => {
+  const rules = readFileSync(new URL("../entry-skills/captain/references/supervision.md", import.meta.url), "utf8").replace(/\s*\n\s*/g, " ");
+  for (const text of [
+    "Read `poteto-help` and pick the playbook and skills for the task.",
+    "run `sharpen`, then `in-your-own-words`",
+    "run `interrogate` on it",
+    "prove it with `principle-prove-it-works` or `verify-this`",
+    "`principle-never-block-on-the-human`, `principle-sequence-verifiable-units`, `principle-encode-lessons-in-structure` and `principle-guard-the-context-window`",
+    "A builder (the default) runs claude-code `claude-opus-5-5`. A checker runs codex `gpt-6-astra`.",
+    "They apply to that task's crews only.",
+    "`firstmate_merge` refuses a production PR without a `pass` verdict for its current head.",
+  ]) assert.ok(rules.includes(text), text);
 });
