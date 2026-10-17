@@ -511,3 +511,20 @@ test('with no delivery rows the quota is probed before discovery, and with 150 p
   assert.equal(commands.filter(c=>c.includes('gh pr list')).length,0,'no branch list under the reserve');
  }finally{await host.harness.lifecycle.dispose();}
 });
+
+test('discovery requests debit the GraphQL meter before they run, so 1,002 points left allows two, not a stale count down to 502',async()=>{
+ const host=await base();try {
+  await host.bb.storage.kv.set('crews',Array.from({length:20},(_,i)=>crew(`c${i}`,`thr_c${i}`,'thr_cap')));
+  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'active',environmentId:`env_${threadId}`}));
+  host.harness.sdk.stub('environments.get',async({environmentId})=>({id:environmentId,hostId:'host_1',status:'ready',isWorktree:true,path:`/wt/${environmentId}`,branchName:`fm/${environmentId}`}));
+  host.harness.sdk.stub('environments.pullRequest',async()=>({outcome:'unavailable'}));
+  const commands=[];
+  hostCommands(host,command=>{commands.push(command);
+   if(command.includes('rateLimit')) return {payload:'{}',stderr:`< X-Ratelimit-Remaining: 1002\n< X-Ratelimit-Reset: ${Math.floor(Date.now()/1000)+600}\n< X-Ratelimit-Resource: graphql\n`};
+   if(command.includes('gh pr list')) return {payload:'[]'};
+   return {code:0};});
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  const requests=host.harness.sdk.callsTo('environments.pullRequest').length+commands.filter(c=>c.includes('gh pr list')).length;
+  assert.equal(requests,2,`${requests} discovery requests with 1,002 points left and a 1,000-point reserve`);
+ }finally{await host.harness.lifecycle.dispose();}
+});
