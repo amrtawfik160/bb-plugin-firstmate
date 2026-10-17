@@ -38,6 +38,8 @@ export const telegramReplyOutputSchema = z.object({
   cardRepeat: z.boolean().optional(),
   /** The connector held the reply back: it only says the work started, or it is a note about the owner. Nothing answered the owner. */
   dropped: z.enum(["started", "about-owner"]).optional(),
+  /** The connector refused the reply at write time: the owner message already has its answer and continuation, or the task its result. */
+  refused: z.enum(["answer", "result"]).optional(),
 });
 
 export function correlationOf(row: Pick<InboundRow, "sourceRefs">): string | undefined {
@@ -57,6 +59,8 @@ export type TelegramReplyResult = {
   cardRepeat?: boolean;
   // The connector sent nothing: the reply only says the work started, or is a note about the owner.
   dropped?: "started" | "about-owner";
+  // The connector sent nothing: one answer message (and one continuation) per owner message, one result per task.
+  refused?: "answer" | "result";
 };
 
 export function telegramReplyFallbackBody(input: TelegramReplyInput & { threadId?: string | null }): string {
@@ -136,6 +140,7 @@ export async function sendTelegramReply(input: {
   if (input.payload.kind === "ack" && result.mode === "off") return { channel: "rpc", body, outcome: "not-applicable", ...mode };
   if (result.cardRepeat === true) return { channel: "rpc", body, outcome: "delivered", cardRepeat: true, ...mode };
   if (result.dropped) return { channel: "rpc", body, outcome: "delivered", dropped: result.dropped, ...mode };
+  if (result.refused) return { channel: "rpc", body, outcome: "delivered", refused: result.refused, ...mode };
   if (result.queued > 0 || result.duplicate) return { channel: "rpc", body, outcome: "delivered", duplicate: result.queued <= 0 && result.duplicate, ...mode };
   throw new Error(`telegram.reply not queued (queued=${result.queued}, mode=${result.mode ?? "unknown"}).`);
 }
