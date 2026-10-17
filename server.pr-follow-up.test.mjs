@@ -143,3 +143,27 @@ test('a PR reopened since its delivery was abandoned is read fresh, and its task
   assert.deepEqual(d.removed(),[]);
  }finally{await d.host.harness.lifecycle.dispose();}
 });
+
+test('background reads stay inside an hourly allowance however many PRs come due, leaving the rest of the quota to merges and checks',async()=>{
+ const prs=Array.from({length:100},(_,i)=>6000+i);
+ const {host,store,gh}=await deck(prs);try {
+  for(let cycle=0;cycle<8;cycle++){
+   for(const n of prs){const r=store.get(id(n));store.save({...r,nextCheckAt:0});}
+   await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  }
+  assert.ok(gh.reads<=500,`${gh.reads} background GitHub reads within one hour`);
+  assert.ok(gh.reads>=400,`only ${gh.reads} reads: the allowance went unused`);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('a checker refresh that overlaps the follow-up read of the same PR shares that read when it covers the head',async()=>{
+ const {host,store,gh}=await deck([2391],{delayMs:300});try {
+  store.save({...store.get(id(2391)),nextCheckAt:0});
+  const cycle=host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  await new Promise(r=>setTimeout(r,100));
+  text(await check(host,2391,head(2391)));
+  await cycle;
+  assert.equal(gh.reads,1,'one GitHub read served both');
+  assert.equal(store.get(id(2391)).check?.commitSha,head(2391));
+ }finally{await host.harness.lifecycle.dispose();}
+});
