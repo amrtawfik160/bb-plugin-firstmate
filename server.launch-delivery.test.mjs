@@ -232,6 +232,7 @@ test('missed manager deletion is surfaced after restart; inventory failures pres
  const host=await base();try {
  const store=createDeliveries(host.bb.storage.database());const r=store.register({url:'https://github.com/acme/repo/pull/9',taskId:'forgotten',projectId:'proj_1',owner:'thr_missing',home:'',worker:'thr_old'});
  host.harness.sdk.stub('threads.get',async()=>{throw new Error('owner unavailable');});host.harness.sdk.stub('threads.list',async()=>{throw new Error('inventory unavailable');});
+ meteredHost(host);
  await host.harness.behavior.runSchedule('pr-delivery-follow-up');assert.equal(store.get(r.id).freshness,'stale');assert.equal(store.get(r.id).ownerNeeded,false);
  host.harness.sdk.stub('threads.list',async()=>[]);const again=store.get(r.id);again.nextCheckAt=0;store.save(again);
  await host.harness.behavior.runSchedule('pr-delivery-follow-up');assert.equal(store.get(r.id).ownerNeeded,true);assert.equal(store.get(r.id).owner,'thr_missing');
@@ -240,6 +241,8 @@ test('missed manager deletion is surfaced after restart; inventory failures pres
 const tool=(host,name)=>host.harness.inspection.registrations.agentTools.find(t=>t.name===name);
 const turn=()=>new Promise(setImmediate);
 async function until(condition) { for(let i=0;i<300;i++){if(condition())return;await turn();}throw new Error('fixture did not reach boundary'); }
+// A host whose GitHub quota probe answers with plenty left; other commands fail like a host without gh.
+const meteredHost=host=>hostCommands(host,command=>command.includes('rateLimit')?{payload:'{}',stderr:`< X-Ratelimit-Remaining: 4000\n< X-Ratelimit-Reset: ${Math.floor(Date.now()/1000)+3600}\n< X-Ratelimit-Resource: graphql\n`}:{code:1,stderr:'gh unavailable'});
 const forge=(extra={})=>({headRefOid:'sha1',state:'OPEN',isDraft:false,statusCheckRollup:[],reviewDecision:null,reviews:[],mergeable:'MERGEABLE',files:[{path:'docs/x.md'}],...extra});
 
 test('factory metadata adoption and dispatch recovery preserve required verification through discovery and merge',async()=>{
@@ -301,6 +304,7 @@ test('registered follow-up disposal settles hung discovery and notification reco
    if(boundary==='discovery') {
     await host.bb.storage.kv.set('crews',[row(1)]);
     host.harness.sdk.stub('environments.pullRequest',async()=>{reached=true;return new Promise(()=>{});});
+    meteredHost(host);
    }else{
     const store=createDeliveries(host.bb.storage.database());let r=store.register({url:'https://github.com/acme/hung/pull/1',taskId:'c1',projectId:'proj_1',owner:'thr_cap',home:'',worker:'thr_c1'});
     r.nextCheckAt=Date.now()+100000;r.notification={desired:'signature',delivered:null,queued:null,retryAt:0,attempted:'signature'};store.save(r);

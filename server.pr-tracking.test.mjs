@@ -467,20 +467,19 @@ test('the open list is asked again with its ETag, and a 304 keeps the rows it ha
  }finally{await d.host.harness.lifecycle.dispose();}
 });
 
-test('the quota guard reads GraphQL points from the PR reads themselves: one probe, then nothing until the window resets',async()=>{
+test('the quota guard reads GraphQL points from metered response headers: a probe first, then nothing until the window resets',async()=>{
  let remaining=150,reset=Math.floor(Date.now()/1000)+600;
  const headers=()=>`< X-Ratelimit-Remaining: ${remaining}\n< X-Ratelimit-Reset: ${reset}\n< X-Ratelimit-Resource: graphql\n`;
- const d=await quietDeck(command=>command.includes('gh pr view')?{payload:JSON.stringify(forge('OPEN')),stderr:headers()}:isOpenList(command)?{payload:listed([])}:{code:0});try {
+ const d=await quietDeck(command=>command.includes('rateLimit')?{payload:'{}',stderr:headers()}:command.includes('gh pr view')?{payload:JSON.stringify(forge('OPEN')),stderr:headers()}:isOpenList(command)?{payload:listed([])}:{code:0});try {
   for(const n of [21,22,23,24]){d.track(n);d.store.save({...d.store.get(`acme/repo#${n}`),nextCheckAt:0});}
   await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
-  assert.equal(d.reads().length,1,'with no reading yet, one PR read probes the quota');
+  assert.ok(d.commands.some(c=>c.includes('rateLimit')&&c.includes('GH_DEBUG=api')),'a metered probe read the quota');
+  assert.deepEqual(d.reads(),[],'150 points left: no PR read');
   await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
-  assert.equal(d.reads().length,1,'150 points left: no further read before the reset');
-  assert.ok(!d.commands.some(c=>c.includes('rate_limit')),'the rate_limit endpoint is not the meter');
-  assert.ok(d.commands.filter(c=>c.includes('gh pr view')).every(c=>c.includes('GH_DEBUG=api')),'PR reads expose their rate-limit headers');
+  assert.deepEqual(d.reads(),[],'no read before the reset');
+  assert.ok(!d.commands.some(c=>c.includes('rate_limit')),'the rate_limit overview is not the meter');
   remaining=4000;reset=Math.floor(Date.now()/1000)-1;
-  for(const n of [21,22,23,24]) d.store.save({...d.store.get(`acme/repo#${n}`),nextCheckAt:0});
-  await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  d.host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'active',environmentId:`env_${threadId}`}));
  }finally{await d.host.harness.lifecycle.dispose();}
 });
 

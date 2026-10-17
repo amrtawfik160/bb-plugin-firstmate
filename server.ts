@@ -7544,18 +7544,38 @@ export default async function plugin(bb: BbPluginApi) {
     }
     return res;
   }
-  /** Background GraphQL reads allowed now: none under the reserve, one probe while the meter is unknown or past its reset. */
+  /** Background GraphQL reads allowed now: none under the reserve, and none while the meter is unknown or past its reset (ensureGraphqlMeter probes first). */
   function graphqlReadsAllowed(hostId: string): number {
     const meter = graphqlMeters.get(hostId);
-    if (!meter || Date.now() >= meter.reset) return 1;
+    if (!meter || Date.now() >= meter.reset) return 0;
     if (meter.remaining >= GRAPHQL_RESERVE) return Number.POSITIVE_INFINITY;
     if (Date.now() >= quotaWarnedUntil) { quotaWarnedUntil = meter.reset; bb.log.warn(`PR follow-up paused: ${meter.remaining} GitHub GraphQL points left, under the ${GRAPHQL_RESERVE} kept for crews, merges and verdict refreshes; resumes after ${new Date(meter.reset).toISOString()}`); }
     return 0;
   }
+  // With no reading, or past its reset, one metered request (1 point, charged) reads the
+  // quota before any other background request. A failed probe leaves the meter unknown,
+  // which allows nothing.
+  async function ensureGraphqlMeter(hostId: string, signal?: AbortSignal) {
+    const meter = graphqlMeters.get(hostId);
+    if (meter && Date.now() < meter.reset) return;
+    if (backgroundAllowance() <= 0) return;
+    await ghGraphql(hostId, `gh api graphql -f query=${shQuote("{ rateLimit { remaining resetAt } }")}`, 30_000, signal)
+      .catch((error) => { if (signal?.aborted) throw error; });
+  }
+  /** Outside the background loop always true; inside it, a request runs only with allowance and quota left. */
+  function backgroundMayRequest(hostId: string | null) {
+    return !backgroundBudget.getStore() || (backgroundAllowance() > 0 && (hostId === null || graphqlReadsAllowed(hostId) > 0));
+  }
   async function backgroundHost(signal?: AbortSignal): Promise<string | undefined> {
     const first = deliveries.list({ limit: 1 })[0];
-    if (!first) return undefined;
-    try { return await resolveHostForProject(first.projectId, first.owner ?? undefined, signal); } catch (error) { if (signal?.aborted) throw error; return undefined; }
+    const crew = first ? undefined : (await raceAbort(readCrews(), signal, STUCK_HOST_CALL_MS))[0];
+    const project = first?.projectId ?? crew?.projectId;
+    if (!project) return undefined;
+    try {
+      const hostId = await resolveHostForProject(project, first?.owner ?? crew?.parentThreadId ?? undefined, signal);
+      await ensureGraphqlMeter(hostId, signal);
+      return hostId;
+    } catch (error) { if (signal?.aborted) throw error; return undefined; }
   }
   async function deliveryPass(signal?: AbortSignal) {
     return backgroundBudget.run(true, () => backgroundDeliveryPass(signal));
@@ -7598,9 +7618,7 @@ export default async function plugin(bb: BbPluginApi) {
     const allowance=backgroundAllowance();
     const due=allowance <= 0 || (host !== undefined && graphqlReadsAllowed(host) === 0) ? [] : deliveries.list({ due:Date.now(),limit:Math.min(FOLLOW_UP_DUE_LIMIT,allowance) });
     const follow=(record:DeliveryRecord)=>boundedFollowUp(async s=>{await reconcileDelivery(record,s);await notifyDelivery(record,s);},signal).catch(error=>bb.log.warn(`PR follow-up ${record.id}: ${String(error)}`));
-    // With no meter yet, or past its reset, one read probes the quota before the rest.
     let next=0;
-    if (host !== undefined && due.length && (!graphqlMeters.has(host) || Date.now() >= graphqlMeters.get(host)!.reset)) await follow(due[next++]!);
     await Promise.all(Array.from({ length:Math.min(FOLLOW_UP_CONCURRENCY,due.length) },async()=>{
       for (let record=due[next++]; record!==undefined; record=due[next++]) {
         signal?.throwIfAborted();
@@ -7793,8 +7811,10 @@ export default async function plugin(bb: BbPluginApi) {
     signal?:AbortSignal,
   ): Promise<{ url: string; state: string; source: string } | null> {
     let env = prFacts(null);
-    chargeGithub();
-    try { env = prFacts(await raceAbort(bb.sdk.environments.pullRequest({ environmentId: envId,signal }),signal,STUCK_HOST_CALL_MS)); } catch(error) { if (signal?.aborted) throw error; }
+    if (backgroundMayRequest(hostId)) {
+      chargeGithub();
+      try { env = prFacts(await raceAbort(bb.sdk.environments.pullRequest({ environmentId: envId,signal }),signal,STUCK_HOST_CALL_MS)); } catch(error) { if (signal?.aborted) throw error; }
+    }
     if (env.available && env.url !== "") {
       await rememberPrUrl(crew, env.url,signal);
       return { url: env.url, state: env.state, source: "environment" };
@@ -7806,7 +7826,7 @@ export default async function plugin(bb: BbPluginApi) {
       const e = asRecord(await raceAbort(bb.sdk.environments.get({ environmentId: envId,signal }),signal,STUCK_HOST_CALL_MS));
       const branch = typeof e["branchName"] === "string" ? e["branchName"] : "";
       const path = typeof e["path"] === "string" ? e["path"] : "";
-      if (branch !== "" && path !== "") {
+      if (branch !== "" && path !== "" && backgroundMayRequest(hostId)) {
         chargeGithub();
         const res = await runStructuredOnHost(hostId,
           `cd ${shQuote(path)} && gh pr list --head ${shQuote(branch)} --state all --json url --limit 1`, 30_000,signal);
