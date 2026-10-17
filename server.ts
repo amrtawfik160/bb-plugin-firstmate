@@ -99,6 +99,8 @@ import { changeReach, type Reach } from "./owner/reach.ts";
 import { hostCanDrive, PROOF_SURFACES, projectBriefLines, projectForName, projectForRepo, repoOf as prRepoOf, surfaceRefusal, surfaceWords } from "./owner/projects.ts";
 import { createReleaseReadbacks, type ReleaseSource } from "./lib/release-readback.ts";
 import { cardSubject, keyFromEnvFile, ownerRules, ruleAnsweringCard } from "./lib/card-rules.ts";
+import { authFailure, signedIn, signInCommand, WAKE_COMPLETION_RETRY_MS, withoutWakeWarning } from "./lib/action-guards.ts";
+import { createLeases, LEASE_TTL_MS } from "./lib/test-server-lease.ts";
 import { addCorrection, CAPTAIN_FILE, CORRECTION_RULE, correctionBrief, fixCorrection, LEDGER_FILE, readLedger, within } from "./owner/corrections.ts";
 import { renderScorecard, type ScorecardData } from "./owner/scorecard.ts";
 import { createQualityEvents } from "./lib/quality-events.ts";
@@ -1522,6 +1524,7 @@ const CAPTAIN_TOOLS = [
   "firstmate_deliver",
   "firstmate_deliveries",
   "firstmate_merge",
+  "firstmate_lease",
   "firstmate_decide",
   "firstmate_crew",
   "firstmate_crews",
@@ -1697,6 +1700,7 @@ export default async function plugin(bb: BbPluginApi) {
   const ownerAsks = createOwnerAsks(bb.storage.database());
   const programs = createPrograms(bb.storage.database());
   const releaseReadbacks = createReleaseReadbacks(bb.storage.database());
+  const leases = createLeases(bb.storage.database());
   const ownerTasks = createOwnerTasks(bb.storage.database(), (task, to) => {
     const program = programs.holding(task.id);
     if (program === undefined) return to === "live" || to === "done" ? releaseHold(task) : null;
@@ -1946,6 +1950,16 @@ export default async function plugin(bb: BbPluginApi) {
       type: "number",
       label: "Minutes before a reversible owner ask with a recommended option proceeds with it (0 = never). Approvals and irreversible asks never proceed on their own.",
       default: 240,
+    },
+    signInCheck: {
+      type: "boolean",
+      label: "Before a dispatch, read the provider's sign-in on the crew's host (codex login status, claude auth status) and refuse the dispatch when it is signed out.",
+      default: true,
+    },
+    repairThreadId: {
+      type: "string",
+      label: "Thread that gets tooling faults Firstmate finds itself, such as a provider that is not signed in (empty: none).",
+      default: "",
     },
     decisionsKeyFile: {
       type: "string",
@@ -3892,7 +3906,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (res.exitCode !== 0) {
         spawnFailed = true;
         spawnEnded = typeof res.exitCode === "number" && !TRANSIENT_SPAWN_FAILURE.test(res.output);
-        spawnFailure = `fm-spawn exit ${res.exitCode}: ${res.output.slice(-2000)}`;
+        spawnFailure = `fm-spawn exit ${res.exitCode}: ${withoutWakeWarning(res.output).slice(-2000)}`;
         // LOUD (B1): a non-zero fm-spawn exit (e.g. the brief-refusal that made every
         // real spawn fail) must be an error, not a muffled warn.
         bb.log.error(`real transport spawn crew=${crew.id} exit=${res.exitCode} ${res.output.slice(0, 600)}`);
@@ -5370,6 +5384,52 @@ export default async function plugin(bb: BbPluginApi) {
     if (changed) await refreshOwnerBoard();
   }
 
+  // Owner decision Q11: one crew at a time on a shared test server (owner/projects.json sharedServers).
+  async function leaseOperation(action: "acquire" | "release" | "status", server: string, caller: string | undefined, reset?: string): Promise<string> {
+    const crew = caller ? await findCrewByThread(caller) : undefined;
+    const crews = await readCrews();
+    const alive = (id: string) => crews.some((row) => row.id === id);
+    if (action === "status") {
+      const holder = leases.holder(server);
+      const waiting = leases.queue(server);
+      return `${server}: ${holder ? `held by crew ${holder.crewId} since ${utcMinute(holder.acquiredAt)}` : "free"}${waiting.length > 0 ? `; waiting: ${waiting.map((w, i) => `${i + 1}. crew ${w.crewId}`).join(", ")}` : ""}.`;
+    }
+    if (crew === undefined || !crew.parentThreadId) throw new Error("Refusing: only a crew leases a shared test server.");
+    const rule = projectForName(await projectLabel(crew.projectId));
+    const declared = rule?.sharedServers?.find((item) => item.id === server);
+    if (declared === undefined) throw new Error(`Refusing: ${rule?.name ?? "this project"} declares no shared server ${server} in owner/projects.json${rule?.sharedServers?.length ? `; its shared servers: ${rule.sharedServers.map((item) => item.id).join(", ")}` : ""}.`);
+    if (action === "release") {
+      const how = reset?.trim() ?? "";
+      if (how === "") throw new Error(`Release needs reset: how you put ${server} back to main (${declared.reset}). Reset it first, then release with --reset "<what you did>".`);
+      const next = leases.release(server, crew.id);
+      bb.log.info(`lease ${server} released by crew ${crew.id}: ${how}`);
+      if (next !== undefined) await handLease(server, next.crewId, crews, `crew ${crew.id} released it after: ${clip(how, 200)}`);
+      return `Released ${server}${next ? `; crew ${next.crewId} has it now` : ""}.`;
+    }
+    const got = leases.acquire(server, crew.id, crew.parentThreadId, alive, Date.now());
+    if (!got.granted) return `Wait: crew ${got.holder.crewId} holds ${server} (${declared.about}) since ${utcMinute(got.holder.acquiredAt)}. You are number ${got.position} in line. Firstmate tells you when it is yours; do not use ${server} before then.`;
+    if (got.expired) bb.log.warn(`lease ${server}: crew ${got.expired.crewId}'s lease expired; crew ${crew.id} has it`);
+    return `The lease on ${server} (${declared.about}) is yours until you release it. It expires after ${LEASE_TTL_MS / 3_600_000} h without a renewal (acquire again to renew) or when your crew ends. When done: ${declared.reset}, then bb firstmate lease release ${server} --reset "<what you did>".`;
+  }
+
+  async function handLease(server: string, crewId: string, crews: readonly Crew[], why: string): Promise<void> {
+    const next = crews.find((row) => row.id === crewId);
+    if (next === undefined || !next.parentThreadId) return;
+    leases.acquire(server, next.id, next.parentThreadId, (id) => crews.some((row) => row.id === id), Date.now());
+    await tellCrew(next, `The lease on ${server} is yours now (${why}). Use it, reset it to main, then release it: bb firstmate lease release ${server} --reset "<what you did>".`, false, true).catch((error) => bb.log.warn(`lease ${server} hand-over to crew ${next.id}: ${String(error)}`));
+  }
+
+  async function expireLeases(): Promise<void> {
+    const crews = await readCrews();
+    const alive = (id: string) => crews.some((row) => row.id === id);
+    for (const server of leases.servers()) {
+      const gone = leases.expire(server, alive, Date.now());
+      if (gone === null) continue;
+      bb.log.warn(`lease ${server}: crew ${gone.expired.crewId}'s lease expired (crew ended or did not renew)`);
+      if (gone.next !== undefined) await handLease(server, gone.next.crewId, crews, `crew ${gone.expired.crewId}'s lease expired`);
+    }
+  }
+
   // A crew waits on the owner when it asks for a decision, or pauses or blocks naming him.
   function crewWaitsOnOwner(status: { verb: string; note: string }): boolean {
     if (status.verb === "needs-decision") return true;
@@ -5735,6 +5795,8 @@ export default async function plugin(bb: BbPluginApi) {
         providerNote = skip.note;
       }
     }
+    await requireProviderSignedIn(input.providerId, input.projectId, input.parentThreadId);
+    await drainBeforeAction(input.parentThreadId, "dispatch");
     const mates = await readSecondmates();
     const mate = input.mode === "local-only" ? undefined : pickSecondmate(mates, input.projectId, task);
     if (mate !== undefined && mate.threadId !== input.parentThreadId) {
@@ -5946,6 +6008,77 @@ export default async function plugin(bb: BbPluginApi) {
       stdin:JSON.stringify({home,owner:source.parentThreadId??"",taskId:source.id,sourceThreadId:source.threadId,threadId:next.threadId,worktree,project,shape:source.shape,mode:source.posture,generation,check,briefSha,providerId:next.providerId,model:next.model,reasoningLevel:next.reasoningLevel})});
     requireNativeSuccess(result,check?"worker replacement preflight":"worker replacement publication");
     const sha=/^FM_BB_REBIND_SOURCE_SHA=([a-f0-9]{64})$/m.exec(result.output)?.[1];if (!sha) throw new Error("Replacement native source evidence missing.");return sha;
+  }
+
+  // Owner decision Q10 (17 Oct): Codex crew thr_uhwgmvpsds got 401 Unauthorized 12 times. A dispatch
+  // reads the provider's sign-in on the crew's host first; a good read holds for 10 minutes.
+  const signInSeen = new Map<string, number>();
+  const SIGN_IN_FRESH_MS = 10 * 60_000;
+  async function requireProviderSignedIn(providerId: string | undefined, projectId: string, captain: string | undefined): Promise<void> {
+    let provider = providerId;
+    if (provider === undefined) {
+      try { const project = asRecord(await bb.sdk.projects.defaultExecutionOptions({ projectId })); provider = typeof project["providerId"] === "string" ? project["providerId"] : undefined; } catch { /* no default to check */ }
+    }
+    const probe = signInCommand(provider);
+    if (provider === undefined || probe === null || (await settings.get()).signInCheck === false) return;
+    let hostId = "";
+    try { hostId = await resolveHostForProject(projectId, captain); } catch (error) { bb.log.warn(`sign-in check skipped for ${provider}: no host (${String(error)})`); return; }
+    const key = `${hostId}:${provider}`;
+    if (Date.now() - (signInSeen.get(key) ?? 0) < SIGN_IN_FRESH_MS) return;
+    let read: { exitCode: number | null; output: string };
+    try { read = await runStructuredOnHost(hostId, `${probe.command} 2>&1`, 20_000); } catch (error) { bb.log.warn(`sign-in check for ${provider} on ${hostId} could not run; dispatch goes ahead: ${String(error)}`); return; }
+    if (signedIn(provider, read.exitCode, read.output)) { signInSeen.set(key, Date.now()); return; }
+    const said = clip(redactSecrets(read.output), 200) || `exit ${read.exitCode}`;
+    const refusal = `Refusing: ${probe.label} is not signed in on host ${hostId} (\`${probe.command}\`: ${said}), so a crew on it would fail at once. Nothing was dispatched. Fix: ${probe.fix}, or dispatch on another provider with providerId.`;
+    bb.log.error(`dispatch refused: ${provider} sign-in failed on ${hostId}: ${said}`);
+    await repairNotice(`sign-in:${key}`, `Firstmate: ${probe.label} is not signed in on host ${hostId} (\`${probe.command}\`: ${said}). Dispatches on it are refused until ${probe.fix}.`);
+    throw new Error(refusal);
+  }
+
+  // Once an hour per problem: a tooling fault goes to the repair thread (setting repairThreadId).
+  async function repairNotice(topic: string, text: string): Promise<void> {
+    const repair = String((await settings.get()).repairThreadId ?? "").trim();
+    if (repair === "") return;
+    const key = `repair-notice:${topic}`;
+    const last = await bb.storage.kv.get<number>(key);
+    if (typeof last === "number" && Date.now() - last < 60 * 60_000) return;
+    await bb.storage.kv.set(key, Date.now());
+    try { await bb.sdk.threads.send({ threadId: repair, mode: "auto", input: [{ type: "text", text, mentions: [] }] }); }
+    catch (error) { bb.log.warn(`repair notice to ${repair} failed: ${String(error)}`); }
+  }
+
+  // Owner decision Q10: a crew whose provider ends without a final report (an exit, a crash, a
+  // compaction exit) is relaunched once with its brief and a note; a second end goes to the captain.
+  // Capacity and plan limits move to another provider instead (turn.failed); a sign-in failure is reported, not retried.
+  async function restartUnexpectedExit(crew: Crew, error: string | null): Promise<boolean> {
+    if (isSecondmateRoute(crew) || (await settings.get()).supervisionEnabled !== true) return false;
+    const detail = [error ?? "", await threadFailureDetail(crew.threadId)].filter((part) => part.trim() !== "").join(": ");
+    if (providerExhausted(null, detail) || planLimitError(detail)) return false;
+    if (authFailure(detail)) {
+      for (const key of signInSeen.keys()) if (key.endsWith(`:${crew.providerId ?? ""}`)) signInSeen.delete(key);
+      const probe = signInCommand(crew.providerId);
+      await notifyCaptain(crew, "error", `crew ${crew.id}: its provider ${crew.providerId ?? ""} refused the sign-in (${clip(detail, 200)}). It was not restarted: a restart fails the same way. Fix: ${probe?.fix ?? "sign the provider in on the host"}, then bb firstmate retry ${crew.id}.`);
+      await repairNotice(`crew-auth:${crew.providerId ?? ""}`, `Firstmate: crew ${crew.id} failed on ${crew.providerId ?? "its provider"} sign-in (${clip(detail, 200)}). ${probe?.fix ?? "Sign the provider in on the host"}.`);
+      return true;
+    }
+    const verdict = verdictOf(parseOutcome(await crewOutput(crew).catch(() => null)));
+    if (verdict === "DONE" || verdict === "FAILED" || verdict === "BLOCKED") return false;
+    const key = `crew-restart:${crew.projectId}:${crew.parentThreadId ?? ""}:${crew.id}`;
+    if (await bb.storage.kv.get(key) !== undefined) {
+      await notifyCaptain(crew, "error", `crew ${crew.id} ended without a final report a second time (${clip(detail, 200) || "no error text"}), after one automatic restart. It is not restarted again: retry it, tell it, or forget it.`);
+      return true;
+    }
+    await bb.storage.kv.set(key, Date.now());
+    let next: Crew;
+    try {
+      next = await relaunchCrew(crew, { note: `Restart after an unexpected exit: the prior thread ended without a final report (${clip(detail, 200) || "no error text"}). Re-read your brief, todo.md and progress in your data folder, re-verify what the prior thread did (the diff, the tests, any push or PR), then continue the task.`, intent: "failure-recovery" });
+    } catch (relaunch) {
+      await notifyCaptain(crew, "error", `crew ${crew.id} ended without a final report (${clip(detail, 200)}) and its one automatic restart was refused: ${relaunch instanceof Error ? relaunch.message : String(relaunch)}`);
+      return true;
+    }
+    bb.log.warn(`crew ${crew.id} ended without a final report (${clip(detail, 200)}); restarted once as ${next.threadId}`);
+    await notifyCaptain(next, "restarted", `crew ${crew.id} ended without a final report (${clip(detail, 200) || "no error text"}); relaunched once in the same worktree with its brief. A second end goes to you.`);
+    return true;
   }
 
   async function relaunchCrew(
@@ -8271,6 +8404,7 @@ export default async function plugin(bb: BbPluginApi) {
       return lines.join("\n");
     };
     const override = opts.overrideOwner === true;
+    if (yes) await drainBeforeAction(crew.parentThreadId, "merge");
     const notMine = override ? null : await ownerRefusal(crew, opts.caller, "merge");
     ownership = notMine !== null;
     refuse(notMine);
@@ -8433,6 +8567,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   // Returns a note for the caller's result; "" when native teardown did the work.
   async function retireLanded(crew: Crew, outcome: string, pr: string, landed = true): Promise<string> {
+    await drainBeforeAction(crew.parentThreadId, "retire");
     if (pr) await registerCrewPr(crew,pr);
     const nativeHome = await crewNativeHome(crew);
     const notes: string[] = [];
@@ -8775,6 +8910,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (crew === undefined) throw new Error(`No crew ${id}. Run "bb firstmate crews".`);
     const notMine = opts.overrideOwner === true ? null : await ownerRefusal(crew, opts.caller, "forget");
     if (notMine !== null) throw new Error(notMine);
+    await drainBeforeAction(crew.parentThreadId, "retire");
     if (stop && isSecondmateRoute(crew) && !force) {
       throw new Error(`Refusing: ${id} is a secondmate route. Drop with forget (no --stop), or --force to also stop that thread.`);
     }
@@ -9947,6 +10083,28 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  // Owner decision Q9 (17 Oct): before a merge, dispatch or retire, Firstmate reads the captain's
+  // waiting wakes itself and hands them over, so the action goes ahead. A drain that fails or is
+  // slow never stops the action.
+  async function drainBeforeAction(captain: string | null | undefined, action: string): Promise<void> {
+    if (!captain) return;
+    const current = await settings.get();
+    const fmHome = (captainHomes.get(captain) ?? current.fmHome).trim();
+    if (fmHome === "") return;
+    try {
+      const hostId = current.fmHostId.trim() || await fleetHost() || "";
+      if (hostId === "") return;
+      const pending = await countUndrainedWakes(hostId, fmHome, captain);
+      if (pending <= 0) return;
+      const out = await serializeLedger(`receipt:${captain}`, () => drainWakes(captain, undefined, undefined, hostId, AbortSignal.any([launchAbort.signal, AbortSignal.timeout(45_000)])));
+      if (out === "Wake queue empty." || wakeBatchIsEmpty(out)) return;
+      bb.log.info(`wake drain before ${action} captain=${captain}: ${pending} wake(s) handed to the captain`);
+      await deliverToCaptain(captain, `WAKES READ BEFORE ${action.toUpperCase()}: ${pending} wake(s) were waiting. Firstmate read them so the ${action} goes ahead; handle them next.\n${wakeOutputForCaptainTool(out)}`, "", undefined, true);
+    } catch (error) {
+      bb.log.warn(`wake drain before ${action} captain=${captain} failed; the ${action} goes ahead: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   // F2: surface durable wakes that arrived while quiet/afk was on. notifyOwner=real
   // deliberately does not add to the KV `held` list (the report lives in the wake
   // queue), so quiet-off / afk-off — which only print the KV held list — would never
@@ -10683,7 +10841,8 @@ export default async function plugin(bb: BbPluginApi) {
   // unreachable, or tasks-axi is missing/failed. Only issues a command when real.
   function requireNativeSuccess(result: { exitCode: number | null; output: string } | null, operation: string): void {
     if (result !== null && result.exitCode === 0) return;
-    const reason = result === null ? "host unavailable" : `exit ${result.exitCode}: ${truncate(result.output, 1600)}`;
+    // Owner decision Q9: the queued-wakes warning never stands in front of the reason that refused.
+    const reason = result === null ? "host unavailable" : `exit ${result.exitCode}: ${truncate(withoutWakeWarning(result.output), 1600)}`;
     bb.log.error(`Native ${operation} failed: ${reason}`);
     throw new Error(`Native ${operation} failed: ${reason}. BB state was not advanced; reconcile native state before retrying.`);
   }
@@ -11785,6 +11944,19 @@ export default async function plugin(bb: BbPluginApi) {
   // BB's public suppress flag only folds low-value rows. The app content script
   // removes Firstmate's pending/success rows entirely; invisible result markers
   // let it restore failures while keeping the tool output available to the model.
+  // A handled wake whose acknowledgement failed is acknowledged again later; an absent receipt counts as done.
+  function finishWakeLater(captain: string, id: string, attempt = 0): void {
+    const delay = WAKE_COMPLETION_RETRY_MS[attempt];
+    if (delay === undefined || captain === "") { bb.log.error(`wake ${id} captain=${captain}: acknowledgement still failing after ${attempt} retries; the action stays done`); return; }
+    const timer = setTimeout(() => {
+      if (launchAbort.signal.aborted) return;
+      void serializeLedger(`receipt:${captain}`, () => inCaptainHome(captain, () => drainWakes(captain, undefined, undefined, undefined, launchAbort.signal, { action: "complete", id })))
+        .then(async () => { bb.log.info(`wake ${id} captain=${captain}: acknowledged on retry ${attempt + 1}`); await bb.storage.kv.delete(`wake-handled:${captain}:${id}`); })
+        .catch((error) => { bb.log.warn(`wake ${id} captain=${captain}: retry ${attempt + 1} failed: ${String(error)}`); finishWakeLater(captain, id, attempt + 1); });
+    }, delay);
+    timer.unref?.();
+  }
+
   const registerCaptainTool = ((tool: Parameters<BbPluginApi["agents"]["registerTool"]>[0]) => {
     const execute = tool.execute as (
       params: unknown,
@@ -11806,7 +11978,13 @@ export default async function plugin(bb: BbPluginApi) {
             if (id && tool.name === "firstmate_fm") return markCaptainToolResult(toolError("Complete handledWake on a direct Firstmate action or firstmate_wake; generic scripts may call back into the wake API."));
             const signal = asRecord(ctx)["signal"] as AbortSignal | undefined;
             const journal = (action: "inspect" | "begin-action" | "mark-success" | "complete") => drainWakes(captain, undefined, undefined, undefined, signal, { action, id });
-            if (id && tool.name === "firstmate_wake") return markCaptainToolResult(await journal("complete"));
+            if (id && tool.name === "firstmate_wake") {
+              try { return markCaptainToolResult(await journal("complete")); }
+              catch (error) {
+                if (await bb.storage.kv.get(`wake-handled:${captain}:${id}`) === undefined) throw error;
+                return markCaptainToolResult(`Wake ${id} was already handled and counts as delivered; Firstmate finishes its acknowledgement in the background.`);
+              }
+            }
             // A crew id that does not exist is refused before the action begins, so the wake stays ready
             // instead of "uncertain". Crews retire when their PR merges, so a follow-up often names one.
             if (id && CREW_ID_TOOLS.has(tool.name) && typeof operation["crewId"] === "string" && await findCrew(operation["crewId"], captain) === undefined) {
@@ -11826,8 +12004,11 @@ export default async function plugin(bb: BbPluginApi) {
               await journal("mark-success");
               suffix = await journal("complete");
             } catch (error) {
-              bb.log.error(`Action ${tool.name} succeeded but wake completion failed captain=${captain}: ${String(error)}`);
-              suffix = `ACTION SUCCEEDED; wake completion is unconfirmed. Do not repeat ${tool.name}. Retry firstmate_wake with handledWake=${id} only. ${String(error)}`;
+              // Owner decision Q9: the action is done, so the wake counts as delivered; Firstmate finishes its acknowledgement.
+              bb.log.warn(`Action ${tool.name} succeeded but wake completion failed captain=${captain}: ${String(error)}; retrying in the background`);
+              await bb.storage.kv.set(`wake-handled:${captain}:${id}`, Date.now());
+              finishWakeLater(captain ?? "", id);
+              suffix = `ACTION SUCCEEDED; wake ${id} counts as delivered. Firstmate finishes its acknowledgement in the background. Do not repeat ${tool.name} or complete the wake again.`;
             }
             return markCaptainToolResult(typeof result === "string" ? `${result}\n\n${suffix}` : {
               ...result, content: [...result.content, { type: "text", text: suffix }],
@@ -12767,6 +12948,16 @@ export default async function plugin(bb: BbPluginApi) {
       } catch (error) {
         return toolError(error instanceof Error ? error.message : "Retry failed.");
       }
+    },
+  });
+
+  registerCaptainTool({
+    name: "firstmate_lease",
+    description: "A shared test server (owner/projects.json sharedServers, such as cyndra-dev) serves one crew at a time. A crew acquires it before use and waits its turn when another crew holds it; after use it resets the server to main and releases it with reset (what it did). status shows the holder and the line.",
+    parameters: z.object({ action: z.enum(["acquire", "release", "status"]), server: z.string().min(1).max(80), reset: z.string().max(500).optional().describe("release: how you reset the server to main") }),
+    async execute({ action, server, reset }, ctx) {
+      try { return await leaseOperation(action, server, ctxString(ctx, "threadId"), reset); }
+      catch (error) { return toolError(error instanceof Error ? error.message : String(error)); }
     },
   });
 
@@ -14217,6 +14408,7 @@ export default async function plugin(bb: BbPluginApi) {
     const crew = await findCrewByThread(thread.id);
     if (crew === undefined || isSecondmateRoute(crew)) return;
     liveTerminalHandled.add(thread.id);
+    if (await restartUnexpectedExit(crew, error).catch((failure) => { bb.log.warn(`crew ${crew.id} restart: ${String(failure)}`); return false; })) { inboundLedger.crewEnded(crew.id, Date.now()); return; }
     await handleCrewFailed(crew, error);
   });
   bb.events.on("interaction.pending", async ({ thread, interaction }) => {
@@ -14871,6 +15063,13 @@ export default async function plugin(bb: BbPluginApi) {
               `Relaunched crew ${id} as thread ${next.threadId} (${next.providerId ?? "default provider"}/${next.model ?? "default model"}/${next.reasoningLevel ?? "default reasoning"}), same worktree.`,
             );
           }
+          case "lease": {
+            const action = rest[0];
+            const server = rest[1];
+            if ((action !== "acquire" && action !== "release" && action !== "status") || !server) return fail("Usage: bb firstmate lease acquire|release|status <server> [--reset \"<how you reset it to main>\"]");
+            const text = await leaseOperation(action, server, ctxThread, flagStr(flags, "reset"));
+            return reply({ action, server, text }, text);
+          }
           case "deliveries": {
             const input=deliveryParams.parse({ action:rest[0] ?? "list",id:rest[1],crewId:flagStr(flags,"crew"),url:flagStr(flags,"url"),from:flagStr(flags,"from") === "none" ? null : flagStr(flags,"from"),
               failureId:flagStr(flags,"failure"),scope:flagStr(flags,"scope"),followUpTask:flagStr(flags,"follow-up-task"),requirement:flagStr(flags,"requirement"),reason:flagStr(flags,"reason"),commitSha:flagStr(flags,"commit"),driven:flagStr(flags,"driven"),seen:flagStr(flags,"seen"),verdict:flagStr(flags,"verdict"),notes:flagStr(flags,"notes"),findings:flagStr(flags,"findings") === undefined ? undefined : Number(flagStr(flags,"findings")),authorized:flags.has("authorized"),all:flags.has("all"),
@@ -15504,6 +15703,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (taskSweepWork || launchAbort.signal.aborted) return;
     taskSweepWork = (async () => {
       for (const captain of knownCaptains) await sweepTasks(captain).catch((error) => bb.log.warn(`task sweep captain=${captain}: ${String(error)}`));
+      await expireLeases().catch((error) => bb.log.warn(`lease expiry: ${String(error)}`));
     })();
     try { await taskSweepWork; } finally { taskSweepWork = undefined; }
   });

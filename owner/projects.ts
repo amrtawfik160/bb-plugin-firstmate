@@ -73,5 +73,8 @@ export function projectBriefLines(project: ProjectRule | undefined, table: Proje
   if (project.release !== undefined) {
     lines.push(`Releases: every ${project.name} build goes to the "${project.release.group}" TestFlight public-link group. Read the build's groups back from App Store Connect or EAS and record what you read: \`bb firstmate deliveries release --task T<n> --build <id> --group "${project.release.group}" --source app-store-connect|eas --seen "<what it showed>"\`. A release is done only with that read-back.`);
   }
+  for (const server of project.sharedServers ?? []) {
+    lines.push(`Shared test server ${server.id} (${server.about}) serves one crew at a time. Before you use it: \`bb firstmate lease acquire ${server.id}\`, and wait until it is yours. After: ${server.reset}, then \`bb firstmate lease release ${server.id} --reset "<what you did>"\`.`);
+  }
   return lines;
 }
