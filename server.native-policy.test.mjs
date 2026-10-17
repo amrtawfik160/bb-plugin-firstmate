@@ -11,7 +11,9 @@ import {createDeliveries,parseForge,deliveryLine} from './lib/pr-delivery.ts';
 import {createLaunches} from './lib/launch.ts';
 import {FIRSTMATE_ROUTINE_MARKER} from './lib/timeline-noise.ts';
 import {runtimeFixture} from './scripts/native-runtime-fixture.mjs';
-import {fixture,pins,scaffold,render,run,ok} from './scripts/prompt-fixture.mjs';
+import {fixture,pins,scaffold,render,run,ok,repository} from './scripts/prompt-fixture.mjs';
+import {mkdtempSync} from 'node:fs';
+import {tmpdir} from 'node:os';
 const ctx={threadId:'thr_cap',projectId:'proj_1'};
 const manifest=JSON.parse(readFileSync('package.json','utf8'));
 const ids=manifestSkillIds(process.cwd());
@@ -241,6 +243,21 @@ for(const pin of pins)test(`native posture ${pin.slice(0,8)} remains intake cont
  }finally{await f.host.harness.lifecycle.dispose();rmSync(home,{recursive:true,force:true});}
 });
 
+
+test('a captain still on the previous audited bundle keeps native policy reads after the plugin ships a newer bundle',async()=>{
+ const directory=mkdtempSync(join(tmpdir(),'fm-previous-bundle-')),home=join(directory,'home'),root=join(directory,'runtime');mkdirSync(home);
+ ok(run('python3',['-c','import importlib.util,sys,pathlib;s=importlib.util.spec_from_file_location("g",sys.argv[1]);g=importlib.util.module_from_spec(s);s.loader.exec_module(g);g.generate(pathlib.Path(sys.argv[2]),pathlib.Path(sys.argv[3]),pin=sys.argv[4],register=False)','scripts/generate-native-runtime.py',repository,join(directory,'assets'),'1f3e769616fdf9f31f85f4c3e6a9f71606634238']));
+ ok(run('git',['clone','--quiet','--branch','main',join(directory,'assets/native.bundle'),root]));
+ assert.equal(ok(run('git',['-C',root,'rev-parse','HEAD'])).trim(),'4cdbef4dbf44a721e55cf0ad01524ee27b377e05','the bundle every live captain home ran before this pin');
+ const f=await hostFor(home);try {
+  await f.host.bb.storage.kv.set('native-runtime:thr_cap',{root});
+  const skill=await f.host.harness.behavior.runCli(['skill','ask-user-authority'],ctx);assert.equal(skill.exitCode,0,skill.stderr);
+  assert.ok(skill.stdout.includes(readFileSync(join(root,'.agents/skills/ask-user-authority/SKILL.md'),'utf8')));
+  const contract=await f.host.harness.behavior.runCli(['contract'],ctx);assert.equal(contract.exitCode,0,contract.stderr);assert.ok(contract.stdout.includes(readFileSync(join(root,'AGENTS.md'),'utf8')));
+  ok(run('git',['-C',root,'-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','--quiet','--allow-empty','-m','unaudited snapshot']));
+  const refused=await f.host.harness.behavior.runCli(['skill','ask-user-authority'],ctx);assert.notEqual(refused.exitCode,0);assert.match(refused.stderr+refused.stdout,/Unrecognized bundled policy snapshot/);
+ }finally{await f.host.harness.lifecycle.dispose();rmSync(directory,{recursive:true,force:true});}
+});
 
 test('bundled policy skill and references use the selected immutable runtime, not an external repository',async()=>{
  const fixture=runtimeFixture(),root=fixture.ready();const f=await hostFor(fixture.home);try {
