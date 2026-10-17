@@ -227,16 +227,25 @@ logs, and the crew and captain event logs.
    02:06:54.
 2. A `working:` line written 5 s after the first switch was recorded as seen
    by the old watcher. Native absorbs working lines without a wake.
-3. The crew's `done` line was written at 02:07:07, inside the watcher handoff
-   (02:07:04 to 02:07:07). The new watcher queued it at 02:07:38. The plugin
-   delivered it, and the captain reported PR #4.
+3. The crew's `done` line is stamped 02:07:06 and was first seen by the
+   recorder at 02:07:07. That is inside the sampled handoff interval: the old
+   watcher was alive at 02:07:04 and the new one at 02:07:07 with heartbeat
+   age 0. The 3-second samples cannot show whether the line was written while
+   no watcher existed. The new watcher queued it at 02:07:38, the queue was
+   empty at 02:07:53, the plugin enqueued the status wake at 02:08:04, and the
+   captain reported PR #4.
 4. After a forward switch, `firstmate_merge` merged PR #4 (`7dbd9dd`). The
    keeper log shows no shell error in this run.
 
-What this proves: in this run, one waking status line written inside a
-watcher handoff was queued by the new watcher and delivered to the captain.
-It is one timing sample, not proof for every timing. The first handoff had
-one 3-second sample with no live watcher (02:05:01); the second had none.
+What this proves: in this run, one waking status line written during a
+sampled watcher handoff was queued by the new watcher and delivered to the
+captain. It is one timing sample, not proof for every timing.
+
+Selection is not the handoff. After the forward selection at 02:04:18 the old
+watcher kept supervising until 02:04:58; the new watcher was first seen at
+02:05:04, with one 3-second sample (02:05:01) showing no live watcher. After
+the rollback at 02:06:54 the old watcher was alive at 02:07:04 and the new one
+at 02:07:07; no sample showed no live watcher.
 
 What the canaries show about the watcher, and what they do not:
 - Run 2: the old watcher stopped at 01:44:28 (`watcher: stopped
@@ -244,8 +253,8 @@ What the canaries show about the watcher, and what they do not:
   its process start time. The crew wrote nothing in that gap, so run 2 does
   not test a wake written during it. Its later completion was delivered.
 - Run 3: the first handoff showed one 3-second sample without a live
-  watcher; the second showed none. One waking line written inside the second
-  handoff was queued and delivered. That is one timing sample.
+  watcher; the second showed none. One waking line written during the second
+  sampled handoff was queued and delivered. That is one timing sample.
 - Not tested: a longer gap, or several events inside a gap. Native watchers
   are one-shot processes with durable wake state and a separate re-arm owner,
   so a short, visible, automatically recovered gap is the expected shape, not
