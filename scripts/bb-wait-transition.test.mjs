@@ -117,3 +117,12 @@ test('60 threads with turns in flight still end the wait inside its budget, and 
   assert.ok(blocked.seconds<3+2,`blocked edge took ${blocked.seconds}s`);
  }finally{rmSync(l.home,{recursive:true,force:true});}
 });
+
+test('with a slow BB CLI (1.5 s a call) the status read, interaction reads and scan all stop at one deadline',()=>{
+ const l=lab(60,{delay:'1.5'});try {
+  for(const t of l.threads){t.status='active';t.runtime.displayStatus='active';}l.save();
+  const r=l.wait(3);
+  assert.equal(r.rc,1,r.err);
+  assert.ok(r.seconds<3+1.5,`wait took ${r.seconds}s for a 3s budget at 1.5s per bb call (calls: ${r.calls.length})`);
+ }finally{rmSync(l.home,{recursive:true,force:true});}
+});
