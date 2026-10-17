@@ -151,6 +151,26 @@ def blockers(home):
         if list(state.glob(pattern)): reasons.append(f'native/BB runtime consumer present: {pattern}')
     return reasons
 
+def lock_in_flight(lock):
+    # Native mkdir locks record their holder in pid; a dead holder is reclaimed by
+    # native's next acquire. A pid not yet written counts only while the lock is new.
+    try: pid=int((lock/'pid').read_text().strip())
+    except (OSError,ValueError):
+        try: return time.time()-lock.lstat().st_mtime<60
+        except OSError: return False
+    try: os.kill(pid,0)
+    except ProcessLookupError: return False
+    except PermissionError: return True
+    return True
+
+def in_flight(home):
+    # A native code switch, like native's own update, leaves task records, the
+    # captain's primary lock and the watcher in place: records keep naming their
+    # immutable release, and supervision re-arms a watcher from another root.
+    # Only a spawn or control step running old code at this moment must finish.
+    state=home/'state'
+    return [f'native operation in flight: {lock.name}' for pattern in ['.spawn-*.lock','.control-*.lock'] for lock in sorted(state.glob(pattern)) if lock_in_flight(lock)]
+
 NATIVE_IDENTITY=('upstreamCommit','snapshotCommit','stateContract')
 ADAPTER_PAYLOADS=('overlay/','runtime-host.py')
 def native_difference(current,target):
@@ -297,7 +317,7 @@ def select(args):
             current.select_patch_set(args.home,root/'overlay')
             errors=current.verify_mirror(args.home,root/'overlay')
             if errors: raise ValueError('external migration requires a verified matching adapter: '+'; '.join(errors))
-        consumers=blockers(args.home)+(['BB launches are running/reserved/uncertain'] if args.consumers else [])
+        consumers=(in_flight(args.home) if previous else blockers(args.home))+(['BB launches are running/reserved/uncertain'] if args.consumers else [])
         current=verify_version(args.store,previous['release'])[1] if consumers and previous and not external else None
         refusal=selection_refusal(current,manifest,consumers)
         if refusal: raise ValueError(refusal)
