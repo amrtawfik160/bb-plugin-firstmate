@@ -41,7 +41,7 @@
       "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner."
     },
     "entry-skills/captain/references/bb.md": {
-      "sha256": "12575d13845d7d1d7ffad4510796aedee0759312bd738742f28337f02a2640c8",
+      "sha256": "7574b968fe7952865db08353b2f5e6d3df02d8e64ca035787c358f26ec52de72",
       "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner. Runtime select allows an adapter-only release switch while crews run; running crews keep their recorded release. Crews retire through firstmate_forget stop=true, not raw fm teardown."
     },
     "entry-skills/captain/references/intake-briefs.md": {

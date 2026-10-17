@@ -12868,7 +12868,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     return {host,...result,pendingSelection:await bb.storage.kv.get(pendingKey)??null};
   }
-  registerCaptainTool({name:"firstmate_runtime",description:"Inspect installed versus selected native runtime. Install a pinned release or explicitly check/select/migrate/rollback this owning captain's quiescent home; no worker turns or task-state changes.",
+  registerCaptainTool({name:"firstmate_runtime",description:"Inspect installed versus selected native runtime. Install a pinned release or explicitly check/select/migrate/rollback this owning captain's home; refused while a native spawn or control step or a BB launch is in flight; no worker turns or task-state changes.",
     parameters:z.object({action:z.enum(["status","install","select","migrate","rollback"]).default("status"),release:z.string().regex(/^(?:[0-9a-f]{64}|external)$/).optional(),check:z.boolean().optional()}),
     async execute({action,release,check},ctx){try{return JSON.stringify(await runtimeForContext(ctx,action,release,check));}catch(error){return toolError(error instanceof Error?error.message:String(error));}}
   });

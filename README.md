@@ -80,7 +80,7 @@ Bare `deck` defers fleet inventory to native startup. Request `deck --digest`, `
 | --- | --- |
 | `deck` / `session` | Bind the exact home and return pending startup / print the fleet digest |
 | `contract` / `skill` | Read the complete supervisor contract / policy skill from the selected native runtime |
-| `runtime` | Inspect installed/selected code; explicitly install, check, select, migrate or roll back a quiescent home |
+| `runtime` | Inspect installed/selected code; explicitly install, check, select, migrate or roll back a home's runtime |
 | `dispatch` | Spawn a ship (isolated worktree) or scout (read-only) crew |
 | `tell` / `interrupt` / `stop` / `retry` | Live steer, hard stop, or re-run a crew |
 | `watch` / `bearings` | Wait on crews, or print the 5-section fleet digest |
