@@ -249,25 +249,31 @@ Observations, not changed here:
 
 Run these as the live captain, in its own thread:
 
-1. `firstmate_runtime action=install`.
-2. `firstmate_runtime action=status`. Note the installed release whose
-   upstream commit is `15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4`.
-3. `firstmate_runtime action=select release=<that release> check=true`.
+1. `firstmate_runtime action=install`. Record the full 64-character
+   `release` it returns. That exact ID is `<release>` below. For head
+   `91b3526` and later docs-only heads it is
+   `e99f6c5ea536272030289bf8cd1896fbacc1e94d72c0a7baa66f06d02e8acc00`; if
+   install returns another ID, use the returned one.
+2. `firstmate_runtime action=status`. Confirm `<release>` is listed with
+   upstream `15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4`. Do not pick a release
+   by its upstream commit: several releases can share one.
+3. `firstmate_runtime action=select release=<release> check=true`.
 4. If it refuses with "native operation in flight" or "BB launches are
    running/reserved/uncertain": wait for that spawn or launch to finish, then
    repeat step 3. If the named lock stays and its process is not a spawn or
    control step (a reused process ID), inspect the lock and the process
    before any reconciliation. Do not delete a lock because it is old.
-5. `firstmate_runtime action=select release=<that release>`. It checks
+5. `firstmate_runtime action=select release=<release>`. It checks
    again; if it refuses, go back to step 4.
 6. `firstmate_contract`, read again in full. It must name 15ad1bd6.
-7. Check `firstmate_runtime action=status`: selected release has upstream
-   15ad1bd6; old crews appear under `referencedReleases`.
+7. Check `firstmate_runtime action=status`: the selected release is exactly
+   `<release>` (all 64 characters), and old crews appear under
+   `referencedReleases`.
    The watcher is replaced within seconds: the canaries measured about 2 s
    (run 2) and at most one 3-second sample without a live watcher (run 3).
    One "watcher down" notice may appear (seen in run 2, not in run 3).
 8. Check that `state/.watch.lock/watcher-path` and
-   `state/.bb-watch-keeper.bindir` in the home name the new release folder.
+   `state/.bb-watch-keeper.bindir` in the home name `versions/<release>/`.
    The plugin log shows "replacing the keeper" when it moved them.
 
 To undo: `firstmate_runtime action=rollback release=<the recorded previous
