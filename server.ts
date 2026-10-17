@@ -88,7 +88,7 @@ import { connectorReplied, correlationOf, isTelegramRpcMissing, oldestUnanswered
 import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRecord } from "./lib/launch.ts";
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
 import { optionHelp } from "./lib/cli-help.ts";
-import { AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython } from "./lib/native-policy.ts";
+import { AUDITED_BUNDLED_SNAPSHOTS, AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython } from "./lib/native-policy.ts";
 import { createDeliveries, LOST_OWNER_RECHECK_MS, canonicalPr, decisionLine, deliveryLine, parseForge, PR_VIEW_FIELDS, PR_VIEW_JQ, prBranchOwner, type DeliveryRecord, type PrBranchCandidate } from "./lib/pr-delivery.ts";
 import { captureHostCommand, decodeHostCapture } from "./lib/host-capture.ts";
 import { selectExecution, validateLaunchCapabilities } from "./lib/execution-selection.ts";
@@ -1259,6 +1259,10 @@ export const OVERLAY_INSTALL_INPUTS = [
   "compat/2d833ff147cd26a5c461e914e06854e0eb2707ce/firstmate-bb-teardown.patch",
   "compat/2d833ff147cd26a5c461e914e06854e0eb2707ce/firstmate-bb-local-merge.patch",
   "compat/2d833ff147cd26a5c461e914e06854e0eb2707ce/firstmate-bb-browser.patch",
+  "compat/1f3e769616fdf9f31f85f4c3e6a9f71606634238/firstmate-bb-backend.patch",
+  "compat/1f3e769616fdf9f31f85f4c3e6a9f71606634238/firstmate-bb-teardown.patch",
+  "compat/1f3e769616fdf9f31f85f4c3e6a9f71606634238/firstmate-bb-local-merge.patch",
+  "compat/1f3e769616fdf9f31f85f4c3e6a9f71606634238/firstmate-bb-browser.patch",
   "install-bb-backend.py",
 ] as const;
 
@@ -11485,10 +11489,9 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function nativePolicyLookup(host:string,root:string,request:Record<string,unknown>,signal:AbortSignal) {
     const helper=`/tmp/.fm-policy-${randomUUID()}.py`;
-    const distribution=JSON.parse(readFileSync(join(PLUGIN_ROOT,"runtime-assets/distribution.json"),"utf8"));
     try {
       if (!await writeHostBytes(host,helper,nativePolicyReadPython,STUCK_HOST_CALL_MS,signal,true)) throw new Error('Failed to stage selected native policy reader; no policy read executed.');
-      const result=await runStructuredOnHost(host,`python3 ${shQuote(helper)} ${shQuote(root)} ${shQuote(JSON.stringify(request))} ${shQuote(JSON.stringify(AUDITED_POLICY_COMMITS))} ${shQuote(distribution.snapshotCommit)}`,30_000,signal);
+      const result=await runStructuredOnHost(host,`python3 ${shQuote(helper)} ${shQuote(root)} ${shQuote(JSON.stringify(request))} ${shQuote(JSON.stringify(AUDITED_POLICY_COMMITS))} ${shQuote(JSON.stringify(AUDITED_BUNDLED_SNAPSHOTS))}`,30_000,signal);
       if (result.exitCode!==0) throw new Error(`Selected native policy read refused: ${result.stderr || result.output || `exit ${result.exitCode}`}`);
       return JSON.parse(result.output) as {commit:string;root:string;path?:string;fragment?:string;sha256?:string;sizeBytes?:number;contractSha256?:string;entries?:Array<{path:string;sha256:string;frontmatter:string}>};
     } finally {await runHostCommand(host,`rm -f ${shQuote(helper)}`,1000).catch(()=>{});}
@@ -12865,7 +12868,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     return {host,...result,pendingSelection:await bb.storage.kv.get(pendingKey)??null};
   }
-  registerCaptainTool({name:"firstmate_runtime",description:"Inspect installed versus selected native runtime. Install a pinned release or explicitly check/select/migrate/rollback this owning captain's quiescent home; no worker turns or task-state changes.",
+  registerCaptainTool({name:"firstmate_runtime",description:"Inspect installed versus selected native runtime. Install a pinned release or explicitly check/select/migrate/rollback this owning captain's home; refused while a native spawn or control step or a BB launch is in flight; no worker turns or task-state changes.",
     parameters:z.object({action:z.enum(["status","install","select","migrate","rollback"]).default("status"),release:z.string().regex(/^(?:[0-9a-f]{64}|external)$/).optional(),check:z.boolean().optional()}),
     async execute({action,release,check},ctx){try{return JSON.stringify(await runtimeForContext(ctx,action,release,check));}catch(error){return toolError(error instanceof Error?error.message:String(error));}}
   });

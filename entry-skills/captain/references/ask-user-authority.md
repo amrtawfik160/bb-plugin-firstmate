@@ -1,7 +1,7 @@
 <!-- BB-SOURCE
      native: .agents/skills/ask-user-authority/SKILL.md
-     sha: 1f3e769616fdf9f31f85f4c3e6a9f71606634238
-     snapshot: native-snapshot/1f3e7696/.agents/skills/ask-user-authority/SKILL.md
+     sha: 15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4
+     snapshot: native-snapshot/15ad1bd6/.agents/skills/ask-user-authority/SKILL.md
      fidelity: verbatim
      note: Adopted as-is from native firstmate (pure decision policy, zero harness
      dependency). Rendered prose is native's own; BB-only framing is fenced
@@ -9,10 +9,6 @@
      "Skill fidelity". -->
 
 # ask-user-authority
-
-<!-- Read before deciding any no-mistakes ask-user finding. Native declares this
-     trigger in its skill frontmatter; a BB captain reference carries it as a
-     comment so the rendered body stays native's own. -->
 
 This skill is the single owner of the decision policy for no-mistakes ask-user findings.
 `AGENTS.md` section 7 points here and does not restate this procedure.
@@ -57,9 +53,3 @@ Do not relay reviewer labels or gate output as if they settled the decision.
 - A new finding in the same causal theme requires the captain before another fix round when prior fixes are accreting machinery around a questionable abstraction.
 - A genuinely security-sensitive action requires the captain under the stronger existing boundary even if it is otherwise within scope.
 - Complex architecture explicitly requested by the captain stays within scope and does not escalate merely because it is complex.
-
-<!-- BB-DIVERGE
-     native: .agents/skills/ask-user-authority/SKILL.md (frontmatter)
-     native-quote: user-invocable: false
-     bb: adopted as a captain reference loaded on demand from the captain skill; the escalation surface is BB plain chat / the AskUserQuestion tool. The decision policy itself is unchanged.
-     reason: BB has no agent-only skill loader or native pane; captain policy is carried as references. -->

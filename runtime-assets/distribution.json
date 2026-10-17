@@ -1,16 +1,17 @@
 {
-  "adapterRevision": "e77033877984b9a8f7ae1465dd60110ecf15be42555a2c6888fe2b72006d4a4a",
-  "archiveBytes": 2676446,
-  "archiveSha256": "2bb8a50bfbbbbf183c2d16b17a3874fb4a5fa7ba24c8bbabe54c7d09ce18f6ee",
+  "adapterRevision": "d5a140b47fed96c82b406e7fe5d46f543c786ce4adf7b4443ad3098d3ff34c9c",
+  "archiveBytes": 2822304,
+  "archiveSha256": "ce52d8092df7e6c773d10893e21cba62367951e6ef9b4a8d8f773d86f028579b",
   "auditedSources": [
+    "15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4",
     "1f3e769616fdf9f31f85f4c3e6a9f71606634238",
     "2d833ff147cd26a5c461e914e06854e0eb2707ce"
   ],
-  "helperSha256": "47f71494ae102ba230f2d3a329cde3a2aec3aa27e2b64dc90d7be32cacae1f0b",
+  "helperSha256": "ced8da32c0434c0673ab682e82ae0bf22a66c4113123b05e24b3b61addb88c52",
   "pluginVersion": "0.4.0",
-  "release": "c9f623c8c1b7b2fb7e9df472f25bb5d081b5c2a4128d2525897b087be8b2bbd8",
+  "release": "e99f6c5ea536272030289bf8cd1896fbacc1e94d72c0a7baa66f06d02e8acc00",
   "schema": 1,
-  "snapshotCommit": "4cdbef4dbf44a721e55cf0ad01524ee27b377e05",
+  "snapshotCommit": "6555ce6848a81d930f17dd752c18424b09684dac",
   "stateContract": "native-flat-v1",
-  "upstreamCommit": "1f3e769616fdf9f31f85f4c3e6a9f71606634238"
+  "upstreamCommit": "15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4"
 }

@@ -2,14 +2,15 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {mkdirSync,writeFileSync,readFileSync,readdirSync,rmSync,cpSync,existsSync} from 'node:fs';
 import {join} from 'node:path';
-import {spawn} from 'node:child_process';
+import {spawn,spawnSync} from 'node:child_process';
 import {runtimeFixture,assets,helper,distribution,secondRelease} from './native-runtime-fixture.mjs';
 import {fixture,pins,run,ok,overlay} from './prompt-fixture.mjs';
 import {captainStartupCommand} from '../server.ts';
+import {AUDITED_BUNDLED_SNAPSHOTS} from '../lib/native-policy.ts';
 function state(home){return Object.fromEntries(['state/.wake-queue','state/legacy.status','data/legacy/brief.md','config/delivery-mode'].map(p=>[p,readFileSync(join(home,p),'utf8')]));}
 function sentinels(home){mkdirSync(join(home,'data/legacy'),{recursive:true});writeFileSync(join(home,'state/.wake-queue'),'unhandled report PR https://github.com/fixture/repo/pull/1\n');writeFileSync(join(home,'state/legacy.status'),'waiting-checks\n');writeFileSync(join(home,'data/legacy/brief.md'),'Exact task; provider acp-grok; model grok-4.6; xhigh; merged-and-verified\n');writeFileSync(join(home,'config/delivery-mode'),'direct-PR\n');}
 
-test('shipped native assets are reproducible, complete and current against exact adapter inputs',()=>{ok(run('python3',['scripts/package-native-runtime.py','--check']));assert.equal(distribution.upstreamCommit,pins[1]);assert.match(readFileSync(join(assets,'LICENSE.firstmate'),'utf8'),/Copyright \(c\) 2026 Kun Chen/);});
+test('shipped native assets are reproducible, complete and current against exact adapter inputs',()=>{ok(run('python3',['scripts/package-native-runtime.py','--check']));assert.equal(distribution.upstreamCommit,pins.at(-1));assert.equal(AUDITED_BUNDLED_SNAPSHOTS[distribution.snapshotCommit],distribution.upstreamCommit,'captains bound to the shipped bundle can read its policy');assert.match(readFileSync(join(assets,'LICENSE.firstmate'),'utf8'),/Copyright \(c\) 2026 Kun Chen/);});
 test('offline clean installation and bound state use only shipped Git snapshot; reload verifies and reuses exact bytes',()=>{
  const f=runtimeFixture();try{const installed=f.json(f.install());assert.equal(installed.signature,'FM_BUNDLED_RUNTIME_INSTALLED');const bound=f.json(f.bind());assert.equal(bound.signature,'FM_BUNDLED_HOME_BOUND');const root=bound.selection.root;
  assert.equal(ok(run('git',['-C',root,'remote','-v'])), '');assert.equal(ok(run('git',['-C',f.home,'remote','-v'])), '');assert.equal(ok(run('git',['-C',root,'rev-list','--count','HEAD'])).trim(),'1');assert.equal(ok(run('git',['-C',root,'rev-parse','HEAD'])).trim(),distribution.snapshotCommit);
@@ -49,6 +50,18 @@ for(const pin of pins)test(`explicit external ${pin.slice(0,8)} migration/read-b
  const rollback=f.json(f.call('rollback',[...owned,'--release','external']));assert.equal(rollback.signature,'FM_EXTERNAL_ROLLBACK_PUBLISHED');assert.equal(existsSync(join(home,'config/bb-runtime-selected.json')),false);assert.deepEqual(state(home),before);assert.equal(f.json(f.call('rollback',[...owned,'--release','external'])).changed,false);assert.ok(existsSync(change.selection.root));
  }finally{f.clean();rmSync(home,{recursive:true,force:true});}
 });
+test('rollback to an external checkout keeps the strict rule: task records, primary lock and watcher refuse it',()=>{
+ const f=runtimeFixture(),home=fixture(pins.at(-2));try {
+ ok(run('python3',[join(overlay,'install-bb-backend.py'),'--home',home]));writeFileSync(join(home,'config/bb-captain'),'thr_fixture\n');f.json(f.install());const owned=['--home',home,'--captain','thr_fixture','--host','host_fixture'];
+ f.json(f.call('migrate',[...owned,'--release',distribution.release]));
+ for(const name of ['c1.meta','.lock','.watch.lock','.bb-watch-keeper.pid']){
+  writeFileSync(join(home,'state',name),'retained authoritative identity\n');
+  for(const extra of [['--check'],[]]){const refused=f.call('rollback',[...owned,'--release','external',...extra]);assert.equal(refused.status,2,name);assert.match(refused.stdout,/selection refused/,name);assert.ok(existsSync(join(home,'config/bb-runtime-selected.json')),name);}
+  rmSync(join(home,'state',name));
+ }
+ assert.equal(f.json(f.call('rollback',[...owned,'--release','external'])).signature,'FM_EXTERNAL_ROLLBACK_PUBLISHED');
+ }finally{f.clean();rmSync(home,{recursive:true,force:true});}
+});
 test('selection refuses foreign captain/host, retained tasks/native lock, unknown release and unaudited external version',()=>{
  const f=runtimeFixture(),home=fixture();try {
  const root=f.ready();sentinels(f.home);const before=state(f.home);for(const args of [[...f.owned.map(x=>x==='thr_fixture'?'thr_foreign':x)], [...f.owned.map(x=>x==='host_fixture'?'host_foreign':x)]]){assert.equal(f.call('inspect',args).status,2);assert.deepEqual(state(f.home),before);}
@@ -60,6 +73,21 @@ test('selection refuses foreign captain/host, retained tasks/native lock, unknow
  }finally{f.clean();rmSync(home,{recursive:true,force:true});}
 });
 
+test('a home with task records, its captain lock and a watcher moves to a new native release; only an operation in flight refuses',()=>{
+ const f=runtimeFixture();try {
+ f.ready();const next=secondRelease(f,{'NOTICE':'\nnext native fixture\n'},'native-next.tar.gz');f.json(f.call('install',['--archive',next.archive,'--sha256',next.sha256]));
+ const state=join(f.home,'state'),lock=(name,pid)=>{mkdirSync(join(state,name));writeFileSync(join(state,name,'pid'),`${pid}\n`);};
+ writeFileSync(join(state,'c1.meta'),'window=bb:thr_crew\nbackend=bb\n');writeFileSync(join(state,'c1.status'),'working: retained\n');
+ writeFileSync(join(state,'.lock'),`${process.pid}\n`);lock('.watch.lock',process.pid);writeFileSync(join(state,'.bb-watch-keeper.pid'),`${process.pid}\n`);
+ const dead=spawnSync('true');lock('.spawn-gone.lock',dead.pid);
+ lock('.spawn-c2.lock',process.pid);
+ const busy=f.call('select',[...f.owned,'--release',next.release]);assert.equal(busy.status,2);assert.match(busy.stdout,/native operation in flight: \.spawn-c2\.lock/);assert.equal(f.json(f.call('inspect',f.owned)).selected.release,distribution.release);
+ rmSync(join(state,'.spawn-c2.lock'),{recursive:true});
+ const moved=f.json(f.call('select',[...f.owned,'--release',next.release]));assert.equal(moved.selection.release,next.release);assert.equal(moved.selection.previous,distribution.release);
+ assert.equal(readFileSync(join(state,'c1.meta'),'utf8'),'window=bb:thr_crew\nbackend=bb\n');assert.equal(readFileSync(join(state,'c1.status'),'utf8'),'working: retained\n');
+ assert.ok(existsSync(join(f.store,'versions',distribution.release,'runtime/bin-bb')),'the previous release stays for records that name it');
+ }finally{f.clean();}
+});
 test('native-seeded secondmate seals parent runtime without changing charter, source or allocating a worker',()=>{
  const f=runtimeFixture();try{
  const root=f.ready(),child=join(f.directory,'secondmate');const env={FM_HOME:f.home,FM_ROOT_OVERRIDE:root,FM_BACKEND:'bb',FM_SECONDMATE_CHARTER:'Read-only fixture audit',FM_SECONDMATE_SCOPE:'Fixture',FM_SKIP_SECONDMATE_SYNC:'1'};

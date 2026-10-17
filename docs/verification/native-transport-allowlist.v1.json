@@ -2,7 +2,8 @@
   "schema": 1,
   "nativeCommits": [
     "2d833ff147cd26a5c461e914e06854e0eb2707ce",
-    "1f3e769616fdf9f31f85f4c3e6a9f71606634238"
+    "1f3e769616fdf9f31f85f4c3e6a9f71606634238",
+    "15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4"
   ],
   "dynamic": {
     "captain": {
@@ -18,8 +19,8 @@
   },
   "renderer": {
     "overlay/bin/backends/bb-worker-prompt.py": {
-      "sha256": "e934b7abbd08aeab965212ccd6be9bb66372c928c4181feb18298548e1a2773f",
-      "reason": "Known native scaffold boundaries only: script/browser transport, exact task-owned paths and inbox IDs; retain operational references, task and native completion gates. Recorded task setup/project reads, paired native status/progress reports and durable unit-bound validation waits; native status/completion authority retained. Preserve selected native zero-turn waiting with foreground checks; no-mistakes pipeline outcomes retain their native owner. Rule 5 blocked wording: a worker clears ordinary obstacles itself and reports blocked only for a secret, approval, decision, withheld access or an irreversible step; every other native stop rule is kept verbatim. A dispatched brief already states that rule in its Obstacles section, so rule 5 then only points there and the rule is stated once. The check instruction says the helper runs a type check, test run or build under the host limiter (fm-heavy)."
+      "sha256": "f48ab33d584a88589ffe49fa4e72ee63be18604afe53e31f18dc2e05ce4fe8d0",
+      "reason": "Known native scaffold boundaries only: script/browser transport, exact task-owned paths and inbox IDs; retain operational references, task and native completion gates. Recorded task setup/project reads, paired native status/progress reports and durable unit-bound validation waits; native status/completion authority retained. Preserve selected native zero-turn waiting with foreground checks; no-mistakes pipeline outcomes retain their native owner. Rule 5 blocked wording: a worker clears ordinary obstacles itself and reports blocked only for a secret, approval, decision, withheld access or an irreversible step; every other native stop rule is kept verbatim. A dispatched brief already states that rule in its Obstacles section, so rule 5 then only points there and the rule is stated once. The check instruction says the helper runs a type check, test run or build under the host limiter (fm-heavy). Rule 2 accepts native's 15ad1bd6 wording (scratch output outside the worktree, leave it clean) and keeps it, with the same exact task-owned paths."
     },
     "overlay/bin/backends/bb-worker-transport.txt": {
       "sha256": "6d450a1fe61c27823c5eff8e991f40dc43507721524be6a13f5e5cf8af2706df",
@@ -32,15 +33,15 @@
   },
   "captainTransport": {
     "entry-skills/captain/SKILL.md": {
-      "sha256": "1010d3290939053d9539101ad13c6049ae8f4d0cff6eeadd3fb919948cceb9c0",
+      "sha256": "24b03eda982f776696944a4001ba062636f011d7bc39f47cb96945245d0c151b",
       "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner. Merge only through firstmate_merge; crew fix rounds go to crews; standing approvals recorded through firstmate_posture."
     },
     "entry-skills/firstmate/SKILL.md": {
-      "sha256": "4278efad7a37ce187b2082ba4eb40e4a77b8e3c112aaaf13fdc786f38edd50ff",
+      "sha256": "f5a9af71ac6bf4eb23fdfce8873ce1d616c78860fe0b96cd7c4216685fbbb4ba",
       "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner."
     },
     "entry-skills/captain/references/bb.md": {
-      "sha256": "12575d13845d7d1d7ffad4510796aedee0759312bd738742f28337f02a2640c8",
+      "sha256": "7574b968fe7952865db08353b2f5e6d3df02d8e64ca035787c358f26ec52de72",
       "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner. Runtime select allows an adapter-only release switch while crews run; running crews keep their recorded release. Crews retire through firstmate_forget stop=true, not raw fm teardown."
     },
     "entry-skills/captain/references/intake-briefs.md": {

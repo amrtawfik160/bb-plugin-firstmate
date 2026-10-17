@@ -5,8 +5,8 @@ description: Enter away-mode supervision. Use when the user runs /afk, says they
 
 <!-- BB-SOURCE
      native: .agents/skills/afk/SKILL.md
-     sha: 1f3e769616fdf9f31f85f4c3e6a9f71606634238
-     snapshot: native-snapshot/1f3e7696/.agents/skills/afk/SKILL.md
+     sha: 15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4
+     snapshot: native-snapshot/15ad1bd6/.agents/skills/afk/SKILL.md
      fidelity: adapted
      note: Away-posture policy copied verbatim from native firstmate. BB tool
      calls that replace native's scripts are fenced BB-ONLY, and every departure

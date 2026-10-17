@@ -307,6 +307,10 @@ OVERLAY_INSTALL_INPUTS = (
     "compat/2d833ff147cd26a5c461e914e06854e0eb2707ce/firstmate-bb-teardown.patch",
     "compat/2d833ff147cd26a5c461e914e06854e0eb2707ce/firstmate-bb-local-merge.patch",
     "compat/2d833ff147cd26a5c461e914e06854e0eb2707ce/firstmate-bb-browser.patch",
+    "compat/1f3e769616fdf9f31f85f4c3e6a9f71606634238/firstmate-bb-backend.patch",
+    "compat/1f3e769616fdf9f31f85f4c3e6a9f71606634238/firstmate-bb-teardown.patch",
+    "compat/1f3e769616fdf9f31f85f4c3e6a9f71606634238/firstmate-bb-local-merge.patch",
+    "compat/1f3e769616fdf9f31f85f4c3e6a9f71606634238/firstmate-bb-browser.patch",
     "install-bb-backend.py",
 )
 

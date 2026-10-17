@@ -41,10 +41,27 @@ for(const pin of pins) test(`exact native ${pin.slice(0,8)} secondmate seed/spaw
  }finally{rmSync(home,{recursive:true,force:true});rmSync(childRoot,{recursive:true,force:true});}
 });
 
+test('a BB crew cannot hide tools, so a listed worker tool exclusion refuses the spawn before any BB thread exists',()=>{
+ const home=fixture(pins.at(-1)),project=mkdtempSync(join(tmpdir(),'fm-exclude-project-'));try {
+  ok(install(home));ok(run('git',['-C',project,'init','-q','-b','main']));ok(run('git',['-C',project,'-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-q','--allow-empty','-m','init']));
+  const fake=join(home,'fakebin');mkdirSync(fake);const log=join(home,'bb-events.jsonl');
+  writeFileSync(join(fake,'bb'),`#!/usr/bin/env python3\nimport json,sys\na=sys.argv[1:]\nopen(${JSON.stringify(log)},'a').write(json.dumps(a)+'\\n')\nok=a[:1] in [['status'],['diagnostics']]\nprint('{}') if ok else None\nsys.exit(0 if ok else 3)\n`,{mode:0o755});
+  const env={FM_HOME:home,FM_BACKEND:'bb',FM_BB_PROJECT_ID:'proj_fixture',FM_BB_MACHINE:'host_fixture',FM_STATE_OVERRIDE:join(home,'state'),PATH:`${fake}:${process.env.PATH}`};
+  ok(run('bash',[join(home,'bin/fm-brief.sh'),'t1',project,'--mode','direct-PR'],env));
+  const brief=join(home,'data/t1/brief.md');writeFileSync(brief,readFileSync(brief,'utf8').replace('{TASK}','Fix a typo.').replace('{FIRSTMATE_SPEC}','One-line change.'));
+  const spawn=()=>{rmSync(log,{force:true});return run('bash',[join(home,'bin-bb/fm-spawn.sh'),'t1',project,'--mode','direct-PR','--yolo','off','--backend','bb','--harness','bb'],env);};
+  const created=()=>existsSync(log)&&readFileSync(log,'utf8').split('\n').filter(Boolean).map(JSON.parse).some(a=>a[0]==='firstmate'&&a[1]==='create-worker');
+  writeFileSync(join(home,'config/crew-exclude-tools'),'Bash\n');
+  const refused=spawn();assert.notEqual(refused.status,0);assert.match(refused.stderr,/the bb runtime cannot hide tools, so this launch is refused/);assert.equal(created(),false,'no BB worker is created');assert.equal(existsSync(join(home,'state/t1.meta')),false);
+  writeFileSync(join(home,'config/crew-exclude-tools'),'# nothing hidden\n');
+  spawn();assert.equal(created(),true,'with nothing listed the spawn reaches BB worker creation');
+ }finally{rmSync(home,{recursive:true,force:true});rmSync(project,{recursive:true,force:true});}
+});
+
 test('unknown source SHA and mismatched old/new patch inputs refuse without replacing the working mirror',()=>{
  const home=fixture(pins[0]),bundle=mkdtempSync(join(tmpdir(),'fm-compat-mismatch-'));try {
   ok(install(home));const before=treeDigest(join(home,'bin-bb'));cpSync(overlay,bundle,{recursive:true});
-  const changed=structuredClone(registry);changed.sets[pins[0]]=changed.sets[pins[1]];writeFileSync(join(bundle,'patch-sets.json'),JSON.stringify(changed));
+  const changed=structuredClone(registry);changed.sets[pins[0]]=changed.sets[pins.at(-1)];writeFileSync(join(bundle,'patch-sets.json'),JSON.stringify(changed));
   const mismatch=install(home,bundle);assert.notEqual(mismatch.status,0);assert.match(mismatch.stderr,/did not apply/);assert.equal(treeDigest(join(home,'bin-bb')),before);
   ok(run('git',['-C',home,'-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','--allow-empty','-m','unknown source fixture']));
   const unknown=install(home);assert.notEqual(unknown.status,0);assert.match(unknown.stderr,/unsupported native source SHA/);assert.equal(treeDigest(join(home,'bin-bb')),before);

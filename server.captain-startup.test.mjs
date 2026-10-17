@@ -10,7 +10,7 @@ import {boundedCaptainStartup} from './lib/captain-startup.ts';
 import {fixture,pins,run,ok} from './scripts/prompt-fixture.mjs';
 const ctx={threadId:'thr_newcap',projectId:'proj_1'};
 function unwrap(command){const m=/^__fm_cmd='([\s\S]*?)'; set \+e; "/.exec(command);assert.ok(m,command);return m[1].replace(/'\\''/g,"'");}
-async function setup(pin=pins[1],options={}) {
+async function setup(pin=pins.at(-1),options={}) {
  const base=fixture(pin);ok(run('python3',['overlay/install-bb-backend.py','--home',base]));const runtime=join(base,'test-runtime');mkdirSync(runtime);const cli=join(runtime,'bin');mkdirSync(cli);writeFileSync(join(cli,'bb'),'#!/bin/sh\nprintf "{}\\n"\n',{mode:0o755});writeFileSync(join(base,'state/unrelated.status'),'UNRELATED SENTINEL\n');
  const home=`${base}-bb-homes/${ctx.threadId}`;
  const host=createFakePluginHost({pluginId:'firstmate',settings:{fmHome:base,fmHostId:'host_1'}});await plugin(host.bb);
@@ -94,12 +94,12 @@ test('every deck links skill-routing into each installed provider skill folder a
  }finally{await f.clean();}
 });
 for(const failure of ['clone','bootstrap'])test(`failed ${failure} aborts captain setup without a watcher or claimed readiness`,async()=>{
- const f=await setup(pins[1],{fail:c=>failure==='clone'?c.includes('git clone'):c.includes('/fm-bootstrap.sh')});try{
+ const f=await setup(pins.at(-1),{fail:c=>failure==='clone'?c.includes('git clone'):c.includes('/fm-bootstrap.sh')});try{
  const result=await f.host.harness.behavior.runCli(['deck','--json'],ctx);assert.equal(result.exitCode,1);assert.match(result.stderr,/Captain is not ready/);assert.match(result.stderr,/prerequisite|initialization/);assert.equal(await f.host.bb.storage.kv.get('fm-watch-captain:host_1'),undefined);assert.equal(f.seen.some(c=>c.includes('fm-session-start.sh')),false);assert.equal(readFileSync(join(f.base,'state/unrelated.status'),'utf8'),'UNRELATED SENTINEL\n');
  }finally{await f.clean();}
 });
 test('foreign source host refuses before any native command or captain registration',async()=>{
- const f=await setup(pins[1],{host:'host_foreign'});try{const result=await f.host.harness.behavior.runCli(['deck'],ctx);assert.equal(result.exitCode,1);assert.match(result.stderr,/another host/);assert.equal(f.seen.length,0);assert.equal(f.host.harness.sdk.callsTo('threads.updatePluginMetadata').length,0);}finally{await f.clean();}
+ const f=await setup(pins.at(-1),{host:'host_foreign'});try{const result=await f.host.harness.behavior.runCli(['deck'],ctx);assert.equal(result.exitCode,1);assert.match(result.stderr,/another host/);assert.equal(f.seen.length,0);assert.equal(f.host.harness.sdk.callsTo('threads.updatePluginMetadata').length,0);}finally{await f.clean();}
 });
 test('unbound ACP contract/startup entrypoints refuse shared home, with supported deck command',async()=>{
  const f=await setup();try{for(const args of [['contract'],['fm','session-start','--json']]){const r=await f.host.harness.behavior.runCli(args,ctx);assert.equal(r.exitCode,1);assert.match(r.stderr,/bound.*home|No bound captain home/);assert.match(r.stderr,/firstmate deck/);}const tool=f.host.harness.registrations.agentTools.find(t=>t.name==='firstmate_fm');const r=await tool.execute({script:'session-start'},ctx);assert.equal(r.isError,true);assert.match(JSON.stringify(r),/bound captain home/);assert.equal(f.seen.length,0);assert.equal(f.host.harness.sdk.callsTo('files.read').length,0);}finally{await f.clean();}

@@ -69,7 +69,7 @@ export function createLaunches(db: Database) {
     return (rows as { record: string }[]).map(r => JSON.parse(r.record));
   }
   function hasRuntimeConsumers(owner:string) {
-    return !!db.prepare("SELECT 1 FROM launches WHERE owner=? AND state IN ('reserved','creating','provisioning','running','uncertain') LIMIT 1").get(owner);
+    return !!db.prepare("SELECT 1 FROM launches WHERE owner=? AND state IN ('reserved','creating','provisioning','uncertain') LIMIT 1").get(owner);
   }
   function heldTaskIds(owner:string) {
     const rows=db.prepare("SELECT record FROM launches WHERE owner=? AND state IN ('reserved','creating','provisioning','uncertain')").all(owner) as {record:string}[];

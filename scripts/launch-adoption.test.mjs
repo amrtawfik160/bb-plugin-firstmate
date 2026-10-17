@@ -12,7 +12,7 @@ import {pins,fixture,scaffold,run,ok,overlay} from './prompt-fixture.mjs';
 
 const ctx={threadId:'thr_captain',projectId:'proj_repair'};
 const target='thr_legacy';
-function setup(pin=pins[1],shape='ship',mode='direct-PR',projectToken) {
+function setup(pin=pins.at(-1),shape='ship',mode='direct-PR',projectToken) {
  const home=fixture(pin);ok(run('python3',[join(overlay,'install-bb-backend.py'),'--home',home]));
  const root=mkdtempSync(join(tmpdir(),'fm-adopt-repo-')),repo=join(root,'repo'),wt=join(root,'wt');mkdirSync(repo);
  ok(run('git',['-C',repo,'init','--quiet','--initial-branch=main']));ok(run('git',['-C',repo,'config','user.email','test@example.com']));ok(run('git',['-C',repo,'config','user.name','Fixture']));
@@ -102,7 +102,7 @@ async function factory(f,reuse) {
  return {host,metadata,environment,thread};
 }
 function noWorkerMutations(host) {for(const method of ['threads.spawn','threads.send','threads.retry','threads.stop','threads.update','threads.delete','threads.archive']) assert.equal(host.harness.sdk.callsTo(method).length,0,method);}
-for(const [pin,projectToken] of [[pins[0],undefined],[pins[0],'crew'],[pins[1],'crew']]) test(`actual factory legacy repair ${pin.slice(0,8)} ${projectToken??'exact path'} restores crew visibility, keeps multiple PR obligations and immutable contract after reload`,async()=>{
+for(const [pin,projectToken] of [[pins[0],undefined],[pins[0],'crew'],[pins.at(-1),'crew']]) test(`actual factory legacy repair ${pin.slice(0,8)} ${projectToken??'exact path'} restores crew visibility, keeps multiple PR obligations and immutable contract after reload`,async()=>{
  const f=setup(pin,'ship','direct-PR',projectToken);let {host,metadata}=await factory(f);try {
   const deliveries=createDeliveries(host.bb.storage.database());for(const number of [43,47]) deliveries.register({url:`https://github.com/acme/repo/pull/${number}`,taskId:f.record.taskId,projectId:ctx.projectId,owner:ctx.threadId,home:f.home,worker:target,requirement:f.record.deliveryRequirement});
   const records=[deliveries.get('acme/repo#43'),deliveries.get('acme/repo#47')];const before=invariant(f);

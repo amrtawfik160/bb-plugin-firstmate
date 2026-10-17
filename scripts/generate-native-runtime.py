@@ -2,16 +2,16 @@
 """Build a reproducible filtered native Git snapshot. Reads only committed source."""
 import argparse, hashlib, json, os, subprocess, tempfile, sys
 from pathlib import Path
-PIN = '1f3e769616fdf9f31f85f4c3e6a9f71606634238'
+PIN = '15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4'
 PREFIXES = ('bin/', '.agents/', '.claude/', '.codex/', '.cursor/', '.grok/', '.omp/', '.opencode/', '.pi/', 'skills/', 'docs/')
 ROOT_FILES = ('AGENTS.md', 'CLAUDE.md', 'GROK_BOT.md', 'README.md', 'LICENSE', 'CONTRIBUTING.md', '.tasks.toml', '.gitignore', '.gitattributes')
 def digest(data): return hashlib.sha256(data).hexdigest()
 def run(args, **kw): return subprocess.check_output(args, **kw)
-def generate(source, destination):
+def generate(source, destination, pin=PIN, register=True):
     destination.mkdir(parents=True, exist_ok=True)
     source_env={key:value for key,value in os.environ.items() if not key.startswith('GIT_')}
     source_env.update(GIT_CONFIG_GLOBAL=os.devnull,GIT_CONFIG_SYSTEM=os.devnull,GIT_NO_REPLACE_OBJECTS='1',GIT_TEMPLATE_DIR='')
-    entries = run(['git','-C',str(source),'ls-tree','-rz',PIN],env=source_env).split(b'\0')
+    entries = run(['git','-C',str(source),'ls-tree','-rz',pin],env=source_env).split(b'\0')
     files = {}
     with tempfile.TemporaryDirectory(prefix='fm-native-package-') as temporary:
         tree = Path(temporary)
@@ -43,28 +43,29 @@ def generate(source, destination):
         for name in files:
             path = tree/name
             if path.is_symlink() and not path.exists(): raise ValueError(f'missing transitive symlink target {name}')
-        descriptor = {'schema':1, 'format':'filtered-git-snapshot-v1', 'upstreamCommit':PIN,
+        descriptor = {'schema':1, 'format':'filtered-git-snapshot-v1', 'upstreamCommit':pin,
                       'upstreamSource':'https://github.com/kunchenguid/firstmate', 'stateContract':'native-flat-v1', 'files':files}
         (tree/'.bb-native-runtime.json').write_text(json.dumps(descriptor,sort_keys=True,separators=(',',':'))+'\n')
         run(['git','init','--quiet','--initial-branch=main',str(tree)],env=env)
         run(['git','-C',str(tree),'add','--force','.'],env=env)
         oid = run(['git','-C',str(tree),'write-tree'],env=env).decode().strip()
-        commit = run(['git','-C',str(tree),'commit-tree',oid],env=env,input=f'Filtered Firstmate runtime {PIN}\n'.encode()).decode().strip()
+        commit = run(['git','-C',str(tree),'commit-tree',oid],env=env,input=f'Filtered Firstmate runtime {pin}\n'.encode()).decode().strip()
         run(['git','-C',str(tree),'update-ref','refs/heads/main',commit],env=env)
         bundle = destination/'native.bundle'
         run(['git','-C',str(tree),'bundle','create',str(bundle.resolve()),'refs/heads/main'],env=env)
-        manifest = {'schema':1,'generator':{'git':run(['git','--version'],env=source_env).decode().strip(),'python':sys.version.split()[0]},'upstreamCommit':PIN,'upstreamSource':descriptor['upstreamSource'],
+        manifest = {'schema':1,'generator':{'git':run(['git','--version'],env=source_env).decode().strip(),'python':sys.version.split()[0]},'upstreamCommit':pin,'upstreamSource':descriptor['upstreamSource'],
                     'snapshotCommit':commit,'stateContract':descriptor['stateContract'],
                     'nativeBundle':{'sha256':digest(bundle.read_bytes()),'bytes':bundle.stat().st_size},
                     'sourceManifestSha256':digest((tree/'.bb-native-runtime.json').read_bytes()),'nativeFiles':len(files)}
         (destination/'native-manifest.json').write_text(json.dumps(manifest,sort_keys=True,indent=2)+'\n')
-        registry_path=Path(__file__).resolve().parents[1]/'overlay/patch-sets.json'
-        registry=json.loads(registry_path.read_text())
-        if PIN not in registry['sets']: raise ValueError('native generator pin has no audited adapter patch set')
-        registry['bundledSnapshots']={commit:{'upstreamCommit':PIN,'sourceManifestSha256':manifest['sourceManifestSha256']}}
-        registry_path.write_text(json.dumps(registry,sort_keys=True,indent=2)+'\n')
+        if register:
+            registry_path=Path(__file__).resolve().parents[1]/'overlay/patch-sets.json'
+            registry=json.loads(registry_path.read_text())
+            if pin not in registry['sets']: raise ValueError('native generator pin has no audited adapter patch set')
+            registry['bundledSnapshots']={commit:{'upstreamCommit':pin,'sourceManifestSha256':manifest['sourceManifestSha256']}}
+            registry_path.write_text(json.dumps(registry,sort_keys=True,indent=2)+'\n')
         (destination/'LICENSE.firstmate').write_bytes((tree/'LICENSE').read_bytes())
-        (destination/'NOTICE').write_text(f'Firstmate by Kun Chen, MIT License.\nSource: {descriptor["upstreamSource"]}\nUpstream commit: {PIN}\nNative files are unchanged; the BB adapter is separately marked and versioned.\nThe snapshot Git commit is a packaging identity, not the upstream commit.\n')
+        (destination/'NOTICE').write_text(f'Firstmate by Kun Chen, MIT License.\nSource: {descriptor["upstreamSource"]}\nUpstream commit: {pin}\nNative files are unchanged; the BB adapter is separately marked and versioned.\nThe snapshot Git commit is a packaging identity, not the upstream commit.\n')
         print(json.dumps(manifest,sort_keys=True))
 if __name__=='__main__':
     parser=argparse.ArgumentParser();parser.add_argument('--source',type=Path,required=True);parser.add_argument('--output',type=Path,default=Path('runtime-assets'))

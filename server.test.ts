@@ -11656,7 +11656,7 @@ for (const missing of [false, true]) {
     const f=replacementFixture(undefined,"ship","local-only");
     const home=f.home;
     if (!missing) {
-      const role=spawnSync("bash",["-c",'. "$1"; fm_brief_worker_role "$2" c1',"fixture",join(home,"bin/fm-dod-lib.sh"),join(home,"state")],{encoding:"utf8"});
+      const role=spawnSync("bash",["-c",'. "$1"; fm_brief_worker_role "$2" c1 "$3"',"fixture",join(home,"bin/fm-dod-lib.sh"),join(home,"state"),home],{encoding:"utf8"});
       assert.equal(role.status,0,role.stderr);
       writeFileSync(join(home,"data/c1/launch-brief.md"),role.stdout+"\n"+f.brief);
     } else {rmSync(join(home,"data/c1/brief.md"));}

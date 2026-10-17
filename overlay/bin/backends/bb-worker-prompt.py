@@ -15,8 +15,11 @@ sys.dont_write_bytecode=True
 IDENTITY = 'You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.\n\n'
 BROWSER = '3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.'
 WRITES = {
-    'ship': '2. Stay inside this worktree; modify nothing outside it.',
-    'scout': '2. Stay inside this worktree; the only files you may write outside it are the report and the status file below.',
+    'ship': ('2. Stay inside this worktree; modify nothing outside it.',
+             '2. Keep project edits inside this worktree; keep proof and scratch output outside it, under `$DATA/$ID/` or a temporary directory.\n'
+             '   Outside the worktree, write only that task material and the status and steering-inbox records authorized below.\n'
+             '   Leave the worktree clean before reporting done.'),
+    'scout': ('2. Stay inside this worktree; the only files you may write outside it are the report and the status file below.',),
 }
 SAME_OBSTACLE = '5. If you hit the same obstacle twice, append `blocked [at=<epoch>]: {why}` and stop; firstmate will help.'
 STUCK = '   Use `blocked:` when you are stuck and need help.'
@@ -105,7 +108,10 @@ def render(brief, kind, task_id, home, bindir, role, transport, mode=''):
     require(scaffold.count('\n# Rules\n') == 1 and scaffold.count('\n# Definition of done\n') == 1, 'core policy headings changed')
     setup, remainder = scaffold.split('\n# Rules\n', 1)
     rules, completion = remainder.split('\n# Definition of done\n', 1)
-    require(rules.count(BROWSER) == 1 and rules.count(WRITES[kind]) == 1, 'native browser/write-rule anchor changed')
+    writes = [anchor.replace('$DATA/$ID/', artifact) for anchor in WRITES[kind]]
+    present = [anchor for anchor in writes if anchor in rules]
+    require(rules.count(BROWSER) == 1 and len(present) == 1 and rules.count(present[0]) == 1, 'native browser/write-rule anchor changed')
+    native_writes = present[0]
     require(status in rules, 'status path does not match this task namespace')
     require('\n# Firstmate instruction inbox\n' in rules, 'native inbox section missing')
     before_inbox, inbox_section = rules.split('\n# Firstmate instruction inbox\n', 1)
@@ -149,7 +155,9 @@ def render(brief, kind, task_id, home, bindir, role, transport, mode=''):
         require(f'`{report}`' in completion, 'native scout report path changed')
         allowed += f', including the native-declared scout report `{report}`'
     allowed += '. These task-owned paths do not authorize editing other tasks, homes, config or shared state. Keep the native status command below intact, including its optional fleet-ledger call.'
-    rules = rules.replace(WRITES[kind], '<!-- BB-DIVERGE: native fm-brief.sh Rules / rule 2; exact task-owned BB operational paths. -->\n' + allowed, 1)
+    if native_writes != writes[0]:
+        allowed = allowed.replace('2. Work in the task worktree. The only writes allowed outside it are', f'2. Keep project edits inside this worktree; keep proof and scratch output outside it, under `{artifact}` or a temporary directory. The only writes allowed outside it are that scratch output,', 1) + '\n   Leave the worktree clean before reporting done.'
+    rules = rules.replace(native_writes, '<!-- BB-DIVERGE: native fm-brief.sh Rules / rule 2; exact task-owned BB operational paths. -->\n' + allowed, 1)
     if kind == 'ship':
         matches = re.findall(r'^Delivery contract: mode=(\S+)', completion, re.M)
         require(len(matches) == 1 and matches[0] in ('direct-PR', 'no-mistakes', 'local-only'), 'unknown native delivery mode')
