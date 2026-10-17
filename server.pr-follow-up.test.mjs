@@ -213,3 +213,22 @@ test('retirement reads count against the hourly allowance and stop when it is sp
   assert.ok(!d.gh.commands.some(c=>c.includes('/pull/5401')),'no retirement read once the hourly allowance is spent');
  }finally{await d.host.harness.lifecycle.dispose();}
 });
+
+test('the hourly allowance is spread across the hour, and a PR the open list shows changed is read before the routine backlog',async(t)=>{
+ t.mock.timers.enable({apis:['Date'],now:Date.now()});
+ const prs=Array.from({length:100},(_,i)=>9000+i);
+ const {host,store,gh}=await deck(prs);try {
+  for(const n of prs) store.save({...store.get(id(n)),nextCheckAt:Date.now()-1000});
+  const perMinute=[];
+  for(let minute=0;minute<5;minute++){
+   const before=gh.reads;
+   if(minute===3) store.save({...store.get(id(9099)),nextCheckAt:0});
+   await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+   perMinute.push(gh.reads-before);
+   if(minute===3) assert.ok(gh.commands.slice(-gh.reads+before).some(c=>c.includes('/pull/9099')),'the changed PR was read in the cycle after the change');
+   t.mock.timers.tick(60_000);
+  }
+  assert.ok(perMinute[0]<=20,`first minute read ${perMinute[0]} of a 100-PR backlog`);
+  assert.ok(perMinute.slice(1).every(n=>n<=10),`later minutes read ${perMinute.slice(1)}: more than 500/60 a minute`);
+ }finally{await host.harness.lifecycle.dispose();}
+});
