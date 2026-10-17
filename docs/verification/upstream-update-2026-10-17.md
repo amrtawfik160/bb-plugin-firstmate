@@ -53,8 +53,8 @@ harness-adapters wording the task asked for.
 
 ## Commit table
 
-Decisions: 27 vendored (come in with the bundle and skill copies), 11 plugin
-changes, 35 do not apply to BB.
+Decisions: 28 vendored (come in with the bundle and skill copies), 11 plugin
+changes, 34 do not apply to BB.
 
 | # | Commit | Subject | Decision | Where or why |
 | --- | --- | --- | --- | --- |
@@ -80,7 +80,7 @@ changes, 35 do not apply to BB.
 | 20 | `53b5bc11` | fix: share Pi Calm's working-ship widget slot | Does not apply | Pi harness. |
 | 21 | `23e71b3d` | feat(bin): add opt-in --herdr-resume-lock-wait to fm-spawn | Does not apply | Herdr backend. The batch path keeps the BB mirror spawn. |
 | 22 | `0f34fab4` | fix(bin): let TERM stop a watcher blocked in a pane capture on bash 3.2 | Vendored | Native watcher. |
-| 23 | `47aff866` | feat: add per-home worker tool exclusions | Does not apply | Applies to native launch commands; BB launches crews as BB threads with no native launch command. |
+| 23 | `47aff866` | feat: add per-home worker tool exclusions | Vendored | The shared spawn preflight runs for BB. A listed `config/crew-exclude-tools` refuses a BB spawn before any thread exists, because a BB crew cannot hide tools (native allows only Pi). Kept as native's fail-closed refusal; `scripts/native-compat.test.mjs` pins it. |
 | 24 | `ac0811c4` | feat(bin): defer spawns beyond a declared per-project capacity, opt-in | Plugin change | Overlay backend patch: batch spawn keeps the mirror path; BB, like Orca, takes the project lock only when a capacity is declared. Not declared in BB homes. |
 | 25 | `228b27d2` | fix(bin): name the Lavish read message count by the same label as its section | Vendored | Lavish process events. |
 | 26 | `8fa25382` | fix(herdr): make the presentation lock namespace per OS account | Does not apply | Herdr backend. |
@@ -167,8 +167,8 @@ release. The state contract (`native-flat-v1`) is the same in both releases.
 
 The switch now refuses only while something is executing old code at that
 moment: a spawn or control lock held by a live process, or a BB launch that is
-reserved, creating, provisioning or uncertain. External-checkout migration
-keeps its stricter rule.
+reserved, creating, provisioning or uncertain. Migration from and rollback to
+an external checkout keep the strict rule.
 
 ## Canary (test captain)
 
@@ -212,15 +212,22 @@ Run these as the live captain, in its own thread:
 3. `firstmate_runtime action=select release=<that release> check=true`.
 4. If it refuses with "native operation in flight" or "BB launches are
    running/reserved/uncertain": wait for that spawn or launch to finish, then
-   repeat step 3.
-5. `firstmate_runtime action=select release=<that release>`.
+   repeat step 3. If the named lock stays and its process is not a spawn or
+   control step (a reused process ID), inspect the lock and the process
+   before any reconciliation. Do not delete a lock because it is old.
+5. `firstmate_runtime action=select release=<that release>`. It checks
+   again; if it refuses, go back to step 4.
 6. `firstmate_contract`, read again in full. It must name 15ad1bd6.
 7. Check `firstmate_runtime action=status`: selected release has upstream
    15ad1bd6; old crews appear under `referencedReleases`.
-8. Check the plugin log for "replacing the keeper" with the new release path.
+8. Check that `state/.watch.lock/watcher-path` and
+   `state/.bb-watch-keeper.bindir` in the home name the new release folder.
+   The plugin log shows "replacing the keeper" when it moved them.
 
-To undo: `firstmate_runtime action=rollback release=<previous release>`, with
-`check=true` first.
+To undo: `firstmate_runtime action=rollback release=<the recorded previous
+release>` (`c9f623c8…` for the live captain), with `check=true` first.
+Rolling back to an external checkout keeps the strict rule: task records, the
+primary lock and the watcher refuse it.
 
 ## What the live captain and its crews see after merge and reload
 
