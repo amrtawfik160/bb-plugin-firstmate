@@ -79,7 +79,7 @@ import {
   buildProgram, createPrograms, isOpenProgram, isOpenTicket, newlyReady, numberOf, programCounts, programText, readyRefs, readyWakeText, repoOf,
   shortTicket, stallReminderDue, stallReminderText, ticketRef, type IssueFacts, type Program, type ProgramFact, type TicketRef,
 } from "./lib/programs.ts";
-import { askLetterAnswer, askIdFromSourceEventId, packAnswers, clip, createOwnerAsks, formatAge, formatAskCard, formatUtcTime, mayDefault, CAPTAIN_RULES, OWNER_DECISION_RULE, recommendedLabel, type AskKind } from "./lib/owner-asks.ts";
+import { askLetterAnswer, askIdFromSourceEventId, packAnswers, clip, createOwnerAsks, formatAge, formatAskCard, formatUtcTime, mayDefault, CAPTAIN_RULES, OWNER_DECISION_RULE, recommendedLabel, type AskKind, type OwnerAsk } from "./lib/owner-asks.ts";
 import { DEFAULT_RELIABILITY_FLAGS, reliabilityFlagsFromSettings } from "./lib/reliability-flags.ts";
 import { sanitizeSettingValue } from "./lib/settings-schema.ts";
 import { coalesceBatches, parseConnectorHeader, parseInboundTelegram, parseSourceRef, parseTelegramSubmission, stripTelegramEnvelope, telegramReplyParameters, telegramSourceRef } from "./lib/telegram-envelope.ts";
@@ -89,13 +89,15 @@ import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRe
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
 import { optionHelp } from "./lib/cli-help.ts";
 import { AUDITED_BUNDLED_SNAPSHOTS, AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython } from "./lib/native-policy.ts";
-import { createDeliveries, LOST_OWNER_RECHECK_MS, canonicalPr, decisionLine, deliveryLine, parseForge, PR_VIEW_FIELDS, PR_VIEW_JQ, prBranchOwner, releasesTask, type DeliveryRecord, type PrBranchCandidate } from "./lib/pr-delivery.ts";
+import { createDeliveries, OWNER_ACTOR, verifiedBy, LOST_OWNER_RECHECK_MS, canonicalPr, decisionLine, deliveryLine, parseForge, PR_VIEW_FIELDS, PR_VIEW_JQ, prBranchOwner, releasesTask, type DeliveryRecord, type PrBranchCandidate } from "./lib/pr-delivery.ts";
 import { captureHostCommand, decodeHostCapture } from "./lib/host-capture.ts";
 import { selectExecution, validateLaunchCapabilities } from "./lib/execution-selection.ts";
 import { crewPipeline, crewPlaybook, crewSkillBlock, crewSkillRoot, notVerifiedNote, notVerifiedRequest, pipelineProofGap, PLAYBOOK_CHOICES, playbookStepCount, redactSecrets, reportGapNote, reportGapRequest, reportGaps, skillCheckScript, skillRoutingLinkScript, verifyStepGap } from "./lib/crew-contract.ts";
 import { CREW_ROLES, crewExecution } from "./owner/crew-roles.ts";
 import { DISPATCH_VERSION, PROOF_STEP, pipelineGates, proofStep } from "./owner/pipelines.ts";
-import { changeReach } from "./owner/reach.ts";
+import { changeReach, type Reach } from "./owner/reach.ts";
+import { hostCanDrive, PROOF_SURFACES, projectBriefLines, projectForName, projectForRepo, repoOf as prRepoOf, surfaceRefusal, surfaceWords } from "./owner/projects.ts";
+import { createReleaseReadbacks, type ReleaseSource } from "./lib/release-readback.ts";
 import { addCorrection, CAPTAIN_FILE, CORRECTION_RULE, correctionBrief, fixCorrection, LEDGER_FILE, readLedger, within } from "./owner/corrections.ts";
 import { renderScorecard, type ScorecardData } from "./owner/scorecard.ts";
 import { createQualityEvents } from "./lib/quality-events.ts";
@@ -1721,12 +1723,25 @@ export default async function plugin(bb: BbPluginApi) {
   const inboundLedger = createInboundLedger(bb.storage.database());
   const ownerAsks = createOwnerAsks(bb.storage.database());
   const programs = createPrograms(bb.storage.database());
-  const ownerTasks = createOwnerTasks(bb.storage.database(), (task) => {
+  const releaseReadbacks = createReleaseReadbacks(bb.storage.database());
+  const ownerTasks = createOwnerTasks(bb.storage.database(), (task, to) => {
     const program = programs.holding(task.id);
-    if (program === undefined) return null;
+    if (program === undefined) return to === "live" || to === "done" ? releaseHold(task) : null;
     const c = programCounts(program);
     return `Task ${task.id} holds program ${program.id} (${program.title}): ${c.total - c.done - c.dropped} of ${c.total} tickets are open. It closes by itself when every ticket is done or dropped. If the owner stops the work, drop the open tickets with firstmate_program set state=dropped and the owner's words.`;
   }, () => { void refreshOwnerBoard(); });
+  // Owner decision Q5: an app release is done or live only with a crew's read-back of the build
+  // in the project's required group (owner/projects.json), read from App Store Connect or EAS.
+  // A task with no merged PR shipped no build, so it needs none.
+  function releaseHold(task: OwnerTask): string | null {
+    const rule = projectForName(task.project);
+    if (rule?.release === undefined) return null;
+    const merged = deliveries.forTasks(task.crewIds, task.prs).some((r) => r.forgeState === "merged" || r.mergeCommitSha !== null);
+    if (!merged) return null;
+    const group = rule.release.group;
+    if (releaseReadbacks.forTask(task.captain, task.id).some((readback) => readback.group.toLowerCase() === group.toLowerCase())) return null;
+    return `Task ${task.id} is a ${rule.name} release with a merged PR: it closes only with a crew's read-back of the build in "${group}". A crew reads the build's groups from App Store Connect or EAS and records it: firstmate_deliveries action=release task=${task.id} build=<build> group="${group}" source=app-store-connect|eas seen="<what it read>".`;
+  }
   const crewWatchdog = createWatchdogStore(bb.storage.database());
   const dispatchJobs = createDispatchJobs(bb.storage.database());
   const doorbellHold = createDoorbellHold(bb.storage.database());
@@ -3609,7 +3624,8 @@ export default async function plugin(bb: BbPluginApi) {
       : "Implement the captain's intent above exactly; do not widen scope. Small diff, own branch, deliver per the mode contract, then report DONE/BLOCKED/FAILED.";
     // Captain-authored specifications retain precedence over the role default.
     // The skills block follows the cap so a long specification never cuts it off.
-    const spec = `${(sections.spec ?? defaultSpec).slice(0, 3000)}\n\n${crewSkillBlock({ ...crew, task, dataDir: `${fmHome}/data/${crew.id}` })}`;
+    const projectLines = projectBriefLines(projectForName(await projectLabel(crew.projectId)));
+    const spec = `${(sections.spec ?? defaultSpec).slice(0, 3000)}\n\n${crewSkillBlock({ ...crew, task, dataDir: `${fmHome}/data/${crew.id}`, projectLines })}`;
     // Intent plus spec plus skills block outgrow one host command, so the fill
     // reads them from a staged host file.
     const fill = `/tmp/.fm-brief-fill-${randomUUID()}`;
@@ -5332,6 +5348,29 @@ export default async function plugin(bb: BbPluginApi) {
       return project.name.trim() || null;
     } catch {
       return null;
+    }
+  }
+
+  /** Send one ask card to the Telegram connector. Returns "" when queued, else why it was not. */
+  async function sendAskCard(ask: OwnerAsk, route: { project?: string; task?: string } = {}): Promise<string> {
+    const gated = !mayDefault(ask);
+    try {
+      const sent = z.object({ queued: z.number(), duplicate: z.boolean() }).parse(await bb.sdk.plugins.callRpc({
+        pluginId: TELEGRAM_BRIDGE_PLUGIN_ID,
+        method: "ask",
+        input: {
+          askId: ask.id, text: formatAskCard(ask), options: ask.options, ...(ask.recommended !== null ? { recommended: ask.recommended } : {}),
+          // The connector folds reversible cards sent within a minute into one message with "Accept all recommended".
+          card: { kind: ask.kind, question: ask.text, ...(ask.impact ? { impact: ask.impact } : {}), defaultAt: ask.defaultAt, gated },
+          // With Telegram topics on the card goes to its project's topic; without it the connector asks Decisions.
+          ...(route.project?.trim() ? { project: route.project.trim() } : {}),
+          ...(route.task !== undefined ? { task: route.task } : {}),
+        },
+        outputSchema: z.object({ queued: z.number(), duplicate: z.boolean() }),
+      }));
+      return sent.queued <= 0 && !sent.duplicate ? "the Telegram connector queued nothing" : "";
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
     }
   }
 
@@ -7802,10 +7841,14 @@ export default async function plugin(bb: BbPluginApi) {
     await askPrDecisions(signal).catch(error=>{ if (!signal?.aborted) bb.log.warn(`PR decision list: ${String(error)}`); });
   }
   const deliveryParams = z.object({
-    action:z.enum(["list","inspect","register","reconcile","assign","abandon","clear-hold","verify","check","account"]),
+    action:z.enum(["list","inspect","register","reconcile","assign","abandon","clear-hold","verify","check","account","device-proof","release"]),
     id:z.string().optional().describe("Deliverable id owner/repo#number; url works instead"),crewId:z.string().optional(),url:z.string().optional().describe("PR link"),from:z.string().nullable().optional(),
     requirement:z.enum(["pr","merged","merged-and-verified"]).optional(),reason:z.string().optional(),commitSha:z.string().optional().describe("Commit the verification covers: an open PR's current head, or a merged PR's merge commit"),
-    driven:z.string().optional().describe("verify: what you drove on the real changed surface at commitSha"),seen:z.string().optional().describe("verify: what you saw"),
+    driven:z.string().optional().describe("verify: what you drove on the real changed surface at commitSha"),seen:z.string().optional().describe("verify: what you saw; release: what App Store Connect or EAS showed"),
+    surface:z.enum(PROOF_SURFACES).optional().describe("verify: the surface you drove: iphone, web or message. It must be the project's proof surface"),
+    build:z.string().max(80).optional().describe("device-proof and release: the app build id or number"),link:z.string().max(500).optional().describe("device-proof: the TestFlight or OTA link the owner opens"),
+    check:z.string().max(500).optional().describe("device-proof: what the owner checks on the device"),task:z.string().regex(/^T\d+$/).optional().describe("release: the owner task the build ships"),
+    group:z.string().max(120).optional().describe("release: the TestFlight group the build is in, as read back"),source:z.enum(["app-store-connect","eas"]).optional().describe("release: where the read-back came from"),
     verdict:z.enum(["pass","fail"]).optional().describe("check: a checker crew's verdict on the PR head"),findings:z.number().int().min(0).optional().describe("check: with verdict fail, how many findings the notes name"),notes:z.string().optional().describe("check: what you checked, drove and saw, and each finding"),
     authorized:z.boolean().optional().describe("Explicit user authority for abandonment or changing the delivery contract"),
     failureId:z.string().optional(),scope:z.enum(["author","baseline"]).optional(),followUpTask:z.string().optional(),
@@ -7908,13 +7951,20 @@ export default async function plugin(bb: BbPluginApi) {
     }
     if (input.action === "check") return [await recordCheckerVerdict(live,owner,input.commitSha ?? "",input.verdict,input.notes ?? "",input.findings)];
     if (input.action === "verify") {
-      await requirePipelineProof(live);
-      const evidence={ driven:input.driven ?? "",seen:input.seen ?? "" };
-      if (r.owner === owner) return [deliveries.verify(r.id,owner,input.commitSha ?? "",evidence)];
-      // A crew that drove the change records it under its own crew id, without the captain.
+      // Owner decision Q6: a crew drives the change and records it under its own crew id. The
+      // captain never verifies for itself (#2523 and dr.woo#124, 15-17 Oct).
       const crew=await findCrewByThread(owner);
-      if (!crew || crew.projectId !== r.projectId) throw new Error(`Only the owning manager or a Firstmate crew on this project can verify ${r.id}.`);
-      return [deliveries.verify(r.id,owner,input.commitSha ?? "",evidence,crew.id)];
+      if (!crew || crew.projectId !== r.projectId) throw new Error(`Refusing: only a crew records verification. The captain cannot verify ${r.id} for itself: the crew that drove the change records what it drove and saw at the head, or the owner taps Works on the crew's device proof card.`);
+      // Owner decision Q5: proof comes from the project's surface, and from the owner when this host cannot drive it.
+      const project=projectForRepo(r.repository);
+      const wrong=surfaceRefusal(project,input.surface);
+      if (wrong !== null) throw new Error(`Refusing: ${wrong}`);
+      if (project !== undefined && !hostCanDrive(project.proofSurface)) throw new Error([
+        `Refusing: this host cannot drive ${surfaceWords(project.proofSurface)}. ${project.name} proof comes from the owner: send him the test build and what to check, and his Works tap is the proof record.`,
+        `firstmate_deliveries action=device-proof id=${r.id} commitSha=${(r.headSha ?? "").slice(0,7)} build="<build id>" link="<TestFlight or OTA link>" check="<what the owner checks>" (CLI: bb firstmate deliveries device-proof ${r.id} --commit ${(r.headSha ?? "").slice(0,7)} --build <id> --link <link> --check "<what to check>").`,
+      ].join("\n"));
+      await requirePipelineProof(live);
+      return [deliveries.verify(r.id,owner,input.commitSha ?? "",{ driven:input.driven ?? "",seen:input.seen ?? "",...(input.surface ? { surface:input.surface } : {}) },crew.id)];
     }
     if (r.owner !== owner) throw new Error("Only the owning manager can reconcile or dispose this deliverable. Use explicit assignment first.");
     if (input.action === "abandon") {
@@ -7931,6 +7981,79 @@ export default async function plugin(bb: BbPluginApi) {
     await reconcileDelivery(r,asRecord(ctx)["signal"] as AbortSignal | undefined);
     await notifyDelivery(deliveries.get(r.id)!);
     return [deliveries.get(r.id)!];
+  }
+
+  // Owner decision Q5: a device proof card and a release read-back answer in words, not as delivery rows.
+  type DeviceProof = { captain: string; pr: string; head: string; build: string; crewId: string; surface: string };
+  const DEVICE_PROOF_PREFIX = "device-proof:";
+  async function deliveryNotice(input: z.infer<typeof deliveryParams>, ctx: unknown): Promise<string | null> {
+    if (input.action !== "device-proof" && input.action !== "release") return null;
+    const caller = ctxString(ctx, "threadId");
+    const crew = caller ? await findCrewByThread(caller) : undefined;
+    if (input.action === "release") {
+      if (crew === undefined || !crew.parentThreadId) throw new Error("Refusing: only a crew records a release read-back. The crew that shipped the build reads its groups from App Store Connect or EAS and records what it read.");
+      const task = input.task === undefined ? undefined : ownerTasks.get(input.task);
+      if (task === undefined || task.captain !== crew.parentThreadId) throw new Error(`release needs task: the owner task T<n> of captain ${crew.parentThreadId} that this build ships.`);
+      const rule = projectForName(task.project) ?? projectForName(await projectLabel(crew.projectId));
+      if (rule?.release === undefined) throw new Error(`Refusing: ${task.project ?? "this project"} has no release rule in owner/projects.json, so there is no group to read back.`);
+      const build = input.build?.trim() ?? "", group = input.group?.trim() ?? "", seen = input.seen?.trim() ?? "";
+      if (build === "" || seen === "" || input.source === undefined) throw new Error("A release read-back needs build, group, source (app-store-connect or eas) and seen (what it showed).");
+      if (group.toLowerCase() !== rule.release.group.toLowerCase()) throw new Error(`Refusing: ${rule.name} builds must be in the "${rule.release.group}" public-link group, not "${group}". Add build ${build} to "${rule.release.group}", read it back from App Store Connect or EAS, then record it again.`);
+      const recorded = releaseReadbacks.record({ task: task.id, captain: task.captain, crewId: crew.id, project: rule.name, build, group: rule.release.group, source: input.source as ReleaseSource, seen, at: Date.now() });
+      return `Release read-back recorded for ${task.id}: build ${recorded.build} in "${recorded.group}" (read from ${recorded.source === "eas" ? "EAS" : "App Store Connect"}: ${recorded.seen}).`;
+    }
+    const id = input.id ?? (input.url ? canonicalPr(input.url).id : "");
+    const r = deliveries.get(id);
+    if (r === undefined) throw new Error(`Unknown deliverable ${id || "(none)"}. Pass id (owner/repo#number) or url (the PR link).`);
+    if (crew === undefined || crew.projectId !== r.projectId) throw new Error(`Refusing: only a crew on this project opens a device proof card for ${r.id}.`);
+    const project = projectForRepo(r.repository);
+    if (project === undefined) throw new Error(`Refusing: no project in owner/projects.json lists ${r.repository}, so it has no device surface. Drive the change yourself and record it with action=verify.`);
+    if (hostCanDrive(project.proofSurface)) throw new Error(`Refusing: this host can drive ${surfaceWords(project.proofSurface)} itself. Drive it and record what you drove and saw with action=verify surface=${project.proofSurface}.`);
+    const head = r.headSha ?? "", given = (input.commitSha ?? "").trim().toLowerCase();
+    if (head === "" || given.length < 7 || !head.toLowerCase().startsWith(given)) throw new Error(`Commit ${input.commitSha ?? "(none)"} does not match the current head ${head.slice(0, 7)} of ${r.id}; pass at least its first 7 characters.`);
+    if (r.forgeState !== "open") throw new Error(`${r.id} is not an open PR; a device proof card covers an open PR's head.`);
+    const build = input.build?.trim() ?? "", link = input.link?.trim() ?? "", check = input.check?.trim() ?? "";
+    if (build === "" || link === "" || check === "") throw new Error("A device proof card needs build (the build id), link (the TestFlight or OTA link) and check (what the owner checks).");
+    const captain = r.owner ?? crew.parentThreadId ?? "";
+    if (captain === "") throw new Error(`${r.id} has no captain to show the card to.`);
+    const device = project.proofSurface === "iphone" ? "your iPhone" : surfaceWords(project.proofSurface);
+    const ask = ownerAsks.create({
+      captain, kind: "approval", text: `${project.name}: does build ${build} work on ${device}? ${clip(check, 300)}`,
+      impact: `Test build ${build}: ${link}`, options: [{ label: "Works", value: "works" }, { label: "Does not work", value: "broken" }],
+      irreversible: true, sourceRef: `proof:${r.id}:${head}`, createdAt: Date.now(),
+    });
+    const proof: DeviceProof = { captain, pr: r.id, head, build, crewId: crew.id, surface: project.proofSurface };
+    await bb.storage.kv.set(`${DEVICE_PROOF_PREFIX}${ask.id}`, proof);
+    const task = ownerTasks.list(captain).find((item) => item.crewIds.includes(crew.id) || item.prs.includes(r.id));
+    const warning = await sendAskCard(ask, { project: project.name, ...(task !== undefined ? { task: task.id } : {}) });
+    await refreshOwnerBoard();
+    return [
+      `Device proof card ${ask.id} is open for ${r.id} at ${head.slice(0, 7)}: build ${build}. The owner's Works tap records the proof; you are told when he answers. Do not record verification yourself.`,
+      ...(warning !== "" ? [`Warning: the card was not sent to Telegram (${warning}); it stays on the owner's board.`] : []),
+    ].join("\n");
+  }
+
+  /** The owner answered an ask by tap or reply. A device proof card's Works records his proof. */
+  async function ownerAnsweredAsk(askId: string, resolution: string): Promise<void> {
+    const proof = await bb.storage.kv.get<DeviceProof>(`${DEVICE_PROOF_PREFIX}${askId}`);
+    if (proof === undefined) return;
+    await bb.storage.kv.delete(`${DEVICE_PROOF_PREFIX}${askId}`);
+    const crew = await findCrew(proof.crewId);
+    const works = /^works\b/i.test(resolution.trim());
+    let note: string;
+    if (works) {
+      try {
+        deliveries.verify(proof.pr, OWNER_ACTOR, proof.head, { driven: `the owner tested build ${proof.build} on ${surfaceWords(proof.surface as never)}`, seen: "Works", surface: proof.surface, build: proof.build });
+        note = `The owner tapped Works for build ${proof.build}: proof is recorded for ${proof.pr} at ${proof.head.slice(0, 7)}.`;
+      } catch (error) {
+        note = `The owner tapped Works for build ${proof.build}, but no proof was recorded for ${proof.pr}: ${error instanceof Error ? error.message : String(error)} Open a new device proof card for the current head.`;
+      }
+    } else {
+      note = `The owner says build ${proof.build} does not work on the owner's iPhone (his answer: "${clip(resolution, 200)}"). No proof is recorded for ${proof.pr}. Find out why, fix it, and open a new device proof card for the new build.`;
+    }
+    bb.log.info(`device proof ${askId} ${proof.pr}@${proof.head.slice(0, 7)} build=${proof.build}: ${works ? "works" : "does not work"}`);
+    if (crew !== undefined) await tellCrew(crew, note, false, true).catch((error) => bb.log.warn(`device proof note to crew ${crew.id}: ${String(error)}`));
+    await deliverToCaptain(proof.captain, note, proof.crewId).catch((error) => bb.log.warn(`device proof note to captain: ${String(error)}`));
   }
 
   async function rememberPrUrl(crew: Crew, url: string,signal?:AbortSignal): Promise<void> {
@@ -8088,35 +8211,56 @@ export default async function plugin(bb: BbPluginApi) {
   // message. A merge needs a verification record for the PR's current head, read fresh
   // from GitHub, or the owner's own words waiving it. Returns the waiver line and records
   // the waiver once the merge goes through.
-  function requireVerification(t: MergeTarget, waiver: string | undefined, actor: string): { note: string; record: () => void } {
+  function requireVerification(t: MergeTarget, waiver: string | undefined, actor: string, reach: { reach: Reach; why: string }): { note: string; record: () => void } {
     const short = (sha: string) => sha.slice(0, 7);
     if (t.headSha === "") throw new Error(`Refusing: cannot read the current head of #${t.number} on GitHub, so its verification record cannot be checked; nothing was merged. Retry when GitHub answers.`);
     const head = t.headSha;
     const row = deliveries.get(prKeyOf(t.url) ?? "");
-    if (row !== undefined && row.verifiedCommitSha === head) return { note: "", record: () => {} };
+    const id = row?.id ?? prKeyOf(t.url) ?? t.url;
+    const production = reach.reach === "production";
+    const project = projectForRepo(prRepoOf(t.url));
+    const how = [
+      "CI and unit tests are not verification. The crew drives the changed surface (the project's verify skill if it has one), then records what it drove and saw:",
+      `${row === undefined ? `firstmate_deliveries action=register url=${t.url}, then ` : ""}firstmate_deliveries action=verify id=${id} commitSha=${short(head)}${project ? ` surface=${project.proofSurface}` : ""} driven="<what you drove>" seen="<what you saw>" (CLI: bb firstmate deliveries verify ${id} --commit ${short(head)}${project ? ` --surface ${project.proofSurface}` : ""} --driven "<what you drove>" --seen "<what you saw>").`,
+      ...(project && !hostCanDrive(project.proofSurface) ? [`This host cannot drive ${surfaceWords(project.proofSurface)}: the crew opens a device proof card (firstmate_deliveries action=device-proof) and the owner's Works tap is the proof.`] : []),
+    ];
     const words = (waiver ?? "").trim();
+    // Owner decision Q6: a production PR merges only on proof a crew (or the owner's tap) recorded at this head.
+    if (production && words !== "") throw new Error([`Refusing: #${t.number} reaches production (${reach.why}); the owner's words cannot waive proof for a production PR. Nothing was merged.`, ...how].join("\n"));
+    if (row !== undefined && row.verifiedCommitSha === head) {
+      if (!production) return { note: "", record: () => {} };
+      if (verifiedBy(row) === "captain") throw new Error([`Refusing: #${t.number}'s verification record was made by the captain, not by a crew; nothing was merged.`, ...how].join("\n"));
+      const wrong = surfaceRefusal(project, row.verification?.surface);
+      if (wrong !== null) throw new Error([`Refusing: ${wrong} The record for head ${short(head)} does not say it came from there; nothing was merged.`, ...how].join("\n"));
+      return { note: "", record: () => {} };
+    }
     if (words !== "") {
       if (words.split(/\s+/).length < 3) throw new Error(`Refusing: allowUnverified must be the owner's own words, quoted as they said them (three words or more), not ${JSON.stringify(words)}. Nothing was merged.`);
       return { note: `\nNot verified: the owner waived verification for head ${short(head)} in these words: "${words}"`,
         record: () => { if (row !== undefined) deliveries.waive(row.id, actor, words, head); } };
     }
-    const missing = row === undefined
-      ? `#${t.number} has no verification record: no delivery row tracks it, so nothing records evidence for head ${short(head)}; nothing was merged.`
-      : row.verifiedCommitSha !== null
-        ? `#${t.number}'s verification record covers ${short(row.verifiedCommitSha)}, not its current head ${short(head)}; nothing was merged.`
-        : `#${t.number} has no verification record for its current head ${short(head)}; nothing was merged.`;
-    const id = row?.id ?? prKeyOf(t.url) ?? t.url;
+    const missing = production
+      ? `#${t.number} reaches production (${reach.why}) and has no proof a crew or the owner recorded for its current head ${short(head)}; nothing was merged.`
+      : row === undefined
+        ? `#${t.number} has no verification record: no delivery row tracks it, so nothing records evidence for head ${short(head)}; nothing was merged.`
+        : row.verifiedCommitSha !== null
+          ? `#${t.number}'s verification record covers ${short(row.verifiedCommitSha)}, not its current head ${short(head)}; nothing was merged.`
+          : `#${t.number} has no verification record for its current head ${short(head)}; nothing was merged.`;
     throw new Error([
       `Refusing: ${missing}`,
-      "CI and unit tests are not verification. Drive the changed surface (the project's verify skill if it has one), then record what you drove and saw:",
-      `${row === undefined ? `firstmate_deliveries action=register url=${t.url}, then ` : ""}firstmate_deliveries action=verify id=${id} commitSha=${short(head)} driven="<what you drove>" seen="<what you saw>" (CLI: bb firstmate deliveries verify ${id} --commit ${short(head)} --driven "<what you drove>" --seen "<what you saw>").`,
-      `Or, only if the owner waived verification in words: firstmate_merge allowUnverified="<the owner's own words>" (CLI: --allow-unverified "<the owner's own words>").`,
+      ...how,
+      ...(production ? [] : [`Or, only if the owner waived verification in words: firstmate_merge allowUnverified="<the owner's own words>" (CLI: --allow-unverified "<the owner's own words>").`]),
     ].join("\n"));
   }
 
-  async function checkerPreview(t: MergeTarget, crew: Crew, hostId: string | null): Promise<{ line: string; refusal: string | null }> {
+  async function prReach(t: MergeTarget, hostId: string | null): Promise<{ reach: Reach; why: string }> {
+    const repo = /github\.com\/([^/]+\/[^/]+)\/pull\//.exec(t.url)?.[1] ?? t.url;
+    return changeReach({ repo, ...(await ghPrFiles(hostId, t.url)) });
+  }
+
+  async function checkerPreview(t: MergeTarget, crew: Crew, reach: { reach: Reach; why: string }): Promise<{ line: string; refusal: string | null }> {
     try {
-      const line = await requireChecker(t, crew, hostId);
+      const line = await requireChecker(t, crew, reach);
       return { line: line === "" ? "not needed: an internal change" : line.trim(), refusal: null };
     } catch (error) {
       const refusal = (error instanceof Error ? error.message : String(error)).split("\n")[0]!;
@@ -8141,10 +8285,8 @@ export default async function plugin(bb: BbPluginApi) {
   // from its repo and changed files) merges only with a pass verdict, at its current head,
   // from a checker crew that is not the builder and runs another model. Returns the line
   // the merge result shows, or "" for an internal PR.
-  async function requireChecker(t: MergeTarget, crew: Crew, hostId: string | null): Promise<string> {
+  async function requireChecker(t: MergeTarget, crew: Crew, reach: { reach: Reach; why: string }): Promise<string> {
     const short = (sha: string) => sha.slice(0, 7);
-    const repo = /github\.com\/([^/]+\/[^/]+)\/pull\//.exec(t.url)?.[1] ?? t.url;
-    const reach = changeReach({ repo, ...(await ghPrFiles(hostId, t.url)) });
     if (reach.reach === "internal") return "";
     const check = deliveries.get(prKeyOf(t.url) ?? "")?.check ?? null;
     if (check === null || t.headSha === "" || check.commitSha !== t.headSha) {
@@ -8352,7 +8494,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (yes) throw new Error(message);
       reasons.push(message);
     };
-    const preview = (pr: MergeTarget | null, checks: CheckView | null, checker: { line: string; refusal: string | null } | null = null): string => {
+    const preview = (pr: MergeTarget | null, checks: CheckView | null, checker: { line: string; refusal: string | null } | null = null, reach: { reach: Reach; why: string } = { reach: "production", why: "its reach was not read" }): string => {
       const flags = [pr !== null ? `--pr ${pr.number}` : "", opts.keepCrew === true ? "--keep-crew" : "", opts.overrideOwner === true ? "--override-owner" : "",
         allowRedCheck?.trim() ? `--allow-red ${shQuote(allowRedCheck.trim())}` : "", allowMissingCheck?.trim() ? `--allow-missing ${shQuote(allowMissingCheck.trim())}` : "",
         opts.allowUnverified?.trim() ? `--allow-unverified ${shQuote(opts.allowUnverified.trim())}` : "", "--yes"].filter(Boolean).join(" ");
@@ -8366,7 +8508,7 @@ export default async function plugin(bb: BbPluginApi) {
           : row?.verifiedCommitSha ? `covers ${row.verifiedCommitSha.slice(0, 7)}, not the current head; the merge will refuse` : "none for the current head; the merge will refuse";
         lines.push(`PR: #${pr.number}${pr.title ? ` ${pr.title}` : ""} ${pr.url} (${pr.state})`, `Head: ${pr.headSha || "could not be read"}`, `Checks: ${checks?.line ?? "could not be read"}`, `Verification record: ${record}`);
         if (pr.state !== "merged") {
-          try { requireVerification(pr, opts.allowUnverified, ""); } catch (error) {
+          try { requireVerification(pr, opts.allowUnverified, "", reach); } catch (error) {
             reasons.push((error instanceof Error ? error.message : String(error)).split("\n")[0]!);
             const sha = pr.headSha.slice(0, 7);
             if (sha !== "") steps.push(`Drive the changed surface at head ${sha}, then record what you drove and saw: ${row === undefined ? `bb firstmate deliveries register --url ${pr.url}, then ` : ""}bb firstmate deliveries verify ${row?.id ?? prKeyOf(pr.url) ?? pr.url} --commit ${sha} --driven "<what you drove>" --seen "<what you saw>"`);
@@ -8427,13 +8569,14 @@ export default async function plugin(bb: BbPluginApi) {
       const foreign = await foreignPrRefusal(crew, pr.url, override,opts.caller, pr.headSha);
       ownership ||= foreign !== null;
       refuse(foreign);
-      if (!yes) return preview(pr, await checkSummary(hostId, pr.url), await checkerPreview(pr, crew, hostId));
+      const reach = await prReach(pr, hostId);
+      if (!yes) return preview(pr, await checkSummary(hostId, pr.url), await checkerPreview(pr, crew, reach), reach);
       let waived = "";
       let checked = "";
       if (pr.state !== "merged") {
-        const verification = requireVerification(pr, opts.allowUnverified, opts.caller ?? crew.parentThreadId ?? "");
+        const verification = requireVerification(pr, opts.allowUnverified, opts.caller ?? crew.parentThreadId ?? "", reach);
         waived = verification.note;
-        checked = await requireChecker(pr, crew, hostId);
+        checked = await requireChecker(pr, crew, reach);
         const args = [crew.id, pr.url];
         if (allowRedCheck?.trim()) args.push("--allow-red", allowRedCheck.trim());
         if (allowMissingCheck?.trim()) args.push("--allow-missing", allowMissingCheck.trim());
@@ -8489,19 +8632,20 @@ export default async function plugin(bb: BbPluginApi) {
     refuse(foreign);
     const fresh = target ?? { url: f.url, number: Number(/\/pull\/(\d+)/.exec(f.url)?.[1]), title: f.title, state: f.state, source: "environment",
       headSha: hostId === null ? "" : (await ghPrIdentity(hostId, f.url))?.headSha ?? "" };
+    const reach = await prReach(fresh, hostId);
     if (!yes) {
       const waive = (allowRedCheck ?? "").trim();
       return preview(fresh, { line: hostId === null ? `${f.checksState}: ${f.passed} passing, ${f.failed} failing, ${f.pending} pending` : (await checkSummary(hostId, f.url)).line,
         checksState: f.checksState, failed: f.failed, pending: f.pending, mergeable: f.mergeable, redChecks: waive !== "" && f.checksState === "failing" ? await redCheckNames(crew, f.url) : null },
-        await checkerPreview(fresh, crew, hostId));
+        await checkerPreview(fresh, crew, reach), reach);
     }
     if (f.state === "merged") {
       await settle("merged (already landed)", f.url);
       return `Already merged: ${landedLine}\n${keep ? kept : `Crew ${crew.id} retired.`}`;
     }
-    const verification = requireVerification(fresh, opts.allowUnverified, opts.caller ?? crew.parentThreadId ?? "");
+    const verification = requireVerification(fresh, opts.allowUnverified, opts.caller ?? crew.parentThreadId ?? "", reach);
     const unverified = verification.note;
-    const checked = await requireChecker(fresh, crew, hostId);
+    const checked = await requireChecker(fresh, crew, reach);
     f = await prepareEnvironmentPullRequest(envId);
     const waive = (allowRedCheck ?? "").trim();
     const redChecks = waive !== "" && f.checksState === "failing" ? await redCheckNames(crew, f.url) : null;
@@ -12323,25 +12467,7 @@ export default async function plugin(bb: BbPluginApi) {
       if ((await reliabilityFlags()).telegramThreading !== "on") {
         return `${done}\nWarning: not sent to Telegram because telegramThreading is off. Put the question in your final message too.`;
       }
-      let warning = "";
-      try {
-        const sent = z.object({ queued: z.number(), duplicate: z.boolean() }).parse(await bb.sdk.plugins.callRpc({
-          pluginId: TELEGRAM_BRIDGE_PLUGIN_ID,
-          method: "ask",
-          input: {
-            askId: ask.id, text: formatAskCard(ask), options: ask.options, ...(ask.recommended !== null ? { recommended: ask.recommended } : {}),
-            // The connector folds reversible cards sent within a minute into one message with "Accept all recommended".
-            card: { kind: ask.kind, question: ask.text, ...(ask.impact ? { impact: ask.impact } : {}), defaultAt: ask.defaultAt, gated },
-            // With Telegram topics on the card goes to its project's topic; without it the connector asks Decisions.
-            ...(project?.trim() ? { project: project.trim() } : {}),
-            ...(cardTask !== undefined ? { task: cardTask } : {}),
-          },
-          outputSchema: z.object({ queued: z.number(), duplicate: z.boolean() }),
-        }));
-        if (sent.queued <= 0 && !sent.duplicate) warning = "the Telegram connector queued nothing";
-      } catch (error) {
-        warning = error instanceof Error ? error.message : String(error);
-      }
+      const warning = await sendAskCard(ask, { ...(project !== undefined ? { project } : {}), ...(cardTask !== undefined ? { task: cardTask } : {}) });
       await refreshOwnerBoard();
       return warning === ""
         ? `Question card ${ask.id} sent. ${done}`
@@ -12361,6 +12487,9 @@ export default async function plugin(bb: BbPluginApi) {
     async execute({ id, resolution, cancelled, reopen }, ctx) {
       const captain = ctxString(ctx, "threadId");
       if (!captain) return toolError("firstmate_resolve_ask runs only in a captain thread.");
+      if (cancelled !== true && reopen !== true && await bb.storage.kv.get(`${DEVICE_PROOF_PREFIX}${id}`) !== undefined) {
+        return toolError(`Refusing: ask ${id} is a device proof card, and only the owner's tap answers a device proof card. His Works is the proof record; cancel it with cancelled=true if the build is replaced.`);
+      }
       const closed = ownerAsks.resolve(id, captain, reopen === true ? "open" : cancelled === true ? "cancelled" : "answered", resolution, Date.now());
       if (!closed) return toolError(`No ask ${id} for this captain.`);
       let warning = "";
@@ -12995,8 +13124,8 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  registerCaptainTool({ name:"firstmate_deliveries",description:"Durable PR health and obligations independent of worker retention. List, inspect, register, reconcile, account each independent failure to an existing authorized follow-up, explicitly assign, abandon with authority, clear-hold after checking commits pushed since a do-not-merge verdict (reason required), or verify: record what was driven on the real changed surface (driven) and what was seen (seen) at commitSha. A crew that drove the change may record it.",parameters:deliveryParams,
-    async execute(input,ctx) { return (await deliveryOperation(input,ctx)).map(deliveryLine).join("\n") || "No unresolved deliverables."; } });
+  registerCaptainTool({ name:"firstmate_deliveries",description:"Durable PR health and obligations independent of worker retention. List, inspect, register, reconcile, account each independent failure to an existing authorized follow-up, explicitly assign, abandon with authority, clear-hold after checking commits pushed since a do-not-merge verdict (reason required), or verify: record what was driven on the real changed surface (driven) and what was seen (seen) at commitSha. Only a crew records verification, from the project's proof surface (surface). When this host cannot drive that surface, the crew opens a device-proof card (build, link, check) and the owner's Works tap is the proof. release: a crew records its read-back of an app build's TestFlight group (task, build, group, source, seen).",parameters:deliveryParams,
+    async execute(input,ctx) { const notice=await deliveryNotice(input,ctx); if (notice !== null) return notice; return (await deliveryOperation(input,ctx)).map(deliveryLine).join("\n") || "No unresolved deliverables."; } });
 
   registerCaptainTool({
     name: "firstmate_promote",
@@ -13558,6 +13687,7 @@ export default async function plugin(bb: BbPluginApi) {
     async resolveAsk({ threadId, id, resolution }) {
       if (!(await isCaptainThread(threadId))) return { ok: false };
       const ok = ownerAsks.resolve(id, threadId, "answered", resolution, Date.now()) !== undefined;
+      if (ok) await ownerAnsweredAsk(id, resolution);
       if (ok) await refreshOwnerBoard();
       return { ok };
     },
@@ -14151,7 +14281,7 @@ export default async function plugin(bb: BbPluginApi) {
       const header = parseConnectorHeader(message);
       if (header && !header.forwarded && header.sourceEventId?.startsWith("pack:")) {
         for (const { id, answer } of packAnswers(header.body)) {
-          if (ownerAsks.get(id)?.state === "open" && ownerAsks.resolve(id, captainThreadId, "answered", answer, Date.now())) answered++;
+          if (ownerAsks.get(id)?.state === "open" && ownerAsks.resolve(id, captainThreadId, "answered", answer, Date.now())) { answered++; await ownerAnsweredAsk(id, answer); }
         }
         continue;
       }
@@ -14159,7 +14289,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (!header || header.forwarded || id === null) continue;
       const ask = ownerAsks.get(id);
       const answer = ask ? askLetterAnswer(ask, header.body) : null;
-      if (ask?.state === "open" && answer !== null && ownerAsks.resolve(id, captainThreadId, "answered", answer, Date.now())) answered++;
+      if (ask?.state === "open" && answer !== null && ownerAsks.resolve(id, captainThreadId, "answered", answer, Date.now())) { answered++; await ownerAnsweredAsk(id, answer); }
     }
     if (answered > 0) await refreshOwnerBoard();
   }
@@ -15096,7 +15226,10 @@ export default async function plugin(bb: BbPluginApi) {
           case "deliveries": {
             const input=deliveryParams.parse({ action:rest[0] ?? "list",id:rest[1],crewId:flagStr(flags,"crew"),url:flagStr(flags,"url"),from:flagStr(flags,"from") === "none" ? null : flagStr(flags,"from"),
               failureId:flagStr(flags,"failure"),scope:flagStr(flags,"scope"),followUpTask:flagStr(flags,"follow-up-task"),requirement:flagStr(flags,"requirement"),reason:flagStr(flags,"reason"),commitSha:flagStr(flags,"commit"),driven:flagStr(flags,"driven"),seen:flagStr(flags,"seen"),verdict:flagStr(flags,"verdict"),notes:flagStr(flags,"notes"),findings:flagStr(flags,"findings") === undefined ? undefined : Number(flagStr(flags,"findings")),authorized:flags.has("authorized"),all:flags.has("all"),
+              surface:flagStr(flags,"surface"),build:flagStr(flags,"build"),link:flagStr(flags,"link"),check:flagStr(flags,"check"),task:flagStr(flags,"task"),group:flagStr(flags,"group"),source:flagStr(flags,"source"),
               limit:flagStr(flags,"limit") ? Number(flagStr(flags,"limit")) : undefined,offset:flagStr(flags,"offset") ? Number(flagStr(flags,"offset")) : undefined });
+            const notice=await deliveryNotice(input,ctx);
+            if (notice !== null) return reply({ action:input.action, text:notice },notice);
             const rows=await deliveryOperation(input,ctx);
             return reply(rows,rows.map(deliveryLine).join("\n") || "No unresolved deliverables.");
           }

@@ -531,13 +531,19 @@ test('durable launch orphan discovery preserves native task mode before author c
   assert.equal(host.harness.sdk.callsTo('threads.spawn').length,0);assert.equal(host.harness.sdk.callsTo('environments.mergePullRequest').length,0);
  }finally{await host.harness.lifecycle.dispose();}
 });
-test('a captain records merge verification by PR link for a crew it owns in another project',async()=>{
+// Owner decision Q6 (17 Oct): the captain never records verification for itself; its crew in that project does.
+test('a crew records merge verification by PR link in another project of its captain; the captain itself is refused',async()=>{
  const host=await base();try {
   const store=createDeliveries(host.bb.storage.database());
   const merged=(url,projectId)=>{const r=store.register({url,taskId:'t1',projectId,owner:'thr_cap',home:'',worker:'thr_c1',requirement:'merged-and-verified'});
    return store.observe(r.id,{headSha:'h1',state:'merged',draft:false,checks:'passing',review:'approved',mergeable:'unknown',reviewHeadSha:null,mergeCommitSha:'merge1'},true);};
   assert.equal(merged('https://github.com/Acme/Other/pull/293','proj_other').status,'merged-needs-verification');
-  const out=await tool(host,'firstmate_deliveries').execute({action:'verify',url:'https://github.com/Acme/Other/pull/293',commitSha:'merge1',driven:'opened the live page after deploy',seen:'the new total'},ctx);
+  const input={action:'verify',url:'https://github.com/Acme/Other/pull/293',commitSha:'merge1',driven:'opened the live page after deploy',seen:'the new total'};
+  const captain=await tool(host,'firstmate_deliveries').execute(input,ctx);
+  assert.match(typeof captain==="string"?captain:JSON.stringify(captain),/Refusing: only a crew records verification/);
+  await host.bb.storage.kv.set('crews',[{id:'t1',task:'x',projectId:'proj_other',threadId:'thr_c1',parentThreadId:'thr_cap',nativeHome:'',worktree:true,shape:'ship',posture:'direct-PR',createdAt:'2026-10-17T00:00:00.000Z',providerId:null,model:null,reasoningLevel:null}]);
+  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:threadId==='thr_c1'?'proj_other':'proj_1',status:'active',environmentId:'env_wt'}));
+  const out=await tool(host,'firstmate_deliveries').execute(input,{threadId:'thr_c1',projectId:'proj_other'});
   assert.match(typeof out==="string"?out:JSON.stringify(out),/acme\/other#293 \[complete\]/);
   assert.equal(store.get('acme/other#293').verifiedCommitSha,'merge1');
   merged('https://github.com/acme/other/pull/294','proj_other');

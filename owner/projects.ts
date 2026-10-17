@@ -61,3 +61,17 @@ export function surfaceRefusal(project: ProjectRule | undefined, given: string |
   if (given.trim().toLowerCase() !== want) return `${project.name} proof must come from ${surfaceWords(want, table)} (surface ${want}), not ${given.trim()}. Proof from another surface does not count.`;
   return null;
 }
+
+/** The lines a ship crew's brief carries for its project: where its proof must come from, and its release read-back. */
+export function projectBriefLines(project: ProjectRule | undefined, table: ProjectTable = PROJECTS): string[] {
+  if (project === undefined) return [];
+  const surface = project.proofSurface;
+  const lines = [`### Proof surface (${project.name})`, `Proof for ${project.name} comes from ${surfaceWords(surface, table)} (surface ${surface}). Record verification with \`--surface ${surface}\`; proof from another surface is refused.`];
+  if (!hostCanDrive(surface, table)) {
+    lines.push(`This host cannot drive ${surfaceWords(surface, table)}. When the PR is open and its test build is out, send the owner the build and what to check: \`bb firstmate deliveries device-proof <owner/repo#n> --commit <head> --build <id> --link <TestFlight or OTA link> --check "<what to check>"\`. His Works tap is the proof record. Do not record verification yourself, and do not report the change proven before he taps Works.`);
+  }
+  if (project.release !== undefined) {
+    lines.push(`Releases: every ${project.name} build goes to the "${project.release.group}" TestFlight public-link group. Read the build's groups back from App Store Connect or EAS and record what you read: \`bb firstmate deliveries release --task T<n> --build <id> --group "${project.release.group}" --source app-store-connect|eas --seen "<what it showed>"\`. A release is done only with that read-back.`);
+  }
+  return lines;
+}

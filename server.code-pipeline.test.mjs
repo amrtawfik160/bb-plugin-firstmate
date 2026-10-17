@@ -74,7 +74,8 @@ async function deck({report=PROVEN,crews=CREWS,files={},output='DONE: PR open'}=
 const tool=(host,name)=>host.harness.inspection.registrations.agentTools.find(t=>t.name===name);
 const text=out=>typeof out==='string'?out:out?.content?.[0]?.text ?? JSON.stringify(out);
 const merges=commands=>commands.filter(c=>c.includes('fm-pr-merge.sh'));
-const verify=(host,n,as='thr_cap')=>tool(host,'firstmate_deliveries').execute({action:'verify',id:id(n),commitSha:head(n).slice(0,7),driven:'a message to the staging bot across a restart',seen:'it was answered'},{threadId:as,projectId:'proj_1'});
+// Owner decisions Q5 and Q6: the crew records verification, from the project's proof surface (Cyndra: the web page).
+const verify=(host,n,as='thr_crew')=>tool(host,'firstmate_deliveries').execute({action:'verify',id:id(n),commitSha:head(n).slice(0,7),driven:'a message to the staging bot across a restart',seen:'it was answered',surface:'web'},{threadId:as,projectId:'proj_1'});
 const check=(host,n,as,verdict='pass',findings)=>tool(host,'firstmate_deliveries').execute({action:'check',id:id(n),commitSha:head(n).slice(0,7),verdict,findings,notes:'read the diff; drove a restart on staging; the message was answered'},{threadId:as,projectId:'proj_1'});
 
 test('verify refuses a bug-fix PR whose crew report has no proof step, and records it once the report has one',async()=>{

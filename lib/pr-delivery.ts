@@ -27,8 +27,10 @@ export interface DeliveryRecord {
   heldHead?: string | null;
   /** The owner's own words that waived verification for one merge of this head. */
   unverifiedMerge?: { words: string; actor: string; headSha: string; at: number } | null;
-  /** What was driven on the real changed surface at commitSha, and what was seen. crewId names the crew that recorded it. */
-  verification?: { crewId: string | null; actor: string; commitSha: string; driven: string; seen: string; at: number } | null;
+  /** What was driven on the real changed surface at commitSha, and what was seen. crewId names the crew that recorded it;
+   * actor "owner" with no crew is the owner's Works tap on a device proof card. surface is where the proof came from
+   * (owner/projects.json), build the app build the owner tested. */
+  verification?: { crewId: string | null; actor: string; commitSha: string; driven: string; seen: string; at: number; surface?: string; build?: string } | null;
   /** The last checker crew's verdict on this PR at commitSha, with the model it ran on. */
   check?: CheckVerdict | null;
   updatedAt: number;
@@ -42,6 +44,15 @@ export interface ForgeObservation {
   title?:string; openedAt?:number; touchedAt?:number;
   /** A do-not-merge verdict that applies to the current head, quoted; null when none. */
   hold?:string|null;
+}
+/** The actor of a verification record the owner made by tapping Works on a device proof card. */
+export const OWNER_ACTOR = 'owner';
+/** Who recorded a verification: a crew, the owner's tap, or the captain (which a production merge does not accept). */
+export function verifiedBy(r: Pick<DeliveryRecord,'verification'>): 'crew' | 'owner' | 'captain' | null {
+  const v = r.verification;
+  if (!v) return null;
+  if (v.crewId) return 'crew';
+  return v.actor === OWNER_ACTOR ? 'owner' : 'captain';
 }
 export function canonicalPr(url: string) {
   const m = /^https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)(?:[/?#].*)?$/.exec(url.trim());
@@ -360,9 +371,9 @@ export function createDeliveries(db: Database) {
    * verified at its current head; a merged one at its merge commit. The commit may be a hex
    * prefix of 7 or more characters; the record keeps the full SHA. The owning manager
    * records it, or a crew the caller vouched for (crewId). */
-  function verify(id:string, actor:string, commitSha:string, evidence:{driven:string; seen:string}, crewId:string|null=null) {
+  function verify(id:string, actor:string, commitSha:string, evidence:{driven:string; seen:string; surface?:string; build?:string}, crewId:string|null=null) {
     const r=get(id); if (!r) throw new Error(`Unknown deliverable ${id}`);
-    if (crewId === null && r.owner !== actor) throw new Error(`Only the owning manager can verify ${r.id}`);
+    if (crewId === null && r.owner !== actor && actor !== OWNER_ACTOR) throw new Error(`Only the owning manager can verify ${r.id}`);
     const merged=r.status === 'merged-needs-verification' || r.status === 'merged-unverified';
     const openPr=!merged && !terminal(r) && r.forgeState === 'open';
     if (!merged && !openPr) throw new Error(`${r.id} is ${r.status}, not merged-needs-verification`);
@@ -374,7 +385,8 @@ export function createDeliveries(db: Database) {
     const driven=typeof evidence?.driven === 'string' ? evidence.driven.trim() : '', seen=typeof evidence?.seen === 'string' ? evidence.seen.trim() : '';
     if (!driven || !seen) throw new Error(`Verifying ${r.id} needs driven (what you drove on the real changed surface) and seen (what you saw). CI and unit tests are not verification.`);
     const at=Date.now(), sha=(openPr ? r.headSha : r.mergeCommitSha)!;
-    const verification={ crewId, actor, commitSha:sha, driven, seen, at };
+    const surface=evidence.surface?.trim(), build=evidence.build?.trim();
+    const verification={ crewId, actor, commitSha:sha, driven, seen, at, ...(surface ? { surface } : {}), ...(build ? { build } : {}) };
     const disposition={ reason:`driven: ${driven}; seen: ${seen}`,actor,at };
     if (openPr) return save({ ...r, verifiedCommitSha:sha, verification, disposition, nextCheckAt:0, updatedAt:at });
     return save({ ...r, status:'complete', verifiedCommitSha:sha, verification, notification:{...r.notification,desired:null,attempted:null},disposition,blocker:'',nextAction:'Delivery contract satisfied',updatedAt:at });
