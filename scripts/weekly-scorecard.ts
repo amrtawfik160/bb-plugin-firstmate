@@ -78,10 +78,13 @@ function readTelegram(since: number, until: number): TelegramWeek {
     if (first.length === 0) return telegramWeek([], null, since, until);
     if (first[0]!.created_at > since) return telegramWeek([], first[0]!.created_at, since, until);
     const before = (offset: number) => { const [row] = rows(offset, 1); return row !== undefined && row.created_at < since; };
+    // The first row at or after `since`: row 0 when it is not before the week.
     let lo = 0;
-    let hi = 1;
-    while (before(hi)) { lo = hi; hi *= 2; }
-    while (lo + 1 < hi) { const mid = Math.floor((lo + hi) / 2); if (before(mid)) lo = mid; else hi = mid; }
+    let hi = first[0]!.created_at < since ? 1 : 0;
+    if (hi > 0) {
+      while (before(hi)) { lo = hi; hi *= 2; }
+      while (lo + 1 < hi) { const mid = Math.floor((lo + hi) / 2); if (before(mid)) lo = mid; else hi = mid; }
+    }
     const week: Row[] = [];
     let size = 20;
     for (let offset = hi; ;) {

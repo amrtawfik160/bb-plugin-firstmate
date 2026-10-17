@@ -143,3 +143,13 @@ test('a page the connector finds too large is read again in smaller pages', () =
   t.world.maxPage = 5;
   assert.match(t.run('--now', MONDAY), /Noise: 8 Telegram messages sent\. 2 not delivered\./);
 });
+
+test('a row created exactly at the start of the week is counted, also when it is row 0', () => {
+  const t = setup();
+  t.world.outbox = [{ created_at: at('2026-10-11T18:00:00.000Z'), state: 'sent' }, { created_at: at('2026-10-12T09:00:00.000Z'), state: 'sent' }];
+  assert.match(t.run('--now', MONDAY), /Noise: 2 Telegram messages sent\./);
+  t.world.outbox = [{ created_at: at('2026-10-11T18:00:00.000Z'), state: 'sent' }];
+  assert.match(t.run('--now', MONDAY), /Noise: 1 Telegram message sent\./);
+  t.world.outbox = [{ created_at: at('2026-10-10T00:00:00.000Z'), state: 'sent' }, { created_at: at('2026-10-11T18:00:00.000Z'), state: 'sent' }, { created_at: at('2026-10-12T09:00:00.000Z'), state: 'failed' }];
+  assert.match(t.run('--now', MONDAY), /Noise: 1 Telegram message sent\. 1 not delivered\./);
+});

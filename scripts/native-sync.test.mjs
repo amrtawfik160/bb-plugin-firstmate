@@ -36,7 +36,7 @@ if (a[0] === 'thread' && a[1] === 'spawn') {
   process.stdout.write(JSON.stringify({ id, status: 'active' })); process.exit(0);
 }
 if (a[0] === 'thread' && a[1] === 'list') { const spawned = entries().filter((e) => e.cmd === 'spawn').map((e) => ({ id: e.id, title: world.titles?.[e.id] ?? e.title, createdAt: e.at, visibility: 'visible', archivedAt: null })); const rows = a.includes('--archived') ? [] : [...spawned, ...(world.otherChildren ?? [])]; process.stdout.write(JSON.stringify(rows)); process.exit(0); }
-if (a[0] === 'thread' && a[1] === 'show') { const t = world.threads[a[2]]; if (!t) { process.stdout.write(JSON.stringify({ ok: false, error: { code: 'not_found' } })); process.exit(1); } process.stdout.write(JSON.stringify({ thread: { id: a[2], status: t.status, archivedAt: null } })); process.exit(0); }
+if (a[0] === 'thread' && a[1] === 'show') { if (world.showFails?.[a[2]]) { process.stdout.write(JSON.stringify({ ok: false, error: { code: 'gateway_error', message: 'HTTP 502' } })); process.exit(1); } const t = world.threads[a[2]]; if (!t) { process.stdout.write(JSON.stringify({ ok: false, error: { code: 'thread_not_found', message: 'HTTP 404: Thread not found' } })); process.exit(1); } process.stdout.write(JSON.stringify({ thread: { id: a[2], status: t.status, archivedAt: null } })); process.exit(0); }
 if (a[0] === 'thread' && a[1] === 'output') { process.stdout.write(JSON.stringify({ output: world.threads[a[2]]?.output ?? '' })); process.exit(0); }
 if (a[0] === 'thread' && a[1] === 'log') {
   if (world.logHangs) { setTimeout(() => {}, 60000); return; }
@@ -225,4 +225,26 @@ test('the run refuses to start without the repair thread and the project', () =>
   const r = spawnSync(process.execPath, [SCRIPT, 'tick'], { encoding: 'utf8', env: { ...process.env, FM_SYNC_MANAGER: '', FM_SYNC_PROJECT: '' } });
   assert.equal(r.status, 2);
   assert.match(r.stderr, /FM_SYNC_MANAGER and FM_SYNC_PROJECT/);
+});
+
+test('a status read that fails is unknown: no replacement sync, no report, and the next run reads again', () => {
+  const t = setup();
+  const head = t.advance();
+  t.run('--start');
+  t.world.threads.thr_fake1 = { status: 'active', output: '' };
+  t.world.showFails = { thr_fake1: true };
+  assert.match(t.run('--start'), /none: cannot read the status of thread thr_fake1/);
+  assert.equal(t.spawns().length, 1);
+  t.world.showFails = {};
+  t.world.threads.thr_fake1 = { status: 'idle', output: 'done' };
+  t.world.prs = [{ number: 140, url: 'https://github.com/o/r/pull/140', headRefName: `native-sync/${head.slice(0, 8)}`, headRefOid: 'c'.repeat(40) }];
+  t.run();
+  t.world.threads.thr_fake2 = { status: 'active', output: '' };
+  t.world.showFails = { thr_fake2: true };
+  assert.match(t.run(), /none: cannot read the status of thread thr_fake2/);
+  assert.equal(t.tells().length, 0, 'an unreadable checker is not a finished checker');
+  t.world.showFails = {};
+  delete t.world.threads.thr_fake1;
+  t.world.threads.thr_fake2 = { status: 'idle', output: 'VERDICT: pass' };
+  assert.match(t.run(), /tell: report:/, 'a thread the server says is gone counts as finished');
 });

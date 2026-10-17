@@ -70,15 +70,34 @@ const closed = syncBranch === undefined || prs.length > 0 ? [] : (json("gh", ["p
   .filter((pr) => !pr.mergedAt)
   .map(toPr);
 
+// A thread the server says does not exist is finished. Any other failed read (timeout,
+// gateway error, bad output) is unknown after 3 tries: this run then does nothing, so an
+// unreadable live thread never gets a replacement or a premature report.
+function readThread(id: string): { status: string; output: string } | undefined | "unknown" {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const thread = bbJson(["thread", "show", id, "--json"]).thread as { status?: unknown; archivedAt?: unknown } | undefined;
+      if (thread === undefined || typeof thread.status !== "string") continue;
+      const status = thread.archivedAt ? "archived" : thread.status;
+      if (!["idle", "error", "archived"].includes(status)) return { status, output: "" };
+      return { status, output: String(bbJson(["thread", "output", id, "--json"]).output ?? "") };
+    } catch (error) {
+      let code = "";
+      try { code = String(JSON.parse(String((error as { stdout?: string }).stdout ?? "")).error?.code ?? ""); } catch { code = ""; }
+      if (/not_found/.test(code)) return undefined;
+    }
+  }
+  return "unknown";
+}
 const threads: Record<string, { status: string; output: string } | undefined> = {};
 for (const id of [state.sync?.threadId, state.check?.threadId]) {
   if (id === undefined || id in threads) continue;
-  let thread: { status?: string; archivedAt?: unknown } | undefined;
-  try { thread = json("bb", ["thread", "show", id, "--json"]).thread; } catch { thread = undefined; }
-  if (thread === undefined) { threads[id] = undefined; continue; }
-  const status = thread.archivedAt ? "archived" : String(thread.status);
-  const done = ["idle", "error", "archived"].includes(status);
-  threads[id] = { status, output: done ? String(json("bb", ["thread", "output", id, "--json"]).output ?? "") : "" };
+  const read = readThread(id);
+  if (read === "unknown") {
+    console.log(`native-sync: none: cannot read the status of thread ${id}; nothing changes until a later run reads it`);
+    process.exit(0);
+  }
+  threads[id] = read;
 }
 
 // Only an operation without its result needs these reads. A lost spawn is looked for among
