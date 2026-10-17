@@ -35,7 +35,7 @@ for(const pin of pins) test(`native ${pin.slice(0,8)} worker renderer preserves 
    assert.equal(readFileSync(f.source,'utf8'),f.text,'native gates retain their original source');
    // fm-spawn's native role overlay and optional intent contract must use the
    // same renderer and must retain the copied captain words at absolute EOF.
-   const role=ok(run('bash',['-c','. "$1"; fm_brief_worker_role "$2" "$3"','fixture',join(home,'bin/fm-dod-lib.sh'),join(home,'state'),id]));
+   const role=ok(run('bash',['-c','. "$1"; fm_brief_worker_role "$2" "$3" "$4"','fixture',join(home,'bin/fm-dod-lib.sh'),join(home,'state'),id,home]));
    let launch=role+'\n'+f.text;
    if(mode==='no-mistakes') launch+=ok(run('bash',['-c','. "$1"; fm_brief_intent_overlay "$2"','fixture',join(home,'bin/fm-dod-lib.sh'),f.task]));
    const launchPath=join(home,'data',id,'launch-brief.md');writeFileSync(launchPath,launch);
