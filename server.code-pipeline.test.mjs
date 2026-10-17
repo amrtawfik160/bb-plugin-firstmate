@@ -16,21 +16,23 @@ const id=n=>`cyndra-ai/cyndra-saas#${n}`;
 const heads=new Map();
 const head=n=>heads.get(n) ?? String(n).repeat(10).slice(0,40);
 const FILES={2391:['apps/web/src/telegram.ts','apps/web/src/telegram.test.ts'],2392:['docs/runbook.md']};
-const crewRow=(id,threadId,extra)=>({id,task:'x',projectId:'proj_1',threadId,parentThreadId:'thr_cap',nativeHome:'/native',worktree:true,shape:'ship',posture:'direct-PR',createdAt:'2026-10-17T00:00:00.000Z',reasoningLevel:null,...extra});
+// dispatchVersion 2: dispatched under the code pipeline and checker rule. A crew without it keeps the old rules.
+const crewRow=(id,threadId,extra)=>({id,task:'x',projectId:'proj_1',threadId,parentThreadId:'thr_cap',nativeHome:'/native',worktree:true,shape:'ship',posture:'direct-PR',createdAt:'2026-10-17T00:00:00.000Z',reasoningLevel:null,dispatchVersion:2,...extra});
 const CREWS=[
  crewRow(BUILDER,'thr_crew',{title:'Fix dropped Telegram messages',providerId:'claude-code',model:'claude-opus-5-5'}),
  crewRow('chk1','thr_chk',{title:'Check PR 2391',providerId:'codex',model:'gpt-6-astra',role:'checker'}),
  crewRow('chk2','thr_chk2',{title:'Check PR 2391 again',providerId:'claude-code',model:'claude-opus-5-5',role:'checker'}),
 ];
-const PROVEN=[
+const PROVEN_LINES=[
  '✓ P1 Diagnose: the inbox ack ran before the write',
  '✓ P2 Failing test: keeps an unwritten message (commit abc1234)',
  '✓ P3 Fix at the root: ack after the write (commit def5678)',
- '✓ P4 Prove on the real surface: driven a message to the staging bot across a restart; seen it answered after the restart',
+ `✓ P4 Prove on the real surface for cyndra-ai/cyndra-saas#2391 at ${'2391'.repeat(10).slice(0,7)}: driven a message to the staging bot across a restart; seen it answered after the restart`,
  '✓ P5 Blast radius: the reply path shares the ack; its test passes',
  '✓ P6 No comments: none',
  '✓ P7 PR: '+url(2391),
-].join('\n');
+];
+const PROVEN=PROVEN_LINES.join('\n');
 
 function hostCommands(host) {
  const commands=[];const byId=new Map();let n=0;
@@ -47,7 +49,7 @@ function forge(command) {
  if(command.includes('gh pr view'))return{payload:JSON.stringify({number:n,url:url(n),title:`Change ${n}`,headRefName:`fm/${BUILDER}-change-${n}`,headRefOid:head(n),state:'OPEN',mergeable:'MERGEABLE',files:(FILES[n]??[]).map(path=>({path}))})};
  return{code:0};
 }
-async function deck({report=PROVEN}={}) {
+async function deck({report=PROVEN,crews=CREWS}={}) {
  heads.clear();
  const host=createFakePluginHost({pluginId:'firstmate',agentSkillIds:['firstmate','captain'],settings:{fmHome:'/native',fmHostId:'host_1'}});await plugin(host.bb);
  host.harness.sdk.stub('threads.list',async()=>[]);
@@ -60,7 +62,7 @@ async function deck({report=PROVEN}={}) {
  host.harness.sdk.stub('threads.events.list',async()=>[]);
  host.harness.sdk.stub('threads.send',async()=>({delivery:'queued'}));
  host.harness.sdk.stub('files.read',async({path})=>path===`/native/data/${BUILDER}/report.md`&&report!==null?{content:report}:(()=>{throw new Error('ENOENT');})());
- await host.bb.storage.kv.set('crews',CREWS);
+ await host.bb.storage.kv.set('crews',crews);
  const store=createDeliveries(host.bb.storage.database());
  for(const n of [2391,2392]){
   const r=store.register({url:url(n),taskId:BUILDER,projectId:'proj_1',owner:'thr_cap',home:'/native',worker:'thr_crew',requirement:'merged',title:`Change ${n}`});
@@ -78,7 +80,7 @@ test('verify refuses a bug-fix PR whose crew report has no proof step, and recor
  const {host,store}=await deck({report:PROVEN.replace(/^✓ P4 .*$/m,'pending: P4 Prove on the real surface: waiting on CI')});try {
   const refused=text(await verify(host,2391));
   assert.match(refused,/^(?:Error: )?Refusing to record verification for cyndra-ai\/cyndra-saas#2391: crew 9ceeb10f's report has its proof step pending: "P4 Prove on the real surface: waiting on CI"\./);
-  assert.match(refused,/✓ P4 Prove on the real surface: driven <what>; seen <what>/);
+  assert.match(refused,/✓ P4 Prove on the real surface for cyndra-ai\/cyndra-saas#2391 at 2391239: driven <what>; seen <what>/);
   assert.equal(store.get(id(2391)).verifiedCommitSha,null);
  }finally{await host.harness.lifecycle.dispose();}
  const ok=await deck();try {
@@ -126,7 +128,7 @@ test('a production PR is refused without a pass verdict for its head, and merges
 });
 
 test('a checker verdict for an older head does not cover a new push',async()=>{
- const {host,commands,store}=await deck();try {
+ const {host,commands,store}=await deck({report:`${PROVEN}\n✓ P4 Prove on the real surface for cyndra-ai/cyndra-saas#2391 at eeeeeee: driven the bot after the new push; seen it answered`});try {
   text(await check(host,2391,'thr_chk'));
   heads.set(2391,'e'.repeat(40));
   store.observe(id(2391),{headSha:head(2391),state:'open',draft:false,checks:'passing',review:'approved',reviewHeadSha:head(2391),mergeCommitSha:null,mergeable:'mergeable'},true);
@@ -137,7 +139,7 @@ test('a checker verdict for an older head does not cover a new push',async()=>{
 });
 
 test('an internal PR (docs only) self-checks and merges without a checker',async()=>{
- const {host,commands}=await deck();try {
+ const {host,commands}=await deck({report:`${PROVEN}\n✓ P4 Prove on the real surface for cyndra-ai/cyndra-saas#2392 at ${head(2392).slice(0,7)}: driven the runbook page; seen the new section`});try {
   text(await verify(host,2392));
   const merged=text(await tool(host,'firstmate_merge').execute({crewId:BUILDER,yes:true,pr:2392},ctx));
   assert.match(merged,/^Merged #2392 Change 2392\n/);
@@ -189,4 +191,52 @@ test('dispatch refuses a model the provider does not offer before anything is sp
   assert.equal(cli.exitCode,1);assert.match(cli.stderr,/does not offer model "claude-opus-5-5"/);
   assert.equal(host.harness.sdk.callsTo('threads.spawn').length,0);
  }finally{await host.harness.lifecycle.dispose();}
+});
+
+// FM138 verdict 1, finding 3: proof for another PR, or for an older head, proves nothing here.
+test('verify refuses a P4 line written for another PR or an older head',async()=>{
+ for(const line of [`✓ P4 Prove on the real surface for cyndra-ai/cyndra-saas#2392 at ${head(2391).slice(0,7)}: driven x; seen y`,`✓ P4 Prove on the real surface for cyndra-ai/cyndra-saas#2391 at fffffff: driven x; seen y`]){
+  const {host,store}=await deck({report:PROVEN.replace(/^✓ P4 .*$/m,line)});try {
+   assert.match(text(await verify(host,2391)),new RegExp(`report has its proof step missing: no "✓ P4 Prove on the real surface for cyndra-ai/cyndra-saas#2391 at ${head(2391).slice(0,7)}" line`),line);
+   assert.equal(store.get(id(2391)).verifiedCommitSha,null);
+  }finally{await host.harness.lifecycle.dispose();}
+ }
+});
+
+// Migration: a crew dispatched before this version keeps the old rules for its PRs.
+test('a crew dispatched before the pipeline version verifies without P4 and merges a production PR without a checker',async()=>{
+ const legacy=CREWS.map(c=>{const {dispatchVersion,...rest}=c;return rest;});
+ const {host,store,commands}=await deck({report:null,crews:legacy});try {
+  text(await verify(host,2391));
+  assert.equal(store.get(id(2391)).verifiedCommitSha,head(2391),'no P4 needed');
+  const merged=text(await tool(host,'firstmate_merge').execute({crewId:BUILDER,yes:true,pr:2391},ctx));
+  assert.match(merged,/^Merged #2391 Change 2391\n/);
+  assert.doesNotMatch(merged,/Checked:/);
+  assert.equal(merges(commands).length,1);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('a new dispatch records the pipeline version on its crew',async()=>{
+ const host=await dispatchHost();try {
+  await tool(host,'firstmate_dispatch').execute({projectId:'proj_1',task:'fix login'},{projectId:'proj_1'});
+  const crews=await host.bb.storage.kv.get('crews');
+  assert.equal(crews[0].dispatchVersion,2);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+// FM138 verdict 1, finding 4: an unreadable catalog cannot prove a model exists.
+test('dispatch refuses when the provider catalog or its model list cannot be read',async()=>{
+ for(const [label,stub] of [
+  ['empty model list',h=>h.harness.sdk.stub('providers.models',async()=>({modelLoadError:null,models:[]}))],
+  ['model load error',h=>h.harness.sdk.stub('providers.models',async()=>({modelLoadError:'offline',models:[]}))],
+  ['models call fails',h=>h.harness.sdk.stub('providers.models',async()=>{throw new Error('host offline');})],
+  ['provider list fails',h=>h.harness.sdk.stub('providers.list',async()=>{throw new Error('host offline');})],
+  ['empty provider list',h=>h.harness.sdk.stub('providers.list',async()=>[])],
+ ]){
+  const host=await dispatchHost();stub(host);try {
+   const out=text(await tool(host,'firstmate_dispatch').execute({projectId:'proj_1',task:'check PR 9',role:'checker',model:'not-a-real-model'},{projectId:'proj_1'}));
+   assert.match(out,/cannot be checked against the catalog of provider "codex"[^]*Nothing was spawned\./,label);
+   assert.equal(host.harness.sdk.callsTo('threads.spawn').length,0,label);
+  }finally{await host.harness.lifecycle.dispose();}
+ }
 });

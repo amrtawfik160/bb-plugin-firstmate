@@ -54,6 +54,7 @@ Legacy `firstmate_wake` `ackThrough` and `recoveryGeneration` must match an outs
 
 ### Checker before merge
 
-- A PR that reaches customers or production needs a checker crew before it merges. The plugin's `owner/reach.json` decides this from the repo and the changed files. A small internal change self-checks.
+- A PR that reaches customers or production needs a checker crew before it merges. The plugin's `owner/reach.json` decides this from the repo and the changed files. Deploy workflows and deploy configs always count as production. A small internal change self-checks.
+- These gates, and the P4 proof gate, apply only to crews dispatched from this version on. A crew dispatched earlier, and its PRs, keep the old rules: a verification record is enough to merge.
 - Dispatch the checker with `role=checker`, the PR link and the head commit. It must be another crew on a different model than the builder. It records `pass` or `fail` with `bb firstmate deliveries check`.
 - `firstmate_merge` refuses a production PR without a `pass` verdict for its current head. A new push needs a new check. Send a `fail` verdict's findings to the builder.

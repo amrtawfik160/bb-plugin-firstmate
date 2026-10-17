@@ -94,7 +94,7 @@ import { captureHostCommand, decodeHostCapture } from "./lib/host-capture.ts";
 import { selectExecution, validateLaunchCapabilities } from "./lib/execution-selection.ts";
 import { crewPipeline, crewPlaybook, crewSkillBlock, crewSkillRoot, notVerifiedNote, notVerifiedRequest, pipelineProofGap, PLAYBOOK_CHOICES, playbookStepCount, redactSecrets, reportGapNote, reportGapRequest, reportGaps, skillCheckScript, skillRoutingLinkScript, verifyStepGap } from "./lib/crew-contract.ts";
 import { CREW_ROLES, crewExecution } from "./owner/crew-roles.ts";
-import { PROOF_STEP } from "./owner/pipelines.ts";
+import { DISPATCH_VERSION, PROOF_STEP, pipelineGates, proofStep } from "./owner/pipelines.ts";
 import { changeReach } from "./owner/reach.ts";
 import { rpcContract } from "./rpc.ts";
 import {
@@ -151,6 +151,8 @@ const crewSchema = z.object({
   playbook: z.enum(PLAYBOOK_CHOICES).optional(),
   // builder, checker or lookup: picks the default model and, for a checker, the brief.
   role: z.enum(CREW_ROLES).optional(),
+  // The rules version this crew was dispatched under; owner/pipelines.ts DISPATCH_VERSION.
+  dispatchVersion: z.number().int().optional(),
   // Last PR url seen for this crew (BB environment PR, gh by branch, or the crew's own
   // report). Lets merge/forget/ownership checks resolve a PR the environment cache misses.
   prUrl: z.string().optional(),
@@ -4478,16 +4480,18 @@ export default async function plugin(bb: BbPluginApi) {
     if (pid === "" && mid === "" && reasoningLevel === undefined) return;
     const envId = parentThreadId !== undefined ? await threadEnv(parentThreadId) : null;
     const routing = selectedHost ? {hostId:selectedHost} : envId !== null ? { environmentId: envId } : {};
+    // FM138 verdict 1, finding 4: a catalog that cannot be read cannot prove the model exists.
+    const unchecked = (why: string) => strict
+      ? new Error(`Execution change refused: ${why}.`)
+      : new Error(`${mid !== "" ? `Model "${mid}"` : `Provider "${pid}"`} cannot be checked against the catalog of provider "${pid || "default"}": ${why}. Retry when the host answers, or name a provider and model it lists. Nothing was spawned.`);
     let providers: unknown;
     try {
       providers = await raceAbort(bb.sdk.providers.list(routing), undefined, STUCK_HOST_CALL_MS);
     } catch (error) {
-      if (strict) throw new Error("Execution change refused: provider catalog unreadable.");
-      bb.log.warn(`provider catalog unreadable (project=${projectId}); dispatch not pre-validated: ${error instanceof Error ? error.message : String(error)}`);
-      return;
+      throw unchecked(`provider catalog unreadable (${error instanceof Error ? error.message : String(error)})`);
     }
     const rows = Array.isArray(providers) ? providers.map(asRecord) : [];
-    if (rows.length === 0) {if (strict) throw new Error("Execution change refused: provider catalog is empty.");return;}
+    if (rows.length === 0) throw unchecked("provider catalog is empty");
     if (pid !== "") {
       const ids = rows.map((p) => p["id"]).filter((id): id is string => typeof id === "string");
       const hit = rows.find((p) => p["id"] === pid);
@@ -4510,12 +4514,11 @@ export default async function plugin(bb: BbPluginApi) {
     let catalog: Record<string, unknown>;
     try {
       catalog = asRecord(await raceAbort(bb.sdk.providers.models({ ...routing, ...(pid !== "" ? { providerId: pid } : {}) }), undefined, STUCK_HOST_CALL_MS));
-    } catch {
-      if (strict) throw new Error("Execution change refused: model catalog unreadable.");
-      return;
+    } catch (error) {
+      throw unchecked(`model catalog unreadable (${error instanceof Error ? error.message : String(error)})`);
     }
     const models = Array.isArray(catalog["models"]) ? (catalog["models"] as unknown[]).map(asRecord) : [];
-    if (catalog["modelLoadError"] != null || models.length === 0) {if (strict) throw new Error("Execution change refused: model catalog is unresolved.");return;}
+    if (catalog["modelLoadError"] != null || models.length === 0) throw unchecked(catalog["modelLoadError"] != null ? `model catalog failed to load (${String(catalog["modelLoadError"])})` : "model catalog is empty");
     if (models.some((m) => m["id"] === mid || m["model"] === mid)) return;
     if (strict) throw new Error(`Execution change refused: model ${mid} is not in the selected provider catalog.`);
     // 17 Oct step 2 canary: a Claude model on the Codex provider was accepted here and
@@ -5637,6 +5640,7 @@ export default async function plugin(bb: BbPluginApi) {
       ...(input.title !== undefined && input.title.trim() !== "" ? { title: input.title.trim().slice(0, 200) } : {}),
       ...(input.playbook !== undefined ? { playbook: input.playbook } : {}),
       ...(input.role !== undefined ? { role: input.role } : {}),
+      dispatchVersion: DISPATCH_VERSION,
       ...(input.sourceRefs && input.sourceRefs.length > 0 ? { sourceRefs: input.sourceRefs } : {}),
       createdAt: new Date().toISOString(),
     };
@@ -7454,13 +7458,15 @@ export default async function plugin(bb: BbPluginApi) {
   // the crew's report shows the proof step done, with what was driven and seen.
   async function requirePipelineProof(r: DeliveryRecord): Promise<void> {
     const crew = r.taskId.startsWith("captain:") ? undefined : await findCrew(r.taskId);
-    if (crew === undefined || crewPipeline(crew) === null) return;
-    const gap = pipelineProofGap(await crewReportText(crew));
+    const pipeline = crew === undefined || !pipelineGates(crew) ? null : crewPipeline(crew);
+    if (crew === undefined || pipeline === null) return;
+    const step = proofStep(pipeline);
+    const gap = pipelineProofGap(await crewReportText(crew), step, { pr: r.id, head: r.headSha ?? "" });
     if (gap === null) return;
     const home = await crewNativeHome(crew);
     throw new Error([
       `Refusing to record verification for ${r.id}: crew ${crew.id}'s report has its proof step ${gap}.`,
-      `The crew writes "✓ P4 ${PROOF_STEP}: driven <what>; seen <what>" in ${home ? `${home}/data/${crew.id}/report.md` : "its report"}, then records verification again. CI and unit tests are not verification.`,
+      `The crew writes "✓ P${step} ${PROOF_STEP} for ${r.id} at ${(r.headSha ?? "").slice(0, 7)}: driven <what>; seen <what>" in ${home ? `${home}/data/${crew.id}/report.md` : "its report"}, then records verification again. CI and unit tests are not verification.`,
     ].join("\n"));
   }
 
@@ -7750,6 +7756,7 @@ export default async function plugin(bb: BbPluginApi) {
   // from a checker crew that is not the builder and runs another model. Returns the line
   // the merge result shows, or "" for an internal PR.
   async function requireChecker(t: MergeTarget, crew: Crew, hostId: string | null): Promise<string> {
+    if (!pipelineGates(crew)) return "";
     const short = (sha: string) => sha.slice(0, 7);
     const repo = /github\.com\/([^/]+\/[^/]+)\/pull\//.exec(t.url)?.[1] ?? t.url;
     const reach = changeReach({ repo, ...(await ghPrFiles(hostId, t.url)) });
@@ -13484,7 +13491,7 @@ export default async function plugin(bb: BbPluginApi) {
     // An unreadable playbook file means pstack is not installed there; the brief says to go on without it.
     if (playbookStepCount(playbookText) === 0) return;
     // A bug-fix or feature crew reports the pipeline's steps, not the playbook's.
-    const pipeline = crewPipeline(crew);
+    const pipeline = pipelineGates(crew) ? crewPipeline(crew) : null;
     const steps = pipeline?.length ?? playbookStepCount(playbookText);
     const home = await crewNativeHome(crew);
     // 0940c38e wrote final-report.md, not report.md.
@@ -13499,7 +13506,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
     if (await bb.storage.kv.get(verifyKey) !== undefined) return;
-    const gap = pipeline !== null ? pipelineProofGap(report) : verifyStepGap(report, playbookText);
+    const gap = pipeline !== null ? pipelineProofGap(report, proofStep(pipeline)) : verifyStepGap(report, playbookText);
     // A report with no step lines is not judged yet; the gap request above asks for them.
     if (gap === null && reportGaps(report, steps).some((g) => g.startsWith("playbook step lines (0 "))) return;
     await bb.storage.kv.set(verifyKey, { gap });

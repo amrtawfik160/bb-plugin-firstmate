@@ -927,13 +927,12 @@ test("crew 0940c38e's final report with a pending verify step is flagged NOT VER
     const sends = sendCalls(host);
     const notes = sends.filter((s) => s.threadId === "thr_cap" && s.text.includes("NOT VERIFIED: crew 0940c38e"));
     assert.equal(notes.length, 1, JSON.stringify(sends));
-    // A bug-fix crew is judged on its pipeline's proof step; the playbook's pending verify line is not it.
-    assert.match(notes[0]!.text, /verify step missing: no "✓ P4 Prove on the real surface" line/);
+    // 0940c38e was dispatched before the pipeline version, so its playbook's verify step judges it.
+    assert.match(notes[0]!.text, /verify step pending: "Verify on the same surface \(waiting Secret and dependency scan/);
     assert.match(notes[0]!.text, /cannot merge until a verification record exists/);
     const toCrew = sends.filter((s) => s.threadId === "thr_crew");
-    assert.equal(toCrew.length, 2, JSON.stringify(toCrew));
-    assert.match(toCrew[0]!.text, /^REPORT INCOMPLETE: your final report lacks playbook step lines \(6 of 7\)\.\nReply with only the missing parts: a line "Skills read: <paths>", and one line per pipeline step, "✓ P<n> <step>: <evidence>"/);
-    assert.match(toCrew[1]!.text, /^VERIFY STEP NOT DONE/);
+    assert.equal(toCrew.length, 1, JSON.stringify(toCrew));
+    assert.match(toCrew[0]!.text, /^VERIFY STEP NOT DONE/);
     assert.deepEqual((await emitIdle(host, "DONE: PR https://github.com/Cyndra-AI/cyndra-saas/pull/2315")).errors, []);
     assert.equal(sendCalls(host).filter((s) => s.text.includes("NOT VERIFIED:")).length, 1, "flagged once");
   } finally {
@@ -966,7 +965,7 @@ test("a feature crew's DONE is counted against the pipeline and judged on its pr
     await host.bb.storage.kv.set("crews", [{
       id: "0151f78d", task: "Per-re-import webhook event key", title: "Add per-re-import webhook event key", projectId: "proj_1",
       threadId: "thr_crew", parentThreadId: "thr_cap", providerId: "claude-code", worktree: true, shape: "ship", posture: "local-only",
-      createdAt: "2026-10-14T00:00:00.000Z",
+      createdAt: "2026-10-14T00:00:00.000Z", dispatchVersion: 2,
     }]);
     host.harness.sdk.stub("environments.list", async () => [{ hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" }]);
     host.harness.sdk.stub("files.read", async (input: unknown) => {
@@ -981,7 +980,7 @@ test("a feature crew's DONE is counted against the pipeline and judged on its pr
     assert.equal(sends.filter((s) => s.text.includes("Report check:")).length, 0, "7 of 7 pipeline lines");
     const notes = sends.filter((s) => s.threadId === "thr_cap" && s.text.includes("NOT VERIFIED: crew 0151f78d"));
     assert.equal(notes.length, 1, JSON.stringify(sends));
-    assert.match(notes[0]!.text, /verify step no evidence: the line lacks "driven <what>; seen <what>"/);
+    assert.match(notes[0]!.text, /verify step malformed: the line must read "✓ P4 Prove on the real surface for <owner\/repo#n> at <head sha>: driven <what>; seen <what>"/);
   } finally {
     await host.harness.lifecycle.dispose();
   }

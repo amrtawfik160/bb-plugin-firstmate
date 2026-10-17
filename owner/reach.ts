@@ -4,25 +4,36 @@
 import { readFileSync } from "node:fs";
 
 export type Reach = "production" | "internal";
-export type ReachTable = { internalPaths: readonly string[]; repos: Readonly<Record<string, { reach: Reach }>> };
+export type ReachTable = {
+  internalPaths: readonly string[];
+  productionPaths: readonly string[];
+  repos: Readonly<Record<string, { reach: Reach; productionPaths?: readonly string[] }>>;
+};
 
 export const REACH: ReachTable = JSON.parse(readFileSync(new URL("./reach.json", import.meta.url), "utf8"));
 
-// "docs/" matches a folder at any depth; "*.md" matches the file name.
-function internalPath(path: string, patterns: readonly string[]): boolean {
-  const segments = path.split("/");
-  const name = segments.at(-1) ?? "";
-  return patterns.some((pattern) => pattern.endsWith("/")
-    ? segments.slice(0, -1).includes(pattern.slice(0, -1))
-    : new RegExp(`^${pattern.split("*").map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join("[^/]*")}$`).test(name));
+const glob = (pattern: string) => new RegExp(`^${pattern.split("*").map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join("[^/]*")}$`, "i");
+
+// "test/" and ".github/workflows/" are folders at any depth, "/docs/" a folder at the root, "*.md" a file name.
+function matches(path: string, patterns: readonly string[]): boolean {
+  const folders = path.split("/");
+  const name = folders.pop() ?? "";
+  return patterns.some((pattern) => {
+    if (!pattern.endsWith("/")) return glob(pattern).test(name);
+    const want = pattern.replace(/^\/|\/$/g, "").split("/");
+    const at = (i: number) => want.every((part, j) => folders[i + j] === part);
+    return pattern.startsWith("/") ? at(0) : folders.some((_, i) => at(i));
+  });
 }
 
 // complete=false: the file list could not be read in full, so nothing proves it internal.
 export function changeReach(pr: { repo: string; files: readonly string[]; complete: boolean }, table: ReachTable = REACH): { reach: Reach; why: string } {
-  const repo = Object.entries(table.repos).find(([name]) => name.toLowerCase() === pr.repo.toLowerCase())?.[1];
+  const repo = Object.entries(table.repos).find(([name]) => glob(name).test(pr.repo))?.[1];
   if (repo?.reach === "internal") return { reach: "internal", why: `${pr.repo} is listed as internal` };
   if (!pr.complete || pr.files.length === 0) return { reach: "production", why: `the changed files of ${pr.repo} could not be read in full` };
-  const outside = pr.files.find((file) => !internalPath(file, table.internalPaths));
+  const deploys = pr.files.find((file) => matches(file, [...table.productionPaths, ...(repo?.productionPaths ?? [])]));
+  if (deploys !== undefined) return { reach: "production", why: `${deploys} is a production path` };
+  const outside = pr.files.find((file) => !matches(file, table.internalPaths));
   if (outside === undefined) return { reach: "internal", why: "every changed file is an internal path" };
   return { reach: "production", why: `${pr.repo} is not listed as internal, and ${outside} is not an internal path` };
 }

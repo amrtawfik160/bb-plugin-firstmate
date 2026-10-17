@@ -104,12 +104,12 @@ test("a feature brief gives full paths, the pipeline checklist, the core princip
     `P1. Sharpen: read \`${root}/sharpen/SKILL.md\`. Evidence: the sharpened request in one sentence.`,
     `P2. Architect: read \`${root}/architect/SKILL.md\`. Evidence: the data shape and the design you chose.`,
     `P3. TDD build: read \`${root}/tdd/SKILL.md\`. Evidence: the test names, each failing before its code.`,
-    `P4. Prove on the real surface: use the project's verify skill if it has one (e.g. \`.agents/skills/verify-<app>/\`), else read \`${root}/verify-this/SKILL.md\`. Evidence: driven <what you drove>; seen <what you saw>.`,
+    `P4. Prove on the real surface: use the project's verify skill if it has one (e.g. \`.agents/skills/verify-<app>/\`), else read \`${root}/verify-this/SKILL.md\`. Evidence: the PR and head you proved, what you drove and what you saw.`,
     `P5. Code review: read \`${root}/code-review/SKILL.md\`. Evidence: the findings and what you fixed.`,
     `P6. No comments: read \`${root}/no-comments/SKILL.md\`. Evidence: the comments you removed, or none.`,
     `P7. PR: read \`${root}/pr/SKILL.md\`. Evidence: the PR link.`,
     "Your final report has one line per pipeline step: \"✓ P<n> <step>: <evidence>\" or \"skip: P<n> <step>: <reason>\".",
-    "Write that report to your report file before you record verification. `bb firstmate deliveries verify` refuses this crew's PR until the report has \"✓ P4 Prove on the real surface: driven <what>; seen <what>\".",
+    "Write that report to your report file before you record verification. `bb firstmate deliveries verify` refuses this crew's PR until the report has \"✓ P4 Prove on the real surface for <owner/repo#n> at <head sha>: driven <what>; seen <what>\" for that PR at its current head. After a new push, add a new P4 line.",
     "Save each screenshot as its own full-size PNG file. Never combine, stitch or downscale screenshots; link each file separately.",
     ...OBSTACLES,
   ].join("\n"));
@@ -394,7 +394,7 @@ test("every brief sends heavy commands through the host limiter, for every provi
 });
 
 // 17 Oct: the four core principles added about 420 characters to every brief, and the
-// code pipeline about 1,200 more to a bug-fix or feature brief.
+// code pipeline about 1,400 more to a bug-fix or feature brief.
 test("the block stays short for every provider, shape, playbook and role", () => {
   for (const providerId of ["claude-code", "codex", "acp-grok", "acp-antigravity", "pi"]) {
     for (const shape of ["ship", "scout"] as const) {
@@ -402,7 +402,7 @@ test("the block stays short for every provider, shape, playbook and role", () =>
         for (const role of ["builder", "checker"] as const) {
           const input = { shape, title: "x", task: "", providerId, playbook, role };
           const size = crewSkillBlock(input).length;
-          const bound = crewPipeline(input) === null ? 3900 : 5100;
+          const bound = crewPipeline(input) === null ? 3900 : 5300;
           assert.ok(size <= bound, `${providerId} ${shape} ${playbook} ${role}: ${size} characters`);
         }
       }
@@ -568,12 +568,12 @@ test("a bug-fix brief carries the fixed pipeline in order, with each skill's pat
     `P1. Diagnose: read \`${root}/diagnosing-bugs/SKILL.md\`. Evidence: the root cause and how you found it.`,
     `P2. Failing test: read \`${root}/tdd/SKILL.md\`. Evidence: the test name and the commit id of the failing test.`,
     "P3. Fix at the root. Evidence: where the system first went wrong and the fix commit id.",
-    `P4. Prove on the real surface: use the project's verify skill if it has one (e.g. \`.agents/skills/verify-<app>/\`), else read \`${root}/verify-this/SKILL.md\`. Evidence: driven <what you drove>; seen <what you saw>.`,
+    `P4. Prove on the real surface: use the project's verify skill if it has one (e.g. \`.agents/skills/verify-<app>/\`), else read \`${root}/verify-this/SKILL.md\`. Evidence: the PR and head you proved, what you drove and what you saw.`,
     `P5. Blast radius: read \`${root}/blast-radius/SKILL.md\`. Evidence: what else the change could break and what you ran to rule it out.`,
     `P6. No comments: read \`${root}/no-comments/SKILL.md\`. Evidence: the comments you removed, or none.`,
     `P7. PR: read \`${root}/pr/SKILL.md\`. Evidence: the PR link.`,
     "Your final report has one line per pipeline step: \"✓ P<n> <step>: <evidence>\" or \"skip: P<n> <step>: <reason>\".",
-    "Write that report to `/fm/data/c1/report.md` before you record verification. `bb firstmate deliveries verify` refuses this crew's PR until the report has \"✓ P4 Prove on the real surface: driven <what>; seen <what>\".",
+    "Write that report to `/fm/data/c1/report.md` before you record verification. `bb firstmate deliveries verify` refuses this crew's PR until the report has \"✓ P4 Prove on the real surface for <owner/repo#n> at <head sha>: driven <what>; seen <what>\" for that PR at its current head. After a new push, add a new P4 line.",
   ].join("\n")), block);
   assert.ok(block.includes("4. Write every pipeline step into `/fm/data/c1/todo.md`, then the playbook steps, before any other work. Tick each step there as you go."), block);
   assert.ok(block.includes("5. Your final report lists each pipeline step as the Pipeline section says."), block);
@@ -629,28 +629,53 @@ test("crews spawn sub-agents only for arena or interrogate, at most 3, with heav
   assert.ok(routing.includes("crews spawn no sub-agents, except for `arena` or `interrogate` where the playbook calls for them"), "skill-routing states the exception");
 });
 
+const HEAD = "abc1234def5678abc1234def5678abc1234def56";
+const PR = { pr: "o/r#9", head: HEAD };
+const PROOF = `✓ P4 Prove on the real surface for o/r#9 at ${HEAD.slice(0, 7)}: driven a save on the staging app with the lock held; seen the row saved after release`;
 const BUG_REPORT = [
   "✓ P1 Diagnose: the queue drops a row when the lock times out",
   "✓ P2 Failing test: drops no row on lock timeout (commit abc1234)",
   "✓ P3 Fix at the root: lock wait moved before the read (commit def5678)",
-  "✓ P4 Prove on the real surface: driven a save on the staging app with the lock held; seen the row saved after release",
+  PROOF,
   "✓ P5 Blast radius: the two other lock callers run the same path; their tests pass",
   "✓ P6 No comments: none",
   "✓ P7 PR: https://github.com/o/r/pull/9",
 ].join("\n");
+const withProof = (line: string) => BUG_REPORT.replace(/^✓ P4 .*$/m, line);
 
-test("a pipeline report with the proof step driven and seen passes the proof check", () => {
-  assert.equal(pipelineProofGap(BUG_REPORT), null);
-  assert.equal(pipelineProofGap(BUG_REPORT.replace("✓ P4 Prove", "- ✓ 4. Prove")), null);
+test("a P4 line for this PR at its head, with what was driven and seen, passes the proof check", () => {
+  assert.equal(pipelineProofGap(BUG_REPORT, 4, PR), null);
+  assert.equal(pipelineProofGap(BUG_REPORT, 4), null, "the DONE check needs one well-formed P4 line");
+  assert.equal(pipelineProofGap(withProof(`- ✓ P4 Prove on the real surface for O/R#9 at ${HEAD}: driven x; seen y`), 4, PR), null);
 });
 
-test("a pipeline report whose proof step is skipped, pending, missing or has no evidence names why", () => {
-  const withProof = (line: string) => BUG_REPORT.replace(/^✓ P4 .*$/m, line);
-  assert.equal(pipelineProofGap(withProof("skip: P4 Prove on the real surface: no staging access")), "skipped: \"P4 Prove on the real surface: no staging access\"");
-  assert.equal(pipelineProofGap(withProof("pending: P4 Prove on the real surface: waiting on CI")), "pending: \"P4 Prove on the real surface: waiting on CI\"");
-  assert.equal(pipelineProofGap(withProof("blocked: P4 Prove on the real surface: no bot token")), "blocked: \"P4 Prove on the real surface: no bot token\"");
-  assert.equal(pipelineProofGap(withProof("")), "missing: no \"✓ P4 Prove on the real surface\" line");
-  assert.equal(pipelineProofGap(withProof("✓ P4 Prove on the real surface: CI is green")), "no evidence: the line lacks \"driven <what>; seen <what>\"");
+test("a P4 line that is skipped, pending, blocked or missing names why", () => {
+  assert.equal(pipelineProofGap(withProof("skip: P4 Prove on the real surface: no staging access"), 4, PR), "skipped: \"P4 Prove on the real surface: no staging access\"");
+  assert.equal(pipelineProofGap(withProof("pending: P4 Prove on the real surface: waiting on CI"), 4, PR), "pending: \"P4 Prove on the real surface: waiting on CI\"");
+  assert.equal(pipelineProofGap(withProof("blocked: P4 Prove on the real surface: no bot token"), 4), "blocked: \"P4 Prove on the real surface: no bot token\"");
+  assert.equal(pipelineProofGap(withProof(""), 4), "missing: no \"✓ P4 Prove on the real surface\" line");
+});
+
+// FM138 verdict 1, finding 2.
+test("a P4 line with an empty driven or seen field, or at the wrong step, is refused", () => {
+  const empty = "malformed: the line must read \"✓ P4 Prove on the real surface for <owner/repo#n> at <head sha>: driven <what>; seen <what>\", with both fields filled";
+  assert.equal(pipelineProofGap(withProof("✓ P4 Prove on the real surface for o/r#9 at abc1234: driven ; seen"), 4, PR), empty);
+  assert.equal(pipelineProofGap(withProof("✓ P4 Prove on the real surface for o/r#9 at abc1234: driven the app; seen  "), 4, PR), empty);
+  assert.equal(pipelineProofGap(withProof("✓ P4 Prove on the real surface: CI is green"), 4, PR), empty);
+  assert.equal(pipelineProofGap(withProof("✓ P99 Prove on the real surface for o/r#9 at abc1234: driven browser; seen page"), 4, PR), "missing: no \"✓ P4 Prove on the real surface\" line");
+  assert.equal(pipelineProofGap(withProof("✓ Prove on the real surface for o/r#9 at abc1234: driven browser; seen page"), 4, PR), "missing: no \"✓ P4 Prove on the real surface\" line");
+});
+
+// FM138 verdict 1, finding 3.
+test("a P4 line for another PR or an older head does not prove this PR at this head", () => {
+  const want = `missing: no "✓ P4 Prove on the real surface for o/r#9 at ${HEAD.slice(0, 7)}" line`;
+  assert.equal(pipelineProofGap(withProof("✓ P4 Prove on the real surface for o/other#9 at abc1234: driven x; seen y"), 4, PR), want);
+  assert.equal(pipelineProofGap(withProof("✓ P4 Prove on the real surface for o/r#10 at abc1234: driven x; seen y"), 4, PR), want);
+  assert.equal(pipelineProofGap(withProof("✓ P4 Prove on the real surface for o/r#9 at 0000000: driven x; seen y"), 4, PR), want);
+  assert.match(pipelineProofGap(withProof("✓ P4 Prove on the real surface for o/r#9 at abc12: driven x; seen y"), 4, PR) ?? "", /^malformed: /, "fewer than 7 characters names no commit");
+  const two = `${BUG_REPORT}\n✓ P4 Prove on the real surface for o/r#10 at 1111111: driven y; seen z`;
+  assert.equal(pipelineProofGap(two, 4, PR), null, "one report can prove two PRs, one line each");
+  assert.equal(pipelineProofGap(two, 4, { pr: "o/r#10", head: "1111111aaaa" }), null);
 });
 
 test("a pipeline crew's DONE report is counted against the pipeline steps, and the request asks for pipeline lines", () => {

@@ -75,13 +75,18 @@ brief as steps P1 to P7. Refactor and perf work keep their rows above.
 The report has one line per step: "✓ P<n> <step>: <evidence>" or
 "skip: P<n> <step>: <reason>". Evidence names the test, or what you drove and
 what you saw. `bb firstmate deliveries verify` refuses a pipeline crew's PR
-until its report has "✓ P4 Prove on the real surface: driven <what>; seen
-<what>".
+until its report has "✓ P4 Prove on the real surface for <owner/repo#n> at
+<head sha>: driven <what>; seen <what>" for that PR at its current head. After
+a new push, add a new P4 line.
 
 A PR that reaches customers or production needs a checker crew on a different
 model before it merges. The plugin's `owner/reach.json` decides that from the
-repo and the changed files. `firstmate_merge` refuses such a PR without a pass
+repo and the changed files. Deploy workflows, deploy configs and agent prompts
+always count as production. `firstmate_merge` refuses such a PR without a pass
 verdict from a crew that is not the builder.
+
+These gates apply to crews dispatched from Firstmate's pipeline version on.
+Older crews and their PRs keep the old rules.
 
 ## Core principles
 

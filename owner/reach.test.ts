@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { changeReach, REACH } from "./reach.ts";
 import { crewExecution, ROLE_DEFAULTS } from "./crew-roles.ts";
 
-const table = { internalPaths: ["docs/", "test/", "*.md", "*.test.*"], repos: { "amrtawfik160/notes": { reach: "internal" as const } } };
+const table = { internalPaths: ["/docs/", "test/", "*.md", "*.test.*"], productionPaths: [".github/workflows/", "Dockerfile", "SKILL.md"], repos: { "amrtawfik160/notes": { reach: "internal" as const } } };
 
 test("a code change in a repo the table does not list reaches production", () => {
   assert.deepEqual(changeReach({ repo: "amrtawfik160/Safi", files: ["artifacts/mobile/app/index.tsx", "docs/a.md"], complete: true }, table),
@@ -24,15 +24,41 @@ test("an unreadable or truncated file list reaches production", () => {
   assert.equal(changeReach({ repo: "amrtawfik160/Safi", files: [], complete: true }, table).reach, "production");
 });
 
-test("a directory pattern matches at any depth, a file pattern matches the file name only", () => {
+test("a directory pattern matches at any depth, a leading slash anchors it at the repo root, a file pattern matches the file name only", () => {
   assert.equal(changeReach({ repo: "o/r", files: ["packages/api/test/a.ts"], complete: true }, table).reach, "internal");
+  assert.equal(changeReach({ repo: "o/r", files: ["docs/plan.md", "docs/a.png"], complete: true }, table).reach, "internal");
+  assert.equal(changeReach({ repo: "o/r", files: ["apps/docs/app/api/route.ts"], complete: true }, table).reach, "production", "a docs folder below the root can hold app code");
   assert.equal(changeReach({ repo: "o/r", files: ["latest/a.ts"], complete: true }, table).reach, "production");
   assert.equal(changeReach({ repo: "o/r", files: ["md/a.ts"], complete: true }, table).reach, "production");
 });
 
-test("the shipped table parses and lists no repo as internal without the owner", () => {
-  assert.ok(REACH.internalPaths.length > 0);
-  for (const [repo, row] of Object.entries(REACH.repos)) assert.ok(row.reach === "internal" || row.reach === "production", repo);
+// FM138 verdict 1, finding 1: a deploy workflow is production, even in an internal folder.
+test("a production path wins over an internal path", () => {
+  assert.deepEqual(changeReach({ repo: "o/r", files: [".github/workflows/deploy.yml"], complete: true }, table),
+    { reach: "production", why: ".github/workflows/deploy.yml is a production path" });
+  assert.equal(changeReach({ repo: "o/r", files: ["docs/Dockerfile"], complete: true }, table).reach, "production");
+  assert.equal(changeReach({ repo: "o/r", files: ["skills/review/SKILL.md"], complete: true }, table).reach, "production", "an agent prompt is not a plain doc");
+});
+
+test("a repo's own production paths add to the shared ones", () => {
+  const own = { ...table, repos: { "o/r": { reach: "production" as const, productionPaths: ["/docs/"] } } };
+  assert.equal(changeReach({ repo: "o/r", files: ["docs/index.md"], complete: true }, own).reach, "production", "this project deploys its site from docs/");
+  assert.equal(changeReach({ repo: "o/other", files: ["docs/index.md"], complete: true }, own).reach, "internal");
+});
+
+test("the shipped table lists only the scratch and demo repos as internal, and treats deploy files as production", () => {
+  for (const repo of ["amrtawfik160/fm-canary-step2-20261017", "amrtawfik160/fm-canary-x", "amrtawfik160/firstmate-demo"]) {
+    assert.equal(changeReach({ repo, files: ["src/app.ts"], complete: true }).reach, "internal", repo);
+  }
+  for (const repo of ["amrtawfik160/Safi", "Cyndra-AI/cyndra-saas", "amrtawfik160/bb-plugin-firstmate"]) {
+    assert.equal(changeReach({ repo, files: ["src/app.ts"], complete: true }).reach, "production", repo);
+  }
+  for (const file of [".github/workflows/deploy.yml", ".github/workflows/release.yml", "Dockerfile", "docker-compose.yml", "fly.toml", "vercel.json", "eas.json", "nixpacks.toml", "Procfile", "AGENTS.md", "CLAUDE.md", "skills/x/SKILL.md"]) {
+    assert.equal(changeReach({ repo: "o/r", files: [file], complete: true }).reach, "production", file);
+  }
+  for (const file of ["docs/guide.md", "README.md", "test/a.test.ts", "src/a.test.ts", "CHANGELOG.md"]) {
+    assert.equal(changeReach({ repo: "o/r", files: [file], complete: true }).reach, "internal", file);
+  }
 });
 
 test("each role has a real default provider and model", () => {
