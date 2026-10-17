@@ -5,6 +5,7 @@ import test from "node:test";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import plugin from "./server.ts";
 import { manifestSkillIds } from "./scripts/plugin-skill-fixture.mjs";
+import { createInboundLedger } from "./lib/inbound-ledger.ts";
 
 type Host = ReturnType<typeof createFakePluginHost>;
 type Rpc = { pluginId: string; method: string; input: Record<string, unknown> };
@@ -41,6 +42,8 @@ function tool(host: Host, name: string) {
   assert.ok(found, `tool ${name} not registered`);
   return found!;
 }
+
+const isErrorResult = (result: unknown) => typeof result === "object" && result !== null && (result as { isError?: boolean }).isError === true;
 
 function text(result: unknown): string {
   const raw = typeof result === "string" ? result : (result as { content: Array<{ text?: string }> }).content.map((c) => c.text ?? "").join("\n");
@@ -103,7 +106,7 @@ test("firstmate_reply result=true sends the task's result to its first owner mes
     const reply = calls.find((call) => call.method === "reply" && call.input.kind !== "ack")!;
     assert.deepEqual({ messageId: reply.input.messageId, task: reply.input.task, result: reply.input.result }, { messageId: "5600", task: "T1", result: true });
 
-    const alerted = await tool(host, "firstmate_alert").execute({ level: "alarm", text: "Safi is down for all users.", task: "T1" }, capCtx);
+    const alerted = await tool(host, "firstmate_alert").execute({ level: "alarm", text: "Safi is down for all users.", task: "T1", incident: "safi-down-1" }, capCtx);
     assert.equal(text(alerted), "Sent the alarm to the owner in task T1's topic.");
     const alert = calls.find((call) => call.method === "alert")!;
     assert.deepEqual({ level: alert.input.level, text: alert.input.text, task: alert.input.task }, { level: "alarm", text: "Safi is down for all users.", task: "T1" });
@@ -131,4 +134,96 @@ test("the captain's Telegram guide says free text never reaches the owner and na
   assert.match(guide, /It never reaches Telegram, with\s+topics on or off/);
   for (const name of ["firstmate_reply", "result=true", "firstmate_ask", "firstmate_alert"]) assert.ok(guide.includes(name), name);
   assert.doesNotMatch(guide, /final text already\s+reaches Telegram/);
+});
+
+// Round 2 of the independent check (FF1-verdict-1.md).
+
+test("check F1: an alarm's identity is its incident and project: the same words for two projects or two incidents are two alarms; a retry of one incident is one", async () => {
+  const { host, calls } = await captainHost();
+  try {
+    await ownerSays(host, "5800", "hi");
+    const alert = (input: Record<string, unknown>) => tool(host, "firstmate_alert").execute({ level: "alarm", text: "Production is unavailable.", ...input }, capCtx);
+    await alert({ project: "Dr Woo", incident: "woo-outage-17oct" });
+    await alert({ project: "Cyndra", incident: "cyndra-outage-17oct" });
+    await alert({ project: "Cyndra", incident: "cyndra-outage-18oct" });
+    await alert({ project: "Cyndra", incident: "cyndra-outage-18oct" });
+    const ids = calls.filter((call) => call.method === "alert").map((call) => String(call.input.alertId));
+    assert.equal(ids.length, 4);
+    assert.equal(new Set(ids.slice(0, 3)).size, 3, "two projects, two incidents: three alarms");
+    assert.equal(ids[3], ids[2], "the retry of one incident keeps its id");
+    assert.ok(isErrorResult(await tool(host, "firstmate_alert").execute({ level: "alarm", text: "x" }, capCtx)), "an incident id is required");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("check F2: with a connector that has no alert method yet, the alarm goes out as a card the old connector sends", async () => {
+  const { host, calls } = await captainHost();
+  try {
+    host.harness.sdk.stub("plugins.callRpc", async (args: Rpc) => {
+      calls.push(args);
+      if (args.method === "alert") throw Object.assign(new Error('plugin "telegram" has no rpc method "alert"'), { code: "unknown_method" });
+      return { ok: true, queued: 1, duplicate: false, mode: "on" };
+    });
+    await ownerSays(host, "5900", "hi");
+    const sent = await tool(host, "firstmate_alert").execute({ level: "alarm", text: "Safi is down for all users.", project: "Safi", incident: "safi-down" }, capCtx);
+    assert.match(text(sent), /as a card/);
+    const card = calls.find((call) => call.method === "ask")!;
+    assert.ok(card, "the old connector's ask method carries it");
+    assert.match(String(card.input.text), /^🚨 Safi is down for all users\./);
+    assert.equal(card.input.project, "Safi");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("check T4: a reply the connector reports undelivered reopens the owner message and tells the captain", async () => {
+  const { host, calls } = await captainHost();
+  try {
+    let undelivered = [{ chatId: "200", messageId: "6000", reason: "Telegram refused the message: Bad Request" }];
+    host.harness.sdk.stub("plugins.callRpc", async (args: Rpc) => {
+      calls.push(args);
+      if (args.method === "undelivered") { const rows = undelivered; undelivered = []; return { undelivered: rows }; }
+      if (args.method === "replied") return { replied: [] };
+      if (args.method === "freeText") return { obligations: [] };
+      return { ok: true, queued: 1, duplicate: false, mode: "on" };
+    });
+    await ownerSays(host, "6000", "Status?");
+    await tool(host, "firstmate_reply").execute({ ref: "tg:200:6000", text: "All green." }, capCtx);
+    assert.equal(createInboundLedger(host.bb.storage.database()).get({ source: "telegram", chatId: "200", messageId: "6000" })?.state, "answered");
+    const sends: string[] = [];
+    host.harness.sdk.stub("threads.send", async (args: { input: Array<{ text: string }> }) => { sends.push(args.input[0]?.text ?? ""); return {}; });
+    await host.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_cap", status: "idle" }), lastAssistantText: "ok" });
+    assert.notEqual(createInboundLedger(host.bb.storage.database()).get({ source: "telegram", chatId: "200", messageId: "6000" })?.state, "answered", "open again");
+    assert.ok(sends.some((line) => /tg:200:6000/.test(line) && /not delivered/i.test(line)), sends.join("\n"));
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("free-text safety: the captain is told of each free text the connector holds, by its ref, and resolves it with firstmate_free_text", async () => {
+  const { host, calls } = await captainHost();
+  try {
+    let obligations = [{ ref: "agent:i9", text: "Safi is down: Convex disabled the account.", at: 1 }];
+    host.harness.sdk.stub("plugins.callRpc", async (args: Rpc) => {
+      calls.push(args);
+      if (args.method === "freeText") { const rows = obligations; obligations = []; return { obligations: rows }; }
+      if (args.method === "undelivered") return { undelivered: [] };
+      if (args.method === "replied") return { replied: [] };
+      if (args.method === "resolveFreeText") return { resolved: (args.input.refs as string[]).length };
+      return { ok: true, queued: 1, duplicate: false, mode: "on" };
+    });
+    await ownerSays(host, "6100", "hi");
+    const sends: string[] = [];
+    host.harness.sdk.stub("threads.send", async (args: { input: Array<{ text: string }> }) => { sends.push(args.input[0]?.text ?? ""); return {}; });
+    await host.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_cap", status: "idle" }), lastAssistantText: "ok" });
+    const told = sends.find((line) => line.includes("agent:i9"));
+    assert.ok(told, sends.join("\n"));
+    assert.match(told!, /firstmate_free_text/);
+    const resolved = await tool(host, "firstmate_free_text").execute({ refs: ["agent:i9"], disposition: "no-send" }, capCtx);
+    assert.match(text(resolved), /1/);
+    assert.deepEqual(calls.find((call) => call.method === "resolveFreeText")!.input, { refs: ["agent:i9"], disposition: "no-send" });
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
 });
