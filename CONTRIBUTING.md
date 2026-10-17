@@ -205,7 +205,7 @@ The pinned native source is vendored, read-only, under `native-snapshot/<sha>/â€
 mirroring native's own paths (`.agents/skills/<name>/SKILL.md`, or a named slice
 such as `AGENTS.section-9.md`). This is what the check diffs against, so it runs
 fully offline. It is a copy of native at the pin â€” never edit it by hand; re-vendor
-from the native clone when you bump a pin. Native is currently at `1f3e7696`.
+from the native clone when you bump a pin. Native is currently at `15ad1bd6`.
 
 Re-vendor with `node scripts/refresh-native-pin.mjs <native clone> <sha>`. It
 writes the new pin on a sync branch in a fresh worktree, never in this
