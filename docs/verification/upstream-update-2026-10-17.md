@@ -214,6 +214,23 @@ raised: a switch while a crew's model turn is running, with the real watcher.
    was lost.
 5. `firstmate_merge` merged PR #3 (`6222b47`) on the switched home.
 
+### Mid-turn switch with a wake inside the handoff (run 3)
+
+Evidence kept under `/tmp/hanoon/canary-evidence/run3/` on the build host:
+a 3-second timeline, wake-queue snapshots, state copies, keeper and watcher
+logs, and the crew and captain event logs.
+
+1. One crew turn (02:03:02 to 02:07:11 UTC) ran through two native switches:
+   forward to `e99f6c5e` at 02:04:18 and a rollback to `c9f623c8` at
+   02:06:54.
+2. A `working:` line written 5 s after the first switch was recorded as seen
+   by the old watcher. Native absorbs working lines without a wake.
+3. The crew's `done` line was written at 02:07:07, inside the watcher handoff
+   (02:07:04 to 02:07:07). The new watcher queued it at 02:07:38. The plugin
+   delivered it, and the captain reported PR #4.
+4. After a forward switch, `firstmate_merge` merged PR #4 (`7dbd9dd`). The
+   keeper log shows no shell error in this run.
+
 Observations, not changed here:
 - The captain once asked for a Claude model on the project's default Codex
   provider; that crew failed at its first turn. The captain retried with the
