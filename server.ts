@@ -1502,6 +1502,7 @@ const CAPTAIN_SKILLS = ["captain", "firstmate", "skill-routing"] as const;
 const CAPTAIN_TOOLS = [
   "firstmate_dispatch",
   "firstmate_reply",
+  "firstmate_alert",
   "firstmate_task",
   "firstmate_program",
   "firstmate_inbox",
