@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { stubProviderCatalog } from "./test/provider-catalog.mjs";
 import test from "node:test";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import plugin from "./server.ts";
@@ -52,7 +53,7 @@ async function realCaptain() {
   });
   await host.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
   await host.bb.storage.kv.set("crews", [crewRow("busy1", "thr_busy", "Fix the checkout total")]);
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   const state = { busy: true, catchupPending: false, spawnExit: 0, spawnOutput: "", spawned: false };
   const native = new Map<string, { title: string; kind: string }>();
   const seen: string[] = [];
@@ -197,7 +198,7 @@ async function plainCaptain() {
   });
   await host.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
   await host.bb.storage.kv.set("crews", [crewRow("busy1", "thr_busy", "Fix the checkout total")]);
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   const state = { busy: true };
   host.harness.sdk.stub("threads.send", async () => ({}));
   host.harness.sdk.stub("threads.events.list", async () => []);

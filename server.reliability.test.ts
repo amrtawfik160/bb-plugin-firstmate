@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { stubProviderCatalog } from "./test/provider-catalog.mjs";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
@@ -16,7 +17,7 @@ type Host = ReturnType<typeof createFakePluginHost>;
 async function load(seed: (host: Host) => Promise<void> = async () => {}) {
   const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: ["captain", "firstmate"] });
   await seed(host);
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   return host;
 }
 

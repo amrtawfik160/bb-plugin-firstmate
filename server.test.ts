@@ -1,4 +1,5 @@
 import {replacementFixture} from './lib/replacement.fixture.mjs';
+import { stubProviderCatalog } from "./test/provider-catalog.mjs";
 import { fixture as nativePromptFixture,scaffold as nativePromptScaffold } from './scripts/prompt-fixture.mjs';
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
@@ -105,7 +106,7 @@ async function load() {
     pluginId: "firstmate",
     agentSkillIds: SKILLS,
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   return host;
 }
 
@@ -382,7 +383,7 @@ test("fleet RPC identifies and scopes the current captain thread", async () => {
 
 test("fleet RPC skips native snapshots for ordinary threads", async () => {
   const host = ownerHost({ transport: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const { seen } = stubRoutedHost(host, () => ({}));
     host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
@@ -395,7 +396,7 @@ test("fleet RPC skips native snapshots for ordinary threads", async () => {
 
 test("fleet RPC shares concurrent native snapshots and caches repeated reads", async () => {
   const host = ownerHost({ transport: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const { seen } = stubRoutedHost(host, () => ({}));
     host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
@@ -560,7 +561,7 @@ test("dispatch with fmHome writes state meta and forget drops it", async () => {
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const hostCommands: string[] = [];
     host.harness.sdk.stub("threadSections.list", async () => []);
@@ -660,7 +661,7 @@ test("deck reuses shared home when automatic native profile is explicitly disabl
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", fullParityOnDeck: false },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubCaptainDeck(host);
     await host.harness.behavior.setSettings({ fmHostId: "host_1" });
@@ -683,7 +684,7 @@ test("host command terminal lingers past BB's open window, then exits so a lost 
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", fullParityOnDeck: false },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   const shim = mkdtempSync(join(tmpdir(), "fm-sleep-shim-"));
   try {
     stubCaptainDeck(host);
@@ -1574,7 +1575,7 @@ test("F2: the real afk contract + .afk flag write to the HOST-LEVEL path native 
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", fmHostId: "host_1", afkOwner: "real" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const hostCommands: string[] = [];
     host.harness.sdk.stub("threads.list", async () => []);
@@ -2411,7 +2412,7 @@ test("forget retries a transient host failure and names what is left when it sti
     pluginId: "firstmate", agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", queueOwner: "real", fmHostId: "host_1" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     let rmCalls = 0;
     stubRoutedHost(host, (wrapped) => {
@@ -2439,7 +2440,7 @@ test("forget finishes when a transient error hid an rm that applied and the retr
     pluginId: "firstmate", agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", queueOwner: "real", fmHostId: "host_1" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     let rmCalls = 0;
     stubRoutedHost(host, (wrapped) => {
@@ -2606,7 +2607,7 @@ test("merge runs native merge and teardown before retiring the crew", async () =
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const hostCommands: string[] = [];
     await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
@@ -2976,10 +2977,10 @@ test("relaunch stops at the stuck-ladder cap and resolves a replaced thread id",
     host.harness.sdk.stub("threads.stop", async () => ({}));
     host.harness.sdk.stub("threads.archive", async () => ({}));
     host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew2" }));
-    const first = await host.harness.behavior.runCli(["retry", "c1", "--model", "m1"]);
+    const first = await host.harness.behavior.runCli(["retry", "c1", "--model", "claude-sonnet-5-5"]);
     assert.equal(first.exitCode, 0, first.stderr);
     // The captain only holds the old thread id from a completion ping.
-    const second = await host.harness.behavior.runCli(["retry", "thr_crew", "--model", "m2"]);
+    const second = await host.harness.behavior.runCli(["retry", "thr_crew", "--model", "claude-haiku-5-5"]);
     assert.notEqual(second.exitCode, 0, second.stdout);
     assert.match(second.stderr, /second failure means report it failed/);
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 1);
@@ -3055,7 +3056,7 @@ test("guide reports computed toolbelt counts when known", async () => {
     agentSkillIds: SKILLS,
     settings: { fmScriptCount: "175", fmSkillCount: "21" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const result = await host.harness.behavior.runCli(["guide"]);
     assert.equal(result.exitCode, 0, result.stderr);
@@ -3071,7 +3072,7 @@ test("deck renders native Bearings without a competing chat-derived cache", asyn
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", fullParityOnDeck: false },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     host.harness.sdk.stub("threads.list", async () => []);
     host.harness.sdk.stub("threads.get", async () =>
@@ -3635,7 +3636,7 @@ test("captain sessions require a full contract read; crews never receive it", as
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", captainContract: "AHOY-CONTRACT-MARKER: supervise before ending a turn." },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const cap = await host.harness.behavior.resolveAgentConfiguration(
       makePluginAgentConfigurationContext({ pluginMetadata: { captain: "true" } }),
@@ -3658,7 +3659,7 @@ test("dispatch scaffolds the real structured brief via fm-brief when real mode i
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const hostCommands: string[] = [];
     host.harness.sdk.stub("threadSections.list", async () => []);
@@ -3701,7 +3702,7 @@ test("migrate-state imports absent crews into real state and is idempotent", asy
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     let metaPresent = false;
     const commands: string[] = [];
@@ -3828,7 +3829,7 @@ const HOLD_STREAM = [
 
 test("crew fold: a metaless crew folds as native `unknown` — mid-stream terminal does NOT suppress the open decision", async () => {
   const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { fmHome: "/tmp/fm-home" } });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
     crewFoldHost(host, HOLD_STREAM, { absent: true }); // no .meta → native `unknown` → no collapse
@@ -3843,7 +3844,7 @@ test("crew fold: a metaless crew folds as native `unknown` — mid-stream termin
 
 test("crew fold: a ship-meta crew collapses the mid-stream terminal, matching native ship", async () => {
   const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { fmHome: "/tmp/fm-home" } });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
     crewFoldHost(host, HOLD_STREAM, { body: "id=c1\nkind=ship\n" }); // ship meta → collapse
@@ -3987,7 +3988,7 @@ test("migrate-state reports failed when the host/state is unreachable (exists ==
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
     host.harness.sdk.stub("threads.list", async () => []);
@@ -4019,7 +4020,7 @@ test("migrate-state imports even when the brief scaffold fails; skips terminal c
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     // c1 active (import, brief fails); c2 finished DONE (terminal, skip).
     await host.bb.storage.kv.set("crews", [
@@ -4068,7 +4069,7 @@ test("tell --resolve-key writes the fm-classify resolved line into real state", 
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const hostCommands: string[] = [];
     await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
@@ -4178,7 +4179,7 @@ test("toolchain shows the heavy-command limiter's slot count and how many comman
     ["bash: fm-heavy: No such file or directory", 127, "HEAVY_LIMITER_UNKNOWN: fm-heavy --status failed: bash: fm-heavy: No such file or directory"],
   ] as const) {
     const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { fmHome: "/tmp/fm-home", fmHostId: "host_1" } });
-    await plugin(host.bb);
+    await plugin(host.bb); stubProviderCatalog(host);
     try {
       const { seen } = stubRealTransportHost(host, { spawnExit: 0, threadIdAfterSpawn: "thr_real" });
       host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) =>
@@ -4197,7 +4198,7 @@ test("toolchain shows the heavy-command limiter's slot count and how many comman
 
 test("real transport dispatches through fm-spawn.sh and adopts its thread id", async () => {
   const host = realHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const { seen } = stubRealTransportHost(host, { spawnExit: 0, threadIdAfterSpawn: "thr_real" });
     const result = await host.harness.behavior.runCli(
@@ -4225,7 +4226,7 @@ test("real transport dispatches through fm-spawn.sh and adopts its thread id", a
 
 test("real transport runs one fm-spawn at a time per home, so a slow spawn does not make the next dispatch fail on the task-set lock", async () => {
   const host = realHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealTransportHost(host, { spawnExit: 0, threadIdAfterSpawn: "thr_real" });
     const cmds = new Map<string, string>();
@@ -4276,7 +4277,7 @@ test("real transport runs one fm-spawn at a time per home, so a slow spawn does 
 
 test("real transport pins --harness bb for a scout too (else fm-spawn aborts on 'unknown')", async () => {
   const host = realHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const { seen } = stubRealTransportHost(host, { spawnExit: 0, threadIdAfterSpawn: "thr_scout" });
     const result = await host.harness.behavior.runCli(
@@ -4296,7 +4297,7 @@ test("real transport pins --harness bb for a scout too (else fm-spawn aborts on 
 
 test("real transport preserves a native refusal instead of spawning around it", async () => {
   const host = realHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew" }));
     const { seen } = stubRealTransportHost(host, { spawnExit: 1, threadIdAfterSpawn: "" });
@@ -4317,7 +4318,7 @@ test("real transport preserves a native refusal instead of spawning around it", 
 
 test("real transport never double-spawns when the meta already has a thread", async () => {
   const host = realHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew" }));
     const { seen } = stubRealTransportHost(host, {
@@ -4397,7 +4398,7 @@ function stubRaceHost(
 
 test("reconcile: a BLOCKED crew idle before its record existed still doorbells the captain", async () => {
   const host = realHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     await host.harness.behavior.setSettings({ supervisionEnabled: true });
     const blocked = "BLOCKED: cannot proceed — the captain expects this";
@@ -4425,7 +4426,7 @@ test("reconcile: a BLOCKED crew idle before its record existed still doorbells t
 
 test("reconcile: an in-band FAILED verdict on a fast crew also reaches the captain", async () => {
   const host = realHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     await host.harness.behavior.setSettings({ supervisionEnabled: true });
     stubRaceHost(host, { status: "idle", output: "FAILED: build broke — see log" });
@@ -4448,7 +4449,7 @@ test("reconcile: notifyOwner=real enqueues the durable wake for a raced BLOCKED 
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", transport: "real", queueOwner: "real", notifyOwner: "real", supervisionEnabled: true },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const { seen } = stubRaceHost(host, { status: "idle", output: "BLOCKED: needs a secret" });
     const result = await host.harness.behavior.runCli(
@@ -4470,7 +4471,7 @@ test("reconcile: notifyOwner=real enqueues the durable wake for a raced BLOCKED 
 
 test("reconcile: a still-active crew at dispatch is not prematurely reported", async () => {
   const host = realHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     await host.harness.behavior.setSettings({ supervisionEnabled: true });
     stubRaceHost(host, { status: "active", output: "still working" });
@@ -4487,7 +4488,7 @@ test("reconcile: a still-active crew at dispatch is not prematurely reported", a
 
 test("reconcile: duplicate idle event is coalesced while a changed verdict still reaches the captain", async () => {
   const host = realHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     await host.harness.behavior.setSettings({ supervisionEnabled: true });
     const blocked = "BLOCKED: waiting on approval";
@@ -4597,7 +4598,7 @@ function crewIdFromStdout(stdout: string): string {
 
 test("C1: real transport adds the backlog row (id=crew id, --kind ship) BEFORE fm-spawn", async () => {
   const host = realHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const { seen } = stubRealTransportBacklog(host, { threadIdAfterSpawn: "thr_real" });
     const result = await host.harness.behavior.runCli(
@@ -4640,7 +4641,7 @@ test("C1: real transport adds the backlog row (id=crew id, --kind ship) BEFORE f
 
 test("C1: real transport adds the backlog row with --kind scout for a scout", async () => {
   const host = realHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const { seen } = stubRealTransportBacklog(host, { threadIdAfterSpawn: "thr_scout" });
     const result = await host.harness.behavior.runCli(
@@ -4667,7 +4668,7 @@ test("C1: real transport requires queueOwner=real — refuses when kv", async ()
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", transport: "real" }, // queueOwner defaults kv
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_native" }));
     const { seen } = stubRealTransportBacklog(host, { threadIdAfterSpawn: "thr_real" });
@@ -4693,7 +4694,7 @@ test("C1: real transport requires queueOwner=real — refuses when kv", async ()
 
 test("C1: a failed backlog add never spawns a worker — refusal preserves ownership", async () => {
   const host = realHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_native" }));
     const { seen } = stubRealTransportBacklog(host, { addExit: 2, threadIdAfterSpawn: "thr_real" });
@@ -4712,7 +4713,7 @@ test("C1: a failed backlog add never spawns a worker — refusal preserves owner
 
 test("C1: a spawn that leaves no thread/orphan preserves the queued backlog row", async () => {
   const host = realHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_native" }));
     const { seen } = stubRealTransportBacklog(host, { spawnExit: 1, threadIdAfterSpawn: "", orphan: false });
@@ -4735,7 +4736,7 @@ test("C1: a spawn that leaves no thread/orphan preserves the queued backlog row"
 
 test("C2: the plugin writes NO canned intake-judgement essay to the brief (native's notice stands)", async () => {
   const host = realHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     // A ship dispatched below the standing posture: the plugin must NOT synthesize a
     // boilerplate "intake judgement" on the brief. The honest record is native
@@ -4762,7 +4763,7 @@ test("C2: the plugin writes NO canned intake-judgement essay to the brief (nativ
 
 test("F2: a crew's backlog row is closed on land even after settings flip to native mid-flight", async () => {
   const host = realHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const { seen } = stubRealTransportBacklog(host, { threadIdAfterSpawn: "thr_real" });
     const dispatched = await host.harness.behavior.runCli(
@@ -4798,7 +4799,7 @@ async function stuckHostWithWatchOwner(beat: { beatAge: number; ageOfCheck: numb
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", watchOwner: "fm-watch" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   stubBusyCrew(host);
   // The crew's host must resolve so per-host suppression (R1) can find its beat.
   host.harness.sdk.stub("environments.list", async () => [
@@ -4865,7 +4866,7 @@ test("the fm-watch supervisor relaunches the real watcher when the beacon is sta
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", watchOwner: "fm-watch", fmHostId: "host_1" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew", "thr_cap")]);
     // Beacon absent + keeper dead → the supervisor must write the keeper script and
@@ -4917,7 +4918,7 @@ test("fm-watch supervisor does NOT back off while the keeper is alive (watcher e
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", watchOwner: "fm-watch", fmHostId: "host_1" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     host.harness.sdk.stub("terminals.create", async () => ({ id: "term_k" }));
     host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
@@ -4974,7 +4975,7 @@ test("captain sessions get the version-pinned real skills inventory", async () =
       }),
     },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const cfg = await host.harness.behavior.resolveAgentConfiguration(
       makePluginAgentConfigurationContext({ pluginMetadata: { captain: "true" } }),
@@ -5044,7 +5045,7 @@ function stubOrphanTransportHost(
 
 test("real transport retains uncertain creation when only an untrusted title matches", async () => {
   const host = realHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_native" }));
     stubOrphanTransportHost(host, { byTitle: true });
@@ -5064,7 +5065,7 @@ test("real transport retains uncertain creation when only an untrusted title mat
 
 test("real transport adopts an orphan by exact launch metadata when the title differs", async () => {
   const host = realHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_native" }));
     stubOrphanTransportHost(host, { byTitle: false });
@@ -5090,7 +5091,7 @@ test("read-through drops a KV crew whose real state/<id>.meta is gone (one batch
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", readThrough: true, fmHostId: "host_1" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     host.harness.sdk.stub("threads.list", async () => []);
     // Only c1 still has a meta; c2 was torn down in the real plane.
@@ -5218,7 +5219,7 @@ function ownerHost(extra: Record<string, unknown> = {}) {
 
 test("A5 memory real: set-captain and add-learning write the tiered files + KV mirror", async () => {
   const host = ownerHost({ memoryOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const { writes } = stubRoutedHost(host, () => ({ payload: "", code: 0 }));
     const set = await host.harness.behavior.runCli(["memory", "set-captain", "prefers", "terse"], { projectId: "proj_1" });
@@ -5242,7 +5243,7 @@ test("R-a memory real: a large learnings file still writes (no command-size ceil
   // learnings.md silently froze past ~7.4 KB. Now the payload streams via stdin —
   // an existing 12 KB file must still take a new line.
   const host = ownerHost({ memoryOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const big = Array.from({ length: 200 }, (_, i) => `- 2026-01-01: old learning number ${i} padded padded padded <!--a:2026-01-01-->`).join("\n");
     assert.ok(Buffer.byteLength(big, "utf8") > 10000, "fixture must exceed the old 10000 ceiling");
@@ -5262,7 +5263,7 @@ test("R-a memory real: a large learnings file still writes (no command-size ceil
 
 test("R-a memory real: learnings cap rotates overflow to the archive, keeps the tail", async () => {
   const host = ownerHost({ memoryOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     // ~90 KB existing body (well over the 64 KB live cap).
     const huge = Array.from({ length: 900 }, (_, i) => `- 2026-01-01: learning ${i} ${"x".repeat(80)} <!--a:2026-01-01-->`).join("\n");
@@ -5289,7 +5290,7 @@ test("R-a memory real: a failed archive write keeps EVERY learning in the live f
   // F-rotate: if the overflow can't be archived, the live file must NOT be trimmed
   // to `kept` — it must retain the full body so oldest learnings are never dropped.
   const host = ownerHost({ memoryOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const huge = Array.from({ length: 900 }, (_, i) => `- 2026-01-01: learning ${i} ${"x".repeat(80)} <!--a:2026-01-01-->`).join("\n");
     assert.ok(Buffer.byteLength(huge, "utf8") > 64000, "fixture must exceed the cap so rotation triggers");
@@ -5318,7 +5319,7 @@ test("atomic write: a failed decode/rename never truncates the existing file", a
   // decodes to a sibling temp and `mv -f`'s over the target only on success, so a
   // failed write leaves the previous file byte-for-byte intact.
   const host = ownerHost({ memoryOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     let failCaptainDecode = false;
     const { writes, vfs } = stubRoutedHost(host, (cmd) => {
@@ -5348,7 +5349,7 @@ test("atomic write: a failed decode/rename never truncates the existing file", a
 
 test("A5 memory real: show reads the real files (source=real)", async () => {
   const host = ownerHost({ memoryOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRoutedHost(host, (cmd) => {
       if (cmd.includes("data/captain.md")) return { payload: "CAP-REAL" };
@@ -5367,7 +5368,7 @@ test("A5 memory real: show reads the real files (source=real)", async () => {
 
 test("A5 memory real: read failure degrades to the KV cache", async () => {
   const host = ownerHost({ memoryOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     await host.bb.storage.kv.set("memory-captain", "KV-CAP");
     // A non-zero exit on the cat means readMemoryFile returns null → fall back.
@@ -5383,7 +5384,7 @@ test("A5 memory real: read failure degrades to the KV cache", async () => {
 
 test("A5 memory kv default is unchanged (no host calls)", async () => {
   const host = ownerHost(); // memoryOwner defaults to kv
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const { seen } = stubRoutedHost(host, () => ({}));
     await host.harness.behavior.runCli(["memory", "set-captain", "x"], { projectId: "proj_1" });
@@ -5398,7 +5399,7 @@ test("A5 memory kv default is unchanged (no host calls)", async () => {
 
 test("D1 migrate-owners: never overwrites non-empty real memory with the KV cache; mirrors file→KV", async () => {
   const host = ownerHost({ memoryOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const fullLearn = "- 2026-01-01: FIRST authoritative learning (the head) <!--a:2026-01-01-->\n- 2026-01-02: second";
     // KV holds only a TRUNCATED tail (a D2 decapitation) — the old migrate wrote this back over the real file.
@@ -5426,7 +5427,7 @@ test("D1 migrate-owners: never overwrites non-empty real memory with the KV cach
 
 test("D1 migrate-owners: refuses to touch memory when the real file is unreadable", async () => {
   const host = ownerHost({ memoryOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     await host.bb.storage.kv.set("memory-learnings", "KV would-be-clobber");
     const { writes } = stubRoutedHost(host, (cmd) => {
@@ -5450,7 +5451,7 @@ const SENTINEL_LINE = "- 2026-01-01: reproduce the FM_MEM_ABSENT bug end-to-end 
 
 test("D1 sentinel (a): file content containing the literal FM_MEM_ABSENT round-trips byte-exact and is not empty", async () => {
   const host = ownerHost({ memoryOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRoutedHost(host, (cmd) => {
       if (cmd.includes("data/captain.md")) return { payload: "CAP-REAL", code: 0 };
@@ -5470,7 +5471,7 @@ test("D1 sentinel (a): file content containing the literal FM_MEM_ABSENT round-t
 
 test("D1 sentinel (b): migrate never overwrites a real file whose content contains the sentinel literal", async () => {
   const host = ownerHost({ memoryOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     await host.bb.storage.kv.set("memory-learnings", "SHORT-KV-CACHE"); // KV shorter than the real file
     const { writes } = stubRoutedHost(host, (cmd) => {
@@ -5488,7 +5489,7 @@ test("D1 sentinel (b): migrate never overwrites a real file whose content contai
 
 test("D1 sentinel (c): a genuinely-absent real file reads as absent and is seeded from KV", async () => {
   const host = ownerHost({ memoryOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     await host.bb.storage.kv.set("memory-learnings", "SEEDME-FROM-KV");
     const { writes } = stubRoutedHost(host, (cmd) => {
@@ -5506,7 +5507,7 @@ test("D1 sentinel (c): a genuinely-absent real file reads as absent and is seede
 
 test("D1 sentinel (d): a read FAILURE is distinct from empty — migrate refuses, never seeds/overwrites", async () => {
   const host = ownerHost({ memoryOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     await host.bb.storage.kv.set("memory-learnings", "WOULD-CLOBBER");
     const { writes } = stubRoutedHost(host, (cmd) => {
@@ -5526,7 +5527,7 @@ test("D1 sentinel (d): a read FAILURE is distinct from empty — migrate refuses
 
 test("D2 add-learning: KV mirrors the FULL learnings file — no mid-line -4000 slice decapitation", async () => {
   const host = ownerHost({ memoryOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const head = "- 2026-01-01: HEADLEARNING captain still owns the runtime rollout <!--a:2026-01-01-->";
     const filler = Array.from({ length: 60 }, (_, i) => `- 2026-01-02: filler learning ${i} ${"y".repeat(50)} <!--a:2026-01-02-->`).join("\n");
@@ -5552,7 +5553,7 @@ test("D2 add-learning: KV mirrors the FULL learnings file — no mid-line -4000 
 
 test("D3 session digest: recall reads the real files, not a stale KV cache (native /stow edits show)", async () => {
   const host = ownerHost({ memoryOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     // KV is STALE (as after a native /stow file edit that never touched KV).
     await host.bb.storage.kv.set("memory-captain", "STALE_KV_CAPTAIN");
@@ -5586,7 +5587,7 @@ test("D4 captain instructions: inject stored memory (prefs + learnings); crews g
       fmSkillsManifest: JSON.stringify({ head: "abc1234567890", skills: [{ name: "stow", desc: "tiered memory" }] }),
     },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const cfg = await host.harness.behavior.resolveAgentConfiguration(
       makePluginAgentConfigurationContext({ pluginMetadata: { captain: "true" } }),
@@ -5610,7 +5611,7 @@ test("D4 captain instructions: inject stored memory (prefs + learnings); crews g
 
 test("D5 memory clear: archives current contents before wiping the real file", async () => {
   const host = ownerHost({ memoryOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const existing = "- 2026-01-01: important learning to preserve <!--a:2026-01-01-->";
     await host.bb.storage.kv.set("memory-learnings", existing);
@@ -5632,7 +5633,7 @@ test("D5 memory clear: archives current contents before wiping the real file", a
 
 test("D5 memory clear: refuses to wipe (no loss) when the archive write fails", async () => {
   const host = ownerHost({ memoryOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const existing = "- 2026-01-01: must not be lost <!--a:2026-01-01-->";
     await host.bb.storage.kv.set("memory-learnings", existing);
@@ -5653,7 +5654,7 @@ test("D5 memory clear: refuses to wipe (no loss) when the archive write fails", 
 
 test("A3 afk real: on enters the durable contract and sets the flag", async () => {
   const host = ownerHost({ afkOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const { seen } = stubRoutedHost(host, () => ({ payload: "", code: 0 }));
     const on = await host.harness.behavior.runCli(["afk", "on", "--words", "back at 5"], { projectId: "proj_1" });
@@ -5669,7 +5670,7 @@ test("A3 afk real: on enters the durable contract and sets the flag", async () =
 
 test("A3 afk real: entry failure preserves the previous posture", async () => {
   const host = ownerHost({ afkOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRoutedHost(host, (cmd) => (cmd.includes("enter") ? { code: 3 } : { code: 0 }));
     const on = await host.harness.behavior.runCli(["afk", "on", "--words", "away"], { projectId: "proj_1" });
@@ -5684,7 +5685,7 @@ test("A3 afk real: entry failure preserves the previous posture", async () => {
 
 test("A4 quiet real: on writes state/.afk quiet, off clears it", async () => {
   const host = ownerHost({ quietOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const { seen } = stubRoutedHost(host, () => ({ code: 0 }));
     await host.harness.behavior.runCli(["quiet", "on"], { projectId: "proj_1" });
@@ -5698,7 +5699,7 @@ test("A4 quiet real: on writes state/.afk quiet, off clears it", async () => {
 
 test("A1 queue real: add owns the row id (add <id> <title> --kind); done drives that id", async () => {
   const host = ownerHost({ queueOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     // The plugin now SUPPLIES its own id (native convention) and never parses one
     // back, so arbitrary/prose add stdout can never mis-target a row.
@@ -5723,7 +5724,7 @@ test("A1 queue real: add owns the row id (add <id> <title> --kind); done drives 
 
 test("A1 queue real: missing tasks-axi retains unresolved full queue intent", async () => {
   const host = ownerHost({ queueOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRoutedHost(host, () => ({ code: 2 })); // tasks-axi not on PATH
     const add = await host.harness.behavior.runCli(["queue", "add", "ship it", "--project", "proj_1"], { projectId: "proj_1" });
@@ -5737,7 +5738,7 @@ test("A1 queue real: missing tasks-axi retains unresolved full queue intent", as
 
 test("A2 decisions real: ask holds a captain-hold row; answer closes it + resolves status", async () => {
   const host = ownerHost({ decisionsOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew", "thr_cap")]);
     const { seen } = stubRoutedHost(host, () => ({ code: 0 }));
@@ -5758,7 +5759,7 @@ test("A2 decisions real: ask holds a captain-hold row; answer closes it + resolv
 
 test("migrate-owners projects KV into the real files and is idempotent", async () => {
   const host = ownerHost({ queueOwner: "real", memoryOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     await host.bb.storage.kv.set("memory-captain", "MC");
     await host.bb.storage.kv.set("queue", [
@@ -5790,7 +5791,7 @@ test("R1 multi-host: a live watcher on host A does not suppress a stuck crew on 
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", watchOwner: "fm-watch" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     host.harness.sdk.stub("threads.list", async () => []);
     host.harness.sdk.stub("threads.send", async () => ({}));
@@ -5819,7 +5820,7 @@ test("R2 relay: actionable stale:/check: lines wake the manager; signal:/heartbe
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", watchOwner: "fm-watch", fmHostId: "host_1" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     host.harness.sdk.stub("terminals.create", async () => ({ id: "term_1" }));
     host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
@@ -5861,7 +5862,7 @@ test("inbox check wakes the deck manager even when no crews exist", async () => 
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", watchOwner: "fm-watch", fmHostId: "host_1" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     host.harness.sdk.stub("terminals.create", async () => ({ id: "term_1" }));
     host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
@@ -5899,7 +5900,7 @@ test("D6 relay: an fm-watch page reaches ONLY the owning captain; unattributable
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", watchOwner: "fm-watch", fmHostId: "host_1" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     host.harness.sdk.stub("terminals.create", async () => ({ id: "term_1" }));
     host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
@@ -5939,7 +5940,7 @@ test("D8 relay: a MULTI-crew stale line is split/filtered per owner (no cross-ca
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", watchOwner: "fm-watch", fmHostId: "host_1" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     host.harness.sdk.stub("terminals.create", async () => ({ id: "term_1" }));
     host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
@@ -5991,7 +5992,7 @@ test("D7: watchOwner=native tears the keeper down on the first tick even after a
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", watchOwner: "native", fmHostId: "host_1" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const cmds: string[] = [];
     let n = 0;
@@ -6026,7 +6027,7 @@ test("B3(c): dispose with the feature OFF tears the keeper down", async () => {
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", watchOwner: "native", fmHostId: "host_1" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   const cmds: string[] = [];
   let n = 0;
   host.harness.sdk.stub("threads.send", async () => ({}));
@@ -6055,7 +6056,7 @@ test("B3(c): dispose during a hot reload (watchOwner still fm-watch) LEAVES the 
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", watchOwner: "fm-watch", fmHostId: "host_1" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   const cmds: string[] = [];
   let n = 0;
   host.harness.sdk.stub("threads.send", async () => ({}));
@@ -6128,7 +6129,7 @@ test("B1: dispatch normalises the leading Captain-label out of the brief intent 
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const hostCommands: string[] = [];
     host.harness.sdk.stub("threadSections.list", async () => []);
@@ -6205,7 +6206,7 @@ test("B2: `bb firstmate wake` presents the ack instruction as the bb command, no
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", notifyOwner: "real", fmHostId: "host_1" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     host.harness.sdk.stub("terminals.create", async () => ({ id: "term_1" }));
     host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
@@ -6254,7 +6255,7 @@ test("B3(b): a failed owner-beat write is surfaced loudly, not swallowed", async
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", watchOwner: "fm-watch", fmHostId: "host_1", watchHeartbeatSec: 30 },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const cmds = new Map<string, string>();
     let n = 0;
@@ -6297,7 +6298,7 @@ test("R3 relaunch backoff: a persistently stale watcher is not relaunched every 
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", watchOwner: "fm-watch", fmHostId: "host_1", watchHeartbeatSec: 30 },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     let relaunchAttempts = 0;
     const cmds = new Map<string, string>();
@@ -6342,7 +6343,7 @@ test("R3 relaunch backoff: a persistently stale watcher is not relaunched every 
 
 test("R4 orphan adoption via broad list when the thread is not tagged firstmate-origin", async () => {
   const host = realHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_native" }));
     host.harness.sdk.stub("threadSections.list", async () => []);
@@ -6393,7 +6394,7 @@ test("R4 orphan adoption via broad list when the thread is not tagged firstmate-
 
 test("R5 read-through does not reap a crew whose meta write is known-failed", async () => {
   const host = ownerHost({ readThrough: true });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     host.harness.sdk.stub("threads.list", async () => []);
     host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ status: "active", environmentId: null }));
@@ -6467,7 +6468,7 @@ test("formatSecondmate renders scope and clone list", () => {
 
 test("F1: memory content equal to the heredoc delimiter round-trips and never injects", async () => {
   const host = ownerHost({ memoryOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const { seen, writes } = stubRoutedHost(host, () => ({ code: 0 }));
     // Exact PoC: lines equal to the OLD heredoc delimiters + a shell payload.
@@ -6488,7 +6489,7 @@ test("F1: memory content equal to the heredoc delimiter round-trips and never in
 
 test("F1: decision answer equal to the delimiter round-trips via base64 (no injection)", async () => {
   const host = ownerHost({ decisionsOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew", "thr_cap")]);
     const { seen, writes } = stubRoutedHost(host, () => ({ code: 0 }));
@@ -6518,7 +6519,7 @@ function afkFlagOp(cmds: string[]): "away" | "quiet" | "removed" | null {
 
 test("F2: afk + quiet both real never clobber the shared state/.afk flag", async () => {
   const host = ownerHost({ afkOwner: "real", quietOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const { seen } = stubRoutedHost(host, () => ({ code: 0 }));
     let mark = seen.length;
@@ -6541,7 +6542,7 @@ test("queue real: id-ownership is robust to arbitrary add output; transitions ta
   // Supersedes the old parse/quarantine tests: we supply the id, so prose or empty
   // add stdout can never mis-target or freeze a row, and start/done always fire.
   const host = ownerHost({ queueOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     let transitions: string[] = [];
     const { seen } = stubRoutedHost(host, (cmd) => {
@@ -6568,7 +6569,7 @@ test("queue real: id-ownership is robust to arbitrary add output; transitions ta
 
 test("queue real: native add refusal retains unresolved full queue intent", async () => {
   const host = ownerHost({ queueOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRoutedHost(host, (cmd) => (cmd.includes("'add'") ? { code: 1 } : { code: 0 }));
     const add = await host.harness.behavior.runCli(["queue", "add", "explicit", "--project", "proj_1"], { projectId: "proj_1" });
@@ -6645,7 +6646,7 @@ for (const dependency of ["gh-axi", "lavish-axi"]) {
     mkdirSync(join(home, "fakebin"));
     writeFileSync(join(home, `fakebin/${dependency}`), "#!/bin/sh\nprintf '0.0.1\\n'\n", { mode: 0o755 });
     const host = itHost(home, {});
-    await plugin(host.bb);
+    await plugin(host.bb); stubProviderCatalog(host);
     try {
       stubRealExecHost(host, { PATH: `${join(home, "fakebin")}:${process.env.PATH}` });
       const result = await host.harness.behavior.runCli(["toolchain", "--json"]);
@@ -6674,7 +6675,7 @@ test("IT lifecycle: native cleanup failure preserves recovery, retry removes onl
   const home = scratchFmHome();
   mkdirSync(join(home, "data"));
   const host = itHost(home, {});
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealExecHost(host);
     host.harness.sdk.stub("threads.list", async () => []);
@@ -6711,7 +6712,7 @@ test("IT lifecycle: native cleanup failure preserves recovery, retry removes onl
 
 test("notifyOwner=kv (default) sends the full report and enqueues no wake", async () => {
   const host = ownerHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const { seen } = stubRoutedHost(host, () => ({ code: 0 }));
     await seedCrew(host);
@@ -6731,7 +6732,7 @@ test("notifyOwner=kv (default) sends the full report and enqueues no wake", asyn
 
 test("tellOwner=kv (default) uses a bare doorbell, no durable record", async () => {
   const host = ownerHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const { seen } = stubRoutedHost(host, () => ({ code: 0 }));
     await seedCrew(host);
@@ -6756,7 +6757,7 @@ test("fmBackendEnv declares FM_SUPERVISION_MODEL=autoarm on every bb firstmate i
 
 test("bb firstmate fm routes with FM_SUPERVISION_MODEL=autoarm in the real command", async () => {
   const host = ownerHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const { seen } = stubRoutedHost(host, () => ({ code: 0 }));
     host.harness.sdk.stub("hosts.list", async () => [{ id: "host_1", name: "host_1" }]);
@@ -6794,7 +6795,7 @@ test("Part C: captainWakeDoorbell appends the drain hint only when drainHint=tru
 // recovery; the steer is immediate delivery even while the captain is busy.
 test("Part B: notifyOwner=real — a plain done is durably stored and steered into the captain turn", async () => {
   const host = ownerHost({ notifyOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const { seen } = stubRoutedHost(host, () => ({ code: 0 }));
     await seedCrew(host);
@@ -6815,7 +6816,7 @@ test("Part B: notifyOwner=real — a plain done is durably stored and steered in
 // so the plugin doorbell must still fire — the suppression must not silence real alerts.
 test("Part B: notifyOwner=real — a failure still doorbells the captain and requires explicit wake acknowledgment", async () => {
   const host = ownerHost({ notifyOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const { seen } = stubRoutedHost(host, () => ({ code: 0 }));
     await seedCrew(host);
@@ -6845,7 +6846,7 @@ test("Part B: notifyOwner=real — a failure still doorbells the captain and req
 // `kind === "idle"` alone.
 test("Part B: notifyOwner=real — an in-band BLOCKED (via thread.idle) still doorbells the captain", async () => {
   const host = ownerHost({ notifyOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRoutedHost(host, () => ({ code: 0 }));
     host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: null }));
@@ -6863,7 +6864,7 @@ test("Part B: notifyOwner=real — an in-band BLOCKED (via thread.idle) still do
 
 test("Part B: notifyOwner=real — an in-band FAILED (via thread.idle) still doorbells the captain", async () => {
   const host = ownerHost({ notifyOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRoutedHost(host, () => ({ code: 0 }));
     host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: null }));
@@ -6883,7 +6884,7 @@ test("Part B: notifyOwner=real — an in-band FAILED (via thread.idle) still doo
 // answer) lives in the durable queue, so its real-mode doorbell keeps the drain hint.
 test("Part C: notifyOwner=real — a NEEDS DECISION doorbell keeps the drain hint (open decision lives in the queue)", async () => {
   const host = ownerHost({ notifyOwner: "real", nudgeMaxPerCrew: 1, nudgeCooldownSeconds: 0 });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRoutedHost(host, () => ({ code: 0 }));
     host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: null }));
@@ -7006,7 +7007,7 @@ test("Part D: the @crew mention menu is scoped to the composing captain's own cr
 test("IT F1: notifyOwner=real — two DISTINCT crew reports both survive wake present+ack", { skip: !FM_INTEGRATION }, async () => {
   const home = scratchFmHome();
   const host = itHost(home, { notifyOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealExecHost(host);
     await seedCrew(host);
@@ -7039,7 +7040,7 @@ test("IT F1: notifyOwner=real — two DISTINCT crew reports both survive wake pr
 test("IT captain idle preserves delivered wakes until explicit native acknowledgement", { skip: !FM_INTEGRATION }, async () => {
   const home = scratchFmHome();
   const host = itHost(home, { notifyOwner: "real", turnEndGuard: "off" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealExecHost(host);
     await seedCrew(host);
@@ -7073,7 +7074,7 @@ test("IT captain idle preserves delivered wakes until explicit native acknowledg
 test("IT Part B: notifyOwner=real — a live-steered plain DONE is recoverable from the durable queue (incl. empty output)", { skip: !FM_INTEGRATION }, async () => {
   const home = scratchFmHome();
   const host = itHost(home, { notifyOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealExecHost(host);
     await seedCrew(host);
@@ -7106,7 +7107,7 @@ test("IT Part B: notifyOwner=real — a live-steered plain DONE is recoverable f
 test("IT D6: two captains — neither sees nor consumes the other's wakes (per-captain state plane)", { skip: !FM_INTEGRATION }, async () => {
   const home = scratchFmHome();
   const host = itHost(home, { notifyOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealExecHost(host);
     await host.bb.storage.kv.set("crews", [
@@ -7141,7 +7142,7 @@ test("IT D6: two captains — neither sees nor consumes the other's wakes (per-c
 test("IT D1/D2: migrate + add-learning preserve the real file head and mirror it to KV (real file I/O)", { skip: !FM_INTEGRATION }, async () => {
   const home = scratchFmHome();
   const host = itHost(home, { memoryOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealExecHost(host);
     // Seed a real data/learnings.md head line through the plugin's own writer (real cat/base64/mv).
@@ -7170,7 +7171,7 @@ test("IT D1/D2: migrate + add-learning preserve the real file head and mirror it
 test("IT F2: quiet hold + notifyOwner=real surfaces the held report at quiet-off", { skip: !FM_INTEGRATION }, async () => {
   const home = scratchFmHome();
   const host = itHost(home, { notifyOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealExecHost(host);
     await seedCrew(host);
@@ -7193,7 +7194,7 @@ test("IT F2: quiet hold + notifyOwner=real surfaces the held report at quiet-off
 test("IT F3: tellOwner=real steers a crew with NO state/<id>.meta (durable record + delivery)", { skip: !FM_INTEGRATION }, async () => {
   const home = scratchFmHome();
   const host = itHost(home, { tellOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealExecHost(host);
     await seedCrew(host);
@@ -7215,7 +7216,7 @@ test("IT F3: tellOwner=real steers a crew with NO state/<id>.meta (durable recor
 test("IT F4: tellOwner=real stores steer text VERBATIM for --key / --resolve-key / slash / $ / multiline", { skip: !FM_INTEGRATION }, async () => {
   const home = scratchFmHome();
   const host = itHost(home, { tellOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealExecHost(host);
     await seedCrew(host);
@@ -7248,7 +7249,7 @@ test("IT F4: tellOwner=real stores steer text VERBATIM for --key / --resolve-key
 test("IT F5: turnEndGuard bounds unchanged wakes and resets only for new work", { skip: !FM_INTEGRATION }, async () => {
   const home = scratchFmHome();
   const host = itHost(home, { turnEndGuard: "re-ring", turnEndGuardBudget: 2 });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealExecHost(host);
     host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
@@ -7296,7 +7297,7 @@ test("note: report lines never override the crew's real terminal verb (latestSta
 test("IT F3b: tellOwner=real leaves acknowledgement to the native worker", { skip: !FM_INTEGRATION }, async () => {
   const home = scratchFmHome();
   const host = itHost(home, { tellOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealExecHost(host);
     await seedCrew(host);
@@ -7590,7 +7591,7 @@ test("ACCEPTANCE (fm-watch-supervisor): a reload during a keeper relaunch-write 
     agentSkillIds: SKILLS,
     settings: { watchOwner: "fm-watch", fmHome: "/tmp/fm-home", fmHostId: "host_1" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     let writeStarted = false;
     let seq = 0;
@@ -7632,7 +7633,7 @@ for (const posture of ["normal", "quiet", "afk"]) {
   test(`IT existing PR preserves crew verdicts under ${posture} posture`, { skip: !FM_INTEGRATION }, async () => {
     const home = scratchFmHome();
     const host = itHost(home, { notifyOwner: "real", supervisionEnabled: true });
-    await plugin(host.bb);
+    await plugin(host.bb); stubProviderCatalog(host);
     try {
       stubRealExecHost(host);
       await seedCrew(host);
@@ -7670,7 +7671,7 @@ for (const posture of ["normal", "quiet", "afk"]) {
 test("IT current native AFK entry writes a valid durable record", { skip: !FM_INTEGRATION }, async () => {
   const home = scratchFmHome();
   const host = itHost(home, { afkOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealExecHost(host);
     const result = await host.harness.behavior.runCli(["afk", "on", "--words", "finish the queued fixes"], { threadId: "thr_cap", projectId: "proj_1" });
@@ -7698,7 +7699,7 @@ test("IT current native AFK entry writes a valid durable record", { skip: !FM_IN
 
 test("native captain contract tool returns the entire source beyond the SDK instruction limit", async () => {
   const host = ownerHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   await host.bb.storage.kv.set("native-home:thr_cap", "/tmp/fm-home");
   await host.bb.storage.kv.set("native-home-host:thr_cap", "host_1");
   try {
@@ -7736,7 +7737,7 @@ test("IT native away spend refusal stays queued and never spawns a BB worker", {
   assert.equal(spawnSync(join(home, "bin/fm-afk-contract.sh"), ["enter", "--spend", "1", "--words", "finish queued work"], { env }).status, 0);
   writeFileSync(join(home, "state/existing.meta"), "kind=ship\n");
   const host = itHost(home, { transport: "real", queueOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealExecHost(host);
     host.harness.sdk.stub("environments.list", async () => [{ hostId: "host_1", status: "ready", isWorktree: false, path: repo }]);
@@ -7759,7 +7760,7 @@ test("IT native captain holds persist and close through tasks-axi", { skip: !FM_
   const home = scratchFmHome();
   mkdirSync(join(home, "data"));
   const host = itHost(home, { decisionsOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealExecHost(host);
     const ask = await host.harness.behavior.runCli(["decide", "ask", "which database?"], { projectId: "proj_1" });
@@ -7792,7 +7793,7 @@ for (const entry of ["tool", "cli"] as const) {
   ]) {
   test(`${entry} host timeout: ${scenario.name}`, async (t) => {
     const host = ownerHost();
-    await plugin(host.bb);
+    await plugin(host.bb); stubProviderCatalog(host);
     const started = Date.now();
     let elapsed = 0;
     t.mock.method(Date, "now", () => started + elapsed);
@@ -7903,7 +7904,7 @@ for (const scenario of ["human", "active-event", "idle-event", "spawn-path", "in
   test(`IT AFK return reconciliation: ${scenario}`, { skip: !FM_INTEGRATION }, async () => {
     const home = scratchFmHome();
     const host = itHost(home, { afkOwner: "real" });
-    await plugin(host.bb);
+    await plugin(host.bb); stubProviderCatalog(host);
     try {
       stubRealExecHost(host);
       const entered = await host.harness.behavior.runCli(["afk", "on", "--words", "finish the queued fixes"], { threadId: "thr_cap", projectId: "proj_1" });
@@ -8000,7 +8001,7 @@ test("IT native decision refusal never resolves BB state or steers a worker", { 
   const home = scratchFmHome();
   mkdirSync(join(home, "data"));
   const host = itHost(home, { decisionsOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealExecHost(host);
     const ctx = { threadId: "thr_cap", projectId: "proj_1" };
@@ -8035,7 +8036,7 @@ test("IT captain homes isolate native backlog, memory and away authority", { ski
   const b = scratchFmHome();
   for (const home of [root, a, b]) mkdirSync(join(home, "data"));
   const host = itHost(root, { queueOwner: "real", afkOwner: "real", memoryOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealExecHost(host);
     for (const [captain, home] of [["thr_a", a], ["thr_b", b]]) await host.bb.storage.kv.set(`native-home:${captain}`, home);
@@ -8105,7 +8106,7 @@ test("IT native local merge respects captain hold and lands BB-named branch", as
     const head = git("-C", wt, "rev-parse", "HEAD");
     // Fake only the BB transport; all native merge/hold/backlog/teardown policy runs.
     writeFileSync(join(home, "fakebin/bb"), `#!/bin/sh\ncase "$1 $2" in\n 'thread show') printf '%s\\n' '${JSON.stringify({ id: "thr_crew", status: "idle", path: wt })}' ;;\n 'thread stop'|'thread archive'|'status ') exit 0 ;;\n *) echo 'unexpected BB transport operation' >&2; exit 1 ;;\nesac\n`, { mode: 0o755 });
-    await plugin(host.bb);
+    await plugin(host.bb); stubProviderCatalog(host);
     stubRealExecHost(host, { PATH: `${join(home, "fakebin")}:${process.env.PATH}` });
     host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }));
     const row = { ...shipRow("c1", "thr_crew", "thr_cap"), posture: "local-only", nativeHome: home, backlogRow: true };
@@ -8202,7 +8203,7 @@ test("IT native return keeps ordinary work gated until its blocker resolves", { 
   writeFileSync(join(home, "state/repair.meta"), "id=repair\nkind=ship\nbackend=bb\n");
   writeFileSync(join(home, "state/repair.status"), "blocked [key=auth]: fixture credential needed\n");
   const host = itHost(home, { afkOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealExecHost(host);
     const ctx = { threadId: "thr_cap", projectId: "proj_1" };
@@ -8226,7 +8227,7 @@ test("IT quiet refuses a failed native flag write without changing cache", { ski
   const home = scratchFmHome();
   mkdirSync(join(home, "state/.afk"));
   const host = itHost(home, { quietOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealExecHost(host);
     const ctx = { threadId: "thr_cap" };
@@ -8256,7 +8257,7 @@ test("concurrent captain queue and decision writes preserve every owner's rows",
 
 test("deck refuses readiness when a configured native adapter cannot refresh", async () => {
   const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { fmHome: "/native", fmHostId: "host_1", fullParityOnDeck: true } });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     await host.bb.storage.kv.set("native-home:thr_cap", "/native/captain");
     await host.bb.storage.kv.set("native-home-host:thr_cap", "host_1");
@@ -8277,7 +8278,7 @@ test("IT secondmate registration rejects a mismatched native parent", { skip: !F
   writeFileSync(join(home, ".fm-secondmate-parent"), "schema=fm-secondmate-parent.v1\nroute=local\nparent_home=/tmp/wrong-parent\n");
   writeFileSync(join(home, "AGENTS.md"), "Fixture captain contract\n");
   const host = itHost(home, {});
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealExecHost(host);
     await host.bb.storage.kv.set("native-home:thr_cap", home);
@@ -8325,7 +8326,7 @@ test("IT BB bootstrap uses browser plugin without requiring AXI browser", { skip
   const probe = join(dir, "no-axi-browser.sh");
   writeFileSync(probe, 'command() { if [ "$*" = "-v chrome-devtools-axi" ]; then return 1; fi; builtin command "$@"; }\n');
   const host = itHost(home, {});
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     assert.equal(spawnSync("git", ["clone", "--quiet", "--shared", discoverFirstmateCheckout()!, home]).status, 0);
     const installed = spawnSync("python3", [join(OVERLAY_ROOT, "install-bb-backend.py"), "--home", home], { encoding: "utf8" });
@@ -8352,7 +8353,7 @@ test("IT BB bootstrap uses browser plugin without requiring AXI browser", { skip
 for (const entry of ["tool", "cli"] as const) {
   test(`wake ${entry}: timeout keeps its cause instead of claiming missing initialization`, async (t) => {
     const host = ownerHost();
-    await plugin(host.bb);
+    await plugin(host.bb); stubProviderCatalog(host);
     const started = Date.now();
     let elapsed = 0;
     const receipts = new Set<string>();
@@ -8396,7 +8397,7 @@ for (const entry of ["tool", "cli"] as const) {
 
 test("wake retries an exited terminal's failed output read without rerunning the command", async () => {
   const host = ownerHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     // The post-drain housekeeping sweep runs its own host commands; only the drain command is counted.
     let reads = 0;
@@ -8424,7 +8425,7 @@ test("wake retries an exited terminal's failed output read without rerunning the
 
 test("wake resolves an unconfigured host from the calling captain's environment", async () => {
   const host = ownerHost({ fmHostId: "" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_cap", environmentId: "env_cap" }));
     host.harness.sdk.stub("environments.get", async () => ({ hostId: "host_captain" }));
@@ -8448,7 +8449,7 @@ test("IT wake script failure remains an error and preserves the queue", { skip: 
   const queue = join(state, ".wake-queue");
   writeFileSync(queue, "retained fixture wake\n");
   const host = itHost(home, {});
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealExecHost(host);
     const result = await host.harness.behavior.runCli(["wake"], { threadId: "thr_cap" });
@@ -8764,7 +8765,7 @@ test("doorbell is skipped only when BB's ping already ran a captain turn that en
 
 async function crewDoneWithCaptainWoken(woken: boolean) {
   const host = ownerHost({ notifyOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   const { seen } = stubRoutedHost(host, (cmd) => {
     // BB's own completion ping starts (and finishes) a captain turn while the
     // plugin is still persisting the durable wake.
@@ -8853,7 +8854,7 @@ test("fm-watch relay: a finished crew's stale page and a foreign thread's page n
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", watchOwner: "fm-watch", fmHostId: "host_1" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_run", "thr_cap"), crewRow("c2", "thr_done", "thr_cap")]);
     await host.bb.storage.kv.set("fm-watch-captain:host_1", "thr_cap");
@@ -8881,7 +8882,7 @@ test("fm-watch relay: the base home never falls back to a captain that owns its 
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", watchOwner: "fm-watch", fmHostId: "host_1" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     await host.bb.storage.kv.set("crews", []);
     await host.bb.storage.kv.set("fm-watch-captain:host_1", "thr_safi");
@@ -8975,7 +8976,7 @@ test("live repro: an idle captain at 790k estimated tokens under a 967k provider
 async function compactionHost() {
   const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { captainCompactAtTokens: 200000 } });
   await host.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   return { host, idle: stubCompactionHost(host) };
 }
 
@@ -9132,7 +9133,7 @@ test("IT archived captain stops a real native watcher and preserves its status",
   });
   const exited = new Promise<void>(resolve => watcher.once("exit", () => resolve()));
   const host = itHost(home, { watchOwner: "fm-watch" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const deadline = Date.now() + 10000;
     while (!existsSync(join(home, "state/.last-watcher-beat")) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
@@ -9175,7 +9176,7 @@ for (const operation of ["context", "compact"] as const) {
   test(`captain wake release aborts during a hung ${operation} call`, async () => {
     const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { captainCompactAtTokens: 200000 } });
     await host.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
-    await plugin(host.bb);
+    await plugin(host.bb); stubProviderCatalog(host);
     let unblock!: () => void;
     let entered!: () => void;
     const blocked = new Promise<void>(resolve => { unblock = resolve; });
@@ -9234,7 +9235,7 @@ test("no-op wakes end silently: the escalation skill no longer asks for 'Captain
 
 test("a crew WAITING: yield is not nagged, never wakes the captain, and is resumed later", async () => {
   const host = ownerHost({ notifyOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const { seen } = stubRoutedHost(host, () => ({ code: 0 }));
     captainAndCrewThreads(host);
@@ -9276,7 +9277,7 @@ function liveCrewQueue(host: Awaited<ReturnType<typeof load>>) {
 
 test("repeated WAITING: yields keep exactly one scheduled resume and spend no extra budget", async () => {
   const host = ownerHost({ notifyOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRoutedHost(host, () => ({ code: 0 }));
     captainAndCrewThreads(host);
@@ -9298,7 +9299,7 @@ test("repeated WAITING: yields keep exactly one scheduled resume and spend no ex
 
 test("a parked crew woken by a leftover timer stays parked: no nag, resume kept; a verdict cancels the resume", async () => {
   const host = ownerHost({ notifyOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRoutedHost(host, () => ({ code: 0 }));
     captainAndCrewThreads(host);
@@ -9327,7 +9328,7 @@ test("a parked crew woken by a leftover timer stays parked: no nag, resume kept;
 
 test("one wake per crew outcome: BB's own child ping replaces the plugin doorbell when the report is durable", async () => {
   const host = ownerHost({ notifyOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const { seen } = stubRoutedHost(host, () => ({ code: 0 }));
     captainAndCrewThreads(host, {}, { parentThreadId: "thr_cap", originKind: null });
@@ -9429,7 +9430,7 @@ test("fm-watch relay: a page whose delivery failed is retried next cycle, not dr
     agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", watchOwner: "fm-watch", fmHostId: "host_1" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   t.mock.timers.enable({ apis: ["setTimeout"] });
   try {
     await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_run", "thr_cap")]);
@@ -9487,7 +9488,7 @@ test("firstmate_contract: complete native contract verbatim by default, sections
 
 test("oversized firstmate_fm output is capped inline and saved whole on the host", async () => {
   const host = ownerHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const big = `HEAD-MARK\n${"peek line\n".repeat(3000)}TAIL-MARK`;
     const { writes } = stubRoutedHost(host, (cmd) => (cmd.includes("fm-peek") ? { payload: big, code: 0 } : { code: 0 }));
@@ -9749,7 +9750,7 @@ test("Oct 14 repro: a tell to an idle crew is delivered at the crew cap; retry s
 
 test("read-through keeps a dispatched crew whose thread still waits for a host slot (no meta yet)", async () => {
   const host = ownerHost({ readThrough: true });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     host.harness.sdk.stub("threads.list", async () => []);
     stubRoutedHost(host, () => ({ payload: "", code: 0 }));
@@ -9887,7 +9888,7 @@ function stubNativeMerge(host: Awaited<ReturnType<typeof load>>, router: (cmd: s
 
 test("merge trusts fm-pr-merge's verified MERGED readback over BB's stale PR cache", async () => {
   const host = nativeMergeHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const url = "https://github.com/o/r/pull/1";
     await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
@@ -9912,7 +9913,7 @@ test("merge trusts fm-pr-merge's verified MERGED readback over BB's stale PR cac
 // nothing native is left; the landed crew is then retired on the BB side.
 async function mergeWithTeardownRefusal(refusal: string) {
   const host = nativeMergeHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   const url = "https://github.com/o/r/pull/1";
   await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
   const routed = stubNativeMerge(host, (cmd) => {
@@ -9966,7 +9967,7 @@ test("merge: another task's missing record is still a teardown refusal", async (
 
 test("merge resolves a crew PR the environment cache misses (crew pushed to an existing PR)", async () => {
   const host = nativeMergeHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const url = "https://github.com/o/r/pull/5";
     await host.bb.storage.kv.set("crews", [{ ...shipRow("c1", "thr_crew", "thr_cap"), prUrl: url }]);
@@ -10055,7 +10056,7 @@ test("forget --stop accepts squash-merged work whose remote branch is gone", asy
 
 test("forgetting a ship retires its armed native check and state sidecars", async () => {
   const host = nativeMergeHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubForgetSdk(host, { dirty: [] });
     const routed = stubRoutedHost(host, () => ({}));
@@ -10140,7 +10141,7 @@ test("briefSections splits headed task text so no section is nested or empty", (
 
 test("real dispatch of headed task text fills intent and spec from the task's own sections", async () => {
   const host = realHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const { seen } = stubRealTransportBacklog(host, { threadIdAfterSpawn: "thr_real" });
     const task = "## Captain's intent\nfix the login redirect\n\n## Firstmate spec\nTouch only auth.ts.";
@@ -10164,7 +10165,7 @@ test("every real brief names skill-routing, poteto mode and the playbook that ma
     [["--", "## Captain's intent\nAdd CSV export\n\n## Firstmate spec\nTouch only auth.ts."], "feature.md", "Touch only auth.ts."],
   ] as const) {
     const host = realHost();
-    await plugin(host.bb);
+    await plugin(host.bb); stubProviderCatalog(host);
     try {
       const { seen } = stubRealTransportBacklog(host, { threadIdAfterSpawn: "thr_real" });
       const result = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", ...args], { projectId: "proj_1" });
@@ -10192,7 +10193,7 @@ test("a real brief picks the playbook from the dispatch title, and --playbook ov
     [["--title", "Fix agent computer feature", "--playbook", "refactoring", "--", "Add the missing feature"], "poteto-mode/playbooks/refactoring.md"],
   ] as const) {
     const host = realHost();
-    await plugin(host.bb);
+    await plugin(host.bb); stubProviderCatalog(host);
     try {
       const { seen } = stubRealTransportBacklog(host, { threadIdAfterSpawn: "thr_real" });
       const result = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", ...args], { projectId: "proj_1" });
@@ -10242,7 +10243,7 @@ test("a BB-transport crew prompt also names skill-routing, poteto mode and the m
 
 test("report-only dispatch fills an investigation specification without implementation boilerplate", async () => {
   const host = realHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const { seen } = stubRealTransportBacklog(host, { threadIdAfterSpawn: "thr_real" });
     const result = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--shape", "scout", "--", "Investigate missing Telegram delivery and report evidence."], { projectId: "proj_1" });
@@ -10257,7 +10258,7 @@ test("report-only dispatch fills an investigation specification without implemen
 
 test("a refused brief removes the backlog row its own dispatch created", async () => {
   const host = realHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const { seen } = stubRealTransportBacklog(host, {
       spawnExit: 1,
@@ -10277,7 +10278,7 @@ test("a refused brief removes the backlog row its own dispatch created", async (
 
 test("a long task scaffolds a brief that carries the full intent, spec and skills block", async () => {
   const host = realHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const { seen } = stubRealTransportBacklog(host, { threadIdAfterSpawn: "thr_real" });
     const intent = "i".repeat(3000);
@@ -10304,7 +10305,7 @@ test("a long task scaffolds a brief that carries the full intent, spec and skill
 
 test("a brief that cannot be written fails the dispatch before fm-spawn and holds no crew slot", async () => {
   const host = realHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const { seen } = stubRealTransportBacklog(host, { threadIdAfterSpawn: "" });
     const cmds = new Map<string, string>();
@@ -10377,13 +10378,13 @@ test("queue add carries providerId/model/reasoningLevel through to the dispatche
     host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "starting" }));
     const queue = agentTool(host, "firstmate_queue");
     const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
-    const added = toolText(await queue.execute({ action: "add", title: "fix login", providerId: "acp-grok", model: "grok-4", reasoningLevel: "high" }, ctx));
+    const added = toolText(await queue.execute({ action: "add", title: "fix login", providerId: "acp-grok", model: "grok-4.6", reasoningLevel: "high" }, ctx));
     const id = /Queued (\S+)/.exec(added)![1]!;
     const dispatched = await queue.execute({ action: "dispatch", queueId: id }, ctx);
     assert.ok(!isToolError(dispatched), toolText(dispatched));
     const spawn = host.harness.sdk.callsTo("threads.spawn")[0]![0] as { providerId?: string; model?: string; reasoningLevel?: string };
     assert.equal(spawn.providerId, "acp-grok");
-    assert.equal(spawn.model, "grok-4");
+    assert.equal(spawn.model, "grok-4.6");
     assert.equal(spawn.reasoningLevel, "high");
   } finally {
     await host.harness.lifecycle.dispose();
@@ -10395,7 +10396,7 @@ test("bearings counts the real backlog, and queue dispatch adopts a hand-filed n
     pluginId: "firstmate", agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", queueOwner: "real", fmHostId: "host_1" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const routed = stubRoutedHost(host, (wrapped) => {
       const cmd = unwrapHostCommand(wrapped);
@@ -10432,7 +10433,7 @@ test("queue dispatch without projectId launches a queued item in its own project
     pluginId: "firstmate", agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", queueOwner: "real", fmHostId: "host_1" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRoutedHost(host, (wrapped) => {
       const cmd = unwrapHostCommand(wrapped);
@@ -10463,7 +10464,7 @@ test("queue dispatch of a native row reads the FULL task text, not the truncated
     pluginId: "firstmate", agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", queueOwner: "real", fmHostId: "host_1" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   const full = `URGENT production incident. ${"The admin dashboard shows a server error after login. ".repeat(4)}Reference 1YPKM-184Z.`;
   try {
     const routed = stubRoutedHost(host, (wrapped) => {
@@ -10493,7 +10494,7 @@ test("queue dispatch of a native row reads the FULL task text, not the truncated
 
 test("real transport adopts the created thread when BB answers 504 while the crew is being made", async () => {
   const host = realHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_native" }));
     stubOrphanTransportHost(host, { byTitle: false });
@@ -10519,7 +10520,7 @@ test("queue dispatch of a native row splits a long title into a short title and 
     pluginId: "firstmate", agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", queueOwner: "real", fmHostId: "host_1" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   const full = `${"Investigate the flaky export job. ".repeat(20)}TAILMARK-9Z`;
   assert.ok(full.length > 500, "the title is over the 500 char title limit");
   try {
@@ -10547,7 +10548,7 @@ test("queue dispatch of a native row splits a long title into a short title and 
 
 test("real transport re-looks for the thread after a 504 spawn failure and adopts it once it appears", async () => {
   const host = realHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_native" }));
     const captured = stubOrphanTransportHost(host, { byTitle: false });
@@ -10590,7 +10591,7 @@ test("maxFanout caps a fan-out dispatch and a watch batch", async () => {
     pluginId: "firstmate", agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", maxFanout: 2 },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const refused = await host.harness.behavior.runCli(
       ["dispatch", "--project", "proj_1", "--task", "one", "--task", "two", "--task", "three"],
@@ -10622,7 +10623,7 @@ test("maxFanout caps a fan-out dispatch and a watch batch", async () => {
 
 test("wake drain preserves open decisions even when the crew register and metadata are gone", async () => {
   const host = ownerHost({ notifyOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     await host.bb.storage.kv.set("crews", [crewRow("live1234", "thr_live", "thr_cap")]);
     const routed = stubRoutedHost(host, (wrapped) => {
@@ -10649,7 +10650,7 @@ test("queue drop closes a hand-filed native backlog row, and prune forgets finis
     pluginId: "firstmate", agentSkillIds: SKILLS,
     settings: { fmHome: "/tmp/fm-home", queueOwner: "real", fmHostId: "host_1" },
   });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const routed = stubRoutedHost(host, (wrapped) => {
       const cmd = unwrapHostCommand(wrapped);
@@ -10683,7 +10684,7 @@ test("queue drop closes a hand-filed native backlog row, and prune forgets finis
 
 test("wake drain retires a Lavish source whose artifact is gone through the native procevent script", async () => {
   const host = ownerHost({ notifyOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const routed = stubRoutedHost(host, (wrapped) => {
       const cmd = unwrapHostCommand(wrapped);
@@ -10786,7 +10787,7 @@ test("async dispatch CLI queues work past the running-crew cap", async () => {
 
 test("read-through: a dropped crew is not re-recovered and re-dropped on every call", async () => {
   const host = ownerHost({ readThrough: true });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     // The thread still carries crew metadata (the recovery sweep sees it), but
     // native state has no meta for it: it is torn down.
@@ -10812,7 +10813,7 @@ test("read-through: a dropped crew is not re-recovered and re-dropped on every c
 
 test("a scheduled WAITING resume is dropped once the crew stopped waiting (stopped/forgotten), and a waiting crew holds a cap slot", async () => {
   const host = ownerHost({ notifyOwner: "real", maxActiveCrews: 1 });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRoutedHost(host, () => ({ code: 0 }));
     captainAndCrewThreads(host);
@@ -10845,7 +10846,7 @@ test("a scheduled WAITING resume is dropped once the crew stopped waiting (stopp
 
 test("BB's child ping does not replace the doorbell while the captain is rate-limited: the wake is held", async () => {
   const host = ownerHost({ notifyOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRoutedHost(host, () => ({ code: 0 }));
     captainAndCrewThreads(host, {}, { parentThreadId: "thr_cap", originKind: null });
@@ -10983,7 +10984,7 @@ test("the landed sweep never wakes an archived (retired) owning captain", async 
 
 test("routine durable plugin wakes batch once; decisions bypass the delay", async () => {
   const host = ownerHost({ notifyOwner: "real", captainWakeBatchMs: 30 });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRoutedHost(host, () => ({ code: 0 }));
     captainAndCrewThreads(host);
@@ -11008,7 +11009,7 @@ test("routine durable plugin wakes batch once; decisions bypass the delay", asyn
 test("persisted routine batch survives restart and failed delivery", async () => {
   const host = ownerHost({ notifyOwner: "real", captainWakeBatchMs: 30 });
   await host.bb.storage.kv.set("captain-wake-hold:thr_cap", { since: Date.now() - 1000, dueAt: Date.now() - 500, reason: "routine event batch", lines: ["DONE: retained outcome"] });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     captainAndCrewThreads(host);
     host.harness.sdk.stub("threads.send", async () => { throw new Error("temporary transport failure"); });
@@ -11024,7 +11025,7 @@ test("persisted routine batch survives restart and failed delivery", async () =>
 test("IT receipts replay across reload, reject failed final actions and complete on success", { skip: !FM_INTEGRATION }, async () => {
   const home = scratchFmHome();
   const host = itHost(home, { notifyOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealExecHost(host);
     await seedCrew(host);
@@ -11058,7 +11059,7 @@ test("IT receipts replay across reload, reject failed final actions and complete
 
 test("batch timer send must not pin release service on abort", async () => {
   const host = ownerHost({ notifyOwner: "real", captainWakeBatchMs: 10 });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   let unblock!: () => void;
   let enter!: () => void;
   const entered = new Promise<void>(r => enter = r);
@@ -11084,7 +11085,7 @@ test("batch timer send must not pin release service on abort", async () => {
 
 test("interaction urgency bypasses batching", async () => {
   const host = ownerHost({ notifyOwner: "real", captainWakeBatchMs: 5000 });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRoutedHost(host, () => ({ code: 0 }));
     captainAndCrewThreads(host);
@@ -11098,7 +11099,7 @@ test("interaction urgency bypasses batching", async () => {
 
 
 test("native host operations can call back into activity without self-deadlock", async () => {
-  const host = ownerHost(); await plugin(host.bb);
+  const host = ownerHost(); await plugin(host.bb); stubProviderCatalog(host);
   try {
     host.harness.sdk.stub("hosts.list", async () => [{ id: "host_1", name: "host_1" }]);
     host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_worker", status: "active" }));
@@ -11124,7 +11125,7 @@ test("native host operations can call back into activity without self-deadlock",
 test("IT inbox parity: one queued doorbell, worker ack removes it across reload", { skip: !FM_INTEGRATION }, async () => {
   const home = scratchFmHome();
   let host = itHost(home, { tellOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealExecHost(host);
     await seedCrew(host);
@@ -11174,7 +11175,7 @@ test("IT inbox parity: one queued doorbell, worker ack removes it across reload"
 test("IT inbox parity: BB accepting a steer is not worker acknowledgement", { skip: !FM_INTEGRATION }, async () => {
   const home = scratchFmHome();
   const host = itHost(home, { tellOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealExecHost(host);
     await seedCrew(host);
@@ -11190,7 +11191,7 @@ test("IT inbox parity: BB accepting a steer is not worker acknowledgement", { sk
 test("IT inbox parity: failed queue delivery retries without deleting unread records", { skip: !FM_INTEGRATION }, async () => {
   const home = scratchFmHome();
   const host = itHost(home, { tellOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealExecHost(host);
     await seedCrew(host);
@@ -11221,7 +11222,7 @@ test("IT inbox parity: failed queue delivery retries without deleting unread rec
 test("IT inbox parity: deferred steer is reported queued, unreadable inbox never falls back to literal delivery", { skip: !FM_INTEGRATION }, async () => {
   const home = scratchFmHome();
   const host = itHost(home, { tellOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealExecHost(host);
     await seedCrew(host);
@@ -11240,7 +11241,7 @@ test("IT inbox parity: deferred steer is reported queued, unreadable inbox never
 test("IT inbox parity: a missing record is not an acknowledgement", { skip: !FM_INTEGRATION }, async () => {
   const home = scratchFmHome();
   const host = itHost(home, { tellOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealExecHost(host); await seedCrew(host);
     let row: unknown;
@@ -11273,7 +11274,7 @@ class BbHttpError extends Error {
 // the sweep re-rang it every 30s and logged the 409 about 85 times an hour.
 test("inbox delivery to an archived thread is closed once with the reason and never retried", async () => {
   let host = ownerHost({ tellOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRoutedHost(host, (cmd) => cmd.includes("python3 -c") ? { payload: "pending\n" } : { code: 0 });
     host.harness.sdk.stub("threads.queuedMessages.list", async () => []);
@@ -11311,7 +11312,7 @@ test("inbox delivery to an archived thread is closed once with the reason and ne
 test("IT inbox parity: a tell to an archived crew thread says NOT delivered, never 'pending retry'", { skip: !FM_INTEGRATION }, async () => {
   const home = scratchFmHome();
   const host = itHost(home, { tellOwner: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealExecHost(host);
     await seedCrew(host);
@@ -11630,7 +11631,7 @@ test("a failed queued row with the same body is re-sent instead of appended", as
 
 test("native startup tool routes to the agent shell without attempting a host-terminal lock", async () => {
   const host = ownerHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   await host.bb.storage.kv.set("native-home:thr_cap", "/tmp/fm-home");
   await host.bb.storage.kv.set("native-home-host:thr_cap", "host_1");
   try {
@@ -11669,7 +11670,7 @@ test("startup command preserves shell arguments without executing their contents
 
 test("CLI startup returns the same harness-shell command without host execution", async () => {
   const host = ownerHost();
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   await host.bb.storage.kv.set("native-home:thr_cap", "/tmp/fm-home");
   await host.bb.storage.kv.set("native-home-host:thr_cap", "host_1");
   try {
@@ -11694,7 +11695,7 @@ for (const missing of [false, true]) {
       writeFileSync(join(home,"data/c1/launch-brief.md"),role.stdout+"\n"+f.brief);
     } else {rmSync(join(home,"data/c1/brief.md"));}
     const host = itHost(home, { transport: "real" });
-    await plugin(host.bb);
+    await plugin(host.bb); stubProviderCatalog(host);
     try {
       stubRealExecHost(host);
       host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: "error", environmentId: "env_wt" }));
@@ -11723,7 +11724,7 @@ for (const missing of [false, true]) {
 
 test("native worker idle honors durable status without imposing chat verdicts or scheduled resumes", async () => {
   const host = ownerHost({ transport: "real", watchOwner: "fm-watch", supervisionEnabled: true });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubIdleSdk(host);
     host.harness.sdk.stub("threads.queuedMessages.list", async () => []);
@@ -11743,7 +11744,7 @@ test("native worker idle honors durable status without imposing chat verdicts or
 
 test("a native worker's chat-only WAITING: yield is recorded as a paused line the watcher can read", async () => {
   const host = ownerHost({ transport: "real", watchOwner: "fm-watch", supervisionEnabled: true });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubIdleSdk(host);
     host.harness.sdk.stub("threads.queuedMessages.list", async () => []);
@@ -11766,7 +11767,7 @@ test("a native worker's chat-only WAITING: yield is recorded as a paused line th
 
 test("native Bearings uses canonical decisions and gates across CLI, tool, session and RPC", async () => {
   const host = ownerHost({ transport: "real" });
-  await plugin(host.bb);
+  await plugin(host.bb); stubProviderCatalog(host);
   try {
     const { seen } = stubRoutedHost(host, cmd => cmd.includes("fm-bearings-snapshot.sh") ? { payload: nativeBearingsFixture({
       home: "fixture/base-label",
@@ -11815,7 +11816,7 @@ test("native replacement refuses a stale owned inbox helper before stopping or s
   const home=nativePromptFixture();
   nativePromptScaffold(home,"c1","ship","local-only");
   writeFileSync(join(home,"bin-bb/fm-inbox-take.py"),"obsolete helper ignoring immutable IDs\n");
-  const host=itHost(home,{transport:"real"});await plugin(host.bb);
+  const host=itHost(home,{transport:"real"});await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealExecHost(host);
     host.harness.sdk.stub("threads.get",async({threadId}:{threadId:string})=>makeThreadResponse({id:threadId,status:"error",environmentId:"env_wt"}));
@@ -11832,7 +11833,7 @@ for (const pin of ["2d833ff147cd26a5c461e914e06854e0eb2707ce", "1f3e769616fdf9f3
     const parent=nativePromptFixture(pin),work=mkdtempSync(join(tmpdir(),"fm-remote-compat-")),child=join(work,"child");
     const seeded=spawnSync("bash",[join(parent,"bin/fm-home-seed.sh"),"domain",child,"--no-projects"],{env:{...process.env,FM_HOME:parent,FM_BACKEND:"bb",FM_SECONDMATE_CHARTER:"Fixture audit",FM_SECONDMATE_SCOPE:"Fixture audit"},encoding:"utf8",timeout:30000});
     assert.equal(seeded.status,0,seeded.stdout+seeded.stderr);
-    const host=itHost(parent,{});await plugin(host.bb);
+    const host=itHost(parent,{});await plugin(host.bb); stubProviderCatalog(host);
     try {
       stubRealExecHost(host);
       host.harness.sdk.stub("threads.get",async({threadId}:{threadId:string})=>makeThreadResponse({id:threadId,status:"idle",environmentId:"env_main"}));

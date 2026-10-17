@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { stubProviderCatalog } from "./test/provider-catalog.mjs";
 import test from 'node:test';
 import {spawnSync} from 'node:child_process';
 import {mkdirSync,rmSync} from 'node:fs';
@@ -23,7 +24,7 @@ function sdk(host) {
  host.harness.sdk.stub('threads.output',async()=>({output:'DONE: done'}));host.harness.sdk.stub('threads.events.list',async()=>[]);
 }
 async function factory(settings={},previous) {
- const host=previous??createFakePluginHost({pluginId:'firstmate',settings});if(!previous)await plugin(host.bb);sdk(host);return host;
+ const host=previous??createFakePluginHost({pluginId:'firstmate',settings});if(!previous)await plugin(host.bb); stubProviderCatalog(host);sdk(host);return host;
 }
 function hostCommands(host,respond) {
  const commands=[];const outputs=new Map();let n=0;

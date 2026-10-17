@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { stubProviderCatalog } from "./test/provider-catalog.mjs";
 import test from 'node:test';
 import { createFakePluginHost,makeThreadResponse,makePluginAgentConfigurationContext } from '@get-bb/plugin-sdk/testing';
 import plugin from './server.ts';
@@ -21,7 +22,7 @@ function hostCommands(host,answer) {
  return commands;
 }
 async function base(settings={}) {
- const host=createFakePluginHost({pluginId:'firstmate',agentSkillIds:['firstmate','captain','skill-routing','calm','catch-up','captain-methods','worker-methods',...UPSTREAM_SKILL_NAMES],settings});await plugin(host.bb);
+ const host=createFakePluginHost({pluginId:'firstmate',agentSkillIds:['firstmate','captain','skill-routing','calm','catch-up','captain-methods','worker-methods',...UPSTREAM_SKILL_NAMES],settings});await plugin(host.bb); stubProviderCatalog(host);
  commonStubs(host);return host;
 }
 function commonStubs(host) {
