@@ -629,6 +629,7 @@ const FOLLOW_UP_DUE_LIMIT = 100;
 const RETAINED_SWEEP_MS = 10 * 60_000;
 const GRAPHQL_RESERVE = 1000;
 const FOLLOW_UP_READS_PER_HOUR = 500;
+const COVERED_DISCOVERY_MS = 30 * 60_000;
 /** `gh api -i … --jq`: the status line and headers, a blank line, then one JSON row per line. A plain answer has rows only. */
 function parseListAnswer(output: string): { status: number; etag?: string; next: boolean; rows: Record<string, unknown>[] } {
   let status = 200, etag: string | undefined, next = false, body = output;
@@ -7045,7 +7046,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (ownerState === "lost") record=deliveries.markOwnerNeeded(record.id) ?? record;
       else if (ownerState === "live") record=deliveries.ownerRestored(record.id) ?? record;
       const hostId = await resolveHostForProject(record.projectId,ownerState === "live" ? record.owner ?? undefined : undefined,signal);
-      const result = await runStructuredOnHost(hostId, `gh pr view ${shQuote(record.url)} --json ${PR_VIEW_FIELDS} --jq ${shQuote(PR_VIEW_JQ)}`,30_000,signal);
+      const result = await ghGraphql(hostId, `gh pr view ${shQuote(record.url)} --json ${PR_VIEW_FIELDS} --jq ${shQuote(PR_VIEW_JQ)}`,30_000,signal);
       if (result.exitCode !== 0) throw new Error(result.stderr || result.output || `Forge lookup exit ${result.exitCode}`);
       const observation = parseForge(JSON.parse(result.output));
       // Standing yolo allows asking the manager to continue; only native merge
@@ -7488,7 +7489,8 @@ export default async function plugin(bb: BbPluginApi) {
         // A ledger row can be closed-era: a PR reopened since keeps the task.
         const reopened: string[] = [];
         for (const r of records) {
-          const read = await runStructuredOnHost(hostId, `gh pr view ${shQuote(r.url)} --json state`, 30_000, signal);
+          if (graphqlReadsAllowed(hostId) === 0) { reopened.push(`${r.id} not read: GraphQL reserve reached`); break; }
+          const read = await ghGraphql(hostId, `gh pr view ${shQuote(r.url)} --json state`, 30_000, signal);
           const state = read.exitCode === 0 ? String(asRecord(JSON.parse(read.output || "{}"))["state"] ?? "") : "";
           if (state !== "MERGED" && state !== "CLOSED") reopened.push(`${r.id} ${state || `unreadable (exit ${read.exitCode})`}`);
         }
@@ -7506,23 +7508,44 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
   const backgroundReads: number[] = [];
+  const crewDiscoveredAt = new Map<string, number>();
+  // GraphQL points left per host, from the X-Ratelimit headers of this plugin's own PR
+  // reads: GitHub enforces those, and the rate_limit overview read 1,126 points more.
+  const graphqlMeters = new Map<string, { remaining: number; reset: number }>();
   let quotaWarnedUntil = 0;
-  async function graphqlQuotaLeft(signal?: AbortSignal): Promise<boolean> {
-    const first = deliveries.list({ due: Date.now(), limit: 1 })[0];
-    if (!first) return true;
-    try {
-      const hostId = await resolveHostForProject(first.projectId, first.owner ?? undefined, signal);
-      const res = await runStructuredOnHost(hostId, `gh api rate_limit --jq .resources.graphql`, 30_000, signal);
-      const limit = asRecord(JSON.parse(res.output || "{}"));
-      if (res.exitCode !== 0 || typeof limit["remaining"] !== "number") return true;
-      if (limit["remaining"] >= GRAPHQL_RESERVE) return true;
-      const reset = typeof limit["reset"] === "number" ? limit["reset"] * 1000 : Date.now() + 60_000;
-      if (Date.now() >= quotaWarnedUntil) { quotaWarnedUntil = reset; bb.log.warn(`PR follow-up paused: ${limit["remaining"]} GitHub GraphQL points left, under the ${GRAPHQL_RESERVE} kept for crews and verdict refreshes; resumes after ${new Date(reset).toISOString()}`); }
-      return false;
-    } catch (error) {
-      if (signal?.aborted) throw error;
-      return true;
+  async function ghGraphql(hostId: string, command: string, timeoutMs: number, signal?: AbortSignal) {
+    // gh's debug output carries whole response bodies; only the rate-limit headers, and the
+    // last lines of a failure, come back.
+    const wrapped = `t=$(mktemp) || exit 1; GH_DEBUG=api ${command} 2>"$t"; rc=$?; grep -i '^< x-ratelimit-' "$t" >&2; [ "$rc" -eq 0 ] || grep -v '^[<>*]' "$t" | tail -n 5 >&2; rm -f "$t"; exit "$rc"`;
+    const res = await runStructuredOnHost(hostId, wrapped, timeoutMs, signal);
+    let remaining: number | undefined, reset: number | undefined, seen = false;
+    for (const line of res.stderr.split("\n")) {
+      const header = /^<\s*x-ratelimit-(remaining|reset|resource):\s*(\S+)/i.exec(line.trim());
+      if (!header) continue;
+      if (header[1]!.toLowerCase() === "remaining") remaining = Number(header[2]);
+      else if (header[1]!.toLowerCase() === "reset") reset = Number(header[2]) * 1000;
+      else if (header[2]!.toLowerCase() === "graphql" && Number.isFinite(remaining) && Number.isFinite(reset)) { graphqlMeters.set(hostId, { remaining: remaining!, reset: reset! }); seen = true; }
     }
+    if (!seen && res.exitCode !== 0 && /rate.?limit/i.test(res.stderr)) graphqlMeters.set(hostId, { remaining: 0, reset: Date.now() + 60_000 });
+    else if (!seen && res.exitCode === 0 && !graphqlMeters.has(hostId)) {
+      // A gh that prints no headers leaves only the hourly allowance to bound the loop.
+      graphqlMeters.set(hostId, { remaining: Number.POSITIVE_INFINITY, reset: Date.now() + 3_600_000 });
+      bb.log.warn(`gh on ${hostId} returned no GraphQL rate-limit headers; PR follow-up is bounded by its hourly allowance alone`);
+    }
+    return res;
+  }
+  /** Background GraphQL reads allowed now: none under the reserve, one probe while the meter is unknown or past its reset. */
+  function graphqlReadsAllowed(hostId: string): number {
+    const meter = graphqlMeters.get(hostId);
+    if (!meter || Date.now() >= meter.reset) return 1;
+    if (meter.remaining >= GRAPHQL_RESERVE) return Number.POSITIVE_INFINITY;
+    if (Date.now() >= quotaWarnedUntil) { quotaWarnedUntil = meter.reset; bb.log.warn(`PR follow-up paused: ${meter.remaining} GitHub GraphQL points left, under the ${GRAPHQL_RESERVE} kept for crews, merges and verdict refreshes; resumes after ${new Date(meter.reset).toISOString()}`); }
+    return 0;
+  }
+  async function backgroundHost(signal?: AbortSignal): Promise<string | undefined> {
+    const first = deliveries.list({ limit: 1 })[0];
+    if (!first) return undefined;
+    try { return await resolveHostForProject(first.projectId, first.owner ?? undefined, signal); } catch (error) { if (signal?.aborted) throw error; return undefined; }
   }
   async function deliveryPass(signal?: AbortSignal) {
     // First, so a PR opened this minute gets its row and its first GitHub read in this cycle.
@@ -7531,9 +7554,20 @@ export default async function plugin(bb: BbPluginApi) {
     const crews = await raceAbort(readCrews(),signal,STUCK_HOST_CALL_MS);
     const batch = [...crews.slice(deliveryDiscoveryCursor),...crews.slice(0,deliveryDiscoveryCursor)].slice(0,10);
     deliveryDiscoveryCursor = crews.length ? (deliveryDiscoveryCursor+batch.length)%crews.length : 0;
+    // The open list read this cycle tracks every open PR of a crew whose repository it
+    // covered. Such a crew is looked up on its own only while it has no tracked PR, at most
+    // every 30 minutes, for a PR merged between two lists. Lookups count against the
+    // hourly allowance and stop under the GraphQL reserve.
+    const host = await backgroundHost(signal);
+    while (backgroundReads.length && backgroundReads[0]! <= Date.now()-3_600_000) backgroundReads.shift();
     for (const crew of batch) {
       signal?.throwIfAborted();
+      if (openPrSnapshot?.repos.some((repo) => repo.projects.has(crew.projectId))
+        && (deliveries.forTasks([crew.id]).length > 0 || Date.now() - (crewDiscoveredAt.get(crew.id) ?? 0) < COVERED_DISCOVERY_MS)) continue;
+      if (backgroundReads.length >= FOLLOW_UP_READS_PER_HOUR || (host !== undefined && graphqlReadsAllowed(host) === 0)) break;
       if (!retries.isDue("pr-discovery", crew.threadId, Date.now())) continue;
+      crewDiscoveredAt.set(crew.id, Date.now());
+      backgroundReads.push(Date.now());
       try {
         await boundedFollowUp(s=>discoverCrewDelivery(crew,s),signal);
         retryCleared("pr-discovery", crew.threadId);
@@ -7553,13 +7587,17 @@ export default async function plugin(bb: BbPluginApi) {
     const now=Date.now();
     while (backgroundReads.length && backgroundReads[0]! <= now-3_600_000) backgroundReads.shift();
     const allowance=Math.max(0,FOLLOW_UP_READS_PER_HOUR-backgroundReads.length);
-    const due=allowance>0 && await graphqlQuotaLeft(signal) ? deliveries.list({ due:now,limit:Math.min(FOLLOW_UP_DUE_LIMIT,allowance) }) : [];
+    const due=host !== undefined && graphqlReadsAllowed(host) === 0 ? [] : deliveries.list({ due:now,limit:Math.min(FOLLOW_UP_DUE_LIMIT,allowance) });
     for (let i=0;i<due.length;i++) backgroundReads.push(now);
+    const follow=(record:DeliveryRecord)=>boundedFollowUp(async s=>{await reconcileDelivery(record,s);await notifyDelivery(record,s);},signal).catch(error=>bb.log.warn(`PR follow-up ${record.id}: ${String(error)}`));
+    // With no meter yet, or past its reset, one read probes the quota before the rest.
     let next=0;
+    if (host !== undefined && due.length && (!graphqlMeters.has(host) || Date.now() >= graphqlMeters.get(host)!.reset)) await follow(due[next++]!);
     await Promise.all(Array.from({ length:Math.min(FOLLOW_UP_CONCURRENCY,due.length) },async()=>{
       for (let record=due[next++]; record!==undefined; record=due[next++]) {
         signal?.throwIfAborted();
-        await boundedFollowUp(async s=>{await reconcileDelivery(record!,s);await notifyDelivery(record!,s);},signal).catch(error=>bb.log.warn(`PR follow-up ${record!.id}: ${String(error)}`));
+        if (host !== undefined && graphqlReadsAllowed(host) === 0) break;
+        await follow(record);
       }
     }));
     await retireEndedRetainedRecords(signal).catch((error) => { if (!signal?.aborted) bb.log.warn(`Retained native records: ${String(error)}`); });
