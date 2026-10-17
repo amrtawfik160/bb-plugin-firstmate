@@ -939,6 +939,9 @@ test("crew 0940c38e's final report with a pending verify step is flagged NOT VER
     // The weekly scorecard counts this done claim without proof once, with no PR record needed.
     const card = JSON.parse((await host.harness.behavior.runCli(["scorecard", "--json"], { threadId: "thr_cap", projectId: "proj_1" } as never)).stdout);
     assert.deepEqual(card.unproven.map((u: { crew: string; run: string }) => [u.crew, u.run]), [["0940c38e", "thr_crew"]]);
+    // Its DONE ends it, so a later crew of the same role on its owner task counts as redone work.
+    const ended = host.bb.storage.database().prepare("SELECT key FROM quality_events WHERE kind = 'crew-ended'").all() as { key: string }[];
+    assert.deepEqual(ended.map((row) => row.key), ["crew-ended:0940c38e"]);
   } finally {
     await host.harness.lifecycle.dispose();
   }

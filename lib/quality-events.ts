@@ -19,15 +19,23 @@ export function createQualityEvents(db: Db) {
       .map((row) => ({ ...(JSON.parse(row.data) as T), at: row.at }));
 
   return {
-    /** Records that a crew works on an owner task. Returns the redo it is, or null: the same
-     * task already had a crew of the same role and shape. Checkers check; they redo nothing. */
+    /** A crew ended: done, failed, stopped or retired. The first end is kept. */
+    noteCrewEnded(input: { captain: string; crew: string; outcome: string; at: number }): boolean {
+      return note(`crew-ended:${input.crew}`, "crew-ended", input.captain, input.at, { crew: input.crew, outcome: input.outcome.split("\n")[0]!.slice(0, 200) });
+    },
+    /** Records that a crew works on an owner task. Returns the redo it is, or null. A redo is a
+     * crew started after an earlier crew of the same role on that task ended: it does that work
+     * again. A crew beside a running one, a later stage (another role) and a checker are not. */
     noteTaskCrew(input: TaskCrew & { captain: string; title: string; at: number }): RedoEvent | null {
       const before = db.prepare("SELECT data FROM quality_events WHERE kind = 'task-crew' AND captain = ? AND key LIKE ?").all(input.captain, `task-crew:${input.task}:%`) as { data: string }[];
       const fresh = note(`task-crew:${input.task}:${input.crew}`, "task-crew", input.captain, input.at, { task: input.task, crew: input.crew, role: input.role, shape: input.shape });
       if (!fresh || input.role === "checker") return null;
-      const after = before.map((row) => JSON.parse(row.data) as TaskCrew).filter((c) => c.role === input.role && c.shape === input.shape).map((c) => c.crew);
-      if (after.length === 0) return null;
-      const redo: RedoEvent = { task: input.task, title: input.title, crew: input.crew, role: input.role, shape: input.shape, after, reason: `another ${input.role} ${input.shape} crew on owner task ${input.task} after ${after.join(", ")}` };
+      const ended = before.map((row) => JSON.parse(row.data) as TaskCrew).filter((c) => c.role === input.role).flatMap((c) => {
+        const end = db.prepare("SELECT at, data FROM quality_events WHERE key = ?").get(`crew-ended:${c.crew}`) as { at: number; data: string } | undefined;
+        return end !== undefined && end.at <= input.at ? [{ crew: c.crew, outcome: (JSON.parse(end.data) as { outcome: string }).outcome }] : [];
+      });
+      if (ended.length === 0) return null;
+      const redo: RedoEvent = { task: input.task, title: input.title, crew: input.crew, role: input.role, shape: input.shape, after: ended.map((e) => e.crew), reason: `started on owner task ${input.task} after ${input.role} crew ${ended.map((e) => `${e.crew} ended (${e.outcome})`).join(", ")}` };
       note(`redo:${input.crew}`, "redo", input.captain, input.at, redo);
       return redo;
     },

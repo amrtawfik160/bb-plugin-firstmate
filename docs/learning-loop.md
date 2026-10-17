@@ -37,7 +37,7 @@ thread passes `--captain`; so does the reflect crew.
 | Line | Unit | Source |
 | --- | --- | --- |
 | Owner corrections | corrections | the corrections ledger |
-| Redone work | redone crews | a re-dispatch record, written when an owner task gets another crew of the same role and shape as an earlier one. A lookup then a builder, a scout then a ship, and checkers are not redone work. |
+| Redone work | crews | a re-dispatch record, written when a crew starts on an owner task after an earlier crew of the same role on that task ended (done, failed, stopped or retired). A crew beside a running one, a later stage (a lookup then a builder) and checkers are not redone work. The scorecard line names this rule. |
 | Checker findings | findings, in fail verdicts | one record per checker verdict (PR, head, checker crew), with its notes and its `--findings <n>` count. A fail verdict without a count is named as such. |
 | Done claims without proof | claims, by crews | one record per crew run whose done report missed its proof step, from the done-report check or the verify gate, whichever sees it first |
 | Noise | Telegram messages | `bb telegram export`: the connector's outbox rows created in the week: sent, not delivered (failed or uncertain), still queued |
@@ -60,8 +60,18 @@ done claims without proof and redone work, read for the named captain; it
 opens a PR or edits captain.md), and the instruction to send the owner the
 reflect crew's CHANGELOG lines. Before it sends, it saves the week and an
 operation id; the message's first line carries both. A later run finds that
-line in the captain's log and does not send again. One run at a time
-(`flock`). Without `--send` it prints the message and sends nothing.
+line in the captain's structured log (searched from the first try to the
+end, within 3 minutes) and does not send again. It sends again only when
+that search reached the end without finding it; an unfinished search sends
+nothing and waits for the next run. One run at a time (`flock`). Without
+`--send` it prints the message and sends nothing.
+
+Every bb call has a 30-second timeout. The Telegram read has a 3-minute
+budget: it reads row 0 first (which alone can prove the week incomplete),
+finds the week's first row with a binary search, and halves its page size
+when the connector says a page is too large. When the budget runs out the
+noise line says `not available (export timed out)`, and the rest of the
+scorecard and the reflect request still go to the captain.
 
 Limit: the Telegram connector has a project field only on replies and cards.
 The captain posts the scorecard as its own message. Its first line names the

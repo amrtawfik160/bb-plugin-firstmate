@@ -10,12 +10,12 @@
 // sends, and a later run looks for that marker in the captain's log before it sends again.
 // Env: FM_CAPTAIN_THREAD (the live captain), FM_REFLECT_PROJECT (the BB project of the reflect
 // crew). Optional: FM_SCORECARD_STATE (state file). --now <iso> sets the clock.
-import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { captainMessage, renderScorecard, scheduledWeek, telegramWeek, type ScorecardData, type TelegramWeek } from "../owner/scorecard.ts";
+import { bb, findMessage } from "./bb-calls.ts";
 import { singleRun } from "./single-run.ts";
 
 const args = process.argv.slice(2);
@@ -35,61 +35,83 @@ if (!Number.isFinite(now)) {
 const statePath = process.env.FM_SCORECARD_STATE || join(homedir(), ".bb-firstmate", "scorecard", "state.json");
 singleRun(`${statePath}.lock`, "weekly-scorecard");
 
-type State = { weeks?: Record<string, { op: string; text: string; sent: boolean }> };
+type Entry = { op: string; text: string; sent: boolean; at: string; receipt?: unknown };
+type State = { weeks?: Record<string, Entry> };
 let state: State = {};
 try { state = JSON.parse(readFileSync(statePath, "utf8")); } catch { state = {}; }
 const save = (next: State) => {
   writeFileSync(`${statePath}.tmp`, `${JSON.stringify(next, null, 2)}\n`);
   renameSync(`${statePath}.tmp`, statePath);
 };
-const bb = (argv: string[]) => execFileSync("bb", argv, { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
+// The Telegram read and the log search each get a budget well inside the automation's 10
+// minutes, so the captain still gets the scorecard when the connector hangs.
+const EXPORT_BUDGET_MS = Number(process.env.FM_SCORECARD_EXPORT_BUDGET_MS) || 3 * 60_000;
+const SEARCH_BUDGET_MS = Number(process.env.FM_SCORECARD_SEARCH_BUDGET_MS) || 3 * 60_000;
 const week = scheduledWeek(now);
 const prior = state.weeks?.[week.key];
-const record = (entry: { op: string; text: string; sent: boolean }) => save({ weeks: Object.fromEntries([...Object.entries(state.weeks ?? {}), [week.key, entry]].slice(-10)) });
+const record = (entry: Entry) => save({ weeks: Object.fromEntries([...Object.entries(state.weeks ?? {}), [week.key, entry]].slice(-10)) });
 
-function tell(text: string): void {
+function tell(text: string): unknown {
   const scratch = mkdtempSync(join(tmpdir(), "scorecard-"));
   try {
     writeFileSync(join(scratch, "message.md"), text);
-    bb(["thread", "tell", captain, "--message-file", join(scratch, "message.md")]);
+    const out = bb(["thread", "tell", captain, "--message-file", join(scratch, "message.md"), "--json"]);
+    try { return JSON.parse(out); } catch { return out.trim(); }
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
 }
 
-// The connector's outbox rows in order of creation, 20 per page. Pages before the week are
-// skipped by a binary search over page numbers.
+type Row = { created_at: number; state: string };
+// The connector's outbox rows in order of creation. Row 0 alone can prove the week incomplete.
+// A binary search over single rows finds the week's first row; pages from there shrink when
+// the connector says a page is too large. Every call and the whole read have a time budget.
 function readTelegram(since: number, until: number): TelegramWeek {
+  const deadline = Date.now() + EXPORT_BUDGET_MS;
+  const rows = (offset: number, limit: number): Row[] => {
+    const left = deadline - Date.now();
+    if (left <= 0) throw new Error("budget");
+    return (JSON.parse(bb(["telegram", "export", "--offset", String(offset), "--limit", String(limit)], Math.min(30_000, left))).outbox ?? []) as Row[];
+  };
   try {
-    const page = (n: number) => (JSON.parse(bb(["telegram", "export", "--offset", String(n * 20), "--limit", "20"])).outbox ?? []) as { created_at: number; state: string }[];
-    const first = page(0);
+    const first = rows(0, 1);
     if (first.length === 0) return telegramWeek([], null, since, until);
-    const reaches = (rows: { created_at: number }[]) => rows.length === 0 || rows[rows.length - 1]!.created_at >= since;
+    if (first[0]!.created_at > since) return telegramWeek([], first[0]!.created_at, since, until);
+    const before = (offset: number) => { const [row] = rows(offset, 1); return row !== undefined && row.created_at < since; };
     let lo = 0;
-    let hi = 0;
-    while (!reaches(hi === 0 ? first : page(hi))) { lo = hi; hi = hi === 0 ? 1 : hi * 2; }
-    while (lo < hi) { const mid = Math.floor((lo + hi) / 2); if (reaches(mid === 0 ? first : page(mid))) hi = mid; else lo = mid + 1; }
-    const rows: { created_at: number; state: string }[] = [];
-    for (let n = hi; ; n++) {
-      const p = n === 0 ? first : page(n);
-      rows.push(...p);
-      if (p.length < 20 || p[p.length - 1]!.created_at >= until) break;
+    let hi = 1;
+    while (before(hi)) { lo = hi; hi *= 2; }
+    while (lo + 1 < hi) { const mid = Math.floor((lo + hi) / 2); if (before(mid)) lo = mid; else hi = mid; }
+    const week: Row[] = [];
+    let size = 20;
+    for (let offset = hi; ;) {
+      let page: Row[];
+      try { page = rows(offset, size); } catch (error) {
+        if (size > 1 && /too large/i.test(String((error as { stderr?: string }).stderr ?? error))) { size = Math.max(1, Math.floor(size / 2)); continue; }
+        throw error;
+      }
+      week.push(...page);
+      if (page.length < size || page[page.length - 1]!.created_at >= until) break;
+      offset += page.length;
     }
-    return telegramWeek(rows, first[0]!.created_at, since, until);
-  } catch {
-    return { unavailable: "bb telegram export failed" };
+    return telegramWeek(week, first[0]!.created_at, since, until);
+  } catch (error) {
+    return { unavailable: Date.now() >= deadline || (error as { code?: string }).code === "ETIMEDOUT" || String(error).includes("budget") ? "export timed out" : "bb telegram export failed" };
   }
 }
 
+const earlier = send && prior !== undefined && !prior.sent ? findMessage(captain, prior.text.split("\n")[0]!, Date.parse(prior.at), SEARCH_BUDGET_MS) : undefined;
 if (send && prior?.sent) {
   console.log(`weekly-scorecard: already sent the week ending ${week.key}`);
-} else if (send && prior !== undefined && bb(["thread", "log", captain, "--limit", "100"]).includes(prior.text.split("\n")[0]!)) {
-  record({ ...prior, sent: true });
+} else if (earlier === "found") {
+  record({ ...prior!, sent: true });
   console.log(`weekly-scorecard: confirmed the week ending ${week.key} in ${captain}'s log; nothing sent again`);
-} else if (send && prior !== undefined) {
-  tell(prior.text);
-  record({ ...prior, sent: true });
-  console.log(`weekly-scorecard: sent the week ending ${week.key} to ${captain} (the earlier send was not delivered)`);
+} else if (earlier === "unknown") {
+  console.log(`weekly-scorecard: none: cannot confirm whether the week ending ${week.key} was sent; the log search did not finish. It runs again next time.`);
+} else if (earlier === "absent") {
+  const receipt = tell(prior!.text);
+  record({ ...prior!, sent: true, receipt });
+  console.log(`weekly-scorecard: sent the week ending ${week.key} to ${captain} (its whole log since the first try has no such message)`);
 } else {
   const iso = (at: number) => new Date(at).toISOString();
   const card = JSON.parse(bb(["firstmate", "scorecard", "--captain", captain, "--since", iso(week.since), "--until", iso(week.until), "--json"])) as ScorecardData & { home: string };
@@ -101,9 +123,10 @@ if (send && prior?.sent) {
     console.log(scorecard);
     console.log(`\n--- dry run: nothing sent. The captain would get: ---\n${message}`);
   } else {
-    record({ op, text: message, sent: false });
-    tell(message);
-    record({ op, text: message, sent: true });
+    const at = new Date().toISOString();
+    record({ op, text: message, sent: false, at });
+    const receipt = tell(message);
+    record({ op, text: message, sent: true, at, receipt });
     console.log(`weekly-scorecard: sent the week ending ${week.key} to ${captain}`);
   }
 }

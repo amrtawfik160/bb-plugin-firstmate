@@ -8,6 +8,7 @@ import { manifestSkillIds } from "./scripts/plugin-skill-fixture.mjs";
 import { createInboundLedger } from "./lib/inbound-ledger.ts";
 import { createOwnerTasks } from "./lib/owner-tasks.ts";
 import { createDeliveries } from "./lib/pr-delivery.ts";
+import { createQualityEvents } from "./lib/quality-events.ts";
 
 type Host = ReturnType<typeof createFakePluginHost>;
 
@@ -508,16 +509,20 @@ test("an open card is on the board, and firstmate_ask reports it as before", asy
   }
 });
 
-test("a second builder crew on the same owner task is recorded as redone work; a lookup then a builder, or a checker, is not", async () => {
+test("a builder started on an owner task after its earlier builder ended is redone work; a parallel builder, a lookup then a builder, or a checker is not", async () => {
   const host = await captainHost();
   try {
     const tasks = createOwnerTasks(host.bb.storage.database());
+    const quality = createQualityEvents(host.bb.storage.database());
     tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Login fix", sourceRefs: ["tg:200:1838"], at: Date.now() - HOUR });
     await dispatch(host, { task: "Find why login fails", taskId: "look-1", taskRef: "T1", role: "lookup", shape: "scout" });
-    await dispatch(host, { task: "Fix login", taskId: "build-1", taskRef: "T1" });
+    quality.noteCrewEnded({ captain: "thr_cap", crew: "look-1", outcome: "DONE", at: Date.now() });
+    await dispatch(host, { task: "Fix login web", taskId: "build-1", taskRef: "T1" });
+    await dispatch(host, { task: "Fix login API", taskId: "build-api", taskRef: "T1" });
     await dispatch(host, { task: "Check the login PR", taskId: "check-1", taskRef: "T1", role: "checker" });
     const quiet = await host.harness.behavior.runCli(["scorecard", "--json"], capCtx);
     assert.deepEqual(JSON.parse(quiet.stdout).redone, []);
+    quality.noteCrewEnded({ captain: "thr_cap", crew: "build-1", outcome: "FAILED: tests red", at: Date.now() });
     await dispatch(host, { task: "Fix login again", taskId: "build-2", taskRef: "T1" });
     const card = await host.harness.behavior.runCli(["scorecard", "--json"], capCtx);
     assert.deepEqual(JSON.parse(card.stdout).redone.map((r: { task: string; crew: string; after: string[] }) => [r.task, r.crew, r.after]), [["T1", "build-2", ["build-1"]]]);

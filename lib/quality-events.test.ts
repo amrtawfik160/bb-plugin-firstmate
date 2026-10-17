@@ -6,16 +6,20 @@ import { createQualityEvents } from "./quality-events.ts";
 const DAY = 86_400_000;
 const T0 = Date.parse("2026-10-12T00:00:00.000Z");
 
-test("redo is another crew of the same role and shape on the same owner task; a staged or checker crew is not", () => {
+test("redo is a crew started on an owner task after an earlier crew of the same role on it ended; parallel, staged and checker crews are not", () => {
   const q = createQualityEvents(new DatabaseSync(":memory:"));
   const crew = (id: string, role: string, shape: string, at: number) => q.noteTaskCrew({ captain: "thr_cap", task: "T1", title: "Login fix", crew: id, role, shape, at });
   assert.equal(crew("look", "lookup", "scout", T0), null);
-  assert.equal(crew("build1", "builder", "ship", T0 + 1), null, "a builder after a lookup is a staged step");
-  assert.equal(crew("chk", "checker", "ship", T0 + 2), null);
-  assert.equal(crew("chk2", "checker", "ship", T0 + 3), null, "a second checker checks a new head; it redoes nothing");
-  const redo = crew("build2", "builder", "ship", T0 + 4);
-  assert.deepEqual(redo, { task: "T1", title: "Login fix", crew: "build2", role: "builder", shape: "ship", after: ["build1"], reason: "another builder ship crew on owner task T1 after build1" });
-  assert.equal(crew("build2", "builder", "ship", T0 + 5), null, "the same crew attached again is not a new redo");
+  q.noteCrewEnded({ captain: "thr_cap", crew: "look", outcome: "DONE: found it", at: T0 + 1 });
+  assert.equal(crew("build1", "builder", "ship", T0 + 2), null, "a builder after a lookup ended is a staged step");
+  assert.equal(crew("api", "builder", "ship", T0 + 3), null, "a parallel builder while build1 runs is not a redo");
+  assert.equal(crew("chk", "checker", "ship", T0 + 4), null);
+  q.noteCrewEnded({ captain: "thr_cap", crew: "build1", outcome: "FAILED: tests red", at: T0 + 5 });
+  q.noteCrewEnded({ captain: "thr_cap", crew: "build1", outcome: "retired", at: T0 + 6 });
+  assert.equal(crew("chk2", "checker", "ship", T0 + 7), null, "a checker after a builder ended checks; it redoes nothing");
+  const redo = crew("build2", "builder", "ship", T0 + 8);
+  assert.deepEqual(redo, { task: "T1", title: "Login fix", crew: "build2", role: "builder", shape: "ship", after: ["build1"], reason: "started on owner task T1 after builder crew build1 ended (FAILED: tests red)" });
+  assert.equal(crew("build2", "builder", "ship", T0 + 9), null, "the same crew attached again is not a new redo");
   const week = q.week(T0, T0 + DAY, "thr_cap");
   assert.deepEqual(week.redone.map((r) => [r.task, r.crew]), [["T1", "build2"]]);
   assert.deepEqual(q.week(T0, T0 + DAY, "thr_other").redone, []);

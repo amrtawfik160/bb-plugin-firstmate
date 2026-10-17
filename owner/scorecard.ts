@@ -34,12 +34,12 @@ export function renderScorecard(d: ScorecardData): string {
   return [
     `🛠 ${SCORECARD_PROJECT} · Weekly scorecard, ${day(d.since)} to ${day(d.until)}`,
     `Owner corrections: ${plural(d.corrections.length, "correction")}.${d.corrections.length > 0 ? ` ${fixed} ${fixed === 1 ? "is" : "are"} fixed.` : ""} Source: corrections ledger.`,
-    `Redone work: ${plural(d.redone.length, "redone crew")}${d.redone.length > 0 ? ` on ${plural(distinct(d.redone.map((r) => r.task)), "owner task")}` : ""}. Source: re-dispatch records.`,
+    `Redone work: ${plural(d.redone.length, "crew")} started on ${d.redone.length > 0 ? plural(distinct(d.redone.map((r) => r.task)), "owner task") : "an owner task"} after an earlier crew of the same role on it ended. Source: re-dispatch records.`,
     fails.length === 0 ? "Checker findings: 0 fail verdicts. Source: checker verdicts."
       : `Checker findings: ${plural(findings, "finding")} in ${plural(fails.length, "fail verdict")} on ${plural(distinct(fails.map((f) => f.pr)), "PR")}${uncounted > 0 ? `; ${plural(uncounted, "verdict")} gave no finding count` : ""}. Source: checker verdicts.`,
     `Done claims without proof: ${plural(d.unproven.length, "claim")}${d.unproven.length > 0 ? ` by ${plural(distinct(d.unproven.map((u) => u.crew)), "crew")}` : ""}. Source: proof checks.`,
     t === undefined ? null
-      : "unavailable" in t ? `Noise: not available: ${t.unavailable}.`
+      : "unavailable" in t ? `Noise: not available (${t.unavailable}).`
       : `Noise: ${plural(t.sent, "Telegram message")} sent. ${t.notDelivered} not delivered. ${t.queued} still queued. Drops are not readable from the CLI. Source: Telegram connector records.`,
   ].filter((line) => line !== null).join("\n");
 }

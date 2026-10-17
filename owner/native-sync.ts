@@ -39,8 +39,10 @@ type Launch = { op: string; threadId?: string; at: string };
 export type SyncState = {
   sync?: Launch & { target: string; attempt: number };
   check?: Launch & { head: string; pr: number };
-  /** A message to the repair thread whose delivery is not confirmed yet. */
-  outbox?: { key: string; op: string; text: string };
+  /** A message to the repair thread whose delivery is not confirmed yet, saved before it is sent. */
+  outbox?: { key: string; op: string; text: string; at: string };
+  /** What `bb thread tell --json` returned for each delivered message. */
+  receipts?: Record<string, unknown>;
   /** Keys of the messages delivered: report:<head>, failed:<target>, closed:<pr>. */
   done?: string[];
 };
@@ -62,10 +64,12 @@ export type SyncObservation = {
   files: readonly string[];
   /** The threads named in the state; a missing thread is finished. */
   threads: Readonly<Record<string, { status: string; output: string } | undefined>>;
-  /** Operation id to thread id, from the titles of the repair thread's children. */
-  launched: Readonly<Record<string, string>>;
-  /** Operation ids whose marker is in the repair thread's recent messages. */
-  delivered: readonly string[];
+  /** For a launch without its result: the repair thread's children created inside the
+   * operation's window whose title carries its id. */
+  launched: Readonly<Record<string, readonly string[]>>;
+  /** For a message without its result: whether the repair thread's log since the intent has
+   * it. "unknown": the search could not finish. */
+  delivered: Readonly<Record<string, "found" | "absent" | "unknown">>;
   /** A fresh operation id for a new side effect. */
   newOp: string;
   /** The live captain home, read-only for the sync crew: the guard hashes its data/captain.md. */
@@ -100,19 +104,22 @@ export function verdictOf(output: string): { verdict: "pass" | "fail"; line: str
 export function nextSyncStep(o: SyncObservation, state: SyncState): SyncStep {
   if (state.outbox !== undefined) {
     const { key, op, text } = state.outbox;
-    return o.delivered.includes(op) ? { action: "delivered", key } : { action: "tell", key, op, text };
+    const seen = o.delivered[op] ?? "unknown";
+    if (seen === "found") return { action: "delivered", key };
+    if (seen === "unknown") return { action: "none", why: `cannot confirm whether ${key} was delivered: the search of the repair thread's log did not finish; it runs again next time` };
+    return { action: "tell", key, op, text };
   }
+  const adopt = (slot: "sync" | "check", op: string, again: () => SyncStep): SyncStep => {
+    const found = o.launched[op] ?? [];
+    if (found.length === 1) return { action: "adopt", slot, threadId: found[0]! };
+    if (found.length > 1) return { action: "none", why: `${found.length} threads carry operation ${op} (${found.join(", ")}); set the right one as ${slot}.threadId in the state file` };
+    return again();
+  };
   const sync = state.sync;
-  if (sync !== undefined && sync.threadId === undefined) {
-    const found = o.launched[sync.op];
-    return found !== undefined ? { action: "adopt", slot: "sync", threadId: found } : spawnSync(o, sync.target, sync.attempt, sync.op);
-  }
+  if (sync !== undefined && sync.threadId === undefined) return adopt("sync", sync.op, () => spawnSync(o, sync.target, sync.attempt, sync.op));
   const pr = o.prs[0];
   const check = state.check;
-  if (check !== undefined && check.threadId === undefined && pr !== undefined) {
-    const found = o.launched[check.op];
-    return found !== undefined ? { action: "adopt", slot: "check", threadId: found } : spawnCheck(pr, check.op);
-  }
+  if (check !== undefined && check.threadId === undefined && pr !== undefined) return adopt("check", check.op, () => spawnCheck(pr, check.op));
   if (sync?.threadId !== undefined && working(o.threads[sync.threadId])) return { action: "none", why: `sync crew ${sync.threadId} is still working` };
   const done = new Set(state.done ?? []);
   const tell = (key: string, body: string): SyncStep => (done.has(key) ? { action: "none", why: `${key} is already reported` } : { action: "tell", key, op: o.newOp, text: `${marker(o.newOp)}\n${body}` });

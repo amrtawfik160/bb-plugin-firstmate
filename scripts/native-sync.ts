@@ -15,7 +15,8 @@ import { randomBytes } from "node:crypto";
 import { mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { marker, nextSyncStep, SYNC, type SyncState, type SyncStep } from "../owner/native-sync.ts";
+import { marker, nextSyncStep, opTag, SYNC, type SyncState, type SyncStep } from "../owner/native-sync.ts";
+import { bbJson, findMessage, markedChildren } from "./bb-calls.ts";
 import { singleRun } from "./single-run.ts";
 
 const args = process.argv.slice(2);
@@ -38,8 +39,11 @@ const dry = args.includes("--dry-run");
 const upstream = process.env.FM_SYNC_UPSTREAM || SYNC.upstream;
 const repo = process.env.FM_SYNC_REPO || SYNC.repo;
 
-const run = (cmd: string, argv: string[]) => execFileSync(cmd, argv, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
-const json = (cmd: string, argv: string[]) => JSON.parse(run(cmd, argv));
+const run = (cmd: string, argv: string[]) => execFileSync(cmd, argv, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"], timeout: 120_000, killSignal: "SIGKILL" });
+const json = (cmd: string, argv: string[]) => (cmd === "bb" ? bbJson(argv) : JSON.parse(run(cmd, argv)));
+// A spawn's thread is created within this long after its saved intent.
+const LAUNCH_WINDOW_MS = 10 * 60_000;
+const SEARCH_BUDGET_MS = Number(process.env.FM_SYNC_SEARCH_BUDGET_MS) || 3 * 60_000;
 const save = (next: SyncState) => {
   writeFileSync(`${statePath}.tmp`, `${JSON.stringify(next, null, 2)}\n`);
   renameSync(`${statePath}.tmp`, statePath);
@@ -77,18 +81,17 @@ for (const id of [state.sync?.threadId, state.check?.threadId]) {
   threads[id] = { status, output: done ? String(json("bb", ["thread", "output", id, "--json"]).output ?? "") : "" };
 }
 
-// Only an operation without its result needs these reads.
-const launched: Record<string, string> = {};
-if ((state.sync && !state.sync.threadId) || (state.check && !state.check.threadId)) {
-  for (const extra of [[], ["--archived"]]) {
-    for (const t of json("bb", ["thread", "list", "--parent-thread", manager, "--json", ...extra]) as { id: string; title: string | null }[]) {
-      const op = /\[op:([0-9a-f]+)\]/.exec(t.title ?? "")?.[1];
-      if (op !== undefined) launched[op] = t.id;
-    }
-  }
+// Only an operation without its result needs these reads. A lost spawn is looked for among
+// the repair thread's children created inside its window; a lost message in the repair
+// thread's whole log since its intent.
+const launched: Record<string, string[]> = {};
+for (const pending of [state.sync, state.check]) {
+  if (pending === undefined || pending.threadId !== undefined) continue;
+  const at = Date.parse(pending.at);
+  launched[pending.op] = markedChildren(manager, opTag(pending.op), at - 5_000, at + LAUNCH_WINDOW_MS);
 }
-const delivered: string[] = [];
-if (state.outbox !== undefined && run("bb", ["thread", "log", manager, "--limit", "100"]).includes(marker(state.outbox.op))) delivered.push(state.outbox.op);
+const delivered: Record<string, "found" | "absent" | "unknown"> = {};
+if (state.outbox !== undefined) delivered[state.outbox.op] = findMessage(manager, marker(state.outbox.op), Date.parse(state.outbox.at), SEARCH_BUDGET_MS);
 
 const step: SyncStep = nextSyncStep({
   start, retry, pin, upstream: head, prs, closed, files, threads, launched, delivered,
@@ -119,10 +122,10 @@ if (step.action === "none") {
   const file = join(scratch, "text.md");
   try {
     if (step.action === "tell") {
-      save({ ...state, outbox: { key: step.key, op: step.op, text: step.text } });
+      save({ ...state, outbox: { key: step.key, op: step.op, text: step.text, at: new Date().toISOString() } });
       writeFileSync(file, step.text);
-      run("bb", ["thread", "tell", manager, "--message-file", file]);
-      save(finished(step.key));
+      const receipt = json("bb", ["thread", "tell", manager, "--message-file", file, "--json"]);
+      save({ ...finished(step.key), receipts: Object.fromEntries([...Object.entries(state.receipts ?? {}), [step.key, receipt]].slice(-20)) });
       console.log(`native-sync: tell: ${label} sent to ${manager}`);
     } else {
       const at = new Date().toISOString();

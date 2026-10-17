@@ -104,12 +104,25 @@ nothing.
 
 The steps, in order:
 
-1. A spawn or a message whose result is unknown (the run died) comes first.
-   Its operation id was saved before it ran. A spawned thread carries the id
-   in its title (`[op:<id>]`); a message carries it on its first line
-   (`[native-sync <id>]`). The run looks for that id among the repair
-   thread's children or in its last 100 messages, and adopts what it finds.
-   It repeats the spawn or the message only when the id is not there.
+1. A spawn or a message whose result is unknown (the run died between the
+   call and saving its result) comes first. The run saves each result the
+   moment the call returns (the thread id; the message receipt), so this
+   case covers only that short window. Its operation id was saved before
+   the call:
+   1. A lost spawn: the run looks among the repair thread's children
+      (visible, hidden and archived) created within 10 minutes after the
+      intent for the title marker `[op:<id>]`. One match is adopted. Two or
+      more stop the loop with a message naming them. None means the spawn
+      did not happen, and it runs again with the same id.
+   2. A lost message: its first line is `[native-sync <id>]`. The run reads
+      the repair thread's structured log from the intent's time to the end,
+      within a 3-minute budget, and looks for a user message with that exact
+      line among its first 3 lines. Found: done. Searched to the end and
+      not found: sent again. Search unfinished: nothing; it tries again on
+      the next run.
+   Limit: the marker is in an editable title. A person who renames that
+   thread inside the crash window, or copies the marker into another child's
+   title inside the window, can mislead this step.
 2. A sync crew is still working: nothing.
 3. A sync PR is open and the sync crew finished: start one checker crew
    (checker model) on the PR's branch, once per PR head. An older checker

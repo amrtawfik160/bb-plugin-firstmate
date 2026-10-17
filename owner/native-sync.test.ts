@@ -7,7 +7,7 @@ const AHEAD = "a".repeat(40);
 const HEAD1 = "1".repeat(40);
 const HEAD2 = "2".repeat(40);
 const pr = (head = HEAD1, number = 140) => ({ number, url: `https://github.com/o/r/pull/${number}`, branch: "native-sync/aaaaaaaa", head });
-const seen = (over: Partial<SyncObservation> = {}): SyncObservation => ({ start: false, retry: false, pin: PIN, upstream: AHEAD, prs: [], closed: [], files: [], threads: {}, launched: {}, delivered: [], newOp: "op9", ...over });
+const seen = (over: Partial<SyncObservation> = {}): SyncObservation => ({ start: false, retry: false, pin: PIN, upstream: AHEAD, prs: [], closed: [], files: [], threads: {}, launched: {}, delivered: {}, newOp: "op9", ...over });
 const started: SyncState = { sync: { op: "op1", target: AHEAD, threadId: "thr_sync", at: "2026-10-18T04:00:00.000Z", attempt: 1 } };
 const idle = (output = "") => ({ status: "idle", output });
 const busy = { status: "active", output: "" };
@@ -32,18 +32,22 @@ test("the weekly run starts one sync crew, with its operation id in the title", 
 
 test("a launch whose result was lost is adopted when its thread exists, and launched again only when it does not", () => {
   const pending: SyncState = { sync: { op: "op1", target: AHEAD, at: "x", attempt: 1 } };
-  assert.deepEqual(nextSyncStep(seen({ launched: { op1: "thr_sync" } }), pending), { action: "adopt", slot: "sync", threadId: "thr_sync" });
+  assert.deepEqual(nextSyncStep(seen({ launched: { op1: ["thr_sync"] } }), pending), { action: "adopt", slot: "sync", threadId: "thr_sync" });
+  const twins = nextSyncStep(seen({ launched: { op1: ["thr_a", "thr_b"] } }), pending);
+  assert.equal(twins.action, "none", "two marked threads are uncertain, never a reason to spawn");
   const again = nextSyncStep(seen(), pending);
   assert.equal(again.action, "spawn-sync");
   if (again.action === "spawn-sync") assert.equal(again.op, "op1", "the retry reuses the same operation id");
   const check: SyncState = { ...started, check: { op: "op2", head: HEAD1, pr: 140, at: "x" } };
-  assert.deepEqual(nextSyncStep(seen({ prs: [pr()], threads: { thr_sync: idle() }, launched: { op2: "thr_chk" } }), check), { action: "adopt", slot: "check", threadId: "thr_chk" });
+  assert.deepEqual(nextSyncStep(seen({ prs: [pr()], threads: { thr_sync: idle() }, launched: { op2: ["thr_chk"] } }), check), { action: "adopt", slot: "check", threadId: "thr_chk" });
 });
 
 test("a message whose result was lost is confirmed from the repair thread's log, or sent again with the same marker", () => {
-  const state: SyncState = { ...started, outbox: { key: "report:x", op: "op5", text: "[native-sync op5]\nhello" } };
-  assert.deepEqual(nextSyncStep(seen({ delivered: ["op5"] }), state), { action: "delivered", key: "report:x" });
-  assert.deepEqual(nextSyncStep(seen(), state), { action: "tell", key: "report:x", op: "op5", text: "[native-sync op5]\nhello" });
+  const state: SyncState = { ...started, outbox: { key: "report:x", op: "op5", text: "[native-sync op5]\nhello", at: "x" } };
+  assert.deepEqual(nextSyncStep(seen({ delivered: { op5: "found" } }), state), { action: "delivered", key: "report:x" });
+  assert.equal(nextSyncStep(seen({ delivered: { op5: "unknown" } }), state).action, "none");
+  assert.equal(nextSyncStep(seen(), state).action, "none", "no search result is unknown, not absent");
+  assert.deepEqual(nextSyncStep(seen({ delivered: { op5: "absent" } }), state), { action: "tell", key: "report:x", op: "op5", text: "[native-sync op5]\nhello" });
 });
 
 test("no second sync crew while one is open", () => {

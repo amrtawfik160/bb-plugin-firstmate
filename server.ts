@@ -5285,6 +5285,7 @@ export default async function plugin(bb: BbPluginApi) {
   /** A crew finished: settle its owner task once no other crew of that task still runs. */
   async function finishTask(crew: Crew, finish: CrewFinish): Promise<void> {
     if (!crew.parentThreadId) return;
+    quality.noteCrewEnded({ captain: crew.parentThreadId, crew: crew.id, outcome: finish.outcome || "retired", at: Date.now() });
     try {
       const running = new Set((await readCrews()).filter((c) => c.threadId !== crew.threadId).map((c) => c.id));
       const before = ownerTasks.list(crew.parentThreadId, { includeClosed: true }).find((task) => task.crewIds.includes(crew.id));
@@ -13533,6 +13534,7 @@ export default async function plugin(bb: BbPluginApi) {
     const stopped = await turnWasStopped(thread);
     const outcome = parseOutcome(lastAssistantText);
     if (stopped || verdictOf(outcome) === "DONE" || verdictOf(outcome) === "FAILED") inboundLedger.crewEnded(crew.id, Date.now());
+    if (crew.parentThreadId && (stopped || ["DONE", "FAILED", "BLOCKED"].includes(verdictOf(outcome) ?? ""))) quality.noteCrewEnded({ captain: crew.parentThreadId, crew: crew.id, outcome: stopped ? "stopped" : outcome ?? "", at: Date.now() });
     // BB already reports interruptions to the parent. A completion wake here can
     // cause the manager to resume work the user just stopped.
     if (stopped) return;

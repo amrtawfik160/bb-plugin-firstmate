@@ -12,7 +12,7 @@ const FIXTURE: ScorecardData = {
     { id: "C4", ref: "tg:985:4410", at: "2026-10-13T08:00:00.000Z", fixed: true },
     { id: "C5", ref: "tg:985:4502", at: "2026-10-15T08:00:00.000Z", fixed: false },
   ],
-  redone: [{ task: "T12", title: "Safi login fix", crew: "b2", role: "builder", shape: "ship", after: ["b1"], reason: "another builder ship crew on owner task T12 after b1", at: "2026-10-14T08:00:00.000Z" }],
+  redone: [{ task: "T12", title: "Safi login fix", crew: "b2", role: "builder", shape: "ship", after: ["b1"], reason: "started on owner task T12 after builder crew b1 ended (FAILED)", at: "2026-10-14T08:00:00.000Z" }],
   checks: [
     { pr: "amrtawfik160/safi#88", commitSha: "a", crew: "chk", model: "gpt-6-astra", verdict: "fail", findings: 3, notes: "1. x\n2. y\n3. z", at: "2026-10-14T08:00:00.000Z" },
     { pr: "amrtawfik160/safi#88", commitSha: "b", crew: "chk", model: "gpt-6-astra", verdict: "pass", findings: 0, notes: "ok", at: "2026-10-15T08:00:00.000Z" },
@@ -25,7 +25,7 @@ test("the scorecard renders each count on its own line, with its unit and its so
   assert.deepEqual(renderScorecard(FIXTURE).split("\n"), [
     "🛠 Hanoon & tools · Weekly scorecard, 11 Oct to 18 Oct",
     "Owner corrections: 2 corrections. 1 is fixed. Source: corrections ledger.",
-    "Redone work: 1 redone crew on 1 owner task. Source: re-dispatch records.",
+    "Redone work: 1 crew started on 1 owner task after an earlier crew of the same role on it ended. Source: re-dispatch records.",
     "Checker findings: 3 findings in 1 fail verdict on 1 PR. Source: checker verdicts.",
     "Done claims without proof: 2 claims by 2 crews. Source: proof checks.",
     "Noise: 412 Telegram messages sent. 3 not delivered. 1 still queued. Drops are not readable from the CLI. Source: Telegram connector records.",
@@ -40,9 +40,9 @@ test("a fail verdict without a finding count is named, not counted as zero findi
 test("an empty week says zero, and an unreadable or incomplete Telegram record says so", () => {
   const text = renderScorecard({ ...FIXTURE, corrections: [], redone: [], checks: [], unproven: [], telegram: { unavailable: "rows before 12 Oct are no longer kept" } });
   assert.match(text, /Owner corrections: 0 corrections\. Source/);
-  assert.match(text, /Redone work: 0 redone crews\. Source/);
+  assert.match(text, /Redone work: 0 crews started on an owner task after an earlier crew of the same role on it ended\. Source/);
   assert.match(text, /Checker findings: 0 fail verdicts\. Source/);
-  assert.match(text, /Noise: not available: rows before 12 Oct are no longer kept\./);
+  assert.match(text, /Noise: not available \(rows before 12 Oct are no longer kept\)\./);
   const { telegram: _, ...firstmateOnly } = FIXTURE;
   assert.equal(renderScorecard(firstmateOnly).split("\n").length, 5, "the Firstmate command alone leaves the Telegram line out");
 });
