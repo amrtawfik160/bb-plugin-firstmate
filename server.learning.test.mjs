@@ -134,3 +134,19 @@ test('the scorecard counts the week from the ledger and the durable events, for 
   assert.match(plain.stdout,/Checker findings: 1 finding in 1 fail verdict on 1 PR\. Source: checker verdicts\./);
  }finally{await host.harness.lifecycle.dispose();}
 });
+
+test('a captain with no ledger yet has 0 corrections: the host answers 404 "Path does not exist"',async()=>{
+ const {host,files,cli}=await deck();try {
+  // The live host's words for a missing file (17 Oct dry run on main 68dc0d7).
+  host.harness.sdk.stub('files.read',async({path})=>{if(files.has(path))return{content:files.get(path)};throw new Error('HTTP 404: Path does not exist');});
+  const list=await cli('corrections','list','--json');
+  assert.equal(list.exitCode,0,list.stderr);
+  assert.deepEqual(JSON.parse(list.stdout),[]);
+  const card=await cli('scorecard','--captain','thr_cap','--json');
+  assert.equal(card.exitCode,0,card.stderr);
+  assert.deepEqual(JSON.parse(card.stdout).corrections,[]);
+  const add=await cli('corrections','add','--ref','tg:1:1','--','first');
+  assert.equal(add.exitCode,0,add.stderr);
+  assert.match(files.get(LEDGER),/"id":"C1"/);
+ }finally{await host.harness.lifecycle.dispose();}
+});
