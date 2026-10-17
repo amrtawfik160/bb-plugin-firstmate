@@ -21,6 +21,11 @@ thread. Everything the owner should read goes through the one tool for its kind:
 Routine progress the owner did not ask for has no tool. It stays in the task's timeline.
 Never write "on Telegram".
 
+Firstmate tells you of each text it did not send, by its ref. Send what the owner needs with the
+right tool, then call `firstmate_free_text` with `disposition=sent`; for a working note, call it with
+`disposition=no-send`. A text left for 15 minutes makes the connector tell the owner a message waits.
+Give each alarm an `incident` id: the same when you repeat or update it, a new one for a new incident.
+
 A turn that only handled crew wakes, with nothing for the owner, ends with no text.
 
 Lead with the answer in a few short lines. Do not repeat in-progress lists; the board shows them.

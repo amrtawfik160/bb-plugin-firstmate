@@ -1529,6 +1529,7 @@ const CAPTAIN_TOOLS = [
   "firstmate_dispatch",
   "firstmate_reply",
   "firstmate_alert",
+  "firstmate_free_text",
   "firstmate_task",
   "firstmate_program",
   "firstmate_inbox",
@@ -5364,6 +5365,55 @@ export default async function plugin(bb: BbPluginApi) {
     if (due.length > 0) await refreshOwnerBoard();
   }
 
+  /** A reply the connector accepted and Telegram then refused for good: its owner message is open again. */
+  async function reopenUndelivered(captainThreadId: string): Promise<void> {
+    let rows: Array<{ chatId: string; messageId: string; reason: string }>;
+    try {
+      rows = (await bb.sdk.plugins.callRpc({
+        pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "undelivered", input: {},
+        outputSchema: z.object({ undelivered: z.array(z.object({ chatId: z.string(), messageId: z.string(), reason: z.string() })) }),
+      })).undelivered;
+    } catch (error) {
+      if (isTelegramRpcMissing(error)) return;
+      throw error;
+    }
+    const reopened = rows.flatMap((row) => {
+      const key = { source: "telegram" as const, chatId: row.chatId, messageId: row.messageId };
+      const found = inboundLedger.get(key);
+      if (found?.captainThreadId !== captainThreadId) return [];
+      inboundLedger.reopen(key, Date.now());
+      return [`- tg:${row.chatId}:${row.messageId}: ${row.reason}`];
+    });
+    if (reopened.length === 0) return;
+    await bb.sdk.threads.send({
+      threadId: captainThreadId, mode: "steer",
+      input: [{ type: "text", text: [`Not delivered to the owner: Telegram refused your reply for good. Each owner message is open again; answer it with firstmate_reply.`, ...reopened].join("\n"), mentions: [], visibility: "agent-only" }],
+    });
+  }
+
+  /** The connector's free-text obligations: the captain is told of each once, by its ref. */
+  async function tellFreeText(captainThreadId: string): Promise<void> {
+    let rows: Array<{ ref: string; text: string; at: number }>;
+    try {
+      rows = (await bb.sdk.plugins.callRpc({
+        pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "freeText", input: {},
+        outputSchema: z.object({ obligations: z.array(z.object({ ref: z.string(), text: z.string(), at: z.number() })) }),
+      })).obligations;
+    } catch (error) {
+      if (isTelegramRpcMissing(error)) return;
+      throw error;
+    }
+    if (rows.length === 0) return;
+    const lines = rows.map((row) => `- ${row.ref}: "${row.text.replace(/\s+/g, " ").slice(0, 160)}"`);
+    await bb.sdk.threads.send({
+      threadId: captainThreadId, mode: "steer",
+      input: [{ type: "text", text: [
+        "Not sent to the owner: these texts were written outside a tool. If the owner needs one, send it with firstmate_reply, firstmate_alert or firstmate_ask, then call firstmate_free_text disposition=sent with its ref. If not, call firstmate_free_text disposition=no-send. One left for 15 minutes makes the connector tell the owner a message waits.",
+        ...lines,
+      ].join("\n"), mentions: [], visibility: "agent-only" }],
+    });
+  }
+
   async function drainCaptainReliability(captainThreadId: string, signal?: AbortSignal): Promise<void> {
     await defaultOverdueAsks(captainThreadId).catch((error) => bb.log.warn(`owner ask deadlines: ${String(error)}`));
     await reconcilePrograms(captainThreadId, { signal }).catch((error) => bb.log.warn(`programs: ${String(error)}`));
@@ -5384,6 +5434,8 @@ export default async function plugin(bb: BbPluginApi) {
         } catch (error) {
           bb.log.warn(`telegram replied check: ${String(error)}`);
         }
+        await reopenUndelivered(captainThreadId).catch((error) => bb.log.warn(`telegram undelivered check: ${String(error)}`));
+        await tellFreeText(captainThreadId).catch((error) => bb.log.warn(`telegram free-text check: ${String(error)}`));
       }
       for (const action of inboundLedger.openForSweep(Date.now(), captainThreadId)) {
         await bb.sdk.threads.send({
@@ -12491,32 +12543,74 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_alert",
-    description: "Tell the owner one alarm or warning that answers no owner message: something broke, is at risk, or needs him soon (\"Safi is down for all users\"). level alarm rings at once, day and night; warning is sent at once. task (T<n>): the owner task it is about; it goes to that task's project topic. Without a task, project names the topic. Text you write in your turn outside a tool never reaches the owner: answer an owner message with firstmate_reply, send its result with firstmate_reply result=true, ask a decision with firstmate_ask, and use this tool for an alarm or a warning. Routine progress is not sent at all; it stays in the task's timeline.",
+    description: "Tell the owner one alarm or warning that answers no owner message: something broke, is at risk, or needs him soon (\"Safi is down for all users\"). level alarm rings at once, day and night; warning is sent at once. incident: a short id of this incident, the same when you repeat or update it, new for a new incident (the same words for a new incident are a new alarm). task (T<n>): the owner task it is about; it goes to that task's project topic. Without a task, project names the topic. files: absolute paths to attach, as for firstmate_reply. Text you write in your turn outside a tool never reaches the owner: answer an owner message with firstmate_reply, send its result with firstmate_reply result=true, ask a decision with firstmate_ask, and use this tool for an alarm or a warning. Routine progress is not sent at all; it stays in the task's timeline.",
     parameters: z.object({
       level: z.enum(["alarm", "warning"]),
       text: z.string().min(1).max(4000).describe("What happened, what it breaks, and what the owner should do, in plain words"),
+      incident: z.string().min(1).max(80).describe("A short id of this incident, such as safi-convex-down-17oct: the same on a repeat, new for a new incident"),
       task: z.string().regex(/^T\d+$/).optional().describe("The owner task this is about (T<n>)"),
       project: z.string().min(1).max(80).optional().describe("Without a task: the project, as in the Telegram projects setting (such as Safi)"),
+      files: z.array(z.string().startsWith("/")).max(10).optional().describe("Absolute paths of files to attach, from your workspace or /tmp"),
     }),
-    async execute({ level, text: words, task: taskId, project }, ctx) {
+    async execute({ level, text: words, incident, task: taskId, project, files }, ctx) {
       const captain = ctxString(ctx, "threadId");
       if (!captain) return toolError("firstmate_alert runs only in a captain thread.");
       if (taskId !== undefined && ownerTasks.get(taskId)?.captain !== captain) return toolError(`No owner task ${taskId} for this captain. Check firstmate_task list.`);
       if ((await reliabilityFlags()).telegramThreading !== "on") return toolError("Not sent: Firstmate's telegramThreading flag is off, so this tool has no way to send to Telegram.");
-      // The same alarm again is one alarm: its id is its content.
-      const alertId = hashText(`${captain}\n${level}\n${taskId ?? ""}\n${words.trim()}`).slice(0, 32);
+      const missing = (files ?? []).filter((file) => !existsSync(file));
+      if (missing.length > 0) return toolError(`Not sent: no file at ${missing.join(", ")}.`);
+      const encode = (segment: string) => encodeURIComponent(segment).replace(/[()]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+      const link = (file: string) => `[${basename(file).replace(/[[\]]/g, "")}](${file.split("/").map(encode).join("/")})`;
+      const body = files && files.length > 0 ? `${words.trim()}\n\n${files.map(link).join("\n")}` : words.trim();
+      // One alarm per incident and place: a repeat of the same incident is the same alarm, a new incident or
+      // another project a new one, whatever the words.
+      const alertId = hashText(`${captain}\n${level}\n${taskId ?? ""}\n${project?.trim().toLowerCase() ?? ""}\n${incident.trim().toLowerCase()}`).slice(0, 32);
+      const place = { ...(taskId ? { task: taskId } : {}), ...(project?.trim() ? { project: project.trim() } : {}) };
       try {
         const sent = await bb.sdk.plugins.callRpc({
           pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "alert",
-          input: { alertId, level, text: words.trim(), ...(taskId ? { task: taskId } : {}), ...(project?.trim() ? { project: project.trim() } : {}) },
+          input: { alertId, level, text: body, ...place },
           outputSchema: z.object({ queued: z.number(), duplicate: z.boolean() }),
         });
-        if (sent.duplicate) return `Already sent this ${level} to the owner.`;
+        if (sent.duplicate) return `Already sent this ${level} (incident ${incident}) to the owner.`;
         if (sent.queued <= 0) return toolError(`Not sent: the Telegram connector did not queue the ${level}.`);
         return `Sent the ${level} to the owner${taskId ? ` in task ${taskId}'s topic` : ""}.`;
       } catch (error) {
-        if (isTelegramRpcMissing(error)) return toolError("Not sent: the Telegram connector has no alert method yet. Tell the repair thread.");
-        return toolError(`Not sent: ${error instanceof Error ? error.message : String(error)}`);
+        if (!isTelegramRpcMissing(error)) return toolError(`Not sent: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      // A connector from before typed alarms has no alert method: the alarm goes out as a card, which it sends.
+      try {
+        const card = await bb.sdk.plugins.callRpc({
+          pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "ask",
+          input: { askId: `alert-${alertId.slice(0, 24)}`, text: `${level === "alarm" ? "🚨" : "⚠️"} ${body}`, options: [{ label: "Seen", value: "seen" }], ...place },
+          outputSchema: z.object({ queued: z.number(), duplicate: z.boolean() }),
+        });
+        if (card.duplicate) return `Already sent this ${level} (incident ${incident}) to the owner, as a card.`;
+        if (card.queued <= 0) return toolError(`Not sent: the Telegram connector did not queue the ${level} card.`);
+        return `Sent the ${level} to the owner as a card: this connector has no alert method yet.`;
+      } catch (error) {
+        return toolError(`Not sent: ${error instanceof Error ? error.message : String(error)}. Tell the repair thread.`);
+      }
+    },
+  });
+
+  registerCaptainTool({
+    name: "firstmate_free_text",
+    description: "Resolve texts you wrote outside a tool that Firstmate told you were not sent (each by its ref, such as agent:abc). disposition sent: you sent what the owner needs with firstmate_reply, firstmate_ask or firstmate_alert. no-send: it was not for the owner (a working note, routine progress). A text left unresolved for 15 minutes makes the connector tell the owner that a message waits for him.",
+    parameters: z.object({
+      refs: z.array(z.string().min(1).max(200)).min(1).max(100),
+      disposition: z.enum(["sent", "no-send"]),
+    }),
+    async execute({ refs, disposition }, ctx) {
+      if (!ctxString(ctx, "threadId")) return toolError("firstmate_free_text runs only in a captain thread.");
+      try {
+        const done = await bb.sdk.plugins.callRpc({
+          pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "resolveFreeText", input: { refs, disposition },
+          outputSchema: z.object({ resolved: z.number() }),
+        });
+        return `Resolved ${done.resolved} of ${refs.length} text(s) as ${disposition}.`;
+      } catch (error) {
+        return toolError(`Not resolved: ${error instanceof Error ? error.message : String(error)}`);
       }
     },
   });

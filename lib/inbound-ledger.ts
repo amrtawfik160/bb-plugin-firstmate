@@ -227,6 +227,11 @@ export type CreateInboundLedger = {
   hasTelegram(captainThreadId: string): boolean;
   markAcked(key: InboundKey, at: number): InboundRow | undefined;
   markAnswered(key: InboundKey, at: number): InboundRow | undefined;
+  /**
+   * The connector reports the reply to this message undelivered: it is open again, its reminders start
+   * over, and its reply claims are cleared so the captain can answer it again.
+   */
+  reopen(key: InboundKey, at: number): InboundRow | undefined;
   /** One transaction: answers the anchor (when given) and each open cover, answered by the reply to by with no
    * message of its own and keeping its crew link, so a failure closes none. Returns the covers it closed. */
   finishReply(anchor: InboundKey | null, covers: InboundKey[], by: string, at: number): InboundRow[];
@@ -378,6 +383,14 @@ export function createInboundLedger(db: Database): CreateInboundLedger {
     hasTelegram,
     markAcked(key, at) {
       return transition(key, (row) => row.state === "received" ? { ...row, state: "acked", ackedAt: at } : row);
+    },
+    reopen(key, at) {
+      return db.transaction(() => {
+        const current = get(key);
+        if (!current || current.state !== "answered") return current;
+        db.prepare("DELETE FROM inbound_outbox WHERE source=? AND chat_id=? AND message_id=? AND kind <> 'ack'").run(key.source, key.chatId, key.messageId);
+        return save({ ...current, state: "acked", answeredAt: null, ackedAt: current.ackedAt ?? at, coveredBy: undefined, remindedAt: null, remindedKind: null });
+      })();
     },
     markAnswered(key, at) {
       return transition(key, (row) => {
