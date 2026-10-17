@@ -79,7 +79,7 @@ import {
   buildProgram, createPrograms, isOpenProgram, isOpenTicket, newlyReady, numberOf, programCounts, programText, readyRefs, readyWakeText, repoOf,
   shortTicket, stallReminderDue, stallReminderText, ticketRef, type IssueFacts, type Program, type ProgramFact, type TicketRef,
 } from "./lib/programs.ts";
-import { askLetterAnswer, askIdFromSourceEventId, packAnswers, clip, createOwnerAsks, formatAge, formatAskCard, formatUtcTime, mayDefault, CAPTAIN_RULES, OWNER_DECISION_RULE, recommendedLabel, type AskKind, type OwnerAsk } from "./lib/owner-asks.ts";
+import { askLetterAnswer, askIdFromSourceEventId, packAnswers, clip, createOwnerAsks, formatAge, formatAskCard, formatUtcTime, mayDefault, CAPTAIN_RULES, OWNER_DECISION_RULE, recommendedLabel, replacedBy, type AskKind, type OwnerAsk } from "./lib/owner-asks.ts";
 import { DEFAULT_RELIABILITY_FLAGS, reliabilityFlagsFromSettings } from "./lib/reliability-flags.ts";
 import { sanitizeSettingValue } from "./lib/settings-schema.ts";
 import { coalesceBatches, parseConnectorHeader, parseInboundTelegram, parseSourceRef, parseTelegramSubmission, stripTelegramEnvelope, telegramReplyParameters, telegramSourceRef } from "./lib/telegram-envelope.ts";
@@ -98,6 +98,7 @@ import { DISPATCH_VERSION, PROOF_STEP, pipelineGates, proofStep } from "./owner/
 import { changeReach, type Reach } from "./owner/reach.ts";
 import { hostCanDrive, PROOF_SURFACES, projectBriefLines, projectForName, projectForRepo, repoOf as prRepoOf, surfaceRefusal, surfaceWords } from "./owner/projects.ts";
 import { createReleaseReadbacks, type ReleaseSource } from "./lib/release-readback.ts";
+import { cardSubject, keyFromEnvFile, ownerRules, ruleAnsweringCard } from "./lib/card-rules.ts";
 import { addCorrection, CAPTAIN_FILE, CORRECTION_RULE, correctionBrief, fixCorrection, LEDGER_FILE, readLedger, within } from "./owner/corrections.ts";
 import { renderScorecard, type ScorecardData } from "./owner/scorecard.ts";
 import { createQualityEvents } from "./lib/quality-events.ts";
@@ -1945,6 +1946,11 @@ export default async function plugin(bb: BbPluginApi) {
       type: "number",
       label: "Minutes before a reversible owner ask with a recommended option proceeds with it (0 = never). Approvals and irreversible asks never proceed on their own.",
       default: 240,
+    },
+    decisionsKeyFile: {
+      type: "string",
+      label: "Dotenv file on this host with OPENAI_API_KEY for the Decisions API. Cards are checked against the owner rules before they are sent; empty sends every card unchecked.",
+      default: "",
     },
   });
 
@@ -5313,6 +5319,76 @@ export default async function plugin(bb: BbPluginApi) {
     await reconcilePrograms(crew.parentThreadId, { gone: crew.id }).catch((error) => bb.log.warn(`programs after crew ${crew.id}: ${String(error)}`));
   }
 
+  // Owner decision Q8 (17 Oct): T194, T196 and T197 stayed "working" 35 h after their crews wrote
+  // a native done line, T200 had no crew, and crew b08649c2 waited on owner questions nobody asked.
+  // Every few minutes each open task follows its crews' own reports.
+  const TASK_IDLE_FLAG_MS = 2 * 60 * 60_000;
+  const statusKey = (crewId: string, line: string) => `${crewId}:${createHash("sha256").update(line).digest("hex").slice(0, 16)}`;
+  async function sweepTasks(captain: string, now = Date.now()): Promise<void> {
+    const tasks = ownerTasks.list(captain);
+    if (tasks.length === 0) return;
+    const crews = await readCrews();
+    const live = new Map(crews.filter((crew) => crew.parentThreadId === captain).map((crew) => [crew.id, crew]));
+    let changed = false;
+    for (const task of tasks) {
+      const own = task.crewIds.map((id) => live.get(id)).filter((crew): crew is Crew => crew !== undefined);
+      for (const crew of own) {
+        let latest: { verb: string; note: string } | null = null;
+        let lineAt: number | null = null;
+        try {
+          const lines = (await crewStatusLines(crew)).lines;
+          latest = latestStatus(lines);
+          const stamp = [...lines].reverse().find((line) => line.trim() !== "")?.match(/\[at=(\d+)\]/)?.[1];
+          lineAt = stamp === undefined ? null : Number(stamp) * 1000;
+        } catch (error) { bb.log.warn(`task sweep: status of crew ${crew.id}: ${String(error)}`); }
+        if (latest === null) continue;
+        const seen = `task-status-seen:${statusKey(crew.id, `${latest.verb} ${latest.note}`)}`;
+        if (await bb.storage.kv.get(seen) !== undefined) continue;
+        await bb.storage.kv.set(seen, now);
+        if (latest.verb === "done") {
+          const after = ownerTasks.crewReportedDone(captain, crew.id, latest.note, (id) => id !== crew.id && live.has(id), (item) => deliveries.forTasks(item.crewIds, item.prs), now);
+          if (after !== undefined && after.state !== task.state) { changed = true; bb.log.info(`task ${task.id}: crew ${crew.id} reported done; ${task.state} -> ${after.state}`); }
+        } else if (crewWaitsOnOwner(latest)) {
+          // The captain may have asked already: a card on this task, or any card it sent after this status line.
+          const asked = ownerAsks.listOpen(captain).find((ask) => ask.task === task.id || (lineAt !== null && ask.createdAt >= lineAt));
+          if (asked === undefined) await askForCrew(captain, task, crew, latest.note, now);
+          else {
+            bb.log.info(`task ${task.id}: crew ${crew.id} waits on the owner; card ${asked.id} already asks, no new card`);
+            const current = ownerTasks.get(task.id);
+            if (current !== undefined && isOpenTask(current) && current.state !== "needs_you") ownerTasks.move(task.id, captain, { to: "needs_you", reason: latest.note }, now);
+          }
+          changed = true;
+        }
+      }
+      const current = ownerTasks.get(task.id);
+      if (current === undefined || current.state !== "working" || own.length > 0 || now - current.updatedAt < TASK_IDLE_FLAG_MS) continue;
+      const flag = `task-idle-flag:${current.id}:${current.updatedAt}`;
+      if (await bb.storage.kv.get(flag) !== undefined) continue;
+      await bb.storage.kv.set(flag, now);
+      await deliverToCaptain(captain, `TASK WITHOUT CREW: task ${current.id} (${current.title}) has been working with no live crew for ${formatAge(now - current.updatedAt)}. Dispatch a crew for it with firstmate_dispatch task=${current.id}, or close it with firstmate_task (done with its outcome, or dropped with the owner's reason).`, "").catch((error) => bb.log.warn(`task ${current.id} idle flag: ${String(error)}`));
+    }
+    if (changed) await refreshOwnerBoard();
+  }
+
+  // A crew waits on the owner when it asks for a decision, or pauses or blocks naming him.
+  function crewWaitsOnOwner(status: { verb: string; note: string }): boolean {
+    if (status.verb === "needs-decision") return true;
+    return (status.verb === "paused" || status.verb === "blocked") && /\b(?:owner|owner's|captain's answer|your answer)\b/i.test(status.note);
+  }
+
+  async function askForCrew(captain: string, task: OwnerTask, crew: Crew, note: string, now: number): Promise<void> {
+    const sourceRef = `crew-wait:${statusKey(crew.id, note)}`;
+    const project = task.project ?? await projectLabel(crew.projectId) ?? undefined;
+    const ask = ownerAsks.create({ captain, kind: "question", text: `${clip(task.title, 60)}: ${clip(note, 900)}`, options: [], sourceRef, createdAt: now,
+      ...(project ? { project } : {}), task: task.id, subject: cardSubject(`${clip(task.title, 60)}: x`) });
+    const replaced = await replaceOpenCards(ask);
+    if (isOpenTask(task) && task.state !== "needs_you") ownerTasks.move(task.id, captain, { to: "needs_you", reason: note }, now);
+    const failed = (await reliabilityFlags()).telegramThreading === "on" ? await sendAskCard(ask, { ...(project ? { project } : {}), task: task.id }) : "";
+    const warning = failed === "" ? "" : ` It was not sent to Telegram (${failed}).`;
+    bb.log.info(`task ${task.id}: crew ${crew.id} waits on the owner; card ${ask.id} opened`);
+    await deliverToCaptain(captain, `CREW QUESTION CARD: crew ${crew.id} waits on the owner for task ${task.id}, so card ${ask.id} carries its question to him${replaced.length > 0 ? ` (replacing ${replaced.join(", ")})` : ""}.${warning} When he answers, pass the answer to the crew with firstmate_tell.`, crew.id).catch((error) => bb.log.warn(`crew question note: ${String(error)}`));
+  }
+
   async function projectLabel(projectId: string | undefined): Promise<string | null> {
     if (!projectId) return null;
     try {
@@ -5344,6 +5420,40 @@ export default async function plugin(bb: BbPluginApi) {
     } catch (error) {
       return error instanceof Error ? error.message : String(error);
     }
+  }
+
+  // Owner decision Q7: a card the owner's rules already answer is not sent. Only a sure Decisions
+  // answer refuses; no key, no rules file, an error or a timeout lets the card go (logged).
+  async function ruleAnswering(captain: string, card: string): Promise<string | null> {
+    const keyFile = String((await settings.get()).decisionsKeyFile ?? "").trim();
+    if (keyFile === "") return null;
+    let apiKey = "";
+    try { apiKey = keyFromEnvFile(readFileSync(keyFile, "utf8")); } catch (error) { bb.log.warn(`card rule check skipped: Decisions key file unreadable (${error instanceof Error ? error.message : String(error)})`); return null; }
+    const home = captainHomes.get(captain) ?? (await settings.get()).fmHome.trim();
+    let rulesText = "";
+    try {
+      const hostId = (await settings.get()).fmHostId.trim() || await resolveHostId(undefined, { threadId: captain });
+      const read = await raceAbort(bb.sdk.files.read({ hostId, path: `${home}/data/captain.md` }), undefined, STUCK_HOST_CALL_MS);
+      rulesText = "content" in read && typeof read.content === "string" ? read.content : "";
+    } catch (error) { bb.log.warn(`card rule check skipped: ${home}/data/captain.md unreadable (${error instanceof Error ? error.message : String(error)})`); return null; }
+    const check = await ruleAnsweringCard(redactSecrets(card), ownerRules(rulesText), { apiKey });
+    if (check.outcome === "unchecked") { bb.log.warn(`card rule check skipped captain=${captain}: ${check.reason}`); return null; }
+    if (check.outcome === "answered") bb.log.info(`card refused captain=${captain}: answered by rule (${check.confidence.toFixed(2)}): ${check.rule}`);
+    return check.outcome === "answered" ? check.rule : null;
+  }
+
+  /** Owner decision Q7: a new card on the same task or topic replaces the open one; Telegram marks the old one replaced. */
+  async function replaceOpenCards(ask: OwnerAsk): Promise<string[]> {
+    const old = replacedBy(ask, ownerAsks.listOpen(ask.captain).filter((other) => other.id !== ask.id));
+    for (const card of old) {
+      const resolution = `Replaced by card ${ask.id}`;
+      const closed = ownerAsks.resolve(card.id, ask.captain, "cancelled", resolution, ask.createdAt);
+      if (closed === undefined || (await reliabilityFlags()).telegramThreading !== "on") continue;
+      try {
+        await bb.sdk.plugins.callRpc({ pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "editAsk", input: { askId: card.id, resolution, at: ask.createdAt }, outputSchema: z.object({ ok: z.boolean() }) });
+      } catch (error) { bb.log.warn(`replaced card ${card.id} not edited in Telegram: ${String(error)}`); }
+    }
+    return old.map((card) => card.id);
   }
 
   // Best effort: the connector redraws its pinned board. A missing method or a failure changes nothing here.
@@ -12043,7 +12153,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_ask",
-    description: "Ask the captain one question, blocker or approval as a Telegram card with up to 4 option buttons. It stays on the captain's board until answered. Returns at once: keep working on other things. The answer arrives from a button tap or a card reply containing just its option letter. Reversible cards sent within a minute of each other share one Telegram message with an \"Accept all recommended\" button; an answer there arrives as one owner message with a line \"- ask <id>: <option>\" per card it answered. irreversible=true or kind=approval never proceeds on a deadline and keeps its own message; a reversible ask with a recommended option proceeds with it at its deadline.",
+    description: "Ask the captain one question, blocker or approval as a Telegram card with up to 4 option buttons. It stays on the captain's board until answered. Returns at once: keep working on other things. The answer arrives from a button tap or a card reply containing just its option letter. Reversible cards sent within a minute of each other share one Telegram message with an \"Accept all recommended\" button; an answer there arrives as one owner message with a line \"- ask <id>: <option>\" per card it answered. irreversible=true or kind=approval never proceeds on a deadline and keeps its own message; a reversible ask with a recommended option proceeds with it at its deadline. A card names its project. A card the owner's rules in captain.md already answer is refused with the rule. A new card on the same task and subject replaces the open one.",
     parameters: z.object({
       impact: z.string().optional().describe("Optional. One plain sentence explaining what this means for the owner’s business"),
       question: z.string().min(1).max(1500).describe("One question, asked in the first sentence; put option text in options, not in the question. Cards sent together that start with the same subject and a colon (\"DM Pro plugin: ...\") get that subject as their shared title"),
@@ -12053,7 +12163,7 @@ export default async function plugin(bb: BbPluginApi) {
       defaultAfterMinutes: z.number().min(5).max(10080).optional().describe("Proceed with the recommended option after this many minutes without an answer (reversible asks only)"),
       irreversible: z.boolean().optional().describe("A gated action (production deploy, money, deleting data, customer messages): never proceeds without an answer"),
       startsNewWork: z.boolean().optional().describe("true when an option starts new work: a build, a new crew, a new ticket. The card then waits for the owner's answer"),
-      project: z.string().min(1).max(80).optional().describe("The project this card is about, as on the board (such as Safi). With Telegram topics on, the card goes to that project's topic"),
+      project: z.string().min(1).max(80).optional().describe("Required unless task has one: the project this card is about, as on the board (such as Safi). With Telegram topics on, the card goes to that project's topic"),
       task: z.string().regex(/^T\d+$/).optional().describe("The owner task this card is for (T<n>). Unset: the open task the owner message of this turn started. In Telegram the card replies to the task's status line, which counts it"),
     }),
     async execute({ impact, question, kind, options, recommended, defaultAfterMinutes, irreversible, startsNewWork, project, task: taskId }, ctx) {
@@ -12063,6 +12173,11 @@ export default async function plugin(bb: BbPluginApi) {
       // Without a task named, the card is for the one open task this turn's owner messages started.
       const turnTasks = [...new Set((ownerTurnRefs.get(captain) ?? []).flatMap((ref) => ownerTasks.openByRef(captain, ref).map((item) => item.id)))];
       const cardTask = taskId ?? (turnTasks.length === 1 ? turnTasks[0] : undefined);
+      // Owner decision Q7: every card names its project (32 of 95 cards on 15-17 Oct had none).
+      const cardProject = project?.trim() || (cardTask !== undefined ? ownerTasks.get(cardTask)?.project ?? undefined : undefined);
+      if (!cardProject) return toolError("Refusing: a card names its project. Pass project (as on the board, such as Safi), or task (T<n>) of a task that has one. Nothing was sent.");
+      const answered = await ruleAnswering(captain, [question, impact ?? "", ...(options ?? []).map((option, index) => `${String.fromCharCode(65 + index)}. ${option.label}`)].filter(Boolean).join("\n"));
+      if (answered !== null) return toolError(`Refusing: the owner's rules already answer this card, so it was not sent. Rule: "${answered}". Act on it and say in one line what you did.`);
       const choices = (options ?? []).map((option, index) => ({ label: option.label, value: option.value ?? String.fromCharCode(65 + index) }));
       if (recommended !== undefined && recommended >= choices.length) return toolError(`recommended must be the index of one of the ${choices.length} option(s).`);
       const newWork = startsNewWork === true;
@@ -12077,15 +12192,17 @@ export default async function plugin(bb: BbPluginApi) {
         captain, kind: kind as AskKind, impact: impact?.replace(/\s+/g, " ").trim().slice(0, 300), text: question.trim(), options: choices,
         recommended: recommended ?? null, defaultAt: minutes > 0 ? now + Math.round(minutes * 60_000) : null,
         irreversible: irreversible === true, startsNewWork: newWork, createdAt: now,
+        project: cardProject, ...(cardTask !== undefined ? { task: cardTask } : {}), subject: cardSubject(question),
       });
+      const replaced = await replaceOpenCards(ask);
       const deadline = ask.defaultAt !== null
         ? ` If no answer by ${formatUtcTime(ask.defaultAt)}, it proceeds with "${recommendedLabel(ask)}" and you are told to go ahead.`
         : newWork ? " It starts new work, so it has no default and waits for the owner's answer." : "";
-      const done = `Ask ${ask.id} is open and on the captain's board.${deadline} Keep working on other things; the answer arrives as an owner message that replies to ask ${ask.id}.`;
+      const done = `Ask ${ask.id} is open and on the captain's board.${deadline}${replaced.length > 0 ? ` It replaces card ${replaced.join(", ")}, now marked replaced.` : ""} Keep working on other things; the answer arrives as an owner message that replies to ask ${ask.id}.`;
       if ((await reliabilityFlags()).telegramThreading !== "on") {
         return `${done}\nWarning: not sent to Telegram because telegramThreading is off. Put the question in your final message too.`;
       }
-      const warning = await sendAskCard(ask, { ...(project !== undefined ? { project } : {}), ...(cardTask !== undefined ? { task: cardTask } : {}) });
+      const warning = await sendAskCard(ask, { project: cardProject, ...(cardTask !== undefined ? { task: cardTask } : {}) });
       await refreshOwnerBoard();
       return warning === ""
         ? `Question card ${ask.id} sent. ${done}`
@@ -13701,6 +13818,12 @@ export default async function plugin(bb: BbPluginApi) {
     if (stopped) return;
     // A crew's DONE without a PR is its delivery; a PR, once there, decides the task instead.
     if (verdictOf(outcome) === "DONE" && (await prForCrew(crew)).url === "") await finishTask(crew, { delivered: true, outcome: outcome! });
+    // With a PR, a DONE report moves the task to its next step: verify, merge, release or live.
+    else if (verdictOf(outcome) === "DONE" && crew.parentThreadId) {
+      const running = new Set((await readCrews()).filter((c) => c.threadId !== crew.threadId).map((c) => c.id));
+      const after = ownerTasks.crewReportedDone(crew.parentThreadId, crew.id, outcome!, (id) => running.has(id), (task) => deliveries.forTasks(task.crewIds, task.prs), Date.now());
+      if (after !== undefined) await refreshOwnerBoard();
+    }
     if (verdictOf(outcome) === "DONE") await checkPlaybookReport(crew, lastAssistantText ?? "").catch(error => bb.log.warn(`report check ${crew.id}: ${String(error)}`));
     if ((await reliabilityFlags()).honestStatus === "on") {
       // Reports once per stuck stretch and never stops the crew; normal idle handling continues.
@@ -15375,6 +15498,14 @@ export default async function plugin(bb: BbPluginApi) {
     if (followUpWork || launchAbort.signal.aborted) return;
     followUpWork=(async()=>{await launchRecoveryPass(launchAbort.signal);resumeDispatchJobs();drainQueuedDispatchesInBackground();await deliveryPass(launchAbort.signal);await raceAbort(publishFleet(),launchAbort.signal,STUCK_HOST_CALL_MS);})();
     try {await followUpWork;} finally {followUpWork=undefined;}
+  });
+  let taskSweepWork: Promise<void> | undefined;
+  bb.background.schedule("task-lifecycle", "*/5 * * * *", async () => {
+    if (taskSweepWork || launchAbort.signal.aborted) return;
+    taskSweepWork = (async () => {
+      for (const captain of knownCaptains) await sweepTasks(captain).catch((error) => bb.log.warn(`task sweep captain=${captain}: ${String(error)}`));
+    })();
+    try { await taskSweepWork; } finally { taskSweepWork = undefined; }
   });
   bb.events.on("thread.archived", async ({ thread }) => {
     deliveries.ownerLost(thread.id);

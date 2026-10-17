@@ -1122,7 +1122,7 @@ type RpcCall = { pluginId: string; method: string; input: Record<string, unknown
 const rpcCalls = (host: Host) => host.harness.sdk.callsTo("plugins.callRpc").map((c) => c[0] as RpcCall);
 const asks = (host: Host) => createOwnerAsks(host.bb.storage.database());
 const askTool = (host: Host, params: Record<string, unknown>, captain = "thr_cap") =>
-  tool(host, "firstmate_ask").execute({ impact: "Customers can use this feature.", ...params }, { threadId: captain, projectId: "proj_1" } as never);
+  tool(host, "firstmate_ask").execute({ impact: "Customers can use this feature.", project: "Safi", ...params }, { threadId: captain, projectId: "proj_1" } as never);
 const connectorOk = (host: Host) => host.harness.sdk.stub("plugins.callRpc", async (args: RpcCall) => (
   args.method === "refreshBoard" ? { ok: true } : { queued: 1, duplicate: false, mode: "on" }
 ));
@@ -1155,6 +1155,7 @@ test("firstmate_ask records the ask and sends the connector a question card with
       recommended: 0,
       // What the connector needs to fold this card into a pack with others sent within a minute.
       card: { kind: "question", question: "Dark mode by default?", impact: "Customers can use this feature.", defaultAt: stored.defaultAt, gated: false },
+      project: "Safi",
     });
   } finally {
     await host.harness.lifecycle.dispose();
@@ -1661,7 +1662,7 @@ test("firstmate_reply sends a reply as written: options, a decision phrase or a 
     host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
     const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
     const card = await tool(host, "firstmate_ask").execute({
-      kind: "approval", irreversible: true, recommended: 0,
+      kind: "approval", irreversible: true, recommended: 0, project: "Safi",
       question: "Safi savings: some users already had money in their goals before this change. Should that old money also come out of \"money on hand\"?",
       options: [{ label: "B: Yes. Take existing goal money out of money on hand too." }, { label: "A: No. Old goal money stays in money on hand." }],
     }, ctx);
