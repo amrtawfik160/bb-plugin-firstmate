@@ -160,3 +160,16 @@ test('a release read-back must name the required TestFlight group, and a Safi ta
   assert.match(text(await tool(host,'firstmate_task').execute({action:'close',id:task.id,state:'done',reason:'Build 21 is in Beta Testers'},ctx)),/Task T1 is done/);
  }finally{await host.harness.lifecycle.dispose();}
 });
+
+test("an owner tap hours later reads the PR fresh from GitHub before it records the proof",async()=>{
+ const {host,store}=await deck();try {
+  const asked=text(await deliveries(host,{action:'device-proof',id:key(WOO,130),commitSha:head(130).slice(0,7),build:'8',link:'https://testflight.apple.com/join/abc',check:'Send a photo'},'thr_woo'));
+  const askId=/card (a[0-9a-z]{6})/.exec(asked)[1];
+  store.stale(key(WOO,130),'GitHub did not answer');
+  assert.equal(store.get(key(WOO,130)).freshness,'stale');
+  await host.harness.behavior.callRpc('resolveAsk',{threadId:'thr_cap',id:askId,resolution:'Works'});
+  const row=store.get(key(WOO,130));
+  assert.equal(row.verifiedCommitSha,head(130));
+  assert.equal(row.verification.actor,'owner');
+ }finally{await host.harness.lifecycle.dispose();}
+});
