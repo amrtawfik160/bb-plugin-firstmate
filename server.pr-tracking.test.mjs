@@ -100,13 +100,16 @@ test('a PR whose captain was marked lost is read on GitHub again within ten minu
  }finally{await host.harness.lifecycle.dispose();}
 });
 
-test('twelve PRs of a deleted captain are all read as merged without one pass pushing the rest back an hour',async()=>{
+test('twelve PRs of a deleted captain are all read as merged without one pass pushing the rest back an hour',async(t)=>{
+ t.mock.timers.enable({apis:['Date'],now:Date.now()});
  const host=await base();try {
   host.harness.sdk.stub('threads.get',async()=>{throw new Error('HTTP 404: Thread not found');});
   const store=createDeliveries(host.bb.storage.database());
   for(let n=1;n<=12;n++) store.register({url:`https://github.com/acme/repo/pull/${n}`,taskId:`t${n}`,projectId:'proj_1',owner:'thr_gone',home:'',worker:`thr_w${n}`,requirement:'pr'});
   hostCommands(host,command=>command.includes('gh pr view') ? {payload:JSON.stringify(forge('MERGED'))} : {code:0});
+  // Two scheduled passes, a minute apart: the paced allowance reads ten, then the rest.
   await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  t.mock.timers.tick(60_000);
   await host.harness.behavior.runSchedule('pr-delivery-follow-up');
   const rows=store.list({owner:'thr_gone'});
   assert.equal(rows.length,12);

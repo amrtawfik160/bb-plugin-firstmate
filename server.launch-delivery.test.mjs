@@ -450,7 +450,9 @@ test('native creation provisioning releases capacity only on exact core deletion
  }finally{await host.harness.lifecycle.dispose();}
 });
 
-test('PR-only delivered artifact remains monitored across reload; baseline follow-up never hides an independent CI failure',async()=>{
+test('PR-only delivered artifact remains monitored across reload; baseline follow-up never hides an independent CI failure',async(t)=>{
+ // Each pass is a minute apart, as the schedule runs them, so the paced allowance refills.
+ t.mock.timers.enable({apis:['Date'],now:Date.now()});
  let host=await base();try {
  const author={...row(1),prUrl:'https://github.com/acme/repo/pull/901',deliveryRequirement:'pr'};
  const baseline={...row(2),task:'Fix authorized baseline failure',deliveryRequirement:'pr'};
@@ -464,7 +466,7 @@ test('PR-only delivered artifact remains monitored across reload; baseline follo
    hostCommands(host,c=>c.includes('gh pr view')?{payload:JSON.stringify(observation())}:{code:0});
  };
  install();let store=createDeliveries(host.bb.storage.database());const id='acme/repo#901';
- const pass=async()=>{const r=store.get(id);store.save({...r,nextCheckAt:0});await host.harness.behavior.runSchedule('pr-delivery-follow-up');};
+ const pass=async()=>{t.mock.timers.tick(60_000);const r=store.get(id);store.save({...r,nextCheckAt:0});await host.harness.behavior.runSchedule('pr-delivery-follow-up');};
  await pass();let r=store.get(id);assert.equal(r.status,'pr-delivered');assert.ok(r.deliverySatisfiedAt);assert.equal(r.requirement,'pr');assert.deepEqual(r.workers,['thr_c1']);
  const satisfiedAt=r.deliverySatisfiedAt;
  // Worker completes and leaves the cache. The persistent author remains callable.

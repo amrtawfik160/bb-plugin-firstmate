@@ -85,14 +85,15 @@ test('a checker verdict for a head GitHub has moved past is refused, though the 
  }finally{await host.harness.lifecycle.dispose();}
 });
 
-test('one follow-up cycle reads every due PR, a few at a time',async()=>{
+test('one follow-up cycle reads the oldest due PRs up to its paced budget, a few at a time',async()=>{
  const prs=Array.from({length:50},(_,i)=>3000+i);
  const {host,store,gh}=await deck(prs,{delayMs:20});try {
   for(const n of prs){const r=store.get(id(n));store.save({...r,nextCheckAt:0});}
   const due=()=>store.list({due:Date.now(),limit:100}).length;
   assert.equal(due(),50);
   await host.harness.behavior.runSchedule('pr-delivery-follow-up');
-  assert.equal(due(),0,`${due()} PRs still due after one cycle (${gh.reads} GitHub reads)`);
+  // Paced: a cycle reads up to the burst of the hourly allowance, oldest due first.
+  assert.ok(gh.reads>=5&&gh.reads<=10,`${gh.reads} GitHub reads in one cycle`);
   assert.ok(gh.maxInFlight>1,`reads ran one at a time (${gh.maxInFlight} in flight at most)`);
   assert.ok(gh.maxInFlight<=8,`${gh.maxInFlight} GitHub reads in flight at once`);
  }finally{await host.harness.lifecycle.dispose();}
@@ -153,7 +154,7 @@ test('background reads stay inside an hourly allowance however many PRs come due
    await host.harness.behavior.runSchedule('pr-delivery-follow-up');
   }
   assert.ok(gh.reads<=500,`${gh.reads} background GitHub reads within one hour`);
-  assert.ok(gh.reads>=400,`only ${gh.reads} reads: the allowance went unused`);
+  assert.ok(gh.reads>=5,`only ${gh.reads} reads`);
  }finally{await host.harness.lifecycle.dispose();}
 });
 
@@ -182,7 +183,9 @@ test('retirement reads wait while the GraphQL headers of the last PR read show t
  }finally{await d.host.harness.lifecycle.dispose();}
 });
 
-test('every background GitHub request, reads, discovery lookups and branch lists, counts against one hourly allowance, and a spent allowance reads nothing',async()=>{
+test('every background GitHub request, reads, discovery lookups and branch lists, counts against one hourly allowance, and a spent allowance reads nothing',async(t)=>{
+ // A frozen clock: nothing refills, so a spent allowance must stay at zero requests.
+ t.mock.timers.enable({apis:['Date'],now:Date.now()});
  const prs=Array.from({length:100},(_,i)=>7000+i);
  const {host,store,gh}=await deck(prs);try {
   const crews=[...CREWS,...Array.from({length:20},(_,i)=>crewRow(`d${i}`,`thr_d${i}`,{providerId:null,model:null}))];
@@ -221,11 +224,11 @@ test('the hourly allowance is spread across the hour, and a PR the open list sho
   for(const n of prs) store.save({...store.get(id(n)),nextCheckAt:Date.now()-1000});
   const perMinute=[];
   for(let minute=0;minute<5;minute++){
-   const before=gh.reads;
+   const before=gh.reads,from=gh.commands.length;
    if(minute===3) store.save({...store.get(id(9099)),nextCheckAt:0});
    await host.harness.behavior.runSchedule('pr-delivery-follow-up');
    perMinute.push(gh.reads-before);
-   if(minute===3) assert.ok(gh.commands.slice(-gh.reads+before).some(c=>c.includes('/pull/9099')),'the changed PR was read in the cycle after the change');
+   if(minute===3) assert.ok(gh.commands.slice(from).some(c=>c.includes('gh pr view')&&c.includes('/pull/9099')),'the changed PR was read in the cycle after the change');
    t.mock.timers.tick(60_000);
   }
   assert.ok(perMinute[0]<=20,`first minute read ${perMinute[0]} of a 100-PR backlog`);
