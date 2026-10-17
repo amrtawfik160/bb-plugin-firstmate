@@ -103,3 +103,16 @@ test('a window missing from the list falls back to that thread alone',()=>{
   assert.ok(shown.length>0&&shown.every(id=>id===missing.id),`show calls: ${shown}`);
  }finally{rmSync(l.home,{recursive:true,force:true});}
 });
+
+test('60 threads with turns in flight still end the wait inside its budget, and a pending interaction among them is found',()=>{
+ const l=lab(60);try {
+  for(const t of l.threads){t.status='active';t.runtime.displayStatus='active';}l.save();
+  const quiet=l.wait(3);
+  assert.equal(quiet.rc,1,quiet.err);
+  assert.ok(quiet.seconds<3+2,`wait took ${quiet.seconds}s for a 3s budget with 60 active threads (calls: ${quiet.calls.length})`);
+  writeFileSync(join(l.dir,'interactions','thr_w052.json'),JSON.stringify([{id:'int_9',status:'pending'}]));
+  const blocked=l.wait(3);
+  assert.equal(blocked.rc,0,blocked.err);assert.equal(blocked.out.split('\t')[0],'thr_w052');assert.equal(blocked.out.split('\t')[3],'blocked');
+  assert.ok(blocked.seconds<3+2,`blocked edge took ${blocked.seconds}s`);
+ }finally{rmSync(l.home,{recursive:true,force:true});}
+});

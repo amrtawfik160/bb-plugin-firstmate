@@ -12,6 +12,7 @@ const url=n=>`https://github.com/Cyndra-AI/cyndra-saas/pull/${n}`;
 const id=n=>`cyndra-ai/cyndra-saas#${n}`;
 const heads=new Map();
 let metas='';
+const states=new Map();
 const head=n=>heads.get(n) ?? String(n).repeat(10).slice(0,40);
 const crewRow=(id,threadId,extra)=>({id,task:'x',projectId:'proj_1',threadId,parentThreadId:'thr_cap',nativeHome:'/native',worktree:true,shape:'ship',posture:'direct-PR',createdAt:'2026-10-17T00:00:00.000Z',reasoningLevel:null,dispatchVersion:2,...extra});
 const CREWS=[
@@ -36,11 +37,11 @@ function hostCommands(host,{delayMs=0}={}) {
 function forge(command) {
  const n=Number(/\/pull\/(\d+)/.exec(command)?.[1]);
  if(command.includes('/state/*.meta'))return{payload:metas};
- if(command.includes('gh pr view'))return{payload:JSON.stringify({number:n,url:url(n),title:`Change ${n}`,headRefName:`fm/${BUILDER}-change-${n}`,headRefOid:head(n),state:'OPEN',isDraft:false,mergeable:'MERGEABLE',statusCheckRollup:[{status:'COMPLETED',conclusion:'SUCCESS'}],reviewDecision:'APPROVED',reviews:[]})};
+ if(command.includes('gh pr view'))return{payload:JSON.stringify({number:n,url:url(n),title:`Change ${n}`,headRefName:`fm/${BUILDER}-change-${n}`,headRefOid:head(n),state:states.get(n) ?? 'OPEN',mergeCommit:states.get(n)==='MERGED'?{oid:'m'.repeat(40)}:null,isDraft:false,mergeable:'MERGEABLE',statusCheckRollup:[{status:'COMPLETED',conclusion:'SUCCESS'}],reviewDecision:'APPROVED',reviews:[]})};
  return{code:0};
 }
 async function deck(prs,{delayMs=0}={}) {
- heads.clear();metas='';
+ heads.clear();metas='';states.clear();
  const host=createFakePluginHost({pluginId:'firstmate',agentSkillIds:['firstmate','captain'],settings:{fmHome:'/native',fmHostId:'host_1'}});await plugin(host.bb);
  host.harness.sdk.stub('threads.list',async()=>[]);
  host.harness.sdk.stub('threads.getPluginMetadata',async()=>({}));
@@ -102,6 +103,7 @@ test('a crew forgotten with its PR open has its native record retired once every
   host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle',environmentId:'env_wt',archivedAt:archived.has(threadId)?1:null}));
   const deliver=(task,thread,n,status)=>{const r=store.register({url:url(n),taskId:task,projectId:'proj_1',owner:'thr_cap',home:'/native',worker:thread,requirement:'pr',continuation:crewRow(task,thread,{backlogRow:true,providerId:null,model:null})});
    store.save({...store.get(r.id),status,nextCheckAt:Date.now()+3_600_000});};
+  for(const n of [5001,5002,5003,5005,5006]) states.set(n,'MERGED');
   deliver('c9','thr_c9',5001,'complete');deliver('c9','thr_c9',5002,'merged-unverified');
   deliver('c8','thr_c8',5003,'complete');deliver('c8','thr_c8',5004,'pr-delivered');
   deliver('c5','thr_c5',5005,'complete');
@@ -111,4 +113,33 @@ test('a crew forgotten with its PR open has its native record retired once every
   const removed=gh.commands.flatMap(c=>/rm -f \S*\/native\/state\/([A-Za-z0-9_-]+)\.meta\b/.exec(c)?.slice(1) ?? []);
   assert.deepEqual(removed,['c9'],'only the forgotten crew whose deliveries all ended loses its record');
  }finally{await host.harness.lifecycle.dispose();}
+});
+
+async function sweepDeck() {
+ const d=await deck([]);
+ d.host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle',environmentId:'env_wt',archivedAt:1}));
+ d.deliver=(task,thread,n,status)=>{const r=d.store.register({url:url(n),taskId:task,projectId:'proj_1',owner:'thr_cap',home:'/native',worker:thread,requirement:'pr',continuation:crewRow(task,thread,{backlogRow:true,providerId:null,model:null})});
+  d.store.save({...d.store.get(r.id),status,nextCheckAt:Date.now()+3_600_000});};
+ d.removed=()=>d.gh.commands.flatMap(c=>/rm -f \S*\/native\/state\/([A-Za-z0-9_-]+)\.meta\b/.exec(c)?.slice(1) ?? []);
+ return d;
+}
+
+test('a forgotten task keeps its record while a delivery of another worker on that task is still open',async()=>{
+ const d=await sweepDeck();try {
+  states.set(5101,'MERGED');
+  d.deliver('c9','thr_c9',5101,'complete');d.deliver('c9','thr_other',5102,'pr-delivered');
+  metas='c9\tthr_c9\n';
+  await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.deepEqual(d.removed(),[]);
+ }finally{await d.host.harness.lifecycle.dispose();}
+});
+
+test('a PR reopened since its delivery was abandoned is read fresh, and its task keeps the record',async()=>{
+ const d=await sweepDeck();try {
+  d.deliver('c4','thr_c4',5201,'explicitly-abandoned');
+  metas='c4\tthr_c4\n';
+  await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.ok(d.gh.commands.some(c=>c.includes('/pull/5201')),'the reopened PR was read from GitHub before retirement');
+  assert.deepEqual(d.removed(),[]);
+ }finally{await d.host.harness.lifecycle.dispose();}
 });

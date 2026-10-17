@@ -428,3 +428,53 @@ test('a second crew on a PR another task owns is logged once per PR and crew, at
   assert.equal(store.get('acme/repo#2374').taskId,'owner-task');
  }finally{await host.harness.lifecycle.dispose();}
 });
+
+async function quietDeck(answer) {
+ const host=await base();
+ await host.bb.storage.kv.set('crews',[crew('c1','thr_c1','thr_cap')]);
+ host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'active',environmentId:`env_${threadId}`}));
+ host.harness.sdk.stub('environments.get',async({environmentId})=>({id:environmentId,hostId:'host_1',status:'ready',isWorktree:true,path:`/wt/${environmentId}`,branchName:'fm/verify'}));
+ const commands=[];hostCommands(host,command=>{commands.push(command);return answer(command);});
+ const store=createDeliveries(host.bb.storage.database());
+ const track=(n,headSha='sha1')=>{const r=store.register({url:`https://github.com/acme/repo/pull/${n}`,taskId:'c1',projectId:'proj_1',owner:'thr_cap',home:'',worker:'thr_c1',requirement:'pr'});
+  store.observe(r.id,{headSha,state:'open',draft:false,checks:'passing',review:'approved',reviewHeadSha:headSha,mergeCommitSha:null,mergeable:'mergeable'},false);
+  store.save({...store.get(r.id),nextCheckAt:Date.now()+30*60_000});};
+ const reads=()=>commands.filter(c=>c.includes('gh pr view')).map(prNumber).sort((a,b)=>a-b);
+ return {host,store,track,reads,commands};
+}
+const listed=(rows,etag='W/"e1"')=>`HTTP/2.0 200 OK\nEtag: ${etag}\nX-Ratelimit-Resource: core\n\n${rows.map(r=>JSON.stringify(r)).join('\n')}`;
+
+test('a quiet PR is read at once when the open list shows a new head or no longer lists it, and only then',async()=>{
+ const rows=[{...openPrs[0],headSha:'sha2'},{number:14,url:'https://github.com/acme/repo/pull/14',title:'Quiet',headRefName:'fm/verify-quiet',headSha:'sha1'}];
+ const d=await quietDeck(command=>isOpenList(command)?{payload:listed(rows)}:command.includes('gh pr view')?{payload:JSON.stringify(forge('OPEN',{headRefOid:'sha2'}))}:{code:0});try {
+  d.track(10);d.track(11);d.track(14);
+  await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.deepEqual(d.reads(),[10,11],'#10 was pushed and #11 left the open list; #14 is unchanged');
+ }finally{await d.host.harness.lifecycle.dispose();}
+});
+
+test('the open list is asked again with its ETag, and a 304 keeps the rows it had',async()=>{
+ let n=0;
+ const d=await quietDeck(command=>{ if(!isOpenList(command)) return command.includes('gh pr view')?{payload:JSON.stringify(forge('OPEN'))}:{code:0};
+  n++; return n===1?{payload:listed([{...openPrs[0],headSha:'sha1'}])}:{payload:'HTTP/2.0 304 Not Modified\nEtag: W/"e1"\n\n',code:1}; });try {
+  d.track(10);
+  await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  const lists=d.commands.filter(isOpenList);
+  assert.equal(lists.length,2);
+  assert.doesNotMatch(lists[0],/If-None-Match/);assert.match(lists[1],/If-None-Match: W\/\\?"e1\\?"/);
+  assert.deepEqual(d.reads(),[],'the 304 kept #10 in the open list, so nothing made it due');
+ }finally{await d.host.harness.lifecycle.dispose();}
+});
+
+test('a cycle reads no due PR while little GitHub GraphQL quota is left, and reads them once it recovers',async()=>{
+ let remaining=150;
+ const d=await quietDeck(command=>command.includes('rate_limit')?{payload:JSON.stringify({remaining,reset:Math.floor(Date.now()/1000)+600})}:command.includes('gh pr view')?{payload:JSON.stringify(forge('OPEN'))}:isOpenList(command)?{payload:listed([])}:{code:0});try {
+  for(const n of [21,22,23]){d.track(n);d.store.save({...d.store.get(`acme/repo#${n}`),nextCheckAt:0});}
+  await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.deepEqual(d.reads(),[],'no GraphQL read with 150 points left');
+  remaining=4000;
+  await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.deepEqual(d.reads(),[21,22,23]);
+ }finally{await d.host.harness.lifecycle.dispose();}
+});
