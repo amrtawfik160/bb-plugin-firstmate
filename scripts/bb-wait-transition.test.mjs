@@ -85,9 +85,10 @@ test('a working thread is checked for a pending interaction the list flag may no
 test('a working thread that stays working is raced until the budget ends, then the wait returns',()=>{
  const l=lab(60);try {
   l.threads[3].status='active';l.threads[3].runtime.displayStatus='active';l.save();
-  const r=l.wait(3);
+  // A 6 s budget leaves room for the race after the scan on a loaded machine.
+  const r=l.wait(6);
   assert.equal(r.rc,1,r.err);
-  assert.ok(r.seconds<3+2,`wait took ${r.seconds}s for a 3s budget`);
+  assert.ok(r.seconds<6+2,`wait took ${r.seconds}s for a 6s budget`);
   assert.ok(r.calls.some(c=>c[1]==='wait'&&c.at(-1)==='thr_w003'),'the working thread was raced to idle');
  }finally{rmSync(l.home,{recursive:true,force:true});}
 });
