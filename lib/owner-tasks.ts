@@ -134,6 +134,41 @@ export function taskTitle(title: string, project: string | null): string {
   return rest === "" || rest === clean ? clean : rest[0]!.toUpperCase() + rest.slice(1);
 }
 
+/** One task as the Telegram connector reads it, for the task's status line and /tasks. */
+export type TelegramTask = Pick<OwnerTask, "id" | "project" | "title" | "state" | "createdAt" | "updatedAt"> & {
+  /** Crews of the task that run now. */
+  crews: number;
+  /** What the task waits on, in the owner's words. Null once it is closed. */
+  waitsOn: string | null;
+  /** The owner's Telegram messages that started it: tg:<chat>:<message>. */
+  refs: string[];
+};
+
+function waitsOn(task: OwnerTask, crews: number): string | null {
+  if (!isOpenTask(task)) return null;
+  if (task.state === "needs_you" || task.state === "ready") return "you";
+  if (task.state === "check") return "the captain's check";
+  return crews > 0 ? `${crews} crew${crews === 1 ? "" : "s"}` : "the captain";
+}
+
+/** Every open task, and each that changed at or after `since`, for the connector. */
+export function telegramTasks(tasks: readonly OwnerTask[], runningCrewIds: readonly string[], since: number): TelegramTask[] {
+  const running = new Set(runningCrewIds);
+  return tasks.filter((task) => isOpenTask(task) || task.updatedAt >= since).map((task) => {
+    const crews = task.crewIds.filter((id) => running.has(id)).length;
+    return {
+      id: task.id, project: task.project, title: task.title, state: task.state, createdAt: task.createdAt, updatedAt: task.updatedAt,
+      crews, waitsOn: waitsOn(task, crews), refs: task.sourceRefs.filter((ref) => ref.startsWith("tg:")),
+    };
+  });
+}
+
+/** The task an owner message started: the newest open one that holds it, else the newest closed one. */
+export function taskOfRef(tasks: readonly OwnerTask[], ref: string): OwnerTask | undefined {
+  const holding = tasks.filter((task) => task.sourceRefs.includes(ref));
+  return holding.filter(isOpenTask).at(-1) ?? holding.at(-1);
+}
+
 /** How a crew left: delivered means it reported DONE or its work landed. */
 export type CrewFinish = { delivered: boolean; outcome: string };
 
@@ -174,7 +209,16 @@ const CLOSING = new Set<TaskState>(["merged", "live", "done", "dropped"]);
 /** Why a task must stay open (an open program holds it), or null when it may close. */
 export type HeldOpen = (task: OwnerTask) => string | null;
 
-export function createOwnerTasks(db: Database, heldOpen: HeldOpen = () => null): OwnerTasks {
+/**
+ * `changed` runs after each write that changed a task, once its transaction is done: the Telegram
+ * connector redraws that task's status line from it.
+ */
+export function createOwnerTasks(db: Database, heldOpen: HeldOpen = () => null, changed: (task: OwnerTask) => void = () => {}): OwnerTasks {
+  const notify = (task: OwnerTask): OwnerTask => {
+    queueMicrotask(() => changed(task));
+    return task;
+  };
+
   db.exec(`CREATE TABLE IF NOT EXISTS owner_task (
     id TEXT PRIMARY KEY, seq INTEGER NOT NULL UNIQUE, captain TEXT NOT NULL, state TEXT NOT NULL, record TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS owner_task_captain ON owner_task(captain, state);`);
@@ -186,7 +230,7 @@ export function createOwnerTasks(db: Database, heldOpen: HeldOpen = () => null):
 
   function save(task: OwnerTask): OwnerTask {
     db.prepare("UPDATE owner_task SET state=?, record=? WHERE id=?").run(task.state, JSON.stringify(task), task.id);
-    return task;
+    return notify(task);
   }
 
   function list(captain: string, scope: { includeClosed?: boolean } = {}): OwnerTask[] {
@@ -236,7 +280,7 @@ export function createOwnerTasks(db: Database, heldOpen: HeldOpen = () => null):
           updatedAt: input.at,
         };
         db.prepare("INSERT INTO owner_task VALUES (?,?,?,?,?)").run(task.id, seq, task.captain, task.state, JSON.stringify(task));
-        return task;
+        return notify(task);
       })();
     },
     get,

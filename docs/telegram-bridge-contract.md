@@ -63,13 +63,20 @@ When `telegramThreading` is on, Firstmate calls the Telegram plugin:
 bb.sdk.plugins.callRpc({
   pluginId: "telegram",
   method: "reply",
-  input: { correlation, chatId, messageId, kind, text, quote? },
-  outputSchema: { queued: number, duplicate: boolean, mode: "on" | "off" },
+  input: { correlation, chatId, messageId, kind, text, quote?, project?, task?, result? },
+  outputSchema: { queued: number, duplicate: boolean, mode: "on" | "off", cardRepeat?: boolean, dropped?: "started" | "about-owner" },
 })
 ```
 
-`kind` is `ack | reply | progress | delegated | nudge | final`. A send counts
-only when `queued > 0` or `duplicate` is true. Any other result, or any error,
+`kind` is `ack | reply | progress | delegated | nudge | final`. `firstmate_reply`
+sends `progress` with `more=true`, `final` for a task's result, and `reply`
+otherwise. `task` is the owner task (`T<n>`) the answer belongs to: the one
+passed to `firstmate_reply`, or the task the owner message started. `result`
+is true when that task is closed (done, merged, live or dropped) and the reply
+is not `more=true`. A send counts
+only when `queued > 0` or `duplicate` is true. `dropped` means the connector
+sent nothing because Decisions is sure the text only says the work started, or
+is a note about the owner: the item stays open and `firstmate_reply` says so. Any other result, or any error,
 leaves the item open and `firstmate_reply` returns an error. Firstmate reserves
 the reply before the call and releases it on failure, so a retry is safe. An
 ack with `mode: "off"` does not apply and is not recorded as sent.
@@ -115,16 +122,22 @@ and `delegated` items with their crew.
 
 ## Owner commands
 
-The connector answers `/inbox`, `/workers`, its board and its digest itself by calling Firstmate:
+The connector answers `/inbox`, `/workers`, `/tasks`, its board, its digest and its task status lines itself by calling Firstmate:
 
 ```
 bb.sdk.plugins.callRpc({
   pluginId: "firstmate",
   method: "telegramCommand",
-  input: { command: "inbox" | "workers" | "board" | "digest", threadId: <bound captain>, since?: <ms> },
-  outputSchema: { text: string, away?: boolean },
+  input: { command: "inbox" | "workers" | "board" | "digest" | "tasks", threadId: <bound captain>, since?: <ms> },
+  outputSchema: { text: string, away?: boolean, projects?: [...], tasks?: [...] },
 })
 ```
+
+`tasks` returns every open owner task and each one that changed at or after
+`since` (default: now): `{ id, project, title, state, crews, waitsOn, refs,
+createdAt, updatedAt }`. `crews` counts the task's running crews, `waitsOn` is
+"you", "the captain's check", "<n> crews" or "the captain" (null once closed),
+and `refs` are the owner's `tg:<chat>:<msg>` messages that started it.
 
 `since` is when the owner last looked. When it is missing, `board` uses 24
 hours ago and `digest` uses 12 hours ago.
@@ -195,6 +208,8 @@ bb.sdk.plugins.callRpc({
     options,          // at most 4 of { label (at most 40), value (at most 64) }; may be empty
     recommended?,     // index into options
     card?: { kind, question, impact?, defaultAt, gated },  // lets the connector fold cards into a pack
+    project?,         // the card's project, for its Telegram topic
+    task?,            // the owner task (T<n>): passed, or the one open task this turn's owner messages started
   },
   outputSchema: { queued: number, duplicate: boolean },
 })
@@ -245,9 +260,12 @@ to go ahead with the recommended option. Approvals and asks with
 `irreversible: true` refuse a deadline and never default.
 `firstmate_resolve_ask` closes an ask as answered or cancelled.
 
-After an ask is created, answered, defaulted or cancelled, Firstmate calls
-`refreshBoard` (input `{}`, output `{ ok: boolean }`) on the connector. It is
-best effort: errors and a missing method are ignored.
+After an ask is created, answered, defaulted or cancelled, and after every
+owner task change (opened, moved, a crew joined or ended, a PR linked or
+proving a state), Firstmate calls `refreshBoard` (input `{}`, output
+`{ ok: boolean }`) on the connector. The connector then reads the board and the
+tasks again and updates each task's status line. It is best effort: errors and
+a missing method are ignored.
 
 ## Reminders
 
