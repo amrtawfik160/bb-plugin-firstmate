@@ -492,3 +492,20 @@ test('background PR discovery uses the open list it already read: no branch list
   assert.equal(createDeliveries(d.host.bb.storage.database()).get('acme/repo#10')?.taskId,'c1','the open list still tracks the crew PR');
  }finally{await d.host.harness.lifecycle.dispose();}
 });
+
+test('with no delivery rows the quota is probed before discovery, and with 150 points left discovery makes no GitHub request',async()=>{
+ const host=await base();try {
+  await host.bb.storage.kv.set('crews',[crew('c1','thr_c1','thr_cap')]);
+  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'active',environmentId:`env_${threadId}`}));
+  host.harness.sdk.stub('environments.get',async({environmentId})=>({id:environmentId,hostId:'host_1',status:'ready',isWorktree:true,path:`/wt/${environmentId}`,branchName:'fm/verify'}));
+  host.harness.sdk.stub('environments.pullRequest',async()=>({outcome:'unavailable'}));
+  const commands=[];
+  hostCommands(host,command=>{commands.push(command);
+   if(command.includes('rateLimit')) return {payload:'{}',stderr:`< X-Ratelimit-Remaining: 150\n< X-Ratelimit-Reset: ${Math.floor(Date.now()/1000)+600}\n< X-Ratelimit-Resource: graphql\n`};
+   return {code:0};});
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.ok(commands.some(c=>c.includes('rateLimit')&&c.includes('GH_DEBUG=api')),'a metered probe ran');
+  assert.equal(host.harness.sdk.callsTo('environments.pullRequest').length,0,'no BB PR lookup under the reserve');
+  assert.equal(commands.filter(c=>c.includes('gh pr list')).length,0,'no branch list under the reserve');
+ }finally{await host.harness.lifecycle.dispose();}
+});
