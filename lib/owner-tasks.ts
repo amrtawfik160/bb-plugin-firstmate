@@ -26,6 +26,11 @@ export interface OwnerTask {
   id: string;
   captain: string;
   project: string | null;
+  /**
+   * The BB project of the task's crews, recorded at dispatch (never the captain thread's project). The
+   * Telegram connector puts the task's messages in this project's topic. Unset on records from before.
+   */
+  projectId?: string | null;
   title: string;
   sourceRefs: string[];
   state: TaskState;
@@ -42,6 +47,7 @@ export interface OwnerTask {
 export type TaskMove = { to: "dropped"; reason: string } | { to: Exclude<TaskState, "dropped">; reason?: string };
 
 export type NewOwnerTask = Pick<OwnerTask, "captain" | "project" | "title" | "sourceRefs"> & {
+  projectId?: string | null;
   crewId?: string;
   prs?: string[];
   backfilled?: boolean;
@@ -136,7 +142,9 @@ export function taskTitle(title: string, project: string | null): string {
 
 /** One task as the Telegram connector reads it, for the task's status line and /tasks. */
 export type TelegramTask = Pick<OwnerTask, "id" | "project" | "title" | "state" | "createdAt" | "updatedAt"> & {
-  /** Crews of the task that run now. */
+  /** The BB project of the task's crews: the connector's topic for the task comes from this id only. */
+  projectId: string | null;
+  /** Crews of the task that are starting or run now. */
   crews: number;
   /** What the task waits on, in the owner's words. Null once it is closed. */
   waitsOn: string | null;
@@ -151,13 +159,16 @@ function waitsOn(task: OwnerTask, crews: number): string | null {
   return crews > 0 ? `${crews} crew${crews === 1 ? "" : "s"}` : "the captain";
 }
 
-/** Every open task, and each that changed at or after `since`, for the connector. */
-export function telegramTasks(tasks: readonly OwnerTask[], runningCrewIds: readonly string[], since: number): TelegramTask[] {
-  const running = new Set(runningCrewIds);
+/**
+ * Every open task, and each that changed at or after `since`, for the connector. `crewIds` are the crews
+ * that start or run now: a crew still starting counts, so a status line never says 0 crews while one starts.
+ */
+export function telegramTasks(tasks: readonly OwnerTask[], crewIds: readonly string[], since: number): TelegramTask[] {
+  const running = new Set(crewIds);
   return tasks.filter((task) => isOpenTask(task) || task.updatedAt >= since).map((task) => {
     const crews = task.crewIds.filter((id) => running.has(id)).length;
     return {
-      id: task.id, project: task.project, title: task.title, state: task.state, createdAt: task.createdAt, updatedAt: task.updatedAt,
+      id: task.id, project: task.project, projectId: task.projectId ?? null, title: task.title, state: task.state, createdAt: task.createdAt, updatedAt: task.updatedAt,
       crews, waitsOn: waitsOn(task, crews), refs: task.sourceRefs.filter((ref) => ref.startsWith("tg:")),
     };
   });
@@ -193,8 +204,11 @@ export type OwnerTasks = {
   openByRef(captain: string, ref: string): OwnerTask[];
   move(id: string, captain: string, move: TaskMove, at: number): OwnerTask;
   linkPr(id: string, captain: string, pr: string, at: number): OwnerTask;
-  /** Put another crew on an existing task. Work restarts, so an open task goes back to working. */
-  attach(id: string, captain: string, input: { crewId: string; sourceRefs: readonly string[]; at: number }): OwnerTask;
+  /**
+   * Put another crew on an existing task. Work restarts, so an open task goes back to working. A task with
+   * no project yet (opened by hand) takes the crew's project.
+   */
+  attach(id: string, captain: string, input: { crewId: string; sourceRefs: readonly string[]; project?: { id: string; label: string | null }; at: number }): OwnerTask;
   /** The task, open or closed, that already holds one of these PRs. */
   holding(captain: string, prs: (pr: string, task: OwnerTask) => boolean): OwnerTask | undefined;
   /** A crew finished. When no other crew of its task still runs, settle the task. */
@@ -270,6 +284,7 @@ export function createOwnerTasks(db: Database, heldOpen: HeldOpen = () => null, 
           id: `T${seq}`,
           captain: input.captain,
           project,
+          projectId: input.projectId ?? null,
           title,
           sourceRefs: [...new Set(input.sourceRefs)],
           state: "working",
@@ -308,8 +323,12 @@ export function createOwnerTasks(db: Database, heldOpen: HeldOpen = () => null, 
         const crewIds = task.crewIds.includes(input.crewId) ? task.crewIds : [...task.crewIds, input.crewId];
         const sourceRefs = [...new Set([...task.sourceRefs, ...input.sourceRefs])];
         const restarted = isOpenTask(task) && task.state !== "working" ? moveTask(task, { to: "working" }, input.at) : task;
-        if (restarted === task && crewIds === task.crewIds && sourceRefs.length === task.sourceRefs.length) return task;
-        return save({ ...restarted, crewIds, sourceRefs, updatedAt: input.at });
+        // The label follows the crew only when the task had none, so an older task keeps its board label.
+        const project = !task.projectId && input.project
+          ? { projectId: input.project.id, project: task.project ?? projectName(input.project.label, list(captain, { includeClosed: true }).map((item) => item.project)) }
+          : {};
+        if (restarted === task && crewIds === task.crewIds && sourceRefs.length === task.sourceRefs.length && !("projectId" in project)) return task;
+        return save({ ...restarted, ...project, crewIds, sourceRefs, updatedAt: input.at });
       })();
     },
     holding(captain, prs) {
