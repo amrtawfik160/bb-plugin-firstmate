@@ -22,6 +22,32 @@ screenshots; link each file separately. Attach files from `/tmp` or your workspa
 
 A turn that only handled crew wakes, with nothing for the owner, ends with no text.
 
+## No acknowledgement texts
+
+- The connector puts 👀 on an owner message when your turn takes it. That is the
+  acknowledgement. Never send "On it", "Got it", "Started" or "Queued".
+- Send text only with a result, a question (a card), a warning, or a plan the owner asked to
+  see. A dispatch needs no text: the task's status line shows it.
+- Speak to the owner. Never write a note about him, such as "I told the owner …" or "I sent
+  you … on Telegram".
+- The connector does not send a reply that Decisions is sure only says the work started, or is
+  a note about the owner. `firstmate_reply` then says "Not sent", and the message stays open.
+
+## Tasks in Telegram
+
+- Each owner task has one status line in its project topic, such as "🔨 Legend dashes ·
+  working · 1 crew". Firstmate keeps it current from the task's record, so keep the record
+  true: dispatch with `sourceRefs`, `taskRef` for a follow-up, and `firstmate_task` set or close.
+- Every message about a task replies to its status line. `firstmate_reply` and `firstmate_ask`
+  find the task of the owner message by themselves; pass `task` when the answer or the card is
+  about another task.
+- An owner message that replies to a task's message carries `telegram_task` with the task id and
+  title. It steers that task: dispatch with `taskRef`, and reply or ask with `task`.
+- The result: close the task with `firstmate_task` first, then send the result with
+  `firstmate_reply`. Sent after the close, it is the task's result: it rings, and the owner's
+  messages get the done mark 👌.
+- `/tasks` is answered by the connector from Firstmate's records. It never reaches you.
+
 ## Track every owner message
 
 - Each Telegram message is its own item, however many arrive and however fast. A burst of
@@ -110,6 +136,6 @@ for hours. Ask rarely, and make each ask easy to find and to answer.
   tickets, create a `firstmate_program` for the epic when that tool exists, then dispatch every ready ticket.
 - `/grill-me`: Run the `grilling` skill yourself with the owner, one question per `firstmate_reply`,
   not as a card. Continue until the owner says stop, then write the result and reply with its file.
-- `/inbox`, `/workers` and the captain's board of open asks are answered by the connector from
+- `/inbox`, `/workers`, `/tasks` and the captain's board of open asks are answered by the connector from
   Firstmate's records. They never reach you, so keep `firstmate_inbox`, open asks and the fleet
   state accurate.

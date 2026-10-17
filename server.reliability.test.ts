@@ -1026,10 +1026,10 @@ for (const quote of [undefined, "Status?"]) {
       recordTelegram(host, "thr_cap", "1671", 3_000);
       recordTelegram(host, "thr_cap", "1672", 4_000);
       createInboundLedger(host.bb.storage.database()).markDelegated({ source: "telegram", chatId: "200", messageId: "1671" }, "thr_crew", 3_500);
-      // Like the connector: one send per chat, message, kind and quote; a later call with that key is a duplicate.
+      // Like an old connector: one send per chat, message and quote; a later call with that key is a duplicate.
       const telegram: string[] = [];
       const held = new Set<string>();
-      let keyOf = (input: { chatId: string; messageId: string; kind: string; quote?: string; text: string }) => `${input.chatId}:${input.messageId}:${input.kind}:${input.quote ?? ""}`;
+      let keyOf = (input: { chatId: string; messageId: string; kind: string; quote?: string; text: string }) => `${input.chatId}:${input.messageId}:${input.quote ?? ""}`;
       host.harness.sdk.stub("plugins.callRpc", async (args: { input: { chatId: string; messageId: string; kind: string; quote?: string; text: string } }) => {
         const key = keyOf(args.input);
         if (held.has(key)) return { queued: 0, duplicate: true, mode: "on" };

@@ -530,3 +530,122 @@ test("a builder started on an owner task after its earlier builder ended is redo
     await host.harness.lifecycle.dispose();
   }
 });
+
+/** Every call Firstmate makes to the Telegram connector; the reply answers as `answer` says. */
+function connector(host: Host, answer: (method: string, input: Record<string, unknown>) => unknown = () => ({ ok: true, queued: 1, duplicate: false, mode: "on" })) {
+  const calls: Array<{ method: string; input: Record<string, unknown> }> = [];
+  host.harness.sdk.stub("plugins.callRpc", async ({ method, input }: { method: string; input: Record<string, unknown> }) => {
+    calls.push({ method, input });
+    return answer(method, input);
+  });
+  return calls;
+}
+
+const settle = () => new Promise((resolve) => setImmediate(resolve));
+const tasksRpc = async (host: Host, since?: number) =>
+  (await host.harness.behavior.callRpc("telegramCommand", { command: "tasks", threadId: "thr_cap", ...(since === undefined ? {} : { since }) }) as { tasks: Array<Record<string, unknown>> }).tasks;
+
+test("the connector reads every open task, and each closed one since it last looked, with its crews, what it waits on and the owner's refs", async () => {
+  const host = await captainHost();
+  try {
+    await ownerSays(host, "2301", "Fix the legend dashes");
+    await dispatch(host, { task: "Fix the legend dashes", taskId: "legend", title: "Legend dashes", sourceRefs: ["tg:200:2301"] });
+    const start = Date.now();
+    // The crew's reservation finishes in the background; until then no crew of the task runs.
+    for (let tries = 0; tries < 50 && (await tasksRpc(host, start))[0]?.crews !== 1; tries += 1) await new Promise((resolve) => setTimeout(resolve, 20));
+    const [open] = await tasksRpc(host, start);
+    assert.deepEqual({ ...open, createdAt: typeof open!.createdAt, updatedAt: typeof open!.updatedAt }, {
+      id: "T1", project: "Areliaa", title: "Legend dashes", state: "working", crews: 1, waitsOn: "1 crew", refs: ["tg:200:2301"], createdAt: "number", updatedAt: "number",
+    });
+    await tool(host, "firstmate_task").execute({ action: "set", id: "T1", state: "needs_you" }, capCtx);
+    assert.equal((await tasksRpc(host, start))[0]!.waitsOn, "you");
+    await tool(host, "firstmate_task").execute({ action: "close", id: "T1", state: "done", reason: "Dots now" }, capCtx);
+    assert.deepEqual((await tasksRpc(host, start)).map((task) => [task.id, task.state, task.waitsOn]), [["T1", "done", null]], "closed since the connector last looked: still read once");
+    assert.deepEqual(await tasksRpc(host, Date.now() + 1), [], "closed before: not read again");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("every task change tells the connector to redraw the task's status line", async () => {
+  const host = await captainHost();
+  const calls = connector(host);
+  try {
+    await ownerSays(host, "2302", "Rename the export button");
+    await dispatch(host, { task: "Rename the export button", taskId: "export", title: "Export button", sourceRefs: ["tg:200:2302"] });
+    await settle();
+    const refreshes = () => calls.filter((call) => call.method === "refreshBoard").length;
+    const opened = refreshes();
+    assert.ok(opened >= 1, "opening the task");
+    await tool(host, "firstmate_task").execute({ action: "set", id: "T1", state: "needs_you" }, capCtx);
+    await settle();
+    assert.ok(refreshes() > opened, "a state change");
+    // A PR that becomes ready to merge moves the task when Firstmate next reads it, with no tool call.
+    const store = createDeliveries(host.bb.storage.database());
+    const pr = store.register({ url: "https://github.com/acme/app/pull/2092", taskId: "export", projectId: "proj_1", owner: "thr_cap", home: "", worker: "thr_new", title: "Export button" });
+    store.save({ ...pr, status: "ready-to-merge" });
+    const moved = refreshes();
+    await tasksRpc(host);
+    await settle();
+    assert.equal(createOwnerTasks(host.bb.storage.database()).get("T1")!.state, "ready");
+    assert.ok(refreshes() > moved, "a move its PR proves");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("firstmate_reply names the task of the owner message; more=true is progress; after the task closes the answer is its result", async () => {
+  const host = await captainHost();
+  const calls = connector(host);
+  try {
+    await ownerSays(host, "2303", "Fix the legend dashes");
+    await dispatch(host, { task: "Fix the legend dashes", taskId: "legend", title: "Legend dashes", sourceRefs: ["tg:200:2303"] });
+    // An "ack" reply sets 👀 when the message reaches the captain; it carries no text.
+    const replies = () => calls.filter((call) => call.method === "reply" && call.input.kind !== "ack").map((call) => ({ kind: call.input.kind, task: call.input.task, result: call.input.result }));
+    await tool(host, "firstmate_reply").execute({ ref: "tg:200:2303", text: "The dashes come from the legend.", more: true }, capCtx);
+    await tool(host, "firstmate_reply").execute({ ref: "tg:200:2303", text: "Should the forecast use dots?" }, capCtx);
+    await tool(host, "firstmate_task").execute({ action: "close", id: "T1", state: "done", reason: "Dots now" }, capCtx);
+    await ownerSays(host, "2304", "Status?");
+    await tool(host, "firstmate_reply").execute({ ref: "tg:200:2303", text: "Done: the forecast uses dots, live." }, capCtx);
+    await tool(host, "firstmate_reply").execute({ ref: "tg:200:2304", text: "All quiet." }, capCtx);
+    assert.deepEqual(replies(), [
+      { kind: "progress", task: "T1", result: undefined },
+      { kind: "reply", task: "T1", result: undefined },
+      { kind: "final", task: "T1", result: true },
+      { kind: "reply", task: undefined, result: undefined },
+    ]);
+    assert.ok(isError(await tool(host, "firstmate_reply").execute({ ref: "tg:200:2304", text: "Other.", task: "T9" }, capCtx)), "an unknown task is refused");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a reply the connector drops as only saying the work started is not sent, and the owner message stays open", async () => {
+  const host = await captainHost();
+  connector(host, (method) => method === "reply" ? { queued: 0, duplicate: false, mode: "on", dropped: "started" } : { ok: true, queued: 1, duplicate: false, mode: "on" });
+  try {
+    await ownerSays(host, "2305", "Fix the legend dashes");
+    const replied = await tool(host, "firstmate_reply").execute({ ref: "tg:200:2305", text: "On it." }, capCtx);
+    assert.ok(isError(replied));
+    assert.match(text(replied), /^Not sent to Telegram: it only says the work started, and the owner already sees 👀 on the message\. tg:200:2305 stays open\./);
+    assert.notEqual(createInboundLedger(host.bb.storage.database()).get({ source: "telegram", chatId: "200", messageId: "2305" })?.state, "answered");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("firstmate_ask names the open task this turn's owner message started, or the task it is given", async () => {
+  const host = await captainHost();
+  const calls = connector(host);
+  try {
+    await ownerSays(host, "2306", "Fix the legend dashes");
+    await dispatch(host, { task: "Fix the legend dashes", taskId: "legend", title: "Legend dashes", sourceRefs: ["tg:200:2306"] });
+    const asks = () => calls.filter((call) => call.method === "ask").map((call) => call.input.task);
+    await tool(host, "firstmate_ask").execute({ question: "Dots or dashes?", kind: "question", options: [{ label: "Dots" }, { label: "Dashes" }] }, capCtx);
+    await tool(host, "firstmate_ask").execute({ question: "Which colour?", kind: "question", options: [{ label: "Blue" }], task: "T1" }, capCtx);
+    assert.deepEqual(asks(), ["T1", "T1"]);
+    assert.ok(isError(await tool(host, "firstmate_ask").execute({ question: "Which?", kind: "question", task: "T5" }, capCtx)));
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});

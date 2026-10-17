@@ -31,13 +31,21 @@ export const rpcContract = defineRpcContract({
     output: z.object({ ok: z.boolean() }),
   },
   telegramCommand: {
-    experimental_description: "Answer a Telegram owner command (/inbox, /workers, the board, or the digest) for one captain thread as plain text. The board has three sections: Needs you, Done since you last looked, In progress. since (ms) is when the owner last looked: board defaults to 24 h ago, digest to 12 h ago. The digest text is empty when there is nothing to report. For board, away is the captain's /afk posture, and projects counts the crews working on each project, for the pinned board of each Telegram project topic.",
+    experimental_description: "Answer a Telegram owner command (/inbox, /workers, the board, the digest, or the tasks) for one captain thread as plain text. tasks returns, in `tasks`, every open owner task and each one that changed since `since` (default now), with its running crews, what it waits on and the owner's Telegram refs, for the connector's task status lines and /tasks. The board has three sections: Needs you, Done since you last looked, In progress. since (ms) is when the owner last looked: board defaults to 24 h ago, digest to 12 h ago. The digest text is empty when there is nothing to report. For board, away is the captain's /afk posture, and projects counts the crews working on each project, for the pinned board of each Telegram project topic.",
     input: z.object({
-      command: z.enum(["inbox", "workers", "board", "digest"]),
+      command: z.enum(["inbox", "workers", "board", "digest", "tasks"]),
       threadId: z.string().min(1),
       since: z.number().int().nonnegative().optional(),
     }),
-    output: z.object({ text: z.string(), away: z.boolean().optional(), projects: z.array(z.object({ name: z.string(), working: z.number().int().nonnegative() })).optional() }),
+    output: z.object({
+      text: z.string(), away: z.boolean().optional(), projects: z.array(z.object({ name: z.string(), working: z.number().int().nonnegative() })).optional(),
+      tasks: z.array(z.object({
+        id: z.string(), project: z.string().nullable(), title: z.string(),
+        state: z.enum(["working", "needs_you", "ready", "check", "merged", "live", "done", "dropped"]),
+        crews: z.number().int().nonnegative(), waitsOn: z.string().nullable(), refs: z.array(z.string()),
+        createdAt: z.number(), updatedAt: z.number(),
+      })).optional(),
+    }),
   },
   fleet: {
     // null is the pre-0.4.0 app contract. Keep it during live reloads because

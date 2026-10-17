@@ -17,6 +17,10 @@ export type TelegramReplyInput = {
   quote?: string;
   /** The project the answer is about. With Telegram topics on, the connector sends it to that project's topic. */
   project?: string;
+  /** The owner task the answer belongs to (T<n>): it replies to that task's status line. */
+  task?: string;
+  /** The answer is the task's result: it rings and marks the owner's messages done. */
+  result?: boolean;
 };
 
 export type TelegramReplyRpcArgs = {
@@ -32,6 +36,8 @@ export const telegramReplyOutputSchema = z.object({
   mode: z.enum(["on", "off"]).optional(),
   /** The connector held the reply back: it only repeats a card of its turn, and the card answers the owner. */
   cardRepeat: z.boolean().optional(),
+  /** The connector held the reply back: it only says the work started, or it is a note about the owner. Nothing answered the owner. */
+  dropped: z.enum(["started", "about-owner"]).optional(),
 });
 
 export function correlationOf(row: Pick<InboundRow, "sourceRefs">): string | undefined {
@@ -49,6 +55,8 @@ export type TelegramReplyResult = {
   duplicate?: boolean;
   // The connector sent nothing: the reply only repeats a card of this turn, and that card answers the owner.
   cardRepeat?: boolean;
+  // The connector sent nothing: the reply only says the work started, or is a note about the owner.
+  dropped?: "started" | "about-owner";
 };
 
 export function telegramReplyFallbackBody(input: TelegramReplyInput & { threadId?: string | null }): string {
@@ -114,6 +122,8 @@ export async function sendTelegramReply(input: {
         ...(input.payload.correlation ? { correlation: input.payload.correlation } : {}),
         ...(input.payload.quote ? { quote: input.payload.quote } : {}),
         ...(input.payload.project ? { project: input.payload.project } : {}),
+        ...(input.payload.task ? { task: input.payload.task } : {}),
+        ...(input.payload.result ? { result: true } : {}),
       },
       outputSchema: telegramReplyOutputSchema,
     });
@@ -125,6 +135,7 @@ export async function sendTelegramReply(input: {
   const mode = result.mode ? { mode: result.mode } : {};
   if (input.payload.kind === "ack" && result.mode === "off") return { channel: "rpc", body, outcome: "not-applicable", ...mode };
   if (result.cardRepeat === true) return { channel: "rpc", body, outcome: "delivered", cardRepeat: true, ...mode };
+  if (result.dropped) return { channel: "rpc", body, outcome: "delivered", dropped: result.dropped, ...mode };
   if (result.queued > 0 || result.duplicate) return { channel: "rpc", body, outcome: "delivered", duplicate: result.queued <= 0 && result.duplicate, ...mode };
   throw new Error(`telegram.reply not queued (queued=${result.queued}, mode=${result.mode ?? "unknown"}).`);
 }
