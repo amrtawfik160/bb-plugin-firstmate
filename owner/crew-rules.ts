@@ -53,6 +53,6 @@ export function checkerSteps(skill: (name: string) => string): string[] {
     `1. Read the diff at the PR's current head. Review it with \`${skill("code-review")}\` and \`${skill("blast-radius")}\`.`,
     "2. Drive the changed surface yourself, with the project's verify skill if it has one.",
     "3. Record your verdict: `bb firstmate deliveries check <owner/repo#n> --commit <head sha> --verdict pass|fail --notes \"<what you checked, drove and saw>\"`.",
-    "4. A fail verdict names each finding. A new push needs a new check.",
+    "4. A fail verdict names each finding, numbered, in its notes, and adds `--findings <n>` with their count. A new push needs a new check.",
   ];
 }

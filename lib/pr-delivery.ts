@@ -29,10 +29,6 @@ export interface DeliveryRecord {
   verification?: { crewId: string | null; actor: string; commitSha: string; driven: string; seen: string; at: number } | null;
   /** The last checker crew's verdict on this PR at commitSha, with the model it ran on. */
   check?: CheckVerdict | null;
-  /** Every checker verdict on this PR, oldest first, for the weekly scorecard. */
-  checks?: CheckVerdict[];
-  /** Each verification the proof gate refused: the crew claimed done without its proof step. */
-  proofRefusals?: { crewId: string; step: number; headSha: string; at: number }[];
   updatedAt: number;
 }
 export interface CheckVerdict { verdict: 'pass' | 'fail'; commitSha: string; crewId: string; providerId: string | null; model: string; notes: string; at: number }
@@ -116,8 +112,6 @@ export const LOST_OWNER_RECHECK_MS = 5 * 60_000;
 const verifiedHead = (r: DeliveryRecord) => r.verifiedCommitSha !== null && r.verifiedCommitSha === r.headSha;
 const short = (sha: string) => sha.slice(0, 7);
 const terminal = (r: DeliveryRecord) => r.status === 'complete' || r.status === 'explicitly-abandoned';
-/** How many checker verdicts and refused proofs a record keeps. */
-const HISTORY = 20;
 function notificationKey(r: DeliveryRecord) {
   return createHash('sha256').update(JSON.stringify([r.headSha, r.status, r.owner, r.ownerNeeded, r.blocker, (r.failures??[]).filter(f=>f.resolvedAt===null).map(f=>[f.id,f.accounting??null])])).digest('hex');
 }
@@ -384,25 +378,7 @@ export function createDeliveries(db: Database) {
     const notes=input.notes.trim();
     if (!notes) throw new Error(`A checker verdict on ${r.id} needs notes: what you checked, drove and saw.`);
     const at=Date.now();
-    const check={ ...input, notes, commitSha:r.headSha, at };
-    return save({ ...r, check, checks:[...(r.checks ?? []), check].slice(-HISTORY), updatedAt:at });
-  }
-  function recordProofRefusal(id:string, crewId:string, step:number) {
-    const r=get(id); if (!r) return undefined;
-    const at=Date.now();
-    return save({ ...r, proofRefusals:[...(r.proofRefusals ?? []), { crewId, step, headSha:r.headSha ?? '', at }].slice(-HISTORY), updatedAt:at });
-  }
-  /** Checker fail verdicts and refused proofs recorded in [since, until), for the weekly scorecard. */
-  function quality(since:number, until:number, owner?:string) {
-    const rows=db.prepare(`SELECT record FROM deliveries${owner === undefined ? '' : ' WHERE owner = ?'}`).all(...(owner === undefined ? [] : [owner])) as { record:string }[];
-    const inWeek=(at:number)=>at >= since && at < until;
-    const checkerFails:{ pr:string; at:number; model:string }[]=[], unproven:{ pr:string; crew:string; at:number }[]=[];
-    for (const { record } of rows) {
-      const r=JSON.parse(record) as DeliveryRecord;
-      for (const c of r.checks ?? []) if (c.verdict === 'fail' && inWeek(c.at)) checkerFails.push({ pr:r.id, at:c.at, model:c.model });
-      for (const p of r.proofRefusals ?? []) if (inWeek(p.at)) unproven.push({ pr:r.id, crew:p.crewId, at:p.at });
-    }
-    return { checkerFails, unproven };
+    return save({ ...r, check:{ ...input, notes, commitSha:r.headSha, at }, updatedAt:at });
   }
   /** The owner's words that waive verification, recorded with the merge of this head. */
   function waive(id:string, actor:string, words:string, headSha:string) {
@@ -448,7 +424,7 @@ export function createDeliveries(db: Database) {
     const rows=db.prepare("SELECT record FROM deliveries WHERE owner=? AND json_extract(record,'$.forgeState')='merged' AND json_extract(record,'$.updatedAt')>=? ORDER BY json_extract(record,'$.updatedAt') DESC,id LIMIT ?").all(owner,since,Math.max(1,Math.min(limit,100))) as {record:string}[];
     return rows.map(row=>JSON.parse(row.record) as DeliveryRecord);
   }
-  return { get,save,list,undecided,touch,needingDecision,markDecisionAsked,mergedSince,conflict,hasOwned,needsTask,taskRecord,ownedTaskRecord,register,observe,stale,assign,ownerLost,markOwnerNeeded,ownerRestored,transferOwner,accountFailure,abandon,clearHold,forTasks,verify,recordCheck,recordProofRefusal,quality,waive,markQueued,notify,pendingNotifications };
+  return { get,save,list,undecided,touch,needingDecision,markDecisionAsked,mergedSince,conflict,hasOwned,needsTask,taskRecord,ownedTaskRecord,register,observe,stale,assign,ownerLost,markOwnerNeeded,ownerRestored,transferOwner,accountFailure,abandon,clearHold,forTasks,verify,recordCheck,waive,markQueued,notify,pendingNotifications };
 }
 
 const DO_NOT_MERGE = /\b(?:do not|don'?t|dont)[\s-]+merge\b|\bdo-not-merge\b/i;

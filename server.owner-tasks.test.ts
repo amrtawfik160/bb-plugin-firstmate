@@ -507,3 +507,21 @@ test("an open card is on the board, and firstmate_ask reports it as before", asy
     await host.harness.lifecycle.dispose();
   }
 });
+
+test("a second builder crew on the same owner task is recorded as redone work; a lookup then a builder, or a checker, is not", async () => {
+  const host = await captainHost();
+  try {
+    const tasks = createOwnerTasks(host.bb.storage.database());
+    tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Login fix", sourceRefs: ["tg:200:1838"], at: Date.now() - HOUR });
+    await dispatch(host, { task: "Find why login fails", taskId: "look-1", taskRef: "T1", role: "lookup", shape: "scout" });
+    await dispatch(host, { task: "Fix login", taskId: "build-1", taskRef: "T1" });
+    await dispatch(host, { task: "Check the login PR", taskId: "check-1", taskRef: "T1", role: "checker" });
+    const quiet = await host.harness.behavior.runCli(["scorecard", "--json"], capCtx);
+    assert.deepEqual(JSON.parse(quiet.stdout).redone, []);
+    await dispatch(host, { task: "Fix login again", taskId: "build-2", taskRef: "T1" });
+    const card = await host.harness.behavior.runCli(["scorecard", "--json"], capCtx);
+    assert.deepEqual(JSON.parse(card.stdout).redone.map((r: { task: string; crew: string; after: string[] }) => [r.task, r.crew, r.after]), [["T1", "build-2", ["build-1"]]]);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});

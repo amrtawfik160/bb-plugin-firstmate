@@ -17,7 +17,7 @@ Use poteto mode with the refactoring playbook, and the principles
 prove-it-works, fix-root-causes, attack-the-premise and
 test-behavior-not-implementation. Do every step yourself. Spawn no
 sub-agents. Run the full suite and the type check as
-`~/.bb-firstmate/bin/fm-heavy <command>`.
+`flock /tmp/hanoon/full-suite.lock nice -n 10 ~/.bb-firstmate/bin/fm-heavy <command>`.
 
 1. Clone native Firstmate fresh into a scratch folder outside the worktree.
    Read the target commit from your brief.
@@ -40,7 +40,10 @@ sub-agents. Run the full suite and the type check as
    (name the file you changed and why), or **Does not apply** (say why). Copy
    the shape of the 2026-10-17 file: how the pin moved, plugin code changes,
    the commit table, known gaps, verification, the live switch steps, and
-   what the live captain sees after the reload.
+   what the live captain sees after the reload. The live switch steps name
+   both releases by their full 64-character release IDs (the previous one
+   from `firstmate_runtime action=status`, the new one from `install`). A
+   native commit is a check, never the selector.
 5. Port behaviour: when a native change needs a BB change (a new script
    argument, a renamed brief rule, a new meta key), change the plugin and add
    a failing test first. Add the new pin to every audited pin list:
@@ -52,8 +55,8 @@ sub-agents. Run the full suite and the type check as
    are. The guard proves it; run it again on your final head and paste its
    result in the PR.
 7. Run the full suite and the type check:
-   `FIRSTMATE_TEST_NATIVE=<clone> FM_TEST_HOME=<clone> ~/.bb-firstmate/bin/fm-heavy npm test`
-   and `~/.bb-firstmate/bin/fm-heavy npx tsc --noEmit`.
+   `FIRSTMATE_TEST_NATIVE=<clone> FM_TEST_HOME=<clone> flock /tmp/hanoon/full-suite.lock nice -n 10 ~/.bb-firstmate/bin/fm-heavy npm test`
+   and `flock /tmp/hanoon/full-suite.lock nice -n 10 ~/.bb-firstmate/bin/fm-heavy npx tsc --noEmit`.
 8. Run a canary on an isolated BB server: its own data folder, its own server
    and host-daemon ports, and its own launch id (set `BB_DATA_DIR`,
    `BB_SERVER_PORT`, `BB_SERVER_URL`, `BB_SERVER_BIND_HOST`,
@@ -84,8 +87,9 @@ its branch.
    pass with no owner change.
 4. Run the full suite and the fidelity and drift checks (steps 3 and 7).
 5. Read the canary evidence in the PR. Say what it proves and what it does not.
-6. End your final message with the findings, one per line, then one line:
-   `VERDICT: pass`, or `VERDICT: fail (<n> findings)`.
+6. End your final message with the findings, one per line, then one last
+   line: `VERDICT: pass`, or `VERDICT: fail (<n> findings)`. Anything after
+   it, or no such line, counts as a fail.
 
 ## What the automation does
 
@@ -100,15 +104,30 @@ nothing.
 
 The steps, in order:
 
-1. A sync crew is still working: nothing.
-2. No sync PR is open. On the weekly run only: if the pin on GitHub main is
-   upstream HEAD, nothing. If a sync to this HEAD already ran and left no open
-   PR, nothing. Otherwise start one sync crew (builder model).
+1. A spawn or a message whose result is unknown (the run died) comes first.
+   Its operation id was saved before it ran. A spawned thread carries the id
+   in its title (`[op:<id>]`); a message carries it on its first line
+   (`[native-sync <id>]`). The run looks for that id among the repair
+   thread's children or in its last 100 messages, and adopts what it finds.
+   It repeats the spawn or the message only when the id is not there.
+2. A sync crew is still working: nothing.
 3. A sync PR is open and the sync crew finished: start one checker crew
-   (checker model) on the PR's branch, once per PR head.
-4. The checker finished: send the repair thread one message with the PR, the
-   checker's verdict, both crews' final messages and the owner card decision.
-   Once per PR head.
+   (checker model) on the PR's branch, once per PR head. An older checker
+   finishes first. When the checker finishes, send the repair thread one
+   message with the PR, the checker's verdict, both crews' final messages and
+   the owner card decision. Once per PR head.
+4. No sync PR is open and the pin on GitHub main is upstream HEAD: nothing.
+5. The last sync was for this upstream HEAD and left no open PR:
+   1. its PR was closed without a merge: one message to the repair thread,
+      then nothing for this HEAD;
+   2. it ended without a PR: start it again, up to 2 attempts in all; after
+      the last one, one message to the repair thread with its final message,
+      then nothing for this HEAD.
+   `tick --start --retry` starts this HEAD again after either message.
+6. Otherwise, on the weekly run only: start one sync crew (builder model).
+
+One run at a time: the run holds a kernel lock (`flock`) on
+`<state file>.lock` for its whole life. A second run exits at once.
 
 The owner gets a card only when the PR changes a file that shapes how Hanoon
 talks to the owner (`OWNER_FACING_PATHS` in `owner/native-sync.ts`: the

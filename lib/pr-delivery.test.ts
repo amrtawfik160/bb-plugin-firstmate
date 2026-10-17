@@ -342,22 +342,3 @@ test("an owner waiver covers only the head it was given for", () => {
   store.observe(r.id, seen({ headSha: next, reviewHeadSha: next }), true, 2);
   assert.equal(store.observe(r.id, seen({ headSha: next, reviewHeadSha: next, state: "merged", mergeCommitSha: MERGE_2315 }), true, 3).status, "merged-unverified");
 });
-
-test("each checker verdict and each refused proof stays on the record, for the weekly scorecard", () => {
-  const store = createDeliveries(new DatabaseSync(":memory:"));
-  const r = store.register({ url: "https://github.com/acme/repo/pull/7", taskId: "t7", projectId: "proj_1", owner: "thr_cap", home: "", worker: "thr_w", requirement: "merged" });
-  const open = (headSha: string) => store.observe(r.id, { headSha, state: "open", draft: false, checks: "passing", review: "approved", reviewHeadSha: headSha, mergeCommitSha: null, mergeable: "mergeable" }, true);
-  open("a".repeat(40));
-  store.recordCheck(r.id, "aaaaaaa", { verdict: "fail", crewId: "chk", providerId: "codex", model: "gpt-6-astra", notes: "1. the retry drops the message" });
-  store.recordProofRefusal(r.id, "t7", 4);
-  open("b".repeat(40));
-  store.recordCheck(r.id, "bbbbbbb", { verdict: "pass", crewId: "chk", providerId: "codex", model: "gpt-6-astra", notes: "fixed" });
-  const saved = store.get(r.id)!;
-  assert.equal(saved.check?.verdict, "pass");
-  assert.deepEqual(saved.checks?.map((c) => [c.verdict, c.commitSha.slice(0, 1)]), [["fail", "a"], ["pass", "b"]]);
-  assert.deepEqual(saved.proofRefusals?.map((p) => [p.crewId, p.step, p.headSha.slice(0, 1)]), [["t7", 4, "a"]]);
-  const week = store.quality(0, Date.now() + 1);
-  assert.deepEqual(week.checkerFails.map((f) => [f.pr, f.model]), [["acme/repo#7", "gpt-6-astra"]]);
-  assert.deepEqual(week.unproven.map((u) => [u.pr, u.crew]), [["acme/repo#7", "t7"]]);
-  assert.deepEqual(store.quality(Date.now() + 1, Date.now() + 2), { checkerFails: [], unproven: [] });
-});

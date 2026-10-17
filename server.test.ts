@@ -936,6 +936,9 @@ test("crew 0940c38e's final report with a pending verify step is flagged NOT VER
     assert.match(toCrew[0]!.text, /^VERIFY STEP NOT DONE/);
     assert.deepEqual((await emitIdle(host, "DONE: PR https://github.com/Cyndra-AI/cyndra-saas/pull/2315")).errors, []);
     assert.equal(sendCalls(host).filter((s) => s.text.includes("NOT VERIFIED:")).length, 1, "flagged once");
+    // The weekly scorecard counts this done claim without proof once, with no PR record needed.
+    const card = JSON.parse((await host.harness.behavior.runCli(["scorecard", "--json"], { threadId: "thr_cap", projectId: "proj_1" } as never)).stdout);
+    assert.deepEqual(card.unproven.map((u: { crew: string; run: string }) => [u.crew, u.run]), [["0940c38e", "thr_crew"]]);
   } finally {
     await host.harness.lifecycle.dispose();
   }

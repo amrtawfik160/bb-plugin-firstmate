@@ -11,7 +11,8 @@ you repeated a mistake. A new request or a change of mind is not a correction.
 2. Record it:
    `bb firstmate corrections add --ref <owner message ref> -- "<the owner's exact words>"`.
    The ref is the message's source ref, for example `tg:<chat>:<message>`. The
-   same ref is recorded once.
+   same ref is recorded once. For a ref that is already recorded, the command
+   prints its state and asks for no new crew; do not dispatch one.
 3. Dispatch the crew the command prints, with its task unchanged:
    `firstmate_dispatch role=builder playbook=none title="Correction C<n>"`. A
    fix that is only one captain.md rule may use `role=lookup`.
