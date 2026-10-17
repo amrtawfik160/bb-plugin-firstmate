@@ -7428,11 +7428,22 @@ export default async function plugin(bb: BbPluginApi) {
       for (const line of listed.output.split("\n")) {
         const [id = "", thread = ""] = line.trim().split("\t");
         if (!/^[A-Za-z0-9._-]+$/.test(id) || thread === "" || live.has(id)) continue;
-        const records = all.filter((r) => r.home === home && r.taskId === id && r.workers.includes(thread));
-        if (records.length === 0 || records.some((r) => !releasesTask(r.status)) || !records[0]!.continuation) continue;
+        // The record's thread proves which crew it is; every delivery of the task, whichever
+        // worker opened it, decides whether the task's native authority is still needed.
+        const records = all.filter((r) => r.home === home && r.taskId === id);
+        const own = records.find((r) => r.workers.includes(thread) && r.continuation);
+        if (!own || records.some((r) => !releasesTask(r.status))) continue;
         if ((await raceAbort(bb.sdk.threads.get({ threadId: thread }), signal, STUCK_HOST_CALL_MS)).archivedAt == null) continue;
+        // A ledger row can be closed-era: a PR reopened since keeps the task.
+        const reopened: string[] = [];
+        for (const r of records) {
+          const read = await runStructuredOnHost(hostId, `gh pr view ${shQuote(r.url)} --json state`, 30_000, signal);
+          const state = read.exitCode === 0 ? String(asRecord(JSON.parse(read.output || "{}"))["state"] ?? "") : "";
+          if (state !== "MERGED" && state !== "CLOSED") reopened.push(`${r.id} ${state || `unreadable (exit ${read.exitCode})`}`);
+        }
+        if (reopened.length) { bb.log.warn(`kept the native record of forgotten crew ${id}: GitHub does not show every PR of it finished (${reopened.join(", ")})`); continue; }
         try {
-          const crew: Crew = { ...crewSchema.parse(records[0]!.continuation), nativeHome: home, parentThreadId: records[0]!.owner };
+          const crew: Crew = { ...crewSchema.parse(own.continuation), nativeHome: home, parentThreadId: own.owner };
           await dropFmMeta(crew);
           await realBacklogTransitionForCrew(crew, "rm", true);
           const leftover = await retireNativeTaskState(crew);
