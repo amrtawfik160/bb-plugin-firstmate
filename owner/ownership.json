@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "native": {
+    "paths": [
+      "native-snapshot/",
+      "runtime-assets/",
+      "third-party/",
+      "lib/upstream-surface.ts",
+      "overlay/patch-base.txt"
+    ],
+    "verbatimSkills": "every skills/ or entry-skills/ markdown file whose BB-SOURCE header says fidelity: verbatim",
+    "regionsInMixedFiles": [
+      "the BB-SOURCE header comment",
+      "the native: and native-quote: fields of each BB-DIVERGE comment"
+    ]
+  },
+  "mixed": "every skills/ or entry-skills/ markdown file whose BB-SOURCE header says fidelity: adapted; every byte outside the native regions is owner-owned",
+  "owner": "every other file in the repo, including owner/, entry-skills/skill-routing/, entry-skills/captain/references/ and the plugin code",
+  "host": [
+    "~/.bb-server/AGENTS.md",
+    "~/.claude/CLAUDE.md",
+    "$FM_HOME/data/captain.md"
+  ],
+  "skip": [".git/", "node_modules/"]
+}
