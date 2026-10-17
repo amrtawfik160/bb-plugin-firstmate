@@ -1331,7 +1331,9 @@ fm_backend_bb_wait_transition() {  # <session> <timeout_secs> <state_dir> <windo
   # Whole seconds for the race, leaving half a second for the closing scan.
   left=$(( (FM_BACKEND_BB_DEADLINE_MS - $(date +%s%3N) - 500) / 1000 ))
   [ "$left" -ge 1 ] || return 1
-  fm_backend_bb_race_idle "$left" "${FM_BACKEND_BB_TO_WAIT[@]}"
+  # Each waiter is a bb CLI process; eight bound the load, and the rest of a
+  # large busy fleet is read again by the next pass.
+  fm_backend_bb_race_idle "$left" "${FM_BACKEND_BB_TO_WAIT[@]:0:8}"
   race_rc=$?
   [ "$race_rc" -eq 2 ] && return 2
   [ "$(date +%s%3N)" -lt "$FM_BACKEND_BB_DEADLINE_MS" ] || return 1

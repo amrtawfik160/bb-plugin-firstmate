@@ -110,6 +110,7 @@ test('60 threads with turns in flight still end the wait inside its budget, and 
   const quiet=l.wait(3);
   assert.equal(quiet.rc,1,quiet.err);
   assert.ok(quiet.seconds<3+2,`wait took ${quiet.seconds}s for a 3s budget with 60 active threads (calls: ${quiet.calls.length})`);
+  assert.ok(quiet.calls.filter(c=>c[1]==='wait').length<=8,'at most eight bb thread wait processes race at once');
   writeFileSync(join(l.dir,'interactions','thr_w052.json'),JSON.stringify([{id:'int_9',status:'pending'}]));
   const blocked=l.wait(3);
   assert.equal(blocked.rc,0,blocked.err);assert.equal(blocked.out.split('\t')[0],'thr_w052');assert.equal(blocked.out.split('\t')[3],'blocked');

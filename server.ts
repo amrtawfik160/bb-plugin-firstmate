@@ -628,6 +628,7 @@ const FOLLOW_UP_CONCURRENCY = 4;
 const FOLLOW_UP_DUE_LIMIT = 100;
 const RETAINED_SWEEP_MS = 10 * 60_000;
 const GRAPHQL_RESERVE = 1000;
+const FOLLOW_UP_READS_PER_HOUR = 500;
 /** `gh api -i … --jq`: the status line and headers, a blank line, then one JSON row per line. A plain answer has rows only. */
 function parseListAnswer(output: string): { status: number; etag?: string; next: boolean; rows: Record<string, unknown>[] } {
   let status = 200, etag: string | undefined, next = false, body = output;
@@ -7022,7 +7023,17 @@ export default async function plugin(bb: BbPluginApi) {
       } catch(inventoryError) { if (signal?.aborted) throw inventoryError; return "unknown"; }
     }
   }
-  async function reconcileDelivery(record:DeliveryRecord,signal?:AbortSignal) {
+  // A read already in flight for this PR serves an overlapping request; fresh=true asks
+  // for a read of its own, for a verdict whose head the shared read did not cover.
+  const deliveryReads=new Map<string,Promise<DeliveryRecord>>();
+  async function reconcileDelivery(record:DeliveryRecord,signal?:AbortSignal,fresh=false):Promise<DeliveryRecord> {
+    const running=deliveryReads.get(record.id);
+    if (running && !fresh) return running;
+    const read=readDelivery(record,signal);
+    deliveryReads.set(record.id,read);
+    try { return await read; } finally { if (deliveryReads.get(record.id)===read) deliveryReads.delete(record.id); }
+  }
+  async function readDelivery(record:DeliveryRecord,signal?:AbortSignal):Promise<DeliveryRecord> {
     return serializeLedger(`delivery:${record.id}`,async()=>{
     record=deliveries.get(record.id) ?? record;
     if (["complete","explicitly-abandoned"].includes(record.status)) return record;
@@ -7375,7 +7386,7 @@ export default async function plugin(bb: BbPluginApi) {
         for (const r of page) {
           if (r.nextCheckAt <= now || r.forgeState !== "open" || !r.id.startsWith(`${repo.repo}#`)) continue;
           const head = heads.get(r.id);
-          if (!repo.allOpen.has(r.id) || (head && r.headSha && head !== r.headSha)) deliveries.save({ ...r, nextCheckAt: now });
+          if (!repo.allOpen.has(r.id) || (head && r.headSha && head !== r.headSha)) deliveries.save({ ...r, nextCheckAt: 0 });
         }
         if (page.length < 100) break;
       }
@@ -7494,6 +7505,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
   }
+  const backgroundReads: number[] = [];
   let quotaWarnedUntil = 0;
   async function graphqlQuotaLeft(signal?: AbortSignal): Promise<boolean> {
     const first = deliveries.list({ due: Date.now(), limit: 1 })[0];
@@ -7536,7 +7548,13 @@ export default async function plugin(bb: BbPluginApi) {
     // reads at a time; ten a cycle left 48 of 71 waiting and their heads minutes old.
     // GraphQL points are shared with every crew on the host; keep a reserve for them and
     // for verdict-time refreshes. Reading the limit itself costs nothing.
-    const due=await graphqlQuotaLeft(signal) ? deliveries.list({ due:Date.now(),limit:FOLLOW_UP_DUE_LIMIT }) : [];
+    // The loop also keeps to its own hourly allowance, so a burst of due PRs cannot spend
+    // what merges, checks and other GitHub users on the host need.
+    const now=Date.now();
+    while (backgroundReads.length && backgroundReads[0]! <= now-3_600_000) backgroundReads.shift();
+    const allowance=Math.max(0,FOLLOW_UP_READS_PER_HOUR-backgroundReads.length);
+    const due=allowance>0 && await graphqlQuotaLeft(signal) ? deliveries.list({ due:now,limit:Math.min(FOLLOW_UP_DUE_LIMIT,allowance) }) : [];
+    for (let i=0;i<due.length;i++) backgroundReads.push(now);
     let next=0;
     await Promise.all(Array.from({ length:Math.min(FOLLOW_UP_CONCURRENCY,due.length) },async()=>{
       for (let record=due[next++]; record!==undefined; record=due[next++]) {
@@ -7648,8 +7666,14 @@ export default async function plugin(bb: BbPluginApi) {
     }
     // A verdict on an open PR covers its head on GitHub, not the head the follow-up
     // loop last saw: a push since then must neither refuse it nor let an old head pass.
-    const live=(input.action === "check" || input.action === "verify") && r.forgeState === "open"
-      ? await reconcileDelivery(r,asRecord(ctx)["signal"] as AbortSignal | undefined).then(()=>deliveries.get(r.id) ?? r) : r;
+    // A read already under way is shared when it shows the head the caller names.
+    const verdictSignal=asRecord(ctx)["signal"] as AbortSignal | undefined;
+    const covers=(x:DeliveryRecord)=>!!input.commitSha && !!x.headSha && x.headSha.toLowerCase().startsWith(input.commitSha.trim().toLowerCase());
+    let live=r;
+    if ((input.action === "check" || input.action === "verify") && r.forgeState === "open") {
+      live=await reconcileDelivery(r,verdictSignal).then(()=>deliveries.get(r.id) ?? r);
+      if (!covers(live)) live=await reconcileDelivery(live,verdictSignal,true).then(()=>deliveries.get(r.id) ?? r);
+    }
     if (input.action === "check") return [await recordCheckerVerdict(live,owner,input.commitSha ?? "",input.verdict,input.notes ?? "",input.findings)];
     if (input.action === "verify") {
       await requirePipelineProof(live);
