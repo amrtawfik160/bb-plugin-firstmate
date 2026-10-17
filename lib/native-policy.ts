@@ -1,6 +1,6 @@
 /** Read policy from the exact selected runtime. SDK 0.4.104 only accepts static
  * skill ids; supplying global copied skills would mix two native revisions. */
-export const AUDITED_POLICY_COMMITS=['2d833ff147cd26a5c461e914e06854e0eb2707ce','1f3e769616fdf9f31f85f4c3e6a9f71606634238'] as const;
+export const AUDITED_POLICY_COMMITS=['2d833ff147cd26a5c461e914e06854e0eb2707ce','1f3e769616fdf9f31f85f4c3e6a9f71606634238','15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4'] as const;
 export function nativeSkillPath(name:string,reference?:string,source?:string) {
   if (!/^[a-z0-9][a-z0-9-]{0,100}$/.test(name)) throw new Error('Use an exact native skill name');
   function normalize(path:string) {

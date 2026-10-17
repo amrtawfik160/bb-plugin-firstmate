@@ -44,7 +44,7 @@ for(const pin of pins) test(`exact native ${pin.slice(0,8)} secondmate seed/spaw
 test('unknown source SHA and mismatched old/new patch inputs refuse without replacing the working mirror',()=>{
  const home=fixture(pins[0]),bundle=mkdtempSync(join(tmpdir(),'fm-compat-mismatch-'));try {
   ok(install(home));const before=treeDigest(join(home,'bin-bb'));cpSync(overlay,bundle,{recursive:true});
-  const changed=structuredClone(registry);changed.sets[pins[0]]=changed.sets[pins[1]];writeFileSync(join(bundle,'patch-sets.json'),JSON.stringify(changed));
+  const changed=structuredClone(registry);changed.sets[pins[0]]=changed.sets[pins.at(-1)];writeFileSync(join(bundle,'patch-sets.json'),JSON.stringify(changed));
   const mismatch=install(home,bundle);assert.notEqual(mismatch.status,0);assert.match(mismatch.stderr,/did not apply/);assert.equal(treeDigest(join(home,'bin-bb')),before);
   ok(run('git',['-C',home,'-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','--allow-empty','-m','unknown source fixture']));
   const unknown=install(home);assert.notEqual(unknown.status,0);assert.match(unknown.stderr,/unsupported native source SHA/);assert.equal(treeDigest(join(home,'bin-bb')),before);

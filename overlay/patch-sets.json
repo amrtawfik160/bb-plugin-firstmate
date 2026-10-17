@@ -1,17 +1,23 @@
 {
   "bundledSnapshots": {
-    "4cdbef4dbf44a721e55cf0ad01524ee27b377e05": {
-      "sourceManifestSha256": "098f5aae7887df23ae1e696634a937b83fd08c02d32a3b34b06f65cef639b58f",
-      "upstreamCommit": "1f3e769616fdf9f31f85f4c3e6a9f71606634238"
+    "6555ce6848a81d930f17dd752c18424b09684dac": {
+      "sourceManifestSha256": "71262f7f4d5320012ca99d43d1e9009339c1b56939c2b70186f7da3980ee22e0",
+      "upstreamCommit": "15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4"
     }
   },
   "schema": 1,
   "sets": {
-    "1f3e769616fdf9f31f85f4c3e6a9f71606634238": [
+    "15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4": [
       "firstmate-bb-backend.patch",
       "firstmate-bb-teardown.patch",
       "firstmate-bb-local-merge.patch",
       "firstmate-bb-browser.patch"
+    ],
+    "1f3e769616fdf9f31f85f4c3e6a9f71606634238": [
+      "compat/1f3e769616fdf9f31f85f4c3e6a9f71606634238/firstmate-bb-backend.patch",
+      "compat/1f3e769616fdf9f31f85f4c3e6a9f71606634238/firstmate-bb-teardown.patch",
+      "compat/1f3e769616fdf9f31f85f4c3e6a9f71606634238/firstmate-bb-local-merge.patch",
+      "compat/1f3e769616fdf9f31f85f4c3e6a9f71606634238/firstmate-bb-browser.patch"
     ],
     "2d833ff147cd26a5c461e914e06854e0eb2707ce": [
       "compat/2d833ff147cd26a5c461e914e06854e0eb2707ce/firstmate-bb-backend.patch",

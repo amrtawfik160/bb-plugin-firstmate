@@ -131,10 +131,10 @@ for(const pin of pins)test(`native relative references ${pin.slice(0,8)} resolve
 });
 
 test('trigger catalog stays complete and isolated to each selected captain runtime; corruption refuses completion',async()=>{
- const one=fixture(pins[0]),two=fixture(pins[1]),f=await hostFor(one);try{
+ const one=fixture(pins[0]),two=fixture(pins.at(-1)),f=await hostFor(one);try{
   await f.host.bb.storage.kv.set('native-home:thr_second',two);await f.host.bb.storage.kv.set('native-home-host:thr_second','host_1');
   const expected=home=>ok(run('git',['-C',home,'ls-tree','-r','--name-only','HEAD','--','.agents/skills'])).trim().split('\n').filter(p=>p.endsWith('/SKILL.md'));
-  for(const [captain,home,pin] of [['thr_cap',one,pins[0]],['thr_second',two,pins[1]]]){
+  for(const [captain,home,pin] of [['thr_cap',one,pins[0]],['thr_second',two,pins.at(-1)]]){
     const result=await f.host.harness.behavior.runCli(['contract'],{...ctx,threadId:captain});assert.equal(result.exitCode,0,result.stderr);
     assert.match(result.stdout,new RegExp('trigger catalog @ '+pin),'catalog must match selected home revision');
     assert.ok(result.stdout.includes(home));assert.ok(!result.stdout.includes(home===one?two:one),'foreign selected home must never provide catalog');

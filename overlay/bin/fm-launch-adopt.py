@@ -15,7 +15,7 @@ import stat
 import subprocess
 import sys
 
-PINS = ('2d833ff147cd26a5c461e914e06854e0eb2707ce', '1f3e769616fdf9f31f85f4c3e6a9f71606634238')
+PINS = ('2d833ff147cd26a5c461e914e06854e0eb2707ce', '1f3e769616fdf9f31f85f4c3e6a9f71606634238', '15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4')
 ISOLATION_SHA = 'fe0f7d8b5bdce903a7ffee99e7f73c19c09d184937896da1c5fca0494f76a625'
 
 
