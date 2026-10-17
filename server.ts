@@ -1982,7 +1982,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
   await reliabilityFlags();
   const coalesceUntil = new Map<string, number>();
-  // Owner message refs of the input that last reached each captain; a crew ping or wake clears them.
+  // Owner message refs of every owner input that reached each captain since its last crew ping or wake, which clears them.
   const ownerTurnRefs = new Map<string, string[]>();
   async function sanitizeDiagnosticSettings() {
     try {
@@ -12069,14 +12069,16 @@ export default async function plugin(bb: BbPluginApi) {
         const named = [...`${title ?? ""}\n${task}`.matchAll(/\bT\d+\b/g)].map((match) => ownerTasks.get(match[0])).find((item) => item?.captain === parentThreadId && isOpenTask(item));
         const held = taskRef !== undefined ? ownerTasks.get(taskRef) : named ?? await prTask(parentThreadId, resolvedProject, title, task);
         if (held !== undefined) {
-          const joined = ownerTasks.attach(held.id, parentThreadId, { crewId, sourceRefs: origin === undefined ? [...passedRefs, ...turnRefs] : [], at: Date.now() });
+          // Only this dispatch's own owner message joins the task: the turn may hold messages about other work.
+          const joinRefs = origin !== undefined ? [] : passedRefs.length > 0 ? passedRefs : turnRefs.length === 1 ? turnRefs : [];
+          const joined = ownerTasks.attach(held.id, parentThreadId, { crewId, sourceRefs: joinRefs, project: { id: resolvedProject, label: await projectLabel(resolvedProject) }, at: Date.now() });
           quality.noteTaskCrew({ captain: parentThreadId, task: joined.id, title: joined.title, crew: crewId, role: role ?? "builder", shape: shape ?? "ship", at: Date.now() });
           await refreshOwnerBoard();
           return ` Owner task ${joined.id} (${joined.state}) tracks it; no new task was opened.`;
         }
         if (origin !== undefined || passedRefs.length === 0) return "";
         const opened = ownerTasks.open({
-          captain: parentThreadId, project: await projectLabel(resolvedProject), title: title ?? task.split("\n")[0]!.slice(0, 120),
+          captain: parentThreadId, project: await projectLabel(resolvedProject), projectId: resolvedProject, title: title ?? task.split("\n")[0]!.slice(0, 120),
           sourceRefs: passedRefs, crewId, at: Date.now(),
         });
         quality.noteTaskCrew({ captain: parentThreadId, task: opened.id, title: opened.title, crew: crewId, role: role ?? "builder", shape: shape ?? "ship", at: Date.now() });
@@ -12290,22 +12292,27 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_reply",
-    description: "Reply to one owner message as a Telegram reply to it (ref=oldest, tg:<chat>:<msg>, or bb:<thread>:<row>; any open message, in any order). quote=exact words from that message, such as one of several questions; each different quote is its own reply. more=true keeps the message open because more replies to it will follow. A text that asks the owner to decide (options A/B with a question, or a count of waiting decisions) is refused: send each decision with firstmate_ask. A text that restates the question of a card sent in the last 30 minutes is refused too. The answer carries its owner task (task, or the task this message started): in Telegram it replies to the task's status line, and sent once the task is closed it is the task's result, which marks the owner's messages done. A text that only says the work started, or a note about the owner, is not sent and the message stays open. covers=refs of other open messages this reply also answers, such as forwarded messages or a burst on one request: they close with no Telegram message of their own.",
+    description: "Reply to one owner message as a Telegram reply to it (ref=oldest, tg:<chat>:<msg>, or bb:<thread>:<row>; any open message, in any order). quote=exact words from that message, such as one of several questions; each different quote is its own reply. more=true keeps the message open because more replies to it will follow. A text that asks the owner to decide (options A/B with a question, or a count of waiting decisions) is refused: send each decision with firstmate_ask. A text that restates the question of a card sent in the last 30 minutes is refused too. The answer carries its owner task (task, or the task this message started): in Telegram it replies to the task's status line, in the task's project topic. result=true makes it the task's result, which marks the owner's messages done; a task has one result. Each owner message gets one Telegram answer message: a later reply to it is added by an edit, one part an edit cannot hold is its continuation, and more is refused. Turn text outside this tool, firstmate_ask and firstmate_alert never reaches the owner. A text that only says the work started, or a note about the owner, is not sent and the message stays open. covers=refs of other open messages this reply also answers, such as forwarded messages or a burst on one request: they close with no Telegram message of their own.",
     parameters: z.object({
-      ref: z.string().min(1),
+      ref: z.string().min(1).optional().describe("The owner message: oldest, tg:<chat>:<msg> or bb:<thread>:<row>. Unset with task: the first owner message of that task"),
       text: z.string().min(1).max(4000),
       quote: z.string().min(1).max(1024).optional(),
       more: z.boolean().optional(),
       files: z.array(z.string().startsWith("/")).max(10).optional().describe("Absolute paths of files to attach, such as a crew's report.md. Telegram sends any file from the captain's workspace or /tmp, only documents and images from a BB worktree, and never hidden files or secrets"),
       covers: z.array(z.string().min(1)).max(50).optional().describe("Refs of other open owner messages this reply also answers; each closes with no Telegram message"),
       project: z.string().min(1).max(80).optional().describe("The project this answer is about, as on the board (such as Safi). With Telegram topics on, the answer goes to that project's topic"),
-      task: z.string().regex(/^T\d+$/).optional().describe("The owner task this answer is about (T<n>), such as the task an owner message steers (telegram_task). Unset: the task this owner message started. In Telegram the answer replies to the task's status line; sent after the task is done or dropped, it is the task's result"),
+      task: z.string().regex(/^T\d+$/).optional().describe("The owner task this answer is about (T<n>), such as the task an owner message steers (telegram_task). Unset: the task this owner message started. In Telegram the answer replies to the task's status line and goes to its project's topic"),
+      result: z.boolean().optional().describe("true: this is the task's result, what was done with any files. It rings, marks the owner's messages done, and is the only result of the task: a second one is refused"),
     }),
-    async execute({ ref, text: words, quote, more, files, covers, project, task: taskId }, ctx) {
+    async execute({ ref: givenRef, text: words, quote, more, files, covers, project, task: taskId, result: resultFlag }, ctx) {
       const flags = await reliabilityFlags();
       if (flags.inboundLedger === "off") return toolError("Inbound ledger is off.");
       const captain = ctxString(ctx, "threadId");
       if (!captain) return toolError("firstmate_reply runs only in a captain thread.");
+      // With a task and no ref, the answer goes to the task's first owner message, such as a result that comes later.
+      const taskRefs = taskId === undefined ? [] : (ownerTasks.get(taskId)?.captain === captain ? ownerTasks.get(taskId)!.sourceRefs : []);
+      const ref = givenRef ?? taskRefs[0];
+      if (ref === undefined) return toolError(taskId === undefined ? "Pass ref (the owner message), or task to answer the task's owner message." : `No owner message for task ${taskId}. Pass ref.`);
       const key = ref === "oldest" ? null : parseSourceRef(ref);
       if (ref !== "oldest" && key === null) return toolError("ref must be oldest, tg:<chat>:<msg>, or bb:<thread>:<row>.");
       const open = inboundLedger.listOpen(captain);
@@ -12317,7 +12324,8 @@ export default async function plugin(bb: BbPluginApi) {
       const named = taskId === undefined ? taskOfRef(ownerTasks.list(captain, { includeClosed: true }), used) : ownerTasks.get(taskId);
       if (taskId !== undefined && named?.captain !== captain) return toolError(`No owner task ${taskId} for this captain. Check firstmate_task list.`);
       // A final answer once its task is closed is the task's result: it rings and marks the owner's messages done.
-      const result = named !== undefined && !isOpenTask(named) && more !== true;
+      // Only the captain's result=true makes the task's result: a later answer about a closed task is an answer.
+      const result = named !== undefined && more !== true && resultFlag === true;
       // The connector's kind only: Firstmate's own repeat check reads the text, never the kind.
       const replyKind = more === true ? "progress" : result ? "final" : "reply";
       const attach = files ?? [];
@@ -12398,6 +12406,7 @@ export default async function plugin(bb: BbPluginApi) {
       let undelivered: string | null = null;
       let cardRepeat = false;
       let dropped: "started" | "about-owner" | undefined;
+      let refusedBy: "answer" | "result" | undefined;
       try {
         if (row.source === "telegram") {
           const sent = await sendTelegramReply({
@@ -12411,6 +12420,7 @@ export default async function plugin(bb: BbPluginApi) {
           channel = sent.channel;
           cardRepeat = sent.cardRepeat === true;
           dropped = sent.dropped;
+          refusedBy = sent.refused;
           await noteTelegramThreading(sent.mode).catch((error) => bb.log.warn(`telegram threading state: ${String(error)}`));
           if (sent.outcome !== "delivered") {
             undelivered = flags.telegramThreading === "on"
@@ -12443,9 +12453,15 @@ export default async function plugin(bb: BbPluginApi) {
           : "it is a note about the owner, not a message to him";
         return toolError(`Not sent to Telegram: ${why}. ${stayOpen} ${covered.length === 0 ? "stays" : "stay"} open. Send text only with a result, a question (firstmate_ask), a warning, or a plan the owner asked to see.`);
       }
+      if (refusedBy !== undefined) {
+        inboundLedger.releaseOutbox(row, claimKind);
+        return toolError(refusedBy === "result"
+          ? `Not sent to Telegram: task ${named?.id ?? ""} already has its result. One result per task; the connector recorded the refusal. Nothing reached the owner; ${stayOpen} ${covered.length === 0 ? "stays" : "stay"} open. If this answers ${used}, send it again without result=true.`
+          : `Not sent to Telegram: ${used} already has its answer message and its one continuation. The connector recorded the refusal. Nothing reached the owner; ${stayOpen} ${covered.length === 0 ? "stays" : "stay"} open. Put what is left in the task's result.`);
+      }
       if (undelivered !== null) {
         inboundLedger.releaseOutbox(row, claimKind);
-        return toolError(`Reply to ${used} was not delivered: ${undelivered}. Nothing reached the owner; ${stayOpen} ${covered.length === 0 ? "stays" : "stay"} open. Answer in your turn text instead.`);
+        return toolError(`Reply to ${used} was not delivered: ${undelivered}. Nothing reached the owner; ${stayOpen} ${covered.length === 0 ? "stays" : "stay"} open. Turn text never reaches the owner, so tell the repair thread the connector cannot take replies.`);
       }
       try {
         inboundLedger.markDelivered(row, claimKind);
@@ -12469,6 +12485,38 @@ export default async function plugin(bb: BbPluginApi) {
       const taskNote = ownerTasks.openByRef(captain, used).map((task) => `\nTask ${task.id} stays open (${task.state}): a reply does not close it. Close it with firstmate_task when it is done or dropped.`).join("");
       const stillOpen = inboundLedger.listPending(captain);
       return (stillOpen.length === 0 ? `${sentLine} No owner message is waiting.` : `${sentLine}\n${formatOwnerInbox(stillOpen, Date.now())}`) + taskNote;
+    },
+  });
+
+  registerCaptainTool({
+    name: "firstmate_alert",
+    description: "Tell the owner one alarm or warning that answers no owner message: something broke, is at risk, or needs him soon (\"Safi is down for all users\"). level alarm rings at once, day and night; warning is sent at once. task (T<n>): the owner task it is about; it goes to that task's project topic. Without a task, project names the topic. Text you write in your turn outside a tool never reaches the owner: answer an owner message with firstmate_reply, send its result with firstmate_reply result=true, ask a decision with firstmate_ask, and use this tool for an alarm or a warning. Routine progress is not sent at all; it stays in the task's timeline.",
+    parameters: z.object({
+      level: z.enum(["alarm", "warning"]),
+      text: z.string().min(1).max(4000).describe("What happened, what it breaks, and what the owner should do, in plain words"),
+      task: z.string().regex(/^T\d+$/).optional().describe("The owner task this is about (T<n>)"),
+      project: z.string().min(1).max(80).optional().describe("Without a task: the project, as in the Telegram projects setting (such as Safi)"),
+    }),
+    async execute({ level, text: words, task: taskId, project }, ctx) {
+      const captain = ctxString(ctx, "threadId");
+      if (!captain) return toolError("firstmate_alert runs only in a captain thread.");
+      if (taskId !== undefined && ownerTasks.get(taskId)?.captain !== captain) return toolError(`No owner task ${taskId} for this captain. Check firstmate_task list.`);
+      if ((await reliabilityFlags()).telegramThreading !== "on") return toolError("Not sent: Firstmate's telegramThreading flag is off, so this tool has no way to send to Telegram.");
+      // The same alarm again is one alarm: its id is its content.
+      const alertId = hashText(`${captain}\n${level}\n${taskId ?? ""}\n${words.trim()}`).slice(0, 32);
+      try {
+        const sent = await bb.sdk.plugins.callRpc({
+          pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "alert",
+          input: { alertId, level, text: words.trim(), ...(taskId ? { task: taskId } : {}), ...(project?.trim() ? { project: project.trim() } : {}) },
+          outputSchema: z.object({ queued: z.number(), duplicate: z.boolean() }),
+        });
+        if (sent.duplicate) return `Already sent this ${level} to the owner.`;
+        if (sent.queued <= 0) return toolError(`Not sent: the Telegram connector did not queue the ${level}.`);
+        return `Sent the ${level} to the owner${taskId ? ` in task ${taskId}'s topic` : ""}.`;
+      } catch (error) {
+        if (isTelegramRpcMissing(error)) return toolError("Not sent: the Telegram connector has no alert method yet. Tell the repair thread.");
+        return toolError(`Not sent: ${error instanceof Error ? error.message : String(error)}`);
+      }
     },
   });
 
@@ -12497,7 +12545,8 @@ export default async function plugin(bb: BbPluginApi) {
           const keys = (refs ?? []).map((ref) => parseSourceRef(ref));
           if (!title || keys.length === 0 || keys.some((key) => key === null)) return toolError("open needs a title and refs: [\"tg:<chat>:<msg>\"].");
           const sourceRefs = keys.map((key) => `${key!.source === "telegram" ? "tg" : "bb"}:${key!.chatId}:${key!.messageId}`);
-          const opened = ownerTasks.open({ captain, project: await projectLabel(ctxString(ctx, "projectId")), title, sourceRefs, at: now });
+          // A task opened by hand has no project until its first crew: never the captain thread's project.
+          const opened = ownerTasks.open({ captain, project: null, projectId: null, title, sourceRefs, at: now });
           await refreshOwnerBoard();
           return `Task ${opened.id} is open (${opened.state}).`;
         }
@@ -13394,7 +13443,9 @@ export default async function plugin(bb: BbPluginApi) {
       if (command === "tasks") {
         const now = Date.now();
         reconcileTasks(threadId, now);
-        return { text: "", tasks: telegramTasks(ownerTasks.list(threadId, { includeClosed: true }), snapshot.rpc.running.map((crew) => crew.id), since ?? now) };
+        // A crew still starting (a held launch, a background dispatch) counts, so no line says 0 crews while one starts.
+        const starting = [...launches.heldTaskIds(threadId).map((key) => (JSON.parse(key) as [string, string])[1]), ...dispatchJobs.pending(threadId).map((job) => job.crewId)];
+        return { text: "", tasks: telegramTasks(ownerTasks.list(threadId, { includeClosed: true }), [...snapshot.rpc.running.map((crew) => crew.id), ...starting], since ?? now) };
       }
       if (command === "board" || command === "digest") {
         const now = Date.now();
@@ -14136,7 +14187,9 @@ export default async function plugin(bb: BbPluginApi) {
           senderIsCrew,
         });
         if (decision === "proceed") {
-          if (turnRefs.length > 0) ownerTurnRefs.set(threadId, turnRefs);
+          // Every owner message that joins the turn keeps its ref: a later one never replaces an earlier one,
+          // so each dispatch finds its own owner message (17 Oct: 5439 replaced 5438, and two crews went untracked).
+          if (turnRefs.length > 0) ownerTurnRefs.set(threadId, [...new Set([...(ownerTurnRefs.get(threadId) ?? []), ...turnRefs])]);
           else ownerTurnRefs.delete(threadId);
           return { action: "proceed" };
         }
