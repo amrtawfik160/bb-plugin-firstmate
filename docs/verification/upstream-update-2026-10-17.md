@@ -238,6 +238,25 @@ watcher handoff was queued by the new watcher and delivered to the captain.
 It is one timing sample, not proof for every timing. The first handoff had
 one 3-second sample with no live watcher (02:05:01); the second had none.
 
+What the canaries show about the watcher, and what they do not:
+- Run 2: the old watcher stopped at 01:44:28 (`watcher: stopped
+  pid=3040417`); the new one was running by about 01:44:30, estimated from
+  its process start time. The crew wrote nothing in that gap, so run 2 does
+  not test a wake written during it. Its later completion was delivered.
+- Run 3: the first handoff showed one 3-second sample without a live
+  watcher; the second showed none. One waking line written inside the second
+  handoff was queued and delivered. That is one timing sample.
+- Not tested: a longer gap, or several events inside a gap. Native watchers
+  are one-shot processes with durable wake state and a separate re-arm owner,
+  so a short, visible, automatically recovered gap is the expected shape, not
+  a guaranteed bound.
+
+Follow-up defect: in run 2 the old release's `fm-watch-arm.sh` printed
+`trap: line 2: unexpected EOF while looking for matching ')'` while being
+replaced. The stop still succeeded and the new watcher reached a fresh
+heartbeat. The root cause is not found. Evidence: `/tmp/hanoon/canary/server2.log`
+and `/tmp/hanoon/canary-evidence/midturn-notes.md` on the build host.
+
 Observations, not changed here:
 - The captain once asked for a Claude model on the project's default Codex
   provider; that crew failed at its first turn. The captain retried with the
@@ -247,39 +266,57 @@ Observations, not changed here:
 
 ## Switching the live captain (after merge and reload)
 
-Run these as the live captain, in its own thread:
+Run these as the live captain, in its own thread. `<home>` is the captain's
+home from `firstmate_deck`.
 
-1. `firstmate_runtime action=install`. Record the full 64-character
-   `release` it returns. That exact ID is `<release>` below. For head
-   `91b3526` and later docs-only heads it is
-   `e99f6c5ea536272030289bf8cd1896fbacc1e94d72c0a7baa66f06d02e8acc00`; if
+1. `firstmate_runtime action=status`. Record the full 64-character selected
+   release as `<previous>` (for the live captain today:
+   `c9f623c8c1b7b2fb7e9df472f25bb5d081b5c2a4128d2525897b087be8b2bbd8`).
+2. `firstmate_runtime action=install`. Record the full 64-character
+   `release` it returns as `<release>`. At head `91b3526` and the docs-only
+   heads after it, this is
+   `e99f6c5ea536272030289bf8cd1896fbacc1e94d72c0a7baa66f06d02e8acc00`. If
    install returns another ID, use the returned one.
-2. `firstmate_runtime action=status`. Confirm `<release>` is listed with
-   upstream `15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4`. Do not pick a release
-   by its upstream commit: several releases can share one.
-3. `firstmate_runtime action=select release=<release> check=true`.
-4. If it refuses with "native operation in flight" or "BB launches are
+3. `firstmate_runtime action=status`. Confirm `<release>` is listed with
+   upstream `15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4`. The native commit is a
+   check, not the selector: several releases can share one.
+4. `firstmate_runtime action=select release=<release> check=true`.
+5. If it refuses with "native operation in flight" or "BB launches are
    running/reserved/uncertain": wait for that spawn or launch to finish, then
-   repeat step 3. If the named lock stays and its process is not a spawn or
+   repeat step 4. If the named lock stays and its process is not a spawn or
    control step (a reused process ID), inspect the lock and the process
    before any reconciliation. Do not delete a lock because it is old.
-5. `firstmate_runtime action=select release=<release>`. It checks
-   again; if it refuses, go back to step 4.
-6. `firstmate_contract`, read again in full. It must name 15ad1bd6.
-7. Check `firstmate_runtime action=status`: the selected release is exactly
-   `<release>` (all 64 characters), and old crews appear under
-   `referencedReleases`.
-   The watcher is replaced within seconds: the canaries measured about 2 s
-   (run 2) and at most one 3-second sample without a live watcher (run 3).
-   One "watcher down" notice may appear (seen in run 2, not in run 3).
-8. Check that `state/.watch.lock/watcher-path` and
-   `state/.bb-watch-keeper.bindir` in the home name `versions/<release>/`.
-   The plugin log shows "replacing the keeper" when it moved them.
+6. `firstmate_runtime action=select release=<release>`. It checks again; if
+   it refuses, go back to step 5.
+7. `firstmate_runtime action=status`: the selected release is exactly
+   `<release>` (all 64 characters), `previous` is `<previous>`, and old crews
+   appear under `referencedReleases`.
+8. `firstmate_contract`, read again in full. It must name 15ad1bd6.
+9. Verify supervision on live processes, not only files. Path files can
+   remain after a process exits. Within 2 minutes of step 6, all must hold:
+   - `<home>/state/.watch.lock/pid` names a live process whose command line
+     runs `versions/<release>/runtime/bin-bb/fm-watch.sh`.
+   - `<home>/state/.bb-watch-keeper.pid` names a live process, and
+     `<home>/state/.bb-watch-keeper.bindir` is
+     `versions/<release>/runtime/bin-bb`.
+   - `<home>/state/.last-watcher-beat` was modified less than 90 seconds ago.
+     In run 3 the beat age stayed at or under 50 seconds.
+   A "watcher down" notice can appear during the replacement (run 2 had one,
+   run 3 did not). It is not expected every time.
+10. If step 9 does not hold within 2 minutes: report "runtime selected,
+    supervision unverified", not "switched". Then:
+    1. Call `firstmate_watch` once, then repeat step 9.
+    2. If it still fails, read the keeper log `<home>/state/.bb-watch-arm.log`
+       and the plugin log for "fm-watch-supervisor" lines. Report what they
+       show.
+    3. If supervision cannot be restored, roll back:
+       `firstmate_runtime action=rollback release=<previous> check=true`, then
+       without `check`, then repeat step 9 with `<previous>` in place of
+       `<release>`.
 
-To undo: `firstmate_runtime action=rollback release=<the recorded previous
-release>` (`c9f623c8…` for the live captain), with `check=true` first.
-Rolling back to an external checkout keeps the strict rule: task records, the
-primary lock and the watcher refuse it.
+To undo at any time: the rollback in step 10.3. Rolling back to an external
+checkout keeps the strict rule: task records, the primary lock and the
+watcher refuse it.
 
 ## What the live captain and its crews see after merge and reload
 
