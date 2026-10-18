@@ -10,6 +10,8 @@ export interface CheckFailure {
 export interface DeliveryRecord {
   id: string; repository: string; number: number; url: string; headSha: string; mergeCommitSha:string|null;
   title?:string; openedAt?:number;
+  /** Where openedAt came from: "github" when it is GitHub's createdAt. Only that source may decide which proof rules apply. */
+  openedAtSource?:'github';
   /** Last activity GitHub recorded on the PR, and when the captain was last asked to decide on it. */
   touchedAt?:number; decisionAskedAt?:number;
   taskId: string; projectId: string; owner: string | null; home: string;
@@ -187,15 +189,16 @@ export function createDeliveries(db: Database) {
     const row=db.prepare(`SELECT record FROM deliveries WHERE owner=? ${includeComplete ? "" : "AND status NOT IN ('complete','explicitly-abandoned')"} AND (json_extract(record,'$.taskId')=? OR EXISTS(SELECT 1 FROM json_each(json_extract(record,'$.workers')) WHERE value=?)) ORDER BY due,id LIMIT 1`).get(owner,id,id) as {record:string}|undefined;
     return row ? JSON.parse(row.record) as DeliveryRecord : undefined;
   }
-  function register(input: { url: string; taskId: string; projectId: string; owner: string | null; home: string; worker: string; requirement?: DeliveryRequirement; continuation?:Record<string,unknown>; title?:string; openedAt?:number }) {
+  function register(input: { url: string; taskId: string; projectId: string; owner: string | null; home: string; worker: string; requirement?: DeliveryRequirement; continuation?:Record<string,unknown>; title?:string; openedAt?:number; openedAtSource?:'github' }) {
     const identity = canonicalPr(input.url);
     const prior = get(identity.id);
     if (prior) {
       if (prior.projectId !== input.projectId || prior.owner !== input.owner || prior.taskId !== input.taskId) throw new Error(`PR ${identity.id} already belongs to another task or manager. Explicit assignment is required.`);
       if (input.requirement && prior.requirement !== input.requirement) throw new Error("Delivery contract is already agreed; registration cannot silently replace it.");
-      return save({ ...prior, title:prior.title ?? input.title, openedAt:prior.openedAt ?? input.openedAt, continuation:input.continuation ?? prior.continuation, workers: [...new Set([...prior.workers,input.worker])].slice(-100) });
+      const source = prior.openedAt !== undefined ? prior.openedAtSource : input.openedAt !== undefined ? input.openedAtSource : undefined;
+      return save({ ...prior, title:prior.title ?? input.title, openedAt:prior.openedAt ?? input.openedAt, ...(source ? { openedAtSource:source } : {}), continuation:input.continuation ?? prior.continuation, workers: [...new Set([...prior.workers,input.worker])].slice(-100) });
     }
-    return save({ ...identity, ...(input.title ? { title:input.title } : {}), ...(input.openedAt ? { openedAt:input.openedAt } : {}), headSha:'', mergeCommitSha:null,taskId:input.taskId, projectId:input.projectId, owner:input.owner,
+    return save({ ...identity, ...(input.title ? { title:input.title } : {}), ...(input.openedAt ? { openedAt:input.openedAt, ...(input.openedAtSource ? { openedAtSource:input.openedAtSource } : {}) } : {}), headSha:'', mergeCommitSha:null,taskId:input.taskId, projectId:input.projectId, owner:input.owner,
       home:input.home, continuation:input.continuation, workers:[input.worker], requirement:input.requirement ?? 'merged', status:'waiting-checks',
       blocker:'Forge observation pending', nextAction:'Observe PR checks and review', nextCheckAt:Date.now(), observedAt:null,
       freshness:'stale', error:null, errors:0, ownerNeeded:input.owner === null, verifiedCommitSha:null, disposition:null,
@@ -212,7 +215,7 @@ export function createDeliveries(db: Database) {
     const forgeKey = JSON.stringify([o.headSha, o.state, o.draft, o.checks, o.review, o.mergeable, o.hold ?? null]);
     const quietReads = prior.forgeKey === forgeKey ? (prior.quietReads ?? 0) + 1 : 0;
     const delay = Math.min(o.checks === 'pending' ? 2 * 60_000 : 30 * 60_000, 60_000 * 2 ** Math.min(quietReads, 6));
-    let r: DeliveryRecord = { ...prior, title:o.title ?? prior.title, openedAt:o.openedAt ?? prior.openedAt, touchedAt:o.touchedAt ?? prior.touchedAt, headSha:o.headSha, mergeCommitSha:o.mergeCommitSha,verifiedCommitSha:changedHead ? null : prior.verifiedCommitSha,
+    let r: DeliveryRecord = { ...prior, title:o.title ?? prior.title, openedAt:o.openedAt ?? prior.openedAt, ...(o.openedAt !== undefined ? { openedAtSource:'github' as const } : prior.openedAtSource ? { openedAtSource:prior.openedAtSource } : {}), touchedAt:o.touchedAt ?? prior.touchedAt, headSha:o.headSha, mergeCommitSha:o.mergeCommitSha,verifiedCommitSha:changedHead ? null : prior.verifiedCommitSha,
       forgeState:o.state, observedAt:now, freshness:'fresh', error:null, errors:0, updatedAt:now, nextCheckAt:now+delay, forgeKey, quietReads };
     const currentFailures=o.failedChecks ?? (o.checks==='failing' ? [{id:'unknown-check',name:'Unidentified failing check; inspect forge',url:r.url}] : []);
     const failures=changedHead ? [] : (prior.failures ?? []);

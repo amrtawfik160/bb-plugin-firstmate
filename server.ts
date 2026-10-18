@@ -1737,6 +1737,8 @@ export default async function plugin(bb: BbPluginApi) {
   })();
   /** True when a PR opened at `openedAt` gets the strict gate. An unknown opening time gets it too. */
   const strictPr = (openedAt: number | undefined) => openedAt === undefined || !Number.isFinite(openedAt) || openedAt >= proofGateLiveAt;
+  /** A PR's opening time, only from GitHub's createdAt: read now, or stored with that source. Any other stored time does not count (checker round 6). */
+  const githubOpenedAt = (read: number | undefined, row: Pick<DeliveryRecord, "openedAt" | "openedAtSource"> | undefined) => read ?? (row?.openedAtSource === "github" ? row.openedAt : undefined);
   const ownerTasks = createOwnerTasks(bb.storage.database(), (task, to) => {
     const program = programs.holding(task.id);
     if (program === undefined) return to === "live" || to === "done" ? releaseHold(task) : null;
@@ -7117,7 +7119,7 @@ export default async function plugin(bb: BbPluginApi) {
   // A second crew (a release operator, a fix crew) may work on a PR another task owns. That is normal, so it is said once.
   const sharedPrsLogged = new Set<string>();
   // `provenBranch`: the PR head is this crew's branch, so a scout or a local-only crew that opened it is tracked too.
-  async function registerCrewPr(crew: Crew, url: string,signal?:AbortSignal,facts:{title?:string;openedAt?:number}={},provenBranch=false) {
+  async function registerCrewPr(crew: Crew, url: string,signal?:AbortSignal,facts:{title?:string;openedAt?:number;openedAtSource?:"github"}={},provenBranch=false) {
     if (isSecondmateRoute(crew) || !url || (!provenBranch && (crew.shape !== "ship" || crew.posture === "local-only"))) return;
     const identity = canonicalPr(url);
     const prior=deliveries.get(identity.id);
@@ -7544,7 +7546,7 @@ export default async function plugin(bb: BbPluginApi) {
     for (const pr of snapshot.repos.flatMap((repo) => repo.prs)) {
       signal?.throwIfAborted();
       if (deliveries.touch(pr.id, pr.touchedAt, pr.title) || !pr.candidate) continue;
-      await boundedFollowUp((s) => registerCrewPr(pr.candidate!.crew, pr.url, s, { title: pr.title, openedAt: pr.openedAt }, true), signal)
+      await boundedFollowUp((s) => registerCrewPr(pr.candidate!.crew, pr.url, s, { title: pr.title, openedAt: pr.openedAt, ...(pr.openedAt !== undefined ? { openedAtSource: "github" as const } : {}) }, true), signal)
         .then(() => { deliveries.touch(pr.id, pr.touchedAt); }, (error) => { if (signal?.aborted) throw error; bb.log.warn(`Open PR tracking ${pr.id}: ${String(error)}`); });
     }
     return snapshot;
@@ -7967,7 +7969,7 @@ export default async function plugin(bb: BbPluginApi) {
       // Owner decision Q6: a crew drives the change and records it under its own crew id. The
       // captain never verifies for itself (#2523 and dr.woo#124, 15-17 Oct).
       // A PR opened before the strict gate went live keeps the old rules: the captain or a crew records it, with no surface rule.
-      if (!strictPr(live.openedAt ?? r.openedAt)) {
+      if (!strictPr(githubOpenedAt(undefined, live) ?? githubOpenedAt(undefined, r))) {
         await requirePipelineProof(live);
         const evidence={ driven:input.driven ?? "",seen:input.seen ?? "",...(input.surface ? { surface:input.surface } : {}) };
         if (r.owner === owner) return [deliveries.verify(r.id,owner,input.commitSha ?? "",evidence)];
@@ -8319,7 +8321,7 @@ export default async function plugin(bb: BbPluginApi) {
     const project = projectForRepo(prRepoOf(t.url));
     // Owner decision Q6 applies to listed projects. A repo with no project rule keeps the merge rules from before
     // (a verification record at the head, and the checker); the preview names the missing rule.
-    const strict = production && project !== undefined && strictPr(t.openedAt ?? row?.openedAt);
+    const strict = production && project !== undefined && strictPr(githubOpenedAt(t.openedAt, row));
     const how = [
       "CI and unit tests are not verification. The crew drives the changed surface (the project's verify skill if it has one), then records what it drove and saw:",
       `${row === undefined ? `firstmate_deliveries action=register url=${t.url}, then ` : ""}firstmate_deliveries action=verify id=${id} commitSha=${short(head)}${project ? ` surface=${project.proofSurface}` : ""} driven="<what you drove>" seen="<what you saw>" (CLI: bb firstmate deliveries verify ${id} --commit ${short(head)}${project ? ` --surface ${project.proofSurface}` : ""} --driven "<what you drove>" --seen "<what you saw>").`,
@@ -8355,10 +8357,10 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /** The merge preview line that says which proof rules apply to a production PR, and why. */
-  function proofRulesLine(t: MergeTarget, rowOpenedAt: number | undefined): string {
+  function proofRulesLine(t: MergeTarget, row: DeliveryRecord | undefined): string {
     const project = projectForRepo(prRepoOf(t.url));
     if (project === undefined) return `Proof rule: ${unlistedNote(prRepoOf(t.url))}`;
-    const openedAt = t.openedAt ?? rowOpenedAt;
+    const openedAt = githubOpenedAt(t.openedAt, row);
     if (!strictPr(openedAt)) return `Proof rules: the rules from before this build: #${t.number} was opened ${utcMinute(openedAt!)}, before the strict proof gate went live ${utcMinute(proofGateLiveAt)}. It needs a verification record at its head and the checker.`;
     return `Proof rules: strict: crew or owner proof at the exact head, from ${surfaceWords(project.proofSurface)}; a record the captain made does not count${openedAt === undefined ? " (GitHub gave no opening time)" : ""}.`;
   }
@@ -8617,7 +8619,7 @@ export default async function plugin(bb: BbPluginApi) {
           ? `covers the current head${row.verification ? `; driven: ${row.verification.driven}; seen: ${row.verification.seen}` : ""}`
           : row?.verifiedCommitSha ? `covers ${row.verifiedCommitSha.slice(0, 7)}, not the current head; the merge will refuse` : "none for the current head; the merge will refuse";
         lines.push(`PR: #${pr.number}${pr.title ? ` ${pr.title}` : ""} ${pr.url} (${pr.state})`, `Head: ${pr.headSha || "could not be read"}`, `Checks: ${checks?.line ?? "could not be read"}`, `Verification record: ${record}`);
-        if (reach.reach === "production") lines.push(proofRulesLine(pr, row?.openedAt));
+        if (reach.reach === "production") lines.push(proofRulesLine(pr, row));
         if (pr.state !== "merged") {
           try { requireVerification(pr, opts.allowUnverified, "", reach); } catch (error) {
             reasons.push((error instanceof Error ? error.message : String(error)).split("\n")[0]!);
