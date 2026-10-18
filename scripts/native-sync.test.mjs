@@ -14,9 +14,15 @@ const FAKE_GH = `#!/usr/bin/env node
 const fs = require('node:fs');
 const world = JSON.parse(fs.readFileSync(process.env.FAKE_WORLD, 'utf8'));
 const a = process.argv.slice(2);
-if (a[0] === 'api') { process.stdout.write('export const UPSTREAM_FIRSTMATE_SHA = "' + world.pin + '";\\n'); process.exit(0); }
-if (a[0] === 'pr' && a[1] === 'list') { const closed = a.includes('closed'); process.stdout.write(JSON.stringify(closed ? world.closed : world.prs)); process.exit(0); }
-if (a[0] === 'pr' && a[1] === 'view') { process.stdout.write(JSON.stringify({ files: (world.files[a[2]] ?? []).map((path) => ({ path })) })); process.exit(0); }
+fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify({ cmd: 'gh', args: a }) + '\\n');
+// Only the REST API: the GraphQL commands (gh pr list, gh pr view) share a smaller rate limit.
+const path = a.find((x) => x.startsWith('repos/')) ?? '';
+if (a[0] === 'api' && world.ghError && path.includes(world.ghError.on)) { process.stderr.write(world.ghError.stderr); process.exit(1); }
+const rest = (pr) => ({ number: pr.number, html_url: pr.url, head: { ref: pr.headRefName, sha: pr.headRefOid }, merged_at: pr.mergedAt ?? null });
+if (a[0] === 'api' && /\\/contents\\//.test(path)) { process.stdout.write('export const UPSTREAM_FIRSTMATE_SHA = "' + world.pin + '";\\n'); process.exit(0); }
+if (a[0] === 'api' && /\\/pulls\\/\\d+\\/files/.test(path) && a.includes('--paginate') && a.includes('--slurp')) { process.stdout.write(JSON.stringify([(world.files[/pulls\\/(\\d+)/.exec(path)[1]] ?? []).map((filename) => ({ filename }))])); process.exit(0); }
+if (a[0] === 'api' && /\\/pulls\\?state=open/.test(path)) { process.stdout.write(JSON.stringify(world.prs.map(rest))); process.exit(0); }
+if (a[0] === 'api' && /\\/pulls\\?state=closed/.test(path)) { const head = new URL('http://x/' + path).searchParams.get('head'); process.stdout.write(JSON.stringify(world.closed.filter((pr) => 'o:' + pr.headRefName === head).map(rest))); process.exit(0); }
 process.stderr.write('fake gh: unknown ' + a.join(' ')); process.exit(1);
 `;
 
@@ -67,16 +73,18 @@ function setup() {
   const world = { pin, prs: [], closed: [], files: {}, threads: {}, crashAfter: null };
   const paths = { world: join(dir, 'world.json'), log: join(dir, 'log.jsonl'), state: join(dir, 'state.json') };
   writeFileSync(paths.log, '');
-  const env = () => ({ ...process.env, FM_SYNC_SEARCH_BUDGET_MS: world.searchBudgetMs ?? '', FM_BB_CALL_TIMEOUT_MS: '3000', PATH: `${bin}:${process.env.PATH}`, FAKE_WORLD: paths.world, FAKE_LOG: paths.log, FM_SYNC_STATE: paths.state, FM_SYNC_UPSTREAM: upstream, FM_SYNC_MANAGER: 'thr_repair', FM_SYNC_PROJECT: 'proj_fm' });
+  const env = () => ({ ...process.env, FM_SYNC_SEARCH_BUDGET_MS: world.searchBudgetMs ?? '', FM_BB_CALL_TIMEOUT_MS: '3000', PATH: `${bin}:${process.env.PATH}`, FAKE_WORLD: paths.world, FAKE_LOG: paths.log, FM_SYNC_STATE: paths.state, FM_SYNC_UPSTREAM: upstream, FM_SYNC_REPO: 'o/r', FM_SYNC_MANAGER: 'thr_repair', FM_SYNC_PROJECT: 'proj_fm' });
   const raw = (...args) => { writeFileSync(paths.world, JSON.stringify(world)); return spawnSync(process.execPath, [SCRIPT, 'tick', ...args], { encoding: 'utf8', env: env() }); };
   const run = (...args) => { const r = raw(...args); assert.equal(r.status, 0, r.stderr); return r.stdout.trim(); };
-  const log = () => readFileSync(paths.log, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const entries = () => readFileSync(paths.log, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const log = () => entries().filter((e) => e.cmd !== 'gh');
+  const ghCalls = () => entries().filter((e) => e.cmd === 'gh').map((e) => e.args);
   const spawns = () => log().filter((e) => e.cmd === 'spawn');
   const tells = () => log().filter((e) => e.cmd === 'tell');
   const advance = () => { git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'upstream fix'); return git('rev-parse', 'HEAD'); };
   const state = () => JSON.parse(readFileSync(paths.state, 'utf8'));
   const chatter = (n, quote) => writeFileSync(paths.log, readFileSync(paths.log, 'utf8') + JSON.stringify({ cmd: 'chatter', to: 'thr_repair', at: Date.now(), n, quote }) + '\n');
-  return { world, run, raw, log, spawns, tells, advance, state, env, paths, chatter };
+  return { world, run, raw, log, ghCalls, spawns, tells, advance, state, env, paths, chatter };
 }
 
 test('a pin already at upstream HEAD does nothing', () => {
@@ -247,4 +255,75 @@ test('a status read that fails is unknown: no replacement sync, no report, and t
   delete t.world.threads.thr_fake1;
   t.world.threads.thr_fake2 = { status: 'idle', output: 'VERDICT: pass' };
   assert.match(t.run(), /tell: report:/, 'a thread the server says is gone counts as finished');
+});
+
+const SKIPPED = /^native-sync: skipped: GitHub unavailable \((.+)\), next tick retries$/;
+
+test('a GitHub rate limit or outage skips the tick: exit 0, one line, no state change, nothing started', () => {
+  const t = setup();
+  const head = t.advance();
+  t.run('--start');
+  t.world.threads.thr_fake1 = { status: 'idle', output: 'done' };
+  t.world.prs = [{ number: 140, url: 'https://github.com/o/r/pull/140', headRefName: `native-sync/${head.slice(0, 8)}`, headRefOid: 'c'.repeat(40) }];
+  const before = readFileSync(t.paths.state, 'utf8');
+  const cases = [
+    ['pulls?state=open', 'GraphQL: API rate limit already exceeded for user ID 1.', 'rate limit'],
+    ['pulls?state=open', 'gh: API rate limit exceeded for user ID 1. (HTTP 403)', 'rate limit'],
+    ['pulls/140/files', 'gh: You have exceeded a secondary rate limit. (HTTP 403)', 'rate limit'],
+    ['contents/', 'gh: Server Error (HTTP 502)', 'HTTP 502'],
+    ['contents/', 'error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com', 'network error'],
+    ['pulls?state=open', 'Get "https://api.github.com/repos/o/r/pulls": dial tcp: i/o timeout', 'network error'],
+  ];
+  for (const [on, stderr, reason] of cases) {
+    t.world.ghError = { on, stderr };
+    const r = t.raw();
+    assert.equal(r.status, 0, `${stderr}\n${r.stderr}`);
+    assert.equal(r.stdout.trim().split('\n').length, 1, r.stdout);
+    assert.equal(SKIPPED.exec(r.stdout.trim())?.[1], reason, r.stdout);
+    assert.equal(readFileSync(t.paths.state, 'utf8'), before, 'the saved state is untouched');
+  }
+  assert.equal(t.spawns().length, 1, 'no checker started while GitHub was unavailable');
+  t.world.ghError = undefined;
+  assert.match(t.run(), /spawn-check: Check native sync PR #140 .* as thr_fake2/, 'the next tick moves on');
+});
+
+test('a GitHub error that is not a rate limit or an outage still fails the run', () => {
+  const t = setup();
+  t.advance();
+  t.world.ghError = { on: 'contents/', stderr: 'gh: Not Found (HTTP 404)' };
+  const r = t.raw('--start');
+  assert.equal(r.status, 1, r.stdout);
+  assert.doesNotMatch(r.stdout, /skipped/);
+  assert.match(r.stderr, /Not Found/);
+});
+
+test('the run reads GitHub through the REST API only, never GraphQL', () => {
+  const t = setup();
+  const head = t.advance();
+  t.run('--start');
+  t.world.threads.thr_fake1 = { status: 'idle', output: 'done' };
+  t.world.prs = [{ number: 140, url: 'https://github.com/o/r/pull/140', headRefName: `native-sync/${head.slice(0, 8)}`, headRefOid: 'c'.repeat(40) }];
+  t.world.files['140'] = ['lib/upstream-surface.ts'];
+  t.run();
+  const calls = t.ghCalls();
+  assert.ok(calls.length >= 3, JSON.stringify(calls));
+  for (const call of calls) {
+    assert.equal(call[0], 'api', call.join(' '));
+    assert.ok(!call.includes('graphql'), call.join(' '));
+  }
+});
+
+test('a sync PR closed without a merge is found on its branch and reported once', () => {
+  const t = setup();
+  const head = t.advance();
+  t.run('--start');
+  t.world.threads.thr_fake1 = { status: 'idle', output: 'done' };
+  const branch = `native-sync/${head.slice(0, 8)}`;
+  t.world.closed = [
+    { number: 139, url: 'https://github.com/o/r/pull/139', headRefName: 'native-sync/00000000', headRefOid: 'e'.repeat(40) },
+    { number: 141, url: 'https://github.com/o/r/pull/141', headRefName: branch, headRefOid: 'a'.repeat(40), mergedAt: '2026-10-17T10:00:00Z' },
+    { number: 142, url: 'https://github.com/o/r/pull/142', headRefName: branch, headRefOid: 'b'.repeat(40) },
+  ];
+  assert.match(t.run(), /tell: closed:142 sent to thr_repair/);
+  assert.match(t.tells()[0].message, /pull\/142 was closed without a merge/);
 });

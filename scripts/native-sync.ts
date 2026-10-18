@@ -7,6 +7,7 @@
 // --retry starts the current upstream HEAD again after a failed or closed sync was reported.
 // Before a spawn or a message, the run saves its operation id; a later run looks for that id
 // (thread title, repair-thread log) before it acts again.
+// A GitHub rate limit or outage skips the run (exit 0, state untouched): the next tick retries.
 // Env: FM_SYNC_MANAGER (the repair thread), FM_SYNC_PROJECT (this repo's BB project).
 // Optional: FM_SYNC_LIVE_HOME (the live captain home, for the guard), FM_SYNC_STATE (state
 // file), FM_SYNC_UPSTREAM, FM_SYNC_REPO.
@@ -52,22 +53,48 @@ const save = (next: SyncState) => {
 let state: SyncState = {};
 try { state = JSON.parse(readFileSync(statePath, "utf8")); } catch { state = {}; }
 
-const surface = run("gh", ["api", "-H", "Accept: application/vnd.github.raw", `repos/${repo}/contents/lib/upstream-surface.ts?ref=main`]);
+// Why a failed GitHub read is GitHub being unavailable, or undefined for any other failure.
+function githubUnavailable(error: unknown): string | undefined {
+  const e = error as { code?: string; signal?: string; stderr?: unknown; message?: string };
+  if (e.code === "ETIMEDOUT" || e.signal === "SIGKILL") return "timeout";
+  const text = `${String(e.stderr ?? "")}\n${e.message ?? ""}`;
+  if (/rate limit/i.test(text)) return "rate limit";
+  const status = /\(HTTP (5\d\d)\)|returned error: (5\d\d)/.exec(text);
+  if (status) return `HTTP ${status[1] ?? status[2]}`;
+  if (/error connecting to|could not resolve host|failed to connect|connection (reset|refused|timed out)|i\/o timeout|tls handshake|unexpected eof|network is unreachable/i.test(text)) return "network error";
+  return undefined;
+}
+// Every GitHub read happens before this run saves anything, so a skip leaves the state as it was.
+const fromGithub = (cmd: string, argv: string[]) => {
+  try {
+    return run(cmd, argv);
+  } catch (error) {
+    const why = githubUnavailable(error);
+    if (why === undefined) throw error;
+    console.log(`native-sync: skipped: GitHub unavailable (${why}), next tick retries`);
+    process.exit(0);
+  }
+};
+// REST, not gh pr list/view: GraphQL has its own, smaller rate limit.
+const ghApi = (...argv: string[]) => JSON.parse(fromGithub("gh", ["api", ...argv]));
+
+const surface = fromGithub("gh", ["api", "-H", "Accept: application/vnd.github.raw", `repos/${repo}/contents/lib/upstream-surface.ts?ref=main`]);
 const pin = /UPSTREAM_FIRSTMATE_SHA = "([0-9a-f]{40})"/.exec(surface)?.[1];
 if (pin === undefined) throw new Error(`no UPSTREAM_FIRSTMATE_SHA in ${repo} main lib/upstream-surface.ts`);
-const head = run("git", ["ls-remote", upstream, "HEAD"]).split(/\s/)[0] ?? "";
+const head = fromGithub("git", ["ls-remote", upstream, "HEAD"]).split(/\s/)[0] ?? "";
 if (!/^[0-9a-f]{40}$/.test(head)) throw new Error(`git ls-remote ${upstream} HEAD returned no commit`);
 
-type GhPr = { number: number; url: string; headRefName: string; headRefOid: string; mergedAt?: string | null };
-const toPr = (pr: GhPr) => ({ number: pr.number, url: pr.url, branch: pr.headRefName, head: pr.headRefOid });
-const prs = (json("gh", ["pr", "list", "--repo", repo, "--state", "open", "--limit", "100", "--json", "number,url,headRefName,headRefOid"]) as GhPr[])
-  .filter((pr) => pr.headRefName.startsWith(SYNC.branchPrefix))
+type GhPr = { number: number; html_url: string; head: { ref: string; sha: string }; merged_at?: string | null };
+const toPr = (pr: GhPr) => ({ number: pr.number, url: pr.html_url, branch: pr.head.ref, head: pr.head.sha });
+const prs = (ghApi(`repos/${repo}/pulls?state=open&per_page=100`) as GhPr[])
+  .filter((pr) => pr.head.ref.startsWith(SYNC.branchPrefix))
   .sort((a, b) => a.number - b.number)
   .map(toPr);
-const files = prs[0] === undefined ? [] : (json("gh", ["pr", "view", String(prs[0].number), "--repo", repo, "--json", "files"]).files as { path: string }[]).map((f) => f.path);
+const files = prs[0] === undefined ? [] : (ghApi("--paginate", "--slurp", `repos/${repo}/pulls/${prs[0].number}/files?per_page=100`) as { filename: string }[][]).flat().map((f) => f.filename);
 const syncBranch = state.sync === undefined ? undefined : `${SYNC.branchPrefix}${state.sync.target.slice(0, 8)}`;
-const closed = syncBranch === undefined || prs.length > 0 ? [] : (json("gh", ["pr", "list", "--repo", repo, "--state", "closed", "--head", syncBranch, "--limit", "20", "--json", "number,url,headRefName,headRefOid,mergedAt"]) as GhPr[])
-  .filter((pr) => !pr.mergedAt)
+const owner = repo.split("/")[0];
+const closed = syncBranch === undefined || prs.length > 0 ? [] : (ghApi(`repos/${repo}/pulls?state=closed&head=${encodeURIComponent(`${owner}:${syncBranch}`)}&per_page=20`) as GhPr[])
+  .filter((pr) => !pr.merged_at)
   .map(toPr);
 
 // A thread the server says does not exist is finished. Any other failed read (timeout,
