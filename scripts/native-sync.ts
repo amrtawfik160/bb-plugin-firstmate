@@ -5,6 +5,7 @@
 // Each run reads the pin (GitHub main), upstream HEAD, the open sync PRs and the threads it
 // started, then does at most one step from owner/native-sync.ts. --dry-run prints the step only.
 // --retry starts the current upstream HEAD again after a failed or closed sync was reported.
+// A weekly run whose upstream moved by files under tests/ only reports it once and starts nothing.
 // Before a spawn or a message, the run saves its operation id; a later run looks for that id
 // (thread title, repair-thread log) before it acts again.
 // A GitHub rate limit or outage skips the run (exit 0, state untouched): the next tick retries.
@@ -139,8 +140,36 @@ for (const pending of [state.sync, state.check]) {
 const delivered: Record<string, "found" | "absent" | "unknown"> = {};
 if (state.outbox !== undefined) delivered[state.outbox.op] = findMessage(manager, marker(state.outbox.op), Date.parse(state.outbox.at), SEARCH_BUDGET_MS);
 
+// Only a weekly run that may start a new sync needs the files changed since the pin. A
+// tree-only scratch clone lists them without the GitHub API. If the list cannot be read, the
+// full sync runs, and this run says why.
+function changedSincePin(): string[] | undefined {
+  const scratch = mkdtempSync(join(tmpdir(), "native-sync-diff-"));
+  try {
+    try {
+      run("git", ["clone", "--quiet", "--bare", "--filter=blob:none", upstream, scratch]);
+    } catch (error) {
+      const why = githubUnavailable(error);
+      if (why !== undefined) {
+        rmSync(scratch, { recursive: true, force: true });
+        console.log(`native-sync: skipped: GitHub unavailable (${why}), next tick retries`);
+        process.exit(0);
+      }
+      throw error;
+    }
+    return run("git", ["-C", scratch, "diff", "--name-only", "--no-renames", pin!, head]).split("\n").filter(Boolean);
+  } catch (error) {
+    console.log(`native-sync: cannot list the files changed since pin ${pin!.slice(0, 8)} (${String((error as { stderr?: unknown }).stderr ?? (error as Error).message).trim().split("\n")[0]}); the full sync runs`);
+    return undefined;
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}
+const newTarget = start && head !== pin && prs.length === 0 && state.outbox === undefined && state.sync?.target !== head;
+const changed = newTarget ? changedSincePin() : undefined;
+
 const step: SyncStep = nextSyncStep({
-  start, retry, pin, upstream: head, prs, closed, files, threads, launched, delivered,
+  start, retry, pin, upstream: head, prs, closed, files, threads, launched, delivered, changed,
   newOp: randomBytes(4).toString("hex"),
   liveHome: process.env.FM_SYNC_LIVE_HOME || undefined,
 }, state);

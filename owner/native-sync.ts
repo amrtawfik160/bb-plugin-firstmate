@@ -33,6 +33,15 @@ export const OWNER_FACING_PATHS = [
   "/docs/verification/native-transport-allowlist.v1.json",
 ] as const;
 
+// Native Firstmate keeps every test under its root tests/ folder (scripts in bin/, skills in
+// .agents/skills/, mods in .claude/mods/). A file there changes no script, skill or contract.
+export const NATIVE_TEST_PATHS = ["/tests/"] as const;
+
+/** True when the files changed since the pin are all test files. An empty or unread list is not. */
+export function testOnlyChange(changed: readonly string[] | undefined): boolean {
+  return changed !== undefined && changed.length > 0 && changed.every((file) => matches(file, NATIVE_TEST_PATHS));
+}
+
 /** threadId is missing while the launch's result is unknown. */
 type Launch = { op: string; threadId?: string; at: string };
 
@@ -43,7 +52,8 @@ export type SyncState = {
   outbox?: { key: string; op: string; text: string; at: string };
   /** What `bb thread tell --json` returned for each delivered message. */
   receipts?: Record<string, unknown>;
-  /** Keys of the messages delivered: report:<head>, failed:<target>, closed:<pr>. */
+  /** Keys of the messages delivered: report:<head>, failed:<target>, closed:<pr>,
+   * tests-only:<upstream HEAD> (the record that this HEAD needs no sync). */
   done?: string[];
 };
 
@@ -70,6 +80,9 @@ export type SyncObservation = {
   /** For a message without its result: whether the repair thread's log since the intent has
    * it. "unknown": the search could not finish. */
   delivered: Readonly<Record<string, "found" | "absent" | "unknown">>;
+  /** Files changed from the pin to upstream HEAD, read only when the weekly run may start a
+   * sync; undefined when not read or unreadable. */
+  changed?: readonly string[];
   /** A fresh operation id for a new side effect. */
   newOp: string;
   /** The live captain home, read-only for the sync crew: the guard hashes its data/captain.md. */
@@ -140,6 +153,7 @@ export function nextSyncStep(o: SyncObservation, state: SyncState): SyncStep {
     return tell(`failed:${sync.target}`, failedReport(o, sync));
   }
   if (!o.start) return { action: "none", why: "no sync PR is open; only the weekly run starts a sync" };
+  if (testOnlyChange(o.changed)) return tell(`tests-only:${o.upstream}`, testsOnlyReport(o));
   return spawnSync(o, o.upstream, 1, o.newOp);
 }
 
@@ -209,5 +223,14 @@ function closedReport(pr: SyncPr): string {
   return [
     `Native sync PR ${pr.url} was closed without a merge. No sync starts for this upstream HEAD until it moves.`,
     RETRY,
+  ].join("\n");
+}
+
+function testsOnlyReport(o: SyncObservation): string {
+  const files = o.changed ?? [];
+  return [
+    `Native Firstmate moved from ${short(o.pin)} to ${short(o.upstream)} by test files only (${files.length} ${files.length === 1 ? "file" : "files"}): ${files.slice(0, 10).join(", ")}${files.length > 10 ? ", …" : ""}.`,
+    "No sync crew, checker, canary or live switch runs for it. Nothing to merge or reload.",
+    `The pin stays at ${short(o.pin)}. The first weekly run that sees a change outside tests/ syncs every change since ${short(o.pin)}, these included.`,
   ].join("\n");
 }
