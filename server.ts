@@ -5375,29 +5375,30 @@ export default async function plugin(bb: BbPluginApi) {
     let changed = false;
     for (const task of tasks) {
       const own = task.crewIds.map((id) => live.get(id)).filter((crew): crew is Crew => crew !== undefined);
+      // Each crew's own latest report decides whether it still works: a registered crew that reported done
+      // does not hold its task (checker round 2).
+      const reports = new Map<string, { verb: string; note: string } | null>();
       for (const crew of own) {
         let latest: { verb: string; note: string } | null = null;
-        let lineAt: number | null = null;
-        try {
-          const lines = (await crewStatusLines(crew)).lines;
-          latest = latestStatus(lines);
-          const stamp = [...lines].reverse().find((line) => line.trim() !== "")?.match(/\[at=(\d+)\]/)?.[1];
-          lineAt = stamp === undefined ? null : Number(stamp) * 1000;
-        } catch (error) { bb.log.warn(`task sweep: status of crew ${crew.id}: ${String(error)}`); }
+        try { latest = latestStatus((await crewStatusLines(crew)).lines); } catch (error) { bb.log.warn(`task sweep: status of crew ${crew.id}: ${String(error)}`); }
+        reports.set(crew.id, latest);
+      }
+      const stillWorking = (id: string) => live.has(id) && reports.get(id)?.verb !== "done";
+      for (const crew of own) {
+        const latest = reports.get(crew.id) ?? null;
         if (latest === null) continue;
         const seen = `task-status-seen:${statusKey(crew.id, `${latest.verb} ${latest.note}`)}`;
         if (await bb.storage.kv.get(seen) !== undefined) continue;
         if (latest.verb === "done") {
-          const after = ownerTasks.crewReportedDone(captain, crew.id, latest.note, (id) => id !== crew.id && live.has(id), (item) => deliveries.forTasks(item.crewIds, item.prs), now);
+          const after = ownerTasks.crewReportedDone(captain, crew.id, latest.note, (id) => id !== crew.id && stillWorking(id), (item) => deliveries.forTasks(item.crewIds, item.prs), now);
           // A done line is used up only once it moved the task: while another crew of the task works, it waits.
           if (after !== undefined && after.state !== task.state) { changed = true; bb.log.info(`task ${task.id}: crew ${crew.id} reported done; ${task.state} -> ${after.state}`); }
           if (after === undefined || after.state !== task.state || !isOpenTask(after)) await bb.storage.kv.set(seen, now);
         } else if (crewWaitsOnOwner(latest)) {
           await bb.storage.kv.set(seen, now);
-          // The captain may have asked already: a card on this task, or a card it sent after this status line
-          // about the same project with no task of its own. A newer card about other work does not count.
-          const asked = ownerAsks.listOpen(captain).find((ask) => ask.task === task.id
-            || (ask.task === undefined && lineAt !== null && ask.createdAt >= lineAt && sameProject(ask.project ?? null, task.project)));
+          // The captain may have asked already, but only a card bound to this task counts: a card about other
+          // work, even on the same project, does not stand for the crew's question (checker round 2).
+          const asked = ownerAsks.listOpen(captain).find((ask) => ask.task === task.id);
           if (asked === undefined) await askForCrew(captain, task, crew, latest.note, now);
           else {
             bb.log.info(`task ${task.id}: crew ${crew.id} waits on the owner; card ${asked.id} already asks, no new card`);
