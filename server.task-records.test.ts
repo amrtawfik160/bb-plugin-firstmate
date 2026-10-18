@@ -339,3 +339,60 @@ test("check round 3: a failure whose confirmation was lost is applied once: it n
     await host.harness.lifecycle.dispose();
   }
 });
+
+test("check round 3: a failure the captain was never told of does not reopen a message answered after it; an old connector's failure is applied once", async () => {
+  const { host, calls } = await captainHost();
+  try {
+    const failures: Array<{ id: string; chatId: string; messageId: string; reason: string; at?: number }> = [];
+    const acked: string[] = [];
+    host.harness.sdk.stub("plugins.callRpc", async (args: Rpc) => {
+      calls.push(args);
+      if (args.method === "undelivered") return { undelivered: failures.filter((row) => !acked.includes(row.id)) };
+      if (args.method === "ackUndelivered") { acked.push(...(args.input.ids as string[])); return { acked: (args.input.ids as string[]).length }; }
+      if (args.method === "replied") return { replied: [] };
+      if (args.method === "freeText") return { obligations: [] };
+      return { ok: true, queued: 1, duplicate: false, mode: "on" };
+    });
+    const ledger = (id: string) => createInboundLedger(host.bb.storage.database()).get({ source: "telegram", chatId: "200", messageId: id });
+    const idle = () => host.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_cap", status: "idle" }), lastAssistantText: "ok" });
+    const pause = () => new Promise((resolve) => setTimeout(resolve, 5));
+    // The failure is reported, but the message to the captain fails, so nothing is applied.
+    await ownerSays(host, "6500", "Report");
+    await tool(host, "firstmate_reply").execute({ ref: "tg:200:6500", text: "Here it is." }, capCtx);
+    await pause();
+    failures.push({ id: "out_10", chatId: "200", messageId: "6500", reason: "Telegram refused the message", at: Date.now() });
+    let steerFails = true;
+    host.harness.sdk.stub("threads.send", async (args: { input: Array<{ text: string }> }) => {
+      if (steerFails && /not delivered/i.test(args.input[0]?.text ?? "")) throw new Error("BB send failed");
+      return {};
+    });
+    await idle();
+    steerFails = false;
+    // The captain answers again anyway, after the failure.
+    await pause();
+    await tool(host, "firstmate_reply").execute({ ref: "tg:200:6500", text: "Here it is, again." }, capCtx);
+    await idle();
+    assert.equal(ledger("6500")?.state, "answered", "a failure older than the answer does not reopen it");
+    assert.ok(acked.includes("out_10"));
+    // An older connector gives no time: the failure is applied once, so a later answer is never reopened by it.
+    await ownerSays(host, "6501", "And the costs?");
+    await tool(host, "firstmate_reply").execute({ ref: "tg:200:6501", text: "Costs are fine." }, capCtx);
+    failures.push({ id: "out_11", chatId: "200", messageId: "6501", reason: "Telegram refused the message" });
+    let ackFails = true;
+    host.harness.sdk.stub("plugins.callRpc", async (args: Rpc) => {
+      if (args.method === "ackUndelivered" && ackFails) { ackFails = false; throw new Error("temporary ack transport failure"); }
+      if (args.method === "undelivered") return { undelivered: failures.filter((row) => !acked.includes(row.id)) };
+      if (args.method === "ackUndelivered") { acked.push(...(args.input.ids as string[])); return { acked: 1 }; }
+      if (args.method === "replied") return { replied: [] };
+      if (args.method === "freeText") return { obligations: [] };
+      return { ok: true, queued: 1, duplicate: false, mode: "on" };
+    });
+    await idle();
+    assert.notEqual(ledger("6501")?.state, "answered", "open again");
+    await tool(host, "firstmate_reply").execute({ ref: "tg:200:6501", text: "Costs are fine, corrected." }, capCtx);
+    await idle();
+    assert.equal(ledger("6501")?.state, "answered", "applied once");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
