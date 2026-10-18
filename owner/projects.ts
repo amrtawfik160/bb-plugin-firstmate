@@ -30,6 +30,7 @@ export type ProjectRule = {
   repos: readonly string[];
   bbProjects?: readonly string[];
   proofSurface: ProofSurface;
+  dev?: { command: string; repository?: string };
   release?: { kind: "testflight"; group: string };
   sharedServers?: readonly SharedServer[];
   live?: LiveRule;

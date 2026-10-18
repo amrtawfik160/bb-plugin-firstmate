@@ -420,3 +420,16 @@ test("raw native teardown of a known crew is refused by firstmate_fm and bb firs
     await host.harness.lifecycle.dispose();
   }
 });
+
+
+test("workstream report storage does not make a finished crew a native retirement candidate", async () => {
+  const { host, commands } = await captainHost({ws1:`done [at=${old}]: report ready\n`});
+  try {
+    await host.bb.storage.kv.set("crews", [crewRow("ws1", "thr_ws", {workstreamId:"ws-audit",worktree:false,reportDir:"/native/data/ws1"})]);
+    await host.harness.behavior.runCli(["retire-finished", "--captain", "thr_cap"], ctx);
+    await host.harness.behavior.runSchedule("finished-crew-retire");
+    assert.deepEqual(teardowns(commands), []);
+    assert.deepEqual(await crewIds(host), ["ws1"]);
+    assert.ok(!commands.some(c=>c.includes("/state/ws1")), "no native lifecycle files are read for the workstream crew");
+  } finally { await host.harness.lifecycle.dispose(); }
+});

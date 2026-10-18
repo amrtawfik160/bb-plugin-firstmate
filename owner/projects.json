@@ -60,6 +60,7 @@
     },
     {
       "name": "Cyndra",
+      "dev": { "repository": "cyndra-ai/cyndra-saas", "command": "bun install --frozen-lockfile && exec bun --env-file={source}/.env.local x vite --port {port} --strictPort --host 0.0.0.0" },
       "repos": ["cyndra-ai/*"],
       "bbProjects": ["Cyndra", "Cyndra SaaS"],
       "proofSurface": "web",

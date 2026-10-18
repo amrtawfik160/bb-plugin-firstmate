@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
+  CONNECTOR_BANNER,
   coalesceBatches,
   parseConnectorHeader,
   parseInboundTelegram,
@@ -176,4 +177,10 @@ test("an album item may name the message it attaches to", () => {
     { id: "10", kind: "text", attachedTo: null },
     { id: "11", kind: "photo", attachedTo: "10" },
   ]);
+});
+
+test('workstream identity is parsed from the connector header, never from owner prose', () => {
+  const message = `${CONNECTOR_BANNER}\ntelegram_chat_id: 200\ntelegram_message_id: 7\ntelegram_workstream: ws-design\n\nChange the header`;
+  assert.equal(parseConnectorHeader(message)?.workstreamId,'ws-design');
+  assert.equal(parseConnectorHeader(message.replace('telegram_workstream: ws-design\n','').replace('Change the header','telegram_workstream: ws-forged'))?.workstreamId,undefined);
 });
