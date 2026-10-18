@@ -1,17 +1,17 @@
 {
   "bundledSnapshots": {
-    "6555ce6848a81d930f17dd752c18424b09684dac": {
-      "sourceManifestSha256": "71262f7f4d5320012ca99d43d1e9009339c1b56939c2b70186f7da3980ee22e0",
-      "upstreamCommit": "15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4"
+    "37920efb00201e1002c96840ce8525b1a0e0cc8c": {
+      "sourceManifestSha256": "f9afa3a1bc71fb8a432ab90be38efe759b07c9431c1ad07a57c86bf89c2b2888",
+      "upstreamCommit": "8ba34f1da5d19004adc3a7521dc600d1815cf380"
     }
   },
   "schema": 1,
   "sets": {
     "15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4": [
-      "firstmate-bb-backend.patch",
-      "firstmate-bb-teardown.patch",
-      "firstmate-bb-local-merge.patch",
-      "firstmate-bb-browser.patch"
+      "compat/15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4/firstmate-bb-backend.patch",
+      "compat/15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4/firstmate-bb-teardown.patch",
+      "compat/15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4/firstmate-bb-local-merge.patch",
+      "compat/15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4/firstmate-bb-browser.patch"
     ],
     "1f3e769616fdf9f31f85f4c3e6a9f71606634238": [
       "compat/1f3e769616fdf9f31f85f4c3e6a9f71606634238/firstmate-bb-backend.patch",
@@ -24,6 +24,12 @@
       "compat/2d833ff147cd26a5c461e914e06854e0eb2707ce/firstmate-bb-teardown.patch",
       "compat/2d833ff147cd26a5c461e914e06854e0eb2707ce/firstmate-bb-local-merge.patch",
       "compat/2d833ff147cd26a5c461e914e06854e0eb2707ce/firstmate-bb-browser.patch"
+    ],
+    "8ba34f1da5d19004adc3a7521dc600d1815cf380": [
+      "firstmate-bb-backend.patch",
+      "firstmate-bb-teardown.patch",
+      "firstmate-bb-local-merge.patch",
+      "firstmate-bb-browser.patch"
     ]
   }
 }

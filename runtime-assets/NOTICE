@@ -1,5 +1,5 @@
 Firstmate by Kun Chen, MIT License.
 Source: https://github.com/kunchenguid/firstmate
-Upstream commit: 15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4
+Upstream commit: 8ba34f1da5d19004adc3a7521dc600d1815cf380
 Native files are unchanged; the BB adapter is separately marked and versioned.
 The snapshot Git commit is a packaging identity, not the upstream commit.

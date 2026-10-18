@@ -4,14 +4,14 @@
     "python": "3.12.3"
   },
   "nativeBundle": {
-    "bytes": 2724568,
-    "sha256": "e7a4cfd743081440dc11cce76404615a5a65f9c1b89fa205efa8fa6a82b537fd"
+    "bytes": 2775383,
+    "sha256": "e8038fa5b245974d38ffb594a3f95bb88442e94022f5e828e06fece9d4b9f93d"
   },
-  "nativeFiles": 398,
+  "nativeFiles": 403,
   "schema": 1,
-  "snapshotCommit": "6555ce6848a81d930f17dd752c18424b09684dac",
-  "sourceManifestSha256": "71262f7f4d5320012ca99d43d1e9009339c1b56939c2b70186f7da3980ee22e0",
+  "snapshotCommit": "37920efb00201e1002c96840ce8525b1a0e0cc8c",
+  "sourceManifestSha256": "f9afa3a1bc71fb8a432ab90be38efe759b07c9431c1ad07a57c86bf89c2b2888",
   "stateContract": "native-flat-v1",
-  "upstreamCommit": "15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4",
+  "upstreamCommit": "8ba34f1da5d19004adc3a7521dc600d1815cf380",
   "upstreamSource": "https://github.com/kunchenguid/firstmate"
 }

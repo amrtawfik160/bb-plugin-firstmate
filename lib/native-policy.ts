@@ -1,10 +1,10 @@
 /** Read policy from the exact selected runtime. SDK 0.4.104 only accepts static
  * skill ids; supplying global copied skills would mix two native revisions. */
-export const AUDITED_POLICY_COMMITS=['2d833ff147cd26a5c461e914e06854e0eb2707ce','1f3e769616fdf9f31f85f4c3e6a9f71606634238','15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4'] as const;
+export const AUDITED_POLICY_COMMITS=['2d833ff147cd26a5c461e914e06854e0eb2707ce','1f3e769616fdf9f31f85f4c3e6a9f71606634238','15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4','8ba34f1da5d19004adc3a7521dc600d1815cf380'] as const;
 /** Every bundled snapshot a captain home may still run, with its native commit.
  * A home keeps its selected bundle until its owner selects another, so an older
  * bundle stays readable after the plugin ships a newer one. */
-export const AUDITED_BUNDLED_SNAPSHOTS={'4cdbef4dbf44a721e55cf0ad01524ee27b377e05':'1f3e769616fdf9f31f85f4c3e6a9f71606634238','6555ce6848a81d930f17dd752c18424b09684dac':'15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4'} as const;
+export const AUDITED_BUNDLED_SNAPSHOTS={'4cdbef4dbf44a721e55cf0ad01524ee27b377e05':'1f3e769616fdf9f31f85f4c3e6a9f71606634238','6555ce6848a81d930f17dd752c18424b09684dac':'15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4','37920efb00201e1002c96840ce8525b1a0e0cc8c':'8ba34f1da5d19004adc3a7521dc600d1815cf380'} as const;
 export function nativeSkillPath(name:string,reference?:string,source?:string) {
   if (!/^[a-z0-9][a-z0-9-]{0,100}$/.test(name)) throw new Error('Use an exact native skill name');
   function normalize(path:string) {

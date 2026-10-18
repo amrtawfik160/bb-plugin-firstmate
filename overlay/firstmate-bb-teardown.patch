@@ -1,5 +1,5 @@
 diff --git a/bin/fm-teardown.sh b/bin/fm-teardown.sh
-index c907563a..7ad9118b 100755
+index 9e3d0413..7d128b04 100755
 --- a/bin/fm-teardown.sh
 +++ b/bin/fm-teardown.sh
 @@ -454,7 +454,7 @@ if [ -f "$META" ] && [ ! -L "$META" ]; then
@@ -20,7 +20,7 @@ index c907563a..7ad9118b 100755
     && fm_treehouse_pool_slot "$PROJ" "$WT"; then
    EXPECTED_TREEHOUSE_PROJECT_LOCK=$(fm_treehouse_project_lock_path "$PROJ") || {
      echo "REFUSED: cannot resolve the shared Treehouse project lock for ${PROJ:-<missing>}; nothing was changed" >&2
-@@ -3010,7 +3010,7 @@ preflight_descendant_treehouse_slots() {
+@@ -3025,7 +3025,7 @@ preflight_descendant_treehouse_slots() {
      backend=$(fm_backend_of_meta "$meta")
      worktree=$(meta_value "$meta" worktree)
      project=$(meta_value "$meta" project)
@@ -29,7 +29,7 @@ index c907563a..7ad9118b 100755
        continue
      fi
      if ! fm_treehouse_pool_slot "$project" "$worktree"; then
-@@ -3043,7 +3043,7 @@ preflight_descendant_treehouse_slots() {
+@@ -3058,7 +3058,7 @@ preflight_descendant_treehouse_slots() {
      backend=$(fm_backend_of_meta "$meta")
      worktree=$(meta_value "$meta" worktree)
      project=$(meta_value "$meta" project)
@@ -38,7 +38,7 @@ index c907563a..7ad9118b 100755
        continue
      fi
      if ! fm_treehouse_pool_slot "$project" "$worktree"; then
-@@ -3668,6 +3668,13 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
+@@ -3688,6 +3688,13 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
        || { endpoint_close_refusal "$ID" "$BACKEND" "$T" 0; exit 1; }
    fi
    fm_backend_remove_worktree "$BACKEND" "$ORCA_WORKTREE_ID"
@@ -52,7 +52,7 @@ index c907563a..7ad9118b 100755
  elif [ "$KIND" != secondmate ] && ! teardown_owns_worktree; then
    :
  elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
-@@ -3765,7 +3772,7 @@ elif [ "$BACKEND" = herdr ]; then
+@@ -3786,7 +3793,7 @@ elif [ "$BACKEND" = herdr ]; then
    else
      echo "warning: herdr session presentation lock path is unavailable; skipping the pane close rather than closing unlocked" >&2
    fi

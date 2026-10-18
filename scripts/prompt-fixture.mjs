@@ -5,7 +5,7 @@ import {tmpdir} from 'node:os';
 import {spawnSync} from 'node:child_process';
 export const overlay=resolve('overlay');
 export const repository=process.env.FIRSTMATE_TEST_NATIVE??'/root/github_projects/firstmate';
-export const pins=['2d833ff147cd26a5c461e914e06854e0eb2707ce','1f3e769616fdf9f31f85f4c3e6a9f71606634238','15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4'];
+export const pins=['2d833ff147cd26a5c461e914e06854e0eb2707ce','1f3e769616fdf9f31f85f4c3e6a9f71606634238','15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4','8ba34f1da5d19004adc3a7521dc600d1815cf380'];
 export function run(command,args,env={}) { return spawnSync(command,args,{encoding:'utf8',env:{...process.env,...env},timeout:30000,maxBuffer:8*1024*1024}); }
 export function ok(result) {assert.equal(result.status,0,result.stdout+result.stderr);return result.stdout;}
 export function fixture(pin=pins.at(-1)) {

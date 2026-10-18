@@ -2,7 +2,7 @@
 """Build a reproducible filtered native Git snapshot. Reads only committed source."""
 import argparse, hashlib, json, os, subprocess, tempfile, sys
 from pathlib import Path
-PIN = '15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4'
+PIN = '8ba34f1da5d19004adc3a7521dc600d1815cf380'
 PREFIXES = ('bin/', '.agents/', '.claude/', '.codex/', '.cursor/', '.grok/', '.omp/', '.opencode/', '.pi/', 'skills/', 'docs/')
 ROOT_FILES = ('AGENTS.md', 'CLAUDE.md', 'GROK_BOT.md', 'README.md', 'LICENSE', 'CONTRIBUTING.md', '.tasks.toml', '.gitignore', '.gitattributes')
 def digest(data): return hashlib.sha256(data).hexdigest()

@@ -1,8 +1,8 @@
 diff --git a/bin/fm-bootstrap.sh b/bin/fm-bootstrap.sh
-index 76209a98..fc9ab269 100755
+index ab1a86ed..583b273c 100755
 --- a/bin/fm-bootstrap.sh
 +++ b/bin/fm-bootstrap.sh
-@@ -833,6 +833,11 @@ missing_tool_diagnostic() {
+@@ -885,6 +885,11 @@ missing_tool_diagnostic() {
  # no verified dependency set is reported before the universal checks continue.
  COMMON_TOOLS="node git gh no-mistakes gh-axi chrome-devtools-axi tasks-axi quota-axi"
  BACKEND=$(fm_backend_name)
@@ -14,7 +14,7 @@ index 76209a98..fc9ab269 100755
  BACKEND_VALID=1
  if ! BACKEND_TOOLS=$(fm_backend_required_tools "$BACKEND"); then
    BACKEND_VALID=0
-@@ -862,7 +867,11 @@ treehouse_supports_lease() {
+@@ -914,7 +919,11 @@ treehouse_supports_lease() {
  tool_version_parts() {  # <tool>
    local tool=$1 output parts major minor patch extra
    command -v "$tool" >/dev/null 2>&1 || return 1
@@ -26,7 +26,7 @@ index 76209a98..fc9ab269 100755
    parts=$(printf '%s\n' "$output" | sed -nE 's/.*[vV]?([0-9]+)\.([0-9]+)\.([0-9]+).*/\1 \2 \3/p' | head -n 1)
    IFS=' ' read -r major minor patch extra <<< "$parts"
    [ -n "$major" ] && [ -n "$minor" ] && [ -n "$patch" ] && [ -z "$extra" ] || return 1
-@@ -1463,7 +1472,7 @@ detect_local_config() {
+@@ -1515,7 +1524,7 @@ detect_local_config() {
    # verified owner rather than a bare `command -v`, so a home that merely has
    # some unrelated executable named `agent` on PATH is still reported missing
    # instead of failing at the first spawn.
