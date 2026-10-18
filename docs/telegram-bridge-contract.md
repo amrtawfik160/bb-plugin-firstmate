@@ -111,6 +111,30 @@ quote, a later reply to the same item with a different text is sent as its own
 reply; the same text again is not sent. An item that got its final reply takes
 no further unquoted reply.
 
+Every owner message a reply answers is linked to an owner task or marked as asking
+for no work, and the ledger row records it as `work` (`T<n>` or `no-work`). The task
+the message started, or one an earlier reply recorded, links it by itself. Otherwise
+the reply passes `task` or `noWork=true`; a reply with neither is refused before
+anything is reserved, and the error names the message. Each `covers` entry is a ref,
+which takes the reply's own `task` or `noWork`, or `{ref, task}` / `{ref, noWork: true}`.
+A covered message's own task comes first.
+
+A message the connector reports as answered closes only when it has its link. One
+with no link stays open, marked replied (`repliedAt`), and its reminder asks for the
+link; `firstmate_reply` then records the link and closes it without sending again.
+An answer to a card records the card's task, or `no-work` when the card has none.
+An answered message whose words change under the same message id (an edit) opens
+again with no link. A row recorded before body hashes opens again only on a real edit:
+an event whose header carries `telegram_edit_date: <Unix seconds>` newer than any
+recorded for it. A replay without it changes nothing. Today the connector drops
+Telegram edits (`ignored_edit`), so no event carries this field yet.
+
+`promise={by, what}` records a dated promise (`P<n>`) once the reply is delivered.
+`by` is an ISO date (due 06:00 UTC, 09:00 Cairo) or a date-time with its zone, in the
+future. Firstmate wakes the captain once at that time; the promise stays on the board
+(`promises` on the `board` command, and a "Promised" section in its text) until the
+captain closes it with `firstmate_promise` kept or dropped.
+
 `firstmate_reply` sends the text as written; no check reads its words. `files` takes
 up to 10 absolute paths. A missing path or one that is not a regular file refuses
 the reply before anything is reserved or sent. Each file is appended as a Markdown

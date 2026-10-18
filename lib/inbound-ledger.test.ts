@@ -272,3 +272,17 @@ test("the hand-back names each owner message with its ref and words, and says to
     `- tg:9:${c.messageId} (crew c2): 'Ship the docs'`,
   ].join("\n"));
 });
+
+test("checker round 1, finding 2: an answered message edited to new words opens again with no link; the same words do not", () => {
+  const ledger = store();
+  const head = "⟦tg chat=9 msg=45 reply_to=- group=- fwd=0 thread=- from=amr⟧";
+  const event = userEvent({ text: `${head}\nThanks`, telegram: parseTelegramEnvelope(head) });
+  const row = ledger.record(event)!;
+  ledger.noteWork([{ key: row, work: "no-work" }]);
+  ledger.finishReply(row, [], "tg:9:45", 2_000);
+  assert.equal(ledger.record(event)?.state, "answered", "a repeat of the same words changes nothing");
+  const edited = ledger.record({ ...event, text: `${head}\nBuild the payment flow` });
+  assert.equal(edited?.state, "acked");
+  assert.equal(edited?.work, null);
+  assert.equal(edited?.preview, "Build the payment flow");
+});

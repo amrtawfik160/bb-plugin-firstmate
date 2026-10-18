@@ -73,7 +73,7 @@ test("Oct 7 repro: a reply of only 'Started' answered the owner message, and now
     await ownerSays(host, "2201", "Fix the Metricool sync, posts stopped publishing");
     const dispatched = await dispatch(host, { task: "Fix the Metricool sync", taskId: "metricool-fix", title: "Fix the Metricool sync", sourceRefs: ["tg:200:2201"] });
     assert.equal(text(dispatched), "Reserved crew metricool-fix. Spawn continues in the background. Owner task T1 tracks it until it is merged, live, done, or dropped; a reply does not close it.");
-    const replied = await tool(host, "firstmate_reply").execute({ ref: "tg:200:2201", text: "Started the Metricool fix." }, capCtx);
+    const replied = await tool(host, "firstmate_reply").execute({ noWork: true, ref: "tg:200:2201", text: "Started the Metricool fix." }, capCtx);
     assert.ok(!isError(replied), text(replied));
     // The reply is a fact about the message: it counts as answered and leaves the inbox.
     assert.equal(createInboundLedger(host.bb.storage.database()).get({ source: "telegram", chatId: "200", messageId: "2201" })?.state, "answered");
@@ -97,17 +97,17 @@ test("Oct 7 repro: a reply of only 'Started' answered the owner message, and now
   }
 });
 
-test("a dispatch in an owner-started turn without the owner's ref or another origin runs with a warning and opens no task", async () => {
+test("a dispatch in an owner-started turn without the owner's ref or another origin opens a task linked to that turn's message", async () => {
   const host = await captainHost();
   try {
     await ownerSays(host, "2202", "Run the Brands audit");
     const untagged = await dispatch(host, { task: "Run the Brands audit", taskId: "brands-audit" });
     assert.ok(!isError(untagged), text(untagged));
-    assert.equal(text(untagged), 'Reserved crew brands-audit. Spawn continues in the background.\nWarning: no owner task tracks this crew. This turn started from owner message tg:200:2202. If this job is the owner\'s, pass sourceRefs: ["tg:200:2202"]; for a follow-up, pass taskRef; otherwise pass origin.');
-    assert.deepEqual(createOwnerTasks(host.bb.storage.database()).list("thr_cap"), []);
+    assert.equal(text(untagged), "Reserved crew brands-audit. Spawn continues in the background. Owner task T1 tracks it until it is merged, live, done, or dropped; a reply does not close it. It is linked to this turn's owner message tg:200:2202; pass sourceRefs, taskRef or origin to say otherwise.");
+    assert.deepEqual(createOwnerTasks(host.bb.storage.database()).list("thr_cap").map((task) => task.sourceRefs), [["tg:200:2202"]]);
     await crewPings(host);
     const after = await dispatch(host, { task: "Rebase the docs branch", taskId: "docs-rebase" });
-    assert.equal(text(after), "Reserved crew docs-rebase. Spawn continues in the background.", "a turn a crew started needs no owner ref");
+    assert.equal(text(after), "Reserved crew docs-rebase. Spawn continues in the background. Owner task T2 tracks it until it is merged, live, done, or dropped; a reply does not close it.", "a turn a crew started needs no owner ref, and its crew is still on a task");
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -140,21 +140,12 @@ test("Oct 7 repro: one owner message with two jobs opens two tasks, each titled 
   }
 });
 
-test("Oct 7 repro: in an owner turn, a job another thread asked for names its origin and opens no owner task", async () => {
+test("Oct 7 repro: in an owner turn, a job another thread asked for names its origin and opens its own task, not linked to the owner's message", async () => {
   const host = await captainHost();
   try {
     await ownerSays(host, "2215", "Five Safi jobs: debts in Arrange home, the glass glitch, ...");
     const deploy = await dispatch(host, { task: "Deploy and merge #2155 then #2156", taskId: "deploy-2155-2156", title: "Deploy + merge #2155 then #2156", origin: { kind: "thread", threadId: "thr_u6n35axzg5" } });
-    assert.equal(text(deploy), "Reserved crew deploy-2155-2156. Spawn continues in the background.");
-    assert.equal(await board(host), [
-      "📌 Needs you: nothing right now.",
-      "",
-      "✅ Finished since you last looked: nothing new.",
-      "",
-      "🚀 Not live yet: nothing merged waits to go live.",
-      "",
-      "🔧 In progress: nothing open.",
-    ].join("\n"));
+    assert.equal(text(deploy), "Reserved crew deploy-2155-2156. Spawn continues in the background. Owner task T1 tracks it until it is merged, live, done, or dropped; a reply does not close it.");
     await dispatch(host, { task: "Show debts in Arrange home items", taskId: "safi-arrange-debts", title: "Safi: debts in Arrange home items", sourceRefs: ["tg:200:2215"] });
     assert.equal(await board(host), [
       "📌 Needs you: nothing right now.",
@@ -163,11 +154,13 @@ test("Oct 7 repro: in an owner turn, a job another thread asked for names its or
       "",
       "🚀 Not live yet: nothing merged waits to go live.",
       "",
-      "🔧 In progress (1)",
-      "- T1 Areliaa · Safi: debts in Arrange home items · 0 min",
+      "🔧 In progress (2)",
+      "- T1 Areliaa · Deploy + merge #2155 then #2156 · 0 min",
+      "- T2 Areliaa · Safi: debts in Arrange home items · 0 min",
     ].join("\n"));
     const captainOwn = await dispatch(host, { task: "Clean the host disk", taskId: "disk-clean", origin: { kind: "captain", reason: "routine upkeep" } });
-    assert.equal(text(captainOwn), "Reserved crew disk-clean. Spawn continues in the background.");
+    assert.equal(text(captainOwn), "Reserved crew disk-clean. Spawn continues in the background. Owner task T3 tracks it until it is merged, live, done, or dropped; a reply does not close it.");
+    assert.deepEqual(createOwnerTasks(host.bb.storage.database()).list("thr_cap").map((task) => [task.id, task.sourceRefs]), [["T1", []], ["T2", ["tg:200:2215"]], ["T3", []]], "an origin job never takes the owner's message");
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -635,13 +628,13 @@ test("firstmate_reply names the task of the owner message; more=true is progress
     await dispatch(host, { task: "Fix the legend dashes", taskId: "legend", title: "Legend dashes", sourceRefs: ["tg:200:2303"] });
     // An "ack" reply sets 👀 when the message reaches the captain; it carries no text.
     const replies = () => calls.filter((call) => call.method === "reply" && call.input.kind !== "ack").map((call) => ({ kind: call.input.kind, task: call.input.task, result: call.input.result }));
-    await tool(host, "firstmate_reply").execute({ ref: "tg:200:2303", text: "The dashes come from the legend.", more: true }, capCtx);
-    await tool(host, "firstmate_reply").execute({ ref: "tg:200:2303", text: "Should the forecast use dots?" }, capCtx);
+    await tool(host, "firstmate_reply").execute({ noWork: true, ref: "tg:200:2303", text: "The dashes come from the legend.", more: true }, capCtx);
+    await tool(host, "firstmate_reply").execute({ noWork: true, ref: "tg:200:2303", text: "Should the forecast use dots?" }, capCtx);
     await tool(host, "firstmate_task").execute({ action: "close", id: "T1", state: "done", reason: "Dots now" }, capCtx);
     await ownerSays(host, "2304", "Status?");
-    await tool(host, "firstmate_reply").execute({ ref: "tg:200:2303", text: "Done: the forecast uses dots, live.", result: true }, capCtx);
-    await tool(host, "firstmate_reply").execute({ ref: "tg:200:2303", text: "The old chart is archived." }, capCtx);
-    await tool(host, "firstmate_reply").execute({ ref: "tg:200:2304", text: "All quiet." }, capCtx);
+    await tool(host, "firstmate_reply").execute({ noWork: true, ref: "tg:200:2303", text: "Done: the forecast uses dots, live.", result: true }, capCtx);
+    await tool(host, "firstmate_reply").execute({ noWork: true, ref: "tg:200:2303", text: "The old chart is archived." }, capCtx);
+    await tool(host, "firstmate_reply").execute({ noWork: true, ref: "tg:200:2304", text: "All quiet." }, capCtx);
     assert.deepEqual(replies(), [
       { kind: "progress", task: "T1", result: undefined },
       { kind: "reply", task: "T1", result: undefined },
@@ -660,7 +653,7 @@ test("a reply the connector drops as only saying the work started is not sent, a
   connector(host, (method) => method === "reply" ? { queued: 0, duplicate: false, mode: "on", dropped: "started" } : { ok: true, queued: 1, duplicate: false, mode: "on" });
   try {
     await ownerSays(host, "2305", "Fix the legend dashes");
-    const replied = await tool(host, "firstmate_reply").execute({ ref: "tg:200:2305", text: "On it." }, capCtx);
+    const replied = await tool(host, "firstmate_reply").execute({ noWork: true, ref: "tg:200:2305", text: "On it." }, capCtx);
     assert.ok(isError(replied));
     assert.match(text(replied), /^Not sent to Telegram: it only says the work started, and the owner already sees 👀 on the message\. tg:200:2305 stays open\./);
     assert.notEqual(createInboundLedger(host.bb.storage.database()).get({ source: "telegram", chatId: "200", messageId: "2305" })?.state, "answered");

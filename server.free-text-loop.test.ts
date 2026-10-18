@@ -155,7 +155,7 @@ test("free-text loop: a turn that sent a typed message gets no reminder for its 
     const tg = connector(host);
     await tg.active();
     await ownerSays(host, "7100", "Status?");
-    await tool(host, "firstmate_reply").execute({ ref: "tg:200:7100", text: "All green." }, capCtx);
+    await tool(host, "firstmate_reply").execute({ noWork: true, ref: "tg:200:7100", text: "All green." }, capCtx);
     tg.freeText("agent:i30", "Replied with the status.");
     await tg.idle();
     await tg.active();
@@ -195,7 +195,7 @@ test("free-text loop: a text read late is not closed by the next turn's typed re
     await tg.active();
     tg.read("agent:delayed-owner");
     await ownerSays(host, "7900", "Status?");
-    await tool(host, "firstmate_reply").execute({ ref: "tg:200:7900", text: "Checking." }, capCtx);
+    await tool(host, "firstmate_reply").execute({ noWork: true, ref: "tg:200:7900", text: "Checking." }, capCtx);
     await tg.idle();
     await tg.active();
     assert.deepEqual(tg.open(), ["agent:delayed-owner"], "turn B's typed reply cannot resolve turn A's text");
