@@ -7551,20 +7551,34 @@ export default async function plugin(bb: BbPluginApi) {
   // GraphQL points left per host, from the X-Ratelimit headers of this plugin's own PR
   // reads: GitHub enforces those, and the rate_limit overview read 1,126 points more.
   const graphqlMeters = new Map<string, { remaining: number; reset: number }>();
+  // Metered requests sent but not answered, per host. A response header counts only the
+  // requests GitHub served before it, so these are still owed when it lands.
+  const graphqlInFlight = new Map<string, number>();
   let quotaWarnedUntil = 0;
   async function ghGraphql(hostId: string, command: string, timeoutMs: number, signal?: AbortSignal, probe = false) {
     // gh's debug output carries whole response bodies; only the rate-limit headers, and the
     // last lines of a failure, come back.
     const wrapped = `t=$(mktemp) || exit 1; GH_DEBUG=api ${command} 2>"$t"; rc=$?; grep -i '^< x-ratelimit-' "$t" >&2; [ "$rc" -eq 0 ] || grep -v '^[<>*]' "$t" | tail -n 5 >&2; rm -f "$t"; exit "$rc"`;
     if (!reserveGithub(hostId, probe)) throw new GithubReservePaused(hostId);
-    const res = await runStructuredOnHost(hostId, wrapped, timeoutMs, signal);
+    graphqlInFlight.set(hostId, (graphqlInFlight.get(hostId) ?? 0) + 1);
+    let res: { exitCode: number; output: string; stderr: string };
+    try { res = await runStructuredOnHost(hostId, wrapped, timeoutMs, signal); }
+    finally { graphqlInFlight.set(hostId, Math.max(0, (graphqlInFlight.get(hostId) ?? 1) - 1)); }
     let remaining: number | undefined, reset: number | undefined, seen = false;
     for (const line of res.stderr.split("\n")) {
       const header = /^<\s*x-ratelimit-(remaining|reset|resource):\s*(\S+)/i.exec(line.trim());
       if (!header) continue;
       if (header[1]!.toLowerCase() === "remaining") remaining = Number(header[2]);
       else if (header[1]!.toLowerCase() === "reset") reset = Number(header[2]) * 1000;
-      else if (header[2]!.toLowerCase() === "graphql" && Number.isFinite(remaining) && Number.isFinite(reset)) { graphqlMeters.set(hostId, { remaining: remaining!, reset: reset! }); seen = true; }
+      else if (header[2]!.toLowerCase() === "graphql" && Number.isFinite(remaining) && Number.isFinite(reset)) {
+        // Requests still in flight are not in this header yet. Within one reset window a
+        // header (which may arrive late) can only lower the meter; a newer reset starts
+        // the next window.
+        const owed = remaining! - (graphqlInFlight.get(hostId) ?? 0);
+        const meter = graphqlMeters.get(hostId);
+        graphqlMeters.set(hostId, { remaining: meter && reset! <= meter.reset ? Math.min(meter.remaining, owed) : owed, reset: Math.max(reset!, meter?.reset ?? 0) });
+        seen = true;
+      }
     }
     if (!seen && res.exitCode !== 0 && /rate.?limit/i.test(res.stderr)) graphqlMeters.set(hostId, { remaining: 0, reset: Date.now() + 60_000 });
     else if (!seen && res.exitCode === 0 && !graphqlMeters.has(hostId)) {
