@@ -227,3 +227,71 @@ test("free-text safety: the captain is told of each free text the connector hold
     await host.harness.lifecycle.dispose();
   }
 });
+
+test("check round 2: a free text is confirmed to the connector only after the captain was told; a failed tell is tried again", async () => {
+  const { host, calls } = await captainHost();
+  try {
+    const due = [{ ref: "agent:i9", text: "Safi is down: Convex disabled the account.", at: 1 }];
+    let acked: string[] = [];
+    host.harness.sdk.stub("plugins.callRpc", async (args: Rpc) => {
+      calls.push(args);
+      if (args.method === "freeText") return { obligations: due.filter((row) => !acked.includes(row.ref)) };
+      if (args.method === "ackFreeText") { acked = [...acked, ...(args.input.refs as string[])]; return { told: (args.input.refs as string[]).length }; }
+      if (args.method === "undelivered") return { undelivered: [] };
+      if (args.method === "replied") return { replied: [] };
+      return { ok: true, queued: 1, duplicate: false, mode: "on" };
+    });
+    await ownerSays(host, "6200", "hi");
+    const sends: string[] = [];
+    let fail = true;
+    host.harness.sdk.stub("threads.send", async (args: { input: Array<{ text: string }> }) => {
+      const line = args.input[0]?.text ?? "";
+      if (fail && line.includes("agent:i9")) throw new Error("BB send failed");
+      sends.push(line);
+      return {};
+    });
+    const idle = () => host.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_cap", status: "idle" }), lastAssistantText: "ok" });
+    await idle();
+    assert.deepEqual(acked, [], "nothing confirmed when the tell failed");
+    fail = false;
+    await idle();
+    assert.ok(sends.some((line) => line.includes("agent:i9")), sends.join("\n"));
+    assert.deepEqual(acked, ["agent:i9"], "confirmed after the tell");
+    await idle();
+    assert.equal(sends.filter((line) => line.includes("agent:i9")).length, 1, "told once");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("check round 2: a reopened owner message stays open though the connector still sees the earlier answer, until a new reply", async () => {
+  const { host, calls } = await captainHost();
+  try {
+    let undelivered = [{ id: "out_1", chatId: "200", messageId: "6300", reason: "Telegram refused the message: Bad Request" }];
+    const ackedUndelivered: string[] = [];
+    host.harness.sdk.stub("plugins.callRpc", async (args: Rpc) => {
+      calls.push(args);
+      if (args.method === "undelivered") return { undelivered: undelivered.filter((row) => !ackedUndelivered.includes(row.id)) };
+      if (args.method === "ackUndelivered") { ackedUndelivered.push(...(args.input.ids as string[])); return { acked: (args.input.ids as string[]).length }; }
+      // An older connector: the first answer was sent, so it says the message was replied to.
+      if (args.method === "replied") return { replied: ["6300"] };
+      if (args.method === "freeText") return { obligations: [] };
+      return { ok: true, queued: 1, duplicate: false, mode: "on" };
+    });
+    await ownerSays(host, "6300", "Status?");
+    await tool(host, "firstmate_reply").execute({ ref: "tg:200:6300", text: "All green." }, capCtx);
+    const ledger = () => createInboundLedger(host.bb.storage.database()).get({ source: "telegram", chatId: "200", messageId: "6300" });
+    const idle = () => host.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_cap", status: "idle" }), lastAssistantText: "ok" });
+    await idle();
+    assert.notEqual(ledger()?.state, "answered", "open again");
+    assert.deepEqual(ackedUndelivered, ["out_1"], "confirmed after the captain was told");
+    await idle();
+    await idle();
+    assert.notEqual(ledger()?.state, "answered", "the earlier answer does not close it again");
+    undelivered = [];
+    await tool(host, "firstmate_reply").execute({ ref: "tg:200:6300", text: "The rest: the logs are clean." }, capCtx);
+    assert.equal(ledger()?.state, "answered", "a new reply closes it");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
