@@ -315,6 +315,8 @@ export function createOwnerAsks(db: Database): OwnerAsks {
         const refused = current.filter(({ id, ask }) => !ask || ask.captain !== captain || (ask.state !== "open" && !already.includes(id))).map(({ id }) => id);
         if (refused.length > 0) return { closed: [], already: [], refused };
         const closed = current.filter(({ id }) => !already.includes(id)).map(({ id }) => id);
+        // A repeat also repairs native work left incomplete by an earlier version or interrupted drain.
+        for (const id of already) db.prepare("UPDATE owner_ask_close SET released=0 WHERE id=?").run(id);
         for (const id of closed) {
           db.prepare("UPDATE owner_ask SET state='cancelled', resolution=?, resolved_at=? WHERE id=?").run(OWNER_CLOSED_RESOLUTION, now, id);
           db.prepare("DELETE FROM owner_ask_defer WHERE id=?").run(id);

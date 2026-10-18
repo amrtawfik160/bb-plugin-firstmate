@@ -57,8 +57,9 @@ async function captainHost(status: Record<string, string> = {}, options: { decis
     const command = byId.get(terminalId) ?? "";
     const crew = /\/native\/state\/([\w-]+)\.status/.exec(command)?.[1];
     const payload = crew !== undefined && status[crew] !== undefined ? status[crew] : "";
-    const code = command.includes("fm-captain-hold.sh") && command.includes("'answer'") && options.nativeAnswer
-      ? options.nativeAnswer() : crew !== undefined && status[crew] === undefined ? 3 : 0;
+    const code = command.includes("fm-captain-hold.sh") && command.includes("'open'") && command.includes("'wait1'") ? 1
+      : command.includes("fm-captain-hold.sh") && command.includes("'answer'") && options.nativeAnswer
+        ? options.nativeAnswer() : crew !== undefined && status[crew] === undefined ? 3 : 0;
     const captured = command.includes("FM_HOST_CAPTURE_V1");
     const out = captured ? JSON.stringify({ protocol: "FM_HOST_CAPTURE_V1", exitCode: code, stdout: payload, stderr: "" }) : payload;
     return { nextSeq: 1, chunks: [{ dataBase64: Buffer.from(`${out}\n__FM_HOST_RC:${captured ? 0 : code}\n`).toString("base64") }] };
@@ -304,6 +305,7 @@ test("closeAsk releases a crew work row held for its sole keyed question", async
     const byId = new Map<string, string>();
     let n = 0;
     const answers: string[] = [];
+    let resolved = false;
     host.harness.sdk.stub("terminals.create", async (args: { start: { command: string } }) => {
       const id = `close-native-${++n}`; byId.set(id, args.start.command); return { id };
     });
@@ -311,7 +313,8 @@ test("closeAsk releases a crew work row held for its sole keyed question", async
       const command = byId.get(terminalId) ?? "";
       const code = (command.includes("'open'") && command.includes("'choice'")) ? 1 : 0;
       if (command.includes("'answer'")) answers.push(command);
-      const payload = command.includes("/native/state/wait1.status") ? "needs-decision [key=choice]: Choose?\n" : "";
+      if (command.includes("resolved [key=choice]: closed by owner, no action")) resolved = true;
+      const payload = command.includes("/native/state/wait1.status") ? `needs-decision [key=choice]: Choose?\n${resolved ? "resolved [key=choice]: closed by owner, no action\n" : ""}` : "";
       const captured = command.includes("FM_HOST_CAPTURE_V1");
       const out = captured ? JSON.stringify({ protocol: "FM_HOST_CAPTURE_V1", exitCode: code, stdout: payload, stderr: "" }) : payload;
       return { nextSeq: 1, chunks: [{ dataBase64: Buffer.from(`${out}\n__FM_HOST_RC:${captured ? 0 : code}\n`).toString("base64") }] };

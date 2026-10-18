@@ -5941,50 +5941,69 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  // Only an exact crew question source can release a native hold. A task can carry several cards.
-  async function releaseClosedAskHold(ask: OwnerAsk): Promise<void> {
+  const closeNativePlanSchema = z.object({
+    keys: z.array(z.string()), holds: z.array(z.string()), shared: z.boolean(), finished: z.boolean(),
+  });
+
+  // Resolve each named question even when another question still owns the shared crew hold.
+  async function releaseClosedAskHold(ask: OwnerAsk): Promise<boolean> {
     const crewId = ask.sourceRef?.startsWith("crew-wait:") ? ask.sourceRef.split(":")[1] : undefined;
-    if (!crewId) return;
+    if (!crewId) return true;
     const crew = await findCrew(crewId);
-    if (crew === undefined || crew.parentThreadId !== ask.captain || isSecondmateRoute(crew)) return;
+    if (crew === undefined || crew.parentThreadId !== ask.captain || isSecondmateRoute(crew)) return true;
     const home = await crewNativeHome(crew);
-    if (home === "") return;
+    if (home === "") return true;
     const hostId = await resolveHostForProject(crew.projectId, ask.captain);
-    const key = `owner-close-holds:${ask.id}`;
-    let targets = await bb.storage.kv.get<Array<{ id: string; statusKey: string | null }>>(key);
-    if (targets === undefined) {
+    const key = `owner-close-native:${ask.id}`;
+    const stored = await bb.storage.kv.get(key);
+    let plan = stored === undefined ? undefined : closeNativePlanSchema.parse(stored);
+    if (plan?.finished) return true;
+    const held = async (id: string): Promise<boolean> => {
+      const open = await runCaptainHold(["open", id], { home, hostId, projectId: crew.projectId });
+      if (open === null || (open.exitCode !== 0 && open.exitCode !== 1)) throw new Error(`Could not read native hold ${id}.`);
+      return open.exitCode === 0;
+    };
+    if (plan === undefined) {
       const { lines, kind } = await crewStatusLines(crew);
-      const openDecisions = foldOpenDecisions(lines, kind);
-      const decisions = openDecisions.filter((d) => ask.sourceRef === `crew-wait:${statusKey(crew.id, d.note)}`);
+      const open = foldOpenDecisions(lines, kind);
+      // Historical questions recover an older Close that saved an empty hold list or already resolved its status.
+      const matching = lines.flatMap((line) => foldOpenDecisions([line], kind))
+        .filter((d) => ask.sourceRef === `crew-wait:${statusKey(crew.id, d.note)}` && !open.some((current) => current.key === d.key && current.note !== d.note));
+      const keys = [...new Set(matching.map((d) => d.key))];
+      const holds: string[] = [];
+      for (const id of keys) if (id !== crew.id && await held(id)) holds.push(id);
       const latest = latestStatus(lines);
-      const candidates = decisions.length > 0
-        ? decisions.map((d) => ({ id: d.key, statusKey: d.key }))
-        : latest !== null && ask.sourceRef === `crew-wait:${statusKey(crew.id, latest.note)}` ? [{ id: crew.id, statusKey: null }] : [];
-      targets = [];
-      for (const candidate of candidates) {
-        const open = await runCaptainHold(["open", candidate.id], { home, hostId, projectId: crew.projectId });
-        if (open === null || (open.exitCode !== 0 && open.exitCode !== 1)) throw new Error(`Could not read native hold ${candidate.id}.`);
-        if (open.exitCode === 0) targets.push(candidate);
-      }
-      // Native may hold the crew's work row itself. Only its sole question can release that shared row.
-      if (targets.length === 0 && decisions.length === 1 && openDecisions.length === 1 && decisions[0]!.key !== crew.id) {
-        const open = await runCaptainHold(["open", crew.id], { home, hostId, projectId: crew.projectId });
-        if (open === null || (open.exitCode !== 0 && open.exitCode !== 1)) throw new Error(`Could not read native hold ${crew.id}.`);
-        if (open.exitCode === 0) targets.push({ id: crew.id, statusKey: decisions[0]!.key });
-      }
-      // Remember exact identities before mutation so a failed release can be retried after status changes.
-      await bb.storage.kv.set(key, targets);
+      const belongs = keys.length > 0 || (latest !== null && ask.sourceRef === `crew-wait:${statusKey(crew.id, latest.note)}`);
+      plan = { keys, holds, shared: belongs && await held(crew.id), finished: false };
+      // Persist both status keys and hold identities before either native mutation.
+      await bb.storage.kv.set(key, plan);
     }
     const resolution = OWNER_CLOSED_RESOLUTION;
     const path = `${home}/state/.bb-close-${createHash("sha256").update(ask.id).digest("hex")}.answer`;
-    if (targets.length > 0 && !(await writeHostFile(hostId, path, resolution))) throw new Error(`Could not write close for ${ask.id}.`);
-    try {
-      for (const target of targets) {
-        requireNativeSuccess(await runCaptainHold(["answer", target.id, "--decision-file", path, "--release"], { home, hostId, projectId: crew.projectId }), "owner close hold");
-        if (target.statusKey !== null && !(await appendResolvedStatus(crew, target.statusKey, resolution))) throw new Error(`Could not resolve crew status for ${ask.id}.`);
+    let staged = false;
+    const release = async (id: string) => {
+      if (!(await held(id))) return;
+      if (!staged) {
+        if (!(await writeHostFile(hostId, path, resolution))) throw new Error(`Could not write close for ${ask.id}.`);
+        staged = true;
       }
+      requireNativeSuccess(await runCaptainHold(["answer", id, "--decision-file", path, "--release"], { home, hostId, projectId: crew.projectId }), "owner close hold");
+    };
+    try {
+      for (const id of plan.holds) await release(id);
+      for (const statusKey of plan.keys) {
+        const { lines, kind } = await crewStatusLines(crew);
+        if (foldOpenDecisions(lines, kind).some((d) => d.key === statusKey) && !(await appendResolvedStatus(crew, statusKey, resolution))) throw new Error(`Could not resolve crew status for ${ask.id}.`);
+      }
+      if (plan.shared) {
+        const { lines, kind } = await crewStatusLines(crew);
+        if (foldOpenDecisions(lines, kind).length > 0) return false;
+        await release(crew.id);
+      }
+      await bb.storage.kv.set(key, { ...plan, finished: true });
+      return true;
     } finally {
-      if (targets.length > 0) await runOnHost(hostId, `rm -f ${shQuote(path)}`, 10_000).catch(() => {});
+      if (staged) await runOnHost(hostId, `rm -f ${shQuote(path)}`, 10_000).catch(() => {});
     }
   }
 
@@ -5993,8 +6012,7 @@ export default async function plugin(bb: BbPluginApi) {
     const next = (closeNoticeChains.get(captainThreadId) ?? Promise.resolve()).then(async () => {
       for (const ask of ownerAsks.unreleasedCloses(captainThreadId)) {
         try {
-          await releaseClosedAskHold(ask);
-          ownerAsks.markClosesReleased([ask.id]);
+          if (await releaseClosedAskHold(ask)) ownerAsks.markClosesReleased([ask.id]);
         } catch (error) { bb.log.warn(`owner ask close hold ${ask.id}: ${String(error)}`); }
       }
       for (const ask of ownerAsks.untoldCloses(captainThreadId)) {
