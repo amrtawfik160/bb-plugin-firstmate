@@ -3,7 +3,8 @@
   "nativeCommits": [
     "2d833ff147cd26a5c461e914e06854e0eb2707ce",
     "1f3e769616fdf9f31f85f4c3e6a9f71606634238",
-    "15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4"
+    "15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4",
+    "8ba34f1da5d19004adc3a7521dc600d1815cf380"
   ],
   "dynamic": {
     "captain": {
@@ -33,11 +34,11 @@
   },
   "captainTransport": {
     "entry-skills/captain/SKILL.md": {
-      "sha256": "24b03eda982f776696944a4001ba062636f011d7bc39f47cb96945245d0c151b",
+      "sha256": "a7890d961a6f1eaf13e1691b9ed1782bbee3d070f1680622b535ca930bd310b7",
       "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner. Merge only through firstmate_merge; crew fix rounds go to crews; standing approvals recorded through firstmate_posture."
     },
     "entry-skills/firstmate/SKILL.md": {
-      "sha256": "f5a9af71ac6bf4eb23fdfce8873ce1d616c78860fe0b96cd7c4216685fbbb4ba",
+      "sha256": "d71f85ed5af7a439f0132670604af0ef90ecf2d8efc95cef11bb5c06f385e396",
       "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner."
     },
     "entry-skills/captain/references/bb.md": {

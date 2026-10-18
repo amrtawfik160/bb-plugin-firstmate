@@ -5,8 +5,8 @@ description: Bind this BB thread to the native Firstmate supervisor contract. Us
 
 <!-- BB-SOURCE
      native: AGENTS.md
-     sha: 15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4
-     snapshot: native-snapshot/15ad1bd6/AGENTS.md
+     sha: 8ba34f1da5d19004adc3a7521dc600d1815cf380
+     snapshot: native-snapshot/8ba34f1d/AGENTS.md
      fidelity: adapted -->
 
 # Captain

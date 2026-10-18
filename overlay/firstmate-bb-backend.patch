@@ -238,10 +238,10 @@ index c6fa78b4..5b841cf3 100644
    esac
  }
 diff --git a/bin/fm-busy-lib.sh b/bin/fm-busy-lib.sh
-index a9c71503..5babc03a 100755
+index a9eb81bf..a9e0a6f3 100755
 --- a/bin/fm-busy-lib.sh
 +++ b/bin/fm-busy-lib.sh
-@@ -47,7 +47,7 @@
+@@ -50,7 +50,7 @@
  #                    unknown invalidation fm-control writes after a Devin interrupt
  #   fm-recovery      a documented recovery reset after relaunch
  # Classifier-only sources (never written into a record):
@@ -250,7 +250,7 @@ index a9c71503..5babc03a 100755
  #   cursor-transcript, missing, malformed, gen-mismatch, source-mismatch,
  #   kimi-unverified, codex-unverified, capture-failed, no-target, launch-prompt
  #
-@@ -1078,6 +1078,18 @@ fm_busy_classify() {  # <backend> <target> <harness> <id> <state-dir> [tail40]
+@@ -1082,6 +1082,18 @@ fm_busy_classify() {  # <backend> <target> <harness> <id> <state-dir> [tail40]
        return 0
        ;;
    esac
@@ -300,7 +300,7 @@ index 4118cc9b..34362b5b 100644
    FM_SM_LIVE_RC=$rc
    if [ "$rc" -eq 0 ]; then
 diff --git a/bin/fm-spawn.sh b/bin/fm-spawn.sh
-index 0a94356c..059753b9 100755
+index 0473c89f..32387b5a 100755
 --- a/bin/fm-spawn.sh
 +++ b/bin/fm-spawn.sh
 @@ -111,11 +111,11 @@
@@ -318,7 +318,7 @@ index 0a94356c..059753b9 100755
  #   codex-app is not a known backend yet; docs/codex-app-backend.md owns that
  #   blocked backend contract. Default tmux spawns do not write backend= to meta;
  #   absent backend= means tmux. cmux does not support --secondmate spawns yet.
-@@ -1358,6 +1358,8 @@ BACKEND=
+@@ -1402,6 +1402,8 @@ BACKEND=
  ORCA_ABORT_CLEANUP=0
  ORCA_WORKTREE_ID=
  ORCA_TERMINAL=
@@ -327,7 +327,7 @@ index 0a94356c..059753b9 100755
  HERDR_PROJECTION_ABORT_CLEANUP=0
  HERDR_PROJECTION_ABORT_SESSION=
  HERDR_PROJECTION_ABORT_TASK_PANE=
-@@ -1476,6 +1478,12 @@ spawn_abort_cleanup() {
+@@ -1523,6 +1525,12 @@ spawn_abort_cleanup() {
      HERDR_PRESENTATION_ORDER_LOCK_HELD=0
      fm_lock_release "$HERDR_PRESENTATION_ORDER_LOCK" || true
    fi
@@ -340,7 +340,7 @@ index 0a94356c..059753b9 100755
    if [ "$ORCA_ABORT_CLEANUP" = 1 ]; then
      ORCA_ABORT_CLEANUP=0
      if [ -n "${ORCA_TERMINAL:-}" ]; then
-@@ -1711,7 +1719,7 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
+@@ -1824,7 +1832,7 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
      pair_args=("${pair%%=*}" "${pair#*=}" "${shared_args[@]+"${shared_args[@]}"}")
      [ "$KIND" != scout ] || pair_args+=(--scout)
      pair_rc=0
@@ -349,7 +349,7 @@ index 0a94356c..059753b9 100755
      if [ "$pair_rc" -eq "$FM_PROJECT_CAPACITY_DEFER_EXIT" ]; then
        echo "batch: DEFERRED ${pair%%=*} (${pair#*=}) - its project is at capacity, so it stays queued" >&2
        [ "$rc" -ne 0 ] || rc=$FM_PROJECT_CAPACITY_DEFER_EXIT
-@@ -1933,6 +1941,9 @@ if [ "$RELAUNCH" -eq 0 ]; then
+@@ -2046,6 +2054,9 @@ if [ "$RELAUNCH" -eq 0 ]; then
        echo "warning: backend=orca resolves config/launch-env-allowlist names from the Orca terminal's own environment, not this home's; set config/launch-env-tmux-session to take them from a scoped tmux session" >&2
      fi
    fi
@@ -359,7 +359,7 @@ index 0a94356c..059753b9 100755
  fi
  SPAWN_TASK_LOCK="$STATE/.spawn-$ID.lock"
  if ! fm_lock_try_acquire "$SPAWN_TASK_LOCK"; then
-@@ -2495,6 +2506,7 @@ launch_template() {
+@@ -2638,6 +2649,7 @@ launch_template() {
    # when a supported effort is requested, since a second --config-override
    # would silently discard the first (confirmed live).
    rovo) printf '%s' 'env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT -u FM_PI_HARNESS __ROVOBIN__ run --yolo __MODELFLAG____ROVOCONFIGOVERRIDE__' ;;
@@ -367,7 +367,7 @@ index 0a94356c..059753b9 100755
    *) return 1 ;;
    esac
  }
-@@ -2684,6 +2696,10 @@ if [ "$KIND" = secondmate ] && [ -z "$ARG3" ]; then
+@@ -2835,6 +2847,10 @@ if [ "$KIND" = secondmate ] && [ -z "$ARG3" ]; then
      fi
    fi
  fi
@@ -378,7 +378,7 @@ index 0a94356c..059753b9 100755
  # Ultra is an explicit native capability, never a Pi thinking-level alias.
  # Validate the fully resolved profile before worktree or endpoint provisioning.
  if [ "$EFFORT" = ultra ]; then
-@@ -3353,13 +3369,13 @@ if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ]; then
+@@ -3524,13 +3540,13 @@ if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ]; then
    SPAWN_PROJECT_CAPACITY_ANY=$FM_PROJECT_CAPACITY_ANY
  fi
  if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ] &&
@@ -394,7 +394,7 @@ index 0a94356c..059753b9 100755
        echo "error: another spawn or cleanup holds the shared project lock for $PROJ_ABS; refusing to race its capacity admission" >&2
      else
        echo "error: another Treehouse slot allocation or return is in progress for $PROJ_ABS; refusing to race it" >&2
-@@ -4277,6 +4293,24 @@ EOF
+@@ -4468,6 +4484,24 @@ EOF
      fi
      T="$ORCA_TERMINAL"
      ;;
@@ -417,9 +417,9 @@ index 0a94356c..059753b9 100755
 +    [ "$KIND" = secondmate ] || validate_spawn_worktree "bb worktree create" "$T"
 +    ;;
    esac
- fi
- if [ "$KIND" = secondmate ]; then
-@@ -4297,6 +4331,7 @@ spawn_send_text_line() { # <target> <text>
+   # Orca and the Herdr projection own their own abort cleanup above; every other
+   # endpoint a fresh polytoken spawn opened is closed by spawn_abort_cleanup when
+@@ -4494,6 +4528,7 @@ spawn_send_text_line() { # <target> <text>
    zellij) fm_backend_zellij_send_text_line "$1" "$2" "$W" ;;
    orca) fm_backend_orca_send_text_line "$1" "$2" ;;
    cmux) fm_backend_cmux_send_text_line "$1" "$2" "$W" ;;
@@ -427,7 +427,7 @@ index 0a94356c..059753b9 100755
    esac
  }
  spawn_current_path() { # <target>
-@@ -4305,6 +4340,7 @@ spawn_current_path() { # <target>
+@@ -4502,6 +4537,7 @@ spawn_current_path() { # <target>
    herdr) fm_backend_herdr_current_path "$1" ;;
    zellij) fm_backend_zellij_current_path "$1" "$W" ;;
    cmux) fm_backend_cmux_current_path "$1" "$W" ;;
@@ -435,7 +435,7 @@ index 0a94356c..059753b9 100755
    esac
  }
  spawn_send_literal() { # <target> <text>
-@@ -4314,6 +4350,7 @@ spawn_send_literal() { # <target> <text>
+@@ -4511,6 +4547,7 @@ spawn_send_literal() { # <target> <text>
    zellij) fm_backend_zellij_send_literal "$1" "$2" "$W" ;;
    orca) fm_backend_orca_send_literal "$1" "$2" ;;
    cmux) fm_backend_cmux_send_literal "$1" "$2" "$W" ;;
@@ -443,7 +443,7 @@ index 0a94356c..059753b9 100755
    esac
  }
  spawn_send_key() { # <target> <key>
-@@ -4323,6 +4360,7 @@ spawn_send_key() { # <target> <key>
+@@ -4520,6 +4557,7 @@ spawn_send_key() { # <target> <key>
    zellij) fm_backend_zellij_send_key "$1" "$2" "$W" ;;
    orca) fm_backend_orca_send_key "$1" "$2" ;;
    cmux) fm_backend_cmux_send_key "$1" "$2" "$W" ;;
@@ -451,7 +451,7 @@ index 0a94356c..059753b9 100755
    esac
  }
  
-@@ -4333,6 +4371,9 @@ spawn_send_key() { # <target> <key>
+@@ -4530,6 +4568,9 @@ spawn_send_key() { # <target> <key>
  # launch boundary and makes a dropped or ignored cwd change a refusal.
  spawn_enter_recorded_worktree() {
    [ "$KIND" = secondmate ] && return 0
@@ -461,7 +461,7 @@ index 0a94356c..059753b9 100755
    spawn_send_text_line "$WT_TARGET" "cd -- $(shell_quote "$WT")" || {
      echo "error: task $ID's endpoint could not be moved into its recorded worktree '$WT'; refusing to launch outside the copy holding its work" >&2
      exit 1
-@@ -4591,6 +4632,10 @@ rovo_endpoint_cleanup() {
+@@ -4788,6 +4829,10 @@ rovo_endpoint_cleanup() {
      fm_backend_kill orca "$T" 2>/dev/null && SPAWN_ENDPOINT_CLOSED=1 || true
      return 0
    fi
@@ -472,7 +472,7 @@ index 0a94356c..059753b9 100755
    local tab_id=
    [ "$BACKEND" = zellij ] && tab_id=$ZELLIJ_TAB_ID
    fm_backend_kill "$BACKEND" "$T" "$tab_id" "fm-$ID" 2>/dev/null && SPAWN_ENDPOINT_CLOSED=1 || true
-@@ -4687,7 +4732,7 @@ elif [ "$RELAUNCH" -eq 1 ]; then
+@@ -4979,7 +5024,7 @@ elif [ "$RELAUNCH" -eq 1 ]; then
      fi
    fi
    [ "$KIND" = secondmate ] || validate_spawn_worktree "relaunch" "$T"
@@ -481,7 +481,7 @@ index 0a94356c..059753b9 100755
    spawn_send_text_line "$WT_TARGET" 'treehouse get'
  
    # Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.
-@@ -5440,6 +5485,7 @@ fi
+@@ -5775,6 +5820,7 @@ fi
  
  META_WINDOW=$T
  [ "$BACKEND" = orca ] && META_WINDOW=$W
@@ -489,16 +489,16 @@ index 0a94356c..059753b9 100755
  SPAWN_GEN="s$(date +%s).${BASHPID:-$$}.$RANDOM"
  SPAWN_META_PATH="$STATE/$ID.meta"
  if [ "$SPAWN_META_LOCK_HELD" != 1 ]; then
-@@ -5457,7 +5503,7 @@ SPAWN_META_PATH=$SPAWN_META_TMP
+@@ -5792,7 +5838,7 @@ SPAWN_META_PATH=$SPAWN_META_TMP
  preserve_relaunch_meta() {
    awk -F= '
      BEGIN {
--      split("window endpoint_task_id worktree project harness kind mode yolo branch tasktmp base_branch upstream_consent forge backup_remote backup_prefix model effort account account_provider busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
-+      split("window endpoint_task_id worktree project harness kind mode yolo branch tasktmp base_branch upstream_consent forge backup_remote backup_prefix model effort account account_provider busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id bb_thread_id home projects control_relaunch_tx", keys, " ")
+-      split("window endpoint_task_id worktree project harness kind mode yolo branch tasktmp base_branch upstream_consent forge backup_remote backup_prefix model effort account account_provider busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx polytoken_session polytoken_port polytoken_credential", keys, " ")
++      split("window endpoint_task_id worktree project harness kind mode yolo branch tasktmp base_branch upstream_consent forge backup_remote backup_prefix model effort account account_provider busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id bb_thread_id home projects control_relaunch_tx polytoken_session polytoken_port polytoken_credential", keys, " ")
        for (i in keys) owned[keys[i]] = 1
      }
      !($1 in owned)
-@@ -5508,6 +5554,9 @@ preserve_relaunch_meta() {
+@@ -5843,6 +5889,9 @@ preserve_relaunch_meta() {
      echo "orca_worktree_id=$ORCA_WORKTREE_ID"
      echo "terminal=$ORCA_TERMINAL"
    fi
@@ -508,7 +508,7 @@ index 0a94356c..059753b9 100755
    if [ "$BACKEND" = cmux ]; then
      echo "cmux_workspace_id=$CMUX_WORKSPACE_ID"
      echo "cmux_surface_id=$CMUX_SURFACE_ID"
-@@ -5611,6 +5660,7 @@ if [ "$SPAWN_TASK_SET_LOCK_HELD" = 1 ]; then
+@@ -5946,6 +5995,7 @@ if [ "$SPAWN_TASK_SET_LOCK_HELD" = 1 ]; then
  fi
  "$SCRIPT_DIR/fm-home-summary-refresh.sh" --best-effort || true
  [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
@@ -516,7 +516,7 @@ index 0a94356c..059753b9 100755
  
  sq_brief=$(shell_quote "$BRIEF")
  sq_turnend=$(shell_quote "$TURNEND")
-@@ -5877,6 +5927,12 @@ spawn_record_traceparent() {
+@@ -6218,6 +6268,12 @@ spawn_record_traceparent() {
  # Export GOTMPDIR into the crewmate's pane shell so the agent and every child
  # process (go build, go test, ...) inherit it. Sent before the launch command so
  # the env is set when the agent starts; the brief sleep lets the export land.
@@ -529,7 +529,7 @@ index 0a94356c..059753b9 100755
  spawn_send_text_line "$T" "export GOTMPDIR=$TASK_TMP/gotmp"
  # Export the compact-adviser kill switch into the pane shell through the same
  # pre-launch channel, so later commands in that shell inherit it too. The launch
-@@ -6041,6 +6097,7 @@ if [ "$ORCA_LAUNCH_ENV_ENABLED" = 1 ]; then
+@@ -6382,6 +6438,7 @@ if [ "$ORCA_LAUNCH_ENV_ENABLED" = 1 ]; then
    spawn_orca_wait_launch_consumed
    trap - HUP INT TERM
  fi
@@ -538,10 +538,10 @@ index 0a94356c..059753b9 100755
    if ! kimi_wait_for_ready; then
      kimi_spawn_fail "$KIMI_READY_FAILURE_DETAIL"
 diff --git a/bin/fm-watch.sh b/bin/fm-watch.sh
-index 1b4c3087..ad4f3619 100755
+index 772199f9..938a387a 100755
 --- a/bin/fm-watch.sh
 +++ b/bin/fm-watch.sh
-@@ -1317,6 +1317,15 @@
+@@ -1329,6 +1329,15 @@ WEDGE_BACKLOG_HOLD_KIND='captain hold'
  wedge_wait_evidence() {  # <task> -> one wait_record on stdout
    local task=$1 last until statusf run
    [ -n "$task" ] || return 1
@@ -557,7 +557,7 @@ index 1b4c3087..ad4f3619 100755
    statusf="$STATE/$task.status"
    last=$(status_declared_wait_line "$statusf")
    if status_is_captain_held "$last"; then
-@@ -2714,6 +2723,11 @@
+@@ -2835,6 +2844,11 @@ rerecord_device_shifted_pr_poll() {  # <id>
    return 0
  }
  
@@ -569,7 +569,7 @@ index 1b4c3087..ad4f3619 100755
  resurface_after_downtime() {
    # Handling successors already have a predecessor-delivered wake on the way.
    # Re-announcing from this cycle is what turned a lost handshake into an
-@@ -2767,7 +2781,10 @@
+@@ -2888,7 +2902,10 @@ while :; do
  
    # Liveness beacon for fm-guard.sh: a fresh mtime here means a watcher is
    # alive. Supervision scripts warn when this goes stale with tasks in flight.
@@ -581,7 +581,7 @@ index 1b4c3087..ad4f3619 100755
  
    # Opt-in fleet activity ledger (docs/fleet-ledger.md): pick up newly appended
    # status lines before this cycle can exit on a wake. Off costs one file test.
-@@ -3102,6 +3119,12 @@
+@@ -3226,6 +3243,12 @@ EOF
    # remembers the hash already classified, or the declaration a busy pane's
    # crossed turn bound already handed to the away-mode daemon).
    while IFS= read -r w; do
@@ -595,7 +595,7 @@ index 1b4c3087..ad4f3619 100755
      task=$(window_to_task "$w" "$STATE")
      # Steering-inbox loss detection runs before the secondmate stale
 diff --git a/docs/configuration.md b/docs/configuration.md
-index a0a2b879..23ffee97 100644
+index 3efe0ffa..19ee9327 100644
 --- a/docs/configuration.md
 +++ b/docs/configuration.md
 @@ -173,6 +173,7 @@ The legacy `state/.afk` daemon flag has no effect on Pi.

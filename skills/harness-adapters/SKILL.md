@@ -3,7 +3,7 @@ name: harness-adapters
 description: >-
   Agent-only reference for firstmate harness operations.
   Use before spawning or recovering a crewmate or secondmate, handling a trust dialog, sending a harness-specific skill invocation, interrupting or exiting an agent, resuming an exited agent, or verifying a new harness adapter.
-  Contains verified facts for bb, claude, codex, opencode, pi, pi-signed, grok, kimi, cursor, gemini, muse, rovo, omp, agy, devin, and commandcode.
+  Contains verified facts for bb, claude, codex, opencode, pi, pi-signed, grok, kimi, cursor, gemini, muse, rovo, omp, agy, devin, commandcode, and polytoken.
 user-invocable: false
 metadata:
   internal: true
@@ -11,8 +11,8 @@ metadata:
 
 <!-- BB-SOURCE
      native: .agents/skills/harness-adapters/SKILL.md
-     sha: 15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4
-     snapshot: native-snapshot/15ad1bd6/.agents/skills/harness-adapters/SKILL.md
+     sha: 8ba34f1da5d19004adc3a7521dc600d1815cf380
+     snapshot: native-snapshot/8ba34f1d/.agents/skills/harness-adapters/SKILL.md
      fidelity: adapted
 -->
 
@@ -42,7 +42,7 @@ For recovery and control, use the exact `harness=` in `state/<id>.meta`; never i
 Deliver lifecycle actions only through `../../../bin/fm-control.sh <task-id> interrupt|exit|relaunch`.
 Never type an interrupt key or exit command through `fm-send`, where routing-marked lifecycle text becomes chat.
 Trust handling is complete only when inspection proves the target started processing its instructions; delivery success alone is not proof.
-Muse, Gemini, AGY, Devin, and Command Code are verified only for crewmate and scout work, never a secondmate or primary.
+Muse, Gemini, AGY, Devin, Command Code, and Polytoken are verified only for crewmate and scout work, never a secondmate or primary.
 
 ## Detection
 
@@ -114,7 +114,8 @@ For the BB runtime, read `references/harness/bb.md`; `firstmate_dispatch` and `f
     "omp": "references/harness/omp.md",
     "agy": "references/harness/agy.md",
     "devin": "references/harness/devin.md",
-    "commandcode": "references/harness/commandcode.md"
+    "commandcode": "references/harness/commandcode.md",
+    "polytoken": "references/harness/polytoken.md"
   }
 }
 ```
