@@ -5367,31 +5367,47 @@ export default async function plugin(bb: BbPluginApi) {
 
   /** A reply the connector accepted and Telegram then refused for good: its owner message is open again. */
   async function reopenUndelivered(captainThreadId: string): Promise<void> {
-    let rows: Array<{ chatId: string; messageId: string; reason: string }>;
+    let rows: Array<{ id?: string; chatId: string; messageId: string; reason: string }>;
     try {
       rows = (await bb.sdk.plugins.callRpc({
         pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "undelivered", input: {},
-        outputSchema: z.object({ undelivered: z.array(z.object({ chatId: z.string(), messageId: z.string(), reason: z.string() })) }),
+        outputSchema: z.object({ undelivered: z.array(z.object({ id: z.string().optional(), chatId: z.string(), messageId: z.string(), reason: z.string() })) }),
       })).undelivered;
     } catch (error) {
       if (isTelegramRpcMissing(error)) return;
       throw error;
     }
-    const reopened = rows.flatMap((row) => {
+    const lines = new Map<string, string>();
+    const ids: string[] = [];
+    for (const row of rows) {
       const key = { source: "telegram" as const, chatId: row.chatId, messageId: row.messageId };
       const found = inboundLedger.get(key);
-      if (found?.captainThreadId !== captainThreadId) return [];
+      if (found?.captainThreadId !== captainThreadId) continue;
+      if (row.id) ids.push(row.id);
+      if (lines.has(`${row.chatId}:${row.messageId}`)) continue;
       inboundLedger.reopen(key, Date.now());
-      return [`- tg:${row.chatId}:${row.messageId}: ${row.reason}`];
-    });
-    if (reopened.length === 0) return;
+      lines.set(`${row.chatId}:${row.messageId}`, `- tg:${row.chatId}:${row.messageId}: ${row.reason}`);
+    }
+    if (lines.size === 0) return;
     await bb.sdk.threads.send({
       threadId: captainThreadId, mode: "steer",
-      input: [{ type: "text", text: [`Not delivered to the owner: Telegram refused your reply for good. Each owner message is open again; answer it with firstmate_reply.`, ...reopened].join("\n"), mentions: [], visibility: "agent-only" }],
+      input: [{ type: "text", text: [`Not delivered to the owner: Telegram refused your reply for good. Each owner message is open again; answer it with firstmate_reply.`, ...lines.values()].join("\n"), mentions: [], visibility: "agent-only" }],
     });
+    // Confirmed only once the captain was told: a failed send leaves the rows due for the next drain.
+    if (ids.length > 0) await confirmToConnector("ackUndelivered", { ids });
   }
 
-  /** The connector's free-text obligations: the captain is told of each once, by its ref. */
+  /** Confirms to the connector what the captain was told. An older connector has no such method: nothing to confirm. */
+  async function confirmToConnector(method: "ackFreeText" | "ackUndelivered", input: { refs: string[] } | { ids: string[] }): Promise<void> {
+    try {
+      await bb.sdk.plugins.callRpc({ pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method, input, outputSchema: z.object({}).passthrough() });
+    } catch (error) {
+      if (isTelegramRpcMissing(error)) return;
+      throw error;
+    }
+  }
+
+  /** The connector's free-text obligations: the captain is told of each once, by its ref, and the connector is told after. */
   async function tellFreeText(captainThreadId: string): Promise<void> {
     let rows: Array<{ ref: string; text: string; at: number }>;
     try {
@@ -5412,6 +5428,8 @@ export default async function plugin(bb: BbPluginApi) {
         ...lines,
       ].join("\n"), mentions: [], visibility: "agent-only" }],
     });
+    // Confirmed only once the captain was told: a failed send leaves them due for the next drain.
+    await confirmToConnector("ackFreeText", { refs: rows.map((row) => row.ref) });
   }
 
   async function drainCaptainReliability(captainThreadId: string, signal?: AbortSignal): Promise<void> {
@@ -5429,7 +5447,8 @@ export default async function plugin(bb: BbPluginApi) {
     if (flags.inboundLedger === "on") {
       if (flags.telegramThreading === "on") {
         try {
-          const replied = await connectorReplied({ open: inboundLedger.listOpen(captainThreadId), callRpc: (args) => bb.sdk.plugins.callRpc(args) });
+          // A reopened row is closed by a new reply only, never by the earlier answer the connector sent.
+          const replied = await connectorReplied({ open: inboundLedger.listOpen(captainThreadId).filter((row) => !row.reopenedAt), callRpc: (args) => bb.sdk.plugins.callRpc(args) });
           for (const key of replied) inboundLedger.markAnswered({ source: "telegram", ...key }, Date.now());
         } catch (error) {
           bb.log.warn(`telegram replied check: ${String(error)}`);

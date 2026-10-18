@@ -39,6 +39,11 @@ export type InboundRow = InboundKey & {
   handedBackAt?: number | null;
   /** The ref of the reply that also answered this message, when firstmate_reply covers it. */
   coveredBy?: string | null;
+  /**
+   * When Telegram refused its reply for good and the row was opened again. Only a new reply closes it: the
+   * connector still sees the earlier answer it sent, so its replied check does not.
+   */
+  reopenedAt?: number | null;
   sourceRefs: string[];
   mediaGroupId: string | null;
   senderId: string | null;
@@ -389,7 +394,7 @@ export function createInboundLedger(db: Database): CreateInboundLedger {
         const current = get(key);
         if (!current || current.state !== "answered") return current;
         db.prepare("DELETE FROM inbound_outbox WHERE source=? AND chat_id=? AND message_id=? AND kind <> 'ack'").run(key.source, key.chatId, key.messageId);
-        return save({ ...current, state: "acked", answeredAt: null, ackedAt: current.ackedAt ?? at, coveredBy: undefined, remindedAt: null, remindedKind: null });
+        return save({ ...current, state: "acked", answeredAt: null, ackedAt: current.ackedAt ?? at, coveredBy: undefined, remindedAt: null, remindedKind: null, reopenedAt: at });
       })();
     },
     markAnswered(key, at) {
