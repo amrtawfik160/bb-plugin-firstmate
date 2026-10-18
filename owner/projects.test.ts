@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { hostCanDrive, PROJECTS, projectBriefLines, projectForName, projectForRepo, repoOf, surfaceRefusal, unlistedRefusal } from "./projects.ts";
+import { hostCanDrive, PROJECTS, projectBriefLines, projectForName, projectForRepo, repoOf, surfaceRefusal, unlistedNote } from "./projects.ts";
 
 test("a PR's repository names its project, without case", () => {
   assert.equal(projectForRepo("AmrTawfik160/dr.woo")?.name, "Dr Woo");
@@ -42,7 +42,8 @@ test("a Dr Woo brief tells the crew the owner proves the iPhone build and the re
 });
 
 // Checker FF2-verdict-1, #144 finding 3: hazw80801/runants had open production PRs and no rule.
-test("every production repo of the live captain has a rule, and an unlisted repo is refused at a production merge", () => {
+test("runants has a web rule; an unlisted repo gets a note naming the missing rule, never an inferred surface", () => {
   assert.equal(projectForRepo("HazW80801/runants")?.proofSurface, "web");
-  assert.match(unlistedRefusal("someone/unlisted"), /no project in owner\/projects\.json lists someone\/unlisted, so its proof surface is unknown/);
+  assert.equal(projectForRepo("amrtawfik160/framed"), undefined);
+  assert.equal(unlistedNote("amrtawfik160/framed"), "no proof rule for amrtawfik160/framed: add one in owner/projects.json");
 });

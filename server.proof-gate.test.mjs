@@ -23,8 +23,10 @@ const CREWS=[
  crewRow('cyn1','thr_cyn',{title:'Fix the Gmail trigger',providerId:'claude-code',model:'claude-opus-5-5'}),
  crewRow('safi1','thr_safi',{title:'Ship build 21',providerId:'claude-code',model:'claude-opus-5-5'}),
  crewRow('chk1','thr_chk',{title:'Check the PR',providerId:'codex',model:'gpt-6-astra',role:'checker'}),
+ crewRow('frm1','thr_frm',{title:'Fix the frame export',providerId:'claude-code',model:'claude-opus-5-5'}),
 ];
-const PRS=[[WOO,130,'woo1','thr_woo'],[CYN,2523,'cyn1','thr_cyn'],[SAFI,77,'safi1','thr_safi']];
+const FRAMED='amrtawfik160/framed';
+const PRS=[[WOO,130,'woo1','thr_woo'],[CYN,2523,'cyn1','thr_cyn'],[SAFI,77,'safi1','thr_safi'],[FRAMED,5,'frm1','thr_frm']];
 const repoOfNumber=n=>PRS.find(p=>p[1]===n)[0];
 
 function hostCommands(host) {
@@ -204,4 +206,40 @@ test('a second build at the same head opens its own card and replaces the first;
   await tap(nine,'Works');
   assert.equal(store.get(key(WOO,130)).verification.build,'9');
  }finally{await host.harness.lifecycle.dispose();}
+});
+
+// Checker round 2: Telegram may record the tap after Firstmate first asks. The card's binding is kept, and
+// Firstmate reads the connector again, until the proof is recorded or the card closes.
+test('a Works tap that Telegram records late still becomes the proof',async()=>{
+ process.env.FM_PROOF_RECHECK_MS='20,20,20';
+ const {host,store,rpc}=await deck();try {
+  const asked=text(await deliveries(host,{action:'device-proof',id:key(WOO,130),commitSha:head(130).slice(0,7),build:'8',link:'https://testflight.apple.com/join/abc',check:'Send a photo'},'thr_woo'));
+  const askId=/card (a[0-9a-z]{6})/.exec(asked)[1];
+  let reads=0;
+  host.harness.sdk.stub('plugins.callRpc',async(call)=>{rpc.push(call);if(call.method==='ownerAnswer')return{answer:++reads>=2?'Works':null};return{ok:true,queued:1,duplicate:false};});
+  await host.harness.behavior.callRpc('resolveAsk',{threadId:'thr_cap',id:askId,resolution:'Works'});
+  assert.equal(store.get(key(WOO,130)).verifiedCommitSha,null,'not recorded yet at the first read');
+  for(let i=0;i<50&&store.get(key(WOO,130)).verifiedCommitSha===null;i++) await new Promise(r=>setTimeout(r,20));
+  assert.equal(store.get(key(WOO,130)).verification?.build,'8');
+ }finally{delete process.env.FM_PROOF_RECHECK_MS;await host.harness.lifecycle.dispose();}
+});
+
+
+// Checker repo scan (18 Oct): 81 production PRs in 12 repos have no project rule. They keep the merge rules from
+// before this build (a verification record at the head, the checker), and the preview names the missing rule.
+// Only listed projects get the strict surface gate; no surface is ever inferred.
+test('a production PR of a repo with no project rule keeps the old rules, and the preview names the missing rule',async()=>{
+ const {host,store,commands}=await deck();try {
+  store.verify(key(FRAMED,5),'thr_cap',head(5).slice(0,7),{driven:'exported a frame',seen:'the PNG opened'});
+  text(await check(host,FRAMED,5));
+  const preview=text(await tool(host,'firstmate_merge').execute({crewId:'frm1',pr:5},ctx));
+  assert.match(preview,/^Proof rule: no proof rule for amrtawfik160\/framed: add one in owner\/projects\.json$/m);
+  assert.match(text(await merge(host,'frm1',5)),/^Merged #5 Change 5\n/);
+  assert.equal(merges(commands).length,1);
+ }finally{await host.harness.lifecycle.dispose();}
+ const strict=await deck();try {
+  strict.store.verify(key(WOO,130),'thr_cap',head(130).slice(0,7),{driven:'read the code',seen:'looks right'});
+  text(await check(strict.host,WOO,130));
+  assert.match(text(await merge(strict.host,'woo1',130)),/^Refusing: #130's verification record was made by the captain, not by a crew/,'a listed project keeps the strict gate');
+ }finally{await strict.host.harness.lifecycle.dispose();}
 });
