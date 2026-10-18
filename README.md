@@ -270,9 +270,10 @@ With `tellOwner=real`, Firstmate uses the upstream inbox writer. The crew's wake
 carries the message text itself, so the crew runs no inbox read and no
 acknowledgement for it. Firstmate keeps the native record and files it under
 `handled/` once the wake is in a crew turn: at once for a delivered steer, and
-when BB dispatches a queued wake. A queued wake carries every text still
+for a queued wake once a crew turn request carries it. A queued wake that is
+removed without reaching the crew leaves its record unread. A queued wake carries every text still
 waiting, so one wake replaces the earlier ones. A text over 12,000 characters
-falls back to the inbox pointer, and then only the worker's move into
+falls back to the inbox pointer (replacing a queued inline wake), and then only the worker's move into
 `handled/` acknowledges it. Unread records are never pruned. Notification
 failures retain the record and retry; failed writes do not fall back to a
 second message transport. `queue=true` defers the notification and disables
@@ -281,7 +282,8 @@ native re-rings for that record; ordinary tells retain native recovery behavior.
 ## Waiting crews and BB's completion pings
 
 BB pings the captain at the end of every crew turn. A ping for crews that only
-reported `WAITING:` is dropped before it wakes the captain, and recorded in the
+reported `WAITING:` is dropped before it wakes the captain when BB queued it after
+that WAITING turn ended and no later turn of the crew has ended. It is recorded in the
 plugin log and in `waiting-pings-dropped`; Firstmate resumes those crews itself.
 BB 0.46.1 lets a plugin see such a ping only when BB queued it (behind a pending
 question, or with the host offline). BB 0.46.2 adds per-crew
@@ -336,8 +338,10 @@ does not stop Firstmate.
 Firstmate checks a thread when its turn ends, and sweeps idle captains every 30
 minutes. The minimum interval between attempts is 20 minutes per thread. An
 unchanged reading cannot trigger another attempt after that interval or a
-plugin reload. A measured reading below 90% of the window clears the stored
-reading, so later growth can qualify again. Concurrent checks share one
+plugin reload. Only a measured reading below the trigger clears the stored
+reading, so later growth can qualify again. Compaction also waits while input
+waits for the thread: a queued message, an open question, or, for a captain, an
+owner message not answered yet. Concurrent checks share one
 attempt, and thread status is checked again before compaction. Manual
 compaction and the provider's own compaction remain available.
 

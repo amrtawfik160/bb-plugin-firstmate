@@ -157,7 +157,11 @@ function crewWaitingTurns(events: Event[], cuts: Cuts): number {
   return turns;
 }
 
-/** Tokens the captain rereads in a day: every model call rereads the whole context, which grows ~4.2k tokens per turn. */
+/**
+ * Tokens the captain rereads in a day: every model call rereads the whole context, which grows ~4.2k tokens per turn.
+ * The model assumes each compaction shrinks the context to 65k. A compaction that does not shrink it is not retried
+ * (check 158/1), so a failed compaction leaves the old reread cost, not a loop.
+ */
 function captainContextTokens(turns: number, budget: number, ratio: number, before: boolean): { compactions: number; tokens: number } {
   let context = 63_000, compactions = 0, tokens = 0, lastAt: number | null = null;
   for (let turn = 0; turn < turns; turn++) {

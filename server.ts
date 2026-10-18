@@ -1221,6 +1221,11 @@ export function wakeAckFromOutput(out: string): { ackThrough: number; recoveryGe
  * threshold only wins when it is lower. Estimated readings count; the caller never retries an
  * unchanged reading and waits `cooldownMs` between compactions.
  */
+/** The token count at which an idle thread compacts: the token setting, or the window share when that comes first. */
+export function compactTrigger(budget: number, ratio: number, modelContextWindow: number): number {
+  return Math.min(budget, modelContextWindow * ratio);
+}
+
 export function captainCompactDue(input: {
   usedTokens: number | null;
   modelContextWindow: number | null;
@@ -1236,7 +1241,7 @@ export function captainCompactDue(input: {
   if (!Number.isFinite(input.ratio) || !(input.ratio > 0) || input.ratio > 1) return false;
   const { usedTokens, modelContextWindow } = input;
   if (usedTokens === null || modelContextWindow === null || !Number.isFinite(usedTokens) || !Number.isFinite(modelContextWindow)) return false;
-  const trigger = Math.min(input.budget, modelContextWindow * input.ratio);
+  const trigger = compactTrigger(input.budget, input.ratio, modelContextWindow);
   if (modelContextWindow <= 0 || usedTokens > modelContextWindow || usedTokens < trigger) return false;
   const provider = input.providerThreshold;
   if (provider !== null && Number.isFinite(provider) && provider > 0 && provider <= trigger) return false;
@@ -6656,7 +6661,7 @@ export default async function plugin(bb: BbPluginApi) {
     doorbell: string; queueIds: string[]; records: string[]; retry: boolean;
     // Record texts, so a queued wake can carry every pending one; and the records whose text the last
     // sent wake carried, which Firstmate files as handled once that wake left the queue.
-    bodies?: Record<string, string>; inlined?: string[];
+    bodies?: Record<string, string>; inlined?: string[]; inlineChecks?: number;
     // Set when the delivery can never land; the sweep skips it from then on.
     closed?: string;
   };
@@ -6681,6 +6686,19 @@ export default async function plugin(bb: BbPluginApi) {
     return rows.filter(row => delivery.queueIds.includes(row.id)
       && row.content.length === 1 && row.content[0]?.type === "text"
       && (row.content[0].text === delivery.doorbell || row.content[0].text.startsWith(INBOX_WAKE_PREFIX)));
+  }
+
+  const INLINE_PROOF_CHECKS = 10;
+  /** A recent turn request of the crew thread carries this delivery's exact wake text. An unreadable log is no proof. */
+  async function crewTurnTookWake(delivery: InboxDelivery, signal?: AbortSignal): Promise<boolean> {
+    try {
+      const rows = await raceAbort(bb.sdk.threads.events.list({ threadId: delivery.threadId, types: ["client/turn/requested"], order: "desc", limit: "50" }), signal, STUCK_HOST_CALL_MS);
+      const needle = JSON.stringify(delivery.doorbell);
+      return (rows as unknown[]).some((row) => asRecord(row)["type"] === "client/turn/requested" && JSON.stringify(asRecord(row)["data"] ?? null).includes(needle));
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      return false;
+    }
   }
 
   /**
@@ -6715,10 +6733,17 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function reconcileOpenInboxDelivery(key: string, delivery: InboxDelivery, signal?: AbortSignal): Promise<void> {
     let rows = await inboxQueueRows(delivery, signal);
-    // A queued wake that carried the text has left the queue: BB delivered it into a crew turn.
+    // A queued wake that carried the text has left the queue. Leaving it proves nothing (a person may have removed
+    // it): the record is filed only once a crew turn request carries that exact wake. Without that proof it stays
+    // unread; after INLINE_PROOF_CHECKS sweeps Firstmate stops looking and logs it.
     if (rows.length === 0 && !delivery.retry && (delivery.inlined ?? []).length > 0) {
-      const filed = await fileInlinedRecords(delivery, delivery.inlined!, signal);
-      delivery.inlined = (delivery.inlined ?? []).filter((id) => !filed.includes(id));
+      if (await crewTurnTookWake(delivery, signal)) {
+        const filed = await fileInlinedRecords(delivery, delivery.inlined!, signal);
+        delivery.inlined = (delivery.inlined ?? []).filter((id) => !filed.includes(id));
+      } else if ((delivery.inlineChecks = (delivery.inlineChecks ?? 0) + 1) >= INLINE_PROOF_CHECKS) {
+        bb.log.warn(`inbox wake for crew ${delivery.crewId} left the queue with no crew turn taking it; record(s) ${(delivery.inlined ?? []).join(", ")} stay unread in ${delivery.home}/state/${delivery.crewId}.inbox`);
+        delivery.inlined = [];
+      }
       await bb.storage.kv.set(key, delivery);
       rows = await inboxQueueRows(delivery, signal);
     }
@@ -6788,7 +6813,8 @@ export default async function plugin(bb: BbPluginApi) {
       await bb.storage.kv.set(key, delivery);
       const wasActive = queue ? false : await crewInTurn(crew);
       try {
-        if (inline === null && queue && superseded.length > 0) {
+        // A queued pointer already makes the crew read every pending record. An inline wake does not: it is replaced below.
+        if (inline === null && queue && superseded.length > 0 && superseded.every((row) => row.content[0]?.type === "text" && !row.content[0].text.startsWith(INBOX_WAKE_PREFIX))) {
           delivery.retry = false;
           await bb.storage.kv.set(key, delivery);
           return `Queued for crew ${crew.id} (native inbox; existing notification covers this record)`;
@@ -15068,21 +15094,30 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /**
-   * BB's completion ping for crews that are all recorded as WAITING (handleWaitingYield, from the crew contract's
-   * outcome line) is dropped before it wakes the captain: Firstmate already resumes those crews itself. Only BB's
-   * template header is read, and only a queued ping reaches this hook (BB 0.46.1 delivers one to an idle or running
-   * captain directly). Each drop is logged and kept in `waiting-pings-dropped`; the rejected row is then removed.
+   * BB's completion ping is dropped before it wakes the captain when it reports only crew turns that ended with the
+   * crew contract's WAITING outcome: Firstmate resumes those crews itself. The ping is tied to that turn by time:
+   * BB queued it at or after the WAITING turn ended, and no later turn of the crew has ended since (its marker is
+   * still there). A ping with no queue time, or queued before that turn ended, is delivered. Only BB's template
+   * header is read, and only a queued ping reaches this hook (BB 0.46.1 delivers one to an idle or running captain
+   * directly). Each drop is logged and kept in `waiting-pings-dropped`; the rejected row is then removed.
    */
   const WAITING_PINGS_DROPPED_KEY = "waiting-pings-dropped";
-  async function dropWaitingPing(captainThreadId: string, text: string): Promise<{ action: "reject"; message: string } | null> {
+  const WAITING_TURN_PREFIX = "crew-waiting-turn:";
+  /** Records when a crew turn ended with WAITING, for either transport; any other turn end clears it. */
+  async function noteCrewTurnEnd(crew: Crew, lastAssistantText: string | null): Promise<void> {
+    if (isWaitingYield(lastAssistantText)) await bb.storage.kv.set(`${WAITING_TURN_PREFIX}${crew.threadId}`, { since: Date.now() });
+    else await bb.storage.kv.delete(`${WAITING_TURN_PREFIX}${crew.threadId}`);
+  }
+  async function dropWaitingPing(captainThreadId: string, text: string, queuedAt: unknown): Promise<{ action: "reject"; message: string } | null> {
+    if (typeof queuedAt !== "number" || !Number.isFinite(queuedAt)) return null;
     const ping = bbChildPingCrews(text);
     if (ping === null || !ping.allCompleted) return null;
     const crews = await readCrews();
-    const waiting = await readWaiting();
     const named: Crew[] = [];
     for (const threadId of ping.threadIds) {
       const crew = crews.find((c) => c.threadId === threadId && c.parentThreadId === captainThreadId);
-      if (crew === undefined || !(await isCrewWaiting(crew, waiting))) return null;
+      const marker = asRecord(await bb.storage.kv.get<unknown>(`${WAITING_TURN_PREFIX}${threadId}`));
+      if (crew === undefined || typeof marker["since"] !== "number" || queuedAt < marker["since"]) return null;
       named.push(crew);
     }
     const ids = named.map((c) => c.id);
@@ -15126,8 +15161,8 @@ export default async function plugin(bb: BbPluginApi) {
           }
           return { action: "proceed" };
         }
-        if (String(context.initiator) === "system" && (context.queuedMessages ?? []).length <= 1) {
-          const dropped = await dropWaitingPing(threadId, context.input.text);
+        if (String(context.initiator) === "system" && (context.queuedMessages ?? []).length === 1) {
+          const dropped = await dropWaitingPing(threadId, context.input.text, asRecord(context.queuedMessages![0])["createdAt"]);
           if (dropped) return dropped;
         }
         const sender = typeof context.senderThreadId === "string" && context.senderThreadId !== "mixed" ? context.senderThreadId : null;
@@ -15302,7 +15337,8 @@ export default async function plugin(bb: BbPluginApi) {
     const { usedTokens, modelContextWindow, estimated } = usage;
     const nativeThreshold = usage.snapshot?.autoCompactAtTokens;
     const evidenceKey = `thread-compaction-evidence:${threadId}`;
-    if (estimated === false && Number.isFinite(usedTokens) && usedTokens >= 0 && Number.isFinite(modelContextWindow) && modelContextWindow > 0 && usedTokens < modelContextWindow * 0.9) {
+    // Only a measured reading below the trigger proves the context shrank; growth past it again may then qualify.
+    if (estimated === false && Number.isFinite(usedTokens) && usedTokens >= 0 && Number.isFinite(modelContextWindow) && modelContextWindow > 0 && usedTokens < compactTrigger(budget, ratio, modelContextWindow)) {
       await bb.storage.kv.delete(evidenceKey);
     }
     const now = Date.now();
@@ -15312,6 +15348,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (await bb.storage.kv.get(evidenceKey) === evidence) return;
     const thread = await raceAbort(bb.sdk.threads.get({ threadId }), signal, STUCK_HOST_CALL_MS);
     if (thread.status !== "idle" || thread.archivedAt != null) return;
+    if (await inputWaits(threadId, signal)) return;
     // Persist the attempted reading before calling the provider so a reload or
     // unchanged failed attempt cannot compact the same context again.
     await bb.storage.kv.set(evidenceKey, evidence);
@@ -15323,6 +15360,24 @@ export default async function plugin(bb: BbPluginApi) {
       if (isAbortError(error)) throw error;
       bb.log.warn(`thread ${threadId} compaction failed at ${usedTokens} tokens: ${error instanceof Error ? error.message : String(error)}`);
     }
+  }
+
+  /**
+   * Owner or crew input waits for this thread: a queued message, an open question, or (for a captain) an owner
+   * message not answered yet. Compaction waits until it is handled, so the answer is written with the full context.
+   * An unreadable queue or question list counts as waiting.
+   */
+  async function inputWaits(threadId: string, signal?: AbortSignal): Promise<boolean> {
+    try {
+      const queued = await raceAbort(bb.sdk.threads.queuedMessages.list({ threadId }), signal, STUCK_HOST_CALL_MS);
+      if (queued.some((row) => !(typeof row.failureReason === "string" && row.failureReason !== ""))) return true;
+      const interactions = await raceAbort(bb.sdk.threads.interactions.list({ threadId }), signal, STUCK_HOST_CALL_MS);
+      if ((interactions as unknown[]).some((row) => { const status = asRecord(row)["status"]; return status === undefined || status === "pending"; })) return true;
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      return true;
+    }
+    return knownCaptains.has(threadId) && inboundLedger.listOpen(threadId).length > 0;
   }
 
   async function maybeCompactCaptain(threadId: string, signal?: AbortSignal): Promise<void> {
@@ -15376,6 +15431,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (verdictOf(parseOutcome(lastAssistantText)) !== "DONE") {
       await maybeCompactCrew(thread.id).catch((error) => bb.log.warn(`crew compaction check failed ${thread.id}: ${String(error)}`));
     }
+    await noteCrewTurnEnd(crew, lastAssistantText);
     liveTerminalHandled.add(thread.id);
     await handleCrewIdle(crew, thread, lastAssistantText);
     if (crew.parentThreadId) await drainQueuedDispatches(crew.parentThreadId).catch((error) => bb.log.warn(`queued dispatch drain: ${String(error)}`));
@@ -15383,6 +15439,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.events.on("thread.failed", async ({ thread, error }) => {
     const crew = await findCrewByThread(thread.id);
     if (crew === undefined || isSecondmateRoute(crew)) return;
+    await noteCrewTurnEnd(crew, null);
     liveTerminalHandled.add(thread.id);
     if (await restartUnexpectedExit(crew, error).catch((failure) => { bb.log.warn(`crew ${crew.id} restart: ${String(failure)}`); return false; })) { inboundLedger.crewEnded(crew.id, Date.now()); return; }
     await handleCrewFailed(crew, error);

@@ -9064,6 +9064,8 @@ function stubCompactionHost(host: Awaited<ReturnType<typeof load>>) {
   host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_cap", status: "idle" }));
   host.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 910000, modelContextWindow: 1000000, estimated: false } }));
   host.harness.sdk.stub("threads.compact", async () => ({ ok: true }));
+  host.harness.sdk.stub("threads.queuedMessages.list", async () => []);
+  host.harness.sdk.stub("threads.interactions.list", async () => []);
   return () => host.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_cap", status: "idle" }), lastAssistantText: "" } as never);
 }
 
@@ -9158,6 +9160,8 @@ test("an idle captain compacts at 200k and an idle crew at 250k by default", asy
     fresh.harness.sdk.stub("threads.get", async ({ threadId }) => makeThreadResponse({ id: threadId, status: "idle" }));
     fresh.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: used, estimated: false, modelContextWindow: 1_000_000 } }));
     fresh.harness.sdk.stub("threads.compact", async () => ({ ok: true }));
+    fresh.harness.sdk.stub("threads.queuedMessages.list", async () => []);
+    fresh.harness.sdk.stub("threads.interactions.list", async () => []);
     const idle = (id: string) => fresh.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id, status: "idle" }), lastAssistantText: "" } as never);
     await fresh.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew", "thr_cap")]);
     await idle("thr_cap");
@@ -9180,6 +9184,8 @@ test("an idle captain past its context budget is compacted once; a crew compacts
     fresh.harness.sdk.stub("threads.get", async ({ threadId }) => makeThreadResponse({ id: threadId, status: "idle" }));
     fresh.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 910_862, estimated: false, modelContextWindow: 1_000_000 } }));
     fresh.harness.sdk.stub("threads.compact", async () => ({ ok: true }));
+    fresh.harness.sdk.stub("threads.queuedMessages.list", async () => []);
+    fresh.harness.sdk.stub("threads.interactions.list", async () => []);
     const idle = (id: string) => fresh.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id, status: "idle" }), lastAssistantText: "" } as never);
     await idle("thr_cap");
     await idle("thr_cap");
@@ -9285,6 +9291,8 @@ for (const operation of ["context", "compact"] as const) {
     const started = new Promise<void>(resolve => { entered = resolve; });
     try {
       host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_cap", status: "idle" }));
+      host.harness.sdk.stub("threads.queuedMessages.list", async () => []);
+      host.harness.sdk.stub("threads.interactions.list", async () => []);
       host.harness.sdk.stub("threads.context", async () => {
         if (operation === "context") { entered(); await blocked; }
         return { usage: { usedTokens: 910000, estimated: false, modelContextWindow: 1000000 } };
@@ -9493,7 +9501,7 @@ test("a queued BB completion ping from a crew recorded as WAITING is dropped bef
     liveCrewQueue(host);
     await emitIdle(host, "WAITING: CI on #1850");
     const hook = host.harness.inspection.registrations.hooks["message.dispatch"]!;
-    const ping = (text: string, queuedMessages: unknown[] = [{}]) => hook({
+    const ping = (text: string, queuedMessages: unknown[] = [{ createdAt: Date.now() }]) => hook({
       thread: makeThreadResponse({ id: "thr_cap", status: "idle" }),
       attempt: "start-turn", initiator: "system", senderThreadId: null, queuedMessages,
       input: { blocks: [], text },
@@ -9502,7 +9510,8 @@ test("a queued BB completion ping from a crew recorded as WAITING is dropped bef
     assert.equal(waiting.action, "reject", "a waiting report does not wake the captain");
     const dropped = await host.bb.storage.kv.get<Array<{ captain: string; crews: string[] }>>("waiting-pings-dropped");
     assert.deepEqual(dropped?.map((row) => [row.captain, row.crews]), [["thr_cap", ["c1"]]]);
-    assert.equal((await ping("[bb system]\n\n@thread:thr_crew completed:\n\nWAITING: CI on #1850", [{}, {}])).action, "proceed", "grouped with other input, the ping is kept");
+    assert.equal((await ping("[bb system]\n\n@thread:thr_crew completed:\n\nWAITING: CI on #1850", [{ createdAt: Date.now() }, { createdAt: Date.now() }])).action, "proceed", "grouped with other input, the ping is kept");
+    assert.equal((await ping("[bb system]\n\n@thread:thr_crew completed:\n\nWAITING: CI on #1850", [{}])).action, "proceed", "a ping with no queue time cannot be tied to the WAITING turn");
     assert.equal((await ping("[bb system]\n\n@thread:thr_crew failed.\n\nInspect it.")).action, "proceed", "a failure always wakes the captain");
     await emitIdle(host, "DONE: #1850 green and merged");
     assert.equal((await ping("[bb system]\n\n@thread:thr_crew completed:\n\nDONE: #1850 green and merged")).action, "proceed", "a finished crew's ping wakes the captain");
@@ -9674,6 +9683,8 @@ test("an already-idle captain past the budget is compacted by the sweep, without
     fresh.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_cap", status: "idle" }));
     fresh.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 958_171, estimated: false, modelContextWindow: 1_000_000 } }));
     fresh.harness.sdk.stub("threads.compact", async () => ({ ok: true }));
+    fresh.harness.sdk.stub("threads.queuedMessages.list", async () => []);
+    fresh.harness.sdk.stub("threads.interactions.list", async () => []);
     const run = fresh.harness.behavior.runService("captain-wake-release");
     const deadline = Date.now() + 3000;
     while (Date.now() < deadline && fresh.harness.sdk.callsTo("threads.compact").length === 0) await new Promise((r) => setTimeout(r, 10));
@@ -11327,11 +11338,13 @@ test("IT inbox parity: one queued doorbell, worker ack removes it across reload"
     const dir = join(home, "state/c1.inbox");
     assert.match(readFileSync(join(dir, "001.msg"), "utf8"), /first instruction/);
     assert.match(readFileSync(join(dir, "002.msg"), "utf8"), /replacement instruction/);
-    // BB dispatches the queued wake into the crew's next turn.
+    // BB dispatches the queued wake into the crew's next turn: its turn request carries the wake.
+    const dispatched = rows[0]!.content;
     rows = [];
     rows.push({ id: "human", content: [{ type: "text", text: "unrelated human instruction" }] });
     host = await host.harness.lifecycle.reload(plugin);
     stubRealExecHost(host);
+    host.harness.sdk.stub("threads.events.list", async () => [{ type: "client/turn/requested", data: { input: dispatched } }]);
     host.harness.sdk.stub("threads.queuedMessages.list", async () => rows);
     host.harness.sdk.stub("threads.queuedMessages.delete", async (args: { queuedMessageId: string }) => {
       rows = rows.filter(r => r.id !== args.queuedMessageId);
@@ -12054,3 +12067,114 @@ for (const pin of ["2d833ff147cd26a5c461e914e06854e0eb2707ce", "1f3e769616fdf9f3
     }finally{await host.harness.lifecycle.dispose();rmSync(parent,{recursive:true,force:true});rmSync(work,{recursive:true,force:true});}
   });
 }
+
+// Checker round 1 on #158 (158-verdict-1.md), reproductions first.
+test("check 158/1: an unchanged reading above the 200k trigger is compacted once, even after the cooldown", async () => {
+  const { host, idle } = await compactionHost();
+  try {
+    host.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 230000, modelContextWindow: 1000000, estimated: false } }));
+    await idle();
+    await host.bb.storage.kv.set("captain-compacted-at:thr_cap", Date.now() - 1300000);
+    await idle();
+    assert.equal(host.harness.sdk.callsTo("threads.compact").length, 1, "unchanged context must not compact again");
+    host.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 120000, modelContextWindow: 1000000, estimated: false } }));
+    await idle();
+    assert.equal(await host.bb.storage.kv.get("thread-compaction-evidence:thr_cap"), undefined, "a reading below the trigger clears the evidence");
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("check 158/2: no compaction while owner input waits: a queued owner message or an open question", async () => {
+  for (const [label, queued, interactions] of [
+    ["queued owner message", [{ id: "owner", initiator: "user", failureReason: null, content: [{ type: "text", text: "Answer my question" }] }], []],
+    ["open question", [], [{ id: "int_1", status: "pending" }]],
+  ] as const) {
+    const { host, idle } = await compactionHost();
+    try {
+      host.harness.sdk.stub("threads.queuedMessages.list", async () => queued);
+      host.harness.sdk.stub("threads.interactions.list", async () => interactions);
+      await idle();
+      assert.equal(host.harness.sdk.callsTo("threads.compact").length, 0, `${label}: answered first`);
+    } finally { await host.harness.lifecycle.dispose(); }
+  }
+});
+
+test("check 158/3: a result queued before the crew's WAITING turn still wakes the captain", async () => {
+  const host = ownerHost({ notifyOwner: "real" });
+  await host.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
+  await plugin(host.bb); stubProviderCatalog(host);
+  try {
+    stubRoutedHost(host, () => ({ code: 0 })); captainAndCrewThreads(host);
+    host.harness.sdk.stub("threads.list", async () => []); await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true }); liveCrewQueue(host);
+    const queuedAt = Date.now() - 60_000;
+    await emitIdle(host, "WAITING: CI");
+    const hook = host.harness.inspection.registrations.hooks["message.dispatch"]!;
+    const result = await hook({ thread: makeThreadResponse({ id: "thr_cap", status: "idle" }), attempt: "start-turn", initiator: "system", senderThreadId: null, queuedMessages: [{ createdAt: queuedAt }], input: { blocks: [], text: "[bb system]\n\n@thread:thr_crew completed:\n\nDONE: verified result from an earlier queued completion" } } as never);
+    assert.equal(result.action, "proceed", "the ping was queued before the WAITING turn ended, so it reports an earlier turn");
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("check 158/4: a real-transport crew's queued WAITING ping is dropped too", async () => {
+  const host = ownerHost({ notifyOwner: "real", transport: "real" });
+  await host.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
+  await plugin(host.bb); stubProviderCatalog(host);
+  try {
+    stubRoutedHost(host, () => ({ code: 0 })); captainAndCrewThreads(host);
+    host.harness.sdk.stub("threads.list", async () => []); await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true }); liveCrewQueue(host);
+    await emitIdle(host, "WAITING: CI");
+    const hook = host.harness.inspection.registrations.hooks["message.dispatch"]!;
+    const ping = (text: string) => hook({ thread: makeThreadResponse({ id: "thr_cap", status: "idle" }), attempt: "start-turn", initiator: "system", senderThreadId: null, queuedMessages: [{ createdAt: Date.now() }], input: { blocks: [], text } } as never);
+    assert.equal((await ping("[bb system]\n\n@thread:thr_crew completed:\n\nWAITING: CI")).action, "reject", "the WAITING turn's own ping");
+    await emitIdle(host, "DONE: merged");
+    assert.equal((await ping("[bb system]\n\n@thread:thr_crew completed:\n\nDONE: merged")).action, "proceed", "a later outcome clears the marker");
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("check 158/5: when queued texts outgrow the wake, one inbox pointer replaces the inline wake", { skip: !FM_INTEGRATION }, async () => {
+  const home = scratchFmHome(); const host = itHost(home, { tellOwner: "real" });
+  await plugin(host.bb); stubProviderCatalog(host);
+  try {
+    stubRealExecHost(host); await seedCrew(host);
+    let rows: Array<{ id: string; content: Array<{ type: string; text: string }> }> = [];
+    let sequence = 0;
+    host.harness.sdk.stub("threads.queuedMessages.list", async () => rows);
+    host.harness.sdk.stub("threads.send", async (args: { input: Array<{ type: string; text: string }> }) => {
+      const row = { id: `check-${++sequence}`, content: args.input }; rows.push(row); return { delivery: "queued", queuedMessage: row };
+    });
+    host.harness.sdk.stub("threads.queuedMessages.delete", async (args: { queuedMessageId: string }) => { rows = rows.filter(r => r.id !== args.queuedMessageId); return {}; });
+    for (let i = 0; i < 4; i++) {
+      const result = await host.harness.behavior.runCli(["tell", "c1", "--queue", `--message=${String(i).repeat(4000)}`], { projectId: "proj_1" });
+      assert.equal(result.exitCode, 0, result.stderr);
+    }
+    assert.equal(rows.length, 1);
+    assert.match(rows[0]!.content[0]!.text, /^: Firstmate instruction waiting/, "four records exceed the cap: a pointer that reads every pending record");
+    assert.doesNotMatch(rows[0]!.content[0]!.text, /^Firstmate instruction for crew/);
+  } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test("check 158/6: a queued wake removed without reaching the crew leaves its record unread", { skip: !FM_INTEGRATION }, async () => {
+  const home = scratchFmHome(); let host = itHost(home, { tellOwner: "real" });
+  await plugin(host.bb); stubProviderCatalog(host);
+  try {
+    stubRealExecHost(host); await seedCrew(host);
+    let wake = "";
+    host.harness.sdk.stub("threads.queuedMessages.list", async () => []);
+    host.harness.sdk.stub("threads.send", async (args: { input: Array<{ text: string }> }) => { wake = args.input[0]!.text; return { delivery: "queued", queuedMessage: { id: "cancelled" } }; });
+    const result = await host.harness.behavior.runCli(["tell", "c1", "--queue", "--message=never delivered"], { projectId: "proj_1" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    host = await host.harness.lifecycle.reload(plugin); stubRealExecHost(host);
+    host.harness.sdk.stub("threads.queuedMessages.list", async () => []);
+    let events: unknown[] = [];
+    host.harness.sdk.stub("threads.events.list", async () => events);
+    const reconcile = async () => {
+      const run = host.harness.behavior.runService("captain-wake-release");
+      try { await new Promise(r => setTimeout(r, 300)); } finally { run.controller.abort(); await run.done; }
+    };
+    await reconcile();
+    assert.ok(existsSync(join(home, "state/c1.inbox/001.msg")), "no turn took the wake: the record stays unread");
+    events = [{ type: "client/turn/requested", data: { input: [{ type: "text", text: wake }] } }];
+    await reconcile();
+    assert.ok(existsSync(join(home, "state/c1.inbox/handled/001.msg")), "a crew turn took the wake: the record is filed");
+  } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
+});
