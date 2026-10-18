@@ -300,7 +300,7 @@ test("the board and the digest read closed tasks and PRs merged since the owner 
 /** A crew row the captain registered, and the thread state forget reads. */
 async function seedCrew(host: Host, id: string, output: string) {
   const crews = ((await host.bb.storage.kv.get("crews")) as unknown[] | undefined) ?? [];
-  await host.bb.storage.kv.set("crews", [...crews, { id, task: id, projectId: "proj_1", threadId: `thr_${id}`, parentThreadId: "thr_cap", providerId: null, model: null, reasoningLevel: null, worktree: true, shape: "scout", posture: "direct-PR", createdAt: "2026-10-07T20:00:00.000Z" }]);
+  await host.bb.storage.kv.set("crews", [...crews, { id, task: id, projectId: "proj_1", threadId: `thr_${id}`, parentThreadId: "thr_cap", providerId: null, model: null, reasoningLevel: null, worktree: false, shape: "scout", posture: "direct-PR", createdAt: "2026-10-07T20:00:00.000Z" }]);
   host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, projectId: "proj_1", status: "idle", environmentId: null }));
   host.harness.sdk.stub("threads.output", async () => ({ output }));
   host.harness.sdk.stub("threads.stop", async () => ({}));

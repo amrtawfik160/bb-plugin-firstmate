@@ -69,6 +69,7 @@ import { finishedCrewCandidates, isFinishedCrewWake, parseWakeRow, quietStaleVer
 import { createDoorbellHold, doorbellHoldDecision } from "./lib/doorbell-hold.ts";
 import { countsForFreeText, createCaptainTurns, turnIndexFromEvents, type FreeTextRow } from "./lib/free-text-turns.ts";
 import { createRetryLedger, type RetryItem, type RetryKind } from "./lib/retry-ledger.ts";
+import { parseWipBackup, wipBackupScript, type WipBackupResult } from "./lib/wip-backup.ts";
 import { HANDOFF_WAKE_AMENDMENT, captainInstructionsWithHandoff } from "./owner/handoff-contract.ts";
 import { honestIdleVerdictPresentation, interruptIsStopped, readyClaim } from "./lib/honest-status.ts";
 import { ACK_TEXT, ackEligible, createInboundLedger, expandTelegramRows, followUpReplyKind, formatOwnerInbox, handBackText, hashText, inboundKey, quotedReplyKind, sweeperSteerText, type InboundKey, type InboundRow, type OutboxKind } from "./lib/inbound-ledger.ts";
@@ -4278,13 +4279,14 @@ export default async function plugin(bb: BbPluginApi) {
       (typeof env["baseBranch"] === "string" && env["baseBranch"]) || null;
     const host = env["hostId"];
     const path = env["path"];
-    if (!base || typeof host !== "string" || !host || typeof path !== "string" || !path) {
-      throw new Error("Cannot verify committed work: environment has no host, path, or base branch.");
+    if (typeof host !== "string" || !host || typeof path !== "string" || !path) {
+      throw new Error("Cannot verify committed work: environment has no host or path.");
     }
     // The base permits clean local-only worktrees without a remote. Use local
     // remote-tracking refs; teardown does not fetch or require network access.
+    // Without a known base, every commit on no remote counts: stricter, never looser.
     const result = await runOnHost(host,
-      `git -C ${shQuote(path)} rev-list --max-count=20 HEAD --not --remotes ${shQuote(base)} --`, 15_000);
+      `git -C ${shQuote(path)} rev-list --max-count=20 HEAD --not --remotes${base ? ` ${shQuote(base)}` : ""} --`, 15_000);
     if (result.exitCode !== 0) throw new Error("Cannot verify committed work: Git reachability check failed. Crew retained.");
     const commits = result.output.trim().split(/\r?\n/).filter(Boolean);
     if (commits.some(sha => !/^[a-f0-9]{40,64}$/.test(sha))) {
@@ -9436,6 +9438,9 @@ export default async function plugin(bb: BbPluginApi) {
     if (pr) await registerCrewPr(crew,pr);
     const nativeHome = await crewNativeHome(crew);
     const notes: string[] = [];
+    // A merged PR does not cover files or commits made after it. Native or BB-side, refuse first.
+    try { await refuseUnlandedCrewWork(crew, notes); }
+    catch (error) { throw new Error(`Crew ${crew.id} kept (PR landed; cleanup pending): ${error instanceof Error ? error.message : String(error)}`); }
     if (nativeHome !== "" && !isSecondmateRoute(crew)) {
       const hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
       const result = await runFmScript({ script: "teardown", args: [crew.id], fmHome: nativeHome, hostId, timeoutMs: 180_000 });
@@ -9598,6 +9603,79 @@ export default async function plugin(bb: BbPluginApi) {
     await backgroundBudget.run("follow-up", () => reconcileExternallyLanded(batch, { notify: true, signal }));
   }
 
+  // Hourly backup of crew commits that no remote branch has (lib/wip-backup.ts). Each recorded
+  // crew worktree pushes HEAD to wip/<crew>-<branch> on its own remote. Uncommitted files and
+  // failed backups go to the crew's captain at most once per crew per day; nothing is committed.
+  type WipBackupRow = { crewId: string; captain: string | null; result: WipBackupResult | null; error: string };
+  async function wipBackupPass(signal: AbortSignal, now = Date.now()): Promise<WipBackupRow[]> {
+    const rows: WipBackupRow[] = [];
+    for (const crew of await readCrews()) {
+      if (signal.aborted) break;
+      if (!crew.worktree || isSecondmateRoute(crew)) continue;
+      const row: WipBackupRow = { crewId: crew.id, captain: crew.parentThreadId, result: null, error: "" };
+      try {
+        const thread = await raceAbort(bb.sdk.threads.get({ threadId: crew.threadId }), signal, STUCK_HOST_CALL_MS);
+        // BB retires an archived thread's environment; nothing is left to back up.
+        if (thread.archivedAt != null || !thread.environmentId) continue;
+        if (await isCaptainThread(crew.threadId)) continue;
+        const env = asRecord(await raceAbort(bb.sdk.environments.get({ environmentId: thread.environmentId }), signal, STUCK_HOST_CALL_MS));
+        const hostId = env["hostId"], path = env["path"];
+        if (env["isWorktree"] !== true || typeof hostId !== "string" || hostId === "" || typeof path !== "string" || path === "") continue;
+        const base = [env["mergeBaseBranch"], env["defaultBranch"], env["baseBranch"]].find((b): b is string => typeof b === "string" && b !== "") ?? "main";
+        const ran = await runOnHost(hostId, wipBackupScript(path, crew.id, base), 120_000, signal);
+        const result = parseWipBackup(ran.output);
+        result.dirty = result.dirty.filter((file) => !isScratchPath(file));
+        row.result = result;
+        if (result.push === "pushed") bb.log.info(`wip backup crew=${crew.id}: ${result.unpushed} commit(s) pushed to ${result.remote}/${result.target}`);
+        else if (result.push === "failed" || result.push === "no-remote") bb.log.warn(`wip backup crew=${crew.id}: ${result.push} ${truncate(result.detail, 300)}`);
+      } catch (error) {
+        if (signal.aborted) break;
+        row.error = error instanceof Error ? error.message : String(error);
+        bb.log.warn(`wip backup crew=${crew.id}: ${row.error}`);
+      }
+      rows.push(row);
+    }
+    if (!signal.aborted) await reportWipRows(rows, now, signal);
+    return rows;
+  }
+
+  // One pass at a time: the hourly schedule and `bb firstmate wip-backup` share it.
+  let wipBackupRun: Promise<WipBackupRow[]> | undefined;
+  function wipBackupOnce(): Promise<WipBackupRow[]> {
+    wipBackupRun ??= wipBackupPass(launchAbort.signal).finally(() => { wipBackupRun = undefined; });
+    return wipBackupRun;
+  }
+
+  // One message per captain, naming each crew not yet reported today.
+  async function reportWipRows(rows: readonly WipBackupRow[], now: number, signal: AbortSignal): Promise<void> {
+    const day = new Date(now).toISOString().slice(0, 10);
+    const byCaptain = new Map<string, Array<{ crewId: string; line: string }>>();
+    for (const row of rows) {
+      const r = row.result;
+      if (row.captain === null || r === null) continue;
+      const parts: string[] = [];
+      if (r.dirty.length > 0) parts.push(`${r.dirty.length >= 200 ? "at least 200" : r.dirty.length} uncommitted file(s), not backed up`);
+      if (r.push === "failed") parts.push(`backup failed${r.unpushed > 0 ? ` for ${r.unpushed} commit(s)` : ""} (${truncate(r.detail, 160) || "no detail"})`);
+      if (r.push === "missing") parts.push("its worktree was not found on its host, so nothing was backed up");
+      if (r.push === "no-remote") parts.push(`${r.unpushed} commit(s) on no remote, and the worktree has no remote to back them up to`);
+      if (parts.length === 0) continue;
+      if ((await bb.storage.kv.get(`wip-reported:${row.crewId}`)) === day) continue;
+      const list = byCaptain.get(row.captain) ?? [];
+      list.push({ crewId: row.crewId, line: `- crew ${row.crewId}: ${parts.join("; ")}.` });
+      byCaptain.set(row.captain, list);
+    }
+    for (const [captain, list] of byCaptain) {
+      const text = [
+        "Daily work check: this work exists only on this host.",
+        ...list.map((item) => item.line),
+        "Tell each crew to commit and push its work. Retire and forget refuse while it is there.",
+      ].join("\n");
+      if (await deliverToCaptain(captain, text, list[0]!.crewId, signal)) {
+        for (const item of list) await bb.storage.kv.set(`wip-reported:${item.crewId}`, day);
+      }
+    }
+  }
+
   // Harness/tool scratch a crew leaves in its worktree (Lavish review artifacts,
   // temp markdown). Not the crew's deliverable, so never "unlanded work".
   function isScratchPath(path: string): boolean {
@@ -9666,6 +9744,44 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  // Unlanded-work protection. "Unlanded" is BOTH uncommitted changes AND
+  // committed-but-unpushed commits (F1) — either is work that only exists in
+  // this worktree, and our hard rule is never to destroy it. We refuse on
+  // either, loudly, leaving the thread AND the worktree intact. This makes
+  // the safety DELIBERATE, not a side effect of the teardown primitive
+  // happening to preserve the branch (see the note at environments.delete).
+  // Commits the hourly wip backup pushed are on a remote branch and pass.
+  async function refuseUnlandedWork(crew: Crew, envId: string, notes: string[]): Promise<void> {
+    const discard = `Deliver first, or re-run with --force "<the owner's words>" to discard.`;
+    const diff = await withTransientRetry(() => bb.sdk.environments.diffFiles({ environmentId: envId, target: "uncommitted" }));
+    const dirty = checkedDiffPaths(diff).filter((path) => !isScratchPath(path));
+    if (dirty.length > 0) {
+      throw new Error(
+        `Refusing: crew ${crew.id} has ${dirty.length} uncommitted file(s) (${dirty.slice(0, 5).join(", ")}${dirty.length > 5 ? "…" : ""}). ${discard}`,
+      );
+    }
+    const unpushed = await committedUnpushedCommits(envId);
+    if (unpushed.length > 0) {
+      const landedPr = await mergedPrCoversHead(crew, envId);
+      if (landedPr === null) {
+        throw new Error(
+          `Refusing: crew ${crew.id} has committed but UNPUSHED work on its branch (${unpushed.length >= 20 ? "at least " : ""}${unpushed.length} commit(s): ${unpushed.slice(0, 5).map(sha => sha.slice(0, 12)).join(", ")}${unpushed.length > 5 ? "…" : ""}). Those commits exist only in this worktree's branch. Open a PR / push first. ${discard}`,
+        );
+      }
+      notes.push(`branch commits landed via merged ${landedPr}`);
+    }
+  }
+
+  // The same refusal for a recorded crew worktree, before any retirement path touches it.
+  // An archived thread's environment is already retired. A worktree that cannot be read refuses.
+  async function refuseUnlandedCrewWork(crew: Crew, notes: string[]): Promise<void> {
+    if (!crew.worktree || isSecondmateRoute(crew) || await isCaptainThread(crew.threadId)) return;
+    const thread = await bb.sdk.threads.get({ threadId: crew.threadId });
+    if (thread.archivedAt != null) return;
+    if (!thread.environmentId) throw new Error(`Cannot verify worktree for crew ${crew.id}: environment unavailable. Crew retained.`);
+    await refuseUnlandedWork(crew, thread.environmentId, notes);
+  }
+
   // BB-side retirement of a crew thread that native teardown did not retire:
   // refuse unlanded work (unless force), stop and archive the thread, and delete
   // a scout's own worktree. Returns whether a worktree was removed.
@@ -9695,31 +9811,7 @@ export default async function plugin(bb: BbPluginApi) {
         if (!force) throw new Error(`Cannot verify environment for crew ${crew.id}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
-    if (!force && envId !== null) {
-      // Unlanded-work protection. "Unlanded" is BOTH uncommitted changes AND
-      // committed-but-unpushed commits (F1) — either is work that only exists in
-      // this worktree, and our hard rule is never to destroy it. We refuse on
-      // either, loudly, leaving the thread AND the worktree intact. This makes
-      // the safety DELIBERATE, not a side effect of the teardown primitive
-      // happening to preserve the branch (see the note at environments.delete).
-      const diff = await withTransientRetry(() => bb.sdk.environments.diffFiles({ environmentId: envId, target: "uncommitted" }));
-      const dirty = checkedDiffPaths(diff).filter((path) => !isScratchPath(path));
-      if (dirty.length > 0) {
-        throw new Error(
-          `Refusing: crew ${crew.id} has ${dirty.length} uncommitted file(s) (${dirty.slice(0, 5).join(", ")}${dirty.length > 5 ? "…" : ""}). Deliver first, or re-run with --force to discard.`,
-        );
-      }
-      const unpushed = await committedUnpushedCommits(envId);
-      if (unpushed.length > 0) {
-        const landedPr = await mergedPrCoversHead(crew, envId);
-        if (landedPr === null) {
-          throw new Error(
-            `Refusing: crew ${crew.id} has committed but UNPUSHED work on its branch (${unpushed.length >= 20 ? "at least " : ""}${unpushed.length} commit(s): ${unpushed.slice(0, 5).map(sha => sha.slice(0, 12)).join(", ")}${unpushed.length > 5 ? "…" : ""}). Those commits exist only in this worktree's branch. Open a PR / push first, or re-run with --force to discard.`,
-          );
-        }
-        notes.push(`branch commits landed via merged ${landedPr}`);
-      }
-    }
+    if (!force && envId !== null) await refuseUnlandedWork(crew, envId, notes);
     await bb.sdk.threads.stop({ threadId: crew.threadId });
     await bb.sdk.threads.archive({ threadId: crew.threadId });
     // D2: native fm-teardown removes the git worktree; do the same so worktrees
@@ -9775,10 +9867,16 @@ export default async function plugin(bb: BbPluginApi) {
     id: string,
     stop: boolean,
     force: boolean,
-    opts: { caller?: string; overrideOwner?: boolean } = {},
+    opts: { caller?: string; overrideOwner?: boolean; ownerWords?: string } = {},
   ): Promise<string> {
+    // Owner decision Q6 (18 Oct): discarding work needs the owner's own words, quoted.
+    const ownerWords = (opts.ownerWords ?? "").trim();
+    if (force && ownerWords === "") {
+      throw new Error(`Refusing --force for ${id}: it can discard work that exists only on this host. Quote the owner's words that allow it: --force "<the owner's words>" (tool: force=true, ownerWords). Nothing changed.`);
+    }
     const crew = (await readCrews()).find(entry => entry.id === id) ?? await findCrew(id) ?? retainedCrew(id, opts.caller ?? homeScope.getStore()?.captain);
     if (crew === undefined) throw new Error(`No crew ${id}. Run "bb firstmate crews".`);
+    if (force) bb.log.warn(`forget ${id} --force on the owner's words: ${truncate(ownerWords, 300)}`);
     const notMine = opts.overrideOwner === true ? null : await ownerRefusal(crew, opts.caller, "forget");
     if (notMine !== null) throw new Error(notMine);
     await drainBeforeAction(crew.parentThreadId, "retire");
@@ -9806,6 +9904,10 @@ export default async function plugin(bb: BbPluginApi) {
     let worktreeRemoved = false;
     let nativeTeardown = false;
     const notes: string[] = [];
+    if (force) notes.push(`forced on the owner's words: "${truncate(ownerWords, 200)}"`);
+    // Forget without stop drops the record, and the hourly wip backup only sees recorded crews,
+    // so it refuses unlanded work like a stop does. A retained delivery is checked below.
+    if (!stop && !force && !preserveAuthority) await refuseUnlandedCrewWork(crew, notes);
     if (openPrs.length > 0) notes.push(`${openPrs.length} open PR(s) stay tracked for you and still need a decision (merge, fix or close): ${openPrs.map((r) => r.url).join(" ")}`);
     if (stop) {
       if (await isCaptainThread(crew.threadId)) {
@@ -9820,6 +9922,7 @@ export default async function plugin(bb: BbPluginApi) {
         const hostId = await resolveHostForProject(crew.projectId, crew.threadId);
         const teardown = () => runFmScript({
           script: "teardown", args: [crew.id, ...(force ? ["--force"] : [])],
+          ...(force ? { env: { FM_FORCE_OWNER_WORDS: truncate(ownerWords, 300) } } : {}),
           fmHome: nativeHome, hostId, timeoutMs: 180_000,
         });
         let result = await teardown();
@@ -12791,7 +12894,8 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb firstmate quiet [on|off|status]",
     "  bb firstmate secondmate [list|register --project <id> --thread <id> [--scope <text>] [--projects a,b]|drop <project>]",
     "  bb firstmate supervision [on|off|status]",
-    "  bb firstmate forget <id> [--stop] [--force]",
+    "  bb firstmate forget <id> [--stop] [--force \"<the owner's words>\"]",
+    "  bb firstmate wip-backup",
     "  bb firstmate mark-crew <thread-id> [--shape ship|scout]",
   ].join("\n");
 
@@ -14198,16 +14302,17 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_forget",
-    description: "Drop a crew record. stop=true archives the thread (refuses dirty work unless force). For a crew with an open PR leave stop off: the PR stays tracked and the thread is archived after the same check.",
+    description: "Drop a crew record. stop=true archives the thread. Both refuse uncommitted or unpushed work unless force=true with ownerWords quoting the owner. For a crew with an open PR leave stop off: the PR stays tracked and the thread is archived after the same check.",
     parameters: z.object({
       crewId: z.string(),
       stop: z.boolean().optional(),
-      force: z.boolean().optional(),
+      force: z.boolean().optional().describe("Discard uncommitted or unpushed work. Needs ownerWords"),
+      ownerWords: z.string().optional().describe("With force: the owner's own words that allow discarding this crew's work, quoted exactly"),
       overrideOwner: z.boolean().optional().describe("Forget a crew owned by another captain (only on the captain's word)"),
     }),
-    async execute({ crewId, stop, force, overrideOwner }, ctx) {
+    async execute({ crewId, stop, force, ownerWords, overrideOwner }, ctx) {
       try {
-        return await forgetCrew(crewId, stop === true, force === true, { caller: ctxString(ctx, "threadId"), overrideOwner: overrideOwner === true });
+        return await forgetCrew(crewId, stop === true, force === true, { caller: ctxString(ctx, "threadId"), overrideOwner: overrideOwner === true, ...(ownerWords !== undefined ? { ownerWords } : {}) });
       } catch (error) {
         return toolError(error instanceof Error ? error.message : "Forget failed.");
       }
@@ -15785,7 +15890,8 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "quiet", summary: "Batch routine pings while present", usage: "bb firstmate quiet on|off|status" },
       { name: "secondmate", summary: "Register a domain captain thread", usage: "bb firstmate secondmate list|register|drop" },
       { name: "supervision", summary: "Event pings + stuck checker", usage: "bb firstmate supervision on|off|status" },
-      { name: "forget", summary: "Drop a crew record", usage: "bb firstmate forget <crew-id> [--stop] [--force]" },
+      { name: "forget", summary: "Drop a crew record", usage: "bb firstmate forget <crew-id> [--stop] [--force \"<the owner's words>\"]" },
+      { name: "wip-backup", summary: "Back up unpushed crew commits to wip/ branches now", usage: "bb firstmate wip-backup" },
       { name: "create-worker", summary: "Internal atomic native worker creation", usage: "bb firstmate create-worker --task <id> --project <id> --home <path> --host <id> --path <path> --prompt-file <path>" },
       { name: "launches", summary: "Inspect durable launch reservations", usage: "bb firstmate launches [--json]" },
       { name: "mark-crew", summary: "Tag a thread as a firstmate crew (used by the real-mode bb backend)", usage: "bb firstmate mark-crew <thread-id> [--shape ship|scout]" },
@@ -16671,6 +16777,14 @@ export default async function plugin(bb: BbPluginApi) {
             const rows = within(readLedger(await readHomeText(home, LEDGER_FILE)), since, until);
             return reply(rows, rows.length === 0 ? "No owner corrections recorded." : rows.map((c) => `${c.id} ${c.at.slice(0, 10)} ${c.ref} ${c.fix ? `fixed: ${c.fix.ref}` : "open"}: ${c.words.split("\n")[0]}`).join("\n"));
           }
+          case "wip-backup": {
+            // The same pass the hourly schedule runs; a pass already running is joined, not repeated.
+            const rows = await wipBackupOnce();
+            const lines = rows.map((row) => row.result === null
+              ? `error      ${row.crewId}: ${truncate(row.error, 200)}`
+              : `${row.result.push.padEnd(10)} ${row.crewId}: ${row.result.unpushed} unpushed commit(s)${row.result.push === "pushed" ? ` -> ${row.result.remote}/${row.result.target}` : ""}; ${row.result.dirty.length} uncommitted file(s)${row.result.push === "failed" ? ` (${truncate(row.result.detail, 160)})` : ""}`);
+            return reply({ rows }, lines.length === 0 ? "No crew worktrees to back up." : lines.join("\n"));
+          }
           case "scorecard": {
             const captain = flagStr(flags, "captain") ?? ctxThread;
             if (captain === undefined) return fail("Pass --captain <thread-id>.");
@@ -16728,8 +16842,10 @@ export default async function plugin(bb: BbPluginApi) {
           case "forget": {
             const id = rest[0];
             if (id === undefined) return fail(usage);
+            // `--force "<the owner's words>"`: a bare --force is refused.
+            const ownerWords = flagStr(flags, "force");
             const text = await forgetCrew(id, flags.has("stop"), flags.has("force"), {
-              caller: ctxThread, overrideOwner: flags.has("override-owner"),
+              caller: ctxThread, overrideOwner: flags.has("override-owner"), ...(ownerWords !== undefined ? { ownerWords } : {}),
             });
             return reply({ forgotten: true, id }, text);
           }
@@ -16783,6 +16899,10 @@ export default async function plugin(bb: BbPluginApi) {
     const [, captain, id] = key.split(":");
     if (captain && id) finishWakeLater(captain, id);
   }
+  bb.background.schedule("wip-backup", "17 * * * *", async () => {
+    if (wipBackupRun || launchAbort.signal.aborted) return;
+    await wipBackupOnce().catch((error) => bb.log.warn(`wip backup: ${String(error)}`));
+  });
   let taskSweepWork: Promise<void> | undefined;
   bb.background.schedule("task-lifecycle", "*/5 * * * *", async () => {
     if (taskSweepWork || launchAbort.signal.aborted) return;

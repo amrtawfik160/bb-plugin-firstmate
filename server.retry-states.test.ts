@@ -205,6 +205,10 @@ test("a refused landed-crew cleanup reports the refusal without advisory banners
     host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: "idle", environmentId: "env_wt" }));
     host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
     host.harness.sdk.stub("threads.output", async () => ({ output: "DONE: shipped" }));
+    // The worktree itself reads clean and pushed; the native refusal below is what is tested.
+    hostCommands(host, () => "");
+    host.harness.sdk.stub("environments.get", async () => ({ id: "env_wt", hostId: "host_1", path: "/wt", isWorktree: true, status: "ready", mergeBaseBranch: "main" }));
+    host.harness.sdk.stub("environments.diffFiles", async () => ({ files: [] }));
     host.harness.sdk.stub("threads.stop", async () => {
       throw new Error("WARNING: watcher still down (same stale episode; last beat: 371824s ago, grace 300s)\nWARNING: queued wakes pending - drain them with bin/fm-wake-drain.sh before anything else.\nREFUSED: worktree has uncommitted changes");
     });

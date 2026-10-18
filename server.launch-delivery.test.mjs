@@ -344,7 +344,7 @@ test('forgotten author retains native guarded merge continuation and refuses des
   host.harness.sdk.stub('threads.stop',async()=>({}));host.harness.sdk.stub('threads.archive',async()=>({}));
   host.harness.sdk.stub('environments.pullRequest',async()=>({outcome:'unavailable'}));
   const commands=hostCommands(host,command=>command.includes('gh pr view')?{payload:JSON.stringify(forge())}:{code:0});
-  const refusal=await host.harness.behavior.runCli(['forget','c1','--stop','--force'],ctx);assert.equal(refusal.exitCode,1);assert.match(refusal.stderr,/Outstanding PR delivery/);assert.equal(host.harness.sdk.callsTo('threads.archive').length,0);
+  const refusal=await host.harness.behavior.runCli(['forget','c1','--stop','--force','owner: discard it'],ctx);assert.equal(refusal.exitCode,1);assert.match(refusal.stderr,/Outstanding PR delivery/);assert.equal(host.harness.sdk.callsTo('threads.archive').length,0);
   // Forget now archives the author's thread after the unlanded-work checks and keeps its environment.
   host.harness.sdk.stub('environments.get',async()=>({id:'env_wt',hostId:'host_1',path:'/wt',isWorktree:true,status:'ready',mergeBaseBranch:'main'}));
   host.harness.sdk.stub('environments.diffFiles',async()=>({files:[]}));

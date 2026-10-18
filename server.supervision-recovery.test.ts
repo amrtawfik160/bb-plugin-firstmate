@@ -595,7 +595,7 @@ test("forgetting a crew with an open PR refuses on unlanded work unless forced, 
       assert.match(refused.stderr, /Refusing: crew c1 has/);
       assert.equal(host.harness.sdk.callsTo("threads.archive").length, 0);
       assert.equal(((await host.bb.storage.kv.get("crews")) as unknown[]).length, 1, "the crew record is kept");
-      const forced = await host.harness.behavior.runCli(["forget", "c1", "--force"], { projectId: "proj_1", threadId: "thr_cap" });
+      const forced = await host.harness.behavior.runCli(["forget", "c1", "--force", "owner: discard it"], { projectId: "proj_1", threadId: "thr_cap" });
       assert.equal(forced.exitCode, 0, forced.stderr);
       assert.equal(host.harness.sdk.callsTo("threads.archive").length, 1);
     } finally {
@@ -941,6 +941,9 @@ function stubMergeSdk(host: Host) {
     },
   }));
   host.harness.sdk.stub("environments.mergePullRequest", async () => { calls.merged++; return {}; });
+  // Retirement inspects the crew worktree first; this one is clean and pushed.
+  host.harness.sdk.stub("environments.get", async () => ({ id: "env_wt", hostId: "host_1", path: "/wt", isWorktree: true, status: "ready", mergeBaseBranch: "main" }));
+  host.harness.sdk.stub("environments.diffFiles", async () => ({ files: [] }));
   return calls;
 }
 
