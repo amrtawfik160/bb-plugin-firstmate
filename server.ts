@@ -5943,6 +5943,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   const closeNativePlanSchema = z.object({
     keys: z.array(z.string()), holds: z.array(z.string()), shared: z.boolean(), finished: z.boolean(),
+    sourceRef: z.string().optional(), questionFinished: z.boolean().default(false),
   });
 
   // Resolve each named question even when another question still owns the shared crew hold.
@@ -5974,7 +5975,7 @@ export default async function plugin(bb: BbPluginApi) {
       for (const id of keys) if (id !== crew.id && await held(id)) holds.push(id);
       const latest = latestStatus(lines);
       const belongs = keys.length > 0 || (latest !== null && ask.sourceRef === `crew-wait:${statusKey(crew.id, latest.note)}`);
-      plan = { keys, holds, shared: belongs && await held(crew.id), finished: false };
+      plan = { keys, holds, shared: belongs && await held(crew.id), finished: false, sourceRef: ask.sourceRef, questionFinished: false };
       // Persist both status keys and hold identities before either native mutation.
       await bb.storage.kv.set(key, plan);
     }
@@ -5990,10 +5991,24 @@ export default async function plugin(bb: BbPluginApi) {
       requireNativeSuccess(await runCaptainHold(["answer", id, "--decision-file", path, "--release"], { home, hostId, projectId: crew.projectId }), "owner close hold");
     };
     try {
-      for (const id of plan.holds) await release(id);
-      for (const statusKey of plan.keys) {
-        const { lines, kind } = await crewStatusLines(crew);
-        if (foldOpenDecisions(lines, kind).some((d) => d.key === statusKey) && !(await appendResolvedStatus(crew, statusKey, resolution))) throw new Error(`Could not resolve crew status for ${ask.id}.`);
+      if (!plan.questionFinished) {
+        // Upgrade saved key-only plans using the card's immutable question identity.
+        if (plan.sourceRef === undefined) {
+          plan.sourceRef = ask.sourceRef;
+          await bb.storage.kv.set(key, plan);
+        }
+        const sourceRef = plan.sourceRef;
+        const sameQuestion = async (id: string) => {
+          const { lines, kind } = await crewStatusLines(crew);
+          return foldOpenDecisions(lines, kind).some((d) => d.key === id && sourceRef === `crew-wait:${statusKey(crew.id, d.note)}`);
+        };
+        for (const id of plan.holds) if (await sameQuestion(id)) await release(id);
+        for (const id of plan.keys) {
+          if (await sameQuestion(id) && !(await appendResolvedStatus(crew, id, resolution))) throw new Error(`Could not resolve crew status for ${ask.id}.`);
+        }
+        // A shared hold can remain pending after this question's own mutations are complete.
+        plan.questionFinished = true;
+        await bb.storage.kv.set(key, plan);
       }
       if (plan.shared) {
         const { lines, kind } = await crewStatusLines(crew);
