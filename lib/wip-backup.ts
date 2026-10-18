@@ -40,16 +40,20 @@ export function wipBackupScript(path: string, crewId: string, base: string): str
   // A git command that fails is a failed backup, never "nothing to push" or "no files".
   const fail = (what: string) => `{ echo "FM_WIP push=failed cannot read ${what}"; exit 0; }`;
   return [
-    `cd ${shQuote(path)} 2>/dev/null && git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "FM_WIP push=missing"; exit 0; }`,
+    `cd ${shQuote(path)} 2>/dev/null || { echo "FM_WIP push=missing"; exit 0; }`,
     `export GIT_TERMINAL_PROMPT=0`,
+    `git rev-parse --is-inside-work-tree >/dev/null 2>&1 || ${fail("the git checkout")}`,
     `st=$(git status --porcelain=v1 --untracked-files=all 2>/dev/null) || ${fail("uncommitted files")}`,
     `printf '%s\\n' "$st" | head -n 200 | while IFS= read -r l; do [ -n "$l" ] && printf 'FM_WIP_DIRTY %s\\n' "\${l:3}"; done`,
-    `branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)`,
-    `head=$(git rev-parse --verify --quiet HEAD 2>/dev/null || true)`,
-    `exclude=""; git rev-parse --verify --quiet ${baseRef} >/dev/null 2>&1 && exclude=${baseRef}`,
+    // symbolic-ref exits 1 only for a detached HEAD; any other failure is unknown.
+    `branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null); rc=$?; case $rc in 0) ;; 1) branch="" ;; *) ${fail("HEAD")} ;; esac`,
+    // No HEAD commit is accepted only for an unborn branch: HEAD names a branch with no ref yet.
+    `if head=$(git rev-parse --verify --quiet HEAD 2>/dev/null) && [ -n "$head" ]; then :; else head=""; [ -n "$branch" ] || ${fail("HEAD")}; refs=$(git for-each-ref --format='%(refname)' "refs/heads/$branch" 2>/dev/null) || ${fail("HEAD")}; [ -z "$refs" ] || ${fail("HEAD")}; fi`,
+    // rev-parse --verify --quiet exits 1 for a ref that does not exist; anything else is unknown.
+    `exclude=""; git rev-parse --verify --quiet ${baseRef} >/dev/null 2>&1; rc=$?; case $rc in 0) exclude=${baseRef} ;; 1) ;; *) ${fail("the base branch")} ;; esac`,
     `n=0; if [ -n "$head" ]; then n=$(git rev-list --count "$head" --not --remotes $exclude -- 2>/dev/null) || ${fail("commits not on a remote")}; fi`,
     `case "$n" in ''|*[!0-9]*) ${fail("commits not on a remote")} ;; esac`,
-    `remote=""; [ -n "$branch" ] && remote=$(git config --get "branch.$branch.remote" 2>/dev/null || true); [ "$remote" = "." ] && remote=""`,
+    `remote=""; if [ -n "$branch" ]; then remote=$(git config --get "branch.$branch.remote" 2>/dev/null); rc=$?; case $rc in 0|1) ;; *) ${fail("the branch remote")} ;; esac; fi; [ "$remote" = "." ] && remote=""`,
     `remotes=$(git remote 2>/dev/null) || ${fail("remotes")}`,
     `[ -z "$remote" ] && { printf '%s\\n' "$remotes" | grep -qx origin && remote=origin || remote=$(printf '%s\\n' "$remotes" | head -n 1); }`,
     `target=${shQuote(prefix)}"\${branch:-detached}"`,
@@ -58,7 +62,7 @@ export function wipBackupScript(path: string, crewId: string, base: string): str
     `[ -n "$remote" ] || { echo "FM_WIP push=no-remote"; exit 0; }`,
     `case "$target" in ${shQuote(prefix)}*) ;; *) echo "FM_WIP push=failed bad target"; exit 0;; esac`,
     // The lease names the value this checkout last pushed or fetched; an unknown branch must not exist yet.
-    `seen=$(git rev-parse --verify --quiet "refs/remotes/$remote/$target" || true)`,
+    `seen=$(git rev-parse --verify --quiet "refs/remotes/$remote/$target" 2>/dev/null); rc=$?; case $rc in 0|1) ;; *) ${fail("the last backup")} ;; esac`,
     `if ! out=$(timeout 90 git push --no-verify --porcelain --force-with-lease="refs/heads/$target:$seen" "$remote" "$head:refs/heads/$target" 2>&1); then echo "FM_WIP push=failed $(printf '%s' "$out" | tr '\\n' ' ' | cut -c1-300)"; exit 0; fi`,
     // Keep the pushed value even when the fetch refspec does not cover wip/ (a single-branch
     // clone): the next lease needs it, and the retire check then sees the commits as pushed.

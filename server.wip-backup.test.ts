@@ -2,7 +2,7 @@
 // plugin, with real git. The crew's remote is a bare repository on local disk; no network.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -287,4 +287,34 @@ test("the CLI backup joins a scheduled backup that is still running", async () =
     assert.equal(calls, 1);
     assert.equal(out.exitCode, 0, out.stderr);
   } finally { release(); await f.done(); }
+});
+
+test("native release refuses when HEAD cannot be read, and allows an unborn branch", async () => {
+  const f = await fixture();
+  try {
+    commit(f.wt, "one.txt", "work\n");
+    const real = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim();
+    writeFileSync(join(f.root, "git"), `#!/bin/sh\ncase " $* " in *" rev-parse --verify --quiet HEAD "*) exit 128;; esac\nexec ${real} "$@"\n`);
+    chmodSync(join(f.root, "git"), 0o755);
+    const r = spawnSync("bash", ["-c", `
+      source ${JSON.stringify(ADAPTER)}
+      fm_backend_bb_thread_id() { echo thr_crew; }
+      fm_backend_bb_show() { echo '{"path":"${f.wt}"}'; }
+      fm_backend_bb_kill() { echo KILLED; }
+      fm_backend_bb_tool_check() { return 0; }
+      bb() { echo CALLED_BB "$@"; }
+      KIND=ship
+      fm_backend_bb_remove_worktree thr_crew
+    `], { encoding: "utf8", env: { ...GIT_ENV, PATH: `${f.root}:${GIT_ENV.PATH}` } });
+    assert.notEqual(r.status, 0, r.stdout);
+    assert.match(r.stderr, /cannot read HEAD/);
+    assert.doesNotMatch(r.stdout, /KILLED|CALLED_BB/);
+  } finally { await f.done(); }
+  const empty = mkdtempSync(join(tmpdir(), "fm-wip-srv-"));
+  try {
+    spawnSync("git", ["init", "-q", "-b", "fm/c3-task", empty], { env: GIT_ENV });
+    const r = nativeRelease(empty, "KIND=ship");
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /CALLED_BB thread archive thr_crew/);
+  } finally { rmSync(empty, { recursive: true, force: true }); }
 });

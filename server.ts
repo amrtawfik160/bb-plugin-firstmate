@@ -9656,6 +9656,7 @@ export default async function plugin(bb: BbPluginApi) {
       const parts: string[] = [];
       if (r.dirty.length > 0) parts.push(`${r.dirty.length >= 200 ? "at least 200" : r.dirty.length} uncommitted file(s), not backed up`);
       if (r.push === "failed") parts.push(`backup failed${r.unpushed > 0 ? ` for ${r.unpushed} commit(s)` : ""} (${truncate(r.detail, 160) || "no detail"})`);
+      if (r.push === "missing") parts.push("its worktree was not found on its host, so nothing was backed up");
       if (r.push === "no-remote") parts.push(`${r.unpushed} commit(s) on no remote, and the worktree has no remote to back them up to`);
       if (parts.length === 0) continue;
       if ((await bb.storage.kv.get(`wip-reported:${row.crewId}`)) === day) continue;

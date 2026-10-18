@@ -861,12 +861,25 @@ fm_backend_bb_worktree_is_clean() {  # <target> <thread-id>
   return 0
 }
 
+# Prints the HEAD commit, or nothing for an unborn branch: HEAD names a branch
+# that has no commit yet. Any other failed read returns 1, and callers refuse.
+fm_backend_bb_head_commit() {  # <worktree>
+  local wt=$1 head ref refs
+  if head=$(git -C "$wt" rev-parse --verify --quiet HEAD 2>/dev/null) && [ -n "$head" ]; then
+    printf '%s\n' "$head"
+    return 0
+  fi
+  ref=$(git -C "$wt" symbolic-ref --quiet HEAD 2>/dev/null) && [ -n "$ref" ] || return 1
+  refs=$(git -C "$wt" for-each-ref --format='%(refname)' "$ref" 2>/dev/null) || return 1
+  [ -z "$refs" ]
+}
+
 # 0 only when every commit on HEAD is on a remote branch, or fm-teardown.sh's own
 # landed check (a merged PR or content on the default branch) accepts it. The hourly
 # wip backup pushes such commits, after which they pass. A checkout this host cannot
 # read, or any git failure, is a refusal.
 fm_backend_bb_worktree_is_pushed() {  # <target> <thread-id>
-  local target=$1 id=$2 show wt unpushed branch
+  local target=$1 id=$2 show wt head unpushed branch
   show=$(fm_backend_bb_show "$id" 2>/dev/null || true)
   wt=$(printf '%s' "$show" | fm_backend_bb_json_field path 2>/dev/null || true)
   if [ -z "$wt" ] && [ -d "$target" ]; then
@@ -876,15 +889,22 @@ fm_backend_bb_worktree_is_pushed() {  # <target> <thread-id>
     echo "error: refusing to remove BB worktree for $id; cannot inspect commits not on a remote (no checkout on this host)" >&2
     return 1
   fi
-  git -C "$wt" rev-parse --verify --quiet HEAD >/dev/null 2>&1 || return 0
-  if ! unpushed=$(git -C "$wt" log --format=%h HEAD --not --remotes -- 2>/dev/null); then
+  if ! head=$(fm_backend_bb_head_commit "$wt"); then
+    echo "error: refusing to remove BB worktree for $id; cannot read HEAD at $wt" >&2
+    return 1
+  fi
+  [ -n "$head" ] || return 0
+  if ! unpushed=$(git -C "$wt" log --format=%h "$head" --not --remotes -- 2>/dev/null); then
     echo "error: refusing to remove BB worktree for $id; cannot inspect commits not on a remote at $wt" >&2
     return 1
   fi
   [ -n "$unpushed" ] || return 0
   if declare -F work_is_landed >/dev/null && [ -n "${WT:-}" ] \
     && [ "$(cd "$WT" 2>/dev/null && pwd -P)" = "$(cd "$wt" && pwd -P)" ]; then
-    branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
+    if ! branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null) || [ -z "$branch" ]; then
+      echo "error: refusing to remove BB worktree for $id; cannot read its branch at $wt" >&2
+      return 1
+    fi
     work_is_landed "$branch" && return 0
   fi
   echo "error: refusing to remove BB worktree for $id; commits on no remote and not landed at $wt:" >&2

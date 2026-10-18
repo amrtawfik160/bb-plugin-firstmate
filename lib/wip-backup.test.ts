@@ -173,3 +173,59 @@ test("a git command that fails is a failed backup, never nothing to push or no f
     } finally { f.done(); }
   }
 });
+
+/** A git that fails one exact command and runs every other one for real. */
+function brokenGit(dir: string, args: string): Record<string, string | undefined> {
+  const real = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim();
+  writeFileSync(join(dir, "git"), `#!/bin/sh\ncase " $* " in *" ${args} "*) exit 128;; esac\nexec ${real} "$@"\n`);
+  chmodSync(join(dir, "git"), 0o755);
+  return { ...GIT_ENV, PATH: `${dir}:${GIT_ENV.PATH}` };
+}
+
+test("a failed HEAD read is a failed backup, not nothing to push", () => {
+  for (const args of ["rev-parse --verify --quiet HEAD", "symbolic-ref --quiet --short HEAD", "for-each-ref"]) {
+    const f = fixture();
+    try {
+      commit(f.wt, "one.txt", "1\n");
+      // for-each-ref is only read when the HEAD commit read fails; fail both for that case.
+      const env = args === "for-each-ref" ? brokenGitTwo(f.root, "rev-parse --verify --quiet HEAD", "for-each-ref") : brokenGit(f.root, args);
+      const r = spawnSync("bash", ["-c", wipBackupScript(f.wt, "c1", "main")], { encoding: "utf8", env });
+      const parsed = parseWipBackup(r.stdout);
+      assert.equal(parsed.push, "failed", `${args}: ${r.stdout}`);
+      assert.match(parsed.detail, /cannot read HEAD/);
+    } finally { f.done(); }
+  }
+});
+
+function brokenGitTwo(dir: string, a: string, b: string): Record<string, string | undefined> {
+  const real = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim();
+  writeFileSync(join(dir, "git"), `#!/bin/sh\ncase " $* " in *" ${a} "*|*" ${b} "*) exit 128;; esac\nexec ${real} "$@"\n`);
+  chmodSync(join(dir, "git"), 0o755);
+  return { ...GIT_ENV, PATH: `${dir}:${GIT_ENV.PATH}` };
+}
+
+test("an unborn branch has nothing to push; a detached HEAD is backed up as detached", () => {
+  const empty = mkdtempSync(join(tmpdir(), "fm-wip-"));
+  try {
+    git(empty, "init", "-q", "-b", "fm/c3-task");
+    const r = backup(empty, "c3");
+    assert.equal(r.push, "none", r.detail);
+    assert.equal(r.unpushed, 0);
+  } finally { rmSync(empty, { recursive: true, force: true }); }
+  const f = fixture();
+  try {
+    const head = commit(f.wt, "a.txt", "1\n");
+    git(f.wt, "checkout", "-q", "--detach");
+    const r = backup(f.wt, "c1");
+    assert.equal(r.push, "pushed", r.detail);
+    assert.equal(remoteRef(f.remote, "refs/heads/wip/c1-detached"), head);
+  } finally { f.done(); }
+});
+
+test("a path that is not a git checkout is a failed backup", () => {
+  const plain = mkdtempSync(join(tmpdir(), "fm-wip-"));
+  try {
+    const r = spawnSync("bash", ["-c", wipBackupScript(plain, "c1", "main")], { encoding: "utf8", env: { ...GIT_ENV, GIT_CEILING_DIRECTORIES: tmpdir() } });
+    assert.equal(parseWipBackup(r.stdout).push, "failed", r.stdout);
+  } finally { rmSync(plain, { recursive: true, force: true }); }
+});
