@@ -14305,6 +14305,21 @@ export default async function plugin(bb: BbPluginApi) {
       if (ok) await refreshOwnerBoard();
       return { ok };
     },
+    async deferAsk({ threadId, ids, until }) {
+      if (!(await isCaptainThread(threadId))) return { ok: false, deferred: [] };
+      const { deferred } = ownerAsks.defer(ids, threadId, until);
+      if (deferred.length > 0) {
+        const when = `${new Date(until).toISOString().slice(0, 10)} ${formatUtcTime(until)}`;
+        const cards = deferred.map((id) => `ask ${id}`).join(", ");
+        await bb.sdk.threads.send({
+          threadId,
+          mode: "steer",
+          input: [{ type: "text", text: `The owner skipped ${cards} until ${when} (decide later). Do not act on it and do not wait on it: go on with other work. The card comes back to the owner at that time; his answer reaches you as usual.`, mentions: [], visibility: "agent-only" }],
+        }).catch((error) => bb.log.warn(`owner ask skip ${cards}: ${String(error)}`));
+        await refreshOwnerBoard();
+      }
+      return { ok: true, deferred };
+    },
     async telegramCommand({ command, threadId, since }) {
       if (!(await isCaptainThread(threadId))) return { text: "The Telegram captain is not a Firstmate captain thread." };
       if (command === "inbox") {
@@ -14326,7 +14341,7 @@ export default async function plugin(bb: BbPluginApi) {
         const from = since ?? now - (command === "board" ? 24 : 12) * 60 * 60_000;
         reconcileTasks(threadId, now);
         const records = new Map([...deliveries.list({ owner: threadId, limit: 100 }), ...deliveries.mergedSince(threadId, from)].map((r) => [r.id, r]));
-        const input: BoardInput = { asks: ownerAsks.listOpen(threadId), calls: snapshot.rpc.ownerCalls, tasks: ownerTasks.list(threadId, { includeClosed: true }), records: [...records.values()], programs: programs.list(threadId), since: from, now };
+        const input: BoardInput = { asks: ownerAsks.listWaiting(threadId, now), calls: snapshot.rpc.ownerCalls, tasks: ownerTasks.list(threadId, { includeClosed: true }), records: [...records.values()], programs: programs.list(threadId), since: from, now };
         if (command === "board") {
           // The running crews per project, for the connector's board in each project topic. Always sent:
           // an empty list means no crew runs, and the connector shows 0 instead of counting task lines.
