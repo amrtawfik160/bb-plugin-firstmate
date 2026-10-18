@@ -3,6 +3,7 @@ import test from 'node:test';
 import { createFakePluginHost,makeThreadResponse } from '@get-bb/plugin-sdk/testing';
 import plugin from './server.ts';
 import { createDeliveries } from './lib/pr-delivery.ts';
+import { createLaunches,launchKey } from './lib/launch.ts';
 
 // 17 Oct: the follow-up loop read 10 PRs a minute while 71 came due every minute, so a
 // ledger head lagged GitHub by minutes and a checker verdict for a just-pushed head was
@@ -322,5 +323,24 @@ test('a kept record is logged once per reason, at info, not on every sweep',asyn
   assert.equal(kept.length,1,`${kept.length} log lines for one unchanged reason`);
   assert.equal(kept[0].level,'info');
   assert.deepEqual(d.removed(),[]);
+ }finally{await d.host.harness.lifecycle.dispose();}
+});
+
+// Checker verdict 1 on #147: a repository with only retired candidates reuses its cached
+// open-list rows. Those rows predate a reopen, so they must not settle a closed ledger row.
+test('a cached open list, not fetched this cycle, does not settle a closed PR that has since reopened',async(t)=>{
+ t.mock.timers.enable({apis:['Date'],now:Date.now()});
+ const d=await sweepDeck();try {
+  openRows=[openRow(1)];
+  await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  t.mock.timers.tick(9*60_000);
+  await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  await d.host.bb.storage.kv.set('crews',[]);
+  createLaunches(d.host.bb.storage.database()).save({key:launchKey('proj_1','thr_cap','/native','c9'),taskId:'c9',projectId:'proj_1',owner:'thr_cap',home:'/native',generation:1,shape:'ship',deliveryMode:'direct-PR',deliveryRequirement:'pr',state:'running',threadId:'thr_c9',hostId:'host_1',path:'/wt',updatedAt:Date.now()});
+  d.deliver('c9','thr_c9',5599,'explicitly-abandoned','closed');
+  metas='c9\tthr_c9\n';openRows=[openRow(1),openRow(5599)];states.set(5599,'OPEN');
+  t.mock.timers.tick(60_000);
+  await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.deepEqual(d.removed(),[],'the reopened PR keeps its native record');
  }finally{await d.host.harness.lifecycle.dispose();}
 });
