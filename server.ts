@@ -67,6 +67,7 @@ import { createWatchdogStore, observeIdleTurn, tripWatchdog, watchdogNoticeText,
 import { captainResumeDelay, FAILOVER_WINDOW_MS, failoverTarget, planLimitError, planLimitNotice, PROVIDER_UNAVAILABLE_KEY, providerExhausted, unavailableProviderLines, unavailableUntil, utcMinute, type ExecutionChoice, type FailedTurnInfo, type UnavailableProviders } from "./lib/provider-failover.ts";
 import { finishedCrewCandidates, isFinishedCrewWake, parseWakeRow, quietStaleVerdict, staleQueueRows, withoutFinishedCrewWakes, type FinishedCrews, type QuietVerdict } from "./lib/finished-crew-wakes.ts";
 import { createDoorbellHold, doorbellHoldDecision } from "./lib/doorbell-hold.ts";
+import { countsForFreeText, createCaptainTurns, turnIndexFromEvents, type FreeTextRow } from "./lib/free-text-turns.ts";
 import { createRetryLedger, type RetryItem, type RetryKind } from "./lib/retry-ledger.ts";
 import { HANDOFF_WAKE_AMENDMENT, captainInstructionsWithHandoff } from "./owner/handoff-contract.ts";
 import { honestIdleVerdictPresentation, interruptIsStopped, readyClaim } from "./lib/honest-status.ts";
@@ -2903,6 +2904,18 @@ export default async function plugin(bb: BbPluginApi) {
   const notificationChains = new Map<string, Promise<void>>();
   // When each captain last went active (a turn started), fed by thread.active.
   const captainTurnStartedAt = new Map<string, number>();
+  // Each captain turn's typed messages and free-text resolves, for the free-text rules (lib/free-text-turns.ts).
+  const captainTurns = createCaptainTurns();
+  /** Records a typed message or free-text resolve against the captain's running turn, by its turn id. */
+  async function recordFreeTextTool(captain: string, toolName: string): Promise<void> {
+    try {
+      const [row] = await bb.sdk.threads.events.list({ threadId: captain, types: ["turn/started"], order: "desc", limit: "1" });
+      const turnId = (row?.scope as { turnId?: unknown } | undefined)?.turnId;
+      if (typeof turnId === "string" && turnId !== "") captainTurns.used(captain, turnId, toolName);
+    } catch (error) {
+      bb.log.warn(`free text: turn of ${toolName} not recorded for ${captain}: ${String(error)}`);
+    }
+  }
   async function notifyCaptain(crew: Crew, event: string, output: string | null, signal?: AbortSignal): Promise<void> {
     const crewFinishedAt = Date.now();
     const previous = notificationChains.get(crew.threadId) ?? Promise.resolve();
@@ -5694,12 +5707,12 @@ export default async function plugin(bb: BbPluginApi) {
   let freeTextUnboundWarned = false;
 
   /**
-   * The connector's free-text obligations: the captain is told of each once, by its ref, and the connector is told after.
-   * They belong to the binding, so only the captain the connector names is told. Without that name no captain is told:
+   * The connector's free-text obligations, sorted by the turn that wrote them (captainTurns). They belong to
+   * the binding, so only the captain the connector names is told. Without that name no captain is told:
    * the obligations stay pending, and the connector's 15-minute notice tells the owner they wait.
    */
-  async function tellFreeText(captainThreadId: string): Promise<void> {
-    let rows: Array<{ ref: string; text: string; at: number }>;
+  async function untoldFreeText(captainThreadId: string): Promise<FreeTextRow[]> {
+    let rows: FreeTextRow[];
     let bound: string | undefined;
     try {
       const out = await bb.sdk.plugins.callRpc({
@@ -5709,26 +5722,65 @@ export default async function plugin(bb: BbPluginApi) {
       rows = out.obligations;
       bound = out.captainThreadId;
     } catch (error) {
-      if (isTelegramRpcMissing(error)) return;
+      if (isTelegramRpcMissing(error)) return [];
       throw error;
     }
-    if (rows.length === 0) return;
+    if (rows.length === 0) return [];
     if (bound === undefined || bound === "") {
       if (!freeTextUnboundWarned) bb.log.warn("telegram free-text check: the connector does not name its bound captain; no captain is told until it does");
       freeTextUnboundWarned = true;
-      return;
+      return [];
     }
-    if (bound !== captainThreadId) return;
-    const lines = rows.map((row) => `- ${row.ref}: "${row.text.replace(/\s+/g, " ").slice(0, 160)}"`);
-    await bb.sdk.threads.send({
-      threadId: captainThreadId, mode: "steer",
-      input: [{ type: "text", text: [
-        "Not sent to the owner: these texts were written outside a tool. If the owner needs one, send it with firstmate_reply, firstmate_alert or firstmate_ask, then call firstmate_free_text disposition=sent with its ref. If not, call firstmate_free_text disposition=no-send. One left for 15 minutes makes the connector tell the owner a message waits.",
-        ...lines,
-      ].join("\n"), mentions: [], visibility: "agent-only" }],
+    if (bound !== captainThreadId) return [];
+    // Each text's turn is the one that wrote it (its item's event), never the time the connector read it.
+    // Unread events leave each text's turn unknown, so each is reminded: never closed unseen.
+    const events = await (async () => bb.sdk.threads.events.list({ threadId: captainThreadId, types: ["item/completed", "turn/completed"], order: "desc", limit: "100" }))()
+      .catch((error) => { bb.log.warn(`free text: events of ${captainThreadId} not read: ${String(error)}`); return []; });
+    const { noSend, remind } = captainTurns.sort(captainThreadId, rows, turnIndexFromEvents(events));
+    if (noSend.length > 0) {
+      // Rules 1 and 2: resolved, so neither a reminder nor the 15-minute owner notice comes of them.
+      await bb.sdk.plugins.callRpc({
+        pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "resolveFreeText", input: { refs: noSend, disposition: "no-send" },
+        outputSchema: z.object({ resolved: z.number() }),
+      });
+      bb.log.info(`free text: ${noSend.length} closed no-send by their turn (${noSend.join(", ")})`);
+    }
+    return remind;
+  }
+
+  /**
+   * On idle, and in the sweep: closes the free texts that need no reminder, and steers nothing. A steer here
+   * started a turn of its own, whose closing text was the next free text: the 18 Oct reminder loop.
+   */
+  async function settleFreeText(captainThreadId: string): Promise<void> {
+    await serializeFreeText(captainThreadId, () => untoldFreeText(captainThreadId));
+  }
+
+  /**
+   * On the captain's real wake (a turn that started): the reminder rides on that turn, once per text, and
+   * the connector is told after. A failed send leaves them due for the next wake.
+   */
+  async function tellFreeText(captainThreadId: string): Promise<void> {
+    await serializeFreeText(captainThreadId, async () => {
+      const rows = await untoldFreeText(captainThreadId);
+      if (rows.length === 0) return;
+      const lines = rows.map((row) => `- ${row.ref}: "${row.text.replace(/\s+/g, " ").slice(0, 160)}"`);
+      await bb.sdk.threads.send({
+        threadId: captainThreadId, mode: "steer",
+        input: [{ type: "text", text: [
+          "Not sent to the owner: these texts were written outside a tool. If the owner needs one, send it with firstmate_reply, firstmate_alert or firstmate_ask, then call firstmate_free_text disposition=sent with its ref. If not, call firstmate_free_text disposition=no-send. One left for 15 minutes makes the connector tell the owner a message waits.",
+          ...lines,
+        ].join("\n"), mentions: [], visibility: "agent-only" }],
+      });
+      await confirmToConnector("ackFreeText", { refs: rows.map((row) => row.ref) });
     });
-    // Confirmed only once the captain was told: a failed send leaves them due for the next drain.
-    await confirmToConnector("ackFreeText", { refs: rows.map((row) => row.ref) });
+  }
+
+  const freeTextChains = new Map<string, Promise<unknown>>();
+  function serializeFreeText<T>(captainThreadId: string, run: () => Promise<T>): Promise<T> {
+    const next = (freeTextChains.get(captainThreadId) ?? Promise.resolve()).catch(() => {}).then(run);
+    freeTextChains.set(captainThreadId, next.catch(() => {}));
+    return next;
   }
 
   async function drainCaptainReliability(captainThreadId: string, signal?: AbortSignal): Promise<void> {
@@ -5759,8 +5811,9 @@ export default async function plugin(bb: BbPluginApi) {
           return false;
         };
         if (await reopenUndelivered(captainThreadId).then(() => false, archived("undelivered"))
-          || await tellFreeText(captainThreadId).then(() => false, archived("free-text"))) {
+          || await settleFreeText(captainThreadId).then(() => false, archived("free-text"))) {
           knownCaptainsRef.delete(captainThreadId);
+          captainTurns.forget(captainThreadId);
           bb.log.info(`captain ${captainThreadId} is archived: left the reliability drain`);
           return;
         }
@@ -12624,6 +12677,7 @@ export default async function plugin(bb: BbPluginApi) {
             const uncertain = `Wake ${id}: action outcome is uncertain. Reconcile external state before acting again, then complete with firstmate_wake handledWake. Do not blindly repeat ${tool.name}.`;
             try { result = await execute(operation, ctx); }
             catch (error) { throw new Error(`${String(error)}${id ? `\n${uncertain}` : ""}`); }
+            if (captain && countsForFreeText(tool.name) && (typeof result === "string" || !result.isError)) await recordFreeTextTool(captain, tool.name);
             if (!id) return markCaptainToolResult(result);
             if (typeof result !== "string" && result.isError) return markCaptainToolResult({
               ...result, content: [...result.content, { type: "text", text: uncertain }],
@@ -14827,6 +14881,19 @@ export default async function plugin(bb: BbPluginApi) {
   });
   bb.events.on("thread.active", async ({ thread }) => {
     captainTurnStartedAt.set(thread.id, Date.now());
+    if (knownCaptainsRef.has(thread.id)) {
+      // A real wake: the free-text reminder rides on this turn instead of starting one of its own.
+      const flags = await reliabilityFlags();
+      if (flags.inboundLedger === "on" && flags.telegramThreading === "on") {
+        await tellFreeText(thread.id).catch((error) => {
+          if (!isArchivedThreadError(error)) return bb.log.warn(`telegram free-text reminder ${thread.id}: ${String(error)}`);
+          // An archived captain refuses every send: it leaves the known captains until it is decked again.
+          knownCaptainsRef.delete(thread.id);
+          captainTurns.forget(thread.id);
+          bb.log.info(`captain ${thread.id} is archived: left the reliability drain`);
+        });
+      }
+    }
     await bb.storage.kv.delete(`captain-delivery:${thread.id}`);
     await inCaptainHome(thread.id, () => reconcileReturnedAfk(thread.id)).catch(error => bb.log.warn(`AFK return: ${String(error)}`));
     if (!isCaptainSpawn(thread)) return;
