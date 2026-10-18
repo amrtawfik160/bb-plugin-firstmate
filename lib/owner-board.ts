@@ -2,6 +2,7 @@ import { ASK_KIND_EMOJI, clip, formatAge, formatUtcTime, recommendedLabel, type 
 import { isOpenTask, linkedPrs, STALE_TASK_MS, type OwnerTask } from "./owner-tasks.ts";
 import { boardPullRequests, type BoardPr, type DeliveryRecord } from "./pr-delivery.ts";
 import { isOpenProgram, programLine, programNeedsOwner, type Program } from "./programs.ts";
+import { notLiveItems, notLiveLine, type NotLiveItem } from "./stalls.ts";
 
 /** What the owner's board and digest are drawn from. `tasks` includes closed tasks;
  * `records` holds the captain's open PRs and the ones merged since `since`. */
@@ -12,6 +13,9 @@ export type BoardInput = {
   records: readonly DeliveryRecord[];
   /** The captain's programs; closed ones are left out. */
   programs?: readonly Program[];
+  /** Merged tasks production does not run yet, with each one's next step and who takes it (from the
+   * project's live rule). Without it, they are listed with no live rule. */
+  notLive?: readonly NotLiveItem[];
   since: number;
   now: number;
 };
@@ -20,12 +24,16 @@ export type BoardInput = {
 export const BOARD_MAX_CHARS = 3900;
 export const BOARD_MAX_NEEDS_YOU = 15;
 export const BOARD_MAX_DONE = 8;
+export const BOARD_MAX_NOT_LIVE = 8;
+export const DIGEST_MAX_NOT_LIVE = 5;
 export const DIGEST_MAX_NEEDS_YOU = 5;
 export const DIGEST_MAX_STALE = 15;
 export const BOARD_ANSWER_HINT = "Tap a question's button or reply with just its letter.";
 
 const WAITING_WORDS: Partial<Record<OwnerTask["state"], string>> = { needs_you: "needs you", ready: "ready for you", check: "finished, check" };
-const DONE_STATES = new Set<OwnerTask["state"]>(["merged", "live", "done", "dropped"]);
+// Owner decision Q1 (18 Oct): only live or dropped is finished; "done" is the word of records from before.
+// Merged work is listed under Not live yet, never as finished.
+const DONE_STATES = new Set<OwnerTask["state"]>(["live", "done", "dropped"]);
 
 /** A section's own facts: `count` is the true total shown in its header. */
 type Items = { count: number; lines: string[] };
@@ -72,12 +80,12 @@ function taskLine(task: OwnerTask, now: number, ref: PrRef, extra: { state?: str
 }
 
 function doneTail(task: OwnerTask): string {
-  return task.state === "dropped" ? `dropped: ${clip(task.dropReason ?? "", 60)}` : task.state;
+  return task.state === "dropped" ? `dropped: ${clip(task.dropReason ?? "", 60)}` : task.state === "done" ? "done (before the live rule)" : task.state;
 }
 
 /** What earlier digests already told the owner. `done` maps a finished item to the `since` of the
  * digest that first listed it. */
-export type DigestMemory = { done: Record<string, number>; stale: { ids: string[]; at: number; since: number } | null };
+export type DigestMemory = { done: Record<string, number>; stale: { ids: string[]; at: number; since: number } | null; notLive?: { ids: string[]; at: number; since: number } | null };
 export const EMPTY_DIGEST_MEMORY: DigestMemory = { done: {}, stale: null };
 export const DIGEST_STALE_REPEAT_MS = 24 * 60 * 60_000;
 
@@ -105,9 +113,11 @@ function collect(input: BoardInput, ref: PrRef, listDone: (key: string) => boole
   const doneTasks = tasks.filter((task) => DONE_STATES.has(task.state) && !(task.state === "dropped" && /duplicate|merged into T\d+/i.test(task.dropReason ?? "")) && task.updatedAt >= input.since).sort((a, b) => b.updatedAt - a.updatedAt || byNumber(b, a));
   // A record's updatedAt is the last time it was observed; for a merged PR that is close to its merge.
   const mergedPrs = input.records.filter((r) => r.forgeState === "merged" && r.updatedAt >= input.since && !linked.has(r.id)).sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id));
-  const finished = [
-    ...doneTasks.map((task) => ({ key: `${task.id}:${task.state}`, line: taskLine(task, input.now, ref, { tail: doneTail(task) }) })),
-    ...mergedPrs.map((r) => ({ key: r.id, line: prLine({ ref: r.id, url: r.url, ...(r.title ? { title: r.title } : {}), state: "merged", needsOwner: false, openedAt: r.openedAt ?? r.updatedAt }, ref) })),
+  const finished = doneTasks.map((task) => ({ key: `${task.id}:${task.state}`, line: taskLine(task, input.now, ref, { tail: doneTail(task) }) }));
+  const notLiveTasks = (input.notLive ?? notLiveItems(tasks, () => undefined, input.now)).filter((item) => !heldTasks.has(item.id));
+  const notLive = [
+    ...notLiveTasks.map((item) => `- ${notLiveLine(item)}`),
+    ...mergedPrs.map((r) => `- ${prLine({ ref: r.id, url: r.url, ...(r.title ? { title: r.title } : {}), state: "merged, no task", needsOwner: false, openedAt: r.openedAt ?? r.updatedAt }, ref)}`),
   ];
   const listed = finished.filter((item) => listDone(item.key));
   const done = listed.map((item) => `- ${item.line}`);
@@ -119,11 +129,14 @@ function collect(input: BoardInput, ref: PrRef, listDone: (key: string) => boole
     ...working.map((task) => `- ${taskLine(task, input.now, ref, { prs: folded(task) })}`),
     ...(otherPrs.length > 0 ? [`Other PRs: ${otherPrs.map((pr) => `${ref(pr)} ${pr.state}`).join("; ")}`] : []),
   ];
-  const stale = tasks.filter((task) => isOpenTask(task) && input.now - task.updatedAt >= STALE_TASK_MS).map((task) => task.id);
+  // Merged tasks are listed under Not live yet, so they are not repeated as stale.
+  const stale = tasks.filter((task) => isOpenTask(task) && task.state !== "merged" && input.now - task.updatedAt >= STALE_TASK_MS).map((task) => task.id);
   return {
     asks,
     needsYou: { count: needsYou.length, lines: needsYou },
     done: { count: done.length, lines: done },
+    notLive: { count: notLive.length, lines: notLive },
+    notLiveIds: [...notLiveTasks.map((item) => item.id), ...mergedPrs.map((r) => r.id)],
     finishedKeys: finished.map((item) => item.key),
     listedKeys: listed.map((item) => item.key),
     inProgress: { count: programs.length + working.length, lines: inProgress },
@@ -179,14 +192,15 @@ export function formatBoard(input: BoardInput): string {
   const facts = collect(input, linkedRef);
   return fit([
     { title: "📌 Needs you", empty: "📌 Needs you: nothing right now.", cap: BOARD_MAX_NEEDS_YOU, items: facts.needsYou, ...(facts.asks.length > 0 ? { footer: BOARD_ANSWER_HINT } : {}) },
-    { title: "✅ Done since you last looked", empty: "✅ Done since you last looked: nothing new.", cap: BOARD_MAX_DONE, items: facts.done },
+    { title: "✅ Finished since you last looked", empty: "✅ Finished since you last looked: nothing new.", cap: BOARD_MAX_DONE, items: facts.done },
+    { title: "🚀 Not live yet", empty: "🚀 Not live yet: nothing merged waits to go live.", cap: BOARD_MAX_NOT_LIVE, items: facts.notLive },
     { title: "🔧 In progress", empty: "🔧 In progress: nothing open.", cap: Infinity, items: facts.inProgress },
   ], BOARD_MAX_CHARS, visibleLength);
 }
 
 /** A short catch-up for the owner; empty when there is nothing to say. */
 export function formatDigest(input: BoardInput): string {
-  return digestText(collect(input, plainRef), true);
+  return digestText(collect(input, plainRef), true, true);
 }
 
 /** The digest without what an earlier digest already said: a finished item is listed once, and an
@@ -203,14 +217,19 @@ export function digestOnce(input: BoardInput, memory: DigestMemory): { text: str
     return since === undefined ? [] : [[key, since]];
   }));
   const stale = facts.stale.length === 0 ? null : showStale ? { ids: facts.stale, at: input.now, since: input.since } : last;
-  return { text: digestText(facts, showStale), memory: { done, stale } };
+  // The not-live list follows the stale rule: once a day unless it changed.
+  const lastNotLive = memory.notLive ?? null;
+  const showNotLive = lastNotLive === null || lastNotLive.since === input.since || lastNotLive.ids.join() !== facts.notLiveIds.join() || input.now - lastNotLive.at >= DIGEST_STALE_REPEAT_MS;
+  const notLive = facts.notLiveIds.length === 0 ? null : showNotLive ? { ids: facts.notLiveIds, at: input.now, since: input.since } : lastNotLive;
+  return { text: digestText(facts, showStale, showNotLive), memory: { done, stale, notLive } };
 }
 
-function digestText(facts: ReturnType<typeof collect>, showStale: boolean): string {
+function digestText(facts: ReturnType<typeof collect>, showStale: boolean, showNotLive: boolean): string {
   const stale = facts.stale.length > DIGEST_MAX_STALE ? [...facts.stale.slice(0, DIGEST_MAX_STALE), "…"] : facts.stale;
   const sections: Section[] = [
     { title: "Needs you", empty: "", cap: DIGEST_MAX_NEEDS_YOU, items: facts.needsYou },
-    { title: "Done", empty: "", cap: BOARD_MAX_DONE, items: facts.done },
+    { title: "Finished", empty: "", cap: BOARD_MAX_DONE, items: facts.done },
+    ...(showNotLive ? [{ title: "Not live yet", empty: "", cap: DIGEST_MAX_NOT_LIVE, items: facts.notLive }] : []),
     // An open program is listed in every digest until each ticket is done or dropped.
     { title: "Programs", empty: "", cap: Infinity, items: facts.programs },
   ].filter((section) => section.items.count > 0);

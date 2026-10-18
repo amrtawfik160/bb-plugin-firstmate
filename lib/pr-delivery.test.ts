@@ -103,7 +103,9 @@ test("a green PR with a do-not-merge comment on its current head is on hold, not
   assert.equal(boardFor(runants1759()), [
     "📌 Needs you: nothing right now.",
     "",
-    "✅ Done since you last looked: nothing new.",
+    "✅ Finished since you last looked: nothing new.",
+    "",
+    "🚀 Not live yet: nothing merged waits to go live.",
     "",
     "🔧 In progress: nothing open.",
     "Other PRs: [runants#1759](https://github.com/hazw80801/runants/pull/1759) on hold",
@@ -136,7 +138,9 @@ test("a held PR that gets new commits needs a captain check before it can show r
   assert.equal(board, [
     "📌 Needs you: nothing right now.",
     "",
-    "✅ Done since you last looked: nothing new.",
+    "✅ Finished since you last looked: nothing new.",
+    "",
+    "🚀 Not live yet: nothing merged waits to go live.",
     "",
     "🔧 In progress: nothing open.",
     "Other PRs: [runants#1759](https://github.com/hazw80801/runants/pull/1759) changed since hold, needs a check",

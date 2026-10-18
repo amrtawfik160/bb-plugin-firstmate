@@ -72,7 +72,7 @@ bb.sdk.plugins.callRpc({
 sends `progress` with `more=true`, `final` for a task's result, and `reply`
 otherwise. `task` is the owner task (`T<n>`) the answer belongs to: the one
 passed to `firstmate_reply`, or the task the owner message started. `result`
-is true when that task is closed (done, merged, live or dropped) and the reply
+is true when the captain marks the answer as the task's result (result=true) and the reply
 is not `more=true`. A send counts
 only when `queued > 0` or `duplicate` is true. `dropped` means the connector
 sent nothing because Decisions is sure the text only says the work started, or

@@ -82,7 +82,9 @@ test("old ask databases migrate without losing open asks and unparsed decisions 
     "1. ❓ Approve cleanup? (0 min, ask anew) https://t.me/c/200/3004",
     "Tap a question's button or reply with just its letter.",
     "",
-    "✅ Done since you last looked: nothing new.",
+    "✅ Finished since you last looked: nothing new.",
+    "",
+    "🚀 Not live yet: nothing merged waits to go live.",
     "",
     "🔧 In progress: nothing open.",
   ].join("\n"));

@@ -5,6 +5,26 @@ import { readFileSync } from "node:fs";
 
 export type ProofSurface = "iphone" | "web" | "message";
 export type SharedServer = { id: string; about: string; reset: string };
+/**
+ * One read-only check of what production runs (owner decision Q9, 18 Oct). `repos` limits it to PRs of
+ * those repos; without it, it covers every repo of the project. Credentials come from `envFile` at run time.
+ */
+export type LiveCheck =
+  | { kind: "plugin-reload"; plugin: string; repos?: readonly string[] }
+  | { kind: "eas-update"; appId: string; channels: readonly string[]; envFile: string; repos?: readonly string[] }
+  | { kind: "coolify-deploy"; envFile: string; baseUrlVar: string; appVar: string; tokenVar: string; repos?: readonly string[] }
+  | { kind: "release-readback"; repos?: readonly string[] };
+/** How a project goes live (owner decision Q2, 18 Oct). */
+export type LiveRule = {
+  definition: string;
+  next: string;
+  actor: string;
+  checks: readonly LiveCheck[];
+  /** Why no check proves some or all of its work yet. */
+  missing?: string;
+  /** Backend files whose change must be deployed too: a PR that touches `paths` needs a backend check to prove it. */
+  backend?: { paths: readonly string[]; what: string; checks: readonly LiveCheck[]; missing: string; repos?: readonly string[] };
+};
 export type ProjectRule = {
   name: string;
   repos: readonly string[];
@@ -12,6 +32,7 @@ export type ProjectRule = {
   proofSurface: ProofSurface;
   release?: { kind: "testflight"; group: string };
   sharedServers?: readonly SharedServer[];
+  live?: LiveRule;
 };
 export type ProjectTable = {
   surfaces: Readonly<Record<ProofSurface, string>>;
@@ -27,6 +48,10 @@ const glob = (pattern: string) => new RegExp(`^${pattern.split("*").map((part) =
 /** The repository of a GitHub PR or repo link, as owner/repo. */
 export function repoOf(url: string): string {
   return /github\.com\/([^/]+\/[^/#?]+)/i.exec(url)?.[1] ?? url.split("#")[0]!;
+}
+
+export function repoMatches(pattern: string, repo: string): boolean {
+  return glob(pattern).test(repo);
 }
 
 export function projectForRepo(repo: string, table: ProjectTable = PROJECTS): ProjectRule | undefined {
@@ -76,7 +101,7 @@ export function projectBriefLines(project: ProjectRule | undefined, table: Proje
     lines.push(`This host cannot drive ${surfaceWords(surface, table)}. When the PR is open and its test build is out, send the owner the build and what to check: \`bb firstmate deliveries device-proof <owner/repo#n> --commit <head> --build <id> --link <TestFlight or OTA link> --check "<what to check>"\`. His Works tap is the proof record. Do not record verification yourself, and do not report the change proven before he taps Works.`);
   }
   if (project.release !== undefined) {
-    lines.push(`Releases: every ${project.name} build goes to the "${project.release.group}" TestFlight public-link group. Read the build's groups back from App Store Connect or EAS and record what you read: \`bb firstmate deliveries release --task T<n> --build <id> --group "${project.release.group}" --source app-store-connect|eas --seen "<what it showed>"\`. A release is done only with that read-back.`);
+    lines.push(`Releases: every ${project.name} build goes to the "${project.release.group}" TestFlight public-link group. Read the build's groups back from App Store Connect or EAS and record what you read: \`bb firstmate deliveries release --task T<n> --build <id> --group "${project.release.group}" --source app-store-connect|eas --seen "<what it showed>" --commit <commit the build was built from>\` (EAS shows it as gitCommitHash: \`eas build:view <id> --json\`). A read-back proves only the merges that commit holds; a build time is not proof.`);
   }
   for (const server of project.sharedServers ?? []) {
     lines.push(`Shared test server ${server.id} (${server.about}) serves one crew at a time. Before you use it: \`bb firstmate lease acquire ${server.id}\`, and wait until it is yours. After: ${server.reset}, then \`bb firstmate lease release ${server.id} --reset "<what you did>"\`.`);

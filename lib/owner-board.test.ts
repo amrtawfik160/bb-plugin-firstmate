@@ -71,11 +71,13 @@ test("the board shows what needs the owner, what finished since they last looked
     "1. T15 Cyndra · Memory screen · ready for you · 4 h · [cyndra-saas#2115](https://github.com/cyndra-ai/cyndra-saas/pull/2115) ready to merge",
     "2. PR [runants#1770](https://github.com/hazw80801/runants/pull/1770) Fix the checkout total rounding on the cart page… · ready to merge",
     "",
-    "✅ Done since you last looked (4)",
-    "- T7 Areliaa · Agent group chats part 2 · merged",
-    "- T14 Weekly email test to amr@cyndra.ai · done",
+    "✅ Finished since you last looked (2)",
+    "- T14 Weekly email test to amr@cyndra.ai · done (before the live rule)",
     "- T16 Brands audit · dropped: Owner moved the audit to next week",
-    "- PR [areliaa#283](https://github.com/amrtawfik160/areliaa/pull/283) Bump the email template · merged",
+    "",
+    "🚀 Not live yet (2)",
+    "- T7 Areliaa · Agent group chats part 2 · merged 2 h ago · next: name how this project goes live in owner/projects.json · the captain",
+    "- PR [areliaa#283](https://github.com/amrtawfik160/areliaa/pull/283) Bump the email template · merged, no task",
     "",
     "🔧 In progress (2)",
     "- T1 Areliaa · Fix the Metricool sync · 2 d · stale 2 d",
@@ -88,7 +90,9 @@ test("an empty board is three short lines", () => {
   assert.equal(formatBoard(input()), [
     "📌 Needs you: nothing right now.",
     "",
-    "✅ Done since you last looked: nothing new.",
+    "✅ Finished since you last looked: nothing new.",
+    "",
+    "🚀 Not live yet: nothing merged waits to go live.",
     "",
     "🔧 In progress: nothing open.",
   ].join("\n"));
@@ -98,7 +102,9 @@ test("with no task running, open pull requests still show under the empty In pro
   assert.equal(formatBoard(input({ records: [pr("acme/web#7", { status: "failing-checks" }), pr("acme/repo#9", { status: "draft", openedAt: NOW - 2 * HOUR })] })), [
     "📌 Needs you: nothing right now.",
     "",
-    "✅ Done since you last looked: nothing new.",
+    "✅ Finished since you last looked: nothing new.",
+    "",
+    "🚀 Not live yet: nothing merged waits to go live.",
     "",
     "🔧 In progress: nothing open.",
     "Other PRs: [repo#9](https://github.com/acme/repo/pull/9) draft; [web#7](https://github.com/acme/web/pull/7) checks failed",
@@ -127,25 +133,34 @@ test("Needs you lists open asks oldest first, then crew items, then tasks and PR
     "6. PR [repo#4](https://github.com/acme/repo/pull/4) Lost manager · waiting on you",
     "Tap a question's button or reply with just its letter.",
     "",
-    "✅ Done since you last looked: nothing new.",
+    "✅ Finished since you last looked: nothing new.",
+    "",
+    "🚀 Not live yet: nothing merged waits to go live.",
     "",
     "🔧 In progress: nothing open.",
   ].join("\n"));
 });
 
-test("Needs you shows 15 items and Done shows 8, each with a true count", () => {
+test("Needs you shows 15 items, Finished 8 and Not live yet 8, each with a true count", () => {
   const text = formatBoard(input({
     calls: Array.from({ length: 18 }, (_, i) => `call ${i + 1}`),
-    tasks: Array.from({ length: 10 }, (_, i) => task(`T${i + 1}`, { state: "done", updatedAt: NOW - (i + 1) * MIN })),
+    tasks: [
+      ...Array.from({ length: 10 }, (_, i) => task(`T${i + 1}`, { state: "live", updatedAt: NOW - (i + 1) * MIN })),
+      ...Array.from({ length: 9 }, (_, i) => task(`T${i + 31}`, { state: "merged", updatedAt: NOW - (i + 1) * HOUR })),
+    ],
   }));
   assert.equal(text, [
     "📌 Needs you (18)",
     ...Array.from({ length: 15 }, (_, i) => `${i + 1}. call ${i + 1}`),
     "…and 3 more",
     "",
-    "✅ Done since you last looked (10)",
-    ...Array.from({ length: 8 }, (_, i) => `- T${i + 1} Task T${i + 1} · done`),
+    "✅ Finished since you last looked (10)",
+    ...Array.from({ length: 8 }, (_, i) => `- T${i + 1} Task T${i + 1} · live`),
     "…and 2 more",
+    "",
+    "🚀 Not live yet (9)",
+    ...Array.from({ length: 8 }, (_, i) => `- T${39 - i} Task T${39 - i} · merged ${9 - i} h ago · next: name how this project goes live in owner/projects.json · the captain`),
+    "…and 1 more",
     "",
     "🔧 In progress: nothing open.",
   ].join("\n"));
@@ -161,7 +176,9 @@ test("an overfull board drops In progress lines first and keeps every Needs you 
     "2. ? d1 :: Use Postgres? (yes / no)",
     "Tap a question's button or reply with just its letter.",
     "",
-    "✅ Done since you last looked: nothing new.",
+    "✅ Finished since you last looked: nothing new.",
+    "",
+    "🚀 Not live yet: nothing merged waits to go live.",
     "",
     "🔧 In progress (60)",
   ];
@@ -185,8 +202,10 @@ test("every PR on the board links to its GitHub page under its short name", () =
     "📌 Needs you (1)",
     "1. PR [cyndra-saas#2140](https://github.com/cyndra-ai/cyndra-saas/pull/2140) Lost manager · waiting on you",
     "",
-    "✅ Done since you last looked (1)",
-    "- PR [areliaa#283](https://github.com/amrtawfik160/areliaa/pull/283) Bump the email template · merged",
+    "✅ Finished since you last looked: nothing new.",
+    "",
+    "🚀 Not live yet (1)",
+    "- PR [areliaa#283](https://github.com/amrtawfik160/areliaa/pull/283) Bump the email template · merged, no task",
     "",
     "🔧 In progress (1)",
     "- T2 Cyndra · Memory screen · 1 h · [cyndra-saas#2146](https://github.com/cyndra-ai/cyndra-saas/pull/2146) ready to merge",
@@ -202,7 +221,9 @@ test("the board limit counts what the owner sees, so long link addresses drop no
     "📌 Needs you (15)",
     ...records.map((r, i) => `${i + 1}. PR [repo#${i + 1}](${r.url}) · waiting on you`),
     "",
-    "✅ Done since you last looked: nothing new.",
+    "✅ Finished since you last looked: nothing new.",
+    "",
+    "🚀 Not live yet: nothing merged waits to go live.",
     "",
     "🔧 In progress: nothing open.",
   ].join("\n"));
@@ -220,11 +241,13 @@ test("the digest lists what needs the owner, what finished, and which tasks went
     "2. T20 Quiet one · needs you · 30 h · stale 30 h",
     "3. PR runants#1770 Fix the checkout total rounding on the cart page… · ready to merge",
     "",
-    "Done (4)",
-    "- T7 Areliaa · Agent group chats part 2 · merged",
-    "- T14 Weekly email test to amr@cyndra.ai · done",
+    "Finished (2)",
+    "- T14 Weekly email test to amr@cyndra.ai · done (before the live rule)",
     "- T16 Brands audit · dropped: Owner moved the audit to next week",
-    "- PR areliaa#283 Bump the email template · merged",
+    "",
+    "Not live yet (2)",
+    "- T7 Areliaa · Agent group chats part 2 · merged 2 h ago · next: name how this project goes live in owner/projects.json · the captain",
+    "- PR areliaa#283 Bump the email template · merged, no task",
     "",
     "Stale (2): T1, T20",
   ].join("\n"));
@@ -267,7 +290,9 @@ test("Oct 8 repro: PR words say what the PR needs, and nobody is told a PR waits
   })), [
     "📌 Needs you: nothing right now.",
     "",
-    "✅ Done since you last looked: nothing new.",
+    "✅ Finished since you last looked: nothing new.",
+    "",
+    "🚀 Not live yet: nothing merged waits to go live.",
     "",
     "🔧 In progress (5)",
     "- T13 RunAnts · Shopify UI · 1 h · [runants#1759](https://github.com/hazw80801/runants/pull/1759) changed since hold, needs a check; [runants#1760](https://github.com/hazw80801/runants/pull/1760) on hold",
@@ -278,9 +303,9 @@ test("Oct 8 repro: PR words say what the PR needs, and nobody is told a PR waits
   ].join("\n"));
 });
 
-test("dropped duplicate tasks stay out of both done lists", () => {
+test("dropped duplicate tasks stay out of both finished lists", () => {
   const facts = input({ tasks: [task("T44", { state: "dropped", dropReason: "Duplicate of T2" }), task("T38", { state: "dropped", dropReason: "Merged into T37: the same PR" })] });
-  assert.equal(formatBoard(facts), "📌 Needs you: nothing right now.\n\n✅ Done since you last looked: nothing new.\n\n🔧 In progress: nothing open.");
+  assert.equal(formatBoard(facts), "📌 Needs you: nothing right now.\n\n✅ Finished since you last looked: nothing new.\n\n🚀 Not live yet: nothing merged waits to go live.\n\n🔧 In progress: nothing open.");
   assert.equal(formatDigest(facts), "");
 });
 
@@ -289,18 +314,18 @@ test("Oct 12 repro: a finished item is listed in one digest only, though its rec
   const record = (at: number) => merged("cyndra-ai/cyndra-saas#2146", { title: "StraightLine recording fix", updatedAt: at });
   const done = task("T90", { title: "Email test", state: "done", updatedAt: NOW - HOUR });
   const first = digestOnce(input({ tasks: [done], records: [record(NOW - HOUR)] }), EMPTY_DIGEST_MEMORY);
-  assert.equal(first.text, "Done (2)\n- T90 Email test · done\n- PR cyndra-saas#2146 StraightLine recording fix · merged");
+  assert.equal(first.text, "Finished (1)\n- T90 Email test · done (before the live rule)\n\nNot live yet (1)\n- PR cyndra-saas#2146 StraightLine recording fix · merged, no task");
   const later = { since: NOW, now: NOW + 2 * HOUR };
   const second = digestOnce(input({ ...later, tasks: [{ ...done, updatedAt: NOW + HOUR }], records: [record(NOW + HOUR)] }), first.memory);
   assert.equal(second.text, "");
   const fresh = digestOnce(input({ ...later, tasks: [done], records: [record(NOW + HOUR), merged("cyndra-ai/cyndra-saas#2150", { updatedAt: NOW + HOUR })] }), second.memory);
-  assert.equal(fresh.text, "Done (1)\n- PR cyndra-saas#2150 · merged", "a newly finished item is still listed, with the count of new items");
+  assert.equal(fresh.text, "Not live yet (2)\n- PR cyndra-saas#2146 StraightLine recording fix · merged, no task\n- PR cyndra-saas#2150 · merged, no task", "a changed not-live list is listed again, whole");
 });
 
 test("a digest that is asked for again with the same since repeats its items, because the first one was not sent", () => {
   const facts = input({ records: [merged("acme/repo#2")], tasks: [task("T1", { updatedAt: NOW - 30 * HOUR })] });
   const first = digestOnce(facts, EMPTY_DIGEST_MEMORY);
-  assert.equal(first.text, "Done (1)\n- PR repo#2 · merged\n\nStale (1): T1");
+  assert.equal(first.text, "Not live yet (1)\n- PR repo#2 · merged, no task\n\nStale (1): T1");
   assert.equal(digestOnce({ ...facts, now: NOW + MIN }, first.memory).text, first.text);
 });
 

@@ -1334,7 +1334,7 @@ const board = (host: Host) => host.harness.behavior.callRpc("telegramCommand", {
 test("telegramCommand board says nothing needs the owner and reports the captain is not away", async () => {
   const host = await boardHost();
   try {
-    assert.deepEqual(await board(host), { text: "📌 Needs you: nothing right now.\n\n✅ Done since you last looked: nothing new.\n\n🔧 In progress: nothing open.", away: false, projects: [] });
+    assert.deepEqual(await board(host), { text: "📌 Needs you: nothing right now.\n\n✅ Finished since you last looked: nothing new.\n\n🚀 Not live yet: nothing merged waits to go live.\n\n🔧 In progress: nothing open.", away: false, projects: [], notLive: [] });
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -1351,7 +1351,7 @@ test("telegramCommand board lists open asks then crew items, and reports /afk as
     asks(host).create({ id: "a000002", captain: "thr_cap", kind: "question", text: "Dark mode?", options: [{ label: "Yes", value: "y" }], recommended: 0, defaultAt: at, createdAt: created + 1 });
     asks(host).create({ id: "a000003", captain: "thr_other", kind: "question", text: "Not mine", options: [], createdAt: created });
     assert.deepEqual(await board(host), {
-      away: true, projects: [],
+      away: true, projects: [], notLive: [],
       text: [
         "📌 Needs you (3)",
         "1. ⛔ Need the Stripe key. (5 min, ask a000001)",
@@ -1359,7 +1359,9 @@ test("telegramCommand board lists open asks then crew items, and reports /afk as
         "3. Needs captain: Telegram threaded replies are off in the Telegram connector, but Firstmate's telegramThreading flag is on, so replies arrive unthreaded. Turn th…",
         "Tap a question's button or reply with just its letter.",
         "",
-        "✅ Done since you last looked: nothing new.",
+        "✅ Finished since you last looked: nothing new.",
+        "",
+        "🚀 Not live yet: nothing merged waits to go live.",
         "",
         "🔧 In progress: nothing open.",
       ].join("\n"),
@@ -1377,14 +1379,16 @@ test("telegramCommand board caps the list at 15 lines", async () => {
       asks(host).create({ id: `a0000${String(i).padStart(2, "0")}`, captain: "thr_cap", kind: "question", text: `Question ${i}?`, options: [], createdAt: created + i });
     }
     assert.deepEqual(await board(host), {
-      away: false, projects: [],
+      away: false, projects: [], notLive: [],
       text: [
         "📌 Needs you (17)",
         ...Array.from({ length: 15 }, (_, i) => `${i + 1}. ❓ Question ${i + 1}? (5 min, ask a0000${String(i + 1).padStart(2, "0")})`),
         "…and 2 more",
         "Tap a question's button or reply with just its letter.",
         "",
-        "✅ Done since you last looked: nothing new.",
+        "✅ Finished since you last looked: nothing new.",
+        "",
+        "🚀 Not live yet: nothing merged waits to go live.",
         "",
         "🔧 In progress: nothing open.",
       ].join("\n"),
@@ -1407,12 +1411,14 @@ test("telegramCommand board keeps decisions, drops launch bookkeeping, and lists
     const merged = store.register({ url: "https://github.com/acme/repo/pull/9", taskId: "c3", projectId: "proj_1", owner: "thr_cap", home: "", worker: "thr_c3" });
     store.save({ ...merged, status: "complete" });
     assert.deepEqual(await board(host), {
-      away: false, projects: [],
+      away: false, projects: [], notLive: [],
       text: [
         "📌 Needs you (1)",
         '1. ? d1 :: Use Postgres? (yes / no) — answer: decide answer d1 -- "<answer>"',
         "",
-        "✅ Done since you last looked: nothing new.",
+        "✅ Finished since you last looked: nothing new.",
+        "",
+        "🚀 Not live yet: nothing merged waits to go live.",
         "",
         "🔧 In progress: nothing open.",
         "Other PRs: [repo#7](https://github.com/acme/repo/pull/7) checks running",

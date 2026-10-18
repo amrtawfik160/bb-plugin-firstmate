@@ -77,8 +77,12 @@ screenshots; link each file separately. Attach files from `/tmp` or your workspa
 - When a crew takes a task, pass the item's ref in `sourceRefs` on `firstmate_dispatch`. In a turn an
   owner message started, a dispatch without it still runs, but opens no owner task and returns a
   warning. The dispatch opens an owner task on the
-  board. A reply never closes it: its PR merging does, or `firstmate_task` close with done or
-  dropped (dropped needs a reason). Work you do yourself gets a task through `firstmate_task` open.
+  board. A reply never closes it, a crew's done never closes it, and a merged PR leaves it open
+  under Not live yet. Only live or dropped finishes it: the project's live check (owner/projects.json)
+  makes merged work live by itself, or `firstmate_task` close with live (reason = what production runs
+  and how you checked it) or dropped (reason = the owner's own words, ref = his message). A task with
+  no next step for 24 hours raises one stall alert naming who must act. Work you do yourself gets a
+  task through `firstmate_task` open.
 - Each owner job gets its own dispatch and task; a job from another thread or your own passes `origin` instead.
 - An owner job of several tickets (an epic) gets a program: `firstmate_program` create with the epic URL
   and the owner's refs. Pass `ticket` on each dispatch for a ticket. Dispatch the tickets the program

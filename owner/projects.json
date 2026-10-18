@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "about": "Owner decisions Q5 and Q11 (17 Oct). The Canary row is the isolated-server test project. Each project names the surface its proof must come from, the release read-back its app builds need, and the shared test servers its crews lease one at a time. A PR belongs to the project whose repos list its repository (owner/repo, * is a wildcard); a crew belongs to the project whose repos list its repository or whose bbProjects list its BB project name. hostCanDrive lists the surfaces a crew on this host can drive itself; for any other surface the crew asks the owner to test the build, and his Works tap is the proof record.",
+  "about": "Owner decisions Q5 and Q11 (17 Oct). The Canary row is the isolated-server test project. Each project names the surface its proof must come from, the release read-back its app builds need, and the shared test servers its crews lease one at a time. A PR belongs to the project whose repos list its repository (owner/repo, * is a wildcard); a crew belongs to the project whose repos list its repository or whose bbProjects list its BB project name. hostCanDrive lists the surfaces a crew on this host can drive itself; for any other surface the crew asks the owner to test the build, and his Works tap is the proof record. live (owner decision Q2, 18 Oct) says how the project goes live: definition is the owner's words, next the step that makes merged work live, actor who takes it, checks the read-only production checks that prove it (any one check that proves a merged PR is enough; a PR whose repo no check lists has none), missing why no check exists yet, and backend the backend folders whose change must be deployed too (a PR that changes them stays not live until a backend check proves it).",
   "surfaces": {
     "iphone": "the app on an iPhone or the iOS Simulator",
     "web": "the deployed web page in a browser",
@@ -13,14 +13,50 @@
       "repos": ["amrtawfik160/dr.woo"],
       "bbProjects": ["woo-app", "Dr Woo"],
       "proofSurface": "iphone",
-      "release": { "kind": "testflight", "group": "Externals" }
+      "release": {
+        "kind": "testflight",
+        "group": "Externals"
+      },
+      "live": {
+        "definition": "A new TestFlight build in the public-link group (Externals), or an OTA update on the production channel.",
+        "next": "ship a TestFlight build to Externals and record its read-back, or publish an OTA update to production",
+        "actor": "the captain",
+        "checks": [
+          {
+            "kind": "release-readback"
+          },
+          {
+            "kind": "eas-update",
+            "appId": "59afc438-c6e6-46ef-ab55-2dc741339cde",
+            "channels": ["production"],
+            "envFile": "/root/.bb-server/secrets/expo.env"
+          }
+        ]
+      }
     },
     {
       "name": "Safi",
       "repos": ["amrtawfik160/safi"],
       "bbProjects": ["Safi"],
       "proofSurface": "iphone",
-      "release": { "kind": "testflight", "group": "Beta Testers" }
+      "release": {
+        "kind": "testflight",
+        "group": "Beta Testers"
+      },
+      "live": {
+        "definition": "Published by OTA to the preview and production channels, with the backend deployed.",
+        "next": "publish the OTA update to preview and production and deploy the backend",
+        "actor": "the captain",
+        "checks": [
+          {
+            "kind": "eas-update",
+            "appId": "bfcd1990-ebd3-456c-b945-6adfd8a97e2c",
+            "channels": ["production", "preview"],
+            "envFile": "/root/.bb-server/secrets/expo.env"
+          }
+        ],
+        "backend": { "paths": ["artifacts/mobile/convex/"], "what": "the Convex backend", "checks": [], "missing": "Convex keeps no record of the deployed commit: its deployment answers only with bundle hashes" }
+      }
     },
     {
       "name": "Cyndra",
@@ -28,42 +64,129 @@
       "bbProjects": ["Cyndra", "Cyndra SaaS"],
       "proofSurface": "web",
       "sharedServers": [
-        { "id": "cyndra-dev", "about": "the shared Cyndra dev server", "reset": "deploy main back to the dev server" }
-      ]
+        {
+          "id": "cyndra-dev",
+          "about": "the shared Cyndra dev server",
+          "reset": "deploy main back to the dev server"
+        }
+      ],
+      "live": {
+        "definition": "Deployed to production in a release window and checked there.",
+        "next": "deploy to production in a release window and check it there",
+        "actor": "the captain",
+        "checks": [],
+        "missing": "no record says which commit Cyndra production runs: GitHub's last Production deployment is from 4 Oct, and the daily production drift check stopped on 27 Sep"
+      }
     },
     {
       "name": "Areliaa",
       "repos": ["amrtawfik160/areliaa"],
       "bbProjects": ["Areliaa"],
-      "proofSurface": "web"
+      "proofSurface": "web",
+      "live": {
+        "definition": "Deployed by Coolify.",
+        "next": "deploy it with Coolify",
+        "actor": "the captain",
+        "checks": [
+          {
+            "kind": "coolify-deploy",
+            "envFile": "/root/.bb-server/secrets/areliaa.env",
+            "baseUrlVar": "COOLIFY_BASE_URL",
+            "appVar": "COOLIFY_APPLICATION_UUID",
+            "tokenVar": "COOLIFY_API_TOKEN"
+          }
+        ]
+      }
     },
     {
       "name": "Parknwash",
       "repos": ["xtawfik/parknwash-*"],
       "bbProjects": ["Parknwash"],
-      "proofSurface": "web"
+      "proofSurface": "web",
+      "live": {
+        "definition": "Deployed by Coolify (the API before the web app when the web app needs an API migration).",
+        "next": "deploy it with Coolify, the API first",
+        "actor": "the captain",
+        "checks": [
+          {
+            "kind": "coolify-deploy",
+            "repos": ["xtawfik/parknwash-api"],
+            "envFile": "/root/.bb-server/secrets/parknwash.env",
+            "baseUrlVar": "COOLIFY_URL",
+            "appVar": "COOLIFY_API_APPLICATION_UUID",
+            "tokenVar": "COOLIFY_API_TOKEN"
+          },
+          {
+            "kind": "coolify-deploy",
+            "repos": ["xtawfik/parknwash-webapp"],
+            "envFile": "/root/.bb-server/secrets/parknwash.env",
+            "baseUrlVar": "COOLIFY_URL",
+            "appVar": "COOLIFY_WEBAPP_APPLICATION_UUID",
+            "tokenVar": "COOLIFY_API_TOKEN"
+          }
+        ]
+      }
     },
     {
       "name": "Runants",
       "repos": ["hazw80801/runants"],
       "bbProjects": ["runants", "Runants"],
-      "proofSurface": "web"
+      "proofSurface": "web",
+      "live": {
+        "definition": "Not named by the owner yet.",
+        "next": "ask the owner how Runants goes live",
+        "actor": "the captain",
+        "checks": [],
+        "missing": "the owner has not named how Runants goes live"
+      }
     },
     {
       "name": "Canary",
       "repos": ["*/fm-canary-*"],
       "bbProjects": ["fm-canary", "fm-canary-34"],
       "proofSurface": "iphone",
-      "release": { "kind": "testflight", "group": "Canary Testers" },
+      "release": {
+        "kind": "testflight",
+        "group": "Canary Testers"
+      },
       "sharedServers": [
-        { "id": "canary-dev", "about": "the canary test server", "reset": "deploy main back to the canary test server" }
-      ]
+        {
+          "id": "canary-dev",
+          "about": "the canary test server",
+          "reset": "deploy main back to the canary test server"
+        }
+      ],
+      "live": {
+        "definition": "The isolated test project: nothing of it goes to production.",
+        "next": "none: canary work is test work",
+        "actor": "the captain",
+        "checks": [],
+        "missing": "the canary project has no production"
+      }
     },
     {
       "name": "Telegram and agents",
       "repos": ["amrtawfik160/bb-plugin-telegram", "amrtawfik160/bb-plugin-firstmate", "*/agent-orchestrator"],
       "bbProjects": ["bb-plugin-telegram", "bb-plugin-firstmate", "agent-orchestrator"],
-      "proofSurface": "message"
+      "proofSurface": "message",
+      "live": {
+        "definition": "The Firstmate and Telegram plugins: merged, and the plugin reloaded on this host.",
+        "next": "reload the plugin on this host",
+        "actor": "the repair thread",
+        "checks": [
+          {
+            "kind": "plugin-reload",
+            "plugin": "firstmate",
+            "repos": ["amrtawfik160/bb-plugin-firstmate"]
+          },
+          {
+            "kind": "plugin-reload",
+            "plugin": "telegram",
+            "repos": ["amrtawfik160/bb-plugin-telegram"]
+          }
+        ],
+        "missing": "no live check for agent-orchestrator: the owner has not named how it goes live"
+      }
     }
   ]
 }

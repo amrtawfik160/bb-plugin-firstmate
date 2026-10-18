@@ -47,3 +47,22 @@ test("runants has a web rule; an unlisted repo gets a note naming the missing ru
   assert.equal(projectForRepo("amrtawfik160/framed"), undefined);
   assert.equal(unlistedNote("amrtawfik160/framed"), "no proof rule for amrtawfik160/framed: add one in owner/projects.json");
 });
+
+// Owner decision Q2 (18 Oct): each project says how it goes live and names the check that proves it.
+test("every project has a live rule: a check that proves it, or the reason none exists", () => {
+  for (const project of PROJECTS.projects) {
+    const live = project.live;
+    assert.ok(live, `${project.name} has no live rule`);
+    assert.ok(live.definition && live.next && live.actor, project.name);
+    assert.ok(live.checks.length > 0 || (live.missing ?? "") !== "", `${project.name}: no check and no reason`);
+  }
+  assert.deepEqual(projectForName("Safi")!.live!.checks.map((c) => c.kind === "eas-update" ? c.channels : c.kind), [["production", "preview"]]);
+  assert.deepEqual(projectForName("Dr Woo")!.live!.checks.map((c) => c.kind), ["release-readback", "eas-update"]);
+  assert.deepEqual(projectForName("Cyndra")!.live!.checks, []);
+  assert.deepEqual(projectForName("Areliaa")!.live!.checks.map((c) => c.kind), ["coolify-deploy"]);
+  assert.deepEqual(projectForName("Parknwash")!.live!.checks.map((c) => c.repos), [["xtawfik/parknwash-api"], ["xtawfik/parknwash-webapp"]]);
+  assert.deepEqual(projectForName("bb-plugin-firstmate")!.live!.checks.map((c) => c.kind === "plugin-reload" ? c.plugin : c.kind), ["firstmate", "telegram"]);
+  for (const project of PROJECTS.projects) for (const check of project.live!.checks) {
+    if ("envFile" in check) assert.match(check.envFile, /^\/root\/\.bb-server\/secrets\/[\w.-]+\.env$/, "credentials only from the host's secrets folder");
+  }
+});

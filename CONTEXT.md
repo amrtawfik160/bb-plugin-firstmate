@@ -4,6 +4,8 @@ Glossary for this project. It maps the upstream [firstmate](https://github.com/k
 captain/crew protocol onto BB primitives. Terms only — no implementation detail;
 for decisions see [docs/adr/](docs/adr/). Where a term means something different
 here than in native firstmate, that difference is called out.
+The life of an owner's piece of work (task, spec, ticket, stall, merged, live,
+dropped, finished) is in [GLOSSARY.md](GLOSSARY.md).
 
 ## Language
 
