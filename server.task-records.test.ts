@@ -208,7 +208,9 @@ test("free-text safety: the captain is told of each free text the connector hold
     let obligations = [{ ref: "agent:i9", text: "Safi is down: Convex disabled the account.", at: 1 }];
     host.harness.sdk.stub("plugins.callRpc", async (args: Rpc) => {
       calls.push(args);
-      if (args.method === "freeText") { const rows = obligations; obligations = []; return { obligations: rows, captainThreadId: "thr_cap" }; }
+      // As the connector: each is returned again until ackFreeText confirms the tell.
+      if (args.method === "freeText") return { obligations, captainThreadId: "thr_cap" };
+      if (args.method === "ackFreeText") { obligations = []; return { told: 1 }; }
       if (args.method === "undelivered") return { undelivered: [] };
       if (args.method === "replied") return { replied: [] };
       if (args.method === "resolveFreeText") return { resolved: (args.input.refs as string[]).length };
@@ -218,6 +220,9 @@ test("free-text safety: the captain is told of each free text the connector hold
     const sends: string[] = [];
     host.harness.sdk.stub("threads.send", async (args: { input: Array<{ text: string }> }) => { sends.push(args.input[0]?.text ?? ""); return {}; });
     await host.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_cap", status: "idle" }), lastAssistantText: "ok" });
+    assert.ok(!sends.some((line) => line.includes("agent:i9")), "an idle starts no reminder turn of its own");
+    // The reminder rides on the captain's next real wake.
+    await host.harness.behavior.emitThreadEvent("thread.active", { thread: makeThreadResponse({ id: "thr_cap", status: "active" }) });
     const told = sends.find((line) => line.includes("agent:i9"));
     assert.ok(told, sends.join("\n"));
     assert.match(told!, /firstmate_free_text/);
@@ -251,14 +256,15 @@ test("check round 2: a free text is confirmed to the connector only after the ca
       sends.push(line);
       return {};
     });
-    const idle = () => host.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_cap", status: "idle" }), lastAssistantText: "ok" });
-    await idle();
+    // A real wake: a turn of the captain started.
+    const wake = () => host.harness.behavior.emitThreadEvent("thread.active", { thread: makeThreadResponse({ id: "thr_cap", status: "active" }) });
+    await wake();
     assert.deepEqual(acked, [], "nothing confirmed when the tell failed");
     fail = false;
-    await idle();
+    await wake();
     assert.ok(sends.some((line) => line.includes("agent:i9")), sends.join("\n"));
     assert.deepEqual(acked, ["agent:i9"], "confirmed after the tell");
-    await idle();
+    await wake();
     assert.equal(sends.filter((line) => line.includes("agent:i9")).length, 1, "told once");
   } finally {
     await host.harness.lifecycle.dispose();
@@ -424,6 +430,7 @@ function freeTextConnector(host: Host, calls: Rpc[], bound?: string) {
   return acked;
 }
 
+const activeOn = (host: Host, threadId: string) => host.harness.behavior.emitThreadEvent("thread.active", { thread: makeThreadResponse({ id: threadId, status: "active" }) });
 const idleOn = (host: Host, threadId: string) => host.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: threadId, status: "idle" }), lastAssistantText: "ok" });
 
 test("free-text binding: a connector that does not name its bound captain tells no captain and confirms nothing, with one warning", async () => {
@@ -454,9 +461,9 @@ test("free-text binding: a connector that names its bound captain decides who is
     await ownerSays(host, "6610", "hi");
     const sends: Array<{ threadId: string; text: string }> = [];
     host.harness.sdk.stub("threads.send", async (args: { threadId: string; input: Array<{ text: string }> }) => { sends.push({ threadId: args.threadId, text: args.input[0]?.text ?? "" }); return {}; });
-    await idleOn(host, "thr_cap");
+    await activeOn(host, "thr_cap");
     assert.deepEqual(acked, []);
-    await idleOn(host, "thr_cap2");
+    await activeOn(host, "thr_cap2");
     assert.deepEqual(sends.filter((s) => s.text.includes("agent:i9")).map((s) => s.threadId), ["thr_cap2"]);
     assert.deepEqual(acked, ["agent:i9"]);
   } finally {
@@ -502,7 +509,7 @@ test("free-text binding: a 409 'Thread is archived' drops the captain, so its ne
     await ownerSays(host, "6620", "hi");
     let sends = 0;
     host.harness.sdk.stub("threads.send", async () => { sends += 1; throw new ArchivedThreadError(); });
-    await idleOn(host, "thr_cap");
+    await activeOn(host, "thr_cap");
     assert.deepEqual(acked, [], "a failed tell is not confirmed");
     const before = { sends, rpc: calls.length };
     await idleOn(host, "thr_cap");
