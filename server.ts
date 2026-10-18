@@ -6745,7 +6745,7 @@ export default async function plugin(bb: BbPluginApi) {
     const [envRes, uncommittedRes, prRes] = await Promise.allSettled([
       bb.sdk.environments.get({ environmentId: envId }),
       bb.sdk.environments.diffFiles({ environmentId: envId, target: "uncommitted" }),
-      readEnvironmentPr(envId, { expectUrl: crew.prUrl }).then((read) => read.value),
+      readEnvironmentPr(envId, { expectUrl: crew.prUrl }),
     ]);
     const envRec = envRes.status === "fulfilled" ? asRecord(envRes.value) : {};
     const branch = envRec["branchName"] ?? envRec["branch"] ?? envRec["name"] ?? "unknown";
@@ -6762,8 +6762,10 @@ export default async function plugin(bb: BbPluginApi) {
       committed = committedRes === null ? [] : extractPaths(committedRes);
     }
     const uncommitted = uncommittedRes.status === "fulfilled" ? extractPaths(uncommittedRes.value) : [];
-    const pr = prRes.status === "fulfilled" ? summarizePR(prRes.value) : "unknown";
-    const prF = prRes.status === "fulfilled" ? prFacts(prRes.value) : prFacts(null);
+    const other = prRes.status === "fulfilled" ? prRes.value.otherPr : undefined;
+    const pr = prRes.status !== "fulfilled" ? "unknown"
+      : other !== undefined ? `${crew.prUrl} (state unknown: the environment now shows ${other || "no PR"})` : summarizePR(prRes.value.value);
+    const prF = prRes.status === "fulfilled" ? prRes.value.facts : prFacts(null);
     if (prF.url) await rememberPrUrl(crew,prF.url);
     const posture = await postureOf(crew.projectId);
     const files = [...new Set([...committed, ...uncommitted])];
@@ -8085,11 +8087,13 @@ export default async function plugin(bb: BbPluginApi) {
   const PR_STATUS_COST = 2;
   const prStatusCache = new Map<string, { at: number; value: unknown }>();
   const prStatusInFlight = new Map<string, Promise<unknown>>();
-  type PrStatusRead = { facts: PrFacts; value: unknown; paused: boolean };
+  // otherPr: the environment's answer named a PR other than the crew's recorded one.
+  type PrStatusRead = { facts: PrFacts; value: unknown; paused: boolean; otherPr?: string };
   async function readEnvironmentPr(envId: string, opts: { fresh?: boolean; hostId?: string | null; signal?: AbortSignal; expectUrl?: string } = {}): Promise<PrStatusRead> {
     // One environment can hold another PR later, or be shared by two crews: an answer
-    // counts for a crew that recorded its PR only when it names that PR. A fresh BB answer
-    // is the environment's truth and is returned whatever it names.
+    // counts for a crew that recorded its PR only when it names that PR. A fresh answer
+    // naming another PR is the environment's state, not this crew's: the crew gets no
+    // facts (unknown), so nothing records or settles its PR from it.
     const expected = opts.expectUrl ? prKeyOf(opts.expectUrl) : null;
     const names = (value: unknown) => expected === null || prKeyOf(prFacts(value).url) === expected;
     const cached = prStatusCache.get(envId);
@@ -8112,6 +8116,7 @@ export default async function plugin(bb: BbPluginApi) {
       const now = Date.now();
       if (prStatusCache.size >= 500) for (const [key, row] of prStatusCache) if (now - row.at >= PR_STATUS_TTL_MS) prStatusCache.delete(key);
       prStatusCache.set(envId, { at: now, value });
+      if (!names(value)) return { facts: prFacts(null), value: null, paused: false, otherPr: prFacts(value).url };
       return { facts: prFacts(value), value, paused: false };
     } finally {
       if (prStatusInFlight.get(envId) === request) prStatusInFlight.delete(envId);
@@ -9249,6 +9254,8 @@ export default async function plugin(bb: BbPluginApi) {
         // ask gh about the PR this crew recorded.
         try {
           const hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined, opts.signal);
+          // In the background sweep this read is charged too; a refused one leaves the crew.
+          if (!reserveGithub(hostId)) continue;
           const view = await ghPrView(hostId, crew.prUrl);
           if (view !== null) { state = view.state; url = crew.prUrl; pr = { ...pr, available: true }; }
         } catch { /* unknown: not landed */ }

@@ -268,3 +268,39 @@ test('a crew joining a read in flight for another PR in its environment reads it
   assert.match(String(await second),/PR: #101/,'the in-flight answer named PR 100, so crew c1 read again');
  } finally {await host.harness.lifecycle.dispose();}
 });
+
+// Checker round 2 on a1b45fd: a fresh answer is the environment's state, not proof of this crew's PR.
+
+test('a fresh answer naming another PR does not retire the crew of its recorded open PR',async()=>{
+ const host=await deck({pullRequest:async()=>({outcome:'available',pullRequest:{url:prUrl(1),number:101,title:'another crew PR',state:'merged'}})});
+ try {
+  await host.bb.storage.kv.set('crews',[{...CREWS[0],prUrl:prUrl(0)}]);
+  host.harness.sdk.stub('threads.output',async()=>({output:'DONE: PR 100 is open for review'}));
+  host.harness.sdk.stub('threads.stop',async()=>({}));
+  host.harness.sdk.stub('threads.archive',async()=>({}));
+  const ctx={threadId:'thr_cap',projectId:'proj_1'};
+  // Prime the shared environment entry with PR 101, forcing a mismatch and refresh for PR 100.
+  await host.bb.storage.kv.set('crews',[CREWS[1],{...CREWS[0],prUrl:prUrl(0)}]);
+  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle',environmentId:'env_shared',parentThreadId:'thr_cap'}));
+  await tool(host,'firstmate_deliver').execute({crewId:'c1'},ctx);
+  await host.bb.storage.kv.set('crews',[{...CREWS[0],prUrl:prUrl(0)}]);
+  await tool(host,'firstmate_bearings').execute({},ctx);
+  assert.ok(reads(host)>=2,'the cached mismatch caused a fresh BB read');
+  assert.equal(host.harness.sdk.callsTo('threads.archive').length,0,'PR 101 being merged says nothing about the recorded PR 100');
+ }finally{await host.harness.lifecycle.dispose();}
+});
+test('a fresh answer naming another PR does not overwrite the crew\'s recorded PR',async()=>{
+ let current={outcome:'available',pullRequest:{url:prUrl(0),number:100,title:'crew A',state:'open'}};
+ const host=await deck({pullRequest:async()=>current});
+ try {
+  const ctx={threadId:'thr_cap',projectId:'proj_1'};
+  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle',environmentId:'env_shared',parentThreadId:'thr_cap'}));
+  await host.bb.storage.kv.set('crews',[{...CREWS[0],prUrl:prUrl(0)},{...CREWS[1],prUrl:prUrl(1)}]);
+  await tool(host,'firstmate_deliver').execute({crewId:'c0'},ctx);
+  current={outcome:'available',pullRequest:{url:prUrl(1),number:101,title:'crew B',state:'merged'}};
+  await tool(host,'firstmate_deliver').execute({crewId:'c1'},ctx);
+  await tool(host,'firstmate_deliver').execute({crewId:'c0'},ctx);
+  const crews=await host.bb.storage.kv.get('crews');
+  assert.equal(crews.find(c=>c.id==='c0').prUrl,prUrl(0),'crew A recorded PR must survive an answer for crew B');
+ }finally{await host.harness.lifecycle.dispose();}
+});
