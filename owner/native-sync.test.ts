@@ -139,19 +139,22 @@ test("the verdict is the checker's last line; anything else counts as a fail", (
 });
 
 test("a weekly run whose upstream changed only test files reports once and starts no sync", () => {
-  const step = nextSyncStep(seen({ start: true, changed: ["tests/fm-supervision-host.test.sh"] }), {});
+  const step = nextSyncStep(seen({ start: true, changed: [{ status: "M", path: "tests/fm-supervision-host.test.sh" }] }), {});
   assert.equal(step.action, "tell");
   if (step.action !== "tell") return;
   assert.equal(step.key, `tests-only:${AHEAD}`);
   assert.match(step.text, /by test files only/);
   assert.match(step.text, /No sync crew, checker, canary or live switch runs/);
-  assert.equal(nextSyncStep(seen({ start: true, changed: ["tests/x.sh"] }), { done: [step.key] }).action, "none");
-  assert.equal(nextSyncStep(seen({ changed: ["tests/x.sh"] }), {}).action, "none", "a follow-up run never reports or starts");
+  assert.equal(nextSyncStep(seen({ start: true, changed: [{ status: "M", path: "tests/x.test.sh" }] }), { done: [step.key] }).action, "none");
+  assert.equal(nextSyncStep(seen({ changed: [{ status: "M", path: "tests/x.test.sh" }] }), {}).action, "none", "a follow-up run never reports or starts");
 });
 
-test("test files are the native repo's root tests/ folder; anything else, an empty list or an unread list syncs", () => {
-  assert.deepEqual(testOnlyChange(["tests/a.sh", "tests/fixtures/b.json"]), true);
-  for (const changed of [[], undefined, ["tests/a.sh", "bin/fm-test-run.sh"], [".claude/mods/firstmate-calm/tests/a.sh"], ["docs/tests/a.md"], ["tests"]]) {
+test("test-only means test entrypoints, fixtures and captures, modified or added; anything else, an empty list or an unread list syncs", () => {
+  const m = (path: string, status = "M") => ({ status, path });
+  assert.equal(testOnlyChange([m("tests/a.test.sh"), m("tests/fixtures/b.json", "A"), m("tests/captures/v1/out.txt")]), true);
+  // PR 154 checker findings 1 and 2: a deletion or rename, and a helper production may source.
+  for (const changed of [[], undefined, [m("tests/a.test.sh"), m("bin/fm-test-run.sh")], [m(".claude/mods/firstmate-calm/tests/a.test.sh")], [m("docs/tests/a.md")], [m("tests")],
+    [m("tests/a.test.sh", "D")], [m("tests/a.test.sh", "D"), m("tests/renamed.test.sh", "A")], [m("tests/helper.sh")], [m("tests/lib.sh")], [m("tests/assets/x.png")], [m("tests/sub/a.test.sh")]]) {
     assert.equal(testOnlyChange(changed), false, JSON.stringify(changed));
     assert.equal(nextSyncStep(seen({ start: true, changed }), {}).action, "spawn-sync", JSON.stringify(changed));
   }

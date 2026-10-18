@@ -59,6 +59,8 @@ if (a[0] === 'thread' && a[1] === 'tell') { log({ cmd: 'tell', at: Date.now(), t
 process.stderr.write('fake bb: unknown ' + a.join(' ')); process.exit(1);
 `;
 
+const git = (t, ...args) => execFileSync('git', ['-C', t.upstream, ...args], { encoding: 'utf8' }).trim();
+
 function setup() {
   const dir = mkdtempSync(join(tmpdir(), 'native-sync-'));
   const bin = join(dir, 'bin');
@@ -85,7 +87,7 @@ function setup() {
   const change = (file) => { mkdirSync(join(upstream, file, '..'), { recursive: true }); writeFileSync(join(upstream, file), `${Math.random()}\n`); git('add', '-A'); return advance(); };
   const state = () => JSON.parse(readFileSync(paths.state, 'utf8'));
   const chatter = (n, quote) => writeFileSync(paths.log, readFileSync(paths.log, 'utf8') + JSON.stringify({ cmd: 'chatter', to: 'thr_repair', at: Date.now(), n, quote }) + '\n');
-  return { world, run, raw, log, ghCalls, spawns, tells, advance, change, state, env, paths, chatter };
+  return { world, run, raw, log, ghCalls, spawns, tells, advance, change, state, env, paths, chatter, upstream };
 }
 
 test('a pin already at upstream HEAD does nothing', () => {
@@ -363,4 +365,19 @@ test('a change outside tests/ or a diff that cannot be read runs the full sync',
   const out = t.run('--start');
   assert.match(out, /cannot list the files changed since pin ffffffff/);
   assert.match(out, /spawn-sync: Native sync to/);
+});
+
+// PR 154 checker findings 1 and 2.
+test('a deletion or rename inside tests/, or a change to a test helper, runs the full sync', () => {
+  const cases = [
+    ['deletion', (t) => { t.change('tests/a.test.sh'); t.world.pin = t.advance(); git(t, 'rm', '-q', 'tests/a.test.sh'); t.advance(); }],
+    ['rename', (t) => { t.change('tests/a.test.sh'); t.world.pin = t.advance(); git(t, 'mv', 'tests/a.test.sh', 'tests/renamed.test.sh'); t.advance(); }],
+    ['helper sourced by production', (t) => { t.change('bin/fm-real.sh'); t.change('tests/helper.sh'); t.world.pin = t.advance(); t.change('tests/helper.sh'); }],
+  ];
+  for (const [name, arrange] of cases) {
+    const t = setup();
+    arrange(t);
+    assert.match(t.run('--start'), /spawn-sync: Native sync to/, name);
+    assert.deepEqual(t.tells(), [], name);
+  }
 });
