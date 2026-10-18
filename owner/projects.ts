@@ -62,9 +62,9 @@ export function surfaceRefusal(project: ProjectRule | undefined, given: string |
   return null;
 }
 
-/** Why a production PR of a repo no project lists cannot merge: nothing says where its proof must come from. */
-export function unlistedRefusal(repo: string): string {
-  return `no project in owner/projects.json lists ${repo}, so its proof surface is unknown. Add the repo to its project there (with its proof surface), then verify again.`;
+/** The merge preview note for a repo no project lists: it keeps the old merge rules, and no surface is inferred. */
+export function unlistedNote(repo: string): string {
+  return `no proof rule for ${repo}: add one in owner/projects.json`;
 }
 
 /** The lines a ship crew's brief carries for its project: where its proof must come from, and its release read-back. */

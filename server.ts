@@ -96,7 +96,7 @@ import { crewPipeline, crewPlaybook, crewSkillBlock, crewSkillRoot, notVerifiedN
 import { CREW_ROLES, crewExecution } from "./owner/crew-roles.ts";
 import { DISPATCH_VERSION, PROOF_STEP, pipelineGates, proofStep } from "./owner/pipelines.ts";
 import { changeReach, type Reach } from "./owner/reach.ts";
-import { hostCanDrive, PROOF_SURFACES, projectBriefLines, projectForName, projectForRepo, repoOf as prRepoOf, surfaceRefusal, surfaceWords, unlistedRefusal } from "./owner/projects.ts";
+import { hostCanDrive, PROOF_SURFACES, projectBriefLines, projectForName, projectForRepo, repoOf as prRepoOf, surfaceRefusal, surfaceWords, unlistedNote } from "./owner/projects.ts";
 import { createReleaseReadbacks, type ReleaseSource } from "./lib/release-readback.ts";
 import { addCorrection, CAPTAIN_FILE, CORRECTION_RULE, correctionBrief, fixCorrection, LEDGER_FILE, readLedger, within } from "./owner/corrections.ts";
 import { renderScorecard, type ScorecardData } from "./owner/scorecard.ts";
@@ -8060,35 +8060,56 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /** The owner answered an ask by tap or reply. A device proof card's Works records his proof. */
-  async function ownerAnsweredAsk(askId: string, resolution: string): Promise<void> {
-    const proof = await bb.storage.kv.get<DeviceProof>(`${DEVICE_PROOF_PREFIX}${askId}`);
+  async function ownerAnsweredAsk(askId: string, resolution: string, attempt = 0): Promise<void> {
+    const key = `${DEVICE_PROOF_PREFIX}${askId}`;
+    const proof = await bb.storage.kv.get<DeviceProof>(key);
     if (proof === undefined) return;
-    await bb.storage.kv.delete(`${DEVICE_PROOF_PREFIX}${askId}`);
     const crew = await findCrew(proof.crewId);
-    // Only the card's exact Works choice is proof, and only when Telegram recorded it from the owner
-    // himself: a plain RPC call or a captain correction proves nothing (checker FF2-verdict-1).
-    const chose = resolution.trim().toLowerCase() === "works";
-    const confirmed = chose ? await ownerTapped(askId) : null;
-    const works = chose && confirmed === "works";
-    let note: string;
-    if (works) {
-      try {
-        // A tap can come hours after the card: read the PR from GitHub first, so the record covers its head now.
-        const row = deliveries.get(proof.pr);
-        if (row !== undefined && row.freshness !== "fresh") await reconcileDelivery(row);
-        deliveries.verify(proof.pr, OWNER_ACTOR, proof.head, { driven: `the owner tested build ${proof.build} on ${surfaceWords(proof.surface as never)}`, seen: "Works", surface: proof.surface, build: proof.build });
-        note = `The owner tapped Works for build ${proof.build}: proof is recorded for ${proof.pr} at ${proof.head.slice(0, 7)}.`;
-      } catch (error) {
-        note = `The owner tapped Works for build ${proof.build}, but no proof was recorded for ${proof.pr}: ${error instanceof Error ? error.message : String(error)} Open a new device proof card for the current head.`;
-      }
-    } else if (chose) {
-      note = `Card ${askId} reads Works for build ${proof.build}, but Telegram has no record of the owner tapping it${confirmed === "unreadable" ? " (the Telegram connector did not answer)" : ""}, so no proof is recorded for ${proof.pr}. Open a new device proof card for the owner to tap.`;
-    } else {
-      note = `The owner says build ${proof.build} does not work on the owner's iPhone (his answer: "${clip(resolution, 200)}"). No proof is recorded for ${proof.pr}. Find out why, fix it, and open a new device proof card for the new build.`;
+    const tell = async (note: string) => {
+      if (crew !== undefined) await tellCrew(crew, note, false, true).catch((error) => bb.log.warn(`device proof note to crew ${crew.id}: ${String(error)}`));
+      await deliverToCaptain(proof.captain, note, proof.crewId).catch((error) => bb.log.warn(`device proof note to captain: ${String(error)}`));
+    };
+    // Only the card's exact Works choice is proof, and only when Telegram recorded it as the owner's own
+    // button tap: typed words, a plain RPC call or a captain correction prove nothing (checker FF2-verdict-1).
+    if (resolution.trim().toLowerCase() !== "works") {
+      await bb.storage.kv.delete(key);
+      bb.log.info(`device proof ${askId} ${proof.pr}@${proof.head.slice(0, 7)} build=${proof.build}: does not work`);
+      await tell(resolution.trim().toLowerCase() === "does not work"
+        ? `The owner says build ${proof.build} does not work on the owner's iPhone. No proof is recorded for ${proof.pr}. Find out why, fix it, and open a new device proof card for the new build.`
+        : `Card ${askId} for build ${proof.build} was answered "${clip(resolution, 200)}", not with its Works button, so no proof is recorded for ${proof.pr}. Open a new device proof card if the build still needs his check.`);
+      return;
     }
-    bb.log.info(`device proof ${askId} ${proof.pr}@${proof.head.slice(0, 7)} build=${proof.build}: ${works ? "works" : "does not work"}`);
-    if (crew !== undefined) await tellCrew(crew, note, false, true).catch((error) => bb.log.warn(`device proof note to crew ${crew.id}: ${String(error)}`));
-    await deliverToCaptain(proof.captain, note, proof.crewId).catch((error) => bb.log.warn(`device proof note to captain: ${String(error)}`));
+    // The binding stays until the proof is recorded or the card closes: Telegram may record the tap after this
+    // first read (checker round 2), so the connector is read again a few times.
+    const confirmed = await ownerTapped(askId);
+    if (confirmed !== "works") {
+      const delays = proofRecheckMs();
+      if (attempt < delays.length) {
+        const timer = setTimeout(() => { if (!launchAbort.signal.aborted) void ownerAnsweredAsk(askId, resolution, attempt + 1).catch((error) => bb.log.warn(`device proof ${askId} recheck: ${String(error)}`)); }, delays[attempt]);
+        timer.unref?.();
+        return;
+      }
+      bb.log.warn(`device proof ${askId}: card reads Works but Telegram has no owner tap after ${attempt + 1} reads`);
+      await tell(`Card ${askId} reads Works for build ${proof.build}, but Telegram has no record of the owner tapping it${confirmed === "unreadable" ? " (the Telegram connector did not answer)" : ""}, so no proof is recorded for ${proof.pr}. The card stays bound: a later tap record is still counted.`);
+      return;
+    }
+    let note: string;
+    try {
+      // A tap can come hours after the card: read the PR from GitHub first, so the record covers its head now.
+      const row = deliveries.get(proof.pr);
+      if (row !== undefined && row.freshness !== "fresh") await reconcileDelivery(row);
+      deliveries.verify(proof.pr, OWNER_ACTOR, proof.head, { driven: `the owner tested build ${proof.build} on ${surfaceWords(proof.surface as never)}`, seen: "Works", surface: proof.surface, build: proof.build });
+      note = `The owner tapped Works for build ${proof.build}: proof is recorded for ${proof.pr} at ${proof.head.slice(0, 7)}.`;
+    } catch (error) {
+      note = `The owner tapped Works for build ${proof.build}, but no proof was recorded for ${proof.pr}: ${error instanceof Error ? error.message : String(error)} Open a new device proof card for the current head.`;
+    }
+    await bb.storage.kv.delete(key);
+    bb.log.info(`device proof ${askId} ${proof.pr}@${proof.head.slice(0, 7)} build=${proof.build}: works`);
+    await tell(note);
+  }
+  function proofRecheckMs(): number[] {
+    const given = (process.env.FM_PROOF_RECHECK_MS ?? "").split(",").map(Number).filter((ms) => Number.isFinite(ms) && ms > 0);
+    return given.length > 0 ? given.slice(0, 5) : [2_000, 10_000, 60_000];
   }
 
   async function rememberPrUrl(crew: Crew, url: string,signal?:AbortSignal): Promise<void> {
@@ -8254,6 +8275,9 @@ export default async function plugin(bb: BbPluginApi) {
     const id = row?.id ?? prKeyOf(t.url) ?? t.url;
     const production = reach.reach === "production";
     const project = projectForRepo(prRepoOf(t.url));
+    // Owner decision Q6 applies to listed projects. A repo with no project rule keeps the merge rules from before
+    // (a verification record at the head, and the checker); the preview names the missing rule.
+    const strict = production && project !== undefined;
     const how = [
       "CI and unit tests are not verification. The crew drives the changed surface (the project's verify skill if it has one), then records what it drove and saw:",
       `${row === undefined ? `firstmate_deliveries action=register url=${t.url}, then ` : ""}firstmate_deliveries action=verify id=${id} commitSha=${short(head)}${project ? ` surface=${project.proofSurface}` : ""} driven="<what you drove>" seen="<what you saw>" (CLI: bb firstmate deliveries verify ${id} --commit ${short(head)}${project ? ` --surface ${project.proofSurface}` : ""} --driven "<what you drove>" --seen "<what you saw>").`,
@@ -8261,10 +8285,9 @@ export default async function plugin(bb: BbPluginApi) {
     ];
     const words = (waiver ?? "").trim();
     // Owner decision Q6: a production PR merges only on proof a crew (or the owner's tap) recorded at this head.
-    if (production && words !== "") throw new Error([`Refusing: #${t.number} reaches production (${reach.why}); the owner's words cannot waive proof for a production PR. Nothing was merged.`, ...how].join("\n"));
-    if (production && project === undefined) throw new Error(`Refusing: #${t.number} reaches production (${reach.why}) and ${unlistedRefusal(prRepoOf(t.url))} Nothing was merged.`);
+    if (strict && words !== "") throw new Error([`Refusing: #${t.number} reaches production (${reach.why}); the owner's words cannot waive proof for a production PR. Nothing was merged.`, ...how].join("\n"));
     if (row !== undefined && row.verifiedCommitSha === head) {
-      if (!production) return { note: "", record: () => {} };
+      if (!strict) return { note: "", record: () => {} };
       if (verifiedBy(row) === "captain") throw new Error([`Refusing: #${t.number}'s verification record was made by the captain, not by a crew; nothing was merged.`, ...how].join("\n"));
       const wrong = surfaceRefusal(project, row.verification?.surface);
       if (wrong !== null) throw new Error([`Refusing: ${wrong} The record for head ${short(head)} does not say it came from there; nothing was merged.`, ...how].join("\n"));
@@ -8275,7 +8298,7 @@ export default async function plugin(bb: BbPluginApi) {
       return { note: `\nNot verified: the owner waived verification for head ${short(head)} in these words: "${words}"`,
         record: () => { if (row !== undefined) deliveries.waive(row.id, actor, words, head); } };
     }
-    const missing = production
+    const missing = strict
       ? `#${t.number} reaches production (${reach.why}) and has no proof a crew or the owner recorded for its current head ${short(head)}; nothing was merged.`
       : row === undefined
         ? `#${t.number} has no verification record: no delivery row tracks it, so nothing records evidence for head ${short(head)}; nothing was merged.`
@@ -8285,7 +8308,7 @@ export default async function plugin(bb: BbPluginApi) {
     throw new Error([
       `Refusing: ${missing}`,
       ...how,
-      ...(production ? [] : [`Or, only if the owner waived verification in words: firstmate_merge allowUnverified="<the owner's own words>" (CLI: --allow-unverified "<the owner's own words>").`]),
+      ...(strict ? [] : [`Or, only if the owner waived verification in words: firstmate_merge allowUnverified="<the owner's own words>" (CLI: --allow-unverified "<the owner's own words>").`]),
     ].join("\n"));
   }
 
@@ -8543,6 +8566,7 @@ export default async function plugin(bb: BbPluginApi) {
           ? `covers the current head${row.verification ? `; driven: ${row.verification.driven}; seen: ${row.verification.seen}` : ""}`
           : row?.verifiedCommitSha ? `covers ${row.verifiedCommitSha.slice(0, 7)}, not the current head; the merge will refuse` : "none for the current head; the merge will refuse";
         lines.push(`PR: #${pr.number}${pr.title ? ` ${pr.title}` : ""} ${pr.url} (${pr.state})`, `Head: ${pr.headSha || "could not be read"}`, `Checks: ${checks?.line ?? "could not be read"}`, `Verification record: ${record}`);
+        if (reach.reach === "production" && projectForRepo(prRepoOf(pr.url)) === undefined) lines.push(`Proof rule: ${unlistedNote(prRepoOf(pr.url))}`);
         if (pr.state !== "merged") {
           try { requireVerification(pr, opts.allowUnverified, "", reach); } catch (error) {
             reasons.push((error instanceof Error ? error.message : String(error)).split("\n")[0]!);
