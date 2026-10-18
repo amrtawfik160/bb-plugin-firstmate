@@ -24,9 +24,12 @@ const CREWS=[
  crewRow('safi1','thr_safi',{title:'Ship build 21',providerId:'claude-code',model:'claude-opus-5-5'}),
  crewRow('chk1','thr_chk',{title:'Check the PR',providerId:'codex',model:'gpt-6-astra',role:'checker'}),
  crewRow('frm1','thr_frm',{title:'Fix the frame export',providerId:'claude-code',model:'claude-opus-5-5'}),
+ crewRow('woo2','thr_woo2',{title:'Older Dr Woo change',providerId:'claude-code',model:'claude-opus-5-5'}),
 ];
 const FRAMED='amrtawfik160/framed';
-const PRS=[[WOO,130,'woo1','thr_woo'],[CYN,2523,'cyn1','thr_cyn'],[SAFI,77,'safi1','thr_safi'],[FRAMED,5,'frm1','thr_frm']];
+const PRS=[[WOO,130,'woo1','thr_woo'],[CYN,2523,'cyn1','thr_cyn'],[SAFI,77,'safi1','thr_safi'],[FRAMED,5,'frm1','thr_frm'],[WOO,111,'woo2','thr_woo2']];
+// dr.woo#111 was opened before the strict proof gate went live (owner decision, 18 Oct: option A).
+const OPENED={111:'2026-10-10T09:00:00Z'};
 const repoOfNumber=n=>PRS.find(p=>p[1]===n)[0];
 
 function hostCommands(host) {
@@ -41,7 +44,7 @@ function forge(command) {
  const n=Number(/\/pull\/(\d+)/.exec(command)?.[1]);
  if(command.includes('fm-pr-merge.sh'))return{payload:`verified: ${url(repoOfNumber(n),n)} is merged (state=MERGED, merged=true, isInMergeQueue=false)`};
  if(command.includes('gh pr checks'))return{code:0,payload:JSON.stringify([{name:'build',bucket:'pass'}])};
- if(command.includes('gh pr view')){const crew=PRS.find(p=>p[1]===n)[2];return{payload:JSON.stringify({number:n,url:url(repoOfNumber(n),n),title:`Change ${n}`,headRefName:`fm/${crew}-change-${n}`,headRefOid:head(n),state:'OPEN',mergeable:'MERGEABLE',files:[{path:'app/screens/upload.tsx'}]})};}
+ if(command.includes('gh pr view')){const crew=PRS.find(p=>p[1]===n)[2];return{payload:JSON.stringify({number:n,url:url(repoOfNumber(n),n),title:`Change ${n}`,headRefName:`fm/${crew}-change-${n}`,headRefOid:head(n),state:'OPEN',mergeable:'MERGEABLE',files:[{path:'app/screens/upload.tsx'}],...(OPENED[n]?{createdAt:OPENED[n]}:{})})};}
  return{code:0};
 }
 async function deck() {
@@ -67,7 +70,7 @@ async function deck() {
  await host.bb.storage.kv.set('crews',CREWS);
  const store=createDeliveries(host.bb.storage.database());
  for(const [repo,n,crew,thread] of PRS){
-  const r=store.register({url:url(repo,n),taskId:crew,projectId:'proj_1',owner:'thr_cap',home:'/native',worker:thread,requirement:'merged',title:`Change ${n}`});
+  const r=store.register({url:url(repo,n),taskId:crew,projectId:'proj_1',owner:'thr_cap',home:'/native',worker:thread,requirement:'merged',title:`Change ${n}`,...(OPENED[n]?{openedAt:Date.parse(OPENED[n])}:{})});
   store.observe(r.id,{headSha:head(n),state:'open',draft:false,checks:'passing',review:'approved',reviewHeadSha:head(n),mergeCommitSha:null,mergeable:'mergeable'},true);
  }
  const tap=async(id,answer)=>{ownerTaps.set(id,answer);return host.harness.behavior.callRpc('resolveAsk',{threadId:'thr_cap',id,resolution:answer});};
@@ -302,5 +305,27 @@ test("another captain's cancel of a device proof card is refused and leaves the 
   const other=text(await tool(host,'firstmate_resolve_ask').execute({id:askId,resolution:'drop it',cancelled:true},{threadId:'thr_other',projectId:'proj_1'}));
   assert.match(other,new RegExp(`No ask ${askId} for this captain`));
   assert.ok(await host.bb.storage.kv.get(`device-proof:${askId}`),"the owning captain's binding is kept");
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+
+// Owner decision (18 Oct, option A): the strict gate covers PRs opened after this build went live. An older PR
+// keeps the rules from before (a verification record at the head, the checker), and the preview says which apply.
+test('a PR opened before the strict gate went live keeps the old rules; a newer one gets the strict gate; the preview says which',async()=>{
+ const {host,store,commands}=await deck();try {
+  const liveAt=await host.bb.storage.kv.get('proof-gate-live-at');
+  assert.equal(typeof liveAt,'number','the go-live time is recorded at startup');
+  // Older dr.woo#111: the captain may record verification, with no surface, as before.
+  assert.doesNotMatch(text(await verify(host,WOO,111,'thr_cap')),/Refusing/);
+  assert.equal(store.get(key(WOO,111)).verification.crewId,null);
+  text(await check(host,WOO,111));
+  const preview=text(await tool(host,'firstmate_merge').execute({crewId:'woo2',pr:111},ctx));
+  assert.match(preview,/^Proof rules: the rules from before this build: #111 was opened 2026-10-10 09:00 UTC, before the strict proof gate went live/m);
+  assert.match(text(await merge(host,'woo2',111)),/^Merged #111 Change 111\n/);
+  // Newer dr.woo#130 (no opening time before go-live): strict.
+  assert.match(text(await verify(host,WOO,130,'thr_cap','iphone')),/Refusing: only a crew records verification/);
+  const strict=text(await tool(host,'firstmate_merge').execute({crewId:'woo1',pr:130},ctx));
+  assert.match(strict,/^Proof rules: strict: crew or owner proof at the exact head, from the app on an iPhone or the iOS Simulator/m);
+  assert.equal(merges(commands).length,1);
  }finally{await host.harness.lifecycle.dispose();}
 });
