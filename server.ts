@@ -4166,12 +4166,21 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function prForCrew(crew: Crew): Promise<PrFacts> {
+    return (await prReadForCrew(crew)).facts;
+  }
+  // Inside the background loop the read is charged to it and checked against the crew's
+  // host reserve; paused means the budget refused it.
+  async function prReadForCrew(crew: Crew, signal?: AbortSignal): Promise<{ facts: PrFacts; paused: boolean }> {
     const envId = await threadEnv(crew.threadId);
-    if (envId === null) return prFacts(null);
+    if (envId === null) return { facts: prFacts(null), paused: false };
     try {
-      return prFacts(await bb.sdk.environments.pullRequest({ environmentId: envId }));
-    } catch {
-      return prFacts(null);
+      const hostId = backgroundBudget.getStore()
+        ? await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined, signal).catch((error) => { if (signal?.aborted) throw error; return null; })
+        : null;
+      return await readEnvironmentPr(envId, { hostId, signal });
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      return { facts: prFacts(null), paused: false };
     }
   }
 
@@ -6214,6 +6223,7 @@ export default async function plugin(bb: BbPluginApi) {
   // compaction exit) is relaunched once with its brief and a note; a second end goes to the captain.
   // Capacity and plan limits move to another provider instead (turn.failed); a sign-in failure is reported, not retried.
   async function restartUnexpectedExit(crew: Crew, error: string | null): Promise<boolean> {
+    const failedAt = Date.now();
     if (isSecondmateRoute(crew) || (await settings.get()).supervisionEnabled !== true) return false;
     const detail = [error ?? "", await threadFailureDetail(crew.threadId)].filter((part) => part.trim() !== "").join(": ");
     if (providerExhausted(null, detail) || planLimitError(detail)) return false;
@@ -6226,6 +6236,8 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const verdict = verdictOf(parseOutcome(await crewOutput(crew).catch(() => null)));
     if (verdict === "DONE" || verdict === "FAILED" || verdict === "BLOCKED") return false;
+    // A failed turn BB's provider retry resumes is not an exit; the captain still hears of the failure.
+    if (await bbRetryPending(crew.threadId, { since: failedAt })) return false;
     const key = `crew-restart:${crew.projectId}:${crew.parentThreadId ?? ""}:${crew.id}`;
     if (await bb.storage.kv.get(key) !== undefined) {
       await notifyCaptain(crew, "error", `crew ${crew.id} ended without a final report a second time (${clip(detail, 200) || "no error text"}), after one automatic restart. It is not restarted again: retry it, tell it, or forget it.`);
@@ -6288,6 +6300,9 @@ export default async function plugin(bb: BbPluginApi) {
       throw new Error(
         `Crew ${crew.id} was already relaunched ${crew.relaunches} time(s). Stuck ladder: second failure means report it failed with preserved work; do not relaunch again.`,
       );
+    }
+    if (await bbRetryQueued(crew.threadId)) {
+      throw new Error(`BB's provider retry already has a retry of crew ${crew.id}'s failed turn queued; a relaunch now would run the work twice. Nothing was relaunched. Wait for it, or cancel it first (bb provider-retry cancel ${crew.threadId}) and run this again.`);
     }
     const envId = await threadEnv(crew.threadId);
     if (envId === null) throw new Error(`Crew ${crew.id} has no environment to reuse.`);
@@ -6730,7 +6745,7 @@ export default async function plugin(bb: BbPluginApi) {
     const [envRes, uncommittedRes, prRes] = await Promise.allSettled([
       bb.sdk.environments.get({ environmentId: envId }),
       bb.sdk.environments.diffFiles({ environmentId: envId, target: "uncommitted" }),
-      bb.sdk.environments.pullRequest({ environmentId: envId }),
+      readEnvironmentPr(envId).then((read) => read.value),
     ]);
     const envRec = envRes.status === "fulfilled" ? asRecord(envRes.value) : {};
     const branch = envRec["branchName"] ?? envRec["branch"] ?? envRec["name"] ?? "unknown";
@@ -8058,6 +8073,38 @@ export default async function plugin(bb: BbPluginApi) {
     await ghGraphql(hostId, `gh api graphql -f query=${shQuote("{ rateLimit { remaining resetAt } }")}`, 30_000, signal, true)
       .catch((error) => { if (signal?.aborted) throw error; });
   }
+  // Every environments.pullRequest read goes through here. BB answers an uncached read
+  // with gh pr view plus a GraphQL merge-queue query and keeps it only 10 seconds (#5704),
+  // so a read reserves a GitHub point, a read within PR_STATUS_TTL_MS of the environment's
+  // last answer gets that answer, and concurrent reads share one request. A read the
+  // background budget refuses returns the last answer of any age, or none, marked paused:
+  // the caller changes nothing and the next cycle reads again. fresh skips the cache for
+  // merge and landing proof, and its answer refreshes the cache.
+  const PR_STATUS_TTL_MS = 2 * 60_000;
+  const prStatusCache = new Map<string, { at: number; value: unknown }>();
+  const prStatusInFlight = new Map<string, Promise<unknown>>();
+  type PrStatusRead = { facts: PrFacts; value: unknown; paused: boolean };
+  async function readEnvironmentPr(envId: string, opts: { fresh?: boolean; hostId?: string | null; signal?: AbortSignal } = {}): Promise<PrStatusRead> {
+    const cached = prStatusCache.get(envId);
+    if (!opts.fresh && cached && Date.now() - cached.at < PR_STATUS_TTL_MS) return { facts: prFacts(cached.value), value: cached.value, paused: false };
+    const shared = opts.fresh ? undefined : prStatusInFlight.get(envId);
+    if (shared) { const value = await shared; return { facts: prFacts(value), value, paused: false }; }
+    const hostId = opts.hostId ?? null;
+    if (hostId !== null && backgroundBudget.getStore()) await ensureGraphqlMeter(hostId, opts.signal);
+    if (!reserveGithub(hostId)) return { facts: prFacts(cached?.value ?? null), value: cached?.value ?? null, paused: true };
+    const call = bb.sdk.environments.pullRequest({ environmentId: envId, ...(opts.signal ? { signal: opts.signal } : {}) });
+    const request: Promise<unknown> = opts.signal ? raceAbort(call, opts.signal, STUCK_HOST_CALL_MS) : call;
+    if (!opts.fresh) prStatusInFlight.set(envId, request);
+    try {
+      const value: unknown = await request;
+      const now = Date.now();
+      if (prStatusCache.size >= 500) for (const [key, row] of prStatusCache) if (now - row.at >= PR_STATUS_TTL_MS) prStatusCache.delete(key);
+      prStatusCache.set(envId, { at: now, value });
+      return { facts: prFacts(value), value, paused: false };
+    } finally {
+      if (prStatusInFlight.get(envId) === request) prStatusInFlight.delete(envId);
+    }
+  }
   async function backgroundHost(signal?: AbortSignal): Promise<string | undefined> {
     const first = deliveries.list({ limit: 1 })[0];
     const crew = first ? undefined : (await raceAbort(readCrews(), signal, STUCK_HOST_CALL_MS))[0];
@@ -8476,17 +8523,17 @@ export default async function plugin(bb: BbPluginApi) {
     envId: string,
     hostId: string | null,
     signal?:AbortSignal,
+    fresh = false,
   ): Promise<{ url: string; state: string; source: string } | null> {
     let env = prFacts(null);
-    if (hostId !== null && backgroundBudget.getStore()) await ensureGraphqlMeter(hostId,signal);
-    if (reserveGithub(hostId)) {
-      try { env = prFacts(await raceAbort(bb.sdk.environments.pullRequest({ environmentId: envId,signal }),signal,STUCK_HOST_CALL_MS)); } catch(error) { if (signal?.aborted) throw error; }
-    }
+    let paused = false;
+    try { ({ facts: env, paused } = await readEnvironmentPr(envId, { hostId, signal, fresh })); } catch(error) { if (signal?.aborted) throw error; }
     if (env.available && env.url !== "") {
       await rememberPrUrl(crew, env.url,signal);
       return { url: env.url, state: env.state, source: "environment" };
     }
-    if (hostId === null) return null;
+    // A refused budget is not "no PR": the gh lookups below would spend the same budget.
+    if (hostId === null || paused) return null;
     const candidates: Array<{ url: string; source: string }> = [];
     if (crew.prUrl !== undefined && crew.prUrl !== "") candidates.push({ url: crew.prUrl, source: "recorded" });
     try {
@@ -8540,7 +8587,7 @@ export default async function plugin(bb: BbPluginApi) {
   // and open. The native merge then reads that PR's checks and pins its head commit.
   async function mergeTarget(crew: Crew, envId: string, hostId: string | null, requested?: string | number): Promise<MergeTarget | null> {
     const ref = requested === undefined || requested === "" ? null : parsePrRef(requested);
-    const current = await resolveCrewPr(crew, envId, hostId);
+    const current = await resolveCrewPr(crew, envId, hostId, undefined, true);
     const tracked = undecidedPrs(crew);
     const openUrls = tracked.map((r) => r.url);
     if (current !== null && current.state !== "merged" && current.state !== "closed" && !openUrls.some((u) => prKeyOf(u) === prKeyOf(current.url))) openUrls.push(current.url);
@@ -8701,7 +8748,7 @@ export default async function plugin(bb: BbPluginApi) {
     return Number.isFinite(raw) && raw >= 0 ? raw : 5_000;
   }
   async function refreshEnvironmentPr(envId: string): Promise<PrFacts> {
-    return prFacts(await bb.sdk.environments.pullRequest({ environmentId: envId }));
+    return (await readEnvironmentPr(envId, { fresh: true })).facts;
   }
 
   // Environment-owned PRs are marked ready and re-read through the SDK.
@@ -8982,6 +9029,7 @@ export default async function plugin(bb: BbPluginApi) {
           else await awaitMergeableKnown(hostId, pr.url);
           result = await runFmScript({ script: "pr-merge", args, fmHome: nativeHome, hostId, timeoutMs: 180_000 });
         }
+        prStatusCache.delete(envId);
         requireNativeSuccess(result, `PR merge ${crew.id}`);
         verification.record();
         // fm-pr-merge reads the PR back from GitHub before it prints this line, so it
@@ -8989,7 +9037,7 @@ export default async function plugin(bb: BbPluginApi) {
         let landed = /verified: \S+ is merged \(state=MERGED/.test(result.output);
         if (!landed && pr.source !== "environment") landed = (await ghPrView(hostId, pr.url))?.state === "merged";
         if (!landed) {
-          try { landed = prFacts(await bb.sdk.environments.pullRequest({ environmentId: envId })).state === "merged"; } catch { /* unconfirmed */ }
+          try { landed = (await refreshEnvironmentPr(envId)).state === "merged"; } catch { /* unconfirmed */ }
         }
         if (!landed) return `${result.output.trim()}\nLanding not yet confirmed; crew ${crew.id} retained. Check the merge queue before teardown.`;
       }
@@ -9007,7 +9055,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined).catch(() => null);
     const target = await mergeTarget(crew, envId, hostId, opts.pr);
-    let f = prFacts(await bb.sdk.environments.pullRequest({ environmentId: envId }));
+    let f = await refreshEnvironmentPr(envId);
     if (!f.available) throw new Error(`No PR for crew ${crew.id}. For local-only: bb firstmate posture set --project ${crew.projectId} --mode local-only then merge.`);
     // This path merges through BB's environment, which holds exactly one PR.
     if (target !== null && prKeyOf(target.url) !== prKeyOf(f.url)) {
@@ -9051,6 +9099,7 @@ export default async function plugin(bb: BbPluginApi) {
     });
     if (!gate.ok) throw new Error(`Refusing: ${gate.reason}`);
     await bb.sdk.environments.mergePullRequest({ environmentId: envId, method: "merge" });
+    prStatusCache.delete(envId);
     verification.record();
     const output = await crewOutput(crew, 300);
     const waived = gate.waived.length > 0 ? ` (waived red check: ${gate.waived.join(", ")})` : "";
@@ -9176,10 +9225,12 @@ export default async function plugin(bb: BbPluginApi) {
       if (!retries.isDue("landed-retire", crew.threadId, Date.now())) continue;
       const status = statusByThread.get(crew.threadId) ?? "unknown";
       if (status !== "idle" && status !== "error") continue;
-      let pr = await prForCrew(crew);
+      const read = await prReadForCrew(crew, opts.signal);
+      let pr = read.facts;
       let state = pr.state;
       let url = pr.url;
-      if (!pr.available && opts.notify === true && crew.prUrl !== undefined && crew.prUrl !== "") {
+      // A refused budget reads nothing more; the crew comes round again in a later pass.
+      if (!pr.available && !read.paused && opts.notify === true && crew.prUrl !== undefined && crew.prUrl !== "") {
         // BB's environment cache has no PR (e.g. the crew pushed to an existing one):
         // ask gh about the PR this crew recorded.
         try {
@@ -9251,7 +9302,8 @@ export default async function plugin(bb: BbPluginApi) {
     const start = landedCursor % all.length;
     const batch = [...all.slice(start), ...all.slice(0, start)].slice(0, LANDED_PASS_BATCH);
     landedCursor = start + batch.length;
-    await reconcileExternallyLanded(batch, { notify: true, signal });
+    // A background sweep: its PR reads count against the follow-up loop's hourly allowance.
+    await backgroundBudget.run("follow-up", () => reconcileExternallyLanded(batch, { notify: true, signal }));
   }
 
   // Harness/tool scratch a crew leaves in its worktree (Lavish review artifacts,
@@ -15089,9 +15141,53 @@ export default async function plugin(bb: BbPluginApi) {
     const summary = `${view.kind} ${interactionId || "(unknown id)"}: ${view.summary}`;
     await notifyCaptain(crew, "interaction", `${summary}\n${command}`);
   });
-  bb.events.on("turn.failed", async ({ threadId, errorInfo }) => {
+  // BB's provider-retry plugin (on by default since BB 0.46) queues its own retry of a turn
+  // that failed on an overload or on a subscription window with a known reset, up to four
+  // per turn. Firstmate acts on such a failure only after BB declines it, or when the plugin
+  // does not answer (off or absent); otherwise the work runs twice. BB decides on the same
+  // event Firstmate handles, and a pool-routed decision can take 5 seconds, so a turn with no
+  // decision yet is read again for about 12 seconds before Firstmate treats it as declined.
+  const bbRetryDecisionSchema = z.object({
+    requestId: z.string(),
+    observedAt: z.number(),
+    decision: z.object({ kind: z.string() }).passthrough(),
+  }).passthrough().nullable();
+  const failedTurns = new Map<string, { requestId: string; at: number }>();
+  function bbRetryWaitMs(): number {
+    const raw = Number(process.env.FM_BB_RETRY_WAIT_MS);
+    return Number.isFinite(raw) && raw >= 0 ? raw : 500;
+  }
+  async function bbRetryQueued(threadId: string): Promise<boolean> {
+    try {
+      const rows = await bb.sdk.threads.queuedMessages.list({ threadId });
+      return rows.some((row) => asRecord(asRecord(row)["payload"])["kind"] === "retry" && !(typeof row.failureReason === "string" && row.failureReason !== ""));
+    } catch {
+      return false;
+    }
+  }
+  // requestId names the failed turn; without it (thread.failed) a decision counts when it
+  // was made after `since`, or when it names the turn turn.failed reported since then.
+  async function bbRetryPending(threadId: string, turn: { requestId?: string; since: number }): Promise<boolean> {
+    for (const step of [0, 1, 2, 4, 8, 8]) {
+      if (step > 0) await sleep(step * bbRetryWaitMs());
+      if (await bbRetryQueued(threadId)) return true;
+      let recorded: z.infer<typeof bbRetryDecisionSchema>;
+      try {
+        recorded = bbRetryDecisionSchema.parse(await bb.sdk.plugins.callRpc({ pluginId: "provider-retry", method: "decision.get", input: { threadId }, outputSchema: bbRetryDecisionSchema, signal: AbortSignal.timeout(5_000) }));
+      } catch {
+        return false;
+      }
+      const reported = failedTurns.get(threadId);
+      const requestId = turn.requestId ?? (reported !== undefined && reported.at >= turn.since ? reported.requestId : undefined);
+      if (recorded !== null && (requestId !== undefined ? recorded.requestId === requestId : recorded.observedAt >= turn.since)) return recorded.decision.kind === "retry";
+    }
+    return false;
+  }
+
+  bb.events.on("turn.failed", async ({ threadId, errorInfo, requestId }) => {
+    failedTurns.set(threadId, { requestId, at: Date.now() });
     if (knownCaptains.has(threadId)) {
-      await resumeExhaustedCaptain(threadId, errorInfo).catch((error) => bb.log.warn(`captain ${threadId} resume: ${String(error)}`));
+      await resumeExhaustedCaptain(threadId, errorInfo, requestId).catch((error) => bb.log.warn(`captain ${threadId} resume: ${String(error)}`));
       return;
     }
     const crew = await findCrewByThread(threadId);
@@ -15103,7 +15199,7 @@ export default async function plugin(bb: BbPluginApi) {
       await crewAtPlanLimit(crew, detail).catch((error) => bb.log.warn(`crew ${crew.id} plan limit: ${String(error)}`));
       return;
     }
-    await failoverExhaustedCrew(crew, errorInfo).catch((error) => bb.log.warn(`crew ${crew.id} failover: ${String(error)}`));
+    await failoverExhaustedCrew(crew, errorInfo, requestId).catch((error) => bb.log.warn(`crew ${crew.id} failover: ${String(error)}`));
   });
 
   async function unavailableProviders(): Promise<UnavailableProviders> {
@@ -15168,8 +15264,12 @@ export default async function plugin(bb: BbPluginApi) {
 
   // The owner had to type "Continue" after a pool outage (fleet audit 2026-10-07: a
   // 21-minute stall). Resume the failed turn after the pool has had time to free.
-  async function resumeExhaustedCaptain(threadId: string, info: FailedTurnInfo): Promise<void> {
+  async function resumeExhaustedCaptain(threadId: string, info: FailedTurnInfo, requestId?: string): Promise<void> {
     if (!providerExhausted(info) && !providerExhausted(null, await threadFailureDetail(threadId))) return;
+    if (await bbRetryPending(threadId, { requestId, since: Date.now() })) {
+      bb.log.info(`captain ${threadId}: BB's provider retry has this failed turn; no second resume`);
+      return;
+    }
     const key = `${CAPTAIN_RESUME_PREFIX}${threadId}`;
     const scheduled = (await bb.storage.kv.get<number>(key)) ?? 0;
     const delay = captainResumeDelay(scheduled);
@@ -15188,12 +15288,16 @@ export default async function plugin(bb: BbPluginApi) {
 
   // Crews died mid-deploy when the pool ran dry (fleet audit 2026-10-07). Move the crew
   // to another provider in the same worktree, once per hour, and make it re-verify.
-  async function failoverExhaustedCrew(crew: Crew, info: FailedTurnInfo): Promise<void> {
+  async function failoverExhaustedCrew(crew: Crew, info: FailedTurnInfo, requestId?: string): Promise<void> {
     if ((await settings.get()).supervisionEnabled !== true) return;
     if (!providerExhausted(info) && !providerExhausted(null, await threadFailureDetail(crew.threadId))) return;
     const key = `crew-failover:${crew.projectId}:${crew.parentThreadId ?? ""}:${crew.id}`;
     const last = await bb.storage.kv.get<number>(key);
     if (typeof last === "number" && Date.now() - last < FAILOVER_WINDOW_MS) return;
+    if (await bbRetryPending(crew.threadId, { requestId, since: Date.now() })) {
+      bb.log.info(`crew ${crew.id}: BB's provider retry has this failed turn; no failover while it is pending`);
+      return;
+    }
     const failed = (await bb.sdk.threads.get({ threadId: crew.threadId })).providerId ?? crew.providerId;
     const target = await failoverExecution(crew, failed);
     if (target === null) {
