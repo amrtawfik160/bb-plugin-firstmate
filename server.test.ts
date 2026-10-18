@@ -4853,6 +4853,11 @@ test("F2: a crew's backlog row is closed on land even after settings flip to nat
     host.harness.sdk.stub("threads.get", async () =>
       makeThreadResponse({ id: "thr_real", status: "idle", environmentId: "env_wt" }),
     );
+    // Forget checks the clean worktree for unlanded work first.
+    host.harness.sdk.stub("environments.diffFiles", async () => ({ files: [] }));
+    host.harness.sdk.stub("environments.get", async () => ({
+      id: "env_wt", hostId: "host_1", path: "/wt", isWorktree: true, status: "ready", mergeBaseBranch: "main",
+    }));
     const forgotten = await host.harness.behavior.runCli(["forget", crewId], { projectId: "proj_1" });
     assert.equal(forgotten.exitCode, 0, forgotten.stderr);
     // The row is ownership: it must still be closed (rm) despite the flip to kv.
