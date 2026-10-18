@@ -20,7 +20,7 @@ const manifest=JSON.parse(readFileSync('package.json','utf8'));
 const ids=manifestSkillIds(process.cwd());
 const hash=text=>createHash('sha256').update(text).digest('hex');
 async function hostFor(home) {
- const host=createFakePluginHost({pluginId:'firstmate',agentSkillIds:ids,settings:{fmHome:home,fmHostId:'host_1',fullParityOnDeck:false}});await plugin(host.bb);stubProviderCatalog(host);
+ const host=createFakePluginHost({pluginId:'firstmate',agentSkillIds:ids,settings:{fmHome:home,fmHostId:'host_1',fullParityOnDeck:false,signInCheck:false}});await plugin(host.bb);stubProviderCatalog(host);
  await host.bb.storage.kv.set('native-home:thr_cap',home);await host.bb.storage.kv.set('native-home-host:thr_cap','host_1');
  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',parentThreadId:threadId==='thr_cap'?null:'thr_cap',environmentId:'env_1'}));
  host.harness.sdk.stub('threads.getPluginMetadata',async()=>({captain:'true'}));
