@@ -95,7 +95,7 @@ try {
   const { harness, bb } = pluginHost;
   const config = await harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({pluginMetadata:{crew:'true', nativeHome:home, crewId:'c1'}}));
   assert.match(config.instructions, /native launch brief owns this worker role/);
-  assert.doesNotMatch(config.instructions, /WAITING:|Never poll CI|scheduled resume|orphaned watcher|background timer/);
+  assert.doesNotMatch(config.instructions, /WAITING:|Wait for CI with one blocking watch|scheduled resume|orphaned watcher|background timer/);
   const commands = new Map();
   const seen = [];
   harness.sdk.stub('hosts.list', async () => [{id:'host_1',name:'fixture'}]);
@@ -234,7 +234,7 @@ try {
   const prompt=harness.sdk.callsTo('threads.spawn')[0][0].prompt;
   assert.ok(prompt.includes('States: working, needs-decision, blocked, paused, done, failed.'));
   assert.ok(prompt.includes('SCOUT task: the deliverable is a written report'));
-  assert.doesNotMatch(prompt,/Never poll CI|WAITING:|stop every timer|scheduled resume/);
+  assert.doesNotMatch(prompt,/Wait for CI with one blocking watch|WAITING:|stop every timer|scheduled resume/);
   const next=(await bb.storage.kv.get('crews'))[0];
   const before=harness.sdk.callsTo('threads.send').length;
   const idle=await harness.behavior.emitThreadEvent('thread.idle',{thread:makeThreadResponse({id:next.threadId,status:'idle'}),lastAssistantText:'Finished; report saved.'});

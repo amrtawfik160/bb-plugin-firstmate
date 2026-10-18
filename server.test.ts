@@ -8366,7 +8366,7 @@ test("native worker transport is shared with the adapter and adds no waiting pol
     assert.ok(result.stdout.includes(`Firstmate home: ${home}`));
     assert.ok(result.stdout.includes(`${home}/data/c1/`));
     assert.ok(result.stdout.includes(f.task));
-    assert.doesNotMatch(result.stdout,/WAITING:|Never poll CI|stop every timer|scheduled resume/);
+    assert.doesNotMatch(result.stdout,/WAITING:|Wait for CI with one blocking watch|stop every timer|scheduled resume/);
   } finally {rmSync(home,{recursive:true,force:true});}
 });
 
@@ -11880,7 +11880,7 @@ for (const missing of [false, true]) {
         assert.match(spawned.prompt,/Smooth canvas zoom/);
         assert.match(spawned.prompt,/# Current worker role contract/);
         assert.doesNotMatch(spawned.prompt,/stale source must not replace/);
-        assert.doesNotMatch(spawned.prompt, /Never poll CI|WAITING:|stop every timer|final message MUST/);
+        assert.doesNotMatch(spawned.prompt, /Wait for CI with one blocking watch|WAITING:|stop every timer|final message MUST/);
       }
     } finally { await host.harness.lifecycle.dispose(); f.clean(); }
   });
