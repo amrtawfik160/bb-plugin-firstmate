@@ -105,7 +105,7 @@ kept under `/tmp/hanoon/canary-8ba34f1d/` on the build host.
    15ad1bd6, the same release the live captain runs. Startup passed.
 2. Dispatched crew `canary-timing-readme-typo` (Claude Sonnet 5.5). Its one
    model turn waited on a signal file.
-3. During that turn, at 03:25:56 UTC, installed this branch (head `0861e96`)
+3. During that turn, at 03:25:56 UTC, installed this branch (head `0861e96`, before the rebase; the rebase did not change the release ID)
    on the isolated server. On the old bundle, `firstmate_skill` still read
    native 15ad1bd6.
 4. Still during that turn: `firstmate_runtime install` returned release
@@ -150,7 +150,7 @@ home from `firstmate_deck`.
    release as `<previous>` (for the live captain today:
    `64909984c99c8f8f2f30f8813821172a17cc008e962a41a5c0c81691dd954c01`).
 2. `firstmate_runtime action=install`. Record the full 64-character
-   `release` it returns as `<release>`. At head `0861e96` and the docs-only
+   `release` it returns as `<release>`. At head `a4e3139` (rebased onto main `dd8806e`) and the docs-only
    heads after it, this is
    `103c4974c1aaa2fc5dce378a0347fa3cdc76b02a2eeb6eee9193e313914abf86`. If
    install returns another ID, use the returned one.
