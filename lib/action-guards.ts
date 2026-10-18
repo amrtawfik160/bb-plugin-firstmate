@@ -30,5 +30,8 @@ export function authFailure(detail: string): boolean {
   return /\b401\b|unauthori[sz]ed|missing bearer|not logged in|authentication (?:failed|required)|invalid api key|login required/i.test(detail);
 }
 
-/** Delays before each retry of a wake acknowledgement that failed after its action succeeded. */
-export const WAKE_COMPLETION_RETRY_MS: readonly number[] = [5_000, 30_000, 120_000];
+/** Delays before each retry of a wake acknowledgement that failed after its action succeeded. FM_WAKE_ACK_RETRY_MS (comma list) overrides them. */
+export function wakeCompletionRetryMs(): readonly number[] {
+  const given = (process.env.FM_WAKE_ACK_RETRY_MS ?? "").split(",").map(Number).filter((ms) => Number.isFinite(ms) && ms > 0);
+  return given.length > 0 ? given.slice(0, 5) : [5_000, 30_000, 120_000];
+}

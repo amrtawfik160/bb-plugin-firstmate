@@ -59,22 +59,26 @@ export function createLeases(db: Database) {
       })();
     },
     /** Release a lease this crew holds. Returns the next crew in line, which the caller tells. */
-    release(server: string, crewId: string): Waiter | undefined {
+    release(server: string, crewId: string, alive: (crewId: string) => boolean): Waiter | undefined {
       return db.transaction(() => {
         const current = holder(server);
         if (current?.crewId !== crewId) throw new Error(`Crew ${crewId} does not hold the lease on ${server}${current ? `; crew ${current.crewId} does` : ""}.`);
         db.prepare("DELETE FROM test_server_lease WHERE server=?").run(server);
+        for (const waiter of queue(server)) if (!alive(waiter.crewId)) db.prepare("DELETE FROM test_server_wait WHERE server=? AND crew=?").run(server, waiter.crewId);
         return queue(server)[0];
       })();
     },
-    /** Drop the lease of a crew that is gone or did not renew. Returns the expired lease and the next crew in line. */
-    expire(server: string, alive: (crewId: string) => boolean, now: number): { expired: Lease; next: Waiter | undefined } | null {
+    /** Drop the lease of a crew that is gone or did not renew, and the waiters that are gone. Returns the
+     * expired lease (if any) and the next crew in line; a queue with no holder also gets its next crew. */
+    expire(server: string, alive: (crewId: string) => boolean, now: number): { expired: Lease | null; next: Waiter | undefined } | null {
       return db.transaction(() => {
         const current = holder(server);
-        if (current === undefined || !stale(current, alive, now)) return null;
-        db.prepare("DELETE FROM test_server_lease WHERE server=?").run(server);
+        if (current !== undefined && !stale(current, alive, now)) return null;
+        if (current !== undefined) db.prepare("DELETE FROM test_server_lease WHERE server=?").run(server);
         for (const waiter of queue(server)) if (!alive(waiter.crewId)) db.prepare("DELETE FROM test_server_wait WHERE server=? AND crew=?").run(server, waiter.crewId);
-        return { expired: current, next: queue(server)[0] };
+        const next = queue(server)[0];
+        if (current === undefined && next === undefined) return null;
+        return { expired: current ?? null, next };
       })();
     },
     servers(): string[] {

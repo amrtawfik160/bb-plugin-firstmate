@@ -99,7 +99,7 @@ import { changeReach, type Reach } from "./owner/reach.ts";
 import { hostCanDrive, PROOF_SURFACES, projectBriefLines, projectForName, projectForRepo, repoOf as prRepoOf, surfaceRefusal, surfaceWords, unlistedNote } from "./owner/projects.ts";
 import { createReleaseReadbacks, type ReleaseSource } from "./lib/release-readback.ts";
 import { cardSubject, keyFromEnvFile, ownerRules, ruleAnsweringCard } from "./lib/card-rules.ts";
-import { authFailure, signedIn, signInCommand, WAKE_COMPLETION_RETRY_MS, withoutWakeWarning } from "./lib/action-guards.ts";
+import { authFailure, signedIn, signInCommand, wakeCompletionRetryMs, withoutWakeWarning } from "./lib/action-guards.ts";
 import { createLeases, LEASE_TTL_MS } from "./lib/test-server-lease.ts";
 import { addCorrection, CAPTAIN_FILE, CORRECTION_RULE, correctionBrief, fixCorrection, LEDGER_FILE, readLedger, within } from "./owner/corrections.ts";
 import { renderScorecard, type ScorecardData } from "./owner/scorecard.ts";
@@ -2394,7 +2394,13 @@ export default async function plugin(bb: BbPluginApi) {
     return queueStore.list();
   }
   const ledgerMutations = new Map<string, Promise<void>>();
+  // The ledger keys the current async chain holds, so a caller can see that it runs under one.
+  const heldLedgers = new AsyncLocalStorage<ReadonlySet<string>>();
+  const holdsLedger = (key: string) => heldLedgers.getStore()?.has(key) === true;
   async function serializeLedger<T>(key: string, operation: () => Promise<T>): Promise<T> {
+    const held = new Set([...(heldLedgers.getStore() ?? []), key]);
+    const inner = operation;
+    operation = () => heldLedgers.run(held, inner);
     const previous = ledgerMutations.get(key) ?? Promise.resolve();
     let release!: () => void;
     const pending = new Promise<void>(resolve => { release = resolve; });
@@ -5433,10 +5439,24 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   // Owner decision Q11: one crew at a time on a shared test server (owner/projects.json sharedServers).
+  // A lease's crew is alive while it is registered and its thread has not failed for good or been archived
+  // (a 401 crew is not restarted, so its record stays: checker FF2-verdict-1).
+  async function leaseAliveCheck(crews: readonly Crew[], servers: readonly string[]): Promise<(id: string) => boolean> {
+    const named = new Set(servers.flatMap((server) => [leases.holder(server)?.crewId, ...leases.queue(server).map((waiter) => waiter.crewId)]).filter((id): id is string => id !== undefined));
+    const dead = new Set<string>();
+    for (const crew of crews.filter((row) => named.has(row.id))) {
+      try {
+        const thread = await raceAbort(bb.sdk.threads.get({ threadId: crew.threadId }), undefined, STUCK_HOST_CALL_MS);
+        if (thread.status === "error" || asRecord(thread)["archivedAt"]) dead.add(crew.id);
+      } catch { /* unreadable: treated as alive until the lease time runs out */ }
+    }
+    return (id: string) => !dead.has(id) && crews.some((row) => row.id === id);
+  }
+
   async function leaseOperation(action: "acquire" | "release" | "status", server: string, caller: string | undefined, reset?: string): Promise<string> {
     const crew = caller ? await findCrewByThread(caller) : undefined;
     const crews = await readCrews();
-    const alive = (id: string) => crews.some((row) => row.id === id);
+    const alive = await leaseAliveCheck(crews, [server]);
     if (action === "status") {
       const holder = leases.holder(server);
       const waiting = leases.queue(server);
@@ -5449,9 +5469,9 @@ export default async function plugin(bb: BbPluginApi) {
     if (action === "release") {
       const how = reset?.trim() ?? "";
       if (how === "") throw new Error(`Release needs reset: how you put ${server} back to main (${declared.reset}). Reset it first, then release with --reset "<what you did>".`);
-      const next = leases.release(server, crew.id);
+      const next = leases.release(server, crew.id, alive);
       bb.log.info(`lease ${server} released by crew ${crew.id}: ${how}`);
-      if (next !== undefined) await handLease(server, next.crewId, crews, `crew ${crew.id} released it after: ${clip(how, 200)}`);
+      if (next !== undefined) await handLease(server, next.crewId, crews, alive, `crew ${crew.id} released it after: ${clip(how, 200)}`);
       return `Released ${server}${next ? `; crew ${next.crewId} has it now` : ""}.`;
     }
     const got = leases.acquire(server, crew.id, crew.parentThreadId, alive, Date.now());
@@ -5460,21 +5480,22 @@ export default async function plugin(bb: BbPluginApi) {
     return `The lease on ${server} (${declared.about}) is yours until you release it. It expires after ${LEASE_TTL_MS / 3_600_000} h without a renewal (acquire again to renew) or when your crew ends. When done: ${declared.reset}, then bb firstmate lease release ${server} --reset "<what you did>".`;
   }
 
-  async function handLease(server: string, crewId: string, crews: readonly Crew[], why: string): Promise<void> {
+  async function handLease(server: string, crewId: string, crews: readonly Crew[], alive: (id: string) => boolean, why: string): Promise<void> {
     const next = crews.find((row) => row.id === crewId);
     if (next === undefined || !next.parentThreadId) return;
-    leases.acquire(server, next.id, next.parentThreadId, (id) => crews.some((row) => row.id === id), Date.now());
+    leases.acquire(server, next.id, next.parentThreadId, alive, Date.now());
     await tellCrew(next, `The lease on ${server} is yours now (${why}). Use it, reset it to main, then release it: bb firstmate lease release ${server} --reset "<what you did>".`, false, true).catch((error) => bb.log.warn(`lease ${server} hand-over to crew ${next.id}: ${String(error)}`));
   }
 
   async function expireLeases(): Promise<void> {
     const crews = await readCrews();
-    const alive = (id: string) => crews.some((row) => row.id === id);
-    for (const server of leases.servers()) {
+    const servers = leases.servers();
+    const alive = await leaseAliveCheck(crews, servers);
+    for (const server of servers) {
       const gone = leases.expire(server, alive, Date.now());
       if (gone === null) continue;
-      bb.log.warn(`lease ${server}: crew ${gone.expired.crewId}'s lease expired (crew ended or did not renew)`);
-      if (gone.next !== undefined) await handLease(server, gone.next.crewId, crews, `crew ${gone.expired.crewId}'s lease expired`);
+      if (gone.expired !== null) bb.log.warn(`lease ${server}: crew ${gone.expired.crewId}'s lease expired (crew ended, failed or did not renew)`);
+      if (gone.next !== undefined) await handLease(server, gone.next.crewId, crews, alive, gone.expired !== null ? `crew ${gone.expired.crewId}'s lease expired` : `nobody held it`);
     }
   }
 
@@ -10590,6 +10611,9 @@ export default async function plugin(bb: BbPluginApi) {
   // slow never stops the action.
   async function drainBeforeAction(captain: string | null | undefined, action: string): Promise<void> {
     if (!captain) return;
+    // An action sent with handledWake runs under the captain's receipt lock: the captain is handling its
+    // wakes right now, and waiting for that lock here would never end (checker FF2-verdict-1).
+    if (holdsLedger(`receipt:${captain}`)) return;
     const current = await settings.get();
     const fmHome = (captainHomes.get(captain) ?? current.fmHome).trim();
     if (fmHome === "") return;
@@ -12448,7 +12472,7 @@ export default async function plugin(bb: BbPluginApi) {
   // let it restore failures while keeping the tool output available to the model.
   // A handled wake whose acknowledgement failed is acknowledged again later; an absent receipt counts as done.
   function finishWakeLater(captain: string, id: string, attempt = 0): void {
-    const delay = WAKE_COMPLETION_RETRY_MS[attempt];
+    const delay = wakeCompletionRetryMs()[attempt];
     if (delay === undefined || captain === "") { bb.log.error(`wake ${id} captain=${captain}: acknowledgement still failing after ${attempt} retries; the action stays done`); return; }
     const timer = setTimeout(() => {
       if (launchAbort.signal.aborted) return;
@@ -16298,6 +16322,11 @@ export default async function plugin(bb: BbPluginApi) {
     followUpWork=(async()=>{await launchRecoveryPass(launchAbort.signal);resumeDispatchJobs();drainQueuedDispatchesInBackground();await deliveryPass(launchAbort.signal);await raceAbort(publishFleet(),launchAbort.signal,STUCK_HOST_CALL_MS);})();
     try {await followUpWork;} finally {followUpWork=undefined;}
   });
+  // A wake acknowledgement that failed after its action is finished after a restart too.
+  for (const key of await bb.storage.kv.list("wake-handled:")) {
+    const [, captain, id] = key.split(":");
+    if (captain && id) finishWakeLater(captain, id);
+  }
   let taskSweepWork: Promise<void> | undefined;
   bb.background.schedule("task-lifecycle", "*/5 * * * *", async () => {
     if (taskSweepWork || launchAbort.signal.aborted) return;
