@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { MAX_SYNC_ATTEMPTS, nextSyncStep, ownerFacing, verdictOf, type SyncObservation, type SyncState } from "./native-sync.ts";
+import { MAX_SYNC_ATTEMPTS, nextSyncStep, ownerFacing, testOnlyChange, verdictOf, type SyncObservation, type SyncState } from "./native-sync.ts";
 
 const PIN = "15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4";
 const AHEAD = "a".repeat(40);
@@ -136,4 +136,23 @@ test("the verdict is the checker's last line; anything else counts as a fail", (
   assert.deepEqual(verdictOf("x\nVERDICT: fail (2 findings)\n"), { verdict: "fail", line: "VERDICT: fail (2 findings)" });
   assert.deepEqual(verdictOf("VERDICT: pass"), { verdict: "pass", line: "VERDICT: pass" });
   assert.equal(verdictOf("VERDICT: pass\nBut one more finding: the guard failed.").verdict, "fail");
+});
+
+test("a weekly run whose upstream changed only test files reports once and starts no sync", () => {
+  const step = nextSyncStep(seen({ start: true, changed: ["tests/fm-supervision-host.test.sh"] }), {});
+  assert.equal(step.action, "tell");
+  if (step.action !== "tell") return;
+  assert.equal(step.key, `tests-only:${AHEAD}`);
+  assert.match(step.text, /by test files only/);
+  assert.match(step.text, /No sync crew, checker, canary or live switch runs/);
+  assert.equal(nextSyncStep(seen({ start: true, changed: ["tests/x.sh"] }), { done: [step.key] }).action, "none");
+  assert.equal(nextSyncStep(seen({ changed: ["tests/x.sh"] }), {}).action, "none", "a follow-up run never reports or starts");
+});
+
+test("test files are the native repo's root tests/ folder; anything else, an empty list or an unread list syncs", () => {
+  assert.deepEqual(testOnlyChange(["tests/a.sh", "tests/fixtures/b.json"]), true);
+  for (const changed of [[], undefined, ["tests/a.sh", "bin/fm-test-run.sh"], [".claude/mods/firstmate-calm/tests/a.sh"], ["docs/tests/a.md"], ["tests"]]) {
+    assert.equal(testOnlyChange(changed), false, JSON.stringify(changed));
+    assert.equal(nextSyncStep(seen({ start: true, changed }), {}).action, "spawn-sync", JSON.stringify(changed));
+  }
 });
