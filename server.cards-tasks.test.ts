@@ -156,13 +156,13 @@ test("the task sweep closes tasks from done reports, opens a card for a crew tha
 
 // Isolated-server run (17 Oct): the captain had already sent its own card about crew B's wait, and
 // the sweep opened a second one.
-test("the sweep opens no crew card when the captain already sent a card after the crew's status line", async () => {
+test("the sweep opens no crew card when the captain already sent a card bound to that task", async () => {
   const at = Math.floor(Date.now() / 1000) - 600;
   const { host, rpc, tasks, asks, restore } = await captainHost({ wait1: `blocked [at=${at}]: need owner to restore the repo\n` });
   try {
     await host.bb.storage.kv.set("crews", [crewRow("wait1", "thr_w1")]);
     const task = tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Slug max", sourceRefs: ["tg:1:1"], crewId: "wait1", at: Date.now() });
-    asks.create({ captain: "thr_cap", kind: "question", text: "PR #6: the repo is gone. What should we do?", options: [], createdAt: at * 1000 + 60_000, project: "Cyndra" });
+    asks.create({ captain: "thr_cap", kind: "question", text: "PR #6: the repo is gone. What should we do?", options: [], createdAt: at * 1000 + 60_000, project: "Cyndra", task: task.id });
     await host.harness.behavior.runSchedule("task-lifecycle");
     assert.equal(asks.listOpen("thr_cap").length, 1, "no second card");
     assert.equal(rpc.filter((call) => call.method === "ask").length, 0);
@@ -184,15 +184,13 @@ test("a newer card on another task or project does not stop the crew's own quest
 });
 
 // #145 finding 2: a done line is not used up while another crew of the task still works.
-test("a task with two crews advances once the last one has reported done, on a later sweep", async () => {
+test("a task with two crews advances once both have reported done, after one crew is retired", async () => {
   const at = Math.floor(Date.now() / 1000) - 600;
   const { host, tasks, restore } = await captainHost({ c1: `done [at=${at}]: part one\n`, c2: `done [at=${at}]: part two\n` });
   try {
     await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_c1", { shape: "scout" }), crewRow("c2", "thr_c2", { shape: "scout" })]);
     const task = tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Two parts", sourceRefs: ["tg:1:2"], crewId: "c1", at: Date.now() });
     tasks.attach(task.id, "thr_cap", { crewId: "c2", sourceRefs: [], at: Date.now() });
-    await host.harness.behavior.runSchedule("task-lifecycle");
-    assert.equal(tasks.get(task.id)!.state, "working", "both crews still run");
     await host.bb.storage.kv.set("crews", [crewRow("c2", "thr_c2", { shape: "scout" })]);
     await host.harness.behavior.runSchedule("task-lifecycle");
     assert.equal(tasks.get(task.id)!.state, "done");
@@ -213,5 +211,43 @@ test("a card the owner answers while an older card is being replaced keeps his a
     });
     text(await tool(host, "firstmate_ask").execute({ question: "Johan draft: send v2?", kind: "question", options: [{ label: "Send" }, { label: "Wait" }], task: task.id }, ctx));
     assert.deepEqual([asks.get(second.id)!.state, asks.get(second.id)!.resolution], ["answered", "Wait: do not send"]);
+  } finally { restore(); await host.harness.lifecycle.dispose(); }
+});
+
+// Checker round 2: both crews of a task are still registered and both reported done. The task advances on one
+// sweep: a crew counts as still working from its own latest report, not from being registered.
+test("a task whose two registered crews both reported done advances; one still working holds it", async () => {
+  const at = Math.floor(Date.now() / 1000) - 600;
+  const both = await captainHost({ c1: `done [at=${at}]: part one\n`, c2: `done [at=${at}]: part two\n` });
+  try {
+    await both.host.bb.storage.kv.set("crews", [crewRow("c1", "thr_c1", { shape: "scout" }), crewRow("c2", "thr_c2", { shape: "scout" })]);
+    const task = both.tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Two parts", sourceRefs: ["tg:1:3"], crewId: "c1", at: Date.now() });
+    both.tasks.attach(task.id, "thr_cap", { crewId: "c2", sourceRefs: [], at: Date.now() });
+    await both.host.harness.behavior.runSchedule("task-lifecycle");
+    assert.equal(both.tasks.get(task.id)!.state, "done");
+  } finally { both.restore(); await both.host.harness.lifecycle.dispose(); }
+  const one = await captainHost({ c1: `done [at=${at}]: part one\n`, c2: `working [at=${at}]: still on part two\n` });
+  try {
+    await one.host.bb.storage.kv.set("crews", [crewRow("c1", "thr_c1", { shape: "scout" }), crewRow("c2", "thr_c2", { shape: "scout" })]);
+    const task = one.tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Two parts", sourceRefs: ["tg:1:3"], crewId: "c1", at: Date.now() });
+    one.tasks.attach(task.id, "thr_cap", { crewId: "c2", sourceRefs: [], at: Date.now() });
+    await one.host.harness.behavior.runSchedule("task-lifecycle");
+    assert.equal(one.tasks.get(task.id)!.state, "working", "c2 still works");
+  } finally { one.restore(); await one.host.harness.lifecycle.dispose(); }
+});
+
+
+// Checker round 2: a newer standalone card on the same project (Cyndra icons) is about other work. Only a card
+// bound to the crew's task suppresses its question; otherwise both cards go out.
+test("a newer standalone card on the same project does not suppress a crew's question card", async () => {
+  const at = Math.floor(Date.now() / 1000) - 600;
+  const { host, tasks, asks, restore } = await captainHost({ wait1: `blocked [at=${at}]: need owner to restore its repo\n` });
+  try {
+    await host.bb.storage.kv.set("crews", [crewRow("wait1", "thr_w1")]);
+    const task = tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Slug max", sourceRefs: ["tg:1:1"], crewId: "wait1", at: Date.now() });
+    asks.create({ captain: "thr_cap", kind: "question", text: "Cyndra icons: outline or filled?", options: [], createdAt: at * 1000 + 60_000, project: "Cyndra" });
+    await host.harness.behavior.runSchedule("task-lifecycle");
+    assert.equal(asks.listOpen("thr_cap").filter((ask) => ask.task === task.id).length, 1, "the crew's own card goes out");
+    assert.equal(asks.listOpen("thr_cap").length, 2, "both cards stay open");
   } finally { restore(); await host.harness.lifecycle.dispose(); }
 });
