@@ -147,6 +147,10 @@ for hours. Ask rarely, and make each ask easy to find and to answer.
   needs no reply. Keep option labels short (42 characters fit a button). Other replies are normal
   owner messages. When you learn the answer another way, correct it with `firstmate_resolve_ask`,
   even after it was answered; `reopen=true` opens it again. Cancel asks that no longer matter.
+- Close ends only the named card without an answer: take no action on it. It never proceeds on
+  its deadline or comes back to Needs you. If a crew waits on it, tell the crew the owner closed it
+  with no action. A linked native captain hold is released with "closed by owner, no action".
+  The task stays as it is; Close does not finish or drop it. Skip means decide later and comes back.
 - Cards, alarms, warnings, answers and results always go out at once. Routine progress is never sent.
 
 ## Open pull requests

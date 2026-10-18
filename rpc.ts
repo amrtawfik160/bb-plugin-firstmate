@@ -30,6 +30,11 @@ export const rpcContract = defineRpcContract({
     input: z.object({ threadId: z.string().min(1), id: z.string().min(1).max(64), resolution: z.string().min(1).max(2000) }),
     output: z.object({ ok: z.boolean() }),
   },
+  closeAsk: {
+    experimental_description: "The owner closes these cards with no answer and no action. All or nothing: foreign, missing or resolved cards refuse the request, except a previous owner close returns already. Closed cards never proceed on their deadline or return to Needs you. The task stays as it is. The captain is told once; a failed notice is retried later.",
+    input: z.object({ threadId: z.string().min(1), ids: z.array(z.string().min(1).max(64)).min(1).max(20) }),
+    output: z.object({ ok: z.boolean(), closed: z.array(z.string()), already: z.array(z.string()), refused: z.array(z.string()) }),
+  },
   deferAsk: {
     experimental_description: "The owner skipped these open cards on the Board (decide later) until `until` (ms). All or nothing: if any card is not this captain's open card, nothing is skipped, ok is false and `refused` names those cards. Each card stays open and comes back to the owner on its own at that time; a skipped card never proceeds on its deadline. `already`: cards still skipped from before, which keep their time; `until` is the time in effect. The captain is told once, and a notice whose send failed is sent again later.",
     input: z.object({ threadId: z.string().min(1), ids: z.array(z.string().min(1).max(64)).min(1).max(20), until: z.number().int().positive() }),

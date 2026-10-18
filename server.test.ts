@@ -6717,7 +6717,7 @@ function scratchFmHome(): string {
 // Make the fake host terminal EXECUTE each command for real (recovering the inner
 // command from the RC wrapper and running it in a fresh shell), so the plugin drives
 // the actual scripts. threads.send stays a recording no-op.
-function stubRealExecHost(host: Awaited<ReturnType<typeof load>>, extraEnv: Record<string, string> = {}) {
+function stubRealExecHost(host: Awaited<ReturnType<typeof load>>, extraEnv: Record<string, string> = {}, intercept?: (command: string) => { output: string; code: number } | undefined) {
   const cmds = new Map<string, string>();
   let n = 0;
   host.harness.sdk.stub("threadSections.list", async () => []);
@@ -6738,6 +6738,8 @@ function stubRealExecHost(host: Awaited<ReturnType<typeof load>>, extraEnv: Reco
   host.harness.sdk.stub("terminals.close", async () => ({}));
   host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
     const inner = unwrapHostCommand(cmds.get(args.terminalId) ?? "");
+    const intercepted = intercept?.(inner);
+    if (intercepted !== undefined) return hostRcPayload(intercepted.output, intercepted.code);
     const r = fixtureShell(inner, { encoding: "utf8", timeout: 30_000, env: { ...process.env, ...extraEnv } });
     return hostRcPayload((r.stdout ?? "") + (r.stderr ?? ""), typeof r.status === "number" ? r.status : 1);
   });
@@ -12201,5 +12203,282 @@ test("check 158/9: a delivered queued wake inside BB's sender envelope is filed 
       assert.ok(existsSync(join(home, "state/c1.inbox/handled/001.msg")), "BB's request carries the sender envelope and still proves delivery");
       assert.ok(!existsSync(join(home, "state/c1.inbox/001.msg")));
     } finally { run.controller.abort(); await run.done; }
+  } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
+});
+
+for (const heldId of ["pick-one", "c1"]) test(`IT closeAsk releases real native hold ${heldId} with no action and leaves other cards and tasks unchanged`, async () => {
+  const home = bundledNativeHome();
+  const host = itHost(home, {});
+  await plugin(host.bb);
+  try {
+    stubRealExecHost(host);
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
+    await host.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
+    const crew = { ...shipRow("c1", "thr_crew", "thr_cap"), nativeHome: home };
+    await host.bb.storage.kv.set("crews", [crew]);
+    writeFileSync(join(home, "state/c1.meta"), "kind=ship\nbackend=bb\n");
+    const native = (...args: string[]) => spawnSync(join(home, "bin/fm-captain-hold.sh"), args, { env: { ...process.env, FM_HOME: home, FM_STATE_OVERRIDE: join(home, "state") }, encoding: "utf8" });
+    for (const id of [heldId, "pick-two"]) {
+      const held = native("hold", id, "--title", id, "--reason", "needs owner");
+      assert.equal(held.status, 0, held.stdout + held.stderr);
+    }
+    const note = "Choose a database?";
+    writeFileSync(join(home, "state/c1.status"), `needs-decision [key=pick-one]: ${note}\n${heldId === "pick-one" ? "needs-decision [key=pick-two]: Choose a cache?\n" : ""}`);
+    const { createOwnerAsks } = await import("./lib/owner-asks.ts");
+    const { createOwnerTasks } = await import("./lib/owner-tasks.ts");
+    const tasks = createOwnerTasks(host.bb.storage.database());
+    const task = tasks.open({ captain: "thr_cap", project: "Safi", title: "Database", sourceRefs: [], crewId: "c1", at: Date.now() });
+    const before = tasks.get(task.id);
+    const asks = createOwnerAsks(host.bb.storage.database());
+    asks.create({ id: "real-close", captain: "thr_cap", kind: "question", text: note, task: task.id, options: [], sourceRef: `crew-wait:c1:${createHash("sha256").update(note).digest("hex").slice(0, 16)}`, createdAt: Date.now() });
+    asks.create({ id: "other-close", captain: "thr_cap", kind: "question", text: "Choose a cache?", task: task.id, options: [], createdAt: Date.now() });
+    const input = { threadId: "thr_cap", ids: ["real-close"] };
+    assert.deepEqual(await host.harness.behavior.callRpc("closeAsk", input), { ok: true, closed: ["real-close"], already: [], refused: [] });
+    assert.equal(native("open", heldId).status, 1, "real native hold must be released");
+    assert.equal(native("open", "pick-two").status, 0, "another card's hold stays open");
+    const backlog = readFileSync(join(home, "data/backlog.md"), "utf8");
+    assert.match(backlog, /closed by owner, no action/);
+    assert.ok(backlog.includes(`- [ ] ${heldId} `), "Close must not finish native work");
+    assert.match(readFileSync(join(home, "state/c1.status"), "utf8"), /resolved \[key=pick-one\]: closed by owner, no action/);
+    assert.equal(asks.get("other-close")?.state, "open");
+    assert.deepEqual(tasks.get(task.id), before);
+    const resolved = readFileSync(join(home, "state/c1.status"), "utf8");
+    await host.harness.behavior.callRpc("closeAsk", input);
+    assert.equal(readFileSync(join(home, "state/c1.status"), "utf8"), resolved);
+  } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
+});
+for (const heldId of ["c1"]) test(`CHECKER shared crew hold releases after its last closed question`, async () => {
+  const home = bundledNativeHome();
+  const host = itHost(home, {});
+  await plugin(host.bb);
+  try {
+    stubRealExecHost(host);
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
+    await host.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
+    const crew = { ...shipRow("c1", "thr_crew", "thr_cap"), nativeHome: home };
+    await host.bb.storage.kv.set("crews", [crew]);
+    writeFileSync(join(home, "state/c1.meta"), "kind=ship\nbackend=bb\n");
+    const native = (...args: string[]) => spawnSync(join(home, "bin/fm-captain-hold.sh"), args, { env: { ...process.env, FM_HOME: home, FM_STATE_OVERRIDE: join(home, "state") }, encoding: "utf8" });
+    for (const id of [heldId]) {
+      const held = native("hold", id, "--title", id, "--reason", "needs owner");
+      assert.equal(held.status, 0, held.stdout + held.stderr);
+    }
+    const note = "Choose a database?";
+    writeFileSync(join(home, "state/c1.status"), `needs-decision [key=pick-one]: ${note}\n${"needs-decision [key=pick-two]: Choose a cache?\n"}`);
+    const { createOwnerAsks } = await import("./lib/owner-asks.ts");
+    const { createOwnerTasks } = await import("./lib/owner-tasks.ts");
+    const tasks = createOwnerTasks(host.bb.storage.database());
+    const task = tasks.open({ captain: "thr_cap", project: "Safi", title: "Database", sourceRefs: [], crewId: "c1", at: Date.now() });
+    const before = tasks.get(task.id);
+    const asks = createOwnerAsks(host.bb.storage.database());
+    asks.create({ id: "real-close", captain: "thr_cap", kind: "question", text: note, task: task.id, options: [], sourceRef: `crew-wait:c1:${createHash("sha256").update(note).digest("hex").slice(0, 16)}`, createdAt: Date.now() });
+    asks.create({ id: "other-close", captain: "thr_cap", kind: "question", text: "Choose a cache?", task: task.id, options: [], sourceRef: `crew-wait:c1:${createHash("sha256").update("Choose a cache?").digest("hex").slice(0, 16)}`, createdAt: Date.now() });
+    const input = { threadId: "thr_cap", ids: ["real-close"] };
+    assert.deepEqual(await host.harness.behavior.callRpc("closeAsk", input), { ok: true, closed: ["real-close"], already: [], refused: [] });
+    assert.equal(native("open", heldId).status, 0, "shared crew hold must stay while another question is open");
+    assert.equal(asks.get("other-close")?.state, "open");
+    assert.deepEqual(await host.harness.behavior.callRpc("closeAsk", { threadId: "thr_cap", ids: ["other-close"] }), { ok: true, closed: ["other-close"], already: [], refused: [] });
+    assert.equal(native("open", heldId).status, 1, "shared crew hold must release after its last question closes");
+    assert.deepEqual(tasks.get(task.id), before);
+  } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
+});
+
+for (const fault of ["before release", "after release", "old empty plan"]) test(`IT shared Close recovers ${fault} through reload and repeat Close`, async () => {
+  const home = bundledNativeHome();
+  let host = itHost(home, {});
+  await plugin(host.bb);
+  const native = (...args: string[]) => spawnSync(join(home, "bin/fm-captain-hold.sh"), args, { env: { ...process.env, FM_HOME: home, FM_STATE_OVERRIDE: join(home, "state") }, encoding: "utf8" });
+  const configure = () => {
+    stubRealExecHost(host);
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
+  };
+  try {
+    configure();
+    await host.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
+    await host.bb.storage.kv.set("crews", [{ ...shipRow("c1", "thr_crew", "thr_cap"), nativeHome: home }]);
+    writeFileSync(join(home, "state/c1.meta"), "kind=ship\nbackend=bb\n");
+    const held = native("hold", "c1", "--title", "Shared work", "--reason", "needs owner");
+    assert.equal(held.status, 0, held.stdout + held.stderr);
+    writeFileSync(join(home, "state/c1.status"), "needs-decision [key=pick-one]: Database?\nneeds-decision [key=pick-two]: Cache?\n");
+    const { createOwnerAsks } = await import("./lib/owner-asks.ts");
+    const { createOwnerTasks } = await import("./lib/owner-tasks.ts");
+    const tasks = createOwnerTasks(host.bb.storage.database());
+    const task = tasks.open({ captain: "thr_cap", project: "Safi", title: "Shared work", sourceRefs: [], crewId: "c1", at: Date.now() });
+    const before = tasks.get(task.id);
+    const asks = createOwnerAsks(host.bb.storage.database());
+    for (const [id, text] of [["first", "Database?"], ["last", "Cache?"]]) asks.create({ id, captain: "thr_cap", kind: "question", text, task: task.id, options: [], sourceRef: `crew-wait:c1:${createHash("sha256").update(text).digest("hex").slice(0, 16)}`, createdAt: Date.now() });
+    const close = (id: string) => host.harness.behavior.callRpc("closeAsk", { threadId: "thr_cap", ids: [id] });
+    if (fault === "old empty plan") {
+      // State left by the first version: both cards closed, no native resolutions, incorrectly marked released.
+      asks.close(["first", "last"], "thr_cap");
+      asks.markClosesReleased(["first", "last"]);
+      for (const id of ["first", "last"]) await host.bb.storage.kv.set(`owner-close-holds:${id}`, []);
+    }
+    await close("first");
+    const firstStatus = readFileSync(join(home, "state/c1.status"), "utf8");
+    assert.match(firstStatus, /resolved \[key=pick-one\]: closed by owner, no action/);
+    assert.doesNotMatch(firstStatus, /resolved \[key=pick-two\]/);
+    assert.equal(native("open", "c1").status, 0);
+    await close("first");
+    assert.equal(readFileSync(join(home, "state/c1.status"), "utf8"), firstStatus);
+    if (fault !== "old empty plan") assert.equal(asks.get("last")?.state, "open");
+    let failures = 0;
+    if (fault !== "old empty plan") {
+      stubRealExecHost(host, {}, (command) => {
+        if (!command.includes('"$FM_BINDIR/fm-captain-hold.sh" \'answer\' \'c1\'')) return;
+        failures++;
+        if (fault === "after release") {
+          const result = fixtureShell(command, { encoding: "utf8", timeout: 30_000, env: process.env });
+          assert.equal(result.status, 0, result.stdout + result.stderr);
+        }
+        return { output: "lost native release reply", code: 1 };
+      });
+      host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
+    }
+    await close("last");
+    const closedStatus = readFileSync(join(home, "state/c1.status"), "utf8");
+    assert.match(closedStatus, /resolved \[key=pick-two\]: closed by owner, no action/);
+    if (fault !== "old empty plan") assert.ok(failures > 0, "release failure must actually be injected");
+    assert.equal(native("open", "c1").status, fault === "before release" ? 0 : 1);
+    host = await host.harness.lifecycle.reload(plugin);
+    configure();
+    assert.deepEqual(await close("last"), { ok: true, closed: [], already: ["last"], refused: [] });
+    assert.equal(native("open", "c1").status, 1, "repeat finishes the release after reconstruction");
+    assert.equal(readFileSync(join(home, "state/c1.status"), "utf8"), closedStatus);
+    const backlog = readFileSync(join(home, "data/backlog.md"), "utf8");
+    assert.ok(backlog.includes("- [ ] c1 "), "the work stays open");
+    assert.match(backlog, /closed by owner, no action/);
+    assert.deepEqual(createOwnerTasks(host.bb.storage.database()).get(task.id), before);
+    const sent = host.harness.sdk.callsTo("threads.send").length;
+    await close("first"); await close("last");
+    assert.equal(host.harness.sdk.callsTo("threads.send").length, sent, "repeat closes send no further captain notices");
+    assert.equal(readFileSync(join(home, "state/c1.status"), "utf8"), closedStatus);
+    assert.equal(readFileSync(join(home, "data/backlog.md"), "utf8"), backlog);
+  } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
+});
+for (const heldId of ["c1"]) test(`CHECKER repeat Close must preserve an open replacement question using the same key`, async () => {
+  const home = bundledNativeHome();
+  const host = itHost(home, {});
+  await plugin(host.bb);
+  try {
+    stubRealExecHost(host);
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
+    await host.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
+    const crew = { ...shipRow("c1", "thr_crew", "thr_cap"), nativeHome: home };
+    await host.bb.storage.kv.set("crews", [crew]);
+    writeFileSync(join(home, "state/c1.meta"), "kind=ship\nbackend=bb\n");
+    const native = (...args: string[]) => spawnSync(join(home, "bin/fm-captain-hold.sh"), args, { env: { ...process.env, FM_HOME: home, FM_STATE_OVERRIDE: join(home, "state") }, encoding: "utf8" });
+    for (const id of [heldId]) {
+      const held = native("hold", id, "--title", id, "--reason", "needs owner");
+      assert.equal(held.status, 0, held.stdout + held.stderr);
+    }
+    const note = "Choose a database?";
+    writeFileSync(join(home, "state/c1.status"), `needs-decision [key=pick-one]: ${note}\n${"needs-decision [key=pick-two]: Choose a cache?\n"}`);
+    const { createOwnerAsks } = await import("./lib/owner-asks.ts");
+    const { createOwnerTasks } = await import("./lib/owner-tasks.ts");
+    const tasks = createOwnerTasks(host.bb.storage.database());
+    const task = tasks.open({ captain: "thr_cap", project: "Safi", title: "Database", sourceRefs: [], crewId: "c1", at: Date.now() });
+    const before = tasks.get(task.id);
+    const asks = createOwnerAsks(host.bb.storage.database());
+    asks.create({ id: "real-close", captain: "thr_cap", kind: "question", text: note, task: task.id, options: [], sourceRef: `crew-wait:c1:${createHash("sha256").update(note).digest("hex").slice(0, 16)}`, createdAt: Date.now() });
+    asks.create({ id: "other-close", captain: "thr_cap", kind: "question", text: "Choose a cache?", task: task.id, options: [], sourceRef: `crew-wait:c1:${createHash("sha256").update("Choose a cache?").digest("hex").slice(0, 16)}`, createdAt: Date.now() });
+    const input = { threadId: "thr_cap", ids: ["real-close"] };
+    assert.deepEqual(await host.harness.behavior.callRpc("closeAsk", input), { ok: true, closed: ["real-close"], already: [], refused: [] });
+    assert.equal(native("open", heldId).status, 0, "shared crew hold must stay while another question is open");
+    assert.equal(asks.get("other-close")?.state, "open");
+    const replacement = "Choose a new storage service?";
+    writeFileSync(join(home, "state/c1.status"), readFileSync(join(home, "state/c1.status"), "utf8") + `needs-decision [key=pick-one]: ${replacement}\n`);
+    asks.create({ id: "replacement", captain: "thr_cap", kind: "question", text: replacement, task: task.id, options: [], sourceRef: `crew-wait:c1:${createHash("sha256").update(replacement).digest("hex").slice(0, 16)}`, createdAt: Date.now() });
+    const beforeRepeat = readFileSync(join(home, "state/c1.status"), "utf8");
+    assert.deepEqual(await host.harness.behavior.callRpc("closeAsk", input), { ok: true, closed: [], already: ["real-close"], refused: [] });
+    const { foldOpenDecisions } = await import("./lib/policy.ts");
+    assert.equal(asks.get("replacement")?.state, "open");
+    assert.ok(foldOpenDecisions(readFileSync(join(home, "state/c1.status"), "utf8").split("\n"), "ship").some(d => d.key === "pick-one" && d.note === replacement), "repeat Close must not resolve the replacement question whose card is open");
+    assert.equal(readFileSync(join(home, "state/c1.status"), "utf8"), beforeRepeat, "repeat Close must not change native status");
+    await host.harness.behavior.callRpc("closeAsk", { threadId: "thr_cap", ids: ["other-close"] });
+    assert.equal(native("open", heldId).status, 0, "open replacement question still needs the shared hold");
+    assert.deepEqual(tasks.get(task.id), before);
+  } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
+});
+for (const heldId of ["c1"]) test(`CHECKER last Close must preserve the shared hold for an open replacement question`, async () => {
+  const home = bundledNativeHome();
+  const host = itHost(home, {});
+  await plugin(host.bb);
+  try {
+    stubRealExecHost(host);
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
+    await host.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
+    const crew = { ...shipRow("c1", "thr_crew", "thr_cap"), nativeHome: home };
+    await host.bb.storage.kv.set("crews", [crew]);
+    writeFileSync(join(home, "state/c1.meta"), "kind=ship\nbackend=bb\n");
+    const native = (...args: string[]) => spawnSync(join(home, "bin/fm-captain-hold.sh"), args, { env: { ...process.env, FM_HOME: home, FM_STATE_OVERRIDE: join(home, "state") }, encoding: "utf8" });
+    for (const id of [heldId]) {
+      const held = native("hold", id, "--title", id, "--reason", "needs owner");
+      assert.equal(held.status, 0, held.stdout + held.stderr);
+    }
+    const note = "Choose a database?";
+    writeFileSync(join(home, "state/c1.status"), `needs-decision [key=pick-one]: ${note}\n${"needs-decision [key=pick-two]: Choose a cache?\n"}`);
+    const { createOwnerAsks } = await import("./lib/owner-asks.ts");
+    const { createOwnerTasks } = await import("./lib/owner-tasks.ts");
+    const tasks = createOwnerTasks(host.bb.storage.database());
+    const task = tasks.open({ captain: "thr_cap", project: "Safi", title: "Database", sourceRefs: [], crewId: "c1", at: Date.now() });
+    const before = tasks.get(task.id);
+    const asks = createOwnerAsks(host.bb.storage.database());
+    asks.create({ id: "real-close", captain: "thr_cap", kind: "question", text: note, task: task.id, options: [], sourceRef: `crew-wait:c1:${createHash("sha256").update(note).digest("hex").slice(0, 16)}`, createdAt: Date.now() });
+    asks.create({ id: "other-close", captain: "thr_cap", kind: "question", text: "Choose a cache?", task: task.id, options: [], sourceRef: `crew-wait:c1:${createHash("sha256").update("Choose a cache?").digest("hex").slice(0, 16)}`, createdAt: Date.now() });
+    const input = { threadId: "thr_cap", ids: ["real-close"] };
+    assert.deepEqual(await host.harness.behavior.callRpc("closeAsk", input), { ok: true, closed: ["real-close"], already: [], refused: [] });
+    assert.equal(native("open", heldId).status, 0, "shared crew hold must stay while another question is open");
+    assert.equal(asks.get("other-close")?.state, "open");
+    const replacement = "Choose a new storage service?";
+    writeFileSync(join(home, "state/c1.status"), readFileSync(join(home, "state/c1.status"), "utf8") + `needs-decision [key=pick-one]: ${replacement}\n`);
+    asks.create({ id: "replacement", captain: "thr_cap", kind: "question", text: replacement, task: task.id, options: [], sourceRef: `crew-wait:c1:${createHash("sha256").update(replacement).digest("hex").slice(0, 16)}`, createdAt: Date.now() });
+    const beforeRepeat = readFileSync(join(home, "state/c1.status"), "utf8");
+    await host.harness.behavior.callRpc("closeAsk", { threadId: "thr_cap", ids: ["other-close"] });
+    assert.equal(asks.get("replacement")?.state, "open");
+    assert.equal(native("open", heldId).status, 0, "open replacement question still needs the shared hold");
+    assert.deepEqual(tasks.get(task.id), before);
+  } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test("IT pending keyed Close preserves a replacement hold after reload", async () => {
+  const home = bundledNativeHome();
+  let host = itHost(home, {});
+  await plugin(host.bb);
+  const native = (...args: string[]) => spawnSync(join(home, "bin/fm-captain-hold.sh"), args, { env: { ...process.env, FM_HOME: home, FM_STATE_OVERRIDE: join(home, "state") }, encoding: "utf8" });
+  try {
+    let failures = 0;
+    stubRealExecHost(host, {}, (command) => {
+      if (!command.includes('"$FM_BINDIR/fm-captain-hold.sh" \'answer\' \'pick-one\'')) return;
+      failures++;
+      return { output: "release interrupted", code: 1 };
+    });
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
+    await host.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
+    await host.bb.storage.kv.set("crews", [{ ...shipRow("c1", "thr_crew", "thr_cap"), nativeHome: home }]);
+    writeFileSync(join(home, "state/c1.meta"), "kind=ship\nbackend=bb\n");
+    const held = native("hold", "pick-one", "--title", "Question", "--reason", "needs owner");
+    assert.equal(held.status, 0, held.stdout + held.stderr);
+    writeFileSync(join(home, "state/c1.status"), "needs-decision [key=pick-one]: Database?\n");
+    const { createOwnerAsks } = await import("./lib/owner-asks.ts");
+    const asks = createOwnerAsks(host.bb.storage.database());
+    const create = (id: string, text: string) => asks.create({ id, captain: "thr_cap", kind: "question", text, options: [], sourceRef: `crew-wait:c1:${createHash("sha256").update(text).digest("hex").slice(0, 16)}`, createdAt: Date.now() });
+    create("old", "Database?");
+    await host.harness.behavior.callRpc("closeAsk", { threadId: "thr_cap", ids: ["old"] });
+    assert.equal(failures, 1, "the saved keyed hold release must actually fail");
+    writeFileSync(join(home, "state/c1.status"), readFileSync(join(home, "state/c1.status"), "utf8") + "needs-decision [key=pick-one]: Replacement?\n");
+    create("new", "Replacement?");
+    const status = readFileSync(join(home, "state/c1.status"), "utf8");
+    const backlog = readFileSync(join(home, "data/backlog.md"), "utf8");
+    host = await host.harness.lifecycle.reload(plugin);
+    stubRealExecHost(host);
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
+    for (const repeat of [1, 2]) {
+      assert.deepEqual(await host.harness.behavior.callRpc("closeAsk", { threadId: "thr_cap", ids: ["old"] }), { ok: true, closed: [], already: ["old"], refused: [] });
+      assert.equal(native("open", "pick-one").status, 0, `repeat ${repeat} must preserve the replacement hold`);
+      assert.equal(readFileSync(join(home, "state/c1.status"), "utf8"), status);
+      assert.equal(readFileSync(join(home, "data/backlog.md"), "utf8"), backlog);
+      assert.equal(createOwnerAsks(host.bb.storage.database()).get("new")?.state, "open");
+    }
   } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
 });
