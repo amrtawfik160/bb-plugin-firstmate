@@ -59,6 +59,14 @@ test('fake BB: two editing tasks share the saved environment in order while a sc
     const scout = await dispatch.execute({task:'Read the diff',taskId:'read-only',shape:'scout',role:'lookup',workstreamId:w.id,origin:{kind:'captain',reason:'approved workstream'},providerId:'codex',model:'gpt-6.1-sol'},ctx);
     assert.match(text(scout),/Dispatched/);
     assert.equal(spawned.length,2);
+    for (const call of spawned) {
+      const metadata = call.pluginMetadata as Record<string,unknown>;
+      const dir = `/repo/.firstmate-workstream-reports/${w.id}/${metadata.crewId}`;
+      assert.equal(metadata.reportDir,dir);
+      assert.ok(String(call.prompt).includes(`${dir}/report.md`),'the brief names the persisted report path');
+      assert.ok(String(call.prompt).includes(`create the report directory '${dir}'`));
+    }
+    assert.ok(String(spawned[1]!.prompt).includes('Read-only repository: do not change repository files or Git state.'));
     for (const call of spawned) assert.deepEqual(call.environment,{type:'reuse',environmentId:'env_ws'});
     assert.equal((spawned[0]!.pluginMetadata as Record<string,unknown>).deliveryRequirement,'pr','an editing crew delivers its PR; Ship owns merging');
     statuses.set('worker1','idle');

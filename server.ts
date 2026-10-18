@@ -145,6 +145,7 @@ const crewSchema = z.object({
   worktree: z.boolean(),
   workstreamId: z.string().optional(),
   workstreamRepo: z.string().optional(),
+  reportDir: z.string().optional(),
   shape: shapeSchema.default("ship"),
   posture: z.string().default("direct-PR"),
   // Tri-state for the read-through reaper (R5): true = a state/<id>.meta was
@@ -3434,6 +3435,16 @@ export default async function plugin(bb: BbPluginApi) {
     return crew.nativeHome ?? (await baseSettings.get()).fmHome.trim();
   }
 
+  async function crewReportDirectory(crew: Crew): Promise<string> {
+    if (crew.reportDir) return crew.reportDir;
+    const home = crew.nativeHome ?? (await baseSettings.get()).fmHome.trim();
+    if (home) return `${home}/data/${crew.id}`;
+    if (!crew.workstreamId) return "";
+    const w = workstreams.get(crew.workstreamId, crew.parentThreadId ?? "");
+    const repo = w.repos.find((r) => !crew.workstreamRepo || r.repository.toLowerCase() === crew.workstreamRepo.toLowerCase());
+    return repo ? `${dirname(repo.sourcePath)}/.firstmate-workstream-reports/${w.id}/${crew.id}` : "";
+  }
+
   async function isNativeWorker(crew: Crew): Promise<boolean> {
     if (await crewNativeHome(crew) === "") return false;
     const current = await baseSettings.get();
@@ -4683,6 +4694,7 @@ export default async function plugin(bb: BbPluginApi) {
               launchKey:typeof meta["launchKey"] === "string" ? meta["launchKey"] : launch?.key,
               deliveryRequirement:recoveredContract(meta,launch),
               yolo:launch?.yolo ?? (typeof meta["yolo"]==="boolean" ? meta["yolo"] : undefined),
+              reportDir: typeof meta["reportDir"] === "string" ? meta["reportDir"] : original?.reportDir,
               nativeHome: typeof meta["nativeHome"] === "string" ? meta["nativeHome"] : (await baseSettings.get()).fmHome.trim(),
               task: typeof meta["task"] === "string" ? meta["task"] : "(recovered crew)",
               ...(typeof meta["title"] === "string" && meta["title"] !== "" ? { title: meta["title"] } : {}),
@@ -6708,6 +6720,8 @@ export default async function plugin(bb: BbPluginApi) {
     const wsRepo = input.workstreamId ? workstreams.get(input.workstreamId, input.parentThreadId!).repos.find((r) => r.projectId === input.projectId && (!input.workstreamRepo || r.repository.toLowerCase() === input.workstreamRepo.toLowerCase())) : undefined;
     if (input.workstreamId && !wsRepo) throw new Error("Repository is absent from workstream.");
     if (wsRepo) crew.workstreamRepo = wsRepo.repository;
+    const reportDir = await crewReportDirectory(crew);
+    if (wsRepo) crew.reportDir = reportDir;
     const selection = wsRepo ? { projectId: input.projectId, hostId: wsRepo.hostId, checkout: wsRepo.path, environmentId: wsRepo.environmentId } : await selectExecution(bb,input.projectId,selectedHost);
     const selectionKey=launchKey(input.projectId,input.parentThreadId ?? "",crew.nativeHome ?? "",crew.id);
     launches.update(selectionKey,{hostId:selection.hostId,path:selection.checkout});
@@ -6773,7 +6787,7 @@ export default async function plugin(bb: BbPluginApi) {
       projectId: input.projectId,
       environment,
       prompt: crewPrompt({
-        task: input.workstreamId ? `${task}\n\nWorkstream ${input.workstreamId}: keep this worktree and branch. Commit and push here. Do not create another worktree or switch branches. Only the owner Ship action may merge or make this work live. Load /pr before creating or updating a PR body. ${input.shape === "scout" || input.role === "checker" || input.role === "lookup" ? "Read-only: do not change files or Git state." : ""}` : task,
+        task: input.workstreamId ? `${task}\n\nWorkstream ${input.workstreamId}: create the report directory ${shQuote(reportDir)} before writing your durable report to ${shQuote(`${reportDir}/report.md`)}. Keep this worktree and branch. Commit and push here. Do not create another worktree or switch branches. Only the owner Ship action may merge or make this work live. Load /pr before creating or updating a PR body. ${input.shape === "scout" || input.role === "checker" || input.role === "lookup" ? "Read-only repository: do not change repository files or Git state." : ""}` : task,
         parentThreadId: input.parentThreadId,
         shape: input.shape,
         mode: input.mode,
@@ -6781,7 +6795,7 @@ export default async function plugin(bb: BbPluginApi) {
         title: crew.title,
         providerId: crew.providerId,
         playbook: crew.playbook,
-        ...(crew.nativeHome ? { dataDir: `${crew.nativeHome}/data/${crew.id}` } : {}),
+        ...(reportDir ? { dataDir: reportDir } : {}),
       }),
       title: crewThreadTitle(task, input.shape, crew.id, input.title),
       parentThreadId: input.parentThreadId,
@@ -6794,7 +6808,7 @@ export default async function plugin(bb: BbPluginApi) {
         crew: "true",
         launchKey: key, generation: 1,
         crewId: crew.id,
-        ...(input.workstreamId ? {workstreamId:input.workstreamId,...(crew.workstreamRepo ? {workstreamRepo:crew.workstreamRepo} : {})} : {}),
+        ...(input.workstreamId ? {workstreamId:input.workstreamId,...(crew.reportDir ? {reportDir:crew.reportDir} : {}),...(crew.workstreamRepo ? {workstreamRepo:crew.workstreamRepo} : {})} : {}),
         nativeHome: crew.nativeHome ?? "",
         task: task.slice(0, 500),
         ...(crew.title !== undefined ? { title: crew.title } : {}),
@@ -6840,7 +6854,8 @@ export default async function plugin(bb: BbPluginApi) {
     const stream = await crewStatusLines(scout,report);
     const status = latestStatus(stream.lines);
     if (!status || status.verb !== "done" || foldOpenDecisions(stream.lines, stream.kind).length > 0) throw new Error("Promotion requires DONE with no open blockers.");
-    const reportPath = home ? `${home}/data/${scout.id}/report.md` : "";
+    const reportDir = await crewReportDirectory(scout);
+    const reportPath = reportDir ? `${reportDir}/report.md` : "";
     if (reportPath) {
       const hostId = await resolveHostForProject(scout.projectId, scout.parentThreadId ?? undefined);
       const result = await bb.sdk.files.read({ hostId, path: reportPath });
@@ -9105,11 +9120,11 @@ export default async function plugin(bb: BbPluginApi) {
   // FM138 verdict 2: the P4 gate reads one authoritative source, the report.md the brief
   // names. Empty when it cannot be read, so the gate fails closed.
   async function crewReportFile(crew: Crew): Promise<string> {
-    const home = await crewNativeHome(crew);
+    const reportDir = await crewReportDirectory(crew);
     const hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined).catch(() => "");
-    if (home === "" || hostId === "") return "";
+    if (reportDir === "" || hostId === "") return "";
     try {
-      const result = await bb.sdk.files.read({ hostId, path: `${home}/data/${crew.id}/report.md` });
+      const result = await bb.sdk.files.read({ hostId, path: `${reportDir}/report.md` });
       return "content" in result && typeof result.content === "string" ? result.content : "";
     } catch { return ""; }
   }
@@ -9124,10 +9139,10 @@ export default async function plugin(bb: BbPluginApi) {
     const gap = pipelineProofGap(await crewReportFile(crew), step, { pr: r.id, head: r.headSha ?? "" });
     if (gap === null) return;
     quality.noteUnproven({ captain: crew.parentThreadId ?? r.owner ?? "", crew: crew.id, run: crew.threadId, pr: r.id, gap, at: Date.now() });
-    const home = await crewNativeHome(crew);
+    const reportDir = await crewReportDirectory(crew);
     throw new Error([
       `Refusing to record verification for ${r.id}: crew ${crew.id}'s report has its proof step ${gap}.`,
-      `The crew writes "✓ P${step} ${PROOF_STEP} for ${r.id} at ${(r.headSha ?? "").slice(0, 7)}: driven <what>; seen <what>" in ${home ? `${home}/data/${crew.id}/report.md` : "its report"}, then records verification again. CI and unit tests are not verification.`,
+      `The crew writes "✓ P${step} ${PROOF_STEP} for ${r.id} at ${(r.headSha ?? "").slice(0, 7)}: driven <what>; seen <what>" in ${reportDir ? `${reportDir}/report.md` : "its report"}, then records verification again. CI and unit tests are not verification.`,
     ].join("\n"));
   }
 
@@ -16085,9 +16100,9 @@ export default async function plugin(bb: BbPluginApi) {
     // A bug-fix or feature crew reports the pipeline's steps, not the playbook's.
     const pipeline = pipelineGates(crew) ? crewPipeline(crew) : null;
     const steps = pipeline?.length ?? playbookStepCount(playbookText);
-    const home = await crewNativeHome(crew);
+    const reportDir = await crewReportDirectory(crew);
     // 0940c38e wrote final-report.md, not report.md.
-    const files = home === "" ? [] : await Promise.all(["report.md", "final-report.md"].map((name) => read(`${home}/data/${crew.id}/${name}`)));
+    const files = reportDir === "" ? [] : await Promise.all(["report.md", "final-report.md"].map((name) => read(`${reportDir}/${name}`)));
     const report = [lastAssistantText, ...files].join("\n");
     if (!gapDone) {
       const gaps = reportGaps(report, steps);

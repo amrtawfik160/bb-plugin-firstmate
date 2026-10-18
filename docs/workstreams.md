@@ -93,3 +93,5 @@ Every repo keeps its worktree and branch across Ship actions. Each Ship uses a P
 Dev links use dedicated `fm-workstream-*.service` units, track actual HTTP requests through a loopback proxy, stop after two hours without requests, and evict the least recently requested link when a fourth starts.
 The `fm-f5f15031-vite*.service` units are never managed by this feature.
 End refuses any task outside Live or Dropped, active crews, dirty files, unpushed commits, or relevant stashes. Topic closure is requested only after cleanup succeeds.
+
+Workstream crews keep a saved report directory, separate from native-worker lifecycle detection. The brief names its `report.md` path. It uses the captain's data directory when available; otherwise reports live beside the source checkout under `.firstmate-workstream-reports/<workstream>/<crew>/`, outside the shared worktree. Verification reads that report only; chat and `final-report.md` cannot replace its surface proof. Reports do not make workstream crews native teardown candidates.
