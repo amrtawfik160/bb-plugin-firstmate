@@ -414,3 +414,101 @@ test("overlapping defer retries tell the captain once", { timeout: 15_000 }, asy
     await host.harness.lifecycle.dispose();
   }
 });
+
+test("closeAsk closes one card without answering, removes it from Needs you, and tells the captain once", async () => {
+  const host = await captainHost();
+  try {
+    const asks = createOwnerAsks(host.bb.storage.database());
+    const now = Date.now();
+    asks.create({ id: "close1", captain: "thr_cap", kind: "question", text: "Publish Safi?", options: [{ label: "Yes", value: "yes" }], recommended: 0, defaultAt: now + 1000, createdAt: now });
+    const input = { threadId: "thr_cap", ids: ["close1"] };
+    assert.deepEqual(await host.harness.behavior.callRpc("closeAsk", input), { ok: true, closed: ["close1"], already: [], refused: [] });
+    assert.equal(asks.get("close1")?.resolution, "closed by owner, no action");
+    assert.ok(asks.get("close1")!.resolvedAt! >= now);
+    assert.deepEqual(asks.listOpen("thr_cap"), []);
+    assert.deepEqual(asks.takeDue("thr_cap", now + 2000), []);
+    const board = await host.harness.behavior.callRpc("telegramCommand", { threadId: "thr_cap", command: "board" }) as { text: string };
+    assert.doesNotMatch(board.text, /Publish Safi/);
+    assert.deepEqual(await host.harness.behavior.callRpc("closeAsk", input), { ok: true, closed: [], already: ["close1"], refused: [] });
+    const notices = host.harness.sdk.callsTo("threads.send");
+    assert.equal(notices.length, 1);
+    assert.deepEqual(notices[0]![0], { threadId: "thr_cap", mode: "steer", input: [{ type: "text", text: "Owner closed card close1 (Publish Safi?) with no answer: take no action on it; if a crew waits on it, tell the crew the owner closed it.", mentions: [], visibility: "agent-only" }] });
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("closeAsk closes only named cards in a pack and preserves their task", async () => {
+  const host = await captainHost();
+  try {
+    const { createOwnerTasks } = await import("./lib/owner-tasks.ts");
+    const tasks = createOwnerTasks(host.bb.storage.database());
+    const task = tasks.open({ captain: "thr_cap", project: "Safi", title: "Publish", sourceRefs: [], at: Date.now() });
+    const asks = createOwnerAsks(host.bb.storage.database());
+    for (const id of ["pack1", "pack2"]) asks.create({ id, captain: "thr_cap", kind: "question", text: id, options: [], task: task.id, createdAt: Date.now() });
+    const before = tasks.get(task.id);
+    await host.harness.behavior.callRpc("closeAsk", { threadId: "thr_cap", ids: ["pack1", "pack1"] });
+    assert.deepEqual(asks.listWaiting("thr_cap", Date.now()).map((ask) => ask.id), ["pack2"]);
+    assert.deepEqual(tasks.get(task.id), before);
+    assert.deepEqual(await host.harness.behavior.callRpc("resolveAsk", { threadId: "thr_cap", id: "pack1", resolution: "Yes" }), { ok: false });
+    assert.equal(asks.resolve("pack1", "thr_cap", "open", "Reopen", Date.now()), undefined);
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("closeAsk refuses all cards when one belongs to another captain, is missing, or is already answered", async () => {
+  const host = await captainHost();
+  try {
+    const asks = createOwnerAsks(host.bb.storage.database());
+    for (const [id, captain] of [["own", "thr_cap"], ["foreign", "thr_other"], ["answered", "thr_cap"]]) asks.create({ id, captain, kind: "question", text: id, options: [], createdAt: Date.now() });
+    asks.resolve("answered", "thr_cap", "answered", "Yes", Date.now());
+    for (const id of ["foreign", "missing", "answered"]) {
+      assert.deepEqual(await host.harness.behavior.callRpc("closeAsk", { threadId: "thr_cap", ids: ["own", id] }), { ok: false, closed: [], already: [], refused: [id] });
+      assert.equal(asks.get("own")?.state, "open");
+    }
+    assert.deepEqual(await host.harness.behavior.callRpc("closeAsk", { threadId: "thr_other", ids: ["own"] }), { ok: false, closed: [], already: [], refused: ["own"] });
+    assert.equal(host.harness.sdk.callsTo("threads.send").length, 0);
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("closeAsk retries a failed notice and overlapping repeats deliver once", async () => {
+  const host = await captainHost();
+  try {
+    const asks = createOwnerAsks(host.bb.storage.database());
+    asks.create({ id: "retryclose", captain: "thr_cap", kind: "question", text: "Ship?", options: [], createdAt: Date.now() });
+    let attempts = 0;
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    host.harness.sdk.stub("threads.send", async () => {
+      attempts++;
+      if (attempts === 1) throw new Error("temporary failure");
+      entered(); await gate; return {};
+    });
+    const input = { threadId: "thr_cap", ids: ["retryclose"] };
+    await host.harness.behavior.callRpc("closeAsk", input);
+    const first = host.harness.behavior.callRpc("closeAsk", input);
+    await started;
+    const second = host.harness.behavior.callRpc("closeAsk", input);
+    release();
+    await Promise.all([first, second]);
+    await host.harness.behavior.callRpc("closeAsk", input);
+    assert.equal(attempts, 2);
+    assert.equal(asks.get("retryclose")?.resolution, "closed by owner, no action");
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("closeAsk is published for RPC discovery with the same bounded ids input as deferAsk", async () => {
+  const host = await captainHost();
+  try {
+    const published = host.harness.registrations.experimental_publishedRpcMethods;
+    const close = published.find((method) => method.method === "closeAsk");
+    const defer = published.find((method) => method.method === "deferAsk");
+    assert.ok(close, "Telegram must discover closeAsk before offering Close");
+    assert.ok(defer);
+    assert.deepEqual(close.inputSchema.properties?.ids, defer.inputSchema.properties?.ids);
+    assert.deepEqual(close.inputSchema.required, ["threadId", "ids"]);
+    assert.match(close.methodDescription!, /no answer and no action/);
+    for (const ids of [[], Array(21).fill("a"), [""], ["a".repeat(65)]]) {
+      await assert.rejects(host.harness.behavior.callRpc("closeAsk", { threadId: "thr_cap", ids }), /input/i);
+    }
+  } finally { await host.harness.lifecycle.dispose(); }
+});

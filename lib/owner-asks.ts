@@ -34,6 +34,9 @@ export type OwnerAsk = {
   deferredUntil?: number;
 };
 
+export type AskClosure = { closed: string[]; already: string[]; refused: string[] };
+export const OWNER_CLOSED_RESOLUTION = "closed by owner, no action";
+
 export type AskDeferral = { deferred: string[]; already: string[]; refused: string[]; until: number | null };
 
 export type NewOwnerAsk = Pick<OwnerAsk, "captain" | "kind" | "text" | "options"> & {
@@ -154,6 +157,12 @@ export type OwnerAsks = {
   listCandidates(captain: string, now: number): OwnerAsk[];
   /** Correct or reopen an ask owned by this captain. */
   resolve(id: string, captain: string, state: AskState, resolution: string, at: number): OwnerAsk | undefined;
+  /** Close only the named cards, atomically; owner closes are terminal and repeated closes are no-ops. */
+  close(ids: readonly string[], captain: string, now?: number): AskClosure;
+  untoldCloses(captain: string): OwnerAsk[];
+  markClosesTold(ids: readonly string[]): void;
+  unreleasedCloses(captain: string): OwnerAsk[];
+  markClosesReleased(ids: readonly string[]): void;
   /**
    * The owner skipped these cards until `until`. All or nothing: when any id is not this captain's open
    * ask, nothing changes and `refused` names those ids. `already`: asks still skipped from before, which
@@ -229,6 +238,7 @@ export function createOwnerAsks(db: Database): OwnerAsks {
       id TEXT PRIMARY KEY, message_url TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS owner_ask_route (
       id TEXT PRIMARY KEY, project TEXT, task TEXT, subject TEXT);
+    CREATE TABLE IF NOT EXISTS owner_ask_close (id TEXT PRIMARY KEY, told INTEGER NOT NULL DEFAULT 0, released INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS owner_ask_defer (id TEXT PRIMARY KEY, until INTEGER NOT NULL, told INTEGER NOT NULL DEFAULT 0);`);
 
   const select = `SELECT owner_ask.*,
@@ -298,6 +308,33 @@ export function createOwnerAsks(db: Database): OwnerAsks {
     get,
     listOpen,
     listWaiting: (captain, now) => listOpen(captain).filter((ask) => !isDeferred(ask, now)),
+    close(ids, captain, now = Date.now()) {
+      return db.transaction(() => {
+        const current = [...new Set(ids)].map((id) => ({ id, ask: get(id) }));
+        const already = current.filter(({ id, ask }) => ask?.captain === captain && db.prepare("SELECT id FROM owner_ask_close WHERE id=?").get(id) !== undefined).map(({ id }) => id);
+        const refused = current.filter(({ id, ask }) => !ask || ask.captain !== captain || (ask.state !== "open" && !already.includes(id))).map(({ id }) => id);
+        if (refused.length > 0) return { closed: [], already: [], refused };
+        const closed = current.filter(({ id }) => !already.includes(id)).map(({ id }) => id);
+        for (const id of closed) {
+          db.prepare("UPDATE owner_ask SET state='cancelled', resolution=?, resolved_at=? WHERE id=?").run(OWNER_CLOSED_RESOLUTION, now, id);
+          db.prepare("DELETE FROM owner_ask_defer WHERE id=?").run(id);
+          db.prepare("INSERT INTO owner_ask_close VALUES (?,0,0)").run(id);
+        }
+        return { closed, already, refused: [] };
+      })();
+    },
+    untoldCloses(captain) {
+      return (db.prepare(`${select} WHERE captain=? AND EXISTS(SELECT 1 FROM owner_ask_close WHERE id=owner_ask.id AND told=0) ORDER BY created_at, owner_ask.id`).all(captain) as AskRecord[]).map(fromRecord);
+    },
+    unreleasedCloses(captain) {
+      return (db.prepare(`${select} WHERE captain=? AND EXISTS(SELECT 1 FROM owner_ask_close WHERE id=owner_ask.id AND released=0) ORDER BY created_at, owner_ask.id`).all(captain) as AskRecord[]).map(fromRecord);
+    },
+    markClosesReleased(ids) {
+      for (const id of ids) db.prepare("UPDATE owner_ask_close SET released=1 WHERE id=?").run(id);
+    },
+    markClosesTold(ids) {
+      for (const id of ids) db.prepare("UPDATE owner_ask_close SET told=1 WHERE id=?").run(id);
+    },
     defer(ids, captain, until, now = Date.now()) {
       return db.transaction(() => {
         const wanted = [...new Set(ids)];
@@ -325,7 +362,7 @@ export function createOwnerAsks(db: Database): OwnerAsks {
     resolve(id, captain, state, resolution, at) {
       return db.transaction(() => {
         const current = get(id);
-        if (!current || current.captain !== captain) return undefined;
+        if (!current || current.captain !== captain || db.prepare("SELECT id FROM owner_ask_close WHERE id=?").get(id) !== undefined) return undefined;
         db.prepare("UPDATE owner_ask SET state=?, resolution=?, resolved_at=? WHERE id=?").run(state, state === "open" ? null : resolution, state === "open" ? null : at, id);
         // A skip ends when the card is answered or reopened: a reopened card waits on the owner again.
         db.prepare("DELETE FROM owner_ask_defer WHERE id=?").run(id);

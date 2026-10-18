@@ -12202,3 +12202,45 @@ test("check 158/9: a delivered queued wake inside BB's sender envelope is filed 
     } finally { run.controller.abort(); await run.done; }
   } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
 });
+
+for (const heldId of ["pick-one", "c1"]) test(`IT closeAsk releases real native hold ${heldId} with no action and leaves other cards and tasks unchanged`, async () => {
+  const home = bundledNativeHome();
+  const host = itHost(home, {});
+  await plugin(host.bb);
+  try {
+    stubRealExecHost(host);
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
+    await host.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
+    const crew = { ...shipRow("c1", "thr_crew", "thr_cap"), nativeHome: home };
+    await host.bb.storage.kv.set("crews", [crew]);
+    writeFileSync(join(home, "state/c1.meta"), "kind=ship\nbackend=bb\n");
+    const native = (...args: string[]) => spawnSync(join(home, "bin/fm-captain-hold.sh"), args, { env: { ...process.env, FM_HOME: home, FM_STATE_OVERRIDE: join(home, "state") }, encoding: "utf8" });
+    for (const id of [heldId, "pick-two"]) {
+      const held = native("hold", id, "--title", id, "--reason", "needs owner");
+      assert.equal(held.status, 0, held.stdout + held.stderr);
+    }
+    const note = "Choose a database?";
+    writeFileSync(join(home, "state/c1.status"), `needs-decision [key=pick-one]: ${note}\n${heldId === "pick-one" ? "needs-decision [key=pick-two]: Choose a cache?\n" : ""}`);
+    const { createOwnerAsks } = await import("./lib/owner-asks.ts");
+    const { createOwnerTasks } = await import("./lib/owner-tasks.ts");
+    const tasks = createOwnerTasks(host.bb.storage.database());
+    const task = tasks.open({ captain: "thr_cap", project: "Safi", title: "Database", sourceRefs: [], crewId: "c1", at: Date.now() });
+    const before = tasks.get(task.id);
+    const asks = createOwnerAsks(host.bb.storage.database());
+    asks.create({ id: "real-close", captain: "thr_cap", kind: "question", text: note, task: task.id, options: [], sourceRef: `crew-wait:c1:${createHash("sha256").update(note).digest("hex").slice(0, 16)}`, createdAt: Date.now() });
+    asks.create({ id: "other-close", captain: "thr_cap", kind: "question", text: "Choose a cache?", task: task.id, options: [], createdAt: Date.now() });
+    const input = { threadId: "thr_cap", ids: ["real-close"] };
+    assert.deepEqual(await host.harness.behavior.callRpc("closeAsk", input), { ok: true, closed: ["real-close"], already: [], refused: [] });
+    assert.equal(native("open", heldId).status, 1, "real native hold must be released");
+    assert.equal(native("open", "pick-two").status, 0, "another card's hold stays open");
+    const backlog = readFileSync(join(home, "data/backlog.md"), "utf8");
+    assert.match(backlog, /closed by owner, no action/);
+    assert.ok(backlog.includes(`- [ ] ${heldId} `), "Close must not finish native work");
+    assert.match(readFileSync(join(home, "state/c1.status"), "utf8"), /resolved \[key=pick-one\]: closed by owner, no action/);
+    assert.equal(asks.get("other-close")?.state, "open");
+    assert.deepEqual(tasks.get(task.id), before);
+    const resolved = readFileSync(join(home, "state/c1.status"), "utf8");
+    await host.harness.behavior.callRpc("closeAsk", input);
+    assert.equal(readFileSync(join(home, "state/c1.status"), "utf8"), resolved);
+  } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
+});

@@ -88,7 +88,7 @@ import {
   buildProgram, createPrograms, isOpenProgram, isOpenTicket, newlyReady, numberOf, programCounts, programText, readyRefs, readyWakeText, repoOf,
   shortTicket, stallReminderDue, stallReminderText, ticketRef, type IssueFacts, type Program, type ProgramFact, type TicketRef,
 } from "./lib/programs.ts";
-import { askLetterAnswer, askIdFromSourceEventId, packAnswers, clip, createOwnerAsks, formatAge, formatAskCard, formatUtcTime, mayDefault, CAPTAIN_RULES, OWNER_DECISION_RULE, recommendedLabel, replacedBy, type AskKind, type OwnerAsk } from "./lib/owner-asks.ts";
+import { askLetterAnswer, askIdFromSourceEventId, packAnswers, clip, createOwnerAsks, formatAge, formatAskCard, formatUtcTime, mayDefault, OWNER_CLOSED_RESOLUTION, CAPTAIN_RULES, OWNER_DECISION_RULE, recommendedLabel, replacedBy, type AskKind, type OwnerAsk } from "./lib/owner-asks.ts";
 import { DEFAULT_RELIABILITY_FLAGS, reliabilityFlagsFromSettings } from "./lib/reliability-flags.ts";
 import { sanitizeSettingValue } from "./lib/settings-schema.ts";
 import { coalesceBatches, parseConnectorHeader, parseInboundTelegram, parseSourceRef, parseTelegramSubmission, stripTelegramEnvelope, telegramReplyParameters, telegramSourceRef } from "./lib/telegram-envelope.ts";
@@ -5941,6 +5941,78 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  // Only an exact crew question source can release a native hold. A task can carry several cards.
+  async function releaseClosedAskHold(ask: OwnerAsk): Promise<void> {
+    const crewId = ask.sourceRef?.startsWith("crew-wait:") ? ask.sourceRef.split(":")[1] : undefined;
+    if (!crewId) return;
+    const crew = await findCrew(crewId);
+    if (crew === undefined || crew.parentThreadId !== ask.captain || isSecondmateRoute(crew)) return;
+    const home = await crewNativeHome(crew);
+    if (home === "") return;
+    const hostId = await resolveHostForProject(crew.projectId, ask.captain);
+    const key = `owner-close-holds:${ask.id}`;
+    let targets = await bb.storage.kv.get<Array<{ id: string; statusKey: string | null }>>(key);
+    if (targets === undefined) {
+      const { lines, kind } = await crewStatusLines(crew);
+      const openDecisions = foldOpenDecisions(lines, kind);
+      const decisions = openDecisions.filter((d) => ask.sourceRef === `crew-wait:${statusKey(crew.id, d.note)}`);
+      const latest = latestStatus(lines);
+      const candidates = decisions.length > 0
+        ? decisions.map((d) => ({ id: d.key, statusKey: d.key }))
+        : latest !== null && ask.sourceRef === `crew-wait:${statusKey(crew.id, latest.note)}` ? [{ id: crew.id, statusKey: null }] : [];
+      targets = [];
+      for (const candidate of candidates) {
+        const open = await runCaptainHold(["open", candidate.id], { home, hostId, projectId: crew.projectId });
+        if (open === null || (open.exitCode !== 0 && open.exitCode !== 1)) throw new Error(`Could not read native hold ${candidate.id}.`);
+        if (open.exitCode === 0) targets.push(candidate);
+      }
+      // Native may hold the crew's work row itself. Only its sole question can release that shared row.
+      if (targets.length === 0 && decisions.length === 1 && openDecisions.length === 1 && decisions[0]!.key !== crew.id) {
+        const open = await runCaptainHold(["open", crew.id], { home, hostId, projectId: crew.projectId });
+        if (open === null || (open.exitCode !== 0 && open.exitCode !== 1)) throw new Error(`Could not read native hold ${crew.id}.`);
+        if (open.exitCode === 0) targets.push({ id: crew.id, statusKey: decisions[0]!.key });
+      }
+      // Remember exact identities before mutation so a failed release can be retried after status changes.
+      await bb.storage.kv.set(key, targets);
+    }
+    const resolution = OWNER_CLOSED_RESOLUTION;
+    const path = `${home}/state/.bb-close-${createHash("sha256").update(ask.id).digest("hex")}.answer`;
+    if (targets.length > 0 && !(await writeHostFile(hostId, path, resolution))) throw new Error(`Could not write close for ${ask.id}.`);
+    try {
+      for (const target of targets) {
+        requireNativeSuccess(await runCaptainHold(["answer", target.id, "--decision-file", path, "--release"], { home, hostId, projectId: crew.projectId }), "owner close hold");
+        if (target.statusKey !== null && !(await appendResolvedStatus(crew, target.statusKey, resolution))) throw new Error(`Could not resolve crew status for ${ask.id}.`);
+      }
+    } finally {
+      if (targets.length > 0) await runOnHost(hostId, `rm -f ${shQuote(path)}`, 10_000).catch(() => {});
+    }
+  }
+
+  const closeNoticeChains = new Map<string, Promise<void>>();
+  function tellClosedAsks(captainThreadId: string): Promise<void> {
+    const next = (closeNoticeChains.get(captainThreadId) ?? Promise.resolve()).then(async () => {
+      for (const ask of ownerAsks.unreleasedCloses(captainThreadId)) {
+        try {
+          await releaseClosedAskHold(ask);
+          ownerAsks.markClosesReleased([ask.id]);
+        } catch (error) { bb.log.warn(`owner ask close hold ${ask.id}: ${String(error)}`); }
+      }
+      for (const ask of ownerAsks.untoldCloses(captainThreadId)) {
+        try {
+          await bb.sdk.threads.send({
+            threadId: captainThreadId, mode: "steer",
+            input: [{ type: "text", text: `Owner closed card ${ask.id} (${ask.text}) with no answer: take no action on it; if a crew waits on it, tell the crew the owner closed it.`, mentions: [], visibility: "agent-only" }],
+          });
+          ownerAsks.markClosesTold([ask.id]);
+        } catch (error) { bb.log.warn(`owner ask close notice ${ask.id}: ${String(error)}`); }
+      }
+    });
+    const settled = next.catch(() => {});
+    closeNoticeChains.set(captainThreadId, settled);
+    void settled.then(() => { if (closeNoticeChains.get(captainThreadId) === settled) closeNoticeChains.delete(captainThreadId); });
+    return next;
+  }
+
   // An overdue reversible ask proceeds with its recommended option; the captain thread is told once.
   async function defaultOverdueAsks(captainThreadId: string): Promise<void> {
     const due = ownerAsks.takeDue(captainThreadId, Date.now());
@@ -6113,6 +6185,7 @@ export default async function plugin(bb: BbPluginApi) {
   async function drainCaptainReliability(captainThreadId: string, signal?: AbortSignal): Promise<void> {
     await wakeDuePromises(captainThreadId, signal).catch((error) => bb.log.warn(`owner promises: ${String(error)}`));
     await tellSkippedAsks(captainThreadId);
+    await tellClosedAsks(captainThreadId);
     await defaultOverdueAsks(captainThreadId).catch((error) => bb.log.warn(`owner ask deadlines: ${String(error)}`));
     await reconcilePrograms(captainThreadId, { signal }).catch((error) => bb.log.warn(`programs: ${String(error)}`));
     await followThrough(captainThreadId, signal).catch((error) => { if (!signal?.aborted) bb.log.warn(`live checks and stalls: ${String(error)}`); });
@@ -15292,6 +15365,15 @@ export default async function plugin(bb: BbPluginApi) {
       if (ok) await ownerAnsweredAsk(id, resolution);
       if (ok) await refreshOwnerBoard();
       return { ok };
+    },
+    async closeAsk({ threadId, ids }) {
+      if (!(await isCaptainThread(threadId))) return { ok: false, closed: [], already: [], refused: ids };
+      const result = ownerAsks.close(ids, threadId);
+      if (result.refused.length > 0) return { ok: false, ...result };
+      for (const id of result.closed) await dropDeviceProof(id);
+      if (result.closed.length > 0) await refreshOwnerBoard();
+      await tellClosedAsks(threadId);
+      return { ok: true, ...result };
     },
     async deferAsk({ threadId, ids, until }) {
       if (!(await isCaptainThread(threadId))) return { ok: false, deferred: [], already: [], refused: ids, until: null };

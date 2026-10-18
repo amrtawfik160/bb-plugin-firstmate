@@ -27,7 +27,7 @@ function crewRow(id: string, threadId: string, extra: Record<string, unknown> = 
   return { id, task: "x", title: id, projectId: "proj_1", threadId, parentThreadId: "thr_cap", nativeHome: "/native", worktree: true, shape: "ship", posture: "direct-PR", createdAt: "2026-10-17T00:00:00.000Z", providerId: null, model: null, reasoningLevel: null, ...extra };
 }
 
-async function captainHost(status: Record<string, string> = {}, options: { decisions?: () => Promise<Response> } = {}) {
+async function captainHost(status: Record<string, string> = {}, options: { decisions?: () => Promise<Response>; nativeAnswer?: () => number } = {}) {
   const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: ["captain", "firstmate"], settings: { fmHome: "/native", fmHostId: "host_1" } });
   await host.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
   await plugin(host.bb);
@@ -57,7 +57,8 @@ async function captainHost(status: Record<string, string> = {}, options: { decis
     const command = byId.get(terminalId) ?? "";
     const crew = /\/native\/state\/([\w-]+)\.status/.exec(command)?.[1];
     const payload = crew !== undefined && status[crew] !== undefined ? status[crew] : "";
-    const code = crew !== undefined && status[crew] === undefined ? 3 : 0;
+    const code = command.includes("fm-captain-hold.sh") && command.includes("'answer'") && options.nativeAnswer
+      ? options.nativeAnswer() : crew !== undefined && status[crew] === undefined ? 3 : 0;
     const captured = command.includes("FM_HOST_CAPTURE_V1");
     const out = captured ? JSON.stringify({ protocol: "FM_HOST_CAPTURE_V1", exitCode: code, stdout: payload, stderr: "" }) : payload;
     return { nextSeq: 1, chunks: [{ dataBase64: Buffer.from(`${out}\n__FM_HOST_RC:${captured ? 0 : code}\n`).toString("base64") }] };
@@ -65,7 +66,7 @@ async function captainHost(status: Record<string, string> = {}, options: { decis
   const realFetch = globalThis.fetch;
   if (options.decisions) globalThis.fetch = (async () => options.decisions!()) as typeof fetch;
   const tasks = createOwnerTasks(host.bb.storage.database());
-  return { host, rpc, tasks, asks: createOwnerAsks(host.bb.storage.database()), restore: () => { globalThis.fetch = realFetch; } };
+  return { host, rpc, tasks, commands, asks: createOwnerAsks(host.bb.storage.database()), restore: () => { globalThis.fetch = realFetch; } };
 }
 const tool = (host: Awaited<ReturnType<typeof captainHost>>["host"], name: string) => host.harness.inspection.registrations.agentTools.find((t) => t.name === name)!;
 const text = (out: unknown) => typeof out === "string" ? out : (out as { content?: Array<{ text?: string }> })?.content?.[0]?.text ?? JSON.stringify(out);
@@ -249,5 +250,75 @@ test("a newer standalone card on the same project does not suppress a crew's que
     await host.harness.behavior.runSchedule("task-lifecycle");
     assert.equal(asks.listOpen("thr_cap").filter((ask) => ask.task === task.id).length, 1, "the crew's own card goes out");
     assert.equal(asks.listOpen("thr_cap").length, 2, "both cards stay open");
+  } finally { restore(); await host.harness.lifecycle.dispose(); }
+});
+
+test("closeAsk releases only its crew's native captain hold without changing the task", async () => {
+  const at = Math.floor(Date.now() / 1000) - 60;
+  const { host, tasks, asks, commands, restore } = await captainHost({ wait1: `needs-decision [key=pick-one] [at=${at}]: Choose a database?\n` });
+  try {
+    await host.bb.storage.kv.set("crews", [crewRow("wait1", "thr_w1")]);
+    const task = tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Database", sourceRefs: [], crewId: "wait1", at: Date.now() });
+    await host.harness.behavior.runSchedule("task-lifecycle");
+    const card = asks.listOpen("thr_cap")[0]!;
+    const before = tasks.get(task.id);
+    const input = { threadId: "thr_cap", ids: [card.id] };
+    await host.harness.behavior.callRpc("closeAsk", input);
+    const answers = () => commands.filter((c) => c.includes("fm-captain-hold.sh") && c.includes("'answer'"));
+    assert.equal(answers().length, 1);
+    assert.match(answers()[0]!, /'pick-one'.*'--decision-file'.*'--release'/);
+    assert.ok(commands.some((c) => c.includes("resolved [key=pick-one]: closed by owner, no action")));
+    assert.deepEqual(tasks.get(task.id), before);
+    await host.harness.behavior.callRpc("closeAsk", input);
+    assert.equal(answers().length, 1);
+  } finally { restore(); await host.harness.lifecycle.dispose(); }
+});
+
+test("closeAsk retries a failed native release after its captain notice succeeded", async () => {
+  let attempts = 0;
+  const { host, tasks, asks, restore } = await captainHost({ wait1: "needs-decision [key=choose]: Choose?\n" }, { nativeAnswer: () => ++attempts === 1 ? 1 : 0 });
+  try {
+    await host.bb.storage.kv.set("crews", [crewRow("wait1", "thr_w1")]);
+    tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Choose", sourceRefs: [], crewId: "wait1", at: Date.now() });
+    await host.harness.behavior.runSchedule("task-lifecycle");
+    const card = asks.listOpen("thr_cap")[0]!;
+    const input = { threadId: "thr_cap", ids: [card.id] };
+    const count = () => host.harness.sdk.callsTo("threads.send").filter((call) => JSON.stringify(call).includes("Owner closed card")).length;
+    await host.harness.behavior.callRpc("closeAsk", input);
+    assert.equal(attempts, 1);
+    assert.equal(count(), 1);
+    await host.harness.behavior.callRpc("closeAsk", input);
+    await host.harness.behavior.callRpc("closeAsk", input);
+    assert.equal(attempts, 2);
+    assert.equal(count(), 1);
+    assert.equal(asks.get(card.id)?.resolution, "closed by owner, no action");
+  } finally { restore(); await host.harness.lifecycle.dispose(); }
+});
+
+test("closeAsk releases a crew work row held for its sole keyed question", async () => {
+  const { host, tasks, asks, restore } = await captainHost({ wait1: "needs-decision [key=choice]: Choose?\n" });
+  try {
+    await host.bb.storage.kv.set("crews", [crewRow("wait1", "thr_w1")]);
+    tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Choose", sourceRefs: [], crewId: "wait1", at: Date.now() });
+    await host.harness.behavior.runSchedule("task-lifecycle");
+    const byId = new Map<string, string>();
+    let n = 0;
+    const answers: string[] = [];
+    host.harness.sdk.stub("terminals.create", async (args: { start: { command: string } }) => {
+      const id = `close-native-${++n}`; byId.set(id, args.start.command); return { id };
+    });
+    host.harness.sdk.stub("terminals.output", async ({ terminalId }: { terminalId: string }) => {
+      const command = byId.get(terminalId) ?? "";
+      const code = (command.includes("'open'") && command.includes("'choice'")) ? 1 : 0;
+      if (command.includes("'answer'")) answers.push(command);
+      const payload = command.includes("/native/state/wait1.status") ? "needs-decision [key=choice]: Choose?\n" : "";
+      const captured = command.includes("FM_HOST_CAPTURE_V1");
+      const out = captured ? JSON.stringify({ protocol: "FM_HOST_CAPTURE_V1", exitCode: code, stdout: payload, stderr: "" }) : payload;
+      return { nextSeq: 1, chunks: [{ dataBase64: Buffer.from(`${out}\n__FM_HOST_RC:${captured ? 0 : code}\n`).toString("base64") }] };
+    });
+    await host.harness.behavior.callRpc("closeAsk", { threadId: "thr_cap", ids: [asks.listOpen("thr_cap")[0]!.id] });
+    assert.equal(answers.length, 1);
+    assert.ok(answers[0]!.includes("'wait1'"));
+    assert.ok(!answers[0]!.includes("'choice'"));
   } finally { restore(); await host.harness.lifecycle.dispose(); }
 });
