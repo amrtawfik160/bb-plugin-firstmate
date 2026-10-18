@@ -8519,7 +8519,7 @@ export default async function plugin(bb: BbPluginApi) {
   // Owner decision Q8: the checker is another crew, on another model than the builder.
   async function recordCheckerVerdict(r: DeliveryRecord, caller: string, commitSha: string, verdict: "pass" | "fail" | undefined, notes: string, findings?: number) {
     const checker = await findCrewByThread(caller);
-    if (checker === undefined || checker.projectId !== r.projectId) throw new Error(`Refusing: only a checker crew records a verdict on ${r.id}. Dispatch one with firstmate_dispatch role=checker on a different model than the builder.`);
+    if (checker === undefined || (checker.projectId !== r.projectId && (r.owner === null || checker.parentThreadId !== r.owner))) throw new Error(`Refusing: only a checker crew records a verdict on ${r.id}. Dispatch one with firstmate_dispatch role=checker on a different model than the builder.`);
     const builder = r.taskId.startsWith("captain:") ? undefined : await findCrew(r.taskId);
     if (checker.id === r.taskId || r.workers.includes(checker.threadId)) throw new Error(`Refusing: crew ${checker.id} built ${r.id}, so it cannot check it. A checker is another crew on a different model.`);
     if (verdict === undefined) throw new Error(`A checker verdict on ${r.id} needs verdict pass or fail.`);
@@ -8557,10 +8557,10 @@ export default async function plugin(bb: BbPluginApi) {
       return [record];
     }
     if (!input.id && !input.url) throw new Error(`${input.action} needs the PR: Pass id (owner/repo#number) or url (the PR link).`);
-    const id=input.id ?? canonicalPr(input.url ?? "").id;
+    const id=(input.id ?? canonicalPr(input.url ?? "").id).trim().toLowerCase();
     const r=deliveries.get(id);
-    // The owning manager reaches its own records in any project; everyone else stays inside their project.
-    if (!r || (r.projectId !== projectId && r.owner !== owner)) throw new Error(`Unknown deliverable ${id}. Pass id (owner/repo#number) or url (the PR link) of a PR tracked for this manager or project.`);
+    // The owning manager and its crews reach its records in any project; everyone else stays inside their project.
+    if (!r || (r.projectId !== projectId && r.owner !== owner && (r.owner === null || (await findCrewByThread(owner))?.parentThreadId !== r.owner))) throw new Error(`Unknown deliverable ${id}. Pass id (owner/repo#number) or url (the PR link) of a PR tracked for this manager or project.`);
     if (input.action === "inspect") return [r];
     if (input.action === "assign") {
       if (input.from !== r.owner) throw new Error("Assignment requires the explicitly named previous manager.");
@@ -8638,7 +8638,7 @@ export default async function plugin(bb: BbPluginApi) {
       const recorded = releaseReadbacks.record({ task: task.id, captain: task.captain, crewId: crew.id, project: rule.name, build, group: rule.release.group, source: input.source as ReleaseSource, seen, at: Date.now() });
       return `Release read-back recorded for ${task.id}: build ${recorded.build} in "${recorded.group}" (read from ${recorded.source === "eas" ? "EAS" : "App Store Connect"}: ${recorded.seen}).`;
     }
-    const id = input.id ?? (input.url ? canonicalPr(input.url).id : "");
+    const id = (input.id ?? (input.url ? canonicalPr(input.url).id : "")).trim().toLowerCase();
     const r = deliveries.get(id);
     if (r === undefined) throw new Error(`Unknown deliverable ${id || "(none)"}. Pass id (owner/repo#number) or url (the PR link).`);
     if (crew === undefined || crew.projectId !== r.projectId) throw new Error(`Refusing: only a crew on this project opens a device proof card for ${r.id}.`);

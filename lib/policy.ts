@@ -545,8 +545,9 @@ export const BB_ARTIFACT_CONTRACT = "Use the absolute task-owned artifact direct
 export const BB_INBOX_TAKE_CONTRACT = "A steering wake that begins with Firstmate instruction waiting is the native inbox doorbell. Run FM_HOME=<home> <home>/bin-bb/fm-inbox-take.sh <task-id>. That script lists state/<task-id>.inbox/*.msg in numeric order and prints each body. After you act, acknowledge only the displayed immutable message IDs you handled using the printed command, for example --ack 001.msg 002.msg. Bare --ack refuses; new arrivals stay pending. Do not hand-roll those steps. A wake that begins with Firstmate instruction for crew carries the instruction text itself: act on that text; Firstmate already filed its record as handled, so run no inbox read or acknowledgement for it.";
 
 // Crews ran `gh-axi run watch` (3s interval) and `pr checks` loops thousands of
-// times and exhausted the GitHub token every crew and captain shares.
-export const CI_POLL_CONTRACT = "Never poll CI in a loop: do not run gh run watch, gh-axi run watch, or repeated gh pr checks / gh-axi pr checks loops; they burn the GitHub token every crew shares. When waiting on CI, run gh pr checks <url> once at most every 5 minutes, or end your turn and let firstmate's PR check wake you. When rate-limited, read gh api rate_limit including .resources.graphql, not only core.";
+// times and exhausted the GitHub token every crew and captain shares. Told to end the
+// turn instead, crews idled on "waiting for CI"; the owner chose one slow blocking watch (18 Oct).
+export const CI_POLL_CONTRACT = "Wait for CI with one blocking watch: find the run id once with gh run list --branch <branch> --limit 1, then run gh run watch <run id> --interval 60 --exit-status in the foreground. If your harness stops it before CI ends, start the same watch again. No sleep loops, no repeated gh pr checks or gh-axi pr checks polls, no gh-axi run watch, and no turn that ends only to wait for CI: they burn the GitHub token every crew shares or leave the work idle. When rate-limited, read gh api rate_limit including .resources.graphql, not only core.";
 
 // Every crew turn end pings the captain (BB's own child-completed message), so a crew that
 // yields every few minutes while a pipeline runs burns a captain wake each time. Keep the

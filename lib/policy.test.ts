@@ -214,7 +214,7 @@ test("crew prompt asserts isolation and forbids nested dispatch", () => {
   assert.match(text, /fm-inbox-take\.sh/);
   // Owner rule (18 Oct): wait for CI with one blocking watch on a slow interval, never by polling or idling.
   assert.match(text, /gh run watch <run id> --interval 60 --exit-status/);
-  assert.match(text, /never a sleep loop, repeated gh pr checks/);
+  assert.match(text, /No sleep loops, no repeated gh pr checks/);
   assert.doesNotMatch(text, /end your turn and let firstmate's PR check wake you/);
 });
 
