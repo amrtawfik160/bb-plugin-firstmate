@@ -3,7 +3,7 @@
 // and closes the row in one step. Nothing ran that teardown: on 18 Oct the live captain home listed
 // 22 finished crews as in flight (one since 9 Oct) and its home summary was invalid. The plugin now
 // retires a finished crew itself, after a grace period, when nothing still needs it.
-import { hasTerminalVerdict, latestStatus, statusLinesFrom } from "./policy.ts";
+import { hasTerminalVerdict, latestStatus, latestWorkerStatusLine } from "./policy.ts";
 
 /** How long a finished crew stays, so the captain can still send it a follow-up first. */
 export const FINISHED_RETIRE_GRACE_MS = 2 * 60 * 60_000;
@@ -30,8 +30,8 @@ export type RetireVerdict = { retire: true; note: string } | { retire: false; re
 
 /** Epoch milliseconds of the latest status line's `[at=<seconds>]` tag; null when absent. */
 export function latestStatusAt(lines: readonly string[]): number | null {
-  const last = statusLinesFrom(lines.join("\n")).at(-1);
-  const at = last === undefined ? null : /\[at=(\d+)\]/.exec(last)?.[1];
+  const last = latestWorkerStatusLine(lines);
+  const at = last === null ? null : /\[at=(\d+)\]/.exec(last)?.[1];
   return at == null ? null : Number(at) * 1000;
 }
 
