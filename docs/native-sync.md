@@ -9,10 +9,10 @@ with both results; it merges, reloads and switches the live home.
 When every change from the pin to upstream HEAD modifies or adds a test
 entrypoint (`tests/<name>.test.<ext>`) or a file under `tests/fixtures/` or
 `tests/captures/`, the weekly run starts nothing. A deletion, a rename, or a
-change to a test helper such as `tests/lib.sh` runs the full sync. It tells the repair thread
-once for that HEAD and records it in the state file. The pin stays, so the
-next other change syncs every change since the pin. A list it
-cannot read runs the full sync.
+change to a test helper such as `tests/lib.sh` runs the full sync. For a
+test-only move, the run tells the repair thread once for that HEAD and
+records it in the state file. The pin stays, so the next other change syncs
+every change since the pin. A list it cannot read runs the full sync.
 
 This file is the sync crew's brief. It repeats what the 17 Oct sync did
 ([upstream update 2026-10-17](verification/upstream-update-2026-10-17.md)).
