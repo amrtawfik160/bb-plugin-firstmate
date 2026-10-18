@@ -6,7 +6,7 @@ export type CrewRole = (typeof CREW_ROLES)[number];
 
 export const ROLE_DEFAULTS: Readonly<Record<CrewRole, { providerId: string; model: string }>> = {
   builder: { providerId: "claude-code", model: "claude-opus-5-5" },
-  checker: { providerId: "codex", model: "gpt-6-astra" },
+  checker: { providerId: "codex", model: "gpt-6.1-sol" },
   lookup: { providerId: "claude-code", model: "claude-haiku-5-5" },
 };
 

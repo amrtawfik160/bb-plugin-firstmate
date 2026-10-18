@@ -12384,7 +12384,7 @@ export default async function plugin(bb: BbPluginApi) {
     taskId:z.string().regex(/^[A-Za-z0-9._-]+$/).optional().describe("Stable retry identity; reuse after an uncertain launch"),
     projectId: z.string().optional().describe("BB project id; defaults to the current thread's project"),
     title: z.string().max(120).optional(),
-    role: z.enum(CREW_ROLES).optional().describe("builder (default): claude-code claude-opus-5-5; checker: codex gpt-6-astra, checks another crew's PR before merge; lookup: claude-code claude-haiku-5-5 for a quick question. providerId, model and reasoningLevel override it for this crew only: pass them only when the owner named them for this task"),
+    role: z.enum(CREW_ROLES).optional().describe("builder (default): claude-code claude-opus-5-5; checker: codex gpt-6.1-sol, checks another crew's PR before merge; lookup: claude-code claude-haiku-5-5 for a quick question. providerId, model and reasoningLevel override it for this crew only: pass them only when the owner named them for this task"),
     providerId: z.string().optional(),
     model: z.string().optional(),
     reasoningLevel: z.enum(["low", "medium", "high", "xhigh", "max", "ultra", "none", "ultracode"]).optional()

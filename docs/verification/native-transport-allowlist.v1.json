@@ -50,7 +50,7 @@
       "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner."
     },
     "entry-skills/captain/references/supervision.md": {
-      "sha256": "a7739674dd219f7127ae3c53f57671dc0df7131b9096eaab85d86a4c7781a78e",
+      "sha256": "dc6c9e548102944c6de4cae441bc391aba19b74964b09e65cd8f0b5b3b37d002",
       "reason": "BB startup, exact selected native policy pointers, host/thread transport and durable receipt procedure; native source remains policy owner. Captain rules: owner standing approvals, crew work stays with crews, merges only through firstmate_merge naming the PR (crewId + pr), with keepCrew when the crew has work after the merge; without yes it merges nothing, whatever the posture, and returns a preview; a merge needs a verification record for the PR head (CI is not verification) or the owner's words in allowUnverified; the record takes driven and seen, and a crew that drove it may record it; a PR merged outside Firstmate with no record is merged-unverified. Before a dispatch: poteto-help picks the playbook and skills, sharpen and in-your-own-words when unclear, interrogate for big plans, prove before telling the owner done. Crew models by role. A production PR needs a checker crew's pass verdict on a different model; only crews dispatched from the pipeline version need a P4 line; the checker rule covers every production merge."
     },
     "entry-skills/skill-routing/SKILL.md": {

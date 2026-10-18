@@ -692,7 +692,7 @@ test("the captain rules name the dispatch skills, the crew models and the checke
     "run `interrogate` on it",
     "prove it with `principle-prove-it-works` or `verify-this`",
     "`principle-never-block-on-the-human`, `principle-sequence-verifiable-units`, `principle-encode-lessons-in-structure` and `principle-guard-the-context-window`",
-    "A builder (the default) runs claude-code `claude-opus-5-5`. A checker runs codex `gpt-6-astra`.",
+    "A builder (the default) runs claude-code `claude-opus-5-5`. A checker runs codex `gpt-6.1-sol`.",
     "They apply to that task's crews only.",
     "`firstmate_merge` refuses a production PR without a `pass` verdict for its current head.",
   ]) assert.ok(rules.includes(text), text);
