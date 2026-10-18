@@ -7,6 +7,9 @@ export const HOUSE_RULES = [
   PSTACK_FIRST,
   // Q18: multi-agent pstack skills only where the playbook calls for them.
   "Spawn no sub-agents, except where your playbook calls for `arena` (a new UI or design choice with no example in the code) or `interrogate` (a risky PR): then spawn at most 3 extra agents for that step, and run their heavy commands through `~/.bb-firstmate/bin/fm-heavy`. Do everything else yourself, in this session.",
+  // 18 Oct skills review G: Matt Pocock's code-review and implement-spec start sub-agents.
+  "`code-review`: run its Standards and Spec reviews yourself, one after the other, not as sub-agents.",
+  "`implement-spec`: never start its sub-agents and never merge a ticket. Build your brief's tickets on your branch and follow the delivery contract.",
   "Until the owner confirms otherwise: Firstmate decides who merges and deploys. Follow the brief's delivery contract for merge and deploy.",
   "Merge only via `bb firstmate merge <crew> --pr <n> --yes`; it refuses a PR with no verification record. Never use `gh pr merge` or GitHub's API.",
   "This host is shared. Run every type check, full test run and build as `~/.bb-firstmate/bin/fm-heavy <command>`; it waits for a host-wide slot.",
@@ -25,7 +28,8 @@ export const OPERATOR_MERGE_STEPS = [
 export const PLAYBOOK_RULES = [
   "Report these steps as ✓, not as a skip:",
   "- A step or skill that spawns a sub-agent, reviewer or other model (delegate, architect, how, why, no-comments): do it yourself in this session, on your own model. Add \"(done in session)\".",
-  "- Cursor-only tools: for create-skill read writing-for-agents; for /loop repeat the step yourself; for origin or gt use gh-axi.",
+  "- Cursor-only tools: for create-skill read writing-for-agents; for /loop repeat the step yourself; for origin or gt use gh-axi; for Cursor Automations or cloud agents do the step yourself or report it blocked.",
+  "- Bugbot: triage its comments as normal review threads. With no Bugbot check on the PR, do not wait for one.",
   "- Opening a PR, merge, deploy: follow the brief's delivery contract. If proof needs a deploy you may not run, prove it on the nearest surface you can and name what is left for Firstmate.",
   // 15 Oct: a crew left "Verify on the same surface" pending on CI and handed a
   // human a Telegram checklist; the PR merged and dropped every Telegram message.

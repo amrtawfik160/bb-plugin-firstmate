@@ -59,6 +59,8 @@ if (a[0] === 'thread' && a[1] === 'tell') { log({ cmd: 'tell', at: Date.now(), t
 process.stderr.write('fake bb: unknown ' + a.join(' ')); process.exit(1);
 `;
 
+const git = (t, ...args) => execFileSync('git', ['-C', t.upstream, ...args], { encoding: 'utf8' }).trim();
+
 function setup() {
   const dir = mkdtempSync(join(tmpdir(), 'native-sync-'));
   const bin = join(dir, 'bin');
@@ -82,9 +84,10 @@ function setup() {
   const spawns = () => log().filter((e) => e.cmd === 'spawn');
   const tells = () => log().filter((e) => e.cmd === 'tell');
   const advance = () => { git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'upstream fix'); return git('rev-parse', 'HEAD'); };
+  const change = (file) => { mkdirSync(join(upstream, file, '..'), { recursive: true }); writeFileSync(join(upstream, file), `${Math.random()}\n`); git('add', '-A'); return advance(); };
   const state = () => JSON.parse(readFileSync(paths.state, 'utf8'));
   const chatter = (n, quote) => writeFileSync(paths.log, readFileSync(paths.log, 'utf8') + JSON.stringify({ cmd: 'chatter', to: 'thr_repair', at: Date.now(), n, quote }) + '\n');
-  return { world, run, raw, log, ghCalls, spawns, tells, advance, state, env, paths, chatter };
+  return { world, run, raw, log, ghCalls, spawns, tells, advance, change, state, env, paths, chatter, upstream };
 }
 
 test('a pin already at upstream HEAD does nothing', () => {
@@ -326,4 +329,55 @@ test('a sync PR closed without a merge is found on its branch and reported once'
   ];
   assert.match(t.run(), /tell: closed:142 sent to thr_repair/);
   assert.match(t.tells()[0].message, /pull\/142 was closed without a merge/);
+});
+
+// 18 Oct: upstream 1aa2a21e changed one test file, and the weekly run would have started
+// the sync crew, the checker, the canary and a live switch for it.
+test('upstream moved by test files only: one message, no sync crew, and the next non-test change syncs both', () => {
+  const t = setup();
+  t.change('tests/fm-supervision-host.test.sh');
+  const head = t.change('tests/fixtures/offer.json');
+  assert.match(t.run('--start'), new RegExp(`tell: tests-only:${head} sent to thr_repair`));
+  assert.deepEqual(t.spawns(), []);
+  assert.equal(t.tells().length, 1);
+  assert.match(t.tells()[0].message, new RegExp(`from ${t.world.pin.slice(0, 8)} to ${head.slice(0, 8)} by test files only`));
+  assert.match(t.tells()[0].message, /tests\/fixtures\/offer\.json/);
+  assert.match(t.run('--start'), new RegExp(`none: tests-only:${head} is already reported`));
+  assert.match(t.run(), /none: no sync PR is open/);
+  assert.equal(t.tells().length, 1);
+
+  const next = t.change('bin/fm-test-run.sh');
+  assert.match(t.run('--start'), /spawn-sync: Native sync to .* as thr_fake1/);
+  assert.match(t.spawns()[0].prompt, new RegExp(`from ${t.world.pin} to ${next}`));
+});
+
+test('a change outside tests/ or a diff that cannot be read runs the full sync', () => {
+  for (const file of ['bin/fm-spawn.sh', '.claude/mods/firstmate-calm/tests/calm.test.sh', 'AGENTS.md', 'skills/stow/tests.md']) {
+    const t = setup();
+    t.change('tests/a.test.sh');
+    t.change(file);
+    assert.match(t.run('--start'), /spawn-sync: Native sync to/, file);
+    assert.deepEqual(t.tells(), [], file);
+  }
+  const t = setup();
+  t.change('tests/a.test.sh');
+  t.world.pin = 'f'.repeat(40);
+  const out = t.run('--start');
+  assert.match(out, /cannot list the files changed since pin ffffffff/);
+  assert.match(out, /spawn-sync: Native sync to/);
+});
+
+// PR 154 checker findings 1 and 2.
+test('a deletion or rename inside tests/, or a change to a test helper, runs the full sync', () => {
+  const cases = [
+    ['deletion', (t) => { t.change('tests/a.test.sh'); t.world.pin = t.advance(); git(t, 'rm', '-q', 'tests/a.test.sh'); t.advance(); }],
+    ['rename', (t) => { t.change('tests/a.test.sh'); t.world.pin = t.advance(); git(t, 'mv', 'tests/a.test.sh', 'tests/renamed.test.sh'); t.advance(); }],
+    ['helper sourced by production', (t) => { t.change('bin/fm-real.sh'); t.change('tests/helper.sh'); t.world.pin = t.advance(); t.change('tests/helper.sh'); }],
+  ];
+  for (const [name, arrange] of cases) {
+    const t = setup();
+    arrange(t);
+    assert.match(t.run('--start'), /spawn-sync: Native sync to/, name);
+    assert.deepEqual(t.tells(), [], name);
+  }
 });

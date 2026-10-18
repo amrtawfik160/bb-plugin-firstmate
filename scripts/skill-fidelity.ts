@@ -32,7 +32,7 @@
 //
 // CLI:  node --experimental-strip-types scripts/skill-fidelity.ts [--native <dir>]
 
-import { readFileSync, existsSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, existsSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { execFileSync } from "node:child_process";
 import { UPSTREAM_FIRSTMATE_SHA } from "../lib/upstream-surface.ts";
@@ -226,8 +226,20 @@ function renderedProse(content: string): string {
     .join(" ");
 }
 
+// Every skill document that copies native carries a BB-SOURCE header; one missing from the
+// list above is checked too, so a newly bundled native skill cannot drift unchecked.
+function sourcedDocs(repoRoot: string, dir: string): string[] {
+  if (!existsSync(join(repoRoot, dir))) return [];
+  return readdirSync(join(repoRoot, dir), { withFileTypes: true }).flatMap((entry) => {
+    const rel = `${dir}/${entry.name}`;
+    if (entry.isDirectory()) return sourcedDocs(repoRoot, rel);
+    return entry.name.endsWith(".md") && /<!-- BB-SOURCE\s/.test(readFileSync(join(repoRoot, rel), "utf8")) ? [rel] : [];
+  });
+}
+
 export function scanAll(repoRoot: string): Skill[] {
-  return SKILL_GLOBS.map((rel) => scanSkill(repoRoot, rel));
+  const docs = [...new Set([...SKILL_GLOBS, ...sourcedDocs(repoRoot, "skills"), ...sourcedDocs(repoRoot, "entry-skills")])];
+  return docs.map((rel) => scanSkill(repoRoot, rel));
 }
 
 export type Problem = { skill: string; line?: number; msg: string };

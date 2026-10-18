@@ -62,7 +62,7 @@ export const BRIEF_SKILLS = [
   "implement", "implement-spec", "grilling", "interrogate", "how", "why", "architect",
   "arena", "prototype", "code-review", "blast-radius", "pr", "unslop", "technical-writing", "writing-for-agents",
   "zoom-out", "deslop", "figure-it-out", "control-cli", "control-ui", "frontend-design",
-  "sharpen", "verify-this", ...CORE_PRINCIPLES,
+  "sharpen", "verify-this", "create-formal-verification-skill", ...CORE_PRINCIPLES,
 ] as const;
 
 // Read-only. A provider that is not installed (no parent folder) is skipped.
@@ -109,6 +109,7 @@ export function crewPipeline(input: { shape: Shape; title?: string; task: string
 
 function pipelineSection(playbook: PlaybookChoice, steps: readonly PipelineStep[], skill: (name: string) => string, dataDir: string | undefined): string[] {
   const proof = steps.findIndex((step) => step.title === PROOF_STEP) + 1;
+  const tdd = steps.findIndex((step) => step.skills.includes("tdd")) + 1;
   const report = dataDir !== undefined && dataDir !== "" ? `\`${dataDir}/report.md\`` : "your report file";
   return [
     `### Pipeline (${playbook.replace("-", " ")}). Do every step, in this order:`,
@@ -120,6 +121,8 @@ function pipelineSection(playbook: PlaybookChoice, steps: readonly PipelineStep[
     }),
     "Your final report has one line per pipeline step: \"✓ P<n> <step>: <evidence>\" or \"skip: P<n> <step>: <reason>\".",
     `Write that report to ${report} before you record verification. \`bb firstmate deliveries verify\` refuses this crew's PR until the report has "✓ P${proof} ${PROOF_STEP} for <owner/repo#n> at <head sha>: driven <what>; seen <what>" for that PR at its current head. After a new push, add a new P${proof} line.`,
+    // Two skills are named tdd; Matt Pocock's owns the folder in every skill root.
+    ...(tdd === 0 ? [] : [`P${tdd}'s \`tdd\` is Matt Pocock's, the only one installed. A playbook's advice to skip an expensive test does not replace P${tdd}: write the test, or report "skip: P${tdd} <step>: <reason>".`]),
   ];
 }
 
@@ -165,7 +168,7 @@ export function crewSkillBlock(input: { shape: Shape; title?: string; task: stri
   lines.push(
     "Your final report has a line \"Skills read: <paths>\" for those files, or \"not read: <path>: <reason>\".",
     `Core principles: read ${named.slice(0, -1).join(", ")} and ${named.at(-1)} in full. poteto-mode loads the other principles by their triggers.`,
-    `Skills on this host are in \`${root}/<name>/SKILL.md\`. Load a skill by reading that file. Do not rely on a Skill tool for pstack skills; they are user-invocable only.`,
+    `Skills on this host are in \`${root}/<name>/SKILL.md\`. Load a skill by reading that file. With no Skill tool, \"call the Skill tool with <name>\" means read that file for <name>.`,
     "If a skill is not installed, continue and say so in your report.",
     ...HOUSE_RULES,
   );

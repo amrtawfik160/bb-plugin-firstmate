@@ -47,7 +47,7 @@ the crewmate's result report, never in a message for the user.
 | Feature or behavior change | Code pipeline (feature) below; poteto-mode `feature.md` |
 | Refactor or architecture | poteto-mode `refactoring.md`; `codebase-design`; `improve-codebase-architecture`; the `principle-*` skills the playbook names |
 | Unclear spec or contested design | Supervisor: `grill-with-docs` with the user, then `to-spec` and `to-tickets` for work that spans crews; `interrogate` under the review bound below. Crewmate: report the open question in your result |
-| Owner asks for `/to-spec`, `/to-tickets`, `/implement-spec`, `/implement` or `/grill-me` | Supervisor: dispatch a crew that loads the named skill, `to-spec`, `to-tickets`, `implement-spec` or `implement`; for /grill-me, run `grilling` yourself with the owner. Crewmate: follow the skill your brief names |
+| Owner asks for `/to-spec`, `/to-tickets`, `/implement-spec`, `/implement` or `/grill-me` | Supervisor: dispatch a crew that loads the named skill, `to-spec`, `to-tickets`, `implement-spec` or `implement`; for `implement-spec`, one crew per ticket under a firstmate_program; for /grill-me, run `grilling` yourself with the owner. Crewmate: follow the skill your brief names, under the sub-agent rule below |
 | Investigation of how or why, or a spec | poteto-mode `investigation.md`; `how` or `why`, single-model |
 | Research or writing, no code | No fixed pipeline: the supervisor names the playbook and skills in the brief |
 | Check another crew's PR before merge (checker crew) | `code-review`; `blast-radius`; `interrogate` under the sub-agent rule below; record the verdict with bb firstmate deliveries check |
@@ -61,6 +61,7 @@ the crewmate's result report, never in a message for the user.
 | Prose for the user | `unslop`; `technical-writing` for docs |
 | Editing a skill or agent instructions | `writing-for-agents` |
 | Stuck or drifting | `zoom-out` |
+| Change to retries, exactly-once delivery or a race | `create-formal-verification-skill` once per area, then that area's verify skill |
 
 ## Code pipeline
 
@@ -99,7 +100,7 @@ poteto-mode loads the other principles by their triggers.
 ## Firstmate rules
 
 pstack always has priority. If a skill or rule conflicts with it, pstack wins.
-The two lines below are the only exceptions:
+The lines below are the only exceptions:
 
 - Until the owner confirms otherwise: crews spawn no sub-agents, except for
   `arena` or `interrogate` where the playbook calls for them: `arena` for a new
@@ -110,6 +111,18 @@ The two lines below are the only exceptions:
   `why`, `swarm`), do that work yourself in your own session with the
   provider, model and effort you were given. The supervisor delegates only to
   crewmates through `firstmate_dispatch`.
+- Matt Pocock's `code-review` and `implement-spec` start sub-agents too.
+  `code-review` starts two review sub-agents: run its Standards review, then
+  its Spec review, yourself in your own session. `implement-spec` starts
+  implementer and merger sub-agents and merges tickets on its own. A crew never
+  starts them and never merges a ticket: it builds the tickets its brief names
+  on its own branch and follows the brief's delivery contract. The supervisor
+  turns the other tickets into crews with `firstmate_program`.
+- `tdd` means Matt Pocock's `tdd`, the one installed at
+  `<skills folder>/tdd/SKILL.md`. pstack's `tdd` is not installed under that
+  name. A playbook's advice to skip an expensive test does not replace the
+  pipeline's failing-test step: write the test, or report the step as skipped
+  with the reason.
 - Until the owner confirms otherwise: Firstmate decides who merges and deploys.
   Follow the brief's delivery contract for merge and deploy in place of the
   merge and deploy steps of poteto-mode's playbooks.
@@ -118,6 +131,12 @@ Other Firstmate rules:
 
 - Load the skills the matched rows name, plus poteto-mode, plus every skill
   the chosen playbook names.
+- When a skill says to call the Skill tool with a skill name and you have no
+  Skill tool, read that skill's `SKILL.md` from the skills folder your brief
+  names.
+- Bugbot: triage its comments like any other review thread. Do not wait for
+  Bugbot when the PR has no Bugbot check. Do a Cursor Automations or cloud
+  agent step yourself, or report it blocked.
 - Before you open a PR, run `/no-comments` over your diff.
 - A crewmate's questions go to the supervisor through the brief's result channel.
 - Never print a secret value. Read variable names only. Do not print `.env`

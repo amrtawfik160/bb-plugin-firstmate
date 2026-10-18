@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { MAX_SYNC_ATTEMPTS, nextSyncStep, ownerFacing, verdictOf, type SyncObservation, type SyncState } from "./native-sync.ts";
+import { MAX_SYNC_ATTEMPTS, nextSyncStep, ownerFacing, testOnlyChange, verdictOf, type SyncObservation, type SyncState } from "./native-sync.ts";
 
 const PIN = "15ad1bd6524bdccca00feb07b3e3ed985fb2d7f4";
 const AHEAD = "a".repeat(40);
@@ -136,4 +136,26 @@ test("the verdict is the checker's last line; anything else counts as a fail", (
   assert.deepEqual(verdictOf("x\nVERDICT: fail (2 findings)\n"), { verdict: "fail", line: "VERDICT: fail (2 findings)" });
   assert.deepEqual(verdictOf("VERDICT: pass"), { verdict: "pass", line: "VERDICT: pass" });
   assert.equal(verdictOf("VERDICT: pass\nBut one more finding: the guard failed.").verdict, "fail");
+});
+
+test("a weekly run whose upstream changed only test files reports once and starts no sync", () => {
+  const step = nextSyncStep(seen({ start: true, changed: [{ status: "M", path: "tests/fm-supervision-host.test.sh" }] }), {});
+  assert.equal(step.action, "tell");
+  if (step.action !== "tell") return;
+  assert.equal(step.key, `tests-only:${AHEAD}`);
+  assert.match(step.text, /by test files only/);
+  assert.match(step.text, /No sync crew, checker, canary or live switch runs/);
+  assert.equal(nextSyncStep(seen({ start: true, changed: [{ status: "M", path: "tests/x.test.sh" }] }), { done: [step.key] }).action, "none");
+  assert.equal(nextSyncStep(seen({ changed: [{ status: "M", path: "tests/x.test.sh" }] }), {}).action, "none", "a follow-up run never reports or starts");
+});
+
+test("test-only means test entrypoints, fixtures and captures, modified or added; anything else, an empty list or an unread list syncs", () => {
+  const m = (path: string, status = "M") => ({ status, path });
+  assert.equal(testOnlyChange([m("tests/a.test.sh"), m("tests/fixtures/b.json", "A"), m("tests/captures/v1/out.txt")]), true);
+  // PR 154 checker findings 1 and 2: a deletion or rename, and a helper production may source.
+  for (const changed of [[], undefined, [m("tests/a.test.sh"), m("bin/fm-test-run.sh")], [m(".claude/mods/firstmate-calm/tests/a.test.sh")], [m("docs/tests/a.md")], [m("tests")],
+    [m("tests/a.test.sh", "D")], [m("tests/a.test.sh", "D"), m("tests/renamed.test.sh", "A")], [m("tests/helper.sh")], [m("tests/lib.sh")], [m("tests/assets/x.png")], [m("tests/sub/a.test.sh")]]) {
+    assert.equal(testOnlyChange(changed), false, JSON.stringify(changed));
+    assert.equal(nextSyncStep(seen({ start: true, changed }), {}).action, "spawn-sync", JSON.stringify(changed));
+  }
 });

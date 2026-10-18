@@ -22,6 +22,24 @@ if (gone.length > 0) {
   console.log(`PIN REFUSED: ${sha} removed native files that BB skills copy. Nothing was written.`);
   process.exit(1);
 }
+// The skill list is every entry of native's .agents/skills at the pin, except the
+// owner's exclusions below. Each one needs a bundled copy in skills/<name>/.
+const EXCLUDED_NATIVE_SKILLS={
+  'firstmate-calm':"a link to native's terminal calm mod; BB bundles its own skills/calm",
+};
+const nativeSkills=git('ls-tree',sha,'.agents/skills/').split('\n').filter(Boolean).map(line=>{
+  const [meta,path]=line.split('\t');
+  return { type:meta.split(' ')[1],name:path.slice('.agents/skills/'.length) };
+}).filter(({ name })=>!Object.hasOwn(EXCLUDED_NATIVE_SKILLS,name));
+if (nativeSkills.length === 0) throw new Error(`${sha} has no .agents/skills entries`);
+const unbundled=nativeSkills.filter(({ type,name })=>type !== 'tree' || !sourced.some(({ file,source })=>file === join('skills',name,'SKILL.md') && source === `.agents/skills/${name}/SKILL.md`));
+if (unbundled.length > 0) {
+  for (const { type,name } of unbundled) console.log(type === 'tree'
+    ? `NEW_NATIVE_SKILL: ${name}: add skills/${name}/SKILL.md as a verbatim copy of .agents/skills/${name}/SKILL.md (BB-SOURCE header and snapshot at the old pin) in its own commit, or add it to EXCLUDED_NATIVE_SKILLS in scripts/vendor-native-pin.mjs with the owner's reason`
+    : `NEW_NATIVE_SKILL: ${name}: a ${type}, not a skill folder; add it to EXCLUDED_NATIVE_SKILLS in scripts/vendor-native-pin.mjs with the owner's reason`);
+  console.log(`PIN REFUSED: ${sha} has native skills that BB does not bundle. Nothing was written.`);
+  process.exit(1);
+}
 for (const { file,original,header,source } of sourced) {
   const snapshot=/snapshot:\s*(\S+)/.exec(header[1])[1];
   const next=snapshot.replace(old.slice(0,8),sha.slice(0,8));
@@ -45,8 +63,7 @@ writeFileSync(`native-snapshot/${sha.slice(0,8)}/AGENTS.section-9.md`,section);
 const scripts=git('ls-tree','-r','--name-only',sha,'bin').trim().split('\n').map(p=>p.slice(4));
 const callable=scripts.filter(p=>/^fm-[a-z0-9-]+\.sh$/.test(p)).map(p=>p.slice(3,-3));
 const support=scripts.filter(p=>!/^fm-[a-z0-9-]+\.sh$/.test(p));
-const manifest=readFileSync('lib/upstream-surface.ts','utf8');
-const skills=JSON.parse(/UPSTREAM_SKILL_NAMES = (\[.*?\]) as const/.exec(manifest)[1]);
+const skills=nativeSkills.map(({ name })=>name).sort();
 writeFileSync('lib/upstream-surface.ts',`// Generated from kunchenguid/firstmate at ${sha} plus the BB backend adapter.\nexport const UPSTREAM_FIRSTMATE_SHA = ${JSON.stringify(sha)};\nexport const UPSTREAM_SCRIPT_NAMES = ${JSON.stringify(callable.sort())} as const;\nexport const UPSTREAM_SKILL_NAMES = ${JSON.stringify(skills)} as const;\nexport const PINNED_SCRIPT_SUPPORT_FILES = ${JSON.stringify([...new Set([...support,'backends/bb.sh'])].sort())} as const;\n`);
 writeFileSync('overlay/patch-base.txt',sha+'\n');
 const readme=readFileSync('native-snapshot/README.md','utf8');

@@ -286,3 +286,52 @@ test("the writer creates an untracked file in the live checkout -> refused", () 
     rmSync(join(root, "owner/new-policy.md"));
   });
 });
+
+// 18 Oct: the writer copied the old skill list forward, so native's new
+// firstmate-self-repo never reached UPSTREAM_SKILL_NAMES.
+const skillNames = (root, rev) => JSON.parse(/UPSTREAM_SKILL_NAMES = (\[.*?\]) as const/.exec(git(root, "show", `${rev}:lib/upstream-surface.ts`))[1]);
+const NEW_SKILL = "---\nname: new-skill\ndescription: A skill native added after the pin.\n---\n\n# new-skill\n\nNative text.\n";
+
+test("the skill list comes from the pinned native tree: a new native skill with no bundled copy -> refused before writing", () => {
+  withRepin(({ root, home, native, sha }) => {
+    const r = repin(root, native, sha, home);
+    assert.match(r.stdout, /NEW_NATIVE_SKILL: new-skill: add skills\/new-skill\/SKILL\.md/);
+    refused(r, /WRITER_FAILED/);
+  }, (dir) => {
+    mkdirSync(join(dir, ".agents/skills/new-skill"), { recursive: true });
+    writeFileSync(join(dir, ".agents/skills/new-skill/SKILL.md"), NEW_SKILL);
+  });
+});
+
+test("a new native skill whose verbatim copy is committed first joins the skill list; an owner exclusion stays out", () => {
+  withRepin(({ root, home, native, sha }) => {
+    const r = repin(root, native, sha, home);
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    const names = skillNames(root, branchOf(r.stdout)[1]);
+    assert.ok(names.includes("new-skill"), names.join(" "));
+    assert.ok(!names.includes("firstmate-calm"), "the owner's exclusion is not a bundled skill");
+    assert.deepEqual(names, [...names].sort());
+    git(root, "worktree", "remove", "--force", branchOf(r.stdout)[2]);
+  }, (dir) => {
+    mkdirSync(join(dir, ".agents/skills/new-skill"), { recursive: true });
+    writeFileSync(join(dir, ".agents/skills/new-skill/SKILL.md"), NEW_SKILL);
+    mkdirSync(join(dir, ".claude/mods/firstmate-calm"), { recursive: true });
+    writeFileSync(join(dir, ".claude/mods/firstmate-calm/SKILL.md"), "calm mod\n");
+    symlinkSync("../../.claude/mods/firstmate-calm", join(dir, ".agents/skills/firstmate-calm"));
+  }, (root) => {
+    const [front, body] = NEW_SKILL.split("\n---\n");
+    mkdirSync(join(root, "skills/new-skill"), { recursive: true });
+    mkdirSync(join(root, `native-snapshot/${PIN.slice(0, 8)}/.agents/skills/new-skill`), { recursive: true });
+    writeFileSync(join(root, `native-snapshot/${PIN.slice(0, 8)}/.agents/skills/new-skill/SKILL.md`), NEW_SKILL);
+    writeFileSync(join(root, "skills/new-skill/SKILL.md"), `${front}\n---\n\n<!-- BB-SOURCE\n     native: .agents/skills/new-skill/SKILL.md\n     sha: ${PIN}\n     snapshot: native-snapshot/${PIN.slice(0, 8)}/.agents/skills/new-skill/SKILL.md\n     fidelity: verbatim -->\n${body}`);
+    git(root, "add", "-A");
+    commit(root);
+  });
+});
+
+test("the pinned skill list matches the pinned native tree, firstmate-self-repo included", () => {
+  const names = JSON.parse(/UPSTREAM_SKILL_NAMES = (\[.*?\]) as const/.exec(readFileSync(join(ROOT, "lib/upstream-surface.ts"), "utf8"))[1]);
+  assert.ok(names.includes("firstmate-self-repo"), names.join(" "));
+  const sources = bbSources(ROOT, "skills").map((s) => s.native);
+  for (const name of names) assert.ok(sources.includes(`.agents/skills/${name}/SKILL.md`), `no bundled copy of ${name}`);
+});

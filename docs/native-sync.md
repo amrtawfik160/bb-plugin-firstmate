@@ -6,6 +6,14 @@ upstream HEAD differs from the pin. The crew opens one PR and stops. A checker
 crew on a different model checks that PR. The repair thread gets one message
 with both results; it merges, reloads and switches the live home.
 
+When every change from the pin to upstream HEAD modifies or adds a test
+entrypoint (`tests/<name>.test.<ext>`) or a file under `tests/fixtures/` or
+`tests/captures/`, the weekly run starts nothing. A deletion, a rename, or a
+change to a test helper such as `tests/lib.sh` runs the full sync. For a
+test-only move, the run tells the repair thread once for that HEAD and
+records it in the state file. The pin stays, so the next other change syncs
+every change since the pin. A list it cannot read runs the full sync.
+
 This file is the sync crew's brief. It repeats what the 17 Oct sync did
 ([upstream update 2026-10-17](verification/upstream-update-2026-10-17.md)).
 Owner decisions: Q3 (weekly sync PR, checker, repair thread merges), Q12 (the
@@ -28,7 +36,12 @@ sub-agents. Run the full suite and the type check as
    native copy or a host file, find the cause and fix it at the root. Never
    edit the owner layer to make the guard pass. A refusal for skill fidelity
    only leaves the branch `native-pin/<sha8>`; fix the skills that copy native
-   text on that branch.
+   text on that branch. The skill list comes from native's `.agents/skills`
+   at the target. If the writer prints `NEW_NATIVE_SKILL <name>`, commit a
+   verbatim copy `skills/<name>/SKILL.md` and its snapshot at the old pin on
+   your branch, then run the guard again. Leave a native skill out only when
+   the owner says so, in `EXCLUDED_NATIVE_SKILLS` in
+   `scripts/vendor-native-pin.mjs`.
 3. Run `npm run fidelity -- --native <clone>` and
    `FM_TEST_HOME=<clone> node scripts/patch-drift-check.mjs --ref <target>`,
    and the same drift check for every pin a live home still runs. Rebuild a
