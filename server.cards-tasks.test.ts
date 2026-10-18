@@ -169,3 +169,49 @@ test("the sweep opens no crew card when the captain already sent a card after th
     assert.equal(tasks.get(task.id)!.state, "needs_you", "the task still shows it waits on the owner");
   } finally { restore(); await host.harness.lifecycle.dispose(); }
 });
+
+// Checker FF2-verdict-1, #145 finding 1: a newer card about other work does not stand for the crew's question.
+test("a newer card on another task or project does not stop the crew's own question card", async () => {
+  const at = Math.floor(Date.now() / 1000) - 600;
+  const { host, tasks, asks, restore } = await captainHost({ wait1: `blocked [at=${at}]: need owner to restore the repo\n` });
+  try {
+    await host.bb.storage.kv.set("crews", [crewRow("wait1", "thr_w1")]);
+    const task = tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Slug max", sourceRefs: ["tg:1:1"], crewId: "wait1", at: Date.now() });
+    asks.create({ captain: "thr_cap", kind: "question", text: "Safi icon: blue or green?", options: [], createdAt: at * 1000 + 60_000, project: "Safi" });
+    await host.harness.behavior.runSchedule("task-lifecycle");
+    assert.equal(asks.listOpen("thr_cap").filter((ask) => ask.task === task.id).length, 1, "exactly one card for the Cyndra question");
+  } finally { restore(); await host.harness.lifecycle.dispose(); }
+});
+
+// #145 finding 2: a done line is not used up while another crew of the task still works.
+test("a task with two crews advances once the last one has reported done, on a later sweep", async () => {
+  const at = Math.floor(Date.now() / 1000) - 600;
+  const { host, tasks, restore } = await captainHost({ c1: `done [at=${at}]: part one\n`, c2: `done [at=${at}]: part two\n` });
+  try {
+    await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_c1", { shape: "scout" }), crewRow("c2", "thr_c2", { shape: "scout" })]);
+    const task = tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Two parts", sourceRefs: ["tg:1:2"], crewId: "c1", at: Date.now() });
+    tasks.attach(task.id, "thr_cap", { crewId: "c2", sourceRefs: [], at: Date.now() });
+    await host.harness.behavior.runSchedule("task-lifecycle");
+    assert.equal(tasks.get(task.id)!.state, "working", "both crews still run");
+    await host.bb.storage.kv.set("crews", [crewRow("c2", "thr_c2", { shape: "scout" })]);
+    await host.harness.behavior.runSchedule("task-lifecycle");
+    assert.equal(tasks.get(task.id)!.state, "done");
+  } finally { restore(); await host.harness.lifecycle.dispose(); }
+});
+
+// #145 finding 3: an owner answer that lands while the replacement edits Telegram is kept.
+test("a card the owner answers while an older card is being replaced keeps his answer", async () => {
+  const { host, tasks, asks, restore } = await captainHost();
+  try {
+    const task = tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Johan draft", sourceRefs: ["tg:1:4831"], crewId: undefined, at: Date.now() });
+    const old = (text: string) => asks.create({ captain: "thr_cap", kind: "question", text, options: [{ label: "Send", value: "A" }, { label: "Wait", value: "B" }], createdAt: Date.now() - 10 * 60_000, project: "Cyndra", task: task.id, subject: "johan draft" });
+    const first = old("Johan draft: send v1?");
+    const second = old("Johan draft: send v1 to Jess too?");
+    host.harness.sdk.stub("plugins.callRpc", async (call: Call) => {
+      if (call.method === "editAsk" && call.input.askId === first.id) asks.resolve(second.id, "thr_cap", "answered", "Wait: do not send", Date.now());
+      return { ok: true, queued: 1, duplicate: false };
+    });
+    text(await tool(host, "firstmate_ask").execute({ question: "Johan draft: send v2?", kind: "question", options: [{ label: "Send" }, { label: "Wait" }], task: task.id }, ctx));
+    assert.deepEqual([asks.get(second.id)!.state, asks.get(second.id)!.resolution], ["answered", "Wait: do not send"]);
+  } finally { restore(); await host.harness.lifecycle.dispose(); }
+});
