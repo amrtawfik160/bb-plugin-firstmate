@@ -64,14 +64,14 @@ test("the shipped table lists only the scratch and demo repos as internal, and t
 test("each role has a real default provider and model", () => {
   assert.deepEqual(ROLE_DEFAULTS, {
     builder: { providerId: "claude-code", model: "claude-opus-5-5" },
-    checker: { providerId: "codex", model: "gpt-6-astra" },
+    checker: { providerId: "codex", model: "gpt-6.1-sol" },
     lookup: { providerId: "claude-code", model: "claude-haiku-5-5" },
   });
 });
 
 test("a dispatch with no execution choice gets its role's default; a builder is the default role", () => {
   assert.deepEqual(crewExecution({}), { role: "builder", providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: undefined, named: false });
-  assert.deepEqual(crewExecution({ role: "checker" }), { role: "checker", providerId: "codex", model: "gpt-6-astra", reasoningLevel: undefined, named: false });
+  assert.deepEqual(crewExecution({ role: "checker" }), { role: "checker", providerId: "codex", model: "gpt-6.1-sol", reasoningLevel: undefined, named: false });
 });
 
 // Owner example: "opus 5.5 medium for ui, grok 4.6 xhigh for logic, codex for checker".

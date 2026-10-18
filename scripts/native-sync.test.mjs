@@ -117,7 +117,7 @@ test('upstream ahead by one commit: one sync crew, one checker, one message to t
   assert.match(t.run(), /spawn-check: Check native sync PR #140 .* as thr_fake2/);
   const checker = t.spawns()[1];
   const cflag = (name) => checker.args[checker.args.indexOf(name) + 1];
-  assert.equal(cflag('--model'), 'gpt-6-astra');
+  assert.equal(cflag('--model'), 'gpt-6.1-sol');
   assert.equal(cflag('--base-branch'), `origin/native-sync/${head.slice(0, 8)}`);
 
   t.world.threads.thr_fake2 = { status: 'active', output: '' };

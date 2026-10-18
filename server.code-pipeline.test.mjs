@@ -173,7 +173,7 @@ test('dispatch gives each role its default model, and an owner-named model appli
  const host=await dispatchHost();try {
   for(const [args,want] of [
    [{task:'fix login'},{providerId:'claude-code',model:'claude-opus-5-5'}],
-   [{task:'check PR 9',role:'checker'},{providerId:'codex',model:'gpt-6-astra'}],
+   [{task:'check PR 9',role:'checker'},{providerId:'codex',model:'gpt-6.1-sol'}],
    [{task:'what node version does the repo pin',role:'lookup',shape:'scout'},{providerId:'claude-code',model:'claude-haiku-5-5'}],
    [{task:'fix login logic',providerId:'acp-grok',model:'grok-4.6',reasoningLevel:'xhigh'},{providerId:'acp-grok',model:'grok-4.6',reasoningLevel:'xhigh'}],
    [{task:'fix login again'},{providerId:'claude-code',model:'claude-opus-5-5'}],
@@ -185,7 +185,7 @@ test('dispatch gives each role its default model, and an owner-named model appli
   }
   const cli=await host.harness.behavior.runCli(['dispatch','--project','proj_1','--role','checker','--','check PR 10'],{projectId:'proj_1'});
   assert.equal(cli.exitCode,0,cli.stderr);
-  assert.deepEqual(spawned(host).at(-1),{providerId:'codex',model:'gpt-6-astra',reasoningLevel:undefined});
+  assert.deepEqual(spawned(host).at(-1),{providerId:'codex',model:'gpt-6.1-sol',reasoningLevel:undefined});
  }finally{await host.harness.lifecycle.dispose();}
 });
 
