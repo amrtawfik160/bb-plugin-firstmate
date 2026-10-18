@@ -13,6 +13,7 @@ const id=n=>`cyndra-ai/cyndra-saas#${n}`;
 const heads=new Map();
 let metas='';
 let ghStderr='';
+let probeStderr='';
 const states=new Map();
 const head=n=>heads.get(n) ?? String(n).repeat(10).slice(0,40);
 const crewRow=(id,threadId,extra)=>({id,task:'x',projectId:'proj_1',threadId,parentThreadId:'thr_cap',nativeHome:'/native',worktree:true,shape:'ship',posture:'direct-PR',createdAt:'2026-10-17T00:00:00.000Z',reasoningLevel:null,dispatchVersion:2,...extra});
@@ -30,7 +31,7 @@ function hostCommands(host,{delayMs=0}={}) {
   const command=byId.get(terminalId);const isRead=command.includes('gh pr view');
   if(isRead){gh.reads++;gh.inFlight++;gh.maxInFlight=Math.max(gh.maxInFlight,gh.inFlight);await new Promise(r=>setTimeout(r,delayMs));gh.inFlight--;}
   const out=forge(command);const captured=command.includes('FM_HOST_CAPTURE_V1');
-  const payload=captured?JSON.stringify({protocol:'FM_HOST_CAPTURE_V1',exitCode:out.code??0,stdout:out.payload??'',stderr:isRead?ghStderr:''}):out.payload??'';
+  const payload=captured?JSON.stringify({protocol:'FM_HOST_CAPTURE_V1',exitCode:out.code??0,stdout:out.payload??'',stderr:isRead?ghStderr:command.includes('rateLimit')?probeStderr:''}):out.payload??'';
   return{nextSeq:1,chunks:[{dataBase64:Buffer.from(`${payload}\n__FM_HOST_RC:${captured?0:out.code ?? 0}\n`).toString('base64')}]};
  });
  return gh;
@@ -42,7 +43,7 @@ function forge(command) {
  return{code:0};
 }
 async function deck(prs,{delayMs=0}={}) {
- heads.clear();metas='';states.clear();ghStderr='';
+ heads.clear();metas='';states.clear();ghStderr='';probeStderr='';
  const host=createFakePluginHost({pluginId:'firstmate',agentSkillIds:['firstmate','captain'],settings:{fmHome:'/native',fmHostId:'host_1'}});await plugin(host.bb);
  host.harness.sdk.stub('threads.list',async()=>[]);
  host.harness.sdk.stub('threads.getPluginMetadata',async()=>({}));
@@ -233,5 +234,17 @@ test('the hourly allowance is spread across the hour, and a PR the open list sho
   }
   assert.ok(perMinute[0]<=20,`first minute read ${perMinute[0]} of a 100-PR backlog`);
   assert.ok(perMinute.slice(1).every(n=>n<=10),`later minutes read ${perMinute.slice(1)}: more than 500/60 a minute`);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('concurrent PR reads reserve their GraphQL point at the request itself, so 1,002 points left allows two reads, not four',async()=>{
+ const prs=Array.from({length:20},(_,i)=>9500+i);
+ const {host,store,gh}=await deck(prs,{delayMs:200});try {
+  await host.bb.storage.kv.set('crews',[]);
+  for(const n of prs) store.save({...store.get(id(n)),nextCheckAt:0});
+  probeStderr=`< X-Ratelimit-Remaining: 1002\n< X-Ratelimit-Reset: ${Math.floor(Date.now()/1000)+600}\n< X-Ratelimit-Resource: graphql\n`;
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.ok(gh.commands.some(c=>c.includes('rateLimit')),'the quota was probed');
+  assert.equal(gh.reads,2,`${gh.reads} PR reads with 1,002 points left and a 1,000-point reserve`);
  }finally{await host.harness.lifecycle.dispose();}
 });
