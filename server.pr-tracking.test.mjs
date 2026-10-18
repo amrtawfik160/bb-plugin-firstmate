@@ -512,7 +512,7 @@ test('with no delivery rows the quota is probed before discovery, and with 150 p
  }finally{await host.harness.lifecycle.dispose();}
 });
 
-test('discovery requests debit the GraphQL meter before they run, so 1,002 points left allows two, not a stale count down to 502',async()=>{
+test('discovery requests debit the GraphQL meter before they run, so 1,002 points left allows two points, not a stale count down to 502',async()=>{
  const host=await base();try {
   await host.bb.storage.kv.set('crews',Array.from({length:20},(_,i)=>crew(`c${i}`,`thr_c${i}`,'thr_cap')));
   host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'active',environmentId:`env_${threadId}`}));
@@ -524,7 +524,8 @@ test('discovery requests debit the GraphQL meter before they run, so 1,002 point
    if(command.includes('gh pr list')) return {payload:'[]'};
    return {code:0};});
   await host.harness.behavior.runSchedule('pr-delivery-follow-up');
-  const requests=host.harness.sdk.callsTo('environments.pullRequest').length+commands.filter(c=>c.includes('gh pr list')).length;
-  assert.equal(requests,2,`${requests} discovery requests with 1,002 points left and a 1,000-point reserve`);
+  // A PR status read through BB can make 2 GitHub requests, so it reserves 2 points.
+  const points=2*host.harness.sdk.callsTo('environments.pullRequest').length+commands.filter(c=>c.includes('gh pr list')).length;
+  assert.equal(points,2,`${points} points spent on discovery with 1,002 points left and a 1,000-point reserve`);
  }finally{await host.harness.lifecycle.dispose();}
 });

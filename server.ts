@@ -4177,7 +4177,7 @@ export default async function plugin(bb: BbPluginApi) {
       const hostId = backgroundBudget.getStore()
         ? await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined, signal).catch((error) => { if (signal?.aborted) throw error; return null; })
         : null;
-      return await readEnvironmentPr(envId, { hostId, signal });
+      return await readEnvironmentPr(envId, { hostId, signal, expectUrl: crew.prUrl });
     } catch (error) {
       if (signal?.aborted) throw error;
       return { facts: prFacts(null), paused: false };
@@ -6745,7 +6745,7 @@ export default async function plugin(bb: BbPluginApi) {
     const [envRes, uncommittedRes, prRes] = await Promise.allSettled([
       bb.sdk.environments.get({ environmentId: envId }),
       bb.sdk.environments.diffFiles({ environmentId: envId, target: "uncommitted" }),
-      readEnvironmentPr(envId).then((read) => read.value),
+      readEnvironmentPr(envId, { expectUrl: crew.prUrl }).then((read) => read.value),
     ]);
     const envRec = envRes.status === "fulfilled" ? asRecord(envRes.value) : {};
     const branch = envRec["branchName"] ?? envRec["branch"] ?? envRec["name"] ?? "unknown";
@@ -7989,20 +7989,21 @@ export default async function plugin(bb: BbPluginApi) {
   // probe, which reads an unknown meter, needs the allowance alone. The debit lowers the
   // host's meter; a response's own headers then set the true value. Outside the loop
   // (verdicts, merges) the request always runs and still debits the meter.
-  function reserveGithub(hostId: string | null, probe = false): boolean {
+  // cost is the GitHub requests one call can make: a PR status read through BB is up to 2.
+  function reserveGithub(hostId: string | null, probe = false, cost = 1): boolean {
     const meter = hostId === null ? undefined : graphqlMeters.get(hostId);
     const pool = backgroundBudget.getStore();
     if (pool === "sweep") {
-      if (sweepAllowance() <= 0) return false;
-      if (!probe && hostId !== null && graphqlReadsAllowed(hostId) === 0) return false;
-      sweepReads.push(Date.now());
+      if (sweepAllowance() < cost) return false;
+      if (!probe && hostId !== null && graphqlReadsAllowed(hostId, cost) === 0) return false;
+      for (let i = 0; i < cost; i++) sweepReads.push(Date.now());
     } else if (pool) {
-      if (backgroundAllowance() <= 0) return false;
-      if (!probe && hostId !== null && graphqlReadsAllowed(hostId) === 0) return false;
-      backgroundReads.push(Date.now());
-      paceTokens -= 1;
+      if (backgroundAllowance() < cost) return false;
+      if (!probe && hostId !== null && graphqlReadsAllowed(hostId, cost) === 0) return false;
+      for (let i = 0; i < cost; i++) backgroundReads.push(Date.now());
+      paceTokens -= cost;
     }
-    if (meter) meter.remaining -= 1;
+    if (meter) meter.remaining -= cost;
     return true;
   }
   function backgroundAllowance() {
@@ -8055,11 +8056,11 @@ export default async function plugin(bb: BbPluginApi) {
     return res;
   }
   /** Background GraphQL reads allowed now: none under the reserve, and none while the meter is unknown or past its reset (ensureGraphqlMeter probes first). */
-  function graphqlReadsAllowed(hostId: string): number {
+  function graphqlReadsAllowed(hostId: string, cost = 1): number {
     const meter = graphqlMeters.get(hostId);
     if (!meter || Date.now() >= meter.reset) return 0;
-    // A request may run only if its point leaves the reserve whole.
-    if (meter.remaining > GRAPHQL_RESERVE) return Number.POSITIVE_INFINITY;
+    // A request may run only if its points leave the reserve whole.
+    if (meter.remaining - cost >= GRAPHQL_RESERVE) return Number.POSITIVE_INFINITY;
     if (Date.now() >= quotaWarnedUntil) { quotaWarnedUntil = meter.reset; bb.log.warn(`PR follow-up paused: ${meter.remaining} GitHub GraphQL points left, under the ${GRAPHQL_RESERVE} kept for crews, merges and verdict refreshes; resumes after ${new Date(meter.reset).toISOString()}`); }
     return 0;
   }
@@ -8077,21 +8078,32 @@ export default async function plugin(bb: BbPluginApi) {
   // with gh pr view plus a GraphQL merge-queue query and keeps it only 10 seconds (#5704),
   // so a read reserves a GitHub point, a read within PR_STATUS_TTL_MS of the environment's
   // last answer gets that answer, and concurrent reads share one request. A read the
-  // background budget refuses returns the last answer of any age, or none, marked paused:
-  // the caller changes nothing and the next cycle reads again. fresh skips the cache for
+  // background budget refuses returns no facts, marked paused: the caller changes nothing
+  // and the next cycle reads again. fresh skips the cache for
   // merge and landing proof, and its answer refreshes the cache.
   const PR_STATUS_TTL_MS = 2 * 60_000;
+  const PR_STATUS_COST = 2;
   const prStatusCache = new Map<string, { at: number; value: unknown }>();
   const prStatusInFlight = new Map<string, Promise<unknown>>();
   type PrStatusRead = { facts: PrFacts; value: unknown; paused: boolean };
-  async function readEnvironmentPr(envId: string, opts: { fresh?: boolean; hostId?: string | null; signal?: AbortSignal } = {}): Promise<PrStatusRead> {
+  async function readEnvironmentPr(envId: string, opts: { fresh?: boolean; hostId?: string | null; signal?: AbortSignal; expectUrl?: string } = {}): Promise<PrStatusRead> {
+    // One environment can hold another PR later, or be shared by two crews: an answer
+    // counts for a crew that recorded its PR only when it names that PR. A fresh BB answer
+    // is the environment's truth and is returned whatever it names.
+    const expected = opts.expectUrl ? prKeyOf(opts.expectUrl) : null;
+    const names = (value: unknown) => expected === null || prKeyOf(prFacts(value).url) === expected;
     const cached = prStatusCache.get(envId);
-    if (!opts.fresh && cached && Date.now() - cached.at < PR_STATUS_TTL_MS) return { facts: prFacts(cached.value), value: cached.value, paused: false };
+    if (!opts.fresh && cached && Date.now() - cached.at < PR_STATUS_TTL_MS && names(cached.value)) return { facts: prFacts(cached.value), value: cached.value, paused: false };
     const shared = opts.fresh ? undefined : prStatusInFlight.get(envId);
-    if (shared) { const value = await shared; return { facts: prFacts(value), value, paused: false }; }
+    if (shared) {
+      const value = await shared;
+      if (names(value)) return { facts: prFacts(value), value, paused: false };
+    }
     const hostId = opts.hostId ?? null;
     if (hostId !== null && backgroundBudget.getStore()) await ensureGraphqlMeter(hostId, opts.signal);
-    if (!reserveGithub(hostId)) return { facts: prFacts(cached?.value ?? null), value: cached?.value ?? null, paused: true };
+    // BB runs gh pr view, then a GraphQL merge-queue query for an open, non-draft PR. A
+    // refused read hands back no facts: an expired answer can not settle anything.
+    if (!reserveGithub(hostId, false, PR_STATUS_COST)) return { facts: prFacts(null), value: null, paused: true };
     const call = bb.sdk.environments.pullRequest({ environmentId: envId, ...(opts.signal ? { signal: opts.signal } : {}) });
     const request: Promise<unknown> = opts.signal ? raceAbort(call, opts.signal, STUCK_HOST_CALL_MS) : call;
     if (!opts.fresh) prStatusInFlight.set(envId, request);
@@ -8527,13 +8539,14 @@ export default async function plugin(bb: BbPluginApi) {
   ): Promise<{ url: string; state: string; source: string } | null> {
     let env = prFacts(null);
     let paused = false;
-    try { ({ facts: env, paused } = await readEnvironmentPr(envId, { hostId, signal, fresh })); } catch(error) { if (signal?.aborted) throw error; }
+    try { ({ facts: env, paused } = await readEnvironmentPr(envId, { hostId, signal, fresh, expectUrl: crew.prUrl })); } catch(error) { if (signal?.aborted) throw error; }
+    // A refused budget is not "no PR": the gh lookups below would spend the same budget.
+    if (paused) return null;
     if (env.available && env.url !== "") {
       await rememberPrUrl(crew, env.url,signal);
       return { url: env.url, state: env.state, source: "environment" };
     }
-    // A refused budget is not "no PR": the gh lookups below would spend the same budget.
-    if (hostId === null || paused) return null;
+    if (hostId === null) return null;
     const candidates: Array<{ url: string; source: string }> = [];
     if (crew.prUrl !== undefined && crew.prUrl !== "") candidates.push({ url: crew.prUrl, source: "recorded" });
     try {
@@ -9226,11 +9239,12 @@ export default async function plugin(bb: BbPluginApi) {
       const status = statusByThread.get(crew.threadId) ?? "unknown";
       if (status !== "idle" && status !== "error") continue;
       const read = await prReadForCrew(crew, opts.signal);
+      // A refused budget settles nothing; the crew comes round again in a later pass.
+      if (read.paused) continue;
       let pr = read.facts;
       let state = pr.state;
       let url = pr.url;
-      // A refused budget reads nothing more; the crew comes round again in a later pass.
-      if (!pr.available && !read.paused && opts.notify === true && crew.prUrl !== undefined && crew.prUrl !== "") {
+      if (!pr.available && opts.notify === true && crew.prUrl !== undefined && crew.prUrl !== "") {
         // BB's environment cache has no PR (e.g. the crew pushed to an existing one):
         // ask gh about the PR this crew recorded.
         try {
@@ -15157,10 +15171,20 @@ export default async function plugin(bb: BbPluginApi) {
     const raw = Number(process.env.FM_BB_RETRY_WAIT_MS);
     return Number.isFinite(raw) && raw >= 0 ? raw : 500;
   }
+  // A retry row is still booked unless BB says it is spent. BB 0.46.1 names the row's
+  // state; a failed send with another attempt booked is failed_retrying, not exhausted.
+  // Older hosts carry no state: a failed row counts as spent only when it shows no next
+  // attempt, and is otherwise kept as booked (the captain can cancel it).
+  function retryRowBooked(row: unknown): boolean {
+    const rec = asRecord(row);
+    if (asRecord(rec["payload"])["kind"] !== "retry") return false;
+    if (typeof rec["state"] === "string") return rec["state"] !== "failed_exhausted";
+    const failed = typeof rec["failureReason"] === "string" && rec["failureReason"] !== "";
+    return !failed || !("nextAttemptAt" in rec) || rec["nextAttemptAt"] !== null;
+  }
   async function bbRetryQueued(threadId: string): Promise<boolean> {
     try {
-      const rows = await bb.sdk.threads.queuedMessages.list({ threadId });
-      return rows.some((row) => asRecord(asRecord(row)["payload"])["kind"] === "retry" && !(typeof row.failureReason === "string" && row.failureReason !== ""));
+      return (await bb.sdk.threads.queuedMessages.list({ threadId })).some(retryRowBooked);
     } catch {
       return false;
     }
