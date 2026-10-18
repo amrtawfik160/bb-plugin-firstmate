@@ -630,7 +630,9 @@ const RETAINED_SWEEP_MS = 10 * 60_000;
 const GRAPHQL_RESERVE = 1000;
 /** A background GitHub request that the hourly allowance or the GraphQL reserve held back; nothing was read. */
 class GithubReservePaused extends Error { constructor(hostId: string) { super(`GitHub request on ${hostId} held back: hourly allowance or GraphQL reserve reached`); } }
-const FOLLOW_UP_READS_PER_HOUR = 500;
+const FOLLOW_UP_READS_PER_HOUR = 470;
+// The retirement sweep's own hourly share; with follow-up's 470 the loop makes at most 500.
+const SWEEP_READS_PER_HOUR = 30;
 const COVERED_DISCOVERY_MS = 30 * 60_000;
 const FOLLOW_UP_BURST = 10;
 /** `gh api -i … --jq`: the status line and headers, a blank line, then one JSON row per line. A plain answer has rows only. */
@@ -7203,7 +7205,7 @@ export default async function plugin(bb: BbPluginApi) {
   const UNOWNED_PR_RECHECK_MS = 60 * 60_000;
   type PrCandidate = PrBranchCandidate & { crew: Crew; path: string; hostId: string; live: boolean; fresh: boolean };
   type OpenPr = { id: string; number: number; url: string; head: string; headSha?: string; title?: string; openedAt?: number; touchedAt?: number; candidate?: PrCandidate };
-  type OpenPrSnapshot = { at: number; repos: Array<{ projects: Set<string>; prs: OpenPr[]; openIds: Set<string>; repo: string; allOpen: Set<string> }> };
+  type OpenPrSnapshot = { at: number; repos: Array<{ projects: Set<string>; prs: OpenPr[]; openIds: Set<string>; repo: string; allOpen: Set<string>; validated: boolean }> };
   const crewBranches = new Map<string, { branch: string; path: string; hostId: string }>();
   const projectRepos = new Map<string, string>();
   const unownedPrs = new Map<string, number>();
@@ -7321,6 +7323,8 @@ export default async function plugin(bb: BbPluginApi) {
         const live = group.candidates.some((c) => c.live);
         const cached = openPrLists.get(repo);
         let listed = cached && !live && Date.now() - cached.at < RETIRED_ONLY_LIST_MS ? cached.rows : undefined;
+        // Rows fetched or revalidated (a 304) by GitHub in this cycle; cached rows are not.
+        const validated = !listed;
         if (!listed) {
           const fields = ".[] | {number, url: .html_url, title, headRefName: .head.ref, headSha: .head.sha, createdAt: .created_at, updatedAt: .updated_at, author: .user.login} | tojson";
           const list = (flags: string) => `${[...new Set(group.paths)].slice(0, 8).map((path) => `if cd ${shQuote(path)} 2>/dev/null; then gh api ${flags} ${shQuote("repos/{owner}/{repo}/pulls?state=open&per_page=100")} --jq ${shQuote(fields)}; exit $?; fi`).join("; ")}; exit 3`;
@@ -7374,7 +7378,7 @@ export default async function plugin(bb: BbPluginApi) {
         }
         // The repository is the origin remote, or else the one every listed PR names.
         const named = new Set([...allOpen].map((id) => id.slice(0, id.lastIndexOf("#"))));
-        snapshot.repos.push({ projects: group.projects, prs, openIds, repo: repo.includes("/") ? repo.slice(repo.indexOf("\t") + 1) : named.size === 1 ? [...named][0]! : "", allOpen });
+        snapshot.repos.push({ projects: group.projects, prs, openIds, repo: repo.includes("/") ? repo.slice(repo.indexOf("\t") + 1) : named.size === 1 ? [...named][0]! : "", allOpen, validated });
       }, signal).catch((error) => { if (!signal?.aborted) bb.log.warn(`Open PR list: ${String(error)}`); });
     }
     return snapshot;
@@ -7403,6 +7407,7 @@ export default async function plugin(bb: BbPluginApi) {
       await boundedFollowUp((s) => registerCrewPr(pr.candidate!.crew, pr.url, s, { title: pr.title, openedAt: pr.openedAt }, true), signal)
         .then(() => { deliveries.touch(pr.id, pr.touchedAt); }, (error) => { if (signal?.aborted) throw error; bb.log.warn(`Open PR tracking ${pr.id}: ${String(error)}`); });
     }
+    return snapshot;
   }
   // Read-only view for a captain: every open PR by this GitHub account in the captain's projects, untracked first.
   async function openPrReport(captain: string, project: string | undefined, signal?: AbortSignal) {
@@ -7466,7 +7471,8 @@ export default async function plugin(bb: BbPluginApi) {
   // ended, and fm-watch kept scanning the archived crew every pass: 22 of the captain's
   // 52 native records on 17 Oct. This retires each such record, with forget's own steps.
   let retainedSweepAt = 0;
-  async function retireEndedRetainedRecords(signal?: AbortSignal) {
+  const keptReasons = new Map<string, string>();
+  async function retireEndedRetainedRecords(open: OpenPrSnapshot | undefined, signal?: AbortSignal) {
     if (Date.now() - retainedSweepAt < RETAINED_SWEEP_MS) return;
     retainedSweepAt = Date.now();
     const all: DeliveryRecord[] = [];
@@ -7491,15 +7497,31 @@ export default async function plugin(bb: BbPluginApi) {
         const own = records.find((r) => r.workers.includes(thread) && r.continuation);
         if (!own || records.some((r) => !releasesTask(r.status))) continue;
         if ((await raceAbort(bb.sdk.threads.get({ threadId: thread }), signal, STUCK_HOST_CALL_MS)).archivedAt == null) continue;
-        // A ledger row can be closed-era: a PR reopened since keeps the task.
+        // A ledger row can be closed-era: a PR reopened since keeps the task. This cycle's
+        // free open list answers for its repository: a PR on it is open again, and a PR the
+        // ledger saw merged or closed and the list does not show is still finished. Only a
+        // PR the ledger never saw finished, or outside the list, is read on GitHub, from the
+        // sweep's own share.
         const reopened: string[] = [];
         for (const r of records) {
-          if (graphqlReadsAllowed(hostId) === 0 || backgroundAllowance() <= 0) { reopened.push(`${r.id} not read: GitHub allowance or reserve reached`); break; }
-          const read = await ghGraphql(hostId, `gh pr view ${shQuote(r.url)} --json state`, 30_000, signal);
+          if (open?.repos.some((repo) => repo.allOpen.has(r.id))) { reopened.push(`${r.id} open on GitHub`); continue; }
+          // Only a list GitHub answered in this cycle settles a terminal ledger row: cached
+          // rows can predate a reopen.
+          const listed = open?.repos.some((repo) => repo.validated && repo.repo && r.id.startsWith(`${repo.repo}#`));
+          if (listed && (r.forgeState === "merged" || r.forgeState === "closed")) continue;
+          let read: { exitCode: number; output: string } | null = null;
+          try { read = await ghGraphql(hostId, `gh pr view ${shQuote(r.url)} --json state`, 30_000, signal); }
+          catch (error) { if (!(error instanceof GithubReservePaused)) throw error; reopened.push(`${r.id} not read yet: the sweep's GitHub share or the reserve is spent`); break; }
           const state = read.exitCode === 0 ? String(asRecord(JSON.parse(read.output || "{}"))["state"] ?? "") : "";
           if (state !== "MERGED" && state !== "CLOSED") reopened.push(`${r.id} ${state || `unreadable (exit ${read.exitCode})`}`);
         }
-        if (reopened.length) { bb.log.warn(`kept the native record of forgotten crew ${id}: GitHub does not show every PR of it finished (${reopened.join(", ")})`); continue; }
+        if (reopened.length) {
+          // Once per record and reason: the same reason every sweep is noise.
+          const reason = reopened.join(", ");
+          if (keptReasons.get(id) !== reason) { keptReasons.set(id, reason); bb.log.info(`kept the native record of forgotten crew ${id}: GitHub does not show every PR of it finished (${reason})`); }
+          continue;
+        }
+        keptReasons.delete(id);
         try {
           const crew: Crew = { ...crewSchema.parse(own.continuation), nativeHome: home, parentThreadId: own.owner };
           await dropFmMeta(crew);
@@ -7516,7 +7538,12 @@ export default async function plugin(bb: BbPluginApi) {
   // lookups and branch lists, retirement reads. Verdict, merge and owner requests run
   // outside the loop and are not charged.
   const backgroundReads: number[] = [];
-  const backgroundBudget = new AsyncLocalStorage<true>();
+  const backgroundBudget = new AsyncLocalStorage<"follow-up" | "sweep">();
+  const sweepReads: number[] = [];
+  function sweepAllowance() {
+    while (sweepReads.length && sweepReads[0]! <= Date.now() - 3_600_000) sweepReads.shift();
+    return SWEEP_READS_PER_HOUR - sweepReads.length;
+  }
   // The hour's count is also paced: a bucket refilled at 500 an hour, holding at most
   // FOLLOW_UP_BURST, so a backlog cannot spend the hour in one cycle and leave a later
   // push waiting.
@@ -7530,7 +7557,12 @@ export default async function plugin(bb: BbPluginApi) {
   // (verdicts, merges) the request always runs and still debits the meter.
   function reserveGithub(hostId: string | null, probe = false): boolean {
     const meter = hostId === null ? undefined : graphqlMeters.get(hostId);
-    if (backgroundBudget.getStore()) {
+    const pool = backgroundBudget.getStore();
+    if (pool === "sweep") {
+      if (sweepAllowance() <= 0) return false;
+      if (!probe && hostId !== null && graphqlReadsAllowed(hostId) === 0) return false;
+      sweepReads.push(Date.now());
+    } else if (pool) {
       if (backgroundAllowance() <= 0) return false;
       if (!probe && hostId !== null && graphqlReadsAllowed(hostId) === 0) return false;
       backgroundReads.push(Date.now());
@@ -7619,11 +7651,14 @@ export default async function plugin(bb: BbPluginApi) {
     } catch (error) { if (signal?.aborted) throw error; return undefined; }
   }
   async function deliveryPass(signal?: AbortSignal) {
-    return backgroundBudget.run(true, () => backgroundDeliveryPass(signal));
+    return backgroundBudget.run("follow-up", () => backgroundDeliveryPass(signal));
   }
   async function backgroundDeliveryPass(signal?: AbortSignal) {
     // First, so a PR opened this minute gets its row and its first GitHub read in this cycle.
-    await openPrSweep(signal).catch(error=>{ if (!signal?.aborted) bb.log.warn(`Open PR sweep: ${String(error)}`); });
+    // Only this cycle's own list can settle a terminal ledger row in the sweep below; a
+    // list sweep that fails leaves it undefined, not the previous cycle's.
+    let cycleLists: OpenPrSnapshot | undefined;
+    await openPrSweep(signal).then(snapshot=>{ cycleLists=snapshot; },error=>{ if (!signal?.aborted) bb.log.warn(`Open PR sweep: ${String(error)}`); });
     await recoverDoneDeliveries(signal);
     const crews = await raceAbort(readCrews(),signal,STUCK_HOST_CALL_MS);
     const batch = [...crews.slice(deliveryDiscoveryCursor),...crews.slice(0,deliveryDiscoveryCursor)].slice(0,10);
@@ -7671,7 +7706,7 @@ export default async function plugin(bb: BbPluginApi) {
         await follow(record);
       }
     }));
-    await retireEndedRetainedRecords(signal).catch((error) => { if (!signal?.aborted) bb.log.warn(`Retained native records: ${String(error)}`); });
+    await backgroundBudget.run("sweep", () => retireEndedRetainedRecords(cycleLists, signal)).catch((error) => { if (!signal?.aborted) bb.log.warn(`Retained native records: ${String(error)}`); });
     // Notification failure stays due independently of forge polling backoff.
     for (const record of deliveries.pendingNotifications()) {
       if (record.notification.desired !== record.notification.delivered) await boundedFollowUp(s=>notifyDelivery(record,s),signal).catch(error=>bb.log.warn(`PR notification ${record.id}: ${String(error)}`));
