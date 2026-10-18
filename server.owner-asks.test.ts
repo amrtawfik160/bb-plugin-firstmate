@@ -385,3 +385,30 @@ test("decide-later expiry returns an overdue question for owner review", async (
     await host.harness.lifecycle.dispose();
   }
 });
+
+// Checker round 2 (159-TG68-verdict-2.md), their reproduction: two overlapping Skip requests for one card
+// make one captain notice, even while the first send is still in flight.
+test("overlapping defer retries tell the captain once", { timeout: 15_000 }, async () => {
+  const host = await captainHost();
+  try {
+    const asks = createOwnerAsks(host.bb.storage.database());
+    const now = Date.now();
+    asks.create({ id: "race", captain: "thr_cap", kind: "question", text: "Ship?", options: [{ label: "Yes", value: "yes" }], createdAt: now });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const firstEntered = new Promise<void>((resolve) => { entered = resolve; });
+    let notices = 0;
+    host.harness.sdk.stub("threads.send", async () => { notices++; entered(); await gate; return {}; });
+    const input = { threadId: "thr_cap", ids: ["race"], until: now + 3_600_000 };
+    const first = host.harness.behavior.callRpc("deferAsk", input);
+    const second = host.harness.behavior.callRpc("deferAsk", input);
+    await firstEntered;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    release();
+    await Promise.all([first, second]);
+    assert.equal(notices, 1, "overlapping RPC/retry must not send the same skip notice twice");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
