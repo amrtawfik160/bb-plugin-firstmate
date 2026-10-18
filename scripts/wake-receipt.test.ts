@@ -241,6 +241,40 @@ test("open decisions already presented never demand a second receipt, even when 
   assert.equal(existsSync(join(f.state, ".bb-wake-receipt.json")), false);
 });
 
+test("six watcher refills after hidden stale rows do not turn an unchanged decision into new receipts", (t) => {
+  const warning = "WARNING: queued wakes pending - drain them with bin/fm-wake-drain.sh before anything else.\n";
+  const f = fixture(t, { persistent: warning + "OPEN DECISIONS (still open):\n2803e0af: waiting on the owner's card\n" });
+  // Every presentation races another watcher poll. The BB layer has pruned the
+  // previous hidden stale row; the guard sees its replacement after the drain.
+  const first = f.run();
+  assert.ok(first.id, "the owner decision is presented once");
+  const receipts = [];
+  let current = first;
+  for (let poll = 0; poll < 6; poll++) {
+    f.update({ arriving: [{ seq: poll + 1, text: "hidden waiting crew" }] });
+    // Model BB's pre-read prune; the watcher refills only after this read.
+    f.update({ queue: [] });
+    current = current.id ? f.run("complete", current.id) : f.run();
+    receipts.push(current.id);
+  }
+  assert.deepEqual(receipts, [null, null, null, null, null, null]);
+  assert.equal(current.report, "No unread reports.");
+  assert.equal(f.read().acks, undefined, "hidden rows are not acknowledged by guessing a native cursor");
+});
+
+test("a truly wedged working crew still gets a stale receipt after warning-only reads", (t) => {
+  const f = fixture(t, { persistent: "WARNING: queued wakes pending - drain them with bin/fm-wake-drain.sh before anything else.\n" });
+  assert.equal(f.run().id, null);
+  const stale = "stale: bb:thr_working (idle 291s, possible wedge, escalation 5)";
+  f.update({ queue: [{ seq: 7, text: stale }] });
+  const report = f.run();
+  assert.ok(report.id);
+  assert.equal(report.pair?.through, 7);
+  assert.match(report.report, /stale: bb:thr_working.*possible wedge/);
+  assert.equal(f.run("inspect", report.id).id, report.id);
+  assert.equal(f.read().acks, undefined, "a real wedge waits for captain handling");
+});
+
 test("an open decision that changed or reopened after resolution is presented again", (t) => {
   const f = fixture(t, { persistent: "OPEN DECISIONS:\nold decision\n" });
   const first = f.run();
@@ -303,12 +337,12 @@ test("a report queued while a completion refreshes is returned by that same comp
   assert.equal(f.read().acks, 1);
 });
 
-test("a pending-queue warning that never yields a report is read once more, then kept for the captain", (t) => {
+test("a pending-queue warning that never yields a report is read once more without opening an empty receipt", (t) => {
   const warning = "WARNING: queued wakes pending - drain them with bin/fm-wake-drain.sh before anything else.\n";
   const f = fixture(t, { persistent: warning });
   const first = f.run();
-  assert.ok(first.id);
-  assert.match(first.report, /queued wakes pending/);
+  assert.equal(first.id, null);
+  assert.equal(first.report, "No unread reports.");
   assert.equal(f.read().reads, 2);
 });
 
@@ -421,9 +455,10 @@ test("a drain waiting on a held receipt lock stops at the budget and names the h
 test("the second read for rows that arrived mid-read is skipped when the budget cannot cover it", (t) => {
   const f = fixture(t, { arriving: [{ seq: 1, text: "late report" }], pause: "reads", pauseSeconds: 1 });
   const first = f.run("receive", "", f.script, { FM_WAKE_RECEIPT_BUDGET: "1.6" });
-  assert.match(first.report, /queued wakes pending/);
+  assert.equal(first.id, null);
+  assert.equal(first.report, "No unread reports.");
   assert.equal(f.read().reads, 1);
-  const second = f.run("complete", first.id!);
+  const second = f.run();
   assert.match(second.report, /1 late report/);
 });
 

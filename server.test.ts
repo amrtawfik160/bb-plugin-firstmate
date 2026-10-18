@@ -7957,12 +7957,13 @@ for (const entry of ["tool", "cli"] as const) {
       });
       const assertCleanup = () => {
         assert.equal(nativeTerminals.size,1,"finish or time out the same native invocation, never retry it");
-        // Receipt: init, two payload chunks, atomic decode/rename, writer
-        // cleanup, one native execution and receipt cleanup. Peek stays direct.
-        assert.equal(commands.size,scenario.script==="wake-drain" ? 7 : 1,"exact staging/execution/cleanup commands");
+        // Receipt payload size changes with the embedded helper. Each chunk must
+        // still belong to one staged execution with complete cleanup.
+        const payloadChunks = [...commands.values()].filter(cmd=>cmd.startsWith("printf '%s' ")).length;
+        assert.equal(commands.size,scenario.script==="wake-drain" ? 5 + payloadChunks : 1,"exact staging/execution/cleanup commands");
         if (scenario.script==="wake-drain") {
           assert.equal(writes.length,1,"publish exactly one complete guarded command");
-          assert.equal([...commands.values()].filter(cmd=>cmd.startsWith("printf '%s' ")).length,2,"exact payload chunk count");
+          assert.ok(payloadChunks > 0,"receipt payload is staged before execution");
           assert.match(command,/ 'receive' '' "\$FM_BINDIR\/fm-wake-drain.sh"$/,"timeout never requests an acknowledgement");
         }
         assert.deepEqual([...closed].sort(),[...commands.keys()].sort(),"every created terminal closes exactly once");

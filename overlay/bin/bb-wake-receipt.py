@@ -96,6 +96,19 @@ def ack_pair(report):
     return {"through": int(matches[0][1]), "generation": matches[0][2]} if matches else None
 
 
+PENDING_WARNING = "WARNING: queued wakes pending - drain them"
+
+
+def report_without_pending_hint(report):
+    # Rows arriving after the presentation boundary have no acknowledgement pair.
+    # A guard hint cannot turn hidden stale rows into new captain reports. Keep
+    # actual presentations (including wedge rows) and their cursor untouched.
+    if ack_pair(report) is not None:
+        return report
+    return "".join(line for line in report.splitlines(keepends=True)
+                   if not line.startswith(PENDING_WARNING))
+
+
 def meaningful(report):
     lines = []
     for line in report.splitlines():
@@ -388,7 +401,7 @@ class Journal:
         if arrived_mid_drain(report) and self.deadline - time.monotonic() >= time.monotonic() - started:
             report = self.native([], phase)
         archive_retired_status(self.state)
-        return report
+        return report_without_pending_hint(report)
 
     def capture_result(self):
         output, result_path = self.capture_paths()
@@ -411,6 +424,7 @@ class Journal:
 
     def finish_presentation(self, report):
         pair = ack_pair(report)
+        report = report_without_pending_hint(report)
         preserved = self.current.pop("preservedReport", "")
         if preserved:
             report = "RECOVERED PRESENTATION (reconcile before repeating actions):\n" + preserved + "\nCURRENT NATIVE PRESENTATION:\n" + report
@@ -510,6 +524,7 @@ class Journal:
                 fresh = self.native([], "refreshing")
         else:
             raise RuntimeError("Invalid completion phase; journal retained")
+        fresh = report_without_pending_hint(fresh)
         acknowledgement = self.current.get("ackReport", "")
         old_report = self.report()
         pair = ack_pair(fresh)
