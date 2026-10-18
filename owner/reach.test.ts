@@ -80,8 +80,18 @@ test("a provider, model or effort the owner names wins for that crew only", () =
     { role: "builder", providerId: "acp-grok", model: "grok-4.6", reasoningLevel: "xhigh", named: true });
   assert.deepEqual(crewExecution({ role: "builder", reasoningLevel: "medium" }),
     { role: "builder", providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "medium", named: false });
+  // Owner rule, 18 Oct: a Codex crew with no named model runs gpt-6.1-sol, never the provider default.
   assert.deepEqual(crewExecution({ role: "checker", providerId: "codex" }),
-    { role: "checker", providerId: "codex", model: undefined, reasoningLevel: undefined, named: true });
+    { role: "checker", providerId: "codex", model: "gpt-6.1-sol", reasoningLevel: undefined, named: true });
+  assert.deepEqual(crewExecution({ role: "builder", providerId: "acp-grok" }),
+    { role: "builder", providerId: "acp-grok", model: undefined, reasoningLevel: undefined, named: true });
+  // Owner rule (repair thread, 18 Oct): another Codex model the owner names is allowed; gpt-6-astra
+  // only with a modelPermission quoting the owner's message ref.
+  assert.equal(crewExecution({ role: "checker", model: "gpt-6-sol" }).model, "gpt-6-sol");
+  assert.equal(crewExecution({ providerId: "codex", model: "gpt-6-luna" }).model, "gpt-6-luna");
+  assert.throws(() => crewExecution({ role: "checker", model: "gpt-6-astra" }), /gpt-6-astra needs the owner's permission/);
+  assert.throws(() => crewExecution({ role: "checker", model: "gpt-6-astra", modelPermission: "yes" }), /gpt-6-astra needs the owner's permission/);
+  assert.equal(crewExecution({ role: "checker", model: "gpt-6-astra", modelPermission: "tg:985604794:5617" }).model, "gpt-6-astra");
   assert.deepEqual(crewExecution({ role: "builder", model: "claude-sonnet-5-5" }),
     { role: "builder", providerId: "claude-code", model: "claude-sonnet-5-5", reasoningLevel: undefined, named: true });
   assert.deepEqual(crewExecution({}), crewExecution({ role: "builder" }), "the next dispatch is back on the default");

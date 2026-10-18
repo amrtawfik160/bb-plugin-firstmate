@@ -115,7 +115,7 @@ async function failoverHost(catalog: Array<{ id: string; available?: boolean }>)
   host.harness.sdk.stub("projects.defaultExecutionOptions", async () => ({ providerId: "claude-code", model: "claude-opus-5-5" }));
   host.harness.sdk.stub("environments.get", async () => ({ id: "env_wt", hostId: "host_1", status: "ready", path: "/repo/isolated", isWorktree: true }));
   host.harness.sdk.stub("providers.list", async () => catalog);
-  host.harness.sdk.stub("providers.models", async ({ providerId }: { providerId: string }) => ({ models: [{ id: `${providerId}-default`, model: `${providerId}-default`, isDefault: true }] }));
+  host.harness.sdk.stub("providers.models", async ({ providerId }: { providerId: string }) => ({ models: [{ id: `${providerId}-default`, model: `${providerId}-default`, isDefault: true }, ...(providerId === "codex" ? [{ id: "gpt-6.1-sol", model: "gpt-6.1-sol" }] : [])] }));
   host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew2" }));
   return host;
 }
@@ -129,7 +129,7 @@ test("a crew whose turn fails on an exhausted provider pool is relaunched once o
     assert.equal(spawns.length, 1, "one replacement worker");
     const args = spawns[0]![0] as { providerId?: string; model?: string; prompt: string; environment?: { type?: string; environmentId?: string } };
     assert.equal(args.providerId, "codex", "a ship crew skips the failed provider and acp-antigravity");
-    assert.equal(args.model, "codex-default");
+    assert.equal(args.model, "gpt-6.1-sol", "owner rule: a Codex crew runs gpt-6.1-sol, not the provider default");
     assert.deepEqual(args.environment, { type: "reuse", environmentId: "env_wt" });
     assert.match(args.prompt, /re-verify/i);
     const crews = (await host.bb.storage.kv.get("crews")) as Array<{ threadId: string; providerId: string | null }>;
@@ -773,7 +773,7 @@ async function planLimitHost(crewPatch: Record<string, unknown> = {}, settings: 
   host.harness.sdk.stub("projects.defaultExecutionOptions", async () => ({ providerId: "acp-cursor", model: "grok-4.6" }));
   host.harness.sdk.stub("environments.get", async () => ({ id: "env_wt", hostId: "host_1", status: "ready", path: "/repo/isolated", isWorktree: true }));
   host.harness.sdk.stub("providers.list", async () => CURSOR_CATALOG);
-  host.harness.sdk.stub("providers.models", async ({ providerId }: { providerId: string }) => ({ models: [{ id: `${providerId}-default`, model: `${providerId}-default`, isDefault: true }] }));
+  host.harness.sdk.stub("providers.models", async ({ providerId }: { providerId: string }) => ({ models: [{ id: `${providerId}-default`, model: `${providerId}-default`, isDefault: true }, ...(providerId === "codex" ? [{ id: "gpt-6.1-sol", model: "gpt-6.1-sol" }] : [])] }));
   host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew2" }));
   return host;
 }

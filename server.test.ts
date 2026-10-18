@@ -62,6 +62,7 @@ import { LEFTOVER_TIMER_CONTRACT, WAITING_PROTOCOL, latestStatus, statusProtocol
 import { UPSTREAM_SCRIPT_NAMES, PINNED_SCRIPT_SUPPORT_FILES, UPSTREAM_SKILL_NAMES } from "./lib/upstream-surface.ts";
 import { FIRSTMATE_ROUTINE_MARKER } from "./lib/timeline-noise.ts";
 import { CAPTAIN_RULES, OWNER_DECISION_RULE } from "./lib/owner-asks.ts";
+import { cleanWorktree } from "./test/clean-worktree.ts";
 
 const CAPTAIN_TEST_SKILLS = ["captain", "firstmate", "skill-routing"] as const;
 const SKILLS = [...new Set([...CAPTAIN_TEST_SKILLS, ...UPSTREAM_SKILL_NAMES])] as const;
@@ -2716,6 +2717,7 @@ test("merge runs native merge and teardown before retiring the crew", async () =
 
 test("bearings reconciles a crew whose PR merged externally", async () => {
   const host = await load();
+  cleanWorktree(host);
   try {
     stubRoutedHost(host, () => ({}));
     stubCleanWorktree(host);
@@ -2807,6 +2809,7 @@ test("bearings never retires a DONE scout because a PR on its environment merged
 
 test("a refused landed-crew cleanup keeps the crew without failing bearings", async () => {
   const host = await load();
+  cleanWorktree(host);
   try {
     stubRoutedHost(host, () => ({}));
     stubCleanWorktree(host);
@@ -5272,7 +5275,8 @@ function stubRoutedHost(
     // Only successful commands mutate the virtual FS (a forced-failure decode never
     // renames over the target — mirrors the atomic write's truncate-safety).
     if (code === 0) simulateHostWrite(unwrapHostCommand(cmd), vfs, writes);
-    const payload=r.payload ?? (cmd.includes("fm-bearings-snapshot.sh") ? nativeBearingsFixture() : "");
+    // The finished-crew unsaved-work check reads a clean, completed check unless a router says otherwise.
+    const payload=r.payload ?? (cmd.includes("FM_UNSAVED") ? "FM_UNSAVED checked\n" : cmd.includes("fm-bearings-snapshot.sh") ? nativeBearingsFixture() : "");
     if (cmd.includes("FM_HOST_CAPTURE_V1")) return hostRcPayload(JSON.stringify({protocol:"FM_HOST_CAPTURE_V1",exitCode:code,stdout:payload,stderr:""}),0);
     return hostRcPayload(payload, code);
   });
@@ -9850,6 +9854,7 @@ test("dispatch refuses a task aimed at another captain's crew PR unless override
 
 test("a PR merged outside its captain retires the crew and tells the OWNING captain", async () => {
   const host = await load();
+  cleanWorktree(host);
   try {
     stubRoutedHost(host, () => ({}));
     stubCleanWorktree(host);
@@ -11119,6 +11124,7 @@ test("the background landed sweep never retires a crew whose PR was closed unmer
 
 test("the landed sweep never wakes an archived (retired) owning captain", async () => {
   const host = await load();
+  cleanWorktree(host);
   try {
     stubRoutedHost(host, () => ({}));
     stubCleanWorktree(host);

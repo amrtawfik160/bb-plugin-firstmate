@@ -81,3 +81,15 @@ test('published selection plus failed BB cache write recovers across factory rel
  const directory=f.directory,host=await f.host.harness.lifecycle.reload(plugin);f=await factory({host,directory,registered:true});const status=await f.host.harness.behavior.runCli(['runtime','status','--json'],ctx);assert.equal(status.exitCode,0,status.stderr);assert.equal(JSON.parse(status.stdout).selected.release,next.release);assert.equal(await f.host.bb.storage.kv.get(`runtime-selection-pending:${ctx.threadId}`),undefined);assert.equal((await f.host.bb.storage.kv.get(`native-runtime:${ctx.threadId}`)).release,next.release);assert.equal(readFileSync(join(home,'state/held.status'),'utf8'),'retained report and PR reference\n');assert.equal(f.host.harness.sdk.callsTo('threads.spawn').length,0);
  }finally{await f.clean();}
 });
+// Owner decision 18 Oct: new captain homes record the native fleet activity ledger and the
+// pipeline cost ledger. Both are native presence flags; a flag removed later stays removed.
+test('a new bundled captain home gets the fleet and pipeline cost ledger flags once',async()=>{
+ const f=await factory();try{
+  assert.equal((await f.host.harness.behavior.runCli(['deck','--json'],ctx)).exitCode,0);
+  const home=await f.host.bb.storage.kv.get(`native-home:${ctx.threadId}`);
+  for(const flag of ['fleet-ledger','pipeline-spend'])assert.ok(existsSync(join(home,'config',flag)),flag);
+  rmSync(join(home,'config/pipeline-spend'));
+  assert.equal((await f.host.harness.behavior.runCli(['deck','--json'],ctx)).exitCode,0);
+  assert.equal(existsSync(join(home,'config/pipeline-spend')),false,'a reused home is not changed');
+ }finally{await f.clean();}
+});

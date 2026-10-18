@@ -50,11 +50,11 @@ the crewmate's result report, never in a message for the user.
 | Owner asks for `/to-spec`, `/to-tickets`, `/implement-spec`, `/implement` or `/grill-me` | Supervisor: dispatch a crew that loads the named skill, `to-spec`, `to-tickets`, `implement-spec` or `implement`; for `implement-spec`, one crew per ticket under a firstmate_program; for /grill-me, run `grilling` yourself with the owner. Crewmate: follow the skill your brief names, under the sub-agent rule below |
 | Investigation of how or why, or a spec | poteto-mode `investigation.md`; `how` or `why`, single-model |
 | Research or writing, no code | No fixed pipeline: the supervisor names the playbook and skills in the brief |
-| Check another crew's PR before merge (checker crew) | `code-review`; `blast-radius`; `interrogate` under the sub-agent rule below; record the verdict with bb firstmate deliveries check |
+| Check another crew's PR before merge (checker crew) | `code-review`; `blast-radius`; `interrogate` under the sub-agent rule below; record the verdict with bb firstmate deliveries check, then send it straight to the crew that must act on it, one message per PR head, not through the supervisor |
 | Design question that needs running code | poteto-mode `prototype.md`; `prototype` |
 | Frontend or UI work (new screen, redesign, visual change) | `frontend-design`; the project's own design system and tokens win where they pin a choice |
 | Pixel-exact UI match | poteto-mode `visual-parity.md` |
-| PR review threads, conflicts or red CI | poteto-mode `babysit.md` |
+| PR review threads, conflicts or red CI | poteto-mode `babysit.md`; wait for CI with one blocking watch command, never a sleep loop or repeated polls |
 | Deploy, merge or other operator task | No playbook: follow the brief's delivery contract |
 | Review or risk | `code-review`; `blast-radius` |
 | PR body | `pr` |
