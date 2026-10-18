@@ -924,6 +924,41 @@ export function crewThreadTitle(task: string, shape: Shape, crewId: string, requ
 // line can ever name the raw script — the consuming form becomes
 // `bb firstmate wake --ack-through <N> --recovery-generation <G>` and the present form
 // becomes `re-run bb firstmate wake …`.
+// Owner, 18 Oct (Q13): the instruction text travels in the crew's wake, so the crew runs no inbox read or
+// acknowledgement for it (485 crew turns a day began with an inbox read). The native record is still written
+// and Firstmate files it under handled/ once the wake is delivered, which keeps it for audit.
+export const INBOX_WAKE_PREFIX = "Firstmate instruction for crew";
+const INBOX_WAKE_MAX_CHARS = 12_000;
+/** The crew wake that carries each record's text, in record order; null past the size cap (the inbox pointer is used). */
+export function inboxWakeText(input: { crewId: string; records: ReadonlyArray<{ id: string; body: string }> }): string | null {
+  const { records } = input;
+  if (records.length === 0 || records.reduce((n, r) => n + r.body.length, 0) > INBOX_WAKE_MAX_CHARS) return null;
+  const which = records.length === 1 ? "it" : "them";
+  const head = `${INBOX_WAKE_PREFIX} ${input.crewId} (${records.map((r) => r.id).join(", ")}). Firstmate has filed ${which} as handled in your inbox, so do not run fm-inbox-take or an acknowledgement for ${which}; act on the text below.`;
+  return [head, ...records.map((r) => records.length === 1 ? r.body : `--- ${r.id}\n${r.body}`)].join("\n\n");
+}
+
+/**
+ * Native "waiting crews spend no turns" (config/wait-no-turns) for one crew only (owner, 18 Oct: canary one crew,
+ * then the fleet). Native reads its config from FM_CONFIG_OVERRIDE when set, so the crew gets its own config
+ * directory: a link to every home config entry plus the wait-no-turns flag. Rebuilt on every use, so a later
+ * home config change reaches it. The home config itself is never changed.
+ */
+export function waitNoTurnsConfigScript(fmHome: string, crewId: string): string {
+  const dir = `${fmHome}/state/${crewId}.wait-config`;
+  return [
+    `__fm_wnt=${shQuote(dir)}`,
+    `rm -rf "$__fm_wnt" && mkdir -p "$__fm_wnt" || exit 1`,
+    `for __fm_entry in ${shQuote(`${fmHome}/config`)}/* ${shQuote(`${fmHome}/config`)}/.[!.]*; do [ -e "$__fm_entry" ] && ln -s "$__fm_entry" "$__fm_wnt/"; done`,
+    `rm -f "$__fm_wnt/wait-no-turns" && : > "$__fm_wnt/wait-no-turns"`,
+    `export FM_CONFIG_OVERRIDE="$__fm_wnt"`,
+  ].join("\n");
+}
+/** True when the waitNoTurnsCrews setting (comma or space separated crew ids) names this crew. */
+export function waitNoTurnsFor(setting: unknown, crewId: string): boolean {
+  return typeof setting === "string" && setting.split(/[\s,]+/).includes(crewId);
+}
+
 export function rewriteWakeAckLine(out: string): string {
   return out.replace(/bin\/fm-wake-drain\.sh/g, "bb firstmate wake");
 }
@@ -935,6 +970,22 @@ export function rewriteWakeAckLine(out: string): string {
 // reach this hook: core delivers them through its parent-system-message path,
 // which skips message.dispatch. notifyCaptainOnce handles that overlap instead.
 const CREW_PING_RE = /^\s*(?:\[bb system\]\s*)?@thread:[A-Za-z0-9_-]+ (?:completed|failed|was interrupted|interrupted|needs attention)\b/i;
+/**
+ * The crews a BB child-outcome ping names, read only from BB's own template header (never from the crew's
+ * output that follows it): one `@thread:<id> completed:` head, or a "Child thread updates:" list. Null for
+ * anything else. `allCompleted` is false once any outcome failed or was interrupted.
+ */
+export function bbChildPingCrews(text: string): { threadIds: string[]; allCompleted: boolean } | null {
+  const body = text.replace(/^\s*\[bb system\]\s*/, "");
+  if (body.length === text.length) return null;
+  const single = /^@thread:([A-Za-z0-9_-]+) (completed|failed|was interrupted)\b/.exec(body);
+  if (single) return { threadIds: [single[1]!], allCompleted: single[2] === "completed" };
+  if (!body.startsWith("Child thread updates:")) return null;
+  const lines = [...body.matchAll(/^- @thread:([A-Za-z0-9_-]+) (.+)$/gm)];
+  if (lines.length === 0) return null;
+  return { threadIds: lines.map((m) => m[1]!), allCompleted: lines.every((m) => m[2]!.startsWith("completed")) };
+}
+
 export function crewPingHoldDecision(input: {
   attempt: string;
   initiator: string;
@@ -961,8 +1012,11 @@ export function doorbellSupersededByBbPing(input: {
   captainStatus: string | null;
   captainTurnStartedAt: number | null;
   crewFinishedAt: number;
+  crewParentNotifications?: string | null;
 }): boolean {
   if (!input.durable) return false;
+  // A crew BB pings only when stuck (BB 0.46.2 parentNotifications) gets no BB ping for a finished turn.
+  if (input.crewParentNotifications != null && input.crewParentNotifications !== "auto") return false;
   if (input.kind !== "idle" && input.kind !== "review" && input.kind !== "error") return false;
   if (input.captainStatus !== "idle") return false;
   return input.captainTurnStartedAt !== null && input.captainTurnStartedAt >= input.crewFinishedAt;
@@ -981,9 +1035,13 @@ export function bbPingCarriesOutcome(input: {
   captainThreadId: string;
   crewParentThreadId: string | null | undefined;
   crewOriginKind: string | null | undefined;
+  crewParentNotifications?: string | null;
 }): boolean {
   if (!input.durable) return false;
   if (input.kind !== "idle" && input.kind !== "review" && input.kind !== "error") return false;
+  // BB 0.46.2 parentNotifications: `stuck` pings failures only, `off` pings nothing.
+  const notify = input.crewParentNotifications ?? "auto";
+  if (notify === "off" || (notify === "stuck" && input.kind !== "error")) return false;
   return input.crewParentThreadId === input.captainThreadId && input.crewOriginKind == null;
 }
 
@@ -1156,12 +1214,12 @@ export function wakeAckFromOutput(out: string): { ackThrough: number; recoveryGe
   return m ? { ackThrough: Number(m[1]), recoveryGeneration: m[2]! } : null;
 }
 
-// The token budget is a floor, not evidence of pressure on a larger model.
 /**
- * Compact once usage passes `ratio` of the window (and at least `budget` tokens). A provider
- * threshold only wins when it is lower: a 1M-token window that the provider compacts at 96.7%
- * otherwise rereads ~800k tokens on every captain wake. Estimated readings count; the caller
- * never retries an unchanged reading and waits `cooldownMs` between compactions.
+ * Compact once usage passes `budget` tokens, or `ratio` of the window when that comes first (a
+ * small window). Every call rereads the whole context, so a 1M window compacted only near full
+ * rereads 400k-800k tokens per wake (owner, 18 Oct: captains at 200k, crews at 250k). A provider
+ * threshold only wins when it is lower. Estimated readings count; the caller never retries an
+ * unchanged reading and waits `cooldownMs` between compactions.
  */
 export function captainCompactDue(input: {
   usedTokens: number | null;
@@ -1178,7 +1236,7 @@ export function captainCompactDue(input: {
   if (!Number.isFinite(input.ratio) || !(input.ratio > 0) || input.ratio > 1) return false;
   const { usedTokens, modelContextWindow } = input;
   if (usedTokens === null || modelContextWindow === null || !Number.isFinite(usedTokens) || !Number.isFinite(modelContextWindow)) return false;
-  const trigger = Math.max(input.budget, modelContextWindow * input.ratio);
+  const trigger = Math.min(input.budget, modelContextWindow * input.ratio);
   if (modelContextWindow <= 0 || usedTokens > modelContextWindow || usedTokens < trigger) return false;
   const provider = input.providerThreshold;
   if (provider !== null && Number.isFinite(provider) && provider > 0 && provider <= trigger) return false;
@@ -1918,20 +1976,36 @@ export default async function plugin(bb: BbPluginApi) {
       label: "Maximum automatic turn-end re-rings for unchanged wake contents; new contents reset the budget.",
       default: 3,
     },
+    waitNoTurnsCrews: {
+      type: "string",
+      label: "Crew ids (comma separated) that start with native \"waiting crews spend no turns\" (config/wait-no-turns) for their brief and spawn, under real transport. For a canary: dispatch with that taskId. For the whole fleet, create config/wait-no-turns in the captain home instead and clear this.",
+      default: "",
+    },
+    crewParentNotifications: {
+      type: "select",
+      label: "Which crew turn ends BB itself reports to the captain (needs BB 0.46.2 or later; an older BB refuses or ignores it). auto: every turn end, BB's default. stuck: only failures, interruptions and questions; Firstmate's own wake reports a finished turn, and skips a WAITING one. Applies to crews started after the change.",
+      options: ["auto", "stuck"],
+      default: "auto",
+    },
     captainWakeBatchMs: {
       type: "number",
       label: "Coalesce plugin-owned durable routine wakes for this many milliseconds (0 = immediate, maximum 5000). Decisions and failures remain immediate. BB core child messages are outside this setting.",
-      default: 1500,
+      default: 5000,
     },
     captainCompactAtTokens: {
       type: "number",
-      label: "Minimum tokens for automatic compaction of an idle captain or crew. Also requires the context share below. A provider threshold wins only when it is lower. Unchanged readings are not retried; minimum interval is 20 minutes. 0 = off.",
+      label: "Compact an idle captain once its context reaches this many tokens. A provider threshold wins only when it is lower. Unchanged readings are not retried; minimum interval is 20 minutes. 0 = off.",
       default: 200000,
+    },
+    crewCompactAtTokens: {
+      type: "number",
+      label: "Compact an idle crew between turns once its context reaches this many tokens; a crew is never compacted mid-turn. Same rules as the captain setting. 0 = off.",
+      default: 250000,
     },
     captainCompactAtRatio: {
       type: "number",
-      label: "Compact an idle captain or crew once its context is this full (0.1 to 1, default 0.6).",
-      default: 0.6,
+      label: "Compact an idle captain or crew earlier when its context is this full and that comes before the token setting, as on a small window (0.1 to 1, default 0.9).",
+      default: 0.9,
     },
     defaultProvider: {
       type: "string",
@@ -3043,15 +3117,18 @@ export default async function plugin(bb: BbPluginApi) {
       if (evicted.length > 0) await publishFleet();
       return;
     }
+    let crewNotifications: string | null = null;
     if (durable && (kind === "idle" || kind === "review" || kind === "error")) {
       let crewThread: Record<string, unknown> | null = null;
       try { crewThread = asRecord(await bb.sdk.threads.get({ threadId: crew.threadId })); } catch { /* unknown: ring */ }
+      crewNotifications = crewThread !== null && typeof crewThread["parentNotifications"] === "string" ? crewThread["parentNotifications"] : null;
       if (crewThread !== null && bbPingCarriesOutcome({
         kind,
         durable,
         captainThreadId: parentThreadId,
         crewParentThreadId: typeof crewThread["parentThreadId"] === "string" ? crewThread["parentThreadId"] : null,
         crewOriginKind: typeof crewThread["originKind"] === "string" ? crewThread["originKind"] : null,
+        crewParentNotifications: crewNotifications,
       // BB's ping into a rate-limited or errored captain fails and is gone; only a held
       // wake brings the report back once the captain is available again.
       }) && !(await captainHoldState(parentThreadId, signal)).hold) {
@@ -3068,6 +3145,7 @@ export default async function plugin(bb: BbPluginApi) {
       captainStatus,
       captainTurnStartedAt: captainTurnStartedAt.get(parentThreadId) ?? null,
       crewFinishedAt,
+      crewParentNotifications: crewNotifications,
     })) {
       bb.log.info(`doorbell skipped crew=${crew.id} captain=${parentThreadId}: BB's completion ping already woke the captain; durable wake kept`);
       await publishFleet();
@@ -3697,9 +3775,11 @@ export default async function plugin(bb: BbPluginApi) {
       "import json,sys;p=sys.argv[1];d=json.load(open(sys.argv[2]));" +
       "s=open(p).read();s=s.replace('{TASK}',d['intent']).replace('{FIRSTMATE_SPEC}',d['spec']);" +
       "open(p,'w').write(s)";
+    const waitNoTurns = waitNoTurnsFor((await settings.get()).waitNoTurnsCrews, crew.id);
     const script = [
       `export FM_HOME=${shQuote(fmHome)}`,
       `export FM_ROOT=${shQuote(fmHome)}`,
+      ...(waitNoTurns ? [waitNoTurnsConfigScript(fmHome, crew.id)] : []),
       fmBinDirAssign(fmHome),
       fmMirrorStaleGuard(fmHome),
       `[ -f ${briefRef} ] || exit 0`,
@@ -3952,6 +4032,8 @@ export default async function plugin(bb: BbPluginApi) {
     };
     if (crew.providerId !== null && crew.providerId !== "") env.FM_BB_PROVIDER = crew.providerId;
     if (capped !== undefined) env.FM_BB_PERMISSION_MODE = capped;
+    // The canary crew's config directory, built by publishFmBrief above.
+    if (waitNoTurnsFor((await settings.get()).waitNoTurnsCrews, crew.id)) env.FM_CONFIG_OVERRIDE = `${fmHome}/state/${crew.id}.wait-config`;
     let spawnFailed = false;
     let spawnFailure = "Native spawn returned without a recorded worker.";
     // fm-spawn ran to its end and said no (a number), or never ran (the home's spawn gate).
@@ -4717,7 +4799,8 @@ export default async function plugin(bb: BbPluginApi) {
     record = await reconcileLaunch(record);
     const suppliedContract=flagStr(flags,"delivery-requirement");
     if (suppliedContract && suppliedContract !== recoveredContract({},record)) throw new Error("Creation retry cannot change the original delivery contract.");
-    const created = await launches.create(key, () => bb.sdk.threads.spawn({ projectId, parentThreadId:owner || undefined,
+    const notify = shape === "secondmate" ? {} : await crewSpawnNotifications();
+    const created = await launches.create(key, () => bb.sdk.threads.spawn({ projectId, parentThreadId:owner || undefined, ...notify,
       environment: shape === "secondmate" || flags.has("shared-env")
         ? { type:"host",hostId,workspace:{ type:"unmanaged",path } }
         : { type:"host",hostId,workspace:{ type:"managed-worktree",baseBranch:{ kind:"default" } } },
@@ -6174,7 +6257,9 @@ export default async function plugin(bb: BbPluginApi) {
       environment=source.environmentId ? {type:"reuse",environmentId:source.environmentId} : {type:"host",hostId,workspace:{type:"unmanaged",path:source.checkout}};
     }
     const key = launchKey(input.projectId, input.parentThreadId ?? "", crew.nativeHome ?? "", crew.id);
+    const notify = await crewSpawnNotifications();
     const created = await launches.create(key, () => bb.sdk.threads.spawn({
+      ...notify,
       projectId: input.projectId,
       environment,
       prompt: crewPrompt({
@@ -6454,7 +6539,9 @@ export default async function plugin(bb: BbPluginApi) {
         reservation=launches.update(key,{replacement:{...reservation.replacement!,archived:true}});
       }
     }
+    const notify = await crewSpawnNotifications();
     const replacement = await launches.create(key, () => bb.sdk.threads.spawn({
+      ...notify,
       projectId: crew.projectId,
       environment: { type: "reuse", environmentId: envId },
       prompt:reservation.replacement!.prompt,
@@ -6503,6 +6590,11 @@ export default async function plugin(bb: BbPluginApi) {
     await publishFleet();
     launches.update(key,{state:reusedEnvironment.status === "ready" && reusedEnvironment.path ? "running" : "provisioning",replacement:{...launches.get(key)!.replacement!,published:true}});
     return next;
+  }
+
+  /** BB 0.46.2 `parentNotifications` for a new crew thread: only when crewParentNotifications asks for it. */
+  async function crewSpawnNotifications(): Promise<object> {
+    return (await settings.get()).crewParentNotifications === "stuck" ? { parentNotifications: "stuck" } : {};
   }
 
   // Write a captain→crew steer as a durable, sequenced steering-inbox record via the
@@ -6562,6 +6654,9 @@ export default async function plugin(bb: BbPluginApi) {
   type InboxDelivery = {
     threadId: string; hostId: string; home: string; crewId: string; senderThreadId?: string;
     doorbell: string; queueIds: string[]; records: string[]; retry: boolean;
+    // Record texts, so a queued wake can carry every pending one; and the records whose text the last
+    // sent wake carried, which Firstmate files as handled once that wake left the queue.
+    bodies?: Record<string, string>; inlined?: string[];
     // Set when the delivery can never land; the sweep skips it from then on.
     closed?: string;
   };
@@ -6585,7 +6680,23 @@ export default async function plugin(bb: BbPluginApi) {
     const rows = await raceAbort(bb.sdk.threads.queuedMessages.list({ threadId: delivery.threadId, signal }), signal, STUCK_HOST_CALL_MS);
     return rows.filter(row => delivery.queueIds.includes(row.id)
       && row.content.length === 1 && row.content[0]?.type === "text"
-      && row.content[0].text === delivery.doorbell);
+      && (row.content[0].text === delivery.doorbell || row.content[0].text.startsWith(INBOX_WAKE_PREFIX)));
+  }
+
+  /**
+   * Files records whose text a delivered wake carried under handled/ (link, then unlink, never overwriting), as
+   * the worker's own acknowledgement would. Returns the ids now filed; an unreadable inbox files nothing.
+   */
+  async function fileInlinedRecords(delivery: InboxDelivery, ids: readonly string[], signal?: AbortSignal): Promise<string[]> {
+    const names = ids.filter((id) => /^\d+\.msg$/.test(id));
+    if (names.length === 0) return [];
+    const script = "import os,sys\nd=sys.argv[1]; h=os.path.join(d,'handled'); os.makedirs(h,exist_ok=True)\nfor n in sys.argv[2:]:\n  s=os.path.join(d,n); t=os.path.join(h,n)\n  if os.path.isfile(s) and not os.path.lexists(t): os.link(s,t)\n  if os.path.isfile(s) and os.path.isfile(t) and os.path.samefile(s,t): os.unlink(s)\n  if os.path.isfile(t) and not os.path.lexists(s): print(n)";
+    const dir = `${delivery.home}/state/${delivery.crewId}.inbox`;
+    const res = await runOnHost(delivery.hostId, `python3 -c ${shQuote(script)} ${shQuote(dir)} ${names.map(shQuote).join(" ")}`, STUCK_HOST_CALL_MS, signal);
+    if (res.exitCode !== 0) { bb.log.warn(`inbox filing crew=${delivery.crewId} exit=${res.exitCode}`); return []; }
+    const filed = res.output.split(/\s+/).filter((n) => names.includes(n));
+    if (filed.length > 0) bb.log.info(`inbox records ${filed.join(", ")} of crew ${delivery.crewId} filed as handled: their text was in the delivered wake`);
+    return filed;
   }
 
   // The native worker's move into handled/ is the only acknowledgement. This
@@ -6603,7 +6714,14 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function reconcileOpenInboxDelivery(key: string, delivery: InboxDelivery, signal?: AbortSignal): Promise<void> {
-    const rows = await inboxQueueRows(delivery, signal);
+    let rows = await inboxQueueRows(delivery, signal);
+    // A queued wake that carried the text has left the queue: BB delivered it into a crew turn.
+    if (rows.length === 0 && !delivery.retry && (delivery.inlined ?? []).length > 0) {
+      const filed = await fileInlinedRecords(delivery, delivery.inlined!, signal);
+      delivery.inlined = (delivery.inlined ?? []).filter((id) => !filed.includes(id));
+      await bb.storage.kv.set(key, delivery);
+      rows = await inboxQueueRows(delivery, signal);
+    }
     const dir = `${delivery.home}/state/${delivery.crewId}.inbox`;
     const probeScript = "import os,sys,json; d=sys.argv[1]; entries=list(os.scandir(d)); records=json.loads(sys.argv[2]); pending=any(e.name.endswith('.msg') for e in entries); acknowledged=bool(records) and all(os.path.isfile(os.path.join(d,'handled',r)) for r in records); print('pending' if pending else 'empty' if acknowledged else 'unconfirmed')";
     const probe = await runOnHost(delivery.hostId,
@@ -6644,22 +6762,33 @@ export default async function plugin(bb: BbPluginApi) {
       const written = await writeInboxRecord(hostId, home, crew.id, message, queue);
       if (!written) throw new Error("Firstmate inbox write failed; instruction delivery is unconfirmed. Inspect the inbox before retrying.");
       const { record } = written;
+      const recordId = record.slice(record.lastIndexOf("/") + 1);
       // BB-DIVERGE: the native doorbell tells the worker to hand-roll list/read/mv.
       // Name the helper that performs those steps. The native prefix stays so a
-      // worker that only knows the old line can still follow it.
-      const doorbell = `${written.doorbell} On BB, run FM_HOME=${home} ${home}/bin-bb/fm-inbox-take.sh ${crew.id} and, after you act, run the helper's printed acknowledgement command with only the displayed immutable message IDs you handled (--ack 001.msg [002.msg ...]). Bare --ack refuses; new arrivals remain pending.`;
+      // worker that only knows the old line can still follow it. It is the fallback
+      // when the text cannot travel in the wake itself.
+      const pointer = `${written.doorbell} On BB, run FM_HOME=${home} ${home}/bin-bb/fm-inbox-take.sh ${crew.id} and, after you act, run the helper's printed acknowledgement command with only the displayed immutable message IDs you handled (--ack 001.msg [002.msg ...]). Bare --ack refuses; new arrivals remain pending.`;
       const previous = await bb.storage.kv.get<InboxDelivery>(key);
       const delivery: InboxDelivery = previous && previous.home === home && previous.crewId === crew.id
-        ? previous : { threadId: crew.threadId, hostId, home, crewId: crew.id, senderThreadId: crew.parentThreadId ?? undefined, doorbell, queueIds: [], records: [], retry: false };
+        ? previous : { threadId: crew.threadId, hostId, home, crewId: crew.id, senderThreadId: crew.parentThreadId ?? undefined, doorbell: pointer, queueIds: [], records: [], retry: false };
+      delivery.records = [...(delivery.records ?? []), recordId];
+      delivery.bodies = { ...(delivery.bodies ?? {}), [recordId]: message.slice(0, MAX_TASK) };
+      // A queued wake carries every text still waiting in the queue, so one wake replaces the earlier ones.
+      const superseded = queue ? await inboxQueueRows(delivery) : [];
+      const carried = queue ? [...new Set([...(delivery.inlined ?? []), recordId])] : [recordId];
+      const inline = carried.every((id) => delivery.bodies![id] !== undefined)
+        ? inboxWakeText({ crewId: crew.id, records: carried.map((id) => ({ id, body: delivery.bodies![id]! })) })
+        : null;
+      const doorbell = inline ?? pointer;
       delivery.doorbell = doorbell;
-      delivery.records = [...(delivery.records ?? []), record.slice(record.lastIndexOf("/") + 1)];
+      delivery.inlined = inline === null ? [] : carried;
       // Persist before sending: reload or a failed send can retry the notification.
       delivery.retry = true;
       delete delivery.closed;
       await bb.storage.kv.set(key, delivery);
       const wasActive = queue ? false : await crewInTurn(crew);
       try {
-        if (queue && (await inboxQueueRows(delivery)).length > 0) {
+        if (inline === null && queue && superseded.length > 0) {
           delivery.retry = false;
           await bb.storage.kv.set(key, delivery);
           return `Queued for crew ${crew.id} (native inbox; existing notification covers this record)`;
@@ -6669,6 +6798,10 @@ export default async function plugin(bb: BbPluginApi) {
           await bb.storage.kv.set(key, delivery);
           return `Resent the failed steer to crew ${crew.id}`;
         }
+        for (const row of superseded) {
+          await bb.sdk.threads.queuedMessages.delete({ threadId: crew.threadId, queuedMessageId: row.id });
+          delivery.queueIds = delivery.queueIds.filter((id) => id !== row.id);
+        }
         const result = await withSessionRepair(crew.threadId, () => bb.sdk.threads.send({
           threadId: crew.threadId, mode: queue ? "queue-if-active" : "steer", senderThreadId: crew.parentThreadId ?? undefined,
           input: [{ type: "text", text: doorbell, mentions: [] }],
@@ -6676,16 +6809,23 @@ export default async function plugin(bb: BbPluginApi) {
         const row = asRecord(asRecord(result)["queuedMessage"]);
         if (typeof row["id"] === "string") delivery.queueIds.push(row["id"]);
         delivery.retry = false;
+        const deferred = asRecord(result)["delivery"] === "queued" || queue;
+        // The steer reached a crew turn with the text in it: the record is read.
+        if (!deferred && inline !== null) {
+          const filed = await fileInlinedRecords(delivery, carried);
+          delivery.inlined = (delivery.inlined ?? []).filter((id) => !filed.includes(id));
+        }
         await bb.storage.kv.set(key, delivery);
         if (asRecord(result)["delivery"] === "queued" && !queue) {
           return `Recorded instruction for crew ${crew.id} (native inbox) but its notification is NOT delivered: BB deferred the steer behind earlier queued input, so no turn started. Inspect it: bb thread queue list ${crew.threadId}`;
         }
-        if (asRecord(result)["delivery"] === "queued" || queue) {
-          return `Queued for crew ${crew.id} (native inbox; worker acknowledgement pending)`;
+        const ack = inline === null ? "native inbox acknowledgement pending" : "text in the wake; Firstmate files the record";
+        if (deferred) {
+          return `Queued for crew ${crew.id} (native inbox; ${inline === null ? "worker acknowledgement pending" : "text in the wake; filed once it is delivered"})`;
         }
         return wasActive
-          ? `Steered into crew ${crew.id}'s running turn (native inbox notification; worker acknowledgement pending)`
-          : `Told crew ${crew.id} (started a turn; native inbox acknowledgement pending)`;
+          ? `Steered into crew ${crew.id}'s running turn (${ack})`
+          : `Told crew ${crew.id} (started a turn; ${ack})`;
       } catch (error) {
         if (isArchivedThreadError(error)) {
           await closeInboxDelivery(key, delivery);
@@ -14927,6 +15067,41 @@ export default async function plugin(bb: BbPluginApi) {
     if (answered > 0) await refreshOwnerBoard();
   }
 
+  /**
+   * BB's completion ping for crews that are all recorded as WAITING (handleWaitingYield, from the crew contract's
+   * outcome line) is dropped before it wakes the captain: Firstmate already resumes those crews itself. Only BB's
+   * template header is read, and only a queued ping reaches this hook (BB 0.46.1 delivers one to an idle or running
+   * captain directly). Each drop is logged and kept in `waiting-pings-dropped`; the rejected row is then removed.
+   */
+  const WAITING_PINGS_DROPPED_KEY = "waiting-pings-dropped";
+  async function dropWaitingPing(captainThreadId: string, text: string): Promise<{ action: "reject"; message: string } | null> {
+    const ping = bbChildPingCrews(text);
+    if (ping === null || !ping.allCompleted) return null;
+    const crews = await readCrews();
+    const waiting = await readWaiting();
+    const named: Crew[] = [];
+    for (const threadId of ping.threadIds) {
+      const crew = crews.find((c) => c.threadId === threadId && c.parentThreadId === captainThreadId);
+      if (crew === undefined || !(await isCrewWaiting(crew, waiting))) return null;
+      named.push(crew);
+    }
+    const ids = named.map((c) => c.id);
+    const log = await bb.storage.kv.get<Array<{ at: number; captain: string; crews: string[] }>>(WAITING_PINGS_DROPPED_KEY) ?? [];
+    await bb.storage.kv.set(WAITING_PINGS_DROPPED_KEY, [...log, { at: Date.now(), captain: captainThreadId, crews: ids }].slice(-200));
+    bb.log.info(`dropped BB's completion ping to captain ${captainThreadId}: crew(s) ${ids.join(", ")} only reported WAITING; Firstmate resumes them`);
+    setTimeout(() => { void dropRejectedCaptainRow(captainThreadId, text).catch(() => {}); }, 5_000).unref?.();
+    return { action: "reject", message: `Firstmate: crew ${ids.join(", ")} only reported WAITING; Firstmate resumes it, so this ping did not wake the captain.` };
+  }
+  async function dropRejectedCaptainRow(captainThreadId: string, text: string): Promise<void> {
+    const rows = await bb.sdk.threads.queuedMessages.list({ threadId: captainThreadId });
+    for (const row of rows) {
+      const failed = typeof row.failureReason === "string" && row.failureReason !== "";
+      if (failed && row.content.length === 1 && row.content[0]?.type === "text" && row.content[0].text === text) {
+        await bb.sdk.threads.queuedMessages.delete({ threadId: captainThreadId, queuedMessageId: row.id });
+      }
+    }
+  }
+
   // Threaded replies off, or no sender: an ack does not apply, and asking again on every dispatch would only repeat the RPC.
   const ackNotApplicable = new Set<string>();
   try {
@@ -14950,6 +15125,10 @@ export default async function plugin(bb: BbPluginApi) {
             }
           }
           return { action: "proceed" };
+        }
+        if (String(context.initiator) === "system" && (context.queuedMessages ?? []).length <= 1) {
+          const dropped = await dropWaitingPing(threadId, context.input.text);
+          if (dropped) return dropped;
         }
         const sender = typeof context.senderThreadId === "string" && context.senderThreadId !== "mixed" ? context.senderThreadId : null;
         const senderIsCrew = sender !== null && (await readCrews()).some((c) => c.threadId === sender);
@@ -15098,16 +15277,16 @@ export default async function plugin(bb: BbPluginApi) {
 
   const CAPTAIN_COMPACT_COOLDOWN_MS = 20 * 60_000;
   const compactionChecks = new Set<string>();
-  async function maybeCompactThread(threadId: string, stampKey: string, signal?: AbortSignal): Promise<void> {
+  async function maybeCompactThread(threadId: string, stampKey: string, budgetSetting: "captainCompactAtTokens" | "crewCompactAtTokens", signal?: AbortSignal): Promise<void> {
     if (compactionChecks.has(threadId)) return;
     compactionChecks.add(threadId);
-    try { await checkThreadCompaction(threadId, stampKey, signal); }
+    try { await checkThreadCompaction(threadId, stampKey, budgetSetting, signal); }
     finally { compactionChecks.delete(threadId); }
   }
 
-  async function checkThreadCompaction(threadId: string, stampKey: string, signal?: AbortSignal): Promise<void> {
+  async function checkThreadCompaction(threadId: string, stampKey: string, budgetSetting: "captainCompactAtTokens" | "crewCompactAtTokens", signal?: AbortSignal): Promise<void> {
     const current = await settings.get();
-    const budget = Number(current.captainCompactAtTokens);
+    const budget = Number(current[budgetSetting]);
     const ratio = Number(current.captainCompactAtRatio);
     if (!(budget > 0)) return;
     const key = stampKey;
@@ -15148,11 +15327,11 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function maybeCompactCaptain(threadId: string, signal?: AbortSignal): Promise<void> {
     if (!knownCaptains.has(threadId)) return;
-    await maybeCompactThread(threadId, `captain-compacted-at:${threadId}`, signal);
+    await maybeCompactThread(threadId, `captain-compacted-at:${threadId}`, "captainCompactAtTokens", signal);
   }
 
   async function maybeCompactCrew(threadId: string, signal?: AbortSignal): Promise<void> {
-    await maybeCompactThread(threadId, `crew-compacted-at:${threadId}`, signal);
+    await maybeCompactThread(threadId, `crew-compacted-at:${threadId}`, "crewCompactAtTokens", signal);
   }
 
   // The thread.idle trigger alone never reaches a captain that is already idle past the
