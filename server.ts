@@ -5635,9 +5635,19 @@ export default async function plugin(bb: BbPluginApi) {
   /**
    * The captain is told once of each card the owner skipped, so it neither waits on it nor acts on it.
    * A notice is marked told only after the send; one that failed is sent at the next Skip request or the
-   * captain's next idle, while the card is still skipped.
+   * captain's next idle, while the card is still skipped. One drain per captain at a time: an overlapping
+   * call (a repeated Skip request, the idle drain) waits for it and then finds nothing left to tell.
    */
-  async function tellSkippedAsks(captainThreadId: string): Promise<void> {
+  const skipNoticeChains = new Map<string, Promise<void>>();
+  function tellSkippedAsks(captainThreadId: string): Promise<void> {
+    const next = (skipNoticeChains.get(captainThreadId) ?? Promise.resolve()).then(() => drainSkipNotices(captainThreadId));
+    const settled = next.catch(() => {});
+    skipNoticeChains.set(captainThreadId, settled);
+    void settled.then(() => { if (skipNoticeChains.get(captainThreadId) === settled) skipNoticeChains.delete(captainThreadId); });
+    return next;
+  }
+
+  async function drainSkipNotices(captainThreadId: string): Promise<void> {
     const untold = ownerAsks.untoldSkips(captainThreadId, Date.now());
     if (untold.length === 0) return;
     const byTime = new Map<number, string[]>();
