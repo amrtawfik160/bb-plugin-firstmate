@@ -44,6 +44,12 @@
       "proofSurface": "web"
     },
     {
+      "name": "Runants",
+      "repos": ["hazw80801/runants"],
+      "bbProjects": ["runants", "Runants"],
+      "proofSurface": "web"
+    },
+    {
       "name": "Canary",
       "repos": ["*/fm-canary-*"],
       "bbProjects": ["fm-canary", "fm-canary-34"],

@@ -96,7 +96,7 @@ import { crewPipeline, crewPlaybook, crewSkillBlock, crewSkillRoot, notVerifiedN
 import { CREW_ROLES, crewExecution } from "./owner/crew-roles.ts";
 import { DISPATCH_VERSION, PROOF_STEP, pipelineGates, proofStep } from "./owner/pipelines.ts";
 import { changeReach, type Reach } from "./owner/reach.ts";
-import { hostCanDrive, PROOF_SURFACES, projectBriefLines, projectForName, projectForRepo, repoOf as prRepoOf, surfaceRefusal, surfaceWords } from "./owner/projects.ts";
+import { hostCanDrive, PROOF_SURFACES, projectBriefLines, projectForName, projectForRepo, repoOf as prRepoOf, surfaceRefusal, surfaceWords, unlistedRefusal } from "./owner/projects.ts";
 import { createReleaseReadbacks, type ReleaseSource } from "./lib/release-readback.ts";
 import { addCorrection, CAPTAIN_FILE, CORRECTION_RULE, correctionBrief, fixCorrection, LEDGER_FILE, readLedger, within } from "./owner/corrections.ts";
 import { renderScorecard, type ScorecardData } from "./owner/scorecard.ts";
@@ -8016,11 +8016,26 @@ export default async function plugin(bb: BbPluginApi) {
     if (build === "" || link === "" || check === "") throw new Error("A device proof card needs build (the build id), link (the TestFlight or OTA link) and check (what the owner checks).");
     const captain = r.owner ?? crew.parentThreadId ?? "";
     if (captain === "") throw new Error(`${r.id} has no captain to show the card to.`);
+    // One open card per PR: the same build again returns it; a new build replaces it.
+    const openProofs: Array<{ ask: OwnerAsk; proof: DeviceProof }> = [];
+    for (const open of ownerAsks.listOpen(captain)) {
+      const bound = await bb.storage.kv.get<DeviceProof>(`${DEVICE_PROOF_PREFIX}${open.id}`);
+      if (bound !== undefined && bound.pr === r.id) openProofs.push({ ask: open, proof: bound });
+    }
+    const same = openProofs.find((item) => item.proof.head === head && item.proof.build === build);
+    if (same !== undefined) return `Device proof card ${same.ask.id} is already open for ${r.id} at ${head.slice(0, 7)}: build ${build}. Wait for the owner's tap.`;
+    for (const older of openProofs) {
+      const resolution = `Replaced by build ${build}`;
+      if (ownerAsks.resolve(older.ask.id, captain, "cancelled", resolution, Date.now()) === undefined) continue;
+      await bb.storage.kv.delete(`${DEVICE_PROOF_PREFIX}${older.ask.id}`);
+      try { await bb.sdk.plugins.callRpc({ pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "editAsk", input: { askId: older.ask.id, resolution, at: Date.now() }, outputSchema: z.object({ ok: z.boolean() }) }); }
+      catch (error) { bb.log.warn(`device proof ${older.ask.id} not marked replaced in Telegram: ${String(error)}`); }
+    }
     const device = project.proofSurface === "iphone" ? "your iPhone" : surfaceWords(project.proofSurface);
     const ask = ownerAsks.create({
       captain, kind: "approval", text: `${project.name}: does build ${build} work on ${device}? ${clip(check, 300)}`,
       impact: `Test build ${build}: ${link}`, options: [{ label: "Works", value: "works" }, { label: "Does not work", value: "broken" }],
-      irreversible: true, sourceRef: `proof:${r.id}:${head}`, createdAt: Date.now(),
+      irreversible: true, sourceRef: `proof:${r.id}:${head}:${build}:${Date.now()}`, createdAt: Date.now(),
     });
     const proof: DeviceProof = { captain, pr: r.id, head, build, crewId: crew.id, surface: project.proofSurface };
     await bb.storage.kv.set(`${DEVICE_PROOF_PREFIX}${ask.id}`, proof);
@@ -8033,13 +8048,28 @@ export default async function plugin(bb: BbPluginApi) {
     ].join("\n");
   }
 
+  /** What the Telegram connector recorded the owner himself answering on a card: "works", "other", "none" or "unreadable". */
+  async function ownerTapped(askId: string): Promise<"works" | "other" | "none" | "unreadable"> {
+    try {
+      const read = z.object({ answer: z.string().nullable() }).parse(await bb.sdk.plugins.callRpc({ pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "ownerAnswer", input: { askId }, outputSchema: z.object({ answer: z.string().nullable() }) }));
+      return read.answer === null ? "none" : read.answer.trim().toLowerCase() === "works" ? "works" : "other";
+    } catch (error) {
+      bb.log.warn(`device proof ${askId}: owner answer could not be read from Telegram: ${String(error)}`);
+      return "unreadable";
+    }
+  }
+
   /** The owner answered an ask by tap or reply. A device proof card's Works records his proof. */
   async function ownerAnsweredAsk(askId: string, resolution: string): Promise<void> {
     const proof = await bb.storage.kv.get<DeviceProof>(`${DEVICE_PROOF_PREFIX}${askId}`);
     if (proof === undefined) return;
     await bb.storage.kv.delete(`${DEVICE_PROOF_PREFIX}${askId}`);
     const crew = await findCrew(proof.crewId);
-    const works = /^works\b/i.test(resolution.trim());
+    // Only the card's exact Works choice is proof, and only when Telegram recorded it from the owner
+    // himself: a plain RPC call or a captain correction proves nothing (checker FF2-verdict-1).
+    const chose = resolution.trim().toLowerCase() === "works";
+    const confirmed = chose ? await ownerTapped(askId) : null;
+    const works = chose && confirmed === "works";
     let note: string;
     if (works) {
       try {
@@ -8051,6 +8081,8 @@ export default async function plugin(bb: BbPluginApi) {
       } catch (error) {
         note = `The owner tapped Works for build ${proof.build}, but no proof was recorded for ${proof.pr}: ${error instanceof Error ? error.message : String(error)} Open a new device proof card for the current head.`;
       }
+    } else if (chose) {
+      note = `Card ${askId} reads Works for build ${proof.build}, but Telegram has no record of the owner tapping it${confirmed === "unreadable" ? " (the Telegram connector did not answer)" : ""}, so no proof is recorded for ${proof.pr}. Open a new device proof card for the owner to tap.`;
     } else {
       note = `The owner says build ${proof.build} does not work on the owner's iPhone (his answer: "${clip(resolution, 200)}"). No proof is recorded for ${proof.pr}. Find out why, fix it, and open a new device proof card for the new build.`;
     }
@@ -8230,6 +8262,7 @@ export default async function plugin(bb: BbPluginApi) {
     const words = (waiver ?? "").trim();
     // Owner decision Q6: a production PR merges only on proof a crew (or the owner's tap) recorded at this head.
     if (production && words !== "") throw new Error([`Refusing: #${t.number} reaches production (${reach.why}); the owner's words cannot waive proof for a production PR. Nothing was merged.`, ...how].join("\n"));
+    if (production && project === undefined) throw new Error(`Refusing: #${t.number} reaches production (${reach.why}) and ${unlistedRefusal(prRepoOf(t.url))} Nothing was merged.`);
     if (row !== undefined && row.verifiedCommitSha === head) {
       if (!production) return { note: "", record: () => {} };
       if (verifiedBy(row) === "captain") throw new Error([`Refusing: #${t.number}'s verification record was made by the captain, not by a crew; nothing was merged.`, ...how].join("\n"));
