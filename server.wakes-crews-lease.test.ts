@@ -102,6 +102,7 @@ test("the shared Cyndra dev server serves one crew at a time; release needs the 
   const { host } = await deck();
   try {
     await host.bb.storage.kv.set("crews", [crewRow("a1", "thr_a"), crewRow("b1", "thr_b"), crewRow("x1", "thr_x")]);
+    host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: "idle", projectId: "proj_1", parentThreadId: "thr_cap" }));
     const lease = (as: string, action: string, reset?: string) => tool(host, "firstmate_lease").execute({ action, server: "cyndra-dev", ...(reset ? { reset } : {}) }, { threadId: as, projectId: "proj_1" } as never).then(text);
     assert.match(await lease("thr_a", "acquire"), /The lease on cyndra-dev \(the shared Cyndra dev server\) is yours/);
     assert.match(await lease("thr_b", "acquire"), /Wait: crew a1 holds cyndra-dev .* You are number 1 in line/);
@@ -135,4 +136,62 @@ test("a native refusal leads with its own reason, never the queued-wakes warning
     assert.ok(seen.some((cmd) => /\.fm-receipt-/.test(cmd)), "the wakes were read before the merge");
     assert.ok(sentTo(host, "thr_cap").some((m) => /WAKES READ BEFORE MERGE: 2 wake\(s\) were waiting.*\n.*crew c9 finished/s.test(m)), sentTo(host, "thr_cap").join("\n---\n"));
   } finally { await host.harness.lifecycle.dispose(); }
+});
+
+// Checker FF2-verdict-1 (18 Oct): a merge sent with handledWake holds the captain's receipt lock, and the
+// wake read before the merge waited for that same lock, so the merge never finished.
+test("a merge sent with a handled wake finishes: the wake read before it does not wait on the receipt it runs under", async () => {
+  const { host } = await deck((cmd) => {
+    if (cmd.includes(".wake-queue")) return { payload: "FMWAKES=2" };
+    if (/^__fm_cmd='bash '\\''\/tmp\/\.fm-receipt-/.test(cmd)) return { payload: `FM_BB_RECEIPT=${JSON.stringify({ id: "rcpt1", phase: "ready", report: "check: crew c9 finished", path: "/tmp/r.txt", replayed: false, truncated: false })}` };
+    if (cmd.includes("fm-merge-local.sh")) return { payload: "merged c1 by fast-forward" };
+    return {};
+  }, { fmHome: "/native", fmHostId: "host_1" });
+  try {
+    await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew", { posture: "local-only", nativeHome: "/native" })]);
+    const merge = tool(host, "firstmate_merge").execute({ crewId: "c1", yes: true, handledWake: "rcpt1" }, { threadId: "thr_cap", projectId: "proj_1" } as never);
+    const outcome = await Promise.race([merge.then(() => "finished"), new Promise((resolve) => setTimeout(() => resolve("deadlocked"), 15_000))]);
+    assert.equal(outcome, "finished");
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+// #146 finding 3: a holder whose crew failed for good (a 401, not restarted) loses the lease at the next sweep.
+test("a lease held by a crew whose thread failed and was not restarted goes to the next crew", async () => {
+  const { host } = await deck();
+  try {
+    await host.bb.storage.kv.set("crews", [crewRow("a1", "thr_a", { providerId: "codex" }), crewRow("b1", "thr_b")]);
+    const lease = (as: string, action: string) => tool(host, "firstmate_lease").execute({ action, server: "cyndra-dev" }, { threadId: as, projectId: "proj_1" } as never).then(text);
+    let failedA = false;
+    host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: threadId === "thr_a" && failedA ? "error" : "idle", providerId: "claude-code", environmentId: "env_wt", projectId: "proj_1", parentThreadId: "thr_cap" }));
+    assert.match(await lease("thr_a", "acquire"), /is yours/);
+    assert.match(await lease("thr_b", "acquire"), /Wait/);
+    failedA = true;
+    await failed(host, "thr_a", "unexpected status 401 Unauthorized");
+    await host.harness.behavior.runSchedule("task-lifecycle");
+    assert.match(await lease("thr_b", "status"), /held by crew b1/);
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+// #146 finding 4: a wake acknowledgement that failed after its action is finished after a plugin restart.
+test("a handled wake whose acknowledgement failed is acknowledged after the plugin restarts", async () => {
+  process.env.FM_WAKE_ACK_RETRY_MS = "10,10,10";
+  try {
+    const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { supervisionEnabled: true, fmHome: "/native", fmHostId: "host_1" } });
+    await host.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
+    await host.bb.storage.kv.set("wake-handled:thr_cap:rcpt9", Date.now() - 60_000);
+    const seen: string[] = [];
+    host.harness.sdk.stub("terminals.create", async (args: { start?: { command?: string } }) => { seen.push(args.start?.command ?? ""); return { id: `t_${seen.length}` }; });
+    host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+    host.harness.sdk.stub("terminals.close", async () => ({}));
+    host.harness.sdk.stub("terminals.output", async () => ({ nextSeq: 1, chunks: [{ dataBase64: Buffer.from(`FM_BB_RECEIPT=${JSON.stringify({ id: "rcpt9", phase: "complete", report: "", path: "/tmp/r", replayed: false, truncated: false })}\n__FM_HOST_RC:0\n`).toString("base64") }] }));
+    host.harness.sdk.stub("threads.getPluginMetadata", async ({ threadId }: { threadId: string }) => (threadId === "thr_cap" ? { captain: "true" } : {}));
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("environments.list", async () => [{ id: "env_source", hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" }]);
+    await plugin(host.bb);
+    try {
+      for (let i = 0; i < 100 && await host.bb.storage.kv.get("wake-handled:thr_cap:rcpt9") !== undefined; i++) await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(await host.bb.storage.kv.get("wake-handled:thr_cap:rcpt9"), undefined, "the acknowledgement was retried and finished");
+      assert.ok(seen.some((cmd) => /\.fm-receipt-/.test(cmd)), "it ran the receipt completion on the host");
+    } finally { await host.harness.lifecycle.dispose(); }
+  } finally { delete process.env.FM_WAKE_ACK_RETRY_MS; }
 });

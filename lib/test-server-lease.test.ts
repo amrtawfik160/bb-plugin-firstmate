@@ -15,7 +15,7 @@ test("one crew holds a shared server; the others wait in order and get it in tha
   assert.deepEqual(leases.acquire("cyndra-dev", "b", "cap", alive(["a", "b", "c"]), 1), { granted: false, holder: leases.holder("cyndra-dev"), position: 1 });
   assert.equal((leases.acquire("cyndra-dev", "c", "cap", alive(["a", "b", "c"]), 2) as { position: number }).position, 2);
   assert.equal((leases.acquire("cyndra-dev", "b", "cap", alive(["a", "b", "c"]), 3) as { position: number }).position, 1, "asking again keeps the place");
-  assert.equal(leases.release("cyndra-dev", "a")?.crewId, "b");
+  assert.equal(leases.release("cyndra-dev", "a", alive(["a", "b", "c"]))?.crewId, "b");
   assert.equal(leases.acquire("cyndra-dev", "c", "cap", alive(["b", "c"]), 4).granted, false, "c cannot jump the queue");
   assert.equal(leases.acquire("cyndra-dev", "b", "cap", alive(["b", "c"]), 5).granted, true);
   assert.throws(() => leases.release("cyndra-dev", "c"), /Crew c does not hold the lease on cyndra-dev; crew b does/);
@@ -32,4 +32,19 @@ test("the lease of a crew that died, or that was not renewed in time, expires", 
   const late = leases.acquire("cyndra-dev", "c", "cap", alive(["b", "c"]), 30 + LEASE_TTL_MS);
   assert.equal(late.granted, true, "b did not renew within the lease time");
   assert.equal(late.granted && late.expired?.crewId, "b");
+});
+
+// Checker FF2-verdict-1, #146 finding 2: a waiter that died is skipped, and a queue with no holder is repaired.
+test("release skips waiters whose crew is gone, and expiry hands a holderless queue to its first live crew", () => {
+  const leases = store();
+  leases.acquire("cyndra-dev", "a", "cap", alive(["a", "b", "c"]), 0);
+  leases.acquire("cyndra-dev", "b", "cap", alive(["a", "b", "c"]), 1);
+  leases.acquire("cyndra-dev", "c", "cap", alive(["a", "b", "c"]), 2);
+  assert.equal(leases.release("cyndra-dev", "a", alive(["a", "c"]))?.crewId, "c", "b is gone");
+  const orphan = store();
+  orphan.acquire("cyndra-dev", "a", "cap", alive(["a", "b"]), 0);
+  orphan.acquire("cyndra-dev", "b", "cap", alive(["a", "b"]), 1);
+  orphan.release("cyndra-dev", "a", alive(["a", "b"]));
+  const repaired = orphan.expire("cyndra-dev", alive(["b"]), 10);
+  assert.equal(repaired?.next?.crewId, "b", "nobody holds it and b waits: b is next");
 });
