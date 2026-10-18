@@ -276,3 +276,16 @@ test('each checker verdict reaches the weekly scorecard with its finding count',
   assert.match((await host.harness.behavior.runCli(['scorecard'],ctx)).stdout,/Checker findings: 2 findings in 1 fail verdict on 1 PR\. Source: checker verdicts\./);
  }finally{await host.harness.lifecycle.dispose();}
 });
+
+// Week of 11-18 Oct: checkers got "Unknown deliverable" for a PR the ledger tracks, when they typed
+// the repo as GitHub shows it (Cyndra-AI, Areliaa) or ran in another BB project than the builder.
+test('a checker of the owning captain records a verdict from another project and with the repo typed as GitHub shows it',async()=>{
+ const crews=[...CREWS,crewRow('chk3','thr_chk3',{projectId:'proj_2',providerId:'codex',model:'gpt-6.1-sol',role:'checker'}),crewRow('other','thr_other',{projectId:'proj_2',parentThreadId:'thr_cap2',providerId:'codex',model:'gpt-6.1-sol',role:'checker'})];
+ const {host,store}=await deck({crews});try {
+  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:threadId==='thr_chk3'||threadId==='thr_other'?'proj_2':'proj_1',status:'idle',environmentId:'env_wt'}));
+  const as=(threadId,ref)=>tool(host,'firstmate_deliveries').execute({action:'check',id:ref,commitSha:head(2391).slice(0,7),verdict:'fail',findings:1,notes:'P1 drops a message on restart'},{threadId,projectId:'proj_2'});
+  assert.match(text(await as('thr_other',id(2391))),/^(?:Error: )?Unknown deliverable cyndra-ai\/cyndra-saas#2391/,'a crew of another captain in another project still cannot reach the record');
+  text(await as('thr_chk3','Cyndra-AI/cyndra-saas#2391'));
+  assert.deepEqual([store.get(id(2391)).check?.crewId,store.get(id(2391)).check?.verdict],['chk3','fail']);
+ }finally{await host.harness.lifecycle.dispose();}
+});

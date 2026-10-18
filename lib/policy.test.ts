@@ -212,9 +212,10 @@ test("crew prompt asserts isolation and forbids nested dispatch", () => {
   assert.match(text, /absolute task-owned artifact directory/);
   assert.match(text, /When gh-axi returns RATE_LIMITED, use gh api REST/);
   assert.match(text, /fm-inbox-take\.sh/);
-  assert.match(text, /Never poll CI in a loop/);
-  assert.match(text, /gh-axi run watch/);
-  assert.match(text, /end your turn and let firstmate's PR check wake you/);
+  // Owner rule (18 Oct): wait for CI with one blocking watch on a slow interval, never by polling or idling.
+  assert.match(text, /gh run watch <run id> --interval 60 --exit-status/);
+  assert.match(text, /never a sleep loop, repeated gh pr checks/);
+  assert.doesNotMatch(text, /end your turn and let firstmate's PR check wake you/);
 });
 
 test("looksReadOnly hints scout", () => {
