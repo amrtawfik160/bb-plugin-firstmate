@@ -38,10 +38,22 @@ async function captainHost() {
   return { host, reminders };
 }
 
-/** A connector holding free-text obligations: untold until acked, open until resolved. */
+/**
+ * The captain thread's event log and a connector holding free-text obligations (untold until acked, open
+ * until resolved). A text is written in the running turn (its item event); the connector reads it later,
+ * stamping `at` at that read, as its enqueueAgent does.
+ */
 function connector(host: Host) {
   const rows: Array<{ ref: string; text: string; at: number; told: boolean; disposition?: string }> = [];
   const resolves: Array<{ refs: string[]; disposition: string }> = [];
+  const events: Array<{ seq: number; type: string; scope: { kind: "turn"; turnId: string }; data: unknown }> = [];
+  let turn = 0;
+  const push = (type: string, data: unknown = {}) => events.push({ seq: events.length + 1, type, scope: { kind: "turn", turnId: `turn-${turn}` }, data });
+  host.harness.sdk.stub("threads.events.list", async (args: { types?: string[]; order?: string; limit?: string }) => {
+    let found = events.filter((row) => !args.types || args.types.includes(row.type));
+    if (args.order === "desc") found = [...found].reverse();
+    return found.slice(0, Number(args.limit ?? 100));
+  });
   host.harness.sdk.stub("plugins.callRpc", async (args: Rpc) => {
     switch (args.method) {
       case "freeText": return { obligations: rows.filter((row) => !row.told && !row.disposition).map(({ ref, text, at }) => ({ ref, text, at })), captainThreadId: "thr_cap" };
@@ -58,12 +70,21 @@ function connector(host: Host) {
       default: return { ok: true, queued: 1, duplicate: false, mode: "on" };
     }
   });
-  const pause = () => new Promise((resolve) => setTimeout(resolve, 3));
+  const written = new Map<string, string>();
   return {
     resolves,
+    events,
     open: () => rows.filter((row) => !row.disposition).map((row) => row.ref),
-    /** The captain writes a text outside a tool; the connector records it as an obligation. */
-    async freeText(ref: string, text: string) { await pause(); rows.push({ ref, text, at: Date.now(), told: false }); await pause(); },
+    /** A captain turn starts (its turn/started event), then BB reports the thread active. */
+    async active() { turn += 1; push("turn/started"); await active(host); },
+    /** The running turn ends (turn/completed), then BB reports the thread idle. */
+    async idle() { push("turn/completed"); await idle(host); },
+    /** The captain writes a text outside a tool, in the running turn. */
+    write(ref: string, text: string) { push("item/completed", { item: { type: "agentMessage", id: ref.slice("agent:".length), text } }); written.set(ref, text); },
+    /** The connector reads a written text, now. */
+    read(ref: string) { rows.push({ ref, text: written.get(ref) ?? "", at: Date.now(), told: false }); },
+    /** Written and read at once. */
+    freeText(ref: string, text: string) { this.write(ref, text); this.read(ref); },
   };
 }
 
@@ -81,24 +102,24 @@ test("free-text loop: the live reminder loop stops after one round", async () =>
   try {
     const tg = connector(host);
     // Turn A: a free text, then idle. No reminder is steered on idle: that steer started the loop.
-    await active(host);
-    await tg.freeText("agent:i660", "Checked the crews; nothing new.");
-    await idle(host);
+    await tg.active();
+    tg.freeText("agent:i660", "Checked the crews; nothing new.");
+    await tg.idle();
     assert.deepEqual(reminders, [], "no reminder turn of its own on idle");
     // A real wake: the reminder rides on it.
-    await active(host);
+    await tg.active();
     assert.equal(reminders.length, 1);
     assert.match(reminders[0]!, /agent:i660/);
     // The reminder turn resolves it, then must close with visible text: that text is the next free text.
     await tool(host, "firstmate_free_text").execute({ refs: ["agent:i660"], disposition: "no-send" }, capCtx);
-    await tg.freeText("agent:i662", "Resolved agent:i660 as no-send.");
-    await idle(host);
+    tg.freeText("agent:i662", "Resolved agent:i660 as no-send.");
+    await tg.idle();
     assert.deepEqual(tg.open(), [], "the closing text is resolved no-send automatically");
     assert.deepEqual(tg.resolves.at(-1), { refs: ["agent:i662"], disposition: "no-send" });
     // Later wakes and idles: no reminder again.
-    await active(host);
-    await idle(host);
-    await active(host);
+    await tg.active();
+    await tg.idle();
+    await tg.active();
     assert.equal(reminders.length, 1, reminders.join("\n---\n"));
   } finally {
     await host.harness.lifecycle.dispose();
@@ -109,18 +130,18 @@ test("free-text loop: a turn's last free text gets exactly one reminder on the n
   const { host, reminders } = await captainHost();
   try {
     const tg = connector(host);
-    await active(host);
-    await tg.freeText("agent:i1", "Looking at the Safi build.");
-    await tg.freeText("agent:i2", "Safi is down: Convex disabled the account.");
-    await idle(host);
+    await tg.active();
+    tg.freeText("agent:i1", "Looking at the Safi build.");
+    tg.freeText("agent:i2", "Safi is down: Convex disabled the account.");
+    await tg.idle();
     assert.deepEqual(reminders, [], "nothing steered on idle");
     assert.deepEqual(tg.open(), ["agent:i2"], "the earlier text closes no-send");
-    await active(host);
+    await tg.active();
     assert.equal(reminders.length, 1);
     assert.match(reminders[0]!, /agent:i2/);
     assert.doesNotMatch(reminders[0]!, /agent:i1\b/);
-    await idle(host);
-    await active(host);
+    await tg.idle();
+    await tg.active();
     assert.equal(reminders.length, 1, "told once");
     assert.deepEqual(tg.open(), ["agent:i2"], "still open until the captain resolves it");
   } finally {
@@ -132,12 +153,12 @@ test("free-text loop: a turn that sent a typed message gets no reminder for its 
   const { host, reminders } = await captainHost();
   try {
     const tg = connector(host);
-    await active(host);
+    await tg.active();
     await ownerSays(host, "7100", "Status?");
     await tool(host, "firstmate_reply").execute({ ref: "tg:200:7100", text: "All green." }, capCtx);
-    await tg.freeText("agent:i30", "Replied with the status.");
-    await idle(host);
-    await active(host);
+    tg.freeText("agent:i30", "Replied with the status.");
+    await tg.idle();
+    await tg.active();
     assert.deepEqual(reminders, []);
     assert.deepEqual(tg.open(), []);
   } finally {
@@ -145,14 +166,15 @@ test("free-text loop: a turn that sent a typed message gets no reminder for its 
   }
 });
 
-test("free-text loop: a text from a turn this load did not see is still reminded, on a real wake only", async () => {
+test("free-text loop: a text whose turn is not in the thread's events is still reminded, on a real wake only", async () => {
   const { host, reminders } = await captainHost();
   try {
     const tg = connector(host);
-    await tg.freeText("agent:i40", "Before the reload.");
-    await idle(host);
+    // Read with no item event: a turn this load cannot find.
+    tg.read("agent:i40");
+    await tg.idle();
     assert.deepEqual(reminders, []);
-    await active(host);
+    await tg.active();
     assert.equal(reminders.length, 1);
     assert.match(reminders[0]!, /agent:i40/);
   } finally {
@@ -160,49 +182,139 @@ test("free-text loop: a text from a turn this load did not see is still reminded
   }
 });
 
-/** The connector's real store behind Firstmate's RPC calls; skipped without a connector checkout. */
+// Check of #157 (d03b70aa): the connector reads a turn's events later, so a text read during the next turn
+// was keyed to that turn. Each case writes the text in turn A and has the connector read it in turn B.
+
+test("free-text loop: a text read late is not closed by the next turn's typed reply", async () => {
+  const { host, reminders } = await captainHost();
+  try {
+    const tg = connector(host);
+    await tg.active();
+    tg.write("agent:delayed-owner", "The production migration failed.");
+    await tg.idle();
+    await tg.active();
+    tg.read("agent:delayed-owner");
+    await ownerSays(host, "7900", "Status?");
+    await tool(host, "firstmate_reply").execute({ ref: "tg:200:7900", text: "Checking." }, capCtx);
+    await tg.idle();
+    await tg.active();
+    assert.deepEqual(tg.open(), ["agent:delayed-owner"], "turn B's typed reply cannot resolve turn A's text");
+    assert.equal(reminders.filter((line) => line.includes("agent:delayed-owner")).length, 1);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("free-text loop: a resolve turn's closing text read late still closes no-send", async () => {
+  const { host, reminders } = await captainHost();
+  try {
+    const tg = connector(host);
+    await tg.active();
+    await tool(host, "firstmate_free_text").execute({ refs: ["agent:i660"], disposition: "no-send" }, capCtx);
+    tg.write("agent:i662", "Resolved.");
+    await tg.idle();
+    await tg.active();
+    tg.read("agent:i662");
+    await tg.idle();
+    assert.deepEqual(tg.open(), [], "the resolve turn's closing text closes no-send");
+    await tg.active();
+    assert.deepEqual(reminders, []);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("free-text loop: a text read while its turn still runs waits for the turn to end", async () => {
+  const { host, reminders } = await captainHost();
+  try {
+    const tg = connector(host);
+    await tg.active();
+    tg.freeText("agent:i70", "Working on it.");
+    await tool(host, "firstmate_free_text").execute({ refs: ["agent:i69"], disposition: "no-send" }, capCtx);
+    // A sweep drains mid-turn: nothing is decided yet.
+    await tg.active();
+    assert.deepEqual(reminders, []);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+/** The connector's real engine and store behind Firstmate's RPC calls; skipped without a connector checkout. */
 const telegram = path.resolve(process.env.TELEGRAM_CHECKOUT ?? new URL("../bb-plugin-telegram", import.meta.url).pathname);
 const present = existsSync(path.join(telegram, "test", "support.ts"));
 const load = (file: string) => import(pathToFileURL(path.join(telegram, file)).href);
 
-test("joint free-text loop: the 15-minute notice counts the unresolved real text only", { skip: present ? false : `no Telegram connector checkout at ${telegram}` }, async () => {
+async function jointHost() {
   await load("test/register.mjs");
   const { baseConfig, cycle, makeHarness, openStore } = await load("test/support.ts");
   const { host, reminders } = await captainHost();
+  const log = connector(host);
+  const { store } = openStore();
+  const clock = { offset: 0 };
+  const tg = makeHarness({ store, now: () => Date.now() + clock.offset, config: baseConfig({ captainThreadId: "thr_cap", pinnedBoard: false, threadedReplies: "on", topics: false, richMessages: false }) });
+  await cycle(tg.engine);
+  const binding = store.activeBinding()!;
+  assert.equal(binding.captain_thread_id, "thr_cap");
+  const engine = tg.engine as unknown as Record<string, (...input: unknown[]) => unknown>;
+  host.harness.sdk.stub("plugins.callRpc", async (args: Rpc) => {
+    switch (args.method) {
+      case "freeText": return { obligations: tg.engine.freeTextObligations(), captainThreadId: binding.captain_thread_id };
+      case "replied": return { replied: [] };
+      case "undelivered": return { undelivered: [] };
+      default: return engine[args.method] ? engine[args.method]!(args.input) : { ok: true };
+    }
+  });
+  const pause = () => new Promise((resolve) => setTimeout(resolve, 3));
+  return {
+    host, reminders, log, store, binding, clock, cycle: () => cycle(tg.engine),
+    notices: () => tg.telegram.sent.filter((row: { text: string }) => /has not sent/i.test(row.text)).length,
+    /** The connector reads a written text through its own enqueueAgent, stamping it now. */
+    async read(ref: string, text: string) { await pause(); await engine.enqueueAgent!(binding, ref, text); await pause(); },
+  };
+}
+
+test("joint free-text loop: the 15-minute notice counts the unresolved real text only", { skip: present ? false : `no Telegram connector checkout at ${telegram}` }, async () => {
+  const j = await jointHost();
   try {
-    const { store } = openStore();
-    const tg = makeHarness({ store, now: () => Date.now(), config: baseConfig({ captainThreadId: "thr_cap", pinnedBoard: false, threadedReplies: "on", topics: false, richMessages: false }) });
-    await cycle(tg.engine);
-    const binding = store.activeBinding()!;
-    assert.equal(binding.captain_thread_id, "thr_cap");
-    const engine = tg.engine as unknown as Record<string, (input?: unknown) => unknown>;
-    host.harness.sdk.stub("plugins.callRpc", async (args: Rpc) => {
-      switch (args.method) {
-        case "freeText": return { obligations: tg.engine.freeTextObligations(), captainThreadId: binding.captain_thread_id };
-        case "replied": return { replied: [] };
-        case "undelivered": return { undelivered: [] };
-        default: return engine[args.method] ? engine[args.method]!(args.input) : { ok: true };
-      }
-    });
-    const pause = () => new Promise((resolve) => setTimeout(resolve, 3));
-    const freeText = async (ref: string, text: string) => {
-      await pause();
-      store.dropFreeText({ botId: binding.bot_id, generation: binding.generation, sourceEventId: ref, text, at: Date.now(), obligation: true });
-      await pause();
-    };
     // Turn A: two free texts, no typed message. Turn B (a real wake): the reminder, an unrelated resolve, a closing text.
-    await active(host);
-    await freeText("agent:j1", "Looking at the deploy.");
-    await freeText("agent:j2", "The deploy failed: the migration is stuck.");
-    await idle(host);
-    await active(host);
-    assert.equal(reminders.length, 1);
-    await tool(host, "firstmate_free_text").execute({ refs: ["agent:other"], disposition: "no-send" }, capCtx);
-    await freeText("agent:j3", "Noted the reminder.");
-    await idle(host);
-    const due = store.overdueObligations(binding.generation, Date.now() + 16 * 60_000);
-    assert.equal(due.count, 1, "only the real one waits");
+    await j.log.active();
+    j.log.write("agent:j1", "Looking at the deploy.");
+    await j.read("agent:j1", "Looking at the deploy.");
+    j.log.write("agent:j2", "The deploy failed: the migration is stuck.");
+    await j.read("agent:j2", "The deploy failed: the migration is stuck.");
+    await j.log.idle();
+    await j.log.active();
+    assert.equal(j.reminders.length, 1);
+    await tool(j.host, "firstmate_free_text").execute({ refs: ["agent:other"], disposition: "no-send" }, capCtx);
+    j.log.write("agent:j3", "Noted the reminder.");
+    await j.read("agent:j3", "Noted the reminder.");
+    await j.log.idle();
+    assert.equal(j.store.overdueObligations(j.binding.generation, Date.now() + 16 * 60_000).count, 1, "only the real one waits");
+    j.clock.offset = 16 * 60_000;
+    await j.cycle();
+    await j.cycle();
+    assert.equal(j.notices(), 1, "one owner notice, for the real text");
   } finally {
-    await host.harness.lifecycle.dispose();
+    await j.host.harness.lifecycle.dispose();
+  }
+});
+
+test("joint free-text loop: a resolve turn's closing text read late sends the owner no notice", { skip: present ? false : `no Telegram connector checkout at ${telegram}` }, async () => {
+  const j = await jointHost();
+  try {
+    await j.log.active();
+    await tool(j.host, "firstmate_free_text").execute({ refs: ["agent:i660"], disposition: "no-send" }, capCtx);
+    j.log.write("agent:i662", "Resolved agent:i660 as no-send.");
+    await j.log.idle();
+    await j.log.active();
+    // The connector reads turn A's closing text only after the next real wake started.
+    await j.read("agent:i662", "Resolved agent:i660 as no-send.");
+    await j.log.idle();
+    j.clock.offset = 16 * 60_000;
+    await j.cycle();
+    await j.cycle();
+    assert.equal(j.notices(), 0, "no waiting-message notice for a resolve turn's closing text");
+  } finally {
+    await j.host.harness.lifecycle.dispose();
   }
 });

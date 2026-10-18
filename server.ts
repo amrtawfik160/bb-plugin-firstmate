@@ -67,7 +67,7 @@ import { createWatchdogStore, observeIdleTurn, tripWatchdog, watchdogNoticeText,
 import { captainResumeDelay, FAILOVER_WINDOW_MS, failoverTarget, planLimitError, planLimitNotice, PROVIDER_UNAVAILABLE_KEY, providerExhausted, unavailableProviderLines, unavailableUntil, utcMinute, type ExecutionChoice, type FailedTurnInfo, type UnavailableProviders } from "./lib/provider-failover.ts";
 import { finishedCrewCandidates, isFinishedCrewWake, parseWakeRow, quietStaleVerdict, staleQueueRows, withoutFinishedCrewWakes, type FinishedCrews, type QuietVerdict } from "./lib/finished-crew-wakes.ts";
 import { createDoorbellHold, doorbellHoldDecision } from "./lib/doorbell-hold.ts";
-import { createCaptainTurns, type FreeTextRow } from "./lib/free-text-turns.ts";
+import { countsForFreeText, createCaptainTurns, turnIndexFromEvents, type FreeTextRow } from "./lib/free-text-turns.ts";
 import { createRetryLedger, type RetryItem, type RetryKind } from "./lib/retry-ledger.ts";
 import { HANDOFF_WAKE_AMENDMENT, captainInstructionsWithHandoff } from "./owner/handoff-contract.ts";
 import { honestIdleVerdictPresentation, interruptIsStopped, readyClaim } from "./lib/honest-status.ts";
@@ -2906,6 +2906,16 @@ export default async function plugin(bb: BbPluginApi) {
   const captainTurnStartedAt = new Map<string, number>();
   // Each captain turn's typed messages and free-text resolves, for the free-text rules (lib/free-text-turns.ts).
   const captainTurns = createCaptainTurns();
+  /** Records a typed message or free-text resolve against the captain's running turn, by its turn id. */
+  async function recordFreeTextTool(captain: string, toolName: string): Promise<void> {
+    try {
+      const [row] = await bb.sdk.threads.events.list({ threadId: captain, types: ["turn/started"], order: "desc", limit: "1" });
+      const turnId = (row?.scope as { turnId?: unknown } | undefined)?.turnId;
+      if (typeof turnId === "string" && turnId !== "") captainTurns.used(captain, turnId, toolName);
+    } catch (error) {
+      bb.log.warn(`free text: turn of ${toolName} not recorded for ${captain}: ${String(error)}`);
+    }
+  }
   async function notifyCaptain(crew: Crew, event: string, output: string | null, signal?: AbortSignal): Promise<void> {
     const crewFinishedAt = Date.now();
     const previous = notificationChains.get(crew.threadId) ?? Promise.resolve();
@@ -5722,7 +5732,11 @@ export default async function plugin(bb: BbPluginApi) {
       return [];
     }
     if (bound !== captainThreadId) return [];
-    const { noSend, remind } = captainTurns.sort(captainThreadId, rows);
+    // Each text's turn is the one that wrote it (its item's event), never the time the connector read it.
+    // Unread events leave each text's turn unknown, so each is reminded: never closed unseen.
+    const events = await (async () => bb.sdk.threads.events.list({ threadId: captainThreadId, types: ["item/completed", "turn/completed"], order: "desc", limit: "100" }))()
+      .catch((error) => { bb.log.warn(`free text: events of ${captainThreadId} not read: ${String(error)}`); return []; });
+    const { noSend, remind } = captainTurns.sort(captainThreadId, rows, turnIndexFromEvents(events));
     if (noSend.length > 0) {
       // Rules 1 and 2: resolved, so neither a reminder nor the 15-minute owner notice comes of them.
       await bb.sdk.plugins.callRpc({
@@ -12663,7 +12677,7 @@ export default async function plugin(bb: BbPluginApi) {
             const uncertain = `Wake ${id}: action outcome is uncertain. Reconcile external state before acting again, then complete with firstmate_wake handledWake. Do not blindly repeat ${tool.name}.`;
             try { result = await execute(operation, ctx); }
             catch (error) { throw new Error(`${String(error)}${id ? `\n${uncertain}` : ""}`); }
-            if (captain && (typeof result === "string" || !result.isError)) captainTurns.used(captain, tool.name, Date.now());
+            if (captain && countsForFreeText(tool.name) && (typeof result === "string" || !result.isError)) await recordFreeTextTool(captain, tool.name);
             if (!id) return markCaptainToolResult(result);
             if (typeof result !== "string" && result.isError) return markCaptainToolResult({
               ...result, content: [...result.content, { type: "text", text: uncertain }],
@@ -14868,7 +14882,6 @@ export default async function plugin(bb: BbPluginApi) {
   bb.events.on("thread.active", async ({ thread }) => {
     captainTurnStartedAt.set(thread.id, Date.now());
     if (knownCaptainsRef.has(thread.id)) {
-      captainTurns.started(thread.id, Date.now());
       // A real wake: the free-text reminder rides on this turn instead of starting one of its own.
       const flags = await reliabilityFlags();
       if (flags.inboundLedger === "on" && flags.telegramThreading === "on") {
@@ -15168,7 +15181,6 @@ export default async function plugin(bb: BbPluginApi) {
     // A captain that completed a turn can take the wakes held while it was unavailable.
     await releaseHeldCaptainWakes(thread.id).catch((error) => bb.log.warn(`held wake release failed captain=${thread.id}: ${String(error)}`));
     if (knownCaptains.has(thread.id)) {
-      captainTurns.ended(thread.id, Date.now());
       await bb.storage.kv.delete(`${CAPTAIN_RESUME_PREFIX}${thread.id}`);
       await drainCaptainReliability(thread.id).catch((error) => bb.log.warn(`captain reliability drain failed ${thread.id}: ${String(error)}`));
     }
