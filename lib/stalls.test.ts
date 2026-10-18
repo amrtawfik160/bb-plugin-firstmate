@@ -39,8 +39,9 @@ test("one alert per stall; again only after another 24 hours stalled; a task tha
   memory = first.memory;
   assert.deepEqual(dueStalls(stalled(now - 25 * H), memory, now + 1 * H).due, [], "no repeat within 24 hours");
   assert.deepEqual(dueStalls(stalled(now - 25 * H), memory, now + STALL_MS).due.map((s) => s.task.id), ["T1"], "still stalled 24 hours later: one repeat");
-  assert.deepEqual(dueStalls(stalled(now - 26 * H), memory, now + 2 * H).due.map((s) => s.task.id), ["T1"], "it moved and stalled again: a new stall");
-  assert.deepEqual(dueStalls([], memory, now + 3 * H).memory, {}, "a task no longer stalled leaves the memory");
+  assert.deepEqual(dueStalls(stalled(now - 26 * H), memory, now + 2 * H).due, [], "it moved and stalled again, but its project was warned 2 hours ago");
+  assert.deepEqual(dueStalls(stalled(now - 26 * H), memory, now + STALL_MS).due.map((s) => s.task.id), ["T1"], "a new stall goes out once the project window opens");
+  assert.deepEqual(dueStalls([], memory, now + 3 * H).memory.tasks, {}, "a task no longer stalled leaves the memory");
 });
 
 test("alerts are grouped per project, name who must act, and cap their lines", () => {
@@ -65,4 +66,19 @@ test("not live yet lists merged tasks only, oldest first, with age, next step an
   assert.deepEqual(items.map((i) => i.id), ["T2", "T1"]);
   assert.equal(items[0]!.missing, "no record says which commit Cyndra production runs");
   assert.equal(notLiveLine(items[1]!), "T1 Safi · task T1 · merged 2 h ago · next: publish the OTA update to preview and production and deploy the backend · the captain");
+});
+
+// Checker 162-verdict-1 fix 4: a second Safi task stalled two hours after the first warning raised another warning.
+test("at most one stall warning per project in 24 hours, across a reload; held stalls go out when the window opens", () => {
+  const tasks = [0, 2 * H].map((updatedAt, i) => task(`T${i + 1}`, "merged", updatedAt));
+  const first = dueStalls(findStalls(tasks, new Set(), planFor, 25 * H), {}, 25 * H);
+  assert.deepEqual(stallAlerts(first.due).map((a) => a.ids), [["T1"]]);
+  const afterReload = JSON.parse(JSON.stringify(first.memory));
+  const second = dueStalls(findStalls(tasks, new Set(), planFor, 27 * H), afterReload, 27 * H);
+  assert.deepEqual(stallAlerts(second.due), [], "Safi was warned two hours ago");
+  const cyndra = task("T9", "merged", 0, { project: "Cyndra" });
+  const other = dueStalls(findStalls([...tasks, cyndra], new Set(), planFor, 27 * H), second.memory, 27 * H);
+  assert.deepEqual(stallAlerts(other.due).map((a) => a.project), ["Cyndra"], "another project has its own window");
+  const opened = dueStalls(findStalls(tasks, new Set(), planFor, 49 * H), other.memory, 49 * H);
+  assert.deepEqual(stallAlerts(opened.due).map((a) => a.ids), [["T1", "T2"]], "24 hours later: one warning with both");
 });

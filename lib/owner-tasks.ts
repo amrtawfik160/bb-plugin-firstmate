@@ -49,6 +49,10 @@ export interface OwnerTask {
   outcome?: string;
   /** What proved it live: the project's check, or the captain's evidence. */
   evidence?: string;
+  /** When it became live or dropped; later edits never move it. */
+  finishedAt?: number;
+  /** PRs the captain linked after it finished: new work, whenever the PR was opened. */
+  lateLinks?: string[];
   /** Corrections of the record, oldest first. Entries are only ever added. */
   history?: TaskCorrection[];
   /** Created after the fact from an owner request that had no closure. */
@@ -106,12 +110,12 @@ export function moveTask(task: OwnerTask, move: TaskMove, at: number): OwnerTask
     const ref = move.ref?.trim() ?? "";
     if (reason === "") throw new Error(`Dropping task ${task.id} needs a reason.`);
     if (ref === "") throw new Error(`Dropping task ${task.id} needs the owner's message ref: only the owner drops work, in his own words.`);
-    return { ...task, state: "dropped", dropReason: reason, dropRef: ref, updatedAt: at };
+    return { ...task, state: "dropped", dropReason: reason, dropRef: ref, finishedAt: at, lateLinks: [], updatedAt: at };
   }
   if (move.to === "live") {
     const evidence = move.reason?.trim() ?? "";
     if (evidence === "") throw new Error(`Task ${task.id} becomes live only with evidence: what production runs and how it was checked.`);
-    return { ...task, state: "live", evidence, outcome: evidence, updatedAt: at };
+    return { ...task, state: "live", evidence, outcome: evidence, finishedAt: at, lateLinks: [], updatedAt: at };
   }
   const outcome = move.reason?.trim();
   return { ...task, state: move.to, ...(outcome ? { outcome } : {}), updatedAt: at };
@@ -384,6 +388,8 @@ export function createOwnerTasks(db: Database, heldOpen: HeldOpen = () => null, 
       return db.transaction(() => {
         const task = owned(id, captain);
         if (task.prs.includes(pr)) return task;
+        // On a finished task the link is new work: the next reconcile reopens it once the PR is open or merged.
+        if (isFinishedTask(task)) return save({ ...task, prs: [...task.prs, pr], lateLinks: [...(task.lateLinks ?? []), pr] });
         return save({ ...task, prs: [...task.prs, pr], updatedAt: at });
       })();
     },
@@ -454,8 +460,11 @@ export function createOwnerTasks(db: Database, heldOpen: HeldOpen = () => null, 
           const proved = stateFromPrs(linked);
           const finished = isFinishedTask(task);
           // A PR from before a task finished only joins its record; new work is an open PR, or a merged one opened after it finished.
-          // A PR closed without a merge is no work at all.
-          const fresh = finished ? added.filter((r) => isOpenPr(r) || ((r.forgeState === "merged" || r.mergeCommitSha !== null) && (r.openedAt ?? 0) > task.updatedAt)) : added;
+          // A PR closed without a merge is no work at all. The finish time is finishedAt; records from before it have updatedAt.
+          const finishedAt = task.finishedAt ?? task.updatedAt;
+          const late = new Set(task.lateLinks ?? []);
+          const isNew = (r: DeliveryRecord) => late.has(r.id) || (r.openedAt ?? 0) > finishedAt || (added.includes(r) && isOpenPr(r));
+          const fresh = finished ? linked.filter((r) => (isOpenPr(r) || r.forgeState === "merged" || r.mergeCommitSha !== null) && isNew(r)) : added;
           let next = added.length === 0 ? task : { ...task, prs, ...(finished ? {} : { updatedAt: at }) };
           // New work on a finished task reopens it; so does a PR still open on a live or done one. A dropped one reopens only for new work.
           const stillOpen = task.state !== "dropped" ? linked.filter(isOpenPr) : [];

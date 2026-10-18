@@ -22,8 +22,8 @@ export type LiveRule = {
   checks: readonly LiveCheck[];
   /** Why no check proves some or all of its work yet. */
   missing?: string;
-  /** The part of going live that no check reads. */
-  unread?: string;
+  /** Backend files whose change must be deployed too: a PR that touches `paths` needs a backend check to prove it. */
+  backend?: { paths: readonly string[]; what: string; checks: readonly LiveCheck[]; missing: string; repos?: readonly string[] };
 };
 export type ProjectRule = {
   name: string;
@@ -101,7 +101,7 @@ export function projectBriefLines(project: ProjectRule | undefined, table: Proje
     lines.push(`This host cannot drive ${surfaceWords(surface, table)}. When the PR is open and its test build is out, send the owner the build and what to check: \`bb firstmate deliveries device-proof <owner/repo#n> --commit <head> --build <id> --link <TestFlight or OTA link> --check "<what to check>"\`. His Works tap is the proof record. Do not record verification yourself, and do not report the change proven before he taps Works.`);
   }
   if (project.release !== undefined) {
-    lines.push(`Releases: every ${project.name} build goes to the "${project.release.group}" TestFlight public-link group. Read the build's groups back from App Store Connect or EAS and record what you read: \`bb firstmate deliveries release --task T<n> --build <id> --group "${project.release.group}" --source app-store-connect|eas --seen "<what it showed>"\`. A release is done only with that read-back.`);
+    lines.push(`Releases: every ${project.name} build goes to the "${project.release.group}" TestFlight public-link group. Read the build's groups back from App Store Connect or EAS and record what you read: \`bb firstmate deliveries release --task T<n> --build <id> --group "${project.release.group}" --source app-store-connect|eas --seen "<what it showed>" --commit <commit the build was built from>\` (or \`--built-at <build time it shows>\` when the commit is not shown). A read-back proves only the merges its build holds.`);
   }
   for (const server of project.sharedServers ?? []) {
     lines.push(`Shared test server ${server.id} (${server.about}) serves one crew at a time. Before you use it: \`bb firstmate lease acquire ${server.id}\`, and wait until it is yours. After: ${server.reset}, then \`bb firstmate lease release ${server.id} --reset "<what you did>"\`.`);

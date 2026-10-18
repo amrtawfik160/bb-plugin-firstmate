@@ -78,9 +78,9 @@ import { inboundHookDecision } from "./lib/inbound-dispatch.ts";
 import { formatWorkersForTelegram } from "./lib/telegram-commands.ts";
 import { digestOnce, EMPTY_DIGEST_MEMORY, formatBoard, workingByProject, type BoardInput, type DigestMemory } from "./lib/owner-board.ts";
 import { createOwnerTasks, isFinishedTask, isOpenTask, sameProject, stateFromPrs, taskLine, taskOfRef, telegramTasks, type CrewFinish, type OwnerTask, type TaskState } from "./lib/owner-tasks.ts";
-import { readEnvFile } from "./lib/live-checks.ts";
+import { readEnvFile, type PrDetails } from "./lib/live-checks.ts";
 import { LIVE_PASS_MS, planOf, ruleOf, runLivePass, type LiveStatus } from "./lib/live-pass.ts";
-import { notLiveItems } from "./lib/stalls.ts";
+import { EMPTY_STALL_MEMORY, notLiveItems } from "./lib/stalls.ts";
 import {
   buildProgram, createPrograms, isOpenProgram, isOpenTicket, newlyReady, numberOf, programCounts, programText, readyRefs, readyWakeText, repoOf,
   shortTicket, stallReminderDue, stallReminderText, ticketRef, type IssueFacts, type Program, type ProgramFact, type TicketRef,
@@ -5161,6 +5161,35 @@ export default async function plugin(bb: BbPluginApi) {
     return answer;
   }
 
+  // A merged PR's merge time and files never change, so they are read once per process.
+  const prDetailsCache = new Map<string, PrDetails>();
+  /** When a merged PR merged and the files it changed, inside the sweep's hourly GitHub allowance; null when not read. */
+  async function prDetails(record: DeliveryRecord, signal?: AbortSignal): Promise<PrDetails | null> {
+    const known = prDetailsCache.get(record.id);
+    if (known !== undefined) return known;
+    const hostId = await backgroundHost(signal);
+    if (hostId === undefined) return null;
+    const read = await backgroundBudget.run("sweep", async () => {
+      if (!reserveGithub(hostId)) return null;
+      const res = await runStructuredOnHost(hostId, `gh pr view ${record.number} --repo ${shQuote(record.repository)} --json mergedAt,changedFiles,files --jq '{mergedAt, changedFiles, files: [.files[].path]}'`, 30_000, signal);
+      if (res.exitCode !== 0) return null;
+      const parsed = z.object({ mergedAt: z.string().nullable(), changedFiles: z.number(), files: z.array(z.string()) }).safeParse(JSON.parse(res.output.trim() || "null"));
+      if (!parsed.success) return null;
+      let files = parsed.data.files;
+      // The GraphQL list stops at 100 files; a bigger PR is read page by page.
+      if (parsed.data.changedFiles > files.length) {
+        if (!reserveGithub(hostId, false, Math.ceil(parsed.data.changedFiles / 100))) return null;
+        const all = await runStructuredOnHost(hostId, `gh api --paginate ${shQuote(`repos/${record.repository}/pulls/${record.number}/files?per_page=100`)} --jq '.[].filename'`, 60_000, signal);
+        if (all.exitCode !== 0) return null;
+        files = all.output.split("\n").map((line) => line.trim()).filter(Boolean);
+      }
+      const mergedAt = parsed.data.mergedAt === null ? null : Date.parse(parsed.data.mergedAt);
+      return { mergedAt: Number.isFinite(mergedAt) ? mergedAt : null, files };
+    });
+    if (read !== null && read.mergedAt !== null) prDetailsCache.set(record.id, read);
+    return read;
+  }
+
   const LIVE_PASS_AT_PREFIX = "live-pass-at:";
   const LIVE_STATUS_PREFIX = "live-status:";
   const STALL_MEMORY_PREFIX = "stall-memory:";
@@ -5176,7 +5205,8 @@ export default async function plugin(bb: BbPluginApi) {
     await bb.storage.kv.set(`${LIVE_PASS_AT_PREFIX}${captain}`, now);
     reconcileTasks(captain, now);
     const telegram = (await reliabilityFlags()).telegramThreading === "on";
-    const stallMemory = z.record(z.string(), z.object({ at: z.number(), updatedAt: z.number() })).safeParse(await bb.storage.kv.get(`${STALL_MEMORY_PREFIX}${captain}`)).data ?? {};
+    const entry = z.object({ at: z.number(), updatedAt: z.number() });
+    const stallMemory = z.object({ tasks: z.record(z.string(), entry), projects: z.record(z.string(), z.number()) }).safeParse(await bb.storage.kv.get(`${STALL_MEMORY_PREFIX}${captain}`)).data ?? EMPTY_STALL_MEMORY;
     const out = await runLivePass({
       captain, now,
       tasks: () => ownerTasks.list(captain, { includeClosed: true }),
@@ -5186,9 +5216,13 @@ export default async function plugin(bb: BbPluginApi) {
       contains: (check, repo, ancestor, descendant) => commitContains(check, repo, ancestor, descendant, signal),
       readback: (task) => {
         const group = ruleOf(task, deliveries.forTasks(task.crewIds, task.prs))?.release?.group;
-        const read = group === undefined ? undefined : releaseReadbacks.forTask(task.captain, task.id).find((row) => row.group.toLowerCase() === group.toLowerCase());
-        return read ? `Build ${read.build} read back in "${read.group}" from ${read.source}: ${read.seen}` : null;
+        if (group === undefined) return [];
+        return releaseReadbacks.forTask(task.captain, task.id).filter((row) => row.group.toLowerCase() === group.toLowerCase()).map((row) => ({
+          text: `Build ${row.build} read back in "${row.group}" from ${row.source}: ${row.seen}`,
+          ...(row.commit ? { commit: row.commit } : {}), ...(row.builtAt !== undefined ? { builtAt: row.builtAt } : {}),
+        }));
       },
+      details: (record) => prDetails(record, signal),
       markLive: (task, evidence, check) => {
         try { ownerTasks.move(task.id, captain, { to: "live", reason: evidence, checked: check }, now); return true; }
         catch (error) { bb.log.info(`live check: ${task.id} stays merged: ${error instanceof Error ? error.message : String(error)}`); return false; }
@@ -8600,7 +8634,7 @@ export default async function plugin(bb: BbPluginApi) {
     surface:z.enum(PROOF_SURFACES).optional().describe("verify: the surface you drove: iphone, web or message. It must be the project's proof surface"),
     build:z.string().max(80).optional().describe("device-proof and release: the app build id or number"),link:z.string().max(500).optional().describe("device-proof: the TestFlight or OTA link the owner opens"),
     check:z.string().max(500).optional().describe("device-proof: what the owner checks on the device"),task:z.string().regex(/^T\d+$/).optional().describe("release: the owner task the build ships"),
-    group:z.string().max(120).optional().describe("release: the TestFlight group the build is in, as read back"),source:z.enum(["app-store-connect","eas"]).optional().describe("release: where the read-back came from"),
+    group:z.string().max(120).optional().describe("release: the TestFlight group the build is in, as read back"),builtAt:z.string().max(40).optional().describe("release: when the build was made (ISO time), as App Store Connect or EAS shows it"),source:z.enum(["app-store-connect","eas"]).optional().describe("release: where the read-back came from"),
     verdict:z.enum(["pass","fail"]).optional().describe("check: a checker crew's verdict on the PR head"),findings:z.number().int().min(0).optional().describe("check: with verdict fail, how many findings the notes name"),notes:z.string().optional().describe("check: what you checked, drove and saw, and each finding"),
     authorized:z.boolean().optional().describe("Explicit user authority for abandonment or changing the delivery contract"),
     failureId:z.string().optional(),scope:z.enum(["author","baseline"]).optional(),followUpTask:z.string().optional(),
@@ -8759,8 +8793,13 @@ export default async function plugin(bb: BbPluginApi) {
       if (rule?.release === undefined) throw new Error(`Refusing: ${task.project ?? "this project"} has no release rule in owner/projects.json, so there is no group to read back.`);
       const build = input.build?.trim() ?? "", group = input.group?.trim() ?? "", seen = input.seen?.trim() ?? "";
       if (build === "" || seen === "" || input.source === undefined) throw new Error("A release read-back needs build, group, source (app-store-connect or eas) and seen (what it showed).");
+      const commit = input.commitSha?.trim() ?? "";
+      const builtAt = input.builtAt === undefined ? undefined : Date.parse(input.builtAt);
+      if (builtAt !== undefined && !Number.isFinite(builtAt)) throw new Error(`builtAt ${input.builtAt} is not a time: pass it as App Store Connect or EAS shows it, such as 2026-10-18T10:41Z.`);
+      // A read-back proves only the merges its build holds: it names the build's commit or the time it was built.
+      if (commit === "" && builtAt === undefined) throw new Error("A release read-back needs commitSha (the commit the build was built from) or builtAt (when it was built), so it proves only the merges that build holds.");
       if (group.toLowerCase() !== rule.release.group.toLowerCase()) throw new Error(`Refusing: ${rule.name} builds must be in the "${rule.release.group}" public-link group, not "${group}". Add build ${build} to "${rule.release.group}", read it back from App Store Connect or EAS, then record it again.`);
-      const recorded = releaseReadbacks.record({ task: task.id, captain: task.captain, crewId: crew.id, project: rule.name, build, group: rule.release.group, source: input.source as ReleaseSource, seen, at: Date.now() });
+      const recorded = releaseReadbacks.record({ task: task.id, captain: task.captain, crewId: crew.id, project: rule.name, build, group: rule.release.group, source: input.source as ReleaseSource, seen, at: Date.now(), ...(commit ? { commit } : {}), ...(builtAt !== undefined ? { builtAt } : {}) });
       return `Release read-back recorded for ${task.id}: build ${recorded.build} in "${recorded.group}" (read from ${recorded.source === "eas" ? "EAS" : "App Store Connect"}: ${recorded.seen}).`;
     }
     const id = input.id ?? (input.url ? canonicalPr(input.url).id : "");
@@ -16404,7 +16443,7 @@ export default async function plugin(bb: BbPluginApi) {
           case "deliveries": {
             const input=deliveryParams.parse({ action:rest[0] ?? "list",id:rest[1],crewId:flagStr(flags,"crew"),url:flagStr(flags,"url"),from:flagStr(flags,"from") === "none" ? null : flagStr(flags,"from"),
               failureId:flagStr(flags,"failure"),scope:flagStr(flags,"scope"),followUpTask:flagStr(flags,"follow-up-task"),requirement:flagStr(flags,"requirement"),reason:flagStr(flags,"reason"),commitSha:flagStr(flags,"commit"),driven:flagStr(flags,"driven"),seen:flagStr(flags,"seen"),verdict:flagStr(flags,"verdict"),notes:flagStr(flags,"notes"),findings:flagStr(flags,"findings") === undefined ? undefined : Number(flagStr(flags,"findings")),authorized:flags.has("authorized"),all:flags.has("all"),
-              surface:flagStr(flags,"surface"),build:flagStr(flags,"build"),link:flagStr(flags,"link"),check:flagStr(flags,"check"),task:flagStr(flags,"task"),group:flagStr(flags,"group"),source:flagStr(flags,"source"),
+              surface:flagStr(flags,"surface"),build:flagStr(flags,"build"),builtAt:flagStr(flags,"built-at"),link:flagStr(flags,"link"),check:flagStr(flags,"check"),task:flagStr(flags,"task"),group:flagStr(flags,"group"),source:flagStr(flags,"source"),
               limit:flagStr(flags,"limit") ? Number(flagStr(flags,"limit")) : undefined,offset:flagStr(flags,"offset") ? Number(flagStr(flags,"offset")) : undefined });
             const notice=await deliveryNotice(input,ctx);
             if (notice !== null) return reply({ action:input.action, text:notice },notice);

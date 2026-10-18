@@ -2,10 +2,10 @@
 // project's production runs, move merged tasks that it holds to live with that evidence, then raise one
 // alert per new stall. Read-only towards production; the only writes are task moves and the alerts.
 import { projectForName, projectForRepo, type LiveCheck, type ProjectRule } from "../owner/projects.ts";
-import { readProduction, taskLiveVerdict, type ProductionRead, type ReaderDeps } from "./live-checks.ts";
+import { readProduction, taskLiveVerdict, type PrDetails, type ProductionRead, type ReaderDeps, type ReleaseEvidence } from "./live-checks.ts";
 import type { OwnerTask } from "./owner-tasks.ts";
 import type { DeliveryRecord } from "./pr-delivery.ts";
-import { dueStalls, findStalls, stallAlerts, type LivePlan, type StallMemory } from "./stalls.ts";
+import { dueStalls, findStalls, stallAlerts, stallMemoryOf, unsentStalls, type LivePlan, type StallMemory } from "./stalls.ts";
 
 export const LIVE_PASS_MS = 60 * 60_000;
 
@@ -22,12 +22,14 @@ export type LivePassDeps = {
   running: ReadonlySet<string>;
   readers: ReaderDeps;
   contains: (check: LiveCheck, repo: string, ancestor: string, descendant: string) => Promise<boolean | null>;
-  /** The release read-back that ships this task, in words, or null. */
-  readback: (task: OwnerTask) => string | null;
+  /** The task's release read-backs in its project's required group. */
+  readback: (task: OwnerTask) => readonly ReleaseEvidence[];
+  /** A merged PR's merge time and files, from GitHub; null when not read. */
+  details?: (record: DeliveryRecord) => Promise<PrDetails | null>;
   /** Move the task to live with this evidence; false when something holds it (a program). */
   markLive: (task: OwnerTask, evidence: string, check: string) => boolean;
   alert: (project: string | null, text: string, incident: string) => Promise<boolean>;
-  stallMemory: StallMemory;
+  stallMemory: StallMemory | Record<string, never>;
 };
 
 /** The project rule of a task: its project label, else the repo of a linked PR. */
@@ -55,7 +57,7 @@ export async function runLivePass(deps: LivePassDeps): Promise<{ live: string[];
   for (const task of deps.tasks().filter((item) => item.state === "merged")) {
     const records = deps.recordsFor(task);
     const rule = ruleOf(task, records);
-    const verdict = await taskLiveVerdict(rule?.live, records, { production, contains: deps.contains, readback: () => deps.readback(task) });
+    const verdict = await taskLiveVerdict(rule?.live, records, { production, contains: deps.contains, readback: () => deps.readback(task), ...(deps.details ? { details: deps.details } : {}) });
     if (rule) {
       const before = status[rule.name];
       // A project is "live check missing" only while no task of it could be read.
@@ -66,15 +68,15 @@ export async function runLivePass(deps: LivePassDeps): Promise<{ live: string[];
   const tasks = deps.tasks();
   const recordsOf = new Map(tasks.map((task) => [task.id, deps.recordsFor(task)]));
   const stalls = findStalls(tasks, deps.running, (task) => planOf(ruleOf(task, recordsOf.get(task.id) ?? []), status), deps.now);
-  const { due, memory } = dueStalls(stalls, deps.stallMemory, deps.now);
+  const earlier = stallMemoryOf(deps.stallMemory);
+  const { due, memory } = dueStalls(stalls, earlier, deps.now);
   const alerted: string[] = [];
   let stallMemory = memory;
   for (const alert of stallAlerts(due)) {
     const incident = `stall-${(alert.project ?? "none").toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${new Date(deps.now).toISOString().slice(0, 13)}`;
     if (await deps.alert(alert.project, alert.text, incident)) { alerted.push(...alert.ids); continue; }
-    // Not sent: these stalls stay due for the next pass.
-    stallMemory = { ...stallMemory };
-    for (const id of alert.ids) if (deps.stallMemory[id] !== undefined) stallMemory[id] = deps.stallMemory[id]!; else delete stallMemory[id];
+    // Not sent: these stalls, and their project's window, stay due for the next pass.
+    stallMemory = unsentStalls(stallMemory, earlier, alert.ids, alert.project);
   }
   return { live, status, stallMemory, alerted };
 }

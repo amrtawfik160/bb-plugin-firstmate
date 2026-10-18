@@ -51,26 +51,62 @@ export function findStalls(tasks: readonly OwnerTask[], running: ReadonlySet<str
     .map((task) => ({ task, idleMs: now - task.updatedAt, ...nextStep(task, planFor(task), 0) }));
 }
 
-/** Per task: when its stall was last alerted, and the update time it was stalled on. */
-export type StallMemory = Record<string, { at: number; updatedAt: number }>;
+/** Per task: when its stall was last alerted, and the update time it was stalled on. Per project: when it was last warned. */
+export type StallMemory = { tasks: Record<string, { at: number; updatedAt: number }>; projects: Record<string, number> };
+export const EMPTY_STALL_MEMORY: StallMemory = { tasks: {}, projects: {} };
+
+const projectKeyOf = (task: OwnerTask) => task.project?.trim().toLowerCase() ?? "";
+
+/** A memory from before project windows held only the per-task map. */
+export function stallMemoryOf(value: unknown): StallMemory {
+  const raw = (value ?? {}) as Partial<StallMemory> & Record<string, unknown>;
+  if (typeof raw.tasks === "object" && raw.tasks !== null) return { tasks: { ...raw.tasks }, projects: { ...(raw.projects ?? {}) } };
+  return { tasks: { ...(raw as StallMemory["tasks"]) }, projects: {} };
+}
 
 /**
  * The stalls to alert now: a new stall once, and the same stall again only after another 24 hours. A task
- * that moved since its alert is a new stall when it stalls again. Tasks no longer stalled leave the memory.
+ * that moved since its alert is a new stall when it stalls again. Each project is warned at most once in
+ * 24 hours: stalls of a project warned more recently wait, still due, for its window. Tasks no longer
+ * stalled leave the memory.
  */
-export function dueStalls(stalls: readonly Stall[], memory: StallMemory, now: number): { due: Stall[]; memory: StallMemory } {
-  const next: StallMemory = {};
-  const due: Stall[] = [];
+export function dueStalls(stalls: readonly Stall[], memory: StallMemory | Record<string, never>, now: number): { due: Stall[]; memory: StallMemory } {
+  const before = stallMemoryOf(memory);
+  const tasks: StallMemory["tasks"] = {};
+  const projects = Object.fromEntries(Object.entries(before.projects).filter(([, at]) => now - at < STALL_MS));
+  const candidates = new Map<string, Stall[]>();
   for (const stall of stalls) {
-    const seen = memory[stall.task.id];
+    const seen = before.tasks[stall.task.id];
     if (seen !== undefined && seen.updatedAt === stall.task.updatedAt && now - seen.at < STALL_MS) {
-      next[stall.task.id] = seen;
+      tasks[stall.task.id] = seen;
       continue;
     }
-    due.push(stall);
-    next[stall.task.id] = { at: now, updatedAt: stall.task.updatedAt };
+    const key = projectKeyOf(stall.task);
+    candidates.set(key, [...(candidates.get(key) ?? []), stall]);
   }
-  return { due, memory: next };
+  const due: Stall[] = [];
+  for (const [key, group] of candidates) {
+    if (projects[key] !== undefined) {
+      for (const stall of group) if (before.tasks[stall.task.id] !== undefined) tasks[stall.task.id] = before.tasks[stall.task.id]!;
+      continue;
+    }
+    projects[key] = now;
+    for (const stall of group) {
+      due.push(stall);
+      tasks[stall.task.id] = { at: now, updatedAt: stall.task.updatedAt };
+    }
+  }
+  return { due, memory: { tasks, projects } };
+}
+
+/** Undo what `dueStalls` recorded for the given tasks and project when their alert was not sent. */
+export function unsentStalls(memory: StallMemory, earlier: StallMemory, ids: readonly string[], project: string | null): StallMemory {
+  const tasks = { ...memory.tasks };
+  for (const id of ids) if (earlier.tasks[id] !== undefined) tasks[id] = earlier.tasks[id]!; else delete tasks[id];
+  const projects = { ...memory.projects };
+  const key = project?.trim().toLowerCase() ?? "";
+  if (earlier.projects[key] !== undefined) projects[key] = earlier.projects[key]!; else delete projects[key];
+  return { tasks, projects };
 }
 
 /** One alert per project, naming who must act on each stalled task. */

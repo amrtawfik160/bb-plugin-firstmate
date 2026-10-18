@@ -179,3 +179,26 @@ test("the captain removes a crew from a task and amends a drop reason; each chan
     ["amend-drop-reason", "Owner: stop the provisioner", "Owner: stop the provisioner work"],
   ], "history only grows");
 });
+
+// Checker 162-verdict-1 fix 3: linkPr put the PR on the record before reconcile, so new work never reopened the task.
+test("a PR the captain links to a finished task reopens it on the next reconcile; the finish time survives later edits", () => {
+  const tasks = createOwnerTasks(memoryDb());
+  const prRecord = (id: string, over: Partial<DeliveryRecord>) => pr({ id, taskId: "none", ...over });
+  tasks.open({ captain: "c", project: "Safi", title: "dropped one", sourceRefs: ["tg:1:1"], at: 0 });
+  tasks.move("T1", "c", { to: "dropped", reason: "stop this", ref: "tg:1:2" }, 10);
+  tasks.linkPr("T1", "c", "amrtawfik160/safi#2", 200);
+  assert.equal(tasks.get("T1")!.finishedAt, 10, "linking does not move the finish time");
+  tasks.reconcile("c", () => [prRecord("amrtawfik160/safi#2", { status: "waiting-checks", forgeState: "open", openedAt: 100 })], 201);
+  assert.equal(tasks.get("T1")!.state, "working");
+  tasks.open({ captain: "c", project: "Safi", title: "live one", sourceRefs: ["tg:1:3"], at: 0 });
+  tasks.move("T2", "c", { to: "live", reason: "old production evidence" }, 10);
+  tasks.linkPr("T2", "c", "amrtawfik160/safi#3", 200);
+  tasks.reconcile("c", (t) => t.id === "T2" ? [prRecord("amrtawfik160/safi#3", { status: "complete", forgeState: "merged", mergeCommitSha: "new", openedAt: 100 })] : [], 201);
+  assert.equal(tasks.get("T2")!.state, "merged", "a newer merged PR takes a live task back to Not live yet");
+  // A PR from before the finish, linked by hand later, is still new work when the captain links it after the finish.
+  tasks.open({ captain: "c", project: "Safi", title: "old pr", sourceRefs: ["tg:1:4"], at: 0 });
+  tasks.move("T3", "c", { to: "dropped", reason: "stop", ref: "tg:1:5" }, 50);
+  tasks.linkPr("T3", "c", "amrtawfik160/safi#4", 60);
+  tasks.reconcile("c", (t) => t.id === "T3" ? [prRecord("amrtawfik160/safi#4", { status: "waiting-checks", forgeState: "open", openedAt: 5 })] : [], 61);
+  assert.equal(tasks.get("T3")!.state, "working", "the captain linked it after the drop: that is new work");
+});

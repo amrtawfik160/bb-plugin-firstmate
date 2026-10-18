@@ -74,6 +74,15 @@ if (checks) {
     cache.set(key, answer);
     return answer;
   };
+  // The merge time and files of a merged PR, read with `gh pr view` inside the same request cap.
+  const details = async (record: DeliveryRecord) => {
+    if (compares >= maxCompare) return null;
+    compares += 1;
+    try {
+      const out = JSON.parse(execFileSync("gh", ["pr", "view", String(record.number), "--repo", record.repository, "--json", "mergedAt,files", "--jq", "{mergedAt, files: [.files[].path]}"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })) as { mergedAt: string | null; files: string[] };
+      return { mergedAt: out.mergedAt ? Date.parse(out.mergedAt) : null, files: out.files };
+    } catch { return null; }
+  };
   const production = (check: LiveCheck) => {
     const key = JSON.stringify(check);
     if (!reads.has(key)) reads.set(key, readProduction(check, {
@@ -87,7 +96,7 @@ if (checks) {
   for (const task of after.filter((t) => t.state === "merged")) {
     const records = recordsFor(task);
     const rule = ruleOf(task, records);
-    const verdict = await taskLiveVerdict(rule?.live, records, { production, contains, readback: () => null });
+    const verdict = await taskLiveVerdict(rule?.live, records, { production, contains, readback: () => [], details });
     verdicts.push({ task, live: verdict.live, why: verdict.live ? verdict.evidence : verdict.missing ? `live check missing: ${verdict.missing}` : verdict.unknown ? "not told yet (compare budget)" : "production does not hold it yet" });
   }
   const byProject = new Map<string, { live: number; notLive: number; reasons: Map<string, number> }>();

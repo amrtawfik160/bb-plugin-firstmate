@@ -15,58 +15,115 @@ export type LiveVerdict =
   /** missing: why no check could read production (shown as "live check missing"); null when production was read and does not hold it yet. */
   | { live: false; missing: string | null; unknown: boolean };
 
+/** A crew's read-back of an app build in the project's required group. A read-back proves a merge only when
+ * the build is from a commit that holds it, or was built after it merged. */
+export type ReleaseEvidence = { text: string; commit?: string; builtAt?: number };
+/** What GitHub says of a merged PR: when it merged and the files it changed; null when not read yet. */
+export type PrDetails = { mergedAt: number | null; files: readonly string[] };
+
 export type LiveDeps = {
   /** What a check reads now; the caller reads each check once per pass. */
   production: (check: LiveCheck) => Promise<ProductionRead>;
   /** True when `ancestor` is in the history of `descendant`; null when it cannot be told now (budget, network). */
   contains: (check: LiveCheck, repo: string, ancestor: string, descendant: string) => Promise<boolean | null>;
-  /** The release read-back that ships this task, in words, or null. */
-  readback: () => string | null;
+  /** The task's release read-backs in the required group. */
+  readback: () => readonly ReleaseEvidence[];
+  /** A merged PR's merge time and files; without it, a rule that needs them proves nothing. */
+  details?: (record: DeliveryRecord) => Promise<PrDetails | null>;
 };
 
 const short = (sha: string) => sha.slice(0, 8);
 const mergedPr = (r: DeliveryRecord) => r.mergeCommitSha !== null && (r.forgeState === "merged" || r.status === "complete" || r.status === "merged-needs-verification" || r.status === "merged-unverified");
 
-function applies(check: LiveCheck, repo: string): boolean {
+function applies(check: { repos?: readonly string[] }, repo: string): boolean {
   return check.repos === undefined || check.repos.some((pattern) => repoMatches(pattern, repo));
 }
 
+type Proof = { proof: string | null; missing: string | null; read: boolean; unknown: boolean };
+
+/** Whether any of `checks` reads production and every run it read holds the PR's merge. */
+async function proveWith(checks: readonly LiveCheck[], record: DeliveryRecord, deps: LiveDeps): Promise<Proof> {
+  const out: Proof = { proof: null, missing: null, read: false, unknown: false };
+  for (const check of checks) {
+    const production = await deps.production(check);
+    if (!production.ok) { out.missing ??= production.missing; continue; }
+    if (production.runs.length === 0) { out.missing ??= "the check read no production run"; continue; }
+    out.read = true;
+    const held: boolean[] = [];
+    for (const run of production.runs) {
+      const has = await deps.contains(check, record.repository, record.mergeCommitSha!, run.sha);
+      if (has === null) out.unknown = true;
+      held.push(has === true);
+    }
+    if (held.every(Boolean)) return { ...out, proof: `${production.runs.map((run) => `${run.label} (${short(run.sha)})`).join(" and ")} holds ${record.id} (${short(record.mergeCommitSha!)})` };
+  }
+  return out;
+}
+
+/** A release read-back that covers this merge: its build holds the merge commit, or was built after the merge. */
+async function proveWithReadback(check: LiveCheck, record: DeliveryRecord, details: PrDetails | null, deps: LiveDeps): Promise<Proof> {
+  const out: Proof = { proof: null, missing: null, read: false, unknown: false };
+  for (const row of deps.readback()) {
+    out.read = true;
+    if (row.commit) {
+      const has = await deps.contains(check, record.repository, record.mergeCommitSha!, row.commit);
+      if (has === true) return { ...out, proof: `${row.text} (built from ${short(row.commit)}, which holds ${record.id})` };
+      if (has === null) out.unknown = true;
+    }
+    if (row.builtAt !== undefined && details?.mergedAt != null && row.builtAt > details.mergedAt) {
+      return { ...out, proof: `${row.text} (built ${new Date(row.builtAt).toISOString().slice(0, 16)}Z, after ${record.id} merged)` };
+    }
+    if (row.builtAt !== undefined && details === null) out.unknown = true;
+  }
+  // A read-back exists but covers an older build: production was read and does not hold this merge.
+  if (!out.read) out.missing = "no release read-back in the required group";
+  return out;
+}
+
 /**
- * Whether production runs every merged PR of a task. A release read-back check proves the whole task;
- * any other check proves one PR when every run it read contains the PR's merge commit.
+ * Whether production runs every merged PR of a task. A PR is live when one check proves it: a release
+ * read-back of a build that covers its merge, or a production read whose every run holds its merge. A PR
+ * that changes the project's backend files needs backend evidence too; unread, it stays not live.
  */
 export async function taskLiveVerdict(rule: LiveRule | undefined, records: readonly DeliveryRecord[], deps: LiveDeps): Promise<LiveVerdict> {
   if (rule === undefined) return { live: false, missing: "this project has no live rule in owner/projects.json", unknown: false };
-  const unread = rule.unread ? ` Not read: ${rule.unread}.` : "";
-  if (rule.checks.some((check) => check.kind === "release-readback")) {
-    const readback = deps.readback();
-    if (readback !== null) return { live: true, evidence: `${readback}.${unread}` };
-  }
   const merged = records.filter(mergedPr);
   if (merged.length === 0) return { live: false, missing: rule.checks.length === 0 ? rule.missing ?? "no live check" : null, unknown: false };
   const proofs: string[] = [];
+  let backendSeen = false;
   for (const record of merged) {
+    const readbacks = rule.checks.filter((check) => check.kind === "release-readback" && applies(check, record.repository));
     const checks = rule.checks.filter((check) => check.kind !== "release-readback" && applies(check, record.repository));
-    if (checks.length === 0) return { live: false, missing: rule.missing ?? `no live check for ${record.repository}`, unknown: false };
-    let proof: string | null = null, missing: string | null = null, read = false, unknown = false;
-    for (const check of checks) {
-      const production = await deps.production(check);
-      if (!production.ok) { missing ??= production.missing; continue; }
-      if (production.runs.length === 0) { missing ??= "the check read no production run"; continue; }
-      read = true;
-      const held: boolean[] = [];
-      for (const run of production.runs) {
-        const has = await deps.contains(check, record.repository, record.mergeCommitSha!, run.sha);
-        if (has === null) unknown = true;
-        held.push(has === true);
+    if (readbacks.length === 0 && checks.length === 0) return { live: false, missing: rule.missing ?? `no live check for ${record.repository}`, unknown: false };
+    const backend = rule.backend !== undefined && applies(rule.backend, record.repository) ? rule.backend : undefined;
+    const needsDetails = backend !== undefined || readbacks.length > 0;
+    const details = needsDetails ? await deps.details?.(record) ?? null : null;
+    if (backend !== undefined) {
+      // Which files the PR changed decides whether the backend must be deployed too; unread, nothing is proven.
+      if (details === null) return { live: false, missing: null, unknown: true };
+      if (details.files.some((file) => backend.paths.some((path) => file.startsWith(path)))) {
+        backendSeen = true;
+        const proved = backend.checks.length === 0 ? { proof: null, missing: backend.missing, read: false, unknown: false } : await proveWith(backend.checks, record, deps);
+        if (proved.proof === null) return { live: false, missing: proved.read ? null : `${record.id} changes ${backend.what}, and the backend was not read: ${proved.missing ?? backend.missing}`, unknown: proved.unknown };
+        proofs.push(proved.proof);
       }
-      if (held.every(Boolean)) { proof = `${production.runs.map((run) => `${run.label} (${short(run.sha)})`).join(" and ")} holds ${record.id} (${short(record.mergeCommitSha!)})`; break; }
+    }
+    let proof: Proof = { proof: null, missing: null, read: false, unknown: false };
+    for (const check of readbacks) {
+      const next = await proveWithReadback(check, record, details, deps);
+      proof = { proof: next.proof, missing: proof.missing ?? next.missing, read: proof.read || next.read, unknown: proof.unknown || next.unknown };
+      if (proof.proof !== null) break;
+    }
+    if (proof.proof === null && checks.length > 0) {
+      const next = await proveWith(checks, record, deps);
+      proof = { proof: next.proof, missing: next.missing ?? proof.missing, read: proof.read || next.read, unknown: proof.unknown || next.unknown };
     }
     // Production that was read and does not hold the merge is "not live yet", not a missing check.
-    if (proof === null) return { live: false, missing: read ? null : missing, unknown };
-    proofs.push(proof);
+    if (proof.proof === null) return { live: false, missing: proof.read ? null : proof.missing, unknown: proof.unknown };
+    proofs.push(proof.proof);
   }
-  return { live: true, evidence: `Live check: ${proofs.join("; ")}.${unread}` };
+  const backendNote = rule.backend !== undefined && !backendSeen ? ` No change to ${rule.backend.what}, so no backend deploy is needed.` : "";
+  return { live: true, evidence: `Live check: ${proofs.join("; ")}.${backendNote}` };
 }
 
 /** KEY=value lines of a dotenv file, or null when it cannot be read. Values never leave this module except to the request they authorize. */

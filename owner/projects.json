@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "about": "Owner decisions Q5 and Q11 (17 Oct). The Canary row is the isolated-server test project. Each project names the surface its proof must come from, the release read-back its app builds need, and the shared test servers its crews lease one at a time. A PR belongs to the project whose repos list its repository (owner/repo, * is a wildcard); a crew belongs to the project whose repos list its repository or whose bbProjects list its BB project name. hostCanDrive lists the surfaces a crew on this host can drive itself; for any other surface the crew asks the owner to test the build, and his Works tap is the proof record. live (owner decision Q2, 18 Oct) says how the project goes live: definition is the owner's words, next the step that makes merged work live, actor who takes it, checks the read-only production checks that prove it (any one check that proves a merged PR is enough; a PR whose repo no check lists has none), missing why no check exists yet, and unread the part of going live no check can read.",
+  "about": "Owner decisions Q5 and Q11 (17 Oct). The Canary row is the isolated-server test project. Each project names the surface its proof must come from, the release read-back its app builds need, and the shared test servers its crews lease one at a time. A PR belongs to the project whose repos list its repository (owner/repo, * is a wildcard); a crew belongs to the project whose repos list its repository or whose bbProjects list its BB project name. hostCanDrive lists the surfaces a crew on this host can drive itself; for any other surface the crew asks the owner to test the build, and his Works tap is the proof record. live (owner decision Q2, 18 Oct) says how the project goes live: definition is the owner's words, next the step that makes merged work live, actor who takes it, checks the read-only production checks that prove it (any one check that proves a merged PR is enough; a PR whose repo no check lists has none), missing why no check exists yet, and backend the backend folders whose change must be deployed too (a PR that changes them stays not live until a backend check proves it).",
   "surfaces": {
     "iphone": "the app on an iPhone or the iOS Simulator",
     "web": "the deployed web page in a browser",
@@ -55,7 +55,7 @@
             "envFile": "/root/.bb-server/secrets/expo.env"
           }
         ],
-        "unread": "the backend deploy: Convex keeps no record of the deployed commit that a check can read"
+        "backend": { "paths": ["artifacts/mobile/convex/"], "what": "the Convex backend", "checks": [], "missing": "Convex keeps no record of the deployed commit: its deployment answers only with bundle hashes" }
       }
     },
     {

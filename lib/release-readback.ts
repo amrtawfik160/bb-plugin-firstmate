@@ -11,6 +11,10 @@ export type ReleaseReadback = {
   source: ReleaseSource;
   seen: string;
   at: number;
+  /** The commit the build was built from, as the crew read it. */
+  commit?: string;
+  /** When the build was made, as App Store Connect or EAS showed it. */
+  builtAt?: number;
 };
 
 type Database = {

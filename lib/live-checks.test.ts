@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { projectForName, type LiveCheck, type LiveRule } from "../owner/projects.ts";
-import { readEnvFile, readProduction, taskLiveVerdict, type LiveDeps, type ProductionRead, type ReaderDeps } from "./live-checks.ts";
+import { readEnvFile, readProduction, taskLiveVerdict, type LiveDeps, type PrDetails, type ProductionRead, type ReaderDeps, type ReleaseEvidence } from "./live-checks.ts";
 import type { DeliveryRecord } from "./pr-delivery.ts";
 
 const merged = (id: string, sha: string): DeliveryRecord => ({ id, repository: id.split("#")[0]!, status: "complete", forgeState: "merged", mergeCommitSha: sha }) as DeliveryRecord;
@@ -17,7 +17,7 @@ function history(edges: Record<string, string>) {
   };
 }
 
-function deps(reads: Record<string, ProductionRead>, edges: Record<string, string>, readback: string | null = null): LiveDeps & { asked: string[] } {
+function deps(reads: Record<string, ProductionRead>, edges: Record<string, string>, readback: ReleaseEvidence[] = [], details: Record<string, PrDetails> = {}): LiveDeps & { asked: string[] } {
   const asked: string[] = [];
   return {
     asked,
@@ -28,8 +28,12 @@ function deps(reads: Record<string, ProductionRead>, edges: Record<string, strin
     },
     contains: history(edges),
     readback: () => readback,
+    details: async (record) => details[record.id] ?? null,
   };
 }
+
+const app = (mergedAt = 0): PrDetails => ({ mergedAt, files: ["artifacts/mobile/app/(tabs)/index.tsx"] });
+const backend = (mergedAt = 0): PrDetails => ({ mergedAt, files: ["artifacts/mobile/app/x.tsx", "artifacts/mobile/convex/goals.ts"] });
 
 const safi = projectForName("Safi")!.live!;
 
@@ -37,13 +41,24 @@ const safi = projectForName("Safi")!.live!;
 test("Safi: merged work is live only when both the production and the preview OTA hold its merge commit", async () => {
   const reads = { "eas:production+preview": { ok: true as const, runs: [{ label: "production OTA a7021b2c", sha: "aa40ebbe" }, { label: "preview OTA 0a29da02", sha: "aa40ebbe" }] } };
   const edges = { aa40ebbe: "2fc73e18", "2fc73e18": "6e24f934", later01: "aa40ebbe" };
-  const live = await taskLiveVerdict(safi, [merged("amrtawfik160/safi#573", "2fc73e18"), merged("amrtawfik160/safi#575", "aa40ebbe")], deps(reads, edges));
+  const files = { "amrtawfik160/safi#573": app(), "amrtawfik160/safi#575": app(), "amrtawfik160/safi#576": app() };
+  const live = await taskLiveVerdict(safi, [merged("amrtawfik160/safi#573", "2fc73e18"), merged("amrtawfik160/safi#575", "aa40ebbe")], deps(reads, edges, [], files));
   assert.equal(live.live, true);
   assert.match((live as { evidence: string }).evidence, /production OTA a7021b2c \(aa40ebbe\) and preview OTA 0a29da02 \(aa40ebbe\) holds amrtawfik160\/safi#573/);
-  assert.match((live as { evidence: string }).evidence, /Not read: the backend deploy/);
-  assert.deepEqual(await taskLiveVerdict(safi, [merged("amrtawfik160/safi#576", "later01")], deps(reads, edges)), { live: false, missing: null, unknown: false }, "read, and not in production yet");
+  assert.match((live as { evidence: string }).evidence, /No change to the Convex backend, so no backend deploy is needed\.$/);
+  assert.deepEqual(await taskLiveVerdict(safi, [merged("amrtawfik160/safi#576", "later01")], deps(reads, edges, [], files)), { live: false, missing: null, unknown: false }, "read, and not in production yet");
   const onlyProduction = { "eas:production+preview": { ok: true as const, runs: [{ label: "production OTA x", sha: "later01" }, { label: "preview OTA y", sha: "aa40ebbe" }] } };
-  assert.equal((await taskLiveVerdict(safi, [merged("amrtawfik160/safi#576", "later01")], deps(onlyProduction, edges))).live, false, "the preview channel must hold it too");
+  assert.equal((await taskLiveVerdict(safi, [merged("amrtawfik160/safi#576", "later01")], deps(onlyProduction, edges, [], files))).live, false, "the preview channel must hold it too");
+});
+
+// Checker 162-verdict-1 fix 1: both OTA channels held a merge that changed the Convex backend, and the task went live with no backend evidence.
+test("Safi: a merge that changes the Convex backend stays not live while the backend deploy cannot be read; unread files prove nothing", async () => {
+  const reads = { "eas:production+preview": { ok: true as const, runs: [{ label: "production OTA p", sha: "m1" }, { label: "preview OTA q", sha: "m1" }] } };
+  const touched = await taskLiveVerdict(safi, [merged("amrtawfik160/safi#577", "m1")], deps(reads, {}, [], { "amrtawfik160/safi#577": backend() }));
+  assert.equal(touched.live, false);
+  assert.match((touched as { missing: string }).missing, /^amrtawfik160\/safi#577 changes the Convex backend, and the backend was not read: Convex keeps no record of the deployed commit/);
+  assert.deepEqual(await taskLiveVerdict(safi, [merged("amrtawfik160/safi#577", "m1")], deps(reads, {})), { live: false, missing: null, unknown: true }, "files not read yet: nothing is proven");
+  assert.equal((await taskLiveVerdict(safi, [merged("amrtawfik160/safi#577", "m1")], { ...deps(reads, {}), details: undefined })).live, false);
 });
 
 test("a project with no check, or a repo no check covers, says the live check is missing instead of guessing", async () => {
@@ -61,8 +76,20 @@ test("a check that cannot read production is a missing check; a later check of t
   const unread = { "eas:production": { ok: false as const, missing: "the Expo token has no access to app 59afc438" } };
   const verdict = await taskLiveVerdict(woo, [merged("amrtawfik160/dr.woo#129", "3fc0f8f")], deps(unread, {}));
   assert.deepEqual(verdict, { live: false, missing: "the Expo token has no access to app 59afc438", unknown: false });
-  const proved = await taskLiveVerdict(woo, [merged("amrtawfik160/dr.woo#129", "3fc0f8f")], deps(unread, {}, "Build 7 read back in Externals from App Store Connect"));
-  assert.deepEqual(proved, { live: true, evidence: "Build 7 read back in Externals from App Store Connect." }, "a TestFlight read-back in the public-link group proves the task");
+  const build7 = { text: "Build 7 read back in Externals from App Store Connect", builtAt: 2_000 };
+  const proved = await taskLiveVerdict(woo, [merged("amrtawfik160/dr.woo#129", "3fc0f8f")], deps(unread, {}, [build7], { "amrtawfik160/dr.woo#129": app(1_000) }));
+  assert.deepEqual(proved, { live: true, evidence: "Live check: Build 7 read back in Externals from App Store Connect (built 1970-01-01T00:00Z, after amrtawfik160/dr.woo#129 merged)." }, "a TestFlight read-back of a build newer than the merge proves it");
+});
+
+// Checker 162-verdict-1 fix 2: Build 7 from an earlier cycle of the task proved a merge made after it.
+test("Dr Woo: a read-back proves a merge only for a build made after it, or built from a commit that holds it", async () => {
+  const woo = projectForName("Dr Woo")!.live!;
+  const unread = { "eas:production": { ok: false as const, missing: "no Expo access" } };
+  const old = { text: "Build 7 in Externals", builtAt: 500 };
+  const pr = merged("amrtawfik160/dr.woo#140", "newmerge");
+  assert.deepEqual(await taskLiveVerdict(woo, [pr], deps(unread, {}, [old], { [pr.id]: app(1_000) })), { live: false, missing: null, unknown: false }, "an older build: not live yet");
+  assert.equal((await taskLiveVerdict(woo, [pr], deps(unread, { build9: "newmerge" }, [old, { text: "Build 9 in Externals", commit: "build9" }], { [pr.id]: app(1_000) }))).live, true, "built from a commit holding the merge");
+  assert.deepEqual(await taskLiveVerdict(woo, [pr], deps(unread, {}, [{ text: "Build 8 in Externals", builtAt: 2_000 }], {})), { live: false, missing: null, unknown: true }, "merge time not read yet");
 });
 
 test("plugins are live once the loaded commit holds the merge; an unknown answer is neither live nor missing", async () => {

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { createOwnerTasks, type OwnerTask } from "./owner-tasks.ts";
+import { createReleaseReadbacks } from "./release-readback.ts";
 import { runLivePass, type LivePassDeps } from "./live-pass.ts";
 import type { DeliveryRecord } from "./pr-delivery.ts";
 
@@ -44,7 +45,8 @@ function world() {
       loadedCommit: async () => "not used",
     },
     contains: async (_check, _repo, ancestor, descendant) => ancestor === descendant,
-    readback: () => null,
+    readback: () => [],
+    details: async () => ({ mergedAt: 0, files: ["artifacts/mobile/app/index.tsx"] }),
     markLive: (task, evidence, check) => { tasks.move(task.id, "c", { to: "live", reason: evidence, checked: check }, now); return true; },
     alert: async (project, text, incident) => { if (!sendOk) return false; alerts.push({ project, text, incident }); return true; },
     stallMemory,
@@ -70,7 +72,7 @@ test("each stall raises one alert per project naming who must act; a repeat wait
   w.failSends(true);
   const unsent = await runLivePass(w.deps(30 * H));
   assert.deepEqual(unsent.alerted, []);
-  assert.deepEqual(unsent.stallMemory, {}, "an alert that was not sent is not remembered");
+  assert.deepEqual(unsent.stallMemory, { tasks: {}, projects: {} }, "an alert that was not sent is not remembered");
   w.failSends(false);
   const first = await runLivePass(w.deps(30 * H, unsent.stallMemory));
   assert.deepEqual(w.alerts.map((a) => a.project), ["Safi", "Cyndra"]);
@@ -82,4 +84,26 @@ test("each stall raises one alert per project naming who must act; a repeat wait
   assert.equal(w.alerts.length, 2);
   const nextDay = await runLivePass(w.deps(54 * H, again.stallMemory));
   assert.deepEqual(nextDay.alerted.sort(), ["T2", "T3"]);
+});
+
+// Checker 162-verdict-1 fix 2: an old Build 7 read-back made the new merge of a reopened task live.
+test("a reopened Dr Woo task is not made live by the read-back of a build from before its new merge", async () => {
+  const raw = memoryDb();
+  const tasks = createOwnerTasks(raw);
+  const readbacks = createReleaseReadbacks(raw);
+  tasks.open({ captain: "c", project: "Dr Woo", title: "Redesign", sourceRefs: ["tg:1:1"], crewId: "old-crew", at: 0 });
+  readbacks.record({ task: "T1", captain: "c", crewId: "old-crew", project: "Dr Woo", build: "7", group: "Externals", source: "app-store-connect", seen: "Build 7 in Externals", at: 5, builtAt: 4 });
+  tasks.move("T1", "c", { to: "live", reason: "Build 7 read back" }, 10);
+  tasks.attach("T1", "c", { crewId: "new-crew", sourceRefs: ["tg:1:2"], at: 20 });
+  const recordsFor = () => [{ ...merged("amrtawfik160/dr.woo#141", "new-crew", "newmerge"), openedAt: 20 }];
+  tasks.reconcile("c", recordsFor, 30);
+  const evidence = (task: OwnerTask) => readbacks.forTask(task.captain, task.id).map((row) => ({ text: `Build ${row.build} read back in ${row.group}`, ...(row.commit ? { commit: row.commit } : {}), ...(row.builtAt !== undefined ? { builtAt: row.builtAt } : {}) }));
+  const pass = (now: number) => runLivePass({ captain: "c", now, tasks: () => tasks.list("c", { includeClosed: true }), recordsFor, running: new Set(),
+    readers: { fetch: async () => { throw new Error("no production proof"); }, env: () => null, loadedCommit: async () => "unknown" }, contains: async () => null,
+    readback: evidence, details: async () => ({ mergedAt: 25, files: ["app/x.tsx"] }),
+    markLive: (item, text, checked) => { tasks.move(item.id, "c", { to: "live", reason: text, checked }, now); return true; },
+    alert: async () => false, stallMemory: {} });
+  assert.deepEqual((await pass(40)).live, [], "Build 7 predates the new merge");
+  readbacks.record({ task: "T1", captain: "c", crewId: "new-crew", project: "Dr Woo", build: "9", group: "Externals", source: "app-store-connect", seen: "Build 9 in Externals", at: 45, builtAt: 44 });
+  assert.deepEqual((await pass(50)).live, ["T1"], "Build 9, built after the merge, proves it");
 });
