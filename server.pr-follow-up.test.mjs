@@ -122,7 +122,9 @@ test('a crew forgotten with its PR open has its native record retired once every
 
 async function sweepDeck() {
  const d=await deck([]);
- d.host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle',environmentId:'env_wt',archivedAt:1}));
+ // Forgotten crews' threads are archived; the live builder's is not, so the open list is read.
+ d.host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle',environmentId:'env_wt',archivedAt:threadId==='thr_crew'||threadId==='thr_chk'?null:1}));
+ d.host.harness.sdk.stub('environments.get',async()=>({id:'env_wt',hostId:'host_1',status:'ready',isWorktree:true,path:'/wt',branchName:`fm/${BUILDER}`}));
  d.deliver=(task,thread,n,status,forgeState)=>{const r=d.store.register({url:url(n),taskId:task,projectId:'proj_1',owner:'thr_cap',home:'/native',worker:thread,requirement:'pr',continuation:crewRow(task,thread,{backlogRow:true,providerId:null,model:null})});
   d.store.save({...d.store.get(r.id),status,...(forgeState?{forgeState}:{}),nextCheckAt:Date.now()+3_600_000});};
  d.removed=()=>d.gh.commands.flatMap(c=>/rm -f \S*\/native\/state\/([A-Za-z0-9_-]+)\.meta\b/.exec(c)?.slice(1) ?? []);
@@ -205,18 +207,16 @@ test('every background GitHub request, reads, discovery lookups and branch lists
  }finally{await host.harness.lifecycle.dispose();}
 });
 
-test('retirement reads count against the hourly allowance and stop when it is spent',async(t)=>{
+test('the sweep reads at most its own share of 30 an hour',async(t)=>{
  t.mock.timers.enable({apis:['Date'],now:Date.now()});
  const d=await sweepDeck();try {
-  const prs=Array.from({length:100},(_,i)=>8000+i);
-  for(const n of prs){const r=d.store.register({url:url(n),taskId:BUILDER,projectId:'proj_1',owner:'thr_cap',home:'/native',worker:'thr_crew',requirement:'pr'});d.store.save({...d.store.get(r.id),nextCheckAt:0});}
-  for(let cycle=0;cycle<6;cycle++){for(const n of prs) d.store.save({...d.store.get(id(n)),nextCheckAt:0});await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');}
-  states.set(5401,'MERGED');d.deliver('c9','thr_c9',5401,'complete');metas='c9\tthr_c9\n';
-  // The sweep runs once every 10 minutes; the hourly allowance is still spent 11 minutes on.
-  t.mock.timers.tick(11*60_000);
-  await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
-  assert.ok(d.gh.commands.some(c=>c.includes('/state/*.meta')),'the sweep ran again');
-  assert.ok(!d.gh.commands.some(c=>c.includes('/pull/5401')),'no retirement read once the hourly allowance is spent');
+  const lines=[];
+  for(let i=0;i<40;i++){states.set(8700+i,'MERGED');d.deliver(`s${i}`,`thr_s${i}`,8700+i,'complete');lines.push(`s${i}\tthr_s${i}`);}
+  metas=lines.join('\n')+'\n';
+  for(let sweep=0;sweep<3;sweep++){await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');t.mock.timers.tick(11*60_000);}
+  const reads=d.gh.commands.filter(c=>c.includes('gh pr view')&&/\/pull\/87\d\d/.test(c)).length;
+  assert.equal(reads,30,`${reads} sweep reads within the hour`);
+  assert.equal(d.removed().length,30);
  }finally{await d.host.harness.lifecycle.dispose();}
 });
 
