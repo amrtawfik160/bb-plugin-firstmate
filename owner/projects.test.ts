@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { hostCanDrive, PROJECTS, projectBriefLines, projectForName, projectForRepo, repoOf, surfaceRefusal } from "./projects.ts";
+import { hostCanDrive, PROJECTS, projectBriefLines, projectForName, projectForRepo, repoOf, surfaceRefusal, unlistedRefusal } from "./projects.ts";
 
 test("a PR's repository names its project, without case", () => {
   assert.equal(projectForRepo("AmrTawfik160/dr.woo")?.name, "Dr Woo");
@@ -39,4 +39,10 @@ test("a Dr Woo brief tells the crew the owner proves the iPhone build and the re
   assert.match(lines, /This host cannot drive .*bb firstmate deliveries device-proof/);
   assert.match(lines, /"Externals" TestFlight public-link group/);
   assert.doesNotMatch(projectBriefLines(projectForName("Cyndra")).join("\n"), /device-proof|TestFlight/);
+});
+
+// Checker FF2-verdict-1, #144 finding 3: hazw80801/runants had open production PRs and no rule.
+test("every production repo of the live captain has a rule, and an unlisted repo is refused at a production merge", () => {
+  assert.equal(projectForRepo("HazW80801/runants")?.proofSurface, "web");
+  assert.match(unlistedRefusal("someone/unlisted"), /no project in owner\/projects\.json lists someone\/unlisted, so its proof surface is unknown/);
 });

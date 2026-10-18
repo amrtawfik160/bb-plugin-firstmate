@@ -58,7 +58,9 @@ async function deck() {
  host.harness.sdk.stub('threads.send',async()=>({delivery:'queued'}));
  host.harness.sdk.stub('projects.get',async()=>({id:'proj_1',name:'woo-app',kind:'repo'}));
  const rpc=[];
- host.harness.sdk.stub('plugins.callRpc',async(call)=>{rpc.push(call);return{ok:true,queued:1,duplicate:false};});
+ // The connector records the owner's own taps; ownerAnswer reads them back.
+ const ownerTaps=new Map();
+ host.harness.sdk.stub('plugins.callRpc',async(call)=>{rpc.push(call);if(call.method==='ownerAnswer')return{answer:ownerTaps.get(call.input.askId)??null};return{ok:true,queued:1,duplicate:false};});
  host.harness.sdk.stub('files.read',async()=>{throw new Error('ENOENT');});
  await host.bb.storage.kv.set('crews',CREWS);
  const store=createDeliveries(host.bb.storage.database());
@@ -66,7 +68,8 @@ async function deck() {
   const r=store.register({url:url(repo,n),taskId:crew,projectId:'proj_1',owner:'thr_cap',home:'/native',worker:thread,requirement:'merged',title:`Change ${n}`});
   store.observe(r.id,{headSha:head(n),state:'open',draft:false,checks:'passing',review:'approved',reviewHeadSha:head(n),mergeCommitSha:null,mergeable:'mergeable'},true);
  }
- return {host,store,rpc,commands:hostCommands(host)};
+ const tap=async(id,answer)=>{ownerTaps.set(id,answer);return host.harness.behavior.callRpc('resolveAsk',{threadId:'thr_cap',id,resolution:answer});};
+ return {host,store,rpc,tap,commands:hostCommands(host)};
 }
 const tool=(host,name)=>host.harness.inspection.registrations.agentTools.find(t=>t.name===name);
 const text=out=>typeof out==='string'?out:out?.content?.[0]?.text ?? JSON.stringify(out);
@@ -98,7 +101,7 @@ test('Dr Woo proof from a web run is refused; an iPhone proof the host cannot dr
 });
 
 test("the owner's Works tap on the crew's device card is the proof record, with the build id; then the merge passes",async()=>{
- const {host,store,rpc,commands}=await deck();try {
+ const {host,store,rpc,tap,commands}=await deck();try {
   const asked=text(await deliveries(host,{action:'device-proof',id:key(WOO,130),commitSha:head(130).slice(0,7),build:'8',link:'https://testflight.apple.com/join/abc',check:'Open a chat, send a photo, and see it arrive'},'thr_woo'));
   const askId=/card (a[0-9a-z]{6})/.exec(asked)?.[1];
   assert.ok(askId,asked);
@@ -110,7 +113,7 @@ test("the owner's Works tap on the crew's device card is the proof record, with 
   assert.match(text(await tool(host,'firstmate_resolve_ask').execute({id:askId,resolution:'Works'},ctx)),/only the owner's tap answers a device proof card/);
   assert.equal(store.get(key(WOO,130)).verifiedCommitSha,null);
   assert.match(text(await merge(host,'woo1',130)),/^Refusing: #130 reaches production .* has no proof a crew or the owner recorded for its current head 1301301/);
-  assert.deepEqual(await host.harness.behavior.callRpc('resolveAsk',{threadId:'thr_cap',id:askId,resolution:'Works'}),{ok:true});
+  assert.deepEqual(await tap(askId,'Works'),{ok:true});
   const recorded=store.get(key(WOO,130)).verification;
   assert.deepEqual([recorded.actor,recorded.crewId,recorded.surface,recorded.build,recorded.commitSha],['owner',null,'iphone','8',head(130)]);
   text(await check(host,WOO,130));
@@ -121,10 +124,10 @@ test("the owner's Works tap on the crew's device card is the proof record, with 
 });
 
 test('a Does not work tap records no proof and the crew hears it',async()=>{
- const {host,store}=await deck();try {
+ const {host,store,tap}=await deck();try {
   const asked=text(await deliveries(host,{action:'device-proof',id:key(WOO,130),commitSha:head(130).slice(0,7),build:'8',link:'https://testflight.apple.com/join/abc',check:'Send a photo'},'thr_woo'));
   const askId=/card (a[0-9a-z]{6})/.exec(asked)[1];
-  await host.harness.behavior.callRpc('resolveAsk',{threadId:'thr_cap',id:askId,resolution:'Does not work'});
+  await tap(askId,'Does not work');
   assert.equal(store.get(key(WOO,130)).verifiedCommitSha,null);
   const told=host.harness.sdk.callsTo('threads.send').map(call=>call[0]).filter(m=>m.threadId==='thr_woo').map(m=>JSON.stringify(m));
   assert.ok(told.some(m=>/build 8 does not work on the owner's iPhone/.test(m)),told.join('\n'));
@@ -162,14 +165,43 @@ test('a release read-back must name the required TestFlight group, and a Safi ta
 });
 
 test("an owner tap hours later reads the PR fresh from GitHub before it records the proof",async()=>{
- const {host,store}=await deck();try {
+ const {host,store,tap}=await deck();try {
   const asked=text(await deliveries(host,{action:'device-proof',id:key(WOO,130),commitSha:head(130).slice(0,7),build:'8',link:'https://testflight.apple.com/join/abc',check:'Send a photo'},'thr_woo'));
   const askId=/card (a[0-9a-z]{6})/.exec(asked)[1];
   store.stale(key(WOO,130),'GitHub did not answer');
   assert.equal(store.get(key(WOO,130)).freshness,'stale');
-  await host.harness.behavior.callRpc('resolveAsk',{threadId:'thr_cap',id:askId,resolution:'Works'});
+  await tap(askId,'Works');
   const row=store.get(key(WOO,130));
   assert.equal(row.verifiedCommitSha,head(130));
   assert.equal(row.verification.actor,'owner');
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+// Checker FF2-verdict-1, #144 finding 1: only the owner's exact Works tap, confirmed by Telegram, is proof.
+test('an answer that is not the exact Works choice, or that Telegram did not record from the owner, records no proof',async()=>{
+ const {host,store,tap}=await deck();try {
+  const open=async(build)=>/card (a[0-9a-z]{6})/.exec(text(await deliveries(host,{action:'device-proof',id:key(WOO,130),commitSha:head(130).slice(0,7),build,link:'https://testflight.apple.com/join/abc',check:'Send a photo'},'thr_woo')))[1];
+  const first=await open('8');
+  await tap(first,'Works for build 7, build 8 not tested');
+  assert.equal(store.get(key(WOO,130)).verifiedCommitSha,null,'not the exact Works choice');
+  const second=await open('8');
+  assert.deepEqual(await host.harness.behavior.callRpc('resolveAsk',{threadId:'thr_cap',id:second,resolution:'Works'}),{ok:true});
+  assert.equal(store.get(key(WOO,130)).verifiedCommitSha,null,'a plain RPC call with no owner tap recorded by Telegram');
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+// #144 finding 2: a new build at the same head gets its own card; the older card is replaced.
+test('a second build at the same head opens its own card and replaces the first; the same build twice keeps one card',async()=>{
+ const {host,store,tap}=await deck();try {
+  const open=async(build)=>text(await deliveries(host,{action:'device-proof',id:key(WOO,130),commitSha:head(130).slice(0,7),build,link:'https://testflight.apple.com/join/abc',check:'Send a photo'},'thr_woo'));
+  const eight=/card (a[0-9a-z]{6})/.exec(await open('8'))[1];
+  const again=await open('8');
+  assert.match(again,new RegExp(`card ${eight} is already open`));
+  const nine=/card (a[0-9a-z]{6})/.exec(await open('9'))[1];
+  assert.notEqual(nine,eight);
+  await tap(eight,'Works');
+  assert.equal(store.get(key(WOO,130)).verifiedCommitSha,null,'the replaced build 8 card no longer proves anything');
+  await tap(nine,'Works');
+  assert.equal(store.get(key(WOO,130)).verification.build,'9');
  }finally{await host.harness.lifecycle.dispose();}
 });
