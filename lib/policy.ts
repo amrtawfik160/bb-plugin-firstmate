@@ -423,7 +423,8 @@ export function hasTerminalVerdict(lines: string[]): boolean {
 function isWorkerStatusLine(line: string): boolean {
   const verb = statusLineVerb(line).toLowerCase();
   // Delivery observations are plugin annotations, not a new worker event.
-  if (verb === "note" && statusLineNote(line).startsWith("FM_DELIVERY_NOTICE=")) return false;
+  if (verb === "note" && (line.slice(0, line.indexOf(":")).includes("[source=bb-plugin]")
+    || statusLineNote(line).startsWith("FM_DELIVERY_NOTICE="))) return false;
   return STATUS_VERBS.has(verb) || verb === "waiting" || verb === "note";
 }
 

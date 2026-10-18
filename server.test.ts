@@ -7396,10 +7396,10 @@ test("IT F5: turnEndGuard bounds unchanged wakes and resets only for new work", 
 
 // ---- re-review: tellOwner steer must not be weaponized by fm-watch ----
 
-test("note: report lines never override the crew's real terminal verb (latestStatus/summary)", () => {
+test("plugin report annotations never override the crew's real terminal verb (latestStatus/summary)", () => {
   // A crew's real verb followed by our appended report note: latestStatus must still
   // report `done`, and the summary must not show the note as the crew's state.
-  const lines = ["working: building", "done: shipped PR #9", "note: crew c1 update REPORTX"];
+  const lines = ["working: building", "done: shipped PR #9", "note [source=bb-plugin]: crew c1 update REPORTX"];
   assert.deepEqual(latestStatus(lines), { verb: "done", note: "shipped PR #9" });
   const summary = statusProtocolSummary(lines);
   assert.match(summary ?? "", /state: done/);

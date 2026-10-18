@@ -7,6 +7,7 @@ const receiptSchema = z.object({
   path: z.string(),
   replayed: z.boolean(),
   truncated: z.boolean(),
+  decisionsRepeated: z.boolean().optional(),
 });
 export type WakeReceipt = z.infer<typeof receiptSchema>;
 
@@ -19,9 +20,16 @@ export function parseWakeReceipt(output: string): WakeReceipt {
 export function renderWakeReceipt(receipt: WakeReceipt): string {
   // The journal owns native acknowledgement. Exposing its command alongside
   // handledWake sends captains down two competing completion paths.
-  const report = receipt.id
+  let report = receipt.id
     ? receipt.report.replace(/^WAKE_ACK_REQUIRED:[^\r\n]*(?:\r?\n|$)/gm, "")
     : receipt.report;
+  if (receipt.decisionsRepeated && !receipt.truncated) {
+    let inside = false;
+    report = report.split("\n").filter((line) => {
+      if (/^[A-Z][A-Z ]{3,}[A-Z](?: \(|:)/.test(line)) inside = line.startsWith("OPEN DECISIONS");
+      return !inside;
+    }).join("\n");
+  }
   const lines = [report.trim() || "No unread reports."];
   if (receipt.truncated) lines.push(`REPORT TRUNCATED: read the full report at ${receipt.path} before completing this receipt.`);
   if (receipt.id) {

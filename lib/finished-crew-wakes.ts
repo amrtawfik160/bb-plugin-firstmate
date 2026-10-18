@@ -67,7 +67,7 @@ export function quietStaleVerdict(crew: QuietCrew): QuietVerdict {
   if (crew.forgotten) return "forgotten";
   const resting = crew.archived || crew.threadStatus === "idle" || crew.threadStatus === "error";
   if (!resting) return "surface";
-  if (crew.statusVerb === "paused" || crew.statusVerb === "captain-held") return "declared-wait";
+  if (crew.statusVerb === "paused" || crew.statusVerb === "waiting" || crew.statusVerb === "captain-held") return "declared-wait";
   if (crew.statusVerb === "done") return "finished";
   // working, blocked, needs-decision and failed are the status file's own word; chat does not override it.
   if (crew.statusVerb !== null && crew.statusVerb !== "resolved") return "surface";

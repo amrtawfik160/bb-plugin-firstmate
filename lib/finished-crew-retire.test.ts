@@ -41,6 +41,7 @@ test("a crew that is not finished, or still needed, is kept with the reason", ()
 
 test("latestStatusAt reads the latest status line's time tag and skips plugin notes", () => {
   assert.equal(latestStatusAt([`done [at=100]: x`, "note: FM_DELIVERY_NOTICE=a#1"]), 100_000);
+  assert.equal(latestStatusAt(["done [at=100]: complete", "note [source=bb-plugin]: crew update"]), 100_000);
   assert.equal(latestStatusAt([]), null);
   for (const verb of ["waiting", "note"]) {
     assert.equal(latestStatusAt(["done [at=100]: complete", `${verb} [at=200]: follow-up`]), 200_000);

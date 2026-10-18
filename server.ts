@@ -2986,8 +2986,8 @@ export default async function plugin(bb: BbPluginApi) {
       // restated: it is not captain-relevant, so a drain never prints the copy.
       `fm_bb_note() {`,
       `  held=$( . "$(dirname "$lib")/fm-classify-lib.sh" >/dev/null 2>&1 && line=$(status_declared_wait_line ${shQuote(statusPath)}) && status_is_paused "$line" && printf '%s' "$line" ) || held=`,
-      `  printf 'note: %s\\n' "$note" >> ${shQuote(statusPath)}`,
-      `  [ -z "$held" ] || [ "$(tail -n 1 ${shQuote(statusPath)})" != "note: $note" ] || printf '%s\\n' "$held" >> ${shQuote(statusPath)}`,
+      `  printf 'note [source=bb-plugin]: %s\\n' "$note" >> ${shQuote(statusPath)}`,
+      `  [ -z "$held" ] || [ "$(tail -n 1 ${shQuote(statusPath)})" != "note [source=bb-plugin]: $note" ] || printf '%s\\n' "$held" >> ${shQuote(statusPath)}`,
       `}`,
       ...(dedupMarker ? [
         `fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK" || exit 1`,
@@ -11165,7 +11165,7 @@ export default async function plugin(bb: BbPluginApi) {
     timeoutMs: number;
     signal?: AbortSignal;
     stdin?: string;
-    receipt?: { action: "receive" | "inspect" | "begin-action" | "mark-success" | "complete" | "legacy-ack"; id?: string };
+    receipt?: { action: "receive" | "inspect" | "begin-action" | "mark-success" | "complete" | "complete-hidden" | "legacy-ack"; id?: string };
     // The caller already ran the away-return checks for this start.
     returnChecked?: boolean;
   }): Promise<{ exitCode: number | null; output: string; scriptPath: string; receipt?: WakeReceipt }> {
@@ -11349,8 +11349,7 @@ export default async function plugin(bb: BbPluginApi) {
     recoveryGeneration?: string,
     hostOverride?: string,
     signal?: AbortSignal,
-    receipt?: { action: "receive" | "inspect" | "begin-action" | "mark-success" | "complete"; id?: string },
-    emptyAfterHide = 0,
+    receipt?: { action: "receive" | "inspect" | "begin-action" | "mark-success" | "complete" | "complete-hidden"; id?: string },
   ): Promise<string> {
     const current = await settings.get();
     const fmHome = current.fmHome.trim();
@@ -11370,13 +11369,15 @@ export default async function plugin(bb: BbPluginApi) {
     ) {
       args.push("--ack-through", String(Math.max(0, Math.trunc(ackThrough))), "--recovery-generation", recoveryGeneration);
     }
+    let quietPruned = 0;
     try {
       // Before every native read of the queue: a fresh read, and the re-read that follows
       // an acknowledgement.
       if (captainThreadId && args.length === 0 && (receipt === undefined || receipt.action === "receive" || receipt.action === "complete")) {
-        await pruneQuietStaleRows(captainThreadId, hostId, fmHome, signal).catch((error) => {
+        quietPruned = await pruneQuietStaleRows(captainThreadId, hostId, fmHome, signal).catch((error) => {
           if (isAbortError(error)) throw error;
           bb.log.warn(`quiet stale prune skipped captain=${captainThreadId}: ${error instanceof Error ? error.message : String(error)}`);
+          return 0;
         });
       }
       // D6: drain/ack only the CALLER captain's own scoped state plane.
@@ -11400,11 +11401,12 @@ export default async function plugin(bb: BbPluginApi) {
       if (res.exitCode !== 0) throw new Error(`native exit ${res.exitCode}: ${raw || "no diagnostic output"}`);
       const out = captainThreadId ? await hideFinishedCrewWakes(raw, captainThreadId, hostId, fmHome, signal) : raw;
       // A receipt opened before its rows were removed can hold nothing but hidden rows.
+      // Pruning the last quiet row can also leave a zero-cutoff recovery receipt.
       // The plugin completes it, so the captain is not handed an empty batch to acknowledge.
       const open = res.receipt;
-      if (out !== raw && open?.id && open.phase === "ready" && emptyAfterHide < 2 && wakeBatchIsEmpty(out)) {
+      if ((out !== raw || quietPruned > 0) && open?.id && open.phase === "ready" && !open.truncated && wakeBatchIsEmpty(out)) {
         bb.log.info(`wake drain: receipt ${open.id} held only hidden rows; completed without the captain`);
-        return await drainWakes(captainThreadId, undefined, undefined, hostOverride, signal, { action: "complete", id: open.id }, emptyAfterHide + 1);
+        return await drainWakes(captainThreadId, undefined, undefined, hostOverride, signal, { action: "complete-hidden", id: open.id });
       }
       // After a successful drain and under its own short budget, so a slow host can only
       // delay housekeeping, never the drain itself. Its effect shows from the next drain.
@@ -11451,8 +11453,19 @@ export default async function plugin(bb: BbPluginApi) {
     const wanted = finishedCrewCandidates(rows);
     if (wanted.threads.length === 0 && wanted.crewIds.length === 0) return out;
     try {
-      const filtered = withoutFinishedCrewWakes(out, await finishedCrewsWithTrackedPrs(captainThreadId, hostId, fmHome, wanted, signal));
-      if (filtered.hidden > 0) bb.log.info(`wake drain: hid ${filtered.hidden} idle alert(s) for DONE crews whose PRs the tracker owns (captain ${captainThreadId})`);
+      const finished = await finishedCrewsWithTrackedPrs(captainThreadId, hostId, fmHome, wanted, signal);
+      const stale = staleQueueRows(out);
+      const crews = stale.length === 0 ? [] : await readCrews();
+      const quiet = new Set<string>();
+      for (const threadId of new Set(stale.map((row) => row.threadId))) {
+        if (await quietCrewVerdict(threadId, captainThreadId, crews, signal) !== "surface") quiet.add(threadId);
+      }
+      const hiddenSeqs = new Set(stale.filter((row) => quiet.has(row.threadId)).map((row) => row.seq));
+      const filtered = withoutFinishedCrewWakes(out, finished);
+      filtered.text = filtered.text.split("\n").filter((line) => {
+        const row = parseWakeRow(line);
+        return row === null || !hiddenSeqs.has(row.seq);
+      }).join("\n");
       return filtered.text;
     } catch (error) {
       bb.log.warn(`wake drain: finished-crew filter skipped: ${error instanceof Error ? error.message : String(error)}`);

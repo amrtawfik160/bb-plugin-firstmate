@@ -9,7 +9,13 @@ The latest waiting event describes waiting for the owner's TestFlight answer.
 those lines and returns the old `done`. Both `quietCrewVerdict` and
 `finishedCrewsWithTrackedPrs` use this reader. This explains the `finished` label:
 it describes a recognized status verb, not proof that the task's work is live.
-The status classification itself is unchanged by this repair.
+Commit `c2f3bdca` repairs this classifier first: verdicts and grace timestamps
+now use the same newest worker event. Newer `waiting` and worker `note` events
+prevent retirement. New plugin notes carry `[source=bb-plugin]`; this structured
+origin and the legacy `FM_DELIVERY_NOTICE` marker keep annotations separate.
+Untagged notes remain worker events. The two
+checker API tests reproduced both command and scheduled teardown before the fix;
+they keep the crew after the fix.
 
 The native watcher's `wedge_timer_check` deliberately resets its timer and
 increments its escalation count each time it queues a wedge. Removing a queued
@@ -27,6 +33,24 @@ warning has no acknowledgement pair. That warning prevented the receipt
 journal from recognizing an unchanged OPEN DECISIONS section as already shown.
 
 ## Repair
+
+The original pairless-warning fix was insufficient: the receipt helper's second
+native read could return a replacement hidden stale row with a valid pair.
+The checker reproduced six stale-only receipts across six completions for a
+paused crew without a tracked PR.
+
+Pruning the final quiet row can leave a zero-cutoff native recovery receipt.
+It is completed only with its recorded pair when this call removed quiet rows
+and no report remains. Unchanged decisions use the journal's persisted repeat
+flag, so they cannot turn a hidden paired refill into a successor receipt.
+
+The presentation filter now applies the quiet-crew rule to those returned rows,
+using fresh BB thread and worker status reads. A receipt containing only hidden
+rows is completed through its recorded native acknowledgement pair, without
+refreshing directly into another hidden batch. This choice is persisted in the
+journal so recovery cannot re-enter that refresh loop. Later rows remain queued;
+real status produced by the acknowledgement becomes a successor receipt.
+Truncated presentations are never completed automatically.
 
 After the existing bounded retry for a warning-only presentation, remove the
 native pending warning from presentations with no acknowledgement pair. Apply
@@ -63,10 +87,13 @@ Additional checks in `scripts/wake-receipt.test.ts`:
 No live home was modified. No plugin reload, merge or server restart is part
 of this repair.
 
-Final validation: type checking passed. The full suite passed 1,791 tests and
-skipped 11 tests, with no failures. The receipt-only suite passed 48 tests and
-skipped 6 native-fixture tests. The 11 focused timeout/package-discovery tests
-passed without skips. The first full run exposed six fixed-chunk-count
-assertions; these now permit payload growth while checking one staged execution
-and complete cleanup. Its separate package-discovery cleanup race did not
-recur in either the focused run or the final full run.
+The initial revision passed its full suite, but the checker supplied the paired
+API reproduction above that its earlier helper-only fixture did not cover.
+The permanent API cases now run against the shipped native bundle for paused,
+waiting, working, late-report and open-decision scenarios. The helper tests also
+cover hidden acknowledgement recovery and real status returned during that ack.
+
+
+See [the retirement audit](164-retirement-audit.md) for the copied records of
+17 retirements since the base commit, including the six crews whose newest
+status cannot be proven. No restoration was performed.

@@ -76,6 +76,80 @@ function fixture(t: { after: (fn: () => void) => void }, initial: Record<string,
   return { dir, state, script, raw, run, read, update };
 }
 
+test("checker164: real wedge escalations are each presented and acknowledged once", (t) => {
+  const f = fixture(t);
+  for (const seq of [1, 2]) {
+    f.update({ queue: [{ seq, text: `stale: bb:thr_working (possible wedge, escalation ${seq})` }] });
+    const report = f.run();
+    assert.ok(report.id);
+    assert.equal(report.pair?.through, seq);
+    assert.match(report.report, new RegExp(`escalation ${seq}`));
+    assert.equal(f.run().id, report.id);
+    assert.equal(f.read().acks ?? 0, seq - 1);
+    assert.equal(f.run("complete", report.id).id, null);
+    assert.equal(f.read().acks, seq);
+    assert.deepEqual(f.read().queue, []);
+  }
+});
+
+test("checker164: mixed real and late rows never acknowledge an unseen report", (t) => {
+  const f = fixture(t, {
+    queue: [{ seq: 4, text: "real report" }],
+    arriving: [{ seq: 5, text: "late report" }],
+  });
+  const first = f.run();
+  assert.ok(first.id);
+  assert.equal(first.pair?.through, 4);
+  assert.match(first.report, /real report/);
+  assert.doesNotMatch(first.report, /late report/);
+  assert.equal(f.read().acks, undefined);
+  const next = f.run("complete", first.id);
+  assert.ok(next.id);
+  assert.equal(next.pair?.through, 5);
+  assert.match(next.report, /late report/);
+  assert.deepEqual(f.read().queue, [{ seq: 5, text: "late report" }]);
+  assert.equal(f.read().acks, 1);
+  assert.equal(f.run("complete", next.id).id, null);
+  assert.equal(f.read().acks, 2);
+});
+
+test("hidden-only completion acknowledges its own pair without refreshing into another hidden batch", (t) => {
+  const f = fixture(t, { queue: [{ seq: 4, text: "hidden waiting crew" }], arriving: [{ seq: 5, text: "late real report" }] });
+  const first = f.run();
+  assert.equal(first.pair?.through, 4);
+  const completed = f.run("complete-hidden", first.id!);
+  assert.equal(completed.id, null);
+  assert.equal(f.read().reads, 1, "completion does not consume another presentation");
+  assert.equal(f.read().acks, 1);
+  assert.deepEqual(f.read().queue, [{ seq: 5, text: "late real report" }]);
+  const next = f.run();
+  assert.match(next.report, /late real report/);
+  assert.equal(next.pair?.through, 5);
+});
+
+test("hidden completion recovers its acknowledgement after a deadline without refreshing", (t) => {
+  const f = fixture(t, { queue: [{ seq: 4, text: "hidden waiting crew" }], pause: "acks", pauseSeconds: 0.5 });
+  const first = f.run();
+  const pending = f.raw("complete-hidden", first.id!, f.script, { FM_WAKE_RECEIPT_BUDGET: "0.1" });
+  assert.equal(pending.status, 75);
+  const recovered = f.run();
+  assert.equal(recovered.id, null);
+  assert.equal(f.read().acks, 1);
+  assert.equal(f.read().reads, 1);
+});
+
+test("hidden completion keeps a real status produced by native acknowledgement", (t) => {
+  const f = fixture(t, { queue: [{ seq: 4, text: "hidden waiting crew" }], ackOutput: "UNREAD STATUS:\nreal status after hidden acknowledgement\n" });
+  const first = f.run();
+  const next = f.run("complete-hidden", first.id!);
+  assert.ok(next.id);
+  assert.notEqual(next.id, first.id);
+  assert.match(next.report, /real status after hidden acknowledgement/);
+  assert.equal(f.read().acks, 1);
+  assert.equal(f.read().reads, 1);
+  assert.equal(f.run("inspect", next.id).id, next.id);
+});
+
 test("receive and inspect replay the same unconsumed receipt across processes", (t) => {
   const f = fixture(t, { queue: [{ seq: 1, text: "worker needs approval" }] });
   const first = f.run();
