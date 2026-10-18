@@ -5690,19 +5690,13 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  // The captain the latest Telegram owner message reached. The connector delivers owner messages to its
-  // bound captain only, so this names the binding when the connector's freeText output does not.
-  const TELEGRAM_CAPTAIN_KEY = "telegram-bound-captain";
-  let telegramCaptain: string | undefined;
-  async function noteTelegramCaptain(threadId: string): Promise<void> {
-    if (telegramCaptain === threadId) return;
-    telegramCaptain = threadId;
-    await bb.storage.kv.set(TELEGRAM_CAPTAIN_KEY, threadId);
-  }
+  // Warned once per load: a connector that does not name its bound captain.
+  let freeTextUnboundWarned = false;
 
   /**
    * The connector's free-text obligations: the captain is told of each once, by its ref, and the connector is told after.
-   * They belong to the binding, so only its captain is told: the one the connector names, else the one owner messages reach.
+   * They belong to the binding, so only the captain the connector names is told. Without that name no captain is told:
+   * the obligations stay pending, and the connector's 15-minute notice tells the owner they wait.
    */
   async function tellFreeText(captainThreadId: string): Promise<void> {
     let rows: Array<{ ref: string; text: string; at: number }>;
@@ -5719,8 +5713,12 @@ export default async function plugin(bb: BbPluginApi) {
       throw error;
     }
     if (rows.length === 0) return;
-    bound ??= telegramCaptain ?? (await bb.storage.kv.get<string>(TELEGRAM_CAPTAIN_KEY)) ?? undefined;
-    if (typeof bound === "string" && bound !== "" && bound !== captainThreadId) return;
+    if (bound === undefined || bound === "") {
+      if (!freeTextUnboundWarned) bb.log.warn("telegram free-text check: the connector does not name its bound captain; no captain is told until it does");
+      freeTextUnboundWarned = true;
+      return;
+    }
+    if (bound !== captainThreadId) return;
     const lines = rows.map((row) => `- ${row.ref}: "${row.text.replace(/\s+/g, " ").slice(0, 160)}"`);
     await bb.sdk.threads.send({
       threadId: captainThreadId, mode: "steer",
@@ -14891,7 +14889,6 @@ export default async function plugin(bb: BbPluginApi) {
         const flags = await reliabilityFlags();
         const text = context.input.text;
         const telegram = parseTelegramSubmission(context.experimental_submission?.data) ?? parseInboundTelegram(text);
-        if (telegram) await noteTelegramCaptain(threadId).catch((error) => bb.log.warn(`telegram captain note: ${String(error)}`));
         if (String(context.initiator) === "user") {
           await recordAskAnswers(threadId, text, context.queuedMessages ?? []).catch((error) => bb.log.warn(`owner ask answer: ${String(error)}`));
         }
@@ -15094,7 +15091,7 @@ export default async function plugin(bb: BbPluginApi) {
   // The thread.idle trigger alone never reaches a captain that is already idle past the
   // budget (it crossed it before this build, or its last turn ended while compaction was
   // cooling down); the release service sweeps those.
-  /** False when the captain is archived or deleted. */
+  /** False when the captain is archived or deleted (marked so, or BB answers 404). Any other failed read keeps it. */
   async function compactIdleCaptain(threadId: string, signal?: AbortSignal): Promise<boolean> {
     try {
       const thread = asRecord(await raceAbort(bb.sdk.threads.get({ threadId }), signal, STUCK_HOST_CALL_MS));
@@ -15102,7 +15099,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (thread["status"] !== "idle") return true;
     } catch (error) {
       if (isAbortError(error)) throw error;
-      return true;
+      return !(asRecord(error)["status"] === 404 || /\bHTTP 404\b.*Thread not found/i.test(String(error)));
     }
     await maybeCompactCaptain(threadId, signal);
     return true;
