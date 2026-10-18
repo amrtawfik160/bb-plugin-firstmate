@@ -27,9 +27,14 @@ export type OwnerAsk = {
   project?: string;
   task?: string;
   subject?: string;
-  /** The owner skipped the card ("decide later") until this time: it is still open but waits on no one until then. */
+  /**
+   * The owner skipped the card ("decide later") until this time: it is still open but waits on no one
+   * until then. A card once skipped never proceeds on its deadline: at this time it waits for the owner.
+   */
   deferredUntil?: number;
 };
+
+export type AskDeferral = { deferred: string[]; already: string[]; refused: string[]; until: number | null };
 
 export type NewOwnerAsk = Pick<OwnerAsk, "captain" | "kind" | "text" | "options"> & {
   impact?: string;
@@ -150,10 +155,15 @@ export type OwnerAsks = {
   /** Correct or reopen an ask owned by this captain. */
   resolve(id: string, captain: string, state: AskState, resolution: string, at: number): OwnerAsk | undefined;
   /**
-   * The owner skipped these cards until `until`: each of this captain's open asks is deferred, and stays
-   * open. `already`: asks deferred until that same time before, so a repeat changes nothing.
+   * The owner skipped these cards until `until`. All or nothing: when any id is not this captain's open
+   * ask, nothing changes and `refused` names those ids. `already`: asks still skipped from before, which
+   * keep their time; `until` is the time in effect for the cards (null when refused).
    */
-  defer(ids: readonly string[], captain: string, until: number): { deferred: string[]; already: string[] };
+  defer(ids: readonly string[], captain: string, until: number, now?: number): AskDeferral;
+  /** This captain's skipped asks, still skipped at `now`, whose captain was not told yet. */
+  untoldSkips(captain: string, now: number): OwnerAsk[];
+  /** The captain was told of these skipped asks. */
+  markSkipsTold(ids: readonly string[]): void;
   /** Mark this captain's overdue reversible asks defaulted and return them, each exactly once. */
   takeDue(captain: string, now: number): OwnerAsk[];
 };
@@ -219,7 +229,7 @@ export function createOwnerAsks(db: Database): OwnerAsks {
       id TEXT PRIMARY KEY, message_url TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS owner_ask_route (
       id TEXT PRIMARY KEY, project TEXT, task TEXT, subject TEXT);
-    CREATE TABLE IF NOT EXISTS owner_ask_defer (id TEXT PRIMARY KEY, until INTEGER NOT NULL);`);
+    CREATE TABLE IF NOT EXISTS owner_ask_defer (id TEXT PRIMARY KEY, until INTEGER NOT NULL, told INTEGER NOT NULL DEFAULT 0);`);
 
   const select = `SELECT owner_ask.*,
     (SELECT impact FROM owner_ask_impact WHERE id=owner_ask.id) AS impact,
@@ -288,19 +298,26 @@ export function createOwnerAsks(db: Database): OwnerAsks {
     get,
     listOpen,
     listWaiting: (captain, now) => listOpen(captain).filter((ask) => !isDeferred(ask, now)),
-    defer(ids, captain, until) {
+    defer(ids, captain, until, now = Date.now()) {
       return db.transaction(() => {
-        const deferred: string[] = [];
-        const already: string[] = [];
-        for (const id of new Set(ids)) {
-          const current = get(id);
-          if (!current || current.captain !== captain || current.state !== "open") continue;
-          if (current.deferredUntil === until) { already.push(id); continue; }
-          db.prepare("INSERT INTO owner_ask_defer VALUES (?,?) ON CONFLICT(id) DO UPDATE SET until=excluded.until").run(id, until);
-          deferred.push(id);
+        const wanted = [...new Set(ids)];
+        const current = wanted.map((id) => ({ id, ask: get(id) }));
+        const refused = current.filter(({ ask }) => !ask || ask.captain !== captain || ask.state !== "open").map(({ id }) => id);
+        if (refused.length > 0) return { deferred: [], already: [], refused, until: null };
+        const already = current.filter(({ ask }) => isDeferred(ask!, now));
+        const deferred = current.filter(({ ask }) => !isDeferred(ask!, now)).map(({ id }) => id);
+        const effective = already.length > 0 ? Math.max(...already.map(({ ask }) => ask!.deferredUntil!)) : until;
+        for (const id of deferred) {
+          db.prepare("INSERT INTO owner_ask_defer VALUES (?,?,0) ON CONFLICT(id) DO UPDATE SET until=excluded.until, told=0").run(id, effective);
         }
-        return { deferred, already };
+        return { deferred, already: already.map(({ id }) => id), refused: [], until: effective };
       })();
+    },
+    untoldSkips(captain, now) {
+      return listOpen(captain).filter((ask) => isDeferred(ask, now) && (db.prepare("SELECT told FROM owner_ask_defer WHERE id=?").get(ask.id) as { told: number } | undefined)?.told === 0);
+    },
+    markSkipsTold(ids) {
+      for (const id of ids) db.prepare("UPDATE owner_ask_defer SET told=1 WHERE id=?").run(id);
     },
     listCandidates(captain, now) {
       return (db.prepare(`${select} WHERE captain=? AND (state='open' OR (state='answered' AND resolved_at>=?)) ORDER BY created_at, owner_ask.id`).all(captain, now - 86_400_000) as AskRecord[]).map(fromRecord);
@@ -318,7 +335,7 @@ export function createOwnerAsks(db: Database): OwnerAsks {
     },
     takeDue(captain, now) {
       return db.transaction(() => {
-        const due = listOpen(captain).filter((ask) => !isDeferred(ask, now) && ask.defaultAt !== null && ask.defaultAt <= now && mayDefault(ask) && recommendedLabel(ask) !== null);
+        const due = listOpen(captain).filter((ask) => ask.deferredUntil === undefined && ask.defaultAt !== null && ask.defaultAt <= now && mayDefault(ask) && recommendedLabel(ask) !== null);
         return due.map((ask) => {
           const resolution = recommendedLabel(ask)!;
           db.prepare("UPDATE owner_ask SET state='defaulted', resolution=?, resolved_at=? WHERE id=?").run(resolution, now, ask.id);
