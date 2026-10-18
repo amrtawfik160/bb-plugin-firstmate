@@ -297,3 +297,38 @@ test("16 Oct project topics: a reply held back as a card repeat says what really
     } finally { await host.harness.lifecycle.dispose(); }
   }
 });
+
+// 18 Oct, owner: "add skip button also in the waiting for you section". The Board's Skip defers the card
+// ("decide later") and the captain is told once, so it neither waits on the card nor acts on it.
+test("deferAsk skips the owner's open cards until a time, tells the captain once, and takes them off Needs you", async () => {
+  const host = await captainHost();
+  try {
+    const asks = createOwnerAsks(host.bb.storage.database());
+    const options = [{ label: "Publish", value: "publish" }, { label: "Wait", value: "wait" }];
+    asks.create({ id: "askip1", captain: "thr_cap", kind: "question", text: "Publish Safi?", options, createdAt: Date.now() });
+    asks.create({ id: "askip2", captain: "thr_cap", kind: "question", text: "Rename the app?", options, createdAt: Date.now() });
+    const until = Date.UTC(2030, 0, 2, 7, 0);
+
+    assert.deepEqual(await host.harness.behavior.callRpc("deferAsk", { threadId: "thr_other", ids: ["askip1"], until }), { ok: false, deferred: [] });
+    assert.deepEqual(await host.harness.behavior.callRpc("deferAsk", { threadId: "thr_cap", ids: ["askip1"], until }), { ok: true, deferred: ["askip1"] });
+    assert.equal(asks.get("askip1")?.deferredUntil, until);
+
+    const told = host.harness.sdk.callsTo("threads.send").map((call) => call[0] as { threadId: string; mode: string; input: Array<{ text: string; visibility?: string }> });
+    assert.equal(told.length, 1);
+    assert.equal(told[0]!.threadId, "thr_cap");
+    assert.equal(told[0]!.mode, "steer");
+    assert.equal(told[0]!.input[0]!.visibility, "agent-only");
+    assert.match(told[0]!.input[0]!.text, /askip1/);
+    assert.match(told[0]!.input[0]!.text, /2030-01-02 07:00 UTC/);
+    assert.match(told[0]!.input[0]!.text, /do not act on it/i);
+
+    assert.deepEqual(await host.harness.behavior.callRpc("deferAsk", { threadId: "thr_cap", ids: ["askip1"], until }), { ok: true, deferred: [] }, "a repeat is a no-op");
+    assert.equal(host.harness.sdk.callsTo("threads.send").length, 1, "the captain is told once");
+
+    const board = await host.harness.behavior.callRpc("telegramCommand", { threadId: "thr_cap", command: "board" }) as { text: string };
+    assert.match(board.text, /Rename the app\?/);
+    assert.doesNotMatch(board.text, /Publish Safi\?/, "a skipped card is not in Needs you");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});

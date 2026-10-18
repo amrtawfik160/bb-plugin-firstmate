@@ -133,3 +133,41 @@ test("no check judges reply prose: the plain-text decision and card-repeat match
     assert.equal(name in ownerAsksModule, false, name);
   }
 });
+
+// 18 Oct, owner: "add skip button also in the waiting for you section". Skip is "decide later": the card
+// is deferred until a time, never deleted, and comes back on its own when that time is up.
+test("a skipped card is deferred until its time, keeps its options, does not default meanwhile, and comes back on its own", () => {
+  const asks = createOwnerAsks(db());
+  const options = [{ label: "Yes", value: "yes" }, { label: "No", value: "no" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "question", text: "Ship?", options, recommended: 0, defaultAt: NOW - 1, createdAt: NOW - 60_000 });
+  asks.create({ id: "a2", captain: "thr_cap", kind: "question", text: "Other?", options, createdAt: NOW - 60_000 });
+  asks.create({ id: "a3", captain: "thr_other", kind: "question", text: "Foreign?", options, createdAt: NOW - 60_000 });
+  asks.resolve("a2", "thr_cap", "answered", "Yes", NOW - 1000);
+  const until = NOW + 3_600_000;
+
+  assert.deepEqual(asks.defer(["a1", "a2", "a3", "missing"], "thr_cap", until), { deferred: ["a1"], already: [] }, "only this captain's open cards are skipped");
+  assert.equal(asks.get("a1")?.state, "open", "a skipped card is still open: an answer on it still counts");
+  assert.equal(asks.get("a1")?.deferredUntil, until);
+  assert.equal(asks.get("a3")?.deferredUntil, undefined);
+  assert.equal(ownerAsksModule.isDeferred(asks.get("a1")!, NOW), true);
+  assert.deepEqual(asks.listWaiting("thr_cap", NOW).map((ask) => ask.id), [], "a skipped card does not wait on the owner");
+  assert.deepEqual(asks.takeDue("thr_cap", NOW), [], "a skipped card does not proceed on its deadline while skipped");
+
+  assert.deepEqual(asks.defer(["a1"], "thr_cap", until), { deferred: [], already: ["a1"] }, "the same skip again changes nothing");
+
+  assert.equal(ownerAsksModule.isDeferred(asks.get("a1")!, until), false, "at its time the card is back");
+  assert.deepEqual(asks.listWaiting("thr_cap", until).map((ask) => ask.id), ["a1"]);
+  assert.deepEqual(asks.takeDue("thr_cap", until).map((ask) => ask.id), ["a1"], "once back, a passed deadline applies again");
+});
+
+test("a skipped card answered early is answered, and a reopened card is no longer skipped", () => {
+  const asks = createOwnerAsks(db());
+  const options = [{ label: "Yes", value: "yes" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "question", text: "Ship?", options, createdAt: NOW });
+  asks.defer(["a1"], "thr_cap", NOW + 3_600_000);
+  asks.resolve("a1", "thr_cap", "answered", "Yes", NOW + 60_000);
+  assert.equal(asks.get("a1")?.state, "answered");
+  asks.resolve("a1", "thr_cap", "open", "", NOW + 120_000);
+  assert.equal(asks.get("a1")?.deferredUntil, undefined, "a reopened card waits on the owner again");
+  assert.deepEqual(asks.listWaiting("thr_cap", NOW + 120_000).map((ask) => ask.id), ["a1"]);
+});
