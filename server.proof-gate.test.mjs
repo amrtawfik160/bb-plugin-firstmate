@@ -167,8 +167,9 @@ test('a release read-back must name the required TestFlight group, and a Safi ta
   const release=(as,group,extra={commitSha:'f'.repeat(40)})=>deliveries(host,{action:'release',task:task.id,build:'21',group,source:'app-store-connect',seen:`build 21 is in ${group}, state Approved`,...extra},as);
   assert.match(text(await release('thr_cap','Beta Testers')),/^(?:Error: )?Refusing: only a crew records a release read-back/);
   // Checker 162-verdict-1 fix 2: a read-back names its build's commit or build time, so it proves only the merges that build holds.
-  assert.match(text(await release('thr_safi','Beta Testers',{})),/A release read-back needs commitSha \(the commit the build was built from\) or builtAt/);
-  assert.match(text(await release('thr_safi','Beta Testers',{builtAt:'yesterday-ish'})),/builtAt yesterday-ish is not a time/);
+  assert.match(text(await release('thr_safi','Beta Testers',{})),/A release read-back needs commitSha: the commit the build was built from/);
+  assert.match(text(await release('thr_safi','Beta Testers',{builtAt:'2026-10-18T10:41Z'})),/needs commitSha.*a build time is not proof/, "a build time alone is refused (checker 162-verdict-2)");
+  assert.match(text(await release('thr_safi','Beta Testers',{builtAt:'yesterday-ish',commitSha:'f'.repeat(40)})),/builtAt yesterday-ish is not a time/);
   assert.match(text(await release('thr_safi','Team (Expo)')),/^(?:Error: )?Refusing: Safi builds must be in the "Beta Testers" public-link group, not "Team \(Expo\)"\. Add build 21 to "Beta Testers", read it back from App Store Connect or EAS, then record it again\./);
   assert.match(text(await tool(host,'firstmate_task').execute({action:'close',id:task.id,state:'live',reason:'Build 21 is live on TestFlight'},ctx)),/Task T1 is a Safi release with a merged PR: it closes only with a crew's read-back of the build in "Beta Testers"/);
   assert.match(text(await release('thr_safi','Beta Testers')),/Release read-back recorded for T1: build 21 in "Beta Testers"/);

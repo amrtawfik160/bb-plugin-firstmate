@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { projectForName, type LiveCheck, type LiveRule } from "../owner/projects.ts";
-import { readEnvFile, readProduction, taskLiveVerdict, type LiveDeps, type PrDetails, type ProductionRead, type ReaderDeps, type ReleaseEvidence } from "./live-checks.ts";
+import { easBuildCommit, readEnvFile, readProduction, taskLiveVerdict, type LiveDeps, type PrDetails, type ProductionRead, type ReaderDeps, type ReleaseEvidence } from "./live-checks.ts";
 import type { DeliveryRecord } from "./pr-delivery.ts";
 
 const merged = (id: string, sha: string): DeliveryRecord => ({ id, repository: id.split("#")[0]!, status: "complete", forgeState: "merged", mergeCommitSha: sha }) as DeliveryRecord;
@@ -75,21 +75,24 @@ test("a check that cannot read production is a missing check; a later check of t
   const woo = projectForName("Dr Woo")!.live!;
   const unread = { "eas:production": { ok: false as const, missing: "the Expo token has no access to app 59afc438" } };
   const verdict = await taskLiveVerdict(woo, [merged("amrtawfik160/dr.woo#129", "3fc0f8f")], deps(unread, {}));
-  assert.deepEqual(verdict, { live: false, missing: "the Expo token has no access to app 59afc438", unknown: false });
-  const build7 = { text: "Build 7 read back in Externals from App Store Connect", builtAt: 2_000 };
-  const proved = await taskLiveVerdict(woo, [merged("amrtawfik160/dr.woo#129", "3fc0f8f")], deps(unread, {}, [build7], { "amrtawfik160/dr.woo#129": app(1_000) }));
-  assert.deepEqual(proved, { live: true, evidence: "Live check: Build 7 read back in Externals from App Store Connect (built 1970-01-01T00:00Z, after amrtawfik160/dr.woo#129 merged)." }, "a TestFlight read-back of a build newer than the merge proves it");
+  assert.deepEqual(verdict, { live: false, missing: "no release read-back in the required group; the Expo token has no access to app 59afc438", unknown: false });
+  const build7 = { text: "Build 7 read back in Externals from App Store Connect", commit: "b7" };
+  const proved = await taskLiveVerdict(woo, [merged("amrtawfik160/dr.woo#129", "3fc0f8f")], deps(unread, { b7: "3fc0f8f" }, [build7], { "amrtawfik160/dr.woo#129": app(1_000) }));
+  assert.deepEqual(proved, { live: true, evidence: "Live check: Build 7 read back in Externals from App Store Connect (built from b7, which holds amrtawfik160/dr.woo#129)." }, "a TestFlight read-back of a build whose commit holds the merge proves it");
 });
 
-// Checker 162-verdict-1 fix 2: Build 7 from an earlier cycle of the task proved a merge made after it.
-test("Dr Woo: a read-back proves a merge only for a build made after it, or built from a commit that holds it", async () => {
+// Checker 162-verdict-1 fix 2 and 162-verdict-2: only the build's commit decides. A build from an older
+// cycle, from an old branch, or with an unread commit proves nothing, however new its build time.
+test("Dr Woo: a read-back proves a merge only when its build commit holds it; build time never proves it", async () => {
   const woo = projectForName("Dr Woo")!.live!;
   const unread = { "eas:production": { ok: false as const, missing: "no Expo access" } };
-  const old = { text: "Build 7 in Externals", builtAt: 500 };
   const pr = merged("amrtawfik160/dr.woo#140", "newmerge");
-  assert.deepEqual(await taskLiveVerdict(woo, [pr], deps(unread, {}, [old], { [pr.id]: app(1_000) })), { live: false, missing: null, unknown: false }, "an older build: not live yet");
-  assert.equal((await taskLiveVerdict(woo, [pr], deps(unread, { build9: "newmerge" }, [old, { text: "Build 9 in Externals", commit: "build9" }], { [pr.id]: app(1_000) }))).live, true, "built from a commit holding the merge");
-  assert.deepEqual(await taskLiveVerdict(woo, [pr], deps(unread, {}, [{ text: "Build 8 in Externals", builtAt: 2_000 }], {})), { live: false, missing: null, unknown: true }, "merge time not read yet");
+  const oldBranch = { text: "Build 8 in Externals, built later from an old branch", commit: "oldbranch", builtAt: 2_000 };
+  assert.deepEqual(await taskLiveVerdict(woo, [pr], deps(unread, { oldbranch: "older" }, [oldBranch], { [pr.id]: app(1_000) })), { live: false, missing: null, unknown: false }, "a known commit without the merge: not live, whatever the time");
+  const unknown: LiveDeps = { ...deps(unread, {}, [{ text: "Build 8 in Externals", commit: "unknownbranch", builtAt: 2_000 }], { [pr.id]: app(1_000) }), contains: async () => null };
+  assert.deepEqual(await taskLiveVerdict(woo, [pr], unknown), { live: false, missing: null, unknown: true }, "containment not told: not proven");
+  assert.deepEqual(await taskLiveVerdict(woo, [pr], deps(unread, {}, [{ text: "Build 8 in Externals", builtAt: 2_000 }], { [pr.id]: app(1_000) })), { live: false, missing: "the release read-back names no build commit: build commit not read; no Expo access", unknown: false }, "no commit on the read-back");
+  assert.equal((await taskLiveVerdict(woo, [pr], deps(unread, { build9: "newmerge" }, [oldBranch, { text: "Build 9 in Externals", commit: "build9" }], { [pr.id]: app(1_000) }))).live, true, "built from a commit holding the merge");
 });
 
 test("plugins are live once the loaded commit holds the merge; an unknown answer is neither live nor missing", async () => {
@@ -165,4 +168,19 @@ test("the plugin reader reports the loaded commit, or why it is not known", asyn
   const base = { fetch: fakeFetch([]).fetch, env: () => null };
   assert.deepEqual(await readProduction(check, { ...base, loadedCommit: async () => "the Telegram plugin does not report the commit it loaded" }), { ok: false, missing: "the Telegram plugin does not report the commit it loaded" });
   assert.deepEqual(await readProduction(check, { ...base, loadedCommit: async () => ({ label: "Telegram loaded", sha: "fa0e1d95" }) }), { ok: true, runs: [{ label: "Telegram loaded", sha: "fa0e1d95" }] });
+});
+
+// Checker 162-verdict-2: EAS builds carry gitCommitHash, so a read-back's build commit is read there when the crew gives none.
+test("the EAS build lookup finds a build's commit by id or iOS build number, and says why when it cannot", async () => {
+  const builds = { data: { app: { byId: { builds: [
+    { id: "2018d35a-b880", platform: "IOS", gitCommitHash: "61c8c825", appBuildVersion: "21" },
+    { id: "cd685739-9621", platform: "IOS", gitCommitHash: null, appBuildVersion: "20" },
+  ] } } } };
+  const deps = (body: unknown) => ({ fetch: fakeFetch([{ body }]).fetch, env: () => ({ EXPO_TOKEN: "t" }) });
+  assert.deepEqual(await easBuildCommit("app", "/f.env", "21", deps(builds)), { commit: "61c8c825" });
+  assert.deepEqual(await easBuildCommit("app", "/f.env", "2018d35a-b880", deps(builds)), { commit: "61c8c825" });
+  assert.deepEqual(await easBuildCommit("app", "/f.env", "20", deps(builds)), { missing: "EAS build 20 names no commit" });
+  assert.deepEqual(await easBuildCommit("app", "/f.env", "99", deps(builds)), { missing: "EAS lists no build 99 among the app's last 50 builds" });
+  assert.deepEqual(await easBuildCommit("app", "/f.env", "21", { ...deps(builds), env: () => null }), { missing: "no EXPO_TOKEN in /f.env" });
+  assert.deepEqual(await easBuildCommit("app", "/f.env", "21", deps({ errors: [{ extensions: { errorCode: "UNAUTHORIZED_ERROR" } }] })), { missing: "the Expo token in /f.env has no access to app app" });
 });

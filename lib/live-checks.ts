@@ -15,8 +15,8 @@ export type LiveVerdict =
   /** missing: why no check could read production (shown as "live check missing"); null when production was read and does not hold it yet. */
   | { live: false; missing: string | null; unknown: boolean };
 
-/** A crew's read-back of an app build in the project's required group. A read-back proves a merge only when
- * the build is from a commit that holds it, or was built after it merged. */
+/** A crew's read-back of an app build in the project's required group. It proves a merge only when the
+ * commit the build was built from holds it; builtAt is shown, never used as proof. */
 export type ReleaseEvidence = { text: string; commit?: string; builtAt?: number };
 /** What GitHub says of a merged PR: when it merged and the files it changed; null when not read yet. */
 export type PrDetails = { mergedAt: number | null; files: readonly string[] };
@@ -60,23 +60,19 @@ async function proveWith(checks: readonly LiveCheck[], record: DeliveryRecord, d
   return out;
 }
 
-/** A release read-back that covers this merge: its build holds the merge commit, or was built after the merge. */
-async function proveWithReadback(check: LiveCheck, record: DeliveryRecord, details: PrDetails | null, deps: LiveDeps): Promise<Proof> {
+/** A release read-back that covers this merge: its build's commit holds the merge commit. Only the commit
+ * decides: a build time never proves which merges a build holds (a new build can come from an old branch). */
+async function proveWithReadback(check: LiveCheck, record: DeliveryRecord, deps: LiveDeps): Promise<Proof> {
   const out: Proof = { proof: null, missing: null, read: false, unknown: false };
-  for (const row of deps.readback()) {
+  const rows = deps.readback();
+  for (const row of rows) {
+    if (!row.commit) continue;
     out.read = true;
-    if (row.commit) {
-      const has = await deps.contains(check, record.repository, record.mergeCommitSha!, row.commit);
-      if (has === true) return { ...out, proof: `${row.text} (built from ${short(row.commit)}, which holds ${record.id})` };
-      if (has === null) out.unknown = true;
-    }
-    if (row.builtAt !== undefined && details?.mergedAt != null && row.builtAt > details.mergedAt) {
-      return { ...out, proof: `${row.text} (built ${new Date(row.builtAt).toISOString().slice(0, 16)}Z, after ${record.id} merged)` };
-    }
-    if (row.builtAt !== undefined && details === null) out.unknown = true;
+    const has = await deps.contains(check, record.repository, record.mergeCommitSha!, row.commit);
+    if (has === true) return { ...out, proof: `${row.text} (built from ${short(row.commit)}, which holds ${record.id})` };
+    if (has === null) out.unknown = true;
   }
-  // A read-back exists but covers an older build: production was read and does not hold this merge.
-  if (!out.read) out.missing = "no release read-back in the required group";
+  if (!out.read) out.missing = rows.length === 0 ? "no release read-back in the required group" : "the release read-back names no build commit: build commit not read";
   return out;
 }
 
@@ -96,8 +92,7 @@ export async function taskLiveVerdict(rule: LiveRule | undefined, records: reado
     const checks = rule.checks.filter((check) => check.kind !== "release-readback" && applies(check, record.repository));
     if (readbacks.length === 0 && checks.length === 0) return { live: false, missing: rule.missing ?? `no live check for ${record.repository}`, unknown: false };
     const backend = rule.backend !== undefined && applies(rule.backend, record.repository) ? rule.backend : undefined;
-    const needsDetails = backend !== undefined || readbacks.length > 0;
-    const details = needsDetails ? await deps.details?.(record) ?? null : null;
+    const details = backend !== undefined ? await deps.details?.(record) ?? null : null;
     if (backend !== undefined) {
       // Which files the PR changed decides whether the backend must be deployed too; unread, nothing is proven.
       if (details === null) return { live: false, missing: null, unknown: true };
@@ -110,13 +105,17 @@ export async function taskLiveVerdict(rule: LiveRule | undefined, records: reado
     }
     let proof: Proof = { proof: null, missing: null, read: false, unknown: false };
     for (const check of readbacks) {
-      const next = await proveWithReadback(check, record, details, deps);
-      proof = { proof: next.proof, missing: proof.missing ?? next.missing, read: proof.read || next.read, unknown: proof.unknown || next.unknown };
+      const next = await proveWithReadback(check, record, deps);
+      // Neither route read anything: name both reasons.
+      const missing = [proof.missing, next.missing].filter((reason): reason is string => reason !== null).join("; ") || null;
+      proof = { proof: next.proof, missing, read: proof.read || next.read, unknown: proof.unknown || next.unknown };
       if (proof.proof !== null) break;
     }
     if (proof.proof === null && checks.length > 0) {
       const next = await proveWith(checks, record, deps);
-      proof = { proof: next.proof, missing: next.missing ?? proof.missing, read: proof.read || next.read, unknown: proof.unknown || next.unknown };
+      // Neither route read anything: name both reasons.
+      const missing = [proof.missing, next.missing].filter((reason): reason is string => reason !== null).join("; ") || null;
+      proof = { proof: next.proof, missing, read: proof.read || next.read, unknown: proof.unknown || next.unknown };
     }
     // Production that was read and does not hold the merge is "not live yet", not a missing check.
     if (proof.proof === null) return { live: false, missing: proof.read ? null : proof.missing, unknown: proof.unknown };
@@ -201,5 +200,29 @@ export async function readProduction(check: LiveCheck, deps: ReaderDeps): Promis
   } catch (error) {
     if (deps.signal?.aborted) throw error;
     return { ok: false, missing: `the ${check.kind} check failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+const EAS_BUILDS = `query($id:String!){ app { byId(appId:$id) { builds(offset:0,limit:50){ id platform gitCommitHash appBuildVersion } } } }`;
+
+/** The commit an EAS build was built from, found by build id or iOS build number; or why it cannot be read. */
+export async function easBuildCommit(appId: string, envFile: string, build: string, deps: Pick<ReaderDeps, "fetch" | "env" | "signal">): Promise<{ commit: string } | { missing: string }> {
+  const token = deps.env(envFile)?.["EXPO_TOKEN"];
+  if (!token) return { missing: `no EXPO_TOKEN in ${envFile}` };
+  try {
+    const res = await deps.fetch("https://api.expo.dev/graphql", {
+      method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify({ query: EAS_BUILDS, variables: { id: appId } }), ...(deps.signal ? { signal: deps.signal } : {}),
+    });
+    const body = await res.json() as { data?: { app?: { byId?: { builds?: { id: string; platform?: string; gitCommitHash?: string | null; appBuildVersion?: string | null }[] } } }; errors?: { extensions?: { errorCode?: string } }[] };
+    if (body.errors?.[0]?.extensions?.errorCode === "UNAUTHORIZED_ERROR") return { missing: `the Expo token in ${envFile} has no access to app ${appId}` };
+    const wanted = build.trim();
+    const row = (body.data?.app?.byId?.builds ?? []).find((b) => b.id === wanted || (b.platform === "IOS" && b.appBuildVersion === wanted));
+    if (!row) return { missing: `EAS lists no build ${wanted} among the app's last 50 builds` };
+    if (!row.gitCommitHash) return { missing: `EAS build ${wanted} names no commit` };
+    return { commit: row.gitCommitHash };
+  } catch (error) {
+    if (deps.signal?.aborted) throw error;
+    return { missing: `EAS did not answer: ${error instanceof Error ? error.message : String(error)}` };
   }
 }

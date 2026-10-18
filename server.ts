@@ -78,7 +78,7 @@ import { inboundHookDecision } from "./lib/inbound-dispatch.ts";
 import { formatWorkersForTelegram } from "./lib/telegram-commands.ts";
 import { digestOnce, EMPTY_DIGEST_MEMORY, formatBoard, workingByProject, type BoardInput, type DigestMemory } from "./lib/owner-board.ts";
 import { createOwnerTasks, isFinishedTask, isOpenTask, sameProject, stateFromPrs, taskLine, taskOfRef, telegramTasks, type CrewFinish, type OwnerTask, type TaskState } from "./lib/owner-tasks.ts";
-import { readEnvFile, type PrDetails } from "./lib/live-checks.ts";
+import { easBuildCommit, readEnvFile, type PrDetails } from "./lib/live-checks.ts";
 import { LIVE_PASS_MS, planOf, ruleOf, runLivePass, type LiveStatus } from "./lib/live-pass.ts";
 import { EMPTY_STALL_MEMORY, notLiveItems } from "./lib/stalls.ts";
 import {
@@ -493,6 +493,12 @@ function wrapHostCommand(command: string): string {
     throw new Error(`Host command too long (${script.length} > ${HOST_COMMAND_MAX}). Stage bulky payloads with writeHostBytes.`);
   }
   return script;
+}
+
+/** fetch for the read-only live checks. The test run sets FM_NO_LIVE_NETWORK=1, so no test reaches Expo or Coolify. */
+function liveFetch(url: string, init: { method?: string; headers: Record<string, string>; body?: string; signal?: AbortSignal }) {
+  if (process.env["FM_NO_LIVE_NETWORK"] === "1") return Promise.reject(new Error("live network is off in tests (FM_NO_LIVE_NETWORK=1)"));
+  return fetch(url, init);
 }
 
 /** Run a local read-only command (git in this plugin's own checkout) with no shell. */
@@ -5212,7 +5218,7 @@ export default async function plugin(bb: BbPluginApi) {
       tasks: () => ownerTasks.list(captain, { includeClosed: true }),
       recordsFor: (task) => deliveries.forTasks(task.crewIds, task.prs),
       running: await captainCrewIds(captain),
-      readers: { fetch: (url, init) => fetch(url, init), env: readEnvFile, loadedCommit: pluginLoadedCommit, ...(signal ? { signal } : {}) },
+      readers: { fetch: liveFetch, env: readEnvFile, loadedCommit: pluginLoadedCommit, ...(signal ? { signal } : {}) },
       contains: (check, repo, ancestor, descendant) => commitContains(check, repo, ancestor, descendant, signal),
       readback: (task) => {
         const group = ruleOf(task, deliveries.forTasks(task.crewIds, task.prs))?.release?.group;
@@ -8634,7 +8640,7 @@ export default async function plugin(bb: BbPluginApi) {
     surface:z.enum(PROOF_SURFACES).optional().describe("verify: the surface you drove: iphone, web or message. It must be the project's proof surface"),
     build:z.string().max(80).optional().describe("device-proof and release: the app build id or number"),link:z.string().max(500).optional().describe("device-proof: the TestFlight or OTA link the owner opens"),
     check:z.string().max(500).optional().describe("device-proof: what the owner checks on the device"),task:z.string().regex(/^T\d+$/).optional().describe("release: the owner task the build ships"),
-    group:z.string().max(120).optional().describe("release: the TestFlight group the build is in, as read back"),builtAt:z.string().max(40).optional().describe("release: when the build was made (ISO time), as App Store Connect or EAS shows it"),source:z.enum(["app-store-connect","eas"]).optional().describe("release: where the read-back came from"),
+    group:z.string().max(120).optional().describe("release: the TestFlight group the build is in, as read back"),builtAt:z.string().max(40).optional().describe("release: when the build was made (ISO time), as App Store Connect or EAS shows it; shown with the read-back, never proof"),source:z.enum(["app-store-connect","eas"]).optional().describe("release: where the read-back came from"),
     verdict:z.enum(["pass","fail"]).optional().describe("check: a checker crew's verdict on the PR head"),findings:z.number().int().min(0).optional().describe("check: with verdict fail, how many findings the notes name"),notes:z.string().optional().describe("check: what you checked, drove and saw, and each finding"),
     authorized:z.boolean().optional().describe("Explicit user authority for abandonment or changing the delivery contract"),
     failureId:z.string().optional(),scope:z.enum(["author","baseline"]).optional(),followUpTask:z.string().optional(),
@@ -8793,11 +8799,20 @@ export default async function plugin(bb: BbPluginApi) {
       if (rule?.release === undefined) throw new Error(`Refusing: ${task.project ?? "this project"} has no release rule in owner/projects.json, so there is no group to read back.`);
       const build = input.build?.trim() ?? "", group = input.group?.trim() ?? "", seen = input.seen?.trim() ?? "";
       if (build === "" || seen === "" || input.source === undefined) throw new Error("A release read-back needs build, group, source (app-store-connect or eas) and seen (what it showed).");
-      const commit = input.commitSha?.trim() ?? "";
+      let commit = input.commitSha?.trim() ?? "";
       const builtAt = input.builtAt === undefined ? undefined : Date.parse(input.builtAt);
       if (builtAt !== undefined && !Number.isFinite(builtAt)) throw new Error(`builtAt ${input.builtAt} is not a time: pass it as App Store Connect or EAS shows it, such as 2026-10-18T10:41Z.`);
-      // A read-back proves only the merges its build holds: it names the build's commit or the time it was built.
-      if (commit === "" && builtAt === undefined) throw new Error("A release read-back needs commitSha (the commit the build was built from) or builtAt (when it was built), so it proves only the merges that build holds.");
+      // A read-back proves only the merges its build's commit holds; a build time proves nothing (a new build can come from an old branch).
+      let fromEas = "";
+      if (commit === "") {
+        // EAS builds carry their commit: read it where the project's Expo token reaches the app.
+        const eas = rule.live?.checks.find((check) => check.kind === "eas-update");
+        if (eas?.kind === "eas-update") {
+          const found = await easBuildCommit(eas.appId, eas.envFile, build, { fetch: liveFetch, env: readEnvFile });
+          if ("commit" in found) commit = found.commit; else fromEas = ` EAS lookup: ${found.missing}.`;
+        }
+      }
+      if (!/^[0-9a-f]{7,40}$/i.test(commit)) throw new Error(`A release read-back needs commitSha: the commit the build was built from (EAS shows it as gitCommitHash: eas build:view <build id> --json). It proves only the merges that commit holds; a build time is not proof.${fromEas}`);
       if (group.toLowerCase() !== rule.release.group.toLowerCase()) throw new Error(`Refusing: ${rule.name} builds must be in the "${rule.release.group}" public-link group, not "${group}". Add build ${build} to "${rule.release.group}", read it back from App Store Connect or EAS, then record it again.`);
       const recorded = releaseReadbacks.record({ task: task.id, captain: task.captain, crewId: crew.id, project: rule.name, build, group: rule.release.group, source: input.source as ReleaseSource, seen, at: Date.now(), ...(commit ? { commit } : {}), ...(builtAt !== undefined ? { builtAt } : {}) });
       return `Release read-back recorded for ${task.id}: build ${recorded.build} in "${recorded.group}" (read from ${recorded.source === "eas" ? "EAS" : "App Store Connect"}: ${recorded.seen}).`;

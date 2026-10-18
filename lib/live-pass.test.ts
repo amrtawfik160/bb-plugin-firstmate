@@ -92,18 +92,18 @@ test("a reopened Dr Woo task is not made live by the read-back of a build from b
   const tasks = createOwnerTasks(raw);
   const readbacks = createReleaseReadbacks(raw);
   tasks.open({ captain: "c", project: "Dr Woo", title: "Redesign", sourceRefs: ["tg:1:1"], crewId: "old-crew", at: 0 });
-  readbacks.record({ task: "T1", captain: "c", crewId: "old-crew", project: "Dr Woo", build: "7", group: "Externals", source: "app-store-connect", seen: "Build 7 in Externals", at: 5, builtAt: 4 });
+  readbacks.record({ task: "T1", captain: "c", crewId: "old-crew", project: "Dr Woo", build: "7", group: "Externals", source: "app-store-connect", seen: "Build 7 in Externals", at: 5, builtAt: 4, commit: "build7" });
   tasks.move("T1", "c", { to: "live", reason: "Build 7 read back" }, 10);
   tasks.attach("T1", "c", { crewId: "new-crew", sourceRefs: ["tg:1:2"], at: 20 });
   const recordsFor = () => [{ ...merged("amrtawfik160/dr.woo#141", "new-crew", "newmerge"), openedAt: 20 }];
   tasks.reconcile("c", recordsFor, 30);
   const evidence = (task: OwnerTask) => readbacks.forTask(task.captain, task.id).map((row) => ({ text: `Build ${row.build} read back in ${row.group}`, ...(row.commit ? { commit: row.commit } : {}), ...(row.builtAt !== undefined ? { builtAt: row.builtAt } : {}) }));
   const pass = (now: number) => runLivePass({ captain: "c", now, tasks: () => tasks.list("c", { includeClosed: true }), recordsFor, running: new Set(),
-    readers: { fetch: async () => { throw new Error("no production proof"); }, env: () => null, loadedCommit: async () => "unknown" }, contains: async () => null,
+    readers: { fetch: async () => { throw new Error("no production proof"); }, env: () => null, loadedCommit: async () => "unknown" }, contains: async (_check, _repo, ancestor, descendant) => descendant === "build9" && ancestor === "newmerge",
     readback: evidence, details: async () => ({ mergedAt: 25, files: ["app/x.tsx"] }),
     markLive: (item, text, checked) => { tasks.move(item.id, "c", { to: "live", reason: text, checked }, now); return true; },
     alert: async () => false, stallMemory: {} });
-  assert.deepEqual((await pass(40)).live, [], "Build 7 predates the new merge");
-  readbacks.record({ task: "T1", captain: "c", crewId: "new-crew", project: "Dr Woo", build: "9", group: "Externals", source: "app-store-connect", seen: "Build 9 in Externals", at: 45, builtAt: 44 });
-  assert.deepEqual((await pass(50)).live, ["T1"], "Build 9, built after the merge, proves it");
+  assert.deepEqual((await pass(40)).live, [], "Build 7's commit does not hold the new merge");
+  readbacks.record({ task: "T1", captain: "c", crewId: "new-crew", project: "Dr Woo", build: "9", group: "Externals", source: "app-store-connect", seen: "Build 9 in Externals", at: 45, builtAt: 44, commit: "build9" });
+  assert.deepEqual((await pass(50)).live, ["T1"], "Build 9's commit holds the merge");
 });
