@@ -5690,19 +5690,37 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  /** The connector's free-text obligations: the captain is told of each once, by its ref, and the connector is told after. */
+  // The captain the latest Telegram owner message reached. The connector delivers owner messages to its
+  // bound captain only, so this names the binding when the connector's freeText output does not.
+  const TELEGRAM_CAPTAIN_KEY = "telegram-bound-captain";
+  let telegramCaptain: string | undefined;
+  async function noteTelegramCaptain(threadId: string): Promise<void> {
+    if (telegramCaptain === threadId) return;
+    telegramCaptain = threadId;
+    await bb.storage.kv.set(TELEGRAM_CAPTAIN_KEY, threadId);
+  }
+
+  /**
+   * The connector's free-text obligations: the captain is told of each once, by its ref, and the connector is told after.
+   * They belong to the binding, so only its captain is told: the one the connector names, else the one owner messages reach.
+   */
   async function tellFreeText(captainThreadId: string): Promise<void> {
     let rows: Array<{ ref: string; text: string; at: number }>;
+    let bound: string | undefined;
     try {
-      rows = (await bb.sdk.plugins.callRpc({
+      const out = await bb.sdk.plugins.callRpc({
         pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "freeText", input: {},
-        outputSchema: z.object({ obligations: z.array(z.object({ ref: z.string(), text: z.string(), at: z.number() })) }),
-      })).obligations;
+        outputSchema: z.object({ obligations: z.array(z.object({ ref: z.string(), text: z.string(), at: z.number() })), captainThreadId: z.string().optional() }),
+      });
+      rows = out.obligations;
+      bound = out.captainThreadId;
     } catch (error) {
       if (isTelegramRpcMissing(error)) return;
       throw error;
     }
     if (rows.length === 0) return;
+    bound ??= telegramCaptain ?? (await bb.storage.kv.get<string>(TELEGRAM_CAPTAIN_KEY)) ?? undefined;
+    if (typeof bound === "string" && bound !== "" && bound !== captainThreadId) return;
     const lines = rows.map((row) => `- ${row.ref}: "${row.text.replace(/\s+/g, " ").slice(0, 160)}"`);
     await bb.sdk.threads.send({
       threadId: captainThreadId, mode: "steer",
@@ -5736,8 +5754,18 @@ export default async function plugin(bb: BbPluginApi) {
         } catch (error) {
           bb.log.warn(`telegram replied check: ${String(error)}`);
         }
-        await reopenUndelivered(captainThreadId).catch((error) => bb.log.warn(`telegram undelivered check: ${String(error)}`));
-        await tellFreeText(captainThreadId).catch((error) => bb.log.warn(`telegram free-text check: ${String(error)}`));
+        // An archived captain refuses every send: it leaves the known captains until it is decked again.
+        const archived = (what: string) => (error: unknown) => {
+          if (isArchivedThreadError(error)) return true;
+          bb.log.warn(`telegram ${what} check: ${String(error)}`);
+          return false;
+        };
+        if (await reopenUndelivered(captainThreadId).then(() => false, archived("undelivered"))
+          || await tellFreeText(captainThreadId).then(() => false, archived("free-text"))) {
+          knownCaptainsRef.delete(captainThreadId);
+          bb.log.info(`captain ${captainThreadId} is archived: left the reliability drain`);
+          return;
+        }
       }
       for (const action of inboundLedger.openForSweep(Date.now(), captainThreadId)) {
         await bb.sdk.threads.send({
@@ -14863,6 +14891,7 @@ export default async function plugin(bb: BbPluginApi) {
         const flags = await reliabilityFlags();
         const text = context.input.text;
         const telegram = parseTelegramSubmission(context.experimental_submission?.data) ?? parseInboundTelegram(text);
+        if (telegram) await noteTelegramCaptain(threadId).catch((error) => bb.log.warn(`telegram captain note: ${String(error)}`));
         if (String(context.initiator) === "user") {
           await recordAskAnswers(threadId, text, context.queuedMessages ?? []).catch((error) => bb.log.warn(`owner ask answer: ${String(error)}`));
         }
@@ -15065,15 +15094,18 @@ export default async function plugin(bb: BbPluginApi) {
   // The thread.idle trigger alone never reaches a captain that is already idle past the
   // budget (it crossed it before this build, or its last turn ended while compaction was
   // cooling down); the release service sweeps those.
-  async function compactIdleCaptain(threadId: string, signal?: AbortSignal): Promise<void> {
+  /** False when the captain is archived or deleted. */
+  async function compactIdleCaptain(threadId: string, signal?: AbortSignal): Promise<boolean> {
     try {
       const thread = asRecord(await raceAbort(bb.sdk.threads.get({ threadId }), signal, STUCK_HOST_CALL_MS));
-      if (thread["status"] !== "idle" || thread["archivedAt"] != null) return;
+      if (thread["archivedAt"] != null || thread["deletedAt"] != null) return false;
+      if (thread["status"] !== "idle") return true;
     } catch (error) {
       if (isAbortError(error)) throw error;
-      return;
+      return true;
     }
     await maybeCompactCaptain(threadId, signal);
+    return true;
   }
 
   bb.events.on("thread.idle", async ({ thread, lastAssistantText }) => {
@@ -16691,7 +16723,8 @@ export default async function plugin(bb: BbPluginApi) {
             nextCompactSweep = Date.now() + CAPTAIN_COMPACT_SWEEP_MS;
             for (const captain of [...knownCaptainsRef]) {
               if (signal.aborted) break;
-              await compactIdleCaptain(captain, signal);
+              // An archived captain costs no calls until it is decked again.
+              if (!(await compactIdleCaptain(captain, signal))) { knownCaptainsRef.delete(captain); continue; }
               await drainCaptainReliability(captain, signal).catch((error) => {
                 if (!signal.aborted) bb.log.warn(`captain reliability sweep ${captain}: ${String(error)}`);
               });
