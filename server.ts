@@ -628,6 +628,8 @@ const FOLLOW_UP_CONCURRENCY = 4;
 const FOLLOW_UP_DUE_LIMIT = 100;
 const RETAINED_SWEEP_MS = 10 * 60_000;
 const GRAPHQL_RESERVE = 1000;
+/** A background GitHub request that the hourly allowance or the GraphQL reserve held back; nothing was read. */
+class GithubReservePaused extends Error { constructor(hostId: string) { super(`GitHub request on ${hostId} held back: hourly allowance or GraphQL reserve reached`); } }
 const FOLLOW_UP_READS_PER_HOUR = 500;
 const COVERED_DISCOVERY_MS = 30 * 60_000;
 const FOLLOW_UP_BURST = 10;
@@ -7062,6 +7064,8 @@ export default async function plugin(bb: BbPluginApi) {
       return observed;
     } catch (error) {
       if (signal?.aborted) throw error;
+      // Held back by the reserve: nothing was read, so the record is not stale.
+      if (error instanceof GithubReservePaused) return record;
       return deliveries.stale(record.id,String(error));
     }
     });
@@ -7517,12 +7521,23 @@ export default async function plugin(bb: BbPluginApi) {
   // FOLLOW_UP_BURST, so a backlog cannot spend the hour in one cycle and leave a later
   // push waiting.
   let paceTokens = FOLLOW_UP_BURST, pacedAt = Date.now();
-  // Each request also debits its host's GraphQL meter by one point before it runs; the
-  // response headers, where a request returns them, then set the true value.
-  function chargeGithub(hostId: string | null) {
+  // Every GitHub request reserves its point at the request itself, in one synchronous
+  // step with nothing awaited between the check and the debit, so concurrent workers
+  // cannot all pass one stale check. Inside the background loop a request runs only with
+  // hourly allowance left and only if its point leaves the GraphQL reserve whole; the
+  // probe, which reads an unknown meter, needs the allowance alone. The debit lowers the
+  // host's meter; a response's own headers then set the true value. Outside the loop
+  // (verdicts, merges) the request always runs and still debits the meter.
+  function reserveGithub(hostId: string | null, probe = false): boolean {
     const meter = hostId === null ? undefined : graphqlMeters.get(hostId);
+    if (backgroundBudget.getStore()) {
+      if (backgroundAllowance() <= 0) return false;
+      if (!probe && hostId !== null && graphqlReadsAllowed(hostId) === 0) return false;
+      backgroundReads.push(Date.now());
+      paceTokens -= 1;
+    }
     if (meter) meter.remaining -= 1;
-    if (backgroundBudget.getStore()) { backgroundReads.push(Date.now()); paceTokens -= 1; }
+    return true;
   }
   function backgroundAllowance() {
     const now = Date.now();
@@ -7537,11 +7552,11 @@ export default async function plugin(bb: BbPluginApi) {
   // reads: GitHub enforces those, and the rate_limit overview read 1,126 points more.
   const graphqlMeters = new Map<string, { remaining: number; reset: number }>();
   let quotaWarnedUntil = 0;
-  async function ghGraphql(hostId: string, command: string, timeoutMs: number, signal?: AbortSignal) {
+  async function ghGraphql(hostId: string, command: string, timeoutMs: number, signal?: AbortSignal, probe = false) {
     // gh's debug output carries whole response bodies; only the rate-limit headers, and the
     // last lines of a failure, come back.
     const wrapped = `t=$(mktemp) || exit 1; GH_DEBUG=api ${command} 2>"$t"; rc=$?; grep -i '^< x-ratelimit-' "$t" >&2; [ "$rc" -eq 0 ] || grep -v '^[<>*]' "$t" | tail -n 5 >&2; rm -f "$t"; exit "$rc"`;
-    chargeGithub(hostId);
+    if (!reserveGithub(hostId, probe)) throw new GithubReservePaused(hostId);
     const res = await runStructuredOnHost(hostId, wrapped, timeoutMs, signal);
     let remaining: number | undefined, reset: number | undefined, seen = false;
     for (const line of res.stderr.split("\n")) {
@@ -7575,12 +7590,8 @@ export default async function plugin(bb: BbPluginApi) {
     const meter = graphqlMeters.get(hostId);
     if (meter && Date.now() < meter.reset) return;
     if (backgroundAllowance() <= 0) return;
-    await ghGraphql(hostId, `gh api graphql -f query=${shQuote("{ rateLimit { remaining resetAt } }")}`, 30_000, signal)
+    await ghGraphql(hostId, `gh api graphql -f query=${shQuote("{ rateLimit { remaining resetAt } }")}`, 30_000, signal, true)
       .catch((error) => { if (signal?.aborted) throw error; });
-  }
-  /** Outside the background loop always true; inside it, a request runs only with allowance and quota left. */
-  function backgroundMayRequest(hostId: string | null) {
-    return !backgroundBudget.getStore() || (backgroundAllowance() > 0 && (hostId === null || graphqlReadsAllowed(hostId) > 0));
   }
   async function backgroundHost(signal?: AbortSignal): Promise<string | undefined> {
     const first = deliveries.list({ limit: 1 })[0];
@@ -7832,8 +7843,7 @@ export default async function plugin(bb: BbPluginApi) {
   ): Promise<{ url: string; state: string; source: string } | null> {
     let env = prFacts(null);
     if (hostId !== null && backgroundBudget.getStore()) await ensureGraphqlMeter(hostId,signal);
-    if (backgroundMayRequest(hostId)) {
-      chargeGithub(hostId);
+    if (reserveGithub(hostId)) {
       try { env = prFacts(await raceAbort(bb.sdk.environments.pullRequest({ environmentId: envId,signal }),signal,STUCK_HOST_CALL_MS)); } catch(error) { if (signal?.aborted) throw error; }
     }
     if (env.available && env.url !== "") {
@@ -7847,8 +7857,7 @@ export default async function plugin(bb: BbPluginApi) {
       const e = asRecord(await raceAbort(bb.sdk.environments.get({ environmentId: envId,signal }),signal,STUCK_HOST_CALL_MS));
       const branch = typeof e["branchName"] === "string" ? e["branchName"] : "";
       const path = typeof e["path"] === "string" ? e["path"] : "";
-      if (branch !== "" && path !== "" && backgroundMayRequest(hostId)) {
-        chargeGithub(hostId);
+      if (branch !== "" && path !== "" && reserveGithub(hostId)) {
         const res = await runStructuredOnHost(hostId,
           `cd ${shQuote(path)} && gh pr list --head ${shQuote(branch)} --state all --json url --limit 1`, 30_000,signal);
         if (res.exitCode !== 0) throw new Error(res.stderr || res.output || `Forge lookup exit ${res.exitCode}`);
