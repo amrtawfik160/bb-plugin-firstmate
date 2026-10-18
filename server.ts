@@ -8110,6 +8110,13 @@ export default async function plugin(bb: BbPluginApi) {
       // A tap can come hours after the card: read the PR from GitHub first, so the record covers its head now.
       const row = deliveries.get(proof.pr);
       if (row !== undefined && row.freshness !== "fresh") await reconcileDelivery(row);
+      // The card may have been cancelled or replaced while the reads above were in flight: read the binding
+      // again, then check the card with no await between that check and the record (checker round 4).
+      if (await bb.storage.kv.get<DeviceProof>(key) === undefined || ownerAsks.get(askId)?.state !== "answered") {
+        bb.log.info(`device proof ${askId}: card closed while its tap was read; no proof recorded`);
+        await dropDeviceProof(askId);
+        return;
+      }
       deliveries.verify(proof.pr, OWNER_ACTOR, proof.head, { driven: `the owner tested build ${proof.build} on ${surfaceWords(proof.surface as never)}`, seen: "Works", surface: proof.surface, build: proof.build });
       note = `The owner tapped Works for build ${proof.build}: proof is recorded for ${proof.pr} at ${proof.head.slice(0, 7)}.`;
     } catch (error) {
