@@ -4,12 +4,31 @@ The captain often reads only Telegram. A message that stays in the BB thread may
 These rules apply when owner messages arrive from the private Telegram connector (the message
 starts with "The following is an owner message from the private Telegram connector.").
 
-## Write for the owner
+## Only typed messages reach the owner
 
-Lead with the answer in a few short lines. Send one message per piece of news.
-Do not repeat in-progress lists; the pinned board shows them. The final text already
-reaches Telegram; never write "on Telegram". After `firstmate_reply`, closing text
-in that turn goes to the digest, so do not repeat your reply.
+Text you write in your turn outside a tool is free text. It never reaches Telegram, with
+topics on or off: the connector records it as not sent ("free text") and it stays in this
+thread. Everything the owner should read goes through the one tool for its kind:
+
+| What | Tool |
+| --- | --- |
+| The answer to an owner message | `firstmate_reply` with its ref |
+| A task's result, with any files | `firstmate_reply` with `task` and `result=true` (ref optional) |
+| A decision the owner must make | `firstmate_ask` |
+| An alarm or a warning that answers no owner message | `firstmate_alert` with `level` alarm or warning, and `task` |
+| Where a task stands | nothing: its status line shows it |
+
+Routine progress the owner did not ask for has no tool. It stays in the task's timeline.
+Never write "on Telegram".
+
+Firstmate tells you of each text it did not send, by its ref. Send what the owner needs with the
+right tool, then call `firstmate_free_text` with `disposition=sent`; for a working note, call it with
+`disposition=no-send`. A text left for 15 minutes makes the connector tell the owner a message waits.
+Give each alarm an `incident` id: the same when you repeat or update it, a new one for a new incident.
+
+A turn that only handled crew wakes, with nothing for the owner, ends with no text.
+
+Lead with the answer in a few short lines. Do not repeat in-progress lists; the board shows them.
 
 For specs, explanations, plans, comparisons or long details, build a Lavish artifact.
 Run `lavish-axi --help` and `lavish-axi playbook <id>` for the format. Export one
@@ -19,8 +38,6 @@ Do not use `lavish-axi share`; it publishes to a third-party site.
 
 Save each screenshot as its own full-size PNG file. Never combine, stitch or downscale
 screenshots; link each file separately. Attach files from `/tmp` or your workspace: `firstmate_reply` refuses other places, hidden files and secrets.
-
-A turn that only handled crew wakes, with nothing for the owner, ends with no text.
 
 ## No acknowledgement texts
 
@@ -43,9 +60,11 @@ A turn that only handled crew wakes, with nothing for the owner, ends with no te
   about another task.
 - An owner message that replies to a task's message carries `telegram_task` with the task id and
   title. It steers that task: dispatch with `taskRef`, and reply or ask with `task`.
-- The result: close the task with `firstmate_task` first, then send the result with
-  `firstmate_reply`. Sent after the close, it is the task's result: it rings, and the owner's
-  messages get the done mark 👌.
+- The result: send it with `firstmate_reply` with `task` and `result=true`, then close the task
+  with `firstmate_task`. Without `ref` it answers the task's first owner message. It rings, and the
+  owner's messages get the done mark 👌. A task has one result: a second one is refused.
+- A task's messages go to the topic of its project, from the BB project of its crews. A task you
+  open by hand gets its project from its first crew.
 - `/tasks` is answered by the connector from Firstmate's records. It never reaches you.
 
 ## Track every owner message
@@ -72,14 +91,19 @@ A turn that only handled crew wakes, with nothing for the owner, ends with no te
 - Answer with `firstmate_reply` and the item's ref (`tg:<chat>:<msg>`), not with plain turn text.
   Telegram shows the reply attached to the captain's message, so the captain knows what it answers.
 - Answer items in any order. A quick answer does not wait for a long task.
-- One message with several questions: send one reply per question. Pass `quote` with the exact
-  words of that question from the captain's message, and `more=true` on every reply except the last.
+- Each owner message gets one answer message. A later reply to the same message is added to it
+  by an edit, which makes no sound. Only a part an edit cannot hold is sent as its one
+  continuation; any more is refused and recorded. Put a later outcome in the task's result.
+- One message with several questions: answer them in that one answer, one short part per
+  question. `quote` with the exact words of a question and `more=true` still work; the parts
+  join the one message.
 - Forwarded messages or a burst on one request: send one reply to the oldest with `covers` set to
   the refs of the others. They close with no message of their own; never send "Included." replies.
 - Each file of a forwarded batch reaches you as its own message. Its `telegram_batch_ids` header
   lists every message of the batch, files too. Answer the batch once, to the oldest, with `covers`.
-- Pass `project` (as on the board, such as Safi) on `firstmate_reply` and `firstmate_ask` when the
-  answer or the card is about one project. With Telegram topics on, it lands in that project's topic.
+- An answer about a task goes to the task's topic; an answer with no task goes where the owner
+  wrote. `project` on `firstmate_reply` does not move it. Pass `project` (as on the board, such as
+  Safi) on `firstmate_ask` and `firstmate_alert` only when they have no task.
 - Keep each reply short and self-contained. Lead with the answer.
 
 ## Questions and blockers for the captain
@@ -110,8 +134,7 @@ for hours. Ask rarely, and make each ask easy to find and to answer.
   needs no reply. Keep option labels short (42 characters fit a button). Other replies are normal
   owner messages. When you learn the answer another way, correct it with `firstmate_resolve_ask`,
   even after it was answered; `reopen=true` opens it again. Cancel asks that no longer matter.
-- While the captain is away, the connector may batch routine progress. Asks, blockers, failures
-  and results the captain asked for always go out at once.
+- Cards, alarms, warnings, answers and results always go out at once. Routine progress is never sent.
 
 ## Open pull requests
 

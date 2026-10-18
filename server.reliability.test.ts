@@ -214,7 +214,9 @@ test("live repro: no reminder for an owner message the connector already answere
     host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
     const asked: unknown[] = [];
     host.harness.sdk.stub("plugins.callRpc", async (args: { method: string; input: { messageIds: string[] } }) => {
-      asked.push(args.input);
+      if (args.method === "replied") asked.push(args.input);
+      if (args.method === "undelivered") return { undelivered: [] };
+      if (args.method === "freeText") return { obligations: [] };
       return args.method === "replied" ? { replied: args.input.messageIds.filter((id) => id === "1926") } : { queued: 1, duplicate: false, mode: "on" };
     });
     recordTelegram(host, "thr_cap", "1926", Date.now() - 4 * 60_000);

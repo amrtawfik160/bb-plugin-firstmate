@@ -555,7 +555,7 @@ test("the connector reads every open task, and each closed one since it last loo
     for (let tries = 0; tries < 50 && (await tasksRpc(host, start))[0]?.crews !== 1; tries += 1) await new Promise((resolve) => setTimeout(resolve, 20));
     const [open] = await tasksRpc(host, start);
     assert.deepEqual({ ...open, createdAt: typeof open!.createdAt, updatedAt: typeof open!.updatedAt }, {
-      id: "T1", project: "Areliaa", title: "Legend dashes", state: "working", crews: 1, waitsOn: "1 crew", refs: ["tg:200:2301"], createdAt: "number", updatedAt: "number",
+      id: "T1", project: "Areliaa", projectId: "proj_1", title: "Legend dashes", state: "working", crews: 1, waitsOn: "1 crew", refs: ["tg:200:2301"], createdAt: "number", updatedAt: "number",
     });
     await tool(host, "firstmate_task").execute({ action: "set", id: "T1", state: "needs_you" }, capCtx);
     assert.equal((await tasksRpc(host, start))[0]!.waitsOn, "you");
@@ -594,7 +594,7 @@ test("every task change tells the connector to redraw the task's status line", a
   }
 });
 
-test("firstmate_reply names the task of the owner message; more=true is progress; after the task closes the answer is its result", async () => {
+test("firstmate_reply names the task of the owner message; more=true is progress; only result=true makes the task's result", async () => {
   const host = await captainHost();
   const calls = connector(host);
   try {
@@ -606,14 +606,16 @@ test("firstmate_reply names the task of the owner message; more=true is progress
     await tool(host, "firstmate_reply").execute({ ref: "tg:200:2303", text: "Should the forecast use dots?" }, capCtx);
     await tool(host, "firstmate_task").execute({ action: "close", id: "T1", state: "done", reason: "Dots now" }, capCtx);
     await ownerSays(host, "2304", "Status?");
-    await tool(host, "firstmate_reply").execute({ ref: "tg:200:2303", text: "Done: the forecast uses dots, live." }, capCtx);
+    await tool(host, "firstmate_reply").execute({ ref: "tg:200:2303", text: "Done: the forecast uses dots, live.", result: true }, capCtx);
+    await tool(host, "firstmate_reply").execute({ ref: "tg:200:2303", text: "The old chart is archived." }, capCtx);
     await tool(host, "firstmate_reply").execute({ ref: "tg:200:2304", text: "All quiet." }, capCtx);
     assert.deepEqual(replies(), [
       { kind: "progress", task: "T1", result: undefined },
       { kind: "reply", task: "T1", result: undefined },
       { kind: "final", task: "T1", result: true },
+      { kind: "reply", task: "T1", result: undefined },
       { kind: "reply", task: undefined, result: undefined },
-    ]);
+    ], "a later answer about the closed task is an answer, not a second result");
     assert.ok(isError(await tool(host, "firstmate_reply").execute({ ref: "tg:200:2304", text: "Other.", task: "T9" }, capCtx)), "an unknown task is refused");
   } finally {
     await host.harness.lifecycle.dispose();
