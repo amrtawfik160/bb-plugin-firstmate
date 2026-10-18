@@ -41,10 +41,10 @@ function lab(n,{delay='0.2'}={}) {
   windows.push(`bb:${id}`);
  }
  const save=()=>writeFileSync(join(dir,'threads.json'),JSON.stringify(threads));save();
- const wait=(timeout)=>{
+ const wait=(timeout,env={})=>{
   const started=Date.now();
   const r=spawnSync('bash',['-c','. "$FM_HOME/bin-bb/fm-backend.sh"; fm_backend_source bb; FM_BACKEND_EVENTS_CAPABILITY_CONFIRMED=1 fm_backend_wait_transition bb bb "$@"','wait',String(timeout),join(home,'state'),...windows],
-   {encoding:'utf8',timeout:600000,env:{...process.env,FM_HOME:home,FM_BACKEND:'bb',FAKE_BB_DIR:dir,FAKE_BB_DELAY:delay,PATH:`${dir}:${process.env.PATH}`}});
+   {encoding:'utf8',timeout:600000,env:{...process.env,FM_HOME:home,FM_BACKEND:'bb',FAKE_BB_DIR:dir,FAKE_BB_DELAY:delay,PATH:`${dir}:${process.env.PATH}`,...env}});
   const calls=existsSync(join(dir,'calls.jsonl'))?readFileSync(join(dir,'calls.jsonl'),'utf8').trim().split('\n').filter(Boolean).map(JSON.parse):[];
   rmSync(join(dir,'calls.jsonl'),{force:true});
   return {rc:r.status,out:r.stdout,err:r.stderr,seconds:(Date.now()-started)/1000,calls};
@@ -151,5 +151,21 @@ test('a thread the list already shows with a pending interaction is handled befo
   assert.equal(r.rc,0,r.err);assert.equal(r.out.split('\t')[0],'thr_w044');assert.equal(r.out.split('\t')[3],'blocked');
   assert.equal(r.calls.filter(c=>c[1]==='interactions').length,0,'no interaction read before the confirmed one is handled');
   assert.ok(r.seconds<budget,`took ${r.seconds}s of a ${budget}s budget`);
+ }finally{rmSync(l.home,{recursive:true,force:true});}
+});
+
+test('the wait reaches the fake bb even when the caller runs with SHLVL=0 and a ~/.bashrc that puts another bb first',()=>{
+ // A Codex command runs with SHLVL=0. Node gives the test's bash a socket for stdin, and
+ // Debian's bash then reads ~/.bashrc, which can put the real bb ahead of the fake one.
+ const l=lab(5);try {
+  const decoy=join(l.home,'decoy'),rc=join(l.home,'rc-home');mkdirSync(decoy);mkdirSync(rc);
+  writeFileSync(join(decoy,'bb'),'#!/bin/sh\necho decoy >> "$FAKE_BB_DIR/decoy.log"\nexit 1\n',{mode:0o755});
+  writeFileSync(join(rc,'.bashrc'),`export PATH="${decoy}:$PATH"\n`);
+  writeFileSync(join(l.dir,'show.json'),JSON.stringify(l.threads));
+  const missing=l.threads.splice(2,1)[0];l.save();
+  const r=l.wait(roomy(l,1,3),{HOME:rc,SHLVL:'0'});
+  assert.ok(!existsSync(join(l.dir,'decoy.log')),'the decoy bb from ~/.bashrc answered');
+  assert.equal(r.rc,1,r.err);
+  assert.deepEqual([...new Set(r.calls.filter(c=>c[1]==='show').map(c=>c.at(-1)))],[missing.id]);
  }finally{rmSync(l.home,{recursive:true,force:true});}
 });
