@@ -37,3 +37,17 @@ _Avoid_: cancelled, abandoned, closed
 **Finished**:
 Live or dropped; nothing else counts.
 _Avoid_: done, complete, closed
+
+## Workstreams
+
+**Workstream**:
+A long piece of work in one project that holds many tasks, with one Telegram topic, one worktree and branch per repository, and one dev link. It ends when all its tasks are Live or Dropped.
+_Avoid_: big task, epic, project (for the workstream itself)
+
+**Ship**:
+The owner's action that checks a workstream's ready code independently, merges it, and makes it live by the project's live path. The owner may Ship many times before the workstream ends.
+_Avoid_: release, deploy, merge (for the owner's action)
+
+**Dev link**:
+The fixed address where the owner tries a workstream's running web app. It starts on request and stops after two hours without HTTP requests. Projects without a web app keep their device proof.
+_Avoid_: preview, test link, share

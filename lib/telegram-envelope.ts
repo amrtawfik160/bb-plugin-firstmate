@@ -18,6 +18,7 @@ export type TelegramEnvelope = {
   forwarded: boolean;
   threadId: string | null;
   senderId: string | null;
+  workstreamId?: string;
   correlation?: string | null;
   binding?: string | null;
   messageIds?: string[];
@@ -132,6 +133,7 @@ export function parseConnectorHeader(text: string): ConnectorHeader | null {
     correlation: dash(fields.get("correlation")),
     binding: dash(fields.get("binding")),
     messageIds: messageIds.length > 0 ? messageIds : [messageId],
+    ...(dash(fields.get("telegram_workstream")) ? {workstreamId:dash(fields.get("telegram_workstream"))!} : {}),
     items: dash(fields.get("telegram_items")),
     project: project
       ? { name: textOrNull(project.name), projectId: textOrNull(project.projectId), captainThreadId: textOrNull(project.captainThreadId) }

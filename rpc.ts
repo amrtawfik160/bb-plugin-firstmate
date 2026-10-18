@@ -1,6 +1,12 @@
 import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 
+import { workstreamSchema, topicSchema } from './lib/workstream-schema.ts';
+export const workstreamListSchema = z.object({workstreams:z.array(workstreamSchema),trialProjectIds:z.array(z.string())});
+export const workstreamResultSchema = z.object({workstream:workstreamSchema});
+export const workstreamDevLinkSchema = workstreamResultSchema.extend({url:z.string()});
+const workstreamOwner = z.object({threadId:z.string().min(1)});
+const workstreamTarget = workstreamOwner.extend({workstreamId:z.string().min(1)});
 const crewRow = z.object({
   id: z.string(),
   status: z.string(),
@@ -13,6 +19,12 @@ const crewRow = z.object({
 });
 
 export const rpcContract = defineRpcContract({
+  "workstreams.list": {input:workstreamOwner.extend({includeEnded:z.boolean().optional()}),output:workstreamListSchema},
+  "workstreams.create": {input:workstreamOwner.extend({projectId:z.string().min(1),name:z.string().min(1),requestId:z.string().min(1),topic:topicSchema.optional()}),output:workstreamResultSchema},
+  "workstreams.bindTopic": {input:workstreamTarget.extend({chatId:z.string().min(1),topicId:z.number().int().positive()}),output:workstreamResultSchema},
+  "workstreams.ship": {input:workstreamTarget.extend({requestId:z.string().min(1)}),output:workstreamResultSchema},
+  "workstreams.devLink": {input:workstreamTarget.extend({realLogin:z.boolean().optional()}),output:workstreamDevLinkSchema},
+  "workstreams.end": {input:workstreamTarget,output:workstreamResultSchema},
   listAsks: {
     experimental_description: "Read open asks and asks answered in the last 24 hours for one captain. Does not create or resolve asks.",
     input: z.object({ threadId: z.string().min(1) }),
@@ -43,6 +55,7 @@ export const rpcContract = defineRpcContract({
       since: z.number().int().nonnegative().optional(),
     }),
     output: z.object({
+      workstreams: z.array(workstreamSchema).optional(),
       text: z.string(), away: z.boolean().optional(), projects: z.array(z.object({ name: z.string(), working: z.number().int().nonnegative() })).optional(),
       notLive: z.array(z.object({
         id: z.string(), project: z.string().nullable(), title: z.string(), state: z.literal("merged"),
@@ -52,6 +65,7 @@ export const rpcContract = defineRpcContract({
         id: z.string(), project: z.string().nullable(), title: z.string(),
         state: z.enum(["working", "needs_you", "ready", "check", "merged", "live", "done", "dropped"]),
         crews: z.number().int().nonnegative(), waitsOn: z.string().nullable(), refs: z.array(z.string()),
+        workstreamId: z.string().optional(),
         projectId: z.string().nullable(),
         createdAt: z.number(), updatedAt: z.number(),
       })).optional(),
