@@ -577,6 +577,7 @@ test("dispatch with fmHome writes state meta and forget drops it", async () => {
       path: "/wt",
       isWorktree: true,
       status: "ready",
+      mergeBaseBranch: "main",
     }));
     host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew" }));
     host.harness.sdk.stub("threads.get", async () =>
@@ -610,6 +611,8 @@ test("dispatch with fmHome writes state meta and forget drops it", async () => {
     assert.match(writeCmd, /yolo=off/);
     assert.ok(writeCmd.includes("/tmp/fm-home/state"));
 
+    // Forget checks the clean worktree for unlanded work first.
+    host.harness.sdk.stub("environments.diffFiles", async () => ({ files: [] }));
     const forgotten = await host.harness.behavior.runCli(["forget", crewId], { projectId: "proj_1" });
     assert.equal(forgotten.exitCode, 0, forgotten.stderr);
     assert.ok(hostCommands.some((cmd) => cmd.includes(`rm -f`) && cmd.includes(`${crewId}.meta`)));
@@ -1858,7 +1861,7 @@ for (const worktree of [true, false]) {
     test(`scout forget: native owns cleanup and backlog (worktree=${worktree}, force=${force})`, async () => {
       const { host, routed } = await nativeScoutForgetFixture({ worktree });
       try {
-        const result = await host.harness.behavior.runCli(["forget", "c1", "--stop", ...(force ? ["--force"] : [])]);
+        const result = await host.harness.behavior.runCli(["forget", "c1", "--stop", ...(force ? ["--force", "owner: discard it"] : [])]);
         assert.equal(result.exitCode, 0, result.stderr);
         const commands = routed.seen.map(unwrapHostCommand);
         const teardown = commands.filter(cmd => cmd.includes('"$FM_BINDIR/fm-teardown.sh"'));
@@ -1903,7 +1906,7 @@ test("scout forget: a missing native task record falls back to BB-side cleanup i
     refusal: "error: teardown refused: task record is not a regular file at /pinned-home/state/c1.meta . BB state was not advanced",
   });
   try {
-    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop", "--force"]);
+    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop", "--force", "owner: discard it"]);
     assert.equal(result.exitCode, 0, result.stderr);
     assert.equal(host.harness.sdk.callsTo("threads.stop").length + host.harness.sdk.callsTo("threads.archive").length > 0, true, "BB side retires the thread");
     assert.deepEqual(await crewsKv(host), []);
@@ -1933,7 +1936,7 @@ test("scout forget: another task's missing record is still a refusal", async () 
     refusal: "error: teardown refused: task record is not a regular file at /pinned-home/state/other.meta .",
   });
   try {
-    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop", "--force"]);
+    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop", "--force", "owner: discard it"]);
     assert.notEqual(result.exitCode, 0);
     assert.equal((await crewsKv(host))[0]?.id, "c1");
   } finally { await host.harness.lifecycle.dispose(); }
@@ -1943,7 +1946,7 @@ test("scout forget: captain guard precedes native teardown even with force", asy
   const { host, routed } = await nativeScoutForgetFixture();
   try {
     host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
-    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop", "--force"]);
+    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop", "--force", "owner: discard it"]);
     assert.notEqual(result.exitCode, 0);
     assert.match(result.stderr, /Refusing to archive the captain thread/);
     assert.ok(routed.seen.every(cmd => !cmd.includes("fm-teardown.sh")));
@@ -2291,7 +2294,7 @@ test("D2: forget --stop --force on a dirty ship archives without deleting the wo
   try {
     await seedCrew(host);
     stubForgetSdk(host, { dirty: ["src/a.ts"] });
-    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop", "--force"], { projectId: "proj_1" });
+    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop", "--force", "owner: discard it"], { projectId: "proj_1" });
     assert.equal(result.exitCode, 0, result.stderr);
     assert.equal(host.harness.sdk.callsTo("threads.archive").length, 1);
     assert.equal(host.harness.sdk.callsTo("environments.delete").length, 0);
@@ -2354,7 +2357,7 @@ test("F1: forget --stop --force archives despite committed-unpushed work and doe
   try {
     await seedCrew(host);
     stubForgetSdk(host, { dirty: [], committed: ["src/feature.ts"] });
-    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop", "--force"], { projectId: "proj_1" });
+    const result = await host.harness.behavior.runCli(["forget", "c1", "--stop", "--force", "owner: discard it"], { projectId: "proj_1" });
     assert.equal(result.exitCode, 0, result.stderr);
     assert.equal(host.harness.sdk.callsTo("threads.archive").length, 1);
     assert.equal(host.harness.sdk.callsTo("environments.delete").length, 0);

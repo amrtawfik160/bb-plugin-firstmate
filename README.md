@@ -154,7 +154,8 @@ bb firstmate fm <script> ...    # run supported bin/fm-<script>.sh with FM_BACKE
 BB-specific behavior in this fork:
 
 - **Event-push watcher.** `backend=bb` reports push-capable. `fm-watch` blocks on `bb thread wait --status idle` instead of sleeping through its poll budget. A pending interaction surfaces as the blocked edge; the first window to finish wins the multi-window wait.
-- **Refusal-safe teardown.** `remove_worktree` inspects the crew worktree first and refuses dirty trees with the changed-file list, so `fm-teardown` aborts and keeps records instead of letting a later force-removal eat uncommitted work. Discarding is an explicit `forget --force`.
+- **Refusal-safe teardown.** `remove_worktree` inspects the crew worktree first and refuses dirty trees with the changed-file list, so `fm-teardown` aborts and keeps records instead of letting a later force-removal eat uncommitted work. Discarding is an explicit `forget --force "<the owner's words>"`; a bare `--force` is refused. Forget without `--stop` refuses unlanded work too.
+- **Hourly wip backup.** Every hour, each crew worktree pushes commits that no remote branch has to `wip/<crew>-<branch>` on its own remote (lease on that branch only; never main, the crew's PR branch, or a PR). Uncommitted files are never committed: the captain hears about them once per crew per day. `bb firstmate wip-backup` runs the same pass now.
 - **Secondmates support both routing and native seeded homes.** `secondmate register --scope "<what it owns>" --projects a,b` registers an existing domain captain. Native `fm-secondmate-add.sh` creates an independent home through native identity, inheritance and isolation guards. Its BB captain role and home metadata are seeded before its first turn. The creation bridge installs the BB backend in that child home. Routing an existing captain does not create a new seeded home.
 
 ## Configuration

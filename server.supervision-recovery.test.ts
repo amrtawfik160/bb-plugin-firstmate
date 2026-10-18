@@ -595,7 +595,7 @@ test("forgetting a crew with an open PR refuses on unlanded work unless forced, 
       assert.match(refused.stderr, /Refusing: crew c1 has/);
       assert.equal(host.harness.sdk.callsTo("threads.archive").length, 0);
       assert.equal(((await host.bb.storage.kv.get("crews")) as unknown[]).length, 1, "the crew record is kept");
-      const forced = await host.harness.behavior.runCli(["forget", "c1", "--force"], { projectId: "proj_1", threadId: "thr_cap" });
+      const forced = await host.harness.behavior.runCli(["forget", "c1", "--force", "owner: discard it"], { projectId: "proj_1", threadId: "thr_cap" });
       assert.equal(forced.exitCode, 0, forced.stderr);
       assert.equal(host.harness.sdk.callsTo("threads.archive").length, 1);
     } finally {
