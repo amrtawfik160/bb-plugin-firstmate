@@ -28,7 +28,12 @@ sub-agents. Run the full suite and the type check as
    native copy or a host file, find the cause and fix it at the root. Never
    edit the owner layer to make the guard pass. A refusal for skill fidelity
    only leaves the branch `native-pin/<sha8>`; fix the skills that copy native
-   text on that branch.
+   text on that branch. The skill list comes from native's `.agents/skills`
+   at the target. If the writer prints `NEW_NATIVE_SKILL <name>`, commit a
+   verbatim copy `skills/<name>/SKILL.md` and its snapshot at the old pin on
+   your branch, then run the guard again. Leave a native skill out only when
+   the owner says so, in `EXCLUDED_NATIVE_SKILLS` in
+   `scripts/vendor-native-pin.mjs`.
 3. Run `npm run fidelity -- --native <clone>` and
    `FM_TEST_HOME=<clone> node scripts/patch-drift-check.mjs --ref <target>`,
    and the same drift check for every pin a live home still runs. Rebuild a
