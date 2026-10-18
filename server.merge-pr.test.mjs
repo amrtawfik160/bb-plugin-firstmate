@@ -188,14 +188,14 @@ test('a merge that does not land records no owner waiver',async()=>{
 test('a crew records verification for a PR it drove; the record keeps its crew id, the head and the evidence',async()=>{
  const {host,store,commands}=await deck([2391],{verified:false});try {
   await host.bb.storage.kv.set('crews',[crew,{...crew,id:'rel00001',task:'release the green PRs',threadId:'thr_release',parentThreadId:'thr_other'}]);
-  const evidence=['--driven','sent hello to the staging bot at 2391239','--seen','the reply arrived in 2 s'];
+  const evidence=['--driven','sent hello to the staging bot at 2391239','--seen','the reply arrived in 2 s','--surface','web'];
   const stranger=await host.harness.behavior.runCli(['deliveries','verify','cyndra-ai/cyndra-saas#2391','--commit',head(2391),...evidence],{threadId:'thr_stranger',projectId:'proj_1'});
-  assert.equal(stranger.exitCode,1);assert.match(stranger.stderr,/Only the owning manager or a Firstmate crew/);
+  assert.equal(stranger.exitCode,1);assert.match(stranger.stderr,/Refusing: only a crew records verification/);
   const cli=await host.harness.behavior.runCli(['deliveries','verify','cyndra-ai/cyndra-saas#2391','--commit',head(2391).slice(0,7),...evidence],{threadId:'thr_release',projectId:'proj_1'});
   assert.equal(cli.exitCode,0,cli.stderr);
   const row=store.get('cyndra-ai/cyndra-saas#2391');
   assert.equal(row.verifiedCommitSha,head(2391));
-  assert.deepEqual({...row.verification,at:0},{crewId:'rel00001',actor:'thr_release',commitSha:head(2391),driven:'sent hello to the staging bot at 2391239',seen:'the reply arrived in 2 s',at:0});
+  assert.deepEqual({...row.verification,at:0},{crewId:'rel00001',actor:'thr_release',commitSha:head(2391),driven:'sent hello to the staging bot at 2391239',seen:'the reply arrived in 2 s',surface:'web',at:0});
   const out=text(await tool(host,'firstmate_merge').execute({crewId:CREW,yes:true,pr:2391},ctx));
   assert.match(out,/^Merged #2391 Change 2391\n/);assert.equal(merges(commands).length,1);
  }finally{await host.harness.lifecycle.dispose();}
@@ -213,7 +213,7 @@ test('a crew of the same captain merges another crew\'s PR once its head is veri
   const merge=threadId=>host.harness.behavior.runCli(['merge',CREW,'--yes','--pr','2391'],{threadId,projectId:'proj_1'});
   const unverified=await merge('thr_release');
   assert.equal(unverified.exitCode,1);assert.match(unverified.stderr,/is the PR of crew 9ceeb10f/);
-  const recorded=await host.harness.behavior.runCli(['deliveries','verify','cyndra-ai/cyndra-saas#2391','--commit',head(2391),'--driven','sent hello to the staging bot','--seen','the reply arrived'],{threadId:'thr_release',projectId:'proj_1'});
+  const recorded=await host.harness.behavior.runCli(['deliveries','verify','cyndra-ai/cyndra-saas#2391','--commit',head(2391),'--driven','sent hello to the staging bot','--seen','the reply arrived','--surface','web'],{threadId:'thr_release',projectId:'proj_1'});
   assert.equal(recorded.exitCode,0,recorded.stderr);
   const other=await merge('thr_rel_other');
   assert.equal(other.exitCode,1);assert.match(other.stderr,/is the PR of crew 9ceeb10f/);

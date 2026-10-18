@@ -123,7 +123,7 @@ function pipelineSection(playbook: PlaybookChoice, steps: readonly PipelineStep[
   ];
 }
 
-export function crewSkillBlock(input: { shape: Shape; title?: string; task: string; providerId?: string | null; playbook?: PlaybookChoice; dataDir?: string; role?: CrewRole }): string {
+export function crewSkillBlock(input: { shape: Shape; title?: string; task: string; providerId?: string | null; playbook?: PlaybookChoice; dataDir?: string; role?: CrewRole; projectLines?: readonly string[] }): string {
   const playbook = crewPlaybook(input);
   const pipeline = crewPipeline(input);
   const checker = input.role === "checker";
@@ -173,6 +173,7 @@ export function crewSkillBlock(input: { shape: Shape; title?: string; task: stri
   else if (playbook === "none") lines.push(...OPERATOR_MERGE_STEPS);
   else lines.push(...PLAYBOOK_RULES);
   if (pipeline !== null) lines.push(...pipelineSection(playbook, pipeline, skill, input.dataDir));
+  if (input.shape === "ship" && input.projectLines !== undefined && input.projectLines.length > 0) lines.push(...input.projectLines);
   lines.push(SCREENSHOT_RULE);
   if (input.shape !== "scout" && !checker && pipeline === null) lines.push(`Before you open a PR, run /no-comments (\`${skill("no-comments")}\`) over your diff.`);
   if (playbook === "bug-fix" && pipeline === null) lines.push(BUG_FIX_PROOF);
@@ -267,7 +268,7 @@ export function notVerifiedNote(crewId: string, gap: string): string {
     `NOT VERIFIED: crew ${crewId}'s DONE report has its verify step ${gap}.`,
     "CI and unit tests are not verification.",
     "Its PRs cannot merge until a verification record exists for the PR head: drive the changed surface, then firstmate_deliveries action=verify with the head commit, driven and seen.",
-    "Only the owner's own words can waive it: firstmate_merge allowUnverified=\"<owner words>\".",
+    "Only the owner's own words can waive it, and only for an internal PR: firstmate_merge allowUnverified=\"<owner words>\". A production PR needs a crew's proof or the owner's Works tap.",
   ].join("\n");
 }
 

@@ -1,0 +1,69 @@
+{
+  "schema": 1,
+  "about": "Owner decisions Q5 and Q11 (17 Oct). The Canary row is the isolated-server test project. Each project names the surface its proof must come from, the release read-back its app builds need, and the shared test servers its crews lease one at a time. A PR belongs to the project whose repos list its repository (owner/repo, * is a wildcard); a crew belongs to the project whose repos list its repository or whose bbProjects list its BB project name. hostCanDrive lists the surfaces a crew on this host can drive itself; for any other surface the crew asks the owner to test the build, and his Works tap is the proof record.",
+  "surfaces": {
+    "iphone": "the app on an iPhone or the iOS Simulator",
+    "web": "the deployed web page in a browser",
+    "message": "a real message through the changed channel"
+  },
+  "hostCanDrive": ["web", "message"],
+  "projects": [
+    {
+      "name": "Dr Woo",
+      "repos": ["amrtawfik160/dr.woo"],
+      "bbProjects": ["woo-app", "Dr Woo"],
+      "proofSurface": "iphone",
+      "release": { "kind": "testflight", "group": "Externals" }
+    },
+    {
+      "name": "Safi",
+      "repos": ["amrtawfik160/safi"],
+      "bbProjects": ["Safi"],
+      "proofSurface": "iphone",
+      "release": { "kind": "testflight", "group": "Beta Testers" }
+    },
+    {
+      "name": "Cyndra",
+      "repos": ["cyndra-ai/*"],
+      "bbProjects": ["Cyndra", "Cyndra SaaS"],
+      "proofSurface": "web",
+      "sharedServers": [
+        { "id": "cyndra-dev", "about": "the shared Cyndra dev server", "reset": "deploy main back to the dev server" }
+      ]
+    },
+    {
+      "name": "Areliaa",
+      "repos": ["amrtawfik160/areliaa"],
+      "bbProjects": ["Areliaa"],
+      "proofSurface": "web"
+    },
+    {
+      "name": "Parknwash",
+      "repos": ["xtawfik/parknwash-*"],
+      "bbProjects": ["Parknwash"],
+      "proofSurface": "web"
+    },
+    {
+      "name": "Runants",
+      "repos": ["hazw80801/runants"],
+      "bbProjects": ["runants", "Runants"],
+      "proofSurface": "web"
+    },
+    {
+      "name": "Canary",
+      "repos": ["*/fm-canary-*"],
+      "bbProjects": ["fm-canary", "fm-canary-34"],
+      "proofSurface": "iphone",
+      "release": { "kind": "testflight", "group": "Canary Testers" },
+      "sharedServers": [
+        { "id": "canary-dev", "about": "the canary test server", "reset": "deploy main back to the canary test server" }
+      ]
+    },
+    {
+      "name": "Telegram and agents",
+      "repos": ["amrtawfik160/bb-plugin-telegram", "amrtawfik160/bb-plugin-firstmate", "*/agent-orchestrator"],
+      "bbProjects": ["bb-plugin-telegram", "bb-plugin-firstmate", "agent-orchestrator"],
+      "proofSurface": "message"
+    }
+  ]
+}
