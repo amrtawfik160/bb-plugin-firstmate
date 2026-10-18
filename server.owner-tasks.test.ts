@@ -471,21 +471,39 @@ test("Oct 8 repro: a research crew that ends its turn with DONE moves its task t
   }
 });
 
-test("a dispatch naming an open task in title or task joins it unless taskRef overrides it", async () => {
+test("a dispatch mentioning an open task in title or task opens a new task unless taskRef is explicit", async () => {
   for (const field of ["title", "task"] as const) {
     const host = await captainHost();
     try {
       const tasks = createOwnerTasks(host.bb.storage.database());
       tasks.open({ captain: "thr_cap", project: "Areliaa", title: "Brand audit", sourceRefs: ["tg:200:1"], at: 1 });
       tasks.open({ captain: "thr_cap", project: "Areliaa", title: "Group chats", sourceRefs: ["tg:200:2"], at: 2 });
-      await dispatch(host, { task: "Continue the work", title: "Follow-up", taskId: "restart-named", origin: { kind: "captain", reason: "Restart stale work" }, [field]: "Restart T1" });
-      assert.deepEqual(tasks.get("T1")?.crewIds, ["restart-named"]);
-      assert.equal(tasks.list("thr_cap").length, 2);
+      await dispatch(host, { task: "Continue the work", title: "Follow-up", taskId: "restart-named", origin: { kind: "thread", threadId: "thr_repair" }, [field]: "Firstmate adopted open PRs as tasks T1 onward" });
+      assert.deepEqual(tasks.get("T1")?.crewIds, []);
+      assert.deepEqual(tasks.get("T3")?.crewIds, ["restart-named"]);
+      assert.equal(tasks.list("thr_cap").length, 3);
       await dispatch(host, { task: "Restart T1", taskId: "explicit-ref", taskRef: "T2", origin: { kind: "captain", reason: "Use the correct task" } });
       assert.deepEqual(tasks.get("T2")?.crewIds, ["explicit-ref"]);
-      assert.equal(tasks.list("thr_cap").length, 2);
+      assert.equal(tasks.list("thr_cap").length, 3);
     } finally { await host.harness.lifecycle.dispose(); }
   }
+});
+
+test("a dispatch whose title names a held PR joins that task despite an incidental task number", async () => {
+  const host = await captainHost();
+  try {
+    const tasks = createOwnerTasks(host.bb.storage.database());
+    tasks.open({ captain: "thr_cap", project: "Areliaa", title: "Unrelated task", sourceRefs: [], at: 1 });
+    tasks.open({ captain: "thr_cap", project: "Areliaa", title: "Login fix", sourceRefs: [], prs: ["acme/app#2562"], at: 2 });
+    const result = await dispatch(host, {
+      task: "Check the adopted PR; the adoption report listed tasks T1 onward",
+      title: "Check #2562", taskId: "check-held-pr", origin: { kind: "thread", threadId: "thr_repair" },
+    });
+    assert.ok(!isError(result), text(result));
+    assert.deepEqual(tasks.get("T1")?.crewIds, []);
+    assert.deepEqual(tasks.get("T2")?.crewIds, ["check-held-pr"]);
+    assert.equal(tasks.list("thr_cap").length, 2);
+  } finally { await host.harness.lifecycle.dispose(); }
 });
 
 test("Oct 8 repro: a captain that receives Telegram messages is told to re-read the Telegram reference after each compaction", async () => {

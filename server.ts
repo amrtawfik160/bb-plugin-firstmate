@@ -5704,7 +5704,7 @@ export default async function plugin(bb: BbPluginApi) {
       const flag = `task-idle-flag:${current.id}:${current.updatedAt}`;
       if (await bb.storage.kv.get(flag) !== undefined) continue;
       await bb.storage.kv.set(flag, now);
-      await deliverToCaptain(captain, `TASK WITHOUT CREW: task ${current.id} (${current.title}) has been working with no live crew for ${formatAge(now - current.updatedAt)}. Dispatch a crew for it with firstmate_dispatch task=${current.id}, or close it with firstmate_task (done with its outcome, or dropped with the owner's reason).`, "").catch((error) => bb.log.warn(`task ${current.id} idle flag: ${String(error)}`));
+      await deliverToCaptain(captain, `TASK WITHOUT CREW: task ${current.id} (${current.title}) has been working with no live crew for ${formatAge(now - current.updatedAt)}. Dispatch a crew for it with firstmate_dispatch taskRef=${current.id}, or close it with firstmate_task (done with its outcome, or dropped with the owner's reason).`, "").catch((error) => bb.log.warn(`task ${current.id} idle flag: ${String(error)}`));
     }
     if (changed) await refreshOwnerBoard();
   }
@@ -13480,8 +13480,7 @@ export default async function plugin(bb: BbPluginApi) {
       const untagged = turnRefs.length > 0 && origin === undefined && taskRef === undefined && !passedRefs.some((ref) => turnRefs.includes(ref));
       const trackOwnerTask = async (crewId: string): Promise<string> => {
         if (parentThreadId === undefined) return "";
-        const named = [...`${title ?? ""}\n${task}`.matchAll(/\bT\d+\b/g)].map((match) => ownerTasks.get(match[0])).find((item) => item?.captain === parentThreadId && isOpenTask(item));
-        const held = taskRef !== undefined ? ownerTasks.get(taskRef) : named ?? await prTask(parentThreadId, resolvedProject, title, task);
+        const held = taskRef !== undefined ? ownerTasks.get(taskRef) : await prTask(parentThreadId, resolvedProject, title, task);
         if (held !== undefined) {
           // Only this dispatch's own owner message joins the task: the turn may hold messages about other work.
           const joinRefs = origin !== undefined ? [] : passedRefs.length > 0 ? passedRefs : turnRefs.length === 1 ? turnRefs : [];
