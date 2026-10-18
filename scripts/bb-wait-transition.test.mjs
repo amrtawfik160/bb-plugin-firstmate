@@ -43,7 +43,9 @@ function lab(n,{delay='0.2'}={}) {
  const save=()=>writeFileSync(join(dir,'threads.json'),JSON.stringify(threads));save();
  const wait=(timeout,env={})=>{
   const started=Date.now();
-  const r=spawnSync('bash',['-c','. "$FM_HOME/bin-bb/fm-backend.sh"; fm_backend_source bb; FM_BACKEND_EVENTS_CAPABILITY_CONFIRMED=1 fm_backend_wait_transition bb bb "$@"','wait',String(timeout),join(home,'state'),...windows],
+  // --norc: with SHLVL=0 (a Codex command) and a socket for stdin, Debian's bash reads
+  // ~/.bashrc, which can put the real bb ahead of the fake one on PATH.
+  const r=spawnSync('bash',['--norc','-c','. "$FM_HOME/bin-bb/fm-backend.sh"; fm_backend_source bb; FM_BACKEND_EVENTS_CAPABILITY_CONFIRMED=1 fm_backend_wait_transition bb bb "$@"','wait',String(timeout),join(home,'state'),...windows],
    {encoding:'utf8',timeout:600000,env:{...process.env,FM_HOME:home,FM_BACKEND:'bb',FAKE_BB_DIR:dir,FAKE_BB_DELAY:delay,PATH:`${dir}:${process.env.PATH}`,...env}});
   const calls=existsSync(join(dir,'calls.jsonl'))?readFileSync(join(dir,'calls.jsonl'),'utf8').trim().split('\n').filter(Boolean).map(JSON.parse):[];
   rmSync(join(dir,'calls.jsonl'),{force:true});
