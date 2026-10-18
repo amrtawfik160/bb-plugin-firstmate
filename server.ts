@@ -5387,13 +5387,17 @@ export default async function plugin(bb: BbPluginApi) {
         if (latest === null) continue;
         const seen = `task-status-seen:${statusKey(crew.id, `${latest.verb} ${latest.note}`)}`;
         if (await bb.storage.kv.get(seen) !== undefined) continue;
-        await bb.storage.kv.set(seen, now);
         if (latest.verb === "done") {
           const after = ownerTasks.crewReportedDone(captain, crew.id, latest.note, (id) => id !== crew.id && live.has(id), (item) => deliveries.forTasks(item.crewIds, item.prs), now);
+          // A done line is used up only once it moved the task: while another crew of the task works, it waits.
           if (after !== undefined && after.state !== task.state) { changed = true; bb.log.info(`task ${task.id}: crew ${crew.id} reported done; ${task.state} -> ${after.state}`); }
+          if (after === undefined || after.state !== task.state || !isOpenTask(after)) await bb.storage.kv.set(seen, now);
         } else if (crewWaitsOnOwner(latest)) {
-          // The captain may have asked already: a card on this task, or any card it sent after this status line.
-          const asked = ownerAsks.listOpen(captain).find((ask) => ask.task === task.id || (lineAt !== null && ask.createdAt >= lineAt));
+          await bb.storage.kv.set(seen, now);
+          // The captain may have asked already: a card on this task, or a card it sent after this status line
+          // about the same project with no task of its own. A newer card about other work does not count.
+          const asked = ownerAsks.listOpen(captain).find((ask) => ask.task === task.id
+            || (ask.task === undefined && lineAt !== null && ask.createdAt >= lineAt && sameProject(ask.project ?? null, task.project)));
           if (asked === undefined) await askForCrew(captain, task, crew, latest.note, now);
           else {
             bb.log.info(`task ${task.id}: crew ${crew.id} waits on the owner; card ${asked.id} already asks, no new card`);
@@ -5488,15 +5492,19 @@ export default async function plugin(bb: BbPluginApi) {
   /** Owner decision Q7: a new card on the same task or topic replaces the open one; Telegram marks the old one replaced. */
   async function replaceOpenCards(ask: OwnerAsk): Promise<string[]> {
     const old = replacedBy(ask, ownerAsks.listOpen(ask.captain).filter((other) => other.id !== ask.id));
+    const replaced: string[] = [];
     for (const card of old) {
       const resolution = `Replaced by card ${ask.id}`;
+      // Read it again: the owner may have answered it while an earlier card was being edited.
+      if (ownerAsks.get(card.id)?.state !== "open") continue;
       const closed = ownerAsks.resolve(card.id, ask.captain, "cancelled", resolution, ask.createdAt);
+      if (closed !== undefined) replaced.push(card.id);
       if (closed === undefined || (await reliabilityFlags()).telegramThreading !== "on") continue;
       try {
         await bb.sdk.plugins.callRpc({ pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "editAsk", input: { askId: card.id, resolution, at: ask.createdAt }, outputSchema: z.object({ ok: z.boolean() }) });
       } catch (error) { bb.log.warn(`replaced card ${card.id} not edited in Telegram: ${String(error)}`); }
     }
-    return old.map((card) => card.id);
+    return replaced;
   }
 
   // Best effort: the connector redraws its pinned board. A missing method or a failure changes nothing here.
