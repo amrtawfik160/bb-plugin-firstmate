@@ -538,10 +538,10 @@ index 0a94356c..059753b9 100755
    if ! kimi_wait_for_ready; then
      kimi_spawn_fail "$KIMI_READY_FAILURE_DETAIL"
 diff --git a/bin/fm-watch.sh b/bin/fm-watch.sh
-index 1b4c3087..ce1f1b23 100755
+index 1b4c3087..ad4f3619 100755
 --- a/bin/fm-watch.sh
 +++ b/bin/fm-watch.sh
-@@ -1317,6 +1317,15 @@ WEDGE_BACKLOG_HOLD_KIND='captain hold'
+@@ -1317,6 +1317,15 @@
  wedge_wait_evidence() {  # <task> -> one wait_record on stdout
    local task=$1 last until statusf run
    [ -n "$task" ] || return 1
@@ -557,6 +557,43 @@ index 1b4c3087..ce1f1b23 100755
    statusf="$STATE/$task.status"
    last=$(status_declared_wait_line "$statusf")
    if status_is_captain_held "$last"; then
+@@ -2714,6 +2723,11 @@
+   return 0
+ }
+ 
++watcher_beat() {
++  touch "$STATE/.last-watcher-beat"
++  WATCHER_BEAT_AT=$SECONDS
++}
++
+ resurface_after_downtime() {
+   # Handling successors already have a predecessor-delivered wake on the way.
+   # Re-announcing from this cycle is what turned a lost handshake into an
+@@ -2767,7 +2781,10 @@
+ 
+   # Liveness beacon for fm-guard.sh: a fresh mtime here means a watcher is
+   # alive. Supervision scripts warn when this goes stale with tasks in flight.
+-  touch "$STATE/.last-watcher-beat"
++  watcher_beat
++  # BB-DIVERGE: the beacon also beats mid-scan, so it no longer marks a finished
++  # pass. This marker is touched only here, at the top of each pass.
++  touch "$STATE/.last-watcher-pass"
+ 
+   # Opt-in fleet activity ledger (docs/fleet-ledger.md): pick up newly appended
+   # status lines before this cycle can exit on a wake. Off costs one file test.
+@@ -3102,6 +3119,12 @@
+   # remembers the hash already classified, or the declaration a busy pane's
+   # crossed turn bound already handed to the away-mode daemon).
+   while IFS= read -r w; do
++    # BB-DIVERGE: one pass captures every recorded window, and a BB capture
++    # takes seconds, so a large fleet's pass outlasted WATCHER_STALE_GRACE and
++    # turn-end arms refused the live watcher as stale. Beat once a tenth of the
++    # grace has passed; a short pass still beats once per cycle, which is what
++    # callers that read a beacon change as a finished cycle rely on.
++    [ $((SECONDS - WATCHER_BEAT_AT)) -lt $((WATCHER_STALE_GRACE / 10)) ] || watcher_beat
+     kind=$(window_kind "$w")
+     task=$(window_to_task "$w" "$STATE")
+     # Steering-inbox loss detection runs before the secondmate stale
 diff --git a/docs/configuration.md b/docs/configuration.md
 index a0a2b879..23ffee97 100644
 --- a/docs/configuration.md
