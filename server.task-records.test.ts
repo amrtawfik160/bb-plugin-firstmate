@@ -295,3 +295,47 @@ test("check round 2: a reopened owner message stays open though the connector st
     await host.harness.lifecycle.dispose();
   }
 });
+
+test("check round 3: a failure whose confirmation was lost is applied once: it never reopens an owner message answered after it", async () => {
+  const { host, calls } = await captainHost();
+  try {
+    const failures = [{ id: "out_9", chatId: "200", messageId: "6400", reason: "Telegram refused the message: Bad Request", at: 0 }];
+    const acked: string[] = [];
+    let ackFails = true;
+    host.harness.sdk.stub("plugins.callRpc", async (args: Rpc) => {
+      calls.push(args);
+      if (args.method === "undelivered") return { undelivered: failures.filter((row) => !acked.includes(row.id)) };
+      if (args.method === "ackUndelivered") {
+        if (ackFails) { ackFails = false; throw new Error("temporary ack transport failure"); }
+        acked.push(...(args.input.ids as string[]));
+        return { acked: (args.input.ids as string[]).length };
+      }
+      if (args.method === "replied") return { replied: [] };
+      if (args.method === "freeText") return { obligations: [] };
+      return { ok: true, queued: 1, duplicate: false, mode: "on" };
+    });
+    await ownerSays(host, "6400", "Report");
+    await tool(host, "firstmate_reply").execute({ ref: "tg:200:6400", text: "Here it is." }, capCtx);
+    // Telegram refuses that reply after it was accepted.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    failures[0]!.at = Date.now();
+    const ledger = () => createInboundLedger(host.bb.storage.database()).get({ source: "telegram", chatId: "200", messageId: "6400" });
+    const sends: string[] = [];
+    host.harness.sdk.stub("threads.send", async (args: { input: Array<{ text: string }> }) => { sends.push(args.input[0]?.text ?? ""); return {}; });
+    const idle = () => host.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_cap", status: "idle" }), lastAssistantText: "ok" });
+    await idle();
+    assert.notEqual(ledger()?.state, "answered", "open again");
+    assert.deepEqual(acked, [], "the confirmation was lost");
+    // The captain sends a corrected reply; Telegram takes it.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await tool(host, "firstmate_reply").execute({ ref: "tg:200:6400", text: "Here it is, corrected." }, capCtx);
+    assert.equal(ledger()?.state, "answered");
+    await idle();
+    await idle();
+    assert.equal(ledger()?.state, "answered", "the old failure does not reopen the repaired message");
+    assert.deepEqual(acked, ["out_9"], "it is confirmed on the next drain");
+    assert.equal(sends.filter((line) => /tg:200:6400/.test(line) && /not delivered/i.test(line)).length, 1, "the captain is told once");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
