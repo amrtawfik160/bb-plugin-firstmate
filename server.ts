@@ -12569,10 +12569,11 @@ export default async function plugin(bb: BbPluginApi) {
       if (cancelled !== true && reopen !== true && await bb.storage.kv.get(`${DEVICE_PROOF_PREFIX}${id}`) !== undefined) {
         return toolError(`Refusing: ask ${id} is a device proof card, and only the owner's tap answers a device proof card. His Works is the proof record; cancel it with cancelled=true if the build is replaced.`);
       }
-      // A cancelled device proof card proves nothing: drop its binding and any pending re-read of its tap.
-      if (cancelled === true) await dropDeviceProof(id);
       const closed = ownerAsks.resolve(id, captain, reopen === true ? "open" : cancelled === true ? "cancelled" : "answered", resolution, Date.now());
       if (!closed) return toolError(`No ask ${id} for this captain.`);
+      // Only the owning captain's cancel reaches here: a cancelled device proof card proves nothing, so its
+      // binding and any pending re-read of its tap go (checker round 4).
+      if (cancelled === true) await dropDeviceProof(id);
       let warning = "";
       try {
         const result = z.object({ ok: z.boolean() }).parse(await bb.sdk.plugins.callRpc({
