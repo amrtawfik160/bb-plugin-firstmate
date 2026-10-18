@@ -53,6 +53,10 @@ const MERGE_SEQUENCE = [
 const HOST_LIMIT = [
   "This host is shared. Run every type check, full test run and build as `~/.bb-firstmate/bin/fm-heavy <command>`; it waits for a host-wide slot.",
   "Do not start such commands in the background or as your own systemd service to skip the wait. Stop dev servers and browsers you started when you finish.",
+  // Owner token rules, 18 Oct.
+  "Wait for CI with one blocking command, e.g. `gh run watch <id> --exit-status`. No sleep loops or repeated polls.",
+  "Run focused tests while you work, and the full suite once, right before each push.",
+  "Codex runs use gpt-6.1-sol, or the model the owner named. Never gpt-6-astra without his permission.",
 ];
 
 test("the playbook comes from the dispatch title, not the task body", () => {
@@ -406,8 +410,9 @@ test("the block stays short for every provider, shape, playbook and role", () =>
         for (const role of ["builder", "checker"] as const) {
           const input = { shape, title: "x", task: "", providerId, playbook, role };
           const size = crewSkillBlock(input).length;
-          // 18 Oct: +600 for the code-review, implement-spec, tdd, Skill-tool and Bugbot rules.
-          const bound = crewPipeline(input) === null ? 4500 : 5900;
+          // 18 Oct: +600 for the code-review, implement-spec, tdd, Skill-tool and Bugbot rules,
+          // then +300 for the owner's CI-wait, test-run and Codex-model rules.
+          const bound = crewPipeline(input) === null ? 4800 : 6200;
           assert.ok(size <= bound, `${providerId} ${shape} ${playbook} ${role}: ${size} characters`);
         }
       }
@@ -616,6 +621,7 @@ test("a checker brief reviews the PR head on a different model and records a ver
     "2. Drive the changed surface yourself, with the project's verify skill if it has one.",
     "3. Record your verdict: `bb firstmate deliveries check <owner/repo#n> --commit <head sha> --verdict pass|fail --notes \"<what you checked, drove and saw>\"`.",
     "4. A fail verdict names each finding, numbered, in its notes, and adds `--findings <n>` with their count. A new push needs a new check.",
+    "5. Send the verdict straight to the crew that must act on it (release crew or PR author): `bb thread tell <its thread id> '<verdict>'`; `bb firstmate crew <id>` shows the id. One message per PR head, not through the captain.",
   ].join("\n")), block);
   assert.ok(!block.includes("### Pipeline"), block);
   assert.ok(!block.includes("/playbooks/"), block);

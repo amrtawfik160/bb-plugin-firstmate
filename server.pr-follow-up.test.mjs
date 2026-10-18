@@ -17,6 +17,7 @@ let ghStderr='';
 let probeStderr='';
 let openRows=null;
 const states=new Map();
+let r5Hook=async()=>{};
 const head=n=>heads.get(n) ?? String(n).repeat(10).slice(0,40);
 const crewRow=(id,threadId,extra)=>({id,task:'x',projectId:'proj_1',threadId,parentThreadId:'thr_cap',nativeHome:'/native',worktree:true,shape:'ship',posture:'direct-PR',createdAt:'2026-10-17T00:00:00.000Z',reasoningLevel:null,dispatchVersion:2,...extra});
 const CREWS=[
@@ -32,6 +33,7 @@ function hostCommands(host,{delayMs=0}={}) {
  host.harness.sdk.stub('terminals.output',async({terminalId})=>{
   const command=byId.get(terminalId);const isRead=command.includes('gh pr view');
   if(isRead){gh.reads++;gh.inFlight++;gh.maxInFlight=Math.max(gh.maxInFlight,gh.inFlight);await new Promise(r=>setTimeout(r,delayMs));gh.inFlight--;}
+  await r5Hook(command);
   const out=forge(command);const captured=command.includes('FM_HOST_CAPTURE_V1');
   const payload=captured?JSON.stringify({protocol:'FM_HOST_CAPTURE_V1',exitCode:out.code??0,stdout:out.payload??'',stderr:isRead?ghStderr:command.includes('rateLimit')?probeStderr:''}):out.payload??'';
   return{nextSeq:1,chunks:[{dataBase64:Buffer.from(`${payload}\n__FM_HOST_RC:${captured?0:out.code ?? 0}\n`).toString('base64')}]};
@@ -364,4 +366,32 @@ test('a list sweep that fails early leaves no validation behind: the reopened PR
   assert.ok(failed);
   assert.deepEqual(d.removed(),[], 'previous-cycle validation must not retire a reopened PR after this cycle fails');
  }finally{await d.host.harness.lifecycle.dispose();}
+});
+
+
+// Checker 156-verdict-5, finding 1 (156-check-5-evidence): a tell revives the retained author after the
+// cleanup's archive read; the cleanup re-reads under the crew's lock and keeps the record.
+test('a retained native-record cleanup keeps a worker that Firstmate revived after its archive read',async()=>{
+ const d=await sweepDeck();
+ let revived=false, sent=0, invoked=false, tellResult;
+ try {
+  states.set(5911,'MERGED');
+  d.deliver('c9','thr_c9',5911,'merged-unverified');
+  metas='c9\tthr_c9\n';
+  d.host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:threadId==='thr_c9'&&revived?'running':'idle',environmentId:'env_wt',archivedAt:threadId==='thr_c9'&&!revived?1:null}));
+  d.host.harness.sdk.stub('threads.updatePluginMetadata',async()=>({}));
+  d.host.harness.sdk.stub('threads.unarchive',async()=>{revived=true;return{};});
+  d.host.harness.sdk.stub('threads.send',async({threadId})=>{if(threadId==='thr_c9')sent++;return{delivery:'sent'};});
+  r5Hook=async command=>{
+   if(!invoked&&command.includes('/pull/5911')&&command.includes('--json state')){
+    invoked=true;
+    tellResult=text(await tool(d.host,'firstmate_tell').execute({crewId:'c9',message:'Make the follow-up change'},{threadId:'thr_cap',projectId:'proj_1'}));
+   }
+  };
+  await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.equal(invoked,true,'restart at the barrier after the cleanup archive read');
+  assert.equal(revived,true,tellResult);
+  assert.equal(sent,1,tellResult);
+  assert.deepEqual(d.removed(),[],'Firstmate started this worker; its native metadata and inbox must stay');
+ } finally {r5Hook=async()=>{};await d.host.harness.lifecycle.dispose();}
 });

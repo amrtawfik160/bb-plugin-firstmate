@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createFakePluginHost,makeThreadResponse } from '@get-bb/plugin-sdk/testing';
 import plugin from './server.ts';
+import {cleanWorktree} from './test/clean-worktree.ts';
 
 // BB 0.46 review F1 (#5704): each uncached environments.pullRequest read makes the host run
 // gh pr view plus a GraphQL merge-queue query, and BB caches it for only 10 seconds. Only
@@ -137,16 +138,19 @@ test('external merge after cached open is observed at two minute expiry',async(t
  t.mock.timers.enable({apis:['Date'],now:Date.now()});
  let state='open';
  const host=await deck({pullRequest:async()=>({outcome:'available',pullRequest:{url:prUrl(0),number:100,title:'x',state}})});
+ cleanWorktree(host);
  try {
   await host.bb.storage.kv.set('crews',[CREWS[0]]);
   host.harness.sdk.stub('threads.output',async()=>({output:'DONE: change ready'}));
   host.harness.sdk.stub('threads.stop',async()=>({}));
   host.harness.sdk.stub('threads.archive',async()=>({}));
   // Retirement asks git for unpushed commits first; there are none.
-  host.harness.sdk.stub('terminals.create',async()=>({id:'t_git'}));
+  // The finished-crew unsaved-work check answers a clean, completed check.
+  const gitCmds=new Map();let gitN=0;
+  host.harness.sdk.stub('terminals.create',async args=>{const tid=`t_git${++gitN}`;gitCmds.set(tid,args.start?.command??'');return{id:tid};});
   host.harness.sdk.stub('terminals.get',async()=>({status:'running'}));
   host.harness.sdk.stub('terminals.close',async()=>({}));
-  host.harness.sdk.stub('terminals.output',async()=>({nextSeq:1,chunks:[{dataBase64:Buffer.from('\n__FM_HOST_RC:0\n').toString('base64')}]}));
+  host.harness.sdk.stub('terminals.output',async({terminalId})=>({nextSeq:1,chunks:[{dataBase64:Buffer.from(`${(gitCmds.get(terminalId)??'').includes('FM_UNSAVED')?'FM_UNSAVED checked\n':''}\n__FM_HOST_RC:0\n`).toString('base64')}]}));
   const ctx={threadId:'thr_cap',projectId:'proj_1'};
   await tool(host,'firstmate_bearings').execute({},ctx);
   state='merged';

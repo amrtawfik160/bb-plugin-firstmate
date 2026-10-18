@@ -192,9 +192,10 @@ test('dispatch gives each role its default model, and an owner-named model appli
 // 17 Oct step 2 canary: a Claude model on the Codex provider failed at its first turn.
 test('dispatch refuses a model the provider does not offer before anything is spawned',async()=>{
  const host=await dispatchHost();try {
-  const out=text(await tool(host,'firstmate_dispatch').execute({projectId:'proj_1',task:'check PR 9',role:'checker',model:'claude-opus-5-5'},{projectId:'proj_1'}));
-  assert.match(out,/Provider "codex" does not offer model "claude-opus-5-5"\. It offers: gpt-6\.1-sol, gpt-6-astra\. Nothing was spawned\./);
-  const cli=await host.harness.behavior.runCli(['dispatch','--project','proj_1','--provider','codex','--model','claude-opus-5-5','--','fix login'],{projectId:'proj_1'});
+  // Codex models are pinned by the owner rule, so the catalog check is shown on another provider.
+  const out=text(await tool(host,'firstmate_dispatch').execute({projectId:'proj_1',task:'fix login',providerId:'acp-grok',model:'claude-opus-5-5'},{projectId:'proj_1'}));
+  assert.match(out,/Provider "acp-grok" does not offer model "claude-opus-5-5"\. It offers: grok-4\.7, grok-4\.6\. Nothing was spawned\./);
+  const cli=await host.harness.behavior.runCli(['dispatch','--project','proj_1','--provider','acp-grok','--model','claude-opus-5-5','--','fix login'],{projectId:'proj_1'});
   assert.equal(cli.exitCode,1);assert.match(cli.stderr,/does not offer model "claude-opus-5-5"/);
   assert.equal(host.harness.sdk.callsTo('threads.spawn').length,0);
  }finally{await host.harness.lifecycle.dispose();}
@@ -244,8 +245,8 @@ test('dispatch refuses when the provider catalog or its model list cannot be rea
   ['empty provider list',h=>h.harness.sdk.stub('providers.list',async()=>[])],
  ]){
   const host=await dispatchHost();stub(host);try {
-   const out=text(await tool(host,'firstmate_dispatch').execute({projectId:'proj_1',task:'check PR 9',role:'checker',model:'not-a-real-model'},{projectId:'proj_1'}));
-   assert.match(out,/cannot be checked against the catalog of provider "codex"[^]*Nothing was spawned\./,label);
+   const out=text(await tool(host,'firstmate_dispatch').execute({projectId:'proj_1',task:'fix login',providerId:'acp-grok',model:'not-a-real-model'},{projectId:'proj_1'}));
+   assert.match(out,/cannot be checked against the catalog of provider "acp-grok"[^]*Nothing was spawned\./,label);
    assert.equal(host.harness.sdk.callsTo('threads.spawn').length,0,label);
   }finally{await host.harness.lifecycle.dispose();}
  }
@@ -274,5 +275,27 @@ test('each checker verdict reaches the weekly scorecard with its finding count',
   const card=JSON.parse((await host.harness.behavior.runCli(['scorecard','--json'],ctx)).stdout);
   assert.deepEqual(card.checks.map(c=>[c.pr,c.verdict,c.findings,c.model]),[[id(2391),'fail',2,'gpt-6-astra']]);
   assert.match((await host.harness.behavior.runCli(['scorecard'],ctx)).stdout,/Checker findings: 2 findings in 1 fail verdict on 1 PR\. Source: checker verdicts\./);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+// Owner rule, 18 Oct: Codex crews and checkers default to gpt-6.1-sol; another named Codex model is
+// allowed; gpt-6-astra only with the owner's permission (modelPermission = his message ref).
+test('a Codex crew defaults to gpt-6.1-sol, may run a named Codex model, and runs gpt-6-astra only with the owner permission ref',async()=>{
+ const host=await dispatchHost();try {
+  const out=await tool(host,'firstmate_dispatch').execute({projectId:'proj_1',task:'fix login',providerId:'codex'},{projectId:'proj_1'});
+  assert.doesNotMatch(text(out),/Refus|Unknown|FAILED/,text(out));
+  assert.deepEqual(spawned(host).at(-1),{providerId:'codex',model:'gpt-6.1-sol',reasoningLevel:undefined});
+  const before=host.harness.sdk.callsTo('threads.spawn').length;
+  const refused=text(await tool(host,'firstmate_dispatch').execute({projectId:'proj_1',task:'check PR 11',role:'checker',model:'gpt-6-astra'},{projectId:'proj_1'}));
+  assert.match(refused,/Refusing: gpt-6-astra needs the owner's permission\. Pass modelPermission with his message ref \(tg:<chat>:<message>\)\. Nothing was spawned\./);
+  const cli=await host.harness.behavior.runCli(['dispatch','--project','proj_1','--provider','codex','--model','gpt-6-astra','--','fix login'],{projectId:'proj_1'});
+  assert.equal(cli.exitCode,1);assert.match(cli.stderr,/needs the owner's permission/);
+  assert.equal(host.harness.sdk.callsTo('threads.spawn').length,before);
+  const allowed=await tool(host,'firstmate_dispatch').execute({projectId:'proj_1',task:'check PR 12',role:'checker',model:'gpt-6-astra',modelPermission:'tg:985604794:5617'},{projectId:'proj_1'});
+  assert.doesNotMatch(text(allowed),/Refus|Unknown|FAILED/,text(allowed));
+  assert.deepEqual(spawned(host).at(-1),{providerId:'codex',model:'gpt-6-astra',reasoningLevel:undefined});
+  const viaCli=await host.harness.behavior.runCli(['dispatch','--project','proj_1','--provider','codex','--model','gpt-6-astra','--model-permission','tg:985604794:5618','--','fix login again'],{projectId:'proj_1'});
+  assert.equal(viaCli.exitCode,0,viaCli.stderr);
+  assert.deepEqual(spawned(host).at(-1),{providerId:'codex',model:'gpt-6-astra',reasoningLevel:undefined});
  }finally{await host.harness.lifecycle.dispose();}
 });

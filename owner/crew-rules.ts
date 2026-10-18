@@ -14,6 +14,10 @@ export const HOUSE_RULES = [
   "Merge only via `bb firstmate merge <crew> --pr <n> --yes`; it refuses a PR with no verification record. Never use `gh pr merge` or GitHub's API.",
   "This host is shared. Run every type check, full test run and build as `~/.bb-firstmate/bin/fm-heavy <command>`; it waits for a host-wide slot.",
   "Do not start such commands in the background or as your own systemd service to skip the wait. Stop dev servers and browsers you started when you finish.",
+  // Owner token rules, 18 Oct (grill Q13, Q14): waits and test runs burned the most tokens.
+  "Wait for CI with one blocking command, e.g. `gh run watch <id> --exit-status`. No sleep loops or repeated polls.",
+  "Run focused tests while you work, and the full suite once, right before each push.",
+  "Codex runs use gpt-6.1-sol, or the model the owner named. Never gpt-6-astra without his permission.",
 ] as const;
 
 // A release or operator crew merges other crews' PRs; it records what it drove itself.
@@ -58,5 +62,7 @@ export function checkerSteps(skill: (name: string) => string): string[] {
     "2. Drive the changed surface yourself, with the project's verify skill if it has one.",
     "3. Record your verdict: `bb firstmate deliveries check <owner/repo#n> --commit <head sha> --verdict pass|fail --notes \"<what you checked, drove and saw>\"`.",
     "4. A fail verdict names each finding, numbered, in its notes, and adds `--findings <n>` with their count. A new push needs a new check.",
+    // Owner decision Q16 (18 Oct): a verdict relayed through the captain cost a captain turn per PR.
+    "5. Send the verdict straight to the crew that must act on it (release crew or PR author): `bb thread tell <its thread id> '<verdict>'`; `bb firstmate crew <id>` shows the id. One message per PR head, not through the captain.",
   ];
 }

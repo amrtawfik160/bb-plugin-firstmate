@@ -12,6 +12,7 @@ import { createDispatchJobs } from "./lib/async-dispatch.ts";
 import { createLaunches } from "./lib/launch.ts";
 import { createInboundLedger } from "./lib/inbound-ledger.ts";
 import { parseInboundTelegram } from "./lib/telegram-envelope.ts";
+import { cleanWorktree } from "./test/clean-worktree.ts";
 
 type Host = ReturnType<typeof createFakePluginHost>;
 const SKILLS = ["captain", "firstmate"];
@@ -194,6 +195,7 @@ test("a crew whose PR discovery keeps failing stops polling after the bound", as
 test("a refused landed-crew cleanup reports the refusal without advisory banners and stops after the bound", async (t) => {
   t.mock.timers.enable({ apis: ["Date"], now: T0 });
   const host = await load();
+  cleanWorktree(host);
   try {
     await host.bb.storage.kv.set("crews", [{
       id: "c1", task: "fix login", projectId: "proj_1", threadId: "thr_crew", parentThreadId: "thr_cap", providerId: null, model: null,
@@ -206,7 +208,7 @@ test("a refused landed-crew cleanup reports the refusal without advisory banners
     host.harness.sdk.stub("threads.getPluginMetadata", async () => ({}));
     host.harness.sdk.stub("threads.output", async () => ({ output: "DONE: shipped" }));
     // The worktree itself reads clean and pushed; the native refusal below is what is tested.
-    hostCommands(host, () => "");
+    hostCommands(host, (command) => command.includes("FM_UNSAVED") ? "FM_UNSAVED checked\n" : "");
     host.harness.sdk.stub("environments.get", async () => ({ id: "env_wt", hostId: "host_1", path: "/wt", isWorktree: true, status: "ready", mergeBaseBranch: "main" }));
     host.harness.sdk.stub("environments.diffFiles", async () => ({ files: [] }));
     host.harness.sdk.stub("threads.stop", async () => {

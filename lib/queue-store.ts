@@ -16,6 +16,7 @@ export const queueItemSchema = z.object({
   // Set only on an over-cap dispatch that named them; absent means the default at start.
   permissionMode:z.enum(['accept-edits','auto','full']).optional(), worktree:z.boolean().optional(), visible:z.boolean().optional(),
   ownerRequestedProvider:z.boolean().optional(),
+  modelPermission:z.string().optional(),
   backlogUnparsed:z.boolean().optional(), createdAt:z.string(), nativePending:z.boolean().optional(),
 }).strict();
 export type QueueItem = z.infer<typeof queueItemSchema>;

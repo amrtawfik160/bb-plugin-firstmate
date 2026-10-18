@@ -40,7 +40,7 @@ async function crewHost(opts: { decision?: () => Decision; queued?: () => unknow
   host.harness.sdk.stub("projects.defaultExecutionOptions", async () => ({ providerId: "claude-code", model: "claude-opus-5-5" }));
   host.harness.sdk.stub("environments.get", async () => ({ id: "env_wt", hostId: "host_1", status: "ready", path: "/repo/isolated", isWorktree: true }));
   host.harness.sdk.stub("providers.list", async () => [{ id: "claude-code", available: true }, { id: "codex", available: true }]);
-  host.harness.sdk.stub("providers.models", async ({ providerId }: { providerId: string }) => ({ models: [{ id: `${providerId}-default`, model: `${providerId}-default`, isDefault: true }] }));
+  host.harness.sdk.stub("providers.models", async ({ providerId }: { providerId: string }) => ({ models: [{ id: `${providerId}-default`, model: `${providerId}-default`, isDefault: true }, ...(providerId === "codex" ? [{ id: "gpt-6.1-sol", model: "gpt-6.1-sol", isDefault: false }] : [])] }));
   host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew2" }));
   host.harness.sdk.stub("threads.queuedMessages.list", async () => opts.queued?.() ?? []);
   host.harness.sdk.stub("plugins.callRpc", async (args: { pluginId: string; method: string; input: { threadId: string }; outputSchema: { parse(v: unknown): unknown } }) => {
@@ -129,7 +129,7 @@ test("a captain's provider change is refused while BB has a retry of the crew's 
   const host = await crewHost({ queued: () => [{ id: "qm_1", threadId: "thr_crew", payload: { kind: "retry" }, content: [], failureReason: null }] });
   try {
     const retry = host.harness.inspection.registrations.agentTools.find((t) => t.name === "firstmate_retry")!;
-    const out = await retry.execute({ crewId: "c1", providerId: "codex", model: "codex-default", reason: "overloaded" }, { threadId: "thr_cap", projectId: "proj_1" });
+    const out = await retry.execute({ crewId: "c1", providerId: "codex", model: "gpt-6.1-sol", reason: "overloaded" }, { threadId: "thr_cap", projectId: "proj_1" });
     assert.equal(spawns(host), 0);
     assert.match(JSON.stringify(out), /provider-retry cancel thr_crew/);
   } finally {
@@ -143,7 +143,7 @@ test("a failed_retrying queue row must still block an explicit provider relaunch
  const host=await crewHost({queued:()=>[{id:'qm1',threadId:'thr_crew',state:'failed_retrying',payload:{kind:'retry',attempt:2,retryOfTurnRequestId:'req_thr_crew_1'},failureReason:'The message could not be sent.'}]});
  try {
   const retry=host.harness.inspection.registrations.agentTools.find(t=>t.name==='firstmate_retry')!;
-  await retry.execute({crewId:'c1',providerId:'codex',model:'codex-default',reason:'overloaded'},{threadId:'thr_cap',projectId:'proj_1'});
+  await retry.execute({crewId:'c1',providerId:'codex',model:'gpt-6.1-sol',reason:'overloaded'},{threadId:'thr_cap',projectId:'proj_1'});
   assert.equal(spawns(host),0,'BB queue still has an automatic retry booked');
  } finally {await host.harness.lifecycle.dispose();}
 });
@@ -151,7 +151,7 @@ test('a failed_exhausted retry row allows one explicit relaunch',async()=>{
  const host=await crewHost({queued:()=>[{id:'qm1',threadId:'thr_crew',state:'failed_exhausted',payload:{kind:'retry'},failureReason:'The message could not be sent.'}]});
  try {
   const retry=host.harness.inspection.registrations.agentTools.find(t=>t.name==='firstmate_retry')!;
-  await retry.execute({crewId:'c1',providerId:'codex',model:'codex-default',reason:'overloaded'},{threadId:'thr_cap',projectId:'proj_1'});
+  await retry.execute({crewId:'c1',providerId:'codex',model:'gpt-6.1-sol',reason:'overloaded'},{threadId:'thr_cap',projectId:'proj_1'});
   assert.equal(spawns(host),1);
  } finally {await host.harness.lifecycle.dispose();}
 });
@@ -159,7 +159,7 @@ test('a failed_exhausted retry row allows one explicit relaunch',async()=>{
 test("on a host without queue state, a failed retry row counts as spent only when it shows no next attempt", async () => {
   const row = (extra: Record<string, unknown>) => ({ id: "qm1", threadId: "thr_crew", payload: { kind: "retry" }, failureReason: "The message could not be sent.", ...extra });
   const retry = (host: Host) => host.harness.inspection.registrations.agentTools.find((t) => t.name === "firstmate_retry")!
-    .execute({ crewId: "c1", providerId: "codex", model: "codex-default", reason: "overloaded" }, { threadId: "thr_cap", projectId: "proj_1" });
+    .execute({ crewId: "c1", providerId: "codex", model: "gpt-6.1-sol", reason: "overloaded" }, { threadId: "thr_cap", projectId: "proj_1" });
   const unknown = await crewHost({ queued: () => [row({})] });
   try {
     await retry(unknown);

@@ -13,6 +13,10 @@ The host store is `$HOME/.local/share/bb-firstmate/versions/<release-sha256>/`. 
 
 Captain homes live separately at `$HOME/.local/share/bb-firstmate/homes/<thread-id>/` and retain config, state, task briefs, inboxes, reports and projects. Their `config/bb-runtime-selected.json` records the exact host/captain, selected release, code root and helper identity. BB KV mirrors that binding for discovery; the on-host selection remains authoritative after interrupted publication. Native-seeded secondmates retain separate homes and their parent's selected release. Worker prompts and replacements resolve code through the selected version while writing only their existing task-owned paths.
 
+A new captain home starts with two native ledgers on: `config/fleet-ledger` (activity records in `state/fleet-ledger.jsonl`) and `config/pipeline-spend` (per-task pipeline cost in `data/pipeline-spend.jsonl`). Both are presence flags. An existing home is not changed; create or delete a flag file in its `config/` to turn a ledger on or off. The fleet ledger has no rotation.
+
+A crew that wrote a native `done` line and stayed idle for 2 hours is retired by the plugin every 10 minutes. Native teardown then closes its backlog row. A crew is kept while its thread runs, its latest status is not `done`, an open PR delivery needs it, an owner card on its task, a decision for it, or a captain-held question from it in the native backlog is still open, or the captain kept it after a merge. A crew is never retired while its worktree has uncommitted files, commits on HEAD or its `fm/<id>` branches that no remote has, or stashes made on those branches; the captain is told once instead. The landed-PR sweep follows the same rule. `bb firstmate retire-finished --captain <thread-id>` lists what the sweep would do; `--apply` runs it now.
+
 ## Update, migrate and roll back
 
 `bb plugin update firstmate` updates plugin assets. It does not upgrade native code under an existing worker or select a new runtime. From the owning captain:

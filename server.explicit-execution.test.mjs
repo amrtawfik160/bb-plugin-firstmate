@@ -149,3 +149,15 @@ test('authoritative deletion after creation refuses native rebind and keeps the 
  const failed=await host.harness.behavior.runCli(change(),ctx);assert.equal(failed.exitCode,1);assert.match(failed.stderr,/Replacement was deleted/);assert.equal(state.n,1);assert.equal((await host.bb.storage.kv.get('crews'))[0].threadId,'thr_old');assert.deepEqual(f.invariant(),before);assert.equal(readFileSync(join(f.home,'state/c1.meta'),'utf8'),f.meta);assert.equal(seen.filter(c=>c.includes('/fm-worker-rebind.sh') && c.includes('--publish')).length,0);
  }finally{await host.harness.lifecycle.dispose();f.clean();}
 });
+
+// Owner rule, 18 Oct: an execution change to gpt-6-astra needs the owner's permission ref.
+test('an execution change to gpt-6-astra is refused without the owner permission ref and runs with it',async()=>{
+ const {host,state}=await factory(0);try {
+  host.harness.sdk.stub('providers.models',async({providerId})=>({models:(providerId==='acp-grok'?['grok-4.6']:['old-model','gpt-6-astra']).map(id=>({id}))}));
+  const astra=['retry','c1','--intent','execution-change','--reason','Owner asked for astra on this task','--provider','codex','--model','gpt-6-astra','--reasoning-level','xhigh'];
+  const refused=await host.harness.behavior.runCli(astra,ctx);
+  assert.equal(refused.exitCode,1);assert.match(refused.stderr,/gpt-6-astra needs the owner's permission/);assert.equal(state.n,0);
+  const allowed=await host.harness.behavior.runCli([...astra,'--model-permission','tg:985604794:5617'],ctx);
+  assert.equal(allowed.exitCode,0,allowed.stderr);assert.equal(state.execution.get('thr_new1').model,'gpt-6-astra');
+ }finally{await host.harness.lifecycle.dispose();}
+});
