@@ -25,9 +25,11 @@ const CREWS=[
  crewRow('chk1','thr_chk',{title:'Check the PR',providerId:'codex',model:'gpt-6-astra',role:'checker'}),
  crewRow('frm1','thr_frm',{title:'Fix the frame export',providerId:'claude-code',model:'claude-opus-5-5'}),
  crewRow('woo2','thr_woo2',{title:'Older Dr Woo change',providerId:'claude-code',model:'claude-opus-5-5'}),
+ crewRow('woo3','thr_woo3',{title:'Dr Woo change first seen early',providerId:'claude-code',model:'claude-opus-5-5'}),
+ crewRow('woo4','thr_woo4',{title:'Dr Woo change GitHub dated early',providerId:'claude-code',model:'claude-opus-5-5'}),
 ];
 const FRAMED='amrtawfik160/framed';
-const PRS=[[WOO,130,'woo1','thr_woo'],[CYN,2523,'cyn1','thr_cyn'],[SAFI,77,'safi1','thr_safi'],[FRAMED,5,'frm1','thr_frm'],[WOO,111,'woo2','thr_woo2']];
+const PRS=[[WOO,130,'woo1','thr_woo'],[CYN,2523,'cyn1','thr_cyn'],[SAFI,77,'safi1','thr_safi'],[FRAMED,5,'frm1','thr_frm'],[WOO,111,'woo2','thr_woo2'],[WOO,112,'woo3','thr_woo3'],[WOO,113,'woo4','thr_woo4']];
 // dr.woo#111 was opened before the strict proof gate went live (owner decision, 18 Oct: option A).
 const OPENED={111:'2026-10-10T09:00:00Z'};
 const repoOfNumber=n=>PRS.find(p=>p[1]===n)[0];
@@ -70,8 +72,8 @@ async function deck() {
  await host.bb.storage.kv.set('crews',CREWS);
  const store=createDeliveries(host.bb.storage.database());
  for(const [repo,n,crew,thread] of PRS){
-  const r=store.register({url:url(repo,n),taskId:crew,projectId:'proj_1',owner:'thr_cap',home:'/native',worker:thread,requirement:'merged',title:`Change ${n}`,...(OPENED[n]?{openedAt:Date.parse(OPENED[n])}:{})});
-  store.observe(r.id,{headSha:head(n),state:'open',draft:false,checks:'passing',review:'approved',reviewHeadSha:head(n),mergeCommitSha:null,mergeable:'mergeable'},true);
+  const r=store.register({url:url(repo,n),taskId:crew,projectId:'proj_1',owner:'thr_cap',home:'/native',worker:thread,requirement:'merged',title:`Change ${n}`});
+  store.observe(r.id,{headSha:head(n),state:'open',draft:false,checks:'passing',review:'approved',reviewHeadSha:head(n),mergeCommitSha:null,mergeable:'mergeable',...(OPENED[n]?{openedAt:Date.parse(OPENED[n])}:{})},true);
  }
  const tap=async(id,answer)=>{ownerTaps.set(id,answer);return host.harness.behavior.callRpc('resolveAsk',{threadId:'thr_cap',id,resolution:answer});};
  return {host,store,rpc,tap,commands:hostCommands(host)};
@@ -327,5 +329,23 @@ test('a PR opened before the strict gate went live keeps the old rules; a newer 
   const strict=text(await tool(host,'firstmate_merge').execute({crewId:'woo1',pr:130},ctx));
   assert.match(strict,/^Proof rules: strict: crew or owner proof at the exact head, from the app on an iPhone or the iOS Simulator/m);
   assert.equal(merges(commands).length,1);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+
+// Checker round 6: a PR's opening time decides only when it came from GitHub's createdAt. dr.woo#112 has an early
+// time from another source (first seen); dr.woo#113 has an early time GitHub's createdAt gave the delivery row.
+// GitHub's merge-time read returns no createdAt for either.
+test('a stored opening time counts only when it came from GitHub createdAt; any other source gets the strict gate',async()=>{
+ const {host,store}=await deck();try {
+  const early=Date.parse('2026-10-09T08:00:00Z');
+  const seen=store.register({url:url(WOO,112),taskId:'woo3',projectId:'proj_1',owner:'thr_cap',home:'/native',worker:'thr_woo3',requirement:'merged',openedAt:early});
+  assert.equal(seen.openedAt,early);
+  assert.match(text(await verify(host,WOO,112,'thr_cap','iphone')),/Refusing: only a crew records verification/,'first-seen time does not count');
+  assert.match(text(await tool(host,'firstmate_merge').execute({crewId:'woo3',pr:112},ctx)),/^Proof rules: strict:/m);
+  store.observe(key(WOO,113),{headSha:head(113),state:'open',draft:false,checks:'passing',review:'approved',reviewHeadSha:head(113),mergeCommitSha:null,mergeable:'mergeable',openedAt:early},true);
+  assert.equal(store.get(key(WOO,113)).openedAtSource,'github');
+  assert.doesNotMatch(text(await verify(host,WOO,113,'thr_cap')),/Refusing/,'GitHub createdAt counts');
+  assert.match(text(await tool(host,'firstmate_merge').execute({crewId:'woo4',pr:113},ctx)),/^Proof rules: the rules from before this build: #113 was opened 2026-10-09 08:00 UTC/m);
  }finally{await host.harness.lifecycle.dispose();}
 });
