@@ -293,3 +293,14 @@ test('a card cancelled while its tap read is in flight records no proof',async()
   assert.equal(store.get(key(WOO,130)).verifiedCommitSha,null,'the cancel won: no proof');
  }finally{await host.harness.lifecycle.dispose();}
 });
+
+// Checker round 4 final: another captain's cancel is refused, and the card's binding stays.
+test("another captain's cancel of a device proof card is refused and leaves the card's binding",async()=>{
+ const {host}=await deck();try {
+  const asked=text(await deliveries(host,{action:'device-proof',id:key(WOO,130),commitSha:head(130).slice(0,7),build:'8',link:'https://testflight.apple.com/join/abc',check:'Send a photo'},'thr_woo'));
+  const askId=/card (a[0-9a-z]{6})/.exec(asked)[1];
+  const other=text(await tool(host,'firstmate_resolve_ask').execute({id:askId,resolution:'drop it',cancelled:true},{threadId:'thr_other',projectId:'proj_1'}));
+  assert.match(other,new RegExp(`No ask ${askId} for this captain`));
+  assert.ok(await host.bb.storage.kv.get(`device-proof:${askId}`),"the owning captain's binding is kept");
+ }finally{await host.harness.lifecycle.dispose();}
+});
