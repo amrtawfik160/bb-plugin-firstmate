@@ -499,7 +499,7 @@ test("Oct 12 repro: the digest lists a finished item once and an unchanged stale
 test("an open card is on the board, and firstmate_ask reports it as before", async () => {
   const host = await captainHost();
   try {
-    const result = text(await tool(host, "firstmate_ask").execute({ question: "Release #2284?", kind: "question", options: [{ label: "No" }, { label: "Yes" }], recommended: 0 }, { threadId: "thr_cap", projectId: "proj_1" } as never));
+    const result = text(await tool(host, "firstmate_ask").execute({ question: "Release #2284?", kind: "question", options: [{ label: "No" }, { label: "Yes" }], recommended: 0, project: "Cyndra" }, { threadId: "thr_cap", projectId: "proj_1" } as never));
     assert.match(result, /^Question card (a[0-9a-z]{6}) sent\. Ask \1 is open and on the captain's board\. If no answer by \d\d:\d\d UTC, it proceeds with "No" and you are told to go ahead\. Keep working on other things; the answer arrives as an owner message that replies to ask \1\.$/);
     assert.match(await board(host), /^📌 Needs you \(1\)\n1\. ❓ Release #2284\? \(0 min, ask a[0-9a-z]{6}\) Recommended: No\. Auto at \d\d:\d\d UTC\.\nTap a question's button or reply with just its letter\./);
     assert.match(await command(host, { command: "digest" }), /^Needs you \(1\)\n1\. ❓ Release #2284\?/);
@@ -643,8 +643,8 @@ test("firstmate_ask names the open task this turn's owner message started, or th
     await ownerSays(host, "2306", "Fix the legend dashes");
     await dispatch(host, { task: "Fix the legend dashes", taskId: "legend", title: "Legend dashes", sourceRefs: ["tg:200:2306"] });
     const asks = () => calls.filter((call) => call.method === "ask").map((call) => call.input.task);
-    await tool(host, "firstmate_ask").execute({ question: "Dots or dashes?", kind: "question", options: [{ label: "Dots" }, { label: "Dashes" }] }, capCtx);
-    await tool(host, "firstmate_ask").execute({ question: "Which colour?", kind: "question", options: [{ label: "Blue" }], task: "T1" }, capCtx);
+    await tool(host, "firstmate_ask").execute({ question: "Dots or dashes?", kind: "question", options: [{ label: "Dots" }, { label: "Dashes" }], project: "Safi" }, capCtx);
+    await tool(host, "firstmate_ask").execute({ question: "Which colour?", kind: "question", options: [{ label: "Blue" }], task: "T1", project: "Safi" }, capCtx);
     assert.deepEqual(asks(), ["T1", "T1"]);
     assert.ok(isError(await tool(host, "firstmate_ask").execute({ question: "Which?", kind: "question", task: "T5" }, capCtx)));
   } finally {

@@ -23,6 +23,10 @@ export type OwnerAsk = {
   resolvedAt: number | null;
   sourceRef?: string;
   messageUrl?: string;
+  /** Where the card belongs: its project, its owner task, and its subject (the words before a leading colon). */
+  project?: string;
+  task?: string;
+  subject?: string;
 };
 
 export type NewOwnerAsk = Pick<OwnerAsk, "captain" | "kind" | "text" | "options"> & {
@@ -34,6 +38,9 @@ export type NewOwnerAsk = Pick<OwnerAsk, "captain" | "kind" | "text" | "options"
   defaultAt?: number | null;
   irreversible?: boolean;
   startsNewWork?: boolean;
+  project?: string;
+  task?: string;
+  subject?: string;
   createdAt: number;
 };
 
@@ -51,6 +58,7 @@ type AskRecord = {
   id: string; captain: string; kind: string; text: string; options: string; recommended: number | null;
   default_at: number | null; irreversible: number; state: string; resolution: string | null;
   created_at: number; resolved_at: number | null; impact: string | null; source_ref: string | null; message_url: string | null; new_work: number;
+  route_project: string | null; route_task: string | null; route_subject: string | null;
 };
 
 export const ASK_KIND_EMOJI: Record<AskKind, string> = { question: "❓", blocker: "⛔", approval: "✅" };
@@ -159,7 +167,25 @@ function fromRecord(row: AskRecord): OwnerAsk {
     resolvedAt: row.resolved_at,
     ...(row.source_ref ? { sourceRef: row.source_ref } : {}),
     ...(row.message_url ? { messageUrl: row.message_url } : {}),
+    ...(row.route_project ? { project: row.route_project } : {}),
+    ...(row.route_task ? { task: row.route_task } : {}),
+    ...(row.route_subject ? { subject: row.route_subject } : {}),
   };
+}
+
+/** Cards in one pack are sent within this window; a pack never replaces its own cards. */
+export const ASK_PACK_WINDOW_MS = 60_000;
+
+/**
+ * Owner decision Q7: the open card a new one replaces. Same subject, and the same task, or the same
+ * project when neither card has a task. A card from the last minute is part of the same pack.
+ */
+export function replacedBy(next: Pick<OwnerAsk, "captain" | "project" | "task" | "subject" | "createdAt">, open: readonly OwnerAsk[]): OwnerAsk[] {
+  const lower = (text: string | undefined) => (text ?? "").trim().toLowerCase();
+  return open.filter((ask) => ask.captain === next.captain && ask.state === "open"
+    && next.createdAt - ask.createdAt >= ASK_PACK_WINDOW_MS
+    && lower(ask.subject) === lower(next.subject)
+    && (next.task !== undefined || ask.task !== undefined ? ask.task === next.task : lower(ask.project) !== "" && lower(ask.project) === lower(next.project)));
 }
 
 export function createOwnerAsks(db: Database): OwnerAsks {
@@ -175,12 +201,17 @@ export function createOwnerAsks(db: Database): OwnerAsks {
     CREATE TABLE IF NOT EXISTS owner_ask_impact (id TEXT PRIMARY KEY, impact TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS owner_ask_new_work (id TEXT PRIMARY KEY);
     CREATE TABLE IF NOT EXISTS owner_ask_link (
-      id TEXT PRIMARY KEY, message_url TEXT NOT NULL);`);
+      id TEXT PRIMARY KEY, message_url TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS owner_ask_route (
+      id TEXT PRIMARY KEY, project TEXT, task TEXT, subject TEXT);`);
 
   const select = `SELECT owner_ask.*,
     (SELECT impact FROM owner_ask_impact WHERE id=owner_ask.id) AS impact,
     (SELECT source_ref FROM owner_ask_source WHERE ask_id=owner_ask.id ORDER BY source_ref LIMIT 1) AS source_ref,
     EXISTS(SELECT 1 FROM owner_ask_new_work WHERE id=owner_ask.id) AS new_work,
+    (SELECT project FROM owner_ask_route WHERE id=owner_ask.id) AS route_project,
+    (SELECT task FROM owner_ask_route WHERE id=owner_ask.id) AS route_task,
+    (SELECT subject FROM owner_ask_route WHERE id=owner_ask.id) AS route_subject,
     owner_ask_link.message_url FROM owner_ask LEFT JOIN owner_ask_link USING(id)`;
 
   function get(id: string): OwnerAsk | undefined {
@@ -213,6 +244,9 @@ export function createOwnerAsks(db: Database): OwnerAsks {
       resolvedAt: null,
       ...(input.sourceRef ? { sourceRef: input.sourceRef } : {}),
       ...(input.messageUrl ? { messageUrl: input.messageUrl } : {}),
+      ...(input.project ? { project: input.project } : {}),
+      ...(input.task ? { task: input.task } : {}),
+      ...(input.subject ? { subject: input.subject } : {}),
     };
     db.prepare("INSERT INTO owner_ask VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(
       ask.id, ask.captain, ask.kind, ask.text, JSON.stringify(ask.options), ask.recommended, ask.defaultAt,
@@ -222,6 +256,7 @@ export function createOwnerAsks(db: Database): OwnerAsks {
     if (ask.startsNewWork) db.prepare("INSERT INTO owner_ask_new_work VALUES (?)").run(id);
     if (input.sourceRef) db.prepare("INSERT INTO owner_ask_source VALUES (?,?,?)").run(input.captain, input.sourceRef, ask.id);
     if (input.messageUrl) db.prepare("INSERT INTO owner_ask_link VALUES (?,?)").run(ask.id, input.messageUrl);
+    if (input.project || input.task || input.subject) db.prepare("INSERT INTO owner_ask_route VALUES (?,?,?,?)").run(ask.id, input.project ?? null, input.task ?? null, input.subject ?? null);
     return ask;
   }
 
