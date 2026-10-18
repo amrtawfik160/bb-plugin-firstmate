@@ -243,3 +243,37 @@ test('a production PR of a repo with no project rule keeps the old rules, and th
   assert.match(text(await merge(strict.host,'woo1',130)),/^Refusing: #130's verification record was made by the captain, not by a crew/,'a listed project keeps the strict gate');
  }finally{await strict.host.harness.lifecycle.dispose();}
 });
+
+// Checker round 3: cancelling the card stops its pending re-reads, and a cancelled card never becomes proof.
+test('a device proof card cancelled while its tap is re-read records no proof',async()=>{
+ process.env.FM_PROOF_RECHECK_MS='40,40,40';
+ const {host,store,rpc}=await deck();try {
+  const asked=text(await deliveries(host,{action:'device-proof',id:key(WOO,130),commitSha:head(130).slice(0,7),build:'8',link:'https://testflight.apple.com/join/abc',check:'Send a photo'},'thr_woo'));
+  const askId=/card (a[0-9a-z]{6})/.exec(asked)[1];
+  let tapped=null;
+  host.harness.sdk.stub('plugins.callRpc',async(call)=>{rpc.push(call);if(call.method==='ownerAnswer')return{answer:tapped};return{ok:true,queued:1,duplicate:false};});
+  await host.harness.behavior.callRpc('resolveAsk',{threadId:'thr_cap',id:askId,resolution:'Works'});
+  assert.doesNotMatch(text(await tool(host,'firstmate_resolve_ask').execute({id:askId,resolution:'Build replaced',cancelled:true},ctx)),/Refusing/);
+  tapped='Works';
+  await new Promise(r=>setTimeout(r,300));
+  assert.equal(store.get(key(WOO,130)).verifiedCommitSha,null,'a cancelled card records no proof');
+  assert.equal(await host.bb.storage.kv.get(`device-proof:${askId}`),undefined,'cancelling deleted the binding');
+ }finally{delete process.env.FM_PROOF_RECHECK_MS;await host.harness.lifecycle.dispose();}
+});
+
+// Checker round 3: the owner tapped, the connector is down at the first read, the captain cancels, the connector
+// comes back. The retry records nothing.
+test('a cancelled card records no proof after a Telegram outage either',async()=>{
+ process.env.FM_PROOF_RECHECK_MS='40,40,40';
+ const {host,store,rpc}=await deck();try {
+  const asked=text(await deliveries(host,{action:'device-proof',id:key(WOO,130),commitSha:head(130).slice(0,7),build:'8',link:'https://testflight.apple.com/join/abc',check:'Send a photo'},'thr_woo'));
+  const askId=/card (a[0-9a-z]{6})/.exec(asked)[1];
+  let down=true;
+  host.harness.sdk.stub('plugins.callRpc',async(call)=>{rpc.push(call);if(call.method==='ownerAnswer'){if(down)throw new Error('connector unavailable');return{answer:'Works'};}return{ok:true,queued:1,duplicate:false};});
+  await host.harness.behavior.callRpc('resolveAsk',{threadId:'thr_cap',id:askId,resolution:'Works'});
+  await tool(host,'firstmate_resolve_ask').execute({id:askId,resolution:'Build replaced',cancelled:true},ctx);
+  down=false;
+  await new Promise(r=>setTimeout(r,300));
+  assert.equal(store.get(key(WOO,130)).verifiedCommitSha,null);
+ }finally{delete process.env.FM_PROOF_RECHECK_MS;await host.harness.lifecycle.dispose();}
+});
