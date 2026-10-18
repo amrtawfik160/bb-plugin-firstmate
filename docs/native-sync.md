@@ -6,10 +6,12 @@ upstream HEAD differs from the pin. The crew opens one PR and stops. A checker
 crew on a different model checks that PR. The repair thread gets one message
 with both results; it merges, reloads and switches the live home.
 
-When every file changed from the pin to upstream HEAD is under native's root
-`tests/` folder, the weekly run starts nothing. It tells the repair thread
+When every change from the pin to upstream HEAD modifies or adds a test
+entrypoint (`tests/<name>.test.<ext>`) or a file under `tests/fixtures/` or
+`tests/captures/`, the weekly run starts nothing. A deletion, a rename, or a
+change to a test helper such as `tests/lib.sh` runs the full sync. It tells the repair thread
 once for that HEAD and records it in the state file. The pin stays, so the
-next change outside `tests/` syncs every change since the pin. A list it
+next other change syncs every change since the pin. A list it
 cannot read runs the full sync.
 
 This file is the sync crew's brief. It repeats what the 17 Oct sync did

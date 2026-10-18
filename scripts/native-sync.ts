@@ -5,7 +5,8 @@
 // Each run reads the pin (GitHub main), upstream HEAD, the open sync PRs and the threads it
 // started, then does at most one step from owner/native-sync.ts. --dry-run prints the step only.
 // --retry starts the current upstream HEAD again after a failed or closed sync was reported.
-// A weekly run whose upstream moved by files under tests/ only reports it once and starts nothing.
+// A weekly run whose upstream only modified or added test entrypoints, fixtures or captures
+// reports it once and starts nothing.
 // Before a spawn or a message, the run saves its operation id; a later run looks for that id
 // (thread title, repair-thread log) before it acts again.
 // A GitHub rate limit or outage skips the run (exit 0, state untouched): the next tick retries.
@@ -17,7 +18,7 @@ import { randomBytes } from "node:crypto";
 import { mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { marker, nextSyncStep, opTag, SYNC, type SyncState, type SyncStep } from "../owner/native-sync.ts";
+import { marker, nextSyncStep, opTag, SYNC, type ChangedFile, type SyncState, type SyncStep } from "../owner/native-sync.ts";
 import { bbJson, findMessage, markedChildren } from "./bb-calls.ts";
 import { singleRun } from "./single-run.ts";
 
@@ -143,7 +144,7 @@ if (state.outbox !== undefined) delivered[state.outbox.op] = findMessage(manager
 // Only a weekly run that may start a new sync needs the files changed since the pin. A
 // tree-only scratch clone lists them without the GitHub API. If the list cannot be read, the
 // full sync runs, and this run says why.
-function changedSincePin(): string[] | undefined {
+function changedSincePin(): ChangedFile[] | undefined {
   const scratch = mkdtempSync(join(tmpdir(), "native-sync-diff-"));
   try {
     try {
@@ -157,7 +158,10 @@ function changedSincePin(): string[] | undefined {
       }
       throw error;
     }
-    return run("git", ["-C", scratch, "diff", "--name-only", "--no-renames", pin!, head]).split("\n").filter(Boolean);
+    return run("git", ["-C", scratch, "diff", "--name-status", "--no-renames", pin!, head]).split("\n").filter(Boolean).map((line) => {
+      const [status, path] = line.split("\t");
+      return { status: status!, path: path! };
+    });
   } catch (error) {
     console.log(`native-sync: cannot list the files changed since pin ${pin!.slice(0, 8)} (${String((error as { stderr?: unknown }).stderr ?? (error as Error).message).trim().split("\n")[0]}); the full sync runs`);
     return undefined;
