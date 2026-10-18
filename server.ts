@@ -5366,34 +5366,50 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /** A reply the connector accepted and Telegram then refused for good: its owner message is open again. */
+  /**
+   * Owner messages whose reply Telegram refused for good open again, and the captain is told. Each failure
+   * is applied once: its id is recorded (kv `telegram-undelivered-applied:<id>`) once the captain was told,
+   * before the connector is told, so a lost confirmation never reopens a message again. A failure never
+   * reopens a message answered after it.
+   */
   async function reopenUndelivered(captainThreadId: string): Promise<void> {
-    let rows: Array<{ id?: string; chatId: string; messageId: string; reason: string }>;
+    let rows: Array<{ id?: string; chatId: string; messageId: string; reason: string; at?: number }>;
     try {
       rows = (await bb.sdk.plugins.callRpc({
         pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "undelivered", input: {},
-        outputSchema: z.object({ undelivered: z.array(z.object({ id: z.string().optional(), chatId: z.string(), messageId: z.string(), reason: z.string() })) }),
+        outputSchema: z.object({ undelivered: z.array(z.object({ id: z.string().optional(), chatId: z.string(), messageId: z.string(), reason: z.string(), at: z.number().optional() })) }),
       })).undelivered;
     } catch (error) {
       if (isTelegramRpcMissing(error)) return;
       throw error;
     }
+    const appliedKey = (id: string) => `telegram-undelivered-applied:${id}`;
     const lines = new Map<string, string>();
     const ids: string[] = [];
+    const toApply: string[] = [];
     for (const row of rows) {
       const key = { source: "telegram" as const, chatId: row.chatId, messageId: row.messageId };
       const found = inboundLedger.get(key);
       if (found?.captainThreadId !== captainThreadId) continue;
-      if (row.id) ids.push(row.id);
+      if (row.id) {
+        ids.push(row.id);
+        if (await bb.storage.kv.get<string>(appliedKey(row.id))) continue;
+        toApply.push(row.id);
+      }
+      // Answered after the failure: the captain already repaired it.
+      if (row.at !== undefined && found.state === "answered" && (found.answeredAt ?? 0) > row.at) continue;
       if (lines.has(`${row.chatId}:${row.messageId}`)) continue;
       inboundLedger.reopen(key, Date.now());
       lines.set(`${row.chatId}:${row.messageId}`, `- tg:${row.chatId}:${row.messageId}: ${row.reason}`);
     }
-    if (lines.size === 0) return;
-    await bb.sdk.threads.send({
-      threadId: captainThreadId, mode: "steer",
-      input: [{ type: "text", text: [`Not delivered to the owner: Telegram refused your reply for good. Each owner message is open again; answer it with firstmate_reply.`, ...lines.values()].join("\n"), mentions: [], visibility: "agent-only" }],
-    });
-    // Confirmed only once the captain was told: a failed send leaves the rows due for the next drain.
+    if (lines.size > 0) {
+      await bb.sdk.threads.send({
+        threadId: captainThreadId, mode: "steer",
+        input: [{ type: "text", text: [`Not delivered to the owner: Telegram refused your reply for good. Each owner message is open again; answer it with firstmate_reply.`, ...lines.values()].join("\n"), mentions: [], visibility: "agent-only" }],
+      });
+    }
+    // Applied, then confirmed, only once the captain was told: a failed send leaves the rows due for the next drain.
+    for (const id of toApply) await bb.storage.kv.set(appliedKey(id), String(Date.now()));
     if (ids.length > 0) await confirmToConnector("ackUndelivered", { ids });
   }
 
