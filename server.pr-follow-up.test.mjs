@@ -14,6 +14,7 @@ const heads=new Map();
 let metas='';
 let ghStderr='';
 let probeStderr='';
+let openRows=null;
 const states=new Map();
 const head=n=>heads.get(n) ?? String(n).repeat(10).slice(0,40);
 const crewRow=(id,threadId,extra)=>({id,task:'x',projectId:'proj_1',threadId,parentThreadId:'thr_cap',nativeHome:'/native',worktree:true,shape:'ship',posture:'direct-PR',createdAt:'2026-10-17T00:00:00.000Z',reasoningLevel:null,dispatchVersion:2,...extra});
@@ -39,11 +40,12 @@ function hostCommands(host,{delayMs=0}={}) {
 function forge(command) {
  const n=Number(/\/pull\/(\d+)/.exec(command)?.[1]);
  if(command.includes('/state/*.meta'))return{payload:metas};
+ if(openRows&&command.includes('pulls?state=open'))return{payload:openRows.map(r=>JSON.stringify(r)).join('\n')};
  if(command.includes('gh pr view'))return{payload:JSON.stringify({number:n,url:url(n),title:`Change ${n}`,headRefName:`fm/${BUILDER}-change-${n}`,headRefOid:head(n),state:states.get(n) ?? 'OPEN',mergeCommit:states.get(n)==='MERGED'?{oid:'m'.repeat(40)}:null,isDraft:false,mergeable:'MERGEABLE',statusCheckRollup:[{status:'COMPLETED',conclusion:'SUCCESS'}],reviewDecision:'APPROVED',reviews:[]})};
  return{code:0};
 }
 async function deck(prs,{delayMs=0}={}) {
- heads.clear();metas='';states.clear();ghStderr='';probeStderr='';
+ heads.clear();metas='';states.clear();ghStderr='';probeStderr='';openRows=null;
  const host=createFakePluginHost({pluginId:'firstmate',agentSkillIds:['firstmate','captain'],settings:{fmHome:'/native',fmHostId:'host_1'}});await plugin(host.bb);
  host.harness.sdk.stub('threads.list',async()=>[]);
  host.harness.sdk.stub('threads.getPluginMetadata',async()=>({}));
@@ -121,8 +123,8 @@ test('a crew forgotten with its PR open has its native record retired once every
 async function sweepDeck() {
  const d=await deck([]);
  d.host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle',environmentId:'env_wt',archivedAt:1}));
- d.deliver=(task,thread,n,status)=>{const r=d.store.register({url:url(n),taskId:task,projectId:'proj_1',owner:'thr_cap',home:'/native',worker:thread,requirement:'pr',continuation:crewRow(task,thread,{backlogRow:true,providerId:null,model:null})});
-  d.store.save({...d.store.get(r.id),status,nextCheckAt:Date.now()+3_600_000});};
+ d.deliver=(task,thread,n,status,forgeState)=>{const r=d.store.register({url:url(n),taskId:task,projectId:'proj_1',owner:'thr_cap',home:'/native',worker:thread,requirement:'pr',continuation:crewRow(task,thread,{backlogRow:true,providerId:null,model:null})});
+  d.store.save({...d.store.get(r.id),status,...(forgeState?{forgeState}:{}),nextCheckAt:Date.now()+3_600_000});};
  d.removed=()=>d.gh.commands.flatMap(c=>/rm -f \S*\/native\/state\/([A-Za-z0-9_-]+)\.meta\b/.exec(c)?.slice(1) ?? []);
  return d;
 }
@@ -271,4 +273,54 @@ test('a late response header cannot raise the GraphQL meter: GitHub stays at or 
   await host.harness.behavior.runSchedule('pr-delivery-follow-up');
   assert.ok(github>=1000,`GitHub ended at ${github} points after ${gh.reads} reads; the reserve is 1,000`);
  }finally{await host.harness.lifecycle.dispose();}
+});
+
+const openRow=n=>({number:n,url:url(n),title:`Change ${n}`,headRefName:`other-${n}`,headSha:'a'.repeat(40),author:'me'});
+const prReads=(d,n)=>d.gh.commands.filter(c=>c.includes('gh pr view')&&c.includes(`/pull/${n}`)).length;
+
+test('the sweep retires a forgotten crew from the ledger\'s merged and closed state, with no GitHub read, when the open list does not show its PRs',async()=>{
+ const d=await sweepDeck();try {
+  openRows=[openRow(1)];
+  d.deliver('c9','thr_c9',5501,'complete','merged');d.deliver('c9','thr_c9',5502,'explicitly-abandoned','closed');
+  metas='c9\tthr_c9\n';
+  await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.equal(prReads(d,5501)+prReads(d,5502),0,'the ledger and the open list settle both PRs');
+  assert.deepEqual(d.removed(),['c9']);
+ }finally{await d.host.harness.lifecycle.dispose();}
+});
+
+test('a forgotten crew whose merged PR the open list shows open again keeps its record',async()=>{
+ const d=await sweepDeck();try {
+  openRows=[openRow(1),openRow(5503)];
+  d.deliver('c8','thr_c8',5503,'complete','merged');
+  metas='c8\tthr_c8\n';
+  await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.deepEqual(d.removed(),[]);
+ }finally{await d.host.harness.lifecycle.dispose();}
+});
+
+test('the sweep reads a PR of unknown state from its own share after follow-up has spent the hourly allowance',async(t)=>{
+ t.mock.timers.enable({apis:['Date'],now:Date.now()});
+ const d=await sweepDeck();try {
+  const prs=Array.from({length:100},(_,i)=>8600+i);
+  for(const n of prs){const r=d.store.register({url:url(n),taskId:BUILDER,projectId:'proj_1',owner:'thr_cap',home:'/native',worker:'thr_crew',requirement:'pr'});d.store.save({...d.store.get(r.id),nextCheckAt:0});}
+  for(let minute=0;minute<70;minute++){for(const n of prs) d.store.save({...d.store.get(id(n)),nextCheckAt:0});await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');t.mock.timers.tick(30_000);}
+  states.set(5504,'MERGED');d.deliver('c7','thr_c7',5504,'complete');metas='c7\tthr_c7\n';
+  t.mock.timers.tick(11*60_000);
+  await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.equal(prReads(d,5504),1,'the unknown-state PR was read from the sweep share');
+  assert.deepEqual(d.removed(),['c7']);
+ }finally{await d.host.harness.lifecycle.dispose();}
+});
+
+test('a kept record is logged once per reason, at info, not on every sweep',async(t)=>{
+ t.mock.timers.enable({apis:['Date'],now:Date.now()});
+ const d=await sweepDeck();try {
+  d.deliver('c6','thr_c6',5505,'complete');metas='c6\tthr_c6\n';
+  for(let sweep=0;sweep<3;sweep++){await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');t.mock.timers.tick(11*60_000);}
+  const kept=d.host.harness.inspection.logEntries.filter(e=>String(e.message).includes('kept the native record of forgotten crew c6'));
+  assert.equal(kept.length,1,`${kept.length} log lines for one unchanged reason`);
+  assert.equal(kept[0].level,'info');
+  assert.deepEqual(d.removed(),[]);
+ }finally{await d.host.harness.lifecycle.dispose();}
 });
