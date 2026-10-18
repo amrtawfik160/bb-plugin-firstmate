@@ -8027,7 +8027,7 @@ export default async function plugin(bb: BbPluginApi) {
     for (const older of openProofs) {
       const resolution = `Replaced by build ${build}`;
       if (ownerAsks.resolve(older.ask.id, captain, "cancelled", resolution, Date.now()) === undefined) continue;
-      await bb.storage.kv.delete(`${DEVICE_PROOF_PREFIX}${older.ask.id}`);
+      await dropDeviceProof(older.ask.id);
       try { await bb.sdk.plugins.callRpc({ pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "editAsk", input: { askId: older.ask.id, resolution, at: Date.now() }, outputSchema: z.object({ ok: z.boolean() }) }); }
       catch (error) { bb.log.warn(`device proof ${older.ask.id} not marked replaced in Telegram: ${String(error)}`); }
     }
@@ -8059,11 +8059,22 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  const proofRechecks = new Map<string, ReturnType<typeof setTimeout>>();
+  async function dropDeviceProof(askId: string): Promise<void> {
+    const timer = proofRechecks.get(askId);
+    if (timer !== undefined) clearTimeout(timer);
+    proofRechecks.delete(askId);
+    await bb.storage.kv.delete(`${DEVICE_PROOF_PREFIX}${askId}`);
+  }
+
   /** The owner answered an ask by tap or reply. A device proof card's Works records his proof. */
   async function ownerAnsweredAsk(askId: string, resolution: string, attempt = 0): Promise<void> {
+    proofRechecks.delete(askId);
     const key = `${DEVICE_PROOF_PREFIX}${askId}`;
     const proof = await bb.storage.kv.get<DeviceProof>(key);
     if (proof === undefined) return;
+    // Only a card the owner answered can prove: a cancelled or reopened card never does (checker round 3).
+    if (ownerAsks.get(askId)?.state !== "answered") { await dropDeviceProof(askId); return; }
     const crew = await findCrew(proof.crewId);
     const tell = async (note: string) => {
       if (crew !== undefined) await tellCrew(crew, note, false, true).catch((error) => bb.log.warn(`device proof note to crew ${crew.id}: ${String(error)}`));
@@ -8087,6 +8098,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (attempt < delays.length) {
         const timer = setTimeout(() => { if (!launchAbort.signal.aborted) void ownerAnsweredAsk(askId, resolution, attempt + 1).catch((error) => bb.log.warn(`device proof ${askId} recheck: ${String(error)}`)); }, delays[attempt]);
         timer.unref?.();
+        proofRechecks.set(askId, timer);
         return;
       }
       bb.log.warn(`device proof ${askId}: card reads Works but Telegram has no owner tap after ${attempt + 1} reads`);
@@ -12550,6 +12562,8 @@ export default async function plugin(bb: BbPluginApi) {
       if (cancelled !== true && reopen !== true && await bb.storage.kv.get(`${DEVICE_PROOF_PREFIX}${id}`) !== undefined) {
         return toolError(`Refusing: ask ${id} is a device proof card, and only the owner's tap answers a device proof card. His Works is the proof record; cancel it with cancelled=true if the build is replaced.`);
       }
+      // A cancelled device proof card proves nothing: drop its binding and any pending re-read of its tap.
+      if (cancelled === true) await dropDeviceProof(id);
       const closed = ownerAsks.resolve(id, captain, reopen === true ? "open" : cancelled === true ? "cancelled" : "answered", resolution, Date.now());
       if (!closed) return toolError(`No ask ${id} for this captain.`);
       let warning = "";
