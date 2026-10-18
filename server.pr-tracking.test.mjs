@@ -100,13 +100,16 @@ test('a PR whose captain was marked lost is read on GitHub again within ten minu
  }finally{await host.harness.lifecycle.dispose();}
 });
 
-test('twelve PRs of a deleted captain are all read as merged without one pass pushing the rest back an hour',async()=>{
+test('twelve PRs of a deleted captain are all read as merged without one pass pushing the rest back an hour',async(t)=>{
+ t.mock.timers.enable({apis:['Date'],now:Date.now()});
  const host=await base();try {
   host.harness.sdk.stub('threads.get',async()=>{throw new Error('HTTP 404: Thread not found');});
   const store=createDeliveries(host.bb.storage.database());
   for(let n=1;n<=12;n++) store.register({url:`https://github.com/acme/repo/pull/${n}`,taskId:`t${n}`,projectId:'proj_1',owner:'thr_gone',home:'',worker:`thr_w${n}`,requirement:'pr'});
   hostCommands(host,command=>command.includes('gh pr view') ? {payload:JSON.stringify(forge('MERGED'))} : {code:0});
+  // Two scheduled passes, a minute apart: the paced allowance reads ten, then the rest.
   await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  t.mock.timers.tick(60_000);
   await host.harness.behavior.runSchedule('pr-delivery-follow-up');
   const rows=store.list({owner:'thr_gone'});
   assert.equal(rows.length,12);
@@ -426,5 +429,102 @@ test('a second crew on a PR another task owns is logged once per PR and crew, at
    ['info','PR acme/repo#2374 already tracked by task owner-task; preserving its owner (crew fix-crew works on it too).'],
   ]);
   assert.equal(store.get('acme/repo#2374').taskId,'owner-task');
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+async function quietDeck(answer) {
+ const host=await base();
+ await host.bb.storage.kv.set('crews',[crew('c1','thr_c1','thr_cap')]);
+ host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'active',environmentId:`env_${threadId}`}));
+ host.harness.sdk.stub('environments.get',async({environmentId})=>({id:environmentId,hostId:'host_1',status:'ready',isWorktree:true,path:`/wt/${environmentId}`,branchName:'fm/verify'}));
+ const commands=[];hostCommands(host,command=>{commands.push(command);return answer(command);});
+ const store=createDeliveries(host.bb.storage.database());
+ const track=(n,headSha='sha1')=>{const r=store.register({url:`https://github.com/acme/repo/pull/${n}`,taskId:'c1',projectId:'proj_1',owner:'thr_cap',home:'',worker:'thr_c1',requirement:'pr'});
+  store.observe(r.id,{headSha,state:'open',draft:false,checks:'passing',review:'approved',reviewHeadSha:headSha,mergeCommitSha:null,mergeable:'mergeable'},false);
+  store.save({...store.get(r.id),nextCheckAt:Date.now()+30*60_000});};
+ const reads=()=>commands.filter(c=>c.includes('gh pr view')).map(prNumber).sort((a,b)=>a-b);
+ return {host,store,track,reads,commands};
+}
+const listed=(rows,etag='W/"e1"')=>`HTTP/2.0 200 OK\nEtag: ${etag}\nX-Ratelimit-Resource: core\n\n${rows.map(r=>JSON.stringify(r)).join('\n')}`;
+
+test('a quiet PR is read at once when the open list shows a new head or no longer lists it, and only then',async()=>{
+ const rows=[{...openPrs[0],headSha:'sha2'},{number:14,url:'https://github.com/acme/repo/pull/14',title:'Quiet',headRefName:'fm/verify-quiet',headSha:'sha1'}];
+ const d=await quietDeck(command=>isOpenList(command)?{payload:listed(rows)}:command.includes('gh pr view')?{payload:JSON.stringify(forge('OPEN',{headRefOid:'sha2'}))}:{code:0});try {
+  d.track(10);d.track(11);d.track(14);
+  await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.deepEqual(d.reads(),[10,11],'#10 was pushed and #11 left the open list; #14 is unchanged');
+ }finally{await d.host.harness.lifecycle.dispose();}
+});
+
+test('the open list is asked again with its ETag, and a 304 keeps the rows it had',async()=>{
+ let n=0;
+ const d=await quietDeck(command=>{ if(!isOpenList(command)) return command.includes('gh pr view')?{payload:JSON.stringify(forge('OPEN'))}:{code:0};
+  n++; return n===1?{payload:listed([{...openPrs[0],headSha:'sha1'}])}:{payload:'HTTP/2.0 304 Not Modified\nEtag: W/"e1"\n\n',code:1}; });try {
+  d.track(10);
+  await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  const lists=d.commands.filter(isOpenList);
+  assert.equal(lists.length,2);
+  assert.doesNotMatch(lists[0],/If-None-Match/);assert.match(lists[1],/If-None-Match: W\/\\?"e1\\?"/);
+  assert.deepEqual(d.reads(),[],'the 304 kept #10 in the open list, so nothing made it due');
+ }finally{await d.host.harness.lifecycle.dispose();}
+});
+
+test('the quota guard reads GraphQL points from metered response headers: a probe first, then nothing until the window resets',async()=>{
+ let remaining=150,reset=Math.floor(Date.now()/1000)+600;
+ const headers=()=>`< X-Ratelimit-Remaining: ${remaining}\n< X-Ratelimit-Reset: ${reset}\n< X-Ratelimit-Resource: graphql\n`;
+ const d=await quietDeck(command=>command.includes('rateLimit')?{payload:'{}',stderr:headers()}:command.includes('gh pr view')?{payload:JSON.stringify(forge('OPEN')),stderr:headers()}:isOpenList(command)?{payload:listed([])}:{code:0});try {
+  for(const n of [21,22,23,24]){d.track(n);d.store.save({...d.store.get(`acme/repo#${n}`),nextCheckAt:0});}
+  await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.ok(d.commands.some(c=>c.includes('rateLimit')&&c.includes('GH_DEBUG=api')),'a metered probe read the quota');
+  assert.deepEqual(d.reads(),[],'150 points left: no PR read');
+  await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.deepEqual(d.reads(),[],'no read before the reset');
+  assert.ok(!d.commands.some(c=>c.includes('rate_limit')),'the rate_limit overview is not the meter');
+  remaining=4000;reset=Math.floor(Date.now()/1000)-1;
+  d.host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'active',environmentId:`env_${threadId}`}));
+ }finally{await d.host.harness.lifecycle.dispose();}
+});
+
+test('background PR discovery uses the open list it already read: no branch lists or BB PR lookups for a covered crew',async()=>{
+ const d=await quietDeck(command=>isOpenList(command)?{payload:listed([{...openPrs[0],headSha:'sha1'}])}:command.includes('gh pr view')?{payload:JSON.stringify(forge('OPEN'))}:{code:0});try {
+  for(let cycle=0;cycle<3;cycle++) await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.equal(d.commands.filter(c=>c.includes('gh pr list')).length,0,'no per-crew branch list');
+  assert.equal(d.host.harness.sdk.callsTo('environments.pullRequest').length,0,'no per-crew BB PR lookup');
+  assert.equal(createDeliveries(d.host.bb.storage.database()).get('acme/repo#10')?.taskId,'c1','the open list still tracks the crew PR');
+ }finally{await d.host.harness.lifecycle.dispose();}
+});
+
+test('with no delivery rows the quota is probed before discovery, and with 150 points left discovery makes no GitHub request',async()=>{
+ const host=await base();try {
+  await host.bb.storage.kv.set('crews',[crew('c1','thr_c1','thr_cap')]);
+  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'active',environmentId:`env_${threadId}`}));
+  host.harness.sdk.stub('environments.get',async({environmentId})=>({id:environmentId,hostId:'host_1',status:'ready',isWorktree:true,path:`/wt/${environmentId}`,branchName:'fm/verify'}));
+  host.harness.sdk.stub('environments.pullRequest',async()=>({outcome:'unavailable'}));
+  const commands=[];
+  hostCommands(host,command=>{commands.push(command);
+   if(command.includes('rateLimit')) return {payload:'{}',stderr:`< X-Ratelimit-Remaining: 150\n< X-Ratelimit-Reset: ${Math.floor(Date.now()/1000)+600}\n< X-Ratelimit-Resource: graphql\n`};
+   return {code:0};});
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.ok(commands.some(c=>c.includes('rateLimit')&&c.includes('GH_DEBUG=api')),'a metered probe ran');
+  assert.equal(host.harness.sdk.callsTo('environments.pullRequest').length,0,'no BB PR lookup under the reserve');
+  assert.equal(commands.filter(c=>c.includes('gh pr list')).length,0,'no branch list under the reserve');
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('discovery requests debit the GraphQL meter before they run, so 1,002 points left allows two, not a stale count down to 502',async()=>{
+ const host=await base();try {
+  await host.bb.storage.kv.set('crews',Array.from({length:20},(_,i)=>crew(`c${i}`,`thr_c${i}`,'thr_cap')));
+  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'active',environmentId:`env_${threadId}`}));
+  host.harness.sdk.stub('environments.get',async({environmentId})=>({id:environmentId,hostId:'host_1',status:'ready',isWorktree:true,path:`/wt/${environmentId}`,branchName:`fm/${environmentId}`}));
+  host.harness.sdk.stub('environments.pullRequest',async()=>({outcome:'unavailable'}));
+  const commands=[];
+  hostCommands(host,command=>{commands.push(command);
+   if(command.includes('rateLimit')) return {payload:'{}',stderr:`< X-Ratelimit-Remaining: 1002\n< X-Ratelimit-Reset: ${Math.floor(Date.now()/1000)+600}\n< X-Ratelimit-Resource: graphql\n`};
+   if(command.includes('gh pr list')) return {payload:'[]'};
+   return {code:0};});
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  const requests=host.harness.sdk.callsTo('environments.pullRequest').length+commands.filter(c=>c.includes('gh pr list')).length;
+  assert.equal(requests,2,`${requests} discovery requests with 1,002 points left and a 1,000-point reserve`);
  }finally{await host.harness.lifecycle.dispose();}
 });

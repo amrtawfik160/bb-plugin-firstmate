@@ -1,0 +1,8 @@
+#!/bin/sh
+# Tests must never reach live GitHub. npm test puts this first on PATH, so a test
+# that runs a real `gh` fails here. A login shell can reset PATH, so npm test also
+# points GH_CONFIG_DIR at an empty folder and drops token variables: a real gh then
+# refuses to run, unauthenticated, before any network call.
+echo "live GitHub call blocked in tests: gh $*" >&2
+[ -z "${FM_LIVE_GH_LOG:-}" ] || echo "gh $*" >> "$FM_LIVE_GH_LOG"
+exit 97

@@ -232,6 +232,7 @@ test('missed manager deletion is surfaced after restart; inventory failures pres
  const host=await base();try {
  const store=createDeliveries(host.bb.storage.database());const r=store.register({url:'https://github.com/acme/repo/pull/9',taskId:'forgotten',projectId:'proj_1',owner:'thr_missing',home:'',worker:'thr_old'});
  host.harness.sdk.stub('threads.get',async()=>{throw new Error('owner unavailable');});host.harness.sdk.stub('threads.list',async()=>{throw new Error('inventory unavailable');});
+ meteredHost(host);
  await host.harness.behavior.runSchedule('pr-delivery-follow-up');assert.equal(store.get(r.id).freshness,'stale');assert.equal(store.get(r.id).ownerNeeded,false);
  host.harness.sdk.stub('threads.list',async()=>[]);const again=store.get(r.id);again.nextCheckAt=0;store.save(again);
  await host.harness.behavior.runSchedule('pr-delivery-follow-up');assert.equal(store.get(r.id).ownerNeeded,true);assert.equal(store.get(r.id).owner,'thr_missing');
@@ -240,6 +241,8 @@ test('missed manager deletion is surfaced after restart; inventory failures pres
 const tool=(host,name)=>host.harness.inspection.registrations.agentTools.find(t=>t.name===name);
 const turn=()=>new Promise(setImmediate);
 async function until(condition) { for(let i=0;i<300;i++){if(condition())return;await turn();}throw new Error('fixture did not reach boundary'); }
+// A host whose GitHub quota probe answers with plenty left; other commands fail like a host without gh.
+const meteredHost=host=>hostCommands(host,command=>command.includes('rateLimit')?{payload:'{}',stderr:`< X-Ratelimit-Remaining: 4000\n< X-Ratelimit-Reset: ${Math.floor(Date.now()/1000)+3600}\n< X-Ratelimit-Resource: graphql\n`}:{code:1,stderr:'gh unavailable'});
 const forge=(extra={})=>({headRefOid:'sha1',state:'OPEN',isDraft:false,statusCheckRollup:[],reviewDecision:null,reviews:[],mergeable:'MERGEABLE',files:[{path:'docs/x.md'}],...extra});
 
 test('factory metadata adoption and dispatch recovery preserve required verification through discovery and merge',async()=>{
@@ -301,6 +304,7 @@ test('registered follow-up disposal settles hung discovery and notification reco
    if(boundary==='discovery') {
     await host.bb.storage.kv.set('crews',[row(1)]);
     host.harness.sdk.stub('environments.pullRequest',async()=>{reached=true;return new Promise(()=>{});});
+    meteredHost(host);
    }else{
     const store=createDeliveries(host.bb.storage.database());let r=store.register({url:'https://github.com/acme/hung/pull/1',taskId:'c1',projectId:'proj_1',owner:'thr_cap',home:'',worker:'thr_c1'});
     r.nextCheckAt=Date.now()+100000;r.notification={desired:'signature',delivered:null,queued:null,retryAt:0,attempted:'signature'};store.save(r);
@@ -396,6 +400,10 @@ test('registered PR schedule parses real PTY forge reads for discovery and merge
 import os,sys
 if sys.stdout.isatty(): print("Working...")
 print("forge stderr diagnostic",file=sys.stderr)
+if sys.argv[1] == "api":
+    for header in ("Remaining: 4000", "Reset: 4102444800", "Resource: graphql"): print("< X-Ratelimit-" + header, file=sys.stderr)
+    print("{}")
+    sys.exit(0)
 if sys.argv[2] == "list": print('[{"url":"https://github.com/acme/pty/pull/50"}]')
 else: print(open(os.path.join(os.path.dirname(__file__),"observation")).read())
 sys.exit(int(open(os.path.join(os.path.dirname(__file__),"exit")).read()))
@@ -407,7 +415,7 @@ sys.exit(int(open(os.path.join(os.path.dirname(__file__),"exit")).read()))
   host.harness.sdk.stub('environments.get',async()=>({id:'env_wt',hostId:'host_1',status:'ready',path:dir,branchName:'owned-task'}));
   host.harness.sdk.stub('threads.send',async()=>({delivery:'queued'}));host.harness.sdk.stub('threads.queuedMessages.list',async()=>[]);
   let n=0;const commands=new Map(),outputs=new Map();
-  host.harness.sdk.stub('terminals.create',async args=>{const id=`pty${++n}`;commands.set(id,args.start.command);outputs.set(id,runPty(args.start.command.replaceAll('gh pr ',`${dir}/gh pr `).replace(/; sleep 30$/, '')));return{id};});
+  host.harness.sdk.stub('terminals.create',async args=>{const id=`pty${++n}`;commands.set(id,args.start.command);outputs.set(id,runPty(args.start.command.replace(/(^|[^\w\/.-])gh (?=pr |api )/g,`$1${dir}/gh `).replace(/; sleep 30$/, '')));return{id};});
   host.harness.sdk.stub('terminals.get',async()=>({status:'exited'}));host.harness.sdk.stub('terminals.close',async()=>({}));
   host.harness.sdk.stub('terminals.output',async({terminalId})=>({nextSeq:1,chunks:[{dataBase64:Buffer.from(outputs.get(terminalId)).toString('base64')}]}));
   await host.harness.behavior.runSchedule('pr-delivery-follow-up');
@@ -446,7 +454,9 @@ test('native creation provisioning releases capacity only on exact core deletion
  }finally{await host.harness.lifecycle.dispose();}
 });
 
-test('PR-only delivered artifact remains monitored across reload; baseline follow-up never hides an independent CI failure',async()=>{
+test('PR-only delivered artifact remains monitored across reload; baseline follow-up never hides an independent CI failure',async(t)=>{
+ // Each pass is a minute apart, as the schedule runs them, so the paced allowance refills.
+ t.mock.timers.enable({apis:['Date'],now:Date.now()});
  let host=await base();try {
  const author={...row(1),prUrl:'https://github.com/acme/repo/pull/901',deliveryRequirement:'pr'};
  const baseline={...row(2),task:'Fix authorized baseline failure',deliveryRequirement:'pr'};
@@ -460,7 +470,7 @@ test('PR-only delivered artifact remains monitored across reload; baseline follo
    hostCommands(host,c=>c.includes('gh pr view')?{payload:JSON.stringify(observation())}:{code:0});
  };
  install();let store=createDeliveries(host.bb.storage.database());const id='acme/repo#901';
- const pass=async()=>{const r=store.get(id);store.save({...r,nextCheckAt:0});await host.harness.behavior.runSchedule('pr-delivery-follow-up');};
+ const pass=async()=>{t.mock.timers.tick(60_000);const r=store.get(id);store.save({...r,nextCheckAt:0});await host.harness.behavior.runSchedule('pr-delivery-follow-up');};
  await pass();let r=store.get(id);assert.equal(r.status,'pr-delivered');assert.ok(r.deliverySatisfiedAt);assert.equal(r.requirement,'pr');assert.deepEqual(r.workers,['thr_c1']);
  const satisfiedAt=r.deliverySatisfiedAt;
  // Worker completes and leaves the cache. The persistent author remains callable.

@@ -342,3 +342,17 @@ test("an owner waiver covers only the head it was given for", () => {
   store.observe(r.id, seen({ headSha: next, reviewHeadSha: next }), true, 2);
   assert.equal(store.observe(r.id, seen({ headSha: next, reviewHeadSha: next, state: "merged", mergeCommitSha: MERGE_2315 }), true, 3).status, "merged-unverified");
 });
+
+test("a PR read unchanged is read less and less often, and any change or pending check brings it back to minutes", () => {
+  const store = createDeliveries(new DatabaseSync(":memory:") as never);
+  const r = store.register({ url: "https://github.com/acme/repo/pull/7", taskId: "c1", projectId: "p", owner: "thr_cap", home: "", worker: "thr_c1", requirement: "pr" });
+  const seen = { headSha: "a1", state: "open", draft: false, checks: "passing", review: "approved", reviewHeadSha: "a1", mergeCommitSha: null, mergeable: "mergeable" } as const;
+  let now = 1_000_000_000;
+  const delays: number[] = [];
+  for (let read = 0; read < 7; read++) { const next = store.observe(r.id, seen, false, now); delays.push((next.nextCheckAt - now) / 60_000); now = next.nextCheckAt; }
+  assert.deepEqual(delays, [1, 2, 4, 8, 16, 30, 30], "minutes until the next read of a quiet PR");
+  const pushed = store.observe(r.id, { ...seen, headSha: "b2", reviewHeadSha: "b2" }, false, now);
+  assert.equal((pushed.nextCheckAt - now) / 60_000, 1, "a new head is read again within a minute");
+  now = pushed.nextCheckAt;
+  for (let read = 0; read < 5; read++) { const next = store.observe(r.id, { ...seen, headSha: "b2", checks: "pending" }, false, now); assert.ok(next.nextCheckAt - now <= 2 * 60_000, "pending checks are read at least every two minutes"); now = next.nextCheckAt; }
+});

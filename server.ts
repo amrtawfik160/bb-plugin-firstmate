@@ -89,7 +89,7 @@ import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRe
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
 import { optionHelp } from "./lib/cli-help.ts";
 import { AUDITED_BUNDLED_SNAPSHOTS, AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython } from "./lib/native-policy.ts";
-import { createDeliveries, LOST_OWNER_RECHECK_MS, canonicalPr, decisionLine, deliveryLine, parseForge, PR_VIEW_FIELDS, PR_VIEW_JQ, prBranchOwner, type DeliveryRecord, type PrBranchCandidate } from "./lib/pr-delivery.ts";
+import { createDeliveries, LOST_OWNER_RECHECK_MS, canonicalPr, decisionLine, deliveryLine, parseForge, PR_VIEW_FIELDS, PR_VIEW_JQ, prBranchOwner, releasesTask, type DeliveryRecord, type PrBranchCandidate } from "./lib/pr-delivery.ts";
 import { captureHostCommand, decodeHostCapture } from "./lib/host-capture.ts";
 import { selectExecution, validateLaunchCapabilities } from "./lib/execution-selection.ts";
 import { crewPipeline, crewPlaybook, crewSkillBlock, crewSkillRoot, notVerifiedNote, notVerifiedRequest, pipelineProofGap, PLAYBOOK_CHOICES, playbookStepCount, redactSecrets, reportGapNote, reportGapRequest, reportGaps, skillCheckScript, skillRoutingLinkScript, verifyStepGap } from "./lib/crew-contract.ts";
@@ -624,6 +624,30 @@ const CAPTAIN_RESUME_PREFIX = "captain-resume:";
 const NO_OUTCOME_PREFIX = "crew-no-outcome:";
 // Thread of a crew forgotten while its PR delivery stays tracked → the captain that forgot it.
 const FORGOTTEN_CREW_PREFIX = "forgotten-crew:";
+const FOLLOW_UP_CONCURRENCY = 4;
+const FOLLOW_UP_DUE_LIMIT = 100;
+const RETAINED_SWEEP_MS = 10 * 60_000;
+const GRAPHQL_RESERVE = 1000;
+/** A background GitHub request that the hourly allowance or the GraphQL reserve held back; nothing was read. */
+class GithubReservePaused extends Error { constructor(hostId: string) { super(`GitHub request on ${hostId} held back: hourly allowance or GraphQL reserve reached`); } }
+const FOLLOW_UP_READS_PER_HOUR = 500;
+const COVERED_DISCOVERY_MS = 30 * 60_000;
+const FOLLOW_UP_BURST = 10;
+/** `gh api -i … --jq`: the status line and headers, a blank line, then one JSON row per line. A plain answer has rows only. */
+function parseListAnswer(output: string): { status: number; etag?: string; next: boolean; rows: Record<string, unknown>[] } {
+  let status = 200, etag: string | undefined, next = false, body = output;
+  if (/^HTTP\/\S+ \d{3}/.test(output.trimStart())) {
+    const text = output.trimStart().replace(/\r/g, "");
+    const end = text.indexOf("\n\n");
+    const head = end === -1 ? text : text.slice(0, end);
+    body = end === -1 ? "" : text.slice(end + 2);
+    status = Number(/^HTTP\/\S+ (\d{3})/.exec(head)![1]);
+    etag = /^etag:\s*(.+)$/im.exec(head)?.[1]?.trim();
+    next = /^link:.*rel="next"/im.test(head);
+  }
+  const rows = body.split("\n").filter((line) => line.trim().startsWith("{") || line.trim().startsWith("[")).flatMap((line) => { const row: unknown = JSON.parse(line); return (Array.isArray(row) ? row : [row]).map((r) => (r && typeof r === "object" ? r : {}) as Record<string, unknown>); });
+  return { status, ...(etag ? { etag } : {}), next, rows };
+}
 const OUTCOME_LINE_REQUEST = [
   "OUTCOME LINE MISSING: your last turn ended without an outcome line. Reply now with exactly one line that states where the task stands, then stop:",
   "  DONE: <one-line outcome>",
@@ -7003,7 +7027,17 @@ export default async function plugin(bb: BbPluginApi) {
       } catch(inventoryError) { if (signal?.aborted) throw inventoryError; return "unknown"; }
     }
   }
-  async function reconcileDelivery(record:DeliveryRecord,signal?:AbortSignal) {
+  // A read already in flight for this PR serves an overlapping request; fresh=true asks
+  // for a read of its own, for a verdict whose head the shared read did not cover.
+  const deliveryReads=new Map<string,Promise<DeliveryRecord>>();
+  async function reconcileDelivery(record:DeliveryRecord,signal?:AbortSignal,fresh=false):Promise<DeliveryRecord> {
+    const running=deliveryReads.get(record.id);
+    if (running && !fresh) return running;
+    const read=readDelivery(record,signal);
+    deliveryReads.set(record.id,read);
+    try { return await read; } finally { if (deliveryReads.get(record.id)===read) deliveryReads.delete(record.id); }
+  }
+  async function readDelivery(record:DeliveryRecord,signal?:AbortSignal):Promise<DeliveryRecord> {
     return serializeLedger(`delivery:${record.id}`,async()=>{
     record=deliveries.get(record.id) ?? record;
     if (["complete","explicitly-abandoned"].includes(record.status)) return record;
@@ -7015,7 +7049,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (ownerState === "lost") record=deliveries.markOwnerNeeded(record.id) ?? record;
       else if (ownerState === "live") record=deliveries.ownerRestored(record.id) ?? record;
       const hostId = await resolveHostForProject(record.projectId,ownerState === "live" ? record.owner ?? undefined : undefined,signal);
-      const result = await runStructuredOnHost(hostId, `gh pr view ${shQuote(record.url)} --json ${PR_VIEW_FIELDS} --jq ${shQuote(PR_VIEW_JQ)}`,30_000,signal);
+      const result = await ghGraphql(hostId, `gh pr view ${shQuote(record.url)} --json ${PR_VIEW_FIELDS} --jq ${shQuote(PR_VIEW_JQ)}`,30_000,signal);
       if (result.exitCode !== 0) throw new Error(result.stderr || result.output || `Forge lookup exit ${result.exitCode}`);
       const observation = parseForge(JSON.parse(result.output));
       // Standing yolo allows asking the manager to continue; only native merge
@@ -7030,6 +7064,8 @@ export default async function plugin(bb: BbPluginApi) {
       return observed;
     } catch (error) {
       if (signal?.aborted) throw error;
+      // Held back by the reserve: nothing was read, so the record is not stale.
+      if (error instanceof GithubReservePaused) return record;
       return deliveries.stale(record.id,String(error));
     }
     });
@@ -7166,8 +7202,8 @@ export default async function plugin(bb: BbPluginApi) {
   const RETIRED_CREW_PR_WINDOW_MS = 14 * 86_400_000;
   const UNOWNED_PR_RECHECK_MS = 60 * 60_000;
   type PrCandidate = PrBranchCandidate & { crew: Crew; path: string; hostId: string; live: boolean; fresh: boolean };
-  type OpenPr = { id: string; number: number; url: string; head: string; title?: string; openedAt?: number; touchedAt?: number; candidate?: PrCandidate };
-  type OpenPrSnapshot = { at: number; repos: Array<{ projects: Set<string>; prs: OpenPr[]; openIds: Set<string> }> };
+  type OpenPr = { id: string; number: number; url: string; head: string; headSha?: string; title?: string; openedAt?: number; touchedAt?: number; candidate?: PrCandidate };
+  type OpenPrSnapshot = { at: number; repos: Array<{ projects: Set<string>; prs: OpenPr[]; openIds: Set<string>; repo: string; allOpen: Set<string> }> };
   const crewBranches = new Map<string, { branch: string; path: string; hostId: string }>();
   const projectRepos = new Map<string, string>();
   const unownedPrs = new Map<string, number>();
@@ -7221,7 +7257,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
   // A repository no live crew works in is listed every ten minutes, not every cycle.
   const RETIRED_ONLY_LIST_MS = 10 * 60_000;
-  const openPrLists = new Map<string, { at: number; rows: Record<string, unknown>[] }>();
+  const openPrLists = new Map<string, { at: number; rows: Record<string, unknown>[]; etag?: string }>();
   // "By this GitHub account": the login gh is signed in with on that host, read once.
   const githubLogins = new Map<string, string>();
   async function hostGithubLogin(hostId: string, signal?: AbortSignal): Promise<string> {
@@ -7286,18 +7322,25 @@ export default async function plugin(bb: BbPluginApi) {
         const cached = openPrLists.get(repo);
         let listed = cached && !live && Date.now() - cached.at < RETIRED_ONLY_LIST_MS ? cached.rows : undefined;
         if (!listed) {
-          const fields = ".[] | {number, url: .html_url, title, headRefName: .head.ref, createdAt: .created_at, updatedAt: .updated_at, author: .user.login} | tojson";
-          const tries = [...new Set(group.paths)].slice(0, 8).map((path) => `if cd ${shQuote(path)} 2>/dev/null; then gh api --paginate ${shQuote("repos/{owner}/{repo}/pulls?state=open&per_page=100")} --jq ${shQuote(fields)}; exit $?; fi`);
-          const res = await runStructuredOnHost(group.hostId, `${tries.join("; ")}; exit 3`, 30_000, s);
-          if (res.exitCode !== 0) return;
-          // One JSON object per line and PR.
-          listed = res.output.split("\n").filter((line) => line.trim()).flatMap((line) => { const row: unknown = JSON.parse(line); return (Array.isArray(row) ? row : [row]).map(asRecord); });
-          openPrLists.set(repo, { at: Date.now(), rows: listed });
+          const fields = ".[] | {number, url: .html_url, title, headRefName: .head.ref, headSha: .head.sha, createdAt: .created_at, updatedAt: .updated_at, author: .user.login} | tojson";
+          const list = (flags: string) => `${[...new Set(group.paths)].slice(0, 8).map((path) => `if cd ${shQuote(path)} 2>/dev/null; then gh api ${flags} ${shQuote("repos/{owner}/{repo}/pulls?state=open&per_page=100")} --jq ${shQuote(fields)}; exit $?; fi`).join("; ")}; exit 3`;
+          // Asked with the last ETag, an unchanged list answers 304, which GitHub does not count.
+          const res = await runStructuredOnHost(group.hostId, list(`-i${cached?.etag ? ` -H ${shQuote(`If-None-Match: ${cached.etag}`)}` : ""}`), 30_000, s);
+          const answer = parseListAnswer(res.output);
+          if (answer.status === 304 && cached) listed = cached.rows;
+          else if (res.exitCode !== 0) return;
+          else if (answer.next) {
+            const all = await runStructuredOnHost(group.hostId, list("--paginate"), 30_000, s);
+            if (all.exitCode !== 0) return;
+            listed = parseListAnswer(all.output).rows;
+          } else listed = answer.rows;
+          openPrLists.set(repo, { at: Date.now(), rows: listed, ...(answer.etag && !answer.next ? { etag: answer.etag } : {}) });
         }
         const me = await hostGithubLogin(group.hostId, s);
         const prs: OpenPr[] = [];
-        const openIds = new Set<string>();
+        const openIds = new Set<string>(), allOpen = new Set<string>();
         for (const row of listed) {
+          try { if (typeof row["url"] === "string") allOpen.add(canonicalPr(row["url"]).id); } catch { /* not a PR link */ }
           if (me && typeof row["author"] === "string" && row["author"].toLowerCase() !== me) continue;
           const url = typeof row["url"] === "string" ? row["url"] : "", head = typeof row["headRefName"] === "string" ? row["headRefName"] : "";
           if (!url || !head) continue;
@@ -7305,7 +7348,7 @@ export default async function plugin(bb: BbPluginApi) {
           try { identity = canonicalPr(url); } catch { continue; }
           openIds.add(identity.id);
           const opened = typeof row["createdAt"] === "string" ? Date.parse(row["createdAt"]) : NaN, touched = typeof row["updatedAt"] === "string" ? Date.parse(row["updatedAt"]) : NaN;
-          prs.push({ id: identity.id, number: identity.number, url: identity.url, head,
+          prs.push({ id: identity.id, number: identity.number, url: identity.url, head, ...(typeof row["headSha"] === "string" && row["headSha"] ? { headSha: row["headSha"] } : {}),
             ...(typeof row["title"] === "string" && row["title"].trim() ? { title: row["title"].trim().slice(0, 300) } : {}),
             ...(Number.isFinite(opened) ? { openedAt: opened } : {}), ...(Number.isFinite(touched) ? { touchedAt: touched } : {}),
             candidate: prBranchOwner(head, group.candidates) });
@@ -7329,7 +7372,9 @@ export default async function plugin(bb: BbPluginApi) {
             else unownedPrs.set(pr.id, Date.now());
           }
         }
-        snapshot.repos.push({ projects: group.projects, prs, openIds });
+        // The repository is the origin remote, or else the one every listed PR names.
+        const named = new Set([...allOpen].map((id) => id.slice(0, id.lastIndexOf("#"))));
+        snapshot.repos.push({ projects: group.projects, prs, openIds, repo: repo.includes("/") ? repo.slice(repo.indexOf("\t") + 1) : named.size === 1 ? [...named][0]! : "", allOpen });
       }, signal).catch((error) => { if (!signal?.aborted) bb.log.warn(`Open PR list: ${String(error)}`); });
     }
     return snapshot;
@@ -7337,6 +7382,21 @@ export default async function plugin(bb: BbPluginApi) {
   async function openPrSweep(signal?: AbortSignal) {
     const snapshot = await readOpenPrs(signal);
     openPrSnapshot = snapshot;
+    // The free open list says which spaced-out PRs changed: a new head, or gone from the
+    // list (merged or closed). Only those are read on GitHub before their next turn.
+    const now = Date.now();
+    for (const repo of snapshot.repos) {
+      const heads = new Map(repo.prs.filter((pr) => pr.headSha).map((pr) => [pr.id, pr.headSha!]));
+      for (let offset = 0; repo.repo; offset += 100) {
+        const page = deliveries.list({ limit: 100, offset });
+        for (const r of page) {
+          if (r.nextCheckAt <= now || r.forgeState !== "open" || !r.id.startsWith(`${repo.repo}#`)) continue;
+          const head = heads.get(r.id);
+          if (!repo.allOpen.has(r.id) || (head && r.headSha && head !== r.headSha)) deliveries.save({ ...r, nextCheckAt: 0 });
+        }
+        if (page.length < 100) break;
+      }
+    }
     for (const pr of snapshot.repos.flatMap((repo) => repo.prs)) {
       signal?.throwIfAborted();
       if (deliveries.touch(pr.id, pr.touchedAt, pr.title) || !pr.candidate) continue;
@@ -7401,16 +7461,174 @@ export default async function plugin(bb: BbPluginApi) {
       if (told) deliveries.markDecisionAsked(records.map((r) => r.id), now);
     }
   }
+  // A crew forgotten while its PR was open keeps its native record, so the merge keeps
+  // native task authority (forgetCrew). Nothing retired that record once its deliveries
+  // ended, and fm-watch kept scanning the archived crew every pass: 22 of the captain's
+  // 52 native records on 17 Oct. This retires each such record, with forget's own steps.
+  let retainedSweepAt = 0;
+  async function retireEndedRetainedRecords(signal?: AbortSignal) {
+    if (Date.now() - retainedSweepAt < RETAINED_SWEEP_MS) return;
+    retainedSweepAt = Date.now();
+    const all: DeliveryRecord[] = [];
+    for (let offset = 0; ; offset += 100) {
+      const page = deliveries.list({ includeComplete: true, limit: 100, offset });
+      all.push(...page);
+      if (page.length < 100) break;
+    }
+    const live = new Set((await raceAbort(readCrews(), signal, STUCK_HOST_CALL_MS)).map((crew) => crew.id));
+    for (const home of new Set(all.map((r) => r.home).filter((h) => h !== ""))) {
+      signal?.throwIfAborted();
+      const sample = all.find((r) => r.home === home)!;
+      const hostId = await resolveHostForProject(sample.projectId, sample.owner ?? undefined, signal);
+      const listed = await runOnHost(hostId, `for m in ${shQuote(home)}/state/*.meta; do [ -f "$m" ] || continue; t=\${m##*/}; printf '%s\\t%s\\n' "\${t%.meta}" "$(sed -n 's/^bb_thread_id=//p' "$m" | tail -n 1)"; done`, 15_000, signal);
+      if (listed.exitCode !== 0) throw new Error(`listing native records in ${home} failed (exit ${listed.exitCode})`);
+      for (const line of listed.output.split("\n")) {
+        const [id = "", thread = ""] = line.trim().split("\t");
+        if (!/^[A-Za-z0-9._-]+$/.test(id) || thread === "" || live.has(id)) continue;
+        // The record's thread proves which crew it is; every delivery of the task, whichever
+        // worker opened it, decides whether the task's native authority is still needed.
+        const records = all.filter((r) => r.home === home && r.taskId === id);
+        const own = records.find((r) => r.workers.includes(thread) && r.continuation);
+        if (!own || records.some((r) => !releasesTask(r.status))) continue;
+        if ((await raceAbort(bb.sdk.threads.get({ threadId: thread }), signal, STUCK_HOST_CALL_MS)).archivedAt == null) continue;
+        // A ledger row can be closed-era: a PR reopened since keeps the task.
+        const reopened: string[] = [];
+        for (const r of records) {
+          if (graphqlReadsAllowed(hostId) === 0 || backgroundAllowance() <= 0) { reopened.push(`${r.id} not read: GitHub allowance or reserve reached`); break; }
+          const read = await ghGraphql(hostId, `gh pr view ${shQuote(r.url)} --json state`, 30_000, signal);
+          const state = read.exitCode === 0 ? String(asRecord(JSON.parse(read.output || "{}"))["state"] ?? "") : "";
+          if (state !== "MERGED" && state !== "CLOSED") reopened.push(`${r.id} ${state || `unreadable (exit ${read.exitCode})`}`);
+        }
+        if (reopened.length) { bb.log.warn(`kept the native record of forgotten crew ${id}: GitHub does not show every PR of it finished (${reopened.join(", ")})`); continue; }
+        try {
+          const crew: Crew = { ...crewSchema.parse(own.continuation), nativeHome: home, parentThreadId: own.owner };
+          await dropFmMeta(crew);
+          await realBacklogTransitionForCrew(crew, "rm", true);
+          const leftover = await retireNativeTaskState(crew);
+          bb.log.info(`retired the native record of forgotten crew ${id}: its PR deliveries ended (${records.map((r) => `${r.id} ${r.status}`).join(", ")})${leftover ? `; ${leftover}` : ""}`);
+        } catch (error) {
+          bb.log.warn(`retiring the native record of forgotten crew ${id} failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    }
+  }
+  // One hourly count of the GitHub requests the background loop makes: PR reads, discovery
+  // lookups and branch lists, retirement reads. Verdict, merge and owner requests run
+  // outside the loop and are not charged.
+  const backgroundReads: number[] = [];
+  const backgroundBudget = new AsyncLocalStorage<true>();
+  // The hour's count is also paced: a bucket refilled at 500 an hour, holding at most
+  // FOLLOW_UP_BURST, so a backlog cannot spend the hour in one cycle and leave a later
+  // push waiting.
+  let paceTokens = FOLLOW_UP_BURST, pacedAt = Date.now();
+  // Every GitHub request reserves its point at the request itself, in one synchronous
+  // step with nothing awaited between the check and the debit, so concurrent workers
+  // cannot all pass one stale check. Inside the background loop a request runs only with
+  // hourly allowance left and only if its point leaves the GraphQL reserve whole; the
+  // probe, which reads an unknown meter, needs the allowance alone. The debit lowers the
+  // host's meter; a response's own headers then set the true value. Outside the loop
+  // (verdicts, merges) the request always runs and still debits the meter.
+  function reserveGithub(hostId: string | null, probe = false): boolean {
+    const meter = hostId === null ? undefined : graphqlMeters.get(hostId);
+    if (backgroundBudget.getStore()) {
+      if (backgroundAllowance() <= 0) return false;
+      if (!probe && hostId !== null && graphqlReadsAllowed(hostId) === 0) return false;
+      backgroundReads.push(Date.now());
+      paceTokens -= 1;
+    }
+    if (meter) meter.remaining -= 1;
+    return true;
+  }
+  function backgroundAllowance() {
+    const now = Date.now();
+    while (backgroundReads.length && backgroundReads[0]! <= now - 3_600_000) backgroundReads.shift();
+    // A clock that moved back refills nothing and takes nothing.
+    paceTokens = Math.min(FOLLOW_UP_BURST, paceTokens + Math.max(0, now - pacedAt) * FOLLOW_UP_READS_PER_HOUR / 3_600_000);
+    pacedAt = now;
+    return Math.min(FOLLOW_UP_READS_PER_HOUR - backgroundReads.length, Math.floor(paceTokens));
+  }
+  const crewDiscoveredAt = new Map<string, number>();
+  // GraphQL points left per host, from the X-Ratelimit headers of this plugin's own PR
+  // reads: GitHub enforces those, and the rate_limit overview read 1,126 points more.
+  const graphqlMeters = new Map<string, { remaining: number; reset: number }>();
+  let quotaWarnedUntil = 0;
+  async function ghGraphql(hostId: string, command: string, timeoutMs: number, signal?: AbortSignal, probe = false) {
+    // gh's debug output carries whole response bodies; only the rate-limit headers, and the
+    // last lines of a failure, come back.
+    const wrapped = `t=$(mktemp) || exit 1; GH_DEBUG=api ${command} 2>"$t"; rc=$?; grep -i '^< x-ratelimit-' "$t" >&2; [ "$rc" -eq 0 ] || grep -v '^[<>*]' "$t" | tail -n 5 >&2; rm -f "$t"; exit "$rc"`;
+    if (!reserveGithub(hostId, probe)) throw new GithubReservePaused(hostId);
+    const res = await runStructuredOnHost(hostId, wrapped, timeoutMs, signal);
+    let remaining: number | undefined, reset: number | undefined, seen = false;
+    for (const line of res.stderr.split("\n")) {
+      const header = /^<\s*x-ratelimit-(remaining|reset|resource):\s*(\S+)/i.exec(line.trim());
+      if (!header) continue;
+      if (header[1]!.toLowerCase() === "remaining") remaining = Number(header[2]);
+      else if (header[1]!.toLowerCase() === "reset") reset = Number(header[2]) * 1000;
+      else if (header[2]!.toLowerCase() === "graphql" && Number.isFinite(remaining) && Number.isFinite(reset)) { graphqlMeters.set(hostId, { remaining: remaining!, reset: reset! }); seen = true; }
+    }
+    if (!seen && res.exitCode !== 0 && /rate.?limit/i.test(res.stderr)) graphqlMeters.set(hostId, { remaining: 0, reset: Date.now() + 60_000 });
+    else if (!seen && res.exitCode === 0 && !graphqlMeters.has(hostId)) {
+      // A gh that prints no headers leaves only the hourly allowance to bound the loop.
+      graphqlMeters.set(hostId, { remaining: Number.POSITIVE_INFINITY, reset: Date.now() + 3_600_000 });
+      bb.log.warn(`gh on ${hostId} returned no GraphQL rate-limit headers; PR follow-up is bounded by its hourly allowance alone`);
+    }
+    return res;
+  }
+  /** Background GraphQL reads allowed now: none under the reserve, and none while the meter is unknown or past its reset (ensureGraphqlMeter probes first). */
+  function graphqlReadsAllowed(hostId: string): number {
+    const meter = graphqlMeters.get(hostId);
+    if (!meter || Date.now() >= meter.reset) return 0;
+    // A request may run only if its point leaves the reserve whole.
+    if (meter.remaining > GRAPHQL_RESERVE) return Number.POSITIVE_INFINITY;
+    if (Date.now() >= quotaWarnedUntil) { quotaWarnedUntil = meter.reset; bb.log.warn(`PR follow-up paused: ${meter.remaining} GitHub GraphQL points left, under the ${GRAPHQL_RESERVE} kept for crews, merges and verdict refreshes; resumes after ${new Date(meter.reset).toISOString()}`); }
+    return 0;
+  }
+  // With no reading, or past its reset, one metered request (1 point, charged) reads the
+  // quota before any other background request. A failed probe leaves the meter unknown,
+  // which allows nothing.
+  async function ensureGraphqlMeter(hostId: string, signal?: AbortSignal) {
+    const meter = graphqlMeters.get(hostId);
+    if (meter && Date.now() < meter.reset) return;
+    if (backgroundAllowance() <= 0) return;
+    await ghGraphql(hostId, `gh api graphql -f query=${shQuote("{ rateLimit { remaining resetAt } }")}`, 30_000, signal, true)
+      .catch((error) => { if (signal?.aborted) throw error; });
+  }
+  async function backgroundHost(signal?: AbortSignal): Promise<string | undefined> {
+    const first = deliveries.list({ limit: 1 })[0];
+    const crew = first ? undefined : (await raceAbort(readCrews(), signal, STUCK_HOST_CALL_MS))[0];
+    const project = first?.projectId ?? crew?.projectId;
+    if (!project) return undefined;
+    try {
+      const hostId = await resolveHostForProject(project, first?.owner ?? crew?.parentThreadId ?? undefined, signal);
+      await ensureGraphqlMeter(hostId, signal);
+      return hostId;
+    } catch (error) { if (signal?.aborted) throw error; return undefined; }
+  }
   async function deliveryPass(signal?: AbortSignal) {
+    return backgroundBudget.run(true, () => backgroundDeliveryPass(signal));
+  }
+  async function backgroundDeliveryPass(signal?: AbortSignal) {
     // First, so a PR opened this minute gets its row and its first GitHub read in this cycle.
     await openPrSweep(signal).catch(error=>{ if (!signal?.aborted) bb.log.warn(`Open PR sweep: ${String(error)}`); });
     await recoverDoneDeliveries(signal);
     const crews = await raceAbort(readCrews(),signal,STUCK_HOST_CALL_MS);
     const batch = [...crews.slice(deliveryDiscoveryCursor),...crews.slice(0,deliveryDiscoveryCursor)].slice(0,10);
     deliveryDiscoveryCursor = crews.length ? (deliveryDiscoveryCursor+batch.length)%crews.length : 0;
+    // The open list read this cycle tracks every open PR of a crew whose repository it
+    // covered. Such a crew is looked up on its own only while it has no tracked PR, at most
+    // every 30 minutes, for a PR merged between two lists. Lookups count against the
+    // hourly allowance and stop under the GraphQL reserve.
+    // The host (and its quota probe) is resolved only when a request is about to run.
+    let hostRead: Promise<string | undefined> | undefined;
+    const quotaHost = () => hostRead ??= backgroundHost(signal);
     for (const crew of batch) {
       signal?.throwIfAborted();
+      if (openPrSnapshot?.repos.some((repo) => repo.projects.has(crew.projectId))
+        && (deliveries.forTasks([crew.id]).length > 0 || Date.now() - (crewDiscoveredAt.get(crew.id) ?? 0) < COVERED_DISCOVERY_MS)) continue;
       if (!retries.isDue("pr-discovery", crew.threadId, Date.now())) continue;
+      // Each lookup probes the quota on the crew's own host and checks it before it runs.
+      if (backgroundAllowance() <= 0) break;
+      crewDiscoveredAt.set(crew.id, Date.now());
       try {
         await boundedFollowUp(s=>discoverCrewDelivery(crew,s),signal);
         retryCleared("pr-discovery", crew.threadId);
@@ -7421,10 +7639,25 @@ export default async function plugin(bb: BbPluginApi) {
           reason: error instanceof Error ? error.message : String(error), logPrefix: (attempt) => `PR discovery ${crew.id} (attempt ${attempt})` }, signal);
       }
     }
-    for (const record of deliveries.list({ due:Date.now(),limit:10 })) {
-      signal?.throwIfAborted();
-      await boundedFollowUp(async s=>{await reconcileDelivery(record,s);await notifyDelivery(record,s);},signal).catch(error=>bb.log.warn(`PR follow-up ${record.id}: ${String(error)}`));
-    }
+    // Every PR comes due each minute, so the cycle reads all of them, a few GitHub
+    // reads at a time; ten a cycle left 48 of 71 waiting and their heads minutes old.
+    // GraphQL points are shared with every crew on the host; keep a reserve for them and
+    // for verdict-time refreshes. Reading the limit itself costs nothing.
+    // The loop also keeps to its own hourly allowance, so a burst of due PRs cannot spend
+    // what merges, checks and other GitHub users on the host need.
+    const allowance=backgroundAllowance();
+    const host=allowance > 0 && deliveries.list({ due:Date.now(),limit:1 }).length ? await quotaHost() : undefined;
+    const due=allowance <= 0 || (host !== undefined && graphqlReadsAllowed(host) === 0) ? [] : deliveries.list({ due:Date.now(),limit:Math.min(FOLLOW_UP_DUE_LIMIT,allowance) });
+    const follow=(record:DeliveryRecord)=>boundedFollowUp(async s=>{await reconcileDelivery(record,s);await notifyDelivery(record,s);},signal).catch(error=>bb.log.warn(`PR follow-up ${record.id}: ${String(error)}`));
+    let next=0;
+    await Promise.all(Array.from({ length:Math.min(FOLLOW_UP_CONCURRENCY,due.length) },async()=>{
+      for (let record=due[next++]; record!==undefined; record=due[next++]) {
+        signal?.throwIfAborted();
+        if (backgroundAllowance() <= 0 || (host !== undefined && graphqlReadsAllowed(host) === 0)) break;
+        await follow(record);
+      }
+    }));
+    await retireEndedRetainedRecords(signal).catch((error) => { if (!signal?.aborted) bb.log.warn(`Retained native records: ${String(error)}`); });
     // Notification failure stays due independently of forge polling backoff.
     for (const record of deliveries.pendingNotifications()) {
       if (record.notification.desired !== record.notification.delivered) await boundedFollowUp(s=>notifyDelivery(record,s),signal).catch(error=>bb.log.warn(`PR notification ${record.id}: ${String(error)}`));
@@ -7526,9 +7759,19 @@ export default async function plugin(bb: BbPluginApi) {
       if (input.from !== r.owner) throw new Error("Assignment requires the explicitly named previous manager.");
       return serializeLedger(`delivery:${r.id}`,async()=>[deliveries.assign(r.id,r.owner,owner,projectId)]);
     }
-    if (input.action === "check") return [await recordCheckerVerdict(r,owner,input.commitSha ?? "",input.verdict,input.notes ?? "",input.findings)];
+    // A verdict on an open PR covers its head on GitHub, not the head the follow-up
+    // loop last saw: a push since then must neither refuse it nor let an old head pass.
+    // A read already under way is shared when it shows the head the caller names.
+    const verdictSignal=asRecord(ctx)["signal"] as AbortSignal | undefined;
+    const covers=(x:DeliveryRecord)=>!!input.commitSha && !!x.headSha && x.headSha.toLowerCase().startsWith(input.commitSha.trim().toLowerCase());
+    let live=r;
+    if ((input.action === "check" || input.action === "verify") && r.forgeState === "open") {
+      live=await reconcileDelivery(r,verdictSignal).then(()=>deliveries.get(r.id) ?? r);
+      if (!covers(live)) live=await reconcileDelivery(live,verdictSignal,true).then(()=>deliveries.get(r.id) ?? r);
+    }
+    if (input.action === "check") return [await recordCheckerVerdict(live,owner,input.commitSha ?? "",input.verdict,input.notes ?? "",input.findings)];
     if (input.action === "verify") {
-      await requirePipelineProof(r);
+      await requirePipelineProof(live);
       const evidence={ driven:input.driven ?? "",seen:input.seen ?? "" };
       if (r.owner === owner) return [deliveries.verify(r.id,owner,input.commitSha ?? "",evidence)];
       // A crew that drove the change records it under its own crew id, without the captain.
@@ -7599,7 +7842,10 @@ export default async function plugin(bb: BbPluginApi) {
     signal?:AbortSignal,
   ): Promise<{ url: string; state: string; source: string } | null> {
     let env = prFacts(null);
-    try { env = prFacts(await raceAbort(bb.sdk.environments.pullRequest({ environmentId: envId,signal }),signal,STUCK_HOST_CALL_MS)); } catch(error) { if (signal?.aborted) throw error; }
+    if (hostId !== null && backgroundBudget.getStore()) await ensureGraphqlMeter(hostId,signal);
+    if (reserveGithub(hostId)) {
+      try { env = prFacts(await raceAbort(bb.sdk.environments.pullRequest({ environmentId: envId,signal }),signal,STUCK_HOST_CALL_MS)); } catch(error) { if (signal?.aborted) throw error; }
+    }
     if (env.available && env.url !== "") {
       await rememberPrUrl(crew, env.url,signal);
       return { url: env.url, state: env.state, source: "environment" };
@@ -7611,7 +7857,7 @@ export default async function plugin(bb: BbPluginApi) {
       const e = asRecord(await raceAbort(bb.sdk.environments.get({ environmentId: envId,signal }),signal,STUCK_HOST_CALL_MS));
       const branch = typeof e["branchName"] === "string" ? e["branchName"] : "";
       const path = typeof e["path"] === "string" ? e["path"] : "";
-      if (branch !== "" && path !== "") {
+      if (branch !== "" && path !== "" && reserveGithub(hostId)) {
         const res = await runStructuredOnHost(hostId,
           `cd ${shQuote(path)} && gh pr list --head ${shQuote(branch)} --state all --json url --limit 1`, 30_000,signal);
         if (res.exitCode !== 0) throw new Error(res.stderr || res.output || `Forge lookup exit ${res.exitCode}`);
