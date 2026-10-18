@@ -6693,8 +6693,13 @@ export default async function plugin(bb: BbPluginApi) {
   async function crewTurnTookWake(delivery: InboxDelivery, signal?: AbortSignal): Promise<boolean> {
     try {
       const rows = await raceAbort(bb.sdk.threads.events.list({ threadId: delivery.threadId, types: ["client/turn/requested"], order: "desc", limit: "50" }), signal, STUCK_HOST_CALL_MS);
-      const needle = JSON.stringify(delivery.doorbell);
-      return (rows as unknown[]).some((row) => asRecord(row)["type"] === "client/turn/requested" && JSON.stringify(asRecord(row)["data"] ?? null).includes(needle));
+      // BB wraps a message sent with a sender thread in "[bb message from thread:<id>]\n\n" (agentThreadMessage).
+      const accepted = new Set([delivery.doorbell, ...(delivery.senderThreadId ? [`[bb message from thread:${delivery.senderThreadId}]\n\n${delivery.doorbell}`] : [])]);
+      return (rows as unknown[]).some((row) => {
+        if (asRecord(row)["type"] !== "client/turn/requested") return false;
+        const input = asRecord(asRecord(row)["data"])["input"];
+        return Array.isArray(input) && input.some((item) => asRecord(item)["type"] === "text" && accepted.has(String(asRecord(item)["text"])));
+      });
     } catch (error) {
       if (isAbortError(error)) throw error;
       return false;
@@ -15105,21 +15110,25 @@ export default async function plugin(bb: BbPluginApi) {
   const WAITING_TURN_PREFIX = "crew-waiting-turn:";
   /** Records when a crew turn ended with WAITING, for either transport; any other turn end clears it. */
   async function noteCrewTurnEnd(crew: Crew, lastAssistantText: string | null): Promise<void> {
-    if (isWaitingYield(lastAssistantText)) await bb.storage.kv.set(`${WAITING_TURN_PREFIX}${crew.threadId}`, { since: Date.now() });
+    if (isWaitingYield(lastAssistantText)) await bb.storage.kv.set(`${WAITING_TURN_PREFIX}${crew.threadId}`, { since: Date.now(), output: (lastAssistantText ?? "").trim() });
     else await bb.storage.kv.delete(`${WAITING_TURN_PREFIX}${crew.threadId}`);
   }
   async function dropWaitingPing(captainThreadId: string, text: string, queuedAt: unknown): Promise<{ action: "reject"; message: string } | null> {
     if (typeof queuedAt !== "number" || !Number.isFinite(queuedAt)) return null;
     const ping = bbChildPingCrews(text);
-    if (ping === null || !ping.allCompleted) return null;
-    const crews = await readCrews();
-    const named: Crew[] = [];
-    for (const threadId of ping.threadIds) {
-      const crew = crews.find((c) => c.threadId === threadId && c.parentThreadId === captainThreadId);
-      const marker = asRecord(await bb.storage.kv.get<unknown>(`${WAITING_TURN_PREFIX}${threadId}`));
-      if (crew === undefined || typeof marker["since"] !== "number" || queuedAt < marker["since"]) return null;
-      named.push(crew);
-    }
+    if (ping === null || !ping.allCompleted || ping.threadIds.length !== 1) return null;
+    const threadId = ping.threadIds[0]!;
+    const crew = (await readCrews()).find((c) => c.threadId === threadId && c.parentThreadId === captainThreadId);
+    const marker = asRecord(await bb.storage.kv.get<unknown>(`${WAITING_TURN_PREFIX}${threadId}`));
+    if (crew === undefined || typeof marker["since"] !== "number" || queuedAt < marker["since"] || typeof marker["output"] !== "string") return null;
+    // The ping must carry that WAITING turn's own output: BB's excerpt is the trimmed output, cut at 4,000 characters.
+    const body = /^\s*\[bb system\]\s*@thread:[A-Za-z0-9_-]+ completed[^:\n]*:\n\n([\s\S]*)$/.exec(text)?.[1];
+    const output = marker["output"];
+    const carried = body !== undefined && output !== "" && (output.length <= 3_900
+      ? body === output || body.startsWith(`${output}\n\n`)
+      : body.startsWith(output.slice(0, 3_900)));
+    if (!carried) return null;
+    const named: Crew[] = [crew];
     const ids = named.map((c) => c.id);
     const log = await bb.storage.kv.get<Array<{ at: number; captain: string; crews: string[] }>>(WAITING_PINGS_DROPPED_KEY) ?? [];
     await bb.storage.kv.set(WAITING_PINGS_DROPPED_KEY, [...log, { at: Date.now(), captain: captainThreadId, crews: ids }].slice(-200));
@@ -15337,15 +15346,16 @@ export default async function plugin(bb: BbPluginApi) {
     const { usedTokens, modelContextWindow, estimated } = usage;
     const nativeThreshold = usage.snapshot?.autoCompactAtTokens;
     const evidenceKey = `thread-compaction-evidence:${threadId}`;
-    // Only a measured reading below the trigger proves the context shrank; growth past it again may then qualify.
-    if (estimated === false && Number.isFinite(usedTokens) && usedTokens >= 0 && Number.isFinite(modelContextWindow) && modelContextWindow > 0 && usedTokens < compactTrigger(budget, ratio, modelContextWindow)) {
+    // Only a reading below the trigger proves the context shrank; until then an attempted compaction is not repeated,
+    // whatever newer snapshot or further growth is reported. Growth past the trigger after shrinking may qualify again.
+    if (Number.isFinite(usedTokens) && usedTokens >= 0 && Number.isFinite(modelContextWindow) && modelContextWindow > 0 && usedTokens < compactTrigger(budget, ratio, modelContextWindow)) {
       await bb.storage.kv.delete(evidenceKey);
     }
     const now = Date.now();
     const providerThreshold = typeof nativeThreshold === "number" ? nativeThreshold : null;
     if (!captainCompactDue({ usedTokens, modelContextWindow, estimated, budget, ratio, providerThreshold, lastCompactAt: typeof last === "number" ? last : null, now, cooldownMs: CAPTAIN_COMPACT_COOLDOWN_MS })) return;
     const evidence = JSON.stringify([usedTokens, modelContextWindow, usage.snapshot?.providerSessionId ?? null, usage.snapshot?.capturedAt ?? null]);
-    if (await bb.storage.kv.get(evidenceKey) === evidence) return;
+    if (await bb.storage.kv.get(evidenceKey) !== undefined) return;
     const thread = await raceAbort(bb.sdk.threads.get({ threadId }), signal, STUCK_HOST_CALL_MS);
     if (thread.status !== "idle" || thread.archivedAt != null) return;
     if (await inputWaits(threadId, signal)) return;
