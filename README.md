@@ -281,12 +281,8 @@ native re-rings for that record; ordinary tells retain native recovery behavior.
 
 ## Waiting crews and BB's completion pings
 
-BB pings the captain at the end of every crew turn. A ping for crews that only
-reported `WAITING:` is dropped before it wakes the captain when BB queued it after
-that WAITING turn ended and no later turn of the crew has ended. It is recorded in the
-plugin log and in `waiting-pings-dropped`; Firstmate resumes those crews itself.
-BB 0.46.1 lets a plugin see such a ping only when BB queued it (behind a pending
-question, or with the host offline). BB 0.46.2 adds per-crew
+BB pings the captain at the end of every crew turn. BB 0.46.1 sends that ping
+past plugin hooks unless it queued it, and Firstmate does not drop it. BB 0.46.2 adds per-crew
 `parentNotifications`: set `crewParentNotifications` to `stuck` after that
 upgrade, and BB pings only for failures, interruptions and questions. Firstmate's
 own wake then reports a finished turn and skips a WAITING one. The setting is

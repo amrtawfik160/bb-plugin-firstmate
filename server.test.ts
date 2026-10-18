@@ -32,7 +32,6 @@ import plugin, {
   watchRelayDedupKey,
   wakeAckFromOutput,
   captainCompactDue,
-  bbChildPingCrews,
   inboxWakeText,
   waitNoTurnsConfigScript,
   bbPingCarriesOutcome,
@@ -9478,48 +9477,6 @@ test("bbPingCarriesOutcome and doorbellSupersededByBbPing: a crew BB pings only 
   assert.equal(doorbellSupersededByBbPing({ ...ring, crewParentNotifications: "stuck" }), false, "no BB ping started that turn");
 });
 
-test("bbChildPingCrews reads only BB's own system header: each crew thread and whether every outcome completed", () => {
-  assert.deepEqual(bbChildPingCrews("[bb system]\n\n@thread:thr_a completed:\n\nWAITING: CI on #1850"), { threadIds: ["thr_a"], allCompleted: true });
-  assert.deepEqual(bbChildPingCrews("[bb system]\n\n@thread:thr_a failed.\n\nInspect it."), { threadIds: ["thr_a"], allCompleted: false });
-  assert.deepEqual(bbChildPingCrews("[bb system]\n\nChild thread updates:\n\n- @thread:thr_a completed.\n- @thread:thr_b completed."), { threadIds: ["thr_a", "thr_b"], allCompleted: true });
-  assert.deepEqual(bbChildPingCrews("[bb system]\n\nChild thread updates:\n\n- @thread:thr_a completed.\n- @thread:thr_b was interrupted."), { threadIds: ["thr_a", "thr_b"], allCompleted: false });
-  assert.equal(bbChildPingCrews("WAITING: @thread:thr_a completed"), null, "a crew's own words are not a BB ping");
-  assert.equal(bbChildPingCrews("[bb system]\n\n@thread:thr_a is now a child of this thread."), null);
-});
-
-// Owner, 18 Oct (Q11): 141 of 752 crew pings were WAITING reports; 158 of 206 such captain turns sent nothing.
-test("a queued BB completion ping from a crew recorded as WAITING is dropped before it wakes the captain, and recorded", async () => {
-  const host = ownerHost({ notifyOwner: "real" });
-  await host.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
-  await plugin(host.bb); stubProviderCatalog(host);
-  try {
-    stubRoutedHost(host, () => ({ code: 0 }));
-    captainAndCrewThreads(host);
-    host.harness.sdk.stub("threads.list", async () => []);
-    await seedCrew(host);
-    await host.harness.behavior.setSettings({ supervisionEnabled: true });
-    liveCrewQueue(host);
-    await emitIdle(host, "WAITING: CI on #1850");
-    const hook = host.harness.inspection.registrations.hooks["message.dispatch"]!;
-    const ping = (text: string, queuedMessages: unknown[] = [{ createdAt: Date.now() }]) => hook({
-      thread: makeThreadResponse({ id: "thr_cap", status: "idle" }),
-      attempt: "start-turn", initiator: "system", senderThreadId: null, queuedMessages,
-      input: { blocks: [], text },
-    } as never);
-    const waiting = await ping("[bb system]\n\n@thread:thr_crew completed:\n\nWAITING: CI on #1850");
-    assert.equal(waiting.action, "reject", "a waiting report does not wake the captain");
-    const dropped = await host.bb.storage.kv.get<Array<{ captain: string; crews: string[] }>>("waiting-pings-dropped");
-    assert.deepEqual(dropped?.map((row) => [row.captain, row.crews]), [["thr_cap", ["c1"]]]);
-    assert.equal((await ping("[bb system]\n\n@thread:thr_crew completed:\n\nWAITING: CI on #1850", [{ createdAt: Date.now() }, { createdAt: Date.now() }])).action, "proceed", "grouped with other input, the ping is kept");
-    assert.equal((await ping("[bb system]\n\n@thread:thr_crew completed:\n\nWAITING: CI on #1850", [{}])).action, "proceed", "a ping with no queue time cannot be tied to the WAITING turn");
-    assert.equal((await ping("[bb system]\n\n@thread:thr_crew failed.\n\nInspect it.")).action, "proceed", "a failure always wakes the captain");
-    await emitIdle(host, "DONE: #1850 green and merged");
-    assert.equal((await ping("[bb system]\n\n@thread:thr_crew completed:\n\nDONE: #1850 green and merged")).action, "proceed", "a finished crew's ping wakes the captain");
-  } finally {
-    await host.harness.lifecycle.dispose();
-  }
-});
-
 test("captain rate limit: read from provider events; a later successful turn clears it", () => {
   const blocked = { type: "provider/rateLimits/updated", createdAt: 1_000, data: { rateLimits: { status: "blocked", windows: [{ status: "blocked", resetsAtMs: 9_000 }, { status: "warning", resetsAtMs: 99_000 }] } } };
   const err = { type: "provider/error", createdAt: 1_001, data: { detail: "You've hit your session limit · resets 8:40pm (UTC)", errorInfo: { category: "rate-limit" } } };
@@ -12098,39 +12055,6 @@ test("check 158/2: no compaction while owner input waits: a queued owner message
   }
 });
 
-test("check 158/3: a result queued before the crew's WAITING turn still wakes the captain", async () => {
-  const host = ownerHost({ notifyOwner: "real" });
-  await host.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
-  await plugin(host.bb); stubProviderCatalog(host);
-  try {
-    stubRoutedHost(host, () => ({ code: 0 })); captainAndCrewThreads(host);
-    host.harness.sdk.stub("threads.list", async () => []); await seedCrew(host);
-    await host.harness.behavior.setSettings({ supervisionEnabled: true }); liveCrewQueue(host);
-    const queuedAt = Date.now() - 60_000;
-    await emitIdle(host, "WAITING: CI");
-    const hook = host.harness.inspection.registrations.hooks["message.dispatch"]!;
-    const result = await hook({ thread: makeThreadResponse({ id: "thr_cap", status: "idle" }), attempt: "start-turn", initiator: "system", senderThreadId: null, queuedMessages: [{ createdAt: queuedAt }], input: { blocks: [], text: "[bb system]\n\n@thread:thr_crew completed:\n\nDONE: verified result from an earlier queued completion" } } as never);
-    assert.equal(result.action, "proceed", "the ping was queued before the WAITING turn ended, so it reports an earlier turn");
-  } finally { await host.harness.lifecycle.dispose(); }
-});
-
-test("check 158/4: a real-transport crew's queued WAITING ping is dropped too", async () => {
-  const host = ownerHost({ notifyOwner: "real", transport: "real" });
-  await host.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
-  await plugin(host.bb); stubProviderCatalog(host);
-  try {
-    stubRoutedHost(host, () => ({ code: 0 })); captainAndCrewThreads(host);
-    host.harness.sdk.stub("threads.list", async () => []); await seedCrew(host);
-    await host.harness.behavior.setSettings({ supervisionEnabled: true }); liveCrewQueue(host);
-    await emitIdle(host, "WAITING: CI");
-    const hook = host.harness.inspection.registrations.hooks["message.dispatch"]!;
-    const ping = (text: string) => hook({ thread: makeThreadResponse({ id: "thr_cap", status: "idle" }), attempt: "start-turn", initiator: "system", senderThreadId: null, queuedMessages: [{ createdAt: Date.now() }], input: { blocks: [], text } } as never);
-    assert.equal((await ping("[bb system]\n\n@thread:thr_crew completed:\n\nWAITING: CI")).action, "reject", "the WAITING turn's own ping");
-    await emitIdle(host, "DONE: merged");
-    assert.equal((await ping("[bb system]\n\n@thread:thr_crew completed:\n\nDONE: merged")).action, "proceed", "a later outcome clears the marker");
-  } finally { await host.harness.lifecycle.dispose(); }
-});
-
 test("check 158/5: when queued texts outgrow the wake, one inbox pointer replaces the inline wake", { skip: !FM_INTEGRATION }, async () => {
   const home = scratchFmHome(); const host = itHost(home, { tellOwner: "real" });
   await plugin(host.bb); stubProviderCatalog(host);
@@ -12198,23 +12122,6 @@ test("check 158/7: a newer snapshot of unchanged context, or more growth, does n
     usage = { ...usage, usedTokens: 240000 };
     await idle();
     assert.equal(host.harness.sdk.callsTo("threads.compact").length, 2, "shrank, then grew past the trigger again");
-  } finally { await host.harness.lifecycle.dispose(); }
-});
-
-test("check 158/8: a ping is dropped only when it carries the WAITING turn's own output", async () => {
-  const host = ownerHost({ notifyOwner: "real" });
-  await host.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
-  await plugin(host.bb); stubProviderCatalog(host);
-  try {
-    stubRoutedHost(host, () => ({ code: 0 })); captainAndCrewThreads(host);
-    host.harness.sdk.stub("threads.list", async () => []); await seedCrew(host);
-    await host.harness.behavior.setSettings({ supervisionEnabled: true }); liveCrewQueue(host);
-    await emitIdle(host, "WAITING: CI");
-    const hook = host.harness.inspection.registrations.hooks["message.dispatch"]!;
-    const ping = (text: string) => hook({ thread: makeThreadResponse({ id: "thr_cap", status: "idle" }), attempt: "start-turn", initiator: "system", senderThreadId: null, queuedMessages: [{ createdAt: Date.now() + 1 }], input: { blocks: [], text } } as never);
-    assert.equal((await ping("[bb system]\n\n@thread:thr_crew completed:\n\nDONE: real result captured before a later WAITING turn")).action, "proceed", "an earlier turn's result queued late");
-    assert.equal((await ping("[bb system]\n\nChild thread updates:\n\n- @thread:thr_crew completed.")).action, "proceed", "a batch carries no output to prove the turn");
-    assert.equal((await ping("[bb system]\n\n@thread:thr_crew completed:\n\nWAITING: CI")).action, "reject", "the WAITING turn's own output");
   } finally { await host.harness.lifecycle.dispose(); }
 });
 

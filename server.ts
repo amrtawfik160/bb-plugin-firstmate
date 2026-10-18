@@ -970,22 +970,6 @@ export function rewriteWakeAckLine(out: string): string {
 // reach this hook: core delivers them through its parent-system-message path,
 // which skips message.dispatch. notifyCaptainOnce handles that overlap instead.
 const CREW_PING_RE = /^\s*(?:\[bb system\]\s*)?@thread:[A-Za-z0-9_-]+ (?:completed|failed|was interrupted|interrupted|needs attention)\b/i;
-/**
- * The crews a BB child-outcome ping names, read only from BB's own template header (never from the crew's
- * output that follows it): one `@thread:<id> completed:` head, or a "Child thread updates:" list. Null for
- * anything else. `allCompleted` is false once any outcome failed or was interrupted.
- */
-export function bbChildPingCrews(text: string): { threadIds: string[]; allCompleted: boolean } | null {
-  const body = text.replace(/^\s*\[bb system\]\s*/, "");
-  if (body.length === text.length) return null;
-  const single = /^@thread:([A-Za-z0-9_-]+) (completed|failed|was interrupted)\b/.exec(body);
-  if (single) return { threadIds: [single[1]!], allCompleted: single[2] === "completed" };
-  if (!body.startsWith("Child thread updates:")) return null;
-  const lines = [...body.matchAll(/^- @thread:([A-Za-z0-9_-]+) (.+)$/gm)];
-  if (lines.length === 0) return null;
-  return { threadIds: lines.map((m) => m[1]!), allCompleted: lines.every((m) => m[2]!.startsWith("completed")) };
-}
-
 export function crewPingHoldDecision(input: {
   attempt: string;
   initiator: string;
@@ -15098,54 +15082,6 @@ export default async function plugin(bb: BbPluginApi) {
     if (answered > 0) await refreshOwnerBoard();
   }
 
-  /**
-   * BB's completion ping is dropped before it wakes the captain when it reports only crew turns that ended with the
-   * crew contract's WAITING outcome: Firstmate resumes those crews itself. The ping is tied to that turn by time:
-   * BB queued it at or after the WAITING turn ended, and no later turn of the crew has ended since (its marker is
-   * still there). A ping with no queue time, or queued before that turn ended, is delivered. Only BB's template
-   * header is read, and only a queued ping reaches this hook (BB 0.46.1 delivers one to an idle or running captain
-   * directly). Each drop is logged and kept in `waiting-pings-dropped`; the rejected row is then removed.
-   */
-  const WAITING_PINGS_DROPPED_KEY = "waiting-pings-dropped";
-  const WAITING_TURN_PREFIX = "crew-waiting-turn:";
-  /** Records when a crew turn ended with WAITING, for either transport; any other turn end clears it. */
-  async function noteCrewTurnEnd(crew: Crew, lastAssistantText: string | null): Promise<void> {
-    if (isWaitingYield(lastAssistantText)) await bb.storage.kv.set(`${WAITING_TURN_PREFIX}${crew.threadId}`, { since: Date.now(), output: (lastAssistantText ?? "").trim() });
-    else await bb.storage.kv.delete(`${WAITING_TURN_PREFIX}${crew.threadId}`);
-  }
-  async function dropWaitingPing(captainThreadId: string, text: string, queuedAt: unknown): Promise<{ action: "reject"; message: string } | null> {
-    if (typeof queuedAt !== "number" || !Number.isFinite(queuedAt)) return null;
-    const ping = bbChildPingCrews(text);
-    if (ping === null || !ping.allCompleted || ping.threadIds.length !== 1) return null;
-    const threadId = ping.threadIds[0]!;
-    const crew = (await readCrews()).find((c) => c.threadId === threadId && c.parentThreadId === captainThreadId);
-    const marker = asRecord(await bb.storage.kv.get<unknown>(`${WAITING_TURN_PREFIX}${threadId}`));
-    if (crew === undefined || typeof marker["since"] !== "number" || queuedAt < marker["since"] || typeof marker["output"] !== "string") return null;
-    // The ping must carry that WAITING turn's own output: BB's excerpt is the trimmed output, cut at 4,000 characters.
-    const body = /^\s*\[bb system\]\s*@thread:[A-Za-z0-9_-]+ completed[^:\n]*:\n\n([\s\S]*)$/.exec(text)?.[1];
-    const output = marker["output"];
-    const carried = body !== undefined && output !== "" && (output.length <= 3_900
-      ? body === output || body.startsWith(`${output}\n\n`)
-      : body.startsWith(output.slice(0, 3_900)));
-    if (!carried) return null;
-    const named: Crew[] = [crew];
-    const ids = named.map((c) => c.id);
-    const log = await bb.storage.kv.get<Array<{ at: number; captain: string; crews: string[] }>>(WAITING_PINGS_DROPPED_KEY) ?? [];
-    await bb.storage.kv.set(WAITING_PINGS_DROPPED_KEY, [...log, { at: Date.now(), captain: captainThreadId, crews: ids }].slice(-200));
-    bb.log.info(`dropped BB's completion ping to captain ${captainThreadId}: crew(s) ${ids.join(", ")} only reported WAITING; Firstmate resumes them`);
-    setTimeout(() => { void dropRejectedCaptainRow(captainThreadId, text).catch(() => {}); }, 5_000).unref?.();
-    return { action: "reject", message: `Firstmate: crew ${ids.join(", ")} only reported WAITING; Firstmate resumes it, so this ping did not wake the captain.` };
-  }
-  async function dropRejectedCaptainRow(captainThreadId: string, text: string): Promise<void> {
-    const rows = await bb.sdk.threads.queuedMessages.list({ threadId: captainThreadId });
-    for (const row of rows) {
-      const failed = typeof row.failureReason === "string" && row.failureReason !== "";
-      if (failed && row.content.length === 1 && row.content[0]?.type === "text" && row.content[0].text === text) {
-        await bb.sdk.threads.queuedMessages.delete({ threadId: captainThreadId, queuedMessageId: row.id });
-      }
-    }
-  }
-
   // Threaded replies off, or no sender: an ack does not apply, and asking again on every dispatch would only repeat the RPC.
   const ackNotApplicable = new Set<string>();
   try {
@@ -15169,10 +15105,6 @@ export default async function plugin(bb: BbPluginApi) {
             }
           }
           return { action: "proceed" };
-        }
-        if (String(context.initiator) === "system" && (context.queuedMessages ?? []).length === 1) {
-          const dropped = await dropWaitingPing(threadId, context.input.text, asRecord(context.queuedMessages![0])["createdAt"]);
-          if (dropped) return dropped;
         }
         const sender = typeof context.senderThreadId === "string" && context.senderThreadId !== "mixed" ? context.senderThreadId : null;
         const senderIsCrew = sender !== null && (await readCrews()).some((c) => c.threadId === sender);
@@ -15441,7 +15373,6 @@ export default async function plugin(bb: BbPluginApi) {
     if (verdictOf(parseOutcome(lastAssistantText)) !== "DONE") {
       await maybeCompactCrew(thread.id).catch((error) => bb.log.warn(`crew compaction check failed ${thread.id}: ${String(error)}`));
     }
-    await noteCrewTurnEnd(crew, lastAssistantText);
     liveTerminalHandled.add(thread.id);
     await handleCrewIdle(crew, thread, lastAssistantText);
     if (crew.parentThreadId) await drainQueuedDispatches(crew.parentThreadId).catch((error) => bb.log.warn(`queued dispatch drain: ${String(error)}`));
@@ -15449,7 +15380,6 @@ export default async function plugin(bb: BbPluginApi) {
   bb.events.on("thread.failed", async ({ thread, error }) => {
     const crew = await findCrewByThread(thread.id);
     if (crew === undefined || isSecondmateRoute(crew)) return;
-    await noteCrewTurnEnd(crew, null);
     liveTerminalHandled.add(thread.id);
     if (await restartUnexpectedExit(crew, error).catch((failure) => { bb.log.warn(`crew ${crew.id} restart: ${String(failure)}`); return false; })) { inboundLedger.crewEnded(crew.id, Date.now()); return; }
     await handleCrewFailed(crew, error);

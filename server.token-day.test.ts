@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { bbChildPingCrews, bbPingCarriesOutcome, captainCompactDue, inboxWakeText, waitNoTurnsFor } from "./server.ts";
+import { bbPingCarriesOutcome, captainCompactDue, inboxWakeText, waitNoTurnsFor } from "./server.ts";
 
 /**
  * Replay of one realistic day of the Hanoon captain (token report, 17-18 Oct 2026), before and after each token cut
@@ -65,19 +65,18 @@ type Cuts = {
   freeTextOnTurnStart: boolean; // item 2, Firstmate side
   typedTurnNoReminder: boolean; // item 2, connector side
   parentNotifications: "auto" | "stuck"; // item 3
-  dropQueuedWaitingPings: boolean; // item 3
   wakeBatchMs: number; // item 4
   inboxInWake: boolean; // item 5
   waitNoTurnsCrews: string; // item 6
 };
 
-const BEFORE: Cuts = { freeTextOnTurnStart: false, typedTurnNoReminder: false, parentNotifications: "auto", dropQueuedWaitingPings: false, wakeBatchMs: 1_500, inboxInWake: false, waitNoTurnsCrews: "" };
+const BEFORE: Cuts = { freeTextOnTurnStart: false, typedTurnNoReminder: false, parentNotifications: "auto", wakeBatchMs: 1_500, inboxInWake: false, waitNoTurnsCrews: "" };
 
 /**
  * One captain: an event that reaches it while idle starts a turn; one that reaches it mid-turn joins that turn.
  * A turn ends with a free text with probability 0.35 and sends a typed message (reply, card, alert) with 0.2.
  */
-function captainTurns(events: Event[], cuts: Cuts, seed = 7): { turns: number; reminderTurns: number; pingTurns: number; droppedPings: number } {
+function captainTurns(events: Event[], cuts: Cuts, seed = 7): { turns: number; reminderTurns: number; pingTurns: number } {
   const random = rng(seed);
   const waiting = new Set<string>();
   // What reaches the captain, and when.
@@ -104,7 +103,7 @@ function captainTurns(events: Event[], cuts: Cuts, seed = 7): { turns: number; r
     wakes.push(due);
   }
   const queue = [...arrivals.filter((a) => a.kind !== "routine"), ...wakes.map((at) => ({ at, kind: "routine" as const }))].sort((a, b) => a.at - b.at);
-  let turns = 0, reminderTurns = 0, pingTurns = 0, droppedPings = 0;
+  let turns = 0, reminderTurns = 0, pingTurns = 0;
   let busyUntil = -1;
   // A turn ended at `end`: before this change its free text made Firstmate start a reminder turn 1 s later.
   const settle = (until: number): void => {
@@ -121,18 +120,12 @@ function captainTurns(events: Event[], cuts: Cuts, seed = 7): { turns: number; r
   };
   for (const arrival of queue) {
     settle(arrival.at);
-    if (arrival.kind === "ping") {
-      const ping = bbChildPingCrews(`[bb system]\n\n@thread:${arrival.crew} ${arrival.outcome === "FAILED" ? "failed." : "completed:\n\n" + arrival.outcome}`);
-      // BB 0.46.1 queues a ping only behind a pending interaction (modelled as 2% of pings); only those reach the hook.
-      const queued = random() < 0.02;
-      if (cuts.dropQueuedWaitingPings && queued && ping?.allCompleted && ping.threadIds.every((id) => waiting.has(id!))) { droppedPings += 1; continue; }
-    }
     if (busyUntil >= arrival.at) continue; // joins the running turn
     turns += 1; busyUntil = arrival.at + TURN_MS;
     if (arrival.kind === "ping") pingTurns += 1;
   }
   settle(Number.MAX_SAFE_INTEGER);
-  return { turns, reminderTurns, pingTurns, droppedPings };
+  return { turns, reminderTurns, pingTurns };
 }
 
 /** Model calls a crew spends on Firstmate's tells: the woken turn, plus the inbox read and its acknowledgement when the text is not in the wake. */
@@ -179,15 +172,12 @@ function captainContextTokens(turns: number, budget: number, ratio: number, befo
 
 test("token day replay: each cut lowers captain turns or crew calls, measured on one realistic day", (t) => {
   const events = day();
-  const AFTER: Cuts = { freeTextOnTurnStart: false, typedTurnNoReminder: false, parentNotifications: "auto", dropQueuedWaitingPings: true, wakeBatchMs: 5_000, inboxInWake: true, waitNoTurnsCrews: "crew3" };
+  const AFTER: Cuts = { freeTextOnTurnStart: false, typedTurnNoReminder: false, parentNotifications: "auto", wakeBatchMs: 5_000, inboxInWake: true, waitNoTurnsCrews: "crew3" };
   const base = captainTurns(events, BEFORE);
   const rows: Array<[string, number, number, string]> = [];
   const step = (label: string, cuts: Cuts) => captainTurns(events, cuts);
 
   // Free-text reminders (Q10) are owned by another change; this replay leaves them as they are.
-  const wp = step("item 3 (drop)", { ...BEFORE, dropQueuedWaitingPings: true });
-  rows.push(["captain turns: drop a queued WAITING ping (item 3, BB 0.46.1)", base.turns, wp.turns, "turns per day"]);
-  assert.ok(wp.turns <= base.turns);
   const stuck = step("item 3 (stuck)", { ...BEFORE, parentNotifications: "stuck" });
   rows.push(["captain turns: crews spawned with parentNotifications=stuck (item 3, BB 0.46.2, off by default)", base.turns, stuck.turns, "turns per day"]);
   assert.ok(stuck.pingTurns < base.pingTurns, "no BB ping for a finished or WAITING turn");
@@ -198,7 +188,7 @@ test("token day replay: each cut lowers captain turns or crew calls, measured on
   assert.ok(batch.turns <= base.turns);
 
   const all = captainTurns(events, AFTER);
-  rows.push(["captain turns: items 3-4 together (stuck stays off)", base.turns, all.turns, "turns per day"]);
+  rows.push(["captain turns: item 4 (stuck stays off)", base.turns, all.turns, "turns per day"]);
   assert.ok(all.turns < base.turns);
 
   const tellBefore = crewTellCalls(events, BEFORE), tellAfter = crewTellCalls(events, AFTER);
@@ -213,7 +203,7 @@ test("token day replay: each cut lowers captain turns or crew calls, measured on
   const ctxBefore = captainContextTokens(base.turns, 200_000, 0.6, true);
   const ctxAfter = captainContextTokens(all.turns, 200_000, 0.9, false);
   rows.push(["captain compactions (item 1)", ctxBefore.compactions, ctxAfter.compactions, "per day"]);
-  rows.push(["captain context tokens reread (item 1, with items 3-4)", Math.round(ctxBefore.tokens / 1e6), Math.round(ctxAfter.tokens / 1e6), "million tokens per day"]);
+  rows.push(["captain context tokens reread (item 1, with item 4)", Math.round(ctxBefore.tokens / 1e6), Math.round(ctxAfter.tokens / 1e6), "million tokens per day"]);
   assert.ok(ctxAfter.tokens < ctxBefore.tokens * 0.6, `${ctxBefore.tokens} -> ${ctxAfter.tokens}`);
 
   for (const [label, before, after, unit] of rows) t.diagnostic(`${label}: ${before} -> ${after} ${unit}`);
