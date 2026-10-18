@@ -277,3 +277,19 @@ test('a cancelled card records no proof after a Telegram outage either',async()=
   assert.equal(store.get(key(WOO,130)).verifiedCommitSha,null);
  }finally{delete process.env.FM_PROOF_RECHECK_MS;await host.harness.lifecycle.dispose();}
 });
+
+// Checker round 4: ownerAnswer is already running when the captain cancels the card; it then returns Works.
+test('a card cancelled while its tap read is in flight records no proof',async()=>{
+ const {host,store,rpc}=await deck();try {
+  const asked=text(await deliveries(host,{action:'device-proof',id:key(WOO,130),commitSha:head(130).slice(0,7),build:'8',link:'https://testflight.apple.com/join/abc',check:'Send a photo'},'thr_woo'));
+  const askId=/card (a[0-9a-z]{6})/.exec(asked)[1];
+  let release;const paused=new Promise(r=>{release=r;});let reading;const started=new Promise(r=>{reading=r;});
+  host.harness.sdk.stub('plugins.callRpc',async(call)=>{rpc.push(call);if(call.method==='ownerAnswer'){reading();await paused;return{answer:'Works'};}return{ok:true,queued:1,duplicate:false};});
+  const answered=host.harness.behavior.callRpc('resolveAsk',{threadId:'thr_cap',id:askId,resolution:'Works'});
+  await started;
+  await tool(host,'firstmate_resolve_ask').execute({id:askId,resolution:'Build replaced',cancelled:true},ctx);
+  release();
+  await answered;
+  assert.equal(store.get(key(WOO,130)).verifiedCommitSha,null,'the cancel won: no proof');
+ }finally{await host.harness.lifecycle.dispose();}
+});
