@@ -36,7 +36,7 @@ export const rpcContract = defineRpcContract({
     output: z.object({ ok: z.boolean(), deferred: z.array(z.string()), already: z.array(z.string()), refused: z.array(z.string()), until: z.number().nullable() }),
   },
   telegramCommand: {
-    experimental_description: "Answer a Telegram owner command (/inbox, /workers, the board, the digest, or the tasks) for one captain thread as plain text. tasks returns, in `tasks`, every open owner task and each one that changed since `since` (default now), with the BB project id of its crews (projectId: the connector's topic for the task comes from it), its starting and running crews, what it waits on and the owner's Telegram refs, for the connector's task status lines and /tasks. The board has four sections: Needs you, Finished since you last looked (live or dropped only), Not live yet (merged work production does not run yet), In progress. board and digest also return notLive: each merged task that is not live yet, with its age since it merged (ms), its next step, who takes it, and why its project's live check is missing (null when the check reads production), for the connector's Not live yet section. since (ms) is when the owner last looked: board defaults to 24 h ago, digest to 12 h ago. The digest text is empty when there is nothing to report. For board, away is the captain's /afk posture, and projects counts the crews working on each project, for the pinned board of each Telegram project topic.",
+    experimental_description: "Answer a Telegram owner command (/inbox, /workers, the board, the digest, or the tasks) for one captain thread as plain text. tasks returns, in `tasks`, every open owner task and each one that changed since `since` (default now), with the BB project id of its crews (projectId: the connector's topic for the task comes from it), its starting and running crews, what it waits on and the owner's Telegram refs, for the connector's task status lines and /tasks. The board has four sections: Needs you, Finished since you last looked (live or dropped only), Not live yet (merged work production does not run yet), In progress. board and digest also return notLive: each merged task that is not live yet, with its age since it merged (ms), its next step, who takes it, and why its project's live check is missing (null when the check reads production), for the connector's Not live yet section. since (ms) is when the owner last looked: board defaults to 24 h ago, digest to 12 h ago. The digest text is empty when there is nothing to report. For board, away is the captain's /afk posture, projects counts the crews working on each project, for the pinned board of each Telegram project topic, and promises (absent when there is none) lists each dated promise to the owner still open (due: the captain was woken), also shown in the board text under Promised.",
     input: z.object({
       command: z.enum(["inbox", "workers", "board", "digest", "tasks"]),
       threadId: z.string().min(1),
@@ -54,6 +54,9 @@ export const rpcContract = defineRpcContract({
         crews: z.number().int().nonnegative(), waitsOn: z.string().nullable(), refs: z.array(z.string()),
         projectId: z.string().nullable(),
         createdAt: z.number(), updatedAt: z.number(),
+      })).optional(),
+      promises: z.array(z.object({
+        id: z.string(), by: z.number(), what: z.string(), task: z.string().nullable(), ref: z.string().nullable(), state: z.enum(["open", "due"]),
       })).optional(),
     }),
   },

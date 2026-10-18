@@ -53,7 +53,7 @@ const ledgerRow = (host: Host, messageId: string) =>
   createInboundLedger(host.bb.storage.database()).get({ source: "telegram", chatId: "200", messageId });
 
 const reply = (host: Host, captain: string, ref: string) =>
-  tool(host, "firstmate_reply").execute({ ref, text: "Rolled back." }, { threadId: captain, projectId: "proj_1" } as never);
+  tool(host, "firstmate_reply").execute({ noWork: true, ref, text: "Rolled back." }, { threadId: captain, projectId: "proj_1" } as never);
 
 test("firstmate_reply keeps the item open when telegram.reply queues nothing", async () => {
   const host = await load();
@@ -206,7 +206,7 @@ test("captain idles repeat an unanswered-item reminder only after backoff", asyn
   }
 });
 
-test("live repro: no reminder for an owner message the connector already answered with the captain's turn text", async () => {
+test("live repro: no unanswered reminder for an owner message the connector already answered with the captain's turn text; it stays open only for its task link (owner decision Q7)", async () => {
   const host = await captainHost();
   try {
     host.harness.sdk.stub("threads.send", async () => ({}));
@@ -228,7 +228,9 @@ test("live repro: no reminder for an owner message the connector already answere
     assert.deepEqual(asked, [{ chatId: "200", messageIds: ["1926", "1927"] }]);
     assert.equal(reminders.length, 1, reminders.join("\n"));
     assert.match(reminders[0]!, /1927/);
-    assert.equal(ledgerRow(host, "1926")?.state, "answered");
+    // The answer reached the owner, but 1926 has no task and no "no work": it waits only for that link.
+    assert.notEqual(ledgerRow(host, "1926")?.state, "answered");
+    assert.ok(ledgerRow(host, "1926")?.repliedAt);
     assert.equal(ledgerRow(host, "1927")?.state, "received");
   } finally {
     await host.harness.lifecycle.dispose();
@@ -637,7 +639,7 @@ test("firstmate_reply answers one message with several questions as one quoted r
     host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
     const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
     const send = (quote: string, more?: boolean) =>
-      tool(host, "firstmate_reply").execute({ ref: "tg:200:1669", text: `About: ${quote}`, quote, ...(more === undefined ? {} : { more }) }, ctx);
+      tool(host, "firstmate_reply").execute({ noWork: true, ref: "tg:200:1669", text: `About: ${quote}`, quote, ...(more === undefined ? {} : { more }) }, ctx);
     const first = await send("Is the deploy done?", true);
     assert.ok(!isError(first), text(first));
     assert.equal(ledgerRow(host, "1669")?.state, "received", "more=true keeps the message open");
@@ -681,7 +683,7 @@ test("firstmate_reply covers: one Telegram reply answers several owner messages 
     createInboundLedger(host.bb.storage.database()).markDelegated({ source: "telegram", chatId: "200", messageId: "1671" }, "thr_crew", 3_500);
     host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
     const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
-    const result = await tool(host, "firstmate_reply").execute({ ref: "tg:200:1669", text: "Research started with all your filters.", covers: ["tg:200:1670", "tg:200:1671"] }, ctx);
+    const result = await tool(host, "firstmate_reply").execute({ noWork: true, ref: "tg:200:1669", text: "Research started with all your filters.", covers: ["tg:200:1670", "tg:200:1671"] }, ctx);
     assert.ok(!isError(result), text(result));
     assert.equal(host.harness.sdk.callsTo("plugins.callRpc").length, 1, "one Telegram reply");
     assert.equal((host.harness.sdk.callsTo("plugins.callRpc")[0]![0] as { input: { messageId: string } }).input.messageId, "1669");
@@ -712,7 +714,7 @@ test("firstmate_reply covers: refuses a covered ref that is not open, another ca
     createInboundLedger(host.bb.storage.database()).markAnswered({ source: "telegram", chatId: "200", messageId: "1671" }, 3_500);
     host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
     const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
-    const send = (ref: string, covers: string[]) => tool(host, "firstmate_reply").execute({ ref, text: "Started.", covers }, ctx);
+    const send = (ref: string, covers: string[]) => tool(host, "firstmate_reply").execute({ noWork: true, ref, text: "Started.", covers }, ctx);
     for (const [ref, bad] of [
       ["tg:200:1669", "tg:200:1671"],
       ["tg:200:1669", "tg:200:1672"],
@@ -740,7 +742,7 @@ test("firstmate_reply covers: a reply that is not delivered leaves the covered i
     recordTelegram(host, "thr_cap", "1669", 1_000);
     recordTelegram(host, "thr_cap", "1670", 2_000);
     host.harness.sdk.stub("plugins.callRpc", async () => { throw new Error("Telegram API unavailable"); });
-    const refused = await tool(host, "firstmate_reply").execute({ ref: "tg:200:1669", text: "Started.", covers: ["tg:200:1670"] }, { threadId: "thr_cap", projectId: "proj_1" } as never);
+    const refused = await tool(host, "firstmate_reply").execute({ noWork: true, ref: "tg:200:1669", text: "Started.", covers: ["tg:200:1670"] }, { threadId: "thr_cap", projectId: "proj_1" } as never);
     assert.ok(isError(refused), text(refused));
     assert.equal(ledgerRow(host, "1670")?.state, "received");
   } finally {
@@ -763,7 +765,7 @@ for (const [name, threading, stub] of [
       createInboundLedger(host.bb.storage.database()).markDelegated({ source: "telegram", chatId: "200", messageId: "1671" }, "thr_crew", 3_500);
       host.harness.sdk.stub("plugins.callRpc", stub ?? (async () => ({ queued: 1, duplicate: false, mode: "on" })));
       const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
-      const args = { ref: "tg:200:1669", text: "Research started with all your filters.", covers: ["tg:200:1670", "tg:200:1671"] };
+      const args = { noWork: true, ref: "tg:200:1669", text: "Research started with all your filters.", covers: ["tg:200:1670", "tg:200:1671"] };
       const result = await tool(host, "firstmate_reply").execute(args, ctx);
       assert.ok(isError(result), text(result));
       assert.match(text(result), /not delivered/);
@@ -795,7 +797,7 @@ test("firstmate_reply covers: repeating a successful call with the same covers r
     recordTelegram(host, "thr_cap", "1671", 3_000);
     host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
     const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
-    const args = { ref: "tg:200:1669", text: "Research started with all your filters.", covers: ["tg:200:1670", "tg:200:1671"] };
+    const args = { noWork: true, ref: "tg:200:1669", text: "Research started with all your filters.", covers: ["tg:200:1670", "tg:200:1671"] };
     assert.ok(!isError(await tool(host, "firstmate_reply").execute(args, ctx)));
     const before = ["1669", "1670", "1671"].map((id) => ledgerRow(host, id));
     const repeat = await tool(host, "firstmate_reply").execute(args, ctx);
@@ -819,11 +821,11 @@ test("firstmate_reply covers: a different reply to the same message refuses cove
     recordTelegram(host, "thr_cap", "1671", 3_000);
     host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
     const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
-    const args = { ref: "tg:200:1669", text: "All filters are included in the research.", covers: ["tg:200:1670", "tg:200:1671"] };
-    const first = await tool(host, "firstmate_reply").execute({ ...args, more: true }, ctx);
+    const args = { noWork: true, ref: "tg:200:1669", text: "All filters are included in the research.", covers: ["tg:200:1670", "tg:200:1671"] };
+    const first = await tool(host, "firstmate_reply").execute({ noWork: true, ...args, more: true }, ctx);
     assert.ok(!isError(first), text(first));
     assert.equal(ledgerRow(host, "1669")?.state, "received");
-    const quoted = await tool(host, "firstmate_reply").execute({ ...args, quote: "Status?" }, ctx);
+    const quoted = await tool(host, "firstmate_reply").execute({ noWork: true, ...args, quote: "Status?" }, ctx);
     assert.ok(isError(quoted), text(quoted));
     assert.match(text(quoted), /covers refused/);
     assert.match(text(quoted), /tg:200:1670 is not open/);
@@ -846,7 +848,7 @@ test("firstmate_reply covers: a ledger write failure after the send leaves every
     createInboundLedger(host.bb.storage.database()).markDelegated({ source: "telegram", chatId: "200", messageId: "1671" }, "thr_crew", 3_500);
     host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
     const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
-    const args = { ref: "tg:200:1669", text: "All filters are included in the research.", covers: ["tg:200:1670", "tg:200:1671", "tg:200:1672"] };
+    const args = { noWork: true, ref: "tg:200:1669", text: "All filters are included in the research.", covers: ["tg:200:1670", "tg:200:1671", "tg:200:1672"] };
     const db = host.bb.storage.database();
     db.exec("CREATE TRIGGER fail_cover BEFORE UPDATE ON inbound_ledger WHEN NEW.message_id='1671' AND NEW.state='answered' BEGIN SELECT RAISE(ABORT, 'simulated cover write failure'); END;");
     const faulted = await tool(host, "firstmate_reply").execute(args, ctx);
@@ -876,7 +878,7 @@ test("firstmate_reply covers: an exact repeat while the first send is still runn
     let deliver: (value: unknown) => void = () => {};
     host.harness.sdk.stub("plugins.callRpc", () => new Promise((resolve) => { deliver = resolve; }));
     const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
-    const args = { ref: "tg:200:1669", text: "All filters are included in the research.", covers: ["tg:200:1670"] };
+    const args = { noWork: true, ref: "tg:200:1669", text: "All filters are included in the research.", covers: ["tg:200:1670"] };
     const first = tool(host, "firstmate_reply").execute(args, ctx);
     await new Promise((resolve) => setTimeout(resolve, 10));
     const repeat = await tool(host, "firstmate_reply").execute(args, ctx);
@@ -906,12 +908,12 @@ test("firstmate_reply covers: an exact repeat closes only the covers the deliver
     recordTelegram(host, "thr_cap", "1671", 3_000);
     host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
     const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
-    const args = { ref: "tg:200:1669", text: "All filters are included in the research.", covers: ["tg:200:1670"] };
+    const args = { noWork: true, ref: "tg:200:1669", text: "All filters are included in the research.", covers: ["tg:200:1670"] };
     const db = host.bb.storage.database();
     db.exec("CREATE TRIGGER fail_cover BEFORE UPDATE ON inbound_ledger WHEN NEW.message_id='1670' AND NEW.state='answered' BEGIN SELECT RAISE(ABORT, 'simulated cover write failure'); END;");
     assert.ok(isError(await tool(host, "firstmate_reply").execute(args, ctx)));
     db.exec("DROP TRIGGER fail_cover;");
-    const extra = await tool(host, "firstmate_reply").execute({ ...args, covers: ["tg:200:1670", "tg:200:1671"] }, ctx);
+    const extra = await tool(host, "firstmate_reply").execute({ noWork: true, ...args, covers: ["tg:200:1670", "tg:200:1671"] }, ctx);
     assert.ok(isError(extra), text(extra));
     assert.match(text(extra), /covers refused/);
     assert.match(text(extra), /tg:200:1671/);
@@ -919,7 +921,7 @@ test("firstmate_reply covers: an exact repeat closes only the covers the deliver
     const exact = await tool(host, "firstmate_reply").execute(args, ctx);
     assert.ok(!isError(exact), text(exact));
     assert.deepEqual(["1669", "1670", "1671"].map((id) => ledgerRow(host, id)?.state), ["answered", "answered", "received"]);
-    const after = await tool(host, "firstmate_reply").execute({ ...args, covers: ["tg:200:1671"] }, ctx);
+    const after = await tool(host, "firstmate_reply").execute({ noWork: true, ...args, covers: ["tg:200:1671"] }, ctx);
     assert.ok(isError(after), text(after));
     assert.equal(ledgerRow(host, "1671")?.state, "received");
     assert.equal(host.harness.sdk.callsTo("plugins.callRpc").length, 1, "no repeat sends again");
@@ -941,7 +943,7 @@ test("firstmate_reply covers: a different text with a quote whose reply was not 
     createInboundLedger(host.bb.storage.database()).markDelegated({ source: "telegram", chatId: "200", messageId: "1671" }, "thr_crew", 3_500);
     host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
     const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
-    const args = { ref: "tg:200:1669", text: "All filters are included in the research.", quote: "Status?", covers: ["tg:200:1670", "tg:200:1671", "tg:200:1672"] };
+    const args = { noWork: true, ref: "tg:200:1669", text: "All filters are included in the research.", quote: "Status?", covers: ["tg:200:1670", "tg:200:1671", "tg:200:1672"] };
     const db = host.bb.storage.database();
     db.exec("CREATE TRIGGER fail_delivery BEFORE UPDATE ON inbound_outbox BEGIN SELECT RAISE(ABORT, 'simulated delivery record failure'); END;");
     assert.ok(isError(await tool(host, "firstmate_reply").execute(args, ctx)));
@@ -973,9 +975,9 @@ test("firstmate_reply covers: a different final text with the quote of a more=tr
     createInboundLedger(host.bb.storage.database()).markDelegated({ source: "telegram", chatId: "200", messageId: "1671" }, "thr_crew", 3_500);
     host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
     const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
-    const partial = await tool(host, "firstmate_reply").execute({ ref: "tg:200:1669", text: "The research is running.", quote: "Status?", more: true }, ctx);
+    const partial = await tool(host, "firstmate_reply").execute({ noWork: true, ref: "tg:200:1669", text: "The research is running.", quote: "Status?", more: true }, ctx);
     assert.ok(!isError(partial), text(partial));
-    const final = await tool(host, "firstmate_reply").execute({ ref: "tg:200:1669", text: "The research is done.", quote: "Status?", covers: ["tg:200:1670", "tg:200:1671", "tg:200:1672"] }, ctx);
+    const final = await tool(host, "firstmate_reply").execute({ noWork: true, ref: "tg:200:1669", text: "The research is done.", quote: "Status?", covers: ["tg:200:1670", "tg:200:1671", "tg:200:1672"] }, ctx);
     assert.ok(!isError(final), text(final));
     assert.doesNotMatch(text(final), /Already replied/);
     assert.deepEqual(["1669", "1670", "1671", "1672"].map((id) => ledgerRow(host, id)?.state), ["answered", "answered", "answered", "answered"]);
@@ -996,10 +998,10 @@ test("firstmate_reply covers: a different unquoted text to an answered message i
     recordTelegram(host, "thr_cap", "1670", 2_000);
     host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
     const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
-    const first = await tool(host, "firstmate_reply").execute({ ref: "tg:200:1669", text: "The research is running." }, ctx);
+    const first = await tool(host, "firstmate_reply").execute({ noWork: true, ref: "tg:200:1669", text: "The research is running." }, ctx);
     assert.ok(!isError(first), text(first));
     assert.equal(ledgerRow(host, "1669")?.state, "answered");
-    const args = { ref: "tg:200:1669", text: "The research is complete and the report is ready.", covers: ["tg:200:1670"] };
+    const args = { noWork: true, ref: "tg:200:1669", text: "The research is complete and the report is ready.", covers: ["tg:200:1670"] };
     const changed = await tool(host, "firstmate_reply").execute(args, ctx);
     assert.ok(!isError(changed), text(changed));
     assert.doesNotMatch(text(changed), /Already replied/);
@@ -1041,10 +1043,10 @@ for (const quote of [undefined, "Status?"]) {
       });
       const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
       const states = () => ["1669", "1670", "1671", "1672"].map((id) => ledgerRow(host, id)?.state);
-      const first = await tool(host, "firstmate_reply").execute({ ref: "tg:200:1669", text: "The research is running.", quote, more: true }, ctx);
+      const first = await tool(host, "firstmate_reply").execute({ noWork: true, ref: "tg:200:1669", text: "The research is running.", quote, more: true }, ctx);
       assert.ok(!isError(first), text(first));
       assert.deepEqual(telegram, ["The research is running."]);
-      const args = { ref: "tg:200:1669", text: "The research is finished with every filter included.", quote, covers: ["tg:200:1670", "tg:200:1671", "tg:200:1672"] };
+      const args = { noWork: true, ref: "tg:200:1669", text: "The research is finished with every filter included.", quote, covers: ["tg:200:1670", "tg:200:1671", "tg:200:1672"] };
       for (const attempt of ["changed reply", "exact repeat"]) {
         const result = await tool(host, "firstmate_reply").execute(args, ctx);
         assert.ok(isError(result), `${attempt}: ${text(result)}`);
@@ -1236,6 +1238,7 @@ test("only a letter reply to an ask card answers that ask and refreshes the boar
     const header = parseInboundTelegram(askReply("a000001", "Yes"))!;
     const row = createInboundLedger(host.bb.storage.database()).get({ source: "telegram", chatId: header.chatId, messageId: header.messageId });
     assert.equal(row?.state, "answered", "an answer to a card raises no unanswered reminder");
+    assert.equal(row?.work, "no-work", "a card answer with no task is recorded as asking for no work");
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -1703,7 +1706,7 @@ test("firstmate_reply sends a reply as written: options, a decision phrase or a 
       "I sent you one question card: should money already in savings goals also come out of \"money on hand\"? I recommend yes.",
     ];
     for (const reply of words) {
-      const sent = await tool(host, "firstmate_reply").execute({ ref: "tg:200:1669", text: reply, more: true }, ctx);
+      const sent = await tool(host, "firstmate_reply").execute({ noWork: true, ref: "tg:200:1669", text: reply, more: true }, ctx);
       assert.ok(!isError(sent), text(sent));
     }
     const replies = host.harness.sdk.callsTo("plugins.callRpc").slice(sentBefore).map((call) => (call[0] as { input: { text: string } }).input.text);
@@ -1738,7 +1741,7 @@ test("captain report: a different text to the same message is sent, before or af
     recordTelegram(host, "thr_cap", "1669");
     host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
     const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
-    const send = (words: string, more?: boolean) => tool(host, "firstmate_reply").execute({ ref: "tg:200:1669", text: words, ...(more === undefined ? {} : { more }) }, ctx);
+    const send = (words: string, more?: boolean) => tool(host, "firstmate_reply").execute({ noWork: true, ref: "tg:200:1669", text: words, ...(more === undefined ? {} : { more }) }, ctx);
     const sentTexts = () => host.harness.sdk.callsTo("plugins.callRpc").map((call) => (call[0] as { input: { text: string } }).input.text);
     assert.ok(!isError(await send("The deploy is running.", true)));
     assert.match(text(await send("The deploy is running.", true)), /Already replied to tg:200:1669/, "the same text is not sent twice");

@@ -160,13 +160,13 @@ test("15 Oct agent-native: firstmate_reply links each attached file and refuses 
   const { host, call, rpc } = await agentNativeCase();
   try {
     const report = join(mkdtempSync(join(tmpdir(), "fm-report-")), "report.md");
-    const missing = await call("firstmate_reply", { ref: AGENT_NATIVE_REF, text: "agent-native: skip adoption, copy a few ideas.", files: [report] });
+    const missing = await call("firstmate_reply", { noWork: true, ref: AGENT_NATIVE_REF, text: "agent-native: skip adoption, copy a few ideas.", files: [report] });
     assert.equal(failed(missing), true, textOf(missing));
     assert.match(textOf(missing), new RegExp(`^Not sent: no file at ${report}\\. ${AGENT_NATIVE_REF} stays open\\.`));
     assert.equal(rpc().filter((c) => c.method === "reply").length, 0);
 
     writeFileSync(report, "# agent-native\nSkip adoption; copy a few ideas with credit.\n");
-    const sent = await call("firstmate_reply", { ref: AGENT_NATIVE_REF, text: "agent-native: skip adoption, copy a few ideas.", files: [report] });
+    const sent = await call("firstmate_reply", { noWork: true, ref: AGENT_NATIVE_REF, text: "agent-native: skip adoption, copy a few ideas.", files: [report] });
     assert.equal(failed(sent), false, textOf(sent));
     const reply = rpc().filter((c) => c.method === "reply").at(-1)!;
     assert.ok(String(reply.input.text).endsWith(`\n\n[report.md](${report})`), String(reply.input.text));
@@ -177,10 +177,10 @@ test("PR 132 round 2: firstmate_reply refuses a directory or a relative path bef
   const { host, call, rpc } = await agentNativeCase();
   try {
     const folder = mkdtempSync(join(tmpdir(), "fm-report-"));
-    const directory = await call("firstmate_reply", { ref: AGENT_NATIVE_REF, text: "Here are the findings.", files: [folder] });
+    const directory = await call("firstmate_reply", { noWork: true, ref: AGENT_NATIVE_REF, text: "Here are the findings.", files: [folder] });
     assert.equal(failed(directory), true, textOf(directory));
     assert.match(textOf(directory), new RegExp(`^Not sent: ${folder} is not a regular file\\. ${AGENT_NATIVE_REF} stays open\\.`));
-    await assert.rejects(call("firstmate_reply", { ref: AGENT_NATIVE_REF, text: "Here are the findings.", files: ["report.md"] }), /must start with "\/"/);
+    await assert.rejects(call("firstmate_reply", { noWork: true, ref: AGENT_NATIVE_REF, text: "Here are the findings.", files: ["report.md"] }), /must start with "\/"/);
     assert.equal(rpc().filter((c) => c.method === "reply").length, 0, "nothing reached the connector");
   } finally { await host.harness.lifecycle.dispose(); }
 });
@@ -192,7 +192,7 @@ test("PR 132 round 3: a file name ending in :<number> is refused before anything
     writeFileSync(join(dir, "report.md"), "# a different file\n");
     const colon = join(dir, "report.md:123");
     writeFileSync(colon, "# the attached file\n");
-    const refused = await call("firstmate_reply", { ref: AGENT_NATIVE_REF, text: "Here are the findings.", files: [colon] });
+    const refused = await call("firstmate_reply", { noWork: true, ref: AGENT_NATIVE_REF, text: "Here are the findings.", files: [colon] });
     assert.equal(failed(refused), true, textOf(refused));
     assert.match(textOf(refused), new RegExp(`^Not sent: ${colon} ends in :<number>, which Telegram reads as a line number\\. Rename or copy the file\\. ${AGENT_NATIVE_REF} stays open\\.`));
     assert.equal(rpc().filter((c) => c.method === "reply").length, 0, "nothing reached the connector");
@@ -204,7 +204,7 @@ test("PR 132 round 2: an attached path with spaces or brackets reaches the conne
   try {
     const report = join(mkdtempSync(join(tmpdir(), "fm report [r2] ")), "report with spaces (final).md");
     writeFileSync(report, "# findings\n");
-    const sent = await call("firstmate_reply", { ref: AGENT_NATIVE_REF, text: "Here are the findings.", files: [report] });
+    const sent = await call("firstmate_reply", { noWork: true, ref: AGENT_NATIVE_REF, text: "Here are the findings.", files: [report] });
     assert.equal(failed(sent), false, textOf(sent));
     const reply = String(rpc().filter((c) => c.method === "reply").at(-1)!.input.text);
     const link = /\n\n\[([^\]\n]*)\]\(([^\s)]+)\)$/.exec(reply);
@@ -224,7 +224,7 @@ test("15 Oct jess-leads: firstmate_reply refuses a file Telegram will not send, 
     const md = join(outside, "jess-leads-openleads.md");
     writeFileSync(csv, "name,email\n");
     writeFileSync(md, "# leads\n");
-    const args = { ref: AGENT_NATIVE_REF, text: "Here are the open leads.", files: [csv, md] };
+    const args = { noWork: true, ref: AGENT_NATIVE_REF, text: "Here are the open leads.", files: [csv, md] };
     const refused = await call("firstmate_reply", args);
     assert.equal(failed(refused), true, textOf(refused));
     assert.equal(textOf(refused).split("\n").slice(0, 3).join("\n"), [
@@ -239,7 +239,7 @@ test("15 Oct jess-leads: firstmate_reply refuses a file Telegram will not send, 
 
     const tmp = mkdtempSync(join("/tmp", "fm-tg-share-"));
     const copies = [csv, md].map((file) => { const copy = join(tmp, file.split("/").at(-1)!); writeFileSync(copy, "x"); return copy; });
-    const sent = await call("firstmate_reply", { ...args, files: copies });
+    const sent = await call("firstmate_reply", { noWork: true, ...args, files: copies });
     assert.equal(failed(sent), false, textOf(sent));
     assert.equal(rpc().filter((c) => c.method === "reply").length, 1);
   } finally {
@@ -256,12 +256,12 @@ test("firstmate_reply sends a file from the captain's workspace, which the conne
     host.harness.sdk.stub("environments.get", async ({ environmentId }: { environmentId: string }) => ({ id: environmentId, hostId: "host_1", status: "ready", path: workspace }));
     const build = join(workspace, "build.zip");
     writeFileSync(build, "zip");
-    const sent = await call("firstmate_reply", { ref: AGENT_NATIVE_REF, text: "The build.", files: [build] });
+    const sent = await call("firstmate_reply", { noWork: true, ref: AGENT_NATIVE_REF, text: "The build.", files: [build] });
     assert.equal(failed(sent), false, textOf(sent));
     assert.equal(rpc().filter((c) => c.method === "reply").length, 1);
     const hidden = join(workspace, ".env");
     writeFileSync(hidden, "TOKEN=x");
-    const refused = await call("firstmate_reply", { ref: AGENT_NATIVE_REF, text: "The env.", files: [hidden] });
+    const refused = await call("firstmate_reply", { noWork: true, ref: AGENT_NATIVE_REF, text: "The env.", files: [hidden] });
     assert.match(textOf(refused), new RegExp(`^Not sent: Telegram will not send ${hidden}: hidden files, hidden folders and \\.env files are never sent\\.`));
   } finally {
     rmSync(workspace, { recursive: true, force: true });
@@ -275,7 +275,7 @@ test("16 Oct project topics: a card and a reply carry the project the captain na
     const card = await call("firstmate_ask", { ...AGENT_NATIVE_CARD, project: "Cyndra" });
     assert.equal(failed(card), false, textOf(card));
     assert.equal(rpc().find((c) => c.method === "ask")!.input.project, "Cyndra");
-    const reply = await call("firstmate_reply", { ref: AGENT_NATIVE_REF, text: "agent-native: skip adoption, copy a few ideas.", project: "Cyndra" });
+    const reply = await call("firstmate_reply", { noWork: true, ref: AGENT_NATIVE_REF, text: "agent-native: skip adoption, copy a few ideas.", project: "Cyndra" });
     assert.equal(failed(reply), false, textOf(reply));
     assert.equal(rpc().find((c) => c.method === "reply")!.input.project, "Cyndra");
     // Owner decision Q7 (17 Oct): a card with no project is refused, not routed by Decisions.
@@ -290,7 +290,7 @@ test("16 Oct project topics: a reply held back as a card repeat says what really
     const { host, call } = await agentNativeCase();
     try {
       host.harness.sdk.stub("plugins.callRpc", async (args: { method: string }) => (args.method === "reply" ? { queued: 0, duplicate: false, mode: "on", cardRepeat: true } : { ok: true, queued: 1, duplicate: false, mode: "on" }));
-      const reply = await call("firstmate_reply", { ref: AGENT_NATIVE_REF, text: "I sent a card about it.", ...(more ? { more: true } : {}) });
+      const reply = await call("firstmate_reply", { noWork: true, ref: AGENT_NATIVE_REF, text: "I sent a card about it.", ...(more ? { more: true } : {}) });
       assert.equal(failed(reply), false, textOf(reply));
       const open = createInboundLedger(host.bb.storage.database()).listPending("thr_cap").some((row) => `tg:${row.chatId}:${row.messageId}` === AGENT_NATIVE_REF);
       assert.equal(open, more, more ? "more=true keeps the message open" : "the card answers it");

@@ -74,16 +74,25 @@ screenshots; link each file separately. Attach files from `/tmp` or your workspa
 - Call `firstmate_inbox` to list every owner message that still needs a final answer, with its
   ref and age. Call it as the last step of every turn that handled an owner message, and answer
   or dispatch every item it lists before the turn ends.
-- When a crew takes a task, pass the item's ref in `sourceRefs` on `firstmate_dispatch`. In a turn an
-  owner message started, a dispatch without it still runs, but opens no owner task and returns a
-  warning. The dispatch opens an owner task on the
-  board. A reply never closes it, a crew's done never closes it, and a merged PR leaves it open
-  under Not live yet. Only live or dropped finishes it: the project's live check (owner/projects.json)
-  makes merged work live by itself, or `firstmate_task` close with live (reason = what production runs
-  and how you checked it) or dropped (reason = the owner's own words, ref = his message). A task with
-  no next step for 24 hours raises one stall alert naming who must act. Work you do yourself gets a
-  task through `firstmate_task` open.
-- Each owner job gets its own dispatch and task; a job from another thread or your own passes `origin` instead.
+- When a crew takes a task, pass the item's ref in `sourceRefs` on `firstmate_dispatch`. The dispatch
+  opens an owner task on the board. Every dispatch opens or joins a task: without `sourceRefs`, a turn
+  one owner message started links that message, and says so. A reply never closes it, a crew's done
+  never closes it, and a merged PR leaves it open under Not live yet. Only live or dropped finishes it:
+  the project's live check (owner/projects.json) makes merged work live by itself, or `firstmate_task`
+  close with live (reason = what production runs and how you checked it) or dropped (reason = the
+  owner's own words, ref = his message). A task with no next step for 24 hours raises one stall alert
+  naming who must act. Work you do yourself gets a task through `firstmate_task` open.
+- Each owner job gets its own dispatch and task; a job from another thread or your own passes `origin`.
+  It still gets a task, linked to no owner message.
+- An owner message for a crew that already runs: pass its ref in `sourceRefs` on `firstmate_tell`, so it
+  joins the crew's task.
+- Each `firstmate_reply` links every message it answers to its task, or marks it as asking for no work.
+  The task the message started counts by itself. Otherwise pass `task`, or `noWork=true` for a
+  question answered, a thanks or a note. A reply with neither is refused and names the message.
+  Each `covers` ref takes the reply's `task` or `noWork`, or its own as `{ref, task}` or `{ref, noWork: true}`.
+- A dated promise ("I will check on 21 Oct") goes in `promise` on `firstmate_reply`: `by` (a date, or a
+  date and time with its zone) and `what`. It wakes you once at that time and shows on the board. Close
+  it with `firstmate_promise` kept, or dropped with a reason. Never keep a dated promise only in a file.
 - An owner job of several tickets (an epic) gets a program: `firstmate_program` create with the epic URL
   and the owner's refs. Pass `ticket` on each dispatch for a ticket. Dispatch the tickets the program
   says are ready. Close a ticket you stop with `firstmate_program` set and the owner's words.

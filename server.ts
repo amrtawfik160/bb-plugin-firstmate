@@ -77,6 +77,8 @@ import { ACK_TEXT, ackEligible, createInboundLedger, expandTelegramRows, followU
 import { inboundHookDecision } from "./lib/inbound-dispatch.ts";
 import { formatWorkersForTelegram } from "./lib/telegram-commands.ts";
 import { digestOnce, EMPTY_DIGEST_MEMORY, formatBoard, workingByProject, type BoardInput, type DigestMemory } from "./lib/owner-board.ts";
+import { createOwnerPromises, promiseLine, promiseTime, followupPromises } from "./lib/owner-promises.ts";
+import { parseSearchRows, strayPrs } from "./lib/stray-prs.ts";
 import { createOwnerTasks, isFinishedTask, isOpenTask, sameProject, stateFromPrs, taskLine, taskOfRef, telegramTasks, type CrewFinish, type OwnerTask, type TaskState } from "./lib/owner-tasks.ts";
 import { easBuildCommit, readEnvFile, type PrDetails } from "./lib/live-checks.ts";
 import { LIVE_PASS_MS, planOf, ruleOf, runLivePass, type LiveStatus } from "./lib/live-pass.ts";
@@ -102,7 +104,7 @@ import { crewPipeline, crewPlaybook, crewSkillBlock, crewSkillRoot, notVerifiedN
 import { CREW_ROLES, crewExecution } from "./owner/crew-roles.ts";
 import { DISPATCH_VERSION, PROOF_STEP, pipelineGates, proofStep } from "./owner/pipelines.ts";
 import { changeReach, type Reach } from "./owner/reach.ts";
-import { type LiveCheck, hostCanDrive, PROOF_SURFACES, projectBriefLines, projectForName, projectForRepo, repoOf as prRepoOf, surfaceRefusal, surfaceWords, unlistedNote } from "./owner/projects.ts";
+import { type LiveCheck, hostCanDrive, PROJECTS, PROOF_SURFACES, projectBriefLines, projectForName, projectForRepo, repoOf as prRepoOf, surfaceRefusal, surfaceWords, unlistedNote } from "./owner/projects.ts";
 import { createReleaseReadbacks, type ReleaseSource } from "./lib/release-readback.ts";
 import { cardSubject, keyFromEnvFile, ownerRules, ruleAnsweringCard } from "./lib/card-rules.ts";
 import { authFailure, signedIn, signInCommand, wakeCompletionRetryMs, withoutWakeWarning } from "./lib/action-guards.ts";
@@ -348,6 +350,12 @@ const MAX_QUEUE = 100;
 const MAX_DECISIONS = 100;
 const MAX_DONE = 10;
 const MAX_TASK = 4000;
+/** Owner decision Q7: the link of an owner message that asks for no work (an inbound row's work). */
+const NO_WORK = "no-work";
+const STRAY_SWEEP_MS = 60 * 60_000;
+const STRAY_SWEEP_KEY = "stray-pr-sweep-at";
+const STRAY_ADOPTED_KEY = "stray-pr-adopted";
+const STRAY_UNLISTED_KEY = "stray-pr-unlisted-told";
 const MAX_OUTPUT = 4000;
 const PLUGIN_ROOT = pluginAssetRoot(import.meta.url);
 const OVERLAY_DIR = join(PLUGIN_ROOT, "overlay");
@@ -1609,6 +1617,7 @@ const CAPTAIN_TOOLS = [
   "firstmate_alert",
   "firstmate_free_text",
   "firstmate_task",
+  "firstmate_promise",
   "firstmate_program",
   "firstmate_inbox",
   "firstmate_ask",
@@ -1825,6 +1834,7 @@ export default async function plugin(bb: BbPluginApi) {
     const c = programCounts(program);
     return `Task ${task.id} holds program ${program.id} (${program.title}): ${c.total - c.done - c.dropped} of ${c.total} tickets are open. It closes by itself when every ticket is done or dropped. If the owner stops the work, drop the open tickets with firstmate_program set state=dropped and the owner's words.`;
   }, () => { void refreshOwnerBoard(); });
+  const ownerPromises = createOwnerPromises(bb.storage.database());
   // Owner decision Q5: an app release is done or live only with a crew's read-back of the build
   // in the project's required group (owner/projects.json), read from App Store Connect or EAS.
   // A task with no merged PR shipped no build, so it needs none.
@@ -6055,7 +6065,26 @@ export default async function plugin(bb: BbPluginApi) {
     return next;
   }
 
+  // Owner decision Q8: each promise wakes its captain when it is due. The claim is taken before the send, so two
+  // checks at once wake once; markWoken records the delivery after it. A crash before the send loses nothing (the
+  // next process takes the claim again); a crash between the send and markWoken repeats the reminder once.
+  async function wakeDuePromises(captainThreadId: string, signal?: AbortSignal): Promise<void> {
+    const due = ownerPromises.claimDue(captainThreadId, Date.now());
+    if (due.length === 0) return;
+    const lines = due.map((p) => `Promise ${p.id} is due: ${p.what} (${p.source === "followups" ? "from the follow-ups file" : `promised in reply to ${p.ref ?? "the owner"}`}${p.task ? `, task ${p.task}` : ""}). Do it now, or tell the owner the new time; then close it with firstmate_promise.`);
+    const told = await deliverToCaptain(captainThreadId, lines.join("\n"), "promise", signal, true).catch((error) => {
+      bb.log.warn(`promise wake for ${captainThreadId}: ${String(error)}`);
+      return false;
+    });
+    if (!told) ownerPromises.release(due.map((p) => p.id));
+    else {
+      ownerPromises.markWoken(due.map((p) => p.id), Date.now());
+      await refreshOwnerBoard();
+    }
+  }
+
   async function drainCaptainReliability(captainThreadId: string, signal?: AbortSignal): Promise<void> {
+    await wakeDuePromises(captainThreadId, signal).catch((error) => bb.log.warn(`owner promises: ${String(error)}`));
     await tellSkippedAsks(captainThreadId);
     await defaultOverdueAsks(captainThreadId).catch((error) => bb.log.warn(`owner ask deadlines: ${String(error)}`));
     await reconcilePrograms(captainThreadId, { signal }).catch((error) => bb.log.warn(`programs: ${String(error)}`));
@@ -6073,8 +6102,16 @@ export default async function plugin(bb: BbPluginApi) {
       if (flags.telegramThreading === "on") {
         try {
           // A reopened row is closed by a new reply only, never by the earlier answer the connector sent.
-          const replied = await connectorReplied({ open: inboundLedger.listOpen(captainThreadId).filter((row) => !row.reopenedAt), callRpc: (args) => bb.sdk.plugins.callRpc(args) });
-          for (const key of replied) inboundLedger.markAnswered({ source: "telegram", ...key }, Date.now());
+          const replied = await connectorReplied({ open: inboundLedger.listOpen(captainThreadId).filter((row) => !row.reopenedAt && row.repliedAt == null), callRpc: (args) => bb.sdk.plugins.callRpc(args) });
+          // Owner decision Q7: an answer the connector sent closes a message only when it has its task or "no work".
+          // One with neither stays open, marked replied, until firstmate_reply records its link.
+          const tasks = replied.length === 0 ? [] : ownerTasks.list(captainThreadId, { includeClosed: true });
+          for (const key of replied) {
+            const found = inboundLedger.get({ source: "telegram", ...key });
+            const linked = !!found?.work || taskOfRef(tasks, telegramSourceRef(key)) !== undefined;
+            if (linked) inboundLedger.markAnswered({ source: "telegram", ...key }, Date.now());
+            else inboundLedger.markRepliedUnlinked({ source: "telegram", ...key }, Date.now());
+          }
         } catch (error) {
           bb.log.warn(`telegram replied check: ${String(error)}`);
         }
@@ -8280,6 +8317,85 @@ export default async function plugin(bb: BbPluginApi) {
         .then(() => { deliveries.touch(pr.id, pr.touchedAt); }, (error) => { if (signal?.aborted) throw error; bb.log.warn(`Open PR tracking ${pr.id}: ${String(error)}`); });
     }
     return snapshot;
+  }
+  // Owner decisions Q3 and Q11: once an hour, GitHub searches list every open PR in the listed repos. Each one no
+  // open task links becomes a task in "check" with its next step, and each captain is woken once for the PRs it
+  // adopted. A PR is adopted once: its task then carries it. A repo no project lists goes to the repair thread once.
+  async function strayPrSweep(signal?: AbortSignal): Promise<string> {
+    await bb.storage.kv.set(STRAY_SWEEP_KEY, Date.now());
+    const captains = [...knownCaptainsRef];
+    if (captains.length === 0) return "No captain is known: nothing to adopt into.";
+    const hostId = (await settings.get()).fmHostId.trim() || await backgroundHost(signal);
+    if (!hostId) return "No host to read GitHub from.";
+    // Every repo owner/projects.json lists, any author (repo: and user: scopes, a few per query to stay inside
+    // GitHub's query limits), and this account's own PRs anywhere, which finds repos no project lists. Each page is
+    // one charged read; when the allowance runs out the sweep keeps what it read and the next hour starts again.
+    const scopes = [...new Set(PROJECTS.projects.flatMap((project) => project.repos).flatMap((pattern) => {
+      const [owner, name] = pattern.split("/");
+      if (!owner || !name || owner.includes("*")) return [];
+      return [name.includes("*") ? `user:${owner}` : `repo:${pattern}`];
+    }))];
+    const groups: string[][] = [];
+    for (const scope of scopes) {
+      const last = groups.at(-1);
+      if (last && last.length < 4) last.push(scope); else groups.push([scope]);
+    }
+    const queries = [...groups.map((group) => group.join(" ")), "author:@me"].map((scope) => `is:pr is:open archived:false ${scope}`);
+    const fields = ".items[] | {url: .html_url, title, createdAt: .created_at, updatedAt: .updated_at, draft} | tojson";
+    const byId = new Map<string, ReturnType<typeof parseSearchRows>[number]>();
+    let complete = true;
+    for (const query of queries) {
+      for (let page = 1; page <= 10; page++) {
+        signal?.throwIfAborted();
+        if (!backgroundBudget.run("sweep", () => reserveGithub(hostId, true))) { complete = false; break; }
+        const res = await runStructuredOnHost(hostId, `gh api -X GET search/issues -f q=${shQuote(query)} -f per_page=100 -f page=${page} --jq ${shQuote(fields)}`, 60_000, signal);
+        if (res.exitCode !== 0) {
+          bb.log.warn(`stray PR sweep: the GitHub search failed: ${clip(res.stderr || res.output, 200)}`);
+          complete = false;
+          break;
+        }
+        const found = parseSearchRows(res.output);
+        for (const pr of found) byId.set(pr.id, pr);
+        if (found.length < 100) break;
+      }
+    }
+    if (!complete) bb.log.warn("stray PR sweep: stopped early (GitHub allowance or a failed read); adopted what it read");
+    const rows = [...byId.values()];
+    const now = Date.now();
+    const tasks = captains.flatMap((captain) => ownerTasks.list(captain, { includeClosed: true }));
+    const records = tasks.filter(isOpenTask).flatMap((task) => deliveries.forTasks(task.crewIds, task.prs));
+    const adoptedBefore = await bb.storage.kv.get<Record<string, number>>(STRAY_ADOPTED_KEY) ?? {};
+    const found = strayPrs(rows, tasks, records, PROJECTS);
+    const byCaptain = new Map<string, string[]>();
+    for (const { pr, project } of found.adopt) {
+      if (adoptedBefore[pr.id] !== undefined) continue;
+      const record = deliveries.get(pr.id);
+      const owner = record?.owner;
+      const captain = owner && captains.includes(owner) ? owner
+        : tasks.filter((task) => sameProject(task.project, project)).sort((a, b) => b.updatedAt - a.updatedAt)[0]?.captain ?? captains[0]!;
+      const opened = ownerTasks.open({ captain, project, projectId: record?.projectId ?? null, title: `PR ${pr.id}: ${pr.title || "untitled"}`, sourceRefs: [], prs: [pr.id], at: now });
+      // A crew that already delivers this PR (a record with no open task) joins the task, so the task follows it.
+      if (record?.taskId) ownerTasks.attach(opened.id, captain, { crewId: record.taskId, sourceRefs: [], at: now });
+      const task = ownerTasks.move(opened.id, captain, { to: "check", reason: `Adopted open PR ${pr.url} that no task tracked. Next: decide merge, fix or close it.` }, now);
+      adoptedBefore[pr.id] = now;
+      byCaptain.set(captain, [...(byCaptain.get(captain) ?? []),
+        `- ${task.id} · ${task.project ?? project} · ${pr.id} ${clip(pr.title, 80)}${pr.draft ? " (draft)" : ""}${pr.openedAt === null ? "" : `, opened ${new Date(pr.openedAt).toISOString().slice(0, 10)}`}`]);
+    }
+    await bb.storage.kv.set(STRAY_ADOPTED_KEY, adoptedBefore);
+    for (const [captain, lines] of byCaptain) {
+      const shown = [...lines.slice(0, 30), ...(lines.length > 30 ? [`…and ${lines.length - 30} more: firstmate_task list`] : [])];
+      await deliverToCaptain(captain, [`Adopted ${lines.length} open PR${lines.length === 1 ? "" : "s"} that no task tracked; each is now a task in "check". Give each a next step: merge, fix, or close.`, ...shown].join("\n"), "stray-prs", signal, true);
+    }
+    const told = await bb.storage.kv.get<string[]>(STRAY_UNLISTED_KEY) ?? [];
+    const fresh = found.unlisted.filter((repo) => !told.includes(repo));
+    if (fresh.length > 0 && String((await settings.get()).repairThreadId ?? "").trim() !== "") {
+      const counts = fresh.map((repo) => { const n = rows.filter((pr) => pr.repo === repo).length; return `${repo} (${n} open PR${n === 1 ? "" : "s"})`; });
+      await repairNotice(`stray-repos:${fresh.join(",")}`, `Firstmate: open PRs in repos no project in owner/projects.json lists, so no task adopts them: ${counts.join(", ")}. Add the repo to a project, or leave it out on purpose.`);
+      await bb.storage.kv.set(STRAY_UNLISTED_KEY, [...told, ...fresh]);
+    }
+    if (byCaptain.size > 0) await refreshOwnerBoard();
+    const adopted = [...byCaptain.values()].flat().length;
+    return `${rows.length} open PR${rows.length === 1 ? "" : "s"} read; ${adopted} adopted into tasks; ${found.unlisted.length} repo${found.unlisted.length === 1 ? "" : "s"} no project lists.`;
   }
   // Read-only view for a captain: every open PR by this GitHub account in the captain's projects, untracked first.
   async function openPrReport(captain: string, project: string | undefined, signal?: AbortSignal) {
@@ -13363,7 +13479,6 @@ export default async function plugin(bb: BbPluginApi) {
       }
       const untagged = turnRefs.length > 0 && origin === undefined && taskRef === undefined && !passedRefs.some((ref) => turnRefs.includes(ref));
       const trackOwnerTask = async (crewId: string): Promise<string> => {
-        if (untagged) return `\nWarning: no owner task tracks this crew. This turn started from owner message ${turnRefs.join(", ")}. If this job is the owner's, pass sourceRefs: ${JSON.stringify(turnRefs)}; for a follow-up, pass taskRef; otherwise pass origin.`;
         if (parentThreadId === undefined) return "";
         const named = [...`${title ?? ""}\n${task}`.matchAll(/\bT\d+\b/g)].map((match) => ownerTasks.get(match[0])).find((item) => item?.captain === parentThreadId && isOpenTask(item));
         const held = taskRef !== undefined ? ownerTasks.get(taskRef) : named ?? await prTask(parentThreadId, resolvedProject, title, task);
@@ -13375,14 +13490,18 @@ export default async function plugin(bb: BbPluginApi) {
           await refreshOwnerBoard();
           return ` Owner task ${joined.id} (${joined.state}) tracks it; no new task was opened.`;
         }
-        if (origin !== undefined || passedRefs.length === 0) return "";
+        // Owner decision Q3: every crew is on a task record, also a job from another thread or the captain's own.
+        const openRefs = origin !== undefined ? [] : passedRefs.length > 0 ? passedRefs : turnRefs.length === 1 ? turnRefs : [];
         const opened = ownerTasks.open({
           captain: parentThreadId, project: await projectLabel(resolvedProject), projectId: resolvedProject, title: title ?? task.split("\n")[0]!.slice(0, 120),
-          sourceRefs: passedRefs, crewId, at: Date.now(),
+          sourceRefs: openRefs, crewId, at: Date.now(),
         });
         quality.noteTaskCrew({ captain: parentThreadId, task: opened.id, title: opened.title, crew: crewId, role: role ?? "builder", shape: shape ?? "ship", at: Date.now() });
         await refreshOwnerBoard();
-        return ` Owner task ${opened.id} tracks it until it is merged, live, done, or dropped; a reply does not close it.`;
+        const linkNote = !untagged ? "" : openRefs.length > 0
+          ? ` It is linked to this turn's owner message ${openRefs[0]}; pass sourceRefs, taskRef or origin to say otherwise.`
+          : `\nWarning: no owner message is linked. This turn holds owner messages ${turnRefs.join(", ")}: pass sourceRefs for the one this job answers.`;
+        return ` Owner task ${opened.id} tracks it until it is merged, live, done, or dropped; a reply does not close it.${linkNote}`;
       };
       const trackTask = async (crewId: string): Promise<string> =>
         (await trackOwnerTask(crewId)) + (parentThreadId === undefined || ticket === undefined ? "" : trackProgramTicket(parentThreadId, crewId, ticket));
@@ -13586,19 +13705,25 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_reply",
-    description: "Reply to one owner message as a Telegram reply to it (ref=oldest, tg:<chat>:<msg>, or bb:<thread>:<row>; any open message, in any order). quote=exact words from that message, such as one of several questions; each different quote is its own reply. more=true keeps the message open because more replies to it will follow. A text that asks the owner to decide (options A/B with a question, or a count of waiting decisions) is refused: send each decision with firstmate_ask. A text that restates the question of a card sent in the last 30 minutes is refused too. The answer carries its owner task (task, or the task this message started): in Telegram it replies to the task's status line, in the task's project topic. result=true makes it the task's result, which marks the owner's messages done; a task has one result. Each owner message gets one Telegram answer message: a later reply to it is added by an edit, one part an edit cannot hold is its continuation, and more is refused. Turn text outside this tool, firstmate_ask and firstmate_alert never reaches the owner. A text that only says the work started, or a note about the owner, is not sent and the message stays open. covers=refs of other open messages this reply also answers, such as forwarded messages or a burst on one request: they close with no Telegram message of their own.",
+    description: "Reply to one owner message as a Telegram reply to it (ref=oldest, tg:<chat>:<msg>, or bb:<thread>:<row>; any open message, in any order). quote=exact words from that message, such as one of several questions; each different quote is its own reply. more=true keeps the message open because more replies to it will follow. A text that asks the owner to decide (options A/B with a question, or a count of waiting decisions) is refused: send each decision with firstmate_ask. A text that restates the question of a card sent in the last 30 minutes is refused too. The answer carries its owner task (task, or the task this message started): in Telegram it replies to the task's status line, in the task's project topic. result=true makes it the task's result, which marks the owner's messages done; a task has one result. Each owner message gets one Telegram answer message: a later reply to it is added by an edit, one part an edit cannot hold is its continuation, and more is refused. Turn text outside this tool, firstmate_ask and firstmate_alert never reaches the owner. A text that only says the work started, or a note about the owner, is not sent and the message stays open. covers=refs of other open messages this reply also answers, such as forwarded messages or a burst on one request: they close with no Telegram message of their own. Every owner message this reply answers is linked to its owner task or marked noWork (it asks for no work): the message's own task (the one it started, or one an earlier reply named) counts; else pass task, or noWork=true; a cover takes the reply's task or noWork, or its own as {ref, task} or {ref, noWork}. A reply with neither is refused. promise={by, what}: a dated promise in this reply, such as \"I will check on 21 Oct\"; it is a record that wakes you at that time and shows on the board until you close it with firstmate_promise.",
     parameters: z.object({
       ref: z.string().min(1).optional().describe("The owner message: oldest, tg:<chat>:<msg> or bb:<thread>:<row>. Unset with task: the first owner message of that task"),
       text: z.string().min(1).max(4000),
       quote: z.string().min(1).max(1024).optional(),
       more: z.boolean().optional(),
       files: z.array(z.string().startsWith("/")).max(10).optional().describe("Absolute paths of files to attach, such as a crew's report.md. Telegram sends any file from the captain's workspace or /tmp, only documents and images from a BB worktree, and never hidden files or secrets"),
-      covers: z.array(z.string().min(1)).max(50).optional().describe("Refs of other open owner messages this reply also answers; each closes with no Telegram message"),
+      covers: z.array(z.union([z.string().min(1), z.object({ ref: z.string().min(1), task: z.string().regex(/^T\d+$/).optional(), noWork: z.literal(true).optional() })])).max(50).optional()
+        .describe("Refs of other open owner messages this reply also answers; each closes with no Telegram message. A plain ref takes this reply's task or noWork; {ref, task} or {ref, noWork: true} sets its own"),
+      noWork: z.literal(true).optional().describe("true: this owner message asks for no work (a question answered, a thanks, a note). Required when the message has no owner task and task is unset"),
+      promise: z.object({
+        by: z.string().min(10).max(40).describe("When: an ISO date (2026-10-21, due 09:00 Cairo) or date-time with zone (2026-10-21T14:40Z)"),
+        what: z.string().min(1).max(500).describe("What you promised, in plain words"),
+      }).optional().describe("A dated promise this reply makes to the owner: a record that wakes you at that time"),
       project: z.string().min(1).max(80).optional().describe("The project this answer is about, as on the board (such as Safi). With Telegram topics on, the answer goes to that project's topic"),
       task: z.string().regex(/^T\d+$/).optional().describe("The owner task this answer is about (T<n>), such as the task an owner message steers (telegram_task). Unset: the task this owner message started. In Telegram the answer replies to the task's status line and goes to its project's topic"),
       result: z.boolean().optional().describe("true: this is the task's result, what was done with any files. It rings, marks the owner's messages done, and is the only result of the task: a second one is refused"),
     }),
-    async execute({ ref: givenRef, text: words, quote, more, files, covers, project, task: taskId, result: resultFlag }, ctx) {
+    async execute({ ref: givenRef, text: words, quote, more, files, covers: coverItems, project, task: taskId, result: resultFlag, noWork, promise }, ctx) {
       const flags = await reliabilityFlags();
       if (flags.inboundLedger === "off") return toolError("Inbound ledger is off.");
       const captain = ctxString(ctx, "threadId");
@@ -13615,8 +13740,16 @@ export default async function plugin(bb: BbPluginApi) {
       if (!row) return toolError(`No inbound row ${ref} for this captain.`);
       const refOf = (item: InboundRow) => item.source === "telegram" ? telegramSourceRef(item) : `bb:${item.chatId}:${item.messageId}`;
       const used = refOf(row);
-      const named = taskId === undefined ? taskOfRef(ownerTasks.list(captain, { includeClosed: true }), used) : ownerTasks.get(taskId);
+      const allTasks = ownerTasks.list(captain, { includeClosed: true });
+      // A message's own task: the one it started, else the one an earlier reply linked it to.
+      const ownTask = (item: InboundRow) => taskOfRef(allTasks, refOf(item))?.id ?? (item.work && item.work !== NO_WORK ? item.work : undefined);
+      const recordedTask = ownTask(row);
+      const named = taskId === undefined ? (recordedTask === undefined ? undefined : ownerTasks.get(recordedTask)) : ownerTasks.get(taskId);
       if (taskId !== undefined && named?.captain !== captain) return toolError(`No owner task ${taskId} for this captain. Check firstmate_task list.`);
+      if (taskId !== undefined && noWork === true) return toolError(`Not sent: pass task or noWork, not both. ${used} stays open.`);
+      const covers = (coverItems ?? []).map((item) => typeof item === "string" ? item : item.ref);
+      const promiseAt = promise === undefined ? undefined : promiseTime(promise.by, Date.now());
+      if (typeof promiseAt === "string") return toolError(`Not sent: ${promiseAt} ${used} stays open.`);
       // A final answer once its task is closed is the task's result: it rings and marks the owner's messages done.
       // Only the captain's result=true makes the task's result: a later answer about a closed task is an answer.
       const result = named !== undefined && more !== true && resultFlag === true;
@@ -13636,6 +13769,30 @@ export default async function plugin(bb: BbPluginApi) {
       // While the first send is running, the repeat closes nothing. Once it is delivered, the repeat finishes any
       // closure an interrupted call left undone, of the covers that reply listed only. It closes this message only
       // when the delivered reply was final, so repeating a more=true text keeps the message open.
+      // Owner decision Q7: every message this reply answers is linked to its task or marked no work. The links are
+      // recorded before any message closes, so a repeat after a failed write records them first, never closes without.
+      const unlinked = (item: InboundRow) => `Not sent: ${refOf(item)} has no owner task. Pass task (T<n>) when it asks for work (dispatch it first, or firstmate_task open), or noWork=true when it asks for none. ${used} stays open.`;
+      const linkWorks = (coveredRows: InboundRow[]): { works: Array<{ key: InboundKey; work: string }> } | { error: string } => {
+        const anchorWork = named?.id ?? (noWork === true ? NO_WORK : undefined);
+        if (anchorWork === undefined) return { error: unlinked(row) };
+        const works: Array<{ key: InboundKey; work: string }> = [{ key: row, work: anchorWork }];
+        for (const item of coveredRows) {
+          const given = (coverItems ?? []).find((other): other is Exclude<typeof other, string> => typeof other !== "string" && inboundKey(parseSourceRef(other.ref) ?? row) === inboundKey(item));
+          if (given?.task !== undefined && given.noWork === true) return { error: `Not sent: ${refOf(item)} takes task or noWork, not both. ${used} stays open.` };
+          if (given?.task !== undefined && ownerTasks.get(given.task)?.captain !== captain) return { error: `Not sent: no owner task ${given.task} for this captain (cover ${refOf(item)}). ${used} stays open.` };
+          const work = given?.task ?? (given?.noWork === true ? NO_WORK : undefined) ?? ownTask(item) ?? taskId ?? (noWork === true ? NO_WORK : undefined);
+          if (work === undefined) return { error: unlinked(item) };
+          works.push({ key: item, work });
+        }
+        return { works };
+      };
+      // Owner decision Q8: the promise is recorded before the message closes; a repeat of the call records it once.
+      const recordPromise = async (): Promise<string> => {
+        if (promise === undefined || typeof promiseAt !== "number") return "";
+        const kept = ownerPromises.add({ captain, by: promiseAt, what: promise.what, ref: used, task: named?.id ?? null, source: "reply", at: Date.now() });
+        if (kept.created) await refreshOwnerBoard();
+        return `\nPromise ${kept.promise.id} is recorded: the captain is woken at ${new Date(kept.promise.by).toISOString()}. It stays on the board until you close it with firstmate_promise.`;
+      };
       const inFlight = `Not sent: the first send of this reply to ${used} is still running, so nothing is closed yet. Repeat the same call later.`;
       const repeatKinds = [quotedReplyKind(quote), followUpReplyKind(body, quote)];
       const delivered = repeatKinds.map((kind) => inboundLedger.outboxGet(row, kind as OutboxKind)).find((out) => out?.contentHash === hashText(body));
@@ -13651,8 +13808,12 @@ export default async function plugin(bb: BbPluginApi) {
           return toolError(`Not sent: covers refused (${extra.map((other) => `${other} was not covered by the reply already sent to ${used}`).join("; ")}). Nothing is closed. Answer ${extra.length === 1 ? "it" : "them"} in a new reply.`);
         }
         const pendingNow = new Set(inboundLedger.listPending(captain).map(inboundKey));
+        const links = linkWorks(recorded.map((other) => inboundLedger.get(other)).filter((other): other is InboundRow => other !== undefined));
+        if ("error" in links) return toolError(links.error);
+        inboundLedger.noteWork(links.works);
+        const promiseNote = await recordPromise();
         const closed = inboundLedger.finishReply(delivered.final === true && more !== true ? row : null, recorded.filter((other) => pendingNow.has(inboundKey(other))), used, Date.now());
-        return (quote ? `Already replied to ${used} for that quote.` : `Already replied to ${used}.`) + coverNote(closed);
+        return (quote ? `Already replied to ${used} for that quote.` : `Already replied to ${used}.`) + coverNote(closed) + promiseNote;
       }
       // Every covered ref must be another open message of this captain, or nothing is sent.
       const pending = new Set(inboundLedger.listPending(captain).map(inboundKey));
@@ -13668,6 +13829,16 @@ export default async function plugin(bb: BbPluginApi) {
         else covered.push(found);
       }
       if (refused.length > 0) return toolError(`Not sent: covers refused (${refused.join("; ")}). ${used} stays open.`);
+      const links = linkWorks(covered);
+      if ("error" in links) return toolError(links.error);
+      const works = links.works;
+      // The connector already answered this message outside firstmate_reply: record its links, send nothing again.
+      if (row.repliedAt != null && row.state !== "answered") {
+        inboundLedger.noteWork(works);
+        const promiseNote = await recordPromise();
+        const closed = inboundLedger.finishReply(more === true ? null : row, covered, used, Date.now());
+        return `Not sent again: the connector already answered ${used}. Its link (${works[0]!.work}) is recorded${more === true ? "" : " and it is closed"}.` + coverNote(closed) + promiseNote;
+      }
       const missing = attach.filter((file) => !existsSync(file));
       if (missing.length > 0) return toolError(`Not sent: no file at ${missing.join(", ")}. ${used} stays open.`);
       const notFile = attach.filter((file) => !statSync(file).isFile());
@@ -13762,8 +13933,12 @@ export default async function plugin(bb: BbPluginApi) {
       } catch (error) {
         return toolError(`Reply to ${used} was delivered, but recording the delivery failed; ${stayOpen} ${covered.length === 0 ? "stays" : "stay"} open, and a repeat of this call cannot close ${covered.length === 0 ? "it" : "them"}. ${error instanceof Error ? error.message : String(error)}`);
       }
-      // The reply and its covers close together; after a failure the identical call closes them with no second send.
+      // The links and the promise are recorded before anything closes; after a failure the identical call records
+      // them and closes, with no second send.
+      let promiseNote = "";
       try {
+        inboundLedger.noteWork(works);
+        promiseNote = await recordPromise();
         inboundLedger.finishReply(more === true ? null : row, covered, used, Date.now());
       } catch (error) {
         return toolError(`Reply to ${used} was delivered, but recording it failed; ${stayOpen} ${covered.length === 0 ? "stays" : "stay"} open. Repeat the same call to close ${covered.length === 0 ? "it" : "them"}: it sends nothing again. ${error instanceof Error ? error.message : String(error)}`);
@@ -13778,7 +13953,7 @@ export default async function plugin(bb: BbPluginApi) {
           : `Replied to ${used}.`) + coverNote(covered);
       const taskNote = ownerTasks.openByRef(captain, used).map((task) => `\nTask ${task.id} stays open (${task.state}): a reply does not close it. Close it with firstmate_task when it is done or dropped.`).join("");
       const stillOpen = inboundLedger.listPending(captain);
-      return (stillOpen.length === 0 ? `${sentLine} No owner message is waiting.` : `${sentLine}\n${formatOwnerInbox(stillOpen, Date.now())}`) + taskNote;
+      return (stillOpen.length === 0 ? `${sentLine} No owner message is waiting.` : `${sentLine}\n${formatOwnerInbox(stillOpen, Date.now())}`) + taskNote + promiseNote;
     },
   });
 
@@ -13942,6 +14117,83 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
+  /** list, or close one promise as kept or dropped (a reason required). Throws on a refusal. */
+  function promiseOperation(captain: string, action: "list" | "kept" | "dropped", id: string | undefined, reason: string | undefined): string {
+    const now = Date.now();
+    if (action === "list") {
+      const open = ownerPromises.list(captain);
+      return open.length === 0 ? "No promise is open." : [`${open.length} promise(s) open:`, ...open.map((p) => promiseLine(p, now))].join("\n");
+    }
+    if (!id || !/^P\d+$/.test(id)) throw new Error(`${action} needs a promise id (P<n>).`);
+    const closed = ownerPromises.close(id, captain, action, reason ?? "", now);
+    void refreshOwnerBoard();
+    return `Promise ${closed.id} is ${closed.state}.`;
+  }
+
+  /**
+   * Owner decision Q8: the one-time import of the dated promises in the captain home's follow-ups file. A dry run
+   * lists what it would record; --apply records each, less the lines in skip. A promise already recorded is not
+   * recorded twice, so a second apply records nothing new.
+   */
+  async function importFollowupPromises(captain: string, file: string | undefined, apply: boolean, skip: number[], signal?: AbortSignal): Promise<string> {
+    const home = captainHomes.get(captain) ?? await bb.storage.kv.get<string>(`native-home:${captain}`);
+    const path = file ?? (typeof home === "string" && home.trim() !== "" ? `${home}/data/followups.md` : undefined);
+    if (!path) throw new Error(`No captain home for ${captain}: pass --file <path>.`);
+    const hostId = (await settings.get()).fmHostId.trim() || await bb.storage.kv.get<string>(`native-home-host:${captain}`) || await resolveHostId(undefined, { threadId: captain });
+    const read = await raceAbort(bb.sdk.files.read({ hostId, path }), signal, STUCK_HOST_CALL_MS);
+    const content = "content" in read && typeof read.content === "string" ? read.content : "";
+    const now = Date.now();
+    const plan = followupPromises(content, now);
+    const when = (at: number) => `${new Date(at).toISOString().slice(0, 16)}Z`;
+    const notDated = plan.skipped.length === 0 ? [] : [`Not dated (${plan.skipped.length}): ${plan.skipped.map((s) => `line ${s.line}`).join(", ")}; they stay in the file.`];
+    if (!apply) {
+      return [`Dry run: ${plan.promises.length} dated promises in ${path} for ${captain}; nothing recorded. Apply with: bb firstmate promises import --captain ${captain} --apply [--skip <line> ...]`,
+        ...plan.promises.map((p) => `- line ${p.line} · ${when(p.by)} · ${clip(p.what, 140)}`), ...notDated].join("\n");
+    }
+    let recorded = 0, already = 0, skipped = 0;
+    for (const p of plan.promises) {
+      if (skip.includes(p.line)) { skipped++; continue; }
+      const added = ownerPromises.add({ captain, by: p.by, what: p.what, ref: null, task: null, source: "followups", at: now });
+      if (added.created) recorded++; else already++;
+    }
+    if (recorded > 0) await refreshOwnerBoard();
+    const parts = [skipped > 0 ? `${skipped} skipped on request` : "", already > 0 ? `${already} already recorded` : ""].filter(Boolean);
+    return `Recorded ${recorded} promise${recorded === 1 ? "" : "s"} for ${captain}${parts.length ? ` (${parts.join(", ")})` : ""}. Each wakes the captain when it is due.`;
+  }
+
+  registerCaptainTool({
+    name: "firstmate_promise",
+    description: "Dated promises to the owner (owner decision Q8). Make one with firstmate_reply promise={by, what}: it wakes you once at its time and stays on the board until you close it here. list shows open promises; kept closes one you did; dropped closes one the owner no longer needs (reason required).",
+    parameters: z.object({
+      action: z.enum(["list", "kept", "dropped"]),
+      id: z.string().regex(/^P\d+$/).optional(),
+      reason: z.string().max(500).optional(),
+    }),
+    async execute({ action, id, reason }, ctx) {
+      const captain = ctxString(ctx, "threadId");
+      if (!captain) return toolError("firstmate_promise runs only in a captain thread.");
+      try { return promiseOperation(captain, action, id, reason); }
+      catch (error) { return toolError(error instanceof Error ? error.message : String(error)); }
+    },
+  });
+
+  // R4 (forgotten-work review, 18 Oct): an owner message passed to a crew that already runs joins the crew's
+  // task, so the message is never only in the tell. A crew with no task gets one.
+  async function tellJoinsTask(crew: Crew, captain: string | undefined, given: string[] | undefined): Promise<string> {
+    if (!captain || crew.parentThreadId !== captain) return "";
+    const turnRefs = ownerTurnRefs.get(captain) ?? [];
+    const refs = given !== undefined
+      ? given.flatMap((ref) => { const key = parseSourceRef(ref); return key === null ? [] : [`${key.source === "telegram" ? "tg" : "bb"}:${key.chatId}:${key.messageId}`]; })
+      : turnRefs.length === 1 ? turnRefs : [];
+    if (refs.length === 0) return "";
+    const held = ownerTasks.list(captain, { includeClosed: true }).filter((task) => task.crewIds.includes(crew.id)).at(-1);
+    const task = held !== undefined
+      ? ownerTasks.attach(held.id, captain, { crewId: crew.id, sourceRefs: refs, at: Date.now() })
+      : ownerTasks.open({ captain, project: await projectLabel(crew.projectId), projectId: crew.projectId, title: crew.title ?? crew.task.split("\n")[0]!.slice(0, 120), sourceRefs: refs, crewId: crew.id, at: Date.now() });
+    await refreshOwnerBoard();
+    return ` Owner message ${refs.join(", ")} is on owner task ${task.id}.`;
+  }
+
   registerCaptainTool({
     name: "firstmate_tell",
     description:
@@ -13951,20 +14203,22 @@ export default async function plugin(bb: BbPluginApi) {
       message: z.string().min(1).max(MAX_TASK),
       queue: z.boolean().optional().describe("Non-urgent note: queue it instead of steering into the crew's running turn (read when the turn ends). Default false = steer now."),
       resolveKey: z.string().optional().describe("Key of the crew's open decision this steer answers (from crew/bearings); closes it in real state"),
+      sourceRefs: z.array(z.string()).optional().describe("Owner messages this instruction passes on (tg:chat:msg or bb:thread:row): they join the crew's owner task. Unset in a turn one owner message started: that message"),
     }),
-    async execute({ crewId, message, queue, resolveKey },ctx) {
+    async execute({ crewId, message, queue, resolveKey, sourceRefs },ctx) {
       const crew = await findCrew(crewId,ctxString(ctx,"threadId"));
       if (crew === undefined) return toolError(`No crew ${crewId}.`);
       try {
+        const taskNote = await tellJoinsTask(crew, ctxString(ctx, "threadId"), sourceRefs);
         // The crew cap limits new crews only: follow-up work for a crew that exists is never refused for it.
         // A full host defers the turn in BB, and tellCrew reports that delivery as queued.
         await resumeRetainedAuthor(crew,ctxString(ctx,"threadId"));
         const sent = await tellCrew(crew, message, false, queue === true);
         if (resolveKey !== undefined && resolveKey.trim() !== "") {
           const closed = await appendResolvedStatus(crew, resolveKey.trim(), message);
-          return `${sent}${closed ? ` (resolved [key=${resolveKey.trim()}] in real state)` : ""}`;
+          return `${sent}${closed ? ` (resolved [key=${resolveKey.trim()}] in real state)` : ""}${taskNote}`;
         }
-        return sent;
+        return `${sent}${taskNote}`;
       } catch (error) {
         return toolError(error instanceof Error ? error.message : "Tell failed.");
       }
@@ -14834,7 +15088,12 @@ export default async function plugin(bb: BbPluginApi) {
         if (command === "board") {
           // The running crews per project, for the connector's board in each project topic. Always sent:
           // an empty list means no crew runs, and the connector shows 0 instead of counting task lines.
-          return { text: formatBoard(input), away: snapshot.rpc.afk, projects: workingByProject(input.tasks, snapshot.rpc.running.map((crew) => crew.id)), notLive };
+          // Owner decision Q8: every open promise is on the board, with when it is due.
+          const promised = ownerPromises.list(threadId);
+          // At most 8 lines, so the board stays inside the connector's message size.
+          const promiseText = promised.length === 0 ? "" : `\n\n⏰ Promised (${promised.length})\n${[...promised.slice(0, 8).map((p) => promiseLine(p, now)), ...(promised.length > 8 ? [`…and ${promised.length - 8} more: firstmate_promise list`] : [])].join("\n")}`;
+          return { text: formatBoard(input) + promiseText, away: snapshot.rpc.afk, projects: workingByProject(input.tasks, snapshot.rpc.running.map((crew) => crew.id)), notLive,
+            ...(promised.length === 0 ? {} : { promises: promised.map(({ id, by, what, task, ref, state }) => ({ id, by, what, task, ref, state: state === "due" ? "due" as const : "open" as const })) }) };
         }
         const memoryKey = `${DIGEST_MEMORY_PREFIX}${threadId}`;
         const digest = digestOnce(input, digestMemorySchema.safeParse(await bb.storage.kv.get(memoryKey)).data ?? EMPTY_DIGEST_MEMORY);
@@ -15505,6 +15764,9 @@ export default async function plugin(bb: BbPluginApi) {
             const ask = id ? ownerAsks.get(id) : undefined;
             const packAnswer = header?.sourceEventId?.startsWith("pack:") === true && packAnswers(header.body).some((item) => ownerAsks.get(item.id)?.captain === threadId);
             if (!header || header.forwarded || (!packAnswer && (!ask || ask.captain !== threadId || askLetterAnswer(ask, header.body) === null))) continue;
+            // The card's own task carries the work its answer drives; a card with no task asks for no new work.
+            const cardTask = ask?.task ?? packAnswers(header.body).map((item) => ownerAsks.get(item.id)?.task).find((task) => task !== undefined);
+            inboundLedger.noteWork([{ key: { source: "telegram", chatId: header.chatId, messageId: header.messageId }, work: cardTask ?? NO_WORK }]);
             inboundLedger.markAnswered({ source: "telegram", chatId: header.chatId, messageId: header.messageId }, Date.now());
           }
           if (flags.inboundLedger === "on") {
@@ -16073,7 +16335,8 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "wake", summary: "Drain the durable crew→captain wake queue (present, or --ack-through <seq> --recovery-generation <gen>)", usage: "bb firstmate wake [--ack-through <seq> --recovery-generation <gen>]" },
       { name: "deliveries", summary: "Durable PR health and follow-up", usage: "bb firstmate deliveries list|inspect|register|reconcile|assign|abandon|clear-hold [id] [--from <manager>] [--reason <evidence>] [--authorized]\nbb firstmate deliveries verify <id> --commit <head sha> --driven \"<what you drove>\" --seen \"<what you saw>\"   (the owning captain, or a crew that drove it)\nbb firstmate deliveries register --url <PR url> [--crew <id>]   (no --crew: a PR you opened yourself)\nbb firstmate deliveries account <id> --failure <id> --scope author|baseline --follow-up-task <existing-task> --reason <evidence> --authorized" },
       { name: "program", summary: "Programs (epics): one record per multi-ticket job, open until every ticket is done or dropped", usage: "bb firstmate program list | show <P-id> | refresh | create <epic-url> [--title t] [--task T<n>] [--ref tg:<chat>:<msg> ...] | set <P-id> <ticket> [<ticket> ...] --state blocked|dropped|ready|running|in-review|done [--reason r] [--ask id] [--crew id] [--pr ref]" },
-      { name: "prs", summary: "Read-only: open PRs by this GitHub account in the captain's projects with their tracking status, untracked first", usage: "bb firstmate prs [--json]" },
+      { name: "prs", summary: "Read-only: open PRs by this GitHub account in the captain's projects with their tracking status, untracked first. sweep: adopt now every open PR no open task links (it also runs hourly)", usage: "bb firstmate prs [--json] | prs sweep" },
+      { name: "promises", summary: "Dated promises to the owner: list, close one, or import the captain's follow-ups file once (dry run unless --apply)", usage: "bb firstmate promises list | kept <P-id> [--reason r] | dropped <P-id> --reason r | import [--captain <thread>] [--file <path>] [--apply] [--skip <line> ...]" },
       { name: "launches", summary: "Inspect reservations or explicitly adopt an existing legacy worker", usage: "bb firstmate launches list | adopt <task-id> --thread <thread-id> [--check] [--json]" },
       { name: "deliver", summary: "Outcome + committed/uncommitted diff + PR", usage: "bb firstmate deliver <crew-id>" },
       { name: "merge", summary: "Merge PR or local-only ff-only land", usage: "bb firstmate merge <crew-id> [--pr <number|url>] [--yes] [--keep-crew] [--allow-unverified <owner words>]" },
@@ -16480,7 +16743,25 @@ export default async function plugin(bb: BbPluginApi) {
             const text = await programOperation(ctxThread, ctxProject, input, signal);
             return reply({ action, text }, text);
           }
+          case "promises": {
+            const action = rest[0] ?? "list";
+            if (action === "import") {
+              const captain = flagStr(flags, "captain") ?? ctxThread;
+              if (!captain) return fail("promises import needs --captain <captain thread>.");
+              const skip = flagAll(flags, "skip").map(Number).filter(Number.isInteger);
+              const text = await importFollowupPromises(captain, flagStr(flags, "file"), flags.has("apply"), skip, signal);
+              return reply({ text }, text);
+            }
+            if (!ctxThread) return fail("promises needs a captain thread.");
+            if (action !== "list" && action !== "kept" && action !== "dropped") return fail("promises takes list, kept, dropped or import.");
+            const text = promiseOperation(ctxThread, action, rest[1], flagStr(flags, "reason"));
+            return reply({ text }, text);
+          }
           case "prs": {
+            if (rest[0] === "sweep") {
+              const text = await strayPrSweep(signal);
+              return reply({ text }, text);
+            }
             if (!ctxThread) return fail("prs needs a captain thread.");
             const report = await openPrReport(ctxThread, ctxProject ?? undefined, signal);
             return reply(report.rows, report.text);
@@ -17322,6 +17603,13 @@ export default async function plugin(bb: BbPluginApi) {
           for (const key of await bb.storage.kv.list(CAPTAIN_WAKE_HOLD_PREFIX)) {
             if (signal.aborted) break;
             await releaseHeldCaptainWakes(key.slice(CAPTAIN_WAKE_HOLD_PREFIX.length), signal);
+          }
+          for (const captain of [...knownCaptainsRef]) {
+            if (signal.aborted) break;
+            await wakeDuePromises(captain, signal).catch((error) => { if (!signal.aborted) bb.log.warn(`owner promises ${captain}: ${String(error)}`); });
+          }
+          if (Date.now() - (await bb.storage.kv.get<number>(STRAY_SWEEP_KEY) ?? 0) >= STRAY_SWEEP_MS) {
+            await strayPrSweep(signal).catch((error) => { if (!signal.aborted) bb.log.warn(`stray PR sweep: ${String(error)}`); });
           }
           if (Date.now() >= nextCompactSweep) {
             nextCompactSweep = Date.now() + CAPTAIN_COMPACT_SWEEP_MS;

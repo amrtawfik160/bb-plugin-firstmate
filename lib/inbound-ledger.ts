@@ -44,6 +44,20 @@ export type InboundRow = InboundKey & {
    * connector still sees the earlier answer it sent, so its replied check does not.
    */
   reopenedAt?: number | null;
+  /**
+   * Owner decision Q7: the owner task this message is part of (T<n>), or "no-work" when it asks for none.
+   * firstmate_reply records it; a reply to a message with neither is refused.
+   */
+  work?: string | null;
+  /**
+   * When the connector reported this message answered while it had no task and no "no-work": the answer reached
+   * the owner, but the message stays open until firstmate_reply records its link (and sends nothing again).
+   */
+  repliedAt?: number | null;
+  /** Hash of the message body without the connector's envelope; a new body under the same id is an edit. */
+  bodyHash?: string;
+  /** Telegram's edit_date (Unix seconds) of the newest edit recorded for this message. */
+  editedAt?: number | null;
   sourceRefs: string[];
   mediaGroupId: string | null;
   senderId: string | null;
@@ -140,6 +154,8 @@ export function eventToRow(event: LedgerEvent): InboundRow | null {
     captainThreadId: event.captainThreadId,
     receivedAt: event.receivedAt,
     textHash: hashText(event.text),
+    bodyHash: hashText(stripTelegramEnvelope(event.text) || event.text),
+    editedAt: tg?.editDate ?? null,
     preview: previewOf(stripTelegramEnvelope(event.text) || event.text),
     state: "received",
     ackedAt: null,
@@ -211,6 +227,9 @@ export function reminderDue(action: SweepAction, now: number): boolean {
 export function sweeperSteerText(action: SweepAction): string {
   const ref = inboundKey(action.row);
   const preview = action.row.preview;
+  if (action.row.repliedAt != null) {
+    return `Answered in Telegram but not linked: ${ref} '${preview}' has no owner task and no "no work". Call firstmate_reply with its ref and task or noWork=true; nothing is sent again.`;
+  }
   if (action.kind === "escalate") {
     return `Unanswered for ${Math.round(action.ageMs / 60_000)} min: ${ref} '${preview}' — answer or dispatch now.`;
   }
@@ -240,6 +259,10 @@ export type CreateInboundLedger = {
   /** One transaction: answers the anchor (when given) and each open cover, answered by the reply to by with no
    * message of its own and keeping its crew link, so a failure closes none. Returns the covers it closed. */
   finishReply(anchor: InboundKey | null, covers: InboundKey[], by: string, at: number): InboundRow[];
+  /** Records the task (T<n>) or "no-work" each owner message is part of; one transaction. */
+  noteWork(entries: ReadonlyArray<{ key: InboundKey; work: string }>): void;
+  /** The connector answered this open message, but it has no link yet: it stays open, marked replied. */
+  markRepliedUnlinked(key: InboundKey, at: number): InboundRow | undefined;
   markDelegated(key: InboundKey, crewId: string, at: number): InboundRow | undefined;
   /** Records that a crew ended on each still-delegated row handed to it. Returns the rows it changed. */
   crewEnded(crewId: string, at: number): InboundRow[];
@@ -319,7 +342,23 @@ export function createInboundLedger(db: Database): CreateInboundLedger {
       let first: InboundRow | null = null;
       for (const next of rows) {
         const existing = get(next);
+        // An answered message whose words changed under the same id is an edit, alone or inside a batch: it opens
+        // again with the new words and no link, since the answer and the task or "no work" given for the old words
+        // do not cover the new ones. A row from before body hashes cannot compare its words (its preview holds 80
+        // characters only): it opens again only on a real edit, an event with Telegram's edit date newer than any
+        // recorded for it. A replay carries no newer edit date and changes nothing. A message still open keeps its
+        // first record; its answer is still to come.
+        const newerEdit = next.editedAt != null && next.editedAt > (existing?.editedAt ?? 0);
+        const changed = existing === undefined ? false : existing.bodyHash !== undefined ? existing.bodyHash !== next.bodyHash : newerEdit;
+        if (existing?.state === "answered" && changed) {
+          db.prepare("DELETE FROM inbound_outbox WHERE source=? AND chat_id=? AND message_id=? AND kind <> 'ack'").run(existing.source, existing.chatId, existing.messageId);
+          first ??= save({ ...existing, textHash: next.textHash, bodyHash: next.bodyHash, preview: next.preview, work: null, repliedAt: null, editedAt: next.editedAt ?? existing.editedAt ?? null,
+            state: "acked", answeredAt: null, ackedAt: existing.ackedAt ?? event.receivedAt, coveredBy: undefined, remindedAt: null, remindedKind: null, reopenedAt: event.receivedAt });
+          continue;
+        }
         if (existing) {
+          // An old row learns its body hash only from a provably identical event (the same full text).
+          if (existing.bodyHash === undefined && next.bodyHash !== undefined && existing.textHash === next.textHash) save({ ...existing, bodyHash: next.bodyHash });
           first ??= existing;
           continue;
         }
@@ -414,6 +453,17 @@ export function createInboundLedger(db: Database): CreateInboundLedger {
           closed.push(save({ ...row, state: "answered", coveredBy: by, answeredAt: at, ackedAt: row.ackedAt ?? at }));
         }
         return closed;
+      })();
+    },
+    markRepliedUnlinked(key, at) {
+      return transition(key, (row) => row.state === "answered" || row.repliedAt != null ? row : { ...row, repliedAt: at, ackedAt: row.ackedAt ?? at, remindedAt: null, remindedKind: null });
+    },
+    noteWork(entries) {
+      db.transaction(() => {
+        for (const { key, work } of entries) {
+          const row = get(key);
+          if (row && row.work !== work) save({ ...row, work });
+        }
       })();
     },
     markDelegated(key, crewId, at) {

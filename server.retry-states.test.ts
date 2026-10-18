@@ -657,7 +657,7 @@ test("a threading mismatch with the Telegram bridge warns once and shows in bear
     host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: "idle" }));
     let mode = "off";
     host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode }));
-    const reply = (ref: string) => tool(host, "firstmate_reply").execute({ ref, text: "Done." }, { threadId: "thr_cap", projectId: "proj_1" } as never);
+    const reply = (ref: string) => tool(host, "firstmate_reply").execute({ noWork: true, ref, text: "Done." }, { threadId: "thr_cap", projectId: "proj_1" } as never);
     for (const id of ["1669", "1670", "1671"]) recordTelegram(host, id);
     await reply("tg:200:1669");
     await reply("tg:200:1670");

@@ -26,6 +26,8 @@ export type TelegramEnvelope = {
   repliedTo?: TelegramRepliedTo | null;
   /** reply_target.sourceEventId: the connector outbox item the owner replied to, such as `ask:<id>`. */
   sourceEventId?: string;
+  /** telegram_edit_date: Telegram's edit_date (Unix seconds) when this event is an edit of an earlier message. */
+  editDate?: number | null;
 };
 
 export type ConnectorHeader = TelegramEnvelope & {
@@ -135,6 +137,7 @@ export function parseConnectorHeader(text: string): ConnectorHeader | null {
       ? { name: textOrNull(project.name), projectId: textOrNull(project.projectId), captainThreadId: textOrNull(project.captainThreadId) }
       : null,
     ...(sourceEventId ? { sourceEventId } : {}),
+    ...(Number(dash(fields.get("telegram_edit_date"))) > 0 ? { editDate: Number(dash(fields.get("telegram_edit_date"))) } : {}),
     body: lines.slice(bodyStart).join("\n").trim(),
   };
 }

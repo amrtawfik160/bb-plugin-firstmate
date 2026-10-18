@@ -190,7 +190,7 @@ test("check T4: a reply the connector reports undelivered reopens the owner mess
       return { ok: true, queued: 1, duplicate: false, mode: "on" };
     });
     await ownerSays(host, "6000", "Status?");
-    await tool(host, "firstmate_reply").execute({ ref: "tg:200:6000", text: "All green." }, capCtx);
+    await tool(host, "firstmate_reply").execute({ noWork: true, ref: "tg:200:6000", text: "All green." }, capCtx);
     assert.equal(createInboundLedger(host.bb.storage.database()).get({ source: "telegram", chatId: "200", messageId: "6000" })?.state, "answered");
     const sends: string[] = [];
     host.harness.sdk.stub("threads.send", async (args: { input: Array<{ text: string }> }) => { sends.push(args.input[0]?.text ?? ""); return {}; });
@@ -286,7 +286,7 @@ test("check round 2: a reopened owner message stays open though the connector st
       return { ok: true, queued: 1, duplicate: false, mode: "on" };
     });
     await ownerSays(host, "6300", "Status?");
-    await tool(host, "firstmate_reply").execute({ ref: "tg:200:6300", text: "All green." }, capCtx);
+    await tool(host, "firstmate_reply").execute({ noWork: true, ref: "tg:200:6300", text: "All green." }, capCtx);
     const ledger = () => createInboundLedger(host.bb.storage.database()).get({ source: "telegram", chatId: "200", messageId: "6300" });
     const idle = () => host.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_cap", status: "idle" }), lastAssistantText: "ok" });
     await idle();
@@ -296,7 +296,7 @@ test("check round 2: a reopened owner message stays open though the connector st
     await idle();
     assert.notEqual(ledger()?.state, "answered", "the earlier answer does not close it again");
     undelivered = [];
-    await tool(host, "firstmate_reply").execute({ ref: "tg:200:6300", text: "The rest: the logs are clean." }, capCtx);
+    await tool(host, "firstmate_reply").execute({ noWork: true, ref: "tg:200:6300", text: "The rest: the logs are clean." }, capCtx);
     assert.equal(ledger()?.state, "answered", "a new reply closes it");
   } finally {
     await host.harness.lifecycle.dispose();
@@ -322,7 +322,7 @@ test("check round 3: a failure whose confirmation was lost is applied once: it n
       return { ok: true, queued: 1, duplicate: false, mode: "on" };
     });
     await ownerSays(host, "6400", "Report");
-    await tool(host, "firstmate_reply").execute({ ref: "tg:200:6400", text: "Here it is." }, capCtx);
+    await tool(host, "firstmate_reply").execute({ noWork: true, ref: "tg:200:6400", text: "Here it is." }, capCtx);
     // Telegram refuses that reply after it was accepted.
     await new Promise((resolve) => setTimeout(resolve, 5));
     failures[0]!.at = Date.now();
@@ -335,7 +335,7 @@ test("check round 3: a failure whose confirmation was lost is applied once: it n
     assert.deepEqual(acked, [], "the confirmation was lost");
     // The captain sends a corrected reply; Telegram takes it.
     await new Promise((resolve) => setTimeout(resolve, 5));
-    await tool(host, "firstmate_reply").execute({ ref: "tg:200:6400", text: "Here it is, corrected." }, capCtx);
+    await tool(host, "firstmate_reply").execute({ noWork: true, ref: "tg:200:6400", text: "Here it is, corrected." }, capCtx);
     assert.equal(ledger()?.state, "answered");
     await idle();
     await idle();
@@ -365,7 +365,7 @@ test("check round 3: a failure the captain was never told of does not reopen a m
     const pause = () => new Promise((resolve) => setTimeout(resolve, 5));
     // The failure is reported, but the message to the captain fails, so nothing is applied.
     await ownerSays(host, "6500", "Report");
-    await tool(host, "firstmate_reply").execute({ ref: "tg:200:6500", text: "Here it is." }, capCtx);
+    await tool(host, "firstmate_reply").execute({ noWork: true, ref: "tg:200:6500", text: "Here it is." }, capCtx);
     await pause();
     failures.push({ id: "out_10", chatId: "200", messageId: "6500", reason: "Telegram refused the message", at: Date.now() });
     let steerFails = true;
@@ -377,13 +377,13 @@ test("check round 3: a failure the captain was never told of does not reopen a m
     steerFails = false;
     // The captain answers again anyway, after the failure.
     await pause();
-    await tool(host, "firstmate_reply").execute({ ref: "tg:200:6500", text: "Here it is, again." }, capCtx);
+    await tool(host, "firstmate_reply").execute({ noWork: true, ref: "tg:200:6500", text: "Here it is, again." }, capCtx);
     await idle();
     assert.equal(ledger("6500")?.state, "answered", "a failure older than the answer does not reopen it");
     assert.ok(acked.includes("out_10"));
     // An older connector gives no time: the failure is applied once, so a later answer is never reopened by it.
     await ownerSays(host, "6501", "And the costs?");
-    await tool(host, "firstmate_reply").execute({ ref: "tg:200:6501", text: "Costs are fine." }, capCtx);
+    await tool(host, "firstmate_reply").execute({ noWork: true, ref: "tg:200:6501", text: "Costs are fine." }, capCtx);
     failures.push({ id: "out_11", chatId: "200", messageId: "6501", reason: "Telegram refused the message" });
     let ackFails = true;
     host.harness.sdk.stub("plugins.callRpc", async (args: Rpc) => {
@@ -396,7 +396,7 @@ test("check round 3: a failure the captain was never told of does not reopen a m
     });
     await idle();
     assert.notEqual(ledger("6501")?.state, "answered", "open again");
-    await tool(host, "firstmate_reply").execute({ ref: "tg:200:6501", text: "Costs are fine, corrected." }, capCtx);
+    await tool(host, "firstmate_reply").execute({ noWork: true, ref: "tg:200:6501", text: "Costs are fine, corrected." }, capCtx);
     await idle();
     assert.equal(ledger("6501")?.state, "answered", "applied once");
   } finally {

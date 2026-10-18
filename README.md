@@ -29,6 +29,8 @@ Background retries have an end. Uncertain launch reconciliation, crew PR discove
 
 `bb firstmate deliveries list --json` lists unresolved work; `inspect`, `register`, `reconcile`, `assign`, `abandon` and `verify` share the `firstmate_deliveries` tool. List accepts bounded `--limit` and `--offset`; `--all` is a read-only project view. Fleet, bearings and session show owner, blocker, next action and PR link. Worker forget preserves records and a scoped continuation snapshot. Outstanding work retains native task authority and its environment; destructive `forget --stop` refuses until delivery completes or is explicitly abandoned. Explicit handoff transfers ownership, including records whose worker was forgotten. Lost managers leave visible owner-needed records; assignment requires naming the previous manager.
 
+Once an hour GitHub searches list every open PR, by any author, in the repos `owner/projects.json` lists (repos named with an owner wildcard, such as `*/agent-orchestrator`, are found through this GitHub account's own PRs only). Each page is one read of the background sweep allowance. Each PR no open owner task links becomes a task in `check` with its next step, joined by the crew that already delivers it if any, and its captain gets one wake per sweep listing them; a PR is adopted once. A repo no project in `owner/projects.json` lists is told to the repair thread once. `bb firstmate prs sweep` runs it now.
+
 Every open PR a crew opens gets a delivery record within one supervision cycle (one minute). A PR belongs to a crew when its head branch is named after the crew (`fm/<task>`, `fm/<task>-…`), is the crew's worktree branch, or was checked out in the crew's worktree. This holds for the second and later PRs of one crew, for a scout that opens a PR, and for a PR opened after the crew was retired; launch records name retired crews. The scan makes one GitHub list call per repository per cycle, through the REST list API and not through search, whose rate budget all crews share. A repository with no live crew is listed every ten minutes. When every crew worktree of a project is gone, the call runs in the project main checkout. A crew whose PR merged is kept, not retired, while another of its PRs is open; a done report names every open PR of the crew. Once per day the captain gets one line with the link for each open PR that nobody touched for 24 hours, to decide: merge, fix or close. `bb firstmate prs [--json]` is read-only and lists the open PRs by this GitHub account in the captain's projects, untracked ones first.
 
 The dispatch contract `--delivery-requirement pr|merged|merged-and-verified` defaults to `merged`. PR-only tasks finish when a non-draft PR exists. Required verification needs the freshly observed merged commit and recorded evidence (`verify <id> --commit <sha> --reason "<evidence>"`). Deployment is not implied. Abandonment requires explicit authority and a reason. Follow-up never grants merge authority or merges directly; managers preserve the agreed native review and validation path and use native guarded merge. Required repository reviews remain pending. Unknown review evidence is labeled unresolved; it permits already-authorized native continuation, without inventing a mandatory external GitHub approval. Approval-required PRs remain visible.
@@ -223,8 +225,12 @@ Each flag in `fmReliability` is off until set, for example
   watchdog does not stop the crew.
 - `inboundLedger` records each owner message. With `on`, `firstmate_reply`
   answers any open item for the calling captain, with an optional `quote` for
-  one of several questions. `firstmate_inbox` lists every item still waiting,
-  and the captain gets one reminder per open item with backoff.
+  one of several questions. Each reply links every message it answers to an
+  owner task, or marks it `noWork`; a reply with neither is refused. A reply's
+  `promise={by, what}` is a dated record that wakes the captain at its time
+  (`firstmate_promise`; `bb firstmate promises import` converts the captain's
+  follow-ups file once, as a dry run unless `--apply`). `firstmate_inbox` lists
+  every item still waiting, and the captain gets one reminder per open item with backoff.
 - `telegramThreading` sends acks and replies through the Telegram plugin's
   `telegram.reply` RPC. See the [bridge contract](docs/telegram-bridge-contract.md).
   If the RPC reports that threaded replies are off in the connector while this
