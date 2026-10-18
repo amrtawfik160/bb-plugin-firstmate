@@ -7205,7 +7205,7 @@ export default async function plugin(bb: BbPluginApi) {
   const UNOWNED_PR_RECHECK_MS = 60 * 60_000;
   type PrCandidate = PrBranchCandidate & { crew: Crew; path: string; hostId: string; live: boolean; fresh: boolean };
   type OpenPr = { id: string; number: number; url: string; head: string; headSha?: string; title?: string; openedAt?: number; touchedAt?: number; candidate?: PrCandidate };
-  type OpenPrSnapshot = { at: number; repos: Array<{ projects: Set<string>; prs: OpenPr[]; openIds: Set<string>; repo: string; allOpen: Set<string> }> };
+  type OpenPrSnapshot = { at: number; repos: Array<{ projects: Set<string>; prs: OpenPr[]; openIds: Set<string>; repo: string; allOpen: Set<string>; validated: boolean }> };
   const crewBranches = new Map<string, { branch: string; path: string; hostId: string }>();
   const projectRepos = new Map<string, string>();
   const unownedPrs = new Map<string, number>();
@@ -7323,6 +7323,8 @@ export default async function plugin(bb: BbPluginApi) {
         const live = group.candidates.some((c) => c.live);
         const cached = openPrLists.get(repo);
         let listed = cached && !live && Date.now() - cached.at < RETIRED_ONLY_LIST_MS ? cached.rows : undefined;
+        // Rows fetched or revalidated (a 304) by GitHub in this cycle; cached rows are not.
+        const validated = !listed;
         if (!listed) {
           const fields = ".[] | {number, url: .html_url, title, headRefName: .head.ref, headSha: .head.sha, createdAt: .created_at, updatedAt: .updated_at, author: .user.login} | tojson";
           const list = (flags: string) => `${[...new Set(group.paths)].slice(0, 8).map((path) => `if cd ${shQuote(path)} 2>/dev/null; then gh api ${flags} ${shQuote("repos/{owner}/{repo}/pulls?state=open&per_page=100")} --jq ${shQuote(fields)}; exit $?; fi`).join("; ")}; exit 3`;
@@ -7376,7 +7378,7 @@ export default async function plugin(bb: BbPluginApi) {
         }
         // The repository is the origin remote, or else the one every listed PR names.
         const named = new Set([...allOpen].map((id) => id.slice(0, id.lastIndexOf("#"))));
-        snapshot.repos.push({ projects: group.projects, prs, openIds, repo: repo.includes("/") ? repo.slice(repo.indexOf("\t") + 1) : named.size === 1 ? [...named][0]! : "", allOpen });
+        snapshot.repos.push({ projects: group.projects, prs, openIds, repo: repo.includes("/") ? repo.slice(repo.indexOf("\t") + 1) : named.size === 1 ? [...named][0]! : "", allOpen, validated });
       }, signal).catch((error) => { if (!signal?.aborted) bb.log.warn(`Open PR list: ${String(error)}`); });
     }
     return snapshot;
@@ -7503,7 +7505,9 @@ export default async function plugin(bb: BbPluginApi) {
         const reopened: string[] = [];
         for (const r of records) {
           if (open?.repos.some((repo) => repo.allOpen.has(r.id))) { reopened.push(`${r.id} open on GitHub`); continue; }
-          const listed = open?.repos.some((repo) => repo.repo && r.id.startsWith(`${repo.repo}#`));
+          // Only a list GitHub answered in this cycle settles a terminal ledger row: cached
+          // rows can predate a reopen.
+          const listed = open?.repos.some((repo) => repo.validated && repo.repo && r.id.startsWith(`${repo.repo}#`));
           if (listed && (r.forgeState === "merged" || r.forgeState === "closed")) continue;
           let read: { exitCode: number; output: string } | null = null;
           try { read = await ghGraphql(hostId, `gh pr view ${shQuote(r.url)} --json state`, 30_000, signal); }
