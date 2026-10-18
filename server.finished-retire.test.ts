@@ -68,6 +68,20 @@ async function captainHost(status: Record<string, string>, threadStatus: Record<
 const teardowns = (commands: string[]) => commands.filter((c) => c.includes("fm-teardown.sh")).map((c) => /"\$FM_BINDIR\/fm-teardown\.sh" '\\''([\w-]+)/.exec(c)?.[1] ?? c);
 const crewIds = async (host: Awaited<ReturnType<typeof captainHost>>["host"]) => ((await host.bb.storage.kv.get("crews")) as Array<{ id: string }>).map((c) => c.id);
 
+for (const verb of ["waiting", "note"]) {
+  test(`checker164: newer ${verb} after done must keep the crew in retire-finished and schedule`, async () => {
+    const status = `done [at=${old}]: v1 complete\n${verb} [at=${fresh}]: WAITING for external CI; follow-up still pending\n`;
+    const { host, commands } = await captainHost({ wait1: status });
+    try {
+      await host.bb.storage.kv.set("crews", [crewRow("wait1", "thr_wait")]);
+      const dry = await host.harness.behavior.runCli(["retire-finished", "--captain", "thr_cap"], ctx);
+      await host.harness.behavior.runSchedule("finished-crew-retire");
+      assert.deepEqual({ dry: /would-retire/.test(dry.stdout), teardowns: teardowns(commands), crews: await crewIds(host) },
+        { dry: false, teardowns: [], crews: ["wait1"] });
+    } finally { await host.harness.lifecycle.dispose(); }
+  });
+}
+
 test("the sweep retires an idle crew that reported done hours ago and keeps every crew still needed", async () => {
   const { host, commands } = await captainHost({
     done1: `working [at=${old - 600}]: reading\ndone [at=${old}]: report ready at data/done1/report.md\n`,

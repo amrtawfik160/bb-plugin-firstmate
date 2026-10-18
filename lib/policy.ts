@@ -186,7 +186,7 @@ export function isWaitingYield(text: string | null | undefined): boolean {
  */
 export function waitingPauseLine(text: string | null | undefined, statusLines: string[], nowSec: number): string | null {
   if (!isWaitingYield(text)) return null;
-  // fm-classify-lib counts `note` as an event; latestStatus does not.
+  // fm-classify-lib counts even delivery annotation notes as events.
   const latest = statusLines.map((line) => statusLineVerb(line).toLowerCase()).filter((verb) => verb === "note" || STATUS_VERBS.has(verb)).at(-1);
   if (latest !== undefined && latest !== "working" && latest !== "note") return null;
   const yieldLine = text!.split(/\r?\n/).find((line) => statusLineVerb(line).toLowerCase() === "waiting") ?? "";
@@ -414,32 +414,39 @@ export function classifyMetaKind(metaContent: string | null): string {
  * ("> done: …", "\"DONE: …\"") do not count. A later non-terminal verb wins.
  */
 export function hasTerminalVerdict(lines: string[]): boolean {
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = (lines[i] ?? "").replace(/\r$/, "");
-    if (!/\S/.test(line)) continue;
-    const verb = statusLineVerb(line).toLowerCase();
-    if (!STATUS_VERBS.has(verb)) continue;
-    if (verb !== "done" && verb !== "failed") return false;
-    return stripTimeTag(line).includes(":");
-  }
-  return false;
+  const line = latestWorkerStatusLine(lines);
+  if (line === null) return false;
+  const verb = statusLineVerb(line).toLowerCase();
+  return (verb === "done" || verb === "failed") && stripTimeTag(line).includes(":");
 }
 
-/** The most recent recognized status verb + note (fm-classify-lib `last_status_line`, verb-filtered). */
-export function latestStatus(lines: string[]): { verb: string; note: string } | null {
+function isWorkerStatusLine(line: string): boolean {
+  const verb = statusLineVerb(line).toLowerCase();
+  // Delivery observations are plugin annotations, not a new worker event.
+  if (verb === "note" && (line.slice(0, line.indexOf(":")).includes("[source=bb-plugin]")
+    || statusLineNote(line).startsWith("FM_DELIVERY_NOTICE="))) return false;
+  return STATUS_VERBS.has(verb) || verb === "waiting" || verb === "note";
+}
+
+/** Latest worker event, including BB waits and notes; delivery annotations do not replace it. */
+export function latestWorkerStatusLine(lines: readonly string[]): string | null {
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = (lines[i] ?? "").replace(/\r$/, "");
-    if (!/\S/.test(line)) continue;
-    const verb = statusLineVerb(line).toLowerCase();
-    if (STATUS_VERBS.has(verb)) return { verb, note: statusLineNote(line) };
+    if (isWorkerStatusLine(line)) return line;
   }
   return null;
 }
 
-/** Pull the status-protocol lines out of arbitrary text (a BB crew's chat output has no .status file). */
+/** Most recent worker event's verb and note. */
+export function latestStatus(lines: string[]): { verb: string; note: string } | null {
+  const line = latestWorkerStatusLine(lines);
+  return line === null ? null : { verb: statusLineVerb(line).toLowerCase(), note: statusLineNote(line) };
+}
+
+/** Pull worker status-protocol events out of chat output. */
 export function statusLinesFrom(text: string | null | undefined): string[] {
   if (text == null || text === "") return [];
-  return text.split(/\r?\n/).filter((line) => /\S/.test(line) && STATUS_VERBS.has(statusLineVerb(line).toLowerCase()));
+  return text.split(/\r?\n/).filter(isWorkerStatusLine);
 }
 
 /**

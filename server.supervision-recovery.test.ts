@@ -498,7 +498,7 @@ test("native: a plugin note written after a crew's paused line leaves the wait s
     await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
     assert.deepEqual((await emitIdle(host, "BLOCKED: the staging deploy needs an owner sign-in")).errors, []);
     const status = readFileSync(join(home, "state/c1.status"), "utf8");
-    assert.match(status, /^note: .*BLOCKED/m, "the report is still written as a note");
+    assert.match(status, /^note \[source=bb-plugin\]: .*BLOCKED/m, "the report is still written as a note");
     assert.equal(nativeDeclaredWait(home, "c1"), paused, "the watcher still reads the declared wait");
     writeFileSync(join(home, "state/c1.status"), "working [at=1791585843]: building\n");
     assert.deepEqual((await emitIdle(host, "BLOCKED: a second, different problem")).errors, []);

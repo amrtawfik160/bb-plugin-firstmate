@@ -7396,10 +7396,10 @@ test("IT F5: turnEndGuard bounds unchanged wakes and resets only for new work", 
 
 // ---- re-review: tellOwner steer must not be weaponized by fm-watch ----
 
-test("note: report lines never override the crew's real terminal verb (latestStatus/summary)", () => {
+test("plugin report annotations never override the crew's real terminal verb (latestStatus/summary)", () => {
   // A crew's real verb followed by our appended report note: latestStatus must still
   // report `done`, and the summary must not show the note as the crew's state.
-  const lines = ["working: building", "done: shipped PR #9", "note: crew c1 update REPORTX"];
+  const lines = ["working: building", "done: shipped PR #9", "note [source=bb-plugin]: crew c1 update REPORTX"];
   assert.deepEqual(latestStatus(lines), { verb: "done", note: "shipped PR #9" });
   const summary = statusProtocolSummary(lines);
   assert.match(summary ?? "", /state: done/);
@@ -7957,12 +7957,13 @@ for (const entry of ["tool", "cli"] as const) {
       });
       const assertCleanup = () => {
         assert.equal(nativeTerminals.size,1,"finish or time out the same native invocation, never retry it");
-        // Receipt: init, two payload chunks, atomic decode/rename, writer
-        // cleanup, one native execution and receipt cleanup. Peek stays direct.
-        assert.equal(commands.size,scenario.script==="wake-drain" ? 7 : 1,"exact staging/execution/cleanup commands");
+        // Receipt payload size changes with the embedded helper. Each chunk must
+        // still belong to one staged execution with complete cleanup.
+        const payloadChunks = [...commands.values()].filter(cmd=>cmd.startsWith("printf '%s' ")).length;
+        assert.equal(commands.size,scenario.script==="wake-drain" ? 5 + payloadChunks : 1,"exact staging/execution/cleanup commands");
         if (scenario.script==="wake-drain") {
           assert.equal(writes.length,1,"publish exactly one complete guarded command");
-          assert.equal([...commands.values()].filter(cmd=>cmd.startsWith("printf '%s' ")).length,2,"exact payload chunk count");
+          assert.ok(payloadChunks > 0,"receipt payload is staged before execution");
           assert.match(command,/ 'receive' '' "\$FM_BINDIR\/fm-wake-drain.sh"$/,"timeout never requests an acknowledgement");
         }
         assert.deepEqual([...closed].sort(),[...commands.keys()].sort(),"every created terminal closes exactly once");

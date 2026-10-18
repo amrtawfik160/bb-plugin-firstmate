@@ -41,7 +41,14 @@ test("a crew that is not finished, or still needed, is kept with the reason", ()
 
 test("latestStatusAt reads the latest status line's time tag and skips plugin notes", () => {
   assert.equal(latestStatusAt([`done [at=100]: x`, "note: FM_DELIVERY_NOTICE=a#1"]), 100_000);
+  assert.equal(latestStatusAt(["done [at=100]: complete", "note [source=bb-plugin]: crew update"]), 100_000);
   assert.equal(latestStatusAt([]), null);
+  for (const verb of ["waiting", "note"]) {
+    assert.equal(latestStatusAt(["done [at=100]: complete", `${verb} [at=200]: follow-up`]), 200_000);
+    assert.equal(latestStatusAt(["done [at=100]: complete", `${verb}: follow-up`]), null);
+    assert.equal(finishedRetireVerdict(facts({ statusLines: [`done [at=${old}]: complete`, `${verb}: follow-up`] }), now).retire, false);
+  }
+  assert.equal(finishedRetireVerdict(facts({ statusLines: [`done [at=${old}]: complete`, "note: FM_DELIVERY_NOTICE=a#1"] }), now).retire, true);
 });
 
 // Checker 156-verdict-1, finding 1: the live backlog held open captain questions

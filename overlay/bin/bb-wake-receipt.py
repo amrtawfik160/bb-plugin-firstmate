@@ -3,6 +3,7 @@
 
 Usage: bb-wake-receipt.py STATE ACTION EXPECTED NATIVE_SCRIPT
 Actions: receive, inspect ID, begin-action ID, mark-success ID, complete ID,
+         complete-hidden ID (BB-classified hidden batches; no successor read),
          legacy-ack THROUGH:GENERATION. receive uses an empty EXPECTED.
 Returns one bounded FM_BB_RECEIPT=<JSON> line; full reports stay on disk.
 FM_WAKE_RECEIPT_BUDGET bounds one call in seconds. A call that reaches it exits
@@ -96,6 +97,19 @@ def ack_pair(report):
     return {"through": int(matches[0][1]), "generation": matches[0][2]} if matches else None
 
 
+PENDING_WARNING = "WARNING: queued wakes pending - drain them"
+
+
+def report_without_pending_hint(report):
+    # Rows arriving after the presentation boundary have no acknowledgement pair.
+    # A guard hint cannot turn hidden stale rows into new captain reports. Keep
+    # actual presentations (including wedge rows) and their cursor untouched.
+    if ack_pair(report) is not None:
+        return report
+    return "".join(line for line in report.splitlines(keepends=True)
+                   if not line.startswith(PENDING_WARNING))
+
+
 def meaningful(report):
     lines = []
     for line in report.splitlines():
@@ -126,6 +140,8 @@ def decisions_surface(report):
     """Return (OPEN DECISIONS section text, whether it is the whole surface)."""
     block, inside, only = [], False, True
     for line in meaningful(report).splitlines():
+        if line.startswith(PENDING_WARNING):
+            continue
         if SECTION.match(line):
             inside = line.startswith("OPEN DECISIONS")
         if inside:
@@ -242,6 +258,7 @@ class Journal:
         cursor, which advances whenever any crew appends any status line.
         """
         block, only = decisions_surface(report)
+        self.current["decisionsRepeated"] = False
         path = self.decisions_path()
         if not block:
             path.unlink(missing_ok=True)
@@ -253,6 +270,7 @@ class Journal:
             seen = False
         if not seen:
             atomic_text(path, digest)
+        self.current["decisionsRepeated"] = seen
         return only and seen
 
     def prune_reports(self):
@@ -296,6 +314,7 @@ class Journal:
             "path": str(self.report_path()) if value else "",
             "replayed": replayed,
             "truncated": False,
+            "decisionsRepeated": bool(value and value.get("decisionsRepeated")),
             "actionSucceeded": bool(value and value.get("actionSucceeded")),
         }
         if completed:
@@ -388,7 +407,7 @@ class Journal:
         if arrived_mid_drain(report) and self.deadline - time.monotonic() >= time.monotonic() - started:
             report = self.native([], phase)
         archive_retired_status(self.state)
-        return report
+        return report_without_pending_hint(report)
 
     def capture_result(self):
         output, result_path = self.capture_paths()
@@ -411,6 +430,7 @@ class Journal:
 
     def finish_presentation(self, report):
         pair = ack_pair(report)
+        report = report_without_pending_hint(report)
         preserved = self.current.pop("preservedReport", "")
         if preserved:
             report = "RECOVERED PRESENTATION (reconcile before repeating actions):\n" + preserved + "\nCURRENT NATIVE PRESENTATION:\n" + report
@@ -422,6 +442,8 @@ class Journal:
         repeat = self.decisions_repeat(report)
         if not self.current["pair"] and (not meaningful(report) or repeat):
             self.clear()
+        else:
+            self.save()
 
     def recover_presentation(self):
         try:
@@ -467,8 +489,13 @@ class Journal:
         self.save()
         self.publish(True)
 
-    def complete(self, expected):
+    def complete(self, expected, hidden=False):
         self.check_id(expected)
+        if hidden:
+            if self.current["phase"] != "ready":
+                raise RuntimeError("Only a ready hidden presentation may skip successor refresh")
+            self.current["hiddenCompletion"] = True
+            self.save()
         completed = self.current["id"]
         if self.current["phase"] in {"ready", "acting"}:
             self.current["phase"] = "handled"
@@ -497,6 +524,18 @@ class Journal:
                 acknowledgement = ""
             self.current.update(phase="acknowledged", ackReport=prior + acknowledgement)
             self.save()
+        if self.current["phase"] == "acknowledged" and self.current.get("hiddenCompletion"):
+            # BB classified every presented row with fresh crew state. A refresh
+            # could immediately present the next hidden refill forever. Acknowledge
+            # only this receipt's native pair; unseen rows stay queued for receive.
+            acknowledgement = report_without_pending_hint(self.current.get("ackReport", ""))
+            if meaningful(acknowledgement):
+                self.current = {"version": 1, "id": uuid.uuid4().hex, "phase": "presenting", "pair": None}
+                self.finish_presentation(acknowledgement)
+            else:
+                self.clear()
+            self.publish(completed=completed)
+            return
         if self.current["phase"] == "acknowledged":
             fresh = self.present("refreshing")
         elif self.current["phase"] == "refreshing":
@@ -510,6 +549,7 @@ class Journal:
                 fresh = self.native([], "refreshing")
         else:
             raise RuntimeError("Invalid completion phase; journal retained")
+        fresh = report_without_pending_hint(fresh)
         acknowledgement = self.current.get("ackReport", "")
         old_report = self.report()
         pair = ack_pair(fresh)
@@ -522,12 +562,13 @@ class Journal:
         known_decisions = (fresh_surface.startswith("OPEN DECISIONS")
                            and old_surface.endswith("\n" + fresh_surface))
         decisions_repeat = self.decisions_repeat(fresh)
+        decisions_seen = self.current.get("decisionsRepeated", False)
         unchanged = decisions_repeat or (self.status_unchanged and (fresh_surface == old_surface or known_decisions))
         if not pair and not meaningful(acknowledgement) and (not meaningful(fresh) or unchanged):
             self.clear()
         else:
             report = ("NATIVE ACKNOWLEDGEMENT OUTPUT (previous handling completed):\n" + acknowledgement + "\n" if meaningful(acknowledgement) else "") + fresh
-            self.current = {"version": 1, "id": uuid.uuid4().hex, "phase": "ready", "pair": pair}
+            self.current = {"version": 1, "id": uuid.uuid4().hex, "phase": "ready", "pair": pair, "decisionsRepeated": decisions_seen}
             atomic_text(self.report_path(), report)
             self.save()
         self.publish(completed=completed)
@@ -548,7 +589,7 @@ def main():
     if len(sys.argv) != 5:
         raise RuntimeError("Usage: bb-wake-receipt.py STATE ACTION EXPECTED NATIVE_SCRIPT")
     state, action, expected, script = sys.argv[1:]
-    if action not in {"receive", "inspect", "begin-action", "mark-success", "complete", "legacy-ack"}:
+    if action not in {"receive", "inspect", "begin-action", "mark-success", "complete", "complete-hidden", "legacy-ack"}:
         raise RuntimeError("Unknown wake receipt action")
     os.umask(0o077)
     state = Path(state).resolve()
@@ -569,8 +610,8 @@ def main():
             journal.begin_action(expected)
         elif action == "mark-success":
             journal.mark_success(expected)
-        elif action == "complete":
-            journal.complete(expected)
+        elif action in {"complete", "complete-hidden"}:
+            journal.complete(expected, hidden=action == "complete-hidden")
         else:
             pair = journal.current.get("pair") if journal.current else None
             if not pair or expected != str(pair["through"]) + ":" + pair["generation"]:
