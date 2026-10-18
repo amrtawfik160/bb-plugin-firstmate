@@ -1,6 +1,7 @@
 // bb-plugin-firstmate — firstmate-style crews native to BB.
 import { deflateSync } from "node:zlib";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
@@ -76,7 +77,10 @@ import { ACK_TEXT, ackEligible, createInboundLedger, expandTelegramRows, followU
 import { inboundHookDecision } from "./lib/inbound-dispatch.ts";
 import { formatWorkersForTelegram } from "./lib/telegram-commands.ts";
 import { digestOnce, EMPTY_DIGEST_MEMORY, formatBoard, workingByProject, type BoardInput, type DigestMemory } from "./lib/owner-board.ts";
-import { createOwnerTasks, isOpenTask, sameProject, stateFromPrs, taskLine, taskOfRef, telegramTasks, type CrewFinish, type OwnerTask, type TaskState } from "./lib/owner-tasks.ts";
+import { createOwnerTasks, isFinishedTask, isOpenTask, sameProject, stateFromPrs, taskLine, taskOfRef, telegramTasks, type CrewFinish, type OwnerTask, type TaskState } from "./lib/owner-tasks.ts";
+import { readEnvFile } from "./lib/live-checks.ts";
+import { LIVE_PASS_MS, planOf, ruleOf, runLivePass, type LiveStatus } from "./lib/live-pass.ts";
+import { notLiveItems } from "./lib/stalls.ts";
 import {
   buildProgram, createPrograms, isOpenProgram, isOpenTicket, newlyReady, numberOf, programCounts, programText, readyRefs, readyWakeText, repoOf,
   shortTicket, stallReminderDue, stallReminderText, ticketRef, type IssueFacts, type Program, type ProgramFact, type TicketRef,
@@ -98,7 +102,7 @@ import { crewPipeline, crewPlaybook, crewSkillBlock, crewSkillRoot, notVerifiedN
 import { CREW_ROLES, crewExecution } from "./owner/crew-roles.ts";
 import { DISPATCH_VERSION, PROOF_STEP, pipelineGates, proofStep } from "./owner/pipelines.ts";
 import { changeReach, type Reach } from "./owner/reach.ts";
-import { hostCanDrive, PROOF_SURFACES, projectBriefLines, projectForName, projectForRepo, repoOf as prRepoOf, surfaceRefusal, surfaceWords, unlistedNote } from "./owner/projects.ts";
+import { type LiveCheck, hostCanDrive, PROOF_SURFACES, projectBriefLines, projectForName, projectForRepo, repoOf as prRepoOf, surfaceRefusal, surfaceWords, unlistedNote } from "./owner/projects.ts";
 import { createReleaseReadbacks, type ReleaseSource } from "./lib/release-readback.ts";
 import { cardSubject, keyFromEnvFile, ownerRules, ruleAnsweringCard } from "./lib/card-rules.ts";
 import { authFailure, signedIn, signInCommand, wakeCompletionRetryMs, withoutWakeWarning } from "./lib/action-guards.ts";
@@ -489,6 +493,16 @@ function wrapHostCommand(command: string): string {
     throw new Error(`Host command too long (${script.length} > ${HOST_COMMAND_MAX}). Stage bulky payloads with writeHostBytes.`);
   }
   return script;
+}
+
+/** Run a local read-only command (git in this plugin's own checkout) with no shell. */
+function runLocal(command: string, args: string[]): Promise<{ code: number | null; stdout: string }> {
+  return new Promise((resolve) => {
+    execFile(command, args, { timeout: 15_000, maxBuffer: 1 << 20 }, (error, stdout) => {
+      const code = error === null ? 0 : typeof (error as NodeJS.ErrnoException & { code?: unknown }).code === "number" ? (error as unknown as { code: number }).code : null;
+      resolve({ code, stdout: String(stdout) });
+    });
+  });
 }
 
 function shQuote(text: string): string {
@@ -1797,9 +1811,11 @@ export default async function plugin(bb: BbPluginApi) {
   /** A PR's opening time, only from GitHub's createdAt: read now, or stored with that source. Any other stored time does not count (checker round 6). */
   const githubOpenedAt = (read: number | undefined, row: Pick<DeliveryRecord, "openedAt" | "openedAtSource"> | undefined) => read ?? (row?.openedAtSource === "github" ? row.openedAt : undefined);
   const leases = createLeases(bb.storage.database());
-  const ownerTasks = createOwnerTasks(bb.storage.database(), (task, to) => {
+  const ownerTasks = createOwnerTasks(bb.storage.database(), (task, to, move) => {
     const program = programs.holding(task.id);
-    if (program === undefined) return to === "live" || to === "done" ? releaseHold(task) : null;
+    // A project live check proves live by the project's own way of going live (owner/projects.json), which
+    // for an OTA project is the published update, not a TestFlight read-back.
+    if (program === undefined) return to === "live" && !(move?.to === "live" && move.checked) ? releaseHold(task) : null;
     const c = programCounts(program);
     return `Task ${task.id} holds program ${program.id} (${program.title}): ${c.total - c.done - c.dropped} of ${c.total} tickets are open. It closes by itself when every ticket is done or dropped. If the owner stops the work, drop the open tickets with firstmate_program set state=dropped and the owner's words.`;
   }, () => { void refreshOwnerBoard(); });
@@ -5098,6 +5114,109 @@ export default async function plugin(bb: BbPluginApi) {
     return ownerTasks.list(captain);
   }
 
+  // The commit this Firstmate loaded: the plugin runs its checkout's source, so HEAD at load is what runs.
+  const firstmateLoaded: Promise<{ label: string; sha: string; at: number } | string> = runLocal("git", ["-C", PLUGIN_ROOT, "rev-parse", "HEAD"])
+    .then((out) => out.code === 0 && /^[0-9a-f]{40}$/.test(out.stdout.trim())
+      ? { label: `Firstmate loaded on this host at ${new Date().toISOString().slice(0, 16)}Z`, sha: out.stdout.trim(), at: Date.now() }
+      : `the Firstmate checkout ${PLUGIN_ROOT} has no readable commit`);
+
+  /** The commit a plugin loaded on this host, or why it is not known. */
+  async function pluginLoadedCommit(plugin: string): Promise<{ label: string; sha: string; at?: number } | string> {
+    if (plugin === "firstmate") return firstmateLoaded;
+    if (plugin !== "telegram") return `no way to read what the ${plugin} plugin loaded`;
+    try {
+      const loaded = await bb.sdk.plugins.callRpc({
+        pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "loadedCommit", input: {},
+        outputSchema: z.object({ sha: z.string().regex(/^[0-9a-f]{40}$/), loadedAt: z.number() }),
+      });
+      return { label: `Telegram loaded on this host at ${new Date(loaded.loadedAt).toISOString().slice(0, 16)}Z`, sha: loaded.sha, at: loaded.loadedAt };
+    } catch (error) {
+      return isTelegramRpcMissing(error) ? "the Telegram plugin does not report the commit it loaded yet" : `the Telegram plugin did not say what it loaded: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+
+  // Containment answers never change for one pair of commits, so they are kept for the process.
+  const containsCache = new Map<string, boolean>();
+  /** True when `ancestor` is in `descendant`'s history: the Firstmate checkout answers for itself, GitHub's
+   * compare for any other repo, inside the sweep's hourly GitHub allowance (null when it is spent). */
+  async function commitContains(check: LiveCheck, repo: string, ancestor: string, descendant: string, signal?: AbortSignal): Promise<boolean | null> {
+    const key = `${repo}\n${ancestor}\n${descendant}`;
+    const known = containsCache.get(key);
+    if (known !== undefined) return known;
+    let answer: boolean | null = null;
+    if (check.kind === "plugin-reload" && check.plugin === "firstmate") {
+      const out = await runLocal("git", ["-C", PLUGIN_ROOT, "merge-base", "--is-ancestor", ancestor, descendant]);
+      answer = out.code === 0 ? true : out.code === 1 ? false : null;
+    } else {
+      const hostId = await backgroundHost(signal);
+      if (hostId === undefined) return null;
+      answer = await backgroundBudget.run("sweep", async () => {
+        if (!reserveGithub(hostId)) return null;
+        const res = await runStructuredOnHost(hostId, `gh api ${shQuote(`repos/${repo}/compare/${ancestor}...${descendant}`)} --jq .status`, 30_000, signal);
+        const status = res.output.trim();
+        return res.exitCode !== 0 ? null : status === "ahead" || status === "identical" ? true : status === "behind" || status === "diverged" ? false : null;
+      });
+    }
+    if (answer !== null) containsCache.set(key, answer);
+    return answer;
+  }
+
+  const LIVE_PASS_AT_PREFIX = "live-pass-at:";
+  const LIVE_STATUS_PREFIX = "live-status:";
+  const STALL_MEMORY_PREFIX = "stall-memory:";
+  async function liveStatusOf(captain: string): Promise<LiveStatus> {
+    return z.record(z.string(), z.object({ missing: z.string().nullable(), at: z.number() })).safeParse(await bb.storage.kv.get(`${LIVE_STATUS_PREFIX}${captain}`)).data ?? {};
+  }
+
+  /** Owner decisions Q1, Q5 and Q9 (18 Oct): once an hour, move merged work production holds to live, then alert new stalls. */
+  async function followThrough(captain: string, signal?: AbortSignal): Promise<void> {
+    const now = Date.now();
+    const last = await bb.storage.kv.get<number>(`${LIVE_PASS_AT_PREFIX}${captain}`);
+    if (typeof last === "number" && now - last < LIVE_PASS_MS) return;
+    await bb.storage.kv.set(`${LIVE_PASS_AT_PREFIX}${captain}`, now);
+    reconcileTasks(captain, now);
+    const telegram = (await reliabilityFlags()).telegramThreading === "on";
+    const stallMemory = z.record(z.string(), z.object({ at: z.number(), updatedAt: z.number() })).safeParse(await bb.storage.kv.get(`${STALL_MEMORY_PREFIX}${captain}`)).data ?? {};
+    const out = await runLivePass({
+      captain, now,
+      tasks: () => ownerTasks.list(captain, { includeClosed: true }),
+      recordsFor: (task) => deliveries.forTasks(task.crewIds, task.prs),
+      running: await captainCrewIds(captain),
+      readers: { fetch: (url, init) => fetch(url, init), env: readEnvFile, loadedCommit: pluginLoadedCommit, ...(signal ? { signal } : {}) },
+      contains: (check, repo, ancestor, descendant) => commitContains(check, repo, ancestor, descendant, signal),
+      readback: (task) => {
+        const group = ruleOf(task, deliveries.forTasks(task.crewIds, task.prs))?.release?.group;
+        const read = group === undefined ? undefined : releaseReadbacks.forTask(task.captain, task.id).find((row) => row.group.toLowerCase() === group.toLowerCase());
+        return read ? `Build ${read.build} read back in "${read.group}" from ${read.source}: ${read.seen}` : null;
+      },
+      markLive: (task, evidence, check) => {
+        try { ownerTasks.move(task.id, captain, { to: "live", reason: evidence, checked: check }, now); return true; }
+        catch (error) { bb.log.info(`live check: ${task.id} stays merged: ${error instanceof Error ? error.message : String(error)}`); return false; }
+      },
+      alert: async (project, text, incident) => {
+        if (!telegram) return false;
+        try {
+          const sent = await bb.sdk.plugins.callRpc({
+            pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "alert",
+            input: { alertId: hashText(`${captain}\nwarning\n\n${project?.toLowerCase() ?? ""}\n${incident}`).slice(0, 32), level: "warning", text, ...(project ? { project } : {}) },
+            outputSchema: z.object({ queued: z.number(), duplicate: z.boolean() }),
+          });
+          return sent.duplicate || sent.queued > 0;
+        } catch (error) {
+          bb.log.warn(`stall alert ${incident}: ${error instanceof Error ? error.message : String(error)}`);
+          return false;
+        }
+      },
+      stallMemory,
+    });
+    await bb.storage.kv.set(`${LIVE_STATUS_PREFIX}${captain}`, { ...(await liveStatusOf(captain)), ...out.status });
+    await bb.storage.kv.set(`${STALL_MEMORY_PREFIX}${captain}`, out.stallMemory);
+    if (out.live.length > 0 || out.alerted.length > 0) {
+      bb.log.info(`follow-through ${captain}: live ${out.live.join(", ") || "none"}; stall alerts ${out.alerted.join(", ") || "none"}`);
+      await refreshOwnerBoard();
+    }
+  }
+
   /** The owner task that already holds the PR a dispatch is for: named in its title, or the only PR its task names. */
   async function prTask(captain: string, projectId: string, title: string | undefined, task: string): Promise<OwnerTask | undefined> {
     const named = (text: string) => {
@@ -5217,7 +5336,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (state.kind !== "running" && state.kind !== "in-review") continue;
       const records = deliveries.forTasks(state.crewId ? [state.crewId] : [], state.kind === "in-review" ? [state.pr] : []);
       const proved = stateFromPrs(records);
-      if (proved === "merged" || proved === "live") {
+      if (proved === "merged") {
         const merged = records.find((r) => r.forgeState === "merged" || r.mergeCommitSha !== null) ?? records[0]!;
         facts.push({ kind: "pr-merged", ticket: ticket.ref, pr: merged.id });
       } else if (proved === "working" || proved === "ready") {
@@ -5262,13 +5381,15 @@ export default async function plugin(bb: BbPluginApi) {
     return current;
   }
 
-  /** A program with every ticket done or dropped closes the owner task it held. */
+  /** A program with every ticket done or dropped hands its owner task on: merged when any ticket merged (its
+   * live check follows), else the captain's check, since only the owner's words drop the task. */
   function closeFinishedProgram(program: Program): void {
     if (isOpenProgram(program) || program.taskId === null) return;
     const task = ownerTasks.get(program.taskId);
-    if (task === undefined || (!isOpenTask(task) && task.state !== "merged")) return;
+    if (task === undefined || !isOpenTask(task)) return;
     const c = programCounts(program);
-    ownerTasks.move(task.id, program.captain, { to: "done", reason: `Program ${program.id}: ${c.done} done, ${c.dropped} dropped` }, Date.now());
+    const to = c.done > 0 ? "merged" : "check";
+    if (task.state !== to) ownerTasks.move(task.id, program.captain, { to, reason: `Program ${program.id}: ${c.done} done, ${c.dropped} dropped` }, Date.now());
   }
 
   /** Bring each open program up to date: tickets from crews and PRs, closed issues from GitHub every 30 minutes,
@@ -5397,7 +5518,7 @@ export default async function plugin(bb: BbPluginApi) {
       return [
         isOpenProgram(program)
           ? `Program ${program.id} is open and keeps owner task ${taskId} open until every ticket is done or dropped.`
-          : `Program ${program.id} is closed; owner task ${taskId} is done.`,
+          : `Program ${program.id} is closed; owner task ${taskId} is ${ownerTasks.get(taskId)?.state ?? "closed"}.`,
         programText(program, now),
         ready.length > 0 ? `Ready now: ${ready.join(", ")}. Dispatch them with ticket set on each dispatch; Firstmate wakes you when more become ready.` : "No ticket is ready yet.",
         ...(outside.length > 0 ? [`Not tracked (outside this program): ${outside.join("; ")}.`] : []),
@@ -5439,7 +5560,7 @@ export default async function plugin(bb: BbPluginApi) {
           if (input.pr) {
             const pr = prKey(input.pr);
             const proved = stateFromPrs(deliveries.forTasks([], [pr]));
-            if (proved !== "merged" && proved !== "live") throw new Error(`${pr} is not a tracked merged PR. Done needs a merged PR or a closed issue.`);
+            if (proved !== "merged") throw new Error(`${pr} is not a tracked merged PR. Done needs a merged PR or a closed issue.`);
             facts.push({ kind: "pr-merged", ticket: ticket.ref, pr });
           } else {
             const hostId = await resolveHostId(undefined, { threadId: captain });
@@ -5463,7 +5584,7 @@ export default async function plugin(bb: BbPluginApi) {
     return [
       programText(updated, now),
       ...(ready.refs.length > 0 ? [`Now ready: ${ready.refs.map((ref) => shortTicket(updated, ref)).join(", ")}. Dispatch them.`] : []),
-      ...(isOpenProgram(updated) ? [] : [`Program ${updated.id} is closed${updated.taskId ? `; owner task ${updated.taskId} is done` : ""}.`]),
+      ...(isOpenProgram(updated) ? [] : [`Program ${updated.id} is closed${updated.taskId ? `; owner task ${updated.taskId} is ${ownerTasks.get(updated.taskId)?.state ?? "closed"}` : ""}.`]),
     ].join("\n");
   }
 
@@ -5704,6 +5825,7 @@ export default async function plugin(bb: BbPluginApi) {
   const digestMemorySchema: z.ZodType<DigestMemory> = z.object({
     done: z.record(z.string(), z.number()),
     stale: z.object({ ids: z.array(z.string()), at: z.number(), since: z.number() }).nullable(),
+    notLive: z.object({ ids: z.array(z.string()), at: z.number(), since: z.number() }).nullable().optional(),
   });
 
   /**
@@ -5897,6 +6019,7 @@ export default async function plugin(bb: BbPluginApi) {
     await tellSkippedAsks(captainThreadId);
     await defaultOverdueAsks(captainThreadId).catch((error) => bb.log.warn(`owner ask deadlines: ${String(error)}`));
     await reconcilePrograms(captainThreadId, { signal }).catch((error) => bb.log.warn(`programs: ${String(error)}`));
+    await followThrough(captainThreadId, signal).catch((error) => { if (!signal?.aborted) bb.log.warn(`live checks and stalls: ${String(error)}`); });
     const flags = await reliabilityFlags();
     // Not gated on asyncDispatch: what was held or queued while it was on still goes out after it is turned off.
     for (const row of doorbellHold.drain(captainThreadId)) {
@@ -13681,17 +13804,20 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_task",
-    description: "Owner tasks: one per owner request, open until it is merged, live, done, or dropped. A reply never closes one. list shows open tasks. open tracks an owner request you work on yourself (refs required). close moves a task to done (outcome) or dropped (reason required). set marks it needs_you, working, or ready. link adds a PR (owner/repo#n or URL) so its merge moves the task.",
+    description: "Owner tasks: one per owner request, open until it is finished. Only live or dropped finishes a task: merged stays open (Not live yet) until its project's live check proves production runs it, and a crew's done never closes one. A reply never closes one either. list shows open tasks. open tracks an owner request you work on yourself (refs required). close moves a task to live (reason = evidence: what production runs and how you checked it) or dropped (reason = the owner's own words, ref = his message ref). set marks it needs_you, working, or ready. link adds a PR (owner/repo#n or URL) so its merge moves the task. Corrections of a wrong record, kept in the task's history with who and why: remove-crew (crewId, reason) takes off a crew that never worked on the task; amend-drop (text = the corrected drop reason, reason = why) fixes a dropped task's reason.",
     parameters: z.object({
-      action: z.enum(["list", "open", "close", "set", "link"]),
+      action: z.enum(["list", "open", "close", "set", "link", "remove-crew", "amend-drop"]),
       id: z.string().regex(/^T\d+$/).optional(),
       title: z.string().min(1).max(200).optional(),
       refs: z.array(z.string()).optional().describe("Owner message refs, tg:<chat>:<msg>"),
-      state: z.enum(["done", "dropped", "needs_you", "working", "ready"]).optional(),
-      reason: z.string().max(500).optional().describe("Outcome for done; required reason for dropped"),
+      state: z.enum(["live", "dropped", "needs_you", "working", "ready"]).optional(),
+      reason: z.string().max(500).optional().describe("live: the evidence (what production runs, how it was checked). dropped: the owner's own words"),
+      ref: z.string().optional().describe("dropped: the owner message whose words drop it, tg:<chat>:<msg>"),
+      crewId: z.string().optional().describe("remove-crew: the crew to take off the task"),
+      text: z.string().max(500).optional().describe("amend-drop: the corrected drop reason"),
       pr: z.string().optional(),
     }),
-    async execute({ action, id, title, refs, state, reason, pr }, ctx) {
+    async execute({ action, id, title, refs, state, reason, pr, ref, crewId, text }, ctx) {
       const captain = ctxString(ctx, "threadId");
       if (!captain) return toolError("firstmate_task runs only in a captain thread.");
       const now = Date.now();
@@ -13711,6 +13837,19 @@ export default async function plugin(bb: BbPluginApi) {
         }
         if (!id) return toolError(`${action} needs id (T<n>).`);
         let changed: OwnerTask;
+        if (action === "remove-crew" || action === "amend-drop") {
+          if (!reason?.trim()) return toolError(`${action} needs reason: why the record is wrong.`);
+          if (action === "remove-crew") {
+            if (!crewId) return toolError("remove-crew needs crewId.");
+            changed = ownerTasks.removeCrew(id, captain, { crewId, reason, actor: captain }, now);
+          } else {
+            if (!text?.trim()) return toolError("amend-drop needs text: the corrected drop reason.");
+            changed = ownerTasks.amendDropReason(id, captain, { text, reason, actor: captain }, now);
+          }
+          await refreshOwnerBoard();
+          const last = changed.history!.at(-1)!;
+          return `Task ${changed.id} corrected (${last.action}): ${last.before}${last.after !== null ? ` -> ${last.after}` : " removed"}. Recorded with reason "${last.reason}"; ${changed.history!.length} correction(s) in its history.`;
+        }
         if (action === "link") {
           if (!pr) return toolError("link needs pr.");
           const ref = /^[\w.-]+\/[\w.-]+#\d+$/.test(pr.trim()) ? pr.trim().toLowerCase() : canonicalPr(pr).id;
@@ -13720,9 +13859,11 @@ export default async function plugin(bb: BbPluginApi) {
         } else {
           const to: TaskState | undefined = state;
           if (to === undefined) return toolError(`${action} needs state.`);
-          if (action === "close" && to !== "done" && to !== "dropped") return toolError("close takes state done or dropped.");
-          if (action === "set" && (to === "done" || to === "dropped")) return toolError("Use action close for done or dropped.");
-          changed = ownerTasks.move(id, captain, to === "dropped" ? { to, reason: reason ?? "" } : { to, reason }, now);
+          if (action === "close" && to !== "live" && to !== "dropped") return toolError("close takes state live or dropped: only those finish a task.");
+          if (action === "set" && (to === "live" || to === "dropped")) return toolError("Use action close for live or dropped.");
+          const current = ownerTasks.get(id);
+          if (action === "set" && current?.captain === captain && isFinishedTask(current)) return toolError(`Task ${id} is ${current.state}; it reopens only when new work arrives on it (a new crew or PR). For new work the owner asks for, dispatch with taskRef=${id}.`);
+          changed = ownerTasks.move(id, captain, to === "dropped" ? { to, reason: reason ?? "", ref: ref ?? "" } : to === "live" ? { to, reason: reason ?? "" } : { to, reason }, now);
         }
         await refreshOwnerBoard();
         return `Task ${changed.id} is ${changed.state}${changed.dropReason ? ` (${changed.dropReason})` : ""}.`;
@@ -14631,16 +14772,20 @@ export default async function plugin(bb: BbPluginApi) {
         const from = since ?? now - (command === "board" ? 24 : 12) * 60 * 60_000;
         reconcileTasks(threadId, now);
         const records = new Map([...deliveries.list({ owner: threadId, limit: 100 }), ...deliveries.mergedSince(threadId, from)].map((r) => [r.id, r]));
-        const input: BoardInput = { asks: ownerAsks.listWaiting(threadId, now), calls: snapshot.rpc.ownerCalls, tasks: ownerTasks.list(threadId, { includeClosed: true }), records: [...records.values()], programs: programs.list(threadId), since: from, now };
+        const tasks = ownerTasks.list(threadId, { includeClosed: true });
+        // Owner decision Q5: merged work that production does not run yet, with its next step and who takes it.
+        const status = await liveStatusOf(threadId);
+        const notLive = notLiveItems(tasks, (task) => planOf(ruleOf(task, deliveries.forTasks(task.crewIds, task.prs)), status), now);
+        const input: BoardInput = { asks: ownerAsks.listWaiting(threadId, now), calls: snapshot.rpc.ownerCalls, tasks, records: [...records.values()], programs: programs.list(threadId), notLive, since: from, now };
         if (command === "board") {
           // The running crews per project, for the connector's board in each project topic. Always sent:
           // an empty list means no crew runs, and the connector shows 0 instead of counting task lines.
-          return { text: formatBoard(input), away: snapshot.rpc.afk, projects: workingByProject(input.tasks, snapshot.rpc.running.map((crew) => crew.id)) };
+          return { text: formatBoard(input), away: snapshot.rpc.afk, projects: workingByProject(input.tasks, snapshot.rpc.running.map((crew) => crew.id)), notLive };
         }
         const memoryKey = `${DIGEST_MEMORY_PREFIX}${threadId}`;
         const digest = digestOnce(input, digestMemorySchema.safeParse(await bb.storage.kv.get(memoryKey)).data ?? EMPTY_DIGEST_MEMORY);
         await bb.storage.kv.set(memoryKey, digest.memory);
-        return { text: digest.text };
+        return { text: digest.text, notLive };
       }
       return { text: formatWorkersForTelegram(snapshot.rpc) };
     },

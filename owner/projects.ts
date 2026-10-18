@@ -5,6 +5,26 @@ import { readFileSync } from "node:fs";
 
 export type ProofSurface = "iphone" | "web" | "message";
 export type SharedServer = { id: string; about: string; reset: string };
+/**
+ * One read-only check of what production runs (owner decision Q9, 18 Oct). `repos` limits it to PRs of
+ * those repos; without it, it covers every repo of the project. Credentials come from `envFile` at run time.
+ */
+export type LiveCheck =
+  | { kind: "plugin-reload"; plugin: string; repos?: readonly string[] }
+  | { kind: "eas-update"; appId: string; channels: readonly string[]; envFile: string; repos?: readonly string[] }
+  | { kind: "coolify-deploy"; envFile: string; baseUrlVar: string; appVar: string; tokenVar: string; repos?: readonly string[] }
+  | { kind: "release-readback"; repos?: readonly string[] };
+/** How a project goes live (owner decision Q2, 18 Oct). */
+export type LiveRule = {
+  definition: string;
+  next: string;
+  actor: string;
+  checks: readonly LiveCheck[];
+  /** Why no check proves some or all of its work yet. */
+  missing?: string;
+  /** The part of going live that no check reads. */
+  unread?: string;
+};
 export type ProjectRule = {
   name: string;
   repos: readonly string[];
@@ -12,6 +32,7 @@ export type ProjectRule = {
   proofSurface: ProofSurface;
   release?: { kind: "testflight"; group: string };
   sharedServers?: readonly SharedServer[];
+  live?: LiveRule;
 };
 export type ProjectTable = {
   surfaces: Readonly<Record<ProofSurface, string>>;
@@ -27,6 +48,10 @@ const glob = (pattern: string) => new RegExp(`^${pattern.split("*").map((part) =
 /** The repository of a GitHub PR or repo link, as owner/repo. */
 export function repoOf(url: string): string {
   return /github\.com\/([^/]+\/[^/#?]+)/i.exec(url)?.[1] ?? url.split("#")[0]!;
+}
+
+export function repoMatches(pattern: string, repo: string): boolean {
+  return glob(pattern).test(repo);
 }
 
 export function projectForRepo(repo: string, table: ProjectTable = PROJECTS): ProjectRule | undefined {

@@ -119,7 +119,7 @@ test("a new card on the same task and subject replaces the open one, which Teleg
   } finally { restore(); await host.harness.lifecycle.dispose(); }
 });
 
-test("the task sweep closes tasks from done reports, opens a card for a crew that waits on the owner, and flags a task with no crew once", async () => {
+test("the task sweep moves done reports to the captain's check, opens a card for a crew that waits on the owner, and flags a task with no crew once", async () => {
   const at = 1792142546;
   const { host, rpc, tasks, asks, restore } = await captainHost({
     scout1: `working [at=${at - 600}]: reading\ndone [at=${at}]: final plan at data/scout1/plan.md\n`,
@@ -137,7 +137,7 @@ test("the task sweep closes tasks from done reports, opens a card for a crew tha
     const tWait = tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Reachloop plan", sourceRefs: ["tg:1:4786"], crewId: "wait1", at: now });
     const t200 = tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Fix Humza's 4 Cyndra bugs", sourceRefs: ["tg:1:4939"], at: now - 3 * 60 * 60_000 });
     await host.harness.behavior.runSchedule("task-lifecycle");
-    assert.equal(tasks.get(t194.id)!.state, "done");
+    assert.equal(tasks.get(t194.id)!.state, "check", "a crew's done never closes a task: the captain checks it");
     assert.equal(tasks.get(t204.id)!.state, "check", "an open PR not verified at its head: the next step is verify");
     assert.match(tasks.get(t204.id)!.outcome ?? "", /Next: verify cyndra-ai\/cyndra-saas#2487/);
     assert.equal(tasks.get(tWait.id)!.state, "needs_you");
@@ -193,7 +193,7 @@ test("a task with two crews advances once both have reported done, after one cre
     tasks.attach(task.id, "thr_cap", { crewId: "c2", sourceRefs: [], at: Date.now() });
     await host.bb.storage.kv.set("crews", [crewRow("c2", "thr_c2", { shape: "scout" })]);
     await host.harness.behavior.runSchedule("task-lifecycle");
-    assert.equal(tasks.get(task.id)!.state, "done");
+    assert.equal(tasks.get(task.id)!.state, "check");
   } finally { restore(); await host.harness.lifecycle.dispose(); }
 });
 
@@ -224,7 +224,7 @@ test("a task whose two registered crews both reported done advances; one still w
     const task = both.tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Two parts", sourceRefs: ["tg:1:3"], crewId: "c1", at: Date.now() });
     both.tasks.attach(task.id, "thr_cap", { crewId: "c2", sourceRefs: [], at: Date.now() });
     await both.host.harness.behavior.runSchedule("task-lifecycle");
-    assert.equal(both.tasks.get(task.id)!.state, "done");
+    assert.equal(both.tasks.get(task.id)!.state, "check");
   } finally { both.restore(); await both.host.harness.lifecycle.dispose(); }
   const one = await captainHost({ c1: `done [at=${at}]: part one\n`, c2: `working [at=${at}]: still on part two\n` });
   try {

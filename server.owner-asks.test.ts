@@ -40,7 +40,9 @@ test("explicit ask RPCs validate the captain and correct answered decisions", as
       "1. ✅ Publish Safi? (0 min, ask aexisting) https://t.me/c/200/3001",
       "Tap a question's button or reply with just its letter.",
       "",
-      "✅ Done since you last looked: nothing new.",
+      "✅ Finished since you last looked: nothing new.",
+      "",
+      "🚀 Not live yet: nothing merged waits to go live.",
       "",
       "🔧 In progress: nothing open.",
     ].join("\n"));
@@ -49,7 +51,7 @@ test("explicit ask RPCs validate the captain and correct answered decisions", as
     assert.equal(asks.get("aexisting")?.resolution, "Publish");
     assert.deepEqual(await host.harness.behavior.callRpc("resolveAsk", { threadId: "thr_cap", id: "aexisting", resolution: "Owner approved the address repair at 12:00 Cairo." }), { ok: true });
     assert.equal(asks.get("aexisting")?.resolution, "Owner approved the address repair at 12:00 Cairo.");
-    assert.deepEqual(await host.harness.behavior.callRpc("telegramCommand", { threadId: "thr_cap", command: "board" }), { text: "📌 Needs you: nothing right now.\n\n✅ Done since you last looked: nothing new.\n\n🔧 In progress: nothing open.", away: false, projects: [] }, "no crew runs: zero crews, so Telegram does not count task lines");
+    assert.deepEqual(await host.harness.behavior.callRpc("telegramCommand", { threadId: "thr_cap", command: "board" }), { text: "📌 Needs you: nothing right now.\n\n✅ Finished since you last looked: nothing new.\n\n🚀 Not live yet: nothing merged waits to go live.\n\n🔧 In progress: nothing open.", away: false, projects: [], notLive: [] }, "no crew runs: zero crews, so Telegram does not count task lines");
 
     const sent = host.harness.sdk.callsTo("plugins.callRpc").map((call) => call[0] as { method: string });
     assert.equal(sent.filter((call) => call.method === "ask").length, 0);

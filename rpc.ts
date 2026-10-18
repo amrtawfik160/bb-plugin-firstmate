@@ -36,7 +36,7 @@ export const rpcContract = defineRpcContract({
     output: z.object({ ok: z.boolean(), deferred: z.array(z.string()), already: z.array(z.string()), refused: z.array(z.string()), until: z.number().nullable() }),
   },
   telegramCommand: {
-    experimental_description: "Answer a Telegram owner command (/inbox, /workers, the board, the digest, or the tasks) for one captain thread as plain text. tasks returns, in `tasks`, every open owner task and each one that changed since `since` (default now), with the BB project id of its crews (projectId: the connector's topic for the task comes from it), its starting and running crews, what it waits on and the owner's Telegram refs, for the connector's task status lines and /tasks. The board has three sections: Needs you, Done since you last looked, In progress. since (ms) is when the owner last looked: board defaults to 24 h ago, digest to 12 h ago. The digest text is empty when there is nothing to report. For board, away is the captain's /afk posture, and projects counts the crews working on each project, for the pinned board of each Telegram project topic.",
+    experimental_description: "Answer a Telegram owner command (/inbox, /workers, the board, the digest, or the tasks) for one captain thread as plain text. tasks returns, in `tasks`, every open owner task and each one that changed since `since` (default now), with the BB project id of its crews (projectId: the connector's topic for the task comes from it), its starting and running crews, what it waits on and the owner's Telegram refs, for the connector's task status lines and /tasks. The board has four sections: Needs you, Finished since you last looked (live or dropped only), Not live yet (merged work production does not run yet), In progress. board and digest also return notLive: each merged task that is not live yet, with its age since it merged (ms), its next step, who takes it, and why its project's live check is missing (null when the check reads production), for the connector's Not live yet section. since (ms) is when the owner last looked: board defaults to 24 h ago, digest to 12 h ago. The digest text is empty when there is nothing to report. For board, away is the captain's /afk posture, and projects counts the crews working on each project, for the pinned board of each Telegram project topic.",
     input: z.object({
       command: z.enum(["inbox", "workers", "board", "digest", "tasks"]),
       threadId: z.string().min(1),
@@ -44,6 +44,10 @@ export const rpcContract = defineRpcContract({
     }),
     output: z.object({
       text: z.string(), away: z.boolean().optional(), projects: z.array(z.object({ name: z.string(), working: z.number().int().nonnegative() })).optional(),
+      notLive: z.array(z.object({
+        id: z.string(), project: z.string().nullable(), title: z.string(), state: z.literal("merged"),
+        ageMs: z.number().nonnegative(), next: z.string(), who: z.string(), missing: z.string().nullable(),
+      })).optional(),
       tasks: z.array(z.object({
         id: z.string(), project: z.string().nullable(), title: z.string(),
         state: z.enum(["working", "needs_you", "ready", "check", "merged", "live", "done", "dropped"]),

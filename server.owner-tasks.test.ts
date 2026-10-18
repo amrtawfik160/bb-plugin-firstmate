@@ -83,7 +83,9 @@ test("Oct 7 repro: a reply of only 'Started' answered the owner message, and now
     assert.equal(await board(host), [
       "📌 Needs you: nothing right now.",
       "",
-      "✅ Done since you last looked: nothing new.",
+      "✅ Finished since you last looked: nothing new.",
+      "",
+      "🚀 Not live yet: nothing merged waits to go live.",
       "",
       "🔧 In progress (1)",
       "- T1 Areliaa · Fix the Metricool sync · 0 min",
@@ -122,7 +124,9 @@ test("Oct 7 repro: one owner message with two jobs opens two tasks, each titled 
     assert.equal(await board(host), [
       "📌 Needs you: nothing right now.",
       "",
-      "✅ Done since you last looked: nothing new.",
+      "✅ Finished since you last looked: nothing new.",
+      "",
+      "🚀 Not live yet: nothing merged waits to go live.",
       "",
       "🔧 In progress (2)",
       "- T1 Areliaa · Safi: debts in Arrange home items · 0 min",
@@ -145,7 +149,9 @@ test("Oct 7 repro: in an owner turn, a job another thread asked for names its or
     assert.equal(await board(host), [
       "📌 Needs you: nothing right now.",
       "",
-      "✅ Done since you last looked: nothing new.",
+      "✅ Finished since you last looked: nothing new.",
+      "",
+      "🚀 Not live yet: nothing merged waits to go live.",
       "",
       "🔧 In progress: nothing open.",
     ].join("\n"));
@@ -153,7 +159,9 @@ test("Oct 7 repro: in an owner turn, a job another thread asked for names its or
     assert.equal(await board(host), [
       "📌 Needs you: nothing right now.",
       "",
-      "✅ Done since you last looked: nothing new.",
+      "✅ Finished since you last looked: nothing new.",
+      "",
+      "🚀 Not live yet: nothing merged waits to go live.",
       "",
       "🔧 In progress (1)",
       "- T1 Areliaa · Safi: debts in Arrange home items · 0 min",
@@ -165,7 +173,7 @@ test("Oct 7 repro: in an owner turn, a job another thread asked for names its or
   }
 });
 
-test("the task follows its crew's PR: ready to merge needs the owner, then merged moves it to Done", async () => {
+test("the task follows its crew's PR: ready to merge needs the owner, then merged moves it to Not live yet, never to Finished", async () => {
   const host = await captainHost();
   try {
     await ownerSays(host, "2204", "Add the memory screen");
@@ -177,7 +185,9 @@ test("the task follows its crew's PR: ready to merge needs the owner, then merge
       "📌 Needs you (1)",
       "1. T1 Areliaa · Memory screen · ready for you · 0 min · [app#2091](https://github.com/acme/app/pull/2091) ready to merge",
       "",
-      "✅ Done since you last looked: nothing new.",
+      "✅ Finished since you last looked: nothing new.",
+      "",
+      "🚀 Not live yet: nothing merged waits to go live.",
       "",
       "🔧 In progress: nothing open.",
     ].join("\n"));
@@ -185,8 +195,10 @@ test("the task follows its crew's PR: ready to merge needs the owner, then merge
     assert.equal(await board(host), [
       "📌 Needs you: nothing right now.",
       "",
-      "✅ Done since you last looked (1)",
-      "- T1 Areliaa · Memory screen · merged",
+      "✅ Finished since you last looked: nothing new.",
+      "",
+      "🚀 Not live yet (1)",
+      "- T1 Areliaa · Memory screen · merged 0 min ago · next: deploy it with Coolify · the captain",
       "",
       "🔧 In progress: nothing open.",
     ].join("\n"));
@@ -197,7 +209,7 @@ test("the task follows its crew's PR: ready to merge needs the owner, then merge
   }
 });
 
-test("recorded merge verification moves a task to live", async () => {
+test("recorded merge verification is not production: the task stays merged until its project's live check", async () => {
   const host = await captainHost();
   try {
     await ownerSays(host, "2205", "Ship agent group chats part 2");
@@ -209,13 +221,13 @@ test("recorded merge verification moves a task to live", async () => {
     assert.equal(createOwnerTasks(host.bb.storage.database()).get("T1")?.state, "merged");
     store.save({ ...store.get("acme/app#2116")!, status: "complete", verifiedCommitSha: "m2" });
     await board(host);
-    assert.equal(createOwnerTasks(host.bb.storage.database()).get("T1")?.state, "live");
+    assert.equal(createOwnerTasks(host.bb.storage.database()).get("T1")?.state, "merged");
   } finally {
     await host.harness.lifecycle.dispose();
   }
 });
 
-test("firstmate_task drops a task only with a reason, and a closed task never reopens", async () => {
+test("firstmate_task drops a task only with the owner's words and ref, makes it live only with evidence, and never reopens a finished one by hand", async () => {
   const host = await captainHost();
   try {
     const task = tool(host, "firstmate_task");
@@ -223,9 +235,14 @@ test("firstmate_task drops a task only with a reason, and a closed task never re
     const noReason = await task.execute({ action: "close", id: "T1", state: "dropped" }, capCtx);
     assert.ok(isError(noReason));
     assert.equal(text(noReason), "Dropping task T1 needs a reason.");
-    assert.equal(text(await task.execute({ action: "close", id: "T1", state: "dropped", reason: "Owner moved the audit to next week" }, capCtx)), "Task T1 is dropped (Owner moved the audit to next week).");
+    assert.equal(text(await task.execute({ action: "close", id: "T1", state: "dropped", reason: "Owner moved the audit to next week" }, capCtx)), "Dropping task T1 needs the owner's message ref: only the owner drops work, in his own words.");
+    assert.equal(text(await task.execute({ action: "close", id: "T1", state: "dropped", reason: "Owner moved the audit to next week", ref: "tg:200:2207" }, capCtx)), "Task T1 is dropped (Owner moved the audit to next week).");
     const reopen = await task.execute({ action: "set", id: "T1", state: "working" }, capCtx);
-    assert.equal(text(reopen), "Task T1 is dropped; it cannot become working.");
+    assert.match(text(reopen), /^Task T1 is dropped; it reopens only when new work arrives on it/);
+    assert.equal(text(await task.execute({ action: "open", title: "Publish the OTA", refs: ["tg:200:2208"] }, capCtx)), "Task T2 is open (working).");
+    assert.equal(text(await task.execute({ action: "close", id: "T2", state: "live" }, capCtx)), "Task T2 becomes live only with evidence: what production runs and how it was checked.");
+    assert.match(text(await task.execute({ action: "close", id: "T2", state: "done" as never }, capCtx)), /Invalid|live|dropped/);
+    assert.equal(text(await task.execute({ action: "close", id: "T2", state: "live", reason: "production OTA a7021b2c is built from aa40ebbe" }, capCtx)), "Task T2 is live.");
     assert.equal(text(await task.execute({ action: "list" }, capCtx)), "No owner task is open.");
   } finally {
     await host.harness.lifecycle.dispose();
@@ -242,7 +259,9 @@ test("the board flags a task with no update for 24 hours as stale", async () => 
     assert.equal(await board(host), [
       "📌 Needs you: nothing right now.",
       "",
-      "✅ Done since you last looked: nothing new.",
+      "✅ Finished since you last looked: nothing new.",
+      "",
+      "🚀 Not live yet: nothing merged waits to go live.",
       "",
       "🔧 In progress (2)",
       "- T1 Areliaa · Metricool fix · 30 h · stale 30 h",
@@ -263,7 +282,7 @@ test("the board and the digest read closed tasks and PRs merged since the owner 
     const store = createDeliveries(host.bb.storage.database());
     tasks.open({ captain: "thr_cap", project: "Areliaa", title: "Metricool fix", sourceRefs: ["tg:200:2301"], crewId: "metricool-fix", prs: ["acme/app#1759"], at: Date.now() - 30 * HOUR });
     tasks.open({ captain: "thr_cap", project: null, title: "Brands audit", sourceRefs: ["tg:200:2302"], at: Date.now() - 2 * HOUR });
-    tasks.move("T2", "thr_cap", { to: "dropped", reason: "Owner moved it to next week" }, Date.now() - HOUR);
+    tasks.move("T2", "thr_cap", { to: "dropped", reason: "Owner moved it to next week", ref: "tg:200:2303" }, Date.now() - HOUR);
     const held = store.register({ url: "https://github.com/acme/app/pull/1759", taskId: "metricool-fix", projectId: "proj_1", owner: "thr_cap", home: "", worker: "thr_new" });
     store.save({ ...held, status: "on-hold" });
     const unlinked = store.register({ url: "https://github.com/acme/app/pull/283", taskId: "c9", projectId: "proj_1", owner: "thr_cap", home: "", worker: "thr_c9", title: "Bump the email template" });
@@ -271,26 +290,30 @@ test("the board and the digest read closed tasks and PRs merged since the owner 
     const old = store.register({ url: "https://github.com/acme/app/pull/270", taskId: "c8", projectId: "proj_1", owner: "thr_cap", home: "", worker: "thr_c8" });
     store.save({ ...old, status: "complete", forgeState: "merged", mergeCommitSha: "m8", updatedAt: Date.now() - 26 * HOUR });
     const text = await board(host);
-    assert.deepEqual(text.split("\n\n").map((section) => section.split("\n")[0]), ["📌 Needs you: nothing right now.", "✅ Done since you last looked (2)", "🔧 In progress (1)"]);
+    assert.deepEqual(text.split("\n\n").map((section) => section.split("\n")[0]), ["📌 Needs you: nothing right now.", "✅ Finished since you last looked (1)", "🚀 Not live yet (1)", "🔧 In progress (1)"]);
     assert.equal(text, [
       "📌 Needs you: nothing right now.",
       "",
-      "✅ Done since you last looked (2)",
+      "✅ Finished since you last looked (1)",
       "- T2 Brands audit · dropped: Owner moved it to next week",
-      "- PR [app#283](https://github.com/acme/app/pull/283) Bump the email template · merged",
+      "",
+      "🚀 Not live yet (1)",
+      "- PR [app#283](https://github.com/acme/app/pull/283) Bump the email template · merged, no task",
       "",
       "🔧 In progress (1)",
       "- T1 Areliaa · Metricool fix · 30 h · [app#1759](https://github.com/acme/app/pull/1759) on hold · stale 30 h",
     ].join("\n"));
     assert.match(await command(host, { command: "board", since: Date.now() - 30 * HOUR }), /\n- PR \[app#270\]\(https:\/\/github\.com\/acme\/app\/pull\/270\) /, "an older since brings back older merges");
     assert.equal(await command(host, { command: "digest" }), [
-      "Done (2)",
+      "Finished (1)",
       "- T2 Brands audit · dropped: Owner moved it to next week",
-      "- PR app#283 Bump the email template · merged",
+      "",
+      "Not live yet (1)",
+      "- PR app#283 Bump the email template · merged, no task",
       "",
       "Stale (1): T1",
     ].join("\n"));
-    tasks.move("T1", "thr_cap", { to: "done" }, Date.now() - 20 * HOUR);
+    tasks.move("T1", "thr_cap", { to: "live", reason: "Coolify deploy holds it" }, Date.now() - 20 * HOUR);
     assert.equal(await command(host, { command: "digest", since: Date.now() - 10 * MIN }), "");
   } finally {
     await host.harness.lifecycle.dispose();
@@ -312,7 +335,7 @@ const forget = async (host: Host, crewId: string) => {
   assert.equal(result.exitCode, 0, result.stderr);
 };
 
-test("Oct 8 repro: a crew that reports done closes its task, and one retired without a report asks for a check", async () => {
+test("a crew's done never closes its task: done and retired without a report both ask the captain to check", async () => {
   const host = await captainHost();
   try {
     const tasks = createOwnerTasks(host.bb.storage.database());
@@ -324,15 +347,17 @@ test("Oct 8 repro: a crew that reports done closes its task, and one retired wit
     await seedCrew(host, "offers-verify", "Still reading the deploy logs");
     await forget(host, "offers-verify");
     assert.equal(await board(host), [
-      "📌 Needs you (1)",
-      "1. T2 Areliaa · Deploy + verify the offers live · finished, check · 2 h",
+      "📌 Needs you (2)",
+      "1. T1 Cyndra · Partner onboarding guide (PDF) · finished, check · 4 h",
+      "2. T2 Areliaa · Deploy + verify the offers live · finished, check · 2 h",
       "",
-      "✅ Done since you last looked (1)",
-      "- T1 Cyndra · Partner onboarding guide (PDF) · done",
+      "✅ Finished since you last looked: nothing new.",
+      "",
+      "🚀 Not live yet: nothing merged waits to go live.",
       "",
       "🔧 In progress: nothing open.",
     ].join("\n"));
-    assert.equal(tasks.get("T1")!.outcome, "DONE: sent cyndra-partner-onboarding-guide.pdf to the owner");
+    assert.equal(tasks.get("T1")!.outcome, "DONE: sent cyndra-partner-onboarding-guide.pdf to the owner. Next: check the work, then make it live with evidence or drop it with the owner's words");
     assert.equal(tasks.get("T2")!.outcome, "Crew retired without reporting done");
   } finally {
     await host.harness.lifecycle.dispose();
@@ -357,8 +382,10 @@ test("Oct 8 repro: a follow-up dispatch with taskRef continues T8, clears its ne
     assert.equal(await board(host), [
       "📌 Needs you: nothing right now.",
       "",
-      "✅ Done since you last looked (1)",
-      "- T1 Cyndra · QA fixes: about 12 small polish items · merged",
+      "✅ Finished since you last looked: nothing new.",
+      "",
+      "🚀 Not live yet (1)",
+      "- T1 Cyndra · QA fixes: about 12 small polish items · merged 0 min ago · next: deploy to production in a release window and check it there (live check missing: no record says which commit Cyndra pro… · the captain",
       "",
       "🔧 In progress: nothing open.",
     ].join("\n"));
@@ -385,7 +412,9 @@ test("Oct 8 repro: a deploy dispatch for a PR another task holds joins that task
     assert.equal(await board(host), [
       "📌 Needs you: nothing right now.",
       "",
-      "✅ Done since you last looked: nothing new.",
+      "✅ Finished since you last looked: nothing new.",
+      "",
+      "🚀 Not live yet: nothing merged waits to go live.",
       "",
       "🔧 In progress (1)",
       "- T1 Cyndra · Perf 4: billing contention · 1 h · [cyndra-saas#2162](https://github.com/cyndra-ai/cyndra-saas/pull/2162) ready to merge",
@@ -408,7 +437,9 @@ test("Oct 8 repro: one project name per project, and a title does not repeat it"
     assert.equal(await board(host), [
       "📌 Needs you: nothing right now.",
       "",
-      "✅ Done since you last looked: nothing new.",
+      "✅ Finished since you last looked: nothing new.",
+      "",
+      "🚀 Not live yet: nothing merged waits to go live.",
       "",
       "🔧 In progress (4)",
       "- T1 Cyndra · Audit the brands · 1 h",
@@ -421,7 +452,7 @@ test("Oct 8 repro: one project name per project, and a title does not repeat it"
   }
 });
 
-test("Oct 8 repro: a research crew that ends its turn with DONE closes its task before anyone retires it", async () => {
+test("Oct 8 repro: a research crew that ends its turn with DONE moves its task to the captain's check before anyone retires it", async () => {
   const host = await captainHost();
   try {
     const tasks = createOwnerTasks(host.bb.storage.database());
@@ -433,10 +464,12 @@ test("Oct 8 repro: a research crew that ends its turn with DONE closes its task 
     });
     assert.deepEqual(emitted.errors, []);
     assert.equal(await board(host), [
-      "📌 Needs you: nothing right now.",
+      "📌 Needs you (1)",
+      "1. T1 Cyndra · Performance research (Astra) · finished, check · 1 h",
       "",
-      "✅ Done since you last looked (1)",
-      "- T1 Cyndra · Performance research (Astra) · done",
+      "✅ Finished since you last looked: nothing new.",
+      "",
+      "🚀 Not live yet: nothing merged waits to go live.",
       "",
       "🔧 In progress: nothing open.",
     ].join("\n"));
@@ -485,12 +518,12 @@ test("Oct 12 repro: the digest lists a finished item once and an unchanged stale
     const record = store.register({ url: "https://github.com/cyndra-ai/cyndra-saas/pull/2146", taskId: "c1", projectId: "proj_1", owner: "thr_cap", home: "", worker: "thr_c1", title: "StraightLine recording fix" });
     const observe = () => store.save({ ...store.get(record.id)!, status: "merged-needs-verification", forgeState: "merged", mergeCommitSha: "m1", updatedAt: Date.now() });
     observe();
-    assert.equal(await command(host, { command: "digest", since: Date.now() - HOUR }), "Done (1)\n- PR cyndra-saas#2146 StraightLine recording fix · merged\n\nStale (1): T1");
+    assert.equal(await command(host, { command: "digest", since: Date.now() - HOUR }), "Not live yet (1)\n- PR cyndra-saas#2146 StraightLine recording fix · merged, no task\n\nStale (1): T1");
     for (const since of [Date.now() - 30 * MIN, Date.now() - 20 * MIN]) {
       observe();
       assert.equal(await command(host, { command: "digest", since }), "", "the next digests repeat nothing");
     }
-    assert.match(await command(host, { command: "board" }), /Done since you last looked \(1\)\n- PR \[cyndra-saas#2146\]/, "the board still shows it");
+    assert.match(await command(host, { command: "board" }), /Not live yet \(1\)\n- PR \[cyndra-saas#2146\]/, "the board still shows it");
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -559,8 +592,8 @@ test("the connector reads every open task, and each closed one since it last loo
     });
     await tool(host, "firstmate_task").execute({ action: "set", id: "T1", state: "needs_you" }, capCtx);
     assert.equal((await tasksRpc(host, start))[0]!.waitsOn, "you");
-    await tool(host, "firstmate_task").execute({ action: "close", id: "T1", state: "done", reason: "Dots now" }, capCtx);
-    assert.deepEqual((await tasksRpc(host, start)).map((task) => [task.id, task.state, task.waitsOn]), [["T1", "done", null]], "closed since the connector last looked: still read once");
+    await tool(host, "firstmate_task").execute({ action: "close", id: "T1", state: "live", reason: "Dots now in the production OTA" }, capCtx);
+    assert.deepEqual((await tasksRpc(host, start)).map((task) => [task.id, task.state, task.waitsOn]), [["T1", "live", null]], "closed since the connector last looked: still read once");
     assert.deepEqual(await tasksRpc(host, Date.now() + 1), [], "closed before: not read again");
   } finally {
     await host.harness.lifecycle.dispose();
@@ -647,6 +680,66 @@ test("firstmate_ask names the open task this turn's owner message started, or th
     await tool(host, "firstmate_ask").execute({ question: "Which colour?", kind: "question", options: [{ label: "Blue" }], task: "T1", project: "Safi" }, capCtx);
     assert.deepEqual(asks(), ["T1", "T1"]);
     assert.ok(isError(await tool(host, "firstmate_ask").execute({ question: "Which?", kind: "question", task: "T5" }, capCtx)));
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// Owner decisions Q1, Q5, Q9 (18 Oct): the captain's reliability pass reads what production runs, moves
+// merged work it holds to live with that evidence, and raises one alert per stalled project.
+test("the hourly pass makes a merged Firstmate PR live from the loaded commit, and alerts the stalled Cyndra task once", async () => {
+  const host = await captainHost();
+  const calls = connector(host);
+  try {
+    const { execFileSync } = await import("node:child_process");
+    const loaded = execFileSync("git", ["-C", new URL(".", import.meta.url).pathname, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    const tasks = createOwnerTasks(host.bb.storage.database());
+    const store = createDeliveries(host.bb.storage.database());
+    tasks.open({ captain: "thr_cap", project: "bb-plugin-firstmate", title: "Live is the only finish", sourceRefs: ["tg:200:3001"], crewId: "fm1", at: Date.now() - 2 * HOUR });
+    tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Maintenance banner", sourceRefs: ["tg:200:3002"], crewId: "cy1", at: Date.now() - 40 * HOUR });
+    const fm = store.register({ url: "https://github.com/amrtawfik160/bb-plugin-firstmate/pull/159", taskId: "fm1", projectId: "proj_1", owner: "thr_cap", home: "", worker: "thr_fm1" });
+    store.save({ ...fm, status: "complete", forgeState: "merged", mergeCommitSha: loaded });
+    const cy = store.register({ url: "https://github.com/cyndra-ai/cyndra-saas/pull/2535", taskId: "cy1", projectId: "proj_1", owner: "thr_cap", home: "", worker: "thr_cy1" });
+    store.save({ ...cy, status: "complete", forgeState: "merged", mergeCommitSha: "c0ffee" });
+    tasks.reconcile("thr_cap", (task) => store.forTasks(task.crewIds, task.prs), Date.now() - 30 * HOUR);
+    assert.deepEqual(tasks.list("thr_cap").map((task) => [task.id, task.state]), [["T1", "merged"], ["T2", "merged"]]);
+    const idle = () => host.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_cap", status: "idle", projectId: "proj_1" }), lastAssistantText: "" });
+    assert.deepEqual((await idle()).errors, []);
+    assert.equal(tasks.get("T1")!.state, "live");
+    assert.match(tasks.get("T1")!.evidence!, new RegExp(`^Live check: Firstmate loaded on this host at .* \\(${loaded.slice(0, 8)}\\) holds amrtawfik160/bb-plugin-firstmate#159`));
+    assert.equal(tasks.get("T2")!.state, "merged");
+    const alerts = () => calls.filter((call) => call.method === "alert");
+    assert.equal(alerts().length, 1);
+    assert.equal(alerts()[0]!.input.project, "Cyndra");
+    assert.equal(alerts()[0]!.input.level, "warning");
+    assert.match(String(alerts()[0]!.input.text), /^1 task has had no next step for more than 24 hours in Cyndra:\n- T2 Maintenance banner \(merged, not live, no step for 30 h\): the captain must deploy to production in a release window and check it there \(live check missing: no record says which commit Cyndra production runs/);
+    await idle();
+    assert.equal(alerts().length, 1, "one alert per stall");
+    const notLive = (await host.harness.behavior.callRpc("telegramCommand", { command: "board", threadId: "thr_cap" }) as { notLive: Array<Record<string, unknown>> }).notLive;
+    assert.deepEqual(notLive.map((item) => [item.id, item.who, item.missing]), [["T2", "the captain", "no record says which commit Cyndra production runs: GitHub's last Production deployment is from 4 Oct, and the daily production drift check stopped on 27 Sep"]]);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// Repair thread, 18 Oct: T203 listed a read-only scout as a crew; T204's drop reason named PR 2487, which now belongs to T247.
+test("firstmate_task corrects a task record: remove-crew and amend-drop need a reason and are kept in the task's history", async () => {
+  const host = await captainHost();
+  try {
+    const tasks = createOwnerTasks(host.bb.storage.database());
+    tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Humza bugs", sourceRefs: ["tg:200:4001"], crewId: "0bd8dda8", at: Date.now() });
+    tasks.attach("T1", "thr_cap", { crewId: "406628f1", sourceRefs: [], at: Date.now() });
+    const task = tool(host, "firstmate_task");
+    assert.equal(text(await task.execute({ action: "remove-crew", id: "T1", crewId: "406628f1" }, capCtx)), "remove-crew needs reason: why the record is wrong.");
+    assert.equal(text(await task.execute({ action: "remove-crew", id: "T1", crewId: "406628f1", reason: "read-only scout" }, capCtx)),
+      'Task T1 corrected (remove-crew): 406628f1 removed. Recorded with reason "read-only scout"; 1 correction(s) in its history.');
+    assert.deepEqual(tasks.get("T1")!.crewIds, ["0bd8dda8"]);
+    tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Provisioner", sourceRefs: ["tg:200:4002"], at: Date.now() });
+    tasks.move("T2", "thr_cap", { to: "dropped", reason: "Owner: stop; drop PR 2487", ref: "tg:200:4003" }, Date.now());
+    assert.equal(text(await task.execute({ action: "amend-drop", id: "T2", text: "Owner: stop the provisioner", reason: "PR 2487 now belongs to T247" }, capCtx)),
+      'Task T2 corrected (amend-drop-reason): Owner: stop; drop PR 2487 -> Owner: stop the provisioner. Recorded with reason "PR 2487 now belongs to T247"; 1 correction(s) in its history.');
+    assert.deepEqual(tasks.get("T2")!.history!.map((h) => h.actor), ["thr_cap"]);
+    assert.match(text(await task.execute({ action: "amend-drop", id: "T1", text: "x", reason: "y" }, capCtx)), /only a dropped task has a drop reason/);
   } finally {
     await host.harness.lifecycle.dispose();
   }

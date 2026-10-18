@@ -129,7 +129,7 @@ test("14 Oct repro: the DM Pro epic becomes a program the captain cannot lose, a
     assert.match(text(await program(host, { action: "create", epic: "cyndra-ai/cyndra-saas#2422", refs: ["tg:985604794:4404"] })), /^Program P1 already tracks this epic\./);
 
     // The owner task stays open while tickets are open.
-    const close = await tool(host, "firstmate_task").execute({ action: "close", id: "T1", state: "done", reason: "first ticket merged" }, capCtx);
+    const close = await tool(host, "firstmate_task").execute({ action: "close", id: "T1", state: "live", reason: "first ticket in production" }, capCtx);
     assert.ok(isError(close));
     assert.match(text(close), /Task T1 holds program P1 \(DM Pro epic\): 19 of 20 tickets are open\./);
 
@@ -170,7 +170,7 @@ test("a merged PR closes the ticket and the captain gets one wake naming the tic
   }
 });
 
-test("dropping every open ticket with the owner's words closes the program and its owner task", async () => {
+test("dropping every open ticket with the owner's words closes the program; its task waits for its merged ticket to go live", async () => {
   const host = await captainHost();
   try {
     github(host);
@@ -179,8 +179,8 @@ test("dropping every open ticket with the owner's words closes the program and i
     const refused = await program(host, { action: "set", id: "P1", tickets, state: "dropped", reason: "" });
     assert.match(text(refused), /needs the owner's words/);
     const dropped = await program(host, { action: "set", id: "P1", tickets, state: "dropped", reason: "Stop DM Pro, we buy a tool instead" });
-    assert.match(text(dropped), /Program P1 is closed; owner task T1 is done\./);
-    assert.equal(createOwnerTasks(host.bb.storage.database()).get("T1")!.state, "done");
+    assert.match(text(dropped), /Program P1 is closed; owner task T1 is merged\./, "its one merged ticket still has to go live");
+    assert.equal(createOwnerTasks(host.bb.storage.database()).get("T1")!.state, "merged");
     assert.equal(text(await program(host, { action: "list" })), "No program is open.");
   } finally {
     await host.harness.lifecycle.dispose();
@@ -295,13 +295,13 @@ test("a ticket GitHub cannot read (deleted, or a PR) is named and keeps its stat
   }
 });
 
-test("an epic whose tickets are all closed closes its program and owner task at once", async () => {
+test("an epic whose tickets are all closed closes its program at once and its task waits to go live", async () => {
   const host = await captainHost();
   try {
     github(host, () => [], { subIssues: epic.subIssues.map((issue) => ({ ...issue, state: "closed" })) });
     const created = text(await createEpic(host));
-    assert.match(created, /Program P1 is closed; owner task T1 is done\./);
-    assert.equal(createOwnerTasks(host.bb.storage.database()).get("T1")!.state, "done");
+    assert.match(created, /Program P1 is closed; owner task T1 is merged\./);
+    assert.equal(createOwnerTasks(host.bb.storage.database()).get("T1")!.state, "merged");
     assert.equal(text(await program(host, { action: "list" })), "No program is open.");
   } finally {
     await host.harness.lifecycle.dispose();

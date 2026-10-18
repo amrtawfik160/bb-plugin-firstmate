@@ -167,9 +167,9 @@ test('a release read-back must name the required TestFlight group, and a Safi ta
   const release=(as,group)=>deliveries(host,{action:'release',task:task.id,build:'21',group,source:'app-store-connect',seen:`build 21 is in ${group}, state Approved`},as);
   assert.match(text(await release('thr_cap','Beta Testers')),/^(?:Error: )?Refusing: only a crew records a release read-back/);
   assert.match(text(await release('thr_safi','Team (Expo)')),/^(?:Error: )?Refusing: Safi builds must be in the "Beta Testers" public-link group, not "Team \(Expo\)"\. Add build 21 to "Beta Testers", read it back from App Store Connect or EAS, then record it again\./);
-  assert.match(text(await tool(host,'firstmate_task').execute({action:'close',id:task.id,state:'done',reason:'Build 21 is live on TestFlight'},ctx)),/Task T1 is a Safi release with a merged PR: it closes only with a crew's read-back of the build in "Beta Testers"/);
+  assert.match(text(await tool(host,'firstmate_task').execute({action:'close',id:task.id,state:'live',reason:'Build 21 is live on TestFlight'},ctx)),/Task T1 is a Safi release with a merged PR: it closes only with a crew's read-back of the build in "Beta Testers"/);
   assert.match(text(await release('thr_safi','Beta Testers')),/Release read-back recorded for T1: build 21 in "Beta Testers"/);
-  assert.match(text(await tool(host,'firstmate_task').execute({action:'close',id:task.id,state:'done',reason:'Build 21 is in Beta Testers'},ctx)),/Task T1 is done/);
+  assert.match(text(await tool(host,'firstmate_task').execute({action:'close',id:task.id,state:'live',reason:'Build 21 is in Beta Testers'},ctx)),/Task T1 is live/);
  }finally{await host.harness.lifecycle.dispose();}
 });
 
