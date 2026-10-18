@@ -7407,6 +7407,7 @@ export default async function plugin(bb: BbPluginApi) {
       await boundedFollowUp((s) => registerCrewPr(pr.candidate!.crew, pr.url, s, { title: pr.title, openedAt: pr.openedAt }, true), signal)
         .then(() => { deliveries.touch(pr.id, pr.touchedAt); }, (error) => { if (signal?.aborted) throw error; bb.log.warn(`Open PR tracking ${pr.id}: ${String(error)}`); });
     }
+    return snapshot;
   }
   // Read-only view for a captain: every open PR by this GitHub account in the captain's projects, untracked first.
   async function openPrReport(captain: string, project: string | undefined, signal?: AbortSignal) {
@@ -7471,7 +7472,7 @@ export default async function plugin(bb: BbPluginApi) {
   // 52 native records on 17 Oct. This retires each such record, with forget's own steps.
   let retainedSweepAt = 0;
   const keptReasons = new Map<string, string>();
-  async function retireEndedRetainedRecords(signal?: AbortSignal) {
+  async function retireEndedRetainedRecords(open: OpenPrSnapshot | undefined, signal?: AbortSignal) {
     if (Date.now() - retainedSweepAt < RETAINED_SWEEP_MS) return;
     retainedSweepAt = Date.now();
     const all: DeliveryRecord[] = [];
@@ -7501,7 +7502,6 @@ export default async function plugin(bb: BbPluginApi) {
         // ledger saw merged or closed and the list does not show is still finished. Only a
         // PR the ledger never saw finished, or outside the list, is read on GitHub, from the
         // sweep's own share.
-        const open = openPrSnapshot && Date.now() - openPrSnapshot.at < 90_000 ? openPrSnapshot : undefined;
         const reopened: string[] = [];
         for (const r of records) {
           if (open?.repos.some((repo) => repo.allOpen.has(r.id))) { reopened.push(`${r.id} open on GitHub`); continue; }
@@ -7655,7 +7655,10 @@ export default async function plugin(bb: BbPluginApi) {
   }
   async function backgroundDeliveryPass(signal?: AbortSignal) {
     // First, so a PR opened this minute gets its row and its first GitHub read in this cycle.
-    await openPrSweep(signal).catch(error=>{ if (!signal?.aborted) bb.log.warn(`Open PR sweep: ${String(error)}`); });
+    // Only this cycle's own list can settle a terminal ledger row in the sweep below; a
+    // list sweep that fails leaves it undefined, not the previous cycle's.
+    let cycleLists: OpenPrSnapshot | undefined;
+    await openPrSweep(signal).then(snapshot=>{ cycleLists=snapshot; },error=>{ if (!signal?.aborted) bb.log.warn(`Open PR sweep: ${String(error)}`); });
     await recoverDoneDeliveries(signal);
     const crews = await raceAbort(readCrews(),signal,STUCK_HOST_CALL_MS);
     const batch = [...crews.slice(deliveryDiscoveryCursor),...crews.slice(0,deliveryDiscoveryCursor)].slice(0,10);
@@ -7703,7 +7706,7 @@ export default async function plugin(bb: BbPluginApi) {
         await follow(record);
       }
     }));
-    await backgroundBudget.run("sweep", () => retireEndedRetainedRecords(signal)).catch((error) => { if (!signal?.aborted) bb.log.warn(`Retained native records: ${String(error)}`); });
+    await backgroundBudget.run("sweep", () => retireEndedRetainedRecords(cycleLists, signal)).catch((error) => { if (!signal?.aborted) bb.log.warn(`Retained native records: ${String(error)}`); });
     // Notification failure stays due independently of forge polling backoff.
     for (const record of deliveries.pendingNotifications()) {
       if (record.notification.desired !== record.notification.delivered) await boundedFollowUp(s=>notifyDelivery(record,s),signal).catch(error=>bb.log.warn(`PR notification ${record.id}: ${String(error)}`));
