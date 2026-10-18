@@ -4279,13 +4279,14 @@ export default async function plugin(bb: BbPluginApi) {
       (typeof env["baseBranch"] === "string" && env["baseBranch"]) || null;
     const host = env["hostId"];
     const path = env["path"];
-    if (!base || typeof host !== "string" || !host || typeof path !== "string" || !path) {
-      throw new Error("Cannot verify committed work: environment has no host, path, or base branch.");
+    if (typeof host !== "string" || !host || typeof path !== "string" || !path) {
+      throw new Error("Cannot verify committed work: environment has no host or path.");
     }
     // The base permits clean local-only worktrees without a remote. Use local
     // remote-tracking refs; teardown does not fetch or require network access.
+    // Without a known base, every commit on no remote counts: stricter, never looser.
     const result = await runOnHost(host,
-      `git -C ${shQuote(path)} rev-list --max-count=20 HEAD --not --remotes ${shQuote(base)} --`, 15_000);
+      `git -C ${shQuote(path)} rev-list --max-count=20 HEAD --not --remotes${base ? ` ${shQuote(base)}` : ""} --`, 15_000);
     if (result.exitCode !== 0) throw new Error("Cannot verify committed work: Git reachability check failed. Crew retained.");
     const commits = result.output.trim().split(/\r?\n/).filter(Boolean);
     if (commits.some(sha => !/^[a-f0-9]{40,64}$/.test(sha))) {
@@ -9437,6 +9438,9 @@ export default async function plugin(bb: BbPluginApi) {
     if (pr) await registerCrewPr(crew,pr);
     const nativeHome = await crewNativeHome(crew);
     const notes: string[] = [];
+    // A merged PR does not cover files or commits made after it. Native or BB-side, refuse first.
+    try { await refuseUnlandedCrewWork(crew, notes); }
+    catch (error) { throw new Error(`Crew ${crew.id} kept (PR landed; cleanup pending): ${error instanceof Error ? error.message : String(error)}`); }
     if (nativeHome !== "" && !isSecondmateRoute(crew)) {
       const hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
       const result = await runFmScript({ script: "teardown", args: [crew.id], fmHome: nativeHome, hostId, timeoutMs: 180_000 });
@@ -9635,6 +9639,13 @@ export default async function plugin(bb: BbPluginApi) {
     return rows;
   }
 
+  // One pass at a time: the hourly schedule and `bb firstmate wip-backup` share it.
+  let wipBackupRun: Promise<WipBackupRow[]> | undefined;
+  function wipBackupOnce(): Promise<WipBackupRow[]> {
+    wipBackupRun ??= wipBackupPass(launchAbort.signal).finally(() => { wipBackupRun = undefined; });
+    return wipBackupRun;
+  }
+
   // One message per captain, naming each crew not yet reported today.
   async function reportWipRows(rows: readonly WipBackupRow[], now: number, signal: AbortSignal): Promise<void> {
     const day = new Date(now).toISOString().slice(0, 10);
@@ -9644,7 +9655,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (row.captain === null || r === null) continue;
       const parts: string[] = [];
       if (r.dirty.length > 0) parts.push(`${r.dirty.length >= 200 ? "at least 200" : r.dirty.length} uncommitted file(s), not backed up`);
-      if (r.push === "failed") parts.push(`backup push of ${r.unpushed} commit(s) failed (${truncate(r.detail, 160) || "no detail"})`);
+      if (r.push === "failed") parts.push(`backup failed${r.unpushed > 0 ? ` for ${r.unpushed} commit(s)` : ""} (${truncate(r.detail, 160) || "no detail"})`);
       if (r.push === "no-remote") parts.push(`${r.unpushed} commit(s) on no remote, and the worktree has no remote to back them up to`);
       if (parts.length === 0) continue;
       if ((await bb.storage.kv.get(`wip-reported:${row.crewId}`)) === day) continue;
@@ -9758,6 +9769,16 @@ export default async function plugin(bb: BbPluginApi) {
       }
       notes.push(`branch commits landed via merged ${landedPr}`);
     }
+  }
+
+  // The same refusal for a recorded crew worktree, before any retirement path touches it.
+  // An archived thread's environment is already retired. A worktree that cannot be read refuses.
+  async function refuseUnlandedCrewWork(crew: Crew, notes: string[]): Promise<void> {
+    if (!crew.worktree || isSecondmateRoute(crew) || await isCaptainThread(crew.threadId)) return;
+    const thread = await bb.sdk.threads.get({ threadId: crew.threadId });
+    if (thread.archivedAt != null) return;
+    if (!thread.environmentId) throw new Error(`Cannot verify worktree for crew ${crew.id}: environment unavailable. Crew retained.`);
+    await refuseUnlandedWork(crew, thread.environmentId, notes);
   }
 
   // BB-side retirement of a crew thread that native teardown did not retire:
@@ -9885,11 +9906,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (force) notes.push(`forced on the owner's words: "${truncate(ownerWords, 200)}"`);
     // Forget without stop drops the record, and the hourly wip backup only sees recorded crews,
     // so it refuses unlanded work like a stop does. A retained delivery is checked below.
-    if (!stop && !force && !preserveAuthority && crew.worktree && !isSecondmateRoute(crew) && !(await isCaptainThread(crew.threadId))) {
-      const thread = await bb.sdk.threads.get({ threadId: crew.threadId });
-      // A thread with no environment has no worktree BB or the backup can reach.
-      if (thread.archivedAt == null && thread.environmentId) await refuseUnlandedWork(crew, thread.environmentId, notes);
-    }
+    if (!stop && !force && !preserveAuthority) await refuseUnlandedCrewWork(crew, notes);
     if (openPrs.length > 0) notes.push(`${openPrs.length} open PR(s) stay tracked for you and still need a decision (merge, fix or close): ${openPrs.map((r) => r.url).join(" ")}`);
     if (stop) {
       if (await isCaptainThread(crew.threadId)) {
@@ -9904,6 +9921,7 @@ export default async function plugin(bb: BbPluginApi) {
         const hostId = await resolveHostForProject(crew.projectId, crew.threadId);
         const teardown = () => runFmScript({
           script: "teardown", args: [crew.id, ...(force ? ["--force"] : [])],
+          ...(force ? { env: { FM_FORCE_OWNER_WORDS: truncate(ownerWords, 300) } } : {}),
           fmHome: nativeHome, hostId, timeoutMs: 180_000,
         });
         let result = await teardown();
@@ -16759,8 +16777,8 @@ export default async function plugin(bb: BbPluginApi) {
             return reply(rows, rows.length === 0 ? "No owner corrections recorded." : rows.map((c) => `${c.id} ${c.at.slice(0, 10)} ${c.ref} ${c.fix ? `fixed: ${c.fix.ref}` : "open"}: ${c.words.split("\n")[0]}`).join("\n"));
           }
           case "wip-backup": {
-            // The same pass the hourly schedule runs.
-            const rows = await wipBackupPass(launchAbort.signal);
+            // The same pass the hourly schedule runs; a pass already running is joined, not repeated.
+            const rows = await wipBackupOnce();
             const lines = rows.map((row) => row.result === null
               ? `error      ${row.crewId}: ${truncate(row.error, 200)}`
               : `${row.result.push.padEnd(10)} ${row.crewId}: ${row.result.unpushed} unpushed commit(s)${row.result.push === "pushed" ? ` -> ${row.result.remote}/${row.result.target}` : ""}; ${row.result.dirty.length} uncommitted file(s)${row.result.push === "failed" ? ` (${truncate(row.result.detail, 160)})` : ""}`);
@@ -16880,11 +16898,9 @@ export default async function plugin(bb: BbPluginApi) {
     const [, captain, id] = key.split(":");
     if (captain && id) finishWakeLater(captain, id);
   }
-  let wipBackupWork: Promise<unknown> | undefined;
   bb.background.schedule("wip-backup", "17 * * * *", async () => {
-    if (wipBackupWork || launchAbort.signal.aborted) return;
-    wipBackupWork = wipBackupPass(launchAbort.signal).catch((error) => bb.log.warn(`wip backup: ${String(error)}`));
-    try { await wipBackupWork; } finally { wipBackupWork = undefined; }
+    if (wipBackupRun || launchAbort.signal.aborted) return;
+    await wipBackupOnce().catch((error) => bb.log.warn(`wip backup: ${String(error)}`));
   });
   let taskSweepWork: Promise<void> | undefined;
   bb.background.schedule("task-lifecycle", "*/5 * * * *", async () => {

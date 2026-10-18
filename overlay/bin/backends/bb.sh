@@ -770,6 +770,9 @@ for raw in sys.stdin:
     if line.startswith("?? .claude/") or line in noise:
         continue
     path = line[3:]
+    # Harness scratch, as the plugin counts it: Lavish review pages and temp notes.
+    if line.startswith("?? ") and (path == ".lavish" or path.startswith(".lavish/") or (path.rsplit("/", 1)[-1].startswith(".tmp-") and path.endswith(".md"))):
+        continue
     if " -> " in path:
         path = path.split(" -> ", 1)[1]
     if len(path) >= 2 and path[0] == "\"" and path[-1] == "\"":
@@ -858,6 +861,37 @@ fm_backend_bb_worktree_is_clean() {  # <target> <thread-id>
   return 0
 }
 
+# 0 only when every commit on HEAD is on a remote branch, or fm-teardown.sh's own
+# landed check (a merged PR or content on the default branch) accepts it. The hourly
+# wip backup pushes such commits, after which they pass. A checkout this host cannot
+# read, or any git failure, is a refusal.
+fm_backend_bb_worktree_is_pushed() {  # <target> <thread-id>
+  local target=$1 id=$2 show wt unpushed branch
+  show=$(fm_backend_bb_show "$id" 2>/dev/null || true)
+  wt=$(printf '%s' "$show" | fm_backend_bb_json_field path 2>/dev/null || true)
+  if [ -z "$wt" ] && [ -d "$target" ]; then
+    wt=$target
+  fi
+  if [ -z "$wt" ] || [ ! -d "$wt" ]; then
+    echo "error: refusing to remove BB worktree for $id; cannot inspect commits not on a remote (no checkout on this host)" >&2
+    return 1
+  fi
+  git -C "$wt" rev-parse --verify --quiet HEAD >/dev/null 2>&1 || return 0
+  if ! unpushed=$(git -C "$wt" log --format=%h HEAD --not --remotes -- 2>/dev/null); then
+    echo "error: refusing to remove BB worktree for $id; cannot inspect commits not on a remote at $wt" >&2
+    return 1
+  fi
+  [ -n "$unpushed" ] || return 0
+  if declare -F work_is_landed >/dev/null && [ -n "${WT:-}" ] \
+    && [ "$(cd "$WT" 2>/dev/null && pwd -P)" = "$(cd "$wt" && pwd -P)" ]; then
+    branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
+    work_is_landed "$branch" && return 0
+  fi
+  echo "error: refusing to remove BB worktree for $id; commits on no remote and not landed at $wt:" >&2
+  printf '%s\n' "$unpushed" | head -5 >&2
+  return 1
+}
+
 fm_backend_bb_remove_worktree() {  # <thread-id-or-worktree-id>
   # BB owns worktree lifecycle. Archive is what retires the managed-worktree;
   # a dirty tree must fail here so fm-teardown.sh aborts and keeps its records.
@@ -865,19 +899,20 @@ fm_backend_bb_remove_worktree() {  # <thread-id-or-worktree-id>
   local id
   id=$(fm_backend_bb_thread_id "$1")
   [ -n "$id" ] || { echo "error: refusing empty BB remove_worktree target" >&2; return 1; }
-  # Upstream scout carve-out: a completed scout's worktree is disposable scratch
-  # (its durable deliverable is the report, already gated by teardown), so it is
-  # discarded without the dirty-tree refusal. --force is the captain's explicit
-  # discard. Ship work still gets the full clean-or-refuse protection. KIND/FORCE
-  # are fm-teardown.sh globals in scope here.
-  case "${KIND:-}" in
-    scout) ;;
-    *)
-      if [ "${FORCE:-}" != "--force" ]; then
-        fm_backend_bb_worktree_is_clean "$1" "$id" || return 1
-      fi
-      ;;
-  esac
+  # Owner decision Q6 (18 Oct): no archive while the worktree holds uncommitted or
+  # unpushed work, scouts included (upstream discards a scout's tree as scratch).
+  # --force discards only with the owner's quoted words in FM_FORCE_OWNER_WORDS.
+  # KIND/FORCE are fm-teardown.sh globals in scope here.
+  if [ "${FORCE:-}" = "--force" ]; then
+    if [ -z "${FM_FORCE_OWNER_WORDS:-}" ]; then
+      echo "error: refusing forced BB worktree release for $id; quote the owner's words that allow the discard (FM_FORCE_OWNER_WORDS)" >&2
+      return 1
+    fi
+    echo "warning: forced BB worktree release for $id on the owner's words: ${FM_FORCE_OWNER_WORDS:0:300}" >&2
+  else
+    fm_backend_bb_worktree_is_clean "$1" "$id" || return 1
+    fm_backend_bb_worktree_is_pushed "$1" "$id" || return 1
+  fi
   fm_backend_bb_kill "$id" || return 1
   fm_backend_bb_tool_check || return 1
   bb thread archive "$id" || return 1

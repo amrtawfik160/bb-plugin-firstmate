@@ -36,22 +36,34 @@ function shQuote(text: string): string {
  */
 export function wipBackupScript(path: string, crewId: string, base: string): string {
   const prefix = wipBranchFor(crewId, "x").slice(0, -1);
+  const baseRef = shQuote(`refs/heads/${base}`);
+  // A git command that fails is a failed backup, never "nothing to push" or "no files".
+  const fail = (what: string) => `{ echo "FM_WIP push=failed cannot read ${what}"; exit 0; }`;
   return [
     `cd ${shQuote(path)} 2>/dev/null && git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "FM_WIP push=missing"; exit 0; }`,
     `export GIT_TERMINAL_PROMPT=0`,
-    `git status --porcelain=v1 --untracked-files=all 2>/dev/null | head -n 200 | while IFS= read -r l; do printf 'FM_WIP_DIRTY %s\\n' "\${l:3}"; done`,
+    `st=$(git status --porcelain=v1 --untracked-files=all 2>/dev/null) || ${fail("uncommitted files")}`,
+    `printf '%s\\n' "$st" | head -n 200 | while IFS= read -r l; do [ -n "$l" ] && printf 'FM_WIP_DIRTY %s\\n' "\${l:3}"; done`,
     `branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)`,
-    `n=0; git rev-parse --verify --quiet HEAD >/dev/null && n=$(git rev-list --count HEAD --not --remotes $(git rev-parse --verify --quiet ${shQuote(`refs/heads/${base}`)} >/dev/null && echo ${shQuote(`refs/heads/${base}`)}) -- 2>/dev/null || echo 0)`,
+    `head=$(git rev-parse --verify --quiet HEAD 2>/dev/null || true)`,
+    `exclude=""; git rev-parse --verify --quiet ${baseRef} >/dev/null 2>&1 && exclude=${baseRef}`,
+    `n=0; if [ -n "$head" ]; then n=$(git rev-list --count "$head" --not --remotes $exclude -- 2>/dev/null) || ${fail("commits not on a remote")}; fi`,
+    `case "$n" in ''|*[!0-9]*) ${fail("commits not on a remote")} ;; esac`,
     `remote=""; [ -n "$branch" ] && remote=$(git config --get "branch.$branch.remote" 2>/dev/null || true); [ "$remote" = "." ] && remote=""`,
-    `[ -z "$remote" ] && { git remote | grep -qx origin && remote=origin || remote=$(git remote | head -n 1); }`,
+    `remotes=$(git remote 2>/dev/null) || ${fail("remotes")}`,
+    `[ -z "$remote" ] && { printf '%s\\n' "$remotes" | grep -qx origin && remote=origin || remote=$(printf '%s\\n' "$remotes" | head -n 1); }`,
     `target=${shQuote(prefix)}"\${branch:-detached}"`,
     `echo "FM_WIP unpushed=$n branch=$branch remote=$remote target=$target"`,
-    `[ "$n" -gt 0 ] 2>/dev/null || { echo "FM_WIP push=none"; exit 0; }`,
+    `[ "$n" -gt 0 ] || { echo "FM_WIP push=none"; exit 0; }`,
     `[ -n "$remote" ] || { echo "FM_WIP push=no-remote"; exit 0; }`,
     `case "$target" in ${shQuote(prefix)}*) ;; *) echo "FM_WIP push=failed bad target"; exit 0;; esac`,
-    // The lease names the value this checkout last saw; an unknown branch must not exist yet.
+    // The lease names the value this checkout last pushed or fetched; an unknown branch must not exist yet.
     `seen=$(git rev-parse --verify --quiet "refs/remotes/$remote/$target" || true)`,
-    `if out=$(timeout 90 git push --no-verify --porcelain --force-with-lease="refs/heads/$target:$seen" "$remote" "HEAD:refs/heads/$target" 2>&1); then echo "FM_WIP push=pushed"; else echo "FM_WIP push=failed $(printf '%s' "$out" | tr '\\n' ' ' | cut -c1-300)"; fi`,
+    `if ! out=$(timeout 90 git push --no-verify --porcelain --force-with-lease="refs/heads/$target:$seen" "$remote" "$head:refs/heads/$target" 2>&1); then echo "FM_WIP push=failed $(printf '%s' "$out" | tr '\\n' ' ' | cut -c1-300)"; exit 0; fi`,
+    // Keep the pushed value even when the fetch refspec does not cover wip/ (a single-branch
+    // clone): the next lease needs it, and the retire check then sees the commits as pushed.
+    `git update-ref "refs/remotes/$remote/$target" "$head" || { echo "FM_WIP push=failed pushed, but could not record refs/remotes/$remote/$target"; exit 0; }`,
+    `echo "FM_WIP push=pushed"`,
   ].join("\n");
 }
 

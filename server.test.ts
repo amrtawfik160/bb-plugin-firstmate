@@ -802,6 +802,20 @@ async function seedCrew(host: Awaited<ReturnType<typeof load>>) {
   ]);
 }
 
+// A crew worktree BB can read, with nothing uncommitted or unpushed: forget and every
+// retirement inspect it first (owner decision Q6), so fixtures give it a real environment.
+function stubCleanWorktree(host: Awaited<ReturnType<typeof load>>, env: Record<string, unknown> = {}) {
+  host.harness.sdk.stub("environments.get", async (args: { environmentId: string }) => ({
+    id: args.environmentId, hostId: "host_1", path: "/wt", isWorktree: true, status: "ready", mergeBaseBranch: "main", ...env,
+  }));
+  host.harness.sdk.stub("environments.diffFiles", async () => ({ files: [] }));
+}
+
+// Only the uncommitted-file read, for fixtures whose environment stub is already specific.
+function stubNoUncommitted(host: Awaited<ReturnType<typeof load>>) {
+  host.harness.sdk.stub("environments.diffFiles", async () => ({ files: [] }));
+}
+
 function stubIdleSdk(host: Awaited<ReturnType<typeof load>>) {
   host.harness.sdk.stub("threads.send", async () => ({}));
   host.harness.sdk.stub("threads.list", async () => []);
@@ -2369,7 +2383,10 @@ test("F1: forget --stop --force archives despite committed-unpushed work and doe
 test("forget drops the crew protocol-nudges row", async () => {
   const host = await load();
   try {
+    stubRoutedHost(host, () => ({}));
     stubIdleSdk(host);
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }));
+    stubCleanWorktree(host);
     await seedCrew(host);
     await host.bb.storage.kv.set("protocol-nudges", {
       c1: { generation: "2026-09-18T00:00:00.000Z", count: 2, lastAt: 1, exhausted: false, dueAt: 9 },
@@ -2388,7 +2405,10 @@ test("forget drops the crew protocol-nudges row", async () => {
 test("forget without stop releases an idle thread so leftover monitors cannot wake it", async () => {
   const host = await load();
   try {
+    stubRoutedHost(host, () => ({}));
     stubIdleSdk(host);
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }));
+    stubCleanWorktree(host);
     host.harness.sdk.stub("threads.stop", async () => ({}));
     await seedCrew(host);
     const result = await host.harness.behavior.runCli(["forget", "c1"]);
@@ -2404,9 +2424,11 @@ test("forget without stop releases an idle thread so leftover monitors cannot wa
 test("forget without stop warns clearly when the crew thread is still running", async () => {
   const host = await load();
   try {
+    stubRoutedHost(host, () => ({}));
     host.harness.sdk.stub("threads.send", async () => ({}));
     host.harness.sdk.stub("threads.list", async () => []);
-    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "active", environmentId: null }));
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "active", environmentId: "env_wt" }));
+    stubCleanWorktree(host);
     host.harness.sdk.stub("threads.stop", async () => ({}));
     await seedCrew(host);
     const result = await host.harness.behavior.runCli(["forget", "c1"]);
@@ -2432,7 +2454,8 @@ test("forget retries a transient host failure and names what is left when it sti
       return {};
     });
     host.harness.sdk.stub("threads.list", async () => []);
-    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: null }));
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }));
+    stubCleanWorktree(host);
     host.harness.sdk.stub("threads.stop", async () => ({}));
     await host.bb.storage.kv.set("crews", [{ ...shipRow("c1", "thr_crew", "thr_cap"), nativeHome: "/tmp/fm-home", backlogRow: true }]);
     const result = await host.harness.behavior.runCli(["forget", "c1"], { threadId: "thr_cap" });
@@ -2464,7 +2487,8 @@ test("forget finishes when a transient error hid an rm that applied and the retr
       return {};
     });
     host.harness.sdk.stub("threads.list", async () => []);
-    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: null }));
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "idle", environmentId: "env_wt" }));
+    stubCleanWorktree(host);
     host.harness.sdk.stub("threads.stop", async () => ({}));
     await host.bb.storage.kv.set("crews", [{ ...shipRow("c1", "thr_crew", "thr_cap"), nativeHome: "/tmp/fm-home", backlogRow: true }]);
     const result = await host.harness.behavior.runCli(["forget", "c1"], { threadId: "thr_cap" });
@@ -2555,6 +2579,7 @@ test("dispatch forwards reasoningLevel to the spawned thread", async () => {
 test("merge lands a PR with zero checks (no_checks) on the captain's word", async () => {
   const host = await load();
   try {
+    stubCleanWorktree(host);
     await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
     stubRoutedHost(host, (cmd) => (unwrapHostCommand(cmd).includes("gh pr view") ? { payload: prViewAnswer(unwrapHostCommand(cmd)) } : {}));
     host.harness.sdk.stub("threads.list", async () => []);
@@ -2639,6 +2664,7 @@ test("merge runs native merge and teardown before retiring the crew", async () =
   });
   await plugin(host.bb); stubProviderCatalog(host);
   try {
+    stubCleanWorktree(host);
     const hostCommands: string[] = [];
     await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
     host.harness.sdk.stub("threads.list", async () => []);
@@ -2691,6 +2717,8 @@ test("merge runs native merge and teardown before retiring the crew", async () =
 test("bearings reconciles a crew whose PR merged externally", async () => {
   const host = await load();
   try {
+    stubRoutedHost(host, () => ({}));
+    stubCleanWorktree(host);
     await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
     host.harness.sdk.stub("threads.list", async () => []);
     host.harness.sdk.stub("threads.get", async () =>
@@ -2780,6 +2808,8 @@ test("bearings never retires a DONE scout because a PR on its environment merged
 test("a refused landed-crew cleanup keeps the crew without failing bearings", async () => {
   const host = await load();
   try {
+    stubRoutedHost(host, () => ({}));
+    stubCleanWorktree(host);
     await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
     host.harness.sdk.stub("threads.list", async () => []);
     host.harness.sdk.stub("threads.get", async () =>
@@ -3128,7 +3158,7 @@ test("deck renders native Bearings without a competing chat-derived cache", asyn
   }
 });
 
-test("bb overlay adapter propagates reasoning, names and tags crews, drops yolo->full, carves out scouts", () => {
+test("bb overlay adapter propagates reasoning, names and tags crews, drops yolo->full, checks scouts too", () => {
   const src = readFileSync(
     join(dirname(fileURLToPath(import.meta.url)), "overlay", "bin", "backends", "bb.sh"),
     "utf8",
@@ -3141,9 +3171,9 @@ test("bb overlay adapter propagates reasoning, names and tags crews, drops yolo-
   assert.doesNotMatch(src, /firstmate mark-crew|thread spawn/);
   // yolo no longer forces BB full permission
   assert.doesNotMatch(src, /perm=full/);
-  // scout scratch carve-out in remove_worktree
-  assert.match(src, /KIND:-/);
-  assert.match(src, /scout\)/);
+  // Owner decision Q6: no scout carve-out; every release checks files and commits, and force needs the owner's words.
+  assert.match(src, /fm_backend_bb_worktree_is_clean "\$1" "\$id" \|\| return 1\n    fm_backend_bb_worktree_is_pushed "\$1" "\$id" \|\| return 1/);
+  assert.match(src, /FM_FORCE_OWNER_WORDS/);
 });
 
 // ── Overlay must NEVER edit tracked native files (mirror-bin invariant) ───────
@@ -6763,7 +6793,8 @@ test("IT lifecycle: native cleanup failure preserves recovery, retry removes onl
     for (const crew of others) writeFileSync(join(home, `state/${crew.id}.meta`), "kind=ship\nbackend=bb\n");
     const metaPath = join(home, "state/retiring.meta");
     mkdirSync(metaPath); // A real host rm failure, without depending on root permissions.
-    await host.bb.storage.kv.set("crews", [{ ...shipRow("retiring", "thr_crew", "thr_cap"), backlogRow: true }, ...others]);
+    // No worktree of its own: this test is about native record cleanup, not unlanded work.
+    await host.bb.storage.kv.set("crews", [{ ...shipRow("retiring", "thr_crew", "thr_cap"), worktree: false, backlogRow: true }, ...others]);
     const failed = await host.harness.behavior.runCli(["forget", "retiring"], { projectId: "proj_1" });
     assert.notEqual(failed.exitCode, 0);
     assert.match(failed.stderr, /Native metadata cleanup failed/);
@@ -8170,6 +8201,8 @@ test("IT native local merge respects captain hold and lands BB-named branch", as
     assert.equal(r.status, 0, r.stderr); return r.stdout.trim();
   };
   try {
+    // The real worktree: after the ff-only merge its commits are on local main, so it is clean.
+    stubCleanWorktree(host, { path: wt });
     mkdirSync(project); mkdirSync(join(home, "fakebin"));
     git("init", "-b", "main", project);
     git("-C", project, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "base");
@@ -9738,6 +9771,8 @@ test("crews all=true stays on this project and caps its text rows", async () => 
 test("merge refuses another captain's crew, or a PR another captain's crew owns, unless overrideOwner", async () => {
   const host = await load();
   try {
+    stubRoutedHost(host, () => ({}));
+    stubCleanWorktree(host);
     const pr = "https://github.com/o/r/pull/7";
     await host.bb.storage.kv.set("crews", [
       { ...shipRow("c1", "thr_c1", "thr_capA"), prUrl: pr },
@@ -9816,6 +9851,8 @@ test("dispatch refuses a task aimed at another captain's crew PR unless override
 test("a PR merged outside its captain retires the crew and tells the OWNING captain", async () => {
   const host = await load();
   try {
+    stubRoutedHost(host, () => ({}));
+    stubCleanWorktree(host);
     await host.harness.behavior.setSettings({ supervisionEnabled: true });
     await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_capB")]);
     host.harness.sdk.stub("threads.list", async () => []);
@@ -10021,6 +10058,7 @@ test("merge trusts fm-pr-merge's verified MERGED readback over BB's stale PR cac
   const host = nativeMergeHost();
   await plugin(host.bb); stubProviderCatalog(host);
   try {
+    stubNoUncommitted(host);
     const url = "https://github.com/o/r/pull/1";
     await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
     stubNativeMerge(host, (cmd) => (cmd.includes("fm-pr-merge.sh")
@@ -10100,6 +10138,7 @@ test("merge resolves a crew PR the environment cache misses (crew pushed to an e
   const host = nativeMergeHost();
   await plugin(host.bb); stubProviderCatalog(host);
   try {
+    stubNoUncommitted(host);
     const url = "https://github.com/o/r/pull/5";
     await host.bb.storage.kv.set("crews", [{ ...shipRow("c1", "thr_crew", "thr_cap"), prUrl: url }]);
     const routed = stubNativeMerge(host, (cmd) => {
@@ -10121,6 +10160,7 @@ test("merge polls a lazily computed UNKNOWN mergeability instead of refusing at 
   const prev = process.env.FM_MERGEABLE_POLL_MS;
   process.env.FM_MERGEABLE_POLL_MS = "0";
   try {
+    stubCleanWorktree(host);
     await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
     stubRoutedHost(host, (cmd) => (unwrapHostCommand(cmd).includes("gh pr view") ? { payload: prViewAnswer(unwrapHostCommand(cmd)) } : {}));
     host.harness.sdk.stub("threads.list", async () => []);
@@ -11080,6 +11120,8 @@ test("the background landed sweep never retires a crew whose PR was closed unmer
 test("the landed sweep never wakes an archived (retired) owning captain", async () => {
   const host = await load();
   try {
+    stubRoutedHost(host, () => ({}));
+    stubCleanWorktree(host);
     await host.harness.behavior.setSettings({ supervisionEnabled: true });
     await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_capB")]);
     host.harness.sdk.stub("threads.list", async () => []);

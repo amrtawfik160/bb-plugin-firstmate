@@ -4,7 +4,8 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import { stubProviderCatalog } from "./test/provider-catalog.mjs";
@@ -174,4 +175,116 @@ test("firstmate_forget refuses force without ownerWords", async () => {
     assert.match(JSON.stringify(result), /Quote the owner's words/);
     assert.deepEqual(await f.crews(), ["c1"]);
   } finally { await f.done(); }
+});
+
+// The native BB backend's worktree release, sourced on its own with BB calls stubbed.
+const ADAPTER = join(dirname(fileURLToPath(import.meta.url)), "overlay/bin/backends/bb.sh");
+function nativeRelease(wt: string, vars: string, extra = "") {
+  return spawnSync("bash", ["-c", `
+    source ${JSON.stringify(ADAPTER)}
+    fm_backend_bb_thread_id() { echo thr_crew; }
+    fm_backend_bb_show() { echo '{"path":"${wt}"}'; }
+    fm_backend_bb_kill() { echo KILLED; }
+    fm_backend_bb_tool_check() { return 0; }
+    fm_backend_bb_run_json() { echo "{}"; }
+    fm_backend_bb_mark_env_deleted() { :; }
+    bb() { echo CALLED_BB "$@"; }
+    ${extra}
+    ${vars}
+    fm_backend_bb_remove_worktree thr_crew
+  `], { encoding: "utf8", env: GIT_ENV });
+}
+
+test("native release refuses a ship with unpushed commits, a dirty scout, and a bare force", async () => {
+  const f = await fixture();
+  try {
+    commit(f.wt, "only-local.txt", "work\n");
+    const ship = nativeRelease(f.wt, "KIND=ship");
+    assert.notEqual(ship.status, 0, ship.stdout);
+    assert.match(ship.stderr, /commits on no remote and not landed/);
+    assert.doesNotMatch(ship.stdout, /KILLED|CALLED_BB/, "nothing stopped or archived");
+    // fm-teardown.sh's own landed check (a merged PR) still lets landed work go.
+    const landed = nativeRelease(f.wt, `KIND=ship WT=${JSON.stringify(f.wt)}`, "work_is_landed() { return 0; }");
+    assert.equal(landed.status, 0, landed.stderr);
+    assert.match(landed.stdout, /CALLED_BB thread archive thr_crew/);
+    git(f.wt, "reset", "-q", "--hard", "main");
+    writeFileSync(join(f.wt, "draft.txt"), "work\n");
+    const scout = nativeRelease(f.wt, "KIND=scout");
+    assert.notEqual(scout.status, 0, scout.stdout);
+    assert.match(scout.stderr, /uncommitted changes/);
+    assert.doesNotMatch(scout.stdout, /KILLED|CALLED_BB/);
+    const bare = nativeRelease(f.wt, "KIND=ship FORCE=--force");
+    assert.notEqual(bare.status, 0, bare.stdout);
+    assert.match(bare.stderr, /quote the owner's words/);
+    const owned = nativeRelease(f.wt, `KIND=ship FORCE=--force FM_FORCE_OWNER_WORDS="drop it"`);
+    assert.equal(owned.status, 0, owned.stderr);
+    assert.match(owned.stderr, /on the owner's words: drop it/);
+    // Lavish review pages are scratch, as the plugin counts them.
+    rmSync(join(f.wt, "draft.txt"));
+    writeFileSync(join(f.wt, ".tmp-notes.md"), "scratch\n");
+    assert.equal(nativeRelease(f.wt, "KIND=scout").status, 0);
+  } finally { await f.done(); }
+});
+
+test("a forced native scout teardown carries the owner's words to the native script", async () => {
+  const f = await fixture();
+  try {
+    await f.host.bb.storage.kv.set("crews", [{
+      id: "c1", task: "look", projectId: "proj_1", threadId: "thr_crew", parentThreadId: "thr_cap", nativeHome: "/pinned-home",
+      providerId: null, model: null, reasoningLevel: null, worktree: true, shape: "scout", posture: "scout", createdAt: "2026-09-18T00:00:00.000Z",
+    }]);
+    await cli(f.host, "forget", "c1", "--stop", "--force", "owner: drop the scout");
+    const teardown = f.commands.find((cmd) => cmd.includes("fm-teardown.sh"));
+    assert.ok(teardown, f.commands.join("\n---\n"));
+    assert.match(teardown!, /export FM_FORCE_OWNER_WORDS='owner: drop the scout'/);
+  } finally { await f.done(); }
+});
+
+test("forget without --stop fails closed when the crew's environment cannot be read", async () => {
+  const f = await fixture();
+  try {
+    commit(f.wt, "only-local.txt", "work\n");
+    f.host.harness.sdk.stub("threads.get", async (args: { threadId: string }) => makeThreadResponse({ id: args.threadId, status: "idle", environmentId: null }));
+    const r = await cli(f.host, "forget", "c1");
+    assert.notEqual(r.exitCode, 0, r.stdout);
+    assert.match(r.stderr, /environment unavailable/);
+    assert.deepEqual(await f.crews(), ["c1"]);
+  } finally { await f.done(); }
+});
+
+test("a PR merged outside the captain does not retire a crew with uncommitted files", async () => {
+  const f = await fixture();
+  try {
+    writeFileSync(join(f.wt, "draft.txt"), "work\n");
+    f.host.harness.sdk.stub("environments.pullRequest", async () => ({ outcome: "available", pullRequest: { url: "https://github.com/o/r/pull/1", number: 1, title: "t", state: "merged", checks: { state: "no_checks", failedCount: 0, pendingCount: 0, passedCount: 0 } } }));
+    const r = await cli(f.host, "bearings");
+    assert.equal(r.exitCode, 0, r.stderr);
+    assert.equal(f.host.harness.sdk.callsTo("threads.archive").length, 0);
+    assert.equal(f.host.harness.sdk.callsTo("threads.stop").length, 0);
+    assert.deepEqual(await f.crews(), ["c1"]);
+  } finally { await f.done(); }
+});
+
+test("the CLI backup joins a scheduled backup that is still running", async () => {
+  const f = await fixture();
+  let release: () => void = () => {};
+  let entered: () => void = () => {};
+  const gate = new Promise<void>((r) => { release = r; });
+  const started = new Promise<void>((r) => { entered = r; });
+  let active = 0, max = 0, calls = 0;
+  try {
+    f.host.harness.sdk.stub("terminals.output", async () => {
+      active++; calls++; max = Math.max(max, active); entered(); await gate; active--;
+      return { nextSeq: 1, chunks: [{ dataBase64: Buffer.from("FM_WIP push=none\n__FM_HOST_RC:0\n").toString("base64") }] };
+    });
+    const scheduled = f.host.harness.behavior.runSchedule("wip-backup");
+    await started;
+    const manual = cli(f.host, "wip-backup");
+    await new Promise((r) => setTimeout(r, 100));
+    release();
+    const [, out] = await Promise.all([scheduled, manual]);
+    assert.equal(max, 1, "two passes inspected the worktree at once");
+    assert.equal(calls, 1);
+    assert.equal(out.exitCode, 0, out.stderr);
+  } finally { release(); await f.done(); }
 });

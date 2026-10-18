@@ -59,6 +59,8 @@ async function deck() {
  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle',environmentId:`env_${threadId}`}));
  host.harness.sdk.stub('environments.list',async()=>[{id:'env_source',hostId:'host_1',status:'ready',isWorktree:false,path:'/repo'}]);
  host.harness.sdk.stub('environments.get',async({environmentId})=>{const crew=CREWS.find(c=>`env_${c.threadId}`===environmentId);const pr=PRS.find(p=>p[2]===crew?.id);return{id:environmentId,hostId:'host_1',status:'ready',isWorktree:true,path:'/wt',branchName:`fm/${crew?.id}-change-${pr?.[1]}`};});
+ // Retirement inspects the crew worktree first; these are clean.
+ host.harness.sdk.stub('environments.diffFiles',async()=>({files:[]}));
  host.harness.sdk.stub('environments.pullRequest',async()=>({outcome:'unavailable'}));
  host.harness.sdk.stub('threads.output',async()=>({output:'DONE: PR open'}));
  host.harness.sdk.stub('threads.events.list',async()=>[]);

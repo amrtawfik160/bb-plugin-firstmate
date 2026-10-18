@@ -941,6 +941,9 @@ function stubMergeSdk(host: Host) {
     },
   }));
   host.harness.sdk.stub("environments.mergePullRequest", async () => { calls.merged++; return {}; });
+  // Retirement inspects the crew worktree first; this one is clean and pushed.
+  host.harness.sdk.stub("environments.get", async () => ({ id: "env_wt", hostId: "host_1", path: "/wt", isWorktree: true, status: "ready", mergeBaseBranch: "main" }));
+  host.harness.sdk.stub("environments.diffFiles", async () => ({ files: [] }));
   return calls;
 }
 

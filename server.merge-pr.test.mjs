@@ -47,6 +47,8 @@ async function deck(open=OPEN,{verified=true}={}) {
  host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle',environmentId:'env_wt'}));
  host.harness.sdk.stub('environments.list',async()=>[{id:'env_source',hostId:'host_1',status:'ready',isWorktree:false,path:'/repo'}]);
  host.harness.sdk.stub('environments.get',async()=>({id:'env_wt',hostId:'host_1',status:'ready',isWorktree:true,path:'/wt',branchName:branch(2391)}));
+ // Retirement inspects the crew worktree first; this one is clean.
+ host.harness.sdk.stub('environments.diffFiles',async()=>({files:[]}));
  // BB's environment points at the crew's newest PR, the one the old merge picked by itself.
  host.harness.sdk.stub('environments.pullRequest',async()=>({outcome:'available',pullRequest:{url:url(2391),state:'open'}}));
  host.harness.sdk.stub('threads.output',async()=>({output:''}));

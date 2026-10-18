@@ -1,7 +1,7 @@
 // Real git fixtures: a bare repository on local disk is the crew's remote. No network.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -141,4 +141,35 @@ test("the crew branch's own upstream remote is used; no remote is reported, not 
 test("a missing worktree path is reported as missing", () => {
   const r = backup(join(tmpdir(), "fm-wip-does-not-exist"), "c1");
   assert.equal(r.push, "missing");
+});
+
+test("a single-branch checkout keeps backing up: the pushed value is kept for the next lease", () => {
+  const f = fixture();
+  try {
+    git(f.wt, "config", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main");
+    commit(f.wt, "one.txt", "1\n");
+    assert.equal(backup(f.wt, "c1").push, "pushed");
+    const head = commit(f.wt, "two.txt", "2\n");
+    const r = backup(f.wt, "c1");
+    assert.equal(r.push, "pushed", r.detail);
+    assert.equal(remoteRef(f.remote, "refs/heads/wip/c1-fm/c1-task"), head);
+    assert.equal(git(f.wt, "rev-list", "--count", "HEAD", "--not", "--remotes"), "0", "the retire check sees the commits as pushed");
+  } finally { f.done(); }
+});
+
+test("a git command that fails is a failed backup, never nothing to push or no files", () => {
+  for (const broken of ["rev-list", "status"]) {
+    const f = fixture();
+    try {
+      commit(f.wt, "one.txt", "1\n");
+      const wrapper = join(f.root, "git");
+      writeFileSync(wrapper, `#!/bin/sh\nif [ "$1" = ${broken} ]; then exit 128; fi\nexec ${spawnSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim()} "$@"\n`);
+      chmodSync(wrapper, 0o755);
+      const r = spawnSync("bash", ["-c", wipBackupScript(f.wt, "c1", "main")], { encoding: "utf8", env: { ...GIT_ENV, PATH: `${f.root}:${GIT_ENV.PATH}` } });
+      const parsed = parseWipBackup(r.stdout);
+      assert.equal(parsed.push, "failed", `${broken}: ${r.stdout}`);
+      assert.match(parsed.detail, /cannot read/);
+      assert.equal(remoteRef(f.remote, "refs/heads/wip/c1-fm/c1-task"), null);
+    } finally { f.done(); }
+  }
 });
