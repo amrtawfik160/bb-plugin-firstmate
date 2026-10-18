@@ -542,7 +542,7 @@ export const BB_ARTIFACT_CONTRACT = "Use the absolute task-owned artifact direct
 // BB-DIVERGE: native fm_task_inbox_doorbell_line tells the worker to list, read,
 // and mv state/<id>.inbox/*.msg by hand. There is no worker drain helper
 // (fm-inbox.sh drain is the captain note inbox). fm-inbox-take.sh is those steps.
-export const BB_INBOX_TAKE_CONTRACT = "A steering wake that begins with Firstmate instruction waiting is the native inbox doorbell. Run FM_HOME=<home> <home>/bin-bb/fm-inbox-take.sh <task-id>. That script lists state/<task-id>.inbox/*.msg in numeric order and prints each body. After you act, acknowledge only the displayed immutable message IDs you handled using the printed command, for example --ack 001.msg 002.msg. Bare --ack refuses; new arrivals stay pending. Do not hand-roll those steps.";
+export const BB_INBOX_TAKE_CONTRACT = "A steering wake that begins with Firstmate instruction waiting is the native inbox doorbell. Run FM_HOME=<home> <home>/bin-bb/fm-inbox-take.sh <task-id>. That script lists state/<task-id>.inbox/*.msg in numeric order and prints each body. After you act, acknowledge only the displayed immutable message IDs you handled using the printed command, for example --ack 001.msg 002.msg. Bare --ack refuses; new arrivals stay pending. Do not hand-roll those steps. A wake that begins with Firstmate instruction for crew carries the instruction text itself: act on that text; Firstmate already filed its record as handled, so run no inbox read or acknowledgement for it.";
 
 // Crews ran `gh-axi run watch` (3s interval) and `pr checks` loops thousands of
 // times and exhausted the GitHub token every crew and captain shares.

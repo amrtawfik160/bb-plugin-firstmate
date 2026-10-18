@@ -35,7 +35,7 @@ The dispatch contract `--delivery-requirement pr|merged|merged-and-verified` def
 
 Native startup uses the workspace already bound by SDK creation. Its cwd assertion still runs; startup `cd` does not become a second model prompt. Explicit worker instructions still use normal delivery.
 
-The native pin includes `wait-no-turns`, watcher continuity, bounded mergeability-unknown retry and completion inventory checks. Native `config/wait-no-turns` remains opt-in. BB does not copy home-local preferences or add a competing native-worker waiting loop. See [implementation evidence](docs/verification/launch-pr-lifecycle-progress.md) for limits and validation.
+The native pin includes `wait-no-turns`, watcher continuity, bounded mergeability-unknown retry and completion inventory checks. Native `config/wait-no-turns` remains opt-in; `waitNoTurnsCrews` tries it on named crews first (see "Waiting crews and BB's completion pings"). BB does not copy home-local preferences or add a competing native-worker waiting loop. See [implementation evidence](docs/verification/launch-pr-lifecycle-progress.md) for limits and validation.
 
 ## Install
 
@@ -266,42 +266,64 @@ Native startup must run beneath the agent harness to acquire its session lock. `
 
 ## Crew message delivery
 
-With `tellOwner=real`, Firstmate uses the upstream inbox writer and constant
-notification text. Only the worker's move into `handled/` acknowledges a message.
-BB queues notification pointers, coalesces them per crew, and removes owned
-notifications once the inbox is consumed. Unread records are never pruned.
-Notification failures retain the record and retry; failed writes do not fall back
-to a second message transport. `queue=true` defers the notification and disables
+With `tellOwner=real`, Firstmate uses the upstream inbox writer. The crew's wake
+carries the message text itself, so the crew runs no inbox read and no
+acknowledgement for it. Firstmate keeps the native record and files it under
+`handled/` once the wake is in a crew turn: at once for a delivered steer, and
+for a queued wake once a crew turn request carries it. A queued wake that is
+removed without reaching the crew leaves its record unread. A queued wake carries every text still
+waiting, so one wake replaces the earlier ones. A text over 12,000 characters
+falls back to the inbox pointer (replacing a queued inline wake), and then only the worker's move into
+`handled/` acknowledges it. Unread records are never pruned. Notification
+failures retain the record and retry; failed writes do not fall back to a
+second message transport. `queue=true` defers the notification and disables
 native re-rings for that record; ordinary tells retain native recovery behavior.
+
+## Waiting crews and BB's completion pings
+
+BB pings the captain at the end of every crew turn. BB 0.46.1 sends that ping
+past plugin hooks unless it queued it, and Firstmate does not drop it. BB 0.46.2 adds per-crew
+`parentNotifications`: set `crewParentNotifications` to `stuck` after that
+upgrade, and BB pings only for failures, interruptions and questions. Firstmate's
+own wake then reports a finished turn and skips a WAITING one. The setting is
+`auto` by default and applies to crews started after the change.
+
+Native "waiting crews spend no turns" (`config/wait-no-turns`) can be tried on
+one crew first. Put its crew id in `waitNoTurnsCrews` and dispatch it with that
+`taskId` under real transport: its brief and spawn read a copy of the home config
+that adds the flag (`state/<id>.wait-config`). To switch the whole fleet on,
+create `config/wait-no-turns` in the captain home and clear `waitNoTurnsCrews`.
+Native's captain-side parts of the flag (the one retry ring and the pending-reply
+hold) follow the home config only.
 
 ## Automatic compaction
 
-Firstmate compacts an idle captain or crew thread when its used tokens reach
-the trigger. Two settings define the trigger:
+Firstmate compacts an idle captain or crew thread between turns when its used
+tokens reach the trigger; a crew is never compacted mid-turn. Every model call
+rereads the whole context, so a large window compacted only near full rereads
+400,000 tokens or more per call. Three settings define the trigger:
 
-- `captainCompactAtTokens`: a minimum token count. Default `200000`. `0` turns
-  Firstmate's automatic compaction off.
-- `captainCompactAtRatio`: a share of the model's context window. Default
-  `0.6`. Range `0.1` to `1`. A value of `0` or less, or above `1`, also turns
+- `captainCompactAtTokens`: tokens for a captain. Default `200000`. `0` turns
   it off.
+- `crewCompactAtTokens`: tokens for a crew. Default `250000`. `0` turns it off.
+- `captainCompactAtRatio`: a share of the model's context window, for both.
+  Default `0.9`. Range `0.1` to `1`. A value of `0` or less, or above `1`, turns
+  compaction off.
 
-The trigger is the larger of the two:
+The trigger is the smaller of the two, so the share only matters on a small
+window:
 
 ```
-trigger = max(captainCompactAtTokens, context window x captainCompactAtRatio)
+trigger = min(token setting, context window x captainCompactAtRatio)
 ```
 
 Worked examples with the defaults:
 
-| Context window | Window x 0.6 | Trigger |
-| --- | --- | --- |
-| 200,000 tokens | 120,000 tokens | 200,000 tokens (the minimum wins) |
-| 1,000,000 tokens | 600,000 tokens | 600,000 tokens (the ratio wins) |
-
-On a 200,000-token window the default trigger equals the whole window, so
-Firstmate in practice leaves that thread to the provider. Lower
-`captainCompactAtTokens` (for example to `120000`) to compact such a thread at
-60%.
+| Thread | Context window | Window x 0.9 | Trigger |
+| --- | --- | --- | --- |
+| Captain | 1,000,000 tokens | 900,000 tokens | 200,000 tokens |
+| Crew | 1,000,000 tokens | 900,000 tokens | 250,000 tokens |
+| Crew | 256,000 tokens | 230,400 tokens | 230,400 tokens (the share wins) |
 
 Estimated readings count. Unknown usage, unknown window size, and usage larger
 than the window do not trigger compaction. When the provider reports its own
@@ -312,8 +334,10 @@ does not stop Firstmate.
 Firstmate checks a thread when its turn ends, and sweeps idle captains every 30
 minutes. The minimum interval between attempts is 20 minutes per thread. An
 unchanged reading cannot trigger another attempt after that interval or a
-plugin reload. A measured reading below 90% of the window clears the stored
-reading, so later growth can qualify again. Concurrent checks share one
+plugin reload. Only a measured reading below the trigger clears the stored
+reading, so later growth can qualify again. Compaction also waits while input
+waits for the thread: a queued message, an open question, or, for a captain, an
+owner message not answered yet. Concurrent checks share one
 attempt, and thread status is checked again before compaction. Manual
 compaction and the provider's own compaction remain available.
 

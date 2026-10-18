@@ -628,6 +628,8 @@ test("a crew that just reported DONE is not compacted, so BB sends no second com
     stubIdleSdk(host);
     host.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 910000, modelContextWindow: 1000000, estimated: false } }));
     host.harness.sdk.stub("threads.compact", async () => ({ ok: true }));
+    host.harness.sdk.stub("threads.queuedMessages.list", async () => []);
+    host.harness.sdk.stub("threads.interactions.list", async () => []);
     await seedCrew(host);
     await emitIdle(host, "DONE: PR https://github.com/acme/repo/pull/1 is open and checks are green.");
     assert.equal(host.harness.sdk.callsTo("threads.compact").length, 0);

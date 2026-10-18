@@ -32,6 +32,8 @@ import plugin, {
   watchRelayDedupKey,
   wakeAckFromOutput,
   captainCompactDue,
+  inboxWakeText,
+  waitNoTurnsConfigScript,
   bbPingCarriesOutcome,
   captainRateLimitFromEvents,
   captainWakeHold,
@@ -2502,6 +2504,25 @@ function hostOutput(text: string, code = 0) {
   return { nextSeq: 1, chunks: [{ dataBase64: Buffer.from(body).toString("base64") }] };
 }
 
+// Owner, 18 Oct (Q11): prepared behind a setting until BB 0.46.2 ships per-child parentNotifications.
+test("crewParentNotifications=stuck spawns crews that BB pings only when stuck; the default leaves BB's pings as they are", async () => {
+  for (const [value, expected] of [["auto", undefined], ["stuck", "stuck"]] as const) {
+    const host = await load();
+    try {
+      await host.harness.behavior.setSettings({ crewParentNotifications: value });
+      host.harness.sdk.stub("environments.list", async () => [{ hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" }]);
+      host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_crew" }));
+      host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_crew", status: "starting" }));
+      const result = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--", "fix flaky login"], { projectId: "proj_1" });
+      assert.equal(result.exitCode, 0, result.stderr);
+      const args = host.harness.sdk.callsTo("threads.spawn")[0]![0] as { parentNotifications?: string };
+      assert.equal(args.parentNotifications, expected, value);
+    } finally {
+      await host.harness.lifecycle.dispose();
+    }
+  }
+});
+
 test("toolbeltPhrase uses computed counts when known, neutral text otherwise", () => {
   assert.match(toolbeltPhrase("175", "21"), /175 bin\/fm-\*\.sh scripts \+ 21 skills/);
   assert.match(toolbeltPhrase("", ""), /full bin\/fm-\*\.sh toolbelt/);
@@ -4227,6 +4248,48 @@ test("real transport dispatches through fm-spawn.sh and adopts its thread id", a
     assert.equal(crews[0]?.threadId, "thr_real");
   } finally {
     await host.harness.lifecycle.dispose();
+  }
+});
+
+// Owner, 18 Oct (Q18): canary native "waiting crews spend no turns" on one named crew before the fleet.
+test("waitNoTurnsCrews names one crew: only its brief and spawn read a config that adds wait-no-turns", async () => {
+  const host = realHost();
+  await plugin(host.bb); stubProviderCatalog(host);
+  try {
+    await host.harness.behavior.setSettings({ waitNoTurnsCrews: "canary1" });
+    const { seen } = stubRealTransportHost(host, { spawnExit: 0, threadIdAfterSpawn: "thr_real" });
+    for (const id of ["canary1", "plain2"]) {
+      const result = await host.harness.behavior.runCli(["dispatch", "--project", "proj_1", "--task-id", id, "--", `fix flaky login ${id}`], { projectId: "proj_1" });
+      assert.equal(result.exitCode, 0, result.stderr);
+    }
+    const of = (id: string, script: string) => seen.filter((c) => c.includes(script) && c.includes(id));
+    for (const script of ["fm-brief.sh", "fm-spawn"]) {
+      assert.ok(of("canary1", script).length > 0, `${script} ran for canary1`);
+      assert.ok(of("canary1", script).every((c) => c.includes("FM_CONFIG_OVERRIDE=") && c.includes("/state/canary1.wait-config")), `${script} for canary1 reads its own config`);
+      assert.ok(of("plain2", script).every((c) => !c.includes("FM_CONFIG_OVERRIDE")), `${script} for plain2 reads the home config`);
+    }
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("waitNoTurnsConfigScript mirrors the home config and adds wait-no-turns for one crew only", () => {
+  const home = mkdtempSync(join(tmpdir(), "fm-wnt-"));
+  try {
+    mkdirSync(join(home, "config"), { recursive: true });
+    mkdirSync(join(home, "state"), { recursive: true });
+    writeFileSync(join(home, "config", "startup-memory-budget"), "7500\n");
+    writeFileSync(join(home, "config", ".hidden"), "1\n");
+    const script = waitNoTurnsConfigScript(home, "canary1");
+    const run = (cmd: string) => spawnSync("bash", ["-c", `${script}\n${cmd}`], { encoding: "utf8" });
+    const out = run('printf "%s\\n" "$FM_CONFIG_OVERRIDE"; [ -e "$FM_CONFIG_OVERRIDE/wait-no-turns" ] && echo flag; cat "$FM_CONFIG_OVERRIDE/startup-memory-budget" "$FM_CONFIG_OVERRIDE/.hidden"');
+    assert.equal(out.status, 0, out.stderr);
+    assert.deepEqual(out.stdout.trim().split("\n"), [join(home, "state", "canary1.wait-config"), "flag", "7500", "1"]);
+    assert.ok(!existsSync(join(home, "config", "wait-no-turns")), "the home config is unchanged");
+    writeFileSync(join(home, "config", "later"), "x\n");
+    assert.equal(run('cat "$FM_CONFIG_OVERRIDE/later"').stdout.trim(), "x", "a rerun picks up a new home entry");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
   }
 });
 
@@ -7208,8 +7271,8 @@ test("IT F3: tellOwner=real steers a crew with NO state/<id>.meta (durable recor
     const res = await host.harness.behavior.runCli(["tell", "c1", "--message=please rebase on main"], { projectId: "proj_1" });
     assert.equal(res.exitCode, 0, res.stderr);
     assert.equal(sendCalls(host).length, 1, "literal doorbell still delivered");
-    const rec = readFileSync(join(home, "state", "c1.inbox", "001.msg"), "utf8");
-    assert.match(rec, /please rebase on main/, "durable record written despite no meta");
+    const rec = readFileSync(join(home, "state", "c1.inbox", "handled", "001.msg"), "utf8");
+    assert.match(rec, /please rebase on main/, "durable record written despite no meta, filed once its wake was delivered");
     assert.ok(!existsSync(join(home, "state", "c1.meta")), "no meta was needed");
   } finally {
     await host.harness.lifecycle.dispose();
@@ -7236,14 +7299,14 @@ test("IT F4: tellOwner=real stores steer text VERBATIM for --key / --resolve-key
       const res = await host.harness.behavior.runCli(["tell", "c1", `--message=${body}`], { projectId: "proj_1" });
       assert.equal(res.exitCode, 0, res.stderr);
       seq += 1;
-      const rec = readFileSync(join(home, "state", "c1.inbox", `${String(seq).padStart(3, "0")}.msg`), "utf8");
+      const rec = readFileSync(join(home, "state", "c1.inbox", "handled", `${String(seq).padStart(3, "0")}.msg`), "utf8");
       const bodyOnDisk = rec.slice(rec.indexOf("\n--\n") + 4);
       assert.equal(bodyOnDisk, STEER_PREFIX + body, `verbatim record mismatch for [${body}]`);
       assert.equal(bodyOnDisk.slice(STEER_PREFIX.length), body, `content mangled after prefix for [${body}]`);
     }
     const texts = sendCalls(host).map((s) => s.text);
     assert.equal(texts.length, bodies.length);
-    for (const text of texts) assert.match(text, /Firstmate instruction waiting/);
+    for (const text of texts) assert.match(text, /^Firstmate instruction for crew c1/);
   } finally {
     await host.harness.lifecycle.dispose();
     rmSync(home, { recursive: true, force: true });
@@ -7300,7 +7363,7 @@ test("note: report lines never override the crew's real terminal verb (latestSta
   assert.doesNotMatch(summary ?? "", /REPORTX/);
 });
 
-test("IT F3b: tellOwner=real leaves acknowledgement to the native worker", { skip: !FM_INTEGRATION }, async () => {
+test("IT F3b: tellOwner=real files a steer whose text reached the crew's turn, so the native ladder stays quiet", { skip: !FM_INTEGRATION }, async () => {
   const home = scratchFmHome();
   const host = itHost(home, { tellOwner: "real" });
   await plugin(host.bb); stubProviderCatalog(host);
@@ -7309,12 +7372,10 @@ test("IT F3b: tellOwner=real leaves acknowledgement to the native worker", { ski
     await seedCrew(host);
     const res = await host.harness.behavior.runCli(["tell", "c1", "--message=please rebase"], { projectId: "proj_1" });
     assert.equal(res.exitCode, 0, res.stderr);
-    const handled = join(home, "state", "c1.inbox", "001.msg");
+    const handled = join(home, "state", "c1.inbox", "handled", "001.msg");
     const rec = readFileSync(handled, "utf8");
     assert.doesNotMatch(rec, /delivery=fire-and-forget/, "ordinary steer must use upstream's normal record");
-    assert.ok(existsSync(handled), "notification acceptance must not acknowledge the record");
-    mkdirSync(join(home, "state/c1.inbox/handled"), { recursive: true });
-    assert.equal(spawnSync("mv", [handled, join(home, "state/c1.inbox/handled/001.msg")]).status, 0);
+    assert.ok(!existsSync(join(home, "state", "c1.inbox", "001.msg")), "the delivered wake carried the text, so the record is filed");
     // The REAL ladder sees no unhandled record, so it stays quiet.
     const due = spawnSync(
       "bash",
@@ -8937,13 +8998,24 @@ test("wake ack pair parses from both the native and the rewritten form", () => {
 
 test("live repro: a captain at 790k of 1M estimated tokens under a 967k provider threshold is due for compaction", () => {
   const live = {
-    budget: 200_000, ratio: 0.6, usedTokens: 789_701, modelContextWindow: 1_000_000, estimated: true,
+    budget: 200_000, ratio: 0.9, usedTokens: 789_701, modelContextWindow: 1_000_000, estimated: true,
     providerThreshold: 967_000, lastCompactAt: null, now: 10_000_000, cooldownMs: 1_200_000,
   };
   assert.equal(captainCompactDue(live), true);
-  assert.equal(captainCompactDue({ ...live, usedTokens: 590_000 }), false, "below 60% waits");
-  assert.equal(captainCompactDue({ ...live, providerThreshold: 500_000 }), false, "a lower provider threshold compacts first");
+  assert.equal(captainCompactDue({ ...live, usedTokens: 190_000 }), false, "below the token budget waits");
+  assert.equal(captainCompactDue({ ...live, providerThreshold: 150_000 }), false, "a lower provider threshold compacts first");
   assert.equal(captainCompactDue({ ...live, lastCompactAt: live.now - 60_000 }), false, "cooldown");
+});
+
+// Owner, 18 Oct (Q9): the captain compacts at 200k of a 1M window, not at 90% of it (median trigger was 405k).
+test("compaction is due at the token budget on a large window; the share only caps a small window", () => {
+  const base = { budget: 200_000, ratio: 0.9, providerThreshold: null, modelContextWindow: 1_000_000, estimated: false, now: 10_000_000, cooldownMs: 1_200_000, lastCompactAt: null };
+  assert.equal(captainCompactDue({ ...base, usedTokens: 210_000 }), true, "200k budget on a 1M window");
+  assert.equal(captainCompactDue({ ...base, usedTokens: 199_999 }), false);
+  assert.equal(captainCompactDue({ ...base, budget: 250_000, usedTokens: 240_000 }), false, "a crew below its 250k budget");
+  assert.equal(captainCompactDue({ ...base, budget: 250_000, usedTokens: 260_000 }), true, "a crew past its 250k budget");
+  assert.equal(captainCompactDue({ ...base, budget: 250_000, modelContextWindow: 256_000, usedTokens: 235_000 }), true, "90% of a 256k window comes first");
+  assert.equal(captainCompactDue({ ...base, budget: 250_000, modelContextWindow: 256_000, usedTokens: 225_000 }), false);
 });
 
 test("captain compaction is due only past the budget and outside the cooldown", () => {
@@ -8955,7 +9027,7 @@ test("captain compaction is due only past the budget and outside the cooldown", 
   assert.equal(captainCompactDue({ ...base, budget: 0, usedTokens: 900_000, lastCompactAt: null }), false, "0 turns it off");
   assert.equal(captainCompactDue({ ...base, usedTokens: null, lastCompactAt: null }), false);
   for (const overrides of [
-    { usedTokens: 899_999 }, { usedTokens: 1_000_001 }, { usedTokens: NaN },
+    { usedTokens: 199_999 }, { usedTokens: 1_000_001 }, { usedTokens: NaN },
     { usedTokens: Infinity }, { modelContextWindow: null }, { modelContextWindow: 0 },
     { modelContextWindow: NaN }, { budget: Infinity }, { ratio: 0 }, { ratio: 1.5 },
   ]) {
@@ -8991,13 +9063,15 @@ function stubCompactionHost(host: Awaited<ReturnType<typeof load>>) {
   host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_cap", status: "idle" }));
   host.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 910000, modelContextWindow: 1000000, estimated: false } }));
   host.harness.sdk.stub("threads.compact", async () => ({ ok: true }));
+  host.harness.sdk.stub("threads.queuedMessages.list", async () => []);
+  host.harness.sdk.stub("threads.interactions.list", async () => []);
   return () => host.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_cap", status: "idle" }), lastAssistantText: "" } as never);
 }
 
 for (const [name, usage] of Object.entries({
   "over-window provider total": { usedTokens: 2103251, modelContextWindow: 256000, estimated: false },
   "missing capacity": { usedTokens: 910000, estimated: false },
-  "a lower provider-managed threshold": { usedTokens: 910000, modelContextWindow: 1000000, estimated: false, snapshot: { autoCompactAtTokens: 550000 } },
+  "a lower provider-managed threshold": { usedTokens: 910000, modelContextWindow: 1000000, estimated: false, snapshot: { autoCompactAtTokens: 150000 } },
 })) {
   test(`automatic compaction ignores ${name}`, async () => {
     const { host, idle } = await compactionHost();
@@ -9021,7 +9095,7 @@ test("automatic compaction requires new evidence after cooldown and reload", asy
     assert.equal(await host.bb.storage.kv.get("captain-project:thr_cap"), "proj_1");
     await idle();
     assert.equal(host.harness.sdk.callsTo("threads.compact").length, 0, "unchanged evidence survives reload and cooldown");
-    host.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 300000, modelContextWindow: 1000000, estimated: false } }));
+    host.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 150000, modelContextWindow: 1000000, estimated: false } }));
     await idle();
     assert.equal(await host.bb.storage.kv.get("thread-compaction-evidence:thr_cap"), undefined, "lower usage clears the old measurement");
     host.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 910000, modelContextWindow: 1000000, estimated: false } }));
@@ -9066,13 +9140,38 @@ test("automatic compaction rechecks current thread status after reading usage", 
   } finally { await host.harness.lifecycle.dispose(); }
 });
 
-test("automatic compaction preserves a captain with ample context remaining", async () => {
+test("automatic compaction preserves a captain below its token budget", async () => {
   const { host, idle } = await compactionHost();
   try {
-    host.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 510_862, estimated: false, modelContextWindow: 1_000_000 } }));
+    host.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 190_862, estimated: false, modelContextWindow: 1_000_000 } }));
     await idle();
-    assert.equal(host.harness.sdk.callsTo("threads.compact").length, 0, "a half-empty context does not need compaction");
+    assert.equal(host.harness.sdk.callsTo("threads.compact").length, 0, "a context under 200k does not need compaction");
   } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("an idle captain compacts at 200k and an idle crew at 250k by default", async () => {
+  const fresh = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS });
+  await fresh.bb.storage.kv.set("captain-project:thr_cap", "proj_1");
+  await plugin(fresh.bb);
+  try {
+    let used = 230_000;
+    fresh.harness.sdk.stub("threads.list", async () => []);
+    fresh.harness.sdk.stub("threads.get", async ({ threadId }) => makeThreadResponse({ id: threadId, status: "idle" }));
+    fresh.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: used, estimated: false, modelContextWindow: 1_000_000 } }));
+    fresh.harness.sdk.stub("threads.compact", async () => ({ ok: true }));
+    fresh.harness.sdk.stub("threads.queuedMessages.list", async () => []);
+    fresh.harness.sdk.stub("threads.interactions.list", async () => []);
+    const idle = (id: string) => fresh.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id, status: "idle" }), lastAssistantText: "" } as never);
+    await fresh.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew", "thr_cap")]);
+    await idle("thr_cap");
+    await idle("thr_crew");
+    used = 260_000;
+    await idle("thr_crew");
+    const compacted = fresh.harness.sdk.callsTo("threads.compact").map((call) => (call[0] as { threadId: string }).threadId);
+    assert.deepEqual(compacted, ["thr_cap", "thr_crew"], "the captain at 230k, the crew only past 250k");
+  } finally {
+    await fresh.harness.lifecycle.dispose();
+  }
 });
 
 test("an idle captain past its context budget is compacted once; a crew compacts on its own stamp", async () => {
@@ -9084,6 +9183,8 @@ test("an idle captain past its context budget is compacted once; a crew compacts
     fresh.harness.sdk.stub("threads.get", async ({ threadId }) => makeThreadResponse({ id: threadId, status: "idle" }));
     fresh.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 910_862, estimated: false, modelContextWindow: 1_000_000 } }));
     fresh.harness.sdk.stub("threads.compact", async () => ({ ok: true }));
+    fresh.harness.sdk.stub("threads.queuedMessages.list", async () => []);
+    fresh.harness.sdk.stub("threads.interactions.list", async () => []);
     const idle = (id: string) => fresh.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id, status: "idle" }), lastAssistantText: "" } as never);
     await idle("thr_cap");
     await idle("thr_cap");
@@ -9189,6 +9290,8 @@ for (const operation of ["context", "compact"] as const) {
     const started = new Promise<void>(resolve => { entered = resolve; });
     try {
       host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_cap", status: "idle" }));
+      host.harness.sdk.stub("threads.queuedMessages.list", async () => []);
+      host.harness.sdk.stub("threads.interactions.list", async () => []);
       host.harness.sdk.stub("threads.context", async () => {
         if (operation === "context") { entered(); await blocked; }
         return { usage: { usedTokens: 910000, estimated: false, modelContextWindow: 1000000 } };
@@ -9362,6 +9465,18 @@ test("bbPingCarriesOutcome: only durable turn-end outcomes of BB child threads",
   assert.equal(bbPingCarriesOutcome({ ...base, crewOriginKind: "fork" }), false, "forks are not parent-notified");
 });
 
+test("bbPingCarriesOutcome and doorbellSupersededByBbPing: a crew BB pings only when stuck gets the plugin doorbell for a finished turn", () => {
+  const base = { kind: "idle", durable: true, captainThreadId: "thr_cap", crewParentThreadId: "thr_cap", crewOriginKind: null };
+  assert.equal(bbPingCarriesOutcome({ ...base, crewParentNotifications: "auto" }), true);
+  assert.equal(bbPingCarriesOutcome({ ...base, crewParentNotifications: "stuck" }), false, "no BB ping for a successful turn");
+  assert.equal(bbPingCarriesOutcome({ ...base, kind: "review", crewParentNotifications: "stuck" }), false);
+  assert.equal(bbPingCarriesOutcome({ ...base, kind: "error", crewParentNotifications: "stuck" }), true, "BB still pings a failure");
+  assert.equal(bbPingCarriesOutcome({ ...base, kind: "error", crewParentNotifications: "off" }), false);
+  const ring = { kind: "idle", durable: true, captainStatus: "idle", captainTurnStartedAt: 2_000, crewFinishedAt: 1_000 };
+  assert.equal(doorbellSupersededByBbPing(ring), true);
+  assert.equal(doorbellSupersededByBbPing({ ...ring, crewParentNotifications: "stuck" }), false, "no BB ping started that turn");
+});
+
 test("captain rate limit: read from provider events; a later successful turn clears it", () => {
   const blocked = { type: "provider/rateLimits/updated", createdAt: 1_000, data: { rateLimits: { status: "blocked", windows: [{ status: "blocked", resetsAtMs: 9_000 }, { status: "warning", resetsAtMs: 99_000 }] } } };
   const err = { type: "provider/error", createdAt: 1_001, data: { detail: "You've hit your session limit · resets 8:40pm (UTC)", errorInfo: { category: "rate-limit" } } };
@@ -9525,6 +9640,8 @@ test("an already-idle captain past the budget is compacted by the sweep, without
     fresh.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thr_cap", status: "idle" }));
     fresh.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 958_171, estimated: false, modelContextWindow: 1_000_000 } }));
     fresh.harness.sdk.stub("threads.compact", async () => ({ ok: true }));
+    fresh.harness.sdk.stub("threads.queuedMessages.list", async () => []);
+    fresh.harness.sdk.stub("threads.interactions.list", async () => []);
     const run = fresh.harness.behavior.runService("captain-wake-release");
     const deadline = Date.now() + 3000;
     while (Date.now() < deadline && fresh.harness.sdk.callsTo("threads.compact").length === 0) await new Promise((r) => setTimeout(r, 10));
@@ -11012,6 +11129,26 @@ test("routine durable plugin wakes batch once; decisions bypass the delay", asyn
   } finally { await host.harness.lifecycle.dispose(); }
 });
 
+// Owner, 18 Oct (Q12): routine wakes wait 5 s by default so a burst is one captain turn.
+test("routine wakes batch for 5 seconds by default; a decision still goes at once", async () => {
+  const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: SKILLS, settings: { fmHome: "/tmp/fm-home", fmHostId: "host_1", notifyOwner: "real" } });
+  await plugin(host.bb); stubProviderCatalog(host);
+  try {
+    stubRoutedHost(host, () => ({ code: 0 }));
+    captainAndCrewThreads(host);
+    host.harness.sdk.stub("threads.list", async () => []);
+    await seedCrew(host);
+    await host.harness.behavior.setSettings({ supervisionEnabled: true });
+    const before = Date.now();
+    await emitIdle(host, "DONE: routine outcome");
+    assert.equal(sendCalls(host).filter(s => s.threadId === "thr_cap").length, 0);
+    const held = await host.bb.storage.kv.get<{ dueAt?: number }>("captain-wake-hold:thr_cap");
+    assert.ok(held?.dueAt !== undefined && held.dueAt - before >= 4_900 && held.dueAt - before <= 5_500, `held for about 5 s, got ${held?.dueAt !== undefined ? held.dueAt - before : "none"}`);
+    await emitIdle(host, "BLOCKED: credentials needed");
+    assert.equal(sendCalls(host).filter(s => s.threadId === "thr_cap").length, 1, "blocked input bypasses batching");
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
 test("persisted routine batch survives restart and failed delivery", async () => {
   const host = ownerHost({ notifyOwner: "real", captainWakeBatchMs: 30 });
   await host.bb.storage.kv.set("captain-wake-hold:thr_cap", { since: Date.now() - 1000, dueAt: Date.now() - 500, reason: "routine event batch", lines: ["DONE: retained outcome"] });
@@ -11150,21 +11287,21 @@ test("IT inbox parity: one queued doorbell, worker ack removes it across reload"
       const result = await host.harness.behavior.runCli(["tell", "c1", "--queue", `--message=${message}`], { projectId: "proj_1" });
       assert.equal(result.exitCode, 0, result.stderr);
     }
-    assert.equal(rows.length, 1, "two inbox records need only one queued doorbell");
-    assert.match(rows[0]!.content[0]!.text, /Firstmate instruction waiting/);
-    assert.doesNotMatch(rows[0]!.content[0]!.text, /replacement instruction/);
+    assert.equal(rows.length, 1, "two inbox records need only one queued wake");
+    assert.match(rows[0]!.content[0]!.text, /^Firstmate instruction for crew c1/);
+    assert.match(rows[0]!.content[0]!.text, /first instruction/, "the wake carries every pending text");
+    assert.match(rows[0]!.content[0]!.text, /replacement instruction/);
+    assert.doesNotMatch(rows[0]!.content[0]!.text, /fm-inbox-take\.sh c1/, "no inbox read is needed");
     const dir = join(home, "state/c1.inbox");
     assert.match(readFileSync(join(dir, "001.msg"), "utf8"), /first instruction/);
     assert.match(readFileSync(join(dir, "002.msg"), "utf8"), /replacement instruction/);
-    // Native worker consumes both records before BB ends its long turn.
-    mkdirSync(join(dir, "handled"), { recursive: true });
-    for (const name of ["001.msg", "002.msg"]) {
-      const result = spawnSync("mv", [join(dir, name), join(dir, "handled", name)]);
-      assert.equal(result.status, 0);
-    }
+    // BB dispatches the queued wake into the crew's next turn: its turn request carries the wake.
+    const dispatched = rows[0]!.content;
+    rows = [];
     rows.push({ id: "human", content: [{ type: "text", text: "unrelated human instruction" }] });
     host = await host.harness.lifecycle.reload(plugin);
     stubRealExecHost(host);
+    host.harness.sdk.stub("threads.events.list", async () => [{ type: "client/turn/requested", data: { input: dispatched } }]);
     host.harness.sdk.stub("threads.queuedMessages.list", async () => rows);
     host.harness.sdk.stub("threads.queuedMessages.delete", async (args: { queuedMessageId: string }) => {
       rows = rows.filter(r => r.id !== args.queuedMessageId);
@@ -11173,12 +11310,18 @@ test("IT inbox parity: one queued doorbell, worker ack removes it across reload"
     const run = host.harness.behavior.runService("captain-wake-release");
     try {
       for (let n = 0; n < 100 && rows.length > 1; n++) await new Promise(r => setTimeout(r, 10));
-      assert.deepEqual(rows.map(r => r.id), ["human"], `only the consumed inbox doorbell is removed: ${JSON.stringify(host.harness.logEntries)}`);
+      for (let n = 0; n < 100 && !existsSync(join(dir, "handled", "002.msg")); n++) await new Promise(r => setTimeout(r, 10));
+      assert.deepEqual(rows.map(r => r.id), ["human"], "unrelated input is kept");
+      for (const name of ["001.msg", "002.msg"]) {
+        assert.ok(existsSync(join(dir, "handled", name)), `${name} is filed as handled once its wake was delivered, and kept for audit`);
+        assert.ok(!existsSync(join(dir, name)));
+      }
     } finally { run.controller.abort(); await run.done; }
   } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
 });
 
-test("IT inbox parity: BB accepting a steer is not worker acknowledgement", { skip: !FM_INTEGRATION }, async () => {
+// Owner, 18 Oct (Q13): 485 crew turns began with "list $FM_TASK_INBOX"; inbox reads cost 250 M tokens a day.
+test("IT inbox in the wake: a delivered steer carries the text, and Firstmate files the record as handled for audit", { skip: !FM_INTEGRATION }, async () => {
   const home = scratchFmHome();
   const host = itHost(home, { tellOwner: "real" });
   await plugin(host.bb); stubProviderCatalog(host);
@@ -11187,11 +11330,25 @@ test("IT inbox parity: BB accepting a steer is not worker acknowledgement", { sk
     await seedCrew(host);
     const result = await host.harness.behavior.runCli(["tell", "c1", "--message=do this once"], { projectId: "proj_1" });
     assert.equal(result.exitCode, 0, result.stderr);
-    assert.ok(existsSync(join(home, "state/c1.inbox/001.msg")), "native record remains until worker ack");
-    assert.ok(!existsSync(join(home, "state/c1.inbox/handled/001.msg")));
-    assert.match(sendCalls(host)[0]!.text, /Firstmate instruction waiting/);
-    assert.doesNotMatch(sendCalls(host)[0]!.text, /do this once/);
+    const wake = sendCalls(host)[0]!.text;
+    assert.match(wake, /^Firstmate instruction for crew c1 \(001\.msg\)/);
+    assert.match(wake, /do this once/, "the text is in the wake itself");
+    assert.doesNotMatch(wake, /fm-inbox-take\.sh c1/, "no inbox read or ack command");
+    assert.ok(existsSync(join(home, "state/c1.inbox/handled/001.msg")), "the record is kept, filed as handled");
+    assert.match(readFileSync(join(home, "state/c1.inbox/handled/001.msg"), "utf8"), /do this once/);
+    assert.ok(!existsSync(join(home, "state/c1.inbox/001.msg")), "nothing is left for a re-ring");
   } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test("inboxWakeText carries each record's text; past its size cap it returns null so the inbox pointer is used", () => {
+  const one = inboxWakeText({ crewId: "c1", records: [{ id: "001.msg", body: "rebase on main" }] })!;
+  assert.match(one, /^Firstmate instruction for crew c1 \(001\.msg\)/);
+  assert.match(one, /rebase on main$/);
+  const two = inboxWakeText({ crewId: "c1", records: [{ id: "001.msg", body: "first" }, { id: "002.msg", body: "second" }] })!;
+  assert.match(two, /\(001\.msg, 002\.msg\)/);
+  assert.ok(two.indexOf("first") < two.indexOf("second"), "in record order");
+  assert.equal(inboxWakeText({ crewId: "c1", records: [] }), null);
+  assert.equal(inboxWakeText({ crewId: "c1", records: [{ id: "001.msg", body: "x".repeat(20_000) }] }), null);
 });
 
 test("IT inbox parity: failed queue delivery retries without deleting unread records", { skip: !FM_INTEGRATION }, async () => {
@@ -11211,7 +11368,8 @@ test("IT inbox parity: failed queue delivery retries without deleting unread rec
     assert.equal(readdirSync(dir).filter(n => n.endsWith(".msg")).length, 206, "unread records are not a disposable cache");
     let retried = false;
     host.harness.sdk.stub("threads.send", async (args: { input: Array<{ text: string }>; senderThreadId?: string }) => {
-      assert.match(args.input[0]!.text, /Firstmate instruction waiting/);
+      assert.match(args.input[0]!.text, /Firstmate instruction for crew c1/);
+      assert.match(args.input[0]!.text, /preserve me/);
       assert.equal(args.senderThreadId, "thr_cap");
       retried = true;
       return { delivery: "queued", queuedMessage: { id: "retry" } };
@@ -11866,3 +12024,125 @@ for (const pin of ["2d833ff147cd26a5c461e914e06854e0eb2707ce", "1f3e769616fdf9f3
     }finally{await host.harness.lifecycle.dispose();rmSync(parent,{recursive:true,force:true});rmSync(work,{recursive:true,force:true});}
   });
 }
+
+// Checker round 1 on #158 (158-verdict-1.md), reproductions first.
+test("check 158/1: an unchanged reading above the 200k trigger is compacted once, even after the cooldown", async () => {
+  const { host, idle } = await compactionHost();
+  try {
+    host.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 230000, modelContextWindow: 1000000, estimated: false } }));
+    await idle();
+    await host.bb.storage.kv.set("captain-compacted-at:thr_cap", Date.now() - 1300000);
+    await idle();
+    assert.equal(host.harness.sdk.callsTo("threads.compact").length, 1, "unchanged context must not compact again");
+    host.harness.sdk.stub("threads.context", async () => ({ usage: { usedTokens: 120000, modelContextWindow: 1000000, estimated: false } }));
+    await idle();
+    assert.equal(await host.bb.storage.kv.get("thread-compaction-evidence:thr_cap"), undefined, "a reading below the trigger clears the evidence");
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("check 158/2: no compaction while owner input waits: a queued owner message or an open question", async () => {
+  for (const [label, queued, interactions] of [
+    ["queued owner message", [{ id: "owner", initiator: "user", failureReason: null, content: [{ type: "text", text: "Answer my question" }] }], []],
+    ["open question", [], [{ id: "int_1", status: "pending" }]],
+  ] as const) {
+    const { host, idle } = await compactionHost();
+    try {
+      host.harness.sdk.stub("threads.queuedMessages.list", async () => queued);
+      host.harness.sdk.stub("threads.interactions.list", async () => interactions);
+      await idle();
+      assert.equal(host.harness.sdk.callsTo("threads.compact").length, 0, `${label}: answered first`);
+    } finally { await host.harness.lifecycle.dispose(); }
+  }
+});
+
+test("check 158/5: when queued texts outgrow the wake, one inbox pointer replaces the inline wake", { skip: !FM_INTEGRATION }, async () => {
+  const home = scratchFmHome(); const host = itHost(home, { tellOwner: "real" });
+  await plugin(host.bb); stubProviderCatalog(host);
+  try {
+    stubRealExecHost(host); await seedCrew(host);
+    let rows: Array<{ id: string; content: Array<{ type: string; text: string }> }> = [];
+    let sequence = 0;
+    host.harness.sdk.stub("threads.queuedMessages.list", async () => rows);
+    host.harness.sdk.stub("threads.send", async (args: { input: Array<{ type: string; text: string }> }) => {
+      const row = { id: `check-${++sequence}`, content: args.input }; rows.push(row); return { delivery: "queued", queuedMessage: row };
+    });
+    host.harness.sdk.stub("threads.queuedMessages.delete", async (args: { queuedMessageId: string }) => { rows = rows.filter(r => r.id !== args.queuedMessageId); return {}; });
+    for (let i = 0; i < 4; i++) {
+      const result = await host.harness.behavior.runCli(["tell", "c1", "--queue", `--message=${String(i).repeat(4000)}`], { projectId: "proj_1" });
+      assert.equal(result.exitCode, 0, result.stderr);
+    }
+    assert.equal(rows.length, 1);
+    assert.match(rows[0]!.content[0]!.text, /^: Firstmate instruction waiting/, "four records exceed the cap: a pointer that reads every pending record");
+    assert.doesNotMatch(rows[0]!.content[0]!.text, /^Firstmate instruction for crew/);
+  } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test("check 158/6: a queued wake removed without reaching the crew leaves its record unread", { skip: !FM_INTEGRATION }, async () => {
+  const home = scratchFmHome(); let host = itHost(home, { tellOwner: "real" });
+  await plugin(host.bb); stubProviderCatalog(host);
+  try {
+    stubRealExecHost(host); await seedCrew(host);
+    let wake = "";
+    host.harness.sdk.stub("threads.queuedMessages.list", async () => []);
+    host.harness.sdk.stub("threads.send", async (args: { input: Array<{ text: string }> }) => { wake = args.input[0]!.text; return { delivery: "queued", queuedMessage: { id: "cancelled" } }; });
+    const result = await host.harness.behavior.runCli(["tell", "c1", "--queue", "--message=never delivered"], { projectId: "proj_1" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    host = await host.harness.lifecycle.reload(plugin); stubRealExecHost(host);
+    host.harness.sdk.stub("threads.queuedMessages.list", async () => []);
+    let events: unknown[] = [];
+    host.harness.sdk.stub("threads.events.list", async () => events);
+    const reconcile = async () => {
+      const run = host.harness.behavior.runService("captain-wake-release");
+      try { await new Promise(r => setTimeout(r, 300)); } finally { run.controller.abort(); await run.done; }
+    };
+    await reconcile();
+    assert.ok(existsSync(join(home, "state/c1.inbox/001.msg")), "no turn took the wake: the record stays unread");
+    events = [{ type: "client/turn/requested", data: { input: [{ type: "text", text: wake }] } }];
+    await reconcile();
+    assert.ok(existsSync(join(home, "state/c1.inbox/handled/001.msg")), "a crew turn took the wake: the record is filed");
+  } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
+});
+
+// Checker round 2 on #158 (158-verdict-2.md).
+test("check 158/7: a newer snapshot of unchanged context, or more growth, does not rearm compaction", async () => {
+  const { host, idle } = await compactionHost();
+  try {
+    let usage = { usedTokens: 230000, modelContextWindow: 1000000, estimated: false, snapshot: { providerSessionId: "same-session", capturedAt: "2026-10-18T15:00:00Z" } };
+    host.harness.sdk.stub("threads.context", async () => ({ usage }));
+    await idle();
+    for (const next of [{ capturedAt: "2026-10-18T15:21:00Z", usedTokens: 230000 }, { capturedAt: "2026-10-18T15:42:00Z", usedTokens: 260000 }]) {
+      await host.bb.storage.kv.set("captain-compacted-at:thr_cap", Date.now() - 1300000);
+      usage = { ...usage, usedTokens: next.usedTokens, snapshot: { ...usage.snapshot, capturedAt: next.capturedAt } };
+      await idle();
+    }
+    assert.equal(host.harness.sdk.callsTo("threads.compact").length, 1, "only shrinkage below the trigger rearms it");
+    usage = { ...usage, usedTokens: 90000 };
+    await idle();
+    await host.bb.storage.kv.set("captain-compacted-at:thr_cap", Date.now() - 1300000);
+    usage = { ...usage, usedTokens: 240000 };
+    await idle();
+    assert.equal(host.harness.sdk.callsTo("threads.compact").length, 2, "shrank, then grew past the trigger again");
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("check 158/9: a delivered queued wake inside BB's sender envelope is filed after reload", { skip: !FM_INTEGRATION }, async () => {
+  const home = scratchFmHome(); let host = itHost(home, { tellOwner: "real" });
+  await plugin(host.bb); stubProviderCatalog(host);
+  try {
+    stubRealExecHost(host); await seedCrew(host);
+    let wake = "";
+    host.harness.sdk.stub("threads.queuedMessages.list", async () => []);
+    host.harness.sdk.stub("threads.send", async (args: { input: Array<{ text: string }> }) => { wake = args.input[0]!.text; return { delivery: "queued", queuedMessage: { id: "delivered" } }; });
+    const result = await host.harness.behavior.runCli(["tell", "c1", "--queue", "--message=act once"], { projectId: "proj_1" });
+    assert.equal(result.exitCode, 0, result.stderr);
+    host = await host.harness.lifecycle.reload(plugin); stubRealExecHost(host);
+    host.harness.sdk.stub("threads.queuedMessages.list", async () => []);
+    host.harness.sdk.stub("threads.events.list", async () => [{ type: "client/turn/requested", data: { senderThreadId: "thr_cap", input: [{ type: "text", text: `[bb message from thread:thr_cap]\n\n${wake}` }], target: { kind: "new-turn" } } }]);
+    const run = host.harness.behavior.runService("captain-wake-release");
+    try {
+      for (let n = 0; n < 200 && !existsSync(join(home, "state/c1.inbox/handled/001.msg")); n++) await new Promise(r => setTimeout(r, 10));
+      assert.ok(existsSync(join(home, "state/c1.inbox/handled/001.msg")), "BB's request carries the sender envelope and still proves delivery");
+      assert.ok(!existsSync(join(home, "state/c1.inbox/001.msg")));
+    } finally { run.controller.abort(); await run.done; }
+  } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
+});
