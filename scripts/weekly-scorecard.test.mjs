@@ -49,6 +49,9 @@ function setup() {
   mkdirSync(join(dir, 'bin'));
   writeFileSync(join(dir, 'bin', 'bb'), FAKE_BB);
   chmodSync(join(dir, 'bin', 'bb'), 0o755);
+  // GitHub is rate limited for every test: the scorecard must not depend on it.
+  writeFileSync(join(dir, 'bin', 'gh'), `#!/bin/sh\necho '{"cmd":"gh"}' >> "$FAKE_LOG"\necho 'GraphQL: API rate limit already exceeded for user ID 1.' >&2\nexit 1\n`);
+  chmodSync(join(dir, 'bin', 'gh'), 0o755);
   const world = {
     card: { captain: 'thr_cap', home: '/homes/cap', corrections: [{ id: 'C4', ref: 'tg:1:1', at: '2026-10-13T08:00:00.000Z', fixed: true }], redone: [], checks: [], unproven: [] },
     outbox: OUTBOX, crashAfterTell: false,
@@ -152,4 +155,10 @@ test('a row created exactly at the start of the week is counted, also when it is
   assert.match(t.run('--now', MONDAY), /Noise: 1 Telegram message sent\./);
   t.world.outbox = [{ created_at: at('2026-10-10T00:00:00.000Z'), state: 'sent' }, { created_at: at('2026-10-11T18:00:00.000Z'), state: 'sent' }, { created_at: at('2026-10-12T09:00:00.000Z'), state: 'failed' }];
   assert.match(t.run('--now', MONDAY), /Noise: 1 Telegram message sent\. 1 not delivered\./);
+});
+
+test('a GitHub rate limit cannot fail the scorecard: the run makes no GitHub call', () => {
+  const t = setup();
+  assert.match(t.run('--send', '--now', SUNDAY), /sent the week ending 2026-10-18 to thr_cap/);
+  assert.equal(t.log().filter((e) => e.cmd === 'gh').length, 0);
 });
