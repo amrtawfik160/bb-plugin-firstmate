@@ -344,3 +344,24 @@ test('a cached open list, not fetched this cycle, does not settle a closed PR th
   assert.deepEqual(d.removed(),[],'the reopened PR keeps its native record');
  }finally{await d.host.harness.lifecycle.dispose();}
 });
+
+// Checker verdict 2 on #147: a list sweep that fails before replacing the snapshot must
+// not leave the previous cycle's validation standing.
+test('a list sweep that fails early leaves no validation behind: the reopened PR keeps its record',async(t)=>{
+ t.mock.timers.enable({apis:['Date'],now:Date.now()});
+ const d=await sweepDeck();try {
+  openRows=[openRow(1)];
+  await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  t.mock.timers.tick(9*60_000);
+  await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  d.deliver('c9','thr_c9',5598,'explicitly-abandoned','closed');
+  metas='c9\tthr_c9\n';openRows=[openRow(1),openRow(5598)];states.set(5598,'OPEN');
+  const realGet=d.host.bb.storage.kv.get.bind(d.host.bb.storage.kv);
+  let failed=false;
+  d.host.bb.storage.kv.get=async(key)=>{if(key==='crews'&&!failed&&new Error().stack?.includes('prCandidates')){failed=true;throw new Error('transient crew-store read failure');}return realGet(key);};
+  t.mock.timers.tick(60_000);
+  await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.ok(failed);
+  assert.deepEqual(d.removed(),[], 'previous-cycle validation must not retire a reopened PR after this cycle fails');
+ }finally{await d.host.harness.lifecycle.dispose();}
+});
