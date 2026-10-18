@@ -51,7 +51,7 @@ test("joint: an answer.md that fails twice reopens the owner message each time a
         case "replied": return { replied: tg.engine.repliedMessages(String(args.input.chatId), args.input.messageIds as string[]) };
         case "undelivered": return { undelivered: tg.engine.undeliveredReplies() };
         case "ackUndelivered": return tg.engine.ackUndelivered(args.input as never);
-        case "freeText": return { obligations: tg.engine.freeTextObligations() };
+        case "freeText": { const bound = store.activeBinding()?.captain_thread_id; return { obligations: tg.engine.freeTextObligations(), ...(bound ? { captainThreadId: bound } : {}) }; }
         case "ackFreeText": return tg.engine.ackFreeText(args.input as never);
         default: return engine[args.method] ? engine[args.method]!(args.input) : { ok: true };
       }

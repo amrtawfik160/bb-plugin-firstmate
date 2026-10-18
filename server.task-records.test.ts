@@ -15,9 +15,10 @@ const envelope = readFileSync(new URL("./test/fixtures/envelopes/live-owner.txt"
 const PROJECTS: Record<string, string> = { proj_cyndra: "Cyndra SaaS", proj_woo: "woo-app" };
 
 /** A captain thread in the Cyndra SaaS project, as on 17 Oct, and a Telegram connector that records every call. */
-async function captainHost() {
+async function captainHost(otherCaptains: string[] = []) {
   const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: manifestSkillIds(new URL(".", import.meta.url).pathname) });
   await host.bb.storage.kv.set("captain-project:thr_cap", "proj_cyndra");
+  for (const other of otherCaptains) await host.bb.storage.kv.set(`captain-project:${other}`, "proj_woo");
   await plugin(host.bb); stubProviderCatalog(host);
   await host.harness.behavior.setSettings({ fmReliability: JSON.stringify({ inboundLedger: "on", telegramThreading: "on", asyncDispatch: "on" }) });
   host.harness.sdk.stub("threads.getPluginMetadata", async ({ threadId }: { threadId: string }) => (threadId === "thr_cap" ? { captain: "true" } : {}));
@@ -207,7 +208,7 @@ test("free-text safety: the captain is told of each free text the connector hold
     let obligations = [{ ref: "agent:i9", text: "Safi is down: Convex disabled the account.", at: 1 }];
     host.harness.sdk.stub("plugins.callRpc", async (args: Rpc) => {
       calls.push(args);
-      if (args.method === "freeText") { const rows = obligations; obligations = []; return { obligations: rows }; }
+      if (args.method === "freeText") { const rows = obligations; obligations = []; return { obligations: rows, captainThreadId: "thr_cap" }; }
       if (args.method === "undelivered") return { undelivered: [] };
       if (args.method === "replied") return { replied: [] };
       if (args.method === "resolveFreeText") return { resolved: (args.input.refs as string[]).length };
@@ -235,7 +236,7 @@ test("check round 2: a free text is confirmed to the connector only after the ca
     let acked: string[] = [];
     host.harness.sdk.stub("plugins.callRpc", async (args: Rpc) => {
       calls.push(args);
-      if (args.method === "freeText") return { obligations: due.filter((row) => !acked.includes(row.ref)) };
+      if (args.method === "freeText") return { obligations: due.filter((row) => !acked.includes(row.ref)), captainThreadId: "thr_cap" };
       if (args.method === "ackFreeText") { acked = [...acked, ...(args.input.refs as string[])]; return { told: (args.input.refs as string[]).length }; }
       if (args.method === "undelivered") return { undelivered: [] };
       if (args.method === "replied") return { replied: [] };
@@ -394,5 +395,150 @@ test("check round 3: a failure the captain was never told of does not reopen a m
     assert.equal(ledger("6501")?.state, "answered", "applied once");
   } finally {
     await host.harness.lifecycle.dispose();
+  }
+});
+
+// Live 18 Oct: the free-text check ran for every known captain. An archived one logged
+// "HTTP 409: Thread is archived" about 20 times an hour, and a second live captain would have been
+// told, and confirmed to the connector, the free texts of the captain Telegram is bound to.
+class ArchivedThreadError extends Error {
+  override name = "BbHttpError";
+  readonly status = 409;
+  readonly code = "thread_not_writable";
+  readonly body = { code: "thread_not_writable", message: "Thread is archived", details: { reason: "archived" } };
+  constructor() { super("HTTP 409: Thread is archived"); }
+}
+
+/** A Telegram connector holding one free text, recording each ack; `bound` is the binding's captain when the connector names it. */
+function freeTextConnector(host: Host, calls: Rpc[], bound?: string) {
+  const due = [{ ref: "agent:i9", text: "Safi is down: Convex disabled the account.", at: 1 }];
+  const acked: string[] = [];
+  host.harness.sdk.stub("plugins.callRpc", async (args: Rpc) => {
+    calls.push(args);
+    if (args.method === "freeText") return { obligations: due.filter((row) => !acked.includes(row.ref)), ...(bound ? { captainThreadId: bound } : {}) };
+    if (args.method === "ackFreeText") { acked.push(...(args.input.refs as string[])); return { told: (args.input.refs as string[]).length }; }
+    if (args.method === "undelivered") return { undelivered: [] };
+    if (args.method === "replied") return { replied: [] };
+    return { ok: true, queued: 1, duplicate: false, mode: "on" };
+  });
+  return acked;
+}
+
+const idleOn = (host: Host, threadId: string) => host.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: threadId, status: "idle" }), lastAssistantText: "ok" });
+
+test("free-text binding: a connector that does not name its bound captain tells no captain and confirms nothing, with one warning", async () => {
+  const { host, calls } = await captainHost(["thr_cap2"]);
+  try {
+    // An older connector: freeText has no captainThreadId. An owner message reaching thr_cap proves nothing about the current binding.
+    const acked = freeTextConnector(host, calls);
+    await ownerSays(host, "6600", "hi");
+    const sends: Array<{ threadId: string; text: string }> = [];
+    host.harness.sdk.stub("threads.send", async (args: { threadId: string; input: Array<{ text: string }> }) => { sends.push({ threadId: args.threadId, text: args.input[0]?.text ?? "" }); return {}; });
+    await idleOn(host, "thr_cap2");
+    await idleOn(host, "thr_cap");
+    await idleOn(host, "thr_cap");
+    assert.deepEqual(sends.filter((s) => s.text.includes("agent:i9")), [], "no captain is told");
+    assert.deepEqual(acked, [], "nothing is confirmed");
+    const warns = host.harness.logEntries.filter((e) => JSON.stringify(e).includes("bound captain"));
+    assert.equal(warns.length, 1, JSON.stringify(warns));
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("free-text binding: a connector that names its bound captain decides who is told", async () => {
+  const { host, calls } = await captainHost(["thr_cap2"]);
+  try {
+    // An owner message reached thr_cap earlier, but the binding moved to thr_cap2.
+    const acked = freeTextConnector(host, calls, "thr_cap2");
+    await ownerSays(host, "6610", "hi");
+    const sends: Array<{ threadId: string; text: string }> = [];
+    host.harness.sdk.stub("threads.send", async (args: { threadId: string; input: Array<{ text: string }> }) => { sends.push({ threadId: args.threadId, text: args.input[0]?.text ?? "" }); return {}; });
+    await idleOn(host, "thr_cap");
+    assert.deepEqual(acked, []);
+    await idleOn(host, "thr_cap2");
+    assert.deepEqual(sends.filter((s) => s.text.includes("agent:i9")).map((s) => s.threadId), ["thr_cap2"]);
+    assert.deepEqual(acked, ["agent:i9"]);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("free-text binding: an archived known captain gets no send and no warning, and later drains skip it", async () => {
+  const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: manifestSkillIds(new URL(".", import.meta.url).pathname) });
+  await host.bb.storage.kv.set("captain-project:thr_old", "proj_cyndra");
+  await plugin(host.bb); stubProviderCatalog(host);
+  try {
+    await host.harness.behavior.setSettings({ fmReliability: JSON.stringify({ inboundLedger: "on", telegramThreading: "on", asyncDispatch: "on" }) });
+    host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
+    host.harness.sdk.stub("threads.list", async () => []);
+    host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, projectId: "proj_cyndra", status: "idle", archivedAt: "2026-10-14T02:54:29.000Z" } as never));
+    const calls: Rpc[] = [];
+    const acked = freeTextConnector(host, calls);
+    const sends: string[] = [];
+    host.harness.sdk.stub("threads.send", async (args: { threadId: string }) => { sends.push(args.threadId); throw new ArchivedThreadError(); });
+    const run = host.harness.behavior.runService("captain-wake-release");
+    try {
+      for (let n = 0; n < 100 && !host.harness.sdk.callsTo("threads.get").some((c) => (c[0] as { threadId: string }).threadId === "thr_old"); n++) await new Promise((r) => setTimeout(r, 10));
+      await new Promise((r) => setTimeout(r, 50));
+    } finally { run.controller.abort(); await run.done; }
+    assert.deepEqual(sends, [], "no send to the archived captain");
+    assert.deepEqual(acked, []);
+    assert.equal(calls.filter((c) => c.method === "freeText").length, 0, "no free-text call for it");
+    const warns = host.harness.logEntries.filter((e) => /thr_old|free-text|Thread is archived/.test(JSON.stringify(e)) && /warn/.test(JSON.stringify(e)));
+    assert.deepEqual(warns, []);
+    const rpcBefore = calls.length;
+    await idleOn(host, "thr_old");
+    assert.deepEqual({ sends, rpc: calls.length }, { sends: [], rpc: rpcBefore }, "a later idle does not drain it");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("free-text binding: a 409 'Thread is archived' drops the captain, so its next idle costs no calls", async () => {
+  const { host, calls } = await captainHost();
+  try {
+    const acked = freeTextConnector(host, calls, "thr_cap");
+    await ownerSays(host, "6620", "hi");
+    let sends = 0;
+    host.harness.sdk.stub("threads.send", async () => { sends += 1; throw new ArchivedThreadError(); });
+    await idleOn(host, "thr_cap");
+    assert.deepEqual(acked, [], "a failed tell is not confirmed");
+    const before = { sends, rpc: calls.length };
+    await idleOn(host, "thr_cap");
+    assert.deepEqual({ sends, rpc: calls.length }, before, "an archived captain is not drained again");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("free-text binding: a deleted captain (HTTP 404) leaves the sweep before any Telegram call; a 502 keeps it", async () => {
+  for (const [label, error, kept] of [
+    ["404", Object.assign(new Error("HTTP 404: Thread not found"), { status: 404, code: "not_found" }), false],
+    ["502", Object.assign(new Error("HTTP 502: Bad Gateway"), { status: 502 }), true],
+  ] as const) {
+    const host = createFakePluginHost({ pluginId: "firstmate", agentSkillIds: manifestSkillIds(new URL(".", import.meta.url).pathname) });
+    await host.bb.storage.kv.set("captain-project:thr_old", "proj_cyndra");
+    await plugin(host.bb); stubProviderCatalog(host);
+    try {
+      await host.harness.behavior.setSettings({ fmReliability: JSON.stringify({ inboundLedger: "on", telegramThreading: "on", asyncDispatch: "on" }) });
+      host.harness.sdk.stub("threads.getPluginMetadata", async () => ({ captain: "true" }));
+      host.harness.sdk.stub("threads.list", async () => []);
+      host.harness.sdk.stub("threads.get", async () => { throw error; });
+      host.harness.sdk.stub("threads.send", async () => ({}));
+      const calls: Rpc[] = [];
+      freeTextConnector(host, calls, "thr_old");
+      const run = host.harness.behavior.runService("captain-wake-release");
+      try {
+        for (let n = 0; n < 100 && host.harness.sdk.callsTo("threads.get").length === 0; n++) await new Promise((r) => setTimeout(r, 10));
+        await new Promise((r) => setTimeout(r, 50));
+      } finally { run.controller.abort(); await run.done; }
+      const sweepFreeText = calls.filter((c) => c.method === "freeText").length;
+      assert.equal(sweepFreeText, kept ? 1 : 0, `${label}: sweep free-text calls`);
+      await idleOn(host, "thr_old");
+      assert.equal(calls.filter((c) => c.method === "freeText").length - sweepFreeText, kept ? 1 : 0, `${label}: a later idle drains it only if kept`);
+    } finally {
+      await host.harness.lifecycle.dispose();
+    }
   }
 });

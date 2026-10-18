@@ -5690,19 +5690,35 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  /** The connector's free-text obligations: the captain is told of each once, by its ref, and the connector is told after. */
+  // Warned once per load: a connector that does not name its bound captain.
+  let freeTextUnboundWarned = false;
+
+  /**
+   * The connector's free-text obligations: the captain is told of each once, by its ref, and the connector is told after.
+   * They belong to the binding, so only the captain the connector names is told. Without that name no captain is told:
+   * the obligations stay pending, and the connector's 15-minute notice tells the owner they wait.
+   */
   async function tellFreeText(captainThreadId: string): Promise<void> {
     let rows: Array<{ ref: string; text: string; at: number }>;
+    let bound: string | undefined;
     try {
-      rows = (await bb.sdk.plugins.callRpc({
+      const out = await bb.sdk.plugins.callRpc({
         pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "freeText", input: {},
-        outputSchema: z.object({ obligations: z.array(z.object({ ref: z.string(), text: z.string(), at: z.number() })) }),
-      })).obligations;
+        outputSchema: z.object({ obligations: z.array(z.object({ ref: z.string(), text: z.string(), at: z.number() })), captainThreadId: z.string().optional() }),
+      });
+      rows = out.obligations;
+      bound = out.captainThreadId;
     } catch (error) {
       if (isTelegramRpcMissing(error)) return;
       throw error;
     }
     if (rows.length === 0) return;
+    if (bound === undefined || bound === "") {
+      if (!freeTextUnboundWarned) bb.log.warn("telegram free-text check: the connector does not name its bound captain; no captain is told until it does");
+      freeTextUnboundWarned = true;
+      return;
+    }
+    if (bound !== captainThreadId) return;
     const lines = rows.map((row) => `- ${row.ref}: "${row.text.replace(/\s+/g, " ").slice(0, 160)}"`);
     await bb.sdk.threads.send({
       threadId: captainThreadId, mode: "steer",
@@ -5736,8 +5752,18 @@ export default async function plugin(bb: BbPluginApi) {
         } catch (error) {
           bb.log.warn(`telegram replied check: ${String(error)}`);
         }
-        await reopenUndelivered(captainThreadId).catch((error) => bb.log.warn(`telegram undelivered check: ${String(error)}`));
-        await tellFreeText(captainThreadId).catch((error) => bb.log.warn(`telegram free-text check: ${String(error)}`));
+        // An archived captain refuses every send: it leaves the known captains until it is decked again.
+        const archived = (what: string) => (error: unknown) => {
+          if (isArchivedThreadError(error)) return true;
+          bb.log.warn(`telegram ${what} check: ${String(error)}`);
+          return false;
+        };
+        if (await reopenUndelivered(captainThreadId).then(() => false, archived("undelivered"))
+          || await tellFreeText(captainThreadId).then(() => false, archived("free-text"))) {
+          knownCaptainsRef.delete(captainThreadId);
+          bb.log.info(`captain ${captainThreadId} is archived: left the reliability drain`);
+          return;
+        }
       }
       for (const action of inboundLedger.openForSweep(Date.now(), captainThreadId)) {
         await bb.sdk.threads.send({
@@ -15065,15 +15091,18 @@ export default async function plugin(bb: BbPluginApi) {
   // The thread.idle trigger alone never reaches a captain that is already idle past the
   // budget (it crossed it before this build, or its last turn ended while compaction was
   // cooling down); the release service sweeps those.
-  async function compactIdleCaptain(threadId: string, signal?: AbortSignal): Promise<void> {
+  /** False when the captain is archived or deleted (marked so, or BB answers 404). Any other failed read keeps it. */
+  async function compactIdleCaptain(threadId: string, signal?: AbortSignal): Promise<boolean> {
     try {
       const thread = asRecord(await raceAbort(bb.sdk.threads.get({ threadId }), signal, STUCK_HOST_CALL_MS));
-      if (thread["status"] !== "idle" || thread["archivedAt"] != null) return;
+      if (thread["archivedAt"] != null || thread["deletedAt"] != null) return false;
+      if (thread["status"] !== "idle") return true;
     } catch (error) {
       if (isAbortError(error)) throw error;
-      return;
+      return !(asRecord(error)["status"] === 404 || /\bHTTP 404\b.*Thread not found/i.test(String(error)));
     }
     await maybeCompactCaptain(threadId, signal);
+    return true;
   }
 
   bb.events.on("thread.idle", async ({ thread, lastAssistantText }) => {
@@ -16691,7 +16720,8 @@ export default async function plugin(bb: BbPluginApi) {
             nextCompactSweep = Date.now() + CAPTAIN_COMPACT_SWEEP_MS;
             for (const captain of [...knownCaptainsRef]) {
               if (signal.aborted) break;
-              await compactIdleCaptain(captain, signal);
+              // An archived captain costs no calls until it is decked again.
+              if (!(await compactIdleCaptain(captain, signal))) { knownCaptainsRef.delete(captain); continue; }
               await drainCaptainReliability(captain, signal).catch((error) => {
                 if (!signal.aborted) bb.log.warn(`captain reliability sweep ${captain}: ${String(error)}`);
               });
