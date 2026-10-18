@@ -248,3 +248,27 @@ test('concurrent PR reads reserve their GraphQL point at the request itself, so 
   assert.equal(gh.reads,2,`${gh.reads} PR reads with 1,002 points left and a 1,000-point reserve`);
  }finally{await host.harness.lifecycle.dispose();}
 });
+
+test('a late response header cannot raise the GraphQL meter: GitHub stays at or above the reserve when early reads answer last',async()=>{
+ const prs=Array.from({length:20},(_,i)=>9700+i);
+ const {host,store,gh}=await deck(prs);try {
+  await host.bb.storage.kv.set('crews',[]);
+  for(const n of prs) store.save({...store.get(id(n)),nextCheckAt:0});
+  // GitHub counts a read when it serves it and reports that count; the first read of
+  // each batch answers last, so its higher count arrives after lower ones.
+  let github=1005,served=0;const reset=Math.floor(Date.now()/1000)+600;
+  const byId=new Map();let t=0;
+  host.harness.sdk.stub('terminals.create',async args=>{const tid=`late${++t}`;byId.set(tid,args.start.command);gh.commands.push(args.start.command);return{id:tid};});
+  host.harness.sdk.stub('terminals.output',async({terminalId})=>{
+   const command=byId.get(terminalId);let stdout='',stderr='',code=0;
+   if(command.includes('rateLimit')){stdout='{}';stderr=`< X-Ratelimit-Remaining: ${github}\n< X-Ratelimit-Reset: ${reset}\n< X-Ratelimit-Resource: graphql\n`;}
+   else if(command.includes('gh pr view')){gh.reads++;github--;const seen=github,order=served++;await new Promise(r=>setTimeout(r,order%4===0?600:50));
+    stdout=forge(command).payload;stderr=`< X-Ratelimit-Remaining: ${seen}\n< X-Ratelimit-Reset: ${reset}\n< X-Ratelimit-Resource: graphql\n`;}
+   const captured=command.includes('FM_HOST_CAPTURE_V1');
+   const payload=captured?JSON.stringify({protocol:'FM_HOST_CAPTURE_V1',exitCode:code,stdout,stderr}):stdout;
+   return{nextSeq:1,chunks:[{dataBase64:Buffer.from(`${payload}\n__FM_HOST_RC:${captured?0:code}\n`).toString('base64')}]};
+  });
+  await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.ok(github>=1000,`GitHub ended at ${github} points after ${gh.reads} reads; the reserve is 1,000`);
+ }finally{await host.harness.lifecycle.dispose();}
+});
