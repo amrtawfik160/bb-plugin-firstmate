@@ -25,7 +25,7 @@ function world() {
   tasks.open({ captain: "c", project: "Safi", title: "Accounts header", sourceRefs: ["tg:1:1"], crewId: "s1", at: 0 });
   tasks.open({ captain: "c", project: "Safi", title: "Voice add", sourceRefs: ["tg:1:2"], crewId: "s2", at: 0 });
   tasks.open({ captain: "c", project: "Cyndra", title: "Maintenance banner", sourceRefs: ["tg:1:3"], crewId: "c1", at: 0 });
-  records.set("s1", [merged("amrtawfik160/safi#560", "s1", "aa40ebbe")]);
+  records.set("s1", [merged("amrtawfik160/safi#560", "s1", "aa40ebbe7d899f96c7f08175c0434cb2b54396dc")]);
   records.set("s2", [merged("amrtawfik160/safi#576", "s2", "later01")]);
   records.set("c1", [merged("cyndra-ai/cyndra-saas#2535", "c1", "c0ffee")]);
   const recordsFor = (task: OwnerTask) => records.get(task.crewIds[0]!) ?? [];
@@ -39,7 +39,7 @@ function world() {
       fetch: async (url, init) => {
         fetchCalls.push(url);
         const ch = JSON.parse(init.body!).variables.ch as string;
-        return { ok: true, status: 200, json: async () => ({ data: { app: { byId: { updateChannelByName: { updateBranches: [{ updates: [{ group: `${ch}-group`, gitCommitHash: "aa40ebbe", createdAt: "2026-10-18T10:41:57Z" }] }] } } } } }) };
+        return { ok: true, status: 200, json: async () => ({ data: { app: { byId: { updateChannelByName: { updateBranches: [{ updates: [{ group: `${ch}-group`, gitCommitHash: "aa40ebbe7d899f96c7f08175c0434cb2b54396dc", createdAt: "2026-10-18T10:41:57Z" }] }] } } } } }) };
       },
       env: () => ({ EXPO_TOKEN: "t" }),
       loadedCommit: async () => "not used",

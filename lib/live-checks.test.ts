@@ -131,11 +131,11 @@ test("the EAS reader reads the newest update of each channel with the token from
   const file = join(dir, "expo.env");
   writeFileSync(file, "EXPO_TOKEN=secret-value\n");
   const check: LiveCheck = { kind: "eas-update", appId: "app-1", channels: ["production", "preview"], envFile: file };
-  const { fetch, calls } = fakeFetch([{ body: easUpdate("a7021b2c-48f6", "aa40ebbe", "2026-10-18T10:41:57Z") }, { body: easUpdate("0a29da02-b73a", "aa40ebbe", "2026-10-18T10:39:09Z") }]);
+  const { fetch, calls } = fakeFetch([{ body: easUpdate("a7021b2c-48f6", "aa40ebbe7d899f96c7f08175c0434cb2b54396dc", "2026-10-18T10:41:57Z") }, { body: easUpdate("0a29da02-b73a", "aa40ebbe7d899f96c7f08175c0434cb2b54396dc", "2026-10-18T10:39:09Z") }]);
   const read = await readProduction(check, { fetch, env: readEnvFile, loadedCommit: async () => "none" });
   assert.deepEqual(read, { ok: true, runs: [
-    { label: "production OTA a7021b2c", sha: "aa40ebbe", at: Date.parse("2026-10-18T10:41:57Z") },
-    { label: "preview OTA 0a29da02", sha: "aa40ebbe", at: Date.parse("2026-10-18T10:39:09Z") },
+    { label: "production OTA a7021b2c", sha: "aa40ebbe7d899f96c7f08175c0434cb2b54396dc", at: Date.parse("2026-10-18T10:41:57Z") },
+    { label: "preview OTA 0a29da02", sha: "aa40ebbe7d899f96c7f08175c0434cb2b54396dc", at: Date.parse("2026-10-18T10:39:09Z") },
   ] });
   assert.equal(calls[0]!.headers.authorization, "Bearer secret-value");
   assert.match(calls[1]!.body!, /"ch":"preview"/);
@@ -144,7 +144,7 @@ test("the EAS reader reads the newest update of each channel with the token from
   assert.deepEqual(answer, { ok: false, missing: `the Expo token in ${file} has no access to app app-1` });
   assert.doesNotMatch(JSON.stringify(answer), /secret-value/, "the token never reaches a result");
   const noHash = fakeFetch([{ body: easUpdate("g", null, "2026-10-18T10:41:57Z") }]);
-  assert.deepEqual(await readProduction(check, { fetch: noHash.fetch, env: readEnvFile, loadedCommit: async () => "none" }), { ok: false, missing: "the newest production OTA update names no commit" });
+  assert.deepEqual(await readProduction(check, { fetch: noHash.fetch, env: readEnvFile, loadedCommit: async () => "none" }), { ok: false, missing: "the newest production OTA update names no full commit" });
 });
 
 test("the Coolify reader needs its token, URL and app in the env file, then reads the newest finished deploy", async () => {
@@ -156,8 +156,8 @@ test("the Coolify reader needs its token, URL and app in the env file, then read
   assert.deepEqual(await readProduction(check, { fetch: none.fetch, env: readEnvFile, loadedCommit: async () => "none" }), { ok: false, missing: `no COOLIFY_API_TOKEN in ${file}` });
   assert.equal(none.calls.length, 0, "no request without a token");
   writeFileSync(file, "COOLIFY_BASE_URL=https://coolify.example/\nCOOLIFY_APPLICATION_UUID=app9\nCOOLIFY_API_TOKEN=tok\n");
-  const { fetch, calls } = fakeFetch([{ body: { count: 2, deployments: [{ status: "in_progress", commit: "ffff111" }, { status: "finished", commit: "27bc41d0", deployment_uuid: "d1", finished_at: "2026-10-18T06:45:00Z" }] } }]);
-  assert.deepEqual(await readProduction(check, { fetch, env: readEnvFile, loadedCommit: async () => "none" }), { ok: true, runs: [{ label: "Coolify deploy d1", sha: "27bc41d0", at: Date.parse("2026-10-18T06:45:00Z") }] });
+  const { fetch, calls } = fakeFetch([{ body: { count: 2, deployments: [{ status: "in_progress", commit: "ffff111" }, { status: "finished", commit: "27bc41d000000000000000000000000000000000", deployment_uuid: "d1", finished_at: "2026-10-18T06:45:00Z" }] } }]);
+  assert.deepEqual(await readProduction(check, { fetch, env: readEnvFile, loadedCommit: async () => "none" }), { ok: true, runs: [{ label: "Coolify deploy d1", sha: "27bc41d000000000000000000000000000000000", at: Date.parse("2026-10-18T06:45:00Z") }] });
   assert.equal(calls[0]!.url, "https://coolify.example/api/v1/deployments/applications/app9?skip=0&take=10");
   const head = fakeFetch([{ body: [{ status: "finished", commit: "HEAD" }] }]);
   assert.deepEqual(await readProduction(check, { fetch: head.fetch, env: readEnvFile, loadedCommit: async () => "none" }), { ok: false, missing: "Coolify lists no finished deploy with a commit" });
@@ -167,20 +167,52 @@ test("the plugin reader reports the loaded commit, or why it is not known", asyn
   const check: LiveCheck = { kind: "plugin-reload", plugin: "telegram" };
   const base = { fetch: fakeFetch([]).fetch, env: () => null };
   assert.deepEqual(await readProduction(check, { ...base, loadedCommit: async () => "the Telegram plugin does not report the commit it loaded" }), { ok: false, missing: "the Telegram plugin does not report the commit it loaded" });
-  assert.deepEqual(await readProduction(check, { ...base, loadedCommit: async () => ({ label: "Telegram loaded", sha: "fa0e1d95" }) }), { ok: true, runs: [{ label: "Telegram loaded", sha: "fa0e1d95" }] });
+  assert.deepEqual(await readProduction(check, { ...base, loadedCommit: async () => ({ label: "Telegram loaded", sha: "fa0e1d95a8900455138b0674d6b78dab6b18d847" }) }), { ok: true, runs: [{ label: "Telegram loaded", sha: "fa0e1d95a8900455138b0674d6b78dab6b18d847" }] });
 });
 
 // Checker 162-verdict-2: EAS builds carry gitCommitHash, so a read-back's build commit is read there when the crew gives none.
 test("the EAS build lookup finds a build's commit by id or iOS build number, and says why when it cannot", async () => {
   const builds = { data: { app: { byId: { builds: [
-    { id: "2018d35a-b880", platform: "IOS", gitCommitHash: "61c8c825", appBuildVersion: "21" },
+    { id: "2018d35a-b880", platform: "IOS", gitCommitHash: "61c8c8256a218a6e4976f98b715aa05a4875960f", appBuildVersion: "21" },
     { id: "cd685739-9621", platform: "IOS", gitCommitHash: null, appBuildVersion: "20" },
   ] } } } };
   const deps = (body: unknown) => ({ fetch: fakeFetch([{ body }]).fetch, env: () => ({ EXPO_TOKEN: "t" }) });
-  assert.deepEqual(await easBuildCommit("app", "/f.env", "21", deps(builds)), { commit: "61c8c825" });
-  assert.deepEqual(await easBuildCommit("app", "/f.env", "2018d35a-b880", deps(builds)), { commit: "61c8c825" });
-  assert.deepEqual(await easBuildCommit("app", "/f.env", "20", deps(builds)), { missing: "EAS build 20 names no commit" });
+  assert.deepEqual(await easBuildCommit("app", "/f.env", "21", deps(builds)), { commit: "61c8c8256a218a6e4976f98b715aa05a4875960f" });
+  assert.deepEqual(await easBuildCommit("app", "/f.env", "2018d35a-b880", deps(builds)), { commit: "61c8c8256a218a6e4976f98b715aa05a4875960f" });
+  assert.deepEqual(await easBuildCommit("app", "/f.env", "20", deps(builds)), { missing: "EAS build 20 names no full commit: build commit not read" });
   assert.deepEqual(await easBuildCommit("app", "/f.env", "99", deps(builds)), { missing: "EAS lists no build 99 among the app's last 50 builds" });
   assert.deepEqual(await easBuildCommit("app", "/f.env", "21", { ...deps(builds), env: () => null }), { missing: "no EXPO_TOKEN in /f.env" });
   assert.deepEqual(await easBuildCommit("app", "/f.env", "21", deps({ errors: [{ extensions: { errorCode: "UNAUTHORIZED_ERROR" } }] })), { missing: "the Expo token in /f.env has no access to app app" });
+});
+
+// Checker 162-verdict-3: a failed response (HTTP error, GraphQL errors, partial data, short hash) never proves anything.
+test("every reader refuses a failed response: HTTP non-200, GraphQL errors with partial data, or a commit that is not 40 hex", async () => {
+  const full = "a".repeat(40);
+  const reply = (status: number, body: unknown): ReaderDeps["fetch"] => async () => ({ ok: status >= 200 && status < 300, status, json: async () => body });
+  const env = () => ({ EXPO_TOKEN: "t", COOLIFY_BASE_URL: "https://c.example", COOLIFY_APPLICATION_UUID: "app", COOLIFY_API_TOKEN: "tok" });
+  const builds = { app: { byId: { builds: [{ id: "build-id", platform: "IOS", gitCommitHash: full, appBuildVersion: "21" }] } } };
+  // The EAS build lookup (the checker's two cases, and a short hash).
+  assert.ok("missing" in await easBuildCommit("app", "/f.env", "21", { env, fetch: reply(500, { data: builds }) }), "HTTP 500");
+  assert.ok("missing" in await easBuildCommit("app", "/f.env", "21", { env, fetch: reply(200, { data: builds, errors: [{ extensions: { errorCode: "INTERNAL_SERVER_ERROR" } }] }) }), "GraphQL errors with partial data");
+  assert.ok("missing" in await easBuildCommit("app", "/f.env", "21", { env, fetch: reply(201, { data: builds }) }), "only HTTP 200 counts");
+  const shortBuilds = { app: { byId: { builds: [{ ...builds.app.byId.builds[0]!, gitCommitHash: "aaaaaaa" }] } } };
+  assert.ok("missing" in await easBuildCommit("app", "/f.env", "21", { env, fetch: reply(200, { data: shortBuilds }) }), "a short hash");
+  assert.deepEqual(await easBuildCommit("app", "/f.env", "21", { env, fetch: reply(200, { data: builds }) }), { commit: full });
+  // The EAS OTA reader.
+  const ota: LiveCheck = { kind: "eas-update", appId: "app", channels: ["production"], envFile: "/f.env" };
+  const update = (hash: string) => ({ app: { byId: { updateChannelByName: { updateBranches: [{ updates: [{ group: "g", gitCommitHash: hash, createdAt: "2026-10-18T10:41:57Z" }] }] } } } });
+  const base = { env, loadedCommit: async () => "none" };
+  assert.equal((await readProduction(ota, { ...base, fetch: reply(500, { data: update(full) }) })).ok, false, "OTA: HTTP 500");
+  assert.equal((await readProduction(ota, { ...base, fetch: reply(200, { data: update(full), errors: [{ message: "partial" }] }) })).ok, false, "OTA: errors with partial data");
+  assert.equal((await readProduction(ota, { ...base, fetch: reply(200, { data: update("aa40ebbe") }) })).ok, false, "OTA: a short hash");
+  assert.equal((await readProduction(ota, { ...base, fetch: reply(200, { data: update(full) }) })).ok, true);
+  // The Coolify reader.
+  const coolify: LiveCheck = { kind: "coolify-deploy", envFile: "/f.env", baseUrlVar: "COOLIFY_BASE_URL", appVar: "COOLIFY_APPLICATION_UUID", tokenVar: "COOLIFY_API_TOKEN" };
+  const deploys = (commit: string) => ({ deployments: [{ status: "finished", commit, deployment_uuid: "d1" }] });
+  assert.equal((await readProduction(coolify, { ...base, fetch: reply(500, deploys(full)) })).ok, false, "Coolify: HTTP 500");
+  assert.equal((await readProduction(coolify, { ...base, fetch: reply(200, { ...deploys(full), errors: ["partial"] }) })).ok, false, "Coolify: an error field");
+  assert.equal((await readProduction(coolify, { ...base, fetch: reply(200, deploys("27bc41d")) })).ok, false, "Coolify: a short hash");
+  assert.equal((await readProduction(coolify, { ...base, fetch: reply(200, deploys(full)) })).ok, true);
+  // The plugin reader: a loaded commit that is not 40 hex is not a commit.
+  assert.equal((await readProduction({ kind: "plugin-reload", plugin: "telegram" }, { ...base, fetch: reply(200, {}), loadedCommit: async () => ({ label: "Telegram", sha: "fa0e1d9" }) })).ok, false, "plugin: a short hash");
 });

@@ -33,6 +33,10 @@ export type LiveDeps = {
 };
 
 const short = (sha: string) => sha.slice(0, 8);
+/** Only a full commit id is commit evidence; a short or missing one proves nothing. */
+const FULL_SHA = /^[0-9a-f]{40}$/i;
+/** A reader trusts only HTTP 200 with no error field: a failed or partial answer is never evidence. */
+const clean = (res: { status: number }, body: unknown) => res.status === 200 && typeof body === "object" && body !== null && !("errors" in body) && !("error" in body);
 const mergedPr = (r: DeliveryRecord) => r.mergeCommitSha !== null && (r.forgeState === "merged" || r.status === "complete" || r.status === "merged-needs-verification" || r.status === "merged-unverified");
 
 function applies(check: { repos?: readonly string[] }, repo: string): boolean {
@@ -156,7 +160,8 @@ export async function readProduction(check: LiveCheck, deps: ReaderDeps): Promis
   try {
     if (check.kind === "plugin-reload") {
       const loaded = await deps.loadedCommit(check.plugin);
-      return typeof loaded === "string" ? { ok: false, missing: loaded } : { ok: true, runs: [loaded] };
+      if (typeof loaded === "string") return { ok: false, missing: loaded };
+      return FULL_SHA.test(loaded.sha) ? { ok: true, runs: [loaded] } : { ok: false, missing: `the ${check.plugin} plugin reported "${loaded.sha}", not a full commit` };
     }
     if (check.kind === "release-readback") return { ok: false, missing: "a release read-back is read per task" };
     const env = deps.env(check.envFile);
@@ -173,13 +178,13 @@ export async function readProduction(check: LiveCheck, deps: ReaderDeps): Promis
         const body = await res.json() as { data?: { app?: { byId?: { updateChannelByName?: { updateBranches?: { updates?: { group?: string; gitCommitHash?: string | null; createdAt?: string }[] }[] } | null } } }; errors?: { extensions?: { errorCode?: string } }[] };
         const code = body.errors?.[0]?.extensions?.errorCode;
         if (code === "UNAUTHORIZED_ERROR") return { ok: false, missing: `the Expo token in ${check.envFile} has no access to app ${check.appId}` };
-        if (!res.ok || body.errors?.length) return { ok: false, missing: `Expo did not answer for the ${channel} channel (${code ?? `HTTP ${res.status}`})` };
+        if (!clean(res, body)) return { ok: false, missing: `Expo did not answer for the ${channel} channel (${code ?? (res.status === 200 ? "errors in the answer" : `HTTP ${res.status}`)})` };
         const channelRow = body.data?.app?.byId?.updateChannelByName;
         if (!channelRow) return { ok: false, missing: `app ${check.appId} has no ${channel} channel` };
         const latest = (channelRow.updateBranches ?? []).flatMap((branch) => branch.updates ?? [])
           .sort((a, b) => Date.parse(b.createdAt ?? "") - Date.parse(a.createdAt ?? ""))[0];
         if (!latest) return { ok: false, missing: `no OTA update on the ${channel} channel` };
-        if (!latest.gitCommitHash) return { ok: false, missing: `the newest ${channel} OTA update names no commit` };
+        if (!latest.gitCommitHash || !FULL_SHA.test(latest.gitCommitHash)) return { ok: false, missing: `the newest ${channel} OTA update names no full commit` };
         runs.push({ label: `${channel} OTA ${short(latest.group ?? "")}`.trim(), sha: latest.gitCommitHash, ...(latest.createdAt ? { at: Date.parse(latest.createdAt) } : {}) });
       }
       return { ok: true, runs };
@@ -190,10 +195,10 @@ export async function readProduction(check: LiveCheck, deps: ReaderDeps): Promis
     const res = await deps.fetch(`${base!.replace(/\/+$/, "")}/api/v1/deployments/applications/${encodeURIComponent(app!)}?skip=0&take=10`, {
       headers: { authorization: `Bearer ${token}`, accept: "application/json" }, ...(deps.signal ? { signal: deps.signal } : {}),
     });
-    if (!res.ok) return { ok: false, missing: `Coolify did not answer (HTTP ${res.status})` };
-    const body = await res.json() as unknown;
+    const body = res.status === 200 ? await res.json() as unknown : null;
+    if (body === null || (!Array.isArray(body) && !clean(res, body))) return { ok: false, missing: `Coolify did not answer cleanly (HTTP ${res.status})` };
     const rows = (Array.isArray(body) ? body : (body as { deployments?: unknown[] })?.deployments ?? []) as { commit?: string; status?: string; deployment_uuid?: string; finished_at?: string; created_at?: string }[];
-    const done = rows.find((row) => row.status === "finished" && typeof row.commit === "string" && /^[0-9a-f]{7,40}$/i.test(row.commit));
+    const done = rows.find((row) => row.status === "finished" && typeof row.commit === "string" && FULL_SHA.test(row.commit));
     if (!done) return { ok: false, missing: "Coolify lists no finished deploy with a commit" };
     const at = Date.parse(done.finished_at ?? done.created_at ?? "");
     return { ok: true, runs: [{ label: `Coolify deploy ${done.deployment_uuid ?? ""}`.trim(), sha: done.commit!, ...(Number.isFinite(at) ? { at } : {}) }] };
@@ -216,10 +221,12 @@ export async function easBuildCommit(appId: string, envFile: string, build: stri
     });
     const body = await res.json() as { data?: { app?: { byId?: { builds?: { id: string; platform?: string; gitCommitHash?: string | null; appBuildVersion?: string | null }[] } } }; errors?: { extensions?: { errorCode?: string } }[] };
     if (body.errors?.[0]?.extensions?.errorCode === "UNAUTHORIZED_ERROR") return { missing: `the Expo token in ${envFile} has no access to app ${appId}` };
+    // HTTP 200 with no errors only: a failed or partial answer is never build evidence.
+    if (!clean(res, body)) return { missing: `EAS did not answer cleanly (HTTP ${res.status}${body.errors ? ", errors in the answer" : ""}): build commit not read` };
     const wanted = build.trim();
     const row = (body.data?.app?.byId?.builds ?? []).find((b) => b.id === wanted || (b.platform === "IOS" && b.appBuildVersion === wanted));
     if (!row) return { missing: `EAS lists no build ${wanted} among the app's last 50 builds` };
-    if (!row.gitCommitHash) return { missing: `EAS build ${wanted} names no commit` };
+    if (!row.gitCommitHash || !FULL_SHA.test(row.gitCommitHash)) return { missing: `EAS build ${wanted} names no full commit: build commit not read` };
     return { commit: row.gitCommitHash };
   } catch (error) {
     if (deps.signal?.aborted) throw error;
