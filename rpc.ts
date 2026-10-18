@@ -30,6 +30,11 @@ export const rpcContract = defineRpcContract({
     input: z.object({ threadId: z.string().min(1), id: z.string().min(1).max(64), resolution: z.string().min(1).max(2000) }),
     output: z.object({ ok: z.boolean() }),
   },
+  deferAsk: {
+    experimental_description: "The owner skipped these open cards on the Board (decide later) until `until` (ms). All or nothing: if any card is not this captain's open card, nothing is skipped, ok is false and `refused` names those cards. Each card stays open and comes back to the owner on its own at that time; a skipped card never proceeds on its deadline. `already`: cards still skipped from before, which keep their time; `until` is the time in effect. The captain is told once, and a notice whose send failed is sent again later.",
+    input: z.object({ threadId: z.string().min(1), ids: z.array(z.string().min(1).max(64)).min(1).max(20), until: z.number().int().positive() }),
+    output: z.object({ ok: z.boolean(), deferred: z.array(z.string()), already: z.array(z.string()), refused: z.array(z.string()), until: z.number().nullable() }),
+  },
   telegramCommand: {
     experimental_description: "Answer a Telegram owner command (/inbox, /workers, the board, the digest, or the tasks) for one captain thread as plain text. tasks returns, in `tasks`, every open owner task and each one that changed since `since` (default now), with the BB project id of its crews (projectId: the connector's topic for the task comes from it), its starting and running crews, what it waits on and the owner's Telegram refs, for the connector's task status lines and /tasks. The board has three sections: Needs you, Done since you last looked, In progress. since (ms) is when the owner last looked: board defaults to 24 h ago, digest to 12 h ago. The digest text is empty when there is nothing to report. For board, away is the captain's /afk posture, and projects counts the crews working on each project, for the pinned board of each Telegram project topic.",
     input: z.object({

@@ -297,3 +297,118 @@ test("16 Oct project topics: a reply held back as a card repeat says what really
     } finally { await host.harness.lifecycle.dispose(); }
   }
 });
+
+// 18 Oct, owner: "add skip button also in the waiting for you section". The Board's Skip defers the card
+// ("decide later") and the captain is told once, so it neither waits on the card nor acts on it.
+test("deferAsk skips the owner's open cards until a time, tells the captain once, and takes them off Needs you", async () => {
+  const host = await captainHost();
+  try {
+    const asks = createOwnerAsks(host.bb.storage.database());
+    const options = [{ label: "Publish", value: "publish" }, { label: "Wait", value: "wait" }];
+    asks.create({ id: "askip1", captain: "thr_cap", kind: "question", text: "Publish Safi?", options, createdAt: Date.now() });
+    asks.create({ id: "askip2", captain: "thr_cap", kind: "question", text: "Rename the app?", options, createdAt: Date.now() });
+    const until = Date.UTC(2030, 0, 2, 7, 0);
+
+    assert.deepEqual(await host.harness.behavior.callRpc("deferAsk", { threadId: "thr_other", ids: ["askip1"], until }), { ok: false, deferred: [], already: [], refused: ["askip1"], until: null });
+    assert.deepEqual(await host.harness.behavior.callRpc("deferAsk", { threadId: "thr_cap", ids: ["askip1"], until }), { ok: true, deferred: ["askip1"], already: [], refused: [], until });
+    assert.equal(asks.get("askip1")?.deferredUntil, until);
+
+    const told = host.harness.sdk.callsTo("threads.send").map((call) => call[0] as { threadId: string; mode: string; input: Array<{ text: string; visibility?: string }> });
+    assert.equal(told.length, 1);
+    assert.equal(told[0]!.threadId, "thr_cap");
+    assert.equal(told[0]!.mode, "steer");
+    assert.equal(told[0]!.input[0]!.visibility, "agent-only");
+    assert.match(told[0]!.input[0]!.text, /askip1/);
+    assert.match(told[0]!.input[0]!.text, /2030-01-02 07:00 UTC/);
+    assert.match(told[0]!.input[0]!.text, /do not act on it/i);
+
+    assert.deepEqual(await host.harness.behavior.callRpc("deferAsk", { threadId: "thr_cap", ids: ["askip1"], until: until + 60_000 }), { ok: true, deferred: [], already: ["askip1"], refused: [], until }, "a repeat is a no-op and keeps the first time");
+    assert.equal(host.harness.sdk.callsTo("threads.send").length, 1, "the captain is told once");
+
+    const board = await host.harness.behavior.callRpc("telegramCommand", { threadId: "thr_cap", command: "board" }) as { text: string };
+    assert.match(board.text, /Rename the app\?/);
+    assert.doesNotMatch(board.text, /Publish Safi\?/, "a skipped card is not in Needs you");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// Checker 159 finding 2: a card answered elsewhere is refused, so the Board can refuse its Skip.
+test("deferAsk refuses a card that is no longer open and skips nothing", async () => {
+  const host = await captainHost();
+  try {
+    const asks = createOwnerAsks(host.bb.storage.database());
+    const options = [{ label: "Yes", value: "yes" }];
+    asks.create({ id: "aopen", captain: "thr_cap", kind: "question", text: "Ship?", options, createdAt: Date.now() });
+    asks.create({ id: "adone", captain: "thr_cap", kind: "question", text: "Ship?", options, createdAt: Date.now() });
+    asks.resolve("adone", "thr_cap", "answered", "Yes", Date.now());
+    assert.deepEqual(await host.harness.behavior.callRpc("deferAsk", { threadId: "thr_cap", ids: ["aopen", "adone"], until: Date.now() + 3_600_000 }), { ok: false, deferred: [], already: [], refused: ["adone"], until: null });
+    assert.equal(asks.get("aopen")?.deferredUntil, undefined);
+    assert.equal(host.harness.sdk.callsTo("threads.send").length, 0, "nothing to tell the captain");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// Checker 159 finding 1 (their reproduction): the captain notice survives a failed send.
+test("a captain notice whose send failed is sent on the next Skip request, once", async () => {
+  const host = await captainHost();
+  try {
+    const asks = createOwnerAsks(host.bb.storage.database());
+    asks.create({ id: "lost", captain: "thr_cap", kind: "question", text: "Ship?", options: [{ label: "Yes", value: "yes" }], createdAt: Date.now() });
+    let attempts = 0, delivered = 0;
+    host.harness.sdk.stub("threads.send", async () => { attempts++; if (attempts === 1) throw new Error("temporary BB send failure"); delivered++; return {}; });
+    const input = { threadId: "thr_cap", ids: ["lost"], until: Date.now() + 3_600_000 };
+    await host.harness.behavior.callRpc("deferAsk", input);
+    await host.harness.behavior.callRpc("deferAsk", input);
+    await host.harness.behavior.callRpc("deferAsk", input);
+    assert.equal(delivered, 1, "captain must receive exactly one skip notice after retry");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// Checker 159 finding 3 (their reproduction): at its time a skipped overdue question waits for the owner.
+test("decide-later expiry returns an overdue question for owner review", async () => {
+  const host = await captainHost();
+  try {
+    const asks = createOwnerAsks(host.bb.storage.database());
+    const now = Date.now();
+    const until = now + 3_600_000;
+    asks.create({ id: "due", captain: "thr_cap", kind: "question", text: "Ship?", options: [{ label: "Yes", value: "yes" }], recommended: 0, defaultAt: now - 1, createdAt: now - 60_000 });
+    await host.harness.behavior.callRpc("deferAsk", { threadId: "thr_cap", ids: ["due"], until });
+    assert.deepEqual(asks.takeDue("thr_cap", until - 1), []);
+    assert.deepEqual(asks.takeDue("thr_cap", until), []);
+    assert.equal(asks.get("due")?.state, "open", "09:00 should return the question for the owner, not decide it automatically");
+    assert.deepEqual(asks.listWaiting("thr_cap", until).map((ask) => ask.id), ["due"]);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+// Checker round 2 (159-TG68-verdict-2.md), their reproduction: two overlapping Skip requests for one card
+// make one captain notice, even while the first send is still in flight.
+test("overlapping defer retries tell the captain once", { timeout: 15_000 }, async () => {
+  const host = await captainHost();
+  try {
+    const asks = createOwnerAsks(host.bb.storage.database());
+    const now = Date.now();
+    asks.create({ id: "race", captain: "thr_cap", kind: "question", text: "Ship?", options: [{ label: "Yes", value: "yes" }], createdAt: now });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const firstEntered = new Promise<void>((resolve) => { entered = resolve; });
+    let notices = 0;
+    host.harness.sdk.stub("threads.send", async () => { notices++; entered(); await gate; return {}; });
+    const input = { threadId: "thr_cap", ids: ["race"], until: now + 3_600_000 };
+    const first = host.harness.behavior.callRpc("deferAsk", input);
+    const second = host.harness.behavior.callRpc("deferAsk", input);
+    await firstEntered;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    release();
+    await Promise.all([first, second]);
+    assert.equal(notices, 1, "overlapping RPC/retry must not send the same skip notice twice");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});

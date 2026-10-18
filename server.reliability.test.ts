@@ -1271,6 +1271,27 @@ test("a pack answer resolves each card it lists and raises no unanswered reminde
   }
 });
 
+// Checker 159 finding 1: a skip notice that failed is sent when the captain goes idle, even with no new request.
+test("a captain idle sends a skip notice whose first send failed, once", async () => {
+  const host = await knownCaptainHost();
+  try {
+    await telegramFlags(host);
+    connectorOk(host);
+    host.harness.sdk.stub("threads.list", async () => []);
+    asks(host).create({ id: "a000009", captain: "thr_cap", kind: "question", text: "Ship?", options: [{ label: "Yes", value: "yes" }], createdAt: 1 });
+    let fail = true;
+    host.harness.sdk.stub("threads.send", async () => { if (fail) throw new Error("BB down"); return {}; });
+    await host.harness.behavior.callRpc("deferAsk", { threadId: "thr_cap", ids: ["a000009"], until: Date.now() + 3_600_000 });
+    fail = false;
+    await captainIdle(host);
+    await captainIdle(host);
+    const notices = host.harness.sdk.callsTo("threads.send").map((c) => (c[0] as { input: Array<{ text: string }> }).input[0]?.text ?? "").filter((text) => /skipped ask a000009/.test(text));
+    assert.equal(notices.length, 2, "one failed send, then exactly one delivered notice");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("a captain idle defaults an overdue reversible ask once and never an irreversible one", async () => {
   const host = await knownCaptainHost();
   try {

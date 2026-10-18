@@ -5704,6 +5704,42 @@ export default async function plugin(bb: BbPluginApi) {
     stale: z.object({ ids: z.array(z.string()), at: z.number(), since: z.number() }).nullable(),
   });
 
+  /**
+   * The captain is told once of each card the owner skipped, so it neither waits on it nor acts on it.
+   * A notice is marked told only after the send; one that failed is sent at the next Skip request or the
+   * captain's next idle, while the card is still skipped. One drain per captain at a time: an overlapping
+   * call (a repeated Skip request, the idle drain) waits for it and then finds nothing left to tell.
+   */
+  const skipNoticeChains = new Map<string, Promise<void>>();
+  function tellSkippedAsks(captainThreadId: string): Promise<void> {
+    const next = (skipNoticeChains.get(captainThreadId) ?? Promise.resolve()).then(() => drainSkipNotices(captainThreadId));
+    const settled = next.catch(() => {});
+    skipNoticeChains.set(captainThreadId, settled);
+    void settled.then(() => { if (skipNoticeChains.get(captainThreadId) === settled) skipNoticeChains.delete(captainThreadId); });
+    return next;
+  }
+
+  async function drainSkipNotices(captainThreadId: string): Promise<void> {
+    const untold = ownerAsks.untoldSkips(captainThreadId, Date.now());
+    if (untold.length === 0) return;
+    const byTime = new Map<number, string[]>();
+    for (const ask of untold) byTime.set(ask.deferredUntil!, [...(byTime.get(ask.deferredUntil!) ?? []), ask.id]);
+    for (const [until, ids] of byTime) {
+      const when = `${new Date(until).toISOString().slice(0, 10)} ${formatUtcTime(until)}`;
+      const cards = ids.map((id) => `ask ${id}`).join(", ");
+      try {
+        await bb.sdk.threads.send({
+          threadId: captainThreadId,
+          mode: "steer",
+          input: [{ type: "text", text: `The owner skipped ${cards} until ${when} (decide later). Do not act on it and do not wait on it: go on with other work. It does not proceed on its deadline. The card comes back to the owner at that time; his answer reaches you as usual.`, mentions: [], visibility: "agent-only" }],
+        });
+        ownerAsks.markSkipsTold(ids);
+      } catch (error) {
+        bb.log.warn(`owner ask skip notice ${cards}: ${String(error)}`);
+      }
+    }
+  }
+
   // An overdue reversible ask proceeds with its recommended option; the captain thread is told once.
   async function defaultOverdueAsks(captainThreadId: string): Promise<void> {
     const due = ownerAsks.takeDue(captainThreadId, Date.now());
@@ -5856,6 +5892,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function drainCaptainReliability(captainThreadId: string, signal?: AbortSignal): Promise<void> {
+    await tellSkippedAsks(captainThreadId);
     await defaultOverdueAsks(captainThreadId).catch((error) => bb.log.warn(`owner ask deadlines: ${String(error)}`));
     await reconcilePrograms(captainThreadId, { signal }).catch((error) => bb.log.warn(`programs: ${String(error)}`));
     const flags = await reliabilityFlags();
@@ -14460,6 +14497,14 @@ export default async function plugin(bb: BbPluginApi) {
       if (ok) await refreshOwnerBoard();
       return { ok };
     },
+    async deferAsk({ threadId, ids, until }) {
+      if (!(await isCaptainThread(threadId))) return { ok: false, deferred: [], already: [], refused: ids, until: null };
+      const result = ownerAsks.defer(ids, threadId, until);
+      if (result.refused.length > 0) return { ok: false, ...result };
+      if (result.deferred.length > 0) await refreshOwnerBoard();
+      await tellSkippedAsks(threadId);
+      return { ok: true, ...result };
+    },
     async telegramCommand({ command, threadId, since }) {
       if (!(await isCaptainThread(threadId))) return { text: "The Telegram captain is not a Firstmate captain thread." };
       if (command === "inbox") {
@@ -14481,7 +14526,7 @@ export default async function plugin(bb: BbPluginApi) {
         const from = since ?? now - (command === "board" ? 24 : 12) * 60 * 60_000;
         reconcileTasks(threadId, now);
         const records = new Map([...deliveries.list({ owner: threadId, limit: 100 }), ...deliveries.mergedSince(threadId, from)].map((r) => [r.id, r]));
-        const input: BoardInput = { asks: ownerAsks.listOpen(threadId), calls: snapshot.rpc.ownerCalls, tasks: ownerTasks.list(threadId, { includeClosed: true }), records: [...records.values()], programs: programs.list(threadId), since: from, now };
+        const input: BoardInput = { asks: ownerAsks.listWaiting(threadId, now), calls: snapshot.rpc.ownerCalls, tasks: ownerTasks.list(threadId, { includeClosed: true }), records: [...records.values()], programs: programs.list(threadId), since: from, now };
         if (command === "board") {
           // The running crews per project, for the connector's board in each project topic. Always sent:
           // an empty list means no crew runs, and the connector shows 0 instead of counting task lines.
