@@ -12,8 +12,8 @@ const HOME = homedir();
 const IN_PLACE_OF_A_SKIP = [
   "Report these steps as ✓, not as a skip:",
   "- A step or skill that spawns a sub-agent, reviewer or other model (delegate, architect, how, why, no-comments): do it yourself in this session, on your own model. Add \"(done in session)\".",
-  "- Cursor-only tools: for create-skill read writing-for-agents; for /loop repeat the step yourself; for origin or gt use gh-axi; for Cursor Automations or cloud agents do the step yourself, or report it blocked if you cannot.",
-  "- Bugbot: triage its comments like any other review thread. If the PR has no Bugbot check, do not wait for one.",
+  "- Cursor-only tools: for create-skill read writing-for-agents; for /loop repeat the step yourself; for origin or gt use gh-axi; for Cursor Automations or cloud agents do the step yourself or report it blocked.",
+  "- Bugbot: triage its comments as normal review threads. With no Bugbot check on the PR, do not wait for one.",
   "- Opening a PR, merge, deploy: follow the brief's delivery contract. If proof needs a deploy you may not run, prove it on the nearest surface you can and name what is left for Firstmate.",
 ];
 
@@ -28,8 +28,8 @@ const SKILLS_READ = "Your final report has a line \"Skills read: <paths>\" for t
 const HOUSE_RULES = [
   "pstack always has priority. If a skill or rule conflicts with it, pstack wins.",
   "Spawn no sub-agents, except where your playbook calls for `arena` (a new UI or design choice with no example in the code) or `interrogate` (a risky PR): then spawn at most 3 extra agents for that step, and run their heavy commands through `~/.bb-firstmate/bin/fm-heavy`. Do everything else yourself, in this session.",
-  "`code-review` starts two review sub-agents: run its Standards review, then its Spec review, yourself in this session.",
-  "`implement-spec` starts implementer and merger sub-agents and merges tickets on its own: never start them and never merge a ticket. Build the tickets your brief names yourself, on your branch, and follow the brief's delivery contract. Firstmate gives other tickets to other crews.",
+  "`code-review`: run its Standards and Spec reviews yourself, one after the other, not as sub-agents.",
+  "`implement-spec`: never start its sub-agents and never merge a ticket. Build your brief's tickets on your branch and follow the delivery contract.",
   "Until the owner confirms otherwise: Firstmate decides who merges and deploys. Follow the brief's delivery contract for merge and deploy.",
 ];
 
@@ -96,7 +96,7 @@ test("a feature brief gives full paths, the pipeline checklist, the core princip
     "5. Your final report lists each pipeline step as the Pipeline section says.",
     SKILLS_READ,
     principles(root),
-    `Skills on this host are in \`${root}/<name>/SKILL.md\`. Load a skill by reading that file. When a skill says to call the Skill tool with <name> and you have no Skill tool, read \`${root}/<name>/SKILL.md\`. pstack skills are user-invocable only: always read their files.`,
+    `Skills on this host are in \`${root}/<name>/SKILL.md\`. Load a skill by reading that file. With no Skill tool, \"call the Skill tool with <name>\" means read that file for <name>.`,
     "If a skill is not installed, continue and say so in your report.",
     ...HOUSE_RULES,
     MERGE_RULE,
@@ -113,7 +113,7 @@ test("a feature brief gives full paths, the pipeline checklist, the core princip
     `P7. PR: read \`${root}/pr/SKILL.md\`. Evidence: the PR link.`,
     "Your final report has one line per pipeline step: \"✓ P<n> <step>: <evidence>\" or \"skip: P<n> <step>: <reason>\".",
     "Write that report to your report file before you record verification. `bb firstmate deliveries verify` refuses this crew's PR until the report has \"✓ P4 Prove on the real surface for <owner/repo#n> at <head sha>: driven <what>; seen <what>\" for that PR at its current head. After a new push, add a new P4 line.",
-    `P3 uses \`${root}/tdd/SKILL.md\`, Matt Pocock's \`tdd\`. It is the only \`tdd\` installed on this host; pstack's \`tdd\` is not. A playbook's advice to skip an expensive test does not replace P3: write the failing test first, or report \"skip: P3 <step>: <reason>\".`,
+    `P3's \`tdd\` is Matt Pocock's, the only one installed. A playbook's advice to skip an expensive test does not replace P3: write the test, or report \"skip: P3 <step>: <reason>\".`,
     "Save each screenshot as its own full-size PNG file. Never combine, stitch or downscale screenshots; link each file separately.",
     ...OBSTACLES,
   ].join("\n"));
@@ -179,7 +179,7 @@ test("each provider's brief points at the folder where that provider reads skill
 test("every brief says to load skills as files, names the skill-routing file and counts in-session delegate steps as done", () => {
   for (const [providerId, root] of [["claude-code", ".claude/skills"], ["codex", ".codex/skills"], [null, ".agents/skills"]] as const) {
     const block = crewSkillBlock({ shape: "ship", title: "Fix agent computer feature", task: "", providerId });
-    assert.ok(block.includes(`Load a skill by reading that file. When a skill says to call the Skill tool with <name> and you have no Skill tool, read \`${HOME}/${root}/<name>/SKILL.md\`. pstack skills are user-invocable only: always read their files.`), block);
+    assert.ok(block.includes(`Load a skill by reading that file. With no Skill tool, \"call the Skill tool with <name>\" means read that file for <name>.`), block);
     assert.ok(block.includes(`1. Read \`${HOME}/${root}/skill-routing/SKILL.md\`.`), block);
     assert.ok(block.includes(IN_PLACE_OF_A_SKIP.join("\n")), block);
     assert.ok(block.includes("Spawn no sub-agents, except"), block);
@@ -406,7 +406,8 @@ test("the block stays short for every provider, shape, playbook and role", () =>
         for (const role of ["builder", "checker"] as const) {
           const input = { shape, title: "x", task: "", providerId, playbook, role };
           const size = crewSkillBlock(input).length;
-          const bound = crewPipeline(input) === null ? 3900 : 5300;
+          // 18 Oct: +600 for the code-review, implement-spec, tdd, Skill-tool and Bugbot rules.
+          const bound = crewPipeline(input) === null ? 4500 : 5900;
           assert.ok(size <= bound, `${providerId} ${shape} ${playbook} ${role}: ${size} characters`);
         }
       }
@@ -578,7 +579,7 @@ test("a bug-fix brief carries the fixed pipeline in order, with each skill's pat
     `P7. PR: read \`${root}/pr/SKILL.md\`. Evidence: the PR link.`,
     "Your final report has one line per pipeline step: \"✓ P<n> <step>: <evidence>\" or \"skip: P<n> <step>: <reason>\".",
     "Write that report to `/fm/data/c1/report.md` before you record verification. `bb firstmate deliveries verify` refuses this crew's PR until the report has \"✓ P4 Prove on the real surface for <owner/repo#n> at <head sha>: driven <what>; seen <what>\" for that PR at its current head. After a new push, add a new P4 line.",
-    `P2 uses \`${root}/tdd/SKILL.md\`, Matt Pocock's \`tdd\`. It is the only \`tdd\` installed on this host; pstack's \`tdd\` is not. A playbook's advice to skip an expensive test does not replace P2: write the failing test first, or report \"skip: P2 <step>: <reason>\".`,
+    `P2's \`tdd\` is Matt Pocock's, the only one installed. A playbook's advice to skip an expensive test does not replace P2: write the test, or report \"skip: P2 <step>: <reason>\".`,
   ].join("\n")), block);
   assert.ok(block.includes("4. Write every pipeline step into `/fm/data/c1/todo.md`, then the playbook steps, before any other work. Tick each step there as you go."), block);
   assert.ok(block.includes("5. Your final report lists each pipeline step as the Pipeline section says."), block);
@@ -733,6 +734,6 @@ test("skill-routing names the sub-agent skills, the tdd it means, the Skill-tool
     "`tdd` means Matt Pocock's `tdd`, the one installed at `<skills folder>/tdd/SKILL.md`.",
     "pstack's `tdd` is not installed under that name.",
     "When a skill says to call the Skill tool with a skill name and you have no Skill tool, read that skill's `SKILL.md` from the skills folder your brief names.",
-    "Bugbot: triage its comments like any other review thread.",
+    "Bugbot: triage its comments like any other review thread. Do not wait for Bugbot when the PR has no Bugbot check.",
   ]) assert.ok(rules.includes(text), text);
 });
