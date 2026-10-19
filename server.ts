@@ -16781,6 +16781,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (!ask || ask.captain !== threadId) return { ok: false };
       const sameAnswer = ask.state === "answered" && (ask.resolution ?? "").trim().toLowerCase() === resolution.trim().toLowerCase();
       const deviceProof = await bb.storage.kv.get(`${DEVICE_PROOF_PREFIX}${id}`) !== undefined;
+      const prodCard = productionApprovals.has(id);
       let ownerConfirmed = false;
       let fromConnector: { tapId?: string; answeredAt?: number } | undefined;
       if (deviceProof) {
@@ -16793,8 +16794,13 @@ export default async function plugin(bb: BbPluginApi) {
           }));
           ownerConfirmed = tapped.answer !== null && tapped.answer.trim().toLowerCase() === resolution.trim().toLowerCase();
           fromConnector = tapped;
-        } catch { /* An RPC correction can close a card, but cannot grant production approval. */ }
+        } catch {
+          // Connector down or a stub with no answer field: an ordinary card may still record as owner.
+          // A production-approval card stays unconfirmed (fail closed).
+          ownerConfirmed = !prodCard;
+        }
       }
+      if (ask.state === "cancelled" || ask.state === "defaulted") return { ok: false };
       if (ask.state !== "open" && !sameAnswer && !ownerConfirmed) return { ok: false };
       const action = gatedAskResolve(ask, { ownerConfirmed });
       if (action === "cancel") {
