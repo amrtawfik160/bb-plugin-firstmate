@@ -21,6 +21,7 @@ const crewRow = z.object({
 export const rpcContract = defineRpcContract({
   "workstreams.list": {input:workstreamOwner.extend({includeEnded:z.boolean().optional()}),output:workstreamListSchema},
   "workstreams.create": {input:workstreamOwner.extend({projectId:z.string().min(1),name:z.string().min(1),requestId:z.string().min(1),topic:topicSchema.optional()}),output:workstreamResultSchema},
+  "workstreams.adopt": {input:workstreamOwner.extend({projectId:z.string().min(1),name:z.string().min(1),requestId:z.string().min(1),taskIds:z.array(z.string().min(1)).min(1)}),output:workstreamResultSchema},
   "workstreams.bindTopic": {input:workstreamTarget.extend({chatId:z.string().min(1),topicId:z.number().int().positive()}),output:workstreamResultSchema},
   "workstreams.ship": {input:workstreamTarget.extend({requestId:z.string().min(1)}),output:workstreamResultSchema},
   "workstreams.devLink": {input:workstreamTarget.extend({realLogin:z.boolean().optional()}),output:workstreamDevLinkSchema},

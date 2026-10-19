@@ -86,6 +86,16 @@ function memoryDb() {
   });
 }
 
+test("moving a task to the state it already has still writes a new outcome", () => {
+  const tasks = createOwnerTasks(memoryDb());
+  const task = tasks.open({ captain: "c", project: "Cyndra", title: "Wait", sourceRefs: ["tg:1:1"], at: 0 });
+  assert.equal(tasks.move(task.id, "c", { to: "needs_you", reason: "first wait" }, 1).outcome, "first wait");
+  const again = tasks.move(task.id, "c", { to: "needs_you", reason: "waiting for owner answers to N4-N7" }, 2);
+  assert.equal(again.state, "needs_you");
+  assert.equal(again.outcome, "waiting for owner answers to N4-N7");
+  assert.equal(again.updatedAt, 2);
+});
+
 test("a task an open program holds cannot be closed or marked merged by hand, by its PRs, or by a finished crew", () => {
   let holding = true;
   const tasks = createOwnerTasks(memoryDb(), (t) => holding && t.id === "T1" ? "Task T1 holds program P1 (DM Pro epic): 19 tickets are open." : null);

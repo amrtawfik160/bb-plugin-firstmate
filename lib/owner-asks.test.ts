@@ -2,13 +2,12 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import * as ownerAsksModule from "./owner-asks.ts";
-import { askLetterAnswer, askIdFromSourceEventId, createOwnerAsks, formatAskCard, newAskId, packAnswers } from "./owner-asks.ts";
+import { askLetterAnswer, askIdFromSourceEventId, choicesFromCrewReport, choicesFromDecisionNote, createOwnerAsks, crewQuestionText, formatAskCard, newAskId, packAnswers } from "./owner-asks.ts";
 import { formatBoard } from "./owner-board.ts";
 
 const NOW = Date.UTC(2026, 9, 7, 12, 0);
 
-function db() {
-  const raw = new DatabaseSync(":memory:");
+function db(raw = new DatabaseSync(":memory:")) {
   return Object.assign(raw, {
     transaction<T>(fn: () => T) {
       return () => {
@@ -66,6 +65,168 @@ test("the store resolves only the owner's open asks and defaults only reversible
   assert.deepEqual(asks.listOpen("thr_cap").map((a) => a.id), ["a2", "a3"]);
 });
 
+test("an owner tap stamps answeredByOwner; the captain can still correct it", () => {
+  const asks = createOwnerAsks(db());
+  const opts = [{ label: "Yes", value: "yes" }, { label: "No", value: "no" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "question", text: "q", options: opts, createdAt: NOW });
+  assert.equal(asks.resolve("a1", "thr_cap", "answered", "Yes", NOW, "owner")?.resolution, "Yes");
+  assert.equal(asks.answeredByOwner("a1"), true);
+  assert.equal(asks.resolve("a1", "thr_cap", "answered", "Captain correction", NOW + 2)?.resolution, "Captain correction");
+  assert.equal(asks.answeredByOwner("a1"), false);
+});
+
+test("structured crew report choices become buttons, and prose invents none", () => {
+  assert.deepEqual(choicesFromCrewReport('{"choices":["Postgres","MySQL","SQLite"]}'), [
+    { label: "Postgres", value: "a" }, { label: "MySQL", value: "b" }, { label: "SQLite", value: "c" },
+  ]);
+  assert.deepEqual(choicesFromCrewReport('Choose a database?\nchoices: ["Postgres","SQLite"]'), [
+    { label: "Postgres", value: "a" }, { label: "SQLite", value: "b" },
+  ]);
+  assert.equal(choicesFromCrewReport("Choose Postgres, MySQL or SQLite?"), null);
+  assert.equal(choicesFromCrewReport("Choose?"), null);
+  assert.equal(crewQuestionText('Choose Postgres or SQLite? {"choices":["Postgres","SQLite"]}'), "Choose Postgres or SQLite?");
+});
+
+test("an owner answer records pending follow-up in the same write; a failure stays visible", () => {
+  const asks = createOwnerAsks(db());
+  const opts = [{ label: "Works", value: "works" }, { label: "Does not work", value: "no" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "question", text: "Does build 21 work?", options: opts, createdAt: NOW });
+  asks.resolve("a1", "thr_cap", "answered", "Does not work", NOW, "owner");
+  assert.deepEqual(asks.pendingFollowUps().map((job) => [job.askId, job.effect, job.error]), [
+    ["a1", "owner-answered", null],
+    ["a1", "refresh-board", null],
+  ]);
+  asks.failFollowUp("a1", "owner-answered", "Telegram down");
+  assert.equal(asks.pendingFollowUps().find((job) => job.effect === "owner-answered")?.error, "Telegram down");
+  asks.markFollowUpDone("a1", "owner-answered");
+  asks.markFollowUpDone("a1", "refresh-board");
+  assert.deepEqual(asks.pendingFollowUps(), []);
+  asks.resolve("a1", "thr_cap", "answered", "Does not work", NOW + 1, "owner");
+  assert.deepEqual(asks.pendingFollowUps(), [], "a repeat owner write does not re-queue finished work");
+});
+
+test("a follow-up that fails 8 times or waits 2 hours becomes failed", () => {
+  const asks = createOwnerAsks(db());
+  const opts = [{ label: "Yes", value: "yes" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "question", text: "q", options: opts, sourceRef: "crew-wait:wait1:abc", createdAt: NOW });
+  asks.resolve("a1", "thr_cap", "answered", "Yes", NOW, "owner");
+  for (let i = 0; i < 7; i++) asks.failFollowUp("a1", "owner-answered", "hold down", NOW + i);
+  assert.equal(asks.pendingFollowUps().find((job) => job.effect === "owner-answered")?.attempts, 7);
+  assert.deepEqual(asks.failedFollowUps(), []);
+  asks.failFollowUp("a1", "owner-answered", "hold down", NOW + 7);
+  assert.equal(asks.pendingFollowUps().find((job) => job.effect === "owner-answered"), undefined);
+  assert.deepEqual(asks.failedFollowUps().map((job) => [job.askId, job.effect, job.attempts, job.noticed]), [
+    ["a1", "owner-answered", 8, false],
+  ]);
+  assert.equal(asks.claimFollowUpNotice("a1", "owner-answered"), true);
+  assert.equal(asks.claimFollowUpNotice("a1", "owner-answered"), false);
+
+  asks.create({ id: "a2", captain: "thr_cap", kind: "question", text: "q2", options: opts, createdAt: NOW });
+  asks.resolve("a2", "thr_cap", "answered", "Yes", NOW, "owner");
+  asks.failFollowUp("a2", "owner-answered", "hold down", NOW);
+  assert.equal(asks.pendingFollowUps().find((job) => job.askId === "a2")?.firstFailedAt, NOW);
+  asks.failFollowUp("a2", "owner-answered", "hold down", NOW + 2 * 60 * 60_000);
+  assert.ok(asks.failedFollowUps().some((job) => job.askId === "a2" && job.effect === "owner-answered"));
+});
+
+test("reopening a card keeps delivered follow-up so a new owner answer queues again", () => {
+  const asks = createOwnerAsks(db());
+  const opts = [{ label: "Yes", value: "yes" }, { label: "No", value: "no" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "question", text: "q", options: opts, createdAt: NOW });
+  asks.resolve("a1", "thr_cap", "answered", "Yes", NOW, "owner");
+  asks.markFollowUpDone("a1", "owner-answered");
+  asks.markFollowUpDone("a1", "refresh-board");
+  asks.resolve("a1", "thr_cap", "open", "Reopen", NOW + 1);
+  assert.deepEqual(asks.pendingFollowUps(), []);
+  asks.resolve("a1", "thr_cap", "answered", "No", NOW + 2, "owner");
+  assert.deepEqual(asks.pendingFollowUps().map((job) => [job.askId, job.effect, job.state]), [
+    ["a1", "owner-answered", "pending"],
+    ["a1", "refresh-board", "pending"],
+  ]);
+});
+
+test("each owner answer keeps its own follow-up sequence and previous pair", () => {
+  const asks = createOwnerAsks(db());
+  const opts = [{ label: "Yes", value: "yes" }, { label: "No", value: "no" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "question", text: "q", options: opts, createdAt: NOW });
+  asks.resolve("a1", "thr_cap", "answered", "Yes", NOW, "owner");
+  const first = asks.pendingFollowUps().find((job) => job.effect === "owner-answered");
+  assert.equal(first?.answerSeq, 1);
+  assert.equal(first?.resolution, "Yes");
+  asks.resolve("a1", "thr_cap", "open", "Reopen", NOW + 1);
+  assert.equal(asks.pendingFollowUps().length, 2, "reopen keeps in-flight follow-up");
+  asks.resolve("a1", "thr_cap", "answered", "No", NOW + 2, "owner");
+  const ownerJobs = asks.pendingFollowUps().filter((job) => job.effect === "owner-answered");
+  assert.equal(ownerJobs.length, 2);
+  const second = ownerJobs.find((job) => job.answerSeq === 2);
+  assert.equal(second?.previous, "Yes");
+  assert.equal(second?.resolution, "No");
+  asks.markFollowUpDone("a1", "owner-answered", 1);
+  assert.equal(asks.pendingFollowUps().some((job) => job.answerSeq === 1 && job.effect === "owner-answered"), false);
+  assert.ok(asks.pendingFollowUps().some((job) => job.answerSeq === 2 && job.effect === "owner-answered" && job.state === "pending"));
+});
+
+test("follow-up rows from the old card-effect key migrate to sequence 1", () => {
+  const raw = new DatabaseSync(":memory:");
+  raw.exec(`CREATE TABLE owner_ask_followup (
+    ask_id TEXT NOT NULL, effect TEXT NOT NULL, state TEXT NOT NULL, error TEXT, created_at INTEGER NOT NULL,
+    PRIMARY KEY (ask_id, effect));
+    INSERT INTO owner_ask_followup VALUES ('a1','owner-answered','pending',NULL,${NOW});`);
+  const asks = createOwnerAsks(db(raw));
+  const pending = asks.pendingFollowUps();
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0]?.answerSeq, 1);
+  assert.equal(pending[0]?.effect, "owner-answered");
+  assert.equal(pending[0]?.askId, "a1");
+});
+
+test("legacy follow-up rows keep the card's recorded answer at migration", () => {
+  const raw = new DatabaseSync(":memory:");
+  raw.exec(`CREATE TABLE owner_ask (id TEXT PRIMARY KEY, captain TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL, options TEXT NOT NULL, recommended INTEGER, default_at INTEGER, irreversible INTEGER NOT NULL, state TEXT NOT NULL, resolution TEXT, created_at INTEGER NOT NULL, resolved_at INTEGER);
+    INSERT INTO owner_ask VALUES ('a1','thr_cap','question','q','[{"label":"Postgres","value":"a"}]',NULL,NULL,0,'answered','Postgres',${NOW},${NOW});
+    CREATE TABLE owner_ask_followup (
+      ask_id TEXT NOT NULL, effect TEXT NOT NULL, state TEXT NOT NULL, error TEXT, created_at INTEGER NOT NULL,
+      PRIMARY KEY (ask_id, effect));
+    INSERT INTO owner_ask_followup VALUES ('a1','owner-answered','done',NULL,${NOW});`);
+  const asks = createOwnerAsks(db(raw));
+  asks.resolve("a1", "thr_cap", "open", "Reopen", NOW + 1);
+  asks.resolve("a1", "thr_cap", "answered", "SQLite", NOW + 2, "owner");
+  const correction = asks.pendingFollowUps().find((job) => job.effect === "owner-answered" && job.answerSeq === 2);
+  assert.equal(correction?.previous, "Postgres");
+  assert.equal(correction?.resolution, "SQLite");
+});
+
+test("a defaulted ask keeps an untold captain notice until it is marked told", () => {
+  const asks = createOwnerAsks(db());
+  asks.create({ id: "a1", captain: "thr_cap", kind: "question", text: "q", options: [{ label: "Yes", value: "yes" }], recommended: 0, defaultAt: NOW - 1, createdAt: NOW - 10 });
+  assert.deepEqual(asks.takeDue("thr_cap", NOW).map((ask) => ask.id), ["a1"]);
+  assert.deepEqual(asks.untoldDefaults("thr_cap").map((ask) => ask.id), ["a1"]);
+  asks.markDefaultsTold(["a1"]);
+  assert.deepEqual(asks.untoldDefaults("thr_cap"), []);
+});
+
+test("an owner confirmation stamps a card the captain already answered", () => {
+  const asks = createOwnerAsks(db());
+  const opts = [{ label: "Approve", value: "approve" }, { label: "No", value: "no" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "approval", text: "Merge?", options: opts, createdAt: NOW });
+  assert.equal(asks.resolve("a1", "thr_cap", "answered", "Approve", NOW)?.resolution, "Approve");
+  assert.equal(asks.answeredByOwner("a1"), false);
+  assert.equal(asks.resolve("a1", "thr_cap", "answered", "Approve", NOW + 1, "owner")?.resolution, "Approve");
+  assert.equal(asks.answeredByOwner("a1"), true);
+});
+
+test("create refuses a question with no options; a blocker with no options is stored", () => {
+  const asks = createOwnerAsks(db());
+  assert.throws(
+    () => asks.create({ id: "a1", captain: "thr_cap", kind: "question", text: "waiting for owner answers", options: [], createdAt: NOW }),
+    /A question card needs options\. Status belongs on the task, not as an open card\./,
+  );
+  assert.equal(asks.get("a1"), undefined);
+  const blocker = asks.create({ id: "a2", captain: "thr_cap", kind: "blocker", text: "Need the Stripe key.", options: [], createdAt: NOW });
+  assert.equal(blocker.state, "open");
+  assert.equal(blocker.options.length, 0);
+});
+
 test("old ask databases migrate without losing open asks and unparsed decisions link from the board", () => {
   const database = db();
   database.exec(`CREATE TABLE owner_ask (id TEXT PRIMARY KEY, captain TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL, options TEXT NOT NULL, recommended INTEGER, default_at INTEGER, irreversible INTEGER NOT NULL, state TEXT NOT NULL, resolution TEXT, created_at INTEGER NOT NULL, resolved_at INTEGER);
@@ -75,7 +236,7 @@ test("old ask databases migrate without losing open asks and unparsed decisions 
   database.prepare("INSERT INTO owner_ask VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run("arollback", "thr_other", "question", "Old plugin still asks?", "[]", null, null, 0, "open", null, NOW, null);
   assert.equal(asks.get("arollback")?.text, "Old plugin still asks?");
   assert.equal(database.prepare("PRAGMA table_info(owner_ask)").all().length, 12);
-  const result = asks.create({ id: "anew", captain: "thr_cap", kind: "question", text: "Approve cleanup?", options: [], sourceRef: "tg:200:3004:decision:0", messageUrl: "https://t.me/c/200/3004", createdAt: NOW });
+  const result = asks.create({ id: "anew", captain: "thr_cap", kind: "question", text: "Approve cleanup?", options: [{ label: "Yes", value: "yes" }], sourceRef: "tg:200:3004:decision:0", messageUrl: "https://t.me/c/200/3004", createdAt: NOW });
   assert.equal(result.id, "anew");
   assert.equal(formatBoard({ asks: [result], calls: [], tasks: [], records: [], since: 0, now: NOW }), [
     "📌 Needs you (1)",
@@ -304,4 +465,10 @@ test("a skipped card answered early is answered, and a reopened card is no longe
   asks.resolve("a1", "thr_cap", "open", "", NOW + 120_000);
   assert.equal(asks.get("a1")?.deferredUntil, undefined, "a reopened card waits on the owner again");
   assert.deepEqual(asks.listWaiting("thr_cap", NOW + 120_000).map((ask) => ask.id), ["a1"]);
+});
+
+test("checker round2: a normal three-choice native question keeps its separate choices", () => {
+  const options=choicesFromDecisionNote('{"choices":["Postgres","MySQL","SQLite"]}');
+  console.log("CHECKER R2 generated choices",JSON.stringify(options));
+  assert.deepEqual(options.map(option=>option.label),["Postgres","MySQL","SQLite"],"the owner must not get a composite Postgres, MySQL choice");
 });

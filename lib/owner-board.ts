@@ -8,6 +8,8 @@ import { notLiveItems, notLiveLine, type NotLiveItem } from "./stalls.ts";
  * `records` holds the captain's open PRs and the ones merged since `since`. */
 export type BoardInput = {
   asks: readonly OwnerAsk[];
+  /** Owner answers that never reached their crew. */
+  undelivered?: readonly { crewId: string }[];
   calls: readonly string[];
   tasks: readonly OwnerTask[];
   records: readonly DeliveryRecord[];
@@ -104,6 +106,7 @@ function collect(input: BoardInput, ref: PrRef, listDone: (key: string) => boole
   const waiting = tasks.filter((task) => task.state === "needs_you" || task.state === "ready" || task.state === "check");
   const ownerPrs = open.filter((pr) => !linked.has(pr.ref) && pr.needsOwner);
   const needsYou = [
+    ...(input.undelivered ?? []).map((item) => `answer not delivered to crew ${item.crewId}`),
     ...asks.map((ask) => askLine(ask, input.now)),
     ...input.calls.map((call) => clip(call, 160)),
     ...waiting.map((task) => taskLine(task, input.now, ref, { state: WAITING_WORDS[task.state], prs: folded(task) })),

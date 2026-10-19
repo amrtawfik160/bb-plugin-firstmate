@@ -395,6 +395,11 @@ export function createOwnerTasks(db: Database, heldOpen: HeldOpen = () => null, 
         const task = owned(id, captain);
         const held = GUARDED.has(move.to) && task.state !== move.to ? heldOpen(task, move.to, move) : null;
         if (held !== null) throw new Error(held);
+        if (task.state === move.to) {
+          const outcome = "reason" in move ? move.reason?.trim() : "";
+          if (!outcome || task.outcome === outcome) return task;
+          return save({ ...task, outcome, updatedAt: at });
+        }
         const next = moveTask(task, move, at);
         if (next === task) return task;
         if (isFinishedTask(task) && !isFinishedTask(next)) {

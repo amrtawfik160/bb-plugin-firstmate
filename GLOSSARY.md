@@ -41,7 +41,7 @@ _Avoid_: done, complete, closed
 ## Workstreams
 
 **Workstream**:
-A long piece of work in one project that holds many tasks, with one Telegram topic, one worktree and branch per repository, and one dev link. It ends when all its tasks are Live or Dropped.
+A long piece of work in one project that holds many tasks, with one Telegram topic. Create provisions one worktree and branch per repository and one dev link. Adopt groups existing open tasks into a topic without new worktrees; running crews keep their worktrees, branches, PRs and dev links. It ends when all its tasks are Live or Dropped.
 _Avoid_: big task, epic, project (for the workstream itself)
 
 **Ship**:

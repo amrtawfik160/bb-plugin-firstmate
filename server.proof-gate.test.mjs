@@ -224,6 +224,26 @@ test('a second build at the same head opens its own card and replaces the first;
 
 // Checker round 2: Telegram may record the tap after Firstmate first asks. The card's binding is kept, and
 // Firstmate reads the connector again, until the proof is recorded or the card closes.
+test('a Works tap with no tap record tells the crew and captain',async()=>{
+ process.env.FM_PROOF_RECHECK_MS='5,5';
+ const {host,store}=await deck();try {
+  const asked=text(await deliveries(host,{action:'device-proof',id:key(WOO,130),commitSha:head(130).slice(0,7),build:'8',link:'https://testflight.apple.com/join/abc',check:'Send a photo'},'thr_woo'));
+  const askId=/card (a[0-9a-z]{6})/.exec(asked)[1];
+  host.harness.sdk.stub('plugins.callRpc',async(call)=>{if(call.method==='ownerAnswer')return{answer:null};return{ok:true,queued:1,duplicate:false};});
+  await host.harness.behavior.callRpc('resolveAsk',{threadId:'thr_cap',id:askId,resolution:'Works'});
+  const told=()=>host.harness.sdk.callsTo('threads.send').map(call=>call[0]).filter(m=>/Telegram has no record of the owner tapping it/.test(JSON.stringify(m)));
+  for(let i=0;i<80&&told().length===0;i++) await new Promise(r=>setTimeout(r,20));
+  assert.ok(told().some(m=>m.threadId==='thr_woo'),'the crew is told');
+  assert.ok(told().some(m=>m.threadId==='thr_cap'),'the captain is told');
+  assert.equal(store.get(key(WOO,130)).verifiedCommitSha,null);
+  assert.ok(await host.bb.storage.kv.get(`device-proof:${askId}`),'the card stays bound for a later tap record');
+  const recheck=await host.bb.storage.kv.get(`device-proof-recheck:${askId}`);
+  assert.ok(recheck && recheck.attempts>=2 && recheck.told===true,'the re-read count is durable');
+  await host.harness.behavior.runSchedule('task-lifecycle');
+  assert.equal(told().length,2,'crew and captain are told once each');
+ }finally{delete process.env.FM_PROOF_RECHECK_MS;await host.harness.lifecycle.dispose();}
+});
+
 test('a Works tap that Telegram records late still becomes the proof',async()=>{
  process.env.FM_PROOF_RECHECK_MS='20,20,20';
  const {host,store,rpc}=await deck();try {
