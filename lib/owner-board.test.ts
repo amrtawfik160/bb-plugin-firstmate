@@ -86,6 +86,13 @@ test("the board shows what needs the owner, what finished since they last looked
   ].join("\n"));
 });
 
+test("the board shows when an owner answer was not delivered to a crew", () => {
+  assert.match(
+    formatBoard(input({ undelivered: [{ crewId: "wait1" }] })),
+    /^📌 Needs you \(1\)\n1\. answer not delivered to crew wait1\n/,
+  );
+});
+
 test("an empty board is three short lines", () => {
   assert.equal(formatBoard(input()), [
     "📌 Needs you: nothing right now.",
