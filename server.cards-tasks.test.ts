@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -74,6 +75,16 @@ const text = (out: unknown) => typeof out === "string" ? out : (out as { content
 const askCards = (rpc: Call[]) => rpc.filter((call) => call.method === "ask");
 const decided = (choice: string, confidence: number) => async () => new Response(JSON.stringify({ answers: [{ name: "answered_by_rule", choice, confidence }] }), { status: 200 });
 
+test("firstmate_ask refuses a question with no options", async () => {
+  const { host, rpc, asks, restore } = await captainHost();
+  try {
+    const refused = text(await tool(host, "firstmate_ask").execute({ question: "waiting for owner answers to N4-N7", kind: "question", project: "Cyndra" }, ctx));
+    assert.match(refused, /Refusing: a question card needs options\. Status belongs on the task, not as an open card/);
+    assert.equal(askCards(rpc).length, 0);
+    assert.equal(asks.listOpen("thr_cap").length, 0);
+  } finally { restore(); await host.harness.lifecycle.dispose(); }
+});
+
 test("a card without a project is refused; a card for a task takes the task's project", async () => {
   const { host, rpc, tasks, restore } = await captainHost();
   try {
@@ -121,7 +132,7 @@ test("a new card on the same task and subject replaces the open one, which Teleg
   } finally { restore(); await host.harness.lifecycle.dispose(); }
 });
 
-test("the task sweep moves done reports to the captain's check, opens a card for a crew that waits on the owner, and flags a task with no crew once", async () => {
+test("the task sweep moves done reports to the captain's check, puts a crew wait on the task, and flags a task with no crew once", async () => {
   const at = 1792142546;
   const { host, rpc, tasks, asks, restore } = await captainHost({
     scout1: `working [at=${at - 600}]: reading\ndone [at=${at}]: final plan at data/scout1/plan.md\n`,
@@ -143,16 +154,15 @@ test("the task sweep moves done reports to the captain's check, opens a card for
     assert.equal(tasks.get(t204.id)!.state, "check", "an open PR not verified at its head: the next step is verify");
     assert.match(tasks.get(t204.id)!.outcome ?? "", /Next: verify cyndra-ai\/cyndra-saas#2487/);
     assert.equal(tasks.get(tWait.id)!.state, "needs_you");
-    const card = asks.listOpen("thr_cap").find((ask) => ask.task === tWait.id)!;
-    assert.match(card.text, /waiting for owner answers to N4-N7/);
-    assert.equal(card.project, "Cyndra");
-    assert.equal(rpc.filter((call) => call.method === "ask" && call.input.askId === card.id).length, 1);
+    assert.match(tasks.get(tWait.id)!.outcome ?? "", /waiting for owner answers to N4-N7/);
+    assert.equal(asks.listOpen("thr_cap").filter((ask) => ask.task === tWait.id).length, 0, "status belongs on the task, not as an open card");
+    assert.equal(rpc.filter((call) => call.method === "ask").length, 0);
     const flags = () => host.harness.sdk.callsTo("threads.send").map((call) => JSON.stringify(call[0])).filter((m) => m.includes("TASK WITHOUT CREW"));
     assert.equal(flags().length, 1);
     assert.match(flags()[0]!, new RegExp(`task ${t200.id} \\(Fix Humza's 4 Cyndra bugs\\)`));
     await host.harness.behavior.runSchedule("task-lifecycle");
     assert.equal(flags().length, 1, "flagged once");
-    assert.equal(asks.listOpen("thr_cap").filter((ask) => ask.task === tWait.id).length, 1, "one card per crew question");
+    assert.equal(asks.listOpen("thr_cap").filter((ask) => ask.task === tWait.id).length, 0, "a second sweep still opens no card");
   } finally { restore(); await host.harness.lifecycle.dispose(); }
 });
 
@@ -164,24 +174,27 @@ test("the sweep opens no crew card when the captain already sent a card bound to
   try {
     await host.bb.storage.kv.set("crews", [crewRow("wait1", "thr_w1")]);
     const task = tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Slug max", sourceRefs: ["tg:1:1"], crewId: "wait1", at: Date.now() });
-    asks.create({ captain: "thr_cap", kind: "question", text: "PR #6: the repo is gone. What should we do?", options: [], createdAt: at * 1000 + 60_000, project: "Cyndra", task: task.id });
+    asks.create({ captain: "thr_cap", kind: "question", text: "PR #6: the repo is gone. What should we do?", options: [{ label: "Restore it", value: "A" }, { label: "Drop the task", value: "B" }], createdAt: at * 1000 + 60_000, project: "Cyndra", task: task.id });
     await host.harness.behavior.runSchedule("task-lifecycle");
     assert.equal(asks.listOpen("thr_cap").length, 1, "no second card");
     assert.equal(rpc.filter((call) => call.method === "ask").length, 0);
     assert.equal(tasks.get(task.id)!.state, "needs_you", "the task still shows it waits on the owner");
+    assert.match(tasks.get(task.id)!.outcome ?? "", /need owner to restore the repo/);
   } finally { restore(); await host.harness.lifecycle.dispose(); }
 });
 
 // Checker FF2-verdict-1, #145 finding 1: a newer card about other work does not stand for the crew's question.
-test("a newer card on another task or project does not stop the crew's own question card", async () => {
+test("a newer card on another task or project does not stand in for the crew wait; the wait is on the task", async () => {
   const at = Math.floor(Date.now() / 1000) - 600;
   const { host, tasks, asks, restore } = await captainHost({ wait1: `blocked [at=${at}]: need owner to restore the repo\n` });
   try {
     await host.bb.storage.kv.set("crews", [crewRow("wait1", "thr_w1")]);
     const task = tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Slug max", sourceRefs: ["tg:1:1"], crewId: "wait1", at: Date.now() });
-    asks.create({ captain: "thr_cap", kind: "question", text: "Safi icon: blue or green?", options: [], createdAt: at * 1000 + 60_000, project: "Safi" });
+    asks.create({ captain: "thr_cap", kind: "question", text: "Safi icon: blue or green?", options: [{ label: "Blue", value: "A" }, { label: "Green", value: "B" }], createdAt: at * 1000 + 60_000, project: "Safi" });
     await host.harness.behavior.runSchedule("task-lifecycle");
-    assert.equal(asks.listOpen("thr_cap").filter((ask) => ask.task === task.id).length, 1, "exactly one card for the Cyndra question");
+    assert.equal(asks.listOpen("thr_cap").filter((ask) => ask.task === task.id).length, 0, "the crew wait is not a card");
+    assert.equal(tasks.get(task.id)!.state, "needs_you");
+    assert.match(tasks.get(task.id)!.outcome ?? "", /need owner to restore the repo/);
   } finally { restore(); await host.harness.lifecycle.dispose(); }
 });
 
@@ -241,16 +254,17 @@ test("a task whose two registered crews both reported done advances; one still w
 
 // Checker round 2: a newer standalone card on the same project (Cyndra icons) is about other work. Only a card
 // bound to the crew's task suppresses its question; otherwise both cards go out.
-test("a newer standalone card on the same project does not suppress a crew's question card", async () => {
+test("a newer standalone card on the same project does not suppress the crew wait on the task", async () => {
   const at = Math.floor(Date.now() / 1000) - 600;
   const { host, tasks, asks, restore } = await captainHost({ wait1: `blocked [at=${at}]: need owner to restore its repo\n` });
   try {
     await host.bb.storage.kv.set("crews", [crewRow("wait1", "thr_w1")]);
     const task = tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Slug max", sourceRefs: ["tg:1:1"], crewId: "wait1", at: Date.now() });
-    asks.create({ captain: "thr_cap", kind: "question", text: "Cyndra icons: outline or filled?", options: [], createdAt: at * 1000 + 60_000, project: "Cyndra" });
+    asks.create({ captain: "thr_cap", kind: "question", text: "Cyndra icons: outline or filled?", options: [{ label: "Outline", value: "A" }, { label: "Filled", value: "B" }], createdAt: at * 1000 + 60_000, project: "Cyndra" });
     await host.harness.behavior.runSchedule("task-lifecycle");
-    assert.equal(asks.listOpen("thr_cap").filter((ask) => ask.task === task.id).length, 1, "the crew's own card goes out");
-    assert.equal(asks.listOpen("thr_cap").length, 2, "both cards stay open");
+    assert.equal(asks.listOpen("thr_cap").filter((ask) => ask.task === task.id).length, 0, "the crew wait is not a card");
+    assert.equal(asks.listOpen("thr_cap").length, 1, "the standalone card stays open");
+    assert.equal(tasks.get(task.id)!.state, "needs_you");
   } finally { restore(); await host.harness.lifecycle.dispose(); }
 });
 
@@ -260,8 +274,14 @@ test("closeAsk releases only its crew's native captain hold without changing the
   try {
     await host.bb.storage.kv.set("crews", [crewRow("wait1", "thr_w1")]);
     const task = tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Database", sourceRefs: [], crewId: "wait1", at: Date.now() });
+    const note = "Choose a database?";
+    const card = asks.create({
+      captain: "thr_cap", kind: "question", text: note,
+      options: [{ label: "Postgres", value: "A" }, { label: "SQLite", value: "B" }],
+      sourceRef: `crew-wait:wait1:${createHash("sha256").update(note).digest("hex").slice(0, 16)}`,
+      createdAt: Date.now(), project: "Cyndra", task: task.id,
+    });
     await host.harness.behavior.runSchedule("task-lifecycle");
-    const card = asks.listOpen("thr_cap")[0]!;
     const before = tasks.get(task.id);
     const input = { threadId: "thr_cap", ids: [card.id] };
     await host.harness.behavior.callRpc("closeAsk", input);
@@ -280,9 +300,15 @@ test("closeAsk retries a failed native release after its captain notice succeede
   const { host, tasks, asks, restore } = await captainHost({ wait1: "needs-decision [key=choose]: Choose?\n" }, { nativeAnswer: () => ++attempts === 1 ? 1 : 0 });
   try {
     await host.bb.storage.kv.set("crews", [crewRow("wait1", "thr_w1")]);
-    tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Choose", sourceRefs: [], crewId: "wait1", at: Date.now() });
+    const task = tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Choose", sourceRefs: [], crewId: "wait1", at: Date.now() });
+    const note = "Choose?";
+    const card = asks.create({
+      captain: "thr_cap", kind: "question", text: note,
+      options: [{ label: "A", value: "A" }, { label: "B", value: "B" }],
+      sourceRef: `crew-wait:wait1:${createHash("sha256").update(note).digest("hex").slice(0, 16)}`,
+      createdAt: Date.now(), project: "Cyndra", task: task.id,
+    });
     await host.harness.behavior.runSchedule("task-lifecycle");
-    const card = asks.listOpen("thr_cap")[0]!;
     const input = { threadId: "thr_cap", ids: [card.id] };
     const count = () => host.harness.sdk.callsTo("threads.send").filter((call) => JSON.stringify(call).includes("Owner closed card")).length;
     await host.harness.behavior.callRpc("closeAsk", input);
@@ -300,7 +326,14 @@ test("closeAsk releases a crew work row held for its sole keyed question", async
   const { host, tasks, asks, restore } = await captainHost({ wait1: "needs-decision [key=choice]: Choose?\n" });
   try {
     await host.bb.storage.kv.set("crews", [crewRow("wait1", "thr_w1")]);
-    tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Choose", sourceRefs: [], crewId: "wait1", at: Date.now() });
+    const task = tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Choose", sourceRefs: [], crewId: "wait1", at: Date.now() });
+    const note = "Choose?";
+    asks.create({
+      captain: "thr_cap", kind: "question", text: note,
+      options: [{ label: "A", value: "A" }, { label: "B", value: "B" }],
+      sourceRef: `crew-wait:wait1:${createHash("sha256").update(note).digest("hex").slice(0, 16)}`,
+      createdAt: Date.now(), project: "Cyndra", task: task.id,
+    });
     await host.harness.behavior.runSchedule("task-lifecycle");
     const byId = new Map<string, string>();
     let n = 0;

@@ -133,7 +133,7 @@ test("a finished crew with an open owner card on its task or an unanswered decis
     await host.bb.storage.kv.set("crews", [crewRow("card1", "thr_card"), crewRow("ask1", "thr_ask"), crewRow("gone1", "thr_gone")]);
     const tasks = createOwnerTasks(host.bb.storage.database());
     const task = tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Reachloop plan", sourceRefs: ["tg:1:1"], crewId: "card1", at: Date.now() });
-    createOwnerAsks(host.bb.storage.database()).create({ captain: "thr_cap", kind: "question", text: "Which plan?", options: [], createdAt: Date.now(), project: "Cyndra", task: task.id });
+    createOwnerAsks(host.bb.storage.database()).create({ captain: "thr_cap", kind: "question", text: "Which plan?", options: [{ label: "A", value: "A" }, { label: "B", value: "B" }], createdAt: Date.now(), project: "Cyndra", task: task.id });
     await host.bb.storage.kv.set("decisions", [
       { id: "d1", parentThreadId: "thr_cap", question: "Ship v2?", crewId: "ask1", status: "deferred", createdAt: "2026-10-18T00:00:00.000Z" },
       { id: "d2", parentThreadId: "thr_cap", question: "Old?", crewId: "gone1", status: "answered", answer: "yes", createdAt: "2026-10-17T00:00:00.000Z" },

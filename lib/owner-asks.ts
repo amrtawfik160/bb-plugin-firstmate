@@ -263,6 +263,9 @@ export function createOwnerAsks(db: Database): OwnerAsks {
   }
 
   function create(input: NewOwnerAsk): OwnerAsk {
+    if (input.kind === "question" && input.options.length === 0) {
+      throw new Error("A question card needs options. Status belongs on the task, not as an open card.");
+    }
     let id = input.id ?? newAskId();
     while (input.id === undefined && get(id)) id = newAskId();
     const ask: OwnerAsk = {

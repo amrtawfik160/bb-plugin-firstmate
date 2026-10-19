@@ -86,6 +86,18 @@ test("an owner confirmation stamps a card the captain already answered", () => {
   assert.equal(asks.answeredByOwner("a1"), true);
 });
 
+test("create refuses a question with no options; a blocker with no options is stored", () => {
+  const asks = createOwnerAsks(db());
+  assert.throws(
+    () => asks.create({ id: "a1", captain: "thr_cap", kind: "question", text: "waiting for owner answers", options: [], createdAt: NOW }),
+    /A question card needs options\. Status belongs on the task, not as an open card\./,
+  );
+  assert.equal(asks.get("a1"), undefined);
+  const blocker = asks.create({ id: "a2", captain: "thr_cap", kind: "blocker", text: "Need the Stripe key.", options: [], createdAt: NOW });
+  assert.equal(blocker.state, "open");
+  assert.equal(blocker.options.length, 0);
+});
+
 test("old ask databases migrate without losing open asks and unparsed decisions link from the board", () => {
   const database = db();
   database.exec(`CREATE TABLE owner_ask (id TEXT PRIMARY KEY, captain TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL, options TEXT NOT NULL, recommended INTEGER, default_at INTEGER, irreversible INTEGER NOT NULL, state TEXT NOT NULL, resolution TEXT, created_at INTEGER NOT NULL, resolved_at INTEGER);
@@ -95,7 +107,7 @@ test("old ask databases migrate without losing open asks and unparsed decisions 
   database.prepare("INSERT INTO owner_ask VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run("arollback", "thr_other", "question", "Old plugin still asks?", "[]", null, null, 0, "open", null, NOW, null);
   assert.equal(asks.get("arollback")?.text, "Old plugin still asks?");
   assert.equal(database.prepare("PRAGMA table_info(owner_ask)").all().length, 12);
-  const result = asks.create({ id: "anew", captain: "thr_cap", kind: "question", text: "Approve cleanup?", options: [], sourceRef: "tg:200:3004:decision:0", messageUrl: "https://t.me/c/200/3004", createdAt: NOW });
+  const result = asks.create({ id: "anew", captain: "thr_cap", kind: "question", text: "Approve cleanup?", options: [{ label: "Yes", value: "yes" }], sourceRef: "tg:200:3004:decision:0", messageUrl: "https://t.me/c/200/3004", createdAt: NOW });
   assert.equal(result.id, "anew");
   assert.equal(formatBoard({ asks: [result], calls: [], tasks: [], records: [], since: 0, now: NOW }), [
     "📌 Needs you (1)",

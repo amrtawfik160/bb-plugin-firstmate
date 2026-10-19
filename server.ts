@@ -5977,7 +5977,7 @@ export default async function plugin(bb: BbPluginApi) {
           else {
             bb.log.info(`task ${task.id}: crew ${crew.id} waits on the owner; card ${asked.id} already asks, no new card`);
             const current = ownerTasks.get(task.id);
-            if (current !== undefined && isOpenTask(current) && current.state !== "needs_you") ownerTasks.move(task.id, captain, { to: "needs_you", reason: latest.note }, now);
+            if (current !== undefined && isOpenTask(current)) ownerTasks.move(task.id, captain, { to: "needs_you", reason: latest.note }, now);
           }
           changed = true;
         }
@@ -6060,16 +6060,9 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function askForCrew(captain: string, task: OwnerTask, crew: Crew, note: string, now: number): Promise<void> {
-    const sourceRef = `crew-wait:${statusKey(crew.id, note)}`;
-    const project = task.project ?? await projectLabel(crew.projectId) ?? undefined;
-    const ask = ownerAsks.create({ captain, kind: "question", text: `${clip(task.title, 60)}: ${clip(note, 900)}`, options: [], sourceRef, createdAt: now,
-      ...(project ? { project } : {}), task: task.id, subject: cardSubject(`${clip(task.title, 60)}: x`) });
-    const replaced = await replaceOpenCards(ask);
-    if (isOpenTask(task) && task.state !== "needs_you") ownerTasks.move(task.id, captain, { to: "needs_you", reason: note }, now);
-    const failed = (await reliabilityFlags()).telegramThreading === "on" ? await sendAskCard(ask, { ...(project ? { project } : {}), task: task.id }) : "";
-    const warning = failed === "" ? "" : ` It was not sent to Telegram (${failed}).`;
-    bb.log.info(`task ${task.id}: crew ${crew.id} waits on the owner; card ${ask.id} opened`);
-    await deliverToCaptain(captain, `CREW QUESTION CARD: crew ${crew.id} waits on the owner for task ${task.id}, so card ${ask.id} carries its question to him${replaced.length > 0 ? ` (replacing ${replaced.join(", ")})` : ""}.${warning} When he answers, pass the answer to the crew with firstmate_tell.`, crew.id).catch((error) => bb.log.warn(`crew question note: ${String(error)}`));
+    if (isOpenTask(task)) ownerTasks.move(task.id, captain, { to: "needs_you", reason: note }, now);
+    bb.log.info(`task ${task.id}: crew ${crew.id} waits on the owner; status on the task, no card`);
+    await deliverToCaptain(captain, `CREW WAITING ON OWNER: crew ${crew.id} waits on the owner for task ${task.id}: ${clip(note, 400)}. When he answers, pass the answer to the crew with firstmate_tell.`, crew.id).catch((error) => bb.log.warn(`crew wait note: ${String(error)}`));
   }
 
   async function projectLabel(projectId: string | undefined): Promise<string | null> {
@@ -14418,6 +14411,9 @@ export default async function plugin(bb: BbPluginApi) {
       const cardText = kind === "approval" ? approvalCardText(question, targets) : question.trim();
       if (cardText.length > 1500) return toolError("Refusing: question plus the exact PR list exceeds 1500 characters. Shorten the question; the PR list is never truncated.");
       const choices = kind === "approval" ? APPROVAL_CHOICES.map(option => ({...option})) : (options ?? []).map((option, index) => ({ label: option.label, value: option.value ?? String.fromCharCode(65 + index) }));
+      if (kind === "question" && choices.length === 0) {
+        return toolError("Refusing: a question card needs options. Status belongs on the task, not as an open card. Nothing was sent.");
+      }
       if (recommended !== undefined && recommended >= choices.length) return toolError(`recommended must be the index of one of the ${choices.length} option(s).`);
       const newWork = startsNewWork === true;
       const gated = !mayDefault({ kind: kind as AskKind, irreversible: irreversible === true, startsNewWork: newWork });

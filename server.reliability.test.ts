@@ -1399,7 +1399,7 @@ test("telegramCommand board lists open asks then crew items, and reports /afk as
     const at = Date.UTC(2026, 9, 7, 14, 30);
     asks(host).create({ id: "a000001", captain: "thr_cap", kind: "blocker", text: "Need the Stripe key.", options: [], createdAt: created });
     asks(host).create({ id: "a000002", captain: "thr_cap", kind: "question", text: "Dark mode?", options: [{ label: "Yes", value: "y" }], recommended: 0, defaultAt: at, createdAt: created + 1 });
-    asks(host).create({ id: "a000003", captain: "thr_other", kind: "question", text: "Not mine", options: [], createdAt: created });
+    asks(host).create({ id: "a000003", captain: "thr_other", kind: "question", text: "Not mine", options: [{ label: "Yes", value: "yes" }], createdAt: created });
     assert.deepEqual(await board(host), {
       away: true, projects: [], notLive: [],
       text: [
@@ -1426,7 +1426,7 @@ test("telegramCommand board caps the list at 15 lines", async () => {
   try {
     const created = Date.now() - 5 * 60_000;
     for (let i = 1; i <= 17; i++) {
-      asks(host).create({ id: `a0000${String(i).padStart(2, "0")}`, captain: "thr_cap", kind: "question", text: `Question ${i}?`, options: [], createdAt: created + i });
+      asks(host).create({ id: `a0000${String(i).padStart(2, "0")}`, captain: "thr_cap", kind: "question", text: `Question ${i}?`, options: [{ label: "Yes", value: "yes" }], createdAt: created + i });
     }
     assert.deepEqual(await board(host), {
       away: false, projects: [], notLive: [],
