@@ -12237,8 +12237,8 @@ for (const heldId of ["pick-one", "c1"]) test(`IT closeAsk releases real native 
     const task = tasks.open({ captain: "thr_cap", project: "Safi", title: "Database", sourceRefs: [], crewId: "c1", at: Date.now() });
     const before = tasks.get(task.id);
     const asks = createOwnerAsks(host.bb.storage.database());
-    asks.create({ id: "real-close", captain: "thr_cap", kind: "question", text: note, task: task.id, options: [], sourceRef: `crew-wait:c1:${createHash("sha256").update(note).digest("hex").slice(0, 16)}`, createdAt: Date.now() });
-    asks.create({ id: "other-close", captain: "thr_cap", kind: "question", text: "Choose a cache?", task: task.id, options: [], createdAt: Date.now() });
+    asks.create({ id: "real-close", captain: "thr_cap", kind: "question", text: note, task: task.id, options: [{ label: "Yes", value: "yes" }], sourceRef: `crew-wait:c1:${createHash("sha256").update(note).digest("hex").slice(0, 16)}`, createdAt: Date.now() });
+    asks.create({ id: "other-close", captain: "thr_cap", kind: "question", text: "Choose a cache?", task: task.id, options: [{ label: "Yes", value: "yes" }], createdAt: Date.now() });
     const input = { threadId: "thr_cap", ids: ["real-close"] };
     assert.deepEqual(await host.harness.behavior.callRpc("closeAsk", input), { ok: true, closed: ["real-close"], already: [], refused: [] });
     assert.equal(native("open", heldId).status, 1, "real native hold must be released");
@@ -12278,8 +12278,8 @@ for (const heldId of ["c1"]) test(`CHECKER shared crew hold releases after its l
     const task = tasks.open({ captain: "thr_cap", project: "Safi", title: "Database", sourceRefs: [], crewId: "c1", at: Date.now() });
     const before = tasks.get(task.id);
     const asks = createOwnerAsks(host.bb.storage.database());
-    asks.create({ id: "real-close", captain: "thr_cap", kind: "question", text: note, task: task.id, options: [], sourceRef: `crew-wait:c1:${createHash("sha256").update(note).digest("hex").slice(0, 16)}`, createdAt: Date.now() });
-    asks.create({ id: "other-close", captain: "thr_cap", kind: "question", text: "Choose a cache?", task: task.id, options: [], sourceRef: `crew-wait:c1:${createHash("sha256").update("Choose a cache?").digest("hex").slice(0, 16)}`, createdAt: Date.now() });
+    asks.create({ id: "real-close", captain: "thr_cap", kind: "question", text: note, task: task.id, options: [{ label: "Yes", value: "yes" }], sourceRef: `crew-wait:c1:${createHash("sha256").update(note).digest("hex").slice(0, 16)}`, createdAt: Date.now() });
+    asks.create({ id: "other-close", captain: "thr_cap", kind: "question", text: "Choose a cache?", task: task.id, options: [{ label: "Yes", value: "yes" }], sourceRef: `crew-wait:c1:${createHash("sha256").update("Choose a cache?").digest("hex").slice(0, 16)}`, createdAt: Date.now() });
     const input = { threadId: "thr_cap", ids: ["real-close"] };
     assert.deepEqual(await host.harness.behavior.callRpc("closeAsk", input), { ok: true, closed: ["real-close"], already: [], refused: [] });
     assert.equal(native("open", heldId).status, 0, "shared crew hold must stay while another question is open");
@@ -12313,7 +12313,7 @@ for (const fault of ["before release", "after release", "old empty plan"]) test(
     const task = tasks.open({ captain: "thr_cap", project: "Safi", title: "Shared work", sourceRefs: [], crewId: "c1", at: Date.now() });
     const before = tasks.get(task.id);
     const asks = createOwnerAsks(host.bb.storage.database());
-    for (const [id, text] of [["first", "Database?"], ["last", "Cache?"]]) asks.create({ id, captain: "thr_cap", kind: "question", text, task: task.id, options: [], sourceRef: `crew-wait:c1:${createHash("sha256").update(text).digest("hex").slice(0, 16)}`, createdAt: Date.now() });
+    for (const [id, text] of [["first", "Database?"], ["last", "Cache?"]]) asks.create({ id, captain: "thr_cap", kind: "question", text, task: task.id, options: [{ label: "Yes", value: "yes" }], sourceRef: `crew-wait:c1:${createHash("sha256").update(text).digest("hex").slice(0, 16)}`, createdAt: Date.now() });
     const close = (id: string) => host.harness.behavior.callRpc("closeAsk", { threadId: "thr_cap", ids: [id] });
     if (fault === "old empty plan") {
       // State left by the first version: both cards closed, no native resolutions, incorrectly marked released.
@@ -12387,15 +12387,15 @@ for (const heldId of ["c1"]) test(`CHECKER repeat Close must preserve an open re
     const task = tasks.open({ captain: "thr_cap", project: "Safi", title: "Database", sourceRefs: [], crewId: "c1", at: Date.now() });
     const before = tasks.get(task.id);
     const asks = createOwnerAsks(host.bb.storage.database());
-    asks.create({ id: "real-close", captain: "thr_cap", kind: "question", text: note, task: task.id, options: [], sourceRef: `crew-wait:c1:${createHash("sha256").update(note).digest("hex").slice(0, 16)}`, createdAt: Date.now() });
-    asks.create({ id: "other-close", captain: "thr_cap", kind: "question", text: "Choose a cache?", task: task.id, options: [], sourceRef: `crew-wait:c1:${createHash("sha256").update("Choose a cache?").digest("hex").slice(0, 16)}`, createdAt: Date.now() });
+    asks.create({ id: "real-close", captain: "thr_cap", kind: "question", text: note, task: task.id, options: [{ label: "Yes", value: "yes" }], sourceRef: `crew-wait:c1:${createHash("sha256").update(note).digest("hex").slice(0, 16)}`, createdAt: Date.now() });
+    asks.create({ id: "other-close", captain: "thr_cap", kind: "question", text: "Choose a cache?", task: task.id, options: [{ label: "Yes", value: "yes" }], sourceRef: `crew-wait:c1:${createHash("sha256").update("Choose a cache?").digest("hex").slice(0, 16)}`, createdAt: Date.now() });
     const input = { threadId: "thr_cap", ids: ["real-close"] };
     assert.deepEqual(await host.harness.behavior.callRpc("closeAsk", input), { ok: true, closed: ["real-close"], already: [], refused: [] });
     assert.equal(native("open", heldId).status, 0, "shared crew hold must stay while another question is open");
     assert.equal(asks.get("other-close")?.state, "open");
     const replacement = "Choose a new storage service?";
     writeFileSync(join(home, "state/c1.status"), readFileSync(join(home, "state/c1.status"), "utf8") + `needs-decision [key=pick-one]: ${replacement}\n`);
-    asks.create({ id: "replacement", captain: "thr_cap", kind: "question", text: replacement, task: task.id, options: [], sourceRef: `crew-wait:c1:${createHash("sha256").update(replacement).digest("hex").slice(0, 16)}`, createdAt: Date.now() });
+    asks.create({ id: "replacement", captain: "thr_cap", kind: "question", text: replacement, task: task.id, options: [{ label: "Yes", value: "yes" }], sourceRef: `crew-wait:c1:${createHash("sha256").update(replacement).digest("hex").slice(0, 16)}`, createdAt: Date.now() });
     const beforeRepeat = readFileSync(join(home, "state/c1.status"), "utf8");
     assert.deepEqual(await host.harness.behavior.callRpc("closeAsk", input), { ok: true, closed: [], already: ["real-close"], refused: [] });
     const { foldOpenDecisions } = await import("./lib/policy.ts");
@@ -12431,15 +12431,15 @@ for (const heldId of ["c1"]) test(`CHECKER last Close must preserve the shared h
     const task = tasks.open({ captain: "thr_cap", project: "Safi", title: "Database", sourceRefs: [], crewId: "c1", at: Date.now() });
     const before = tasks.get(task.id);
     const asks = createOwnerAsks(host.bb.storage.database());
-    asks.create({ id: "real-close", captain: "thr_cap", kind: "question", text: note, task: task.id, options: [], sourceRef: `crew-wait:c1:${createHash("sha256").update(note).digest("hex").slice(0, 16)}`, createdAt: Date.now() });
-    asks.create({ id: "other-close", captain: "thr_cap", kind: "question", text: "Choose a cache?", task: task.id, options: [], sourceRef: `crew-wait:c1:${createHash("sha256").update("Choose a cache?").digest("hex").slice(0, 16)}`, createdAt: Date.now() });
+    asks.create({ id: "real-close", captain: "thr_cap", kind: "question", text: note, task: task.id, options: [{ label: "Yes", value: "yes" }], sourceRef: `crew-wait:c1:${createHash("sha256").update(note).digest("hex").slice(0, 16)}`, createdAt: Date.now() });
+    asks.create({ id: "other-close", captain: "thr_cap", kind: "question", text: "Choose a cache?", task: task.id, options: [{ label: "Yes", value: "yes" }], sourceRef: `crew-wait:c1:${createHash("sha256").update("Choose a cache?").digest("hex").slice(0, 16)}`, createdAt: Date.now() });
     const input = { threadId: "thr_cap", ids: ["real-close"] };
     assert.deepEqual(await host.harness.behavior.callRpc("closeAsk", input), { ok: true, closed: ["real-close"], already: [], refused: [] });
     assert.equal(native("open", heldId).status, 0, "shared crew hold must stay while another question is open");
     assert.equal(asks.get("other-close")?.state, "open");
     const replacement = "Choose a new storage service?";
     writeFileSync(join(home, "state/c1.status"), readFileSync(join(home, "state/c1.status"), "utf8") + `needs-decision [key=pick-one]: ${replacement}\n`);
-    asks.create({ id: "replacement", captain: "thr_cap", kind: "question", text: replacement, task: task.id, options: [], sourceRef: `crew-wait:c1:${createHash("sha256").update(replacement).digest("hex").slice(0, 16)}`, createdAt: Date.now() });
+    asks.create({ id: "replacement", captain: "thr_cap", kind: "question", text: replacement, task: task.id, options: [{ label: "Yes", value: "yes" }], sourceRef: `crew-wait:c1:${createHash("sha256").update(replacement).digest("hex").slice(0, 16)}`, createdAt: Date.now() });
     const beforeRepeat = readFileSync(join(home, "state/c1.status"), "utf8");
     await host.harness.behavior.callRpc("closeAsk", { threadId: "thr_cap", ids: ["other-close"] });
     assert.equal(asks.get("replacement")?.state, "open");
@@ -12469,7 +12469,7 @@ test("IT pending keyed Close preserves a replacement hold after reload", async (
     writeFileSync(join(home, "state/c1.status"), "needs-decision [key=pick-one]: Database?\n");
     const { createOwnerAsks } = await import("./lib/owner-asks.ts");
     const asks = createOwnerAsks(host.bb.storage.database());
-    const create = (id: string, text: string) => asks.create({ id, captain: "thr_cap", kind: "question", text, options: [], sourceRef: `crew-wait:c1:${createHash("sha256").update(text).digest("hex").slice(0, 16)}`, createdAt: Date.now() });
+    const create = (id: string, text: string) => asks.create({ id, captain: "thr_cap", kind: "question", text, options: [{ label: "Yes", value: "yes" }], sourceRef: `crew-wait:c1:${createHash("sha256").update(text).digest("hex").slice(0, 16)}`, createdAt: Date.now() });
     create("old", "Database?");
     await host.harness.behavior.callRpc("closeAsk", { threadId: "thr_cap", ids: ["old"] });
     assert.equal(failures, 1, "the saved keyed hold release must actually fail");

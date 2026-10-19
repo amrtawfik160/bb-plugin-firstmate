@@ -135,6 +135,10 @@ const ownerMessage = (host: Host) => host.harness.inspection.registrations.hooks
   input: { blocks: [], text: envelope("live-owner") },
 } as never);
 
+async function afterDispatch() {
+  for (let i = 0; i < 12; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
 for (const [label, result] of [
   ["threaded replies are off", { queued: 0, duplicate: false, mode: "off" }],
   ["telegram.reply queues nothing", { queued: 0, duplicate: false, mode: "on" }],
@@ -144,6 +148,7 @@ for (const [label, result] of [
     try {
       host.harness.sdk.stub("plugins.callRpc", async () => result);
       await ownerMessage(host);
+      await afterDispatch();
       assert.equal(host.harness.sdk.callsTo("plugins.callRpc").length, 1);
       assert.equal(ledgerRow(host, "1669")?.state, "received");
       assert.equal(createInboundLedger(host.bb.storage.database()).outboxGet({ source: "telegram", chatId: "200", messageId: "1669" }, "ack"), undefined);
@@ -163,7 +168,9 @@ for (const [label, threading, stub] of [
       await host.harness.behavior.setSettings({ fmReliability: JSON.stringify({ inboundLedger: "on", telegramThreading: threading }) });
       host.harness.sdk.stub("plugins.callRpc", stub ?? (async () => ({ queued: 1, duplicate: false, mode: "on" })));
       await ownerMessage(host);
+      await afterDispatch();
       await ownerMessage(host);
+      await afterDispatch();
       assert.equal(ledgerRow(host, "1669")?.state, "received");
       assert.equal(createInboundLedger(host.bb.storage.database()).outboxGet({ source: "telegram", chatId: "200", messageId: "1669" }, "ack"), undefined);
       assert.ok(host.harness.sdk.callsTo("plugins.callRpc").filter(([args]) => (args as { method: string }).method === "reply").length <= 1, "a missing sender is not asked again");
@@ -178,6 +185,7 @@ test("a delivered ack marks the item acknowledged", async () => {
   try {
     host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
     await ownerMessage(host);
+    await afterDispatch();
     assert.equal(ledgerRow(host, "1669")?.state, "acked");
   } finally {
     await host.harness.lifecycle.dispose();
@@ -1234,6 +1242,7 @@ test("only a letter reply to an ask card answers that ask and refreshes the boar
     const answered = asks(host).get("a000001")!;
     assert.equal(answered.state, "answered");
     assert.equal(answered.resolution, "Yes");
+    await afterDispatch();
     assert.equal(rpcCalls(host).filter((c) => c.method === "refreshBoard").length, 1);
     const header = parseInboundTelegram(askReply("a000001", "Yes"))!;
     const row = createInboundLedger(host.bb.storage.database()).get({ source: "telegram", chatId: header.chatId, messageId: header.messageId });
@@ -1274,6 +1283,44 @@ test("a pack answer resolves each card it lists and raises no unanswered reminde
   }
 });
 
+test("a button tap decides inside a second even when Telegram never answers, and a repeat of the same tap applies once", async () => {
+  const host = await captainHost();
+  try {
+    host.harness.sdk.stub("plugins.callRpc", () => new Promise(() => {}));
+    host.harness.sdk.stub("threads.send", () => new Promise(() => {}));
+    const opts = [{ label: "Yes", value: "yes" }, { label: "No", value: "no" }];
+    asks(host).create({ id: "a000001", captain: "thr_cap", kind: "question", text: "Ship it?", options: opts, recommended: 0, createdAt: 1 });
+    const hook = host.harness.inspection.registrations.hooks["message.dispatch"]!;
+    const tap = askReply("a000001", "a.");
+    const dispatch = () => hook({
+      thread: makeThreadResponse({ id: "thr_cap", status: "active" }),
+      attempt: "join-turn", initiator: "user", senderThreadId: null, queuedMessages: [],
+      input: { blocks: [], text: tap },
+    } as never);
+    const started = Date.now();
+    const first = await Promise.race([
+      dispatch(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("dispatch hook did not decide within 1000ms")), 1000)),
+    ]);
+    assert.equal((first as { action: string }).action, "proceed");
+    assert.ok(Date.now() - started < 1000, "the hook must return well inside BB's 10 s limit");
+    const stored = asks(host).get("a000001")!;
+    assert.equal(stored.state, "answered");
+    assert.equal(stored.resolution, "Yes");
+    const resolvedAt = stored.resolvedAt;
+    const second = await Promise.race([
+      dispatch(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("repeat dispatch hook did not decide within 1000ms")), 1000)),
+    ]);
+    assert.equal((second as { action: string }).action, "proceed");
+    assert.equal(asks(host).get("a000001")?.resolution, "Yes");
+    assert.equal(asks(host).get("a000001")?.resolvedAt, resolvedAt);
+    assert.equal(asks(host).answeredByOwner("a000001"), true);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 // Checker 159 finding 1: a skip notice that failed is sent when the captain goes idle, even with no new request.
 test("a captain idle sends a skip notice whose first send failed, once", async () => {
   const host = await knownCaptainHost();
@@ -1290,6 +1337,28 @@ test("a captain idle sends a skip notice whose first send failed, once", async (
     await captainIdle(host);
     const notices = host.harness.sdk.callsTo("threads.send").map((c) => (c[0] as { input: Array<{ text: string }> }).input[0]?.text ?? "").filter((text) => /skipped ask a000009/.test(text));
     assert.equal(notices.length, 2, "one failed send, then exactly one delivered notice");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a default notice whose send failed is sent at the next idle, once", async () => {
+  const host = await knownCaptainHost();
+  try {
+    await telegramFlags(host);
+    connectorOk(host);
+    host.harness.sdk.stub("threads.list", async () => []);
+    const opts = [{ label: "Use Postgres", value: "pg" }, { label: "Use SQLite", value: "sqlite" }];
+    asks(host).create({ id: "a000001", captain: "thr_cap", kind: "question", text: "Which DB?", options: opts, recommended: 0, defaultAt: Date.now() - 60_000, createdAt: 1 });
+    let fail = true;
+    host.harness.sdk.stub("threads.send", async () => { if (fail) throw new Error("BB down"); return {}; });
+    await captainIdle(host);
+    fail = false;
+    await captainIdle(host);
+    await captainIdle(host);
+    const notices = host.harness.sdk.callsTo("threads.send").map((c) => (c[0] as { input: Array<{ text: string }> }).input[0]?.text ?? "").filter((text) => /No answer to ask a000001/.test(text));
+    assert.equal(notices.length, 2, "one failed send, then exactly one delivered notice");
+    assert.equal(asks(host).get("a000001")?.state, "defaulted");
   } finally {
     await host.harness.lifecycle.dispose();
   }
@@ -1352,7 +1421,7 @@ test("telegramCommand board lists open asks then crew items, and reports /afk as
     const at = Date.UTC(2026, 9, 7, 14, 30);
     asks(host).create({ id: "a000001", captain: "thr_cap", kind: "blocker", text: "Need the Stripe key.", options: [], createdAt: created });
     asks(host).create({ id: "a000002", captain: "thr_cap", kind: "question", text: "Dark mode?", options: [{ label: "Yes", value: "y" }], recommended: 0, defaultAt: at, createdAt: created + 1 });
-    asks(host).create({ id: "a000003", captain: "thr_other", kind: "question", text: "Not mine", options: [], createdAt: created });
+    asks(host).create({ id: "a000003", captain: "thr_other", kind: "question", text: "Not mine", options: [{ label: "Yes", value: "yes" }], createdAt: created });
     assert.deepEqual(await board(host), {
       away: true, projects: [], notLive: [],
       text: [
@@ -1379,7 +1448,7 @@ test("telegramCommand board caps the list at 15 lines", async () => {
   try {
     const created = Date.now() - 5 * 60_000;
     for (let i = 1; i <= 17; i++) {
-      asks(host).create({ id: `a0000${String(i).padStart(2, "0")}`, captain: "thr_cap", kind: "question", text: `Question ${i}?`, options: [], createdAt: created + i });
+      asks(host).create({ id: `a0000${String(i).padStart(2, "0")}`, captain: "thr_cap", kind: "question", text: `Question ${i}?`, options: [{ label: "Yes", value: "yes" }], createdAt: created + i });
     }
     assert.deepEqual(await board(host), {
       away: false, projects: [], notLive: [],
@@ -1904,4 +1973,104 @@ test("a crew that fails, stops, finishes or is archived hands its owner messages
       await host.harness.lifecycle.dispose();
     }
   }
+});
+
+test("checker 169: replay after restart recovers deferred device proof work", async () => {
+  // These are the persisted rows at the crash boundary: answer committed, follow-up not run.
+  const host = await captainHost();
+  try {
+    const store = asks(host);
+    store.create({ id: "a000001", captain: "thr_cap", kind: "question", text: "Does build 21 work?", options: [{label:"Works",value:"works"},{label:"Does not work",value:"no"}], createdAt: 1 });
+    store.resolve("a000001", "thr_cap", "answered", "Does not work", 123, "owner");
+    await host.bb.storage.kv.set("device-proof:a000001", {captain:"thr_cap",pr:"owner/repo#1",head:"a".repeat(40),build:"21",crewId:"crew1",surface:"iphone"});
+    connectorOk(host);
+    const hook = host.harness.inspection.registrations.hooks["message.dispatch"]!;
+    await hook({thread:makeThreadResponse({id:"thr_cap",status:"active"}),attempt:"join-turn",initiator:"user",senderThreadId:null,queuedMessages:[],input:{blocks:[],text:askReply("a000001","b.")}} as never);
+    await afterDispatch();
+    assert.equal(store.get("a000001")?.resolvedAt,123,"a restart replay must not reapply the answer");
+    assert.equal(await host.bb.storage.kv.get("device-proof:a000001"), undefined, "the durable deferred work must run after replay, so a failed build reaches the crew and captain");
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("startup drain recovers deferred device proof work without a new tap", async () => {
+  const host = await captainHost();
+  try {
+    const store = asks(host);
+    store.create({ id: "a000001", captain: "thr_cap", kind: "question", text: "Does build 21 work?", options: [{label:"Works",value:"works"},{label:"Does not work",value:"no"}], createdAt: 1 });
+    store.resolve("a000001", "thr_cap", "answered", "Does not work", 123, "owner");
+    await host.bb.storage.kv.set("device-proof:a000001", {captain:"thr_cap",pr:"owner/repo#1",head:"a".repeat(40),build:"21",crewId:"crew1",surface:"iphone"});
+    const reloaded = await host.harness.lifecycle.reload(plugin);
+    try {
+      await afterDispatch();
+      assert.equal(asks(reloaded).get("a000001")?.resolvedAt, 123, "startup must not reapply the answer");
+      assert.equal(await reloaded.bb.storage.kv.get("device-proof:a000001"), undefined, "startup must run the deferred proof work");
+    } finally { await reloaded.harness.lifecycle.dispose(); }
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+const checkerR2Tap = (host: Host, id: string, letter = "a.") => host.harness.inspection.registrations.hooks["message.dispatch"]!({
+  thread:makeThreadResponse({id:"thr_cap",status:"active"}),attempt:"join-turn",initiator:"user",senderThreadId:null,queuedMessages:[],input:{blocks:[],text:askReply(id,letter)}
+} as never);
+const checkerR2Card = (host: Host, id: string) => asks(host).create({id,captain:"thr_cap",kind:"question",text:"Choose?",options:[{label:"Yes",value:"yes"},{label:"No",value:"no"}],createdAt:1});
+
+test("checker round2: a failed board effect remains pending with its error", async () => {
+  const host=await captainHost();
+  try {
+    checkerR2Card(host,"a000001");
+    host.harness.sdk.stub("plugins.callRpc",async (call: {method:string}) => {if(call.method==="refreshBoard") throw new Error("board offline");return {ok:true,queued:1,mode:"on"};});
+    await checkerR2Tap(host,"a000001");await afterDispatch();
+    const pending=asks(host).pendingFollowUps();
+    console.log("CHECKER R2 failed board",JSON.stringify(pending));
+    assert.ok(pending.some(job=>job.askId==="a000001"&&job.effect==="refresh-board"&&job.error?.includes("board offline")),"failed board refresh must stay pending and expose its error");
+  } finally {await host.harness.lifecycle.dispose();}
+});
+
+test("checker round2: an unresponsive board cannot starve another card's proof work", async () => {
+  const host=await captainHost();
+  let release = () => {};
+  const blocked = new Promise<void>(resolve => { release=resolve; });
+  try {
+    checkerR2Card(host,"a000001");
+    host.harness.sdk.stub("plugins.callRpc", async (call: {method:string}) => {if(call.method==="refreshBoard") await blocked;return {ok:true,queued:1,mode:"on"};});
+    await checkerR2Tap(host,"a000001");await afterDispatch();
+    asks(host).create({id:"a000002",captain:"thr_cap",kind:"question",text:"Does build 22 work?",options:[{label:"Works",value:"works"},{label:"Does not work",value:"no"}],createdAt:2});
+    await host.bb.storage.kv.set("device-proof:a000002",{captain:"thr_cap",pr:"owner/repo#2",head:"a".repeat(40),build:"22",crewId:"crew1",surface:"iphone"});
+    await checkerR2Tap(host,"a000002","b.");await afterDispatch();
+    console.log("CHECKER R2 blocked board",JSON.stringify({secondAnswer:asks(host).get("a000002")?.resolution,pending:asks(host).pendingFollowUps()}));
+    assert.equal(await host.bb.storage.kv.get("device-proof:a000002"),undefined,"another card's proof effect must run even when an earlier board request never answers");
+  } finally {release();await afterDispatch();await host.harness.lifecycle.dispose();}
+});
+
+test("checker round2: connector RPC followed by restart refreshes the board only once", async () => {
+  const host=await captainHost();
+  let next: Host | undefined;
+  try {
+    checkerR2Card(host,"a000001");
+    host.harness.sdk.stub("threads.getPluginMetadata",async()=>({captain:"true"}));
+    let refreshes=0;
+    host.harness.sdk.stub("plugins.callRpc",async (call: {method:string})=>{if(call.method==="refreshBoard")refreshes++;return {ok:true,queued:1,mode:"on"};});
+    await host.harness.behavior.callRpc("resolveAsk",{threadId:"thr_cap",id:"a000001",resolution:"Yes"});
+    const first=refreshes;
+    next=await host.harness.lifecycle.reload(plugin);await afterDispatch();
+    // Each host has separate SDK inspection history.
+    const after=rpcCalls(next).filter(call=>call.method==="refreshBoard").length;
+    console.log("CHECKER R2 RPC restart",JSON.stringify({first,after}));
+    await checkerR2Tap(next,"a000001");await afterDispatch();
+    assert.equal(first+rpcCalls(next).filter(call=>call.method==="refreshBoard").length,1,"the immediate RPC refresh must not be repeated by the durable drain");
+  } finally {if(next) await next.harness.lifecycle.dispose();await host.harness.lifecycle.dispose();}
+});
+
+test("checker round2: a pending Works confirmation survives a restart", async () => {
+  const host=await captainHost();let next: Host | undefined;
+  const oldDelay=process.env.FM_PROOF_RECHECK_MS;process.env.FM_PROOF_RECHECK_MS="60000";
+  try {
+    asks(host).create({id:"a000001",captain:"thr_cap",kind:"question",text:"Does build 21 work?",options:[{label:"Works",value:"works"},{label:"Does not work",value:"no"}],createdAt:1});
+    await host.bb.storage.kv.set("device-proof:a000001",{captain:"thr_cap",pr:"owner/repo#1",head:"a".repeat(40),build:"21",crewId:"crew1",surface:"iphone"});
+    host.harness.sdk.stub("plugins.callRpc",async (call: {method:string})=>call.method==="ownerAnswer"?{answer:null}:{ok:true,queued:1,mode:"on"});
+    await checkerR2Tap(host,"a000001");await afterDispatch();
+    assert.ok(await host.bb.storage.kv.get("device-proof:a000001"));
+    console.log("CHECKER R2 unconfirmed Works",JSON.stringify({pending:asks(host).pendingFollowUps(),states:host.bb.storage.database().prepare("SELECT effect,state,error FROM owner_ask_followup").all()}));
+    next=await host.harness.lifecycle.reload(plugin);await afterDispatch();
+    assert.ok(asks(next).pendingFollowUps().some(job=>job.askId==="a000001"&&job.effect==="owner-answered"),"Works waiting for confirmation must retain durable work across restart, not only a timer");
+  } finally {if(next) await next.harness.lifecycle.dispose();await host.harness.lifecycle.dispose();if(oldDelay===undefined)delete process.env.FM_PROOF_RECHECK_MS;else process.env.FM_PROOF_RECHECK_MS=oldDelay;}
 });

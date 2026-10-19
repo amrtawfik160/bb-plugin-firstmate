@@ -36,6 +36,113 @@ export type OwnerAsk = {
 
 export type AskClosure = { closed: string[]; already: string[]; refused: string[] };
 export const OWNER_CLOSED_RESOLUTION = "closed by owner, no action";
+export const ASK_FOLLOWUP_EFFECTS = ["owner-answered", "refresh-board"] as const;
+export const ASK_FOLLOWUP_RETRY_BOUND = 8;
+export const ASK_FOLLOWUP_GIVE_UP_MS = 2 * 60 * 60_000;
+export type AskFollowUpEffect = (typeof ASK_FOLLOWUP_EFFECTS)[number];
+export type AskFollowUpState = "pending" | "done" | "failed";
+export type AskFollowUp = {
+  askId: string;
+  answerSeq: number;
+  effect: AskFollowUpEffect;
+  state: AskFollowUpState;
+  error: string | null;
+  createdAt: number;
+  attempts: number;
+  firstFailedAt: number | null;
+  noticed: boolean;
+  previous: string | null;
+  resolution: string | null;
+};
+
+/**
+ * Structured button labels from a crew report. JSON only: a whole-note array or
+ * `{choices|options:[...]}`, a trailing JSON value, or a `choices:` JSON line.
+ * Prose is not parsed and never becomes Yes/No.
+ */
+export function choicesFromCrewReport(note: string): AskOption[] | null {
+  for (const payload of structuredChoicePayloads(note)) {
+    const options = parseChoicePayload(payload);
+    if (options !== null && options.length > 0) return options;
+  }
+  return null;
+}
+
+/** Structured choices from a crew report, or none. */
+export function choicesFromDecisionNote(note: string): AskOption[] {
+  return choicesFromCrewReport(note) ?? [];
+}
+
+/** Question text with a trailing structured choices payload removed. */
+export function crewQuestionText(note: string): string {
+  const tail = jsonTail(note.trim());
+  if (tail === undefined || tail.length === note.trim().length) return note.trim();
+  return note.trim().slice(0, note.trim().length - tail.length).trim();
+}
+
+function structuredChoicePayloads(note: string): string[] {
+  const trimmed = note.trim();
+  const payloads = [trimmed];
+  for (const line of trimmed.split("\n")) {
+    const text = line.trim();
+    const prefix = "choices:";
+    if (text.length >= prefix.length && text.slice(0, prefix.length).toLowerCase() === prefix) {
+      payloads.push(text.slice(text.indexOf(":") + 1).trim());
+    }
+  }
+  const tail = jsonTail(trimmed);
+  if (tail !== undefined) payloads.push(tail);
+  return payloads;
+}
+
+function jsonTail(text: string): string | undefined {
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch !== "{" && ch !== "[") continue;
+    const slice = text.slice(i);
+    try {
+      JSON.parse(slice);
+      return slice;
+    } catch { /* keep scanning for a trailing JSON value */ }
+  }
+  return undefined;
+}
+
+function parseChoicePayload(raw: string): AskOption[] | null {
+  try {
+    const value: unknown = JSON.parse(raw);
+    const list = Array.isArray(value) ? value
+      : value !== null && typeof value === "object" && Array.isArray((value as { choices?: unknown }).choices)
+        ? (value as { choices: unknown[] }).choices
+      : value !== null && typeof value === "object" && Array.isArray((value as { options?: unknown }).options)
+        ? (value as { options: unknown[] }).options
+      : null;
+    if (list === null || list.length === 0) return null;
+    const options: AskOption[] = [];
+    for (let i = 0; i < list.length; i++) {
+      const item = list[i];
+      if (typeof item === "string") {
+        const label = item.trim();
+        if (label.length === 0 || label.length > 80) return null;
+        options.push({ label, value: String.fromCharCode(97 + i) });
+        continue;
+      }
+      if (item !== null && typeof item === "object" && typeof (item as { label?: unknown }).label === "string") {
+        const label = (item as { label: string }).label.trim();
+        if (label.length === 0 || label.length > 80) return null;
+        const value = typeof (item as { value?: unknown }).value === "string" && (item as { value: string }).value.trim() !== ""
+          ? (item as { value: string }).value
+          : String.fromCharCode(97 + i);
+        options.push({ label, value });
+        continue;
+      }
+      return null;
+    }
+    return options;
+  } catch {
+    return null;
+  }
+}
 
 export type AskDeferral = { deferred: string[]; already: string[]; refused: string[]; until: number | null };
 
@@ -176,6 +283,15 @@ export type OwnerAsks = {
   markSkipsTold(ids: readonly string[]): void;
   /** Mark this captain's overdue reversible asks defaulted and return them, each exactly once. */
   takeDue(captain: string, now: number): OwnerAsk[];
+  /** Defaulted asks whose captain has not yet been told to go ahead. */
+  untoldDefaults(captain: string): OwnerAsk[];
+  markDefaultsTold(ids: readonly string[]): void;
+  pendingFollowUps(): AskFollowUp[];
+  failedFollowUps(): AskFollowUp[];
+  markFollowUpDone(askId: string, effect: AskFollowUpEffect, answerSeq?: number): void;
+  failFollowUp(askId: string, effect: AskFollowUpEffect, error: string, now?: number, answerSeq?: number): AskFollowUpState;
+  recordFollowUpError(askId: string, effect: AskFollowUpEffect, error: string, answerSeq?: number): void;
+  claimFollowUpNotice(askId: string, effect: AskFollowUpEffect, answerSeq?: number): boolean;
 };
 
 function fromRecord(row: AskRecord): OwnerAsk {
@@ -241,7 +357,38 @@ export function createOwnerAsks(db: Database): OwnerAsks {
     CREATE TABLE IF NOT EXISTS owner_ask_route (
       id TEXT PRIMARY KEY, project TEXT, task TEXT, subject TEXT);
     CREATE TABLE IF NOT EXISTS owner_ask_close (id TEXT PRIMARY KEY, told INTEGER NOT NULL DEFAULT 0, released INTEGER NOT NULL DEFAULT 0);
-    CREATE TABLE IF NOT EXISTS owner_ask_defer (id TEXT PRIMARY KEY, until INTEGER NOT NULL, told INTEGER NOT NULL DEFAULT 0);`);
+    CREATE TABLE IF NOT EXISTS owner_ask_defer (id TEXT PRIMARY KEY, until INTEGER NOT NULL, told INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS owner_ask_followup (
+      ask_id TEXT NOT NULL, answer_seq INTEGER NOT NULL, effect TEXT NOT NULL, state TEXT NOT NULL, error TEXT, created_at INTEGER NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0, first_failed_at INTEGER, noticed INTEGER NOT NULL DEFAULT 0,
+      previous TEXT, resolution TEXT,
+      PRIMARY KEY (ask_id, answer_seq, effect));
+    CREATE TABLE IF NOT EXISTS owner_ask_default_notice (
+      id TEXT PRIMARY KEY, told INTEGER NOT NULL DEFAULT 0);`);
+  {
+    const cols = new Set((db.prepare("PRAGMA table_info(owner_ask_followup)").all() as Array<{ name: string }>).map((row) => row.name));
+    if (!cols.has("attempts")) db.exec("ALTER TABLE owner_ask_followup ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0");
+    if (!cols.has("first_failed_at")) db.exec("ALTER TABLE owner_ask_followup ADD COLUMN first_failed_at INTEGER");
+    if (!cols.has("noticed")) db.exec("ALTER TABLE owner_ask_followup ADD COLUMN noticed INTEGER NOT NULL DEFAULT 0");
+    if (!cols.has("answer_seq")) {
+      db.exec(`CREATE TABLE owner_ask_followup_new (
+        ask_id TEXT NOT NULL, answer_seq INTEGER NOT NULL, effect TEXT NOT NULL, state TEXT NOT NULL, error TEXT, created_at INTEGER NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0, first_failed_at INTEGER, noticed INTEGER NOT NULL DEFAULT 0,
+        previous TEXT, resolution TEXT,
+        PRIMARY KEY (ask_id, answer_seq, effect));
+        INSERT INTO owner_ask_followup_new (ask_id, answer_seq, effect, state, error, created_at, attempts, first_failed_at, noticed, previous, resolution)
+        SELECT f.ask_id, 1, f.effect, f.state, f.error, f.created_at, COALESCE(f.attempts, 0), f.first_failed_at, COALESCE(f.noticed, 0), NULL, NULLIF(TRIM(a.resolution), '')
+        FROM owner_ask_followup f LEFT JOIN owner_ask a ON a.id = f.ask_id;
+        DROP TABLE owner_ask_followup;
+        ALTER TABLE owner_ask_followup_new RENAME TO owner_ask_followup;`);
+    } else {
+      if (!cols.has("previous")) db.exec("ALTER TABLE owner_ask_followup ADD COLUMN previous TEXT");
+      if (!cols.has("resolution")) {
+        db.exec("ALTER TABLE owner_ask_followup ADD COLUMN resolution TEXT");
+        db.exec(`UPDATE owner_ask_followup SET resolution = (SELECT NULLIF(TRIM(resolution), '') FROM owner_ask WHERE owner_ask.id = owner_ask_followup.ask_id) WHERE resolution IS NULL`);
+      }
+    }
+  }
 
   const select = `SELECT owner_ask.*,
     (SELECT impact FROM owner_ask_impact WHERE id=owner_ask.id) AS impact,
@@ -258,11 +405,18 @@ export function createOwnerAsks(db: Database): OwnerAsks {
     return row ? fromRecord(row) : undefined;
   }
 
+  function answeredByOwner(id: string): boolean {
+    return db.prepare("SELECT id FROM owner_ask_answer WHERE id=? AND source='owner'").get(id) !== undefined;
+  }
+
   function listOpen(captain: string): OwnerAsk[] {
     return (db.prepare(`${select} WHERE captain=? AND state='open' ORDER BY created_at, owner_ask.id`).all(captain) as AskRecord[]).map(fromRecord);
   }
 
   function create(input: NewOwnerAsk): OwnerAsk {
+    if (input.kind === "question" && input.options.length === 0) {
+      throw new Error("A question card needs options. Status belongs on the task, not as an open card.");
+    }
     let id = input.id ?? newAskId();
     while (input.id === undefined && get(id)) id = newAskId();
     const ask: OwnerAsk = {
@@ -363,16 +517,27 @@ export function createOwnerAsks(db: Database): OwnerAsks {
     listCandidates(captain, now) {
       return (db.prepare(`${select} WHERE captain=? AND (state='open' OR (state='answered' AND resolved_at>=?)) ORDER BY created_at, owner_ask.id`).all(captain, now - 86_400_000) as AskRecord[]).map(fromRecord);
     },
-    answeredByOwner(id) {
-      return db.prepare("SELECT id FROM owner_ask_answer WHERE id=? AND source='owner'").get(id) !== undefined;
-    },
+    answeredByOwner,
     resolve(id, captain, state, resolution, at, source) {
       return db.transaction(() => {
         const current = get(id);
         if (!current || current.captain !== captain || db.prepare("SELECT id FROM owner_ask_close WHERE id=?").get(id) !== undefined) return undefined;
+        if (source === "owner") {
+          const sameAnswer = current.state === "answered" && (current.resolution ?? "").trim().toLowerCase() === resolution.trim().toLowerCase();
+          if (sameAnswer && answeredByOwner(id)) return current;
+          if (current.state !== "open" && !sameAnswer) return undefined;
+        }
+        const previousRecorded = (lastFollowUpResolution(id) ?? current.resolution ?? "").trim();
         db.prepare("UPDATE owner_ask SET state=?, resolution=?, resolved_at=? WHERE id=?").run(state, state === "open" ? null : resolution, state === "open" ? null : at, id);
         db.prepare("DELETE FROM owner_ask_answer WHERE id=?").run(id);
-        if (source === "owner" && state === "answered") db.prepare("INSERT INTO owner_ask_answer VALUES (?,?)").run(id, source);
+        if (source === "owner" && state === "answered") {
+          db.prepare("INSERT INTO owner_ask_answer VALUES (?,?)").run(id, source);
+          const seq = nextAnswerSeq(id);
+          for (const effect of ASK_FOLLOWUP_EFFECTS) {
+            db.prepare("INSERT INTO owner_ask_followup (ask_id, answer_seq, effect, state, error, created_at, previous, resolution) VALUES (?,?,?,?,?,?,?,?)")
+              .run(id, seq, effect, "pending", null, at, previousRecorded === "" ? null : previousRecorded, resolution);
+          }
+        }
         // A skip ends when the card is answered or reopened: a reopened card waits on the owner again.
         db.prepare("DELETE FROM owner_ask_defer WHERE id=?").run(id);
         const { deferredUntil: _skip, ...rest } = current;
@@ -385,10 +550,81 @@ export function createOwnerAsks(db: Database): OwnerAsks {
         return due.map((ask) => {
           const resolution = recommendedLabel(ask)!;
           db.prepare("UPDATE owner_ask SET state='defaulted', resolution=?, resolved_at=? WHERE id=?").run(resolution, now, ask.id);
+          db.prepare("INSERT OR IGNORE INTO owner_ask_default_notice VALUES (?,0)").run(ask.id);
           return { ...ask, state: "defaulted" as const, resolution, resolvedAt: now };
         });
       })();
     },
+    untoldDefaults(captain) {
+      return (db.prepare(`${select} WHERE captain=? AND state='defaulted' AND EXISTS(SELECT 1 FROM owner_ask_default_notice WHERE id=owner_ask.id AND told=0) ORDER BY created_at, owner_ask.id`).all(captain) as AskRecord[]).map(fromRecord);
+    },
+    markDefaultsTold(ids) {
+      for (const id of ids) db.prepare("UPDATE owner_ask_default_notice SET told=1 WHERE id=?").run(id);
+    },
+    pendingFollowUps() {
+      return followUps("pending");
+    },
+    failedFollowUps() {
+      return followUps("failed");
+    },
+    markFollowUpDone(askId, effect, answerSeq = 1) {
+      db.prepare("UPDATE owner_ask_followup SET state='done', error=NULL WHERE ask_id=? AND answer_seq=? AND effect=?").run(askId, answerSeq, effect);
+    },
+    failFollowUp(askId, effect, error, now = Date.now(), answerSeq = 1) {
+      const row = followUpRow(askId, effect, answerSeq);
+      if (row === undefined || row.state !== "pending") return (row?.state ?? "pending") as AskFollowUpState;
+      const attempts = row.attempts + 1;
+      const firstFailedAt = row.firstFailedAt ?? now;
+      const state: AskFollowUpState = attempts >= ASK_FOLLOWUP_RETRY_BOUND || now - firstFailedAt >= ASK_FOLLOWUP_GIVE_UP_MS ? "failed" : "pending";
+      db.prepare("UPDATE owner_ask_followup SET error=?, attempts=?, first_failed_at=?, state=? WHERE ask_id=? AND answer_seq=? AND effect=? AND state='pending'").run(error, attempts, firstFailedAt, state, askId, answerSeq, effect);
+      return state;
+    },
+    recordFollowUpError(askId, effect, error, answerSeq = 1) {
+      db.prepare("UPDATE owner_ask_followup SET error=? WHERE ask_id=? AND answer_seq=? AND effect=? AND state='pending'").run(error, askId, answerSeq, effect);
+    },
+    claimFollowUpNotice(askId, effect, answerSeq = 1) {
+      const row = followUpRow(askId, effect, answerSeq);
+      if (!row || row.state !== "failed" || row.noticed) return false;
+      db.prepare("UPDATE owner_ask_followup SET noticed=1 WHERE ask_id=? AND answer_seq=? AND effect=? AND state='failed' AND noticed=0").run(askId, answerSeq, effect);
+      return true;
+    },
+  };
+
+  function lastFollowUpResolution(id: string): string | null {
+    const row = db.prepare("SELECT resolution FROM owner_ask_followup WHERE ask_id=? AND resolution IS NOT NULL AND TRIM(resolution) != '' ORDER BY answer_seq DESC LIMIT 1").get(id) as { resolution: string } | undefined;
+    return row?.resolution ?? null;
+  }
+  function nextAnswerSeq(id: string): number {
+    const row = db.prepare("SELECT MAX(answer_seq) AS n FROM owner_ask_followup WHERE ask_id=?").get(id) as { n: number | null } | undefined;
+    return (row?.n ?? 0) + 1;
+  }
+  function followUpRow(askId: string, effect: AskFollowUpEffect, answerSeq = 1): AskFollowUp | undefined {
+    const row = db.prepare("SELECT ask_id, answer_seq, effect, state, error, created_at, attempts, first_failed_at, noticed, previous, resolution FROM owner_ask_followup WHERE ask_id=? AND answer_seq=? AND effect=?").get(askId, answerSeq, effect) as FollowUpRecord | undefined;
+    return row ? fromFollowUp(row) : undefined;
+  }
+  function followUps(state: "pending" | "failed"): AskFollowUp[] {
+    return (db.prepare("SELECT ask_id, answer_seq, effect, state, error, created_at, attempts, first_failed_at, noticed, previous, resolution FROM owner_ask_followup WHERE state=? ORDER BY ask_id, answer_seq, effect").all(state) as FollowUpRecord[]).map(fromFollowUp);
+  }
+}
+
+type FollowUpRecord = {
+  ask_id: string; answer_seq: number; effect: string; state: string; error: string | null; created_at: number;
+  attempts: number; first_failed_at: number | null; noticed: number; previous: string | null; resolution: string | null;
+};
+
+function fromFollowUp(row: FollowUpRecord): AskFollowUp {
+  return {
+    askId: row.ask_id,
+    answerSeq: row.answer_seq ?? 1,
+    effect: row.effect as AskFollowUpEffect,
+    state: row.state as AskFollowUpState,
+    error: row.error,
+    createdAt: row.created_at,
+    attempts: row.attempts ?? 0,
+    firstFailedAt: row.first_failed_at,
+    noticed: row.noticed === 1,
+    previous: row.previous ?? null,
+    resolution: row.resolution ?? null,
   };
 }
 

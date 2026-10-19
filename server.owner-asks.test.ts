@@ -49,8 +49,9 @@ test("explicit ask RPCs validate the captain and correct answered decisions", as
     assert.deepEqual(await host.harness.behavior.callRpc("resolveAsk", { threadId: "thr_other", id: "aexisting", resolution: "Publish" }), { ok: false });
     assert.deepEqual(await host.harness.behavior.callRpc("resolveAsk", { threadId: "thr_cap", id: "aexisting", resolution: "Publish" }), { ok: true });
     assert.equal(asks.get("aexisting")?.resolution, "Publish");
-    assert.deepEqual(await host.harness.behavior.callRpc("resolveAsk", { threadId: "thr_cap", id: "aexisting", resolution: "Owner approved the address repair at 12:00 Cairo." }), { ok: true });
-    assert.equal(asks.get("aexisting")?.resolution, "Owner approved the address repair at 12:00 Cairo.");
+    assert.deepEqual(await host.harness.behavior.callRpc("resolveAsk", { threadId: "thr_cap", id: "aexisting", resolution: "Publish" }), { ok: true }, "an exact repeat of the recorded answer is accepted");
+    assert.deepEqual(await host.harness.behavior.callRpc("resolveAsk", { threadId: "thr_cap", id: "aexisting", resolution: "Owner approved the address repair at 12:00 Cairo." }), { ok: false });
+    assert.equal(asks.get("aexisting")?.resolution, "Publish");
     assert.deepEqual(await host.harness.behavior.callRpc("telegramCommand", { threadId: "thr_cap", command: "board" }), { text: "📌 Needs you: nothing right now.\n\n✅ Finished since you last looked: nothing new.\n\n🚀 Not live yet: nothing merged waits to go live.\n\n🔧 In progress: nothing open.", away: false, projects: [], notLive: [] }, "no crew runs: zero crews, so Telegram does not count task lines");
 
     const sent = host.harness.sdk.callsTo("plugins.callRpc").map((call) => call[0] as { method: string });
@@ -60,6 +61,21 @@ test("explicit ask RPCs validate the captain and correct answered decisions", as
   }
 });
 
+
+test("resolveAsk on a replaced card changes nothing", async () => {
+  const host = await captainHost();
+  try {
+    const asks = createOwnerAsks(host.bb.storage.database());
+    asks.create({ id: "aold", captain: "thr_cap", kind: "question", text: "Which database?", options: [{ label: "Postgres", value: "a" }, { label: "SQLite", value: "b" }], createdAt: 1 });
+    asks.resolve("aold", "thr_cap", "cancelled", "Replaced by card anew", 2);
+    assert.deepEqual(await host.harness.behavior.callRpc("resolveAsk", { threadId: "thr_cap", id: "aold", resolution: "Postgres" }), { ok: false });
+    assert.equal(asks.get("aold")?.state, "cancelled");
+    assert.equal(asks.get("aold")?.resolution, "Replaced by card anew");
+    assert.deepEqual(asks.pendingFollowUps(), []);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
 
 test("listAsks includes open and recently answered asks only for its captain", async () => {
   const host = await captainHost();
@@ -89,7 +105,7 @@ test("captain can correct an answered ask and reopen it", async () => {
   const host = await captainHost();
   try {
     const asks = createOwnerAsks(host.bb.storage.database());
-    asks.create({ id: "assh", captain: "thr_cap", kind: "question", text: "Addresses?", options: [], createdAt: 1 });
+    asks.create({ id: "assh", captain: "thr_cap", kind: "question", text: "Addresses?", options: [{ label: "Yes", value: "yes" }], createdAt: 1 });
     asks.resolve("assh", "thr_cap", "answered", "What?", 2);
     const tool = host.harness.inspection.registrations.agentTools.find((item) => item.name === "firstmate_resolve_ask")!;
     const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
@@ -443,7 +459,7 @@ test("closeAsk closes only named cards in a pack and preserves their task", asyn
     const tasks = createOwnerTasks(host.bb.storage.database());
     const task = tasks.open({ captain: "thr_cap", project: "Safi", title: "Publish", sourceRefs: [], at: Date.now() });
     const asks = createOwnerAsks(host.bb.storage.database());
-    for (const id of ["pack1", "pack2"]) asks.create({ id, captain: "thr_cap", kind: "question", text: id, options: [], task: task.id, createdAt: Date.now() });
+    for (const id of ["pack1", "pack2"]) asks.create({ id, captain: "thr_cap", kind: "question", text: id, options: [{ label: "Yes", value: "yes" }], task: task.id, createdAt: Date.now() });
     const before = tasks.get(task.id);
     await host.harness.behavior.callRpc("closeAsk", { threadId: "thr_cap", ids: ["pack1", "pack1"] });
     assert.deepEqual(asks.listWaiting("thr_cap", Date.now()).map((ask) => ask.id), ["pack2"]);
@@ -457,7 +473,7 @@ test("closeAsk refuses all cards when one belongs to another captain, is missing
   const host = await captainHost();
   try {
     const asks = createOwnerAsks(host.bb.storage.database());
-    for (const [id, captain] of [["own", "thr_cap"], ["foreign", "thr_other"], ["answered", "thr_cap"]]) asks.create({ id, captain, kind: "question", text: id, options: [], createdAt: Date.now() });
+    for (const [id, captain] of [["own", "thr_cap"], ["foreign", "thr_other"], ["answered", "thr_cap"]]) asks.create({ id, captain, kind: "question", text: id, options: [{ label: "Yes", value: "yes" }], createdAt: Date.now() });
     asks.resolve("answered", "thr_cap", "answered", "Yes", Date.now());
     for (const id of ["foreign", "missing", "answered"]) {
       assert.deepEqual(await host.harness.behavior.callRpc("closeAsk", { threadId: "thr_cap", ids: ["own", id] }), { ok: false, closed: [], already: [], refused: [id] });
@@ -472,7 +488,7 @@ test("closeAsk retries a failed notice and overlapping repeats deliver once", as
   const host = await captainHost();
   try {
     const asks = createOwnerAsks(host.bb.storage.database());
-    asks.create({ id: "retryclose", captain: "thr_cap", kind: "question", text: "Ship?", options: [], createdAt: Date.now() });
+    asks.create({ id: "retryclose", captain: "thr_cap", kind: "question", text: "Ship?", options: [{ label: "Yes", value: "yes" }], createdAt: Date.now() });
     let attempts = 0;
     let release!: () => void;
     let entered!: () => void;
