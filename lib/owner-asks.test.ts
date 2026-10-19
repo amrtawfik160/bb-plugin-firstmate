@@ -7,8 +7,7 @@ import { formatBoard } from "./owner-board.ts";
 
 const NOW = Date.UTC(2026, 9, 7, 12, 0);
 
-function db() {
-  const raw = new DatabaseSync(":memory:");
+function db(raw = new DatabaseSync(":memory:")) {
   return Object.assign(raw, {
     transaction<T>(fn: () => T) {
       return () => {
@@ -130,7 +129,7 @@ test("a follow-up that fails 8 times or waits 2 hours becomes failed", () => {
   assert.ok(asks.failedFollowUps().some((job) => job.askId === "a2" && job.effect === "owner-answered"));
 });
 
-test("reopening a card clears follow-up so a new owner answer queues again", () => {
+test("reopening a card keeps delivered follow-up so a new owner answer queues again", () => {
   const asks = createOwnerAsks(db());
   const opts = [{ label: "Yes", value: "yes" }, { label: "No", value: "no" }];
   asks.create({ id: "a1", captain: "thr_cap", kind: "question", text: "q", options: opts, createdAt: NOW });
@@ -144,6 +143,41 @@ test("reopening a card clears follow-up so a new owner answer queues again", () 
     ["a1", "owner-answered", "pending"],
     ["a1", "refresh-board", "pending"],
   ]);
+});
+
+test("each owner answer keeps its own follow-up sequence and previous pair", () => {
+  const asks = createOwnerAsks(db());
+  const opts = [{ label: "Yes", value: "yes" }, { label: "No", value: "no" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "question", text: "q", options: opts, createdAt: NOW });
+  asks.resolve("a1", "thr_cap", "answered", "Yes", NOW, "owner");
+  const first = asks.pendingFollowUps().find((job) => job.effect === "owner-answered");
+  assert.equal(first?.answerSeq, 1);
+  assert.equal(first?.resolution, "Yes");
+  asks.resolve("a1", "thr_cap", "open", "Reopen", NOW + 1);
+  assert.equal(asks.pendingFollowUps().length, 2, "reopen keeps in-flight follow-up");
+  asks.resolve("a1", "thr_cap", "answered", "No", NOW + 2, "owner");
+  const ownerJobs = asks.pendingFollowUps().filter((job) => job.effect === "owner-answered");
+  assert.equal(ownerJobs.length, 2);
+  const second = ownerJobs.find((job) => job.answerSeq === 2);
+  assert.equal(second?.previous, "Yes");
+  assert.equal(second?.resolution, "No");
+  asks.markFollowUpDone("a1", "owner-answered", 1);
+  assert.equal(asks.pendingFollowUps().some((job) => job.answerSeq === 1 && job.effect === "owner-answered"), false);
+  assert.ok(asks.pendingFollowUps().some((job) => job.answerSeq === 2 && job.effect === "owner-answered" && job.state === "pending"));
+});
+
+test("follow-up rows from the old card-effect key migrate to sequence 1", () => {
+  const raw = new DatabaseSync(":memory:");
+  raw.exec(`CREATE TABLE owner_ask_followup (
+    ask_id TEXT NOT NULL, effect TEXT NOT NULL, state TEXT NOT NULL, error TEXT, created_at INTEGER NOT NULL,
+    PRIMARY KEY (ask_id, effect));
+    INSERT INTO owner_ask_followup VALUES ('a1','owner-answered','pending',NULL,${NOW});`);
+  const asks = createOwnerAsks(db(raw));
+  const pending = asks.pendingFollowUps();
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0]?.answerSeq, 1);
+  assert.equal(pending[0]?.effect, "owner-answered");
+  assert.equal(pending[0]?.askId, "a1");
 });
 
 test("a defaulted ask keeps an untold captain notice until it is marked told", () => {

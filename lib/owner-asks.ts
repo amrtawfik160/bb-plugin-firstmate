@@ -43,6 +43,7 @@ export type AskFollowUpEffect = (typeof ASK_FOLLOWUP_EFFECTS)[number];
 export type AskFollowUpState = "pending" | "done" | "failed";
 export type AskFollowUp = {
   askId: string;
+  answerSeq: number;
   effect: AskFollowUpEffect;
   state: AskFollowUpState;
   error: string | null;
@@ -50,6 +51,8 @@ export type AskFollowUp = {
   attempts: number;
   firstFailedAt: number | null;
   noticed: boolean;
+  previous: string | null;
+  resolution: string | null;
 };
 
 /**
@@ -285,10 +288,10 @@ export type OwnerAsks = {
   markDefaultsTold(ids: readonly string[]): void;
   pendingFollowUps(): AskFollowUp[];
   failedFollowUps(): AskFollowUp[];
-  markFollowUpDone(askId: string, effect: AskFollowUpEffect): void;
-  failFollowUp(askId: string, effect: AskFollowUpEffect, error: string, now?: number): AskFollowUpState;
-  recordFollowUpError(askId: string, effect: AskFollowUpEffect, error: string): void;
-  claimFollowUpNotice(askId: string, effect: AskFollowUpEffect): boolean;
+  markFollowUpDone(askId: string, effect: AskFollowUpEffect, answerSeq?: number): void;
+  failFollowUp(askId: string, effect: AskFollowUpEffect, error: string, now?: number, answerSeq?: number): AskFollowUpState;
+  recordFollowUpError(askId: string, effect: AskFollowUpEffect, error: string, answerSeq?: number): void;
+  claimFollowUpNotice(askId: string, effect: AskFollowUpEffect, answerSeq?: number): boolean;
 };
 
 function fromRecord(row: AskRecord): OwnerAsk {
@@ -356,9 +359,10 @@ export function createOwnerAsks(db: Database): OwnerAsks {
     CREATE TABLE IF NOT EXISTS owner_ask_close (id TEXT PRIMARY KEY, told INTEGER NOT NULL DEFAULT 0, released INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS owner_ask_defer (id TEXT PRIMARY KEY, until INTEGER NOT NULL, told INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS owner_ask_followup (
-      ask_id TEXT NOT NULL, effect TEXT NOT NULL, state TEXT NOT NULL, error TEXT, created_at INTEGER NOT NULL,
+      ask_id TEXT NOT NULL, answer_seq INTEGER NOT NULL, effect TEXT NOT NULL, state TEXT NOT NULL, error TEXT, created_at INTEGER NOT NULL,
       attempts INTEGER NOT NULL DEFAULT 0, first_failed_at INTEGER, noticed INTEGER NOT NULL DEFAULT 0,
-      PRIMARY KEY (ask_id, effect));
+      previous TEXT, resolution TEXT,
+      PRIMARY KEY (ask_id, answer_seq, effect));
     CREATE TABLE IF NOT EXISTS owner_ask_default_notice (
       id TEXT PRIMARY KEY, told INTEGER NOT NULL DEFAULT 0);`);
   {
@@ -366,6 +370,20 @@ export function createOwnerAsks(db: Database): OwnerAsks {
     if (!cols.has("attempts")) db.exec("ALTER TABLE owner_ask_followup ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0");
     if (!cols.has("first_failed_at")) db.exec("ALTER TABLE owner_ask_followup ADD COLUMN first_failed_at INTEGER");
     if (!cols.has("noticed")) db.exec("ALTER TABLE owner_ask_followup ADD COLUMN noticed INTEGER NOT NULL DEFAULT 0");
+    if (!cols.has("answer_seq")) {
+      db.exec(`CREATE TABLE owner_ask_followup_new (
+        ask_id TEXT NOT NULL, answer_seq INTEGER NOT NULL, effect TEXT NOT NULL, state TEXT NOT NULL, error TEXT, created_at INTEGER NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0, first_failed_at INTEGER, noticed INTEGER NOT NULL DEFAULT 0,
+        previous TEXT, resolution TEXT,
+        PRIMARY KEY (ask_id, answer_seq, effect));
+        INSERT INTO owner_ask_followup_new (ask_id, answer_seq, effect, state, error, created_at, attempts, first_failed_at, noticed, previous, resolution)
+        SELECT ask_id, 1, effect, state, error, created_at, COALESCE(attempts, 0), first_failed_at, COALESCE(noticed, 0), NULL, NULL FROM owner_ask_followup;
+        DROP TABLE owner_ask_followup;
+        ALTER TABLE owner_ask_followup_new RENAME TO owner_ask_followup;`);
+    } else {
+      if (!cols.has("previous")) db.exec("ALTER TABLE owner_ask_followup ADD COLUMN previous TEXT");
+      if (!cols.has("resolution")) db.exec("ALTER TABLE owner_ask_followup ADD COLUMN resolution TEXT");
+    }
   }
 
   const select = `SELECT owner_ask.*,
@@ -505,13 +523,15 @@ export function createOwnerAsks(db: Database): OwnerAsks {
           if (sameAnswer && answeredByOwner(id)) return current;
           if (current.state !== "open" && !sameAnswer) return undefined;
         }
+        const previousRecorded = (lastFollowUpResolution(id) ?? current.resolution ?? "").trim();
         db.prepare("UPDATE owner_ask SET state=?, resolution=?, resolved_at=? WHERE id=?").run(state, state === "open" ? null : resolution, state === "open" ? null : at, id);
         db.prepare("DELETE FROM owner_ask_answer WHERE id=?").run(id);
-        if (state === "open") db.prepare("DELETE FROM owner_ask_followup WHERE ask_id=?").run(id);
         if (source === "owner" && state === "answered") {
           db.prepare("INSERT INTO owner_ask_answer VALUES (?,?)").run(id, source);
+          const seq = nextAnswerSeq(id);
           for (const effect of ASK_FOLLOWUP_EFFECTS) {
-            db.prepare("INSERT OR IGNORE INTO owner_ask_followup (ask_id, effect, state, error, created_at) VALUES (?,?,?,?,?)").run(id, effect, "pending", null, at);
+            db.prepare("INSERT INTO owner_ask_followup (ask_id, answer_seq, effect, state, error, created_at, previous, resolution) VALUES (?,?,?,?,?,?,?,?)")
+              .run(id, seq, effect, "pending", null, at, previousRecorded === "" ? null : previousRecorded, resolution);
           }
         }
         // A skip ends when the card is answered or reopened: a reopened card waits on the owner again.
@@ -543,43 +563,55 @@ export function createOwnerAsks(db: Database): OwnerAsks {
     failedFollowUps() {
       return followUps("failed");
     },
-    markFollowUpDone(askId, effect) {
-      db.prepare("UPDATE owner_ask_followup SET state='done', error=NULL WHERE ask_id=? AND effect=?").run(askId, effect);
+    markFollowUpDone(askId, effect, answerSeq = 1) {
+      db.prepare("UPDATE owner_ask_followup SET state='done', error=NULL WHERE ask_id=? AND answer_seq=? AND effect=?").run(askId, answerSeq, effect);
     },
-    failFollowUp(askId, effect, error, now = Date.now()) {
-      const row = followUpRow(askId, effect);
+    failFollowUp(askId, effect, error, now = Date.now(), answerSeq = 1) {
+      const row = followUpRow(askId, effect, answerSeq);
       if (row === undefined || row.state !== "pending") return (row?.state ?? "pending") as AskFollowUpState;
       const attempts = row.attempts + 1;
       const firstFailedAt = row.firstFailedAt ?? now;
       const state: AskFollowUpState = attempts >= ASK_FOLLOWUP_RETRY_BOUND || now - firstFailedAt >= ASK_FOLLOWUP_GIVE_UP_MS ? "failed" : "pending";
-      db.prepare("UPDATE owner_ask_followup SET error=?, attempts=?, first_failed_at=?, state=? WHERE ask_id=? AND effect=? AND state='pending'").run(error, attempts, firstFailedAt, state, askId, effect);
+      db.prepare("UPDATE owner_ask_followup SET error=?, attempts=?, first_failed_at=?, state=? WHERE ask_id=? AND answer_seq=? AND effect=? AND state='pending'").run(error, attempts, firstFailedAt, state, askId, answerSeq, effect);
       return state;
     },
-    recordFollowUpError(askId, effect, error) {
-      db.prepare("UPDATE owner_ask_followup SET error=? WHERE ask_id=? AND effect=? AND state='pending'").run(error, askId, effect);
+    recordFollowUpError(askId, effect, error, answerSeq = 1) {
+      db.prepare("UPDATE owner_ask_followup SET error=? WHERE ask_id=? AND answer_seq=? AND effect=? AND state='pending'").run(error, askId, answerSeq, effect);
     },
-    claimFollowUpNotice(askId, effect) {
-      const row = followUpRow(askId, effect);
+    claimFollowUpNotice(askId, effect, answerSeq = 1) {
+      const row = followUpRow(askId, effect, answerSeq);
       if (!row || row.state !== "failed" || row.noticed) return false;
-      db.prepare("UPDATE owner_ask_followup SET noticed=1 WHERE ask_id=? AND effect=? AND state='failed' AND noticed=0").run(askId, effect);
+      db.prepare("UPDATE owner_ask_followup SET noticed=1 WHERE ask_id=? AND answer_seq=? AND effect=? AND state='failed' AND noticed=0").run(askId, answerSeq, effect);
       return true;
     },
   };
 
-  function followUpRow(askId: string, effect: AskFollowUpEffect): AskFollowUp | undefined {
-    const row = db.prepare("SELECT ask_id, effect, state, error, created_at, attempts, first_failed_at, noticed FROM owner_ask_followup WHERE ask_id=? AND effect=?").get(askId, effect) as FollowUpRecord | undefined;
+  function lastFollowUpResolution(id: string): string | null {
+    const row = db.prepare("SELECT resolution FROM owner_ask_followup WHERE ask_id=? AND resolution IS NOT NULL AND TRIM(resolution) != '' ORDER BY answer_seq DESC LIMIT 1").get(id) as { resolution: string } | undefined;
+    return row?.resolution ?? null;
+  }
+  function nextAnswerSeq(id: string): number {
+    const row = db.prepare("SELECT MAX(answer_seq) AS n FROM owner_ask_followup WHERE ask_id=?").get(id) as { n: number | null } | undefined;
+    return (row?.n ?? 0) + 1;
+  }
+  function followUpRow(askId: string, effect: AskFollowUpEffect, answerSeq = 1): AskFollowUp | undefined {
+    const row = db.prepare("SELECT ask_id, answer_seq, effect, state, error, created_at, attempts, first_failed_at, noticed, previous, resolution FROM owner_ask_followup WHERE ask_id=? AND answer_seq=? AND effect=?").get(askId, answerSeq, effect) as FollowUpRecord | undefined;
     return row ? fromFollowUp(row) : undefined;
   }
   function followUps(state: "pending" | "failed"): AskFollowUp[] {
-    return (db.prepare("SELECT ask_id, effect, state, error, created_at, attempts, first_failed_at, noticed FROM owner_ask_followup WHERE state=? ORDER BY created_at, ask_id, effect").all(state) as FollowUpRecord[]).map(fromFollowUp);
+    return (db.prepare("SELECT ask_id, answer_seq, effect, state, error, created_at, attempts, first_failed_at, noticed, previous, resolution FROM owner_ask_followup WHERE state=? ORDER BY ask_id, answer_seq, effect").all(state) as FollowUpRecord[]).map(fromFollowUp);
   }
 }
 
-type FollowUpRecord = { ask_id: string; effect: string; state: string; error: string | null; created_at: number; attempts: number; first_failed_at: number | null; noticed: number };
+type FollowUpRecord = {
+  ask_id: string; answer_seq: number; effect: string; state: string; error: string | null; created_at: number;
+  attempts: number; first_failed_at: number | null; noticed: number; previous: string | null; resolution: string | null;
+};
 
 function fromFollowUp(row: FollowUpRecord): AskFollowUp {
   return {
     askId: row.ask_id,
+    answerSeq: row.answer_seq ?? 1,
     effect: row.effect as AskFollowUpEffect,
     state: row.state as AskFollowUpState,
     error: row.error,
@@ -587,6 +619,8 @@ function fromFollowUp(row: FollowUpRecord): AskFollowUp {
     attempts: row.attempts ?? 0,
     firstFailedAt: row.first_failed_at,
     noticed: row.noticed === 1,
+    previous: row.previous ?? null,
+    resolution: row.resolution ?? null,
   };
 }
 

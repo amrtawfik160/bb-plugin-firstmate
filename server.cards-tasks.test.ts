@@ -668,6 +668,100 @@ test("an open question that shares the crew hold still applies native and leaves
   } finally { restore(); await host.harness.lifecycle.dispose(); }
 });
 
+test("checker round7: consecutive delivered corrections name the actual previous answer",async()=>{
+ const {host,state,card,commands,restore}=await checkerCorrectionFixture();try{
+  const before=commands.length;const sends=host.harness.sdk.callsTo("threads.send").length;
+  for(const answer of ["SQLite","Postgres"]){await tool(host,"firstmate_resolve_ask").execute({id:card.id,reopen:true,resolution:"Correction"},ctx);await host.harness.behavior.callRpc("resolveAsk",{threadId:"thr_cap",id:card.id,resolution:answer});await host.harness.behavior.callRpc("resolveAsk",{threadId:"thr_cap",id:card.id,resolution:answer});}
+  const messages=host.harness.sdk.callsTo("threads.send").slice(sends).map(call=>call[0] as {threadId:string;input:Array<{text:string}>}).filter(call=>call.threadId==="thr_w1");
+  assert.equal(messages.length,2,"each accepted correction is delivered once");
+  assert.equal(commands.slice(before).filter(command=>command.includes("fm-captain-hold.sh")&&command.includes("'answer'")).length,0);
+  console.log("CHECKER R7 consecutive",JSON.stringify(messages.map(message=>message.input[0].text)));
+  assert.match(messages[0].input[0].text,/was Postgres, now SQLite/);assert.match(messages[1].input[0].text,/was SQLite, now Postgres/,"the second correction must name the last delivered answer");
+ }finally{await host.harness.lifecycle.dispose();restore();}
+});
+
+test("checker round7: a slow first correction cannot consume a newer correction's delivery",async()=>{
+ const {host,asks,card,restore}=await checkerCorrectionFixture();let release=()=>{};const gate=new Promise<void>(resolve=>{release=resolve;});let first:Promise<unknown>|undefined;const accepted:string[]=[];let started=0;
+ try{
+  host.harness.sdk.stub("threads.send",async(input:{threadId:string;input:Array<{text:string}>})=>{if(input.threadId==="thr_w1"){started++;if(started===1)await gate;accepted.push(input.input[0].text);}return {delivery:"queued"};});
+  await tool(host,"firstmate_resolve_ask").execute({id:card.id,reopen:true,resolution:"Correction one"},ctx);
+  first=host.harness.behavior.callRpc("resolveAsk",{threadId:"thr_cap",id:card.id,resolution:"SQLite"});
+  for(let i=0;i<30&&started===0;i++)await new Promise(resolve=>setImmediate(resolve));assert.equal(started,1);
+  await tool(host,"firstmate_resolve_ask").execute({id:card.id,reopen:true,resolution:"Correction two"},ctx);
+  assert.equal((await host.harness.behavior.callRpc("resolveAsk",{threadId:"thr_cap",id:card.id,resolution:"Postgres"})).ok,true);
+  release();await first;
+  await host.harness.behavior.callRpc("resolveAsk",{threadId:"thr_cap",id:card.id,resolution:"Postgres"});
+  console.log("CHECKER R7 slow correction",JSON.stringify({accepted,stored:asks.get(card.id)?.resolution,pending:asks.pendingFollowUps()}));
+  assert.equal(accepted.filter(text=>text.includes("now SQLite")).length,1);
+  assert.equal(accepted.filter(text=>text.includes("now Postgres")).length,1,"completion of the old send must not mark the new answer delivered");
+ }finally{release();if(first)await first.catch(()=>{});await host.harness.lifecycle.dispose();restore();}
+});
+
+test("checker round7: a restart between two corrections delivers both in order once each", async () => {
+  const { host, state, card, commands, restore } = await checkerCorrectionFixture();
+  let next: Awaited<ReturnType<typeof host.harness.lifecycle.reload>> | undefined;
+  try {
+    const firstSends = host.harness.sdk.callsTo("threads.send").length;
+    const before = commands.length;
+    await tool(host, "firstmate_resolve_ask").execute({ id: card.id, reopen: true, resolution: "Correction" }, ctx);
+    await host.harness.behavior.callRpc("resolveAsk", { threadId: "thr_cap", id: card.id, resolution: "SQLite" });
+    const first = host.harness.sdk.callsTo("threads.send").slice(firstSends)
+      .map((call) => call[0] as { threadId: string; input: Array<{ text: string }> })
+      .filter((call) => call.threadId === "thr_w1");
+    assert.equal(first.length, 1);
+    assert.match(first[0]!.input[0]!.text, /was Postgres, now SQLite/);
+    next = await host.harness.lifecycle.reload(plugin);
+    const nextCommands: string[] = [];
+    let n = 0;
+    next.harness.sdk.stub("threads.getPluginMetadata", async ({ threadId }: { threadId: string }) => (threadId === "thr_cap" ? { captain: "true" } : {}));
+    next.harness.sdk.stub("threads.list", async () => []);
+    next.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, projectId: "proj_1", status: "idle" }));
+    next.harness.sdk.stub("threads.send", async () => ({ delivery: "queued" }));
+    next.harness.sdk.stub("threads.output", async () => ({ output: "" }));
+    next.harness.sdk.stub("environments.list", async () => [{ id: "env_source", hostId: "host_1", status: "ready", isWorktree: false, path: "/repo" }]);
+    next.harness.sdk.stub("projects.get", async () => ({ id: "proj_1", name: "Cyndra", kind: "repo" }));
+    next.harness.sdk.stub("files.read", async ({ path }: { path: string }) => {
+      if (path === "/native/data/captain.md") return { content: CAPTAIN_MD, sizeBytes: CAPTAIN_MD.length };
+      throw new Error("ENOENT");
+    });
+    next.harness.sdk.stub("plugins.callRpc", async () => ({ ok: true, queued: 1, duplicate: false }));
+    next.harness.sdk.stub("terminals.create", async (args: { start: { command: string } }) => {
+      const id = `term${++n}`;
+      nextCommands.push(args.start.command);
+      return { id };
+    });
+    next.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
+    next.harness.sdk.stub("terminals.close", async () => ({}));
+    next.harness.sdk.stub("terminals.output", async ({ terminalId }: { terminalId: string }) => {
+      const command = nextCommands[Number(terminalId.replace("term", "")) - 1] ?? "";
+      let code = 0;
+      if (command.includes("fm-captain-hold.sh") && command.includes("'open'")) {
+        code = (command.includes("'choice'") ? state.held : command.includes("'wait1'") ? state.shared : false) ? 0 : 1;
+      }
+      const payload = command.includes("fm-bearings-snapshot.sh")
+        ? JSON.stringify({ schema: "fm-bearings.v1", home: "/native", in_flight: [], decisions_open: [], landed: [], gates: [], omitted: [] })
+        : command.includes("/native/state/wait1.status") ? state.text : "";
+      const captured = command.includes("FM_HOST_CAPTURE_V1");
+      const out = captured ? JSON.stringify({ protocol: "FM_HOST_CAPTURE_V1", exitCode: code, stdout: payload, stderr: "" }) : payload;
+      return { nextSeq: 1, chunks: [{ dataBase64: Buffer.from(`${out}\n__FM_HOST_RC:${captured ? 0 : code}\n`).toString("base64") }] };
+    });
+    await tool(next, "firstmate_resolve_ask").execute({ id: card.id, reopen: true, resolution: "Correction" }, ctx);
+    await next.harness.behavior.callRpc("resolveAsk", { threadId: "thr_cap", id: card.id, resolution: "Postgres" });
+    const second = next.harness.sdk.callsTo("threads.send")
+      .map((call) => call[0] as { threadId: string; input: Array<{ text: string }> })
+      .filter((call) => call.threadId === "thr_w1");
+    assert.equal(second.length, 1, "the second correction is delivered once after restart");
+    assert.match(second[0]!.input[0]!.text, /was SQLite, now Postgres/);
+    assert.equal(commands.slice(before).filter((command) => command.includes("fm-captain-hold.sh") && command.includes("'answer'")).length, 0);
+    assert.equal(nextCommands.filter((command) => command.includes("fm-captain-hold.sh") && command.includes("'answer'")).length, 0);
+    assert.equal(createOwnerAsks(next.bb.storage.database()).pendingFollowUps().length, 0);
+  } finally {
+    if (next) await next.harness.lifecycle.dispose();
+    await host.harness.lifecycle.dispose();
+    restore();
+  }
+});
+
 test("checker round3: failed prose-question notice is retried until a card can be made", async () => {
   const {host,tasks,asks,restore}=await captainHost({wait1:"needs-decision [key=choice]: Choose Postgres, MySQL or SQLite?\n"});
   let attempts=0;
