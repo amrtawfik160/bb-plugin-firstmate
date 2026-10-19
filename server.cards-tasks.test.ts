@@ -584,6 +584,90 @@ test("a correction to a resolved native question stays pending until the crew qu
   } finally { restore(); await host.harness.lifecycle.dispose(); }
 });
 
+async function checkerCorrectionFixture() {
+ const state={text:'needs-decision [key=choice]: Choose? {"choices":["Postgres","SQLite"]}\n',held:true,shared:false};
+ const result=await captainHost({wait1:state.text});const {host,commands}=result;
+ host.harness.sdk.stub("terminals.output",async({terminalId}:{terminalId:string})=>{
+  const command=commands[Number(terminalId.replace("term",""))-1]??"";let code=0;
+  if(command.includes("fm-captain-hold.sh")&&command.includes("'open'"))code=(command.includes("'choice'")?state.held:command.includes("'wait1'")?state.shared:false)?0:1;
+  if(command.includes("fm-captain-hold.sh")&&command.includes("'answer'")&&command.includes("'choice'"))state.held=false;
+  const payload=command.includes("fm-bearings-snapshot.sh")?JSON.stringify({schema:"fm-bearings.v1",home:"/native",in_flight:[],decisions_open:[],landed:[],gates:[],omitted:[]}):command.includes("/native/state/wait1.status")?state.text:"";
+  const captured=command.includes("FM_HOST_CAPTURE_V1");const out=captured?JSON.stringify({protocol:"FM_HOST_CAPTURE_V1",exitCode:code,stdout:payload,stderr:""}):payload;
+  return {nextSeq:1,chunks:[{dataBase64:Buffer.from(`${out}\n__FM_HOST_RC:${captured?0:code}\n`).toString("base64")}]};
+ });
+ await host.bb.storage.kv.set("crews",[crewRow("wait1","thr_w1")]);
+ const task=result.tasks.open({captain:"thr_cap",project:"Cyndra",title:"Database",sourceRefs:[],crewId:"wait1",at:Date.now()});
+ await host.harness.behavior.runSchedule("task-lifecycle");const card=result.asks.listOpen("thr_cap").find(ask=>ask.task===task.id)!;
+ await host.harness.behavior.callRpc("resolveAsk",{threadId:"thr_cap",id:card.id,resolution:"Postgres"});assert.equal(state.held,false);state.text+='resolved [key=choice]: Postgres\n';
+ return {...result,state,card};
+}
+
+test("checker round6: a correction steers while a newer question owns the shared crew hold",async()=>{
+ const {host,asks,state,card,commands,restore}=await checkerCorrectionFixture();try{
+  state.text+='needs-decision [key=newer]: Which backup? {"choices":["Cloud","Disk"]}\n';state.shared=true;
+  const before=commands.length;const sends=host.harness.sdk.callsTo("threads.send").length;
+  await tool(host,"firstmate_resolve_ask").execute({id:card.id,reopen:true,resolution:"Correction"},ctx);await host.harness.behavior.callRpc("resolveAsk",{threadId:"thr_cap",id:card.id,resolution:"SQLite"});
+  const mutations=commands.slice(before).filter(command=>command.includes("fm-captain-hold.sh")&&command.includes("'answer'"));
+  assert.equal(mutations.length,0,"a correction must not release a newer or unrelated hold");
+  const corrections=host.harness.sdk.callsTo("threads.send").slice(sends).filter(call=>JSON.stringify(call).includes("thr_w1")&&JSON.stringify(call).includes("now SQLite"));
+  console.log("CHECKER R6 newer hold",JSON.stringify({corrections:corrections.length,holdMutations:mutations.length,pending:asks.pendingFollowUps()}));
+  assert.equal(corrections.length,1,"the correction must reach the crew while its newer question remains open");
+ }finally{await host.harness.lifecycle.dispose();restore();}
+});
+
+test("an open question that shares the crew hold still applies native and leaves the other question held", async () => {
+  const choiceNote = 'Choose? {"choices":["Postgres","SQLite"]}';
+  const newerNote = 'Which backup? {"choices":["Cloud","Disk"]}';
+  const state = {
+    text: `needs-decision [key=choice]: ${choiceNote}\nneeds-decision [key=newer]: ${newerNote}\n`,
+    choiceHeld: true,
+    newerHeld: true,
+    shared: true,
+  };
+  const { host, asks, commands, restore } = await captainHost({ wait1: state.text });
+  host.harness.sdk.stub("terminals.output", async ({ terminalId }: { terminalId: string }) => {
+    const command = commands[Number(terminalId.replace("term", "")) - 1] ?? "";
+    let code = 0;
+    if (command.includes("fm-captain-hold.sh") && command.includes("'open'")) {
+      code = (command.includes("'choice'") ? state.choiceHeld : command.includes("'newer'") ? state.newerHeld : command.includes("'wait1'") ? state.shared : false) ? 0 : 1;
+    }
+    if (command.includes("fm-captain-hold.sh") && command.includes("'answer'") && command.includes("'choice'")) state.choiceHeld = false;
+    if (command.includes("fm-captain-hold.sh") && command.includes("'answer'") && command.includes("'wait1'")) state.shared = false;
+    if (command.includes("fm-captain-hold.sh") && command.includes("'answer'") && command.includes("'newer'")) state.newerHeld = false;
+    const payload = command.includes("fm-bearings-snapshot.sh")
+      ? JSON.stringify({ schema: "fm-bearings.v1", home: "/native", in_flight: [], decisions_open: [], landed: [], gates: [], omitted: [] })
+      : command.includes("/native/state/wait1.status") ? state.text : "";
+    const captured = command.includes("FM_HOST_CAPTURE_V1");
+    const out = captured ? JSON.stringify({ protocol: "FM_HOST_CAPTURE_V1", exitCode: code, stdout: payload, stderr: "" }) : payload;
+    return { nextSeq: 1, chunks: [{ dataBase64: Buffer.from(`${out}\n__FM_HOST_RC:${captured ? 0 : code}\n`).toString("base64") }] };
+  });
+  try {
+    await host.bb.storage.kv.set("crews", [crewRow("wait1", "thr_w1")]);
+    const choice = asks.create({
+      captain: "thr_cap", kind: "question", text: "Choose?",
+      options: [{ label: "Postgres", value: "a" }, { label: "SQLite", value: "b" }],
+      sourceRef: `crew-wait:wait1:${createHash("sha256").update(choiceNote).digest("hex").slice(0, 16)}`,
+      createdAt: 1, project: "Cyndra",
+    });
+    asks.create({
+      captain: "thr_cap", kind: "question", text: "Which backup?",
+      options: [{ label: "Cloud", value: "a" }, { label: "Disk", value: "b" }],
+      sourceRef: `crew-wait:wait1:${createHash("sha256").update(newerNote).digest("hex").slice(0, 16)}`,
+      createdAt: 2, project: "Cyndra",
+    });
+    const before = commands.length;
+    const sends = host.harness.sdk.callsTo("threads.send").length;
+    assert.equal((await host.harness.behavior.callRpc("resolveAsk", { threadId: "thr_cap", id: choice.id, resolution: "Postgres" })).ok, true);
+    const answers = commands.slice(before).filter((command) => command.includes("fm-captain-hold.sh") && command.includes("'answer'"));
+    assert.ok(answers.some((command) => command.includes("'choice'")), "the still-open question is applied natively");
+    assert.equal(answers.filter((command) => command.includes("'wait1'") || command.includes("'newer'")).length, 0, "the shared crew hold and the other question stay held");
+    assert.equal(state.shared, true);
+    assert.equal(state.newerHeld, true);
+    const steers = host.harness.sdk.callsTo("threads.send").slice(sends).filter((call) => JSON.stringify(call).includes("thr_w1") && JSON.stringify(call).includes("corrected"));
+    assert.equal(steers.length, 0, "an open shared-hold question does not take the resolved-question steering path");
+  } finally { restore(); await host.harness.lifecycle.dispose(); }
+});
+
 test("checker round3: failed prose-question notice is retried until a card can be made", async () => {
   const {host,tasks,asks,restore}=await captainHost({wait1:"needs-decision [key=choice]: Choose Postgres, MySQL or SQLite?\n"});
   let attempts=0;

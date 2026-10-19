@@ -6299,9 +6299,8 @@ export default async function plugin(bb: BbPluginApi) {
       const keys = [...new Set(matching.map((d) => d.key))];
       const holds: string[] = [];
       for (const id of keys) if (id !== crew.id && await held(id)) holds.push(id);
-      const latest = latestStatus(lines);
-      const belongs = keys.length > 0 || (latest !== null && ask.sourceRef === `crew-wait:${statusKey(crew.id, latest.note)}`);
-      plan = { keys, holds, shared: belongs && await held(crew.id), finished: false, sourceRef: ask.sourceRef, questionFinished: false };
+      const openHere = open.some((d) => ask.sourceRef === `crew-wait:${statusKey(crew.id, d.note)}`);
+      plan = { keys, holds, shared: openHere && await held(crew.id), finished: false, sourceRef: ask.sourceRef, questionFinished: false };
       // Persist both status keys and hold identities before either native mutation.
       await bb.storage.kv.set(storeKey, plan);
     }
@@ -6329,8 +6328,8 @@ export default async function plugin(bb: BbPluginApi) {
         };
         const openIds: string[] = [];
         for (const id of new Set([...plan.holds, ...plan.keys])) if (await sameQuestion(id)) openIds.push(id);
-        // Historical match is not an open decision or hold. Do not claim applied; the caller steers.
-        if (openIds.length === 0 && !plan.shared) return "steer";
+        // A resolved question has no open ids. Steer even if another question owns the crew hold.
+        if (openIds.length === 0) return "steer";
         for (const id of plan.holds) if (openIds.includes(id)) await release(id);
         for (const id of plan.keys) {
           if (openIds.includes(id) && !(await appendResolvedStatus(crew, id, resolution))) throw new Error(`Could not resolve crew status for ${ask.id}.`);
