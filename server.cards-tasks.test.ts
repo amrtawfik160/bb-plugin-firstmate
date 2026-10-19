@@ -4,7 +4,7 @@ import test from "node:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
+import { createFakePluginHost, makeThreadResponse, makeQueueEntry } from "@get-bb/plugin-sdk/testing";
 import plugin from "./server.ts";
 import { createOwnerAsks } from "./lib/owner-asks.ts";
 import { createOwnerTasks } from "./lib/owner-tasks.ts";
@@ -1020,6 +1020,79 @@ test("checker round10: unreadable reconciliation blocks one card only and ends v
   await f.host.harness.behavior.runSchedule("task-lifecycle");assert.equal(others.length,1);assert.equal(checkerCrewSends(f.host).length,0);assert.ok(f.asks.pendingFollowUps().some(job=>job.answerSeq===3));assert.equal((await f.host.bb.storage.kv.get<{state:string}>(f.key))?.state,"unknown");
   const unconfirmed=()=>checkerCrewSends(f.host,"thr_cap").filter(send=>send.input[0].text.includes(`Could not confirm the owner's answer on card ${f.card.id}`));assert.equal(unconfirmed().length,1);await f.host.harness.behavior.runSchedule("task-lifecycle");assert.equal(unconfirmed().length,1);
   for(let i=0;i<8&&!f.asks.failedFollowUps().some(job=>job.askId===f.card.id&&job.answerSeq===2);i++)await f.host.harness.behavior.runSchedule("task-lifecycle");assert.ok(f.asks.failedFollowUps().some(job=>job.askId===f.card.id&&job.answerSeq===2&&job.attempts===8));const board=await f.host.harness.behavior.callRpc("telegramCommand",{threadId:"thr_cap",command:"board"});assert.match(JSON.stringify(board),/answer not delivered to crew wait1/);const failed=()=>checkerCrewSends(f.host,"thr_cap").filter(send=>send.input[0].text.includes(`card ${f.card.id} was not delivered to crew wait1`));assert.equal(failed().length,1);await f.host.harness.behavior.runSchedule("task-lifecycle");assert.equal(failed().length,1);
+ }finally{await f.host.harness.lifecycle.dispose();f.restore();}
+});
+
+async function checkerActualUnknown(){
+ const f=await checkerCorrectionFixture();let marker="";
+ f.host.harness.sdk.stub("threads.events.list",async()=>{throw new Error("event read unavailable during interrupted send");});f.host.harness.sdk.stub("threads.queuedMessages.list",async()=>{throw new Error("queue read unavailable during interrupted send");});
+ f.host.harness.sdk.stub("threads.send",async(input:{threadId:string;input:Array<{text:string}>})=>{if(input.threadId==="thr_w1"){marker=input.input.at(-1)?.text??"";throw new Error("send result unavailable");}return {delivery:"queued"};});
+ await checkerAcceptCorrection(f.host,f.card.id,"SQLite");assert.match(marker,/^askref:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+ const key=`owner-answer-sent:${f.card.id}:2`;const record=await f.host.bb.storage.kv.get<{state:string;marker:string;threadId:string;at:number}>(key);assert.equal(record?.marker,marker);assert.equal(record?.state,"unknown");return {...f,marker,key,record:record!};
+}
+
+for(const place of ["queue","event"])for(const shape of ["contains nonce","marker line in answer","near match","exact nonce from owner"]){
+ test(`checker round11: ${shape} in ${place} cannot authenticate a Firstmate answer`,async()=>{
+  const f=await checkerActualUnknown();let accepted=0;
+  try{
+   const quoted=shape==="contains nonce"?`The owner quoted ${f.marker} in an answer.`:shape==="marker line in answer"?`Owner example:\n${f.marker}\nEnd example.`:shape==="near match"?`${f.marker}-other`:f.marker;
+   const userQueue=makeQueueEntry({threadId:"thr_w1",origin:"app",originPluginId:null,initiator:"user",senderThreadId:null,content:[{type:"text",text:quoted}]});
+   const failedOriginal=makeQueueEntry({threadId:"thr_w1",origin:"plugin",originPluginId:"firstmate",initiator:"agent",senderThreadId:"thr_cap",failureReason:"original answer was not delivered",content:[{type:"text",text:"The owner corrected the answer."},{type:"text",text:f.marker}]});
+   f.host.harness.sdk.stub("threads.queuedMessages.list",async()=>place==="queue"?[failedOriginal,userQueue]:[failedOriginal]);f.host.harness.sdk.stub("threads.events.list",async()=>place==="event"?[checkerEvent(1,quoted)]:[]);f.host.harness.sdk.stub("threads.send",async(input:{threadId:string})=>{if(input.threadId==="thr_w1")accepted++;return {delivery:"queued"};});
+   for(let i=0;i<3;i++)await f.host.harness.behavior.runSchedule("task-lifecycle");console.log("CHECKER R11 owner marker",JSON.stringify({place,shape,accepted,record:await f.host.bb.storage.kv.get(f.key),pending:f.asks.pendingFollowUps()}));assert.equal(accepted,1,"owner-controlled text without a Firstmate owner-answer identity cannot complete the real answer's pending delivery");
+  }finally{await f.host.harness.lifecycle.dispose();f.restore();}
+ });
+}
+
+test("checker round11: actual random nonce survives restart and differs for the next answer",async()=>{
+ const f=await checkerActualUnknown();let next;let nextMarker="";
+ try{
+  next=await checkerReload(f.host,f.state.text);next.harness.sdk.stub("threads.queuedMessages.list",async()=>[makeQueueEntry({threadId:"thr_w1",origin:"plugin",originPluginId:"firstmate",initiator:"agent",senderThreadId:"thr_cap",content:[{type:"text",text:"The owner corrected the answer."},{type:"text",text:f.marker}]})]);next.harness.sdk.stub("threads.events.list",async()=>[]);next.harness.sdk.stub("threads.send",async(input:{threadId:string;input:Array<{text:string}>})=>{if(input.threadId==="thr_w1")nextMarker=input.input.at(-1)?.text??"";return {delivery:"queued"};});
+  await next.harness.behavior.runSchedule("task-lifecycle");assert.equal(nextMarker,"");assert.equal((await next.bb.storage.kv.get<{marker:string}>(f.key))?.marker,f.marker);assert.equal(createOwnerAsks(next.bb.storage.database()).pendingFollowUps().length,0);
+  await checkerAcceptCorrection(next,f.card.id,"Postgres");assert.match(nextMarker,/^askref:[0-9a-f-]{36}$/i);assert.notEqual(nextMarker,f.marker);assert.equal((await next.bb.storage.kv.get<{marker:string}>(`owner-answer-sent:${f.card.id}:3`))?.marker,nextMarker);
+ }finally{if(next)await next.harness.lifecycle.dispose();await f.host.harness.lifecycle.dispose();f.restore();}
+});
+
+test("checker round11: several pages are read at 100 each until the real nonce is found",async()=>{
+ const f=await checkerActualUnknown();const history=Array.from({length:350},(_,i)=>({...checkerEvent(350-i,i===349?f.marker:`later event ${350-i}`),createdAt:f.record.at+350-i}));const reads:Array<{beforeSeq?:string;limit?:string}>=[];
+ try{
+  f.host.harness.sdk.stub("threads.queuedMessages.list",async()=>[]);f.host.harness.sdk.stub("threads.events.list",async(args:{threadId:string;beforeSeq?:string;limit?:string})=>{if(args.threadId!=="thr_w1")return [];reads.push(args);assert.ok(Number(args.limit)<=100);return history.filter(row=>args.beforeSeq===undefined||row.seq<Number(args.beforeSeq)).slice(0,Number(args.limit));});
+  await f.host.harness.behavior.runSchedule("task-lifecycle");assert.equal(reads.length,4);assert.deepEqual(reads.map(row=>row.beforeSeq),[undefined,"251","151","51"]);assert.equal((await f.host.bb.storage.kv.get<{state:string}>(f.key))?.state,"delivered");assert.equal(f.asks.pendingFollowUps().length,0);
+ }finally{await f.host.harness.lifecycle.dispose();f.restore();}
+});
+
+test("checker round11: absence stops at the original intent time",async()=>{
+ const f=await checkerActualUnknown();const reads:string[]=[];const history=Array.from({length:250},(_,i)=>({...checkerEvent(250-i,`older event ${250-i}`),createdAt:f.record.at+250-i-101}));let accepted=0;
+ try{
+  f.host.harness.sdk.stub("threads.queuedMessages.list",async()=>[]);f.host.harness.sdk.stub("threads.events.list",async(args:{beforeSeq?:string;limit?:string})=>{reads.push(args.beforeSeq??"first");assert.ok(Number(args.limit)<=100);return history.filter(row=>!args.beforeSeq||row.seq<Number(args.beforeSeq)).slice(0,Number(args.limit));});f.host.harness.sdk.stub("threads.send",async(input:{threadId:string})=>{if(input.threadId==="thr_w1")accepted++;return {delivery:"queued"};});
+  await f.host.harness.behavior.runSchedule("task-lifecycle");assert.deepEqual(reads,["first","151"]);assert.equal(await f.host.bb.storage.kv.get(f.key),undefined);await f.host.harness.behavior.runSchedule("task-lifecycle");assert.equal(accepted,1);
+ }finally{await f.host.harness.lifecycle.dispose();f.restore();}
+});
+
+test("checker round11: a later page read failure keeps the nonce unknown",async()=>{
+ const f=await checkerActualUnknown();let reads=0;
+ try{
+  f.host.harness.sdk.stub("threads.queuedMessages.list",async()=>[]);f.host.harness.sdk.stub("threads.events.list",async(args:{beforeSeq?:string;limit?:string})=>{reads++;assert.ok(Number(args.limit)<=100);if(args.beforeSeq)throw new Error("second page unavailable");return Array.from({length:100},(_,i)=>({...checkerEvent(300-i,`recent event ${300-i}`),createdAt:f.record.at+300-i}));});
+  await f.host.harness.behavior.runSchedule("task-lifecycle");assert.equal(reads,2);assert.equal((await f.host.bb.storage.kv.get<{state:string;marker:string}>(f.key))?.state,"unknown");assert.equal((await f.host.bb.storage.kv.get<{marker:string}>(f.key))?.marker,f.marker);assert.ok(f.asks.pendingFollowUps().some(job=>job.answerSeq===2&&job.effect==="owner-answered"));
+ }finally{await f.host.harness.lifecycle.dispose();f.restore();}
+});
+
+for(const restart of [false,true])test(`checker round11: slow send failure preserves the original intent time, restart=${restart}`,async()=>{
+ const f=await checkerCorrectionFixture();const realNow=Date.now;let now=realNow();const originalIntentAt=now;Date.now=()=>now;let next;let active=f.host;let accepted=0;let marker="";const history:ReturnType<typeof checkerEvent>[]=[];const reads:Array<{beforeSeq?:string}>=[];const key=`owner-answer-sent:${f.card.id}:2`;
+ try{
+  f.host.harness.sdk.stub("threads.queuedMessages.list",async()=>{throw new Error("read unavailable at send failure");});f.host.harness.sdk.stub("threads.events.list",async()=>{throw new Error("read unavailable at send failure");});
+  f.host.harness.sdk.stub("threads.send",async(input:{threadId:string;input:Array<{text:string}>})=>{if(input.threadId==="thr_w1"){accepted++;marker=input.input.at(-1)?.text??"";history.push(...Array.from({length:221},(_,i)=>({...checkerEvent(221-i,i===220?marker:`crew work event ${221-i}`),createdAt:originalIntentAt+(221-i)*1000})));now=originalIntentAt+10*60_000;throw new Error("response lost after a slow accepted send");}return {delivery:"queued"};});
+  await checkerAcceptCorrection(f.host,f.card.id,"SQLite");const afterError=await f.host.bb.storage.kv.get<{at:number;state:string}>(key);assert.equal(accepted,1);
+  if(restart){next=await checkerReload(f.host,f.state.text);active=next;}
+  active.harness.sdk.stub("threads.queuedMessages.list",async()=>[]);active.harness.sdk.stub("threads.events.list",async(args:{threadId:string;beforeSeq?:string;limit?:string})=>{if(args.threadId!=="thr_w1")return [];reads.push(args);assert.ok(Number(args.limit)<=100);return history.filter(row=>!args.beforeSeq||row.seq<Number(args.beforeSeq)).slice(0,Number(args.limit));});active.harness.sdk.stub("threads.send",async(input:{threadId:string})=>{if(input.threadId==="thr_w1")accepted++;return {delivery:"queued"};});
+  for(let i=0;i<3;i++)await active.harness.behavior.runSchedule("task-lifecycle");console.log("CHECKER R11 intent time",JSON.stringify({restart,originalIntentAt,afterError,reads,accepted,record:await active.bb.storage.kv.get(key),pending:createOwnerAsks(active.bb.storage.database()).pendingFollowUps()}));assert.equal(accepted,1,"changing sending to unknown must not move the time cutoff past an accepted receipt and authorize a duplicate");assert.equal(afterError?.at,originalIntentAt);
+ }finally{Date.now=realNow;if(next)await next.harness.lifecycle.dispose();await f.host.harness.lifecycle.dispose();f.restore();}
+});
+
+test("checker round11: queue-to-event transition is found in the required read order",async()=>{
+ const f=await checkerActualUnknown();const order:string[]=[];const events:ReturnType<typeof checkerEvent>[]=[];
+ try{
+  f.host.harness.sdk.stub("threads.queuedMessages.list",async()=>{order.push("queue");events.push(checkerEvent(1,f.marker));return [];});f.host.harness.sdk.stub("threads.events.list",async()=>{order.push("events");return events;});await f.host.harness.behavior.runSchedule("task-lifecycle");assert.deepEqual(order,["queue","events"]);assert.equal((await f.host.bb.storage.kv.get<{state:string}>(f.key))?.state,"delivered");assert.equal(f.asks.pendingFollowUps().length,0);
  }finally{await f.host.harness.lifecycle.dispose();f.restore();}
 });
 

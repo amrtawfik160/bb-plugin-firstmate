@@ -9673,43 +9673,70 @@ export default async function plugin(bb: BbPluginApi) {
       const prior = sendState(record);
       if (prior === "delivered") return { status: "completed" };
       const marker = typeof record?.marker === "string" && record.marker ? record.marker : `askref:${randomUUID()}`;
+      const intentAt = typeof record?.at === "number" ? record.at : Date.now();
       const writeSend = (state: "sending" | "delivered" | "unknown", threadId?: string) =>
-        bb.storage.kv.set(sentKey, { state, marker, threadId: threadId ?? record?.threadId, at: record?.at ?? Date.now() });
-      const ownerAnswerHasMarker = (value: unknown, needle: string): boolean => {
-        if (!needle || value == null || typeof value !== "object") return false;
-        const row = value as Record<string, unknown>;
-        if (row.failureReason) return false;
-        const texts = (parts: unknown) => Array.isArray(parts) && parts.some((part) => {
-          if (part == null || typeof part !== "object") return false;
-          const item = part as { type?: unknown; text?: unknown };
-          return item.type === "text" && item.text === needle;
-        });
-        const firstmateCorrelation = (obj: Record<string, unknown> | undefined) => {
-          const submission = obj?.pluginSubmission;
-          if (submission == null || typeof submission !== "object") return false;
-          const sub = submission as { pluginId?: unknown; data?: { correlation?: unknown } };
-          return sub.pluginId === "firstmate" && sub.data?.correlation === needle;
-        };
-        if (firstmateCorrelation(row) || texts(row.content) || texts(row.input)) return true;
-        const eventData = row.data;
-        if (eventData != null && typeof eventData === "object") {
-          const data = eventData as Record<string, unknown> & { item?: { type?: unknown; content?: unknown } };
-          if (firstmateCorrelation(data)) return true;
-          if (data.item?.type === "userMessage" && texts(data.item.content)) return true;
-          if (texts(data.input)) return true;
+        bb.storage.kv.set(sentKey, { state, marker, threadId: threadId ?? record?.threadId, at: intentAt });
+      const asRecord = (value: unknown): Record<string, unknown> | undefined =>
+        value != null && typeof value === "object" ? value as Record<string, unknown> : undefined;
+      const texts = (parts: unknown, needle: string) => Array.isArray(parts) && parts.some((part) => {
+        if (part == null || typeof part !== "object") return false;
+        const item = part as { type?: unknown; text?: unknown };
+        return item.type === "text" && item.text === needle;
+      });
+      const firstmateCorrelation = (obj: Record<string, unknown> | undefined, needle: string) => {
+        const submission = obj?.pluginSubmission;
+        if (submission == null || typeof submission !== "object") return false;
+        const sub = submission as { pluginId?: unknown; data?: { correlation?: unknown } };
+        return sub.pluginId === "firstmate" && sub.data?.correlation === needle;
+      };
+      const pluginInitiator = (value: unknown) => value === "agent" || value === "plugin";
+      const firstmateOrigin = (obj: Record<string, unknown> | undefined) =>
+        obj?.originPluginId === "firstmate" && pluginInitiator(obj.initiator);
+      const ownerDenied = (obj: Record<string, unknown> | undefined) =>
+        obj != null && (obj.initiator === "user" || obj.origin === "app" || (typeof obj.originPluginId === "string" && obj.originPluginId !== "firstmate"));
+      const originFieldsAbsent = (obj: Record<string, unknown> | undefined) =>
+        obj != null && obj.origin === undefined && obj.originPluginId === undefined && obj.initiator === undefined;
+      const exactMarker = (row: Record<string, unknown>, data: Record<string, unknown> | undefined, needle: string) => {
+        if (texts(row.content, needle) || texts(row.input, needle)) return true;
+        if (data) {
+          const item = data.item as { type?: unknown; content?: unknown } | undefined;
+          if (item?.type === "userMessage" && texts(item.content, needle)) return true;
+          if (texts(data.input, needle)) return true;
         }
         return false;
       };
+      const nonceCarried = (row: Record<string, unknown>, needle: string) => {
+        const data = asRecord(row.data);
+        return firstmateCorrelation(row, needle) || firstmateCorrelation(data, needle) || exactMarker(row, data, needle);
+      };
+      const ownerAnswerHasMarker = (value: unknown, needle: string, suppressLegacy: boolean): boolean => {
+        if (!needle || value == null || typeof value !== "object") return false;
+        const row = value as Record<string, unknown>;
+        if (row.failureReason) return false;
+        const data = asRecord(row.data);
+        if (ownerDenied(row) || ownerDenied(data)) return false;
+        const corr = firstmateCorrelation(row, needle) || firstmateCorrelation(data, needle);
+        const exact = exactMarker(row, data, needle);
+        if ((firstmateOrigin(row) || firstmateOrigin(data)) && (corr || exact)) return true;
+        if (corr) return true;
+        if (suppressLegacy) return false;
+        return exact && originFieldsAbsent(row) && (data === undefined || originFieldsAbsent(data));
+      };
+      const failedFirstmateExposesNonce = (rows: unknown[], needle: string) => rows.some((value) => {
+        const row = asRecord(value);
+        if (!row?.failureReason || row.originPluginId !== "firstmate") return false;
+        return nonceCarried(row, needle);
+      });
       const discover = async (threadId: string) => {
         const needle = marker;
-        const intentAt = record?.at ?? 0;
         let queued;
         try {
           queued = await raceAbort(bb.sdk.threads.queuedMessages.list({ threadId }), undefined, STUCK_HOST_CALL_MS);
         } catch {
           return "unknown" as const;
         }
-        const queuedHit = queued.some((row) => ownerAnswerHasMarker(row, needle));
+        const suppressLegacy = failedFirstmateExposesNonce(queued, needle);
+        const queuedHit = queued.some((row) => ownerAnswerHasMarker(row, needle, suppressLegacy));
         try {
           let beforeSeq: string | undefined;
           for (;;) {
@@ -9717,7 +9744,7 @@ export default async function plugin(bb: BbPluginApi) {
               threadId, order: "desc", limit: "100", types: ["item/completed"],
               ...(beforeSeq !== undefined ? { beforeSeq } : {}),
             }), undefined, STUCK_HOST_CALL_MS);
-            if (queuedHit || page.some((row) => ownerAnswerHasMarker(row, needle))) return "found" as const;
+            if (queuedHit || page.some((row) => ownerAnswerHasMarker(row, needle, suppressLegacy))) return "found" as const;
             if (page.length === 0) return "absent" as const;
             const oldest = page[page.length - 1]!;
             if (typeof oldest.createdAt === "number" && oldest.createdAt < intentAt) return "absent" as const;
