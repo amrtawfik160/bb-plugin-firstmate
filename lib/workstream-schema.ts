@@ -5,6 +5,8 @@ export const workstreamRepoSchema = z.object({
   repository: z.string(), projectId: z.string(), hostId: z.string(), path: z.string(), sourcePath: z.string(),
   branch: z.string(), environmentId: z.string().nullable(),
   existing: z.boolean().optional(),
+  taskId: z.string().optional(),
+  crewId: z.string().optional(),
 });
 export const jobSchema = z.object({
   id: z.string(), editing: z.boolean(), payload: z.string(),

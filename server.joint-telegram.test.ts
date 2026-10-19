@@ -113,7 +113,13 @@ test("joint: adopt three Cyndra-shaped workstreams of two tasks (one running cre
     host.harness.sdk.stub("threads.list", async () => []);
     host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({
       id: threadId, projectId: "proj_cyndra", status: threadId === "thr_crew_chat" ? "active" : "starting",
+      environmentId: threadId === "thr_crew_chat" ? "env_chat" : undefined,
     }));
+    host.harness.sdk.stub("environments.get", async ({ environmentId }: { environmentId: string }) => (
+      environmentId === "env_chat"
+        ? { id: "env_chat", hostId: "h1", path: "/wt/chat", status: "ready", isWorktree: true, branchName: "fm/chat" }
+        : { id: environmentId, hostId: "h1", path: "/repo/main", status: "ready", isWorktree: false }
+    ));
     host.harness.sdk.stub("threadSections.list", async () => []);
     host.harness.sdk.stub("environments.list", async () => []);
     host.harness.sdk.stub("projects.list", async () => [{ id: "proj_cyndra", name: "Cyndra SaaS" }, { id: "proj_safi", name: "Safi" }]);
@@ -211,7 +217,8 @@ test("joint: adopt three Cyndra-shaped workstreams of two tasks (one running cre
         threadId: "thr_cap", projectId: "proj_cyndra", name: group.name, requestId: group.requestId, taskIds: group.ids,
       }) as { workstream: { id: string; repos: unknown[] } });
     }
-    assert.equal(adopted[0]!.workstream.repos.length, 0);
+    assert.equal(adopted[0]!.workstream.repos.length, 1);
+    assert.equal((adopted[0]!.workstream.repos[0] as { path?: string }).path, "/wt/chat");
     const crew = ((await host.bb.storage.kv.get("crews")) as Array<{ id: string; workstreamId?: string }>).find((row) => row.id === "crew-chat");
     assert.equal(crew?.workstreamId, undefined);
     tg.engine.refreshBoardSoon();

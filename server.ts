@@ -2311,37 +2311,42 @@ export default async function plugin(bb: BbPluginApi) {
   }
   async function adoptedRepos(taskIds: string[], projectId: string): Promise<WorkstreamRepo[]> {
     const rule = projectForName(await projectLabel(projectId));
-    let selection: Awaited<ReturnType<typeof selectExecution>> | undefined;
-    try { selection = await selectExecution(bb, projectId); } catch { /* grouping still works without a checkout */ }
     const fallback = rule?.dev?.repository ?? rule?.repos.find((pattern) => !pattern.includes("*"));
     const crews = await readCrews();
     const repos: WorkstreamRepo[] = [];
     const seen = new Set<string>();
-    const add = (repository: string | undefined, hostId: string | undefined, path: string | undefined, branch: string, environmentId: string | null, sourcePath: string) => {
-      if (!repository || !hostId || !path) return;
-      const key = `${repository.toLowerCase()}:${path}`;
-      if (seen.has(key)) return;
-      seen.add(key);
-      repos.push({ repository, projectId, hostId, path, sourcePath, branch, environmentId, existing: true });
-    };
+    function fail(taskId: string, threadId: string | undefined, reason: string): never {
+      throw new Error(`Cannot resolve the worktree for task ${taskId}${threadId ? ` thread ${threadId}` : ""}: ${reason}`);
+    }
     for (const taskId of taskIds) {
       const task = ownerTasks.get(taskId);
-      for (const crew of crews.filter((c) => task?.crewIds.includes(c.id))) {
-        const envId = await threadEnv(crew.threadId);
-        if (!envId) continue;
+      for (const crewId of task?.crewIds ?? []) {
+        const crew = crews.find((c) => c.id === crewId);
+        if (!crew) fail(taskId, undefined, `crew ${crewId} is missing.`);
+        let envId: string;
+        try {
+          const id = await threadEnv(crew.threadId, undefined, true);
+          if (!id) fail(taskId, crew.threadId, "no environment.");
+          envId = id;
+        } catch (error) {
+          if (error instanceof Error && error.message.startsWith("Cannot resolve the worktree")) throw error;
+          fail(taskId, crew.threadId, error instanceof Error ? error.message : String(error));
+        }
         let env: Record<string, unknown>;
         try { env = asRecord(await bb.sdk.environments.get({ environmentId: envId })); }
-        catch { throw new Error(`Cannot resolve the worktree for task ${taskId}.`); }
+        catch (error) { fail(taskId, crew.threadId, error instanceof Error ? error.message : String(error)); }
         const branch = typeof env["branchName"] === "string" ? env["branchName"] : "";
         const path = typeof env["path"] === "string" ? env["path"] : "";
         const hostId = typeof env["hostId"] === "string" ? env["hostId"] : "";
-        if (!branch || !path || !hostId || env["isWorktree"] === false) throw new Error(`Cannot resolve the worktree for task ${taskId}.`);
+        if (!branch || !path || !hostId || env["isWorktree"] === false) fail(taskId, crew.threadId, "environment is incomplete or is the source checkout.");
         const repository = (crew.prUrl ? prRepoOf(crew.prUrl) : undefined) ?? (task?.prs[0] ? prRepoOf(task.prs[0]) : undefined) ?? fallback;
-        if (!repository) throw new Error(`Cannot resolve the repository for task ${taskId}.`);
-        add(repository, hostId, path, branch, envId, selection?.checkout ?? path);
+        if (!repository) fail(taskId, crew.threadId, "no repository.");
+        const key = `${repository.toLowerCase()}:${path}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        repos.push({ repository, projectId, hostId, path, sourcePath: path, branch, environmentId: envId, existing: true, taskId, crewId: crew.id });
       }
     }
-    if (repos.length === 0) add(fallback, selection?.hostId, selection?.checkout, "main", selection?.environmentId ?? null, selection?.checkout ?? "");
     return repos;
   }
   async function workstreamOperation(action: string, raw: unknown) {
@@ -2411,11 +2416,14 @@ export default async function plugin(bb: BbPluginApi) {
         pr = {url,state:"OPEN",headRefOid:head};
       }
       const attached = new Set(w.taskIds.flatMap((id) => ownerTasks.get(id)?.crewIds ?? []));
-      const builder = (await readCrews()).filter((c) => c.projectId === repo.projectId && (!c.workstreamRepo || c.workstreamRepo.toLowerCase() === repo.repository.toLowerCase()) && (c.workstreamId === w.id || attached.has(c.id)) && c.shape !== "scout" && c.role !== "checker" && c.role !== "lookup" && c.threadId).at(0);
+      const crews = await readCrews();
+      const builder = repo.crewId
+        ? crews.find((c) => c.id === repo.crewId && c.threadId)
+        : crews.filter((c) => c.projectId === repo.projectId && (!c.workstreamRepo || c.workstreamRepo.toLowerCase() === repo.repository.toLowerCase()) && (c.workstreamId === w.id || attached.has(c.id)) && c.shape !== "scout" && c.role !== "checker" && c.role !== "lookup" && c.threadId).at(0);
       if (!builder) throw new Error("Ship needs a finished builder in each repository.");
       await rememberPrUrl(builder,pr.url);
       await discoverCrewDelivery(builder);
-      for (const id of w.taskIds) {
+      for (const id of repo.taskId ? [repo.taskId] : w.taskIds) {
         const task = ownerTasks.get(id);
         if (task && task.state !== "live" && task.state !== "dropped") ownerTasks.linkPr(id,w.threadId,pr.url,Date.now());
       }
@@ -3912,12 +3920,15 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  async function threadEnv(threadId: string, signal?: AbortSignal): Promise<string | null> {
+  async function threadEnv(threadId: string, signal?: AbortSignal, required = false): Promise<string | null> {
     try {
       const thread = await raceAbort(bb.sdk.threads.get({ threadId }), signal, STUCK_HOST_CALL_MS);
       const envId = asRecord(thread)["environmentId"];
-      return typeof envId === "string" ? envId : null;
-    } catch {
+      if (typeof envId === "string" && envId) return envId;
+      if (required) throw new Error(`thread ${threadId} has no environment`);
+      return null;
+    } catch (error) {
+      if (required) throw error;
       return null;
     }
   }

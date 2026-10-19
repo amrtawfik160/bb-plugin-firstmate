@@ -38,6 +38,17 @@ async function adoptHost(status: Record<string, string> = {}) {
   return { host, tasks, open };
 }
 
+function stubCrewWorktrees(host: Awaited<ReturnType<typeof adoptHost>>['host'], status: Record<string, string>, threads: Record<string, { envId: string; path: string; branch: string }>) {
+  host.harness.sdk.stub('threads.get', async ({ threadId }: { threadId: string }) => makeThreadResponse({
+    id: threadId, projectId: 'cyndra', status: status[threadId] ?? 'active',
+    environmentId: threads[threadId]?.envId,
+  }));
+  host.harness.sdk.stub('environments.get', async ({ environmentId }: { environmentId: string }) => {
+    const spec = Object.values(threads).find((row) => row.envId === environmentId);
+    if (spec) return { id: spec.envId, hostId: 'h1', path: spec.path, status: 'ready', isWorktree: true, branchName: spec.branch };
+    return { id: environmentId, hostId: 'h1', path: '/repo/main', status: 'ready', isWorktree: false };
+  });
+}
 
 test('independent refusal matrix: no storage, Telegram or BB side effects', async () => {
  const {host,tasks,open}=await adoptHost();
@@ -61,6 +72,7 @@ test('independent refusal matrix: no storage, Telegram or BB side effects', asyn
 test('independent adoption preserves running crew identity and makes no host action', async()=>{
  const {host,open}=await adoptHost({thr_run:'active'});
  try{
+  stubCrewWorktrees(host,{thr_run:'active'},{thr_run:{envId:'env_original',path:'/wt/original',branch:'feat/original'}});
   const original=[crewRow('builder','thr_run',{environmentId:'env_original',branch:'feat/original',prUrl:'https://github.com/example/repo/pull/1',devLink:'https://original.getbb.app'})];
   await host.bb.storage.kv.set('crews',original);
   const invoked:string[]=[];
@@ -72,12 +84,15 @@ test('independent adoption preserves running crew identity and makes no host act
 });
 test('independent adopted dev link can use existing repository',async()=>{
  const {host,open}=await adoptHost();try{
-  const t=open('Dev');const r=await host.harness.behavior.callRpc('workstreams.adopt',{threadId:'cap',projectId:'cyndra',name:'Dev',requestId:'dev',taskIds:[t.id]}) as any;
+  stubCrewWorktrees(host,{},{thr_dev:{envId:'env_dev',path:'/wt/dev',branch:'fm/dev'}});
+  await host.bb.storage.kv.set('crews',[crewRow('dev','thr_dev')]);
+  const t=open('Dev',{crewId:'dev'});const r=await host.harness.behavior.callRpc('workstreams.adopt',{threadId:'cap',projectId:'cyndra',name:'Dev',requestId:'dev',taskIds:[t.id]}) as any;
   await host.harness.behavior.callRpc('workstreams.devLink',{threadId:'cap',workstreamId:r.workstream.id});
  }finally{await host.harness.lifecycle.dispose()}
 });
 test('independent adopted Ship must inspect existing task PR before release',async()=>{
  const {host,tasks,open}=await adoptHost({thr_builder:'idle'});try{
+  stubCrewWorktrees(host,{thr_builder:'idle'},{thr_builder:{envId:'env_builder',path:'/wt/builder',branch:'fm/builder'}});
   const original=crewRow('builder','thr_builder',{prUrl:'https://github.com/example/repo/pull/88'});await host.bb.storage.kv.set('crews',[original]);
   const t=open('Ready',{crewId:'builder'});tasks.linkPr(t.id,'cap','https://github.com/example/repo/pull/88',Date.now());
   const spawned:any[]=[];const commands:any[]=[];
@@ -121,6 +136,7 @@ test('independent restart after record save or partial attach completes same wor
 
 test('independent adopted follow-up reuses original worktree',async()=>{
  const {host,open}=await adoptHost({thr_run:'active'});try{
+  stubCrewWorktrees(host,{thr_run:'active'},{thr_run:{envId:'env_original',path:'/wt/original',branch:'feat/original'}});
   await host.bb.storage.kv.set('crews',[crewRow('original','thr_run',{environmentId:'env_original'})]);const t=open('Existing',{crewId:'original'});
   const r=await host.harness.behavior.callRpc('workstreams.adopt',{threadId:'cap',projectId:'cyndra',name:'Follow',requestId:'follow',taskIds:[t.id]}) as any;
   const spawned:any[]=[];host.harness.sdk.stub('threads.spawn',async(a:any)=>{spawned.push(a);return{id:'fake_follow'}});
