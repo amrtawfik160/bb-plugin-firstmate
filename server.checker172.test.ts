@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { writeFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import test from "node:test";
+import { fixture } from "./scripts/prompt-fixture.mjs";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import plugin from "./server.ts";
 import { createLaunches, launchKey } from "./lib/launch.ts";
@@ -190,7 +192,8 @@ test("probe: a create-worker RPC still running before reserve resurrects a faile
   host.harness.sdk.stub("files.read",async()=>{readReached=true;await readGate;return {content:"Native validated brief",contentEncoding:"utf8",sizeBytes:22};});
   host.harness.sdk.stub("threads.spawn",async()=>({id:"thr_late_worker"}));
   state.onSpawn=async()=>{
-   pendingCreate=host.harness.behavior.runCli(["create-worker","--json","--task",TASK,"--shape","ship","--project",ctx.projectId,"--home",HOME,"--host","host_1","--path","/repo","--prompt-file","/tmp/brief","--parent",ctx.threadId,"--native-pid","999"],ctx);
+   const token=launchStore(host).forTask(ctx.projectId,ctx.threadId,TASK)?.attemptToken;
+   pendingCreate=host.harness.behavior.runCli(["create-worker","--json","--task",TASK,"--shape","ship","--project",ctx.projectId,"--home",HOME,"--host","host_1","--path","/repo","--prompt-file","/tmp/brief","--parent",ctx.threadId,"--native-pid","999",...(token?["--attempt-token",token]:[])],ctx);
    for(let i=0;i<2000&&!readReached;i++)await Promise.resolve();
    assert.ok(readReached,"create RPC must reach prompt read");
    assert.equal(launchStore(host).forTask(ctx.projectId,ctx.threadId,TASK).state,"reserved");
@@ -208,12 +211,12 @@ test("probe: a create-worker RPC still running before reserve resurrects a faile
 });
 
 test("probe: native lock pid is recognized by the release command",()=>{
- const root=mkdtempSync("/tmp/checker172-lock-");
+ const home=fixture();
  try{
-  const file=root+"/fm-spawn.sh";
+  const file=join(home,"fm-spawn.sh");
   writeFileSync(file,`#!/bin/bash
-export FM_HOME="${root}"
-source /tmp/verify-172-r1/native/bin/fm-wake-lib.sh
+export FM_HOME="${home}"
+source "${home}/bin/fm-wake-lib.sh"
 fm_lock_try_acquire "$STATE/.spawn-test.lock" || exit 1
 pid=$(cat "$STATE/.spawn-test.lock/pid")
 kill -0 "$pid" || exit 2
@@ -223,7 +226,7 @@ case "$native_command" in *fm-spawn.sh*) echo FM_SPAWN_LOCK=live ;; *) echo FM_S
   const r=spawnSync("bash",[file],{encoding:"utf8"});
   assert.equal(r.status,0,r.stderr);assert.match(r.stdout,/FM_SPAWN_LOCK=live/);
   console.log("CONFIRMED: actual native symlink lock and pid file recognized as live");
- }finally{rmSync(root,{recursive:true,force:true});}
+ }finally{rmSync(home,{recursive:true,force:true});}
 });
 
 test("probe: wrapped diagnostic is mistaken for a finished spawn",async()=>{

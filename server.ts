@@ -1825,6 +1825,11 @@ export default async function plugin(bb: BbPluginApi) {
   const pluginStartedAt = Date.now();
   const queueStore = createQueueStore(bb.storage.database(), () => bb.storage.kv.get(QUEUE_KEY));
   const launches = createLaunches(bb.storage.database());
+  const activeCreateAttempts = new Map<string, string>();
+  function createRequestActive(record: LaunchRecord): boolean {
+    if (activeCreateAttempts.has(record.key)) return true;
+    return record.createWorkerStarted === true && !(record.updatedAt < pluginStartedAt);
+  }
   const reports=scoutReports(bb.storage.database());
   const deliveries = createDeliveries(bb.storage.database());
   const quality = createQualityEvents(bb.storage.database());
@@ -4354,7 +4359,7 @@ export default async function plugin(bb: BbPluginApi) {
     const pendingKey=launchKey(crew.projectId,crew.parentThreadId ?? "",crew.nativeHome ?? "",crew.id);
     const endedBeforeCreation=(reason:string)=>{
       const rec=launches.get(pendingKey);
-      if (rec?.state === "reserved" && rec.creationRequested !== true && rec.createWorkerStarted !== true) launches.update(pendingKey,{ state:"failed",error:reason });
+      if (rec && rec.state === "reserved" && rec.creationRequested !== true && !createRequestActive(rec)) launches.update(pendingKey,{ state:"failed",error:reason });
     };
     const refused=(message:string)=>{ endedBeforeCreation(message.slice(0,300)); return new Error(message); };
     // Refuse a brief native would refuse BEFORE any backlog row exists, so a bad
@@ -4468,11 +4473,13 @@ export default async function plugin(bb: BbPluginApi) {
         signal,
         returnChecked: true,
       }));
-      if (typeof res.exitCode === "number") observedExitCode = res.exitCode;
+      if (res.fromMarker === true && typeof res.exitCode === "number") observedExitCode = res.exitCode;
       if (res.exitCode !== 0) {
         spawnFailed = true;
-        spawnEnded = typeof res.exitCode === "number";
-        spawnFailure = `fm-spawn exit ${res.exitCode}: ${withoutWakeWarning(res.output).slice(-2000)}`;
+        spawnEnded = res.fromMarker === true && typeof res.exitCode === "number";
+        spawnFailure = spawnEnded
+          ? `fm-spawn exit ${res.exitCode}: ${withoutWakeWarning(res.output).slice(-2000)}`
+          : `fm-spawn ended without a native return-code marker: ${withoutWakeWarning(res.output).slice(-2000)}`;
         // LOUD (B1): a non-zero fm-spawn exit (e.g. the brief-refusal that made every
         // real spawn fail) must be an error, not a muffled warn.
         bb.log.error(`real transport spawn crew=${crew.id} exit=${res.exitCode} ${res.output.slice(0, 600)}`);
@@ -5197,6 +5204,7 @@ export default async function plugin(bb: BbPluginApi) {
     const nativePid=flagStr(flags,"native-pid");
     if (!nativePid || !/^\d+$/.test(nativePid)) throw new Error("Internal creation requires a native spawn process identity.");
     const attemptToken=flagStr(flags,"attempt-token");
+    const myToken=attemptToken ?? "";
     const admission=await runOnHost(hostId,["set -eu",
       `test -d ${shQuote(`${home}/state/.spawn-${taskId}.lock`)}`,
       `[ "$(cat ${shQuote(`${home}/state/.spawn-${taskId}.lock/pid`)})" = ${shQuote(nativePid)} ]`,
@@ -5206,16 +5214,20 @@ export default async function plugin(bb: BbPluginApi) {
     ].join("\n"),15_000,launchAbort.signal);
     requireNativeSuccess(admission,"native launch admission proof");
     const key = launchKey(projectId, owner, home, taskId);
+    try {
     const refuseSupersededCreate = (record: LaunchRecord | undefined) => {
       if (record?.state === "failed") throw new Error("Creation refused: this launch attempt was failed or superseded.");
     };
-    const refuseTokenMismatch = (record: LaunchRecord | undefined) => {
-      if (record?.attemptToken && attemptToken !== record.attemptToken) throw new Error("Creation refused: attempt token mismatch.");
-    };
     let bound = launches.get(key);
     refuseSupersededCreate(bound);
-    if (bound && bound.state !== "deleted") launches.update(key, { createWorkerStarted: true });
-    else if (!bound) bound = await launches.reserve({ key, taskId, projectId, owner, home, generation:1,shape,nativeInvoked:true,deliveryMode:flagStr(flags,"delivery-mode"),deliveryRequirement:z.enum(["pr","merged","merged-and-verified"]).parse(flagStr(flags,"delivery-requirement") ?? "merged"),state:"reserved",threadId:null,hostId,creationRequested:false,attemptToken,createWorkerStarted:true,updatedAt:Date.now() }, () => launchCapacity(owner || undefined));
+    if (bound && bound.state !== "deleted") {
+      if ((bound.attemptToken ?? "") !== myToken) throw new Error("Creation refused: attempt token mismatch.");
+      launches.update(key, { createWorkerStarted: true });
+      activeCreateAttempts.set(key, myToken);
+    } else if (!bound) {
+      bound = await launches.reserve({ key, taskId, projectId, owner, home, generation:1,shape,nativeInvoked:true,deliveryMode:flagStr(flags,"delivery-mode"),deliveryRequirement:z.enum(["pr","merged","merged-and-verified"]).parse(flagStr(flags,"delivery-requirement") ?? "merged"),state:"reserved",threadId:null,hostId,creationRequested:false,attemptToken,createWorkerStarted:true,updatedAt:Date.now() }, () => launchCapacity(owner || undefined));
+      activeCreateAttempts.set(key, myToken);
+    }
     const selection = await selectExecution(bb, projectId, hostId);
     if (shape !== "secondmate" && selection.checkout !== path) throw new Error("Native project path does not match selected host checkout.");
     const permissionMode = capPermission(toPermissionMode(flagStr(flags, "permission-mode")), await parentPermission(owner || undefined));
@@ -5243,7 +5255,6 @@ export default async function plugin(bb: BbPluginApi) {
     const prompt = read.contentEncoding === "base64" ? Buffer.from(read.content,"base64").toString("utf8") : read.content;
     let record = launches.get(key);
     refuseSupersededCreate(record);
-    refuseTokenMismatch(record);
     if (!record) throw new Error("Creation refused: launch reservation missing.");
     record = await reconcileLaunch(record);
     const suppliedContract=flagStr(flags,"delivery-requirement");
@@ -5258,7 +5269,7 @@ export default async function plugin(bb: BbPluginApi) {
       visibility:flags.has("hidden") ? "hidden" : "visible",
       pluginMetadata: { launchKey:key,generation:1,nativeHome:shape === "secondmate" ? path : home,
         ...(shape === "secondmate" ? { captain:"true",nativeTaskId:taskId,nativeParentHome:home,...(parentRuntime?{nativeRuntimeRelease:parentRuntime.release}:{}) } : { crew:"true",crewId:taskId,shape,posture:flagStr(flags,"delivery-mode") ?? "direct-PR",worktree:!flags.has("shared-env"),deliveryRequirement:recoveredContract({},record) }) },
-    }), launchAbort.signal);
+    }), launchAbort.signal, 30_000, myToken);
     if (shape === "secondmate") {
       if(parentRuntime) {
         const bound=await nativeRuntime.operation(hostId,"bind-seeded",{home:path,captain:created.threadId!,release:parentRuntime.release,parentHome:home,parentCaptain:owner,taskId},launchAbort.signal);
@@ -5287,6 +5298,15 @@ export default async function plugin(bb: BbPluginApi) {
     } while (Date.now()<deadline);
     launches.update(key,{ state:"provisioning",error:"Environment is still provisioning; native isolation guard has not run." });
     throw new Error(`Worker ${created.threadId} is still provisioning. It is retained under task ${taskId}; reconcile before retrying.`);
+    } finally {
+      if (activeCreateAttempts.get(key) === myToken) {
+        activeCreateAttempts.delete(key);
+        const latest = launches.get(key);
+        if (latest && latest.creationRequested !== true && (latest.attemptToken ?? "") === myToken && latest.createWorkerStarted === true) {
+          launches.update(key, { createWorkerStarted: false });
+        }
+      }
+    }
   }
 
   function strictReasoning(value: unknown): ReasoningLevel | undefined {
@@ -6880,7 +6900,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   function releaseEligible(record: LaunchRecord | undefined, boundHome: string): record is LaunchRecord {
-    return !!record && record.state === "uncertain" && !record.threadId && record.creationRequested !== true && !record.adoption && record.home === boundHome;
+    return !!record && record.state === "uncertain" && !record.threadId && record.creationRequested !== true && !record.adoption && record.home === boundHome && !createRequestActive(record);
   }
 
   async function inventoryForRelease(record: LaunchRecord, signal: AbortSignal) {
@@ -6903,6 +6923,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (record.creationRequested === true) throw new Error("Release refused: creation was requested.");
     if (record.adoption) throw new Error("Release refused: adoption is in progress.");
     if (record.home !== home) throw new Error("Release refused: launch home does not match the bound native home.");
+    if (createRequestActive(record)) throw new Error("Release refused: a create-worker request is still active.");
     if (record.creationRequested === undefined && !(record.updatedAt < pluginStartedAt)) {
       throw new Error("Release refused: no plugin process boundary after the record's last update.");
     }
@@ -6924,11 +6945,12 @@ export default async function plugin(bb: BbPluginApi) {
       if (second) throw new Error(`Release refused: a matching thread ${second} exists.`);
       const lockAfter = await inspectSpawnLock(latest, signal);
       if (lockAfter === "live") throw new Error("Release refused: a live fm-spawn lock is still held.");
+      if (activeCreateAttempts.has(latest.key)) throw new Error("Release refused: a create-worker request is still active.");
       if (latest.creationRequested === undefined && !(snapshot.updatedAt < pluginStartedAt)) {
         throw new Error("Release refused: no plugin process boundary after the record's last update.");
       }
       const reason = "Released: no worker was created; two discovery reads 30s apart found no thread and the spawn lock is not live.";
-      const released = launches.compareAndReleaseFailed(snapshot, home, reason);
+      const released = launches.compareAndReleaseFailed(snapshot, home, reason, pluginStartedAt);
       return { taskId: released.taskId, state: "failed" as const };
     });
   }
@@ -7022,8 +7044,8 @@ export default async function plugin(bb: BbPluginApi) {
       } catch (error) {
         const latest = launches.get(key)!;
         const observed = error instanceof NativeSpawnAttemptError ? error.observedExitCode : undefined;
-        const inFlight = latest.createWorkerStarted === true;
-        if (latest.state === "reserved" && latest.creationRequested !== true && !inFlight && (!latest.nativeInvoked || typeof observed === "number")) launches.update(key, { state: "failed", error: String(error) });
+        const inFlight = createRequestActive(latest);
+        if (latest.state === "reserved" && latest.creationRequested !== true && !inFlight && (!latest.nativeInvoked || (typeof observed === "number" && observed !== 0))) launches.update(key, { state: "failed", error: String(error) });
         else if (latest.state !== "failed" && latest.state !== "deleted") launches.update(key, { state: latest.threadId ? "provisioning" : "uncertain", error: String(error) });
         const ended = launches.get(key)?.state ?? "uncertain";
         const next = ended === "failed"
@@ -7202,6 +7224,9 @@ export default async function plugin(bb: BbPluginApi) {
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         bb.log.error(`real transport refused crew=${crew.id}: ${reason}`);
+        if (error instanceof NativeSpawnAttemptError) {
+          throw new NativeSpawnAttemptError(`Real dispatch ${crew.id} stopped: ${reason}`, error.observedExitCode);
+        }
         throw new Error(`Real dispatch ${crew.id} stopped: ${reason}`);
       }
     }
@@ -11754,7 +11779,7 @@ export default async function plugin(bb: BbPluginApi) {
     command: string,
     timeoutMs: number,
     signal?: AbortSignal,
-  ): Promise<{ exitCode: number | null; output: string }> {
+  ): Promise<{ exitCode: number | null; output: string; fromMarker?: boolean }> {
     signal?.throwIfAborted();
     // Capture only the cleanup callback while the plugin context is live. A late
     // create reply must still be closed after disposal invalidates bb.sdk access.
@@ -11811,10 +11836,10 @@ export default async function plugin(bb: BbPluginApi) {
           );
         }
         const parsed = parseHostRc(output);
-        if (parsed !== null) return parsed;
+        if (parsed !== null) return { ...parsed, fromMarker: true };
         if (status === "exited" && outputRead) {
           const exitCode = asRecord(cur)["exitCode"];
-          return { exitCode: typeof exitCode === "number" ? exitCode : 1, output: stripAnsi(output) };
+          return { exitCode: typeof exitCode === "number" ? exitCode : null, output: stripAnsi(output), fromMarker: false };
         }
         await sleep(250);
       }
@@ -11841,7 +11866,7 @@ export default async function plugin(bb: BbPluginApi) {
     timeoutMs: number,
     signal?: AbortSignal,
     stdin?: string,
-  ): Promise<{ exitCode: number | null; output: string }> {
+  ): Promise<{ exitCode: number | null; output: string; fromMarker?: boolean }> {
     if (stdin === undefined) return runHostCommand(hostId, command, timeoutMs, signal);
     const tmp = `/tmp/.fm-stdin-${randomUUID()}`;
     if (!(await writeHostBytes(hostId, tmp, stdin, timeoutMs, signal))) {
@@ -12338,7 +12363,7 @@ export default async function plugin(bb: BbPluginApi) {
     receipt?: { action: "receive" | "inspect" | "begin-action" | "mark-success" | "complete" | "complete-hidden" | "legacy-ack"; id?: string };
     // The caller already ran the away-return checks for this start.
     returnChecked?: boolean;
-  }): Promise<{ exitCode: number | null; output: string; scriptPath: string; receipt?: WakeReceipt }> {
+  }): Promise<{ exitCode: number | null; output: string; scriptPath: string; receipt?: WakeReceipt; fromMarker?: boolean }> {
     const script = normalizeFmScript(input.script);
     if (script === "spawn" && input.returnChecked !== true) await reconcileReturnedAfk(input.parentThreadId);
     if (["spawn", "pr-merge", "merge-local"].includes(script) && input.returnChecked !== true) await guardReturnCatchup(input.hostId, input.fmHome);

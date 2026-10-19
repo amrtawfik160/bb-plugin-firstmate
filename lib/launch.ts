@@ -123,18 +123,20 @@ export function createLaunches(db: Database) {
     inFlight.set(key, work);
     return work;
   }
-  function compareAndReleaseFailed(expected: LaunchRecord, boundHome: string, reason: string): LaunchRecord {
+  function compareAndReleaseFailed(expected: LaunchRecord, boundHome: string, reason: string, pluginStartedAt?: number): LaunchRecord {
     return db.transaction(() => {
       const current = get(expected.key);
+      const createStillActive = current?.createWorkerStarted === true && !(pluginStartedAt !== undefined && current.updatedAt < pluginStartedAt);
       if (!current || current.key !== expected.key || current.updatedAt !== expected.updatedAt ||
           current.state !== 'uncertain' || current.threadId || current.creationRequested === true ||
-          current.adoption || current.home !== boundHome || current.home !== expected.home) {
+          current.adoption || current.home !== boundHome || current.home !== expected.home ||
+          createStillActive) {
         throw new Error('Release refused: the launch changed before the slot could be freed.');
       }
       return update(expected.key, { state: 'failed', error: reason });
     })();
   }
-  async function create(key: string, spawn: () => Promise<{ id: string }>, signal?: AbortSignal, timeoutMs=30_000) {
+  async function create(key: string, spawn: () => Promise<{ id: string }>, signal?: AbortSignal, timeoutMs=30_000, expectedAttemptToken?: string) {
     return once(key, async () => {
       const record = get(key);
       if (!record) throw new Error('Launch reservation missing');
@@ -146,6 +148,9 @@ export function createLaunches(db: Database) {
       db.transaction(() => {
         const current=get(key)!;
         if (current.state !== 'reserved') throw new Error(`Launch ${current.taskId} requires reconciliation before creation.`);
+        if (expectedAttemptToken !== undefined && (current.attemptToken ?? "") !== expectedAttemptToken) {
+          throw new Error('Creation refused: attempt token mismatch.');
+        }
         update(key, { state: 'creating', creationRequested: true });
       })();
       try {
