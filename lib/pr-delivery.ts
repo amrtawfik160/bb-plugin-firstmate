@@ -31,8 +31,9 @@ export interface DeliveryRecord {
   unverifiedMerge?: { words: string; actor: string; headSha: string; at: number } | null;
   /** What was driven on the real changed surface at commitSha, and what was seen. crewId names the crew that recorded it;
    * actor "owner" with no crew is the owner's Works tap on a device proof card. surface is where the proof came from
-   * (owner/projects.json), build the app build the owner tested. */
-  verification?: { crewId: string | null; actor: string; commitSha: string; driven: string; seen: string; at: number; surface?: string; build?: string } | null;
+   * (owner/projects.json), build the app build the owner tested. tappedCommitSha is the PR head the owner tapped when
+   * that tap covers a same-tree merge commit; treesMatched records that GitHub reported equal trees. */
+  verification?: { crewId: string | null; actor: string; commitSha: string; driven: string; seen: string; at: number; surface?: string; build?: string; tappedCommitSha?: string; treesMatched?: true; treeSha?: string } | null;
   /** The last checker crew's verdict on this PR at commitSha, with the model it ran on. */
   check?: CheckVerdict | null;
   updatedAt: number;
@@ -55,6 +56,18 @@ export function verifiedBy(r: Pick<DeliveryRecord,'verification'>): 'crew' | 'ow
   if (!v) return null;
   if (v.crewId) return 'crew';
   return v.actor === OWNER_ACTOR ? 'owner' : 'captain';
+}
+const sameCommit = (full:string, given:string) => full === given || (/^[0-9a-f]{7,}$/i.test(given.trim()) && full.toLowerCase().startsWith(given.trim().toLowerCase()));
+/** An owner Works tap on this PR's head that can cover the merge commit when GitHub trees match. */
+export function ownerWorksHeadTap(r: Pick<DeliveryRecord,'headSha'|'mergeCommitSha'|'verification'|'verifiedCommitSha'>): { tappedSha: string; mergeSha: string } | null {
+  const v = r.verification;
+  if (!v || v.actor !== OWNER_ACTOR || v.crewId) return null;
+  if (v.seen.trim().toLowerCase() !== 'works') return null;
+  const merge = r.mergeCommitSha, head = r.headSha;
+  if (!merge || !head || !v.commitSha) return null;
+  if (!sameCommit(head, v.commitSha) && !sameCommit(v.commitSha, head)) return null;
+  if (r.verifiedCommitSha && sameCommit(merge, r.verifiedCommitSha)) return null;
+  return { tappedSha: head, mergeSha: merge };
 }
 export function canonicalPr(url: string) {
   const m = /^https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)(?:[/?#].*)?$/.exec(url.trim());
@@ -372,12 +385,11 @@ export function createDeliveries(db: Database) {
     if (ids.length) matching.push(`id IN (${ids.map(()=>'?').join(',')})`);
     return (db.prepare(`SELECT record FROM deliveries WHERE ${matching.join(' OR ')} ORDER BY id`).all(...taskIds,...ids) as {record:string}[]).map(row=>JSON.parse(row.record) as DeliveryRecord);
   }
-  const sameCommit = (full:string, given:string) => full === given || (/^[0-9a-f]{7,}$/.test(given.trim().toLowerCase()) && full.toLowerCase().startsWith(given.trim().toLowerCase()));
   /** Records what was driven on the real changed surface and what was seen. An open PR is
    * verified at its current head; a merged one at its merge commit. The commit may be a hex
    * prefix of 7 or more characters; the record keeps the full SHA. The owning manager
    * records it, or a crew the caller vouched for (crewId). */
-  function verify(id:string, actor:string, commitSha:string, evidence:{driven:string; seen:string; surface?:string; build?:string}, crewId:string|null=null) {
+  function verify(id:string, actor:string, commitSha:string, evidence:{driven:string; seen:string; surface?:string; build?:string; tappedCommitSha?:string; treeSha?:string}, crewId:string|null=null) {
     const r=get(id); if (!r) throw new Error(`Unknown deliverable ${id}`);
     if (crewId === null && r.owner !== actor && actor !== OWNER_ACTOR) throw new Error(`Only the owning manager can verify ${r.id}`);
     const merged=r.status === 'merged-needs-verification' || r.status === 'merged-unverified';
@@ -392,7 +404,9 @@ export function createDeliveries(db: Database) {
     if (!driven || !seen) throw new Error(`Verifying ${r.id} needs driven (what you drove on the real changed surface) and seen (what you saw). CI and unit tests are not verification.`);
     const at=Date.now(), sha=(openPr ? r.headSha : r.mergeCommitSha)!;
     const surface=evidence.surface?.trim(), build=evidence.build?.trim();
-    const verification={ crewId, actor, commitSha:sha, driven, seen, at, ...(surface ? { surface } : {}), ...(build ? { build } : {}) };
+    const tapped=evidence.tappedCommitSha?.trim(), tree=evidence.treeSha?.trim();
+    const verification={ crewId, actor, commitSha:sha, driven, seen, at, ...(surface ? { surface } : {}), ...(build ? { build } : {}),
+      ...(tapped ? { tappedCommitSha:tapped, treesMatched:true as const } : {}), ...(tree ? { treeSha:tree } : {}) };
     const disposition={ reason:`driven: ${driven}; seen: ${seen}`,actor,at };
     if (openPr) return save({ ...r, verifiedCommitSha:sha, verification, disposition, nextCheckAt:0, updatedAt:at });
     return save({ ...r, status:'complete', verifiedCommitSha:sha, verification, notification:{...r.notification,desired:null,attempted:null},disposition,blocker:'',nextAction:'Delivery contract satisfied',updatedAt:at });

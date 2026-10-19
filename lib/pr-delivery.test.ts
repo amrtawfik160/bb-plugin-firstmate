@@ -3,7 +3,7 @@ import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { formatBoard } from "./owner-board.ts";
 import { spawnSync } from "node:child_process";
-import { boardPullRequests, createDeliveries, decisionLine, parseForge, PR_VIEW_JQ, prBranchOwner, type DeliveryRecord } from "./pr-delivery.ts";
+import { boardPullRequests, createDeliveries, decisionLine, OWNER_ACTOR, ownerWorksHeadTap, parseForge, PR_VIEW_JQ, prBranchOwner, type DeliveryRecord } from "./pr-delivery.ts";
 
 function record(n: number, over: Partial<DeliveryRecord> = {}): DeliveryRecord {
   return {
@@ -337,6 +337,20 @@ test("a verification record needs what was driven and what was seen; a CI senten
 
 // PR 129 review: a waiver given for head A still counted after a push to head B, so an
 // outside merge of B read complete instead of merged-unverified.
+test("an owner Works tap on the PR head is eligible to cover a later merge commit", () => {
+  const head = HEAD_2315, merge = MERGE_2315;
+  const tap = (over: Partial<DeliveryRecord> = {}) => ownerWorksHeadTap({
+    headSha: head, mergeCommitSha: merge, verifiedCommitSha: head,
+    verification: { crewId: null, actor: OWNER_ACTOR, commitSha: head, driven: "tested build 6", seen: "Works", at: 1, surface: "iphone", build: "6" },
+    ...over,
+  });
+  assert.deepEqual(tap(), { tappedSha: head, mergeSha: merge });
+  assert.equal(tap({ verification: { crewId: "woo1", actor: "thr_woo", commitSha: head, driven: "web", seen: "ok", at: 1 } }), null, "a crew record is not a Works tap");
+  assert.equal(tap({ verification: { crewId: null, actor: OWNER_ACTOR, commitSha: head, driven: "tested", seen: "Does not work", at: 1 } }), null, "Broken is not Works");
+  assert.equal(tap({ headSha: "2222222222222222222222222222222222222222" }), null, "a tap for another head is not this PR's head at merge");
+  assert.equal(tap({ verifiedCommitSha: merge, verification: { crewId: null, actor: OWNER_ACTOR, commitSha: merge, driven: "tested", seen: "Works", at: 1 } }), null, "already covers the merge");
+});
+
 test("an owner waiver covers only the head it was given for", () => {
   const store = createDeliveries(new DatabaseSync(":memory:") as never);
   const r = track(store, "merged");

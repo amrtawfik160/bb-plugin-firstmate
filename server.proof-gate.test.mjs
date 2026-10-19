@@ -44,7 +44,19 @@ function hostCommands(host,nativeWorker) {
  host.harness.sdk.stub('terminals.output',async({terminalId})=>{const command=byId.get(terminalId);const out=nativeWorker && command.includes("^bb_thread_id=") ? {payload:nativeWorker} : forge(command);const captured=command.includes('FM_HOST_CAPTURE_V1');const payload=captured?JSON.stringify({protocol:'FM_HOST_CAPTURE_V1',exitCode:out.code??0,stdout:out.payload??'',stderr:''}):out.payload??'';return{nextSeq:1,chunks:[{dataBase64:Buffer.from(`${payload}\n__FM_HOST_RC:${captured?0:out.code ?? 0}\n`).toString('base64')}]};});
  return commands;
 }
+const MERGE_SHA='ab73ad9242afa06ac55dcb74e279674578d65534';
+const SAME_TREE='dcb1515659f1bed7f18973876fedd95f442c18da';
+const OTHER_TREE='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+/** Tests set a commit sha to a tree sha, or null to fail the GitHub read. */
+const commitTrees=new Map();
 function forge(command) {
+ const git=/\/git\/commits\/([0-9a-f]+)/i.exec(command);
+ if(git){
+  const sha=git[1];
+  const hit=[...commitTrees.entries()].find(([k])=>k.toLowerCase().startsWith(sha.toLowerCase())||sha.toLowerCase().startsWith(k.toLowerCase()));
+  if(hit&&hit[1]===null)return{code:1,payload:`Not Found: commit ${sha}`};
+  return{payload:hit?hit[1]:SAME_TREE};
+ }
  const n=Number(/\/pull\/(\d+)/.exec(command)?.[1]);
  if(command.includes('fm-pr-merge.sh'))return{payload:`verified: ${url(repoOfNumber(n),n)} is merged (state=MERGED, merged=true, isInMergeQueue=false)`};
  if(command.includes('gh pr checks'))return{code:0,payload:JSON.stringify([{name:'build',bucket:'pass'}])};
@@ -459,5 +471,101 @@ for (const [repo,n,thread] of [[WOO,130,'thr_woo'],[SAFI,77,'thr_safi']]) for (c
    assert.equal(store.get(id).verifiedCommitSha,'b'.repeat(40));
    assert.equal(store.get(id).verification.build,'42');
   }
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+const mergeObs=(headSha,mergeSha)=>({headSha,state:'merged',draft:false,checks:'passing',review:'approved',reviewHeadSha:headSha,mergeCommitSha:mergeSha,mergeable:'mergeable'});
+async function worksTapThenMerge() {
+ const ctx=await deck({requirement:'merged-and-verified'});
+ const id=key(WOO,130);
+ const asked=text(await deliveries(ctx.host,{action:'device-proof',id,commitSha:head(130).slice(0,7),build:'6',link:'https://testflight.apple.com/join/abc',check:'Send a photo'},'thr_woo'));
+ const askId=/card (a[0-9a-z]{6})/.exec(asked)?.[1];
+ assert.ok(askId,asked);
+ await ctx.tap(askId,'Works');
+ assert.equal(ctx.store.get(id).verifiedCommitSha,head(130));
+ ctx.store.observe(id,mergeObs(head(130),MERGE_SHA),true);
+ assert.equal(ctx.store.get(id).status,'merged-needs-verification');
+ return {...ctx,id};
+}
+
+test('same-tree merge with a head Works tap: verify at the merge commit passes',async()=>{
+ commitTrees.set(head(130),SAME_TREE);commitTrees.set(MERGE_SHA,SAME_TREE);
+ const {host,store,id}=await worksTapThenMerge();
+ try {
+  const out=text(await deliveries(host,{action:'verify',id,commitSha:MERGE_SHA.slice(0,7),driven:'the owner already tapped Works',seen:'Works',surface:'iphone'},'thr_woo'));
+  assert.doesNotMatch(out,/Refusing/);
+  const row=store.get(id);
+  assert.equal(row.status,'complete');
+  assert.equal(row.verifiedCommitSha,MERGE_SHA);
+  assert.equal(row.verification.actor,'owner');
+  assert.equal(row.verification.tappedCommitSha,head(130));
+  assert.equal(row.verification.treesMatched,true);
+ }finally{commitTrees.clear();await host.harness.lifecycle.dispose();}
+});
+
+test('a Works tap does not cover a merge commit whose tree differs',async()=>{
+ commitTrees.set(head(130),SAME_TREE);commitTrees.set(MERGE_SHA,OTHER_TREE);
+ const {host,store,id}=await worksTapThenMerge();
+ try {
+  const out=text(await deliveries(host,{action:'verify',id,commitSha:MERGE_SHA.slice(0,7),driven:'the owner already tapped Works',seen:'Works',surface:'iphone'},'thr_woo'));
+  assert.match(out,/trees differ/i);
+  assert.equal(store.get(id).status,'merged-needs-verification');
+  assert.equal(store.get(id).verifiedCommitSha,head(130));
+ }finally{commitTrees.clear();await host.harness.lifecycle.dispose();}
+});
+
+test('a Does not work tap does not cover the merge commit',async()=>{
+ const {host,store,tap}=await deck({requirement:'merged-and-verified'});
+ try {
+  const id=key(WOO,130);
+  const asked=text(await deliveries(host,{action:'device-proof',id,commitSha:head(130).slice(0,7),build:'6',link:'https://testflight.apple.com/join/abc',check:'Send a photo'},'thr_woo'));
+  const askId=/card (a[0-9a-z]{6})/.exec(asked)[1];
+  await tap(askId,'Does not work');
+  store.observe(id,mergeObs(head(130),MERGE_SHA),true);
+  commitTrees.set(head(130),SAME_TREE);commitTrees.set(MERGE_SHA,SAME_TREE);
+  const out=text(await deliveries(host,{action:'verify',id,commitSha:MERGE_SHA.slice(0,7),driven:'retry',seen:'Works',surface:'iphone'},'thr_woo'));
+  assert.match(out,/Refusing/);
+  assert.equal(store.get(id).verifiedCommitSha,null);
+  assert.equal(store.get(id).status,'merged-needs-verification');
+ }finally{commitTrees.clear();await host.harness.lifecycle.dispose();}
+});
+
+test("a Works tap on another PR does not cover this PR's merge commit",async()=>{
+ const {host,store,tap}=await deck({requirement:'merged-and-verified'});
+ try {
+  const other=key(WOO,112);
+  const asked=text(await deliveries(host,{action:'device-proof',id:other,commitSha:head(112).slice(0,7),build:'6',link:'https://testflight.apple.com/join/abc',check:'Send a photo'},'thr_woo3'));
+  const askId=/card (a[0-9a-z]{6})/.exec(asked)[1];
+  await tap(askId,'Works');
+  const id=key(WOO,130);
+  store.observe(id,mergeObs(head(130),MERGE_SHA),true);
+  commitTrees.set(head(112),SAME_TREE);commitTrees.set(head(130),SAME_TREE);commitTrees.set(MERGE_SHA,SAME_TREE);
+  const out=text(await deliveries(host,{action:'verify',id,commitSha:MERGE_SHA.slice(0,7),driven:'the other PR worked',seen:'Works',surface:'iphone'},'thr_woo'));
+  assert.match(out,/Refusing/);
+  assert.equal(store.get(id).status,'merged-needs-verification');
+  assert.equal(store.get(id).verifiedCommitSha,null);
+  assert.equal(store.get(other).verifiedCommitSha,head(112));
+ }finally{commitTrees.clear();await host.harness.lifecycle.dispose();}
+});
+
+test('a GitHub commit-tree read failure does not count as a same-tree match',async()=>{
+ commitTrees.set(head(130),null);commitTrees.set(MERGE_SHA,null);
+ const {host,store,id}=await worksTapThenMerge();
+ try {
+  const out=text(await deliveries(host,{action:'verify',id,commitSha:MERGE_SHA.slice(0,7),driven:'the owner already tapped Works',seen:'Works',surface:'iphone'},'thr_woo'));
+  assert.match(out,/GitHub did not return trees|could not read .*tree|tree.*unreadable|did not return a tree/i);
+  assert.equal(store.get(id).status,'merged-needs-verification');
+  assert.equal(store.get(id).verifiedCommitSha,head(130));
+ }finally{commitTrees.clear();await host.harness.lifecycle.dispose();}
+});
+
+test('device-proof still covers only an open PR head, not a merge commit',async()=>{
+ const {host,store}=await deck({requirement:'merged-and-verified'});
+ try {
+  const id=key(WOO,130);
+  store.observe(id,mergeObs(head(130),MERGE_SHA),true);
+  const out=text(await deliveries(host,{action:'device-proof',id,commitSha:MERGE_SHA.slice(0,7),build:'6',link:'https://testflight.apple.com/join/abc',check:'Send a photo'},'thr_woo'));
+  assert.match(out,/not an open PR|does not match the current head/);
+  assert.equal(store.get(id).verifiedCommitSha,null);
  }finally{await host.harness.lifecycle.dispose();}
 });

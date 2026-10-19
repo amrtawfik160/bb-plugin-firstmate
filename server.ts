@@ -99,7 +99,7 @@ import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRe
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
 import { optionHelp } from "./lib/cli-help.ts";
 import { AUDITED_BUNDLED_SNAPSHOTS, AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython } from "./lib/native-policy.ts";
-import { createDeliveries, OWNER_ACTOR, verifiedBy, LOST_OWNER_RECHECK_MS, canonicalPr, decisionLine, deliveryLine, parseForge, PR_VIEW_FIELDS, PR_VIEW_JQ, prBranchOwner, releasesTask, type DeliveryRecord, type PrBranchCandidate } from "./lib/pr-delivery.ts";
+import { createDeliveries, OWNER_ACTOR, ownerWorksHeadTap, verifiedBy, LOST_OWNER_RECHECK_MS, canonicalPr, decisionLine, deliveryLine, parseForge, PR_VIEW_FIELDS, PR_VIEW_JQ, prBranchOwner, releasesTask, type DeliveryRecord, type PrBranchCandidate } from "./lib/pr-delivery.ts";
 import { captureHostCommand, decodeHostCapture } from "./lib/host-capture.ts";
 import { selectExecution, validateLaunchCapabilities } from "./lib/execution-selection.ts";
 import { crewPipeline, crewPlaybook, crewSkillBlock, crewSkillRoot, notVerifiedNote, notVerifiedRequest, pipelineProofGap, PLAYBOOK_CHOICES, playbookStepCount, redactSecrets, reportGapNote, reportGapRequest, reportGaps, skillCheckScript, skillRoutingLinkScript, verifyStepGap } from "./lib/crew-contract.ts";
@@ -8552,7 +8552,12 @@ export default async function plugin(bb: BbPluginApi) {
       const authorized=posture.yolo && !!posture.provenance;
       const unverifiedStanding=!posture.provenance && (posture.yolo || record.continuation?.["yolo"]===true);
       signal?.throwIfAborted();
-      const observed=deliveries.observe(record.id,observation,authorized,Date.now(),unverifiedStanding);
+      let observed=deliveries.observe(record.id,observation,authorized,Date.now(),unverifiedStanding);
+      if (ownerWorksHeadTap(observed)) {
+        const applied = await applyOwnerWorksTapToMerge(observed, signal);
+        if (applied.ok) observed = applied.record;
+        else bb.log.warn(`same-tree owner tap ${observed.id}: ${applied.reason}`);
+      }
       // Without a manager nobody acts on minute-by-minute health; look less often until it merges or closes.
       if (observed.ownerNeeded && !["complete","explicitly-abandoned","merged-unverified"].includes(observed.status)) return deliveries.save({...observed,nextCheckAt:Date.now()+LOST_OWNER_RECHECK_MS});
       return observed;
@@ -9342,6 +9347,42 @@ export default async function plugin(bb: BbPluginApi) {
     }
     await askPrDecisions(signal).catch(error=>{ if (!signal?.aborted) bb.log.warn(`PR decision list: ${String(error)}`); });
   }
+  async function githubCommitTree(hostId: string, repo: string, sha: string, signal?: AbortSignal): Promise<string> {
+    let res: { exitCode: number; output: string; stderr: string };
+    try {
+      res = await runStructuredOnHost(hostId, `gh api ${shQuote(`repos/${repo}/git/commits/${sha}`)} --jq .tree.sha`, 30_000, signal);
+    } catch (error) {
+      throw new Error(`GitHub did not return a tree for ${sha.slice(0, 7)}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (res.exitCode !== 0) throw new Error(`GitHub did not return a tree for ${sha.slice(0, 7)}: ${res.stderr || res.output || `exit ${res.exitCode}`}`);
+    const tree = res.output.trim().replace(/^"|"$/g, "");
+    if (!/^[0-9a-f]{40}$/i.test(tree)) throw new Error(`GitHub tree for ${sha.slice(0, 7)} was unreadable`);
+    return tree.toLowerCase();
+  }
+  async function applyOwnerWorksTapToMerge(r: DeliveryRecord, signal?: AbortSignal): Promise<{ ok: true; record: DeliveryRecord } | { ok: false; reason: string }> {
+    const tap = ownerWorksHeadTap(r);
+    if (!tap) return { ok: false, reason: `Refusing: ${r.id} has no owner Works tap on its head to cover the merge commit.` };
+    let hostId: string;
+    try { hostId = await resolveHostForProject(r.projectId, r.owner ?? undefined, signal); }
+    catch (error) {
+      return { ok: false, reason: `Refusing: GitHub did not return trees for ${tap.tappedSha.slice(0, 7)} and ${tap.mergeSha.slice(0, 7)}, so the Works tap cannot cover the merge commit: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    let treeX: string, treeM: string;
+    try {
+      treeX = await githubCommitTree(hostId, r.repository, tap.tappedSha, signal);
+      treeM = await githubCommitTree(hostId, r.repository, tap.mergeSha, signal);
+    } catch (error) {
+      return { ok: false, reason: `Refusing: GitHub did not return trees for ${tap.tappedSha.slice(0, 7)} and ${tap.mergeSha.slice(0, 7)}, so the Works tap cannot cover the merge commit: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    if (treeX !== treeM) {
+      return { ok: false, reason: `Refusing: the owner's Works tap covers ${tap.tappedSha.slice(0, 7)}, and GitHub's trees differ from merge commit ${tap.mergeSha.slice(0, 7)} (${treeX.slice(0, 7)} vs ${treeM.slice(0, 7)}).` };
+    }
+    const v = r.verification!;
+    return { ok: true, record: deliveries.verify(r.id, OWNER_ACTOR, tap.mergeSha, {
+      driven: v.driven, seen: v.seen, surface: v.surface, build: v.build,
+      tappedCommitSha: tap.tappedSha, treeSha: treeX,
+    }) };
+  }
   const deliveryParams = z.object({
     action:z.enum(["list","inspect","register","reconcile","assign","abandon","clear-hold","verify","check","account","device-proof","release"]),
     id:z.string().optional().describe("Deliverable id owner/repo#number; url works instead"),crewId:z.string().optional(),url:z.string().optional().describe("PR link"),from:z.string().nullable().optional(),
@@ -9456,6 +9497,14 @@ export default async function plugin(bb: BbPluginApi) {
     }
     if (input.action === "check") return [await recordCheckerVerdict(live,owner,input.commitSha ?? "",input.verdict,input.notes ?? "",input.findings)];
     if (input.action === "verify") {
+      const given = (input.commitSha ?? "").trim();
+      const tap = ownerWorksHeadTap(live);
+      const coversTap = tap !== null && given.length >= 7 && (live.mergeCommitSha?.toLowerCase().startsWith(given.toLowerCase()) === true || live.headSha?.toLowerCase().startsWith(given.toLowerCase()) === true);
+      if (coversTap) {
+        const applied = await applyOwnerWorksTapToMerge(live, verdictSignal);
+        if (applied.ok) return [applied.record];
+        throw new Error(applied.reason);
+      }
       // Owner decision Q6: a crew drives the change and records it under its own crew id. The
       // captain never verifies for itself (#2523 and dr.woo#124, 15-17 Oct).
       // A PR opened before the strict gate went live keeps the old rules: the captain or a crew records it, with no surface rule.
