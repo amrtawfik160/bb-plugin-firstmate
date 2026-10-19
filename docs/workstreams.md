@@ -33,10 +33,23 @@ type Workstream = {
     id: string; // crew identity
     editing: boolean;
     payload: string; // internal saved dispatch JSON
-    state: "queued" | "starting" | "running" | "finished";
+    state: "queued" | "waiting-memory" | "starting" | "running" | "finished" | "folding" | "folded" | "failed" | "kept-unsaved" | "dropped";
     threadId: string | null;
     error?: string;
+    taskId?: string;
+    followUpOf?: string;
+    title?: string;
+    model?: string;
+    note?: string;
+    report?: string;
+    files?: string[];
+    failedAt?: number;
+    environmentId?: string | null;
+    path?: string;
+    branch?: string;
+    repos?: Array<{ repository: string; path: string; branch: string; environmentId?: string | null }>;
   }>;
+  cardRevision?: number; // monotonic status-card revision, Firstmate-owned
   devLink: {
     state: "stopped" | "starting" | "running";
     port: number;
@@ -87,15 +100,19 @@ Envelope context provides a fallback only when dispatch names sourceRefs that id
 A dispatch cannot mix workstreams or move an existing task between them.
 The tasks RPC includes optional `workstreamId` on tasks. The board response includes optional `workstreams` before its task sections.
 
-The captain tool is `firstmate_workstream`, with actions `list`, `create`, `adopt`, `bindTopic`, `ship`, `devLink`, and `end`.
-The CLI is `bb firstmate workstream list|create|adopt|bind-topic|ship|dev-link|end`, with `--task <id>` repeated on adopt.
+The captain tool is `firstmate_workstream`, with actions `list`, `create`, `adopt`, `bindTopic`, `ship`, `devLink`, `end`, `view`, and `lookup`.
+The CLI is `bb firstmate workstream list|create|adopt|bind-topic|ship|dev-link|end|view|lookup`, with `--task <id>` repeated on adopt and on lookup.
 The captain handles an accepted captain card by calling the same create action with the card's stable requestId.
 When the owner asks for topics for current work, the captain proposes the grouping in one `firstmate_ask` card (kind question), then adopt after the answer.
 
 Editing crews default to PR delivery; only Ship merges their work. Explicit delivery contracts remain explicit.
 Cyndra dev startup installs from the frozen lockfile, loads the source checkout's `.env.local` at runtime, and waits for an HTTP response before returning the dev link. No config file is copied into the workstream.
 
-One editing crew runs per workstream. Checkers and scouts are read-only. Ship waits for every editing crew attached to the adopted tasks, not only workstream jobs. While one is active, Ship stays queued and tells the owner once, then runs the checker, approval and merge loop.
+Created workstreams start a new editing crew for each task, each with its own BB-managed worktree cut from the workstream branch. Checkers and scouts stay read-only and reuse the workstream worktree. While free memory is below 3 GB, new crews wait (`waiting-memory`) and the drain retries them. When a created crew is idle and its own tests passed, Firstmate folds: merge that crew branch into the workstream branch in the workstream worktree (all repos of the task or none; a partial fold is rolled back). A conflict tells the same crew to update from the workstream branch, fix, retest, and report again. Folds wait while a Ship is checking or merging, then run. Ship takes only folded work; running tasks fold later and go out with the next Ship. After a fold, Firstmate archives the crew thread so BB removes its worktree, deletes the task branch, and restarts the dev link if package, lock, vite/next/tsconfig, or `.env*` files changed. A worktree with uncommitted or unpushed work is kept (`kept-unsaved`). A failed crew is not folded; its worktree is kept 7 days for retry, then archived, branch kept. A dropped task archives at once, branch kept.
+
+Adopted workstreams keep one editing crew at a time and reuse existing worktrees. Ship waits for every editing crew attached to the adopted tasks, not only workstream jobs. While one is active, Ship stays queued and tells the owner once, then runs the checker, approval and merge loop.
+
+`view` is one line per task (number, short title, model, state). `lookup` returns at most about 15 lines (brief, last crew report, changed files). Owner messages stay in full. Firstmate calls the connector RPC `workstreamCard` on every task state change with a monotonic revision; a missing RPC is logged once and ignored. The card maps a finished editing job to `folding` until the fold lands, and a finished scout to `folded`. Final results use the existing `reply` RPC kind `final`. A follow-up to a running crew is `firstmate_tell`. A follow-up to a folded task starts a new crew from the latest workstream branch with the old brief and last report. Firstmate decides new task vs follow-up by judgement; a direct reply to a crew message is always a follow-up.
 Every repo keeps its worktree and branch across Ship actions. Ship resolves the builder, task and PR from that entry. An adopted entry without that task and builder is refused before any PR write; Ship does not pick another builder or attach the PR to every task. Processing one branch does not change another crew's PR or task. Each Ship uses a PR for that branch, checks it independently through Firstmate's existing checker path, and takes main into the branch after merge. A local Git reference records the last shipped head, so retained squash-merge ancestry does not count as unshipped work.
 Dev links use dedicated `fm-workstream-*.service` units, track actual HTTP requests through a loopback proxy, stop after two hours without requests, and evict the least recently requested link when a fourth starts.
 The `fm-f5f15031-vite*.service` units are never managed by this feature.

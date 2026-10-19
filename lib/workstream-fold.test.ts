@@ -1,0 +1,93 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import {
+  CARD_TASK_STATES,
+  compactTaskLine,
+  crewOwnTestsPassed,
+  FAILED_KEEP_MS,
+  foldTouchesDevFiles,
+  formatWorkstreamLookup,
+  isAdoptedWorkstream,
+  jobToCardState,
+  LOOKUP_MAX_LINES,
+  memAvailableBytes,
+  MEMORY_GUARD_BYTES,
+  memoryIsLow,
+  parseFoldOutput,
+  workstreamCardInput,
+} from "./workstream-fold.ts";
+
+test("MemAvailable below 3 GB is low, and a missing line is refused", () => {
+  assert.equal(memAvailableBytes("MemTotal: 8000000 kB\nMemAvailable: 3145728 kB\n"), MEMORY_GUARD_BYTES);
+  assert.equal(memoryIsLow(MEMORY_GUARD_BYTES - 1), true);
+  assert.equal(memoryIsLow(MEMORY_GUARD_BYTES), false);
+  assert.throws(() => memAvailableBytes("MemTotal: 1 kB\n"), /MemAvailable missing/);
+});
+
+test("a crew folds only when its report records tests passing", () => {
+  assert.equal(crewOwnTestsPassed(""), false);
+  assert.equal(crewOwnTestsPassed("tests failed\n0 pass"), false);
+  assert.equal(crewOwnTestsPassed("12 fail, 3 pass"), false);
+  assert.equal(crewOwnTestsPassed("1995 pass, 0 fail, 23 skip"), true);
+  assert.equal(crewOwnTestsPassed("All tests passed."), true);
+});
+
+test("package, lock, vite/next/tsconfig and env files restart the dev link", () => {
+  assert.equal(foldTouchesDevFiles(["src/app.ts"]), false);
+  assert.equal(foldTouchesDevFiles(["package.json"]), true);
+  assert.equal(foldTouchesDevFiles(["apps/web/pnpm-lock.yaml"]), true);
+  assert.equal(foldTouchesDevFiles(["vite.config.ts"]), true);
+  assert.equal(foldTouchesDevFiles(["next.config.mjs"]), true);
+  assert.equal(foldTouchesDevFiles(["tsconfig.json"]), true);
+  assert.equal(foldTouchesDevFiles([".env.local"]), true);
+});
+
+test("job states map onto the status card, and lookup stays at 15 lines", () => {
+  assert.equal(jobToCardState("queued"), "queued");
+  assert.equal(jobToCardState("waiting-memory"), "waiting-memory");
+  assert.equal(jobToCardState("running"), "working");
+  assert.equal(jobToCardState("folding"), "folding");
+  assert.equal(jobToCardState("folded"), "folded");
+  assert.equal(jobToCardState("finished"), "folding");
+  assert.equal(jobToCardState("finished", true), "folding");
+  assert.equal(jobToCardState("finished", false), "folded");
+  assert.equal(jobToCardState("failed"), "failed");
+  assert.equal(jobToCardState("kept-unsaved"), "kept-unsaved");
+  assert.equal(jobToCardState("dropped"), "dropped");
+  assert.ok(CARD_TASK_STATES.includes("waiting-memory"));
+  const lookup = formatWorkstreamLookup({
+    task: "T3",
+    title: "Restyle composer",
+    brief: "Change the composer tokens.\nMore brief than a card needs.",
+    report: Array.from({ length: 20 }, (_, i) => `line ${i} of the last crew report`).join("\n"),
+    files: ["a.ts", "b.ts", "c.ts", "d.ts", "e.ts", "f.ts", "g.ts"],
+  });
+  assert.equal(lookup.split("\n").length <= LOOKUP_MAX_LINES, true);
+  assert.match(lookup, /^T3 Restyle composer/);
+  assert.match(lookup, /brief:/);
+  assert.equal(compactTaskLine({ id: "T3", title: "Restyle composer", model: "gpt-6.1-sol", state: "working" }), "T3 Restyle composer gpt-6.1-sol working");
+});
+
+test("adopted workstreams are the ones with requestTaskIds or existing repos", () => {
+  assert.equal(isAdoptedWorkstream({ repos: [] }), false);
+  assert.equal(isAdoptedWorkstream({ requestTaskIds: ["T1"], repos: [] }), true);
+  assert.equal(isAdoptedWorkstream({ repos: [{ existing: true }] }), true);
+  assert.equal(FAILED_KEEP_MS, 7 * 24 * 60 * 60_000);
+});
+
+test("fold output names changed files, and a conflict is not a success", () => {
+  assert.deepEqual(parseFoldOutput("FOLD_OK\npackage.json\nsrc/app.ts\n"), { ok: true, conflict: false, files: ["package.json", "src/app.ts"] });
+  assert.deepEqual(parseFoldOutput("FOLD_CONFLICT\n"), { ok: false, conflict: true, files: [] });
+});
+
+test("the status card payload clips title, model and note and keeps revision", () => {
+  const payload = workstreamCardInput({
+    workstreamId: "ws-1",
+    revision: 4,
+    tasks: [{ task: "T1", title: "x".repeat(90), model: "m".repeat(50), state: "working", note: "n".repeat(140) }],
+  });
+  assert.equal(payload.revision, 4);
+  assert.equal(payload.tasks[0]!.title.length, 80);
+  assert.equal(payload.tasks[0]!.model.length, 40);
+  assert.equal(payload.tasks[0]!.note?.length, 120);
+});

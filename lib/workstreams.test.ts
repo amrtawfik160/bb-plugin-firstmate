@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import { createWorkstreams, WorkstreamWaiting, DEV_IDLE_MS, type WorkstreamDeps } from './workstreams.ts';
+import { FAILED_KEEP_MS, FOLD_CONFLICT_TELL, MEMORY_GUARD_BYTES } from './workstream-fold.ts';
 
 function fixture() {
   const db = new DatabaseSync(':memory:');
@@ -35,7 +36,7 @@ test('creation survives reload and deduplicates a Telegram topic', async () => {
   } finally { f.db.close(); }
 });
 
-test('two editing tasks never run at once; scouts run alongside; queued editors resume in order after reload', async () => {
+test('created workstreams start editing tasks together; scouts run alongside; a retry does not spawn twice', async () => {
   const f = fixture();
   try {
     const w = await f.create();
@@ -44,12 +45,9 @@ test('two editing tasks never run at once; scouts run alongside; queued editors 
       f.store.submit(w.id, 'cap', { id: 'editor2', editing: true, payload: '{}' }),
       f.store.submit(w.id, 'cap', { id: 'scout', editing: false, payload: '{}' }),
     ]);
-    assert.deepEqual(f.started, ['editor1', 'scout']);
-    f.statuses.set('editor1', 'idle');
-    await createWorkstreams(f.db, f.deps).reconcile();
-    assert.deepEqual(f.started, ['editor1', 'scout', 'editor2']);
+    assert.deepEqual([...f.started].sort(), ['editor1', 'editor2', 'scout']);
     await f.store.submit(w.id, 'cap', { id: 'editor2', editing: true, payload: '{}' });
-    assert.deepEqual(f.started, ['editor1', 'scout', 'editor2'], 'a retry must not start a second editor');
+    assert.deepEqual([...f.started].sort(), ['editor1', 'editor2', 'scout']);
   } finally { f.db.close(); }
 });
 
@@ -89,19 +87,17 @@ test('End refuses merged tasks and unsaved work, then leaves the topic after cle
   } finally { f.db.close(); }
 });
 
-test('Ship is repeatable by requestId and blocks new editors while the checker waits', async () => {
+test('Ship is repeatable by requestId and created editors still start while the checker waits', async () => {
   const f = fixture(); let ships = 0;
   try {
     const w = await f.create();
     f.deps.ship = async () => { ships++; if (ships === 1) throw new WorkstreamWaiting('checker pending'); };
     assert.equal((await f.store.ship(w.id, 'cap', 'tap1')).ship.state,'running');
     await f.store.submit(w.id, 'cap', { id: 'editor', editing: true, payload: '{}' });
-    assert.deepEqual(f.started, []);
-    // The queued editor cannot prevent resuming the Ship it is waiting for.
+    assert.deepEqual(f.started, ['editor']);
     await f.store.ship(w.id, 'cap', 'tap1');
     await f.store.ship(w.id, 'cap', 'tap1');
     assert.equal(ships, 2);
-    await f.store.reconcile(); assert.deepEqual(f.started, ['editor']);
   } finally { f.db.close(); }
 });
 
@@ -117,17 +113,18 @@ test('a project without a web app refuses dev link before any service starts', a
   } finally { f.db.close(); }
 });
 
-test('a failed spawn keeps its editing reservation across reload and retries the same identity', async () => {
+test('a failed created spawn retries the same identity and does not block the next editor', async () => {
   const f = fixture(); let attempts = 0;
   try {
-    f.deps.start = async (_w,job) => { attempts++; if (attempts === 1) throw new Error('spawn outcome unknown'); f.started.push(job.id); return job.id; };
+    f.deps.start = async (_w,job) => { attempts++; if (job.id === 'one' && attempts === 1) throw new Error('spawn outcome unknown'); f.started.push(job.id); return job.id; };
     const w = await f.create();
-    await assert.rejects(f.store.submit(w.id,'cap',{id:'one',editing:true,payload:'{}'}),/unknown/);
-    assert.equal(f.store.get(w.id,'cap').jobs[0]!.state,'starting');
+    const first = await f.store.submit(w.id,'cap',{id:'one',editing:true,payload:'{}'});
+    assert.equal(first.state,'starting');
     const reload = createWorkstreams(f.db,f.deps);
     await reload.submit(w.id,'cap',{id:'two',editing:true,payload:'{}'});
-    assert.deepEqual(f.started,['one']);
-    assert.equal(reload.get(w.id,'cap').jobs[1]!.state,'queued');
+    assert.ok(f.started.includes('two'));
+    await reload.reconcile();
+    assert.ok(f.started.includes('one'));
   } finally { f.db.close(); }
 });
 
@@ -147,14 +144,16 @@ test('workstream ends automatically only after every task is Live or Dropped and
   } finally { f.db.close(); }
 });
 
-test('a failed editor releases its slot, while an unreadable editor keeps the next task queued', async () => {
+test('a failed created editor does not hold the next editing task', async () => {
   const f = fixture();
   try {
     const w = await f.create();
     await f.store.submit(w.id,'cap',{id:'one',editing:true,payload:'{}'});
     await f.store.submit(w.id,'cap',{id:'two',editing:true,payload:'{}'});
-    f.statuses.set('one','unknown'); await f.store.reconcile(); assert.deepEqual(f.started,['one']);
-    f.statuses.set('one','error'); await f.store.reconcile(); assert.deepEqual(f.started,['one','two']);
+    assert.deepEqual([...f.started].sort(), ['one', 'two']);
+    f.statuses.set('one','error'); await f.store.reconcile();
+    assert.equal(f.store.get(w.id,'cap').jobs[0]!.state, 'failed');
+    assert.equal(f.store.get(w.id,'cap').jobs[1]!.state, 'running');
   } finally { f.db.close(); }
 });
 
@@ -310,5 +309,194 @@ test('fourth dev link uses HTTP activity received since the last reconciliation'
     f.deps.devActivity = async (w) => w.id === a.id ? 400 : 0;
     await f.store.devLink(d.id,'cap');
     assert.deepEqual(f.stopped,[b.id]);
+  } finally { f.db.close(); }
+});
+
+test('adopted workstreams still run one editor at a time', async () => {
+  const f = fixture();
+  try {
+    const w = await f.store.adopt({ threadId: 'cap', projectId: 'cyndra', name: 'Chat', requestId: 'serial', taskIds: ['T1'] });
+    await f.store.submit(w.id, 'cap', { id: 'editor1', editing: true, payload: '{}' });
+    await f.store.submit(w.id, 'cap', { id: 'editor2', editing: true, payload: '{}' });
+    await f.store.submit(w.id, 'cap', { id: 'scout', editing: false, payload: '{}' });
+    assert.deepEqual(f.started, ['editor1', 'scout']);
+    f.statuses.set('editor1', 'idle');
+    await f.store.reconcile();
+    assert.deepEqual(f.started, ['editor1', 'scout', 'editor2']);
+  } finally { f.db.close(); }
+});
+
+test('created editors wait when memory is below 3 GB and start after it recovers', async () => {
+  const f = fixture();
+  let free = MEMORY_GUARD_BYTES - 1;
+  f.deps.memAvailable = async () => free;
+  try {
+    const w = await f.create();
+    const one = await f.store.submit(w.id, 'cap', { id: 'e1', editing: true, payload: '{}' });
+    const two = await f.store.submit(w.id, 'cap', { id: 'e2', editing: true, payload: '{}' });
+    assert.equal(one.state, 'waiting-memory');
+    assert.equal(two.state, 'waiting-memory');
+    assert.deepEqual(f.started, []);
+    free = MEMORY_GUARD_BYTES;
+    await f.store.reconcile();
+    assert.deepEqual([...f.started].sort(), ['e1', 'e2']);
+  } finally { f.db.close(); }
+});
+
+test('a created fold merges when tests passed, tells the same crew on conflict, and rolls a partial fold back', async () => {
+  const f = fixture();
+  const folded: string[] = [];
+  const told: string[] = [];
+  const archived: string[] = [];
+  const deleted: string[] = [];
+  let conflict = false;
+  let files = ['src/app.ts'];
+  f.deps.report = async () => '1995 pass, 0 fail';
+  f.deps.fold = async (_w, job) => {
+    folded.push(job.id);
+    return conflict ? { ok: false, conflict: true, files: [] } : { ok: true, conflict: false, files };
+  };
+  f.deps.tell = async (_w, job, message) => { told.push(`${job.id}:${message}`); };
+  f.deps.archive = async (_w, job) => { archived.push(job.id); };
+  f.deps.deleteBranch = async (_w, job) => { deleted.push(job.id); };
+  try {
+    const w = await f.create();
+    await f.store.submit(w.id, 'cap', { id: 'crew', editing: true, payload: '{"task":"Restyle composer"}', taskId: 'T3', title: 'Restyle composer', model: 'gpt-6.1-sol' });
+    f.statuses.set('crew', 'idle');
+    conflict = true;
+    await f.store.reconcile();
+    assert.equal(f.store.get(w.id, 'cap').jobs[0]!.state, 'running');
+    assert.equal(told[0]!.startsWith('crew:'), true);
+    assert.match(told[0]!, new RegExp(FOLD_CONFLICT_TELL.slice(0, 20)));
+    assert.deepEqual(archived, []);
+    conflict = false;
+    f.statuses.set('crew', 'idle');
+    await f.store.reconcile();
+    const job = f.store.get(w.id, 'cap').jobs[0]!;
+    assert.equal(job.state, 'folded');
+    assert.deepEqual(archived, ['crew']);
+    assert.deepEqual(deleted, ['crew']);
+    assert.deepEqual(job.files, ['src/app.ts']);
+  } finally { f.db.close(); }
+});
+
+test('folds wait while Ship is checking, and Ship proceeds with already folded work', async () => {
+  const f = fixture();
+  const folded: string[] = [];
+  let ships = 0;
+  f.deps.report = async () => 'All tests passed.';
+  f.deps.fold = async (_w, job) => { folded.push(job.id); return { ok: true, conflict: false, files: ['a.ts'] }; };
+  f.deps.archive = async () => {};
+  f.deps.deleteBranch = async () => {};
+  f.deps.ship = async () => { ships++; if (ships === 1) throw new WorkstreamWaiting('checker pending'); };
+  try {
+    const w = await f.create();
+    await f.store.submit(w.id, 'cap', { id: 'done', editing: true, payload: '{}' });
+    await f.store.submit(w.id, 'cap', { id: 'live', editing: true, payload: '{}' });
+    f.statuses.set('done', 'idle');
+    await f.store.ship(w.id, 'cap', 'tap');
+    assert.equal(f.store.get(w.id, 'cap').ship.state, 'running');
+    assert.deepEqual(folded, ['done']);
+    f.statuses.set('live', 'idle');
+    await f.store.reconcile();
+    assert.equal(f.store.get(w.id, 'cap').jobs.find((j) => j.id === 'live')!.state, 'finished');
+    assert.match(f.store.view(w.id, 'cap'), /live .* folding/);
+    assert.deepEqual(folded, ['done']);
+    ships = 1;
+    await f.store.reconcile();
+    assert.equal(f.store.get(w.id, 'cap').ship.state, 'complete');
+    await f.store.reconcile();
+    assert.equal(f.store.get(w.id, 'cap').jobs.find((j) => j.id === 'live')!.state, 'folded');
+  } finally { f.db.close(); }
+});
+
+test('a fold that changes package files restarts a running dev link', async () => {
+  const f = fixture();
+  const restarted: string[] = [];
+  f.deps.report = async () => '12 passed';
+  f.deps.fold = async () => ({ ok: true, conflict: false, files: ['package.json'] });
+  f.deps.archive = async () => {};
+  f.deps.deleteBranch = async () => {};
+  f.deps.restartDev = async (w) => { restarted.push(w.id); };
+  try {
+    const w = await f.create();
+    await f.store.devLink(w.id, 'cap');
+    await f.store.submit(w.id, 'cap', { id: 'crew', editing: true, payload: '{}' });
+    f.statuses.set('crew', 'idle');
+    await f.store.reconcile();
+    assert.deepEqual(restarted, [w.id]);
+  } finally { f.db.close(); }
+});
+
+test('cleanup never deletes unsaved work, archives a drop at once, and archives a failed crew after 7 days', async () => {
+  const f = fixture();
+  const archived: string[] = [];
+  const unsaved = new Map<string, string[]>();
+  f.deps.archive = async (_w, job) => { archived.push(job.id); };
+  f.deps.unsavedJob = async (_w, job) => unsaved.get(job.id) ?? [];
+  const states = new Map<string, string>([['T1', 'working'], ['T2', 'working']]);
+  f.deps.taskState = (id) => states.get(id);
+  try {
+    const w = await f.create();
+    await f.store.submit(w.id, 'cap', { id: 'keep', editing: true, payload: '{}', taskId: 'T1' });
+    await f.store.submit(w.id, 'cap', { id: 'drop', editing: true, payload: '{}', taskId: 'T2' });
+    unsaved.set('keep', ['1 uncommitted file(s)']);
+    f.statuses.set('keep', 'error');
+    await f.store.reconcile();
+    assert.equal(f.store.get(w.id, 'cap').jobs.find((j) => j.id === 'keep')!.state, 'failed');
+    states.set('T2', 'dropped');
+    await f.store.reconcile();
+    assert.equal(f.store.get(w.id, 'cap').jobs.find((j) => j.id === 'drop')!.state, 'dropped');
+    assert.deepEqual(archived, ['drop']);
+    f.time(100 + FAILED_KEEP_MS + 1);
+    await f.store.reconcile();
+    assert.equal(f.store.get(w.id, 'cap').jobs.find((j) => j.id === 'keep')!.state, 'kept-unsaved');
+    assert.equal(archived.includes('keep'), false);
+    unsaved.set('keep', []);
+    f.statuses.set('keep', 'error');
+    const failed = await f.create('other', 9);
+    await f.store.submit(failed.id, 'cap', { id: 'old', editing: true, payload: '{}' });
+    f.statuses.set('old', 'error');
+    await f.store.reconcile();
+    f.time(100 + 3 * FAILED_KEEP_MS);
+    await f.store.reconcile();
+    assert.equal(f.store.get(failed.id, 'cap').jobs[0]!.note, 'archived after 7 days');
+    assert.ok(archived.includes('old'));
+  } finally { f.db.close(); }
+});
+
+test('card revisions rise on each task state change, and lookup stays short', async () => {
+  const f = fixture();
+  const revisions: number[] = [];
+  f.deps.card = async (w) => { revisions.push(w.cardRevision ?? 0); };
+  try {
+    const w = await f.create();
+    await f.store.submit(w.id, 'cap', { id: 'crew', editing: true, payload: '{"task":"Restyle composer"}', taskId: 'T3', title: 'Restyle composer', model: 'gpt-6.1-sol' });
+    assert.ok(revisions.length >= 2);
+    assert.equal(revisions.every((n, i) => i === 0 || n > revisions[i - 1]!), true);
+    f.store.noteJob(w.id, 'cap', 'crew', { report: 'line 1\nline 2', files: ['a.ts'] });
+    const lookup = f.store.lookup(w.id, 'cap', 'T3');
+    assert.ok(lookup.split('\n').length <= 15);
+    assert.match(lookup, /^T3 Restyle composer/);
+    assert.match(f.store.view(w.id, 'cap'), /T3 Restyle composer gpt-6.1-sol working/);
+  } finally { f.db.close(); }
+});
+
+test('a follow-up of a folded task is a new crew linked to the old one', async () => {
+  const f = fixture();
+  f.deps.report = async () => 'All tests passed.';
+  f.deps.fold = async () => ({ ok: true, conflict: false, files: ['a.ts'] });
+  f.deps.archive = async () => {};
+  f.deps.deleteBranch = async () => {};
+  try {
+    const w = await f.create();
+    await f.store.submit(w.id, 'cap', { id: 'first', editing: true, payload: '{"task":"first brief"}', taskId: 'T3' });
+    f.statuses.set('first', 'idle');
+    await f.store.reconcile();
+    assert.equal(f.store.get(w.id, 'cap').jobs[0]!.state, 'folded');
+    const next = await f.store.submit(w.id, 'cap', { id: 'second', editing: true, payload: '{"task":"first brief\\nlast report"}', taskId: 'T3', followUpOf: 'first' });
+    assert.equal(next.followUpOf, 'first');
+    assert.equal(next.state, 'running');
+    assert.ok(f.started.includes('second'));
   } finally { f.db.close(); }
 });

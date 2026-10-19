@@ -66,7 +66,7 @@ test('workstreams RPC lists trial IDs and refuses creation outside Cyndra before
   } finally { await host.harness.lifecycle.dispose(); }
 });
 
-test('fake BB: two editing tasks share the saved environment in order while a scout can run', async () => {
+test('fake BB: two created editing tasks start together on their own worktrees while a scout reuses the workstream', async () => {
   const { createWorkstreams } = await import('./lib/workstreams.ts');
   const host = createFakePluginHost({ pluginId:'firstmate', agentSkillIds:manifestSkillIds(new URL('.',import.meta.url).pathname) });
   const seeded = createWorkstreams(host.bb.storage.database(), {
@@ -96,14 +96,20 @@ test('fake BB: two editing tasks share the saved environment in order while a sc
   const ctx = {threadId:'cap',projectId:'cyndra'} as never;
   const text = (result:unknown) => typeof result === 'string' ? result : JSON.stringify(result);
   try {
+    const cards: Array<Record<string, unknown>> = [];
+    host.harness.sdk.stub('plugins.callRpc', async (args: { method?: string; input?: Record<string, unknown> }) => {
+      if (args.method === 'workstreamCard') { cards.push(args.input ?? {}); return { ok: true }; }
+      return { ok: true, queued: 1, duplicate: false };
+    });
     const one = await dispatch.execute({task:'First edit',taskId:'editor-one',workstreamId:w.id,origin:{kind:'captain',reason:'approved workstream'},providerId:'codex',model:'gpt-6.1-sol'},ctx);
     assert.match(text(one),/Dispatched/);
     const two = await dispatch.execute({task:'Second edit',taskId:'editor-two',workstreamId:w.id,origin:{kind:'captain',reason:'approved workstream'},providerId:'codex',model:'gpt-6.1-sol'},ctx);
-    assert.match(text(two),/Queued crew/);
-    await assert.rejects(host.harness.behavior.callRpc("workstreams.ship",{threadId:"cap",workstreamId:w.id,requestId:"tap-while-editing"}),/Ship waits/);
+    assert.match(text(two),/Dispatched/);
+    const ship = await host.harness.behavior.callRpc("workstreams.ship",{threadId:"cap",workstreamId:w.id,requestId:"tap-while-editing"}).catch((error: unknown) => String(error));
+    assert.equal(typeof ship === 'string' && /Ship waits/.test(ship), false);
     const scout = await dispatch.execute({task:'Read the diff',taskId:'read-only',shape:'scout',role:'lookup',workstreamId:w.id,origin:{kind:'captain',reason:'approved workstream'},providerId:'codex',model:'gpt-6.1-sol'},ctx);
     assert.match(text(scout),/Dispatched/);
-    assert.equal(spawned.length,2);
+    assert.equal(spawned.length,3);
     for (const call of spawned) {
       const metadata = call.pluginMetadata as Record<string,unknown>;
       const dir = `/repo/.firstmate-workstream-reports/${w.id}/${metadata.crewId}`;
@@ -112,13 +118,15 @@ test('fake BB: two editing tasks share the saved environment in order while a sc
       assert.ok(String(call.prompt).includes(`${dir}/report.md`),'the brief names the persisted report path');
       assert.ok(String(call.prompt).includes(`create the report directory '${dir}'`));
     }
-    assert.ok(String(spawned[1]!.prompt).includes('Read-only repository: do not change repository files or Git state.'));
-    for (const call of spawned) assert.deepEqual(call.environment,{type:'reuse',environmentId:'env_ws'});
-    assert.equal((spawned[0]!.pluginMetadata as Record<string,unknown>).deliveryRequirement,'pr','an editing crew delivers its PR; Ship owns merging');
-    statuses.set('worker1','idle');
-    await host.harness.behavior.runSchedule('workstreams');
-    assert.equal(spawned.length,3);
+    assert.ok(String(spawned[2]!.prompt).includes('Read-only repository: do not change repository files or Git state.'));
+    assert.deepEqual(spawned[0]!.environment,{type:'host',hostId:'h1',workspace:{type:'managed-worktree',baseBranch:{kind:'named',name:'workstream/ws-test'}}});
+    assert.deepEqual(spawned[1]!.environment,{type:'host',hostId:'h1',workspace:{type:'managed-worktree',baseBranch:{kind:'named',name:'workstream/ws-test'}}});
     assert.deepEqual(spawned[2]!.environment,{type:'reuse',environmentId:'env_ws'});
+    assert.equal((spawned[0]!.pluginMetadata as Record<string,unknown>).deliveryRequirement,'pr','an editing crew delivers its PR; Ship owns merging');
+    assert.ok(cards.length >= 1);
+    assert.equal(typeof cards[0]!.revision, 'number');
+    const view = await host.harness.inspection.registrations.agentTools.find((t) => t.name === 'firstmate_workstream')!.execute({ action: 'view', workstreamId: w.id }, ctx);
+    assert.match(typeof view === 'string' ? view : JSON.stringify(view), /working|folded|queued/);
     const listed = await host.harness.behavior.callRpc('workstreams.list',{threadId:'cap'}) as {workstreams:Array<{taskIds:string[]}>};
     assert.equal(listed.workstreams[0]!.taskIds.length,3);
   } finally { await host.harness.lifecycle.dispose(); }

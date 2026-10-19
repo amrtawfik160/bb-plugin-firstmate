@@ -4,7 +4,8 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync, existsSync, mkdirSync, readFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { provisionScript, takeMainScript, devStartScript, devUnit, devAppCommand, unshippedScript } from './workstream-runtime.ts';
+import { provisionScript, takeMainScript, devStartScript, devUnit, devAppCommand, unshippedScript, foldScript, rollbackFoldScript, extraTaskWorktreeScript, deleteTaskBranchScript } from './workstream-runtime.ts';
+import { parseFoldOutput } from './workstream-fold.ts';
 import { UNSAVED_WORK_SCRIPT, unsavedWorkFindings } from './finished-crew-retire.ts';
 import type { Workstream } from './workstreams.ts';
 
@@ -94,6 +95,82 @@ test('dev command completes setup before starting the app', () => {
   } finally { rmSync(dir,{recursive:true,force:true}); }
 });
 
+
+test('real Git: fold merges a crew worktree into the workstream branch and names changed files', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fm-fold-ok-'));
+  try {
+    const remote = join(dir, 'origin.git'), source = join(dir, 'source'), ws = join(dir, 'ws'), crew = join(dir, 'crew');
+    execFileSync('git', ['init', '--bare', '-q', remote]);
+    execFileSync('git', ['init', '-qb', 'main', source]);
+    git(source, 'config', 'user.name', 'fixture'); git(source, 'config', 'user.email', 'fixture@test');
+    writeFileSync(join(source, 'base.txt'), 'base'); commit(source);
+    git(source, 'remote', 'add', 'origin', remote); git(source, 'push', '-u', 'origin', 'main');
+    const branch = 'workstream/ws-fold';
+    execFileSync('bash', ['-c', provisionScript(source, ws, branch)], { stdio: 'pipe' });
+    execFileSync('bash', ['-c', extraTaskWorktreeScript(ws, crew, 'task/ws-fold/one', branch)], { stdio: 'pipe' });
+    writeFileSync(join(crew, 'feature.txt'), 'from crew'); commit(crew);
+    const output = execFileSync('bash', ['-c', foldScript(ws, crew, branch)], { encoding: 'utf8' });
+    const parsed = parseFoldOutput(output);
+    assert.equal(parsed.ok, true);
+    assert.equal(parsed.conflict, false);
+    assert.ok(parsed.files.includes('feature.txt'));
+    assert.equal(existsSync(join(ws, 'feature.txt')), true);
+    git(source, 'worktree', 'remove', '--force', crew);
+    execFileSync('bash', ['-c', deleteTaskBranchScript(source, 'task/ws-fold/one')], { stdio: 'pipe' });
+    assert.equal(git(source, 'branch', '--list', 'task/ws-fold/one'), '');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('real Git: a fold conflict leaves the workstream branch unchanged so the same crew can fix it', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fm-fold-conflict-'));
+  try {
+    const remote = join(dir, 'origin.git'), source = join(dir, 'source'), ws = join(dir, 'ws'), crew = join(dir, 'crew');
+    execFileSync('git', ['init', '--bare', '-q', remote]);
+    execFileSync('git', ['init', '-qb', 'main', source]);
+    git(source, 'config', 'user.name', 'fixture'); git(source, 'config', 'user.email', 'fixture@test');
+    writeFileSync(join(source, 'clash.txt'), 'base'); commit(source);
+    git(source, 'remote', 'add', 'origin', remote); git(source, 'push', '-u', 'origin', 'main');
+    const branch = 'workstream/ws-conflict';
+    execFileSync('bash', ['-c', provisionScript(source, ws, branch)], { stdio: 'pipe' });
+    execFileSync('bash', ['-c', extraTaskWorktreeScript(ws, crew, 'task/ws-conflict/one', branch)], { stdio: 'pipe' });
+    writeFileSync(join(ws, 'clash.txt'), 'workstream'); commit(ws);
+    writeFileSync(join(crew, 'clash.txt'), 'crew'); commit(crew);
+    const before = git(ws, 'rev-parse', 'HEAD');
+    assert.throws(() => execFileSync('bash', ['-c', foldScript(ws, crew, branch)], { stdio: 'pipe' }));
+    assert.equal(git(ws, 'rev-parse', 'HEAD'), before);
+    assert.equal(readFileSync(join(ws, 'clash.txt'), 'utf8'), 'workstream');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('real Git: a partial multi-repo fold rolls back the first repo when the second conflicts', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fm-fold-rollback-'));
+  try {
+    const make = (name: string) => {
+      const remote = join(dir, `${name}.git`), source = join(dir, `${name}-source`), ws = join(dir, `${name}-ws`), crew = join(dir, `${name}-crew`);
+      execFileSync('git', ['init', '--bare', '-q', remote]);
+      execFileSync('git', ['init', '-qb', 'main', source]);
+      git(source, 'config', 'user.name', 'fixture'); git(source, 'config', 'user.email', 'fixture@test');
+      writeFileSync(join(source, 'file.txt'), 'base'); commit(source);
+      git(source, 'remote', 'add', 'origin', remote); git(source, 'push', '-u', 'origin', 'main');
+      const branch = `workstream/${name}`;
+      execFileSync('bash', ['-c', provisionScript(source, ws, branch)], { stdio: 'pipe' });
+      execFileSync('bash', ['-c', extraTaskWorktreeScript(ws, crew, `task/${name}/one`, branch)], { stdio: 'pipe' });
+      return { ws, crew, branch };
+    };
+    const first = make('one');
+    const second = make('two');
+    writeFileSync(join(first.crew, 'ok.txt'), 'ok'); commit(first.crew);
+    writeFileSync(join(second.ws, 'file.txt'), 'ws'); commit(second.ws);
+    writeFileSync(join(second.crew, 'file.txt'), 'crew'); commit(second.crew);
+    const firstBefore = git(first.ws, 'rev-parse', 'HEAD');
+    execFileSync('bash', ['-c', foldScript(first.ws, first.crew, first.branch)], { stdio: 'pipe' });
+    assert.equal(existsSync(join(first.ws, 'ok.txt')), true);
+    assert.throws(() => execFileSync('bash', ['-c', foldScript(second.ws, second.crew, second.branch)], { stdio: 'pipe' }));
+    execFileSync('bash', ['-c', rollbackFoldScript(first.ws)], { stdio: 'pipe' });
+    assert.equal(git(first.ws, 'rev-parse', 'HEAD'), firstBefore);
+    assert.equal(existsSync(join(first.ws, 'ok.txt')), false);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 test('squash-merged work is not shipped again or counted in the next unshipped age', () => {
   const dir = mkdtempSync(join(tmpdir(),'fm-workstream-squash-'));

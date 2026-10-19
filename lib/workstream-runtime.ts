@@ -52,6 +52,57 @@ export function devStartScript(w: Workstream, repo: WorkstreamRepo, command: str
   ].join('\n');
 }
 
+export function foldScript(workstreamPath: string, crewPath: string, workstreamBranch: string): string {
+  return [
+    "set -eu",
+    `cd -- ${shQuote(workstreamPath)}`,
+    `[ "$(git symbolic-ref --short HEAD)" = ${shQuote(workstreamBranch)} ]`,
+    '[ -z "$(git status --porcelain --untracked-files=all)" ]',
+    "before=$(git rev-parse HEAD)",
+    "gitdir=$(git rev-parse --git-dir)",
+    'printf %s "$before" > "$gitdir/FOLD_BEFORE"',
+    `if git fetch -- ${shQuote(crewPath)} HEAD && git -c core.editor=true merge --no-edit FETCH_HEAD; then`,
+    "  echo FOLD_OK",
+    '  git diff --name-only "$before" HEAD',
+    "  exit 0",
+    "fi",
+    "echo FOLD_CONFLICT",
+    "git merge --abort >/dev/null 2>&1 || true",
+    "exit 2",
+  ].join("\n");
+}
+
+export function rollbackFoldScript(workstreamPath: string): string {
+  return [
+    "set -eu",
+    `cd -- ${shQuote(workstreamPath)}`,
+    "git merge --abort >/dev/null 2>&1 || true",
+    "gitdir=$(git rev-parse --git-dir)",
+    'before=$(cat "$gitdir/FOLD_BEFORE")',
+    'git reset --hard "$before"',
+  ].join("\n");
+}
+
+export function extraTaskWorktreeScript(workstreamPath: string, path: string, taskBranch: string, workstreamBranch: string): string {
+  const parent = path.slice(0, path.lastIndexOf("/"));
+  return [
+    "set -eu",
+    `cd -- ${shQuote(workstreamPath)}`,
+    `[ "$(git symbolic-ref --short HEAD)" = ${shQuote(workstreamBranch)} ]`,
+    `if [ ! -d ${shQuote(path)} ]; then mkdir -p -- ${shQuote(parent)}; git worktree add -b ${shQuote(taskBranch)} ${shQuote(path)} HEAD; fi`,
+    `[ "$(git -C ${shQuote(path)} symbolic-ref --short HEAD)" = ${shQuote(taskBranch)} ]`,
+  ].join("\n");
+}
+
+export function deleteTaskBranchScript(sourcePath: string, branch: string): string {
+  return [
+    "set -eu",
+    `cd -- ${shQuote(sourcePath)}`,
+    `git push origin --delete ${shQuote(branch)} || true`,
+    `git branch -D ${shQuote(branch)} || true`,
+  ].join("\n");
+}
+
 export function unshippedScript(repo: WorkstreamRepo): string {
   const shipped = `refs/firstmate/shipped/${repo.branch}`;
   return [
