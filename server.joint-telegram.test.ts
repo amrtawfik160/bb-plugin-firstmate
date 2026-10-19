@@ -111,15 +111,27 @@ test("joint: adopt three Cyndra-shaped workstreams of two tasks (one running cre
     await host.harness.behavior.setSettings({ fmReliability: JSON.stringify({ inboundLedger: "on", telegramThreading: "on", asyncDispatch: "on" }), decisionsKeyFile: "" });
     host.harness.sdk.stub("threads.getPluginMetadata", async ({ threadId }: { threadId: string }) => (threadId === "thr_cap" ? { captain: "true" } : {}));
     host.harness.sdk.stub("threads.list", async () => []);
-    host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({
-      id: threadId, projectId: "proj_cyndra", status: threadId === "thr_crew_chat" ? "active" : "starting",
-      environmentId: threadId === "thr_crew_chat" ? "env_chat" : undefined,
-    }));
-    host.harness.sdk.stub("environments.get", async ({ environmentId }: { environmentId: string }) => (
-      environmentId === "env_chat"
-        ? { id: "env_chat", hostId: "h1", path: "/wt/chat", status: "ready", isWorktree: true, branchName: "fm/chat" }
-        : { id: environmentId, hostId: "h1", path: "/repo/main", status: "ready", isWorktree: false }
-    ));
+    const crewSpecs = [
+      { id: "crew-chat", threadId: "thr_crew_chat", envId: "env_chat", path: "/wt/chat", branch: "fm/chat", active: true },
+      { id: "crew-tokens", threadId: "thr_crew_tokens", envId: "env_tokens", path: "/wt/tokens", branch: "fm/tokens", active: false },
+      { id: "crew-apple", threadId: "thr_crew_apple", envId: "env_apple", path: "/wt/apple", branch: "fm/apple", active: false },
+      { id: "crew-nav", threadId: "thr_crew_nav", envId: "env_nav", path: "/wt/nav", branch: "fm/nav", active: false },
+      { id: "crew-coss", threadId: "thr_crew_coss", envId: "env_coss", path: "/wt/coss", branch: "fm/coss", active: false },
+      { id: "crew-sheet", threadId: "thr_crew_sheet", envId: "env_sheet", path: "/wt/sheet", branch: "fm/sheet", active: false },
+    ];
+    host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => {
+      const spec = crewSpecs.find((row) => row.threadId === threadId);
+      return makeThreadResponse({
+        id: threadId, projectId: "proj_cyndra", status: spec?.active ? "active" : spec ? "idle" : "starting",
+        environmentId: spec?.envId,
+      });
+    });
+    host.harness.sdk.stub("environments.get", async ({ environmentId }: { environmentId: string }) => {
+      const spec = crewSpecs.find((row) => row.envId === environmentId);
+      return spec
+        ? { id: spec.envId, hostId: "h1", path: spec.path, status: "ready", isWorktree: true, branchName: spec.branch }
+        : { id: environmentId, hostId: "h1", path: "/repo/main", status: "ready", isWorktree: false };
+    });
     host.harness.sdk.stub("threadSections.list", async () => []);
     host.harness.sdk.stub("environments.list", async () => []);
     host.harness.sdk.stub("projects.list", async () => [{ id: "proj_cyndra", name: "Cyndra SaaS" }, { id: "proj_safi", name: "Safi" }]);
@@ -196,14 +208,13 @@ test("joint: adopt three Cyndra-shaped workstreams of two tasks (one running cre
     const tasks = createOwnerTasks(host.bb.storage.database());
     const opened = lines.map(([id, title], index) => tasks.open({
       captain: "thr_cap", project: "Cyndra SaaS", projectId: "proj_cyndra", title, sourceRefs: [`tg:42:${id}`],
-      crewId: index === 0 ? "crew-chat" : undefined, at: now,
+      crewId: crewSpecs[index]!.id, at: now,
     }));
-    await host.bb.storage.kv.set("crews", [{
-      id: "crew-chat", task: "Restyle the Cyndra web chat composer", title: "Cyndra web chat restyle",
-      projectId: "proj_cyndra", threadId: "thr_crew_chat", parentThreadId: "thr_cap", nativeHome: "",
-      worktree: true, shape: "ship", posture: "direct-PR", createdAt: new Date().toISOString(),
-      providerId: null, model: null, reasoningLevel: null,
-    }]);
+    await host.bb.storage.kv.set("crews", crewSpecs.map((spec, index) => ({
+      id: spec.id, task: lines[index]![1], title: spec.id, projectId: "proj_cyndra", threadId: spec.threadId,
+      parentThreadId: "thr_cap", nativeHome: "", worktree: true, shape: "ship", posture: "direct-PR",
+      createdAt: new Date().toISOString(), providerId: null, model: null, reasoningLevel: null,
+    })));
     tg.engine.refreshBoardSoon();
     await cycle(tg.engine);
     const groups = [
@@ -217,7 +228,7 @@ test("joint: adopt three Cyndra-shaped workstreams of two tasks (one running cre
         threadId: "thr_cap", projectId: "proj_cyndra", name: group.name, requestId: group.requestId, taskIds: group.ids,
       }) as { workstream: { id: string; repos: unknown[] } });
     }
-    assert.equal(adopted[0]!.workstream.repos.length, 1);
+    assert.equal(adopted[0]!.workstream.repos.length, 2);
     assert.equal((adopted[0]!.workstream.repos[0] as { path?: string }).path, "/wt/chat");
     const crew = ((await host.bb.storage.kv.get("crews")) as Array<{ id: string; workstreamId?: string }>).find((row) => row.id === "crew-chat");
     assert.equal(crew?.workstreamId, undefined);

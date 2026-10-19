@@ -56,14 +56,16 @@ test('independent refusal matrix: no storage, Telegram or BB side effects', asyn
   const tool=host.harness.inspection.registrations.agentTools.find(t=>t.name==='firstmate_workstream')!;
   assert.match(tool.description,/propose the grouping in one firstmate_ask card \(kind question\), then adopt after the answer/);
   const calls: unknown[]=[]; host.harness.sdk.stub('plugins.callRpc',async(a:unknown)=>{calls.push(a);return {ok:true}});
-  const good=open('Good'); const foreign=open('Foreign',{project:'Safi',projectId:'safi'}); const closed=open('Closed');
+  stubCrewWorktrees(host,{thr_good:'idle',thr_extra:'idle'},{thr_good:{envId:'env_good',path:'/wt/good',branch:'fm/good'},thr_extra:{envId:'env_extra',path:'/wt/extra',branch:'fm/extra'}});
+  await host.bb.storage.kv.set('crews',[crewRow('good','thr_good'),crewRow('extra','thr_extra')]);
+  const good=open('Good',{crewId:'good'}); const foreign=open('Foreign',{project:'Safi',projectId:'safi'}); const closed=open('Closed');
   tasks.move(closed.id,'cap',{to:'dropped',reason:'owner dropped',ref:'tg:42:88'},Date.now());
   const invoke=(ids:string[],requestId='refuse')=>host.harness.behavior.callRpc('workstreams.adopt',{threadId:'cap',projectId:'cyndra',name:'Review',requestId,taskIds:ids});
   for(const ids of [[good.id,foreign.id],[good.id,closed.id],[good.id,'T999999'],[]]) {
    await assert.rejects(invoke(ids));
    assert.equal((await host.harness.behavior.callRpc('workstreams.list',{threadId:'cap'}) as any).workstreams.length,0); assert.equal(calls.length,0);
   }
-  const held=await invoke([good.id],'held') as any; const extra=open('Extra');calls.length=0;
+  const held=await invoke([good.id],'held') as any; const extra=open('Extra',{crewId:'extra'});calls.length=0;
   await assert.rejects(invoke([extra.id,good.id],'collision'));
   const list=await host.harness.behavior.callRpc('workstreams.list',{threadId:'cap'}) as any;
   assert.equal(list.workstreams.length,1);assert.deepEqual(list.workstreams[0].taskIds,[good.id]);assert.equal(calls.length,0);
@@ -107,7 +109,9 @@ test('independent adopted Ship must inspect existing task PR before release',asy
 });
 test('independent End keeps topic and trial exclusion is clean',async()=>{
  const {host,tasks,open}=await adoptHost();try{
-  const t=open('End');const r=await host.harness.behavior.callRpc('workstreams.adopt',{threadId:'cap',projectId:'cyndra',name:'End',requestId:'end',taskIds:[t.id]}) as any;
+  stubCrewWorktrees(host,{thr_end:'idle'},{thr_end:{envId:'env_end',path:'/wt/end',branch:'fm/end'}});
+  await host.bb.storage.kv.set('crews',[crewRow('end','thr_end')]);
+  const t=open('End',{crewId:'end'});const r=await host.harness.behavior.callRpc('workstreams.adopt',{threadId:'cap',projectId:'cyndra',name:'End',requestId:'end',taskIds:[t.id]}) as any;
   await host.harness.behavior.callRpc('workstreams.bindTopic',{threadId:'cap',workstreamId:r.workstream.id,chatId:'42',topicId:500});
   tasks.move(t.id,'cap',{to:'dropped',reason:'owner dropped',ref:'tg:42:88'},Date.now());
   const calls:any[]=[];host.harness.sdk.stub('plugins.callRpc',async(a:any)=>{calls.push(a);return{ok:true}});
@@ -152,7 +156,14 @@ test('independent real project setting resolves Dr Woo and RunAnts; unlabeled Co
  const {host,open}=await adoptHost();try{
   host.harness.sdk.stub('projects.list',async()=>[{id:'cyndra',name:'Cyndra SaaS'},{id:'proj_wwm6pj4tq5',name:'woo-app'},{id:'proj_c92bh29baq',name:'RunAnts'}]);
   host.harness.sdk.stub('projects.get',async({projectId}:{projectId:string})=>({id:projectId,name:projectId==='proj_wwm6pj4tq5'?'woo-app':projectId==='proj_c92bh29baq'?'RunAnts':'Cyndra SaaS',kind:'repo',sources:[]}));
-  const woo=open('Dr Woo',{project:'woo-app',projectId:'proj_wwm6pj4tq5'});const run=open('Coss',{project:'RunAnts',projectId:'proj_c92bh29baq'});const missing=open('Coss without project',{project:null,projectId:null});
+  host.harness.sdk.stub('threads.get',async({threadId}:{threadId:string})=>makeThreadResponse({id:threadId,projectId:threadId==='thr_woo'?'proj_wwm6pj4tq5':threadId==='thr_runants'?'proj_c92bh29baq':'cyndra',status:'idle',environmentId:threadId==='thr_woo'?'env_woo':threadId==='thr_runants'?'env_runants':undefined}));
+  host.harness.sdk.stub('environments.get',async({environmentId}:{environmentId:string})=>(
+    environmentId==='env_woo'?{id:'env_woo',hostId:'h1',path:'/wt/woo',status:'ready',isWorktree:true,branchName:'fm/woo'}:
+    environmentId==='env_runants'?{id:'env_runants',hostId:'h1',path:'/wt/runants',status:'ready',isWorktree:true,branchName:'fm/runants'}:
+    {id:environmentId,hostId:'h1',path:'/repo/main',status:'ready',isWorktree:false}
+  ));
+  await host.bb.storage.kv.set('crews',[crewRow('woo','thr_woo',{projectId:'proj_wwm6pj4tq5'}),crewRow('runants','thr_runants',{projectId:'proj_c92bh29baq'})]);
+  const woo=open('Dr Woo',{project:'woo-app',projectId:'proj_wwm6pj4tq5',crewId:'woo'});const run=open('Coss',{project:'RunAnts',projectId:'proj_c92bh29baq',crewId:'runants'});const missing=open('Coss without project',{project:null,projectId:null});
   const invoke=(projectId:string,ids:string[])=>host.harness.behavior.callRpc('workstreams.adopt',{threadId:'cap',projectId,name:'Adopt',requestId:projectId,taskIds:ids});
   await assert.rejects(invoke('proj_wwm6pj4tq5',[woo.id]),/trial/);await assert.rejects(invoke('proj_c92bh29baq',[run.id]),/trial/);
   await host.harness.behavior.setSettings({workstreamProjects:JSON.stringify(['Cyndra','Dr Woo','RunAnts'])});

@@ -2309,6 +2309,9 @@ export default async function plugin(bb: BbPluginApi) {
     const projects = await bb.sdk.projects.list({});
     return projects.filter((p) => configured.some((name) => p.id === name || projectForName(p.name)?.name.toLowerCase() === name.toLowerCase() || p.name.toLowerCase() === name.toLowerCase())).map((p) => p.id);
   }
+  function isAdoptedWorkstream(w: Workstream): boolean {
+    return w.requestTaskIds !== undefined || w.repos.some((repo) => repo.existing);
+  }
   async function adoptedRepos(taskIds: string[], projectId: string): Promise<WorkstreamRepo[]> {
     const rule = projectForName(await projectLabel(projectId));
     const fallback = rule?.dev?.repository ?? rule?.repos.find((pattern) => !pattern.includes("*"));
@@ -2320,7 +2323,9 @@ export default async function plugin(bb: BbPluginApi) {
     }
     for (const taskId of taskIds) {
       const task = ownerTasks.get(taskId);
-      for (const crewId of task?.crewIds ?? []) {
+      const crewIds = task?.crewIds ?? [];
+      if (crewIds.length === 0) fail(taskId, undefined, "no crew.");
+      for (const crewId of crewIds) {
         const crew = crews.find((c) => c.id === crewId);
         if (!crew) fail(taskId, undefined, `crew ${crewId} is missing.`);
         let envId: string;
@@ -2394,6 +2399,8 @@ export default async function plugin(bb: BbPluginApi) {
     throw new Error("Unknown workstream action.");
   }
   async function shipWorkstream(w: Workstream): Promise<void> {
+    if (isAdoptedWorkstream(w) && w.repos.length === 0) throw new Error("Adopted workstream has no repository.");
+    if (w.repos.some((repo) => repo.existing && (!repo.taskId || !repo.crewId))) throw new Error("Ship needs the task and builder recorded on each adopted repository.");
     for (const repo of w.repos) {
       const prefix = `cd -- ${shQuote(repo.path)} && `;
       await workstreamCommand(repo, prefix + `[ -z "$(git status --porcelain --untracked-files=all)" ] && git push origin HEAD:${shQuote(repo.branch)}`);
@@ -2419,11 +2426,13 @@ export default async function plugin(bb: BbPluginApi) {
       const crews = await readCrews();
       const builder = repo.crewId
         ? crews.find((c) => c.id === repo.crewId && c.threadId)
-        : crews.filter((c) => c.projectId === repo.projectId && (!c.workstreamRepo || c.workstreamRepo.toLowerCase() === repo.repository.toLowerCase()) && (c.workstreamId === w.id || attached.has(c.id)) && c.shape !== "scout" && c.role !== "checker" && c.role !== "lookup" && c.threadId).at(0);
+        : repo.existing
+          ? undefined
+          : crews.filter((c) => c.projectId === repo.projectId && (!c.workstreamRepo || c.workstreamRepo.toLowerCase() === repo.repository.toLowerCase()) && (c.workstreamId === w.id || attached.has(c.id)) && c.shape !== "scout" && c.role !== "checker" && c.role !== "lookup" && c.threadId).at(0);
       if (!builder) throw new Error("Ship needs a finished builder in each repository.");
       await rememberPrUrl(builder,pr.url);
       await discoverCrewDelivery(builder);
-      for (const id of repo.taskId ? [repo.taskId] : w.taskIds) {
+      for (const id of repo.taskId ? [repo.taskId] : repo.existing ? [] : w.taskIds) {
         const task = ownerTasks.get(id);
         if (task && task.state !== "live" && task.state !== "dropped") ownerTasks.linkPr(id,w.threadId,pr.url,Date.now());
       }
@@ -6752,9 +6761,9 @@ export default async function plugin(bb: BbPluginApi) {
     if (input.mode === "local-only") throw new Error("Workstreams use the Ship PR path; local-only is unsupported.");
     const w = workstreams.get(input.workstreamId, input.parentThreadId);
     if (!input.deliveryRequirement && input.shape === "ship" && input.role !== "checker" && input.role !== "lookup") input.deliveryRequirement = "pr";
-    const belongs = w.repos.length === 0
-      ? w.projectId === input.projectId
-      : w.repos.some((r) => r.projectId === input.projectId && (!input.workstreamRepo || r.repository.toLowerCase() === input.workstreamRepo.toLowerCase()));
+    const belongs = isAdoptedWorkstream(w) || w.repos.length > 0
+      ? w.repos.some((r) => r.projectId === input.projectId && (!input.workstreamRepo || r.repository.toLowerCase() === input.workstreamRepo.toLowerCase()))
+      : w.projectId === input.projectId;
     if (!belongs) throw new Error("Dispatch repository does not belong to workstream.");
     const id = input.crewId ?? randomUUID().slice(0, 8);
     if (workstreams.listAll().some((other) => other.id !== w.id && other.jobs.some((j) => j.id === id))) throw new Error("Crew identity already belongs to another workstream.");
@@ -6946,9 +6955,10 @@ export default async function plugin(bb: BbPluginApi) {
     // A bad provider/model makes BB create a thread that is already in error. Check
     // BB's own catalog first so the refusal happens before anything is spawned.
     const selectedHost=await resolveHostForProject(input.projectId,input.parentThreadId,input.signal);
-    const wsRepos = input.workstreamId ? workstreams.get(input.workstreamId, input.parentThreadId!).repos : [];
+    const stream = input.workstreamId ? workstreams.get(input.workstreamId, input.parentThreadId!) : undefined;
+    const wsRepos = stream?.repos ?? [];
     const wsRepo = wsRepos.find((r) => r.projectId === input.projectId && (!input.workstreamRepo || r.repository.toLowerCase() === input.workstreamRepo.toLowerCase()));
-    if (input.workstreamId && wsRepos.length > 0 && !wsRepo) throw new Error("Repository is absent from workstream.");
+    if (input.workstreamId && (wsRepos.length > 0 || (stream && isAdoptedWorkstream(stream))) && !wsRepo) throw new Error("Repository is absent from workstream.");
     if (wsRepo) crew.workstreamRepo = wsRepo.repository;
     const reportDir = await crewReportDirectory(crew);
     if (wsRepo) crew.reportDir = reportDir;
