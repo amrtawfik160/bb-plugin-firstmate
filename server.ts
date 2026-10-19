@@ -5969,12 +5969,13 @@ export default async function plugin(bb: BbPluginApi) {
           if (after !== undefined && after.state !== task.state) { changed = true; bb.log.info(`task ${task.id}: crew ${crew.id} reported done; ${task.state} -> ${after.state}`); }
           if (after === undefined || after.state !== task.state || !isOpenTask(after)) await bb.storage.kv.set(seen, now);
         } else if (crewWaitsOnOwner(latest)) {
-          await bb.storage.kv.set(seen, now);
           // The captain may have asked already, but only a card bound to this task counts: a card about other
           // work, even on the same project, does not stand for the crew's question (checker round 2).
           const asked = ownerAsks.listOpen(captain).find((ask) => ask.task === task.id);
-          if (asked === undefined) await askForCrew(captain, task, crew, latest, now);
-          else {
+          if (asked === undefined) {
+            if (await askForCrew(captain, task, crew, latest, now)) await bb.storage.kv.set(seen, now);
+          } else {
+            await bb.storage.kv.set(seen, now);
             bb.log.info(`task ${task.id}: crew ${crew.id} waits on the owner; card ${asked.id} already asks, no new card`);
             const current = ownerTasks.get(task.id);
             if (current !== undefined && isOpenTask(current)) ownerTasks.move(task.id, captain, { to: "needs_you", reason: latest.note }, now);
@@ -6086,12 +6087,12 @@ export default async function plugin(bb: BbPluginApi) {
     return { sourceRef: `crew-wait:${statusKey(crew.id, decision.note)}` };
   }
 
-  async function askForCrew(captain: string, task: OwnerTask, crew: Crew, latest: { verb: string; note: string }, now: number): Promise<void> {
+  async function askForCrew(captain: string, task: OwnerTask, crew: Crew, latest: { verb: string; note: string }, now: number): Promise<boolean> {
     if (isOpenTask(task)) ownerTasks.move(task.id, captain, { to: "needs_you", reason: latest.note }, now);
     if (latest.verb !== "needs-decision") {
       bb.log.info(`task ${task.id}: crew ${crew.id} waits on the owner; status on the task, no card`);
       await deliverToCaptain(captain, `CREW WAITING ON OWNER: crew ${crew.id} waits on the owner for task ${task.id}: ${clip(latest.note, 400)}. When he answers, pass the answer to the crew with firstmate_tell.`, crew.id).catch((error) => bb.log.warn(`crew wait note: ${String(error)}`));
-      return;
+      return true;
     }
     const sourceRef = `crew-wait:${statusKey(crew.id, latest.note)}`;
     const options = choicesFromCrewReport(latest.note);
@@ -6099,8 +6100,12 @@ export default async function plugin(bb: BbPluginApi) {
       const key = await nativeDecisionKey(crew, latest.note);
       const bind = key ? `${crew.id}:${key}` : crew.id;
       bb.log.info(`task ${task.id}: crew ${crew.id} waits on the owner; captain must send firstmate_ask bind=${bind}`);
-      await deliverToCaptain(captain, `CREW QUESTION: crew ${crew.id} waits on the owner for task ${task.id}: ${clip(crewQuestionText(latest.note), 400)}. Send him a card with firstmate_ask, pass bind=${bind} so his answer releases this hold.`, crew.id).catch((error) => bb.log.warn(`crew question note: ${String(error)}`));
-      return;
+      try {
+        return await deliverToCaptain(captain, `CREW QUESTION: crew ${crew.id} waits on the owner for task ${task.id}: ${clip(crewQuestionText(latest.note), 400)}. Send him a card with firstmate_ask, pass bind=${bind} so his answer releases this hold.`, crew.id);
+      } catch (error) {
+        bb.log.warn(`crew question note: ${String(error)}`);
+        return false;
+      }
     }
     const project = task.project ?? await projectLabel(crew.projectId) ?? undefined;
     const question = crewQuestionText(latest.note);
@@ -6114,6 +6119,7 @@ export default async function plugin(bb: BbPluginApi) {
     const warning = failed === "" ? "" : ` It was not sent to Telegram (${failed}).`;
     bb.log.info(`task ${task.id}: crew ${crew.id} waits on the owner; card ${ask.id} opened`);
     await deliverToCaptain(captain, `CREW QUESTION CARD: crew ${crew.id} waits on the owner for task ${task.id}, so card ${ask.id} carries its question to him${replaced.length > 0 ? ` (replacing ${replaced.join(", ")})` : ""}.${warning} His answer is applied to the native question.`, crew.id).catch((error) => bb.log.warn(`crew question note: ${String(error)}`));
+    return true;
   }
 
   async function projectLabel(projectId: string | undefined): Promise<string | null> {

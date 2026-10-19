@@ -427,3 +427,19 @@ test("firstmate_ask bind attaches a captain card to the native question", async 
     assert.ok(answers.some((c) => c.includes("'choice'") && c.includes("'--release'")), "owner answer must release the native question, as Close does");
   } finally { restore(); await host.harness.lifecycle.dispose(); }
 });
+
+test("checker round3: failed prose-question notice is retried until a card can be made", async () => {
+  const {host,tasks,asks,restore}=await captainHost({wait1:"needs-decision [key=choice]: Choose Postgres, MySQL or SQLite?\n"});
+  let attempts=0;
+  try {
+    await host.bb.storage.kv.set("crews",[crewRow("wait1","thr_w1")]);
+    const task=tasks.open({captain:"thr_cap",project:"Cyndra",title:"Database",sourceRefs:[],crewId:"wait1",at:Date.now()});
+    host.harness.sdk.stub("threads.send",async (input: {input:unknown})=>{if(JSON.stringify(input).includes("CREW QUESTION:")){attempts++;throw new Error("temporary captain send failure");}return {delivery:"queued"};});
+    await host.harness.behavior.runSchedule("task-lifecycle");
+    assert.equal(attempts,1);
+    host.harness.sdk.stub("threads.send",async (input: {input:unknown})=>{if(JSON.stringify(input).includes("CREW QUESTION:"))attempts++;return {delivery:"queued"};});
+    await host.harness.behavior.runSchedule("task-lifecycle");
+    console.log("CHECKER R3 prose handoff",JSON.stringify({attempts,cards:asks.listOpen("thr_cap").filter(ask=>ask.task===task.id).length,state:tasks.get(task.id)?.state}));
+    assert.ok(attempts>=2,"a failed handoff must not consume the sole request to make the owner's card");
+  } finally {restore();await host.harness.lifecycle.dispose();}
+});
