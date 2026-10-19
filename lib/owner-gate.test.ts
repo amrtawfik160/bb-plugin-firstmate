@@ -115,6 +115,22 @@ test("the newest owner No wins over an older Approve and over a pre-approval", (
   assert.match(status.description, /No/);
 });
 
+test("the latest owner-answer time wins even when its card was issued earlier", () => {
+  const status = ownerApprovalStatus({
+    pr: PR, head: HEAD,
+    cards: [
+      card({ id: "later-issued", resolution: "Approve", createdAt: 2, answeredAt: 10 }),
+      card({ id: "earlier-issued", resolution: "No", createdAt: 1, answeredAt: 20 }),
+    ],
+    coverage: () => "covers",
+    preApprovals: [pre()],
+    task: "T12",
+    taskOpen: true,
+  });
+  assert.equal(status.state, "pending");
+  assert.match(status.description, /No/);
+});
+
 test("pre-approval covers only its task's PRs and expires when the task closes", () => {
   const covering = preApprovalCovers(pre(), { task: "T12", what: "merge", taskOpen: true });
   assert.equal(covering, true);
@@ -350,7 +366,7 @@ test("owner dispatch source is BB's origin record, never the text", () => {
   assert.equal(ownerDispatchSource({ ...base, origin: "cli" }), null);
   assert.equal(ownerDispatchSource({ ...base, origin: "plugin", originPluginId: "telegram" }), "telegram");
   assert.equal(ownerDispatchSource({ ...base, submissionPluginId: "telegram" }), "telegram");
-  assert.equal(ownerDispatchSource({ ...base, origin: "app" }), "app");
+  assert.equal(ownerDispatchSource({ ...base, origin: "app" }), null);
   assert.equal(ownerDispatchSource({ initiator: "user", senderThreadId: null, origin: undefined, originPluginId: undefined }), "omitted");
 });
 
@@ -371,6 +387,37 @@ test("cardsForPr still reads owner No after captain cancel or reopen", () => {
   const loaded = gate.cardsForPr(PR);
   assert.equal(loaded[0]?.answeredByOwner, true);
   assert.equal(loaded[0]?.resolution, "No");
+  assert.equal(approvalFor({
+    pr: PR, head: HEAD, action: "merge", cards: loaded, coverage: () => "covers",
+    preApprovals: [pre()], task: "T12", taskOpen: true, generation: 1,
+  }).state, "pending");
+});
+
+test("cardsForPr uses stored owner-answer time so a later No on an earlier card wins", () => {
+  const database = db();
+  const asks = createOwnerAsks(database);
+  const gate = createOwnerGate(database);
+  const first = asks.create({
+    captain: "thr_cap", kind: "approval", text: `Merge ${PR}?`,
+    options: [{ label: "Approve", value: "approve" }, { label: "No", value: "no" }], createdAt: 1,
+  });
+  createProductionApprovals(database).bindCard(first.id, [{ pr: PR, head: HEAD }]);
+  asks.resolve(first.id, "thr_cap", "answered", "No", 10, "owner");
+  asks.resolve(first.id, "thr_cap", "open", "Ask owner again", 11);
+  const second = asks.create({
+    captain: "thr_cap", kind: "approval", text: `Merge ${PR}?`,
+    options: [{ label: "Approve", value: "approve" }, { label: "No", value: "no" }], createdAt: 2,
+  });
+  createProductionApprovals(database).bindCard(second.id, [{ pr: PR, head: HEAD }]);
+  asks.resolve(second.id, "thr_cap", "answered", "Approve", 20, "owner");
+  assert.equal(approvalFor({
+    pr: PR, head: HEAD, action: "merge", cards: gate.cardsForPr(PR), coverage: () => "covers",
+    preApprovals: [pre()], task: "T12", taskOpen: true, generation: 1,
+  }).state, "success");
+  asks.resolve(first.id, "thr_cap", "answered", "No", 30, "owner");
+  const loaded = gate.cardsForPr(PR);
+  assert.equal(loaded.find((row) => row.id === first.id)?.answeredAt, 30);
+  assert.equal(loaded.find((row) => row.id === second.id)?.answeredAt, 20);
   assert.equal(approvalFor({
     pr: PR, head: HEAD, action: "merge", cards: loaded, coverage: () => "covers",
     preApprovals: [pre()], task: "T12", taskOpen: true, generation: 1,

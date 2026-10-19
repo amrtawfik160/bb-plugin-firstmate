@@ -197,10 +197,12 @@ test('ROUND4 origin: another plugin carrying copied Telegram text cannot grant p
 
 test('ROUND4 origin: plain owner instruction in the BB app can pre-approve its task',async()=>{
  const {host}=await deck();let restore=()=>{};try{
+  // owner decision A, 19 Oct: Telegram only
   const task=taskFor(host,'Billing',['bb:thr_cap:101']);restore=await judgeYes(host);
   globalThis.fetch=(async()=>new Response(JSON.stringify({answers:[{name:'merge_after_finish',choice:'yes',confidence:0.99},{name:'deploy_to_production',choice:'no',confidence:0.99},{name:'matching_task',choice:task.id,confidence:0.99}]}))) as typeof fetch;
   await originMessage(host,'Finish the billing fix and merge after you finish',{sender:null,initiator:'user',origin:'app',originPluginId:null});
-  const out=await cliCheck(host,task.id);assert.equal(out.exitCode,0,'the owner pre-approval exception is ignored for ordinary BB app messages');
+  assert.equal(createOwnerGate(host.bb.storage.database()).listPreApprovals().length,0);
+  const out=await cliCheck(host,task.id);assert.equal(out.exitCode,1);
  }finally{restore();await host.harness.lifecycle.dispose();}
 });
 

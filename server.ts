@@ -10217,28 +10217,22 @@ export default async function plugin(bb: BbPluginApi) {
       originPluginId: unknown;
       submissionPluginId: unknown;
       submissionData: unknown;
-      messageId: string;
     },
   ): Promise<void> {
     const source = ownerDispatchSource(dispatch);
     if (source === null) return;
-    const telegramPath = source === "telegram" || source === "omitted";
-    const telegram = telegramPath
-      ? (dispatch.submissionPluginId === "telegram" ? parseTelegramSubmission(dispatch.submissionData) : null) ?? parseInboundTelegram(text)
-      : null;
-    const header = telegramPath ? parseConnectorHeader(text) : null;
+    const telegram = (dispatch.submissionPluginId === "telegram" ? parseTelegramSubmission(dispatch.submissionData) : null) ?? parseInboundTelegram(text);
+    const header = parseConnectorHeader(text);
     const sourceEventId = telegram?.sourceEventId ?? header?.sourceEventId;
     if (sourceEventId && /^(ask|pack|proof):/i.test(sourceEventId)) return;
     if (telegram?.forwarded === true || header?.forwarded === true) return;
     const messageId = telegram?.messageId ?? header?.messageId;
     const senderId = telegram?.senderId ?? header?.senderId;
-    if (telegramPath && (!messageId || !senderId)) return;
-    const body = source === "app" ? text.trim() : stripTelegramEnvelope(text);
+    if (!messageId || !senderId) return;
+    const body = stripTelegramEnvelope(text);
     if (body === "" || isBotOrAckText(text)) return;
     if (ownerAsks.listOpen(captain).some((ask) => askLetterAnswer(ask, body) !== null)) return;
-    const ref = source === "app"
-      ? (dispatch.messageId !== "" ? `bb:${captain}:${dispatch.messageId}` : "")
-      : telegram ? telegramSourceRef(telegram) : header ? telegramSourceRef(header) : "";
+    const ref = telegram ? telegramSourceRef(telegram) : header ? telegramSourceRef(header) : "";
     if (ref !== "" && ownerGate.listPreApprovals().some((row) => row.ownerMessageRef === ref)) return;
     const keyFile = String((await settings.get()).decisionsKeyFile ?? "").trim();
     let apiKey = "";
@@ -16912,10 +16906,6 @@ export default async function plugin(bb: BbPluginApi) {
           const initiator = row === undefined ? context.initiator : rec["initiator"];
           if (String(initiator) !== "user") continue;
           const rowText = row === undefined ? text : String(rec["text"] ?? asRecord(rec["input"])["text"] ?? text);
-          const queuedMessage = asRecord(asRecord(context)["queuedMessage"]);
-          const messageId = typeof rec["id"] === "string" && rec["id"] !== ""
-            ? rec["id"]
-            : typeof queuedMessage["id"] === "string" ? queuedMessage["id"] : "";
           await considerOwnerPreApproval(threadId, rowText, {
             initiator,
             senderThreadId: row === undefined ? context.senderThreadId : rec["senderThreadId"],
@@ -16923,7 +16913,6 @@ export default async function plugin(bb: BbPluginApi) {
             originPluginId: row === undefined ? asRecord(context)["originPluginId"] : rec["originPluginId"],
             submissionPluginId: asRecord(context.experimental_submission).pluginId,
             submissionData: context.experimental_submission?.data,
-            messageId,
           }).catch((error) => bb.log.warn(`owner pre-approval: ${String(error)}`));
         }
         let turnRefs: string[] = [];

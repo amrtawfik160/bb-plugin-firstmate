@@ -19,6 +19,7 @@ export type GateCard = {
   resolution: string | null;
   answeredByOwner: boolean;
   createdAt: number;
+  answeredAt?: number;
 };
 
 export type PreApproval = {
@@ -71,7 +72,7 @@ type Database = {
 
 const allowsSchema = z.enum(["merge", "deploy", "both"]);
 
-export type OwnerDispatchSource = "telegram" | "app" | "omitted" | null;
+export type OwnerDispatchSource = "telegram" | "omitted" | null;
 
 /** Classify a dispatch from BB origin fields. `omitted` means those fields were never set. */
 export function ownerDispatchSource(input: {
@@ -91,7 +92,6 @@ export function ownerDispatchSource(input: {
   if (origin === "mixed" || originPluginId === "mixed") return null;
   if (typeof originPluginId === "string" && originPluginId !== "telegram") return null;
   if (originPluginId === "telegram" || submissionPluginId === "telegram") return "telegram";
-  if (origin === "app") return "app";
   if (origin === undefined && originPluginId === undefined) return "omitted";
   return null;
 }
@@ -108,13 +108,25 @@ function ownerNo(card: GateCard): boolean {
   return card.kind === "approval" && card.state === "answered" && card.answeredByOwner && card.resolution === "No";
 }
 
+function ownerAnswerTime(card: GateCard): number {
+  return card.answeredAt ?? card.createdAt;
+}
+
 function newestForPr(cards: readonly GateCard[], pr: string, captain?: string): GateCard | undefined {
-  return cards.find((card) =>
-    card.kind === "approval"
-    && card.answeredByOwner
-    && card.prs.some((named) => samePr(named, pr))
-    && (captain === undefined || card.captain === undefined || card.captain === captain)
-  );
+  let newest: GateCard | undefined;
+  for (const card of cards) {
+    if (card.kind !== "approval" || !card.answeredByOwner) continue;
+    if (!card.prs.some((named) => samePr(named, pr))) continue;
+    if (captain !== undefined && card.captain !== undefined && card.captain !== captain) continue;
+    if (!newest) {
+      newest = card;
+      continue;
+    }
+    const time = ownerAnswerTime(card);
+    const best = ownerAnswerTime(newest);
+    if (time > best || (time === best && card.id > newest.id)) newest = card;
+  }
+  return newest;
 }
 
 function coverOf(card: GateCard, head: string, coverage?: (card: GateCard) => HeadCoverage): HeadCoverage {
@@ -139,10 +151,11 @@ export type ApprovalDecisionInput = {
  * The only production-approval decision. Merge prod-check, deploy prod-check, Ship/merge,
  * and the GitHub status all call this. Callers do not add a fallback.
  *
- * Order: newest owner-confirmed decision for this PR, scoped to the captain that owns the
- * PR's task (a newer No blocks whatever pre-approval exists); an owner Approve covers only
- * the head it named plus proven base-only merges; else a valid pre-approval for this opening
- * of the task.
+ * Order: latest owner-confirmed decision for this PR by stored owner-answer time (then
+ * card id), scoped to the captain that owns the PR's task. Cards with no owner answer never
+ * count. A later No blocks whatever pre-approval exists; an owner Approve covers only the
+ * head it named plus proven base-only merges; else a valid pre-approval for this opening of
+ * the task.
  */
 export function approvalFor(input: ApprovalDecisionInput): OwnerApprovalStatus {
   const newest = newestForPr(input.cards, input.pr, input.captain);
@@ -226,6 +239,7 @@ type CardRow = {
   state: string;
   resolution: string | null;
   created_at: number;
+  answered_at: number | null;
   owner: number;
 };
 
@@ -323,6 +337,7 @@ export function createOwnerGate(db: Database) {
             CASE WHEN ans.id IS NOT NULL THEN 'answered' ELSE a.state END AS state,
             COALESCE(ans.resolution, a.resolution) AS resolution,
             a.created_at,
+            ans.at AS answered_at,
             CASE WHEN ans.id IS NOT NULL THEN 1 ELSE 0 END AS owner
            FROM production_approval_pr p
            JOIN production_approval_card c ON c.ask=p.ask
@@ -348,6 +363,7 @@ export function createOwnerGate(db: Database) {
             resolution: row.resolution,
             answeredByOwner: row.owner === 1,
             createdAt: row.created_at,
+            ...(typeof row.answered_at === "number" ? { answeredAt: row.answered_at } : {}),
           };
         });
       } catch {

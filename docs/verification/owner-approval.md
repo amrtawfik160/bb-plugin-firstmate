@@ -25,30 +25,32 @@ and still refuses `firstmate_merge` and Ship without an owner Approve.
 An owner message that tells the agent to merge after it finishes, or to deploy
 to production, is judged by the Decisions model. There is no word list.
 
-The record is created only from a message BB itself recorded as an owner
-message: Telegram (`originPluginId` or `experimental_submission.pluginId` is
-`telegram`, no sender thread, initiator user) or a BB-app owner message
-(`origin` is `app`, no sender thread, initiator user). A missing sender is not
-Telegram. CLI/SDK origins, other plugins, `mixed`, and any message with a
-sender create nothing. Envelope text is trusted only on the Telegram path.
-Decisions are not proof of origin. Each owner message id issues permission
-once (Telegram `tg:chat:msg`, BB-app `bb:thread:id`): a replay after close,
-reopen, restart, or a new task generation creates nothing. It stores the owner
-message, a quote of the words, the task, the open epoch of that task, the
-project, and whether it allows merge, deploy, or both.
+The record is created only from a Telegram owner message (`originPluginId` or
+`experimental_submission.pluginId` is `telegram`, no sender thread, initiator
+user). A BB-app message creates nothing: BB records it with the same fields as
+a captain self-tell (initiator user, null sender, null origin), so the two
+cannot be told apart. CLI/SDK origins, other plugins, `mixed`, and any message
+with a sender also create nothing. Envelope text is trusted only on the
+Telegram path. Decisions are not proof of origin. Each Telegram message id
+issues permission once (`tg:chat:msg`): a replay after close, reopen, restart,
+or a new task generation creates nothing. It stores the owner message, a quote
+of the words, the task, the open epoch of that task, the project, and whether
+it allows merge, deploy, or both. The owner still approves each merge on its
+approval card.
 It covers PRs of that task only. Closing the task expires it permanently:
 reopening, re-linking, or a new task carrying the same source ref does not
 revive it. An unbound permission binds once, to the first matching task, and
 is consumed then. Telegram gets a progress note that quotes the words.
 
 An owner No stays until the owner changes it. Captain cancel or reopen changes
-only the card; it never deletes or hides that answer. A newer owner answer
-(Telegram or BB app) is the only replacement.
+only the card; it never deletes or hides that answer. A newer owner answer is
+the only replacement.
 
 Merge prod-check, deploy prod-check, Ship, firstmate_merge, deploy detection,
 and the GitHub status all call one function `approvalFor` and share one head
-coverage function, including proven base-only merges. A newer owner-confirmed
-decision for that PR wins; an unanswered newer card never hides an earlier No.
+coverage function, including proven base-only merges. The latest stored
+owner-answer time for that PR wins; card issue order does not. An unanswered
+newer card never hides an earlier No.
 An owner Approve covers only the head it named, plus base-only merges already
 proven. Another captain's unanswered card never changes that coverage.
 Binding, closing, an owner answer, a new head, or a link re-posts the GitHub

@@ -235,6 +235,7 @@ export function createOwnerAsks(db: Database): OwnerAsks {
   try { db.exec("ALTER TABLE owner_ask_answer ADD COLUMN at INTEGER"); } catch { /* already present on this database */ }
   try {
     db.exec("UPDATE owner_ask_answer SET resolution=(SELECT resolution FROM owner_ask WHERE owner_ask.id=owner_ask_answer.id) WHERE source='owner' AND (resolution IS NULL OR resolution='')");
+    db.exec("UPDATE owner_ask_answer SET at=(SELECT resolved_at FROM owner_ask WHERE owner_ask.id=owner_ask_answer.id) WHERE source='owner' AND at IS NULL");
   } catch { /* owner_ask is always created first; ignore a half-migrated test database */ }
   db.exec(`
     CREATE TABLE IF NOT EXISTS owner_ask_source (
