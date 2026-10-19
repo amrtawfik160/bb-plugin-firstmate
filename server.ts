@@ -98,6 +98,7 @@ import { coalesceBatches, parseConnectorHeader, parseInboundTelegram, parseSourc
 import { telegramFileRefusals } from "./lib/telegram-files.ts";
 import { connectorReplied, correlationOf, isTelegramRpcMissing, oldestUnanswered, sendTelegramReply, TELEGRAM_BRIDGE_PLUGIN_ID, telegramReplyFallbackBody } from "./lib/telegram-reply.ts";
 import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRecord } from "./lib/launch.ts";
+import { captainWatchNeed, WATCH_NEED_LOG, type WatchNeedReason } from "./lib/captain-watch-need.ts";
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
 import { optionHelp } from "./lib/cli-help.ts";
 import { AUDITED_BUNDLED_SNAPSHOTS, AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython } from "./lib/native-policy.ts";
@@ -300,6 +301,9 @@ function pushHeld(held: string[], text: string): { held: string[]; evicted: stri
 }
 
 const CREWS_KEY = "crews";
+const CAPTAIN_WATCH_STOPPED_PREFIX = "captain-watch-stopped:";
+const CAPTAIN_WATCH_WAKE_PREFIX = "captain-watch-wake:";
+const RETIRED_HOME_PREFIX = "captain-home-retired:";
 // BB caps one KV value at 256 KiB. Full briefs made the register overflow it at a few
 // hundred crews and every dispatch failed, so the register keeps a prefix only.
 const CREW_TASK_PREFIX = "crew-task:";
@@ -3354,6 +3358,10 @@ export default async function plugin(bb: BbPluginApi) {
         return { durable: false };
       }
       bb.log.info(`fm wake enqueued crew=${crew.id} key=${key} (note→status + pointer)`);
+      if (crew.parentThreadId) {
+        await bb.storage.kv.set(`${CAPTAIN_WATCH_WAKE_PREFIX}${crew.parentThreadId}`, true);
+        await ensureCaptainWatch(crew.parentThreadId, "queued-wake", signal);
+      }
       return { durable: true };
     } catch (error) {
       if (isAbortError(error)) throw error;
@@ -6883,6 +6891,7 @@ export default async function plugin(bb: BbPluginApi) {
     return launches.once(`dispatch:${key}`, async () => {
       const record = await launches.reserve({ key, taskId, projectId: input.projectId, owner: input.parentThreadId ?? "",
         home, generation: 1, shape: input.shape, deliveryMode:input.mode, yolo:input.yolo, deliveryRequirement:input.deliveryRequirement ?? "merged", state: "reserved", threadId: null, updatedAt: Date.now() }, () => launchCapacity(input.parentThreadId));
+      if (input.parentThreadId) await ensureCaptainWatch(input.parentThreadId, "in-flight-launch");
       const resolved = await reconcileLaunch(record);
       if (resolved.state === "deleted") throw new Error(`Worker for launch ${taskId} was deleted by BB core. This attempt cannot be resumed.`);
       if (input.deliveryRequirement && input.deliveryRequirement !== recoveredContract({},resolved)) throw new Error("Retry cannot change the original delivery contract.");
@@ -12211,6 +12220,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
       stage('captain registration');await markDeck(threadId,startSignal);startSignal.throwIfAborted();
       await raceAbort(rememberWatchCaptain(ctx,threadId),startSignal,STUCK_HOST_CALL_MS);startSignal.throwIfAborted();
+      if (home) await ensureCaptainWatch(threadId, "captain-turn", startSignal);
       const renderedDigest=(!current.fullParityOnDeck||all||digest)?(stage('requested session digest'),await raceAbort(deckDigest(ctx,startSignal,all),startSignal)):undefined;
       const command=home?(captainStartupCommand(home,'session-start')??''):'';
       return {captain:true,threadId,realMode:!!home,nativeHome:home,hostId:host,ready:false,requiresAgentShell:!!home,startupCommand:command,digest:renderedDigest??null,
@@ -17086,6 +17096,9 @@ export default async function plugin(bb: BbPluginApi) {
   });
   bb.events.on("thread.active", async ({ thread }) => {
     captainTurnStartedAt.set(thread.id, Date.now());
+    if (await bb.storage.kv.get(`native-home:${thread.id}`)) {
+      await ensureCaptainWatch(thread.id, "captain-turn");
+    }
     if (knownCaptainsRef.has(thread.id)) {
       // A real wake: the free-text reminder rides on this turn instead of starting one of its own.
       const flags = await reliabilityFlags();
@@ -19137,7 +19150,6 @@ export default async function plugin(bb: BbPluginApi) {
   // A deleted captain 404s forever. Its keeper would otherwise keep re-arming fm-watch
   // until the owner beat expired. Stop it, and record the home as retired so later
   // passes and reloads skip it. The home's files and its native-home binding are kept.
-  const RETIRED_HOME_PREFIX = "captain-home-retired:";
   async function retireDeletedCaptainHome(captain: string, signal?: AbortSignal): Promise<void> {
     const home = await bb.storage.kv.get<string>(`native-home:${captain}`);
     const host = await bb.storage.kv.get<string>(`native-home-host:${captain}`);
@@ -19146,6 +19158,86 @@ export default async function plugin(bb: BbPluginApi) {
     }
     await bb.storage.kv.set(`${RETIRED_HOME_PREFIX}${captain}`, true);
     bb.log.info(`captain home ${captain}: thread deleted; keeper stopped and the home is retired from supervision`);
+  }
+
+  async function captainHomeWatchNeed(captain: string, captainStatus: string, signal?: AbortSignal): Promise<WatchNeedReason> {
+    const queuedWake = (await bb.storage.kv.get(`${CAPTAIN_WATCH_WAKE_PREFIX}${captain}`)) === true;
+    const crews = (await readCrews()).filter((crew) => crew.parentThreadId === captain && !isSecondmateRoute(crew));
+    const statuses = crews.some((crew) => crew.threadId !== "") ? await statusesFor(crews, signal) : new Map<string, string>();
+    return captainWatchNeed({
+      captainStatus,
+      queuedWake,
+      crews: crews.map((crew) => ({
+        threadId: crew.threadId,
+        threadStatus: crew.threadId === "" ? null : statuses.get(crew.threadId) ?? null,
+      })),
+      launches: launches.list(captain).map((row) => ({ state: row.state })),
+    });
+  }
+
+  async function captainWakeQueueLive(hostId: string, fmHome: string, captain: string, signal?: AbortSignal): Promise<boolean | null> {
+    const stateDir = wakeStateDir(fmHome, captain);
+    const queue = `${stateDir}/.wake-queue`;
+    const receipt = `${stateDir}/.bb-wake-receipt.json`;
+    const script = `if [ -s ${shQuote(queue)} ] || [ -s ${shQuote(receipt)} ]; then echo FM_QUEUE=yes; else echo FM_QUEUE=no; fi`;
+    try {
+      const res = await runOnHost(hostId, script, 15_000, signal);
+      if (res.output.includes("FM_QUEUE=yes")) return true;
+      if (res.output.includes("FM_QUEUE=no")) return false;
+      return null;
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      return null;
+    }
+  }
+
+  async function resolveWatchNeed(
+    captain: string,
+    hostId: string,
+    fmHome: string,
+    captainStatus: string,
+    alreadyStopped: boolean,
+    signal?: AbortSignal,
+  ): Promise<WatchNeedReason> {
+    let need = await captainHomeWatchNeed(captain, captainStatus, signal);
+    if (need !== "nothing-live" && need !== "queued-wake") return need;
+    if (need === "nothing-live" && alreadyStopped) return need;
+    const live = await captainWakeQueueLive(hostId, fmHome, captain, signal);
+    if (live === true) {
+      await bb.storage.kv.set(`${CAPTAIN_WATCH_WAKE_PREFIX}${captain}`, true);
+      return "queued-wake";
+    }
+    if (live === false) {
+      await bb.storage.kv.delete(`${CAPTAIN_WATCH_WAKE_PREFIX}${captain}`);
+      return need === "queued-wake" ? "nothing-live" : need;
+    }
+    return "queued-wake";
+  }
+
+  async function ensureCaptainWatch(captain: string, reason: Exclude<WatchNeedReason, "nothing-live">, signal?: AbortSignal): Promise<void> {
+    if (captain === "") return;
+    try {
+      const home = await bb.storage.kv.get<string>(`native-home:${captain}`);
+      const host = await bb.storage.kv.get<string>(`native-home-host:${captain}`);
+      if (typeof home !== "string" || home.trim() === "" || typeof host !== "string" || host === "") return;
+      if ((await bb.storage.kv.get(`${RETIRED_HOME_PREFIX}${captain}`)) === true) return;
+      await inCaptainHome(captain, async () => {
+        const s = await settings.get();
+        if (s.watchOwner !== "fm-watch") return;
+        const thread = await raceAbort(bb.sdk.threads.get({ threadId: captain }), signal, STUCK_HOST_CALL_MS);
+        if (thread.archivedAt != null) return;
+        const grace = Math.max(30, Number(s.watchHeartbeatSec) || 90);
+        const result = await superviseFmWatch(host, s.fmHome, grace, true, signal, captain);
+        if (!result) return;
+        if ((await bb.storage.kv.get(`${CAPTAIN_WATCH_STOPPED_PREFIX}${captain}`)) === true) {
+          await bb.storage.kv.delete(`${CAPTAIN_WATCH_STOPPED_PREFIX}${captain}`);
+          bb.log.info(`captain home ${captain}: watcher restarted (${WATCH_NEED_LOG[reason]})`);
+        }
+      });
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      bb.log.warn(`captain home ${captain}: watcher restart failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   bb.background.service("captain-home-watch", {
@@ -19180,12 +19272,37 @@ export default async function plugin(bb: BbPluginApi) {
                 await stopFmWatchKeeper(host, s.fmHome, signal);
                 return;
               }
+              const alreadyStopped = (await bb.storage.kv.get(`${CAPTAIN_WATCH_STOPPED_PREFIX}${captain}`)) === true;
+              let need = await resolveWatchNeed(captain, host, s.fmHome, thread.status, alreadyStopped, signal);
+              if (need === "nothing-live") {
+                if (!alreadyStopped) {
+                  const latest = await raceAbort(bb.sdk.threads.get({ threadId: captain }), signal, STUCK_HOST_CALL_MS);
+                  if (latest.archivedAt != null) {
+                    await stopFmWatchKeeper(host, s.fmHome, signal);
+                    seen.delete(captain);
+                    return;
+                  }
+                  need = await captainHomeWatchNeed(captain, latest.status, signal);
+                }
+                if (need === "nothing-live") {
+                  if (!alreadyStopped) {
+                    await stopFmWatchKeeper(host, s.fmHome, signal);
+                    await bb.storage.kv.set(`${CAPTAIN_WATCH_STOPPED_PREFIX}${captain}`, true);
+                    bb.log.info(`captain home ${captain}: watcher stopped (${WATCH_NEED_LOG["nothing-live"]})`);
+                  }
+                  return;
+                }
+              }
               const grace = Math.max(30, Number(s.watchHeartbeatSec) || 90);
               const prior = fmWatchBeatSchema.safeParse(await bb.storage.kv.get(fmWatchBeatKey(host)));
               const now = Date.now();
               const backoff = prior.success ? prior.data.backoffUntil ?? 0 : 0;
               const result = await superviseFmWatch(host, s.fmHome, grace, now >= backoff, signal, captain);
               if (!result) return;
+              if (alreadyStopped || (await bb.storage.kv.get(`${CAPTAIN_WATCH_STOPPED_PREFIX}${captain}`)) === true) {
+                await bb.storage.kv.delete(`${CAPTAIN_WATCH_STOPPED_PREFIX}${captain}`);
+                bb.log.info(`captain home ${captain}: watcher restarted (${WATCH_NEED_LOG[need]})`);
+              }
               const streak = result.keeperAlive ? 0 : result.relaunched ? (prior.success ? prior.data.consecutiveRelaunch ?? 0 : 0) + 1 : 0;
               await bb.storage.kv.set(fmWatchBeatKey(host), {
                 beatAge: result.beatAge, checkedAt: now, grace, relaunched: result.relaunched,
