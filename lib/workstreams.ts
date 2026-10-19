@@ -96,7 +96,8 @@ export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
       w.cleanupApproved = true; save(w);
       await stop(w);
       for (const repo of w.repos) await deps.remove(repo);
-      w.state = 'ended'; w.closeTopicRequested = w.topic !== undefined; w.updatedAt = deps.now(); return save(w);
+      // Private chat cannot close or reopen a topic (conversation-topics rule 7).
+      w.state = 'ended'; w.closeTopicRequested = false; w.updatedAt = deps.now(); return save(w);
   }
   const service = {
     get,
@@ -114,6 +115,33 @@ export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
       }
       if (!w.provisioned) { w.repos = await deps.provision(w); w.provisioned = true; save(w); }
       return w;
+    }),
+    adopt: (input: { threadId: string; projectId: string; name: string; requestId: string; taskIds: string[] }) => serial(async () => {
+      const taskIds = [...new Set(input.taskIds)];
+      if (taskIds.length === 0) throw new Error('Adopt needs taskIds.');
+      let w = all().find((row) => row.threadId === input.threadId && row.requestId === input.requestId);
+      if (w && (w.threadId !== input.threadId || w.projectId !== input.projectId)) throw new Error('Topic or request belongs to another captain or project.');
+      for (const taskId of taskIds) {
+        const holder = all().find((other) => other.taskIds.includes(taskId) && other.id !== w?.id);
+        if (holder) throw new Error(`Task ${taskId} already belongs to a workstream.`);
+      }
+      if (!w) {
+        const ports = new Set(all().map((row) => row.devLink.port));
+        let port = 5200; while (ports.has(port)) port++;
+        w = save({
+          threadId: input.threadId, projectId: input.projectId, name: input.name, requestId: input.requestId,
+          id: `ws-${randomUUID().slice(0, 12)}`, state: 'open',
+          supportsDevLink: await deps.supportsDevLink?.(input.projectId) ?? true,
+          provisioned: true, repos: [], taskIds: [], jobs: [],
+          devLink: { state: 'stopped', port, realLogin: false }, closeTopicRequested: false, ship: { state: 'idle' },
+          createdAt: deps.now(), updatedAt: deps.now(),
+        });
+      }
+      for (const taskId of taskIds) {
+        if (!w.taskIds.includes(taskId)) w.taskIds.push(taskId);
+      }
+      w.updatedAt = deps.now();
+      return save(w);
     }),
     bindTopic: (id: string, threadId: string, topic: z.infer<typeof topicSchema>) => serial(async () => {
       const w = open(id, threadId);

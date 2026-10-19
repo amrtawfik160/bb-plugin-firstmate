@@ -72,7 +72,7 @@ test('fourth dev link stops least recently requested, keeps fixed port and stops
   } finally { f.db.close(); }
 });
 
-test('End refuses merged tasks and unsaved work, then closes topic only after cleanup', async () => {
+test('End refuses merged tasks and unsaved work, then leaves the topic after cleanup', async () => {
   const f = fixture();
   try {
     const w = await f.create();
@@ -84,7 +84,7 @@ test('End refuses merged tasks and unsaved work, then closes topic only after cl
     await assert.rejects(f.store.end(w.id, 'cap'), /Unsaved work/);
     f.deps.unsaved = async () => [];
     const ended = await f.store.end(w.id, 'cap');
-    assert.equal(ended.closeTopicRequested, true);
+    assert.equal(ended.closeTopicRequested, false);
     assert.equal(ended.state, 'ended');
   } finally { f.db.close(); }
 });
@@ -142,7 +142,7 @@ test('workstream ends automatically only after every task is Live or Dropped and
     await f.store.reconcile(); assert.equal(removed,0);
     f.deps.unsaved = async () => [];
     await f.store.reconcile(); assert.equal(removed,1);
-    assert.equal(f.store.get(w.id,'cap').closeTopicRequested,true);
+    assert.equal(f.store.get(w.id,'cap').closeTopicRequested,false);
     await f.store.reconcile(); assert.equal(removed,1);
   } finally { f.db.close(); }
 });
@@ -173,6 +173,48 @@ test('End and task attachment serialize so a late task cannot join a removed wor
     release(); await ending; await rejected;
     assert.deepEqual(f.store.get(w.id,'cap').taskIds,['T1']);
   } finally { release?.(); f.db.close(); }
+});
+
+test('adopt groups open tasks without provisioning; a retry of the same requestId is a no-op', async () => {
+  const f = fixture();
+  let provisions = 0;
+  const inner = f.deps.provision;
+  f.deps.provision = async (w) => { provisions++; return inner(w); };
+  try {
+    const first = await f.store.adopt({ threadId: 'cap', projectId: 'cyndra', name: 'Cyndra web chat restyle', requestId: 'adopt-chat', taskIds: ['T1', 'T2'] });
+    assert.deepEqual(first.taskIds, ['T1', 'T2']);
+    assert.equal(first.provisioned, true);
+    assert.deepEqual(first.repos, []);
+    assert.equal(provisions, 0);
+    const retry = await f.store.adopt({ threadId: 'cap', projectId: 'cyndra', name: 'Renamed', requestId: 'adopt-chat', taskIds: ['T1', 'T2'] });
+    assert.equal(retry.id, first.id);
+    assert.equal(f.store.list('cap').length, 1);
+  } finally { f.db.close(); }
+});
+
+test('adopt refuses a task already in another workstream and creates nothing', async () => {
+  const f = fixture();
+  try {
+    const held = await f.store.adopt({ threadId: 'cap', projectId: 'cyndra', name: 'Held', requestId: 'held', taskIds: ['T1'] });
+    await assert.rejects(f.store.adopt({ threadId: 'cap', projectId: 'cyndra', name: 'Other', requestId: 'other', taskIds: ['T1', 'T2'] }), /already belongs to a workstream/);
+    assert.deepEqual(f.store.list('cap').map((w) => w.id), [held.id]);
+  } finally { f.db.close(); }
+});
+
+test('End leaves the topic after cleanup, for created and adopted workstreams', async () => {
+  const f = fixture();
+  try {
+    const created = await f.create();
+    f.store.attachTask(created.id, 'cap', 'T1');
+    const endedCreated = await f.store.end(created.id, 'cap');
+    assert.equal(endedCreated.closeTopicRequested, false);
+    assert.equal(endedCreated.state, 'ended');
+    const adopted = await f.store.adopt({ threadId: 'cap', projectId: 'cyndra', name: 'Chat', requestId: 'adopt-end', taskIds: ['T2'] });
+    await f.store.bindTopic(adopted.id, 'cap', { chatId: '200', topicId: 9 });
+    const endedAdopted = await f.store.end(adopted.id, 'cap');
+    assert.equal(endedAdopted.closeTopicRequested, false);
+    assert.deepEqual(endedAdopted.topic, { chatId: '200', topicId: 9 });
+  } finally { f.db.close(); }
 });
 
 test('HTTP activity renews the dev link idle window without another Open tap', async () => {
