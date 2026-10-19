@@ -58,16 +58,23 @@ export function verifiedBy(r: Pick<DeliveryRecord,'verification'>): 'crew' | 'ow
   return v.actor === OWNER_ACTOR ? 'owner' : 'captain';
 }
 const sameCommit = (full:string, given:string) => full === given || (/^[0-9a-f]{7,}$/i.test(given.trim()) && full.toLowerCase().startsWith(given.trim().toLowerCase()));
+const FULL_COMMIT = /^[0-9a-f]{40}$/i;
+/** Full 40-hex commit identity, compared ignoring case. Prefixes are for typed commands only. */
+export function fullCommitSha(value: string | null | undefined): string | null {
+  if (value == null) return null;
+  const t = value.trim();
+  return FULL_COMMIT.test(t) ? t.toLowerCase() : null;
+}
 /** An owner Works tap on this PR's head that can cover the merge commit when GitHub trees match. */
 export function ownerWorksHeadTap(r: Pick<DeliveryRecord,'headSha'|'mergeCommitSha'|'verification'|'verifiedCommitSha'>): { tappedSha: string; mergeSha: string } | null {
   const v = r.verification;
   if (!v || v.actor !== OWNER_ACTOR || v.crewId) return null;
   if (v.seen.trim().toLowerCase() !== 'works') return null;
-  const merge = r.mergeCommitSha, head = r.headSha;
-  if (!merge || !head || !v.commitSha) return null;
-  if (!sameCommit(head, v.commitSha) && !sameCommit(v.commitSha, head)) return null;
-  if (r.verifiedCommitSha && sameCommit(merge, r.verifiedCommitSha)) return null;
-  return { tappedSha: head, mergeSha: merge };
+  const merge = fullCommitSha(r.mergeCommitSha), head = fullCommitSha(r.headSha), tapped = fullCommitSha(v.commitSha);
+  if (!merge || !head || !tapped || head !== tapped) return null;
+  const verified = fullCommitSha(r.verifiedCommitSha);
+  if (verified && verified === merge) return null;
+  return { tappedSha: tapped, mergeSha: merge };
 }
 export function canonicalPr(url: string) {
   const m = /^https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)(?:[/?#].*)?$/.exec(url.trim());

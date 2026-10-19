@@ -349,6 +349,13 @@ test("an owner Works tap on the PR head is eligible to cover a later merge commi
   assert.equal(tap({ verification: { crewId: null, actor: OWNER_ACTOR, commitSha: head, driven: "tested", seen: "Does not work", at: 1 } }), null, "Broken is not Works");
   assert.equal(tap({ headSha: "2222222222222222222222222222222222222222" }), null, "a tap for another head is not this PR's head at merge");
   assert.equal(tap({ verifiedCommitSha: merge, verification: { crewId: null, actor: OWNER_ACTOR, commitSha: merge, driven: "tested", seen: "Works", at: 1 } }), null, "already covers the merge");
+  assert.equal(tap({ headSha: head.slice(0, 7) }), null, "a short stored head is not the final head");
+  assert.equal(tap({ verification: { crewId: null, actor: OWNER_ACTOR, commitSha: head.slice(0, 7), driven: "tested", seen: "Works", at: 1 } }), null, "a short stored tap is not the final head");
+  assert.equal(tap({ mergeCommitSha: merge.slice(0, 7) }), null, "a short stored merge does not qualify");
+  assert.deepEqual(tap({
+    headSha: head.toUpperCase(), mergeCommitSha: merge.toUpperCase(),
+    verification: { crewId: null, actor: OWNER_ACTOR, commitSha: head.toUpperCase(), driven: "tested", seen: "Works", at: 1, surface: "iphone", build: "6" },
+  }), { tappedSha: head, mergeSha: merge }, "full identities compare ignoring hex case");
 });
 
 test("an owner waiver covers only the head it was given for", () => {

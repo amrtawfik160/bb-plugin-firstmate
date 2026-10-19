@@ -449,7 +449,12 @@ test('checker167: Works on a pending device card releases a merged delivery',asy
   assert.ok(ask,response);
   store.observe(id,{headSha:head(130),state:'merged',draft:false,checks:'passing',review:'approved',reviewHeadSha:head(130),mergeCommitSha:'b'.repeat(40),mergeable:'mergeable'},true);
   await tap(ask,'works');
-  assert.equal(store.get(id).status,'complete');
+  const row=store.get(id);
+  assert.equal(row.status,'complete');
+  assert.equal(row.verifiedCommitSha,'b'.repeat(40));
+  assert.equal(row.verification.tappedCommitSha,head(130));
+  assert.equal(row.verification.treesMatched,true);
+  assert.equal(row.verification.treeSha,SAME_TREE);
  }finally{await host.harness.lifecycle.dispose();}
 });
 
@@ -467,11 +472,30 @@ for (const [repo,n,thread] of [[WOO,130,'thr_woo'],[SAFI,77,'thr_safi']]) for (c
    assert.equal(store.get(id).status,'merged-needs-verification');
    assert.equal(store.get(id).verifiedCommitSha,null);
   } else {
-   assert.equal(store.get(id).status,'complete');
-   assert.equal(store.get(id).verifiedCommitSha,'b'.repeat(40));
-   assert.equal(store.get(id).verification.build,'42');
+   const row=store.get(id);
+   assert.equal(row.status,'complete');
+   assert.equal(row.verifiedCommitSha,'b'.repeat(40));
+   assert.equal(row.verification.build,'42');
+   assert.equal(row.verification.tappedCommitSha,head(n));
+   assert.equal(row.verification.treesMatched,true);
+   assert.equal(row.verification.treeSha,SAME_TREE);
   }
  }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('checker167: Works after squash refuses when GitHub trees differ',async()=>{
+ const {host,store,tap}=await deck({requirement:'merged-and-verified'});
+ try {
+  const id=key(WOO,130);
+  const response=text(await deliveries(host,{action:'device-proof',id,commitSha:head(130).slice(0,7),build:'42',link:'https://example.com/build42',check:'Upload a photo'},'thr_woo'));
+  const ask=/Device proof card (\S+) is open/.exec(response)?.[1];
+  assert.ok(ask,response);
+  store.observe(id,{headSha:head(130),state:'merged',draft:false,checks:'passing',review:'approved',reviewHeadSha:head(130),mergeCommitSha:'b'.repeat(40),mergeable:'mergeable'},true);
+  commitTrees.set(head(130),SAME_TREE);commitTrees.set('b'.repeat(40),OTHER_TREE);
+  await tap(ask,'Works');
+  assert.equal(store.get(id).status,'merged-needs-verification');
+  assert.equal(store.get(id).verifiedCommitSha,null);
+ }finally{commitTrees.clear();await host.harness.lifecycle.dispose();}
 });
 
 const mergeObs=(headSha,mergeSha)=>({headSha,state:'merged',draft:false,checks:'passing',review:'approved',reviewHeadSha:headSha,mergeCommitSha:mergeSha,mergeable:'mergeable'});

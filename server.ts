@@ -99,7 +99,7 @@ import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRe
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
 import { optionHelp } from "./lib/cli-help.ts";
 import { AUDITED_BUNDLED_SNAPSHOTS, AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython } from "./lib/native-policy.ts";
-import { createDeliveries, OWNER_ACTOR, ownerWorksHeadTap, verifiedBy, LOST_OWNER_RECHECK_MS, canonicalPr, decisionLine, deliveryLine, parseForge, PR_VIEW_FIELDS, PR_VIEW_JQ, prBranchOwner, releasesTask, type DeliveryRecord, type PrBranchCandidate } from "./lib/pr-delivery.ts";
+import { createDeliveries, OWNER_ACTOR, ownerWorksHeadTap, fullCommitSha, verifiedBy, LOST_OWNER_RECHECK_MS, canonicalPr, decisionLine, deliveryLine, parseForge, PR_VIEW_FIELDS, PR_VIEW_JQ, prBranchOwner, releasesTask, type DeliveryRecord, type PrBranchCandidate } from "./lib/pr-delivery.ts";
 import { captureHostCommand, decodeHostCapture } from "./lib/host-capture.ts";
 import { selectExecution, validateLaunchCapabilities } from "./lib/execution-selection.ts";
 import { crewPipeline, crewPlaybook, crewSkillBlock, crewSkillRoot, notVerifiedNote, notVerifiedRequest, pipelineProofGap, PLAYBOOK_CHOICES, playbookStepCount, redactSecrets, reportGapNote, reportGapRequest, reportGaps, skillCheckScript, skillRoutingLinkScript, verifyStepGap } from "./lib/crew-contract.ts";
@@ -8553,7 +8553,7 @@ export default async function plugin(bb: BbPluginApi) {
       const unverifiedStanding=!posture.provenance && (posture.yolo || record.continuation?.["yolo"]===true);
       signal?.throwIfAborted();
       let observed=deliveries.observe(record.id,observation,authorized,Date.now(),unverifiedStanding);
-      if (ownerWorksHeadTap(observed)) {
+      if (observed.status === "merged-needs-verification" && ownerWorksHeadTap(observed)) {
         const applied = await applyOwnerWorksTapToMerge(observed, signal);
         if (applied.ok) observed = applied.record;
         else bb.log.warn(`same-tree owner tap ${observed.id}: ${applied.reason}`);
@@ -9143,16 +9143,18 @@ export default async function plugin(bb: BbPluginApi) {
   // host's meter; a response's own headers then set the true value. Outside the loop
   // (verdicts, merges) the request always runs and still debits the meter.
   // cost is the GitHub requests one call can make: a PR status read through BB is up to 2.
-  function reserveGithub(hostId: string | null, probe = false, cost = 1): boolean {
-    const meter = hostId === null ? undefined : graphqlMeters.get(hostId);
+  // REST tree reads pass rest=true: they take the hourly allowance and skip GraphQL
+  // reserve and meter, which stay for GraphQL PR reads.
+  function reserveGithub(hostId: string | null, probe = false, cost = 1, rest = false): boolean {
+    const meter = rest || hostId === null ? undefined : graphqlMeters.get(hostId);
     const pool = backgroundBudget.getStore();
     if (pool === "sweep") {
       if (sweepAllowance() < cost) return false;
-      if (!probe && hostId !== null && graphqlReadsAllowed(hostId, cost) === 0) return false;
+      if (!rest && !probe && hostId !== null && graphqlReadsAllowed(hostId, cost) === 0) return false;
       for (let i = 0; i < cost; i++) sweepReads.push(Date.now());
     } else if (pool) {
       if (backgroundAllowance() < cost) return false;
-      if (!probe && hostId !== null && graphqlReadsAllowed(hostId, cost) === 0) return false;
+      if (!rest && !probe && hostId !== null && graphqlReadsAllowed(hostId, cost) === 0) return false;
       for (let i = 0; i < cost; i++) backgroundReads.push(Date.now());
       paceTokens -= cost;
     }
@@ -9347,40 +9349,95 @@ export default async function plugin(bb: BbPluginApi) {
     }
     await askPrDecisions(signal).catch(error=>{ if (!signal?.aborted) bb.log.warn(`PR decision list: ${String(error)}`); });
   }
+  // Commit trees never change. Cache hits skip GitHub; in-flight reads share one request;
+  // a failed lookup cools down so observations do not retry it immediately.
+  const TREE_FAIL_COOLDOWN_MS = 60_000;
+  const commitTreeCache = new Map<string, string>();
+  const commitTreeFailUntil = new Map<string, number>();
+  const commitTreeInFlight = new Map<string, Promise<string>>();
+  const commitTreeMismatch = new Map<string, string>();
+  function commitTreeKey(hostId: string, repo: string, sha: string) {
+    return `${hostId}\n${repo.toLowerCase()}\n${sha}`;
+  }
+  function commitTreePairKey(hostId: string, repo: string, a: string, b: string) {
+    return a < b ? `${hostId}\n${repo.toLowerCase()}\n${a}\n${b}` : `${hostId}\n${repo.toLowerCase()}\n${b}\n${a}`;
+  }
   async function githubCommitTree(hostId: string, repo: string, sha: string, signal?: AbortSignal): Promise<string> {
-    let res: { exitCode: number; output: string; stderr: string };
-    try {
-      res = await runStructuredOnHost(hostId, `gh api ${shQuote(`repos/${repo}/git/commits/${sha}`)} --jq .tree.sha`, 30_000, signal);
-    } catch (error) {
-      throw new Error(`GitHub did not return a tree for ${sha.slice(0, 7)}: ${error instanceof Error ? error.message : String(error)}`);
+    const full = fullCommitSha(sha);
+    if (!full) throw new Error(`GitHub did not return a tree for ${sha.slice(0, 7)}: commit is not a full identity`);
+    const key = commitTreeKey(hostId, repo, full);
+    const cached = commitTreeCache.get(key);
+    if (cached !== undefined) return cached;
+    const coolUntil = commitTreeFailUntil.get(key);
+    if (coolUntil !== undefined && Date.now() < coolUntil) {
+      throw new Error(`GitHub did not return a tree for ${full.slice(0, 7)}: retry cooling down`);
     }
-    if (res.exitCode !== 0) throw new Error(`GitHub did not return a tree for ${sha.slice(0, 7)}: ${res.stderr || res.output || `exit ${res.exitCode}`}`);
-    const tree = res.output.trim().replace(/^"|"$/g, "");
-    if (!/^[0-9a-f]{40}$/i.test(tree)) throw new Error(`GitHub tree for ${sha.slice(0, 7)} was unreadable`);
-    return tree.toLowerCase();
+    const shared = commitTreeInFlight.get(key);
+    if (shared) return shared;
+    const request = (async () => {
+      if (backgroundBudget.getStore() && !reserveGithub(hostId, false, 1, true)) throw new GithubReservePaused(hostId);
+      let res: { exitCode: number; output: string; stderr: string };
+      try {
+        res = await runStructuredOnHost(hostId, `gh api ${shQuote(`repos/${repo}/git/commits/${full}`)} --jq .tree.sha`, 30_000, signal);
+      } catch (error) {
+        commitTreeFailUntil.set(key, Date.now() + TREE_FAIL_COOLDOWN_MS);
+        throw new Error(`GitHub did not return a tree for ${full.slice(0, 7)}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      if (res.exitCode !== 0) {
+        commitTreeFailUntil.set(key, Date.now() + TREE_FAIL_COOLDOWN_MS);
+        throw new Error(`GitHub did not return a tree for ${full.slice(0, 7)}: ${res.stderr || res.output || `exit ${res.exitCode}`}`);
+      }
+      const tree = res.output.trim().replace(/^"|"$/g, "");
+      if (!/^[0-9a-f]{40}$/i.test(tree)) {
+        commitTreeFailUntil.set(key, Date.now() + TREE_FAIL_COOLDOWN_MS);
+        throw new Error(`GitHub tree for ${full.slice(0, 7)} was unreadable`);
+      }
+      const value = tree.toLowerCase();
+      commitTreeCache.set(key, value);
+      commitTreeFailUntil.delete(key);
+      return value;
+    })();
+    commitTreeInFlight.set(key, request);
+    try { return await request; }
+    finally { if (commitTreeInFlight.get(key) === request) commitTreeInFlight.delete(key); }
+  }
+  async function compareOwnerTapTrees(hostId: string, repo: string, tappedSha: string, mergeSha: string, signal?: AbortSignal): Promise<{ ok: true; treeSha: string } | { ok: false; reason: string }> {
+    const x = fullCommitSha(tappedSha), m = fullCommitSha(mergeSha);
+    if (!x || !m) {
+      return { ok: false, reason: `Refusing: GitHub did not return trees for ${(tappedSha || "").slice(0, 7)} and ${(mergeSha || "").slice(0, 7)}, so the Works tap cannot cover the merge commit: commit is not a full identity` };
+    }
+    const pair = commitTreePairKey(hostId, repo, x, m);
+    const known = commitTreeMismatch.get(pair);
+    if (known !== undefined) return { ok: false, reason: known };
+    let treeX: string, treeM: string;
+    try {
+      treeX = await githubCommitTree(hostId, repo, x, signal);
+      treeM = await githubCommitTree(hostId, repo, m, signal);
+    } catch (error) {
+      return { ok: false, reason: `Refusing: GitHub did not return trees for ${x.slice(0, 7)} and ${m.slice(0, 7)}, so the Works tap cannot cover the merge commit: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    if (treeX !== treeM) {
+      const reason = `Refusing: the owner's Works tap covers ${x.slice(0, 7)}, and GitHub's trees differ from merge commit ${m.slice(0, 7)} (${treeX.slice(0, 7)} vs ${treeM.slice(0, 7)}).`;
+      commitTreeMismatch.set(pair, reason);
+      return { ok: false, reason };
+    }
+    return { ok: true, treeSha: treeX };
   }
   async function applyOwnerWorksTapToMerge(r: DeliveryRecord, signal?: AbortSignal): Promise<{ ok: true; record: DeliveryRecord } | { ok: false; reason: string }> {
     const tap = ownerWorksHeadTap(r);
     if (!tap) return { ok: false, reason: `Refusing: ${r.id} has no owner Works tap on its head to cover the merge commit.` };
+    if (r.status !== "merged-needs-verification") return { ok: false, reason: `Refusing: ${r.id} is ${r.status}, not merged-needs-verification` };
     let hostId: string;
     try { hostId = await resolveHostForProject(r.projectId, r.owner ?? undefined, signal); }
     catch (error) {
       return { ok: false, reason: `Refusing: GitHub did not return trees for ${tap.tappedSha.slice(0, 7)} and ${tap.mergeSha.slice(0, 7)}, so the Works tap cannot cover the merge commit: ${error instanceof Error ? error.message : String(error)}` };
     }
-    let treeX: string, treeM: string;
-    try {
-      treeX = await githubCommitTree(hostId, r.repository, tap.tappedSha, signal);
-      treeM = await githubCommitTree(hostId, r.repository, tap.mergeSha, signal);
-    } catch (error) {
-      return { ok: false, reason: `Refusing: GitHub did not return trees for ${tap.tappedSha.slice(0, 7)} and ${tap.mergeSha.slice(0, 7)}, so the Works tap cannot cover the merge commit: ${error instanceof Error ? error.message : String(error)}` };
-    }
-    if (treeX !== treeM) {
-      return { ok: false, reason: `Refusing: the owner's Works tap covers ${tap.tappedSha.slice(0, 7)}, and GitHub's trees differ from merge commit ${tap.mergeSha.slice(0, 7)} (${treeX.slice(0, 7)} vs ${treeM.slice(0, 7)}).` };
-    }
+    const compared = await compareOwnerTapTrees(hostId, r.repository, tap.tappedSha, tap.mergeSha, signal);
+    if (!compared.ok) return compared;
     const v = r.verification!;
     return { ok: true, record: deliveries.verify(r.id, OWNER_ACTOR, tap.mergeSha, {
       driven: v.driven, seen: v.seen, surface: v.surface, build: v.build,
-      tappedCommitSha: tap.tappedSha, treeSha: treeX,
+      tappedCommitSha: tap.tappedSha, treeSha: compared.treeSha,
     }) };
   }
   const deliveryParams = z.object({
@@ -9695,10 +9752,20 @@ export default async function plugin(bb: BbPluginApi) {
         return;
       }
       const current = deliveries.get(proof.pr);
-      if (current?.forgeState === "merged" && current.headSha !== proof.head) throw new Error("The device card does not cover the PR's final head.");
-      const commit = current?.forgeState === "merged" ? current.mergeCommitSha ?? proof.head : proof.head;
-      deliveries.verify(proof.pr, OWNER_ACTOR, commit, { driven: `the owner tested build ${proof.build} on ${surfaceWords(proof.surface as never)}`, seen: "Works", surface: proof.surface, build: proof.build });
-      note = `The owner tapped Works for build ${proof.build}: proof is recorded for ${proof.pr} at ${commit.slice(0, 7)}.`;
+      const evidence = { driven: `the owner tested build ${proof.build} on ${surfaceWords(proof.surface as never)}`, seen: "Works", surface: proof.surface, build: proof.build };
+      if (current?.forgeState === "merged") {
+        const cardHead = fullCommitSha(proof.head), nowHead = fullCommitSha(current.headSha), mergeSha = fullCommitSha(current.mergeCommitSha);
+        if (!cardHead || !nowHead || cardHead !== nowHead) throw new Error("The device card does not cover the PR's final head.");
+        if (!mergeSha) throw new Error(`${proof.pr} has no recorded merge commit; reconcile it, then verify again`);
+        const hostId = await resolveHostForProject(current.projectId, current.owner ?? undefined);
+        const compared = await compareOwnerTapTrees(hostId, current.repository, cardHead, mergeSha);
+        if (!compared.ok) throw new Error(compared.reason);
+        deliveries.verify(proof.pr, OWNER_ACTOR, mergeSha, { ...evidence, tappedCommitSha: cardHead, treeSha: compared.treeSha });
+        note = `The owner tapped Works for build ${proof.build}: proof is recorded for ${proof.pr} at ${mergeSha.slice(0, 7)}.`;
+      } else {
+        deliveries.verify(proof.pr, OWNER_ACTOR, proof.head, evidence);
+        note = `The owner tapped Works for build ${proof.build}: proof is recorded for ${proof.pr} at ${proof.head.slice(0, 7)}.`;
+      }
     } catch (error) {
       note = `The owner tapped Works for build ${proof.build}, but no proof was recorded for ${proof.pr}: ${error instanceof Error ? error.message : String(error)} Open a new device proof card for the current head.`;
     }
