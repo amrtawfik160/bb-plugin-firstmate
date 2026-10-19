@@ -25,10 +25,23 @@ and still refuses `firstmate_merge` and Ship without an owner Approve.
 An owner message that tells the agent to merge after it finishes, or to deploy
 to production, is judged by the Decisions model. There is no word list.
 
-The record stores the owner message, a quote of the words, the task, the
-project, and whether it allows merge, deploy, or both. It covers PRs of that
-task only, and it expires when the task closes. Telegram gets a progress note
-that quotes the words.
+The record is created only from an owner-confirmed owner message: the connector
+envelope names that message and its sender, and a crew-authored or copied
+envelope does not create one. It stores the owner message, a quote of the
+words, the task, the open epoch of that task, the project, and whether it
+allows merge, deploy, or both. It covers PRs of that task only. Closing the
+task expires it permanently: reopening, re-linking, or a new task carrying the
+same source ref does not revive it. An unbound permission binds once, to the
+first matching task, and is consumed then. Telegram gets a progress note that
+quotes the words.
+
+Merge prod-check, deploy prod-check, Ship, firstmate_merge, and the GitHub
+status all call one function `approvalFor`. A newer owner No blocks whatever
+pre-approval exists. An owner Approve covers only the head it named, plus
+base-only merges already proven. Another captain's unanswered card never
+changes that coverage. Binding, closing, an owner answer, a new head, or a
+link re-posts the GitHub status for the PR's current head through the durable
+retry. The task for a PR is the open task that currently contains it.
 
 ## Crew check
 

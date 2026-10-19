@@ -26,6 +26,8 @@ export type PreApproval = {
   ownerMessageRef: string;
   quote: string;
   task: string;
+  /** Open epoch of the task this record is bound to. 0 means unbound. */
+  generation: number;
   project: string;
   allows: Allows;
   createdAt: number;
@@ -53,6 +55,7 @@ export type ProdCheckInput = {
   coverage?: (card: GateCard) => HeadCoverage;
   preApprovals: readonly PreApproval[];
   taskOpen?: boolean;
+  generation?: number;
   taskPrs?: readonly string[];
   captain?: string;
 };
@@ -93,17 +96,29 @@ function coverOf(card: GateCard, head: string, coverage?: (card: GateCard) => He
   return card.head === head ? "covers" : "unknown";
 }
 
-/** GitHub commit status for this PR head: success only from an owner Approve that covers it, or a live pre-approval. */
-export function ownerApprovalStatus(input: {
+export type ApprovalDecisionInput = {
   pr: string;
   head: string;
+  action: ProdWhat;
   cards: readonly GateCard[];
   coverage?: (card: GateCard) => HeadCoverage;
   preApprovals: readonly PreApproval[];
   task?: string;
   taskOpen?: boolean;
+  generation?: number;
   captain?: string;
-}): OwnerApprovalStatus {
+};
+
+/**
+ * The only production-approval decision. Merge prod-check, deploy prod-check, Ship/merge,
+ * and the GitHub status all call this. Callers do not add a fallback.
+ *
+ * Order: newest owner-confirmed decision for this PR, scoped to the captain that owns the
+ * PR's task (a newer No blocks whatever pre-approval exists); an owner Approve covers only
+ * the head it named plus proven base-only merges; else a valid pre-approval for this opening
+ * of the task.
+ */
+export function approvalFor(input: ApprovalDecisionInput): OwnerApprovalStatus {
   const newest = newestForPr(input.cards, input.pr, input.captain);
   if (newest && ownerNo(newest)) {
     return { state: "pending", description: clip("Owner answered No", 140) };
@@ -111,7 +126,9 @@ export function ownerApprovalStatus(input: {
   if (newest && ownerApprove(newest) && coverOf(newest, input.head, input.coverage) === "covers") {
     return { state: "success", description: clip("Owner Approve at this head", 140) };
   }
-  const pre = input.preApprovals.find((row) => preApprovalCovers(row, { task: input.task, what: "merge", taskOpen: input.taskOpen === true }));
+  const pre = input.preApprovals.find((row) => preApprovalCovers(row, {
+    task: input.task, what: input.action, taskOpen: input.taskOpen === true, generation: input.generation,
+  }));
   if (pre) return { state: "success", description: clip(`Owner pre-approval for ${pre.task} allows ${pre.allows}`, 140) };
   if (newest && ownerApprove(newest)) {
     const covered = coverOf(newest, input.head, input.coverage);
@@ -121,9 +138,16 @@ export function ownerApprovalStatus(input: {
   return { state: "pending", description: clip(`Needs owner Approve for ${input.pr}`, 140) };
 }
 
-export function preApprovalCovers(pre: PreApproval, input: { task?: string; what: ProdWhat; taskOpen: boolean }): boolean {
+/** GitHub commit status for this PR head: `approvalFor` with action merge. */
+export function ownerApprovalStatus(input: Omit<ApprovalDecisionInput, "action">): OwnerApprovalStatus {
+  return approvalFor({ ...input, action: "merge" });
+}
+
+export function preApprovalCovers(pre: PreApproval, input: { task?: string; what: ProdWhat; taskOpen: boolean; generation?: number }): boolean {
   if (!input.taskOpen) return false;
   if (input.task === undefined || pre.task !== input.task) return false;
+  const epoch = input.generation ?? 1;
+  if ((pre.generation ?? 1) !== epoch) return false;
   return pre.allows === "both" || pre.allows === input.what;
 }
 
@@ -146,27 +170,25 @@ export function prodCheck(input: ProdCheckInput): { ok: boolean; reason: string 
   if (input.task && input.pr && input.taskPrs && !input.taskPrs.some((named) => samePr(named, input.pr!))) {
     return { ok: false, reason: `Refusing: ${input.pr} is not work of task ${input.task}.` };
   }
-  if (input.what === "merge" && input.pr) {
-    const status = ownerApprovalStatus({
+  if (input.pr) {
+    const decision = approvalFor({
       pr: input.pr,
       head: input.head ?? "",
+      action: input.what,
       cards: input.cards,
       coverage: input.coverage,
       preApprovals: input.preApprovals,
       task: input.task,
       taskOpen: input.taskOpen,
+      generation: input.generation,
       captain: input.captain,
     });
-    if (status.state === "success") return { ok: true, reason: status.description };
+    if (decision.state === "success") return { ok: true, reason: decision.description };
+    return { ok: false, reason: `Refusing: ${input.project} ${input.what} needs an owner approval or pre-approval for this work.` };
   }
-  if (input.what === "deploy" && input.pr) {
-    const newest = newestForPr(input.cards, input.pr, input.captain);
-    if (newest && ownerNo(newest)) return { ok: false, reason: clip("Owner answered No", 140) };
-    if (newest && ownerApprove(newest) && coverOf(newest, input.head ?? "", input.coverage) === "covers") {
-      return { ok: true, reason: "Owner Approve covers this work" };
-    }
-  }
-  const pre = input.preApprovals.find((row) => preApprovalCovers(row, { task: input.task, what: input.what, taskOpen: input.taskOpen === true }));
+  const pre = input.preApprovals.find((row) => preApprovalCovers(row, {
+    task: input.task, what: input.what, taskOpen: input.taskOpen === true, generation: input.generation,
+  }));
   if (pre) return { ok: true, reason: quotePreApproval(pre) };
   return { ok: false, reason: `Refusing: ${input.project} ${input.what} needs an owner approval or pre-approval for this work.` };
 }
@@ -199,35 +221,52 @@ export function createOwnerGate(db: Database) {
     CREATE TABLE IF NOT EXISTS production_status_retry (
     pr TEXT NOT NULL, head TEXT NOT NULL, last_error TEXT NOT NULL, at INTEGER NOT NULL,
     PRIMARY KEY (pr, head));`);
+  try {
+    db.exec("ALTER TABLE production_pre_approval ADD COLUMN generation INTEGER NOT NULL DEFAULT 1");
+  } catch { /* already present on this database */ }
+
+  function asPreApproval(row: {
+    id: string; owner_message_ref: string; quote: string; task: string; project: string; allows: string; created_at: number; generation?: number;
+  }): PreApproval {
+    return {
+      id: row.id,
+      ownerMessageRef: row.owner_message_ref,
+      quote: row.quote,
+      task: row.task,
+      generation: typeof row.generation === "number" ? row.generation : 1,
+      project: row.project,
+      allows: allowsSchema.parse(row.allows),
+      createdAt: row.created_at,
+    };
+  }
 
   function listPreApprovals(task?: string): PreApproval[] {
     const rows = (task === undefined
       ? db.prepare("SELECT * FROM production_pre_approval ORDER BY created_at DESC").all()
       : db.prepare("SELECT * FROM production_pre_approval WHERE task=? ORDER BY created_at DESC").all(task)) as Array<{
-      id: string; owner_message_ref: string; quote: string; task: string; project: string; allows: string; created_at: number;
+      id: string; owner_message_ref: string; quote: string; task: string; project: string; allows: string; created_at: number; generation?: number;
     }>;
-    return rows.map((row) => ({
-      id: row.id,
-      ownerMessageRef: row.owner_message_ref,
-      quote: row.quote,
-      task: row.task,
-      project: row.project,
-      allows: allowsSchema.parse(row.allows),
-      createdAt: row.created_at,
-    }));
+    return rows.map(asPreApproval);
   }
 
   return {
-    recordPreApproval(input: Omit<PreApproval, "id"> & { id?: string }): PreApproval {
-      const row: PreApproval = { ...input, id: input.id ?? newId("p") };
-      db.prepare("INSERT INTO production_pre_approval VALUES (?,?,?,?,?,?,?)").run(
-        row.id, row.ownerMessageRef, row.quote, row.task, row.project, row.allows, row.createdAt,
+    recordPreApproval(input: Omit<PreApproval, "id" | "generation"> & { id?: string; generation?: number }): PreApproval {
+      const generation = input.generation ?? (input.task ? 1 : 0);
+      const row: PreApproval = { ...input, id: input.id ?? newId("p"), generation };
+      db.prepare("INSERT INTO production_pre_approval(id, owner_message_ref, quote, task, project, allows, created_at, generation) VALUES (?,?,?,?,?,?,?,?)").run(
+        row.id, row.ownerMessageRef, row.quote, row.task, row.project, row.allows, row.createdAt, row.generation,
       );
       return row;
     },
     listPreApprovals,
-    covering(input: { task: string; what: ProdWhat; taskOpen: boolean }): PreApproval | undefined {
-      return listPreApprovals(input.task).find((row) => preApprovalCovers(row, input));
+    bindPreApproval(id: string, task: string, generation: number): boolean {
+      const current = db.prepare("SELECT task FROM production_pre_approval WHERE id=?").get(id) as { task: string } | undefined;
+      if (!current || current.task !== "") return false;
+      db.prepare("UPDATE production_pre_approval SET task=?, generation=? WHERE id=? AND task=''").run(task, generation, id);
+      return true;
+    },
+    covering(input: { task: string; what: ProdWhat; taskOpen: boolean; generation?: number }): PreApproval | undefined {
+      return listPreApprovals(input.task).find((row) => preApprovalCovers(row, { ...input, generation: input.generation ?? 1 }));
     },
     targetsForAsk(ask: string): Array<{ pr: string; head: string }> {
       try {

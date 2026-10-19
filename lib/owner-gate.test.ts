@@ -5,6 +5,7 @@ import { createOwnerAsks } from "./owner-asks.ts";
 import { createProductionApprovals } from "./production-approval.ts";
 import {
   OWNER_APPROVAL_CONTEXT,
+  approvalFor,
   createOwnerGate,
   gatedAskResolve,
   ownerApprovalStatus,
@@ -51,6 +52,7 @@ const pre = (over: Partial<PreApproval> = {}): PreApproval => ({
   ownerMessageRef: "tg:1:99",
   quote: "merge after you finish",
   task: "T12",
+  generation: 1,
   project: "Cyndra",
   allows: "merge",
   createdAt: 1,
@@ -272,4 +274,38 @@ test("a failed status POST is retried on the same head until it succeeds", () =>
   assert.equal(gate.statusPostNeeded(PR.toUpperCase(), HEAD), true);
   gate.clearStatusPost(PR, HEAD);
   assert.equal(gate.statusPostNeeded(PR, HEAD), false);
+});
+
+test("prod-check merge uses approvalFor so a later No beats pre-approval", () => {
+  const out = prodCheck({
+    project: "Cyndra", what: "merge", pr: PR, head: HEAD, task: "T12",
+    cards: [card({ id: "a2", resolution: "No", createdAt: 2 })],
+    coverage: () => "covers",
+    preApprovals: [pre()],
+    taskOpen: true,
+    generation: 1,
+  });
+  assert.equal(out.ok, false);
+});
+
+test("a pre-approval of an earlier opening does not cover a reopened task", () => {
+  assert.equal(preApprovalCovers(pre(), { task: "T12", what: "merge", taskOpen: true, generation: 2 }), false);
+  assert.equal(approvalFor({
+    pr: PR, head: HEAD, action: "merge", cards: [], coverage: () => "unknown",
+    preApprovals: [pre()], task: "T12", taskOpen: true, generation: 2,
+  }).state, "pending");
+});
+
+test("an unbound pre-approval binds once to the first matching task epoch", () => {
+  const database = db();
+  const gate = createOwnerGate(database);
+  const stored = gate.recordPreApproval({
+    ownerMessageRef: "tg:1:99", quote: "merge after you finish", task: "", project: "Cyndra", allows: "merge", createdAt: 10,
+  });
+  assert.equal(stored.generation, 0);
+  assert.equal(gate.bindPreApproval(stored.id, "T12", 1), true);
+  assert.equal(gate.listPreApprovals("").length, 0);
+  assert.equal(gate.listPreApprovals("T12")[0]?.generation, 1);
+  assert.equal(gate.bindPreApproval(stored.id, "T99", 1), false);
+  assert.equal(gate.listPreApprovals("T12").length, 1);
 });

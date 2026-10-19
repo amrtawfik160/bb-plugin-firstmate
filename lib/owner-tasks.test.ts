@@ -147,9 +147,13 @@ test("a finished or merged task with a new PR, or an open PR, reopens; a dropped
 test("a new crew on a finished task reopens it; the same crew again changes nothing", () => {
   const tasks = createOwnerTasks(memoryDb());
   tasks.open({ captain: "c", project: "Safi", title: "Publish OTA", sourceRefs: ["tg:1:1"], crewId: "a", at: 0 });
+  assert.equal(tasks.get("T1")!.generation, 1);
   tasks.move("T1", "c", { to: "live", reason: "production OTA holds it" }, 1);
   assert.equal(tasks.attach("T1", "c", { crewId: "a", sourceRefs: [], at: 2 }).state, "live");
-  assert.equal(tasks.attach("T1", "c", { crewId: "b", sourceRefs: ["tg:1:2"], at: 3 }).state, "working");
+  assert.equal(tasks.get("T1")!.generation, 1);
+  const reopened = tasks.attach("T1", "c", { crewId: "b", sourceRefs: ["tg:1:2"], at: 3 });
+  assert.equal(reopened.state, "working");
+  assert.equal(reopened.generation, 2);
 });
 
 // Repair thread, 18 Oct: T203 listed a read-only scout as a crew; T204's drop reason named a PR that now belongs to T247.
