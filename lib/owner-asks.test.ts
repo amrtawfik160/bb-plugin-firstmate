@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import * as ownerAsksModule from "./owner-asks.ts";
-import { askLetterAnswer, askIdFromSourceEventId, createOwnerAsks, formatAskCard, newAskId, packAnswers } from "./owner-asks.ts";
+import { askLetterAnswer, askIdFromSourceEventId, choicesFromDecisionNote, createOwnerAsks, formatAskCard, newAskId, packAnswers } from "./owner-asks.ts";
 import { formatBoard } from "./owner-board.ts";
 
 const NOW = Date.UTC(2026, 9, 7, 12, 0);
@@ -74,6 +74,30 @@ test("an owner tap stamps answeredByOwner; the captain can still correct it", ()
   assert.equal(asks.answeredByOwner("a1"), true);
   assert.equal(asks.resolve("a1", "thr_cap", "answered", "Captain correction", NOW + 2)?.resolution, "Captain correction");
   assert.equal(asks.answeredByOwner("a1"), false);
+});
+
+test("choicesFromDecisionNote turns an or-list into buttons and falls back to Yes/No", () => {
+  assert.deepEqual(choicesFromDecisionNote("Choose Postgres or SQLite?"), [{ label: "Postgres", value: "a" }, { label: "SQLite", value: "b" }]);
+  assert.deepEqual(choicesFromDecisionNote("rename or keep?"), [{ label: "rename", value: "a" }, { label: "keep", value: "b" }]);
+  assert.deepEqual(choicesFromDecisionNote("Choose?"), [{ label: "Yes", value: "yes" }, { label: "No", value: "no" }]);
+});
+
+test("an owner answer records pending follow-up in the same write; a failure stays visible", () => {
+  const asks = createOwnerAsks(db());
+  const opts = [{ label: "Works", value: "works" }, { label: "Does not work", value: "no" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "question", text: "Does build 21 work?", options: opts, createdAt: NOW });
+  asks.resolve("a1", "thr_cap", "answered", "Does not work", NOW, "owner");
+  assert.deepEqual(asks.pendingFollowUps().map((job) => [job.askId, job.effect, job.error]), [
+    ["a1", "owner-answered", null],
+    ["a1", "refresh-board", null],
+  ]);
+  asks.failFollowUp("a1", "owner-answered", "Telegram down");
+  assert.equal(asks.pendingFollowUps().find((job) => job.effect === "owner-answered")?.error, "Telegram down");
+  asks.markFollowUpDone("a1", "owner-answered");
+  asks.markFollowUpDone("a1", "refresh-board");
+  assert.deepEqual(asks.pendingFollowUps(), []);
+  asks.resolve("a1", "thr_cap", "answered", "Does not work", NOW + 1, "owner");
+  assert.deepEqual(asks.pendingFollowUps(), [], "a repeat owner write does not re-queue finished work");
 });
 
 test("an owner confirmation stamps a card the captain already answered", () => {

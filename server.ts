@@ -89,7 +89,7 @@ import {
   buildProgram, createPrograms, isOpenProgram, isOpenTicket, newlyReady, numberOf, programCounts, programText, readyRefs, readyWakeText, repoOf,
   shortTicket, stallReminderDue, stallReminderText, ticketRef, type IssueFacts, type Program, type ProgramFact, type TicketRef,
 } from "./lib/programs.ts";
-import { askLetterAnswer, askIdFromSourceEventId, packAnswers, clip, createOwnerAsks, formatAge, formatAskCard, formatUtcTime, mayDefault, OWNER_CLOSED_RESOLUTION, CAPTAIN_RULES, OWNER_DECISION_RULE, recommendedLabel, replacedBy, type AskKind, type OwnerAsk } from "./lib/owner-asks.ts";
+import { askLetterAnswer, askIdFromSourceEventId, packAnswers, choicesFromDecisionNote, clip, createOwnerAsks, formatAge, formatAskCard, formatUtcTime, mayDefault, OWNER_CLOSED_RESOLUTION, CAPTAIN_RULES, OWNER_DECISION_RULE, recommendedLabel, replacedBy, type AskKind, type AskFollowUp, type OwnerAsk } from "./lib/owner-asks.ts";
 import { DEFAULT_RELIABILITY_FLAGS, reliabilityFlagsFromSettings } from "./lib/reliability-flags.ts";
 import { sanitizeSettingValue } from "./lib/settings-schema.ts";
 import { coalesceBatches, parseConnectorHeader, parseInboundTelegram, parseSourceRef, parseTelegramSubmission, stripTelegramEnvelope, telegramReplyParameters, telegramSourceRef } from "./lib/telegram-envelope.ts";
@@ -5973,7 +5973,7 @@ export default async function plugin(bb: BbPluginApi) {
           // The captain may have asked already, but only a card bound to this task counts: a card about other
           // work, even on the same project, does not stand for the crew's question (checker round 2).
           const asked = ownerAsks.listOpen(captain).find((ask) => ask.task === task.id);
-          if (asked === undefined) await askForCrew(captain, task, crew, latest.note, now);
+          if (asked === undefined) await askForCrew(captain, task, crew, latest, now);
           else {
             bb.log.info(`task ${task.id}: crew ${crew.id} waits on the owner; card ${asked.id} already asks, no new card`);
             const current = ownerTasks.get(task.id);
@@ -6059,10 +6059,25 @@ export default async function plugin(bb: BbPluginApi) {
     return (status.verb === "paused" || status.verb === "blocked") && /\b(?:owner|owner's|captain's answer|your answer)\b/i.test(status.note);
   }
 
-  async function askForCrew(captain: string, task: OwnerTask, crew: Crew, note: string, now: number): Promise<void> {
-    if (isOpenTask(task)) ownerTasks.move(task.id, captain, { to: "needs_you", reason: note }, now);
-    bb.log.info(`task ${task.id}: crew ${crew.id} waits on the owner; status on the task, no card`);
-    await deliverToCaptain(captain, `CREW WAITING ON OWNER: crew ${crew.id} waits on the owner for task ${task.id}: ${clip(note, 400)}. When he answers, pass the answer to the crew with firstmate_tell.`, crew.id).catch((error) => bb.log.warn(`crew wait note: ${String(error)}`));
+  async function askForCrew(captain: string, task: OwnerTask, crew: Crew, latest: { verb: string; note: string }, now: number): Promise<void> {
+    if (isOpenTask(task)) ownerTasks.move(task.id, captain, { to: "needs_you", reason: latest.note }, now);
+    if (latest.verb !== "needs-decision") {
+      bb.log.info(`task ${task.id}: crew ${crew.id} waits on the owner; status on the task, no card`);
+      await deliverToCaptain(captain, `CREW WAITING ON OWNER: crew ${crew.id} waits on the owner for task ${task.id}: ${clip(latest.note, 400)}. When he answers, pass the answer to the crew with firstmate_tell.`, crew.id).catch((error) => bb.log.warn(`crew wait note: ${String(error)}`));
+      return;
+    }
+    const sourceRef = `crew-wait:${statusKey(crew.id, latest.note)}`;
+    const project = task.project ?? await projectLabel(crew.projectId) ?? undefined;
+    const ask = ownerAsks.create({
+      captain, kind: "question", text: `${clip(task.title, 60)}: ${clip(latest.note, 900)}`,
+      options: choicesFromDecisionNote(latest.note), sourceRef, createdAt: now,
+      ...(project ? { project } : {}), task: task.id, subject: cardSubject(`${clip(task.title, 60)}: x`),
+    });
+    const replaced = await replaceOpenCards(ask);
+    const failed = (await reliabilityFlags()).telegramThreading === "on" ? await sendAskCard(ask, { ...(project ? { project } : {}), task: task.id }) : "";
+    const warning = failed === "" ? "" : ` It was not sent to Telegram (${failed}).`;
+    bb.log.info(`task ${task.id}: crew ${crew.id} waits on the owner; card ${ask.id} opened`);
+    await deliverToCaptain(captain, `CREW QUESTION CARD: crew ${crew.id} waits on the owner for task ${task.id}, so card ${ask.id} carries its question to him${replaced.length > 0 ? ` (replacing ${replaced.join(", ")})` : ""}.${warning} When he answers, pass the answer to the crew with firstmate_tell.`, crew.id).catch((error) => bb.log.warn(`crew question note: ${String(error)}`));
   }
 
   async function projectLabel(projectId: string | undefined): Promise<string | null> {
@@ -9536,6 +9551,30 @@ export default async function plugin(bb: BbPluginApi) {
   function proofRecheckMs(): number[] {
     const given = (process.env.FM_PROOF_RECHECK_MS ?? "").split(",").map(Number).filter((ms) => Number.isFinite(ms) && ms > 0);
     return given.length > 0 ? given.slice(0, 5) : [2_000, 10_000, 60_000];
+  }
+
+  let askFollowUpDrain: Promise<void> = Promise.resolve();
+  function drainAskFollowUps(): Promise<void> {
+    const run = askFollowUpDrain.then(async () => {
+      for (const job of ownerAsks.pendingFollowUps()) await runAskFollowUp(job);
+    });
+    askFollowUpDrain = run.catch((error) => { bb.log.warn(`ask follow-up drain: ${String(error)}`); });
+    return run;
+  }
+  async function runAskFollowUp(job: AskFollowUp): Promise<void> {
+    try {
+      if (job.effect === "owner-answered") {
+        const ask = ownerAsks.get(job.askId);
+        if (ask?.resolution) await ownerAnsweredAsk(job.askId, ask.resolution);
+      } else if (job.effect === "refresh-board") {
+        await refreshOwnerBoard();
+      }
+      ownerAsks.markFollowUpDone(job.askId, job.effect);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      ownerAsks.failFollowUp(job.askId, job.effect, message);
+      bb.log.warn(`ask follow-up ${job.askId} ${job.effect}: ${message}`);
+    }
   }
 
   async function rememberPrUrl(crew: Crew, url: string,signal?:AbortSignal): Promise<void> {
@@ -16540,13 +16579,8 @@ export default async function plugin(bb: BbPluginApi) {
           await bb.storage.kv.set(`workstream-ref:tg:${telegram.chatId}:${telegram.messageId}`,w.id);
         }
         if (String(context.initiator) === "user") {
-          const answered = recordAskAnswers(threadId, text, context.queuedMessages ?? []);
-          if (answered.length > 0) {
-            followUp.push(async () => {
-              for (const item of answered) await ownerAnsweredAsk(item.id, item.answer);
-              await refreshOwnerBoard();
-            });
-          }
+          recordAskAnswers(threadId, text, context.queuedMessages ?? []);
+          followUp.push(() => drainAskFollowUps());
         }
         let turnRefs: string[] = [];
         const inbound = inboundHookDecision({
@@ -16697,6 +16731,7 @@ export default async function plugin(bb: BbPluginApi) {
   } catch (error) {
     bb.log.warn(`message.dispatch hook unavailable; crew pings join running turns: ${String(error)}`);
   }
+  void drainAskFollowUps().catch((error) => bb.log.warn(`ask follow-up startup: ${String(error)}`));
 
   const CAPTAIN_COMPACT_COOLDOWN_MS = 20 * 60_000;
   const compactionChecks = new Set<string>();
@@ -18252,6 +18287,7 @@ export default async function plugin(bb: BbPluginApi) {
     taskSweepWork = (async () => {
       for (const captain of knownCaptains) await sweepTasks(captain).catch((error) => bb.log.warn(`task sweep captain=${captain}: ${String(error)}`));
       await expireLeases().catch((error) => bb.log.warn(`lease expiry: ${String(error)}`));
+      await drainAskFollowUps().catch((error) => bb.log.warn(`ask follow-up retry: ${String(error)}`));
     })();
     try { await taskSweepWork; } finally { taskSweepWork = undefined; }
   });

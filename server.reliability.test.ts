@@ -1969,3 +1969,19 @@ test("checker 169: replay after restart recovers deferred device proof work", as
     assert.equal(await host.bb.storage.kv.get("device-proof:a000001"), undefined, "the durable deferred work must run after replay, so a failed build reaches the crew and captain");
   } finally { await host.harness.lifecycle.dispose(); }
 });
+
+test("startup drain recovers deferred device proof work without a new tap", async () => {
+  const host = await captainHost();
+  try {
+    const store = asks(host);
+    store.create({ id: "a000001", captain: "thr_cap", kind: "question", text: "Does build 21 work?", options: [{label:"Works",value:"works"},{label:"Does not work",value:"no"}], createdAt: 1 });
+    store.resolve("a000001", "thr_cap", "answered", "Does not work", 123, "owner");
+    await host.bb.storage.kv.set("device-proof:a000001", {captain:"thr_cap",pr:"owner/repo#1",head:"a".repeat(40),build:"21",crewId:"crew1",surface:"iphone"});
+    const reloaded = await host.harness.lifecycle.reload(plugin);
+    try {
+      await afterDispatch();
+      assert.equal(asks(reloaded).get("a000001")?.resolvedAt, 123, "startup must not reapply the answer");
+      assert.equal(await reloaded.bb.storage.kv.get("device-proof:a000001"), undefined, "startup must run the deferred proof work");
+    } finally { await reloaded.harness.lifecycle.dispose(); }
+  } finally { await host.harness.lifecycle.dispose(); }
+});

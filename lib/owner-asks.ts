@@ -36,6 +36,18 @@ export type OwnerAsk = {
 
 export type AskClosure = { closed: string[]; already: string[]; refused: string[] };
 export const OWNER_CLOSED_RESOLUTION = "closed by owner, no action";
+export const ASK_FOLLOWUP_EFFECTS = ["owner-answered", "refresh-board"] as const;
+export type AskFollowUpEffect = (typeof ASK_FOLLOWUP_EFFECTS)[number];
+export type AskFollowUp = { askId: string; effect: AskFollowUpEffect; state: "pending" | "done"; error: string | null; createdAt: number };
+
+/** Button labels for a native needs-decision note. "Choose Postgres or SQLite?" becomes two options. */
+export function choicesFromDecisionNote(note: string): AskOption[] {
+  const body = note.replace(/[?!.]+$/u, "").trim();
+  const stripped = body.replace(/^(choose|pick|select)\s+/i, "");
+  const parts = stripped.split(/\s+or\s+/i).map((part) => part.trim()).filter((part) => part.length > 0 && part.length <= 80);
+  if (parts.length >= 2) return parts.map((label, i) => ({ label, value: String.fromCharCode(97 + i) }));
+  return [{ label: "Yes", value: "yes" }, { label: "No", value: "no" }];
+}
 
 export type AskDeferral = { deferred: string[]; already: string[]; refused: string[]; until: number | null };
 
@@ -176,6 +188,9 @@ export type OwnerAsks = {
   markSkipsTold(ids: readonly string[]): void;
   /** Mark this captain's overdue reversible asks defaulted and return them, each exactly once. */
   takeDue(captain: string, now: number): OwnerAsk[];
+  pendingFollowUps(): AskFollowUp[];
+  markFollowUpDone(askId: string, effect: AskFollowUpEffect): void;
+  failFollowUp(askId: string, effect: AskFollowUpEffect, error: string): void;
 };
 
 function fromRecord(row: AskRecord): OwnerAsk {
@@ -241,7 +256,10 @@ export function createOwnerAsks(db: Database): OwnerAsks {
     CREATE TABLE IF NOT EXISTS owner_ask_route (
       id TEXT PRIMARY KEY, project TEXT, task TEXT, subject TEXT);
     CREATE TABLE IF NOT EXISTS owner_ask_close (id TEXT PRIMARY KEY, told INTEGER NOT NULL DEFAULT 0, released INTEGER NOT NULL DEFAULT 0);
-    CREATE TABLE IF NOT EXISTS owner_ask_defer (id TEXT PRIMARY KEY, until INTEGER NOT NULL, told INTEGER NOT NULL DEFAULT 0);`);
+    CREATE TABLE IF NOT EXISTS owner_ask_defer (id TEXT PRIMARY KEY, until INTEGER NOT NULL, told INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS owner_ask_followup (
+      ask_id TEXT NOT NULL, effect TEXT NOT NULL, state TEXT NOT NULL, error TEXT, created_at INTEGER NOT NULL,
+      PRIMARY KEY (ask_id, effect));`);
 
   const select = `SELECT owner_ask.*,
     (SELECT impact FROM owner_ask_impact WHERE id=owner_ask.id) AS impact,
@@ -375,7 +393,12 @@ export function createOwnerAsks(db: Database): OwnerAsks {
         if (!current || current.captain !== captain || db.prepare("SELECT id FROM owner_ask_close WHERE id=?").get(id) !== undefined) return undefined;
         db.prepare("UPDATE owner_ask SET state=?, resolution=?, resolved_at=? WHERE id=?").run(state, state === "open" ? null : resolution, state === "open" ? null : at, id);
         db.prepare("DELETE FROM owner_ask_answer WHERE id=?").run(id);
-        if (source === "owner" && state === "answered") db.prepare("INSERT INTO owner_ask_answer VALUES (?,?)").run(id, source);
+        if (source === "owner" && state === "answered") {
+          db.prepare("INSERT INTO owner_ask_answer VALUES (?,?)").run(id, source);
+          for (const effect of ASK_FOLLOWUP_EFFECTS) {
+            db.prepare("INSERT OR IGNORE INTO owner_ask_followup VALUES (?,?,?,?,?)").run(id, effect, "pending", null, at);
+          }
+        }
         // A skip ends when the card is answered or reopened: a reopened card waits on the owner again.
         db.prepare("DELETE FROM owner_ask_defer WHERE id=?").run(id);
         const { deferredUntil: _skip, ...rest } = current;
@@ -391,6 +414,17 @@ export function createOwnerAsks(db: Database): OwnerAsks {
           return { ...ask, state: "defaulted" as const, resolution, resolvedAt: now };
         });
       })();
+    },
+    pendingFollowUps() {
+      return (db.prepare("SELECT ask_id, effect, state, error, created_at FROM owner_ask_followup WHERE state='pending' ORDER BY created_at, ask_id, effect").all() as Array<{ ask_id: string; effect: string; state: string; error: string | null; created_at: number }>).map((row) => ({
+        askId: row.ask_id, effect: row.effect as AskFollowUpEffect, state: "pending" as const, error: row.error, createdAt: row.created_at,
+      }));
+    },
+    markFollowUpDone(askId, effect) {
+      db.prepare("UPDATE owner_ask_followup SET state='done', error=NULL WHERE ask_id=? AND effect=?").run(askId, effect);
+    },
+    failFollowUp(askId, effect, error) {
+      db.prepare("UPDATE owner_ask_followup SET error=? WHERE ask_id=? AND effect=? AND state='pending'").run(error, askId, effect);
     },
   };
 }
