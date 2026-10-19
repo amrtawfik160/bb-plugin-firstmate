@@ -1,3 +1,4 @@
+import { approvePr } from './test/production-approval.ts';
 // Provider failover, captain resume, missing outcome lines, and idle alerts for
 // finished crews (fleet audit 2026-10-07).
 import assert from "node:assert/strict";
@@ -921,8 +922,9 @@ test("the toolchain report lists a provider that unnamed dispatches skip, with t
 // the next tell answered "No crew d883a2a4", and the captain had to dispatch a new crew.
 function stubMergeSdk(host: Host) {
   const calls = { merged: 0 };
+  approvePr(host.bb.storage.database(), "thr_cap", "o/r#1", "a".repeat(40));
   // The merge gate reads the PR head fresh from GitHub.
-  stubRoutedHost(host, (cmd) => (cmd.includes("gh pr view")
+  stubRoutedHost(host, (cmd) => (cmd.includes("gh pr merge") ? (calls.merged++, {}) : cmd.includes("gh pr view")
     ? { payload: JSON.stringify({ number: 1, url: "https://github.com/o/r/pull/1", title: "t", headRefName: "fm/c1-x", headRefOid: "a".repeat(40), state: "OPEN", files: [{ path: "docs/x.md" }] }) }
     : {}));
   host.harness.sdk.stub("threads.list", async () => []);

@@ -1,3 +1,4 @@
+import { affirmative, APPROVAL_CHOICES, approvalCardText, fixedApprovalChoices, compareSchema, createProductionApprovals, onlyBaseMerges, productionMergeGuard, PRODUCTION_APPROVAL_POINTER, PRODUCTION_CARD_RULE } from "./lib/production-approval.ts";
 // bb-plugin-firstmate — firstmate-style crews native to BB.
 import { deflateSync } from "node:zlib";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -1672,7 +1673,7 @@ const BB_SKILL_RUNTIME_CONTRACT = [
   "Translate bin/fm-<name>.sh calls to firstmate_fm with script=<name> and the same arguments; use bb firstmate fm <name> only when a shell command is required.",
   "Load native policy skills and their references with firstmate_skill (bb firstmate skill <name> [reference] [--source <selected-root source-file>]); it reads this captain’s selected runtime. Native AGENTS.md means firstmate_contract; bin and docs mean the selected runtime, while data, state and config mean the exact bound captain home returned by deck.",
   "Map workers, panes, and tabs to BB crew threads via firstmate_dispatch/tell/interrupt/retry/stop. Call firstmate_watch once per batch; it hands off to private durable wakes. End the turn; never retry or poll.",
-  `${OWNER_DECISION_RULE} ${CAPTAIN_RULES} ${CORRECTION_RULE} firstmate_deliveries retains open PRs after worker retirement and wake acknowledgement. Continue authorized review/fix/merge work using the author for fixes and preserving the agreed native review and validation path, including independent review when required; merge through firstmate_merge. Inspect unresolved delivery records after compaction or handoff.`,
+  `${OWNER_DECISION_RULE} ${CAPTAIN_RULES} ${PRODUCTION_APPROVAL_POINTER} ${CORRECTION_RULE} firstmate_deliveries retains open PRs after worker retirement and wake acknowledgement. Continue authorized review/fix/merge work using the author for fixes and preserving the agreed native review and validation path, including independent review when required; merge through firstmate_merge. Inspect unresolved delivery records after compaction or handoff.`,
   "Run firstmate_toolchain for native dependency detection. For browser work use the /browser skill and browser_script (or bb plugin run browser script), with profileId unset for the thread-isolated default. This replaces native chrome-devtools-axi transport. Read config/lavish-axi-host for remote Lavish access and use bb connect expose for a board the captain should see.",
   "Treat tmux, herdr, zellij, cmux, orca, and harness-specific hook setup as reference material unless the active backend explicitly names that runtime.",
 ].join(" ");
@@ -1815,6 +1816,7 @@ export default async function plugin(bb: BbPluginApi) {
   const quality = createQualityEvents(bb.storage.database());
   const inboundLedger = createInboundLedger(bb.storage.database());
   const ownerAsks = createOwnerAsks(bb.storage.database());
+  const productionApprovals = createProductionApprovals(bb.storage.database());
   const programs = createPrograms(bb.storage.database());
   const releaseReadbacks = createReleaseReadbacks(bb.storage.database());
   // Owner decision (18 Oct, option A): the strict proof gate covers PRs GitHub says were opened after this
@@ -2329,6 +2331,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
       const target = await mergeTarget(builder,repo.environmentId ?? "",repo.hostId,pr.url);
       if (!target) throw new Error("Cannot read workstream PR head.");
+      await requireProductionApproval(target,builder,repo.hostId);
       const reach = await prReach(target,repo.hostId);
       try { await requireChecker(target,builder,{...reach,reach:"production"}); }
       catch (error) {
@@ -2355,7 +2358,7 @@ export default async function plugin(bb: BbPluginApi) {
       const rule = projectForName(await projectLabel(w.projectId));
       const crewId = `${w.id.slice(3)}-live-${w.ship.requestId?.replace(/[^a-zA-Z0-9._-]/g,"_").slice(0,30)}`;
       const known = (await readCrews()).find((c) => c.id === crewId);
-      if (!known) await dispatchCrewUnqueued({task:`Make merged workstream ${w.id} live. Tasks: ${w.taskIds.join(", ")}. Follow this project path: ${rule?.live?.next ?? "ask the captain to name the project live path"}. Record live evidence with the existing Firstmate task and live-check tools. Do not merge other work or create a new worktree.`,crewId,projectId:w.projectId,parentThreadId:w.threadId,workstreamId:w.id,role:"builder",shape:"ship",mode:"direct-PR",worktree:false,visible:true});
+      if (!known) await dispatchCrewUnqueued({task:`Prepare the release of merged workstream ${w.id}. Request any missing publication approval from the captain before making it live. A merge approval alone does not authorize publication. Tasks: ${w.taskIds.join(", ")}. Follow this project path: ${rule?.live?.next ?? "ask the captain to name the project live path"}. Record live evidence with the existing Firstmate task and live-check tools. Do not merge other work or create a new worktree.`,crewId,projectId:w.projectId,parentThreadId:w.threadId,workstreamId:w.id,role:"builder",shape:"ship",mode:"direct-PR",worktree:false,visible:true});
       throw new WorkstreamWaiting(`Merged work awaits the project live check: ${rule?.live?.missing ?? rule?.live?.next ?? "live path missing"}`);
     }
   }
@@ -9966,6 +9969,36 @@ export default async function plugin(bb: BbPluginApi) {
     return `Refusing: ${url} is the PR of crew ${hit.crew.id}, owned by ${hit.owner ? `captain @thread:${hit.owner}` : "an unassigned manager"}. Coordinate with that captain before landing it, or pass overrideOwner=true (--override-owner) when the captain told you to.`;
   }
 
+  async function requireProductionApproval(pr: MergeTarget, crew: Crew, hostId: string | null): Promise<void> {
+    if (pr.state === "merged") return;
+    const key = prKeyOf(pr.url) ?? "";
+    for (const binding of productionApprovals.candidates(key)) {
+      const ask = ownerAsks.get(binding.ask);
+      if (!ask || ask.captain !== crew.parentThreadId) continue;
+      if (ask.kind !== "approval" || ask.state !== "answered" || !ownerAsks.answeredByOwner(ask.id) || !affirmative(ask)) break;
+      if (pr.headSha !== "" && binding.head === pr.headSha) return;
+      if (hostId === null || !pr.headSha) break;
+      try {
+        const repo = key.split("#")[0]!;
+        const number = key.split("#")[1]!;
+        const read = async (path: string) => {
+          const result = await runStructuredOnHost(hostId, `gh api ${shQuote(path)}`, 30_000);
+          if (result.exitCode !== 0) throw new Error("Cannot read approval ancestry");
+          return JSON.parse(result.output);
+        };
+        const comparison = compareSchema.parse(await read(`repos/${repo}/compare/${binding.head}...${pr.headSha}`));
+        const base = z.object({head:z.object({sha:z.string()}),base:z.object({sha:z.string()})}).parse(await read(`repos/${repo}/pulls/${number}`));
+        if (base.head.sha !== pr.headSha) break;
+        if (await onlyBaseMerges(binding.head, pr.headSha, comparison, async (sha) => {
+          const relation = compareSchema.parse(await read(`repos/${repo}/compare/${sha}...${base.base.sha}`));
+          return relation.status === "ahead" || relation.status === "identical";
+        })) return;
+      } catch { /* Missing or incomplete ancestry requires a new card. */ }
+      break;
+    }
+    throw new Error(`Refusing: ${key} needs an owner approval card for its current changes; nothing was merged. Send firstmate_ask kind=approval with structured prs naming ${key}, what changes, where it goes live, how to undo, and screenshots for visible changes. Pass prs=["${key}"] and omit options and recommended. Wait for the owner's Approve answer. New author commits need a new card; --yes and standing approvals do not count.`);
+  }
+
   async function mergeCrew(
     crew: Crew,
     yes: boolean,
@@ -10010,7 +10043,7 @@ export default async function plugin(bb: BbPluginApi) {
         opts.allowUnverified?.trim() ? `--allow-unverified ${shQuote(opts.allowUnverified.trim())}` : "", "--yes"].filter(Boolean).join(" ");
       const lines = ["Not merged: this is a preview. A merge needs --yes (yes=true), whatever the posture."];
       const steps: string[] = [];
-      if (pr === null) lines.push(`Crew ${crew.id} is local-only: --yes fast-forwards its branch onto the default branch.`);
+      if (pr === null) lines.push(`Crew ${crew.id} is local-only: merging refuses until it has a PR and an owner approval card.`);
       else {
         const row = deliveries.get(prKeyOf(pr.url) ?? "");
         const record = pr.headSha !== "" && row?.verifiedCommitSha === pr.headSha
@@ -10063,8 +10096,9 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const local = crew.posture === "local-only";
     const named = opts.pr !== undefined && opts.pr !== "";
-    if (local && named) throw new Error(`Refusing: crew ${crew.id} is local-only. It lands by fast-forward, not through a PR, so drop pr.`);
+    if (local && named) throw new Error(`Refusing: crew ${crew.id} is local-only. Create a PR with a PR delivery posture, then request an owner approval card before merging.`);
     if (local && !yes) return preview(null, null);
+    if (local) throw new Error("Refusing: local-only merges cannot name a PR on an owner approval card. Create a PR and send firstmate_ask kind=approval before merging.");
     const nativeHome = await crewNativeHome(crew);
     if (nativeHome !== "" && !crew.workstreamId) {
       const hostId = await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
@@ -10082,6 +10116,7 @@ export default async function plugin(bb: BbPluginApi) {
       ownership ||= foreign !== null;
       refuse(foreign);
       const reach = await prReach(pr, hostId);
+      if (!yes) { try { await requireProductionApproval(pr, crew, hostId); } catch (error) { reasons.push(String(error)); } }
       if (!yes) return preview(pr, await checkSummary(hostId, pr.url), await checkerPreview(pr, crew, reach), reach);
       let waived = "";
       let checked = "";
@@ -10089,6 +10124,7 @@ export default async function plugin(bb: BbPluginApi) {
         const verification = requireVerification(pr, opts.allowUnverified, opts.caller ?? crew.parentThreadId ?? "", reach);
         waived = verification.note;
         checked = await requireChecker(pr, crew, reach);
+        await requireProductionApproval(pr, crew, hostId);
         const args = [crew.id, pr.url];
         if (allowRedCheck?.trim()) args.push("--allow-red", allowRedCheck.trim());
         if (allowMissingCheck?.trim()) args.push("--allow-missing", allowMissingCheck.trim());
@@ -10097,11 +10133,11 @@ export default async function plugin(bb: BbPluginApi) {
         } else {
           await awaitMergeableKnown(hostId, pr.url);
         }
-        let result = await runFmScript({ script: "pr-merge", args, fmHome: nativeHome, hostId, timeoutMs: 180_000 });
+        let result = await runFmScript({ script: "pr-merge", args, fmHome: nativeHome, hostId, approvedHead: pr.headSha, timeoutMs: 180_000 });
         if (result.exitCode !== 0 && /mergeable is "UNKNOWN"/.test(result.output)) {
           if (pr.source === "environment") await prepareEnvironmentPullRequest(envId);
           else await awaitMergeableKnown(hostId, pr.url);
-          result = await runFmScript({ script: "pr-merge", args, fmHome: nativeHome, hostId, timeoutMs: 180_000 });
+          result = await runFmScript({ script: "pr-merge", args, fmHome: nativeHome, hostId, approvedHead: pr.headSha, timeoutMs: 180_000 });
         }
         prStatusCache.delete(envId);
         requireNativeSuccess(result, `PR merge ${crew.id}`);
@@ -10159,6 +10195,7 @@ export default async function plugin(bb: BbPluginApi) {
     const verification = requireVerification(fresh, opts.allowUnverified, opts.caller ?? crew.parentThreadId ?? "", reach);
     const unverified = verification.note;
     const checked = await requireChecker(fresh, crew, reach);
+    await requireProductionApproval(fresh, crew, hostId);
     f = await prepareEnvironmentPullRequest(envId);
     const waive = (allowRedCheck ?? "").trim();
     const redChecks = waive !== "" && f.checksState === "failing" ? await redCheckNames(crew, f.url) : null;
@@ -10172,7 +10209,9 @@ export default async function plugin(bb: BbPluginApi) {
       redChecks,
     });
     if (!gate.ok) throw new Error(`Refusing: ${gate.reason}`);
-    await bb.sdk.environments.mergePullRequest({ environmentId: envId, method: "merge" });
+    if (hostId === null || !fresh.headSha) throw new Error("Refusing: cannot bind the merge to the owner-approved PR head.");
+    const merged = await runStructuredOnHost(hostId, `gh pr merge ${shQuote(fresh.url)} --merge --match-head-commit ${shQuote(fresh.headSha)}`, 180_000);
+    if (merged.exitCode !== 0) throw new Error(`Refusing: head-bound merge failed: ${merged.output}`);
     prStatusCache.delete(envId);
     verification.record();
     const output = await crewOutput(crew, 300);
@@ -11590,6 +11629,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function runFmScript(input: {
     script: string;
+    approvedHead?: string;
     args: string[];
     hostId: string;
     fmHome: string;
@@ -11642,6 +11682,7 @@ export default async function plugin(bb: BbPluginApi) {
       fmMirrorStaleGuard(input.fmHome),
       `if [ ! -f "$FM_BINDIR/${scriptLeaf}" ]; then echo "error: missing $FM_BINDIR/${scriptLeaf}" >&2; exit 127; fi`,
       ["update","test-run","test-isolation-proof","lint","lint-workflows"].includes(script) ? 'if [ "${FM_BUNDLED_VERIFIED:-}" = 1 ]; then echo "Bundled native development/update command refused; use a development source checkout for lint/tests or install a tested BB plugin release and use bb firstmate runtime select --check." >&2; exit 2; fi' : "",
+      ...(script === "pr-merge" && input.approvedHead ? [productionMergeGuard(input.approvedHead)] : []),
       invocation,
     ]
       .filter((line) => line !== "")
@@ -14024,7 +14065,7 @@ export default async function plugin(bb: BbPluginApi) {
     const catalog=await nativePolicyLookup(hostId,path.slice(0,-'/AGENTS.md'.length),{operation:'catalog'},signal);
     if (catalog.contractSha256!==createHash('sha256').update(content).digest('hex')) throw new Error('Native contract changed during selected-runtime trigger read; complete contract/catalog read remains unresolved.');
     const triggers=`## Selected native skill trigger catalog @ ${catalog.commit}\n${catalog.root}\n\n${catalog.entries!.map(entry=>`### ${entry.path}\nNative file SHA-256: ${entry.sha256}\n\n\`\`\`yaml\n${entry.frontmatter}\n\`\`\``).join('\n\n')}`;
-    return `${picked.text}\n\n${triggers}\n\n## BB runtime adaptations\n${BB_SKILL_RUNTIME_CONTRACT}\n${done} Treat native policy refusals as refusals. Read durable reports with firstmate_wake; pass handledWake on the final successful action after handling the whole batch.\n`;
+    return `${picked.text}\n\n${triggers}\n\n## BB runtime adaptations\n${BB_SKILL_RUNTIME_CONTRACT}\n${PRODUCTION_CARD_RULE}\n${done} Treat native policy refusals as refusals. Read durable reports with firstmate_wake; pass handledWake on the final successful action after handling the whole batch.\n`;
   }
 
   async function nativePolicyLookup(host:string,root:string,request:Record<string,unknown>,signal:AbortSignal) {
@@ -14343,12 +14384,13 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_ask",
-    description: "Ask the captain one question, blocker or approval as a Telegram card with up to 4 option buttons. It stays on the captain's board until answered. Returns at once: keep working on other things. The answer arrives from a button tap or a card reply containing just its option letter. Reversible cards sent within a minute of each other share one Telegram message with an \"Accept all recommended\" button; an answer there arrives as one owner message with a line \"- ask <id>: <option>\" per card it answered. irreversible=true or kind=approval never proceeds on a deadline and keeps its own message; a reversible ask with a recommended option proceeds with it at its deadline. A card names its project. A card the owner's rules in captain.md already answer is refused with the rule. A new card on the same task and subject replaces the open one.",
+    description: "Ask the captain one question, blocker or approval as a Telegram card with up to 4 option buttons. It stays on the captain's board until answered. Returns at once: keep working on other things. The answer arrives from a button tap or a card reply containing just its option letter. Reversible cards sent within a minute of each other share one Telegram message with an \"Accept all recommended\" button; an answer there arrives as one owner message with a line \"- ask <id>: <option>\" per card it answered. Approval cards supply fixed Approve and No buttons: omit options and recommended, and pass the exact authorized PR list in prs; question-text PR mentions grant no permission. irreversible=true or kind=approval never proceeds on a deadline and keeps its own message; a reversible ask with a recommended option proceeds with it at its deadline. A card names its project. A card the owner's rules in captain.md already answer is refused with the rule. A new card on the same task and subject replaces the open one.",
     parameters: z.object({
       impact: z.string().optional().describe("Optional. One plain sentence explaining what this means for the owner’s business"),
       question: z.string().min(1).max(1500).describe("One question, asked in the first sentence; put option text in options, not in the question. Cards sent together that start with the same subject and a colon (\"DM Pro plugin: ...\") get that subject as their shared title"),
       kind: z.enum(["question", "blocker", "approval"]),
-      options: z.array(z.object({ label: z.string().min(1).max(1000).describe("Short: up to 42 characters fit a button whole"), value: z.string().min(1).max(64).optional() })).max(4).optional(),
+      options: z.array(z.object({ label: z.string().min(1).max(1000).describe("Questions and blockers only; approval cards use fixed Approve and No buttons"), value: z.string().min(1).max(64).optional() })).max(4).optional(),
+      prs: z.array(z.string().max(200).regex(/^[\w.-]+\/[\w.-]+#[1-9]\d*$/)).max(20).optional().describe("Approval only: the exact PRs authorized by this card, as owner/repo#N. The plugin displays this list. PR mentions in question text grant no permission"),
       recommended: z.number().int().min(0).optional().describe("Index of the recommended option"),
       defaultAfterMinutes: z.number().min(5).max(10080).optional().describe("Proceed with the recommended option after this many minutes without an answer (reversible asks only)"),
       irreversible: z.boolean().optional().describe("A gated action (production deploy, money, deleting data, customer messages): never proceeds without an answer"),
@@ -14356,7 +14398,7 @@ export default async function plugin(bb: BbPluginApi) {
       project: z.string().min(1).max(80).optional().describe("Required unless task has one: the project this card is about, as on the board (such as Safi). With Telegram topics on, the card goes to that project's topic"),
       task: z.string().regex(/^T\d+$/).optional().describe("The owner task this card is for (T<n>). Unset: the open task the owner message of this turn started. In Telegram the card replies to the task's status line, which counts it"),
     }),
-    async execute({ impact, question, kind, options, recommended, defaultAfterMinutes, irreversible, startsNewWork, project, task: taskId }, ctx) {
+    async execute({ impact, question, kind, options, prs, recommended, defaultAfterMinutes, irreversible, startsNewWork, project, task: taskId }, ctx) {
       const captain = ctxString(ctx, "threadId");
       if (!captain) return toolError("firstmate_ask runs only in a captain thread.");
       if (taskId !== undefined && ownerTasks.get(taskId)?.captain !== captain) return toolError(`No owner task ${taskId} for this captain. Check firstmate_task list.`);
@@ -14366,9 +14408,16 @@ export default async function plugin(bb: BbPluginApi) {
       // Owner decision Q7: every card names its project (32 of 95 cards on 15-17 Oct had none).
       const cardProject = project?.trim() || (cardTask !== undefined ? ownerTasks.get(cardTask)?.project ?? undefined : undefined);
       if (!cardProject) return toolError("Refusing: a card names its project. Pass project (as on the board, such as Safi), or task (T<n>) of a task that has one. Nothing was sent.");
-      const answered = await ruleAnswering(captain, [question, impact ?? "", ...(options ?? []).map((option, index) => `${String.fromCharCode(65 + index)}. ${option.label}`)].filter(Boolean).join("\n"));
+      const answered = kind === "approval" ? null : await ruleAnswering(captain, [question, impact ?? "", ...(options ?? []).map((option, index) => `${String.fromCharCode(65 + index)}. ${option.label}`)].filter(Boolean).join("\n"));
       if (answered !== null) return toolError(`Refusing: the owner's rules already answer this card, so it was not sent. Rule: "${answered}". Act on it and say in one line what you did.`);
-      const choices = (options ?? []).map((option, index) => ({ label: option.label, value: option.value ?? String.fromCharCode(65 + index) }));
+      if (kind === "approval" && ((options !== undefined && !fixedApprovalChoices(options)) || recommended !== undefined)) {
+        return toolError("Refusing: approval cards use fixed Approve and No buttons, with no captain-set recommendation. Omit options and recommended.");
+      }
+      if (kind !== "approval" && prs !== undefined) return toolError("Refusing: prs belongs only to an approval card.");
+      const targets = [...new Set((prs ?? []).map(pr => pr.toLowerCase()))];
+      const cardText = kind === "approval" ? approvalCardText(question, targets) : question.trim();
+      if (cardText.length > 1500) return toolError("Refusing: question plus the exact PR list exceeds 1500 characters. Shorten the question; the PR list is never truncated.");
+      const choices = kind === "approval" ? APPROVAL_CHOICES.map(option => ({...option})) : (options ?? []).map((option, index) => ({ label: option.label, value: option.value ?? String.fromCharCode(65 + index) }));
       if (recommended !== undefined && recommended >= choices.length) return toolError(`recommended must be the index of one of the ${choices.length} option(s).`);
       const newWork = startsNewWork === true;
       const gated = !mayDefault({ kind: kind as AskKind, irreversible: irreversible === true, startsNewWork: newWork });
@@ -14378,12 +14427,23 @@ export default async function plugin(bb: BbPluginApi) {
       if (defaultAfterMinutes !== undefined && recommended === undefined) return toolError("defaultAfterMinutes needs a recommended option to proceed with.");
       const minutes = gated || recommended === undefined ? 0 : defaultAfterMinutes ?? Number((await settings.get()).askDefaultMinutes ?? 240);
       const now = Date.now();
+      const approvalHeads: Array<{pr: string; head: string}> = [];
+      if (kind === "approval") {
+        for (const pr of targets) {
+          const [repo, number] = pr.split("#");
+          const hostId = await resolveHostId(undefined, ctx);
+          const identity = await ghPrIdentity(hostId, `https://github.com/${repo}/pull/${number}`);
+          if (!identity?.headSha) return toolError(`Refusing: cannot read ${pr} for the owner approval card. Nothing was sent.`);
+          approvalHeads.push({pr, head:identity.headSha});
+        }
+      }
       const ask = ownerAsks.create({
-        captain, kind: kind as AskKind, impact: impact?.replace(/\s+/g, " ").trim().slice(0, 300), text: question.trim(), options: choices,
+        captain, kind: kind as AskKind, impact: impact?.replace(/\s+/g, " ").trim().slice(0, 300), text: cardText, options: choices,
         recommended: recommended ?? null, defaultAt: minutes > 0 ? now + Math.round(minutes * 60_000) : null,
         irreversible: irreversible === true, startsNewWork: newWork, createdAt: now,
         project: cardProject, ...(cardTask !== undefined ? { task: cardTask } : {}), subject: cardSubject(question),
       });
+      if (kind === "approval") productionApprovals.bindCard(ask.id, approvalHeads);
       const replaced = await replaceOpenCards(ask);
       const deadline = ask.defaultAt !== null
         ? ` If no answer by ${formatUtcTime(ask.defaultAt)}, it proceeds with "${recommendedLabel(ask)}" and you are told to go ahead.`
@@ -15648,6 +15708,7 @@ export default async function plugin(bb: BbPluginApi) {
         const startup = captainStartupCommand(current.fmHome, script, args ?? []);
         if (startup!==null && current.fullParityOnDeck && !homeScope.getStore()?.home) return toolError("Native startup requires a bound captain home. Call firstmate_deck or bb firstmate deck; shared-home fallback refused.");
         if (startup !== null) return `BB startup transport: run this exact command through your agent's shell tool, which runs under the harness. The host-terminal RPC cannot provide that ancestry. No native startup or lock acquisition has been attempted by this tool.\n\n${startup}`;
+        if (["pr-merge", "merge-local"].includes(normalizeFmScript(script))) return toolError("Refusing: use firstmate_merge with an owner approval card; raw merge scripts bypass approval checks.");
         const refusal = await rawTeardownRefusal(script, args ?? [], ctxString(ctx, "threadId"));
         if (refusal !== null) return toolError(refusal);
         const hostId = await resolveHostId(undefined, ctx);
@@ -15781,7 +15842,16 @@ export default async function plugin(bb: BbPluginApi) {
     },
     async resolveAsk({ threadId, id, resolution }) {
       if (!(await isCaptainThread(threadId))) return { ok: false };
-      const ok = ownerAsks.resolve(id, threadId, "answered", resolution, Date.now()) !== undefined;
+      let ownerConfirmed = !productionApprovals.has(id);
+      if (!ownerConfirmed) {
+        try {
+          const tapped = z.object({ answer: z.string().nullable() }).parse(await bb.sdk.plugins.callRpc({
+            pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "ownerAnswer", input: { askId: id }, outputSchema: z.object({ answer: z.string().nullable() }),
+          }));
+          ownerConfirmed = tapped.answer !== null && tapped.answer.trim().toLowerCase() === resolution.trim().toLowerCase();
+        } catch { /* An RPC correction can close a card, but cannot grant production approval. */ }
+      }
+      const ok = ownerAsks.resolve(id, threadId, "answered", resolution, Date.now(), ownerConfirmed ? "owner" : undefined) !== undefined;
       if (ok) await ownerAnsweredAsk(id, resolution);
       if (ok) await refreshOwnerBoard();
       return { ok };
@@ -16423,7 +16493,7 @@ export default async function plugin(bb: BbPluginApi) {
       const header = parseConnectorHeader(message);
       if (header && !header.forwarded && header.sourceEventId?.startsWith("pack:")) {
         for (const { id, answer } of packAnswers(header.body)) {
-          if (ownerAsks.get(id)?.state === "open" && ownerAsks.resolve(id, captainThreadId, "answered", answer, Date.now())) { answered++; await ownerAnsweredAsk(id, answer); }
+          if (ownerAsks.get(id)?.state === "open" && ownerAsks.resolve(id, captainThreadId, "answered", answer, Date.now(), "owner")) { answered++; await ownerAnsweredAsk(id, answer); }
         }
         continue;
       }
@@ -16431,7 +16501,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (!header || header.forwarded || id === null) continue;
       const ask = ownerAsks.get(id);
       const answer = ask ? askLetterAnswer(ask, header.body) : null;
-      if (ask?.state === "open" && answer !== null && ownerAsks.resolve(id, captainThreadId, "answered", answer, Date.now())) { answered++; await ownerAnsweredAsk(id, answer); }
+      if (ask?.state === "open" && answer !== null && ownerAsks.resolve(id, captainThreadId, "answered", answer, Date.now(), "owner")) { answered++; await ownerAnsweredAsk(id, answer); }
     }
     if (answered > 0) await refreshOwnerBoard();
   }
@@ -17135,6 +17205,7 @@ export default async function plugin(bb: BbPluginApi) {
           if (startup !== null) return { exitCode: 0, stdout: json
             ? JSON.stringify({ requiresAgentShell: true, command: startup })
             : `Run through the agent's shell (native lock requires harness ancestry):\n${startup}` };
+          if (["pr-merge", "merge-local"].includes(normalizeFmScript(parsed.script))) return fail("Refusing: use firstmate_merge with an owner approval card; raw merge scripts bypass approval checks.");
           const refusal = await rawTeardownRefusal(parsed.script, parsed.args, ctxString(ctx, "threadId"));
           if (refusal !== null) return fail(refusal);
           const hostId = await resolveHostId(flagFromArgv(argv, "machine"), ctx);

@@ -1,3 +1,4 @@
+import { approvePr } from './test/production-approval.ts';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createFakePluginHost,makeThreadResponse } from '@get-bb/plugin-sdk/testing';
@@ -17,7 +18,7 @@ const CYN='Cyndra-AI/cyndra-saas';
 const SAFI='amrtawfik160/Safi';
 const url=(repo,n)=>`https://github.com/${repo}/pull/${n}`;
 const key=(repo,n)=>`${repo.toLowerCase()}#${n}`;
-const head=n=>String(n).repeat(10).slice(0,40);
+const head=n=>String(n).repeat(40).slice(0,40);
 const crewRow=(id,threadId,extra)=>({id,task:'x',projectId:'proj_1',threadId,parentThreadId:'thr_cap',nativeHome:'/native',worktree:true,shape:'ship',posture:'direct-PR',createdAt:'2026-10-17T00:00:00.000Z',reasoningLevel:null,playbook:'babysit',...extra});
 const CREWS=[
  crewRow('woo1','thr_woo',{title:'Fix the photo upload',providerId:'claude-code',model:'claude-opus-5-5'}),
@@ -75,6 +76,7 @@ async function deck({nativeWorker,requirement="merged"}={}) {
  await host.bb.storage.kv.set('crews',CREWS.map(c=>({...c,deliveryRequirement:requirement})));
  const store=createDeliveries(host.bb.storage.database());
  for(const [repo,n,crew,thread] of PRS){
+  approvePr(host.bb.storage.database(),'thr_cap',key(repo,n),head(n));
   const r=store.register({url:url(repo,n),taskId:crew,projectId:'proj_1',owner:'thr_cap',home:'/native',worker:thread,requirement,title:`Change ${n}`});
   store.observe(r.id,{headSha:head(n),state:'open',draft:false,checks:'passing',review:'approved',reviewHeadSha:head(n),mergeCommitSha:null,mergeable:'mergeable',...(OPENED[n]?{openedAt:Date.parse(OPENED[n])}:{})},true);
  }

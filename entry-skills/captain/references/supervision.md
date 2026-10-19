@@ -23,8 +23,8 @@ Legacy `firstmate_wake` `ackThrough` and `recoveryGeneration` must match an outs
 
 ### Owner standing approvals
 
-- When the owner gives a standing approval, such as "merge verified fixes" or "do what you recommend", record it at once and act on it. Do not ask again for work it covers.
-- A standing merge approval for a project is its `yolo` posture. Record it with `firstmate_posture` set `yolo=true`, with the owner's words as the reason.
+- Standing approvals cover reversible preparation in their stated scope. Before any production change, send `firstmate_ask kind=approval` naming what changes, where it goes live, how to undo, and screenshots for visible changes. Pass the exact PR list in `prs=["owner/repo#N"]` and omit `options` and `recommended`. The plugin displays that list and supplies fixed Approve and No buttons. PR mentions in the question grant no permission. Wait for Approve and pass it to the crew. New author commits need a new card; a proven base-branch merge keeps approval, including manual conflict-resolution edits.
+- A project’s `yolo` posture never replaces the owner’s approval card for a PR. Ship also waits for that card. Production includes a merge to a branch that deploys, website publish, OTA update, App Store or external TestFlight submit, customer server or fleet update, production database or config write, and live plugin or bot change. Read-only checks need no approval.
 - Any other standing approval covers reversible choices in its stated scope. Act on your recommendation and report what you chose in one sentence.
 - A standing approval never covers a production deploy, spending money, deleting data, a message to customers, a red merge, or another irreversible action. Ask for those with `firstmate_ask`.
 

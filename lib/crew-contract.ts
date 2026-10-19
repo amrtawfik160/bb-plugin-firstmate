@@ -1,3 +1,4 @@
+import { PRODUCTION_RULE } from "./production-approval.ts";
 import { homedir } from "node:os";
 import type { Shape } from "./policy.ts";
 import { BUG_FIX_PROOF, checkerSteps, HOUSE_RULES, OBSTACLES, OPERATOR_MERGE_STEPS, PLAYBOOK_RULES, SCREENSHOT_RULE } from "../owner/crew-rules.ts";
@@ -171,6 +172,7 @@ export function crewSkillBlock(input: { shape: Shape; title?: string; task: stri
     `Skills on this host are in \`${root}/<name>/SKILL.md\`. Load a skill by reading that file. With no Skill tool, \"call the Skill tool with <name>\" means read that file for <name>.`,
     "If a skill is not installed, continue and say so in your report.",
     ...HOUSE_RULES,
+    PRODUCTION_RULE,
   );
   if (checker) lines.push(...checkerSteps(skill));
   else if (playbook === "none") lines.push(...OPERATOR_MERGE_STEPS);

@@ -1,3 +1,4 @@
+import { approvePr } from './test/production-approval.ts';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createFakePluginHost,makeThreadResponse } from '@get-bb/plugin-sdk/testing';
@@ -66,6 +67,7 @@ async function deck({report=PROVEN,crews=CREWS,files={},output='DONE: PR open'}=
  await host.bb.storage.kv.set('crews',crews);
  const store=createDeliveries(host.bb.storage.database());
  for(const n of [2391,2392]){
+  approvePr(host.bb.storage.database(),'thr_cap',id(n),head(n));
   const r=store.register({url:url(n),taskId:BUILDER,projectId:'proj_1',owner:'thr_cap',home:'/native',worker:'thr_crew',requirement:'merged',title:`Change ${n}`});
   store.observe(r.id,{headSha:head(n),state:'open',draft:false,checks:'passing',review:'approved',reviewHeadSha:head(n),mergeCommitSha:null,mergeable:'mergeable'},true);
  }

@@ -30,7 +30,7 @@ const HOUSE_RULES = [
   "Spawn no sub-agents, except where your playbook calls for `arena` (a new UI or design choice with no example in the code) or `interrogate` (a risky PR): then spawn at most 3 extra agents for that step, and run their heavy commands through `~/.bb-firstmate/bin/fm-heavy`. Do everything else yourself, in this session.",
   "`code-review`: run its Standards and Spec reviews yourself, one after the other, not as sub-agents.",
   "`implement-spec`: never start its sub-agents and never merge a ticket. Build your brief's tickets on your branch and follow the delivery contract.",
-  "Until the owner confirms otherwise: Firstmate decides who merges and deploys. Follow the brief's delivery contract for merge and deploy.",
+  "Production changes require the owner’s approval card naming the change. The captain passes that approval to the crew before merge or deploy.",
 ];
 
 const VERIFY_RULES = [
@@ -105,6 +105,7 @@ test("a feature brief gives full paths, the pipeline checklist, the core princip
     ...HOUSE_RULES,
     MERGE_RULE,
     ...HOST_LIMIT,
+    'Production approval: do not merge, publish, deploy, submit or write to production. Report "ready to go live" with what changes, where and how to undo. Go live only after the captain passes on the owner’s approval card naming that change.',
     ...IN_PLACE_OF_A_SKIP,
     ...VERIFY_RULES,
     "### Pipeline (feature). Do every step, in this order:",
@@ -412,7 +413,7 @@ test("the block stays short for every provider, shape, playbook and role", () =>
           const size = crewSkillBlock(input).length;
           // 18 Oct: +600 for the code-review, implement-spec, tdd, Skill-tool and Bugbot rules,
           // then +300 for the owner's CI-wait, test-run and Codex-model rules.
-          const bound = crewPipeline(input) === null ? 4800 : 6200;
+          const bound = crewPipeline(input) === null ? 5100 : 6500;
           assert.ok(size <= bound, `${providerId} ${shape} ${playbook} ${role}: ${size} characters`);
         }
       }
@@ -551,7 +552,7 @@ test("every brief says merges go only through bb firstmate merge, never gh pr me
 test("a release or operator brief gives the per-PR drive, record and merge steps after the host rules", () => {
   assert.equal(crewPlaybook({ shape: "ship", title: "Release the green PRs", task: "" }), "none");
   const release = crewSkillBlock({ shape: "ship", title: "Release the green PRs", task: "Merge the approved PRs", providerId: "codex" });
-  assert.ok(release.includes([MERGE_RULE, ...HOST_LIMIT, ...MERGE_SEQUENCE].join("\n")), release);
+  assert.ok(release.includes([MERGE_RULE, ...HOST_LIMIT, 'Production approval: do not merge, publish, deploy, submit or write to production. Report "ready to go live" with what changes, where and how to undo. Go live only after the captain passes on the owner’s approval card naming that change.', ...MERGE_SEQUENCE].join("\n")), release);
   assert.ok(!crewSkillBlock({ shape: "ship", title: "Add a CSV export", task: "" }).includes(MERGE_SEQUENCE[0]!));
 });
 
@@ -742,4 +743,27 @@ test("skill-routing names the sub-agent skills, the tdd it means, the Skill-tool
     "When a skill says to call the Skill tool with a skill name and you have no Skill tool, read that skill's `SKILL.md` from the skills folder your brief names.",
     "Bugbot: triage its comments like any other review thread. Do not wait for Bugbot when the PR has no Bugbot check.",
   ]) assert.ok(rules.includes(text), text);
+});
+
+test('every dispatch brief contains one production approval rule', () => {
+  for (const shape of ['ship', 'scout'] as const) {
+    for (const playbook of PLAYBOOK_CHOICES) {
+      const brief = crewSkillBlock({shape, playbook, task:'Build the requested change'});
+      assert.equal(brief.split('Production approval:').length - 1, 1);
+      assert.ok(brief.includes('ready to go live'));
+    }
+  }
+});
+
+test('approval remains bound when native merge rereads a changed head', async () => {
+  const { productionMergeGuard } = await import('./production-approval.ts');
+  const dir=mkdtempSync(join(tmpdir(),'approval-forge-'));
+  try {
+    writeFileSync(join(dir,'gh'),'#!/bin/sh\nprintf "merged\\n"\n',{mode:0o755});
+    for (const head of ['a'.repeat(40),'b'.repeat(40)]) {
+      const run=spawnSync('bash',['-c',`${productionMergeGuard('a'.repeat(40))}\nbash -c 'gh pr merge 1 --match-head-commit ${head}'`],{encoding:'utf8',env:{...process.env,PATH:`${dir}:${process.env.PATH}`}});
+      assert.equal(run.status,head.startsWith('a')?0:1,run.stderr);
+      if(head.startsWith('b')) assert.ok(!run.stdout.includes('merged'));
+    }
+  } finally { rmSync(dir,{recursive:true,force:true}); }
 });

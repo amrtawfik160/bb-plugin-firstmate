@@ -110,7 +110,7 @@ test("a new card on the same task and subject replaces the open one, which Teleg
   try {
     const task = tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Johan draft", sourceRefs: ["tg:1:4831"], at: Date.now() });
     const old = asks.create({ captain: "thr_cap", kind: "approval", text: "Johan draft: send v1 in the Jess group?", options: [{ label: "Send", value: "A" }, { label: "Wait", value: "B" }], createdAt: Date.now() - 10 * 60_000, project: "Cyndra", task: task.id, subject: "johan draft" });
-    const out = text(await tool(host, "firstmate_ask").execute({ question: "Johan draft: send v2 in the Jess group?", kind: "approval", options: [{ label: "Send" }, { label: "Wait" }], task: task.id }, ctx));
+    const out = text(await tool(host, "firstmate_ask").execute({ question: "Johan draft: send v2 in the Jess group?", kind: "approval", task: task.id }, ctx));
     const id = /Ask (a[0-9a-z]{6}) is open/.exec(out)![1]!;
     assert.match(out, new RegExp(`It replaces card ${old.id}, now marked replaced`));
     assert.deepEqual([asks.get(old.id)!.state, asks.get(old.id)!.resolution], ["cancelled", `Replaced by card ${id}`]);

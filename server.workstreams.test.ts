@@ -63,6 +63,7 @@ test('fake BB: two editing tasks share the saved environment in order while a sc
       const metadata = call.pluginMetadata as Record<string,unknown>;
       const dir = `/repo/.firstmate-workstream-reports/${w.id}/${metadata.crewId}`;
       assert.equal(metadata.reportDir,dir);
+      assert.equal(String(call.prompt).split("Production approval:").length - 1,1);
       assert.ok(String(call.prompt).includes(`${dir}/report.md`),'the brief names the persisted report path');
       assert.ok(String(call.prompt).includes(`create the report directory '${dir}'`));
     }
