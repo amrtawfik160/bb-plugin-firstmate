@@ -36,7 +36,7 @@ async function realCaptain(opts: { hangSpawn?: boolean; abort?: AbortController 
   stubProviderCatalog(host);
   const seen: string[] = [];
   const cmds = new Map<string, string>();
-  const state = { spawnExit: 1, spawnOutput: ADMISSION_TIMEOUT, threadIdAfterSpawn: "", spawned: 0, spawnSucceeded: false };
+  const state = { spawnExit: 1, spawnOutput: ADMISSION_TIMEOUT, threadIdAfterSpawn: "", spawned: 0, spawnSucceeded: false, spawnCreateError: undefined as Error | undefined, onSpawn: undefined as undefined | (() => Promise<void>) };
   host.harness.sdk.stub("threads.send", async () => ({}));
   host.harness.sdk.stub("threads.events.list", async () => []);
   host.harness.sdk.stub("threads.list", async () => []);
@@ -55,6 +55,7 @@ async function realCaptain(opts: { hangSpawn?: boolean; abort?: AbortController 
     const id = `term_${++n}`;
     cmds.set(id, args.start?.command ?? "");
     seen.push(args.start?.command ?? "");
+    if (state.spawnCreateError && (args.start?.command ?? "").includes("fm-spawn.sh") && !(args.start?.command ?? "").includes("native_command=")) throw state.spawnCreateError;
     return { id };
   });
   host.harness.sdk.stub("terminals.get", async () => ({ status: "running" }));
@@ -64,6 +65,7 @@ async function realCaptain(opts: { hangSpawn?: boolean; abort?: AbortController 
     if (cmd.includes("fm-project-mode.sh")) return hostRc("direct-PR off");
     if (cmd.includes("fm-spawn.sh") && !cmd.includes("native_command=")) {
       state.spawned++;
+      if (state.onSpawn) await state.onSpawn();
       if (opts.hangSpawn) {
         opts.abort?.abort();
         await new Promise(() => {});
@@ -149,7 +151,7 @@ test("help names launches release", async () => {
 test("an uncertain no-thread legacy launch can be released", async (t) => {
   const { host } = await realCaptain();
   try {
-    seedUncertain(host);
+    seedUncertain(host, { creationRequested: false });
     let lists = 0;
     host.harness.sdk.stub("threads.list", async () => {
       lists++;
@@ -183,7 +185,7 @@ test("release refuses creationRequested, a matching thread, a live fm-spawn lock
     assert.match(requested.stderr, /creationRequested|creation was requested/);
     assert.equal(launchStore(host).forTask(ctx.projectId, ctx.threadId, TASK)?.state, "uncertain");
 
-    seedUncertain(host);
+    seedUncertain(host, { creationRequested: false });
     host.harness.sdk.stub("threads.list", async () => [makeThreadResponse({ id: "thr_found", projectId: ctx.projectId, parentThreadId: ctx.threadId })]);
     host.harness.sdk.stub("threads.getPluginMetadata", async ({ threadId }: { threadId: string }) => {
       if (threadId === ctx.threadId) return { captain: "true", nativeHome: HOME };
@@ -195,7 +197,7 @@ test("release refuses creationRequested, a matching thread, a live fm-spawn lock
     assert.match(found.stderr, /thread/);
     assert.equal(launchStore(host).forTask(ctx.projectId, ctx.threadId, TASK)?.state, "uncertain");
 
-    seedUncertain(host);
+    seedUncertain(host, { creationRequested: false });
     host.harness.sdk.stub("threads.list", async () => []);
     const cmds = new Map<string, string>();
     let n = 0;
@@ -214,10 +216,89 @@ test("release refuses creationRequested, a matching thread, a live fm-spawn lock
     assert.match(live.stderr, /fm-spawn|spawn lock/);
     assert.equal(launchStore(host).forTask(ctx.projectId, ctx.threadId, TASK)?.state, "uncertain");
 
-    seedUncertain(host);
+    seedUncertain(host, { creationRequested: false });
     const foreign = await host.harness.behavior.runCli(["launches", "release", TASK], { threadId: "thr_other", projectId: ctx.projectId });
     assert.equal(foreign.exitCode, 1, foreign.stderr);
     assert.match(foreign.stderr, /owning captain|captain|home|project/);
+    assert.equal(launchStore(host).forTask(ctx.projectId, ctx.threadId, TASK)?.state, "uncertain");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("create-worker refuses a mismatched attempt token and does not spawn", async () => {
+  const { host } = await realCaptain();
+  try {
+    const key = launchKey(ctx.projectId, ctx.threadId, HOME, TASK);
+    launchStore(host).save({
+      key, taskId: TASK, projectId: ctx.projectId, owner: ctx.threadId, home: HOME,
+      generation: 1, shape: "ship", deliveryMode: "direct-PR", deliveryRequirement: "merged",
+      state: "reserved", threadId: null, nativeInvoked: true, hostId: "host_1", updatedAt: Date.now(),
+      creationRequested: false, attemptToken: "token-a",
+    } as never);
+    host.harness.sdk.stub("files.read", async () => ({ content: "Native validated brief", contentEncoding: "utf8", sizeBytes: 22 }));
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_should_not_exist" }));
+    const created = await host.harness.behavior.runCli(["create-worker", "--json", "--task", TASK, "--shape", "ship", "--project", ctx.projectId, "--home", HOME, "--host", "host_1", "--path", "/repo", "--prompt-file", "/tmp/brief", "--parent", ctx.threadId, "--native-pid", "999", "--attempt-token", "token-b"], ctx);
+    assert.equal(created.exitCode, 1, created.stderr);
+    assert.match(created.stderr, /token/);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
+    assert.equal(launchStore(host).get(key)?.threadId, null);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("legacy release is refused without a process boundary", async () => {
+  const { host } = await realCaptain();
+  try {
+    seedUncertain(host, { updatedAt: Date.now() });
+    const result = await host.harness.behavior.runCli(["launches", "release", TASK], ctx);
+    assert.equal(result.exitCode, 1, result.stderr);
+    assert.match(result.stderr, /process boundary|plugin process/);
+    assert.equal(launchStore(host).forTask(ctx.projectId, ctx.threadId, TASK)?.state, "uncertain");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("legacy release is refused on a failed inventory page", async (t) => {
+  const { host } = await realCaptain();
+  try {
+    seedUncertain(host, { updatedAt: 1 });
+    host.harness.sdk.stub("threads.list", async () => { throw new Error("inventory page failed"); });
+    const result = await host.harness.behavior.runCli(["launches", "release", TASK], ctx);
+    assert.equal(result.exitCode, 1, result.stderr);
+    assert.match(result.stderr, /inventory page|page read failed/);
+    assert.equal(launchStore(host).forTask(ctx.projectId, ctx.threadId, TASK)?.state, "uncertain");
+  } finally {
+    t.mock.timers.reset();
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("legacy release is refused when inventory pages never exhaust", async (t) => {
+  const { host } = await realCaptain();
+  try {
+    seedUncertain(host, { updatedAt: 1 });
+    host.harness.sdk.stub("threads.list", async ({ offset }: { offset?: number }) =>
+      Array.from({ length: 50 }, (_, i) => makeThreadResponse({ id: `other_${(offset ?? 0) + i}`, projectId: ctx.projectId, parentThreadId: ctx.threadId })));
+    const result = await host.harness.behavior.runCli(["launches", "release", TASK], ctx);
+    assert.equal(result.exitCode, 1, result.stderr);
+    assert.match(result.stderr, /limit|inventory/);
+    assert.equal(launchStore(host).forTask(ctx.projectId, ctx.threadId, TASK)?.state, "uncertain");
+  } finally {
+    t.mock.timers.reset();
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a wrapped diagnostic is not a typed exit status for this attempt", async () => {
+  const { host, state } = await realCaptain();
+  try {
+    state.spawnCreateError = new Error("ECONNRESET; context from earlier attempt: fm-spawn exit 1");
+    const result = await host.harness.behavior.runCli(["dispatch", "--project", ctx.projectId, "--task-id", TASK, "--", "fix login"], ctx);
+    assert.equal(result.exitCode, 1);
+    assert.equal(state.spawned, 0);
     assert.equal(launchStore(host).forTask(ctx.projectId, ctx.threadId, TASK)?.state, "uncertain");
   } finally {
     await host.harness.lifecycle.dispose();
