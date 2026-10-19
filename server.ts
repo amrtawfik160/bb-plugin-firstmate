@@ -25,6 +25,8 @@ import {
   looksReadOnly,
   foldOpenDecisions,
   latestStatus,
+  statusLineNote,
+  statusLineVerb,
   mergeGate,
   parseOutcome,
   verdictMarker,
@@ -6262,7 +6264,7 @@ export default async function plugin(bb: BbPluginApi) {
     sourceRef: z.string().optional(), questionFinished: z.boolean().default(false),
   });
 
-  type AskNativeHoldResult = "applied" | "shared" | "gone" | "not-native";
+  type AskNativeHoldResult = "applied" | "shared" | "gone" | "not-native" | "steer";
 
   function crewIdFromWaitRef(sourceRef: string | undefined): string | undefined {
     if (!sourceRef?.startsWith("crew-wait:")) return undefined;
@@ -6325,9 +6327,13 @@ export default async function plugin(bb: BbPluginApi) {
           const { lines, kind } = await crewStatusLines(crew);
           return foldOpenDecisions(lines, kind).some((d) => d.key === id && sourceRef === `crew-wait:${statusKey(crew.id, d.note)}`);
         };
-        for (const id of plan.holds) if (await sameQuestion(id)) await release(id);
+        const openIds: string[] = [];
+        for (const id of new Set([...plan.holds, ...plan.keys])) if (await sameQuestion(id)) openIds.push(id);
+        // Historical match is not an open decision or hold. Do not claim applied; the caller steers.
+        if (openIds.length === 0 && !plan.shared) return "steer";
+        for (const id of plan.holds) if (openIds.includes(id)) await release(id);
         for (const id of plan.keys) {
-          if (await sameQuestion(id) && !(await appendResolvedStatus(crew, id, resolution))) throw new Error(`Could not resolve crew status for ${ask.id}.`);
+          if (openIds.includes(id) && !(await appendResolvedStatus(crew, id, resolution))) throw new Error(`Could not resolve crew status for ${ask.id}.`);
         }
         // A shared hold can remain pending after this question's own mutations are complete.
         plan.questionFinished = true;
@@ -6343,6 +6349,29 @@ export default async function plugin(bb: BbPluginApi) {
     } finally {
       if (staged) await runOnHost(hostId, `rm -f ${shQuote(path)}`, 10_000).catch(() => {});
     }
+  }
+
+  function lastResolvedNote(lines: string[], key: string): string {
+    let note = "";
+    for (const line of lines) {
+      if (statusLineVerb(line).toLowerCase() !== "resolved") continue;
+      if (/\[key=([^\]]*)\]/.exec(line)?.[1] === key) note = statusLineNote(line);
+    }
+    return note;
+  }
+
+  async function nativeCorrectionText(ask: OwnerAsk, crew: Crew): Promise<string> {
+    const { lines, kind } = await crewStatusLines(crew);
+    const matching = lines.flatMap((line) => foldOpenDecisions([line], kind))
+      .filter((d) => ask.sourceRef === `crew-wait:${statusKey(crew.id, d.note)}`);
+    const key = matching.at(-1)?.key;
+    const previous = key !== undefined ? lastResolvedNote(lines, key) : "";
+    const next = ask.resolution;
+    if (key !== undefined && previous !== "") {
+      return `The owner corrected card ${ask.id} question ${key}: was ${previous}, now ${next}`;
+    }
+    if (key !== undefined) return `The owner corrected card ${ask.id} question ${key}: now ${next}`;
+    return `The owner corrected card ${ask.id}: now ${next}`;
   }
 
   async function releaseClosedAskHold(ask: OwnerAsk): Promise<boolean> {
@@ -9665,12 +9694,15 @@ export default async function plugin(bb: BbPluginApi) {
         if (crew === undefined || crew.parentThreadId !== ask.captain) {
           return { status: "retryable", error: "crew not found for steering queue" };
         }
+        const text = result === "steer"
+          ? await nativeCorrectionText(ask, crew)
+          : `The owner answered card ${ask.id}: ${ask.resolution}`;
         try {
           await bb.sdk.threads.send({
             threadId: crew.threadId,
             senderThreadId: crew.parentThreadId ?? undefined,
             mode: "queue-if-active",
-            input: [{ type: "text", text: `The owner answered card ${ask.id}: ${ask.resolution}`.slice(0, MAX_TASK), mentions: [] }],
+            input: [{ type: "text", text: text.slice(0, MAX_TASK), mentions: [] }],
           });
           return { status: "completed" };
         } catch (error) {

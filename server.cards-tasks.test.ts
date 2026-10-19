@@ -476,21 +476,111 @@ test("an owner answer on a workstream crew's card reaches that crew", async () =
 });
 
 test("reopen then owner re-answer releases the hold with the new answer", async () => {
-  const { host, tasks, asks, commands, restore } = await captainHost({ wait1: "needs-decision [key=choice]: Choose Postgres or SQLite? {\"choices\":[\"Postgres\",\"SQLite\"]}\n" });
+  const status = { wait1: "needs-decision [key=choice]: Choose Postgres or SQLite? {\"choices\":[\"Postgres\",\"SQLite\"]}\n" };
+  const { host, tasks, asks, commands, restore } = await captainHost(status);
+  let held = true;
+  host.harness.sdk.stub("terminals.output", async ({ terminalId }: { terminalId: string }) => {
+    const command = commands[Number(terminalId.replace("term", "")) - 1] ?? "";
+    let code = 0;
+    if (command.includes("fm-captain-hold.sh") && command.includes("'open'")) code = command.includes("'choice'") && held ? 0 : 1;
+    if (command.includes("fm-captain-hold.sh") && command.includes("'answer'") && command.includes("'choice'")) held = false;
+    const payload = command.includes("fm-bearings-snapshot.sh")
+      ? JSON.stringify({ schema: "fm-bearings.v1", home: "/native", in_flight: [], decisions_open: [], landed: [], gates: [], omitted: [] })
+      : command.includes("/native/state/wait1.status") ? status.wait1 : "";
+    const captured = command.includes("FM_HOST_CAPTURE_V1");
+    const out = captured ? JSON.stringify({ protocol: "FM_HOST_CAPTURE_V1", exitCode: code, stdout: payload, stderr: "" }) : payload;
+    return { nextSeq: 1, chunks: [{ dataBase64: Buffer.from(`${out}\n__FM_HOST_RC:${captured ? 0 : code}\n`).toString("base64") }] };
+  });
   try {
     await host.bb.storage.kv.set("crews", [crewRow("wait1", "thr_w1")]);
     const task = tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Database", sourceRefs: [], crewId: "wait1", at: Date.now() });
     await host.harness.behavior.runSchedule("task-lifecycle");
     const card = asks.listOpen("thr_cap").find((ask) => ask.task === task.id)!;
     assert.equal((await host.harness.behavior.callRpc("resolveAsk", { threadId: "thr_cap", id: card.id, resolution: "Postgres" })).ok, true);
+    assert.equal(held, false);
+    status.wait1 += "resolved [key=choice]: Postgres\n";
     const first = commands.filter((c) => c.includes("fm-captain-hold.sh") && c.includes("'answer'")).length;
     assert.ok(first > 0);
+    const sendsBefore = host.harness.sdk.callsTo("threads.send").length;
     await tool(host, "firstmate_resolve_ask").execute({ id: card.id, resolution: "Recorded by mistake", reopen: true }, ctx);
     assert.equal(asks.get(card.id)?.state, "open");
     assert.equal((await host.harness.behavior.callRpc("resolveAsk", { threadId: "thr_cap", id: card.id, resolution: "SQLite" })).ok, true);
     const answers = commands.filter((c) => c.includes("fm-captain-hold.sh") && c.includes("'answer'"));
-    assert.ok(answers.length > first, "re-answer must release the hold again");
-    assert.ok(commands.some((c) => c.includes("U1FMaXRl")), "the new answer written for the hold is SQLite");
+    assert.equal(answers.length, first, "a closed native hold is not released again");
+    const steers = host.harness.sdk.callsTo("threads.send").slice(sendsBefore)
+      .map((call) => call[0] as { threadId: string; mode?: string; input: Array<{ text: string }> })
+      .filter((send) => send.threadId === "thr_w1");
+    assert.ok(steers.some((send) => send.mode === "queue-if-active" && send.input[0]?.text.includes("choice") && send.input[0]?.text.includes("Postgres") && send.input[0]?.text.includes("SQLite")), "the crew is told the question key, the old answer and the new answer");
+    assert.deepEqual(asks.pendingFollowUps(), []);
+  } finally { restore(); await host.harness.lifecycle.dispose(); }
+});
+
+test("checker round5 P5: a resolved native question receives the reopened card's new answer",async()=>{
+ const status={wait1:'needs-decision [key=choice]: Choose? {"choices":["Postgres","SQLite"]}\n'};
+ const {host,tasks,asks,commands,restore}=await captainHost(status);let held=true;
+ host.harness.sdk.stub("terminals.output",async({terminalId}:{terminalId:string})=>{
+  const command=commands[Number(terminalId.replace("term",""))-1]??"";
+  let code=0;
+  if(command.includes("fm-captain-hold.sh")&&command.includes("'open'"))code=command.includes("'choice'")&&held?0:1;
+  if(command.includes("fm-captain-hold.sh")&&command.includes("'answer'")&&command.includes("'choice'"))held=false;
+  const payload=command.includes("fm-bearings-snapshot.sh")?JSON.stringify({schema:"fm-bearings.v1",home:"/native",in_flight:[],decisions_open:[],landed:[],gates:[],omitted:[]}):command.includes("/native/state/wait1.status")?status.wait1:"";
+  const captured=command.includes("FM_HOST_CAPTURE_V1");const out=captured?JSON.stringify({protocol:"FM_HOST_CAPTURE_V1",exitCode:code,stdout:payload,stderr:""}):payload;
+  return {nextSeq:1,chunks:[{dataBase64:Buffer.from(`${out}\n__FM_HOST_RC:${captured?0:code}\n`).toString("base64")}]};
+ });
+ try{
+  await host.bb.storage.kv.set("crews",[crewRow("wait1","thr_w1")]);const task=tasks.open({captain:"thr_cap",project:"Cyndra",title:"Database",sourceRefs:[],crewId:"wait1",at:Date.now()});
+  await host.harness.behavior.runSchedule("task-lifecycle");const card=asks.listOpen("thr_cap").find(ask=>ask.task===task.id)!;
+  await host.harness.behavior.callRpc("resolveAsk",{threadId:"thr_cap",id:card.id,resolution:"Postgres"});assert.equal(held,false);
+  status.wait1+='resolved [key=choice]: Postgres\n';
+  const before=commands.length;const sendsBefore=host.harness.sdk.callsTo("threads.send").length;
+  await tool(host,"firstmate_resolve_ask").execute({id:card.id,reopen:true,resolution:"Correct the answer"},ctx);
+  await host.harness.behavior.callRpc("resolveAsk",{threadId:"thr_cap",id:card.id,resolution:"SQLite"});
+  const nativeNew=commands.slice(before).filter(command=>command.includes("fm-captain-hold.sh")&&command.includes("'answer'"));
+  const newSteers=host.harness.sdk.callsTo("threads.send").slice(sendsBefore).filter(call=>JSON.stringify(call).includes("thr_w1")&&JSON.stringify(call).includes("SQLite"));
+  console.log("CHECKER R5 real native reopen",JSON.stringify({stored:asks.get(card.id)?.resolution,nativeNew:nativeNew.length,newSteers:newSteers.length,pending:asks.pendingFollowUps()}));
+  assert.ok(nativeNew.length>0||newSteers.length>0,"a second answer must reach the crew after the first native decision and hold are resolved");
+ }finally{restore();await host.harness.lifecycle.dispose();}
+});
+
+test("a correction to a resolved native question stays pending until the crew queue accepts it", async () => {
+  const status = { wait1: "needs-decision [key=choice]: Choose? {\"choices\":[\"Postgres\",\"SQLite\"]}\n" };
+  const { host, tasks, asks, commands, restore } = await captainHost(status);
+  let held = true;
+  host.harness.sdk.stub("terminals.output", async ({ terminalId }: { terminalId: string }) => {
+    const command = commands[Number(terminalId.replace("term", "")) - 1] ?? "";
+    let code = 0;
+    if (command.includes("fm-captain-hold.sh") && command.includes("'open'")) code = command.includes("'choice'") && held ? 0 : 1;
+    if (command.includes("fm-captain-hold.sh") && command.includes("'answer'") && command.includes("'choice'")) held = false;
+    const payload = command.includes("fm-bearings-snapshot.sh")
+      ? JSON.stringify({ schema: "fm-bearings.v1", home: "/native", in_flight: [], decisions_open: [], landed: [], gates: [], omitted: [] })
+      : command.includes("/native/state/wait1.status") ? status.wait1 : "";
+    const captured = command.includes("FM_HOST_CAPTURE_V1");
+    const out = captured ? JSON.stringify({ protocol: "FM_HOST_CAPTURE_V1", exitCode: code, stdout: payload, stderr: "" }) : payload;
+    return { nextSeq: 1, chunks: [{ dataBase64: Buffer.from(`${out}\n__FM_HOST_RC:${captured ? 0 : code}\n`).toString("base64") }] };
+  });
+  try {
+    await host.bb.storage.kv.set("crews", [crewRow("wait1", "thr_w1")]);
+    const task = tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Database", sourceRefs: [], crewId: "wait1", at: Date.now() });
+    await host.harness.behavior.runSchedule("task-lifecycle");
+    const card = asks.listOpen("thr_cap").find((ask) => ask.task === task.id)!;
+    await host.harness.behavior.callRpc("resolveAsk", { threadId: "thr_cap", id: card.id, resolution: "Postgres" });
+    status.wait1 += "resolved [key=choice]: Postgres\n";
+    let failSteer = true;
+    const realSend = async () => ({ delivery: "queued" as const });
+    host.harness.sdk.stub("threads.send", async (input: { threadId: string; input: Array<{ text: string }> }) => {
+      if (failSteer && input.threadId === "thr_w1" && JSON.stringify(input).includes("SQLite")) throw new Error("queue down");
+      return realSend();
+    });
+    await tool(host, "firstmate_resolve_ask").execute({ id: card.id, reopen: true, resolution: "Correct the answer" }, ctx);
+    await host.harness.behavior.callRpc("resolveAsk", { threadId: "thr_cap", id: card.id, resolution: "SQLite" });
+    assert.ok(asks.pendingFollowUps().some((job) => job.askId === card.id && job.effect === "owner-answered"), "a failed correction stays pending");
+    failSteer = false;
+    await host.harness.behavior.runSchedule("task-lifecycle");
+    assert.deepEqual(asks.pendingFollowUps(), []);
+    const steers = host.harness.sdk.callsTo("threads.send")
+      .map((call) => call[0] as { threadId: string; input: Array<{ text: string }> })
+      .filter((send) => send.threadId === "thr_w1" && send.input[0]?.text.includes("SQLite"));
+    assert.ok(steers.length >= 1);
   } finally { restore(); await host.harness.lifecycle.dispose(); }
 });
 
