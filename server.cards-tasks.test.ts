@@ -762,6 +762,133 @@ test("checker round7: a restart between two corrections delivers both in order o
   }
 });
 
+async function checkerReload(previous: Awaited<ReturnType<typeof captainHost>>["host"], statusText="needs-decision [key=choice]: Choose Postgres, MySQL or SQLite?\n") {
+  const next=await previous.harness.lifecycle.reload(plugin);
+  next.harness.sdk.stub("threads.getPluginMetadata",async({threadId}: {threadId:string})=>threadId==="thr_cap"?{captain:"true"}:{});
+  next.harness.sdk.stub("threads.list",async()=>[]);
+  next.harness.sdk.stub("threads.get",async({threadId}: {threadId:string})=>makeThreadResponse({id:threadId,projectId:"proj_1",status:"idle"}));
+  next.harness.sdk.stub("threads.output",async()=>({output:""}));
+  next.harness.sdk.stub("environments.list",async()=>[{id:"env_source",hostId:"host_1",status:"ready",isWorktree:false,path:"/repo"}]);
+  next.harness.sdk.stub("projects.get",async()=>({id:"proj_1",name:"Cyndra",kind:"repo"}));
+  next.harness.sdk.stub("files.read",async({path}: {path:string})=>{if(path==="/native/data/captain.md")return {content:CAPTAIN_MD,sizeBytes:CAPTAIN_MD.length};throw new Error("ENOENT");});
+  next.harness.sdk.stub("plugins.callRpc",async()=>({ok:true,queued:1,duplicate:false}));
+  const byId=new Map<string,string>();let seq=0;
+  next.harness.sdk.stub("terminals.create",async(args: {start:{command:string}})=>{const id=`reload-${++seq}`;byId.set(id,args.start.command);return {id};});
+  next.harness.sdk.stub("terminals.get",async()=>({status:"running"}));
+  next.harness.sdk.stub("terminals.close",async()=>({}));
+  next.harness.sdk.stub("terminals.output",async({terminalId}: {terminalId:string})=>{
+    const command=byId.get(terminalId)??"";
+    const payload=command.includes("/native/state/wait1.status")?statusText:"";
+    const code=command.includes("fm-captain-hold.sh")&&command.includes("'open'")&&command.includes("'wait1'")?1:0;
+    const captured=command.includes("FM_HOST_CAPTURE_V1");
+    const out=captured?JSON.stringify({protocol:"FM_HOST_CAPTURE_V1",exitCode:code,stdout:payload,stderr:""}):payload;
+    return {nextSeq:1,chunks:[{dataBase64:Buffer.from(`${out}\n__FM_HOST_RC:${captured?0:code}\n`).toString("base64")}]};
+  });
+  return next;
+}
+
+async function checkerAcceptCorrection(host:Awaited<ReturnType<typeof captainHost>>["host"],id:string,answer:string){
+ await tool(host,"firstmate_resolve_ask").execute({id,reopen:true,resolution:"Correction"},ctx);
+ return host.harness.behavior.callRpc("resolveAsk",{threadId:"thr_cap",id,resolution:answer});
+}
+
+test("checker round8: three corrections with a slow first send stay in answer order",async()=>{
+ const {host,asks,card,restore}=await checkerCorrectionFixture();let release=()=>{};const gate=new Promise<void>(resolve=>{release=resolve;});let first:Promise<unknown>|undefined;let started=0;const accepted:string[]=[];
+ try{
+  host.harness.sdk.stub("threads.send",async(input:{threadId:string;input:Array<{text:string}>})=>{if(input.threadId==="thr_w1"){started++;if(started===1)await gate;accepted.push(input.input[0].text);}return {delivery:"queued"};});
+  first=checkerAcceptCorrection(host,card.id,"SQLite");for(let i=0;i<30&&started===0;i++)await new Promise(resolve=>setImmediate(resolve));assert.equal(started,1);
+  // Let a correct implementation leave these RPCs pending behind the first answer.
+  const second=checkerAcceptCorrection(host,card.id,"Postgres");for(let i=0;i<12;i++)await new Promise(resolve=>setImmediate(resolve));
+  const third=checkerAcceptCorrection(host,card.id,"SQLite");for(let i=0;i<12;i++)await new Promise(resolve=>setImmediate(resolve));
+  release();await Promise.all([first,second,third]);await host.harness.behavior.runSchedule("task-lifecycle");
+  console.log("CHECKER R8 order",JSON.stringify(accepted));assert.equal(accepted.length,3);
+  assert.deepEqual(accepted.map(text=>text.split(": was ")[1]),["Postgres, now SQLite","SQLite, now Postgres","Postgres, now SQLite"],"corrections must be accepted by the crew queue in owner-answer order");
+  assert.equal(asks.pendingFollowUps().length,0);
+ }finally{release();if(first)await first.catch(()=>{});await host.harness.lifecycle.dispose();restore();}
+});
+
+function checkerLegacyTable(host:Awaited<ReturnType<typeof captainHost>>["host"]){
+ const db=host.bb.storage.database();db.exec(`ALTER TABLE owner_ask_followup RENAME TO owner_ask_followup_v8;
+ CREATE TABLE owner_ask_followup (ask_id TEXT NOT NULL,effect TEXT NOT NULL,state TEXT NOT NULL,error TEXT,created_at INTEGER NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,first_failed_at INTEGER,noticed INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(ask_id,effect));
+ INSERT INTO owner_ask_followup SELECT ask_id,effect,state,error,created_at,attempts,first_failed_at,noticed FROM owner_ask_followup_v8;
+ DROP TABLE owner_ask_followup_v8;`);
+ return createOwnerAsks(db);
+}
+
+test("checker round8: a legacy pending row migrates and delivers once",async()=>{
+ const {host,asks,restore}=await captainHost();try{
+  await host.bb.storage.kv.set("crews",[crewRow("target","thr_target",{workstreamId:"ws-1"})]);
+  const card=asks.create({captain:"thr_cap",kind:"question",text:"Choose?",options:[{label:"A",value:"a"}],sourceRef:"crew-wait:target:question",createdAt:1});asks.resolve(card.id,"thr_cap","answered","A",2,"owner");
+  const migrated=checkerLegacyTable(host);assert.equal(migrated.pendingFollowUps()[0].answerSeq,1);
+  await host.harness.behavior.runSchedule("task-lifecycle");await host.harness.behavior.runSchedule("task-lifecycle");await host.harness.behavior.callRpc("resolveAsk",{threadId:"thr_cap",id:card.id,resolution:"A"});
+  assert.equal(host.harness.sdk.callsTo("threads.send").filter(call=>JSON.stringify(call).includes("thr_target")).length,1);assert.equal(migrated.pendingFollowUps().length,0);
+ }finally{await host.harness.lifecycle.dispose();restore();}
+});
+
+test("checker round8: reopening a migrated delivered card retains its actual previous answer",async()=>{
+ const {host,card,restore}=await checkerCorrectionFixture();try{
+  checkerLegacyTable(host);const before=host.harness.sdk.callsTo("threads.send").length;
+  await checkerAcceptCorrection(host,card.id,"SQLite");const messages=host.harness.sdk.callsTo("threads.send").slice(before).map(call=>call[0] as {threadId:string;input:Array<{text:string}>}).filter(call=>call.threadId==="thr_w1");
+  console.log("CHECKER R8 legacy pair",JSON.stringify(messages.map(message=>message.input[0].text)));
+  assert.equal(messages.length,1);assert.match(messages[0].input[0].text,/was Postgres, now SQLite/,"upgrade must retain the previous owner answer before reopening clears the card");
+ }finally{await host.harness.lifecycle.dispose();restore();}
+});
+
+test("checker round8: an earlier native completion plan cannot consume the corrected answer",async()=>{
+ const state={text:'needs-decision [key=choice]: Choose? {"choices":["Postgres","SQLite"]}\n',held:true,attempts:0};
+ const {host,tasks,asks,commands,restore}=await captainHost({wait1:state.text});
+ host.harness.sdk.stub("terminals.output",async({terminalId}:{terminalId:string})=>{
+  const command=commands[Number(terminalId.replace("term",""))-1]??"";let code=0;
+  if(command.includes("fm-captain-hold.sh")&&command.includes("'open'"))code=command.includes("'choice'")&&state.held?0:1;
+  if(command.includes("fm-captain-hold.sh")&&command.includes("'answer'")&&command.includes("'choice'")){state.attempts++;code=state.attempts===1?2:0;if(code===0)state.held=false;}
+  if(command.includes("resolved [key=choice]: Postgres")&&command.includes(">>"))state.text+='resolved [key=choice]: Postgres\n';
+  const payload=command.includes("fm-bearings-snapshot.sh")?JSON.stringify({schema:"fm-bearings.v1",home:"/native",in_flight:[],decisions_open:[],landed:[],gates:[],omitted:[]}):command.includes("/native/state/wait1.status")?state.text:"";
+  const captured=command.includes("FM_HOST_CAPTURE_V1");const out=captured?JSON.stringify({protocol:"FM_HOST_CAPTURE_V1",exitCode:code,stdout:payload,stderr:""}):payload;
+  return {nextSeq:1,chunks:[{dataBase64:Buffer.from(`${out}\n__FM_HOST_RC:${captured?0:code}\n`).toString("base64")}]};
+ });
+ try{
+  await host.bb.storage.kv.set("crews",[crewRow("wait1","thr_w1")]);const task=tasks.open({captain:"thr_cap",project:"Cyndra",title:"Database",sourceRefs:[],crewId:"wait1",at:Date.now()});await host.harness.behavior.runSchedule("task-lifecycle");const card=asks.listOpen("thr_cap").find(ask=>ask.task===task.id)!;
+  await host.harness.behavior.callRpc("resolveAsk",{threadId:"thr_cap",id:card.id,resolution:"Postgres"});assert.ok(asks.pendingFollowUps().some(job=>job.effect==="owner-answered"));
+  const sends=host.harness.sdk.callsTo("threads.send").length;await checkerAcceptCorrection(host,card.id,"SQLite");
+  const corrected=host.harness.sdk.callsTo("threads.send").slice(sends).filter(call=>JSON.stringify(call).includes("thr_w1")&&JSON.stringify(call).includes("now SQLite"));
+  console.log("CHECKER R8 native plan",JSON.stringify({attempts:state.attempts,corrections:corrected.length,pending:asks.pendingFollowUps(),stored:asks.get(card.id)?.resolution}));
+  assert.equal(state.attempts,2);assert.equal(corrected.length,1,"the completed plan for the old native answer must not complete the new correction");
+ }finally{await host.harness.lifecycle.dispose();restore();}
+});
+
+
+test("checker round8: three sequential corrections survive restart between answers",async()=>{
+ const fixture=await checkerCorrectionFixture();const {card,state,restore}=fixture;let active=fixture.host;const hosts=[active];const received:string[]=[];
+ const sending=async(input:{threadId:string;input:Array<{text:string}>})=>{if(input.threadId==="thr_w1")received.push(input.input[0].text);return {delivery:"queued"};};
+ try{
+  for(const answer of ["SQLite","Postgres","SQLite"]){active.harness.sdk.stub("threads.send",sending);await checkerAcceptCorrection(active,card.id,answer);await active.harness.behavior.callRpc("resolveAsk",{threadId:"thr_cap",id:card.id,resolution:answer});active=await checkerReload(active,state.text);hosts.push(active);for(let i=0;i<12;i++)await new Promise(resolve=>setImmediate(resolve));}
+  assert.deepEqual(received.map(text=>text.split(": was ")[1]),["Postgres, now SQLite","SQLite, now Postgres","Postgres, now SQLite"]);assert.equal(createOwnerAsks(active.bb.storage.database()).pendingFollowUps().length,0);
+ }finally{for(const h of hosts)await h.harness.lifecycle.dispose();restore();}
+});
+
+test("checker round8: restart after queue acceptance before send response does not enqueue twice",async()=>{
+ const {host,card,state,restore}=await checkerCorrectionFixture();let next;let release=()=>{};const gate=new Promise<void>(resolve=>{release=resolve;});let accepted=0;let first:Promise<unknown>|undefined;
+ try{
+  host.harness.sdk.stub("threads.send",async(input:{threadId:string})=>{if(input.threadId==="thr_w1"){accepted++;await gate;}return {delivery:"queued"};});
+  first=checkerAcceptCorrection(host,card.id,"SQLite").catch(()=>{});for(let i=0;i<30&&accepted===0;i++)await new Promise(resolve=>setImmediate(resolve));assert.equal(accepted,1);
+  next=await checkerReload(host,state.text);next.harness.sdk.stub("threads.send",async(input:{threadId:string})=>{if(input.threadId==="thr_w1")accepted++;return {delivery:"queued"};});
+  for(let i=0;i<12;i++)await new Promise(resolve=>setImmediate(resolve));await next.harness.behavior.runSchedule("task-lifecycle");
+  const newCalls=next.harness.sdk.callsTo("threads.send").filter(call=>JSON.stringify(call).includes("thr_w1"));console.log("CHECKER R8 in-flight restart",JSON.stringify({accepted,newCalls:newCalls.length,pending:createOwnerAsks(next.bb.storage.database()).pendingFollowUps()}));
+  assert.equal(newCalls.length,0,"a correction already accepted by the queue before restart must not be queued again");
+ }finally{release();if(first)await first;if(next)await next.harness.lifecycle.dispose();await host.harness.lifecycle.dispose();restore();}
+});
+
+test("checker round8: a migrated pending answer keeps its value when the owner corrects before retry",async()=>{
+ const {host,asks,restore}=await captainHost();const received:string[]=[];
+ try{
+  await host.bb.storage.kv.set("crews",[crewRow("target","thr_target",{workstreamId:"ws-1"})]);
+  const card=asks.create({captain:"thr_cap",kind:"question",text:"Choose?",options:[{label:"A",value:"a"},{label:"B",value:"b"}],sourceRef:"crew-wait:target:question",createdAt:1});asks.resolve(card.id,"thr_cap","answered","A",2,"owner");
+  checkerLegacyTable(host);host.harness.sdk.stub("threads.send",async(input:{threadId:string;input:Array<{text:string}>})=>{if(input.threadId==="thr_target")received.push(input.input[0].text);return {delivery:"queued"};});
+  await checkerAcceptCorrection(host,card.id,"B");await host.harness.behavior.runSchedule("task-lifecycle");console.log("CHECKER R8 legacy pending correction",JSON.stringify(received));
+  assert.deepEqual(received,[`The owner answered card ${card.id}: A`,`The owner answered card ${card.id}: B`],"each accepted answer must retain its own value across upgrade and correction");
+ }finally{await host.harness.lifecycle.dispose();restore();}
+});
+
 test("checker round3: failed prose-question notice is retried until a card can be made", async () => {
   const {host,tasks,asks,restore}=await captainHost({wait1:"needs-decision [key=choice]: Choose Postgres, MySQL or SQLite?\n"});
   let attempts=0;

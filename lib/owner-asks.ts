@@ -377,12 +377,16 @@ export function createOwnerAsks(db: Database): OwnerAsks {
         previous TEXT, resolution TEXT,
         PRIMARY KEY (ask_id, answer_seq, effect));
         INSERT INTO owner_ask_followup_new (ask_id, answer_seq, effect, state, error, created_at, attempts, first_failed_at, noticed, previous, resolution)
-        SELECT ask_id, 1, effect, state, error, created_at, COALESCE(attempts, 0), first_failed_at, COALESCE(noticed, 0), NULL, NULL FROM owner_ask_followup;
+        SELECT f.ask_id, 1, f.effect, f.state, f.error, f.created_at, COALESCE(f.attempts, 0), f.first_failed_at, COALESCE(f.noticed, 0), NULL, NULLIF(TRIM(a.resolution), '')
+        FROM owner_ask_followup f LEFT JOIN owner_ask a ON a.id = f.ask_id;
         DROP TABLE owner_ask_followup;
         ALTER TABLE owner_ask_followup_new RENAME TO owner_ask_followup;`);
     } else {
       if (!cols.has("previous")) db.exec("ALTER TABLE owner_ask_followup ADD COLUMN previous TEXT");
-      if (!cols.has("resolution")) db.exec("ALTER TABLE owner_ask_followup ADD COLUMN resolution TEXT");
+      if (!cols.has("resolution")) {
+        db.exec("ALTER TABLE owner_ask_followup ADD COLUMN resolution TEXT");
+        db.exec(`UPDATE owner_ask_followup SET resolution = (SELECT NULLIF(TRIM(resolution), '') FROM owner_ask WHERE owner_ask.id = owner_ask_followup.ask_id) WHERE resolution IS NULL`);
+      }
     }
   }
 

@@ -180,6 +180,22 @@ test("follow-up rows from the old card-effect key migrate to sequence 1", () => 
   assert.equal(pending[0]?.askId, "a1");
 });
 
+test("legacy follow-up rows keep the card's recorded answer at migration", () => {
+  const raw = new DatabaseSync(":memory:");
+  raw.exec(`CREATE TABLE owner_ask (id TEXT PRIMARY KEY, captain TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL, options TEXT NOT NULL, recommended INTEGER, default_at INTEGER, irreversible INTEGER NOT NULL, state TEXT NOT NULL, resolution TEXT, created_at INTEGER NOT NULL, resolved_at INTEGER);
+    INSERT INTO owner_ask VALUES ('a1','thr_cap','question','q','[{"label":"Postgres","value":"a"}]',NULL,NULL,0,'answered','Postgres',${NOW},${NOW});
+    CREATE TABLE owner_ask_followup (
+      ask_id TEXT NOT NULL, effect TEXT NOT NULL, state TEXT NOT NULL, error TEXT, created_at INTEGER NOT NULL,
+      PRIMARY KEY (ask_id, effect));
+    INSERT INTO owner_ask_followup VALUES ('a1','owner-answered','done',NULL,${NOW});`);
+  const asks = createOwnerAsks(db(raw));
+  asks.resolve("a1", "thr_cap", "open", "Reopen", NOW + 1);
+  asks.resolve("a1", "thr_cap", "answered", "SQLite", NOW + 2, "owner");
+  const correction = asks.pendingFollowUps().find((job) => job.effect === "owner-answered" && job.answerSeq === 2);
+  assert.equal(correction?.previous, "Postgres");
+  assert.equal(correction?.resolution, "SQLite");
+});
+
 test("a defaulted ask keeps an untold captain notice until it is marked told", () => {
   const asks = createOwnerAsks(db());
   asks.create({ id: "a1", captain: "thr_cap", kind: "question", text: "q", options: [{ label: "Yes", value: "yes" }], recommended: 0, defaultAt: NOW - 1, createdAt: NOW - 10 });

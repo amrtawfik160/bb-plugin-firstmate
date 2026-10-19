@@ -9599,7 +9599,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /** The owner answered an ask by tap or reply. A device proof card's Works records his proof. */
-  async function ownerAnsweredAsk(askId: string, resolution: string, previous = ""): Promise<FollowUpResult> {
+  async function ownerAnsweredAsk(askId: string, resolution: string, previous = "", answerSeq = 1): Promise<FollowUpResult> {
     const ask = ownerAsks.get(askId);
     const key = `${DEVICE_PROOF_PREFIX}${askId}`;
     const proof = await bb.storage.kv.get<DeviceProof>(key);
@@ -9665,8 +9665,12 @@ export default async function plugin(bb: BbPluginApi) {
       return { status: "completed" };
     }
     if (ask?.sourceRef?.startsWith("crew-wait:") && resolution) {
+      // SDK has no idempotent-send key: record card+seq before the queue call so restart
+      // does not enqueue a correction the crew queue already accepted.
+      const sentKey = `owner-answer-sent:${ask.id}:${answerSeq}`;
+      if (await bb.storage.kv.get(sentKey) !== undefined) return { status: "completed" };
       try {
-        const result = await applyAskNativeHold(ask, resolution, `owner-answer-native:${ask.id}`, "owner answer hold");
+        const result = await applyAskNativeHold(ask, resolution, `owner-answer-native:${ask.id}:${answerSeq}`, "owner answer hold");
         if (result === "shared") return { status: "retryable", error: "native hold still shared with another question" };
         if (result === "applied") return { status: "completed" };
         const crewId = crewIdFromWaitRef(ask.sourceRef)!;
@@ -9686,6 +9690,7 @@ export default async function plugin(bb: BbPluginApi) {
           ? await nativeCorrectionText(ask, crew, previous, resolution)
           : `The owner answered card ${ask.id}: ${resolution}`;
         try {
+          await bb.storage.kv.set(sentKey, { at: Date.now() });
           await bb.sdk.threads.send({
             threadId: crew.threadId,
             senderThreadId: crew.parentThreadId ?? undefined,
@@ -9694,6 +9699,7 @@ export default async function plugin(bb: BbPluginApi) {
           });
           return { status: "completed" };
         } catch (error) {
+          await bb.storage.kv.delete(sentKey).catch(() => {});
           return { status: "retryable", error: error instanceof Error ? error.message : String(error) };
         }
       } catch (error) {
@@ -9706,16 +9712,27 @@ export default async function plugin(bb: BbPluginApi) {
   const followUpInFlight = new Map<string, Promise<FollowUpResult>>();
   const ASK_FOLLOWUP_WAIT_MS = STUCK_HOST_CALL_MS;
 
+  function earlierAnswerPending(job: AskFollowUp): boolean {
+    return ownerAsks.pendingFollowUps().some((other) => other.askId === job.askId && other.answerSeq < job.answerSeq);
+  }
+
   function drainAskFollowUps(): Promise<void> {
-    const groups = new Map<string, AskFollowUp[]>();
-    for (const job of ownerAsks.pendingFollowUps()) {
-      const list = groups.get(job.askId) ?? [];
-      list.push(job);
-      groups.set(job.askId, list);
-    }
-    return Promise.all([...groups].map(async ([askId, jobs]) => {
+    const askIds = [...new Set(ownerAsks.pendingFollowUps().map((job) => job.askId))];
+    return Promise.all(askIds.map(async (askId) => {
       try {
-        for (const job of jobs) await runAskFollowUp(job);
+        const seen = new Set<string>();
+        for (;;) {
+          const job = ownerAsks.pendingFollowUps().find((candidate) => {
+            if (candidate.askId !== askId) return false;
+            const key = `${candidate.askId}:${candidate.answerSeq}:${candidate.effect}`;
+            if (seen.has(key) || followUpInFlight.has(key)) return false;
+            if (earlierAnswerPending(candidate)) return false;
+            return true;
+          });
+          if (job === undefined) return;
+          seen.add(`${job.askId}:${job.answerSeq}:${job.effect}`);
+          await runAskFollowUp(job);
+        }
       } catch (error) {
         bb.log.warn(`ask follow-up drain ${askId}: ${String(error)}`);
       }
@@ -9755,9 +9772,9 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function executeAskFollowUp(job: AskFollowUp): Promise<FollowUpResult> {
     if (job.effect === "owner-answered") {
-      const resolution = (job.resolution ?? ownerAsks.get(job.askId)?.resolution ?? "").trim();
+      const resolution = (job.resolution ?? "").trim();
       if (!resolution) return { status: "completed" };
-      return ownerAnsweredAsk(job.askId, resolution, job.previous ?? "");
+      return ownerAnsweredAsk(job.askId, resolution, job.previous ?? "", job.answerSeq);
     }
     if (job.effect === "refresh-board") return runRefreshOwnerBoard();
     return { status: "completed" };
@@ -9768,6 +9785,7 @@ export default async function plugin(bb: BbPluginApi) {
       ownerAsks.failFollowUp(job.askId, job.effect, job.error ?? "timed out", undefined, job.answerSeq);
       return;
     }
+    if (earlierAnswerPending(job)) return;
     const key = `${job.askId}:${job.answerSeq}:${job.effect}`;
     const existing = followUpInFlight.get(key);
     if (existing !== undefined) return;
