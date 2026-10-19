@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { OWNER_APPROVAL_CONTEXT } from "../lib/owner-gate.ts";
-import { desiredProtection } from "../lib/github-protection.ts";
+import { desiredProtection, GITHUB_FREE_PLAN_REASON, GITHUB_FREE_PLAN_REPOS } from "../lib/github-protection.ts";
 
 const SCRIPT = new URL("./install-owner-approval.ts", import.meta.url).pathname;
 
@@ -124,14 +124,46 @@ test("the install script --apply PUTs Owner approval and keeps every existing ru
 test("the install script --apply does not PUT when required checks cannot be enforced", () => {
   const dir = mkdtempSync(join(tmpdir(), "owner-approval-gh-"));
   fakeGh(dir, existingGet, "forbidden");
-  const run = spawnSync(process.execPath, ["--experimental-strip-types", SCRIPT, "--apply", "--json", "--repo", "amrtawfik160/safi"], {
+  const run = spawnSync(process.execPath, ["--experimental-strip-types", SCRIPT, "--apply", "--json", "--repo", "example/private-repo"], {
     encoding: "utf8",
     env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
     timeout: 15_000,
   });
   assert.equal(run.status, 0, run.stderr + run.stdout);
-  const rows = JSON.parse(run.stdout) as Array<{ canEnforce: boolean; applied: boolean }>;
+  const rows = JSON.parse(run.stdout) as Array<{ canEnforce: boolean; applied: boolean; skipped?: boolean }>;
   assert.equal(rows[0]?.canEnforce, false);
   assert.equal(rows[0]?.applied, false);
+  assert.equal(rows[0]?.skipped, false);
+  assert.equal(existsSync(join(dir, "put.json")), false);
+});
+
+test("the install script skips GitHub free-plan repos with no gh call, no PUT, and no error", () => {
+  const dir = mkdtempSync(join(tmpdir(), "owner-approval-skip-"));
+  const bin = join(dir, "gh");
+  writeFileSync(bin, `#!/bin/sh
+printf '%s\\n' "$*" >> "${dir}/calls"
+echo 'gh must not run for a skipped repo' >&2
+exit 1
+`);
+  chmodSync(bin, 0o755);
+  for (const repo of GITHUB_FREE_PLAN_REPOS) {
+    const run = spawnSync(process.execPath, ["--experimental-strip-types", SCRIPT, "--apply", "--json", "--repo", repo], {
+      encoding: "utf8",
+      env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
+      timeout: 15_000,
+    });
+    assert.equal(run.status, 0, `${repo}: ${run.stderr}${run.stdout}`);
+    const rows = JSON.parse(run.stdout) as Array<{
+      repo: string; skipped?: boolean; canEnforce: boolean; applied: boolean; put: unknown; reason?: string; undoCommand?: string;
+    }>;
+    assert.equal(rows[0]?.repo, repo);
+    assert.equal(rows[0]?.skipped, true);
+    assert.equal(rows[0]?.canEnforce, false);
+    assert.equal(rows[0]?.applied, false);
+    assert.equal(rows[0]?.put, null);
+    assert.equal(rows[0]?.undoCommand, "none");
+    assert.equal(rows[0]?.reason, GITHUB_FREE_PLAN_REASON);
+  }
+  assert.equal(existsSync(join(dir, "calls")), false, "skip must not call gh");
   assert.equal(existsSync(join(dir, "put.json")), false);
 });

@@ -49,7 +49,7 @@ function withOwnerApproval(checks: Array<{ context: string; app_id?: number | nu
 
 function statusChecksPut(value: unknown, addOwner: boolean) {
   const row = value === null ? {} : asRecord(value);
-  const checks = addOwner ? withOwnerApproval(checksOf(row)) : checksOf(row).filter((item) => item.context !== OWNER_APPROVAL_CONTEXT);
+  const checks = addOwner ? withOwnerApproval(checksOf(row)) : checksOf(row);
   const contexts = [...new Set(checks.map((item) => item.context))];
   return {
     strict: row["strict"] === true,
@@ -151,6 +151,19 @@ export function mergeAllowedByRequiredStatus(input: {
   statuses: Readonly<Record<string, string>>;
 }): boolean {
   return input.requiredContexts.every((context) => input.statuses[context] === "success");
+}
+
+export const GITHUB_FREE_PLAN_REPOS = [
+  "amrtawfik160/dr.woo",
+  "amrtawfik160/safi",
+  "amrtawfik160/areliaa",
+  "amrtawfik160/bb-plugin-telegram",
+] as const;
+
+export const GITHUB_FREE_PLAN_REASON = "GitHub free plan: required checks are not available. Firstmate merge and Ship remain the gate.";
+
+export function isGithubFreePlanRepo(repo: string): boolean {
+  return GITHUB_FREE_PLAN_REPOS.some((named) => named.toLowerCase() === repo.trim().toLowerCase());
 }
 
 export function canEnforceRequiredChecks(error: { status: number; message: string } | null): { ok: boolean; reason?: string } {

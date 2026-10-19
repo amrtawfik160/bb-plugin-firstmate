@@ -4,6 +4,9 @@ import { OWNER_APPROVAL_CONTEXT } from "./owner-gate.ts";
 import {
   canEnforceRequiredChecks,
   desiredProtection,
+  GITHUB_FREE_PLAN_REASON,
+  GITHUB_FREE_PLAN_REPOS,
+  isGithubFreePlanRepo,
   mergeAllowedByRequiredStatus,
   protectionPutFromGet,
 } from "./github-protection.ts";
@@ -95,6 +98,41 @@ test("a personal private repo that GitHub refuses cannot be enforced", () => {
   assert.equal(canEnforceRequiredChecks({ status: 403, message: "Upgrade to GitHub Pro or make this repository public to enable this feature." }).ok, false);
   assert.equal(canEnforceRequiredChecks({ status: 404, message: "Branch not protected" }).ok, true);
   assert.equal(canEnforceRequiredChecks(null).ok, true);
+});
+
+test("undo keeps an existing Owner approval check and its app binding", () => {
+  const existing = {
+    required_status_checks: {
+      strict: true,
+      contexts: ["ci", OWNER_APPROVAL_CONTEXT],
+      checks: [{ context: "ci", app_id: 7 }, { context: OWNER_APPROVAL_CONTEXT, app_id: 9 }],
+    },
+    enforce_admins: { enabled: true },
+    required_pull_request_reviews: null,
+    restrictions: null,
+  };
+  const plan = desiredProtection(existing);
+  const undo = JSON.stringify(plan.undo);
+  assert.match(undo, /Owner approval/);
+  assert.match(undo, /"app_id":9/);
+  const checks = (plan.undo as { required_status_checks: { checks: Array<{ context: string; app_id?: number }> } }).required_status_checks.checks;
+  assert.ok(checks.some((check) => check.context === OWNER_APPROVAL_CONTEXT && check.app_id === 9));
+});
+
+test("GitHub free-plan repos are named and skipped without a retryable 403", () => {
+  assert.deepEqual([...GITHUB_FREE_PLAN_REPOS], [
+    "amrtawfik160/dr.woo",
+    "amrtawfik160/safi",
+    "amrtawfik160/areliaa",
+    "amrtawfik160/bb-plugin-telegram",
+  ]);
+  for (const repo of GITHUB_FREE_PLAN_REPOS) {
+    assert.equal(isGithubFreePlanRepo(repo), true);
+    assert.equal(isGithubFreePlanRepo(repo.toUpperCase()), true);
+  }
+  assert.equal(isGithubFreePlanRepo("cyndra-ai/cyndra-saas"), false);
+  assert.equal(isGithubFreePlanRepo("example/private-repo"), false);
+  assert.match(GITHUB_FREE_PLAN_REASON, /Firstmate merge and Ship remain the gate/);
 });
 
 test("GET-to-PUT conversion does not drop a required reviews block when it is null", () => {

@@ -46,10 +46,14 @@ and alerts the repair thread when one has no approval.
 - A crew that skips `prod-check` can still run Convex deploy, Expo publish, or
   Coolify from a shell.
 - Every agent uses the owner's GitHub account, so GitHub cannot tell an agent
-  from the owner. The merge backstop is the required status check, and only
-  after the install step is applied on repos that support required checks.
-- Some personal private repos cannot enforce required checks on the current
-  plan.
+  from the owner. Shared GitHub credentials can still post a forged
+  `Owner approval` success status, or remove branch protection.
+- The merge backstop is the required status check, and only after the install
+  step is applied on repos that support required checks.
+- The owner stays on the GitHub free plan. These four repos are not enforced
+  by GitHub: `amrtawfik160/dr.woo`, `amrtawfik160/safi`,
+  `amrtawfik160/areliaa`, `amrtawfik160/bb-plugin-telegram`. There the
+  Firstmate merge and Ship gate is the only check.
 
 ## Install step
 
@@ -57,6 +61,9 @@ and alerts the repair thread when one has no approval.
 check can be enforced. `--dry-run` is the default and prints the exact change
 and an undo command. `--apply` is for the repair thread after the owner
 approves. This change never runs `--apply`.
+
+The installer skips those four free-plan repos cleanly: no GitHub call, no PUT,
+no retry, and no error. Firstmate merge and Ship remain the gate there.
 
 ## Evidence
 
@@ -69,3 +76,4 @@ approves. This change never runs `--apply`.
 - `the install script dry-run keeps every existing protection rule`
 - `the install script --apply PUTs Owner approval and keeps every existing rule`
 - `the install script --apply does not PUT when required checks cannot be enforced`
+- `the install script skips GitHub free-plan repos with no gh call, no PUT, and no error`

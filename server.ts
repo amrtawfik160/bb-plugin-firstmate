@@ -1,7 +1,7 @@
 import { affirmative, APPROVAL_CHOICES, approvalCardText, fixedApprovalChoices, compareSchema, createProductionApprovals, onlyBaseMerges, productionMergeGuard, PRODUCTION_APPROVAL_POINTER, PRODUCTION_CARD_RULE } from "./lib/production-approval.ts";
 import { createOwnerGate, gatedAskResolve, ownerApprovalStatus, prodCheck, quotePreApproval, type HeadCoverage, type PreApproval, type ProdWhat } from "./lib/owner-gate.ts";
 import { postStatusCommand } from "./lib/github-status.ts";
-import { judgePreApproval } from "./lib/pre-approval-judge.ts";
+import { judgePreApprovalBound } from "./lib/pre-approval-judge.ts";
 // bb-plugin-firstmate — firstmate-style crews native to BB.
 import { deflateSync } from "node:zlib";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -8446,7 +8446,7 @@ export default async function plugin(bb: BbPluginApi) {
       signal?.throwIfAborted();
       const previousHead = record.headSha ?? "";
       const observed=deliveries.observe(record.id,observation,authorized,Date.now(),unverifiedStanding);
-      if (observed.headSha && observed.headSha !== previousHead) {
+      if (observed.headSha && (observed.headSha !== previousHead || ownerGate.statusPostNeeded(observed.id, observed.headSha))) {
         const task = taskForPr(observed.id, observed.owner);
         await syncOwnerApprovalStatus(observed.id, observed.headSha, hostId || null, task);
       }
@@ -9987,30 +9987,19 @@ export default async function plugin(bb: BbPluginApi) {
   async function requireProductionApproval(pr: MergeTarget, crew: Crew, hostId: string | null): Promise<void> {
     if (pr.state === "merged") return;
     const key = prKeyOf(pr.url) ?? "";
-    for (const binding of productionApprovals.candidates(key)) {
-      const ask = ownerAsks.get(binding.ask);
-      if (!ask || ask.captain !== crew.parentThreadId) continue;
-      if (ask.kind !== "approval" || ask.state !== "answered" || !ownerAsks.answeredByOwner(ask.id) || !affirmative(ask)) break;
-      if (pr.headSha !== "" && binding.head === pr.headSha) return;
-      if (hostId === null || !pr.headSha) break;
-      try {
-        const repo = key.split("#")[0]!;
-        const number = key.split("#")[1]!;
-        const read = async (path: string) => {
-          const result = await runStructuredOnHost(hostId, `gh api ${shQuote(path)}`, 30_000);
-          if (result.exitCode !== 0) throw new Error("Cannot read approval ancestry");
-          return JSON.parse(result.output);
-        };
-        const comparison = compareSchema.parse(await read(`repos/${repo}/compare/${binding.head}...${pr.headSha}`));
-        const base = z.object({head:z.object({sha:z.string()}),base:z.object({sha:z.string()})}).parse(await read(`repos/${repo}/pulls/${number}`));
-        if (base.head.sha !== pr.headSha) break;
-        if (await onlyBaseMerges(binding.head, pr.headSha, comparison, async (sha) => {
-          const relation = compareSchema.parse(await read(`repos/${repo}/compare/${sha}...${base.base.sha}`));
-          return relation.status === "ahead" || relation.status === "identical";
-        })) return;
-      } catch { /* Missing or incomplete ancestry requires a new card. */ }
-      break;
+    const task = taskForPr(key, crew.parentThreadId);
+    if (task && key && !task.prs.some((named) => named.toLowerCase() === key.toLowerCase())) {
+      throw new Error(`Refusing: ${key} is not work of task ${task.id}; nothing was merged.`);
     }
+    const cards = ownerGate.cardsForPr(key);
+    const newest = cards[0];
+    const covered = newest ? await headCoverage(hostId, key, newest.head, pr.headSha) : "unknown";
+    const status = ownerApprovalStatus({
+      pr: key, head: pr.headSha, cards, coverage: () => covered,
+      preApprovals: coveringPres(task), task: task?.id, taskOpen: task ? !isFinishedTask(task) : false,
+      captain: crew.parentThreadId ?? undefined,
+    });
+    if (status.state === "success") return;
     throw new Error(`Refusing: ${key} needs an owner approval card for its current changes; nothing was merged. Send firstmate_ask kind=approval with structured prs naming ${key}, what changes, where it goes live, how to undo, and screenshots for visible changes. Pass prs=["${key}"] and omit options and recommended. Wait for the owner's Approve answer. New author commits need a new card; --yes and standing approvals do not count.`);
   }
 
@@ -10083,18 +10072,25 @@ export default async function plugin(bb: BbPluginApi) {
     const status = ownerApprovalStatus({
       pr, head, cards, coverage: () => covered, preApprovals: coveringPres(found),
       task: found?.id, taskOpen: found ? !isFinishedTask(found) : false,
+      captain: found?.captain,
     });
     const repo = pr.split("#")[0]!;
+    const fail = (message: string) => {
+      ownerGate.needStatusPost(pr, head, message, Date.now());
+      bb.log.warn(`owner approval status ${pr}@${head.slice(0, 7)}: ${message}`);
+      void repairNotice(`owner-approval-status:${pr}:${head}`, `Firstmate: Owner approval status for ${pr} failed (${clip(message, 200)}).`);
+    };
     try {
       const postedHost = hostId ?? await gateHost(found?.projectId, found?.captain);
       if (!postedHost) {
-        bb.log.warn(`owner approval status ${pr}: no host`);
+        fail("no host");
         return;
       }
       const posted = await runStructuredOnHost(postedHost, postStatusCommand(repo, head, status), 30_000);
       if (posted.exitCode !== 0) throw new Error(posted.stderr || posted.output || `status exit ${posted.exitCode}`);
+      ownerGate.clearStatusPost(pr, head);
     } catch (error) {
-      bb.log.warn(`owner approval status ${pr}@${head.slice(0, 7)}: ${error instanceof Error ? error.message : String(error)}`);
+      fail(error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -10108,6 +10104,19 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  function checkProdTarget(input: { project: string; what: ProdWhat; task?: OwnerTask; pr?: string; captain?: string }): { ok: boolean; reason: string } {
+    const head = input.pr ? (deliveries.get(input.pr)?.headSha ?? "") : "";
+    return prodCheck({
+      project: input.project, what: input.what, task: input.task?.id, pr: input.pr, head,
+      cards: input.pr ? ownerGate.cardsForPr(input.pr) : [],
+      coverage: (card) => (!head ? "unknown" : card.head === head ? "covers" : "new-author"),
+      preApprovals: coveringPres(input.task),
+      taskOpen: input.task ? !isFinishedTask(input.task) : false,
+      taskPrs: input.task?.prs,
+      captain: input.captain ?? input.task?.captain,
+    });
+  }
+
   async function runProdCheck(input: { project: string; what: ProdWhat; task?: string; pr?: string; threadId?: string }): Promise<{ ok: boolean; reason: string }> {
     const crew = input.threadId ? await findCrewByThread(input.threadId) : undefined;
     const captain = crew?.parentThreadId ?? input.threadId;
@@ -10116,26 +10125,29 @@ export default async function plugin(bb: BbPluginApi) {
     const named = input.task && captain ? ownerTasks.get(input.task) : undefined;
     if (input.task && (!named || named.captain !== captain)) return { ok: false, reason: `Refusing: no owner task ${input.task} for this captain.` };
     const task = named ?? (pr && captain ? taskForPr(pr, captain) : undefined);
-    const prs = pr ? [pr] : (task?.prs ?? []);
-    const cards = prs.flatMap((id) => ownerGate.cardsForPr(id));
-    const head = pr ? (deliveries.get(pr)?.headSha ?? "") : "";
-    return prodCheck({
-      project: input.project, what: input.what, task: task?.id, pr, head, cards,
-      coverage: (card) => (head === "" || card.head === head) ? "covers" : "new-author",
-      preApprovals: coveringPres(task),
-      taskOpen: task ? !isFinishedTask(task) : false,
-    });
+    if (named && pr && !named.prs.some((item) => item.toLowerCase() === pr)) {
+      return { ok: false, reason: `Refusing: ${pr} is not work of task ${named.id}.` };
+    }
+    const targets = pr ? [pr] : (task?.prs ?? []);
+    if (targets.length === 0) return checkProdTarget({ project: input.project, what: input.what, task, captain });
+    let last = { ok: true, reason: "" };
+    for (const id of targets) {
+      last = checkProdTarget({ project: input.project, what: input.what, task, pr: id, captain });
+      if (!last.ok) return last;
+    }
+    return last;
   }
 
   function sightDeploy(input: { project: string; task?: string; source: string; detail: string }): boolean {
     const task = input.task ? ownerTasks.get(input.task) : undefined;
-    const result = prodCheck({
-      project: input.project, what: "deploy", task: task?.id,
-      cards: (task?.prs ?? []).flatMap((pr) => ownerGate.cardsForPr(pr)),
-      coverage: () => "covers",
-      preApprovals: coveringPres(task),
-      taskOpen: task ? !isFinishedTask(task) : false,
-    });
+    const targets = task?.prs ?? [];
+    let result = targets.length === 0
+      ? checkProdTarget({ project: input.project, what: "deploy", task, captain: task?.captain })
+      : { ok: true, reason: "" };
+    for (const id of targets) {
+      result = checkProdTarget({ project: input.project, what: "deploy", task, pr: id, captain: task?.captain });
+      if (!result.ok) break;
+    }
     ownerGate.recordDeploy({ project: input.project, task: input.task, source: input.source, detail: input.detail, approved: result.ok, at: Date.now() });
     if (!result.ok) {
       void repairNotice(`unapproved-deploy:${input.project}:${input.task ?? ""}`, `Firstmate: ${input.project} went live without owner approval (${clip(input.detail, 200)}).`);
@@ -10159,19 +10171,21 @@ export default async function plugin(bb: BbPluginApi) {
         return;
       }
     }
-    const judgment = await judgePreApproval(body, { apiKey });
-    if (judgment === "neither") return;
+    const projectName = telegram?.project?.name?.trim() || header?.project?.name?.trim() || "";
+    const open = ownerTasks.list(captain);
+    const candidates = projectName ? open.filter((task) => sameProject(task.project, projectName)) : open;
+    const judgment = await judgePreApprovalBound(body, {
+      apiKey,
+      tasks: candidates.map((task) => ({ id: task.id, title: task.title, project: task.project ?? "" })),
+    });
+    if (judgment.allows === "neither") return;
     const ref = telegram ? telegramSourceRef(telegram) : header ? telegramSourceRef(header) : "";
     const byRef = ref ? ownerTasks.openByRef(captain, ref)[0] : undefined;
-    const named = telegram?.project?.name?.trim() || header?.project?.name?.trim() || "";
-    const open = ownerTasks.list(captain);
-    const unique = named
-      ? open.filter((task) => sameProject(task.project, named))
-      : open;
-    const task = byRef ?? (unique.length === 1 ? unique[0] : undefined);
+    const named = candidates.find((task) => task.id === judgment.task);
+    const task = byRef ?? named;
     const pre = ownerGate.recordPreApproval({
       ownerMessageRef: ref, quote: clip(body, 4000), task: task?.id ?? "",
-      project: task?.project ?? named, allows: judgment, createdAt: Date.now(),
+      project: task?.project ?? projectName, allows: judgment.allows, createdAt: Date.now(),
     });
     const quoted = quotePreApproval(pre);
     if (telegram && (await reliabilityFlags()).telegramThreading === "on") {
@@ -15090,6 +15104,13 @@ export default async function plugin(bb: BbPluginApi) {
           if (action === "set" && current?.captain === captain && isFinishedTask(current)) return toolError(`Task ${id} is ${current.state}; it reopens only when new work arrives on it (a new crew or PR). For new work the owner asks for, dispatch with taskRef=${id}.`);
           changed = ownerTasks.move(id, captain, to === "dropped" ? { to, reason: reason ?? "", ref: ref ?? "" } : to === "live" ? { to, reason: reason ?? "" } : { to, reason }, now);
         }
+        if (action === "close") {
+          const hostId = await gateHost(changed.projectId, captain);
+          for (const named of changed.prs) {
+            const head = deliveries.get(named)?.headSha ?? "";
+            if (head) await syncOwnerApprovalStatus(named, head, hostId, changed);
+          }
+        }
         await refreshOwnerBoard();
         return `Task ${changed.id} is ${changed.state}${changed.dropReason ? ` (${changed.dropReason})` : ""}.`;
       } catch (error) {
@@ -16716,8 +16737,32 @@ export default async function plugin(bb: BbPluginApi) {
   const knownCaptains = knownCaptainsRef;
   for (const key of await bb.storage.kv.list(CAPTAIN_PROJECT_PREFIX)) knownCaptains.add(key.slice(CAPTAIN_PROJECT_PREFIX.length));
   const heldPingCaptains = new Set<string>();
+  async function connectorOwnerAnswer(askId: string): Promise<string | null> {
+    try {
+      const read = z.object({ answer: z.string().nullable() }).parse(await bb.sdk.plugins.callRpc({
+        pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "ownerAnswer", input: { askId },
+        outputSchema: z.object({ answer: z.string().nullable() }),
+      }));
+      return read.answer;
+    } catch {
+      return null;
+    }
+  }
+
+  function matchesOwnerAnswer(ask: OwnerAsk, expected: string, confirmed: string | null): boolean {
+    if (confirmed === null) return false;
+    if (confirmed.trim().toLowerCase() === expected.trim().toLowerCase()) return true;
+    return askLetterAnswer(ask, confirmed) === expected;
+  }
+
+  async function connectorConfirmsAsk(ask: OwnerAsk, expected: string): Promise<boolean> {
+    if (ask.kind !== "approval" && !ask.irreversible) return true;
+    return matchesOwnerAnswer(ask, expected, await connectorOwnerAnswer(ask.id));
+  }
+
   // An owner reply to an ask card, or a tap on one of its buttons, answers that ask.
   // Only the connector header at the start of the message counts, so quoted text cannot answer one.
+  // An approval or irreversible card counts only after connector evidence confirms the owner.
   async function recordAskAnswers(captainThreadId: string, text: string, queued: readonly unknown[]): Promise<void> {
     const texts = queued.length > 0
       ? queued.map((row) => String(asRecord(row)["text"] ?? asRecord(asRecord(row)["input"])["text"] ?? text))
@@ -16727,7 +16772,10 @@ export default async function plugin(bb: BbPluginApi) {
       const header = parseConnectorHeader(message);
       if (header && !header.forwarded && header.sourceEventId?.startsWith("pack:")) {
         for (const { id, answer } of packAnswers(header.body)) {
-          if (ownerAsks.get(id)?.state === "open" && ownerAsks.resolve(id, captainThreadId, "answered", answer, Date.now(), "owner")) { answered++; await ownerAnsweredAsk(id, answer); await syncOwnerApprovalForAsk(id); }
+          const ask = ownerAsks.get(id);
+          if (!ask || ask.state !== "open") continue;
+          if (!(await connectorConfirmsAsk(ask, answer))) continue;
+          if (ownerAsks.resolve(id, captainThreadId, "answered", answer, Date.now(), "owner")) { answered++; await ownerAnsweredAsk(id, answer); await syncOwnerApprovalForAsk(id); }
         }
         continue;
       }
@@ -16735,7 +16783,9 @@ export default async function plugin(bb: BbPluginApi) {
       if (!header || header.forwarded || id === null) continue;
       const ask = ownerAsks.get(id);
       const answer = ask ? askLetterAnswer(ask, header.body) : null;
-      if (ask?.state === "open" && answer !== null && ownerAsks.resolve(id, captainThreadId, "answered", answer, Date.now(), "owner")) { answered++; await ownerAnsweredAsk(id, answer); await syncOwnerApprovalForAsk(id); }
+      if (!ask || ask.state !== "open" || answer === null) continue;
+      if (!(await connectorConfirmsAsk(ask, answer))) continue;
+      if (ownerAsks.resolve(id, captainThreadId, "answered", answer, Date.now(), "owner")) { answered++; await ownerAnsweredAsk(id, answer); await syncOwnerApprovalForAsk(id); }
     }
     if (answered > 0) await refreshOwnerBoard();
   }

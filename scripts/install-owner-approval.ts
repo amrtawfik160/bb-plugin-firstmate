@@ -2,7 +2,7 @@
 /** Dry-run (default) or apply Owner approval as a required status on each repo Firstmate merges into. */
 import { spawnSync } from "node:child_process";
 import { PROJECTS } from "../owner/projects.ts";
-import { canEnforceRequiredChecks, desiredProtection, isExactRepo, listedRepoPatterns } from "../lib/github-protection.ts";
+import { canEnforceRequiredChecks, desiredProtection, GITHUB_FREE_PLAN_REASON, isExactRepo, isGithubFreePlanRepo, listedRepoPatterns } from "../lib/github-protection.ts";
 
 type GhResult = { exitCode: number; stdout: string; stderr: string };
 
@@ -63,6 +63,20 @@ function protectionOf(repo: string, branch: string): { existing: unknown; error:
 }
 
 function reportRepo(repo: string, apply: boolean) {
+  if (isGithubFreePlanRepo(repo)) {
+    return {
+      repo,
+      branch: "",
+      dryRun: !apply,
+      canEnforce: false,
+      reason: GITHUB_FREE_PLAN_REASON,
+      put: null,
+      undoCommand: "none",
+      rulesets: [],
+      applied: false,
+      skipped: true,
+    };
+  }
   const branch = defaultBranch(repo);
   const { existing, error } = protectionOf(repo, branch);
   const enforceable = canEnforceRequiredChecks(error?.status === 404 ? { status: 404, message: error.message } : error);
@@ -86,10 +100,18 @@ function reportRepo(repo: string, apply: boolean) {
     undoCommand: plan.undoCommand,
     rulesets: parseJson(rulesets.stdout) ?? [],
     applied,
+    skipped: false,
   };
 }
 
 function format(row: ReturnType<typeof reportRepo>): string {
+  if (row.skipped) {
+    return [
+      `skip ${row.repo}`,
+      `can enforce: no (${row.reason})`,
+      "applied: no",
+    ].join("\n");
+  }
   const lines = [
     `${row.dryRun ? "dry-run" : "apply"} ${row.repo} (branch ${row.branch})`,
     `can enforce: ${row.canEnforce ? "yes" : "no"}${row.reason ? ` (${row.reason})` : ""}`,

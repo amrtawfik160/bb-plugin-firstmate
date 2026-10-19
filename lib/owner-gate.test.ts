@@ -186,6 +186,51 @@ test("prod-check exits non-zero without an approval or pre-approval for that wor
   assert.equal(expired.ok, false);
 });
 
+test("deploy uses the newest owner decision and the current PR head", () => {
+  const stale = prodCheck({
+    project: "Cyndra", what: "deploy", pr: PR, head: NEXT, task: "T12",
+    cards: [card({ id: "a1" })], coverage: () => "new-author",
+    preApprovals: [], taskOpen: true,
+  });
+  assert.equal(stale.ok, false);
+
+  const laterNo = prodCheck({
+    project: "Cyndra", what: "deploy", pr: PR, head: HEAD,
+    cards: [card({ id: "a2", resolution: "No", createdAt: 2 }), card({ id: "a1", createdAt: 1 })],
+    coverage: () => "covers",
+    preApprovals: [],
+  });
+  assert.equal(laterNo.ok, false);
+});
+
+test("a question card or another captain's Approve cannot authorize this work", () => {
+  const viaQuestion = ownerApprovalStatus({
+    pr: PR, head: HEAD, cards: [card({ id: "q1", kind: "question" })],
+    coverage: () => "covers", preApprovals: [],
+  });
+  assert.equal(viaQuestion.state, "pending");
+
+  const viaOther = ownerApprovalStatus({
+    pr: PR, head: HEAD, cards: [card({ id: "a1", captain: "thr_other" })],
+    coverage: () => "covers", preApprovals: [], captain: "thr_cap",
+  });
+  assert.equal(viaOther.state, "pending");
+
+  const viaOwn = ownerApprovalStatus({
+    pr: PR, head: HEAD, cards: [card({ id: "a1", captain: "thr_cap" })],
+    coverage: () => "covers", preApprovals: [], captain: "thr_cap",
+  });
+  assert.equal(viaOwn.state, "success");
+});
+
+test("explicit task pre-approval cannot authorize a different PR", () => {
+  const refused = prodCheck({
+    project: "Cyndra", what: "merge", task: "T12", pr: OTHER, head: HEAD,
+    cards: [], preApprovals: [pre()], taskOpen: true, taskPrs: [PR],
+  });
+  assert.equal(refused.ok, false);
+});
+
 test("the result text quotes the owner's pre-approval words", () => {
   assert.match(quotePreApproval(pre()), /"merge after you finish"/);
   assert.match(quotePreApproval(pre()), /T12/);
@@ -216,4 +261,15 @@ test("the store records a pre-approval and a deploy without approval", () => {
   const sighting = gate.recordDeploy({ project: "Safi", source: "live-pass", detail: "OTA production", approved: false, at: 11, task: "T12" });
   assert.equal(sighting.approved, false);
   assert.equal(gate.unapprovedDeploys().some((row) => row.id === sighting.id), true);
+});
+
+test("a failed status POST is retried on the same head until it succeeds", () => {
+  const database = db();
+  const gate = createOwnerGate(database);
+  assert.equal(gate.statusPostNeeded(PR, HEAD), false);
+  gate.needStatusPost(PR, HEAD, "GitHub temporary 503", 1);
+  assert.equal(gate.statusPostNeeded(PR, HEAD), true);
+  assert.equal(gate.statusPostNeeded(PR.toUpperCase(), HEAD), true);
+  gate.clearStatusPost(PR, HEAD);
+  assert.equal(gate.statusPostNeeded(PR, HEAD), false);
 });

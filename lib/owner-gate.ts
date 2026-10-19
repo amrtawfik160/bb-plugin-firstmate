@@ -13,6 +13,7 @@ export type GateCard = {
   prs: readonly string[];
   head: string;
   kind: AskKind;
+  captain?: string;
   irreversible: boolean;
   state: AskState;
   resolution: string | null;
@@ -52,6 +53,8 @@ export type ProdCheckInput = {
   coverage?: (card: GateCard) => HeadCoverage;
   preApprovals: readonly PreApproval[];
   taskOpen?: boolean;
+  taskPrs?: readonly string[];
+  captain?: string;
 };
 
 type Database = {
@@ -70,15 +73,19 @@ function samePr(left: string, right: string): boolean {
 }
 
 function ownerApprove(card: GateCard): boolean {
-  return card.state === "answered" && card.answeredByOwner && card.resolution === "Approve";
+  return card.kind === "approval" && card.state === "answered" && card.answeredByOwner && card.resolution === "Approve";
 }
 
 function ownerNo(card: GateCard): boolean {
-  return card.state === "answered" && card.answeredByOwner && card.resolution === "No";
+  return card.kind === "approval" && card.state === "answered" && card.answeredByOwner && card.resolution === "No";
 }
 
-function newestForPr(cards: readonly GateCard[], pr: string): GateCard | undefined {
-  return cards.find((card) => card.prs.some((named) => samePr(named, pr)));
+function newestForPr(cards: readonly GateCard[], pr: string, captain?: string): GateCard | undefined {
+  return cards.find((card) =>
+    card.kind === "approval"
+    && card.prs.some((named) => samePr(named, pr))
+    && (captain === undefined || card.captain === undefined || card.captain === captain)
+  );
 }
 
 function coverOf(card: GateCard, head: string, coverage?: (card: GateCard) => HeadCoverage): HeadCoverage {
@@ -95,19 +102,22 @@ export function ownerApprovalStatus(input: {
   preApprovals: readonly PreApproval[];
   task?: string;
   taskOpen?: boolean;
+  captain?: string;
 }): OwnerApprovalStatus {
-  const newest = newestForPr(input.cards, input.pr);
+  const newest = newestForPr(input.cards, input.pr, input.captain);
   if (newest && ownerNo(newest)) {
     return { state: "pending", description: clip("Owner answered No", 140) };
   }
-  if (newest && ownerApprove(newest)) {
-    const covered = coverOf(newest, input.head, input.coverage);
-    if (covered === "covers") return { state: "success", description: clip("Owner Approve at this head", 140) };
-    if (covered === "new-author") return { state: "pending", description: clip("New author commits after approval", 140) };
-    return { state: "pending", description: clip("Cannot prove this head is covered", 140) };
+  if (newest && ownerApprove(newest) && coverOf(newest, input.head, input.coverage) === "covers") {
+    return { state: "success", description: clip("Owner Approve at this head", 140) };
   }
   const pre = input.preApprovals.find((row) => preApprovalCovers(row, { task: input.task, what: "merge", taskOpen: input.taskOpen === true }));
   if (pre) return { state: "success", description: clip(`Owner pre-approval for ${pre.task} allows ${pre.allows}`, 140) };
+  if (newest && ownerApprove(newest)) {
+    const covered = coverOf(newest, input.head, input.coverage);
+    if (covered === "new-author") return { state: "pending", description: clip("New author commits after approval", 140) };
+    return { state: "pending", description: clip("Cannot prove this head is covered", 140) };
+  }
   return { state: "pending", description: clip(`Needs owner Approve for ${input.pr}`, 140) };
 }
 
@@ -133,6 +143,9 @@ export function quotePreApproval(pre: PreApproval): string {
 }
 
 export function prodCheck(input: ProdCheckInput): { ok: boolean; reason: string } {
+  if (input.task && input.pr && input.taskPrs && !input.taskPrs.some((named) => samePr(named, input.pr!))) {
+    return { ok: false, reason: `Refusing: ${input.pr} is not work of task ${input.task}.` };
+  }
   if (input.what === "merge" && input.pr) {
     const status = ownerApprovalStatus({
       pr: input.pr,
@@ -142,12 +155,16 @@ export function prodCheck(input: ProdCheckInput): { ok: boolean; reason: string 
       preApprovals: input.preApprovals,
       task: input.task,
       taskOpen: input.taskOpen,
+      captain: input.captain,
     });
     if (status.state === "success") return { ok: true, reason: status.description };
   }
-  if (input.what === "deploy") {
-    const approved = input.cards.find((card) => ownerApprove(card) && (input.head === undefined || coverOf(card, input.head, input.coverage) === "covers"));
-    if (approved) return { ok: true, reason: "Owner Approve covers this work" };
+  if (input.what === "deploy" && input.pr) {
+    const newest = newestForPr(input.cards, input.pr, input.captain);
+    if (newest && ownerNo(newest)) return { ok: false, reason: clip("Owner answered No", 140) };
+    if (newest && ownerApprove(newest) && coverOf(newest, input.head ?? "", input.coverage) === "covers") {
+      return { ok: true, reason: "Owner Approve covers this work" };
+    }
   }
   const pre = input.preApprovals.find((row) => preApprovalCovers(row, { task: input.task, what: input.what, taskOpen: input.taskOpen === true }));
   if (pre) return { ok: true, reason: quotePreApproval(pre) };
@@ -163,6 +180,7 @@ type CardRow = {
   head: string;
   prs: string;
   kind: string;
+  captain: string;
   irreversible: number;
   state: string;
   resolution: string | null;
@@ -177,7 +195,10 @@ export function createOwnerGate(db: Database) {
     CREATE INDEX IF NOT EXISTS production_pre_approval_task ON production_pre_approval(task);
     CREATE TABLE IF NOT EXISTS production_deploy_sighting (
     id TEXT PRIMARY KEY, project TEXT NOT NULL, task TEXT, source TEXT NOT NULL,
-    detail TEXT NOT NULL, approved INTEGER NOT NULL, at INTEGER NOT NULL);`);
+    detail TEXT NOT NULL, approved INTEGER NOT NULL, at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS production_status_retry (
+    pr TEXT NOT NULL, head TEXT NOT NULL, last_error TEXT NOT NULL, at INTEGER NOT NULL,
+    PRIMARY KEY (pr, head));`);
 
   function listPreApprovals(task?: string): PreApproval[] {
     const rows = (task === undefined
@@ -218,7 +239,7 @@ export function createOwnerGate(db: Database) {
     cardsForPr(pr: string): GateCard[] {
       try {
         const rows = db.prepare(
-          `SELECT p.ask, p.head, c.prs, a.kind, a.irreversible, a.state, a.resolution, a.created_at,
+          `SELECT p.ask, p.head, c.prs, a.kind, a.captain, a.irreversible, a.state, a.resolution, a.created_at,
             EXISTS(SELECT 1 FROM owner_ask_answer WHERE id=p.ask AND source='owner') AS owner
            FROM production_approval_pr p
            JOIN production_approval_card c ON c.ask=p.ask
@@ -237,6 +258,7 @@ export function createOwnerGate(db: Database) {
             prs,
             head: row.head,
             kind: row.kind as AskKind,
+            captain: row.captain,
             irreversible: row.irreversible === 1,
             state: row.state as AskState,
             resolution: row.resolution,
@@ -267,6 +289,15 @@ export function createOwnerGate(db: Database) {
         approved: row.approved === 1,
         at: row.at,
       }));
+    },
+    needStatusPost(pr: string, head: string, error: string, at: number): void {
+      db.prepare("INSERT INTO production_status_retry(pr, head, last_error, at) VALUES(?,?,?,?) ON CONFLICT(pr, head) DO UPDATE SET last_error=excluded.last_error, at=excluded.at").run(pr.toLowerCase(), head, error, at);
+    },
+    clearStatusPost(pr: string, head: string): void {
+      db.prepare("DELETE FROM production_status_retry WHERE pr=? AND head=?").run(pr.toLowerCase(), head);
+    },
+    statusPostNeeded(pr: string, head: string): boolean {
+      return db.prepare("SELECT 1 FROM production_status_retry WHERE pr=? AND head=?").get(pr.toLowerCase(), head) !== undefined;
     },
   };
 }
