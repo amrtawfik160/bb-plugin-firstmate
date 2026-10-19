@@ -1,3 +1,4 @@
+import { approvePr } from './test/production-approval.ts';
 import {replacementFixture} from './lib/replacement.fixture.mjs';
 import { stubProviderCatalog } from "./test/provider-catalog.mjs";
 import { fixture as nativePromptFixture,scaffold as nativePromptScaffold } from './scripts/prompt-fixture.mjs';
@@ -2599,11 +2600,13 @@ test("merge lands a PR with zero checks (no_checks) on the captain's word", asyn
         mergeability: { mergeable: "MERGEABLE" },
       },
     }));
+    approvePr(host.bb.storage.database(), "thr_cap", "o/r#1", "a".repeat(40));
     let merged = 0;
     host.harness.sdk.stub("environments.mergePullRequest", async () => { merged++; return {}; });
     const result = await host.harness.behavior.runCli(["merge", "c1", "--allow-unverified", "the owner said merge it", "--yes"]);
     assert.equal(result.exitCode, 0, result.stderr);
-    assert.equal(merged, 1);
+    assert.equal(merged, 0, "the BB merge API cannot bind the owner-approved head");
+    assert.ok(host.harness.sdk.callsTo("terminals.create").some(([args]) => JSON.stringify(args).includes("--match-head-commit")));
     assert.match(result.stdout, /Merged #1 t\nhttps:\/\/github\.com\/o\/r\/pull\/1/);
     assert.deepEqual((await host.bb.storage.kv.get("crews")) as unknown[], []);
   } finally {
@@ -2665,6 +2668,7 @@ test("merge runs native merge and teardown before retiring the crew", async () =
   });
   await plugin(host.bb); stubProviderCatalog(host);
   try {
+    approvePr(host.bb.storage.database(), "thr_cap", "o/r#1", "a".repeat(40));
     stubCleanWorktree(host);
     const hostCommands: string[] = [];
     await host.bb.storage.kv.set("crews", [shipRow("c1", "thr_crew", "thr_cap")]);
@@ -8198,7 +8202,7 @@ function bundledNativeHome(): string {
   return home;
 }
 
-test("IT native local merge respects captain hold and lands BB-named branch", async () => {
+test("IT local merge refuses without a PR approval card even after a native captain hold is released", async () => {
   const home = bundledNativeHome();
   const project = join(home, "project");
   const wt = join(home, "worker");
@@ -8232,16 +8236,16 @@ test("IT native local merge respects captain hold and lands BB-named branch", as
     assert.equal(held.status, 0, held.stderr);
     const denied = await host.harness.behavior.runCli(["merge", "c1", "--allow-unverified", "the owner said merge it", "--yes"]);
     assert.equal(denied.exitCode, 1);
-    assert.match(denied.stderr, /held for the captain/);
+    assert.match(denied.stderr, /local-only merges cannot name a PR/);
     assert.equal(git("-C", project, "rev-parse", "HEAD"), base);
     writeFileSync(join(home, "answer"), "approved");
     const released = native("captain-hold", ["answer", "c1", "--decision-file", join(home, "answer"), "--release"]);
     assert.equal(released.status, 0, released.stderr);
     const landed = await host.harness.behavior.runCli(["merge", "c1", "--allow-unverified", "the owner said merge it", "--yes"]);
-    assert.equal(landed.exitCode, 0, landed.stderr);
-    assert.equal(git("-C", project, "rev-parse", "HEAD"), head);
-    assert.ok(!existsSync(join(home, "state/c1.meta")), "native teardown removed the owned record");
-    assert.deepEqual(await host.bb.storage.kv.get("crews"), []);
+    assert.equal(landed.exitCode, 1, landed.stderr);
+    assert.match(landed.stderr, /local-only merges cannot name a PR/);
+    assert.equal(git("-C", project, "rev-parse", "HEAD"), base);
+    assert.ok(existsSync(join(home, "state/c1.meta")), "approval refusal retains the crew");
     assert.equal(host.harness.sdk.callsTo("environments.mergePullRequest").length, 0);
   } finally { await host.harness.lifecycle.dispose(); rmSync(home, { recursive: true, force: true }); }
 });
@@ -10046,6 +10050,7 @@ function nativeMergeHost() {
 }
 
 function stubNativeMerge(host: Awaited<ReturnType<typeof load>>, router: (cmd: string) => { payload?: string; code?: number }, pr: unknown) {
+  for (const n of [1, 5]) approvePr(host.bb.storage.database(), "thr_cap", `o/r#${n}`, "a".repeat(40));
   const routed = stubRoutedHost(host, (cmd) => {
     const c = unwrapHostCommand(cmd), r = router(c);
     if (!c.includes("gh pr view") || (r.code ?? 0) !== 0) return r;
@@ -10187,10 +10192,12 @@ test("merge polls a lazily computed UNKNOWN mergeability instead of refusing at 
         mergeability: { mergeable: ++reads < 3 ? "UNKNOWN" : "MERGEABLE" },
       },
     }));
+    approvePr(host.bb.storage.database(), "thr_cap", "o/r#2", "a".repeat(40));
     host.harness.sdk.stub("environments.mergePullRequest", async () => ({}));
     const result = await host.harness.behavior.runCli(["merge", "c1", "--allow-unverified", "the owner said merge it", "--yes"]);
     assert.equal(result.exitCode, 0, result.stderr);
-    assert.equal(host.harness.sdk.callsTo("environments.mergePullRequest").length, 1);
+    assert.equal(host.harness.sdk.callsTo("environments.mergePullRequest").length, 0);
+    assert.ok(host.harness.sdk.callsTo("terminals.create").some(([args]) => JSON.stringify(args).includes("--match-head-commit")));
   } finally {
     if (prev === undefined) delete process.env.FM_MERGEABLE_POLL_MS; else process.env.FM_MERGEABLE_POLL_MS = prev;
     await host.harness.lifecycle.dispose();

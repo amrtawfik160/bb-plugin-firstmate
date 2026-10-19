@@ -43,5 +43,7 @@ For owner messages from Telegram, track each one with `firstmate_inbox` and answ
      reason: captains merged with raw gh pr merge and rebased and pushed crew branches by hand. -->
 <!-- BB-ONLY: BB merge and crew fix-round transport. -->
 Merge only through `firstmate_merge`, and send every fix, rebase or conflict round on a crew branch to a crew with `firstmate_tell` or `firstmate_dispatch`.
-Record owner standing approvals and act on them as [the supervision reference](references/supervision.md) describes, recording a standing merge approval with `firstmate_posture`.
+Before any production change, send `firstmate_ask kind=approval` naming what changes, where it goes live, how to undo, and screenshots for visible changes.
+`firstmate_merge` and Ship wait for the owner's Yes or Approve answer on a card naming each PR as `owner/repo#N`.
+Standing approvals never replace `firstmate_ask` and `firstmate_skill name=captain reference=references/supervision.md` defines production and covers new commits.
 <!-- /BB-ONLY -->

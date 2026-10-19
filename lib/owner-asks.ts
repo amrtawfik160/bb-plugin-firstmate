@@ -156,7 +156,8 @@ export type OwnerAsks = {
   listWaiting(captain: string, now: number): OwnerAsk[];
   listCandidates(captain: string, now: number): OwnerAsk[];
   /** Correct or reopen an ask owned by this captain. */
-  resolve(id: string, captain: string, state: AskState, resolution: string, at: number): OwnerAsk | undefined;
+  resolve(id: string, captain: string, state: AskState, resolution: string, at: number, source?: "owner"): OwnerAsk | undefined;
+  answeredByOwner(id: string): boolean;
   /** Close only the named cards, atomically; owner closes are terminal and repeated closes are no-ops. */
   close(ids: readonly string[], captain: string, now?: number): AskClosure;
   untoldCloses(captain: string): OwnerAsk[];
@@ -229,7 +230,8 @@ export function createOwnerAsks(db: Database): OwnerAsks {
     resolution TEXT, created_at INTEGER NOT NULL, resolved_at INTEGER);
     CREATE INDEX IF NOT EXISTS owner_ask_open ON owner_ask(captain, state, created_at);`);
 
-  db.exec(`CREATE TABLE IF NOT EXISTS owner_ask_source (
+  db.exec(`CREATE TABLE IF NOT EXISTS owner_ask_answer (id TEXT PRIMARY KEY, source TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS owner_ask_source (
     captain TEXT NOT NULL, source_ref TEXT NOT NULL, ask_id TEXT NOT NULL,
     PRIMARY KEY(captain, source_ref));
     CREATE TABLE IF NOT EXISTS owner_ask_impact (id TEXT PRIMARY KEY, impact TEXT NOT NULL);
@@ -361,11 +363,16 @@ export function createOwnerAsks(db: Database): OwnerAsks {
     listCandidates(captain, now) {
       return (db.prepare(`${select} WHERE captain=? AND (state='open' OR (state='answered' AND resolved_at>=?)) ORDER BY created_at, owner_ask.id`).all(captain, now - 86_400_000) as AskRecord[]).map(fromRecord);
     },
-    resolve(id, captain, state, resolution, at) {
+    answeredByOwner(id) {
+      return db.prepare("SELECT id FROM owner_ask_answer WHERE id=? AND source='owner'").get(id) !== undefined;
+    },
+    resolve(id, captain, state, resolution, at, source) {
       return db.transaction(() => {
         const current = get(id);
         if (!current || current.captain !== captain || db.prepare("SELECT id FROM owner_ask_close WHERE id=?").get(id) !== undefined) return undefined;
         db.prepare("UPDATE owner_ask SET state=?, resolution=?, resolved_at=? WHERE id=?").run(state, state === "open" ? null : resolution, state === "open" ? null : at, id);
+        db.prepare("DELETE FROM owner_ask_answer WHERE id=?").run(id);
+        if (source === "owner" && state === "answered") db.prepare("INSERT INTO owner_ask_answer VALUES (?,?)").run(id, source);
         // A skip ends when the card is answered or reopened: a reopened card waits on the owner again.
         db.prepare("DELETE FROM owner_ask_defer WHERE id=?").run(id);
         const { deferredUntil: _skip, ...rest } = current;

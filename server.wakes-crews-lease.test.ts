@@ -1,3 +1,4 @@
+import { approvePr } from './test/production-approval.ts';
 // Owner decisions Q9, Q10 and Q11 (17 Oct): wakes never block an action, a crew that ends without a
 // report restarts once, a provider that is not signed in refuses the dispatch, and a shared test
 // server serves one crew at a time.
@@ -124,14 +125,16 @@ test("a native refusal leads with its own reason, never the queued-wakes warning
     if (cmd.includes(".wake-queue")) return { payload: `FMWAKES=${wakes.count}` };
     // The wake read runs as an encoded receipt script.
     if (/^__fm_cmd='bash '\\''\/tmp\/\.fm-receipt-/.test(cmd)) return { payload: `FM_BB_RECEIPT=${JSON.stringify({ id: "rcpt1", phase: "ready", report: "check: crew c9 finished; PR #2501 waits for review", path: "/tmp/r.txt", replayed: false, truncated: false })}` };
-    if (cmd.includes("fm-merge-local.sh")) return { payload: `${WARNING}\nREFUSED: worktree /wt has uncommitted changes`, code: 1 };
+    if (cmd.includes("gh pr view")) return { payload: JSON.stringify({url:"https://github.com/o/r/pull/1",number:1,title:"Change",headRefOid:"a".repeat(40),state:"OPEN",mergeable:"MERGEABLE",files:[{path:"docs/x.md"}]}) };
+    if (cmd.includes("fm-pr-merge.sh")) return { payload: `${WARNING}\nREFUSED: worktree /wt has uncommitted changes`, code: 1 };
     return {};
   }, { fmHome: "/native", fmHostId: "host_1" });
   try {
-    await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew", { posture: "local-only", nativeHome: "/native" })]);
-    const cli = await host.harness.behavior.runCli(["merge", "c1", "--yes"], { threadId: "thr_cap", projectId: "proj_1" });
+    await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew", { posture: "direct-PR", nativeHome: "/native", prUrl: "https://github.com/o/r/pull/1" })]);
+    approvePr(host.bb.storage.database(), "thr_cap", "o/r#1", "a".repeat(40));
+    const cli = await host.harness.behavior.runCli(["merge", "c1", "--yes", "--allow-unverified", "the owner said merge it"], { threadId: "thr_cap", projectId: "proj_1" });
     assert.equal(cli.exitCode, 1);
-    assert.match(cli.stderr, /Native local merge c1 failed: exit 1: REFUSED: worktree \/wt has uncommitted changes/);
+    assert.match(cli.stderr, /REFUSED: worktree \/wt has uncommitted changes/);
     assert.doesNotMatch(cli.stderr, /queued wakes pending/);
     assert.ok(seen.some((cmd) => /\.fm-receipt-/.test(cmd)), "the wakes were read before the merge");
     assert.ok(sentTo(host, "thr_cap").some((m) => /WAKES READ BEFORE MERGE: 2 wake\(s\) were waiting.*\n.*crew c9 finished/s.test(m)), sentTo(host, "thr_cap").join("\n---\n"));
