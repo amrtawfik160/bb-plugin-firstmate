@@ -180,6 +180,9 @@ export function createDeliveries(db: Database) {
   function needsTask(owner:string,projectId:string,taskId:string) {
     return !!db.prepare("SELECT 1 FROM deliveries WHERE owner=? AND project=? AND status NOT IN ('complete','explicitly-abandoned','merged-unverified') AND json_extract(record,'$.taskId')=? LIMIT 1").get(owner,projectId,taskId);
   }
+  function awaitingVerification(owner:string,projectId:string,taskId:string) {
+    return !!db.prepare("SELECT 1 FROM deliveries WHERE owner=? AND project=? AND status='merged-needs-verification' AND json_extract(record,'$.taskId')=? LIMIT 1").get(owner,projectId,taskId);
+  }
   function taskRecord(owner:string,projectId:string,id:string) {
     const row=db.prepare("SELECT record FROM deliveries WHERE owner=? AND project=? AND status NOT IN ('complete','explicitly-abandoned') AND (json_extract(record,'$.taskId')=? OR EXISTS(SELECT 1 FROM json_each(json_extract(record,'$.workers')) WHERE value=?)) ORDER BY due,id LIMIT 1").get(owner,projectId,id,id) as {record:string}|undefined;
     return row ? JSON.parse(row.record) as DeliveryRecord : undefined;
@@ -450,7 +453,7 @@ export function createDeliveries(db: Database) {
     const rows=db.prepare("SELECT record FROM deliveries WHERE owner=? AND json_extract(record,'$.forgeState')='merged' AND json_extract(record,'$.updatedAt')>=? ORDER BY json_extract(record,'$.updatedAt') DESC,id LIMIT ?").all(owner,since,Math.max(1,Math.min(limit,100))) as {record:string}[];
     return rows.map(row=>JSON.parse(row.record) as DeliveryRecord);
   }
-  return { get,save,list,undecided,touch,needingDecision,markDecisionAsked,mergedSince,conflict,hasOwned,needsTask,taskRecord,ownedTaskRecord,register,observe,stale,assign,ownerLost,markOwnerNeeded,ownerRestored,transferOwner,accountFailure,abandon,clearHold,forTasks,verify,recordCheck,waive,markQueued,notify,pendingNotifications };
+  return { get,save,list,undecided,touch,needingDecision,markDecisionAsked,mergedSince,conflict,hasOwned,needsTask,awaitingVerification,taskRecord,ownedTaskRecord,register,observe,stale,assign,ownerLost,markOwnerNeeded,ownerRestored,transferOwner,accountFailure,abandon,clearHold,forTasks,verify,recordCheck,waive,markQueued,notify,pendingNotifications };
 }
 
 const DO_NOT_MERGE = /\b(?:do not|don'?t|dont)[\s-]+merge\b|\bdo-not-merge\b/i;
