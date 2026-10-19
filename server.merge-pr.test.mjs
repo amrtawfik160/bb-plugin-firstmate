@@ -366,6 +366,7 @@ test('approval card creation binds the named PR and only the owner RPC grants pe
   const asks=createOwnerAsks(host.bb.storage.database());
   const ask=asks.listOpen('thr_cap')[0];assert.ok(ask,asked);
   await tool(host,'firstmate_resolve_ask').execute({id:ask.id,resolution:'Approve'},ctx);
+  assert.equal(asks.get(ask.id)?.state,'cancelled');
   let out=text(await tool(host,'firstmate_merge').execute({crewId:CREW,yes:true,pr:2391},ctx));
   assert.match(out,/owner approval card/);assert.deepEqual(merges(commands),[]);
   host.harness.sdk.stub('plugins.callRpc',async()=>({answer:'Approve',ok:true}));

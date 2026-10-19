@@ -31,6 +31,7 @@ const HOUSE_RULES = [
   "`code-review`: run its Standards and Spec reviews yourself, one after the other, not as sub-agents.",
   "`implement-spec`: never start its sub-agents and never merge a ticket. Build your brief's tickets on your branch and follow the delivery contract.",
   "Production changes require the owner’s approval card naming the change. The captain passes that approval to the crew before merge or deploy.",
+  "Before a production merge or deploy, run `bb firstmate prod-check <project> <merge|deploy>` with the task or PR; it exits non-zero without an owner approval or pre-approval.",
 ];
 
 const VERIFY_RULES = [
