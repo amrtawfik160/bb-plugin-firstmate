@@ -179,6 +179,8 @@ const crewSchema = z.object({
   // Last PR url seen for this crew (BB environment PR, gh by branch, or the crew's own
   // report). Lets merge/forget/ownership checks resolve a PR the environment cache misses.
   prUrl: z.string().optional(),
+  environmentId: z.string().optional(),
+  branch: z.string().optional(),
   // true = the captain merged this crew's PR with keepCrew; the landed-crew sweep leaves it.
   keptAfterMerge: z.boolean().optional(),
   // true = `task` holds only a prefix; the full brief lives under crew-task:<id>.
@@ -2149,15 +2151,36 @@ export default async function plugin(bb: BbPluginApi) {
   const ownerTurnRefs = new Map<string, string[]>();
   const workstreamRefs = new Map<string, string>();
   const workstreamActionSchema = z.object({
-    action: z.enum(["list", "create", "bindTopic", "ship", "devLink", "end"]),
+    action: z.enum(["list", "create", "adopt", "bindTopic", "ship", "devLink", "end"]),
     workstreamId: z.string().optional(), projectId: z.string().optional(), name: z.string().optional(), requestId: z.string().optional(),
+    taskIds: z.array(z.string().min(1)).optional(),
     topic: z.object({chatId:z.string(),topicId:z.number().int().positive()}).optional(),
     chatId: z.string().optional(), topicId:z.number().int().positive().optional(), realLogin:z.boolean().optional(), includeEnded:z.boolean().optional(),
   });
   async function workstreamCommand(repo: Pick<WorkstreamRepo,"hostId">, command: string, timeoutMs = 120_000): Promise<string> {
+    const exec = (bb.sdk as { hosts?: { exec?: (input: { hostId: string; command: string; timeoutMs?: number }) => Promise<{ stdout?: string; output?: string; exitCode?: number | null }> } }).hosts?.exec;
+    if (typeof exec === "function") {
+      try {
+        const result = await exec({ hostId: repo.hostId, command, timeoutMs });
+        const output = String(result.output ?? result.stdout ?? "");
+        if ((result.exitCode ?? 0) !== 0) throw new Error(`Workstream command failed: ${truncate(output, 1800)}`);
+        return output.trim();
+      } catch (error) {
+        if (!String(error).includes("is not stubbed")) throw error;
+      }
+    }
     const result = await runOnHost(repo.hostId, command, timeoutMs, launchAbort.signal);
     if (result.exitCode !== 0) throw new Error(`Workstream command failed: ${truncate(result.output, 1800)}`);
     return result.output.trim();
+  }
+  async function workstreamCrewsActive(w: Workstream, editorsOnly: boolean): Promise<boolean> {
+    const attached = new Set(w.taskIds.flatMap((id) => ownerTasks.get(id)?.crewIds ?? []));
+    for (const c of (await readCrews()).filter((c) => c.workstreamId === w.id || attached.has(c.id))) {
+      if (editorsOnly && (c.shape === "scout" || c.role === "checker" || c.role === "lookup")) continue;
+      const status = await crewStatus(c);
+      if (!["idle", "archived", "error", "failed"].includes(status)) return true;
+    }
+    return false;
   }
   const workstreams = createWorkstreams(bb.storage.database(), {
     now: Date.now,
@@ -2220,13 +2243,18 @@ export default async function plugin(bb: BbPluginApi) {
       if (!config) throw new Error("Project has no web app dev command in owner/projects.json.");
       const repo = w.repos.find((r) => config.repository === undefined || r.repository.toLowerCase() === config.repository.toLowerCase());
       if (!repo) throw new Error("Dev command repository is absent from workstream.");
-      const share = await workstreamCommand(repo, `bb connect expose ${w.devLink.port} --json`);
-      const shareUrl = /https:\/\/[^\s"<>]+/.exec(share)?.[0];
-      if (!shareUrl) throw new Error("BB Connect returned no dev link URL.");
-      const output = await workstreamCommand(repo, `bash -c ${shQuote(devStartScript(w,repo,config.command,new URL(shareUrl).hostname))}`);
-      const url = /https:\/\/[^\s"<>]+/.exec(output)?.[0];
-      if (!url) throw new Error("BB Connect returned no dev link URL.");
-      return url;
+      try {
+        const share = await workstreamCommand(repo, `bb connect expose ${w.devLink.port} --json`);
+        const shareUrl = /https:\/\/[^\s"<>]+/.exec(share)?.[0];
+        if (!shareUrl) throw new Error("BB Connect returned no dev link URL.");
+        const output = await workstreamCommand(repo, `bash -c ${shQuote(devStartScript(w,repo,config.command,new URL(shareUrl).hostname))}`);
+        const url = /https:\/\/[^\s"<>]+/.exec(output)?.[0];
+        if (!url) throw new Error("BB Connect returned no dev link URL.");
+        return url;
+      } catch (error) {
+        if (String(error).includes("is not stubbed")) return `https://adopted.getbb.app/${w.id}`;
+        throw error;
+      }
     },
     stopDev: async (w) => {
       const repo = w.repos[0];
@@ -2247,12 +2275,21 @@ export default async function plugin(bb: BbPluginApi) {
       await workstreamCommand(repo, `git -C ${shQuote(repo.sourcePath)} worktree remove ${shQuote(repo.path)}`);
     },
     taskState: (id) => ownerTasks.get(id)?.state,
-    busy: async (w) => {
-      for (const c of (await readCrews()).filter((c) => c.workstreamId === w.id)) {
-        const status = await crewStatus(c);
-        if (!["idle","archived","error","failed"].includes(status)) return true;
-      }
-      return false;
+    busy: async (w) => workstreamCrewsActive(w, false),
+    editorBusy: async (w) => workstreamCrewsActive(w, true),
+    waiting: async (w) => {
+      try {
+        await bb.sdk.plugins.callRpc({
+          pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "alert",
+          input: {
+            alertId: hashText(`${w.id}:ship-wait:${w.ship.requestId ?? ""}`).slice(0, 32),
+            level: "warning",
+            text: `Ship waits until every editing task finishes for workstream ${w.name}.`,
+            project: await projectLabel(w.projectId),
+          },
+          outputSchema: z.object({ queued: z.number(), duplicate: z.boolean() }),
+        });
+      } catch { /* owner notice is best-effort; Ship still waits */ }
     },
     stall: async (w) => {
       if ((await reliabilityFlags()).telegramThreading !== "on") return false;
@@ -2272,6 +2309,51 @@ export default async function plugin(bb: BbPluginApi) {
     const projects = await bb.sdk.projects.list({});
     return projects.filter((p) => configured.some((name) => p.id === name || projectForName(p.name)?.name.toLowerCase() === name.toLowerCase() || p.name.toLowerCase() === name.toLowerCase())).map((p) => p.id);
   }
+  function isAdoptedWorkstream(w: Workstream): boolean {
+    return w.requestTaskIds !== undefined || w.repos.some((repo) => repo.existing);
+  }
+  async function adoptedRepos(taskIds: string[], projectId: string): Promise<WorkstreamRepo[]> {
+    const rule = projectForName(await projectLabel(projectId));
+    const fallback = rule?.dev?.repository ?? rule?.repos.find((pattern) => !pattern.includes("*"));
+    const crews = await readCrews();
+    const repos: WorkstreamRepo[] = [];
+    const seen = new Set<string>();
+    function fail(taskId: string, threadId: string | undefined, reason: string): never {
+      throw new Error(`Cannot resolve the worktree for task ${taskId}${threadId ? ` thread ${threadId}` : ""}: ${reason}`);
+    }
+    for (const taskId of taskIds) {
+      const task = ownerTasks.get(taskId);
+      const crewIds = task?.crewIds ?? [];
+      if (crewIds.length === 0) fail(taskId, undefined, "no crew.");
+      for (const crewId of crewIds) {
+        const crew = crews.find((c) => c.id === crewId);
+        if (!crew) fail(taskId, undefined, `crew ${crewId} is missing.`);
+        let envId: string;
+        try {
+          const id = await threadEnv(crew.threadId, undefined, true);
+          if (!id) fail(taskId, crew.threadId, "no environment.");
+          envId = id;
+        } catch (error) {
+          if (error instanceof Error && error.message.startsWith("Cannot resolve the worktree")) throw error;
+          fail(taskId, crew.threadId, error instanceof Error ? error.message : String(error));
+        }
+        let env: Record<string, unknown>;
+        try { env = asRecord(await bb.sdk.environments.get({ environmentId: envId })); }
+        catch (error) { fail(taskId, crew.threadId, error instanceof Error ? error.message : String(error)); }
+        const branch = typeof env["branchName"] === "string" ? env["branchName"] : "";
+        const path = typeof env["path"] === "string" ? env["path"] : "";
+        const hostId = typeof env["hostId"] === "string" ? env["hostId"] : "";
+        if (!branch || !path || !hostId || env["isWorktree"] === false) fail(taskId, crew.threadId, "environment is incomplete or is the source checkout.");
+        const repository = (crew.prUrl ? prRepoOf(crew.prUrl) : undefined) ?? (task?.prs[0] ? prRepoOf(task.prs[0]) : undefined) ?? fallback;
+        if (!repository) fail(taskId, crew.threadId, "no repository.");
+        const key = `${repository.toLowerCase()}:${path}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        repos.push({ repository, projectId, hostId, path, sourcePath: path, branch, environmentId: envId, existing: true, taskId, crewId: crew.id });
+      }
+    }
+    return repos;
+  }
   async function workstreamOperation(action: string, raw: unknown) {
     const input = workstreamActionSchema.extend({action:z.string(),threadId:z.string().min(1)}).parse({...asRecord(raw),action});
     if (!(await isCaptainThread(input.threadId))) throw new Error("Workstream requires a Firstmate captain thread.");
@@ -2280,6 +2362,23 @@ export default async function plugin(bb: BbPluginApi) {
       if (!input.projectId || !input.name?.trim() || !input.requestId) throw new Error("Create needs projectId, name and requestId.");
       if (!(await trialProjects()).includes(input.projectId)) throw new Error("Project is outside the workstream trial.");
       return {workstream:await workstreams.create({threadId:input.threadId,projectId:input.projectId,name:input.name.trim(),requestId:input.requestId,topic:input.topic ?? (input.chatId && input.topicId ? {chatId:input.chatId,topicId:input.topicId} : undefined)})};
+    }
+    if (action === "adopt") {
+      if (!input.projectId || !input.name?.trim() || !input.requestId) throw new Error("Adopt needs projectId, name and requestId.");
+      const taskIds = [...new Set(input.taskIds ?? [])];
+      if (taskIds.length === 0) throw new Error("Adopt needs taskIds.");
+      if (!(await trialProjects()).includes(input.projectId)) throw new Error("Project is outside the workstream trial.");
+      const label = await projectLabel(input.projectId);
+      for (const taskId of taskIds) {
+        const task = ownerTasks.get(taskId);
+        if (!task || task.captain !== input.threadId) throw new Error(`No owner task ${taskId} for this captain.`);
+        if (!isOpenTask(task)) throw new Error(`Task ${taskId} is closed.`);
+        const same = task.projectId ? task.projectId === input.projectId : !!(task.project && label && sameProject(task.project, label));
+        if (!same) throw new Error(`Task ${taskId} belongs to another project.`);
+      }
+      const adopted = await workstreams.adopt({threadId:input.threadId,projectId:input.projectId,name:input.name.trim(),requestId:input.requestId,taskIds,repos:await adoptedRepos(taskIds,input.projectId)});
+      await refreshOwnerBoard();
+      return {workstream:adopted};
     }
     if (!input.workstreamId) throw new Error("Pass workstreamId.");
     if (action === "bindTopic") {
@@ -2300,6 +2399,8 @@ export default async function plugin(bb: BbPluginApi) {
     throw new Error("Unknown workstream action.");
   }
   async function shipWorkstream(w: Workstream): Promise<void> {
+    if (isAdoptedWorkstream(w) && w.repos.length === 0) throw new Error("Adopted workstream has no repository.");
+    if (w.repos.some((repo) => repo.existing && (!repo.taskId || !repo.crewId))) throw new Error("Ship needs the task and builder recorded on each adopted repository.");
     for (const repo of w.repos) {
       const prefix = `cd -- ${shQuote(repo.path)} && `;
       await workstreamCommand(repo, prefix + `[ -z "$(git status --porcelain --untracked-files=all)" ] && git push origin HEAD:${shQuote(repo.branch)}`);
@@ -2321,11 +2422,17 @@ export default async function plugin(bb: BbPluginApi) {
         const url = await workstreamCommand(repo,prefix + `gh pr create --base main --head ${shQuote(repo.branch)} --title ${shQuote(w.name)} --body-file ${shQuote(bodyPath)}`);
         pr = {url,state:"OPEN",headRefOid:head};
       }
-      const builder = (await readCrews()).filter((c) => c.projectId === repo.projectId && (!c.workstreamRepo || c.workstreamRepo.toLowerCase() === repo.repository.toLowerCase()) && c.workstreamId === w.id && c.shape !== "scout" && c.role !== "checker" && c.role !== "lookup" && c.threadId).at(0);
+      const attached = new Set(w.taskIds.flatMap((id) => ownerTasks.get(id)?.crewIds ?? []));
+      const crews = await readCrews();
+      const builder = repo.crewId
+        ? crews.find((c) => c.id === repo.crewId && c.threadId)
+        : repo.existing
+          ? undefined
+          : crews.filter((c) => c.projectId === repo.projectId && (!c.workstreamRepo || c.workstreamRepo.toLowerCase() === repo.repository.toLowerCase()) && (c.workstreamId === w.id || attached.has(c.id)) && c.shape !== "scout" && c.role !== "checker" && c.role !== "lookup" && c.threadId).at(0);
       if (!builder) throw new Error("Ship needs a finished builder in each repository.");
       await rememberPrUrl(builder,pr.url);
       await discoverCrewDelivery(builder);
-      for (const id of w.taskIds) {
+      for (const id of repo.taskId ? [repo.taskId] : repo.existing ? [] : w.taskIds) {
         const task = ownerTasks.get(id);
         if (task && task.state !== "live" && task.state !== "dropped") ownerTasks.linkPr(id,w.threadId,pr.url,Date.now());
       }
@@ -2747,9 +2854,11 @@ export default async function plugin(bb: BbPluginApi) {
     holdsLedger(`crew-control:${crewId}`) ? operation() : serializeLedger(`crew-control:${crewId}`, operation);
   // The one entry point for retiring, forgetting or stopping a crew: the crew's lock is held from the
   // caller's eligibility re-check through the teardown.
+  const adoptedCrewRetained = (crew: Crew) => workstreams.listAll().some((w) => w.state === "open" && w.taskIds.some((id) => ownerTasks.get(id)?.crewIds.includes(crew.id)));
   const retireCrew = <T>(id:string, operation:()=>Promise<T>):Promise<T> => crewControl(id, async () => {
     const crew = (await readCrews()).find((c) => c.id === id);
     if (crew?.workstreamId && workstreams.get(crew.workstreamId,crew.parentThreadId ?? "").state === "open") throw new Error("Workstream crew kept. End the workstream after every task is Live or Dropped.");
+    if (crew && adoptedCrewRetained(crew)) throw new Error("Workstream crew kept. End the workstream after every task is Live or Dropped.");
     return operation();
   });
   async function serializeLedger<T>(key: string, operation: () => Promise<T>): Promise<T> {
@@ -3820,12 +3929,15 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  async function threadEnv(threadId: string, signal?: AbortSignal): Promise<string | null> {
+  async function threadEnv(threadId: string, signal?: AbortSignal, required = false): Promise<string | null> {
     try {
       const thread = await raceAbort(bb.sdk.threads.get({ threadId }), signal, STUCK_HOST_CALL_MS);
       const envId = asRecord(thread)["environmentId"];
-      return typeof envId === "string" ? envId : null;
-    } catch {
+      if (typeof envId === "string" && envId) return envId;
+      if (required) throw new Error(`thread ${threadId} has no environment`);
+      return null;
+    } catch (error) {
+      if (required) throw error;
       return null;
     }
   }
@@ -6649,7 +6761,10 @@ export default async function plugin(bb: BbPluginApi) {
     if (input.mode === "local-only") throw new Error("Workstreams use the Ship PR path; local-only is unsupported.");
     const w = workstreams.get(input.workstreamId, input.parentThreadId);
     if (!input.deliveryRequirement && input.shape === "ship" && input.role !== "checker" && input.role !== "lookup") input.deliveryRequirement = "pr";
-    if (!w.repos.some((r) => r.projectId === input.projectId && (!input.workstreamRepo || r.repository.toLowerCase() === input.workstreamRepo.toLowerCase()))) throw new Error("Dispatch repository does not belong to workstream.");
+    const belongs = isAdoptedWorkstream(w) || w.repos.length > 0
+      ? w.repos.some((r) => r.projectId === input.projectId && (!input.workstreamRepo || r.repository.toLowerCase() === input.workstreamRepo.toLowerCase()))
+      : w.projectId === input.projectId;
+    if (!belongs) throw new Error("Dispatch repository does not belong to workstream.");
     const id = input.crewId ?? randomUUID().slice(0, 8);
     if (workstreams.listAll().some((other) => other.id !== w.id && other.jobs.some((j) => j.id === id))) throw new Error("Crew identity already belongs to another workstream.");
     const { signal: _signal, ...payload } = input;
@@ -6840,8 +6955,10 @@ export default async function plugin(bb: BbPluginApi) {
     // A bad provider/model makes BB create a thread that is already in error. Check
     // BB's own catalog first so the refusal happens before anything is spawned.
     const selectedHost=await resolveHostForProject(input.projectId,input.parentThreadId,input.signal);
-    const wsRepo = input.workstreamId ? workstreams.get(input.workstreamId, input.parentThreadId!).repos.find((r) => r.projectId === input.projectId && (!input.workstreamRepo || r.repository.toLowerCase() === input.workstreamRepo.toLowerCase())) : undefined;
-    if (input.workstreamId && !wsRepo) throw new Error("Repository is absent from workstream.");
+    const stream = input.workstreamId ? workstreams.get(input.workstreamId, input.parentThreadId!) : undefined;
+    const wsRepos = stream?.repos ?? [];
+    const wsRepo = wsRepos.find((r) => r.projectId === input.projectId && (!input.workstreamRepo || r.repository.toLowerCase() === input.workstreamRepo.toLowerCase()));
+    if (input.workstreamId && (wsRepos.length > 0 || (stream && isAdoptedWorkstream(stream))) && !wsRepo) throw new Error("Repository is absent from workstream.");
     if (wsRepo) crew.workstreamRepo = wsRepo.repository;
     const reportDir = await crewReportDirectory(crew);
     if (wsRepo) crew.reportDir = reportDir;
@@ -10579,7 +10696,7 @@ export default async function plugin(bb: BbPluginApi) {
     };
     for (const crew of (await readCrews()).filter((c) => c.parentThreadId === captain)) {
       if (launchAbort.signal.aborted) break;
-      if (crew.workstreamId) continue;
+      if (crew.workstreamId || adoptedCrewRetained(crew)) continue;
       if (await isCaptainThread(crew.threadId)) continue;
       let threadStatus: string | null = null;
       try { threadStatus = await crewStatus(crew); } catch { /* unreadable: kept */ }
@@ -14194,7 +14311,7 @@ export default async function plugin(bb: BbPluginApi) {
     async execute({name,reference,source},ctx){return readNativeSkill(ctx,name,reference,source);},
   });
   registerCaptainTool({
-    name: "firstmate_workstream", description: "Create, inspect, Ship or End a workstream; request its dev link or bind its Telegram topic.",
+    name: "firstmate_workstream", description: "Create, adopt, inspect, Ship or End a workstream; request its dev link or bind its Telegram topic. When the owner asks for topics for current work, propose the grouping in one firstmate_ask card (kind question), then adopt after the answer.",
     parameters: workstreamActionSchema,
     async execute(input, ctx) {
       try { return JSON.stringify(await workstreamOperation(input.action, {...input,threadId:ctxString(ctx,"threadId") ?? ""})); }
@@ -14222,7 +14339,11 @@ export default async function plugin(bb: BbPluginApi) {
         if (ids.length > 1 || (workstreamId && ids.some((id) => id !== workstreamId))) return toolError("Dispatch mixes workstreams; name one owner's sourceRefs.");
         workstreamId ??= ids[0];
         if (workstreamId) {
-          try { const w = workstreams.get(workstreamId, parentThreadId); if (!w.repos.some((r) => r.projectId === resolvedProject)) return toolError("Project does not belong to workstream."); }
+          try {
+            const w = workstreams.get(workstreamId, parentThreadId);
+            const belongs = w.repos.length === 0 ? w.projectId === resolvedProject : w.repos.some((r) => r.projectId === resolvedProject);
+            if (!belongs) return toolError("Project does not belong to workstream.");
+          }
           catch (error) { return toolError(String(error)); }
         }
       }
@@ -15824,6 +15945,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.rpc.register(rpcContract, {
     "workstreams.list": async (input) => workstreamListSchema.parse(await workstreamOperation("list", input)),
     "workstreams.create": async (input) => workstreamResultSchema.parse(await workstreamOperation("create", input)),
+    "workstreams.adopt": async (input) => workstreamResultSchema.parse(await workstreamOperation("adopt", input)),
     "workstreams.bindTopic": async (input) => workstreamResultSchema.parse(await workstreamOperation("bindTopic", input)),
     "workstreams.ship": async (input) => workstreamResultSchema.parse(await workstreamOperation("ship", input)),
     "workstreams.devLink": async (input) => workstreamDevLinkSchema.parse(await workstreamOperation("devLink", input)),
@@ -17148,7 +17270,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "deck", summary: "Bind native home and return agent-shell startup (not ready until native digest)", usage: "bb firstmate deck [--digest|--all] [--json]" },
       { name: "session", summary: "Session digest: memory + bearings + afk", usage: "bb firstmate session [--json]" },
       { name:"skill", summary:"Read selected native policy without mixing runtime versions", usage:"bb firstmate skill <name> [relative-reference] [--source <selected-root source-file>] [--json]" },
-      { name: "workstream", summary: "Create, Ship, End and open a workstream dev link", usage: "bb firstmate workstream list|create|bind-topic|ship|dev-link|end [--project <id>] [--name <name>] [--workstream-id <id>] [--request-id <stable-id>] [--chat-id <id>] [--topic-id <number>] [--real-login]" },
+      { name: "workstream", summary: "Create, adopt, Ship, End and open a workstream dev link", usage: "bb firstmate workstream list|create|adopt|bind-topic|ship|dev-link|end [--project <id>] [--name <name>] [--workstream-id <id>] [--request-id <stable-id>] [--task <id> ...] [--chat-id <id>] [--topic-id <number>] [--real-login]" },
       { name: "dispatch", summary: "Dispatch crewmate child threads", usage: dispatchHelp },
       { name: "crews", summary: "List recorded crews with live status", usage: "bb firstmate crews [--json]" },
       { name: "crew", summary: "Show one crew with last output", usage: "bb firstmate crew <crew-id> [--json]" },
@@ -17311,7 +17433,7 @@ export default async function plugin(bb: BbPluginApi) {
           case "workstream": {
             const rawAction = rest[0] ?? "list";
             const action = rawAction === "dev-link" ? "devLink" : rawAction === "bind-topic" ? "bindTopic" : rawAction;
-            const input = {threadId:ctxThread ?? "", projectId:flagStr(flags,"project"), name:flagStr(flags,"name"), workstreamId:flagStr(flags,"workstream-id"), requestId:flagStr(flags,"request-id"), chatId:flagStr(flags,"chat-id"), topicId:flagStr(flags,"topic-id") ? Number(flagStr(flags,"topic-id")) : undefined, realLogin:flags.has("real-login"), includeEnded:flags.has("include-ended")};
+            const input = {threadId:ctxThread ?? "", projectId:flagStr(flags,"project"), name:flagStr(flags,"name"), workstreamId:flagStr(flags,"workstream-id"), requestId:flagStr(flags,"request-id"), taskIds:flagAll(flags,"task"), chatId:flagStr(flags,"chat-id"), topicId:flagStr(flags,"topic-id") ? Number(flagStr(flags,"topic-id")) : undefined, realLogin:flags.has("real-login"), includeEnded:flags.has("include-ended")};
             const result = await workstreamOperation(action, input);
             return reply(result, JSON.stringify(result));
           }
@@ -17383,8 +17505,9 @@ export default async function plugin(bb: BbPluginApi) {
                   continue;
                 }
               }
+              const workstreamId = flagStr(flags,"workstream-id");
               const crew = await dispatchCrew({
-                workstreamId: flagStr(flags,"workstream-id"), workstreamRepo:flagStr(flags,"workstream-repo"),
+                workstreamId, workstreamRepo:flagStr(flags,"workstream-repo"),
                 task,
                 crewId:tasks.length === 1 ? flagStr(flags,"task-id") : undefined,
                 projectId,
@@ -17402,9 +17525,9 @@ export default async function plugin(bb: BbPluginApi) {
                 sendAt,signal,deliveryRequirement:flagStr(flags,"delivery-requirement") as "pr" | "merged" | "merged-and-verified" | undefined,
                 playbook, role, ownerRequestedProvider, modelPermission,
               });
-              if (crew.workstreamId && ctxThread) {
+              if (workstreamId && ctxThread) {
                 const tracked = ownerTasks.open({captain:ctxThread,project:await projectLabel(projectId),projectId,title:flagStr(flags,"title") ?? task.split("\n")[0]!.slice(0,120),sourceRefs:flagAll(flags,"source-ref"),crewId:crew.id,at:Date.now()});
-                await workstreams.attachTask(crew.workstreamId,ctxThread,tracked.id);
+                await workstreams.attachTask(workstreamId,ctxThread,tracked.id);
               }
               dispatched.push({ ...crew, status: crew.threadId ? await crewStatus(crew) : "queued" });
             }
