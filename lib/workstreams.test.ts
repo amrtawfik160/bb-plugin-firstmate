@@ -237,6 +237,31 @@ test('an editing follow-up waits while the workstream is busy', async () => {
   } finally { f.db.close(); }
 });
 
+test('Ship queues while an attached editor is busy, tells the owner once, then ships after idle', async () => {
+  const f = fixture();
+  let busy = true;
+  const told: string[] = [];
+  let ships = 0;
+  f.deps.editorBusy = async () => busy;
+  f.deps.waiting = async (w) => { told.push(w.id); };
+  f.deps.ship = async () => { ships++; };
+  try {
+    const w = await f.store.adopt({ threadId: 'cap', projectId: 'cyndra', name: 'Existing', requestId: 'adopt', taskIds: ['T1'] });
+    const first = await f.store.ship(w.id, 'cap', 'tap');
+    assert.equal(first.ship.state, 'queued');
+    assert.equal(ships, 0);
+    await f.store.ship(w.id, 'cap', 'tap');
+    assert.deepEqual(told, [w.id]);
+    busy = false;
+    const second = await f.store.ship(w.id, 'cap', 'tap');
+    assert.equal(second.ship.state, 'complete');
+    assert.equal(ships, 1);
+    busy = true;
+    await f.store.reconcile();
+    assert.equal(ships, 1);
+  } finally { f.db.close(); }
+});
+
 test('adopt refuses a task already in another workstream and creates nothing', async () => {
   const f = fixture();
   try {

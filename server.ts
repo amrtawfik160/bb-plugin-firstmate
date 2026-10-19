@@ -2277,6 +2277,20 @@ export default async function plugin(bb: BbPluginApi) {
     taskState: (id) => ownerTasks.get(id)?.state,
     busy: async (w) => workstreamCrewsActive(w, false),
     editorBusy: async (w) => workstreamCrewsActive(w, true),
+    waiting: async (w) => {
+      try {
+        await bb.sdk.plugins.callRpc({
+          pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "alert",
+          input: {
+            alertId: hashText(`${w.id}:ship-wait:${w.ship.requestId ?? ""}`).slice(0, 32),
+            level: "warning",
+            text: `Ship waits until every editing task finishes for workstream ${w.name}.`,
+            project: await projectLabel(w.projectId),
+          },
+          outputSchema: z.object({ queued: z.number(), duplicate: z.boolean() }),
+        });
+      } catch { /* owner notice is best-effort; Ship still waits */ }
+    },
     stall: async (w) => {
       if ((await reliabilityFlags()).telegramThreading !== "on") return false;
       const stale: string[] = [];
@@ -2313,24 +2327,19 @@ export default async function plugin(bb: BbPluginApi) {
     for (const taskId of taskIds) {
       const task = ownerTasks.get(taskId);
       for (const crew of crews.filter((c) => task?.crewIds.includes(c.id))) {
-        let hostId = selection?.hostId;
-        let path = selection?.checkout;
-        let environmentId = crew.environmentId ?? selection?.environmentId ?? null;
-        let branch = crew.branch ?? "main";
-        if (crew.environmentId) {
-          try {
-            const env = await bb.sdk.environments.get({ environmentId: crew.environmentId });
-            hostId = env.hostId;
-            path = env.path ?? path;
-            environmentId = env.id;
-            const named = (env as { branchName?: string }).branchName;
-            if (named) branch = named;
-          } catch { /* keep selection */ }
-        }
+        const envId = await threadEnv(crew.threadId);
+        if (!envId) continue;
+        let env: Record<string, unknown>;
+        try { env = asRecord(await bb.sdk.environments.get({ environmentId: envId })); }
+        catch { throw new Error(`Cannot resolve the worktree for task ${taskId}.`); }
+        const branch = typeof env["branchName"] === "string" ? env["branchName"] : "";
+        const path = typeof env["path"] === "string" ? env["path"] : "";
+        const hostId = typeof env["hostId"] === "string" ? env["hostId"] : "";
+        if (!branch || !path || !hostId || env["isWorktree"] === false) throw new Error(`Cannot resolve the worktree for task ${taskId}.`);
         const repository = (crew.prUrl ? prRepoOf(crew.prUrl) : undefined) ?? (task?.prs[0] ? prRepoOf(task.prs[0]) : undefined) ?? fallback;
-        add(repository, hostId, path, branch, environmentId, selection?.checkout ?? path ?? "");
+        if (!repository) throw new Error(`Cannot resolve the repository for task ${taskId}.`);
+        add(repository, hostId, path, branch, envId, selection?.checkout ?? path);
       }
-      for (const pr of task?.prs ?? []) add(prRepoOf(pr), selection?.hostId, selection?.checkout, "main", selection?.environmentId ?? null, selection?.checkout ?? "");
     }
     if (repos.length === 0) add(fallback, selection?.hostId, selection?.checkout, "main", selection?.environmentId ?? null, selection?.checkout ?? "");
     return repos;
