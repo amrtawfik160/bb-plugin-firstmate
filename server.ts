@@ -1,4 +1,4 @@
-import { affirmative, approvalPrs, compareSchema, createProductionApprovals, onlyBaseMerges, productionMergeGuard, PRODUCTION_APPROVAL_POINTER, PRODUCTION_CARD_RULE } from "./lib/production-approval.ts";
+import { affirmative, APPROVAL_CHOICES, approvalCardText, fixedApprovalChoices, compareSchema, createProductionApprovals, onlyBaseMerges, productionMergeGuard, PRODUCTION_APPROVAL_POINTER, PRODUCTION_CARD_RULE } from "./lib/production-approval.ts";
 // bb-plugin-firstmate — firstmate-style crews native to BB.
 import { deflateSync } from "node:zlib";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -9996,7 +9996,7 @@ export default async function plugin(bb: BbPluginApi) {
       } catch { /* Missing or incomplete ancestry requires a new card. */ }
       break;
     }
-    throw new Error(`Refusing: ${key} needs an owner approval card for its current changes; nothing was merged. Send firstmate_ask kind=approval naming ${key}, what changes, where it goes live, how to undo, and screenshots for visible changes. Wait for the owner's Yes or Approve answer. New author commits need a new card; --yes and standing approvals do not count.`);
+    throw new Error(`Refusing: ${key} needs an owner approval card for its current changes; nothing was merged. Send firstmate_ask kind=approval with structured prs naming ${key}, what changes, where it goes live, how to undo, and screenshots for visible changes. Pass prs=["${key}"] and omit options and recommended. Wait for the owner's Approve answer. New author commits need a new card; --yes and standing approvals do not count.`);
   }
 
   async function mergeCrew(
@@ -14384,12 +14384,13 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_ask",
-    description: "Ask the captain one question, blocker or approval as a Telegram card with up to 4 option buttons. It stays on the captain's board until answered. Returns at once: keep working on other things. The answer arrives from a button tap or a card reply containing just its option letter. Reversible cards sent within a minute of each other share one Telegram message with an \"Accept all recommended\" button; an answer there arrives as one owner message with a line \"- ask <id>: <option>\" per card it answered. irreversible=true or kind=approval never proceeds on a deadline and keeps its own message; a reversible ask with a recommended option proceeds with it at its deadline. A card names its project. A card the owner's rules in captain.md already answer is refused with the rule. A new card on the same task and subject replaces the open one.",
+    description: "Ask the captain one question, blocker or approval as a Telegram card with up to 4 option buttons. It stays on the captain's board until answered. Returns at once: keep working on other things. The answer arrives from a button tap or a card reply containing just its option letter. Reversible cards sent within a minute of each other share one Telegram message with an \"Accept all recommended\" button; an answer there arrives as one owner message with a line \"- ask <id>: <option>\" per card it answered. Approval cards supply fixed Approve and No buttons: omit options and recommended, and pass the exact authorized PR list in prs; question-text PR mentions grant no permission. irreversible=true or kind=approval never proceeds on a deadline and keeps its own message; a reversible ask with a recommended option proceeds with it at its deadline. A card names its project. A card the owner's rules in captain.md already answer is refused with the rule. A new card on the same task and subject replaces the open one.",
     parameters: z.object({
       impact: z.string().optional().describe("Optional. One plain sentence explaining what this means for the owner’s business"),
       question: z.string().min(1).max(1500).describe("One question, asked in the first sentence; put option text in options, not in the question. Cards sent together that start with the same subject and a colon (\"DM Pro plugin: ...\") get that subject as their shared title"),
       kind: z.enum(["question", "blocker", "approval"]),
-      options: z.array(z.object({ label: z.string().min(1).max(1000).describe("Short: up to 42 characters fit a button whole"), value: z.string().min(1).max(64).optional() })).max(4).optional(),
+      options: z.array(z.object({ label: z.string().min(1).max(1000).describe("Questions and blockers only; approval cards use fixed Approve and No buttons"), value: z.string().min(1).max(64).optional() })).max(4).optional(),
+      prs: z.array(z.string().max(200).regex(/^[\w.-]+\/[\w.-]+#[1-9]\d*$/)).max(20).optional().describe("Approval only: the exact PRs authorized by this card, as owner/repo#N. The plugin displays this list. PR mentions in question text grant no permission"),
       recommended: z.number().int().min(0).optional().describe("Index of the recommended option"),
       defaultAfterMinutes: z.number().min(5).max(10080).optional().describe("Proceed with the recommended option after this many minutes without an answer (reversible asks only)"),
       irreversible: z.boolean().optional().describe("A gated action (production deploy, money, deleting data, customer messages): never proceeds without an answer"),
@@ -14397,7 +14398,7 @@ export default async function plugin(bb: BbPluginApi) {
       project: z.string().min(1).max(80).optional().describe("Required unless task has one: the project this card is about, as on the board (such as Safi). With Telegram topics on, the card goes to that project's topic"),
       task: z.string().regex(/^T\d+$/).optional().describe("The owner task this card is for (T<n>). Unset: the open task the owner message of this turn started. In Telegram the card replies to the task's status line, which counts it"),
     }),
-    async execute({ impact, question, kind, options, recommended, defaultAfterMinutes, irreversible, startsNewWork, project, task: taskId }, ctx) {
+    async execute({ impact, question, kind, options, prs, recommended, defaultAfterMinutes, irreversible, startsNewWork, project, task: taskId }, ctx) {
       const captain = ctxString(ctx, "threadId");
       if (!captain) return toolError("firstmate_ask runs only in a captain thread.");
       if (taskId !== undefined && ownerTasks.get(taskId)?.captain !== captain) return toolError(`No owner task ${taskId} for this captain. Check firstmate_task list.`);
@@ -14409,7 +14410,14 @@ export default async function plugin(bb: BbPluginApi) {
       if (!cardProject) return toolError("Refusing: a card names its project. Pass project (as on the board, such as Safi), or task (T<n>) of a task that has one. Nothing was sent.");
       const answered = kind === "approval" ? null : await ruleAnswering(captain, [question, impact ?? "", ...(options ?? []).map((option, index) => `${String.fromCharCode(65 + index)}. ${option.label}`)].filter(Boolean).join("\n"));
       if (answered !== null) return toolError(`Refusing: the owner's rules already answer this card, so it was not sent. Rule: "${answered}". Act on it and say in one line what you did.`);
-      const choices = (options ?? []).map((option, index) => ({ label: option.label, value: option.value ?? String.fromCharCode(65 + index) }));
+      if (kind === "approval" && ((options !== undefined && !fixedApprovalChoices(options)) || recommended !== undefined)) {
+        return toolError("Refusing: approval cards use fixed Approve and No buttons, with no captain-set recommendation. Omit options and recommended.");
+      }
+      if (kind !== "approval" && prs !== undefined) return toolError("Refusing: prs belongs only to an approval card.");
+      const targets = [...new Set((prs ?? []).map(pr => pr.toLowerCase()))];
+      const cardText = kind === "approval" ? approvalCardText(question, targets) : question.trim();
+      if (cardText.length > 1500) return toolError("Refusing: question plus the exact PR list exceeds 1500 characters. Shorten the question; the PR list is never truncated.");
+      const choices = kind === "approval" ? APPROVAL_CHOICES.map(option => ({...option})) : (options ?? []).map((option, index) => ({ label: option.label, value: option.value ?? String.fromCharCode(65 + index) }));
       if (recommended !== undefined && recommended >= choices.length) return toolError(`recommended must be the index of one of the ${choices.length} option(s).`);
       const newWork = startsNewWork === true;
       const gated = !mayDefault({ kind: kind as AskKind, irreversible: irreversible === true, startsNewWork: newWork });
@@ -14421,7 +14429,7 @@ export default async function plugin(bb: BbPluginApi) {
       const now = Date.now();
       const approvalHeads: Array<{pr: string; head: string}> = [];
       if (kind === "approval") {
-        for (const pr of approvalPrs(question)) {
+        for (const pr of targets) {
           const [repo, number] = pr.split("#");
           const hostId = await resolveHostId(undefined, ctx);
           const identity = await ghPrIdentity(hostId, `https://github.com/${repo}/pull/${number}`);
@@ -14430,12 +14438,12 @@ export default async function plugin(bb: BbPluginApi) {
         }
       }
       const ask = ownerAsks.create({
-        captain, kind: kind as AskKind, impact: impact?.replace(/\s+/g, " ").trim().slice(0, 300), text: question.trim(), options: choices,
+        captain, kind: kind as AskKind, impact: impact?.replace(/\s+/g, " ").trim().slice(0, 300), text: cardText, options: choices,
         recommended: recommended ?? null, defaultAt: minutes > 0 ? now + Math.round(minutes * 60_000) : null,
         irreversible: irreversible === true, startsNewWork: newWork, createdAt: now,
         project: cardProject, ...(cardTask !== undefined ? { task: cardTask } : {}), subject: cardSubject(question),
       });
-      for (const {pr, head} of approvalHeads) productionApprovals.bind(ask.id, pr, head);
+      if (kind === "approval") productionApprovals.bindCard(ask.id, approvalHeads);
       const replaced = await replaceOpenCards(ask);
       const deadline = ask.defaultAt !== null
         ? ` If no answer by ${formatUtcTime(ask.defaultAt)}, it proceeds with "${recommendedLabel(ask)}" and you are told to go ahead.`

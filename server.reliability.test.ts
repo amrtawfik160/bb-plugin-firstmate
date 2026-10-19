@@ -1188,7 +1188,7 @@ test("firstmate_ask refuses a deadline on an approval or an irreversible ask, an
     await telegramFlags(host);
     connectorOk(host);
     const options = [{ label: "Deploy" }, { label: "Wait" }];
-    const approval = await askTool(host, { question: "Deploy billing?", kind: "approval", options, recommended: 0, defaultAfterMinutes: 30 });
+    const approval = await askTool(host, { question: "Deploy billing?", kind: "approval", defaultAfterMinutes: 30 });
     assert.ok(isError(approval), text(approval));
     assert.match(text(approval), /defaultAfterMinutes is not allowed for an approval/);
     const gated = await askTool(host, { question: "Delete old data?", kind: "question", options, recommended: 1, defaultAfterMinutes: 30, irreversible: true });
@@ -1694,7 +1694,7 @@ test("firstmate_reply sends a reply as written: options, a decision phrase or a 
     host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
     const ctx = { threadId: "thr_cap", projectId: "proj_1" } as never;
     const card = await tool(host, "firstmate_ask").execute({
-      kind: "approval", irreversible: true, recommended: 0, project: "Safi",
+      kind: "question", irreversible: true, recommended: 0, project: "Safi",
       question: "Safi savings: some users already had money in their goals before this change. Should that old money also come out of \"money on hand\"?",
       options: [{ label: "B: Yes. Take existing goal money out of money on hand too." }, { label: "A: No. Old goal money stays in money on hand." }],
     }, ctx);

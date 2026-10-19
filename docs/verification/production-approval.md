@@ -32,17 +32,25 @@ an approval card naming that change.
 
 ## Approval record
 
-A card names PRs as `owner/repo#N`; one card can name several PRs. Card creation
-reads and stores each PR head. Existing cards without a stored head require a
-new card. Only owner connector answers grant permission. Captain corrections and plain RPC calls without a matching Telegram owner tap,
-unknown old answer provenance, rejected answers, defaults and unanswered cards
-cannot grant it. Approve/Yes labels or explicit `approve`/`yes` option values
-are affirmative. Other answers require a new card.
+A card takes PRs from the structured `firstmate_ask prs` field, as
+`owner/repo#N`. The plugin normalizes and deduplicates that list, displays it in
+“PRs approved by this card”, and captures only those PR heads. Contextual or
+rollback PR mentions in the question do not grant permission. The rendered
+question and complete list must fit the card limit; the list is never truncated.
+
+The plugin supplies fixed Approve and No buttons. It rejects other option sets
+and captain-set recommendations. Authorization reads only the visible Approve
+answer on the fixed card, never a captain-defined hidden value. Existing cards
+without a structured-target record require a new card. Captain corrections,
+plain RPC calls without a matching Telegram owner tap, unanswered cards and No
+cannot grant permission. Device proof cards remain a separate proof mechanism
+and cannot authorize production merges.
 
 The newest card for this PR and captain takes precedence, so a later No cannot
 be bypassed with an older approval. New author commits invalidate the card. A changed head is accepted only when
 GitHub comparison data proves that its first-parent changes are merges whose
-other parents are already in the PR base. Missing, divergent or truncated
+other parents are already in the PR base, including manual conflict-resolution edits
+(owner decision in review round 1). Missing, divergent or truncated
 ancestry refuses. The existing verification and checker gates still apply to
 the current head, even when approval survives a base merge.
 
@@ -72,3 +80,16 @@ local shell tests use temporary fake `gh` executables.
 Transport pins were updated with the owner-authorized boundary change and its
 causal regression evidence. Native source, ownership guards and ownership
 classifications were preserved.
+
+Review round 1 reproduced all four checker failures before the fix, plus the
+chat and board Ship variants. The tests exercise the copied real Telegram
+connector with fake Telegram and in-memory databases. They cover both visible
+Approve and No through chat and board, rejected contradictory option sets,
+legacy contradictory cards, and structured-only PR binding and card rendering.
+
+The approval integration fixture uses `APPROVAL_TELEGRAM_CHECKOUT` (falling back
+to `TELEGRAM_CHECKOUT` or the sibling checkout). This runs the real approval
+transport independently of older optional cross-repository integration tests.
+With the checker’s connector copy, the older file-delivery notification test
+fails identically on head `0799293e` and this revision; it is not an approval
+regression. Its evidence is preserved with the round-1 test logs.

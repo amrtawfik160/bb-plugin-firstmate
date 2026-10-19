@@ -4,33 +4,41 @@ import type { createOwnerAsks, OwnerAsk } from "./owner-asks.ts";
 type Database = Parameters<typeof createOwnerAsks>[0];
 
 export const PRODUCTION_RULE = 'Production approval: do not merge, publish, deploy, submit or write to production. Report "ready to go live" with what changes, where and how to undo. Go live only after the captain passes on the owner’s approval card naming that change.';
-export const PRODUCTION_APPROVAL_POINTER = "Every production change needs firstmate_ask kind=approval naming what changes, where, how to undo, and screenshots for visible changes. Name PRs as owner/repo#N and wait for the owner’s Yes/Approve. Standing approvals never replace this card.";
-export const PRODUCTION_CARD_RULE = "Before any production change, send firstmate_ask kind=approval. Name what changes, where it goes live, how to undo, and screenshots for visible changes. Name each PR as owner/repo#N. Wait for the owner's Yes or Approve answer. Production includes a merge to a branch that deploys, website publish, OTA update, App Store or external TestFlight submit, customer server or fleet update, production database or config write, and live plugin or bot change. Read-only checks need no approval. Standing approvals and --yes do not replace this card.";
+export const PRODUCTION_APPROVAL_POINTER = "Every production change needs firstmate_ask kind=approval naming what changes, where, how to undo, and screenshots for visible changes. Pass PRs in prs=[owner/repo#N] and wait for the owner’s Approve on the plugin’s fixed Approve/No buttons. Standing approvals never replace this card.";
+export const PRODUCTION_CARD_RULE = "Before any production change, send firstmate_ask kind=approval. Name what changes, where it goes live, how to undo, and screenshots for visible changes. Pass PRs in the structured prs=[owner/repo#N] field, not question text. The plugin displays exactly that list and supplies fixed Approve and No buttons. Omit options and recommended. Wait for the owner's Approve answer. Production includes a merge to a branch that deploys, website publish, OTA update, App Store or external TestFlight submit, customer server or fleet update, production database or config write, and live plugin or bot change. Read-only checks need no approval. Standing approvals and --yes do not replace this card.";
 
-/** Parse PR identifiers, never infer permission from agent-written prose. */
-export function approvalPrs(text: string): string[] {
-  return [...new Set([...text.matchAll(/\b([\w.-]+\/[\w.-]+)#([1-9]\d*)\b/g)].map((m) => `${m[1]!.toLowerCase()}#${m[2]}`))];
+export const APPROVAL_CHOICES = [{label:"Approve",value:"approve"},{label:"No",value:"no"}] as const;
+
+export function fixedApprovalChoices(options: readonly {label:string;value?:string}[]): boolean {
+  return options.length === APPROVAL_CHOICES.length && options.every((option,index) => {
+    const fixed = APPROVAL_CHOICES[index]!;
+    return option.label === fixed.label && (option.value === undefined || option.value === fixed.value);
+  });
 }
 
+/** Permission comes from the owner's visible choice, never an agent's hidden value. */
 export function affirmative(ask: OwnerAsk): boolean {
-  const answer = ask.resolution?.trim().toLowerCase();
-  if (answer === "yes" || answer === "approve") return true;
-  const option = ask.options.find((o) => o.label.trim().toLowerCase() === answer);
-  const value = (option?.value ?? answer)?.toLowerCase();
-  return value === "yes" || value === "approve";
+  return fixedApprovalChoices(ask.options) && ask.resolution === "Approve";
+}
+
+export function approvalCardText(question: string, prs: readonly string[]): string {
+  return `${question.trim()}\n\nPRs approved by this card:\n${prs.length ? prs.map(pr => `- ${pr}`).join("\n") : "None"}`;
 }
 
 export function createProductionApprovals(db: Database) {
-  db.exec("CREATE TABLE IF NOT EXISTS production_approval_pr (ask TEXT NOT NULL, pr TEXT NOT NULL, head TEXT NOT NULL, PRIMARY KEY(ask,pr))");
+  db.exec("CREATE TABLE IF NOT EXISTS production_approval_pr (ask TEXT NOT NULL, pr TEXT NOT NULL, head TEXT NOT NULL, PRIMARY KEY(ask,pr)); CREATE TABLE IF NOT EXISTS production_approval_card (ask TEXT PRIMARY KEY, prs TEXT NOT NULL)");
   return {
-    bind(ask: string, pr: string, head: string) {
-      db.prepare("INSERT INTO production_approval_pr VALUES (?,?,?)").run(ask, pr.toLowerCase(), head);
+    bindCard(ask: string, targets: readonly {pr:string;head:string}[]) {
+      db.transaction(() => {
+        db.prepare("INSERT INTO production_approval_card VALUES (?,?)").run(ask, JSON.stringify(targets.map(target => target.pr)));
+        for (const {pr,head} of targets) db.prepare("INSERT INTO production_approval_pr VALUES (?,?,?)").run(ask, pr, head);
+      })();
     },
     has(ask: string): boolean {
-      return db.prepare("SELECT ask FROM production_approval_pr WHERE ask=? LIMIT 1").get(ask) !== undefined;
+      return db.prepare("SELECT ask FROM production_approval_card WHERE ask=?").get(ask) !== undefined;
     },
     candidates(pr: string) {
-      return z.array(z.object({ ask: z.string(), head: z.string() })).parse(db.prepare("SELECT ask,head FROM production_approval_pr WHERE pr=? ORDER BY rowid DESC").all(pr.toLowerCase()));
+      return z.array(z.object({ ask: z.string(), head: z.string() })).parse(db.prepare("SELECT p.ask,p.head FROM production_approval_pr p JOIN production_approval_card c ON c.ask=p.ask WHERE p.pr=? ORDER BY p.rowid DESC").all(pr.toLowerCase()));
     },
   };
 }

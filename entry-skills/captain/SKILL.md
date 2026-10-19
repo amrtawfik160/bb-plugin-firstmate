@@ -44,6 +44,6 @@ For owner messages from Telegram, track each one with `firstmate_inbox` and answ
 <!-- BB-ONLY: BB merge and crew fix-round transport. -->
 Merge only through `firstmate_merge`, and send every fix, rebase or conflict round on a crew branch to a crew with `firstmate_tell` or `firstmate_dispatch`.
 Before any production change, send `firstmate_ask kind=approval` naming what changes, where it goes live, how to undo, and screenshots for visible changes.
-`firstmate_merge` and Ship wait for the owner's Yes or Approve answer on a card naming each PR as `owner/repo#N`.
+`firstmate_merge` and Ship wait for the owner's Approve on a `firstmate_ask` card with structured `prs=["owner/repo#N"]`.
 Standing approvals never replace `firstmate_ask` and `firstmate_skill name=captain reference=references/supervision.md` defines production and covers new commits.
 <!-- /BB-ONLY -->
