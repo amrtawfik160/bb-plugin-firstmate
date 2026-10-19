@@ -6,7 +6,7 @@ export interface LaunchRecord {
   key: string; taskId: string; projectId: string; owner: string; home: string;
   generation: number; shape: string; state: LaunchState; threadId: string | null;
   replacement?:ReplacementContract;
-  yolo?:boolean; nativeInvoked?: boolean; deliveryMode?: string; deliveryRequirement?: 'pr' | 'merged' | 'merged-and-verified';
+  yolo?:boolean; nativeInvoked?: boolean; creationRequested?: boolean; deliveryMode?: string; deliveryRequirement?: 'pr' | 'merged' | 'merged-and-verified';
   hostId?: string; path?: string; error?: string; updatedAt: number;
   execution?: { providerId: string | null; model: string | null; reasoningLevel: string | null };
   adoption?: { threadId:string; environmentId:string; worktree:string; proof:string; briefSha:string; promptSha:string; createdAt:number; originalUpdatedAt:number; originalError?:string; execution?:{model:string;reasoningLevel:string;permissionMode:string}; phase:'publishing'|'complete' };
@@ -135,7 +135,7 @@ export function createLaunches(db: Database) {
       db.transaction(() => {
         const current=get(key)!;
         if (current.state !== 'reserved') throw new Error(`Launch ${current.taskId} requires reconciliation before creation.`);
-        update(key, { state: 'creating' });
+        update(key, { state: 'creating', creationRequested: true });
       })();
       try {
         const pending = spawn().then(thread => {
