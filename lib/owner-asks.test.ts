@@ -455,6 +455,48 @@ test("a resolve without tapId does not renew a tap-identified answer", () => {
   assert.equal(row.tap_id, "tg:1");
 });
 
+test("replaying the same tapId after reopen keeps the owner skip", () => {
+  const asks = createOwnerAsks(db());
+  const options = [{ label: "No", value: "no" }, { label: "Approve", value: "approve" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "approval", text: "Merge?", options, createdAt: NOW });
+  const stamp = { tapId: "board:repeat-skip", answeredAt: NOW };
+  asks.resolve("a1", "thr_cap", "answered", "Approve", NOW, "owner", stamp);
+  asks.resolve("a1", "thr_cap", "open", "Reopen", NOW + 100);
+  const until = NOW + 60_000;
+  assert.deepEqual(asks.defer(["a1"], "thr_cap", until).refused, []);
+  const before = asks.get("a1");
+  assert.equal(asks.resolve("a1", "thr_cap", "answered", "Approve", NOW + 200, "owner", stamp), undefined);
+  assert.deepEqual(asks.get("a1"), before);
+});
+
+test("an unstamped owner answer still records follow-ups and does not stamp tap_id", () => {
+  const database = db();
+  const asks = createOwnerAsks(database);
+  const options = [{ label: "Yes", value: "yes" }, { label: "No", value: "no" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "question", text: "Ship?", options, createdAt: NOW });
+  assert.equal(asks.resolve("a1", "thr_cap", "answered", "Yes", NOW, "owner")?.resolution, "Yes");
+  assert.equal(asks.answeredByOwner("a1"), true);
+  const row = database.prepare("SELECT tap_id, at FROM owner_ask_answer WHERE id=?").get("a1") as { tap_id: string | null; at: number };
+  assert.equal(row.tap_id, null);
+  assert.equal(row.at, NOW);
+  assert.equal(asks.pendingFollowUps().length, 2);
+});
+
+test("rows recorded before the stamp cutoff keep a grant mark", () => {
+  const database = db();
+  database.exec(`CREATE TABLE owner_ask (
+    id TEXT PRIMARY KEY, captain TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL, options TEXT NOT NULL,
+    recommended INTEGER, default_at INTEGER, irreversible INTEGER NOT NULL, state TEXT NOT NULL,
+    resolution TEXT, created_at INTEGER NOT NULL, resolved_at INTEGER)`);
+  database.exec("CREATE TABLE owner_ask_answer (id TEXT PRIMARY KEY, source TEXT NOT NULL, resolution TEXT, at INTEGER, tap_id TEXT)");
+  database.prepare("INSERT INTO owner_ask VALUES ('old','thr_cap','approval','Merge?','[]',null,null,0,'answered','Approve',1,1)").run();
+  database.prepare("INSERT INTO owner_ask_answer VALUES ('old','owner','Approve',1,null)").run();
+  createOwnerAsks(database);
+  const row = database.prepare("SELECT tap_id, at FROM owner_ask_answer WHERE id=?").get("old") as { tap_id: string; at: number };
+  assert.equal(row.tap_id, "legacy:old");
+  assert.equal(row.at, 1);
+});
+
 test("a skipped card answered early is answered, and a reopened card is no longer skipped", () => {
   const asks = createOwnerAsks(db());
   const options = [{ label: "Yes", value: "yes" }];

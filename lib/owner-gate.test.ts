@@ -272,7 +272,7 @@ test("the store records a pre-approval and a deploy without approval", () => {
     options: [{ label: "Approve", value: "approve" }, { label: "No", value: "no" }], createdAt: 1,
   });
   createProductionApprovals(database).bindCard(ask.id, [{ pr: PR, head: HEAD }]);
-  asks.resolve(ask.id, "thr_cap", "answered", "Approve", 2, "owner");
+  asks.resolve(ask.id, "thr_cap", "answered", "Approve", 2, "owner", { tapId: `test:${ask.id}`, answeredAt: 2 });
   const loaded = gate.cardsForPr(PR);
   assert.equal(loaded[0]?.answeredByOwner, true);
   assert.equal(loaded[0]?.head, HEAD);
@@ -382,7 +382,7 @@ test("cardsForPr still reads owner No after captain cancel or reopen", () => {
     options: [{ label: "Approve", value: "approve" }, { label: "No", value: "no" }], createdAt: 2,
   });
   createProductionApprovals(database).bindCard(ask.id, [{ pr: PR, head: HEAD }]);
-  asks.resolve(ask.id, "thr_cap", "answered", "No", 3, "owner");
+  asks.resolve(ask.id, "thr_cap", "answered", "No", 3, "owner", { tapId: `test:${ask.id}`, answeredAt: 3 });
   asks.resolve(ask.id, "thr_cap", "cancelled", "Captain clearing old card", 4);
   const loaded = gate.cardsForPr(PR);
   assert.equal(loaded[0]?.answeredByOwner, true);
@@ -402,19 +402,19 @@ test("cardsForPr uses stored owner-answer time so a later No on an earlier card 
     options: [{ label: "Approve", value: "approve" }, { label: "No", value: "no" }], createdAt: 1,
   });
   createProductionApprovals(database).bindCard(first.id, [{ pr: PR, head: HEAD }]);
-  asks.resolve(first.id, "thr_cap", "answered", "No", 10, "owner");
+  asks.resolve(first.id, "thr_cap", "answered", "No", 10, "owner", { tapId: "test:first-no", answeredAt: 10 });
   asks.resolve(first.id, "thr_cap", "open", "Ask owner again", 11);
   const second = asks.create({
     captain: "thr_cap", kind: "approval", text: `Merge ${PR}?`,
     options: [{ label: "Approve", value: "approve" }, { label: "No", value: "no" }], createdAt: 2,
   });
   createProductionApprovals(database).bindCard(second.id, [{ pr: PR, head: HEAD }]);
-  asks.resolve(second.id, "thr_cap", "answered", "Approve", 20, "owner");
+  asks.resolve(second.id, "thr_cap", "answered", "Approve", 20, "owner", { tapId: "test:second-yes", answeredAt: 20 });
   assert.equal(approvalFor({
     pr: PR, head: HEAD, action: "merge", cards: gate.cardsForPr(PR), coverage: () => "covers",
     preApprovals: [pre()], task: "T12", taskOpen: true, generation: 1,
   }).state, "success");
-  asks.resolve(first.id, "thr_cap", "answered", "No", 30, "owner");
+  asks.resolve(first.id, "thr_cap", "answered", "No", 30, "owner", { tapId: "test:first-no-again", answeredAt: 30 });
   const loaded = gate.cardsForPr(PR);
   assert.equal(loaded.find((row) => row.id === first.id)?.answeredAt, 30);
   assert.equal(loaded.find((row) => row.id === second.id)?.answeredAt, 20);
@@ -422,6 +422,46 @@ test("cardsForPr uses stored owner-answer time so a later No on an earlier card 
     pr: PR, head: HEAD, action: "merge", cards: loaded, coverage: () => "covers",
     preApprovals: [pre()], task: "T12", taskOpen: true, generation: 1,
   }).state, "pending");
+});
+
+test("an unstamped owner Approve does not grant merge or production", () => {
+  const database = db();
+  const asks = createOwnerAsks(database);
+  const gate = createOwnerGate(database);
+  const ask = asks.create({
+    captain: "thr_cap", kind: "approval", text: `Merge ${PR}?`,
+    options: [{ label: "Approve", value: "approve" }, { label: "No", value: "no" }], createdAt: 1,
+  });
+  createProductionApprovals(database).bindCard(ask.id, [{ pr: PR, head: HEAD }]);
+  asks.resolve(ask.id, "thr_cap", "answered", "Approve", 2, "owner");
+  const loaded = gate.cardsForPr(PR);
+  assert.equal(loaded[0]?.answeredByOwner, false);
+  assert.equal(approvalFor({
+    pr: PR, head: HEAD, action: "merge", cards: loaded, coverage: () => "covers",
+    preApprovals: [], task: "T12", taskOpen: true, generation: 1,
+  }).state, "pending");
+});
+
+test("a migrated pre-stamp owner row still grants", () => {
+  const database = db();
+  database.exec(`CREATE TABLE owner_ask (
+    id TEXT PRIMARY KEY, captain TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL, options TEXT NOT NULL,
+    recommended INTEGER, default_at INTEGER, irreversible INTEGER NOT NULL, state TEXT NOT NULL,
+    resolution TEXT, created_at INTEGER NOT NULL, resolved_at INTEGER)`);
+  database.exec("CREATE TABLE owner_ask_answer (id TEXT PRIMARY KEY, source TEXT NOT NULL, resolution TEXT, at INTEGER, tap_id TEXT)");
+  database.prepare("INSERT INTO owner_ask VALUES ('old','thr_cap','approval','Merge?','[]',null,null,0,'answered','Approve',1,2)").run();
+  database.prepare("INSERT INTO owner_ask_answer VALUES ('old','owner','Approve',2,null)").run();
+  const asks = createOwnerAsks(database);
+  const gate = createOwnerGate(database);
+  createProductionApprovals(database).bindCard("old", [{ pr: PR, head: HEAD }]);
+  const loaded = gate.cardsForPr(PR);
+  assert.equal(asks.answeredByOwner("old"), true);
+  assert.equal(loaded[0]?.answeredByOwner, true);
+  assert.equal(loaded[0]?.answeredAt, 2);
+  assert.equal(approvalFor({
+    pr: PR, head: HEAD, action: "merge", cards: loaded, coverage: () => "covers",
+    preApprovals: [],
+  }).state, "success");
 });
 
 test("no-PR prod-check uses approvalFor so a covering pre-approval still succeeds", () => {

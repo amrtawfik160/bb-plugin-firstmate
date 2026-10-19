@@ -355,6 +355,16 @@ export function createOwnerAsks(db: Database): OwnerAsks {
     db.exec("UPDATE owner_ask_answer SET resolution=(SELECT resolution FROM owner_ask WHERE owner_ask.id=owner_ask_answer.id) WHERE source='owner' AND (resolution IS NULL OR resolution='')");
     db.exec("UPDATE owner_ask_answer SET at=(SELECT resolved_at FROM owner_ask WHERE owner_ask.id=owner_ask_answer.id) WHERE source='owner' AND at IS NULL");
   } catch { /* owner_ask is always created first; ignore a half-migrated test database */ }
+  db.exec("CREATE TABLE IF NOT EXISTS owner_ask_stamp_migrated (v INTEGER PRIMARY KEY)");
+  if (db.prepare("SELECT v FROM owner_ask_stamp_migrated WHERE v=1").get() === undefined) {
+    db.exec("INSERT INTO owner_ask_stamp_migrated(v) VALUES (1)");
+    try {
+      db.exec(`UPDATE owner_ask_answer
+        SET tap_id = CASE WHEN tap_id IS NULL OR tap_id = '' THEN 'legacy:' || id ELSE tap_id END,
+            at = COALESCE(at, (SELECT resolved_at FROM owner_ask WHERE owner_ask.id = owner_ask_answer.id), 0)
+        WHERE source = 'owner'`);
+    } catch { /* owner_ask missing on a half-migrated test database */ }
+  }
   db.exec(`
     CREATE TABLE IF NOT EXISTS owner_ask_source (
     captain TEXT NOT NULL, source_ref TEXT NOT NULL, ask_id TEXT NOT NULL,
@@ -552,9 +562,10 @@ export function createOwnerAsks(db: Database): OwnerAsks {
           const reopen = db.prepare("SELECT at FROM owner_ask_reopen WHERE id=?").get(id) as { at: number } | undefined;
           const tapId = typeof tap?.tapId === "string" && tap.tapId !== "" ? tap.tapId : undefined;
           const answeredAt = tap !== undefined && tapId !== undefined && Number.isFinite(tap.answeredAt) ? Math.min(tap.answeredAt, at) : undefined;
+          const stamped = tapId !== undefined && answeredAt !== undefined;
           if (tapId !== undefined && existing?.tap_id === tapId) {
-            clearDefer();
-            return rest;
+            if (reopen !== undefined && (answeredAt === undefined || answeredAt <= reopen.at)) return undefined;
+            return current;
           }
           if (reopen !== undefined && answeredAt !== undefined && answeredAt <= reopen.at) return undefined;
           const identified = typeof existing?.tap_id === "string" && existing.tap_id !== "";
@@ -566,9 +577,11 @@ export function createOwnerAsks(db: Database): OwnerAsks {
           }
           const displayAt = answeredAt ?? at;
           db.prepare("UPDATE owner_ask SET state=?, resolution=?, resolved_at=? WHERE id=?").run(state, resolution, displayAt, id);
-          // A resolve without tapId never creates or renews a tap-identified permission.
-          if (tapId !== undefined || !identified) {
-            db.prepare("INSERT INTO owner_ask_answer(id, source, resolution, at, tap_id) VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET source=excluded.source, resolution=excluded.resolution, at=excluded.at, tap_id=excluded.tap_id").run(id, source, resolution, displayAt, tapId ?? existing?.tap_id ?? null);
+          if (stamped) {
+            db.prepare("INSERT INTO owner_ask_answer(id, source, resolution, at, tap_id) VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET source=excluded.source, resolution=excluded.resolution, at=excluded.at, tap_id=excluded.tap_id").run(id, source, resolution, displayAt, tapId);
+            enqueueOwnerFollowUps(resolution, displayAt);
+          } else if (!identified) {
+            db.prepare("INSERT INTO owner_ask_answer(id, source, resolution, at, tap_id) VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET source=excluded.source, resolution=excluded.resolution, at=excluded.at, tap_id=excluded.tap_id").run(id, source, resolution, displayAt, null);
             enqueueOwnerFollowUps(resolution, displayAt);
           }
           clearDefer();

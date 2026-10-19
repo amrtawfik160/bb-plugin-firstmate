@@ -176,11 +176,11 @@ async function originMessage(host:Host,msg:string,input:{sender:string|null;init
 
 test('ROUND6 connector retry editing an earlier Approve must not replace later owner No',async()=>{
  const {pathToFileURL}=await import('node:url');
- await import(pathToFileURL('/tmp/firstmate-170-telegram-check-6/test/register.mjs').href);
- const {baseConfig,cycle,makeHarness,openStore}=await import(pathToFileURL('/tmp/firstmate-170-telegram-check-6/test/support.ts').href);
+ await import(pathToFileURL('/tmp/firstmate-170-telegram-check-8/test/register.mjs').href);
+ const {baseConfig,cycle,makeHarness,openStore}=await import(pathToFileURL('/tmp/firstmate-170-telegram-check-8/test/support.ts').href);
  const {host}=await deck();const {store,db}=openStore();let taskId='';let refusedWhenNoArrived=false;
  const rpcTrace:Array<{id:string;resolution:string;at:number}>=[];
- const tg=makeHarness({store,config:baseConfig({captainThreadId:'thr_cap',threadedReplies:'on',pinnedBoard:false}),resolveAsk:async(input:{threadId:string;id:string;resolution:string})=>{
+ const tg=makeHarness({store,now:Date.now,config:baseConfig({captainThreadId:'thr_cap',threadedReplies:'on',pinnedBoard:false}),resolveAsk:async(input:{threadId:string;id:string;resolution:string})=>{
   await new Promise(resolve=>setTimeout(resolve,3));
   const out=await host.harness.behavior.callRpc('resolveAsk',input);
   rpcTrace.push({id:input.id,resolution:input.resolution,at:Date.now()});
@@ -205,7 +205,7 @@ test('ROUND6 connector retry editing an earlier Approve must not replace later o
   assert.equal(tg.engine.ownerAnswer({askId:firstId}).answer,'Approve');
   assert.equal(tg.engine.ownerAnswer({askId:second.id}).answer,'No');
   const cards=createOwnerGate(host.bb.storage.database()).cardsForPr(PR);
-  writeFileSync('/tmp/firstmate-170-r6-checker-retry-trace.json',JSON.stringify({rpcTrace,cards,refusedWhenNoArrived,pending:store.listControls('ask-edit:'),telegramEdits:tg.telegram.edits},null,2));
+  writeFileSync('/root/.local/share/hanoon-telegram-plan/170-check-8/170-retry-trace-8.json',JSON.stringify({rpcTrace,cards,refusedWhenNoArrived,pending:store.listControls('ask-edit:'),telegramEdits:tg.telegram.edits},null,2));
   assert.equal(refusedWhenNoArrived,true,'newer No did not initially refuse');
   assert.equal((await cliCheck(host,task.id)).exitCode,1,'connector chat-edit retry promoted the old Approve over the later owner No');
  }finally{await host.harness.lifecycle.dispose();db.close();}

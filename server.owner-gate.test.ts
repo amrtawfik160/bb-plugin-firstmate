@@ -113,12 +113,15 @@ function postedKind(commands: string[]): string {
 const askApproval = (host: Host) => tool(host, "firstmate_ask").execute({
   kind: "approval", prs: [PR], question: "Merge cyndra-ai/cyndra-saas#2391 to production? Undo: revert the PR.", project: "Cyndra",
 }, ctx);
-const ownerTap = (host: Host, id: string, answer = "Approve") => {
+let taps = 0;
+const ownerTap = async (host: Host, id: string, answer = "Approve") => {
+  await new Promise((resolve) => setTimeout(resolve, 3));
+  const stamp = { answeredAt: Date.now(), tapId: `board:${id}:${++taps}` };
   host.harness.sdk.stub("plugins.callRpc", async (call: RpcCall) => {
-    if (call.method === "ownerAnswer") return { answer, ok: true };
+    if (call.method === "ownerAnswer") return { answer, ok: true, ...stamp };
     return { ok: true, queued: 1, duplicate: false, mode: "on" };
   });
-  return host.harness.behavior.callRpc("resolveAsk", { threadId: "thr_cap", id, resolution: answer });
+  return host.harness.behavior.callRpc("resolveAsk", { threadId: "thr_cap", id, resolution: answer, ...stamp });
 };
 
 test("owner Approve posts success Owner approval status at the PR head", async () => {

@@ -6,5 +6,6 @@ export function approvePr(db: Parameters<typeof createOwnerAsks>[0], captain: st
   const asks = createOwnerAsks(db);
   const ask = asks.create({captain,kind:'approval',text:`Merge ${pr}?`,options:[{label:'Approve',value:'approve'},{label:'No',value:'no'}],createdAt:Date.now()});
   createProductionApprovals(db).bindCard(ask.id,[{pr,head}]);
-  asks.resolve(ask.id,captain,'answered','Approve',Date.now(),'owner');
+  const at=Date.now();
+  asks.resolve(ask.id,captain,'answered','Approve',at,'owner',{tapId:'test:'+ask.id,answeredAt:at});
 }

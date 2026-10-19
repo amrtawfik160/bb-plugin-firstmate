@@ -343,6 +343,7 @@ export function createOwnerGate(db: Database) {
            JOIN production_approval_card c ON c.ask=p.ask
            JOIN owner_ask a ON a.id=p.ask
            LEFT JOIN owner_ask_answer ans ON ans.id=p.ask AND ans.source='owner'
+             AND ans.tap_id IS NOT NULL AND ans.tap_id != '' AND ans.at IS NOT NULL
            WHERE lower(p.pr)=?
            ORDER BY p.rowid DESC`,
         ).all(pr.toLowerCase()) as CardRow[];

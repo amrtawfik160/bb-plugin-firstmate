@@ -45,10 +45,14 @@ is consumed then. Telegram gets a progress note that quotes the words.
 An owner No stays until the owner changes it. Captain cancel or reopen changes
 only the card; it never deletes or hides that answer. A newer owner answer is
 the only replacement. The stored answer time is the connector's tap time
-(`answeredAt`), never the RPC arrival time. The same `tapId` is a replay and
-changes nothing. A tap whose time is at or before the captain's reopen is
-refused. A resolve without `tapId` does not renew a tap-identified answer. A
-new owner tap after reopen has its own `tapId` and time.
+(`answeredAt`), never the RPC arrival time. Merge and production permission
+need both a nonempty connector `tapId` and a valid `answeredAt`. An unstamped
+answer (old connector) can still show on the card and still run ordinary
+question follow-ups; it never grants. Rows written before this version keep
+their grant: a one-shot migration marks them. The same `tapId` is a replay:
+if its time is at or before the captain's reopen it is refused and records
+nothing; otherwise the card is unchanged, including an owner skip. A new owner
+tap after reopen has its own `tapId` and time.
 
 Merge prod-check, deploy prod-check, Ship, firstmate_merge, deploy detection,
 and the GitHub status all call one function `approvalFor` and share one head

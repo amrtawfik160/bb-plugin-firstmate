@@ -178,12 +178,12 @@ async function originMessage(host:Host,msg:string,input:{sender:string|null;init
 
 async function connectorDeck7(deleted=true){
  const {pathToFileURL}=await import('node:url');
- await import(pathToFileURL('/tmp/firstmate-170-telegram-check-7/test/register.mjs').href);
- const {baseConfig,cycle,makeHarness,openStore}=await import(pathToFileURL('/tmp/firstmate-170-telegram-check-7/test/support.ts').href);
+ await import(pathToFileURL('/tmp/firstmate-170-telegram-check-8/test/register.mjs').href);
+ const {baseConfig,cycle,makeHarness,openStore}=await import(pathToFileURL('/tmp/firstmate-170-telegram-check-8/test/support.ts').href);
  let {host}=await deck();const {store,db}=openStore();const task=taskFor(host);
  let failReopen=false;let pauseId='';let release=()=>{};let reached=()=>{};let paused=Promise.resolve();
  const rpcTrace:Array<{id:string;resolution:string;at:number}>=[];
- const tg=makeHarness({store,config:baseConfig({captainThreadId:'thr_cap',threadedReplies:'on',pinnedBoard:false}),resolveAsk:async(input:{threadId:string;id:string;resolution:string})=>{
+ const tg=makeHarness({store,now:Date.now,config:baseConfig({captainThreadId:'thr_cap',threadedReplies:'on',pinnedBoard:false}),resolveAsk:async(input:{threadId:string;id:string;resolution:string})=>{
   if(input.id===pauseId){pauseId='';reached();await new Promise<void>(resolve=>{release=resolve;});}
   await new Promise(resolve=>setTimeout(resolve,3));
   const out=await host.harness.behavior.callRpc('resolveAsk',input);rpcTrace.push({id:input.id,resolution:input.resolution,at:Date.now()});return out;
@@ -195,7 +195,7 @@ async function connectorDeck7(deleted=true){
  await host.harness.behavior.setSettings({fmReliability:JSON.stringify({inboundLedger:'on',telegramThreading:'on'})});route();await cycle(tg.engine);
  const asks=()=>createOwnerAsks(host.bb.storage.database());
  const card=async()=>{await askApproval(host);const ask=asks().listOpen('thr_cap')[0]!;await cycle(tg.engine);const board=await tg.engine.boardState();const match=board.cards.find((c:{messageId:string})=>store.replyForMessage(c.messageId)?.source_event_id==='ask:'+ask.id);assert.ok(match,'card not rendered');return {id:ask.id,messageId:match.messageId};};
- const tap=async(messageId:string,label:string)=>{const board=await tg.engine.boardState();const c=board.cards.find((x:{messageId:string})=>x.messageId===messageId);assert.ok(c,'card not open on Board');const b=c.buttons.find((x:{text:string})=>x.text===label);assert.ok(b);assert.deepEqual(await tg.engine.boardAnswer({token:b.token}),{ok:true});await cycle(tg.engine);};
+ const tap=async(messageId:string,label:string)=>{await new Promise(resolve=>setTimeout(resolve,3));const board=await tg.engine.boardState();const c=board.cards.find((x:{messageId:string})=>x.messageId===messageId);assert.ok(c,'card not open on Board');const b=c.buttons.find((x:{text:string})=>x.text===label);assert.ok(b);assert.deepEqual(await tg.engine.boardAnswer({token:b.token}),{ok:true});await cycle(tg.engine);};
  const a=await card();if(deleted)tg.telegram.deleteMessage(Number(a.messageId));await tap(a.messageId,'Approve');
  if(deleted)assert.ok(store.listControls('ask-edit:').length>0);
  const b=await card();
@@ -211,7 +211,7 @@ async function connectorDeck7(deleted=true){
   async generation(){await tool(host,'firstmate_task').execute({action:'close',id:task.id,state:'dropped',reason:'stop old work',ref:'tg:200:9701'},ctx);tasksOf(host).attach(task.id,'thr_cap',{crewId:'next-generation',sourceRefs:['tg:200:9702'],at:Date.now()});},
   pauseNext(){paused=new Promise<void>(resolve=>{reached=resolve;});pauseId=a.id;return paused;},
   release(){release();},
-  snapshot(label:string){writeFileSync('/tmp/firstmate-170-r7-'+label+'.json',JSON.stringify({rpcTrace,cards:createOwnerGate(host.bb.storage.database()).cardsForPr(PR),pending:store.listControls('ask-edit:'),edits:tg.telegram.edits},null,2));},
+  snapshot(label:string){writeFileSync('/root/.local/share/hanoon-telegram-plan/170-check-8/170-trace-8-'+label+'.json',JSON.stringify({rpcTrace,cards:createOwnerGate(host.bb.storage.database()).cardsForPr(PR),pending:store.listControls('ask-edit:'),edits:tg.telegram.edits},null,2));},
   async dispose(){release();await host.harness.lifecycle.dispose();db.close();},
  };
 }
