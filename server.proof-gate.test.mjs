@@ -388,3 +388,74 @@ test('merge keeps a crew with required verification until its merged commit is v
   assert.equal(commands.some(c=>c.includes('fm-teardown.sh')),false);
  } finally {await host.harness.lifecycle.dispose();}
 });
+
+for (const source of ['launch','native']) test(`checker167: ${source} recovery must enforce missing pipeline proof`,async()=>{
+ const {host,store}=await deck({nativeWorker:source==='native'?'thr_cyn':undefined,requirement:'merged-and-verified'});
+ try {
+  const id=key(CYN,2523);
+  const builder={...CREWS.find(c=>c.id==='cyn1'),dispatchVersion:2,playbook:'bug-fix',deliveryRequirement:'merged-and-verified'};
+  store.save({...store.get(id),continuation:builder});
+  store.observe(id,{headSha:head(2523),state:'merged',draft:false,checks:'passing',review:'approved',reviewHeadSha:head(2523),mergeCommitSha:head(2523),mergeable:'mergeable'},true);
+  await host.bb.storage.kv.set('crews',[builder]);
+  assert.match(text(await verify(host,CYN,2523,'thr_cyn','web')),/Refusing to record verification.*proof step/s,'baseline must refuse a missing report');
+  await host.bb.storage.kv.set('crews',[]);
+  if(source==='launch') createLaunches(host.bb.storage.database()).save({key:'checker167',taskId:'cyn1',projectId:'proj_1',owner:'thr_cap',home:'/native',generation:1,shape:'ship',state:'running',threadId:'thr_cyn',updatedAt:Date.now()});
+  const result=text(await verify(host,CYN,2523,'thr_cyn','web'));
+  assert.match(result,/Refusing to record verification.*proof step/s,`recovery accepted missing report: ${result}`);
+  assert.equal(store.get(id).verifiedCommitSha,null);
+  await host.bb.storage.kv.set('crews',[CREWS.find(c=>c.id==='woo1')]);
+  assert.match(text(await verify(host,CYN,2523,'thr_woo','web')),/Refusing to record verification.*proof step/s,'a fresh same-project crew must also meet the original pipeline');
+  await host.bb.storage.kv.set('crews',[]);
+  const scope=`P4 Prove on the real surface for ${id} at ${head(2523).slice(0,7)}`;
+  host.harness.sdk.stub('files.read',async()=>({content:`pending: ${scope}: waiting for the real check`}));
+  assert.match(text(await verify(host,CYN,2523,'thr_cyn','web')),/Refusing to record verification.*proof step/s);
+  assert.equal(store.get(id).verifiedCommitSha,null);
+  host.harness.sdk.stub('files.read',async()=>({content:`✓ ${scope}: driven opened upload; seen photo arrived`}));
+  assert.doesNotMatch(text(await verify(host,CYN,2523,'thr_cyn','web')),/Refusing/);
+  assert.equal(store.get(id).verification.crewId,'cyn1');
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('checker167: strict verification from another same-project crew is accepted',async()=>{
+ const {host,store}=await deck({requirement:'merged-and-verified'});
+ try {
+  const id=key(CYN,2523);
+  store.observe(id,{headSha:head(2523),state:'merged',draft:false,checks:'passing',review:'approved',reviewHeadSha:head(2523),mergeCommitSha:head(2523),mergeable:'mergeable'},true);
+  assert.doesNotMatch(text(await verify(host,CYN,2523,'thr_woo','web')),/Refusing/);
+  assert.equal(store.get(id).verification.crewId,'woo1');
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test('checker167: Works on a pending device card releases a merged delivery',async()=>{
+ const {host,store,tap}=await deck({requirement:'merged-and-verified'});
+ try {
+  const id=key(WOO,130);
+  const response=text(await deliveries(host,{action:'device-proof',id,commitSha:head(130).slice(0,7),build:'42',link:'https://example.com/build42',check:'Upload a photo'},'thr_woo'));
+  const ask=/Device proof card (\S+) is open/.exec(response)?.[1];
+  assert.ok(ask,response);
+  store.observe(id,{headSha:head(130),state:'merged',draft:false,checks:'passing',review:'approved',reviewHeadSha:head(130),mergeCommitSha:'b'.repeat(40),mergeable:'mergeable'},true);
+  await tap(ask,'works');
+  assert.equal(store.get(id).status,'complete');
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+for (const [repo,n,thread] of [[WOO,130,'thr_woo'],[SAFI,77,'thr_safi']]) for (const changed of [false,true]) test(`checker167: ${repo} Works after squash checks the card's final head (changed=${changed})`,async()=>{
+ const {host,store,tap}=await deck({requirement:'merged-and-verified'});
+ try {
+  const id=key(repo,n);
+  const response=text(await deliveries(host,{action:'device-proof',id,commitSha:head(n).slice(0,7),build:'42',link:'https://example.com/build42',check:'Upload a photo'},thread));
+  const ask=/Device proof card (\S+) is open/.exec(response)?.[1];
+  assert.ok(ask,response);
+  const finalHead=changed?'c'.repeat(40):head(n);
+  store.observe(id,{headSha:finalHead,state:'merged',draft:false,checks:'passing',review:'approved',reviewHeadSha:finalHead,mergeCommitSha:'b'.repeat(40),mergeable:'mergeable'},true);
+  await tap(ask,'Works');
+  if(changed) {
+   assert.equal(store.get(id).status,'merged-needs-verification');
+   assert.equal(store.get(id).verifiedCommitSha,null);
+  } else {
+   assert.equal(store.get(id).status,'complete');
+   assert.equal(store.get(id).verifiedCommitSha,'b'.repeat(40));
+   assert.equal(store.get(id).verification.build,'42');
+  }
+ }finally{await host.harness.lifecycle.dispose();}
+});

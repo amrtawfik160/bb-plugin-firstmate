@@ -9252,7 +9252,10 @@ export default async function plugin(bb: BbPluginApi) {
   // Owner decision Q4: a bug-fix or feature crew's PR gets no verification record until
   // the crew's report shows the proof step done, with what was driven and seen.
   async function requirePipelineProof(r: DeliveryRecord): Promise<void> {
-    const crew = r.taskId.startsWith("captain:") ? undefined : await findCrew(r.taskId);
+    if (r.taskId.startsWith("captain:")) return;
+    const crew = await findCrew(r.taskId) ?? (r.continuation === undefined ? undefined
+      : { ...crewSchema.parse(r.continuation), parentThreadId: r.owner, nativeHome: r.home });
+    if (crew !== undefined && (crew.id !== r.taskId || crew.projectId !== r.projectId)) throw new Error(`Refusing to record verification for ${r.id}: its saved crew identity does not match the delivery.`);
     const pipeline = crew === undefined || !pipelineGates(crew) ? null : crewPipeline(crew);
     if (crew === undefined || pipeline === null) return;
     const step = proofStep(pipeline);
@@ -9522,8 +9525,11 @@ export default async function plugin(bb: BbPluginApi) {
         await dropDeviceProof(askId);
         return;
       }
-      deliveries.verify(proof.pr, OWNER_ACTOR, proof.head, { driven: `the owner tested build ${proof.build} on ${surfaceWords(proof.surface as never)}`, seen: "Works", surface: proof.surface, build: proof.build });
-      note = `The owner tapped Works for build ${proof.build}: proof is recorded for ${proof.pr} at ${proof.head.slice(0, 7)}.`;
+      const current = deliveries.get(proof.pr);
+      if (current?.forgeState === "merged" && current.headSha !== proof.head) throw new Error("The device card does not cover the PR's final head.");
+      const commit = current?.forgeState === "merged" ? current.mergeCommitSha ?? proof.head : proof.head;
+      deliveries.verify(proof.pr, OWNER_ACTOR, commit, { driven: `the owner tested build ${proof.build} on ${surfaceWords(proof.surface as never)}`, seen: "Works", surface: proof.surface, build: proof.build });
+      note = `The owner tapped Works for build ${proof.build}: proof is recorded for ${proof.pr} at ${commit.slice(0, 7)}.`;
     } catch (error) {
       note = `The owner tapped Works for build ${proof.build}, but no proof was recorded for ${proof.pr}: ${error instanceof Error ? error.message : String(error)} Open a new device proof card for the current head.`;
     }
@@ -10856,6 +10862,7 @@ export default async function plugin(bb: BbPluginApi) {
     const awaitingVerification = deliveries.awaitingVerification(crew.parentThreadId ?? "", crew.projectId, crew.id);
     if (!force && awaitingVerification) throw new Error(`Outstanding PR delivery still needs verification; crew ${crew.id} is kept. Complete verification or quote the owner's words with --force.`);
     if (stop && preserveAuthority && !(force && awaitingVerification)) throw new Error(`Outstanding PR delivery requires this task's native authority and environment. Forget without --stop, or complete/explicitly abandon its delivery before teardown.${openPrs.length ? ` Open PR(s) with no decision: ${openPrs.map((r) => r.url).join(" ")}` : ""}`);
+    if (force && awaitingVerification) preserveAuthority = false;
     let worktreeRemoved = false;
     let nativeTeardown = false;
     const notes: string[] = [];
@@ -10925,7 +10932,10 @@ export default async function plugin(bb: BbPluginApi) {
         await withTransientRetry(() => realBacklogTransitionForCrew(crew, "rm", true));
         // Native teardown retires checks/sidecars itself; this path must do it too.
         const leftover = await withTransientRetry(() => retireNativeTaskState(crew));
-        if (leftover !== "") notes.push(`WARN: ${leftover}`);
+        if (leftover !== "") {
+          if (force && awaitingVerification) throw new Error(leftover);
+          notes.push(`WARN: ${leftover}`);
+        }
       } catch (error) {
         // Earlier steps are already applied (thread stopped/archived, native meta dropped);
         // say so plainly and keep the crew record so re-running forget finishes the rest.
