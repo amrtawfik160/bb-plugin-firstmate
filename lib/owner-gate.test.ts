@@ -1,0 +1,219 @@
+import assert from "node:assert/strict";
+import { DatabaseSync } from "node:sqlite";
+import test from "node:test";
+import { createOwnerAsks } from "./owner-asks.ts";
+import { createProductionApprovals } from "./production-approval.ts";
+import {
+  OWNER_APPROVAL_CONTEXT,
+  createOwnerGate,
+  gatedAskResolve,
+  ownerApprovalStatus,
+  preApprovalCovers,
+  prodCheck,
+  quotePreApproval,
+  type GateCard,
+  type PreApproval,
+} from "./owner-gate.ts";
+
+const HEAD = "a".repeat(40);
+const NEXT = "b".repeat(40);
+const PR = "cyndra-ai/cyndra-saas#2570";
+const OTHER = "cyndra-ai/cyndra-saas#1";
+
+function db() {
+  const raw = new DatabaseSync(":memory:");
+  return Object.assign(raw, {
+    transaction<T>(fn: () => T) {
+      return () => {
+        raw.exec("BEGIN");
+        try { const out = fn(); raw.exec("COMMIT"); return out; } catch (error) { raw.exec("ROLLBACK"); throw error; }
+      };
+    },
+  });
+}
+
+function card(over: Partial<GateCard> & Pick<GateCard, "id">): GateCard {
+  return {
+    prs: [PR],
+    head: HEAD,
+    kind: "approval",
+    irreversible: false,
+    state: "answered",
+    resolution: "Approve",
+    answeredByOwner: true,
+    createdAt: 1,
+    ...over,
+  };
+}
+
+const pre = (over: Partial<PreApproval> = {}): PreApproval => ({
+  id: "p1",
+  ownerMessageRef: "tg:1:99",
+  quote: "merge after you finish",
+  task: "T12",
+  project: "Cyndra",
+  allows: "merge",
+  createdAt: 1,
+  ...over,
+});
+
+test("the GitHub context name is Owner approval", () => {
+  assert.equal(OWNER_APPROVAL_CONTEXT, "Owner approval");
+});
+
+test("success status only after an owner Approve naming the PR at its head", () => {
+  const approved = ownerApprovalStatus({
+    pr: PR, head: HEAD, cards: [card({ id: "a1" })],
+    coverage: () => "covers", preApprovals: [],
+  });
+  assert.equal(approved.state, "success");
+  assert.match(approved.description, /Owner Approve/i);
+
+  const unnamed = ownerApprovalStatus({
+    pr: PR, head: HEAD, cards: [card({ id: "a1", prs: [OTHER] })],
+    coverage: () => "covers", preApprovals: [],
+  });
+  assert.equal(unnamed.state, "pending");
+
+  const open = ownerApprovalStatus({
+    pr: PR, head: HEAD, cards: [card({ id: "a1", state: "open", resolution: null })],
+    coverage: () => "covers", preApprovals: [],
+  });
+  assert.equal(open.state, "pending");
+});
+
+test("a new author commit after owner Approve flips the status back to pending", () => {
+  const status = ownerApprovalStatus({
+    pr: PR, head: NEXT, cards: [card({ id: "a1" })],
+    coverage: () => "new-author", preApprovals: [],
+  });
+  assert.equal(status.state, "pending");
+  assert.match(status.description, /new author commits after approval/i);
+});
+
+test("a base merge of an approved head stays success", () => {
+  const status = ownerApprovalStatus({
+    pr: PR, head: NEXT, cards: [card({ id: "a1" })],
+    coverage: () => "covers", preApprovals: [],
+  });
+  assert.equal(status.state, "success");
+});
+
+test("the newest owner No wins over an older Approve and over a pre-approval", () => {
+  const status = ownerApprovalStatus({
+    pr: PR, head: HEAD,
+    cards: [card({ id: "a2", resolution: "No", createdAt: 2 }), card({ id: "a1", createdAt: 1 })],
+    coverage: () => "covers",
+    preApprovals: [pre()],
+    task: "T12",
+    taskOpen: true,
+  });
+  assert.equal(status.state, "pending");
+  assert.match(status.description, /No/);
+});
+
+test("pre-approval covers only its task's PRs and expires when the task closes", () => {
+  const covering = preApprovalCovers(pre(), { task: "T12", what: "merge", taskOpen: true });
+  assert.equal(covering, true);
+  assert.equal(preApprovalCovers(pre(), { task: "T9", what: "merge", taskOpen: true }), false);
+  assert.equal(preApprovalCovers(pre(), { task: "T12", what: "deploy", taskOpen: true }), false);
+  assert.equal(preApprovalCovers(pre({ allows: "both" }), { task: "T12", what: "deploy", taskOpen: true }), true);
+  assert.equal(preApprovalCovers(pre(), { task: "T12", what: "merge", taskOpen: false }), false);
+
+  const ok = ownerApprovalStatus({
+    pr: PR, head: HEAD, cards: [], coverage: () => "unknown",
+    preApprovals: [pre()], task: "T12", taskOpen: true,
+  });
+  assert.equal(ok.state, "success");
+  assert.match(ok.description, /pre-approval/i);
+
+  const otherTask = ownerApprovalStatus({
+    pr: PR, head: HEAD, cards: [], coverage: () => "unknown",
+    preApprovals: [pre()], task: "T9", taskOpen: true,
+  });
+  assert.equal(otherTask.state, "pending");
+
+  const closed = ownerApprovalStatus({
+    pr: PR, head: HEAD, cards: [], coverage: () => "unknown",
+    preApprovals: [pre()], task: "T12", taskOpen: false,
+  });
+  assert.equal(closed.state, "pending");
+});
+
+test("captain self-resolve on an approval or irreversible card only cancels it", () => {
+  assert.equal(gatedAskResolve({ kind: "approval", irreversible: false }, { ownerConfirmed: false }), "cancel");
+  assert.equal(gatedAskResolve({ kind: "question", irreversible: true }, { ownerConfirmed: false }), "cancel");
+  assert.equal(gatedAskResolve({ kind: "approval", irreversible: false }, { ownerConfirmed: true }), "answer");
+  assert.equal(gatedAskResolve({ kind: "question", irreversible: false }, { ownerConfirmed: false }), "answer");
+  assert.equal(gatedAskResolve({ kind: "approval", irreversible: false }, { ownerConfirmed: false, cancelled: true }), "cancel");
+  assert.equal(gatedAskResolve({ kind: "approval", irreversible: false }, { ownerConfirmed: false, reopen: true }), "reopen");
+});
+
+test("a captain-answered Approve cannot produce a success status (a7ro6jg)", () => {
+  const status = ownerApprovalStatus({
+    pr: PR, head: HEAD,
+    cards: [card({ id: "a7ro6jg", answeredByOwner: false, state: "answered", resolution: "Approve" })],
+    coverage: () => "covers", preApprovals: [],
+  });
+  assert.equal(status.state, "pending");
+});
+
+test("prod-check exits non-zero without an approval or pre-approval for that work", () => {
+  const refused = prodCheck({
+    project: "Cyndra", what: "deploy", task: "T12",
+    cards: [], preApprovals: [], taskOpen: true,
+  });
+  assert.equal(refused.ok, false);
+  assert.match(refused.reason, /approval/i);
+
+  const viaCard = prodCheck({
+    project: "Cyndra", what: "merge", pr: PR, head: HEAD,
+    cards: [card({ id: "a1" })], coverage: () => "covers",
+    preApprovals: [],
+  });
+  assert.equal(viaCard.ok, true);
+
+  const viaPre = prodCheck({
+    project: "Cyndra", what: "deploy", task: "T12",
+    cards: [], preApprovals: [pre({ allows: "deploy" })], taskOpen: true,
+  });
+  assert.equal(viaPre.ok, true);
+
+  const expired = prodCheck({
+    project: "Cyndra", what: "merge", task: "T12", pr: PR, head: HEAD,
+    cards: [], preApprovals: [pre()], taskOpen: false,
+  });
+  assert.equal(expired.ok, false);
+});
+
+test("the result text quotes the owner's pre-approval words", () => {
+  assert.match(quotePreApproval(pre()), /"merge after you finish"/);
+  assert.match(quotePreApproval(pre()), /T12/);
+});
+
+test("the store records a pre-approval and a deploy without approval", () => {
+  const database = db();
+  createOwnerAsks(database);
+  createProductionApprovals(database);
+  const gate = createOwnerGate(database);
+  const stored = gate.recordPreApproval({
+    ownerMessageRef: "tg:1:99", quote: "deploy this to production", task: "T12", project: "Cyndra", allows: "deploy", createdAt: 10,
+  });
+  assert.equal(gate.covering({ task: "T12", what: "deploy", taskOpen: true })?.id, stored.id);
+  assert.equal(gate.covering({ task: "T12", what: "merge", taskOpen: true }), undefined);
+
+  const asks = createOwnerAsks(database);
+  const ask = asks.create({
+    captain: "thr_cap", kind: "approval", text: `Merge ${PR}?`,
+    options: [{ label: "Approve", value: "approve" }, { label: "No", value: "no" }], createdAt: 1,
+  });
+  createProductionApprovals(database).bindCard(ask.id, [{ pr: PR, head: HEAD }]);
+  asks.resolve(ask.id, "thr_cap", "answered", "Approve", 2, "owner");
+  const loaded = gate.cardsForPr(PR);
+  assert.equal(loaded[0]?.answeredByOwner, true);
+  assert.equal(loaded[0]?.head, HEAD);
+
+  const sighting = gate.recordDeploy({ project: "Safi", source: "live-pass", detail: "OTA production", approved: false, at: 11, task: "T12" });
+  assert.equal(sighting.approved, false);
+  assert.equal(gate.unapprovedDeploys().some((row) => row.id === sighting.id), true);
+});
