@@ -5527,9 +5527,9 @@ export default async function plugin(bb: BbPluginApi) {
         }));
       },
       details: (record) => prDetails(record, signal),
-      markLive: (task, evidence, check) => {
+      markLive: async (task, evidence, check) => {
         try {
-          sightDeploy({ project: task.project ?? "", task: task.id, source: "live-pass", detail: evidence });
+          await sightDeploy({ project: task.project ?? "", task: task.id, source: "live-pass", detail: evidence });
           ownerTasks.move(task.id, captain, { to: "live", reason: evidence, checked: check }, now);
           return true;
         }
@@ -8447,7 +8447,7 @@ export default async function plugin(bb: BbPluginApi) {
       const previousHead = record.headSha ?? "";
       const observed=deliveries.observe(record.id,observation,authorized,Date.now(),unverifiedStanding);
       if (observed.headSha && (observed.headSha !== previousHead || ownerGate.statusPostNeeded(observed.id, observed.headSha))) {
-        const task = taskForPr(observed.id, observed.owner);
+        const task = taskForPr(observed.id, observed.owner, observed.taskId);
         await syncOwnerApprovalStatus(observed.id, observed.headSha, hostId || null, task);
       }
       // Without a manager nobody acts on minute-by-minute health; look less often until it merges or closes.
@@ -9425,7 +9425,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (!/^[0-9a-f]{7,40}$/i.test(commit)) throw new Error(`A release read-back needs commitSha: the commit the build was built from (EAS shows it as gitCommitHash: eas build:view <build id> --json). It proves only the merges that commit holds; a build time is not proof.${fromEas}`);
       if (group.toLowerCase() !== rule.release.group.toLowerCase()) throw new Error(`Refusing: ${rule.name} builds must be in the "${rule.release.group}" public-link group, not "${group}". Add build ${build} to "${rule.release.group}", read it back from App Store Connect or EAS, then record it again.`);
       const recorded = releaseReadbacks.record({ task: task.id, captain: task.captain, crewId: crew.id, project: rule.name, build, group: rule.release.group, source: input.source as ReleaseSource, seen, at: Date.now(), ...(commit ? { commit } : {}), ...(builtAt !== undefined ? { builtAt } : {}) });
-      sightDeploy({ project: rule.name, task: task.id, source: "release-readback", detail: `build ${recorded.build} in ${recorded.group}` });
+      await sightDeploy({ project: rule.name, task: task.id, source: "release-readback", detail: `build ${recorded.build} in ${recorded.group}` });
       return `Release read-back recorded for ${task.id}: build ${recorded.build} in "${recorded.group}" (read from ${recorded.source === "eas" ? "EAS" : "App Store Connect"}: ${recorded.seen}).`;
     }
     const id = input.id ?? (input.url ? canonicalPr(input.url).id : "");
@@ -9987,7 +9987,9 @@ export default async function plugin(bb: BbPluginApi) {
   async function requireProductionApproval(pr: MergeTarget, crew: Crew, hostId: string | null): Promise<void> {
     if (pr.state === "merged") return;
     const key = prKeyOf(pr.url) ?? "";
-    const task = taskForPr(key, crew.parentThreadId);
+    const picked = pickTaskForPr(openTasksForPr(key, crew.parentThreadId), crew.id);
+    if (picked.unclear) throw new Error(`Refusing: ${key} is on more than one open task; nothing was merged.`);
+    const task = picked.task;
     if (task && key && !task.prs.some((named) => named.toLowerCase() === key.toLowerCase())) {
       throw new Error(`Refusing: ${key} is not work of task ${task.id}; nothing was merged.`);
     }
@@ -10065,13 +10067,33 @@ export default async function plugin(bb: BbPluginApi) {
     return ownerGate.listPreApprovals(task.id);
   }
 
-  function taskForPr(pr: string, captain?: string | null): OwnerTask | undefined {
+  function openTasksForPr(pr: string, captain?: string | null): OwnerTask[] {
     const captains = captain ? [captain] : [...knownCaptainsRef];
+    const hits: OwnerTask[] = [];
+    const needle = pr.toLowerCase();
     for (const id of captains) {
-      const hit = ownerTasks.list(id).find((task) => task.prs.some((named) => named.toLowerCase() === pr.toLowerCase()));
-      if (hit) return hit;
+      for (const task of ownerTasks.list(id)) {
+        if (task.prs.some((named) => named.toLowerCase() === needle)) hits.push(task);
+      }
     }
-    return undefined;
+    return hits;
+  }
+
+  function pickTaskForPr(hits: readonly OwnerTask[], crewId?: string | null): { task?: OwnerTask; unclear: boolean } {
+    if (hits.length === 0) return { unclear: false };
+    if (crewId) {
+      const owned = hits.filter((task) => task.crewIds.includes(crewId));
+      if (owned.length === 1) return { task: owned[0], unclear: false };
+      if (owned.length > 1) return { unclear: true };
+      if (hits.length === 1) return { task: hits[0], unclear: false };
+      return { unclear: true };
+    }
+    if (hits.length === 1) return { task: hits[0], unclear: false };
+    return { unclear: true };
+  }
+
+  function taskForPr(pr: string, captain?: string | null, crewId?: string | null): OwnerTask | undefined {
+    return pickTaskForPr(openTasksForPr(pr, captain), crewId).task;
   }
 
   async function refreshApprovalForTask(task: OwnerTask): Promise<void> {
@@ -10131,12 +10153,14 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  function checkProdTarget(input: { project: string; what: ProdWhat; task?: OwnerTask; pr?: string; captain?: string }): { ok: boolean; reason: string } {
+  async function checkProdTarget(input: { project: string; what: ProdWhat; task?: OwnerTask; pr?: string; captain?: string }): Promise<{ ok: boolean; reason: string }> {
     const head = input.pr ? (deliveries.get(input.pr)?.headSha ?? "") : "";
+    const cards = input.pr ? ownerGate.cardsForPr(input.pr) : [];
+    const hostId = input.pr ? await gateHost(input.task?.projectId, input.captain ?? input.task?.captain) : null;
+    const coverage = input.pr ? await cardCoverage(hostId, input.pr, head, cards) : undefined;
     return prodCheck({
       project: input.project, what: input.what, task: input.task?.id, pr: input.pr, head,
-      cards: input.pr ? ownerGate.cardsForPr(input.pr) : [],
-      coverage: (card) => (!head ? "unknown" : card.head === head ? "covers" : "new-author"),
+      cards, coverage,
       preApprovals: coveringPres(input.task),
       taskOpen: input.task ? !isFinishedTask(input.task) : false,
       generation: input.task ? taskOpenEpoch(input.task) : undefined,
@@ -10157,23 +10181,23 @@ export default async function plugin(bb: BbPluginApi) {
       return { ok: false, reason: `Refusing: ${pr} is not work of task ${named.id}.` };
     }
     const targets = pr ? [pr] : (task?.prs ?? []);
-    if (targets.length === 0) return checkProdTarget({ project: input.project, what: input.what, task, captain });
+    if (targets.length === 0) return await checkProdTarget({ project: input.project, what: input.what, task, captain });
     let last = { ok: true, reason: "" };
     for (const id of targets) {
-      last = checkProdTarget({ project: input.project, what: input.what, task, pr: id, captain });
+      last = await checkProdTarget({ project: input.project, what: input.what, task, pr: id, captain });
       if (!last.ok) return last;
     }
     return last;
   }
 
-  function sightDeploy(input: { project: string; task?: string; source: string; detail: string }): boolean {
+  async function sightDeploy(input: { project: string; task?: string; source: string; detail: string }): Promise<boolean> {
     const task = input.task ? ownerTasks.get(input.task) : undefined;
     const targets = task?.prs ?? [];
     let result = targets.length === 0
-      ? checkProdTarget({ project: input.project, what: "deploy", task, captain: task?.captain })
+      ? await checkProdTarget({ project: input.project, what: "deploy", task, captain: task?.captain })
       : { ok: true, reason: "" };
     for (const id of targets) {
-      result = checkProdTarget({ project: input.project, what: "deploy", task, pr: id, captain: task?.captain });
+      result = await checkProdTarget({ project: input.project, what: "deploy", task, pr: id, captain: task?.captain });
       if (!result.ok) break;
     }
     ownerGate.recordDeploy({ project: input.project, task: input.task, source: input.source, detail: input.detail, approved: result.ok, at: Date.now() });
@@ -10189,8 +10213,8 @@ export default async function plugin(bb: BbPluginApi) {
     telegram: TelegramEnvelope | null,
     sender?: { threadId: string | null; isCrew: boolean },
   ): Promise<void> {
-    if (sender?.isCrew === true) return;
-    if (sender?.threadId && sender.threadId !== captain) return;
+    // BB's dispatch record: a sender thread means a BB thread delivered this, not the Telegram connector.
+    if (sender?.threadId) return;
     const header = parseConnectorHeader(text);
     const sourceEventId = telegram?.sourceEventId ?? header?.sourceEventId;
     if (sourceEventId && /^(ask|pack|proof):/i.test(sourceEventId)) return;
@@ -10201,6 +10225,8 @@ export default async function plugin(bb: BbPluginApi) {
     const body = stripTelegramEnvelope(text);
     if (body === "" || isBotOrAckText(text)) return;
     if (ownerAsks.listOpen(captain).some((ask) => askLetterAnswer(ask, body) !== null)) return;
+    const ref = telegram ? telegramSourceRef(telegram) : header ? telegramSourceRef(header) : "";
+    if (ref !== "" && ownerGate.listPreApprovals().some((row) => row.ownerMessageRef === ref)) return;
     const keyFile = String((await settings.get()).decisionsKeyFile ?? "").trim();
     let apiKey = "";
     if (keyFile !== "") {
@@ -10217,7 +10243,6 @@ export default async function plugin(bb: BbPluginApi) {
       tasks: candidates.map((task) => ({ id: task.id, title: task.title, project: task.project ?? "" })),
     });
     if (judgment.allows === "neither") return;
-    const ref = telegram ? telegramSourceRef(telegram) : header ? telegramSourceRef(header) : "";
     const byRef = ref ? ownerTasks.openByRef(captain, ref)[0] : undefined;
     const named = candidates.find((task) => task.id === judgment.task);
     const task = byRef ?? named;

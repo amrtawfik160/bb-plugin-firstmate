@@ -86,6 +86,7 @@ function ownerNo(card: GateCard): boolean {
 function newestForPr(cards: readonly GateCard[], pr: string, captain?: string): GateCard | undefined {
   return cards.find((card) =>
     card.kind === "approval"
+    && card.answeredByOwner
     && card.prs.some((named) => samePr(named, pr))
     && (captain === undefined || card.captain === undefined || card.captain === captain)
   );
@@ -170,26 +171,19 @@ export function prodCheck(input: ProdCheckInput): { ok: boolean; reason: string 
   if (input.task && input.pr && input.taskPrs && !input.taskPrs.some((named) => samePr(named, input.pr!))) {
     return { ok: false, reason: `Refusing: ${input.pr} is not work of task ${input.task}.` };
   }
-  if (input.pr) {
-    const decision = approvalFor({
-      pr: input.pr,
-      head: input.head ?? "",
-      action: input.what,
-      cards: input.cards,
-      coverage: input.coverage,
-      preApprovals: input.preApprovals,
-      task: input.task,
-      taskOpen: input.taskOpen,
-      generation: input.generation,
-      captain: input.captain,
-    });
-    if (decision.state === "success") return { ok: true, reason: decision.description };
-    return { ok: false, reason: `Refusing: ${input.project} ${input.what} needs an owner approval or pre-approval for this work.` };
-  }
-  const pre = input.preApprovals.find((row) => preApprovalCovers(row, {
-    task: input.task, what: input.what, taskOpen: input.taskOpen === true, generation: input.generation,
-  }));
-  if (pre) return { ok: true, reason: quotePreApproval(pre) };
+  const decision = approvalFor({
+    pr: input.pr ?? "",
+    head: input.head ?? "",
+    action: input.what,
+    cards: input.cards,
+    coverage: input.coverage,
+    preApprovals: input.preApprovals,
+    task: input.task,
+    taskOpen: input.taskOpen,
+    generation: input.generation,
+    captain: input.captain,
+  });
+  if (decision.state === "success") return { ok: true, reason: decision.description };
   return { ok: false, reason: `Refusing: ${input.project} ${input.what} needs an owner approval or pre-approval for this work.` };
 }
 
@@ -224,6 +218,9 @@ export function createOwnerGate(db: Database) {
   try {
     db.exec("ALTER TABLE production_pre_approval ADD COLUMN generation INTEGER NOT NULL DEFAULT 1");
   } catch { /* already present on this database */ }
+  try {
+    db.exec("CREATE UNIQUE INDEX IF NOT EXISTS production_pre_approval_owner_message_ref ON production_pre_approval(owner_message_ref) WHERE owner_message_ref != ''");
+  } catch { /* already present, or older rows share a ref */ }
 
   function asPreApproval(row: {
     id: string; owner_message_ref: string; quote: string; task: string; project: string; allows: string; created_at: number; generation?: number;
@@ -251,11 +248,30 @@ export function createOwnerGate(db: Database) {
 
   return {
     recordPreApproval(input: Omit<PreApproval, "id" | "generation"> & { id?: string; generation?: number }): PreApproval {
+      const asRow = (row: {
+        id: string; owner_message_ref: string; quote: string; task: string; project: string; allows: string; created_at: number; generation?: number;
+      }) => asPreApproval(row);
+      if (input.ownerMessageRef !== "") {
+        const existing = db.prepare("SELECT * FROM production_pre_approval WHERE owner_message_ref=?").get(input.ownerMessageRef) as {
+          id: string; owner_message_ref: string; quote: string; task: string; project: string; allows: string; created_at: number; generation?: number;
+        } | undefined;
+        if (existing) return asRow(existing);
+      }
       const generation = input.generation ?? (input.task ? 1 : 0);
       const row: PreApproval = { ...input, id: input.id ?? newId("p"), generation };
-      db.prepare("INSERT INTO production_pre_approval(id, owner_message_ref, quote, task, project, allows, created_at, generation) VALUES (?,?,?,?,?,?,?,?)").run(
-        row.id, row.ownerMessageRef, row.quote, row.task, row.project, row.allows, row.createdAt, row.generation,
-      );
+      try {
+        db.prepare("INSERT INTO production_pre_approval(id, owner_message_ref, quote, task, project, allows, created_at, generation) VALUES (?,?,?,?,?,?,?,?)").run(
+          row.id, row.ownerMessageRef, row.quote, row.task, row.project, row.allows, row.createdAt, row.generation,
+        );
+      } catch (error) {
+        if (input.ownerMessageRef !== "") {
+          const existing = db.prepare("SELECT * FROM production_pre_approval WHERE owner_message_ref=?").get(input.ownerMessageRef) as {
+            id: string; owner_message_ref: string; quote: string; task: string; project: string; allows: string; created_at: number; generation?: number;
+          } | undefined;
+          if (existing) return asRow(existing);
+        }
+        throw error;
+      }
       return row;
     },
     listPreApprovals,

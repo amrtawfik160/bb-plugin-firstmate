@@ -309,3 +309,43 @@ test("an unbound pre-approval binds once to the first matching task epoch", () =
   assert.equal(gate.bindPreApproval(stored.id, "T99", 1), false);
   assert.equal(gate.listPreApprovals("T12").length, 1);
 });
+
+test("an owner message ref issues permission once and a replay creates nothing", () => {
+  const database = db();
+  const gate = createOwnerGate(database);
+  const first = gate.recordPreApproval({
+    ownerMessageRef: "tg:200:8811", quote: "merge after you finish", task: "T1", project: "Cyndra", allows: "both", createdAt: 10, generation: 1,
+  });
+  const replay = gate.recordPreApproval({
+    ownerMessageRef: "tg:200:8811", quote: "merge after you finish", task: "T1", project: "Cyndra", allows: "both", createdAt: 20, generation: 2,
+  });
+  assert.equal(replay.id, first.id);
+  assert.equal(replay.generation, 1);
+  assert.equal(gate.listPreApprovals().length, 1);
+});
+
+test("a newer unanswered card is ignored so an earlier owner No still wins", () => {
+  const out = approvalFor({
+    pr: PR, head: HEAD, action: "merge",
+    cards: [
+      card({ id: "open", state: "open", resolution: null, answeredByOwner: false, createdAt: 3 }),
+      card({ id: "no", resolution: "No", createdAt: 2 }),
+    ],
+    coverage: () => "covers",
+    preApprovals: [pre()],
+    task: "T12",
+    taskOpen: true,
+    generation: 1,
+  });
+  assert.equal(out.state, "pending");
+  assert.match(out.description, /No/);
+});
+
+test("no-PR prod-check uses approvalFor so a covering pre-approval still succeeds", () => {
+  const out = prodCheck({
+    project: "Cyndra", what: "deploy", task: "T12",
+    cards: [], preApprovals: [pre({ allows: "deploy" })], taskOpen: true, generation: 1,
+  });
+  assert.equal(out.ok, true);
+  assert.match(out.reason, /pre-approval/);
+});

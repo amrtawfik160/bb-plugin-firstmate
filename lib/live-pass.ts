@@ -27,7 +27,7 @@ export type LivePassDeps = {
   /** A merged PR's merge time and files, from GitHub; null when not read. */
   details?: (record: DeliveryRecord) => Promise<PrDetails | null>;
   /** Move the task to live with this evidence; false when something holds it (a program). */
-  markLive: (task: OwnerTask, evidence: string, check: string) => boolean;
+  markLive: (task: OwnerTask, evidence: string, check: string) => boolean | Promise<boolean>;
   alert: (project: string | null, text: string, incident: string) => Promise<boolean>;
   stallMemory: StallMemory | Record<string, never>;
 };
@@ -63,7 +63,7 @@ export async function runLivePass(deps: LivePassDeps): Promise<{ live: string[];
       // A project is "live check missing" only while no task of it could be read.
       status[rule.name] = { missing: verdict.live ? null : before !== undefined && before.missing === null ? null : verdict.missing, at: deps.now };
     }
-    if (verdict.live && deps.markLive(task, verdict.evidence, rule?.name ?? "live check")) live.push(task.id);
+    if (verdict.live && await deps.markLive(task, verdict.evidence, rule?.name ?? "live check")) live.push(task.id);
   }
   const tasks = deps.tasks();
   const recordsOf = new Map(tasks.map((task) => [task.id, deps.recordsFor(task)]));
