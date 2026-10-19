@@ -106,6 +106,55 @@ test("an owner answer records pending follow-up in the same write; a failure sta
   assert.deepEqual(asks.pendingFollowUps(), [], "a repeat owner write does not re-queue finished work");
 });
 
+test("a follow-up that fails 8 times or waits 2 hours becomes failed", () => {
+  const asks = createOwnerAsks(db());
+  const opts = [{ label: "Yes", value: "yes" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "question", text: "q", options: opts, sourceRef: "crew-wait:wait1:abc", createdAt: NOW });
+  asks.resolve("a1", "thr_cap", "answered", "Yes", NOW, "owner");
+  for (let i = 0; i < 7; i++) asks.failFollowUp("a1", "owner-answered", "hold down", NOW + i);
+  assert.equal(asks.pendingFollowUps().find((job) => job.effect === "owner-answered")?.attempts, 7);
+  assert.deepEqual(asks.failedFollowUps(), []);
+  asks.failFollowUp("a1", "owner-answered", "hold down", NOW + 7);
+  assert.equal(asks.pendingFollowUps().find((job) => job.effect === "owner-answered"), undefined);
+  assert.deepEqual(asks.failedFollowUps().map((job) => [job.askId, job.effect, job.attempts, job.noticed]), [
+    ["a1", "owner-answered", 8, false],
+  ]);
+  assert.equal(asks.claimFollowUpNotice("a1", "owner-answered"), true);
+  assert.equal(asks.claimFollowUpNotice("a1", "owner-answered"), false);
+
+  asks.create({ id: "a2", captain: "thr_cap", kind: "question", text: "q2", options: opts, createdAt: NOW });
+  asks.resolve("a2", "thr_cap", "answered", "Yes", NOW, "owner");
+  asks.failFollowUp("a2", "owner-answered", "hold down", NOW);
+  assert.equal(asks.pendingFollowUps().find((job) => job.askId === "a2")?.firstFailedAt, NOW);
+  asks.failFollowUp("a2", "owner-answered", "hold down", NOW + 2 * 60 * 60_000);
+  assert.ok(asks.failedFollowUps().some((job) => job.askId === "a2" && job.effect === "owner-answered"));
+});
+
+test("reopening a card clears follow-up so a new owner answer queues again", () => {
+  const asks = createOwnerAsks(db());
+  const opts = [{ label: "Yes", value: "yes" }, { label: "No", value: "no" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "question", text: "q", options: opts, createdAt: NOW });
+  asks.resolve("a1", "thr_cap", "answered", "Yes", NOW, "owner");
+  asks.markFollowUpDone("a1", "owner-answered");
+  asks.markFollowUpDone("a1", "refresh-board");
+  asks.resolve("a1", "thr_cap", "open", "Reopen", NOW + 1);
+  assert.deepEqual(asks.pendingFollowUps(), []);
+  asks.resolve("a1", "thr_cap", "answered", "No", NOW + 2, "owner");
+  assert.deepEqual(asks.pendingFollowUps().map((job) => [job.askId, job.effect, job.state]), [
+    ["a1", "owner-answered", "pending"],
+    ["a1", "refresh-board", "pending"],
+  ]);
+});
+
+test("a defaulted ask keeps an untold captain notice until it is marked told", () => {
+  const asks = createOwnerAsks(db());
+  asks.create({ id: "a1", captain: "thr_cap", kind: "question", text: "q", options: [{ label: "Yes", value: "yes" }], recommended: 0, defaultAt: NOW - 1, createdAt: NOW - 10 });
+  assert.deepEqual(asks.takeDue("thr_cap", NOW).map((ask) => ask.id), ["a1"]);
+  assert.deepEqual(asks.untoldDefaults("thr_cap").map((ask) => ask.id), ["a1"]);
+  asks.markDefaultsTold(["a1"]);
+  assert.deepEqual(asks.untoldDefaults("thr_cap"), []);
+});
+
 test("an owner confirmation stamps a card the captain already answered", () => {
   const asks = createOwnerAsks(db());
   const opts = [{ label: "Approve", value: "approve" }, { label: "No", value: "no" }];

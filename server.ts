@@ -89,7 +89,7 @@ import {
   buildProgram, createPrograms, isOpenProgram, isOpenTicket, newlyReady, numberOf, programCounts, programText, readyRefs, readyWakeText, repoOf,
   shortTicket, stallReminderDue, stallReminderText, ticketRef, type IssueFacts, type Program, type ProgramFact, type TicketRef,
 } from "./lib/programs.ts";
-import { askLetterAnswer, askIdFromSourceEventId, packAnswers, choicesFromCrewReport, clip, createOwnerAsks, crewQuestionText, formatAge, formatAskCard, formatUtcTime, mayDefault, OWNER_CLOSED_RESOLUTION, CAPTAIN_RULES, OWNER_DECISION_RULE, recommendedLabel, replacedBy, type AskKind, type AskFollowUp, type OwnerAsk } from "./lib/owner-asks.ts";
+import { askLetterAnswer, askIdFromSourceEventId, packAnswers, choicesFromCrewReport, clip, createOwnerAsks, crewQuestionText, formatAge, formatAskCard, formatUtcTime, mayDefault, OWNER_CLOSED_RESOLUTION, CAPTAIN_RULES, OWNER_DECISION_RULE, recommendedLabel, replacedBy, ASK_FOLLOWUP_GIVE_UP_MS, type AskKind, type AskFollowUp, type OwnerAsk } from "./lib/owner-asks.ts";
 import { DEFAULT_RELIABILITY_FLAGS, reliabilityFlagsFromSettings } from "./lib/reliability-flags.ts";
 import { sanitizeSettingValue } from "./lib/settings-schema.ts";
 import { coalesceBatches, parseConnectorHeader, parseInboundTelegram, parseSourceRef, parseTelegramSubmission, stripTelegramEnvelope, telegramReplyParameters, telegramSourceRef } from "./lib/telegram-envelope.ts";
@@ -6118,7 +6118,8 @@ export default async function plugin(bb: BbPluginApi) {
     const failed = (await reliabilityFlags()).telegramThreading === "on" ? await sendAskCard(ask, { ...(project ? { project } : {}), task: task.id }) : "";
     const warning = failed === "" ? "" : ` It was not sent to Telegram (${failed}).`;
     bb.log.info(`task ${task.id}: crew ${crew.id} waits on the owner; card ${ask.id} opened`);
-    await deliverToCaptain(captain, `CREW QUESTION CARD: crew ${crew.id} waits on the owner for task ${task.id}, so card ${ask.id} carries its question to him${replaced.length > 0 ? ` (replacing ${replaced.join(", ")})` : ""}.${warning} His answer is applied to the native question.`, crew.id).catch((error) => bb.log.warn(`crew question note: ${String(error)}`));
+    const nativeHome = !isSecondmateRoute(crew) && await crewNativeHome(crew) !== "";
+    await deliverToCaptain(captain, `CREW QUESTION CARD: crew ${crew.id} waits on the owner for task ${task.id}, so card ${ask.id} carries its question to him${replaced.length > 0 ? ` (replacing ${replaced.join(", ")})` : ""}.${warning} ${nativeHome ? "His answer is applied to the native question." : "His answer is sent to the crew."}`, crew.id).catch((error) => bb.log.warn(`crew question note: ${String(error)}`));
     return true;
   }
 
@@ -6261,18 +6262,27 @@ export default async function plugin(bb: BbPluginApi) {
     sourceRef: z.string().optional(), questionFinished: z.boolean().default(false),
   });
 
+  type AskNativeHoldResult = "applied" | "shared" | "gone" | "not-native";
+
+  function crewIdFromWaitRef(sourceRef: string | undefined): string | undefined {
+    if (!sourceRef?.startsWith("crew-wait:")) return undefined;
+    const crewId = sourceRef.slice("crew-wait:".length).split(":")[0];
+    return crewId || undefined;
+  }
+
   // Resolve each named question even when another question still owns the shared crew hold.
-  async function applyAskNativeHold(ask: OwnerAsk, resolution: string, storeKey: string, operation: string): Promise<boolean> {
-    const crewId = ask.sourceRef?.startsWith("crew-wait:") ? ask.sourceRef.split(":")[1] : undefined;
-    if (!crewId) return true;
+  async function applyAskNativeHold(ask: OwnerAsk, resolution: string, storeKey: string, operation: string): Promise<AskNativeHoldResult> {
+    const crewId = crewIdFromWaitRef(ask.sourceRef);
+    if (!crewId) return "applied";
     const crew = await findCrew(crewId);
-    if (crew === undefined || crew.parentThreadId !== ask.captain || isSecondmateRoute(crew)) return true;
+    if (crew === undefined || crew.parentThreadId !== ask.captain) return "gone";
+    if (isSecondmateRoute(crew)) return "not-native";
     const home = await crewNativeHome(crew);
-    if (home === "") return true;
+    if (home === "") return "not-native";
     const hostId = await resolveHostForProject(crew.projectId, ask.captain);
     const stored = await bb.storage.kv.get(storeKey);
     let plan = stored === undefined ? undefined : closeNativePlanSchema.parse(stored);
-    if (plan?.finished) return true;
+    if (plan?.finished) return "applied";
     const held = async (id: string): Promise<boolean> => {
       const open = await runCaptainHold(["open", id], { home, hostId, projectId: crew.projectId });
       if (open === null || (open.exitCode !== 0 && open.exitCode !== 1)) throw new Error(`Could not read native hold ${id}.`);
@@ -6325,18 +6335,19 @@ export default async function plugin(bb: BbPluginApi) {
       }
       if (plan.shared) {
         const { lines, kind } = await crewStatusLines(crew);
-        if (foldOpenDecisions(lines, kind).length > 0) return false;
+        if (foldOpenDecisions(lines, kind).length > 0) return "shared";
         await release(crew.id);
       }
       await bb.storage.kv.set(storeKey, { ...plan, finished: true });
-      return true;
+      return "applied";
     } finally {
       if (staged) await runOnHost(hostId, `rm -f ${shQuote(path)}`, 10_000).catch(() => {});
     }
   }
 
   async function releaseClosedAskHold(ask: OwnerAsk): Promise<boolean> {
-    return applyAskNativeHold(ask, OWNER_CLOSED_RESOLUTION, `owner-close-native:${ask.id}`, "owner close hold");
+    const result = await applyAskNativeHold(ask, OWNER_CLOSED_RESOLUTION, `owner-close-native:${ask.id}`, "owner close hold");
+    return result !== "shared";
   }
 
   const closeNoticeChains = new Map<string, Promise<void>>();
@@ -6366,12 +6377,18 @@ export default async function plugin(bb: BbPluginApi) {
   // An overdue reversible ask proceeds with its recommended option; the captain thread is told once.
   async function defaultOverdueAsks(captainThreadId: string): Promise<void> {
     const due = ownerAsks.takeDue(captainThreadId, Date.now());
-    for (const ask of due) {
-      await bb.sdk.threads.send({
-        threadId: captainThreadId,
-        mode: "steer",
-        input: [{ type: "text", text: `No answer to ask ${ask.id} by its deadline: go ahead with "${ask.resolution}" as recommended, and tell the captain in one short message that you did.`, mentions: [], visibility: "agent-only" }],
-      }).catch((error) => bb.log.warn(`owner ask default ${ask.id}: ${String(error)}`));
+    const untold = ownerAsks.untoldDefaults(captainThreadId);
+    for (const ask of untold) {
+      try {
+        await bb.sdk.threads.send({
+          threadId: captainThreadId,
+          mode: "steer",
+          input: [{ type: "text", text: `No answer to ask ${ask.id} by its deadline: go ahead with "${ask.resolution}" as recommended, and tell the captain in one short message that you did.`, mentions: [], visibility: "agent-only" }],
+        });
+        ownerAsks.markDefaultsTold([ask.id]);
+      } catch (error) {
+        bb.log.warn(`owner ask default ${ask.id}: ${String(error)}`);
+      }
     }
     if (due.length > 0) await refreshOwnerBoard();
   }
@@ -9532,20 +9549,25 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   const proofRechecks = new Map<string, ReturnType<typeof setTimeout>>();
-  const proofRecheckAttempts = new Map<string, number>();
+  const DEVICE_PROOF_RECHECK_PREFIX = "device-proof-recheck:";
+  type ProofRecheck = { attempts: number; told: boolean };
+  async function proofRecheckState(askId: string): Promise<ProofRecheck> {
+    return (await bb.storage.kv.get<ProofRecheck>(`${DEVICE_PROOF_RECHECK_PREFIX}${askId}`)) ?? { attempts: 0, told: false };
+  }
+  async function setProofRecheckState(askId: string, state: ProofRecheck): Promise<void> {
+    await bb.storage.kv.set(`${DEVICE_PROOF_RECHECK_PREFIX}${askId}`, state);
+  }
   function proofRecheckMs(): number[] {
     const given = (process.env.FM_PROOF_RECHECK_MS ?? "").split(",").map(Number).filter((ms) => Number.isFinite(ms) && ms > 0);
     return given.length > 0 ? given.slice(0, 5) : [2_000, 10_000, 60_000];
   }
-  function scheduleProofRecheck(askId: string): void {
+  function scheduleProofRecheck(askId: string, attempt: number): void {
     if (proofRechecks.has(askId)) return;
     const delays = proofRecheckMs();
-    const attempt = proofRecheckAttempts.get(askId) ?? 0;
     if (attempt >= delays.length) return;
     const timer = setTimeout(() => {
       if (proofRechecks.get(askId) !== timer) return;
       proofRechecks.delete(askId);
-      proofRecheckAttempts.set(askId, attempt + 1);
       if (!launchAbort.signal.aborted) void drainAskFollowUps().catch((error) => bb.log.warn(`device proof ${askId} recheck: ${String(error)}`));
     }, delays[attempt]!);
     timer.unref?.();
@@ -9555,8 +9577,8 @@ export default async function plugin(bb: BbPluginApi) {
     const timer = proofRechecks.get(askId);
     if (timer !== undefined) clearTimeout(timer);
     proofRechecks.delete(askId);
-    proofRecheckAttempts.delete(askId);
     await bb.storage.kv.delete(`${DEVICE_PROOF_PREFIX}${askId}`);
+    await bb.storage.kv.delete(`${DEVICE_PROOF_RECHECK_PREFIX}${askId}`);
   }
 
   /** The owner answered an ask by tap or reply. A device proof card's Works records his proof. */
@@ -9587,7 +9609,17 @@ export default async function plugin(bb: BbPluginApi) {
       // a restart still retries; the timer only drains that pending work.
       const confirmed = await ownerTapped(askId);
       if (confirmed !== "works") {
-        scheduleProofRecheck(askId);
+        const delays = proofRecheckMs();
+        const recheck = await proofRecheckState(askId);
+        if (recheck.attempts < delays.length) {
+          scheduleProofRecheck(askId, recheck.attempts);
+          await setProofRecheckState(askId, { ...recheck, attempts: recheck.attempts + 1 });
+          return { status: "retryable", error: "waiting for owner tap confirmation" };
+        }
+        if (!recheck.told) {
+          await tell(`Card ${askId} reads Works for build ${proof.build}, but Telegram has no record of the owner tapping it${confirmed === "unreadable" ? " (the Telegram connector did not answer)" : ""}, so no proof is recorded for ${proof.pr}. The card stays bound: a later tap record is still counted.`);
+          await setProofRecheckState(askId, { ...recheck, told: true });
+        }
         return { status: "retryable", error: "waiting for owner tap confirmation" };
       }
       let note: string;
@@ -9617,9 +9649,33 @@ export default async function plugin(bb: BbPluginApi) {
     }
     if (ask?.sourceRef?.startsWith("crew-wait:") && ask.resolution) {
       try {
-        const finished = await applyAskNativeHold(ask, ask.resolution, `owner-answer-native:${ask.id}`, "owner answer hold");
-        if (!finished) return { status: "retryable", error: "native hold still shared with another question" };
-        return { status: "completed" };
+        const result = await applyAskNativeHold(ask, ask.resolution, `owner-answer-native:${ask.id}`, "owner answer hold");
+        if (result === "shared") return { status: "retryable", error: "native hold still shared with another question" };
+        if (result === "applied") return { status: "completed" };
+        const crewId = crewIdFromWaitRef(ask.sourceRef)!;
+        if (result === "gone") {
+          const note = `Crew ${crewId} is gone: the owner's answer on card ${ask.id} (${clip(ask.resolution, 200)}) was not delivered.`;
+          const sent = await deliverToCaptain(ask.captain, note, crewId).catch((error) => {
+            bb.log.warn(`owner answer gone crew ${crewId}: ${String(error)}`);
+            return false;
+          });
+          return sent ? { status: "completed" } : { status: "retryable", error: "captain not told that the crew is gone" };
+        }
+        const crew = await findCrew(crewId);
+        if (crew === undefined || crew.parentThreadId !== ask.captain) {
+          return { status: "retryable", error: "crew not found for steering queue" };
+        }
+        try {
+          await bb.sdk.threads.send({
+            threadId: crew.threadId,
+            senderThreadId: crew.parentThreadId ?? undefined,
+            mode: "queue-if-active",
+            input: [{ type: "text", text: `The owner answered card ${ask.id}: ${ask.resolution}`.slice(0, MAX_TASK), mentions: [] }],
+          });
+          return { status: "completed" };
+        } catch (error) {
+          return { status: "retryable", error: error instanceof Error ? error.message : String(error) };
+        }
       } catch (error) {
         return { status: "retryable", error: error instanceof Error ? error.message : String(error) };
       }
@@ -9643,11 +9699,34 @@ export default async function plugin(bb: BbPluginApi) {
       } catch (error) {
         bb.log.warn(`ask follow-up drain ${askId}: ${String(error)}`);
       }
-    })).then(() => {});
+    })).then(() => tellFailedAskFollowUps());
+  }
+
+  async function tellFailedAskFollowUps(): Promise<void> {
+    for (const job of ownerAsks.failedFollowUps()) {
+      if (job.noticed || job.effect !== "owner-answered") continue;
+      const ask = ownerAsks.get(job.askId);
+      const crewId = crewIdFromWaitRef(ask?.sourceRef);
+      if (!ask || !crewId) {
+        ownerAsks.claimFollowUpNotice(job.askId, job.effect);
+        continue;
+      }
+      try {
+        await bb.sdk.threads.send({
+          threadId: ask.captain,
+          mode: "steer",
+          input: [{ type: "text", text: `The owner's answer on card ${ask.id} was not delivered to crew ${crewId}.`, mentions: [], visibility: "agent-only" }],
+        });
+        ownerAsks.claimFollowUpNotice(job.askId, job.effect);
+      } catch (error) {
+        bb.log.warn(`ask follow-up failed notice ${job.askId}: ${String(error)}`);
+      }
+    }
   }
 
   function applyFollowUpResult(job: AskFollowUp, result: FollowUpResult): void {
     if (result.status === "completed") ownerAsks.markFollowUpDone(job.askId, job.effect);
+    else if (result.error === "waiting for owner tap confirmation") ownerAsks.recordFollowUpError(job.askId, job.effect, result.error);
     else {
       ownerAsks.failFollowUp(job.askId, job.effect, result.error);
       bb.log.warn(`ask follow-up ${job.askId} ${job.effect}: ${result.error}`);
@@ -9665,6 +9744,10 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function runAskFollowUp(job: AskFollowUp): Promise<void> {
+    if (job.firstFailedAt !== null && Date.now() - job.firstFailedAt >= ASK_FOLLOWUP_GIVE_UP_MS) {
+      ownerAsks.failFollowUp(job.askId, job.effect, job.error ?? "timed out");
+      return;
+    }
     const key = `${job.askId}:${job.effect}`;
     const existing = followUpInFlight.get(key);
     if (existing !== undefined) return;
@@ -14637,6 +14720,10 @@ export default async function plugin(bb: BbPluginApi) {
       // Only the owning captain's cancel reaches here: a cancelled device proof card proves nothing, so its
       // binding and any pending re-read of its tap go (checker round 4).
       if (cancelled === true) await dropDeviceProof(id);
+      if (reopen === true) {
+        await bb.storage.kv.delete(`owner-answer-native:${id}`);
+        await bb.storage.kv.delete(`owner-close-native:${id}`);
+      }
       let warning = "";
       try {
         const result = z.object({ ok: z.boolean() }).parse(await bb.sdk.plugins.callRpc({
@@ -15999,6 +16086,10 @@ export default async function plugin(bb: BbPluginApi) {
     },
     async resolveAsk({ threadId, id, resolution }) {
       if (!(await isCaptainThread(threadId))) return { ok: false };
+      const current = ownerAsks.get(id);
+      if (!current || current.captain !== threadId) return { ok: false };
+      const sameAnswer = current.state === "answered" && (current.resolution ?? "").trim().toLowerCase() === resolution.trim().toLowerCase();
+      if (current.state !== "open" && !sameAnswer) return { ok: false };
       let ownerConfirmed = !productionApprovals.has(id);
       if (!ownerConfirmed) {
         try {
@@ -16054,7 +16145,13 @@ export default async function plugin(bb: BbPluginApi) {
         // Owner decision Q5: merged work that production does not run yet, with its next step and who takes it.
         const status = await liveStatusOf(threadId);
         const notLive = notLiveItems(tasks, (task) => planOf(ruleOf(task, deliveries.forTasks(task.crewIds, task.prs)), status), now);
-        const input: BoardInput = { asks: ownerAsks.listWaiting(threadId, now), calls: snapshot.rpc.ownerCalls, tasks, records: [...records.values()], programs: programs.list(threadId), notLive, since: from, now };
+        const undelivered = ownerAsks.failedFollowUps().flatMap((job) => {
+          if (job.effect !== "owner-answered") return [];
+          const ask = ownerAsks.get(job.askId);
+          const crewId = crewIdFromWaitRef(ask?.sourceRef);
+          return ask?.captain === threadId && crewId ? [{ crewId }] : [];
+        });
+        const input: BoardInput = { asks: ownerAsks.listWaiting(threadId, now), undelivered, calls: snapshot.rpc.ownerCalls, tasks, records: [...records.values()], programs: programs.list(threadId), notLive, since: from, now };
         if (command === "board") {
           // The running crews per project, for the connector's board in each project topic. Always sent:
           // an empty list means no crew runs, and the connector shows 0 instead of counting task lines.

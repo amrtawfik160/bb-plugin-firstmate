@@ -1342,6 +1342,28 @@ test("a captain idle sends a skip notice whose first send failed, once", async (
   }
 });
 
+test("a default notice whose send failed is sent at the next idle, once", async () => {
+  const host = await knownCaptainHost();
+  try {
+    await telegramFlags(host);
+    connectorOk(host);
+    host.harness.sdk.stub("threads.list", async () => []);
+    const opts = [{ label: "Use Postgres", value: "pg" }, { label: "Use SQLite", value: "sqlite" }];
+    asks(host).create({ id: "a000001", captain: "thr_cap", kind: "question", text: "Which DB?", options: opts, recommended: 0, defaultAt: Date.now() - 60_000, createdAt: 1 });
+    let fail = true;
+    host.harness.sdk.stub("threads.send", async () => { if (fail) throw new Error("BB down"); return {}; });
+    await captainIdle(host);
+    fail = false;
+    await captainIdle(host);
+    await captainIdle(host);
+    const notices = host.harness.sdk.callsTo("threads.send").map((c) => (c[0] as { input: Array<{ text: string }> }).input[0]?.text ?? "").filter((text) => /No answer to ask a000001/.test(text));
+    assert.equal(notices.length, 2, "one failed send, then exactly one delivered notice");
+    assert.equal(asks(host).get("a000001")?.state, "defaulted");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("a captain idle defaults an overdue reversible ask once and never an irreversible one", async () => {
   const host = await knownCaptainHost();
   try {
