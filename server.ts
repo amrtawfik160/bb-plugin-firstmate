@@ -1825,11 +1825,32 @@ export default async function plugin(bb: BbPluginApi) {
   const pluginStartedAt = Date.now();
   const queueStore = createQueueStore(bb.storage.database(), () => bb.storage.kv.get(QUEUE_KEY));
   const launches = createLaunches(bb.storage.database());
-  const activeCreateAttempts = new Map<string, string>();
+  const activeCreateHandlers = new Map<string, { key: string; token: string }>();
   function createRequestActive(record: LaunchRecord): boolean {
-    if (activeCreateAttempts.has(record.key)) return true;
+    for (const handler of activeCreateHandlers.values()) {
+      if (handler.key === record.key) return true;
+    }
     return record.createWorkerStarted === true && !(record.updatedAt < pluginStartedAt);
   }
+  function registerCreateHandler(key: string, token: string): string {
+    const id = randomUUID();
+    activeCreateHandlers.set(id, { key, token });
+    return id;
+  }
+  function unregisterCreateHandler(id: string | undefined): void {
+    if (!id) return;
+    const info = activeCreateHandlers.get(id);
+    if (!info) return;
+    activeCreateHandlers.delete(id);
+    for (const handler of activeCreateHandlers.values()) {
+      if (handler.key === info.key && handler.token === info.token) return;
+    }
+    const latest = launches.get(info.key);
+    if (latest && latest.creationRequested !== true && (latest.attemptToken ?? "") === info.token && latest.createWorkerStarted === true) {
+      launches.update(info.key, { createWorkerStarted: false });
+    }
+  }
+  const CREATE_STILL_RUNNING = "Release refused: a create-worker request is still running. If it never finishes, restart the plugin, then release again.";
   const reports=scoutReports(bb.storage.database());
   const deliveries = createDeliveries(bb.storage.database());
   const quality = createQualityEvents(bb.storage.database());
@@ -5214,6 +5235,7 @@ export default async function plugin(bb: BbPluginApi) {
     ].join("\n"),15_000,launchAbort.signal);
     requireNativeSuccess(admission,"native launch admission proof");
     const key = launchKey(projectId, owner, home, taskId);
+    let handlerId: string | undefined;
     try {
     const refuseSupersededCreate = (record: LaunchRecord | undefined) => {
       if (record?.state === "failed") throw new Error("Creation refused: this launch attempt was failed or superseded.");
@@ -5223,10 +5245,10 @@ export default async function plugin(bb: BbPluginApi) {
     if (bound && bound.state !== "deleted") {
       if ((bound.attemptToken ?? "") !== myToken) throw new Error("Creation refused: attempt token mismatch.");
       launches.update(key, { createWorkerStarted: true });
-      activeCreateAttempts.set(key, myToken);
+      handlerId = registerCreateHandler(key, myToken);
     } else if (!bound) {
       bound = await launches.reserve({ key, taskId, projectId, owner, home, generation:1,shape,nativeInvoked:true,deliveryMode:flagStr(flags,"delivery-mode"),deliveryRequirement:z.enum(["pr","merged","merged-and-verified"]).parse(flagStr(flags,"delivery-requirement") ?? "merged"),state:"reserved",threadId:null,hostId,creationRequested:false,attemptToken,createWorkerStarted:true,updatedAt:Date.now() }, () => launchCapacity(owner || undefined));
-      activeCreateAttempts.set(key, myToken);
+      handlerId = registerCreateHandler(key, myToken);
     }
     const selection = await selectExecution(bb, projectId, hostId);
     if (shape !== "secondmate" && selection.checkout !== path) throw new Error("Native project path does not match selected host checkout.");
@@ -5299,13 +5321,7 @@ export default async function plugin(bb: BbPluginApi) {
     launches.update(key,{ state:"provisioning",error:"Environment is still provisioning; native isolation guard has not run." });
     throw new Error(`Worker ${created.threadId} is still provisioning. It is retained under task ${taskId}; reconcile before retrying.`);
     } finally {
-      if (activeCreateAttempts.get(key) === myToken) {
-        activeCreateAttempts.delete(key);
-        const latest = launches.get(key);
-        if (latest && latest.creationRequested !== true && (latest.attemptToken ?? "") === myToken && latest.createWorkerStarted === true) {
-          launches.update(key, { createWorkerStarted: false });
-        }
-      }
+      unregisterCreateHandler(handlerId);
     }
   }
 
@@ -6923,7 +6939,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (record.creationRequested === true) throw new Error("Release refused: creation was requested.");
     if (record.adoption) throw new Error("Release refused: adoption is in progress.");
     if (record.home !== home) throw new Error("Release refused: launch home does not match the bound native home.");
-    if (createRequestActive(record)) throw new Error("Release refused: a create-worker request is still active.");
+    if (createRequestActive(record)) throw new Error(CREATE_STILL_RUNNING);
     if (record.creationRequested === undefined && !(record.updatedAt < pluginStartedAt)) {
       throw new Error("Release refused: no plugin process boundary after the record's last update.");
     }
@@ -6945,7 +6961,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (second) throw new Error(`Release refused: a matching thread ${second} exists.`);
       const lockAfter = await inspectSpawnLock(latest, signal);
       if (lockAfter === "live") throw new Error("Release refused: a live fm-spawn lock is still held.");
-      if (activeCreateAttempts.has(latest.key)) throw new Error("Release refused: a create-worker request is still active.");
+      if (createRequestActive(latest)) throw new Error(CREATE_STILL_RUNNING);
       if (latest.creationRequested === undefined && !(snapshot.updatedAt < pluginStartedAt)) {
         throw new Error("Release refused: no plugin process boundary after the record's last update.");
       }

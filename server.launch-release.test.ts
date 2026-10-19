@@ -467,3 +467,65 @@ test("committed native-lock test does not source the review-only fixture path", 
   const source = readFileSync(new URL("./server.checker172.test.ts", import.meta.url), "utf8");
   assert.doesNotMatch(source, /\/tmp\/verify-172-r1/);
 });
+
+test("a duplicate create-worker failure does not clear another active handler", async (t) => {
+  const { host, state } = await realCaptain();
+  let unpause = () => {};
+  const gate = new Promise<void>((resolve) => { unpause = resolve; });
+  let entered = false;
+  let reads = 0;
+  let work: Promise<{ exitCode: number; stderr: string }> | undefined;
+  try {
+    const store = launchStore(host);
+    let record: ReturnType<typeof store.get>;
+    host.harness.sdk.stub("files.read", async () => {
+      if (++reads === 1) {
+        entered = true;
+        await gate;
+        throw new Error("original prompt still failing");
+      }
+      throw new Error("definite duplicate prompt read failure");
+    });
+    state.onSpawn = async () => {
+      record = store.forTask(ctx.projectId, ctx.threadId, TASK);
+      work = host.harness.behavior.runCli(createWorkerArgv(record?.attemptToken), ctx);
+      await drain(() => entered);
+    };
+    const dispatched = await host.harness.behavior.runCli(["dispatch", "--project", ctx.projectId, "--task-id", TASK, "--", "fix login"], ctx);
+    assert.equal(dispatched.exitCode, 1);
+    assert.equal(store.get(record!.key)?.state, "uncertain");
+    assert.equal(store.get(record!.key)?.createWorkerStarted, true);
+    const listed = await host.harness.behavior.runCli(["launches", "list"], ctx);
+    assert.equal(listed.exitCode, 0);
+    assert.match(listed.stdout, /47806a51 uncertain/);
+    const duplicate = await host.harness.behavior.runCli(createWorkerArgv(record!.attemptToken), ctx);
+    assert.equal(duplicate.exitCode, 1);
+    assert.match(duplicate.stderr, /duplicate prompt read failure/);
+    assert.equal(store.get(record!.key)?.createWorkerStarted, true);
+    const refused = await host.harness.behavior.runCli(["launches", "release", TASK], ctx);
+    assert.equal(refused.exitCode, 1, refused.stderr);
+    assert.match(refused.stderr, /still running/);
+    assert.match(refused.stderr, /restart/);
+    assert.equal(store.get(record!.key)?.state, "uncertain");
+    unpause();
+    const first = await work!;
+    assert.equal(first.exitCode, 1, first.stderr);
+    assert.notEqual(store.get(record!.key)?.createWorkerStarted, true);
+    let inventoryReads = 0;
+    host.harness.sdk.stub("threads.list", async () => { inventoryReads++; return []; });
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+    const pendingRelease = host.harness.behavior.runCli(["launches", "release", TASK], ctx);
+    await drain(() => inventoryReads === 1);
+    for (let i = 0; i < 100; i++) await Promise.resolve();
+    t.mock.timers.tick(30_000);
+    const released = await pendingRelease;
+    assert.equal(released.exitCode, 0, released.stderr);
+    assert.equal(store.get(record!.key)?.state, "failed");
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
+  } finally {
+    unpause();
+    if (work) await work.catch(() => {});
+    t.mock.timers.reset();
+    await host.harness.lifecycle.dispose();
+  }
+});
