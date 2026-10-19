@@ -433,3 +433,37 @@ test("workstream report storage does not make a finished crew a native retiremen
     assert.ok(!commands.some(c=>c.includes("/state/ws1")), "no native lifecycle files are read for the workstream crew");
   } finally { await host.harness.lifecycle.dispose(); }
 });
+
+for (const retirement of ["forget", "finished", "force"]) test(`merged delivery keeps its crew until verification or owner force, then ${retirement} retires it`, async () => {
+ const {host,commands}=await captainHost({pending1:`done [at=${old}]: PR merged\n`});
+ try {
+  await host.bb.storage.kv.set("crews",[crewRow("pending1","thr_pending",{shape:"ship"})]);
+  const store=createDeliveries(host.bb.storage.database());
+  const r=store.register({url:"https://github.com/acme/repo/pull/91",taskId:"pending1",projectId:"proj_1",owner:"thr_cap",home:"/native",worker:"thr_pending",requirement:"merged-and-verified"});
+  store.observe(r.id,{headSha:"a".repeat(40),state:"merged",draft:false,checks:"passing",review:"approved",reviewHeadSha:"a".repeat(40),mergeCommitSha:"b".repeat(40),mergeable:"mergeable"},true);
+  await host.harness.behavior.setSettings({readThrough:true});
+  const listed=await host.harness.behavior.runCli(["crews"],ctx);
+  assert.equal(listed.exitCode,0,listed.stderr);
+  assert.deepEqual(await crewIds(host),["pending1"],"missing native meta must not drop a crew awaiting verification");
+  for (const args of [["forget","pending1"],["forget","pending1","--stop"]]) {
+   const result=await host.harness.behavior.runCli(args,ctx);
+   assert.equal(result.exitCode,1,result.stdout);
+   assert.deepEqual(await crewIds(host),["pending1"]);
+  }
+  await host.harness.behavior.runSchedule("finished-crew-retire");
+  assert.deepEqual(teardowns(commands),[]);
+  if (retirement !== "force") store.verify(r.id,"thr_pending","bbbbbbb",{driven:"opened page",seen:"page works"},"pending1");
+  if (retirement === "force") {
+   const retired=await host.harness.behavior.runCli(["forget","pending1","--stop","--force","Owner: drop this merged task now"],ctx);
+   assert.equal(retired.exitCode,0,retired.stderr);
+  } else if (retirement === "forget") {
+   const retired=await host.harness.behavior.runCli(["forget","pending1","--stop"],ctx);
+   assert.equal(retired.exitCode,0,retired.stderr);
+  } else {
+   await host.harness.behavior.setSettings({readThrough:false});
+   await host.harness.behavior.runSchedule("finished-crew-retire");
+   assert.deepEqual(teardowns(commands),["pending1"]);
+  }
+  assert.deepEqual(await crewIds(host),[]);
+ } finally {await host.harness.lifecycle.dispose();}
+});

@@ -395,3 +395,14 @@ test('a retained native-record cleanup keeps a worker that Firstmate revived aft
   assert.deepEqual(d.removed(),[],'Firstmate started this worker; its native metadata and inbox must stay');
  } finally {r5Hook=async()=>{};await d.host.harness.lifecycle.dispose();}
 });
+
+test('forgotten native authority stays while its delivery needs merged verification',async()=>{
+ const d=await sweepDeck();
+ try {
+  states.set(5921,'MERGED');
+  d.deliver('c9','thr_c9',5921,'merged-needs-verification');
+  metas='c9\tthr_c9\n';
+  await d.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+  assert.deepEqual(d.removed(),[]);
+ } finally {await d.host.harness.lifecycle.dispose();}
+});

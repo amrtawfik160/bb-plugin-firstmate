@@ -3,6 +3,7 @@ import test from 'node:test';
 import { createFakePluginHost,makeThreadResponse } from '@get-bb/plugin-sdk/testing';
 import plugin from './server.ts';
 import { createDeliveries } from './lib/pr-delivery.ts';
+import { createLaunches } from './lib/launch.ts';
 import { createOwnerTasks } from './lib/owner-tasks.ts';
 
 process.env.FM_MERGEABLE_POLL_MS='0';
@@ -34,12 +35,12 @@ const PRS=[[WOO,130,'woo1','thr_woo'],[CYN,2523,'cyn1','thr_cyn'],[SAFI,77,'safi
 const OPENED={111:'2026-10-10T09:00:00Z'};
 const repoOfNumber=n=>PRS.find(p=>p[1]===n)[0];
 
-function hostCommands(host) {
+function hostCommands(host,nativeWorker) {
  const commands=[];const byId=new Map();let n=0;
  host.harness.sdk.stub('terminals.create',async args=>{const tid=`term${++n}`;byId.set(tid,args.start.command);commands.push(args.start.command);return{id:tid};});
  host.harness.sdk.stub('terminals.get',async()=>({status:'running'}));
  host.harness.sdk.stub('terminals.close',async()=>({}));
- host.harness.sdk.stub('terminals.output',async({terminalId})=>{const command=byId.get(terminalId);const out=forge(command);const captured=command.includes('FM_HOST_CAPTURE_V1');const payload=captured?JSON.stringify({protocol:'FM_HOST_CAPTURE_V1',exitCode:out.code??0,stdout:out.payload??'',stderr:''}):out.payload??'';return{nextSeq:1,chunks:[{dataBase64:Buffer.from(`${payload}\n__FM_HOST_RC:${captured?0:out.code ?? 0}\n`).toString('base64')}]};});
+ host.harness.sdk.stub('terminals.output',async({terminalId})=>{const command=byId.get(terminalId);const out=nativeWorker && command.includes("^bb_thread_id=") ? {payload:nativeWorker} : forge(command);const captured=command.includes('FM_HOST_CAPTURE_V1');const payload=captured?JSON.stringify({protocol:'FM_HOST_CAPTURE_V1',exitCode:out.code??0,stdout:out.payload??'',stderr:''}):out.payload??'';return{nextSeq:1,chunks:[{dataBase64:Buffer.from(`${payload}\n__FM_HOST_RC:${captured?0:out.code ?? 0}\n`).toString('base64')}]};});
  return commands;
 }
 function forge(command) {
@@ -49,7 +50,7 @@ function forge(command) {
  if(command.includes('gh pr view')){const crew=PRS.find(p=>p[1]===n)[2];return{payload:JSON.stringify({number:n,url:url(repoOfNumber(n),n),title:`Change ${n}`,headRefName:`fm/${crew}-change-${n}`,headRefOid:head(n),state:'OPEN',mergeable:'MERGEABLE',files:[{path:'app/screens/upload.tsx'}],...(OPENED[n]?{createdAt:OPENED[n]}:{})})};}
  return{code:0};
 }
-async function deck() {
+async function deck({nativeWorker,requirement="merged"}={}) {
  const host=createFakePluginHost({pluginId:'firstmate',agentSkillIds:['firstmate','captain'],settings:{fmHome:'/native',fmHostId:'host_1'}});
  await host.bb.storage.kv.set('captain-project:thr_cap','proj_1');
  await plugin(host.bb);
@@ -71,14 +72,14 @@ async function deck() {
  const ownerTaps=new Map();
  host.harness.sdk.stub('plugins.callRpc',async(call)=>{rpc.push(call);if(call.method==='ownerAnswer')return{answer:ownerTaps.get(call.input.askId)??null};return{ok:true,queued:1,duplicate:false};});
  host.harness.sdk.stub('files.read',async()=>{throw new Error('ENOENT');});
- await host.bb.storage.kv.set('crews',CREWS);
+ await host.bb.storage.kv.set('crews',CREWS.map(c=>({...c,deliveryRequirement:requirement})));
  const store=createDeliveries(host.bb.storage.database());
  for(const [repo,n,crew,thread] of PRS){
-  const r=store.register({url:url(repo,n),taskId:crew,projectId:'proj_1',owner:'thr_cap',home:'/native',worker:thread,requirement:'merged',title:`Change ${n}`});
+  const r=store.register({url:url(repo,n),taskId:crew,projectId:'proj_1',owner:'thr_cap',home:'/native',worker:thread,requirement,title:`Change ${n}`});
   store.observe(r.id,{headSha:head(n),state:'open',draft:false,checks:'passing',review:'approved',reviewHeadSha:head(n),mergeCommitSha:null,mergeable:'mergeable',...(OPENED[n]?{openedAt:Date.parse(OPENED[n])}:{})},true);
  }
  const tap=async(id,answer)=>{ownerTaps.set(id,answer);return host.harness.behavior.callRpc('resolveAsk',{threadId:'thr_cap',id,resolution:answer});};
- return {host,store,rpc,tap,commands:hostCommands(host)};
+ return {host,store,rpc,tap,commands:hostCommands(host,nativeWorker)};
 }
 const tool=(host,name)=>host.harness.inspection.registrations.agentTools.find(t=>t.name===name);
 const text=out=>typeof out==='string'?out:out?.content?.[0]?.text ?? JSON.stringify(out);
@@ -354,4 +355,36 @@ test('a stored opening time counts only when it came from GitHub createdAt; any 
   assert.doesNotMatch(text(await verify(host,WOO,113,'thr_cap')),/Refusing/,'GitHub createdAt counts');
   assert.match(text(await tool(host,'firstmate_merge').execute({crewId:'woo4',pr:113},ctx)),/^Proof rules: the rules from before this build: #113 was opened 2026-10-09 08:00 UTC/m);
  }finally{await host.harness.lifecycle.dispose();}
+});
+
+for (const source of ['launch','native']) for (const openedAt of ['2026-10-10T09:00:00Z', undefined]) {
+ test(`missing crew verifies its merged delivery through ${source} (${openedAt ?? "strict"})`, async()=>{
+  const {host,store}=await deck({nativeWorker:source === "native" ? "thr_cyn" : undefined,requirement:"merged-and-verified"});
+  try {
+   const id=key(CYN,2523);
+   store.observe(id,{headSha:head(2523),state:'merged',draft:false,checks:'passing',review:'approved',reviewHeadSha:head(2523),mergeCommitSha:head(2523),mergeable:'mergeable',...(openedAt ? {openedAt:Date.parse(openedAt)} : {})},true);
+   assert.equal(store.get(id).status,"merged-needs-verification");
+   await check(host,CYN,2523);
+   await host.bb.storage.kv.set('crews',[]);
+   if (source === "launch") createLaunches(host.bb.storage.database()).save({key:'fixture',taskId:'cyn1',projectId:'proj_1',owner:'thr_cap',home:'/native',generation:1,shape:'ship',state:'running',threadId:'thr_cyn',updatedAt:Date.now()});
+   if (!openedAt) assert.match(text(await verify(host,CYN,2523,'thr_cap','web')),/The captain cannot verify/);
+   host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_other',status:'idle'}));
+   assert.match(text(await verify(host,CYN,2523,'thr_cyn','web')),/Refusing|Only the owning|Unknown deliverable/);
+   host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle'}));
+   assert.match(text(await verify(host,CYN,2523,'thr_unrelated','web')),/Refusing|Only the owning/);
+   assert.doesNotMatch(text(await verify(host,CYN,2523,'thr_cyn','web')),/Refusing|Only the owning/);
+   assert.equal(store.get(id).verification.crewId,'cyn1');
+  } finally {await host.harness.lifecycle.dispose();}
+ });
+}
+
+test('merge keeps a crew with required verification until its merged commit is verified',async()=>{
+ const {host,store,commands}=await deck({requirement:'merged-and-verified'});
+ try {
+  await verify(host,WOO,111,'thr_woo2');
+  await check(host,WOO,111);
+  assert.match(text(await merge(host,'woo2',111)),/^Merged #111[\s\S]*Crew woo2 kept: its delivery still needs verification/);
+  assert.ok((await host.bb.storage.kv.get('crews')).some(c=>c.id==='woo2'));
+  assert.equal(commands.some(c=>c.includes('fm-teardown.sh')),false);
+ } finally {await host.harness.lifecycle.dispose();}
 });

@@ -4756,6 +4756,7 @@ export default async function plugin(bb: BbPluginApi) {
               const rescued = new Set<Crew>();
               for (const c of crews) {
                 if (kept.includes(c)) continue;
+                if (deliveries.needsTask(c.parentThreadId ?? "", c.projectId, c.id)) { rescued.add(c); continue; }
                 const age = Date.now() - Date.parse(c.createdAt);
                 if (Number.isFinite(age) && age < READ_THROUGH_GRACE_MS) { rescued.add(c); continue; }
                 const st = await crewStatus(c, signal);
@@ -4907,6 +4908,19 @@ export default async function plugin(bb: BbPluginApi) {
     if (!record?.continuation) return undefined;
     const recovered=crewSchema.parse(record.continuation);
     return {...recovered,parentThreadId:record.owner,deliveryRequirement:record.requirement,prUrl:record.url};
+  }
+
+  async function verificationCrewId(record: DeliveryRecord, threadId: string): Promise<string | undefined> {
+    if (threadId === record.owner) return undefined;
+    const crew = await findCrewByThread(threadId);
+    if (crew) return crew.projectId === record.projectId ? crew.id : undefined;
+    const thread = await bb.sdk.threads.get({ threadId });
+    if (thread.projectId !== record.projectId) return undefined;
+    const launch = launches.forTask(record.projectId, record.owner ?? "", record.taskId);
+    if (launch?.threadId === threadId && launch.state !== "deleted" && !launches.isDeletedWorker(threadId)) return record.taskId;
+    if (!record.home) return undefined;
+    const hostId = await resolveHostForProject(record.projectId, record.owner ?? undefined);
+    return await readFmMetaField(hostId, record.taskId, "bb_thread_id", record.home) === threadId ? record.taskId : undefined;
   }
 
   async function findCrewByThread(threadId: string): Promise<Crew | undefined> {
@@ -9326,12 +9340,12 @@ export default async function plugin(bb: BbPluginApi) {
         await requirePipelineProof(live);
         const evidence={ driven:input.driven ?? "",seen:input.seen ?? "",...(input.surface ? { surface:input.surface } : {}) };
         if (r.owner === owner) return [deliveries.verify(r.id,owner,input.commitSha ?? "",evidence)];
-        const older=await findCrewByThread(owner);
-        if (!older || older.projectId !== r.projectId) throw new Error(`Only the owning manager or a Firstmate crew on this project can verify ${r.id}.`);
-        return [deliveries.verify(r.id,owner,input.commitSha ?? "",evidence,older.id)];
+        const older=await verificationCrewId(r,owner);
+        if (!older) throw new Error(`Only the owning manager or a Firstmate crew on this project can verify ${r.id}.`);
+        return [deliveries.verify(r.id,owner,input.commitSha ?? "",evidence,older)];
       }
-      const crew=await findCrewByThread(owner);
-      if (!crew || crew.projectId !== r.projectId) throw new Error(`Refusing: only a crew records verification. The captain cannot verify ${r.id} for itself: the crew that drove the change records what it drove and saw at the head, or the owner taps Works on the crew's device proof card.`);
+      const crew=await verificationCrewId(r,owner);
+      if (!crew) throw new Error(`Refusing: only a crew records verification. The captain cannot verify ${r.id} for itself: the crew that drove the change records what it drove and saw at the head, or the owner taps Works on the crew's device proof card.`);
       // Owner decision Q5: proof comes from the project's surface, and from the owner when this host cannot drive it.
       const project=projectForRepo(r.repository);
       const wrong=surfaceRefusal(project,input.surface);
@@ -9341,7 +9355,7 @@ export default async function plugin(bb: BbPluginApi) {
         `firstmate_deliveries action=device-proof id=${r.id} commitSha=${(r.headSha ?? "").slice(0,7)} build="<build id>" link="<TestFlight or OTA link>" check="<what the owner checks>" (CLI: bb firstmate deliveries device-proof ${r.id} --commit ${(r.headSha ?? "").slice(0,7)} --build <id> --link <link> --check "<what to check>").`,
       ].join("\n"));
       await requirePipelineProof(live);
-      return [deliveries.verify(r.id,owner,input.commitSha ?? "",{ driven:input.driven ?? "",seen:input.seen ?? "",...(input.surface ? { surface:input.surface } : {}) },crew.id)];
+      return [deliveries.verify(r.id,owner,input.commitSha ?? "",{ driven:input.driven ?? "",seen:input.seen ?? "",...(input.surface ? { surface:input.surface } : {}) },crew)];
     }
     if (r.owner !== owner) throw new Error("Only the owning manager can reconcile or dispose this deliverable. Use explicit assignment first.");
     if (input.action === "abandon") {
@@ -9963,7 +9977,16 @@ export default async function plugin(bb: BbPluginApi) {
       keep = true;
       kept = `Crew ${crew.id} kept, not retired: ${others.length} other open PR(s) need a decision (merge, fix or close): ${others.map((r) => r.url).join(" ")}`;
     };
-    const settle = (outcome: string, pr: string) => { keepForOpenPrs(pr); return keep ? keepLanded(crew, outcome, pr) : retireLanded(crew, outcome, pr); };
+    const settle = async (outcome: string, pr: string) => {
+      keepForOpenPrs(pr);
+      if (keep) return keepLanded(crew, outcome, pr);
+      const note = await retireLanded(crew, outcome, pr);
+      if ((await readCrews()).some(c => c.id === crew.id && c.threadId === crew.threadId)) {
+        keep = true;
+        kept = `Crew ${crew.id} kept: its delivery still needs verification.`;
+      }
+      return note;
+    };
     // 15 Oct: a probe without --yes merged two PRs under a standing yolo posture. Only
     // --yes (yes=true) merges; without it the merge stops at a preview, whatever the posture.
     // The preview comes before any ownership, verification or check refusal: it names each
@@ -10194,6 +10217,10 @@ export default async function plugin(bb: BbPluginApi) {
   }
   async function retireLandedNow(crew: Crew, outcome: string, pr: string, landed: boolean): Promise<string> {
     if (pr) await registerCrewPr(crew,pr);
+    if (deliveries.awaitingVerification(crew.parentThreadId ?? "", crew.projectId, crew.id)
+        || (deliveries.needsTask(crew.parentThreadId ?? "", crew.projectId, crew.id) && await contractForCrew(crew) === "merged-and-verified")) {
+      return ` — Crew ${crew.id} kept: its delivery still needs verification.`;
+    }
     const nativeHome = await crewNativeHome(crew);
     const notes: string[] = [];
     // A merged PR does not cover files or commits made after it. Native or BB-side, refuse first.
@@ -10341,7 +10368,7 @@ export default async function plugin(bb: BbPluginApi) {
           const now = await crewStatus(crew).catch(() => null);
           if (now !== "idle" && now !== "error") return false;
           await retireLanded(crew, state === "merged" ? "merged externally" : "PR closed externally", url, state === "merged");
-          return true;
+          return !(await readCrews()).some(c => c.id === crew.id && c.threadId === crew.threadId);
         });
         if (!done) continue;
         retired.add(crew.id);
@@ -10826,7 +10853,9 @@ export default async function plugin(bb: BbPluginApi) {
       preserveAuthority=deliveries.needsTask(crew.parentThreadId ?? "",crew.projectId,crew.id);
     }
     const openPrs = undecidedPrs(crew);
-    if (stop && preserveAuthority) throw new Error(`Outstanding PR delivery requires this task's native authority and environment. Forget without --stop, or complete/explicitly abandon its delivery before teardown.${openPrs.length ? ` Open PR(s) with no decision: ${openPrs.map((r) => r.url).join(" ")}` : ""}`);
+    const awaitingVerification = deliveries.awaitingVerification(crew.parentThreadId ?? "", crew.projectId, crew.id);
+    if (!force && awaitingVerification) throw new Error(`Outstanding PR delivery still needs verification; crew ${crew.id} is kept. Complete verification or quote the owner's words with --force.`);
+    if (stop && preserveAuthority && !(force && awaitingVerification)) throw new Error(`Outstanding PR delivery requires this task's native authority and environment. Forget without --stop, or complete/explicitly abandon its delivery before teardown.${openPrs.length ? ` Open PR(s) with no decision: ${openPrs.map((r) => r.url).join(" ")}` : ""}`);
     let worktreeRemoved = false;
     let nativeTeardown = false;
     const notes: string[] = [];
