@@ -9496,25 +9496,25 @@ export default async function plugin(bb: BbPluginApi) {
     try { return await request; }
     finally { if (commitTreeInFlight.get(key) === request) commitTreeInFlight.delete(key); }
   }
-  async function compareOwnerTapTrees(hostId: string, repo: string, tappedSha: string, mergeSha: string, signal?: AbortSignal): Promise<{ ok: true; treeSha: string } | { ok: false; reason: string }> {
+  async function compareOwnerTapTrees(hostId: string, repo: string, tappedSha: string, mergeSha: string, signal?: AbortSignal): Promise<{ ok: true; treeSha: string } | { ok: false; reason: string; temporary: boolean }> {
     const x = fullCommitSha(tappedSha), m = fullCommitSha(mergeSha);
     if (!x || !m) {
-      return { ok: false, reason: `Refusing: GitHub did not return trees for ${(tappedSha || "").slice(0, 7)} and ${(mergeSha || "").slice(0, 7)}, so the Works tap cannot cover the merge commit: commit is not a full identity` };
+      return { ok: false, temporary: false, reason: `Refusing: GitHub did not return trees for ${(tappedSha || "").slice(0, 7)} and ${(mergeSha || "").slice(0, 7)}, so the Works tap cannot cover the merge commit: commit is not a full identity` };
     }
     const pair = commitTreePairKey(hostId, repo, x, m);
     const known = commitTreeMismatch.get(pair);
-    if (known !== undefined) return { ok: false, reason: known };
+    if (known !== undefined) return { ok: false, reason: known, temporary: false };
     let treeX: string, treeM: string;
     try {
       treeX = await githubCommitTree(hostId, repo, x, signal);
       treeM = await githubCommitTree(hostId, repo, m, signal);
     } catch (error) {
-      return { ok: false, reason: `Refusing: GitHub did not return trees for ${x.slice(0, 7)} and ${m.slice(0, 7)}, so the Works tap cannot cover the merge commit: ${error instanceof Error ? error.message : String(error)}` };
+      return { ok: false, temporary: true, reason: `Refusing: GitHub did not return trees for ${x.slice(0, 7)} and ${m.slice(0, 7)}, so the Works tap cannot cover the merge commit: ${error instanceof Error ? error.message : String(error)}` };
     }
     if (treeX !== treeM) {
       const reason = `Refusing: the owner's Works tap covers ${x.slice(0, 7)}, and GitHub's trees differ from merge commit ${m.slice(0, 7)} (${treeX.slice(0, 7)} vs ${treeM.slice(0, 7)}).`;
       commitTreeMismatch.set(pair, reason);
-      return { ok: false, reason };
+      return { ok: false, reason, temporary: false };
     }
     return { ok: true, treeSha: treeX };
   }
@@ -9813,6 +9813,20 @@ export default async function plugin(bb: BbPluginApi) {
     timer.unref?.();
     proofRechecks.set(askId, timer);
   }
+  function scheduleTreeProofRetry(askId: string): void {
+    if (proofRechecks.has(askId)) return;
+    const timer = setTimeout(() => {
+      if (proofRechecks.get(askId) !== timer) return;
+      proofRechecks.delete(askId);
+      if (!launchAbort.signal.aborted) void drainAskFollowUps().catch((error) => bb.log.warn(`device proof ${askId} tree retry: ${String(error)}`));
+    }, TREE_FAIL_COOLDOWN_MS);
+    timer.unref?.();
+    proofRechecks.set(askId, timer);
+  }
+  function laterOwnerAnswer(askId: string, seq: number): boolean {
+    return [...ownerAsks.pendingFollowUps(), ...ownerAsks.failedFollowUps()]
+      .some((job) => job.askId === askId && job.effect === "owner-answered" && job.answerSeq > seq);
+  }
   async function dropDeviceProof(askId: string): Promise<void> {
     const timer = proofRechecks.get(askId);
     if (timer !== undefined) clearTimeout(timer);
@@ -9862,40 +9876,67 @@ export default async function plugin(bb: BbPluginApi) {
         }
         return { status: "retryable", error: "waiting for owner tap confirmation" };
       }
-      let note: string;
+      const evidence = { driven: `the owner tested build ${proof.build} on ${surfaceWords(proof.surface as never)}`, seen: "Works", surface: proof.surface, build: proof.build };
+      const refusePermanent = async (reason: string): Promise<FollowUpResult> => {
+        await dropDeviceProof(askId);
+        const note = `The owner tapped Works for build ${proof.build}, but no proof was recorded for ${proof.pr}: ${reason} Open a new device proof card for the current head.`;
+        bb.log.info(`device proof ${askId} ${proof.pr}@${proof.head.slice(0, 7)} build=${proof.build}: works`);
+        await tell(note);
+        return { status: "completed" };
+      };
+      const retryTree = (): FollowUpResult => {
+        scheduleTreeProofRetry(askId);
+        return { status: "retryable", error: "waiting for commit tree" };
+      };
       try {
         // A tap can come hours after the card: read the PR from GitHub first, so the record covers its head now.
         const row = deliveries.get(proof.pr);
         if (row !== undefined && row.freshness !== "fresh") await reconcileDelivery(row);
-        // The card may have been cancelled or replaced while the reads above were in flight: read the binding
-        // again, then check the card with no await between that check and the record (checker round 4).
-        if (await bb.storage.kv.get<DeviceProof>(key) === undefined || ownerAsks.get(askId)?.state !== "answered") {
-          bb.log.info(`device proof ${askId}: card closed while its tap was read; no proof recorded`);
-          await dropDeviceProof(askId);
-          return { status: "completed" };
-        }
         const current = deliveries.get(proof.pr);
-        const evidence = { driven: `the owner tested build ${proof.build} on ${surfaceWords(proof.surface as never)}`, seen: "Works", surface: proof.surface, build: proof.build };
         if (current?.forgeState === "merged") {
           const cardHead = fullCommitSha(proof.head), nowHead = fullCommitSha(current.headSha), mergeSha = fullCommitSha(current.mergeCommitSha);
-          if (!cardHead || !nowHead || cardHead !== nowHead) throw new Error("The device card does not cover the PR's final head.");
-          if (!mergeSha) throw new Error(`${proof.pr} has no recorded merge commit; reconcile it, then verify again`);
+          if (!cardHead || !nowHead || cardHead !== nowHead) return refusePermanent("The device card does not cover the PR's final head.");
+          if (!mergeSha) return retryTree();
           const hostId = await resolveHostForProject(current.projectId, current.owner ?? undefined);
           const compared = await compareOwnerTapTrees(hostId, current.repository, cardHead, mergeSha);
-          if (!compared.ok) throw new Error(compared.reason);
+          if (!compared.ok) return compared.temporary ? retryTree() : refusePermanent(compared.reason);
+          // After every host and tree read: re-read the binding, then check state, answer
+          // sequence, Works, and delivery identity with no await before the write.
+          const liveProof = await bb.storage.kv.get<DeviceProof>(key);
+          const liveAsk = ownerAsks.get(askId);
+          const live = deliveries.get(proof.pr);
+          if (liveProof === undefined || liveAsk?.state !== "answered") {
+            bb.log.info(`device proof ${askId}: card closed while its tap was read; no proof recorded`);
+            return { status: "completed" };
+          }
+          if ((liveAsk.resolution ?? "").trim().toLowerCase() !== "works" || laterOwnerAnswer(askId, answerSeq)) return { status: "completed" };
+          if (fullCommitSha(live?.headSha) !== nowHead || fullCommitSha(live?.mergeCommitSha) !== mergeSha) return { status: "completed" };
           deliveries.verify(proof.pr, OWNER_ACTOR, mergeSha, { ...evidence, tappedCommitSha: cardHead, treeSha: compared.treeSha });
-          note = `The owner tapped Works for build ${proof.build}: proof is recorded for ${proof.pr} at ${mergeSha.slice(0, 7)}.`;
-        } else {
-          deliveries.verify(proof.pr, OWNER_ACTOR, proof.head, evidence);
-          note = `The owner tapped Works for build ${proof.build}: proof is recorded for ${proof.pr} at ${proof.head.slice(0, 7)}.`;
+          await bb.storage.kv.delete(key);
+          const note = `The owner tapped Works for build ${proof.build}: proof is recorded for ${proof.pr} at ${mergeSha.slice(0, 7)}.`;
+          bb.log.info(`device proof ${askId} ${proof.pr}@${proof.head.slice(0, 7)} build=${proof.build}: works`);
+          await tell(note);
+          return { status: "completed" };
         }
+        const liveProof = await bb.storage.kv.get<DeviceProof>(key);
+        const liveAsk = ownerAsks.get(askId);
+        if (liveProof === undefined || liveAsk?.state !== "answered") {
+          bb.log.info(`device proof ${askId}: card closed while its tap was read; no proof recorded`);
+          return { status: "completed" };
+        }
+        if ((liveAsk.resolution ?? "").trim().toLowerCase() !== "works" || laterOwnerAnswer(askId, answerSeq)) return { status: "completed" };
+        deliveries.verify(proof.pr, OWNER_ACTOR, proof.head, evidence);
+        await bb.storage.kv.delete(key);
+        const note = `The owner tapped Works for build ${proof.build}: proof is recorded for ${proof.pr} at ${proof.head.slice(0, 7)}.`;
+        bb.log.info(`device proof ${askId} ${proof.pr}@${proof.head.slice(0, 7)} build=${proof.build}: works`);
+        await tell(note);
+        return { status: "completed" };
       } catch (error) {
-        note = `The owner tapped Works for build ${proof.build}, but no proof was recorded for ${proof.pr}: ${error instanceof Error ? error.message : String(error)} Open a new device proof card for the current head.`;
+        if (error instanceof GithubReservePaused) return retryTree();
+        const message = error instanceof Error ? error.message : String(error);
+        if (/did not return (a )?trees?|cooling down|unreadable|Timed out/i.test(message)) return retryTree();
+        return refusePermanent(message);
       }
-      await bb.storage.kv.delete(key);
-      bb.log.info(`device proof ${askId} ${proof.pr}@${proof.head.slice(0, 7)} build=${proof.build}: works`);
-      await tell(note);
-      return { status: "completed" };
     }
     if (ask?.sourceRef?.startsWith("crew-wait:") && resolution) {
       const sentKey = `owner-answer-sent:${ask.id}:${answerSeq}`;
@@ -10205,7 +10246,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   function applyFollowUpResult(job: AskFollowUp, result: FollowUpResult): void {
     if (result.status === "completed") ownerAsks.markFollowUpDone(job.askId, job.effect, job.answerSeq);
-    else if (result.error === "waiting for owner tap confirmation") ownerAsks.recordFollowUpError(job.askId, job.effect, result.error, job.answerSeq);
+    else if (result.error === "waiting for owner tap confirmation" || result.error === "waiting for commit tree") ownerAsks.recordFollowUpError(job.askId, job.effect, result.error, job.answerSeq);
     else {
       ownerAsks.failFollowUp(job.askId, job.effect, result.error, undefined, job.answerSeq);
       bb.log.warn(`ask follow-up ${job.askId} ${job.effect}: ${result.error}`);
