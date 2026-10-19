@@ -358,3 +358,19 @@ test("closeAsk releases a crew work row held for its sole keyed question", async
     assert.ok(!answers[0]!.includes("'choice'"));
   } finally { restore(); await host.harness.lifecycle.dispose(); }
 });
+
+test("checker 169: a new native owner decision reaches the owner as an actionable card", async () => {
+  const { host, tasks, asks, commands, restore } = await captainHost({ wait1: "needs-decision [key=choice]: Choose Postgres or SQLite?\n" });
+  try {
+    await host.bb.storage.kv.set("crews", [crewRow("wait1", "thr_w1")]);
+    const task = tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Database", sourceRefs: [], crewId: "wait1", at: Date.now() });
+    await host.harness.behavior.runSchedule("task-lifecycle");
+    assert.ok(asks.listOpen("thr_cap").some(ask => ask.task === task.id && ask.options.length > 0 && ask.sourceRef?.startsWith("crew-wait:wait1:")), "native owner decision must have an actionable card linked to its hold");
+    const card = asks.listOpen("thr_cap").find((ask) => ask.task === task.id)!;
+    await host.harness.behavior.callRpc("closeAsk", { threadId: "thr_cap", ids: [card.id] });
+    assert.equal(asks.get(card.id)?.resolution, "closed by owner, no action");
+    const answers = commands.filter((c) => c.includes("fm-captain-hold.sh") && c.includes("'answer'"));
+    assert.equal(answers.length, 1, "Close must release the native hold bound to the card");
+    assert.match(answers[0]!, /'choice'.*'--decision-file'.*'--release'/);
+  } finally { restore(); await host.harness.lifecycle.dispose(); }
+});

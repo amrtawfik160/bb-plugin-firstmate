@@ -1952,3 +1952,20 @@ test("a crew that fails, stops, finishes or is archived hands its owner messages
     }
   }
 });
+
+test("checker 169: replay after restart recovers deferred device proof work", async () => {
+  // These are the persisted rows at the crash boundary: answer committed, follow-up not run.
+  const host = await captainHost();
+  try {
+    const store = asks(host);
+    store.create({ id: "a000001", captain: "thr_cap", kind: "question", text: "Does build 21 work?", options: [{label:"Works",value:"works"},{label:"Does not work",value:"no"}], createdAt: 1 });
+    store.resolve("a000001", "thr_cap", "answered", "Does not work", 123, "owner");
+    await host.bb.storage.kv.set("device-proof:a000001", {captain:"thr_cap",pr:"owner/repo#1",head:"a".repeat(40),build:"21",crewId:"crew1",surface:"iphone"});
+    connectorOk(host);
+    const hook = host.harness.inspection.registrations.hooks["message.dispatch"]!;
+    await hook({thread:makeThreadResponse({id:"thr_cap",status:"active"}),attempt:"join-turn",initiator:"user",senderThreadId:null,queuedMessages:[],input:{blocks:[],text:askReply("a000001","b.")}} as never);
+    await afterDispatch();
+    assert.equal(store.get("a000001")?.resolvedAt,123,"a restart replay must not reapply the answer");
+    assert.equal(await host.bb.storage.kv.get("device-proof:a000001"), undefined, "the durable deferred work must run after replay, so a failed build reaches the crew and captain");
+  } finally { await host.harness.lifecycle.dispose(); }
+});
