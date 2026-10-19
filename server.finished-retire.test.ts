@@ -422,6 +422,27 @@ test("raw native teardown of a known crew is refused by firstmate_fm and bb firs
 });
 
 
+test("automatic retirement keeps an adopted crew's worktree while the workstream is open", async () => {
+  const { host, commands } = await captainHost({ adopt1: `done [at=${old}]: report ready\n` });
+  try {
+    const { createWorkstreams } = await import("./lib/workstreams.ts");
+    const tasks = createOwnerTasks(host.bb.storage.database());
+    const task = tasks.open({ captain: "thr_cap", project: "Cyndra", projectId: "proj_1", title: "Adopted keep", sourceRefs: ["tg:42:1"], crewId: "adopt1", at: Date.now() });
+    const store = createWorkstreams(host.bb.storage.database(), {
+      now: () => Date.now(), provision: async () => { throw new Error("must not provision"); },
+      start: async () => { throw new Error("must not spawn"); }, status: async () => "idle",
+      startDev: async () => "", stopDev: async () => {}, unsaved: async () => [], remove: async () => {},
+      ship: async () => {}, taskState: () => "working",
+    });
+    await store.adopt({ threadId: "thr_cap", projectId: "proj_1", name: "Keep", requestId: "keep-adopt", taskIds: [task.id] });
+    await host.bb.storage.kv.set("crews", [crewRow("adopt1", "thr_adopt1")]);
+    await host.harness.behavior.runCli(["retire-finished", "--captain", "thr_cap"], ctx);
+    await host.harness.behavior.runSchedule("finished-crew-retire");
+    assert.deepEqual(teardowns(commands), []);
+    assert.deepEqual(await crewIds(host), ["adopt1"]);
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
 test("workstream report storage does not make a finished crew a native retirement candidate", async () => {
   const { host, commands } = await captainHost({ws1:`done [at=${old}]: report ready\n`});
   try {
