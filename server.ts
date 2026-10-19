@@ -130,6 +130,17 @@ import {
   FIRSTMATE_ROUTINE_MARKER,
 } from "./lib/timeline-noise.ts";
 
+const connectorOwnerAnswerSchema = z.object({
+  answer: z.string().nullable(),
+  answeredAt: z.number().int().optional(),
+  tapId: z.string().min(1).max(200).optional(),
+});
+
+function connectorTap(read: { tapId?: string; answeredAt?: number }): { tapId: string; answeredAt: number } | undefined {
+  const tapId = typeof read.tapId === "string" && read.tapId !== "" ? read.tapId : undefined;
+  return tapId !== undefined && Number.isFinite(read.answeredAt) ? { tapId, answeredAt: read.answeredAt as number } : undefined;
+}
+
 const shapeSchema = z.enum(["ship", "scout"]);
 const modeSchema = z.enum(["direct-PR", "no-mistakes", "local-only"]);
 
@@ -16151,21 +16162,23 @@ export default async function plugin(bb: BbPluginApi) {
       if (ok) await refreshOwnerBoard();
       return { ok };
     },
-    async resolveAsk({ threadId, id, resolution }) {
+    async resolveAsk({ threadId, id, resolution, answeredAt, tapId }) {
       if (!(await isCaptainThread(threadId))) return { ok: false };
       const ask = ownerAsks.get(id);
       if (!ask || ask.captain !== threadId) return { ok: false };
       const deviceProof = await bb.storage.kv.get(`${DEVICE_PROOF_PREFIX}${id}`) !== undefined;
       let ownerConfirmed = false;
+      let fromConnector: { tapId?: string; answeredAt?: number } | undefined;
       if (deviceProof) {
         // Device-proof RPC must answer even when ownerAnswer is still null: ownerAnsweredAsk re-reads the tap.
         ownerConfirmed = true;
       } else {
         try {
-          const tapped = z.object({ answer: z.string().nullable() }).parse(await bb.sdk.plugins.callRpc({
-            pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "ownerAnswer", input: { askId: id }, outputSchema: z.object({ answer: z.string().nullable() }),
+          const tapped = connectorOwnerAnswerSchema.parse(await bb.sdk.plugins.callRpc({
+            pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "ownerAnswer", input: { askId: id }, outputSchema: connectorOwnerAnswerSchema,
           }));
           ownerConfirmed = tapped.answer !== null && tapped.answer.trim().toLowerCase() === resolution.trim().toLowerCase();
+          fromConnector = tapped;
         } catch { /* An RPC correction can close a card, but cannot grant production approval. */ }
       }
       const action = gatedAskResolve(ask, { ownerConfirmed });
@@ -16175,7 +16188,11 @@ export default async function plugin(bb: BbPluginApi) {
         if (ok) await syncOwnerApprovalForAsk(id);
         return { ok };
       }
-      const ok = ownerAsks.resolve(id, threadId, "answered", resolution, Date.now(), ownerConfirmed ? "owner" : undefined) !== undefined;
+      const tap = connectorTap({
+        tapId: tapId || fromConnector?.tapId,
+        answeredAt: answeredAt ?? fromConnector?.answeredAt,
+      });
+      const ok = ownerAsks.resolve(id, threadId, "answered", resolution, Date.now(), ownerConfirmed ? "owner" : undefined, ownerConfirmed ? tap : undefined) !== undefined;
       if (ok) await ownerAnsweredAsk(id, resolution);
       if (ok) await refreshOwnerBoard();
       if (ok) await syncOwnerApprovalForAsk(id);
@@ -16807,15 +16824,15 @@ export default async function plugin(bb: BbPluginApi) {
   const knownCaptains = knownCaptainsRef;
   for (const key of await bb.storage.kv.list(CAPTAIN_PROJECT_PREFIX)) knownCaptains.add(key.slice(CAPTAIN_PROJECT_PREFIX.length));
   const heldPingCaptains = new Set<string>();
-  async function connectorOwnerAnswer(askId: string): Promise<string | null> {
+  async function readConnectorOwnerAnswer(askId: string): Promise<{ answer: string | null; tap?: { tapId: string; answeredAt: number } }> {
     try {
-      const read = z.object({ answer: z.string().nullable() }).parse(await bb.sdk.plugins.callRpc({
+      const read = connectorOwnerAnswerSchema.parse(await bb.sdk.plugins.callRpc({
         pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "ownerAnswer", input: { askId },
-        outputSchema: z.object({ answer: z.string().nullable() }),
+        outputSchema: connectorOwnerAnswerSchema,
       }));
-      return read.answer;
+      return { answer: read.answer, tap: connectorTap(read) };
     } catch {
-      return null;
+      return { answer: null };
     }
   }
 
@@ -16825,9 +16842,17 @@ export default async function plugin(bb: BbPluginApi) {
     return askLetterAnswer(ask, confirmed) === expected;
   }
 
-  async function connectorConfirmsAsk(ask: OwnerAsk, expected: string): Promise<boolean> {
-    if (ask.kind !== "approval" && !ask.irreversible) return true;
-    return matchesOwnerAnswer(ask, expected, await connectorOwnerAnswer(ask.id));
+  async function recordOneAskAnswer(captainThreadId: string, ask: OwnerAsk, answer: string): Promise<boolean> {
+    let tap: { tapId: string; answeredAt: number } | undefined;
+    if (ask.kind === "approval" || ask.irreversible) {
+      const read = await readConnectorOwnerAnswer(ask.id);
+      if (!matchesOwnerAnswer(ask, answer, read.answer)) return false;
+      tap = read.tap;
+    }
+    if (!ownerAsks.resolve(ask.id, captainThreadId, "answered", answer, Date.now(), "owner", tap)) return false;
+    await ownerAnsweredAsk(ask.id, answer);
+    await syncOwnerApprovalForAsk(ask.id);
+    return true;
   }
 
   // An owner reply to an ask card, or a tap on one of its buttons, answers that ask.
@@ -16844,8 +16869,7 @@ export default async function plugin(bb: BbPluginApi) {
         for (const { id, answer } of packAnswers(header.body)) {
           const ask = ownerAsks.get(id);
           if (!ask || ask.state !== "open") continue;
-          if (!(await connectorConfirmsAsk(ask, answer))) continue;
-          if (ownerAsks.resolve(id, captainThreadId, "answered", answer, Date.now(), "owner")) { answered++; await ownerAnsweredAsk(id, answer); await syncOwnerApprovalForAsk(id); }
+          if (await recordOneAskAnswer(captainThreadId, ask, answer)) answered++;
         }
         continue;
       }
@@ -16854,8 +16878,7 @@ export default async function plugin(bb: BbPluginApi) {
       const ask = ownerAsks.get(id);
       const answer = ask ? askLetterAnswer(ask, header.body) : null;
       if (!ask || ask.state !== "open" || answer === null) continue;
-      if (!(await connectorConfirmsAsk(ask, answer))) continue;
-      if (ownerAsks.resolve(id, captainThreadId, "answered", answer, Date.now(), "owner")) { answered++; await ownerAnsweredAsk(id, answer); await syncOwnerApprovalForAsk(id); }
+      if (await recordOneAskAnswer(captainThreadId, ask, answer)) answered++;
     }
     if (answered > 0) await refreshOwnerBoard();
   }

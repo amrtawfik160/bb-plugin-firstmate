@@ -155,8 +155,8 @@ export type OwnerAsks = {
   /** The open asks that wait on the owner now: open and not skipped until later. */
   listWaiting(captain: string, now: number): OwnerAsk[];
   listCandidates(captain: string, now: number): OwnerAsk[];
-  /** Correct or reopen an ask owned by this captain. */
-  resolve(id: string, captain: string, state: AskState, resolution: string, at: number, source?: "owner"): OwnerAsk | undefined;
+  /** Correct or reopen an ask owned by this captain. Owner answers pass `tap` for connector tap identity. */
+  resolve(id: string, captain: string, state: AskState, resolution: string, at: number, source?: "owner", tap?: { tapId: string; answeredAt: number }): OwnerAsk | undefined;
   answeredByOwner(id: string): boolean;
   /** Close only the named cards, atomically; owner closes are terminal and repeated closes are no-ops. */
   close(ids: readonly string[], captain: string, now?: number): AskClosure;
@@ -233,6 +233,8 @@ export function createOwnerAsks(db: Database): OwnerAsks {
   db.exec(`CREATE TABLE IF NOT EXISTS owner_ask_answer (id TEXT PRIMARY KEY, source TEXT NOT NULL);`);
   try { db.exec("ALTER TABLE owner_ask_answer ADD COLUMN resolution TEXT"); } catch { /* already present on this database */ }
   try { db.exec("ALTER TABLE owner_ask_answer ADD COLUMN at INTEGER"); } catch { /* already present on this database */ }
+  try { db.exec("ALTER TABLE owner_ask_answer ADD COLUMN tap_id TEXT"); } catch { /* already present on this database */ }
+  db.exec(`CREATE TABLE IF NOT EXISTS owner_ask_reopen (id TEXT PRIMARY KEY, at INTEGER NOT NULL);`);
   try {
     db.exec("UPDATE owner_ask_answer SET resolution=(SELECT resolution FROM owner_ask WHERE owner_ask.id=owner_ask_answer.id) WHERE source='owner' AND (resolution IS NULL OR resolution='')");
     db.exec("UPDATE owner_ask_answer SET at=(SELECT resolved_at FROM owner_ask WHERE owner_ask.id=owner_ask_answer.id) WHERE source='owner' AND at IS NULL");
@@ -373,28 +375,47 @@ export function createOwnerAsks(db: Database): OwnerAsks {
     answeredByOwner(id) {
       return db.prepare("SELECT id FROM owner_ask_answer WHERE id=? AND source='owner'").get(id) !== undefined;
     },
-    resolve(id, captain, state, resolution, at, source) {
+    resolve(id, captain, state, resolution, at, source, tap) {
       return db.transaction(() => {
         const current = get(id);
         if (!current || current.captain !== captain || db.prepare("SELECT id FROM owner_ask_close WHERE id=?").get(id) !== undefined) return undefined;
+        const { deferredUntil: _skip, ...rest } = current;
+        const clearDefer = () => db.prepare("DELETE FROM owner_ask_defer WHERE id=?").run(id);
+        if (state === "open") {
+          db.prepare("UPDATE owner_ask SET state=?, resolution=?, resolved_at=? WHERE id=?").run("open", null, null, id);
+          db.prepare("INSERT INTO owner_ask_reopen(id, at) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET at=excluded.at").run(id, at);
+          clearDefer();
+          return { ...rest, state: "open" as const, resolution: null, resolvedAt: null };
+        }
         if (source === "owner" && state === "answered") {
-          const existing = db.prepare("SELECT resolution FROM owner_ask_answer WHERE id=? AND source='owner'").get(id) as { resolution: string | null } | undefined;
-          const sameChoice = existing !== undefined && String(existing.resolution ?? "") === String(resolution ?? "");
-          // Same choice on a card that is not open is a retry; after reopen it is a new tap.
-          if (sameChoice && current.state !== "open") {
-            db.prepare("DELETE FROM owner_ask_defer WHERE id=?").run(id);
-            const { deferredUntil: _skip, ...rest } = current;
+          const existing = db.prepare("SELECT resolution, at, tap_id FROM owner_ask_answer WHERE id=? AND source='owner'").get(id) as { resolution: string | null; at: number | null; tap_id: string | null } | undefined;
+          const reopen = db.prepare("SELECT at FROM owner_ask_reopen WHERE id=?").get(id) as { at: number } | undefined;
+          const tapId = typeof tap?.tapId === "string" && tap.tapId !== "" ? tap.tapId : undefined;
+          const answeredAt = tap !== undefined && tapId !== undefined && Number.isFinite(tap.answeredAt) ? Math.min(tap.answeredAt, at) : undefined;
+          if (tapId !== undefined && existing?.tap_id === tapId) {
+            clearDefer();
             return rest;
           }
+          if (reopen !== undefined && answeredAt !== undefined && answeredAt <= reopen.at) return undefined;
+          const identified = typeof existing?.tap_id === "string" && existing.tap_id !== "";
+          const sameChoice = existing !== undefined && String(existing.resolution ?? "") === String(resolution ?? "");
+          const unansweredSinceReopen = reopen === undefined || existing?.at == null || existing.at > reopen.at;
+          if (tapId === undefined && sameChoice && unansweredSinceReopen) {
+            clearDefer();
+            return rest;
+          }
+          const displayAt = answeredAt ?? at;
+          db.prepare("UPDATE owner_ask SET state=?, resolution=?, resolved_at=? WHERE id=?").run(state, resolution, displayAt, id);
+          // A resolve without tapId never creates or renews a tap-identified permission.
+          if (tapId !== undefined || !identified) {
+            db.prepare("INSERT INTO owner_ask_answer(id, source, resolution, at, tap_id) VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET source=excluded.source, resolution=excluded.resolution, at=excluded.at, tap_id=excluded.tap_id").run(id, source, resolution, displayAt, tapId ?? existing?.tap_id ?? null);
+          }
+          clearDefer();
+          return { ...rest, state, resolution, resolvedAt: displayAt };
         }
-        db.prepare("UPDATE owner_ask SET state=?, resolution=?, resolved_at=? WHERE id=?").run(state, state === "open" ? null : resolution, state === "open" ? null : at, id);
-        if (source === "owner" && state === "answered") {
-          db.prepare("INSERT INTO owner_ask_answer(id, source, resolution, at) VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET source=excluded.source, resolution=excluded.resolution, at=excluded.at").run(id, source, resolution, at);
-        }
-        // A skip ends when the card is answered or reopened: a reopened card waits on the owner again.
-        db.prepare("DELETE FROM owner_ask_defer WHERE id=?").run(id);
-        const { deferredUntil: _skip, ...rest } = current;
-        return { ...rest, state, resolution: state === "open" ? null : resolution, resolvedAt: state === "open" ? null : at };
+        db.prepare("UPDATE owner_ask SET state=?, resolution=?, resolved_at=? WHERE id=?").run(state, resolution, at, id);
+        clearDefer();
+        return { ...rest, state, resolution, resolvedAt: at };
       })();
     },
     takeDue(captain, now) {

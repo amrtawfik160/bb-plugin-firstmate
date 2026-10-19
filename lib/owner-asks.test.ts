@@ -235,6 +235,65 @@ test("the same owner choice after reopen updates the answer time", () => {
   assert.equal(row.at, NOW + 30_000);
 });
 
+test("replaying the same tapId keeps the original answer time", () => {
+  const database = db();
+  const asks = createOwnerAsks(database);
+  const options = [{ label: "No", value: "no" }, { label: "Approve", value: "approve" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "approval", text: "Merge?", options, createdAt: NOW });
+  const tap = { tapId: "tg:1", answeredAt: NOW };
+  asks.resolve("a1", "thr_cap", "answered", "Approve", NOW + 5_000, "owner", tap);
+  asks.resolve("a1", "thr_cap", "open", "Ask owner again", NOW + 10_000);
+  assert.ok(asks.resolve("a1", "thr_cap", "answered", "Approve", NOW + 30_000, "owner", { tapId: "tg:1", answeredAt: NOW + 30_000 }));
+  assert.equal(asks.get("a1")?.state, "open");
+  const row = database.prepare("SELECT resolution, at, tap_id FROM owner_ask_answer WHERE id=?").get("a1") as { resolution: string; at: number; tap_id: string };
+  assert.equal(row.resolution, "Approve");
+  assert.equal(row.at, NOW);
+  assert.equal(row.tap_id, "tg:1");
+});
+
+test("a stale tap from before reopen is refused and writes nothing", () => {
+  const database = db();
+  const asks = createOwnerAsks(database);
+  const options = [{ label: "No", value: "no" }, { label: "Approve", value: "approve" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "approval", text: "Merge?", options, createdAt: NOW });
+  asks.resolve("a1", "thr_cap", "answered", "No", NOW, "owner", { tapId: "tg:no", answeredAt: NOW });
+  asks.resolve("a1", "thr_cap", "open", "Ask owner again", NOW + 10_000);
+  assert.equal(asks.resolve("a1", "thr_cap", "answered", "Approve", NOW + 30_000, "owner", { tapId: "tg:old", answeredAt: NOW + 5_000 }), undefined);
+  assert.equal(asks.get("a1")?.state, "open");
+  const row = database.prepare("SELECT resolution, at, tap_id FROM owner_ask_answer WHERE id=?").get("a1") as { resolution: string; at: number; tap_id: string };
+  assert.equal(row.resolution, "No");
+  assert.equal(row.at, NOW);
+  assert.equal(row.tap_id, "tg:no");
+});
+
+test("a genuine re-tap after reopen wins with its own tapId", () => {
+  const database = db();
+  const asks = createOwnerAsks(database);
+  const options = [{ label: "No", value: "no" }, { label: "Approve", value: "approve" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "approval", text: "Merge?", options, createdAt: NOW });
+  asks.resolve("a1", "thr_cap", "answered", "No", NOW, "owner", { tapId: "tg:no", answeredAt: NOW });
+  asks.resolve("a1", "thr_cap", "open", "Ask owner again", NOW + 10_000);
+  assert.equal(asks.resolve("a1", "thr_cap", "answered", "Approve", NOW + 30_000, "owner", { tapId: "tg:new", answeredAt: NOW + 20_000 })?.resolution, "Approve");
+  const row = database.prepare("SELECT resolution, at, tap_id FROM owner_ask_answer WHERE id=?").get("a1") as { resolution: string; at: number; tap_id: string };
+  assert.equal(row.resolution, "Approve");
+  assert.equal(row.at, NOW + 20_000);
+  assert.equal(row.tap_id, "tg:new");
+});
+
+test("a resolve without tapId does not renew a tap-identified answer", () => {
+  const database = db();
+  const asks = createOwnerAsks(database);
+  const options = [{ label: "No", value: "no" }, { label: "Approve", value: "approve" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "approval", text: "Merge?", options, createdAt: NOW });
+  asks.resolve("a1", "thr_cap", "answered", "Approve", NOW, "owner", { tapId: "tg:1", answeredAt: NOW });
+  asks.resolve("a1", "thr_cap", "open", "Ask owner again", NOW + 10_000);
+  assert.equal(asks.resolve("a1", "thr_cap", "answered", "Approve", NOW + 30_000, "owner")?.state, "answered");
+  const row = database.prepare("SELECT resolution, at, tap_id FROM owner_ask_answer WHERE id=?").get("a1") as { resolution: string; at: number; tap_id: string };
+  assert.equal(row.resolution, "Approve");
+  assert.equal(row.at, NOW);
+  assert.equal(row.tap_id, "tg:1");
+});
+
 test("a skipped card answered early is answered, and a reopened card is no longer skipped", () => {
   const asks = createOwnerAsks(db());
   const options = [{ label: "Yes", value: "yes" }];
