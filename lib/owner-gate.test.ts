@@ -9,6 +9,7 @@ import {
   createOwnerGate,
   gatedAskResolve,
   ownerApprovalStatus,
+  ownerDispatchSource,
   preApprovalCovers,
   prodCheck,
   quotePreApproval,
@@ -339,6 +340,41 @@ test("a newer unanswered card is ignored so an earlier owner No still wins", () 
   });
   assert.equal(out.state, "pending");
   assert.match(out.description, /No/);
+});
+
+test("owner dispatch source is BB's origin record, never the text", () => {
+  const base = { initiator: "user", senderThreadId: null, origin: null, originPluginId: null };
+  assert.equal(ownerDispatchSource(base), null);
+  assert.equal(ownerDispatchSource({ ...base, origin: "plugin", originPluginId: "other-plugin" }), null);
+  assert.equal(ownerDispatchSource({ ...base, senderThreadId: "thr_crew", originPluginId: "telegram" }), null);
+  assert.equal(ownerDispatchSource({ ...base, origin: "cli" }), null);
+  assert.equal(ownerDispatchSource({ ...base, origin: "plugin", originPluginId: "telegram" }), "telegram");
+  assert.equal(ownerDispatchSource({ ...base, submissionPluginId: "telegram" }), "telegram");
+  assert.equal(ownerDispatchSource({ ...base, origin: "app" }), "app");
+  assert.equal(ownerDispatchSource({ initiator: "user", senderThreadId: null, origin: undefined, originPluginId: undefined }), "omitted");
+});
+
+test("cardsForPr still reads owner No after captain cancel or reopen", () => {
+  const database = db();
+  const asks = createOwnerAsks(database);
+  const gate = createOwnerGate(database);
+  gate.recordPreApproval({
+    ownerMessageRef: "tg:200:1", quote: "merge after you finish", task: "T12", project: "Cyndra", allows: "merge", createdAt: 1,
+  });
+  const ask = asks.create({
+    captain: "thr_cap", kind: "approval", text: `Merge ${PR}?`,
+    options: [{ label: "Approve", value: "approve" }, { label: "No", value: "no" }], createdAt: 2,
+  });
+  createProductionApprovals(database).bindCard(ask.id, [{ pr: PR, head: HEAD }]);
+  asks.resolve(ask.id, "thr_cap", "answered", "No", 3, "owner");
+  asks.resolve(ask.id, "thr_cap", "cancelled", "Captain clearing old card", 4);
+  const loaded = gate.cardsForPr(PR);
+  assert.equal(loaded[0]?.answeredByOwner, true);
+  assert.equal(loaded[0]?.resolution, "No");
+  assert.equal(approvalFor({
+    pr: PR, head: HEAD, action: "merge", cards: loaded, coverage: () => "covers",
+    preApprovals: [pre()], task: "T12", taskOpen: true, generation: 1,
+  }).state, "pending");
 });
 
 test("no-PR prod-check uses approvalFor so a covering pre-approval still succeeds", () => {

@@ -184,6 +184,20 @@ test("each skipped card waits until the captain is told, and is told once", () =
   assert.deepEqual(asks.untoldSkips("thr_cap", NOW + 60_000), [], "a skip whose time passed needs no notice");
 });
 
+test("an owner answer stays after captain cancel or reopen", () => {
+  const asks = createOwnerAsks(db());
+  const options = [{ label: "No", value: "no" }, { label: "Approve", value: "approve" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "approval", text: "Merge?", options, createdAt: NOW });
+  asks.resolve("a1", "thr_cap", "answered", "No", NOW, "owner");
+  assert.equal(asks.answeredByOwner("a1"), true);
+  asks.resolve("a1", "thr_cap", "cancelled", "Captain clearing old card", NOW + 1);
+  assert.equal(asks.answeredByOwner("a1"), true);
+  asks.resolve("a1", "thr_cap", "open", "Reopen", NOW + 2);
+  assert.equal(asks.answeredByOwner("a1"), true);
+  asks.resolve("a1", "thr_cap", "answered", "Approve", NOW + 3, "owner");
+  assert.equal(asks.answeredByOwner("a1"), true);
+});
+
 test("a skipped card answered early is answered, and a reopened card is no longer skipped", () => {
   const asks = createOwnerAsks(db());
   const options = [{ label: "Yes", value: "yes" }];

@@ -1,5 +1,5 @@
 import { affirmative, APPROVAL_CHOICES, approvalCardText, fixedApprovalChoices, compareSchema, createProductionApprovals, onlyBaseMerges, productionMergeGuard, PRODUCTION_APPROVAL_POINTER, PRODUCTION_CARD_RULE } from "./lib/production-approval.ts";
-import { approvalFor, createOwnerGate, gatedAskResolve, prodCheck, quotePreApproval, type GateCard, type HeadCoverage, type PreApproval, type ProdWhat } from "./lib/owner-gate.ts";
+import { approvalFor, createOwnerGate, gatedAskResolve, ownerDispatchSource, prodCheck, quotePreApproval, type GateCard, type HeadCoverage, type PreApproval, type ProdWhat } from "./lib/owner-gate.ts";
 import { postStatusCommand } from "./lib/github-status.ts";
 import { judgePreApprovalBound } from "./lib/pre-approval-judge.ts";
 // bb-plugin-firstmate — firstmate-style crews native to BB.
@@ -10210,22 +10210,35 @@ export default async function plugin(bb: BbPluginApi) {
   async function considerOwnerPreApproval(
     captain: string,
     text: string,
-    telegram: TelegramEnvelope | null,
-    sender?: { threadId: string | null; isCrew: boolean },
+    dispatch: {
+      initiator: unknown;
+      senderThreadId: unknown;
+      origin: unknown;
+      originPluginId: unknown;
+      submissionPluginId: unknown;
+      submissionData: unknown;
+      messageId: string;
+    },
   ): Promise<void> {
-    // BB's dispatch record: a sender thread means a BB thread delivered this, not the Telegram connector.
-    if (sender?.threadId) return;
-    const header = parseConnectorHeader(text);
+    const source = ownerDispatchSource(dispatch);
+    if (source === null) return;
+    const telegramPath = source === "telegram" || source === "omitted";
+    const telegram = telegramPath
+      ? (dispatch.submissionPluginId === "telegram" ? parseTelegramSubmission(dispatch.submissionData) : null) ?? parseInboundTelegram(text)
+      : null;
+    const header = telegramPath ? parseConnectorHeader(text) : null;
     const sourceEventId = telegram?.sourceEventId ?? header?.sourceEventId;
     if (sourceEventId && /^(ask|pack|proof):/i.test(sourceEventId)) return;
     if (telegram?.forwarded === true || header?.forwarded === true) return;
     const messageId = telegram?.messageId ?? header?.messageId;
     const senderId = telegram?.senderId ?? header?.senderId;
-    if (!messageId || !senderId) return;
-    const body = stripTelegramEnvelope(text);
+    if (telegramPath && (!messageId || !senderId)) return;
+    const body = source === "app" ? text.trim() : stripTelegramEnvelope(text);
     if (body === "" || isBotOrAckText(text)) return;
     if (ownerAsks.listOpen(captain).some((ask) => askLetterAnswer(ask, body) !== null)) return;
-    const ref = telegram ? telegramSourceRef(telegram) : header ? telegramSourceRef(header) : "";
+    const ref = source === "app"
+      ? (dispatch.messageId !== "" ? `bb:${captain}:${dispatch.messageId}` : "")
+      : telegram ? telegramSourceRef(telegram) : header ? telegramSourceRef(header) : "";
     if (ref !== "" && ownerGate.listPreApprovals().some((row) => row.ownerMessageRef === ref)) return;
     const keyFile = String((await settings.get()).decisionsKeyFile ?? "").trim();
     let apiKey = "";
@@ -16891,7 +16904,27 @@ export default async function plugin(bb: BbPluginApi) {
         }
         if (String(context.initiator) === "user") {
           await recordAskAnswers(threadId, text, context.queuedMessages ?? []).catch((error) => bb.log.warn(`owner ask answer: ${String(error)}`));
-          await considerOwnerPreApproval(threadId, text, telegram, { threadId: sender, isCrew: senderIsCrew }).catch((error) => bb.log.warn(`owner pre-approval: ${String(error)}`));
+        }
+        const queued = context.queuedMessages ?? [];
+        const rows: unknown[] = queued.length > 0 ? queued : [undefined];
+        for (const row of rows) {
+          const rec = asRecord(row);
+          const initiator = row === undefined ? context.initiator : rec["initiator"];
+          if (String(initiator) !== "user") continue;
+          const rowText = row === undefined ? text : String(rec["text"] ?? asRecord(rec["input"])["text"] ?? text);
+          const queuedMessage = asRecord(asRecord(context)["queuedMessage"]);
+          const messageId = typeof rec["id"] === "string" && rec["id"] !== ""
+            ? rec["id"]
+            : typeof queuedMessage["id"] === "string" ? queuedMessage["id"] : "";
+          await considerOwnerPreApproval(threadId, rowText, {
+            initiator,
+            senderThreadId: row === undefined ? context.senderThreadId : rec["senderThreadId"],
+            origin: row === undefined ? asRecord(context)["origin"] : rec["origin"],
+            originPluginId: row === undefined ? asRecord(context)["originPluginId"] : rec["originPluginId"],
+            submissionPluginId: asRecord(context.experimental_submission).pluginId,
+            submissionData: context.experimental_submission?.data,
+            messageId,
+          }).catch((error) => bb.log.warn(`owner pre-approval: ${String(error)}`));
         }
         let turnRefs: string[] = [];
         const inbound = inboundHookDecision({

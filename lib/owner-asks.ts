@@ -230,7 +230,13 @@ export function createOwnerAsks(db: Database): OwnerAsks {
     resolution TEXT, created_at INTEGER NOT NULL, resolved_at INTEGER);
     CREATE INDEX IF NOT EXISTS owner_ask_open ON owner_ask(captain, state, created_at);`);
 
-  db.exec(`CREATE TABLE IF NOT EXISTS owner_ask_answer (id TEXT PRIMARY KEY, source TEXT NOT NULL);
+  db.exec(`CREATE TABLE IF NOT EXISTS owner_ask_answer (id TEXT PRIMARY KEY, source TEXT NOT NULL);`);
+  try { db.exec("ALTER TABLE owner_ask_answer ADD COLUMN resolution TEXT"); } catch { /* already present on this database */ }
+  try { db.exec("ALTER TABLE owner_ask_answer ADD COLUMN at INTEGER"); } catch { /* already present on this database */ }
+  try {
+    db.exec("UPDATE owner_ask_answer SET resolution=(SELECT resolution FROM owner_ask WHERE owner_ask.id=owner_ask_answer.id) WHERE source='owner' AND (resolution IS NULL OR resolution='')");
+  } catch { /* owner_ask is always created first; ignore a half-migrated test database */ }
+  db.exec(`
     CREATE TABLE IF NOT EXISTS owner_ask_source (
     captain TEXT NOT NULL, source_ref TEXT NOT NULL, ask_id TEXT NOT NULL,
     PRIMARY KEY(captain, source_ref));
@@ -371,8 +377,9 @@ export function createOwnerAsks(db: Database): OwnerAsks {
         const current = get(id);
         if (!current || current.captain !== captain || db.prepare("SELECT id FROM owner_ask_close WHERE id=?").get(id) !== undefined) return undefined;
         db.prepare("UPDATE owner_ask SET state=?, resolution=?, resolved_at=? WHERE id=?").run(state, state === "open" ? null : resolution, state === "open" ? null : at, id);
-        db.prepare("DELETE FROM owner_ask_answer WHERE id=?").run(id);
-        if (source === "owner" && state === "answered") db.prepare("INSERT INTO owner_ask_answer VALUES (?,?)").run(id, source);
+        if (source === "owner" && state === "answered") {
+          db.prepare("INSERT INTO owner_ask_answer(id, source, resolution, at) VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET source=excluded.source, resolution=excluded.resolution, at=excluded.at").run(id, source, resolution, at);
+        }
         // A skip ends when the card is answered or reopened: a reopened card waits on the owner again.
         db.prepare("DELETE FROM owner_ask_defer WHERE id=?").run(id);
         const { deferredUntil: _skip, ...rest } = current;

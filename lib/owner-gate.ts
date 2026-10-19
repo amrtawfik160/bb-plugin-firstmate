@@ -71,6 +71,31 @@ type Database = {
 
 const allowsSchema = z.enum(["merge", "deploy", "both"]);
 
+export type OwnerDispatchSource = "telegram" | "app" | "omitted" | null;
+
+/** Classify a dispatch from BB origin fields. `omitted` means those fields were never set. */
+export function ownerDispatchSource(input: {
+  initiator: unknown;
+  senderThreadId: unknown;
+  origin: unknown;
+  originPluginId: unknown;
+  submissionPluginId?: unknown;
+}): OwnerDispatchSource {
+  if (String(input.initiator ?? "") !== "user") return null;
+  const sender = input.senderThreadId;
+  if (sender === "mixed") return null;
+  if (typeof sender === "string" && sender !== "") return null;
+  const origin = input.origin;
+  const originPluginId = input.originPluginId;
+  const submissionPluginId = input.submissionPluginId;
+  if (origin === "mixed" || originPluginId === "mixed") return null;
+  if (typeof originPluginId === "string" && originPluginId !== "telegram") return null;
+  if (originPluginId === "telegram" || submissionPluginId === "telegram") return "telegram";
+  if (origin === "app") return "app";
+  if (origin === undefined && originPluginId === undefined) return "omitted";
+  return null;
+}
+
 function samePr(left: string, right: string): boolean {
   return left.trim().toLowerCase() === right.trim().toLowerCase();
 }
@@ -294,11 +319,15 @@ export function createOwnerGate(db: Database) {
     cardsForPr(pr: string): GateCard[] {
       try {
         const rows = db.prepare(
-          `SELECT p.ask, p.head, c.prs, a.kind, a.captain, a.irreversible, a.state, a.resolution, a.created_at,
-            EXISTS(SELECT 1 FROM owner_ask_answer WHERE id=p.ask AND source='owner') AS owner
+          `SELECT p.ask, p.head, c.prs, a.kind, a.captain, a.irreversible,
+            CASE WHEN ans.id IS NOT NULL THEN 'answered' ELSE a.state END AS state,
+            COALESCE(ans.resolution, a.resolution) AS resolution,
+            a.created_at,
+            CASE WHEN ans.id IS NOT NULL THEN 1 ELSE 0 END AS owner
            FROM production_approval_pr p
            JOIN production_approval_card c ON c.ask=p.ask
            JOIN owner_ask a ON a.id=p.ask
+           LEFT JOIN owner_ask_answer ans ON ans.id=p.ask AND ans.source='owner'
            WHERE lower(p.pr)=?
            ORDER BY p.rowid DESC`,
         ).all(pr.toLowerCase()) as CardRow[];
