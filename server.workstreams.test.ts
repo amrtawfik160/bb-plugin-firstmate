@@ -117,12 +117,14 @@ test('adopt RPC groups open tasks without provisioning; a retry of the same requ
   try {
     const one = open('Cyndra web chat restyle');
     const two = open('Composer tokens');
-    const first = await host.harness.behavior.callRpc('workstreams.adopt', { threadId: 'cap', projectId: 'cyndra', name: 'Cyndra web chat restyle', requestId: 'adopt-chat', taskIds: [one.id, two.id] }) as { workstream: { id: string; taskIds: string[]; repos: unknown[]; provisioned: boolean } };
+    const first = await host.harness.behavior.callRpc('workstreams.adopt', { threadId: 'cap', projectId: 'cyndra', name: 'Cyndra web chat restyle', requestId: 'adopt-chat', taskIds: [one.id, two.id] }) as { workstream: { id: string; taskIds: string[]; repos: Array<{ repository: string; existing?: boolean }>; provisioned: boolean } };
     assert.deepEqual(first.workstream.taskIds, [one.id, two.id]);
     assert.equal(first.workstream.provisioned, true);
-    assert.deepEqual(first.workstream.repos, []);
-    const retry = await host.harness.behavior.callRpc('workstreams.adopt', { threadId: 'cap', projectId: 'cyndra', name: 'Renamed', requestId: 'adopt-chat', taskIds: [one.id, two.id] }) as { workstream: { id: string } };
+    assert.equal(first.workstream.repos[0]?.repository, 'cyndra-ai/cyndra-saas');
+    assert.equal(first.workstream.repos[0]?.existing, true);
+    const retry = await host.harness.behavior.callRpc('workstreams.adopt', { threadId: 'cap', projectId: 'cyndra', name: 'Cyndra web chat restyle', requestId: 'adopt-chat', taskIds: [one.id, two.id] }) as { workstream: { id: string } };
     assert.equal(retry.workstream.id, first.workstream.id);
+    await assert.rejects(host.harness.behavior.callRpc('workstreams.adopt', { threadId: 'cap', projectId: 'cyndra', name: 'Renamed', requestId: 'adopt-chat', taskIds: [one.id, two.id] }), /changed its original/);
     const listed = await host.harness.behavior.callRpc('workstreams.list', { threadId: 'cap' }) as { workstreams: unknown[] };
     assert.equal(listed.workstreams.length, 1);
   } finally { await host.harness.lifecycle.dispose(); }
@@ -150,7 +152,7 @@ test('adopt refuses another project, a closed task, a held task, a trial miss an
   } finally { await host.harness.lifecycle.dispose(); }
 });
 
-test('CLI --task adopt, captain tool text, dispatch on an adopted stream does not stamp workstreamId, End refuses a running attached crew', async () => {
+test('CLI --task adopt, captain tool text, dispatch on an adopted stream keeps workstreamId, End refuses a running attached crew', async () => {
   const { host, open } = await adoptHost({ thr_run: 'active' });
   try {
     const tool = host.harness.inspection.registrations.agentTools.find((t) => t.name === 'firstmate_workstream')!;
@@ -159,9 +161,10 @@ test('CLI --task adopt, captain tool text, dispatch on an adopted stream does no
     const two = open('Composer tokens');
     const cli = await host.harness.behavior.runCli(['workstream', 'adopt', '--project', 'cyndra', '--name', 'Cyndra web chat restyle', '--request-id', 'cli-adopt', '--task', one.id, '--task', two.id], cap) as { exitCode: number; stdout: string; stderr?: string };
     assert.equal(cli.exitCode, 0, cli.stderr ?? cli.stdout);
-    const adopted = JSON.parse(cli.stdout) as { workstream: { id: string; taskIds: string[]; repos: unknown[] } };
+    const adopted = JSON.parse(cli.stdout) as { workstream: { id: string; taskIds: string[]; repos: Array<{ repository: string; existing?: boolean }> } };
     assert.deepEqual(adopted.workstream.taskIds, [one.id, two.id]);
-    assert.deepEqual(adopted.workstream.repos, []);
+    assert.equal(adopted.workstream.repos[0]?.repository, 'cyndra-ai/cyndra-saas');
+    assert.equal(adopted.workstream.repos[0]?.existing, true);
     const spawned: Array<Record<string, unknown>> = [];
     host.harness.sdk.stub('threads.spawn', async (args: Record<string, unknown>) => { spawned.push(args); return { id: `worker${spawned.length}` }; });
     await host.harness.behavior.setSettings({ signInCheck: false, fmHome: '', maxActiveCrews: 0 });
@@ -171,9 +174,10 @@ test('CLI --task adopt, captain tool text, dispatch on an adopted stream does no
     assert.match(text(sent), /Dispatched/);
     assert.equal(spawned.length, 1);
     const metadata = spawned[0]!.pluginMetadata as Record<string, unknown>;
-    assert.equal(metadata.workstreamId, undefined);
+    assert.equal(metadata.workstreamId, adopted.workstream.id);
+    assert.deepEqual(spawned[0]!.environment, { type: 'reuse', environmentId: 'env_main' });
     const crews = await host.bb.storage.kv.get('crews') as Array<{ id: string; workstreamId?: string }>;
-    assert.equal(crews.find((c) => c.id === 'follow-1')?.workstreamId, undefined);
+    assert.equal(crews.find((c) => c.id === 'follow-1')?.workstreamId, adopted.workstream.id);
     const follow = createOwnerTasks(host.bb.storage.database()).list('cap').find((task) => task.crewIds.includes('follow-1'));
     const listed = await host.harness.behavior.callRpc('workstreams.list', { threadId: 'cap' }) as { workstreams: Array<{ taskIds: string[] }> };
     assert.ok(follow && listed.workstreams[0]!.taskIds.includes(follow.id), `attached after dispatch: ${listed.workstreams[0]!.taskIds.join(',')}`);

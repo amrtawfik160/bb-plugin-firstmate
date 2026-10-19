@@ -186,9 +186,54 @@ test('adopt groups open tasks without provisioning; a retry of the same requestI
     assert.equal(first.provisioned, true);
     assert.deepEqual(first.repos, []);
     assert.equal(provisions, 0);
-    const retry = await f.store.adopt({ threadId: 'cap', projectId: 'cyndra', name: 'Renamed', requestId: 'adopt-chat', taskIds: ['T1', 'T2'] });
+    const retry = await f.store.adopt({ threadId: 'cap', projectId: 'cyndra', name: 'Cyndra web chat restyle', requestId: 'adopt-chat', taskIds: ['T1', 'T2'] });
     assert.equal(retry.id, first.id);
     assert.equal(f.store.list('cap').length, 1);
+  } finally { f.db.close(); }
+});
+
+test('adopt stores provided existing repos without provisioning', async () => {
+  const f = fixture();
+  let provisions = 0;
+  const inner = f.deps.provision;
+  f.deps.provision = async (w) => { provisions++; return inner(w); };
+  try {
+    const repo = { repository: 'example/repo', projectId: 'cyndra', hostId: 'h1', path: '/repo/feat', sourcePath: '/repo/main', branch: 'feat/original', environmentId: 'env_original', existing: true };
+    let removed = 0, inspected = 0;
+    f.deps.remove = async () => { removed++; };
+    f.deps.unsaved = async () => { inspected++; return []; };
+    const first = await f.store.adopt({ threadId: 'cap', projectId: 'cyndra', name: 'Running', requestId: 'repos', taskIds: ['T1'], repos: [repo] });
+    assert.deepEqual(first.repos, [repo]);
+    assert.equal(provisions, 0);
+    const ended = await f.store.end(first.id, 'cap');
+    assert.equal(ended.state, 'ended');
+    assert.equal(removed, 0);
+    assert.equal(inspected, 0);
+  } finally { f.db.close(); }
+});
+
+test('adopt retry with a different name or task list is refused', async () => {
+  const f = fixture();
+  try {
+    const first = await f.store.adopt({ threadId: 'cap', projectId: 'cyndra', name: 'Chat', requestId: 'stable', taskIds: ['T1', 'T2'] });
+    await assert.rejects(f.store.adopt({ threadId: 'cap', projectId: 'cyndra', name: 'Renamed', requestId: 'stable', taskIds: ['T1', 'T2'] }), /changed its original/);
+    await assert.rejects(f.store.adopt({ threadId: 'cap', projectId: 'cyndra', name: 'Chat', requestId: 'stable', taskIds: ['T1', 'T2', 'T3'] }), /changed its original/);
+    const listed = f.store.list('cap');
+    assert.equal(listed.length, 1);
+    assert.equal(listed[0]!.name, 'Chat');
+    assert.deepEqual(listed[0]!.taskIds, ['T1', 'T2']);
+    assert.equal(listed[0]!.id, first.id);
+  } finally { f.db.close(); }
+});
+
+test('an editing follow-up waits while the workstream is busy', async () => {
+  const f = fixture();
+  f.deps.busy = async () => true;
+  try {
+    const w = await f.store.adopt({ threadId: 'cap', projectId: 'cyndra', name: 'Follow', requestId: 'follow', taskIds: ['T1'] });
+    const job = await f.store.submit(w.id, 'cap', { id: 'follow', editing: true, payload: '{}' });
+    assert.equal(job.state, 'queued');
+    assert.deepEqual(f.started, []);
   } finally { f.db.close(); }
 });
 

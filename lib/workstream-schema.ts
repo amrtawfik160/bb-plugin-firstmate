@@ -4,6 +4,7 @@ export const topicSchema = z.object({ chatId: z.string().min(1), topicId: z.numb
 export const workstreamRepoSchema = z.object({
   repository: z.string(), projectId: z.string(), hostId: z.string(), path: z.string(), sourcePath: z.string(),
   branch: z.string(), environmentId: z.string().nullable(),
+  existing: z.boolean().optional(),
 });
 export const jobSchema = z.object({
   id: z.string(), editing: z.boolean(), payload: z.string(),
@@ -12,7 +13,7 @@ export const jobSchema = z.object({
 export const workstreamSchema = z.object({
   id: z.string(), name: z.string(), projectId: z.string(), threadId: z.string(), requestId: z.string(),
   state: z.enum(['open', 'ended']), supportsDevLink: z.boolean(), provisioned: z.boolean(), topic: topicSchema.optional(),
-  repos: z.array(workstreamRepoSchema), taskIds: z.array(z.string()), jobs: z.array(jobSchema),
+  repos: z.array(workstreamRepoSchema), taskIds: z.array(z.string()), requestTaskIds: z.array(z.string()).optional(), jobs: z.array(jobSchema),
   devLink: z.object({ state: z.enum(['stopped', 'starting', 'running']), port: z.number().int(), url: z.string().optional(), lastRequestedAt: z.number().optional(), realLogin: z.boolean().default(false) }),
   closeTopicRequested: z.boolean(),
   ship: z.object({ state: z.enum(['idle', 'queued', 'running', 'blocked', 'complete']), requestId: z.string().optional(), error: z.string().optional() }),

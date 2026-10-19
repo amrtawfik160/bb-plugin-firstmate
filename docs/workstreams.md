@@ -23,8 +23,10 @@ type Workstream = {
     path: string;
     branch: string;
     environmentId: string | null; // null until first crew registers the worktree with BB
+    existing?: boolean; // adopted from an already-running checkout; End does not remove it
   }>;
   taskIds: string[];
+  requestTaskIds?: string[]; // original adopt task list; a retry must match name, project and this list
   jobs: Array<{
     id: string; // crew identity
     editing: boolean;
@@ -74,7 +76,7 @@ Invalid requests and failed creation, dev-link or End actions reject the RPC wit
 Trial project names are configured in Firstmate; `trialProjectIds` resolves those names to BB project IDs. Initial trial is Cyndra only.
 `create` refuses projects outside the trial. Existing records remain readable when the trial setting changes.
 Creation deduplicates globally by topic chatId plus topicId, and within one captain by requestId. Adopt deduplicates within one captain by requestId. Conflicting captain or project ownership is refused.
-Adopt groups existing open tasks of that project into a workstream and its Telegram topic without provisioning worktrees. Running crews keep their worktrees, branches, PRs and dev links. It refuses a task of another project, a closed task, or a task already in a workstream; nothing is created on a refusal. An adopted record is `provisioned` with an empty `repos` list: it is a topic grouping, not a shared worktree environment.
+Adopt groups existing open tasks of that project into a workstream and its Telegram topic without provisioning worktrees. Running crews keep their worktrees, branches, PRs and dev links. It refuses a task of another project, a closed task, or a task already in a workstream; nothing is created on a refusal. An adopted record is `provisioned` and records each attached task's existing repository, branch and PR. End does not remove those worktrees. A repeated requestId with a different name, project or task list is refused.
 
 Telegram adds `telegram_workstream: <id>` to its trusted message envelope, beside `telegram_task`.
 For a project with several repositories, dispatch also accepts optional `workstreamRepo: "owner/repo"` (`--workstream-repo`). It defaults to the first repository.

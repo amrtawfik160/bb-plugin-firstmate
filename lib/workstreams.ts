@@ -24,6 +24,7 @@ export type WorkstreamDeps = {
   ship: (w: Workstream) => Promise<void>;
   taskState: (id: string) => string | undefined;
   busy?: (w: Workstream) => Promise<boolean>;
+  editorBusy?: (w: Workstream) => Promise<boolean>;
   stall?: (w: Workstream) => Promise<boolean>;
   error?: (w: Workstream, error: unknown) => void;
 };
@@ -67,6 +68,7 @@ export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
       if (job.state !== 'queued' && job.state !== 'starting') continue;
       if (job.editing && w.jobs.some((j) => j.id !== job.id && j.editing && (j.state === 'running' || j.state === 'starting'))) continue;
       if (job.editing && w.ship.state === 'running') continue;
+      if (job.editing && await (deps.editorBusy ?? deps.busy)?.(w)) continue;
       job.state = 'starting'; save(w);
       try {
         job.threadId = await deps.start(w, job);
@@ -90,12 +92,16 @@ export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
       if (w.jobs.some((j) => j.state !== 'finished')) throw new Error('Workstream still has crews or queued tasks.');
       if (w.taskIds.some((id) => !['live', 'dropped'].includes(deps.taskState(id) ?? 'unknown'))) throw new Error('Every task must be Live or Dropped before End.');
       for (const repo of w.repos) {
+        if (repo.existing) continue;
         const findings = await deps.unsaved(repo);
         if (findings.length) throw new Error(`Unsaved work: ${findings.join(', ')}`);
       }
       w.cleanupApproved = true; save(w);
       await stop(w);
-      for (const repo of w.repos) await deps.remove(repo);
+      for (const repo of w.repos) {
+        if (repo.existing) continue;
+        await deps.remove(repo);
+      }
       // Private chat cannot close or reopen a topic (conversation-topics rule 7).
       w.state = 'ended'; w.closeTopicRequested = false; w.updatedAt = deps.now(); return save(w);
   }
@@ -116,11 +122,18 @@ export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
       if (!w.provisioned) { w.repos = await deps.provision(w); w.provisioned = true; save(w); }
       return w;
     }),
-    adopt: (input: { threadId: string; projectId: string; name: string; requestId: string; taskIds: string[] }) => serial(async () => {
+    adopt: (input: { threadId: string; projectId: string; name: string; requestId: string; taskIds: string[]; repos?: WorkstreamRepo[] }) => serial(async () => {
       const taskIds = [...new Set(input.taskIds)];
       if (taskIds.length === 0) throw new Error('Adopt needs taskIds.');
       let w = all().find((row) => row.threadId === input.threadId && row.requestId === input.requestId);
       if (w && (w.threadId !== input.threadId || w.projectId !== input.projectId)) throw new Error('Topic or request belongs to another captain or project.');
+      if (w) {
+        const original = [...(w.requestTaskIds ?? w.taskIds)].sort();
+        const requested = [...taskIds].sort();
+        if (w.name !== input.name || JSON.stringify(original) !== JSON.stringify(requested)) {
+          throw new Error('Adopt retry changed its original name, project or task list.');
+        }
+      }
       for (const taskId of taskIds) {
         const holder = all().find((other) => other.taskIds.includes(taskId) && other.id !== w?.id);
         if (holder) throw new Error(`Task ${taskId} already belongs to a workstream.`);
@@ -132,10 +145,12 @@ export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
           threadId: input.threadId, projectId: input.projectId, name: input.name, requestId: input.requestId,
           id: `ws-${randomUUID().slice(0, 12)}`, state: 'open',
           supportsDevLink: await deps.supportsDevLink?.(input.projectId) ?? true,
-          provisioned: true, repos: [], taskIds: [], jobs: [],
+          provisioned: true, repos: input.repos ?? [], requestTaskIds: taskIds, taskIds: [], jobs: [],
           devLink: { state: 'stopped', port, realLogin: false }, closeTopicRequested: false, ship: { state: 'idle' },
           createdAt: deps.now(), updatedAt: deps.now(),
         });
+      } else if (w.repos.length === 0 && input.repos?.length) {
+        w.repos = input.repos;
       }
       for (const taskId of taskIds) {
         if (!w.taskIds.includes(taskId)) w.taskIds.push(taskId);
