@@ -198,6 +198,43 @@ test("an owner answer stays after captain cancel or reopen", () => {
   assert.equal(asks.answeredByOwner("a1"), true);
 });
 
+test("replaying the same owner choice keeps the original answer time", () => {
+  const database = db();
+  const asks = createOwnerAsks(database);
+  const options = [{ label: "No", value: "no" }, { label: "Approve", value: "approve" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "approval", text: "Merge?", options, createdAt: NOW });
+  asks.resolve("a1", "thr_cap", "answered", "Approve", NOW, "owner");
+  asks.resolve("a1", "thr_cap", "answered", "Approve", NOW + 30_000, "owner");
+  const row = database.prepare("SELECT resolution, at FROM owner_ask_answer WHERE id=?").get("a1") as { resolution: string; at: number };
+  assert.equal(row.resolution, "Approve");
+  assert.equal(row.at, NOW);
+});
+
+test("a new owner choice on the same card updates the answer time", () => {
+  const database = db();
+  const asks = createOwnerAsks(database);
+  const options = [{ label: "No", value: "no" }, { label: "Approve", value: "approve" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "approval", text: "Merge?", options, createdAt: NOW });
+  asks.resolve("a1", "thr_cap", "answered", "Approve", NOW, "owner");
+  asks.resolve("a1", "thr_cap", "answered", "No", NOW + 30_000, "owner");
+  const row = database.prepare("SELECT resolution, at FROM owner_ask_answer WHERE id=?").get("a1") as { resolution: string; at: number };
+  assert.equal(row.resolution, "No");
+  assert.equal(row.at, NOW + 30_000);
+});
+
+test("the same owner choice after reopen updates the answer time", () => {
+  const database = db();
+  const asks = createOwnerAsks(database);
+  const options = [{ label: "No", value: "no" }, { label: "Approve", value: "approve" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "approval", text: "Merge?", options, createdAt: NOW });
+  asks.resolve("a1", "thr_cap", "answered", "No", NOW, "owner");
+  asks.resolve("a1", "thr_cap", "open", "Ask owner again", NOW + 1);
+  asks.resolve("a1", "thr_cap", "answered", "No", NOW + 30_000, "owner");
+  const row = database.prepare("SELECT resolution, at FROM owner_ask_answer WHERE id=?").get("a1") as { resolution: string; at: number };
+  assert.equal(row.resolution, "No");
+  assert.equal(row.at, NOW + 30_000);
+});
+
 test("a skipped card answered early is answered, and a reopened card is no longer skipped", () => {
   const asks = createOwnerAsks(db());
   const options = [{ label: "Yes", value: "yes" }];

@@ -377,6 +377,16 @@ export function createOwnerAsks(db: Database): OwnerAsks {
       return db.transaction(() => {
         const current = get(id);
         if (!current || current.captain !== captain || db.prepare("SELECT id FROM owner_ask_close WHERE id=?").get(id) !== undefined) return undefined;
+        if (source === "owner" && state === "answered") {
+          const existing = db.prepare("SELECT resolution FROM owner_ask_answer WHERE id=? AND source='owner'").get(id) as { resolution: string | null } | undefined;
+          const sameChoice = existing !== undefined && String(existing.resolution ?? "") === String(resolution ?? "");
+          // Same choice on a card that is not open is a retry; after reopen it is a new tap.
+          if (sameChoice && current.state !== "open") {
+            db.prepare("DELETE FROM owner_ask_defer WHERE id=?").run(id);
+            const { deferredUntil: _skip, ...rest } = current;
+            return rest;
+          }
+        }
         db.prepare("UPDATE owner_ask SET state=?, resolution=?, resolved_at=? WHERE id=?").run(state, state === "open" ? null : resolution, state === "open" ? null : at, id);
         if (source === "owner" && state === "answered") {
           db.prepare("INSERT INTO owner_ask_answer(id, source, resolution, at) VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET source=excluded.source, resolution=excluded.resolution, at=excluded.at").run(id, source, resolution, at);
