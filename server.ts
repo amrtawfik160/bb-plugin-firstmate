@@ -16795,12 +16795,13 @@ export default async function plugin(bb: BbPluginApi) {
           ownerConfirmed = tapped.answer !== null && tapped.answer.trim().toLowerCase() === resolution.trim().toLowerCase();
           fromConnector = tapped;
         } catch {
-          // Connector down or a stub with no answer field: an ordinary card may still record as owner.
-          // A production-approval card stays unconfirmed (fail closed).
-          ownerConfirmed = !prodCard;
+          // Connector down or a stub with no answer field: an ordinary open/answered card may still
+          // record as owner. A production-approval card stays unconfirmed (fail closed). A replaced
+          // or defaulted card stays closed.
+          ownerConfirmed = !prodCard && ask.state !== "cancelled" && ask.state !== "defaulted";
         }
       }
-      if (ask.state === "cancelled" || ask.state === "defaulted") return { ok: false };
+      if ((ask.state === "cancelled" || ask.state === "defaulted") && !ownerConfirmed) return { ok: false };
       if (ask.state !== "open" && !sameAnswer && !ownerConfirmed) return { ok: false };
       const action = gatedAskResolve(ask, { ownerConfirmed });
       if (action === "cancel") {
@@ -16815,7 +16816,7 @@ export default async function plugin(bb: BbPluginApi) {
       });
       const ok = ownerAsks.resolve(id, threadId, "answered", resolution, Date.now(), ownerConfirmed ? "owner" : undefined, ownerConfirmed ? tap : undefined) !== undefined;
       if (ok) await drainAskFollowUps();
-      if (ok) await refreshOwnerBoard();
+      if (ok && !ownerConfirmed) await refreshOwnerBoard();
       if (ok) await syncOwnerApprovalForAsk(id);
       return { ok };
     },

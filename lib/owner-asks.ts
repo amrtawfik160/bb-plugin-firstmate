@@ -548,7 +548,6 @@ export function createOwnerAsks(db: Database): OwnerAsks {
           return { ...rest, state: "open" as const, resolution: null, resolvedAt: null };
         }
         if (source === "owner" && state === "answered") {
-          if (current.state === "cancelled" || current.state === "defaulted") return undefined;
           const existing = db.prepare("SELECT resolution, at, tap_id FROM owner_ask_answer WHERE id=? AND source='owner'").get(id) as { resolution: string | null; at: number | null; tap_id: string | null } | undefined;
           const reopen = db.prepare("SELECT at FROM owner_ask_reopen WHERE id=?").get(id) as { at: number } | undefined;
           const tapId = typeof tap?.tapId === "string" && tap.tapId !== "" ? tap.tapId : undefined;
