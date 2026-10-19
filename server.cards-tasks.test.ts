@@ -979,7 +979,8 @@ async function checkerPendingIntent(){
  const fixture=await checkerCorrectionFixture();const {host,asks,card}=fixture;
  asks.resolve(card.id,"thr_cap","open","Correction",Date.now());asks.resolve(card.id,"thr_cap","answered","SQLite",Date.now(),"owner");
  const marker=`askref:${card.id}:2`;const key=`owner-answer-sent:${card.id}:2`;
- await host.bb.storage.kv.set(key,{state:"sending",marker,threadId:"thr_w1",at:Date.now()});
+ const input=[{type:"text" as const,text:"The owner corrected the answer."},{type:"text" as const,text:marker}];
+ await host.bb.storage.kv.set(key,{state:"sending",marker,markers:[marker],threadId:"thr_w1",at:Date.now(),senderThreadId:"thr_cap",input,inputs:[input]}); // real journal receipt, FIX-169-13
  return {...fixture,marker,key};
 }
 function checkerEvent(seq:number,body:string){return {id:`event-${seq}`,scope:{kind:"thread"},threadId:"thr_w1",seq,createdAt:Date.now(),type:"item/completed",data:{providerThreadId:"provider-w1",item:{id:`input-${seq}`,type:"userMessage",content:[{type:"text",text:body}]}}};}
@@ -988,7 +989,7 @@ function checkerRequested(seq:number,marker:string,requestId="req-1",sender="thr
 function checkerAccepted(seq:number,requestId="req-1"){return {id:`accept-${seq}`,scope:{kind:"thread" as const},threadId:"thr_w1",seq,createdAt:Date.now(),type:"turn/input/accepted",data:{clientRequestId:requestId,providerThreadId:"provider-w1",threadId:"thr_w1",scope:{kind:"thread"}}};}
 
 test("checker round10: a delivered marker beyond the first 100 events is found",async()=>{
- const f=await checkerPendingIntent();const history=Array.from({length:101},(_,i)=>{const seq=101-i;if(seq===101)return checkerAccepted(101,"req-r10");if(seq===1)return checkerRequested(1,f.marker,"req-r10");return checkerEvent(seq,`ordinary event ${seq}`);});const reads:Array<{beforeSeq?:string;limit?:string}>=[];
+ const f=await checkerPendingIntent();const journal=r13Journal(r13Input(await f.host.bb.storage.kv.get(f.key)));const history=Array.from({length:101},(_,i)=>{const seq=101-i;if(seq===101)return {...journal[0],seq:101};if(seq===1)return {...journal[1],seq:1};return checkerEvent(seq,`ordinary event ${seq}`);});const reads:Array<{beforeSeq?:string;limit?:string}>=[]; // real journal receipt, FIX-169-13
  try{
   f.host.harness.sdk.stub("threads.events.list",async(args:{threadId:string;beforeSeq?:string;limit?:string})=>{if(args.threadId!=="thr_w1")return [];reads.push(args);assert.ok(Number(args.limit??100)<=100);return history.filter(row=>!args.beforeSeq||row.seq<Number(args.beforeSeq)).slice(0,Number(args.limit??100));});f.host.harness.sdk.stub("threads.queuedMessages.list",async()=>[]);
   await f.host.harness.behavior.runSchedule("task-lifecycle");const record=await f.host.bb.storage.kv.get(f.key);console.log("CHECKER R10 pagination",JSON.stringify({reads,record,pending:f.asks.pendingFollowUps()}));
@@ -1001,7 +1002,7 @@ test("checker round10: marker-like text inside another owner answer cannot fake 
  try{
   f.host.harness.sdk.stub("threads.events.list",async()=>[]);f.host.harness.sdk.stub("threads.queuedMessages.list",async()=>[{...checkerQueue(`The owner answered card ${f.card.id}: Example text ${f.marker} is documentation, not a receipt.`),pluginSubmission:{pluginId:"firstmate",data:{correlation:`askref:${f.card.id}:1`,askId:f.card.id,answerSeq:1}}}]);
   f.host.harness.sdk.stub("threads.send",async(input:{threadId:string})=>{if(input.threadId==="thr_w1")accepted++;return {delivery:"queued"};});for(let i=0;i<3;i++)await f.host.harness.behavior.runSchedule("task-lifecycle");console.log("CHECKER R10 marker text",JSON.stringify({accepted,record:await f.host.bb.storage.kv.get(f.key),pending:f.asks.pendingFollowUps()}));
-  assert.equal(accepted,1,"an older answer's ordinary text must not stand in for the newer correction's delivery identity");
+  assert.equal(accepted,0,"an older answer's ordinary text must not stand in for the newer correction's delivery identity");assert.equal((await f.host.bb.storage.kv.get<{state:string}>(f.key))?.state,"unknown");
  }finally{await f.host.harness.lifecycle.dispose();f.restore();}
 });
 
@@ -1049,14 +1050,14 @@ for(const place of ["queue","event"])for(const shape of ["contains nonce","marke
 test("checker round11: actual random nonce survives restart and differs for the next answer",async()=>{
  const f=await checkerActualUnknown();let next;let nextMarker="";
  try{
-  next=await checkerReload(f.host,f.state.text);next.harness.sdk.stub("threads.queuedMessages.list",async()=>[]);next.harness.sdk.stub("threads.events.list",async()=>[checkerRequested(1,f.marker,"req-restart"),checkerAccepted(2,"req-restart")]);next.harness.sdk.stub("threads.send",async(input:{threadId:string;input:Array<{text:string}>})=>{if(input.threadId==="thr_w1")nextMarker=input.input.at(-1)?.text??"";return {delivery:"queued"};});
+  next=await checkerReload(f.host,f.state.text);next.harness.sdk.stub("threads.queuedMessages.list",async()=>[]);next.harness.sdk.stub("threads.events.list",async()=>r13Journal(r13Input(await next.bb.storage.kv.get(f.key))));next.harness.sdk.stub("threads.send",async(input:{threadId:string;input:Array<{text:string}>})=>{if(input.threadId==="thr_w1")nextMarker=input.input.at(-1)?.text??"";return {delivery:"queued"};}); // real journal receipt, FIX-169-13
   await next.harness.behavior.runSchedule("task-lifecycle");assert.equal(nextMarker,"");assert.equal((await next.bb.storage.kv.get<{marker:string}>(f.key))?.marker,f.marker);assert.equal(createOwnerAsks(next.bb.storage.database()).pendingFollowUps().length,0);
   await checkerAcceptCorrection(next,f.card.id,"Postgres");assert.match(nextMarker,/^askref:[0-9a-f-]{36}$/i);assert.notEqual(nextMarker,f.marker);assert.equal((await next.bb.storage.kv.get<{marker:string}>(`owner-answer-sent:${f.card.id}:3`))?.marker,nextMarker);
  }finally{if(next)await next.harness.lifecycle.dispose();await f.host.harness.lifecycle.dispose();f.restore();}
 });
 
 test("checker round11: several pages are read at 100 each until the real nonce is found",async()=>{
- const f=await checkerActualUnknown();const history=Array.from({length:350},(_,i)=>{const seq=350-i;const createdAt=f.record.at+seq;if(seq===350)return {...checkerAccepted(350,"req-pages"),createdAt};if(seq===1)return {...checkerRequested(1,f.marker,"req-pages"),createdAt};return {...checkerEvent(seq,`later event ${seq}`),createdAt};});const reads:Array<{beforeSeq?:string;limit?:string}>=[];
+ const f=await checkerActualUnknown();const journal=r13Journal(r13Input(await f.host.bb.storage.kv.get(f.key)));const history=Array.from({length:350},(_,i)=>{const seq=350-i;const createdAt=f.record.at+seq;if(seq===350)return {...journal[0],seq,createdAt};if(seq===1)return {...journal[1],seq,createdAt};return {...checkerEvent(seq,`later event ${seq}`),createdAt};});const reads:Array<{beforeSeq?:string;limit?:string}>=[]; // real journal receipt, FIX-169-13
  try{
   f.host.harness.sdk.stub("threads.queuedMessages.list",async()=>[]);f.host.harness.sdk.stub("threads.events.list",async(args:{threadId:string;beforeSeq?:string;limit?:string})=>{if(args.threadId!=="thr_w1")return [];reads.push(args);assert.ok(Number(args.limit)<=100);return history.filter(row=>args.beforeSeq===undefined||row.seq<Number(args.beforeSeq)).slice(0,Number(args.limit));});
   await f.host.harness.behavior.runSchedule("task-lifecycle");assert.equal(reads.length,4);assert.deepEqual(reads.map(row=>row.beforeSeq),[undefined,"251","151","51"]);assert.equal((await f.host.bb.storage.kv.get<{state:string}>(f.key))?.state,"delivered");assert.equal(f.asks.pendingFollowUps().length,0);
@@ -1094,7 +1095,7 @@ for(const restart of [false,true])test(`checker round11: slow send failure prese
 test("checker round11: queue-to-event transition is found in the required read order",async()=>{
  const f=await checkerActualUnknown();const order:string[]=[];const events:object[]=[];
  try{
-  f.host.harness.sdk.stub("threads.queuedMessages.list",async()=>{order.push("queue");events.push(checkerRequested(1,f.marker,"req-q2e"),checkerAccepted(2,"req-q2e"));return [];});f.host.harness.sdk.stub("threads.events.list",async()=>{order.push("events");return events;});await f.host.harness.behavior.runSchedule("task-lifecycle");assert.deepEqual(order,["queue","events"]);assert.equal((await f.host.bb.storage.kv.get<{state:string}>(f.key))?.state,"delivered");assert.equal(f.asks.pendingFollowUps().length,0);
+  f.host.harness.sdk.stub("threads.queuedMessages.list",async()=>{order.push("queue");events.push(...r13Journal(r13Input(await f.host.bb.storage.kv.get(f.key))));return [];});f.host.harness.sdk.stub("threads.events.list",async()=>{order.push("events");return events;});await f.host.harness.behavior.runSchedule("task-lifecycle");assert.deepEqual(order,["queue","events"]);assert.equal((await f.host.bb.storage.kv.get<{state:string}>(f.key))?.state,"delivered");assert.equal(f.asks.pendingFollowUps().length,0); // real journal receipt, FIX-169-13
  }finally{await f.host.harness.lifecycle.dispose();f.restore();}
 });
 
@@ -1114,8 +1115,8 @@ for(const failedCopy of [false,true])test(`checker round12: actual Firstmate sen
  const f=await checkerCorrectionFixture();let accepted=0;let marker="";let content:Array<{type:"text";text:string}>=[];const key=`owner-answer-sent:${f.card.id}:2`;
  try{
   f.host.harness.sdk.stub("threads.queuedMessages.list",async()=>{throw new Error("queue read unavailable with lost response");});f.host.harness.sdk.stub("threads.events.list",async()=>{throw new Error("event read unavailable with lost response");});f.host.harness.sdk.stub("threads.send",async(input:{threadId:string;input:Array<{type:"text";text:string}>})=>{if(input.threadId==="thr_w1"){accepted++;content=input.input.map(part=>({type:"text",text:part.text}));marker=content.at(-1)!.text;throw new Error("response lost after the real send reached the crew");}return {delivery:"queued"};});
-  await checkerAcceptCorrection(f.host,f.card.id,"SQLite");assert.equal(accepted,1);const event={...checkerEvent(1,marker),data:{providerThreadId:"provider-w1",item:{id:"actual-firstmate-input",type:"userMessage",content}}};
-  f.host.harness.sdk.stub("threads.queuedMessages.list",async()=>failedCopy ? [makeQueueEntry({threadId:"thr_w1",origin:"plugin",originPluginId:"firstmate",initiator:"agent",senderThreadId:"thr_cap",failureReason:"an earlier queued attempt failed",content})] : []);f.host.harness.sdk.stub("threads.events.list",async()=>[event]);f.host.harness.sdk.stub("threads.send",async(input:{threadId:string})=>{if(input.threadId==="thr_w1")accepted++;return {delivery:"queued"};});for(let i=0;i<3;i++)await f.host.harness.behavior.runSchedule("task-lifecycle");console.log("CHECKER R12 completed receipt",JSON.stringify({failedCopy,accepted,event,record:await f.host.bb.storage.kv.get(key),pending:f.asks.pendingFollowUps()}));assert.equal(accepted,1,"a retained failed queue entry must not make recovery ignore the actual completed Firstmate input and send it twice");assert.equal((await f.host.bb.storage.kv.get<{state:string}>(key))?.state,"delivered");
+  await checkerAcceptCorrection(f.host,f.card.id,"SQLite");assert.equal(accepted,1);const event=r13Journal(content, "thr_cap", "agent", true); // real journal receipt, FIX-169-13
+  f.host.harness.sdk.stub("threads.queuedMessages.list",async()=>failedCopy ? [makeQueueEntry({threadId:"thr_w1",origin:"plugin",originPluginId:"firstmate",initiator:"agent",senderThreadId:"thr_cap",failureReason:"an earlier queued attempt failed",content})] : []);f.host.harness.sdk.stub("threads.events.list",async()=>event);f.host.harness.sdk.stub("threads.send",async(input:{threadId:string})=>{if(input.threadId==="thr_w1")accepted++;return {delivery:"queued"};});for(let i=0;i<3;i++)await f.host.harness.behavior.runSchedule("task-lifecycle");console.log("CHECKER R12 completed receipt",JSON.stringify({failedCopy,accepted,event,record:await f.host.bb.storage.kv.get(key),pending:f.asks.pendingFollowUps()}));assert.equal(accepted,1,"a retained failed queue entry must not make recovery ignore the actual completed Firstmate input and send it twice");assert.equal((await f.host.bb.storage.kv.get<{state:string}>(key))?.state,"delivered");
  }finally{await f.host.harness.lifecycle.dispose();f.restore();}
 });
 
@@ -1125,6 +1126,48 @@ for(const restart of [false,true])test(`checker round12: confirmed-absence retry
   if(restart){next=await checkerReload(f.host,f.state.text);active=next;}active.harness.sdk.stub("threads.queuedMessages.list",async()=>[]);active.harness.sdk.stub("threads.events.list",async()=>[]);active.harness.sdk.stub("threads.send",async(input:{threadId:string})=>{if(input.threadId==="thr_w1")accepted++;return {delivery:"queued"};});
   await active.harness.behavior.runSchedule("task-lifecycle");const afterAbsent=await active.bb.storage.kv.get(f.key);now+=60_000;await active.harness.behavior.runSchedule("task-lifecycle");const delivered=await active.bb.storage.kv.get<{at:number;state:string;marker:string}>(f.key);console.log("CHECKER R12 retry intent",JSON.stringify({restart,originalAt,afterAbsent,delivered,accepted}));assert.equal(accepted,1);assert.equal(delivered?.at,originalAt,"the original intent time must survive retry as required, rather than being discarded with the absent marker");
  }finally{Date.now=realNow;if(next)await next.harness.lifecycle.dispose();await f.host.harness.lifecycle.dispose();f.restore();}
+});
+
+// Round 13 journal shapes follow the installed BB server's persisted dispatch events.
+function r13Input(record:unknown){return (record as {input:Array<{type:"text";text:string}>}).input;}
+function r13Journal(content:Array<{type:"text";text:string}>,sender="thr_cap",initiator="agent",completed=false){
+ const id="request-r13";
+ const request={...checkerEvent(1,""),type:"client/turn/requested",data:{input:content.map((p,i)=>({...p,text:i===0?`[bb message from thread:${sender}]\n\n${p.text}`:p.text})),senderThreadId:sender,initiator,requestId:id}};
+ const receipt=completed?{...checkerEvent(2,""),data:{providerThreadId:"provider-w1",item:{id:"r13-item",type:"userMessage",clientRequestId:id,content:request.data.input}}}:{...checkerEvent(2,""),type:"turn/input/accepted",scope:{kind:"turn",turnId:"turn-r13"},data:{clientRequestId:id,threadId:"thr_w1",providerThreadId:"provider-w1",scope:{kind:"turn",turnId:"turn-r13"}}};
+ return [receipt,request];
+}
+for(const mode of ["genuine accepted","genuine completed","failed queue plus genuine accepted","owner nonce queue","owner nonce completed","owner quoted nonce queue","owner quoted nonce completed","other agent nonce","captain nonce only","owner copied full completed","other agent copied full completed","genuine raw queue"]){
+ test(`checker round13: ${mode}`,async()=>{
+ const f=await checkerActualUnknown();let sends=0;
+ try{
+  const record=await f.host.bb.storage.kv.get(f.key);const content=r13Input(record);let queue:unknown[]=[];let events:unknown[]=[];
+  const nonce=[{type:"text" as const,text:f.marker}];
+  if(mode.startsWith("genuine")&&mode!=="genuine raw queue")events=r13Journal(content,"thr_cap","agent",mode==="genuine completed");
+  if(mode==="failed queue plus genuine accepted"){queue=[makeQueueEntry({threadId:"thr_w1",senderThreadId:"thr_cap",initiator:"agent",content,failureReason:"failed original queue"})];events=r13Journal(content);}
+  if(mode==="owner nonce queue")queue=[makeQueueEntry({threadId:"thr_w1",senderThreadId:null,initiator:"user",origin:"app",originPluginId:null,content:nonce})];
+  if(mode==="owner nonce completed")events=[checkerEvent(1,f.marker)];
+  if(mode==="owner quoted nonce queue")queue=[makeQueueEntry({threadId:"thr_w1",senderThreadId:null,initiator:"user",content:[{type:"text",text:`Please inspect ${f.marker} before trying again.`}]})];
+  if(mode==="owner quoted nonce completed")events=[checkerEvent(1,`Please inspect ${f.marker} before trying again.`)];
+  if(mode==="other agent nonce")events=r13Journal([{type:"text",text:"Please inspect this delivery reference."},...nonce],"thr_other","agent");
+  if(mode==="captain nonce only")events=r13Journal([{type:"text",text:"Please inspect this delivery reference."},...nonce]);
+  if(mode==="owner copied full completed")events=[{...checkerEvent(2,""),data:{providerThreadId:"provider-w1",item:{id:"owner-input",type:"userMessage",clientRequestId:"owner-request",content}}},{...checkerEvent(1,""),type:"client/turn/requested",data:{initiator:"user",senderThreadId:null,requestId:"owner-request",input:content}}];
+  if(mode==="other agent copied full completed")events=r13Journal(content,"thr_other","agent",true);
+  if(mode==="genuine raw queue")queue=[makeQueueEntry({threadId:"thr_w1",senderThreadId:"thr_cap",initiator:"agent",origin:null,originPluginId:null,content})];
+  f.host.harness.sdk.stub("threads.queuedMessages.list",async()=>queue);f.host.harness.sdk.stub("threads.events.list",async()=>events);f.host.harness.sdk.stub("threads.send",async(input:{threadId:string})=>{if(input.threadId==="thr_w1")sends++;return {delivery:"queued"};});
+  await f.host.harness.behavior.runSchedule("task-lifecycle");const actual=await f.host.bb.storage.kv.get<{state:string}>(f.key);const genuine=mode.startsWith("genuine")||mode==="failed queue plus genuine accepted";console.log("CHECKER R13",JSON.stringify({mode,actual,sends,pending:f.asks.pendingFollowUps().length}));assert.equal(sends,0);assert.equal(actual?.state,genuine?"delivered":"unknown",`only the genuine Firstmate answer can be confirmed: ${mode}`);
+  if(!genuine){for(let i=0;i<7;i++)await f.host.harness.behavior.runSchedule("task-lifecycle");assert.ok(f.asks.failedFollowUps().some(j=>j.answerSeq===2&&j.attempts===8));assert.equal(checkerCrewSends(f.host).length,1);}
+ }finally{await f.host.harness.lifecycle.dispose();f.restore();}
+ });
+}
+for(const restart of [false,true])test(`checker round13: old nonce proves delivery after absent retry error and restart=${restart}`,async()=>{
+ const f=await checkerActualUnknown();let next;let active=f.host;const original=await active.bb.storage.kv.get(f.key);const oldInput=r13Input(original);let sends=0;
+ try{
+  active.harness.sdk.stub("threads.queuedMessages.list",async()=>[]);active.harness.sdk.stub("threads.events.list",async()=>[]);active.harness.sdk.stub("threads.send",async(input:{threadId:string})=>{if(input.threadId==="thr_w1"){sends++;throw new Error("retry response lost");}return {delivery:"queued"};});
+  await active.harness.behavior.runSchedule("task-lifecycle");let after=await active.bb.storage.kv.get<{at:number;markers:string[];marker:string}>(f.key);assert.equal(sends,1);assert.equal(after?.at,f.record.at);assert.ok(after?.markers.includes(f.marker));assert.notEqual(after?.marker,f.marker);
+  if(restart){next=await checkerReload(active,f.state.text);active=next;}
+  active.harness.sdk.stub("threads.queuedMessages.list",async()=>[]);active.harness.sdk.stub("threads.events.list",async()=>r13Journal(oldInput));active.harness.sdk.stub("threads.send",async(input:{threadId:string})=>{if(input.threadId==="thr_w1")sends++;return {delivery:"queued"};});
+  await active.harness.behavior.runSchedule("task-lifecycle");await active.harness.behavior.runSchedule("task-lifecycle");const final=await active.bb.storage.kv.get<{at:number;markers:string[];state:string}>(f.key);assert.equal(final?.state,"delivered");assert.equal(final?.at,f.record.at);assert.ok(final?.markers.includes(f.marker));assert.equal(sends,1);assert.equal(createOwnerAsks(active.bb.storage.database()).pendingFollowUps().length,0);
+ }finally{if(next)await next.harness.lifecycle.dispose();await f.host.harness.lifecycle.dispose();f.restore();}
 });
 
 test("checker round3: failed prose-question notice is retried until a card can be made", async () => {

@@ -9706,40 +9706,38 @@ export default async function plugin(bb: BbPluginApi) {
         const item = asRecord(part);
         return item?.type === "text" && typeof item.text === "string" ? [item.text] : [];
       }) : [];
-      const hasNeedle = (parts: unknown, needles: string[]) => {
-        const texts = textParts(parts);
-        return needles.some((needle) => needle && texts.includes(needle));
-      };
       const sameInput = (parts: unknown, stored: SendInput[]) => {
         const texts = textParts(parts);
         return texts.length === stored.length && stored.every((part, index) => part.text === texts[index]);
       };
-      const rowParts = (row: Record<string, unknown>) => {
-        const data = asRecord(row.data);
-        const item = asRecord(data?.item);
-        return [row.content, row.input, data?.input, item?.type === "userMessage" ? item.content : undefined];
-      };
+      const wrapStored = (stored: SendInput[]) => stored.map((part, index) =>
+        index === 0
+          ? { type: "text" as const, text: `[bb message from thread:${senderId}]\n\n${part.text}` }
+          : part
+      );
       const rowType = (row: Record<string, unknown>) => {
         const data = asRecord(row.data);
         return typeof row.type === "string" ? row.type : typeof data?.type === "string" ? data.type : "";
       };
-      const nonceCarried = (row: Record<string, unknown>, needles: string[]) => rowParts(row).some((parts) => hasNeedle(parts, needles));
-      const matchesStoredSend = (row: Record<string, unknown>) =>
-        inputs.length > 0 && rowParts(row).some((parts) => inputs.some((stored) => sameInput(parts, stored)));
-      const pendingQueueProof = (row: Record<string, unknown>) =>
+      const nonceSeen = (row: Record<string, unknown>, needles: string[]) => {
+        const blob = JSON.stringify(row);
+        return needles.some((needle) => needle.length > 0 && blob.includes(needle));
+      };
+      const isProvenQueue = (row: Record<string, unknown>) =>
         !row.failureReason
         && row.senderThreadId === senderId
         && (row.initiator === "agent" || row.initiator === "system")
-        && matchesStoredSend(row);
-      const isOurRequested = (data: Record<string, unknown>, needles: string[]) =>
+        && inputs.some((stored) => sameInput(row.content, stored));
+      const isProvenRequest = (data: Record<string, unknown>) =>
         (data.initiator === "agent" || data.initiator === "system")
         && data.senderThreadId === senderId
         && typeof data.requestId === "string"
-        && hasNeedle(data.input, needles);
-      const completedSendMatch = (row: Record<string, unknown>) => {
-        if (rowType(row) !== "item/completed") return false;
-        const item = asRecord(asRecord(row.data)?.item);
-        return item?.type === "userMessage" && matchesStoredSend(row);
+        && inputs.some((stored) => sameInput(data.input, wrapStored(stored)));
+      const isProvenReceipt = (row: Record<string, unknown>, joined: ReadonlySet<string>) => {
+        if (isProvenQueue(row)) return true;
+        const data = asRecord(row.data) ?? {};
+        return rowType(row) === "client/turn/requested" && isProvenRequest(data)
+          && typeof data.requestId === "string" && joined.has(data.requestId);
       };
       const discover = async (threadId: string) => {
         const needles = markers.filter((value) => value);
@@ -9750,11 +9748,12 @@ export default async function plugin(bb: BbPluginApi) {
           return "unknown" as const;
         }
         let sawNonce = false;
+        const none = new Set<string>();
         for (const value of queued) {
           const row = asRecord(value);
           if (!row) continue;
-          if (nonceCarried(row, needles)) sawNonce = true;
-          if (pendingQueueProof(row)) return "found" as const;
+          if (nonceSeen(row, needles)) sawNonce = true;
+          if (isProvenReceipt(row, none)) return "found" as const;
         }
         try {
           let beforeSeq: string | undefined;
@@ -9767,12 +9766,10 @@ export default async function plugin(bb: BbPluginApi) {
               types: ["client/turn/requested", "turn/input/accepted", "item/completed"],
               ...(beforeSeq !== undefined ? { beforeSeq } : {}),
             }), undefined, STUCK_HOST_CALL_MS);
-            let proved = false;
             for (const value of page) {
               const row = asRecord(value);
               if (!row) continue;
-              if (nonceCarried(row, needles)) sawNonce = true;
-              if (completedSendMatch(row)) proved = true;
+              if (nonceSeen(row, needles)) sawNonce = true;
               const data = asRecord(row.data) ?? {};
               const type = rowType(row);
               if (type === "turn/input/accepted" && typeof data.clientRequestId === "string") acceptedIds.add(data.clientRequestId);
@@ -9780,12 +9777,12 @@ export default async function plugin(bb: BbPluginApi) {
                 const item = asRecord(data.item);
                 if (item?.type === "userMessage" && typeof item.clientRequestId === "string") completedIds.add(item.clientRequestId);
               }
-              if (type === "client/turn/requested" && isOurRequested(data, needles)) {
-                const id = data.requestId;
-                if (typeof id === "string") requestIds.add(id);
+              if (type === "client/turn/requested" && isProvenRequest(data) && typeof data.requestId === "string") {
+                requestIds.add(data.requestId);
               }
             }
-            if (proved || [...requestIds].some((id) => acceptedIds.has(id) || completedIds.has(id))) return "found" as const;
+            const joined = new Set([...acceptedIds, ...completedIds]);
+            if ([...requestIds].some((id) => joined.has(id))) return "found" as const;
             if (page.length === 0) return sawNonce ? "unknown" as const : "absent" as const;
             const oldest = page[page.length - 1]!;
             if (typeof oldest.createdAt === "number" && oldest.createdAt < intentAt) return sawNonce ? "unknown" as const : "absent" as const;
