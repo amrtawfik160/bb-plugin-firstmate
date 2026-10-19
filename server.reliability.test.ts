@@ -135,6 +135,10 @@ const ownerMessage = (host: Host) => host.harness.inspection.registrations.hooks
   input: { blocks: [], text: envelope("live-owner") },
 } as never);
 
+async function afterDispatch() {
+  for (let i = 0; i < 12; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
 for (const [label, result] of [
   ["threaded replies are off", { queued: 0, duplicate: false, mode: "off" }],
   ["telegram.reply queues nothing", { queued: 0, duplicate: false, mode: "on" }],
@@ -144,6 +148,7 @@ for (const [label, result] of [
     try {
       host.harness.sdk.stub("plugins.callRpc", async () => result);
       await ownerMessage(host);
+      await afterDispatch();
       assert.equal(host.harness.sdk.callsTo("plugins.callRpc").length, 1);
       assert.equal(ledgerRow(host, "1669")?.state, "received");
       assert.equal(createInboundLedger(host.bb.storage.database()).outboxGet({ source: "telegram", chatId: "200", messageId: "1669" }, "ack"), undefined);
@@ -163,7 +168,9 @@ for (const [label, threading, stub] of [
       await host.harness.behavior.setSettings({ fmReliability: JSON.stringify({ inboundLedger: "on", telegramThreading: threading }) });
       host.harness.sdk.stub("plugins.callRpc", stub ?? (async () => ({ queued: 1, duplicate: false, mode: "on" })));
       await ownerMessage(host);
+      await afterDispatch();
       await ownerMessage(host);
+      await afterDispatch();
       assert.equal(ledgerRow(host, "1669")?.state, "received");
       assert.equal(createInboundLedger(host.bb.storage.database()).outboxGet({ source: "telegram", chatId: "200", messageId: "1669" }, "ack"), undefined);
       assert.ok(host.harness.sdk.callsTo("plugins.callRpc").filter(([args]) => (args as { method: string }).method === "reply").length <= 1, "a missing sender is not asked again");
@@ -178,6 +185,7 @@ test("a delivered ack marks the item acknowledged", async () => {
   try {
     host.harness.sdk.stub("plugins.callRpc", async () => ({ queued: 1, duplicate: false, mode: "on" }));
     await ownerMessage(host);
+    await afterDispatch();
     assert.equal(ledgerRow(host, "1669")?.state, "acked");
   } finally {
     await host.harness.lifecycle.dispose();
@@ -1234,6 +1242,7 @@ test("only a letter reply to an ask card answers that ask and refreshes the boar
     const answered = asks(host).get("a000001")!;
     assert.equal(answered.state, "answered");
     assert.equal(answered.resolution, "Yes");
+    await afterDispatch();
     assert.equal(rpcCalls(host).filter((c) => c.method === "refreshBoard").length, 1);
     const header = parseInboundTelegram(askReply("a000001", "Yes"))!;
     const row = createInboundLedger(host.bb.storage.database()).get({ source: "telegram", chatId: header.chatId, messageId: header.messageId });
@@ -1269,6 +1278,44 @@ test("a pack answer resolves each card it lists and raises no unanswered reminde
     const header = parseInboundTelegram(message)!;
     const row = createInboundLedger(host.bb.storage.database()).get({ source: "telegram", chatId: header.chatId, messageId: header.messageId });
     assert.equal(row?.state, "answered", "a pack answer needs action, not a reply");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a button tap decides inside a second even when Telegram never answers, and a repeat of the same tap applies once", async () => {
+  const host = await captainHost();
+  try {
+    host.harness.sdk.stub("plugins.callRpc", () => new Promise(() => {}));
+    host.harness.sdk.stub("threads.send", () => new Promise(() => {}));
+    const opts = [{ label: "Yes", value: "yes" }, { label: "No", value: "no" }];
+    asks(host).create({ id: "a000001", captain: "thr_cap", kind: "question", text: "Ship it?", options: opts, recommended: 0, createdAt: 1 });
+    const hook = host.harness.inspection.registrations.hooks["message.dispatch"]!;
+    const tap = askReply("a000001", "a.");
+    const dispatch = () => hook({
+      thread: makeThreadResponse({ id: "thr_cap", status: "active" }),
+      attempt: "join-turn", initiator: "user", senderThreadId: null, queuedMessages: [],
+      input: { blocks: [], text: tap },
+    } as never);
+    const started = Date.now();
+    const first = await Promise.race([
+      dispatch(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("dispatch hook did not decide within 1000ms")), 1000)),
+    ]);
+    assert.equal((first as { action: string }).action, "proceed");
+    assert.ok(Date.now() - started < 1000, "the hook must return well inside BB's 10 s limit");
+    const stored = asks(host).get("a000001")!;
+    assert.equal(stored.state, "answered");
+    assert.equal(stored.resolution, "Yes");
+    const resolvedAt = stored.resolvedAt;
+    const second = await Promise.race([
+      dispatch(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("repeat dispatch hook did not decide within 1000ms")), 1000)),
+    ]);
+    assert.equal((second as { action: string }).action, "proceed");
+    assert.equal(asks(host).get("a000001")?.resolution, "Yes");
+    assert.equal(asks(host).get("a000001")?.resolvedAt, resolvedAt);
+    assert.equal(asks(host).answeredByOwner("a000001"), true);
   } finally {
     await host.harness.lifecycle.dispose();
   }

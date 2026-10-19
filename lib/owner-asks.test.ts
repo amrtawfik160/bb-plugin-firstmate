@@ -66,6 +66,26 @@ test("the store resolves only the owner's open asks and defaults only reversible
   assert.deepEqual(asks.listOpen("thr_cap").map((a) => a.id), ["a2", "a3"]);
 });
 
+test("an owner tap stamps answeredByOwner; the captain can still correct it", () => {
+  const asks = createOwnerAsks(db());
+  const opts = [{ label: "Yes", value: "yes" }, { label: "No", value: "no" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "question", text: "q", options: opts, createdAt: NOW });
+  assert.equal(asks.resolve("a1", "thr_cap", "answered", "Yes", NOW, "owner")?.resolution, "Yes");
+  assert.equal(asks.answeredByOwner("a1"), true);
+  assert.equal(asks.resolve("a1", "thr_cap", "answered", "Captain correction", NOW + 2)?.resolution, "Captain correction");
+  assert.equal(asks.answeredByOwner("a1"), false);
+});
+
+test("an owner confirmation stamps a card the captain already answered", () => {
+  const asks = createOwnerAsks(db());
+  const opts = [{ label: "Approve", value: "approve" }, { label: "No", value: "no" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "approval", text: "Merge?", options: opts, createdAt: NOW });
+  assert.equal(asks.resolve("a1", "thr_cap", "answered", "Approve", NOW)?.resolution, "Approve");
+  assert.equal(asks.answeredByOwner("a1"), false);
+  assert.equal(asks.resolve("a1", "thr_cap", "answered", "Approve", NOW + 1, "owner")?.resolution, "Approve");
+  assert.equal(asks.answeredByOwner("a1"), true);
+});
+
 test("old ask databases migrate without losing open asks and unparsed decisions link from the board", () => {
   const database = db();
   database.exec(`CREATE TABLE owner_ask (id TEXT PRIMARY KEY, captain TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL, options TEXT NOT NULL, recommended INTEGER, default_at INTEGER, irreversible INTEGER NOT NULL, state TEXT NOT NULL, resolution TEXT, created_at INTEGER NOT NULL, resolved_at INTEGER);

@@ -16484,16 +16484,16 @@ export default async function plugin(bb: BbPluginApi) {
   const heldPingCaptains = new Set<string>();
   // An owner reply to an ask card, or a tap on one of its buttons, answers that ask.
   // Only the connector header at the start of the message counts, so quoted text cannot answer one.
-  async function recordAskAnswers(captainThreadId: string, text: string, queued: readonly unknown[]): Promise<void> {
+  function recordAskAnswers(captainThreadId: string, text: string, queued: readonly unknown[]): Array<{ id: string; answer: string }> {
     const texts = queued.length > 0
       ? queued.map((row) => String(asRecord(row)["text"] ?? asRecord(asRecord(row)["input"])["text"] ?? text))
       : [text];
-    let answered = 0;
+    const answered: Array<{ id: string; answer: string }> = [];
     for (const message of texts) {
       const header = parseConnectorHeader(message);
       if (header && !header.forwarded && header.sourceEventId?.startsWith("pack:")) {
         for (const { id, answer } of packAnswers(header.body)) {
-          if (ownerAsks.get(id)?.state === "open" && ownerAsks.resolve(id, captainThreadId, "answered", answer, Date.now(), "owner")) { answered++; await ownerAnsweredAsk(id, answer); }
+          if (ownerAsks.get(id)?.state === "open" && ownerAsks.resolve(id, captainThreadId, "answered", answer, Date.now(), "owner")) answered.push({ id, answer });
         }
         continue;
       }
@@ -16501,15 +16501,16 @@ export default async function plugin(bb: BbPluginApi) {
       if (!header || header.forwarded || id === null) continue;
       const ask = ownerAsks.get(id);
       const answer = ask ? askLetterAnswer(ask, header.body) : null;
-      if (ask?.state === "open" && answer !== null && ownerAsks.resolve(id, captainThreadId, "answered", answer, Date.now(), "owner")) { answered++; await ownerAnsweredAsk(id, answer); }
+      if (ask?.state === "open" && answer !== null && ownerAsks.resolve(id, captainThreadId, "answered", answer, Date.now(), "owner")) answered.push({ id, answer });
     }
-    if (answered > 0) await refreshOwnerBoard();
+    return answered;
   }
 
   // Threaded replies off, or no sender: an ack does not apply, and asking again on every dispatch would only repeat the RPC.
   const ackNotApplicable = new Set<string>();
   try {
     bb.experimental_hooks.on("message.dispatch", async (context) => {
+      const followUp: Array<() => Promise<void>> = [];
       try {
         const threadId = context.thread.id;
         if (!knownCaptains.has(threadId)) {
@@ -16543,7 +16544,13 @@ export default async function plugin(bb: BbPluginApi) {
           await bb.storage.kv.set(`workstream-ref:tg:${telegram.chatId}:${telegram.messageId}`,w.id);
         }
         if (String(context.initiator) === "user") {
-          await recordAskAnswers(threadId, text, context.queuedMessages ?? []).catch((error) => bb.log.warn(`owner ask answer: ${String(error)}`));
+          const answered = recordAskAnswers(threadId, text, context.queuedMessages ?? []);
+          if (answered.length > 0) {
+            followUp.push(async () => {
+              for (const item of answered) await ownerAnsweredAsk(item.id, item.answer);
+              await refreshOwnerBoard();
+            });
+          }
         }
         let turnRefs: string[] = [];
         const inbound = inboundHookDecision({
@@ -16619,33 +16626,37 @@ export default async function plugin(bb: BbPluginApi) {
               if (!primary || !ackEligible(primary, now) || ackNotApplicable.has(inboundKey(primary))) continue;
               const body = telegramReplyFallbackBody({ chatId: primary.chatId, messageId: primary.messageId, kind: "ack", text: ACK_TEXT, threadId: primary.topicId });
               if (!inboundLedger.claimOutbox(primary, "ack", body, now).sent) continue;
-              const sent = await sendTelegramReply({
-                payload: { chatId: primary.chatId, messageId: primary.messageId, kind: "ack", text: ACK_TEXT, threadId: primary.topicId, correlation: correlationOf(primary) },
-                callRpc: flags.telegramThreading === "on" ? (args) => bb.sdk.plugins.callRpc(args) : null,
-              }).catch((error) => {
-                bb.log.warn(`inbound telegram ack failed: ${String(error)}`);
-                return null;
+              followUp.push(async () => {
+                const sent = await sendTelegramReply({
+                  payload: { chatId: primary.chatId, messageId: primary.messageId, kind: "ack", text: ACK_TEXT, threadId: primary.topicId, correlation: correlationOf(primary) },
+                  callRpc: flags.telegramThreading === "on" ? (args) => bb.sdk.plugins.callRpc(args) : null,
+                }).catch((error) => {
+                  bb.log.warn(`inbound telegram ack failed: ${String(error)}`);
+                  return null;
+                });
+                await noteTelegramThreading(sent?.mode).catch((error) => bb.log.warn(`telegram threading state: ${String(error)}`));
+                if (sent?.outcome !== "delivered") {
+                  inboundLedger.releaseOutbox(primary, "ack");
+                  if (sent?.outcome === "not-applicable" || sent?.outcome === "undelivered") ackNotApplicable.add(inboundKey(primary));
+                  return;
+                }
+                inboundLedger.markAcked(primary, now);
+                for (const extra of keys.slice(1)) inboundLedger.markAcked(extra, now);
               });
-              await noteTelegramThreading(sent?.mode).catch((error) => bb.log.warn(`telegram threading state: ${String(error)}`));
-              if (sent?.outcome !== "delivered") {
-                inboundLedger.releaseOutbox(primary, "ack");
-                if (sent?.outcome === "not-applicable" || sent?.outcome === "undelivered") ackNotApplicable.add(inboundKey(primary));
-                continue;
-              }
-              inboundLedger.markAcked(primary, now);
-              for (const extra of keys.slice(1)) inboundLedger.markAcked(extra, now);
             }
             for (const row of open.filter((item) => item.source === "bb")) {
               if (!ackEligible(row, now)) continue;
               const body = `received #${row.messageId}: ${row.preview}`;
               const claimed = inboundLedger.claimOutbox(row, "ack", body, now);
               if (claimed.sent) {
-                inboundLedger.markAcked(row, now);
-                await bb.sdk.threads.send({
-                  threadId,
-                  mode: "steer",
-                  input: [{ type: "text", text: body, mentions: [], visibility: "agent-only" }],
-                }).catch((error) => bb.log.warn(`inbound ack failed: ${String(error)}`));
+                followUp.push(async () => {
+                  inboundLedger.markAcked(row, now);
+                  await bb.sdk.threads.send({
+                    threadId,
+                    mode: "steer",
+                    input: [{ type: "text", text: body, mentions: [], visibility: "agent-only" }],
+                  }).catch((error) => bb.log.warn(`inbound ack failed: ${String(error)}`));
+                });
               }
             }
           }
@@ -16679,6 +16690,12 @@ export default async function plugin(bb: BbPluginApi) {
         return { action: "wait", reason: "Crew update held until the captain's current turn ends (firstmate batches crew pings)." };
       } catch {
         return { action: "proceed" };
+      } finally {
+        if (followUp.length > 0) {
+          void Promise.resolve().then(async () => {
+            for (const step of followUp) await step();
+          }).catch((error) => bb.log.warn(`dispatch follow-up: ${String(error)}`));
+        }
       }
     });
   } catch (error) {
