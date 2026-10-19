@@ -9666,29 +9666,67 @@ export default async function plugin(bb: BbPluginApi) {
     }
     if (ask?.sourceRef?.startsWith("crew-wait:") && resolution) {
       const sentKey = `owner-answer-sent:${ask.id}:${answerSeq}`;
-      const marker = `askref:${ask.id}:${answerSeq}`;
       type AnswerSend = { state?: "sending" | "delivered" | "unknown"; marker?: string; threadId?: string; at?: number };
       const sendState = (row: AnswerSend | undefined) =>
         row === undefined ? undefined : row.state === "delivered" || row.state === "unknown" || row.state === "sending" ? row.state : "sending";
       const record = await bb.storage.kv.get<AnswerSend>(sentKey);
       const prior = sendState(record);
       if (prior === "delivered") return { status: "completed" };
+      const marker = typeof record?.marker === "string" && record.marker ? record.marker : `askref:${randomUUID()}`;
       const writeSend = (state: "sending" | "delivered" | "unknown", threadId?: string) =>
-        bb.storage.kv.set(sentKey, { state, marker: record?.marker ?? marker, threadId: threadId ?? record?.threadId, at: Date.now() });
+        bb.storage.kv.set(sentKey, { state, marker, threadId: threadId ?? record?.threadId, at: record?.at ?? Date.now() });
+      const ownerAnswerHasMarker = (value: unknown, needle: string): boolean => {
+        if (!needle || value == null || typeof value !== "object") return false;
+        const row = value as Record<string, unknown>;
+        if (row.failureReason) return false;
+        const texts = (parts: unknown) => Array.isArray(parts) && parts.some((part) => {
+          if (part == null || typeof part !== "object") return false;
+          const item = part as { type?: unknown; text?: unknown };
+          return item.type === "text" && item.text === needle;
+        });
+        const firstmateCorrelation = (obj: Record<string, unknown> | undefined) => {
+          const submission = obj?.pluginSubmission;
+          if (submission == null || typeof submission !== "object") return false;
+          const sub = submission as { pluginId?: unknown; data?: { correlation?: unknown } };
+          return sub.pluginId === "firstmate" && sub.data?.correlation === needle;
+        };
+        if (firstmateCorrelation(row) || texts(row.content) || texts(row.input)) return true;
+        const eventData = row.data;
+        if (eventData != null && typeof eventData === "object") {
+          const data = eventData as Record<string, unknown> & { item?: { type?: unknown; content?: unknown } };
+          if (firstmateCorrelation(data)) return true;
+          if (data.item?.type === "userMessage" && texts(data.item.content)) return true;
+          if (texts(data.input)) return true;
+        }
+        return false;
+      };
       const discover = async (threadId: string) => {
+        const needle = marker;
+        const intentAt = record?.at ?? 0;
+        let queued;
         try {
-          const events = await raceAbort(bb.sdk.threads.events.list({
-            threadId, order: "desc", limit: "100", types: ["item/completed"],
-          }), undefined, STUCK_HOST_CALL_MS);
-          const queued = await raceAbort(bb.sdk.threads.queuedMessages.list({ threadId }), undefined, STUCK_HOST_CALL_MS);
-          const needle = record?.marker ?? marker;
-          const hit = (value: unknown) => JSON.stringify(value).includes(needle);
-          if (events.some(hit) || queued.some((row) => {
-            const item = row as { failureReason?: unknown; content?: unknown };
-            return !item.failureReason && hit(item.content ?? row);
-          })) return "found" as const;
-          if (events.length >= 100) return "unknown" as const;
-          return "absent" as const;
+          queued = await raceAbort(bb.sdk.threads.queuedMessages.list({ threadId }), undefined, STUCK_HOST_CALL_MS);
+        } catch {
+          return "unknown" as const;
+        }
+        const queuedHit = queued.some((row) => ownerAnswerHasMarker(row, needle));
+        try {
+          let beforeSeq: string | undefined;
+          for (;;) {
+            const page = await raceAbort(bb.sdk.threads.events.list({
+              threadId, order: "desc", limit: "100", types: ["item/completed"],
+              ...(beforeSeq !== undefined ? { beforeSeq } : {}),
+            }), undefined, STUCK_HOST_CALL_MS);
+            if (queuedHit || page.some((row) => ownerAnswerHasMarker(row, needle))) return "found" as const;
+            if (page.length === 0) return "absent" as const;
+            const oldest = page[page.length - 1]!;
+            if (typeof oldest.createdAt === "number" && oldest.createdAt < intentAt) return "absent" as const;
+            if (page.length < 100) return "absent" as const;
+            if (oldest.seq == null) return "unknown" as const;
+            const next = String(oldest.seq);
+            if (beforeSeq === next) return "unknown" as const;
+            beforeSeq = next;
+          }
         } catch {
           return "unknown" as const;
         }

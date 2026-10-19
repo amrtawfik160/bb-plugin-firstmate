@@ -475,6 +475,18 @@ test("an owner answer on a workstream crew's card reaches that crew", async () =
   } finally { restore(); await host.harness.lifecycle.dispose(); }
 });
 
+for(const route of ["secondmate","workstream"])test(`checker round5 P3: ${route} send fails once then delivers once`,async()=>{
+ const {host,asks,restore}=await captainHost();let attempts=0;try{
+  await host.bb.storage.kv.set("crews",[crewRow("target","thr_target",route==="secondmate"?{posture:"secondmate:domain"}:{workstreamId:"ws-1"})]);
+  const card=asks.create({captain:"thr_cap",kind:"question",text:"Choose?",options:[{label:"Yes",value:"yes"}],sourceRef:"crew-wait:target:question",createdAt:1});
+  host.harness.sdk.stub("threads.events.list",async()=>[]);host.harness.sdk.stub("threads.queuedMessages.list",async()=>[]);
+  host.harness.sdk.stub("threads.send",async(input:{threadId:string})=>{if(input.threadId==="thr_target"&&++attempts===1)throw new Error("crew queue down");return {delivery:"queued"};});
+  await host.harness.behavior.callRpc("resolveAsk",{threadId:"thr_cap",id:card.id,resolution:"Yes"});assert.ok(asks.pendingFollowUps().some(job=>job.askId===card.id&&job.effect==="owner-answered"));
+  await host.harness.behavior.runSchedule("task-lifecycle");assert.equal(attempts,2);assert.equal(asks.pendingFollowUps().filter(job=>job.askId===card.id).length,0);
+  await host.harness.behavior.callRpc("resolveAsk",{threadId:"thr_cap",id:card.id,resolution:"Yes"});assert.equal(attempts,2);
+ }finally{restore();await host.harness.lifecycle.dispose();}
+});
+
 test("reopen then owner re-answer releases the hold with the new answer", async () => {
   const status = { wait1: "needs-decision [key=choice]: Choose Postgres or SQLite? {\"choices\":[\"Postgres\",\"SQLite\"]}\n" };
   const { host, tasks, asks, commands, restore } = await captainHost(status);
@@ -603,6 +615,32 @@ async function checkerCorrectionFixture() {
  await host.harness.behavior.callRpc("resolveAsk",{threadId:"thr_cap",id:card.id,resolution:"Postgres"});assert.equal(state.held,false);state.text+='resolved [key=choice]: Postgres\n';
  return {...result,state,card};
 }
+
+test("checker round6: correction retries, names both answers, and does not duplicate across restart",async()=>{
+ const {host,asks,state,card,restore}=await checkerCorrectionFixture();let next;let attempts=0;let deliveries=0;
+ try{
+  host.harness.sdk.stub("threads.events.list",async()=>[]);host.harness.sdk.stub("threads.queuedMessages.list",async()=>[]);
+  host.harness.sdk.stub("threads.send",async(input:{threadId:string;mode:string;input:Array<{text:string}>})=>{if(input.threadId==="thr_w1"){attempts++;if(attempts===1)throw new Error("crew queue down");deliveries++;assert.equal(input.mode,"queue-if-active");assert.match(input.input[0].text,/question choice: was Postgres, now SQLite/);}return {delivery:"queued"};});
+  await tool(host,"firstmate_resolve_ask").execute({id:card.id,reopen:true,resolution:"Correction"},ctx);
+  await host.harness.behavior.callRpc("resolveAsk",{threadId:"thr_cap",id:card.id,resolution:"SQLite"});assert.ok(asks.pendingFollowUps().some(job=>job.askId===card.id&&job.effect==="owner-answered"));assert.equal(deliveries,0);
+  await host.harness.behavior.runSchedule("task-lifecycle");assert.equal(attempts,2);assert.equal(deliveries,1);assert.equal(asks.pendingFollowUps().length,0);
+  await host.harness.behavior.callRpc("resolveAsk",{threadId:"thr_cap",id:card.id,resolution:"SQLite"});assert.equal(deliveries,1);
+  next=await host.harness.lifecycle.reload(plugin);for(let i=0;i<12;i++)await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(next.harness.sdk.callsTo("threads.send").filter(call=>JSON.stringify(call).includes("thr_w1")).length,0,"completed correction must not be delivered again at startup");
+  assert.equal(createOwnerAsks(next.bb.storage.database()).pendingFollowUps().length,0);
+ }finally{if(next)await next.harness.lifecycle.dispose();await host.harness.lifecycle.dispose();restore();}
+});
+
+test("checker round6: correction that fails eight sends fails in view once",async()=>{
+ const {host,asks,card,restore}=await checkerCorrectionFixture();let attempts=0;try{
+  host.harness.sdk.stub("threads.events.list",async()=>[]);host.harness.sdk.stub("threads.queuedMessages.list",async()=>[]);
+  host.harness.sdk.stub("threads.send",async(input:{threadId:string})=>{if(input.threadId==="thr_w1"){attempts++;throw new Error("crew queue down");}return {delivery:"queued"};});
+  await tool(host,"firstmate_resolve_ask").execute({id:card.id,reopen:true,resolution:"Correction"},ctx);await host.harness.behavior.callRpc("resolveAsk",{threadId:"thr_cap",id:card.id,resolution:"SQLite"});
+  for(let i=0;i<7;i++)await host.harness.behavior.runSchedule("task-lifecycle");assert.equal(attempts,8);assert.ok(asks.failedFollowUps().some(job=>job.askId===card.id&&job.attempts===8));
+  const count=()=>host.harness.sdk.callsTo("threads.send").filter(call=>JSON.stringify(call).includes(`card ${card.id} was not delivered to crew wait1`)).length;assert.equal(count(),1);await host.harness.behavior.runSchedule("task-lifecycle");assert.equal(count(),1);assert.equal(attempts,8);
+  const board=await host.harness.behavior.callRpc("telegramCommand",{threadId:"thr_cap",command:"board"});assert.match(JSON.stringify(board),/answer not delivered to crew wait1/);
+ }finally{await host.harness.lifecycle.dispose();restore();}
+});
 
 test("checker round6: a correction steers while a newer question owns the shared crew hold",async()=>{
  const {host,asks,state,card,commands,restore}=await checkerCorrectionFixture();try{
@@ -924,6 +962,65 @@ test("checker round9: restart after send response before closing its row does no
   next=await checkerReload(host,state.text);next.harness.sdk.stub("threads.send",async(input:{threadId:string})=>{if(input.threadId==="thr_w1")accepted++;return {delivery:"queued"};});for(let i=0;i<12;i++)await new Promise(resolve=>setImmediate(resolve));await next.harness.behavior.runSchedule("task-lifecycle");
   assert.equal(accepted,1);assert.equal(checkerCrewSends(next).length,0);assert.equal(createOwnerAsks(next.bb.storage.database()).pendingFollowUps().length,0);
  }finally{db.prepare=originalPrepare;if(next)await next.harness.lifecycle.dispose();await host.harness.lifecycle.dispose();restore();}
+});
+
+test("checker round9: terminal failure of an earlier answer releases the next with visible failure",async()=>{
+ const {host,asks,card,restore}=await checkerCorrectionFixture();let attempts=0;const delivered:string[]=[];
+ try{
+  host.harness.sdk.stub("threads.events.list",async()=>[]);host.harness.sdk.stub("threads.queuedMessages.list",async()=>[]);
+  host.harness.sdk.stub("threads.send",async(input:{threadId:string;input:Array<{text:string}>})=>{if(input.threadId==="thr_w1"){if(input.input[0].text.includes("now SQLite")){attempts++;throw new Error("queue refuses first correction");}delivered.push(input.input[0].text);}return {delivery:"queued"};});
+  await checkerAcceptCorrection(host,card.id,"SQLite");assert.equal(attempts,1);await checkerAcceptCorrection(host,card.id,"Postgres");assert.equal(delivered.length,0,"newer answer must wait while older remains retryable");
+  for(let i=0;i<8&&attempts<8;i++)await host.harness.behavior.runSchedule("task-lifecycle");await host.harness.behavior.runSchedule("task-lifecycle");assert.equal(attempts,8);assert.equal(delivered.length,1);assert.match(delivered[0],/was SQLite, now Postgres/);assert.ok(asks.failedFollowUps().some(job=>job.answerSeq===2&&job.effect==="owner-answered"));
+  const notices=()=>checkerCrewSends(host,"thr_cap").filter(send=>send.input[0].text.includes(`card ${card.id} was not delivered to crew wait1`));assert.equal(notices().length,1);const board=await host.harness.behavior.callRpc("telegramCommand",{threadId:"thr_cap",command:"board"});assert.match(JSON.stringify(board),/answer not delivered to crew wait1/);await host.harness.behavior.runSchedule("task-lifecycle");assert.equal(notices().length,1);assert.equal(delivered.length,1);console.log("CHECKER R9 terminal failure",JSON.stringify({attempts,delivered,captainNotices:notices().length,board}));
+ }finally{await host.harness.lifecycle.dispose();restore();}
+});
+
+async function checkerPendingIntent(){
+ const fixture=await checkerCorrectionFixture();const {host,asks,card}=fixture;
+ asks.resolve(card.id,"thr_cap","open","Correction",Date.now());asks.resolve(card.id,"thr_cap","answered","SQLite",Date.now(),"owner");
+ const marker=`askref:${card.id}:2`;const key=`owner-answer-sent:${card.id}:2`;
+ await host.bb.storage.kv.set(key,{state:"sending",marker,threadId:"thr_w1",at:Date.now()});
+ return {...fixture,marker,key};
+}
+function checkerEvent(seq:number,body:string){return {id:`event-${seq}`,scope:{kind:"thread"},threadId:"thr_w1",seq,createdAt:Date.now(),type:"item/completed",data:{providerThreadId:"provider-w1",item:{id:`input-${seq}`,type:"userMessage",content:[{type:"text",text:body}]}}};}
+function checkerQueue(body:string){return {id:"queue-1",threadId:"thr_w1",failureReason:null,content:[{type:"text",text:body}]};}
+
+test("checker round10: a delivered marker beyond the first 100 events is found",async()=>{
+ const f=await checkerPendingIntent();const history=Array.from({length:101},(_,i)=>checkerEvent(101-i,i===100?f.marker:`ordinary event ${101-i}`));const reads:Array<{beforeSeq?:string;limit?:string}>=[];
+ try{
+  f.host.harness.sdk.stub("threads.events.list",async(args:{threadId:string;beforeSeq?:string;limit?:string})=>{if(args.threadId!=="thr_w1")return [];reads.push(args);assert.ok(Number(args.limit??100)<=100);return history.filter(row=>!args.beforeSeq||row.seq<Number(args.beforeSeq)).slice(0,Number(args.limit??100));});f.host.harness.sdk.stub("threads.queuedMessages.list",async()=>[]);
+  await f.host.harness.behavior.runSchedule("task-lifecycle");const record=await f.host.bb.storage.kv.get(f.key);console.log("CHECKER R10 pagination",JSON.stringify({reads,record,pending:f.asks.pendingFollowUps()}));
+  assert.equal((record as {state?:string})?.state,"delivered","the retained older event must confirm delivery rather than become an unknown failure");assert.equal(f.asks.pendingFollowUps().length,0);assert.ok(reads.length>=2);assert.equal(checkerCrewSends(f.host).length,0);
+ }finally{await f.host.harness.lifecycle.dispose();f.restore();}
+});
+
+test("checker round10: marker-like text inside another owner answer cannot fake delivery",async()=>{
+ const f=await checkerPendingIntent();let accepted=0;
+ try{
+  f.host.harness.sdk.stub("threads.events.list",async()=>[]);f.host.harness.sdk.stub("threads.queuedMessages.list",async()=>[{...checkerQueue(`The owner answered card ${f.card.id}: Example text ${f.marker} is documentation, not a receipt.`),pluginSubmission:{pluginId:"firstmate",data:{correlation:`askref:${f.card.id}:1`,askId:f.card.id,answerSeq:1}}}]);
+  f.host.harness.sdk.stub("threads.send",async(input:{threadId:string})=>{if(input.threadId==="thr_w1")accepted++;return {delivery:"queued"};});for(let i=0;i<3;i++)await f.host.harness.behavior.runSchedule("task-lifecycle");console.log("CHECKER R10 marker text",JSON.stringify({accepted,record:await f.host.bb.storage.kv.get(f.key),pending:f.asks.pendingFollowUps()}));
+  assert.equal(accepted,1,"an older answer's ordinary text must not stand in for the newer correction's delivery identity");
+ }finally{await f.host.harness.lifecycle.dispose();f.restore();}
+});
+
+test("checker round10: a queue item moving into events during discovery cannot cause duplicate delivery",async()=>{
+ const f=await checkerPendingIntent();let accepted=1;let moved=false;const events:ReturnType<typeof checkerEvent>[]=[];let queued=[checkerQueue(f.marker)];let discoveries=0;
+ try{
+  f.host.harness.sdk.stub("threads.events.list",async(args:{threadId:string})=>{if(args.threadId!=="thr_w1")return [];discoveries++;const snapshot=[...events];if(!moved){moved=true;queued=[];events.push(checkerEvent(1,f.marker));}return snapshot;});f.host.harness.sdk.stub("threads.queuedMessages.list",async()=>queued);
+  f.host.harness.sdk.stub("threads.send",async(input:{threadId:string})=>{if(input.threadId==="thr_w1")accepted++;return {delivery:"queued"};});for(let i=0;i<3;i++)await f.host.harness.behavior.runSchedule("task-lifecycle");console.log("CHECKER R10 queue transition",JSON.stringify({accepted,discoveries,record:await f.host.bb.storage.kv.get(f.key),pending:f.asks.pendingFollowUps()}));assert.equal(accepted,1,"queue consumption between the event snapshot and queue snapshot must not look like non-acceptance");
+ }finally{await f.host.harness.lifecycle.dispose();f.restore();}
+});
+
+test("checker round10: unreadable reconciliation blocks one card only and ends visibly failed once",async()=>{
+ const f=await checkerPendingIntent();const others:string[]=[];
+ try{
+  const crews=await f.host.bb.storage.kv.get<ReturnType<typeof crewRow>[]>("crews");await f.host.bb.storage.kv.set("crews",[...(crews??[]),crewRow("other","thr_other",{workstreamId:"ws-other"})]);
+  f.asks.resolve(f.card.id,"thr_cap","open","Correction",Date.now());f.asks.resolve(f.card.id,"thr_cap","answered","Postgres",Date.now(),"owner");const other=f.asks.create({captain:"thr_cap",kind:"question",text:"Other choice?",options:[{label:"Yes",value:"yes"}],sourceRef:"crew-wait:other:question",createdAt:Date.now()});f.asks.resolve(other.id,"thr_cap","answered","Yes",Date.now(),"owner");
+  f.host.harness.sdk.stub("threads.events.list",async(args:{threadId:string})=>{if(args.threadId==="thr_w1")throw new Error("crew event read unavailable");return [];});f.host.harness.sdk.stub("threads.queuedMessages.list",async()=>{throw new Error("crew queue read unavailable");});f.host.harness.sdk.stub("threads.send",async(input:{threadId:string;input:Array<{text:string}>})=>{if(input.threadId==="thr_other")others.push(input.input[0].text);return {delivery:"queued"};});
+  await f.host.harness.behavior.runSchedule("task-lifecycle");assert.equal(others.length,1);assert.equal(checkerCrewSends(f.host).length,0);assert.ok(f.asks.pendingFollowUps().some(job=>job.answerSeq===3));assert.equal((await f.host.bb.storage.kv.get<{state:string}>(f.key))?.state,"unknown");
+  const unconfirmed=()=>checkerCrewSends(f.host,"thr_cap").filter(send=>send.input[0].text.includes(`Could not confirm the owner's answer on card ${f.card.id}`));assert.equal(unconfirmed().length,1);await f.host.harness.behavior.runSchedule("task-lifecycle");assert.equal(unconfirmed().length,1);
+  for(let i=0;i<8&&!f.asks.failedFollowUps().some(job=>job.askId===f.card.id&&job.answerSeq===2);i++)await f.host.harness.behavior.runSchedule("task-lifecycle");assert.ok(f.asks.failedFollowUps().some(job=>job.askId===f.card.id&&job.answerSeq===2&&job.attempts===8));const board=await f.host.harness.behavior.callRpc("telegramCommand",{threadId:"thr_cap",command:"board"});assert.match(JSON.stringify(board),/answer not delivered to crew wait1/);const failed=()=>checkerCrewSends(f.host,"thr_cap").filter(send=>send.input[0].text.includes(`card ${f.card.id} was not delivered to crew wait1`));assert.equal(failed().length,1);await f.host.harness.behavior.runSchedule("task-lifecycle");assert.equal(failed().length,1);
+ }finally{await f.host.harness.lifecycle.dispose();f.restore();}
 });
 
 test("checker round3: failed prose-question notice is retried until a card can be made", async () => {
