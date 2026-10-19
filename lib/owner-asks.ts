@@ -40,13 +40,93 @@ export const ASK_FOLLOWUP_EFFECTS = ["owner-answered", "refresh-board"] as const
 export type AskFollowUpEffect = (typeof ASK_FOLLOWUP_EFFECTS)[number];
 export type AskFollowUp = { askId: string; effect: AskFollowUpEffect; state: "pending" | "done"; error: string | null; createdAt: number };
 
-/** Button labels for a native needs-decision note. "Choose Postgres or SQLite?" becomes two options. */
+/**
+ * Structured button labels from a crew report. JSON only: a whole-note array or
+ * `{choices|options:[...]}`, a trailing JSON value, or a `choices:` JSON line.
+ * Prose is not parsed and never becomes Yes/No.
+ */
+export function choicesFromCrewReport(note: string): AskOption[] | null {
+  for (const payload of structuredChoicePayloads(note)) {
+    const options = parseChoicePayload(payload);
+    if (options !== null && options.length > 0) return options;
+  }
+  return null;
+}
+
+/** Structured choices from a crew report, or none. */
 export function choicesFromDecisionNote(note: string): AskOption[] {
-  const body = note.replace(/[?!.]+$/u, "").trim();
-  const stripped = body.replace(/^(choose|pick|select)\s+/i, "");
-  const parts = stripped.split(/\s+or\s+/i).map((part) => part.trim()).filter((part) => part.length > 0 && part.length <= 80);
-  if (parts.length >= 2) return parts.map((label, i) => ({ label, value: String.fromCharCode(97 + i) }));
-  return [{ label: "Yes", value: "yes" }, { label: "No", value: "no" }];
+  return choicesFromCrewReport(note) ?? [];
+}
+
+/** Question text with a trailing structured choices payload removed. */
+export function crewQuestionText(note: string): string {
+  const tail = jsonTail(note.trim());
+  if (tail === undefined || tail.length === note.trim().length) return note.trim();
+  return note.trim().slice(0, note.trim().length - tail.length).trim();
+}
+
+function structuredChoicePayloads(note: string): string[] {
+  const trimmed = note.trim();
+  const payloads = [trimmed];
+  for (const line of trimmed.split("\n")) {
+    const text = line.trim();
+    const prefix = "choices:";
+    if (text.length >= prefix.length && text.slice(0, prefix.length).toLowerCase() === prefix) {
+      payloads.push(text.slice(text.indexOf(":") + 1).trim());
+    }
+  }
+  const tail = jsonTail(trimmed);
+  if (tail !== undefined) payloads.push(tail);
+  return payloads;
+}
+
+function jsonTail(text: string): string | undefined {
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch !== "{" && ch !== "[") continue;
+    const slice = text.slice(i);
+    try {
+      JSON.parse(slice);
+      return slice;
+    } catch { /* keep scanning for a trailing JSON value */ }
+  }
+  return undefined;
+}
+
+function parseChoicePayload(raw: string): AskOption[] | null {
+  try {
+    const value: unknown = JSON.parse(raw);
+    const list = Array.isArray(value) ? value
+      : value !== null && typeof value === "object" && Array.isArray((value as { choices?: unknown }).choices)
+        ? (value as { choices: unknown[] }).choices
+      : value !== null && typeof value === "object" && Array.isArray((value as { options?: unknown }).options)
+        ? (value as { options: unknown[] }).options
+      : null;
+    if (list === null || list.length === 0) return null;
+    const options: AskOption[] = [];
+    for (let i = 0; i < list.length; i++) {
+      const item = list[i];
+      if (typeof item === "string") {
+        const label = item.trim();
+        if (label.length === 0 || label.length > 80) return null;
+        options.push({ label, value: String.fromCharCode(97 + i) });
+        continue;
+      }
+      if (item !== null && typeof item === "object" && typeof (item as { label?: unknown }).label === "string") {
+        const label = (item as { label: string }).label.trim();
+        if (label.length === 0 || label.length > 80) return null;
+        const value = typeof (item as { value?: unknown }).value === "string" && (item as { value: string }).value.trim() !== ""
+          ? (item as { value: string }).value
+          : String.fromCharCode(97 + i);
+        options.push({ label, value });
+        continue;
+      }
+      return null;
+    }
+    return options;
+  } catch {
+    return null;
+  }
 }
 
 export type AskDeferral = { deferred: string[]; already: string[]; refused: string[]; until: number | null };

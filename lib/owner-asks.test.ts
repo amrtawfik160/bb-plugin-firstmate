@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import * as ownerAsksModule from "./owner-asks.ts";
-import { askLetterAnswer, askIdFromSourceEventId, choicesFromDecisionNote, createOwnerAsks, formatAskCard, newAskId, packAnswers } from "./owner-asks.ts";
+import { askLetterAnswer, askIdFromSourceEventId, choicesFromCrewReport, choicesFromDecisionNote, createOwnerAsks, crewQuestionText, formatAskCard, newAskId, packAnswers } from "./owner-asks.ts";
 import { formatBoard } from "./owner-board.ts";
 
 const NOW = Date.UTC(2026, 9, 7, 12, 0);
@@ -76,10 +76,16 @@ test("an owner tap stamps answeredByOwner; the captain can still correct it", ()
   assert.equal(asks.answeredByOwner("a1"), false);
 });
 
-test("choicesFromDecisionNote turns an or-list into buttons and falls back to Yes/No", () => {
-  assert.deepEqual(choicesFromDecisionNote("Choose Postgres or SQLite?"), [{ label: "Postgres", value: "a" }, { label: "SQLite", value: "b" }]);
-  assert.deepEqual(choicesFromDecisionNote("rename or keep?"), [{ label: "rename", value: "a" }, { label: "keep", value: "b" }]);
-  assert.deepEqual(choicesFromDecisionNote("Choose?"), [{ label: "Yes", value: "yes" }, { label: "No", value: "no" }]);
+test("structured crew report choices become buttons, and prose invents none", () => {
+  assert.deepEqual(choicesFromCrewReport('{"choices":["Postgres","MySQL","SQLite"]}'), [
+    { label: "Postgres", value: "a" }, { label: "MySQL", value: "b" }, { label: "SQLite", value: "c" },
+  ]);
+  assert.deepEqual(choicesFromCrewReport('Choose a database?\nchoices: ["Postgres","SQLite"]'), [
+    { label: "Postgres", value: "a" }, { label: "SQLite", value: "b" },
+  ]);
+  assert.equal(choicesFromCrewReport("Choose Postgres, MySQL or SQLite?"), null);
+  assert.equal(choicesFromCrewReport("Choose?"), null);
+  assert.equal(crewQuestionText('Choose Postgres or SQLite? {"choices":["Postgres","SQLite"]}'), "Choose Postgres or SQLite?");
 });
 
 test("an owner answer records pending follow-up in the same write; a failure stays visible", () => {
@@ -250,4 +256,10 @@ test("a skipped card answered early is answered, and a reopened card is no longe
   asks.resolve("a1", "thr_cap", "open", "", NOW + 120_000);
   assert.equal(asks.get("a1")?.deferredUntil, undefined, "a reopened card waits on the owner again");
   assert.deepEqual(asks.listWaiting("thr_cap", NOW + 120_000).map((ask) => ask.id), ["a1"]);
+});
+
+test("checker round2: a normal three-choice native question keeps its separate choices", () => {
+  const options=choicesFromDecisionNote('{"choices":["Postgres","MySQL","SQLite"]}');
+  console.log("CHECKER R2 generated choices",JSON.stringify(options));
+  assert.deepEqual(options.map(option=>option.label),["Postgres","MySQL","SQLite"],"the owner must not get a composite Postgres, MySQL choice");
 });

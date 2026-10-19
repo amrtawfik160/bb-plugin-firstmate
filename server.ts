@@ -89,7 +89,7 @@ import {
   buildProgram, createPrograms, isOpenProgram, isOpenTicket, newlyReady, numberOf, programCounts, programText, readyRefs, readyWakeText, repoOf,
   shortTicket, stallReminderDue, stallReminderText, ticketRef, type IssueFacts, type Program, type ProgramFact, type TicketRef,
 } from "./lib/programs.ts";
-import { askLetterAnswer, askIdFromSourceEventId, packAnswers, choicesFromDecisionNote, clip, createOwnerAsks, formatAge, formatAskCard, formatUtcTime, mayDefault, OWNER_CLOSED_RESOLUTION, CAPTAIN_RULES, OWNER_DECISION_RULE, recommendedLabel, replacedBy, type AskKind, type AskFollowUp, type OwnerAsk } from "./lib/owner-asks.ts";
+import { askLetterAnswer, askIdFromSourceEventId, packAnswers, choicesFromCrewReport, clip, createOwnerAsks, crewQuestionText, formatAge, formatAskCard, formatUtcTime, mayDefault, OWNER_CLOSED_RESOLUTION, CAPTAIN_RULES, OWNER_DECISION_RULE, recommendedLabel, replacedBy, type AskKind, type AskFollowUp, type OwnerAsk } from "./lib/owner-asks.ts";
 import { DEFAULT_RELIABILITY_FLAGS, reliabilityFlagsFromSettings } from "./lib/reliability-flags.ts";
 import { sanitizeSettingValue } from "./lib/settings-schema.ts";
 import { coalesceBatches, parseConnectorHeader, parseInboundTelegram, parseSourceRef, parseTelegramSubmission, stripTelegramEnvelope, telegramReplyParameters, telegramSourceRef } from "./lib/telegram-envelope.ts";
@@ -6059,6 +6059,33 @@ export default async function plugin(bb: BbPluginApi) {
     return (status.verb === "paused" || status.verb === "blocked") && /\b(?:owner|owner's|captain's answer|your answer)\b/i.test(status.note);
   }
 
+  async function nativeDecisionKey(crew: Crew, note: string): Promise<string | undefined> {
+    try {
+      const { lines, kind } = await crewStatusLines(crew);
+      return foldOpenDecisions(lines, kind).find((d) => d.note === note)?.key;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async function bindNativeQuestion(captain: string, bind: string): Promise<{ sourceRef: string } | { error: string }> {
+    const trimmed = bind.trim();
+    if (trimmed.startsWith("crew-wait:")) return { sourceRef: trimmed };
+    const colon = trimmed.indexOf(":");
+    const crewId = (colon === -1 ? trimmed : trimmed.slice(0, colon)).trim();
+    const key = colon === -1 ? undefined : trimmed.slice(colon + 1).trim();
+    if (crewId === "") return { error: "bind names a crew id, or crewId:key of the native question." };
+    const crew = await findCrew(crewId, captain);
+    if (crew === undefined || crew.parentThreadId !== captain) return { error: `No crew ${crewId} for this captain.` };
+    const { lines, kind } = await crewStatusLines(crew);
+    const open = foldOpenDecisions(lines, kind);
+    const decision = key
+      ? open.find((d) => d.key === key)
+      : open.find((d) => d.verb === "needs-decision") ?? open.at(-1);
+    if (decision === undefined) return { error: `No open native question${key ? ` ${key}` : ""} for crew ${crewId}.` };
+    return { sourceRef: `crew-wait:${statusKey(crew.id, decision.note)}` };
+  }
+
   async function askForCrew(captain: string, task: OwnerTask, crew: Crew, latest: { verb: string; note: string }, now: number): Promise<void> {
     if (isOpenTask(task)) ownerTasks.move(task.id, captain, { to: "needs_you", reason: latest.note }, now);
     if (latest.verb !== "needs-decision") {
@@ -6067,17 +6094,26 @@ export default async function plugin(bb: BbPluginApi) {
       return;
     }
     const sourceRef = `crew-wait:${statusKey(crew.id, latest.note)}`;
+    const options = choicesFromCrewReport(latest.note);
+    if (options === null) {
+      const key = await nativeDecisionKey(crew, latest.note);
+      const bind = key ? `${crew.id}:${key}` : crew.id;
+      bb.log.info(`task ${task.id}: crew ${crew.id} waits on the owner; captain must send firstmate_ask bind=${bind}`);
+      await deliverToCaptain(captain, `CREW QUESTION: crew ${crew.id} waits on the owner for task ${task.id}: ${clip(crewQuestionText(latest.note), 400)}. Send him a card with firstmate_ask, pass bind=${bind} so his answer releases this hold.`, crew.id).catch((error) => bb.log.warn(`crew question note: ${String(error)}`));
+      return;
+    }
     const project = task.project ?? await projectLabel(crew.projectId) ?? undefined;
+    const question = crewQuestionText(latest.note);
     const ask = ownerAsks.create({
-      captain, kind: "question", text: `${clip(task.title, 60)}: ${clip(latest.note, 900)}`,
-      options: choicesFromDecisionNote(latest.note), sourceRef, createdAt: now,
+      captain, kind: "question", text: `${clip(task.title, 60)}: ${clip(question, 900)}`,
+      options, sourceRef, createdAt: now,
       ...(project ? { project } : {}), task: task.id, subject: cardSubject(`${clip(task.title, 60)}: x`),
     });
     const replaced = await replaceOpenCards(ask);
     const failed = (await reliabilityFlags()).telegramThreading === "on" ? await sendAskCard(ask, { ...(project ? { project } : {}), task: task.id }) : "";
     const warning = failed === "" ? "" : ` It was not sent to Telegram (${failed}).`;
     bb.log.info(`task ${task.id}: crew ${crew.id} waits on the owner; card ${ask.id} opened`);
-    await deliverToCaptain(captain, `CREW QUESTION CARD: crew ${crew.id} waits on the owner for task ${task.id}, so card ${ask.id} carries its question to him${replaced.length > 0 ? ` (replacing ${replaced.join(", ")})` : ""}.${warning} When he answers, pass the answer to the crew with firstmate_tell.`, crew.id).catch((error) => bb.log.warn(`crew question note: ${String(error)}`));
+    await deliverToCaptain(captain, `CREW QUESTION CARD: crew ${crew.id} waits on the owner for task ${task.id}, so card ${ask.id} carries its question to him${replaced.length > 0 ? ` (replacing ${replaced.join(", ")})` : ""}.${warning} His answer is applied to the native question.`, crew.id).catch((error) => bb.log.warn(`crew question note: ${String(error)}`));
   }
 
   async function projectLabel(projectId: string | undefined): Promise<string | null> {
@@ -6151,14 +6187,23 @@ export default async function plugin(bb: BbPluginApi) {
     return replaced;
   }
 
-  // Best effort: the connector redraws its pinned board. A missing method or a failure changes nothing here.
-  async function refreshOwnerBoard(): Promise<void> {
-    if ((await reliabilityFlags()).telegramThreading !== "on") return;
+  type FollowUpResult = { status: "completed" } | { status: "retryable" | "failed"; error: string };
+
+  async function runRefreshOwnerBoard(): Promise<FollowUpResult> {
+    if ((await reliabilityFlags()).telegramThreading !== "on") return { status: "completed" };
     try {
       await bb.sdk.plugins.callRpc({ pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "refreshBoard", input: {}, outputSchema: z.object({ ok: z.boolean() }) });
+      return { status: "completed" };
     } catch (error) {
-      if (!isTelegramRpcMissing(error)) bb.log.warn(`telegram refreshBoard: ${String(error)}`);
+      if (isTelegramRpcMissing(error)) return { status: "completed" };
+      return { status: "retryable", error: error instanceof Error ? error.message : String(error) };
     }
+  }
+
+  // Best effort: the connector redraws its pinned board. A missing method or a failure changes nothing here.
+  async function refreshOwnerBoard(): Promise<void> {
+    const result = await runRefreshOwnerBoard();
+    if (result.status !== "completed") bb.log.warn(`telegram refreshBoard: ${result.error}`);
   }
 
   // What the digests already told the owner, so the next one does not repeat it.
@@ -6211,7 +6256,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   // Resolve each named question even when another question still owns the shared crew hold.
-  async function releaseClosedAskHold(ask: OwnerAsk): Promise<boolean> {
+  async function applyAskNativeHold(ask: OwnerAsk, resolution: string, storeKey: string, operation: string): Promise<boolean> {
     const crewId = ask.sourceRef?.startsWith("crew-wait:") ? ask.sourceRef.split(":")[1] : undefined;
     if (!crewId) return true;
     const crew = await findCrew(crewId);
@@ -6219,8 +6264,7 @@ export default async function plugin(bb: BbPluginApi) {
     const home = await crewNativeHome(crew);
     if (home === "") return true;
     const hostId = await resolveHostForProject(crew.projectId, ask.captain);
-    const key = `owner-close-native:${ask.id}`;
-    const stored = await bb.storage.kv.get(key);
+    const stored = await bb.storage.kv.get(storeKey);
     let plan = stored === undefined ? undefined : closeNativePlanSchema.parse(stored);
     if (plan?.finished) return true;
     const held = async (id: string): Promise<boolean> => {
@@ -6241,25 +6285,24 @@ export default async function plugin(bb: BbPluginApi) {
       const belongs = keys.length > 0 || (latest !== null && ask.sourceRef === `crew-wait:${statusKey(crew.id, latest.note)}`);
       plan = { keys, holds, shared: belongs && await held(crew.id), finished: false, sourceRef: ask.sourceRef, questionFinished: false };
       // Persist both status keys and hold identities before either native mutation.
-      await bb.storage.kv.set(key, plan);
+      await bb.storage.kv.set(storeKey, plan);
     }
-    const resolution = OWNER_CLOSED_RESOLUTION;
-    const path = `${home}/state/.bb-close-${createHash("sha256").update(ask.id).digest("hex")}.answer`;
+    const path = `${home}/state/.bb-hold-${createHash("sha256").update(storeKey).digest("hex")}.answer`;
     let staged = false;
     const release = async (id: string) => {
       if (!(await held(id))) return;
       if (!staged) {
-        if (!(await writeHostFile(hostId, path, resolution))) throw new Error(`Could not write close for ${ask.id}.`);
+        if (!(await writeHostFile(hostId, path, resolution))) throw new Error(`Could not write ${operation} for ${ask.id}.`);
         staged = true;
       }
-      requireNativeSuccess(await runCaptainHold(["answer", id, "--decision-file", path, "--release"], { home, hostId, projectId: crew.projectId }), "owner close hold");
+      requireNativeSuccess(await runCaptainHold(["answer", id, "--decision-file", path, "--release"], { home, hostId, projectId: crew.projectId }), operation);
     };
     try {
       if (!plan.questionFinished) {
         // Upgrade saved key-only plans using the card's immutable question identity.
         if (plan.sourceRef === undefined) {
           plan.sourceRef = ask.sourceRef;
-          await bb.storage.kv.set(key, plan);
+          await bb.storage.kv.set(storeKey, plan);
         }
         const sourceRef = plan.sourceRef;
         const sameQuestion = async (id: string) => {
@@ -6272,18 +6315,22 @@ export default async function plugin(bb: BbPluginApi) {
         }
         // A shared hold can remain pending after this question's own mutations are complete.
         plan.questionFinished = true;
-        await bb.storage.kv.set(key, plan);
+        await bb.storage.kv.set(storeKey, plan);
       }
       if (plan.shared) {
         const { lines, kind } = await crewStatusLines(crew);
         if (foldOpenDecisions(lines, kind).length > 0) return false;
         await release(crew.id);
       }
-      await bb.storage.kv.set(key, { ...plan, finished: true });
+      await bb.storage.kv.set(storeKey, { ...plan, finished: true });
       return true;
     } finally {
       if (staged) await runOnHost(hostId, `rm -f ${shQuote(path)}`, 10_000).catch(() => {});
     }
+  }
+
+  async function releaseClosedAskHold(ask: OwnerAsk): Promise<boolean> {
+    return applyAskNativeHold(ask, OWNER_CLOSED_RESOLUTION, `owner-close-native:${ask.id}`, "owner close hold");
   }
 
   const closeNoticeChains = new Map<string, Promise<void>>();
@@ -9479,101 +9526,160 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   const proofRechecks = new Map<string, ReturnType<typeof setTimeout>>();
-  async function dropDeviceProof(askId: string): Promise<void> {
-    const timer = proofRechecks.get(askId);
-    if (timer !== undefined) clearTimeout(timer);
-    proofRechecks.delete(askId);
-    await bb.storage.kv.delete(`${DEVICE_PROOF_PREFIX}${askId}`);
-  }
-
-  /** The owner answered an ask by tap or reply. A device proof card's Works records his proof. */
-  async function ownerAnsweredAsk(askId: string, resolution: string, attempt = 0): Promise<void> {
-    proofRechecks.delete(askId);
-    const key = `${DEVICE_PROOF_PREFIX}${askId}`;
-    const proof = await bb.storage.kv.get<DeviceProof>(key);
-    if (proof === undefined) return;
-    // Only a card the owner answered can prove: a cancelled or reopened card never does (checker round 3).
-    if (ownerAsks.get(askId)?.state !== "answered") { await dropDeviceProof(askId); return; }
-    const crew = await findCrew(proof.crewId);
-    const tell = async (note: string) => {
-      if (crew !== undefined) await tellCrew(crew, note, false, true).catch((error) => bb.log.warn(`device proof note to crew ${crew.id}: ${String(error)}`));
-      await deliverToCaptain(proof.captain, note, proof.crewId).catch((error) => bb.log.warn(`device proof note to captain: ${String(error)}`));
-    };
-    // Only the card's exact Works choice is proof, and only when Telegram recorded it as the owner's own
-    // button tap: typed words, a plain RPC call or a captain correction prove nothing (checker FF2-verdict-1).
-    if (resolution.trim().toLowerCase() !== "works") {
-      await bb.storage.kv.delete(key);
-      bb.log.info(`device proof ${askId} ${proof.pr}@${proof.head.slice(0, 7)} build=${proof.build}: does not work`);
-      await tell(resolution.trim().toLowerCase() === "does not work"
-        ? `The owner says build ${proof.build} does not work on the owner's iPhone. No proof is recorded for ${proof.pr}. Find out why, fix it, and open a new device proof card for the new build.`
-        : `Card ${askId} for build ${proof.build} was answered "${clip(resolution, 200)}", not with its Works button, so no proof is recorded for ${proof.pr}. Open a new device proof card if the build still needs his check.`);
-      return;
-    }
-    // The binding stays until the proof is recorded or the card closes: Telegram may record the tap after this
-    // first read (checker round 2), so the connector is read again a few times.
-    const confirmed = await ownerTapped(askId);
-    if (confirmed !== "works") {
-      const delays = proofRecheckMs();
-      if (attempt < delays.length) {
-        const timer = setTimeout(() => { if (!launchAbort.signal.aborted) void ownerAnsweredAsk(askId, resolution, attempt + 1).catch((error) => bb.log.warn(`device proof ${askId} recheck: ${String(error)}`)); }, delays[attempt]);
-        timer.unref?.();
-        proofRechecks.set(askId, timer);
-        return;
-      }
-      bb.log.warn(`device proof ${askId}: card reads Works but Telegram has no owner tap after ${attempt + 1} reads`);
-      await tell(`Card ${askId} reads Works for build ${proof.build}, but Telegram has no record of the owner tapping it${confirmed === "unreadable" ? " (the Telegram connector did not answer)" : ""}, so no proof is recorded for ${proof.pr}. The card stays bound: a later tap record is still counted.`);
-      return;
-    }
-    let note: string;
-    try {
-      // A tap can come hours after the card: read the PR from GitHub first, so the record covers its head now.
-      const row = deliveries.get(proof.pr);
-      if (row !== undefined && row.freshness !== "fresh") await reconcileDelivery(row);
-      // The card may have been cancelled or replaced while the reads above were in flight: read the binding
-      // again, then check the card with no await between that check and the record (checker round 4).
-      if (await bb.storage.kv.get<DeviceProof>(key) === undefined || ownerAsks.get(askId)?.state !== "answered") {
-        bb.log.info(`device proof ${askId}: card closed while its tap was read; no proof recorded`);
-        await dropDeviceProof(askId);
-        return;
-      }
-      const current = deliveries.get(proof.pr);
-      if (current?.forgeState === "merged" && current.headSha !== proof.head) throw new Error("The device card does not cover the PR's final head.");
-      const commit = current?.forgeState === "merged" ? current.mergeCommitSha ?? proof.head : proof.head;
-      deliveries.verify(proof.pr, OWNER_ACTOR, commit, { driven: `the owner tested build ${proof.build} on ${surfaceWords(proof.surface as never)}`, seen: "Works", surface: proof.surface, build: proof.build });
-      note = `The owner tapped Works for build ${proof.build}: proof is recorded for ${proof.pr} at ${commit.slice(0, 7)}.`;
-    } catch (error) {
-      note = `The owner tapped Works for build ${proof.build}, but no proof was recorded for ${proof.pr}: ${error instanceof Error ? error.message : String(error)} Open a new device proof card for the current head.`;
-    }
-    await bb.storage.kv.delete(key);
-    bb.log.info(`device proof ${askId} ${proof.pr}@${proof.head.slice(0, 7)} build=${proof.build}: works`);
-    await tell(note);
-  }
+  const proofRecheckAttempts = new Map<string, number>();
   function proofRecheckMs(): number[] {
     const given = (process.env.FM_PROOF_RECHECK_MS ?? "").split(",").map(Number).filter((ms) => Number.isFinite(ms) && ms > 0);
     return given.length > 0 ? given.slice(0, 5) : [2_000, 10_000, 60_000];
   }
-
-  let askFollowUpDrain: Promise<void> = Promise.resolve();
-  function drainAskFollowUps(): Promise<void> {
-    const run = askFollowUpDrain.then(async () => {
-      for (const job of ownerAsks.pendingFollowUps()) await runAskFollowUp(job);
-    });
-    askFollowUpDrain = run.catch((error) => { bb.log.warn(`ask follow-up drain: ${String(error)}`); });
-    return run;
+  function scheduleProofRecheck(askId: string): void {
+    if (proofRechecks.has(askId)) return;
+    const delays = proofRecheckMs();
+    const attempt = proofRecheckAttempts.get(askId) ?? 0;
+    if (attempt >= delays.length) return;
+    const timer = setTimeout(() => {
+      if (proofRechecks.get(askId) !== timer) return;
+      proofRechecks.delete(askId);
+      proofRecheckAttempts.set(askId, attempt + 1);
+      if (!launchAbort.signal.aborted) void drainAskFollowUps().catch((error) => bb.log.warn(`device proof ${askId} recheck: ${String(error)}`));
+    }, delays[attempt]!);
+    timer.unref?.();
+    proofRechecks.set(askId, timer);
   }
-  async function runAskFollowUp(job: AskFollowUp): Promise<void> {
-    try {
-      if (job.effect === "owner-answered") {
-        const ask = ownerAsks.get(job.askId);
-        if (ask?.resolution) await ownerAnsweredAsk(job.askId, ask.resolution);
-      } else if (job.effect === "refresh-board") {
-        await refreshOwnerBoard();
+  async function dropDeviceProof(askId: string): Promise<void> {
+    const timer = proofRechecks.get(askId);
+    if (timer !== undefined) clearTimeout(timer);
+    proofRechecks.delete(askId);
+    proofRecheckAttempts.delete(askId);
+    await bb.storage.kv.delete(`${DEVICE_PROOF_PREFIX}${askId}`);
+  }
+
+  /** The owner answered an ask by tap or reply. A device proof card's Works records his proof. */
+  async function ownerAnsweredAsk(askId: string, resolution: string): Promise<FollowUpResult> {
+    const ask = ownerAsks.get(askId);
+    const key = `${DEVICE_PROOF_PREFIX}${askId}`;
+    const proof = await bb.storage.kv.get<DeviceProof>(key);
+    if (proof !== undefined) {
+      // Only a card the owner answered can prove: a cancelled or reopened card never does (checker round 3).
+      if (ask?.state !== "answered") { await dropDeviceProof(askId); return { status: "completed" }; }
+      const crew = await findCrew(proof.crewId);
+      const tell = async (note: string) => {
+        if (crew !== undefined) await tellCrew(crew, note, false, true).catch((error) => bb.log.warn(`device proof note to crew ${crew.id}: ${String(error)}`));
+        await deliverToCaptain(proof.captain, note, proof.crewId).catch((error) => bb.log.warn(`device proof note to captain: ${String(error)}`));
+      };
+      // Only the card's exact Works choice is proof, and only when Telegram recorded it as the owner's own
+      // button tap: typed words, a plain RPC call or a captain correction prove nothing (checker FF2-verdict-1).
+      if (resolution.trim().toLowerCase() !== "works") {
+        await bb.storage.kv.delete(key);
+        bb.log.info(`device proof ${askId} ${proof.pr}@${proof.head.slice(0, 7)} build=${proof.build}: does not work`);
+        await tell(resolution.trim().toLowerCase() === "does not work"
+          ? `The owner says build ${proof.build} does not work on the owner's iPhone. No proof is recorded for ${proof.pr}. Find out why, fix it, and open a new device proof card for the new build.`
+          : `Card ${askId} for build ${proof.build} was answered "${clip(resolution, 200)}", not with its Works button, so no proof is recorded for ${proof.pr}. Open a new device proof card if the build still needs his check.`);
+        return { status: "completed" };
       }
-      ownerAsks.markFollowUpDone(job.askId, job.effect);
+      // The binding stays until the proof is recorded or the card closes: Telegram may record the tap after this
+      // first read (checker round 2), so the connector is read again a few times. The follow-up stays pending so
+      // a restart still retries; the timer only drains that pending work.
+      const confirmed = await ownerTapped(askId);
+      if (confirmed !== "works") {
+        scheduleProofRecheck(askId);
+        return { status: "retryable", error: "waiting for owner tap confirmation" };
+      }
+      let note: string;
+      try {
+        // A tap can come hours after the card: read the PR from GitHub first, so the record covers its head now.
+        const row = deliveries.get(proof.pr);
+        if (row !== undefined && row.freshness !== "fresh") await reconcileDelivery(row);
+        // The card may have been cancelled or replaced while the reads above were in flight: read the binding
+        // again, then check the card with no await between that check and the record (checker round 4).
+        if (await bb.storage.kv.get<DeviceProof>(key) === undefined || ownerAsks.get(askId)?.state !== "answered") {
+          bb.log.info(`device proof ${askId}: card closed while its tap was read; no proof recorded`);
+          await dropDeviceProof(askId);
+          return { status: "completed" };
+        }
+        const current = deliveries.get(proof.pr);
+        if (current?.forgeState === "merged" && current.headSha !== proof.head) throw new Error("The device card does not cover the PR's final head.");
+        const commit = current?.forgeState === "merged" ? current.mergeCommitSha ?? proof.head : proof.head;
+        deliveries.verify(proof.pr, OWNER_ACTOR, commit, { driven: `the owner tested build ${proof.build} on ${surfaceWords(proof.surface as never)}`, seen: "Works", surface: proof.surface, build: proof.build });
+        note = `The owner tapped Works for build ${proof.build}: proof is recorded for ${proof.pr} at ${commit.slice(0, 7)}.`;
+      } catch (error) {
+        note = `The owner tapped Works for build ${proof.build}, but no proof was recorded for ${proof.pr}: ${error instanceof Error ? error.message : String(error)} Open a new device proof card for the current head.`;
+      }
+      await bb.storage.kv.delete(key);
+      bb.log.info(`device proof ${askId} ${proof.pr}@${proof.head.slice(0, 7)} build=${proof.build}: works`);
+      await tell(note);
+      return { status: "completed" };
+    }
+    if (ask?.sourceRef?.startsWith("crew-wait:") && ask.resolution) {
+      try {
+        const finished = await applyAskNativeHold(ask, ask.resolution, `owner-answer-native:${ask.id}`, "owner answer hold");
+        if (!finished) return { status: "retryable", error: "native hold still shared with another question" };
+        return { status: "completed" };
+      } catch (error) {
+        return { status: "retryable", error: error instanceof Error ? error.message : String(error) };
+      }
+    }
+    return { status: "completed" };
+  }
+
+  const followUpInFlight = new Map<string, Promise<FollowUpResult>>();
+  const ASK_FOLLOWUP_WAIT_MS = STUCK_HOST_CALL_MS;
+
+  function drainAskFollowUps(): Promise<void> {
+    const groups = new Map<string, AskFollowUp[]>();
+    for (const job of ownerAsks.pendingFollowUps()) {
+      const list = groups.get(job.askId) ?? [];
+      list.push(job);
+      groups.set(job.askId, list);
+    }
+    return Promise.all([...groups].map(async ([askId, jobs]) => {
+      try {
+        for (const job of jobs) await runAskFollowUp(job);
+      } catch (error) {
+        bb.log.warn(`ask follow-up drain ${askId}: ${String(error)}`);
+      }
+    })).then(() => {});
+  }
+
+  function applyFollowUpResult(job: AskFollowUp, result: FollowUpResult): void {
+    if (result.status === "completed") ownerAsks.markFollowUpDone(job.askId, job.effect);
+    else {
+      ownerAsks.failFollowUp(job.askId, job.effect, result.error);
+      bb.log.warn(`ask follow-up ${job.askId} ${job.effect}: ${result.error}`);
+    }
+  }
+
+  async function executeAskFollowUp(job: AskFollowUp): Promise<FollowUpResult> {
+    if (job.effect === "owner-answered") {
+      const ask = ownerAsks.get(job.askId);
+      if (!ask?.resolution) return { status: "completed" };
+      return ownerAnsweredAsk(job.askId, ask.resolution);
+    }
+    if (job.effect === "refresh-board") return runRefreshOwnerBoard();
+    return { status: "completed" };
+  }
+
+  async function runAskFollowUp(job: AskFollowUp): Promise<void> {
+    const key = `${job.askId}:${job.effect}`;
+    const existing = followUpInFlight.get(key);
+    if (existing !== undefined) return;
+    const work = executeAskFollowUp(job);
+    followUpInFlight.set(key, work);
+    try {
+      const result = await raceAbort(work, undefined, ASK_FOLLOWUP_WAIT_MS);
+      applyFollowUpResult(job, result);
+      followUpInFlight.delete(key);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       ownerAsks.failFollowUp(job.askId, job.effect, message);
       bb.log.warn(`ask follow-up ${job.askId} ${job.effect}: ${message}`);
+      const timedOut = error instanceof Error && error.message === "Timed out.";
+      if (timedOut) {
+        void work.then((result) => {
+          if (result.status === "completed") ownerAsks.markFollowUpDone(job.askId, job.effect);
+        }).catch(() => {}).finally(() => { if (followUpInFlight.get(key) === work) followUpInFlight.delete(key); });
+        return;
+      }
+      followUpInFlight.delete(key);
     }
   }
 
@@ -14416,7 +14522,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_ask",
-    description: "Ask the captain one question, blocker or approval as a Telegram card with up to 4 option buttons. It stays on the captain's board until answered. Returns at once: keep working on other things. The answer arrives from a button tap or a card reply containing just its option letter. Reversible cards sent within a minute of each other share one Telegram message with an \"Accept all recommended\" button; an answer there arrives as one owner message with a line \"- ask <id>: <option>\" per card it answered. Approval cards supply fixed Approve and No buttons: omit options and recommended, and pass the exact authorized PR list in prs; question-text PR mentions grant no permission. irreversible=true or kind=approval never proceeds on a deadline and keeps its own message; a reversible ask with a recommended option proceeds with it at its deadline. A card names its project. A card the owner's rules in captain.md already answer is refused with the rule. A new card on the same task and subject replaces the open one.",
+    description: "Ask the captain one question, blocker or approval as a Telegram card with up to 4 option buttons. It stays on the captain's board until answered. Returns at once: keep working on other things. The answer arrives from a button tap or a card reply containing just its option letter. Reversible cards sent within a minute of each other share one Telegram message with an \"Accept all recommended\" button; an answer there arrives as one owner message with a line \"- ask <id>: <option>\" per card it answered. Approval cards supply fixed Approve and No buttons: omit options and recommended, and pass the exact authorized PR list in prs; question-text PR mentions grant no permission. irreversible=true or kind=approval never proceeds on a deadline and keeps its own message; a reversible ask with a recommended option proceeds with it at its deadline. A card names its project. A card the owner's rules in captain.md already answer is refused with the rule. A new card on the same task and subject replaces the open one. bind=crewId or crewId:key attaches the card to a native crew question so the owner's answer or Close releases that hold.",
     parameters: z.object({
       impact: z.string().optional().describe("Optional. One plain sentence explaining what this means for the owner’s business"),
       question: z.string().min(1).max(1500).describe("One question, asked in the first sentence; put option text in options, not in the question. Cards sent together that start with the same subject and a colon (\"DM Pro plugin: ...\") get that subject as their shared title"),
@@ -14429,8 +14535,9 @@ export default async function plugin(bb: BbPluginApi) {
       startsNewWork: z.boolean().optional().describe("true when an option starts new work: a build, a new crew, a new ticket. The card then waits for the owner's answer"),
       project: z.string().min(1).max(80).optional().describe("Required unless task has one: the project this card is about, as on the board (such as Safi). With Telegram topics on, the card goes to that project's topic"),
       task: z.string().regex(/^T\d+$/).optional().describe("The owner task this card is for (T<n>). Unset: the open task the owner message of this turn started. In Telegram the card replies to the task's status line, which counts it"),
+      bind: z.string().min(1).max(120).optional().describe("Bind this card to a native crew question so the owner's answer or Close releases that hold. Pass the crew id, or crewId:key of the status decision."),
     }),
-    async execute({ impact, question, kind, options, prs, recommended, defaultAfterMinutes, irreversible, startsNewWork, project, task: taskId }, ctx) {
+    async execute({ impact, question, kind, options, prs, recommended, defaultAfterMinutes, irreversible, startsNewWork, project, task: taskId, bind }, ctx) {
       const captain = ctxString(ctx, "threadId");
       if (!captain) return toolError("firstmate_ask runs only in a captain thread.");
       if (taskId !== undefined && ownerTasks.get(taskId)?.captain !== captain) return toolError(`No owner task ${taskId} for this captain. Check firstmate_task list.`);
@@ -14472,11 +14579,20 @@ export default async function plugin(bb: BbPluginApi) {
           approvalHeads.push({pr, head:identity.headSha});
         }
       }
+      let sourceRef: string | undefined;
+      if (bind !== undefined) {
+        const bound = await bindNativeQuestion(captain, bind);
+        if ("error" in bound) return toolError(`Refusing: ${bound.error} Nothing was sent.`);
+        const already = ownerAsks.listOpen(captain).find((open) => open.sourceRef === bound.sourceRef);
+        if (already !== undefined) return toolError(`Refusing: card ${already.id} already binds that native question. Nothing was sent.`);
+        sourceRef = bound.sourceRef;
+      }
       const ask = ownerAsks.create({
         captain, kind: kind as AskKind, impact: impact?.replace(/\s+/g, " ").trim().slice(0, 300), text: cardText, options: choices,
         recommended: recommended ?? null, defaultAt: minutes > 0 ? now + Math.round(minutes * 60_000) : null,
         irreversible: irreversible === true, startsNewWork: newWork, createdAt: now,
         project: cardProject, ...(cardTask !== undefined ? { task: cardTask } : {}), subject: cardSubject(question),
+        ...(sourceRef !== undefined ? { sourceRef } : {}),
       });
       if (kind === "approval") productionApprovals.bindCard(ask.id, approvalHeads);
       const replaced = await replaceOpenCards(ask);
@@ -15887,8 +16003,7 @@ export default async function plugin(bb: BbPluginApi) {
         } catch { /* An RPC correction can close a card, but cannot grant production approval. */ }
       }
       const ok = ownerAsks.resolve(id, threadId, "answered", resolution, Date.now(), ownerConfirmed ? "owner" : undefined) !== undefined;
-      if (ok) await ownerAnsweredAsk(id, resolution);
-      if (ok) await refreshOwnerBoard();
+      if (ok) await drainAskFollowUps();
       return { ok };
     },
     async closeAsk({ threadId, ids }) {

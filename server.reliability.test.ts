@@ -1985,3 +1985,70 @@ test("startup drain recovers deferred device proof work without a new tap", asyn
     } finally { await reloaded.harness.lifecycle.dispose(); }
   } finally { await host.harness.lifecycle.dispose(); }
 });
+
+const checkerR2Tap = (host: Host, id: string, letter = "a.") => host.harness.inspection.registrations.hooks["message.dispatch"]!({
+  thread:makeThreadResponse({id:"thr_cap",status:"active"}),attempt:"join-turn",initiator:"user",senderThreadId:null,queuedMessages:[],input:{blocks:[],text:askReply(id,letter)}
+} as never);
+const checkerR2Card = (host: Host, id: string) => asks(host).create({id,captain:"thr_cap",kind:"question",text:"Choose?",options:[{label:"Yes",value:"yes"},{label:"No",value:"no"}],createdAt:1});
+
+test("checker round2: a failed board effect remains pending with its error", async () => {
+  const host=await captainHost();
+  try {
+    checkerR2Card(host,"a000001");
+    host.harness.sdk.stub("plugins.callRpc",async (call: {method:string}) => {if(call.method==="refreshBoard") throw new Error("board offline");return {ok:true,queued:1,mode:"on"};});
+    await checkerR2Tap(host,"a000001");await afterDispatch();
+    const pending=asks(host).pendingFollowUps();
+    console.log("CHECKER R2 failed board",JSON.stringify(pending));
+    assert.ok(pending.some(job=>job.askId==="a000001"&&job.effect==="refresh-board"&&job.error?.includes("board offline")),"failed board refresh must stay pending and expose its error");
+  } finally {await host.harness.lifecycle.dispose();}
+});
+
+test("checker round2: an unresponsive board cannot starve another card's proof work", async () => {
+  const host=await captainHost();
+  let release = () => {};
+  const blocked = new Promise<void>(resolve => { release=resolve; });
+  try {
+    checkerR2Card(host,"a000001");
+    host.harness.sdk.stub("plugins.callRpc", async (call: {method:string}) => {if(call.method==="refreshBoard") await blocked;return {ok:true,queued:1,mode:"on"};});
+    await checkerR2Tap(host,"a000001");await afterDispatch();
+    asks(host).create({id:"a000002",captain:"thr_cap",kind:"question",text:"Does build 22 work?",options:[{label:"Works",value:"works"},{label:"Does not work",value:"no"}],createdAt:2});
+    await host.bb.storage.kv.set("device-proof:a000002",{captain:"thr_cap",pr:"owner/repo#2",head:"a".repeat(40),build:"22",crewId:"crew1",surface:"iphone"});
+    await checkerR2Tap(host,"a000002","b.");await afterDispatch();
+    console.log("CHECKER R2 blocked board",JSON.stringify({secondAnswer:asks(host).get("a000002")?.resolution,pending:asks(host).pendingFollowUps()}));
+    assert.equal(await host.bb.storage.kv.get("device-proof:a000002"),undefined,"another card's proof effect must run even when an earlier board request never answers");
+  } finally {release();await afterDispatch();await host.harness.lifecycle.dispose();}
+});
+
+test("checker round2: connector RPC followed by restart refreshes the board only once", async () => {
+  const host=await captainHost();
+  let next: Host | undefined;
+  try {
+    checkerR2Card(host,"a000001");
+    host.harness.sdk.stub("threads.getPluginMetadata",async()=>({captain:"true"}));
+    let refreshes=0;
+    host.harness.sdk.stub("plugins.callRpc",async (call: {method:string})=>{if(call.method==="refreshBoard")refreshes++;return {ok:true,queued:1,mode:"on"};});
+    await host.harness.behavior.callRpc("resolveAsk",{threadId:"thr_cap",id:"a000001",resolution:"Yes"});
+    const first=refreshes;
+    next=await host.harness.lifecycle.reload(plugin);await afterDispatch();
+    // Each host has separate SDK inspection history.
+    const after=rpcCalls(next).filter(call=>call.method==="refreshBoard").length;
+    console.log("CHECKER R2 RPC restart",JSON.stringify({first,after}));
+    await checkerR2Tap(next,"a000001");await afterDispatch();
+    assert.equal(first+rpcCalls(next).filter(call=>call.method==="refreshBoard").length,1,"the immediate RPC refresh must not be repeated by the durable drain");
+  } finally {if(next) await next.harness.lifecycle.dispose();await host.harness.lifecycle.dispose();}
+});
+
+test("checker round2: a pending Works confirmation survives a restart", async () => {
+  const host=await captainHost();let next: Host | undefined;
+  const oldDelay=process.env.FM_PROOF_RECHECK_MS;process.env.FM_PROOF_RECHECK_MS="60000";
+  try {
+    asks(host).create({id:"a000001",captain:"thr_cap",kind:"question",text:"Does build 21 work?",options:[{label:"Works",value:"works"},{label:"Does not work",value:"no"}],createdAt:1});
+    await host.bb.storage.kv.set("device-proof:a000001",{captain:"thr_cap",pr:"owner/repo#1",head:"a".repeat(40),build:"21",crewId:"crew1",surface:"iphone"});
+    host.harness.sdk.stub("plugins.callRpc",async (call: {method:string})=>call.method==="ownerAnswer"?{answer:null}:{ok:true,queued:1,mode:"on"});
+    await checkerR2Tap(host,"a000001");await afterDispatch();
+    assert.ok(await host.bb.storage.kv.get("device-proof:a000001"));
+    console.log("CHECKER R2 unconfirmed Works",JSON.stringify({pending:asks(host).pendingFollowUps(),states:host.bb.storage.database().prepare("SELECT effect,state,error FROM owner_ask_followup").all()}));
+    next=await host.harness.lifecycle.reload(plugin);await afterDispatch();
+    assert.ok(asks(next).pendingFollowUps().some(job=>job.askId==="a000001"&&job.effect==="owner-answered"),"Works waiting for confirmation must retain durable work across restart, not only a timer");
+  } finally {if(next) await next.harness.lifecycle.dispose();await host.harness.lifecycle.dispose();if(oldDelay===undefined)delete process.env.FM_PROOF_RECHECK_MS;else process.env.FM_PROOF_RECHECK_MS=oldDelay;}
+});
