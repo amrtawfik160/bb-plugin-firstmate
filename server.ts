@@ -9665,11 +9665,51 @@ export default async function plugin(bb: BbPluginApi) {
       return { status: "completed" };
     }
     if (ask?.sourceRef?.startsWith("crew-wait:") && resolution) {
-      // SDK has no idempotent-send key: record card+seq before the queue call so restart
-      // does not enqueue a correction the crew queue already accepted.
       const sentKey = `owner-answer-sent:${ask.id}:${answerSeq}`;
-      if (await bb.storage.kv.get(sentKey) !== undefined) return { status: "completed" };
+      const marker = `askref:${ask.id}:${answerSeq}`;
+      type AnswerSend = { state?: "sending" | "delivered" | "unknown"; marker?: string; threadId?: string; at?: number };
+      const sendState = (row: AnswerSend | undefined) =>
+        row === undefined ? undefined : row.state === "delivered" || row.state === "unknown" || row.state === "sending" ? row.state : "sending";
+      const record = await bb.storage.kv.get<AnswerSend>(sentKey);
+      const prior = sendState(record);
+      if (prior === "delivered") return { status: "completed" };
+      const writeSend = (state: "sending" | "delivered" | "unknown", threadId?: string) =>
+        bb.storage.kv.set(sentKey, { state, marker: record?.marker ?? marker, threadId: threadId ?? record?.threadId, at: Date.now() });
+      const discover = async (threadId: string) => {
+        try {
+          const events = await raceAbort(bb.sdk.threads.events.list({
+            threadId, order: "desc", limit: "100", types: ["item/completed"],
+          }), undefined, STUCK_HOST_CALL_MS);
+          const queued = await raceAbort(bb.sdk.threads.queuedMessages.list({ threadId }), undefined, STUCK_HOST_CALL_MS);
+          const needle = record?.marker ?? marker;
+          const hit = (value: unknown) => JSON.stringify(value).includes(needle);
+          if (events.some(hit) || queued.some((row) => {
+            const item = row as { failureReason?: unknown; content?: unknown };
+            return !item.failureReason && hit(item.content ?? row);
+          })) return "found" as const;
+          if (events.length >= 100) return "unknown" as const;
+          return "absent" as const;
+        } catch {
+          return "unknown" as const;
+        }
+      };
+      const settleUnknown = async (threadId: string): Promise<FollowUpResult> => {
+        await writeSend("unknown", threadId);
+        const found = await discover(threadId);
+        if (found === "found") {
+          await writeSend("delivered", threadId);
+          return { status: "completed" };
+        }
+        if (found === "absent") {
+          await bb.storage.kv.delete(sentKey).catch(() => {});
+          return { status: "retryable", error: "crew queue does not have this owner answer" };
+        }
+        return { status: "retryable", error: "could not confirm the owner's answer reached the crew" };
+      };
       try {
+        if ((prior === "sending" || prior === "unknown") && typeof record?.threadId === "string" && record.threadId) {
+          return settleUnknown(record.threadId);
+        }
         const result = await applyAskNativeHold(ask, resolution, `owner-answer-native:${ask.id}:${answerSeq}`, "owner answer hold");
         if (result === "shared") return { status: "retryable", error: "native hold still shared with another question" };
         if (result === "applied") return { status: "completed" };
@@ -9686,21 +9726,36 @@ export default async function plugin(bb: BbPluginApi) {
         if (crew === undefined || crew.parentThreadId !== ask.captain) {
           return { status: "retryable", error: "crew not found for steering queue" };
         }
+        if (prior === "sending" || prior === "unknown") return settleUnknown(crew.threadId);
         const text = result === "steer"
           ? await nativeCorrectionText(ask, crew, previous, resolution)
           : `The owner answered card ${ask.id}: ${resolution}`;
         try {
-          await bb.storage.kv.set(sentKey, { at: Date.now() });
+          await writeSend("sending", crew.threadId);
           await bb.sdk.threads.send({
             threadId: crew.threadId,
             senderThreadId: crew.parentThreadId ?? undefined,
             mode: "queue-if-active",
-            input: [{ type: "text", text: text.slice(0, MAX_TASK), mentions: [] }],
+            input: [
+              { type: "text", text: text.slice(0, MAX_TASK), mentions: [] },
+              { type: "text", text: marker, mentions: [] },
+            ],
+            pluginSubmission: { pluginId: "firstmate", data: { correlation: marker, askId: ask.id, answerSeq } },
           });
+          await writeSend("delivered", crew.threadId);
           return { status: "completed" };
         } catch (error) {
-          await bb.storage.kv.delete(sentKey).catch(() => {});
-          return { status: "retryable", error: error instanceof Error ? error.message : String(error) };
+          await writeSend("unknown", crew.threadId);
+          const found = await discover(crew.threadId);
+          if (found === "found") {
+            await writeSend("delivered", crew.threadId);
+            return { status: "completed" };
+          }
+          if (found === "absent") {
+            await bb.storage.kv.delete(sentKey).catch(() => {});
+            return { status: "retryable", error: error instanceof Error ? error.message : String(error) };
+          }
+          return { status: "retryable", error: "could not confirm the owner's answer reached the crew" };
         }
       } catch (error) {
         return { status: "retryable", error: error instanceof Error ? error.message : String(error) };
@@ -9736,7 +9791,10 @@ export default async function plugin(bb: BbPluginApi) {
       } catch (error) {
         bb.log.warn(`ask follow-up drain ${askId}: ${String(error)}`);
       }
-    })).then(() => tellFailedAskFollowUps());
+    })).then(async () => {
+      await tellFailedAskFollowUps();
+      await tellUnconfirmedAskFollowUps();
+    });
   }
 
   async function tellFailedAskFollowUps(): Promise<void> {
@@ -9757,6 +9815,40 @@ export default async function plugin(bb: BbPluginApi) {
         ownerAsks.claimFollowUpNotice(job.askId, job.effect, job.answerSeq);
       } catch (error) {
         bb.log.warn(`ask follow-up failed notice ${job.askId}: ${String(error)}`);
+      }
+    }
+  }
+
+  const unconfirmedAskNotices = new Set<string>();
+  async function tellUnconfirmedAskFollowUps(): Promise<void> {
+    for (const job of ownerAsks.pendingFollowUps()) {
+      if (job.effect !== "owner-answered") continue;
+      const toldKey = `owner-answer-unconfirmed:${job.askId}:${job.answerSeq}`;
+      if (unconfirmedAskNotices.has(toldKey)) continue;
+      unconfirmedAskNotices.add(toldKey);
+      const rec = await bb.storage.kv.get<{ state?: string }>(`owner-answer-sent:${job.askId}:${job.answerSeq}`);
+      if (rec?.state !== "unknown") {
+        unconfirmedAskNotices.delete(toldKey);
+        continue;
+      }
+      if (await bb.storage.kv.get(toldKey) !== undefined) continue;
+      const ask = ownerAsks.get(job.askId);
+      const crewId = crewIdFromWaitRef(ask?.sourceRef);
+      if (!ask || !crewId) {
+        await bb.storage.kv.set(toldKey, { at: Date.now() });
+        continue;
+      }
+      try {
+        await bb.storage.kv.set(toldKey, { at: Date.now() });
+        await bb.sdk.threads.send({
+          threadId: ask.captain,
+          mode: "steer",
+          input: [{ type: "text", text: `Could not confirm the owner's answer on card ${ask.id} reached crew ${crewId}.`, mentions: [], visibility: "agent-only" }],
+        });
+      } catch (error) {
+        unconfirmedAskNotices.delete(toldKey);
+        await bb.storage.kv.delete(toldKey).catch(() => {});
+        bb.log.warn(`ask follow-up unconfirmed notice ${job.askId}: ${String(error)}`);
       }
     }
   }
@@ -16183,12 +16275,16 @@ export default async function plugin(bb: BbPluginApi) {
         // Owner decision Q5: merged work that production does not run yet, with its next step and who takes it.
         const status = await liveStatusOf(threadId);
         const notLive = notLiveItems(tasks, (task) => planOf(ruleOf(task, deliveries.forTasks(task.crewIds, task.prs)), status), now);
-        const undelivered = ownerAsks.failedFollowUps().flatMap((job) => {
-          if (job.effect !== "owner-answered") return [];
+        const undelivered: { crewId: string }[] = [];
+        for (const job of [...ownerAsks.failedFollowUps(), ...ownerAsks.pendingFollowUps()]) {
+          if (job.effect !== "owner-answered") continue;
           const ask = ownerAsks.get(job.askId);
           const crewId = crewIdFromWaitRef(ask?.sourceRef);
-          return ask?.captain === threadId && crewId ? [{ crewId }] : [];
-        });
+          if (!ask || ask.captain !== threadId || !crewId) continue;
+          if (job.state === "failed") { undelivered.push({ crewId }); continue; }
+          const rec = await bb.storage.kv.get<{ state?: string }>(`owner-answer-sent:${job.askId}:${job.answerSeq}`);
+          if (rec?.state === "unknown" || rec?.state === "sending") undelivered.push({ crewId });
+        }
         const input: BoardInput = { asks: ownerAsks.listWaiting(threadId, now), undelivered, calls: snapshot.rpc.ownerCalls, tasks, records: [...records.values()], programs: programs.list(threadId), notLive, since: from, now };
         if (command === "board") {
           // The running crews per project, for the connector's board in each project topic. Always sent:

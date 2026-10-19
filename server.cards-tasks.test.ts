@@ -567,6 +567,8 @@ test("a correction to a resolved native question stays pending until the crew qu
     status.wait1 += "resolved [key=choice]: Postgres\n";
     let failSteer = true;
     const realSend = async () => ({ delivery: "queued" as const });
+    host.harness.sdk.stub("threads.events.list", async () => []);
+    host.harness.sdk.stub("threads.queuedMessages.list", async () => []);
     host.harness.sdk.stub("threads.send", async (input: { threadId: string; input: Array<{ text: string }> }) => {
       if (failSteer && input.threadId === "thr_w1" && JSON.stringify(input).includes("SQLite")) throw new Error("queue down");
       return realSend();
@@ -778,7 +780,7 @@ async function checkerReload(previous: Awaited<ReturnType<typeof captainHost>>["
   next.harness.sdk.stub("terminals.close",async()=>({}));
   next.harness.sdk.stub("terminals.output",async({terminalId}: {terminalId:string})=>{
     const command=byId.get(terminalId)??"";
-    const payload=command.includes("/native/state/wait1.status")?statusText:"";
+    const payload=command.includes("fm-bearings-snapshot.sh")?JSON.stringify({schema:"fm-bearings.v1",home:"/native",in_flight:[],decisions_open:[],landed:[],gates:[],omitted:[]}):command.includes("/native/state/wait1.status")?statusText:"";
     const code=command.includes("fm-captain-hold.sh")&&command.includes("'open'")&&command.includes("'wait1'")?1:0;
     const captured=command.includes("FM_HOST_CAPTURE_V1");
     const out=captured?JSON.stringify({protocol:"FM_HOST_CAPTURE_V1",exitCode:code,stdout:payload,stderr:""}):payload;
@@ -887,6 +889,41 @@ test("checker round8: a migrated pending answer keeps its value when the owner c
   await checkerAcceptCorrection(host,card.id,"B");await host.harness.behavior.runSchedule("task-lifecycle");console.log("CHECKER R8 legacy pending correction",JSON.stringify(received));
   assert.deepEqual(received,[`The owner answered card ${card.id}: A`,`The owner answered card ${card.id}: B`],"each accepted answer must retain its own value across upgrade and correction");
  }finally{await host.harness.lifecycle.dispose();restore();}
+});
+
+const checkerCrewSends=(host:Awaited<ReturnType<typeof captainHost>>["host"],target="thr_w1")=>host.harness.sdk.callsTo("threads.send").map(call=>call[0] as {threadId:string;input:Array<{text:string}>}).filter(call=>call.threadId===target);
+
+test("checker round9: restart after recording identity but before sending cannot silently lose the correction",async()=>{
+ const {host,asks,card,state,restore}=await checkerCorrectionFixture();let next;let release=()=>{};const gate=new Promise<void>(resolve=>{release=resolve;});let recorded=false;let first:Promise<unknown>|undefined;
+ const originalSet=host.bb.storage.kv.set.bind(host.bb.storage.kv);
+ try{
+  host.bb.storage.kv.set=async(key,value)=>{await originalSet(key,value);if(key===`owner-answer-sent:${card.id}:2`){recorded=true;await gate;}};
+  first=checkerAcceptCorrection(host,card.id,"SQLite").catch(()=>{});for(let i=0;i<40&&!recorded;i++)await new Promise(resolve=>setImmediate(resolve));assert.equal(recorded,true);assert.equal(checkerCrewSends(host).length,0,"crash boundary is before the queue call");assert.ok(asks.pendingFollowUps().some(job=>job.answerSeq===2&&job.effect==="owner-answered"));
+  next=await checkerReload(host,state.text);next.harness.sdk.stub("threads.send",async()=>({delivery:"queued"}));for(let i=0;i<12;i++)await new Promise(resolve=>setImmediate(resolve));await next.harness.behavior.runSchedule("task-lifecycle");
+  const store=createOwnerAsks(next.bb.storage.database());const board=await next.harness.behavior.callRpc("telegramCommand",{threadId:"thr_cap",command:"board"});const captain=checkerCrewSends(next,"thr_cap").map(send=>send.input[0].text).join("\n");const delivered=checkerCrewSends(next).length;const unknown=/answer.*(?:unknown|uncertain|not delivered)|(?:unknown|uncertain).*delivery|could not confirm.*(?:answer|correction)/i;
+  console.log("CHECKER R9 before send",JSON.stringify({recorded,delivered,pending:store.pendingFollowUps(),failed:store.failedFollowUps(),captain,board}));
+  assert.ok(delivered===1||(unknown.test(captain)&&unknown.test(JSON.stringify(board))),"a recorded-but-unsent identity must recover delivery or expose uncertainty to both captain and owner");
+ }finally{release();if(first)await first;if(next)await next.harness.lifecycle.dispose();await host.harness.lifecycle.dispose();restore();}
+});
+
+test("checker round9: queue acceptance followed by a lost response cannot duplicate on retry",async()=>{
+ const {host,asks,card,restore}=await checkerCorrectionFixture();const accepted:string[]=[];
+ try{
+  host.harness.sdk.stub("threads.send",async(input:{threadId:string;input:Array<{text:string}>})=>{if(input.threadId==="thr_w1"){accepted.push(input.input[0].text);if(accepted.length===1)throw new Error("transport lost the response after queue acceptance");}return {delivery:"queued"};});
+  await checkerAcceptCorrection(host,card.id,"SQLite");assert.equal(accepted.length,1);assert.ok(asks.pendingFollowUps().some(job=>job.answerSeq===2&&job.effect==="owner-answered"));await host.harness.behavior.runSchedule("task-lifecycle");
+  console.log("CHECKER R9 lost response",JSON.stringify({accepted,pending:asks.pendingFollowUps(),failed:asks.failedFollowUps()}));assert.equal(accepted.length,1,"uncertain send result must be reconciled or reported, not blindly retried");
+ }finally{await host.harness.lifecycle.dispose();restore();}
+});
+
+test("checker round9: restart after send response before closing its row does not duplicate",async()=>{
+ const {host,asks,card,state,restore}=await checkerCorrectionFixture();let next;let accepted=0;const db=host.bb.storage.database();const originalPrepare=db.prepare.bind(db);let blocked=0;
+ try{
+  host.harness.sdk.stub("threads.send",async(input:{threadId:string})=>{if(input.threadId==="thr_w1")accepted++;return {delivery:"queued"};});
+  db.prepare=(sql)=>{const stmt=originalPrepare(sql);if(sql.startsWith("UPDATE owner_ask_followup SET state='done'")){const run=stmt.run.bind(stmt);stmt.run=(...params)=>{if(params[0]===card.id&&params[1]===2&&params[2]==="owner-answered"){blocked++;throw new Error("crash boundary before closing the delivered row");}return run(...params);};}return stmt;};
+  await checkerAcceptCorrection(host,card.id,"SQLite");db.prepare=originalPrepare;assert.equal(accepted,1);assert.equal(blocked,1);assert.ok(asks.pendingFollowUps().some(job=>job.answerSeq===2&&job.effect==="owner-answered"));
+  next=await checkerReload(host,state.text);next.harness.sdk.stub("threads.send",async(input:{threadId:string})=>{if(input.threadId==="thr_w1")accepted++;return {delivery:"queued"};});for(let i=0;i<12;i++)await new Promise(resolve=>setImmediate(resolve));await next.harness.behavior.runSchedule("task-lifecycle");
+  assert.equal(accepted,1);assert.equal(checkerCrewSends(next).length,0);assert.equal(createOwnerAsks(next.bb.storage.database()).pendingFollowUps().length,0);
+ }finally{db.prepare=originalPrepare;if(next)await next.harness.lifecycle.dispose();await host.harness.lifecycle.dispose();restore();}
 });
 
 test("checker round3: failed prose-question notice is retried until a card can be made", async () => {
