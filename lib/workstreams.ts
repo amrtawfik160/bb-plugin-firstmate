@@ -1,26 +1,65 @@
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { workstreamSchema, type Workstream, type WorkstreamRepo, type WorkstreamJob, type topicSchema } from './workstream-schema.ts';
+import { workstreamSchema, type Workstream, type WorkstreamRepo, type WorkstreamJob, type FoldStep, type ShipSnapshot, type topicSchema } from './workstream-schema.ts';
+import {
+  compactTaskLine,
+  crewOwnTestsPassed,
+  currentJobs,
+  FAILED_KEEP_MS,
+  FOLD_CONFLICT_TELL,
+  foldTouchesDevFiles,
+  formatWorkstreamLookup,
+  isAdoptedWorkstream,
+  jobToCardState,
+  memoryIsLow,
+} from './workstream-fold.ts';
 
 export class WorkstreamWaiting extends Error {}
 
 export const DEV_IDLE_MS = 2 * 60 * 60_000;
 export const UNSHIPPED_MS = 2 * 24 * 60 * 60_000;
 export { workstreamSchema, topicSchema } from './workstream-schema.ts';
-export type { Workstream, WorkstreamRepo, WorkstreamJob } from './workstream-schema.ts';
+export type { Workstream, WorkstreamRepo, WorkstreamJob, FoldStep, ShipSnapshot } from './workstream-schema.ts';
+export { isAdoptedWorkstream } from './workstream-fold.ts';
 type Database = { exec(sql: string): unknown; prepare(sql: string): { run(...args: unknown[]): unknown; all(...args: unknown[]): unknown[] } };
+/** A fold done in one step, without a saved per-repository transaction. */
+export type FoldResult = { ok: boolean; conflict: boolean; files: string[]; wait?: string };
+/** Per-repository Git steps of a fold. The service saves each step, so a restart can finish or undo it. */
+export type FoldOps = {
+  /** Read-only: one step per repository of the task, or why the fold must wait. */
+  plan: (w: Workstream, job: WorkstreamJob) => Promise<{ steps: FoldStep[] } | { wait: string }>;
+  merge: (w: Workstream, step: FoldStep) => Promise<{ kind: 'merged'; after: string; files: string[] } | { kind: 'conflict' } | { kind: 'wait'; reason: string }>;
+  /** The workstream head, whether it holds the task commit, and the files changed since the step's `before`. */
+  inspect: (w: Workstream, step: FoldStep) => Promise<{ head: string; hasTarget: boolean; files: string[] }>;
+  /** False when the undo must wait, for example for a local change in a file the fold changed. */
+  rollback: (w: Workstream, step: FoldStep) => Promise<boolean>;
+};
+/** Nothing when the crew was archived; `kept` when it must stay for now. */
+export type ArchiveOutcome = void | { kept: string; findings?: string[] };
+
+/** The folded work a Ship request takes: folded task crews not shipped before, and their tasks. */
+export function shipSnapshotOf(w: Pick<Workstream, 'jobs'> & { ship?: { snapshot?: ShipSnapshot } }): ShipSnapshot {
+  if (w.ship?.snapshot) return w.ship.snapshot;
+  // Crews from before task worktrees edited the workstream worktree itself, so a finished one is in it.
+  const jobs = w.jobs.filter((j) => j.editing && !j.shipped && (j.state === 'folded' || (!j.isolated && j.state === 'finished')));
+  return { jobs: jobs.map((j) => j.id), taskIds: [...new Set(jobs.flatMap((j) => (j.taskId ? [j.taskId] : [])))], heads: {} };
+}
 export type WorkstreamDeps = {
   now: () => number;
   supportsDevLink?: (projectId: string) => Promise<boolean>;
   provision: (w: Workstream) => Promise<WorkstreamRepo[]>;
   start: (w: Workstream, job: WorkstreamJob) => Promise<string>;
+  /** The task crew's own BB-managed checkout, once BB has created it; null until then. */
+  checkout?: (w: Workstream, job: WorkstreamJob) => Promise<Partial<WorkstreamJob> | null>;
   status: (threadId: string) => Promise<string>;
   startDev: (w: Workstream) => Promise<string>;
   devRunning?: (w: Workstream) => Promise<boolean>;
   devActivity?: (w: Workstream) => Promise<number>;
   stopDev: (w: Workstream) => Promise<void>;
   unsaved: (repo: WorkstreamRepo) => Promise<string[]>;
-  remove: (repo: WorkstreamRepo) => Promise<void>;
+  /** Why End must keep this workstream worktree (another thread still uses it); null when it may go. */
+  keepWorktree?: (w: Workstream, repo: WorkstreamRepo) => Promise<string | null>;
+  remove: (repo: WorkstreamRepo, w: Workstream) => Promise<void>;
   ship: (w: Workstream) => Promise<void>;
   taskState: (id: string) => string | undefined;
   busy?: (w: Workstream) => Promise<boolean>;
@@ -28,7 +67,40 @@ export type WorkstreamDeps = {
   waiting?: (w: Workstream) => Promise<void>;
   stall?: (w: Workstream) => Promise<boolean>;
   error?: (w: Workstream, error: unknown) => void;
+  memAvailable?: () => Promise<number>;
+  report?: (w: Workstream, job: WorkstreamJob) => Promise<string>;
+  fold?: (w: Workstream, job: WorkstreamJob) => Promise<FoldResult>;
+  foldOps?: FoldOps;
+  tell?: (w: Workstream, job: WorkstreamJob, message: string) => Promise<void>;
+  archive?: (w: Workstream, job: WorkstreamJob) => Promise<ArchiveOutcome>;
+  deleteBranch?: (w: Workstream, job: WorkstreamJob) => Promise<void>;
+  unsavedJob?: (w: Workstream, job: WorkstreamJob) => Promise<string[]>;
+  restartDev?: (w: Workstream) => Promise<void>;
+  card?: (w: Workstream) => Promise<void>;
+  signal?: AbortSignal;
 };
+
+type JobSubmit = Pick<WorkstreamJob, 'id' | 'editing' | 'payload'> & Partial<Pick<WorkstreamJob, 'taskId' | 'followUpOf' | 'title' | 'model' | 'environmentId' | 'path' | 'branch' | 'repos' | 'repository' | 'baseBranch'>>;
+
+function keptUnsaved(job: WorkstreamJob): boolean {
+  return job.state === 'kept-unsaved' || job.cleanup === 'kept-unsaved';
+}
+
+function jobClosed(job: WorkstreamJob): boolean {
+  if (keptUnsaved(job) || job.cleanup === 'pending') return false;
+  // Scouts, adopted editors, and editors saved before task worktrees close as before: when finished.
+  if (!job.isolated) return job.state === 'finished' || job.state === 'dropped' || job.state === 'folded';
+  return job.state === 'folded' || job.state === 'dropped' || job.state === 'failed';
+}
+
+function briefOf(job: WorkstreamJob): string {
+  try {
+    const task = JSON.parse(job.payload) as { task?: unknown };
+    return typeof task.task === 'string' ? task.task : '';
+  } catch {
+    return '';
+  }
+}
 
 export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
   db.exec('CREATE TABLE IF NOT EXISTS firstmate_workstream (id TEXT PRIMARY KEY, record TEXT NOT NULL)');
@@ -60,26 +132,291 @@ export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
     if (!w.provisioned) throw new Error('Workstream provisioning is incomplete; retry creation with its requestId.');
     return w;
   };
-  async function drain(w: Workstream) {
-    for (const job of w.jobs.filter((j) => j.state === 'running')) {
-      const status = job.threadId ? await deps.status(job.threadId) : 'unknown';
-      if (status === 'idle' || status === 'archived' || status === 'error' || status === 'failed') { job.state = 'finished'; save(w); }
+  async function bumpCard(w: Workstream) {
+    w.cardRevision = (w.cardRevision ?? 0) + 1;
+    w.updatedAt = deps.now();
+    save(w);
+    try { await deps.card?.(w); } catch (error) { deps.error?.(w, error); }
+  }
+  async function rejectFold(w: Workstream, job: WorkstreamJob) {
+    job.state = 'running';
+    job.error = FOLD_CONFLICT_TELL;
+    await bumpCard(w);
+    await deps.tell?.(w, job, FOLD_CONFLICT_TELL);
+  }
+  async function waitToFold(w: Workstream, job: WorkstreamJob, reason: string) {
+    job.state = 'finished';
+    job.note = `waiting: ${reason}`;
+    await bumpCard(w);
+  }
+  // The fold has landed in every repository (job.fold committed). The dev link restart follows the
+  // landed fold, whatever later happens to the task's worktree cleanup.
+  async function finishFold(w: Workstream, job: WorkstreamJob) {
+    const files = job.fold?.files ?? job.files ?? [];
+    if (job.state !== 'folded') {
+      job.state = 'folded';
+      job.files = files;
+      job.foldedAt = deps.now();
+      job.cleanup = 'pending';
+      delete job.error;
+      delete job.note;
+      await bumpCard(w);
     }
-    for (const job of w.jobs) {
-      if (job.state !== 'queued' && job.state !== 'starting') continue;
-      if (job.editing && w.jobs.some((j) => j.id !== job.id && j.editing && (j.state === 'running' || j.state === 'starting'))) continue;
-      if (job.editing && (w.ship.state === 'running' || w.ship.state === 'queued')) continue;
-      if (job.editing && await (deps.editorBusy ?? deps.busy)?.(w)) continue;
-      job.state = 'starting'; save(w);
+    if (!job.fold) return;
+    if (foldTouchesDevFiles(files) && w.devLink.state === 'running' && deps.restartDev) {
+      try { await deps.restartDev(w); } catch (error) { deps.error?.(w, error); }
+    }
+    delete job.fold;
+    save(w);
+  }
+  async function foldOnce(w: Workstream, job: WorkstreamJob, fold: NonNullable<WorkstreamDeps['fold']>) {
+    job.state = 'folding';
+    await bumpCard(w);
+    try {
+      const result = await fold(w, job);
+      if (result.ok) {
+        job.fold = { state: 'committed', steps: [], files: result.files };
+        await finishFold(w, job);
+      } else if (result.wait) await waitToFold(w, job, result.wait);
+      else await rejectFold(w, job);
+    } catch (error) {
+      job.state = 'finished';
+      job.error = String(error);
+      save(w);
+      deps.error?.(w, error);
+    }
+  }
+  async function startFold(w: Workstream, job: WorkstreamJob, ops: FoldOps) {
+    let plan: Awaited<ReturnType<FoldOps['plan']>>;
+    try { plan = await ops.plan(w, job); }
+    catch (error) { deps.error?.(w, error); return; }
+    if ('wait' in plan) {
+      if (job.note !== `waiting: ${plan.wait}`) await waitToFold(w, job, plan.wait);
+      return;
+    }
+    // Saved before any Git change, so a restart finds every repository and its original head.
+    job.fold = { state: 'merging', steps: plan.steps.map((step) => ({ ...step, state: 'pending' as const })) };
+    job.state = 'folding';
+    delete job.note;
+    await bumpCard(w);
+    await advanceFold(w, job, ops);
+  }
+  async function advanceFold(w: Workstream, job: WorkstreamJob, ops: FoldOps) {
+    const fold = job.fold!;
+    try {
+      if (fold.state === 'merging') {
+        for (const step of fold.steps) {
+          if (step.state !== 'pending') continue;
+          const result = await ops.merge(w, step);
+          if (result.kind === 'merged') {
+            step.state = 'merged';
+            step.after = result.after;
+            fold.files = [...(fold.files ?? []), ...result.files];
+            save(w);
+            continue;
+          }
+          fold.state = 'rolling-back';
+          fold.reason = result.kind;
+          if (result.kind === 'wait') job.note = `waiting: ${result.reason}`;
+          save(w);
+          break;
+        }
+        if (fold.state === 'merging') {
+          fold.state = 'committed';
+          save(w);
+          await finishFold(w, job);
+          return;
+        }
+      }
+      if (fold.state !== 'rolling-back') return;
+      for (const step of [...fold.steps].reverse()) {
+        if (step.state !== 'merged') continue;
+        if (!(await ops.rollback(w, step))) {
+          job.note = 'fold undo waits: the workstream worktree changed';
+          save(w);
+          return;
+        }
+        step.state = 'rolled-back';
+        save(w);
+      }
+      const reason = fold.reason;
+      delete job.fold;
+      if (reason === 'conflict') await rejectFold(w, job);
+      else if (reason === 'wait') await waitToFold(w, job, job.note?.replace(/^waiting: /, '') ?? 'the workstream worktree is busy');
+      else { job.state = 'finished'; await bumpCard(w); }
+    } catch (error) {
+      // A host command's outcome is unknown: the saved transaction is checked again on the next pass.
+      save(w);
+      deps.error?.(w, error);
+    }
+  }
+  // A job saved as folding was interrupted (restart or a host error) or its undo had to wait. Finish a
+  // fold that verifiably landed in every repository; otherwise undo every repository it changed.
+  async function recoverFold(w: Workstream, job: WorkstreamJob) {
+    const fold = job.fold;
+    if (!fold) { job.state = 'finished'; await bumpCard(w); return; }
+    const ops = deps.foldOps;
+    if (!ops) return;
+    if (fold.state === 'merging') {
+      // The changed files are read again from each saved original head, so a landed fold whose result
+      // was lost still restarts the dev link and shows its files.
+      const files = new Set<string>();
       try {
-        job.threadId = await deps.start(w, job);
-        job.state = 'running'; delete job.error; save(w);
-      } catch (error) {
-        job.error = String(error); save(w);
-        // A failed spawn may already have created a thread. Keep its editing reservation and retry its identity.
-        throw error;
+        for (const step of fold.steps) {
+          const seen = await ops.inspect(w, step);
+          if (seen.hasTarget) { step.state = 'merged'; step.after ??= seen.head; for (const file of seen.files) files.add(file); }
+          else step.state = 'pending';
+        }
+      } catch (error) { deps.error?.(w, error); return; }
+      if (fold.steps.every((step) => step.state === 'merged')) {
+        fold.files = [...files];
+        fold.state = 'committed';
+        save(w);
+        await finishFold(w, job);
+        return;
+      }
+      fold.state = 'rolling-back';
+      fold.reason = 'restart';
+      save(w);
+    }
+    await advanceFold(w, job, ops);
+  }
+  async function holdCleanup(w: Workstream, job: WorkstreamJob, cleanup: 'pending' | 'kept-unsaved', note: string) {
+    if (job.cleanup === cleanup && job.note === note) return;
+    job.cleanup = cleanup;
+    job.note = note;
+    await bumpCard(w);
+  }
+  // Retire a task crew after its fold, drop or 7 failed days. Nothing is archived while it holds unsaved
+  // work or the archive callback finds it still needed; both are retried on the next pass.
+  async function cleanUp(w: Workstream, job: WorkstreamJob, foldedWork: boolean, doneNote?: string) {
+    let findings: string[];
+    try { findings = deps.unsavedJob ? await deps.unsavedJob(w, job) : []; }
+    catch (error) { deps.error?.(w, error); findings = ['worktree check failed']; }
+    if (findings.length) return holdCleanup(w, job, 'kept-unsaved', `kept: unsaved work (${findings.join(', ')})`);
+    let outcome: ArchiveOutcome;
+    try { outcome = await deps.archive?.(w, job); }
+    catch (error) { deps.error?.(w, error); return holdCleanup(w, job, 'pending', `cleanup pending: ${error instanceof Error ? error.message : String(error)}`); }
+    if (outcome) {
+      return outcome.findings?.length
+        ? holdCleanup(w, job, 'kept-unsaved', `kept: unsaved work (${outcome.findings.join(', ')})`)
+        : holdCleanup(w, job, 'pending', `cleanup waits: ${outcome.kept}`);
+    }
+    if (foldedWork) {
+      try { await deps.deleteBranch?.(w, job); } catch (error) { deps.error?.(w, error); }
+    }
+    job.cleanup = 'done';
+    if (doneNote) job.note = doneNote; else delete job.note;
+    await bumpCard(w);
+  }
+  async function drain(w: Workstream) {
+    if (deps.signal?.aborted) return;
+    const created = !isAdoptedWorkstream(w);
+    for (const job of w.jobs) {
+      if (!job.isolated || !job.taskId || deps.taskState(job.taskId) !== 'dropped') continue;
+      if (job.state === 'dropped' || job.state === 'folded' || job.state === 'folding') continue;
+      job.state = 'dropped';
+      job.cleanup = job.threadId ? 'pending' : 'done';
+      await bumpCard(w);
+    }
+    for (const job of w.jobs.filter((j) => j.state === 'running')) {
+      if (job.isolated && !job.path && deps.checkout) {
+        try {
+          const checkout = await deps.checkout(w, job);
+          if (checkout) { Object.assign(job, checkout); save(w); }
+        } catch (error) { deps.error?.(w, error); }
+      }
+      const status = job.threadId ? await deps.status(job.threadId) : 'unknown';
+      if (status === 'idle' || status === 'archived' || status === 'error' || status === 'failed') {
+        if (job.isolated && (status === 'error' || status === 'failed' || status === 'archived')) {
+          job.state = 'failed';
+          job.failedAt = deps.now();
+        } else {
+          job.state = 'finished';
+        }
+        await bumpCard(w);
       }
     }
+    // A fold saved before a restart, or an undo that had to wait, finishes before any new fold. After the
+    // status poll, so a crew told about a conflict here is not seen idle and folded again in this pass.
+    for (const job of w.jobs) {
+      if (deps.signal?.aborted) return;
+      if (job.fold?.state === 'committed') await finishFold(w, job);
+      else if (job.state === 'folding') await recoverFold(w, job);
+    }
+    // One fold at a time: an undo that has to wait holds later folds, whose merges would move the branch.
+    if (created && w.ship.state !== 'running' && !w.jobs.some((j) => j.state === 'folding')) {
+      for (const job of w.jobs.filter((j) => j.isolated && j.state === 'finished')) {
+        if (deps.signal?.aborted) return;
+        const report = deps.report ? await deps.report(w, job) : job.report ?? '';
+        if (report) job.report = report;
+        if (!crewOwnTestsPassed(report) || (!deps.foldOps && !deps.fold)) { save(w); continue; }
+        if (deps.foldOps) await startFold(w, job, deps.foldOps);
+        else await foldOnce(w, job, deps.fold!);
+        if (job.state === 'folding') break;
+      }
+    }
+    for (const job of w.jobs) {
+      if (deps.signal?.aborted) return;
+      if (!job.isolated || job.cleanup === 'done') continue;
+      if ((job.state === 'folded' || job.state === 'dropped') && job.cleanup) await cleanUp(w, job, job.state === 'folded');
+      else if (job.state === 'failed' && job.failedAt != null && !job.supersededBy && deps.now() - job.failedAt >= FAILED_KEEP_MS) await cleanUp(w, job, false, 'archived after 7 days');
+    }
+    for (const job of w.jobs) {
+      if (deps.signal?.aborted) return;
+      if (job.state !== 'queued' && job.state !== 'starting' && job.state !== 'waiting-memory') continue;
+      // Adopted editors, and editors saved before task worktrees, share the workstream worktree: one at a time.
+      if (!created || (job.editing && !job.isolated)) {
+        if (job.editing && w.jobs.some((j) => j.id !== job.id && j.editing && (j.state === 'running' || j.state === 'starting'))) continue;
+        if (job.editing && (w.ship.state === 'running' || w.ship.state === 'queued')) continue;
+        if (job.editing && await (deps.editorBusy ?? deps.busy)?.(w)) continue;
+      } else if (job.state === 'queued' || job.state === 'waiting-memory') {
+        if (deps.memAvailable) {
+          try {
+            if (memoryIsLow(await deps.memAvailable())) {
+              if (job.state !== 'waiting-memory') {
+                job.state = 'waiting-memory';
+                await bumpCard(w);
+              }
+              continue;
+            }
+          } catch (error) {
+            deps.error?.(w, error);
+            continue;
+          }
+        }
+      }
+      if (job.state === 'queued' || job.state === 'waiting-memory') {
+        job.state = 'starting';
+        await bumpCard(w);
+      }
+      try {
+        job.threadId = await deps.start(w, job);
+        job.state = 'running';
+        delete job.error;
+        await bumpCard(w);
+      } catch (error) {
+        job.error = String(error);
+        save(w);
+        if (!created) throw error;
+      }
+    }
+  }
+  // A created workstream's Ship takes the folded work present when it starts; a retry of the same
+  // request keeps that snapshot, and later folds wait for the next Ship.
+  function beginShip(w: Workstream, requestId: string) {
+    const snapshot = isAdoptedWorkstream(w) ? undefined
+      : w.ship.requestId === requestId && w.ship.snapshot ? w.ship.snapshot : shipSnapshotOf({ jobs: w.jobs });
+    w.ship = { state: 'running', requestId, ...(snapshot ? { snapshot } : {}) };
+    save(w);
+  }
+  function completeShip(w: Workstream) {
+    for (const id of w.ship.snapshot?.jobs ?? []) {
+      const job = w.jobs.find((j) => j.id === id);
+      if (job) job.shipped = w.ship.requestId ?? '';
+    }
+    w.ship.state = 'complete';
+    delete w.ship.error;
   }
   async function stop(w: Workstream) {
     if (w.devLink.state === 'stopped') return;
@@ -90,18 +427,21 @@ export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
       if (w.state === 'ended') return w;
       if (await deps.busy?.(w)) throw new Error('Workstream still has active crews.');
       if (w.ship.state === 'running' || w.ship.state === 'queued') throw new Error('Ship is still running.');
-      if (w.jobs.some((j) => j.state !== 'finished')) throw new Error('Workstream still has crews or queued tasks.');
+      if (w.jobs.some((j) => !jobClosed(j) && !keptUnsaved(j))) throw new Error('Workstream still has crews, queued tasks or task cleanup.');
+      if (w.jobs.some(keptUnsaved)) throw new Error(`Unsaved work: ${w.jobs.filter(keptUnsaved).map((j) => j.note ?? j.id).join(', ')}`);
       if (w.taskIds.some((id) => !['live', 'dropped'].includes(deps.taskState(id) ?? 'unknown'))) throw new Error('Every task must be Live or Dropped before End.');
       for (const repo of w.repos) {
         if (repo.existing) continue;
         const findings = await deps.unsaved(repo);
         if (findings.length) throw new Error(`Unsaved work: ${findings.join(', ')}`);
+        const kept = await deps.keepWorktree?.(w, repo);
+        if (kept) throw new Error(`Workstream worktree kept: ${kept}`);
       }
       w.cleanupApproved = true; save(w);
       await stop(w);
       for (const repo of w.repos) {
         if (repo.existing) continue;
-        await deps.remove(repo);
+        await deps.remove(repo, w);
       }
       // Private chat cannot close or reopen a topic (conversation-topics rule 7).
       w.state = 'ended'; w.closeTopicRequested = false; w.updatedAt = deps.now(); return save(w);
@@ -173,14 +513,72 @@ export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
     environment(id: string, threadId: string, path: string, environmentId: string) {
       const w = open(id, threadId);
       const repo = w.repos.find((r) => r.path === path);
-      if (!repo) throw new Error('Environment does not belong to workstream.');
-      repo.environmentId = environmentId; save(w);
+      if (repo) { repo.environmentId = environmentId; save(w); return; }
+      const job = w.jobs.find((j) => j.path === path || j.repos?.some((r) => r.path === path));
+      if (!job) return;
+      if (job.path === path) job.environmentId = environmentId;
+      for (const checkout of job.repos ?? []) if (checkout.path === path) checkout.environmentId = environmentId;
+      save(w);
     },
-    submit: (id: string, threadId: string, input: Pick<WorkstreamJob, 'id' | 'editing' | 'payload'>) => serial(async () => {
+    noteJob: (id: string, threadId: string, jobId: string, patch: Partial<WorkstreamJob>) => {
+      const w = open(id, threadId);
+      const job = w.jobs.find((j) => j.id === jobId);
+      if (!job) throw new Error('No workstream crew with that id.');
+      const attached = patch.taskId !== undefined && patch.taskId !== job.taskId;
+      Object.assign(job, patch);
+      save(w);
+      // The card lists only crews with an owner task, so show this one as soon as its task attaches.
+      if (attached) void serial(async () => bumpCard(open(id, threadId))).catch((error) => deps.error?.(w, error));
+      return job;
+    },
+    view: (id: string, threadId: string) => {
+      const w = get(id, threadId);
+      return currentJobs(w.jobs).map((job) => compactTaskLine({
+        id: job.taskId ?? job.id,
+        title: job.title ?? briefOf(job).split('\n')[0] ?? job.id,
+        model: job.model ?? 'default',
+        state: jobToCardState(job.state, job.editing, job.cleanup),
+      })).join('\n');
+    },
+    lookup: (id: string, threadId: string, taskId: string) => {
+      const w = get(id, threadId);
+      const job = [...w.jobs].reverse().find((j) => j.taskId === taskId || j.id === taskId);
+      if (!job) throw new Error('No task in this workstream.');
+      return formatWorkstreamLookup({
+        task: job.taskId ?? job.id,
+        title: job.title ?? '',
+        brief: briefOf(job),
+        report: job.report ?? '',
+        files: job.files ?? [],
+      });
+    },
+    submit: (id: string, threadId: string, input: JobSubmit) => serial(async () => {
       const w = open(id, threadId);
       const known = w.jobs.find((j) => j.id === input.id);
       if (known && (known.payload !== input.payload || known.editing !== input.editing)) throw new Error('Workstream retry changed its original task.');
-      if (!known) { w.jobs.push({ ...input, state: 'queued', threadId: null }); w.updatedAt = deps.now(); save(w); }
+      if (!known) {
+        const isolated = input.editing && !isAdoptedWorkstream(w);
+        w.jobs.push({
+          id: input.id, editing: input.editing, payload: input.payload, state: 'queued', threadId: null,
+          ...(isolated ? { isolated: true } : {}),
+          ...(input.taskId ? { taskId: input.taskId } : {}),
+          ...(input.followUpOf ? { followUpOf: input.followUpOf } : {}),
+          ...(input.title ? { title: input.title } : {}),
+          ...(input.model ? { model: input.model } : {}),
+          ...(input.environmentId !== undefined ? { environmentId: input.environmentId } : {}),
+          ...(input.path ? { path: input.path } : {}),
+          ...(input.branch ? { branch: input.branch } : {}),
+          ...(input.repos ? { repos: input.repos } : {}),
+          ...(input.repository ? { repository: input.repository } : {}),
+          ...(input.baseBranch ? { baseBranch: input.baseBranch } : {}),
+        });
+        // A retry that takes a failed crew's worktree owns it now: the old crew no longer expires on its own.
+        if (isolated && input.environmentId) {
+          for (const old of w.jobs) if (old.id !== input.id && old.state === 'failed' && old.environmentId === input.environmentId) old.supersededBy ??= input.id;
+        }
+        w.updatedAt = deps.now();
+        save(w);
+      }
       await drain(w);
       return w.jobs.find((j) => j.id === input.id)!;
     }),
@@ -210,17 +608,25 @@ export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
       if (w.ship.requestId === requestId && w.ship.state === 'complete') return w;
       if ((w.ship.state === 'running' || w.ship.state === 'queued') && w.ship.requestId !== requestId) return w;
       await drain(w);
-      if (w.jobs.some((j) => j.editing && (j.state === 'starting' || j.state === 'running' || (j.state === 'queued' && !['running', 'blocked', 'queued'].includes(w.ship.state))))) throw new Error('Ship waits until every editing task finishes.');
-      if (await (deps.editorBusy ?? deps.busy)?.(w)) {
+      if (isAdoptedWorkstream(w)) {
+        if (w.jobs.some((j) => j.editing && (j.state === 'starting' || j.state === 'running' || (j.state === 'queued' && !['running', 'blocked', 'queued'].includes(w.ship.state))))) throw new Error('Ship waits until every editing task finishes.');
+        if (await (deps.editorBusy ?? deps.busy)?.(w)) {
+          const told = w.ship.state === 'queued' && w.ship.requestId === requestId;
+          w.ship = { state: 'queued', requestId, error: 'Ship waits until every editing task finishes.' };
+          save(w);
+          if (!told) await deps.waiting?.(w);
+          return w;
+        }
+      } else if (w.jobs.some((j) => j.state === 'folding')) {
         const told = w.ship.state === 'queued' && w.ship.requestId === requestId;
-        w.ship = { state: 'queued', requestId, error: 'Ship waits until every editing task finishes.' };
+        w.ship = { state: 'queued', requestId, error: 'Ship waits until the current fold finishes.' };
         save(w);
         if (!told) await deps.waiting?.(w);
         return w;
       }
-      w.ship = { state: 'running', requestId }; save(w);
-      try { await deps.ship(w); w.ship = { state: 'complete', requestId }; }
-      catch (error) { w.ship = { state: error instanceof WorkstreamWaiting ? 'running' : 'blocked', requestId, error: String(error) }; save(w); if (error instanceof WorkstreamWaiting) return w; throw error; }
+      beginShip(w, requestId);
+      try { await deps.ship(w); completeShip(w); }
+      catch (error) { w.ship = { ...w.ship, state: error instanceof WorkstreamWaiting ? 'running' : 'blocked', error: String(error) }; save(w); if (error instanceof WorkstreamWaiting) return w; throw error; }
       w.updatedAt = deps.now(); return save(w);
     }),
     end: (id: string, threadId: string) => serial(async () => endRecord(get(id, threadId))),
@@ -234,16 +640,18 @@ export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
         if (w.devLink.state !== 'stopped' && deps.now() - (w.devLink.lastRequestedAt ?? 0) >= DEV_IDLE_MS) await stop(w);
         await drain(w);
         if (w.ship.state === 'queued') {
-          if (await (deps.editorBusy ?? deps.busy)?.(w)) continue;
-          w.ship = { state: 'running', requestId: w.ship.requestId }; save(w);
+          if (isAdoptedWorkstream(w)) {
+            if (await (deps.editorBusy ?? deps.busy)?.(w)) continue;
+          } else if (w.jobs.some((j) => j.state === 'folding')) continue;
+          beginShip(w, w.ship.requestId ?? '');
         }
         if (w.ship.state === 'running') {
-          try { await deps.ship(w); w.ship.state = 'complete'; delete w.ship.error; }
+          try { await deps.ship(w); completeShip(w); }
           catch (error) { w.ship.state = error instanceof WorkstreamWaiting ? 'running' : 'blocked'; w.ship.error = String(error); }
           save(w);
         }
         if (deps.now() - (w.lastStallAt ?? 0) >= 24 * 60 * 60_000 && await deps.stall?.(w)) { w.lastStallAt = deps.now(); save(w); }
-        if (w.taskIds.length > 0 && w.taskIds.every((id) => ['live','dropped'].includes(deps.taskState(id) ?? '')) && w.jobs.every((j) => j.state === 'finished') && w.ship.state !== 'running' && w.ship.state !== 'queued') {
+        if (w.taskIds.length > 0 && w.taskIds.every((id) => ['live','dropped'].includes(deps.taskState(id) ?? '')) && w.jobs.every((j) => jobClosed(j)) && w.ship.state !== 'running' && w.ship.state !== 'queued') {
           try { await endRecord(w); } catch (error) { deps.error?.(w,error); }
         }
         } catch (error) { deps.error?.(w,error); }

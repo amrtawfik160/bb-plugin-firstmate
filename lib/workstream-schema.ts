@@ -8,9 +8,54 @@ export const workstreamRepoSchema = z.object({
   taskId: z.string().optional(),
   crewId: z.string().optional(),
 });
+export const jobCheckoutSchema = z.object({
+  repository: z.string(), path: z.string(), branch: z.string(), environmentId: z.string().nullable().optional(),
+  hostId: z.string().optional(),
+});
+// One repository of a fold, saved before any Git change so a restart can finish or undo it.
+export const foldStepSchema = z.object({
+  repository: z.string(), hostId: z.string(), workstreamPath: z.string(), checkoutPath: z.string(),
+  before: z.string(), target: z.string(), after: z.string().optional(),
+  state: z.enum(['pending', 'merged', 'rolled-back']),
+});
+export const foldSchema = z.object({
+  state: z.enum(['merging', 'committed', 'rolling-back']),
+  steps: z.array(foldStepSchema),
+  files: z.array(z.string()).optional(),
+  // Why the undo is retried: the crew is told about a conflict only after it lands.
+  reason: z.enum(['conflict', 'wait', 'restart']).optional(),
+});
 export const jobSchema = z.object({
   id: z.string(), editing: z.boolean(), payload: z.string(),
-  state: z.enum(['queued', 'starting', 'running', 'finished']), threadId: z.string().nullable(), error: z.string().optional(),
+  state: z.enum(['queued', 'waiting-memory', 'starting', 'running', 'finished', 'folding', 'folded', 'failed', 'kept-unsaved', 'dropped']),
+  threadId: z.string().nullable(), error: z.string().optional(),
+  taskId: z.string().optional(),
+  followUpOf: z.string().optional(),
+  failedAt: z.number().optional(),
+  environmentId: z.string().nullable().optional(),
+  path: z.string().optional(),
+  branch: z.string().optional(),
+  repos: z.array(jobCheckoutSchema).optional(),
+  note: z.string().optional(),
+  title: z.string().optional(),
+  model: z.string().optional(),
+  report: z.string().optional(),
+  files: z.array(z.string()).optional(),
+  // A created-workstream editor in its own worktree. Fold and cleanup rules apply only to these;
+  // records saved before this field existed keep their old behaviour.
+  isolated: z.boolean().optional(),
+  // The one repository this task changes (owner/repo).
+  repository: z.string().optional(),
+  // A retry after its old worktree was removed starts a new worktree from this retained branch.
+  baseBranch: z.string().optional(),
+  // A retry took over this failed crew's worktree, so this job no longer expires on its own.
+  supersededBy: z.string().optional(),
+  fold: foldSchema.optional(),
+  foldedAt: z.number().optional(),
+  // Cleanup after fold, drop or failed expiry, separate from the task's result.
+  cleanup: z.enum(['pending', 'kept-unsaved', 'done']).optional(),
+  // The Ship request that took this folded work.
+  shipped: z.string().optional(),
 });
 export const workstreamSchema = z.object({
   id: z.string(), name: z.string(), projectId: z.string(), threadId: z.string(), requestId: z.string(),
@@ -18,11 +63,18 @@ export const workstreamSchema = z.object({
   repos: z.array(workstreamRepoSchema), taskIds: z.array(z.string()), requestTaskIds: z.array(z.string()).optional(), jobs: z.array(jobSchema),
   devLink: z.object({ state: z.enum(['stopped', 'starting', 'running']), port: z.number().int(), url: z.string().optional(), lastRequestedAt: z.number().optional(), realLogin: z.boolean().default(false) }),
   closeTopicRequested: z.boolean(),
-  ship: z.object({ state: z.enum(['idle', 'queued', 'running', 'blocked', 'complete']), requestId: z.string().optional(), error: z.string().optional() }),
+  ship: z.object({
+    state: z.enum(['idle', 'queued', 'running', 'blocked', 'complete']), requestId: z.string().optional(), error: z.string().optional(),
+    // The folded work this Ship request takes, saved when it starts: later folds go out with the next Ship.
+    snapshot: z.object({ jobs: z.array(z.string()), taskIds: z.array(z.string()), heads: z.record(z.string(), z.string()) }).optional(),
+  }),
   lastStallAt: z.number().optional(),
   cleanupApproved: z.boolean().optional(),
+  cardRevision: z.number().int().nonnegative().optional(),
   createdAt: z.number(), updatedAt: z.number(),
 });
 export type Workstream = z.infer<typeof workstreamSchema>;
 export type WorkstreamRepo = z.infer<typeof workstreamRepoSchema>;
 export type WorkstreamJob = z.infer<typeof jobSchema>;
+export type FoldStep = z.infer<typeof foldStepSchema>;
+export type ShipSnapshot = NonNullable<Workstream['ship']['snapshot']>;

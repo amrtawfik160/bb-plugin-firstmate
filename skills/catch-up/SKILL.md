@@ -45,7 +45,10 @@ groups:
 - **Important results:** Consequential completed outcomes and changed plans.
   Preserve distinctions such as ready for review, merged, and deployed.
 - **In progress:** One line per active workstream, grouped by project when useful.
-  Include the next meaningful milestone; omit routine retries and tool activity.
+  For a created workstream, add one short line per task (number, title, model, state)
+  from `firstmate_workstream` action `view`, and `lookup` only when a task needs its
+  brief, last report, or changed files. Include the next meaningful milestone;
+  omit routine retries and tool activity.
 - **Next:** Ordered steps with their owner and any prerequisite. Distinguish
   already authorized work from a proposed action that needs approval.
 

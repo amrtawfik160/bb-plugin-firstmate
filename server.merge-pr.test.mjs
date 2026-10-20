@@ -389,6 +389,8 @@ test('Ship refuses the workstream PR without an owner approval card',async()=>{
    start:async()=>'',status:async()=> 'idle',startDev:async()=>'',stopDev:async()=>{},unsaved:async()=>[],remove:async()=>{},ship:async()=>{},taskState:()=> 'working',
   });
   const w=await seed.create({threadId:'thr_cap',projectId:'proj_1',name:'Design',requestId:'create'});
+  // Ship takes folded work only: the builder's task has folded into the workstream branch.
+  await seed.submit(w.id,'thr_cap',{id:CREW,editing:true,payload:'{}',repository:'cyndra-ai/cyndra-saas'});seed.noteJob(w.id,'thr_cap',CREW,{state:'folded'});
   await host.bb.storage.kv.set('crews',[{...crew,workstreamId:w.id,workstreamRepo:'cyndra-ai/cyndra-saas'}]);
   host.harness.sdk.stub('threads.getPluginMetadata',async()=>({captain:'true'}));
   const invoked=hostCommands(host,c=>{
@@ -448,6 +450,7 @@ async function shipApprovalProbe(host) {
  const {createWorkstreams}=await import('./lib/workstreams.ts');
  const seed=createWorkstreams(host.bb.storage.database(),{now:Date.now,provision:async()=>[{repository:'cyndra-ai/cyndra-saas',projectId:'proj_1',hostId:'host_1',path:'/wt',sourcePath:'/repo',branch:branch(2391),environmentId:'env_wt'}],start:async()=>'',status:async()=> 'idle',startDev:async()=>'',stopDev:async()=>{},unsaved:async()=>[],remove:async()=>{},ship:async()=>{},taskState:()=> 'working'});
  const w=await seed.create({threadId:'thr_cap',projectId:'proj_1',name:'Design',requestId:'create'});
+ await seed.submit(w.id,'thr_cap',{id:CREW,editing:true,payload:'{}',repository:'cyndra-ai/cyndra-saas'});seed.noteJob(w.id,'thr_cap',CREW,{state:'folded'});
  await host.bb.storage.kv.set('crews',[{...crew,workstreamId:w.id,workstreamRepo:'cyndra-ai/cyndra-saas'}]);
  host.harness.sdk.stub('threads.getPluginMetadata',async()=>({captain:'true'}));
  hostCommands(host,c=>c.includes('gh pr list')?{payload:JSON.stringify([{url:url(2391),state:'OPEN',headRefOid:head(2391)}])}:c.includes('git rev-parse HEAD')?{payload:head(2391)}:forge(c));
