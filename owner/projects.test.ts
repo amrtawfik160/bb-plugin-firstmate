@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { hostCanDrive, PROJECTS, projectBriefLines, projectForName, projectForRepo, repoOf, surfaceRefusal, unlistedNote } from "./projects.ts";
+import { devCommandFor, devCommands, hostCanDrive, PROJECTS, projectBriefLines, projectForName, projectForRepo, repoOf, surfaceRefusal, unlistedNote } from "./projects.ts";
 
 test("a PR's repository names its project, without case", () => {
   assert.equal(projectForRepo("AmrTawfik160/dr.woo")?.name, "Dr Woo");
@@ -65,4 +65,21 @@ test("every project has a live rule: a check that proves it, or the reason none 
   for (const project of PROJECTS.projects) for (const check of project.live!.checks) {
     if ("envFile" in check) assert.match(check.envFile, /^\/root\/\.bb-server\/secrets\/[\w.-]+\.env$/, "credentials only from the host's secrets folder");
   }
+});
+
+test("a project may name one dev command per repository; a workstream gets the one for its repository", () => {
+  const both = { dev: [
+    { repository: "cyndra-ai/cyndra-saas", command: "vite --port {port}" },
+    { repository: "amrtawfik160/reels-app", command: "npm run dev" },
+  ] };
+  assert.deepEqual(devCommandFor(both, ["amrtawfik160/reels-app"]), { command: both.dev[1], repository: "amrtawfik160/reels-app" });
+  assert.deepEqual(devCommandFor(both, ["Cyndra-AI/cyndra-saas"]), { command: both.dev[0], repository: "Cyndra-AI/cyndra-saas" });
+  assert.equal(devCommandFor(both, ["other/repo"]), undefined);
+  // The older single entry still works: with a repository it serves only that one, without one it serves any.
+  const single = { dev: { repository: "cyndra-ai/cyndra-saas", command: "vite" } };
+  assert.deepEqual(devCommands(single), [single.dev]);
+  assert.equal(devCommandFor(single, ["amrtawfik160/reels-app"]), undefined);
+  assert.deepEqual(devCommandFor({ dev: { command: "vite" } }, ["x/y"]), { command: { command: "vite" }, repository: "x/y" });
+  assert.deepEqual(devCommands({}), []);
+  assert.equal(devCommandFor(projectForName("Cyndra"), ["cyndra-ai/cyndra-saas"])?.repository, "cyndra-ai/cyndra-saas");
 });

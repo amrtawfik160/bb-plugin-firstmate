@@ -5,6 +5,7 @@ import plugin from './server.ts';
 import { createOwnerTasks } from './lib/owner-tasks.ts';
 import { stubProviderCatalog } from './test/provider-catalog.mjs';
 import { manifestSkillIds } from './scripts/plugin-skill-fixture.mjs';
+import { legacyAdopt, stubHostGit } from './test/workstream-adopt-fixtures.mjs';
 
 const skills = manifestSkillIds(new URL('.', import.meta.url).pathname);
 const cap = { threadId: 'cap', projectId: 'cyndra' } as never;
@@ -46,27 +47,24 @@ async function realistic(options:{explicit?:boolean;two?:boolean;noPr?:boolean;p
  const actualEnv=(id:string)=>({id,hostId:'h1',path:id==='env_one'?'/wt/one':id==='env_two'?'/wt/two':'/repo/main',status:'ready',isWorktree:id!=='env_main',branchName:id==='env_one'?'fm/one':id==='env_two'?'fm/two':'main'});
  host.harness.sdk.stub('threads.get',async({threadId}:{threadId:string})=>makeThreadResponse({id:threadId,projectId:'cyndra',status:statuses.get(threadId)??'active',environmentId:threadId==='thr_one'?'env_one':threadId==='thr_two'?'env_two':'env_main'}));
  host.harness.sdk.stub('environments.get',async({environmentId}:{environmentId:string})=>actualEnv(environmentId));
- if(options.project){host.harness.sdk.stub('projects.list',async()=>[{id:'cyndra',name:options.project}]);host.harness.sdk.stub('projects.get',async()=>({id:'cyndra',name:options.project,kind:'repo',sources:[{hostId:'h1',path:'/repo/main',isDefault:true}],gitRemoteUrl:'https://github.com/example/runants.git'}));await host.harness.behavior.setSettings({workstreamProjects:JSON.stringify([options.project])});}
+ if(options.project){host.harness.sdk.stub('projects.list',async()=>[{id:'cyndra',name:options.project}]);host.harness.sdk.stub('projects.get',async()=>({id:'cyndra',name:options.project,kind:'repo',sources:[{hostId:'h1',path:'/repo/main',isDefault:true}],gitRemoteUrl:'https://github.com/example/runants.git'}));}
  const crews=[crewRow('one','thr_one',{...(options.noPr?{}:{prUrl:'https://github.com/cyndra-ai/cyndra-saas/pull/101'}),...(options.explicit?{environmentId:'env_one',branch:'fm/one'}:{})})];
  if(options.two)crews.push(crewRow('two','thr_two',{prUrl:'https://github.com/cyndra-ai/cyndra-saas/pull/102',...(options.explicit?{environmentId:'env_two',branch:'fm/two'}:{})}));
  await host.bb.storage.kv.set('crews',crews);
  const opened=crews.map((c,i)=>open(`Existing ${i}`,{crewId:c.id,project:options.project??'Cyndra SaaS'}));
  if(!options.noPr) for(let i=0;i<opened.length;i++)tasks.linkPr(opened[i]!.id,'cap',crews[i]!.prUrl!,Date.now());
  await host.harness.behavior.setSettings({signInCheck:false,fmHome:'',maxActiveCrews:0});
- const adopt=()=>host.harness.behavior.callRpc('workstreams.adopt',{threadId:'cap',projectId:'cyndra',name:'Existing work',requestId:'realistic',taskIds:opened.map(t=>t.id)}) as Promise<any>;
+ // A workstream adopted before adopt with fold: the old Ship, dev link and follow-up still apply to it.
+ const adopt=()=>legacyAdopt(host,{projectId:'cyndra',name:'Existing work',requestId:'realistic',taskIds:opened.map(t=>t.id)}) as Promise<any>;
+ // Today's adopt: it reads where each task's work is and shows the owner a card, or refuses.
+ const adoptRpc=()=>host.harness.behavior.callRpc('workstreams.adopt',{threadId:'cap',projectId:'cyndra',name:'Existing work',requestId:'realistic',taskIds:opened.map(t=>t.id)}) as Promise<any>;
  const commands:string[]=[];let n=0;const byId=new Map<string,string>();
  let respond:(s:string)=>string=()=>'';
  host.harness.sdk.stub('terminals.create',async({start}:{start:{command:string}})=>{const id=`terminal${++n}`;commands.push(start.command);byId.set(id,start.command);return{id}});
  host.harness.sdk.stub('terminals.get',async()=>({status:'running'}));host.harness.sdk.stub('terminals.close',async()=>({}));
  host.harness.sdk.stub('terminals.output',async({terminalId}:{terminalId:string})=>{const c=byId.get(terminalId)??'';const data=respond(c);const captured=c.includes('FM_HOST_CAPTURE_V1')?JSON.stringify({protocol:'FM_HOST_CAPTURE_V1',exitCode:0,stdout:data,stderr:''}):data;return{nextSeq:1,chunks:[{dataBase64:Buffer.from(captured + String.fromCharCode(10) + '__FM_HOST_RC:0' + String.fromCharCode(10)).toString('base64')}]}});
- return{host,tasks,opened,crews,statuses,commands,adopt,setResponse:(r:(c:string)=>string)=>{respond=r}};
+ return{host,tasks,opened,crews,statuses,commands,adopt,adoptRpc,setResponse:(r:(c:string)=>string)=>{respond=r}};
 }
-test('round2 actual thread environment and branch survive adoption without new crew fields',async()=>{
- const f=await realistic();try{
-  const r=await f.adopt();console.log('NORMAL CREW REPOS',JSON.stringify(r.workstream.repos));
-  assert.deepEqual(r.workstream.repos.map((r:any)=>({path:r.path,branch:r.branch,environmentId:r.environmentId})),[{path:'/wt/one',branch:'fm/one',environmentId:'env_one'}]);
- }finally{await f.host.harness.lifecycle.dispose()}
-});
 test('round2 dev startup serves adopted worktree through actual terminal transport',async()=>{
  const f=await realistic();try{
   f.setResponse(c=>c.includes('bb connect expose')?'https://real-fake-share.getbb.app/':'');
@@ -86,12 +84,6 @@ test('round2 follow-up waits then reuses real original environment with workstre
   assert.equal(spawned.length,1);assert.equal(spawned[0].pluginMetadata.workstreamId,r.workstream.id);assert.deepEqual(spawned[0].environment,{type:'reuse',environmentId:'env_one'});
  }finally{await f.host.harness.lifecycle.dispose()}
 });
-test('round2 two tasks in same repository retain exactly their two existing branches',async()=>{
- const f=await realistic({explicit:true,two:true});try{
-  const r=await f.adopt();console.log('TWO TASK REPOS',JSON.stringify(r.workstream.repos));
-  assert.deepEqual(r.workstream.repos.map((r:any)=>({path:r.path,branch:r.branch})).sort((a:any,b:any)=>a.path.localeCompare(b.path)),[{path:'/wt/one',branch:'fm/one'},{path:'/wt/two',branch:'fm/two'}]);
- }finally{await f.host.harness.lifecycle.dispose()}
-});
 test('round2 Ship waits for original active adopted editor before touching Git',async()=>{
  const f=await realistic({explicit:true,active:true});try{
   const r=await f.adopt();const commands:any[]=[];f.host.harness.sdk.stub('hosts.exec',async(a:any)=>{commands.push(a);throw Error('stop-before-git')});
@@ -108,15 +100,16 @@ test('round2 project with no PR yet never skips directly to release',async()=>{
   assert.equal(r.workstream.repos.length,1,'resolve actual repository even without a PR');
  }finally{await f.host.harness.lifecycle.dispose()}
 });
-test('round2 changed adopt request is refused with no saved change; exact repeat remains idempotent',async()=>{
+test('round2 changed adopt request is refused with no saved change; an exact repeat shows the same card',async()=>{
  const f=await realistic();try{
-  const r=await f.adopt();const before=JSON.stringify((await f.host.harness.behavior.callRpc('workstreams.list',{threadId:'cap'})));
-  const same=f.opened[0]!;const extra=f.tasks.open({captain:'cap',project:'Cyndra SaaS',projectId:'cyndra',title:'Same project extra',sourceRefs:['tg:42:78'],at:Date.now()});
-  const other=f.tasks.open({captain:'cap',project:'Safi',projectId:'safi',title:'Other project',sourceRefs:['tg:42:77'],at:Date.now()});await f.host.harness.behavior.setSettings({workstreamProjects:'["Cyndra","Safi"]'});
-  for(const override of [{name:'Changed'},{projectId:'safi',taskIds:[other.id]},{taskIds:[...r.workstream.taskIds,extra.id]}]) await assert.rejects(f.host.harness.behavior.callRpc('workstreams.adopt',{threadId:'cap',projectId:'cyndra',name:'Existing work',requestId:'realistic',taskIds:r.workstream.taskIds,...override}));
-  await f.host.harness.behavior.setSettings({workstreamProjects:'["Cyndra"]'});
+  stubHostGit(f.host);
+  const first=await f.adoptRpc();assert.equal(first.card.state,'open');const before=JSON.stringify((await f.host.harness.behavior.callRpc('workstreams.list',{threadId:'cap'})));
+  const extra=f.tasks.open({captain:'cap',project:'Cyndra SaaS',projectId:'cyndra',title:'Same project extra',sourceRefs:['tg:42:78'],at:Date.now()});
+  const other=f.tasks.open({captain:'cap',project:'Safi',projectId:'safi',title:'Other project',sourceRefs:['tg:42:77'],at:Date.now()});
+  const ids=f.opened.map(t=>t.id);
+  for(const override of [{name:'Changed'},{projectId:'safi',taskIds:[other.id]},{taskIds:[...ids,extra.id]}]) await assert.rejects(f.host.harness.behavior.callRpc('workstreams.adopt',{threadId:'cap',projectId:'cyndra',name:'Existing work',requestId:'realistic',taskIds:ids,...override}),/changed its original/);
   assert.equal(JSON.stringify(await f.host.harness.behavior.callRpc('workstreams.list',{threadId:'cap'})),before);
-  const repeat=await f.adopt();assert.equal(repeat.workstream.id,r.workstream.id);assert.deepEqual(repeat.workstream.taskIds,r.workstream.taskIds);
+  const repeat=await f.adoptRpc();assert.equal(repeat.card.askId,first.card.askId);
  }finally{await f.host.harness.lifecycle.dispose()}
 });
 test('round2 Ship addresses original task branch and worktree rather than project main',async()=>{

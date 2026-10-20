@@ -8,6 +8,7 @@ import plugin from "./server.ts";
 import { createDeliveries } from "./lib/pr-delivery.ts";
 import { createOwnerAsks } from "./lib/owner-asks.ts";
 import { createOwnerTasks } from "./lib/owner-tasks.ts";
+import { seedLegacyWorkstream } from "./test/legacy-workstream.mjs";
 
 const ctx = { threadId: "thr_cap", projectId: "proj_1" };
 const old = Math.floor(Date.now() / 1000) - 3 * 60 * 60;
@@ -434,7 +435,8 @@ test("automatic retirement keeps an adopted crew's worktree while the workstream
       startDev: async () => "", stopDev: async () => {}, unsaved: async () => [], remove: async () => {},
       ship: async () => {}, taskState: () => "working",
     });
-    await store.adopt({ threadId: "thr_cap", projectId: "proj_1", name: "Keep", requestId: "keep-adopt", taskIds: [task.id] });
+    seedLegacyWorkstream(host.bb.storage.database(), { threadId: "thr_cap", projectId: "proj_1", name: "Keep", requestId: "keep-adopt", taskIds: [task.id] });
+    assert.equal(store.list("thr_cap").length, 1);
     await host.bb.storage.kv.set("crews", [crewRow("adopt1", "thr_adopt1")]);
     await host.harness.behavior.runCli(["retire-finished", "--captain", "thr_cap"], ctx);
     await host.harness.behavior.runSchedule("finished-crew-retire");

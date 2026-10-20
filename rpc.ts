@@ -5,6 +5,12 @@ import { workstreamSchema, topicSchema } from './lib/workstream-schema.ts';
 export const workstreamListSchema = z.object({workstreams:z.array(workstreamSchema),trialProjectIds:z.array(z.string())});
 export const workstreamResultSchema = z.object({workstream:workstreamSchema});
 export const workstreamDevLinkSchema = workstreamResultSchema.extend({url:z.string()});
+// Adopt first shows the owner one card; his Approve adopts. A call before his answer returns the card.
+export const workstreamAdoptSchema = z.object({
+  workstream: workstreamSchema.optional(),
+  card: z.object({ askId: z.string(), state: z.enum(['open', 'declined']), text: z.string() }).optional(),
+  warning: z.string().optional(),
+});
 const workstreamOwner = z.object({threadId:z.string().min(1)});
 const workstreamTarget = workstreamOwner.extend({workstreamId:z.string().min(1)});
 const crewRow = z.object({
@@ -21,8 +27,11 @@ const crewRow = z.object({
 export const rpcContract = defineRpcContract({
   "workstreams.list": {input:workstreamOwner.extend({includeEnded:z.boolean().optional()}),output:workstreamListSchema},
   "workstreams.create": {input:workstreamOwner.extend({projectId:z.string().min(1),name:z.string().min(1),requestId:z.string().min(1),topic:topicSchema.optional()}),output:workstreamResultSchema},
-  "workstreams.adopt": {input:workstreamOwner.extend({projectId:z.string().min(1),name:z.string().min(1),requestId:z.string().min(1),taskIds:z.array(z.string().min(1)).min(1)}),output:workstreamResultSchema},
-  "workstreams.bindTopic": {input:workstreamTarget.extend({chatId:z.string().min(1),topicId:z.number().int().positive()}),output:workstreamResultSchema},
+  "workstreams.adopt": {input:workstreamOwner.extend({projectId:z.string().min(1),name:z.string().min(1),requestId:z.string().min(1),taskIds:z.array(z.string().min(1)).min(1),
+    tasks:z.array(z.object({taskId:z.string().min(1),repository:z.string().optional(),branches:z.array(z.string().min(1)).optional()})).optional(),
+    replacesPrs:z.array(z.string().url()).optional()}),output:workstreamAdoptSchema},
+  // goneTopicId: the recorded topic is gone; the new topic replaces it. Without it a recorded topic is kept.
+  "workstreams.bindTopic": {input:workstreamTarget.extend({chatId:z.string().min(1),topicId:z.number().int().positive(),goneTopicId:z.number().int().positive().optional()}),output:workstreamResultSchema},
   "workstreams.ship": {input:workstreamTarget.extend({requestId:z.string().min(1)}),output:workstreamResultSchema},
   "workstreams.devLink": {input:workstreamTarget.extend({realLogin:z.boolean().optional()}),output:workstreamDevLinkSchema},
   "workstreams.end": {input:workstreamTarget,output:workstreamResultSchema},

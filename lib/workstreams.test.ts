@@ -3,6 +3,7 @@ import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import { createWorkstreams, WorkstreamWaiting, DEV_IDLE_MS, type WorkstreamDeps } from './workstreams.ts';
 import { FAILED_KEEP_MS, FOLD_CONFLICT_TELL, MEMORY_GUARD_BYTES } from './workstream-fold.ts';
+import { seedLegacyWorkstream } from '../test/legacy-workstream.mjs';
 
 function fixture() {
   const db = new DatabaseSync(':memory:');
@@ -174,24 +175,7 @@ test('End and task attachment serialize so a late task cannot join a removed wor
   } finally { release?.(); f.db.close(); }
 });
 
-test('adopt groups open tasks without provisioning; a retry of the same requestId is a no-op', async () => {
-  const f = fixture();
-  let provisions = 0;
-  const inner = f.deps.provision;
-  f.deps.provision = async (w) => { provisions++; return inner(w); };
-  try {
-    const first = await f.store.adopt({ threadId: 'cap', projectId: 'cyndra', name: 'Cyndra web chat restyle', requestId: 'adopt-chat', taskIds: ['T1', 'T2'] });
-    assert.deepEqual(first.taskIds, ['T1', 'T2']);
-    assert.equal(first.provisioned, true);
-    assert.deepEqual(first.repos, []);
-    assert.equal(provisions, 0);
-    const retry = await f.store.adopt({ threadId: 'cap', projectId: 'cyndra', name: 'Cyndra web chat restyle', requestId: 'adopt-chat', taskIds: ['T1', 'T2'] });
-    assert.equal(retry.id, first.id);
-    assert.equal(f.store.list('cap').length, 1);
-  } finally { f.db.close(); }
-});
-
-test('adopt stores provided existing repos without provisioning', async () => {
+test('a workstream adopted before adopt with fold keeps its existing repos, and End leaves them', async () => {
   const f = fixture();
   let provisions = 0;
   const inner = f.deps.provision;
@@ -201,8 +185,8 @@ test('adopt stores provided existing repos without provisioning', async () => {
     let removed = 0, inspected = 0;
     f.deps.remove = async () => { removed++; };
     f.deps.unsaved = async () => { inspected++; return []; };
-    const first = await f.store.adopt({ threadId: 'cap', projectId: 'cyndra', name: 'Running', requestId: 'repos', taskIds: ['T1'], repos: [repo] });
-    assert.deepEqual(first.repos, [repo]);
+    const first = seedLegacyWorkstream(f.db, { projectId: 'cyndra', name: 'Running', requestId: 'repos', taskIds: ['T1'], repos: [repo] });
+    assert.deepEqual(f.store.get(first.id, 'cap').repos, [repo]);
     assert.equal(provisions, 0);
     const ended = await f.store.end(first.id, 'cap');
     assert.equal(ended.state, 'ended');
@@ -211,25 +195,11 @@ test('adopt stores provided existing repos without provisioning', async () => {
   } finally { f.db.close(); }
 });
 
-test('adopt retry with a different name or task list is refused', async () => {
-  const f = fixture();
-  try {
-    const first = await f.store.adopt({ threadId: 'cap', projectId: 'cyndra', name: 'Chat', requestId: 'stable', taskIds: ['T1', 'T2'] });
-    await assert.rejects(f.store.adopt({ threadId: 'cap', projectId: 'cyndra', name: 'Renamed', requestId: 'stable', taskIds: ['T1', 'T2'] }), /changed its original/);
-    await assert.rejects(f.store.adopt({ threadId: 'cap', projectId: 'cyndra', name: 'Chat', requestId: 'stable', taskIds: ['T1', 'T2', 'T3'] }), /changed its original/);
-    const listed = f.store.list('cap');
-    assert.equal(listed.length, 1);
-    assert.equal(listed[0]!.name, 'Chat');
-    assert.deepEqual(listed[0]!.taskIds, ['T1', 'T2']);
-    assert.equal(listed[0]!.id, first.id);
-  } finally { f.db.close(); }
-});
-
 test('an editing follow-up waits while the workstream is busy', async () => {
   const f = fixture();
   f.deps.busy = async () => true;
   try {
-    const w = await f.store.adopt({ threadId: 'cap', projectId: 'cyndra', name: 'Follow', requestId: 'follow', taskIds: ['T1'] });
+    const w = seedLegacyWorkstream(f.db, { projectId: 'cyndra', name: 'Follow', requestId: 'follow', taskIds: ['T1'] });
     const job = await f.store.submit(w.id, 'cap', { id: 'follow', editing: true, payload: '{}' });
     assert.equal(job.state, 'queued');
     assert.deepEqual(f.started, []);
@@ -245,7 +215,7 @@ test('Ship queues while an attached editor is busy, tells the owner once, then s
   f.deps.waiting = async (w) => { told.push(w.id); };
   f.deps.ship = async () => { ships++; };
   try {
-    const w = await f.store.adopt({ threadId: 'cap', projectId: 'cyndra', name: 'Existing', requestId: 'adopt', taskIds: ['T1'] });
+    const w = seedLegacyWorkstream(f.db, { projectId: 'cyndra', name: 'Existing', requestId: 'adopt', taskIds: ['T1'] });
     const first = await f.store.ship(w.id, 'cap', 'tap');
     assert.equal(first.ship.state, 'queued');
     assert.equal(ships, 0);
@@ -261,15 +231,6 @@ test('Ship queues while an attached editor is busy, tells the owner once, then s
   } finally { f.db.close(); }
 });
 
-test('adopt refuses a task already in another workstream and creates nothing', async () => {
-  const f = fixture();
-  try {
-    const held = await f.store.adopt({ threadId: 'cap', projectId: 'cyndra', name: 'Held', requestId: 'held', taskIds: ['T1'] });
-    await assert.rejects(f.store.adopt({ threadId: 'cap', projectId: 'cyndra', name: 'Other', requestId: 'other', taskIds: ['T1', 'T2'] }), /already belongs to a workstream/);
-    assert.deepEqual(f.store.list('cap').map((w) => w.id), [held.id]);
-  } finally { f.db.close(); }
-});
-
 test('End leaves the topic after cleanup, for created and adopted workstreams', async () => {
   const f = fixture();
   try {
@@ -278,7 +239,7 @@ test('End leaves the topic after cleanup, for created and adopted workstreams', 
     const endedCreated = await f.store.end(created.id, 'cap');
     assert.equal(endedCreated.closeTopicRequested, false);
     assert.equal(endedCreated.state, 'ended');
-    const adopted = await f.store.adopt({ threadId: 'cap', projectId: 'cyndra', name: 'Chat', requestId: 'adopt-end', taskIds: ['T2'] });
+    const adopted = seedLegacyWorkstream(f.db, { projectId: 'cyndra', name: 'Chat', requestId: 'adopt-end', taskIds: ['T2'] });
     await f.store.bindTopic(adopted.id, 'cap', { chatId: '200', topicId: 9 });
     const endedAdopted = await f.store.end(adopted.id, 'cap');
     assert.equal(endedAdopted.closeTopicRequested, false);
@@ -315,7 +276,7 @@ test('fourth dev link uses HTTP activity received since the last reconciliation'
 test('adopted workstreams still run one editor at a time', async () => {
   const f = fixture();
   try {
-    const w = await f.store.adopt({ threadId: 'cap', projectId: 'cyndra', name: 'Chat', requestId: 'serial', taskIds: ['T1'] });
+    const w = seedLegacyWorkstream(f.db, { projectId: 'cyndra', name: 'Chat', requestId: 'serial', taskIds: ['T1'] });
     await f.store.submit(w.id, 'cap', { id: 'editor1', editing: true, payload: '{}' });
     await f.store.submit(w.id, 'cap', { id: 'editor2', editing: true, payload: '{}' });
     await f.store.submit(w.id, 'cap', { id: 'scout', editing: false, payload: '{}' });
@@ -745,7 +706,7 @@ test('compact view shows the latest job of each task once', async () => {
 test('a finished adopted editor, and one saved before task worktrees, close under the old rule so End works', async () => {
   const f = fixture();
   try {
-    const adopted = await f.store.adopt({ threadId: 'cap', projectId: 'cyndra', name: 'Adopted', requestId: 'adopt-end', taskIds: ['T1'] });
+    const adopted = seedLegacyWorkstream(f.db, { projectId: 'cyndra', name: 'Adopted', requestId: 'adopt-end', taskIds: ['T1'] });
     await f.store.submit(adopted.id, 'cap', { id: 'editor', editing: true, payload: '{}' });
     assert.equal(f.store.get(adopted.id, 'cap').jobs[0]!.isolated, undefined);
     f.statuses.set('editor', 'idle');

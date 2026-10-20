@@ -34,13 +34,21 @@ export function isRunning(row: { status: string; busy?: boolean }): boolean {
   return isRunningStatus(row.status) || row.busy === true;
 }
 
-export type CleanupTrigger = "live" | "dropped";
+export type CleanupTrigger = "live" | "dropped" | "folded";
 
+/**
+ * `releasedCrewIds`: crews an adopt-with-fold workstream let go, because their work is in its branch or
+ * their task was dropped. Only those crews of a workstream task are cleaned, while the task stays open.
+ */
 export function taskCleanupTrigger(
-  task: Pick<OwnerTask, "id" | "state">,
+  task: Pick<OwnerTask, "id" | "state"> & { crewIds?: readonly string[] },
   workstreamTaskIds: ReadonlySet<string>,
+  releasedCrewIds: ReadonlySet<string> = new Set(),
 ): { trigger: CleanupTrigger } | { trigger: null; reason: "workstream" | "not-finished" } {
-  if (workstreamTaskIds.has(task.id)) return { trigger: null, reason: "workstream" };
+  if (workstreamTaskIds.has(task.id)) {
+    if (!(task.crewIds ?? []).some((id) => releasedCrewIds.has(id))) return { trigger: null, reason: "workstream" };
+    return { trigger: task.state === "dropped" ? "dropped" : "folded" };
+  }
   if (task.state === "live") return { trigger: "live" };
   if (task.state === "dropped") return { trigger: "dropped" };
   return { trigger: null, reason: "not-finished" };
@@ -131,6 +139,8 @@ export type CleanupDeps = {
   signal: AbortSignal;
   tasks: readonly OwnerTask[];
   workstreamTaskIds: ReadonlySet<string>;
+  /** Adopted crews whose work folded into their workstream branch, or whose task was dropped. */
+  releasedCrewIds?: ReadonlySet<string>;
   crews: readonly CleanupCrew[];
   maxTasks?: number;
   cursor?: number;
@@ -168,18 +178,21 @@ export type CleanupRow = { taskId: string; action: "archived" | "kept"; detail: 
 type Decision = { archive: true } | { archive: false; reason: string };
 
 export async function runTaskWorktreeCleanup(deps: CleanupDeps): Promise<{ rows: CleanupRow[]; nextCursor: number }> {
-  const crewsOf = (task: OwnerTask) => deps.crews.filter((crew) => task.crewIds.includes(crew.id) && crew.worktree && !crew.workstreamId && crew.threadId);
+  const released = deps.releasedCrewIds ?? new Set<string>();
+  const trigger = (task: OwnerTask) => taskCleanupTrigger(task, deps.workstreamTaskIds, released);
+  // A workstream task's crews go only once the workstream released them; its other crews still hold work.
+  const crewsOf = (task: OwnerTask) => deps.crews.filter((crew) => task.crewIds.includes(crew.id) && crew.worktree && !crew.workstreamId && crew.threadId
+    && (!deps.workstreamTaskIds.has(task.id) || released.has(crew.id)));
   // A task whose crews were all retired has nothing left to clean, so it never takes a place in the pass.
   const eligible = deps.tasks.filter((task) => (deps.only === undefined || task.id === deps.only)
-    && taskCleanupTrigger(task, deps.workstreamTaskIds).trigger !== null && crewsOf(task).length > 0);
+    && trigger(task).trigger !== null && crewsOf(task).length > 0);
   const { slice, nextCursor } = rotateSlice(eligible, deps.cursor ?? 0, deps.maxTasks ?? CLEANUP_MAX_TASKS);
   const rows: CleanupRow[] = [];
   const locked = deps.locked ?? (<T>(_ids: readonly string[], operation: () => Promise<T>) => operation());
 
   for (const task of slice) {
     if (deps.signal.aborted) break;
-    const trigger = taskCleanupTrigger(task, deps.workstreamTaskIds);
-    if (trigger.trigger === null) continue;
+    if (trigger(task).trigger === null) continue;
     const own = crewsOf(task);
     let alreadyArchived = 0;
     const byEnv = new Map<string, CleanupCrew[]>();
@@ -233,7 +246,7 @@ export async function runTaskWorktreeCleanup(deps: CleanupDeps): Promise<{ rows:
 
       let outcome: LockedOutcome;
       try {
-        outcome = await locked(ready.map((crew) => crew.id), () => archiveUnderLock(deps, task.id, envId, env, envCrews, ready));
+        outcome = await locked(ready.map((crew) => crew.id), () => archiveUnderLock(deps, task.id, envId, env, envCrews, ready, released));
       } catch (error) {
         if (isAbort(error) || deps.signal.aborted) break;
         rows.push({ taskId: task.id, action: "kept", detail: `crew lock refused (${message(error)})` });
@@ -289,7 +302,7 @@ async function environmentCheck(deps: CleanupDeps, envId: string, taskThreadIds:
 // Under the crews' lock: the worktree check, every fact read again after it, then each archive
 // with a read right before and right after.
 async function archiveUnderLock(deps: CleanupDeps, taskId: string, envId: string, env: CleanupEnvironment,
-  envCrews: readonly CleanupCrew[], ready: readonly CleanupCrew[]): Promise<LockedOutcome> {
+  envCrews: readonly CleanupCrew[], ready: readonly CleanupCrew[], released: ReadonlySet<string>): Promise<LockedOutcome> {
   const out: LockedOutcome = { rows: [], archived: 0 };
   const keepAll = (detail: string) => { for (const crew of ready) out.rows.push({ action: "kept", detail, threadId: crew.threadId }); return out; };
   // The lock may have been free only after a long wait.
@@ -304,7 +317,7 @@ async function archiveUnderLock(deps: CleanupDeps, taskId: string, envId: string
   // The worktree check took time. Read the task, its holders, the environment and its threads again.
   const tasks = (deps.tasksNow ?? (() => deps.tasks))();
   const task = tasks.find((row) => row.id === taskId);
-  const trigger = task === undefined ? null : taskCleanupTrigger(task, deps.workstreamTaskIds).trigger;
+  const trigger = task === undefined ? null : taskCleanupTrigger(task, deps.workstreamTaskIds, released).trigger;
   if (task === undefined || trigger === null) return keepAll("task reopened");
   const again = await environmentCheck(deps, envId, new Set(envCrews.map((crew) => crew.threadId)));
   if (again === "aborted") return { ...out, aborted: true };
