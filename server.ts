@@ -19966,15 +19966,37 @@ export default async function plugin(bb: BbPluginApi) {
     })();
     try { await taskWorktreeCleanupWork; } finally { taskWorktreeCleanupWork = undefined; }
   });
-  async function threadArchivedEffects(threadId: string): Promise<void> {
-    deliveries.ownerLost(threadId);
-    const crew = await findCrewByThread(threadId);
-    if (crew !== undefined) inboundLedger.crewEnded(crew.id, Date.now());
+  // What a thread's archive means here: its deliveries need a new manager and the owner messages its
+  // crew held go back to the captain. The one entry point for every archive path (the event, the
+  // worktree cleanup). Applied once per archive, and only while that archive stands: BB sends the
+  // event later, without waiting, so it can arrive after an archive the cleanup undid (work had
+  // started) or after the thread came back, also after this pass ended or a reload. `archivedAt` is
+  // the event's own archive time; without it, the archive the thread is in now.
+  async function threadArchivedEffects(threadId: string, archivedAt?: number | null): Promise<void> {
+    await serializeLedger(`thread-archived:${threadId}`, async () => {
+      let current: number | null;
+      try {
+        const thread = asRecord(await raceAbort(bb.sdk.threads.get({ threadId }), undefined, STUCK_HOST_CALL_MS));
+        current = typeof thread["archivedAt"] === "number" ? thread["archivedAt"] : null;
+      } catch (error) {
+        // The delivery pass still finds an archived manager, and a crew's own end still closes its messages.
+        bb.log.warn(`thread archived ${threadId}: state unreadable, effects not applied: ${error instanceof Error ? error.message : String(error)}`);
+        return;
+      }
+      if (current === null) return;
+      if (archivedAt != null && archivedAt !== current) return;
+      const applied = `thread-archived-effects:${threadId}:${current}`;
+      if ((await bb.storage.kv.get(applied)) === true) return;
+      deliveries.ownerLost(threadId);
+      const crew = await findCrewByThread(threadId);
+      if (crew !== undefined) inboundLedger.crewEnded(crew.id, Date.now());
+      await bb.storage.kv.set(applied, true);
+    });
   }
   bb.events.on("thread.archived", async ({ thread }) => {
-    // The worktree cleanup applies these itself once its archive is verified, and never after an undo.
+    // The worktree cleanup decides first: it applies these itself once its archive is verified.
     if (cleanupArchiving.has(thread.id)) return;
-    await threadArchivedEffects(thread.id);
+    await threadArchivedEffects(thread.id, thread.archivedAt ?? null);
   });
   bb.events.on("thread.deleted", ({ thread }) => { launches.workerDeleted(thread.id); deliveries.ownerLost(thread.id); });
 

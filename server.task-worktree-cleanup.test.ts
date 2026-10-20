@@ -31,6 +31,8 @@ async function captainHost(opts: {
   const worktreeOf = opts.worktreeOf ?? {};
   const extraOccupants = opts.extraOccupants ?? {};
   const archived = new Set<string>();
+  // Like BB: one archive time per archive, read back the same until the thread is unarchived.
+  const archivedAtOf = new Map<string, number>();
   const unarchived: string[] = [];
   const envDeletes: string[] = [];
   const parentOf = opts.parentOf ?? {};
@@ -39,7 +41,7 @@ async function captainHost(opts: {
   const row = (id: string, environmentId = envOf[id] ?? `env_${id}`) => ({
     ...makeThreadResponse({
       id, projectId: "proj_1", status: (statusOf[id] ?? "idle") as "idle", environmentId,
-      ...(archived.has(id) ? { archivedAt: Date.now() } : {}),
+      ...(archived.has(id) ? { archivedAt: archivedAtOf.get(id) ?? 1 } : {}),
     }),
     parentThreadId: parentOf[id] ?? (id === "thr_cap" ? null : "thr_cap"),
     lifecycleOwnerThreadId: lifecycleOwnerOf[id] ?? null,
@@ -56,7 +58,7 @@ async function captainHost(opts: {
     const ids = [...new Set([...fallback, ...(extraOccupants[args.environmentId] ?? [])])];
     return ids.map((id) => makeThreadResponse({
       id, projectId: "proj_1", status: (statusOf[id] ?? "idle") as "idle", environmentId: args.environmentId,
-      ...(archived.has(id) ? { archivedAt: Date.now() } : {}),
+      ...(archived.has(id) ? { archivedAt: archivedAtOf.get(id) ?? 1 } : {}),
     }));
   });
   host.harness.sdk.stub("threads.send", async () => ({ delivery: "queued" }));
@@ -65,10 +67,10 @@ async function captainHost(opts: {
   host.harness.sdk.stub("threads.archive", async ({ threadId }: { threadId: string }) => {
     const tree = (root: string): string[] => [root, ...known().filter((id) => parentOf[id] === root || lifecycleOwnerOf[id] === root).flatMap(tree)];
     const archivedThreadIds = tree(threadId).filter((id) => !archived.has(id));
-    for (const id of archivedThreadIds) archived.add(id);
+    for (const id of archivedThreadIds) { archived.add(id); archivedAtOf.set(id, Date.now()); }
     return { ok: true, archivedThreadIds };
   });
-  host.harness.sdk.stub("threads.unarchive", async ({ threadId }: { threadId: string }) => { archived.delete(threadId); unarchived.push(threadId); return { ok: true }; });
+  host.harness.sdk.stub("threads.unarchive", async ({ threadId }: { threadId: string }) => { archived.delete(threadId); archivedAtOf.delete(threadId); unarchived.push(threadId); return { ok: true }; });
   host.harness.sdk.stub("environments.get", async ({ environmentId }: { environmentId: string }) => ({
     id: environmentId, hostId: "host_1", status: "ready", isWorktree: worktreeOf[environmentId] !== false, path: `/wt/${environmentId}`,
   }));
@@ -90,7 +92,7 @@ async function captainHost(opts: {
     const out = captured ? JSON.stringify({ protocol: "FM_HOST_CAPTURE_V1", exitCode: 0, stdout: payload, stderr: "" }) : payload;
     return { nextSeq: 1, chunks: [{ dataBase64: Buffer.from(`${out}\n__FM_HOST_RC:0\n`).toString("base64") }] };
   });
-  return { host, archived, unarchived, envDeletes, statusOf, byId };
+  return { host, archived, archivedAtOf, row, unarchived, envDeletes, statusOf, byId };
 }
 
 function liveTask(host: Awaited<ReturnType<typeof captainHost>>["host"], crewId: string, title = "Banner") {
@@ -283,5 +285,61 @@ test("a captain turn that starts during the worktree check keeps the crew", asyn
     });
     await host.harness.behavior.runSchedule("task-worktree-cleanup");
     assert.deepEqual([...archived], []);
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+// Check round 2 (PR #179), finding 2: BB sends "thread archived" later, without waiting.
+test("a late archived event for an undone archive changes nothing, also after a reload", async () => {
+  const { host, archived, unarchived, statusOf, row } = await captainHost({ envOf: { thr_c1: "env_c1" } });
+  let current = host;
+  try {
+    await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_c1")]);
+    liveTask(host, "c1");
+    const deliveries = createDeliveries(host.bb.storage.database());
+    deliveries.register({ url: "https://github.com/acme/app/pull/7", taskId: "c1", projectId: "proj_1", owner: "thr_c1", home: "", worker: "thr_c1", requirement: "pr" });
+    let event: ReturnType<typeof row> | undefined;
+    host.harness.sdk.stub("threads.archive", async ({ threadId }: { threadId: string }) => {
+      statusOf[threadId] = "active";
+      archived.add(threadId);
+      event = { ...row(threadId), archivedAt: Date.now() };
+      return { ok: true, archivedThreadIds: [threadId] };
+    });
+    await host.harness.behavior.runSchedule("task-worktree-cleanup");
+    assert.deepEqual(unarchived, ["thr_c1"]);
+    const getStub = (target: typeof host) => target.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => row(threadId));
+    current = await host.harness.lifecycle.reload(plugin);
+    getStub(current);
+    await current.harness.behavior.emitThreadEvent("thread.archived", { thread: event! as never });
+    assert.equal(createDeliveries(current.bb.storage.database()).get("acme/app#7")?.ownerNeeded, false);
+  } finally { await current.harness.lifecycle.dispose(); }
+});
+
+test("an archived event for an earlier archive the thread came back from changes nothing", async () => {
+  const { host, archived, archivedAtOf, row } = await captainHost({ envOf: { thr_c1: "env_c1" } });
+  try {
+    const deliveries = createDeliveries(host.bb.storage.database());
+    deliveries.register({ url: "https://github.com/acme/app/pull/7", taskId: "c1", projectId: "proj_1", owner: "thr_c1", home: "", worker: "thr_c1", requirement: "pr" });
+    archived.add("thr_c1");
+    archivedAtOf.set("thr_c1", 2_000);
+    await host.harness.behavior.emitThreadEvent("thread.archived", { thread: { ...row("thr_c1"), archivedAt: 1_000 } as never });
+    assert.equal(deliveries.get("acme/app#7")?.ownerNeeded, false, "a stale event");
+    await host.harness.behavior.emitThreadEvent("thread.archived", { thread: { ...row("thr_c1"), archivedAt: 2_000 } as never });
+    assert.equal(deliveries.get("acme/app#7")?.ownerNeeded, true, "the archive that stands");
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("a verified archive's effects run once; its late event does not run them again", async () => {
+  const { host, archived, archivedAtOf, row } = await captainHost({ envOf: { thr_c1: "env_c1" } });
+  try {
+    await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_c1")]);
+    liveTask(host, "c1");
+    const deliveries = createDeliveries(host.bb.storage.database());
+    deliveries.register({ url: "https://github.com/acme/app/pull/7", taskId: "c1", projectId: "proj_1", owner: "thr_c1", home: "", worker: "thr_c1", requirement: "pr" });
+    await host.harness.behavior.runSchedule("task-worktree-cleanup");
+    assert.deepEqual([...archived], ["thr_c1"]);
+    assert.equal(deliveries.get("acme/app#7")?.ownerNeeded, true);
+    deliveries.ownerRestored("acme/app#7");
+    await host.harness.behavior.emitThreadEvent("thread.archived", { thread: { ...row("thr_c1"), archivedAt: archivedAtOf.get("thr_c1")! } as never });
+    assert.equal(deliveries.get("acme/app#7")?.ownerNeeded, false, "applied once per archive");
   } finally { await host.harness.lifecycle.dispose(); }
 });

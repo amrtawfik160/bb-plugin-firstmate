@@ -16,6 +16,13 @@ export const CLEANUP_PASS_BUDGET_MS = 60_000;
 export const CLEANUP_MAX_TASKS = 20;
 export const KEPT_UNSAVED = "kept: unsaved work";
 
+/** BB keeps an archived thread's turn and terminals for this long; an unarchive inside it loses nothing. */
+export const ARCHIVE_UNDO_GRACE_MS = 30_000;
+/** Counted from just before the archive is sent, so earlier than BB's grace, which starts when BB commits
+ * it: the archive call and the read-back end by `verifyMs`, and every undo call is sent and awaited by
+ * `undoByMs`. The time between is reserved for the undo. */
+export const ARCHIVE_TIMINGS = { verifyMs: 12_000, undoByMs: 22_000 } as const;
+
 const RUNNING = new Set(["active", "starting", "pending", "stopping", "running"]);
 
 export function isRunningStatus(status: string): boolean {
@@ -152,6 +159,8 @@ export type CleanupDeps = {
   undone?: (threadId: string, detail: string) => void;
   /** An archive was read back and stands. */
   verified?: (threadId: string) => void;
+  /** Tests shorten these; see ARCHIVE_TIMINGS. */
+  archiveTimings?: { verifyMs: number; undoByMs: number };
 };
 
 export type CleanupRow = { taskId: string; action: "archived" | "kept"; detail: string; threadId?: string };
@@ -381,25 +390,32 @@ async function archiveChecked(deps: CleanupDeps, threadId: string, envId: string
   if (isRunning(before)) return { archived: false, detail: "running" };
   if (before.environmentId !== envId) return { archived: false, detail: "environment changed" };
 
+  const timings = deps.archiveTimings ?? ARCHIVE_TIMINGS;
+  const sentAt = Date.now();
+  const verifyBy = sentAt + timings.verifyMs, undoBy = sentAt + timings.undoByMs;
   let taken: readonly string[];
-  try { taken = await deps.archive(threadId); }
+  try { taken = await byDeadline(deps.archive(threadId), verifyBy, "archive"); }
   catch (error) {
     // The request may still have reached BB (a timeout, a reload); nothing verified it, so undo it.
     const stopping = isAbort(error) || deps.signal.aborted;
-    const undone = await undo(deps, threadId, [threadId], stopping ? "stopped while archiving" : `archive failed (${message(error)})`);
+    const undone = await undo(deps, threadId, [threadId], stopping ? "stopped while archiving" : `archive failed (${message(error)})`, undoBy);
     return stopping ? { ...undone, aborted: true } : undone;
   }
 
   // Read again right after: BB's archive has no idle check, so a turn or background work that
-  // started after the last read is seen here, while BB's undo grace still keeps it running.
+  // started after the last read is seen here, while BB's undo grace still keeps it running. Any
+  // sign of work, a failed read or the end of the verify time goes straight to the reserved undo.
   let reason: string | null = null;
   const others = taken.filter((id) => id !== threadId);
   if (others.length > 0) reason = `BB also archived ${others.join(", ")}`;
   if (reason === null) {
     try {
-      const after = await deps.thread(threadId);
-      const occupants = await deps.occupants(envId);
-      if (isRunning(after) || occupants.some((row) => isRunning(row))) reason = "work started while archiving";
+      const after = await byDeadline(deps.thread(threadId), verifyBy, "read-back");
+      // The thread itself shows work: undo now, without waiting for the worktree's threads. A read-back
+      // without the archive verifies nothing either; unarchiving a thread that is not archived is harmless.
+      if (after.archivedAt == null) reason = "read-back does not show the archive";
+      else if (isRunning(after)) reason = "work started while archiving";
+      else if ((await byDeadline(deps.occupants(envId), verifyBy, "worktree read-back")).some((row) => isRunning(row))) reason = "work started while archiving";
     } catch (error) {
       reason = isAbort(error) || deps.signal.aborted ? "stopped while archiving" : `not verified after archiving (${message(error)})`;
     }
@@ -408,21 +424,31 @@ async function archiveChecked(deps: CleanupDeps, threadId: string, envId: string
     deps.verified?.(threadId);
     return { archived: true, detail: "archived" };
   }
-  const undone = await undo(deps, threadId, taken.includes(threadId) ? taken : [threadId, ...taken], reason);
+  const undone = await undo(deps, threadId, taken.includes(threadId) ? taken : [threadId, ...taken], reason, undoBy);
   return deps.signal.aborted ? { ...undone, aborted: true } : undone;
 }
 
-// The lifecycle owner first: BB refuses to unarchive a dependent before its owner.
-async function undo(deps: CleanupDeps, threadId: string, taken: readonly string[], reason: string): Promise<{ archived: false; detail: string }> {
+// The lifecycle owner first: BB refuses to unarchive a dependent before its owner. Each call is
+// sent even when an earlier one ran out of time; waiting for it stops at the undo deadline.
+async function undo(deps: CleanupDeps, threadId: string, taken: readonly string[], reason: string, undoBy: number):
+  Promise<{ archived: false; detail: string }> {
   const order = [threadId, ...taken.filter((id) => id !== threadId)];
   const failed: string[] = [];
   for (const id of order) {
-    try { await deps.unarchive(id); }
+    try { await byDeadline(deps.unarchive(id), undoBy, "undo"); }
     catch (error) { failed.push(`${id} (${message(error)})`); }
   }
   const detail = failed.length === 0 ? `${reason}; archive undone` : `${reason}; undo failed for ${failed.join(", ")}`;
   deps.undone?.(threadId, detail);
   return { archived: false, detail };
+}
+
+/** Stops waiting for the call at the deadline; the call itself was already sent. */
+function byDeadline<T>(call: Promise<T>, deadline: number, what: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${what} not answered in time`)), Math.max(0, deadline - Date.now()));
+    call.then((value) => { clearTimeout(timer); resolve(value); }, (error: unknown) => { clearTimeout(timer); reject(error); });
+  });
 }
 
 async function unsavedIn(deps: CleanupDeps, path: string, crews: readonly CleanupCrew[]): Promise<readonly string[] | null> {

@@ -476,3 +476,60 @@ test("the worktree check and the archive run under the crews' lock, and the capt
   });
   assert.equal(heldAtReport, false, "telling the captain may take the captain's wake lock, which comes before a crew lock");
 });
+
+// Check round 2 (PR #179), finding 1: the undo must start well inside BB's 30-second grace.
+const quick = { verifyMs: 40, undoByMs: 120 };
+const never = <T>() => new Promise<T>(() => {});
+
+test("a read-back that does not answer in time goes straight to the reserved undo", async () => {
+  const w = world();
+  w.tasks = [task({ id: "T1", state: "live" })];
+  putCrew(w, "c1", "thr_c1");
+  let sentAt = 0, undoAt = 0;
+  const out = await run(w, {
+    archiveTimings: quick,
+    archive: async (id) => { sentAt = Date.now(); w.threads[id]!.archivedAt = 1; return [id]; },
+    thread: async (id) => (id === "thr_c1" && w.threads[id]!.archivedAt != null ? never<CleanupThread>() : w.threads[id]!),
+    unarchive: async (id) => { undoAt = Date.now(); w.unarchived.push(id); w.threads[id]!.archivedAt = null; },
+  });
+  assert.deepEqual(w.unarchived, ["thr_c1"]);
+  assert.ok(undoAt - sentAt < quick.undoByMs, `undo ${undoAt - sentAt} ms after the archive was sent`);
+  assert.match(out.rows[0]?.detail ?? "", /not verified after archiving \(read-back not answered in time\); archive undone/);
+});
+
+test("an archive call that does not answer in time is undone", async () => {
+  const w = world();
+  w.tasks = [task({ id: "T1", state: "live" })];
+  putCrew(w, "c1", "thr_c1");
+  const out = await run(w, { archiveTimings: quick, archive: () => never<readonly string[]>() });
+  assert.deepEqual(w.unarchived, ["thr_c1"]);
+  assert.match(out.rows[0]?.detail ?? "", /archive failed \(archive not answered in time\); archive undone/);
+});
+
+test("when the read-back shows work, the undo does not wait for the worktree read", async () => {
+  const w = world();
+  w.tasks = [task({ id: "T1", state: "live" })];
+  putCrew(w, "c1", "thr_c1");
+  let afterArchive = 0;
+  await run(w, {
+    archive: async (id) => { w.threads[id]!.status = "active"; w.threads[id]!.archivedAt = 1; return [id]; },
+    occupants: async (id) => { if (w.threads["thr_c1"]!.archivedAt != null) afterArchive += 1; return w.occupants[id] ?? []; },
+  });
+  assert.deepEqual(w.unarchived, ["thr_c1"]);
+  assert.equal(afterArchive, 0);
+});
+
+test("an undo call that does not answer stops being awaited at the undo deadline", async () => {
+  const w = world();
+  w.tasks = [task({ id: "T1", state: "live" })];
+  putCrew(w, "c1", "thr_c1");
+  const started = Date.now();
+  const out = await run(w, {
+    archiveTimings: quick,
+    archive: async (id) => { w.threads[id]!.status = "active"; w.threads[id]!.archivedAt = 1; return [id]; },
+    unarchive: () => never<void>(),
+  });
+  assert.ok(Date.now() - started < 1_000);
+  assert.match(out.rows[0]?.detail ?? "", /undo failed for thr_c1 \(undo not answered in time\)/);
+  assert.match(w.undone[0] ?? "", /undo failed/);
+});
