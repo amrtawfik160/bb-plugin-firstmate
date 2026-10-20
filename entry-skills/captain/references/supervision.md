@@ -48,7 +48,8 @@ Legacy `firstmate_wake` `ackThrough` and `recoveryGeneration` must match an outs
 
 ### Crew models
 
-- `firstmate_dispatch` `role` picks the model. A builder (the default) runs claude-code `claude-opus-5-5`. A checker runs codex `gpt-6.1-sol`. A `lookup` (a quick question) runs claude-code `claude-haiku-5-5`.
+- `firstmate_dispatch` `role` picks the model when the owner named none and you pass no `rule`. A builder (the default) uses the home's `config/crew-dispatch.json` default (starter: claude-code `claude-opus-5-5`). A checker uses the checker rule (starter: codex `gpt-6.1-sol`, must differ from the builder). A `lookup` runs claude-code `claude-haiku-5-5`.
+- When the owner named no model, pick a rule from that file by judgement and pass it as `rule` (the rule id or when-text). Quota skips a profile under 15% weekly. The dispatch result names the pick in one short line; pass that line to the owner. Edit rules with `firstmate_models` (`bb firstmate models`).
 - Pass `providerId`, `model` or `reasoningLevel` only when the owner named them for this task. They apply to that task's crews only. Example: "opus 5.5 medium for ui, grok 4.6 xhigh for logic, codex for checker" gives the UI crew `claude-opus-5-5` with `reasoningLevel=medium`, the logic crew `acp-grok` `grok-4.6` with `xhigh`, and the checker `providerId=codex`.
 - Dispatch refuses a model that the provider does not offer, and nothing is spawned. Use the ids it lists.
 
