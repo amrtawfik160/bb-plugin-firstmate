@@ -98,7 +98,8 @@ test('a model BB lists but the provider CLI refuses is refused at dispatch, befo
   } finally { await f.host.harness.lifecycle.dispose(); }
 });
 
-// A dispatch that names acp-antigravity and no model runs the bridge's default model, gemini-4-argon on 20 Oct.
+// A dispatch that names acp-antigravity and no model runs the provider's catalog default (gemini-3.8-flash on 20 Oct).
+// The check follows that default: here the catalog marks gemini-4-argon, which agy refuses, then gemini-3.8-flash.
 test('a named provider with no model is checked by its default model: one its CLI refuses is refused before anything is reserved', async () => {
   const f = await gapsHost();
   const antigravity = (fallback: string) => ['gemini-3.8-flash', 'gemini-4-argon', 'claude-sonnet-4-6'].map((id) => ({ id, model: id, ...(id === fallback ? { isDefault: true } : {}) }));

@@ -6229,9 +6229,9 @@ export default async function plugin(bb: BbPluginApi) {
     return `${subject} (\`${probe.command}\`). ${accepted.length > 0 ? `Models it accepts: ${accepted.join(", ")}.${named ? "" : " Name one of them."}` : `Its CLI lists only: ${ids.ids.join(", ")}.`} Nothing was spawned.`;
   }
 
-  // 20 Oct: a dispatch that names acp-antigravity and no model runs on the model the bridge starts by default,
-  // gemini-4-argon, which agy refuses. That default is checked like a named model. A catalog that cannot be read
-  // leaves it unchecked, as before.
+  // A dispatch that names acp-antigravity and no model runs on the provider's catalog default (gemini-3.8-flash on
+  // 20 Oct; the bridge falls back to gemini-4-argon, which agy refuses, when its adapter reports no model). That
+  // default is checked like a named model. A catalog that cannot be read leaves it unchecked, as before.
   async function cliDefaultModelRefusal(providerId: string, hostId: string | undefined): Promise<string | null> {
     if (hostId === undefined) return null;
     let models: Record<string, unknown>[];
@@ -19267,7 +19267,8 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
     if (await bb.storage.kv.get(verifyKey) !== undefined) return;
-    const gap = pipeline !== null ? pipelineProofGap(report, proofStep(pipeline)) : verifyStepGap(report, playbookText);
+    // A workstream crew opens no PR: its brief asks for the proof line at its head commit.
+    const gap = pipeline !== null ? pipelineProofGap(report, proofStep(pipeline), undefined, { workstream: crew.workstreamId !== undefined }) : verifyStepGap(report, playbookText);
     // A report with no step lines is not judged yet; the gap request above asks for them.
     if (gap === null && reportGaps(report, steps).some((g) => g.startsWith("playbook step lines (0 "))) return;
     await bb.storage.kv.set(verifyKey, { gap });

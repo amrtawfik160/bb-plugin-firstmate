@@ -110,14 +110,30 @@ test('a workstream task crew is told not to open a PR, a lookup keeps /pr, and a
     const tasks = createOwnerTasks(host.bb.storage.database());
     const held = tasks.list('cap').find((t) => t.crewIds.includes('editor-one'))!;
     assert.equal(held.state, 'working');
+    // The report check reads the playbook file; the crew's report is its final message.
+    host.harness.sdk.stub('files.read', async ({ path }: { path: string }) => {
+      if (path.endsWith('/poteto-mode/playbooks/feature.md')) return { content: '1. Sharpen\n2. Build\n3. Prove\n', contentEncoding: 'utf8', sizeBytes: 30 };
+      throw new Error('no such file');
+    });
     const emitted = await host.harness.behavior.emitThreadEvent('thread.idle', {
       thread: makeThreadResponse({ id: 'worker1', status: 'idle', projectId: 'cyndra' }),
-      lastAssistantText: 'DONE: committed 4f2a9c1 on the task branch\n\nHead commit 4f2a9c1. No PR: the workstream PR ships this work.',
+      lastAssistantText: [
+        'DONE: committed 4f2a9c1 on the task branch', '',
+        'Head commit 4f2a9c1. No PR: the workstream PR ships this work.',
+        'Skills read: /root/.codex/skills/skill-routing/SKILL.md',
+        '✓ P1 Sharpen: the editor saves drafts', '✓ P2 Architect: one draft row per user', '✓ P3 TDD build: saves a draft (failed first)',
+        '✓ P4 Prove on the real surface at 4f2a9c1: driven a draft save on the dev link; seen the draft after reload',
+        '✓ P5 Code review: none', '✓ P6 No comments: none', 'skip: P7 PR: workstream PR',
+      ].join('\n'),
     });
     assert.deepEqual(emitted.errors, []);
     const after = tasks.get(held.id)!;
     assert.equal(after.state, 'check', 'the DONE report finished the crew, as a delivery');
     assert.match(after.outcome ?? '', /^DONE: committed 4f2a9c1 on the task branch\. Next: check the work/, 'its DONE is read as delivered, not as a crew that retired without reporting done');
+    assert.deepEqual(await host.bb.storage.kv.get('report-check:worker1'), { gaps: [] }, 'skip: P7 counts, so no "(6 of 7)" request');
+    assert.deepEqual(await host.bb.storage.kv.get('verify-check:worker1'), { gap: null }, 'its P4 line at the head commit proves the step without a PR');
+    const sent = host.harness.sdk.callsTo('threads.send').map((call) => JSON.stringify(call[0]));
+    assert.ok(!sent.some((m) => /REPORT INCOMPLETE|NOT VERIFIED/.test(m)), sent.join('\n'));
   } finally { await host.harness.lifecycle.dispose(); }
 });
 
