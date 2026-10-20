@@ -5221,8 +5221,9 @@ export default async function plugin(bb: BbPluginApi) {
   async function threadFailureDetail(threadId: string): Promise<string> {
     return (await threadFailure(threadId)).detail;
   }
-  // httpStatus is the structured status of the newest provider error, when it has one.
-  async function threadFailure(threadId: string, signal?: AbortSignal): Promise<{ detail: string; httpStatus: number | null }> {
+  // httpStatus is the structured status of the newest provider error, when it has one. read is
+  // false when the events could not be read, so a null status there is unknown, not "no status".
+  async function threadFailure(threadId: string, signal?: AbortSignal): Promise<{ detail: string; httpStatus: number | null; read: boolean }> {
     let detail = "";
     let httpStatus: number | null = null;
     try {
@@ -5238,8 +5239,9 @@ export default async function plugin(bb: BbPluginApi) {
       }
     } catch {
       // the generic note still applies
+      return { detail, httpStatus, read: false };
     }
-    return { detail, httpStatus };
+    return { detail, httpStatus, read: true };
   }
   // The one captain notice for a crew whose provider answered 402. The thread.failed handler and
   // the crew-watch pass both page this exact text, so the per-thread delivery signature lets only
@@ -5252,8 +5254,12 @@ export default async function plugin(bb: BbPluginApi) {
     return `crew ${crew.id}: its provider${provider ? ` ${provider}` : ""} is out of balance (HTTP 402 Payment Required). It was not restarted: a restart on ${provider ?? "the same provider"} fails the same way. Its ${kept} are kept. To continue, restart it on another provider: bb firstmate retry ${crew.id} --provider <id>.`;
   }
   // What the crew-watch pass pages for a crew in error: the 402 notice, else the crew's output.
-  async function errorPage(crew: Crew, signal?: AbortSignal): Promise<string | null> {
-    return await paymentRequiredNotice(crew, (await threadFailure(crew.threadId, signal)).httpStatus, signal) ?? await crewOutput(crew, 300, signal);
+  // Undefined when its provider errors could not be read: paging the output then would send a
+  // second, different wake after a 402 notice, so the page waits for the next pass.
+  async function errorPage(crew: Crew, signal?: AbortSignal): Promise<string | null | undefined> {
+    const failure = await threadFailure(crew.threadId, signal);
+    if (!failure.read) return undefined;
+    return await paymentRequiredNotice(crew, failure.httpStatus, signal) ?? await crewOutput(crew, 300, signal);
   }
 
   async function createNativeWorker(flags: Map<string, FlagValue>, ctx: unknown) {
@@ -14981,7 +14987,11 @@ export default async function plugin(bb: BbPluginApi) {
       if (prev === undefined) {
         if (status === "error" || status === "unknown") {
           const detail = status === "error" ? await errorPage(crew, passSignal) : null;
-          if (passSignal.aborted || !(await pageOrDefer(crew, status, detail))) {
+          if (detail === undefined && !passSignal.aborted) {
+            bb.log.warn(`crew ${crew.id}: its provider errors could not be read; its error page waits for the next pass`);
+            continue;
+          }
+          if (passSignal.aborted || !(await pageOrDefer(crew, status, detail ?? null))) {
             inspected--;
             break;
           }
@@ -14999,7 +15009,11 @@ export default async function plugin(bb: BbPluginApi) {
       if (status === "error" || status === "unknown") {
         if (prev.alerted !== status) {
           const detail = status === "error" ? await errorPage(crew, passSignal) : null;
-          if (passSignal.aborted || !(await pageOrDefer(crew, status, detail))) {
+          if (detail === undefined && !passSignal.aborted) {
+            bb.log.warn(`crew ${crew.id}: its provider errors could not be read; its error page waits for the next pass`);
+            continue;
+          }
+          if (passSignal.aborted || !(await pageOrDefer(crew, status, detail ?? null))) {
             inspected--;
             break;
           }

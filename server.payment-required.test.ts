@@ -112,3 +112,41 @@ for (const reload of [false, true]) {
     } finally { await host.harness.lifecycle.dispose(); if (next) await next.harness.lifecycle.dispose(); }
   });
 }
+
+// PR #178 check round 2: BB's event read failed during the next pass, and the pass read that as "no 402".
+async function seed(host: Host, tracked = true) {
+  withGrok(host);
+  await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew", kept)]);
+  if (tracked) await host.bb.storage.kv.set("watch", {c1: {status: "active", hash: "", at: Date.now(), stuck: false}});
+}
+test("an event-read outage after a 402 lifecycle wake must not send a second wake", async () => {
+  const {host} = await deck();
+  try {
+    await seed(host);
+    host.harness.sdk.stub("threads.events.list", async () => [GROK_402]);
+    await failed(host, "thr_crew", "Provider error");
+    assert.equal(sentTo(host, "thr_cap").length, 1);
+    host.harness.sdk.stub("threads.events.list", async (args: {threadId?: string; types?: string[]}) => {
+      if (args.threadId === "thr_crew" && args.types?.includes("provider/error")) throw new Error("BB events service temporarily unavailable");
+      return [];
+    });
+    await host.bb.storage.kv.set("watch-meta", {checked: -1});
+    const run = host.harness.behavior.runService("crew-watch");
+    try {
+      const until = Date.now() + 5000;
+      let settled = false;
+      while (Date.now() < until) {
+        const meta = await host.bb.storage.kv.get("watch-meta") as {checked?: number};
+        if (meta?.checked !== -1 || host.harness.logEntries.some(row => row.message.includes("supervise:"))) {settled = true; break;}
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      assert.ok(settled, "the outage pass completed or deferred");
+    } finally {run.controller.abort(); await run.done;}
+    const wakes = sentTo(host, "thr_cap");
+    console.log(JSON.stringify({scenario: "event-read outage", wakes}));
+    assert.equal(wakes.length, 1, "event-read outage must preserve the prior 402 notification");
+    host.harness.sdk.stub("threads.events.list", async () => [GROK_402]);
+    await onePass(host);
+    assert.equal(sentTo(host, "thr_cap").length, 1, "a successful later read must still deduplicate");
+  } finally {await host.harness.lifecycle.dispose();}
+});
