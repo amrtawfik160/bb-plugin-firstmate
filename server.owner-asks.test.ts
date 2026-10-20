@@ -46,12 +46,20 @@ test("explicit ask RPCs validate the captain and correct answered decisions", as
       "",
       "🔧 In progress: nothing open.",
     ].join("\n"));
+    let tap = "Publish";
+    host.harness.sdk.stub("plugins.callRpc", async (call: { method?: string }) => {
+      if (call.method === "ownerAnswer") return { answer: tap, ok: true };
+      return { ok: true, queued: 1, duplicate: false, mode: "on" };
+    });
     assert.deepEqual(await host.harness.behavior.callRpc("resolveAsk", { threadId: "thr_other", id: "aexisting", resolution: "Publish" }), { ok: false });
     assert.deepEqual(await host.harness.behavior.callRpc("resolveAsk", { threadId: "thr_cap", id: "aexisting", resolution: "Publish" }), { ok: true });
     assert.equal(asks.get("aexisting")?.resolution, "Publish");
     assert.deepEqual(await host.harness.behavior.callRpc("resolveAsk", { threadId: "thr_cap", id: "aexisting", resolution: "Publish" }), { ok: true }, "an exact repeat of the recorded answer is accepted");
     assert.deepEqual(await host.harness.behavior.callRpc("resolveAsk", { threadId: "thr_cap", id: "aexisting", resolution: "Owner approved the address repair at 12:00 Cairo." }), { ok: false });
     assert.equal(asks.get("aexisting")?.resolution, "Publish");
+    tap = "Owner approved the address repair at 12:00 Cairo.";
+    assert.deepEqual(await host.harness.behavior.callRpc("resolveAsk", { threadId: "thr_cap", id: "aexisting", resolution: "Owner approved the address repair at 12:00 Cairo." }), { ok: true });
+    assert.equal(asks.get("aexisting")?.resolution, "Owner approved the address repair at 12:00 Cairo.");
     assert.deepEqual(await host.harness.behavior.callRpc("telegramCommand", { threadId: "thr_cap", command: "board" }), { text: "📌 Needs you: nothing right now.\n\n✅ Finished since you last looked: nothing new.\n\n🚀 Not live yet: nothing merged waits to go live.\n\n🔧 In progress: nothing open.", away: false, projects: [], notLive: [] }, "no crew runs: zero crews, so Telegram does not count task lines");
 
     const sent = host.harness.sdk.callsTo("plugins.callRpc").map((call) => call[0] as { method: string });

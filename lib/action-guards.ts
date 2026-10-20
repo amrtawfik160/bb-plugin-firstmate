@@ -9,6 +9,26 @@ export function withoutWakeWarning(output: string): string {
   return output.split(/\r?\n/).filter((line) => !WAKE_WARNING.test(line.trim())).join("\n").trim();
 }
 
+/** fm-spawn appends a "bb cli errors:" dump after the refusal; drop that block and everything after it. */
+export function withoutBbCliErrors(output: string): string {
+  const lines = output.split(/\r?\n/);
+  const cut = lines.findIndex((line) => line.trim() === "bb cli errors:");
+  return (cut === -1 ? lines : lines.slice(0, cut)).join("\n").trim();
+}
+
+const SPAWN_FAILURE_MAX = 2000;
+
+/** Stored/shown fm-spawn refusal: real error first, then a tail if the remainder is still long. */
+export function nativeSpawnFailureOutput(output: string): string {
+  const cleaned = withoutBbCliErrors(withoutWakeWarning(output));
+  if (cleaned.length <= SPAWN_FAILURE_MAX) return cleaned;
+  const firstLine = (cleaned.split(/\r?\n/, 1)[0] ?? "").slice(0, SPAWN_FAILURE_MAX);
+  if (firstLine.length >= SPAWN_FAILURE_MAX) return firstLine;
+  const sep = "\n...\n";
+  const tailBudget = SPAWN_FAILURE_MAX - firstLine.length - sep.length;
+  return `${firstLine}${sep}${cleaned.slice(-tailBudget)}`;
+}
+
 /** The command that reads a provider's sign-in on its host, or null when it has none to check. */
 export function signInCommand(providerId: string | null | undefined): { command: string; fix: string; label: string } | null {
   if (providerId === "codex" || providerId === "provider-codex") return { command: "codex login status", fix: "run `codex login` on that host", label: "Codex" };

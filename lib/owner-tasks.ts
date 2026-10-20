@@ -57,6 +57,11 @@ export interface OwnerTask {
   history?: TaskCorrection[];
   /** Created after the fact from an owner request that had no closure. */
   backfilled: boolean;
+  /**
+   * Open epoch. Starts at 1. Closing then reopening (attach, reconcile, or a move
+   * from a finished state) increments it so a pre-approval bound to the old opening dies.
+   */
+  generation?: number;
   createdAt: number;
   updatedAt: number;
 }
@@ -98,6 +103,10 @@ export function isOpenTask(task: Pick<OwnerTask, "state">): boolean {
 
 export function isFinishedTask(task: Pick<OwnerTask, "state">): boolean {
   return FINISHED_TASK_STATES.includes(task.state);
+}
+
+export function taskOpenEpoch(task: Pick<OwnerTask, "generation">): number {
+  return task.generation && task.generation > 0 ? task.generation : 1;
 }
 
 /** Apply one move, or explain why the state machine refuses it. */
@@ -313,7 +322,9 @@ export function createOwnerTasks(db: Database, heldOpen: HeldOpen = () => null, 
 
   function get(id: string): OwnerTask | undefined {
     const row = db.prepare("SELECT record FROM owner_task WHERE id=?").get(id) as { record: string } | undefined;
-    return row ? JSON.parse(row.record) as OwnerTask : undefined;
+    if (!row) return undefined;
+    const parsed = JSON.parse(row.record) as OwnerTask;
+    return { generation: 1, ...parsed };
   }
 
   function save(task: OwnerTask): OwnerTask {
@@ -325,7 +336,10 @@ export function createOwnerTasks(db: Database, heldOpen: HeldOpen = () => null, 
     const rows = (scope.includeClosed
       ? db.prepare("SELECT record FROM owner_task WHERE captain=? ORDER BY seq").all(captain)
       : db.prepare(`SELECT record FROM owner_task WHERE captain=? AND state IN (${OPEN_TASK_STATES.map(() => "?").join(",")}) ORDER BY seq`).all(captain, ...OPEN_TASK_STATES)) as { record: string }[];
-    return rows.map((row) => JSON.parse(row.record) as OwnerTask);
+    return rows.map((row) => {
+      const parsed = JSON.parse(row.record) as OwnerTask;
+      return { generation: 1, ...parsed };
+    });
   }
 
   function openByRef(captain: string, ref: string): OwnerTask[] {
@@ -365,6 +379,7 @@ export function createOwnerTasks(db: Database, heldOpen: HeldOpen = () => null, 
           prs: [...new Set(input.prs ?? [])],
           crewIds: input.crewId ? [input.crewId] : [],
           backfilled: input.backfilled === true,
+          generation: 1,
           createdAt: input.at,
           updatedAt: input.at,
         };
@@ -386,7 +401,11 @@ export function createOwnerTasks(db: Database, heldOpen: HeldOpen = () => null, 
           return save({ ...task, outcome, updatedAt: at });
         }
         const next = moveTask(task, move, at);
-        return next === task ? task : save(next);
+        if (next === task) return task;
+        if (isFinishedTask(task) && !isFinishedTask(next)) {
+          return save({ ...next, generation: taskOpenEpoch(task) + 1 });
+        }
+        return save(next);
       })();
     },
     linkPr(id, captain, pr, at) {
@@ -410,7 +429,8 @@ export function createOwnerTasks(db: Database, heldOpen: HeldOpen = () => null, 
           ? { projectId: input.project.id, project: task.project ?? projectName(input.project.label, list(captain, { includeClosed: true }).map((item) => item.project)) }
           : {};
         if (restarted === task && crewIds === task.crewIds && sourceRefs.length === task.sourceRefs.length && !("projectId" in project)) return task;
-        return save({ ...restarted, ...project, crewIds, sourceRefs, updatedAt: input.at });
+        const generation = isFinishedTask(task) && restarted.state !== task.state ? taskOpenEpoch(task) + 1 : taskOpenEpoch(restarted);
+        return save({ ...restarted, ...project, crewIds, sourceRefs, generation, updatedAt: input.at });
       })();
     },
     removeCrew(id, captain, input, at) {
@@ -475,7 +495,7 @@ export function createOwnerTasks(db: Database, heldOpen: HeldOpen = () => null, 
           const stillOpen = task.state !== "dropped" ? linked.filter(isOpenPr) : [];
           if (finished && (fresh.length > 0 || stillOpen.length > 0)) {
             const why = fresh.length > 0 ? `New PR ${fresh.map((r) => r.id).join(", ")} on a finished task` : `PR ${stillOpen.map((r) => r.id).join(", ")} is still open`;
-            next = moveTask(next, { to: "working", reason: why }, at);
+            next = { ...moveTask(next, { to: "working", reason: why }, at), generation: taskOpenEpoch(task) + 1 };
           } else if (finished) {
             if (next !== task) changed.push(save(next));
             continue;
