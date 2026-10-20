@@ -41,7 +41,7 @@ async function realCaptain(opts: { hangSpawn?: boolean; abort?: AbortController;
   stubProviderCatalog(host);
   const seen: string[] = [];
   const cmds = new Map<string, string>();
-  const state = { spawnExit: 1, spawnOutput: ADMISSION_TIMEOUT, threadIdAfterSpawn: "", spawned: 0, spawnSucceeded: false, spawnCreateError: undefined as Error | undefined, onSpawn: undefined as undefined | (() => Promise<void>), omitSpawnMarker: false, envAttemptToken: undefined as string | undefined };
+  const state = { spawnExit: 1, spawnOutput: ADMISSION_TIMEOUT, threadIdAfterSpawn: "", spawned: 0, spawnSucceeded: false, spawnCreateError: undefined as Error | undefined, onSpawn: undefined as undefined | (() => Promise<void>), omitSpawnMarker: false, envAttemptToken: undefined as string | undefined, failBriefStaging: false };
   host.harness.sdk.stub("threads.send", async () => ({}));
   host.harness.sdk.stub("threads.events.list", async () => []);
   host.harness.sdk.stub("threads.list", async () => []);
@@ -67,6 +67,7 @@ async function realCaptain(opts: { hangSpawn?: boolean; abort?: AbortController;
   host.harness.sdk.stub("terminals.close", async () => ({}));
   host.harness.sdk.stub("terminals.output", async (args: { terminalId: string }) => {
     const cmd = cmds.get(args.terminalId) ?? "";
+    if (state.failBriefStaging && cmd.includes(".fm-brief-fill")) return hostRc("host file staging failed", 1);
     if (cmd.includes("fm-project-mode.sh")) return hostRc("direct-PR off");
     if (cmd.includes("fm-spawn.sh") && !cmd.includes("native_command=")) {
       state.spawned++;
@@ -627,6 +628,49 @@ test("a failed scout start then a same-id ship start launches and rewrites the n
     assert.equal(retry.exitCode, 0, retry.stderr);
     assert.equal(spawnCommands(seen).length, 2);
     assert.ok(seen.slice(before).some((c) => c.includes("rm -f") && c.includes("launch-brief.md")));
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a scout-to-ship retry that fails at brief staging keeps the rewrite for the next ship retry (177 check 1)", async () => {
+  const { host, seen, state } = await realCaptain();
+  try {
+    const args = (shape: string, task: string) => ["dispatch", "--project", ctx.projectId, "--task-id", TASK, "--shape", shape, "--", task];
+    const first = await host.harness.behavior.runCli(args("scout", "survey login"), ctx);
+    assert.equal(first.exitCode, 1, first.stderr);
+    assert.equal(launchStore(host).forTask(ctx.projectId, ctx.threadId, TASK)?.shape, "scout");
+    assert.equal(spawnCommands(seen).length, 1);
+
+    // The ship retry saves its shape, then host staging fails before the brief is rewritten.
+    state.failBriefStaging = true;
+    const staged = await host.harness.behavior.runCli(args("ship", "fix login"), ctx);
+    assert.equal(staged.exitCode, 1, staged.stderr);
+    assert.match(staged.stderr, /could not stage the brief text/);
+    const failed = launchStore(host).forTask(ctx.projectId, ctx.threadId, TASK);
+    assert.equal(failed?.shape, "ship");
+    assert.equal(failed?.state, "failed");
+    assert.equal(failed?.threadId, null);
+    assert.equal(failed?.creationRequested, false);
+    assert.equal(spawnCommands(seen).length, 1, "no spawn ran without a brief");
+
+    state.failBriefStaging = false;
+    state.spawnExit = 0;
+    state.threadIdAfterSpawn = "thr_ship";
+    const before = seen.length;
+    const retry = await host.harness.behavior.runCli(args("ship", "fix login"), ctx);
+    assert.equal(retry.exitCode, 0, retry.stderr);
+    const briefScript = seen.slice(before).find((c) => c.includes("fm-brief.sh") && c.includes(".fm-brief-fill") && !c.includes(".fm-b64-"));
+    assert.ok(briefScript, "the retry rewrites the native brief");
+    assert.ok(briefScript.indexOf("launch-brief.md") > -1 && briefScript.indexOf("rm -f") < briefScript.indexOf("crew --mode"), "the scout brief is removed before the ship scaffold");
+    assert.doesNotMatch(briefScript, /crew --scout/);
+    const spawns = spawnCommands(seen.slice(before));
+    assert.equal(spawns.length, 1, "exactly one ship start");
+    assert.doesNotMatch(spawns[0]!, /--scout/);
+    assert.match(spawns[0]!, /--mode/);
+    const launched = launchStore(host).forTask(ctx.projectId, ctx.threadId, TASK);
+    assert.equal(launched?.threadId, "thr_ship");
+    assert.equal(launched?.shape, "ship");
   } finally {
     await host.harness.lifecycle.dispose();
   }

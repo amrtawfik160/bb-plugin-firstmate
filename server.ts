@@ -7031,12 +7031,11 @@ export default async function plugin(bb: BbPluginApi) {
     const key = launchKey(input.projectId, input.parentThreadId ?? "", home, taskId);
     return launches.once(`dispatch:${key}`, async () => {
       const prior = launches.get(key);
-      let replaceNativeBrief = false;
-      if (prior && prior.shape !== input.shape) {
-        const canReplace = prior.state === "failed" && !prior.threadId && prior.creationRequested !== true && !createRequestActive(prior);
-        if (!canReplace) throw new Error(`Start ${taskId} under a new id.`);
-        replaceNativeBrief = true;
-      }
+      // A failed attempt that proves no worker and no creation request rewrites the native brief
+      // for this request, even when its saved shape already matches: an earlier retry may have
+      // saved the new shape and then failed before its brief rewrite (host staging).
+      const replaceNativeBrief = prior !== undefined && prior.state === "failed" && !prior.threadId && prior.creationRequested === false && !createRequestActive(prior);
+      if (prior && prior.shape !== input.shape && !replaceNativeBrief) throw new Error(`Start ${taskId} under a new id.`);
       const record = await launches.reserve({ key, taskId, projectId: input.projectId, owner: input.parentThreadId ?? "",
         home, generation: 1, shape: input.shape, deliveryMode:input.mode, yolo:input.yolo, deliveryRequirement:input.deliveryRequirement ?? "merged", state: "reserved", threadId: null, creationRequested: false, attemptToken: randomUUID(), updatedAt: Date.now() }, () => launchCapacity(input.parentThreadId));
       const resolved = await reconcileLaunch(record);
