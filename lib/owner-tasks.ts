@@ -51,6 +51,8 @@ export interface OwnerTask {
   evidence?: string;
   /** When it became live or dropped; later edits never move it. */
   finishedAt?: number;
+  /** Set when Live/dropped cleanup refused because the worktree still has uncommitted or unpushed work. */
+  worktreeKept?: "kept: unsaved work";
   /** PRs the captain linked after it finished: new work, whenever the PR was opened. */
   lateLinks?: string[];
   /** Corrections of the record, oldest first. Entries are only ever added. */
@@ -273,6 +275,8 @@ export type OwnerTasks = {
   removeCrew(id: string, captain: string, input: Correction & { crewId: string }, at: number): OwnerTask;
   /** Correct a dropped task's reason; the owner's message ref stays. Moves no state. */
   amendDropReason(id: string, captain: string, input: Correction & { text: string }, at: number): OwnerTask;
+  /** Record that Live/dropped cleanup kept the worktree because it still has unsaved work. Moves no state. */
+  keepWorktree(id: string, captain: string, note: "kept: unsaved work"): OwnerTask;
   /** A crew finished. When no other crew of its task still runs, settle the task. */
   finishCrew(captain: string, crewId: string, finish: CrewFinish, running: (crewId: string) => boolean,
     recordsFor: (task: OwnerTask) => readonly DeliveryRecord[], at: number): OwnerTask | undefined;
@@ -431,6 +435,13 @@ export function createOwnerTasks(db: Database, heldOpen: HeldOpen = () => null, 
         if (reason === "" || text === "") throw new Error(`Amending task ${id}'s drop reason needs a reason and the new words.`);
         const entry: TaskCorrection = { at, actor: input.actor, action: "amend-drop-reason", before: task.dropReason ?? "", after: text, reason };
         return save({ ...task, dropReason: text, history: [...(task.history ?? []), entry] });
+      })();
+    },
+    keepWorktree(id, captain, note) {
+      return db.transaction(() => {
+        const task = owned(id, captain);
+        if (task.worktreeKept === note) return task;
+        return save({ ...task, worktreeKept: note });
       })();
     },
     holding(captain, prs) {
