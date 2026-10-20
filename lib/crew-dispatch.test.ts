@@ -66,7 +66,7 @@ test("first use writes the DESIGN.md starter rules; empty home stays in memory",
     const loaded = loadCrewDispatch(f.dir);
     assert.equal(loaded.written, true);
     assert.equal(loaded.broken, false);
-    const written = JSON.parse(readFileSync(join(f.dir, "config", "crew-dispatch.json"), "utf8")) as {
+    const written = JSON.parse(readFileSync(join(f.dir, "config", "fm-model-rules.json"), "utf8")) as {
       rules: Array<{ id: string; use: Array<{ harness: string; model: string; effort?: string }> }>;
       default: Array<{ model: string }>;
     };
@@ -81,6 +81,22 @@ test("first use writes the DESIGN.md starter rules; empty home stays in memory",
     assert.equal(written.default[0]?.model, "claude-opus-5-5");
     assert.equal(JSON.stringify(written).includes("gpt-6-astra"), false, "no starter rule uses gpt-6-astra");
     assert.equal(loadCrewDispatch(f.dir).written, false, "a second load does not rewrite");
+  } finally { f.done(); }
+});
+
+test("the plugin never reads or writes config/crew-dispatch.json, the file the native home check scans", () => {
+  const f = home();
+  try {
+    mkdirSync(join(f.dir, "config"), { recursive: true });
+    const native = join(f.dir, "config", "crew-dispatch.json");
+    writeFileSync(native, '{"rules":[],"default":{"harness":"grok"}}');
+    const loaded = loadCrewDispatch(f.dir);
+    assert.equal(loaded.broken, false, "the native file is not read");
+    assert.equal(loaded.config.default[0]?.model, "claude-opus-5-5");
+    runModelsCommand(f.dir, { action: "set", id: "docs", when: "docs only", use: [{ harness: "claude-code", model: "claude-haiku-5-5" }] });
+    runModelsCommand(f.dir, { action: "reset" });
+    assert.equal(readFileSync(native, "utf8"), '{"rules":[],"default":{"harness":"grok"}}', "the native file is not written");
+    assert.deepEqual(readdirSync(join(f.dir, "config")).filter((name) => !name.endsWith(".bak")).sort(), ["crew-dispatch.json", "fm-model-rules.json"]);
   } finally { f.done(); }
 });
 
@@ -220,13 +236,13 @@ test("checker differs: a checker skips the builder model of the task it checks",
 test("broken file: falls back to starter rules, reports once, and edits never overwrite it", () => {
   const f = home();
   try {
-    const file = join(f.dir, "config", "crew-dispatch.json");
+    const file = join(f.dir, "config", "fm-model-rules.json");
     mkdirSync(join(f.dir, "config"), { recursive: true });
     writeFileSync(file, "{not json");
     const first = loadCrewDispatch(f.dir);
     assert.equal(first.broken, true);
     assert.equal(first.config.default[0]?.model, "claude-opus-5-5");
-    assert.equal(first.brokenNotice, "Tell the owner: config/crew-dispatch.json is broken (not valid JSON); crews use the starter rules until it is fixed.");
+    assert.equal(first.brokenNotice, "Tell the owner: config/fm-model-rules.json is broken (not valid JSON); crews use the starter rules until it is fixed.");
     const second = loadCrewDispatch(f.dir);
     assert.equal(second.broken, true);
     assert.equal(second.brokenNotice, undefined, "reported once per broken content");
@@ -235,14 +251,14 @@ test("broken file: falls back to starter rules, reports once, and edits never ov
     assert.match(third.brokenNotice ?? "", /broken \(default\..*harness/, "new broken content reports again, with the field");
     writeFileSync(file, '{"rules":[{"when":"x","use":{"harness":"codex","modle":"gpt-6-luna"}}],"default":{"harness":"codex"}}');
     assert.equal(loadCrewDispatch(f.dir).broken, true, "an unknown key is a typo, not ignored");
-    assert.match(runModelsCommand(f.dir, { action: "list" }).text, /^config\/crew-dispatch\.json is broken \(.+\); crews use these starter rules/);
+    assert.match(runModelsCommand(f.dir, { action: "list" }).text, /^config\/fm-model-rules\.json is broken \(.+\); crews use these starter rules/);
     assert.throws(() => runModelsCommand(f.dir, { action: "set", when: "docs", use: [{ harness: "codex" }] }), /is broken .*run reset/);
     assert.match(readFileSync(file, "utf8"), /modle/, "the owner's broken text is untouched");
     const reset = runModelsCommand(f.dir, { action: "reset" });
-    assert.match(reset.text, /Wrote the starter rules; the old file is config\/crew-dispatch\.json\..+\.bak/);
+    assert.match(reset.text, /Wrote the starter rules; the old file is config\/fm-model-rules\.json\..+\.bak/);
     assert.equal(readdirSync(join(f.dir, "config")).filter((name) => name.endsWith(".bak")).length, 1);
     assert.equal(loadCrewDispatch(f.dir).broken, false);
-    assert.equal(existsSync(join(f.dir, "state", "crew-dispatch.broken")), false);
+    assert.equal(existsSync(join(f.dir, "state", "fm-model-rules.broken")), false);
   } finally { f.done(); }
 });
 

@@ -29,7 +29,7 @@ A task or ticket that is not finished and has had no next step for more than 24 
 _Avoid_: stuck, forgotten, blocked
 
 **Model rule**:
-One line of the home's model-choice file (`config/crew-dispatch.json`): a kind of task and the models for it, strongest first. When the owner names no model, Firstmate picks the rule; quota and the provider catalog pick the model from it.
+One line of the home's model-choice file (`config/fm-model-rules.json`): a kind of task and the models for it, strongest first. When the owner names no model, Firstmate picks the rule; quota and the provider catalog pick the model from it.
 _Avoid_: routing rule, dispatch profile
 
 ## States

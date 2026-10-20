@@ -48,7 +48,7 @@ Legacy `firstmate_wake` `ackThrough` and `recoveryGeneration` must match an outs
 
 ### Crew models
 
-- Order: a model the owner named, then the model rule you pick, then the role default. The rules are in the home's `config/crew-dispatch.json`; `firstmate_models` lists them.
+- Order: a model the owner named, then the model rule you pick, then the role default. The rules are in the home's `config/fm-model-rules.json`; `firstmate_models` lists them.
 - When the owner named no model, pass the rule that fits the task best as `rule` (its id or when-text). Choose by your judgement. Omit `rule` when none fits.
 - Without a rule, `role` decides. A builder (the default) uses the file's default (starter: claude-code `claude-opus-5-5`). A checker uses the checker rule (starter: codex `gpt-6.1-sol`) and never the model of the builder it checks; pass its `taskRef`. A `lookup` runs claude-code `claude-haiku-5-5`.
 - Each rule lists models strongest first. Dispatch skips a model with less than 15% of its weekly quota left, and a model the provider catalog refuses. When every model is low, it keeps the strongest one.

@@ -1,6 +1,8 @@
 // Model choice for crews the owner named no model for (workstream redesign, 19 Oct). Each Firstmate home
-// keeps config/crew-dispatch.json in the upstream shape, with BB provider ids as `harness`. Firstmate picks
-// a rule by judgement and passes its id or when-text; code never matches task text against the rules.
+// keeps config/fm-model-rules.json in the upstream crew-dispatch shape, with BB provider ids as `harness`.
+// Owner decision (20 Oct): only the plugin reads this file. The native home check validates
+// config/crew-dispatch.json against upstream harness names, so the plugin never reads or writes that name.
+// Firstmate picks a rule by judgement and passes its id or when-text; code never matches task text.
 import { execFile as execFileCb } from "node:child_process";
 import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -14,8 +16,8 @@ const execFile = promisify(execFileCb);
 const QUOTA_FRESH_MS = 5 * 60 * 1000;
 const QUOTA_RETRY_MS = 60 * 1000;
 export const LOW_QUOTA_PERCENT = 15;
-const REL_PATH = "config/crew-dispatch.json";
-const BROKEN_PATH = "state/crew-dispatch.broken";
+const REL_PATH = "config/fm-model-rules.json";
+const BROKEN_PATH = "state/fm-model-rules.broken";
 
 export const BB_PROVIDERS = ["claude-code", "codex", "acp-grok", "acp-antigravity", "acp-cursor", "pi"] as const;
 export type BbProvider = (typeof BB_PROVIDERS)[number];

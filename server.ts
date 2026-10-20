@@ -7153,7 +7153,7 @@ export default async function plugin(bb: BbPluginApi) {
     const task = input.task.trim().slice(0, MAX_TASK);
     if (task === "") throw new Error("Empty task.");
     // Owner decision (19 Oct): a model the owner named wins. Else the rule Firstmate picked from the
-    // home's config/crew-dispatch.json, else that file's role default; quota and the catalog skip candidates.
+    // home's config/fm-model-rules.json, else that file's role default; quota and the catalog skip candidates.
     const ownerNamed = input.providerNamed === true || input.ownerRequestedProvider === true || input.model !== undefined;
     let pickedByDispatch = false;
     let planLimitMove = false;
@@ -15162,7 +15162,7 @@ export default async function plugin(bb: BbPluginApi) {
     taskId:z.string().regex(/^[A-Za-z0-9._-]+$/).optional().describe("Stable retry identity; reuse after an uncertain launch"),
     projectId: z.string().optional().describe("BB project id; defaults to the current thread's project"),
     title: z.string().max(120).optional(),
-    role: z.enum(CREW_ROLES).optional().describe("builder (default): the default in the home's config/crew-dispatch.json (starter: claude-code claude-opus-5-5); checker: its checker rule, never the builder's model (starter: codex gpt-6.1-sol); lookup: claude-code claude-haiku-5-5. providerId, model and reasoningLevel override it for this crew only: pass them only when the owner named them for this task"),
+    role: z.enum(CREW_ROLES).optional().describe("builder (default): the default in the home's config/fm-model-rules.json (starter: claude-code claude-opus-5-5); checker: its checker rule, never the builder's model (starter: codex gpt-6.1-sol); lookup: claude-code claude-haiku-5-5. providerId, model and reasoningLevel override it for this crew only: pass them only when the owner named them for this task"),
     rule: z.string().min(1).optional().describe("When the owner named no model: the id or when-text of the model-choice rule that fits this task best, by your judgement (firstmate_models list shows them). Omit it when no rule fits."),
     providerId: z.string().optional(),
     model: z.string().optional(),
@@ -15680,7 +15680,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_models",
-    description: "Show and edit the model-choice rules in this home's config/crew-dispatch.json, e.g. when the owner says \"use Opus for UI\". list shows them; set adds or replaces a rule (id, when, use, why); remove drops one; default replaces the default list; reset backs up the file and writes the starter rules. List each rule's models strongest first.",
+    description: "Show and edit the model-choice rules in this home's config/fm-model-rules.json, e.g. when the owner says \"use Opus for UI\". list shows them; set adds or replaces a rule (id, when, use, why); remove drops one; default replaces the default list; reset backs up the file and writes the starter rules. List each rule's models strongest first.",
     parameters: z.object({
       action: z.enum(MODELS_ACTIONS).default("list"),
       id: z.string().optional().describe("Short rule id, e.g. ui"),
@@ -18736,7 +18736,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "queue", summary: "Backlog with deps/time gates; reconcile restores exact native linkage without launching; prune forgets finished items", usage: queueHelp },
       { name: "decide", summary: "Durable decisions", usage: 'bb firstmate decide ask -- "<question>"' },
       { name: "posture", summary: "Per-project delivery mode + yolo", usage: "bb firstmate posture set --project <id> [--mode m]" },
-      { name: "models", summary: "Show and edit the home's model-choice rules (config/crew-dispatch.json)", usage: "bb firstmate models [list|set|remove|default|reset] [--id id] [--when text] [--why text] [--use json]" },
+      { name: "models", summary: "Show and edit the home's model-choice rules (config/fm-model-rules.json)", usage: "bb firstmate models [list|set|remove|default|reset] [--id id] [--when text] [--why text] [--use json]" },
       { name: "memory", summary: "Captain prefs + learnings", usage: "bb firstmate memory show" },
       { name: "corrections", summary: "Owner corrections ledger: record one, record its fix, list them", usage: 'bb firstmate corrections add --ref <owner message ref> -- "<owner words>" | fix <C-id> --fix <PR url|data/captain.md> --changelog "<one line>" | list [--captain <thread-id>] [--since <iso>] [--until <iso>] [--json]' },
       { name: "retire-finished", summary: "Retire crews that reported done and went idle; lists only, unless --apply", usage: "bb firstmate retire-finished [--captain <thread-id>] [--apply] [--json]" },

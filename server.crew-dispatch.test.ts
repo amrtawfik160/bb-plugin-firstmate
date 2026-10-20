@@ -139,10 +139,10 @@ test("firstmate_models edits the home file and the next dispatch uses it; a brok
       assert.notEqual(bad.exitCode, 0);
       assert.match(bad.stderr + bad.stdout, /use is invalid/);
       mkdirSync(join(dir, "config"), { recursive: true });
-      writeFileSync(join(dir, "config", "crew-dispatch.json"), "{oops");
+      writeFileSync(join(dir, "config", "fm-model-rules.json"), "{oops");
       const first = await dispatch(host, { task: "restyle the login form", rule: "ui", sharedEnv: true });
       assert.match(first, /\nPicked acp-grok grok-4\.5 high|\nPicked claude-code claude-opus-5-5 \(rule ui; skipped/);
-      assert.match(first, /\nTell the owner: config\/crew-dispatch\.json is broken \(not valid JSON\); crews use the starter rules until it is fixed\./);
+      assert.match(first, /\nTell the owner: config\/fm-model-rules\.json is broken \(not valid JSON\); crews use the starter rules until it is fixed\./);
       assert.doesNotMatch(await dispatch(host, { task: "restyle the signup form", rule: "ui", sharedEnv: true }), /is broken/, "reported once");
     } finally { await host.harness.lifecycle.dispose(); }
   } finally { rmSync(dir, { recursive: true, force: true }); }
