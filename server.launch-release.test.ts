@@ -38,7 +38,7 @@ async function realCaptain(opts: { hangSpawn?: boolean; abort?: AbortController;
   stubProviderCatalog(host);
   const seen: string[] = [];
   const cmds = new Map<string, string>();
-  const state = { spawnExit: 1, spawnOutput: ADMISSION_TIMEOUT, threadIdAfterSpawn: "", spawned: 0, spawnSucceeded: false, spawnCreateError: undefined as Error | undefined, onSpawn: undefined as undefined | (() => Promise<void>), omitSpawnMarker: false };
+  const state = { spawnExit: 1, spawnOutput: ADMISSION_TIMEOUT, threadIdAfterSpawn: "", spawned: 0, spawnSucceeded: false, spawnCreateError: undefined as Error | undefined, onSpawn: undefined as undefined | (() => Promise<void>), omitSpawnMarker: false, envAttemptToken: undefined as string | undefined };
   host.harness.sdk.stub("threads.send", async () => ({}));
   host.harness.sdk.stub("threads.events.list", async () => []);
   host.harness.sdk.stub("threads.list", async () => []);
@@ -80,7 +80,9 @@ async function realCaptain(opts: { hangSpawn?: boolean; abort?: AbortController;
       const tid = state.spawnSucceeded ? state.threadIdAfterSpawn : "";
       return hostRc(tid === "" ? "FM_META_ABSENT" : tid);
     }
-    if (cmd.includes("FM_SPAWN_LOCK") || cmd.includes(".spawn-")) return hostRc("FM_SPAWN_LOCK=absent");
+    if (cmd.includes("FM_SPAWN_LOCK") || cmd.includes(".spawn-")) {
+      return hostRc(`FM_SPAWN_LOCK=absent\nFM_BB_ATTEMPT_TOKEN=${state.envAttemptToken ?? ""}`);
+    }
     return hostRc("");
   });
   return { host, seen, state };
@@ -421,7 +423,7 @@ test("an active create-worker request cannot be released, and create rechecks th
 });
 
 test("a missing attempt token leaves a retryable failed launch", async () => {
-  const { host, state } = await realCaptain();
+  const { host, seen, state } = await realCaptain();
   try {
     const store = launchStore(host);
     host.harness.sdk.stub("files.read", async () => ({ content: "brief", contentEncoding: "utf8", sizeBytes: 5 }));
@@ -434,6 +436,7 @@ test("a missing attempt token leaves a retryable failed launch", async () => {
     assert.match(rejected?.stderr ?? "", /token/);
     assert.equal(first.exitCode, 1);
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
+    assert.ok(spawnCommands(seen).some((c) => c.includes("export FM_BB_ATTEMPT_TOKEN=")));
     const record = store.forTask(ctx.projectId, ctx.threadId, TASK);
     assert.notEqual(record?.createWorkerStarted, true);
     assert.notEqual(record?.creationRequested, true);
@@ -526,6 +529,105 @@ test("a duplicate create-worker failure does not clear another active handler", 
     unpause();
     if (work) await work.catch(() => {});
     t.mock.timers.reset();
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("an old-runtime create-worker still creates when the spawn process env carries the matching token", async () => {
+  const { host, state } = await realCaptain();
+  try {
+    const key = launchKey(ctx.projectId, ctx.threadId, HOME, TASK);
+    launchStore(host).save({
+      key, taskId: TASK, projectId: ctx.projectId, owner: ctx.threadId, home: HOME,
+      generation: 1, shape: "ship", deliveryMode: "direct-PR", deliveryRequirement: "merged",
+      state: "reserved", threadId: null, nativeInvoked: true, hostId: "host_1", updatedAt: Date.now(),
+      creationRequested: false, attemptToken: "token-a",
+    } as never);
+    state.envAttemptToken = "token-a";
+    host.harness.sdk.stub("files.read", async () => ({ content: "Native validated brief", contentEncoding: "utf8", sizeBytes: 22 }));
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_env_token" }));
+    const created = await host.harness.behavior.runCli(createWorkerArgv(undefined), ctx);
+    assert.equal(created.exitCode, 0, created.stderr);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 1);
+    assert.equal(launchStore(host).get(key)?.threadId, "thr_env_token");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a wrong spawn-process env attempt token is refused and does not spawn", async () => {
+  const { host, state } = await realCaptain();
+  try {
+    const key = launchKey(ctx.projectId, ctx.threadId, HOME, TASK);
+    launchStore(host).save({
+      key, taskId: TASK, projectId: ctx.projectId, owner: ctx.threadId, home: HOME,
+      generation: 1, shape: "ship", deliveryMode: "direct-PR", deliveryRequirement: "merged",
+      state: "reserved", threadId: null, nativeInvoked: true, hostId: "host_1", updatedAt: Date.now(),
+      creationRequested: false, attemptToken: "token-a",
+    } as never);
+    state.envAttemptToken = "token-wrong";
+    host.harness.sdk.stub("files.read", async () => ({ content: "Native validated brief", contentEncoding: "utf8", sizeBytes: 22 }));
+    host.harness.sdk.stub("threads.spawn", async () => ({ id: "thr_should_not_exist" }));
+    const created = await host.harness.behavior.runCli(createWorkerArgv(undefined), ctx);
+    assert.equal(created.exitCode, 1, created.stderr);
+    assert.match(created.stderr, /token/);
+    assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
+    assert.equal(launchStore(host).get(key)?.threadId, null);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a failed scout start then a same-id ship start launches and rewrites the native brief", async () => {
+  const { host, seen, state } = await realCaptain();
+  try {
+    const first = await host.harness.behavior.runCli(["dispatch", "--project", ctx.projectId, "--task-id", TASK, "--shape", "scout", "--", "survey login"], ctx);
+    assert.equal(first.exitCode, 1, first.stderr);
+    const record = launchStore(host).forTask(ctx.projectId, ctx.threadId, TASK);
+    assert.equal(record?.state, "failed");
+    assert.equal(record?.shape, "scout");
+    assert.equal(record?.threadId, null);
+    assert.equal(spawnCommands(seen).length, 1);
+    const before = seen.length;
+    state.spawnExit = 0;
+    state.threadIdAfterSpawn = "thr_ship";
+    const retry = await host.harness.behavior.runCli(["dispatch", "--project", ctx.projectId, "--task-id", TASK, "--shape", "ship", "--", "fix login"], ctx);
+    assert.equal(retry.exitCode, 0, retry.stderr);
+    assert.equal(spawnCommands(seen).length, 2);
+    assert.ok(seen.slice(before).some((c) => c.includes("rm -f") && c.includes("launch-brief.md")));
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("an unsafe same-id shape change is refused with a new id instead of spawning", async () => {
+  const { host, seen } = await realCaptain();
+  try {
+    seedUncertain(host, { shape: "scout" });
+    const result = await host.harness.behavior.runCli(["dispatch", "--project", ctx.projectId, "--task-id", TASK, "--shape", "ship", "--", "fix login"], ctx);
+    assert.equal(result.exitCode, 1, result.stderr);
+    assert.match(result.stderr, /new id/);
+    assert.doesNotMatch(result.stderr, /same id/);
+    assert.equal(spawnCommands(seen).length, 0);
+    assert.equal(launchStore(host).forTask(ctx.projectId, ctx.threadId, TASK)?.state, "uncertain");
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a stored dispatch error keeps attempt token mismatch when fm-spawn appends a long bb cli errors dump", async () => {
+  const { host, state } = await realCaptain();
+  try {
+    const dump = "bb firstmate status UNAVAILABLE\n".repeat(150);
+    state.spawnOutput = `error: Creation refused: attempt token mismatch.\nbb cli errors:\n${dump}`;
+    const result = await host.harness.behavior.runCli(["dispatch", "--project", ctx.projectId, "--task-id", TASK, "--", "fix login"], ctx);
+    assert.equal(result.exitCode, 1, result.stderr);
+    assert.match(result.stderr, /attempt token mismatch/);
+    const record = launchStore(host).forTask(ctx.projectId, ctx.threadId, TASK);
+    assert.match(record?.error ?? "", /attempt token mismatch/);
+    assert.doesNotMatch(record?.error ?? "", /bb cli errors:/);
+    assert.doesNotMatch(result.stderr, /UNAVAILABLE/);
+  } finally {
     await host.harness.lifecycle.dispose();
   }
 });

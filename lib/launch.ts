@@ -15,6 +15,32 @@ type Database = ReturnType<BbPluginApi['storage']['database']>;
 export const launchTaskKey=(project:string,task:string)=>JSON.stringify([project,task]);
 export const launchKey = (project: string, owner: string, home: string, task: string, generation = 1) => JSON.stringify([project, owner, home, task, generation]);
 
+/** Host python for native launch admission. No single quotes: server.ts wraps it with shQuote. */
+export const ATTEMPT_TOKEN_ENVIRON_PY = [
+  "import sys",
+  "pid=sys.argv[1]",
+  "val=\"\"",
+  "try:",
+  " data=open(\"/proc/%s/environ\"%pid,\"rb\").read().split(b\"\\0\")",
+  " for item in data:",
+  "  if item.startswith(b\"FM_BB_ATTEMPT_TOKEN=\"):",
+  "   val=item.split(b\"=\",1)[1].decode(\"utf-8\",\"replace\")",
+  "   break",
+  "except OSError:",
+  " pass",
+  "print(\"FM_BB_ATTEMPT_TOKEN=%s\"%val)",
+].join("\n");
+
+/** Token printed by admission after proving the native fm-spawn pid and lock. */
+export function attemptTokenFromAdmissionOutput(output: string): string | undefined {
+  let found: string | undefined;
+  for (const line of output.split(/\r?\n/)) {
+    if (line.startsWith("FM_BB_ATTEMPT_TOKEN=")) found = line.slice("FM_BB_ATTEMPT_TOKEN=".length);
+  }
+  if (found === undefined || found === "") return undefined;
+  return found;
+}
+
 /** A durable reservation outlives the RPC which starts creation. Absence from a
  * bounded inventory is never proof that a timed-out create did not succeed. */
 export function createLaunches(db: Database) {

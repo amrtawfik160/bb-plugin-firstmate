@@ -97,7 +97,7 @@ import { sanitizeSettingValue } from "./lib/settings-schema.ts";
 import { coalesceBatches, parseConnectorHeader, parseInboundTelegram, parseSourceRef, parseTelegramSubmission, stripTelegramEnvelope, telegramReplyParameters, telegramSourceRef } from "./lib/telegram-envelope.ts";
 import { telegramFileRefusals } from "./lib/telegram-files.ts";
 import { connectorReplied, correlationOf, isTelegramRpcMissing, oldestUnanswered, sendTelegramReply, TELEGRAM_BRIDGE_PLUGIN_ID, telegramReplyFallbackBody } from "./lib/telegram-reply.ts";
-import { createLaunches, launchKey, launchTaskKey, discoverLaunch, discoverLaunchComplete, type LaunchRecord } from "./lib/launch.ts";
+import { ATTEMPT_TOKEN_ENVIRON_PY, attemptTokenFromAdmissionOutput, createLaunches, launchKey, launchTaskKey, discoverLaunch, discoverLaunchComplete, type LaunchRecord } from "./lib/launch.ts";
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
 import { optionHelp } from "./lib/cli-help.ts";
 import { AUDITED_BUNDLED_SNAPSHOTS, AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython } from "./lib/native-policy.ts";
@@ -111,7 +111,7 @@ import { changeReach, type Reach } from "./owner/reach.ts";
 import { type LiveCheck, hostCanDrive, PROJECTS, PROOF_SURFACES, projectBriefLines, projectForName, projectForRepo, repoOf as prRepoOf, surfaceRefusal, surfaceWords, unlistedNote } from "./owner/projects.ts";
 import { createReleaseReadbacks, type ReleaseSource } from "./lib/release-readback.ts";
 import { cardSubject, keyFromEnvFile, ownerRules, ruleAnsweringCard } from "./lib/card-rules.ts";
-import { authFailure, signedIn, signInCommand, wakeCompletionRetryMs, withoutWakeWarning } from "./lib/action-guards.ts";
+import { authFailure, nativeSpawnFailureOutput, signedIn, signInCommand, wakeCompletionRetryMs, withoutWakeWarning } from "./lib/action-guards.ts";
 import { createLeases, LEASE_TTL_MS } from "./lib/test-server-lease.ts";
 import { addCorrection, CAPTAIN_FILE, CORRECTION_RULE, correctionBrief, fixCorrection, LEDGER_FILE, readLedger, within } from "./owner/corrections.ts";
 import { renderScorecard, type ScorecardData } from "./owner/scorecard.ts";
@@ -4168,10 +4168,11 @@ export default async function plugin(bb: BbPluginApi) {
   // fm-brief.sh, then fill its {TASK}/{FIRSTMATE_SPEC} placeholders so real tools
   // (fm-bearings-snapshot, teardown, a manual `fm` relaunch) see a Captain-intent /
   // Firstmate-spec brief for a BB-dispatched crew, not just a synthetic prompt.
-  // Idempotent (never overwrites an existing brief). A missing script is not a
-  // failure; a host or scaffold failure is returned so the caller decides — real
-  // transport cannot spawn without the brief, a BB crew already has its prompt.
-  async function publishFmBrief(crew: Crew, hostId: string | undefined, task: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  // Skip when brief.md already exists, unless replaceNativeBrief removes it first.
+  // A missing script is not a failure; a host or scaffold failure is returned so
+  // the caller decides — real transport cannot spawn without the brief, a BB crew
+  // already has its prompt.
+  async function publishFmBrief(crew: Crew, hostId: string | undefined, task: string, replaceNativeBrief = false): Promise<{ ok: true } | { ok: false; error: string }> {
     const fmHome = await crewNativeHome(crew);
     if (fmHome === "") return { ok: false, error: "no native home" };
     if (isSecondmateRoute(crew)) return { ok: false, error: "secondmate routes carry no brief" };
@@ -4220,7 +4221,9 @@ export default async function plugin(bb: BbPluginApi) {
       fmBinDirAssign(fmHome),
       fmMirrorStaleGuard(fmHome),
       `[ -f ${briefRef} ] || exit 0`,
-      `[ -f ${shQuote(brief)} ] && exit 0`,
+      replaceNativeBrief
+        ? `rm -f -- ${shQuote(brief)} ${shQuote(`${fmHome}/data/${crew.id}/launch-brief.md`)}`
+        : `[ -f ${shQuote(brief)} ] && exit 0`,
       // F2: do NOT `>/dev/null 2>&1 || exit 0` here — that swallowed a stale-mirror
       // failure (e.g. a missing SCRIPT_DIR sibling in bin-bb) whole. Capture the
       // scaffold's stderr and surface it so publishFmBrief logs it (best-effort still:
@@ -4368,6 +4371,7 @@ export default async function plugin(bb: BbPluginApi) {
       ownsRow?: boolean;
       visible?: boolean;
       checkout?:string;
+      replaceNativeBrief?: boolean;
     },
     hostId: string,
     signal?: AbortSignal,
@@ -4427,7 +4431,7 @@ export default async function plugin(bb: BbPluginApi) {
     // Scaffold the authoritative brief first — a ship spawn reads its recorded
     // "Delivery contract: mode=" line and refuses a mismatch, so the brief must
     // exist (with the right mode) before fm-spawn.sh runs.
-    const scaffolded = await publishFmBrief(crew, hostId, input.task);
+    const scaffolded = await publishFmBrief(crew, hostId, input.task, input.replaceNativeBrief === true);
     if (!scaffolded.ok) {
       // Nothing was spawned and no backlog row was added, so the launch holds no slot.
       endedBeforeCreation("Brief could not be written before BB creation");
@@ -4499,8 +4503,8 @@ export default async function plugin(bb: BbPluginApi) {
         spawnFailed = true;
         spawnEnded = res.fromMarker === true && typeof res.exitCode === "number";
         spawnFailure = spawnEnded
-          ? `fm-spawn exit ${res.exitCode}: ${withoutWakeWarning(res.output).slice(-2000)}`
-          : `fm-spawn ended without a native return-code marker: ${withoutWakeWarning(res.output).slice(-2000)}`;
+          ? `fm-spawn exit ${res.exitCode}: ${nativeSpawnFailureOutput(res.output)}`
+          : `fm-spawn ended without a native return-code marker: ${nativeSpawnFailureOutput(res.output)}`;
         // LOUD (B1): a non-zero fm-spawn exit (e.g. the brief-refusal that made every
         // real spawn fail) must be an error, not a muffled warn.
         bb.log.error(`real transport spawn crew=${crew.id} exit=${res.exitCode} ${res.output.slice(0, 600)}`);
@@ -4534,7 +4538,7 @@ export default async function plugin(bb: BbPluginApi) {
       return orphan;
     }
     // No thread in the native record or in BB, and fm-spawn is no longer running.
-    if (spawnEnded && typeof observedExitCode === "number") endedBeforeCreation("Native start ended before BB creation");
+    if (spawnEnded && typeof observedExitCode === "number") endedBeforeCreation(spawnFailure);
     // Native retains queued work when policy refuses a spawn (for example an AFK cap).
     // Keep that row available for reconciliation instead of deleting it and bypassing the gate.
     // A refused BRIEF is different: the row names a task that can never spawn as written,
@@ -5225,15 +5229,16 @@ export default async function plugin(bb: BbPluginApi) {
     const nativePid=flagStr(flags,"native-pid");
     if (!nativePid || !/^\d+$/.test(nativePid)) throw new Error("Internal creation requires a native spawn process identity.");
     const attemptToken=flagStr(flags,"attempt-token");
-    const myToken=attemptToken ?? "";
     const admission=await runOnHost(hostId,["set -eu",
       `test -d ${shQuote(`${home}/state/.spawn-${taskId}.lock`)}`,
       `[ "$(cat ${shQuote(`${home}/state/.spawn-${taskId}.lock/pid`)})" = ${shQuote(nativePid)} ]`,
       `kill -0 ${shQuote(nativePid)}`,
       `native_command=$(ps -p ${shQuote(nativePid)} -o command=)`,
       `case "$native_command" in *fm-spawn.sh*) ;; *) echo 'error: creation must follow native fm-spawn guards' >&2; exit 1 ;; esac`,
+      `python3 -c ${shQuote(ATTEMPT_TOKEN_ENVIRON_PY)} ${shQuote(nativePid)}`,
     ].join("\n"),15_000,launchAbort.signal);
     requireNativeSuccess(admission,"native launch admission proof");
+    const myToken=attemptToken ?? attemptTokenFromAdmissionOutput(admission.output) ?? "";
     const key = launchKey(projectId, owner, home, taskId);
     let handlerId: string | undefined;
     try {
@@ -5247,7 +5252,7 @@ export default async function plugin(bb: BbPluginApi) {
       launches.update(key, { createWorkerStarted: true });
       handlerId = registerCreateHandler(key, myToken);
     } else if (!bound) {
-      bound = await launches.reserve({ key, taskId, projectId, owner, home, generation:1,shape,nativeInvoked:true,deliveryMode:flagStr(flags,"delivery-mode"),deliveryRequirement:z.enum(["pr","merged","merged-and-verified"]).parse(flagStr(flags,"delivery-requirement") ?? "merged"),state:"reserved",threadId:null,hostId,creationRequested:false,attemptToken,createWorkerStarted:true,updatedAt:Date.now() }, () => launchCapacity(owner || undefined));
+      bound = await launches.reserve({ key, taskId, projectId, owner, home, generation:1,shape,nativeInvoked:true,deliveryMode:flagStr(flags,"delivery-mode"),deliveryRequirement:z.enum(["pr","merged","merged-and-verified"]).parse(flagStr(flags,"delivery-requirement") ?? "merged"),state:"reserved",threadId:null,hostId,creationRequested:false,attemptToken: myToken || undefined,createWorkerStarted:true,updatedAt:Date.now() }, () => launchCapacity(owner || undefined));
       handlerId = registerCreateHandler(key, myToken);
     }
     const selection = await selectExecution(bb, projectId, hostId);
@@ -7022,6 +7027,13 @@ export default async function plugin(bb: BbPluginApi) {
     const home = (await settings.get()).fmHome.trim();
     const key = launchKey(input.projectId, input.parentThreadId ?? "", home, taskId);
     return launches.once(`dispatch:${key}`, async () => {
+      const prior = launches.get(key);
+      let replaceNativeBrief = false;
+      if (prior && prior.shape !== input.shape) {
+        const canReplace = prior.state === "failed" && !prior.threadId && prior.creationRequested !== true && !createRequestActive(prior);
+        if (!canReplace) throw new Error(`Start ${taskId} under a new id.`);
+        replaceNativeBrief = true;
+      }
       const record = await launches.reserve({ key, taskId, projectId: input.projectId, owner: input.parentThreadId ?? "",
         home, generation: 1, shape: input.shape, deliveryMode:input.mode, yolo:input.yolo, deliveryRequirement:input.deliveryRequirement ?? "merged", state: "reserved", threadId: null, creationRequested: false, attemptToken: randomUUID(), updatedAt: Date.now() }, () => launchCapacity(input.parentThreadId));
       const resolved = await reconcileLaunch(record);
@@ -7041,7 +7053,7 @@ export default async function plugin(bb: BbPluginApi) {
         return recovered;
       }
       try {
-        const crew = await dispatchCrewBody({ ...input, crewId: taskId, ownsRow:input.crewId === undefined });
+        const crew = await dispatchCrewBody({ ...input, crewId: taskId, ownsRow:input.crewId === undefined, replaceNativeBrief });
         crew.launchKey = key;
         let actualProvider = crew.providerId;
         let thread: Awaited<ReturnType<typeof bb.sdk.threads.defaultExecutionOptions>> | null = null;
@@ -7096,6 +7108,7 @@ export default async function plugin(bb: BbPluginApi) {
     sendAt?: number;
     deliveryRequirement?: "pr" | "merged" | "merged-and-verified";
     sourceRefs?: string[];
+    replaceNativeBrief?: boolean;
     ownerRequestedProvider?: boolean;
     /** The owner's message ref that permits a model needing his permission (owner/crew-roles.ts). */
     modelPermission?: string;
@@ -7216,7 +7229,8 @@ export default async function plugin(bb: BbPluginApi) {
           crew,
           { task: input.task, projectId: input.projectId, parentThreadId: input.parentThreadId,
             title: input.title, permissionMode: input.permissionMode,
-            ownsRow: input.ownsRow, visible: input.visible,checkout:selection.checkout },
+            ownsRow: input.ownsRow, visible: input.visible,checkout:selection.checkout,
+            replaceNativeBrief: input.replaceNativeBrief === true },
           rtHost,input.signal,
         );
         if (realThreadId !== null && realThreadId !== "") {
