@@ -5222,13 +5222,13 @@ export default async function plugin(bb: BbPluginApi) {
     return (await threadFailure(threadId)).detail;
   }
   // httpStatus is the structured status of the newest provider error, when it has one.
-  async function threadFailure(threadId: string): Promise<{ detail: string; httpStatus: number | null }> {
+  async function threadFailure(threadId: string, signal?: AbortSignal): Promise<{ detail: string; httpStatus: number | null }> {
     let detail = "";
     let httpStatus: number | null = null;
     try {
       const rows = await raceAbort(bb.sdk.threads.events.list({
         threadId, order: "desc", limit: "20", types: ["system/error", "provider/error"],
-      }), undefined, STUCK_HOST_CALL_MS);
+      }), signal, STUCK_HOST_CALL_MS);
       const provider = rows.find((row) => row.type === "provider/error");
       if (provider !== undefined) httpStatus = providerErrorStatus(provider.data);
       for (const row of rows) {
@@ -5240,6 +5240,20 @@ export default async function plugin(bb: BbPluginApi) {
       // the generic note still applies
     }
     return { detail, httpStatus };
+  }
+  // The one captain notice for a crew whose provider answered 402. The thread.failed handler and
+  // the crew-watch pass both page this exact text, so the per-thread delivery signature lets only
+  // the first through, also across a plugin reload. Null for any other status.
+  async function paymentRequiredNotice(crew: Crew, httpStatus: number | null, signal?: AbortSignal): Promise<string | null> {
+    if (httpStatus !== PAYMENT_REQUIRED) return null;
+    const provider = (await raceAbort(bb.sdk.threads.get({ threadId: crew.threadId }), signal, STUCK_HOST_CALL_MS).catch(() => null))?.providerId ?? crew.providerId;
+    const branch = crew.branch ? `branch ${crew.branch}` : "branch";
+    const kept = crew.prUrl ? `worktree, ${branch} and PR ${crew.prUrl}` : `worktree and ${branch}`;
+    return `crew ${crew.id}: its provider${provider ? ` ${provider}` : ""} is out of balance (HTTP 402 Payment Required). It was not restarted: a restart on ${provider ?? "the same provider"} fails the same way. Its ${kept} are kept. To continue, restart it on another provider: bb firstmate retry ${crew.id} --provider <id>.`;
+  }
+  // What the crew-watch pass pages for a crew in error: the 402 notice, else the crew's output.
+  async function errorPage(crew: Crew, signal?: AbortSignal): Promise<string | null> {
+    return await paymentRequiredNotice(crew, (await threadFailure(crew.threadId, signal)).httpStatus, signal) ?? await crewOutput(crew, 300, signal);
   }
 
   async function createNativeWorker(flags: Map<string, FlagValue>, ctx: unknown) {
@@ -7450,12 +7464,10 @@ export default async function plugin(bb: BbPluginApi) {
     if (isSecondmateRoute(crew) || (await settings.get()).supervisionEnabled !== true) return false;
     const failure = await threadFailure(crew.threadId);
     const detail = [error ?? "", failure.detail].filter((part) => part.trim() !== "").join(": ");
-    if (failure.httpStatus === PAYMENT_REQUIRED) {
-      const provider = (await bb.sdk.threads.get({ threadId: crew.threadId }).catch(() => null))?.providerId ?? crew.providerId;
-      const branch = crew.branch ? `branch ${crew.branch}` : "branch";
-      const kept = crew.prUrl ? `worktree, ${branch} and PR ${crew.prUrl}` : `worktree and ${branch}`;
-      bb.log.warn(`crew ${crew.id}: provider ${provider ?? "(unknown)"} answered 402 Payment Required; not restarted`);
-      await notifyCaptain(crew, "error", `crew ${crew.id}: its provider${provider ? ` ${provider}` : ""} is out of balance (HTTP 402 Payment Required). It was not restarted: a restart on ${provider ?? "the same provider"} fails the same way. Its ${kept} are kept. To continue, restart it on another provider: bb firstmate retry ${crew.id} --provider <id>.`);
+    const outOfBalance = await paymentRequiredNotice(crew, failure.httpStatus);
+    if (outOfBalance !== null) {
+      bb.log.warn(`crew ${crew.id}: its provider answered 402 Payment Required; not restarted`);
+      await notifyCaptain(crew, "error", outOfBalance);
       return true;
     }
     if (providerExhausted(null, detail) || planLimitError(detail)) return false;
@@ -14968,8 +14980,8 @@ export default async function plugin(bb: BbPluginApi) {
       const prev = state[crew.id];
       if (prev === undefined) {
         if (status === "error" || status === "unknown") {
-          const detail = status === "error" ? await crewOutput(crew, 300, passSignal) : null;
-          if (!(await pageOrDefer(crew, status, detail))) {
+          const detail = status === "error" ? await errorPage(crew, passSignal) : null;
+          if (passSignal.aborted || !(await pageOrDefer(crew, status, detail))) {
             inspected--;
             break;
           }
@@ -14986,8 +14998,8 @@ export default async function plugin(bb: BbPluginApi) {
       }
       if (status === "error" || status === "unknown") {
         if (prev.alerted !== status) {
-          const detail = status === "error" ? await crewOutput(crew, 300, passSignal) : null;
-          if (!(await pageOrDefer(crew, status, detail))) {
+          const detail = status === "error" ? await errorPage(crew, passSignal) : null;
+          if (passSignal.aborted || !(await pageOrDefer(crew, status, detail))) {
             inspected--;
             break;
           }
