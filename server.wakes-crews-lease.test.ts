@@ -7,6 +7,7 @@ import test from "node:test";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import plugin from "./server.ts";
 import { UPSTREAM_SKILL_NAMES } from "./lib/upstream-surface.ts";
+import { providerErrorStatus } from "./lib/provider-failover.ts";
 
 const SKILLS = [...new Set(["captain", "firstmate", "skill-routing", ...UPSTREAM_SKILL_NAMES])];
 const WARNING = "WARNING: queued wakes pending - drain them with bin/fm-wake-drain.sh before anything else.";
@@ -86,6 +87,64 @@ test("a 401 from the provider is reported with the fix and not restarted (crew t
     assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0);
     assert.ok(sentTo(host, "thr_cap").some((m) => /refused the sign-in .* It was not restarted: a restart fails the same way\. Fix: run `codex login` on that host/.test(m)), sentTo(host, "thr_cap").join("\n---\n"));
     assert.equal(sentTo(host, "thr_repair").length, 1);
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+// 20 Oct: Grok answered every turn with 402 "usage balance exhausted"; crew 0f2d6bce was restarted on
+// Grok (thr_wxeqpusbvx), failed the same way at once, and the captain got two failures and no restart.
+// This is the provider error BB recorded on that thread: its own errorInfo is empty, and the status
+// sits in the provider's JSON body.
+const GROK_402 = { type: "provider/error", data: { message: "Provider error", detail: "Internal error: {\"message\":\"API error (status 402 Payment Required): Grok Build usage balance exhausted\",\"http_status\":402}" } };
+const kept = { providerId: "acp-grok", model: null, environmentId: "env_wt", branch: "fm/c1-fix", prUrl: "https://github.com/o/r/pull/7" };
+function withGrok(host: Host) {
+  host.harness.sdk.stub("providers.list", async () => [{ id: "claude-code", available: true }, { id: "codex", available: true }, { id: "acp-grok", available: true }]);
+  host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => threadId === "thr_cap"
+    ? makeThreadResponse({ id: "thr_cap", status: "idle", providerId: "claude-code", projectId: "proj_1" })
+    : makeThreadResponse({ id: threadId, status: "error", providerId: "acp-grok", environmentId: "env_wt", projectId: "proj_1", parentThreadId: "thr_cap" }));
+}
+
+test("the provider error status is read from structured fields only, never from the words", () => {
+  assert.equal(providerErrorStatus(GROK_402.data), 402);
+  assert.equal(providerErrorStatus({ message: "Provider error", errorInfo: { category: "billing", httpStatusCode: 402, providerCode: null } }), 402);
+  assert.equal(providerErrorStatus({ message: "Provider error", errorInfo: null, detail: "Internal error: {\"message\":\"overloaded\",\"http_status\":529}" }), 529);
+  assert.equal(providerErrorStatus({ message: "Provider error", detail: "API error (status 402 Payment Required): balance exhausted" }), null);
+  assert.equal(providerErrorStatus({ message: "Provider error", detail: "Internal error: {not json, 402}" }), null);
+  assert.equal(providerErrorStatus({ message: "Provider error", detail: "Internal error: {\"http_status\":\"402\"}" }), null);
+  assert.equal(providerErrorStatus(null), null);
+});
+
+test("a crew whose provider answers 402 (balance exhausted) is not restarted; the captain gets one plain wake and the crew keeps its worktree, branch and PR", async () => {
+  for (const event of [GROK_402, { type: "provider/error", data: { message: "Provider error", errorInfo: { category: "billing", httpStatusCode: 402, providerCode: null } } }]) {
+    const { host } = await deck();
+    try {
+      withGrok(host);
+      const before = crewRow("c1", "thr_crew", kept);
+      await host.bb.storage.kv.set("crews", [before]);
+      host.harness.sdk.stub("threads.events.list", async () => [event]);
+      await failed(host, "thr_crew", "Provider error");
+      await host.harness.behavior.emitThreadEvent("turn.failed", { threadId: "thr_crew", requestId: "req_1", errorInfo: null } as never);
+      assert.equal(host.harness.sdk.callsTo("threads.spawn").length, 0, "no restart on the same provider");
+      const wakes = sentTo(host, "thr_cap");
+      assert.equal(wakes.length, 1, wakes.join("\n---\n"));
+      assert.match(wakes[0]!, /crew c1: its provider acp-grok is out of balance \(HTTP 402 Payment Required\)\. It was not restarted: a restart on acp-grok fails the same way\./);
+      assert.match(wakes[0]!, /Its worktree, branch fm\/c1-fix and PR https:\/\/github\.com\/o\/r\/pull\/7 are kept\. To continue, restart it on another provider: bb firstmate retry c1 --provider <id>\./);
+      assert.deepEqual(((await host.bb.storage.kv.get("crews")) as unknown[]).find((c) => (c as { id: string }).id === "c1"), before);
+      assert.equal(host.harness.sdk.callsTo("threads.archive").length, 0);
+    } finally { await host.harness.lifecycle.dispose(); }
+  }
+});
+
+test("a provider error with any other status still gets its one automatic restart, even when its text says 402", async () => {
+  const { host } = await deck();
+  try {
+    withGrok(host);
+    await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew", kept)]);
+    host.harness.sdk.stub("threads.events.list", async () => [{ type: "provider/error", data: { message: "Provider error", detail: "Internal error: {\"message\":\"API error (status 500): upstream said 402 Payment Required once\",\"http_status\":500}" } }]);
+    await failed(host, "thr_crew", "Provider error: 402 Payment Required");
+    const spawns = host.harness.sdk.callsTo("threads.spawn");
+    assert.equal(spawns.length, 1, `one restart: ${sentTo(host, "thr_cap").join(" || ")}`);
+    assert.match((spawns[0]![0] as { prompt: string }).prompt, /Restart after an unexpected exit/);
+    assert.ok(sentTo(host, "thr_cap").some((m) => /relaunched once in the same worktree/.test(m)), sentTo(host, "thr_cap").join("\n---\n"));
   } finally { await host.harness.lifecycle.dispose(); }
 });
 
