@@ -706,7 +706,9 @@ test("the captain rules name the dispatch skills, the crew models and the checke
     "run `interrogate` on it",
     "prove it with `principle-prove-it-works` or `verify-this`",
     "`principle-never-block-on-the-human`, `principle-sequence-verifiable-units`, `principle-encode-lessons-in-structure` and `principle-guard-the-context-window`",
-    "A builder (the default) runs claude-code `claude-opus-5-5`. A checker runs codex `gpt-6.1-sol`.",
+    "Order: a model the owner named, then the model rule you pick, then the role default.",
+    "A builder (the default) uses the file's default (starter: claude-code `claude-opus-5-5`). A checker uses the checker rule (starter: codex `gpt-6.1-sol`) and never the model of the builder it checks",
+    "Give a line that starts `Tell the owner:` to the owner.",
     "They apply to that task's crews only.",
     "`firstmate_merge` refuses a production PR without a `pass` verdict for its current head.",
   ]) assert.ok(rules.includes(text), text);
