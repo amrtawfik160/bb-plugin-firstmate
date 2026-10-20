@@ -789,6 +789,34 @@ test("a gh read in a terminal returns only gh's JSON and keeps gh's exit code (C
   }
 });
 
+// #188 round 2 checker: a gh read killed mid-run (its terminal closed, or a timeout) left its stderr file in /tmp.
+test("a gh read removes its stderr file when it ends, fails, or is killed", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "fm-gh-read-tmp-"));
+  const env = { ...process.env, TMPDIR: dir };
+  try {
+    const ok = spawnSync("bash", ["-c", ghReadCommand("echo '{\"state\":\"OPEN\"}'; echo Working... >&2")], { encoding: "utf8", env });
+    assert.equal(ok.status, 0);
+    assert.equal(ok.stdout, '{"state":"OPEN"}\n');
+    assert.equal(ok.stderr, "", "gh's progress line is held while gh succeeds");
+    const failed = spawnSync("bash", ["-c", ghReadCommand("echo 'GraphQL: no such PR' >&2; exit 3")], { encoding: "utf8", env });
+    assert.equal(failed.status, 3, "gh's exit code is kept");
+    assert.equal(failed.stderr, "GraphQL: no such PR\n", "gh's error is shown when it fails");
+    assert.deepEqual(readdirSync(dir), []);
+    for (const signal of ["SIGHUP", "SIGTERM"] as const) {
+      const child = spawn("bash", ["-c", ghReadCommand("echo Working... >&2; sleep 30")], { env, detached: true, stdio: "ignore" });
+      const exited = new Promise((resolve) => child.once("exit", resolve));
+      for (let i = 0; i < 200 && readdirSync(dir).length === 0; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(readdirSync(dir).length, 1, "the read holds gh's stderr in a temp file while it runs");
+      // A closed host terminal hangs up its whole process group; a timeout kill terminates it.
+      process.kill(-child.pid!, signal);
+      await exited;
+      assert.deepEqual(readdirSync(dir), [], `the temp file is removed after ${signal}`);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("deck refuses missing environment before native setup or claimed readiness", async () => {
   const host = await load();
   try {

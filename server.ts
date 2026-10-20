@@ -573,9 +573,10 @@ function wrapHostCommand(command: string): string {
 // A gh call whose output Firstmate reads. On the host terminal gh writes a "Working..." progress line to stderr,
 // and the PTY mixes it into the output (Cyndra PR 2581's fold check failed "Unexpected token 'W'" on every read,
 // 2026-10-20). The host's gh wrapper sets GH_FORCE_TTY, so a pipe alone does not stop it: stderr is held in a
-// file and shown only when gh fails, stdout goes through a pipe, and pipefail keeps gh's exit code.
+// file and shown only when gh fails, stdout goes through a pipe, and pipefail keeps gh's exit code. The EXIT trap
+// removes that file also when the read is killed: a closed terminal hangs it up, a timeout terminates it.
 export function ghReadCommand(command: string): string {
-  return `bash -o pipefail -c ${shQuote(`e=$(mktemp) || exit 1; { ${command}; } 2>"$e" | cat; rc=$?; [ "$rc" -eq 0 ] || cat "$e" >&2; rm -f "$e"; exit "$rc"`)}`;
+  return `bash -o pipefail -c ${shQuote(`e=$(mktemp) || exit 1; trap 'rm -f "$e"' EXIT; { ${command}; } 2>"$e" | cat; rc=$?; [ "$rc" -eq 0 ] || cat "$e" >&2; exit "$rc"`)}`;
 }
 
 /** fetch for the read-only live checks. The test run sets FM_NO_LIVE_NETWORK=1, so no test reaches Expo or Coolify. */
