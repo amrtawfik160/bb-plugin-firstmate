@@ -149,6 +149,60 @@ export function deleteTaskBranchScript(sourcePath: string, branch: string): stri
   ].join("\n");
 }
 
+// BB cuts a managed worktree only from the project's checkout. A workstream repository that is not that
+// checkout (Reels in Cyndra) gets a task worktree Firstmate makes beside the workstream worktree, on the
+// crew's fm/<crew> branch, which PR tracking and the unsaved-work check already read as the crew's.
+export function taskWorktree(repo: Pick<WorkstreamRepo, 'path'>, crewId: string): { path: string; branch: string } {
+  const at = repo.path.lastIndexOf('/');
+  return { path: `${repo.path.slice(0, at)}/.tasks/${crewId}/${repo.path.slice(at + 1)}`, branch: `fm/${crewId}` };
+}
+export function isTaskWorktree(repo: Pick<WorkstreamRepo, 'path'>, path: string): boolean {
+  return path.startsWith(`${repo.path.slice(0, repo.path.lastIndexOf('/'))}/.tasks/`);
+}
+
+/**
+ * That task worktree, cut from `base`: `check` only reads why it cannot be made, `make` makes it. A worktree
+ * already on the crew's branch (a retried start) is used again. Prints TASK_SETUP_OK, or TASK_SETUP_REFUSED
+ * and the reason.
+ */
+export function taskWorktreeScript(mode: 'check' | 'make', sourcePath: string, worktree: { path: string; branch: string }, base: string): string {
+  const refuse = (reason: string) => `{ echo ${shQuote(`TASK_SETUP_REFUSED ${reason}`)}; exit 0; }`;
+  const { path, branch } = worktree;
+  return [
+    'set -eu',
+    `cd -- ${shQuote(sourcePath)} 2>/dev/null || ${refuse(`the repository checkout ${sourcePath} is missing`)}`,
+    `git rev-parse --git-dir >/dev/null 2>&1 || ${refuse(`${sourcePath} is not a Git checkout`)}`,
+    `if [ -e ${shQuote(path)} ]; then`,
+    `  [ "$(git -C ${shQuote(path)} symbolic-ref --quiet --short HEAD 2>/dev/null || true)" = ${shQuote(branch)} ] || ${refuse(`${path} already holds another checkout`)}`,
+    'else',
+    `  git check-ref-format --branch ${shQuote(branch)} >/dev/null 2>&1 || ${refuse(`${branch} is not a valid branch name; start the task under another id`)}`,
+    `  ! git show-ref --verify --quiet ${shQuote(`refs/heads/${branch}`)} || ${refuse(`branch ${branch} already exists in ${sourcePath}; start the task under another id`)}`,
+    `  git rev-parse --verify --quiet ${shQuote(`refs/heads/${base}^{commit}`)} >/dev/null || ${refuse(`branch ${base} is not in ${sourcePath}`)}`,
+    ...(mode === 'make' ? [
+      `  mkdir -p -- ${shQuote(path.slice(0, path.lastIndexOf('/')))}`,
+      `  git worktree add -q -b ${shQuote(branch)} ${shQuote(path)} ${shQuote(base)} >&2`,
+    ] : []),
+    'fi',
+    'echo TASK_SETUP_OK',
+  ].join('\n');
+}
+export function taskSetupRefusal(output: string): string | null {
+  const refused = /^TASK_SETUP_REFUSED (.+)$/m.exec(output)?.[1];
+  if (refused) return refused;
+  return /^TASK_SETUP_OK$/m.test(output) ? null : 'its repository check gave no answer';
+}
+
+/** Removes that task worktree once its crew is archived; Git refuses when it holds changes. */
+export function removeTaskWorktreeScript(sourcePath: string, path: string): string {
+  return [
+    'set -eu',
+    `cd -- ${shQuote(sourcePath)}`,
+    `if [ -e ${shQuote(path)} ]; then git worktree remove ${shQuote(path)}; fi`,
+    'git worktree prune',
+    `rmdir -- ${shQuote(path.slice(0, path.lastIndexOf('/')))} 2>/dev/null || true`,
+  ].join('\n');
+}
+
 export function unshippedScript(repo: WorkstreamRepo): string {
   const shipped = `refs/firstmate/shipped/${repo.branch}`;
   const base = shQuote(`origin/${repo.base ?? 'main'}`);

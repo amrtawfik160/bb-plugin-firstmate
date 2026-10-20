@@ -126,7 +126,7 @@ import { createQualityEvents } from "./lib/quality-events.ts";
 import { rpcContract, workstreamListSchema, workstreamResultSchema, workstreamDevLinkSchema, workstreamAdoptSchema, workstreamBindSchema } from "./rpc.ts";
 import { archiveWithUndo } from "./lib/workstream-archive.ts";
 import { createWorkstreams, shipSnapshotOf, WorkstreamJobRefused, WorkstreamJobWaiting, WorkstreamRefusal, WorkstreamWaiting, type Workstream, type WorkstreamRepo, type WorkstreamJob, type FoldStep } from "./lib/workstreams.ts";
-import { provisionScript, takeMainScript, unshippedScript, devStartScript, devUnit, devActivityPath, foldScript, foldPlanScript, foldInspectScript, rollbackFoldScript, deleteTaskBranchScript, prBaseScript, saveWorkScript, foldBranchPlanScript, prContainsScript, cloneSourceScript } from "./lib/workstream-runtime.ts";
+import { provisionScript, takeMainScript, unshippedScript, devStartScript, devUnit, devActivityPath, foldScript, foldPlanScript, foldInspectScript, rollbackFoldScript, deleteTaskBranchScript, prBaseScript, saveWorkScript, foldBranchPlanScript, prContainsScript, cloneSourceScript, taskWorktree, isTaskWorktree, taskWorktreeScript, taskSetupRefusal, removeTaskWorktreeScript } from "./lib/workstream-runtime.ts";
 import { adoptCardText, basePhrase, parseContained, parseSavedWork, prBaseFromLsRemote, proposeWorkstreams, replacedPrVerdict, separateQuestion, type AdoptSource } from "./lib/workstream-adopt.ts";
 import {
   WORKSTREAM_CARD_METHOD,
@@ -2294,6 +2294,23 @@ export default async function plugin(bb: BbPluginApi) {
     const branch = typeof env["branchName"] === "string" ? env["branchName"] : job.branch ?? "";
     return { path, branch, environmentId, repos: [{ repository, path, branch, environmentId, hostId }] };
   }
+  // BB cuts a managed worktree only from the project's checkout on the host (20 Oct: three Reels builders in
+  // Cyndra failed setup, its branch being only in the Reels repository). A task of another repository gets
+  // a worktree Firstmate makes from that repository; null when BB's own worktree fits.
+  async function ownTaskWorktree(projectId: string, repo: WorkstreamRepo, crewId: string): Promise<{ path: string; branch: string } | null> {
+    const checkout = (await bb.sdk.projects.get({ projectId })).sources?.find((s) => s.hostId === repo.hostId && s.path)?.path;
+    return checkout === repo.sourcePath ? null : taskWorktree(repo, crewId);
+  }
+  /** Why a workstream task crew's own worktree cannot be made, read before anything is reserved; null when it can. */
+  async function workstreamSetupRefusal(w: Workstream, input: { projectId: string; workstreamRepo?: string; crewId: string; shape: Shape; role?: Crew["role"]; reuseEnvironmentId?: string; baseBranch?: string }): Promise<string | null> {
+    if (isAdoptedWorkstream(w) || input.reuseEnvironmentId || input.shape === "scout" || input.role === "checker" || input.role === "lookup") return null;
+    const repo = w.repos.find((r) => r.projectId === input.projectId && (!input.workstreamRepo || r.repository.toLowerCase() === input.workstreamRepo.toLowerCase()));
+    const own = repo && await ownTaskWorktree(input.projectId, repo, input.crewId);
+    if (!repo || !own) return null;
+    const reason = await workstreamCommand(repo, `bash -c ${shQuote(taskWorktreeScript("check", repo.sourcePath, own, input.baseBranch ?? repo.branch))}`)
+      .then(taskSetupRefusal, (error: unknown) => `its checkout on host ${repo.hostId} could not be read (${truncate(error instanceof Error ? error.message : String(error), 300)})`);
+    return reason === null ? null : `Refusing: workstream ${w.id} cannot set up a worktree of ${repo.repository} for crew ${input.crewId}: ${reason}. Nothing was reserved or started.`;
+  }
   function jobCheckouts(job: WorkstreamJob): NonNullable<WorkstreamJob["repos"]> {
     if (job.repos?.length) return job.repos;
     return job.path ? [{ repository: job.repository ?? "", path: job.path, branch: job.branch ?? "", environmentId: job.environmentId ?? null }] : [];
@@ -2847,6 +2864,22 @@ export default async function plugin(bb: BbPluginApi) {
         return null;
       });
       if (undone) return { kept: undone };
+      // BB removes the worktrees it made once their threads are archived. One Firstmate made for another
+      // repository than the project's checkout goes here, after the same unsaved-work check.
+      const removed = new Set<string>();
+      for (const checkout of again.jobs.flatMap(jobCheckouts)) {
+        const repo = again.fresh.repos.find((r) => r.repository === checkout.repository);
+        if (!repo || !isTaskWorktree(repo, checkout.path) || removed.has(checkout.path)) continue;
+        removed.add(checkout.path);
+        try {
+          await workstreamCommand({ hostId: checkout.hostId || repo.hostId }, `bash -c ${shQuote(removeTaskWorktreeScript(repo.sourcePath, checkout.path))}`);
+        } catch (error) {
+          return { kept: `its worktree ${checkout.path} was not removed (${truncate(error instanceof Error ? error.message : String(error), 200)})` };
+        }
+        if (!checkout.environmentId) continue;
+        await bb.sdk.environments.delete({ environmentId: checkout.environmentId })
+          .then(() => markEnvDeleted(checkout.environmentId!), (error: unknown) => bb.log.warn(`task environment ${checkout.environmentId}: ${String(error)}`));
+      }
     }),
     deleteBranch: async (w, job) => {
       const kept: string[] = [];
@@ -8090,6 +8123,8 @@ export default async function plugin(bb: BbPluginApi) {
     if (!belongs) throw new Error("Dispatch repository does not belong to workstream.");
     const id = input.crewId ?? randomUUID().slice(0, 8);
     if (workstreams.listAll().some((other) => other.id !== w.id && other.jobs.some((j) => j.id === id))) throw new Error("Crew identity already belongs to another workstream.");
+    const refusal = await workstreamSetupRefusal(w, { ...input, crewId: id });
+    if (refusal) throw new Error(refusal);
     const { signal: _signal, ...payload } = input;
     const repository = w.repos.find((r) => r.projectId === input.projectId && (!input.workstreamRepo || r.repository.toLowerCase() === input.workstreamRepo.toLowerCase()))?.repository;
     // An async dispatch opened its owner task already: the job carries it from the start, so a notice names it.
@@ -8426,11 +8461,21 @@ export default async function plugin(bb: BbPluginApi) {
       environment = { type: "reuse", environmentId: input.reuseEnvironmentId };
     } else if (createdEditor && wsRepo) {
       hostId = wsRepo.hostId;
-      environment = {
-        type: "host",
-        hostId,
-        workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: input.baseBranch ?? wsRepo.branch } },
-      };
+      const base = input.baseBranch ?? wsRepo.branch;
+      const own = await ownTaskWorktree(input.projectId, wsRepo, crew.id);
+      if (own) {
+        // Made on the host from the workstream repository; the thread attaches to it as BB attaches a checkout.
+        const refused = taskSetupRefusal(await workstreamCommand(wsRepo, `bash -c ${shQuote(taskWorktreeScript("make", wsRepo.sourcePath, own, base))}`, 600_000));
+        if (refused !== null) throw new Error(`Workstream ${input.workstreamId} cannot set up a worktree of ${wsRepo.repository} for crew ${crew.id}: ${refused}.`);
+        launches.update(selectionKey, { path: own.path });
+        environment = { type: "host", hostId, workspace: { type: "unmanaged", path: own.path } };
+      } else {
+        environment = {
+          type: "host",
+          hostId,
+          workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: base } },
+        };
+      }
       crew.worktree = true;
     } else if (input.worktree && !input.workstreamId) {
       hostId = selection.hostId;
@@ -17013,6 +17058,12 @@ export default async function plugin(bb: BbPluginApi) {
       };
       if (background) {
         const reservedId = crewKey;
+        // A workstream repository that cannot be set up refuses here, so no crew is reserved for it.
+        if (workstreamId) {
+          const refusal = await workstreamSetupRefusal(workstreams.get(workstreamId, parentThreadId), { ...spawnInput, crewId: reservedId })
+            .catch((error: unknown) => error instanceof Error ? error.message : String(error));
+          if (refusal) return toolError(`Dispatch failed: ${refusal}`);
+        }
         dispatchJobs.save({
           crewId: reservedId,
           captainThreadId: parentThreadId,
