@@ -6,6 +6,7 @@ import test from "node:test";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import plugin from "./server.ts";
 import { UPSTREAM_SKILL_NAMES } from "./lib/upstream-surface.ts";
+import { stubProviderCatalog } from "./test/provider-catalog.mjs";
 
 const SKILLS = [...new Set(["captain", "firstmate", "skill-routing", ...UPSTREAM_SKILL_NAMES])];
 type Host = ReturnType<typeof createFakePluginHost>;
@@ -149,4 +150,63 @@ test("an event-read outage after a 402 lifecycle wake must not send a second wak
     await onePass(host);
     assert.equal(sentTo(host, "thr_cap").length, 1, "a successful later read must still deduplicate");
   } finally {await host.harness.lifecycle.dispose();}
+});
+
+// 20 Oct: after Grok answered 402 "usage balance exhausted", nothing stopped the next dispatch on acp-grok.
+// Ten Grok crew threads failed on 402 between 01:19 and 03:49 UTC.
+const capCtx = { threadId: "thr_cap", projectId: "proj_1" };
+const dispatchText = async (host: Host, input: Record<string, unknown>) => {
+  const tool = host.harness.inspection.registrations.agentTools.find((t) => t.name === "firstmate_dispatch")!;
+  const out = await tool.execute({ projectId: "proj_1", shape: "scout", ...input }, capCtx);
+  return typeof out === "string" ? out : (out as { content?: Array<{ text?: string }> }).content?.map((c) => c.text ?? "").join("\n") ?? "";
+};
+const turnFailed = (host: Host, threadId: string) => host.harness.behavior.emitThreadEvent("turn.failed",
+  { threadId, requestId: `req_${threadId}`, turnId: null, errorInfo: null, inputAccepted: true, rateLimits: null, attemptNumber: 1 } as never);
+const codexSignedIn = (cmd: string) => (cmd.includes("codex login status") ? { payload: "Logged in using ChatGPT" } : {});
+async function grokDeck() {
+  const { host } = await deck(codexSignedIn);
+  withGrok(host);
+  stubProviderCatalog(host);
+  host.harness.sdk.stub("threads.events.list", async () => [GROK_402]);
+  await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew", kept)]);
+  return host;
+}
+const spawnedOn = (host: Host) => host.harness.sdk.callsTo("threads.spawn").map(([args]) => (args as { providerId?: string }).providerId);
+
+test("a 402 holds its provider: a named dispatch on it is refused, another provider dispatches, a reload keeps the hold, and it ends", async (t) => {
+  const host = await grokDeck();
+  let next: Host | undefined;
+  try {
+    await turnFailed(host, "thr_crew");
+    const refused = await dispatchText(host, { task: "check the invoice total", providerId: "acp-grok", model: "grok-4.6" });
+    console.log(JSON.stringify({ refused, spawned: spawnedOn(host) }));
+    assert.match(refused, /acp-grok is out of balance \(HTTP 402 Payment Required\) until \d{4}-\d\d-\d\d \d\d:\d\d UTC.*dispatch on another provider with providerId/);
+    assert.deepEqual(spawnedOn(host), [], "nothing was dispatched on the held provider");
+
+    await dispatchText(host, { task: "check the invoice total", providerId: "codex", model: "gpt-6.1-sol" });
+    assert.deepEqual(spawnedOn(host), ["codex"], "a dispatch on another provider is unaffected");
+
+    next = (await deck()).host;
+    for (const key of await host.bb.storage.kv.list("")) await next.bb.storage.kv.set(key, await host.bb.storage.kv.get(key));
+    withGrok(next);
+    stubProviderCatalog(next);
+    assert.match(await dispatchText(next, { task: "check the refund total", providerId: "acp-grok", model: "grok-4.6" }), /acp-grok is out of balance/, "the hold survives a plugin reload");
+
+    const now = Date.now();
+    t.mock.method(Date, "now", () => now + 61 * 60_000);
+    await dispatchText(next, { task: "check the tax total", providerId: "acp-grok", model: "grok-4.6" });
+    assert.deepEqual(spawnedOn(next), ["acp-grok"], "the hold ends after one hour");
+  } finally { await host.harness.lifecycle.dispose(); if (next) await next.harness.lifecycle.dispose(); }
+});
+
+test("a crew turn that completes on the held provider ends the hold", async () => {
+  const host = await grokDeck();
+  try {
+    await turnFailed(host, "thr_crew");
+    assert.match(await dispatchText(host, { task: "check the invoice total", providerId: "acp-grok", model: "grok-4.6" }), /out of balance/);
+    await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_crew", kept), crewRow("c2", "thr_grok2", { providerId: "acp-grok", model: "grok-4.6" })]);
+    await host.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_grok2", status: "idle", providerId: "acp-grok", projectId: "proj_1", parentThreadId: "thr_cap" }), lastAssistantText: "Working on the tests." } as never);
+    await dispatchText(host, { task: "check the refund total", providerId: "acp-grok", model: "grok-4.6" });
+    assert.deepEqual(spawnedOn(host), ["acp-grok"], "a served turn proves the balance is back");
+  } finally { await host.harness.lifecycle.dispose(); }
 });
