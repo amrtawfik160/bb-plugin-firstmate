@@ -5254,11 +5254,12 @@ export default async function plugin(bb: BbPluginApi) {
     return `crew ${crew.id}: its provider${provider ? ` ${provider}` : ""} is out of balance (HTTP 402 Payment Required). It was not restarted: a restart on ${provider ?? "the same provider"} fails the same way. Its ${kept} are kept. To continue, restart it on another provider: bb firstmate retry ${crew.id} --provider <id>.`;
   }
   // What the crew-watch pass pages for a crew in error: the 402 notice, else the crew's output.
-  // Undefined when its provider errors could not be read: paging the output then would send a
-  // second, different wake after a 402 notice, so the page waits for the next pass.
+  // Undefined when its provider errors could not be read and the captain already has a notice for
+  // this thread: paging the output then would send a second, different wake after a 402 notice, so
+  // the page waits for the next pass. With no notice yet, the output is paged as before.
   async function errorPage(crew: Crew, signal?: AbortSignal): Promise<string | null | undefined> {
     const failure = await threadFailure(crew.threadId, signal);
-    if (!failure.read) return undefined;
+    if (!failure.read && await bb.storage.kv.get(`captain-delivery:${crew.threadId}`) !== undefined) return undefined;
     return await paymentRequiredNotice(crew, failure.httpStatus, signal) ?? await crewOutput(crew, 300, signal);
   }
 
