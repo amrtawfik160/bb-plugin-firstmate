@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { workstreamSchema, type Workstream, type WorkstreamRepo, type WorkstreamJob, type FoldStep, type ShipSnapshot, type topicSchema } from './workstream-schema.ts';
+import { workstreamSchema, type BindRefusalReason, type Workstream, type WorkstreamRepo, type WorkstreamJob, type FoldStep, type ShipSnapshot, type topicSchema } from './workstream-schema.ts';
 import {
   compactTaskLine,
   crewOwnTestsPassed,
@@ -16,6 +16,11 @@ import {
 import { resolverBrief, RESOLVE_UNSAFE, type AdoptSource } from './workstream-adopt.ts';
 
 export class WorkstreamWaiting extends Error {}
+/** A bindTopic refusal: `reason` is the stable code; the message text is unchanged for callers that read it. */
+export class WorkstreamRefusal extends Error {
+  readonly reason: BindRefusalReason;
+  constructor(reason: BindRefusalReason, message: string) { super(message); this.reason = reason; }
+}
 
 export const DEV_IDLE_MS = 2 * 60 * 60_000;
 export const UNSHIPPED_MS = 2 * 24 * 60 * 60_000;
@@ -588,7 +593,9 @@ export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
       if (!w) {
         const ports = new Set(all().map((w) => w.devLink.port));
         let port = 5200; while (ports.has(port)) port++;
-        w = save({ ...input, id: `ws-${randomUUID().slice(0, 12)}`, state: 'open', supportsDevLink: await deps.supportsDevLink?.(input.projectId) ?? true, provisioned: false, repos: [], taskIds: [], jobs: [],
+        // A create without a topic records none: an undefined field fails the RPC result's JSON check.
+        const { topic, ...named } = input;
+        w = save({ ...named, ...(topic ? { topic } : {}), id: `ws-${randomUUID().slice(0, 12)}`, state: 'open', supportsDevLink: await deps.supportsDevLink?.(input.projectId) ?? true, provisioned: false, repos: [], taskIds: [], jobs: [],
           devLink: { state: 'stopped', port, realLogin: false }, closeTopicRequested: false, ship: { state: 'idle' }, createdAt: deps.now(), updatedAt: deps.now() });
       }
       if (!w.provisioned) { w.repos = await deps.provision(w); w.provisioned = true; save(w); }
@@ -602,6 +609,7 @@ export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
     adoptFold: (input: {
       threadId: string; projectId: string; name: string; requestId: string; taskIds: string[];
       repositories: string[]; sources: Array<AdoptSource & { title?: string }>; replaces?: Array<{ url: string; repository: string }>;
+      bases?: Record<string, string>;
     }) => serial(async () => {
       const taskIds = [...new Set(input.taskIds)];
       if (taskIds.length === 0) throw new Error('Adopt needs taskIds.');
@@ -625,7 +633,7 @@ export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
           id: `ws-${randomUUID().slice(0, 12)}`, state: 'open',
           supportsDevLink: await deps.supportsDevLink?.(input.projectId) ?? true,
           provisioned: false, repos: [], taskIds: [], jobs: [],
-          adoption: { taskIds, repositories: [...new Set(input.repositories)] },
+          adoption: { taskIds, repositories: [...new Set(input.repositories)], ...(input.bases ? { bases: input.bases } : {}) },
           ...(input.replaces?.length ? { replaces: input.replaces.map((pr) => ({ ...pr, state: 'open' as const })) } : {}),
           devLink: { state: 'stopped', port, realLogin: false }, closeTopicRequested: false, ship: { state: 'idle' },
           createdAt: deps.now(), updatedAt: deps.now(),
@@ -649,9 +657,9 @@ export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
     bindTopic: (id: string, threadId: string, topic: z.infer<typeof topicSchema>, goneTopicId?: number) => serial(async () => {
       const w = open(id, threadId);
       const used = all().find((other) => other.id !== id && other.topic?.chatId === topic.chatId && other.topic.topicId === topic.topicId);
-      if (used) throw new Error('Topic already belongs to a workstream.');
+      if (used) throw new WorkstreamRefusal('topic_in_use', 'Topic already belongs to a workstream.');
       if (w.topic && JSON.stringify(w.topic) !== JSON.stringify(topic) && (goneTopicId === undefined || w.topic.topicId !== goneTopicId)) {
-        throw new Error('Workstream already has a topic.');
+        throw new WorkstreamRefusal('workstream_has_topic', 'Workstream already has a topic.');
       }
       w.topic = topic; w.updatedAt = deps.now(); return save(w);
     }),

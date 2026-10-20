@@ -7,12 +7,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import {
-  adoptCardText, prBaseFromLsRemote, proposeWorkstreams, replacedPrVerdict, resolverBrief, RESOLVE_UNSAFE,
+  adoptCardText, basePhrase, prBaseFromLsRemote, proposeWorkstreams, replacedPrVerdict, resolverBrief, RESOLVE_UNSAFE,
   parseSavedWork, parseContained, type AdoptSource,
 } from './workstream-adopt.ts';
 import { provisionScript, takeMainScript, unshippedScript, saveWorkScript, foldBranchPlanScript, prContainsScript, prBaseScript, foldScript } from './workstream-runtime.ts';
 import { foldValue, parseFoldOutput, isAdoptedWorkstream } from './workstream-fold.ts';
-import { createWorkstreams, type WorkstreamDeps, type FoldOps } from './workstreams.ts';
+import { createWorkstreams, WorkstreamRefusal, type WorkstreamDeps, type FoldOps } from './workstreams.ts';
 
 const git = (dir: string, ...args: string[]) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 const commit = (dir: string, message = 'work') => { git(dir, 'add', '-A'); git(dir, '-c', 'user.name=fixture', '-c', 'user.email=fixture@test', 'commit', '-qm', message); };
@@ -45,6 +45,23 @@ test('the owner card lists every task once, its repository move, and when it fol
   assert.match(text, /from main/);
   assert.equal(text.split('\n').filter((line) => line.includes('T13')).length, 1);
   assert.ok(text.length <= 1500);
+});
+
+test('the owner card names the real base and the project a task with none will get', () => {
+  const text = adoptCardText({
+    name: 'RunAnts UI',
+    base: basePhrase([{ repository: 'HazW80801/runants', base: 'staging' }]),
+    sources: [source({ taskId: 'T361', crewId: 'r361', branch: 'fm/361', repository: 'HazW80801/runants' })],
+    tasks: [{ id: 'T361', title: 'Planes gutters', project: 'RunAnts' }, { id: 'T362', title: 'Sidebar', }],
+    replaces: [],
+  });
+  assert.match(text, /a new branch from staging and one dev link/);
+  assert.doesNotMatch(text, /from main/);
+  assert.match(text, /T361 Planes gutters: folds now \(fm\/361\); no project recorded, joins project RunAnts/);
+  assert.doesNotMatch(text.split('\n').find((line) => line.includes('T362'))!, /project/);
+  // Repositories with different bases name each one.
+  assert.equal(basePhrase([{ repository: 'a/x', base: 'main' }, { repository: 'b/y', base: 'main' }]), 'main');
+  assert.equal(basePhrase([{ repository: 'a/x', base: 'staging' }, { repository: 'b/y', base: 'main' }]), 'staging in a/x and main in b/y');
 });
 
 test('the PR base comes from the remote default branch; a PR closes only when all its commits are in', () => {
@@ -297,6 +314,23 @@ test('a new topic replaces a recorded topic only when the caller names the recor
     // A workstream without a topic binds its first one as before.
     const other = await f.store.create({ threadId: 'cap', projectId: 'cyndra', name: 'Other', requestId: 'o' });
     assert.deepEqual((await f.store.bindTopic(other.id, 'cap', { chatId: '200', topicId: 11 })).topic, { chatId: '200', topicId: 11 });
+  } finally { f.db.close(); }
+});
+
+test('a bind refusal carries a stable reason; its message text is unchanged', async () => {
+  const f = fixture();
+  try {
+    const w = await f.store.create({ threadId: 'cap', projectId: 'cyndra', name: 'Design', requestId: 'd', topic: { chatId: '200', topicId: 7 } });
+    const other = await f.store.create({ threadId: 'cap', projectId: 'cyndra', name: 'Other', requestId: 'o' });
+    const refusal = async (run: () => Promise<unknown>) => { try { await run(); } catch (error) { return error; } assert.fail('the bind was not refused'); };
+    const has = await refusal(() => f.store.bindTopic(w.id, 'cap', { chatId: '200', topicId: 9 }));
+    assert.ok(has instanceof WorkstreamRefusal);
+    assert.equal(has.reason, 'workstream_has_topic');
+    assert.equal(has.message, 'Workstream already has a topic.');
+    const used = await refusal(() => f.store.bindTopic(other.id, 'cap', { chatId: '200', topicId: 7 }));
+    assert.ok(used instanceof WorkstreamRefusal);
+    assert.equal(used.reason, 'topic_in_use');
+    assert.equal(used.message, 'Topic already belongs to a workstream.');
   } finally { f.db.close(); }
 });
 

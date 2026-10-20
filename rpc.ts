@@ -1,10 +1,12 @@
 import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 
-import { workstreamSchema, topicSchema } from './lib/workstream-schema.ts';
+import { bindRefusalSchema, workstreamSchema, topicSchema } from './lib/workstream-schema.ts';
 export const workstreamListSchema = z.object({workstreams:z.array(workstreamSchema),trialProjectIds:z.array(z.string())});
 export const workstreamResultSchema = z.object({workstream:workstreamSchema});
 export const workstreamDevLinkSchema = workstreamResultSchema.extend({url:z.string()});
+// With structuredRefusal, a refusal is a result: the workstream as recorded, and why the bind was refused.
+export const workstreamBindSchema = workstreamResultSchema.extend({refused:bindRefusalSchema.optional()});
 // Adopt first shows the owner one card; his Approve adopts. A call before his answer returns the card.
 export const workstreamAdoptSchema = z.object({
   workstream: workstreamSchema.optional(),
@@ -31,7 +33,9 @@ export const rpcContract = defineRpcContract({
     tasks:z.array(z.object({taskId:z.string().min(1),repository:z.string().optional(),branches:z.array(z.string().min(1)).optional()})).optional(),
     replacesPrs:z.array(z.string().url()).optional()}),output:workstreamAdoptSchema},
   // goneTopicId: the recorded topic is gone; the new topic replaces it. Without it a recorded topic is kept.
-  "workstreams.bindTopic": {input:workstreamTarget.extend({chatId:z.string().min(1),topicId:z.number().int().positive(),goneTopicId:z.number().int().positive().optional()}),output:workstreamResultSchema},
+  // structuredRefusal: a refusal returns refused {reason, message} (reason workstream_has_topic or topic_in_use)
+  // instead of an error. Without it a refusal is an error with the same message.
+  "workstreams.bindTopic": {input:workstreamTarget.extend({chatId:z.string().min(1),topicId:z.number().int().positive(),goneTopicId:z.number().int().positive().optional(),structuredRefusal:z.boolean().optional()}),output:workstreamBindSchema},
   "workstreams.ship": {input:workstreamTarget.extend({requestId:z.string().min(1)}),output:workstreamResultSchema},
   "workstreams.devLink": {input:workstreamTarget.extend({realLogin:z.boolean().optional()}),output:workstreamDevLinkSchema},
   "workstreams.end": {input:workstreamTarget,output:workstreamResultSchema},

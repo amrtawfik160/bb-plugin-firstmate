@@ -542,3 +542,145 @@ test('check round 2: a conflict crew whose turn ended but whose background comma
     assert.equal(after, before, 'running background command still owns resolver worktree');
   } finally { await p.done(); }
 });
+
+// Gaps found on first live use (BUILD-ADOPT-GAPS.md, 20 Oct): T361 and T366 had no recorded project and were
+// refused; RunAnts (default branch staging) must start from staging and every adopt text must say so.
+async function runantsWorld() {
+  const w = await world();
+  const repoName = 'HazW80801/runants';
+  const runants = { id: 'runants', name: 'RunAnts', source: join(w.dir, 'src', 'runants') };
+  const cyndra = { id: 'cyndra', name: 'Cyndra SaaS' };
+  w.remote(repoName, 'staging');
+  mkdirSync(join(w.dir, 'src'));
+  const seed = w.clone(repoName, join(w.dir, 'seed'));
+  git(seed, 'checkout', '-q', '-b', 'staging');
+  writeFileSync(join(seed, 'app.tsx'), 'app'); commitAll(seed, 'base'); git(seed, 'push', '-q', 'origin', 'HEAD:main');
+  writeFileSync(join(seed, 'staging.tsx'), 'staging only'); commitAll(seed, 'staging work'); git(seed, 'push', '-q', 'origin', 'HEAD:staging');
+  w.clone(repoName, runants.source);
+  const tree = join(w.dir, 'wt-361');
+  git(runants.source, 'worktree', 'add', '-q', '-b', 'fm/361', tree, 'origin/staging');
+  writeFileSync(join(tree, 'planes.tsx'), 'planes'); commitAll(tree, 'T361 planes');
+  const h = await rehomeHost(w, [runants, cyndra]);
+  h.envs.set('env_361', { path: tree, branch: 'fm/361' });
+  await h.crew('r361', 'runants', 'thr_361', { status: 'idle', envId: 'env_361' }, { environmentId: 'env_361', branch: 'fm/361' });
+  // As the live T361: no project and no project id recorded.
+  const t361 = h.tasks.open({ captain: 'cap', project: null, projectId: null, title: 'Planes gutters', sourceRefs: ['tg:42:361'], crewId: 'r361', at: Date.now() });
+  const done = async () => { await h.host.harness.lifecycle.dispose(); rmSync(w.dir, { recursive: true, force: true }); };
+  return { w, h, runants, cyndra, tree, t361, done };
+}
+
+test('adopt gaps: a task with no recorded project joins the requested project; the card names it and Approve records it', async () => {
+  const r = await runantsWorld();
+  try {
+    const other = r.h.open('Cyndra banner', r.cyndra);
+    await assert.rejects(
+      r.h.call('workstreams.adopt', { threadId: 'cap', projectId: 'runants', name: 'RunAnts UI', requestId: 'mixed', taskIds: [r.t361.id, other.id] }),
+      new RegExp(`Task ${other.id} belongs to another project\\.`),
+    );
+    assert.equal(r.h.rpcs.some((x) => x.method === 'ask'), false, 'a refusal comes before any card');
+    const { card, workstream } = await adoptByCard(r.h, { projectId: 'runants', name: 'RunAnts UI', requestId: 'runants-ui', taskIds: [r.t361.id] });
+    assert.match(card.text, new RegExp(`${r.t361.id} Planes gutters: .*no project recorded, joins project RunAnts`));
+    assert.deepEqual(workstream.taskIds, [r.t361.id]);
+    const task = r.h.tasks.get(r.t361.id)!;
+    assert.equal(task.projectId, 'runants', 'Approve records the project on the task');
+    assert.equal(task.project, 'RunAnts');
+    assert.equal(r.h.tasks.get(other.id)!.projectId, 'cyndra');
+    assert.equal(existsSync(join(workstream.repos[0].path, 'planes.tsx')), true, 'its saved work folds');
+  } finally { await r.done(); }
+});
+
+test('adopt gaps: in a staging repository the card, the adopt result and a task crew brief name staging; the base is read once, at the card', async () => {
+  const r = await runantsWorld();
+  try {
+    const reads = () => r.h.commands.filter((c) => c.includes('ls-remote')).length;
+    const first = await r.h.call('workstreams.adopt', { threadId: 'cap', projectId: 'runants', name: 'RunAnts UI', requestId: 'runants-ui', taskIds: [r.t361.id] }) as { card: { askId: string; text: string } };
+    assert.match(first.card.text, /a new branch from staging and one dev link/);
+    assert.doesNotMatch(first.card.text, /from main/);
+    assert.equal(reads(), 1, 'the card reads the base once');
+    await r.h.call('resolveAsk', { threadId: 'cap', id: first.card.askId, resolution: 'Approve' });
+    assert.equal(reads(), 1, 'Approve uses the base the card showed');
+    const listed = await r.h.call('workstreams.list', { threadId: 'cap' }) as { workstreams: Array<Row & { id: string; repos: Array<{ base?: string; path: string }> }> };
+    const ws = listed.workstreams[0]!;
+    assert.equal(ws.repos[0]!.base, 'staging');
+    assert.equal(existsSync(join(ws.repos[0]!.path, 'staging.tsx')), true, 'the workstream branch starts from staging');
+    const result = r.h.sent.find((text) => text.startsWith('WORKSTREAM ADOPTED'));
+    assert.ok(result, r.h.sent.join(' | '));
+    assert.match(result, /from staging/);
+    assert.doesNotMatch(result, /from main/);
+    // A new task crew in the workstream is told that Ship merges the workstream branch into staging.
+    const dispatch = r.h.host.harness.inspection.registrations.agentTools.find((t) => t.name === 'firstmate_dispatch')!;
+    await dispatch.execute({ task: 'Tighten the planes gutters', taskId: 'gutters-2', workstreamId: ws.id, origin: { kind: 'captain', reason: 'owner follow-up' }, providerId: 'codex', model: 'gpt-6.1-sol' }, { threadId: 'cap', projectId: 'runants' } as never);
+    await r.h.host.harness.behavior.runSchedule('workstreams');
+    const brief = r.h.spawned.map((s) => JSON.stringify(s)).find((s) => s.includes('Tighten the planes gutters'));
+    assert.ok(brief, 'the task crew started');
+    assert.match(brief, /merge the workstream branch to staging/);
+    assert.doesNotMatch(brief, /workstream branch to main/);
+  } finally { await r.done(); }
+});
+
+test('adopt gaps: a default branch that cannot be read refuses the adopt before any card; it never falls back to main', async () => {
+  const r = await runantsWorld();
+  try {
+    r.h.host.harness.sdk.stub('hosts.exec', async ({ command }: { command: string }) => {
+      r.h.commands.push(command);
+      if (command.includes('ls-remote')) return { exitCode: 128, output: 'fatal: Could not read from remote repository.' };
+      const run = spawnSync('bash', ['-c', command], { encoding: 'utf8', env: gitEnv, cwd: r.w.dir, timeout: 60_000 });
+      return { exitCode: run.status ?? 1, output: run.status === 0 ? run.stdout : `${run.stdout}${run.stderr}` };
+    });
+    await assert.rejects(
+      r.h.call('workstreams.adopt', { threadId: 'cap', projectId: 'runants', name: 'RunAnts UI', requestId: 'runants-ui', taskIds: [r.t361.id] }),
+      /Cannot read the default branch of hazw80801\/runants/i,
+    );
+    assert.equal(r.h.rpcs.some((x) => x.method === 'ask'), false, 'no card is shown');
+    assert.equal(r.h.tasks.get(r.t361.id)!.projectId, null);
+  } finally { await r.done(); }
+});
+
+test('adopt gaps: create saves the real base on the repository record; a main repository records main', async () => {
+  const r = await runantsWorld();
+  try {
+    const created = await r.h.call('workstreams.create', { threadId: 'cap', projectId: 'runants', name: 'RunAnts next', requestId: 'runants-next' }) as { workstream: { repos: Array<{ base?: string; path: string }> } };
+    assert.equal(created.workstream.repos[0]!.base, 'staging');
+    assert.equal(existsSync(join(created.workstream.repos[0]!.path, 'staging.tsx')), true);
+  } finally { await r.done(); }
+  const p = await probeWorld();
+  try {
+    const created = await p.h.call('workstreams.create', { threadId: 'cap', projectId: p.project.id, name: 'Cyndra next', requestId: 'cyndra-next' }) as { workstream: { repos: Array<{ base?: string }> } };
+    assert.equal(created.workstream.repos[0]!.base, 'main', 'the base is saved even when it is main');
+  } finally { await p.done(); }
+});
+
+test('adopt gaps: a bind refusal carries a stable reason in the result when the caller asks for it; the error text is unchanged', async () => {
+  const w = await world();
+  try {
+    const h = await rehomeHost(w, [{ id: 'safi', name: 'Safi' }]);
+    try {
+      const db = h.host.bb.storage.database();
+      db.exec('CREATE TABLE IF NOT EXISTS firstmate_workstream (id TEXT PRIMARY KEY, record TEXT NOT NULL)');
+      const record = (id: string, topic?: { chatId: string; topicId: number }) => ({ id, name: id, projectId: 'safi', threadId: 'cap', requestId: id, state: 'open', supportsDevLink: false, provisioned: true, ...(topic ? { topic } : {}), repos: [], taskIds: [], jobs: [], devLink: { state: 'stopped', port: id === 'ws-a' ? 5300 : 5301, realLogin: false }, closeTopicRequested: false, ship: { state: 'idle' }, createdAt: 1, updatedAt: 1 });
+      for (const row of [record('ws-a', { chatId: '42', topicId: 5 }), record('ws-b')]) db.prepare('INSERT INTO firstmate_workstream (id,record) VALUES (?,?)').run(row.id, JSON.stringify(row));
+      // A caller that does not ask still gets the same errors.
+      await assert.rejects(h.call('workstreams.bindTopic', { threadId: 'cap', workstreamId: 'ws-a', chatId: '42', topicId: 6 }), /Workstream already has a topic\./);
+      await assert.rejects(h.call('workstreams.bindTopic', { threadId: 'cap', workstreamId: 'ws-b', chatId: '42', topicId: 5 }), /Topic already belongs to a workstream\./);
+      const has = await h.call('workstreams.bindTopic', { threadId: 'cap', workstreamId: 'ws-a', chatId: '42', topicId: 6, structuredRefusal: true }) as { workstream: Row; refused?: Row };
+      assert.deepEqual(has.refused, { reason: 'workstream_has_topic', message: 'Workstream already has a topic.' });
+      assert.deepEqual(has.workstream['topic'], { chatId: '42', topicId: 5 }, 'the recorded topic is kept');
+      const used = await h.call('workstreams.bindTopic', { threadId: 'cap', workstreamId: 'ws-b', chatId: '42', topicId: 5, structuredRefusal: true }) as { workstream: Row; refused?: Row };
+      assert.deepEqual(used.refused, { reason: 'topic_in_use', message: 'Topic already belongs to a workstream.' });
+      assert.equal(used.workstream['topic'], undefined);
+      const bound = await h.call('workstreams.bindTopic', { threadId: 'cap', workstreamId: 'ws-b', chatId: '42', topicId: 7, structuredRefusal: true }) as { workstream: Row; refused?: Row };
+      assert.equal(bound.refused, undefined);
+      assert.deepEqual(bound.workstream['topic'], { chatId: '42', topicId: 7 });
+    } finally { await h.host.harness.lifecycle.dispose(); }
+  } finally { rmSync(w.dir, { recursive: true, force: true }); }
+});
+
+test('adopt gaps: a captain with no host reads the base on the host of a task crew checkout; the card names staging', async () => {
+  const r = await runantsWorld();
+  try {
+    // Neither the captain thread nor the project has a ready environment; the crew's checkout is on h1.
+    r.h.host.harness.sdk.stub('environments.list', async () => []);
+    const first = await r.h.call('workstreams.adopt', { threadId: 'cap', projectId: 'runants', name: 'RunAnts UI', requestId: 'runants-ui', taskIds: [r.t361.id] }) as { card: { text: string } };
+    assert.match(first.card.text, /a new branch from staging/);
+  } finally { await r.done(); }
+});

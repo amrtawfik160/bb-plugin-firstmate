@@ -1,13 +1,17 @@
 import { z } from 'zod';
 
 export const topicSchema = z.object({ chatId: z.string().min(1), topicId: z.number().int().positive() });
+// Why bindTopic refused, stable for the Telegram connector: the workstream already has another topic, or
+// another workstream holds this topic. The refusal's message text stays as before.
+export const bindRefusalSchema = z.object({ reason: z.enum(['workstream_has_topic', 'topic_in_use']), message: z.string() });
+export type BindRefusalReason = z.infer<typeof bindRefusalSchema>['reason'];
 export const workstreamRepoSchema = z.object({
   repository: z.string(), projectId: z.string(), hostId: z.string(), path: z.string(), sourcePath: z.string(),
   branch: z.string(), environmentId: z.string().nullable(),
   existing: z.boolean().optional(),
   taskId: z.string().optional(),
   crewId: z.string().optional(),
-  // The repository's PR base (its default branch); absent means main.
+  // The repository's PR base (its default branch), read once at create or adopt; absent on older records means main.
   base: z.string().optional(),
 });
 export const jobCheckoutSchema = z.object({
@@ -82,8 +86,9 @@ export const workstreamSchema = z.object({
     // The folded work this Ship request takes, saved when it starts: later folds go out with the next Ship.
     snapshot: z.object({ jobs: z.array(z.string()), taskIds: z.array(z.string()), heads: z.record(z.string(), z.string()) }).optional(),
   }),
-  // Adopt with fold: the original task list (a retry must match it) and the repositories provisioned.
-  adoption: z.object({ taskIds: z.array(z.string()), repositories: z.array(z.string()) }).optional(),
+  // Adopt with fold: the original task list (a retry must match it) and the repositories provisioned, with
+  // each repository's default branch as the owner's card named it (absent on records from before).
+  adoption: z.object({ taskIds: z.array(z.string()), repositories: z.array(z.string()), bases: z.record(z.string(), z.string()).optional() }).optional(),
   // Tasks that left the workstream (a conflict that could not be merged safely); they keep their own work.
   leftTaskIds: z.array(z.string()).optional(),
   // PRs this workstream replaces: each closes with a link once the workstream PR holds all its commits.

@@ -162,7 +162,9 @@ test('independent adopted follow-up reuses original worktree',async()=>{
  }finally{await host.harness.lifecycle.dispose()}
 });
 
-test('independent Dr Woo and RunAnts adopt without a project setting; an unlabeled Coss task refuses atomically',async()=>{
+// Changed 20 Oct (BUILD-ADOPT-GAPS.md, allowed assertion change): a task with no recorded project now joins the
+// requested project; a task recorded under another project still refuses the whole adopt.
+test('independent Dr Woo and RunAnts adopt without a project setting; a task of another project refuses atomically, an unlabeled task joins',async()=>{
  const {host,open}=await adoptHost();try{
   host.harness.sdk.stub('projects.list',async()=>[{id:'cyndra',name:'Cyndra SaaS'},{id:'proj_wwm6pj4tq5',name:'woo-app'},{id:'proj_c92bh29baq',name:'RunAnts'}]);
   host.harness.sdk.stub('projects.get',async({projectId}:{projectId:string})=>({id:projectId,name:projectId==='proj_wwm6pj4tq5'?'woo-app':projectId==='proj_c92bh29baq'?'RunAnts':'Cyndra SaaS',kind:'repo',sources:[]}));
@@ -177,8 +179,9 @@ test('independent Dr Woo and RunAnts adopt without a project setting; an unlabel
   const invoke=(projectId:string,ids:string[])=>host.harness.behavior.callRpc('workstreams.adopt',{threadId:'cap',projectId,name:'Adopt',requestId:projectId,taskIds:ids});
   stubHostGit(host,{origin:{'/wt/woo':'https://github.com/amrtawfik160/dr.woo.git','/wt/runants':'https://github.com/HazW80801/runants.git'}});
   assert.deepEqual((await host.harness.behavior.callRpc('workstreams.list',{threadId:'cap'}) as any).trialProjectIds,['cyndra','proj_wwm6pj4tq5','proj_c92bh29baq']);
-  assert.ok(((await invoke('proj_wwm6pj4tq5',[woo.id])) as any).card);await assert.rejects(invoke('proj_c92bh29baq',[run.id,missing.id]),/another project/);
+  assert.ok(((await invoke('proj_wwm6pj4tq5',[woo.id])) as any).card);await assert.rejects(invoke('proj_c92bh29baq',[run.id,woo.id]),/another project/);
   assert.equal((await host.harness.behavior.callRpc('workstreams.list',{threadId:'cap'}) as any).workstreams.length,0,'nothing is adopted before the owner answers');
-  assert.ok(((await invoke('proj_c92bh29baq',[run.id])) as any).card);
+  const joined=(await invoke('proj_c92bh29baq',[run.id,missing.id])) as any;
+  assert.ok(joined.card);assert.match(joined.card.text,new RegExp(`${missing.id} Coss without project: .*no project recorded, joins project RunAnts`));
  }finally{await host.harness.lifecycle.dispose()}
 });
