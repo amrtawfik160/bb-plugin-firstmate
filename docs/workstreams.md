@@ -31,7 +31,7 @@ type Workstream = {
   taskIds: string[];
   requestTaskIds?: string[]; // original task list of an adopt from before adopt with fold
   adoption?: { taskIds: string[]; repositories: string[]; bases?: Record<string, string> }; // adopt with fold: original task list, repositories, and each repository's base as the card named it
-  leftTaskIds?: string[]; // tasks that left after a conflict that could not be merged safely
+  leftTaskIds?: string[]; // tasks that left: a conflict that could not be merged safely, or removeTask
   replaces?: Array<{ url: string; repository: string; state: "open" | "closed" | "skipped"; note?: string }>; // PRs the workstream PR replaces
   jobs: Array<{
     id: string; // crew identity
@@ -66,6 +66,7 @@ type Workstream = {
     conflict?: FoldStep; // the adopted fold that conflicted, for its conflict crew
     resolver?: string; // the conflict crew merging this job's work
     resolves?: string; // on a conflict crew: the job whose work it merges
+    told?: "waiting" | "unresolved"; // the captain heard that its start waits for a crew slot or is unresolved
   }>;
   cardRevision?: number; // monotonic status-card revision, Firstmate-owned
   devLink: {
@@ -140,6 +141,10 @@ A landed fold makes the job `folded` at once and restarts a running dev link if 
 Workstreams adopted before adopt with fold keep one editing crew at a time and reuse existing worktrees. Ship waits for every editing crew attached to the adopted tasks, not only workstream jobs. While one is active, Ship stays queued and tells the owner once, then runs the checker, approval and merge loop.
 
 `view` is one line per task (number, short title, model, state), from the latest job of each task. `lookup` returns at most about 15 lines (brief, last crew report, changed files). Owner messages stay in full. Firstmate calls the connector RPC `workstreamCard` on every task state change with a monotonic revision; a missing RPC is logged once and ignored. The card lists a crew once its owner task (`T<n>`) is attached, and is sent again at that moment. The card maps a finished editing job to `folding` until the fold lands, and a finished scout to `folded`. Final results use the existing `reply` RPC kind `final`. A follow-up to a running crew is `firstmate_tell`. A follow-up to a folded task (`taskRef`) starts a new crew from the latest workstream branch; its brief is the earlier task, its last report, and the new instruction, linked to the earlier crew. `firstmate_dispatch` and `bb firstmate dispatch --workstream-id <id> [--task-ref T<n>]` attach the owner task to the job the same way, which sends the status card again. The card shows the latest job of each task once. Firstmate decides new task vs follow-up by judgement; a direct reply to a crew message is always a follow-up.
+
+Only `workstreamId` puts a crew in a workstream. An owner message from a workstream's topic does not: a dispatch without `workstreamId` that answers one gets a note naming that workstream. A task attached by mistake leaves with `removeTask` (`taskId`): its jobs that never folded are dropped and the workstream never cleans their worktrees, its crews are ordinary crews again, and folded work stays. A task with folded work, or with a crew still working in the workstream, cannot leave.
+
+A dispatch that names a provider or model is checked before anything is reserved or queued: the provider's sign-in, BB's model catalog, and, where Firstmate can read it, the provider CLI's own model list (`agy models` for `acp-antigravity`). A model the CLI does not accept is refused with the models it accepts. A job's start then ends one of three ways. Without a free crew slot it stays `queued` with the reason; the captain hears once, with the crews that hold the slots, and again when it starts. Refused before any worker (a model that left the catalog, say), it ends `failed` with the reason and nothing to clean; the captain hears how to run the task again. When a worker may exist, it stays `starting` and is retried each pass; the captain hears once. `view` shows the reason after the state. `cancel` (`crewId`) drops a job that has not started. A provisioning launch whose crew thread no longer works holds no crew slot. A failed workstream crew runs again as a follow-up: `firstmate_dispatch` with `workstreamId` and `taskRef`, on any provider and model; it continues in the failed crew's kept worktree. Retry and relaunch of a workstream crew name that command.
 Every repo keeps its worktree and branch across Ship actions. Ship resolves the builder, task and PR from that entry. An adopted entry without that task and builder is refused before any PR write; Ship does not pick another builder or attach the PR to every task. Processing one branch does not change another crew's PR or task. Each Ship uses a PR for that branch, checks it independently through Firstmate's existing checker path, and takes main into the branch after merge. A local Git reference records the last shipped head, so retained squash-merge ancestry does not count as unshipped work.
 Dev links use dedicated `fm-workstream-*.service` units, track actual HTTP requests through a loopback proxy, stop after two hours without requests, and evict the least recently requested link when a fourth starts.
 The `fm-f5f15031-vite*.service` units are never managed by this feature.

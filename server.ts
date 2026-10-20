@@ -118,13 +118,14 @@ import { type LiveCheck, devCommandFor, devCommands, hostCanDrive, PROJECTS, PRO
 import { createReleaseReadbacks, type ReleaseSource } from "./lib/release-readback.ts";
 import { cardSubject, keyFromEnvFile, ownerRules, ruleAnsweringCard } from "./lib/card-rules.ts";
 import { authFailure, nativeSpawnFailureOutput, signedIn, signInCommand, wakeCompletionRetryMs, withoutWakeWarning } from "./lib/action-guards.ts";
+import { acceptedCatalogModels, cliAcceptsModel, parseCliModels, providerModelsCommand } from "./lib/provider-cli-models.ts";
 import { createLeases, LEASE_TTL_MS } from "./lib/test-server-lease.ts";
 import { addCorrection, CAPTAIN_FILE, CORRECTION_RULE, correctionBrief, fixCorrection, LEDGER_FILE, readLedger, within } from "./owner/corrections.ts";
 import { renderScorecard, type ScorecardData } from "./owner/scorecard.ts";
 import { createQualityEvents } from "./lib/quality-events.ts";
 import { rpcContract, workstreamListSchema, workstreamResultSchema, workstreamDevLinkSchema, workstreamAdoptSchema, workstreamBindSchema } from "./rpc.ts";
 import { archiveWithUndo } from "./lib/workstream-archive.ts";
-import { createWorkstreams, shipSnapshotOf, WorkstreamRefusal, WorkstreamWaiting, type Workstream, type WorkstreamRepo, type WorkstreamJob, type FoldStep } from "./lib/workstreams.ts";
+import { createWorkstreams, shipSnapshotOf, WorkstreamJobRefused, WorkstreamJobWaiting, WorkstreamRefusal, WorkstreamWaiting, type Workstream, type WorkstreamRepo, type WorkstreamJob, type FoldStep } from "./lib/workstreams.ts";
 import { provisionScript, takeMainScript, unshippedScript, devStartScript, devUnit, devActivityPath, foldScript, foldPlanScript, foldInspectScript, rollbackFoldScript, deleteTaskBranchScript, prBaseScript, saveWorkScript, foldBranchPlanScript, prContainsScript, cloneSourceScript } from "./lib/workstream-runtime.ts";
 import { adoptCardText, basePhrase, parseContained, parseSavedWork, prBaseFromLsRemote, proposeWorkstreams, replacedPrVerdict, separateQuestion, type AdoptSource } from "./lib/workstream-adopt.ts";
 import {
@@ -2231,8 +2232,9 @@ export default async function plugin(bb: BbPluginApi) {
   const ownerTurnRefs = new Map<string, string[]>();
   const workstreamRefs = new Map<string, string>();
   const workstreamActionSchema = z.object({
-    action: z.enum(["list", "propose", "create", "adopt", "bindTopic", "ship", "devLink", "end", "view", "lookup"]),
+    action: z.enum(["list", "propose", "create", "adopt", "bindTopic", "ship", "devLink", "end", "view", "lookup", "removeTask", "cancel"]),
     workstreamId: z.string().optional(), projectId: z.string().optional(), name: z.string().optional(), requestId: z.string().optional(),
+    crewId: z.string().optional().describe("cancel only: the waiting crew to drop"),
     taskIds: z.array(z.string().min(1)).optional(),
     taskId: z.string().optional(),
     // Adopt: per task, the repository it really belongs to and the pushed branches that hold its work.
@@ -2492,6 +2494,25 @@ export default async function plugin(bb: BbPluginApi) {
       return null;
     }));
   }
+  // 20 Oct: dashboard-loading-1020b's start hit "Crew cap reached" on every pass and its job stayed "starting".
+  // A failed workstream start waits for a slot, ends failed when it was refused before any worker, or stays
+  // unresolved (a worker may exist) and is retried.
+  function workstreamStartError(error: unknown, projectId: string, captain: string, jobId: string): Error {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/^Crew cap reached/.test(message)) return new WorkstreamJobWaiting(message.replace(/ Queue this task until capacity is available\.$/, ""));
+    const launch = launches.forTask(projectId, captain, jobId);
+    if (launch === undefined || launch.state === "failed" || launch.state === "deleted") {
+      return new WorkstreamJobRefused(/^Launch \S+ \(failed\): (?:Error: )?([\s\S]*?) No worker was created/.exec(message)?.[1]?.replace(/\.$/, "") ?? message);
+    }
+    return error instanceof Error ? error : new Error(message);
+  }
+  /** Why a workstream job has not started yet, for the captain. */
+  function workstreamWait(stream: Workstream | undefined, job: WorkstreamJob | undefined): string {
+    if (job?.state === "failed") return `it did not start: ${job.error ?? "its start was refused"}`;
+    if (job?.told === "waiting" && job.error) return `it waits for a free crew slot (${job.error}). You are told when it starts.`;
+    if (job?.state === "waiting-memory") return "waiting for memory.";
+    return stream && isAdoptedWorkstream(stream) ? "one editor runs at a time." : "it starts when memory allows.";
+  }
   // Both dispatch paths (firstmate_dispatch and `bb firstmate dispatch`) attach a workstream crew's owner
   // task to its job, which sends the status card again, and continue a task the same way.
   async function attachWorkstreamTask(workstreamId: string, captain: string, crewId: string): Promise<void> {
@@ -2563,7 +2584,7 @@ export default async function plugin(bb: BbPluginApi) {
         providerNamed:original.providerNamed, permissionMode:toPermissionMode(original.permissionMode), reasoningLevel:toReasoningLevel(input.reasoningLevel),
         worktree: job.isolated === true, visible:input.visible !== false, shape:input.shape ?? "ship", mode:input.mode ?? "direct-PR", yolo:original.yolo,
         reuseEnvironmentId: job.environmentId ?? undefined, baseBranch: job.baseBranch, workstreamTask: job.isolated === true, workstreamMerge: !!job.resolves,
-      }));
+      })).catch((error: unknown) => { throw workstreamStartError(error, original.projectId, w.threadId, job.id); });
       if (job.isolated) {
         try { Object.assign(job, await taskCheckout(w, job, crew.threadId) ?? {}); }
         catch { /* the checkout is recorded on a later pass; a fold waits for it */ }
@@ -2572,6 +2593,18 @@ export default async function plugin(bb: BbPluginApi) {
       return crew.threadId;
     },
     checkout: async (w, job) => (job.threadId ? taskCheckout(w, job, job.threadId) : null),
+    jobNotice: async (w, job, notice) => {
+      const name = `Crew ${job.id} (${[job.taskId, truncate(job.title ?? "untitled", 60)].filter((part) => part !== undefined).join(", ")}) in workstream ${w.name}`;
+      let text: string;
+      if (notice.kind === "started") text = `${name} started as thread ${notice.reason}.`;
+      else if (notice.kind === "failed") text = `${name} did not start: ${notice.reason} To run the task again: firstmate_dispatch with workstreamId=${w.id}${job.taskId ? ` taskRef=${job.taskId}` : ""} and a provider and model that work.`;
+      else if (notice.kind === "unresolved") text = `${name} has not started: its start is unresolved (${notice.reason}). It is retried every minute; you are told when it starts or fails. To drop it: firstmate_workstream action=cancel workstreamId=${w.id} crewId=${job.id}.`;
+      else {
+        const { activeTaskIds, held } = await launchCapacity(w.threadId);
+        text = `${name} has not started: it waits for a free crew slot. ${notice.reason} It starts by itself when a slot opens; you are told then. Slots are held by: ${await slotHolders(w.threadId, [...activeTaskIds, ...held])}. To drop it: firstmate_workstream action=cancel workstreamId=${w.id} crewId=${job.id}.`;
+      }
+      await deliverToCaptain(w.threadId, text, job.id, undefined, true);
+    },
     status: async (id) => {
       try {
         const thread = await bb.sdk.threads.get({threadId:id});
@@ -3202,6 +3235,25 @@ export default async function plugin(bb: BbPluginApi) {
       if (!taskId) throw new Error("Lookup needs taskId.");
       return { text: workstreams.lookup(input.workstreamId, input.threadId, taskId) };
     }
+    if (action === "removeTask") {
+      const taskId = input.taskId ?? input.taskIds?.[0];
+      if (!taskId) throw new Error("removeTask needs taskId.");
+      const w = await workstreams.removeTask(input.workstreamId, input.threadId, taskId);
+      return { text: `${taskId} left workstream ${w.name} (${w.id}). Folded work in the workstream is unchanged; the task's other crews are ordinary crews again. Run it outside the workstream with firstmate_dispatch taskRef=${taskId} and no workstreamId.` };
+    }
+    if (action === "cancel") {
+      if (!input.crewId) throw new Error("cancel needs crewId.");
+      const w = workstreams.get(input.workstreamId, input.threadId);
+      const waiting = w.jobs.find((j) => j.id === input.crewId);
+      let projectId = w.projectId;
+      try { const named = asRecord(JSON.parse(waiting?.payload ?? "{}"))["projectId"]; if (typeof named === "string") projectId = named; } catch { /* the workstream's project */ }
+      const launch = launches.forTask(projectId, input.threadId, input.crewId);
+      if (launch !== undefined && launch.state !== "failed") throw new Error(`Crew ${input.crewId} has a start in progress or a worker (launch ${launch.state}); it is not a waiting job.`);
+      const job = await workstreams.cancel(input.workstreamId, input.threadId, input.crewId);
+      const reserved = dispatchJobs.get(job.id);
+      if (reserved && reserved.state !== "started" && reserved.state !== "failed") dispatchJobs.save({ ...reserved, state: "failed", error: "cancelled by the captain" });
+      return { text: `Cancelled crew ${job.id} in workstream ${w.name} before it started. Its owner task stays open.` };
+    }
     if (action === "ship") {
       if (!input.requestId) throw new Error("Ship needs a stable requestId.");
       try { return {workstream:await workstreams.ship(input.workstreamId,input.threadId,input.requestId)}; }
@@ -3741,12 +3793,18 @@ export default async function plugin(bb: BbPluginApi) {
   // while holding one of those.
   const crewControl = <T>(crewId: string, operation: () => Promise<T>): Promise<T> =>
     holdsLedger(`crew-control:${crewId}`) ? operation() : serializeLedger(`crew-control:${crewId}`, operation);
+  // A crew whose task left its workstream (removeTask) is no longer kept by it.
+  const workstreamKeepsCrew = (crew: Crew) => {
+    const w = workstreams.get(crew.workstreamId!, crew.parentThreadId ?? "");
+    const job = w.jobs.find((j) => j.id === crew.id);
+    return w.state === "open" && !(job?.state === "dropped" && job.taskId !== undefined && w.leftTaskIds?.includes(job.taskId));
+  };
   // The one entry point for retiring, forgetting or stopping a crew: the crew's lock is held from the
   // caller's eligibility re-check through the teardown.
   const adoptedCrewRetained = (crew: Crew) => workstreams.listAll().some((w) => w.state === "open" && w.taskIds.some((id) => ownerTasks.get(id)?.crewIds.includes(crew.id)));
   const retireCrew = <T>(id:string, operation:()=>Promise<T>):Promise<T> => crewControl(id, async () => {
     const crew = (await readCrews()).find((c) => c.id === id);
-    if (crew?.workstreamId && workstreams.get(crew.workstreamId,crew.parentThreadId ?? "").state === "open") throw new Error("Workstream crew kept. End the workstream after every task is Live or Dropped.");
+    if (crew?.workstreamId && workstreamKeepsCrew(crew)) throw new Error("Workstream crew kept. End the workstream after every task is Live or Dropped.");
     if (crew && adoptedCrewRetained(crew)) throw new Error("Workstream crew kept. End the workstream after every task is Live or Dropped.");
     return operation();
   });
@@ -5834,9 +5892,9 @@ export default async function plugin(bb: BbPluginApi) {
   // out. Returns the refusal text, or null when there is room for `adding` more.
   async function crewCapRefusal(parentThreadId: string | undefined, adding: number): Promise<string | null> {
     if (parentThreadId === undefined) return null;
-    const {cap,activeTaskIds}=await launchCapacity(parentThreadId);
+    const {cap,activeTaskIds,held}=await launchCapacity(parentThreadId);
     if (cap === 0) return null;
-    const running=new Set([...activeTaskIds,...launches.heldTaskIds(parentThreadId)]).size;
+    const running=new Set([...activeTaskIds,...held]).size;
     if (running + adding <= cap) return null;
     return `Crew cap reached: ${running} crews running (cap ${cap}). Queue this with firstmate_queue and dispatch when a crew finishes, or ask the captain to raise the cap.`;
   }
@@ -6041,12 +6099,43 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const models = Array.isArray(catalog["models"]) ? (catalog["models"] as unknown[]).map(asRecord) : [];
     if (catalog["modelLoadError"] != null || models.length === 0) throw unchecked(catalog["modelLoadError"] != null ? `model catalog failed to load (${String(catalog["modelLoadError"])})` : "model catalog is empty");
-    if (models.some((m) => m["id"] === mid || m["model"] === mid)) return;
+    if (models.some((m) => m["id"] === mid || m["model"] === mid)) {
+      const hostId = selectedHost ?? await resolveHostForProject(projectId, parentThreadId).catch(() => undefined);
+      const listed = models.map((m) => m["id"]).filter((m): m is string => typeof m === "string");
+      const cli = await cliModelRefusal(pid, mid, listed, hostId);
+      if (cli === null) return;
+      if (strict) throw new Error(`Execution change refused: ${cli}`);
+      throw refused(cli, "not accepted by its CLI");
+    }
     if (strict) throw new Error(`Execution change refused: model ${mid} is not in the selected provider catalog.`);
     // 17 Oct step 2 canary: a Claude model on the Codex provider was accepted here and
     // the crew failed at its first turn. A model the catalog does not list is refused.
     const offered = models.map((m) => m["id"]).filter((m): m is string => typeof m === "string");
     throw refused(`Provider "${pid || "default"}" does not offer model "${mid}". It offers: ${offered.join(", ")}. Nothing was spawned.`, "not in the catalog");
+  }
+
+  // 20 Oct: BB's catalog for acp-antigravity listed gemini-4-argon; agy refused it, and crews 9ade6f3a, 43864fce
+  // and hermes-split-step3-1020 died at their first turn. A provider whose CLI lists its own models is checked
+  // against that list too. A list that cannot be read leaves BB's catalog as the only check; a good read holds 10 minutes.
+  const cliModelLists = new Map<string, { at: number; ids: string[] }>();
+  const CLI_MODELS_FRESH_MS = 10 * 60_000;
+  async function cliModelRefusal(providerId: string, model: string, catalog: string[], hostId: string | undefined): Promise<string | null> {
+    const probe = providerModelsCommand(providerId);
+    if (probe === null || hostId === undefined) return null;
+    const key = `${hostId}:${providerId}`;
+    let ids = cliModelLists.get(key);
+    if (ids === undefined || Date.now() - ids.at >= CLI_MODELS_FRESH_MS) {
+      let read: { exitCode: number | null; output: string };
+      try { read = await runStructuredOnHost(hostId, probe.command, 20_000); }
+      catch (error) { bb.log.warn(`${probe.label} model list on ${hostId} could not be read; BB's catalog stands: ${String(error)}`); return null; }
+      const listed = read.exitCode === 0 ? parseCliModels(read.output) : [];
+      if (listed.length === 0) { bb.log.warn(`${probe.label} on ${hostId} listed no models (exit ${read.exitCode}); BB's catalog stands`); return null; }
+      ids = { at: Date.now(), ids: listed };
+      cliModelLists.set(key, ids);
+    }
+    if (cliAcceptsModel(model, ids.ids)) return null;
+    const accepted = acceptedCatalogModels(catalog, ids.ids);
+    return `Provider "${providerId}" lists model "${model}", but its CLI on host ${hostId} does not accept it (\`${probe.command}\`). ${accepted.length > 0 ? `Models it accepts: ${accepted.join(", ")}.` : `Its CLI lists only: ${ids.ids.join(", ")}.`} Nothing was spawned.`;
   }
 
   // A spawned crew whose thread is already in error never started; say so instead
@@ -6237,9 +6326,21 @@ export default async function plugin(bb: BbPluginApi) {
     }
     // Worker retention is independent of launch capacity. A forgotten running
     // worker still consumes admission capacity until core reports completion.
+    // 20 Oct: crews 9ade6f3a and 43864fce failed at their first turn, but their launches stayed
+    // provisioning and, with two finished merge crews, filled the cap of 7. A provisioning launch whose
+    // thread no longer works releases its slot; one whose thread cannot be read keeps it.
+    const released: string[] = [];
     for (let offset=0; ; offset+=100) {
       const records=launches.list(owner ?? "",100,offset);
       for (const record of records) {
+        if (record.state === "provisioning" && record.threadId && record.shape !== "secondmate-route") {
+          try {
+            const thread=await raceAbort(bb.sdk.threads.get({threadId:record.threadId}),launchAbort.signal,STUCK_HOST_CALL_MS);
+            const crew=mine.find((c) => c.threadId === record.threadId);
+            if (!["active","pending","starting"].includes(thread.status) && !(crew && await isCrewWaiting(crew))) released.push(record.key);
+          } catch { /* unreadable: it keeps its slot */ }
+          continue;
+        }
         if (record.state !== "running" || !record.threadId || record.shape === "secondmate-route") continue;
         try {
           const thread=await raceAbort(bb.sdk.threads.get({threadId:record.threadId}),launchAbort.signal,STUCK_HOST_CALL_MS);
@@ -6250,7 +6351,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
       if (records.length<100) break;
     }
-    return { cap, activeTaskIds };
+    return { cap, activeTaskIds, released, held: launches.heldTaskIds(owner ?? "", new Set(released)) };
   }
 
   // Background spawns are tracked apart from the per-minute follow-up pass, so a
@@ -6280,9 +6381,19 @@ export default async function plugin(bb: BbPluginApi) {
         return;
       }
       dispatchJobs.save({ ...job, state: "spawning", startedAt: now, backoffUntil: null });
-      await dispatchCrew({ ...input, crewId: reservedId, signal: launchAbort.signal });
+      const crew = await dispatchCrew({ ...input, crewId: reservedId, signal: launchAbort.signal });
       const done = dispatchJobs.get(reservedId);
       if (done) dispatchJobs.save({ ...done, state: "started" });
+      // The tool only answered "Reserved": a workstream job that did not start says why, once.
+      if (input.workstreamId && !crew.threadId) try {
+        const stream = workstreams.get(input.workstreamId, job.captainThreadId);
+        const queued = stream.jobs.find((j) => j.id === reservedId);
+        if (queued && queued.state !== "failed" && queued.told === undefined) {
+          workstreams.noteJob(stream.id, job.captainThreadId, reservedId, { told: "waiting" });
+          await deliverToCaptain(job.captainThreadId, `Crew ${reservedId} is queued in workstream ${stream.name} (${stream.id}): ${workstreamWait(stream, queued)} You are told when it starts or fails. To drop it: firstmate_workstream action=cancel workstreamId=${stream.id} crewId=${reservedId}.`, reservedId, undefined, true)
+            .catch((notifyError) => bb.log.warn(`async dispatch ${reservedId} queue notice: ${String(notifyError)}`));
+        }
+      } catch (noticeError) { bb.log.warn(`async dispatch ${reservedId} queue notice: ${String(noticeError)}`); }
       // The tool only answered "Reserved": the model pick and its notices reach the captain now.
       const picked = dispatchProviderNotes.get(reservedId);
       if (picked !== undefined) {
@@ -6344,8 +6455,8 @@ export default async function plugin(bb: BbPluginApi) {
   }): Promise<string | null> {
     const flags = await reliabilityFlags();
     if (flags.asyncDispatch !== "on") return null;
-    const { cap, activeTaskIds } = await launchCapacity(input.parentThreadId);
-    const running = new Set([...activeTaskIds, ...launches.heldTaskIds(input.parentThreadId)]).size;
+    const { cap, activeTaskIds, held } = await launchCapacity(input.parentThreadId);
+    const running = new Set([...activeTaskIds, ...held]).size;
     const admit = admissionDecision({
       cap,
       statuses: Array.from({ length: running }, () => "active"),
@@ -6394,7 +6505,7 @@ export default async function plugin(bb: BbPluginApi) {
         : null;
       if (parsed && parsed.chatId) inboundLedger.markDelegated(parsed, queued.id, Date.now());
     }
-    const holders = await slotHolders(input.parentThreadId, [...activeTaskIds, ...launches.heldTaskIds(input.parentThreadId)]);
+    const holders = await slotHolders(input.parentThreadId, [...activeTaskIds, ...held]);
     const tell = (input.sourceRefs?.length ?? 0) > 0 ? "Tell the owner now" : "If the owner asked for this, tell the owner now";
     return `Queued as ${queued.id} (crew cap ${admit.cap}; will dispatch when a slot opens). It has NOT started. ${tell} that this job waits for a free crew slot. Slots are held by: ${holders}. To start it sooner: raise the crew cap (maxActiveCrews setting), or stop one of these crews.`;
   }
@@ -6435,8 +6546,8 @@ export default async function plugin(bb: BbPluginApi) {
     for (const item of startOrder(all.filter((row) => row.overCap === true && row.status === "queued" && storedQueueGate(row, all, now) === null))) {
       const parent = item.parentThreadId;
       if (!parent) continue;
-      const { cap, activeTaskIds } = await launchCapacity(parent);
-      const running = new Set([...activeTaskIds, ...launches.heldTaskIds(parent)]).size;
+      const { cap, activeTaskIds, held } = await launchCapacity(parent);
+      const running = new Set([...activeTaskIds, ...held]).size;
       if (cap > 0 && running >= cap) { noSlot.push(item); continue; }
       try {
         await inCaptainHome(parent, () => dispatchQueueItem(item, parent, { threadId: parent, projectId: item.projectId }));
@@ -6458,8 +6569,8 @@ export default async function plugin(bb: BbPluginApi) {
     const captain = item.parentThreadId;
     const waited = now - Date.parse(item.createdAt);
     if (!captain || (item.sourceRefs?.length ?? 0) === 0 || !(waited >= OWNER_JOB_WAIT_NOTICE_MS) || queueStore.waitNoticed(item)) return;
-    const { activeTaskIds } = await launchCapacity(captain);
-    const holders = await slotHolders(captain, [...activeTaskIds, ...launches.heldTaskIds(captain)]);
+    const { activeTaskIds, held } = await launchCapacity(captain);
+    const holders = await slotHolders(captain, [...activeTaskIds, ...held]);
     const told = await deliverToCaptain(captain, `Owner job ${item.id} (${truncate(item.title, 70)}) has waited ${Math.floor(waited / 60_000)} minutes for a crew slot and has not started. Tell the owner. Slots are held by: ${holders}. Options: A) wait, it starts by itself when a slot opens; B) raise the crew cap (maxActiveCrews setting), then firstmate_queue action=dispatch queueId=${item.id}; C) stop one of the crews above with firstmate_forget crewId=<id> stop=true. This is the only notice for this job.`, item.id, undefined, true)
       .catch((error) => { bb.log.warn(`owner job ${item.id} wait notice: ${String(error)}`); return false; });
     if (told) queueStore.noticeWait(item, now);
@@ -7913,7 +8024,9 @@ export default async function plugin(bb: BbPluginApi) {
     if (workstreams.listAll().some((other) => other.id !== w.id && other.jobs.some((j) => j.id === id))) throw new Error("Crew identity already belongs to another workstream.");
     const { signal: _signal, ...payload } = input;
     const repository = w.repos.find((r) => r.projectId === input.projectId && (!input.workstreamRepo || r.repository.toLowerCase() === input.workstreamRepo.toLowerCase()))?.repository;
-    const job = await workstreams.submit(w.id, input.parentThreadId, { id,
+    // An async dispatch opened its owner task already: the job carries it from the start, so a notice names it.
+    const opened = ownerTasks.list(input.parentThreadId, { includeClosed: true }).find((t) => t.crewIds.includes(id));
+    const job = await workstreams.submit(w.id, input.parentThreadId, { id, ...(opened ? { taskId: opened.id } : {}),
       editing: input.shape !== "scout" && input.role !== "checker" && input.role !== "lookup", payload: JSON.stringify(payload),
       title: input.title, model: input.model, followUpOf: input.followUpOf,
       ...(input.reuseEnvironmentId ? { environmentId: input.reuseEnvironmentId } : {}),
@@ -8450,6 +8563,25 @@ export default async function plugin(bb: BbPluginApi) {
     return true;
   }
 
+  // 20 Oct: retry of failed workstream crew 9ade6f3a was refused with no way forward named. A workstream crew
+  // runs again as a follow-up dispatch, which waits for the workstream's editor and a failed task's kept worktree.
+  function workstreamFollowUp(crew: Crew, opts: { providerId?: string; model?: string; reasoningLevel?: string }): string {
+    const task = ownerTasks.list(crew.parentThreadId ?? "", { includeClosed: true }).find((t) => t.crewIds.includes(crew.id));
+    const execution = [opts.providerId ? `providerId=${opts.providerId}` : "", opts.model ? `model=${opts.model}` : "", opts.reasoningLevel ? `reasoningLevel=${opts.reasoningLevel}` : ""].filter((part) => part !== "").join(" ");
+    let job: WorkstreamJob | undefined;
+    let left = false;
+    try {
+      const w = workstreams.get(crew.workstreamId!, crew.parentThreadId ?? "");
+      job = w.jobs.find((j) => j.id === crew.id);
+      left = job?.taskId !== undefined && w.leftTaskIds?.includes(job.taskId) === true;
+    } catch { /* an unreadable workstream names no reuse */ }
+    if (left) return `Crew ${crew.id}'s task ${job!.taskId} left workstream ${crew.workstreamId}: run it again outside the workstream with firstmate_dispatch taskRef=${job!.taskId}${execution ? ` ${execution}` : ""} and no workstreamId.`;
+    const how = job && ["failed", "kept-unsaved"].includes(job.state) && job.cleanup !== "done" && job.environmentId
+      ? "which reuses its worktree"
+      : job?.state === "folded" ? "which starts from the workstream branch with its last report" : "which waits for the workstream editor";
+    return `Crew ${crew.id} works in workstream ${crew.workstreamId}: relaunch it as a follow-up, ${how}: firstmate_dispatch workstreamId=${crew.workstreamId}${task ? ` taskRef=${task.id}` : ""}${execution ? ` ${execution}` : ""} with the task. A retry or relaunch cannot reserve the workstream's editor.`;
+  }
+
   async function relaunchCrew(
     crew: Crew,
     opts: { providerId?: string; model?: string; reasoningLevel?: ReasoningLevel; note?: string; overCap?: boolean;intent?:ReplacementIntent;caller?:string;modelPermission?:string },
@@ -8459,7 +8591,7 @@ export default async function plugin(bb: BbPluginApi) {
     return crewControl(crew.id,()=>relaunchCrewNow(crew,opts));
   }
   async function relaunchCrewNow(crew:Crew,opts:{ providerId?: string; model?: string; reasoningLevel?: ReasoningLevel; note?: string; overCap?: boolean;intent?:ReplacementIntent;caller?:string;modelPermission?:string }):Promise<Crew> {
-    if (crew.workstreamId) throw new Error("Dispatch the follow-up with workstreamId; legacy relaunch cannot reserve its editor.");
+    if (crew.workstreamId) throw new Error(workstreamFollowUp(crew, opts));
     const request=JSON.stringify([crew.projectId,crew.parentThreadId,crew.id,crew.threadId,opts]);
     return launches.once(`replacement-request:${request}`,()=>serializeLedger(`replacement-task:${crew.projectId}:${crew.parentThreadId}:${crew.id}`,async()=>{
       const current=(await readCrews()).find(c=>c.id===crew.id && c.projectId===crew.projectId && c.parentThreadId===crew.parentThreadId);
@@ -8559,7 +8691,16 @@ export default async function plugin(bb: BbPluginApi) {
     if (JSON.stringify(reservation.replacement?.target)!==JSON.stringify(plan.contract.target) || reservation.replacement?.sourceThreadId!==crew.threadId || reservation.replacement.intent!==intent || reservation.replacement.reason!==note) throw new Error("Replacement reservation conflicts with this exact request.");
     reservation = await reconcileLaunch(reservation);
     if (fmHome) {
-      const sha=await rebindReplacement(crew,{...crew,threadId:reservation.threadId??crew.threadId,providerId:providerId??null,model:model??null,reasoningLevel:reasoningLevel??null},reusedEnvironment.hostId,reusedEnvironment.path??"",plan.generation,true,reservation.replacement!.nativeBriefSha);
+      let sha: string;
+      try {
+        sha=await rebindReplacement(crew,{...crew,threadId:reservation.threadId??crew.threadId,providerId:providerId??null,model:model??null,reasoningLevel:reasoningLevel??null},reusedEnvironment.hostId,reusedEnvironment.path??"",plan.generation,true,reservation.replacement!.nativeBriefSha);
+      } catch (error) {
+        // 20 Oct: a refused preflight left hermes-split-step3-1020's replacement reserved, holding a crew
+        // slot with no worker. Nothing was asked of BB yet, so the reservation ends here.
+        const latest=launches.get(key);
+        if (latest?.state==="reserved" && !latest.threadId && latest.creationRequested!==true) launches.update(key,{state:"failed",error:String(error)});
+        throw error;
+      }
       if (!reservation.replacement!.nativeBriefSha) reservation=launches.update(key,{replacement:{...reservation.replacement!,nativeBriefSha:sha}});
     }
     // Release only after the replacement's native instructions are readable and a
@@ -8923,13 +9064,13 @@ export default async function plugin(bb: BbPluginApi) {
     if (w.state !== "open") throw new Error("Workstream has ended.");
     if (crew.shape === "scout" || crew.role === "checker" || crew.role === "lookup") return;
     const job = w.jobs.find((j) => j.id === crew.id);
-    if (w.state !== "open" || !job || job.state === "finished" || job.state === "folded" || job.state === "dropped" || job.state === "failed" || job.state === "kept-unsaved" || w.ship.state === "running" || w.ship.state === "blocked") throw new Error("Dispatch a follow-up task with workstreamId so it waits for the workstream editor.");
+    if (w.state !== "open" || !job || job.state === "finished" || job.state === "folded" || job.state === "dropped" || job.state === "failed" || job.state === "kept-unsaved" || w.ship.state === "running" || w.ship.state === "blocked") throw new Error(workstreamFollowUp(crew, {}));
   }
   async function retryCrewTurn(crew: Crew, reason: string | undefined): Promise<string> {
     return crewControl(crew.id, () => retryCrewTurnNow(crew, reason));
   }
   async function retryCrewTurnNow(crew: Crew, reason: string | undefined): Promise<string> {
-    if (crew.workstreamId) throw new Error("Dispatch the follow-up with workstreamId; legacy retry cannot reserve its editor.");
+    if (crew.workstreamId) throw new Error(workstreamFollowUp(crew, {}));
     await ensureWorkspace(crew.threadId, crew);
     try {
       await withSessionRepair(crew.threadId, () => bb.sdk.threads.retry({
@@ -16309,7 +16450,7 @@ export default async function plugin(bb: BbPluginApi) {
     mode: modeSchema.optional(),
     worktree: z.boolean().optional(),
     workstreamRepo: z.string().optional().describe("Repository owner/repo within a multi-repo workstream"),
-    workstreamId: z.string().min(1).optional().describe("Attach this crew to a workstream. Created workstreams start each editing task in its own worktree from the workstream branch. Adopted workstreams keep one editor at a time."),
+    workstreamId: z.string().min(1).optional().describe("Attach this crew to a workstream. Only this field puts a crew in a workstream; an owner message from a workstream topic does not. Created workstreams start each editing task in its own worktree from the workstream branch. Adopted workstreams keep one editor at a time."),
     sharedEnv: z.boolean().optional().describe("Unsupported for native ship transport; shared-worktree requests refuse before creation"),
     visible: z.boolean().optional().describe("Show in the BB sidebar as a nested subagent (default true)"),
     deliveryRequirement:z.enum(["pr","merged","merged-and-verified"]).optional().describe("Agreed delivery contract; default is merge without deployment"),
@@ -16639,7 +16780,7 @@ export default async function plugin(bb: BbPluginApi) {
     async execute({name,reference,source},ctx){return readNativeSkill(ctx,name,reference,source);},
   });
   registerCaptainTool({
-    name: "firstmate_workstream", description: "Propose, create, adopt, inspect, Ship or End a workstream; request its dev link or bind its Telegram topic. view returns one line per task (number, title, model, state). lookup returns at most 15 lines for one task (brief, last report, changed files). A new task in a workstream starts its own crew and worktree; a follow-up to a running crew is firstmate_tell; a follow-up to a folded task is a new dispatch with taskRef. Decide new task vs follow-up by judgement, not a pattern. A direct reply to a crew message is always a follow-up. When the owner asks for topics for current work (\"make topics for my current workstreams\"), call propose: it groups open tasks per project. Agree names and grouping with the owner, then call adopt once per workstream; adopt shows the owner one card listing its tasks, and his Approve adopts it: idle crews' saved work folds at once, running crews fold when they finish. Pass tasks[].repository and tasks[].branches for work recorded under the wrong repository, and replacesPrs for PRs the workstream PR replaces. A gone topic is replaced with bindTopic and goneTopicId.",
+    name: "firstmate_workstream", description: "Propose, create, adopt, inspect, Ship or End a workstream; request its dev link or bind its Telegram topic. view returns one line per task (number, title, model, state). lookup returns at most 15 lines for one task (brief, last report, changed files). A new task in a workstream starts its own crew and worktree; a follow-up to a running crew is firstmate_tell; a follow-up to a folded task is a new dispatch with taskRef. Decide new task vs follow-up by judgement, not a pattern. A direct reply to a crew message is always a follow-up. When the owner asks for topics for current work (\"make topics for my current workstreams\"), call propose: it groups open tasks per project. Agree names and grouping with the owner, then call adopt once per workstream; adopt shows the owner one card listing its tasks, and his Approve adopts it: idle crews' saved work folds at once, running crews fold when they finish. Pass tasks[].repository and tasks[].branches for work recorded under the wrong repository, and replacesPrs for PRs the workstream PR replaces. A gone topic is replaced with bindTopic and goneTopicId. removeTask takes a task attached by mistake out of the workstream (taskId); its folded work stays, and a crew still working on it must finish first. cancel drops a crew that has not started (crewId). A failed task runs again as a follow-up: firstmate_dispatch with workstreamId and taskRef, on any provider and model.",
     parameters: workstreamActionSchema,
     async execute(input, ctx) {
       try { return JSON.stringify(await workstreamOperation(input.action, {...input,threadId:ctxString(ctx,"threadId") ?? ""})); }
@@ -16659,13 +16800,14 @@ export default async function plugin(bb: BbPluginApi) {
       if (resolvedProject === undefined) return toolError("No project: pass projectId.");
       const parentThreadId = typeof ctxRecord["threadId"] === "string" ? ctxRecord["threadId"] : undefined;
       const turnRefs = parentThreadId === undefined ? [] : ownerTurnRefs.get(parentThreadId) ?? [];
+      // 20 Oct: the Hermes split dispatch (taskRef T333, no workstreamId) answered in the Cyndra SaaS UI topic and
+      // joined that workstream. Only workstreamId puts a crew in a workstream; a topic message only adds a note.
+      let topicNote = "";
       if (parentThreadId) {
         const refs = sourceRefs ?? turnRefs;
         const mapped = await Promise.all(refs.map(async (ref) => workstreamRefs.get(ref) ?? await bb.storage.kv.get<string>(`workstream-ref:${ref}`)));
         const ids = [...new Set(mapped.filter((id): id is string => typeof id === "string" && !!id))];
-        if (!sourceRefs && ids.length && mapped.some((id) => !id)) return toolError("Turn mixes General and workstream messages; pass the owner's sourceRefs.");
-        if (ids.length > 1 || (workstreamId && ids.some((id) => id !== workstreamId))) return toolError("Dispatch mixes workstreams; name one owner's sourceRefs.");
-        workstreamId ??= ids[0];
+        if (workstreamId && ids.some((id) => id !== workstreamId)) return toolError("Dispatch mixes workstreams; name one owner's sourceRefs.");
         if (workstreamId) {
           try {
             const w = workstreams.get(workstreamId, parentThreadId);
@@ -16673,6 +16815,10 @@ export default async function plugin(bb: BbPluginApi) {
             if (!belongs) return toolError("Project does not belong to workstream.");
           }
           catch (error) { return toolError(String(error)); }
+        }
+        for (const id of ids.filter((id) => id !== workstreamId)) {
+          const stream = workstreams.list(parentThreadId).find((w) => w.id === id);
+          if (stream) topicNote += `\nOwner message ${refs[mapped.indexOf(id)]} came from the topic of workstream ${stream.name} (${stream.id}); this crew is not in it. To work there, dispatch with workstreamId=${stream.id}.`;
         }
       }
       const passedRefs = (sourceRefs ?? []).flatMap((ref) => {
@@ -16684,12 +16830,27 @@ export default async function plugin(bb: BbPluginApi) {
       }
       if (taskRef && parentThreadId) {
         const holding = workstreams.list(parentThreadId,true).find((w) => w.taskIds.includes(taskRef));
-        if (holding && holding.id !== workstreamId) return toolError("Task belongs to another workstream; keep its workstreamId.");
+        if (holding && holding.id !== workstreamId) return toolError(`Task belongs to another workstream: ${taskRef} is in ${holding.name} (${holding.id}). Keep its workstreamId, or, if it was attached by mistake, take it out first with firstmate_workstream action=removeTask workstreamId=${holding.id} taskId=${taskRef}.`);
       }
       if (parentThreadId && !taskRef) {
         const prior = await prTask(parentThreadId,resolvedProject,title,task);
         const holding = prior ? workstreams.list(parentThreadId,true).find((w) => w.taskIds.includes(prior.id)) : undefined;
         if (holding && holding.id !== workstreamId) return toolError("PR belongs to another workstream; pass its workstreamId.");
+      }
+      // 20 Oct: dispatch dashboard-loading-1020b answered "Reserved" for a model the provider's CLI refuses, then
+      // waited for a crew slot it could never use. A named provider or model is checked before anything is
+      // reserved, queued or tracked, in the order the spawn checks it: sign-in, then the model.
+      if (providerId !== undefined || model !== undefined) {
+        try {
+          const execution = crewExecution({ role, providerId, model, modelPermission });
+          const guarded = (shape ?? "ship") === "ship" && execution.providerId === GUARDED_SHIP_PROVIDER && ownerRequestedProvider !== true && (await settings.get()).shipAntigravityGuard !== false;
+          if (!guarded) {
+            await requireProviderSignedIn(execution.providerId, resolvedProject, parentThreadId);
+            await validateProviderChoice(execution.providerId, execution.model, resolvedProject, parentThreadId, toReasoningLevel(reasoningLevel));
+          }
+        } catch (error) {
+          return toolError(`Dispatch refused: ${error instanceof Error ? error.message : String(error)}`);
+        }
       }
       const untagged = turnRefs.length > 0 && origin === undefined && taskRef === undefined && !passedRefs.some((ref) => turnRefs.includes(ref));
       const trackOwnerTask = async (crewId: string): Promise<string> => {
@@ -16726,7 +16887,7 @@ export default async function plugin(bb: BbPluginApi) {
           try { await attachWorkstreamTask(workstreamId, parentThreadId, crewId); }
           catch (error) { bb.log.warn(`workstream task ${crewId}: ${String(error)}`); }
         }
-        return note + (parentThreadId === undefined || ticket === undefined ? "" : trackProgramTicket(parentThreadId, crewId, ticket));
+        return note + (parentThreadId === undefined || ticket === undefined ? "" : trackProgramTicket(parentThreadId, crewId, ticket)) + topicNote;
       };
       if (overrideOwner !== true) {
         const conflict = await dispatchPrConflict(task, resolvedProject, parentThreadId);
@@ -16805,12 +16966,8 @@ export default async function plugin(bb: BbPluginApi) {
       if (workstreamId && !crew.threadId) {
         const stream = parentThreadId ? workstreams.get(workstreamId, parentThreadId) : undefined;
         const job = stream?.jobs.find((j) => j.id === crew.id);
-        const wait = job?.state === "waiting-memory"
-          ? "waiting for memory."
-          : stream && isAdoptedWorkstream(stream)
-            ? "one editor runs at a time."
-            : "it starts when memory allows.";
-        return `Queued crew ${crew.id} in workstream ${workstreamId}; ${wait}${await trackTask(crew.id)}`;
+        if (job?.state === "failed") return toolError(`Dispatch failed: crew ${crew.id} in workstream ${workstreamId} ${workstreamWait(stream, job)}`);
+        return `Queued crew ${crew.id} in workstream ${workstreamId}; ${workstreamWait(stream, job)}${await trackTask(crew.id)}`;
       }
       const warn = wt.sharedOverride ? " WARN: ship crew on shared env." : "";
       const status = await crewStatus(crew);
@@ -20072,7 +20229,7 @@ export default async function plugin(bb: BbPluginApi) {
           }
           case "workstream": {
             const rawAction = rest[0] ?? "list";
-            const action = rawAction === "dev-link" ? "devLink" : rawAction === "bind-topic" ? "bindTopic" : rawAction;
+            const action = rawAction === "dev-link" ? "devLink" : rawAction === "bind-topic" ? "bindTopic" : rawAction === "remove-task" ? "removeTask" : rawAction;
             // Adopt: --repo <task>=<owner/repo> moves a task recorded under the wrong repository; --branch
             // <task>=<branch> names a pushed branch that holds its work (repeat for several).
             const named = new Map<string, { taskId: string; repository?: string; branches?: string[] }>();
@@ -20087,7 +20244,7 @@ export default async function plugin(bb: BbPluginApi) {
             for (const value of flagAll(flags, "repo")) { const { row, value: repository } = pair(value, "repo"); row.repository = repository; }
             for (const value of flagAll(flags, "branch")) { const { row, value: branch } = pair(value, "branch"); row.branches = [...(row.branches ?? []), branch]; }
             const replacesPrs = flagAll(flags, "replaces");
-            const input = {threadId:ctxThread ?? "", projectId:flagStr(flags,"project"), name:flagStr(flags,"name"), workstreamId:flagStr(flags,"workstream-id"), requestId:flagStr(flags,"request-id"), taskIds:flagAll(flags,"task"), chatId:flagStr(flags,"chat-id"), topicId:flagStr(flags,"topic-id") ? Number(flagStr(flags,"topic-id")) : undefined, goneTopicId:flagStr(flags,"gone-topic-id") ? Number(flagStr(flags,"gone-topic-id")) : undefined, realLogin:flags.has("real-login"), includeEnded:flags.has("include-ended"), ...(named.size > 0 ? { tasks: [...named.values()] } : {}), ...(replacesPrs.length > 0 ? { replacesPrs } : {})};
+            const input = {threadId:ctxThread ?? "", projectId:flagStr(flags,"project"), name:flagStr(flags,"name"), workstreamId:flagStr(flags,"workstream-id"), requestId:flagStr(flags,"request-id"), taskIds:flagAll(flags,"task"), chatId:flagStr(flags,"chat-id"), topicId:flagStr(flags,"topic-id") ? Number(flagStr(flags,"topic-id")) : undefined, goneTopicId:flagStr(flags,"gone-topic-id") ? Number(flagStr(flags,"gone-topic-id")) : undefined, realLogin:flags.has("real-login"), includeEnded:flags.has("include-ended"), crewId:flagStr(flags,"crew-id"), ...(named.size > 0 ? { tasks: [...named.values()] } : {}), ...(replacesPrs.length > 0 ? { replacesPrs } : {})};
             const result = await workstreamOperation(action, input);
             return reply(result, JSON.stringify(result));
           }

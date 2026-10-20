@@ -97,9 +97,10 @@ export function createLaunches(db: Database) {
   function hasRuntimeConsumers(owner:string) {
     return !!db.prepare("SELECT 1 FROM launches WHERE owner=? AND state IN ('reserved','creating','provisioning','uncertain') LIMIT 1").get(owner);
   }
-  function heldTaskIds(owner:string) {
+  /** released: launch keys whose worker thread has ended, so they hold no slot (read by the caller from BB). */
+  function heldTaskIds(owner:string,released:ReadonlySet<string>=new Set()) {
     const rows=db.prepare("SELECT record FROM launches WHERE owner=? AND state IN ('reserved','creating','provisioning','uncertain')").all(owner) as {record:string}[];
-    return rows.map(row=>{const r=JSON.parse(row.record) as LaunchRecord;return launchTaskKey(r.projectId,r.taskId);});
+    return rows.map(row=>JSON.parse(row.record) as LaunchRecord).filter(r=>!released.has(r.key)).map(r=>launchTaskKey(r.projectId,r.taskId));
   }
   function forTask(project:string,owner:string,task:string):LaunchRecord|undefined {
     const row=db.prepare("SELECT record FROM launches WHERE project=? AND owner=? AND json_extract(record,'$.taskId')=? ORDER BY json_extract(record,'$.generation') DESC LIMIT 1").get(project,owner,task) as {record:string}|undefined;
@@ -126,16 +127,16 @@ export function createLaunches(db: Database) {
     })();
   }
   /** supersedeKey: an earlier replacement of the same source that never asked BB for a worker; failed in the same transaction. */
-  async function reserve(record: LaunchRecord, capacity: () => Promise<{ cap: number; activeTaskIds: string[] }>, overCap = false, supersedeKey?: string) {
+  async function reserve(record: LaunchRecord, capacity: () => Promise<{ cap: number; activeTaskIds: string[]; released?: string[] }>, overCap = false, supersedeKey?: string) {
     const run = tail.then(async () => {
       const prior = get(record.key);
       if (prior && prior.state !== 'failed') return prior;
-      const { cap, activeTaskIds } = await capacity();
+      const { cap, activeTaskIds, released } = await capacity();
       return db.transaction(() => {
         const current=get(record.key);
         if (current && current.state !== "failed") return current;
         const active = new Set(activeTaskIds);
-        for (const held of heldTaskIds(record.owner)) active.add(held);
+        for (const held of heldTaskIds(record.owner,new Set(released))) active.add(held);
         if (!overCap && cap > 0 && !active.has(launchTaskKey(record.projectId,record.taskId)) && active.size >= cap) throw new Error(`Crew cap reached: ${active.size} crews running or reserved (cap ${cap}). Queue this task until capacity is available.`);
         if (supersedeKey !== undefined) {
           const stale = get(supersedeKey);

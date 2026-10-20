@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
-import { createWorkstreams, WorkstreamWaiting, DEV_IDLE_MS, type WorkstreamDeps } from './workstreams.ts';
+import { createWorkstreams, WorkstreamWaiting, WorkstreamJobWaiting, WorkstreamJobRefused, DEV_IDLE_MS, type WorkstreamDeps } from './workstreams.ts';
 import { FAILED_KEEP_MS, FOLD_CONFLICT_TELL, MEMORY_GUARD_BYTES } from './workstream-fold.ts';
 import { seedLegacyWorkstream } from '../test/legacy-workstream.mjs';
 
@@ -730,5 +730,123 @@ test('an editor saved before task worktrees waits for the running editor, as it 
     await f.store.reconcile();
     assert.ok(f.started.includes('legacy'));
     assert.equal(f.store.get(w.id, 'cap').jobs.find((j) => j.id === 'legacy')!.isolated, undefined);
+  } finally { f.db.close(); }
+});
+
+// 20 Oct, ws-32df9211-06b: dispatch dashboard-loading-1020b answered "Reserved"; its start then hit "Crew cap
+// reached" on every pass and the job stayed "starting" with no word to the captain.
+test('a job without a free crew slot waits as queued with its reason; the captain hears once, and again when it starts', async () => {
+  const f = fixture(); const told: string[] = [];
+  let full = true;
+  f.deps.start = async (_w, job) => {
+    if (full) throw new WorkstreamJobWaiting('Crew cap reached: 7 crews running or reserved (cap 7).');
+    f.started.push(job.id); return `thr_${job.id}`;
+  };
+  f.deps.jobNotice = async (_w, job, notice) => { told.push(`${job.id} ${notice.kind}: ${notice.reason}`); };
+  try {
+    const w = await f.create();
+    const job = await f.store.submit(w.id, 'cap', { id: 'dash', editing: true, payload: '{}', taskId: 'T377', title: 'Dashboard loads forever' });
+    assert.equal(job.state, 'queued');
+    assert.match(job.error ?? '', /Crew cap reached/);
+    await f.store.reconcile();
+    assert.deepEqual(told, ['dash waiting: Crew cap reached: 7 crews running or reserved (cap 7).'], 'one notice, not one per pass');
+    assert.equal(f.store.view(w.id, 'cap'), 'T377 Dashboard loads forever default queued (waits: Crew cap reached: 7 crews running or reserved (cap 7).)');
+    full = false;
+    await f.store.reconcile();
+    const started = f.store.get(w.id, 'cap').jobs[0]!;
+    assert.deepEqual([started.state, started.threadId, started.error, started.told], ['running', 'thr_dash', undefined, undefined]);
+    assert.equal(told.at(-1), 'dash started: thr_dash');
+  } finally { f.db.close(); }
+});
+
+test('a job whose start is refused before any spawn ends failed with its reason, and the next editor takes its turn', async () => {
+  const f = fixture(); const told: string[] = [];
+  f.deps.start = async (_w, job) => {
+    if (job.id === 'argon') throw new WorkstreamJobRefused('Provider "acp-antigravity" does not accept model "gemini-4-argon" on host h1. Nothing was spawned.');
+    f.started.push(job.id); f.statuses.set(job.id, 'active'); return job.id;
+  };
+  f.deps.jobNotice = async (_w, job, notice) => { told.push(`${job.id} ${notice.kind}`); };
+  try {
+    const w = seedLegacyWorkstream(f.db, { projectId: 'cyndra', name: 'Chat', requestId: 'serial', taskIds: ['T1'] });
+    const argon = await f.store.submit(w.id, 'cap', { id: 'argon', editing: true, payload: '{}', taskId: 'T1' });
+    await f.store.submit(w.id, 'cap', { id: 'sonnet', editing: true, payload: '{}', taskId: 'T1' });
+    assert.deepEqual([argon.state, argon.threadId, argon.cleanup], ['failed', null, 'done']);
+    assert.match(argon.error ?? '', /Nothing was spawned/);
+    assert.equal(typeof argon.failedAt, 'number');
+    assert.deepEqual(f.started, ['sonnet'], 'a refused job never holds the one editor of an adopted workstream');
+    assert.deepEqual(told, ['argon failed']);
+    f.statuses.set('sonnet', 'idle');
+    await f.store.reconcile();
+    assert.equal(f.store.get(w.id, 'cap').state, 'ended', 'a job that never started has nothing to clean, so End is not held');
+  } finally { f.db.close(); }
+});
+
+test('a start whose outcome is unresolved stays starting and retries; the captain hears its reason once', async () => {
+  const f = fixture(); const told: string[] = [];
+  f.deps.start = async () => { throw new Error('Launch one (uncertain): host did not answer.'); };
+  f.deps.jobNotice = async (_w, job, notice) => { told.push(`${job.id} ${notice.kind}: ${notice.reason}`); };
+  try {
+    const w = await f.create();
+    const job = await f.store.submit(w.id, 'cap', { id: 'one', editing: true, payload: '{}' });
+    await f.store.reconcile();
+    assert.equal(job.state, 'starting');
+    assert.equal(f.store.get(w.id, 'cap').jobs[0]!.state, 'starting');
+    assert.deepEqual(told, ['one unresolved: Launch one (uncertain): host did not answer.']);
+  } finally { f.db.close(); }
+});
+
+test('the captain cancels a job that has not started; a started one is refused', async () => {
+  const f = fixture();
+  f.deps.start = async (_w, job) => { if (job.id === 'waits') throw new WorkstreamJobWaiting('Crew cap reached'); f.started.push(job.id); return job.id; };
+  try {
+    const w = await f.create();
+    await f.store.submit(w.id, 'cap', { id: 'waits', editing: true, payload: '{}', taskId: 'T1' });
+    await f.store.submit(w.id, 'cap', { id: 'runs', editing: true, payload: '{}', taskId: 'T2' });
+    const cancelled = await f.store.cancel(w.id, 'cap', 'waits');
+    assert.deepEqual([cancelled.state, cancelled.cleanup, cancelled.note], ['dropped', 'done', 'cancelled by the captain before it started']);
+    await assert.rejects(f.store.cancel(w.id, 'cap', 'runs'), /has started/);
+    await f.store.reconcile();
+    assert.deepEqual(f.started, ['runs'], 'a cancelled job never starts');
+  } finally { f.db.close(); }
+});
+
+// 20 Oct: dispatch 43864fce (Hermes split, taskRef T333) carried no workstreamId but joined ws-32df9211-06b.
+test('a wrongly attached task leaves the workstream; its unfolded jobs are dropped and folded work stays', async () => {
+  const f = fixture();
+  f.deps.taskState = () => 'working';
+  f.deps.report = async () => 'All tests passed.';
+  f.deps.fold = async () => ({ ok: true, conflict: false, files: ['a.ts'] });
+  try {
+    const w = await f.create();
+    await f.store.attachTask(w.id, 'cap', 'T302');
+    await f.store.submit(w.id, 'cap', { id: 'ui', editing: true, payload: '{}', taskId: 'T302' });
+    f.statuses.set('ui', 'idle');
+    await f.store.reconcile();
+    await f.store.attachTask(w.id, 'cap', 'T333');
+    await f.store.submit(w.id, 'cap', { id: 'hermes', editing: true, payload: '{}', taskId: 'T333' });
+    f.statuses.set('hermes', 'error');
+    await f.store.reconcile();
+    const before = f.store.get(w.id, 'cap').jobs.find((j) => j.id === 'ui')!;
+    assert.equal(before.state, 'folded');
+    const after = await f.store.removeTask(w.id, 'cap', 'T333');
+    assert.deepEqual(after.taskIds, ['T302']);
+    assert.deepEqual(after.leftTaskIds, ['T333']);
+    const hermes = after.jobs.find((j) => j.id === 'hermes')!;
+    assert.deepEqual([hermes.state, hermes.cleanup, hermes.note], ['dropped', 'done', 'left the workstream: T333 does not belong to it']);
+    assert.deepEqual(after.jobs.find((j) => j.id === 'ui'), before, 'folded work is untouched');
+    assert.deepEqual(createWorkstreams(f.db, f.deps).get(w.id, 'cap').taskIds, ['T302'], 'a later save does not bring it back');
+    await assert.rejects(f.store.removeTask(w.id, 'cap', 'T302'), /folded work/);
+    await assert.rejects(f.store.removeTask(w.id, 'cap', 'T999'), /not in this workstream/);
+  } finally { f.db.close(); }
+});
+
+test('a task whose crew still works in the workstream cannot leave it', async () => {
+  const f = fixture();
+  try {
+    const w = await f.create();
+    await f.store.attachTask(w.id, 'cap', 'T5');
+    await f.store.submit(w.id, 'cap', { id: 'busy', editing: true, payload: '{}', taskId: 'T5' });
+    await assert.rejects(f.store.removeTask(w.id, 'cap', 'T5'), /crew busy still works/);
+    assert.deepEqual(f.store.get(w.id, 'cap').taskIds, ['T5']);
   } finally { f.db.close(); }
 });

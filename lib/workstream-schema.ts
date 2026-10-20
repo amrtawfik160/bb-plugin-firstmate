@@ -74,6 +74,9 @@ export const jobSchema = z.object({
   // The conflict crew merging this job's work, and on that crew, the job it merges.
   resolver: z.string().optional(),
   resolves: z.string().optional(),
+  // The captain was told this job waits for a crew slot, or that its start is unresolved; he hears once
+  // more when it starts or fails.
+  told: z.enum(['waiting', 'unresolved']).optional(),
 });
 export const workstreamSchema = z.object({
   id: z.string(), name: z.string(), projectId: z.string(), threadId: z.string(), requestId: z.string(),

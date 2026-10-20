@@ -111,6 +111,14 @@ export function archiveKeepReason(facts: ArchiveFacts): string | null {
   return null;
 }
 
+/** Why a job has not started, for its view line: waiting for a crew slot, refused, or unresolved. */
+export function jobStartNote(job: { state: string; threadId: string | null; error?: string }): string {
+  if (!job.error) return "";
+  if (job.state === "queued") return ` (waits: ${oneLine(job.error, 160)})`;
+  if (job.state === "failed" && job.threadId === null) return ` (did not start: ${oneLine(job.error, 160)})`;
+  if (job.state === "starting") return ` (start unresolved: ${oneLine(job.error, 160)})`;
+  return "";
+}
 function oneLine(text: string, max: number): string {
   const line = text.trim().split(/\s+/).join(" ");
   return line.length <= max ? line : `${line.slice(0, Math.max(0, max - 1))}…`;

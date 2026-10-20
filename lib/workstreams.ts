@@ -10,12 +10,19 @@ import {
   foldTouchesDevFiles,
   formatWorkstreamLookup,
   isAdoptedWorkstream,
+  jobStartNote,
   jobToCardState,
   memoryIsLow,
 } from './workstream-fold.ts';
 import { resolverBrief, RESOLVE_UNSAFE, type AdoptSource } from './workstream-adopt.ts';
 
 export class WorkstreamWaiting extends Error {}
+/** A job's start found no free crew slot: it waits in line and starts on a later pass. */
+export class WorkstreamJobWaiting extends Error {}
+/** A job's start was refused before anything was spawned: it ends failed, and a retry is a new dispatch. */
+export class WorkstreamJobRefused extends Error {}
+/** What the captain hears about a job's start. */
+export type JobNotice = { kind: 'waiting' | 'unresolved' | 'failed' | 'started'; reason: string };
 /** A bindTopic refusal: `reason` is the stable code; the message text is unchanged for callers that read it. */
 export class WorkstreamRefusal extends Error {
   readonly reason: BindRefusalReason;
@@ -83,6 +90,8 @@ export type WorkstreamDeps = {
   unsavedJob?: (w: Workstream, job: WorkstreamJob) => Promise<string[]>;
   restartDev?: (w: Workstream) => Promise<void>;
   card?: (w: Workstream) => Promise<void>;
+  /** Tell the captain that a job waits for a crew slot, has an unresolved start, failed to start, or started after either. */
+  jobNotice?: (w: Workstream, job: WorkstreamJob, notice: JobNotice) => Promise<void>;
   /**
    * Before an adopted crew's work folds: save its uncommitted work as a backup commit and push it. `wait`
    * holds the fold; `sourceBranch` folds that pushed branch because the crew's worktree is gone; `running`
@@ -125,6 +134,8 @@ function keptUnsaved(job: WorkstreamJob): boolean {
 
 function jobClosed(job: WorkstreamJob): boolean {
   if (keptUnsaved(job) || job.cleanup === 'pending') return false;
+  // A job refused before any spawn has no crew, work or worktree.
+  if (job.state === 'failed' && job.threadId === null) return true;
   // Scouts, adopted editors, and editors saved before task worktrees close as before: when finished.
   if (!job.isolated) return job.state === 'finished' || job.state === 'dropped' || job.state === 'folded';
   return job.state === 'folded' || job.state === 'dropped' || job.state === 'failed';
@@ -522,21 +533,48 @@ export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
           }
         }
       }
-      if (job.state === 'queued' || job.state === 'waiting-memory') {
+      // A job that waits for a crew slot tries again as queued, so its card does not flip on every pass.
+      const waiting = job.state === 'queued' && job.told === 'waiting';
+      if (!waiting && (job.state === 'queued' || job.state === 'waiting-memory')) {
         job.state = 'starting';
         await bumpCard(w);
       }
       try {
         job.threadId = await deps.start(w, job);
+        const told = job.told;
         job.state = 'running';
-        delete job.error;
+        delete job.error; delete job.told;
         await bumpCard(w);
+        if (told) await notice(w, job, { kind: 'started', reason: job.threadId });
       } catch (error) {
-        job.error = String(error);
-        save(w);
+        const reason = error instanceof Error ? error.message : String(error);
+        if (error instanceof WorkstreamJobWaiting) {
+          // In line, not a start in flight: it holds no editor, and the next pass tries again.
+          const first = job.told !== 'waiting';
+          Object.assign(job, { state: 'queued', error: reason, told: 'waiting' });
+          save(w);
+          if (first) await notice(w, job, { kind: 'waiting', reason });
+          continue;
+        }
+        if (error instanceof WorkstreamJobRefused) {
+          Object.assign(job, { state: 'failed', failedAt: deps.now(), error: reason, cleanup: 'done' });
+          delete job.told;
+          await bumpCard(w);
+          await notice(w, job, { kind: 'failed', reason });
+          continue;
+        }
+        // A start that may have made a worker stays in flight, so it keeps an adopted workstream's one editor.
+        const flipped = job.state !== 'starting';
+        const first = job.told !== 'unresolved';
+        Object.assign(job, { state: 'starting', error: String(error), told: 'unresolved' });
+        if (flipped) await bumpCard(w); else save(w);
+        if (first) await notice(w, job, { kind: 'unresolved', reason });
         if (!created) throw error;
       }
     }
+  }
+  async function notice(w: Workstream, job: WorkstreamJob, told: JobNotice) {
+    try { await deps.jobNotice?.(w, job, told); } catch (error) { deps.error?.(w, error); }
   }
   // A created workstream's Ship takes the folded work present when it starts; a retry of the same
   // request keeps that snapshot, and later folds wait for the next Ship.
@@ -668,6 +706,42 @@ export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
       if (w.leftTaskIds?.includes(taskId)) w.leftTaskIds = w.leftTaskIds.filter((left) => left !== taskId);
       if (!w.taskIds.includes(taskId)) { w.taskIds.push(taskId); w.updatedAt = deps.now(); save(w); }
     }),
+    /**
+     * A task attached to the wrong workstream leaves it. Its jobs that never folded are dropped and the
+     * workstream never cleans their worktrees; folded work and every other task's jobs stay as they are.
+     */
+    removeTask: (id: string, threadId: string, taskId: string) => serial(async () => {
+      const w = open(id, threadId);
+      if (!w.taskIds.includes(taskId)) throw new Error(`Task ${taskId} is not in this workstream.`);
+      const jobs = w.jobs.filter((j) => j.taskId === taskId);
+      if (jobs.some((j) => j.state === 'folded' || j.state === 'folding' || j.fold)) throw new Error(`Task ${taskId} has folded work in this workstream; it stays. Drop the task instead if that work must go.`);
+      const busy = jobs.find((j) => j.threadId !== null && (j.state === 'running' || j.state === 'starting'));
+      if (busy) throw new Error(`Task ${taskId} cannot leave yet: crew ${busy.id} still works on it in this workstream. Wait for it to finish or fail.`);
+      const unsaved = jobs.find(keptUnsaved);
+      if (unsaved) throw new Error(`Task ${taskId} cannot leave yet: crew ${unsaved.id} holds unsaved work (${unsaved.note ?? 'kept'}).`);
+      for (const job of jobs) {
+        if (job.state === 'dropped') continue;
+        Object.assign(job, { state: 'dropped', cleanup: 'done', note: `left the workstream: ${taskId} does not belong to it` });
+        delete job.told;
+      }
+      w.taskIds = w.taskIds.filter((t) => t !== taskId);
+      w.leftTaskIds = [...new Set([...(w.leftTaskIds ?? []), taskId])];
+      await bumpCard(w);
+      return w;
+    }),
+    /** The captain drops a job that has not started: no crew thread exists, so nothing else changes. */
+    cancel: (id: string, threadId: string, jobId: string) => serial(async () => {
+      const w = open(id, threadId);
+      const job = w.jobs.find((j) => j.id === jobId);
+      if (!job) throw new Error('No workstream crew with that id.');
+      if (job.threadId !== null || !['queued', 'waiting-memory', 'starting'].includes(job.state)) {
+        throw new Error(`Crew ${jobId} has started (${job.state}); it is no longer a waiting job.`);
+      }
+      Object.assign(job, { state: 'dropped', cleanup: 'done', note: 'cancelled by the captain before it started' });
+      delete job.told;
+      await bumpCard(w);
+      return job;
+    }),
     environment(id: string, threadId: string, path: string, environmentId: string) {
       const w = open(id, threadId);
       const repo = w.repos.find((r) => r.path === path);
@@ -691,12 +765,12 @@ export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
     },
     view: (id: string, threadId: string) => {
       const w = get(id, threadId);
-      return currentJobs(w.jobs).map((job) => compactTaskLine({
+      return currentJobs(w.jobs.filter((job) => !job.taskId || !w.leftTaskIds?.includes(job.taskId))).map((job) => compactTaskLine({
         id: job.taskId ?? job.id,
         title: job.title ?? briefOf(job).split('\n')[0] ?? job.id,
         model: job.model ?? 'default',
         state: jobToCardState(job.state, job.editing, job.cleanup),
-      })).join('\n');
+      }) + jobStartNote(job)).join('\n');
     },
     lookup: (id: string, threadId: string, taskId: string) => {
       const w = get(id, threadId);
