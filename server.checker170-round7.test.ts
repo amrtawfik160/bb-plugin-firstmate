@@ -11,8 +11,11 @@ import { createOwnerTasks } from "./lib/owner-tasks.ts";
 import { createDeliveries } from "./lib/pr-delivery.ts";
 import { createProductionApprovals } from "./lib/production-approval.ts";
 import plugin from "./server.ts";
+import { approvalConnectorSkip, loadApprovalConnectorSupport, testEvidenceDir } from "./test/approval-telegram-checkout.ts";
 
 process.env.FM_MERGEABLE_POLL_MS = "0";
+const evidence = testEvidenceDir();
+const connectorSkip = approvalConnectorSkip();
 
 const CREW = "9ceeb10f";
 const PR = "cyndra-ai/cyndra-saas#2391";
@@ -177,9 +180,7 @@ async function originMessage(host:Host,msg:string,input:{sender:string|null;init
 
 
 async function connectorDeck7(deleted=true){
- const {pathToFileURL}=await import('node:url');
- await import(pathToFileURL('/tmp/firstmate-170-telegram-check-8/test/register.mjs').href);
- const {baseConfig,cycle,makeHarness,openStore}=await import(pathToFileURL('/tmp/firstmate-170-telegram-check-8/test/support.ts').href);
+ const {baseConfig,cycle,makeHarness,openStore}=await loadApprovalConnectorSupport();
  let {host}=await deck();const {store,db}=openStore();const task=taskFor(host);
  let failReopen=false;let pauseId='';let release=()=>{};let reached=()=>{};let paused=Promise.resolve();
  const rpcTrace:Array<{id:string;resolution:string;at:number}>=[];
@@ -211,12 +212,12 @@ async function connectorDeck7(deleted=true){
   async generation(){await tool(host,'firstmate_task').execute({action:'close',id:task.id,state:'dropped',reason:'stop old work',ref:'tg:200:9701'},ctx);tasksOf(host).attach(task.id,'thr_cap',{crewId:'next-generation',sourceRefs:['tg:200:9702'],at:Date.now()});},
   pauseNext(){paused=new Promise<void>(resolve=>{reached=resolve;});pauseId=a.id;return paused;},
   release(){release();},
-  snapshot(label:string){writeFileSync('/root/.local/share/hanoon-telegram-plan/170-check-8/170-trace-8-'+label+'.json',JSON.stringify({rpcTrace,cards:createOwnerGate(host.bb.storage.database()).cardsForPr(PR),pending:store.listControls('ask-edit:'),edits:tg.telegram.edits},null,2));},
+  snapshot(label:string){writeFileSync(evidence+'170-trace-8-'+label+'.json',JSON.stringify({rpcTrace,cards:createOwnerGate(host.bb.storage.database()).cardsForPr(PR),pending:store.listControls('ask-edit:'),edits:tg.telegram.edits},null,2));},
   async dispose(){release();await host.harness.lifecycle.dispose();db.close();},
  };
 }
 
-for(const noFirst of [false,true])test('ROUND7 cached Approve after captain reopen cannot replace No ('+(noFirst?'No before reopen':'No after reopen')+')',async()=>{
+for(const noFirst of [false,true])test('ROUND7 cached Approve after captain reopen cannot replace No ('+(noFirst?'No before reopen':'No after reopen')+')',{skip:connectorSkip},async()=>{
  const d=await connectorDeck7();try{
   if(noFirst){await d.tap(d.b.messageId,'No');assert.equal((await d.check()).exitCode,1);}
   d.failEdit(true);await d.reopen();assert.equal(d.asks().get(d.a.id)?.state,'open');
@@ -226,7 +227,7 @@ for(const noFirst of [false,true])test('ROUND7 cached Approve after captain reop
  }finally{await d.dispose();}
 });
 
-test('ROUND7 in-flight edit retry cannot become a new choice when captain reopens during delivery',async()=>{
+test('ROUND7 in-flight edit retry cannot become a new choice when captain reopens during delivery',{skip:connectorSkip},async()=>{
  const d=await connectorDeck7();let inflight:Promise<void>|undefined;try{
   await d.tap(d.b.messageId,'No');assert.equal((await d.check()).exitCode,1);
   const paused=d.pauseNext();inflight=d.cycle();
@@ -237,7 +238,7 @@ test('ROUND7 in-flight edit retry cannot become a new choice when captain reopen
  }finally{d.release();if(inflight)await inflight;await d.dispose();}
 });
 
-for(const mode of ['cancel','restart','generation'])test('ROUND7 '+mode+' alone preserves latest No against cached same-choice replay',async()=>{
+for(const mode of ['cancel','restart','generation'])test('ROUND7 '+mode+' alone preserves latest No against cached same-choice replay',{skip:connectorSkip},async()=>{
  const d=await connectorDeck7();try{
   await d.tap(d.b.messageId,'No');assert.equal((await d.check()).exitCode,1);
   if(mode==='cancel')await d.cancel();if(mode==='restart')await d.restart();if(mode==='generation')await d.generation();
@@ -245,7 +246,7 @@ for(const mode of ['cancel','restart','generation'])test('ROUND7 '+mode+' alone 
  }finally{await d.dispose();}
 });
 
-for(const mode of ['cancel-reopen','restart-after-reopen','generation-after-reopen'])test('ROUND7 '+mode+' does not turn old cached Approve into a new owner answer',async()=>{
+for(const mode of ['cancel-reopen','restart-after-reopen','generation-after-reopen'])test('ROUND7 '+mode+' does not turn old cached Approve into a new owner answer',{skip:connectorSkip},async()=>{
  const d=await connectorDeck7();try{
   await d.tap(d.b.messageId,'No');assert.equal((await d.check()).exitCode,1);
   d.failEdit(true);if(mode==='cancel-reopen')await d.cancel();await d.reopen();
@@ -254,7 +255,7 @@ for(const mode of ['cancel-reopen','restart-after-reopen','generation-after-reop
  }finally{await d.dispose();}
 });
 
-test('ROUND7 genuine owner re-tap after successful reopen wins over earlier No',async()=>{
+test('ROUND7 genuine owner re-tap after successful reopen wins over earlier No',{skip:connectorSkip},async()=>{
  const d=await connectorDeck7(false);try{
   await d.tap(d.b.messageId,'No');assert.equal((await d.check()).exitCode,1);
   await d.reopen();assert.equal(d.asks().get(d.a.id)?.state,'open');

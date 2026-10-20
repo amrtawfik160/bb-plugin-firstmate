@@ -11,8 +11,11 @@ import { createOwnerTasks } from "./lib/owner-tasks.ts";
 import { createDeliveries } from "./lib/pr-delivery.ts";
 import { createProductionApprovals } from "./lib/production-approval.ts";
 import plugin from "./server.ts";
+import { approvalConnectorSkip, loadApprovalConnectorSupport, testEvidenceDir } from "./test/approval-telegram-checkout.ts";
 
 process.env.FM_MERGEABLE_POLL_MS = "0";
+const evidence = testEvidenceDir();
+const connectorSkip = approvalConnectorSkip();
 
 const CREW = "9ceeb10f";
 const PR = "cyndra-ai/cyndra-saas#2391";
@@ -185,7 +188,7 @@ for (const state of ['open', 'cancelled', 'defaulted']) for (const fields of ['n
   host.harness.sdk.stub('plugins.callRpc',async(call:RpcCall)=>call.method==='ownerAnswer'?{answer:'Approve',...stamp}:{ok:true});
   const result=await host.harness.behavior.callRpc('resolveAsk',{threadId:'thr_cap',id:ask.id,resolution:'Approve',...stamp});
   const merge=await cliCheck(host,task.id); const deploy=await cliCheck(host,task.id,'deploy');
-  writeFileSync('/root/.local/share/hanoon-telegram-plan/170-check-8/170-incomplete-'+state+'-'+fields+'-8.json',JSON.stringify({result,merge,deploy,cards:createOwnerGate(host.bb.storage.database()).cardsForPr(PR)},null,2));
+  writeFileSync(evidence+'170-incomplete-'+state+'-'+fields+'-8.json',JSON.stringify({result,merge,deploy,cards:createOwnerGate(host.bb.storage.database()).cardsForPr(PR)},null,2));
   assert.equal(merge.exitCode,1,'missing tap identity/time must not grant merge');
   assert.equal(deploy.exitCode,1,'missing tap identity/time must not grant production');
  } finally {await host.harness.lifecycle.dispose();}
@@ -232,9 +235,7 @@ test('R8 replaying an identical tap changes no skip state',async()=>{
  }finally{await host.harness.lifecycle.dispose();}
 });
 async function connectorDeck7(deleted=true){
- const {pathToFileURL}=await import('node:url');
- await import(pathToFileURL('/tmp/firstmate-170-telegram-check-8/test/register.mjs').href);
- const {baseConfig,cycle,makeHarness,openStore}=await import(pathToFileURL('/tmp/firstmate-170-telegram-check-8/test/support.ts').href);
+ const {baseConfig,cycle,makeHarness,openStore}=await loadApprovalConnectorSupport();
  let {host}=await deck();const {store,db}=openStore();const task=taskFor(host);
  let failReopen=false;let pauseId='';let release=()=>{};let reached=()=>{};let paused=Promise.resolve();
  const rpcTrace:Array<{id:string;resolution:string;at:number;answeredAt?:number;tapId?:string}>=[];
@@ -266,13 +267,13 @@ async function connectorDeck7(deleted=true){
   async generation(){await tool(host,'firstmate_task').execute({action:'close',id:task.id,state:'dropped',reason:'stop old work',ref:'tg:200:9701'},ctx);tasksOf(host).attach(task.id,'thr_cap',{crewId:'next-generation',sourceRefs:['tg:200:9702'],at:Date.now()});},
   pauseNext(){paused=new Promise<void>(resolve=>{reached=resolve;});pauseId=a.id;return paused;},
   release(){release();},
-  snapshot(label:string){writeFileSync('/root/.local/share/hanoon-telegram-plan/170-check-8/170-trace-8-'+label+'.json',JSON.stringify({rpcTrace,cards:createOwnerGate(host.bb.storage.database()).cardsForPr(PR),pending:store.listControls('ask-edit:'),edits:tg.telegram.edits},null,2));},
+  snapshot(label:string){writeFileSync(evidence+'170-trace-8-'+label+'.json',JSON.stringify({rpcTrace,cards:createOwnerGate(host.bb.storage.database()).cardsForPr(PR),pending:store.listControls('ask-edit:'),edits:tg.telegram.edits},null,2));},
   async dispose(){release();await host.harness.lifecycle.dispose();db.close();},
  };
 }
 
 
-test('R8 real connector retry after reopen and no later owner tap preserves original permission time',async()=>{
+test('R8 real connector retry after reopen and no later owner tap preserves original permission time',{skip:connectorSkip},async()=>{
  const d=await connectorDeck7();try{
   const gate=()=>createOwnerGate(d.host().bb.storage.database()).cardsForPr(PR).find(c=>c.id===d.a.id)!;
   const before=gate();d.failEdit(true);await d.reopen();await d.cycle();
@@ -282,7 +283,7 @@ test('R8 real connector retry after reopen and no later owner tap preserves orig
   d.snapshot('no-later-owner-tap');
  }finally{await d.dispose();}
 });
-test('R8 real connector cached replay preserves owner skip after captain reopen',async()=>{
+test('R8 real connector cached replay preserves owner skip after captain reopen',{skip:connectorSkip},async()=>{
  const d=await connectorDeck7();try{
   d.failEdit(true);await d.reopen();
   const until=Date.now()+60000;
