@@ -7956,7 +7956,7 @@ test("IT native away spend refusal stays queued and never spawns a BB worker", {
   assert.equal(spawnSync("git", ["init", repo]).status, 0);
   assert.equal(spawnSync(join(home, "bin/fm-afk-contract.sh"), ["enter", "--spend", "1", "--words", "finish queued work"], { env }).status, 0);
   writeFileSync(join(home, "state/existing.meta"), "kind=ship\n");
-  const host = itHost(home, { transport: "real", queueOwner: "real" });
+  const host = itHost(home, { transport: "real", queueOwner: "real", signInCheck: false });
   await plugin(host.bb); stubProviderCatalog(host);
   try {
     stubRealExecHost(host);
