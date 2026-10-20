@@ -396,6 +396,47 @@ test("crews are taught not to leave timers that ping the captain with empty comp
   assert.match(LEFTOVER_TIMER_CONTRACT, /stop every timer, monitor, and background shell you started/);
 });
 
+// 20 Oct: workstream task crew T377 opened cyndra-ai/cyndra-saas#2581 because its brief ended "Then push + open a PR".
+test("a workstream crew is told to commit, not to open a PR, and to report its head commit", () => {
+  for (const mode of ["direct-PR", "no-mistakes"] as const) {
+    const task = crewPrompt({ task: "fix login", parentThreadId: "thr_cap", shape: "ship", mode, isolated: true, workstream: "task" });
+    assert.ok(task.includes("Delivery (workstream task): own branch, small diff, run relevant checks."), task);
+    assert.ok(task.includes("Then commit and push to this task branch. Do NOT open a PR; the workstream PR ships this work. Report DONE with the head commit."));
+    assert.ok(task.includes("After DONE: outcome, head commit, changed files, validation run, blockers/next step."));
+    assert.doesNotMatch(task, /open a PR\. Report DONE with the PR URL|Report DONE with the PR URL/);
+    const merge = crewPrompt({ task: "resolve the fold conflict", parentThreadId: "thr_cap", shape: "ship", mode, isolated: false, workstream: "merge" });
+    assert.ok(merge.includes("Then commit here. Do NOT push and do NOT open a PR; only the owner Ship action merges the workstream branch. Report DONE with the head commit."), merge);
+    assert.doesNotMatch(merge, /Report DONE with the PR URL/);
+  }
+  // PR #189 checker D1: the pipeline's P7 still said "PR: read …/pr/SKILL.md", so a crew that follows its steps opens a PR.
+  for (const workstream of ["task", "merge"] as const) {
+    for (const playbook of ["feature", "bug-fix", "none"] as const) {
+      const brief = crewPrompt({ task: "fix login", parentThreadId: "thr_cap", shape: "ship", mode: "direct-PR", isolated: true, providerId: "claude-code", playbook, workstream, dataDir: "/ws/reports/c1" });
+      const at = `${workstream} ${playbook}`;
+      assert.doesNotMatch(brief, /P7\. PR: read/, at);
+      assert.doesNotMatch(brief, /this crew's PR/, at);
+      assert.doesNotMatch(brief, /Before you open a PR/, at);
+      if (playbook === "none") {
+        assert.ok(brief.includes("Before you commit, run /no-comments (`/root/.claude/skills/no-comments/SKILL.md`) over your diff."), at);
+        continue;
+      }
+      assert.equal(brief.match(/^P\d+\. /gm)?.length, 7, `${at}: the step count stays the one the report check counts`);
+      assert.ok(brief.includes('P7. PR: none for this crew; the workstream PR ships its work. Report "skip: P7 PR: workstream PR".'), at);
+      assert.ok(brief.includes('Firstmate checks it for "✓ P4 Prove on the real surface at <head sha>: driven <what>; seen <what>" at your head commit. After a new commit, add a new P4 line.'), at);
+      assert.ok(brief.includes("P4. Prove on the real surface: use the project's verify skill if it has one (e.g. `.agents/skills/verify-<app>/`), else read `/root/.claude/skills/verify-this/SKILL.md`. Evidence: the head commit you proved, what you drove and what you saw."), at);
+    }
+  }
+  for (const playbook of ["feature", "bug-fix"] as const) {
+    const outside = crewPrompt({ task: "fix login", parentThreadId: "thr_cap", shape: "ship", mode: "direct-PR", isolated: true, providerId: "claude-code", playbook });
+    assert.ok(outside.includes("P7. PR: read `/root/.claude/skills/pr/SKILL.md`. Evidence: the PR link."), playbook);
+    assert.ok(outside.includes("`bb firstmate deliveries verify` refuses this crew's PR until the report has \"✓ P4 Prove on the real surface for <owner/repo#n> at <head sha>: driven <what>; seen <what>\" for that PR at its current head. After a new push, add a new P4 line."), playbook);
+    assert.ok(outside.includes("Evidence: the PR and head you proved, what you drove and what you saw."), playbook);
+  }
+  assert.ok(crewPrompt({ task: "fix login", parentThreadId: "thr_cap", shape: "ship", mode: "direct-PR", isolated: true, providerId: "claude-code", playbook: "none" }).includes("Before you open a PR, run /no-comments"));
+  assert.match(crewPrompt({ task: "fix login", parentThreadId: "thr_cap", shape: "ship", mode: "direct-PR", isolated: true }), /Then push \+ open a PR\. Report DONE with the PR URL\./, "a crew outside a workstream still opens its PR");
+  assert.match(crewPrompt({ task: "check it", parentThreadId: "thr_cap", shape: "scout", mode: "direct-PR", isolated: false, workstream: "task" }), /^Report \(standalone/m, "a scout keeps its report tail");
+});
+
 test("fan-out cap is configurable past the old hard 10 and stays bounded", () => {
   assert.equal(resolveFanoutCap(undefined), 10);
   assert.equal(resolveFanoutCap("nope"), 10);

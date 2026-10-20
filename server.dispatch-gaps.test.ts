@@ -26,7 +26,7 @@ const AGY = 'Fetching available models...\ngemini-3.8-flash-high\tGemini 3.8 Fla
 // BB's catalog for acp-antigravity came from the host bridge's own table, which still listed gemini-4-argon.
 const CATALOG = { ...PROVIDER_CATALOG, 'acp-antigravity': ['gemini-4-argon', 'gemini-3.8-flash', 'claude-sonnet-4-6'] };
 
-async function gapsHost(opts: { async?: boolean; cap?: number; catalog?: Record<string, string[]> } = {}) {
+async function gapsHost(opts: { async?: boolean; cap?: number; catalog?: Record<string, string[]>; agyFails?: boolean } = {}) {
   const host = createFakePluginHost({ pluginId: 'firstmate', agentSkillIds: skills, settings: opts.async ? { fmReliability: JSON.stringify({ asyncDispatch: 'on' }) } : {} });
   const seeded = createWorkstreams(host.bb.storage.database(), {
     now: () => 0, provision: async () => [{ repository: 'cyndra-ai/cyndra-saas', projectId: 'cyndra', hostId: 'h1', path: '/repo/ws', sourcePath: '/repo/main', branch: 'workstream/ws-ui', environmentId: 'env_ws' }],
@@ -65,10 +65,13 @@ async function gapsHost(opts: { async?: boolean; cap?: number; catalog?: Record<
   host.harness.sdk.stub('terminals.close', async () => ({}));
   host.harness.sdk.stub('terminals.output', async ({ terminalId }: { terminalId: string }) => {
     const cmd = byId.get(terminalId) ?? '';
-    const payload = cmd.includes('agy models') ? AGY : '';
+    // agyFails: the CLI cannot list its models (`agy models` exits 1 with nothing on stdout).
+    const failed = opts.agyFails === true && cmd.includes('agy models');
+    const payload = cmd.includes('agy models') && !failed ? AGY : '';
     const captured = cmd.includes('FM_HOST_CAPTURE_V1');
-    const out = captured ? JSON.stringify({ protocol: 'FM_HOST_CAPTURE_V1', exitCode: 0, stdout: payload, stderr: '' }) : payload;
-    return { nextSeq: 1, chunks: [{ dataBase64: Buffer.from(`${out}\n__FM_HOST_RC:0\n`).toString('base64') }] };
+    const rc = failed ? 1 : 0;
+    const out = captured ? JSON.stringify({ protocol: 'FM_HOST_CAPTURE_V1', exitCode: rc, stdout: payload, stderr: failed ? 'agy: not signed in' : '' }) : payload;
+    return { nextSeq: 1, chunks: [{ dataBase64: Buffer.from(`${out}\n__FM_HOST_RC:${rc}\n`).toString('base64') }] };
   });
   const tasks = createOwnerTasks(host.bb.storage.database());
   const dispatch = async (input: Record<string, unknown>) => text(await tool(host, 'firstmate_dispatch').execute({ projectId: 'cyndra', ...input }, ctx));
@@ -92,6 +95,40 @@ test('a model BB lists but the provider CLI refuses is refused at dispatch, befo
     const fine = await f.dispatch({ task: 'Fix the dashboard that loads forever', taskId: 'dashboard-flash', workstreamId: f.w.id, origin: { kind: 'captain', reason: 'owner asked' }, providerId: 'acp-antigravity', model: 'gemini-3.8-flash', ownerRequestedProvider: true });
     assert.match(fine, /Reserved crew dashboard-flash/);
     assert.equal(f.commands.filter((c) => c.includes('agy models')).length, 1, 'the CLI list is read once and reused');
+  } finally { await f.host.harness.lifecycle.dispose(); }
+});
+
+// A dispatch that names acp-antigravity and no model runs the provider's catalog default (gemini-3.8-flash on 20 Oct).
+// The check follows that default: here the catalog marks gemini-4-argon, which agy refuses, then gemini-3.8-flash.
+test('a named provider with no model is checked by its default model: one its CLI refuses is refused before anything is reserved', async () => {
+  const f = await gapsHost();
+  const antigravity = (fallback: string) => ['gemini-3.8-flash', 'gemini-4-argon', 'claude-sonnet-4-6'].map((id) => ({ id, model: id, ...(id === fallback ? { isDefault: true } : {}) }));
+  let fallback = 'gemini-4-argon';
+  f.host.harness.sdk.stub('providers.models', async ({ providerId }: { providerId?: string } = {}) => ({ modelLoadError: null, models: providerId === 'acp-antigravity' ? antigravity(fallback) : (CATALOG[providerId ?? 'claude-code'] ?? []).map((id) => ({ id, model: id })) }));
+  const refusal = /Dispatch refused: Provider "acp-antigravity" was named with no model, and its default model "gemini-4-argon" is not accepted by its CLI on host h1 \(`agy models`\)\. Models it accepts: gemini-3\.8-flash, claude-sonnet-4-6\. Name one of them\. Nothing was spawned\./;
+  try {
+    const ws = await f.dispatch({ task: 'Fix the dashboard that loads forever', taskId: 'dashboard-default', workstreamId: f.w.id, origin: { kind: 'captain', reason: 'owner asked' }, providerId: 'acp-antigravity', ownerRequestedProvider: true });
+    assert.match(ws, refusal);
+    assert.deepEqual(f.seeded.get(f.w.id, 'cap').jobs, [], 'no workstream job waits for a slot');
+    const plain = await f.dispatch({ task: 'Fix the dashboard that loads forever', taskId: 'dashboard-default-2', origin: { kind: 'captain', reason: 'owner asked' }, providerId: 'acp-antigravity', ownerRequestedProvider: true });
+    assert.match(plain, refusal);
+    assert.equal(createLaunches(f.host.bb.storage.database()).forTask('cyndra', 'cap', 'dashboard-default-2'), undefined, 'no launch was reserved');
+    assert.equal(f.spawned.length, 0);
+    assert.deepEqual(f.tasks.list('cap'), [], 'no owner task was opened');
+    fallback = 'gemini-3.8-flash';
+    assert.match(await f.dispatch({ task: 'Fix the dashboard that loads forever', taskId: 'dashboard-default-3', origin: { kind: 'captain', reason: 'owner asked' }, providerId: 'acp-antigravity', ownerRequestedProvider: true }), /Dispatched ship crew dashboard-default-3/);
+  } finally { await f.host.harness.lifecycle.dispose(); }
+});
+
+// #186 checker, non-blocking 3: a hung `agy models` cost up to 20 s per read, and each dispatch read it twice.
+test('a provider CLI list that cannot be read lets the dispatch through, and is not read again for a short time', async () => {
+  const f = await gapsHost({ agyFails: true });
+  try {
+    const one = await f.dispatch({ task: 'Fix the dashboard', taskId: 'dash-unread-1', origin: { kind: 'captain', reason: 'owner asked' }, providerId: 'acp-antigravity', model: 'gemini-4-argon', ownerRequestedProvider: true });
+    assert.match(one, /Dispatched ship crew dash-unread-1/, 'BB catalog stands when the CLI list cannot be read');
+    const two = await f.dispatch({ task: 'Fix the dashboard', taskId: 'dash-unread-2', origin: { kind: 'captain', reason: 'owner asked' }, providerId: 'acp-antigravity', model: 'gemini-4-argon', ownerRequestedProvider: true });
+    assert.match(two, /Dispatched ship crew dash-unread-2/);
+    assert.equal(f.commands.filter((c) => c.includes('agy models')).length, 1, 'the failed read is held, not repeated by each check of each dispatch');
   } finally { await f.host.harness.lifecycle.dispose(); }
 });
 

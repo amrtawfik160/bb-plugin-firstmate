@@ -595,6 +595,21 @@ export function retryReason(reason: string | undefined, crewId: string): string 
   return text.length <= 200 ? text : `${text.slice(0, 199)}…`;
 }
 
+// 20 Oct: workstream task crew T377 opened cyndra-ai/cyndra-saas#2581 from a brief that ended "Then push + open
+// a PR". A workstream crew's commits ship in the workstream PR, so its brief never asks for a PR.
+const WORKSTREAM_DELIVERY = {
+  task: [
+    "Delivery (workstream task): own branch, small diff, run relevant checks.",
+    "Then commit and push to this task branch. Do NOT open a PR; the workstream PR ships this work. Report DONE with the head commit.",
+    "After DONE: outcome, head commit, changed files, validation run, blockers/next step.",
+  ],
+  merge: [
+    "Delivery (workstream merge): resolve the merge in this worktree, run relevant checks.",
+    "Then commit here. Do NOT push and do NOT open a PR; only the owner Ship action merges the workstream branch. Report DONE with the head commit.",
+    "After DONE: outcome, head commit, changed files, validation run, blockers/next step.",
+  ],
+} as const;
+
 export function crewPrompt(input: {
   task: string;
   parentThreadId: string | undefined;
@@ -605,6 +620,8 @@ export function crewPrompt(input: {
   providerId?: string | null;
   playbook?: PlaybookChoice;
   dataDir?: string;
+  /** A crew editing a workstream: the workstream PR ships its work, whatever its delivery mode. */
+  workstream?: "task" | "merge";
 }): string {
   const { task, parentThreadId, shape, mode, isolated } = input;
   const head = [
@@ -645,6 +662,8 @@ export function crewPrompt(input: {
           "decision inventory (options + your recommendation), open questions.",
           "A recommendation is not authorization: never implement what you recommend.",
         ]
+      : input.workstream !== undefined
+        ? WORKSTREAM_DELIVERY[input.workstream]
       : mode === "local-only"
         ? [
             "Delivery (local-only): own branch, small diff, run relevant checks.",

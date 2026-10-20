@@ -68,6 +68,75 @@ test('workstreams RPC lists every project, and creation is not limited to Cyndra
     assert.ok(host.harness.inspection.registrations.agentTools.some((t) => t.name === 'firstmate_workstream'));
   } finally { await host.harness.lifecycle.dispose(); }
 });
+// 20 Oct: workstream task crew T377 opened cyndra-ai/cyndra-saas#2581; the workstream PR was to ship its work.
+test('a workstream task crew is told not to open a PR, a lookup keeps /pr, and a DONE without a PR is the task crew delivery', async () => {
+  const { createWorkstreams } = await import('./lib/workstreams.ts');
+  const host = createFakePluginHost({ pluginId: 'firstmate', agentSkillIds: skills });
+  const seeded = createWorkstreams(host.bb.storage.database(), {
+    now: () => 0, provision: async () => [{ repository: 'cyndra-ai/cyndra-saas', projectId: 'cyndra', hostId: 'h1', path: '/repo/ws', sourcePath: '/repo/main', branch: 'workstream/ws-test', environmentId: 'env_ws' }],
+    start: async () => 'unused', status: async () => 'unknown', startDev: async () => '', stopDev: async () => {}, unsaved: async () => [], remove: async () => {}, ship: async () => {}, taskState: () => 'working',
+  });
+  const w = await seeded.create({ threadId: 'cap', projectId: 'cyndra', name: 'Design', requestId: 'create' });
+  await plugin(host.bb); stubProviderCatalog(host);
+  await host.harness.behavior.setSettings({ transport: 'real', signInCheck: false, fmHome: '', maxActiveCrews: 0 });
+  await host.bb.storage.kv.set('captain-project:cap', 'cyndra');
+  const spawned: Array<Record<string, unknown>> = [];
+  host.harness.sdk.stub('threads.getPluginMetadata', async ({ threadId }: { threadId: string }) => (threadId === 'cap' ? { captain: 'true' } : {}));
+  host.harness.sdk.stub('threads.get', async ({ threadId }: { threadId: string }) => ({ ...makeThreadResponse({ id: threadId, projectId: 'cyndra', status: threadId === 'worker1' ? 'idle' : 'active' }), environmentId: threadId === 'cap' ? 'env_main' : 'env_ws' }));
+  host.harness.sdk.stub('threads.list', async () => []);
+  host.harness.sdk.stub('threads.events.list', async () => []);
+  host.harness.sdk.stub('projects.get', async () => ({ id: 'cyndra', name: 'Cyndra SaaS', kind: 'repo', sources: [{ hostId: 'h1', path: '/repo/main', isDefault: true }] }));
+  host.harness.sdk.stub('projects.list', async () => [{ id: 'cyndra', name: 'Cyndra SaaS' }]);
+  host.harness.sdk.stub('environments.list', async () => [{ id: 'env_main', hostId: 'h1', path: '/repo/main', status: 'ready', isWorktree: false }]);
+  host.harness.sdk.stub('environments.get', async ({ environmentId }: { environmentId: string }) => ({ id: environmentId, hostId: 'h1', path: environmentId === 'env_ws' ? '/repo/ws' : '/repo/main', status: 'ready', isWorktree: false }));
+  host.harness.sdk.stub('threads.spawn', async (args: Record<string, unknown>) => { spawned.push(args); return { id: `worker${spawned.length}` }; });
+  host.harness.sdk.stub('threads.defaultExecutionOptions', async () => ({ model: 'gpt-6.1-sol', reasoningLevel: 'high' }));
+  host.harness.sdk.stub('threads.send', async () => ({}));
+  host.harness.sdk.stub('threadSections.list', async () => []);
+  host.harness.sdk.stub('threadSections.create', async () => ({ id: 'sec' }));
+  host.harness.sdk.stub('plugins.callRpc', async () => ({ ok: true, queued: 1, duplicate: false }));
+  const dispatch = host.harness.inspection.registrations.agentTools.find((t) => t.name === 'firstmate_dispatch')!;
+  const text = (result: unknown) => typeof result === 'string' ? result : JSON.stringify(result);
+  try {
+    assert.match(text(await dispatch.execute({ task: 'First edit', taskId: 'editor-one', workstreamId: w.id, origin: { kind: 'captain', reason: 'approved workstream' }, providerId: 'codex', model: 'gpt-6.1-sol' }, cap)), /Dispatched/);
+    assert.match(text(await dispatch.execute({ task: 'Read the diff', taskId: 'read-only', shape: 'scout', role: 'lookup', workstreamId: w.id, origin: { kind: 'captain', reason: 'approved workstream' }, providerId: 'codex', model: 'gpt-6.1-sol' }, cap)), /Dispatched/);
+    assert.equal(spawned.length, 2);
+    const editor = String(spawned[0]!.prompt);
+    assert.ok(editor.includes('Do not open a PR; the workstream PR ships this work.'), editor);
+    assert.ok(editor.includes('Then commit and push to this task branch. Do NOT open a PR; the workstream PR ships this work. Report DONE with the head commit.'));
+    assert.doesNotMatch(editor, /Load \/pr before creating or updating a PR body/);
+    assert.doesNotMatch(editor, /open a PR\. Report DONE with the PR URL/);
+    assert.ok(String(spawned[1]!.prompt).includes('Load /pr before creating or updating a PR body.'), 'a read-only crew of the workstream keeps the /pr sentence');
+    const tasks = createOwnerTasks(host.bb.storage.database());
+    const held = tasks.list('cap').find((t) => t.crewIds.includes('editor-one'))!;
+    assert.equal(held.state, 'working');
+    // The report check reads the playbook file; the crew's report is its final message.
+    host.harness.sdk.stub('files.read', async ({ path }: { path: string }) => {
+      if (path.endsWith('/poteto-mode/playbooks/feature.md')) return { content: '1. Sharpen\n2. Build\n3. Prove\n', contentEncoding: 'utf8', sizeBytes: 30 };
+      throw new Error('no such file');
+    });
+    const emitted = await host.harness.behavior.emitThreadEvent('thread.idle', {
+      thread: makeThreadResponse({ id: 'worker1', status: 'idle', projectId: 'cyndra' }),
+      lastAssistantText: [
+        'DONE: committed 4f2a9c1 on the task branch', '',
+        'Head commit 4f2a9c1. No PR: the workstream PR ships this work.',
+        'Skills read: /root/.codex/skills/skill-routing/SKILL.md',
+        '✓ P1 Sharpen: the editor saves drafts', '✓ P2 Architect: one draft row per user', '✓ P3 TDD build: saves a draft (failed first)',
+        '✓ P4 Prove on the real surface at 4f2a9c1: driven a draft save on the dev link; seen the draft after reload',
+        '✓ P5 Code review: none', '✓ P6 No comments: none', 'skip: P7 PR: workstream PR',
+      ].join('\n'),
+    });
+    assert.deepEqual(emitted.errors, []);
+    const after = tasks.get(held.id)!;
+    assert.equal(after.state, 'check', 'the DONE report finished the crew, as a delivery');
+    assert.match(after.outcome ?? '', /^DONE: committed 4f2a9c1 on the task branch\. Next: check the work/, 'its DONE is read as delivered, not as a crew that retired without reporting done');
+    assert.deepEqual(await host.bb.storage.kv.get('report-check:worker1'), { gaps: [] }, 'skip: P7 counts, so no "(6 of 7)" request');
+    assert.deepEqual(await host.bb.storage.kv.get('verify-check:worker1'), { gap: null }, 'its P4 line at the head commit proves the step without a PR');
+    const sent = host.harness.sdk.callsTo('threads.send').map((call) => JSON.stringify(call[0]));
+    assert.ok(!sent.some((m) => /REPORT INCOMPLETE|NOT VERIFIED/.test(m)), sent.join('\n'));
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
 test('fake BB: two created editing tasks start together on their own worktrees while a scout reuses the workstream', async () => {
   const { createWorkstreams } = await import('./lib/workstreams.ts');
   const host = createFakePluginHost({ pluginId:'firstmate', agentSkillIds:manifestSkillIds(new URL('.',import.meta.url).pathname) });

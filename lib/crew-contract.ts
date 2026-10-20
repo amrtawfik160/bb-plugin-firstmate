@@ -108,26 +108,32 @@ export function crewPipeline(input: { shape: Shape; title?: string; task: string
   return input.shape === "ship" ? codePipeline(crewPlaybook(input)) : null;
 }
 
-function pipelineSection(playbook: PlaybookChoice, steps: readonly PipelineStep[], skill: (name: string) => string, dataDir: string | undefined): string[] {
+// PR #189 checker D1: a workstream crew's P7 still said "PR: read …/pr/SKILL.md", so a crew that followed its
+// pipeline opened its own PR. A workstream crew keeps the step, so the report check counts the same steps, and skips it.
+function pipelineSection(playbook: PlaybookChoice, steps: readonly PipelineStep[], skill: (name: string) => string, dataDir: string | undefined, workstream: boolean): string[] {
   const proof = steps.findIndex((step) => step.title === PROOF_STEP) + 1;
   const tdd = steps.findIndex((step) => step.skills.includes("tdd")) + 1;
   const report = dataDir !== undefined && dataDir !== "" ? `\`${dataDir}/report.md\`` : "your report file";
   return [
     `### Pipeline (${playbook.replace("-", " ")}). Do every step, in this order:`,
     ...steps.map((step, i) => {
+      if (workstream && step.title === "PR") return `P${i + 1}. PR: none for this crew; the workstream PR ships its work. Report "skip: P${i + 1} PR: workstream PR".`;
       const how = step.title === PROOF_STEP
         ? `: use the project's verify skill if it has one (e.g. \`.agents/skills/verify-<app>/\`), else read \`${skill(step.skills[0]!)}\``
         : step.skills.length > 0 ? `: read ${step.skills.map((name) => `\`${skill(name)}\``).join(" and ")}` : "";
-      return `P${i + 1}. ${step.title}${how}. Evidence: ${step.evidence}.`;
+      const evidence = workstream && step.title === PROOF_STEP ? "the head commit you proved, what you drove and what you saw" : step.evidence;
+      return `P${i + 1}. ${step.title}${how}. Evidence: ${evidence}.`;
     }),
     "Your final report has one line per pipeline step: \"✓ P<n> <step>: <evidence>\" or \"skip: P<n> <step>: <reason>\".",
-    `Write that report to ${report} before you record verification. \`bb firstmate deliveries verify\` refuses this crew's PR until the report has "✓ P${proof} ${PROOF_STEP} for <owner/repo#n> at <head sha>: driven <what>; seen <what>" for that PR at its current head. After a new push, add a new P${proof} line.`,
+    workstream
+      ? `Write that report to ${report} before you report DONE. Firstmate checks it for "✓ P${proof} ${PROOF_STEP} at <head sha>: driven <what>; seen <what>" at your head commit. After a new commit, add a new P${proof} line.`
+      : `Write that report to ${report} before you record verification. \`bb firstmate deliveries verify\` refuses this crew's PR until the report has "✓ P${proof} ${PROOF_STEP} for <owner/repo#n> at <head sha>: driven <what>; seen <what>" for that PR at its current head. After a new push, add a new P${proof} line.`,
     // Two skills are named tdd; Matt Pocock's owns the folder in every skill root.
     ...(tdd === 0 ? [] : [`P${tdd}'s \`tdd\` is Matt Pocock's, the only one installed. A playbook's advice to skip an expensive test does not replace P${tdd}: write the test, or report "skip: P${tdd} <step>: <reason>".`]),
   ];
 }
 
-export function crewSkillBlock(input: { shape: Shape; title?: string; task: string; providerId?: string | null; playbook?: PlaybookChoice; dataDir?: string; role?: CrewRole; projectLines?: readonly string[] }): string {
+export function crewSkillBlock(input: { shape: Shape; title?: string; task: string; providerId?: string | null; playbook?: PlaybookChoice; dataDir?: string; role?: CrewRole; projectLines?: readonly string[]; workstream?: "task" | "merge" }): string {
   const playbook = crewPlaybook(input);
   const pipeline = crewPipeline(input);
   const checker = input.role === "checker";
@@ -177,10 +183,10 @@ export function crewSkillBlock(input: { shape: Shape; title?: string; task: stri
   if (checker) lines.push(...checkerSteps(skill));
   else if (playbook === "none") lines.push(...OPERATOR_MERGE_STEPS);
   else lines.push(...PLAYBOOK_RULES);
-  if (pipeline !== null) lines.push(...pipelineSection(playbook, pipeline, skill, input.dataDir));
+  if (pipeline !== null) lines.push(...pipelineSection(playbook, pipeline, skill, input.dataDir, input.workstream !== undefined));
   if (input.shape === "ship" && input.projectLines !== undefined && input.projectLines.length > 0) lines.push(...input.projectLines);
   lines.push(SCREENSHOT_RULE);
-  if (input.shape !== "scout" && !checker && pipeline === null) lines.push(`Before you open a PR, run /no-comments (\`${skill("no-comments")}\`) over your diff.`);
+  if (input.shape !== "scout" && !checker && pipeline === null) lines.push(`Before you ${input.workstream !== undefined ? "commit" : "open a PR"}, run /no-comments (\`${skill("no-comments")}\`) over your diff.`);
   if (playbook === "bug-fix" && pipeline === null) lines.push(BUG_FIX_PROOF);
   lines.push(...OBSTACLES);
   return lines.join("\n");
@@ -241,14 +247,18 @@ export function verifyStepGap(report: string, playbook: string): string | null {
 const PROOF_LINE = new RegExp(`^[ \\t]*(?:[-*][ \\t]*)?(✓|✔|✅|skip(?:ped)?:|pending:?|blocked:|todo:|not done:|☐|\\[ \\])[ \\t]*(P(\\d+)\\.?[ \\t]+${PROOF_STEP}\\b(.*))$`, "gim");
 const PROOF_SCOPE = /^\s+for\s+(\S+#\d+)\s+at\s+([0-9a-f]{7,40})(?=\s*(?::|$))/i;
 const PROOF_BODY = /^\s+for\s+\S+#\d+\s+at\s+[0-9a-f]{7,40}\s*:\s*driven\s+(.*?)\s*;\s*seen\s+(.*?)\s*$/i;
+// A workstream crew opens no PR, so its line names only its head commit: "✓ P4 Prove on the real surface at abc1234: driven …; seen …".
+const HEAD_PROOF_BODY = /^\s+at\s+[0-9a-f]{7,40}\s*:\s*driven\s+(.*?)\s*;\s*seen\s+(.*?)\s*$/i;
 
 // Why a pipeline crew's report does not prove its proof step (P<step>), or null. With a
-// PR and head, only a line for that PR at that head counts.
-export function pipelineProofGap(report: string, step: number, scope?: { pr: string; head: string }): string | null {
+// PR and head, only a line for that PR at that head counts. A workstream crew's DONE check also takes
+// a line at its head commit.
+export function pipelineProofGap(report: string, step: number, scope?: { pr: string; head: string }, opts: { workstream?: boolean } = {}): string | null {
+  const headOnly = opts.workstream === true && scope === undefined;
   const lines = [...report.matchAll(PROOF_LINE)].filter((m) => Number(m[3]) === step).map((m) => {
     const mark = m[1]!.toLowerCase().replace(/:$/, "");
     const scoped = PROOF_SCOPE.exec(m[4]!);
-    const body = PROOF_BODY.exec(m[4]!);
+    const body = PROOF_BODY.exec(m[4]!) ?? (headOnly ? HEAD_PROOF_BODY.exec(m[4]!) : null);
     const done = /^[✓✔✅]$/.test(mark);
     const filled = body !== null && body[1]!.trim() !== "" && body[2]!.trim() !== "";
     return { mark, text: m[2]!.trim(), done, filled, pr: scoped?.[1]?.toLowerCase(), sha: scoped?.[2]?.toLowerCase() };
@@ -262,7 +272,7 @@ export function pipelineProofGap(report: string, step: number, scope?: { pr: str
   if (open !== undefined) return `${STEP_STATE[open.mark] ?? "not done"}: "${open.text}"`;
   if (shown.some((l) => l.done && l.filled)) return null;
   const malformed = shown.find((l) => l.done) ?? (scope !== undefined ? lines.find((l) => l.done && !l.filled) : undefined);
-  if (malformed !== undefined) return `malformed: the line must read "✓ P${step} ${PROOF_STEP} for <owner/repo#n> at <head sha>: driven <what>; seen <what>", with both fields filled`;
+  if (malformed !== undefined) return `malformed: the line must read "✓ P${step} ${PROOF_STEP}${headOnly ? "" : " for <owner/repo#n>"} at <head sha>: driven <what>; seen <what>", with both fields filled`;
   const last = shown.at(-1);
   if (last !== undefined) return `${STEP_STATE[last.mark] ?? "not done"}: "${last.text}"`;
   return `missing: no "✓ P${step} ${PROOF_STEP} for ${scope!.pr} at ${scope!.head.slice(0, 7)}" line`;

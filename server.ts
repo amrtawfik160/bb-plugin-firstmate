@@ -415,6 +415,13 @@ function asRecord(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
 }
 
+/** The model BB starts a thread on when none is named: the catalog's default entry, else its first. */
+function defaultCatalogModel(models: Record<string, unknown>[]): string | undefined {
+  const pick = models.find((m) => m["isDefault"] === true) ?? models[0];
+  const id = pick?.["model"] ?? pick?.["id"];
+  return typeof id === "string" && id !== "" ? id : undefined;
+}
+
 function ctxString(ctx: unknown, key: string): string | undefined {
   const value = asRecord(ctx)[key];
   return typeof value === "string" ? value : undefined;
@@ -566,9 +573,10 @@ function wrapHostCommand(command: string): string {
 // A gh call whose output Firstmate reads. On the host terminal gh writes a "Working..." progress line to stderr,
 // and the PTY mixes it into the output (Cyndra PR 2581's fold check failed "Unexpected token 'W'" on every read,
 // 2026-10-20). The host's gh wrapper sets GH_FORCE_TTY, so a pipe alone does not stop it: stderr is held in a
-// file and shown only when gh fails, stdout goes through a pipe, and pipefail keeps gh's exit code.
+// file and shown only when gh fails, stdout goes through a pipe, and pipefail keeps gh's exit code. The EXIT trap
+// removes that file also when the read is killed: a closed terminal hangs it up, a timeout terminates it.
 export function ghReadCommand(command: string): string {
-  return `bash -o pipefail -c ${shQuote(`e=$(mktemp) || exit 1; { ${command}; } 2>"$e" | cat; rc=$?; [ "$rc" -eq 0 ] || cat "$e" >&2; rm -f "$e"; exit "$rc"`)}`;
+  return `bash -o pipefail -c ${shQuote(`e=$(mktemp) || exit 1; trap 'rm -f "$e"' EXIT; { ${command}; } 2>"$e" | cat; rc=$?; [ "$rc" -eq 0 ] || cat "$e" >&2; exit "$rc"`)}`;
 }
 
 /** fetch for the read-only live checks. The test run sets FM_NO_LIVE_NETWORK=1, so no test reaches Expo or Coolify. */
@@ -6158,7 +6166,14 @@ export default async function plugin(bb: BbPluginApi) {
         throw refused(`Provider "${pid}" is installed but not available on this host (sign-in or install needed). Nothing was spawned.`, "provider not available");
       }
     }
-    if (mid === "") return;
+    if (mid === "") {
+      if (providerModelsCommand(pid) === null) return;
+      const hostId = selectedHost ?? await resolveHostForProject(projectId, parentThreadId).catch(() => undefined);
+      const cli = await cliDefaultModelRefusal(pid, hostId);
+      if (cli === null) return;
+      if (strict) throw new Error(`Execution change refused: ${cli}`);
+      throw refused(cli, "not accepted by its CLI");
+    }
     let catalog: Record<string, unknown>;
     try {
       catalog = asRecord(await raceAbort(bb.sdk.providers.models({ ...routing, ...(pid !== "" ? { providerId: pid } : {}) }), undefined, STUCK_HOST_CALL_MS));
@@ -6185,25 +6200,50 @@ export default async function plugin(bb: BbPluginApi) {
   // 20 Oct: BB's catalog for acp-antigravity listed gemini-4-argon; agy refused it, and crews 9ade6f3a, 43864fce
   // and hermes-split-step3-1020 died at their first turn. A provider whose CLI lists its own models is checked
   // against that list too. A list that cannot be read leaves BB's catalog as the only check; a good read holds 10 minutes.
+  // A failed read holds 2 minutes: a hung `agy models` costs 20 s, and each dispatch checks twice (#186 checker).
   const cliModelLists = new Map<string, { at: number; ids: string[] }>();
+  const cliModelReadFailures = new Map<string, number>();
   const CLI_MODELS_FRESH_MS = 10 * 60_000;
-  async function cliModelRefusal(providerId: string, model: string, catalog: string[], hostId: string | undefined): Promise<string | null> {
+  const CLI_MODELS_FAILED_HOLD_MS = 2 * 60_000;
+  async function cliModelRefusal(providerId: string, model: string, catalog: string[], hostId: string | undefined, named = true): Promise<string | null> {
     const probe = providerModelsCommand(providerId);
     if (probe === null || hostId === undefined) return null;
     const key = `${hostId}:${providerId}`;
     let ids = cliModelLists.get(key);
     if (ids === undefined || Date.now() - ids.at >= CLI_MODELS_FRESH_MS) {
+      if (Date.now() - (cliModelReadFailures.get(key) ?? -Infinity) < CLI_MODELS_FAILED_HOLD_MS) return null;
       let read: { exitCode: number | null; output: string };
       try { read = await runStructuredOnHost(hostId, probe.command, 20_000); }
-      catch (error) { bb.log.warn(`${probe.label} model list on ${hostId} could not be read; BB's catalog stands: ${String(error)}`); return null; }
+      catch (error) { cliModelReadFailures.set(key, Date.now()); bb.log.warn(`${probe.label} model list on ${hostId} could not be read; BB's catalog stands: ${String(error)}`); return null; }
       const listed = read.exitCode === 0 ? parseCliModels(read.output) : [];
-      if (listed.length === 0) { bb.log.warn(`${probe.label} on ${hostId} listed no models (exit ${read.exitCode}); BB's catalog stands`); return null; }
+      if (listed.length === 0) { cliModelReadFailures.set(key, Date.now()); bb.log.warn(`${probe.label} on ${hostId} listed no models (exit ${read.exitCode}); BB's catalog stands`); return null; }
+      cliModelReadFailures.delete(key);
       ids = { at: Date.now(), ids: listed };
       cliModelLists.set(key, ids);
     }
     if (cliAcceptsModel(model, ids.ids)) return null;
     const accepted = acceptedCatalogModels(catalog, ids.ids);
-    return `Provider "${providerId}" lists model "${model}", but its CLI on host ${hostId} does not accept it (\`${probe.command}\`). ${accepted.length > 0 ? `Models it accepts: ${accepted.join(", ")}.` : `Its CLI lists only: ${ids.ids.join(", ")}.`} Nothing was spawned.`;
+    const subject = named
+      ? `Provider "${providerId}" lists model "${model}", but its CLI on host ${hostId} does not accept it`
+      : `Provider "${providerId}" was named with no model, and its default model "${model}" is not accepted by its CLI on host ${hostId}`;
+    return `${subject} (\`${probe.command}\`). ${accepted.length > 0 ? `Models it accepts: ${accepted.join(", ")}.${named ? "" : " Name one of them."}` : `Its CLI lists only: ${ids.ids.join(", ")}.`} Nothing was spawned.`;
+  }
+
+  // A dispatch that names acp-antigravity and no model runs on the provider's catalog default (gemini-3.8-flash on
+  // 20 Oct; the bridge falls back to gemini-4-argon, which agy refuses, when its adapter reports no model). That
+  // default is checked like a named model. A catalog that cannot be read leaves it unchecked, as before.
+  async function cliDefaultModelRefusal(providerId: string, hostId: string | undefined): Promise<string | null> {
+    if (hostId === undefined) return null;
+    let models: Record<string, unknown>[];
+    try {
+      const catalog = asRecord(await raceAbort(bb.sdk.providers.models({ hostId, providerId }), undefined, STUCK_HOST_CALL_MS));
+      if (catalog["modelLoadError"] != null) return null;
+      models = Array.isArray(catalog["models"]) ? (catalog["models"] as unknown[]).map(asRecord) : [];
+    } catch { return null; }
+    const model = defaultCatalogModel(models);
+    if (model === undefined) return null;
+    const listed = models.map((m) => m["id"]).filter((m): m is string => typeof m === "string");
+    return cliModelRefusal(providerId, model, listed, hostId, false);
   }
 
   // A spawned crew whose thread is already in error never started; say so instead
@@ -8002,8 +8042,15 @@ export default async function plugin(bb: BbPluginApi) {
     return match[1] as "absent" | "dead" | "live";
   }
 
+  // 20 Oct: retry reservations hermes-split-step3-1020 and reels-animate-6118 stayed "reserved" for hours with no
+  // worker and held crew slots. A dispatch takes a reservation to creation within minutes, so one this old never
+  // asked for a worker and is released like an uncertain one, after the same discovery reads and spawn-lock check.
+  const RESERVED_RELEASE_AGE_MS = 30 * 60_000;
+  function releasableState(record: LaunchRecord): boolean {
+    return record.state === "uncertain" || record.state === "reserved" && Date.now() - record.updatedAt >= RESERVED_RELEASE_AGE_MS;
+  }
   function releaseEligible(record: LaunchRecord | undefined, boundHome: string): record is LaunchRecord {
-    return !!record && record.state === "uncertain" && !record.threadId && record.creationRequested !== true && !record.adoption && record.home === boundHome && !createRequestActive(record);
+    return !!record && releasableState(record) && !record.threadId && record.creationRequested !== true && !record.adoption && record.home === boundHome && !createRequestActive(record);
   }
 
   async function inventoryForRelease(record: LaunchRecord, signal: AbortSignal) {
@@ -8021,7 +8068,10 @@ export default async function plugin(bb: BbPluginApi) {
     if (!metaFlag(captainMeta, "captain") || captain.projectId !== projectId || captain.archivedAt || captain.deletedAt) throw new Error("Release must run in the live owning captain and exact project context.");
     const record = launches.forTask(projectId, owner, taskId);
     if (!record) throw new Error(`No launch for ${taskId} in this captain and project.`);
-    if (record.state !== "uncertain") throw new Error(`Release refused: state is ${record.state}.`);
+    if (record.state !== "uncertain" && record.state !== "reserved") throw new Error(`Release refused: state is ${record.state}.`);
+    if (!releasableState(record)) {
+      throw new Error(`Release refused: the reservation is ${Math.floor((Date.now() - record.updatedAt) / 60_000)} min old. A reservation that never asked for a worker can be released once it is ${RESERVED_RELEASE_AGE_MS / 60_000} min old.`);
+    }
     if (record.threadId) throw new Error("Release refused: a thread is already recorded.");
     if (record.creationRequested === true) throw new Error("Release refused: creation was requested.");
     if (record.adoption) throw new Error("Release refused: adoption is in progress.");
@@ -8446,14 +8496,17 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const key = launchKey(input.projectId, input.parentThreadId ?? "", crew.nativeHome ?? "", crew.id);
     const notify = await crewSpawnNotifications();
+    // A checker updates the workstream PR body, so a read-only crew keeps /pr; an editor's commits ship in the workstream PR.
+    const readOnly = input.shape === "scout" || input.role === "checker" || input.role === "lookup";
+    const workstreamMerge = !!input.workstreamMerge && !!wsRepo;
     const created = await launches.create(key, () => bb.sdk.threads.spawn({
       ...notify,
       projectId: input.projectId,
       environment,
       prompt: crewPrompt({
-        task: input.workstreamId ? `${task}\n\nWorkstream ${input.workstreamId}: create the report directory ${shQuote(reportDir)} before writing your durable report to ${shQuote(`${reportDir}/report.md`)}. Record that tests passed in that report.${input.workstreamMerge && wsRepo
+        task: input.workstreamId ? `${task}\n\nWorkstream ${input.workstreamId}: create the report directory ${shQuote(reportDir)} before writing your durable report to ${shQuote(`${reportDir}/report.md`)}. Record that tests passed in that report.${workstreamMerge && wsRepo
           ? ` This is the workstream worktree of ${wsRepo.repository} on ${wsRepo.branch}. Commit the merge here and do not push; only the owner Ship action merges the workstream branch.`
-          : `${createdEditor && wsRepo ? ` Repository ${wsRepo.repository}: this worktree, cut from ${input.reuseEnvironmentId ? "your earlier attempt" : input.baseBranch ?? wsRepo.branch}, is this task's only checkout; leave every other checkout alone.` : ""} Keep this worktree and branch. Commit and push here. Do not create another worktree or switch branches. Firstmate folds this branch into the workstream branch when tests pass. Only the owner Ship action may merge the workstream branch to ${wsRepo?.base ?? "main"}. Load /pr before creating or updating a PR body. ${input.shape === "scout" || input.role === "checker" || input.role === "lookup" ? "Read-only repository: do not change repository files or Git state." : ""}`}` : task,
+          : `${createdEditor && wsRepo ? ` Repository ${wsRepo.repository}: this worktree, cut from ${input.reuseEnvironmentId ? "your earlier attempt" : input.baseBranch ?? wsRepo.branch}, is this task's only checkout; leave every other checkout alone.` : ""} Keep this worktree and branch. Commit and push here. Do not create another worktree or switch branches. Firstmate folds this branch into the workstream branch when tests pass. Only the owner Ship action may merge the workstream branch to ${wsRepo?.base ?? "main"}. ${readOnly ? "Load /pr before creating or updating a PR body. Read-only repository: do not change repository files or Git state." : "Do not open a PR; the workstream PR ships this work."}`}` : task,
         parentThreadId: input.parentThreadId,
         shape: input.shape,
         mode: input.mode,
@@ -8462,6 +8515,7 @@ export default async function plugin(bb: BbPluginApi) {
         providerId: crew.providerId,
         playbook: crew.playbook,
         ...(reportDir ? { dataDir: reportDir } : {}),
+        ...(input.workstreamId && !readOnly ? { workstream: workstreamMerge ? "merge" as const : "task" as const } : {}),
       }),
       title: crewThreadTitle(task, input.shape, crew.id, input.title),
       parentThreadId: input.parentThreadId,
@@ -16554,7 +16608,7 @@ export default async function plugin(bb: BbPluginApi) {
     dispatchHelp,
     "  bb firstmate launches list [--limit n] [--offset n] [--json]   # uncertain slots require reconciliation",
     "  bb firstmate launches adopt <task-id> --thread <thread-id> [--check] [--json]   # exact legacy registration repair; no turn or merge",
-    "  bb firstmate launches release <task-id>   # free an uncertain slot that never requested a worker",
+    "  bb firstmate launches release <task-id>   # free an uncertain slot, or one reserved 30+ min, that never requested a worker",
     "  bb firstmate deliveries list|inspect|register|reconcile|assign|abandon|clear-hold [id] [--from manager] [--reason evidence] [--authorized]",
     '  bb firstmate deliveries verify <id> --commit <head sha> --driven "<what you drove>" --seen "<what you saw>"   # a crew that drove it may record it',
     "  bb firstmate prs [--json]   # read-only: open PRs by this GitHub account in your projects, untracked ones first",
@@ -19213,7 +19267,8 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
     if (await bb.storage.kv.get(verifyKey) !== undefined) return;
-    const gap = pipeline !== null ? pipelineProofGap(report, proofStep(pipeline)) : verifyStepGap(report, playbookText);
+    // A workstream crew opens no PR: its brief asks for the proof line at its head commit.
+    const gap = pipeline !== null ? pipelineProofGap(report, proofStep(pipeline), undefined, { workstream: crew.workstreamId !== undefined }) : verifyStepGap(report, playbookText);
     // A report with no step lines is not judged yet; the gap request above asks for them.
     if (gap === null && reportGaps(report, steps).some((g) => g.startsWith("playbook step lines (0 "))) return;
     await bb.storage.kv.set(verifyKey, { gap });
@@ -20003,10 +20058,7 @@ export default async function plugin(bb: BbPluginApi) {
     try {
       const catalog = asRecord(await raceAbort(bb.sdk.providers.models({ ...routing, providerId }), undefined, STUCK_HOST_CALL_MS));
       if (catalog["modelLoadError"] != null) return undefined;
-      const entries = Array.isArray(catalog["models"]) ? (catalog["models"] as unknown[]).map(asRecord) : [];
-      const pick = entries.find((m) => m["isDefault"] === true) ?? entries[0];
-      const id = pick?.["model"] ?? pick?.["id"];
-      return typeof id === "string" && id !== "" ? id : undefined;
+      return defaultCatalogModel(Array.isArray(catalog["models"]) ? (catalog["models"] as unknown[]).map(asRecord) : []);
     } catch {
       return undefined;
     }

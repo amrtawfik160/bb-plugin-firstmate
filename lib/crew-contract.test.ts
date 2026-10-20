@@ -698,6 +698,19 @@ test("a pipeline crew's DONE report is counted against the pipeline steps, and t
   assert.deepEqual(reportGaps(`${BUG_REPORT.split("\n").slice(0, 3).join("\n")}\nSkills read: /x`, CODE_PIPELINES["bug-fix"].length), ["playbook step lines (3 of 7)"]);
 });
 
+// PR #189 checker D1: a workstream crew opens no PR, so its brief asks for a P4 line at its head commit and a skipped P7.
+test("a workstream crew's report proves P4 at its head commit with no PR, and its skipped P7 counts as a step line", () => {
+  const report = BUG_REPORT
+    .replace(/^✓ P4 .*$/m, "✓ P4 Prove on the real surface at 4f2a9c1: driven a save on the dev link with the lock held; seen the row saved after release")
+    .replace(/^✓ P7 .*$/m, "skip: P7 PR: workstream PR");
+  assert.equal(pipelineProofGap(report, 4, undefined, { workstream: true }), null);
+  assert.deepEqual(reportGaps(`${report}\nSkills read: /x`, CODE_PIPELINES["bug-fix"].length), [], "7 of 7 step lines");
+  assert.match(pipelineProofGap(report, 4) ?? "", /^malformed: /, "outside a workstream the line still names its PR");
+  assert.match(pipelineProofGap(report, 4, PR, { workstream: true }) ?? "", /^malformed: .* for <owner\/repo#n> at/, "a PR's own check still needs a line for that PR");
+  const empty = report.replace(/^✓ P4 .*$/m, "✓ P4 Prove on the real surface at 4f2a9c1: driven ; seen");
+  assert.equal(pipelineProofGap(empty, 4, undefined, { workstream: true }), "malformed: the line must read \"✓ P4 Prove on the real surface at <head sha>: driven <what>; seen <what>\", with both fields filled");
+});
+
 test("the captain rules name the dispatch skills, the crew models and the checker rule", () => {
   const rules = readFileSync(new URL("../entry-skills/captain/references/supervision.md", import.meta.url), "utf8").replace(/\s*\n\s*/g, " ");
   for (const text of [
