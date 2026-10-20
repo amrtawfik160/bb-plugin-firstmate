@@ -396,6 +396,22 @@ test("crews are taught not to leave timers that ping the captain with empty comp
   assert.match(LEFTOVER_TIMER_CONTRACT, /stop every timer, monitor, and background shell you started/);
 });
 
+// 20 Oct: workstream task crew T377 opened cyndra-ai/cyndra-saas#2581 because its brief ended "Then push + open a PR".
+test("a workstream crew is told to commit, not to open a PR, and to report its head commit", () => {
+  for (const mode of ["direct-PR", "no-mistakes"] as const) {
+    const task = crewPrompt({ task: "fix login", parentThreadId: "thr_cap", shape: "ship", mode, isolated: true, workstream: "task" });
+    assert.ok(task.includes("Delivery (workstream task): own branch, small diff, run relevant checks."), task);
+    assert.ok(task.includes("Then commit and push to this task branch. Do NOT open a PR; the workstream PR ships this work. Report DONE with the head commit."));
+    assert.ok(task.includes("After DONE: outcome, head commit, changed files, validation run, blockers/next step."));
+    assert.doesNotMatch(task, /open a PR\. Report DONE with the PR URL|Report DONE with the PR URL/);
+    const merge = crewPrompt({ task: "resolve the fold conflict", parentThreadId: "thr_cap", shape: "ship", mode, isolated: false, workstream: "merge" });
+    assert.ok(merge.includes("Then commit here. Do NOT push and do NOT open a PR; only the owner Ship action merges the workstream branch. Report DONE with the head commit."), merge);
+    assert.doesNotMatch(merge, /Report DONE with the PR URL/);
+  }
+  assert.match(crewPrompt({ task: "fix login", parentThreadId: "thr_cap", shape: "ship", mode: "direct-PR", isolated: true }), /Then push \+ open a PR\. Report DONE with the PR URL\./, "a crew outside a workstream still opens its PR");
+  assert.match(crewPrompt({ task: "check it", parentThreadId: "thr_cap", shape: "scout", mode: "direct-PR", isolated: false, workstream: "task" }), /^Report \(standalone/m, "a scout keeps its report tail");
+});
+
 test("fan-out cap is configurable past the old hard 10 and stays bounded", () => {
   assert.equal(resolveFanoutCap(undefined), 10);
   assert.equal(resolveFanoutCap("nope"), 10);

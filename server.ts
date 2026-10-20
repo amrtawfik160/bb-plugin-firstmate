@@ -8446,14 +8446,17 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const key = launchKey(input.projectId, input.parentThreadId ?? "", crew.nativeHome ?? "", crew.id);
     const notify = await crewSpawnNotifications();
+    // A checker updates the workstream PR body, so a read-only crew keeps /pr; an editor's commits ship in the workstream PR.
+    const readOnly = input.shape === "scout" || input.role === "checker" || input.role === "lookup";
+    const workstreamMerge = !!input.workstreamMerge && !!wsRepo;
     const created = await launches.create(key, () => bb.sdk.threads.spawn({
       ...notify,
       projectId: input.projectId,
       environment,
       prompt: crewPrompt({
-        task: input.workstreamId ? `${task}\n\nWorkstream ${input.workstreamId}: create the report directory ${shQuote(reportDir)} before writing your durable report to ${shQuote(`${reportDir}/report.md`)}. Record that tests passed in that report.${input.workstreamMerge && wsRepo
+        task: input.workstreamId ? `${task}\n\nWorkstream ${input.workstreamId}: create the report directory ${shQuote(reportDir)} before writing your durable report to ${shQuote(`${reportDir}/report.md`)}. Record that tests passed in that report.${workstreamMerge && wsRepo
           ? ` This is the workstream worktree of ${wsRepo.repository} on ${wsRepo.branch}. Commit the merge here and do not push; only the owner Ship action merges the workstream branch.`
-          : `${createdEditor && wsRepo ? ` Repository ${wsRepo.repository}: this worktree, cut from ${input.reuseEnvironmentId ? "your earlier attempt" : input.baseBranch ?? wsRepo.branch}, is this task's only checkout; leave every other checkout alone.` : ""} Keep this worktree and branch. Commit and push here. Do not create another worktree or switch branches. Firstmate folds this branch into the workstream branch when tests pass. Only the owner Ship action may merge the workstream branch to ${wsRepo?.base ?? "main"}. Load /pr before creating or updating a PR body. ${input.shape === "scout" || input.role === "checker" || input.role === "lookup" ? "Read-only repository: do not change repository files or Git state." : ""}`}` : task,
+          : `${createdEditor && wsRepo ? ` Repository ${wsRepo.repository}: this worktree, cut from ${input.reuseEnvironmentId ? "your earlier attempt" : input.baseBranch ?? wsRepo.branch}, is this task's only checkout; leave every other checkout alone.` : ""} Keep this worktree and branch. Commit and push here. Do not create another worktree or switch branches. Firstmate folds this branch into the workstream branch when tests pass. Only the owner Ship action may merge the workstream branch to ${wsRepo?.base ?? "main"}. ${readOnly ? "Load /pr before creating or updating a PR body. Read-only repository: do not change repository files or Git state." : "Do not open a PR; the workstream PR ships this work."}`}` : task,
         parentThreadId: input.parentThreadId,
         shape: input.shape,
         mode: input.mode,
@@ -8462,6 +8465,7 @@ export default async function plugin(bb: BbPluginApi) {
         providerId: crew.providerId,
         playbook: crew.playbook,
         ...(reportDir ? { dataDir: reportDir } : {}),
+        ...(input.workstreamId && !readOnly ? { workstream: workstreamMerge ? "merge" as const : "task" as const } : {}),
       }),
       title: crewThreadTitle(task, input.shape, crew.id, input.title),
       parentThreadId: input.parentThreadId,
