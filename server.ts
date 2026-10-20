@@ -122,11 +122,11 @@ import { createLeases, LEASE_TTL_MS } from "./lib/test-server-lease.ts";
 import { addCorrection, CAPTAIN_FILE, CORRECTION_RULE, correctionBrief, fixCorrection, LEDGER_FILE, readLedger, within } from "./owner/corrections.ts";
 import { renderScorecard, type ScorecardData } from "./owner/scorecard.ts";
 import { createQualityEvents } from "./lib/quality-events.ts";
-import { rpcContract, workstreamListSchema, workstreamResultSchema, workstreamDevLinkSchema, workstreamAdoptSchema } from "./rpc.ts";
+import { rpcContract, workstreamListSchema, workstreamResultSchema, workstreamDevLinkSchema, workstreamAdoptSchema, workstreamBindSchema } from "./rpc.ts";
 import { archiveWithUndo } from "./lib/workstream-archive.ts";
-import { createWorkstreams, shipSnapshotOf, WorkstreamWaiting, type Workstream, type WorkstreamRepo, type WorkstreamJob, type FoldStep } from "./lib/workstreams.ts";
+import { createWorkstreams, shipSnapshotOf, WorkstreamRefusal, WorkstreamWaiting, type Workstream, type WorkstreamRepo, type WorkstreamJob, type FoldStep } from "./lib/workstreams.ts";
 import { provisionScript, takeMainScript, unshippedScript, devStartScript, devUnit, devActivityPath, foldScript, foldPlanScript, foldInspectScript, rollbackFoldScript, deleteTaskBranchScript, prBaseScript, saveWorkScript, foldBranchPlanScript, prContainsScript, cloneSourceScript } from "./lib/workstream-runtime.ts";
-import { adoptCardText, parseContained, parseSavedWork, prBaseFromLsRemote, proposeWorkstreams, replacedPrVerdict, separateQuestion, type AdoptSource } from "./lib/workstream-adopt.ts";
+import { adoptCardText, basePhrase, parseContained, parseSavedWork, prBaseFromLsRemote, proposeWorkstreams, replacedPrVerdict, separateQuestion, type AdoptSource } from "./lib/workstream-adopt.ts";
 import {
   WORKSTREAM_CARD_METHOD,
   archiveKeepReason,
@@ -2237,6 +2237,7 @@ export default async function plugin(bb: BbPluginApi) {
       .describe("adopt only: per task, repository (owner/repo) when it was recorded under the wrong repository, and branches (pushed) that hold its work"),
     replacesPrs: z.array(z.string().url()).optional().describe("adopt only: PR links the workstream PR replaces; each closes once the workstream PR holds all its commits"),
     goneTopicId: z.number().int().positive().optional().describe("bindTopic only: the recorded topic id, when that topic is gone; the new topic replaces it"),
+    structuredRefusal: z.boolean().optional().describe("bindTopic only: a refusal returns refused {reason, message} instead of an error"),
     topic: z.object({chatId:z.string(),topicId:z.number().int().positive()}).optional(),
     chatId: z.string().optional(), topicId:z.number().int().positive().optional(), realLogin:z.boolean().optional(), includeEnded:z.boolean().optional(),
   });
@@ -2543,9 +2544,10 @@ export default async function plugin(bb: BbPluginApi) {
         const path = `${dirname(source.checkout)}/.firstmate-workstreams/${w.id}/${basename(source.checkout)}`;
         const branch = `workstream/${w.id}`;
         // The workstream branch starts from the repository's PR base (staging for RunAnts), and Ship merges there.
+        // It is read once, here, and saved on the record; a record saved without it keeps main.
         const base = await repositoryBase(repository, source, source.hostId);
         await workstreamCommand(source, `bash -c ${shQuote(provisionScript(source.checkout,path,branch,base))}`);
-        repos.push({repository,projectId:w.projectId,hostId:source.hostId,sourcePath:source.checkout,path,branch,environmentId:null,...(base !== "main" ? {base} : {})});
+        repos.push({repository,projectId:w.projectId,hostId:source.hostId,sourcePath:source.checkout,path,branch,environmentId:null,base});
       }
       if (repos.length === 0) throw new Error("No repository for workstream.");
       return repos;
@@ -2893,14 +2895,21 @@ export default async function plugin(bb: BbPluginApi) {
     await workstreamCommand({ hostId }, `bash -c ${shQuote(cloneSourceScript(repository, checkout))}`, 600_000);
     return { hostId, checkout };
   }
-  // The repository's PR base: its default branch on GitHub (staging for RunAnts), else main.
+  // The repository's PR base: its default branch on GitHub (staging for RunAnts), read from its checkout on
+  // this host, else from GitHub. A base that cannot be read refuses: main in its place would start a staging
+  // repository's workstream from the wrong branch and point its Ship PR there.
   async function repositoryBase(repository: string, source: { hostId: string; checkout: string } | null, hostId: string): Promise<string> {
-    if (!source && !hostId) return "main";
+    if (!source && !hostId) throw new Error(`Cannot read the default branch of ${repository}: no host to read it on.`);
+    let output: string;
     try {
-      const output = source ? await workstreamCommand(source, prBaseScript(source.checkout), 60_000)
+      output = source ? await workstreamCommand(source, prBaseScript(source.checkout), 60_000)
         : await workstreamCommand({ hostId }, `git ls-remote --symref ${shQuote(`https://github.com/${repository}.git`)} HEAD`, 60_000);
-      return prBaseFromLsRemote(output) ?? "main";
-    } catch { return "main"; }
+    } catch (error) {
+      throw new Error(`Cannot read the default branch of ${repository} (${truncate(error instanceof Error ? error.message : String(error), 300)}). Retry once its remote answers.`);
+    }
+    const base = prBaseFromLsRemote(output);
+    if (!base) throw new Error(`Cannot read the default branch of ${repository}: its remote names none. Retry once its remote answers.`);
+    return base;
   }
   // Adopt with fold: a workstream branch from each repository's PR base, as Create makes one.
   async function provisionAdopted(w: Workstream): Promise<WorkstreamRepo[]> {
@@ -2909,11 +2918,13 @@ export default async function plugin(bb: BbPluginApi) {
     const repos: WorkstreamRepo[] = [];
     for (const repository of w.adoption?.repositories ?? []) {
       const source = (await repositorySource(repository, w.projectId, hostId, true))!;
-      const base = await repositoryBase(repository, source, hostId);
+      // The base the owner's card named, read once at the card; a card from before that field reads it now.
+      const shown = Object.entries(w.adoption?.bases ?? {}).find(([name]) => name.toLowerCase() === repository.toLowerCase())?.[1];
+      const base = shown ?? await repositoryBase(repository, source, hostId);
       const path = `${dirname(own ?? source.checkout)}/.firstmate-workstreams/${w.id}/${basename(source.checkout)}`;
       const branch = `workstream/${w.id}`;
       await workstreamCommand(source, `bash -c ${shQuote(provisionScript(source.checkout, path, branch, base))}`);
-      repos.push({ repository, projectId: w.projectId, hostId, sourcePath: source.checkout, path, branch, environmentId: null, ...(base !== "main" ? { base } : {}) });
+      repos.push({ repository, projectId: w.projectId, hostId, sourcePath: source.checkout, path, branch, environmentId: null, base });
     }
     if (repos.length === 0) throw new Error("No repository for workstream.");
     return repos;
@@ -2922,6 +2933,16 @@ export default async function plugin(bb: BbPluginApi) {
   type AdoptRequest = {
     threadId: string; projectId: string; name: string; requestId: string; taskIds: string[];
     tasks: Array<{ taskId: string; repository?: string; branches?: string[] }>; replacesPrs: string[];
+    // Each repository's default branch, read once for the card; Approve starts the workstream branch there.
+    // A card shown before this field existed has none, so its base is read at Approve.
+    bases?: Record<string, string>;
+  };
+  // A task joins an adopt of its own project. A task with no recorded project (T361 and T366, 20 Oct) joins
+  // the requested project, which the card names and Approve records on the task.
+  const taskProjectFit = (task: OwnerTask, projectId: string, label: string | null): "same" | "none" | "other" => {
+    if (task.projectId) return task.projectId === projectId ? "same" : "other";
+    if (!task.project) return "none";
+    return label && sameProject(task.project, label) ? "same" : "other";
   };
   // The owner card of an adopt (lib/workstream-adopt.ts adoptCardText) and the request it approves.
   const ADOPT_CARD_PREFIX = "workstream-adopt:";
@@ -3037,8 +3058,17 @@ export default async function plugin(bb: BbPluginApi) {
     return { sources, repositories, replaces };
   }
   async function adoptApproved(req: AdoptRequest): Promise<Workstream> {
+    // The owner's Approve gives each task with no recorded project the project its card named.
+    const label = await projectLabel(req.projectId);
+    for (const taskId of req.taskIds) {
+      const task = ownerTasks.get(taskId);
+      if (!task) continue;
+      const fit = taskProjectFit(task, req.projectId, label);
+      if (fit === "other") throw new Error(`Task ${taskId} belongs to another project.`);
+      if (fit === "none") ownerTasks.recordProject(taskId, req.threadId, { id: req.projectId, label: label ?? req.projectId }, Date.now());
+    }
     const plan = await adoptSources(req);
-    const w = await workstreams.adoptFold({ threadId: req.threadId, projectId: req.projectId, name: req.name, requestId: req.requestId, taskIds: req.taskIds, ...plan });
+    const w = await workstreams.adoptFold({ threadId: req.threadId, projectId: req.projectId, name: req.name, requestId: req.requestId, taskIds: req.taskIds, ...plan, ...(req.bases ? { bases: req.bases } : {}) });
     await refreshOwnerBoard();
     return w;
   }
@@ -3078,8 +3108,7 @@ export default async function plugin(bb: BbPluginApi) {
       const task = ownerTasks.get(taskId);
       if (!task || task.captain !== input.threadId) throw new Error(`No owner task ${taskId} for this captain.`);
       if (!isOpenTask(task)) throw new Error(`Task ${taskId} is closed.`);
-      const same = task.projectId ? task.projectId === input.projectId : !!(task.project && label && sameProject(task.project, label));
-      if (!same) throw new Error(`Task ${taskId} belongs to another project.`);
+      if (taskProjectFit(task, input.projectId, label) === "other") throw new Error(`Task ${taskId} belongs to another project.`);
     }
     for (const named of input.tasks ?? []) if (!taskIds.includes(named.taskId)) throw new Error(`tasks names ${named.taskId}, which is not in taskIds.`);
     const req: AdoptRequest = { threadId: input.threadId, projectId: input.projectId, name: input.name.trim(), requestId: input.requestId, taskIds, tasks: input.tasks ?? [], replacesPrs: [...new Set(input.replacesPrs ?? [])] };
@@ -3110,10 +3139,18 @@ export default async function plugin(bb: BbPluginApi) {
     }
     // Everything is read before the card, so a refusal comes before the owner sees anything.
     const plan = await adoptSources(req);
-    const hostId = await resolveHostForProject(req.projectId, req.threadId).catch(() => "");
-    const first = plan.repositories[0]!;
-    const base = await repositoryBase(first, await repositorySource(first, req.projectId, hostId, false), hostId);
-    const text = adoptCardText({ name: req.name, base, sources: plan.sources, tasks: taskIds.map((id) => ({ id, title: ownerTasks.get(id)?.title ?? id })), replaces: req.replacesPrs });
+    // Only reads happen here; a captain with no host reads on the host of a task's crew checkout.
+    const hostId = await resolveHostForProject(req.projectId, req.threadId).catch(() => "") || plan.sources.find((s) => s.hostId)?.hostId || "";
+    // Each repository's default branch is read once, here: the card names it and Approve starts from it.
+    const bases: Record<string, string> = {};
+    for (const repository of plan.repositories) bases[repository] = await repositoryBase(repository, await repositorySource(repository, req.projectId, hostId, false), hostId);
+    req.bases = bases;
+    const base = basePhrase(plan.repositories.map((repository) => ({ repository, base: bases[repository]! })));
+    const tasks = taskIds.map((id) => {
+      const task = ownerTasks.get(id);
+      return { id, title: task?.title ?? id, ...(task && taskProjectFit(task, req.projectId, label) === "none" ? { project: label ?? req.projectId } : {}) };
+    });
+    const text = adoptCardText({ name: req.name, base, sources: plan.sources, tasks, replaces: req.replacesPrs });
     const ask = ownerAsks.create({
       captain: input.threadId, kind: "question", text, options: ADOPT_CHOICES.map((option) => ({ ...option })),
       recommended: null, defaultAt: null, irreversible: false, startsNewWork: true, createdAt: Date.now(),
@@ -3148,7 +3185,11 @@ export default async function plugin(bb: BbPluginApi) {
     if (!input.workstreamId) throw new Error("Pass workstreamId.");
     if (action === "bindTopic") {
       if (!input.chatId || !input.topicId) throw new Error("Bind topic needs chatId and topicId.");
-      return {workstream:await workstreams.bindTopic(input.workstreamId,input.threadId,{chatId:input.chatId,topicId:input.topicId},input.goneTopicId)};
+      try { return {workstream:await workstreams.bindTopic(input.workstreamId,input.threadId,{chatId:input.chatId,topicId:input.topicId},input.goneTopicId)}; }
+      catch (error) {
+        if (!input.structuredRefusal || !(error instanceof WorkstreamRefusal)) throw error;
+        return {workstream:workstreams.get(input.workstreamId,input.threadId),refused:{reason:error.reason,message:error.message}};
+      }
     }
     if (action === "devLink") return workstreams.devLink(input.workstreamId,input.threadId,input.realLogin);
     if (action === "end") return {workstream:await workstreams.end(input.workstreamId,input.threadId)};
@@ -8228,7 +8269,7 @@ export default async function plugin(bb: BbPluginApi) {
       prompt: crewPrompt({
         task: input.workstreamId ? `${task}\n\nWorkstream ${input.workstreamId}: create the report directory ${shQuote(reportDir)} before writing your durable report to ${shQuote(`${reportDir}/report.md`)}. Record that tests passed in that report.${input.workstreamMerge && wsRepo
           ? ` This is the workstream worktree of ${wsRepo.repository} on ${wsRepo.branch}. Commit the merge here and do not push; only the owner Ship action merges the workstream branch.`
-          : `${createdEditor && wsRepo ? ` Repository ${wsRepo.repository}: this worktree, cut from ${input.reuseEnvironmentId ? "your earlier attempt" : input.baseBranch ?? wsRepo.branch}, is this task's only checkout; leave every other checkout alone.` : ""} Keep this worktree and branch. Commit and push here. Do not create another worktree or switch branches. Firstmate folds this branch into the workstream branch when tests pass. Only the owner Ship action may merge the workstream branch to main. Load /pr before creating or updating a PR body. ${input.shape === "scout" || input.role === "checker" || input.role === "lookup" ? "Read-only repository: do not change repository files or Git state." : ""}`}` : task,
+          : `${createdEditor && wsRepo ? ` Repository ${wsRepo.repository}: this worktree, cut from ${input.reuseEnvironmentId ? "your earlier attempt" : input.baseBranch ?? wsRepo.branch}, is this task's only checkout; leave every other checkout alone.` : ""} Keep this worktree and branch. Commit and push here. Do not create another worktree or switch branches. Firstmate folds this branch into the workstream branch when tests pass. Only the owner Ship action may merge the workstream branch to ${wsRepo?.base ?? "main"}. Load /pr before creating or updating a PR body. ${input.shape === "scout" || input.role === "checker" || input.role === "lookup" ? "Read-only repository: do not change repository files or Git state." : ""}`}` : task,
         parentThreadId: input.parentThreadId,
         shape: input.shape,
         mode: input.mode,
@@ -18382,7 +18423,7 @@ export default async function plugin(bb: BbPluginApi) {
     "workstreams.list": async (input) => workstreamListSchema.parse(await workstreamOperation("list", input)),
     "workstreams.create": async (input) => workstreamResultSchema.parse(await workstreamOperation("create", input)),
     "workstreams.adopt": async (input) => workstreamAdoptSchema.parse(await workstreamOperation("adopt", input)),
-    "workstreams.bindTopic": async (input) => workstreamResultSchema.parse(await workstreamOperation("bindTopic", input)),
+    "workstreams.bindTopic": async (input) => workstreamBindSchema.parse(await workstreamOperation("bindTopic", input)),
     "workstreams.ship": async (input) => workstreamResultSchema.parse(await workstreamOperation("ship", input)),
     "workstreams.devLink": async (input) => workstreamDevLinkSchema.parse(await workstreamOperation("devLink", input)),
     "workstreams.end": async (input) => workstreamResultSchema.parse(await workstreamOperation("end", input)),

@@ -239,3 +239,19 @@ test("the kept-worktree note clears once the worktree is removed", () => {
   assert.equal(tasks.get("T1")!.worktreeKept, undefined);
   assert.equal(cleared.state, "dropped");
 });
+
+test("an approved adopt records the project of a task that had none; a task under another project is refused", () => {
+  const tasks = createOwnerTasks(memoryDb());
+  tasks.open({ captain: "c", project: null, projectId: null, title: "Planes gutters", sourceRefs: ["tg:1:1"], crewId: "c1", at: 0 });
+  tasks.open({ captain: "c", project: "Cyndra", projectId: "cyndra", title: "Banner", sourceRefs: ["tg:1:2"], crewId: "c2", at: 0 });
+  const recorded = tasks.recordProject("T1", "c", { id: "runants", label: "RunAnts" }, 10);
+  assert.equal(recorded.projectId, "runants");
+  assert.equal(recorded.project, "RunAnts");
+  assert.equal(recorded.updatedAt, 10);
+  assert.equal(tasks.get("T1")!.projectId, "runants");
+  // The same project again changes nothing; another project never replaces a recorded one.
+  assert.equal(tasks.recordProject("T1", "c", { id: "runants", label: "RunAnts" }, 20).updatedAt, 10);
+  assert.throws(() => tasks.recordProject("T1", "c", { id: "cyndra", label: "Cyndra" }, 30), /Task T1 belongs to another project\./);
+  assert.throws(() => tasks.recordProject("T2", "c", { id: "runants", label: "RunAnts" }, 30), /Task T2 belongs to another project\./);
+  assert.equal(tasks.get("T2")!.projectId, "cyndra");
+});

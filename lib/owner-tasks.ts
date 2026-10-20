@@ -286,6 +286,8 @@ export type OwnerTasks = {
   amendDropReason(id: string, captain: string, input: Correction & { text: string }, at: number): OwnerTask;
   /** Record that Live/dropped cleanup kept the worktree because it still has unsaved work; null clears it. Moves no state. */
   keepWorktree(id: string, captain: string, note: "kept: unsaved work" | null): OwnerTask;
+  /** Record the project of a task that has none (an adopt the owner approved). A task recorded under another project is refused. Moves no state. */
+  recordProject(id: string, captain: string, project: { id: string; label: string | null }, at: number): OwnerTask;
   /** A crew finished. When no other crew of its task still runs, settle the task. */
   finishCrew(captain: string, crewId: string, finish: CrewFinish, running: (crewId: string) => boolean,
     recordsFor: (task: OwnerTask) => readonly DeliveryRecord[], at: number): OwnerTask | undefined;
@@ -466,6 +468,15 @@ export function createOwnerTasks(db: Database, heldOpen: HeldOpen = () => null, 
           return save(rest);
         }
         return save({ ...task, worktreeKept: note });
+      })();
+    },
+    recordProject(id, captain, project, at) {
+      return db.transaction(() => {
+        const task = owned(id, captain);
+        if (task.projectId === project.id) return task;
+        if (task.projectId || task.project) throw new Error(`Task ${id} belongs to another project.`);
+        const label = projectName(project.label, list(captain, { includeClosed: true }).map((item) => item.project));
+        return save({ ...task, projectId: project.id, project: label, updatedAt: at });
       })();
     },
     holding(captain, prs) {

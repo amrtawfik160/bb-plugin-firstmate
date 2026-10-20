@@ -35,12 +35,22 @@ function clipLine(text: string, max: number): string {
   return line.length <= max ? line : `${line.slice(0, Math.max(0, max - 1))}…`;
 }
 
-/** The one owner card for one workstream: every task it groups, where its work comes from, and the PRs it replaces. */
+/** The workstream branch's starting point for the card: one base, or each repository's base when they differ. */
+export function basePhrase(bases: ReadonlyArray<{ repository: string; base: string }>): string {
+  const distinct = [...new Set(bases.map((b) => b.base))];
+  return distinct.length <= 1 ? distinct[0] ?? 'main' : bases.map((b) => `${b.base} in ${b.repository}`).join(' and ');
+}
+
+/**
+ * The one owner card for one workstream: every task it groups, where its work comes from, and the PRs it
+ * replaces. `base` is basePhrase of the repositories' default branches. A task's `project` is the project it
+ * gets on Approve, because it has none recorded.
+ */
 export function adoptCardText(input: {
   name: string;
   base: string;
   sources: readonly AdoptSource[];
-  tasks: ReadonlyArray<{ id: string; title: string }>;
+  tasks: ReadonlyArray<{ id: string; title: string; project?: string }>;
   replaces: readonly string[];
 }): string {
   const lines = [`Group these tasks into workstream "${clipLine(input.name, 60)}", with a new topic, a new branch from ${input.base} and one dev link:`];
@@ -50,7 +60,8 @@ export function adoptCardText(input: {
     const when = own.length === 0 ? 'no saved work; new work starts in the workstream'
       : own.some((s) => s.running) ? 'its crew is still working; folds when its crew finishes'
       : `folds now (${own.map((s) => s.branch).join(', ')})`;
-    lines.push(`- ${task.id} ${clipLine(task.title, 60)}: ${when}${moved ? `; moves from ${moved.repointedFrom} to ${moved.repository}` : ''}`);
+    const joins = task.project ? `; no project recorded, joins project ${clipLine(task.project, 40)}` : '';
+    lines.push(`- ${task.id} ${clipLine(task.title, 60)}: ${when}${moved ? `; moves from ${moved.repointedFrom} to ${moved.repository}` : ''}${joins}`);
   }
   if (input.replaces.length > 0) {
     lines.push(`Closes ${input.replaces.map(prLabel).join(', ')} with a link once the workstream PR holds all their commits.`);
