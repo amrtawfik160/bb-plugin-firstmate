@@ -6,6 +6,7 @@ import test from 'node:test';
 import { createFakePluginHost, makeThreadResponse } from '@get-bb/plugin-sdk/testing';
 import plugin from './server.ts';
 import { createOwnerTasks } from './lib/owner-tasks.ts';
+import { createDeliveries } from './lib/pr-delivery.ts';
 import { createWorkstreams } from './lib/workstreams.ts';
 import { stubProviderCatalog } from './test/provider-catalog.mjs';
 import { manifestSkillIds } from './scripts/plugin-skill-fixture.mjs';
@@ -43,6 +44,13 @@ async function foldedTask() {
   let unsaved = 'FM_UNSAVED checked';
   let duringCheck: () => void = () => {};
   let archiveError: Error | undefined;
+  // GitHub as gh answers on the host: the open PRs of each head branch, one PR's head and commits, and
+  // which commits the workstream branch holds.
+  const gh = {
+    open: new Map<string, string[]>(),
+    pr: { state: 'OPEN', headRefName: 'task/one', headRefOid: 'c2', commits: [{ oid: 'c1' }, { oid: 'c2' }] },
+    inWorkstream: new Set<string>(),
+  };
   host.harness.sdk.stub('threads.getPluginMetadata', async ({ threadId }: { threadId: string }) => (threadId === 'cap' ? { captain: 'true' } : {}));
   host.harness.sdk.stub('threads.get', async ({ threadId }: { threadId: string }) => ({
     ...makeThreadResponse({ id: threadId, projectId: 'cyndra', status: String(threads.get(threadId)?.status ?? 'idle') }),
@@ -60,6 +68,13 @@ async function foldedTask() {
     commands.push(command);
     if (command.includes('echo present')) return { exitCode: 0, stdout: 'present' };
     if (command.includes(' check ')) { duringCheck(); return { exitCode: 0, stdout: unsaved }; }
+    const head = /gh pr list --head '([^']+)'/.exec(command)?.[1];
+    if (head) return { exitCode: 0, stdout: JSON.stringify((gh.open.get(head) ?? []).map((url) => ({ url }))) };
+    if (command.includes('gh pr view')) return { exitCode: 0, stdout: JSON.stringify(gh.pr) };
+    if (command.includes('merge-base --is-ancestor')) {
+      const shas = [...gh.pr.commits.map((c) => c.oid), gh.pr.headRefOid].filter((sha) => command.includes(sha));
+      return { exitCode: 0, stdout: shas.map((sha) => `${gh.inWorkstream.has(sha) ? 'FM_IN' : 'FM_OUT'} ${sha}`).join('\n') };
+    }
     return { exitCode: 0, stdout: '' };
   });
   host.harness.sdk.stub('threads.archive', async ({ threadId }: { threadId: string }) => {
@@ -72,7 +87,7 @@ async function foldedTask() {
   host.harness.sdk.stub('plugins.callRpc', async () => ({ ok: true, queued: 1, duplicate: false }));
   const job = () => seeded.get(w.id, 'cap').jobs.find((j) => j.id === 'crew1')!;
   return {
-    host, tasks, task, threads, lists, archived, unarchived, stopped, commands, job,
+    host, tasks, task, threads, lists, archived, unarchived, stopped, commands, job, gh,
     whenArchived: (fn: (threadId: string) => string[]) => { onArchive = fn; },
     pass: () => host.harness.behavior.runSchedule('workstreams'),
     set: (knobs: { unsaved?: string; duringCheck?: () => void; archiveError?: Error }) => {
@@ -219,6 +234,87 @@ test('End archives the crew threads in the workstream worktree one by one under 
         assert.ok(f.commands.some((c) => c.includes('worktree remove') && c.includes('/repo/ws')));
       }
       assert.deepEqual(bulk, [], 'never an environment-wide archive');
+    } finally { await f.host.harness.lifecycle.dispose(); }
+  }
+});
+
+// 20 Oct, Cyndra PR 2581: the task crew opened its own PR, the fold deleted its branch, GitHub closed the PR,
+// and its delivery waited for the owner although the workstream branch held every commit of it.
+const PR = 'https://github.com/cyndra-ai/cyndra-saas/pull/2581';
+const PR_ID = 'cyndra-ai/cyndra-saas#2581';
+const OPEN_READ = { headSha: 'c2', state: 'open', draft: false, checks: 'passing', review: 'unknown', reviewHeadSha: null, mergeCommitSha: null, mergeable: 'mergeable' } as const;
+
+test('a fold closes the task branch\'s open PR with a note and ends its delivery, only when the workstream branch holds every commit', async () => {
+  for (const [name, inWorkstream, workstreamPr] of [['one commit outside', ['c1'], null], ['all in, no workstream PR yet', ['c1', 'c2'], null], ['all in', ['c1', 'c2'], 'https://github.com/cyndra-ai/cyndra-saas/pull/2600']] as const) {
+    const f = await foldedTask();
+    try {
+      const store = createDeliveries(f.host.bb.storage.database());
+      store.register({ url: PR, taskId: 'crew1', projectId: 'cyndra', owner: 'cap', home: '', worker: 'thr_task', requirement: 'pr' });
+      store.observe(PR_ID, OPEN_READ, false);
+      f.gh.open.set('task/one', [PR]);
+      if (workstreamPr) f.gh.open.set('workstream/ws-test', [workstreamPr]);
+      f.gh.inWorkstream = new Set(inWorkstream);
+      await f.pass();
+      assert.equal(f.job().cleanup, 'done', name);
+      const close = f.commands.findIndex((c) => c.includes('gh pr close'));
+      const remove = f.commands.findIndex((c) => c.includes('push origin --delete'));
+      if (inWorkstream.length < 2) {
+        assert.equal(close, -1, `${name}: the PR stays open`);
+        assert.equal(remove, -1, `${name}: the branch stays`);
+        assert.match(f.job().note ?? '', /branch task\/one kept: .*pull\/2581 stays open: 1 of 2 commits are not in the workstream branch/, name);
+        assert.equal(store.get(PR_ID)!.status, 'pr-delivered', `${name}: the delivery is untouched`);
+        continue;
+      }
+      const note = `Folded into workstream Design; its commits ship in the workstream PR ${workstreamPr ?? 'when it is opened'}.`;
+      assert.ok(close >= 0 && f.commands[close]!.includes(PR) && f.commands[close]!.includes(note), `${name}: the PR is closed with the note`);
+      assert.ok(remove > close, `${name}: the branch goes after the PR is closed`);
+      const row = store.get(PR_ID)!;
+      assert.equal(row.status, 'explicitly-abandoned', name);
+      assert.equal(row.disposition?.reason, note, name);
+      assert.equal(row.notification.desired, null, `${name}: nothing goes to the captain`);
+      assert.equal(f.job().note, undefined, name);
+    } finally { await f.host.harness.lifecycle.dispose(); }
+  }
+});
+
+test('an already closed PR of a folded task ends on its next read with no notice, only when the workstream branch holds every commit', async () => {
+  for (const [name, inWorkstream, headRefName] of [['all in', ['c1', 'c2'], 'task/one'], ['one commit outside', ['c2'], 'task/one'], ['the head is not the task branch', ['c1', 'c2'], 'workstream/ws-test']] as const) {
+    const f = await foldedTask();
+    try {
+      const store = createDeliveries(f.host.bb.storage.database());
+      store.register({ url: PR, taskId: 'crew1', projectId: 'cyndra', owner: 'cap', home: '', worker: 'thr_task', requirement: 'pr' });
+      store.observe(PR_ID, OPEN_READ, false);
+      const closed = store.observe(PR_ID, { ...OPEN_READ, state: 'closed' }, false);
+      // The captain already heard about the close once, as for PR 2581.
+      store.save({ ...closed, notification: { ...closed.notification, delivered: closed.notification.desired, queued: closed.notification.desired } });
+      f.gh.pr = { ...f.gh.pr, state: 'CLOSED', headRefName };
+      f.gh.inWorkstream = new Set(inWorkstream);
+      const sent: string[] = [];
+      f.host.harness.sdk.stub('threads.send', async (args: Row) => { sent.push(JSON.stringify(args)); return { delivery: 'queued' }; });
+      f.host.harness.sdk.stub('environments.list', async () => [{ id: 'env_main', hostId: 'h1', status: 'ready', isWorktree: false, path: '/repo/main' }]);
+      const terminals = new Map<string, string>();
+      f.host.harness.sdk.stub('terminals.create', async (args: { start: { command: string } }) => { const id = `term${terminals.size + 1}`; terminals.set(id, args.start.command); return { id }; });
+      f.host.harness.sdk.stub('terminals.get', async () => ({ status: 'running' }));
+      f.host.harness.sdk.stub('terminals.close', async () => ({}));
+      f.host.harness.sdk.stub('terminals.output', async ({ terminalId }: { terminalId: string }) => {
+        const command = terminals.get(terminalId) ?? '';
+        const stdout = command.includes('gh pr view') ? JSON.stringify({ state: 'CLOSED', headRefOid: 'c2', isDraft: false, statusCheckRollup: [], reviewDecision: '', reviews: [], mergeable: 'UNKNOWN', mergeCommit: null, title: 'Fix the dashboard', comments: [], labels: [], commits: [] }) : '';
+        const payload = command.includes('FM_HOST_CAPTURE_V1') ? JSON.stringify({ protocol: 'FM_HOST_CAPTURE_V1', exitCode: 0, stdout, stderr: '' }) : stdout;
+        return { nextSeq: 1, chunks: [{ dataBase64: Buffer.from(`${payload}\n__FM_HOST_RC:0\n`).toString('base64') }] };
+      });
+      const tool = f.host.harness.inspection.registrations.agentTools.find((t) => t.name === 'firstmate_deliveries')!;
+      await tool.execute({ action: 'reconcile', id: PR_ID }, { threadId: 'cap', projectId: 'cyndra' });
+      const row = store.get(PR_ID)!;
+      assert.deepEqual(sent.filter((m) => m.includes('FM_DELIVERY_NOTICE')), [], `${name}: no notice goes to the captain`);
+      assert.ok(!f.commands.some((c) => c.includes('gh pr close') || c.includes('gh pr comment')), `${name}: nothing is written on GitHub`);
+      if (name !== 'all in') {
+        assert.equal(row.status, 'closed-needs-disposition', name);
+        assert.equal(row.disposition, null, name);
+        continue;
+      }
+      assert.equal(row.status, 'explicitly-abandoned', name);
+      assert.equal(row.disposition?.reason, 'Folded into workstream Design; its commits ship in the workstream PR when it is opened.', name);
+      assert.equal(row.notification.desired, null, name);
     } finally { await f.host.harness.lifecycle.dispose(); }
   }
 });

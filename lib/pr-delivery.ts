@@ -356,6 +356,15 @@ export function createDeliveries(db: Database) {
     if (!reason.trim()) throw new Error('Abandonment requires a reason and explicit authority');
     return save({ ...r, status:'explicitly-abandoned', notification:{...r.notification,desired:null,attempted:null}, disposition:{ reason:reason.trim(), actor, at:Date.now() }, blocker:'',nextAction:'Explicitly abandoned',updatedAt:Date.now() });
   }
+  /** A workstream task's PR whose every commit the workstream branch holds: its work ships in the workstream PR,
+   * so it ends without an owner decision. The caller checked the commits. A merged PR, or one already
+   * decided, is kept as it is. */
+  function disposeFolded(id:string, reason:string, actor:string, now=Date.now()) {
+    const r=get(id); if (!r) throw new Error(`Unknown deliverable ${id}`);
+    if (terminal(r)) return r;
+    if (r.forgeState === 'merged' || r.mergeCommitSha) throw new Error(`${r.id} is merged; a fold does not dispose it`);
+    return save({ ...r, status:'explicitly-abandoned', notification:{...r.notification,desired:null,attempted:null}, disposition:{ reason, actor, at:now }, blocker:'',nextAction:reason,updatedAt:now });
+  }
   /** The captain checked the commits pushed after a hold and lifts it. */
   function clearHold(id:string, actor:string, reason:string) {
     const r=get(id); if (!r || r.owner !== actor) throw new Error('Only the owning manager can clear a hold');
@@ -474,7 +483,7 @@ export function createDeliveries(db: Database) {
     const rows=db.prepare("SELECT record FROM deliveries WHERE owner=? AND json_extract(record,'$.forgeState')='merged' AND json_extract(record,'$.updatedAt')>=? ORDER BY json_extract(record,'$.updatedAt') DESC,id LIMIT ?").all(owner,since,Math.max(1,Math.min(limit,100))) as {record:string}[];
     return rows.map(row=>JSON.parse(row.record) as DeliveryRecord);
   }
-  return { get,save,list,undecided,touch,needingDecision,markDecisionAsked,mergedSince,conflict,hasOwned,needsTask,awaitingVerification,taskRecord,ownedTaskRecord,register,observe,stale,assign,ownerLost,markOwnerNeeded,ownerRestored,transferOwner,accountFailure,abandon,clearHold,forTasks,verify,recordCheck,waive,markQueued,notify,pendingNotifications };
+  return { get,save,list,undecided,touch,needingDecision,markDecisionAsked,mergedSince,conflict,hasOwned,needsTask,awaitingVerification,taskRecord,ownedTaskRecord,register,observe,stale,assign,ownerLost,markOwnerNeeded,ownerRestored,transferOwner,accountFailure,abandon,disposeFolded,clearHold,forTasks,verify,recordCheck,waive,markQueued,notify,pendingNotifications };
 }
 
 const DO_NOT_MERGE = /\b(?:do not|don'?t|dont)[\s-]+merge\b|\bdo-not-merge\b/i;
