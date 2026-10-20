@@ -10,7 +10,7 @@ The owner works on big features in a workstream: one Telegram topic, one workstr
 ## Consequences
 
 - Fold conflicts are fixed by the crew that made the change, which updates from the workstream branch, retests and folds again.
-- A task that touches several repositories folds in all of them or in none.
+- A task has one BB-managed checkout, in the repository its dispatch names; BB cannot create a managed worktree for another repository. Its fold is saved before any Git change, so a restart completes or undoes it in every repository.
 - Folds wait while a Ship checks and merges, so Ship checks exactly what it merges.
 - A folded task's worktree is removed at once; only the workstream branch keeps its work.
 - Adopted workstreams, whose tasks have their own branches, keep the old behaviour.

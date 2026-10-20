@@ -3,6 +3,7 @@ export const FAILED_KEEP_MS = 7 * 24 * 60 * 60_000;
 export const LOOKUP_MAX_LINES = 15;
 export const FOLD_OK = "FOLD_OK";
 export const FOLD_CONFLICT = "FOLD_CONFLICT";
+export const FOLD_WAIT = "FOLD_WAIT";
 export const WORKSTREAM_CARD_METHOD = "workstreamCard";
 export const FOLD_CONFLICT_TELL =
   "Fold into the workstream branch hit a conflict. Update this worktree from the workstream branch, fix the conflict, retest, and report again. Do not create another worktree.";
@@ -60,7 +61,8 @@ export function foldTouchesDevFiles(paths: readonly string[]): boolean {
   });
 }
 
-export function jobToCardState(state: string, editing = true): CardTaskState {
+export function jobToCardState(state: string, editing = true, cleanup?: string): CardTaskState {
+  if (cleanup === "kept-unsaved") return "kept-unsaved";
   if (state === "waiting-memory") return "waiting-memory";
   if (state === "starting" || state === "running") return "working";
   if (state === "folding") return "folding";
@@ -73,9 +75,40 @@ export function jobToCardState(state: string, editing = true): CardTaskState {
 }
 
 export function compactTaskLine(task: { id: string; title: string; model: string; state: string }): string {
-  const title = task.title.trim().slice(0, 60) || "untitled";
-  const model = task.model.trim().slice(0, 40) || "default";
+  const title = oneLine(task.title, 60) || "untitled";
+  const model = oneLine(task.model, 40) || "default";
   return `${task.id} ${title} ${model} ${task.state}`;
+}
+
+/** The latest job of each owner task, in order; jobs without a task stay as they are. */
+export function currentJobs<T extends { taskId?: string }>(jobs: readonly T[]): T[] {
+  const latest = new Map<string, T>();
+  for (const job of jobs) if (job.taskId) latest.set(job.taskId, job);
+  return jobs.filter((job) => !job.taskId || latest.get(job.taskId) === job);
+}
+
+const SETTLED_THREAD = new Set(["idle", "error", "failed", "archived"]);
+
+export type ArchiveFacts = {
+  /** The crew threads this cleanup would archive. */
+  threads: ReadonlyArray<{ id: string; status: string; busy: boolean; archived: boolean; children: number; dependents: number }>;
+  /** The captain or other parent is in a turn. */
+  parentRunning: boolean;
+  /** Live threads in the same worktree that are not this task's own. */
+  others: readonly string[];
+  /** Other open tasks or workstream crews that still use this crew or its worktree. */
+  heldBy: readonly string[];
+};
+
+/** Why a task crew must stay; null when its threads may be archived. BB archive also archives children. */
+export function archiveKeepReason(facts: ArchiveFacts): string | null {
+  const live = facts.threads.filter((thread) => !thread.archived);
+  if (live.some((thread) => !SETTLED_THREAD.has(thread.status) || thread.busy)) return "a crew thread is still working";
+  if (facts.parentRunning) return "its captain is in a turn";
+  if (live.some((thread) => thread.children > 0 || thread.dependents > 0)) return "a crew thread has child threads";
+  if (facts.others.length > 0) return `its worktree is shared with ${facts.others.join(", ")}`;
+  if (facts.heldBy.length > 0) return `still used by ${facts.heldBy.join(", ")}`;
+  return null;
 }
 
 function oneLine(text: string, max: number): string {
@@ -103,13 +136,25 @@ export function formatWorkstreamLookup(input: {
   return lines.slice(0, LOOKUP_MAX_LINES).join("\n");
 }
 
-export function parseFoldOutput(output: string): { ok: boolean; conflict: boolean; files: string[] } {
+export type FoldOutput = { ok: boolean; conflict: boolean; files: string[]; wait?: string; head?: string };
+
+/** Reads the markers of lib/workstream-runtime.ts fold scripts. FOLD_WAIT is a safe stop, not a conflict. */
+export function parseFoldOutput(output: string): FoldOutput {
   const lines = output.split("\n").map((line) => line.trim()).filter(Boolean);
+  const wait = lines.find((line) => line === FOLD_WAIT || line.startsWith(`${FOLD_WAIT} `));
+  if (wait !== undefined) return { ok: false, conflict: false, files: [], wait: wait.slice(FOLD_WAIT.length).trim() || "the workstream worktree is busy" };
   const conflict = lines.includes(FOLD_CONFLICT);
   const ok = lines.includes(FOLD_OK) && !conflict;
   const marker = lines.findIndex((line) => line === FOLD_OK || line === FOLD_CONFLICT);
   const files = ok ? lines.slice(marker + 1) : [];
-  return { ok, conflict, files };
+  const head = /^FOLD_HEAD ([0-9a-f]{7,64})$/.exec(lines.find((line) => line.startsWith("FOLD_HEAD ")) ?? "")?.[1];
+  return { ok, conflict, files, ...(head ? { head } : {}) };
+}
+
+/** One `FOLD_<NAME> <value>` line of a fold script, or undefined. */
+export function foldValue(output: string, name: string): string | undefined {
+  const prefix = `FOLD_${name} `;
+  return output.split("\n").map((line) => line.trim()).find((line) => line.startsWith(prefix))?.slice(prefix.length).trim();
 }
 
 export type WorkstreamCardTask = {

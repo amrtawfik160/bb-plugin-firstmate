@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  archiveKeepReason,
   CARD_TASK_STATES,
   compactTaskLine,
+  currentJobs,
   crewOwnTestsPassed,
   FAILED_KEEP_MS,
   foldTouchesDevFiles,
@@ -103,4 +105,32 @@ test("the status card payload sends only T<n> task IDs of at most 24 characters"
     ],
   });
   assert.deepEqual(payload.tasks.map((task) => task.task), ["T2"]);
+});
+
+test("fold output separates a safe wait from a conflict, and reads the new head", () => {
+  assert.deepEqual(parseFoldOutput("FOLD_WAIT the workstream worktree has staged changes\n"), { ok: false, conflict: false, files: [], wait: "the workstream worktree has staged changes" });
+  assert.deepEqual(parseFoldOutput("FOLD_HEAD abc1234\nFOLD_OK\na.ts\n"), { ok: true, conflict: false, files: ["a.ts"], head: "abc1234" });
+});
+
+test("the card and view take the latest job of each task, and a kept worktree shows on the card", () => {
+  const jobs = [{ id: "a", taskId: "T1" }, { id: "b" }, { id: "c", taskId: "T1" }, { id: "d", taskId: "T2" }];
+  assert.deepEqual(currentJobs(jobs).map((job) => job.id), ["b", "c", "d"]);
+  assert.equal(jobToCardState("folded", true, "kept-unsaved"), "kept-unsaved");
+  assert.equal(jobToCardState("folded", true, "pending"), "folded");
+  assert.equal(compactTaskLine({ id: "T1", title: "Two\nlines", model: "m\n1", state: "working" }), "T1 Two lines m 1 working");
+});
+
+test("a crew is archived only when nothing still needs it", () => {
+  const idle = { id: "thr", status: "idle", busy: false, archived: false, children: 0, dependents: 0 };
+  const clear = { threads: [idle], parentRunning: false, others: [], heldBy: [] };
+  assert.equal(archiveKeepReason(clear), null);
+  assert.match(archiveKeepReason({ ...clear, threads: [{ ...idle, status: "active" }] })!, /still working/);
+  assert.match(archiveKeepReason({ ...clear, threads: [{ ...idle, status: "unknown" }] })!, /still working/);
+  assert.match(archiveKeepReason({ ...clear, threads: [{ ...idle, busy: true }] })!, /still working/);
+  assert.match(archiveKeepReason({ ...clear, parentRunning: true })!, /captain/);
+  assert.match(archiveKeepReason({ ...clear, threads: [{ ...idle, children: 1 }] })!, /child threads/);
+  assert.match(archiveKeepReason({ ...clear, threads: [{ ...idle, dependents: 1 }] })!, /child threads/);
+  assert.match(archiveKeepReason({ ...clear, others: ["thr_retry"] })!, /shared with thr_retry/);
+  assert.match(archiveKeepReason({ ...clear, heldBy: ["task T2"] })!, /still used by task T2/);
+  assert.equal(archiveKeepReason({ ...clear, threads: [{ ...idle, status: "active", archived: true }] }), null);
 });

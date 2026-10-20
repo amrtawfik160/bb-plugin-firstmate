@@ -450,7 +450,9 @@ test('cleanup never deletes unsaved work, archives a drop at once, and archives 
     assert.deepEqual(archived, ['drop']);
     f.time(100 + FAILED_KEEP_MS + 1);
     await f.store.reconcile();
-    assert.equal(f.store.get(w.id, 'cap').jobs.find((j) => j.id === 'keep')!.state, 'kept-unsaved');
+    const kept = f.store.get(w.id, 'cap').jobs.find((j) => j.id === 'keep')!;
+    assert.equal(kept.state, 'failed', 'the failed result stays; only its cleanup waits');
+    assert.equal(kept.cleanup, 'kept-unsaved');
     assert.equal(archived.includes('keep'), false);
     unsaved.set('keep', []);
     f.statuses.set('keep', 'error');
@@ -498,5 +500,241 @@ test('a follow-up of a folded task is a new crew linked to the old one', async (
     assert.equal(next.followUpOf, 'first');
     assert.equal(next.state, 'running');
     assert.ok(f.started.includes('second'));
+  } finally { f.db.close(); }
+});
+
+// Per-repository fold steps over fake Git: each repository has a head; merging moves it to `after`.
+function foldGit(repos: string[]) {
+  const heads = new Map(repos.map((r) => [r, `${r}-base`]));
+  const calls: string[] = [];
+  let mergeOutcome = (_repository: string): 'merged' | 'conflict' | 'wait' => 'merged';
+  let rollbackOk = true;
+  let crashAfterMerge = false;
+  const ops: NonNullable<WorkstreamDeps['foldOps']> = {
+    plan: async () => ({ steps: repos.map((repository) => ({ repository, hostId: 'h1', workstreamPath: `/ws/${repository}`, checkoutPath: `/task/${repository}`, before: heads.get(repository)!, target: `${repository}-task`, state: 'pending' as const })) }),
+    merge: async (_w, step) => {
+      calls.push(`merge ${step.repository}`);
+      const outcome = mergeOutcome(step.repository);
+      if (outcome === 'conflict') return { kind: 'conflict' };
+      if (outcome === 'wait') return { kind: 'wait', reason: 'the workstream worktree has local changes in files this fold changes' };
+      heads.set(step.repository, `${step.repository}-merged`);
+      if (crashAfterMerge) throw new Error('host connection lost');
+      return { kind: 'merged', after: `${step.repository}-merged`, files: [`${step.repository}.ts`] };
+    },
+    inspect: async (_w, step) => ({ head: heads.get(step.repository)!, hasTarget: heads.get(step.repository) === `${step.repository}-merged` }),
+    rollback: async (_w, step) => {
+      calls.push(`undo ${step.repository}`);
+      if (!rollbackOk) return false;
+      heads.set(step.repository, step.before);
+      return true;
+    },
+  };
+  return {
+    ops, heads, calls,
+    set: (knobs: { merge?: typeof mergeOutcome; rollbackOk?: boolean; crashAfterMerge?: boolean }) => {
+      if (knobs.merge) mergeOutcome = knobs.merge;
+      if (knobs.rollbackOk !== undefined) rollbackOk = knobs.rollbackOk;
+      if (knobs.crashAfterMerge !== undefined) crashAfterMerge = knobs.crashAfterMerge;
+    },
+  };
+}
+
+test('a fold that conflicts in its second repository undoes the first, then tells the same crew', async () => {
+  const f = fixture(); const git = foldGit(['one', 'two']); const told: string[] = [];
+  f.deps.report = async () => 'All tests passed.';
+  f.deps.foldOps = git.ops;
+  f.deps.tell = async (_w, job) => { told.push(job.id); };
+  try {
+    const w = await f.create();
+    await f.store.submit(w.id, 'cap', { id: 'crew', editing: true, payload: '{}' });
+    git.set({ merge: (r) => (r === 'two' ? 'conflict' : 'merged') });
+    f.statuses.set('crew', 'idle');
+    await f.store.reconcile();
+    assert.deepEqual(git.calls, ['merge one', 'merge two', 'undo one']);
+    assert.equal(git.heads.get('one'), 'one-base');
+    const job = f.store.get(w.id, 'cap').jobs[0]!;
+    assert.equal(job.state, 'running');
+    assert.equal(job.fold, undefined);
+    assert.deepEqual(told, ['crew']);
+  } finally { f.db.close(); }
+});
+
+test('an undo that must wait keeps the job folding and holds Ship, then finishes on a later pass', async () => {
+  const f = fixture(); const git = foldGit(['one', 'two']); const told: string[] = []; let ships = 0;
+  f.deps.report = async () => 'All tests passed.';
+  f.deps.foldOps = git.ops;
+  f.deps.tell = async (_w, job) => { told.push(job.id); };
+  f.deps.ship = async () => { ships++; };
+  try {
+    const w = await f.create();
+    await f.store.submit(w.id, 'cap', { id: 'crew', editing: true, payload: '{}' });
+    git.set({ merge: (r) => (r === 'two' ? 'conflict' : 'merged'), rollbackOk: false });
+    f.statuses.set('crew', 'idle');
+    await f.store.reconcile();
+    assert.equal(f.store.get(w.id, 'cap').jobs[0]!.state, 'folding');
+    assert.match(f.store.get(w.id, 'cap').jobs[0]!.note ?? '', /undo waits/);
+    assert.equal((await f.store.ship(w.id, 'cap', 'tap')).ship.state, 'queued');
+    assert.equal(ships, 0);
+    assert.deepEqual(told, [], 'the crew hears about the conflict only once the undo landed');
+    git.set({ rollbackOk: true });
+    await f.store.reconcile();
+    assert.equal(git.heads.get('one'), 'one-base');
+    assert.equal(f.store.get(w.id, 'cap').jobs[0]!.state, 'running');
+    assert.deepEqual(told, ['crew']);
+    assert.equal(f.store.get(w.id, 'cap').ship.state, 'complete');
+  } finally { f.db.close(); }
+});
+
+test('a restart finishes a fold that landed in every repository and undoes one that landed in some', async () => {
+  const f = fixture(); const git = foldGit(['one', 'two']); let restarts = 0;
+  f.deps.report = async () => '12 passed';
+  f.deps.foldOps = git.ops;
+  f.deps.restartDev = async () => { restarts++; };
+  try {
+    const w = await f.create();
+    await f.store.devLink(w.id, 'cap');
+    await f.store.submit(w.id, 'cap', { id: 'all', editing: true, payload: '{}' });
+    git.set({ crashAfterMerge: true });
+    f.statuses.set('all', 'idle');
+    await f.store.reconcile();
+    const saved = f.store.get(w.id, 'cap').jobs[0]!;
+    assert.equal(saved.state, 'folding');
+    assert.equal(saved.fold?.state, 'merging');
+    git.heads.set('two', 'two-merged');
+    git.set({ crashAfterMerge: false });
+    const reloaded = createWorkstreams(f.db, f.deps);
+    await reloaded.reconcile();
+    assert.equal(reloaded.get(w.id, 'cap').jobs[0]!.state, 'folded', 'both repositories hold the task commit');
+    assert.deepEqual(git.calls.filter((c) => c.startsWith('undo')), []);
+    assert.equal(restarts, 0, 'no package or settings file changed');
+
+    const g = fixture(); const partial = foldGit(['one', 'two']);
+    g.deps.report = async () => '12 passed';
+    g.deps.foldOps = partial.ops;
+    const v = await g.create();
+    await g.store.submit(v.id, 'cap', { id: 'some', editing: true, payload: '{}' });
+    partial.set({ crashAfterMerge: true });
+    g.statuses.set('some', 'idle');
+    await g.store.reconcile();
+    partial.set({ crashAfterMerge: false });
+    const again = createWorkstreams(g.db, g.deps);
+    partial.set({ merge: () => 'wait' });
+    await again.reconcile();
+    assert.equal(partial.heads.get('one'), 'one-base', 'the repository that merged is undone');
+    const job = again.get(v.id, 'cap').jobs[0]!;
+    assert.equal(job.state, 'finished');
+    assert.equal(job.fold, undefined);
+    g.db.close();
+  } finally { f.db.close(); }
+});
+
+test('a fold that must wait for the workstream worktree is retried and never reaches the crew', async () => {
+  const f = fixture(); const git = foldGit(['one']); const told: string[] = [];
+  f.deps.report = async () => 'All tests passed.';
+  f.deps.foldOps = git.ops;
+  f.deps.tell = async (_w, job) => { told.push(job.id); };
+  try {
+    const w = await f.create();
+    await f.store.submit(w.id, 'cap', { id: 'crew', editing: true, payload: '{}' });
+    git.set({ merge: () => 'wait' });
+    f.statuses.set('crew', 'idle');
+    await f.store.reconcile();
+    const waiting = f.store.get(w.id, 'cap').jobs[0]!;
+    assert.equal(waiting.state, 'finished');
+    assert.match(waiting.note ?? '', /^waiting: the workstream worktree has local changes/);
+    assert.deepEqual(told, []);
+    git.set({ merge: () => 'merged' });
+    await f.store.reconcile();
+    assert.equal(f.store.get(w.id, 'cap').jobs[0]!.state, 'folded');
+    const unplanned = fixture();
+    unplanned.deps.report = async () => 'All tests passed.';
+    unplanned.deps.foldOps = { ...git.ops, plan: async () => ({ wait: 'the task checkout is not recorded yet' }) };
+    const u = await unplanned.create();
+    await unplanned.store.submit(u.id, 'cap', { id: 'crew', editing: true, payload: '{}' });
+    unplanned.statuses.set('crew', 'idle');
+    await unplanned.store.reconcile();
+    assert.equal(unplanned.store.get(u.id, 'cap').jobs[0]!.note, 'waiting: the task checkout is not recorded yet');
+    unplanned.db.close();
+  } finally { f.db.close(); }
+});
+
+test('Ship takes only work folded when it starts; later folds go out with the next Ship', async () => {
+  const f = fixture(); const snapshots: string[][] = [];
+  f.deps.report = async () => 'All tests passed.';
+  f.deps.fold = async () => ({ ok: true, conflict: false, files: ['a.ts'] });
+  f.deps.ship = async (w) => { snapshots.push([...(w.ship.snapshot?.jobs ?? [])]); };
+  try {
+    const w = await f.create();
+    await f.store.submit(w.id, 'cap', { id: 'first', editing: true, payload: '{}', taskId: 'T1' });
+    await f.store.submit(w.id, 'cap', { id: 'second', editing: true, payload: '{}', taskId: 'T2' });
+    f.statuses.set('first', 'idle');
+    await f.store.ship(w.id, 'cap', 'one');
+    assert.deepEqual(snapshots, [['first']]);
+    assert.deepEqual(f.store.get(w.id, 'cap').ship.snapshot?.taskIds, ['T1']);
+    f.statuses.set('second', 'idle');
+    await f.store.reconcile();
+    await f.store.ship(w.id, 'cap', 'two');
+    assert.deepEqual(snapshots, [['first'], ['second']]);
+    assert.equal(f.store.get(w.id, 'cap').jobs.find((j) => j.id === 'first')!.shipped, 'one');
+  } finally { f.db.close(); }
+});
+
+test('a dropped task archives a started crew; a queued one has nothing to clean', async () => {
+  const f = fixture(); const archived: string[] = [];
+  let free = MEMORY_GUARD_BYTES - 1;
+  f.deps.memAvailable = async () => free;
+  f.deps.archive = async (_w, job) => { archived.push(job.id); };
+  const states = new Map([['T1', 'working'], ['T2', 'working']]);
+  f.deps.taskState = (id) => states.get(id);
+  try {
+    const w = await f.create();
+    free = MEMORY_GUARD_BYTES;
+    await f.store.submit(w.id, 'cap', { id: 'started', editing: true, payload: '{}', taskId: 'T1' });
+    free = MEMORY_GUARD_BYTES - 1;
+    await f.store.submit(w.id, 'cap', { id: 'queued', editing: true, payload: '{}', taskId: 'T2' });
+    states.set('T1', 'dropped'); states.set('T2', 'dropped');
+    await f.store.reconcile();
+    const jobs = f.store.get(w.id, 'cap').jobs;
+    assert.deepEqual(archived, ['started']);
+    assert.deepEqual(jobs.map((j) => [j.id, j.state, j.cleanup]), [['started', 'dropped', 'done'], ['queued', 'dropped', 'done']]);
+  } finally { f.db.close(); }
+});
+
+test('an archive that keeps the crew, or fails, leaves cleanup pending until a later pass succeeds', async () => {
+  const f = fixture();
+  let outcome: 'kept' | 'fail' | 'ok' = 'kept';
+  f.deps.report = async () => 'All tests passed.';
+  f.deps.fold = async () => ({ ok: true, conflict: false, files: ['a.ts'] });
+  f.deps.archive = async () => {
+    if (outcome === 'fail') throw new Error('archive refused');
+    if (outcome === 'kept') return { kept: 'its captain is in a turn' };
+  };
+  try {
+    const w = await f.create();
+    await f.store.submit(w.id, 'cap', { id: 'crew', editing: true, payload: '{}' });
+    f.statuses.set('crew', 'idle');
+    await f.store.reconcile();
+    assert.deepEqual([f.store.get(w.id, 'cap').jobs[0]!.cleanup, f.store.get(w.id, 'cap').jobs[0]!.note], ['pending', 'cleanup waits: its captain is in a turn']);
+    outcome = 'fail';
+    await f.store.reconcile();
+    assert.equal(f.store.get(w.id, 'cap').jobs[0]!.cleanup, 'pending');
+    await assert.rejects(f.store.end(w.id, 'cap'), /task cleanup/);
+    outcome = 'ok';
+    await f.store.reconcile();
+    assert.equal(f.store.get(w.id, 'cap').jobs[0]!.cleanup, 'done');
+  } finally { f.db.close(); }
+});
+
+test('compact view shows the latest job of each task once', async () => {
+  const f = fixture();
+  f.deps.report = async () => 'All tests passed.';
+  f.deps.fold = async () => ({ ok: true, conflict: false, files: ['a.ts'] });
+  try {
+    const w = await f.create();
+    await f.store.submit(w.id, 'cap', { id: 'first', editing: true, payload: '{}', taskId: 'T3', title: 'Restyle' });
+    f.statuses.set('first', 'idle');
+    await f.store.reconcile();
+    await f.store.submit(w.id, 'cap', { id: 'second', editing: true, payload: '{}', taskId: 'T3', title: 'Restyle', followUpOf: 'first' });
+    assert.deepEqual(f.store.view(w.id, 'cap').split('\n'), ['T3 Restyle default working']);
   } finally { f.db.close(); }
 });

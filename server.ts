@@ -120,10 +120,13 @@ import { addCorrection, CAPTAIN_FILE, CORRECTION_RULE, correctionBrief, fixCorre
 import { renderScorecard, type ScorecardData } from "./owner/scorecard.ts";
 import { createQualityEvents } from "./lib/quality-events.ts";
 import { rpcContract, workstreamListSchema, workstreamResultSchema, workstreamDevLinkSchema } from "./rpc.ts";
-import { createWorkstreams, WorkstreamWaiting, type Workstream, type WorkstreamRepo, type WorkstreamJob } from "./lib/workstreams.ts";
-import { provisionScript, takeMainScript, unshippedScript, devStartScript, devUnit, devActivityPath, foldScript, rollbackFoldScript, extraTaskWorktreeScript, deleteTaskBranchScript } from "./lib/workstream-runtime.ts";
+import { createWorkstreams, shipSnapshotOf, WorkstreamWaiting, type Workstream, type WorkstreamRepo, type WorkstreamJob, type FoldStep } from "./lib/workstreams.ts";
+import { provisionScript, takeMainScript, unshippedScript, devStartScript, devUnit, devActivityPath, foldScript, foldPlanScript, foldInspectScript, rollbackFoldScript, deleteTaskBranchScript } from "./lib/workstream-runtime.ts";
 import {
   WORKSTREAM_CARD_METHOD,
+  archiveKeepReason,
+  currentJobs,
+  foldValue,
   isAdoptedWorkstream,
   jobToCardState,
   memAvailableBytes,
@@ -2245,6 +2248,153 @@ export default async function plugin(bb: BbPluginApi) {
     }
     return false;
   }
+  // A task crew's checkout once BB has created its managed worktree. The workstream worktree itself never
+  // counts as a task checkout.
+  async function taskCheckout(w: Workstream, job: WorkstreamJob, threadId: string): Promise<Partial<WorkstreamJob> | null> {
+    const environmentId = await threadEnv(threadId);
+    if (!environmentId) return null;
+    const env = asRecord(await bb.sdk.environments.get({ environmentId }));
+    const path = typeof env["path"] === "string" ? env["path"] : "";
+    if (!path || w.repos.some((r) => r.path === path)) return null;
+    const repository = job.repository ?? w.repos[0]?.repository ?? "";
+    const hostId = typeof env["hostId"] === "string" ? env["hostId"] : w.repos.find((r) => r.repository === repository)?.hostId ?? "";
+    const branch = typeof env["branchName"] === "string" ? env["branchName"] : job.branch ?? "";
+    return { path, branch, environmentId, repos: [{ repository, path, branch, environmentId, hostId }] };
+  }
+  function jobCheckouts(job: WorkstreamJob): NonNullable<WorkstreamJob["repos"]> {
+    if (job.repos?.length) return job.repos;
+    return job.path ? [{ repository: job.repository ?? "", path: job.path, branch: job.branch ?? "", environmentId: job.environmentId ?? null }] : [];
+  }
+  function foldRepo(w: Workstream, step: FoldStep): WorkstreamRepo {
+    const repo = w.repos.find((r) => r.repository === step.repository && r.path === step.workstreamPath);
+    if (!repo) throw new Error(`Fold repository ${step.repository} left the workstream.`);
+    return { ...repo, hostId: step.hostId };
+  }
+  /** The crews one cleanup retires: the job, and the failed crews whose worktree a retry of it took over. */
+  function cleanupJobs(w: Workstream, job: WorkstreamJob): WorkstreamJob[] {
+    const own = [job];
+    for (let i = 0; i < own.length; i++) for (const other of w.jobs) if (other.supersededBy === own[i]!.id && !own.includes(other)) own.push(other);
+    return own;
+  }
+  async function threadArchived(threadId: string): Promise<boolean> {
+    return asRecord(await bb.sdk.threads.get({ threadId }))["archivedAt"] != null;
+  }
+  async function taskUnsaved(w: Workstream, jobs: WorkstreamJob[]): Promise<string[]> {
+    const findings = new Set<string>();
+    for (const job of jobs) {
+      for (const checkout of jobCheckouts(job)) {
+        if (w.repos.some((r) => r.path === checkout.path)) continue;
+        const host = { hostId: checkout.hostId || w.repos.find((r) => r.repository === checkout.repository)?.hostId || w.repos[0]?.hostId || "" };
+        const exists = await workstreamCommand(host, `if [ -d ${shQuote(checkout.path)} ]; then echo present; else echo absent; fi`);
+        // BB removes a managed worktree once its threads are archived; that is not lost work.
+        if (exists === "absent" && job.threadId && await threadArchived(job.threadId)) continue;
+        if (exists === "absent") { findings.add("worktree unreadable"); continue; }
+        for (const finding of unsavedWorkFindings(await workstreamCommand(host, `bash -c ${shQuote(UNSAVED_WORK_SCRIPT)} check ${shQuote(checkout.path)} ${shQuote(job.id)}`))) findings.add(finding);
+      }
+    }
+    return [...findings];
+  }
+  const threadRows = (listed: unknown): Record<string, unknown>[] => {
+    const rows = Array.isArray(listed) ? listed : asRecord(listed)["threads"];
+    return Array.isArray(rows) ? rows.map(asRecord) : [];
+  };
+  const liveRow = (row: Record<string, unknown>) => row["archivedAt"] == null;
+  const backgroundBusy = (row: Record<string, unknown>) => {
+    const activity = asRecord(row["activity"]);
+    return ["activeBackgroundAgentCount", "activeBackgroundCommandCount", "activeWorkflowCount"].some((key) => Number(activity[key] ?? 0) > 0);
+  };
+  // Live threads of a project, paged; null when there are more than this scan reads.
+  async function liveProjectThreads(projectId: string): Promise<Record<string, unknown>[] | null> {
+    const rows: Record<string, unknown>[] = [];
+    for (let page = 0; page < 25; page++) {
+      const batch = threadRows(await bb.sdk.threads.list({ projectId, includeHidden: true, limit: 200, offset: page * 200 }));
+      rows.push(...batch);
+      if (batch.length < 200) return rows;
+    }
+    return null;
+  }
+  // What an archive of these crews would touch, read fresh: their threads, children, lifecycle and
+  // source dependents, parent, the other threads in their worktrees, and open tasks that still hold them.
+  async function taskArchiveFacts(w: Workstream, own: WorkstreamJob[]): Promise<Parameters<typeof archiveKeepReason>[0] | { kept: string }> {
+    try {
+      const ownIds = new Set(own.map((j) => j.id));
+      const threadIds = own.flatMap((j) => (j.threadId ? [j.threadId] : []));
+      const threads: Array<{ id: string; status: string; busy: boolean; archived: boolean; children: number; dependents: number }> = [];
+      let parentRunning = false;
+      for (const id of threadIds) {
+        const row = asRecord(await bb.sdk.threads.get({ threadId: id }));
+        const archived = row["archivedAt"] != null;
+        const children = archived ? 0 : threadRows(await bb.sdk.threads.list({ parentThreadId: id, includeHidden: true })).filter(liveRow).length;
+        const sourced = archived ? 0 : threadRows(await bb.sdk.threads.list({ sourceThreadId: id, includeHidden: true })).filter(liveRow).length;
+        threads.push({ id, status: typeof row["status"] === "string" ? row["status"] : "unknown", busy: backgroundBusy(row), archived, children, dependents: sourced });
+        const parentId = typeof row["parentThreadId"] === "string" ? row["parentThreadId"] : w.threadId;
+        if (!archived) {
+          const parent = asRecord(await bb.sdk.threads.get({ threadId: parentId }));
+          // Only a turn counts: a captain may keep a background watcher running for hours.
+          if (parent["archivedAt"] == null && !["idle", "error", "failed"].includes(String(parent["status"]))) parentRunning = true;
+        }
+      }
+      if (threads.some((t) => !t.archived)) {
+        const rows = await liveProjectThreads(w.projectId);
+        if (!rows) return { kept: "too many project threads to check for lifecycle dependents" };
+        for (const thread of threads) thread.dependents += rows.filter((r) => liveRow(r) && r["lifecycleOwnerThreadId"] === thread.id).length;
+      }
+      const workstreamEnvs = new Set(w.repos.map((r) => r.environmentId).filter(Boolean));
+      const envIds = [...new Set(own.flatMap((j) => [j.environmentId, ...(j.repos ?? []).map((r) => r.environmentId)]))]
+        .filter((id): id is string => typeof id === "string" && id !== "" && !workstreamEnvs.has(id));
+      const others = new Set<string>();
+      for (const environmentId of envIds) {
+        for (const row of threadRows(await bb.sdk.threads.list({ environmentId, includeHidden: true }))) {
+          if (liveRow(row) && typeof row["id"] === "string" && !threadIds.includes(row["id"])) others.add(row["id"]);
+        }
+      }
+      const ownTasks = new Set(own.flatMap((j) => (j.taskId ? [j.taskId] : [])));
+      const heldBy: string[] = [];
+      for (const task of ownerTasks.list(w.threadId, { includeClosed: true })) {
+        if (!ownTasks.has(task.id) && isOpenTask(task) && own.some((j) => task.crewIds.includes(j.id))) heldBy.push(`task ${task.id}`);
+      }
+      for (const other of w.jobs) {
+        if (ownIds.has(other.id) || other.cleanup === "done" || (other.state === "dropped" && !other.threadId)) continue;
+        if (envIds.some((id) => id === other.environmentId || other.repos?.some((r) => r.environmentId === id))) heldBy.push(`crew ${other.id}`);
+      }
+      return { threads, parentRunning, others: [...others], heldBy };
+    } catch (error) {
+      return { kept: `its thread state is unreadable (${error instanceof Error ? error.message : String(error)})` };
+    }
+  }
+  // Both dispatch paths (firstmate_dispatch and `bb firstmate dispatch`) attach a workstream crew's owner
+  // task to its job, which sends the status card again, and continue a task the same way.
+  async function attachWorkstreamTask(workstreamId: string, captain: string, crewId: string): Promise<void> {
+    const task = ownerTasks.list(captain, { includeClosed: true }).find((t) => t.crewIds.includes(crewId));
+    if (!task) return;
+    await workstreams.attachTask(workstreamId, captain, task.id);
+    const job = workstreams.get(workstreamId, captain).jobs.find((j) => j.id === crewId);
+    if (job && job.taskId !== task.id) workstreams.noteJob(workstreamId, captain, crewId, { taskId: task.id });
+  }
+  /**
+   * A dispatch that continues a workstream task (taskRef). After a fold: a new crew from the latest
+   * workstream branch, briefed with the earlier task, its last report and the new instruction. After a
+   * failure: a retry in the old worktree, or from the retained task branch once that worktree is gone.
+   */
+  function workstreamContinuation(workstreamId: string, captain: string, taskRef: string | undefined, task: string): { task: string; followUpOf?: string; reuseEnvironmentId?: string; baseBranch?: string } {
+    if (!taskRef) return { task };
+    const prior = [...workstreams.get(workstreamId, captain).jobs].reverse().find((j) => j.taskId === taskRef);
+    if (!prior || !["folded", "failed", "kept-unsaved"].includes(prior.state)) return { task };
+    let brief = "";
+    try { const payload = asRecord(JSON.parse(prior.payload)); brief = typeof payload["task"] === "string" ? payload["task"] : ""; } catch { /* an unreadable payload has no brief */ }
+    const text = [
+      `Follow-up to task ${taskRef}, earlier crew ${prior.id}.`,
+      `Earlier task:\n${brief.trim() || "(none)"}`,
+      `Last report:\n${prior.report?.trim() || "(none)"}`,
+      `New instruction:\n${task}`,
+    ].join("\n\n");
+    if (prior.state === "folded") return { task: text, followUpOf: prior.id };
+    const worktreeKept = prior.cleanup !== "done" && !!prior.environmentId;
+    return {
+      task: text, followUpOf: prior.id,
+      ...(worktreeKept ? { reuseEnvironmentId: prior.environmentId! } : prior.branch ? { baseBranch: prior.branch } : {}),
+    };
+  }
   let workstreamCardMissing = false;
   const workstreams = createWorkstreams(bb.storage.database(), {
     now: Date.now,
@@ -2274,62 +2424,28 @@ export default async function plugin(bb: BbPluginApi) {
     start: async (w, job) => {
       const input = dispatchParams.parse(JSON.parse(job.payload));
       const original = z.object({projectId:z.string(),permissionMode:z.string().optional(),providerNamed:z.boolean().optional(),yolo:z.boolean().optional()}).parse(JSON.parse(job.payload));
-      const createdEditor = !isAdoptedWorkstream(w) && job.editing;
       const crew = await inCaptainHome(w.threadId, () => dispatchCrewUnqueued({
         ...input, task:input.task, crewId:job.id, projectId:original.projectId, parentThreadId:w.threadId, workstreamId:w.id,
         providerNamed:original.providerNamed, permissionMode:toPermissionMode(original.permissionMode), reasoningLevel:toReasoningLevel(input.reasoningLevel),
-        worktree: createdEditor, visible:input.visible !== false, shape:input.shape ?? "ship", mode:input.mode ?? "direct-PR", yolo:original.yolo,
-        reuseEnvironmentId: job.environmentId ?? undefined,
+        worktree: job.isolated === true, visible:input.visible !== false, shape:input.shape ?? "ship", mode:input.mode ?? "direct-PR", yolo:original.yolo,
+        reuseEnvironmentId: job.environmentId ?? undefined, baseBranch: job.baseBranch,
       }));
-      if (createdEditor) {
-        try {
-          const thread = await bb.sdk.threads.get({ threadId: crew.threadId });
-          if (thread.environmentId) {
-            const env = asRecord(await bb.sdk.environments.get({ environmentId: thread.environmentId }));
-            const path = typeof env["path"] === "string" ? env["path"] : "";
-            const branch = typeof env["branchName"] === "string" ? env["branchName"] : `task/${w.id}/${job.id}`;
-            if (path) {
-              job.path = path;
-              job.branch = branch;
-              job.environmentId = thread.environmentId;
-            }
-          }
-        } catch { /* checkout is recorded on the next status poll */ }
-        const checkouts: NonNullable<WorkstreamJob["repos"]> = [];
-        if (job.path) {
-          const primary = w.repos.find((r) => !input.workstreamRepo || r.repository.toLowerCase() === input.workstreamRepo.toLowerCase()) ?? w.repos[0];
-          if (primary) checkouts.push({ repository: primary.repository, path: job.path, branch: job.branch ?? `task/${w.id}/${job.id}`, environmentId: job.environmentId });
-        }
-        for (const repo of w.repos) {
-          if (checkouts.some((c) => c.repository === repo.repository)) continue;
-          const path = `${dirname(repo.path)}/.firstmate-task-crews/${w.id}/${job.id}/${basename(repo.path)}`;
-          const branch = `task/${w.id}/${job.id}/${basename(repo.repository)}`;
-          try {
-            await workstreamCommand(repo, `bash -c ${shQuote(extraTaskWorktreeScript(repo.path, path, branch, repo.branch))}`);
-            checkouts.push({ repository: repo.repository, path, branch, environmentId: null });
-          } catch (error) { bb.log.warn(`task worktree ${job.id} ${repo.repository}: ${String(error)}`); }
-        }
-        if (checkouts.length) job.repos = checkouts;
+      if (job.isolated) {
+        try { Object.assign(job, await taskCheckout(w, job, crew.threadId) ?? {}); }
+        catch { /* the checkout is recorded on a later pass; a fold waits for it */ }
       }
       if (crew.model) job.model = crew.model;
       return crew.threadId;
     },
+    checkout: async (w, job) => (job.threadId ? taskCheckout(w, job, job.threadId) : null),
     status: async (id) => {
       try {
         const thread = await bb.sdk.threads.get({threadId:id});
         const crew = (await readCrews()).find((c) => c.threadId === id);
         if (crew?.workstreamId && thread.environmentId) {
           const env = await bb.sdk.environments.get({environmentId:thread.environmentId});
-          if (env.path) {
-            workstreams.environment(crew.workstreamId,crew.parentThreadId ?? "",env.path,thread.environmentId);
-            try {
-              workstreams.noteJob(crew.workstreamId, crew.parentThreadId ?? "", crew.id, {
-                path: env.path,
-                environmentId: thread.environmentId,
-                ...(typeof (env as { branchName?: string }).branchName === "string" ? { branch: (env as { branchName: string }).branchName } : {}),
-              });
-            } catch { /* job checkout is optional until the crew row exists */ }
-          }
+          // Only an environment whose path is the workstream worktree becomes the workstream environment.
+          if (env.path) workstreams.environment(crew.workstreamId,crew.parentThreadId ?? "",env.path,thread.environmentId);
         }
         return thread.status;
       } catch { return "unknown"; }
@@ -2422,69 +2538,82 @@ export default async function plugin(bb: BbPluginApi) {
       } catch { /* report is optional until the crew writes it */ }
       return job.report ?? "";
     },
-    fold: async (w, job) => {
-      const checkouts = job.repos?.length
-        ? job.repos
-        : job.path
-          ? [{ repository: w.repos[0]?.repository ?? "", path: job.path, branch: job.branch ?? "" }]
-          : [];
-      if (checkouts.length === 0) return { ok: false, conflict: false, files: [] };
-      const done: WorkstreamRepo[] = [];
-      const files: string[] = [];
-      for (const checkout of checkouts) {
-        const wsRepo = w.repos.find((r) => r.repository === checkout.repository) ?? w.repos[0];
-        if (!wsRepo) return { ok: false, conflict: false, files: [] };
-        try {
-          const output = await workstreamCommand(wsRepo, `bash -c ${shQuote(foldScript(wsRepo.path, checkout.path, wsRepo.branch))}`);
-          const parsed = parseFoldOutput(output);
-          if (!parsed.ok) {
-            for (const repo of done) await workstreamCommand(repo, `bash -c ${shQuote(rollbackFoldScript(repo.path))}`).catch(() => {});
-            return parsed;
-          }
-          files.push(...parsed.files);
-          done.push(wsRepo);
-        } catch (error) {
-          for (const repo of done) await workstreamCommand(repo, `bash -c ${shQuote(rollbackFoldScript(repo.path))}`).catch(() => {});
-          return { ok: false, conflict: String(error).includes("FOLD_CONFLICT") || String(error).includes("exit code 2"), files: [] };
-        }
-      }
-      return { ok: true, conflict: false, files };
+    foldOps: {
+      plan: async (w, job) => {
+        const repository = job.repository ?? job.repos?.[0]?.repository ?? w.repos[0]?.repository;
+        const repo = w.repos.find((r) => r.repository === repository);
+        if (!repo) return { wait: `repository ${repository ?? "(none)"} is not in this workstream` };
+        // A task changes its one repository; its BB-managed checkout must be recorded before any fold.
+        const checkout = job.repos?.find((c) => c.repository === repo.repository);
+        if (!checkout?.path || !checkout.environmentId) return { wait: "the task checkout is not recorded yet" };
+        if (w.repos.some((r) => r.path === checkout.path)) return { wait: "the task checkout is the shared workstream worktree" };
+        const hostId = checkout.hostId || repo.hostId;
+        if (hostId !== repo.hostId) return { wait: "the task checkout is on another host than the workstream worktree" };
+        const output = await workstreamCommand(repo, `bash -c ${shQuote(foldPlanScript(repo.path, repo.branch, checkout.path))}`);
+        const wait = parseFoldOutput(output).wait;
+        if (wait) return { wait };
+        const before = foldValue(output, "BEFORE"), target = foldValue(output, "TARGET");
+        if (!before || !target) throw new Error("The fold plan returned no heads.");
+        return { steps: [{ repository: repo.repository, hostId, workstreamPath: repo.path, checkoutPath: checkout.path, before, target, state: "pending" }] };
+      },
+      merge: async (w, step) => {
+        const repo = foldRepo(w, step);
+        const parsed = parseFoldOutput(await workstreamCommand(repo, `bash -c ${shQuote(foldScript(step.workstreamPath, step.checkoutPath, repo.branch, step.target, step.before))}`));
+        if (parsed.wait) return { kind: "wait", reason: parsed.wait };
+        if (parsed.conflict) return { kind: "conflict" };
+        if (!parsed.ok || !parsed.head) throw new Error("The fold returned no result.");
+        return { kind: "merged", after: parsed.head, files: parsed.files };
+      },
+      inspect: async (w, step) => {
+        const output = await workstreamCommand(foldRepo(w, step), `bash -c ${shQuote(foldInspectScript(step.workstreamPath, step.target))}`);
+        const head = foldValue(output, "HEAD");
+        if (!head) throw new Error("The fold check returned no head.");
+        return { head, hasTarget: foldValue(output, "HAS_TARGET") === "yes" };
+      },
+      rollback: async (w, step) => {
+        const output = await workstreamCommand(foldRepo(w, step), `bash -c ${shQuote(rollbackFoldScript(step.workstreamPath, step.before, step.after ?? step.before))}`);
+        if (output.includes("FOLD_ROLLED_BACK")) return true;
+        if (output.includes("FOLD_ROLLBACK_BLOCKED")) return false;
+        throw new Error("The fold undo returned no result.");
+      },
     },
     tell: async (_w, job, message) => {
       const crew = (await readCrews()).find((c) => c.id === job.id);
       if (crew?.threadId) await tellCrew(crew, message, false);
     },
-    archive: async (w, job) => {
-      if (job.threadId) await bb.sdk.threads.archive({ threadId: job.threadId }).catch(() => {});
-      const envIds = [...new Set([job.environmentId, ...(job.repos ?? []).map((r) => r.environmentId)].filter((id): id is string => !!id))];
-      for (const environmentId of envIds) await bb.sdk.environments.archiveThreads({ environmentId }).catch(() => {});
-      for (const checkout of job.repos ?? []) {
-        if (!checkout.path || w.repos.some((r) => r.path === checkout.path)) continue;
-        const source = w.repos.find((r) => r.repository === checkout.repository)?.sourcePath ?? w.repos[0]?.sourcePath;
-        if (!source) continue;
-        await workstreamCommand(w.repos[0]!, `if [ -d ${shQuote(checkout.path)} ]; then git -C ${shQuote(source)} worktree remove --force ${shQuote(checkout.path)} || rm -rf -- ${shQuote(checkout.path)}; fi`).catch(() => {});
-      }
-    },
+    // Under the crew's lifecycle lock, so no Firstmate tell or retry starts it meanwhile. Every fact is read
+    // again after the slow Git check. BB's archive also archives children, so a crew with any is kept.
+    archive: async (w, job) => crewControl(job.id, async () => {
+      const own = () => {
+        const fresh = workstreams.get(w.id, w.threadId);
+        const current = fresh.jobs.find((j) => j.id === job.id);
+        return current ? { fresh, jobs: cleanupJobs(fresh, current) } : null;
+      };
+      const first = own();
+      if (!first) return { kept: "its workstream record changed" };
+      const before = await taskArchiveFacts(first.fresh, first.jobs);
+      if ("kept" in before) return before;
+      const reason = archiveKeepReason(before);
+      if (reason) return { kept: reason };
+      const findings = await taskUnsaved(first.fresh, first.jobs);
+      if (findings.length) return { kept: "unsaved work", findings };
+      const again = own();
+      if (!again) return { kept: "its workstream record changed" };
+      const after = await taskArchiveFacts(again.fresh, again.jobs);
+      if ("kept" in after) return after;
+      const late = archiveKeepReason(after);
+      if (late) return { kept: late };
+      for (const thread of after.threads) if (!thread.archived) await bb.sdk.threads.archive({ threadId: thread.id });
+    }),
     deleteBranch: async (w, job) => {
-      const branches = [...new Set([job.branch, ...(job.repos ?? []).map((r) => r.branch)].filter((branch): branch is string => !!branch))];
-      for (const repo of w.repos) {
-        for (const branch of branches) {
-          if (branch === repo.branch) continue;
-          await workstreamCommand(repo, `bash -c ${shQuote(deleteTaskBranchScript(repo.sourcePath, branch))}`).catch(() => {});
-        }
+      for (const checkout of jobCheckouts(job)) {
+        const repo = w.repos.find((r) => r.repository === checkout.repository);
+        if (!repo || !checkout.branch || checkout.branch === repo.branch) continue;
+        await workstreamCommand({ hostId: checkout.hostId || repo.hostId }, `bash -c ${shQuote(deleteTaskBranchScript(repo.sourcePath, checkout.branch))}`)
+          .catch((error) => bb.log.warn(`task branch ${checkout.branch}: ${String(error)}`));
       }
     },
-    unsavedJob: async (w, job) => {
-      const paths = [...new Set([job.path, ...(job.repos ?? []).map((r) => r.path)].filter((path): path is string => !!path))];
-      const findings: string[] = [];
-      const repo = w.repos[0];
-      if (!repo) return findings;
-      for (const path of paths) {
-        if (w.repos.some((r) => r.path === path)) continue;
-        findings.push(...unsavedWorkFindings(await workstreamCommand(repo, `bash -c ${shQuote(UNSAVED_WORK_SCRIPT)} check ${shQuote(path)} ${shQuote(job.id)}`)));
-      }
-      return findings;
-    },
+    unsavedJob: async (w, job) => taskUnsaved(w, cleanupJobs(w, job)),
     restartDev: async (w) => {
       const repo = w.repos[0];
       if (repo) await workstreamCommand(repo, `if [ "$(systemctl show -p LoadState --value ${shQuote(devUnit(w))})" != not-found ]; then systemctl stop ${shQuote(devUnit(w))}; fi`);
@@ -2510,13 +2639,13 @@ export default async function plugin(bb: BbPluginApi) {
       const payload = workstreamCardInput({
         workstreamId: w.id,
         revision: w.cardRevision ?? 0,
-        tasks: w.jobs.map((job) => {
+        tasks: currentJobs(w.jobs).map((job) => {
           const task = job.taskId ? ownerTasks.get(job.taskId) : undefined;
           return {
             task: job.taskId ?? job.id,
             title: task?.title ?? job.title ?? job.id,
             model: job.model ?? "default",
-            state: jobToCardState(job.state, job.editing),
+            state: jobToCardState(job.state, job.editing, job.cleanup),
             ...(job.note ? { note: job.note } : {}),
           };
         }),
@@ -2641,12 +2770,21 @@ export default async function plugin(bb: BbPluginApi) {
   async function shipWorkstream(w: Workstream): Promise<void> {
     if (isAdoptedWorkstream(w) && w.repos.length === 0) throw new Error("Adopted workstream has no repository.");
     if (w.repos.some((repo) => repo.existing && (!repo.taskId || !repo.crewId))) throw new Error("Ship needs the task and builder recorded on each adopted repository.");
+    // A created workstream ships the folded work saved when this Ship started; running tasks go out later.
+    const snapshot = isAdoptedWorkstream(w) ? undefined : shipSnapshotOf(w);
     for (const repo of w.repos) {
       const prefix = `cd -- ${shQuote(repo.path)} && `;
-      await workstreamCommand(repo, prefix + `[ -z "$(git status --porcelain --untracked-files=all)" ] && git push origin HEAD:${shQuote(repo.branch)}`);
+      let head: string;
+      if (snapshot) {
+        head = snapshot.heads[repo.repository] ?? await workstreamCommand(repo, prefix + 'git rev-parse HEAD');
+        snapshot.heads[repo.repository] = head;
+        await workstreamCommand(repo, prefix + `git push origin ${shQuote(`${head}:refs/heads/${repo.branch}`)}`);
+      } else {
+        await workstreamCommand(repo, prefix + `[ -z "$(git status --porcelain --untracked-files=all)" ] && git push origin HEAD:${shQuote(repo.branch)}`);
+        head = await workstreamCommand(repo,prefix + 'git rev-parse HEAD');
+      }
       const rows = z.array(z.object({url:z.string(),state:z.string(),headRefOid:z.string()})).parse(JSON.parse(await workstreamCommand(repo,
         prefix + `gh pr list --head ${shQuote(repo.branch)} --base main --state all --limit 100 --json url,state,headRefOid`)));
-      const head = await workstreamCommand(repo,prefix + 'git rev-parse HEAD');
       let pr = rows.find((r) => r.state === "OPEN");
       if (!pr) {
         await workstreamCommand(repo,prefix + 'git fetch origin main >/dev/null');
@@ -2662,22 +2800,19 @@ export default async function plugin(bb: BbPluginApi) {
         const url = await workstreamCommand(repo,prefix + `gh pr create --base main --head ${shQuote(repo.branch)} --title ${shQuote(w.name)} --body-file ${shQuote(bodyPath)}`);
         pr = {url,state:"OPEN",headRefOid:head};
       }
-      const attached = new Set(w.taskIds.flatMap((id) => ownerTasks.get(id)?.crewIds ?? []));
       const crews = await readCrews();
-      let builder = repo.crewId
-        ? crews.find((c) => c.id === repo.crewId && c.threadId)
-        : repo.existing
-          ? undefined
-          : crews.filter((c) => c.projectId === repo.projectId && (!c.workstreamRepo || c.workstreamRepo.toLowerCase() === repo.repository.toLowerCase()) && (c.workstreamId === w.id || attached.has(c.id)) && c.shape !== "scout" && c.role !== "checker" && c.role !== "lookup" && c.threadId).at(0);
-      if (!builder) {
-        if (isAdoptedWorkstream(w) || !w.jobs.some((j) => j.editing && j.state === "folded")) throw new Error("Ship needs a finished builder in each repository.");
-        const folded = w.jobs.filter((j) => j.editing && j.state === "folded").at(-1);
+      let builder: Crew | undefined;
+      if (repo.crewId) builder = crews.find((c) => c.id === repo.crewId && c.threadId);
+      else if (snapshot) {
+        // The builder is the latest folded crew of this repository in this Ship's snapshot.
+        const folded = snapshot.jobs.map((id) => w.jobs.find((j) => j.id === id)).filter((j) => j && (j.repository ?? j.repos?.[0]?.repository ?? w.repos[0]?.repository) === repo.repository).at(-1);
         builder = folded ? crews.find((c) => c.id === folded.id && c.threadId) : undefined;
-        if (!builder) throw new Error("Ship needs a finished builder in each repository.");
+        if (!builder) throw new Error(`Ship has no folded task in ${repo.repository}.`);
       }
+      if (!builder) throw new Error("Ship needs a finished builder in each repository.");
       await rememberPrUrl(builder,pr.url);
       await discoverCrewDelivery(builder);
-      for (const id of repo.taskId ? [repo.taskId] : repo.existing ? [] : w.taskIds) {
+      for (const id of repo.taskId ? [repo.taskId] : repo.existing ? [] : snapshot?.taskIds ?? w.taskIds) {
         const task = ownerTasks.get(id);
         if (task && task.state !== "live" && task.state !== "dropped") ownerTasks.linkPr(id,w.threadId,pr.url,Date.now());
       }
@@ -2705,12 +2840,13 @@ export default async function plugin(bb: BbPluginApi) {
     }
     await bb.storage.kv.delete(`${LIVE_PASS_AT_PREFIX}${w.threadId}`);
     await followThrough(w.threadId);
-    const pending = w.taskIds.map((id) => ownerTasks.get(id)).filter((t) => t && t.state !== "live" && t.state !== "dropped");
+    const shippedTasks = snapshot?.taskIds ?? w.taskIds;
+    const pending = shippedTasks.map((id) => ownerTasks.get(id)).filter((t) => t && t.state !== "live" && t.state !== "dropped");
     if (pending.length) {
       const rule = projectForName(await projectLabel(w.projectId));
       const crewId = `${w.id.slice(3)}-live-${w.ship.requestId?.replace(/[^a-zA-Z0-9._-]/g,"_").slice(0,30)}`;
       const known = (await readCrews()).find((c) => c.id === crewId);
-      if (!known) await dispatchCrewUnqueued({task:`Prepare the release of merged workstream ${w.id}. Request any missing publication approval from the captain before making it live. A merge approval alone does not authorize publication. Tasks: ${w.taskIds.join(", ")}. Follow this project path: ${rule?.live?.next ?? "ask the captain to name the project live path"}. Record live evidence with the existing Firstmate task and live-check tools. Do not merge other work or create a new worktree.`,crewId,projectId:w.projectId,parentThreadId:w.threadId,workstreamId:w.id,role:"builder",shape:"ship",mode:"direct-PR",worktree:false,visible:true});
+      if (!known) await dispatchCrewUnqueued({task:`Prepare the release of merged workstream ${w.id}. Request any missing publication approval from the captain before making it live. A merge approval alone does not authorize publication. Tasks: ${shippedTasks.join(", ")}. Follow this project path: ${rule?.live?.next ?? "ask the captain to name the project live path"}. Record live evidence with the existing Firstmate task and live-check tools. Do not merge other work or create a new worktree.`,crewId,projectId:w.projectId,parentThreadId:w.threadId,workstreamId:w.id,role:"builder",shape:"ship",mode:"direct-PR",worktree:false,visible:true});
       throw new WorkstreamWaiting(`Merged work awaits the project live check: ${rule?.live?.missing ?? rule?.live?.next ?? "live path missing"}`);
     }
   }
@@ -7223,10 +7359,15 @@ export default async function plugin(bb: BbPluginApi) {
     const id = input.crewId ?? randomUUID().slice(0, 8);
     if (workstreams.listAll().some((other) => other.id !== w.id && other.jobs.some((j) => j.id === id))) throw new Error("Crew identity already belongs to another workstream.");
     const { signal: _signal, ...payload } = input;
+    const repository = w.repos.find((r) => r.projectId === input.projectId && (!input.workstreamRepo || r.repository.toLowerCase() === input.workstreamRepo.toLowerCase()))?.repository;
     const job = await workstreams.submit(w.id, input.parentThreadId, { id,
       editing: input.shape !== "scout" && input.role !== "checker" && input.role !== "lookup", payload: JSON.stringify(payload),
       title: input.title, model: input.model, followUpOf: input.followUpOf,
-      ...(input.reuseEnvironmentId ? { environmentId: input.reuseEnvironmentId } : {}) });
+      ...(input.reuseEnvironmentId ? { environmentId: input.reuseEnvironmentId } : {}),
+      ...(input.baseBranch ? { baseBranch: input.baseBranch } : {}),
+      ...(repository ? { repository } : {}) });
+    // An async dispatch opens its owner task before the job exists; attach it now that it does.
+    await attachWorkstreamTask(w.id, input.parentThreadId, id);
     const crew = (await readCrews()).find((c) => c.id === id && c.workstreamId === w.id);
     return crew ?? { id, task: input.task, projectId: input.projectId, parentThreadId: input.parentThreadId,
       threadId: job.threadId ?? "", providerId: input.providerId ?? null, model: input.model ?? null, reasoningLevel: input.reasoningLevel ?? null,
@@ -7332,6 +7473,8 @@ export default async function plugin(bb: BbPluginApi) {
     role?: Crew["role"];
     signal?:AbortSignal;
     reuseEnvironmentId?: string;
+    /** A retry whose old worktree is gone starts a new worktree from the retained task branch. */
+    baseBranch?: string;
     followUpOf?: string;
   }): Promise<Crew> {
     const task = input.task.trim().slice(0, MAX_TASK);
@@ -7489,7 +7632,7 @@ export default async function plugin(bb: BbPluginApi) {
       environment = {
         type: "host",
         hostId,
-        workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: wsRepo.branch } },
+        workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: input.baseBranch ?? wsRepo.branch } },
       };
       crew.worktree = true;
     } else if (input.worktree && !input.workstreamId) {
@@ -7511,7 +7654,7 @@ export default async function plugin(bb: BbPluginApi) {
       projectId: input.projectId,
       environment,
       prompt: crewPrompt({
-        task: input.workstreamId ? `${task}\n\nWorkstream ${input.workstreamId}: create the report directory ${shQuote(reportDir)} before writing your durable report to ${shQuote(`${reportDir}/report.md`)}. Record that tests passed in that report. Keep this worktree and branch. Commit and push here. Do not create another worktree or switch branches. Firstmate folds this branch into the workstream branch when tests pass. Only the owner Ship action may merge the workstream branch to main. Load /pr before creating or updating a PR body. ${input.shape === "scout" || input.role === "checker" || input.role === "lookup" ? "Read-only repository: do not change repository files or Git state." : ""}` : task,
+        task: input.workstreamId ? `${task}\n\nWorkstream ${input.workstreamId}: create the report directory ${shQuote(reportDir)} before writing your durable report to ${shQuote(`${reportDir}/report.md`)}. Record that tests passed in that report.${createdEditor && wsRepo ? ` Repository ${wsRepo.repository}: this worktree, cut from ${input.reuseEnvironmentId ? "your earlier attempt" : input.baseBranch ?? wsRepo.branch}, is this task's only checkout; leave every other checkout alone.` : ""} Keep this worktree and branch. Commit and push here. Do not create another worktree or switch branches. Firstmate folds this branch into the workstream branch when tests pass. Only the owner Ship action may merge the workstream branch to main. Load /pr before creating or updating a PR body. ${input.shape === "scout" || input.role === "checker" || input.role === "lookup" ? "Read-only repository: do not change repository files or Git state." : ""}` : task,
         parentThreadId: input.parentThreadId,
         shape: input.shape,
         mode: input.mode,
@@ -7545,8 +7688,12 @@ export default async function plugin(bb: BbPluginApi) {
     await mutateCrews(crews => [crew, ...crews.filter(c => c.id !== crew.id)]);
     await publishFleet();
     if (input.workstreamId) {
-      const environmentId = await threadEnv(crew.threadId);
-      if (environmentId) workstreams.environment(input.workstreamId, input.parentThreadId!, selection.checkout, environmentId);
+      // Registered by its real path: a task crew's own worktree never becomes the workstream environment.
+      try {
+        const environmentId = await threadEnv(crew.threadId);
+        const path = environmentId ? asRecord(await bb.sdk.environments.get({ environmentId }))["path"] : undefined;
+        if (environmentId && typeof path === "string" && path) workstreams.environment(input.workstreamId, input.parentThreadId!, path, environmentId);
+      } catch (error) { bb.log.warn(`workstream environment ${crew.id}: ${String(error)}`); }
       await reconcileCrewTerminal(crew).catch(() => {});
       return crew;
     }
@@ -15344,7 +15491,7 @@ export default async function plugin(bb: BbPluginApi) {
     ticket: z.string().optional().describe("Program ticket this crew works: #n, owner/repo#n or the issue URL. The program marks it running"),
   });
 
-  const dispatchHelp='bb firstmate dispatch [options] -- "<task>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","sendAt","origin","taskRef","ticket"])+"\n  --task <text>  Repeat for bounded fan-out; --hidden hides the worker.\n  sendAt/--send-at is unsupported; native ship isolation is mandatory.";
+  const dispatchHelp='bb firstmate dispatch [options] -- "<task>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","sendAt","origin","taskRef","ticket"])+"\n  --task <text>  Repeat for bounded fan-out; --hidden hides the worker.\n  --task-ref T<n>  With --workstream-id: continue that task (a follow-up after its fold, a retry after a failure).\n  sendAt/--send-at is unsupported; native ship isolation is mandatory.";
   const queueHelp='bb firstmate queue add [options] -- "<title>"\n'+optionHelp(dispatchParams,{projectId:"project",providerId:"provider"},["task","taskId","overrideOwner","sendAt","title","permissionMode","sharedEnv","worktree","visible","ownerRequestedProvider","origin","taskRef","playbook","ticket","role"])+"\n  --detail <full-task>\n  --after <queue-id>  Repeat for dependencies, which remain dispatch gates.\n  --wait-until <ISO-time>  Eligibility only; explicit dispatch required.\n  dispatch preserves the queued shape, mode, contract, dependencies and identity; only provider/model/reasoning/permission/visibility/worktree options override at dispatch.\n  list | next | done <queue-id> | drop <queue-id> | prune | reconcile <exact-id> --project <id> [original options]"+"\nDispatch: bb firstmate queue dispatch <queue-id> [options]\n"+optionHelp(dispatchParams,{projectId:"project",providerId:"provider",visible:"hidden"},["task","taskId","overrideOwner","sendAt","title","shape","mode","deliveryRequirement","ownerRequestedProvider","origin","taskRef","playbook","ticket","role"]);
   const usage = [
     "Usage:",
@@ -15738,11 +15885,8 @@ export default async function plugin(bb: BbPluginApi) {
       const trackTask = async (crewId: string): Promise<string> => {
         const note = await trackOwnerTask(crewId);
         if (workstreamId && parentThreadId) {
-          const task = ownerTasks.list(parentThreadId, {includeClosed:true}).find((t) => t.crewIds.includes(crewId));
-          if (task) {
-            await workstreams.attachTask(workstreamId, parentThreadId, task.id);
-            try { workstreams.noteJob(workstreamId, parentThreadId, crewId, { taskId: task.id }); } catch { /* job may still be queued without a row */ }
-          }
+          try { await attachWorkstreamTask(workstreamId, parentThreadId, crewId); }
+          catch (error) { bb.log.warn(`workstream task ${crewId}: ${String(error)}`); }
         }
         return note + (parentThreadId === undefined || ticket === undefined ? "" : trackProgramTicket(parentThreadId, crewId, ticket));
       };
@@ -15777,21 +15921,9 @@ export default async function plugin(bb: BbPluginApi) {
         worktreeFlag: worktree === true,
         explicit: worktree,
       });
-      let followUpOf: string | undefined;
-      let reuseEnvironmentId: string | undefined;
-      if (workstreamId && parentThreadId) {
-        const stream = workstreams.get(workstreamId, parentThreadId);
-        const prior = taskRef
-          ? [...stream.jobs].reverse().find((j) => j.taskId === taskRef)
-          : undefined;
-        if (prior?.state === "folded" || prior?.state === "failed" || prior?.state === "kept-unsaved") {
-          followUpOf = prior.id;
-          if ((prior.state === "failed" || prior.state === "kept-unsaved") && prior.environmentId) reuseEnvironmentId = prior.environmentId;
-          if (prior.report && !task.includes("Previous report")) task = `${task}\n\nPrevious report:\n${prior.report}`;
-        }
-      }
+      const continued = workstreamId && parentThreadId ? workstreamContinuation(workstreamId, parentThreadId, taskRef, task) : { task };
       const spawnInput = {
-        task: task as string, crewId: taskId, workstreamId, workstreamRepo, followUpOf, reuseEnvironmentId,
+        ...continued, crewId: taskId, workstreamId, workstreamRepo,
         projectId: resolvedProject,
         parentThreadId,
         sourceRefs,
@@ -19065,6 +19197,15 @@ export default async function plugin(bb: BbPluginApi) {
             if (sendAt !== undefined) validateLaunchCapabilities({ transport: current.transport, shape, worktree: wt.worktree, sendAt });
             const ownerRequestedProvider = flags.has("owner-requested-provider");
             const modelPermission = flagStr(flags, "model-permission");
+            const taskRef = flagStr(flags, "task-ref");
+            if (taskRef !== undefined) {
+              const stream = flagStr(flags, "workstream-id");
+              if (!stream) return fail("--task-ref continues a workstream task; pass --workstream-id.");
+              if (tasks.length !== 1) return fail("--task-ref continues one task; pass one task.");
+              if (!ctxThread || ownerTasks.get(taskRef)?.captain !== ctxThread) return fail(`No owner task ${taskRef} for this captain.`);
+              const holding = workstreams.list(ctxThread, true).find((w) => w.taskIds.includes(taskRef));
+              if (holding && holding.id !== stream) return fail("Task belongs to another workstream; keep its workstreamId.");
+            }
 
             if (!flags.has("override-owner")) {
               for (const t of tasks) {
@@ -19103,9 +19244,10 @@ export default async function plugin(bb: BbPluginApi) {
                 }
               }
               const workstreamId = flagStr(flags,"workstream-id");
+              const continued = workstreamId && ctxThread ? workstreamContinuation(workstreamId, ctxThread, taskRef, task) : { task };
               const crew = await dispatchCrew({
                 workstreamId, workstreamRepo:flagStr(flags,"workstream-repo"),
-                task,
+                ...continued,
                 crewId:tasks.length === 1 ? flagStr(flags,"task-id") : undefined,
                 projectId,
                 parentThreadId: ctxThread,
@@ -19123,8 +19265,10 @@ export default async function plugin(bb: BbPluginApi) {
                 playbook, role, ownerRequestedProvider, modelPermission,
               });
               if (workstreamId && ctxThread) {
-                const tracked = ownerTasks.open({captain:ctxThread,project:await projectLabel(projectId),projectId,title:flagStr(flags,"title") ?? task.split("\n")[0]!.slice(0,120),sourceRefs:flagAll(flags,"source-ref"),crewId:crew.id,at:Date.now()});
-                await workstreams.attachTask(workstreamId,ctxThread,tracked.id);
+                const at = Date.now(), sourceRefs = flagAll(flags,"source-ref"), project = {id:projectId,label:await projectLabel(projectId)};
+                if (taskRef) ownerTasks.attach(taskRef,ctxThread,{crewId:crew.id,sourceRefs,project,at});
+                else ownerTasks.open({captain:ctxThread,project:project.label,projectId,title:flagStr(flags,"title") ?? task.split("\n")[0]!.slice(0,120),sourceRefs,crewId:crew.id,at});
+                await attachWorkstreamTask(workstreamId,ctxThread,crew.id);
               }
               dispatched.push({ ...crew, status: crew.threadId ? await crewStatus(crew) : "queued" });
             }

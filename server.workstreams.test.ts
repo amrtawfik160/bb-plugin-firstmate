@@ -237,3 +237,53 @@ test('CLI --task adopt, captain tool text, dispatch on an adopted stream keeps w
     await assert.rejects(host.harness.behavior.callRpc('workstreams.end', { threadId: 'cap', workstreamId: busy.workstream.id }), /active crews/);
   } finally { await host.harness.lifecycle.dispose(); }
 });
+
+test('fake BB: a failed task retries in its kept worktree, or from its retained branch once that worktree is gone, from both dispatch paths', async () => {
+  const { createWorkstreams } = await import('./lib/workstreams.ts');
+  const host = createFakePluginHost({ pluginId:'firstmate', agentSkillIds:manifestSkillIds(new URL('.',import.meta.url).pathname) });
+  const seeded = createWorkstreams(host.bb.storage.database(), {
+    now:()=>0, provision:async () => [{repository:'cyndra-ai/cyndra-saas',projectId:'cyndra',hostId:'h1',path:'/repo/ws',sourcePath:'/repo/main',branch:'workstream/ws-test',environmentId:null}],
+    start:async () => 'unused',status:async () => 'unknown',startDev:async () => '',stopDev:async () => {},unsaved:async () => [],remove:async () => {},ship:async () => {},taskState:()=> 'working',
+  });
+  const w = await seeded.create({threadId:'cap',projectId:'cyndra',name:'Design',requestId:'create'});
+  await plugin(host.bb); stubProviderCatalog(host);
+  await host.harness.behavior.setSettings({transport:'real',signInCheck:false,fmHome:'',maxActiveCrews:0});
+  await host.bb.storage.kv.set('captain-project:cap','cyndra');
+  const spawned: Array<Record<string,unknown>> = [];
+  host.harness.sdk.stub('threads.getPluginMetadata',async ({threadId}:{threadId:string}) => threadId === 'cap' ? {captain:'true'} : {});
+  host.harness.sdk.stub('threads.get',async ({threadId}:{threadId:string}) => ({...makeThreadResponse({id:threadId,projectId:'cyndra',status:'active'}),environmentId:threadId === 'cap' ? 'env_main' : `env_${threadId}`}));
+  host.harness.sdk.stub('threads.list',async () => []);
+  host.harness.sdk.stub('projects.get',async () => ({id:'cyndra',name:'Cyndra SaaS',kind:'repo',sources:[{hostId:'h1',path:'/repo/main',isDefault:true}]}));
+  host.harness.sdk.stub('projects.list',async () => [{id:'cyndra',name:'Cyndra SaaS'}]);
+  host.harness.sdk.stub('environments.list',async () => [{id:'env_main',hostId:'h1',path:'/repo/main',status:'ready',isWorktree:false}]);
+  host.harness.sdk.stub('environments.get',async ({environmentId}:{environmentId:string}) => ({id:environmentId,hostId:'h1',path:environmentId.startsWith('env_worker') ? `/repo/${environmentId}` : '/repo/main',branchName:environmentId.startsWith('env_worker') ? `task/${environmentId}` : undefined,status:'ready',isWorktree:environmentId.startsWith('env_worker')}));
+  host.harness.sdk.stub('threads.spawn',async (args:Record<string,unknown>) => { spawned.push(args); return {id:`worker${spawned.length}`}; });
+  host.harness.sdk.stub('threads.defaultExecutionOptions',async () => ({model:'gpt-6.1-sol',reasoningLevel:'high'}));
+  host.harness.sdk.stub('threads.send',async () => ({}));
+  host.harness.sdk.stub('threadSections.list',async () => []);
+  host.harness.sdk.stub('threadSections.create',async () => ({id:'sec'}));
+  host.harness.sdk.stub('plugins.callRpc',async () => ({ok:true,queued:1,duplicate:false}));
+  const dispatch = host.harness.inspection.registrations.agentTools.find((t) => t.name === 'firstmate_dispatch')!;
+  const ctx = {threadId:'cap',projectId:'cyndra'} as never;
+  try {
+    await dispatch.execute({task:'First edit',taskId:'editor-one',workstreamId:w.id,origin:{kind:'captain',reason:'approved workstream'},providerId:'codex',model:'gpt-6.1-sol'},ctx);
+    const first = seeded.get(w.id,'cap').jobs.find((j) => j.id === 'editor-one')!;
+    assert.deepEqual([first.taskId,first.environmentId,first.branch,first.repos?.[0]?.hostId],['T1','env_worker1','task/env_worker1','h1'],'the task records its own BB-managed checkout');
+    seeded.noteJob(w.id,'cap','editor-one',{state:'failed',failedAt:0});
+    await dispatch.execute({task:'Try again',taskId:'editor-retry',taskRef:'T1',workstreamId:w.id,providerId:'codex',model:'gpt-6.1-sol'},ctx);
+    assert.deepEqual(spawned[1]!.environment,{type:'reuse',environmentId:'env_worker1'},'a retry continues in the kept worktree');
+    assert.match(String(spawned[1]!.prompt),/First edit[\s\S]*Try again/);
+    assert.equal(seeded.get(w.id,'cap').jobs.find((j) => j.id === 'editor-one')!.supersededBy,'editor-retry');
+    seeded.noteJob(w.id,'cap','editor-retry',{state:'failed',failedAt:0,cleanup:'done'});
+    const cli = await host.harness.behavior.runCli(['dispatch','--task-id','editor-third','--workstream-id',w.id,'--task-ref','T1','--provider','codex','--model','gpt-6.1-sol','--','Third try'],ctx);
+    assert.equal(cli.exitCode,0,cli.stderr);
+    assert.deepEqual(spawned[2]!.environment,{type:'host',hostId:'h1',workspace:{type:'managed-worktree',baseBranch:{kind:'named',name:'task/env_worker2'}}},'once the worktree is gone, a retry starts from the retained branch');
+    const third = seeded.get(w.id,'cap').jobs.find((j) => j.id === 'editor-third')!;
+    assert.equal(third.taskId,'T1','the CLI joins the task it continues');
+    assert.equal(third.followUpOf,'editor-retry');
+    assert.deepEqual(seeded.get(w.id,'cap').taskIds,['T1']);
+    const refused = await host.harness.behavior.runCli(['dispatch','--task-ref','T1','--','No workstream'],ctx);
+    assert.equal(refused.exitCode,1);
+    assert.match(refused.stderr,/--workstream-id/);
+  } finally { await host.harness.lifecycle.dispose(); }
+});

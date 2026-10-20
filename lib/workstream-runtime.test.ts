@@ -4,13 +4,14 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync, existsSync, mkdirSync, readFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { provisionScript, takeMainScript, devStartScript, devUnit, devAppCommand, unshippedScript, foldScript, rollbackFoldScript, extraTaskWorktreeScript, deleteTaskBranchScript } from './workstream-runtime.ts';
-import { parseFoldOutput } from './workstream-fold.ts';
+import { provisionScript, takeMainScript, devStartScript, devUnit, devAppCommand, unshippedScript, foldScript, foldPlanScript, foldInspectScript, rollbackFoldScript, deleteTaskBranchScript } from './workstream-runtime.ts';
+import { foldValue, parseFoldOutput } from './workstream-fold.ts';
 import { UNSAVED_WORK_SCRIPT, unsavedWorkFindings } from './finished-crew-retire.ts';
 import type { Workstream } from './workstreams.ts';
 
 const git = (dir:string,...args:string[]) => execFileSync('git',['-C',dir,...args],{encoding:'utf8',stdio:['ignore','pipe','pipe']}).trim();
 const commit = (dir:string) => { git(dir,'add','-A'); git(dir,'-c','user.name=fixture','-c','user.email=fixture@test','commit','-qm','work'); };
+const taskWorktree = (ws:string, path:string, branch:string) => git(ws,'worktree','add','-q','-b',branch,path,'HEAD');
 
 test('real Git: repeat creation preserves work, each Ship takes main, unsaved work refuses cleanup', () => {
   const dir = mkdtempSync(join(tmpdir(),'fm-workstream-'));
@@ -107,7 +108,7 @@ test('real Git: fold merges a crew worktree into the workstream branch and names
     git(source, 'remote', 'add', 'origin', remote); git(source, 'push', '-u', 'origin', 'main');
     const branch = 'workstream/ws-fold';
     execFileSync('bash', ['-c', provisionScript(source, ws, branch)], { stdio: 'pipe' });
-    execFileSync('bash', ['-c', extraTaskWorktreeScript(ws, crew, 'task/ws-fold/one', branch)], { stdio: 'pipe' });
+    taskWorktree(ws, crew, 'task/ws-fold/one');
     writeFileSync(join(crew, 'feature.txt'), 'from crew'); commit(crew);
     const output = execFileSync('bash', ['-c', foldScript(ws, crew, branch)], { encoding: 'utf8' });
     const parsed = parseFoldOutput(output);
@@ -132,11 +133,13 @@ test('real Git: a fold conflict leaves the workstream branch unchanged so the sa
     git(source, 'remote', 'add', 'origin', remote); git(source, 'push', '-u', 'origin', 'main');
     const branch = 'workstream/ws-conflict';
     execFileSync('bash', ['-c', provisionScript(source, ws, branch)], { stdio: 'pipe' });
-    execFileSync('bash', ['-c', extraTaskWorktreeScript(ws, crew, 'task/ws-conflict/one', branch)], { stdio: 'pipe' });
+    taskWorktree(ws, crew, 'task/ws-conflict/one');
     writeFileSync(join(ws, 'clash.txt'), 'workstream'); commit(ws);
     writeFileSync(join(crew, 'clash.txt'), 'crew'); commit(crew);
     const before = git(ws, 'rev-parse', 'HEAD');
-    assert.throws(() => execFileSync('bash', ['-c', foldScript(ws, crew, branch)], { stdio: 'pipe' }));
+    const parsed = parseFoldOutput(execFileSync('bash', ['-c', foldScript(ws, crew, branch)], { encoding: 'utf8' }));
+    assert.equal(parsed.conflict, true);
+    assert.equal(parsed.ok, false);
     assert.equal(git(ws, 'rev-parse', 'HEAD'), before);
     assert.equal(readFileSync(join(ws, 'clash.txt'), 'utf8'), 'workstream');
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -154,7 +157,7 @@ test('real Git: a partial multi-repo fold rolls back the first repo when the sec
       git(source, 'remote', 'add', 'origin', remote); git(source, 'push', '-u', 'origin', 'main');
       const branch = `workstream/${name}`;
       execFileSync('bash', ['-c', provisionScript(source, ws, branch)], { stdio: 'pipe' });
-      execFileSync('bash', ['-c', extraTaskWorktreeScript(ws, crew, `task/${name}/one`, branch)], { stdio: 'pipe' });
+      taskWorktree(ws, crew, `task/${name}/one`);
       return { ws, crew, branch };
     };
     const first = make('one');
@@ -165,7 +168,7 @@ test('real Git: a partial multi-repo fold rolls back the first repo when the sec
     const firstBefore = git(first.ws, 'rev-parse', 'HEAD');
     execFileSync('bash', ['-c', foldScript(first.ws, first.crew, first.branch)], { stdio: 'pipe' });
     assert.equal(existsSync(join(first.ws, 'ok.txt')), true);
-    assert.throws(() => execFileSync('bash', ['-c', foldScript(second.ws, second.crew, second.branch)], { stdio: 'pipe' }));
+    assert.equal(parseFoldOutput(execFileSync('bash', ['-c', foldScript(second.ws, second.crew, second.branch)], { encoding: 'utf8' })).conflict, true);
     execFileSync('bash', ['-c', rollbackFoldScript(first.ws)], { stdio: 'pipe' });
     assert.equal(git(first.ws, 'rev-parse', 'HEAD'), firstBefore);
     assert.equal(existsSync(join(first.ws, 'ok.txt')), false);
@@ -197,4 +200,41 @@ test('squash-merged work is not shipped again or counted in the next unshipped a
       assert.equal(unshipped(),'','a repeated Ship must not open an empty PR');
     }
   } finally { rmSync(dir,{recursive:true,force:true}); }
+});
+
+test('real Git: a fold waits for a local change it would overwrite, and an undo waits for a local change in a folded file', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fm-fold-wait-'));
+  try {
+    const source = join(dir, 'source'), ws = join(dir, 'ws'), crew = join(dir, 'crew');
+    execFileSync('git', ['init', '-qb', 'main', source]);
+    git(source, 'config', 'user.name', 'fixture'); git(source, 'config', 'user.email', 'fixture@test');
+    writeFileSync(join(source, 'app.ts'), 'base'); commit(source);
+    git(source, 'worktree', 'add', '-q', '-b', 'workstream/ws-wait', ws);
+    taskWorktree(ws, crew, 'task/ws-wait/one');
+    writeFileSync(join(crew, 'app.ts'), 'crew'); commit(crew);
+    const run = (script: string) => execFileSync('bash', ['-c', script], { encoding: 'utf8' });
+    const plan = run(foldPlanScript(ws, 'workstream/ws-wait', crew));
+    const before = foldValue(plan, 'BEFORE')!, target = foldValue(plan, 'TARGET')!;
+    assert.equal(target, git(crew, 'rev-parse', 'HEAD'));
+    writeFileSync(join(ws, 'app.ts'), 'dev server write');
+    const waited = parseFoldOutput(run(foldScript(ws, crew, 'workstream/ws-wait', target, before)));
+    assert.match(waited.wait ?? '', /local changes/);
+    assert.equal(git(ws, 'rev-parse', 'HEAD'), before);
+    assert.equal(readFileSync(join(ws, 'app.ts'), 'utf8'), 'dev server write', 'the local change is kept');
+    git(ws, 'checkout', '--', 'app.ts');
+    assert.match(parseFoldOutput(run(foldScript(ws, crew, 'workstream/ws-wait', target, 'f'.repeat(40)))).wait ?? '', /moved/);
+    const folded = parseFoldOutput(run(foldScript(ws, crew, 'workstream/ws-wait', target, before)));
+    assert.equal(folded.ok, true);
+    const after = folded.head!;
+    assert.equal(foldValue(run(foldInspectScript(ws, target)), 'HAS_TARGET'), 'yes');
+    writeFileSync(join(ws, 'app.ts'), 'dev server write after the fold');
+    assert.match(run(rollbackFoldScript(ws, before, after)), /FOLD_ROLLBACK_BLOCKED/);
+    assert.equal(git(ws, 'rev-parse', 'HEAD'), after);
+    assert.equal(readFileSync(join(ws, 'app.ts'), 'utf8'), 'dev server write after the fold');
+    git(ws, 'checkout', '--', 'app.ts');
+    assert.match(run(rollbackFoldScript(ws, before, after)), /FOLD_ROLLED_BACK/);
+    assert.equal(git(ws, 'rev-parse', 'HEAD'), before);
+    assert.equal(foldValue(run(foldInspectScript(ws, target)), 'HAS_TARGET'), 'no');
+    assert.match(run(rollbackFoldScript(ws, before, after)), /FOLD_ROLLED_BACK/, 'a repeated undo is a no-op');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
