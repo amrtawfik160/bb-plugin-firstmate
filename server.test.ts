@@ -764,12 +764,13 @@ test("a gh read in a terminal returns only gh's JSON and keeps gh's exit code (C
     await host.harness.behavior.runCli(["deck"], { threadId: "thr_cap", projectId: "proj_1" });
     const created = host.harness.sdk.callsTo("terminals.create")[0]?.[0] as { start: { command: string } } | undefined;
     assert.ok(created, "deck ran a host command");
-    // Like gh: a progress line on stderr only when stdout is a terminal, then the JSON on stdout.
+    // Like the host's gh (its wrapper sets GH_FORCE_TTY): a progress line whenever stderr is a terminal, the JSON
+    // on stdout, and on failure an error on stderr.
     const gh = join(dir, "gh");
-    writeFileSync(gh, `#!/bin/sh\n[ -t 1 ] && echo Working... >&2\necho '{"state":"CLOSED"}'\nexit "\${GH_STUB_EXIT:-0}"\n`, { mode: 0o755 });
+    writeFileSync(gh, `#!/bin/sh\n[ -t 2 ] && echo Working... >&2\n[ "\${GH_STUB_EXIT:-0}" = 0 ] || { echo "GraphQL: no such PR" >&2; exit "$GH_STUB_EXIT"; }\necho '{"state":"CLOSED"}'\n`, { mode: 0o755 });
     const read = (exit: string) => {
       const envelope = created.start.command
-        .replace(/^__fm_cmd='[\s\S]*?'; set \+e; /, `__fm_cmd='${ghReadCommand(`${gh} pr view 2581 --json state`).replace(/'/g, "'\\''")}'; set +e; `)
+        .replace(/^__fm_cmd='[\s\S]*?'; set \+e; /, () => `__fm_cmd='${ghReadCommand(`${gh} pr view 2581 --json state`).replace(/'/g, "'\\''")}'; set +e; `)
         .replace(/; sleep \d+$/, "");
       const run = spawnSync("script", ["-qec", envelope, "/dev/null"], { encoding: "utf8", timeout: 8000, env: { ...process.env, SHELL: "/bin/bash", TERM: "xterm", GH_STUB_EXIT: exit } });
       assert.equal(run.error, undefined);
@@ -779,7 +780,9 @@ test("a gh read in a terminal returns only gh's JSON and keeps gh's exit code (C
     const ok = read("0");
     assert.equal(ok.rc, 0);
     assert.deepEqual(JSON.parse(ok.output), { state: "CLOSED" }, "no progress line in the parsed output");
-    assert.equal(read("1").rc, 1, "gh's failure is not hidden by the pipe");
+    const failed = read("1");
+    assert.equal(failed.rc, 1, "gh's failure is not hidden by the pipe");
+    assert.match(failed.output, /GraphQL: no such PR/, "gh's error is shown when it fails");
   } finally {
     rmSync(dir, { recursive: true, force: true });
     await host.harness.lifecycle.dispose();

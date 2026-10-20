@@ -563,11 +563,12 @@ function wrapHostCommand(command: string): string {
   return script;
 }
 
-// A gh call whose output Firstmate reads. On the host terminal gh draws a "Working..." progress line, and the PTY
-// mixes it into the output (Cyndra PR 2581's fold check failed "Unexpected token 'W'" on every read, 2026-10-20).
-// gh draws it only when stdout is a terminal, so stdout goes through a pipe; pipefail keeps gh's exit code.
+// A gh call whose output Firstmate reads. On the host terminal gh writes a "Working..." progress line to stderr,
+// and the PTY mixes it into the output (Cyndra PR 2581's fold check failed "Unexpected token 'W'" on every read,
+// 2026-10-20). The host's gh wrapper sets GH_FORCE_TTY, so a pipe alone does not stop it: stderr is held in a
+// file and shown only when gh fails, stdout goes through a pipe, and pipefail keeps gh's exit code.
 export function ghReadCommand(command: string): string {
-  return `bash -o pipefail -c ${shQuote(`${command} | cat`)}`;
+  return `bash -o pipefail -c ${shQuote(`e=$(mktemp) || exit 1; { ${command}; } 2>"$e" | cat; rc=$?; [ "$rc" -eq 0 ] || cat "$e" >&2; rm -f "$e"; exit "$rc"`)}`;
 }
 
 /** fetch for the read-only live checks. The test run sets FM_NO_LIVE_NETWORK=1, so no test reaches Expo or Coolify. */
@@ -3297,7 +3298,7 @@ export default async function plugin(bb: BbPluginApi) {
         head = await workstreamCommand(repo,prefix + 'git rev-parse HEAD');
       }
       const rows = z.array(z.object({url:z.string(),state:z.string(),headRefOid:z.string()})).parse(JSON.parse(await workstreamCommand(repo,
-        prefix + `gh pr list --head ${shQuote(repo.branch)} --base ${shQuote(base)} --state all --limit 100 --json url,state,headRefOid`)));
+        ghReadCommand(prefix + `gh pr list --head ${shQuote(repo.branch)} --base ${shQuote(base)} --state all --limit 100 --json url,state,headRefOid`))));
       let pr = rows.find((r) => r.state === "OPEN");
       if (!pr) {
         await workstreamCommand(repo,prefix + `git fetch origin ${shQuote(base)} >/dev/null`);
