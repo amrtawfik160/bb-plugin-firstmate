@@ -71,7 +71,7 @@ import { boundedCaptainStartup, captainBindingText } from "./lib/captain-startup
 import { createQueueStore, startOrder, type QueueItem } from "./lib/queue-store.ts";
 import { admissionDecision, createDispatchJobs, dispatchJobLine, spawnBackoffMs } from "./lib/async-dispatch.ts";
 import { createWatchdogStore, observeIdleTurn, tripWatchdog, watchdogNoticeText, watchdogTrip } from "./lib/crew-watchdog.ts";
-import { captainResumeDelay, FAILOVER_WINDOW_MS, failoverTarget, planLimitError, planLimitNotice, PROVIDER_UNAVAILABLE_KEY, providerExhausted, unavailableProviderLines, unavailableUntil, utcMinute, type ExecutionChoice, type FailedTurnInfo, type UnavailableProviders } from "./lib/provider-failover.ts";
+import { captainResumeDelay, FAILOVER_WINDOW_MS, failoverTarget, PAYMENT_REQUIRED, planLimitError, planLimitNotice, PROVIDER_UNAVAILABLE_KEY, providerErrorStatus, providerExhausted, unavailableProviderLines, unavailableUntil, utcMinute, type ExecutionChoice, type FailedTurnInfo, type UnavailableProviders } from "./lib/provider-failover.ts";
 import { finishedCrewCandidates, isFinishedCrewWake, parseWakeRow, quietStaleVerdict, staleQueueRows, withoutFinishedCrewWakes, type FinishedCrews, type QuietVerdict } from "./lib/finished-crew-wakes.ts";
 import { finishedRetireVerdict, openCaptainHoldOrigins, UNSAVED_WORK_SCRIPT, unsavedWorkFindings } from "./lib/finished-crew-retire.ts";
 import { createDoorbellHold, doorbellHoldDecision } from "./lib/doorbell-hold.ts";
@@ -5626,19 +5626,48 @@ export default async function plugin(bb: BbPluginApi) {
   // BB's own reason a thread is in error (provisioning, provider), e.g. "Provisioning
   // thread failed: Host is not connected", so a failed dispatch names its real cause.
   async function threadFailureDetail(threadId: string): Promise<string> {
+    return (await threadFailure(threadId)).detail;
+  }
+  // httpStatus is the structured status of the newest provider error, when it has one. read is
+  // false when the events could not be read, so a null status there is unknown, not "no status".
+  async function threadFailure(threadId: string, signal?: AbortSignal): Promise<{ detail: string; httpStatus: number | null; read: boolean }> {
+    let detail = "";
+    let httpStatus: number | null = null;
     try {
       const rows = await raceAbort(bb.sdk.threads.events.list({
         threadId, order: "desc", limit: "20", types: ["system/error", "provider/error"],
-      }), undefined, STUCK_HOST_CALL_MS);
+      }), signal, STUCK_HOST_CALL_MS);
+      const provider = rows.find((row) => row.type === "provider/error");
+      if (provider !== undefined) httpStatus = providerErrorStatus(provider.data);
       for (const row of rows) {
         const data = asRecord(row.data);
         const parts = [data["message"], data["detail"]].filter((v): v is string => typeof v === "string" && v.trim() !== "");
-        if (parts.length > 0) return truncate(parts.join(": "), 300);
+        if (parts.length > 0) { detail = truncate(parts.join(": "), 300); break; }
       }
     } catch {
       // the generic note still applies
+      return { detail, httpStatus, read: false };
     }
-    return "";
+    return { detail, httpStatus, read: true };
+  }
+  // The one captain notice for a crew whose provider answered 402. The thread.failed handler and
+  // the crew-watch pass both page this exact text, so the per-thread delivery signature lets only
+  // the first through, also across a plugin reload. Null for any other status.
+  async function paymentRequiredNotice(crew: Crew, httpStatus: number | null, signal?: AbortSignal): Promise<string | null> {
+    if (httpStatus !== PAYMENT_REQUIRED) return null;
+    const provider = (await raceAbort(bb.sdk.threads.get({ threadId: crew.threadId }), signal, STUCK_HOST_CALL_MS).catch(() => null))?.providerId ?? crew.providerId;
+    const branch = crew.branch ? `branch ${crew.branch}` : "branch";
+    const kept = crew.prUrl ? `worktree, ${branch} and PR ${crew.prUrl}` : `worktree and ${branch}`;
+    return `crew ${crew.id}: its provider${provider ? ` ${provider}` : ""} is out of balance (HTTP 402 Payment Required). It was not restarted: a restart on ${provider ?? "the same provider"} fails the same way. Its ${kept} are kept. To continue, restart it on another provider: bb firstmate retry ${crew.id} --provider <id>.`;
+  }
+  // What the crew-watch pass pages for a crew in error: the 402 notice, else the crew's output.
+  // Undefined when its provider errors could not be read and the captain already has a notice for
+  // this thread: paging the output then would send a second, different wake after a 402 notice, so
+  // the page waits for the next pass. With no notice yet, the output is paged as before.
+  async function errorPage(crew: Crew, signal?: AbortSignal): Promise<string | null | undefined> {
+    const failure = await threadFailure(crew.threadId, signal);
+    if (!failure.read && await bb.storage.kv.get(`captain-delivery:${crew.threadId}`) !== undefined) return undefined;
+    return await paymentRequiredNotice(crew, failure.httpStatus, signal) ?? await crewOutput(crew, 300, signal);
   }
 
   async function createNativeWorker(flags: Map<string, FlagValue>, ctx: unknown) {
@@ -7870,10 +7899,19 @@ export default async function plugin(bb: BbPluginApi) {
   // Owner decision Q10: a crew whose provider ends without a final report (an exit, a crash, a
   // compaction exit) is relaunched once with its brief and a note; a second end goes to the captain.
   // Capacity and plan limits move to another provider instead (turn.failed); a sign-in failure is reported, not retried.
+  // 20 Oct: Grok answered 402 "usage balance exhausted" and crew 0f2d6bce was restarted on Grok, which
+  // failed the same way at once. A 402 is reported, not restarted; the captain picks the next provider.
   async function restartUnexpectedExit(crew: Crew, error: string | null): Promise<boolean> {
     const failedAt = Date.now();
     if (isSecondmateRoute(crew) || (await settings.get()).supervisionEnabled !== true) return false;
-    const detail = [error ?? "", await threadFailureDetail(crew.threadId)].filter((part) => part.trim() !== "").join(": ");
+    const failure = await threadFailure(crew.threadId);
+    const detail = [error ?? "", failure.detail].filter((part) => part.trim() !== "").join(": ");
+    const outOfBalance = await paymentRequiredNotice(crew, failure.httpStatus);
+    if (outOfBalance !== null) {
+      bb.log.warn(`crew ${crew.id}: its provider answered 402 Payment Required; not restarted`);
+      await notifyCaptain(crew, "error", outOfBalance);
+      return true;
+    }
     if (providerExhausted(null, detail) || planLimitError(detail)) return false;
     if (authFailure(detail)) {
       for (const key of signInSeen.keys()) if (key.endsWith(`:${crew.providerId ?? ""}`)) signInSeen.delete(key);
@@ -15398,8 +15436,12 @@ export default async function plugin(bb: BbPluginApi) {
       const prev = state[crew.id];
       if (prev === undefined) {
         if (status === "error" || status === "unknown") {
-          const detail = status === "error" ? await crewOutput(crew, 300, passSignal) : null;
-          if (!(await pageOrDefer(crew, status, detail))) {
+          const detail = status === "error" ? await errorPage(crew, passSignal) : null;
+          if (detail === undefined && !passSignal.aborted) {
+            bb.log.warn(`crew ${crew.id}: its provider errors could not be read; its error page waits for the next pass`);
+            continue;
+          }
+          if (passSignal.aborted || !(await pageOrDefer(crew, status, detail ?? null))) {
             inspected--;
             break;
           }
@@ -15416,8 +15458,12 @@ export default async function plugin(bb: BbPluginApi) {
       }
       if (status === "error" || status === "unknown") {
         if (prev.alerted !== status) {
-          const detail = status === "error" ? await crewOutput(crew, 300, passSignal) : null;
-          if (!(await pageOrDefer(crew, status, detail))) {
+          const detail = status === "error" ? await errorPage(crew, passSignal) : null;
+          if (detail === undefined && !passSignal.aborted) {
+            bb.log.warn(`crew ${crew.id}: its provider errors could not be read; its error page waits for the next pass`);
+            continue;
+          }
+          if (passSignal.aborted || !(await pageOrDefer(crew, status, detail ?? null))) {
             inspected--;
             break;
           }

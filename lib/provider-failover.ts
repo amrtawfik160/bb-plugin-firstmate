@@ -9,6 +9,25 @@ export function providerExhausted(info: FailedTurnInfo, detail = ""): boolean {
   return /\b429\b|no account pooler account|at capacity|rate.?limit/i.test(detail);
 }
 
+export const PAYMENT_REQUIRED = 402;
+
+// The HTTP status a provider/error event carries in a structured field: BB's errorInfo, else the
+// provider's JSON error body. acp-grok leaves errorInfo empty and writes
+// `Internal error: {"message":"API error (status 402 Payment Required): …","http_status":402}`.
+export function providerErrorStatus(data: unknown): number | null {
+  const row = (data ?? {}) as { errorInfo?: { httpStatusCode?: unknown } | null; detail?: unknown };
+  if (typeof row.errorInfo?.httpStatusCode === "number") return row.errorInfo.httpStatusCode;
+  const detail = typeof row.detail === "string" ? row.detail : "";
+  const start = detail.indexOf("{"), end = detail.lastIndexOf("}");
+  if (start < 0 || end < start) return null;
+  try {
+    const status = (JSON.parse(detail.slice(start, end + 1)) as { http_status?: unknown } | null)?.http_status;
+    return typeof status === "number" ? status : null;
+  } catch {
+    return null;
+  }
+}
+
 export const FAILOVER_WINDOW_MS = 60 * 60_000;
 // Antigravity crews skip the outcome line and the PR contract (fleet audit 2026-10-07).
 export const SHIP_EXCLUDED_PROVIDERS: ReadonlySet<string> = new Set(["acp-antigravity"]);
