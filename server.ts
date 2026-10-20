@@ -91,7 +91,7 @@ import {
   buildProgram, createPrograms, isOpenProgram, isOpenTicket, newlyReady, numberOf, programCounts, programText, readyRefs, readyWakeText, repoOf,
   shortTicket, stallReminderDue, stallReminderText, ticketRef, type IssueFacts, type Program, type ProgramFact, type TicketRef,
 } from "./lib/programs.ts";
-import { askLetterAnswer, askIdFromSourceEventId, packAnswers, choicesFromCrewReport, clip, createOwnerAsks, crewQuestionText, formatAge, formatAskCard, formatUtcTime, mayDefault, OWNER_CLOSED_RESOLUTION, CAPTAIN_RULES, OWNER_DECISION_RULE, recommendedLabel, replacedBy, ASK_FOLLOWUP_GIVE_UP_MS, type AskKind, type AskFollowUp, type OwnerAsk } from "./lib/owner-asks.ts";
+import { askLetterAnswer, askIdFromSourceEventId, packAnswers, choicesFromCrewReport, clip, createOwnerAsks, crewQuestionText, formatAge, formatAskCard, formatAskRound, formatUtcTime, isRoundAsk, mayDefault, OWNER_CLOSED_RESOLUTION, CAPTAIN_RULES, OWNER_DECISION_RULE, recommendedLabel, replacedBy, ASK_FOLLOWUP_GIVE_UP_MS, ASK_ROUND_MAX_CHARS, type AskKind, type AskFollowUp, type OwnerAsk } from "./lib/owner-asks.ts";
 import { DEFAULT_RELIABILITY_FLAGS, reliabilityFlagsFromSettings } from "./lib/reliability-flags.ts";
 import { sanitizeSettingValue } from "./lib/settings-schema.ts";
 import { coalesceBatches, parseConnectorHeader, parseInboundTelegram, parseSourceRef, parseTelegramSubmission, stripTelegramEnvelope, telegramReplyParameters, telegramSourceRef } from "./lib/telegram-envelope.ts";
@@ -6322,14 +6322,17 @@ export default async function plugin(bb: BbPluginApi) {
   /** Send one ask card to the Telegram connector. Returns "" when queued, else why it was not. */
   async function sendAskCard(ask: OwnerAsk, route: { project?: string; task?: string } = {}): Promise<string> {
     const gated = !mayDefault(ask);
+    const round = isRoundAsk(ask);
     try {
       const sent = z.object({ queued: z.number(), duplicate: z.boolean() }).parse(await bb.sdk.plugins.callRpc({
         pluginId: TELEGRAM_BRIDGE_PLUGIN_ID,
         method: "ask",
         input: {
-          askId: ask.id, text: formatAskCard(ask), options: ask.options, ...(ask.recommended !== null ? { recommended: ask.recommended } : {}),
+          askId: ask.id, text: round ? formatAskRound(ask) : formatAskCard(ask), options: round ? [] : ask.options,
+          ...(!round && ask.recommended !== null ? { recommended: ask.recommended } : {}),
           // The connector folds reversible cards sent within a minute into one message with "Accept all recommended".
-          card: { kind: ask.kind, question: ask.text, ...(ask.impact ? { impact: ask.impact } : {}), defaultAt: ask.defaultAt, gated },
+          // A grilling round is one plain message: empty options, no pack card.
+          ...(round ? {} : { card: { kind: ask.kind, question: ask.text, ...(ask.impact ? { impact: ask.impact } : {}), defaultAt: ask.defaultAt, gated } }),
           // With Telegram topics on the card goes to its project's topic; without it the connector asks Decisions.
           ...(route.project?.trim() ? { project: route.project.trim() } : {}),
           ...(route.task !== undefined ? { task: route.task } : {}),
@@ -15301,12 +15304,17 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_ask",
-    description: "Ask the captain one question, blocker or approval as a Telegram card with up to 4 option buttons. It stays on the captain's board until answered. Returns at once: keep working on other things. The answer arrives from a button tap or a card reply containing just its option letter. Reversible cards sent within a minute of each other share one Telegram message with an \"Accept all recommended\" button; an answer there arrives as one owner message with a line \"- ask <id>: <option>\" per card it answered. Approval cards supply fixed Approve and No buttons: omit options and recommended, and pass the exact authorized PR list in prs; question-text PR mentions grant no permission. irreversible=true or kind=approval never proceeds on a deadline and keeps its own message; a reversible ask with a recommended option proceeds with it at its deadline. A card names its project. A card the owner's rules in captain.md already answer is refused with the rule. A new card on the same task and subject replaces the open one. bind=crewId or crewId:key attaches the card to a native crew question so the owner's answer or Close releases that hold.",
+    description: "Ask the captain one question, blocker or approval as a Telegram card with up to 4 option buttons. It stays on the captain's board until answered. Returns at once: keep working on other things. The answer arrives from a button tap or a card reply containing just its option letter. Reversible cards sent within a minute of each other share one Telegram message with an \"Accept all recommended\" button; an answer there arrives as one owner message with a line \"- ask <id>: <option>\" per card it answered. Approval cards supply fixed Approve and No buttons: omit options and recommended, and pass the exact authorized PR list in prs; question-text PR mentions grant no permission. irreversible=true or kind=approval never proceeds on a deadline and keeps its own message; a reversible ask with a recommended option proceeds with it at its deadline. A grilling question batch is one round: pass round with 2 to 12 questions (each with 2 to 4 options and recommended); it is one Telegram message with no buttons. Single decisions, blockers and approvals stay one question per card. A card names its project. A card the owner's rules in captain.md already answer is refused with the rule. A new card on the same task and subject replaces the open one. bind=crewId or crewId:key attaches the card to a native crew question so the owner's answer or Close releases that hold.",
     parameters: z.object({
       impact: z.string().optional().describe("Optional. One plain sentence explaining what this means for the owner’s business"),
-      question: z.string().min(1).max(1500).describe("One question, asked in the first sentence; put option text in options, not in the question. Cards sent together that start with the same subject and a colon (\"DM Pro plugin: ...\") get that subject as their shared title"),
+      question: z.string().min(1).max(1500).optional().describe("One question, asked in the first sentence; put option text in options, not in the question. Required unless round is set, when it is an optional title. Cards sent together that start with the same subject and a colon (\"DM Pro plugin: ...\") get that subject as their shared title"),
       kind: z.enum(["question", "blocker", "approval"]),
       options: z.array(z.object({ label: z.string().min(1).max(1000).describe("Questions and blockers only; approval cards use fixed Approve and No buttons"), value: z.string().min(1).max(64).optional() })).max(4).optional(),
+      round: z.array(z.object({
+        question: z.string().min(1).max(500),
+        options: z.array(z.object({ label: z.string().min(1).max(1000), value: z.string().min(1).max(64).optional() })).min(2).max(4),
+        recommended: z.number().int().min(0),
+      })).min(2).max(12).optional().describe("A grilling question batch: 2 to 12 questions in one Telegram message, no buttons. Kind must be question and reversible"),
       prs: z.array(z.string().max(200).regex(/^[\w.-]+\/[\w.-]+#[1-9]\d*$/)).max(20).optional().describe("Approval only: the exact PRs authorized by this card, as owner/repo#N. The plugin displays this list. PR mentions in question text grant no permission"),
       recommended: z.number().int().min(0).optional().describe("Index of the recommended option"),
       defaultAfterMinutes: z.number().min(5).max(10080).optional().describe("Proceed with the recommended option after this many minutes without an answer (reversible asks only)"),
@@ -15316,7 +15324,7 @@ export default async function plugin(bb: BbPluginApi) {
       task: z.string().regex(/^T\d+$/).optional().describe("The owner task this card is for (T<n>). Unset: the open task the owner message of this turn started. In Telegram the card replies to the task's status line, which counts it"),
       bind: z.string().min(1).max(120).optional().describe("Bind this card to a native crew question so the owner's answer or Close releases that hold. Pass the crew id, or crewId:key of the status decision."),
     }),
-    async execute({ impact, question, kind, options, prs, recommended, defaultAfterMinutes, irreversible, startsNewWork, project, task: taskId, bind }, ctx) {
+    async execute({ impact, question, kind, options, round, prs, recommended, defaultAfterMinutes, irreversible, startsNewWork, project, task: taskId, bind }, ctx) {
       const captain = ctxString(ctx, "threadId");
       if (!captain) return toolError("firstmate_ask runs only in a captain thread.");
       if (taskId !== undefined && ownerTasks.get(taskId)?.captain !== captain) return toolError(`No owner task ${taskId} for this captain. Check firstmate_task list.`);
@@ -15326,6 +15334,54 @@ export default async function plugin(bb: BbPluginApi) {
       // Owner decision Q7: every card names its project (32 of 95 cards on 15-17 Oct had none).
       const cardProject = project?.trim() || (cardTask !== undefined ? ownerTasks.get(cardTask)?.project ?? undefined : undefined);
       if (!cardProject) return toolError("Refusing: a card names its project. Pass project (as on the board, such as Safi), or task (T<n>) of a task that has one. Nothing was sent.");
+      if (round !== undefined) {
+        if (kind !== "question") return toolError("Refusing: a grilling round is a reversible question, never an approval or blocker. Nothing was sent.");
+        if (irreversible === true) return toolError("Refusing: a grilling round must be reversible. Nothing was sent.");
+        if (defaultAfterMinutes !== undefined) return toolError("Refusing: a grilling round has no deadline. Remove defaultAfterMinutes. Nothing was sent.");
+        if (startsNewWork === true) return toolError("Refusing: a grilling round does not start new work. Nothing was sent.");
+        if (bind !== undefined) return toolError("Refusing: a grilling round cannot bind a crew question. Nothing was sent.");
+        if (options !== undefined) return toolError("Refusing: omit options when sending a round. Put each question's options on that round item. Nothing was sent.");
+        if (recommended !== undefined) return toolError("Refusing: omit recommended when sending a round. Put recommended on each round item. Nothing was sent.");
+        if (prs !== undefined) return toolError("Refusing: prs belongs only to an approval card. Nothing was sent.");
+        const roundQuestions = round.map((item) => ({
+          question: item.question.trim(),
+          options: item.options.map((option, index) => ({ label: option.label, value: option.value ?? String.fromCharCode(65 + index) })),
+          recommended: item.recommended,
+        }));
+        for (const [index, item] of roundQuestions.entries()) {
+          if (item.recommended >= item.options.length) {
+            return toolError(`Refusing: round question ${index + 1} recommended must be the index of one of its options. Nothing was sent.`);
+          }
+        }
+        const title = question?.trim() ?? "";
+        const storedText = title || roundQuestions[0]!.question;
+        const roundImpact = impact?.replace(/\s+/g, " ").trim();
+        const formatted = formatAskRound({ text: storedText, ...(roundImpact ? { impact: roundImpact } : {}), round: roundQuestions });
+        if (formatted.length > ASK_ROUND_MAX_CHARS) {
+          return toolError("Refusing: the grilling round is longer than one Telegram message (3000 characters). Shorten the questions. Nothing was sent.");
+        }
+        const answeredRound = await ruleAnswering(captain, formatted);
+        if (answeredRound !== null) return toolError(`Refusing: the owner's rules already answer this card, so it was not sent. Rule: "${answeredRound}". Act on it and say in one line what you did.`);
+        const nowRound = Date.now();
+        const roundAsk = ownerAsks.create({
+          captain, kind: "question", ...(roundImpact ? { impact: roundImpact } : {}), text: storedText,
+          options: [], round: roundQuestions, recommended: null, defaultAt: null,
+          irreversible: false, startsNewWork: false, createdAt: nowRound,
+          project: cardProject, ...(cardTask !== undefined ? { task: cardTask } : {}),
+          subject: (title || roundQuestions[0]!.question).slice(0, 60).toLowerCase(),
+        });
+        const replacedRound = await replaceOpenCards(roundAsk);
+        const roundDone = `Ask ${roundAsk.id} is open and on the captain's board.${replacedRound.length > 0 ? ` It replaces card ${replacedRound.join(", ")}, now marked replaced.` : ""} Keep working on other things; the answer arrives as an owner message that replies to ask ${roundAsk.id}.`;
+        if ((await reliabilityFlags()).telegramThreading !== "on") {
+          return `${roundDone}\nWarning: not sent to Telegram because telegramThreading is off. Put the question in your final message too.`;
+        }
+        const roundWarning = await sendAskCard(roundAsk, { project: cardProject, ...(cardTask !== undefined ? { task: cardTask } : {}) });
+        await refreshOwnerBoard();
+        return roundWarning === ""
+          ? `Question card ${roundAsk.id} sent. ${roundDone}`
+          : `${roundDone}\nWarning: the question card was not sent to Telegram (${roundWarning}). The ask stays open on the board; put the question in your final message too.`;
+      }
+      if (question === undefined) return toolError("Refusing: a question card needs a question. Nothing was sent.");
       const answered = kind === "approval" ? null : await ruleAnswering(captain, [question, impact ?? "", ...(options ?? []).map((option, index) => `${String.fromCharCode(65 + index)}. ${option.label}`)].filter(Boolean).join("\n"));
       if (answered !== null) return toolError(`Refusing: the owner's rules already answer this card, so it was not sent. Rule: "${answered}". Act on it and say in one line what you did.`);
       if (kind === "approval" && ((options !== undefined && !fixedApprovalChoices(options)) || recommended !== undefined)) {
@@ -15392,19 +15448,36 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_resolve_ask",
-    description: "Correct or close an ask from firstmate_ask, or reopen it with reopen=true, when you learn the answer another way (resolution = the answer), or cancel it when it no longer matters (cancelled=true).",
+    description: "Correct or close an ask from firstmate_ask, or reopen it with reopen=true, when you learn the answer another way (resolution = the answer), or cancel it when it no longer matters (cancelled=true). For a grilling round, pass answers=[{n, choice}] to record each answer; a partial set keeps the round open.",
     parameters: z.object({
       id: z.string().min(1).max(64),
-      resolution: z.string().min(1).max(2000),
+      resolution: z.string().min(1).max(2000).optional(),
+      answers: z.array(z.object({
+        n: z.number().int().min(1).max(12),
+        choice: z.string().min(1).max(200),
+      })).min(1).max(12).optional().describe("Grilling round: each answered question by number and letter or label"),
       cancelled: z.boolean().optional(),
       reopen: z.boolean().optional(),
     }),
-    async execute({ id, resolution, cancelled, reopen }, ctx) {
+    async execute({ id, resolution, answers, cancelled, reopen }, ctx) {
       const captain = ctxString(ctx, "threadId");
       if (!captain) return toolError("firstmate_resolve_ask runs only in a captain thread.");
       if (cancelled !== true && reopen !== true && await bb.storage.kv.get(`${DEVICE_PROOF_PREFIX}${id}`) !== undefined) {
         return toolError(`Refusing: ask ${id} is a device proof card, and only the owner's tap answers a device proof card. His Works is the proof record; cancel it with cancelled=true if the build is replaced.`);
       }
+      if (answers !== undefined) {
+        if (cancelled === true || reopen === true) return toolError("Refusing: answers cannot be combined with cancelled or reopen.");
+        const recorded = ownerAsks.recordRoundAnswers(id, captain, answers, Date.now());
+        if (!recorded) return toolError(`No open ask ${id} for this captain.`);
+        if (recorded.error !== undefined) return toolError(`Refusing: ${recorded.error}`);
+        await refreshOwnerBoard();
+        const left = ownerAsks.listOpen(captain).length;
+        return recorded.complete
+          ? `Ask ${id} answered. ${recorded.summary}. ${left === 0 ? "No ask is open." : `${left} ask(s) still open.`}`
+          : `Ask ${id} still open. Recorded ${recorded.summary}. ${left} ask(s) still open.`;
+      }
+      if (resolution === undefined) return toolError("Pass resolution.");
+      const current = ownerAsks.get(id);
       const closed = ownerAsks.resolve(id, captain, reopen === true ? "open" : cancelled === true ? "cancelled" : "answered", resolution, Date.now());
       if (!closed) return toolError(`No ask ${id} for this captain.`);
       // Only the owning captain's cancel reaches here: a cancelled device proof card proves nothing, so its
@@ -15415,14 +15488,16 @@ export default async function plugin(bb: BbPluginApi) {
         await bb.storage.kv.delete(`owner-close-native:${id}`);
       }
       let warning = "";
-      try {
-        const result = z.object({ ok: z.boolean() }).parse(await bb.sdk.plugins.callRpc({
-          pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "editAsk",
-          input: { askId: id, resolution, at: closed.resolvedAt ?? Date.now(), ...(reopen === true ? { reopen: true } : {}) },
-          outputSchema: z.object({ ok: z.boolean() }),
-        }));
-        if (!result.ok) warning = " The Telegram card could not be updated.";
-      } catch (error) { warning = ` The Telegram card could not be updated (${error instanceof Error ? error.message : String(error)}).`; }
+      if (!isRoundAsk(current ?? closed)) {
+        try {
+          const result = z.object({ ok: z.boolean() }).parse(await bb.sdk.plugins.callRpc({
+            pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "editAsk",
+            input: { askId: id, resolution, at: closed.resolvedAt ?? Date.now(), ...(reopen === true ? { reopen: true } : {}) },
+            outputSchema: z.object({ ok: z.boolean() }),
+          }));
+          if (!result.ok) warning = " The Telegram card could not be updated.";
+        } catch (error) { warning = ` The Telegram card could not be updated (${error instanceof Error ? error.message : String(error)}).`; }
+      }
       await refreshOwnerBoard();
       const left = ownerAsks.listOpen(captain).length;
       return `Ask ${id} ${closed.state}. ${left === 0 ? "No ask is open." : `${left} ask(s) still open.`}${warning}`;
@@ -15431,7 +15506,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_reply",
-    description: "Reply to one owner message as a Telegram reply to it (ref=oldest, tg:<chat>:<msg>, or bb:<thread>:<row>; any open message, in any order). quote=exact words from that message, such as one of several questions; each different quote is its own reply. more=true keeps the message open because more replies to it will follow. A text that asks the owner to decide (options A/B with a question, or a count of waiting decisions) is refused: send each decision with firstmate_ask. A text that restates the question of a card sent in the last 30 minutes is refused too. The answer carries its owner task (task, or the task this message started): in Telegram it replies to the task's status line, in the task's project topic. result=true makes it the task's result, which marks the owner's messages done; a task has one result. Each owner message gets one Telegram answer message: a later reply to it is added by an edit, one part an edit cannot hold is its continuation, and more is refused. Turn text outside this tool, firstmate_ask and firstmate_alert never reaches the owner. A text that only says the work started, or a note about the owner, is not sent and the message stays open. covers=refs of other open messages this reply also answers, such as forwarded messages or a burst on one request: they close with no Telegram message of their own. Every owner message this reply answers is linked to its owner task or marked noWork (it asks for no work): the message's own task (the one it started, or one an earlier reply named) counts; else pass task, or noWork=true; a cover takes the reply's task or noWork, or its own as {ref, task} or {ref, noWork}. A reply with neither is refused. promise={by, what}: a dated promise in this reply, such as \"I will check on 21 Oct\"; it is a record that wakes you at that time and shows on the board until you close it with firstmate_promise.",
+    description: "Reply to one owner message as a Telegram reply to it (ref=oldest, tg:<chat>:<msg>, or bb:<thread>:<row>; any open message, in any order). quote=exact words from that message, such as one of several questions; each different quote is its own reply. more=true keeps the message open because more replies to it will follow. A text that asks the owner to decide (options A/B with a question, or a count of waiting decisions) is refused: send each decision with firstmate_ask. A grilling question batch is one firstmate_ask round, not this tool. A text that restates the question of a card sent in the last 30 minutes is refused too. The answer carries its owner task (task, or the task this message started): in Telegram it replies to the task's status line, in the task's project topic. result=true makes it the task's result, which marks the owner's messages done; a task has one result. Each owner message gets one Telegram answer message: a later reply to it is added by an edit, one part an edit cannot hold is its continuation, and more is refused. Turn text outside this tool, firstmate_ask and firstmate_alert never reaches the owner. A text that only says the work started, or a note about the owner, is not sent and the message stays open. covers=refs of other open messages this reply also answers, such as forwarded messages or a burst on one request: they close with no Telegram message of their own. Every owner message this reply answers is linked to its owner task or marked noWork (it asks for no work): the message's own task (the one it started, or one an earlier reply named) counts; else pass task, or noWork=true; a cover takes the reply's task or noWork, or its own as {ref, task} or {ref, noWork}. A reply with neither is refused. promise={by, what}: a dated promise in this reply, such as \"I will check on 21 Oct\"; it is a record that wakes you at that time and shows on the board until you close it with firstmate_promise.",
     parameters: z.object({
       ref: z.string().min(1).optional().describe("The owner message: oldest, tg:<chat>:<msg> or bb:<thread>:<row>. Unset with task: the first owner message of that task"),
       text: z.string().min(1).max(4000),
