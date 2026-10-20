@@ -1,4 +1,4 @@
-import type { ReplacementContract } from './replacement.ts';
+import { replacementSupersedable, SUPERSEDED_REPLACEMENT, type ReplacementContract } from './replacement.ts';
 import type { BbPluginApi } from '@get-bb/plugin-sdk';
 
 export type LaunchState = 'reserved' | 'creating' | 'provisioning' | 'running' | 'failed' | 'uncertain' | 'deleted';
@@ -125,7 +125,8 @@ export function createLaunches(db: Database) {
       return update(expected.key,{state:'provisioning',threadId:adoption.threadId,adoption,error:'Explicit adoption publication incomplete; repeat with this exact thread.'});
     })();
   }
-  async function reserve(record: LaunchRecord, capacity: () => Promise<{ cap: number; activeTaskIds: string[] }>, overCap = false) {
+  /** supersedeKey: an earlier replacement of the same source that never asked BB for a worker; failed in the same transaction. */
+  async function reserve(record: LaunchRecord, capacity: () => Promise<{ cap: number; activeTaskIds: string[] }>, overCap = false, supersedeKey?: string) {
     const run = tail.then(async () => {
       const prior = get(record.key);
       if (prior && prior.state !== 'failed') return prior;
@@ -136,6 +137,11 @@ export function createLaunches(db: Database) {
         const active = new Set(activeTaskIds);
         for (const held of heldTaskIds(record.owner)) active.add(held);
         if (!overCap && cap > 0 && !active.has(launchTaskKey(record.projectId,record.taskId)) && active.size >= cap) throw new Error(`Crew cap reached: ${active.size} crews running or reserved (cap ${cap}). Queue this task until capacity is available.`);
+        if (supersedeKey !== undefined) {
+          const stale = get(supersedeKey);
+          if (!stale || !replacementSupersedable(stale)) throw new Error('An existing replacement has a different immutable request. Reconcile that exact request first.');
+          if (stale.state !== 'failed') update(supersedeKey, { state: 'failed', error: SUPERSEDED_REPLACEMENT });
+        }
         return save({ ...record, creationRequested: record.creationRequested === true });
       })();
     });

@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import plugin from "./server.ts";
-import { createLaunches, launchKey } from "./lib/launch.ts";
+import { ATTEMPT_TOKEN_ENVIRON_PY, attemptTokenFromAdmissionOutput, createLaunches, launchKey } from "./lib/launch.ts";
 import { stubProviderCatalog } from "./test/provider-catalog.mjs";
 
 type Host = ReturnType<typeof createFakePluginHost>;
@@ -529,6 +532,35 @@ test("a duplicate create-worker failure does not clear another active handler", 
     unpause();
     if (work) await work.catch(() => {});
     t.mock.timers.reset();
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("the reserved attempt token reaches the fm-spawn process environment through the real host command", async () => {
+  const { host, seen } = await realCaptain();
+  const dir = mkdtempSync(join(tmpdir(), "fm-attempt-env-"));
+  try {
+    await host.harness.behavior.runCli(["dispatch", "--project", ctx.projectId, "--task-id", TASK, "--", "fix login"], ctx);
+    const token = launchStore(host).forTask(ctx.projectId, ctx.threadId, TASK)?.attemptToken;
+    assert.ok(token);
+    const wrapped = spawnCommands(seen).find((c) => c.includes("export FM_BB_ATTEMPT_TOKEN="));
+    const match = /^__fm_cmd='([\s\S]*?)'; set \+e; "/.exec(wrapped ?? "");
+    assert.ok(match, "spawn command keeps the host runner wrapper");
+    const inner = match[1]!.replace(/'\\''/g, "'").replaceAll(HOME, dir);
+    // An old runtime: fm-spawn.sh owns the lock pid, and its bb.sh passes --native-pid "$$" with no
+    // --attempt-token. Admission runs in another process without the variable and reads the pid's environ.
+    writeFileSync(join(dir, "admission.py"), ATTEMPT_TOKEN_ENVIRON_PY);
+    mkdirSync(join(dir, "bin"));
+    writeFileSync(join(dir, "bin", "fm-spawn.sh"), [
+      "#!/usr/bin/env bash",
+      `lock="$FM_HOME/state/.spawn-$1.lock"; mkdir -p "$lock"; echo "$$" > "$lock/pid"`,
+      `env -u FM_BB_ATTEMPT_TOKEN python3 "$FM_HOME/admission.py" "$(cat "$lock/pid")" > "$FM_HOME/admission.out"`,
+    ].join("\n"), { mode: 0o755 });
+    const run = spawnSync("bash", ["-c", inner], { encoding: "utf8", timeout: 30_000 });
+    assert.equal(run.status, 0, `${run.stdout}\n${run.stderr}`);
+    assert.equal(attemptTokenFromAdmissionOutput(readFileSync(join(dir, "admission.out"), "utf8")), token);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
     await host.harness.lifecycle.dispose();
   }
 });

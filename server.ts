@@ -7552,7 +7552,7 @@ export default async function plugin(bb: BbPluginApi) {
     });
     const key = launchKey(crew.projectId,crew.parentThreadId ?? "",crew.nativeHome ?? "",crew.id,plan.generation);
     let reservation = await launches.reserve({ key,taskId:crew.id,projectId:crew.projectId,owner:crew.parentThreadId ?? "",home:crew.nativeHome ?? "",
-      generation:plan.generation,replacement:plan.contract,shape:crew.shape,deliveryMode:crew.posture,deliveryRequirement:crew.deliveryRequirement,state:"reserved",threadId:null,hostId:reusedEnvironment.hostId,path:reusedEnvironment.path ?? undefined,updatedAt:Date.now() }, () => launchCapacity(crew.parentThreadId ?? undefined),opts.overCap);
+      generation:plan.generation,replacement:plan.contract,shape:crew.shape,deliveryMode:crew.posture,deliveryRequirement:crew.deliveryRequirement,state:"reserved",threadId:null,hostId:reusedEnvironment.hostId,path:reusedEnvironment.path ?? undefined,updatedAt:Date.now() }, () => launchCapacity(crew.parentThreadId ?? undefined),opts.overCap,plan.supersede?.key);
     if (JSON.stringify(reservation.replacement?.target)!==JSON.stringify(plan.contract.target) || reservation.replacement?.sourceThreadId!==crew.threadId || reservation.replacement.intent!==intent || reservation.replacement.reason!==note) throw new Error("Replacement reservation conflicts with this exact request.");
     reservation = await reconcileLaunch(reservation);
     if (fmHome) {
