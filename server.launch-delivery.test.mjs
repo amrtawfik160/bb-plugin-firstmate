@@ -134,7 +134,9 @@ test('background PR follow-up survives reload, forgotten worker, stale lookup an
  r=store.get(r.id);r.nextCheckAt=0;store.save(r);await host.harness.behavior.runSchedule('pr-delivery-follow-up');assert.equal(host.harness.sdk.callsTo('threads.send').length,1);
  const shown=await host.harness.behavior.runCli(['deliveries','list','--json'],ctx);assert.equal(JSON.parse(shown.stdout).length,1);
  unavailable=true;r=store.get(r.id);r.nextCheckAt=0;store.save(r);await host.harness.behavior.runSchedule('pr-delivery-follow-up');assert.equal(store.get(r.id).freshness,'stale');assert.equal(store.get(r.id).status,'needs-verification');
- await host.harness.behavior.emitThreadEvent('thread.archived',{thread:makeThreadResponse({id:'thr_cap',projectId:'proj_1',archivedAt:Date.now()})});assert.equal(store.get(r.id).ownerNeeded,true);
+ // The archive stands: BB reads it back with the event's own archive time.
+ const archivedAt=Date.now();host.harness.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,projectId:'proj_1',status:'idle',environmentId:'env_wt',...(threadId==='thr_cap'?{archivedAt}:{})}));
+ await host.harness.behavior.emitThreadEvent('thread.archived',{thread:makeThreadResponse({id:'thr_cap',projectId:'proj_1',archivedAt})});assert.equal(store.get(r.id).ownerNeeded,true);
  const other=await host.harness.behavior.runCli(['deliveries','list','--json'],{threadId:'thr_other',projectId:'proj_1'});assert.equal(JSON.parse(other.stdout)[0].ownerNeeded,true,'lost manager obligation is visibly project scoped');
  host.harness.sdk.stub('threads.getPluginMetadata',async()=>({captain:'true'}));
  const rpc=await host.harness.behavior.callRpc('fleet',{threadId:'thr_cap'});assert.equal(rpc.deliveries[0].id,r.id);assert.equal(rpcContract.fleet.output.safeParse(rpc).success,true);

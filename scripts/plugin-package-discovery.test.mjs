@@ -10,6 +10,9 @@ import {resolveInstalledBbRuntime} from './bb-runtime-fixture.mjs';
 const exec=promisify(execFile),root=resolve('.');
 async function freePort(){const socket=createServer();await new Promise(r=>socket.listen(0,'127.0.0.1',r));const port=socket.address().port;await new Promise(r=>socket.close(r));return port;}
 const discoveryEnv={...process.env};for(const key of Object.keys(discoveryEnv))if(key.startsWith('BB_'))delete discoveryEnv[key];
+// npm test puts a blocking bb first on PATH (test/no-live-bb). Locate the installed package past it;
+// it runs below only against this test's own server, HOME, data folder and ports.
+discoveryEnv.PATH=(process.env.PATH??'').split(':').filter(dir=>dir!=='' && resolve(dir)!==join(root,'test/no-live-bb')).join(':');
 const pathBinary=realpathSync((await exec('sh',['-c','command -v bb'],{env:discoveryEnv})).stdout.trim());
 
 test('installed BB runtime lookup accepts both official entrypoints from the same package',()=>{

@@ -83,7 +83,8 @@ function taskLine(task: OwnerTask, now: number, ref: PrRef, extra: { state?: str
 }
 
 function doneTail(task: OwnerTask): string {
-  return task.state === "dropped" ? `dropped: ${clip(task.dropReason ?? "", 60)}` : task.state === "done" ? "done (before the live rule)" : task.state;
+  const state = task.state === "dropped" ? `dropped: ${clip(task.dropReason ?? "", 60)}` : task.state === "done" ? "done (before the live rule)" : task.state;
+  return task.worktreeKept ? `${state} · ${task.worktreeKept}` : state;
 }
 
 /** What earlier digests already told the owner. `done` maps a finished item to the `since` of the

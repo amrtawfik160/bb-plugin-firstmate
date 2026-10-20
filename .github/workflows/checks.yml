@@ -69,6 +69,8 @@ jobs:
           files=$(node scripts/ci-test-coverage.mjs --run-list)
           echo "Running $(echo $files | wc -w) test files"
           sudo git config --system --add safe.directory '*'
+          # The same test environment as npm test (scripts/run-tests.sh): the blocking gh and bb
+          # stand-ins first on PATH, the no-live-bb preload, no tokens, no live network.
           sudo env "PATH=$PATH" HOME=/root \
             FIRSTMATE_TEST_NATIVE="$FIRSTMATE_TEST_NATIVE" FM_TEST_HOME="$FM_TEST_HOME" FM_CLASSIFY_LIB="$FM_CLASSIFY_LIB" \
-            node --test --experimental-strip-types --import ./test/temp-cleanup.mjs --test-global-setup=./test/temp-guard.mjs $files
+            sh scripts/run-tests.sh $files
