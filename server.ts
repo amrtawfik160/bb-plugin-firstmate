@@ -9808,7 +9808,7 @@ export default async function plugin(bb: BbPluginApi) {
     const timer = setTimeout(() => {
       if (proofRechecks.get(askId) !== timer) return;
       proofRechecks.delete(askId);
-      if (!launchAbort.signal.aborted) void drainAskFollowUps().catch((error) => bb.log.warn(`device proof ${askId} recheck: ${String(error)}`));
+      if (!launchAbort.signal.aborted) void backgroundBudget.run("follow-up", () => drainAskFollowUps()).catch((error) => bb.log.warn(`device proof ${askId} recheck: ${String(error)}`));
     }, delays[attempt]!);
     timer.unref?.();
     proofRechecks.set(askId, timer);
@@ -9818,7 +9818,7 @@ export default async function plugin(bb: BbPluginApi) {
     const timer = setTimeout(() => {
       if (proofRechecks.get(askId) !== timer) return;
       proofRechecks.delete(askId);
-      if (!launchAbort.signal.aborted) void drainAskFollowUps().catch((error) => bb.log.warn(`device proof ${askId} tree retry: ${String(error)}`));
+      if (!launchAbort.signal.aborted) void backgroundBudget.run("follow-up", () => drainAskFollowUps()).catch((error) => bb.log.warn(`device proof ${askId} tree retry: ${String(error)}`));
     }, TREE_FAIL_COOLDOWN_MS);
     timer.unref?.();
     proofRechecks.set(askId, timer);
@@ -9884,9 +9884,9 @@ export default async function plugin(bb: BbPluginApi) {
         await tell(note);
         return { status: "completed" };
       };
-      const retryTree = (): FollowUpResult => {
+      const retryTree = (count = true): FollowUpResult => {
         scheduleTreeProofRetry(askId);
-        return { status: "retryable", error: "waiting for commit tree" };
+        return { status: "retryable", error: count ? "waiting for commit tree" : "waiting for github allowance" };
       };
       try {
         // A tap can come hours after the card: read the PR from GitHub first, so the record covers its head now.
@@ -9896,10 +9896,13 @@ export default async function plugin(bb: BbPluginApi) {
         if (current?.forgeState === "merged") {
           const cardHead = fullCommitSha(proof.head), nowHead = fullCommitSha(current.headSha), mergeSha = fullCommitSha(current.mergeCommitSha);
           if (!cardHead || !nowHead || cardHead !== nowHead) return refusePermanent("The device card does not cover the PR's final head.");
-          if (!mergeSha) return retryTree();
+          if (!mergeSha) return retryTree(false);
           const hostId = await resolveHostForProject(current.projectId, current.owner ?? undefined);
           const compared = await compareOwnerTapTrees(hostId, current.repository, cardHead, mergeSha);
-          if (!compared.ok) return compared.temporary ? retryTree() : refusePermanent(compared.reason);
+          if (!compared.ok) {
+            if (!compared.temporary) return refusePermanent(compared.reason);
+            return retryTree(!/cooling down|held back: hourly allowance|GraphQL reserve/i.test(compared.reason));
+          }
           // After every host and tree read: re-read the binding, then check state, answer
           // sequence, Works, and delivery identity with no await before the write.
           const liveProof = await bb.storage.kv.get<DeviceProof>(key);
@@ -9932,9 +9935,10 @@ export default async function plugin(bb: BbPluginApi) {
         await tell(note);
         return { status: "completed" };
       } catch (error) {
-        if (error instanceof GithubReservePaused) return retryTree();
+        if (error instanceof GithubReservePaused) return retryTree(false);
         const message = error instanceof Error ? error.message : String(error);
-        if (/did not return (a )?trees?|cooling down|unreadable|Timed out/i.test(message)) return retryTree();
+        if (/cooling down|held back: hourly allowance|GraphQL reserve/i.test(message)) return retryTree(false);
+        if (/did not return (a )?trees?|unreadable|Timed out/i.test(message)) return retryTree(true);
         return refusePermanent(message);
       }
     }
@@ -10246,7 +10250,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   function applyFollowUpResult(job: AskFollowUp, result: FollowUpResult): void {
     if (result.status === "completed") ownerAsks.markFollowUpDone(job.askId, job.effect, job.answerSeq);
-    else if (result.error === "waiting for owner tap confirmation" || result.error === "waiting for commit tree") ownerAsks.recordFollowUpError(job.askId, job.effect, result.error, job.answerSeq);
+    else if (result.error === "waiting for owner tap confirmation" || result.error === "waiting for github allowance") ownerAsks.recordFollowUpError(job.askId, job.effect, result.error, job.answerSeq);
     else {
       ownerAsks.failFollowUp(job.askId, job.effect, result.error, undefined, job.answerSeq);
       bb.log.warn(`ask follow-up ${job.askId} ${job.effect}: ${result.error}`);
@@ -16671,12 +16675,18 @@ export default async function plugin(bb: BbPluginApi) {
         // Owner decision Q5: merged work that production does not run yet, with its next step and who takes it.
         const status = await liveStatusOf(threadId);
         const notLive = notLiveItems(tasks, (task) => planOf(ruleOf(task, deliveries.forTasks(task.crewIds, task.prs)), status), now);
-        const undelivered: { crewId: string }[] = [];
+        const undelivered: { crewId?: string; recovery?: string }[] = [];
         for (const job of [...ownerAsks.failedFollowUps(), ...ownerAsks.pendingFollowUps()]) {
           if (job.effect !== "owner-answered") continue;
           const ask = ownerAsks.get(job.askId);
-          const crewId = crewIdFromWaitRef(ask?.sourceRef);
-          if (!ask || ask.captain !== threadId || !crewId) continue;
+          if (!ask || ask.captain !== threadId) continue;
+          const crewId = crewIdFromWaitRef(ask.sourceRef);
+          if (!crewId) {
+            if (job.state === "failed" && await bb.storage.kv.get(`${DEVICE_PROOF_PREFIX}${job.askId}`) !== undefined) {
+              undelivered.push({ recovery: "retry by asking again" });
+            }
+            continue;
+          }
           if (job.state === "failed") { undelivered.push({ crewId }); continue; }
           const rec = await bb.storage.kv.get<{ state?: string }>(`owner-answer-sent:${job.askId}:${job.answerSeq}`);
           if (rec?.state === "unknown" || rec?.state === "sending") undelivered.push({ crewId });
@@ -17479,7 +17489,7 @@ export default async function plugin(bb: BbPluginApi) {
   } catch (error) {
     bb.log.warn(`message.dispatch hook unavailable; crew pings join running turns: ${String(error)}`);
   }
-  void drainAskFollowUps().catch((error) => bb.log.warn(`ask follow-up startup: ${String(error)}`));
+  void backgroundBudget.run("follow-up", () => drainAskFollowUps()).catch((error) => bb.log.warn(`ask follow-up startup: ${String(error)}`));
 
   const CAPTAIN_COMPACT_COOLDOWN_MS = 20 * 60_000;
   const compactionChecks = new Set<string>();
@@ -19036,7 +19046,7 @@ export default async function plugin(bb: BbPluginApi) {
     taskSweepWork = (async () => {
       for (const captain of knownCaptains) await sweepTasks(captain).catch((error) => bb.log.warn(`task sweep captain=${captain}: ${String(error)}`));
       await expireLeases().catch((error) => bb.log.warn(`lease expiry: ${String(error)}`));
-      await drainAskFollowUps().catch((error) => bb.log.warn(`ask follow-up retry: ${String(error)}`));
+      await backgroundBudget.run("follow-up", () => drainAskFollowUps()).catch((error) => bb.log.warn(`ask follow-up retry: ${String(error)}`));
     })();
     try { await taskSweepWork; } finally { taskSweepWork = undefined; }
   });
