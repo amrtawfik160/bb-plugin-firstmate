@@ -71,7 +71,7 @@ import { boundedCaptainStartup, captainBindingText } from "./lib/captain-startup
 import { createQueueStore, startOrder, type QueueItem } from "./lib/queue-store.ts";
 import { admissionDecision, createDispatchJobs, dispatchJobLine, spawnBackoffMs } from "./lib/async-dispatch.ts";
 import { createWatchdogStore, observeIdleTurn, tripWatchdog, watchdogNoticeText, watchdogTrip } from "./lib/crew-watchdog.ts";
-import { captainResumeDelay, FAILOVER_WINDOW_MS, failoverTarget, planLimitError, planLimitNotice, PROVIDER_UNAVAILABLE_KEY, providerExhausted, unavailableProviderLines, unavailableUntil, utcMinute, type ExecutionChoice, type FailedTurnInfo, type UnavailableProviders } from "./lib/provider-failover.ts";
+import { captainResumeDelay, FAILOVER_WINDOW_MS, failoverTarget, PAYMENT_REQUIRED, planLimitError, planLimitNotice, PROVIDER_UNAVAILABLE_KEY, providerErrorStatus, providerExhausted, unavailableProviderLines, unavailableUntil, utcMinute, type ExecutionChoice, type FailedTurnInfo, type UnavailableProviders } from "./lib/provider-failover.ts";
 import { finishedCrewCandidates, isFinishedCrewWake, parseWakeRow, quietStaleVerdict, staleQueueRows, withoutFinishedCrewWakes, type FinishedCrews, type QuietVerdict } from "./lib/finished-crew-wakes.ts";
 import { finishedRetireVerdict, openCaptainHoldOrigins, UNSAVED_WORK_SCRIPT, unsavedWorkFindings } from "./lib/finished-crew-retire.ts";
 import { createDoorbellHold, doorbellHoldDecision } from "./lib/doorbell-hold.ts";
@@ -5219,19 +5219,27 @@ export default async function plugin(bb: BbPluginApi) {
   // BB's own reason a thread is in error (provisioning, provider), e.g. "Provisioning
   // thread failed: Host is not connected", so a failed dispatch names its real cause.
   async function threadFailureDetail(threadId: string): Promise<string> {
+    return (await threadFailure(threadId)).detail;
+  }
+  // httpStatus is the structured status of the newest provider error, when it has one.
+  async function threadFailure(threadId: string): Promise<{ detail: string; httpStatus: number | null }> {
+    let detail = "";
+    let httpStatus: number | null = null;
     try {
       const rows = await raceAbort(bb.sdk.threads.events.list({
         threadId, order: "desc", limit: "20", types: ["system/error", "provider/error"],
       }), undefined, STUCK_HOST_CALL_MS);
+      const provider = rows.find((row) => row.type === "provider/error");
+      if (provider !== undefined) httpStatus = providerErrorStatus(provider.data);
       for (const row of rows) {
         const data = asRecord(row.data);
         const parts = [data["message"], data["detail"]].filter((v): v is string => typeof v === "string" && v.trim() !== "");
-        if (parts.length > 0) return truncate(parts.join(": "), 300);
+        if (parts.length > 0) { detail = truncate(parts.join(": "), 300); break; }
       }
     } catch {
       // the generic note still applies
     }
-    return "";
+    return { detail, httpStatus };
   }
 
   async function createNativeWorker(flags: Map<string, FlagValue>, ctx: unknown) {
@@ -7435,10 +7443,21 @@ export default async function plugin(bb: BbPluginApi) {
   // Owner decision Q10: a crew whose provider ends without a final report (an exit, a crash, a
   // compaction exit) is relaunched once with its brief and a note; a second end goes to the captain.
   // Capacity and plan limits move to another provider instead (turn.failed); a sign-in failure is reported, not retried.
+  // 20 Oct: Grok answered 402 "usage balance exhausted" and crew 0f2d6bce was restarted on Grok, which
+  // failed the same way at once. A 402 is reported, not restarted; the captain picks the next provider.
   async function restartUnexpectedExit(crew: Crew, error: string | null): Promise<boolean> {
     const failedAt = Date.now();
     if (isSecondmateRoute(crew) || (await settings.get()).supervisionEnabled !== true) return false;
-    const detail = [error ?? "", await threadFailureDetail(crew.threadId)].filter((part) => part.trim() !== "").join(": ");
+    const failure = await threadFailure(crew.threadId);
+    const detail = [error ?? "", failure.detail].filter((part) => part.trim() !== "").join(": ");
+    if (failure.httpStatus === PAYMENT_REQUIRED) {
+      const provider = (await bb.sdk.threads.get({ threadId: crew.threadId }).catch(() => null))?.providerId ?? crew.providerId;
+      const branch = crew.branch ? `branch ${crew.branch}` : "branch";
+      const kept = crew.prUrl ? `worktree, ${branch} and PR ${crew.prUrl}` : `worktree and ${branch}`;
+      bb.log.warn(`crew ${crew.id}: provider ${provider ?? "(unknown)"} answered 402 Payment Required; not restarted`);
+      await notifyCaptain(crew, "error", `crew ${crew.id}: its provider${provider ? ` ${provider}` : ""} is out of balance (HTTP 402 Payment Required). It was not restarted: a restart on ${provider ?? "the same provider"} fails the same way. Its ${kept} are kept. To continue, restart it on another provider: bb firstmate retry ${crew.id} --provider <id>.`);
+      return true;
+    }
     if (providerExhausted(null, detail) || planLimitError(detail)) return false;
     if (authFailure(detail)) {
       for (const key of signInSeen.keys()) if (key.endsWith(`:${crew.providerId ?? ""}`)) signInSeen.delete(key);
