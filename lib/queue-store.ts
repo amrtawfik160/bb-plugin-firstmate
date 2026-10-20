@@ -17,6 +17,7 @@ export const queueItemSchema = z.object({
   permissionMode:z.enum(['accept-edits','auto','full']).optional(), worktree:z.boolean().optional(), visible:z.boolean().optional(),
   ownerRequestedProvider:z.boolean().optional(),
   modelPermission:z.string().optional(),
+  rule:z.string().optional(),
   backlogUnparsed:z.boolean().optional(), createdAt:z.string(), nativePending:z.boolean().optional(),
 }).strict();
 export type QueueItem = z.infer<typeof queueItemSchema>;

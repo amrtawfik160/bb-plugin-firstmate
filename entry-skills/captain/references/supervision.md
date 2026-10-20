@@ -48,7 +48,14 @@ Legacy `firstmate_wake` `ackThrough` and `recoveryGeneration` must match an outs
 
 ### Crew models
 
-- `firstmate_dispatch` `role` picks the model. A builder (the default) runs claude-code `claude-opus-5-5`. A checker runs codex `gpt-6.1-sol`. A `lookup` (a quick question) runs claude-code `claude-haiku-5-5`.
+- Order: a model the owner named, then the model rule you pick, then the role default. The rules are in the home's `config/fm-model-rules.json`; `firstmate_models` lists them.
+- When the owner named no model, pass the rule that fits the task best as `rule` (its id or when-text). Choose by your judgement. Omit `rule` when none fits.
+- Without a rule, `role` decides. A builder (the default) uses the file's default (starter: claude-code `claude-opus-5-5`). A checker uses the checker rule (starter: codex `gpt-6.1-sol`) and never the model of the builder it checks; pass its `taskRef`. A `lookup` runs claude-code `claude-haiku-5-5`.
+- Each rule lists models strongest first. Dispatch skips a model with less than 15% of its weekly quota left, and a model the provider catalog refuses. When every model is low, it keeps the strongest one.
+- When no model in the rule can run, dispatch tries the role default, then another usable provider. Each one is checked the same way, and the result says why in a `Tell the owner:` line.
+- A model the owner named always runs as named. When its provider is at its plan limit, the result says so; name another model to move it.
+- The dispatch result names the picked model and why in one line. Give a line that starts `Tell the owner:` to the owner.
+- When the owner changes a rule ("use Opus for UI"), save it with `firstmate_models` `set` (`bb firstmate models set`). `reset` backs up a broken file and writes the starter rules.
 - Pass `providerId`, `model` or `reasoningLevel` only when the owner named them for this task. They apply to that task's crews only. Example: "opus 5.5 medium for ui, grok 4.6 xhigh for logic, codex for checker" gives the UI crew `claude-opus-5-5` with `reasoningLevel=medium`, the logic crew `acp-grok` `grok-4.6` with `xhigh`, and the checker `providerId=codex`.
 - Dispatch refuses a model that the provider does not offer, and nothing is spawned. Use the ids it lists.
 
