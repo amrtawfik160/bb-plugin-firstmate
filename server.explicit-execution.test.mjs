@@ -161,3 +161,29 @@ test('an execution change to gpt-6-astra is refused without the owner permission
   assert.equal(allowed.exitCode,0,allowed.stderr);assert.equal(state.execution.get('thr_new1').model,'gpt-6-astra');
  }finally{await host.harness.lifecycle.dispose();}
 });
+test('a failure-recovery restart that stopped before asking for a worker does not block a retry with another model (reels-animate-6118)',async()=>{
+ const {host,state}=await factory(0);try {
+ const recover=model=>['retry','c1','--provider','acp-grok','--model',model,'--reasoning-level','xhigh'];
+ host.harness.sdk.stub('threads.stop',async()=>{throw new Error('stop timed out');});
+ const stuck=await host.harness.behavior.runCli(recover('grok-4.6'),ctx);assert.equal(stuck.exitCode,1);assert.match(stuck.stderr,/stop timed out/);
+ const launches=createLaunches(host.bb.storage.database());
+ const stale=launches.forTask('proj_1','thr_cap','c1');assert.equal(stale.generation,2);assert.equal(stale.state,'reserved');assert.equal(stale.threadId,null);assert.equal(stale.creationRequested,false);assert.equal(stale.replacement.target.model,'grok-4.6');
+ host.harness.sdk.stub('threads.stop',async()=>({}));
+ const retried=await host.harness.behavior.runCli(recover('next-model'),ctx);assert.equal(retried.exitCode,0,retried.stderr);assert.equal(state.n,1);
+ assert.equal(launches.get(stale.key).state,'failed');assert.match(launches.get(stale.key).error,/Superseded by a new request/);
+ const current=launches.forTask('proj_1','thr_cap','c1');assert.equal(current.generation,3);assert.equal(current.threadId,'thr_new1');assert.equal(current.replacement.target.model,'next-model');
+ const saved=(await host.bb.storage.kv.get('crews'))[0];assert.equal(saved.threadId,'thr_new1');assert.equal(saved.model,'next-model');assert.equal(saved.relaunches,1);assert.equal(saved.replacementGeneration,3);
+ }finally{await host.harness.lifecycle.dispose();}
+});
+test('a restart that already asked BB for a worker still refuses a retry with another model',async()=>{
+ const {host,state}=await factory(0);try {
+ const recover=model=>['retry','c1','--provider','acp-grok','--model',model,'--reasoning-level','xhigh'];
+ host.harness.sdk.stub('threads.spawn',async()=>{throw new Error('504 after creation');});
+ const unknown=await host.harness.behavior.runCli(recover('grok-4.6'),ctx);assert.equal(unknown.exitCode,1);
+ const launches=createLaunches(host.bb.storage.database());
+ const held=launches.forTask('proj_1','thr_cap','c1');assert.equal(held.state,'uncertain');assert.equal(held.creationRequested,true);
+ const other=await host.harness.behavior.runCli(recover('next-model'),ctx);assert.equal(other.exitCode,1);assert.match(other.stderr,/immutable request/);
+ assert.equal(host.harness.sdk.callsTo('threads.spawn').length,1);assert.equal(state.n,0);
+ const after=launches.forTask('proj_1','thr_cap','c1');assert.equal(after.key,held.key);assert.equal(after.state,'uncertain');
+ }finally{await host.harness.lifecycle.dispose();}
+});

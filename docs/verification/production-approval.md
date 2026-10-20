@@ -62,6 +62,14 @@ A push during merge preparation cannot silently replace the checked head.
 No new owner bypass flag was added. A verification waiver does not waive the
 approval card. Read-only checks and reversible PR preparation need no card.
 
+## GitHub status, pre-approval, and deploys
+
+Firstmate also posts an `Owner approval` commit status on the PR head, records
+an owner pre-approval judged by the Decisions model, and requires
+`bb firstmate prod-check` before a production merge or deploy. Captain resolve
+on an approval card cancels it. Details, limits, and the install step are in
+`docs/verification/owner-approval.md`.
+
 ## Evidence
 
 Before: `production merge without an owner approval card is refused` failed;

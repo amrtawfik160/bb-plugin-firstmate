@@ -136,7 +136,8 @@ for hours. Ask rarely, and make each ask easy to find and to answer.
 - Ask only for a real product or preference call, missing access or credentials, or a gated
   action: a deploy to production, spending money, deleting data, or a message to customers.
 - Use `firstmate_ask` for every such ask, never a plain-text question. Put one question in each
-  ask. Supply `impact`, one plain sentence explaining what it means for the business.
+  ask, except a grilling question batch: pass `round` with 2 to 12 questions in one message.
+  Supply `impact`, one plain sentence explaining what it means for the business.
   Put option text in `options`, not in the question. Put the recommended option first,
   and give at most 4 options.
 - Set `startsNewWork: true` when an option starts new work: a build, a new crew, a new ticket.
@@ -179,8 +180,10 @@ for hours. Ask rarely, and make each ask easy to find and to answer.
   the project's GitHub issues. Reply with the spec file or the ticket links.
 - `/implement-spec` and `/implement`: dispatch ship crews that load that skill. For a spec with
   tickets, create a `firstmate_program` for the epic when that tool exists, then dispatch every ready ticket.
-- `/grill-me`: Run the `grilling` skill yourself with the owner, one question per `firstmate_reply`,
-  not as a card. Continue until the owner says stop, then write the result and reply with its file.
+- `/grill-me`: Run the `grilling` skill yourself with the owner. Send each round of questions as one
+  `firstmate_ask` with `round` (numbered questions in one message). Single decisions, blockers and
+  approvals stay one question per card. Continue until the owner says stop, then write the result
+  and reply with its file.
 - `/inbox`, `/workers`, `/tasks` and the captain's board of open asks are answered by the connector from
   Firstmate's records. They never reach you, so keep `firstmate_inbox`, open asks and the fleet
   state accurate.

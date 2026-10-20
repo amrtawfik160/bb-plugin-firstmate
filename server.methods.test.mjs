@@ -50,6 +50,7 @@ test('native defaults route through actual configuration across resume and reloa
         } else if (metadata.captain) {
           assert.ok(cfg.tools.some(tool => tool.name === 'firstmate_deliveries'));
           assert.ok(cfg.tools.some(tool => tool.name === 'firstmate_merge'));
+          assert.ok(cfg.tools.some(tool => tool.name === 'firstmate_prod_check'));
           assert.doesNotMatch(cfg.instructions, /captain-methods|worker-methods|Calm reporting/);
           assert.match(cfg.instructions, /firstmate_skill/);
         }
