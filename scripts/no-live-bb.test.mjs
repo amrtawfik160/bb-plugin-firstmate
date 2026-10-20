@@ -51,13 +51,31 @@ test('the preload drops BB_CLI and keeps a shell level a test sets itself', () =
   assert.deepEqual(JSON.parse(read({ SHLVL: '0' }).stdout), ['1', null]);
 });
 
-test('npm test puts a blocking bb first on PATH, which refuses and logs every call', () => {
+test('npm test and CI run tests in one environment that puts the blocking stand-ins first on PATH', () => {
   const script = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).scripts.test;
-  assert.match(script, /PATH="\$PWD\/test\/no-live-github:\$PWD\/test\/no-live-bb:\$PATH"/);
-  assert.match(script, /--import \.\/test\/no-live-bb\.mjs/);
-  assert.match(script, /-u BB_CLI /);
+  assert.match(script, /^sh scripts\/run-tests\.sh \S+\.test\./);
   const workflow = readFileSync(join(root, '.github/workflows/checks.yml'), 'utf8');
-  assert.match(workflow, /--import \.\/test\/no-live-bb\.mjs/);
+  assert.match(workflow, /\n\s+sh scripts\/run-tests\.sh \$files\n/);
+  assert.doesNotMatch(workflow, /node --test/, 'CI must not bypass the shared test environment');
+  // What a test process gets from the shared runner: a fake node reports it.
+  const dir = mkdtempSync(join(tmpdir(), 'fm-no-live-bb-run-'));
+  try {
+    writeFileSync(join(dir, 'node'), '#!/bin/sh\nprintf "%s\\n" "$PATH" "${BB_CLI-unset}" "$FM_NO_LIVE_NETWORK" "$GH_CONFIG_DIR" "$(command -v bb)" "$(command -v gh)" "$*"\n', { mode: 0o755 });
+    const run = spawnSync('sh', [join(root, 'scripts/run-tests.sh'), 'a.test.ts'], { encoding: 'utf8', env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, BB_CLI: '/real/bb', GH_TOKEN: 'x' } });
+    assert.equal(run.status, 0, run.stderr);
+    const [path, bbCli, offline, ghConfig, bb, gh, args] = run.stdout.split('\n');
+    assert.ok(path.startsWith(`${join(root, 'test/no-live-github')}:${join(root, 'test/no-live-bb')}:`), path);
+    assert.equal(bb, join(root, 'test/no-live-bb/bb'));
+    assert.equal(gh, join(root, 'test/no-live-github/gh'));
+    assert.equal(bbCli, 'unset');
+    assert.equal(offline, '1');
+    assert.equal(ghConfig, join(root, 'test/no-live-github/config'));
+    assert.match(args, /--import \.\/test\/no-live-bb\.mjs/);
+    assert.match(args, / a\.test\.ts$/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('the blocking bb stand-in refuses and logs every call', () => {
   const dir = mkdtempSync(join(tmpdir(), 'fm-no-live-bb-log-'));
   try {
     const log = join(dir, 'calls');

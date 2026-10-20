@@ -107,9 +107,10 @@ real `gh`, which refused unauthenticated.
 
 Fixing one fixture at a time left the rest exposed, so every test process now loads
 `test/no-live-bb.mjs`. It raises a missing or zero `SHLVL` to 1, so a child `bash -c` is
-level 2 and never reads `~/.bashrc`, and it drops `BB_CLI`. `npm test` also puts the
-blocking stand-in `test/no-live-bb/bb` (exit 97, optional `FM_LIVE_BB_LOG`) after the `gh`
-one on `PATH`, and unsets `BB_CLI`. The dev-link test checks that its shell resolves its
+level 2 and never reads `~/.bashrc`, and it drops `BB_CLI`. `npm test` and CI run tests
+through one script, `scripts/run-tests.sh`, so their environments cannot drift. It puts
+the blocking stand-in `test/no-live-bb/bb` (exit 97, optional `FM_LIVE_BB_LOG`) after the
+`gh` one first on `PATH`, loads the preload, and unsets `BB_CLI`. The dev-link test checks that its shell resolves its
 own fake `bb` before the script runs. `scripts/no-live-bb.test.mjs` reproduces the escape
 with a decoy `bb` in a throwaway `HOME` and proves the guard.
 
