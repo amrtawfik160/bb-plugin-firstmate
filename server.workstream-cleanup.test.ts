@@ -33,9 +33,13 @@ async function foldedTask() {
     ['cap', { status: 'idle' }],
     ['thr_task', { status: 'idle', environmentId: 'env_task', parentThreadId: 'cap' }],
   ]);
-  const lists = { occupants: new Map<string, Row[]>([['env_task', [{ id: 'thr_task', archivedAt: null }]]]), children: [] as Row[], project: [] as Row[] };
+  const lists = { occupants: new Map<string, Row[]>([['env_task', [{ id: 'thr_task', archivedAt: null, status: 'idle' }]]]), children: [] as Row[], project: [] as Row[] };
   const archived: string[] = [];
+  const unarchived: string[] = [];
+  const stopped: string[] = [];
   const commands: string[] = [];
+  // What BB does inside the archive call; by default it archives just this thread.
+  let onArchive: (threadId: string) => string[] = (threadId) => [threadId];
   let unsaved = 'FM_UNSAVED checked';
   let duringCheck: () => void = () => {};
   let archiveError: Error | undefined;
@@ -61,12 +65,15 @@ async function foldedTask() {
   host.harness.sdk.stub('threads.archive', async ({ threadId }: { threadId: string }) => {
     if (archiveError) throw archiveError;
     archived.push(threadId);
-    return { archivedThreadIds: [threadId] };
+    return { ok: true, archivedThreadIds: onArchive(threadId) };
   });
+  host.harness.sdk.stub('threads.unarchive', async ({ threadId }: { threadId: string }) => { unarchived.push(threadId); return { ok: true }; });
+  host.harness.sdk.stub('threads.stop', async ({ threadId }: { threadId: string }) => { stopped.push(threadId); return { ok: true }; });
   host.harness.sdk.stub('plugins.callRpc', async () => ({ ok: true, queued: 1, duplicate: false }));
   const job = () => seeded.get(w.id, 'cap').jobs.find((j) => j.id === 'crew1')!;
   return {
-    host, tasks, task, threads, lists, archived, commands, job,
+    host, tasks, task, threads, lists, archived, unarchived, stopped, commands, job,
+    whenArchived: (fn: (threadId: string) => string[]) => { onArchive = fn; },
     pass: () => host.harness.behavior.runSchedule('workstreams'),
     set: (knobs: { unsaved?: string; duringCheck?: () => void; archiveError?: Error }) => {
       if (knobs.unsaved !== undefined) unsaved = knobs.unsaved;
@@ -94,7 +101,7 @@ test('each reason to keep a crew leaves cleanup pending and archives nothing', a
     ['captain in a turn', (f) => f.threads.set('cap', { status: 'active' }), /captain/],
     ['child thread', (f) => { f.lists.children = [{ id: 'thr_child', archivedAt: null }]; }, /child threads/],
     ['lifecycle dependent', (f) => { f.lists.project = [{ id: 'thr_dep', archivedAt: null, lifecycleOwnerThreadId: 'thr_task' }]; }, /child threads/],
-    ['shared worktree', (f) => f.lists.occupants.set('env_task', [{ id: 'thr_task', archivedAt: null }, { id: 'thr_retry', archivedAt: null }]), /shared with thr_retry/],
+    ['shared worktree', (f) => f.lists.occupants.set('env_task', [{ id: 'thr_task', archivedAt: null, status: 'idle' }, { id: 'thr_retry', archivedAt: null, status: 'idle' }]), /shared with thr_retry/],
     ['another open task', (f) => {
       const other = f.tasks.open({ captain: 'cap', project: 'Cyndra SaaS', projectId: 'cyndra', title: 'Other', sourceRefs: ['tg:42:2'], at: Date.now() });
       f.tasks.attach(other.id, 'cap', { crewId: 'crew1', sourceRefs: [], project: { id: 'cyndra', label: 'Cyndra SaaS' }, at: Date.now() });
@@ -137,9 +144,53 @@ test('unsaved work keeps the worktree, and an archive failure leaves cleanup pen
     f.set({ unsaved: 'FM_UNSAVED checked', archiveError: new Error('BB refused the archive') });
     await f.pass();
     assert.equal(f.job().cleanup, 'pending');
-    assert.match(f.job().note ?? '', /cleanup pending: BB refused the archive/);
+    assert.match(f.job().note ?? '', /archive failed \(BB refused the archive\); archive undone/);
+    assert.deepEqual(f.unarchived, ['thr_task'], 'an archive request that may have reached BB is undone');
     f.set({});
     await f.pass();
     assert.equal(f.job().cleanup, 'done');
+  } finally { await f.host.harness.lifecycle.dispose(); }
+});
+
+test('a turn started just before the archive keeps running: the archive is undone within the grace and logged once', async () => {
+  const f = await foldedTask();
+  try {
+    // BB accepts the archive although a turn started after the last read; its grace keeps the turn running.
+    f.whenArchived((threadId) => { f.threads.set(threadId, { ...f.threads.get(threadId), status: 'active' }); return [threadId]; });
+    await f.pass();
+    assert.deepEqual(f.archived, ['thr_task']);
+    assert.deepEqual(f.unarchived, ['thr_task']);
+    assert.deepEqual(f.stopped, [], 'the new turn is never stopped');
+    assert.equal(f.threads.get('thr_task')!.status, 'active', 'the turn keeps running');
+    assert.equal(f.job().cleanup, 'pending');
+    assert.match(f.job().note ?? '', /work started while archiving; archive undone/);
+    f.threads.set('thr_task', { ...f.threads.get('thr_task'), status: 'idle' });
+    await f.pass();
+    assert.deepEqual(f.unarchived, ['thr_task', 'thr_task']);
+    const undoLogs = f.host.harness.inspection.logEntries.filter((entry) => entry.level === 'warn' && entry.message.includes('workstream task cleanup: thr_task'));
+    assert.equal(undoLogs.length, 1, 'a repeated undo is logged once');
+    f.threads.set('thr_task', { ...f.threads.get('thr_task'), status: 'idle' });
+    f.whenArchived((threadId) => [threadId]);
+    await f.pass();
+    assert.equal(f.job().cleanup, 'done');
+    assert.deepEqual(f.unarchived, ['thr_task', 'thr_task']);
+  } finally { await f.host.harness.lifecycle.dispose(); }
+});
+
+test('an archive that BB widened to other threads, or one that work started beside, is undone for every thread it took', async () => {
+  const f = await foldedTask();
+  try {
+    f.whenArchived((threadId) => [threadId, 'thr_hidden_source']);
+    await f.pass();
+    assert.deepEqual(f.unarchived, ['thr_task', 'thr_hidden_source'], 'the crew thread first, then the rest');
+    assert.match(f.job().note ?? '', /BB also archived thr_hidden_source; archive undone/);
+    assert.equal(f.job().cleanup, 'pending');
+    const g = await foldedTask();
+    try {
+      g.whenArchived((threadId) => { g.lists.occupants.set('env_task', [{ id: threadId, archivedAt: 1 }, { id: 'thr_late', archivedAt: null, status: 'active' }]); return [threadId]; });
+      await g.pass();
+      assert.deepEqual(g.unarchived, ['thr_task']);
+      assert.match(g.job().note ?? '', /work started while archiving/);
+    } finally { await g.host.harness.lifecycle.dispose(); }
   } finally { await f.host.harness.lifecycle.dispose(); }
 });
