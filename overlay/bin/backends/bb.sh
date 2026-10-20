@@ -403,6 +403,7 @@ $prompt"
   [ -z "$provider" ] || set -- "$@" --provider "$provider"
   [ -z "$model" ] || set -- "$@" --model "$model"
   [ -z "$reasoning" ] || set -- "$@" --reasoning-level "$reasoning"
+  [ -n "${FM_BB_ATTEMPT_TOKEN:-}" ] && set -- "$@" --attempt-token "$FM_BB_ATTEMPT_TOKEN"
   out=$(fm_backend_bb_run_json "$@")
   local spawn_status=$?
   rm -f "$prompt_file"
