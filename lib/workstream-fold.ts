@@ -160,6 +160,27 @@ export function parseFoldInspect(output: string): { head: string; hasTarget: boo
   return { head, hasTarget: foldValue(output, "HAS_TARGET") === "yes", files: marker < 0 ? [] : lines.slice(marker + 1) };
 }
 
+/**
+ * A folded task's own PR ends without an owner decision only when its head is the task's branch and the
+ * workstream branch holds every one of its commits, its head commit too: then its work ships in the
+ * workstream PR. A merged PR is never disposed.
+ */
+export function foldedPrVerdict(pr: { state: string; headRefName: string; headRefOid: string; commits: readonly string[] }, taskBranches: readonly string[], contained: ReadonlySet<string>):
+  { action: "dispose" } | { action: "keep"; reason: string } {
+  if (pr.state.toUpperCase() === "MERGED") return { action: "keep", reason: "it is merged" };
+  if (!taskBranches.includes(pr.headRefName)) return { action: "keep", reason: `its head ${pr.headRefName} is not this task's branch` };
+  if (pr.commits.length === 0) return { action: "keep", reason: "its commits could not be read" };
+  const commits = [...new Set([...pr.commits, pr.headRefOid].filter(Boolean))];
+  const missing = commits.filter((sha) => !contained.has(sha)).length;
+  if (missing > 0) return { action: "keep", reason: `${missing} of ${commits.length} commits are not in the workstream branch` };
+  return { action: "dispose" };
+}
+
+/** The note on a folded task's PR and the reason its delivery ends. */
+export function foldedPrNote(workstream: string, workstreamPr: string | null): string {
+  return `Folded into workstream ${workstream}; its commits ship in the workstream PR ${workstreamPr ?? "when it is opened"}.`;
+}
+
 /** One `FOLD_<NAME> <value>` line of a fold script, or undefined. */
 export function foldValue(output: string, name: string): string | undefined {
   const prefix = `FOLD_${name} `;

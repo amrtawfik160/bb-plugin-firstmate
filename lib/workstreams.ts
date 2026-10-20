@@ -79,7 +79,8 @@ export type WorkstreamDeps = {
   foldOps?: FoldOps;
   tell?: (w: Workstream, job: WorkstreamJob, message: string) => Promise<void>;
   archive?: (w: Workstream, job: WorkstreamJob) => Promise<ArchiveOutcome>;
-  deleteBranch?: (w: Workstream, job: WorkstreamJob) => Promise<void>;
+  /** Deletes a folded task's branch; returns why a branch was kept (its open PR holds work the fold did not take). */
+  deleteBranch?: (w: Workstream, job: WorkstreamJob) => Promise<string | void>;
   unsavedJob?: (w: Workstream, job: WorkstreamJob) => Promise<string[]>;
   restartDev?: (w: Workstream) => Promise<void>;
   card?: (w: Workstream) => Promise<void>;
@@ -407,11 +408,13 @@ export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
         ? holdCleanup(w, job, 'kept-unsaved', `kept: unsaved work (${outcome.findings.join(', ')})`)
         : holdCleanup(w, job, 'pending', `cleanup waits: ${outcome.kept}`);
     }
+    let kept: string | void = undefined;
     if (foldedWork) {
-      try { await deps.deleteBranch?.(w, job); } catch (error) { deps.error?.(w, error); }
+      try { kept = await deps.deleteBranch?.(w, job); } catch (error) { deps.error?.(w, error); }
     }
     job.cleanup = 'done';
-    if (doneNote) job.note = doneNote; else delete job.note;
+    const note = kept || doneNote;
+    if (note) job.note = note; else delete job.note;
     await bumpCard(w);
   }
   async function drain(w: Workstream) {

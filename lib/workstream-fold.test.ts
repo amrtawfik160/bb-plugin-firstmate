@@ -7,6 +7,8 @@ import {
   currentJobs,
   crewOwnTestsPassed,
   FAILED_KEEP_MS,
+  foldedPrNote,
+  foldedPrVerdict,
   foldTouchesDevFiles,
   formatWorkstreamLookup,
   isAdoptedWorkstream,
@@ -133,4 +135,18 @@ test("a crew is archived only when nothing still needs it", () => {
   assert.match(archiveKeepReason({ ...clear, others: ["thr_retry"] })!, /shared with thr_retry/);
   assert.match(archiveKeepReason({ ...clear, heldBy: ["task T2"] })!, /still used by task T2/);
   assert.equal(archiveKeepReason({ ...clear, threads: [{ ...idle, status: "active", archived: true }] }), null);
+});
+
+test("a fold disposes a task PR only when its head is the task branch and the workstream branch holds every commit", () => {
+  const pr = { state: "CLOSED", headRefName: "task/one", headRefOid: "c", commits: ["a", "b", "c"] };
+  const all = new Set(["a", "b", "c"]);
+  assert.deepEqual(foldedPrVerdict(pr, ["task/one"], all), { action: "dispose" });
+  assert.deepEqual(foldedPrVerdict({ ...pr, state: "OPEN" }, ["task/one"], all), { action: "dispose" });
+  assert.deepEqual(foldedPrVerdict(pr, ["task/one"], new Set(["a", "b"])), { action: "keep", reason: "1 of 3 commits are not in the workstream branch" });
+  assert.deepEqual(foldedPrVerdict({ ...pr, headRefOid: "d" }, ["task/one"], all), { action: "keep", reason: "1 of 4 commits are not in the workstream branch" }, "the PR head counts too");
+  assert.deepEqual(foldedPrVerdict({ ...pr, state: "MERGED" }, ["task/one"], all), { action: "keep", reason: "it is merged" });
+  assert.deepEqual(foldedPrVerdict({ ...pr, headRefName: "workstream/ws-1" }, ["task/one"], all), { action: "keep", reason: "its head workstream/ws-1 is not this task's branch" });
+  assert.deepEqual(foldedPrVerdict({ ...pr, commits: [] }, ["task/one"], all), { action: "keep", reason: "its commits could not be read" });
+  assert.equal(foldedPrNote("Cyndra SaaS UI", null), "Folded into workstream Cyndra SaaS UI; its commits ship in the workstream PR when it is opened.");
+  assert.equal(foldedPrNote("Cyndra SaaS UI", "https://github.com/acme/repo/pull/9"), "Folded into workstream Cyndra SaaS UI; its commits ship in the workstream PR https://github.com/acme/repo/pull/9.");
 });

@@ -381,3 +381,27 @@ test("a PR read unchanged is read less and less often, and any change or pending
   now = pushed.nextCheckAt;
   for (let read = 0; read < 5; read++) { const next = store.observe(r.id, { ...seen, headSha: "b2", checks: "pending" }, false, now); assert.ok(next.nextCheckAt - now <= 2 * 60_000, "pending checks are read at least every two minutes"); now = next.nextCheckAt; }
 });
+
+// 20 Oct: a fold deleted the task branch of Cyndra PR 2581, GitHub closed the PR, and its row waited for an
+// owner decision although the workstream branch held every commit of it.
+test("a folded task PR ends with the fold's reason and no notice; a merged PR or an earlier decision is kept", () => {
+  const store = createDeliveries(new DatabaseSync(":memory:") as never);
+  const reason = "Folded into workstream Cyndra SaaS UI; its commits ship in the workstream PR when it is opened.";
+  store.save(record(1, { taskId: "c1", status: "closed-needs-disposition", forgeState: "closed", blocker: "PR closed without merge", notification: { desired: "closed", delivered: null, queued: null, retryAt: 0 } }));
+  const ended = store.disposeFolded("acme/repo#1", reason, "workstream:ws-1", 5_000);
+  assert.equal(ended.status, "explicitly-abandoned");
+  assert.deepEqual(ended.disposition, { reason, actor: "workstream:ws-1", at: 5_000 });
+  assert.equal(ended.notification.desired, null, "nothing goes to the captain");
+  assert.equal(ended.blocker, "");
+  assert.equal(ended.nextAction, reason);
+  assert.deepEqual(store.undecided("c1", "proj_1"), []);
+  const closed = { headSha: "sha", state: "closed", draft: false, checks: "unknown", review: "unknown", reviewHeadSha: null, mergeCommitSha: null, mergeable: "unknown" } as const;
+  assert.equal(store.observe("acme/repo#1", closed, false).status, "explicitly-abandoned", "a later read keeps it ended");
+  store.save(record(2, { status: "pr-delivered", forgeState: "open" }));
+  assert.equal(store.disposeFolded("acme/repo#2", reason, "workstream:ws-1").status, "explicitly-abandoned", "an open PR the fold closes ends too");
+  store.save(record(3, { status: "merged-unverified", forgeState: "merged", mergeCommitSha: "m".repeat(40) }));
+  assert.throws(() => store.disposeFolded("acme/repo#3", reason, "workstream:ws-1"), /merged/);
+  store.save(record(4, { status: "explicitly-abandoned", disposition: { reason: "the owner dropped it", actor: "thr_cap", at: 1 } }));
+  assert.equal(store.disposeFolded("acme/repo#4", reason, "workstream:ws-1").disposition?.reason, "the owner dropped it");
+  assert.throws(() => store.disposeFolded("acme/repo#9", reason, "workstream:ws-1"), /Unknown deliverable/);
+});

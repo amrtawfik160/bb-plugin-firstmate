@@ -131,6 +131,8 @@ import {
   WORKSTREAM_CARD_METHOD,
   archiveKeepReason,
   currentJobs,
+  foldedPrNote,
+  foldedPrVerdict,
   foldValue,
   isAdoptedWorkstream,
   parseFoldInspect,
@@ -2806,12 +2808,17 @@ export default async function plugin(bb: BbPluginApi) {
       if (undone) return { kept: undone };
     }),
     deleteBranch: async (w, job) => {
+      const kept: string[] = [];
       for (const checkout of jobCheckouts(job)) {
         const repo = w.repos.find((r) => r.repository === checkout.repository);
         if (!repo || !checkout.branch || checkout.branch === repo.branch) continue;
+        const why = await closeFoldedPrs(w, repo, job, checkout.branch)
+          .catch((error) => `its open PRs could not be checked (${truncate(error instanceof Error ? error.message : String(error), 200)})`);
+        if (why) { kept.push(`branch ${checkout.branch} kept: ${why}`); continue; }
         await workstreamCommand({ hostId: checkout.hostId || repo.hostId }, `bash -c ${shQuote(deleteTaskBranchScript(repo.sourcePath, checkout.branch))}`)
           .catch((error) => bb.log.warn(`task branch ${checkout.branch}: ${String(error)}`));
       }
+      return kept.join("; ") || undefined;
     },
     unsavedJob: async (w, job) => taskUnsaved(w, cleanupJobs(w, job)),
     restartDev: async (w) => {
@@ -3326,6 +3333,59 @@ export default async function plugin(bb: BbPluginApi) {
         entry.note = `not checked: ${truncate(error instanceof Error ? error.message : String(error), 200)}`;
       }
     }
+  }
+
+  // A folded task's own PR (Cyndra PR 2581, 20 Oct: the fold deleted its branch, GitHub closed it, and it waited
+  // for the owner) ends without an owner decision when the workstream branch holds every commit of it.
+  async function foldedTaskPr(w: Workstream, repo: WorkstreamRepo, job: WorkstreamJob, url: string): Promise<{ dispose: string } | { keep: string }> {
+    const prefix = `cd -- ${shQuote(repo.path)} && `;
+    const view = z.object({ state: z.string(), headRefName: z.string(), headRefOid: z.string(), commits: z.array(z.object({ oid: z.string() })) })
+      .parse(JSON.parse(await workstreamCommand(repo, prefix + `gh pr view ${shQuote(url)} --json state,headRefName,headRefOid,commits`)));
+    const commits = view.commits.map((c) => c.oid);
+    const contained = commits.length === 0 ? new Set<string>() : parseContained(await workstreamCommand(repo, `bash -c ${shQuote(prContainsScript(repo.path, `refs/heads/${repo.branch}`, [...new Set([...commits, view.headRefOid])]))}`));
+    const verdict = foldedPrVerdict({ ...view, commits }, jobCheckouts(job).map((c) => c.branch), contained);
+    if (verdict.action === "keep") return { keep: verdict.reason };
+    const workstreamPr = z.array(z.object({ url: z.string() })).parse(JSON.parse(await workstreamCommand(repo, prefix + `gh pr list --head ${shQuote(repo.branch)} --state open --json url --limit 1`)));
+    return { dispose: foldedPrNote(w.name, workstreamPr[0]?.url ?? null) };
+  }
+
+  // Deleting a task branch closes its open PRs on GitHub. Before that, each one is closed here with a note and
+  // its delivery ends, only when every one of them may be; otherwise the branch and its PRs stay, and the
+  // reason is returned.
+  async function closeFoldedPrs(w: Workstream, repo: WorkstreamRepo, job: WorkstreamJob, branch: string): Promise<string | null> {
+    const prefix = `cd -- ${shQuote(repo.path)} && `;
+    const open = z.array(z.object({ url: z.string() })).parse(JSON.parse(await workstreamCommand(repo, prefix + `gh pr list --head ${shQuote(branch)} --state open --json url`)));
+    const closing: Array<{ url: string; note: string }> = [];
+    for (const pr of open) {
+      const check = await foldedTaskPr(w, repo, job, pr.url);
+      if ("keep" in check) return `${pr.url} stays open: ${check.keep}`;
+      closing.push({ url: pr.url, note: check.dispose });
+    }
+    for (const { url, note } of closing) {
+      await workstreamCommand(repo, prefix + `gh pr close ${shQuote(url)} --comment ${shQuote(note)}`);
+      const id = canonicalPr(url).id;
+      if (deliveries.get(id)) deliveries.disposeFolded(id, note, `workstream:${w.id}`);
+      bb.log.info(`workstream ${w.id}: closed ${url}, folded into ${repo.branch}`);
+    }
+    return null;
+  }
+
+  // A PR read as closed that belongs to a folded task of a workstream gets the same end, with no owner notice.
+  async function disposeClosedFoldedPr(record: DeliveryRecord): Promise<DeliveryRecord> {
+    for (const w of workstreams.listAll()) {
+      const job = w.jobs.find((j) => j.id === record.taskId && j.state === "folded");
+      const repo = job && w.repos.find((r) => r.repository.toLowerCase() === record.repository);
+      if (!job || !repo) continue;
+      try {
+        const check = await foldedTaskPr(w, repo, job, record.url);
+        if ("dispose" in check) return deliveries.disposeFolded(record.id, check.dispose, `workstream:${w.id}`);
+        bb.log.info(`${record.id} of folded task ${job.id} stays closed-needs-disposition: ${check.keep}`);
+      } catch (error) {
+        bb.log.info(`${record.id} of folded task ${job.id} not checked: ${truncate(error instanceof Error ? error.message : String(error), 200)}`);
+      }
+      return record;
+    }
+    return record;
   }
 
   // Ship's merge of a created workstream's PR. The PR's branch is the workstream branch, so the merge runs on
@@ -9818,6 +9878,7 @@ export default async function plugin(bb: BbPluginApi) {
       signal?.throwIfAborted();
       const previousHead = record.headSha ?? "";
       let observed=deliveries.observe(record.id,observation,authorized,Date.now(),unverifiedStanding);
+      if (observed.status === "closed-needs-disposition") observed=await disposeClosedFoldedPr(observed);
       if (observed.status === "merged-needs-verification" && ownerWorksHeadTap(observed)) {
         const applied = await applyOwnerWorksTapToMerge(observed, signal);
         if (applied.ok) observed = applied.record;
