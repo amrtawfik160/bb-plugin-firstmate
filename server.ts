@@ -546,10 +546,13 @@ class NativeSpawnAttemptError extends Error {
 // terminal still exits on its own. Scrollback stays readable after exit. Bulky or
 // arbitrary payloads never travel as terminal stdin — the PTY line discipline (canonical mode) buffers+echoes input without delivering it to
 // the reading process, so writes hung until timeout; payloads are staged to a host
-// file via writeHostBytes and fed with `< file` instead.
+// file via writeHostBytes and fed with `< file` instead. The PTY also makes git and gh
+// page any output longer than the 30 terminal rows and wait for a key that never comes
+// (a fold's `git diff --name-only` hung every pass, 2026-10-20), so pagers are off after
+// the login profile runs.
 function wrapHostCommand(command: string): string {
   const assigned = `__fm_cmd=${shQuote(command)}`;
-  const run = '"${SHELL:-/bin/bash}" -lc "$__fm_cmd"';
+  const run = '"${SHELL:-/bin/bash}" -lc "export GIT_PAGER= GH_PAGER=; $__fm_cmd"';
   const script = `${assigned}; set +e; ${run}; __fm_ec=$?; printf '\\n${HOST_RC_MARKER}:%s\\n' "$__fm_ec"; sleep ${HOST_TERMINAL_LINGER_S}`;
   if (script.length > HOST_COMMAND_MAX) {
     throw new Error(`Host command too long (${script.length} > ${HOST_COMMAND_MAX}). Stage bulky payloads with writeHostBytes.`);
