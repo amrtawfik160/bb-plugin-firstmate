@@ -38,8 +38,10 @@ test('the package test script and CI load the cleanup and the guard', async () =
   const { readFileSync } = await import('node:fs');
   const script = JSON.parse(readFileSync('package.json', 'utf8')).scripts.test;
   const ci = readFileSync('.github/workflows/checks.yml', 'utf8');
-  for (const text of [script, ci]) {
-    assert.match(text, /--import \.\/test\/temp-cleanup\.mjs/);
-    assert.match(text, /--test-global-setup=\.\/test\/temp-guard\.mjs/);
-  }
+  // Both run tests through the one shared test environment (scripts/run-tests.sh).
+  assert.match(script, /^sh scripts\/run-tests\.sh /);
+  assert.match(ci, /\n\s+sh scripts\/run-tests\.sh \$files\n/);
+  const runner = readFileSync('scripts/run-tests.sh', 'utf8');
+  assert.match(runner, /--import \.\/test\/temp-cleanup\.mjs/);
+  assert.match(runner, /--test-global-setup=\.\/test\/temp-guard\.mjs/);
 });

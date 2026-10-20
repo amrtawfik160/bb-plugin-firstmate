@@ -1952,10 +1952,11 @@ test("a crew that fails, stops, finishes or is archived hands its owner messages
     ["failed", (host: Host) => host.harness.behavior.emitThreadEvent("thread.failed", { thread: makeThreadResponse({ id: "thr_c1", status: "error" }), error: "boom" })],
     ["done", (host: Host) => host.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_c1", status: "idle" }), lastAssistantText: "DONE: login fixed" })],
     ["stopped", (host: Host) => host.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: "thr_c1", status: "stopping" }), lastAssistantText: "Working on it" })],
-    ["archived", async (host: Host) => {
-      // Archive effects apply while BB still reports the thread archived.
-      host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: threadId === "thr_c1" ? "idle" : "active", ...(threadId === "thr_c1" ? { archivedAt: Date.now() } : {}) }));
-      await host.harness.behavior.emitThreadEvent("thread.archived", { thread: makeThreadResponse({ id: "thr_c1", status: "idle", archivedAt: Date.now() }) });
+    ["archived", (host: Host) => {
+      // The archive stands: BB reads it back with the event's own archive time.
+      const archivedAt = Date.now();
+      host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, status: threadId === "thr_c1" ? "idle" : "active", ...(threadId === "thr_c1" ? { archivedAt } : {}) }));
+      return host.harness.behavior.emitThreadEvent("thread.archived", { thread: makeThreadResponse({ id: "thr_c1", status: "idle", archivedAt }) });
     }],
   ] as const) {
     const host = await captainHost();

@@ -73,7 +73,11 @@ test('dev start executes only its dedicated systemd unit and exposes its fixed p
     for (const [name,body] of Object.entries(commands)) { writeFileSync(join(bin,name),`#!/bin/sh\n${body}\n`); chmodSync(join(bin,name),0o755); }
     const w: Workstream = {id:'ws-test',name:'Design',threadId:'cap',projectId:'p',requestId:'create',state:'open',supportsDevLink:true,provisioned:true,repos:[],taskIds:[],jobs:[],devLink:{state:'starting',port:5200,realLogin:false},closeTopicRequested:false,ship:{state:'idle'},createdAt:0,updatedAt:0};
     const repo = {repository:'cyndra-ai/app',projectId:'p',hostId:'h',path:'/fixture path',sourcePath:'/main',branch:'workstream/ws-test',environmentId:null};
-    const output = execFileSync('bash',['-c',devStartScript(w,repo,'bun x vite --port {port}','dev.example.test')],{encoding:'utf8',env:{...process.env,PATH:`${bin}:${process.env.PATH}`,TEST_LOG:log}});
+    const env = {...process.env,PATH:`${bin}:${process.env.PATH}`,TEST_LOG:log};
+    // The script ends in `bb connect expose`, which publishes a port. Before it runs, the same shell
+    // must resolve this fake bb; on 20 Oct a full run's bash resolved the real one (test/no-live-bb.mjs).
+    assert.equal(execFileSync('bash',['-c','command -v bb'],{encoding:'utf8',env}).trim(),join(bin,'bb'),'this test would reach the real bb');
+    const output = execFileSync('bash',['-c',devStartScript(w,repo,'bun x vite --port {port}','dev.example.test')],{encoding:'utf8',env});
     assert.match(output,/https:\/\/dev.example.test/);
     const calls = readFileSync(log,'utf8');
     assert.match(calls,/--unit=fm-workstream-ws-test.service/);

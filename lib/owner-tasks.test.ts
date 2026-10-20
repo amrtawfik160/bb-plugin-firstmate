@@ -216,3 +216,26 @@ test("a PR the captain links to a finished task reopens it on the next reconcile
   tasks.reconcile("c", (t) => t.id === "T3" ? [prRecord("amrtawfik160/safi#4", { status: "waiting-checks", forgeState: "open", openedAt: 5 })] : [], 61);
   assert.equal(tasks.get("T3")!.state, "working", "the captain linked it after the drop: that is new work");
 });
+
+test("unsaved-work cleanup records kept: unsaved work on the task without moving it", () => {
+  const tasks = createOwnerTasks(memoryDb());
+  tasks.open({ captain: "c", project: "Cyndra", title: "Banner", sourceRefs: ["tg:1:1"], crewId: "c1", at: 0 });
+  tasks.move("T1", "c", { to: "live", reason: "production OTA holds it" }, 10);
+  const kept = tasks.keepWorktree("T1", "c", "kept: unsaved work");
+  assert.equal(kept.state, "live");
+  assert.equal(kept.worktreeKept, "kept: unsaved work");
+  assert.equal(kept.updatedAt, 10);
+  assert.equal(kept.finishedAt, 10);
+  assert.equal(tasks.keepWorktree("T1", "c", "kept: unsaved work").updatedAt, 10);
+});
+
+test("the kept-worktree note clears once the worktree is removed", () => {
+  const tasks = createOwnerTasks(memoryDb());
+  tasks.open({ captain: "c", project: "Cyndra", title: "Banner", sourceRefs: ["tg:1:1"], crewId: "c1", at: 0 });
+  tasks.move("T1", "c", { to: "dropped", reason: "owner said stop", ref: "tg:1:2" }, 10);
+  tasks.keepWorktree("T1", "c", "kept: unsaved work");
+  const cleared = tasks.keepWorktree("T1", "c", null);
+  assert.equal(cleared.worktreeKept, undefined);
+  assert.equal(tasks.get("T1")!.worktreeKept, undefined);
+  assert.equal(cleared.state, "dropped");
+});
