@@ -112,3 +112,9 @@ blocking stand-in `test/no-live-bb/bb` (exit 97, optional `FM_LIVE_BB_LOG`) afte
 one on `PATH`, and unsets `BB_CLI`. The dev-link test checks that its shell resolves its
 own fake `bb` before the script runs. `scripts/no-live-bb.test.mjs` reproduces the escape
 with a decoy `bb` in a throwaway `HOME` and proves the guard.
+
+One test runs the installed BB on purpose: `scripts/plugin-package-discovery.test.mjs`
+locates the installed package past the stand-in, then runs it only against its own
+server, `HOME`, data folder and ports, with every `BB_` variable removed. The first full
+run with the guard also showed the stand-in refusing two `bb diagnostics cli-errors --json`
+calls that used to reach the real CLI.
