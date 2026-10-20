@@ -713,6 +713,41 @@ test("host command terminal lingers past BB's open window, then exits so a lost 
   }
 });
 
+test("host command in a terminal never waits in a pager: a fold's long git diff returns its exit code", { skip: spawnSync("script", ["--version"]).status !== 0 && "needs util-linux script for a pseudo-terminal" }, async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", fullParityOnDeck: false },
+  });
+  await plugin(host.bb); stubProviderCatalog(host);
+  const dir = mkdtempSync(join(tmpdir(), "fm-pager-"));
+  try {
+    stubCaptainDeck(host);
+    await host.harness.behavior.setSettings({ fmHostId: "host_1" });
+    stubRoutedHost(host, () => ({}));
+    await host.harness.behavior.runCli(["deck"], { threadId: "thr_cap", projectId: "proj_1" });
+    const created = host.harness.sdk.callsTo("terminals.create")[0]?.[0] as { start: { command: string } } | undefined;
+    assert.ok(created, "deck ran a host command");
+    const git = (...args: string[]) => assert.equal(spawnSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@t", ...args]).status, 0);
+    git("init", "-q");
+    git("commit", "-q", "--allow-empty", "-m", "before");
+    for (let i = 0; i < 80; i++) writeFileSync(join(dir, `f${i}`), `${i}\n`);
+    git("add", ".");
+    git("commit", "-q", "-m", "after");
+    // The real envelope with the fold's diff (80 lines, more than the 30 terminal rows) and no linger.
+    const envelope = created.start.command
+      .replace(/^__fm_cmd='[\s\S]*?'; set \+e; /, `__fm_cmd='git -C ${dir} diff --name-only HEAD~1 HEAD'; set +e; `)
+      .replace(/; sleep \d+$/, "");
+    const run = spawnSync("script", ["-qec", envelope, "/dev/null"], { encoding: "utf8", timeout: 8000, env: { ...process.env, SHELL: "/bin/bash", TERM: "xterm", PAGER: "less", GIT_PAGER: "less" } });
+    assert.equal(run.error, undefined, "the command waited in a pager");
+    assert.match(run.stdout, /\n__FM_HOST_RC:0\r?\n/);
+    assert.equal((run.stdout.match(/^f\d+\r?$/gm) ?? []).length, 80, "every changed file is printed");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("deck refuses missing environment before native setup or claimed readiness", async () => {
   const host = await load();
   try {
