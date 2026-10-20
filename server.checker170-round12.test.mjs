@@ -8,6 +8,7 @@ import plugin from './server.ts';
 import { createDeliveries, ownerWorksHeadTap } from './lib/pr-delivery.ts';
 import { createLaunches } from './lib/launch.ts';
 import { createOwnerTasks } from './lib/owner-tasks.ts';
+import { testEvidenceDir } from './test/approval-telegram-checkout.ts';
 
 process.env.FM_MERGEABLE_POLL_MS='0';
 
@@ -133,7 +134,7 @@ function mergedForge(h=head(130)) {
  return {headRefOid:h,state:'MERGED',isDraft:false,mergeable:'MERGEABLE',mergeCommit:{oid:MERGE_SHA},reviewDecision:'APPROVED',statusCheckRollup:[],createdAt:'2026-10-19T00:00:00Z'};
 }
 
-const probeEvidence='/root/.local/share/hanoon-telegram-plan/170-check-12/';
+const probeEvidence = testEvidenceDir();
 function observeStatusPosts(c,{failFirst=false}={}) {
  const byId=new Map();let n=0;const posts=[];
  c.host.harness.sdk.stub('terminals.create',async({start})=>{
