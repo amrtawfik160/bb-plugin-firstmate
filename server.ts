@@ -101,6 +101,7 @@ import { coalesceBatches, isBotOrAckText, parseConnectorHeader, parseInboundTele
 import { telegramFileRefusals } from "./lib/telegram-files.ts";
 import { connectorReplied, correlationOf, isTelegramRpcMissing, oldestUnanswered, sendTelegramReply, TELEGRAM_BRIDGE_PLUGIN_ID, TELEGRAM_REPLY_METHOD, telegramReplyFallbackBody, telegramReplyOutputSchema } from "./lib/telegram-reply.ts";
 import { ATTEMPT_TOKEN_ENVIRON_PY, attemptTokenFromAdmissionOutput, createLaunches, launchKey, launchTaskKey, discoverLaunch, discoverLaunchComplete, type LaunchRecord } from "./lib/launch.ts";
+import { captainWatchNeed, NATIVE_SOURCE_REPROBE_MS, NATIVE_WATCH_SOURCES, nativeWatchSourceScript, parseNativeWatchSource, WATCH_NEED_LOG, type NativeWatchSource, type WatchNeedReason } from "./lib/captain-watch-need.ts";
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
 import { optionHelp } from "./lib/cli-help.ts";
 import { AUDITED_BUNDLED_SNAPSHOTS, AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython } from "./lib/native-policy.ts";
@@ -325,6 +326,9 @@ function pushHeld(held: string[], text: string): { held: string[]; evicted: stri
 }
 
 const CREWS_KEY = "crews";
+const CAPTAIN_WATCH_STOPPED_PREFIX = "captain-watch-stopped:";
+const CAPTAIN_WATCH_WAKE_PREFIX = "captain-watch-wake:";
+const RETIRED_HOME_PREFIX = "captain-home-retired:";
 // BB caps one KV value at 256 KiB. Full briefs made the register overflow it at a few
 // hundred crews and every dispatch failed, so the register keeps a prefix only.
 const CREW_TASK_PREFIX = "crew-task:";
@@ -2193,6 +2197,9 @@ export default async function plugin(bb: BbPluginApi) {
   type HomeScope = { captain?: string; home?: string; host?: string };
   const homeScope = new AsyncLocalStorage<HomeScope>();
   const captainHomes = new Map<string, string>();
+  // Last host probe of each captain home's native wake sources, keyed by home. Any event that
+  // can create a source forgets the entry, so the next supervision pass probes again.
+  const nativeWatchProbes = new Map<string, { at: number; source: NativeWatchSource | "none" }>();
   for (const key of await bb.storage.kv.list("native-home:")) {
     const home = await bb.storage.kv.get<string>(key);
     if (typeof home === "string") captainHomes.set(key.slice("native-home:".length), home);
@@ -3733,6 +3740,10 @@ export default async function plugin(bb: BbPluginApi) {
         return { durable: false };
       }
       bb.log.info(`fm wake enqueued crew=${crew.id} key=${key} (note→status + pointer)`);
+      if (crew.parentThreadId) {
+        await bb.storage.kv.set(`${CAPTAIN_WATCH_WAKE_PREFIX}${crew.parentThreadId}`, true);
+        await ensureCaptainWatch(crew.parentThreadId, "queued-wake", signal);
+      }
       return { durable: true };
     } catch (error) {
       if (isAbortError(error)) throw error;
@@ -7392,6 +7403,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (prior && prior.shape !== input.shape && !replaceNativeBrief) throw new Error(`Start ${taskId} under a new id.`);
       const record = await launches.reserve({ key, taskId, projectId: input.projectId, owner: input.parentThreadId ?? "",
         home, generation: 1, shape: input.shape, deliveryMode:input.mode, yolo:input.yolo, deliveryRequirement:input.deliveryRequirement ?? "merged", state: "reserved", threadId: null, creationRequested: false, attemptToken: randomUUID(), updatedAt: Date.now() }, () => launchCapacity(input.parentThreadId));
+      if (input.parentThreadId) await ensureCaptainWatch(input.parentThreadId, "in-flight-launch");
       const resolved = await reconcileLaunch(record);
       if (resolved.state === "deleted") throw new Error(`Worker for launch ${taskId} was deleted by BB core. This attempt cannot be resumed.`);
       if (input.deliveryRequirement && input.deliveryRequirement !== recoveredContract({},resolved)) throw new Error("Retry cannot change the original delivery contract.");
@@ -13225,6 +13237,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
       stage('captain registration');await markDeck(threadId,startSignal);startSignal.throwIfAborted();
       await raceAbort(rememberWatchCaptain(ctx,threadId),startSignal,STUCK_HOST_CALL_MS);startSignal.throwIfAborted();
+      if (home) await ensureCaptainWatch(threadId, "captain-turn", startSignal);
       const renderedDigest=(!current.fullParityOnDeck||all||digest)?(stage('requested session digest'),await raceAbort(deckDigest(ctx,startSignal,all),startSignal)):undefined;
       const command=home?(captainStartupCommand(home,'session-start')??''):'';
       return {captain:true,threadId,realMode:!!home,nativeHome:home,hostId:host,ready:false,requiresAgentShell:!!home,startupCommand:command,digest:renderedDigest??null,
@@ -13232,7 +13245,17 @@ export default async function plugin(bb: BbPluginApi) {
     });
   }
 
-  async function runFmScript(input: {
+  // A native script can create a wake source fm-watch reports (a merge outcome, a registered
+  // check), so the home's native wake sources are probed again on the next supervision pass.
+  async function runFmScript(input: Parameters<typeof runNativeFmScript>[0]): ReturnType<typeof runNativeFmScript> {
+    try {
+      return await runNativeFmScript(input);
+    } finally {
+      if (!input.script.includes("bearings-snapshot")) nativeWatchProbes.delete(input.fmHome);
+    }
+  }
+
+  async function runNativeFmScript(input: {
     script: string;
     approvedHead?: string;
     args: string[];
@@ -18247,6 +18270,9 @@ export default async function plugin(bb: BbPluginApi) {
   });
   bb.events.on("thread.active", async ({ thread }) => {
     captainTurnStartedAt.set(thread.id, Date.now());
+    if (await bb.storage.kv.get(`native-home:${thread.id}`)) {
+      await ensureCaptainWatch(thread.id, "captain-turn");
+    }
     if (knownCaptainsRef.has(thread.id)) {
       // A real wake: the free-text reminder rides on this turn instead of starting one of its own.
       const flags = await reliabilityFlags();
@@ -20375,7 +20401,6 @@ export default async function plugin(bb: BbPluginApi) {
   // A deleted captain 404s forever. Its keeper would otherwise keep re-arming fm-watch
   // until the owner beat expired. Stop it, and record the home as retired so later
   // passes and reloads skip it. The home's files and its native-home binding are kept.
-  const RETIRED_HOME_PREFIX = "captain-home-retired:";
   async function retireDeletedCaptainHome(captain: string, signal?: AbortSignal): Promise<void> {
     const home = await bb.storage.kv.get<string>(`native-home:${captain}`);
     const host = await bb.storage.kv.get<string>(`native-home-host:${captain}`);
@@ -20384,6 +20409,95 @@ export default async function plugin(bb: BbPluginApi) {
     }
     await bb.storage.kv.set(`${RETIRED_HOME_PREFIX}${captain}`, true);
     bb.log.info(`captain home ${captain}: thread deleted; keeper stopped and the home is retired from supervision`);
+  }
+
+  async function captainHomeWatchNeed(captain: string, captainStatus: string, signal?: AbortSignal): Promise<WatchNeedReason> {
+    const queuedWake = (await bb.storage.kv.get(`${CAPTAIN_WATCH_WAKE_PREFIX}${captain}`)) === true;
+    const crews = (await readCrews()).filter((crew) => crew.parentThreadId === captain && !isSecondmateRoute(crew));
+    const statuses = crews.some((crew) => crew.threadId !== "") ? await statusesFor(crews, signal) : new Map<string, string>();
+    return captainWatchNeed({
+      captainStatus,
+      queuedWake,
+      crews: crews.map((crew) => ({
+        threadId: crew.threadId,
+        threadStatus: crew.threadId === "" ? null : statuses.get(crew.threadId) ?? null,
+      })),
+      launches: launches.list(captain).map((row) => ({ state: row.state })),
+    });
+  }
+
+  // A cached probe is reused for NATIVE_SOURCE_REPROBE_MS. That also bounds how long a stopped
+  // watcher can miss a source that no plugin event announced.
+  async function probeNativeWatchSource(hostId: string, fmHome: string, captain: string, signal?: AbortSignal): Promise<NativeWatchSource | "none"> {
+    const cached = nativeWatchProbes.get(fmHome);
+    if (cached && Date.now() - cached.at < NATIVE_SOURCE_REPROBE_MS) return cached.source;
+    const script = nativeWatchSourceScript({ binDirAssign: fmBinDirAssign(fmHome), fmHome, stateDir: wakeStateDir(fmHome, captain) });
+    let source: NativeWatchSource | "none";
+    try {
+      source = parseNativeWatchSource((await runOnHost(hostId, script, 15_000, signal)).output) ?? "unreadable";
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      source = "unreadable";
+    }
+    if (source === "unreadable") nativeWatchProbes.delete(fmHome);
+    else nativeWatchProbes.set(fmHome, { at: Date.now(), source });
+    return source;
+  }
+
+  async function resolveWatchNeed(
+    captain: string,
+    hostId: string,
+    fmHome: string,
+    captainStatus: string,
+    signal?: AbortSignal,
+  ): Promise<{ need: WatchNeedReason; source?: NativeWatchSource }> {
+    const need = await captainHomeWatchNeed(captain, captainStatus, signal);
+    if (need !== "nothing-live" && need !== "queued-wake") {
+      nativeWatchProbes.delete(fmHome);
+      return { need };
+    }
+    const source = await probeNativeWatchSource(hostId, fmHome, captain, signal);
+    if (source === "wake-queue") {
+      await bb.storage.kv.set(`${CAPTAIN_WATCH_WAKE_PREFIX}${captain}`, true);
+      return { need: "queued-wake" };
+    }
+    // Fail closed: an unreadable home keeps its watcher and its queued-wake flag.
+    if (source === "unreadable") return { need: need === "queued-wake" ? need : "native-source", source };
+    await bb.storage.kv.delete(`${CAPTAIN_WATCH_WAKE_PREFIX}${captain}`);
+    return source === "none" ? { need: "nothing-live" } : { need: "native-source", source };
+  }
+
+  function watchNeedLog(need: WatchNeedReason, source?: NativeWatchSource): string {
+    return source === undefined ? WATCH_NEED_LOG[need] : `${WATCH_NEED_LOG[need]}: ${NATIVE_WATCH_SOURCES[source]}`;
+  }
+
+  // Restarts a watcher the supervision pass stopped. A running watcher is left to the pass.
+  async function ensureCaptainWatch(captain: string, reason: Exclude<WatchNeedReason, "nothing-live">, signal?: AbortSignal): Promise<void> {
+    if (captain === "") return;
+    try {
+      const home = await bb.storage.kv.get<string>(`native-home:${captain}`);
+      const host = await bb.storage.kv.get<string>(`native-home-host:${captain}`);
+      if (typeof home !== "string" || home.trim() === "" || typeof host !== "string" || host === "") return;
+      nativeWatchProbes.delete(home);
+      if ((await bb.storage.kv.get(`${CAPTAIN_WATCH_STOPPED_PREFIX}${captain}`)) !== true) return;
+      if ((await bb.storage.kv.get(`${RETIRED_HOME_PREFIX}${captain}`)) === true) return;
+      await inCaptainHome(captain, async () => {
+        const s = await settings.get();
+        if (s.watchOwner !== "fm-watch") return;
+        const thread = await raceAbort(bb.sdk.threads.get({ threadId: captain }), signal, STUCK_HOST_CALL_MS);
+        if (thread.archivedAt != null) return;
+        const grace = Math.max(30, Number(s.watchHeartbeatSec) || 90);
+        const result = await superviseFmWatch(host, s.fmHome, grace, true, signal, captain);
+        if (!result) return;
+        if ((await bb.storage.kv.get(`${CAPTAIN_WATCH_STOPPED_PREFIX}${captain}`)) === true) {
+          await bb.storage.kv.delete(`${CAPTAIN_WATCH_STOPPED_PREFIX}${captain}`);
+          bb.log.info(`captain home ${captain}: watcher restarted (${WATCH_NEED_LOG[reason]})`);
+        }
+      });
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      bb.log.warn(`captain home ${captain}: watcher restart failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   bb.background.service("captain-home-watch", {
@@ -20418,12 +20532,38 @@ export default async function plugin(bb: BbPluginApi) {
                 await stopFmWatchKeeper(host, s.fmHome, signal);
                 return;
               }
+              const alreadyStopped = (await bb.storage.kv.get(`${CAPTAIN_WATCH_STOPPED_PREFIX}${captain}`)) === true;
+              const resolved = await resolveWatchNeed(captain, host, s.fmHome, thread.status, signal);
+              let need = resolved.need;
+              if (need === "nothing-live") {
+                if (!alreadyStopped) {
+                  const latest = await raceAbort(bb.sdk.threads.get({ threadId: captain }), signal, STUCK_HOST_CALL_MS);
+                  if (latest.archivedAt != null) {
+                    await stopFmWatchKeeper(host, s.fmHome, signal);
+                    seen.delete(captain);
+                    return;
+                  }
+                  need = await captainHomeWatchNeed(captain, latest.status, signal);
+                }
+                if (need === "nothing-live") {
+                  if (!alreadyStopped) {
+                    await stopFmWatchKeeper(host, s.fmHome, signal);
+                    await bb.storage.kv.set(`${CAPTAIN_WATCH_STOPPED_PREFIX}${captain}`, true);
+                    bb.log.info(`captain home ${captain}: watcher stopped (${WATCH_NEED_LOG["nothing-live"]})`);
+                  }
+                  return;
+                }
+              }
               const grace = Math.max(30, Number(s.watchHeartbeatSec) || 90);
               const prior = fmWatchBeatSchema.safeParse(await bb.storage.kv.get(fmWatchBeatKey(host)));
               const now = Date.now();
               const backoff = prior.success ? prior.data.backoffUntil ?? 0 : 0;
               const result = await superviseFmWatch(host, s.fmHome, grace, now >= backoff, signal, captain);
               if (!result) return;
+              if (alreadyStopped || (await bb.storage.kv.get(`${CAPTAIN_WATCH_STOPPED_PREFIX}${captain}`)) === true) {
+                await bb.storage.kv.delete(`${CAPTAIN_WATCH_STOPPED_PREFIX}${captain}`);
+                bb.log.info(`captain home ${captain}: watcher restarted (${watchNeedLog(need, resolved.source)})`);
+              }
               const streak = result.keeperAlive ? 0 : result.relaunched ? (prior.success ? prior.data.consecutiveRelaunch ?? 0 : 0) + 1 : 0;
               await bb.storage.kv.set(fmWatchBeatKey(host), {
                 beatAge: result.beatAge, checkedAt: now, grace, relaunched: result.relaunched,
