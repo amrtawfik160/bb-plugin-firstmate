@@ -11,7 +11,7 @@ import { createProductionApprovals } from './lib/production-approval.ts';
 import { createOwnerAsks as oldCreateOwnerAsks } from './test/fixtures/owner-asks-pre-stamp.ts';
 import { approvalConnectorSkip, APPROVAL_CONNECTOR_SKIP, testEvidenceDir } from './test/approval-telegram-checkout.ts';
 
-const evidence='/root/.local/share/hanoon-telegram-plan/170-check-10/';
+const evidence = testEvidenceDir();
 function adapt(raw, before=()=>{}) {
  return {exec(sql){before(sql);return raw.exec(sql);},prepare(sql){return raw.prepare(sql);},transaction(fn){return ()=>{raw.exec('BEGIN');try{const out=fn();raw.exec('COMMIT');return out;}catch(error){raw.exec('ROLLBACK');throw error;}};}};
 }
