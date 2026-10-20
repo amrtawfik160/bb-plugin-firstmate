@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import * as ownerAsksModule from "./owner-asks.ts";
-import { askLetterAnswer, askIdFromSourceEventId, choicesFromCrewReport, choicesFromDecisionNote, createOwnerAsks, crewQuestionText, formatAskCard, newAskId, packAnswers } from "./owner-asks.ts";
+import { askLetterAnswer, askIdFromSourceEventId, choicesFromCrewReport, choicesFromDecisionNote, createOwnerAsks, crewQuestionText, formatAskCard, formatAskRound, newAskId, packAnswers } from "./owner-asks.ts";
 import { formatBoard } from "./owner-board.ts";
 
 const NOW = Date.UTC(2026, 9, 7, 12, 0);
@@ -225,6 +225,60 @@ test("create refuses a question with no options; a blocker with no options is st
   const blocker = asks.create({ id: "a2", captain: "thr_cap", kind: "blocker", text: "Need the Stripe key.", options: [], createdAt: NOW });
   assert.equal(blocker.state, "open");
   assert.equal(blocker.options.length, 0);
+});
+
+const GRILL_ROUND = [
+  { question: "What is the goal of Reels?", options: [{ label: "Grow reach", value: "A" }, { label: "Convert sales", value: "B" }, { label: "Test ideas", value: "C" }], recommended: 0 },
+  { question: "Who is the audience?", options: [{ label: "Existing customers", value: "A" }, { label: "New viewers", value: "B" }, { label: "Both", value: "C" }], recommended: 1 },
+  { question: "How often should we post?", options: [{ label: "Daily", value: "A" }, { label: "Three times a week", value: "B" }, { label: "Weekly", value: "C" }], recommended: 1 },
+  { question: "What is the first series?", options: [{ label: "Product tips", value: "A" }, { label: "Customer stories", value: "B" }, { label: "Behind the scenes", value: "C" }], recommended: 2 },
+];
+
+test("formatAskRound prints numbered questions, marks the recommended option, and says how to answer", () => {
+  assert.equal(formatAskRound({ text: GRILL_ROUND[0]!.question, round: GRILL_ROUND }), [
+    "1. What is the goal of Reels?",
+    "✓ A. Grow reach",
+    "B. Convert sales",
+    "C. Test ideas",
+    "",
+    "2. Who is the audience?",
+    "A. Existing customers",
+    "✓ B. New viewers",
+    "C. Both",
+    "",
+    "3. How often should we post?",
+    "A. Daily",
+    "✓ B. Three times a week",
+    "C. Weekly",
+    "",
+    "4. What is the first series?",
+    "A. Product tips",
+    "B. Customer stories",
+    "✓ C. Behind the scenes",
+    "",
+    "Answer like 1A 2C, or 'yes' to accept all recommended.",
+  ].join("\n"));
+});
+
+test("a grilling round is one stored ask; partial answers keep it open and a full set closes it", () => {
+  const asks = createOwnerAsks(db());
+  const ask = asks.create({
+    id: "around", captain: "thr_cap", kind: "question", text: GRILL_ROUND[0]!.question,
+    options: [], round: GRILL_ROUND, createdAt: NOW,
+  });
+  assert.equal(ask.state, "open");
+  assert.equal(asks.get("around")?.round?.length, 4);
+  assert.equal(asks.listWaiting("thr_cap", NOW).length, 1);
+  const partial = asks.recordRoundAnswers("around", "thr_cap", [{ n: 1, choice: "A" }, { n: 2, choice: "New viewers" }], NOW);
+  assert.equal(partial?.complete, false);
+  assert.equal(asks.get("around")?.state, "open");
+  assert.deepEqual(asks.get("around")?.roundAnswers, { 1: "Grow reach", 2: "New viewers" });
+  const full = asks.recordRoundAnswers("around", "thr_cap", [{ n: 3, choice: "b" }, { n: 4, choice: "C" }], NOW + 1);
+  assert.equal(full?.complete, true);
+  assert.equal(full?.summary, "1A 2B 3B 4C");
+  assert.equal(asks.get("around")?.state, "answered");
+  assert.equal(asks.get("around")?.resolution, "1A 2B 3B 4C");
+  assert.equal(asks.listWaiting("thr_cap", NOW + 1).length, 0);
 });
 
 test("old ask databases migrate without losing open asks and unparsed decisions link from the board", () => {
