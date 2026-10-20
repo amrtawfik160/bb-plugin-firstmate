@@ -359,18 +359,18 @@ export function createOwnerAsks(db: Database): OwnerAsks {
   db.exec("BEGIN IMMEDIATE");
   try {
     if (db.prepare("SELECT v FROM owner_ask_stamp_migrated WHERE v=1").get() === undefined) {
-      try {
-        db.exec(`UPDATE owner_ask_answer
-          SET tap_id = CASE WHEN tap_id IS NULL OR tap_id = '' THEN 'legacy:' || id ELSE tap_id END,
-              at = COALESCE(at, (SELECT resolved_at FROM owner_ask WHERE owner_ask.id = owner_ask_answer.id), 0)
-          WHERE source = 'owner'`);
-      } catch { /* owner_ask missing on a half-migrated test database */ }
+      db.exec(`UPDATE owner_ask_answer
+        SET tap_id = CASE WHEN tap_id IS NULL OR tap_id = '' THEN 'legacy:' || id ELSE tap_id END,
+            at = COALESCE(at, (SELECT resolved_at FROM owner_ask WHERE owner_ask.id = owner_ask_answer.id), 0)
+        WHERE source = 'owner'`);
       db.exec("INSERT INTO owner_ask_stamp_migrated(v) VALUES (1);\nCOMMIT");
     } else {
       db.exec("COMMIT");
     }
   } catch (error) {
-    try { db.exec("ROLLBACK"); } catch { /* no open transaction */ }
+    try { db.exec("ROLLBACK"); } catch (rollbackError) {
+      if (!/no transaction is active/i.test(String(rollbackError))) throw rollbackError;
+    }
     throw error;
   }
   db.exec(`
