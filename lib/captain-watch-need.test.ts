@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -210,5 +210,72 @@ test("the native probe reads declared waits and unreported status with the packa
     assert.equal(real(() => {}), "none");
   } finally {
     runtime.clean();
+  }
+});
+
+// Root reads any file, so a permission fault only shows for another account.
+const NOBODY = ["--reuid=65534", "--regid=65534", "--clear-groups"];
+const switchSkip = (() => {
+  if (process.getuid?.() !== 0) return "switching to an unprivileged user needs root";
+  const trial = spawnSync("setpriv", [...NOBODY, "true"], { encoding: "utf8" });
+  if (trial.error || trial.status !== 0) return `setpriv cannot switch to uid 65534: ${trial.error?.message ?? trial.stderr.trim()}`;
+  return false;
+})();
+
+test("the native probe fails closed when a permission fault hides the state", { skip: switchSkip }, () => {
+  // The per-test temp root is private to root; uid 65534 must be able to reach the test home.
+  const dir = mkdtempSync("/tmp/fm-watch-perm-");
+  chmodSync(dir, 0o755);
+  try {
+    const asNobody = (name: string, setup: (home: string, state: string) => void): string => {
+      const home = join(dir, name);
+      const state = join(home, "state");
+      mkdirSync(state, { recursive: true });
+      setup(home, state);
+      const script = nativeWatchSourceScript({ binDirAssign: "FM_BINDIR=/nonexistent; FM_BUNDLED_VERIFIED=1", fmHome: home, stateDir: state });
+      const res = spawnSync("setpriv", [...NOBODY, "bash", "-c", script], { encoding: "utf8" });
+      assert.equal(res.status, 0, res.stderr);
+      const source = parseNativeWatchSource(res.stdout);
+      assert.ok(source !== null, res.stdout + res.stderr);
+      return source;
+    };
+    const locked: string[] = [];
+    const lock = (path: string) => { chmodSync(path, 0o000); locked.push(path); };
+    try {
+      assert.equal(asNobody("readable", () => {}), "none");
+      assert.equal(asNobody("missing", (_home, state) => rmSync(state, { recursive: true })), "none");
+      assert.equal(asNobody("state-locked", (_home, state) => {
+        writeFileSync(join(state, "critical.check.sh"), "#!/bin/sh\n");
+        lock(state);
+      }), "unreadable");
+      assert.equal(asNobody("state-unlisted", (_home, state) => {
+        writeFileSync(join(state, "critical.check.sh"), "#!/bin/sh\n");
+        chmodSync(state, 0o311);
+        locked.push(state);
+      }), "unreadable");
+      assert.equal(asNobody("home-locked", (home, state) => {
+        writeFileSync(join(state, "critical.check.sh"), "#!/bin/sh\n");
+        lock(home);
+      }), "unreadable");
+      assert.equal(asNobody("procevent-locked", (_home, state) => {
+        mkdirSync(join(state, "procevent"));
+        writeFileSync(join(state, "procevent", "lavish-1.source"), "x");
+        lock(join(state, "procevent"));
+      }), "unreadable");
+      assert.equal(asNobody("inbox-locked", (_home, state) => {
+        crew(state, "c1");
+        mkdirSync(join(state, "c1.inbox"));
+        writeFileSync(join(state, "c1.inbox", "000001.msg"), "x");
+        lock(join(state, "c1.inbox"));
+      }), "unreadable");
+      assert.equal(asNobody("meta-locked", (_home, state) => {
+        crew(state, "mate1", undefined, "kind=secondmate\n");
+        lock(join(state, "mate1.meta"));
+      }), "unreadable");
+    } finally {
+      for (const path of locked) chmodSync(path, 0o755);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
