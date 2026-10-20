@@ -185,6 +185,60 @@ test("an uncertain no-thread legacy launch can be released", async (t) => {
   }
 });
 
+// 20 Oct: retry reservations hermes-split-step3-1020 (generation 3, creation never requested) and reels-animate-6118
+// (generation 2, since ~01:00 UTC, a record from before creationRequested was saved) held crew slots with no worker.
+for (const [name, generation, ageMs, creationRequested] of [
+  ["hermes-split-step3-1020", 3, 3 * 60 * 60_000, false],
+  ["reels-animate-6118", 2, 12 * 60 * 60_000, undefined],
+] as const) {
+  test(`a reserved retry that never asked for a worker is released after the safe age (${name} shape)`, async (t) => {
+    const { host } = await realCaptain();
+    try {
+      const store = launchStore(host);
+      const first = launchKey(ctx.projectId, ctx.threadId, HOME, TASK);
+      store.save({ key: first, taskId: TASK, projectId: ctx.projectId, owner: ctx.threadId, home: HOME, generation: 1, shape: "ship", deliveryMode: "direct-PR", deliveryRequirement: "merged",
+        state: "running", threadId: "thr_source", nativeInvoked: true, hostId: "host_1", updatedAt: Date.now() - ageMs - 60_000 } as never);
+      const key = launchKey(ctx.projectId, ctx.threadId, HOME, TASK, generation);
+      store.save({ key, taskId: TASK, projectId: ctx.projectId, owner: ctx.threadId, home: HOME, generation, shape: "ship", deliveryMode: "direct-PR", deliveryRequirement: "merged",
+        state: "reserved", threadId: null, hostId: "host_1", updatedAt: Date.now() - ageMs, ...(creationRequested === undefined ? {} : { creationRequested }),
+        replacement: { sourceCrew: {}, sourceThreadId: "thr_source", environmentId: "env_wt", intent: "failure-recovery", reason: "", recoveryCount: 1, task: "fix login", prompt: "fix login", target: { providerId: "claude-code", model: null, reasoningLevel: null } } } as never);
+      assert.deepEqual(store.heldTaskIds(ctx.threadId).length, 1, "the reservation holds a crew slot");
+      let reads = 0;
+      host.harness.sdk.stub("threads.list", async () => { reads++; return []; });
+      t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+      const pending = host.harness.behavior.runCli(["launches", "release", TASK], ctx);
+      await drain(() => reads === 1);
+      for (let i = 0; i < 100; i++) await Promise.resolve();
+      t.mock.timers.tick(30_000);
+      const result = await pending;
+      assert.equal(result.exitCode, 0, result.stderr);
+      assert.match(result.stdout, /Released 47806a51/);
+      assert.equal(store.get(key)?.state, "failed");
+      assert.deepEqual(store.heldTaskIds(ctx.threadId), [], "the crew slot is free");
+      assert.equal(store.get(first)?.state, "running", "the first generation's record is untouched");
+    } finally {
+      t.mock.timers.reset();
+      await host.harness.lifecycle.dispose();
+    }
+  });
+}
+
+test("a reserved launch younger than the safe age is not released: a dispatch may still be starting it", async () => {
+  const { host } = await realCaptain();
+  try {
+    seedUncertain(host, { state: "reserved", creationRequested: false, updatedAt: Date.now() - 5 * 60_000 });
+    const result = await host.harness.behavior.runCli(["launches", "release", TASK], ctx);
+    assert.equal(result.exitCode, 1, result.stderr);
+    assert.match(result.stderr, /Release refused: the reservation is 5 min old\. A reservation that never asked for a worker can be released once it is 30 min old\./);
+    assert.equal(launchStore(host).forTask(ctx.projectId, ctx.threadId, TASK)?.state, "reserved");
+    const running = await (async () => { seedUncertain(host, { state: "running", threadId: "thr_w", updatedAt: 1 }); return host.harness.behavior.runCli(["launches", "release", TASK], ctx); })();
+    assert.equal(running.exitCode, 1, running.stderr);
+    assert.match(running.stderr, /Release refused: state is running\./);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
 test("release refuses creationRequested, a matching thread, a live fm-spawn lock, and a non-owner thread", async () => {
   const { host } = await realCaptain();
   try {

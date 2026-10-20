@@ -160,8 +160,9 @@ export function createLaunches(db: Database) {
     return db.transaction(() => {
       const current = get(expected.key);
       const createStillActive = current?.createWorkerStarted === true && !(pluginStartedAt !== undefined && current.updatedAt < pluginStartedAt);
+      // The caller judged an uncertain record, or a reserved one old enough that it never asked for a worker.
       if (!current || current.key !== expected.key || current.updatedAt !== expected.updatedAt ||
-          current.state !== 'uncertain' || current.threadId || current.creationRequested === true ||
+          current.state !== expected.state || (current.state !== 'uncertain' && current.state !== 'reserved') || current.threadId || current.creationRequested === true ||
           current.adoption || current.home !== boundHome || current.home !== expected.home ||
           createStillActive) {
         throw new Error('Release refused: the launch changed before the slot could be freed.');

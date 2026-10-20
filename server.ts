@@ -8041,8 +8041,15 @@ export default async function plugin(bb: BbPluginApi) {
     return match[1] as "absent" | "dead" | "live";
   }
 
+  // 20 Oct: retry reservations hermes-split-step3-1020 and reels-animate-6118 stayed "reserved" for hours with no
+  // worker and held crew slots. A dispatch takes a reservation to creation within minutes, so one this old never
+  // asked for a worker and is released like an uncertain one, after the same discovery reads and spawn-lock check.
+  const RESERVED_RELEASE_AGE_MS = 30 * 60_000;
+  function releasableState(record: LaunchRecord): boolean {
+    return record.state === "uncertain" || record.state === "reserved" && Date.now() - record.updatedAt >= RESERVED_RELEASE_AGE_MS;
+  }
   function releaseEligible(record: LaunchRecord | undefined, boundHome: string): record is LaunchRecord {
-    return !!record && record.state === "uncertain" && !record.threadId && record.creationRequested !== true && !record.adoption && record.home === boundHome && !createRequestActive(record);
+    return !!record && releasableState(record) && !record.threadId && record.creationRequested !== true && !record.adoption && record.home === boundHome && !createRequestActive(record);
   }
 
   async function inventoryForRelease(record: LaunchRecord, signal: AbortSignal) {
@@ -8060,7 +8067,10 @@ export default async function plugin(bb: BbPluginApi) {
     if (!metaFlag(captainMeta, "captain") || captain.projectId !== projectId || captain.archivedAt || captain.deletedAt) throw new Error("Release must run in the live owning captain and exact project context.");
     const record = launches.forTask(projectId, owner, taskId);
     if (!record) throw new Error(`No launch for ${taskId} in this captain and project.`);
-    if (record.state !== "uncertain") throw new Error(`Release refused: state is ${record.state}.`);
+    if (record.state !== "uncertain" && record.state !== "reserved") throw new Error(`Release refused: state is ${record.state}.`);
+    if (!releasableState(record)) {
+      throw new Error(`Release refused: the reservation is ${Math.floor((Date.now() - record.updatedAt) / 60_000)} min old. A reservation that never asked for a worker can be released once it is ${RESERVED_RELEASE_AGE_MS / 60_000} min old.`);
+    }
     if (record.threadId) throw new Error("Release refused: a thread is already recorded.");
     if (record.creationRequested === true) throw new Error("Release refused: creation was requested.");
     if (record.adoption) throw new Error("Release refused: adoption is in progress.");
@@ -16597,7 +16607,7 @@ export default async function plugin(bb: BbPluginApi) {
     dispatchHelp,
     "  bb firstmate launches list [--limit n] [--offset n] [--json]   # uncertain slots require reconciliation",
     "  bb firstmate launches adopt <task-id> --thread <thread-id> [--check] [--json]   # exact legacy registration repair; no turn or merge",
-    "  bb firstmate launches release <task-id>   # free an uncertain slot that never requested a worker",
+    "  bb firstmate launches release <task-id>   # free an uncertain slot, or one reserved 30+ min, that never requested a worker",
     "  bb firstmate deliveries list|inspect|register|reconcile|assign|abandon|clear-hold [id] [--from manager] [--reason evidence] [--authorized]",
     '  bb firstmate deliveries verify <id> --commit <head sha> --driven "<what you drove>" --seen "<what you saw>"   # a crew that drove it may record it',
     "  bb firstmate prs [--json]   # read-only: open PRs by this GitHub account in your projects, untracked ones first",
