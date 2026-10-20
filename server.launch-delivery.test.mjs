@@ -382,8 +382,7 @@ test('native guard failure after real bridge creation retains an unadmitted work
   host.harness.sdk.stub('terminals.output',async({terminalId})=>{
    const command=commands.get(terminalId);let code=0,payload='';
    if(command.includes('fm-spawn.sh')&&!command.includes('native_command=')) {
-    const token=createLaunches(host.bb.storage.database()).forTask('proj_1','thr_cap','guard')?.attemptToken;
-    const creation=await host.harness.behavior.runCli(['create-worker','--task','guard','--shape','ship','--project','proj_1','--home','/native','--host','host_1','--path','/repo','--prompt-file','/tmp/brief','--parent','thr_cap','--native-pid','999',...(token?['--attempt-token',token]:[])],ctx);
+    const creation=await host.harness.behavior.runCli(['create-worker','--task','guard','--shape','ship','--project','proj_1','--home','/native','--host','host_1','--path','/repo','--prompt-file','/tmp/brief','--parent','thr_cap','--native-pid','999'],ctx);
     assert.equal(creation.exitCode,0,creation.stderr);code=1;payload='native isolation/publication guard refused after BB creation';
    }else if(command.includes('bb_thread_id')) payload='FM_META_ABSENT';
    return{nextSeq:1,chunks:[{dataBase64:Buffer.from(`${payload}\n__FM_HOST_RC:${code}\n`).toString('base64')}]};
