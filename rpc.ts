@@ -40,7 +40,13 @@ export const rpcContract = defineRpcContract({
     output: z.object({ ok: z.boolean() }),
   },
   resolveAsk: {
-    input: z.object({ threadId: z.string().min(1), id: z.string().min(1).max(64), resolution: z.string().min(1).max(2000) }),
+    input: z.object({
+      threadId: z.string().min(1),
+      id: z.string().min(1).max(64),
+      resolution: z.string().min(1).max(2000),
+      answeredAt: z.number().int().optional(),
+      tapId: z.string().min(1).max(200).optional(),
+    }),
     output: z.object({ ok: z.boolean() }),
   },
   closeAsk: {
