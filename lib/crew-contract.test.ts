@@ -303,7 +303,7 @@ test("skill-routing and the captain Telegram guide route each Matt Pocock skill 
     "`firstmate_program`",
     "dispatch every ready ticket",
     "Run the `grilling` skill yourself",
-    "one question per `firstmate_reply`",
+    "`firstmate_ask` with `round`",
   ]) assert.ok(guide.includes(text), text);
 });
 

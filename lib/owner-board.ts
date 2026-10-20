@@ -1,4 +1,4 @@
-import { ASK_KIND_EMOJI, clip, formatAge, formatUtcTime, recommendedLabel, type OwnerAsk } from "./owner-asks.ts";
+import { ASK_KIND_EMOJI, clip, formatAge, formatUtcTime, isRoundAsk, recommendedLabel, type OwnerAsk } from "./owner-asks.ts";
 import { isOpenTask, linkedPrs, STALE_TASK_MS, type OwnerTask } from "./owner-tasks.ts";
 import { boardPullRequests, type BoardPr, type DeliveryRecord } from "./pr-delivery.ts";
 import { isOpenProgram, programLine, programNeedsOwner, type Program } from "./programs.ts";
@@ -31,6 +31,7 @@ export const DIGEST_MAX_NOT_LIVE = 5;
 export const DIGEST_MAX_NEEDS_YOU = 5;
 export const DIGEST_MAX_STALE = 15;
 export const BOARD_ANSWER_HINT = "Tap a question's button or reply with just its letter.";
+export const BOARD_ROUND_ANSWER_HINT = "Answer a grilling round like 1A 2C, or 'yes' for all recommended. Tap a card's button or reply with its letter.";
 
 const WAITING_WORDS: Partial<Record<OwnerTask["state"], string>> = { needs_you: "needs you", ready: "ready for you", check: "finished, check" };
 // Owner decision Q1 (18 Oct): only live or dropped is finished; "done" is the word of records from before.
@@ -194,7 +195,7 @@ export function workingByProject(tasks: BoardInput["tasks"], runningCrewIds: rea
 export function formatBoard(input: BoardInput): string {
   const facts = collect(input, linkedRef);
   return fit([
-    { title: "📌 Needs you", empty: "📌 Needs you: nothing right now.", cap: BOARD_MAX_NEEDS_YOU, items: facts.needsYou, ...(facts.asks.length > 0 ? { footer: BOARD_ANSWER_HINT } : {}) },
+    { title: "📌 Needs you", empty: "📌 Needs you: nothing right now.", cap: BOARD_MAX_NEEDS_YOU, items: facts.needsYou, ...(facts.asks.length > 0 ? { footer: facts.asks.some(isRoundAsk) ? BOARD_ROUND_ANSWER_HINT : BOARD_ANSWER_HINT } : {}) },
     { title: "✅ Finished since you last looked", empty: "✅ Finished since you last looked: nothing new.", cap: BOARD_MAX_DONE, items: facts.done },
     { title: "🚀 Not live yet", empty: "🚀 Not live yet: nothing merged waits to go live.", cap: BOARD_MAX_NOT_LIVE, items: facts.notLive },
     { title: "🔧 In progress", empty: "🔧 In progress: nothing open.", cap: Infinity, items: facts.inProgress },
