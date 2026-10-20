@@ -533,3 +533,27 @@ test("an undo call that does not answer stops being awaited at the undo deadline
   assert.match(out.rows[0]?.detail ?? "", /undo failed for thr_c1 \(undo not answered in time\)/);
   assert.match(w.undone[0] ?? "", /undo failed/);
 });
+
+test("an adopted crew whose work folded into its workstream is retired while the task stays open; other crews of that task stay", async () => {
+  assert.deepEqual(taskCleanupTrigger(task({ id: "T1", state: "working", crewIds: ["c1", "c2"] }), new Set(["T1"]), new Set(["c1"])), { trigger: "folded" });
+  assert.deepEqual(taskCleanupTrigger(task({ id: "T1", state: "working", crewIds: ["c2"] }), new Set(["T1"]), new Set(["c1"])), { trigger: null, reason: "workstream" });
+  const w = world();
+  w.tasks = [task({ id: "T1", state: "working", crewIds: ["c1", "c2", "c3"] })];
+  putCrew(w, "c1", "thr_c1", "env_1");
+  putCrew(w, "c2", "thr_c2", "env_2");
+  putCrew(w, "c3", "thr_c3", "env_3", { status: "active" });
+  const rows = (await run(w, { workstreamTaskIds: new Set(["T1"]), releasedCrewIds: new Set(["c1", "c3"]) })).rows;
+  assert.deepEqual(w.archived, ["thr_c1"], "only the folded crew's worktree goes; the unfolded crew keeps its work");
+  assert.deepEqual(rows, [
+    { taskId: "T1", action: "archived", detail: "folded", threadId: "thr_c1" },
+    { taskId: "T1", action: "kept", detail: "running" },
+  ]);
+  // A folded crew with unsaved work is kept, as for any finished task.
+  const dirty = world();
+  dirty.tasks = [task({ id: "T2", state: "working" })];
+  putCrew(dirty, "c1", "thr_c1");
+  dirty.dirty["/wt/env_1"] = ["1 uncommitted file(s)"];
+  await run(dirty, { workstreamTaskIds: new Set(["T2"]), releasedCrewIds: new Set(["c1"]) });
+  assert.deepEqual(dirty.archived, []);
+  assert.deepEqual(dirty.keptNotes, [`T2:${KEPT_UNSAVED}`]);
+});

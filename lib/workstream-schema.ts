@@ -7,6 +7,8 @@ export const workstreamRepoSchema = z.object({
   existing: z.boolean().optional(),
   taskId: z.string().optional(),
   crewId: z.string().optional(),
+  // The repository's PR base (its default branch); absent means main.
+  base: z.string().optional(),
 });
 export const jobCheckoutSchema = z.object({
   repository: z.string(), path: z.string(), branch: z.string(), environmentId: z.string().nullable().optional(),
@@ -56,6 +58,18 @@ export const jobSchema = z.object({
   cleanup: z.enum(['pending', 'kept-unsaved', 'done']).optional(),
   // The Ship request that took this folded work.
   shipped: z.string().optional(),
+  // An adopted crew's saved work (adopt with fold): it folds when the crew is idle, a conflict goes to a
+  // new crew, and its old worktree is retired by the task-worktree cleanup, never by the workstream.
+  adopted: z.boolean().optional(),
+  // Fold this pushed branch instead of a checkout: the crew's worktree is gone or holds another repository.
+  sourceBranch: z.string().optional(),
+  // The repository the task was recorded under before the owner card moved it.
+  repointedFrom: z.string().optional(),
+  // The fold that conflicted, kept for the conflict crew and its check.
+  conflict: foldStepSchema.optional(),
+  // The conflict crew merging this job's work, and on that crew, the job it merges.
+  resolver: z.string().optional(),
+  resolves: z.string().optional(),
 });
 export const workstreamSchema = z.object({
   id: z.string(), name: z.string(), projectId: z.string(), threadId: z.string(), requestId: z.string(),
@@ -68,6 +82,12 @@ export const workstreamSchema = z.object({
     // The folded work this Ship request takes, saved when it starts: later folds go out with the next Ship.
     snapshot: z.object({ jobs: z.array(z.string()), taskIds: z.array(z.string()), heads: z.record(z.string(), z.string()) }).optional(),
   }),
+  // Adopt with fold: the original task list (a retry must match it) and the repositories provisioned.
+  adoption: z.object({ taskIds: z.array(z.string()), repositories: z.array(z.string()) }).optional(),
+  // Tasks that left the workstream (a conflict that could not be merged safely); they keep their own work.
+  leftTaskIds: z.array(z.string()).optional(),
+  // PRs this workstream replaces: each closes with a link once the workstream PR holds all its commits.
+  replaces: z.array(z.object({ url: z.string(), repository: z.string(), state: z.enum(['open', 'closed', 'skipped']), note: z.string().optional() })).optional(),
   lastStallAt: z.number().optional(),
   cleanupApproved: z.boolean().optional(),
   cardRevision: z.number().int().nonnegative().optional(),

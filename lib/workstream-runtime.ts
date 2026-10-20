@@ -2,24 +2,26 @@ import { readFileSync } from 'node:fs';
 import type { Workstream, WorkstreamRepo } from './workstreams.ts';
 const shQuote = (text: string) => "'" + text.replaceAll("'", "'\"'\"'") + "'";
 
-export function provisionScript(source: string, path: string, branch: string): string {
+/** `base` is the repository's PR base (main, or staging for RunAnts); the workstream branch starts there. */
+export function provisionScript(source: string, path: string, branch: string, base = 'main'): string {
   return [
     'set -eu', `cd -- ${shQuote(source)}`,
-    'git fetch origin main',
-    `if [ ! -d ${shQuote(path)} ]; then mkdir -p -- ${shQuote(path.slice(0, path.lastIndexOf('/')))}; if git show-ref --verify --quiet ${shQuote(`refs/heads/${branch}`)}; then git worktree add ${shQuote(path)} ${shQuote(branch)}; else git worktree add -b ${shQuote(branch)} ${shQuote(path)} origin/main; fi; fi`,
+    `git fetch origin ${shQuote(base)}`,
+    `if [ ! -d ${shQuote(path)} ]; then mkdir -p -- ${shQuote(path.slice(0, path.lastIndexOf('/')))}; if git show-ref --verify --quiet ${shQuote(`refs/heads/${branch}`)}; then git worktree add ${shQuote(path)} ${shQuote(branch)}; else git worktree add -b ${shQuote(branch)} ${shQuote(path)} ${shQuote(`origin/${base}`)}; fi; fi`,
     `[ "$(git -C ${shQuote(path)} symbolic-ref --short HEAD)" = ${shQuote(branch)} ]`,
     `git -C ${shQuote(path)} remote get-url origin`,
   ].join('\n');
 }
 
 export function takeMainScript(repo: WorkstreamRepo): string {
+  const base = repo.base ?? 'main';
   return [
     'set -eu', `cd -- ${shQuote(repo.path)}`,
     `[ "$(git symbolic-ref --short HEAD)" = ${shQuote(repo.branch)} ]`,
     '[ -z "$(git status --porcelain --untracked-files=all)" ]',
-    'git fetch origin main',
-    // A squash merge has a different ancestry. Merge main without discarding the workstream's commits.
-    'git -c core.editor=true merge --no-edit origin/main',
+    `git fetch origin ${shQuote(base)}`,
+    // A squash merge has a different ancestry. Merge the PR base without discarding the workstream's commits.
+    `git -c core.editor=true merge --no-edit ${shQuote(`origin/${base}`)}`,
     `git push origin HEAD:${shQuote(repo.branch)}`,
     `git update-ref ${shQuote(`refs/firstmate/shipped/${repo.branch}`)} HEAD`,
   ].join('\n');
@@ -149,11 +151,81 @@ export function deleteTaskBranchScript(sourcePath: string, branch: string): stri
 
 export function unshippedScript(repo: WorkstreamRepo): string {
   const shipped = `refs/firstmate/shipped/${repo.branch}`;
+  const base = shQuote(`origin/${repo.base ?? 'main'}`);
   return [
     'set -eu', `cd -- ${shQuote(repo.path)}`,
-    'if git diff --quiet origin/main HEAD; then exit 0; else result=$?; [ "$result" -eq 1 ] || exit "$result"; fi',
-    'base=origin/main',
+    `if git diff --quiet ${base} HEAD; then exit 0; else result=$?; [ "$result" -eq 1 ] || exit "$result"; fi`,
+    `base=${base}`,
     `if git show-ref --verify --quiet ${shQuote(shipped)}; then base=${shQuote(shipped)}; fi`,
     'git log --reverse --format=%ct "$base"..HEAD | head -n 1',
+  ].join('\n');
+}
+
+/** The remote's default branch, read by prBaseFromLsRemote (lib/workstream-adopt.ts). */
+export function prBaseScript(source: string): string {
+  return `git -C ${shQuote(source)} ls-remote --symref origin HEAD`;
+}
+
+// Scratch files that never join a backup commit (see isScratchPath in server.ts); they stay uncommitted,
+// so the old worktree is kept as unsaved work rather than losing them.
+const SAVE_PATHS = `-- . ${shQuote(':(exclude).lavish')} ${shQuote(':(exclude,glob)**/.tmp-*.md')}`;
+
+/**
+ * Before an adopted crew's work folds (owner decision Q3, 20 Oct): commit its uncommitted work as a backup
+ * commit on its own branch. Prints FM_SAVE none, FM_SAVE commit <sha>, FM_SAVE missing (no worktree) or
+ * FM_SAVE busy <reason> (a merge or rebase is in progress, so nothing is committed).
+ */
+export function saveWorkScript(path: string, message: string): string {
+  return [
+    'set -eu',
+    `cd -- ${shQuote(path)} 2>/dev/null || { echo 'FM_SAVE missing'; exit 0; }`,
+    "git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo 'FM_SAVE missing'; exit 0; }",
+    'for marker in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply; do',
+    '  if [ -e "$(git rev-parse --git-path "$marker")" ]; then echo "FM_SAVE busy a $marker is in progress"; exit 0; fi',
+    'done',
+    `st=$(git status --porcelain --untracked-files=all ${SAVE_PATHS})`,
+    `[ -n "$st" ] || { echo 'FM_SAVE none'; exit 0; }`,
+    'git config user.email >/dev/null 2>&1 || export GIT_AUTHOR_NAME=Firstmate GIT_AUTHOR_EMAIL=firstmate@localhost GIT_COMMITTER_NAME=Firstmate GIT_COMMITTER_EMAIL=firstmate@localhost',
+    `git add -A ${SAVE_PATHS}`,
+    `git commit --no-verify -q -m ${shQuote(message)}`,
+    'echo "FM_SAVE commit $(git rev-parse HEAD)"',
+  ].join('\n');
+}
+
+/**
+ * Read-only for the workstream branch: fetch a pushed branch into a Firstmate ref and print the heads a fold
+ * would merge (FOLD_BEFORE, FOLD_TARGET), or FOLD_WAIT when the branch is not on origin.
+ */
+export function foldBranchPlanScript(workstreamPath: string, workstreamBranch: string, sourceBranch: string): string {
+  const ref = `refs/firstmate/adopt/${sourceBranch}`;
+  return [
+    'set -eu',
+    `cd -- ${shQuote(workstreamPath)}`,
+    onBranch(workstreamBranch),
+    'echo "FOLD_BEFORE $(git rev-parse HEAD)"',
+    `git fetch -q origin ${shQuote(`+refs/heads/${sourceBranch}:${ref}`)} 2>/dev/null || { echo ${shQuote(`FOLD_WAIT the branch ${sourceBranch} is not on origin`)}; exit 0; }`,
+    `echo "FOLD_TARGET $(git rev-parse ${shQuote(ref)})"`,
+  ].join('\n');
+}
+
+/** Which of a replaced PR's commits the workstream head holds: FM_IN <sha> or FM_OUT <sha> per commit. */
+export function prContainsScript(path: string, head: string, commits: readonly string[]): string {
+  return [
+    'set -eu',
+    `cd -- ${shQuote(path)}`,
+    `for c in ${commits.map(shQuote).join(' ') || "''"}; do`,
+    '  [ -n "$c" ] || continue',
+    `  if git merge-base --is-ancestor "$c" ${shQuote(head)} 2>/dev/null; then echo "FM_IN $c"; else echo "FM_OUT $c"; fi`,
+    'done',
+  ].join('\n');
+}
+
+/** A checkout of a repository no BB project holds (Reels), made once beside a project checkout and reused. */
+export function cloneSourceScript(repository: string, path: string): string {
+  return [
+    'set -eu',
+    `if [ -e ${shQuote(`${path}/.git`)} ]; then exit 0; fi`,
+    `mkdir -p -- ${shQuote(path.slice(0, path.lastIndexOf('/')))}`,
+    `git clone -q ${shQuote(`https://github.com/${repository}.git`)} ${shQuote(path)}`,
   ].join('\n');
 }

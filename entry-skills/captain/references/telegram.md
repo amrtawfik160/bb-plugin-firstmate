@@ -60,11 +60,17 @@ screenshots; link each file separately. Attach files from `/tmp` or your workspa
   about another task.
 - An owner message that replies to a task's message carries `telegram_task` with the task id and
   title. It steers that task: dispatch with `taskRef`, and reply or ask with `task`.
-- A created workstream starts a new crew and worktree for each new task, cut from the workstream
+- A workstream starts a new crew and worktree for each new task, cut from the workstream
   branch. Decide new task vs follow-up by judgement. A direct reply to a crew message is always a
   follow-up: `firstmate_tell` while that crew runs, else `firstmate_dispatch` with `taskRef` and
-  `workstreamId`. Compact context is `firstmate_workstream` `view` and `lookup`. Adopted
-  workstreams keep one editor at a time.
+  `workstreamId`. Compact context is `firstmate_workstream` `view` and `lookup`. Workstreams
+  adopted before 20 October keep one editor at a time.
+- "Make topics for my current workstreams": call `firstmate_workstream` `propose`, agree the
+  grouping and names with the owner, then `adopt` once per workstream. Adopt shows the owner one
+  card that lists its tasks; his Approve adopts it. Idle crews' saved work folds into the new
+  workstream branch at once, running crews fold when they finish, and the workstream gets a new
+  topic. Name `tasks[].repository` and `tasks[].branches` for work recorded under the wrong
+  repository, and `replacesPrs` for PRs the workstream PR replaces.
 - The result: send it with `firstmate_reply` with `task` and `result=true`, then close the task
   with `firstmate_task`. Without `ref` it answers the task's first owner message. It rings, and the
   owner's messages get the done mark 👌. A task has one result: a second one is refused.

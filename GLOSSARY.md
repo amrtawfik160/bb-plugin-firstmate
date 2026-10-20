@@ -53,7 +53,7 @@ _Avoid_: done, complete, closed
 ## Workstreams
 
 **Workstream**:
-A long piece of work in one project that holds many tasks, with one Telegram topic. Create provisions one workstream branch per repository and one dev link. Each task in it gets its own new crew and its own worktree, cut from the workstream branch; many tasks run at once. Adopt groups existing open tasks into a topic without new worktrees; running crews keep their worktrees, branches, PRs and dev links. It ends when all its tasks are Live or Dropped.
+A long piece of work in one project that holds many tasks, with one Telegram topic. Create provisions one workstream branch per repository and one dev link. Each task in it gets its own new crew and its own worktree, cut from the workstream branch; many tasks run at once. Adopt brings existing open tasks into a new workstream with a new topic, once the owner approves one card that lists them: idle crews' saved work folds at once, and running crews fold when they finish. It ends when all its tasks are Live or Dropped.
 _Avoid_: big task, epic, project (for the workstream itself)
 
 **Workstream branch**:
@@ -61,7 +61,7 @@ The one branch per repository that collects a workstream's finished tasks; the d
 _Avoid_: feature branch, integration branch
 
 **Fold**:
-A finished task's work joining the workstream branch, after the crew's own tests pass; its worktree is then removed. Folded is not merged: only Ship merges to main.
+A finished task's work joining the workstream branch, after the crew's own tests pass; its worktree is then removed. Folded is not merged: only Ship merges.
 _Avoid_: merge back, land, integrate
 
 **Follow-up**:

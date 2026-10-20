@@ -8,6 +8,7 @@ import { mkdtempSync,writeFileSync,readFileSync,existsSync,rmSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createWorkstreams } from './lib/workstreams.ts';
+import { seedLegacyWorkstream } from './test/legacy-workstream.mjs';
 import { foldScript, rollbackFoldScript } from './lib/workstream-runtime.ts';
 import { FAILED_KEEP_MS, crewOwnTestsPassed, parseFoldOutput } from './lib/workstream-fold.ts';
 function fixture(){
@@ -33,7 +34,7 @@ test('a fold kept for unsaved work restarts the dev link and is cleaned once the
  f.db.close();
 });
 test('an adopted task drop keeps the old cleanup path: nothing is archived', async () => {
- const f=fixture();const w=await f.store.adopt({threadId:'cap',projectId:'p',name:'Adopt',requestId:'adopt',taskIds:['T1'],repos:[{repository:'o/r',projectId:'p',hostId:'h',path:'/fixture/existing',sourcePath:'/fixture/source',branch:'fm/existing',environmentId:'env-existing',existing:true}]});
+ const f=fixture();const w=seedLegacyWorkstream(f.db,{projectId:'p',name:'Adopt',requestId:'adopt',taskIds:['T1'],repos:[{repository:'o/r',projectId:'p',hostId:'h',path:'/fixture/existing',sourcePath:'/fixture/source',branch:'fm/existing',environmentId:'env-existing',existing:true}]});
  await f.store.submit(w.id,'cap',{id:'one',editing:true,payload:'{}',taskId:'T1',environmentId:'env-existing'});f.deps.taskState=()=> 'dropped';await f.store.reconcile();assert.equal(f.archived.length,0);
  f.db.close();
 });
