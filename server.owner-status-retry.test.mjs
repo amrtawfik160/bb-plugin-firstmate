@@ -192,3 +192,35 @@ test('a long outage keeps background status posts within the rolling hourly allo
     assert.deepEqual(prReads(c.commands), []);
   } finally { Date.now = realNow; await c.host.harness.lifecycle.dispose(); }
 });
+
+test('a background approval read the allowance refuses defers the whole status sync, saved with its last error', async () => {
+  const c = await completedWithSavedRetry();
+  const realNow = Date.now;
+  try {
+    let simulated = realNow() + 3_600_000;
+    Date.now = () => simulated;
+    addCompleted(c, 131, 150, 'GitHub outage');
+    // Each later delivery was approved on an older head, so its status first reads the comparison.
+    for (let n = 131; n <= 150; n++) approvePr(c.host.bb.storage.database(), 'thr_cap', `${REPO}#${n}`, '2'.repeat(40));
+    const compares = (commands) => commands.filter((cmd) => cmd.includes('/compare/'));
+    const saved = new Map(retryRows(c).map((row) => [row.pr, row.last_error]));
+    c.recover();
+    await c.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+    const sent = posts(c.commands).length;
+    const read = compares(c.commands).length;
+    assert.ok(sent >= 1 && sent + read <= 10, `${sent} posts and ${read} comparison reads in one pass; the shared burst is 10`);
+    const left = retryRows(c);
+    assert.equal(left.length, 21 - sent);
+    for (const row of left) assert.equal(row.last_error, saved.get(row.pr), row.pr);
+    // The captain's own reconcile is not charged: it reads and posts with the allowance used up.
+    await c.deliveries({ action: 'reconcile', id: left[0].pr });
+    assert.equal(posts(c.commands).length, sent + 1);
+    assert.equal(compares(c.commands).length, read + 1);
+    for (let pass = 0; pass < 10 && retryRows(c).length > 0; pass++) {
+      simulated += 60_000;
+      await c.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+    }
+    assert.deepEqual(retryRows(c), []);
+    assert.equal(posts(c.commands).length, 21, 'each saved post is sent once');
+  } finally { Date.now = realNow; await c.host.harness.lifecycle.dispose(); }
+});

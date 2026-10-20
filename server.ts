@@ -9635,7 +9635,7 @@ export default async function plugin(bb: BbPluginApi) {
     for (const { pr, head } of statusRetries) {
       signal?.throwIfAborted();
       if (backgroundAllowance() <= 0) break;
-      await boundedFollowUp(() => serializeLedger(`delivery:${pr}`, () => retryOwnerApprovalStatus(pr, head, true)), signal)
+      await boundedFollowUp(() => serializeLedger(`delivery:${pr}`, () => retryOwnerApprovalStatus(pr, head)), signal)
         .catch(error => bb.log.warn(`Owner approval status retry ${pr}: ${String(error)}`));
     }
     await backgroundBudget.run("sweep", () => retireEndedRetainedRecords(cycleLists, signal)).catch((error) => { if (!signal?.aborted) bb.log.warn(`Retained native records: ${String(error)}`); });
@@ -10961,6 +10961,8 @@ export default async function plugin(bb: BbPluginApi) {
       const repo = pr.split("#")[0]!;
       const number = pr.split("#")[1]!;
       const read = async (path: string) => {
+        // A background pass pays each read from the shared allowance; explicit requests are not charged.
+        if (!reserveGithub(hostId, false, 1, true)) throw new GithubReservePaused(hostId);
         const result = await runStructuredOnHost(hostId, `gh api ${shQuote(path)}`, 30_000);
         if (result.exitCode !== 0) throw new Error("Cannot read approval ancestry");
         return JSON.parse(result.output);
@@ -10973,7 +10975,8 @@ export default async function plugin(bb: BbPluginApi) {
         return relation.status === "ahead" || relation.status === "identical";
       })) return "covers";
       return "new-author";
-    } catch {
+    } catch (error) {
+      if (error instanceof GithubReservePaused) throw error;
       return "unknown";
     }
   }
@@ -11051,11 +11054,22 @@ export default async function plugin(bb: BbPluginApi) {
     try { return canonicalPr(trimmed).id; } catch { return undefined; }
   }
 
-  async function syncOwnerApprovalStatus(pr: string, head: string, hostId: string | null, task?: OwnerTask | null, charged = false): Promise<void> {
+  async function syncOwnerApprovalStatus(pr: string, head: string, hostId: string | null, task?: OwnerTask | null): Promise<void> {
     if (!pr || !head) return;
+    // A background pass pays every approval read from the shared GitHub allowance, and the post
+    // too when it retries a saved one. A refused request defers the whole sync: the saved post
+    // keeps its last error, and no failure is recorded. Explicit requests are not charged.
+    const retry = backgroundBudget.getStore() !== undefined && ownerGate.statusPostNeeded(pr, head);
+    const defer = () => ownerGate.deferStatusPost(pr, head, Date.now());
     const found = task ?? taskForPr(pr);
     const cards = ownerGate.cardsForPr(pr);
-    const coverage = await cardCoverage(hostId, pr, head, cards);
+    let coverage: Awaited<ReturnType<typeof cardCoverage>>;
+    try { coverage = await cardCoverage(hostId, pr, head, cards); }
+    catch (error) {
+      if (!(error instanceof GithubReservePaused)) throw error;
+      defer();
+      return;
+    }
     const status = approvalFor({
       pr, head, action: "merge", cards, coverage, preApprovals: coveringPres(found),
       task: found?.id, taskOpen: found ? !isFinishedTask(found) : false,
@@ -11074,11 +11088,8 @@ export default async function plugin(bb: BbPluginApi) {
         fail("no host");
         return;
       }
-      // A background retry spends one request of the shared GitHub allowance on the post. With
-      // none left the post waits, saved, for a later pass; that is not a failure. Explicit
-      // requests are not charged.
-      if (charged && !reserveGithub(postedHost, false, 1, true)) {
-        ownerGate.deferStatusPost(pr, head, Date.now());
+      if (retry && !reserveGithub(postedHost, false, 1, true)) {
+        defer();
         return;
       }
       const posted = await runStructuredOnHost(postedHost, postStatusCommand(repo, head, status), 30_000);
@@ -11090,12 +11101,11 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   // A completed or abandoned delivery is no longer polled; its saved status post retries here.
-  // charged: a background retry, paid from the shared GitHub allowance.
-  async function retryOwnerApprovalStatus(pr: string, head: string, charged = false): Promise<void> {
+  async function retryOwnerApprovalStatus(pr: string, head: string): Promise<void> {
     const record = deliveries.get(pr);
     const task = taskForPr(pr, record?.owner, record?.taskId);
     const hostId = await gateHost(task?.projectId ?? record?.projectId, record?.owner ?? task?.captain);
-    await syncOwnerApprovalStatus(pr, head, hostId, task, charged);
+    await syncOwnerApprovalStatus(pr, head, hostId, task);
   }
 
   async function syncOwnerApprovalForAsk(askId: string): Promise<void> {
