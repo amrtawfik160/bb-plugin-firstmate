@@ -108,7 +108,7 @@ import { createDeliveries, OWNER_ACTOR, ownerWorksHeadTap, fullCommitSha, verifi
 import { captureHostCommand, decodeHostCapture } from "./lib/host-capture.ts";
 import { selectExecution, validateLaunchCapabilities } from "./lib/execution-selection.ts";
 import { crewPipeline, crewPlaybook, crewSkillBlock, crewSkillRoot, notVerifiedNote, notVerifiedRequest, pipelineProofGap, PLAYBOOK_CHOICES, playbookStepCount, redactSecrets, reportGapNote, reportGapRequest, reportGaps, skillCheckScript, skillRoutingLinkScript, verifyStepGap } from "./lib/crew-contract.ts";
-import { chooseProfile, latestBuilderModel, loadCrewDispatch, readBbSubsQuota, runModelsCommand } from "./lib/crew-dispatch.ts";
+import { chooseProfile, formatPickLine, latestBuilderModel, loadCrewDispatch, MODELS_ACTIONS, readBbSubsQuota, runModelsCommand, type ModelsAction } from "./lib/crew-dispatch.ts";
 import { CODEX_MODEL, CREW_ROLES, crewExecution, modelPermissionRefusal } from "./owner/crew-roles.ts";
 import { DISPATCH_VERSION, PROOF_STEP, pipelineGates, proofStep } from "./owner/pipelines.ts";
 import { changeReach, type Reach } from "./owner/reach.ts";
@@ -5163,9 +5163,11 @@ export default async function plugin(bb: BbPluginApi) {
     const envId = parentThreadId !== undefined ? await threadEnv(parentThreadId) : null;
     const routing = selectedHost ? {hostId:selectedHost} : envId !== null ? { environmentId: envId } : {};
     // FM138 verdict 1, finding 4: a catalog that cannot be read cannot prove the model exists.
-    const unchecked = (why: string) => strict
+    const unchecked = (why: string) => Object.assign(strict
       ? new Error(`Execution change refused: ${why}.`)
-      : new Error(`${mid !== "" ? `Model "${mid}"` : `Provider "${pid}"`} cannot be checked against the catalog of provider "${pid || "default"}": ${why}. Retry when the host answers, or name a provider and model it lists. Nothing was spawned.`);
+      : new Error(`${mid !== "" ? `Model "${mid}"` : `Provider "${pid}"`} cannot be checked against the catalog of provider "${pid || "default"}": ${why}. Retry when the host answers, or name a provider and model it lists. Nothing was spawned.`), { catalogRefusal: "unchecked" as const });
+    // A short reason on each concrete refusal lets model choice skip that candidate (lib/crew-dispatch.ts).
+    const refused = (message: string, catalogRefusal: string) => Object.assign(new Error(message), { catalogRefusal });
     let providers: unknown;
     try {
       providers = await raceAbort(bb.sdk.providers.list(routing), undefined, STUCK_HOST_CALL_MS);
@@ -5180,16 +5182,17 @@ export default async function plugin(bb: BbPluginApi) {
       if (hit === undefined) {
         const lower = pid.toLowerCase();
         const near = ids.filter((id) => id.toLowerCase().includes(lower) || lower.includes(id.toLowerCase()));
-        throw new Error(
+        throw refused(
           `Unknown providerId "${pid}"${near.length > 0 ? ` — did you mean ${near.map((id) => `"${id}"`).join(" or ")}?` : "."} Known providers: ${ids.join(", ")}. Nothing was spawned.`,
+          "unknown provider",
         );
       }
       if (strict && reasoningLevel && !Array.isArray(hit["reasoningLevels"])) throw new Error("Execution change refused: reasoning capability is unknown.");
       if (reasoningLevel && Array.isArray(hit["reasoningLevels"]) && !hit["reasoningLevels"].some((level:unknown) => asRecord(level)["id"] === reasoningLevel)) {
-        throw new Error(`Provider "${pid}" does not advertise reasoning level "${reasoningLevel}". Nothing was spawned.`);
+        throw refused(`Provider "${pid}" does not advertise reasoning level "${reasoningLevel}". Nothing was spawned.`, `no ${reasoningLevel} effort`);
       }
       if (hit["available"] === false) {
-        throw new Error(`Provider "${pid}" is installed but not available on this host (sign-in or install needed). Nothing was spawned.`);
+        throw refused(`Provider "${pid}" is installed but not available on this host (sign-in or install needed). Nothing was spawned.`, "provider not available");
       }
     }
     if (mid === "") return;
@@ -5206,7 +5209,7 @@ export default async function plugin(bb: BbPluginApi) {
     // 17 Oct step 2 canary: a Claude model on the Codex provider was accepted here and
     // the crew failed at its first turn. A model the catalog does not list is refused.
     const offered = models.map((m) => m["id"]).filter((m): m is string => typeof m === "string");
-    throw new Error(`Provider "${pid || "default"}" does not offer model "${mid}". It offers: ${offered.join(", ")}. Nothing was spawned.`);
+    throw refused(`Provider "${pid || "default"}" does not offer model "${mid}". It offers: ${offered.join(", ")}. Nothing was spawned.`, "not in the catalog");
   }
 
   // A spawned crew whose thread is already in error never started; say so instead
@@ -7143,29 +7146,50 @@ export default async function plugin(bb: BbPluginApi) {
     role?: Crew["role"];
     /** Crew-dispatch rule id or when-text. Firstmate picks this by judgement. */
     rule?: string;
+    /** For a checker: the crews of the task it checks, so it runs another model than their builder. */
+    checksCrewIds?: string[];
     signal?:AbortSignal;
   }): Promise<Crew> {
     const task = input.task.trim().slice(0, MAX_TASK);
     if (task === "") throw new Error("Empty task.");
-    // Owner-named model wins. Else a rule from config/crew-dispatch.json, else the file default.
+    // Owner decision (19 Oct): a model the owner named wins. Else the rule Firstmate picked from the
+    // home's config/crew-dispatch.json, else that file's role default; quota and the catalog skip candidates.
     const ownerNamed = input.providerNamed === true || input.ownerRequestedProvider === true || input.model !== undefined;
     let pickedByDispatch = false;
     let providerNote: string | undefined;
-    const execution = ownerNamed
-      ? crewExecution({ role: input.role, providerId: input.providerNamed === true || input.ownerRequestedProvider === true ? input.providerId : undefined, model: input.model, modelPermission: input.modelPermission })
-      : await (async () => {
-        const loaded = loadCrewDispatch((await settings.get()).fmHome.trim());
-        const quota = await readBbSubsQuota().catch(() => null);
-        const avoidModel = input.role === "checker" ? latestBuilderModel(await readCrews(), input.parentThreadId) : undefined;
-        const pick = chooseProfile({ config: loaded.config, rule: input.rule, role: input.role, modelPermission: input.modelPermission, avoidModel, quota });
-        pickedByDispatch = true;
-        const note = [pick.line, pick.notice, loaded.brokenNotice].filter((part) => part !== undefined && part !== "").join("\n");
-        if (note !== "") providerNote = note;
-        return crewExecution({ role: input.role, providerId: pick.providerId, model: pick.model, reasoningLevel: toReasoningLevel(pick.reasoningLevel), modelPermission: input.modelPermission });
-      })();
-    const pickedEffort = toReasoningLevel(execution.reasoningLevel);
-    input = { ...input, providerId: execution.providerId, model: execution.model, ...(pickedEffort !== undefined ? { reasoningLevel: pickedEffort } : {}) };
+    if (ownerNamed) {
+      const execution = crewExecution({ role: input.role, providerId: input.providerNamed === true || input.ownerRequestedProvider === true ? input.providerId : undefined, model: input.model, modelPermission: input.modelPermission });
+      input = { ...input, providerId: execution.providerId, model: execution.model };
+    } else {
+      const loaded = loadCrewDispatch((await settings.get()).fmHome.trim());
+      const quota = await readBbSubsQuota();
+      const avoidModel = input.role === "checker" ? latestBuilderModel(await readCrews(), { parentThreadId: input.parentThreadId, crewIds: input.checksCrewIds }) : undefined;
+      const marks: UnavailableProviders = await unavailableProviders().catch(() => ({}));
+      const shipGuard = input.shape === "ship" && (await settings.get()).shipAntigravityGuard !== false;
+      const host = await resolveHostForProject(input.projectId, input.parentThreadId, input.signal).catch(() => undefined);
+      const owned = input;
+      const pick = await chooseProfile({
+        config: loaded.config, rule: input.rule, role: input.role, reasoningLevel: input.reasoningLevel, modelPermission: input.modelPermission, avoidModel, quota,
+        check: async (profile) => {
+          if (shipGuard && profile.harness === GUARDED_SHIP_PROVIDER) return "not used for ship work";
+          const mark = marks[profile.harness];
+          if (mark !== undefined) return `${mark.reason} until ${utcMinute(mark.until)}`;
+          try {
+            await validateProviderChoice(profile.harness, profile.model, owned.projectId, owned.parentThreadId, toReasoningLevel(profile.effort), host);
+            return null;
+          } catch (error) {
+            const why = asRecord(error)["catalogRefusal"];
+            return typeof why === "string" && why !== "unchecked" ? why : null;
+          }
+        },
+      });
+      pickedByDispatch = true;
+      providerNote = [pick.line, pick.notice, loaded.brokenNotice].filter((part) => part !== undefined && part !== "").join("\n");
+      input = { ...input, providerId: pick.providerId, model: pick.model, reasoningLevel: toReasoningLevel(pick.reasoningLevel) };
+    }
+    let guardMoved = false;
     if (input.shape === "ship" && input.providerId === GUARDED_SHIP_PROVIDER && input.ownerRequestedProvider !== true && !pickedByDispatch && (await settings.get()).shipAntigravityGuard !== false) {
+      guardMoved = true;
       const fallback = (await settings.get()).defaultProvider;
       input = { ...input, providerId: fallback !== "" && fallback !== GUARDED_SHIP_PROVIDER ? fallback : undefined, model: undefined, providerNamed: false };
     }
@@ -7176,6 +7200,10 @@ export default async function plugin(bb: BbPluginApi) {
         input = { ...input, providerId: skip.providerId, model: skip.model ?? undefined, reasoningLevel: skip.reasoningLevel ?? input.reasoningLevel };
         providerNote = skip.note;
       }
+    }
+    // The ship guard and a plan-limit skip explain their own move; otherwise name the owner's pick.
+    if (ownerNamed && providerNote === undefined && !guardMoved) {
+      providerNote = formatPickLine({ providerId: input.providerId, model: input.model, reasoningLevel: input.reasoningLevel, source: "named" });
     }
     await requireProviderSignedIn(input.providerId, input.projectId, input.parentThreadId);
     await drainBeforeAction(input.parentThreadId, "dispatch");
@@ -15125,8 +15153,8 @@ export default async function plugin(bb: BbPluginApi) {
     taskId:z.string().regex(/^[A-Za-z0-9._-]+$/).optional().describe("Stable retry identity; reuse after an uncertain launch"),
     projectId: z.string().optional().describe("BB project id; defaults to the current thread's project"),
     title: z.string().max(120).optional(),
-    role: z.enum(CREW_ROLES).optional().describe("builder (default): home crew-dispatch.json default; checker: checker rule (must differ from the builder); lookup: claude-code claude-haiku-5-5. providerId, model and reasoningLevel override it for this crew only: pass them only when the owner named them for this task"),
-    rule: z.string().min(1).optional().describe("Crew-dispatch rule id or when-text from config/crew-dispatch.json. Firstmate picks this by judgement. Do not match task text with regex."),
+    role: z.enum(CREW_ROLES).optional().describe("builder (default): the default in the home's config/crew-dispatch.json (starter: claude-code claude-opus-5-5); checker: its checker rule, never the builder's model (starter: codex gpt-6.1-sol); lookup: claude-code claude-haiku-5-5. providerId, model and reasoningLevel override it for this crew only: pass them only when the owner named them for this task"),
+    rule: z.string().min(1).optional().describe("When the owner named no model: the id or when-text of the model-choice rule that fits this task best, by your judgement (firstmate_models list shows them). Omit it when no rule fits."),
     providerId: z.string().optional(),
     model: z.string().optional(),
     reasoningLevel: z.enum(["low", "medium", "high", "xhigh", "max", "ultra", "none", "ultracode"]).optional()
@@ -15189,7 +15217,7 @@ export default async function plugin(bb: BbPluginApi) {
     '  bb firstmate decide ask [--option o ...] [--crew <id>] -- "<question>"',
     "  bb firstmate decide [list|answer <id>|defer <id>|drop <id>]",
     "  bb firstmate posture [set --project <id> [--mode m] [--yolo on|off] [--reason current-user-override]]",
-    "  bb firstmate models [list|show|set|remove|default] [--id id] [--when text] [--why text] [--use json]",
+    "  bb firstmate models [list|set|remove|default|reset] [--id id] [--when text] [--why text] [--use json]",
     "  bb firstmate memory [show|set-captain|add-learning|drop-learning <n>|clear <captain|learnings>]",
     "  bb firstmate afk [on|off|status] [-- \"words\"]",
     "  bb firstmate quiet [on|off|status]",
@@ -15476,7 +15504,7 @@ export default async function plugin(bb: BbPluginApi) {
   registerCaptainTool({
     name: "firstmate_dispatch",
     description:
-      "Dispatch a firstmate-style crewmate: spawns a child BB thread for one task (ship crews get an isolated worktree by default) and records it as a crew. When the owner named no model, pass `rule` (id or when-text from config/crew-dispatch.json) chosen by judgement. Each owner job opens its own owner task: pass the owner's sourceRefs, or origin when the job came from another thread or the captain. A follow-up on an existing task (fix round, deploy, check) passes taskRef instead; a dispatch for a PR a task already holds joins that task.",
+      "Dispatch a firstmate-style crewmate: spawns a child BB thread for one task (ship crews get an isolated worktree by default) and records it as a crew. When the owner named no model, pass the best-fitting `rule`. The result names the picked model in one line; pass any \"Tell the owner:\" line to the owner. Each owner job opens its own owner task: pass the owner's sourceRefs, or origin when the job came from another thread or the captain. A follow-up on an existing task (fix round, deploy, check) passes taskRef instead; a dispatch for a PR a task already holds joins that task.",
     presentation: { label: { pending: "Dispatching crewmate", completed: "Dispatched crewmate" } },
     parameters: dispatchParams,
     async execute({ task, taskId, projectId, title, role, rule, providerId, model, reasoningLevel, permissionMode, shape, mode, worktree, sharedEnv, visible, sendAt, deliveryRequirement, overrideOwner, sourceRefs, origin, ownerRequestedProvider, modelPermission, taskRef, playbook, ticket, workstreamId, workstreamRepo }, ctx) {
@@ -15602,6 +15630,10 @@ export default async function plugin(bb: BbPluginApi) {
         shape: resolvedShape,
         mode: toMode(mode, posture.mode), yolo: posture.yolo,
         sendAt, deliveryRequirement, ownerRequestedProvider, modelPermission, playbook, rule,
+        // A checker runs another model than the builder of the task it checks.
+        ...(role === "checker" && parentThreadId !== undefined
+          ? { checksCrewIds: (taskRef !== undefined ? ownerTasks.get(taskRef) : await prTask(parentThreadId, resolvedProject, title, task))?.crewIds ?? [] }
+          : {}),
       };
       if (background) {
         const reservedId = crewKey;
@@ -15639,14 +15671,14 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_models",
-    description: "Show and edit this home's config/crew-dispatch.json rules. list/show, set (id, when, use, why), remove, or default.",
+    description: "Show and edit the model-choice rules in this home's config/crew-dispatch.json, e.g. when the owner says \"use Opus for UI\". list shows them; set adds or replaces a rule (id, when, use, why); remove drops one; default replaces the default list; reset backs up the file and writes the starter rules. List each rule's models strongest first.",
     parameters: z.object({
-      action: z.enum(["list", "show", "set", "remove", "default"]).default("list"),
-      id: z.string().optional(),
-      when: z.string().optional(),
+      action: z.enum(MODELS_ACTIONS).default("list"),
+      id: z.string().optional().describe("Short rule id, e.g. ui"),
+      when: z.string().optional().describe("Plain kind of task the rule is for, e.g. UI changes"),
       why: z.string().optional(),
       use: z.union([z.string(), z.array(z.object({ harness: z.string(), model: z.string().optional(), effort: z.string().optional() }))]).optional()
-        .describe("Profile object array, or JSON of that array"),
+        .describe("Profiles strongest first: [{harness: BB provider id (claude-code, codex, acp-grok, acp-antigravity, acp-cursor, pi), model, effort}], or that array as JSON"),
     }),
     async execute({ action, id, when, why, use }) {
       try {
@@ -18695,7 +18727,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "queue", summary: "Backlog with deps/time gates; reconcile restores exact native linkage without launching; prune forgets finished items", usage: queueHelp },
       { name: "decide", summary: "Durable decisions", usage: 'bb firstmate decide ask -- "<question>"' },
       { name: "posture", summary: "Per-project delivery mode + yolo", usage: "bb firstmate posture set --project <id> [--mode m]" },
-      { name: "models", summary: "Show and edit per-home crew-dispatch rules", usage: "bb firstmate models [list|show|set|remove|default] [--id id] [--when text] [--why text] [--use json]" },
+      { name: "models", summary: "Show and edit the home's model-choice rules (config/crew-dispatch.json)", usage: "bb firstmate models [list|set|remove|default|reset] [--id id] [--when text] [--why text] [--use json]" },
       { name: "memory", summary: "Captain prefs + learnings", usage: "bb firstmate memory show" },
       { name: "corrections", summary: "Owner corrections ledger: record one, record its fix, list them", usage: 'bb firstmate corrections add --ref <owner message ref> -- "<owner words>" | fix <C-id> --fix <PR url|data/captain.md> --changelog "<one line>" | list [--captain <thread-id>] [--since <iso>] [--until <iso>] [--json]' },
       { name: "retire-finished", summary: "Retire crews that reported done and went idle; lists only, unless --apply", usage: "bb firstmate retire-finished [--captain <thread-id>] [--apply] [--json]" },
@@ -19672,8 +19704,8 @@ export default async function plugin(bb: BbPluginApi) {
             return reply({ ...data, captain, home }, renderScorecard(data));
           }
           case "models": {
-            const action = (rest[0] ?? "list") as "list" | "show" | "set" | "remove" | "default";
-            if (!["list", "show", "set", "remove", "default"].includes(action)) return fail(usage);
+            const action = (rest[0] ?? "list") as ModelsAction;
+            if (!MODELS_ACTIONS.includes(action)) return fail(usage);
             try {
               const result = runModelsCommand(current.fmHome.trim(), {
                 action,
