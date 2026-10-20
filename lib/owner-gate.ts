@@ -400,5 +400,9 @@ export function createOwnerGate(db: Database) {
     statusPostNeeded(pr: string, head: string): boolean {
       return db.prepare("SELECT 1 FROM production_status_retry WHERE pr=? AND head=?").get(pr.toLowerCase(), head) !== undefined;
     },
+    /** Every saved status post still to retry, the longest waiting first. */
+    pendingStatusPosts(): Array<{ pr: string; head: string }> {
+      return z.array(z.object({ pr: z.string(), head: z.string() })).parse(db.prepare("SELECT pr, head FROM production_status_retry ORDER BY at, pr, head").all());
+    },
   };
 }

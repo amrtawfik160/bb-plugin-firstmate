@@ -8652,7 +8652,10 @@ export default async function plugin(bb: BbPluginApi) {
   async function readDelivery(record:DeliveryRecord,signal?:AbortSignal):Promise<DeliveryRecord> {
     return serializeLedger(`delivery:${record.id}`,async()=>{
     record=deliveries.get(record.id) ?? record;
-    if (["complete","explicitly-abandoned"].includes(record.status)) return record;
+    if (["complete","explicitly-abandoned"].includes(record.status)) {
+      if (record.headSha && ownerGate.statusPostNeeded(record.id, record.headSha)) await retryOwnerApprovalStatus(record.id, record.headSha);
+      return record;
+    }
     try {
       // The forge state is read whatever happened to the manager: a merged or
       // closed PR must leave the open list even when its captain is gone.
@@ -9465,6 +9468,17 @@ export default async function plugin(bb: BbPluginApi) {
         await follow(record);
       }
     }));
+    // The due list skips completed and abandoned deliveries; their saved owner approval
+    // status posts are read on their own, so those deliveries are not polled again.
+    const statusRetries = ownerGate.pendingStatusPosts()
+      .filter(({ pr }) => ["complete","explicitly-abandoned"].includes(deliveries.get(pr)?.status ?? ""))
+      .slice(0, FOLLOW_UP_DUE_LIMIT);
+    for (const { pr, head } of statusRetries) {
+      signal?.throwIfAborted();
+      if (backgroundAllowance() <= 0) break;
+      await boundedFollowUp(() => serializeLedger(`delivery:${pr}`, () => retryOwnerApprovalStatus(pr, head)), signal)
+        .catch(error => bb.log.warn(`Owner approval status retry ${pr}: ${String(error)}`));
+    }
     await backgroundBudget.run("sweep", () => retireEndedRetainedRecords(cycleLists, signal)).catch((error) => { if (!signal?.aborted) bb.log.warn(`Retained native records: ${String(error)}`); });
     // Notification failure stays due independently of forge polling backoff.
     for (const record of deliveries.pendingNotifications()) {
@@ -10907,6 +10921,14 @@ export default async function plugin(bb: BbPluginApi) {
     } catch (error) {
       fail(error instanceof Error ? error.message : String(error));
     }
+  }
+
+  // A completed or abandoned delivery is no longer polled; its saved status post retries here.
+  async function retryOwnerApprovalStatus(pr: string, head: string): Promise<void> {
+    const record = deliveries.get(pr);
+    const task = taskForPr(pr, record?.owner, record?.taskId);
+    const hostId = await gateHost(task?.projectId ?? record?.projectId, record?.owner ?? task?.captain);
+    await syncOwnerApprovalStatus(pr, head, hostId, task);
   }
 
   async function syncOwnerApprovalForAsk(askId: string): Promise<void> {
